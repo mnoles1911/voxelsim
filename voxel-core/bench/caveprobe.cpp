@@ -133,6 +133,16 @@
 //                        the thing that changed (cave_families.h explains why
 //                        this is done by differencing rather than by building
 //                        the v24 tree)
+//     --field-off        THE W5 CONTROL PANEL: reduce the SAME world with the
+//                        v27 field coupling neutralised -- v26's global edge
+//                        density, calibre, crevice rate and entrance rate, on
+//                        identical columns, terrain, seed and predicate. Every
+//                        W5 claim is the difference between a run with this and
+//                        a run without it; see cave_families.h for why the
+//                        control is a neutralised gate set rather than a v26
+//                        build, and for the ONE term where it matches v26's
+//                        rate but not its draws (the crevice gate changed
+//                        channel).
 //     --cavern-ab-off    skip the W4 chamber-shape A/B. It is ON by default and
 //                        should stay on: it is what turns "plan-view symmetry
 //                        is broken" from an assertion into a measurement, and
@@ -343,6 +353,7 @@ int main(int argc, char** argv) {
     int64_t maxDepthM = 45, steepMmPerM = 300, connectN = 512;
     int px = 512, tileScale = 1;
     bool entranceCavityOff = false;
+    bool fieldOff = false;
     bool cavernAbOff = false;
     std::string coarseDir;
     bool images = true, sectionOnly = false, connectAtSet = false;
@@ -381,6 +392,8 @@ int main(int argc, char** argv) {
             outPrefix = argv[++i];
         } else if (a == "--entrance-off") {
             entranceCavityOff = true;
+        } else if (a == "--field-off") {
+            fieldOff = true;
         } else if (a == "--cavern-ab-off") {
             cavernAbOff = true;
         } else if (a == "--no-images") {
@@ -471,6 +484,21 @@ int main(int argc, char** argv) {
     }
     Amplifier amp(seed, *tiles);
 
+    // v27: the entrance gate is field-driven, so an instrument that wants to
+    // know whether site (i, j) is open has to ask with THAT node's own gates.
+    // Hand-rolling the old two-bit test here would count a world nobody is
+    // building -- which is exactly the failure mode caveEntranceGateOpen exists
+    // to remove. `fieldOff` makes this arm the control, same as everywhere else.
+    auto siteGates = [&](int64_t i, int64_t j) -> CaveGates {
+        if (fieldOff) return kCaveGatesNeutral;
+        return caveGatesFromField(
+            amp.caveFieldAt(caveNodeAnchorMm(i), caveNodeAnchorMm(j)));
+    };
+    auto entranceOpen = [&](int64_t i, int64_t j) {
+        return caveEntranceGateOpen(seed, i, j, siteGates(i, j));
+    };
+
+
     // Region, in voxels. The sample stride is what one image pixel covers; the
     // census is over the SAME samples the images are drawn from, so a picture
     // and a number can never disagree about the region.
@@ -491,7 +519,8 @@ int main(int argc, char** argv) {
 
     std::printf("\nvxc_caveprobe  seed=%llu  kWorldGenVersion=%u%s\n", (unsigned long long)seed,
                 kWorldGenVersion,
-                entranceCavityOff ? "  [--entrance-off: the v24 bore, cavity suppressed]" : "");
+                entranceCavityOff ? "  [--entrance-off: the v24 bore, cavity suppressed]"
+                                  : (fieldOff ? "  [--field-off: v26 global gates, no W5 field]" : ""));
     std::printf("region centre=(%.1f, %.1f) m  span=%.1f m  %dx%d samples  stride=%.1f m "
                 "(%.4f km^2)\n",
                 originXM, originYM, spanM, px, px,
@@ -601,7 +630,7 @@ int main(int argc, char** argv) {
                 const bool steep = slopeMmPerM >= steepMmPerM;
                 if (steep) ++colsSteep;
 
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), entranceCavityOff);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), amp.fieldAtFn(), entranceCavityOff, fieldOff);
                 if (cv.full.count != col.cave.count ||
                     cv.full.shaftMarginSq != col.cave.shaftMarginSq)
                     ++memoMismatch;
@@ -825,7 +854,7 @@ int main(int argc, char** argv) {
                 const int64_t vx = (axis == 0) ? x0 + static_cast<int64_t>(i) * stride : cx;
                 const int64_t vy = (axis == 0) ? cy : y0 + static_cast<int64_t>(i) * stride;
                 const ColumnSample col = amp.column(vx, vy);
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), entranceCavityOff);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn(), amp.fieldAtFn(), entranceCavityOff, fieldOff);
                 for (int64_t r = 0; r < h; ++r) {
                     const int64_t vz = zTop - r; // row 0 = top of image
                     const MaterialId strat = Amplifier::stratigraphyAt(col, vz);
@@ -912,8 +941,7 @@ int main(int argc, char** argv) {
                 if ((i & kCaveShaftNodeMask) == 0 && (j & kCaveShaftNodeMask) == 0 &&
                     inRegion(caveNode(seed, i, j))) {
                     ++shaftCandidates;
-                    if (((hash2(seed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0)
-                        ++shaftOpen;
+                    if (entranceOpen(i, j)) ++shaftOpen;
                 }
                 // (i & 7), not (i % 8): two's-complement AND is the floored
                 // modulo for negative indices too -- the same reason caves.h
@@ -931,7 +959,10 @@ int main(int argc, char** argv) {
         for (int64_t j = lj0; j <= lj1; ++j)
             for (int64_t i = li0; i <= li1; ++i)
                 for (int32_t d = 0; d < 2; ++d) {
-                    if (!caveEdgeExists(seed, i, j, d)) continue;
+                    // v27: the density gate is the SOURCE NODE's, so the
+                    // heading histogram has to ask with that node's own gates
+                    // or it walks edges the world does not build.
+                    if (!caveEdgeExists(seed, i, j, d, siteGates(i, j).edgeGateQ20)) continue;
                     const CaveNode a = caveNode(seed, i, j);
                     const CaveNode b = (d == 0) ? caveNode(seed, i + 1, j) : caveNode(seed, i, j + 1);
                     // Walk the axis the way the carve does: the SUB-SEGMENTS of
@@ -994,7 +1025,7 @@ int main(int argc, char** argv) {
             for (int64_t i = floorDiv(bxMm0, kCaveLatticeMm) - 1;
                  i <= floorDiv(bxMm1, kCaveLatticeMm) + 1; ++i) {
                 if ((i & kCaveShaftNodeMask) != 0 || (j & kCaveShaftNodeMask) != 0) continue;
-                if (((hash2(seed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) != 0) continue;
+                if (!entranceOpen(i, j)) continue;
                 const CaveNode nd = caveNode(seed, i, j);
                 if (nd.xMm < bxMm0 || nd.xMm >= bxMm1 || nd.yMm < byMm0 || nd.yMm >= byMm1)
                     continue;
@@ -1519,7 +1550,7 @@ int main(int argc, char** argv) {
                     continue; // jittered out of the census region
                 const bool isShaft =
                     (i & kCaveShaftNodeMask) == 0 && (j & kCaveShaftNodeMask) == 0 &&
-                    ((hash2(seed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0;
+                    entranceOpen(i, j);
                 const bool isCavern = (i & (kCavernCoarseLatticeRatio - 1)) == 0 &&
                                       (j & (kCavernCoarseLatticeRatio - 1)) == 0 &&
                                       cavernSiteGateOpen(seed, i, j) &&

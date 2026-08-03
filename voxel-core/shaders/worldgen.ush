@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 26
+#define VXC_WORLDGEN_VERSION_USH 27
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -1962,10 +1962,19 @@ uint stratigraphyAt(GpuColumnSample col, int64_t vz)
 // can be diffed by eye. DO NOT let them drift.
 //
 // Recomputed here per VoxelizeMain thread rather than carried through
-// GpuColumnSample: it needs only (seed, vx, vy, surfaceMm) â€” no raster reads â€”
-// so recomputing costs the same 34 hashes ColumnMain would have paid, keeps
-// the column buffer layout (and the harness's column comparison) unchanged,
-// and avoids widening a cross-kernel struct contract.
+// GpuColumnSample: it keeps the column buffer layout (and the harness's column
+// comparison) unchanged and avoids widening a cross-kernel struct contract.
+//
+// v25 gave it ONE raster read (the entrance site's own ground). v27 (plan W5)
+// gives it sixteen more: the field coupling samples climate + relief at each of
+// the 4x4 lattice node ANCHORS. The CPU memoises those per lattice cell -- one
+// cell is 65'536 voxel columns -- and this kernel cannot, so it pays them per
+// thread. That is 16 climate loads plus 64 raw elevation loads, all inside the
+// window the raster is already sized for and nearly all L1-hot (a 4x4 anchor
+// block spans ~102 m, i.e. four pixels at the coarse pitch). It is the same
+// order as the ~16 raster loads + spline the v20 density-band removal reclaimed
+// from this kernel, and the reason VoxelizeMain now binds ClimatePacked (t1 ->
+// Vulkan binding 2) as well as ElevationMm.
 
 static const int64_t kCaveLatticeMm = 25600;
 static const int64_t kCaveNodeDepthMinMm = 9000;
@@ -2031,6 +2040,129 @@ static const uint CH_CAVE_WAYPOINT = 29;    // v24 edge waypoint offset + dip
 static const uint CH_CAVE_NODE_RADIUS = 50; // v24 per-node tube calibre
 static const uint CH_CAVE_ENTRANCE = 51;     // v25 cavity floor / axis rise / reach
 static const uint CH_CAVE_ENTRANCE_RIM = 52; // v25 rim noise, keyed on WORLD cells
+static const uint CH_CAVE_CREV_GATE = 56;    // v27 field-driven crevice gate
+
+// --- v27 (plan W5) field coupling: MIRROR of voxelcore/caves.h --------------
+// Read that header for WHY the field is sampled at the lattice node ANCHOR and
+// not at the querying column (an edge is seen from both sides and both sides
+// must agree), why the density term cannot break connectivity (the backbone is
+// unconditional), and why the roof guarantee moved from a two-constant
+// static_assert to a per-control-value cap. The code below is a line-for-line
+// transliteration of it.
+static const int64_t kCaveReliefLoMm = 2000;
+static const int64_t kCaveReliefHiMm = 16000;
+static const int kCaveFrostColdU8 = 121;  // climateTempU8FromDegC(-2)
+static const int kCaveFrostWarmU8 = 166;  // climateTempU8FromDegC(12)
+static const int64_t kCaveFrostBoostQ10 = 512;
+static const int64_t kCaveGateOne = 1048576; // 1 << 20
+static const int kCaveGateShift = 30;
+static const int64_t kCaveEdgeGateLoQ20 = kCaveGateOne / 8;
+static const int64_t kCaveEdgeGateHiQ20 = kCaveGateOne / 2;
+static const int64_t kCaveCalibreLoQ10 = 896;
+static const int64_t kCaveCalibreHiQ10 = 1462;
+static const int64_t kCaveCalibreRoofSlackMm = 100;
+static const int64_t kCrevGateLoQ20 = kCaveGateOne / 16;
+static const int64_t kCrevGateHiQ20 = kCaveGateOne / 3;
+static const int64_t kCrevUpLoQ10 = 768;
+static const int64_t kCrevUpHiQ10 = 1408;
+static const int64_t kCaveShaftGateLoQ20 = kCaveGateOne / 8;
+static const int64_t kCaveShaftGateHiQ20 = kCaveGateOne / 3;
+
+// vxc::CaveGates, in the order caves.h declares it.
+struct GpuCaveGates
+{
+    int64_t edgeGateQ20;
+    int64_t calibreQ10;
+    int64_t crevGateQ20;
+    int64_t crevUpQ10;
+    int64_t entranceGateQ20;
+};
+
+// vxc::caveSmoothQ10 bit-for-bit. Every operand is non-negative after the
+// clamp, so truncDiv matches the CPU's `/`.
+int64_t caveSmoothQ10(int64_t tQ10)
+{
+    const int64_t c = clamp64(tQ10, 0, 1024);
+    return truncDiv(c * c * (3 * 1024 - 2 * c), 1024 * 1024);
+}
+
+int64_t caveReliefQ10(int64_t reliefMm)
+{
+    if (reliefMm <= kCaveReliefLoMm) return (int64_t)0;
+    if (reliefMm >= kCaveReliefHiMm) return (int64_t)1024;
+    return caveSmoothQ10(truncDiv((reliefMm - kCaveReliefLoMm) * 1024,
+                                  kCaveReliefHiMm - kCaveReliefLoMm));
+}
+
+int64_t caveFrostQ10(int64_t tempU8)
+{
+    if (tempU8 <= (int64_t)kCaveFrostColdU8) return (int64_t)1024;
+    if (tempU8 >= (int64_t)kCaveFrostWarmU8) return (int64_t)0;
+    return caveSmoothQ10(truncDiv(((int64_t)kCaveFrostWarmU8 - tempU8) * 1024,
+                                  (int64_t)(kCaveFrostWarmU8 - kCaveFrostColdU8)));
+}
+
+int64_t caveFractureQ10(int64_t reliefQ10, int64_t frostQ10)
+{
+    return clamp64(reliefQ10 + truncDiv(frostQ10 * kCaveFrostBoostQ10, 1024), 0, 1024);
+}
+
+// vxc::caveLerpQ10. caves.h writes it with `/`, and tQ10 is non-negative while
+// every shipped gate has hi > lo, so truncDiv is both the match and the only
+// rounding that can occur.
+int64_t caveLerpQ10(int64_t lo, int64_t hi, int64_t tQ10)
+{
+    return lo + truncDiv((hi - lo) * tQ10, 1024);
+}
+
+// vxc::caveGateOpen. The SHIFT is load-bearing: bits 30..49 put v26's two gate
+// bits (48, 49) at the top of the window, so a threshold of kCaveGateOne/4 is
+// bit-for-bit v26's `((h >> 48) & 3) == 0`.
+bool caveGateOpen(uint64_t h, int shift, int64_t thresholdQ20)
+{
+    return (int64_t)((h >> shift) & 0xFFFFFULL) < thresholdQ20;
+}
+
+// vxc::caveScaledRadiusMm: the calibre gate and the depth-aware roof cap, which
+// are one rule. See caves.h for why capping at the control points bounds the
+// whole sub-segment (depth and radius interpolate at the same parameter).
+int64_t caveScaledRadiusMm(int64_t rawMm, int64_t calibreQ10, int64_t axisDepthMm)
+{
+    const int64_t scaled = truncDiv(rawMm * calibreQ10, 1024);
+    const int64_t cap = axisDepthMm - kCaveRoofMinMm - kCaveCalibreRoofSlackMm;
+    return scaled < cap ? scaled : cap;
+}
+
+// vxc::caveGatesFromField composed with vxc::Amplifier::caveFieldAt: the raster
+// taps AND the gate derivation, at lattice node (ni, nj).
+//
+// THE TAP CONTRACT, mirroring amplifier.cpp exactly: the sample point is the
+// node's LATTICE ANCHOR (a pure function of the node index, not of its jitter);
+// the climate read is NEAREST PIXEL -- not the faded bilinear blend ColumnMain
+// classifies biomes on -- and takes bio_1 from the low byte of the packed word;
+// the relief is carrier.h's relief30 over four RAW elevation reads at
+// +/- carrierReliefLagPx, i.e. the same value the detail gate is conditioned on.
+GpuCaveGates caveGatesAtNode(int64_t ni, int64_t nj)
+{
+    const int64_t fpx = floorDiv(ni * kCaveLatticeMm, (int64_t)PixelSizeMm);
+    const int64_t fpy = floorDiv(nj * kCaveLatticeMm, (int64_t)PixelSizeMm);
+    const int64_t lag = carrierReliefLagPx((int64_t)PixelSizeMm);
+    const int64_t reliefMm = carrierReliefMm(
+        (int64_t)rasterElevationMm(fpx - lag, fpy), (int64_t)rasterElevationMm(fpx + lag, fpy),
+        (int64_t)rasterElevationMm(fpx, fpy - lag), (int64_t)rasterElevationMm(fpx, fpy + lag));
+    const int64_t tempU8 = (int64_t)(rasterClimate(fpx, fpy) & 0xFFu);
+
+    const int64_t rQ = caveReliefQ10(reliefMm);
+    const int64_t fracQ = caveFractureQ10(rQ, caveFrostQ10(tempU8));
+
+    GpuCaveGates g;
+    g.edgeGateQ20 = caveLerpQ10(kCaveEdgeGateLoQ20, kCaveEdgeGateHiQ20, rQ);
+    g.calibreQ10 = caveLerpQ10(kCaveCalibreLoQ10, kCaveCalibreHiQ10, rQ);
+    g.crevGateQ20 = caveLerpQ10(kCrevGateLoQ20, kCrevGateHiQ20, fracQ);
+    g.crevUpQ10 = caveLerpQ10(kCrevUpLoQ10, kCrevUpHiQ10, fracQ);
+    g.entranceGateQ20 = caveLerpQ10(kCaveShaftGateLoQ20, kCaveShaftGateHiQ20, rQ);
+    return g;
+}
 
 struct GpuCaveColumn
 {
@@ -2067,12 +2199,16 @@ int64_t caveEntranceRimQ10(uint64_t seed, int64_t xMm, int64_t yMm)
     return 1024 - kCaveEntranceRimAmpQ10 + floorDiv(rv * (2 * kCaveEntranceRimAmpQ10), 1024);
 }
 
-// vxc::caveEdgeExists bit-for-bit.
-bool caveEdgeExists(uint64_t seed, int64_t ei, int64_t ej, int edir)
+// vxc::caveEdgeExists bit-for-bit. v27: the 1-in-N gate's rate is the SOURCE
+// NODE's field, never the querying column's -- an edge is looked at from both
+// sides and both sides must agree. Backbone edges stay unconditional, which is
+// what keeps the connectivity proof independent of the density field.
+bool caveEdgeExists(uint64_t seed, int64_t ei, int64_t ej, int edir, int64_t gateQ20)
 {
     if (edir == 0 && (ej & kCaveBackboneMask) == 0) return true;
     if (edir == 1 && (ei & kCaveBackboneMask) == 0) return true;
-    return ((hash2(seed, ei, ej * 2 + (int64_t)edir, CH_CAVE_EDGE) >> 48) & kCaveEdgeGateMask) == 0;
+    return caveGateOpen(hash2(seed, ei, ej * 2 + (int64_t)edir, CH_CAVE_EDGE), kCaveGateShift,
+                        gateQ20);
 }
 
 // vxc::caveEdgeRadiusMm bit-for-bit.
@@ -2119,7 +2255,11 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
     int64_t nodeX[16];
     int64_t nodeY[16];
     int64_t nodeD[16];
-    int64_t nodeR[16]; // v24 per-node calibre
+    int64_t nodeR[16]; // v24 per-node calibre, v27 field-scaled and roof-capped
+    // v27: each node's own gates, computed once and used for everything that
+    // node owns -- its calibre, its two outgoing edges, their crevices, and (if
+    // it is a backbone crossing) its entrance. Mirrors caves.h's `gates[16]`.
+    GpuCaveGates nodeG[16];
     for (int nj = 0; nj < 4; ++nj)
     {
         for (int ni = 0; ni < 4; ++ni)
@@ -2134,7 +2274,11 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                           (int64_t)((((hn >> 20) & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
             nodeD[nidx] = kCaveNodeDepthMinMm +
                           (int64_t)((((hn >> 40) & 0xFFFFFULL) * (uint64_t)kCaveNodeDepthSpanMm) >> 20);
-            nodeR[nidx] = caveNodeRadiusMm(seed, gi, gj);
+            nodeG[nidx] = caveGatesAtNode(gi, gj);
+            // Capped against the NODE's own depth: this control point is where
+            // the passage is shallowest, so it is where the cap actually binds.
+            nodeR[nidx] = caveScaledRadiusMm(caveNodeRadiusMm(seed, gi, gj),
+                                             nodeG[nidx].calibreQ10, nodeD[nidx]);
         }
     }
 
@@ -2144,9 +2288,10 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
         {
             const int64_t ei = ci - 1 + (int64_t)di;
             const int64_t ej = cj - 1 + (int64_t)dj;
+            const GpuCaveGates eg = nodeG[di + 4 * dj]; // the edge's SOURCE node
             for (int dir = 0; dir < 2; ++dir)
             {
-                if (!caveEdgeExists(seed, ei, ej, dir)) continue;
+                if (!caveEdgeExists(seed, ei, ej, dir, eg.edgeGateQ20)) continue;
                 const int aIdx = di + 4 * dj;
                 const int bIdx = (dir == 0) ? (di + 1 + 4 * dj) : (di + 4 * (dj + 1));
                 const int64_t axMm = nodeX[aIdx];
@@ -2172,7 +2317,10 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                 const int64_t wayDMm =
                     floorDiv(adMm + bdMm, 2) +
                     (int64_t)((((hw >> 40) & 0xFFFFFULL) * (uint64_t)kCaveWaypointDipMm) >> 20);
-                const int64_t edgeRMm = caveEdgeRadiusMm(seed, ei, ej, dir);
+                // v27: the MID calibre is capped against the WAYPOINT's depth,
+                // which is the control point it belongs to.
+                const int64_t edgeRMm = caveScaledRadiusMm(caveEdgeRadiusMm(seed, ei, ej, dir),
+                                                           eg.calibreQ10, wayDMm);
                 const int64_t arMm = nodeR[aIdx];
                 const int64_t brMm = nodeR[bIdx];
 
@@ -2221,28 +2369,40 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                     cc.segCount += 1;
                 }
 
-                // Crevice: a 1-in-8 gated thin vertical slab riding this same
+                // Crevice: a hash-gated thin vertical slab riding this same
                 // edge. Only reachable here because marginSq > 0 already put
                 // us within the (wider) tunnel radius of this axis, and
-                // kCrevHalfThickMaxMm < kCaveRadiusMinMm, so a column outside
-                // the tube is provably outside the crevice's narrower
-                // corridor too â€” no separate reject was skipped.
+                // kCrevHalfThickMaxMm < the smallest SCALED tunnel radius, so a
+                // column outside the tube is provably outside the crevice's
+                // narrower corridor too â€” no separate reject was skipped.
                 //
                 // caves.h computes this hash for every existing edge (its
                 // lattice block) and reads it only here; recomputing it lazily
                 // is the same pure function of (seed, i, j, dir), so the value
                 // is identical.
+                //
+                // v27: the GATE has moved to its own channel and its rate is the
+                // source node's FRACTURE budget (relief plus a frost boost). It
+                // could not stay a bit slice of crevH -- that hash's 64 bits are
+                // all spent on geometry, so a 20-bit rate window would have
+                // correlated presence with size. See caves.h CH_CAVE_CREV_GATE.
                 const uint64_t crevH = hash2(seed, ei, ej * 2 + (int64_t)dir, CH_CREVICE);
-                if (((crevH >> 61) & kCrevGateMask) == 0)
+                if (caveGateOpen(hash2(seed, ei, ej * 2 + (int64_t)dir, CH_CAVE_CREV_GATE), 44,
+                                 eg.crevGateQ20))
                 {
                     const int64_t tMm =
                         kCrevHalfThickMinMm +
                         (int64_t)(((crevH & 0xFFFFFULL) * (uint64_t)kCrevHalfThickSpanMm) >> 20);
                     if (ex * ex + ey * ey <= tMm * tMm)
                     {
-                        const int64_t hUpMm =
-                            kCrevUpMinMm +
-                            (int64_t)((((crevH >> 20) & 0xFFFFFULL) * (uint64_t)kCrevUpSpanMm) >> 20);
+                        // v27: the UPWARD reach is field-scaled; the downward
+                        // reach deliberately is not (it sets the cave pass's
+                        // whole depth envelope -- caves.h kCaveDeepestCarveMm).
+                        const int64_t hUpMm = truncDiv(
+                            (kCrevUpMinMm +
+                             (int64_t)((((crevH >> 20) & 0xFFFFFULL) * (uint64_t)kCrevUpSpanMm) >> 20)) *
+                                eg.crevUpQ10,
+                            1024);
                         const int64_t hDownMm =
                             kCrevDownMinMm +
                             (int64_t)((((crevH >> 40) & 0xFFFFFULL) * (uint64_t)kCrevDownSpanMm) >> 20);
@@ -2298,9 +2458,14 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
             const int64_t hi = ci - 1 + (int64_t)si;
             const int64_t hj = cj - 1 + (int64_t)sj;
             if ((hi & kCaveShaftNodeMask) != 0 || (hj & kCaveShaftNodeMask) != 0) continue;
-            const uint64_t hs = hash2(seed, hi, hj, CH_CAVE_SHAFT);
-            if (((hs >> 48) & kCaveShaftGateMask) != 0) continue;
             const int sIdx = si + 4 * sj;
+            const uint64_t hs = hash2(seed, hi, hj, CH_CAVE_SHAFT);
+            // v27: the entrance RATE is the node's field -- 1-in-8 on a plain,
+            // 1-in-2 in the mountains. At the neutral rate this is bit-for-bit
+            // v26's `((hs >> 48) & 3) == 0`; bits 30..47 were unused, so the
+            // wider window correlates the gate with nothing (in particular not
+            // with the throat radius in bits 0..19).
+            if (!caveGateOpen(hs, kCaveGateShift, nodeG[sIdx].entranceGateQ20)) continue;
             const uint64_t he = hash2(seed, hi, hj, CH_CAVE_ENTRANCE);
             const int64_t entFloorMm =
                 kCaveEntranceFloorMinMm +
@@ -2308,6 +2473,9 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
             const int64_t entOverMm =
                 kCaveEntranceOverMinMm +
                 (int64_t)((((he >> 20) & 0xFFFFFULL) * (uint64_t)kCaveEntranceOverSpanMm) >> 20);
+            // v27 note: the cavity FOOTPRINT is deliberately NOT field-scaled.
+            // See caves.h's "G5 MOUTH BUDGET" block for the measurement that
+            // dropped it -- it cost a roof-integrity bound.
             const int64_t entReachMm =
                 kCaveEntranceReachMinMm +
                 (int64_t)((((he >> 40) & 0xFFFFFULL) * (uint64_t)kCaveEntranceReachSpanMm) >> 20);

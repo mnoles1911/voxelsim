@@ -44,9 +44,25 @@ constexpr int32_t kFlatBedrockMm = 45000;    // 45 m â€” deliberately kept 
 // and is tested against the amplifier further down.
 constexpr auto kFlatSurfaceAt = [](int64_t, int64_t) -> int32_t { return kFlatSurfaceMm; };
 
+// The v27 field callback for the flat world, and it is NOT a neutral fixture:
+// a dead-flat, temperate world really does have relief 0 and ~10 C, so the flat
+// tests below now measure the SPARSEST arm of every W5 gate — 1-in-8 edges,
+// 0.875x calibre, 1-in-16 crevices, 1-in-8 entrances. That is deliberate. The
+// gates' floor is where the network has the least to work with, so it is the
+// interesting place to hold connectivity and the roof guarantee, and a test
+// that ran at the middle of the range would prove neither end.
+//
+// `kAlpineFieldAt` is the other end, for the tests that have to see both.
+constexpr CaveField kPlainField{climateTempU8FromDegC(10), 0};
+constexpr CaveField kAlpineField{climateTempU8FromDegC(-10), 20000};
+constexpr auto kFlatFieldAt = [](int64_t, int64_t) -> CaveField { return kPlainField; };
+constexpr auto kAlpineFieldAt = [](int64_t, int64_t) -> CaveField { return kAlpineField; };
+constexpr CaveGates kPlainGates = caveGatesFromField(kPlainField);
+constexpr CaveGates kAlpineGates = caveGatesFromField(kAlpineField);
+
 // Carve predicate for the flat world.
 bool flatCarve(int64_t vx, int64_t vy, int64_t vz) {
-    const CaveColumn c = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, kFlatSurfaceAt);
+    const CaveColumn c = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
     return caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz);
 }
 
@@ -64,7 +80,7 @@ bool flatCarve(int64_t vx, int64_t vy, int64_t vz) {
 bool firstOpenEntranceNode(int64_t i0, int64_t j0, int64_t span, int64_t& iOut, int64_t& jOut) {
     for (int64_t j = j0; j <= j0 + span; j += 4)
         for (int64_t i = i0; i <= i0 + span; i += 4)
-            if (((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0) {
+            if (caveEntranceGateOpen(kSeed, i, j, kPlainGates)) {
                 iOut = i;
                 jOut = j;
                 return true;
@@ -101,8 +117,8 @@ ComponentStats summarize(const ConnectivityResult& r) {
 VXC_TEST(cave_column_is_deterministic) {
     for (int64_t x = -4000; x <= 4000; x += 613)
         for (int64_t y = -4000; y <= 4000; y += 419) {
-            const CaveColumn a = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
-            const CaveColumn b = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn a = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
+            const CaveColumn b = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             CHECK_EQ(a.count, b.count);
             for (int32_t s = 0; s < a.count; ++s) {
                 CHECK_EQ(a.segs[s].marginSq, b.segs[s].marginSq);
@@ -133,8 +149,8 @@ VXC_TEST(cave_carve_is_deterministic_through_the_amplifier) {
     bool differs = false;
     for (int64_t x = -200; x <= 200 && !differs; x += 17)
         for (int64_t y = -200; y <= 200 && !differs; y += 19) {
-            const CaveColumn ac = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
-            const CaveColumn cc = caveColumnFor(kSeed + 1, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn ac = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
+            const CaveColumn cc = caveColumnFor(kSeed + 1, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             if (ac.count != cc.count) differs = true;
             else
                 for (int32_t s = 0; s < ac.count; ++s)
@@ -154,7 +170,7 @@ VXC_TEST(cave_golden_digest) {
     Digest d;
     for (int64_t y = -640; y < 640; y += 37) {
         for (int64_t x = -640; x < 640; x += 41) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             d.u32(static_cast<uint32_t>(c.count));
             for (int32_t s = 0; s < c.count; ++s) {
                 d.u32(static_cast<uint32_t>(c.segs[s].marginSq));
@@ -185,7 +201,7 @@ VXC_TEST(cave_golden_digest) {
     for (int64_t dy = -140; dy <= 140; dy += 7)
         for (int64_t dx = -140; dx <= 140; dx += 7) {
             const CaveColumn c =
-                caveColumnFor(kSeed, envx + dx, envy + dy, kFlatSurfaceMm, kFlatSurfaceAt);
+                caveColumnFor(kSeed, envx + dx, envy + dy, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             if (c.shaftMarginSq > 0) ++entranceColumnsDigested;
             d.u32(static_cast<uint32_t>(c.shaftMarginSq));
             d.u32(static_cast<uint32_t>(c.shaftDepthMinMm));
@@ -210,7 +226,7 @@ VXC_TEST(cave_golden_digest) {
     // this pin by vxc_caveprobe (plan-view and cross-section images plus the
     // per-family census) and by vxc_gpu, whose new cave-band fixture compares
     // the cave voxels themselves for the first time.
-    CHECK_EQ(d.h, 0x6FF4E353EA1E63E4ull);
+    CHECK_EQ(d.h, 0xE9A1F7CD29499B96ull);
 }
 
 // --- safety rule 1: the bedrock floor is never breached ----------------------
@@ -255,7 +271,7 @@ VXC_TEST(cave_bedrock_margin_clamp_refuses_a_shallow_bedrock_column) {
     int64_t tested = 0;
     for (int64_t x = 0; x < 512; x += 3)
         for (int64_t y = 0; y < 512; y += 5) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             if (c.count == 0) continue;
             for (int64_t vz = 560; vz < 960; ++vz) {
                 if (!caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz)) continue;
@@ -279,7 +295,7 @@ VXC_TEST(cave_never_carves_at_or_below_sea_level_or_in_coastal_columns) {
     for (int32_t surfaceMm = -40000; surfaceMm < kCaveMinSurfaceMm; surfaceMm += 271)
         for (int64_t x = 0; x < 256; x += 37)
             for (int64_t y = 0; y < 256; y += 41) {
-                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt);
+                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt, kFlatFieldAt);
                 ++oceanColumns;
                 CHECK_EQ(c.count, 0);
                 CHECK_EQ(c.shaftMarginSq, 0);
@@ -291,7 +307,7 @@ VXC_TEST(cave_never_carves_at_or_below_sea_level_or_in_coastal_columns) {
     for (int32_t surfaceMm = kCaveMinSurfaceMm; surfaceMm < 60000; surfaceMm += 311)
         for (int64_t x = 0; x < 256; x += 19)
             for (int64_t y = 0; y < 256; y += 23) {
-                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt);
+                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt, kFlatFieldAt);
                 for (int64_t vz = -400; vz < kCaveMinVoxelZ; vz += 3) {
                     CHECK(!caveCarveAt(c, surfaceMm, 45000, vz));
                     ++subSeaChecks;
@@ -429,7 +445,7 @@ VXC_TEST(cave_segment_cap_headroom) {
     size_t columns = 0, withAny = 0;
     for (int64_t x = -2048; x < 2048; x += 3)
         for (int64_t y = -2048; y < 2048; y += 7) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             ++columns;
             if (c.count > 0) ++withAny;
             if (c.count > maxSegs) maxSegs = c.count;
@@ -443,21 +459,45 @@ VXC_TEST(cave_segment_cap_headroom) {
 
 // --- crevices (M4 cave pass v2, docs/cavern-design.md Â§4) -------------------
 
-VXC_TEST(crevice_gate_rate_is_about_one_in_eight) {
+VXC_TEST(crevice_gate_rate_tracks_the_fracture_field) {
     // Direct hash-level check, independent of whether any particular edge
-    // exists: the gate itself should open close to 1/8 of the time.
-    int64_t total = 0, open = 0;
-    for (int64_t i = -400; i < 400; ++i)
-        for (int64_t j = -400; j < 400; j += 7)
-            for (int32_t dir = 0; dir < 2; ++dir) {
-                ++total;
-                if (caveCreviceGateOpen(caveCreviceHash(kSeed, i, j, dir))) ++open;
-            }
-    const double rate = double(open) / double(total);
-    std::printf("    [caves] crevice gate: %lld/%lld open (%.3f%%, target 12.5%%)\n",
-                static_cast<long long>(open), static_cast<long long>(total), 100.0 * rate);
-    CHECK(rate > 0.10);
-    CHECK(rate < 0.15);
+    // exists. v27: the gate is no longer a fixed 1-in-8 — its rate is the
+    // source node's FRACTURE budget — so this measures THREE rates and pins
+    // each against the threshold its own arm asks for.
+    //
+    // The NEUTRAL arm is the one that carries the v26 claim forward: the gate
+    // moved channel (CH_CAVE_CREV_GATE, and caves.h says why it had to), so the
+    // control cannot reproduce v26's draws. It must still reproduce its RATE,
+    // and that is the thing this arm is here to check.
+    struct Arm {
+        const char* name;
+        CaveGates gates;
+        double lo, hi;
+    };
+    const Arm arms[] = {
+        {"plain (relief 0, 10 C)", kPlainGates, 0.045, 0.085},     // 1-in-16 = 6.25%
+        {"neutral (v26 control)", kCaveGatesNeutral, 0.10, 0.15},  // 1-in-8  = 12.5%
+        {"alpine (relief 20 m, -10 C)", kAlpineGates, 0.28, 0.39}, // 1-in-3  = 33.3%
+    };
+    for (const Arm& arm : arms) {
+        int64_t total = 0, open = 0;
+        for (int64_t i = -400; i < 400; ++i)
+            for (int64_t j = -400; j < 400; j += 7)
+                for (int32_t dir = 0; dir < 2; ++dir) {
+                    ++total;
+                    if (caveCreviceGateOpen(kSeed, i, j, dir, arm.gates.crevGateQ20)) ++open;
+                }
+        const double rate = double(open) / double(total);
+        std::printf("    [caves] crevice gate %-28s %lld/%lld open (%.3f%%, threshold %.3f%%)\n",
+                    arm.name, static_cast<long long>(open), static_cast<long long>(total),
+                    100.0 * rate, 100.0 * double(arm.gates.crevGateQ20) / double(kCaveGateOne));
+        CHECK(rate > arm.lo);
+        CHECK(rate < arm.hi);
+    }
+    // The point of the coupling, as an ORDERING rather than three unrelated
+    // numbers: a plain fractures less than the v26 world, a mountain more.
+    CHECK(kPlainGates.crevGateQ20 < kCaveGatesNeutral.crevGateQ20);
+    CHECK(kCaveGatesNeutral.crevGateQ20 < kAlpineGates.crevGateQ20);
 }
 
 VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
@@ -471,9 +511,9 @@ VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
     for (int64_t j = 0; j <= 40 && edgesChecked < 20; j += 4) {
         for (int64_t i = 0; i <= 40 && edgesChecked < 20; ++i) {
             for (int32_t dir = 0; dir < 2 && edgesChecked < 20; ++dir) {
-                if (!caveEdgeExists(kSeed, i, j, dir)) continue;
+                if (!caveEdgeExists(kSeed, i, j, dir, kPlainGates.edgeGateQ20)) continue;
                 const uint64_t crevH = caveCreviceHash(kSeed, i, j, dir);
-                if (!caveCreviceGateOpen(crevH)) continue;
+                if (!caveCreviceGateOpen(kSeed, i, j, dir, kPlainGates.crevGateQ20)) continue;
                 ++edgesChecked;
 
                 const CaveNode a = caveNode(kSeed, i, j);
@@ -485,16 +525,20 @@ VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
                 const int64_t tMm =
                     kCrevHalfThickMinMm +
                     static_cast<int64_t>(((crevH & 0xFFFFFu) * static_cast<uint64_t>(kCrevHalfThickSpanMm)) >> 20);
-                const int64_t hUpMm =
+                // v27: the UP reach is field-scaled. This arm is the plain
+                // (0.75x), which is also the tightest case for the "the slab
+                // still contains its own tube axis" claim below.
+                const int64_t hUpRawMm =
                     kCrevUpMinMm + static_cast<int64_t>((((crevH >> 20) & 0xFFFFFu) *
                                                           static_cast<uint64_t>(kCrevUpSpanMm)) >> 20);
+                const int64_t hUpMm = hUpRawMm * kPlainGates.crevUpQ10 / 1024;
                 const int64_t hDownMm =
                     kCrevDownMinMm + static_cast<int64_t>((((crevH >> 40) & 0xFFFFFu) *
                                                             static_cast<uint64_t>(kCrevDownSpanMm)) >> 20);
                 CHECK(tMm >= kCrevHalfThickMinMm);
                 CHECK(tMm < kCrevHalfThickMinMm + kCrevHalfThickSpanMm);
-                CHECK(hUpMm >= kCrevUpMinMm);
-                CHECK(hUpMm < kCrevUpMinMm + kCrevUpSpanMm);
+                CHECK(hUpRawMm >= kCrevUpMinMm);
+                CHECK(hUpRawMm < kCrevUpMinMm + kCrevUpSpanMm);
                 CHECK(hDownMm >= kCrevDownMinMm);
                 CHECK(hDownMm < kCrevDownMinMm + kCrevDownSpanMm);
 
@@ -548,7 +592,7 @@ VXC_TEST(crevice_segments_actually_appear_in_caveColumnFor) {
     for (int64_t x = -4096; x < 4096; x += 3)
         for (int64_t y = -4096; y < 4096; y += 5) {
             ++columns;
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             if (c.count > maxSegs) maxSegs = c.count;
         }
     std::printf("    [caves] crevice presence: max %d segs/column over %zu columns "
@@ -656,7 +700,7 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
     bool found = false;
     for (int64_t j = 0; j <= 64 && !found; j += 4)
         for (int64_t i = 0; i <= 64 && !found; i += 4)
-            if ((((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0)) {
+            if (caveEntranceGateOpen(kSeed, i, j, kPlainGates)) {
                 si = i;
                 sj = j;
                 found = true;
@@ -667,7 +711,7 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
     // The shaft column: carved from the surface all the way down to the node.
     const int64_t nvx = floorDiv(node.xMm, int64_t(kVoxelSizeMm));
     const int64_t nvy = floorDiv(node.yMm, int64_t(kVoxelSizeMm));
-    const CaveColumn shaftCol = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt);
+    const CaveColumn shaftCol = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
     CHECK(shaftCol.shaftMarginSq > 0);
     CHECK(shaftCol.count > 0); // backbone tunnels meet at a shaft node, by construction
     const int64_t topVz = floorDiv(kFlatSurfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
@@ -723,7 +767,7 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
 // while keeping the three things the cylinder was carrying, and these tests are
 // what stop a later tune quietly dropping one of them.
 
-VXC_TEST(cave_entrance_rate_and_daylight_are_unchanged_from_v24) {
+VXC_TEST(cave_entrance_rate_tracks_the_field_and_daylight_is_unconditional) {
     // GUARANTEE 1 (entrance rate) and GUARANTEE 2 (structural connectivity),
     // both stated over EVERY open site in a wide sample rather than over one.
     //
@@ -735,12 +779,12 @@ VXC_TEST(cave_entrance_rate_and_daylight_are_unchanged_from_v24) {
     for (int64_t j = -128; j <= 128; j += 4)
         for (int64_t i = -128; i <= 128; i += 4) {
             ++candidates;
-            if (((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) != 0) continue;
+            if (!caveEntranceGateOpen(kSeed, i, j, kPlainGates)) continue;
             ++opened;
             const CaveNode n = caveNode(kSeed, i, j);
             const int64_t nvx = floorDiv(n.xMm, int64_t(kVoxelSizeMm));
             const int64_t nvy = floorDiv(n.yMm, int64_t(kVoxelSizeMm));
-            const CaveColumn c = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn c = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             const int64_t topVz = floorDiv(kFlatSurfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             // Open to the sky directly over the node...
             if (caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, topVz)) ++daylit;
@@ -760,11 +804,43 @@ VXC_TEST(cave_entrance_rate_and_daylight_are_unchanged_from_v24) {
                 (long long)opened, (long long)candidates, (long long)daylit,
                 (long long)reachesNode);
     CHECK(opened > 0);
-    // The gate is 1-in-4 on two bits, so over 4225 candidates the count sits
-    // near a quarter. Bounds are wide on purpose: this is a statement about the
-    // GATE being untouched, not about the hash's fine balance.
-    CHECK(opened * 5 > candidates);
-    CHECK(opened * 3 < candidates);
+    // v27: the rate is the FIELD's, and this world is flat and temperate, so
+    // the arm being counted is the plain's 1-in-8. Bounds stay wide on purpose:
+    // this is a statement about which gate fired, not about the hash's fine
+    // balance.
+    CHECK(opened * 12 > candidates); // > 1-in-12
+    CHECK(opened * 6 < candidates);  // < 1-in-6
+    // THE ORDERING IS THE CLAIM, and it is measured on the same candidate set
+    // rather than asserted from the constants: a plain opens fewer sites than
+    // the v26 world, a mountain opens more, and every one of them is still an
+    // entrance (the daylight checks below run on the plain arm, which is the
+    // sparsest and therefore the one where a sealed site would hide).
+    int64_t openedNeutral = 0, openedAlpine = 0;
+    for (int64_t j = -128; j <= 128; j += 4)
+        for (int64_t i = -128; i <= 128; i += 4) {
+            if (caveEntranceGateOpen(kSeed, i, j, kCaveGatesNeutral)) ++openedNeutral;
+            if (caveEntranceGateOpen(kSeed, i, j, kAlpineGates)) ++openedAlpine;
+        }
+    std::printf("    [caves] entrance rate by field: plain %lld, v26 control %lld, alpine %lld "
+                "(of %lld candidates)\n",
+                (long long)opened, (long long)openedNeutral, (long long)openedAlpine,
+                (long long)candidates);
+    CHECK(opened < openedNeutral);
+    CHECK(openedNeutral < openedAlpine);
+    // The control arm must still be v26's 1-in-4 -- and BIT-IDENTICALLY so, not
+    // merely at the same rate. caves.h positions the threshold window so the
+    // neutral test is the same predicate v26 wrote by hand; if that ever stops
+    // being true, cave_families.h's W5 control stops being a single-term
+    // difference and every W5 number becomes a two-build comparison.
+    int64_t v26Opened = 0, disagreements = 0;
+    for (int64_t j = -128; j <= 128; j += 4)
+        for (int64_t i = -128; i <= 128; i += 4) {
+            const bool v26 = ((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & 3u) == 0;
+            if (v26) ++v26Opened;
+            if (v26 != caveEntranceGateOpen(kSeed, i, j, kCaveGatesNeutral)) ++disagreements;
+        }
+    CHECK_EQ(disagreements, 0);
+    CHECK_EQ(v26Opened, openedNeutral);
     // EVERY open site is an entrance. Not "most": the throat is unconditional,
     // so one failure here means the daylight guarantee has become conditional
     // on arithmetic somewhere and the network is free to seal itself.
@@ -796,7 +872,7 @@ VXC_TEST(cave_entrance_is_a_cavity_with_a_roof_not_a_bore) {
     for (int64_t dy = -160; dy <= 160; ++dy)
         for (int64_t dx = -160; dx <= 160; ++dx) {
             const CaveColumn c =
-                caveColumnFor(kSeed, nvx + dx, nvy + dy, kFlatSurfaceMm, kFlatSurfaceAt);
+                caveColumnFor(kSeed, nvx + dx, nvy + dy, kFlatSurfaceMm, kFlatSurfaceAt, kFlatFieldAt);
             if (c.shaftMarginSq <= 0) continue;
             ++footprint;
             if (c.shaftDepthMinMm > 0) ++roofed; else ++opened;
@@ -1014,7 +1090,7 @@ VXC_TEST(cave_family_attribution_is_exact) {
     for (int64_t x = -512; x <= 512; x += 7)
         for (int64_t y = -512; y <= 512; y += 11) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn(), amp.fieldAtFn());
             ++columns;
             if (cv.full.count != col.cave.count ||
                 cv.full.shaftMarginSq != col.cave.shaftMarginSq ||
@@ -1060,7 +1136,7 @@ VXC_TEST(cave_per_family_volume_and_entrance_census) {
     for (int64_t x = -1024; x <= 1024; x += 11)
         for (int64_t y = -1024; y <= 1024; y += 13) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn(), amp.fieldAtFn());
             ++columns;
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             uint32_t colMask = 0;
@@ -1132,7 +1208,7 @@ VXC_TEST(cave_floor_area_and_headroom_budget) {
     for (int64_t x = -1024; x <= 1024; x += 11)
         for (int64_t y = -1024; y <= 1024; y += 13) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn(), amp.fieldAtFn());
             ++columns;
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             for (int64_t k = 0; k <= 450; ++k) {

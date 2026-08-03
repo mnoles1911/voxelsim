@@ -69,9 +69,10 @@ enum : uint32_t {
 inline constexpr uint32_t kCaveFamilyPriority[kCaveFamilyCount] = {
     CAVE_FAM_SHAFT, CAVE_FAM_CAVERN, CAVE_FAM_TUNNEL, CAVE_FAM_CREVICE};
 
-// A crevHash whose gate is CLOSED. caveCreviceGateOpen tests
-// ((h >> 61) & kCrevGateMask) == 0, so any value with a set bit in 61..63
-// closes it for every seed.
+// v27: the crevice GATE is no longer a bit of crevHash (it moved to its own
+// channel, caves.h CH_CAVE_CREV_GATE), so the tunnel-only variant closes the
+// lattice edge's `crevOpen` flag directly instead of poisoning a hash. Same
+// property, one indirection fewer: the tunnel emission never reads either.
 inline constexpr uint64_t kCaveCrevHashClosed = 1ull << 61;
 
 struct CaveColumnVariants {
@@ -158,22 +159,60 @@ inline CavernColumn cavernColumnWithoutChamberShape(uint64_t seed, const CavernC
         });
 }
 
+// THE v26 FIELD COUPLING — i.e. NONE — OUT OF THE v27 WORLD. The control panel
+// for W5's A/B, and the reason every W5 number is a difference.
+//
+// WHY IT HAS TO BE A DIFFERENCE, in the same shape as W3's and W4's. "Mountains
+// have more and bigger caves than desert plains" is a claim about numbers
+// moving in opposite directions at two places. Measuring the shipping arm at
+// two places and reporting the ratio would be satisfied by things that are not
+// the coupling at all: a mountain has more SOLID BAND per column to carve into
+// (its surface is higher above the bedrock band and above sea level), its
+// steeper ground truncates entrances differently, and its columns clip the
+// sample region differently. All three were already true at v26, when the cave
+// pass read nothing about the place.
+//
+// So both arms are reduced on the SAME columns, the same terrain, the same
+// seed, the same shipping predicate, and differ in exactly one thing: whether
+// the six gate values come from the field or from kCaveGatesNeutral. Neutral is
+// not a fixture value — it is v26's rates, and for the edge and entrance gates
+// it is v26's exact draws (caves.h caveGateOpen explains how a threshold
+// reproduces a two-bit test). The crevice gate is rate-identical only, because
+// its channel moved; that one exception is stated at CH_CAVE_CREV_GATE rather
+// than left for someone to find.
+//
+// Nothing here edits worldgen, nothing here is mirrored in the shader, and
+// nothing here can move a digest.
 template <typename SurfaceFn>
+inline CaveLattice caveLatticeWithoutFieldCoupling(uint64_t seed, int64_t ci, int64_t cj,
+                                                   const SurfaceFn& surfaceAt) {
+    return caveLatticeForGates(seed, ci, cj, surfaceAt,
+                               [](int64_t, int64_t) { return kCaveGatesNeutral; });
+}
+
+template <typename SurfaceFn, typename FieldFn>
 inline CaveColumnVariants caveColumnVariantsFor(uint64_t seed, int64_t vx, int64_t vy,
                                                 int32_t surfaceMm, const SurfaceFn& surfaceAt,
-                                                bool entranceCavityOff = false) {
+                                                const FieldFn& fieldAt,
+                                                bool entranceCavityOff = false,
+                                                bool fieldCouplingOff = false) {
     CaveColumnVariants out;
     if (surfaceMm < kCaveMinSurfaceMm) return out; // caveColumnFor's own guard
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    const CaveLattice L = entranceCavityOff
-                              ? caveLatticeWithoutEntranceCavity(caveLatticeFor(seed, ci, cj, surfaceAt))
-                              : caveLatticeFor(seed, ci, cj, surfaceAt);
+    const CaveLattice base = fieldCouplingOff
+                                 ? caveLatticeWithoutFieldCoupling(seed, ci, cj, surfaceAt)
+                                 : caveLatticeFor(seed, ci, cj, surfaceAt, fieldAt);
+    const CaveLattice L =
+        entranceCavityOff ? caveLatticeWithoutEntranceCavity(base) : base;
 
     CaveLattice lns = L;
     lns.shaftNodeSlot = -1;
     CaveLattice lt = lns;
-    for (CaveLatticeEdge& e : lt.edges) e.crevHash = kCaveCrevHashClosed;
+    for (CaveLatticeEdge& e : lt.edges) {
+        e.crevHash = kCaveCrevHashClosed;
+        e.crevOpen = false;
+    }
 
     out.full = caveColumnFromLattice(seed, L, vx, vy, surfaceMm);
     out.tunCrev = caveColumnFromLattice(seed, lns, vx, vy, surfaceMm);

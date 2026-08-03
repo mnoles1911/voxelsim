@@ -38,6 +38,12 @@ constexpr int32_t kFlatBedrockMm = 250000; // 250 m â€” comfortably past th
 
 int32_t flatSurfaceAt(int64_t, int64_t) { return kFlatSurfaceMm; }
 
+// v27: the cave pass's coupling field (caves.h CaveField). The cavern pass does
+// NOT read it — W5 couples G1/G3/G5 and leaves G2 to W6 — so this exists only
+// for the tunnel-network calls the cavern tests make alongside their own.
+// Flat, temperate ground: relief 0, ~10 C.
+CaveField flatFieldAt(int64_t, int64_t) { return CaveField{climateTempU8FromDegC(10), 0}; }
+
 CavernColumn flatCavernColumnFor(int64_t vx, int64_t vy) {
     return cavernColumnFor(kSeed, vx, vy, kFlatSurfaceMm, flatSurfaceAt);
 }
@@ -49,7 +55,7 @@ bool flatCavernCarve(int64_t vx, int64_t vy, int64_t vz) {
 
 bool flatEitherCarve(int64_t vx, int64_t vy, int64_t vz) {
     if (flatCavernCarve(vx, vy, vz)) return true;
-    const CaveColumn tc = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, flatSurfaceAt);
+    const CaveColumn tc = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, flatSurfaceAt, flatFieldAt);
     return caveCarveAt(tc, kFlatSurfaceMm, kFlatBedrockMm, vz);
 }
 
@@ -275,7 +281,7 @@ VXC_TEST(cavern_anchor_point_is_carved_by_both_cavern_and_tunnel_systems) {
             const int64_t anchorVz = floorDiv(site.anchorZMm - kVoxelSizeMm / 2, int64_t(kVoxelSizeMm));
 
             const CavernColumn cc = flatCavernColumnFor(anchorVx, anchorVy);
-            const CaveColumn tc = caveColumnFor(kSeed, anchorVx, anchorVy, kFlatSurfaceMm, flatSurfaceAt);
+            const CaveColumn tc = caveColumnFor(kSeed, anchorVx, anchorVy, kFlatSurfaceMm, flatSurfaceAt, flatFieldAt);
             CHECK(cc.count > 0);
             CHECK(tc.count > 0); // backbone-crossing node -> 4 incident tunnels
             CHECK(cavernCarveAt(cc, kFlatSurfaceMm, kFlatBedrockMm, anchorVz));
@@ -360,7 +366,7 @@ VXC_TEST(cavern_flood_fill_shares_a_component_with_the_wider_tunnel_network) {
             if (dSq > furthestMm * furthestMm) furthestMm = cavernIsqrt(dSq);
             if (reachesTunnel) continue;
             if (flatCavernCarve(wx, wy, wz)) continue; // inside a room: not the proof
-            const CaveColumn tc = caveColumnFor(kSeed, wx, wy, kFlatSurfaceMm, flatSurfaceAt);
+            const CaveColumn tc = caveColumnFor(kSeed, wx, wy, kFlatSurfaceMm, flatSurfaceAt, flatFieldAt);
             if (caveCarveAt(tc, kFlatSurfaceMm, kFlatBedrockMm, wz)) reachesTunnel = true;
         }
     }

@@ -64,7 +64,25 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   51       caves.h            CH_CAVE_ENTRANCE     (v25 entrance cavity)
 //   52       caves.h            CH_CAVE_ENTRANCE_RIM (v25, keyed on WORLD cells,
 //                                            not on a lattice node)
-//   53..     FREE
+//   53       caverns.h          CH_CAVERN_SHAPE      (v26 chamber shape)
+//   54       caverns.h          CH_CAVERN_PILLAR     (v26, keyed on a world 8 m
+//                                            pillar cell)
+//   55       caverns.h          CH_CAVERN_BREAKDOWN  (v26, keyed on a world
+//                                            3.2 m noise lattice)
+//   56       caves.h            CH_CAVE_CREV_GATE    (v27 field-driven crevice
+//                                            gate; CH_CREVICE had no spare bits
+//                                            wide enough for a rate window that
+//                                            did not correlate with its own
+//                                            geometry fields)
+//   57..     FREE
+//
+// TABLE HYGIENE, recorded because it nearly cost a double allocation: v26's
+// three cavern channels were registered in hash_channel_registry.h (the
+// machine-checked twin) but NEVER added to this table, which still read
+// "53.. FREE" when W5 came to pick an id. The static_assert would have caught
+// it at build time -- that is what it is for -- but the table is the thing
+// people read first, so it is the thing that has to be right. If the two ever
+// disagree again, the static_assert is still the one that is right.
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a

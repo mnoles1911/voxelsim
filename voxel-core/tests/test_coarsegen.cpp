@@ -226,7 +226,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x437FD87987A5814Dull);
+    CHECK_EQ(d, 0x6F406B134FD82893ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -309,7 +309,23 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // of a 512-cell sample on grades real tiles do not reach, and occupancy IS
     // silhouette and collision, so if LOD popping shows up at the L1 transition on
     // a real mountainside this is the number to start from.
-    const int64_t occCeilPermille[5] = {0, 70, 65, 28, 25};
+    // v27 (plan W5, field coupling) moved L4 and only L4: measured 48/48/13/35
+    // against v16's 68/48/26/20. L1 and L3 IMPROVED, L2 is unchanged, and L4
+    // rose 20 -> 35, so the ceiling goes to 38 -- just above the measurement, on
+    // the same terms every earlier movement of this array was accepted.
+    //
+    // The mechanism is specific and worth naming rather than shrugging at: W5
+    // gates cave density and calibre on RELIEF, and this fixture's synthetic
+    // tiles are high-relief nearly everywhere, so it sits at the top of both
+    // gates -- more edges open and tubes up to 1.43x wider. An L4 cell is 1.6 m
+    // of fine voxels, which is comparable to a tube RADIUS, so that is exactly
+    // the level where "did the representative column happen to fall inside a
+    // tube?" starts to disagree with the cell's average. It is a LOD-fidelity
+    // cost of more void, not a new mechanism, and it is bounded by the same
+    // caveat the L1 note already carries: these are synthetic grades real tiles
+    // do not reach. If popping shows up at the L4 ring on a real mountainside,
+    // this is the number to start from.
+    const int64_t occCeilPermille[5] = {0, 70, 65, 28, 38};
     // v10 raised L3 from 85 to 135. This is a REAL fidelity regression and is
     // recorded as one rather than absorbed: measured L3 material mismatch went
     // 85 -> 125 per mille when the bedding term landed.

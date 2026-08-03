@@ -211,6 +211,18 @@ public:
         };
     }
 
+    // The W5 coupling field (voxelcore/caves.h CaveField) at a world-mm
+    // position: the relief and the temperature the cave pass gates on. Same
+    // shape and same reason as surfaceAtFn above — instruments must reduce a
+    // column with the identical function the amplifier used, or they measure a
+    // world nobody is building. See the definition in amplifier.cpp for why it
+    // is a nearest-pixel read rather than the blend column() classifies on.
+    CaveField caveFieldAt(int64_t xMm, int64_t yMm) const;
+
+    auto fieldAtFn() const {
+        return [this](int64_t xMm, int64_t yMm) -> CaveField { return caveFieldAt(xMm, yMm); };
+    }
+
     // A PROVABLE UPPER BOUND on the DISPLACED surface over every column in the
     // inclusive voxel-index rectangle [vx0, vx1] x [vy0, vy1] — i.e.
     //

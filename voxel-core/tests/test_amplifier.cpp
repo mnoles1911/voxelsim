@@ -167,8 +167,16 @@ VXC_TEST(amplifier_stratigraphy_ordering) {
             const int64_t bandFloorVz = nominalTopVz(col) - kBandVox;
             CHECK_EQ(Amplifier::stratigraphyAt(col, topVz + 1), MAT_AIR);
             CHECK(Amplifier::stratigraphyAt(col, topVz) != MAT_AIR);
-            // The surface shell itself is never carved (roof clamp).
-            CHECK(Amplifier::materialAt(col, topVz) != MAT_AIR);
+            // The surface shell is never carved by a TUNNEL (roof clamp) — but
+            // an ENTRANCE CAVITY is the one enumerated exception to that clamp
+            // (caves.h kCaveShaftNodeMask), and it always was: this line read
+            // "the surface shell itself is never carved" and was true only
+            // because none of the 121 sampled columns happened to sit inside an
+            // entrance footprint. v27 raised the entrance rate on high-relief
+            // ground and one of them promptly did, which is the only reason
+            // anyone found out. The claim is now the true one, stated with the
+            // exception it always had.
+            if (col.cave.shaftMarginSq == 0) CHECK(Amplifier::materialAt(col, topVz) != MAT_AIR);
             bool leftTopLayer = false;
             for (int64_t vz = topVz; vz > topVz - 1200; vz -= 7) {
                 const MaterialId m = Amplifier::stratigraphyAt(col, vz);
@@ -423,7 +431,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
     //  rejected before it shipped -- see the Wave C retry notes;
     //  0xA429D263050DB344 at v12..v25)
-    CHECK_EQ(d.h, 0x7FDF3F7675524C5Full);
+    CHECK_EQ(d.h, 0x2F4EBFAF25CA8EC3ull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {
@@ -1096,6 +1104,6 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     // work to do, since the band genuinely puts air below surfaceMm.
     // (was 0xE9D395DF74D61495 at v5, 0x6E19AE5BC47B4E45 at v6..v11; -350 mm now,
     //  not the -700 the first cut of v12 gave it)
-    CHECK_EQ(d.h, 0x94F4B64F8B4E95D8ull);
+    CHECK_EQ(d.h, 0x99DC2ABBA30DD4A8ull);
 }
 

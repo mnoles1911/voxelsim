@@ -930,6 +930,77 @@ harness runs per-item on branch builds, the version event ships once.
   *Verify: tunnel-interior + aerial pairs at tundra vs savanna vs a
   high-relief site; the W1 plan-view at both showing density difference; global
   volume within budget.*
+
+  **LANDED at kWorldGenVersion 27, PARTIALLY VERIFIED, and the underground
+  work is being shelved after it** — the owner rejected the v25 entrance and
+  v26 chamber SHAPES ("incredibly unnatural, stamped geometric shapes … Same
+  with doline"), and `docs/underground-entrance-rework-plan.md` carries that
+  diagnosis. **W5 is orthogonal to it and survives**: field coupling is about
+  WHERE caves are dense and wide, not about what shape they are, and that doc
+  lists it as still wanted. The numbers below outlive the shapes.
+
+  Six gates ship, all keyed on the lattice NODE (never on the querying column
+  — an edge is seen from both sides and both sides must agree), sampled at the
+  node's lattice ANCHOR: G1 density 1-in-8 … 1-in-2, G1 calibre 0.875× … 1.428×
+  (realised radius [1.05, 2.45] m on a plain, [1.71, 4.00] m alpine), G3
+  crevice rate 1-in-16 … 1-in-3 and G3 upward reach 0.75× … 1.375× (both on
+  relief PLUS a weighted frost boost), G5 entrance rate 1-in-8 … 1-in-3.
+
+  **Measured, one world, gates off vs on** (`vxc_caveprobe --field-off`, seed
+  20260719, synthetic sampler, 819.2 m box —
+  `docs/measurements/w5-field-coupling-2026-08-03.txt`): carved volume
+  **1.440% → 2.727%** of the 6–45 m band; tunnel **1.117% → 2.300%**; crevice
+  **0.049% → 0.160%**; tunnel axis length per km² 44,473 → 53,496 m (that is
+  the density term) against a 2.06× volume rise (so the rest is calibre);
+  tunnel floor area 133,002 → 213,732 m²/km². Global volume is **within
+  budget** — 2.727% against the 15% ctest ceiling, 5.5× of headroom — and the
+  carve DEPTH envelope does not move at all.
+
+  **Three things that did NOT move, reported because they are the honest
+  half.** The thinnest non-entrance roof is 6.0 m in both arms against a 6.0 m
+  clamp — that is the measurement that the new *depth-aware calibre cap* holds,
+  which had to replace v26's two-constant roof static_assert (9 m of cover
+  cannot hold a 4 m tube above a 6 m clamp by arithmetic). Perforated surface
+  moved 5%, i.e. the ground is no more of a colander than at v26. And
+  **entrance density is not demonstrated**: 20 open sites → 19, because this
+  fixture's relief sits near the middle of the ramp where the gate is close to
+  v26's 1-in-4. The SET changed, the COUNT did not, and no claim is made for
+  that half of G5 without a real-tile run.
+
+  **A term was tried, measured and DROPPED**: a relief multiplier on the
+  entrance cavity's footprint. At 1.25× (1.5625× of area) it took the two
+  roof-integrity bounds shipped since v25 from comfortable to failing —
+  footprint over a cavity 3.96% → 6.18% against a 5% gate, open-to-sky 1.17% →
+  1.83% against a 2% gate. The W5 line asks for G5 *density*, not size, so
+  buying size by loosening a roof bound in the wave that multiplies what the
+  bound guards was the wrong trade. caves.h records it where the constant would
+  have been.
+
+  **AND THE OLD BEDROCK ASSERT WAS WRONG, quietly, for three versions.** It
+  bounded the deepest carve by the TUBE alone and omitted the crevice's 6 m
+  downward reach, so the real envelope has been 41.0 m against an assert
+  claiming 40 m ever since crevices shipped. Harmless (bedrock has been ≥ 180 m
+  since v5) and never checked. v27 states the envelope over every construct
+  that can carve and asserts that instead — and the widened calibre does not
+  move it, because the crevice term still dominates.
+
+  CPU/GPU **bit-exact at v27** on an AMD RX 7800 XT (59,520 columns, 18.8M
+  cells, digest `ec45911f93ad4c47`); VoxelizeMain now binds ClimatePacked as
+  well as ElevationMm and its dispatch cost went 11.32 → 14.16 ms over the same
+  cells. `vxc_tests` 368 pass / 0 fail. UE module recompiled clean.
+
+  **Still open, and it is the usual list plus one instrument gap.** No rendered
+  frame exists (the editor was held all session), and the captures are now
+  cancelled with the rework. No real-tile run, so the tundra-vs-savanna
+  TEMPERATURE contrast — the one thing the frost term exists for — is
+  unmeasured. The UE-side `kExpectedCpuDigest` was NOT re-measured and is
+  expected to be wrong (it needs the editor; a loud block at the constant says
+  so). And `--field-off` is not wired through vxc_caveprobe's connectivity
+  flood fill, which reduces columns through the shipping Amplifier directly —
+  so that block prints byte-identical numbers in both arms, which is
+  UNMEASURED and not a null result. The structural connectivity argument is
+  untouched either way: the density gate only ever moves the rate on
+  NON-backbone edges.
 * **W6 — Lithology overlay + karst tier:** the hashed carbonate field, G1/G2
   density multipliers, dolines and stream sinks (flow plane's first consumer,
   fine tier; coarse parity per §5.4). Prerequisite: an Earth karst reference

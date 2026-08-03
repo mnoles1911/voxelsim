@@ -292,7 +292,56 @@ namespace vxc {
 // TILES DO NOT NEED REGENERATING, same as v24/v25: caves are runtime worldgen
 // only and the bake computes no underground data. Saved edit logs invalidate
 // as usual.
-inline constexpr uint32_t kWorldGenVersion = 26;
+//
+// ---------------------------------------------------------------------------
+// v27 -- FIELD COUPLING v1 (docs/underground-system-plan.md W5)
+// ---------------------------------------------------------------------------
+// THE FIRST VERSION IN WHICH THE UNDERGROUND KNOWS WHERE IT IS. Every cave
+// constant up to v26 was global: a desert plain and an alpine range got the
+// same passage density, the same calibre range, the same crevice rate and the
+// same entrance rate. v27 gates six of them on two fields the amplifier already
+// reads -- carrier.h's relief30 and the climate raster's bio_1 -- which is what
+// delivers the owner's "caves, tunnels and caverns should be influenced by the
+// biome and terrain type".
+//
+//   G1 density   non-backbone edge gate   1-in-8 (plain) .. 1-in-2 (alpine)
+//   G1 calibre   tube radius multiplier   0.875x .. 1.428x  ([1.05, 4.00] m)
+//   G3 rate      crevice gate             1-in-16 .. 1-in-3, on relief+frost
+//   G3 size      crevice UPWARD reach     0.75x .. 1.375x, on relief+frost
+//   G5 density   entrance gate            1-in-8 .. 1-in-2
+//   G5 mouth     entrance footprint       0.875x .. 1.25x
+//
+// NO LITHOLOGY, NO FLOW (both W6) AND NO PRECIPITATION -- the last excluded by
+// the owner's own answer to Q4, not by sequencing.
+//
+// ONE NEW HASH CHANNEL (CH_CAVE_CREV_GATE = 56). The edge and entrance gates
+// needed none: their thresholds sit on a 20-bit window POSITIONED so that its
+// top two bits are the two bits v26 tested, which makes the neutral rate
+// bit-for-bit v26's gate and every other rate a continuous widening of the same
+// comparison. That is also what makes cave_families.h's W5 control an exact
+// single-term difference rather than a rate match.
+//
+// THE ROOF GUARANTEE CHANGED SHAPE, and this is the load-bearing part. v26
+// proved "no tunnel voxel shallower than 6.2 m" from two constants; a 4.0 m
+// calibre ceiling makes that arithmetic false. It is replaced by a per-control-
+// value cap (caves.h caveScaledRadiusMm) plus a linearity argument -- depth and
+// radius interpolate at the same parameter, so a bound at both endpoints holds
+// throughout -- so the guarantee is still structural, proved per segment rather
+// than per constant.
+//
+// AND THE OLD BEDROCK ASSERT WAS WRONG, quietly, since crevices shipped: it
+// bounded the deepest carve by the TUBE alone and missed the crevice's 6 m
+// downward reach, so the real envelope has been 41.0 m against an assert
+// claiming 40 m. v27 states the envelope over every construct that can carve
+// and asserts that instead. The widened calibre does not move it (the crevice
+// term still dominates).
+//
+// GPU: VoxelizeMain now binds ClimatePacked as well as ElevationMm -- the field
+// taps are per lattice node, which the CPU memoises per cell and the shader
+// cannot.
+//
+// TILES DO NOT NEED REGENERATING, same as v24/v25/v26.
+inline constexpr uint32_t kWorldGenVersion = 27;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 26;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 27;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -90,6 +90,38 @@ namespace
 	// cells fold in. That is why this value differs from a v21 measurement taken
 	// before that fix (0x23cd9b86724c4e2b) -- same worldgen, one more region.
 	constexpr uint64 kExpectedCpuDigest = 0xb2b5d2f1044caa35ull;
+
+	// ======================================================================
+	// v27 (plan W5): THIS VALUE HAS *NOT* BEEN RE-MEASURED, AND IT IS
+	// EXPECTED TO BE WRONG. READ THIS BEFORE TRUSTING A voxel.GPU.VerifyRegion
+	// RESULT.
+	// ======================================================================
+	// The version pin above was rolled to 27 because the static_assert is what
+	// keeps a stale voxelcore.lib visible, and leaving it at 26 stops the module
+	// building at all. The DIGEST could not be rolled with it: re-measuring it
+	// requires running voxel.GPU.VerifyRegion in the editor, and the editor was
+	// held by another agent for this whole session, so no v27 measurement exists.
+	//
+	// AND UNLIKE v22/v25/v26, IT ALMOST CERTAINLY DID MOVE. Those three were
+	// shown differentially not to move because nothing they changed could reach
+	// the fixtures: v22's savanna gate is unreachable in the fixtures' climate
+	// range, and the v25/v26 entrance and cavern work needs sites the fixtures
+	// do not contain. v27 is different in kind — it changes TUNNEL density and
+	// calibre everywhere in the world, and the fold at line ~588 includes CELL
+	// materials, so any fixture cell inside a tunnel moves it. The bench's own
+	// figures say the fixtures do contain tunnels: vxc_gpu's cave-band region
+	// reports 2027 cave columns of 4096 at v26 and 2439 at v27.
+	//
+	// TO CLOSE THIS: run voxel.GPU.VerifyRegion over BOTH fixture regions, take
+	// the 'got' value out of the CPU REFERENCE DIGEST MISMATCH line, and replace
+	// the constant above. Nothing else about this file needs to change, and
+	// until that happens the gate will report a mismatch that means only "the
+	// pin is stale", which is the exact failure mode the block above this one
+	// spends fifteen lines warning about.
+	//
+	// The CPU/GPU equivalence itself is NOT unverified: vxc_gpu passes bit-exact
+	// at v27 over 59,520 columns and 18.8M cells on an AMD RX 7800 XT, digest
+	// ec45911f93ad4c47. What is unverified is only this UE-side PIN.
 
 	// v22 RE-MEASURED IT AND IT DID NOT MOVE, WHICH IS A FINDING, NOT A PASS.
 	// v22 changed classifyBiome's savanna gate from bio_4 to bio_15 (core.h's

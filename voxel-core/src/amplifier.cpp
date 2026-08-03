@@ -286,13 +286,19 @@ struct CaveLatticeSlot {
 // dependency into nothing at all. The memo stays output-neutral for the same
 // reason it always was: caveLatticeFor is a pure function of (seed, ci, cj)
 // and of a surfaceAt that is itself a pure function of position.
-template <typename SurfaceFn>
+// v27: the block ALSO carries the W5 field coupling, which costs sixteen more
+// raster taps per cell (one climate read plus four raw elevation reads at each
+// of the 4x4 node anchors — caves.h caveLatticeFor). Same argument as the
+// entrance's surface tap, one order larger: sixteen taps per 65'536 columns is
+// nothing, and the memo is what buys that. The shader has no memo and pays them
+// per column; that asymmetry is stated in worldgen.ush at the mirror.
+template <typename SurfaceFn, typename FieldFn>
 const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj,
-                                     const SurfaceFn& surfaceAt) {
+                                     const SurfaceFn& surfaceAt, const FieldFn& fieldAt) {
     static thread_local CaveLatticeSlot slots[kCaveLatticeSlots];
     CaveLatticeSlot& s = slots[slotIndex(seed, ci, cj, kCaveLatticeSlots)];
     if (s.valid && s.seed == seed && s.ci == ci && s.cj == cj) return s.value;
-    s.value = caveLatticeFor(seed, ci, cj, surfaceAt);
+    s.value = caveLatticeFor(seed, ci, cj, surfaceAt, fieldAt);
     s.valid = true;
     s.seed = seed;
     s.ci = ci;
@@ -300,17 +306,17 @@ const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj,
     return s.value;
 }
 
-// caveColumnFor(seed, vx, vy, surfaceMm, surfaceAt), memoised. Bit-identical by
-// construction: it is caves.h's own composition with the cell-only half served
-// from the table.
-template <typename SurfaceFn>
+// caveColumnFor(seed, vx, vy, surfaceMm, surfaceAt, fieldAt), memoised.
+// Bit-identical by construction: it is caves.h's own composition with the
+// cell-only half served from the table.
+template <typename SurfaceFn, typename FieldFn>
 CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
-                            const SurfaceFn& surfaceAt) {
+                            const SurfaceFn& surfaceAt, const FieldFn& fieldAt) {
     if (surfaceMm < kCaveMinSurfaceMm) return CaveColumn{};
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    return caveColumnFromLattice(seed, cachedCaveLattice(seed, ci, cj, surfaceAt), vx, vy,
-                                 surfaceMm);
+    return caveColumnFromLattice(seed, cachedCaveLattice(seed, ci, cj, surfaceAt, fieldAt), vx,
+                                 vy, surfaceMm);
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,9 +1308,21 @@ static_assert(!kAmpUnscaled || (kFineLandformAbsMaxMm == 100 && kFineMetreAbsMax
 // crevice is emitted as an ordinary segment whose depth extends the axis by at
 // most its downward reach. Sinkhole shafts bypass the roof clamp but are capped
 // by the same caveNode depth ceiling, so they are covered by the axis term.
+//
+// v27 takes the SCALED radius ceiling (the W5 calibre gate can multiply a draw
+// by 1.428x). Note this sum has always been conservative in two directions at
+// once — it adds the tube radius AND the crevice reach where only the larger of
+// the two can apply to any one segment, and it omits the waypoint dip, which is
+// smaller than the slack that over-counting leaves. caves.h's
+// kCaveDeepestCarveMm is the TIGHT envelope and the one the bedrock assert is
+// written on; this one only has to be an upper bound, so it stays in the shape
+// the surrounding derivation is written in.
 constexpr int64_t kMaxCaveCarveBelowSurfaceMm = kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm +
-                                                kCaveRadiusMaxMm + kCrevDownMinMm + kCrevDownSpanMm;
-static_assert(kMaxCaveCarveBelowSurfaceMm == 42800,
+                                                kCaveRadiusScaledMaxMm + kCrevDownMinMm +
+                                                kCrevDownSpanMm;
+static_assert(kMaxCaveCarveBelowSurfaceMm >= kCaveDeepestCarveMm,
+              "the amplifier's carve allowance must cover caves.h's own tight envelope");
+static_assert(kMaxCaveCarveBelowSurfaceMm == 43997,
               "cave/crevice depth envelope moved; Amplifier::solidBelowBoundMm derives its "
               "carve allowance from these constants.");
 
@@ -1725,6 +1743,33 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
 }
 
 int32_t Amplifier::surfaceMm(int64_t vx, int64_t vy) const { return evalSurface(vx, vy).surfaceMm; }
+
+// The W5 coupling field at a world-mm position (voxelcore/caves.h CaveField).
+//
+// BOTH CHANNELS ARE READS OF THINGS THIS FILE ALREADY COMPUTES, and that is the
+// point of "no new data": `reliefMm` is the very value the detail gate is
+// conditioned on, served straight out of the per-cell stencil slot, and
+// `tempU8` is the same climate raster the biome classifier reads.
+//
+// NEAREST PIXEL, NOT THE FADED-BILINEAR BLEND column() uses for classification.
+// The blend exists to stop biome boundaries following the 30 m pixel grid,
+// which is a statement about a boundary drawn ACROSS the world. This value is
+// consumed by a per-node gate 25.6 m apart, so a blend would cost four taps to
+// move a threshold that no continuous surface is drawn against. Relief is
+// per-cell for the same reason it is in the detail gate.
+//
+// No dither either, for the opposite reason to the biome gates': the ecotone
+// dither breaks up a line the eye can follow, and there is no line here — the
+// gates it feeds are already scattered over independent hashes.
+CaveField Amplifier::caveFieldAt(int64_t xMm, int64_t yMm) const {
+    const int64_t pxMm = tiles_->pixelSizeMm();
+    const int64_t px = floorDiv(xMm, pxMm);
+    const int64_t py = floorDiv(yMm, pxMm);
+    CaveField f;
+    f.reliefMm = static_cast<int32_t>(cachedStencilSlot(id_, *tiles_, px, py).reliefMm);
+    f.tempU8 = static_cast<int32_t>(cachedClimate(id_, *tiles_, px, py).temperature);
+    return f;
+}
 
 // ---------------------------------------------------------------------------
 // The sky-band trim's proof obligation. DERIVATION â€” read this before touching
@@ -2291,7 +2336,15 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
                            floorDiv(yMm, int64_t(kVoxelSizeMm)))
             .surfaceMm;
     };
-    col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm, surfaceAt);
+    // v27 (plan W5): the second terrain callback the cave pass takes — the
+    // COUPLING FIELD at a lattice node's anchor. Same contract shape as
+    // surfaceAt and for the same reason: the relief and the temperature a cave
+    // is gated on must be the very ones this world's surface and biome came
+    // from, not a second implementation of either.
+    const auto fieldAt = [this](int64_t xMm, int64_t yMm) -> CaveField {
+        return caveFieldAt(xMm, yMm);
+    };
+    col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm, surfaceAt, fieldAt);
 
     // M4 cave pass v2 cavern pass (voxelcore/caverns.h), wired in exactly as
     // the cave pass above is: one reduction per column, carried in the

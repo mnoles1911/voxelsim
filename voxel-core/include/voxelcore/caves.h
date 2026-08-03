@@ -112,6 +112,71 @@
 // 3x3 block of source nodes centred on the column's own cell can possibly
 // reach it. Nothing is missed and nothing outside is consulted.
 
+// ---------------------------------------------------------------------------
+// FIELD COUPLING (v27, docs/underground-system-plan.md W5)
+// ---------------------------------------------------------------------------
+// Until v26 every constant in this file was the same everywhere in the world.
+// A desert plain and an alpine range got the same edge density, the same
+// calibre range, the same crevice rate and the same entrance rate, because
+// nothing here read anything about the place. That is the single complaint the
+// owner's brief opens with -- caves "should be influenced by the biome and
+// terrain type" -- and W5 is the wave that answers it.
+//
+// TWO FIELDS, BOTH ALREADY IN THE AMPLIFIER, NO NEW DATA:
+//
+//   * RELIEF -- carrier.h's relief30 (the rise across a 30 m physical
+//     baseline), the same statistic the detail gate is conditioned on. It
+//     spans 18x between the plains and alpine exemplars (872 mm vs 15,692 mm,
+//     carrier.h's kReliefRefMm calibration), which is the property that makes
+//     it usable as a landform discriminator at all.
+//   * TEMPERATURE -- the climate raster's bio_1 byte (climate.h), read at the
+//     node, used for ONE thing: frost shattering, which raises the fracture
+//     (crevice) budget in cold ground.
+//
+// DELIBERATELY ABSENT: lithology and flow (both W6), and PRECIPITATION, which
+// is excluded by the owner's own answer to Q4 -- caves stay dry until the
+// watershed work lands, and a precip term is the first thing that would
+// smuggle wetness back in.
+//
+// WHERE THE FIELD IS SAMPLED, AND WHY IT IS THE NODE AND NOT THE COLUMN.
+// Every term below is a property of a lattice NODE or of an EDGE, never of the
+// querying column. That is not a performance choice, it is a correctness one:
+// an edge is seen by columns on both sides of it, and a gate keyed on the
+// querying column's own field would make the same edge exist from one side and
+// not from the other. Keying on the node makes each decision a pure function of
+// (seed, i, j) and the terrain at ONE place, so both sides agree by
+// construction. The sample point is the node's LATTICE ANCHOR (i * lattice,
+// j * lattice) rather than its jittered position, so the field does not depend
+// on the node hash and re-jittering nodes would not move it.
+//
+// CALIBRE STAYS CONTINUOUS ANYWAY. A per-node radius scale would be a visible
+// step at a node if the radius were constant along an edge -- but since v24 it
+// is INTERPOLATED between the two nodes' values and the edge's own mid draw, so
+// scaling the control values leaves the passage C0 exactly as it was. The
+// discrete gates (edge existence, crevice presence, entrance presence) are
+// discrete decisions anyway; the field moves their RATE, and a rate has no
+// seam.
+//
+// CONNECTIVITY IS NOT AT RISK, AND THAT IS THE WHOLE POINT OF THE BACKBONE.
+// The density term only ever moves the 1-in-N gate on NON-backbone edges. The
+// backbone is unconditional, so the "connected by construction, for every seed,
+// with no thresholds to tune" argument at the top of this file survives a
+// density field that goes to zero. A field coupling on a noise-threshold cave
+// system would have to be tuned against disconnection; here it cannot be.
+//
+// THE ROOF GUARANTEE BECAME STRUCTURAL INSTEAD OF STATIC. v26 proved "no tunnel
+// voxel is shallower than 6.2 m" from two constants (min axis depth minus max
+// radius). Widening the calibre ceiling to 4.0 m breaks that arithmetic -- 9 m
+// of minimum axis depth cannot cover a 4 m radius against a 6 m clamp. The
+// replacement is a per-control-value CAP (caveScaledRadiusMm): a tube may be no
+// wider at a control point than that point's own cover allows. Because depth
+// and radius are interpolated along a sub-segment at the SAME parameter, a
+// bound that holds at both endpoints holds everywhere between them by
+// linearity -- so the guarantee is still structural, it is just proved per
+// segment instead of per constant. See the static_asserts and
+// cave_surface_integrity_roof_thickness.
+
+#include "voxelcore/climate.h"
 #include "voxelcore/core.h"
 #include "voxelcore/hash.h"
 
@@ -136,11 +201,17 @@ inline constexpr int64_t kCaveNodeDepthSpanMm = 25000;
 // along an edge. Three draws now bound one passage — the two END nodes' own
 // radii and the per-edge draw, which becomes the MID value — and the radius is
 // interpolated between them, so a passage swells and chokes along its length
-// instead of being one extruded bore. The RANGE is deliberately unchanged: the
-// plan's widening to [0.8, 4.0] m belongs with the field coupling of W5/W6 that
-// decides where the wide end lives, and dropping the floor to 0.8 m would break
-// the crevice containment static_assert below (crevices must stay thinner than
-// the thinnest tunnel) — a coupling worth stating rather than discovering.
+// instead of being one extruded bore.
+//
+// v27 (W5): this is the RAW draw. The field coupling multiplies it by
+// kCaveCalibre*Q10 (0.875x on a plain, 1.428x in the mountains), which puts the
+// realised range at [1.05, 2.45] m on flat ground and [1.71, 4.00] m on alpine
+// ground. That is the plan's "[0.8, 4.0] m with the field coupling deciding
+// where the wide end lives" — with the LOW end held at 1.05 m rather than
+// 0.80 m, because a crevice must stay thinner than the thinnest tunnel or it
+// can exist outside its own tube's footprint (static_assert below). The
+// coupling was worth stating rather than discovering, and it is still the
+// binding one.
 inline constexpr int64_t kCaveRadiusMinMm = 1200;
 inline constexpr int64_t kCaveRadiusSpanMm = 1600;
 inline constexpr int64_t kCaveRadiusMaxMm = kCaveRadiusMinMm + kCaveRadiusSpanMm;
@@ -177,8 +248,13 @@ inline constexpr int32_t kCaveEdgeSubSegs = 2; // a -> waypoint -> b
 // construct tools/lint-shader-ub.py exists to keep out of the shader).
 inline constexpr int64_t kCaveBackboneMask = 3;
 
-// Non-backbone edges open when the top 2 bits of their hash are zero (1 in 4).
+// v26 and earlier: non-backbone edges opened when the top 2 bits of their hash
+// were zero (1 in 4). v27 replaced the fixed mask with a field-driven threshold
+// (kCaveEdgeGate*Q20 + caveGateOpen), whose neutral setting tests the SAME two
+// bits — so this constant is kept as the statement of what "neutral" means and
+// as the thing the bit-identity static_assert below is written against.
 inline constexpr uint64_t kCaveEdgeGateMask = 3;
+static_assert(kCaveEdgeGateMask == 3, "the v26 gate this file's control reproduces");
 
 // --- entrances (v25, docs/underground-system-plan.md W3) ---------------------
 //
@@ -239,10 +315,14 @@ inline constexpr uint64_t kCaveEdgeGateMask = 3;
 // The rim is warped by a value-noise field (kCaveEntranceRim*) so no two
 // cavities share an outline and none of them is a circle.
 //
-// Density is unchanged: one candidate node per 4x4 lattice cells (102.4 m
-// square), gated to 1 in 4, so roughly one entrance per 205 m square.
+// CANDIDATE density is unchanged and always has been: one candidate node per
+// 4x4 lattice cells (102.4 m square). v25 and v26 gated those 1 in 4, giving
+// roughly one entrance per 205 m square everywhere in the world. v27 (W5) makes
+// the GATE the field's: 1 in 8 on a desert plain (~290 m spacing) up to 1 in 2
+// in the mountains (~145 m). The candidate set, the backbone-crossing anchor
+// and all three §2.3 guarantees are untouched — only how many candidates open.
 inline constexpr int64_t kCaveShaftNodeMask = 3;  // (i & mask) == 0 && (j & mask) == 0
-inline constexpr uint64_t kCaveShaftGateMask = 3; // 1 in 4 of those open
+inline constexpr uint64_t kCaveShaftGateMask = 3; // v26's 1-in-4; the v27 neutral rate
 // The THROAT: the surviving v24 bore, surface -> node. It is deliberately
 // unchanged in size and role. It is what makes "every open site has an opening
 // at the axis, and that opening reaches a backbone node" a structural fact
@@ -322,13 +402,223 @@ inline constexpr int64_t kCrevUpSpanMm = 7000;  // -> [3, 10) m
 inline constexpr int64_t kCrevDownMinMm = 2000; // 2 m below the tube axis
 inline constexpr int64_t kCrevDownSpanMm = 4000; // -> [2, 6) m
 
+inline constexpr int64_t kCrevHalfThickMaxMm = kCrevHalfThickMinMm + kCrevHalfThickSpanMm;
+
+// ===========================================================================
+// THE FIELD (v27, plan W5) — the two inputs, the two gates they drive, and the
+// six numbers those gates hand to the rest of this file.
+// ===========================================================================
+
+// One sample of the coupling field, taken at a lattice node's ANCHOR. Both
+// members come from data the amplifier already reads per column; nothing here
+// is a new raster, a new channel or a new tile.
+struct CaveField {
+    // climate.h's bio_1 byte. The default is ClimateSample's own missing-tile
+    // value (~10 C), so a world with no climate tiles gates as temperate rather
+    // than as frozen — a missing tile must not manufacture fracture caves.
+    int32_t tempU8 = climateTempU8FromDegC(10);
+    // carrier.h's relief30: the rise across a 30 m physical baseline, in mm.
+    // Exactly zero on dead-flat ground.
+    int32_t reliefMm = 0;
+};
+
+// --- the relief ramp --------------------------------------------------------
+// 0 at or below the low knee, 1024 at or above the high one, smoothstepped
+// between. Both knees are stated INDEPENDENTLY of carrier.h's kReliefRefMm
+// even though the high one carries the same value: kReliefRefMm calibrates the
+// DETAIL gate, and a retune of surface roughness must not silently move every
+// cave in the world.
+//
+// The numbers come from carrier.h's own measurement of the two exemplars on the
+// pinned world: plains 872 mm, alpine 15,692 mm. The low knee sits above the
+// plains figure so a plain lands on the floor of every gate below, and the high
+// knee sits at the alpine figure so mountains saturate.
+inline constexpr int64_t kCaveReliefLoMm = 2000;
+inline constexpr int64_t kCaveReliefHiMm = 16000;
+
+// Integer smoothstep 3t^2 - 2t^3 in Q10, clamped. Used by both ramps so the
+// gates share one curve shape and one rounding.
+constexpr int64_t caveSmoothQ10(int64_t tQ10) {
+    const int64_t c = clampi64(tQ10, 0, 1024);
+    return (c * c * (3 * 1024 - 2 * c)) / (1024 * 1024);
+}
+static_assert(caveSmoothQ10(0) == 0);
+static_assert(caveSmoothQ10(1024) == 1024);
+static_assert(caveSmoothQ10(512) == 512);
+static_assert(caveSmoothQ10(-5000) == 0 && caveSmoothQ10(50000) == 1024,
+              "the smoothstep must clamp, not wrap: the relief argument is raster-derived "
+              "and nothing upstream bounds it");
+
+constexpr int64_t caveReliefQ10(int64_t reliefMm) {
+    if (reliefMm <= kCaveReliefLoMm) return 0;
+    if (reliefMm >= kCaveReliefHiMm) return 1024;
+    return caveSmoothQ10((reliefMm - kCaveReliefLoMm) * 1024 /
+                         (kCaveReliefHiMm - kCaveReliefLoMm));
+}
+
+// --- the frost ramp ---------------------------------------------------------
+// FULL frost weight at or below -2 C mean annual temperature, none at or above
+// +12 C. Stated in physical units through climate.h's encoder for the reason
+// that header exists: a bare u8 threshold is calibrated against whatever
+// distribution its author happened to be looking at.
+inline constexpr int32_t kCaveFrostColdU8 = climateTempU8FromDegC(-2);
+inline constexpr int32_t kCaveFrostWarmU8 = climateTempU8FromDegC(12);
+static_assert(kCaveFrostColdU8 < kCaveFrostWarmU8, "the frost ramp runs cold -> warm");
+
+constexpr int64_t caveFrostQ10(int64_t tempU8) {
+    if (tempU8 <= kCaveFrostColdU8) return 1024;
+    if (tempU8 >= kCaveFrostWarmU8) return 0;
+    return caveSmoothQ10((kCaveFrostWarmU8 - tempU8) * 1024 /
+                         (kCaveFrostWarmU8 - kCaveFrostColdU8));
+}
+
+// The FRACTURE budget: relief plus a weighted frost boost, clamped.
+//
+// THE PLAN'S TABLE SAYS "cold (bio_1) + high relief -> G3 up", i.e. a PRODUCT,
+// and this is deliberately a weighted SUM instead. A product is zero wherever
+// relief is zero, which would make the temperature term invisible on flat
+// ground — and "tundra vs savanna" is exactly the pair W5 has to show a
+// difference on. The sum keeps relief dominant (it alone can saturate the
+// budget; frost alone can reach at most half of it) while letting a cold flat
+// place out-fracture a hot flat one, which is the frost-shattering reading and
+// is what the Verify line asks to see.
+inline constexpr int64_t kCaveFrostBoostQ10 = 512;
+constexpr int64_t caveFractureQ10(int64_t reliefQ10, int64_t frostQ10) {
+    return clampi64(reliefQ10 + frostQ10 * kCaveFrostBoostQ10 / 1024, 0, 1024);
+}
+
+// --- the gate currency ------------------------------------------------------
+// Every hash GATE below is a threshold on a 20-bit slice of an existing hash,
+// so a rate is a plain integer in [0, 2^20] and lerps without a second unit.
+inline constexpr int64_t kCaveGateOne = 1 << 20;
+
+// G1 DENSITY (non-backbone edges): 1-in-8 on a plain, 1-in-2 in the mountains.
+// The NEUTRAL value is exactly 1-in-4 — and because the 20-bit slice is chosen
+// so that its top two bits are the two bits v26 tested, a neutral gate opens
+// the BIT-IDENTICAL edge set v26 opened. That is what makes the W5 control an
+// exact single-term difference rather than merely a rate match.
+inline constexpr int64_t kCaveEdgeGateLoQ20 = kCaveGateOne / 8;
+inline constexpr int64_t kCaveEdgeGateHiQ20 = kCaveGateOne / 2;
+inline constexpr int64_t kCaveEdgeGateNeutralQ20 = kCaveGateOne / 4;
+
+// G1 CALIBRE: the multiplier on every tube radius control value.
+inline constexpr int64_t kCaveCalibreLoQ10 = 896;  // 0.875x — desert plains
+inline constexpr int64_t kCaveCalibreHiQ10 = 1462; // 1.428x — 2.8 m draw -> 4.0 m
+inline constexpr int64_t kCaveRadiusScaledMaxMm = kCaveRadiusMaxMm * kCaveCalibreHiQ10 / 1024;
+inline constexpr int64_t kCaveRadiusScaledMinMm = kCaveRadiusMinMm * kCaveCalibreLoQ10 / 1024;
+// The slack the depth-aware roof cap carries over kCaveRoofMinMm. One voxel,
+// and it exists for a rounding reason rather than a design one: both the axis
+// depth and the radius are realised with floorDiv along a sub-segment, and each
+// can round down by up to 1 mm, so a cap written with zero slack could be
+// violated by a millimetre at an interior point. 100 mm is two orders more than
+// that needs and still nothing against the 6 m clamp.
+inline constexpr int64_t kCaveCalibreRoofSlackMm = 100;
+
+// G3 FRACTURE RATE: 1-in-16 where nothing fractures, up to 1-in-3 in cold,
+// steep ground. Neutral is 1-in-8, v26's fixed rate.
+inline constexpr int64_t kCrevGateLoQ20 = kCaveGateOne / 16;
+inline constexpr int64_t kCrevGateHiQ20 = kCaveGateOne / 3;
+inline constexpr int64_t kCrevGateNeutralQ20 = kCaveGateOne / 8;
+
+// G3 FRACTURE SIZE: a multiplier on the slab's UPWARD reach only.
+//
+// Upward only, and the asymmetry is forced rather than chosen. The downward
+// reach is what sets the cave pass's deepest possible carve (see
+// kCaveDeepestCarveMm) — it has been the binding term there since crevices
+// shipped — so scaling it would move the world's whole carve envelope for a
+// cosmetic gain. The upward reach is already clamped per column against the
+// roof, so scaling it up is free: a fissure reaches further toward daylight
+// where the rock is fractured, and pinches where it is not.
+inline constexpr int64_t kCrevUpLoQ10 = 768;  // 0.75x
+inline constexpr int64_t kCrevUpHiQ10 = 1408; // 1.375x
+
+// G5 ENTRANCE RATE: 1-in-8 on a plain, 1-in-3 in the mountains — the "more
+// mouths in a mountainside" half of the headline. Neutral is 1-in-4, and the
+// slice is again chosen so neutral reproduces v26's open-site set exactly.
+inline constexpr int64_t kCaveShaftGateLoQ20 = kCaveGateOne / 8;
+inline constexpr int64_t kCaveShaftGateHiQ20 = kCaveGateOne / 3;
+inline constexpr int64_t kCaveShaftGateNeutralQ20 = kCaveGateOne / 4;
+
+// G5 MOUTH BUDGET — TRIED, MEASURED, AND DROPPED. Recorded rather than
+// silently absent, because the plan's coupling table lists it.
+//
+// A relief multiplier on the entrance cavity's footprint RADIUS was written and
+// measured at 1.25x on saturated relief. Radius scales area by its square, so
+// 1.25x is 1.5625x of ground over a cavity, and the two roof-integrity bounds
+// cave_surface_integrity_roof_thickness has enforced since v25 went from
+// comfortable to failing/near-failing on the same 102.4 m box centred on a real
+// entrance:
+//
+//     footprint over a cavity   3.96%  ->  6.18%   (bound 5%   — FAILS)
+//     open to the sky           1.17%  ->  1.83%   (bound 2%   — 9% of margin left)
+//
+// Two things follow, and both argue the same way. First, the W5 line asks for
+// G5 *density*, not G5 size; the plan's "horizontal-mouth budget" is delivered
+// by the rate plus the terrain clip that already decides mouth SHAPE (v25), so
+// nothing in the brief is lost. Second, buying a size term by loosening a
+// roof-integrity bound in the same wave that multiplies what the bound guards
+// is the wrong trade — the bound is the only thing standing between "more
+// entrances in mountains" and "the mountains are a colander".
+//
+// If a mouth-size term is wanted later it should come with a re-derived bound
+// and its own measurement, not by widening this one. The rate ceiling above is
+// 1-in-3 rather than 1-in-2 for the same reason, one step down: at 1-in-2 the
+// footprint reaches 4.7% against the same 5% bound, which is margin too thin to
+// ship on a statistic this noisy.
+
+// Everything the field decides, in one struct — so there is exactly one place
+// to read what the coupling does, and exactly one thing for the A/B control to
+// neutralise (cave_families.h). Nothing else in this file reads CaveField.
+struct CaveGates {
+    int32_t edgeGateQ20 = static_cast<int32_t>(kCaveEdgeGateNeutralQ20);
+    int32_t calibreQ10 = 1024;
+    int32_t crevGateQ20 = static_cast<int32_t>(kCrevGateNeutralQ20);
+    int32_t crevUpQ10 = 1024;
+    int32_t entranceGateQ20 = static_cast<int32_t>(kCaveShaftGateNeutralQ20);
+};
+
+// THE CONTROL VALUE, and it is a worldgen constant rather than a test fixture:
+// a default-constructed CaveGates reproduces v26's rates, and for the edge and
+// entrance gates v26's exact draws. cave_families.h's A/B feeds this in.
+inline constexpr CaveGates kCaveGatesNeutral{};
+
+constexpr int64_t caveLerpQ10(int64_t lo, int64_t hi, int64_t tQ10) {
+    return lo + (hi - lo) * tQ10 / 1024;
+}
+
+constexpr CaveGates caveGatesFromField(const CaveField& f) {
+    const int64_t rQ = caveReliefQ10(f.reliefMm);
+    const int64_t fracQ = caveFractureQ10(rQ, caveFrostQ10(f.tempU8));
+    CaveGates g;
+    g.edgeGateQ20 =
+        static_cast<int32_t>(caveLerpQ10(kCaveEdgeGateLoQ20, kCaveEdgeGateHiQ20, rQ));
+    g.calibreQ10 = static_cast<int32_t>(caveLerpQ10(kCaveCalibreLoQ10, kCaveCalibreHiQ10, rQ));
+    g.crevGateQ20 = static_cast<int32_t>(caveLerpQ10(kCrevGateLoQ20, kCrevGateHiQ20, fracQ));
+    g.crevUpQ10 = static_cast<int32_t>(caveLerpQ10(kCrevUpLoQ10, kCrevUpHiQ10, fracQ));
+    g.entranceGateQ20 =
+        static_cast<int32_t>(caveLerpQ10(kCaveShaftGateLoQ20, kCaveShaftGateHiQ20, rQ));
+    return g;
+}
+
 // Crevices must stay thinner than the thinnest tunnel: their xy accept
 // corridor (radius t) is then always a strict subset of the tube's own
 // (radius r), so a crevice can never exist somewhere its own tube doesn't —
 // the containment the header comment's connectivity argument relies on.
-static_assert(kCrevHalfThickMinMm + kCrevHalfThickSpanMm < kCaveRadiusMinMm,
-              "crevices must stay thinner than the thinnest tunnel radius, or a "
+//
+// v27 restates it against the SCALED minimum, because the calibre gate can now
+// shrink a plain's tubes below the raw draw. 800 mm against 1050 mm: the gate's
+// low knee cannot go below 683/1024 without breaking this, which is the real
+// reason the plan's 0.8 m floor is not reachable here.
+static_assert(kCrevHalfThickMaxMm < kCaveRadiusScaledMinMm,
+              "crevices must stay thinner than the thinnest SCALED tunnel radius, or a "
               "crevice could exist outside its own tube's xy footprint");
+// The other way a tube can get thin is the depth-aware roof cap. The shallowest
+// possible axis is a node at kCaveNodeDepthMinMm, so the cap can never demand
+// less than this — and it must still clear the crevice.
+static_assert(kCaveNodeDepthMinMm - kCaveRoofMinMm - kCaveCalibreRoofSlackMm >
+                  kCrevHalfThickMaxMm,
+              "the depth-aware calibre cap must never squeeze a tube below its own "
+              "crevice's half-thickness");
 
 // --- structural invariants, checked at compile time -------------------------
 
@@ -336,28 +626,49 @@ static_assert(kCrevHalfThickMinMm + kCrevHalfThickSpanMm < kCaveRadiusMinMm,
 // than one lattice cell sideways off its axis' bounding box. Since v24 the axis
 // is a polyline whose waypoint may sit kCaveWaypointLatMm outside that box, so
 // the waypoint excursion is part of the reach and part of this bound.
-static_assert((kCaveRadiusMaxMm + kCaveWaypointLatMm) * 2 < kCaveLatticeMm,
-              "cave tube reach (max radius plus the waypoint's lateral excursion) must "
-              "stay well under one lattice cell, or the 3x3 candidate-node block in "
+static_assert((kCaveRadiusScaledMaxMm + kCaveWaypointLatMm) * 2 < kCaveLatticeMm,
+              "cave tube reach (max SCALED radius plus the waypoint's lateral excursion) "
+              "must stay well under one lattice cell, or the 3x3 candidate-node block in "
               "caveColumnFor stops being exhaustive");
-// Roof: shallowest possible carved voxel is axis depth minus max radius. The
-// waypoint dips DOWNWARD only, so the shallowest axis point is still a node and
-// this bound is unchanged by v24 — see kCaveWaypointDipMm for why that
-// asymmetry is forced rather than chosen.
-static_assert(kCaveNodeDepthMinMm - kCaveRadiusMaxMm > kCaveRoofMinMm,
-              "tube geometry must keep itself above the roof clamp — the clamp is a "
-              "backstop, not the mechanism");
-// Floor: deepest possible carved voxel vs a bedrock top of 40 m. That is the
-// PRE-v5 amplifier minimum, kept deliberately after the v5 move to a
-// 180-220 m band (amplifier.cpp bedrockDepthMm): asserting against the old,
-// much shallower floor is a strictly stronger statement, and it keeps tunnel
-// geometry provably independent of wherever the bedrock band happens to sit.
-// The waypoint dip is added because it is the one construct that can put the
-// axis below its own endpoints.
-static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
-                      kCaveRadiusMaxMm + kCaveBedrockMarginMm < 40000,
-              "tube geometry must keep itself out of bedrock — the bedrock margin is a "
-              "backstop, not the mechanism");
+// ROOF. Until v26 this was a two-constant subtraction: min axis depth minus max
+// radius. v27's 4.0 m calibre ceiling makes that arithmetic false (9 m of cover
+// cannot hold a 4 m tube above a 6 m clamp), so the guarantee moved into
+// caveScaledRadiusMm's per-control-value cap and the linearity argument in the
+// header comment. What is still static is the WORST CASE THE CAP ITSELF CAN
+// PRODUCE: at the shallowest legal axis the cap allows exactly this much
+// radius, and that must still clear the clamp.
+static_assert(kCaveNodeDepthMinMm - (kCaveNodeDepthMinMm - kCaveRoofMinMm -
+                                     kCaveCalibreRoofSlackMm) > kCaveRoofMinMm,
+              "the depth-aware calibre cap must leave the roof clamp unreachable — the "
+              "clamp is a backstop, not the mechanism");
+// FLOOR — and the old form of this assert was WRONG, quietly, since M4 cave
+// pass v2 shipped crevices.
+//
+// It bounded the deepest carve by the TUBE alone (axis + dip + radius), and
+// asserted that against a 40 m bedrock top: the PRE-v5 amplifier minimum, kept
+// deliberately after the v5 move to a 180-220 m band because asserting against
+// the shallower figure is a strictly stronger statement. But a crevice reaches
+// kCrevDownMinMm + kCrevDownSpanMm = 6 m below its own tube axis, more than
+// twice the widest tube radius, so the real deepest carve has been 41.0 m — one
+// metre PAST the figure the assert claimed — for three worldgen versions. It
+// was harmless (bedrock has been >= 180 m since v5) and it was never checked,
+// which is the part worth recording.
+//
+// v27 states the envelope explicitly, over every construct that can carve, and
+// asserts THAT. The tunnel term grows (3.998 m of scaled radius against 2.8 m)
+// and the crevice term does not move at all, so the envelope is unchanged at
+// 41.0 m and the widened calibre costs the world nothing in depth.
+inline constexpr int64_t kCaveDeepestAxisMm =
+    kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm;
+inline constexpr int64_t kCaveDeepestTunnelMm = kCaveDeepestAxisMm + kCaveRadiusScaledMaxMm;
+inline constexpr int64_t kCaveDeepestCreviceMm =
+    kCaveDeepestAxisMm + kCrevDownMinMm + kCrevDownSpanMm;
+inline constexpr int64_t kCaveDeepestCarveMm =
+    kCaveDeepestTunnelMm > kCaveDeepestCreviceMm ? kCaveDeepestTunnelMm : kCaveDeepestCreviceMm;
+static_assert(kCaveDeepestCarveMm + kCaveBedrockMarginMm < 45000,
+              "cave-pass geometry (tube AND crevice) must keep itself out of bedrock — the "
+              "bedrock margin is a backstop, not the mechanism. 45 m is four times clear of "
+              "the 180 m the amplifier's band has bottomed out at since v5.");
 
 // --- entrance-cavity invariants (v25) ---------------------------------------
 
@@ -378,6 +689,7 @@ static_assert(kCaveEntranceOverMinMm > 0,
 // draws INCLUDING the worst rim warp, so the throat's own daylight bore is
 // never left standing outside the chamber it is supposed to open into. The
 // test is on t^2: (rThroatMax / reachMin)^2 * rimMax < 1.
+//
 static_assert(kCaveShaftRadiusMaxMm * kCaveShaftRadiusMaxMm * kCaveEntranceRimMaxQ10 <
                   kCaveEntranceReachMinMm * kCaveEntranceReachMinMm * 1024,
               "the throat must stay inside the entrance cavity's footprint under the worst "
@@ -429,6 +741,21 @@ inline constexpr uint32_t CH_CAVE_NODE_RADIUS = 50; // per-node tube radius
 // node, so it must not share a channel with anything keyed on (i, j).
 inline constexpr uint32_t CH_CAVE_ENTRANCE = 51;     // cavity floor / axis rise / reach
 inline constexpr uint32_t CH_CAVE_ENTRANCE_RIM = 52; // rim value noise, keyed on world cells
+// v27 (plan W5). The crevice GATE needs its own channel, and this is the one
+// place W5 could not reuse a bit slice of an existing hash.
+//
+// The edge and entrance gates could: v26 tested two named bits of CH_CAVE_EDGE
+// / CH_CAVE_SHAFT, and a 20-bit window POSITIONED so those two bits are its top
+// two makes "threshold == 1/4" bit-identical to v26 while every other threshold
+// is a smooth widening of the same comparison. CH_CREVICE has no room for that
+// trick: its 64 bits are already spent on three 20-bit geometry fields plus the
+// 3-bit gate at 61..63, so any 20-bit window wide enough for a rate would
+// overlap the down-reach field and correlate crevice PRESENCE with crevice
+// SIZE. That is a real artifact, not a coincidence to leave alone (see
+// CH_CAVE_NODE_RADIUS for the same call made the same way), so the gate gets a
+// clean channel and the W5 control is rate-identical to v26 here rather than
+// bit-identical. Stated rather than glossed.
+inline constexpr uint32_t CH_CAVE_CREV_GATE = 56;
 
 // --- node / edge primitives -------------------------------------------------
 
@@ -474,13 +801,33 @@ constexpr CaveNode caveNode(uint64_t seed, int64_t i, int64_t j) {
     return caveNodeFromHash(hash2(seed, i, j, CH_CAVE_NODE), i, j);
 }
 
+// The 20-bit slice a field-driven gate is compared against. The SHIFT is the
+// load-bearing part: `(h >> 30) & 0xFFFFF` is bits 30..49, whose top two bits
+// are bits 48 and 49 — the exact pair v26's `((h >> 48) & 3) == 0` tested. So
+// `caveGateOpen(h, kCaveGateOne / 4)` is bit-for-bit v26's 1-in-4 gate, and
+// every other threshold widens or narrows the same comparison continuously.
+inline constexpr int32_t kCaveGateShift = 30;
+constexpr bool caveGateOpen(uint64_t h, int32_t shift, int64_t thresholdQ20) {
+    return static_cast<int64_t>((h >> shift) & 0xFFFFFu) < thresholdQ20;
+}
+static_assert(kCaveEdgeGateNeutralQ20 == kCaveGateOne / 4 &&
+                  kCaveShaftGateNeutralQ20 == kCaveGateOne / 4,
+              "the neutral edge/entrance thresholds are what make the W5 control reproduce "
+              "v26's draws exactly; they are 1/4 of the gate currency because v26 tested two "
+              "bits, and moving either breaks the bit-identity claim in cave_families.h");
+
 // dir 0 = the +x edge out of (i, j), dir 1 = the +y edge. Backbone edges are
 // unconditional (that is what makes the network connected for every seed);
-// everything else is a 1-in-4 hash gate.
-constexpr bool caveEdgeExists(uint64_t seed, int64_t i, int64_t j, int32_t dir) {
+// everything else is a hash gate whose RATE is the field's (v27) — 1-in-8 on a
+// plain, 1-in-4 at the neutral control, 1-in-2 in the mountains.
+//
+// `gateQ20` belongs to the edge's SOURCE node (i, j), never to the querying
+// column: an edge is looked at from both sides and both sides must agree.
+constexpr bool caveEdgeExists(uint64_t seed, int64_t i, int64_t j, int32_t dir,
+                              int64_t gateQ20) {
     if (dir == 0 && (j & kCaveBackboneMask) == 0) return true;
     if (dir == 1 && (i & kCaveBackboneMask) == 0) return true;
-    return ((hash2(seed, i, j * 2 + dir, CH_CAVE_EDGE) >> 48) & kCaveEdgeGateMask) == 0;
+    return caveGateOpen(hash2(seed, i, j * 2 + dir, CH_CAVE_EDGE), kCaveGateShift, gateQ20);
 }
 
 // The MID calibre of an edge since v24: the radius the passage has at its
@@ -509,6 +856,25 @@ constexpr int64_t caveNodeRadiusMm(uint64_t seed, int64_t i, int64_t j) {
 // crevice is only ever evaluated on an edge that already exists).
 constexpr uint64_t caveCreviceHash(uint64_t seed, int64_t i, int64_t j, int32_t dir) {
     return hash2(seed, i, j * 2 + dir, CH_CREVICE);
+}
+
+// THE CALIBRE GATE AND THE ROOF CAP, in one place because they are one rule.
+//
+// `rawMm` is the hashed draw, `calibreQ10` the field's multiplier, and
+// `axisDepthMm` the depth of the control point this radius belongs to. The cap
+// is what replaced v26's two-constant roof static_assert: a control point may
+// be no wider than its own cover allows, so the passage cannot reach the roof
+// clamp no matter how generous the field is.
+//
+// WHY IT IS SOUND ALONG THE WHOLE SEGMENT, not just at the control points:
+// caveColumnFromLattice interpolates the axis depth and the radius at the SAME
+// parameter num/den, so both are affine in that parameter and
+// `depth - radius >= kCaveRoofMinMm + slack` at both endpoints implies it
+// everywhere between. The slack absorbs the two floorDivs.
+constexpr int64_t caveScaledRadiusMm(int64_t rawMm, int64_t calibreQ10, int64_t axisDepthMm) {
+    const int64_t scaled = rawMm * calibreQ10 / 1024;
+    const int64_t cap = axisDepthMm - kCaveRoofMinMm - kCaveCalibreRoofSlackMm;
+    return scaled < cap ? scaled : cap;
 }
 
 // The interior waypoint of edge (i, j, dir), given its two endpoint nodes.
@@ -541,8 +907,30 @@ constexpr CaveWaypoint caveWaypoint(uint64_t seed, int64_t i, int64_t j, int32_t
                               static_cast<uint64_t>(kCaveWaypointDipMm)) >> 20);
     return w;
 }
-constexpr bool caveCreviceGateOpen(uint64_t h) {
+// v26 and earlier: the crevice gate was the top 3 bits of caveCreviceHash.
+// v27 moved it to its own channel and its own field-driven threshold (see
+// CH_CAVE_CREV_GATE); this is kept as the statement of the neutral rate the
+// control reproduces, and is what kCrevGateNeutralQ20 is derived against.
+constexpr bool caveCreviceGateOpenV26(uint64_t h) {
     return ((h >> 61) & kCrevGateMask) == 0;
+}
+static_assert(kCrevGateNeutralQ20 == kCaveGateOne / 8,
+              "the neutral crevice threshold must reproduce v26's 1-in-8 RATE (it cannot "
+              "reproduce its draws — the gate moved channel; see CH_CAVE_CREV_GATE)");
+
+// The entrance gate on its own, for instruments that enumerate open SITES
+// without reducing a column (test_caves, vxc_caveprobe). It exists so those do
+// not hand-roll the predicate: three of them hand-rolled v26's two-bit test,
+// and a hand-rolled copy of a gate that has just become field-driven is exactly
+// how an instrument ends up counting a world nobody is building.
+constexpr bool caveEntranceGateOpen(uint64_t seed, int64_t i, int64_t j,
+                                    const CaveGates& gates) {
+    return caveGateOpen(hash2(seed, i, j, CH_CAVE_SHAFT), kCaveGateShift, gates.entranceGateQ20);
+}
+
+constexpr bool caveCreviceGateOpen(uint64_t seed, int64_t i, int64_t j, int32_t dir,
+                                   int64_t gateQ20) {
+    return caveGateOpen(hash2(seed, i, j * 2 + dir, CH_CAVE_CREV_GATE), 44, gateQ20);
 }
 
 // --- per-column reduction ---------------------------------------------------
@@ -612,9 +1000,15 @@ static_assert(kCaveRadiusMinMm > 0,
               "CaveLatticeEdge uses radiusMm == 0 as its 'edge does not exist' sentinel");
 
 struct CaveLatticeEdge {
-    int32_t radiusMm = 0;  // MID calibre; 0 == this edge does not exist
+    int32_t radiusMm = 0;  // MID calibre, SCALED and roof-capped; 0 == no edge here
     uint64_t crevHash = 0; // caveCreviceHash for it (meaningless if radiusMm == 0)
     CaveWaypoint way;      // v24 interior waypoint (meaningless if radiusMm == 0)
+    // v27: the crevice's GATE and SIZE now come from the source node's field,
+    // so both are decided here rather than per column. The gate moved out of
+    // `crevHash` entirely (it has its own channel — see CH_CAVE_CREV_GATE);
+    // crevHash still supplies all three geometry draws exactly as it did.
+    bool crevOpen = false;
+    int32_t crevUpQ10 = 1024;
 };
 
 struct CaveLattice {
@@ -691,10 +1085,16 @@ struct CaveEntranceSite {
 
 template <typename SurfaceFn>
 constexpr CaveEntranceSite caveEntranceSite(uint64_t seed, int64_t i, int64_t j,
-                                            const CaveNode& node, const SurfaceFn& surfaceAt) {
+                                            const CaveNode& node, const SurfaceFn& surfaceAt,
+                                            const CaveGates& gates) {
     CaveEntranceSite s;
     const uint64_t hs = hash2(seed, i, j, CH_CAVE_SHAFT);
-    if (((hs >> 48) & kCaveShaftGateMask) != 0) return s; // not an entrance node
+    // v27: a field-driven threshold on bits 30..49 replaces v26's two-bit test
+    // on bits 48..49. At the neutral rate the two are the SAME predicate (see
+    // caveGateOpen), and bits 30..47 were unused, so widening the window
+    // correlates the gate with nothing — in particular not with the throat
+    // radius, which lives in bits 0..19 of this same hash.
+    if (!caveGateOpen(hs, kCaveGateShift, gates.entranceGateQ20)) return s;
     const int32_t siteSurfaceMm = surfaceAt(node.xMm, node.yMm);
     if (siteSurfaceMm < kCaveMinSurfaceMm) return s; // beach/ocean guard on the SITE
 
@@ -707,6 +1107,8 @@ constexpr CaveEntranceSite caveEntranceSite(uint64_t seed, int64_t i, int64_t j,
         kCaveEntranceOverMinMm +
         static_cast<int64_t>((((he >> 20) & 0xFFFFFu) *
                               static_cast<uint64_t>(kCaveEntranceOverSpanMm)) >> 20);
+    // v27 note: the cavity's FOOTPRINT is deliberately NOT field-scaled. See
+    // the "G5 MOUTH BUDGET" block above for the measurement that dropped it.
     const int64_t reachMm =
         kCaveEntranceReachMinMm +
         static_cast<int64_t>((((he >> 40) & 0xFFFFFu) *
@@ -733,34 +1135,59 @@ constexpr CaveEntranceSite caveEntranceSite(uint64_t seed, int64_t i, int64_t j,
 // it to nothing. The shader mirror cannot memoise, so it defers the tap until
 // AFTER the cheap xy reject; the value is the same either way, since surfaceAt
 // is a pure function of the node's xy.
-template <typename SurfaceFn>
-constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj,
-                                     const SurfaceFn& surfaceAt) {
+// v27: `gatesAt(i, j) -> CaveGates` supplies the field coupling for lattice node
+// (i, j). Both callers of this form are in-tree and deliberately so: the
+// SHIPPING path is caveLatticeFor below, which derives the gates from the field
+// at the node's anchor; the CONTROL is cave_families.h, which passes
+// kCaveGatesNeutral and gets v26's density and calibre out of the v27 world.
+// Splitting at the gates rather than at the field is what makes that control an
+// exact single-term difference — see the header comment there.
+template <typename SurfaceFn, typename GatesFn>
+constexpr CaveLattice caveLatticeForGates(uint64_t seed, int64_t ci, int64_t cj,
+                                          const SurfaceFn& surfaceAt, const GatesFn& gatesAt) {
     CaveLattice L;
 
     // 4x4 node block: the 3x3 candidate SOURCE nodes plus the +x/+y endpoints
-    // they need.
+    // they need. Each node's own gates are computed once here and used for
+    // everything that node owns — its calibre, its two outgoing edges, its
+    // crevices and (if it is a backbone crossing) its entrance.
+    CaveGates gates[16];
     for (int32_t dj = 0; dj < 4; ++dj)
         for (int32_t di = 0; di < 4; ++di) {
             const int32_t slot = di + 4 * dj;
-            L.nodes[slot] = caveNode(seed, ci - 1 + di, cj - 1 + dj);
-            L.nodeRadiusMm[slot] =
-                static_cast<int32_t>(caveNodeRadiusMm(seed, ci - 1 + di, cj - 1 + dj));
+            const int64_t i = ci - 1 + di;
+            const int64_t j = cj - 1 + dj;
+            L.nodes[slot] = caveNode(seed, i, j);
+            gates[slot] = gatesAt(i, j);
+            // The node's calibre is capped against the NODE's own depth: this
+            // control point is where the passage is shallowest, so it is where
+            // the cap actually binds.
+            L.nodeRadiusMm[slot] = static_cast<int32_t>(caveScaledRadiusMm(
+                caveNodeRadiusMm(seed, i, j), gates[slot].calibreQ10, L.nodes[slot].depthMm));
         }
 
     for (int32_t dj = 0; dj < 3; ++dj)
         for (int32_t di = 0; di < 3; ++di) {
             const int64_t i = ci - 1 + di;
             const int64_t j = cj - 1 + dj;
+            const CaveGates& g = gates[di + 4 * dj];
             for (int32_t dir = 0; dir < 2; ++dir) {
-                if (!caveEdgeExists(seed, i, j, dir)) continue;
+                if (!caveEdgeExists(seed, i, j, dir, g.edgeGateQ20)) continue;
                 CaveLatticeEdge& e = L.edges[(di + 3 * dj) * 2 + dir];
-                e.radiusMm = static_cast<int32_t>(caveEdgeRadiusMm(seed, i, j, dir));
                 e.crevHash = caveCreviceHash(seed, i, j, dir);
+                e.crevOpen = caveCreviceGateOpen(seed, i, j, dir, g.crevGateQ20);
+                e.crevUpQ10 = g.crevUpQ10;
                 const CaveNode& a = L.nodes[di + 4 * dj];
                 const CaveNode& b = (dir == 0) ? L.nodes[di + 1 + 4 * dj]
                                                : L.nodes[di + 4 * (dj + 1)];
                 e.way = caveWaypoint(seed, i, j, dir, a, b);
+                // The MID calibre is capped against the WAYPOINT's depth, which
+                // is the control point it belongs to. radiusMm must be written
+                // LAST of the three geometry fields only in the sense that it is
+                // the existence sentinel; the waypoint it depends on is computed
+                // above.
+                e.radiusMm = static_cast<int32_t>(caveScaledRadiusMm(
+                    caveEdgeRadiusMm(seed, i, j, dir), g.calibreQ10, e.way.depthMm));
             }
         }
 
@@ -775,7 +1202,7 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj,
             if ((i & kCaveShaftNodeMask) != 0 || (j & kCaveShaftNodeMask) != 0) continue;
             const int32_t slot = di + 4 * dj;
             const CaveEntranceSite site =
-                caveEntranceSite(seed, i, j, L.nodes[slot], surfaceAt);
+                caveEntranceSite(seed, i, j, L.nodes[slot], surfaceAt, gates[slot]);
             if (!site.valid) continue;
             L.shaftNodeSlot = slot;
             L.shaftRadiusMm = site.throatRadiusMm;
@@ -785,6 +1212,30 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj,
             L.entranceNodeZMm = site.nodeZMm;
         }
     return L;
+}
+
+// The lattice ANCHOR of node (i, j) — where the coupling field is sampled. Not
+// the jittered node position: see the header comment.
+constexpr int64_t caveNodeAnchorMm(int64_t i) { return i * kCaveLatticeMm; }
+
+// THE SHIPPING COMPOSITION. `fieldAt(xMm, yMm) -> CaveField` is the second
+// terrain callback the cave pass takes, alongside surfaceAt, and it is written
+// against exactly the same contract: it must come from the very functions this
+// column's own climate and relief came from. amplifier.cpp supplies
+// Amplifier::caveFieldAt and worldgen.ush mirrors that call.
+//
+// SIXTEEN taps per lattice CELL — one per node of the 4x4 block, and a cell is
+// 65'536 voxel columns, so the CPU's lattice memo amortises them to nothing.
+// The shader cannot memoise and pays them per column; that is the same trade
+// the entrance's surface tap already makes, and the reason the field is keyed
+// on the anchor (a pure function of (i, j)) rather than on the jittered node is
+// that it makes the tap independent of every hash in this file.
+template <typename SurfaceFn, typename FieldFn>
+constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj,
+                                     const SurfaceFn& surfaceAt, const FieldFn& fieldAt) {
+    return caveLatticeForGates(seed, ci, cj, surfaceAt, [&](int64_t i, int64_t j) {
+        return caveGatesFromField(fieldAt(caveNodeAnchorMm(i), caveNodeAnchorMm(j)));
+    });
 }
 
 // Every tube axis within reach of column (vx, vy), given its lattice cell's
@@ -877,14 +1328,20 @@ constexpr CaveColumn caveColumnFromLattice(uint64_t seed, const CaveLattice& L, 
                 // outside the crevice's own, narrower corridor too, so no
                 // separate reject was skipped.
                 const uint64_t crevH = edge.crevHash;
-                if (caveCreviceGateOpen(crevH)) {
+                if (edge.crevOpen) {
                     const int64_t tMm =
                         kCrevHalfThickMinMm +
                         static_cast<int64_t>(((crevH & 0xFFFFFu) * static_cast<uint64_t>(kCrevHalfThickSpanMm)) >> 20);
                     if (ex * ex + ey * ey <= tMm * tMm) {
+                        // v27: the UPWARD reach is the field-scaled one — a
+                        // fracture propagates further toward daylight where the
+                        // rock is fractured. The downward reach is deliberately
+                        // NOT scaled (see kCrevUpLoQ10): it is the term that
+                        // sets kCaveDeepestCarveMm.
                         const int64_t hUpMm =
-                            kCrevUpMinMm + static_cast<int64_t>((((crevH >> 20) & 0xFFFFFu) *
-                                                                  static_cast<uint64_t>(kCrevUpSpanMm)) >> 20);
+                            (kCrevUpMinMm + static_cast<int64_t>((((crevH >> 20) & 0xFFFFFu) *
+                                                                  static_cast<uint64_t>(kCrevUpSpanMm)) >> 20)) *
+                            edge.crevUpQ10 / 1024;
                         const int64_t hDownMm =
                             kCrevDownMinMm + static_cast<int64_t>((((crevH >> 40) & 0xFFFFFu) *
                                                                     static_cast<uint64_t>(kCrevDownSpanMm)) >> 20);
@@ -1013,14 +1470,15 @@ constexpr CaveColumn caveColumnFromLattice(uint64_t seed, const CaveLattice& L, 
 // worldgen contract and the HLSL mirror are written against. Callers walking
 // many columns should go through amplifier.cpp's memoised path instead, which
 // produces bit-identical values.
-template <typename SurfaceFn>
+template <typename SurfaceFn, typename FieldFn>
 constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
-                                   const SurfaceFn& surfaceAt) {
+                                   const SurfaceFn& surfaceAt, const FieldFn& fieldAt) {
     CaveColumn out;
     if (surfaceMm < kCaveMinSurfaceMm) return out;
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    return caveColumnFromLattice(seed, caveLatticeFor(seed, ci, cj, surfaceAt), vx, vy, surfaceMm);
+    return caveColumnFromLattice(seed, caveLatticeFor(seed, ci, cj, surfaceAt, fieldAt), vx, vy,
+                                 surfaceMm);
 }
 
 // --- per-voxel carve test ---------------------------------------------------

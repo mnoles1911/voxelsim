@@ -131,6 +131,11 @@ namespace
 			// Bound again because the cavern pass evaluates terrain height at
 			// a cave site's own xy, which is usually not a dispatch column.
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			// v27 (plan W5): the cave pass's density/calibre/fracture gates read
+			// bio_1 at each lattice node anchor, so VoxelizeMain needs the
+			// climate raster as well as the elevation one. Same reason the
+			// elevation SRV joined at C6, one wave later.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ClimatePacked)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
 		END_SHADER_PARAMETER_STRUCT()
@@ -344,6 +349,8 @@ namespace
 			// so the raster is live here for the same reason it is in
 			// VoxelizeMain.
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
+			// v27: and the climate raster too, for the same W5 field gates.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ClimatePacked)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<int>, OutBand)
 		END_SHADER_PARAMETER_STRUCT()
@@ -632,6 +639,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
 		FillLooseParameters(*Params, Request);
 		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		Params->ClimatePacked = GraphBuilder.CreateSRV(ClimateBuffer);
 		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
 		Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
 
@@ -658,6 +666,7 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		Params->BandOriginJ = Request.BandOriginJ;
 		Params->BandEdge = Request.BandEdge;
 		Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
+		Params->ClimatePacked = GraphBuilder.CreateSRV(ClimateBuffer);
 		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
 		Params->OutBand = GraphBuilder.CreateUAV(Out.Band);
 

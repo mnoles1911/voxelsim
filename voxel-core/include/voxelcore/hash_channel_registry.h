@@ -74,6 +74,14 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // exact class of bug this table exists to make impossible.
     {CH_CAVE_ENTRANCE, 1, "CH_CAVE_ENTRANCE"},
     {CH_CAVE_ENTRANCE_RIM, 1, "CH_CAVE_ENTRANCE_RIM"},
+    // v27 field coupling (plan W5). The edge and entrance gates reuse bit
+    // slices of CH_CAVE_EDGE / CH_CAVE_SHAFT -- positioned so the neutral rate
+    // reproduces v26's draws exactly -- and needed no id. The CREVICE gate did:
+    // CH_CREVICE's 64 bits are entirely spent on three 20-bit geometry fields
+    // plus the old 3-bit gate, so any window wide enough for a rate would have
+    // overlapped the down-reach field and correlated crevice PRESENCE with
+    // crevice SIZE.
+    {CH_CAVE_CREV_GATE, 1, "CH_CAVE_CREV_GATE"},
     // caverns.h
     {CH_CAVERN_SITE, 1, "CH_CAVERN_SITE"},
     {CH_CAVERN_ROUGH, 1, "CH_CAVERN_ROUGH"},

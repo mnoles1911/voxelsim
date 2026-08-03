@@ -1,0 +1,138 @@
+W5 -- FIELD COUPLING v1 (kWorldGenVersion 27)
+Measured 2026-08-03, seed 20260719, SyntheticTileSampler, region centred on the
+origin, 819.2 m span, 384x384 samples (0.4442 km^2), scan band surface..45 m.
+
+  vxc_caveprobe --synthetic 20260719 --origin 0 0 --span 819.2 --px 384 \
+      --no-images --connect 160 [--field-off]
+
+THE COMPARISON IS A SINGLE-TERM CONTROL IN ONE WORLD, not two builds. Both arms
+are the SAME seed, the SAME columns, the SAME terrain and the SAME shipping
+predicate (caveCarveAt); they differ only in whether the six gate values come
+from the coupling field or from kCaveGatesNeutral, which reproduces v26's rates
+-- and, for the edge and entrance gates, v26's exact draws. See
+cave_families.h's caveLatticeWithoutFieldCoupling and caves.h's caveGateOpen for
+why a threshold can be bit-identical to a two-bit test.
+
+---------------------------------------------------------------------------
+THE NUMBERS
+---------------------------------------------------------------------------
+                                     control (v26 gates)   W5 on      ratio
+  carved volume, % of solid band          1.440%           2.727%     1.89x
+    of which tunnel                       1.1174%          2.3001%    2.06x
+    of which crevice                      0.0486%          0.1595%    3.28x
+    of which entrance (shaft)             0.0779%          0.0764%    0.98x
+  tunnel axis length per km^2            44,473 m         53,496 m    1.20x
+  tunnel floor area, m^2/km^2           133,002          213,732      1.61x
+  crevice standable floor spots             483              975      2.02x
+  entrance sites open (of 64)                20               19      0.95x
+  perforated surface columns             0.2157%          0.2258%     1.05x
+  thinnest non-shaft roof                   6.0 m            6.0 m    --
+  columns with any cave                   15.3%            23.5%      1.54x
+
+READ THE ROWS THAT DID *NOT* MOVE FIRST.
+
+  * The ROOF is 6.0 m in both arms, against a 6.0 m clamp. That is the number
+    the v27 calibre widening put at risk: a 4.0 m tube cannot sit 9 m down
+    under a 6 m clamp by arithmetic alone, so the guarantee moved from a
+    two-constant static_assert into a per-control-value cap
+    (caves.h caveScaledRadiusMm) plus a linearity argument. This row is the
+    measurement that the cap holds on real geometry, and it holds exactly --
+    the clamp is still a backstop, not the mechanism.
+
+  * ENTRANCES BARELY MOVED, and that is a real (negative) result rather than a
+    rounding artifact. 20 sites open at v26's flat 1-in-4, 19 at the field's
+    1-in-8..1-in-3. The SET changed -- four sites the control reports as
+    "GATED OPEN BUT SEALED" are closed in the shipping arm and three others
+    opened -- but the COUNT did not, because this fixture's relief at the node
+    anchors sits near the middle of the ramp, where the field's gate is close
+    to 1-in-4 by construction. The entrance-density half of W5 is therefore
+    NOT demonstrated by this fixture, and no claim is made for it here. It
+    needs a run over real tiles spanning a plain and a range; see OUTSTANDING.
+
+  * PERFORATION moved 5%, i.e. essentially not at all, which is the point: the
+    surface is not more of a colander at v27 than at v26 on this ground.
+
+WHAT DID MOVE IS THE TUNNEL AND FRACTURE VOLUME: 2.06x and 3.28x on
+high-relief synthetic ground. The two terms behind them are separable in the
+table -- axis LENGTH is up 1.20x (that is the density gate, more non-backbone
+edges opening) and volume is up 2.06x, so the remaining 1.7x is CALIBRE. Both
+are doing work, and the calibre term is the larger of the two.
+
+GLOBAL VOLUME IS WITHIN BUDGET, treated as a gate rather than a note: 2.727%
+of the 6..45 m subsurface band is cave air, against the 15% ceiling
+cave_volume_fraction_is_cave_like_not_sponge_like enforces -- 5.5x of headroom,
+and the ctest reads 2.816% on its own footprint. The band's DEPTH envelope did
+not move at all (caves.h kCaveDeepestCarveMm, 41.0 m, still set by the crevice
+down-reach rather than by the widened tube).
+
+---------------------------------------------------------------------------
+THE NOISE FLOOR, AND ONE INSTRUMENT GAP FOUND WHILE MEASURING
+---------------------------------------------------------------------------
+Two of the rows above are bounded below by the construct rather than by the
+field, and saying so is the point:
+
+  * entrance VOLUME cannot move much in either direction, because the cavity's
+    footprint is deliberately NOT field-scaled (see caves.h "G5 MOUTH BUDGET"
+    for the measurement that dropped that term), so 0.98x is the expected null,
+    not a weak signal.
+
+  * plan components (3 vs 3) and the two cavern rows (2 open sites in both
+    arms) are unaffected BY CONSTRUCTION -- W5 couples G1/G3/G5 and leaves G2
+    to W6 -- so they are controls on the control, not results.
+
+AND ONE LINE IN THAT OUTPUT IS NOT AN A/B AT ALL, WHICH IS WORTH RECORDING
+RATHER THAN QUIETLY DROPPING. The `cave-only flood fill` block reports
+byte-identical numbers in both arms (components=4, 74663 samples, largest
+66.82%). That is not a null result: `--field-off` is wired through
+caveColumnVariantsFor and through the site-gate helper, but the connectivity
+section reduces columns through the shipping `Amplifier` directly, so it sees
+the shipping arm in BOTH runs. The connectivity effect of the density gate is
+therefore UNMEASURED, not measured-as-zero. It is exactly the shape of error
+W3's mouth metric and W4's first floor statistic were -- a statistic satisfied
+by the construct rather than by the thing under test -- and it is listed under
+OUTSTANDING rather than reported.
+
+The structural argument for connectivity is unchanged and does not depend on
+that measurement: the density gate only ever moves the 1-in-N rate on
+NON-BACKBONE edges, and the backbone is unconditional, so the network stays
+connected by construction for every seed even if the density field went to
+zero. That is a property of the formulation, not of a threshold.
+
+---------------------------------------------------------------------------
+CPU/GPU
+---------------------------------------------------------------------------
+vxc_gpu PASSES bit-exact at kWorldGenVersion 27 on an AMD Radeon RX 7800 XT,
+59,520 columns / 18,843,648 cells / 14,626 quads over 12 regions, digest
+ec45911f93ad4c47 (v26 was 68acd4a2d65f4d0f). The cave-band fixture's exercised
+count rose 2027 -> 2439 cave columns of 4096 and the entrance fixture's 9691 ->
+11120, i.e. the fixtures do reach the changed code.
+
+VoxelizeMain now binds ClimatePacked (t1 -> Vulkan binding 2) alongside
+ElevationMm, because the field taps are per lattice NODE: the CPU memoises them
+per lattice cell (65'536 columns) and the shader cannot. Cost measured on the
+harness: VoxelizeMain total dispatch 11.32 ms -> 14.16 ms over the same 18.8M
+cells (1664 -> 1331 Mcells/sec). That is 16 climate loads plus 64 raw elevation
+loads per thread and it is the honest price of the wave.
+
+---------------------------------------------------------------------------
+OUTSTANDING
+---------------------------------------------------------------------------
+1. NO RENDERED FRAME EXISTS. The Verify line's tunnel-interior + aerial pairs
+   at tundra / savanna / high-relief, and the W1 plan-view at both, are all
+   outstanding: the box's one editor slot was held for this whole session.
+
+2. NO REAL-TILE RUN. Every number above is on SyntheticTileSampler, whose
+   climate is noise rather than physical and whose relief saturates. The
+   tundra-vs-savanna half of the Verify line is a TEMPERATURE contrast and
+   cannot be shown on this fixture at all; the entrance-density half needs a
+   fixture that spans a plain and a range. Both want
+   `vxc_caveprobe <s16 tiledir> --scale 16 --coarse-dir <s1 tiledir>` at two
+   chosen sites, and site selection must be done on s16 (see MEMORY).
+
+3. THE UE-SIDE kExpectedCpuDigest WAS NOT RE-MEASURED and is expected to be
+   wrong -- it needs voxel.GPU.VerifyRegion in the editor. See the loud block
+   at that constant in VoxelGpuVerify.cpp. Unlike v22/v25/v26, this one almost
+   certainly moved: v27 changes tunnel density and calibre everywhere and the
+   fold includes cell materials.
+
+4. THE FLOOD-FILL ARM OF --field-off IS NOT WIRED (above).

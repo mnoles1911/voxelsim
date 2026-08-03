@@ -33,6 +33,7 @@
 //     binding 3: OutColumns       (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u0, RW)
 //   VoxelizeMain pipeline descriptor set:
 //     binding 0: WorldGenParams   (VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b0; same buffer as above)
+//     binding 2: ClimatePacked    (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t1; same buffer as above, v27 W5 field gates)
 //     binding 4: InColumns        (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, t3; same buffer as OutColumns)
 //     binding 5: OutCells         (VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, u2, RW)
 //
@@ -713,13 +714,20 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
     // evaluate terrain height at the SITE's own xy — which is generally not a
     // column in the dispatch, so it cannot be carried on GpuColumnSample and
     // must be recomputed from the elevation raster in-shader.
-    VkDescriptorSetLayoutBinding voxBindings[4]{};
+    //
+    // Binding 2 (ClimatePacked) is new as of the v27 W5 field coupling: the cave
+    // pass's density/calibre/fracture gates read the climate raster's bio_1 byte
+    // at each lattice node anchor (caves.h caveGatesFromField). Same argument as
+    // binding 1 one wave later -- a node is generally not a column in the
+    // dispatch, so the value cannot ride GpuColumnSample.
+    VkDescriptorSetLayoutBinding voxBindings[5]{};
     voxBindings[0] = {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     voxBindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    voxBindings[2] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
-    voxBindings[3] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[3] = {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    voxBindings[4] = {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
     VkDescriptorSetLayoutCreateInfo voxDslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    voxDslci.bindingCount = 4;
+    voxDslci.bindingCount = 5;
     voxDslci.pBindings = voxBindings;
     vkCheck(vkCreateDescriptorSetLayout(ctx.device, &voxDslci, nullptr, &ctx.voxDescSetLayout),
             "vkCreateDescriptorSetLayout(voxelize)");
@@ -752,7 +760,7 @@ GpuContext createContext(const std::string& spvPath, const std::string& voxelize
 
     VkDescriptorPoolSize voxPoolSizes[2]{};
     voxPoolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1};
-    voxPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3};
+    voxPoolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4}; // v27: +ClimatePacked
     VkDescriptorPoolCreateInfo voxDpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     voxDpci.maxSets = 1;
     voxDpci.poolSizeCount = 2;
@@ -1389,16 +1397,19 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     // pass's site-surface evaluation), binding 4 (InColumns) the SAME
     // columnsBuf ColumnMain just wrote, binding 5 (OutCells) the new cellsBuf.
     VkDescriptorBufferInfo cellsInfo{cellsBuf.buffer, 0, VK_WHOLE_SIZE};
-    VkWriteDescriptorSet voxWrites[4]{};
+    VkWriteDescriptorSet voxWrites[5]{};
     voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
     voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 1, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
-    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
+    // v27: the same climate buffer ColumnMain reads, for the W5 field gates.
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 2, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
+    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 4, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
+    voxWrites[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, ctx.voxDescSet, 5, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 4, voxWrites, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 5, voxWrites, 0, nullptr);
 
     const uint32_t groupsX = (region.width + 7) / 8;
     const uint32_t groupsY = (region.height + 7) / 8;
@@ -1772,13 +1783,14 @@ struct FlightDescriptors {
 FlightDescriptors createFlightDescriptors(GpuContext& ctx, int32_t totalSlots,
                                            std::vector<FlightSlot>& slots) {
     FlightDescriptors fd;
-    // Per tile: colSet (1 uniform + 3 storage), voxSet (1 uniform + 3 storage
-    // -- elevation joined it with the C6 cavern mirror),
+    // Per tile: colSet (1 uniform + 3 storage), voxSet (1 uniform + 4 storage
+    // -- elevation joined it with the C6 cavern mirror, climate with the v27
+    // W5 field coupling),
     // meshCountSet/meshEmitSet/scanSet (1 uniform + 6 storage each, x3) --
     // mirrors createContext()'s pool-size derivation, just x totalSlots.
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uint32_t(totalSlots) * 5};
-    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(totalSlots) * 24};
+    poolSizes[1] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, uint32_t(totalSlots) * 25};
     VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpci.maxSets = uint32_t(totalSlots) * 5;
     dpci.poolSizeCount = 2;
@@ -1844,16 +1856,19 @@ void writeColVoxDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
     VkDescriptorBufferInfo cellsInfo{s.gb.cellsBuf.buf.buffer, 0, VK_WHOLE_SIZE};
     // Binding 1 (ElevationMm) is bound to the voxelize set too since the C6
     // cavern mirror — see the voxBindings comment in initVulkan().
-    VkWriteDescriptorSet voxWrites[4]{};
+    // v27: binding 2 (ClimatePacked) joins it for the W5 field gates.
+    VkWriteDescriptorSet voxWrites[5]{};
     voxWrites[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &paramsInfo, nullptr};
     voxWrites[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 1, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &elevInfo, nullptr};
-    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 4, 0, 1,
+    voxWrites[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 2, 0, 1,
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &climInfo, nullptr};
+    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 4, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &columnsInfo, nullptr};
-    voxWrites[3] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 5, 0, 1,
+    voxWrites[4] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, s.voxSet, 5, 0, 1,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &cellsInfo, nullptr};
-    vkUpdateDescriptorSets(ctx.device, 4, voxWrites, 0, nullptr);
+    vkUpdateDescriptorSets(ctx.device, 5, voxWrites, 0, nullptr);
 }
 
 void writeMeshDescriptorsSlot(GpuContext& ctx, FlightSlot& s) {
