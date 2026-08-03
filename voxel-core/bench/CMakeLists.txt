@@ -52,6 +52,19 @@ if(NOT MSVC)
   target_compile_options(vxc_riverprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_caveprobe: the underground system's first instrument (W1 of
+# docs/underground-system-plan.md). Plan views and vertical cross-sections of
+# the SHIPPING carve predicates as PNGs, plus the per-family census -- volume,
+# entrances, floor area/headroom, depth distribution, passage-direction lock and
+# connectivity -- that a cave redesign has to be judged against. Nobody can
+# judge a cave change from a screenshot, and until this existed there was no
+# measurement at all. -------------------------------------------------------
+add_executable(vxc_caveprobe caveprobe.cpp)
+target_link_libraries(vxc_caveprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_caveprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_dump_biome_constants: prints biome.h's compile-time-derived
 # thresholds as plain integers, for hand-transcription into worldgen.ush's
 # mirror (HLSL has no climate.h). Hand-arithmetic is how a mirror drifts. -----
