@@ -771,10 +771,19 @@ def superblock_gate_verdict(
     upstream catchment -- which routinely lies outside the tile. A superblock
     supplies that context. When it is incomplete, rivers entering from the
     absent tiles contribute nothing, so the tile is carved by less water than
-    really flows through it: you do not get wrong water, you get wrong
-    mountains, and the valleys fade out where the data ran out.
+    really flows through it.
 
-    And it never heals. ``pipeline.ORDER_DEPENDENCE`` is explicit: "A tile baked
+    THE ELEVATION ARGUMENT FOR THIS GATE WAS MEASURED AND IS FALSE. An earlier
+    version of this docstring claimed "you do not get wrong water, you get wrong
+    mountains". Tested by baking a tile with and without its injected inflow:
+    ZERO elevation cells moved past the 100 mm wire LSB, and 5 of 67M flow cells
+    changed. Do not restore that claim, and do not justify this gate on visible
+    terrain damage -- if someone re-measures and finds the same nulls, the gate
+    will look unfounded and get removed.
+
+    The gate stands on DETERMINISM instead, which the same test confirms: those
+    5 cells are 5 cells of disagreement between two clients that baked the same
+    coordinates against different neighbour sets, and it never heals. ``pipeline.ORDER_DEPENDENCE`` is explicit: "A tile baked
     against an incomplete superblock stays baked that way", because a shipped
     tile is never regenerated. So the defect is permanent in a way an ordinary
     warning is not, and it was previously emitted as a warning that pregen then
@@ -808,9 +817,10 @@ def superblock_gate_verdict(
         )
     return False, (
         f"error: tile ({{x}},{{y}}) baked against {what}. Its upstream "
-        "catchment is truncated, so it is carved by less water than really "
-        "flows through it, and a shipped tile is never regenerated -- refusing "
-        "to publish it. Generate the missing coarse tiles and re-run, or pass "
+        "catchment is truncated, so its routing depends on which neighbours "
+        "happened to exist, and a shipped tile is never regenerated -- two "
+        "clients would disagree about this ground forever -- refusing to "
+        "publish it. Generate the missing coarse tiles and re-run, or pass "
         "--allow-incomplete-superblock for a throwaway development bake."
     )
 
