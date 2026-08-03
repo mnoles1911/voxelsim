@@ -36,7 +36,45 @@ are what landed on disk, not just the HEAD-reported Content-Length.
 
 ## Status
 
-Textures are fetched and importable (see `ue-project/Tools/import_sky_textures.py`),
-but **there is no sky material yet** -- none of this repo's
-`create_*_material.py` scripts builds one. These assets currently have
-nowhere to render; that is expected, not a bug.
+**These textures now render, and the import step is REQUIRED.** Superseded on
+2026-08-02; this section previously said there was no sky material and that the
+assets had "nowhere to render". That stopped being true in `befb438`/`2284c5e`,
+which shipped `M_NightSky` and `M_SkyAtmosphereDome` (built by
+`ue-project/Tools/create_sky_material.py` and
+`create_sky_atmosphere_dome_material.py`). Both carry hard package references to
+`/Game/Voxel/T_SkyStarmap`, and `M_NightSky` also to `/Game/Voxel/T_MoonColor`.
+
+Getting the sky on screen is therefore TWO steps, and the second one is easy to
+skip because nothing enforces it:
+
+```powershell
+.\tools\fetch-sky-assets.ps1                      # 1. download into tools/sky-assets/
+& 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe' `
+    .\ue-project\VoxelEarth.uproject -run=pythonscript `
+    -script=.\ue-project\Tools\import_sky_textures.py -unattended -nop4 -nosplash
+```
+
+The `.uasset` outputs are gitignored build artifacts (`.gitignore:82-84`) --
+`T_SkyStarmap` alone is 38.8 MB against a repo whose largest tracked binary is
+385 KB -- so **a fresh clone has the materials but not the textures**, and the
+import has to be re-run per checkout.
+
+**What skipping step 2 looks like**, observed on 2026-08-02 in a checkout where
+only step 1 had been run. The sky subsystem initialises normally and
+`VoxelSky clock RESOLVED` still appears, so the log looks healthy; the tell is:
+
+```
+LogMaterial: Warning: M_NightSky: Requesting an invalid TextureIndex! (1 / 1)
+LoadErrors: While trying to load package /Game/Voxel/M_NightSky, a dependent
+            package /Game/Voxel/T_SkyStarmap was not available.
+LoadErrors: While trying to load package /Game/Voxel/M_SkyAtmosphereDome, a
+            dependent package /Game/Voxel/T_SkyStarmap was not available.
+```
+
+Note this is NOT caught by the material guard in `VoxelSkyDomeActor.cpp:135-141`:
+that only tests whether the material object loads, and a material with an
+unresolved texture reference still loads. `bAtmosphereMaterialValid` stays true,
+so the IsSky dome is still shown -- i.e. a missing texture degrades silently,
+unlike a missing material, which is refused loudly. Grep the log for
+`invalid TextureIndex` or `T_SkyStarmap ... was not available` to tell the two
+apart.
