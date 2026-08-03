@@ -81,6 +81,14 @@ Downsample (120 m/px is plenty for a 261 km world) or use JPEG.
 | `vista_map.py` | Where are the screenshot sites? (pins on the world hillshade) |
 | `find_site.py` | Where should I stand to photograph biome X? |
 
+Not in this directory but held to the same conventions:
+`../lake_survey.py` (watershed plan work item 2) — where are the basins, how
+many, how deep, and which of them hold water? It calls `province_fields`
+through the bake's own object rather than re-deriving a discriminant, and its
+overlays sit beside the report in `docs/lake-survey/`. Its expensive half is a
+BAKE per tile, so it runs on the pod; the report half is numpy over the dumps
+and re-sweeps every threshold without re-baking.
+
 ## Picking screenshot sites
 
 Sites chosen off a biome map by eye are wrong often enough to be worth
