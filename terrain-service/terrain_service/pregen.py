@@ -70,6 +70,164 @@ from .world_manifest import record_world_identity
 COARSE_SCALE = 1
 
 
+def _build_model_parent(args, provider, geom, consts, kernels, cache, blocks):
+    """The MODEL-BACKED top of the hydrology pyramid, or None.
+
+    WHAT PROBLEM. ``superblock_max_level`` (1 by default, 246 km) gets no
+    inflow at its own edges, so a river draining more than 246 km arrives with
+    ZERO upstream area and carves nothing -- ``pipeline.HYDROLOGY_RESIDUALS``
+    #2. The fix is a parent above it, and the cheapest parent available is the
+    diffusion model's own coarse stage: one cell is 7.68 km, so a 512^2 window
+    spans 3,932 km and costs coarse-stage inference only. Buying the same reach
+    as an EXACT pyramid level would need 4,096 coarse tiles (~6 GB) to exist
+    first, and only reach 983 km.
+
+    WHY HERE. ``bake/pipeline.py`` receives a ``CoarseFetch`` callable and must
+    not learn that a diffusion model exists -- that is a design property, not
+    an accident. ``pregen`` holds the provider AND calls
+    ``build_flow_superblock``, so it is the one place both halves are already
+    in scope. ``pipeline.build_model_superblock`` takes an ARRAY.
+
+    WHY THE WINDOW IS WORLD-ANCHORED. Same reason ``superblock_index`` floors:
+    two top-level blocks that share an edge must see the same parent, or the
+    two sides of that edge disagree about how much water crosses it. The window
+    grid is anchored at multiples of ``--bake-model-window`` coarse cells and
+    the window is required to be a whole number of top-level blocks, so a block
+    can never straddle two windows and get half a parent.
+
+    ``blocks`` is the set of top-level ``(sx, sy)`` this run needs. They must
+    all land in ONE window: a run spanning two windows would need two parents,
+    which is supportable but has never been needed (one window is 3,932 km) and
+    is refused rather than half-implemented.
+    """
+    import numpy as np
+
+    from .bake import pipeline as bp
+
+    if not hasattr(provider, "coarse_elevation_m"):
+        print(
+            f"error: --bake-model-parent needs a provider that can serve its "
+            f"own coarse stage; {type(provider).__name__} cannot. Use "
+            "--provider diffusion against a real checkpoint (not --dry-run).",
+            file=sys.stderr,
+        )
+        return None
+
+    fine_px = provider.coarse_cell_fine_px(args.seed)
+    cells_per_tile, rem = divmod(geom.coarse_tile_px, fine_px)
+    if rem or cells_per_tile < 1:
+        print(
+            f"error: a {geom.coarse_tile_px}px coarse tile is not a whole "
+            f"number of {fine_px}px coarse cells; the model window cannot be "
+            "aligned to the tile grid.",
+            file=sys.stderr,
+        )
+        return None
+
+    top = bp.FlowLevel(level=consts.superblock_max_level, geom=geom, consts=consts)
+    block_cells = top.tiles_per_side * cells_per_tile
+    window = int(getattr(args, "bake_model_window", 512))
+    if window % block_cells:
+        print(
+            f"error: --bake-model-window {window} is not a multiple of the "
+            f"{block_cells} coarse cells a level-{top.level} superblock spans. "
+            "A block straddling two windows would get half a parent and no "
+            "warning; pick a multiple.",
+            file=sys.stderr,
+        )
+        return None
+
+    # World-anchored: the window index comes from the block's own world
+    # position, never from where this run happens to be centred.
+    windows = {(sx * block_cells // window, sy * block_cells // window)
+               for sx, sy in blocks}
+    if len(windows) != 1:
+        print(
+            f"error: this run's level-{top.level} superblocks span "
+            f"{len(windows)} model windows ({sorted(windows)}). One window is "
+            f"{window * fine_px * geom.coarse_pixel_m / 1000:.0f} km; a run "
+            "wider than that needs one parent per window, which is not wired.",
+            file=sys.stderr,
+        )
+        return None
+    mx, my = windows.pop()
+
+    cell_m = fine_px * geom.coarse_pixel_m
+    origin_m = (mx * window * cell_m, my * window * cell_m)
+    cpu0 = time.process_time()
+
+    # Reuse a cached window only when it is the SAME window. The cache key
+    # (fine_provider_id, seed, level, index) covers the checkpoint, the
+    # conditioning data and the world shape, but NOT the window size -- and
+    # unlike a tile-backed block this one's fingerprint cannot be re-verified
+    # without re-running inference, which is the cost the cache exists to
+    # avoid. Geometry is the part that can be checked for free, so check it.
+    sb = None
+    blob = cache.get_flow(provider.fine_provider_id, args.seed,
+                          bp.MODEL_FLOW_LEVEL, mx, my)
+    if blob is not None:
+        try:
+            cached, _ = bp.decode_flow_superblock(blob)
+        except ValueError as e:
+            print(f"  warning: cached model window is unreadable ({e}); "
+                  "rebuilding", file=sys.stderr)
+        else:
+            if (cached.size_px, cached.cell_m, cached.origin_m) == (
+                window, cell_m, origin_m
+            ):
+                sb = cached
+            else:
+                print(
+                    f"  warning: cached model window ({mx},{my}) is "
+                    f"{cached.size_px}px @ {cached.cell_m:.0f}m from "
+                    f"{cached.origin_m}, this run wants {window}px @ "
+                    f"{cell_m:.0f}m from {origin_m}; rebuilding",
+                    file=sys.stderr,
+                )
+
+    if sb is None:
+        ci0, cj0 = my * window, mx * window
+        elev = provider.coarse_elevation_m(
+            args.seed, ci0, ci0 + window, cj0, cj0 + window
+        )
+        sb = bp.build_model_superblock(
+            np.asarray(elev, np.float32),
+            origin_m=origin_m,
+            cell_m=cell_m,
+            kernels=kernels,
+            sx=mx,
+            sy=my,
+            consts=consts,
+        )
+        cache.put_flow(
+            provider.fine_provider_id, args.seed, bp.MODEL_FLOW_LEVEL, mx, my,
+            bp.encode_flow_superblock(sb, args.seed),
+        )
+
+    # A parent that only half-covers its child injects at the edges it reaches
+    # and truncates the rest -- silently, with fewer entry cells and smaller
+    # rivers as the only symptom. The alignment arithmetic above should make
+    # this impossible; assert it rather than trust it.
+    for sx, sy in sorted(blocks):
+        child_origin = (sx * top.span_m, sy * top.span_m)
+        if not bp.superblock_covers(sb, child_origin, top.span_m):
+            print(
+                f"error: model window ({mx},{my}) does not cover level-"
+                f"{top.level} superblock ({sx},{sy}) at {child_origin}",
+                file=sys.stderr,
+            )
+            return None
+
+    print(
+        f"[flow M] model window ({mx},{my}) {window}x{window} @ "
+        f"{cell_m:.0f} m/px, span {window * cell_m / 1000:.0f} km, "
+        f"origin {origin_m}  max_acc={float(sb.acc.max()) / 1e6:,.0f} km2  "
+        f"fp={sb.fingerprint_hex[:12]}  cpu={time.process_time() - cpu0:.1f}s",
+        file=sys.stderr,
+    )
+    return sb
+
+
 def _coarse_planes(cache: TileCache, provider, seed: int, x: int, y: int,
                    generate: bool):
     """Coarse tile (x, y) as ``(elevation_m float32, climate uint8)``, or None.
@@ -324,15 +482,45 @@ def _run_bake(args, provider, cache: TileCache) -> int:
     superblocks: dict[tuple[int, int, int], object] = {}
     stale_superblocks = 0
     incomplete_superblocks = 0
+
+    # THE TOP LEVEL'S OWN PARENT, from the model rather than from tiles.
+    # Without it the top level receives nothing at its edges and every
+    # catchment larger than its span (246 km) is truncated to zero upstream
+    # area -- pipeline.HYDROLOGY_RESIDUALS #2. Built BEFORE the level loop so
+    # the loop below stays a plain "parent is the level above".
+    # getattr, like allow_incomplete_superblock below: _run_bake is called with
+    # hand-built argument objects by tools outside this module, and a new flag
+    # must not break them.
+    model_parent = None
+    if getattr(args, "bake_model_parent", False):
+        top = levels[0]
+        model_parent = _build_model_parent(
+            args, provider, geom, consts, kernels, cache,
+            {bp.superblock_index(x, y, top) for (x, y) in ring},
+        )
+        if model_parent is None:
+            return 1
+
     for level in levels:
         needed = {bp.superblock_index(x, y, level) for (x, y) in ring}
         for sx, sy in sorted(needed):
+            entry_mode = bp.ENTRY_FOOTPRINT
             parent = None
             if level.level < consts.superblock_max_level:
                 up = bp.FlowLevel(level=level.level + 1, geom=geom, consts=consts)
                 # The parent covering this block's own origin tile.
                 ptx, pty = sx * level.tiles_per_side, sy * level.tiles_per_side
                 parent = superblocks.get((up.level,) + bp.superblock_index(ptx, pty, up))
+            elif model_parent is not None:
+                parent = model_parent
+                # The entry mode is a per-HOP choice because the ratio is. At
+                # L1 -> L0 the footprint is 4x4 and the two modes barely
+                # differ; at M -> L1 it is 64x64 and ENTRY_FOOTPRINT can put a
+                # continental river 3.8 km inside the domain, possibly across a
+                # divide. See pipeline.ENTRY_CROSSING.
+                entry_mode = getattr(
+                    args, "bake_model_entry_mode", bp.ENTRY_CROSSING
+                )
             parent_fp = parent.inputs_fingerprint if parent is not None else b""
 
             blob = cache.get_flow(fine_provider_id, args.seed, level.level, sx, sy)
@@ -349,6 +537,14 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                         file=sys.stderr,
                     )
                     sb = None
+            if sb is not None and getattr(args, "bake_rebuild_superblocks", False):
+                # A cached block is normally REUSED even when its fingerprint
+                # says the world moved, because it is what the tiles already
+                # baked against (ORDER_DEPENDENCE). That policy makes an A/B
+                # impossible: turning the model parent on changes only the
+                # fingerprint, so the parentless block would be reused and the
+                # experiment would silently measure nothing.
+                sb = None
             if sb is not None and verify_superblocks:
                 # THE ORDER-DEPENDENCE CHECK (pipeline.ORDER_DEPENDENCE). A
                 # cached superblock was built from whatever coarse tiles
@@ -362,6 +558,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     sy,
                     level,
                     parent_fingerprint=parent_fp,
+                    entry_mode=entry_mode,
                 )
                 if now_fp != sb.inputs_fingerprint:
                     stale_superblocks += 1
@@ -383,6 +580,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     level,
                     kernels,
                     parent=parent,
+                    entry_mode=entry_mode,
                 )
                 cache.put_flow(
                     fine_provider_id,
@@ -678,6 +876,62 @@ def main() -> int:
             "Bake mode: override BakeConstants.superblock_max_level. Level L "
             "spans 4^(L+1) tiles; the top level receives no inflow at its own "
             "edges, so it is where catchment truncation happens."
+        ),
+    )
+    parser.add_argument(
+        "--bake-model-parent",
+        action="store_true",
+        help=(
+            "Bake mode: give the TOP flow superblock level a parent built from "
+            "the diffusion model's own coarse stage (7.68 km/px), so a "
+            "catchment larger than that level's 246 km span is no longer "
+            "truncated to zero upstream area (pipeline.HYDROLOGY_RESIDUALS "
+            "#2). Costs one coarse-stage inference over "
+            "--bake-model-window^2 cells and ZERO coarse tiles. Needs "
+            "--provider diffusion against a real checkpoint. OPT-IN: it "
+            "changes every top-level superblock's inputs fingerprint, hence "
+            "the rivers, hence the terrain."
+        ),
+    )
+    parser.add_argument(
+        "--bake-model-window",
+        type=int,
+        default=512,
+        help=(
+            "Bake mode: edge of the model coarse-map window, in coarse cells "
+            "(7.68 km each). This is the largest catchment the pyramid can "
+            "resolve: 512 spans 3,932 km (Mississippi-scale) for one "
+            "coarse-stage inference. Must be a whole number of top-level "
+            "superblocks (32 cells each at the default max level) so no block "
+            "straddles two windows."
+        ),
+    )
+    parser.add_argument(
+        "--bake-model-entry-mode",
+        choices=("footprint", "crossing"),
+        default="crossing",
+        help=(
+            "Bake mode: where a model-parent cell's through-flow lands inside "
+            "its child. 'footprint' is the pyramid's historical rule (lowest "
+            "cell anywhere in the parent cell's footprint) and is fine at the "
+            "4x4 ratio between tile-backed levels; at the model parent's 64x64 "
+            "it can deposit a continental river ~3.8 km INTO the domain, "
+            "possibly across a divide. 'crossing' (default) restricts the "
+            "search to the face the flow actually crosses. Affects the M -> "
+            "top hop only; see pipeline.ENTRY_CROSSING."
+        ),
+    )
+    parser.add_argument(
+        "--bake-rebuild-superblocks",
+        action="store_true",
+        help=(
+            "Bake mode: rebuild every flow superblock, ignoring cached ones. "
+            "Normally a cached block is reused even when its fingerprint says "
+            "the world has moved, because it is what the tiles already baked "
+            "against (pipeline.ORDER_DEPENDENCE) -- which makes an A/B of a "
+            "hydrology change impossible, since the 'after' arm would silently "
+            "reuse the 'before' block. Use for experiments, in a scratch "
+            "--cache-dir."
         ),
     )
     parser.add_argument(

@@ -1368,11 +1368,59 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
 
 2. **The top of the pyramid is open.** Level ``superblock_max_level`` receives
    no inflow at its own edges, so a catchment larger than that level's span
-   (245 km at the default level 1) is truncated. The plan's answer is to seed
-   the top level from terrain-diffusion's own coarse map at 7.7 km/px; the
-   hook is ``build_flow_superblock(parent=...)`` and it is UNWIRED -- reading
-   the model's coarse map needs WorldPipeline internals this service does not
-   have. Until then the top level is the truncation point.
+   (245 km at the default level 1) is truncated.
+
+   WIRED 2026-08-03, as an opt-in: ``build_model_superblock`` builds a
+   ``FlowSuperblock`` from a raster the CALLER supplies -- in production the
+   diffusion model's own coarse map at 7.68 km/px -- and ``pregen --mode bake
+   --bake-model-parent`` passes it as ``parent=`` to the top tile-backed
+   level. A 512^2 window spans 3,932 km and needs zero coarse tiles, against
+   4,096 of them (~6 GB) to buy one more EXACT level worth 983 km.
+
+   This module still knows nothing about a diffusion model: the factory takes
+   an array, exactly as the rest of the pyramid takes a ``CoarseFetch``. The
+   provider lives in ``pregen``, which owns both halves. See
+   ``docs/parent-hook-scope.md``.
+
+   What it does NOT fix, all three MEASURED on seed 20260719 (289 coarse
+   tiles, level-1 block (-1,-1), 512^2 window, 2026-08-03):
+
+   a. The model window has an open top of its OWN, three coarse cells shy of
+      4,000 km instead of 246. Truncation is pushed out 16x per axis, not
+      removed.
+   b. **Most of what arrives is not drainage, it is sea floor.** The priority
+      flood fills the ocean basin and MFD routes it like any other surface, so
+      at 7.68 km/px with a 61.7% ocean window the biggest crossing carried
+      183,882 km^2 into the block through a parent cell 2,065 m BELOW sea
+      level, only 41.4% of it land. Of the 222,888 km^2 injected in total,
+      **2.9% landed on cells above sea level**; 611 of 1.9 M land cells moved
+      at all. It is not harmful -- water entering at -2,000 m flows further
+      down, out to sea, and never reaches a shipped hillslope -- but the
+      headline number is not a river, and anyone quoting it should say so.
+      Gating injection on land is a real option and is deliberately NOT taken
+      here: it would need its own experiment, and a coastal plain below the
+      coarse cell's mean is exactly where it would go wrong.
+   c. The terrestrial gain is real but LOCAL to the boundary. Every tile that
+      changed sits on the top level's own edge, because that is where
+      injection happens; the best land tile went from 470.1 to 1,075.5 km^2 of
+      catchment (2.29x). Whether a continental river appears at all depends on
+      whether one drains into that particular 246 km block -- for this world,
+      none does.
+   d. **The reach is not symmetric, and where it points is arbitrary.** The
+      window is world-anchored on a multiple of its own size, so a top-level
+      block can sit anywhere in it -- and on seed 20260719 it sits in the
+      extreme +x/+y CORNER (window cells [-512, 0), block cells [-32, 0)).
+      Upstream area arriving from beyond the block's east or south edge is
+      still truncated exactly as before; only west and north got the 3,932 km.
+
+      Anchoring is what makes the pyramid cacheable (``superblock_index``:
+      two tiles sharing an edge must read the same block), but a window
+      CENTRED on its own top-level block would also be a deterministic
+      function of that block, and would give every block the full radius. The
+      cost is that two adjacent blocks would then see different windows and
+      could disagree about the flow crossing their shared edge -- which they
+      already do, since each runs its own fill and accumulation. Worth
+      measuring; deliberately not changed here on argument alone.
 
 3. **Routing disagreement between levels.** Injected area arrives where the
    30 m D8 routing says it crosses, not where the 1.875 m MFD routing would
@@ -1410,6 +1458,47 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
    ``filled`` raster (world-anchored, shared, 61 km at level 0), NOT more
    inflow: ``inject_edge_inflow`` runs after the fill and cannot change where
    the surface lets water go. Not wired.
+
+7. **A level only ever hands its child what CROSSES the child's boundary.**
+   Found while measuring #2's fix, and it is the reason that fix delivered so
+   little. ``inject_edge_inflow`` counts parent cells that are OUTSIDE the
+   child and drain INTO it. Area added to the parent anywhere INSIDE the
+   child's own footprint is therefore invisible to that child, which rebuilds
+   its accumulation from its own coarse tiles and never learns of it.
+
+   Normally harmless -- a large catchment crosses many boundaries on its way
+   down, so it is picked up at each hop. It bites when the new area is
+   injected CLOSE to where it is wanted, which is exactly what a top-level
+   parent does: it deposits on the top level's rim, and everything within one
+   child block of that rim shares a block with the deposit.
+
+   MEASURED, seed 20260719, 2026-08-03, and it goes all the way down:
+
+     * the model parent moved level-1 accumulation on 0.49% of cells and took
+       the best land tile from 470.1 to 1,075.5 km^2;
+     * **1 of the 16 level-0 blocks under it changed at all** -- block
+       (-4,-3), inflow 21,399.1 -> 21,854.7 km^2 (+455.6, +2.1%) -- delivering
+       to exactly ONE tile, (-16,-9), 2,238.4 -> 2,683.9 km^2, 35,249 cells;
+     * of those 35,249 changed level-0 cells, **35,232 (100.0%) lie INSIDE
+       that tile's own padded domain**. The bake re-derives its interior from
+       the coarse elevation and imports only a boundary condition, so a change
+       inside the domain is discarded. The inflow handed to ``bake_tile`` was
+       identical to four decimals in both arms (384.4912 km^2, 214 entry
+       cells) and the tile baked BYTE-IDENTICAL in elevation, accumulation and
+       flow -- 0 of 67,108,864 cells.
+
+   So the model parent, correctly wired, deterministic, conservative and
+   cheap, changed the shipped terrain of this world by exactly nothing. Not
+   because the effect was small: because it was still in transit inside the
+   destination tile when the pyramid stopped carrying it.
+
+   TWO THINGS TO REMEMBER. **Rank candidate tiles by the change in the inflow
+   their L0 block hands the bake, never by the change in level-1 accumulation
+   over the tile** -- the first A/B here picked its tile the second way, spent
+   13 minutes a side, and measured a tile the water provably could not reach.
+   And **a boundary-crossing pyramid delivers nothing within one child block
+   of where you inject**; buying reach at the top is worth little until that
+   is addressed.
 """
 
 
@@ -1508,6 +1597,36 @@ visible and attributable instead of invisible, which is the difference between
 a known limitation and a mystery.
 """
 
+#: Where ``inject_edge_inflow`` puts a parent cell's through-flow inside the
+#: child, and the reason there is a choice at all.
+#:
+#: ``ENTRY_FOOTPRINT`` -- the lowest child cell ANYWHERE in the receiving parent
+#: cell's footprint. What the pyramid has always done, and correct enough at
+#: L1 -> L0, where the footprint is 4x4 (<=120 m of lateral error, and
+#: HYDROLOGY_RESIDUALS #3 records that it heals within a few hundred metres).
+#:
+#: ``ENTRY_CROSSING`` -- the lowest child cell on the FACE the parent's flow
+#: actually crosses, i.e. the one-cell-thick strip of the footprint against the
+#: shared edge. Identical to ENTRY_FOOTPRINT whenever the footprint is that
+#: strip (a 1-cell-deep footprint), so it changes nothing at ratio 1.
+#:
+#: The choice only starts to matter as the ratio grows. A model-backed parent
+#: at 7,680 m feeding a 120 m child is 64x64, so ENTRY_FOOTPRINT can deposit up
+#: to 10.7 km from the crossing IN ANY DIRECTION -- including deep into the
+#: domain, in a valley the water never entered, on the wrong side of a divide.
+#: That looks broken rather than approximate.
+#:
+#: NOT hypothetical. MEASURED on seed 20260719, level-1 block (-1,-1), a 512^2
+#: model window: the two rules disagreed on 9 of 15 crossings, by up to 9.61 km
+#: (median 1.80 km of the ones that moved), and three of the crossings that
+#: moved had a 100% LAND catchment behind them. ENTRY_CROSSING cannot do it:
+#: the water starts on the face it came through, so its error is confined to
+#: ONE axis, ALONG that face. The injected TOTAL was identical either way --
+#: both rules pick exactly one cell per crossing, so conservation is untouched.
+ENTRY_FOOTPRINT = "footprint"
+ENTRY_CROSSING = "crossing"
+ENTRY_MODES = (ENTRY_FOOTPRINT, ENTRY_CROSSING)
+
 #: Digest length of ``superblock_inputs_fingerprint``. 16 bytes: this is a
 #: provenance tag compared for equality, never a security boundary, and it
 #: rides in every .vxfl header.
@@ -1522,6 +1641,7 @@ def superblock_inputs_fingerprint(
     sy: int,
     level: "FlowLevel",
     parent_fingerprint: bytes = b"",
+    entry_mode: str = ENTRY_FOOTPRINT,
 ) -> bytes:
     """Digest of every input one superblock's hydrology is built from.
 
@@ -1550,6 +1670,13 @@ def superblock_inputs_fingerprint(
                 "coarse_tile_px": int(level.geom.coarse_tile_px),
                 "mfd_p": float(level.consts.mfd_p),
                 "flat_eps": level.consts.flat_eps,
+                # CONDITIONAL KEY, deliberately. The entry mode changes WHERE a
+                # parent's through-flow lands, so it belongs in the provenance
+                # digest -- but emitting it unconditionally would have rewritten
+                # the fingerprint of every superblock already cached, for a
+                # setting none of them used. Absent means ENTRY_FOOTPRINT, which
+                # is what every block built before 2026-08-03 did.
+                **({} if entry_mode == ENTRY_FOOTPRINT else {"entry_mode": entry_mode}),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -1723,6 +1850,7 @@ def build_flow_superblock(
     level: FlowLevel,
     kernels: BakeKernels,
     parent: "FlowSuperblock | None" = None,
+    entry_mode: str = ENTRY_FOOTPRINT,
 ) -> FlowSuperblock:
     """Coarse hydrology over one world-anchored superblock.
 
@@ -1780,6 +1908,7 @@ def build_flow_superblock(
             child_cell_m=level.cell_m,
             src=parent,
             d8_fn=kernels.d8_receivers,
+            entry_mode=entry_mode,
         )
     acc = np.asarray(
         kernels.accumulate_mfd(
@@ -1805,8 +1934,151 @@ def build_flow_superblock(
             parent_fingerprint=(
                 parent.inputs_fingerprint if parent is not None else b""
             ),
+            entry_mode=entry_mode,
         ),
     )
+
+
+#: ``FlowSuperblock.level`` for a MODEL-BACKED block. Deliberately far above
+#: any level the tile-backed pyramid can reach (level 5 would already span
+#: 62,914 km) so the two can never collide in the flow cache namespace, and so
+#: a block read back from disk says which kind it is without a second field.
+MODEL_FLOW_LEVEL = 200
+
+#: ``FlowSuperblock.tiles_per_side`` for a model-backed block: it is not backed
+#: by tiles at all. See ``build_model_superblock`` on why ``complete`` is
+#: nonetheless True.
+MODEL_TILES_PER_SIDE = 0
+
+_MODEL_FP_DOMAIN = b"vxbake-flow-model-inputs:v1"
+
+
+def model_superblock_fingerprint(
+    elev_m: np.ndarray,
+    origin_m: tuple[float, float],
+    cell_m: float,
+    consts: BakeConstants = CONSTANTS,
+) -> bytes:
+    """Provenance digest for a model-backed superblock.
+
+    Same job as ``superblock_inputs_fingerprint`` and a DIFFERENT domain
+    string, because the inputs are a different kind of thing: there are no
+    tiles to enumerate present-or-absent, so the digest covers the raster
+    itself plus the geometry and routing constants it was accumulated under.
+
+    It matters for the same reason the tile-backed one does. The child hashes
+    its parent's digest, so a top-level superblock built against a model window
+    is distinguishable from the same block built without one, or against a
+    different window -- which is precisely the "was this built in a smaller
+    world?" question ``pregen`` asks before it reuses a cached block.
+    """
+    h = hashlib.sha256()
+    h.update(_MODEL_FP_DOMAIN)
+    h.update(
+        json.dumps(
+            {
+                "bake_version": BAKE_VERSION,
+                "cell_m": float(cell_m),
+                "origin_x_m": float(origin_m[0]),
+                "origin_y_m": float(origin_m[1]),
+                "size_px": int(np.shape(elev_m)[0]),
+                "mfd_p": float(consts.mfd_p),
+                "flat_eps": consts.flat_eps,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    h.update(np.ascontiguousarray(elev_m, dtype=np.float32).tobytes())
+    return h.digest()[:FLOW_FINGERPRINT_BYTES]
+
+
+def build_model_superblock(
+    elev_m: np.ndarray,
+    origin_m: tuple[float, float],
+    cell_m: float,
+    kernels: BakeKernels,
+    sx: int = 0,
+    sy: int = 0,
+    consts: BakeConstants = CONSTANTS,
+) -> FlowSuperblock:
+    """A ``FlowSuperblock`` over an elevation raster the CALLER supplies.
+
+    This is the answer to HYDROLOGY_RESIDUALS #2. The tile-backed pyramid's top
+    level gets no inflow at its own edges, so a river draining more than that
+    level's span (246 km at the default) arrives with zero upstream area and
+    carves nothing. Give the top level a parent and the truncation moves out to
+    whatever the parent spans.
+
+    WHY IT TAKES AN ARRAY. In production the raster is the diffusion model's
+    own coarse map at 7.68 km/px, where a 512^2 window covers 3,932 km and
+    needs ZERO coarse tiles -- against the 4,096 tiles (~6 GB) that buying one
+    more EXACT pyramid level would require to exist before any fine tile in the
+    region could publish. That asymmetry is the whole argument for doing it
+    this way. But this module must not learn that a diffusion model exists: it
+    receives a ``CoarseFetch`` callable and knows nothing about where coarse
+    elevation comes from, and that is a property worth keeping. ``pregen``
+    holds the provider AND calls this, so the seam costs no layering.
+
+    ``inject_edge_inflow`` reads only ``cell_m``, ``origin_m``, ``acc`` and
+    ``filled`` off a parent. Everything else on the dataclass is bookkeeping,
+    which is what makes a synthetic parent constructible at all.
+
+    COMPLETENESS, deliberately. ``missing_tiles`` is empty and ``complete`` is
+    therefore True, because there are no tiles that could be missing -- the
+    model is defined everywhere. That must NOT be read as "the child is
+    complete": a child computes its own ``missing_tiles`` from its own coarse
+    fetch and is unaffected by this, so ``pregen``'s publish gate still refuses
+    a tile whose 30 m neighbourhood was never generated. Model backing fixes
+    TRUNCATION; it says nothing about EXPLORATION ORDER, and conflating the two
+    would silently reopen what the gate closed. See ORDER_DEPENDENCE.
+
+    No downsample and no ``missing`` scan: unlike ``build_flow_superblock``
+    there are no tiles to assemble. Everything after that is the same fill and
+    the same MFD accumulation, at the same constants, so the child cannot tell
+    which kind of parent it has.
+    """
+    z = np.ascontiguousarray(elev_m, dtype=np.float32)
+    if z.ndim != 2 or z.shape[0] != z.shape[1]:
+        raise ValueError(f"model superblock raster must be square 2-D, got {z.shape}")
+    if not np.isfinite(z).all():
+        # A non-finite cell would propagate through the fill into every
+        # downstream accumulation and land in a shipped tile as a hole.
+        raise ValueError("model superblock raster contains non-finite elevations")
+    if cell_m <= 0:
+        raise ValueError(f"model superblock cell_m must be positive, got {cell_m}")
+
+    filled = np.asarray(kernels.fill_depressions(z), dtype=np.float32)
+    acc = np.asarray(
+        kernels.accumulate_mfd(filled, float(cell_m), p=consts.mfd_p),
+        dtype=np.float32,
+    )
+    return FlowSuperblock(
+        level=MODEL_FLOW_LEVEL,
+        sx=int(sx),
+        sy=int(sy),
+        tiles_per_side=MODEL_TILES_PER_SIDE,
+        cell_m=float(cell_m),
+        origin_m=(float(origin_m[0]), float(origin_m[1])),
+        acc=acc,
+        filled=filled,
+        missing_tiles=(),
+        inputs_fingerprint=model_superblock_fingerprint(z, origin_m, cell_m, consts),
+    )
+
+
+def superblock_covers(parent: FlowSuperblock, child_origin_m, child_span_m) -> bool:
+    """Does ``parent`` contain the child's whole extent?
+
+    A parent that only half-covers its child is not an error -- it injects at
+    the edges it does reach and the rest is the same truncation as no parent at
+    all -- but it is never what the caller meant, and the failure is silent
+    (fewer entry cells, smaller rivers, nothing logged). ``pregen`` checks this
+    before wiring a model window so a mis-sized window is loud.
+    """
+    ox, oy = parent.origin_m
+    n = parent.size_px * parent.cell_m
+    cx, cy = child_origin_m
+    return ox <= cx and oy <= cy and cx + child_span_m <= ox + n and cy + child_span_m <= oy + n
 
 
 def inject_edge_inflow(
@@ -1815,6 +2087,7 @@ def inject_edge_inflow(
     child_cell_m: float,
     src: FlowSuperblock,
     d8_fn: Callable,
+    entry_mode: str = ENTRY_FOOTPRINT,
 ) -> np.ndarray:
     """Upstream area entering the child domain, as an m^2 field on the child.
 
@@ -1825,16 +2098,22 @@ def inject_edge_inflow(
         that is outside the child and whose receiver is inside it;
       * that cell delivers its whole accumulated area. Nothing upstream of it
         is counted separately, because those cells' receivers are outside;
-      * deposit the amount in the LOWEST child cell inside the receiving
-        parent cell's footprint, i.e. the thalweg. Mass is preserved exactly
-        and the water starts in the channel rather than smeared across 16 px
-        of bank.
+      * deposit the amount in the LOWEST child cell of a CANDIDATE SET, i.e.
+        the thalweg. Mass is preserved exactly and the water starts in the
+        channel rather than smeared across 16 px of bank.
+
+    ``entry_mode`` picks the candidate set -- the whole footprint, or just the
+    face the flow crosses. See ``ENTRY_FOOTPRINT`` / ``ENTRY_CROSSING`` for
+    which to use and why the answer depends on the parent-to-child ratio.
+    Conservation is identical either way: both pick exactly one cell.
 
     The result is meant for ``accumulate_mfd(..., inflow=...)``, which treats
     it as extra drainage area (m^2) present at that cell before routing.
 
     See HYDROLOGY_RESIDUALS #3 and #4 for what this still gets wrong.
     """
+    if entry_mode not in ENTRY_MODES:
+        raise ValueError(f"entry_mode must be one of {ENTRY_MODES}, got {entry_mode!r}")
     child_z = np.asarray(child_z, dtype=np.float32)
     h, w = child_z.shape
     inflow = np.zeros((h, w), np.float32)
@@ -1870,7 +2149,9 @@ def inject_edge_inflow(
     # Perimeter-sized loop (a few thousand cells at most): the argmin over a
     # parent cell's child footprint does not vectorise cleanly and is not on
     # any hot path.
-    for src_cell, amount in zip(tgt.tolist(), acc_flat[idx].tolist()):
+    for entry_cell, src_cell, amount in zip(
+        idx.tolist(), tgt.tolist(), acc_flat[idx].tolist()
+    ):
         si, sj = divmod(int(src_cell), sw)
         # Child index window covering this parent cell.
         j0 = int(np.floor((sox + sj * scell - ox) / child_cell_m))
@@ -1882,6 +2163,25 @@ def inject_edge_inflow(
         if i0 >= i1 or j0 >= j1:
             continue
         window = child_z[i0:i1, j0:j1]
+        if entry_mode == ENTRY_CROSSING:
+            # Mask everything but the face(s) the parent's step crosses. The
+            # step is one D8 move from the entry cell to this one, so its sign
+            # names the face: moving east (dj=+1) enters through the WEST face,
+            # i.e. the child column at j0. A diagonal step crosses a corner and
+            # both faces are candidates.
+            ei, ej = divmod(int(entry_cell), sw)
+            di, dj = si - ei, sj - ej
+            face = np.zeros(window.shape, bool)
+            if di > 0:
+                face[0, :] = True
+            elif di < 0:
+                face[-1, :] = True
+            if dj > 0:
+                face[:, 0] = True
+            elif dj < 0:
+                face[:, -1] = True
+            if face.any():
+                window = np.where(face, window, np.float32(np.inf))
         li, lj = np.unravel_index(int(np.argmin(window)), window.shape)
         inflow[i0 + li, j0 + lj] += np.float32(amount)
     return inflow
