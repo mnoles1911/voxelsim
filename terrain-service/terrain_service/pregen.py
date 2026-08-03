@@ -373,6 +373,7 @@ def _run_bake(args, provider, cache: TileCache) -> int:
 
     # -- pass 3: the bakes.
     allow_incomplete = bool(getattr(args, "allow_incomplete_superblock", False))
+    codec = _resolve_codec(getattr(args, "codec", "raw"))
     level0 = bp.FlowLevel(level=0, geom=geom, consts=consts)
     baked = skipped = failed = 0
     npz_dir = Path(args.bake_npz_dir) if args.bake_npz_dir else None
@@ -442,7 +443,9 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 flow=result.flow,
             )
         try:
-            encoded = _encode_fine(result, args.seed, fine_provider_id)
+            encoded = _encode_fine(
+                result, args.seed, fine_provider_id, codec=codec
+            )
         except NotImplementedError as e:
             print(f"error: {e}", file=sys.stderr)
             failed += 1
@@ -471,6 +474,43 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         file=sys.stderr,
     )
     return 0 if failed == 0 else 1
+
+
+def _resolve_codec(name: str) -> int | None:
+    """``--codec`` name -> ``tile_codec`` constant, refusing early if unusable.
+
+    WHY THIS EXISTS. ``_encode_fine`` has accepted a ``codec`` argument since
+    2026-08-01, but no caller ever supplied one, so the encoder's own
+    ``CODEC_RAW`` default won every time: **every fine tile pregen has ever
+    written is uncompressed**, including all 17 in the cache today. The library
+    default is right for the library -- CODEC_RAW must never depend on an
+    optional package, and CI deliberately does not install ``zstandard`` -- but
+    it left the production path with no way to reach compression at all.
+
+    It matters because the ratio is large and already measured: 201.4 MB RAW
+    against 33.4 MB CODEC_ZSTD on tile (-5,2), 6.0x, elevation and flow planes
+    bit-identical on round trip. Across a world that is the difference between
+    ~58 GB and ~9.7 GB of storage and of wire.
+
+    ``auto`` is deliberately NOT offered. A flag that silently degrades to RAW
+    when ``zstandard`` is missing would write uncompressed tiles into a cache
+    whose operator believes they are compressed, and the size only shows up
+    later as a bandwidth bill. Ask for zstd and not have it: fail here.
+    """
+    from . import tile_codec as tc
+
+    name = (name or "raw").lower()
+    if name == "raw":
+        return tc.CODEC_RAW
+    if name == "zstd":
+        if not tc.HAVE_ZSTD:
+            raise SystemExit(
+                "error: --codec zstd needs the 'zstandard' package, which is "
+                "not installed here. Install it, or pass --codec raw. Refusing "
+                "to silently write uncompressed tiles under a compressed flag."
+            )
+        return tc.CODEC_ZSTD
+    raise SystemExit(f"error: unknown --codec {name!r} (want 'raw' or 'zstd')")
 
 
 def superblock_gate_verdict(
@@ -727,6 +767,21 @@ def main() -> int:
             "(nothing is generated). Run this at bring-up to get the value "
             "for --conditioning-digest / "
             "TERRAIN_DIFFUSION_CONDITIONING_DIGEST."
+        ),
+    )
+    parser.add_argument(
+        "--codec",
+        choices=("raw", "zstd"),
+        default="raw",
+        help=(
+            "Fine-tier block codec. 'raw' (default, and what every tile in "
+            "existence was written with) never depends on a compression "
+            "library. 'zstd' compresses ~6x (measured 201.4 -> 33.4 MB on tile "
+            "(-5,2), planes bit-identical on round trip) and needs the "
+            "'zstandard' package here plus a client that can decode it -- see "
+            "tools/fetch-zstd.ps1. There is deliberately no 'auto': a flag "
+            "that quietly fell back to raw would fill a cache with "
+            "uncompressed tiles its operator believed were compressed."
         ),
     )
     parser.add_argument(

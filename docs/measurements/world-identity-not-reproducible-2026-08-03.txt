@@ -1,0 +1,107 @@
+WORLD IDENTITY IS NOT REPRODUCIBLE ACROSS MACHINES
+==================================================
+2026-08-03, on a fresh Vast.ai RTX 4090 pod, seed 20260719.
+
+FINDING
+-------
+The same seed, the same repo commit and the same checkpoint bundle id produce a
+DIFFERENT WORLD on a new machine. The 289-tile world in
+`terrain-diffusion-unlabeled-71e2b362e3241e71` -- the one carrying all nine
+owner-approved vistas, 17 baked fine tiles and the whole standing map set --
+cannot be extended by any new pod. It is frozen: usable, never growable.
+
+This matters far beyond one world. docs/world-generation-architecture.md
+commits to an INFINITE world that a server keeps generating as players explore,
+for as long as the game lives. That requires generating tile (5000, -3000) in
+2027 that joins seamlessly to tile (0,0) generated in 2026. Today it would not.
+
+WHAT WAS MEASURED
+-----------------
+Tile (-3,-3), seed 20260719, coarse tier, regenerated on the new pod:
+
+  original 289-tile world   cc25236e00b10a03b2b222fb580f2c249ba13a48ee2e972c...
+  pod, pod-built conditioning
+                            00468b506f042c67002420e4f12cc26e0cbc726e3c81f6f6...
+  pod, local conditioning   ea6387a207782a478cdb5eb7c1a19063f3af2475080c6083...
+
+All three are 1,572,889 bytes. All three are different terrain.
+
+THE CONTROL, AND IT IS THE GOOD NEWS
+------------------------------------
+Same config, run twice on the same pod:
+
+  run 1  ea6387a207782a478cdb5eb7c1a19063f3af2475080c6083aa5f49563c466369
+  run 2  ea6387a207782a478cdb5eb7c1a19063f3af2475080c6083aa5f49563c466369
+
+BYTE-IDENTICAL. Inference is deterministic given identical inputs, so the
+content-addressed design is sound and this is an INPUT problem, not a sampler
+problem. That is the difference between "pin the inputs" and "the architecture
+does not work".
+
+ROOT CAUSE: TWO OF THE SIX CONDITIONING FILES ARE BUILT, NOT DOWNLOADED
+-----------------------------------------------------------------------
+`compute_conditioning_digest` hashes the BYTES of six files. Comparing this
+box against the fresh pod:
+
+  wc2.1_10m_bio_1.tif        f61633ffac9d44ed  ==  f61633ffac9d44ed   MATCH
+  wc2.1_10m_bio_4.tif        a1bacac2f3d64528  ==  a1bacac2f3d64528   MATCH
+  wc2.1_10m_bio_12.tif       1e823e951ace0186  ==  1e823e951ace0186   MATCH
+  wc2.1_10m_bio_15.tif       6e16bf2e37752932  ==  6e16bf2e37752932   MATCH
+  etopo_10m.tif              9a45dd6dc5b0959c  !=  3a0e8ebe4d54b15c   DIFFER
+                             9,344,975 bytes       8,442,844 bytes
+  synthetic_map_stats.json   8fe9d083f10a0daf  !=  2dd3181f0ca32210   DIFFER
+                             12,297 bytes          12,570 bytes
+
+The four WorldClim rasters are DOWNLOADED and are byte-identical everywhere.
+The two that differ are the two the bootstrap BUILDS:
+
+  * `etopo_10m.tif` is built locally and is not byte-reproducible -- the two
+    copies differ even in LENGTH, by 902,131 bytes.
+  * `synthetic_map_stats.json` is DERIVED from etopo, so it inherits the drift
+    and adds its own.
+
+Both feed the conditioning digest, so the digest, the provider_id and therefore
+the world all move with them.
+
+Uploading this box's pair to the pod moved provider_id 191538c21b32bf64 ->
+80b9ca451a23eae4 and changed the tile bytes, confirming the causal chain. It
+did NOT reach 71e2b362e3241e71, so at least one further input of the original
+world (most plausibly the checkpoint bundle, whose sha was never recorded for
+that run) is also unrecovered. The original conditioning pair died with the pod
+that built it.
+
+WHY THE GUARDS DID THEIR JOB
+----------------------------
+Nothing here was silent. The provider_id mismatch is the content-addressing
+working exactly as designed: it refused to let new tiles masquerade as members
+of an existing world. Had `--provider-id-override` been used to force them
+together -- which is precisely what that flag would have done -- the result
+would have been one namespace containing two different planets, with a seam
+somewhere in the middle and no error anywhere. Checking cost one 11-second tile.
+
+WHAT TO FIX
+-----------
+1. `etopo_10m.tif` and `synthetic_map_stats.json` must become PINNED ARTIFACTS
+   -- built once, content-hashed, published, and downloaded by the bootstrap
+   like the WorldClim rasters already are. Rebuilding them per machine is what
+   makes a world unextendable.
+2. Record the full identity triple (checkpoint sha256, conditioning digest,
+   provider_id) with every world at creation, in the world's own directory.
+   The original world's triple was never written down, which is why it cannot
+   be reconstructed even in principle now.
+3. Make the bootstrap FAIL, not warn, if a requested provider_id cannot be
+   reproduced from the artifacts it has.
+
+THE WORLD GENERATED AFTER THIS FINDING
+--------------------------------------
+  provider_id         terrain-diffusion-unlabeled-80b9ca451a23eae4
+  seed                20260719 (0x000000000135276f)
+  checkpoint bundle   xandergos/terrain-diffusion-30m
+  checkpoint sha256   bc5cb9d75e3bbe39e8d38c71934fb4560558125ae4cc2803317a5c7a5313ae1d
+  conditioning digest c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2
+  etopo_10m.tif       sha256 prefix 9a45dd6dc5b0959c, 9,344,975 bytes
+  synthetic_map_stats sha256 prefix 8fe9d083f10a0daf, 12,297 bytes
+  per-tile cost       9.9 s on an RTX 4090 (not the 22.5 s previously assumed)
+
+This triple IS recorded, and both conditioning files exist on this box, so this
+world is reproducible -- which is the whole point of writing it down here.

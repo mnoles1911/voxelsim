@@ -386,3 +386,50 @@ def test_allow_incomplete_superblock_is_advertised_in_help():
     assert out.returncode == 0
     assert "--allow-incomplete-superblock" in out.stdout
     assert "DEVELOPMENT ONLY" in out.stdout
+
+
+# ---------------------------------------------------------------------------
+# --codec. _encode_fine has accepted a codec since 2026-08-01 but no caller
+# passed one, so every fine tile ever written by pregen is uncompressed.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_codec_raw_is_the_default():
+    from terrain_service import tile_codec as tc
+    from terrain_service.pregen import _resolve_codec
+
+    assert _resolve_codec("raw") == tc.CODEC_RAW
+    assert _resolve_codec("") == tc.CODEC_RAW
+    assert _resolve_codec(None) == tc.CODEC_RAW
+
+
+def test_resolve_codec_zstd_or_a_clear_refusal():
+    """Never silently degrade: a cache full of RAW under a zstd flag is worse
+    than a failed run, because the size only shows up as a bandwidth bill."""
+    from terrain_service import tile_codec as tc
+    from terrain_service.pregen import _resolve_codec
+
+    if tc.HAVE_ZSTD:
+        assert _resolve_codec("zstd") == tc.CODEC_ZSTD
+    else:
+        with pytest.raises(SystemExit) as e:
+            _resolve_codec("zstd")
+        assert "zstandard" in str(e.value)
+
+
+def test_resolve_codec_rejects_nonsense():
+    from terrain_service.pregen import _resolve_codec
+
+    with pytest.raises(SystemExit):
+        _resolve_codec("lz4")
+
+
+def test_codec_flag_is_advertised_and_has_no_auto():
+    out = subprocess.run(
+        ["python", "-m", "terrain_service.pregen", "--help"],
+        cwd=Path(__file__).parent.parent, capture_output=True, text=True,
+    )
+    assert out.returncode == 0
+    assert "--codec" in out.stdout
+    # 'auto' would defeat the whole point; assert it is not offered.
+    assert "auto" not in out.stdout.split("--codec")[1].split("--")[0]
