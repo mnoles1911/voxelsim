@@ -190,4 +190,113 @@ namespace VoxelClimate
 	// per-channel transform (see the measurement note above); the mid value only
 	// controls a blend ratio, so its precision does not matter.
 	uint8 BiomeTintForFace(uint8 MaterialId, int32 FaceAxis, bool bFacePositive);
+
+	// --- the surface-proximity gate's reference height -----------------------
+	//
+	// BiomeTintForFace above answers "which way does this face point". It is not
+	// enough on its own: a cave FLOOR is a +Z face too, and face direction alone
+	// paints it grassland green (VoxelChunkComponent.cpp:192-200 records that
+	// regression). So the tint is additionally gated on the face being near the
+	// terrain surface -- within kSurfaceBandUU below it.
+	//
+	// WHAT WENT WRONG WITH THAT GATE, measured in
+	// docs/measurements/hatching-lattice-diagnosis-2026-08-03.txt. The reference
+	// height was ONE sample taken at the chunk CENTRE, compared against a FIXED
+	// 2 m band. A chunk is 3.2 m across at L0 -- over which the surface really
+	// does barely move -- but 102.4 m across at L5. On a slope the surface
+	// crosses tens of metres over a coarse chunk, so most of its sky-facing
+	// faces fall outside a 2 m band and lose the tint, and a HORIZONTAL plane
+	// cut through a tilted voxel staircase is a chevron. That is the lattice the
+	// owner sees on distant slopes, in tundra, taiga and rainforest alike.
+	//
+	// THE FIX IS TO MAKE THE REFERENCE FOLLOW THE GROUND, not to widen the band.
+	// Widening it with chunk size was the cheaper candidate and it is the wrong
+	// trade: at L5 the band becomes ~100 m and every cave ceiling within 100 m
+	// of daylight goes green, i.e. it fixes the slope by deleting the guard.
+	// Here the surface height is sampled at the chunk's four XY CORNERS and
+	// carried as the least-squares PLANE through them, evaluated per vertex. The
+	// band stays 2 m, so the cave semantics are unchanged in magnitude: a cave
+	// floor is far below ITS OWN column's surface and stays untinted.
+	//
+	// The residual is the terrain's departure from planarity across one chunk,
+	// which is curvature only -- the slope term, which is what actually broke
+	// the gate, is removed exactly. Curvature is unbiased and chunk-local, so
+	// what is left cannot be a lattice.
+	//
+	// WHY QUANTISED. The pooled path has exactly ONE spare float in its per-chunk
+	// table row (ChunkParams.w; .xy are climate and .z is the height, and water
+	// owns .y). Two gradients have to fit in it. They are packed as two 12-bit
+	// fixed-point fields, which is EXACT in float32 (the packed value is an
+	// integer < 2^24) rather than approximately-preserved the way a bit-cast
+	// half2 would be -- and a bit-cast could also produce a denormal or a NaN,
+	// which is not a thing to put in a vertex buffer. Resolution 1/256 costs at
+	// most 0.2 m of reference error at L5's 102.4 m chunk, against a 2 m band.
+	//
+	// BOTH RENDER PATHS USE THESE FUNCTIONS. The component path evaluates them on
+	// the CPU into vertex colour; the pooled path packs the plane into
+	// ChunkParams and evaluates the SAME expression in VoxelQuadVertexFactory.ush.
+	// The HLSL is a transcription of the three functions below and must move with
+	// them -- that is why the constants are here and not spelled twice.
+	inline constexpr double kSurfaceBandUU = 200.0;          // 2 m
+	inline constexpr double kSurfaceSlopeQuantScale = 256.0; // steps per unit slope
+	inline constexpr int32  kSurfaceSlopeQuantMax = 2047;    // +-7.996 slope, 12 bits
+	inline constexpr int32  kSurfaceSlopeQuantBias = 2048;
+
+	// Packs a gradient pair for ChunkParams.w. Returns EXACTLY 0.0 for a flat
+	// plane so that the value every other writer leaves in .w -- water's params,
+	// the pool's hidden entry, single-chunk mode, any build that predates this --
+	// decodes to "no gradient", i.e. to the behaviour that was there before.
+	inline float PackSurfaceGradients(double DZDX, double DZDY)
+	{
+		if (DZDX == 0.0 && DZDY == 0.0)
+		{
+			return 0.0f;
+		}
+		const int32 QX = FMath::Clamp(FMath::RoundToInt(DZDX * kSurfaceSlopeQuantScale),
+		                              -kSurfaceSlopeQuantMax, kSurfaceSlopeQuantMax) + kSurfaceSlopeQuantBias;
+		const int32 QY = FMath::Clamp(FMath::RoundToInt(DZDY * kSurfaceSlopeQuantScale),
+		                              -kSurfaceSlopeQuantMax, kSurfaceSlopeQuantMax) + kSurfaceSlopeQuantBias;
+		// 4095 * 4096 + 4095 = 16,777,215 = 2^24 - 1: the largest integer float32
+		// still represents exactly. Do not widen either field past 12 bits.
+		return float(QX * 4096 + QY);
+	}
+
+	// SPLIT WITH INTEGER OPS. `floor(Packed / 4096)` would also work: I claimed
+	// it was unsafe at the top of the range and CHECKED IT INSTEAD OF SHIPPING
+	// THE CLAIM, over all 4095 x 4095 packings in float32 -- zero mismatches. The
+	// reason is that the quotient qx + qy/4096 needs 12 integer bits and 12
+	// fraction bits, exactly the 24 float32 carries, so it is representable
+	// rather than rounded. The note is left here because "the obvious float
+	// decode is subtly broken" is the kind of thing that gets repeated once
+	// someone writes it down, and it is not true of this encoding.
+	//
+	// The integer split is kept anyway: it is exact by construction rather than
+	// by a 24-bit coincidence that a wider field would silently break, and it is
+	// cheaper. If either field is ever widened past 12 bits, the divide form
+	// WOULD break and this one will not. The HLSL mirror does the same.
+	inline void UnpackSurfaceGradients(float Packed, float& OutDZDX, float& OutDZDY)
+	{
+		if (Packed <= 0.0f)
+		{
+			OutDZDX = 0.0f;
+			OutDZDY = 0.0f;
+			return;
+		}
+		const int32 Bits = int32(Packed);
+		const int32 QX = (Bits >> 12) & 0xFFF;
+		const int32 QY = Bits & 0xFFF;
+		OutDZDX = float(QX - kSurfaceSlopeQuantBias) / float(kSurfaceSlopeQuantScale);
+		OutDZDY = float(QY - kSurfaceSlopeQuantBias) / float(kSurfaceSlopeQuantScale);
+	}
+
+	// The gate's reference height at a point, in the chunk's own frame: X/Y/Z are
+	// all relative to the chunk origin, which is what keeps this in float32 (the
+	// absolute value is ~8.4M UU, where float32's ULP is 1 UU against a 10 UU
+	// voxel). BaseRelUU is the surface at the chunk's XY origin, NOT its centre,
+	// precisely so no half-edge term is needed here and the shader does not have
+	// to know the chunk's level.
+	inline float SurfaceZRelAt(float BaseRelUU, float DZDX, float DZDY, float XRelUU, float YRelUU)
+	{
+		return BaseRelUU + DZDX * XRelUU + DZDY * YRelUU;
+	}
 }
