@@ -233,7 +233,7 @@ namespace vxc {
 // WIRE FORMAT UNCHANGED. All four climate bytes were already carried and
 // blended; only which byte classifyBiome reads moved. Tiles do not need
 // regenerating and provider_id does not roll for this.
-inline constexpr uint32_t kWorldGenVersion = 22;
+inline constexpr uint32_t kWorldGenVersion = 23;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 
