@@ -115,16 +115,39 @@ seed — the marginal cost of the Nth visitor is a cache hit.
 ### Streaming: the tile is a storage unit, not a transfer unit
 
 190 MB per tile sounds prohibitive and is not, because a tile is **236 km²**
-and a player can see a few km. At ~0.8 MB/km², a 2 km view radius is **~10 MB**
-of terrain. The requirement is not "ship 190 MB", it is "ship the ~10 MB the
-player can actually see", which means **fine tiles must be sliceable into
-independently addressable sub-blocks**. That slicing does not exist yet and is
-the main streaming work item.
+and a player can see a few km. At ~0.8 MB/km² raw, a 2 km view radius is
+**~10 MB** of terrain — and ~1.7 MB once compressed (below). The requirement is
+not "ship 190 MB", it is "ship the couple of megabytes the player can actually
+see", which means **fine tiles must be sliceable into independently addressable
+sub-blocks**. That slicing does not exist yet and is the main streaming work
+item.
 
-Compression compounds it: heightfields delta-compress well, but the client
-**cannot decode compressed tiles today** — `ThirdParty/zstd` is absent, so
-`CODEC_ZSTD` tiles are refused with `kNoDecompressor` (task #43). Measure the
-real ratio before sizing storage or egress; do not extrapolate from 190 MB.
+**And compression is already measured — 6.0×.** `pregen._encode_fine` records
+it on tile (-5,2): **201.4 MB RAW against 33.4 MB `CODEC_ZSTD`**, with
+elevation and flow planes bit-identical on round trip. So the real numbers are:
+
+    per fine tile        ~33 MB compressed  (not 190)
+    per km^2             ~0.14 MB
+    2 km view radius     ~1.7 MB
+    289-tile world       ~9.7 GB            (not 58)
+
+That materially changes the streaming story — a player's visible surroundings
+are under two megabytes.
+
+**Neither end can use it yet, for two separate reasons** (task #43):
+
+* `pregen` has **no `--codec` flag**, and `codec` reaches `_encode_fine` only
+  if a caller passes it, so "every tile pregen has ever written is
+  uncompressed" — including all 17 in the cache today.
+* The client cannot decode `CODEC_ZSTD` at all. `VoxelTileCodec.h` records that
+  the plan assumed UE 5.8 ships zstd in `Engine/Source/ThirdParty` and it does
+  not: "no zstd.h, no zstd*.lib, no zstd module, and no .Build.cs anywhere ...
+  There IS no engine-provided C zstd to borrow here today." The build confirms
+  it, logging `no zstd module found` and dropping `CODEC_ZSTD` support, so such
+  a tile is refused with `kNoDecompressor` rather than mis-decoded.
+
+Both are plumbing against a ratio that is already known. Size storage and
+egress from 33 MB, not 190.
 
 Client-side caching is already built and already bounded: a **12 GiB LRU**
 keyed on `<provider_id>/<seed>/s16/<x>_<y>`, with identity validation that
@@ -234,7 +257,8 @@ rather than a mystery. Keep it that way — never let the single-player path
    everything else being trustworthy.
 2. **Fine-tile sub-block slicing** — the actual streaming unit. Without it the
    190 MB tile is the transfer granularity and nothing else matters.
-3. **zstd** (#43) — and *measure* the ratio.
+3. **zstd** (#43) — the ratio is already measured at 6.0×; what is missing is a
+   `--codec` flag on `pregen` and a vendored zstd for the client.
 4. **Bake service + queue + CDN**, superblock-aligned.
 5. **Edit ordering and broadcast** over the existing log.
 6. **Bound the depression fill**, then re-evaluate a smaller bake unit for
