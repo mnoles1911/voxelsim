@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 23;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 24;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -143,6 +143,51 @@ namespace
 	// Measured 2026-08-01 at kWorldGenVersion 22 by a standalone mirror of the
 	// CPU-side fold below, validated by reproducing the v21 value byte for byte
 	// against the same tree before the change was applied.
+	//
+	// v24 DID NOT MOVE IT EITHER, AND THIS TIME THE REASON IS THE SHARPEST YET
+	// -- IT IS THE SAME GAP THE kBandOnlyRegions COMMENT BELOW DESCRIBES, SEEN
+	// FROM THE OTHER SIDE. v24 (docs/underground-system-plan.md W2) waypoints
+	// every cave edge into a two-segment polyline and interpolates its radius,
+	// which moves every tunnel axis in the world. The fold is unchanged.
+	//
+	// The reason is NOT that the fixtures have no caves. They do: over the
+	// "origin" fixture's 4,096 columns, 2,703 have cave segments at v23 and
+	// 2,027 at v24 -- the change is enormous there. The reason is that the
+	// fold's CELL range is derived from the topmost solid voxel of each column
+	// and is 2 bricks tall, i.e. the SURFACE, while the roof guarantee keeps
+	// every cave voxel at least 6 m below it. Carved cells inside the compared
+	// range: 0 at v23, 0 at v24. Neither fixture contains a sinkhole shaft (the
+	// one construct allowed through the roof), so nothing reaches the band.
+	//
+	// So the compared volume misses the cave pass entirely, and has for its
+	// whole life -- exactly the failure mode this file already records twice
+	// ("a gate that closes everywhere in the fixture is indistinguishable from
+	// a term that is not mirrored at all"), one level down: a term that fires
+	// OUTSIDE the compared volume is indistinguishable from one that is not
+	// mirrored at all. voxel-core/bench/gpu_harness.cpp had the identical hole
+	// and v24 closes it there with a "cave-band" fixture and a per-region
+	// compareDepthVox that reaches the cave envelope; vxc_gpu now compares
+	// 2.67M cells instead of 1.07M and its digest moved for the first time on a
+	// cave change. THE EQUIVALENT FIXTURE IS STILL MISSING HERE, and it belongs
+	// in kBandOnlyRegions (which does not feed this pin) so that closing the
+	// hole does not turn this cross-toolchain gate into a re-baselining
+	// exercise -- the same argument the savanna and fine-tier gaps above are
+	// already parked under.
+	//
+	// HOW THE "unchanged" WAS ESTABLISHED, stated plainly because it was NOT
+	// re-measured through UE's own RDG path: another agent held the box's one
+	// editor slot, so voxel.GPU.VerifyRegion was not run. Instead the standalone
+	// mirror above was extended to report, per fixture, every ColumnSample field
+	// and every Amplifier::materialAt value over the exact compared cell range,
+	// and run against BOTH trees -- v23 from main and v24 from this branch. The
+	// columns+cells fold is byte-identical between them (0x0badfe3a5dec55d2 on
+	// both). Since the mesher's entire input is those cells, the quads are
+	// identical too, so the full fold cannot have moved. That is a DIFFERENTIAL
+	// proof rather than an absolute re-measurement: the standalone mirror covers
+	// columns and cells but not the raster-window construction, so it does not
+	// reproduce this constant's absolute value and is not expected to. Anyone
+	// with the editor should re-run voxel.GPU.VerifyRegion to confirm
+	// absolutely; the prediction on record is that it prints b2b5d2f1044caa35.
 
 	struct FRegionSpec
 	{

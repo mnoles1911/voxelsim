@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 23
+#define VXC_WORLDGEN_VERSION_USH 24
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -2000,6 +2000,12 @@ static const int64_t kCrevUpMinMm = 3000;
 static const int64_t kCrevUpSpanMm = 7000;
 static const int64_t kCrevDownMinMm = 2000;
 static const int64_t kCrevDownSpanMm = 4000;
+// v24 waypointed axes (caves.h kCaveWaypoint*). The dip is DOWNWARD only --
+// the roof static_assert on the CPU side has 200 mm of slack, so any upward
+// excursion would need the whole depth band re-tuned first.
+static const int64_t kCaveWaypointLatMm = 5120;
+static const int64_t kCaveWaypointDipMm = 1000;
+static const int kCaveEdgeSubSegs = 2;
 
 // HashChannel ids from voxelcore/caves.h â€” append only, never renumber.
 static const uint CH_CAVE_NODE = 30;
@@ -2008,6 +2014,8 @@ static const uint CH_CAVE_RADIUS = 20;
 static const uint CH_CAVE_SHAFT = 21;
 // 22/23/25 belong to the cavern pass below (CH_CAVERN_SITE/_ROUGH/_FLOOD).
 static const uint CH_CREVICE = 24;
+static const uint CH_CAVE_WAYPOINT = 29;    // v24 edge waypoint offset + dip
+static const uint CH_CAVE_NODE_RADIUS = 50; // v24 per-node tube calibre
 
 struct GpuCaveColumn
 {
@@ -2034,8 +2042,19 @@ int64_t caveEdgeRadiusMm(uint64_t seed, int64_t ei, int64_t ej, int edir)
            (int64_t)((((hr >> 44) & 0xFFFFFULL) * (uint64_t)kCaveRadiusSpanMm) >> 20);
 }
 
-// vxc::caveColumnFor bit-for-bit, including the (dj, di, dir) iteration order
-// that decides which tubes survive the kMaxCaveSegs cap.
+// vxc::caveNodeRadiusMm bit-for-bit (v24). Per NODE, so all four passages
+// meeting at a junction agree on how wide the junction is. It needs its own
+// channel rather than CH_CAVE_RADIUS with an (i, j) key, because the edge draw
+// keys on (i, j*2+dir) and (i, 5) would collide exactly with edge (i, 2, 1).
+int64_t caveNodeRadiusMm(uint64_t seed, int64_t ni, int64_t nj)
+{
+    const uint64_t hnr = hash2(seed, ni, nj, CH_CAVE_NODE_RADIUS);
+    return kCaveRadiusMinMm +
+           (int64_t)((((hnr >> 44) & 0xFFFFFULL) * (uint64_t)kCaveRadiusSpanMm) >> 20);
+}
+
+// vxc::caveColumnFor bit-for-bit, including the (dj, di, dir, sub) iteration
+// order that decides which tubes survive the kMaxCaveSegs cap.
 GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm)
 {
     GpuCaveColumn cc;
@@ -2058,6 +2077,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
     int64_t nodeX[16];
     int64_t nodeY[16];
     int64_t nodeD[16];
+    int64_t nodeR[16]; // v24 per-node calibre
     for (int nj = 0; nj < 4; ++nj)
     {
         for (int ni = 0; ni < 4; ++ni)
@@ -2072,6 +2092,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                           (int64_t)((((hn >> 20) & 0xFFFFFULL) * (uint64_t)kCaveLatticeMm) >> 20);
             nodeD[nidx] = kCaveNodeDepthMinMm +
                           (int64_t)((((hn >> 40) & 0xFFFFFULL) * (uint64_t)kCaveNodeDepthSpanMm) >> 20);
+            nodeR[nidx] = caveNodeRadiusMm(seed, gi, gj);
         }
     }
 
@@ -2093,22 +2114,61 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                 const int64_t byMm = nodeY[bIdx];
                 const int64_t bdMm = nodeD[bIdx];
 
-                const int64_t sdx = bxMm - axMm;
-                const int64_t sdy = byMm - ayMm;
+                // v24 waypoint: the interior control point of this edge.
+                // caves.h computes it in its lattice block from the two node
+                // positions; recomputing it here is the same pure function of
+                // (seed, i, j, dir) and the same two nodes, so the value is
+                // identical. floorDiv on the midpoint, not >>1, because the
+                // sum can be negative and a shift would round the wrong way.
+                const uint64_t hw = hash2(seed, ei, ej * 2 + (int64_t)dir, CH_CAVE_WAYPOINT);
+                const int64_t wayXMm =
+                    floorDiv(axMm + bxMm, 2) - kCaveWaypointLatMm +
+                    (int64_t)(((hw & 0xFFFFFULL) * (uint64_t)(2 * kCaveWaypointLatMm)) >> 20);
+                const int64_t wayYMm =
+                    floorDiv(ayMm + byMm, 2) - kCaveWaypointLatMm +
+                    (int64_t)((((hw >> 20) & 0xFFFFFULL) * (uint64_t)(2 * kCaveWaypointLatMm)) >> 20);
+                const int64_t wayDMm =
+                    floorDiv(adMm + bdMm, 2) +
+                    (int64_t)((((hw >> 40) & 0xFFFFFULL) * (uint64_t)kCaveWaypointDipMm) >> 20);
+                const int64_t edgeRMm = caveEdgeRadiusMm(seed, ei, ej, dir);
+                const int64_t arMm = nodeR[aIdx];
+                const int64_t brMm = nodeR[bIdx];
+
+                // Each half of the polyline reduces independently -- a
+                // waypointed edge can pass the SAME column twice at two
+                // different depths, and dropping the second passage would
+                // throw away exactly the vertical richness waypoints exist
+                // to create.
+                for (int sub = 0; sub < kCaveEdgeSubSegs; ++sub)
+                {
+                const int64_t pxMm = (sub == 0) ? axMm : wayXMm;
+                const int64_t pyMm = (sub == 0) ? ayMm : wayYMm;
+                const int64_t pdMm = (sub == 0) ? adMm : wayDMm;
+                const int64_t qxMm = (sub == 0) ? wayXMm : bxMm;
+                const int64_t qyMm = (sub == 0) ? wayYMm : byMm;
+                const int64_t qdMm = (sub == 0) ? wayDMm : bdMm;
+                const int64_t prMm = (sub == 0) ? arMm : edgeRMm;
+                const int64_t qrMm = (sub == 0) ? edgeRMm : brMm;
+
+                const int64_t sdx = qxMm - pxMm;
+                const int64_t sdy = qyMm - pyMm;
                 const int64_t den = sdx * sdx + sdy * sdy;
                 if (den == 0) continue;
 
-                const int64_t wx = xMm - axMm;
-                const int64_t wy = yMm - ayMm;
+                const int64_t wx = xMm - pxMm;
+                const int64_t wy = yMm - pyMm;
                 const int64_t num = clamp64(wx * sdx + wy * sdy, 0, den);
 
-                const int64_t cxMm = axMm + floorDiv(sdx * num, den);
-                const int64_t cyMm = ayMm + floorDiv(sdy * num, den);
-                const int64_t cdMm = adMm + floorDiv((bdMm - adMm) * num, den);
+                const int64_t cxMm = pxMm + floorDiv(sdx * num, den);
+                const int64_t cyMm = pyMm + floorDiv(sdy * num, den);
+                const int64_t cdMm = pdMm + floorDiv((qdMm - pdMm) * num, den);
 
                 const int64_t ex = xMm - cxMm;
                 const int64_t ey = yMm - cyMm;
-                const int64_t rr = caveEdgeRadiusMm(seed, ei, ej, dir);
+                // Calibre interpolated along the sub-segment at the same
+                // parameter as the axis point: C0 across the waypoint and
+                // across every node.
+                const int64_t rr = prMm + floorDiv((qrMm - prMm) * num, den);
                 const int64_t marginSq = rr * rr - (ex * ex + ey * ey);
                 if (marginSq <= 0) continue;
 
@@ -2156,7 +2216,12 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                         // edge, so den*den overflows int64. caves.h found that
                         // overflow and took the same Q16 route â€” this mirrors
                         // it exactly, including both floorDivs.
-                        const int64_t uQ16 = floorDiv(num << 16, den);
+                        // u along the WHOLE edge, not this sub-segment:
+                        // (sub + num/den) / kCaveEdgeSubSegs. Per-sub-segment u
+                        // would put a full-width slab at both nodes, which is
+                        // the exact artifact the taper exists to remove.
+                        const int64_t uQ16 = floorDiv(((int64_t)sub << 16) + floorDiv(num << 16, den),
+                                                      (int64_t)kCaveEdgeSubSegs);
                         const int64_t taperQ16 = (4 * uQ16 * ((int64_t)65536 - uQ16)) >> 16;
                         const int64_t halfSpanTaperedMm =
                             floorDiv(halfSpanMm * taperQ16, (int64_t)65536);
@@ -2170,6 +2235,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
                         }
                     }
                 }
+                } // sub
             }
         }
     }

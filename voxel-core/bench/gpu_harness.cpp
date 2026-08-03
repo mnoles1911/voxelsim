@@ -942,6 +942,28 @@ struct RegionSpec {
     // class's comment for why a gentler raster is the only way this harness can
     // reach the INTERIOR of v10's curvature ramp rather than only its clamps.
     int64_t elevationDivisor;
+    // How far BELOW the surface band this fixture's cell comparison reaches,
+    // in voxels. 0 = the historical behaviour: compare only the bricks the
+    // topmost solid voxel lands in.
+    //
+    // WHY THIS FIELD EXISTS (worldgen v24). The cell comparison was derived
+    // purely from the topmost solid voxel of each column, so the compared
+    // volume was the SURFACE and nothing else. The cave pass carves 9-34 m
+    // BELOW that -- 90 to 340 voxels down, tens of bricks outside the compared
+    // range -- which means caveColumnFor and caveCarveAt, the largest single
+    // term in column(), had NEVER been compared between CPU and GPU by this
+    // harness, for the entire life of the cave pass. vxc_gpu passed bit-exact
+    // over a mirror it was not reading.
+    //
+    // This is the identical failure the density-band-cliff region below was
+    // added to fix -- "a gate that closes everywhere in the fixture is
+    // indistinguishable from a term that is not mirrored at all" -- one level
+    // down: a term that fires OUTSIDE the compared volume is indistinguishable
+    // from one that is not mirrored at all. The lesson recorded at vzMin's
+    // computation ("a per-voxel term is only actually compared if the range
+    // being compared covers the voxels it touches") was written about the 3D
+    // density band and was true of caves the whole time.
+    int32_t compareDepthVox;
 };
 
 struct RegionResult {
@@ -1262,6 +1284,10 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
             vzMax = top > vzMax ? top : vzMax;
         }
     }
+    // Reach below the surface band by this fixture's declared cave/deep
+    // envelope. Applied to vzMin only: the compared volume grows DOWNWARD, so
+    // no fixture loses coverage it had.
+    vzMin -= region.compareDepthVox;
     const int32_t brickZMin = static_cast<int32_t>(floorDiv(vzMin, 8));
     const int32_t brickZMax = static_cast<int32_t>(floorDiv(vzMax, 8));
     const uint32_t bricksZ = static_cast<uint32_t>(brickZMax - brickZMin + 1);
@@ -1486,7 +1512,14 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     // MeshEmitMain, chained in ONE command buffer via runMeshChain() --------
     // (docs/gpu-mesher-design.md: deterministic ordering with no atomics;
     // see runMeshChain()'s doc comment for the barrier/timing design).
-    if (bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
+    // A compareDepthVox fixture is a CELL-comparison fixture and skips the mesh
+    // chain deliberately, rather than by accident of being thin. Reaching 34 m
+    // down makes the interior-brick footprint ~50 bricks tall, whose mask count
+    // exceeds ScanSumsMain's single-workgroup scan limit -- and the greedy
+    // mesher is already exercised by the seven surface fixtures, none of which
+    // this changes. What was missing was never mesh coverage; it was that no
+    // fixture's compared CELLS ever contained a cave voxel.
+    if (region.compareDepthVox == 0 && bricksX >= 3 && bricksY >= 3 && bricksZ >= 3) {
         const uint32_t mbx = bricksX - 2, mby = bricksY - 2, mbz = bricksZ - 2;
         const uint32_t maskCount = mbx * mby * mbz * 48u;
         result.interiorBricksX = mbx;
@@ -1546,9 +1579,10 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
         ctx.destroyBuffer(blockSumsBuf);
         ctx.destroyBuffer(quadsBuf);
     } else {
-        std::printf("[%s] region too thin for interior mesh bricks (bricksZ=%u) — mesh pass "
-                    "skipped\n",
-                    region.name, bricksZ);
+        std::printf("[%s] mesh pass skipped (%s, bricksZ=%u)\n", region.name,
+                    region.compareDepthVox ? "deep cell-comparison fixture, see RegionSpec"
+                                           : "region too thin for interior mesh bricks",
+                    bricksZ);
     }
 
     ctx.destroyBuffer(paramsBuf);
@@ -2869,12 +2903,12 @@ int main(int argc, char** argv) {
     // `cScale - 1024` is negative AND ODD, which is the sole case in which
     // evalSurface's truncating `/ 2` on the micro band differs from a floor.
     const RegionSpec regions[] = {
-        {"origin", -64, -64, 64, 64, 30000, 1},
-        {"far-negative", -100000, 250000, 64, 64, 30000, 1},
-        {"positive", 100064, 250064, 64, 64, 30000, 1},
-        {"fine-tier", -12, 40008, 24, 24, 3750, 1},
-        {"gentle-crest", -64, -64, 64, 64, 30000, 100},
-        {"gentle-hollow", 100064, 250064, 64, 64, 30000, 100},
+        {"origin", -64, -64, 64, 64, 30000, 1, 0},
+        {"far-negative", -100000, 250000, 64, 64, 30000, 1, 0},
+        {"positive", 100064, 250064, 64, 64, 30000, 1, 0},
+        {"fine-tier", -12, 40008, 24, 24, 3750, 1, 0},
+        {"gentle-crest", -64, -64, 64, 64, 30000, 100, 0},
+        {"gentle-hollow", 100064, 250064, 64, 64, 30000, 100, 0},
         // And one gentle FINE-tier region, which is the only fixture where
         // carrierCurvatureTierNormQ10 actually rounds. At 30000 its divide is
         // exact by construction (numerator is curvature * 30000^2 over 30000^2),
@@ -2883,7 +2917,7 @@ int main(int argc, char** argv) {
         // 576 columns on the crest side with a numerator that is negative and
         // not a multiple of 64 -- i.e. 576 columns where the CPU's deliberate
         // floorDiv and a truncating divide give different answers.
-        {"gentle-fine-crest", -400000, -400000, 24, 24, 3750, 100},
+        {"gentle-fine-crest", -400000, -400000, 24, 24, 3750, 100, 0},
         // AND ONE REGION WHERE THE 3D DENSITY BAND ACTUALLY FIRES (v12).
         //
         // This one exists because of a near-miss. When the band was first wired
@@ -2904,7 +2938,7 @@ int main(int argc, char** argv) {
         // the band, the contrast curve, the taper and the per-column brick
         // widening are all live here -- and any divergence in them is a cell
         // mismatch rather than a silent pass.
-        {"density-band-cliff", -8800, -30816, 64, 64, 30000, 1},
+        {"density-band-cliff", -8800, -30816, 64, 64, 30000, 1, 0},
         // SAVANNA BOUNDARY (worldgen v22). Same argument as density-band-cliff
         // one paragraph up, for the gate v22 changed.
         //
@@ -2932,7 +2966,28 @@ int main(int argc, char** argv) {
         //
         // Climate there (u8): temp 207, precip 17, bio_15 89 -- against gates
         // warm 185, arid 9, mod 34, CV 89.
-        {"savanna-boundary", -249632, 1151968, 64, 64, 30000, 1},
+        {"savanna-boundary", -249632, 1151968, 64, 64, 30000, 1, 0},
+        // AND ONE REGION THAT ACTUALLY REACHES THE CAVES (worldgen v24).
+        //
+        // See compareDepthVox on RegionSpec for the finding this closes: every
+        // region above compares only the surface bricks, and the cave pass
+        // carves 9-34 m under them, so caveColumnFor / caveCarveAt -- the
+        // single largest term in column() -- were never compared at all. The
+        // W2 waypointing change moved every tunnel axis in the world and this
+        // harness's digest did not move by one bit, which is how it was found.
+        //
+        // The depth is the cave envelope, not a round number: the deepest
+        // reachable carved voxel is the deepest node depth plus the waypoint
+        // dip plus the fattest radius (caves.h's own bedrock static_assert
+        // adds these same three terms), rounded up to a whole brick. The
+        // origin is the one the "origin" fixture already uses, chosen because
+        // the synthetic sampler puts ~16% of columns there over a tunnel and
+        // the block contains a gated-open sinkhole node -- so tunnels,
+        // crevices and a shaft are all inside the compared volume rather than
+        // merely nearby.
+        {"cave-band", -64, -64, 64, 64, 30000, 1,
+         static_cast<int32_t>((kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
+                               kCaveRadiusMaxMm) / kVoxelSizeMm)},
     };
 
     Digest gpuDigest;

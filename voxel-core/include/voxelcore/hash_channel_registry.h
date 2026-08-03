@@ -63,6 +63,11 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     {CH_CAVE_RADIUS, 1, "CH_CAVE_RADIUS"},
     {CH_CAVE_SHAFT, 1, "CH_CAVE_SHAFT"},
     {CH_CREVICE, 1, "CH_CREVICE"},
+    // v24 waypointed axes + per-node calibre (plan W2). 29 is the id
+    // density3.h's deleted CH_POCKET held; hash.h lists it as free rather than
+    // silently reusable, so claiming it is registered here like everything else.
+    {CH_CAVE_WAYPOINT, 1, "CH_CAVE_WAYPOINT"},
+    {CH_CAVE_NODE_RADIUS, 1, "CH_CAVE_NODE_RADIUS"},
     // caverns.h
     {CH_CAVERN_SITE, 1, "CH_CAVERN_SITE"},
     {CH_CAVERN_ROUGH, 1, "CH_CAVERN_ROUGH"},

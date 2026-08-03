@@ -114,13 +114,47 @@ inline constexpr int64_t kCaveLatticeMm = 25600;
 inline constexpr int64_t kCaveNodeDepthMinMm = 9000;
 inline constexpr int64_t kCaveNodeDepthSpanMm = 25000;
 
-// Tube radius, constant along one edge (varies edge to edge): [min, min+span).
-// 1.2 m .. 2.8 m radius = 2.4 m .. 5.6 m wide passages — walkable by an agent,
-// diggable by a player, and wide enough that the greedy mesher makes cheap
-// quads out of the walls.
+// Tube radius: [min, min+span). 1.2 m .. 2.8 m radius = 2.4 m .. 5.6 m wide
+// passages — walkable by an agent, diggable by a player, and wide enough that
+// the greedy mesher makes cheap quads out of the walls.
+//
+// v24 (docs/underground-system-plan.md W2): the radius is no longer constant
+// along an edge. Three draws now bound one passage — the two END nodes' own
+// radii and the per-edge draw, which becomes the MID value — and the radius is
+// interpolated between them, so a passage swells and chokes along its length
+// instead of being one extruded bore. The RANGE is deliberately unchanged: the
+// plan's widening to [0.8, 4.0] m belongs with the field coupling of W5/W6 that
+// decides where the wide end lives, and dropping the floor to 0.8 m would break
+// the crevice containment static_assert below (crevices must stay thinner than
+// the thinnest tunnel) — a coupling worth stating rather than discovering.
 inline constexpr int64_t kCaveRadiusMinMm = 1200;
 inline constexpr int64_t kCaveRadiusSpanMm = 1600;
 inline constexpr int64_t kCaveRadiusMaxMm = kCaveRadiusMinMm + kCaveRadiusSpanMm;
+
+// --- waypointed axes (v24, plan W2) -----------------------------------------
+// Every edge gains ONE interior waypoint near its midpoint, hash-jittered
+// sideways and dipped downward, turning a straight capsule into a two-segment
+// polyline. Both endpoints are still the lattice nodes, so every connectivity
+// argument in this file is untouched: the backbone is still the same graph and
+// the shaft still bottoms out on a node that four tunnels pass through.
+//
+// WHAT THIS DOES AND DOES NOT FIX. It removes the straight-capsule tell (plan
+// section 2.6 item 3) and it breaks the long unbroken SIGHTLINE down a backbone
+// row. It does NOT flatten the network's routing: both ends of a run are still
+// lattice nodes, so eight consecutive backbone edges still displace due east
+// within a couple of degrees no matter how the axis wanders in between.
+// vxc_caveprobe reports those as two separate numbers (SEGMENT lock and ROUTING
+// lock) precisely so this distinction is measured rather than assumed; moving
+// the routing lock needs off-axis edges, which is a different change.
+inline constexpr int64_t kCaveWaypointLatMm = 5120; // +/- 5.12 m sideways
+// DOWNWARD ONLY, and the asymmetry is forced rather than chosen: the roof
+// static_assert below has only 200 mm of slack (min axis depth 9 m minus max
+// radius 2.8 m against a 6 m clamp), so ANY upward excursion needs the depth
+// band re-tuned first — which moves every cave in the world and is its own
+// decision. Downward has 1200 mm of slack against the deliberately conservative
+// 40 m bedrock assert, and 1.0 m of it is spent here.
+inline constexpr int64_t kCaveWaypointDipMm = 1000;
+inline constexpr int32_t kCaveEdgeSubSegs = 2; // a -> waypoint -> b
 
 // Backbone selector. `(j & kCaveBackboneMask) == 0` keeps every 4th row's +x
 // edges and every 4th column's +y edges — the provably-connected skeleton.
@@ -170,6 +204,15 @@ inline constexpr int64_t kCaveMinVoxelZ = 0;          // never carve at or below
 // CaveSegmentCapHeadroom measures the real maximum over a large sample and
 // fails if it ever reaches the cap, so the (deterministic, fixed-iteration-
 // order) truncation below is never reached in practice on either CPU or GPU.
+// v24 note, recorded because the plan expected the opposite: waypointing an
+// edge into kCaveEdgeSubSegs independently-reduced sub-segments does NOT need
+// a bigger cap. The theoretical worst case doubles, but the measured maximum
+// over 800k columns is unchanged at 5-6 (test_caves.cpp
+// cave_segment_cap_headroom) -- consecutive halves of one polyline are on
+// opposite sides of the waypoint, so a column is normally inside only one of
+// them. The cap stays at 12, which keeps ColumnSample the size it was and
+// leaves the GPU struct's unrolled arrays alone. Crawlways (plan W7) are a
+// second lattice and are the thing that will actually move this number.
 inline constexpr int32_t kMaxCaveSegs = 12;
 
 // --- crevices (M4 cave pass v2, docs/cavern-design.md §4) -------------------
@@ -199,11 +242,17 @@ static_assert(kCrevHalfThickMinMm + kCrevHalfThickSpanMm < kCaveRadiusMinMm,
 // --- structural invariants, checked at compile time -------------------------
 
 // The 3x3 candidate block is only exhaustive while a tube cannot reach more
-// than one lattice cell sideways off its axis' bounding box.
-static_assert(kCaveRadiusMaxMm * 2 < kCaveLatticeMm,
-              "cave tube diameter must stay well under one lattice cell, or the 3x3 "
-              "candidate-node block in caveColumnFor stops being exhaustive");
-// Roof: shallowest possible carved voxel is axis depth minus max radius.
+// than one lattice cell sideways off its axis' bounding box. Since v24 the axis
+// is a polyline whose waypoint may sit kCaveWaypointLatMm outside that box, so
+// the waypoint excursion is part of the reach and part of this bound.
+static_assert((kCaveRadiusMaxMm + kCaveWaypointLatMm) * 2 < kCaveLatticeMm,
+              "cave tube reach (max radius plus the waypoint's lateral excursion) must "
+              "stay well under one lattice cell, or the 3x3 candidate-node block in "
+              "caveColumnFor stops being exhaustive");
+// Roof: shallowest possible carved voxel is axis depth minus max radius. The
+// waypoint dips DOWNWARD only, so the shallowest axis point is still a node and
+// this bound is unchanged by v24 — see kCaveWaypointDipMm for why that
+// asymmetry is forced rather than chosen.
 static_assert(kCaveNodeDepthMinMm - kCaveRadiusMaxMm > kCaveRoofMinMm,
               "tube geometry must keep itself above the roof clamp — the clamp is a "
               "backstop, not the mechanism");
@@ -212,8 +261,10 @@ static_assert(kCaveNodeDepthMinMm - kCaveRadiusMaxMm > kCaveRoofMinMm,
 // 180-220 m band (amplifier.cpp bedrockDepthMm): asserting against the old,
 // much shallower floor is a strictly stronger statement, and it keeps tunnel
 // geometry provably independent of wherever the bedrock band happens to sit.
-static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveRadiusMaxMm +
-                      kCaveBedrockMarginMm < 40000,
+// The waypoint dip is added because it is the one construct that can put the
+// axis below its own endpoints.
+static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
+                      kCaveRadiusMaxMm + kCaveBedrockMarginMm < 40000,
               "tube geometry must keep itself out of bedrock — the bedrock margin is a "
               "backstop, not the mechanism");
 
@@ -231,10 +282,22 @@ static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveRadiusMaxMm +
 // merely a name clash). Moved to the free ids hash.h's table identifies.
 inline constexpr uint32_t CH_CAVE_NODE = 30;   // node jitter (position + depth)
 inline constexpr uint32_t CH_CAVE_EDGE = 31;   // non-backbone edge gate
-inline constexpr uint32_t CH_CAVE_RADIUS = 20; // per-edge tube radius
+inline constexpr uint32_t CH_CAVE_RADIUS = 20; // per-edge tube radius (the MID value since v24)
 inline constexpr uint32_t CH_CAVE_SHAFT = 21;  // sinkhole gate + shaft radius
 // 22/23/25 belong to voxelcore/caverns.h (CH_CAVERN_SITE/_ROUGH/_FLOOD).
 inline constexpr uint32_t CH_CREVICE = 24;     // crevice gate + slab geometry
+// v24 (plan W2). Two new ids, both taken from hash.h's declared-free list.
+// 29 is the id density3.h's deleted CH_POCKET used to hold; hash.h keeps it
+// listed as free rather than silently reusable, so claiming it is registered
+// in hash_channel_registry.h like everything else.
+//
+// The node radius needs its OWN channel rather than reusing CH_CAVE_RADIUS
+// with an (i, j) key: the edge draw keys on (i, j*2+dir), and (i, 5) as a node
+// key collides exactly with edge (i, j=2, dir=1). That would make a node's
+// calibre equal to one particular neighbouring edge's, which is a correlation
+// artifact, not a coincidence to leave alone.
+inline constexpr uint32_t CH_CAVE_WAYPOINT = 29;    // edge waypoint offset + dip
+inline constexpr uint32_t CH_CAVE_NODE_RADIUS = 50; // per-node tube radius
 
 // --- node / edge primitives -------------------------------------------------
 
@@ -242,6 +305,15 @@ struct CaveNode {
     int64_t xMm = 0;
     int64_t yMm = 0;
     int64_t depthMm = 0; // below the terrain surface, not an absolute z
+};
+
+// One edge's interior waypoint (v24): the midpoint of the two nodes, pushed
+// sideways and dipped. `radiusMm` is the edge's own draw, i.e. the calibre at
+// the waypoint.
+struct CaveWaypoint {
+    int64_t xMm = 0;
+    int64_t yMm = 0;
+    int64_t depthMm = 0;
 };
 
 // Jittered position + depth of lattice node (i, j). One hash2 supplies all
@@ -280,8 +352,21 @@ constexpr bool caveEdgeExists(uint64_t seed, int64_t i, int64_t j, int32_t dir) 
     return ((hash2(seed, i, j * 2 + dir, CH_CAVE_EDGE) >> 48) & kCaveEdgeGateMask) == 0;
 }
 
+// The MID calibre of an edge since v24: the radius the passage has at its
+// waypoint. Unchanged arithmetic — what changed is that it is one of three
+// control values instead of the whole edge.
 constexpr int64_t caveEdgeRadiusMm(uint64_t seed, int64_t i, int64_t j, int32_t dir) {
     const uint64_t h = hash2(seed, i, j * 2 + dir, CH_CAVE_RADIUS);
+    return kCaveRadiusMinMm +
+           static_cast<int64_t>((((h >> 44) & 0xFFFFFu) * static_cast<uint64_t>(kCaveRadiusSpanMm)) >> 20);
+}
+
+// The calibre a passage has AT a node (v24). Per NODE, not per edge, so all
+// four passages meeting at a junction agree on how wide the junction is —
+// which is what makes a junction read as one place rather than as four tubes
+// that happen to touch.
+constexpr int64_t caveNodeRadiusMm(uint64_t seed, int64_t i, int64_t j) {
+    const uint64_t h = hash2(seed, i, j, CH_CAVE_NODE_RADIUS);
     return kCaveRadiusMinMm +
            static_cast<int64_t>((((h >> 44) & 0xFFFFFu) * static_cast<uint64_t>(kCaveRadiusSpanMm)) >> 20);
 }
@@ -293,6 +378,37 @@ constexpr int64_t caveEdgeRadiusMm(uint64_t seed, int64_t i, int64_t j, int32_t 
 // crevice is only ever evaluated on an edge that already exists).
 constexpr uint64_t caveCreviceHash(uint64_t seed, int64_t i, int64_t j, int32_t dir) {
     return hash2(seed, i, j * 2 + dir, CH_CREVICE);
+}
+
+// The interior waypoint of edge (i, j, dir), given its two endpoint nodes.
+// One hash2 supplies all three fields: 20 bits of x offset, 20 of y offset,
+// 20 of downward dip, each decoded by the same multiply-then-shift the node
+// jitter uses (never a division). The base point is the exact integer midpoint
+// of the two nodes — truncating toward zero via a shift would be direction-
+// dependent for negative coordinates, so it goes through floorDiv like every
+// other division in this file.
+constexpr CaveWaypoint caveWaypoint(uint64_t seed, int64_t i, int64_t j, int32_t dir,
+                                    const CaveNode& a, const CaveNode& b) {
+    const uint64_t h = hash2(seed, i, j * 2 + dir, CH_CAVE_WAYPOINT);
+    CaveWaypoint w;
+    // The lateral base is the midpoint shifted a full excursion NEGATIVE, and
+    // the decoded [0, 2*lat) draw is then added. Writing it as
+    // "midpoint + draw - lat" is the same int64 value but subtracts from an
+    // expression whose right operand came out of unsigned arithmetic, which is
+    // the shape tools/lint-shader-ub.py rejects in the mirror -- and it is
+    // right to: that shape is one editing slip away from wrapping. Both sides
+    // are kept in this order so the CPU and the shader read identically.
+    w.xMm = floorDiv(a.xMm + b.xMm, 2) - kCaveWaypointLatMm +
+            static_cast<int64_t>(((h & 0xFFFFFu) *
+                                  static_cast<uint64_t>(2 * kCaveWaypointLatMm)) >> 20);
+    w.yMm = floorDiv(a.yMm + b.yMm, 2) - kCaveWaypointLatMm +
+            static_cast<int64_t>((((h >> 20) & 0xFFFFFu) *
+                                  static_cast<uint64_t>(2 * kCaveWaypointLatMm)) >> 20);
+    w.depthMm =
+        floorDiv(a.depthMm + b.depthMm, 2) +
+        static_cast<int64_t>((((h >> 40) & 0xFFFFFu) *
+                              static_cast<uint64_t>(kCaveWaypointDipMm)) >> 20);
+    return w;
 }
 constexpr bool caveCreviceGateOpen(uint64_t h) {
     return ((h >> 61) & kCrevGateMask) == 0;
@@ -346,12 +462,14 @@ static_assert(kCaveRadiusMinMm > 0,
               "CaveLatticeEdge uses radiusMm == 0 as its 'edge does not exist' sentinel");
 
 struct CaveLatticeEdge {
-    int32_t radiusMm = 0;  // 0 == this edge does not exist
+    int32_t radiusMm = 0;  // MID calibre; 0 == this edge does not exist
     uint64_t crevHash = 0; // caveCreviceHash for it (meaningless if radiusMm == 0)
+    CaveWaypoint way;      // v24 interior waypoint (meaningless if radiusMm == 0)
 };
 
 struct CaveLattice {
-    CaveNode nodes[16] = {};       // di + 4*dj over the 4x4 block
+    CaveNode nodes[16] = {};        // di + 4*dj over the 4x4 block
+    int32_t nodeRadiusMm[16] = {};  // v24 per-node calibre, same slot indexing
     CaveLatticeEdge edges[18] = {}; // (di + 3*dj) * 2 + dir over the 3x3 sources
     int32_t shaftNodeSlot = -1;    // di + 4*dj of the sinkhole candidate, -1 = none
     int32_t shaftRadiusMm = 0;
@@ -365,8 +483,12 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
     // 4x4 node block: the 3x3 candidate SOURCE nodes plus the +x/+y endpoints
     // they need.
     for (int32_t dj = 0; dj < 4; ++dj)
-        for (int32_t di = 0; di < 4; ++di)
-            L.nodes[di + 4 * dj] = caveNode(seed, ci - 1 + di, cj - 1 + dj);
+        for (int32_t di = 0; di < 4; ++di) {
+            const int32_t slot = di + 4 * dj;
+            L.nodes[slot] = caveNode(seed, ci - 1 + di, cj - 1 + dj);
+            L.nodeRadiusMm[slot] =
+                static_cast<int32_t>(caveNodeRadiusMm(seed, ci - 1 + di, cj - 1 + dj));
+        }
 
     for (int32_t dj = 0; dj < 3; ++dj)
         for (int32_t di = 0; di < 3; ++di) {
@@ -377,6 +499,10 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
                 CaveLatticeEdge& e = L.edges[(di + 3 * dj) * 2 + dir];
                 e.radiusMm = static_cast<int32_t>(caveEdgeRadiusMm(seed, i, j, dir));
                 e.crevHash = caveCreviceHash(seed, i, j, dir);
+                const CaveNode& a = L.nodes[di + 4 * dj];
+                const CaveNode& b = (dir == 0) ? L.nodes[di + 1 + 4 * dj]
+                                               : L.nodes[di + 4 * (dj + 1)];
+                e.way = caveWaypoint(seed, i, j, dir, a, b);
             }
         }
 
@@ -419,36 +545,67 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
             for (int32_t dir = 0; dir < 2; ++dir) {
                 const CaveLatticeEdge& edge = L.edges[(di + 3 * dj) * 2 + dir];
                 if (edge.radiusMm == 0) continue; // edge does not exist
-                const CaveNode a = nodes[di + 4 * dj];
-                const CaveNode b = (dir == 0) ? nodes[di + 1 + 4 * dj] : nodes[di + 4 * (dj + 1)];
+                const int32_t aSlot = di + 4 * dj;
+                const int32_t bSlot = (dir == 0) ? di + 1 + 4 * dj : di + 4 * (dj + 1);
+                const CaveNode a = nodes[aSlot];
+                const CaveNode b = nodes[bSlot];
 
-                const int64_t dx = b.xMm - a.xMm;
-                const int64_t dy = b.yMm - a.yMm;
-                const int64_t den = dx * dx + dy * dy;
-                if (den == 0) continue; // unreachable (one axis always spans a full cell)
+                // v24: the axis is a two-segment polyline a -> waypoint -> b,
+                // and each sub-segment is reduced independently. Reducing only
+                // the global closest approach would be cheaper but wrong: a
+                // waypointed edge can pass the SAME column twice at two
+                // different depths, and that second passage is exactly the
+                // vertical richness the waypoints exist to create.
+                //
+                // The iteration order (dj, di, dir, sub) is part of the
+                // worldgen contract — it decides which segments survive if the
+                // kMaxCaveSegs cap were ever hit — and the shader mirrors it.
+                for (int32_t sub = 0; sub < kCaveEdgeSubSegs; ++sub) {
+                    const int64_t pxMm = (sub == 0) ? a.xMm : edge.way.xMm;
+                    const int64_t pyMm = (sub == 0) ? a.yMm : edge.way.yMm;
+                    const int64_t pdMm = (sub == 0) ? a.depthMm : edge.way.depthMm;
+                    const int64_t qxMm = (sub == 0) ? edge.way.xMm : b.xMm;
+                    const int64_t qyMm = (sub == 0) ? edge.way.yMm : b.yMm;
+                    const int64_t qdMm = (sub == 0) ? edge.way.depthMm : b.depthMm;
+                    // Calibre control values: node radius at the outer end,
+                    // the edge's own draw at the waypoint.
+                    const int64_t prMm =
+                        (sub == 0) ? L.nodeRadiusMm[aSlot] : static_cast<int64_t>(edge.radiusMm);
+                    const int64_t qrMm =
+                        (sub == 0) ? static_cast<int64_t>(edge.radiusMm) : L.nodeRadiusMm[bSlot];
 
-                // Closest approach in xy, parameterised on the axis and clamped
-                // to the segment. Rational t = num/den kept exact; the single
-                // rounding is the floorDiv when the closest point is realised.
-                const int64_t wx = xMm - a.xMm;
-                const int64_t wy = yMm - a.yMm;
-                const int64_t num = clampi64(wx * dx + wy * dy, 0, den);
+                    const int64_t dx = qxMm - pxMm;
+                    const int64_t dy = qyMm - pyMm;
+                    const int64_t den = dx * dx + dy * dy;
+                    if (den == 0) continue; // a waypoint landing exactly on its node
 
-                const int64_t cx = a.xMm + floorDiv(dx * num, den);
-                const int64_t cy = a.yMm + floorDiv(dy * num, den);
-                const int64_t cd = a.depthMm + floorDiv((b.depthMm - a.depthMm) * num, den);
+                    // Closest approach in xy, parameterised on the sub-segment
+                    // and clamped to it. Rational t = num/den kept exact; the
+                    // single rounding is the floorDiv when the closest point is
+                    // realised.
+                    const int64_t wx = xMm - pxMm;
+                    const int64_t wy = yMm - pyMm;
+                    const int64_t num = clampi64(wx * dx + wy * dy, 0, den);
 
-                const int64_t ex = xMm - cx;
-                const int64_t ey = yMm - cy;
-                const int64_t r = edge.radiusMm;
-                const int64_t marginSq = r * r - (ex * ex + ey * ey);
-                if (marginSq <= 0) continue;
+                    const int64_t cx = pxMm + floorDiv(dx * num, den);
+                    const int64_t cy = pyMm + floorDiv(dy * num, den);
+                    const int64_t cd = pdMm + floorDiv((qdMm - pdMm) * num, den);
 
-                if (out.count < kMaxCaveSegs) {
-                    out.segs[out.count].marginSq = static_cast<int32_t>(marginSq);
-                    out.segs[out.count].depthMm = static_cast<int32_t>(cd);
-                    ++out.count;
-                }
+                    const int64_t ex = xMm - cx;
+                    const int64_t ey = yMm - cy;
+                    // Calibre interpolated along the sub-segment at the same
+                    // parameter as the axis point, so the passage swells and
+                    // chokes continuously and is C0 across the waypoint and
+                    // across every node.
+                    const int64_t r = prMm + floorDiv((qrMm - prMm) * num, den);
+                    const int64_t marginSq = r * r - (ex * ex + ey * ey);
+                    if (marginSq <= 0) continue;
+
+                    if (out.count < kMaxCaveSegs) {
+                        out.segs[out.count].marginSq = static_cast<int32_t>(marginSq);
+                        out.segs[out.count].depthMm = static_cast<int32_t>(cd);
+                        ++out.count;
+                    }
 
                 // Crevice: a 1-in-8 gated thin vertical slab riding this same
                 // edge (docs/cavern-design.md §4). Only reachable here because
@@ -475,11 +632,16 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
                         // an abrupt flat lid from caveCarveAt's own guard.
                         const int64_t hUpEffMm = clampi64(hUpMm, 0, cd - kCaveRoofMinMm);
                         const int64_t halfSpanMm = (hUpEffMm + hDownMm) / 2;
-                        // Lens taper: 4u(1-u), u = num/den (the closest-
-                        // approach parameter already computed above) -- 0 at
-                        // either node, 1 at mid-edge, so the fissure pinches
-                        // to nothing well before it would otherwise end in a
-                        // flat wall at the node. Done in Q16 fixed point
+                        // Lens taper: 4u(1-u), where u is the closest-approach
+                        // parameter along the WHOLE edge, not along this
+                        // sub-segment -- 0 at either node, 1 at the waypoint,
+                        // so the fissure still pinches to nothing before it
+                        // would otherwise end in a flat wall at the node.
+                        // Since v24 the edge is two sub-segments, so
+                        // u = (sub + num/den) / kCaveEdgeSubSegs; computing it
+                        // per sub-segment instead would put a full-width slab
+                        // at both nodes, which is the exact artifact the taper
+                        // exists to remove. Done in Q16 fixed point
                         // rather than the exact rational (num*(den-num)/den^2)
                         // on purpose: den = dx^2+dy^2 for a jittered lattice
                         // edge can reach ~3e9 mm^2 (two node jitters can each
@@ -489,7 +651,9 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
                         // shader, and the reason every division elsewhere in
                         // this file goes through floorDiv on pre-scaled
                         // quantities instead of squaring a large denominator.
-                        const int64_t uQ16 = floorDiv(num << 16, den);
+                        const int64_t uQ16 =
+                            floorDiv((static_cast<int64_t>(sub) << 16) + floorDiv(num << 16, den),
+                                     kCaveEdgeSubSegs);
                         const int64_t taperQ16 = (4 * uQ16 * ((1 << 16) - uQ16)) >> 16;
                         const int64_t halfSpanTaperedMm = floorDiv(halfSpanMm * taperQ16, 1 << 16);
                         const int64_t crevMarginSq = halfSpanTaperedMm * halfSpanTaperedMm;
@@ -501,6 +665,7 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
                         }
                     }
                 }
+                } // sub
             }
         }
     }

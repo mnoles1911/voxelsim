@@ -233,7 +233,44 @@ namespace vxc {
 // WIRE FORMAT UNCHANGED. All four climate bytes were already carried and
 // blended; only which byte classifyBiome reads moved. Tiles do not need
 // regenerating and provider_id does not roll for this.
-inline constexpr uint32_t kWorldGenVersion = 23;
+//
+// ---------------------------------------------------------------------------
+// v24 -- WAYPOINTED CAVE PASSAGES AND VARIABLE CALIBRE
+// (docs/underground-system-plan.md W2)
+// ---------------------------------------------------------------------------
+// The owner's complaint was that caves "look very computer made with procedural
+// shapes". Two of the mechanical tells behind that are straight constant-radius
+// capsules and a hard lattice direction. v24 addresses the first two:
+//
+//   * every lattice edge's axis becomes a two-segment polyline through one
+//     hash-jittered interior waypoint (sideways up to 5.12 m, dipped up to
+//     1.0 m), and each sub-segment reduces independently -- a waypointed edge
+//     can pass the same column twice at two depths;
+//   * the tube radius interpolates between three control values (each end
+//     NODE's own calibre and the per-edge draw as the mid value) instead of
+//     being one constant per edge, so passages swell and choke.
+//
+// Two new hash channels, 29 and 50 (hash.h's declared-free ids). Radius RANGE
+// unchanged; the plan's widening to [0.8, 4.0] m belongs with the field
+// coupling that decides where the wide end lives, and would break the crevice
+// containment static_assert as it stands.
+//
+// Structure untouched: both endpoints are still lattice nodes, so the backbone
+// connectivity proof, the depth-space roof guarantee, the shaft's
+// bottoms-out-on-a-node argument and all three bedrock guards are unchanged.
+// Measured connectivity did not regress (flat-terrain largest component
+// 90.12% -> 90.48%, real terrain 65.01% -> 70.15%).
+//
+// WHAT IT DOES NOT DO, measured rather than assumed: it does not flatten the
+// network's ROUTING. Tunnel axis length within 15 deg of a cardinal falls from
+// 54.1% to 47.8%, but the net heading of eight consecutive backbone edges still
+// departs from due E/N by only 2.1 deg on average -- because both ends of a run
+// are still lattice nodes. vxc_caveprobe reports those as two separate numbers
+// for exactly this reason. Moving the routing lock needs off-axis edges.
+//
+// TILES DO NOT NEED REGENERATING: caves are runtime worldgen only and the bake
+// computes no underground data. Saved edit logs invalidate as usual.
+inline constexpr uint32_t kWorldGenVersion = 24;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

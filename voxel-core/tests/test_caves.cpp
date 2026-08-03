@@ -142,8 +142,15 @@ VXC_TEST(cave_golden_digest) {
     // ~1-in-8 of existing edges, so count/segs[] shift for many sampled
     // columns even though the tunnel geometry itself is unchanged. Re-pinned
     // per the build plan's explicit "caves.h + test_caves.cpp headroom/golden
-    // updates" ownership for this subtask.
-    CHECK_EQ(d.h, 0xF809F0E416F80133ull);
+    // updates" ownership for this subtask. MOVED AGAIN at kWorldGenVersion 24
+    // (docs/underground-system-plan.md W2): every edge axis is now a two-segment
+    // polyline through a hash-jittered waypoint and its radius interpolates
+    // between three control values instead of being one constant, so every
+    // marginSq and depthMm in the reduction moves. Verified independently of
+    // this pin by vxc_caveprobe (plan-view and cross-section images plus the
+    // per-family census) and by vxc_gpu, whose new cave-band fixture compares
+    // the cave voxels themselves for the first time.
+    CHECK_EQ(d.h, 0x975A546F41FE1A4Cull);
 }
 
 // --- safety rule 1: the bedrock floor is never breached ----------------------
@@ -384,16 +391,20 @@ VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
                 CHECK(hDownMm >= kCrevDownMinMm);
                 CHECK(hDownMm < kCrevDownMinMm + kCrevDownSpanMm);
 
-                // Mid-edge: taper is maximal, so the slab is at its full
-                // (roof-clamped) size and must contain the tube axis depth at
-                // that same point. Q16 fixed point, matching caveColumnFor's
-                // crevice block exactly (den can be too large to square into
-                // int64, see that block's comment).
-                const int64_t numMid = den / 2;
-                const int64_t cdMid = a.depthMm + floorDiv((b.depthMm - a.depthMm) * numMid, den);
+                // Mid-EDGE is the WAYPOINT since v24, not the linear midpoint:
+                // u = 1 there by construction (sub = 1, num = 0), so the taper
+                // is maximal, the slab is at its full roof-clamped size, and it
+                // must contain the axis depth at that same point -- which is
+                // now the waypoint's own dipped depth, not an interpolation
+                // between the two nodes.
+                const CaveWaypoint w = caveWaypoint(kSeed, i, j, dir, a, b);
+                const int64_t cdMid = w.depthMm;
                 const int64_t hUpEffMm = clampi64(hUpMm, 0, cdMid - kCaveRoofMinMm);
                 const int64_t halfSpanMm = (hUpEffMm + hDownMm) / 2;
-                const int64_t uQ16Mid = floorDiv(numMid << 16, den);
+                // u at the waypoint: sub = 1, num = 0 -> (1<<16 + 0)/2 = 0.5,
+                // which is where 4u(1-u) peaks at 1.0.
+                const int64_t uQ16Mid =
+                    floorDiv((static_cast<int64_t>(1) << 16) + 0, kCaveEdgeSubSegs);
                 const int64_t taperQ16Mid = (4 * uQ16Mid * ((1 << 16) - uQ16Mid)) >> 16;
                 const int64_t halfSpanTaperedMid = floorDiv(halfSpanMm * taperQ16Mid, 1 << 16);
                 CHECK(halfSpanTaperedMid > 0);
@@ -402,11 +413,16 @@ VXC_TEST(crevice_geometry_pinches_out_at_nodes_and_contains_the_tube_axis) {
                 CHECK(centerOffset <= halfSpanTaperedMid);
                 CHECK(-centerOffset <= halfSpanTaperedMid);
 
-                // At either node (u=0 or u=1), the taper is zero by
-                // construction -- the slab pinches to nothing.
-                CHECK_EQ((4 * static_cast<int64_t>(0) * ((1 << 16) - 0)) >> 16, 0);
-                const int64_t uQ16End = floorDiv(den << 16, den); // u=1 -> 1<<16
-                CHECK_EQ((4 * uQ16End * ((1 << 16) - uQ16End)) >> 16, 0);
+                // At either node the taper is zero by construction -- the slab
+                // pinches to nothing. Node A is sub=0, num=0 -> u=0; node B is
+                // sub=1, num=den -> u = (1<<16 + 1<<16)/2 = 1<<16.
+                const int64_t uQ16NodeA = floorDiv(0 + floorDiv(0, den), kCaveEdgeSubSegs);
+                CHECK_EQ((4 * uQ16NodeA * ((1 << 16) - uQ16NodeA)) >> 16, 0);
+                const int64_t uQ16NodeB =
+                    floorDiv((static_cast<int64_t>(1) << 16) + floorDiv(den << 16, den),
+                             kCaveEdgeSubSegs);
+                CHECK_EQ(uQ16NodeB, static_cast<int64_t>(1) << 16);
+                CHECK_EQ((4 * uQ16NodeB * ((1 << 16) - uQ16NodeB)) >> 16, 0);
             }
         }
     }

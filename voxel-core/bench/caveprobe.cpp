@@ -699,9 +699,23 @@ int main(int argc, char** argv) {
         const int64_t lj0 = floorDiv(y0 * kVoxelSizeMm, kCaveLatticeMm);
         const int64_t li1 = floorDiv((x0 + spanVx) * kVoxelSizeMm, kCaveLatticeMm);
         const int64_t lj1 = floorDiv((y0 + spanVx) * kVoxelSizeMm, kCaveLatticeMm);
-        for (int64_t j = lj0; j <= lj1; ++j)
-            for (int64_t i = li0; i <= li1; ++i) {
-                if ((i & kCaveShaftNodeMask) == 0 && (j & kCaveShaftNodeMask) == 0) {
+        // Sites are counted by their JITTERED POSITION falling inside the
+        // census region, not by their lattice index. A node lands anywhere in
+        // its own 25.6 m cell, so index-based counting reports entrances that
+        // are not in the region and misses ones that are -- on the savanna tile
+        // it claimed two entrances in a region whose surface the probe found to
+        // be unperforated, because both nodes had jittered out of it. The
+        // lattice range below is widened by one cell so no in-region node is
+        // missed.
+        const int64_t rxMm0 = x0 * kVoxelSizeMm, rxMm1 = (x0 + spanVx) * kVoxelSizeMm;
+        const int64_t ryMm0 = y0 * kVoxelSizeMm, ryMm1 = (y0 + spanVx) * kVoxelSizeMm;
+        auto inRegion = [&](const CaveNode& nd) {
+            return nd.xMm >= rxMm0 && nd.xMm < rxMm1 && nd.yMm >= ryMm0 && nd.yMm < ryMm1;
+        };
+        for (int64_t j = lj0 - 1; j <= lj1 + 1; ++j)
+            for (int64_t i = li0 - 1; i <= li1 + 1; ++i) {
+                if ((i & kCaveShaftNodeMask) == 0 && (j & kCaveShaftNodeMask) == 0 &&
+                    inRegion(caveNode(seed, i, j))) {
                     ++shaftCandidates;
                     if (((hash2(seed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0)
                         ++shaftOpen;
@@ -710,7 +724,7 @@ int main(int argc, char** argv) {
                 // modulo for negative indices too -- the same reason caves.h
                 // uses a power-of-two mask for its backbone selector.
                 if ((i & (kCavernCoarseLatticeRatio - 1)) == 0 &&
-                    (j & (kCavernCoarseLatticeRatio - 1)) == 0) {
+                    (j & (kCavernCoarseLatticeRatio - 1)) == 0 && inRegion(caveNode(seed, i, j))) {
                     ++cavernCandidates;
                     // Site gate AND the child-0 depth safety window, which is
                     // what actually decides whether a room exists.
@@ -725,19 +739,32 @@ int main(int argc, char** argv) {
                     if (!caveEdgeExists(seed, i, j, d)) continue;
                     const CaveNode a = caveNode(seed, i, j);
                     const CaveNode b = (d == 0) ? caveNode(seed, i + 1, j) : caveNode(seed, i, j + 1);
-                    const double dx = static_cast<double>(b.xMm - a.xMm);
-                    const double dy = static_cast<double>(b.yMm - a.yMm);
-                    const double len = std::sqrt(dx * dx + dy * dy) / 1000.0;
-                    double deg = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
-                    if (deg < 0) deg += 180.0;
-                    if (deg >= 180.0) deg -= 180.0;
-                    dirLenM[static_cast<size_t>(std::min(kDirBins - 1,
-                                                         static_cast<int>(deg / 15.0)))] += len;
-                    totalEdgeLenM += len;
-                    // within 15 degrees of due E (0/180) or due N (90)
-                    const double dE = std::min(deg, 180.0 - deg);
-                    const double dN = std::abs(deg - 90.0);
-                    if (std::min(dE, dN) <= 15.0) cardinalLenM += len;
+                    // Walk the axis the way the carve does: the SUB-SEGMENTS of
+                    // the waypointed polyline, not the node-to-node chord.
+                    // Measuring the chord is what this histogram did first, and
+                    // it is blind by construction to the very change waypointing
+                    // makes -- it reported the identical 54.14% before and after
+                    // W2, because a waypoint moves the axis without moving
+                    // either endpoint.
+                    const CaveWaypoint w = caveWaypoint(seed, i, j, d, a, b);
+                    const int64_t pxs[3] = {a.xMm, w.xMm, b.xMm};
+                    const int64_t pys[3] = {a.yMm, w.yMm, b.yMm};
+                    for (int32_t sub = 0; sub < kCaveEdgeSubSegs; ++sub) {
+                        const double dx = static_cast<double>(pxs[sub + 1] - pxs[sub]);
+                        const double dy = static_cast<double>(pys[sub + 1] - pys[sub]);
+                        const double len = std::sqrt(dx * dx + dy * dy) / 1000.0;
+                        if (len <= 0.0) continue;
+                        double deg = std::atan2(dy, dx) * 180.0 / 3.14159265358979323846;
+                        if (deg < 0) deg += 180.0;
+                        if (deg >= 180.0) deg -= 180.0;
+                        dirLenM[static_cast<size_t>(
+                            std::min(kDirBins - 1, static_cast<int>(deg / 15.0)))] += len;
+                        totalEdgeLenM += len;
+                        // within 15 degrees of due E (0/180) or due N (90)
+                        const double dE = std::min(deg, 180.0 - deg);
+                        const double dN = std::abs(deg - 90.0);
+                        if (std::min(dE, dN) <= 15.0) cardinalLenM += len;
+                    }
                 }
     }
 
@@ -1045,8 +1072,14 @@ int main(int argc, char** argv) {
         const int64_t li1 = floorDiv((x0 + spanVx) * kVoxelSizeMm, kCaveLatticeMm);
         const int64_t lj1 = floorDiv((y0 + spanVx) * kVoxelSizeMm, kCaveLatticeMm);
         int listed = 0;
-        for (int64_t j = lj0; j <= lj1 && listed < 24; ++j)
-            for (int64_t i = li0; i <= li1 && listed < 24; ++i) {
+        for (int64_t j = lj0 - 1; j <= lj1 + 1 && listed < 24; ++j)
+            for (int64_t i = li0 - 1; i <= li1 + 1 && listed < 24; ++i) {
+                const CaveNode probeNode = caveNode(seed, i, j);
+                if (probeNode.xMm < x0 * kVoxelSizeMm ||
+                    probeNode.xMm >= (x0 + spanVx) * kVoxelSizeMm ||
+                    probeNode.yMm < y0 * kVoxelSizeMm ||
+                    probeNode.yMm >= (y0 + spanVx) * kVoxelSizeMm)
+                    continue; // jittered out of the census region
                 const bool isShaft =
                     (i & kCaveShaftNodeMask) == 0 && (j & kCaveShaftNodeMask) == 0 &&
                     ((hash2(seed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0;

@@ -59,7 +59,8 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
 //   48       hash.h             CH_CARRIER_WARP_X  (v16 carrier warp)
 //   49       hash.h             CH_CARRIER_WARP_Y  (v16 carrier warp)
-//   50..     FREE
+//   50       caves.h            CH_CAVE_NODE_RADIUS (v24)
+//   51..     FREE
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a
