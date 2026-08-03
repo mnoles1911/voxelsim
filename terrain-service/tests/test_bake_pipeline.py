@@ -1588,3 +1588,213 @@ def test_real_kernels_have_the_frozen_signatures(mod):
             f"{mod}.{fn_name}{tuple(got)} does not start with the frozen "
             f"interface {tuple(params)}"
         )
+
+
+# ---------------------------------------------------------------------------
+# The MODEL-BACKED top of the pyramid: HYDROLOGY_RESIDUALS #2.
+# ---------------------------------------------------------------------------
+
+
+def _model_bowl(n=16):
+    """A raster that drains to one corner, so 'upstream area' is unambiguous."""
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+    return (yy + xx) * 10.0
+
+
+def test_build_model_superblock_needs_no_tiles_and_is_reproducible():
+    """The whole point: a parent constructible from an ARRAY, not from tiles.
+
+    ``inject_edge_inflow`` reads only cell_m / origin_m / acc / filled off a
+    parent, so a synthetic one is a legal parent -- which is what lets the top
+    level be seeded from the model's coarse map at 7.68 km/px, covering 3,932
+    km for zero coarse tiles.
+    """
+    z = _model_bowl()
+    sb = pipeline.build_model_superblock(
+        z, origin_m=(-1_966_080.0, 983_040.0), cell_m=7680.0, kernels=kernels(),
+        sx=-1, sy=3, consts=TEST_CONSTS,
+    )
+    assert sb.level == pipeline.MODEL_FLOW_LEVEL
+    assert sb.cell_m == 7680.0
+    assert sb.acc.shape == z.shape and sb.filled.shape == z.shape
+    # No tiles means nothing can be MISSING. This must not be read as "the
+    # child is complete" -- see the docstring; the child computes its own.
+    assert sb.missing_tiles == () and sb.complete
+    assert sb.tiles_per_side == pipeline.MODEL_TILES_PER_SIDE
+
+    # Determinism over the raster: same window in, same accumulation out.
+    again = pipeline.build_model_superblock(
+        z.copy(), origin_m=(-1_966_080.0, 983_040.0), cell_m=7680.0,
+        kernels=kernels(), sx=-1, sy=3, consts=TEST_CONSTS,
+    )
+    np.testing.assert_array_equal(sb.acc, again.acc)
+    assert sb.inputs_fingerprint == again.inputs_fingerprint
+
+    # ... and the fingerprint moves when the window's CONTENT moves, which is
+    # what makes "this block was built against a different world" detectable
+    # through the child's chained digest.
+    moved = pipeline.build_model_superblock(
+        z + 1.0, origin_m=(-1_966_080.0, 983_040.0), cell_m=7680.0,
+        kernels=kernels(), sx=-1, sy=3, consts=TEST_CONSTS,
+    )
+    assert moved.inputs_fingerprint != sb.inputs_fingerprint
+
+
+def test_build_model_superblock_refuses_rasters_it_cannot_route():
+    k = kernels()
+    with pytest.raises(ValueError, match="square 2-D"):
+        pipeline.build_model_superblock(
+            np.zeros((4, 8), np.float32), (0.0, 0.0), 7680.0, k)
+    with pytest.raises(ValueError, match="non-finite"):
+        z = _model_bowl(4)
+        z[1, 1] = np.nan
+        pipeline.build_model_superblock(z, (0.0, 0.0), 7680.0, k)
+    with pytest.raises(ValueError, match="cell_m"):
+        pipeline.build_model_superblock(_model_bowl(4), (0.0, 0.0), 0.0, k)
+
+
+def test_model_parent_carries_area_into_a_child_that_had_none():
+    """Conservation at the model parent's 64x64 ratio.
+
+    ``inject_edge_inflow`` claims exact conservation; the tile-backed pyramid
+    only ever exercised it at 4x4. Every parent flow path crosses the child
+    boundary exactly once (single-receiver D8), so the injected total must
+    equal the accumulation of exactly those crossing cells -- no more, and
+    counted no more than once.
+    """
+    k = kernels()
+    parent = pipeline.build_model_superblock(
+        _model_bowl(16), origin_m=(0.0, 0.0), cell_m=7680.0, kernels=k,
+        consts=TEST_CONSTS,
+    )
+    child_cell_m = 120.0
+    child_origin = (4 * 7680.0, 4 * 7680.0)
+    child_n = 128
+    yy, xx = np.mgrid[0:child_n, 0:child_n].astype(np.float32)
+    child_z = (yy + xx) * 0.5 + 800.0
+
+    inflow = pipeline.inject_edge_inflow(
+        child_z=child_z, child_origin_m=child_origin,
+        child_cell_m=child_cell_m, src=parent, d8_fn=ref_d8,
+    )
+    assert inflow.sum() > 0.0
+
+    rec, _ = ref_d8(parent.filled, parent.cell_m)
+    rec = np.asarray(rec).reshape(-1)
+    sh, sw = parent.acc.shape
+    cx = parent.origin_m[0] + (np.arange(sw) + 0.5) * parent.cell_m
+    cy = parent.origin_m[1] + (np.arange(sh) + 0.5) * parent.cell_m
+    inside = (
+        ((cy >= child_origin[1])
+         & (cy < child_origin[1] + child_n * child_cell_m))[:, None]
+        & ((cx >= child_origin[0])
+           & (cx < child_origin[0] + child_n * child_cell_m))[None, :]
+    ).reshape(-1)
+    valid = rec >= 0
+    entry = np.zeros(rec.shape, bool)
+    entry[valid] = (~inside[valid]) & inside[rec[valid]]
+    expect = float(parent.acc.reshape(-1)[entry].sum())
+    assert float(inflow.sum()) == pytest.approx(expect, rel=1e-5)
+
+
+def test_entry_crossing_keeps_the_water_on_the_face_it_came_through():
+    """Mitigation 1, and why it is not cosmetic at a 64x64 ratio.
+
+    ENTRY_FOOTPRINT deposits in the lowest child cell ANYWHERE in the
+    receiving parent cell's footprint. Here the footprint's global minimum sits
+    63 cells from the face the parent's flow actually crosses -- at the
+    production ratio that is ~7.6 km inside the domain, in whatever valley
+    happens to be there. ENTRY_CROSSING cannot leave the face.
+    """
+    parent = pipeline.FlowSuperblock(
+        level=pipeline.MODEL_FLOW_LEVEL, sx=0, sy=0,
+        tiles_per_side=pipeline.MODEL_TILES_PER_SIDE, cell_m=640.0,
+        origin_m=(0.0, 0.0),
+        # A west-to-east staircase: everything drains east, so the crossing
+        # into column 2 is through its WEST face.
+        acc=np.tile(np.array([1.0, 2.0, 3.0, 4.0], np.float32), (4, 1)) * 1000.0,
+        filled=np.tile(np.array([40.0, 30.0, 20.0, 10.0], np.float32), (4, 1)),
+    )
+    # Child covers parent columns 2..3 at a 64x ratio.
+    child = np.full((256, 128), 5.0, np.float32)
+    child[100, 63] = 1.0  # a deep hole at the EAST edge of parent cell (1, 2)
+
+    common = dict(child_origin_m=(1280.0, 0.0), child_cell_m=10.0,
+                  src=parent, d8_fn=ref_d8)
+    foot = pipeline.inject_edge_inflow(
+        child_z=child, entry_mode=pipeline.ENTRY_FOOTPRINT, **common)
+    cross = pipeline.inject_edge_inflow(
+        child_z=child, entry_mode=pipeline.ENTRY_CROSSING, **common)
+
+    # Conservation is identical -- both pick exactly one cell per crossing.
+    assert float(foot.sum()) == pytest.approx(float(cross.sum()))
+    # Parent row 1 spans child rows 64..127. The footprint rule follows the
+    # hole 63 columns in; the crossing rule stays on column 0, the west face.
+    assert foot[100, 63] > 0.0
+    assert cross[100, 63] == 0.0
+    assert cross[64:128, 0].sum() > 0.0
+
+    with pytest.raises(ValueError, match="entry_mode"):
+        pipeline.inject_edge_inflow(
+            child_z=child, entry_mode="nearest", **common)
+
+
+def test_entry_mode_is_in_the_digest_but_only_when_it_is_not_the_default():
+    """Where inflow lands changes the hydrology, so it belongs in the digest.
+
+    Emitted CONDITIONALLY: hashing it unconditionally would have rewritten the
+    fingerprint of every superblock already cached, for a setting none of them
+    used.
+    """
+    world = synth_world()
+
+    def fetch(x, y):
+        return world.get((x, y))
+
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    base = pipeline.superblock_inputs_fingerprint(fetch, 0, 0, lv)
+    assert pipeline.superblock_inputs_fingerprint(
+        fetch, 0, 0, lv, entry_mode=pipeline.ENTRY_FOOTPRINT) == base
+    assert pipeline.superblock_inputs_fingerprint(
+        fetch, 0, 0, lv, entry_mode=pipeline.ENTRY_CROSSING) != base
+
+
+def test_a_model_parent_changes_the_child_and_the_child_says_so():
+    """End to end through ``build_flow_superblock``: the wiring under test.
+
+    The parent must reach the child's accumulation AND the child's provenance
+    digest, or "was this built with a model parent?" is unanswerable from the
+    cached artifact.
+    """
+    world = synth_world()
+
+    def fetch(x, y):
+        return world.get((x, y))
+
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    span = lv.span_m
+    n = 8
+    cell = span  # one parent cell per child block, so coverage is generous
+    parent = pipeline.build_model_superblock(
+        _model_bowl(n), origin_m=(-2 * cell, -2 * cell), cell_m=cell,
+        kernels=kernels(), consts=TEST_CONSTS,
+    )
+    assert pipeline.superblock_covers(parent, (0.0, 0.0), span)
+
+    plain = pipeline.build_flow_superblock(fetch, 0, 0, lv, kernels())
+    seeded = pipeline.build_flow_superblock(
+        fetch, 0, 0, lv, kernels(), parent=parent)
+    assert seeded.inputs_fingerprint != plain.inputs_fingerprint
+    assert float(seeded.acc.sum()) > float(plain.acc.sum())
+
+
+def test_superblock_covers_catches_a_parent_that_only_half_reaches():
+    sb = pipeline.build_model_superblock(
+        _model_bowl(8), origin_m=(0.0, 0.0), cell_m=7680.0, kernels=kernels(),
+        consts=TEST_CONSTS,
+    )
+    span = 8 * 7680.0
+    assert pipeline.superblock_covers(sb, (0.0, 0.0), span)
+    assert pipeline.superblock_covers(sb, (7680.0, 7680.0), span - 2 * 7680.0)
+    assert not pipeline.superblock_covers(sb, (-7680.0, 0.0), span)
+    assert not pipeline.superblock_covers(sb, (7680.0, 0.0), span)

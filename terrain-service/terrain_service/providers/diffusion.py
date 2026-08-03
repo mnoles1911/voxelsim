@@ -160,6 +160,19 @@ _CLIMATE_ORDER: tuple[str, ...] = (
     "precip_variability",
 )
 
+#: Fine (30 m) pixels per cell of the model's COARSE stage, on both axes.
+#:
+#: ``world_pipeline.py::_compute_climate`` indexes ``self.coarse`` at
+#: ``i // (32 * scale)`` with ``scale = latent_compression``; the shipped
+#: checkpoint has ``latent_compression = 8``, so 256. That is where the
+#: "one coarse cell is 7.68 km" everything in this repo quotes comes from, and
+#: it makes a coarse cell exactly half a tile (``TILE_SIZE`` = 512).
+#:
+#: ``TerrainDiffusionBackend.coarse_cell_fine_px`` re-derives this from the
+#: LIVE pipeline and refuses if it disagrees, because a wrong ratio silently
+#: georeferences a whole coarse window to the wrong ground.
+FINE_PX_PER_COARSE_CELL = 256
+
 
 class ModelOutputMismatch(ValueError):
     """Raised by validate_model_output; .issues lists every mismatch found."""
@@ -1497,6 +1510,82 @@ class TerrainDiffusionBackend:
         out = pipeline.get(i1, j1, i2, j2, with_climate=True)
         return out["elev"], out["climate"]
 
+    def coarse_elevation_m(
+        self, seed: int, ci0: int, ci1: int, cj0: int, cj1: int
+    ) -> np.ndarray:
+        """The model's COARSE-STAGE elevation over a cell window, in metres.
+
+        Rows ``[ci0, ci1)`` and columns ``[cj0, cj1)`` of the coarse map. Per
+        ``tools/world_map.py::check_axis_mapping`` (r = +0.999 against the
+        cached tiles, -0.795 transposed) ``ci`` is the tile-Y axis and ``cj``
+        is tile-X, the same orientation ``generate_rasters`` uses.
+
+        WHY THIS EXISTS. The hydrology pyramid's top level receives no inflow
+        at its own edges, so a catchment larger than its span is truncated
+        (``bake.pipeline.HYDROLOGY_RESIDUALS`` #2). The coarse map is the
+        cheapest possible parent: one cell is ``FINE_PX_PER_COARSE_CELL`` * 30
+        m = 7.68 km, a 512^2 window therefore spans 3,932 km, and it costs
+        coarse-stage inference ONLY -- it touches neither the latent stage nor
+        the decoder, which are what make a tile expensive.
+
+        The access idiom is the explorer's own
+        (``terrain_diffusion/inference/explorer/server.py::_coarse_channel``):
+        divide by the accumulator plane, take channel 0, then undo the
+        signed-sqrt encoding. Transcribed rather than imported because the
+        explorer is a Flask app that pulls in matplotlib.
+
+        Returns float32 so it can go straight to ``build_model_superblock``.
+        """
+        pipeline = self._pipeline_for_seed(seed)
+        import torch
+
+        # The coarse stage is DETERMINISTIC given the world seed -- it is
+        # hashed per tile inside the pipeline's tile store, exactly like tile
+        # generation. No torch.manual_seed here on purpose: unlike
+        # generate_rasters there is no (x, y, scale) to derive one from, and
+        # pinning the global RNG from the bare world seed would make the answer
+        # depend on the ORDER windows were requested in. Determinism is
+        # asserted by test rather than assumed -- see the scope doc's test 1.
+        with torch.no_grad():
+            c = pipeline.coarse[:, ci0:ci1, cj0:cj1]
+            norm = (c[:-1] / (c[-1:] + 1e-8))[0]
+            elev = torch.sign(norm) * torch.square(norm)
+            out = elev.detach().to("cpu").to(torch.float32).numpy()
+        if out.shape != (ci1 - ci0, cj1 - cj0):
+            raise RuntimeError(
+                f"coarse window came back {out.shape}, asked for "
+                f"{(ci1 - ci0, cj1 - cj0)} -- world.coarse is not being indexed "
+                "in world coordinates the way this assumes"
+            )
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    def coarse_cell_fine_px(self, seed: int) -> int:
+        """Fine (30 m) pixels per coarse cell, ASKED OF THE LIVE PIPELINE.
+
+        ``_compute_climate`` indexes the coarse map at ``i // (32 * scale)``
+        with ``scale = latent_compression``, so the ratio is
+        ``32 * latent_compression`` -- 256 at the shipped ``latent_compression
+        = 8``, which is where "one coarse cell is 7.68 km" comes from.
+
+        Derived rather than hard-coded because getting it wrong is silent: a
+        window built at the wrong ratio is georeferenced to the wrong ground
+        and injects a real river into the wrong place, with nothing in the
+        output to say so. ``FINE_PX_PER_COARSE_CELL`` is the value every other
+        tool in this repo assumes, and a checkpoint that disagreed with it
+        would break those tools too, so this refuses rather than adapts.
+        """
+        pipeline = self._pipeline_for_seed(seed)
+        ratio = int(32 * int(pipeline.latent_compression))
+        if ratio != FINE_PX_PER_COARSE_CELL:
+            raise RuntimeError(
+                f"this checkpoint puts {ratio} fine px in a coarse cell, not "
+                f"{FINE_PX_PER_COARSE_CELL}. tools/world_map.py, the 7.68 km "
+                "coarse cell in docs, and the flow pyramid's model window all "
+                "assume the latter; reconcile them deliberately rather than "
+                "letting one tool silently use a different world grid."
+            )
+        return ratio
+
     def generate_rasters(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
         # _pipeline_for_seed -> _load_pipeline does the guarded `import
         # torch` (clear RuntimeError if missing) BEFORE anything below
@@ -1621,6 +1710,49 @@ class DiffusionProvider:
             self._clamped_cells = clamped
         validate_model_output(raster, self.config.channel_mapping)
         return adapt_raster_to_tile(raster, self.config, seed, x, y, scale)
+
+    # -- the coarse stage, for the hydrology pyramid's top level -------------
+    #
+    # Deliberately NOT part of the TileProvider protocol. A provider that
+    # cannot serve its own coarse map (synthetic, dry-run) simply does not have
+    # these, and ``pregen`` duck-types for them and says so; a protocol method
+    # would have forced every provider to grow a stub that raises, which is the
+    # same absence spelled at more length.
+
+    def coarse_elevation_m(
+        self, seed: int, ci0: int, ci1: int, cj0: int, cj1: int
+    ) -> np.ndarray:
+        """Coarse-stage elevation over a cell window, metres. See the backend's.
+
+        Refused in dry-run mode: the synthetic stand-in has no coarse STAGE,
+        only per-tile rasters, so anything returned here would be a fabricated
+        parent for the flow pyramid -- rivers invented out of nothing, in a
+        world whose id says it is only standing in for the plumbing.
+        """
+        return self._coarse_backend().coarse_elevation_m(seed, ci0, ci1, cj0, cj1)
+
+    def coarse_cell_fine_px(self, seed: int) -> int:
+        """Fine pixels per coarse cell, asked of the live pipeline."""
+        return self._coarse_backend().coarse_cell_fine_px(seed)
+
+    def _coarse_backend(self):
+        if self.dry_run:
+            raise NotImplementedError(
+                "dry-run mode has no coarse stage to read: its rasters come "
+                "from SyntheticProvider one tile at a time. A model-backed "
+                "flow parent needs the real checkpoint."
+            )
+        backend = self.model_backend
+        if backend is None:
+            if self._real_backend is None:
+                self._real_backend = TerrainDiffusionBackend(self.config)
+            backend = self._real_backend
+        if not hasattr(backend, "coarse_elevation_m"):
+            raise NotImplementedError(
+                f"{type(backend).__name__} does not expose the coarse stage "
+                "(coarse_elevation_m); only TerrainDiffusionBackend does."
+            )
+        return backend
 
     def _call_model(self, seed: int, x: int, y: int, scale: int) -> dict[str, np.ndarray]:
         """Get raw (unquantized) model rasters for one tile.
