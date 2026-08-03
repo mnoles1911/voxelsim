@@ -1406,6 +1406,21 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
       catchment (2.29x). Whether a continental river appears at all depends on
       whether one drains into that particular 246 km block -- for this world,
       none does.
+   d. **The reach is not symmetric, and where it points is arbitrary.** The
+      window is world-anchored on a multiple of its own size, so a top-level
+      block can sit anywhere in it -- and on seed 20260719 it sits in the
+      extreme +x/+y CORNER (window cells [-512, 0), block cells [-32, 0)).
+      Upstream area arriving from beyond the block's east or south edge is
+      still truncated exactly as before; only west and north got the 3,932 km.
+
+      Anchoring is what makes the pyramid cacheable (``superblock_index``:
+      two tiles sharing an edge must read the same block), but a window
+      CENTRED on its own top-level block would also be a deterministic
+      function of that block, and would give every block the full radius. The
+      cost is that two adjacent blocks would then see different windows and
+      could disagree about the flow crossing their shared edge -- which they
+      already do, since each runs its own fill and accumulation. Worth
+      measuring; deliberately not changed here on argument alone.
 
 3. **Routing disagreement between levels.** Injected area arrives where the
    30 m D8 routing says it crosses, not where the 1.875 m MFD routing would
@@ -1443,6 +1458,47 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
    ``filled`` raster (world-anchored, shared, 61 km at level 0), NOT more
    inflow: ``inject_edge_inflow`` runs after the fill and cannot change where
    the surface lets water go. Not wired.
+
+7. **A level only ever hands its child what CROSSES the child's boundary.**
+   Found while measuring #2's fix, and it is the reason that fix delivered so
+   little. ``inject_edge_inflow`` counts parent cells that are OUTSIDE the
+   child and drain INTO it. Area added to the parent anywhere INSIDE the
+   child's own footprint is therefore invisible to that child, which rebuilds
+   its accumulation from its own coarse tiles and never learns of it.
+
+   Normally harmless -- a large catchment crosses many boundaries on its way
+   down, so it is picked up at each hop. It bites when the new area is
+   injected CLOSE to where it is wanted, which is exactly what a top-level
+   parent does: it deposits on the top level's rim, and everything within one
+   child block of that rim shares a block with the deposit.
+
+   MEASURED, seed 20260719, 2026-08-03, and it goes all the way down:
+
+     * the model parent moved level-1 accumulation on 0.49% of cells and took
+       the best land tile from 470.1 to 1,075.5 km^2;
+     * **1 of the 16 level-0 blocks under it changed at all** -- block
+       (-4,-3), inflow 21,399.1 -> 21,854.7 km^2 (+455.6, +2.1%) -- delivering
+       to exactly ONE tile, (-16,-9), 2,238.4 -> 2,683.9 km^2, 35,249 cells;
+     * of those 35,249 changed level-0 cells, **35,232 (100.0%) lie INSIDE
+       that tile's own padded domain**. The bake re-derives its interior from
+       the coarse elevation and imports only a boundary condition, so a change
+       inside the domain is discarded. The inflow handed to ``bake_tile`` was
+       identical to four decimals in both arms (384.4912 km^2, 214 entry
+       cells) and the tile baked BYTE-IDENTICAL in elevation, accumulation and
+       flow -- 0 of 67,108,864 cells.
+
+   So the model parent, correctly wired, deterministic, conservative and
+   cheap, changed the shipped terrain of this world by exactly nothing. Not
+   because the effect was small: because it was still in transit inside the
+   destination tile when the pyramid stopped carrying it.
+
+   TWO THINGS TO REMEMBER. **Rank candidate tiles by the change in the inflow
+   their L0 block hands the bake, never by the change in level-1 accumulation
+   over the tile** -- the first A/B here picked its tile the second way, spent
+   13 minutes a side, and measured a tile the water provably could not reach.
+   And **a boundary-crossing pyramid delivers nothing within one child block
+   of where you inject**; buying reach at the top is worth little until that
+   is addressed.
 """
 
 
@@ -1555,12 +1611,18 @@ a known limitation and a mystery.
 #: strip (a 1-cell-deep footprint), so it changes nothing at ratio 1.
 #:
 #: The choice only starts to matter as the ratio grows. A model-backed parent
-#: at 7,680 m feeding a 120 m child is 64x64: ENTRY_FOOTPRINT may deposit up to
-#: ~5.4 km from the crossing IN ANY DIRECTION, including 3.8 km deep into the
-#: domain in a valley the water never entered -- the wrong side of a divide,
-#: which looks broken rather than approximate. ENTRY_CROSSING cannot do that:
-#: the water starts on the face it came through, and its error is confined to
-#: ONE axis, ALONG that face.
+#: at 7,680 m feeding a 120 m child is 64x64, so ENTRY_FOOTPRINT can deposit up
+#: to 10.7 km from the crossing IN ANY DIRECTION -- including deep into the
+#: domain, in a valley the water never entered, on the wrong side of a divide.
+#: That looks broken rather than approximate.
+#:
+#: NOT hypothetical. MEASURED on seed 20260719, level-1 block (-1,-1), a 512^2
+#: model window: the two rules disagreed on 9 of 15 crossings, by up to 9.61 km
+#: (median 1.80 km of the ones that moved), and three of the crossings that
+#: moved had a 100% LAND catchment behind them. ENTRY_CROSSING cannot do it:
+#: the water starts on the face it came through, so its error is confined to
+#: ONE axis, ALONG that face. The injected TOTAL was identical either way --
+#: both rules pick exactly one cell per crossing, so conservation is untouched.
 ENTRY_FOOTPRINT = "footprint"
 ENTRY_CROSSING = "crossing"
 ENTRY_MODES = (ENTRY_FOOTPRINT, ENTRY_CROSSING)

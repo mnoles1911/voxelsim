@@ -1798,3 +1798,31 @@ def test_superblock_covers_catches_a_parent_that_only_half_reaches():
     assert pipeline.superblock_covers(sb, (7680.0, 7680.0), span - 2 * 7680.0)
     assert not pipeline.superblock_covers(sb, (-7680.0, 0.0), span)
     assert not pipeline.superblock_covers(sb, (7680.0, 0.0), span)
+
+
+def test_a_model_parent_does_not_make_an_incomplete_child_look_complete():
+    """Scope doc test 4, decided deliberately.
+
+    A model-backed parent has no ``missing_tiles`` -- the model is defined
+    everywhere -- and it would be easy for that to leak downward and mark a
+    child complete. It must not: model backing fixes TRUNCATION (a catchment
+    larger than the top level's span) and says nothing about EXPLORATION ORDER
+    (a neighbour that has never been generated). Conflating them would
+    silently reopen what the publish gate just closed.
+    """
+    world = synth_world()
+    world.pop((1, 1))  # the frontier has not reached this tile yet
+
+    def fetch(x, y):
+        return world.get((x, y))
+
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    parent = pipeline.build_model_superblock(
+        _model_bowl(8), origin_m=(-2 * lv.span_m, -2 * lv.span_m),
+        cell_m=lv.span_m, kernels=kernels(), consts=TEST_CONSTS,
+    )
+    assert parent.complete  # nothing it is built from can be missing
+
+    sb = pipeline.build_flow_superblock(fetch, 0, 0, lv, kernels(), parent=parent)
+    assert sb.missing_tiles == ((1, 1),)
+    assert not sb.complete
