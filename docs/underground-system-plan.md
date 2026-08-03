@@ -733,6 +733,70 @@ harness runs per-item on branch builds, the version event ships once.
   *Verify: A/B of the §1 shaft capture — same node, funnel vs cylinder; the
   surface aerial showing a bowl instead of a hole; a mountainside mouth
   capture; perforation stat unchanged.*
+
+  **LANDED at kWorldGenVersion 25, with two plan assumptions contradicted by
+  measurement.** One construct, not four: an entrance CAVITY with a level floor
+  at absolute z and a lens roof CLIPPED BY THE REAL GROUND. Nothing in it
+  branches on landform — the terrain does the branching, which is why it is
+  caused variety and not placed variety. On flat ground the roof breaks the
+  surface only in the middle and the result is a bowl with an overhanging rock
+  lip (a doline); where the ground falls away the roof becomes the hillside and
+  the chamber opens SIDEWAYS with a level floor (the mountainside mouth); ground
+  falling along one axis stretches that opening into the streambed-capture
+  geometry, which is the swallet's shape without a drop of water. The v24 bore
+  survives inside it as the THROAT, which is what keeps the three guarantees
+  structural rather than arithmetic.
+
+  Contradicted:
+  1. **W3 did NOT need a CaveColumn/GPU struct change of the kind expected.**
+     It needed exactly one int32 — `shaftDepthMinMm` — because a roof clipped
+     by the ground makes the entrance a closed depth INTERVAL instead of a
+     cutoff. The union of throat and cavity is provably one interval, so no
+     segment list was needed, and `GpuCaveColumn` is kernel-local so no
+     cross-kernel layout moved. Per-voxel cost: one extra compare.
+  2. **"Tunnels daylight sideways on steep slopes for free" (§2.1, caves.h's own
+     header) was FALSE.** vxc_caveprobe measured it at the grassland site:
+     sideways-daylighting columns numbered exactly the perforated shaft columns,
+     i.e. zero mouths existed that were not a vertical hole seen from below. A
+     tunnel axis is ≥ 9 m under its own column, so ground a metre away has to
+     fall 9 m in 1 m for the claim to hold — a cliff, not a hillside. The
+     mouths in this item are therefore NEW capability, not a tuning of an
+     existing one, and caves.h now records the falsification in place of the
+     claim.
+
+  Measured, seed 20260719, grassland tile `-1_1`, 409.6 m box, v24 → v25:
+  entrance sites and gate UNCHANGED by construction (same nodes, same 1-in-4;
+  1047 of 4225 candidates open over a 13 km grid, and all 1047 are daylit at the
+  axis AND carved continuously from daylight to their backbone node);
+  carved volume 1.709% → 1.734% of the band (+1.5%); perforated surface
+  0.0092% → 0.084%, still an order under the 0.5% ctest gate; sideways
+  daylighting mouths 24 → 477 (v24's 24 were exactly its 24 perforated
+  columns, i.e. none); entrance footprint 0.31% of the surface, of which 74% is
+  ROOFED and 55% carries less cover than the 6 m roof clamp — that last number
+  is the horizontal-mouth signal, and it was structurally 0 at v24. Standable
+  floor inside entrances 0 → 613 spots. Connectivity at a real entrance did not
+  regress: largest component 81.76% → 82.98%, sky-reachable share 81.76% →
+  82.98%, portal samples 50 → 782.
+
+  **And a third fixture-coverage trap, sprung and caught the same day.**
+  `vxc_gpu`'s cave-band fixture asserted in a comment that a gated-open sinkhole
+  node was inside it. It was not, and never had been: entrance candidates are
+  102.4 m apart and that dispatch is 6.4 m across. v25 moved every entrance in
+  the world and the harness digest did not change one bit. Closed by an
+  entrance-bearing fixture placed on a site found with `vxc_caveprobe
+  --synthetic` (15,335 entrance columns of 16,384; CPU/GPU bit-exact on an AMD
+  RX 7800 XT over 10.1M cells) and, so it cannot recur silently, by a per-region
+  "exercised: N cave / N entrance / N cavern" line printed at every run. The
+  same line shows the CAVERN pass is still exercised by NO vxc_gpu fixture at
+  all — that one is left for W4, stated rather than closed.
+
+  Still open from this item: the UE-side `kExpectedCpuDigest` fixtures contain
+  no entrance either, so the pin is a statement about surface worldgen only; it
+  was shown differentially not to move (the ten pre-v25 harness fixtures
+  reproduce v24's digest byte for byte) and the version pin was rolled to 25
+  with the module recompiled. **No rendered frame exists for any of this** —
+  the box's editor was owned by another agent for the whole session, so every
+  *Verify* capture above is still outstanding.
 * **W4 — G2 chambers** (offsets, elongation, pillars, breakdown).
   *Verify: A/B CavernShot pair; plan-view symmetry visibly broken.*
 * **W5 — Field coupling v1, no new data:** temperature + relief gates on

@@ -417,7 +417,7 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11; and
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
     //  rejected before it shipped -- see the Wave C retry notes)
-    CHECK_EQ(d.h, 0xEAC32303E8B9BD0Dull);
+    CHECK_EQ(d.h, 0xA429D263050DB344ull);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

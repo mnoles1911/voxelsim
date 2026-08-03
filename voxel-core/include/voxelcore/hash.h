@@ -53,14 +53,18 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   26       detail_rill.h      CH_RILL
 //   27       detail_bedding.h   CH_BEDDING_STRIKE
 //   28       detail_bedding.h   CH_BEDDING
-//   29       FREE               (was density3.h CH_POCKET â€” see HISTORY)
+//   29       caves.h            CH_CAVE_WAYPOINT   (v24; the id density3.h's
+//                                            deleted CH_POCKET held â€” see HISTORY)
 //   30       caves.h            CH_CAVE_NODE       (moved from 18 â€” see HISTORY)
 //   31       caves.h            CH_CAVE_EDGE       (moved from 19 â€” see HISTORY)
 //   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
 //   48       hash.h             CH_CARRIER_WARP_X  (v16 carrier warp)
 //   49       hash.h             CH_CARRIER_WARP_Y  (v16 carrier warp)
 //   50       caves.h            CH_CAVE_NODE_RADIUS (v24)
-//   51..     FREE
+//   51       caves.h            CH_CAVE_ENTRANCE     (v25 entrance cavity)
+//   52       caves.h            CH_CAVE_ENTRANCE_RIM (v25, keyed on WORLD cells,
+//                                            not on a lattice node)
+//   53..     FREE
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a

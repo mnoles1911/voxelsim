@@ -37,10 +37,39 @@ constexpr int32_t kFlatBedrockMm = 45000;    // 45 m â€” deliberately kept 
                                              // bedrock clamp against a floor
                                              // shallow enough for it to bind
 
+// The surfaceAt callback (caves.h caveEntranceSite) for the flat world: every
+// xy has the same ground, which is what makes these tests measure the NETWORK
+// and not the terrain. On flat ground the v25 entrance cavity degenerates to a
+// symmetric bowl over its throat -- the hillside-mouth case needs real relief
+// and is tested against the amplifier further down.
+constexpr auto kFlatSurfaceAt = [](int64_t, int64_t) -> int32_t { return kFlatSurfaceMm; };
+
 // Carve predicate for the flat world.
 bool flatCarve(int64_t vx, int64_t vy, int64_t vz) {
-    const CaveColumn c = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm);
+    const CaveColumn c = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, kFlatSurfaceAt);
     return caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz);
+}
+
+// The first gated-open ENTRANCE node at or after lattice (i0, j0), scanning the
+// same (j, i) order everywhere in this file so two tests never disagree about
+// which site "the first one" is.
+//
+// WHY EVERY ENTRANCE TEST GOES THROUGH THIS. Entrance candidates sit on a
+// 102.4 m lattice and only one in four is open, so a test that samples a
+// "reasonable" 50-100 m box usually contains NO entrance and then measures the
+// box instead of the world. That has now happened four separate times in this
+// subsystem -- twice in this file, once in vxc_caveprobe's bring-up, and once
+// in vxc_gpu's cave-band fixture, whose comment asserted an entrance was inside
+// it for a whole worldgen version while the harness compared none.
+bool firstOpenEntranceNode(int64_t i0, int64_t j0, int64_t span, int64_t& iOut, int64_t& jOut) {
+    for (int64_t j = j0; j <= j0 + span; j += 4)
+        for (int64_t i = i0; i <= i0 + span; i += 4)
+            if (((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) == 0) {
+                iOut = i;
+                jOut = j;
+                return true;
+            }
+    return false;
 }
 
 struct ComponentStats {
@@ -72,8 +101,8 @@ ComponentStats summarize(const ConnectivityResult& r) {
 VXC_TEST(cave_column_is_deterministic) {
     for (int64_t x = -4000; x <= 4000; x += 613)
         for (int64_t y = -4000; y <= 4000; y += 419) {
-            const CaveColumn a = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
-            const CaveColumn b = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            const CaveColumn a = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn b = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             CHECK_EQ(a.count, b.count);
             for (int32_t s = 0; s < a.count; ++s) {
                 CHECK_EQ(a.segs[s].marginSq, b.segs[s].marginSq);
@@ -104,8 +133,8 @@ VXC_TEST(cave_carve_is_deterministic_through_the_amplifier) {
     bool differs = false;
     for (int64_t x = -200; x <= 200 && !differs; x += 17)
         for (int64_t y = -200; y <= 200 && !differs; y += 19) {
-            const CaveColumn ac = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
-            const CaveColumn cc = caveColumnFor(kSeed + 1, x, y, kFlatSurfaceMm);
+            const CaveColumn ac = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
+            const CaveColumn cc = caveColumnFor(kSeed + 1, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             if (ac.count != cc.count) differs = true;
             else
                 for (int32_t s = 0; s < ac.count; ++s)
@@ -125,18 +154,49 @@ VXC_TEST(cave_golden_digest) {
     Digest d;
     for (int64_t y = -640; y < 640; y += 37) {
         for (int64_t x = -640; x < 640; x += 41) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             d.u32(static_cast<uint32_t>(c.count));
             for (int32_t s = 0; s < c.count; ++s) {
                 d.u32(static_cast<uint32_t>(c.segs[s].marginSq));
                 d.u32(static_cast<uint32_t>(c.segs[s].depthMm));
             }
             d.u32(static_cast<uint32_t>(c.shaftMarginSq));
+            d.u32(static_cast<uint32_t>(c.shaftDepthMinMm));
             d.u32(static_cast<uint32_t>(c.shaftDepthMaxMm));
             for (int64_t vz = 560; vz < 1000; vz += 3)
                 d.u8(caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz) ? 1 : 0);
         }
     }
+    // AND A SWEEP THAT PROVABLY CONTAINS AN ENTRANCE (v25).
+    //
+    // The 128 m grid above is a TUNNEL golden and nothing else: entrance nodes
+    // are 102.4 m apart and 1-in-4 gated, so it contains one about a third of
+    // the time and contained none at this seed. The v25 entrance rework changed
+    // the entrance construct completely -- new cavity, new field, new per-voxel
+    // compare -- and this digest did not move, which is the same blind spot
+    // vxc_gpu's cave-band fixture had. Fixed by sweeping a real site's own
+    // footprint, and by CHECKING coverage below rather than trusting a comment.
+    int64_t ei = 0, ej = 0;
+    CHECK(firstOpenEntranceNode(0, 0, 64, ei, ej));
+    const CaveNode enode = caveNode(kSeed, ei, ej);
+    const int64_t envx = floorDiv(enode.xMm, int64_t(kVoxelSizeMm));
+    const int64_t envy = floorDiv(enode.yMm, int64_t(kVoxelSizeMm));
+    int64_t entranceColumnsDigested = 0;
+    for (int64_t dy = -140; dy <= 140; dy += 7)
+        for (int64_t dx = -140; dx <= 140; dx += 7) {
+            const CaveColumn c =
+                caveColumnFor(kSeed, envx + dx, envy + dy, kFlatSurfaceMm, kFlatSurfaceAt);
+            if (c.shaftMarginSq > 0) ++entranceColumnsDigested;
+            d.u32(static_cast<uint32_t>(c.shaftMarginSq));
+            d.u32(static_cast<uint32_t>(c.shaftDepthMinMm));
+            d.u32(static_cast<uint32_t>(c.shaftDepthMaxMm));
+            for (int64_t vz = 560; vz < 1000; vz += 3)
+                d.u8(caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz) ? 1 : 0);
+        }
+    // The digest is only an entrance golden if entrance columns went into it.
+    CHECK(entranceColumnsDigested > 0);
+    std::printf("    [caves] golden covers %lld entrance columns at lattice (%lld,%lld)\n",
+                (long long)entranceColumnsDigested, (long long)ei, (long long)ej);
     // GOLDEN(cave_layer) â€” new at kWorldGenVersion 4; MOVED for M4 cave pass v2
     // (docs/cavern-design.md C2): caveColumnFor now also emits crevice segs on
     // ~1-in-8 of existing edges, so count/segs[] shift for many sampled
@@ -150,7 +210,7 @@ VXC_TEST(cave_golden_digest) {
     // this pin by vxc_caveprobe (plan-view and cross-section images plus the
     // per-family census) and by vxc_gpu, whose new cave-band fixture compares
     // the cave voxels themselves for the first time.
-    CHECK_EQ(d.h, 0x975A546F41FE1A4Cull);
+    CHECK_EQ(d.h, 0x6FF4E353EA1E63E4ull);
 }
 
 // --- safety rule 1: the bedrock floor is never breached ----------------------
@@ -195,7 +255,7 @@ VXC_TEST(cave_bedrock_margin_clamp_refuses_a_shallow_bedrock_column) {
     int64_t tested = 0;
     for (int64_t x = 0; x < 512; x += 3)
         for (int64_t y = 0; y < 512; y += 5) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             if (c.count == 0) continue;
             for (int64_t vz = 560; vz < 960; ++vz) {
                 if (!caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz)) continue;
@@ -219,7 +279,7 @@ VXC_TEST(cave_never_carves_at_or_below_sea_level_or_in_coastal_columns) {
     for (int32_t surfaceMm = -40000; surfaceMm < kCaveMinSurfaceMm; surfaceMm += 271)
         for (int64_t x = 0; x < 256; x += 37)
             for (int64_t y = 0; y < 256; y += 41) {
-                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm);
+                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt);
                 ++oceanColumns;
                 CHECK_EQ(c.count, 0);
                 CHECK_EQ(c.shaftMarginSq, 0);
@@ -231,7 +291,7 @@ VXC_TEST(cave_never_carves_at_or_below_sea_level_or_in_coastal_columns) {
     for (int32_t surfaceMm = kCaveMinSurfaceMm; surfaceMm < 60000; surfaceMm += 311)
         for (int64_t x = 0; x < 256; x += 19)
             for (int64_t y = 0; y < 256; y += 23) {
-                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm);
+                const CaveColumn c = caveColumnFor(kSeed, x, y, surfaceMm, kFlatSurfaceAt);
                 for (int64_t vz = -400; vz < kCaveMinVoxelZ; vz += 3) {
                     CHECK(!caveCarveAt(c, surfaceMm, 45000, vz));
                     ++subSeaChecks;
@@ -272,8 +332,20 @@ VXC_TEST(cave_surface_integrity_roof_thickness) {
     Amplifier amp(kSeed, tiles);
     int64_t thinnestRoofMm = 1 << 30;
     size_t carved = 0, columnsWithCaves = 0, columnsSampled = 0, shaftColumns = 0;
-    for (int64_t x = -512; x <= 512; x += 3)
-        for (int64_t y = -512; y <= 512; y += 5) {
+    size_t perforatedColumns = 0;
+    // CENTRED ON A REAL ENTRANCE (v25), not on the world origin. This test's
+    // whole subject is "the roof clamp holds everywhere except at the
+    // enumerated entrances", and at the origin it sampled ZERO entrance
+    // columns for the entire life of the cave pass -- so the exception half of
+    // its own statement was never exercised and its perforation bound was a
+    // bound on nothing. See firstOpenEntranceNode for why this keeps happening.
+    int64_t ei = 0, ej = 0;
+    CHECK(firstOpenEntranceNode(0, 0, 64, ei, ej));
+    const CaveNode enode = caveNode(kSeed, ei, ej);
+    const int64_t ex0 = floorDiv(enode.xMm, int64_t(kVoxelSizeMm));
+    const int64_t ey0 = floorDiv(enode.yMm, int64_t(kVoxelSizeMm));
+    for (int64_t x = ex0 - 512; x <= ex0 + 512; x += 3)
+        for (int64_t y = ey0 - 512; y <= ey0 + 512; y += 5) {
             const ColumnSample col = amp.column(x, y);
             ++columnsSampled;
             // Sinkhole shafts are the one deliberate roof breach (caves.h
@@ -281,6 +353,18 @@ VXC_TEST(cave_surface_integrity_roof_thickness) {
             // below, and it is what makes the network enterable at all.
             if (col.cave.shaftMarginSq > 0) {
                 ++shaftColumns;
+                // Inside an entrance FOOTPRINT is not the same as open to the
+                // sky, and v25 is exactly the change that separated them: the
+                // cavity's roof is clipped by the ground, so most of a doline's
+                // footprint carries rock overhead (its overhanging lip) and a
+                // hillside mouth is roofed over its whole length. Perforation
+                // -- "you would fall in walking over it" -- is the number the
+                // "the surface is not a colander" guarantee is about, and it is
+                // now a strict SUBSET of the footprint rather than equal to it.
+                if (col.cave.shaftDepthMinMm == 0 &&
+                    Amplifier::materialAt(
+                        col, floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm)) == MAT_AIR)
+                    ++perforatedColumns;
                 continue;
             }
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
@@ -302,15 +386,38 @@ VXC_TEST(cave_surface_integrity_roof_thickness) {
     CHECK(thinnestRoofMm >= kCaveRoofMinMm);
     // Not swiss cheese: most columns are not undermined at all.
     CHECK(columnsWithCaves * 2 < columnsSampled);
-    // The perforated fraction of the surface must be a rounding error.
-    CHECK(shaftColumns * 500 < columnsSampled);
+    // THE ROOF-INTEGRITY GUARANTEE, in the two halves v25 split it into.
+    //
+    // (a) The exception is still SPARSE and still enumerated: the fraction of
+    //     ground lying over an entrance cavity is bounded. It is no longer
+    //     point-sized -- a doline is a landform, not a drill hole -- so the
+    //     bound is 5% of a footprint centred on an entrance, not the 0.2% a
+    //     1.4 m bore needed. What has NOT changed is that it is a closed set of
+    //     hash-gated sites and not a threshold that can leak.
+    // (b) Most of that footprint is ROOFED. The thing a player falls into is
+    //     a minority of the cavity, not the whole of it -- which is the
+    //     difference between a doline with an overhanging lip and a hole.
+    //
+    // BOTH NUMBERS HERE ARE LOCAL DENSITIES, not world rates, and the bounds
+    // are written knowing it: this footprint is deliberately centred on an
+    // entrance, so it contains one where an average 102 m square contains a
+    // quarter of one. The GLOBAL "the surface is not a colander" rate is
+    // asserted where it belongs, over undirected ground, in
+    // cave_per_family_volume_and_entrance_census.
+    CHECK(shaftColumns * 20 < columnsSampled);
+    CHECK(perforatedColumns * 50 < columnsSampled);
+    CHECK(perforatedColumns * 2 < shaftColumns);
+    // ...and the entrance really is inside this footprint, or neither bound
+    // above means anything. That is the failure mode this test shipped with.
+    CHECK(shaftColumns > 0);
+    CHECK(perforatedColumns > 0);
     std::printf("    [caves] roof: thinnest cover %lld mm (clamp %lld mm) over "
-                "non-sinkhole ground; %zu/%zu sampled columns (%.1f%%) have any cave "
-                "beneath them; %zu (%.4f%%) are inside a sinkhole shaft\n",
+                "non-entrance ground; %zu/%zu sampled columns (%.1f%%) have any cave "
+                "beneath them; %zu (%.4f%%) lie over an entrance cavity, of which %zu are open\n",
                 static_cast<long long>(thinnestRoofMm),
                 static_cast<long long>(kCaveRoofMinMm), columnsWithCaves, columnsSampled,
                 100.0 * double(columnsWithCaves) / double(columnsSampled), shaftColumns,
-                100.0 * double(shaftColumns) / double(columnsSampled));
+                100.0 * double(shaftColumns) / double(columnsSampled), perforatedColumns);
 }
 
 // --- storage bound ----------------------------------------------------------
@@ -322,7 +429,7 @@ VXC_TEST(cave_segment_cap_headroom) {
     size_t columns = 0, withAny = 0;
     for (int64_t x = -2048; x < 2048; x += 3)
         for (int64_t y = -2048; y < 2048; y += 7) {
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             ++columns;
             if (c.count > 0) ++withAny;
             if (c.count > maxSegs) maxSegs = c.count;
@@ -441,7 +548,7 @@ VXC_TEST(crevice_segments_actually_appear_in_caveColumnFor) {
     for (int64_t x = -4096; x < 4096; x += 3)
         for (int64_t y = -4096; y < 4096; y += 5) {
             ++columns;
-            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm);
+            const CaveColumn c = caveColumnFor(kSeed, x, y, kFlatSurfaceMm, kFlatSurfaceAt);
             if (c.count > maxSegs) maxSegs = c.count;
         }
     std::printf("    [caves] crevice presence: max %d segs/column over %zu columns "
@@ -560,7 +667,7 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
     // The shaft column: carved from the surface all the way down to the node.
     const int64_t nvx = floorDiv(node.xMm, int64_t(kVoxelSizeMm));
     const int64_t nvy = floorDiv(node.yMm, int64_t(kVoxelSizeMm));
-    const CaveColumn shaftCol = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm);
+    const CaveColumn shaftCol = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt);
     CHECK(shaftCol.shaftMarginSq > 0);
     CHECK(shaftCol.count > 0); // backbone tunnels meet at a shaft node, by construction
     const int64_t topVz = floorDiv(kFlatSurfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
@@ -606,6 +713,168 @@ VXC_TEST(cave_sinkhole_reaches_the_surface_and_joins_the_main_network) {
                 "%zu of %zu cave samples and descends %lld m from daylight\n",
                 static_cast<long long>(si), static_cast<long long>(sj), surfaceCompSize,
                 total, static_cast<long long>(descentM));
+}
+
+// --- W3: the entrance portfolio, and the three guarantees it inherited -------
+//
+// docs/underground-system-plan.md W3. v24's entrance was a naked vertical
+// cylinder; the owner called those out by name ("really weird vertical shafts
+// that shoot straight up to the game world surface"). v25 replaces the SHAPE
+// while keeping the three things the cylinder was carrying, and these tests are
+// what stop a later tune quietly dropping one of them.
+
+VXC_TEST(cave_entrance_rate_and_daylight_are_unchanged_from_v24) {
+    // GUARANTEE 1 (entrance rate) and GUARANTEE 2 (structural connectivity),
+    // both stated over EVERY open site in a wide sample rather than over one.
+    //
+    // The rate is a property of the gate and the candidate lattice, neither of
+    // which v25 touched -- so the test is not "roughly the same", it is
+    // "identical to the closed form": one candidate per 4x4 lattice cells, one
+    // in four of them open.
+    int64_t candidates = 0, opened = 0, daylit = 0, reachesNode = 0;
+    for (int64_t j = -128; j <= 128; j += 4)
+        for (int64_t i = -128; i <= 128; i += 4) {
+            ++candidates;
+            if (((hash2(kSeed, i, j, CH_CAVE_SHAFT) >> 48) & kCaveShaftGateMask) != 0) continue;
+            ++opened;
+            const CaveNode n = caveNode(kSeed, i, j);
+            const int64_t nvx = floorDiv(n.xMm, int64_t(kVoxelSizeMm));
+            const int64_t nvy = floorDiv(n.yMm, int64_t(kVoxelSizeMm));
+            const CaveColumn c = caveColumnFor(kSeed, nvx, nvy, kFlatSurfaceMm, kFlatSurfaceAt);
+            const int64_t topVz = floorDiv(kFlatSurfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            // Open to the sky directly over the node...
+            if (caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, topVz)) ++daylit;
+            // ...and carved CONTINUOUSLY down to the node itself, which is a
+            // backbone crossing and therefore on the main component. This is
+            // the throat, and it is exactly why v25 kept it: the cavity's
+            // arithmetic never has to be trusted for the entrance guarantee.
+            const int64_t nodeVz = floorDiv(kFlatSurfaceMm - n.depthMm, int64_t(kVoxelSizeMm));
+            bool continuous = true;
+            for (int64_t vz = topVz; vz >= nodeVz && continuous; --vz)
+                if (!caveCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz)) continuous = false;
+            if (continuous) ++reachesNode;
+            CHECK(c.count > 0); // backbone tunnels meet here, by construction
+        }
+    std::printf("    [caves] entrance sites: %lld open of %lld candidates on the 102.4 m grid; "
+                "%lld daylit at the axis, %lld carved continuously from daylight to the node\n",
+                (long long)opened, (long long)candidates, (long long)daylit,
+                (long long)reachesNode);
+    CHECK(opened > 0);
+    // The gate is 1-in-4 on two bits, so over 4225 candidates the count sits
+    // near a quarter. Bounds are wide on purpose: this is a statement about the
+    // GATE being untouched, not about the hash's fine balance.
+    CHECK(opened * 5 > candidates);
+    CHECK(opened * 3 < candidates);
+    // EVERY open site is an entrance. Not "most": the throat is unconditional,
+    // so one failure here means the daylight guarantee has become conditional
+    // on arithmetic somewhere and the network is free to seal itself.
+    CHECK_EQ(daylit, opened);
+    CHECK_EQ(reachesNode, opened);
+}
+
+VXC_TEST(cave_entrance_is_a_cavity_with_a_roof_not_a_bore) {
+    // THE SHAPE CHANGE ITSELF, measured rather than eyeballed. The owner judges
+    // screenshots; a test still has to be able to say the geometry is the one
+    // that was designed.
+    //
+    // Two properties separate a v25 cavity from a v24 cylinder, and a cylinder
+    // has neither at any column:
+    //   * ROOFED VOID -- the entrance carves rock with intact ground above it
+    //     (shaftDepthMinMm > 0). On flat land this set is a doline's
+    //     overhanging lip; on a slope it is the whole length of a mouth.
+    //   * A LEVEL FLOOR -- the cavity is anchored at absolute z, so across the
+    //     footprint the deepest carved voxel sits at ONE elevation instead of
+    //     draping under the terrain. That is what a mob stands on.
+    int64_t ei = 0, ej = 0;
+    CHECK(firstOpenEntranceNode(0, 0, 64, ei, ej));
+    const CaveNode n = caveNode(kSeed, ei, ej);
+    const int64_t nvx = floorDiv(n.xMm, int64_t(kVoxelSizeMm));
+    const int64_t nvy = floorDiv(n.yMm, int64_t(kVoxelSizeMm));
+
+    int64_t footprint = 0, roofed = 0, opened = 0;
+    int64_t floorZMin = 1ll << 40, floorZMax = -(1ll << 40);
+    for (int64_t dy = -160; dy <= 160; ++dy)
+        for (int64_t dx = -160; dx <= 160; ++dx) {
+            const CaveColumn c =
+                caveColumnFor(kSeed, nvx + dx, nvy + dy, kFlatSurfaceMm, kFlatSurfaceAt);
+            if (c.shaftMarginSq <= 0) continue;
+            ++footprint;
+            if (c.shaftDepthMinMm > 0) ++roofed; else ++opened;
+            // Deepest carved voxel of the ENTRANCE, as an absolute elevation.
+            // Throat columns bore past the cavity floor to the node, so they
+            // are excluded from the level-floor statement -- not from the
+            // footprint, which they are legitimately part of.
+            if (c.shaftDepthMaxMm < kCaveNodeDepthMinMm) {
+                const int64_t deepestZMm = int64_t(kFlatSurfaceMm) - c.shaftDepthMaxMm;
+                if (deepestZMm < floorZMin) floorZMin = deepestZMm;
+                if (deepestZMm > floorZMax) floorZMax = deepestZMm;
+            }
+        }
+    std::printf("    [caves] entrance at lattice (%lld,%lld): %lld footprint columns, "
+                "%lld roofed / %lld open to the sky; cavity floor spans %lld mm\n",
+                (long long)ei, (long long)ej, (long long)footprint, (long long)roofed,
+                (long long)opened, (long long)(floorZMax - floorZMin));
+    CHECK(footprint > 0);
+    // A bore has no roofed void at all, anywhere. The lip is most of the
+    // footprint, which is what makes the visible hole much smaller than the
+    // chamber under it.
+    CHECK(roofed > 0);
+    CHECK(roofed > opened);
+    // ...and it is still an entrance, not a sealed chamber.
+    CHECK(opened > 0);
+    // The floor is LEVEL to within one voxel: it is one absolute-z plane, so
+    // the only spread allowed is that plane's voxel quantisation.
+    CHECK(floorZMax - floorZMin <= kVoxelSizeMm);
+}
+
+VXC_TEST(cave_entrance_daylights_sideways_on_real_relief) {
+    // THE MOUNTAINSIDE MOUTH -- the owner's Q6 item that v24 could not produce
+    // at all. caves.h's original header claimed tunnels "daylight sideways on
+    // steep slopes for free"; vxc_caveprobe measured that claim at the
+    // grassland site and found the sideways-mouth count EQUAL to the perforated
+    // shaft count, i.e. zero mouths that were not simply a hole seen from
+    // below. A tunnel is >= 6 m under its own column, so for a neighbour a
+    // metre away to lie below it the ground has to fall 6 m in 1 m.
+    //
+    // v25 gets mouths out of the SAME construct as dolines, by clipping the
+    // cavity's roof against the real ground: where the ground falls away the
+    // roof becomes the hillside, and the chamber opens through it. The
+    // signature asserted here is a roofed entrance void whose rock cover is
+    // THINNER than the roof clamp -- which only the entrance exception can
+    // produce, and only where a void has met falling ground.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    int64_t ei = 0, ej = 0;
+    CHECK(firstOpenEntranceNode(0, 0, 64, ei, ej));
+    const CaveNode n = caveNode(kSeed, ei, ej);
+    const int64_t nvx = floorDiv(n.xMm, int64_t(kVoxelSizeMm));
+    const int64_t nvy = floorDiv(n.yMm, int64_t(kVoxelSizeMm));
+
+    int64_t footprint = 0, roofed = 0, thinRoof = 0, floorSpots = 0;
+    for (int64_t dy = -160; dy <= 160; dy += 2)
+        for (int64_t dx = -160; dx <= 160; dx += 2) {
+            const ColumnSample col = amp.column(nvx + dx, nvy + dy);
+            if (col.cave.shaftMarginSq <= 0) continue;
+            ++footprint;
+            if (col.cave.shaftDepthMinMm <= 0) continue;
+            ++roofed;
+            if (col.cave.shaftDepthMinMm < kCaveRoofMinMm) ++thinRoof;
+            // Somewhere to stand inside it: the solid voxel under the void.
+            const int64_t floorVz =
+                floorDiv(int64_t(col.surfaceMm) - col.cave.shaftDepthMaxMm - kVoxelSizeMm / 2,
+                         int64_t(kVoxelSizeMm)) -
+                1;
+            if (Amplifier::materialAt(col, floorVz) != MAT_AIR) ++floorSpots;
+        }
+    std::printf("    [caves] entrance on real terrain: %lld footprint columns, %lld roofed, "
+                "%lld with cover thinner than the %lld mm clamp, %lld with a solid floor\n",
+                (long long)footprint, (long long)roofed, (long long)thinRoof,
+                (long long)kCaveRoofMinMm, (long long)floorSpots);
+    CHECK(footprint > 0);
+    CHECK(roofed > 0);
+    CHECK(thinRoof > 0);
+    // Mobs (plan 5.6): an entrance a player can walk into needs ground under it.
+    CHECK(floorSpots > 0);
 }
 
 // --- gameplay coupling: cave air is ordinary air ----------------------------
@@ -711,7 +980,7 @@ VXC_TEST(cave_family_attribution_is_exact) {
     for (int64_t x = -512; x <= 512; x += 7)
         for (int64_t y = -512; y <= 512; y += 11) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
             ++columns;
             if (cv.full.count != col.cave.count ||
                 cv.full.shaftMarginSq != col.cave.shaftMarginSq ||
@@ -757,7 +1026,7 @@ VXC_TEST(cave_per_family_volume_and_entrance_census) {
     for (int64_t x = -1024; x <= 1024; x += 11)
         for (int64_t y = -1024; y <= 1024; y += 13) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
             ++columns;
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             uint32_t colMask = 0;
@@ -829,7 +1098,7 @@ VXC_TEST(cave_floor_area_and_headroom_budget) {
     for (int64_t x = -1024; x <= 1024; x += 11)
         for (int64_t y = -1024; y <= 1024; y += 13) {
             const ColumnSample col = amp.column(x, y);
-            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm, amp.surfaceAtFn());
             ++columns;
             const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             for (int64_t k = 0; k <= 450; ++k) {

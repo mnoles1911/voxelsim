@@ -270,7 +270,7 @@ namespace vxc {
 //
 // TILES DO NOT NEED REGENERATING: caves are runtime worldgen only and the bake
 // computes no underground data. Saved edit logs invalidate as usual.
-inline constexpr uint32_t kWorldGenVersion = 24;
+inline constexpr uint32_t kWorldGenVersion = 25;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

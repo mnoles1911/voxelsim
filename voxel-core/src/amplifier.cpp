@@ -279,11 +279,20 @@ struct CaveLatticeSlot {
     CaveLattice value;
 };
 
-const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj) {
+// v25: the block now also carries the entrance SITE, which needs the terrain
+// surface at the node's own xy (caves.h's caveEntranceSite / surfaceAt
+// contract). That tap happens at most once per lattice cell — i.e. once per
+// 65'536 voxel columns on a sweep — so the memo turns the entrance's terrain
+// dependency into nothing at all. The memo stays output-neutral for the same
+// reason it always was: caveLatticeFor is a pure function of (seed, ci, cj)
+// and of a surfaceAt that is itself a pure function of position.
+template <typename SurfaceFn>
+const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj,
+                                     const SurfaceFn& surfaceAt) {
     static thread_local CaveLatticeSlot slots[kCaveLatticeSlots];
     CaveLatticeSlot& s = slots[slotIndex(seed, ci, cj, kCaveLatticeSlots)];
     if (s.valid && s.seed == seed && s.ci == ci && s.cj == cj) return s.value;
-    s.value = caveLatticeFor(seed, ci, cj);
+    s.value = caveLatticeFor(seed, ci, cj, surfaceAt);
     s.valid = true;
     s.seed = seed;
     s.ci = ci;
@@ -291,14 +300,17 @@ const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj) {
     return s.value;
 }
 
-// caveColumnFor(seed, vx, vy, surfaceMm), memoised. Bit-identical by
+// caveColumnFor(seed, vx, vy, surfaceMm, surfaceAt), memoised. Bit-identical by
 // construction: it is caves.h's own composition with the cell-only half served
 // from the table.
-CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
+template <typename SurfaceFn>
+CaveColumn cachedCaveColumn(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
+                            const SurfaceFn& surfaceAt) {
     if (surfaceMm < kCaveMinSurfaceMm) return CaveColumn{};
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    return caveColumnFromLattice(cachedCaveLattice(seed, ci, cj), vx, vy);
+    return caveColumnFromLattice(seed, cachedCaveLattice(seed, ci, cj, surfaceAt), vx, vy,
+                                 surfaceMm);
 }
 
 // ---------------------------------------------------------------------------
@@ -2266,8 +2278,20 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // worldgen.ush recompute it inside VoxelizeMain rather than widening
     // GpuColumnSample. Mirrored bit-exactly there.
     // Served from the per-thread cave-lattice memo above; bit-identical to
-    // caveColumnFor(seed_, vx, vy, col.surfaceMm).
-    col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm);
+    // caveColumnFor(seed_, vx, vy, col.surfaceMm, surfaceAt).
+    //
+    // v25: the ONE terrain read the cave pass makes at an xy other than the
+    // querying column's is the entrance site's own ground height (caves.h,
+    // caveEntranceSite). It is the identical callback the cavern pass uses,
+    // declared once here and shared, because both passes are written against
+    // the same contract: the surface must come from the very function this
+    // column's own surfaceMm came from.
+    const auto surfaceAt = [this](int64_t xMm, int64_t yMm) -> int32_t {
+        return evalSurface(floorDiv(xMm, int64_t(kVoxelSizeMm)),
+                           floorDiv(yMm, int64_t(kVoxelSizeMm)))
+            .surfaceMm;
+    };
+    col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm, surfaceAt);
 
     // M4 cave pass v2 cavern pass (voxelcore/caverns.h), wired in exactly as
     // the cave pass above is: one reduction per column, carried in the
@@ -2283,11 +2307,8 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // columns that pass the gate/depth/xy-reach rejects, and it hits the tile
     // memo above, so it costs nothing in the common case. C6 will recompute it
     // inside VoxelizeMain rather than widening GpuColumnSample.
-    const auto surfaceAt = [this](int64_t xMm, int64_t yMm) -> int32_t {
-        return evalSurface(floorDiv(xMm, int64_t(kVoxelSizeMm)),
-                           floorDiv(yMm, int64_t(kVoxelSizeMm)))
-            .surfaceMm;
-    };
+    // (The lambda itself is declared above the cave pass since v25 — both
+    // passes take the same callback.)
     col.cavern = cachedCavernColumn(seed_, vx, vy, col.surfaceMm, surfaceAt);
     return col;
 }

@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 24
+#define VXC_WORLDGEN_VERSION_USH 25
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -1978,6 +1978,19 @@ static const int64_t kCaveShaftNodeMask = 3;
 static const uint64_t kCaveShaftGateMask = 3;
 static const int64_t kCaveShaftRadiusMinMm = 1000;
 static const int64_t kCaveShaftRadiusSpanMm = 700;
+// v25 entrance cavity (caves.h kCaveEntrance*, plan W3). The naked vertical
+// bore is still here as the THROAT; everything below is the chamber wrapped
+// round it, whose roof is clipped by the real ground -- which is what turns
+// one construct into a doline on flat land and a horizontal mouth on a
+// hillside without a single landform branch.
+static const int64_t kCaveEntranceFloorMinMm = 5000;
+static const int64_t kCaveEntranceFloorSpanMm = 4000;
+static const int64_t kCaveEntranceOverMinMm = 1000;
+static const int64_t kCaveEntranceOverSpanMm = 2000;
+static const int64_t kCaveEntranceReachMinMm = 5000;
+static const int64_t kCaveEntranceReachSpanMm = 8000;
+static const int64_t kCaveEntranceRimCellMm = 6400;
+static const int64_t kCaveEntranceRimAmpQ10 = 256;
 static const int64_t kCaveRoofMinMm = 6000;
 static const int64_t kCaveBedrockMarginMm = 2000;
 static const int kCaveMinSurfaceMm = 12000;
@@ -2016,15 +2029,43 @@ static const uint CH_CAVE_SHAFT = 21;
 static const uint CH_CREVICE = 24;
 static const uint CH_CAVE_WAYPOINT = 29;    // v24 edge waypoint offset + dip
 static const uint CH_CAVE_NODE_RADIUS = 50; // v24 per-node tube calibre
+static const uint CH_CAVE_ENTRANCE = 51;     // v25 cavity floor / axis rise / reach
+static const uint CH_CAVE_ENTRANCE_RIM = 52; // v25 rim noise, keyed on WORLD cells
 
 struct GpuCaveColumn
 {
     int segCount;
     int segMarginSq[kMaxCaveSegs];
     int segDepthMm[kMaxCaveSegs];
+    // v25: the entrance is a closed depth INTERVAL, not a cutoff -- a cavity
+    // whose roof is clipped by the ground starts below the surface under a
+    // doline's lip and uphill of a hillside mouth. Mirrors vxc::CaveColumn's
+    // shaftDepthMinMm/shaftDepthMaxMm exactly. This struct is kernel-local
+    // (VoxelizeMain recomputes the cave pass rather than reading it from a
+    // buffer), so widening it moves no cross-kernel layout.
     int shaftMarginSq;
+    int shaftDepthMinMm;
     int shaftDepthMaxMm;
 };
+
+// vxc::caveEntranceRimQ10 bit-for-bit. Bilinear value noise on a 6.4 m WORLD
+// grid, Q10, used as a multiplier on the squared radial parameter -- so it is
+// exactly zero at the axis and cannot perturb the daylight guarantee.
+int64_t caveEntranceRimQ10(uint64_t seed, int64_t xMm, int64_t yMm)
+{
+    const int64_t rgx = floorDiv(xMm, kCaveEntranceRimCellMm);
+    const int64_t rgy = floorDiv(yMm, kCaveEntranceRimCellMm);
+    const int64_t rfx = floorDiv((xMm - rgx * kCaveEntranceRimCellMm) * 1024, kCaveEntranceRimCellMm);
+    const int64_t rfy = floorDiv((yMm - rgy * kCaveEntranceRimCellMm) * 1024, kCaveEntranceRimCellMm);
+    const int64_t rv00 = (int64_t)(hash2(seed, rgx, rgy, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t rv10 = (int64_t)(hash2(seed, rgx + 1, rgy, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t rv01 = (int64_t)(hash2(seed, rgx, rgy + 1, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t rv11 = (int64_t)(hash2(seed, rgx + 1, rgy + 1, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t rva = rv00 + floorDiv((rv10 - rv00) * rfx, 1024);
+    const int64_t rvb = rv01 + floorDiv((rv11 - rv01) * rfx, 1024);
+    const int64_t rv = rva + floorDiv((rvb - rva) * rfy, 1024);
+    return 1024 - kCaveEntranceRimAmpQ10 + floorDiv(rv * (2 * kCaveEntranceRimAmpQ10), 1024);
+}
 
 // vxc::caveEdgeExists bit-for-bit.
 bool caveEdgeExists(uint64_t seed, int64_t ei, int64_t ej, int edir)
@@ -2060,6 +2101,7 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
     GpuCaveColumn cc;
     cc.segCount = 0;
     cc.shaftMarginSq = 0;
+    cc.shaftDepthMinMm = 0;
     cc.shaftDepthMaxMm = 0;
     [unroll]
     for (int q = 0; q < kMaxCaveSegs; ++q)
@@ -2240,7 +2282,14 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
         }
     }
 
-    // Sinkhole shaft â€” at most one backbone-crossing node is in reach.
+    // Entrance (v25) â€” at most one backbone-crossing node is in reach.
+    // Mirrors vxc::caveEntranceSite + the entrance half of
+    // caveColumnFromLattice. THE ONE STRUCTURAL DIFFERENCE FROM THE CPU, and it
+    // moves no value: the CPU computes the site once per lattice cell (it has a
+    // memo and 65'536 columns to amortise over), while this kernel has neither,
+    // so it defers the evalSurface tap until after the cheap xy reject. That is
+    // legal precisely because caveEntranceSite is a pure function of the node's
+    // own xy â€” the value cannot depend on when it is asked for.
     for (int sj = 0; sj < 3; ++sj)
     {
         for (int si = 0; si < 3; ++si)
@@ -2252,14 +2301,64 @@ GpuCaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfaceMm
             const uint64_t hs = hash2(seed, hi, hj, CH_CAVE_SHAFT);
             if (((hs >> 48) & kCaveShaftGateMask) != 0) continue;
             const int sIdx = si + 4 * sj;
-            const int64_t sr = kCaveShaftRadiusMinMm +
-                               (int64_t)(((hs & 0xFFFFFULL) * (uint64_t)kCaveShaftRadiusSpanMm) >> 20);
+            const uint64_t he = hash2(seed, hi, hj, CH_CAVE_ENTRANCE);
+            const int64_t entFloorMm =
+                kCaveEntranceFloorMinMm +
+                (int64_t)(((he & 0xFFFFFULL) * (uint64_t)kCaveEntranceFloorSpanMm) >> 20);
+            const int64_t entOverMm =
+                kCaveEntranceOverMinMm +
+                (int64_t)((((he >> 20) & 0xFFFFFULL) * (uint64_t)kCaveEntranceOverSpanMm) >> 20);
+            const int64_t entReachMm =
+                kCaveEntranceReachMinMm +
+                (int64_t)((((he >> 40) & 0xFFFFFULL) * (uint64_t)kCaveEntranceReachSpanMm) >> 20);
             const int64_t sex = xMm - nodeX[sIdx];
             const int64_t sey = yMm - nodeY[sIdx];
-            const int64_t sMarginSq = sr * sr - (sex * sex + sey * sey);
-            if (sMarginSq <= 0) continue;
-            cc.shaftMarginSq = (int)sMarginSq;
-            cc.shaftDepthMaxMm = (int)nodeD[sIdx];
+            const int64_t sDistSq = sex * sex + sey * sey;
+            const int64_t entReachSq = entReachMm * entReachMm;
+            if (sDistSq >= entReachSq) continue; // outside the whole cavity
+
+            // THE surfaceAt CONTRACT (caves.h caveEntranceSite): the surface at
+            // the NODE's own xy, through the very function the querying column's
+            // own surfaceMm came from, mm -> voxel floorDiv included.
+            const int siteSurfaceMm = evalSurface(seed, floorDiv(nodeX[sIdx], (int64_t)kVoxelSizeMm),
+                                                  floorDiv(nodeY[sIdx], (int64_t)kVoxelSizeMm))
+                                          .surfaceMm;
+            if (siteSurfaceMm < kCaveMinSurfaceMm) continue; // beach/ocean guard on the SITE
+
+            const int64_t entFloorZMm = (int64_t)siteSurfaceMm - entFloorMm;
+            const int64_t entNodeZMm = (int64_t)siteSurfaceMm - nodeD[sIdx];
+            const int64_t entAxisRiseMm = entFloorMm + entOverMm;
+
+            const int64_t tSqQ16 =
+                floorDiv(floorDiv(sDistSq * 65536, entReachSq) * caveEntranceRimQ10(seed, xMm, yMm),
+                         1024);
+            const int64_t entHMm =
+                (tSqQ16 >= 65536) ? (int64_t)0
+                                  : floorDiv(entAxisRiseMm * (65536 - tSqQ16), 65536);
+            const int64_t entRoofZMm = entFloorZMm + entHMm;
+            const int64_t entTopZMm =
+                ((int64_t)surfaceMm < entRoofZMm) ? (int64_t)surfaceMm : entRoofZMm;
+            if (entTopZMm >= entFloorZMm)
+            {
+                cc.shaftMarginSq = (int)(entReachSq - sDistSq);
+                const int64_t entDMinMm = (int64_t)surfaceMm - entTopZMm;
+                cc.shaftDepthMinMm = (int)(entDMinMm > 0 ? entDMinMm : (int64_t)0);
+                cc.shaftDepthMaxMm = (int)((int64_t)surfaceMm - entFloorZMm);
+            }
+
+            // The THROAT: v24's bore, surface -> node, unchanged.
+            const int64_t sr = kCaveShaftRadiusMinMm +
+                               (int64_t)(((hs & 0xFFFFFULL) * (uint64_t)kCaveShaftRadiusSpanMm) >> 20);
+            const int64_t throatDepthMm = (int64_t)surfaceMm - entNodeZMm;
+            if (sDistSq < sr * sr && throatDepthMm >= 0)
+            {
+                const int64_t throatMarginSq = sr * sr - sDistSq;
+                if (throatMarginSq > (int64_t)cc.shaftMarginSq)
+                    cc.shaftMarginSq = (int)throatMarginSq;
+                cc.shaftDepthMinMm = 0;
+                if (throatDepthMm > (int64_t)cc.shaftDepthMaxMm)
+                    cc.shaftDepthMaxMm = (int)throatDepthMm;
+            }
         }
     }
     return cc;
@@ -2275,7 +2374,9 @@ bool caveCarveAt(GpuCaveColumn cc, int surfaceMm, int bedrockDepthMm, int64_t vz
     const int64_t centreMm = vz * (int64_t)kVoxelSizeMm + (int64_t)kVoxelSizeMm / 2;
     const int64_t depthMm = (int64_t)surfaceMm - centreMm;
     if (depthMm < 0) return false;
-    if (cc.shaftMarginSq > 0 && depthMm <= (int64_t)cc.shaftDepthMaxMm) return true;
+    if (cc.shaftMarginSq > 0 && depthMm >= (int64_t)cc.shaftDepthMinMm &&
+        depthMm <= (int64_t)cc.shaftDepthMaxMm)
+        return true;
     if (depthMm < kCaveRoofMinMm) return false;
     if (depthMm + kCaveBedrockMarginMm >= (int64_t)bedrockDepthMm) return false;
 

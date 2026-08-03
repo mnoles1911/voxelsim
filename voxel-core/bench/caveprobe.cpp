@@ -424,6 +424,17 @@ int main(int argc, char** argv) {
     int64_t perfCols[kCaveFamilyCount] = {0, 0, 0, 0}; // surface voxel of the column is carved
     int64_t perfColsAny = 0, perfColsFlat = 0, perfColsSteep = 0;
     int64_t mouthCols = 0, mouthColsFlat = 0, mouthColsSteep = 0; // sideways daylighting
+    // ENTRANCE SHAPE (v25, plan W3). The three counters above are terrain-side
+    // proxies -- "is there a void near a free face" -- and they were the only
+    // entrance geometry this tool could see while an entrance was a bore. The
+    // entrance is now a cavity that reports its own shape per column, so ask it
+    // directly instead: how much ground lies over one, how much of that is
+    // ROOFED (a doline's overhanging lip, a mouth's ceiling) rather than open to
+    // the sky, and how much of the roofed part carries LESS cover than the roof
+    // clamp -- which is the signature of a cavity that has met falling ground,
+    // i.e. a horizontal mouth rather than a bowl.
+    int64_t entCols = 0, entOpenCols = 0, entRoofedCols = 0, entThinRoofCols = 0;
+    int64_t entRoofedFlat = 0, entRoofedSteep = 0;
     // floors
     int64_t floorCols[kCaveFamilyCount] = {0, 0, 0, 0};
     int64_t floorSpots[kCaveFamilyCount] = {0, 0, 0, 0};
@@ -466,7 +477,7 @@ int main(int argc, char** argv) {
                 const bool steep = slopeMmPerM >= steepMmPerM;
                 if (steep) ++colsSteep;
 
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn());
                 if (cv.full.count != col.cave.count ||
                     cv.full.shaftMarginSq != col.cave.shaftMarginSq)
                     ++memoMismatch;
@@ -515,6 +526,18 @@ int main(int argc, char** argv) {
                 if (colMask) ++colsWithAny;
                 for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                     if (colMask & (1u << f)) ++famCols[f];
+
+                // Entrance shape, straight off the reduction.
+                if (col.cave.shaftMarginSq > 0) {
+                    ++entCols;
+                    if (col.cave.shaftDepthMinMm > 0) {
+                        ++entRoofedCols;
+                        if (steep) ++entRoofedSteep; else ++entRoofedFlat;
+                        if (col.cave.shaftDepthMinMm < kCaveRoofMinMm) ++entThinRoofCols;
+                    } else {
+                        ++entOpenCols;
+                    }
+                }
 
                 // Perforation: the column's own top solid voxel is carved, i.e.
                 // you would fall in walking over it. This is the entrance-rate
@@ -630,7 +653,7 @@ int main(int argc, char** argv) {
                 const int64_t vx = (axis == 0) ? x0 + static_cast<int64_t>(i) * stride : cx;
                 const int64_t vy = (axis == 0) ? cy : y0 + static_cast<int64_t>(i) * stride;
                 const ColumnSample col = amp.column(vx, vy);
-                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm, amp.surfaceAtFn());
                 for (int64_t r = 0; r < h; ++r) {
                     const int64_t vz = zTop - r; // row 0 = top of image
                     const MaterialId strat = Amplifier::stratigraphyAt(col, vz);
@@ -956,6 +979,21 @@ int main(int argc, char** argv) {
             std::printf("  by family: %-8s %lld\n", kFamName[f], (long long)perfCols[f]);
     std::printf("sideways daylighting mouths (columns): %lld total, %lld flat, %lld steep\n",
                 (long long)mouthCols, (long long)mouthColsFlat, (long long)mouthColsSteep);
+    std::printf("entrance cavity footprint: %lld columns (%.4f%% of the surface, "
+                "%.0f m^2/km^2)\n",
+                (long long)entCols, 100.0 * entCols / colsD,
+                entCols * sampleAreaM2 / std::max(1e-9, regionKm2));
+    std::printf("  open to the sky : %lld (%.1f%% of the footprint) -- the doline mouth\n",
+                (long long)entOpenCols, 100.0 * entOpenCols / std::max<int64_t>(1, entCols));
+    std::printf("  roofed          : %lld (%.1f%%), %lld flat / %lld steep -- overhanging "
+                "lip and hillside ceiling\n",
+                (long long)entRoofedCols, 100.0 * entRoofedCols / std::max<int64_t>(1, entCols),
+                (long long)entRoofedFlat, (long long)entRoofedSteep);
+    std::printf("  ... of which cover thinner than the %lld mm roof clamp: %lld (%.1f%% of "
+                "the footprint) -- a cavity meeting falling ground, i.e. a HORIZONTAL "
+                "MOUTH\n",
+                (long long)kCaveRoofMinMm, (long long)entThinRoofCols,
+                100.0 * entThinRoofCols / std::max<int64_t>(1, entCols));
 
     std::printf("\n--- floor area and headroom (5.6: where can a mob stand?) ---\n");
     std::printf("%-9s %14s %14s %12s %12s\n", "family", "floor spots", "m^2/km^2", "columns",
@@ -1138,6 +1176,9 @@ int main(int argc, char** argv) {
     }
     d.u64(static_cast<uint64_t>(perfColsAny));
     d.u64(static_cast<uint64_t>(mouthCols));
+    d.u64(static_cast<uint64_t>(entCols));
+    d.u64(static_cast<uint64_t>(entRoofedCols));
+    d.u64(static_cast<uint64_t>(entThinRoofCols));
     std::printf("\ncaveprobe census digest=%016llx  (kWorldGenVersion=%u)\n",
                 (unsigned long long)d.h, kWorldGenVersion);
     if (attrMismatch || memoMismatch) return 1;

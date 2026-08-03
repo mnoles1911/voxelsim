@@ -68,6 +68,12 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // silently reusable, so claiming it is registered here like everything else.
     {CH_CAVE_WAYPOINT, 1, "CH_CAVE_WAYPOINT"},
     {CH_CAVE_NODE_RADIUS, 1, "CH_CAVE_NODE_RADIUS"},
+    // v25 entrance cavity (plan W3). CH_CAVE_ENTRANCE_RIM is keyed on a WORLD
+    // grid cell rather than on a lattice node, so sharing an id with anything
+    // keyed on (i, j) would correlate a doline's rim with a lattice draw -- the
+    // exact class of bug this table exists to make impossible.
+    {CH_CAVE_ENTRANCE, 1, "CH_CAVE_ENTRANCE"},
+    {CH_CAVE_ENTRANCE_RIM, 1, "CH_CAVE_ENTRANCE_RIM"},
     // caverns.h
     {CH_CAVERN_SITE, 1, "CH_CAVERN_SITE"},
     {CH_CAVERN_ROUGH, 1, "CH_CAVERN_ROUGH"},

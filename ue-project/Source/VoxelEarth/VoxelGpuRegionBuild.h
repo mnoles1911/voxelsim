@@ -30,7 +30,18 @@ namespace VoxelGpuRegionBuild
 	// at px and px+1. Undersizing the window does not fault -- the kernel
 	// clamps to the window edge -- it just silently produces different terrain
 	// from the CPU.
+	// v25: the cave pass ALSO taps the surface at an xy other than the querying
+	// column's -- the entrance site's own ground (caves.h caveEntranceSite). The
+	// bound is the ENTRANCE REACH, not the lattice spacing, and only because
+	// worldgen.ush does the xy reject BEFORE the tap: a node further away than the
+	// cavity can reach is never asked about. Both facts are load-bearing for this
+	// margin, so both are stated where the margin is, and the static_assert turns
+	// the arithmetic half into a build failure if either reach is retuned.
 	inline constexpr int64 kRasterCavernMarginMm = vxc::kCavernMaxReachMm + vxc::kVoxelSizeMm;
+	static_assert(vxc::kCaveEntranceReachMaxMm + vxc::kVoxelSizeMm <= vxc::kCavernMaxReachMm,
+	              "the raster window margin is sized from the cavern pass's reach; the cave "
+	              "entrance's surface tap must stay inside it, or VoxelizeMain silently reads a "
+	              "clamped elevation and disagrees with the CPU");
 
 	// Fills PixelSizeMm / RasterOriginPx / RasterSize / ElevationMm /
 	// ClimatePacked for the dispatch footprint already set on Req

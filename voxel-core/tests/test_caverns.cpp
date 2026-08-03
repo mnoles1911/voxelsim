@@ -47,7 +47,7 @@ bool flatCavernCarve(int64_t vx, int64_t vy, int64_t vz) {
 
 bool flatEitherCarve(int64_t vx, int64_t vy, int64_t vz) {
     if (flatCavernCarve(vx, vy, vz)) return true;
-    const CaveColumn tc = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm);
+    const CaveColumn tc = caveColumnFor(kSeed, vx, vy, kFlatSurfaceMm, flatSurfaceAt);
     return caveCarveAt(tc, kFlatSurfaceMm, kFlatBedrockMm, vz);
 }
 
@@ -221,7 +221,7 @@ VXC_TEST(cavern_anchor_point_is_carved_by_both_cavern_and_tunnel_systems) {
             const int64_t anchorVz = floorDiv(site.anchorZMm - kVoxelSizeMm / 2, int64_t(kVoxelSizeMm));
 
             const CavernColumn cc = flatCavernColumnFor(anchorVx, anchorVy);
-            const CaveColumn tc = caveColumnFor(kSeed, anchorVx, anchorVy, kFlatSurfaceMm);
+            const CaveColumn tc = caveColumnFor(kSeed, anchorVx, anchorVy, kFlatSurfaceMm, flatSurfaceAt);
             CHECK(cc.count > 0);
             CHECK(tc.count > 0); // backbone-crossing node -> 4 incident tunnels
             CHECK(cavernCarveAt(cc, kFlatSurfaceMm, kFlatBedrockMm, anchorVz));

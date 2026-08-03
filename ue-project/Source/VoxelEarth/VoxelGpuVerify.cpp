@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 24;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 25;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -188,6 +188,48 @@ namespace
 	// reproduce this constant's absolute value and is not expected to. Anyone
 	// with the editor should re-run voxel.GPU.VerifyRegion to confirm
 	// absolutely; the prediction on record is that it prints b2b5d2f1044caa35.
+
+	// v25 DID NOT MOVE IT EITHER, AND THIS TIME IT WAS ESTABLISHED BEFORE THE
+	// FACT RATHER THAN GUESSED AT. v25 (docs/underground-system-plan.md W3)
+	// replaces the sinkhole bore with an entrance CAVITY: a level floor at
+	// absolute z, a lens roof clipped by the real ground, a rim warped by value
+	// noise, a new field on CaveColumn and a new per-voxel compare. It moves
+	// every entrance in the world, and the fold is unchanged.
+	//
+	// WHY, in one line: neither digest fixture contains an entrance. Not "no
+	// entrance reaches the compared band" -- no entrance is in the 6.4 m window
+	// at all. Entrance candidate nodes sit on a 102.4 m grid and one in four is
+	// open, so a 6.4 m window contains one about once in 250 tries.
+	//
+	// HOW THAT WAS ESTABLISHED WITHOUT THE EDITOR (another agent holds the
+	// box's one slot, again). Two independent statements, both from
+	// voxel-core/bench/gpu_harness.cpp, whose "origin" and "far-negative"
+	// fixtures are these two verbatim:
+	//
+	//   1. DIRECTLY. That harness now prints, per region, how many columns
+	//      actually carry a cave / an entrance / a cavern -- added by W3 for
+	//      exactly this reason, because the previous fixture comment ASSERTED
+	//      an entrance was present and was wrong for a whole worldgen version.
+	//      Both regions report 0 entrance columns of 4,096.
+	//   2. DIFFERENTIALLY. Building that harness at v25 with its new entrance
+	//      fixture removed reproduces the v24 digest 5d3fc4a8e8366148 byte for
+	//      byte over all ten pre-existing regions. Since the fold below digests
+	//      ColumnSample fields and Amplifier::materialAt over the compared
+	//      cells, and those are byte-identical, this constant cannot have moved.
+	//
+	// The prediction on record is therefore that voxel.GPU.VerifyRegion still
+	// prints b2b5d2f1044caa35 at v25. Anyone with the editor should confirm it
+	// absolutely -- and note that the v24 prediction made the same way WAS
+	// confirmed by a later run (Saved/gpuverify-v24d.log: "CPU reference digest:
+	// b2b5d2f1044caa35 (matches the pinned value; vxc::kWorldGenVersion = 24)").
+	//
+	// THE FIXTURE GAP ITSELF IS STILL OPEN HERE and is now measured rather than
+	// suspected: kBandOnlyRegions gained shaft- and cavern-bearing fixtures at
+	// v24, but the PINNED regions still see no entrance and no cavern, so this
+	// constant remains a statement about surface worldgen only. Closing it means
+	// adding an entrance-bearing region to kBandOnlyRegions (which does not feed
+	// this pin), not to kRegions -- the same argument the savanna and fine-tier
+	// gaps above are parked under.
 
 	struct FRegionSpec
 	{

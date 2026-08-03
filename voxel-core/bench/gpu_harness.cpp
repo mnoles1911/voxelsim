@@ -91,7 +91,18 @@ namespace {
 // clamps to the window edge as a defensive backstop, so the GPU would read a
 // different elevation than the CPU and the byte-compare would fail with no
 // other symptom. That is exactly the failure mode this constant prevents.
+// v25: the cave pass ALSO taps the surface at an xy other than the querying
+// column's -- the entrance site's own ground (caves.h caveEntranceSite). The
+// bound is the ENTRANCE REACH, not the lattice spacing, and only because
+// worldgen.ush does the xy reject BEFORE the tap: a node further away than the
+// cavity can reach is never asked about. Both facts are load-bearing for this
+// margin, so both are stated where the margin is, and the static_assert turns
+// the arithmetic half into a build failure if either reach is retuned.
 constexpr int64_t kRasterCavernMarginMm = kCavernMaxReachMm + kVoxelSizeMm;
+static_assert(kCaveEntranceReachMaxMm + kVoxelSizeMm <= kCavernMaxReachMm,
+              "the raster window margin is sized from the cavern pass's reach; the cave "
+              "entrance's surface tap must stay inside it, or VoxelizeMain silently reads a "
+              "clamped elevation and disagrees with the CPU");
 
 // --- Vulkan dynamic loading: no import lib, no static linkage -------------
 
@@ -2988,6 +2999,32 @@ int main(int argc, char** argv) {
         {"cave-band", -64, -64, 64, 64, 30000, 1,
          static_cast<int32_t>((kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
                                kCaveRadiusMaxMm) / kVoxelSizeMm)},
+        // AND ONE REGION THAT REACHES AN ENTRANCE (worldgen v25).
+        //
+        // THE THIRD TIME THIS TRAP HAS BEEN SPRUNG, and the first time it was
+        // caught the same day. cave-band's comment above asserts "the block
+        // contains a gated-open sinkhole node -- so tunnels, crevices and a
+        // shaft are all inside the compared volume". It does not, and it never
+        // did. Entrance candidate nodes sit on a 102.4 m grid and cave-band's
+        // dispatch is 64 columns = 6.4 m across, so the odds of one landing
+        // inside it were about 1 in 250. The W3 entrance rework moved every
+        // entrance in the world -- new cavity, new terrain tap, a new field on
+        // GpuCaveColumn, a new per-voxel compare -- and this harness's digest
+        // did not change by one bit. The per-region "exercised:" line printed
+        // below now makes that visible at every run instead of at the next
+        // accident.
+        //
+        // This fixture is placed ON a real entrance rather than hoping: the
+        // node at world (5.1, -101.1) m, found with
+        //   vxc_caveprobe --synthetic 20260719 --origin 0 0 --span 409.6
+        // which lists gated-open sites in world metres for exactly this use.
+        // 128 columns = 12.8 m centred on it covers the throat, the cavity
+        // interior and -- for the smaller reach draws -- the rim where the
+        // cavity roof meets the ground, so both sides of the entrance's
+        // boundary are compared and not just its middle.
+        {"entrance", 51 - 64, -1011 - 64, 128, 128, 30000, 1,
+         static_cast<int32_t>((kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
+                               kCaveRadiusMaxMm) / kVoxelSizeMm)},
     };
 
     Digest gpuDigest;
@@ -3171,6 +3208,35 @@ int main(int argc, char** argv) {
         // whole reason the positive-coordinate control region exists.
         std::printf("[%s] mismatches in this region: %zu\n", region.name,
                     totalMismatches - regionMismatchesBefore);
+        // WHAT THIS REGION ACTUALLY EXERCISED, not what it was meant to.
+        //
+        // The recorded trap, twice now: "a gate that closes everywhere in the
+        // fixture is indistinguishable from a term that is not mirrored at all"
+        // (density-band-cliff), then "a term that fires OUTSIDE the compared
+        // volume is indistinguishable from one that is not mirrored at all"
+        // (compareDepthVox). Both were found late and by accident. The v25
+        // entrance rework hit the same wall a THIRD time: it moved every
+        // entrance in the world and this harness's digest did not change one
+        // bit, because the cave-band fixture's comment claimed a gated-open
+        // sinkhole node was inside it and no line of code had ever checked.
+        //
+        // So the claim is now a printed COUNT. A fixture that says it covers
+        // entrances and reports 0 entrance columns is visibly not covering
+        // them, at every run, without anyone having to notice a digest that
+        // failed to move.
+        {
+            size_t caveCols = 0, entranceCols = 0, cavernCols = 0;
+            for (const ColumnSample& c : gpu.cpuCols) {
+                if (c.cave.count > 0) ++caveCols;
+                if (c.cave.shaftMarginSq > 0) ++entranceCols;
+                if (c.cavern.count > 0) ++cavernCols;
+            }
+            std::printf("[%s]   exercised: %zu cave / %zu entrance / %zu cavern column(s) of %zu%s\n",
+                        region.name, caveCols, entranceCols, cavernCols, gpu.cpuCols.size(),
+                        region.compareDepthVox == 0
+                            ? "   [surface-band fixture: the cave pass is NOT in the compared cells]"
+                            : "");
+        }
         // First column of the region, field by field. A per-region sample is
         // what distinguishes "the same wrong constant everywhere" (a hash fed
         // the wrong coordinates) from "wrong by a little, differently each

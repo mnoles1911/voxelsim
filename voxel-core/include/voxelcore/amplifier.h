@@ -195,6 +195,22 @@ public:
     // height without needing materials.
     int32_t surfaceMm(int64_t vx, int64_t vy) const;
 
+    // The `surfaceAt` callback caves.h (caveEntranceSite) and caverns.h
+    // (cavernSiteFor) are written against: millimetre world position in,
+    // surface height out, with the mm -> voxel floorDiv that both contracts
+    // specify. column() builds this same lambda internally; this accessor
+    // exists so INSTRUMENTS (vxc_caveprobe, test_caves) reduce a column with
+    // the identical function rather than each hand-rolling the floorDiv — one
+    // of the two hand-rolled copies getting it wrong is exactly how an
+    // instrument ends up confidently measuring a world that is not the one
+    // being built.
+    auto surfaceAtFn() const {
+        return [this](int64_t xMm, int64_t yMm) -> int32_t {
+            return surfaceMm(floorDiv(xMm, int64_t(kVoxelSizeMm)),
+                             floorDiv(yMm, int64_t(kVoxelSizeMm)));
+        };
+    }
+
     // A PROVABLE UPPER BOUND on the DISPLACED surface over every column in the
     // inclusive voxel-index rectangle [vx0, vx1] x [vy0, vy1] — i.e.
     //

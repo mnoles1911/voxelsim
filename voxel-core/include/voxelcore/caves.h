@@ -53,19 +53,33 @@
 //      is kCaveRadiusMinMm + kCaveRadiusSpanMm, so no TUNNEL voxel is ever
 //      shallower than 6.2 m below its own surface; static_assert below pins
 //      that against kCaveRoofMinMm. The single deliberate exception is the
-//      sinkhole shaft (see kCaveShaftNodeMask) — a sparse, explicitly chosen
-//      set of entrance holes, not a leaky roof.
+//      ENTRANCE (see kCaveShaftNodeMask) — a sparse, explicitly chosen set of
+//      hash-gated sites, not a leaky roof. Since v25 that exception is a
+//      cavity rather than a bore, so it covers area rather than points, and
+//      test_caves.cpp bounds BOTH its footprint and the much smaller part of
+//      it that is actually open to the sky.
 //   2. The network stays out of the bedrock floor: deepest possible carve is
 //      36.8 m, while bedrockDepthMm is >= 180 m everywhere since
 //      kWorldGenVersion 5 (>= 40 m before it — amplifier.cpp), and
 //      caveCarveAt additionally refuses anything within kCaveBedrockMarginMm
 //      of the column's own bedrock top AND Amplifier::materialAt refuses to
 //      turn MAT_BEDROCK into air at all. Three independent guards.
-//   3. Cave MOUTHS still happen, for free, exactly where you want them.
-//      "6 m below the surface directly overhead" is only 6 m of rock on FLAT
-//      ground; on a steep hillside the nearest free face is sideways, and the
-//      tube daylights on the slope. No special entrance rule, no perforated
-//      meadows.
+//   3. Cave MOUTHS. This block used to claim that tunnels daylight sideways on
+//      steep slopes "for free", because 6 m of cover overhead is no cover at
+//      all when the nearest free face is sideways. THAT CLAIM WAS FALSE AND
+//      WAS NEVER MEASURED. vxc_caveprobe measured it at the grassland site the
+//      day W3 started: sideways-daylighting columns numbered exactly the
+//      perforated shaft columns, i.e. NOT ONE mouth existed that was not just
+//      a vertical hole seen from below. The arithmetic says why — a tunnel
+//      axis is at least 9 m under its own column, so for ground a metre away
+//      to lie below it the terrain has to fall 9 m in 1 m, which is a cliff,
+//      not a hillside.
+//
+//      v25 produces mouths deliberately instead, and from the entrance
+//      construct rather than from the tunnels: an entrance cavity has a LEVEL
+//      floor and a roof clipped by the real ground, so on falling ground the
+//      roof becomes the hillside and the chamber opens through it. See the
+//      entrance block below.
 //
 // The cost of depth space is that the carved set is only connected up to the
 // per-column shift z = surface - depth: a cliff that drops more than a tube
@@ -166,28 +180,105 @@ inline constexpr int64_t kCaveBackboneMask = 3;
 // Non-backbone edges open when the top 2 bits of their hash are zero (1 in 4).
 inline constexpr uint64_t kCaveEdgeGateMask = 3;
 
-// --- sinkhole shafts (the entrances) ----------------------------------------
-// Depth-space tunnels never break the surface on their own (that is the roof
-// guarantee), which on gentle terrain would leave the whole network sealed and
-// reachable only by digging. Real cave systems open through a sparse set of
-// potholes/sinkholes, and so does this one: at a BACKBONE CROSSING node — one
-// where (i & 3) == 0 AND (j & 3) == 0, hence guaranteed to have all four
-// backbone tunnels incident on it — a 1-in-4 hash gate opens a vertical shaft
-// from that node's depth straight up to the surface.
+// --- entrances (v25, docs/underground-system-plan.md W3) ---------------------
 //
-// Connectivity is again structural, not hoped for: the shaft's bottom IS the
-// node point, which lies on the axis of every tunnel meeting there, so the
-// shaft is part of the main component by construction.
+// WHAT WAS HERE BEFORE, AND WHY IT WAS NOT A BUG. Depth-space tunnels never
+// break the surface on their own (that is the roof guarantee), which on gentle
+// terrain would leave the whole network sealed and reachable only by digging.
+// So at a BACKBONE CROSSING node — one where (i & 3) == 0 AND (j & 3) == 0,
+// hence guaranteed to have all four backbone tunnels incident on it — a 1-in-4
+// hash gate opened a vertical shaft from that node's depth straight up to the
+// surface. That construct carried THREE load-bearing guarantees at once and
+// v25 keeps all three, by construction and not by tuning:
 //
-// Density: one candidate node per 4x4 lattice cells (102.4 m square), gated to
-// 1 in 4, so roughly one entrance per 205 m square, each a ~1.0-1.7 m radius
-// hole. That is findable on a walk without turning the ground into a colander
-// — test_caves.cpp measures the perforated fraction of the surface (well under
-// 0.1%) rather than leaving it to judgement.
+//   1. ENTRANCE RATE. The gate, the candidate node set and therefore the
+//      number of entrances per km^2 are untouched. Same nodes, same 1-in-4.
+//   2. STRUCTURAL CONNECTIVITY. The THROAT below is still a bore whose bottom
+//      IS the node point, which lies on the axis of every tunnel meeting
+//      there, and whose top is still the open surface. Everything else here is
+//      shape added AROUND that bore.
+//   3. ROOF INTEGRITY ELSEWHERE. The entrance is still the ONE enumerated
+//      exception to the roof clamp in caveCarveAt, and it is still sparse. It
+//      is no longer point-sized, so the exception's AREA is now a measured
+//      quantity rather than a negligible one — test_caves.cpp
+//      cave_entrance_exception_area_is_bounded is the gate on it.
+//
+// WHAT CHANGED, AND WHY. The owner's complaint was not that entrances exist;
+// it was "really weird vertical shafts that shoot straight up to the game world
+// surface", i.e. the SHAPE: a hash-placed, perfectly cylindrical, perfectly
+// vertical bore with no surface expression — no bowl, no lip, no cause — at
+// the same density on every landform. v25 keeps the bore and wraps it in an
+// ENTRANCE CAVITY whose shape is decided by the ground:
+//
+//   * a LEVEL FLOOR at absolute z = (surface at the node) - kCaveEntranceFloor,
+//     the same absolute-z anchoring caverns.h uses and for the same reason: a
+//     floor that drapes with the terrain overhead is visibly wrong, and a level
+//     one is somewhere a mob can stand (plan 5.6).
+//   * a lens-shaped ROOF rising to `axisRise` over the node and tapering to the
+//     floor at radius `reach`, so the cavity is a chamber that pinches out
+//     rather than a hole with vertical walls;
+//   * the roof is clipped by the real ground, `zTop = min(surface, floor + H)`.
+//
+// THAT ONE CLIP IS THE WHOLE PORTFOLIO. Nothing below branches on landform;
+// the terrain does the branching, which is what makes this caused variety
+// rather than placed variety (docs/landform-provinces-plan.md):
+//
+//   * FLAT GROUND. The surface is ~level with the node's, so the roof breaks
+//     the ground only where H exceeds the floor depth — a bowl, open in the
+//     middle, with a rock LIP overhanging the void all round it. A doline.
+//   * A HILLSIDE. Downhill of the node the ground falls below floor + H, so
+//     `zTop` becomes the ground itself and the cavity's roof IS the hill face:
+//     the chamber daylights SIDEWAYS as a horizontal mouth with a level floor,
+//     and stops entirely where the ground drops below the floor. This is the
+//     "caves open horizontally in mountainsides" item, and it is free — no
+//     second construct, no slope input, no new hash.
+//   * A DRAINAGE LINE. Ground falling along one axis only stretches the mouth
+//     along that axis: the swallow-hole/streambed-capture GEOMETRY, which is
+//     what W3 can honestly build while water waits for the watershed work.
+//
+// The rim is warped by a value-noise field (kCaveEntranceRim*) so no two
+// cavities share an outline and none of them is a circle.
+//
+// Density is unchanged: one candidate node per 4x4 lattice cells (102.4 m
+// square), gated to 1 in 4, so roughly one entrance per 205 m square.
 inline constexpr int64_t kCaveShaftNodeMask = 3;  // (i & mask) == 0 && (j & mask) == 0
 inline constexpr uint64_t kCaveShaftGateMask = 3; // 1 in 4 of those open
+// The THROAT: the surviving v24 bore, surface -> node. It is deliberately
+// unchanged in size and role. It is what makes "every open site has an opening
+// at the axis, and that opening reaches a backbone node" a structural fact
+// instead of something the cavity's arithmetic has to be trusted to deliver.
 inline constexpr int64_t kCaveShaftRadiusMinMm = 1000;
 inline constexpr int64_t kCaveShaftRadiusSpanMm = 700;
+inline constexpr int64_t kCaveShaftRadiusMaxMm = kCaveShaftRadiusMinMm + kCaveShaftRadiusSpanMm;
+
+// Cavity floor depth below the NODE's own surface: [5, 9) m. Strictly less than
+// kCaveNodeDepthMinMm so the floor is always above the node and the throat
+// always has something to bore through (static_assert below).
+inline constexpr int64_t kCaveEntranceFloorMinMm = 5000;
+inline constexpr int64_t kCaveEntranceFloorSpanMm = 4000;
+// How far the roof rises ABOVE the floor at the axis, over and above the floor
+// depth itself: axisRise = floorDepth + over, with over in [1, 3) m. Because
+// axisRise > floorDepth, the roof at the axis is above the node's own surface,
+// which is what opens the bowl on flat ground; `over` is therefore the knob
+// that decides how WIDE the daylight hole is, and hashing it is what stops
+// every doline being the same size.
+inline constexpr int64_t kCaveEntranceOverMinMm = 1000;
+inline constexpr int64_t kCaveEntranceOverSpanMm = 2000;
+// Footprint radius: [5, 13) m. This is the horizontal extent of the whole
+// cavity, NOT of the daylight hole — on flat ground the hole is
+// reach * sqrt(over / axisRise), roughly a third of it.
+inline constexpr int64_t kCaveEntranceReachMinMm = 5000;
+inline constexpr int64_t kCaveEntranceReachSpanMm = 8000;
+inline constexpr int64_t kCaveEntranceReachMaxMm =
+    kCaveEntranceReachMinMm + kCaveEntranceReachSpanMm;
+// Rim warp: bilinear value noise on a 6.4 m grid, applied as a Q10 multiplier
+// on the squared radial parameter, so the rim wanders by roughly +/-12% of the
+// reach. It multiplies t^2, so it is exactly ZERO at the axis — the daylight
+// guarantee cannot be perturbed by it, which is why it is a multiplier and not
+// an offset.
+inline constexpr int64_t kCaveEntranceRimCellMm = 6400;
+inline constexpr int64_t kCaveEntranceRimAmpQ10 = 256; // t^2 scaled by [0.75, 1.25)
+inline constexpr int64_t kCaveEntranceRimMaxQ10 = 1024 + kCaveEntranceRimAmpQ10;
 
 // Hard safety clamps, all applied per voxel in caveCarveAt.
 inline constexpr int64_t kCaveRoofMinMm = 6000;       // never carve shallower than this
@@ -268,6 +359,38 @@ static_assert(kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
               "tube geometry must keep itself out of bedrock — the bedrock margin is a "
               "backstop, not the mechanism");
 
+// --- entrance-cavity invariants (v25) ---------------------------------------
+
+// The cavity floor must sit strictly ABOVE the shallowest node, or the throat
+// would have nothing to bore and the union of throat and cavity would stop
+// being a single depth interval (which is what lets CaveColumn carry an
+// entrance in two int32s — see the reduction below).
+static_assert(kCaveEntranceFloorMinMm + kCaveEntranceFloorSpanMm <= kCaveNodeDepthMinMm,
+              "the entrance cavity's floor must stay above the shallowest lattice node, or "
+              "the throat has nothing to bore and the entrance stops being one depth interval");
+// The roof at the axis must clear the floor, unconditionally, for every draw.
+// This is the DAYLIGHT GUARANTEE in arithmetic form: axisRise > floorDepth means
+// the cavity roof at the axis is above the node's own surface.
+static_assert(kCaveEntranceOverMinMm > 0,
+              "the entrance cavity's axis rise must exceed its floor depth, or a site could "
+              "generate a sealed chamber instead of an entrance");
+// The throat must lie strictly inside the cavity for every combination of
+// draws INCLUDING the worst rim warp, so the throat's own daylight bore is
+// never left standing outside the chamber it is supposed to open into. The
+// test is on t^2: (rThroatMax / reachMin)^2 * rimMax < 1.
+static_assert(kCaveShaftRadiusMaxMm * kCaveShaftRadiusMaxMm * kCaveEntranceRimMaxQ10 <
+                  kCaveEntranceReachMinMm * kCaveEntranceReachMinMm * 1024,
+              "the throat must stay inside the entrance cavity's footprint under the worst "
+              "rim warp, or a bore could daylight outside its own chamber");
+// The reach bounds how far from the querying column the cave pass has to
+// evaluate the terrain surface (see the surfaceAt contract below). The GPU
+// raster window is sized from kCavernMaxReachMm, and the assert that the
+// entrance tap fits inside it lives next to that constant (gpu_harness.cpp,
+// VoxelGpuRegionBuild.h) where the margin is actually computed.
+static_assert(kCaveEntranceReachMaxMm < kCaveLatticeMm,
+              "an entrance cavity must not reach further than one lattice cell, or the 3x3 "
+              "candidate block stops being exhaustive for entrances");
+
 // --- hash channels ----------------------------------------------------------
 // Extends hash.h's HashChannel registry — see the authoritative allocation
 // table at the top of hash.h (and its machine-checked twin,
@@ -298,6 +421,14 @@ inline constexpr uint32_t CH_CREVICE = 24;     // crevice gate + slab geometry
 // artifact, not a coincidence to leave alone.
 inline constexpr uint32_t CH_CAVE_WAYPOINT = 29;    // edge waypoint offset + dip
 inline constexpr uint32_t CH_CAVE_NODE_RADIUS = 50; // per-node tube radius
+// v25 (plan W3). The entrance CAVITY's own draws get a channel of their own
+// rather than spending more bits of CH_CAVE_SHAFT: that hash already supplies
+// the gate (bits 48..49) and the throat radius (bits 0..19), and stacking three
+// more 20-bit fields on it would leave nothing spare for a later entrance term.
+// CH_CAVE_ENTRANCE_RIM is keyed on a WORLD-POSITION grid cell, not on a lattice
+// node, so it must not share a channel with anything keyed on (i, j).
+inline constexpr uint32_t CH_CAVE_ENTRANCE = 51;     // cavity floor / axis rise / reach
+inline constexpr uint32_t CH_CAVE_ENTRANCE_RIM = 52; // rim value noise, keyed on world cells
 
 // --- node / edge primitives -------------------------------------------------
 
@@ -426,11 +557,30 @@ struct CaveSeg {
 struct CaveColumn {
     int32_t count = 0;
     CaveSeg segs[kMaxCaveSegs] = {};
-    // Sinkhole shaft over this column, if any (at most one can be in range —
-    // shaft nodes are 102.4 m apart and a shaft is ~1.4 m wide). Zero
-    // marginSq means "no shaft here", which is the overwhelmingly common case.
-    int32_t shaftMarginSq = 0;   // r^2 - xyDist^2 to the shaft axis, > 0 if present
-    int32_t shaftDepthMaxMm = 0; // shaft runs from the surface down to this depth
+    // The entrance over this column, if any (at most one can be in range —
+    // entrance nodes are 102.4 m apart and a cavity reaches at most 13 m).
+    // Zero marginSq means "no entrance here", which is the overwhelmingly
+    // common case.
+    //
+    // v25 (plan W3) added `shaftDepthMinMm`, and it is the one struct change
+    // the entrance portfolio needed. Until v24 an entrance was always open to
+    // the sky over its whole footprint, so a single "carve from depth 0 down
+    // to here" cutoff described it exactly. A cavity whose roof is clipped by
+    // the real ground is NOT that: uphill of the node, and everywhere under the
+    // overhanging lip of a doline, the void starts BELOW the surface. Two
+    // int32s therefore describe the entrance as the closed depth interval
+    // [min, max], and the per-voxel test gains exactly one compare.
+    //
+    // WHY AN INTERVAL IS ENOUGH — the union of the throat and the cavity is
+    // provably one interval, never two. Both share the same bottom-anchored
+    // structure: the cavity occupies [floorZ, zTop] and the throat, where it
+    // exists, occupies [nodeZ, surface] with nodeZ <= floorZ (static_assert on
+    // kCaveEntranceFloor*). So a throat column's union is [nodeZ, surface] and
+    // a cavity-only column's is [floorZ, zTop]. There is no case that produces
+    // a gap, which is what keeps this two fields rather than a segment list.
+    int32_t shaftMarginSq = 0;   // reach^2 - xyDist^2 to the entrance axis, > 0 if present
+    int32_t shaftDepthMinMm = 0; // ... shallowest carved depth (0 == open to the sky here)
+    int32_t shaftDepthMaxMm = 0; // ... deepest carved depth
 };
 
 // ---------------------------------------------------------------------------
@@ -471,13 +621,121 @@ struct CaveLattice {
     CaveNode nodes[16] = {};        // di + 4*dj over the 4x4 block
     int32_t nodeRadiusMm[16] = {};  // v24 per-node calibre, same slot indexing
     CaveLatticeEdge edges[18] = {}; // (di + 3*dj) * 2 + dir over the 3x3 sources
-    int32_t shaftNodeSlot = -1;    // di + 4*dj of the sinkhole candidate, -1 = none
-    int32_t shaftRadiusMm = 0;
+    int32_t shaftNodeSlot = -1;    // di + 4*dj of the entrance candidate, -1 = none
+    int32_t shaftRadiusMm = 0;     // the throat bore's radius
+    // v25 entrance cavity, all four decided at the SITE (see caveEntranceSite).
+    int32_t entranceReachMm = 0;   // footprint radius
+    int32_t entranceAxisRiseMm = 0; // roof height above the floor, at the axis
+    int64_t entranceFloorZMm = 0;  // ABSOLUTE z of the level floor
+    int64_t entranceNodeZMm = 0;   // ABSOLUTE z of the node = the throat's bottom
 };
+
+// --- entrance rim noise ------------------------------------------------------
+// Bilinear value noise on a kCaveEntranceRimCellMm grid, in Q10, keyed on WORLD
+// position rather than on the entrance node — so the warp is a property of the
+// place, two neighbouring entrances in the same terrain share the same field,
+// and nothing about it depends on which site is being drawn.
+//
+// Returned as a Q10 multiplier in [1024 - amp, 1024 + amp). Four hash2 calls,
+// paid only by columns already inside an entrance footprint (~0.5% of the
+// world), and integer-bilinear so it has no seams.
+constexpr int64_t caveEntranceRimQ10(uint64_t seed, int64_t xMm, int64_t yMm) {
+    const int64_t gx = floorDiv(xMm, kCaveEntranceRimCellMm);
+    const int64_t gy = floorDiv(yMm, kCaveEntranceRimCellMm);
+    // Fractions in Q10. floorDiv above makes these non-negative for negative
+    // world coordinates too, which is the whole reason the grid index is not a
+    // shift.
+    const int64_t fx = floorDiv((xMm - gx * kCaveEntranceRimCellMm) * 1024, kCaveEntranceRimCellMm);
+    const int64_t fy = floorDiv((yMm - gy * kCaveEntranceRimCellMm) * 1024, kCaveEntranceRimCellMm);
+    // 10 bits of each corner hash, so every intermediate below stays far inside
+    // int64 even after two Q10 multiplies.
+    const int64_t v00 = static_cast<int64_t>(hash2(seed, gx, gy, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t v10 = static_cast<int64_t>(hash2(seed, gx + 1, gy, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t v01 = static_cast<int64_t>(hash2(seed, gx, gy + 1, CH_CAVE_ENTRANCE_RIM) >> 54);
+    const int64_t v11 =
+        static_cast<int64_t>(hash2(seed, gx + 1, gy + 1, CH_CAVE_ENTRANCE_RIM) >> 54);
+    // floorDiv, not `>> 10`, on every one of these: the corner DIFFERENCES
+    // are signed, and a right shift of a negative signed value is one of the
+    // constructs this file routes through floorDiv everywhere else rather than
+    // trusting two languages to agree about. tools/lint-shader-ub.py has no
+    // rule for it, so the discipline has to come from here.
+    const int64_t a = v00 + floorDiv((v10 - v00) * fx, 1024);
+    const int64_t b = v01 + floorDiv((v11 - v01) * fx, 1024);
+    const int64_t v = a + floorDiv((b - a) * fy, 1024); // [0, 1024)
+    return 1024 - kCaveEntranceRimAmpQ10 + floorDiv(v * (2 * kCaveEntranceRimAmpQ10), 1024);
+}
+
+// --- entrance site -----------------------------------------------------------
+// The per-SITE half of the entrance: everything that depends on the node and on
+// the terrain AT the node, and nothing that depends on the querying column.
+//
+// THE surfaceAt CONTRACT, identical in shape and in reason to caverns.h's: the
+// surface is sampled at the NODE's own (xMm, yMm), not at the querying column's.
+// A cavity floor that drapes with the ground overhead cannot produce a hillside
+// mouth (the whole point of v25) and cannot give a mob anywhere level to stand.
+// amplifier.cpp supplies `evalSurface(floorDiv(xMm, kVoxelSizeMm),
+// floorDiv(yMm, kVoxelSizeMm)).surfaceMm`, mm -> voxel floorDiv included, and
+// worldgen.ush mirrors that call exactly.
+//
+// `valid` is false when the node's own ground is below kCaveMinSurfaceMm — the
+// beach/ocean guard applied to the SITE, mirroring cavernSiteFor. Without it a
+// site whose node sits in shallow water could anchor a floor below sea level.
+struct CaveEntranceSite {
+    bool valid = false;
+    int32_t throatRadiusMm = 0;
+    int32_t reachMm = 0;
+    int32_t axisRiseMm = 0;
+    int64_t floorZMm = 0;
+    int64_t nodeZMm = 0;
+};
+
+template <typename SurfaceFn>
+constexpr CaveEntranceSite caveEntranceSite(uint64_t seed, int64_t i, int64_t j,
+                                            const CaveNode& node, const SurfaceFn& surfaceAt) {
+    CaveEntranceSite s;
+    const uint64_t hs = hash2(seed, i, j, CH_CAVE_SHAFT);
+    if (((hs >> 48) & kCaveShaftGateMask) != 0) return s; // not an entrance node
+    const int32_t siteSurfaceMm = surfaceAt(node.xMm, node.yMm);
+    if (siteSurfaceMm < kCaveMinSurfaceMm) return s; // beach/ocean guard on the SITE
+
+    const uint64_t he = hash2(seed, i, j, CH_CAVE_ENTRANCE);
+    const int64_t floorDepthMm =
+        kCaveEntranceFloorMinMm +
+        static_cast<int64_t>(((he & 0xFFFFFu) * static_cast<uint64_t>(kCaveEntranceFloorSpanMm)) >>
+                             20);
+    const int64_t overMm =
+        kCaveEntranceOverMinMm +
+        static_cast<int64_t>((((he >> 20) & 0xFFFFFu) *
+                              static_cast<uint64_t>(kCaveEntranceOverSpanMm)) >> 20);
+    const int64_t reachMm =
+        kCaveEntranceReachMinMm +
+        static_cast<int64_t>((((he >> 40) & 0xFFFFFu) *
+                              static_cast<uint64_t>(kCaveEntranceReachSpanMm)) >> 20);
+
+    s.valid = true;
+    s.throatRadiusMm = static_cast<int32_t>(
+        kCaveShaftRadiusMinMm +
+        static_cast<int64_t>(((hs & 0xFFFFFu) * static_cast<uint64_t>(kCaveShaftRadiusSpanMm)) >>
+                             20));
+    s.reachMm = static_cast<int32_t>(reachMm);
+    s.axisRiseMm = static_cast<int32_t>(floorDepthMm + overMm);
+    s.floorZMm = static_cast<int64_t>(siteSurfaceMm) - floorDepthMm;
+    s.nodeZMm = static_cast<int64_t>(siteSurfaceMm) - node.depthMm;
+    return s;
+}
 
 // All of caveColumnFor's hashing, for lattice cell (ci, cj). Iteration order
 // matches the fused form exactly.
-constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
+//
+// v25: templated on the surface function, for the entrance site only (see
+// caveEntranceSite's surfaceAt contract). At most ONE surface tap per lattice
+// cell — a cell is 65'536 voxel columns, so the memo in amplifier.cpp amortises
+// it to nothing. The shader mirror cannot memoise, so it defers the tap until
+// AFTER the cheap xy reject; the value is the same either way, since surfaceAt
+// is a pure function of the node's xy.
+template <typename SurfaceFn>
+constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj,
+                                     const SurfaceFn& surfaceAt) {
     CaveLattice L;
 
     // 4x4 node block: the 3x3 candidate SOURCE nodes plus the +x/+y endpoints
@@ -506,22 +764,25 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
             }
         }
 
-    // Sinkhole shaft candidate. At most one node in the 3x3 block can be a
-    // backbone crossing (three consecutive indices contain at most one
-    // multiple of 4 on each axis), so the first hit in the fixed (dj, di)
-    // order is also the only hit — recording it here is exactly what the
-    // fused loop's early-out found.
+    // Entrance candidate. At most one node in the 3x3 block can be a backbone
+    // crossing (three consecutive indices contain at most one multiple of 4 on
+    // each axis), so the first hit in the fixed (dj, di) order is also the only
+    // hit — recording it here is exactly what the fused loop's early-out found.
     for (int32_t dj = 0; dj < 3 && L.shaftNodeSlot < 0; ++dj)
         for (int32_t di = 0; di < 3 && L.shaftNodeSlot < 0; ++di) {
             const int64_t i = ci - 1 + di;
             const int64_t j = cj - 1 + dj;
             if ((i & kCaveShaftNodeMask) != 0 || (j & kCaveShaftNodeMask) != 0) continue;
-            const uint64_t h = hash2(seed, i, j, CH_CAVE_SHAFT);
-            if (((h >> 48) & kCaveShaftGateMask) != 0) continue;
-            L.shaftNodeSlot = di + 4 * dj;
-            L.shaftRadiusMm = static_cast<int32_t>(
-                kCaveShaftRadiusMinMm +
-                static_cast<int64_t>(((h & 0xFFFFFu) * static_cast<uint64_t>(kCaveShaftRadiusSpanMm)) >> 20));
+            const int32_t slot = di + 4 * dj;
+            const CaveEntranceSite site =
+                caveEntranceSite(seed, i, j, L.nodes[slot], surfaceAt);
+            if (!site.valid) continue;
+            L.shaftNodeSlot = slot;
+            L.shaftRadiusMm = site.throatRadiusMm;
+            L.entranceReachMm = site.reachMm;
+            L.entranceAxisRiseMm = site.axisRiseMm;
+            L.entranceFloorZMm = site.floorZMm;
+            L.entranceNodeZMm = site.nodeZMm;
         }
     return L;
 }
@@ -534,7 +795,8 @@ constexpr CaveLattice caveLatticeFor(uint64_t seed, int64_t ci, int64_t cj) {
 // Iteration order (dj, then di, then dir) is part of the worldgen contract: it
 // is what decides which segments survive if the kMaxCaveSegs cap were ever
 // hit, and the shader mirrors it exactly.
-constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int64_t vy) {
+constexpr CaveColumn caveColumnFromLattice(uint64_t seed, const CaveLattice& L, int64_t vx,
+                                           int64_t vy, int32_t surfaceMm) {
     CaveColumn out;
     const int64_t xMm = vx * kVoxelSizeMm;
     const int64_t yMm = vy * kVoxelSizeMm;
@@ -670,16 +932,78 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
         }
     }
 
-    // Sinkhole shaft: the single candidate the lattice block already found.
+    // --- entrance: the single candidate the lattice block already found ------
+    //
+    // Everything here is in ABSOLUTE z and converted to this column's depth
+    // space exactly once, at the end. That is deliberate: the cavity's floor
+    // and roof are level surfaces, and expressing a level surface in a
+    // per-column depth frame is precisely the thing that produced a draped,
+    // shape-less bore in v24.
     if (L.shaftNodeSlot >= 0) {
         const CaveNode& n = nodes[L.shaftNodeSlot];
-        const int64_t r = L.shaftRadiusMm;
         const int64_t ex = xMm - n.xMm;
         const int64_t ey = yMm - n.yMm;
-        const int64_t marginSq = r * r - (ex * ex + ey * ey);
-        if (marginSq > 0) {
-            out.shaftMarginSq = static_cast<int32_t>(marginSq);
-            out.shaftDepthMaxMm = static_cast<int32_t>(n.depthMm);
+        const int64_t distSq = ex * ex + ey * ey;
+        const int64_t reach = L.entranceReachMm;
+        const int64_t reachSq = reach * reach;
+        if (distSq < reachSq) {
+            // Radial parameter, squared, in Q16, warped by the rim noise. The
+            // warp MULTIPLIES, so it vanishes at the axis: the daylight
+            // guarantee below cannot be perturbed by terrain-keyed noise.
+            //
+            // distSq <= reachSq < 169e6 and the shift is by 16, so the
+            // numerator peaks near 1.1e13 — three orders of magnitude inside
+            // int64, and no denominator is ever squared (the trap the crevice
+            // taper documents).
+            const int64_t tSqQ16 =
+                floorDiv(floorDiv(distSq * 65536, reachSq) * caveEntranceRimQ10(seed, xMm, yMm),
+                         1024);
+            // Roof height above the level floor: a lens that is axisRise tall
+            // over the node and pinches to the floor at the (warped) rim.
+            const int64_t hMm =
+                tSqQ16 >= 65536 ? 0
+                                : floorDiv(static_cast<int64_t>(L.entranceAxisRiseMm) *
+                                               (65536 - tSqQ16),
+                                           65536);
+            // THE ONE CLIP THAT MAKES THE PORTFOLIO. On flat ground `zRoof`
+            // wins in the middle and the ground wins further out: a bowl with
+            // an overhanging lip. On a hillside the ground wins on the downhill
+            // side and the cavity daylights sideways; where the ground falls
+            // below the floor there is nothing left to carve at all.
+            const int64_t zRoofMm = L.entranceFloorZMm + hMm;
+            const int64_t zTopMm =
+                (static_cast<int64_t>(surfaceMm) < zRoofMm) ? static_cast<int64_t>(surfaceMm)
+                                                            : zRoofMm;
+            if (zTopMm >= L.entranceFloorZMm) {
+                out.shaftMarginSq = static_cast<int32_t>(reachSq - distSq);
+                const int64_t dMinMm = static_cast<int64_t>(surfaceMm) - zTopMm;
+                out.shaftDepthMinMm = static_cast<int32_t>(dMinMm > 0 ? dMinMm : 0);
+                out.shaftDepthMaxMm =
+                    static_cast<int32_t>(static_cast<int64_t>(surfaceMm) - L.entranceFloorZMm);
+            }
+        }
+        // The THROAT, unchanged from v24 in size and role: a bore from this
+        // column's own surface down to the node. It is a strict superset of the
+        // cavity's interval here (the static_asserts prove the throat lies
+        // inside the footprint and the node below the floor), so it simply
+        // replaces the interval rather than having to be merged with it — and
+        // it is what keeps "every open site has daylight over a backbone node"
+        // a structural fact rather than an arithmetic hope.
+        const int64_t rt = L.shaftRadiusMm;
+        const int64_t throatDepthMm = static_cast<int64_t>(surfaceMm) - L.entranceNodeZMm;
+        // `throatDepthMm >= 0` is a degeneracy guard, not a normal case: the
+        // throat is at most 1.7 m from the node, so this column's ground can
+        // only be BELOW the node's own depth where the terrain drops ~10 m
+        // within 1.7 m -- a cliff face cutting through the site. Without it
+        // that column would still be flagged as an entrance and would take
+        // caveCarveAt's roof-clamp exception for an interval that is empty.
+        if (distSq < rt * rt && throatDepthMm >= 0) {
+            const int64_t throatMarginSq = rt * rt - distSq;
+            if (throatMarginSq > static_cast<int64_t>(out.shaftMarginSq))
+                out.shaftMarginSq = static_cast<int32_t>(throatMarginSq);
+            out.shaftDepthMinMm = 0;
+            if (throatDepthMm > static_cast<int64_t>(out.shaftDepthMaxMm))
+                out.shaftDepthMaxMm = static_cast<int32_t>(throatDepthMm);
         }
     }
     return out;
@@ -689,12 +1013,14 @@ constexpr CaveColumn caveColumnFromLattice(const CaveLattice& L, int64_t vx, int
 // worldgen contract and the HLSL mirror are written against. Callers walking
 // many columns should go through amplifier.cpp's memoised path instead, which
 // produces bit-identical values.
-constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
+template <typename SurfaceFn>
+constexpr CaveColumn caveColumnFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm,
+                                   const SurfaceFn& surfaceAt) {
     CaveColumn out;
     if (surfaceMm < kCaveMinSurfaceMm) return out;
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    return caveColumnFromLattice(caveLatticeFor(seed, ci, cj), vx, vy);
+    return caveColumnFromLattice(seed, caveLatticeFor(seed, ci, cj, surfaceAt), vx, vy, surfaceMm);
 }
 
 // --- per-voxel carve test ---------------------------------------------------
@@ -721,11 +1047,19 @@ constexpr bool caveCarveAt(const CaveColumn& cave, int32_t surfaceMm, int32_t be
     const int64_t centreMm = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
     const int64_t depthMm = static_cast<int64_t>(surfaceMm) - centreMm;
     if (depthMm < 0) return false; // above ground is the surface shell's business
-    // Sinkhole shaft: the ONE construct allowed through the roof clamp, by
-    // design (see kCaveShaftNodeMask). Its bottom is a backbone crossing node,
-    // so it always lands on the main network; its top is the surface, so it is
-    // an entrance. Bounded well above bedrock by kCaveNodeDepth*.
-    if (cave.shaftMarginSq > 0 && depthMm <= static_cast<int64_t>(cave.shaftDepthMaxMm))
+    // The entrance: the ONE construct allowed through the roof clamp, by design
+    // (see kCaveShaftNodeMask). Its throat's bottom is a backbone crossing node,
+    // so it always lands on the main network; its throat's top is the surface,
+    // so it is an entrance. Bounded well above bedrock by kCaveNodeDepth*.
+    //
+    // v25 made this a closed depth INTERVAL rather than a cutoff — one extra
+    // compare — because the cavity's roof is clipped by the real ground, so
+    // under a doline's overhanging lip and everywhere uphill of a hillside
+    // mouth the void legitimately starts below the surface. `shaftDepthMinMm`
+    // is 0 wherever the entrance is open to the sky, which is the whole
+    // throat and the middle of every bowl.
+    if (cave.shaftMarginSq > 0 && depthMm >= static_cast<int64_t>(cave.shaftDepthMinMm) &&
+        depthMm <= static_cast<int64_t>(cave.shaftDepthMaxMm))
         return true;
     if (depthMm < kCaveRoofMinMm) return false;
     if (depthMm + kCaveBedrockMarginMm >= static_cast<int64_t>(bedrockDepthMm)) return false;

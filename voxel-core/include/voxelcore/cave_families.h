@@ -83,22 +83,23 @@ struct CaveColumnVariants {
 // `full` is bit-identical to what caveColumnFor(seed, vx, vy, surfaceMm)
 // returns, including its below-threshold empty case -- callers cross-check
 // that against the ColumnSample they already have.
+template <typename SurfaceFn>
 inline CaveColumnVariants caveColumnVariantsFor(uint64_t seed, int64_t vx, int64_t vy,
-                                                int32_t surfaceMm) {
+                                                int32_t surfaceMm, const SurfaceFn& surfaceAt) {
     CaveColumnVariants out;
     if (surfaceMm < kCaveMinSurfaceMm) return out; // caveColumnFor's own guard
     const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
     const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    const CaveLattice L = caveLatticeFor(seed, ci, cj);
+    const CaveLattice L = caveLatticeFor(seed, ci, cj, surfaceAt);
 
     CaveLattice lns = L;
     lns.shaftNodeSlot = -1;
     CaveLattice lt = lns;
     for (CaveLatticeEdge& e : lt.edges) e.crevHash = kCaveCrevHashClosed;
 
-    out.full = caveColumnFromLattice(L, vx, vy);
-    out.tunCrev = caveColumnFromLattice(lns, vx, vy);
-    out.tunnel = caveColumnFromLattice(lt, vx, vy);
+    out.full = caveColumnFromLattice(seed, L, vx, vy, surfaceMm);
+    out.tunCrev = caveColumnFromLattice(seed, lns, vx, vy, surfaceMm);
+    out.tunnel = caveColumnFromLattice(seed, lt, vx, vy, surfaceMm);
     return out;
 }
 
@@ -112,7 +113,8 @@ constexpr bool caveInShaftBranch(const CaveColumn& c, int32_t surfaceMm, int64_t
     const int64_t depthMm =
         static_cast<int64_t>(surfaceMm) - (vz * kVoxelSizeMm + kVoxelSizeMm / 2);
     if (depthMm < 0) return false;
-    return depthMm <= static_cast<int64_t>(c.shaftDepthMaxMm);
+    return depthMm >= static_cast<int64_t>(c.shaftDepthMinMm) &&
+           depthMm <= static_cast<int64_t>(c.shaftDepthMaxMm);
 }
 
 // Family bitmask for one voxel. `caveTruthOut` receives caveCarveAt's own
