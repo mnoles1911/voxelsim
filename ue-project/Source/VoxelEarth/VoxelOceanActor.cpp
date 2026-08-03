@@ -10,6 +10,8 @@
 #include "GameFramework/PlayerController.h"
 #include "UObject/ConstructorHelpers.h"
 #include "VoxelEarth.h"
+#include "VoxelWaterSubsystem.h"
+#include "VoxelWorldSubsystem.h"
 
 AVoxelOceanActor::AVoxelOceanActor()
 {
@@ -127,7 +129,10 @@ void AVoxelOceanActor::UpdateFollowPlane()
 
 	const double SnappedX = FMath::GridSnap(CameraLoc.X, FollowSnapUU);
 	const double SnappedY = FMath::GridSnap(CameraLoc.Y, FollowSnapUU);
-	SetActorLocation(FVector(SnappedX, SnappedY, 0.0));
+	// The visual plane sits ON the datum, by name (voxelcore/core.h
+	// kSeaLevelMm via UVoxelWaterSubsystem::SeaLevelZUU) rather than on a
+	// literal 0 that happened to agree with it.
+	SetActorLocation(FVector(SnappedX, SnappedY, UVoxelWaterSubsystem::SeaLevelZUU()));
 }
 
 void AVoxelOceanActor::UpdateUnderwaterState()
@@ -139,24 +144,48 @@ void AVoxelOceanActor::UpdateUnderwaterState()
 		return;
 	}
 
-	double CameraZ = 0.0;
+	FVector CameraPos = FVector::ZeroVector;
 	bool bHaveCamera = false;
 	if (PC->PlayerCameraManager)
 	{
-		CameraZ = PC->PlayerCameraManager->GetCameraLocation().Z;
+		CameraPos = PC->PlayerCameraManager->GetCameraLocation();
 		bHaveCamera = true;
 	}
 	else if (APawn* P = PC->GetPawn())
 	{
-		CameraZ = P->GetActorLocation().Z;
+		CameraPos = P->GetActorLocation();
 		bHaveCamera = true;
 	}
 	if (!bHaveCamera)
 	{
 		return;
 	}
+	const double CameraZ = CameraPos.Z;
 
-	const bool bNowUnderwater = CameraZ < 0.0;
+	// WAS `CameraZ < 0.0`, with nothing else consulted. A dry cavern below sea
+	// level -- which this world has plenty of, caves.h only refuses to carve
+	// AT or below the datum, not above it under a valley floor -- got full
+	// underwater fog and the tinted post-process, and the post-process is
+	// `bUnbound = true`, so the tint was global. See
+	// UVoxelWaterSubsystem::IsUnderwaterAtWorld for what replaces it and what
+	// it still cannot tell apart (docs/watershed-system-plan.md §5.3).
+	bool bNowUnderwater;
+	if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+	{
+		bNowUnderwater = Water->IsUnderwaterAtWorld(CameraPos);
+	}
+	else if (UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>())
+	{
+		// No water simulation in this world (the transient loading world, or a
+		// stripped configuration): the ocean datum alone, which is still the
+		// terrain-aware test rather than the camera one.
+		bNowUnderwater = UVoxelWaterSubsystem::IsOpenSeaAtWorld(
+			CameraZ, Terrain->GetSurfaceHeightUU(CameraPos.X, CameraPos.Y));
+	}
+	else
+	{
+		bNowUnderwater = false;
+	}
 	if (bNowUnderwater == bUnderwater)
 	{
 		return; // no transition -- fog/post-process state is already correct
@@ -179,6 +208,15 @@ void AVoxelOceanActor::UpdateUnderwaterState()
 	// The only observable signal for this branch in an unattended
 	// screenshot run (task spec: verify via log lines instead of a second
 	// screenshot) -- logged once per transition, not per tick.
-	UE_LOG(LogVoxelEarth, Log, TEXT("Ocean: camera %s water (camera z=%.1f UU)"),
-	       bUnderwater ? TEXT("entered") : TEXT("exited"), CameraZ);
+	// The ground height goes in the line because it is now HALF THE ANSWER: a
+	// transition at z=-500 over ground at +12000 would be the old camera-only
+	// bug returning, and the log is the only signal an unattended screenshot
+	// run has.
+	const double GroundZ = World->GetSubsystem<UVoxelWorldSubsystem>()
+	                           ? World->GetSubsystem<UVoxelWorldSubsystem>()->GetSurfaceHeightUU(CameraPos.X, CameraPos.Y)
+	                           : 0.0;
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Ocean: camera %s water (camera z=%.1f UU, worldgen ground z=%.1f UU, sea z=%.1f UU)"),
+	       bUnderwater ? TEXT("entered") : TEXT("exited"), CameraZ, GroundZ,
+	       UVoxelWaterSubsystem::SeaLevelZUU());
 }

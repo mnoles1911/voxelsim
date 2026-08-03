@@ -90,7 +90,12 @@ int32_t TileGridSampler::elevationMm(int64_t px, int64_t py) {
     const TileData* t = findTile(px, py, lx, ly);
     if (!t) {
         missingTileQueries.fetch_add(1, std::memory_order_relaxed);
-        return 0;
+        // A tile that is not loaded reads as SEA LEVEL, not as "zero". The
+        // distinction is the point of the symbol: the fallback is a datum
+        // choice (a missing tile is open ocean, the same conservative posture
+        // pipeline.py's MISSING_ELEVATION_M takes on the bake side), not an
+        // arbitrary default. missingTileQueries counts every one of them.
+        return kSeaLevelMm;
     }
     const int64_t metres = t->elevationAt(lx, ly);
     return static_cast<int32_t>(metres * 1000);
@@ -714,7 +719,7 @@ int32_t FineTileSampler::elevationMm(int64_t px, int64_t py) {
     const FineTile* t = nullptr;
     uint32_t lx, ly;
     const std::vector<int16_t>* block = blockFor(px, py, t, lx, ly);
-    if (!block) return 0;
+    if (!block) return kSeaLevelMm; // missing block == open ocean; see TileGridSampler
     return t->elevationMmFromCp((*block)[ly * t->blockDim() + lx]);
 }
 

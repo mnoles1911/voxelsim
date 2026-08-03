@@ -187,6 +187,13 @@ private:
 
 	UVoxelWorldSubsystem* GetVoxelWorldSubsystem() const;
 
+	// True when the point is in water: real CA/implicit water, or the open
+	// sea over a seabed. Routes through UVoxelWaterSubsystem so the swim test
+	// and the underwater post-process cannot disagree, and so baked lakes and
+	// rivers start making the character swim the moment they exist without a
+	// second predicate being written here. Replaced a bare `Z < 0`.
+	bool IsInWaterAt(const FVector& Pos) const;
+
 	// --- State --------------------------------------------------------------
 
 	float CurrentForwardInput = 0.f;

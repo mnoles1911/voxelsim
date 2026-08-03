@@ -161,6 +161,12 @@ static const uint BIOME_BARE_ROCK = 9;   // appended at worldgen v8
 // `vxc_dump_biome_constants` (voxel-core/bench) and paste its output: it prints
 // them from the very headers the CPU path compiles against, which is the only
 // way this mirror cannot drift by arithmetic slip.
+// SEA LEVEL (voxelcore/core.h kSeaLevelMm). The datum every elevation gate
+// below is relative to -- the beach band is kSeaLevelMm-3000 .. +4000, not
+// "-3000 .. 4000 absolute". Mirrored here so the shader has the same one
+// symbol the CPU path has instead of the implicit 0 it had before.
+static const int kSeaLevelMm = 0;
+static const int64_t kSeaLevelVoxelZ = 0; // kSeaLevelMm / kVoxelSizeMm
 static const int64_t kBiomeCliffSlopeMmPerM = 700; // 70% grade, ~35 deg (v9: mm per METRE)
 static const int kBiomeBeachLowerMm = -3000;
 static const int kBiomeBeachUpperMm = 4000;
@@ -1981,7 +1987,7 @@ static const int64_t kCaveShaftRadiusSpanMm = 700;
 static const int64_t kCaveRoofMinMm = 6000;
 static const int64_t kCaveBedrockMarginMm = 2000;
 static const int kCaveMinSurfaceMm = 12000;
-static const int64_t kCaveMinVoxelZ = 0;
+static const int64_t kCaveMinVoxelZ = kSeaLevelVoxelZ; // caves.h: never carve at or below sea level
 // Raised 8 -> 12 by M4 cave pass v2 (C2): a crevice can now ride the SAME
 // lattice edge as a tunnel, so a junction column can see 4 tunnels + 4
 // crevices; 12 leaves headroom. Mirrors caves.h's kMaxCaveSegs exactly â€” the

@@ -159,7 +159,10 @@ inline constexpr int64_t kCaveShaftRadiusSpanMm = 700;
 inline constexpr int64_t kCaveRoofMinMm = 6000;       // never carve shallower than this
 inline constexpr int64_t kCaveBedrockMarginMm = 2000; // stop this far above bedrock top
 inline constexpr int32_t kCaveMinSurfaceMm = 12000;   // columns below this get no caves at all
-inline constexpr int64_t kCaveMinVoxelZ = 0;          // never carve at or below sea level
+// Never carve at or below sea level. DERIVED from core.h's datum rather than
+// written as its own 0: this is a sea-level rule, so a change of datum must
+// move it, and worldgen.ush mirrors this line by name.
+inline constexpr int64_t kCaveMinVoxelZ = kSeaLevelVoxelZ;
 
 // Max tube axes recorded per column. Four edges meet at a node, so a column
 // sitting exactly on a junction can legitimately see 4 tunnels; since M4 cave

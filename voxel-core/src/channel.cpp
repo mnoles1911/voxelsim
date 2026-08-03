@@ -145,7 +145,7 @@ void ChannelField::build(ITileSampler& tiles, IChannelSurface& surface, const Ri
         const int64_t dx = r.bx - r.ax, dy = r.by - r.ay;
         r.lenSq = dx * dx + dy * dy;
 
-        if (r.bedAMm <= 0 && r.bedBMm <= 0) ++stats_.segmentsBelowSeaLevel;
+        if (r.bedAMm <= kRiverSeaLevelMm && r.bedBMm <= kRiverSeaLevelMm) ++stats_.segmentsBelowSeaLevel;
         stats_.maxWidthMm = std::max(stats_.maxWidthMm,
                                      static_cast<int64_t>(std::max(r.widthAMm, r.widthBMm)));
         stats_.maxDepthMm = std::max(stats_.maxDepthMm,
@@ -170,7 +170,7 @@ void ChannelField::build(ITileSampler& tiles, IChannelSurface& surface, const Ri
         if (net.outgoingSegment(static_cast<uint32_t>(n)) != RiverNetwork::kNoSegment) continue;
         if (!hasIncoming[n]) continue;
         ++stats_.outlets;
-        if (nodeBedMm_[n] > 0) ++stats_.outletsAboveSeaLevel;
+        if (nodeBedMm_[n] > kRiverSeaLevelMm) ++stats_.outletsAboveSeaLevel;
     }
 
     // --- spatial index ------------------------------------------------------

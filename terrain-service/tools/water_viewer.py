@@ -81,8 +81,8 @@ _HTML = """<!doctype html>
     <div class="sub">__SPAN__ km across &middot; seed __SEED__ &middot; coarse cells of 7.68 km</div>
 
     <div class="row">
-      <label>Water level <b><span id="wlv">0</span> m</b></label>
-      <input type="range" id="water" min="-2000" max="2000" step="10" value="0">
+      <label>Water level <b><span id="wlv">__SEALEVEL__</span> m</b></label>
+      <input type="range" id="water" min="-2000" max="2000" step="10" value="__SEALEVEL__">
     </div>
     <div class="row chk"><input type="checkbox" id="nowater"><label for="nowater"
       style="margin:0;display:inline">Hide water entirely (bare topography)</label></div>
@@ -287,7 +287,7 @@ function draw() {
 for (const id of ['water','nowater','relief','btint','ramp','shore'])
   document.getElementById(id).addEventListener('input', draw);
 document.getElementById('reset').addEventListener('click', () => {
-  document.getElementById('water').value = 0;
+  document.getElementById('water').value = K.seaLevel;  // core.h kSeaLevelMm
   document.getElementById('nowater').checked = false; draw();
 });
 draw();
@@ -319,6 +319,9 @@ def main() -> None:
         "pcv": [round(float(v), 1) for v in d["precip_cv"].ravel()],
     }
     consts = {
+        # The game's datum (core.h kSeaLevelMm), so the slider's zero and its
+        # reset button mean "the sea" by name rather than by coincidence.
+        "seaLevel": k["sea_level_m"],
         "beachLo": k["beach_lower_m"], "beachHi": k["beach_upper_m"],
         "treeBase": k["treeline_base_m"], "treePerC": k["treeline_m_per_c"],
         "tempCold": k["temp_cold_c"], "tempWarm": k["temp_warm_c"], "tempHot": k["temp_hot_c"],
@@ -332,7 +335,8 @@ def main() -> None:
             .replace("__COLS__", json.dumps([[round(c * 255) for c in col] for _, col in BIOMES]))
             .replace("__NAMES__", json.dumps([n for n, _ in BIOMES]))
             .replace("__SPAN__", f"{span:.0f}")
-            .replace("__SEED__", args.seed))
+            .replace("__SEED__", args.seed)
+            .replace("__SEALEVEL__", f"{k['sea_level_m']:g}"))
     Path(args.out).write_text(html, encoding="utf-8")
     kb = len(html) / 1024
     print(f"wrote {args.out} ({kb:.0f} KB, self-contained -- open it in a browser)")

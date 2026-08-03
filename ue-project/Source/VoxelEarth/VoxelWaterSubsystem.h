@@ -310,6 +310,55 @@ public:
 	// converted to CA water. Verification/debug read.
 	uint8 GetImplicitFillAtWorld(const FVector& WorldUU) const;
 
+	// --- "Am I in water?", for real ------------------------------------------
+	//
+	// Every underwater/swim test in the client used to be `Z < 0`: below the
+	// sea-level datum, full stop, with no terrain and no water consulted. That
+	// makes a DRY CAVERN 200 m under a mountain read as ocean -- global
+	// underwater fog, a tinted post-process, and a swimming character, inside
+	// solid rock's air pocket. It also makes every visual judgement of every
+	// later water milestone unreadable, which is why
+	// docs/watershed-system-plan.md puts fixing it first (§5.3, item 1).
+	//
+	// Two queries, deliberately separate:
+
+	// WATER THAT IS ACTUALLY THERE: the CA's fill, plus the implicit field for
+	// bricks it has not taken over yet (implicitFillAt already returns 0 once
+	// a brick is mobilized, so the two never double-count). Today that means
+	// cavern lakes and anything a player poured or breached; when the baked
+	// lake/river datum joins the implicit field (plan items 3-4 and 7) it
+	// starts answering for those too with NO change here -- which is the point
+	// of routing the test through the water datum rather than the camera.
+	// Returns 0-255 fill units, 0 for dry.
+	uint8 GetWaterFillAtWorld(const FVector& WorldUU) const;
+
+	// THE FULL PREDICATE the client should use: simulated/implicit water, OR
+	// the open sea. See IsOpenSeaAtWorld for what "the open sea" is allowed to
+	// mean before the ocean is a real datum (plan item 8).
+	bool IsUnderwaterAtWorld(const FVector& WorldUU) const;
+
+	// Sea level in UE units, from voxelcore/core.h's kSeaLevelMm -- the one
+	// symbol, converted once, so nothing in the client spells the datum as a
+	// literal again.
+	static double SeaLevelZUU();
+
+	// THE OCEAN, AS A DATUM. True when a point is in the open sea: below sea
+	// level, and standing over WORLDGEN ground that is itself below sea level
+	// (a seabed) rather than over land.
+	//
+	// The second condition is the whole fix. "Below sea level" alone is what
+	// tinted dry caverns; "below sea level over a seabed" is false inside a
+	// mountain, false in a dry pit dug into land (the worldgen ground there is
+	// still above the datum, which is why this takes the worldgen surface and
+	// NOT the edited one), and true where the sea actually is.
+	//
+	// What it still gets wrong, stated rather than hidden: a natural inland
+	// depression whose baked floor lies below sea level reads as sea. Nothing
+	// short of a real water datum can tell that apart from a bay, and supplying
+	// one is exactly what plan items 3-4 do. Until then this is strictly less
+	// wrong than the camera test, and the failure is rarer and diagnosable.
+	static bool IsOpenSeaAtWorld(double WorldZUU, double WorldgenGroundZUU);
+
 	// C8 ledger, for verification logging. Shortfall MUST be 0 forever: it
 	// counts units the implicit field gave up that the CA did not accept,
 	// which is the one way mobilization could destroy water. See waterca.h.

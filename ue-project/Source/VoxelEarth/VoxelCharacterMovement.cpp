@@ -5,6 +5,7 @@
 #include "GameFramework/Actor.h"
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
+#include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
 namespace
@@ -139,6 +140,26 @@ UVoxelWorldSubsystem* UVoxelCharacterMovementComponent::GetVoxelWorldSubsystem()
 {
 	UWorld* World = GetWorld();
 	return World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+}
+
+bool UVoxelCharacterMovementComponent::IsInWaterAt(const FVector& Pos) const
+{
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+	// The water subsystem owns the full predicate (simulated water, the
+	// implicit field, and the open-sea datum). Without it -- a world with no
+	// water simulation -- fall back to the datum half alone, which still needs
+	// the terrain: "below sea level" on its own is what this replaced.
+	if (UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>())
+	{
+		return Water->IsUnderwaterAtWorld(Pos);
+	}
+	UVoxelWorldSubsystem* Terrain = GetVoxelWorldSubsystem();
+	return Terrain && UVoxelWaterSubsystem::IsOpenSeaAtWorld(
+	                      Pos.Z, Terrain->GetSurfaceHeightUU(Pos.X, Pos.Y));
 }
 
 bool UVoxelCharacterMovementComponent::IsGroundedAt(const FVector& Pos) const
@@ -594,12 +615,19 @@ void UVoxelCharacterMovementComponent::TickMovement(float DeltaTime)
 		return;
 	}
 
-	// Water track W1 swimming placeholder (docs/voxel-earth-implementation-
-	// plan.md SS3.7): the box counts as "in the water" once it is entirely below
-	// sea level (z=0, matching AVoxelOceanActor's implicit ocean --
-	// VoxelCoords.h: voxel z=0 == UE world z=0). Binary swim/walk switch only --
-	// no buoyancy, drag or currents (those are W4).
-	const bool bSwimming = (Pos.Z + GetHalfExtentZ()) < 0.0;
+	// Water track W1 swimming (docs/voxel-earth-implementation-plan.md SS3.7,
+	// tightened by docs/watershed-system-plan.md item 1): the box counts as "in
+	// the water" once its TOP is in water. Binary swim/walk switch only -- no
+	// buoyancy, drag or currents (those are W4).
+	//
+	// WAS `(Pos.Z + GetHalfExtentZ()) < 0.0` -- entirely below the sea-level
+	// datum, with neither terrain nor water consulted, so a character standing
+	// on the dry floor of a cavern below sea level swam through the air. The
+	// predicate now asks the water datum (UVoxelWaterSubsystem::
+	// IsUnderwaterAtWorld: real CA water, the implicit field, or the open sea
+	// over a seabed) and the same query will answer for baked lakes and rivers
+	// when they land, with no change here.
+	const bool bSwimming = IsInWaterAt(FVector(Pos.X, Pos.Y, Pos.Z + GetHalfExtentZ()));
 	const bool bGrounded = !bSwimming && bGroundedNow;
 	bSwimmingLastTick = bSwimming;
 	bGroundedLastTick = bGrounded;

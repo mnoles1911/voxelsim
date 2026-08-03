@@ -4459,6 +4459,52 @@ uint8 UVoxelWaterSubsystem::GetImplicitFillAtWorld(const FVector& WorldUU) const
 	                                 int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU)));
 }
 
+uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+	const int64 Vx = int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU));
+	const int64 Vy = int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU));
+	const int64 Vz = int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU));
+	// CA first: once a brick is mobilized the CA owns it and implicitFillAt
+	// already reads 0 there, so the max of the two is the whole water column
+	// with no double count in either direction (waterca.h's ownership
+	// partition is what guarantees that, not call order here).
+	const uint8 CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
+	return CaFill > 0 ? CaFill : Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+}
+
+double UVoxelWaterSubsystem::SeaLevelZUU()
+{
+	// mm -> UU. VoxelCoords::VoxelSizeUU UU per vxc::kVoxelSizeMm mm.
+	return double(vxc::kSeaLevelMm) * VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm);
+}
+
+bool UVoxelWaterSubsystem::IsOpenSeaAtWorld(double WorldZUU, double WorldgenGroundZUU)
+{
+	const double SeaZ = SeaLevelZUU();
+	// Above the datum is never sea; below the seabed is rock, not sea.
+	return WorldZUU < SeaZ && WorldgenGroundZUU < SeaZ && WorldZUU >= WorldgenGroundZUU;
+}
+
+bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
+{
+	if (GetWaterFillAtWorld(WorldUU) > 0)
+	{
+		return true;
+	}
+	if (!Impl)
+	{
+		return false;
+	}
+	// GetSurfaceHeightUU is the AMPLIFIER column surface -- worldgen, not the
+	// edited overlay -- which is exactly what the seabed test needs: a pit a
+	// player dug into land is not an ocean, and its edited ground is.
+	return IsOpenSeaAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
+}
+
 void UVoxelWaterSubsystem::GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,
                                                  uint64& OutShortfall) const
 {

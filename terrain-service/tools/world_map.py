@@ -78,6 +78,11 @@ COARSE_PER_TILE = TILE_SIZE // FINE_PER_COARSE
 
 _REPO = Path(__file__).resolve().parents[2]
 _BIOME_H = _REPO / "voxel-core" / "include" / "voxelcore" / "biome.h"
+#: Sea level lives in core.h, not biome.h -- biome.h's beach band is stated
+#: RELATIVE to it. There is no C++ -> Python constants dump in this repo (the
+#: only C++ -> HLSL one is a hand-paste from ``vxc_dump_biome_constants``), so
+#: this reader is the mirror, and it now reads two headers instead of one.
+_CORE_H = _REPO / "voxel-core" / "include" / "voxelcore" / "core.h"
 
 
 # --- thresholds, read out of biome.h ---------------------------------------
@@ -91,9 +96,17 @@ def _read_constants() -> dict:
     encoding at all. The coarse API already serves degrees C and mm/yr, so the
     whole comparison happens in physical units and quantization never enters.
     """
-    if not _BIOME_H.is_file():
-        sys.exit(f"cannot find {_BIOME_H} -- run this from inside the repo")
+    for header in (_BIOME_H, _CORE_H):
+        if not header.is_file():
+            sys.exit(f"cannot find {header} -- run this from inside the repo")
     src = _BIOME_H.read_text(encoding="utf-8")
+    core_src = _CORE_H.read_text(encoding="utf-8")
+
+    def core_plain(const: str) -> float:
+        m = re.search(rf"{const}\s*=\s*(-?[\d']+)\s*;", core_src)
+        if not m:
+            sys.exit(f"core.h no longer defines {const} as a plain integer.")
+        return float(m.group(1).replace("'", ""))
 
     def phys(const: str, fn: str) -> float:
         m = re.search(rf"{const}\s*=\s*{fn}\(\s*(-?[\d']+)\s*\)", src)
@@ -124,6 +137,13 @@ def _read_constants() -> dict:
         # kBiomeSeasonalHighU8 -- a gate no climate on Earth could satisfy.
         "precip_seasonal_high_pct":
             phys("kBiomePrecipSeasonalHighU8", "climatePrecipVarU8FromDeciPct") / 10.0,
+        # THE WATERLINE, from core.h's kSeaLevelMm. Read rather than assumed
+        # because this tool draws the maps the world is judged from and it used
+        # to draw them at ``beach_lower_m`` -- the BOTTOM of the beach band,
+        # three metres below the game's actual sea. Every published map put its
+        # coast in the wrong place, consistently, and no amount of comparing
+        # maps to each other could show it.
+        "sea_level_m": core_plain("kSeaLevelMm") / 1000.0,
         "beach_lower_m": plain("kBiomeBeachLowerMm") / 1000.0,
         "beach_upper_m": plain("kBiomeBeachUpperMm") / 1000.0,
         "treeline_base_m": plain("kBiomeTreelineBaseMm") / 1000.0,
@@ -322,7 +342,11 @@ def bathymetric(elev_m: np.ndarray) -> np.ndarray:
 def compose(elev, biome, k, style="blend", relief=3.0, cell_m=None, sea_level=None,
             stretch=False):
     """Colour + shade one field. Shared by the coarse and detail paths."""
-    sea_level = k["beach_lower_m"] if sea_level is None else sea_level
+    # THE GAME'S SEA LEVEL (core.h kSeaLevelMm), not the beach band's lower
+    # edge. This was ``k["beach_lower_m"]`` -- -3.0 m -- so every published map
+    # drew its waterline three metres below where the client puts it, flooding
+    # a strip of land on every coast in every deliverable map.
+    sea_level = k["sea_level_m"] if sea_level is None else sea_level
     sea = elev < sea_level
 
     if style == "biome" and biome is not None:
@@ -500,7 +524,7 @@ def audition(url: str, seeds: list, half: int, k: dict, out: str) -> None:
         ax.set_yticks([])
 
         land = d["elev"] > k["beach_upper_m"]
-        reach = inland_reach_km(d["elev"], k["beach_lower_m"])
+        reach = inland_reach_km(d["elev"], k["sea_level_m"])
         counts = np.bincount(biome.ravel(), minlength=len(BIOMES)) / biome.size * 100
         present = [BIOMES[i][0] for i in range(len(BIOMES)) if counts[i] >= 1.0]
         tmed = float(np.median(d["temp"][land])) if land.any() else float("nan")
