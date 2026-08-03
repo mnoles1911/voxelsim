@@ -10163,10 +10163,12 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 // oversampled signal. The error is a gentle chunk-to-chunk gradient, not
 // banding. If boundary artifacts ever do show, docs/gpu-g3-integration-plan.md
 // records the two escalations.
-// It also carries the surface height the pooled shader needs for its
-// biome-tint gate. The component path samples that per chunk too
-// (BuildChunkVertexData's ChunkSurfaceZUU), at the same point -- the chunk
-// centre -- so this is the same number, not an approximation of it.
+// It also carries the surface PLANE the pooled shader needs for its biome-tint
+// gate: a height at the chunk's XY origin plus a quantised gradient pair. The
+// component path fits the same plane from the same four corner samples
+// (BuildChunkVertexData's ChunkSurfacePlane), through the same functions in
+// VoxelClimateProbe.h, so this is the same plane and not an approximation of it.
+// It was one height at the chunk centre until task #44; see the header note.
 //
 // It is returned RELATIVE TO THE CHUNK ORIGIN. The subtraction has to happen
 // here, in double precision, because the absolute value is ~8.4M UU where
@@ -10188,20 +10190,75 @@ static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
 	// No subsystem -> no gate, matching BuildChunkVertexData's fallback for
 	// transient/loading worlds ("always surface", how it behaved before the gate
 	// existed).
+	//
+	// FOUR CORNERS, NOT THE CENTRE, and the reason is the whole of task #44: one
+	// height for a chunk that is 102.4 m across at L5 is a HORIZONTAL reference
+	// plane held against a sloping surface, and cutting a tilted voxel staircase
+	// with a horizontal plane draws a chevron. See VoxelClimateProbe.h's
+	// "surface-proximity gate's reference height" note for the measurement and
+	// for why the band was not simply widened instead.
+	//
+	// The extra cost is three more Amplifier::column calls per chunk apply, on
+	// the game thread. SampleChunkParamsForPool was MEASURED at 0.002-0.004 ms
+	// per apply -- 0.2% of an apply, against poolAdd's 98-99% -- when T1-3
+	// proposed caching it away (docs/backlog.md, "T1-3 ... STRUCK"), so 4x it is
+	// still under 1% of an apply, and this is the thread the frame is NOT bound
+	// on (docs: render-thread bound at 2K, game thread ~75% idle). The fine-tier
+	// PREFETCH is not paid four times: RequestFootprint inside GetSurfaceHeightUU
+	// dilates around each query, and the four corners of one chunk fall inside
+	// one dilated footprint after the first.
 	float SurfaceZRelUU = UVoxelGpuPoolComponent::kNoSurfaceGate;
+	float PackedGradients = 0.0f;
 	if (const UWorld* World = Root.GetWorld())
 	{
 		if (const UVoxelWorldSubsystem* Sub = World->GetSubsystem<UVoxelWorldSubsystem>())
 		{
-			const double SurfaceZUU = Sub->GetSurfaceHeightUU(Centre.X, Centre.Y);
-			SurfaceZRelUU = float(SurfaceZUU - ChunkWorldOrigin.Z);
+			// SPAN, NOT EDGE. GetSurfaceHeightUU floors its argument to a voxel,
+			// so a sample at X0 + EdgeUU is the first column of the NEXT chunk --
+			// which on the fine tier can be the first column of the next TILE,
+			// and a query for a non-resident fine tile is a fatal residency leak
+			// in unattended runs rather than a wrong number. One level-voxel in
+			// keeps all four samples inside the chunk whose columns the mesher
+			// has already required to be resident.
+			const double LevelVoxelUU = double(VoxelCoords::VoxelSizeUU) * double(int64(1) << Level);
+			const double SpanUU = 2.0 * HalfEdgeUU - LevelVoxelUU;
+			const double X0 = ChunkWorldOrigin.X;
+			const double Y0 = ChunkWorldOrigin.Y;
+			const double H00 = Sub->GetSurfaceHeightUU(X0, Y0);
+			const double H10 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0);
+			const double H01 = Sub->GetSurfaceHeightUU(X0, Y0 + SpanUU);
+			const double H11 = Sub->GetSurfaceHeightUU(X0 + SpanUU, Y0 + SpanUU);
+
+			// Least-squares plane through the four samples. Written as central
+			// differences of the two pairs so it degenerates to the exact answer
+			// on genuinely planar ground and cannot be skewed by which corner is
+			// sampled first.
+			const double RawDZDX = ((H10 + H11) - (H00 + H01)) / (2.0 * SpanUU);
+			const double RawDZDY = ((H01 + H11) - (H00 + H10)) / (2.0 * SpanUU);
+			PackedGradients = VoxelClimate::PackSurfaceGradients(RawDZDX, RawDZDY);
+
+			// Re-read the QUANTISED gradients to build the base from, so the
+			// plane this chunk is drawn with is the plane the base was fitted
+			// for. Building the base from the raw values instead would leave the
+			// quantisation error as a constant vertical offset over the whole
+			// chunk -- exactly the error being removed.
+			float DZDX = 0.0f, DZDY = 0.0f;
+			VoxelClimate::UnpackSurfaceGradients(PackedGradients, DZDX, DZDY);
+
+			// Value at the chunk's XY ORIGIN, relative to the chunk's origin Z.
+			// Both subtractions are done here in double, for the same reason the
+			// centre height always was: the absolute value is ~8.4M UU and
+			// float32's ULP there is 1 UU against a 10 UU voxel.
+			const double MeanZUU = 0.25 * (H00 + H10 + H01 + H11);
+			const double BaseZUU = MeanZUU - (double(DZDX) + double(DZDY)) * 0.5 * SpanUU;
+			SurfaceZRelUU = float(BaseZUU - ChunkWorldOrigin.Z);
 		}
 	}
 
 	return FVector4f(float(Bytes.Temperature) / 255.0f,
 	                 float(Bytes.Precipitation) / 255.0f,
 	                 SurfaceZRelUU,
-	                 0.0f);
+	                 PackedGradients);
 }
 
 void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)

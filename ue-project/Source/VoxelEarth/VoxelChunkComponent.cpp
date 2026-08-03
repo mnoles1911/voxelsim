@@ -201,28 +201,63 @@ namespace
 		//
 		// Fix: a +Z face only takes the biome colour if it is actually near the
 		// terrain surface. GetSurfaceHeightUU is the full amplifier column (the
-		// real surface, not the 30 m tile base), sampled ONCE PER CHUNK at the
-		// chunk centre rather than per quad: a chunk is 3.2 m across and the
-		// surface barely moves over that, so per-chunk is ample and keeps this
-		// off the per-quad path on the meshing workers.
+		// real surface, not the 30 m tile base).
+		//
+		// IT IS A PLANE, NOT A HEIGHT, and that is task #44. This was one sample
+		// at the chunk CENTRE against a fixed 2 m band, on the argument that "a
+		// chunk is 3.2 m across and the surface barely moves over that". True at
+		// L0 and false by a factor of 32 at L5, where the chunk is 102.4 m
+		// across: on a slope most of a coarse chunk's sky-facing faces then fall
+		// outside the band and lose the tint, and a horizontal cut through a
+		// tilted voxel staircase is a chevron. Measured in
+		// docs/measurements/hatching-lattice-diagnosis-2026-08-03.txt.
+		//
+		// So the reference follows the ground: four corner samples, the plane
+		// through them, evaluated per corner below. Same four samples, same
+		// packing, same evaluation as the pooled path -- both go through
+		// VoxelClimateProbe.h, which is where the reasoning lives.
 		//
 		// Chunks with no subsystem (transient/loading worlds) fall back to
 		// "always surface", matching how this behaved before the gate existed.
-		double ChunkSurfaceZUU = -TNumericLimits<double>::Max();
+		double ChunkSurfaceBaseZUU = -TNumericLimits<double>::Max();
+		float ChunkDZDX = 0.0f;
+		float ChunkDZDY = 0.0f;
 		if (const UWorld* SurfWorld = Component.GetWorld())
 		{
 			if (const UVoxelWorldSubsystem* SurfSub = SurfWorld->GetSubsystem<UVoxelWorldSubsystem>())
 			{
-				const double HalfChunkUU = 0.5 * double(VoxelCoords::ChunkEdgeVoxels) * double(LevelVoxelSizeUU);
-				ChunkSurfaceZUU = SurfSub->GetSurfaceHeightUU(ComponentWorldOrigin.X + HalfChunkUU,
-				                                              ComponentWorldOrigin.Y + HalfChunkUU);
+				// One level-voxel in from the far edge, so all four samples are
+				// columns of THIS chunk -- see SampleChunkParamsForPool for why
+				// that matters on the fine tier.
+				const double SpanUU =
+					double(VoxelCoords::ChunkEdgeVoxels - 1) * double(LevelVoxelSizeUU);
+				const double X0 = ComponentWorldOrigin.X;
+				const double Y0 = ComponentWorldOrigin.Y;
+				const double H00 = SurfSub->GetSurfaceHeightUU(X0, Y0);
+				const double H10 = SurfSub->GetSurfaceHeightUU(X0 + SpanUU, Y0);
+				const double H01 = SurfSub->GetSurfaceHeightUU(X0, Y0 + SpanUU);
+				const double H11 = SurfSub->GetSurfaceHeightUU(X0 + SpanUU, Y0 + SpanUU);
+
+				const double RawDZDX = ((H10 + H11) - (H00 + H01)) / (2.0 * SpanUU);
+				const double RawDZDY = ((H01 + H11) - (H00 + H10)) / (2.0 * SpanUU);
+				// Round-tripped through the pooled path's 12-bit packing even
+				// though nothing is packed here, so the two renderers cannot
+				// disagree about where the surface is on the same chunk.
+				VoxelClimate::UnpackSurfaceGradients(
+					VoxelClimate::PackSurfaceGradients(RawDZDX, RawDZDY), ChunkDZDX, ChunkDZDY);
+
+				const double MeanZUU = 0.25 * (H00 + H10 + H01 + H11);
+				ChunkSurfaceBaseZUU =
+					MeanZUU - (double(ChunkDZDX) + double(ChunkDZDY)) * 0.5 * SpanUU;
 			}
 		}
-		// 2 m of slack: the per-chunk sample is taken at the chunk centre, so a
-		// quad at the chunk edge on a steep slope can legitimately sit somewhat
-		// below it. Generous enough not to punch holes in the surface, far
-		// tighter than the tens of metres a cave sits below it.
-		constexpr double kSurfaceBandUU = 200.0;
+		// 2 m of slack. It no longer has to absorb the slope across a chunk --
+		// the plane does that -- so what is left for it is the terrain's
+		// CURVATURE over one chunk plus the mesher's own quantisation. Deliberately
+		// unchanged at 200: this is the number that keeps cave floors untinted,
+		// and the point of fitting the plane was to fix the slope WITHOUT
+		// spending the cave guard to do it.
+		constexpr double kSurfaceBandUU = VoxelClimate::kSurfaceBandUU;
 
 		// -VoxelMatHistogram: one-shot histogram of the material ids voxel-core
 		// actually emits. Added because this change spent a long time reasoning
@@ -414,8 +449,16 @@ namespace
 						// instead of in the shader.
 						// Below the surface band, nothing is biome-tinted --
 						// cave floors are +Z faces too (see the gate above).
+						// The reference is the fitted plane at THIS corner's XY,
+						// not one height for the whole chunk. Pos is chunk-local,
+						// which is the frame the plane is expressed in and the
+						// frame the shader evaluates it in.
+						const double CornerSurfaceZUU =
+							ChunkSurfaceBaseZUU +
+							double(VoxelClimate::SurfaceZRelAt(0.0f, ChunkDZDX, ChunkDZDY,
+							                                   float(Pos[CornerIdx].X), float(Pos[CornerIdx].Y)));
 						const bool bNearSurface =
-							(ComponentWorldOrigin.Z + double(Pos[CornerIdx].Z)) > (ChunkSurfaceZUU - kSurfaceBandUU);
+							(ComponentWorldOrigin.Z + double(Pos[CornerIdx].Z)) > (CornerSurfaceZUU - kSurfaceBandUU);
 						const uint8 TintByte = bNearSurface
 							? VoxelClimate::BiomeTintForFace(Q.Mat, Axis, Q.Positive != 0)
 							: 0;

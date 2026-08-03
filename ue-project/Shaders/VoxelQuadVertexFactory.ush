@@ -129,10 +129,15 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	float3 ChunkOrigin = VoxelVF.ChunkOriginUU;
 	float ChunkScale = VoxelVF.LevelScale;
 	float2 ChunkClimate = float2(0.5f, 0.5f);
-	// Surface height at this chunk's centre, relative to the chunk's own origin.
+	// The terrain surface over this chunk as a PLANE, in the chunk's own frame:
+	// ChunkSurfaceZRelUU is its value at the chunk's XY ORIGIN (not its centre --
+	// that is what lets this be evaluated without knowing the chunk's level), and
+	// ChunkSurfaceGradPacked carries the two gradients.
+	//
 	// Single-chunk mode has no per-chunk table, so it takes the "no subsystem"
 	// fallback BuildChunkVertexData uses: everything counts as surface.
 	float ChunkSurfaceZRelUU = -1.0e30f;
+	float ChunkSurfaceGradPacked = 0.0f;
 	if (VoxelVF.PoolMode != 0u)
 	{
 		const uint ChunkId = VoxelVF.QuadChunkIds[QuadIndex];
@@ -142,6 +147,7 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		const float4 Params = VoxelVF.ChunkParams[ChunkId];
 		ChunkClimate = Params.xy;
 		ChunkSurfaceZRelUU = Params.z;
+		ChunkSurfaceGradPacked = Params.w;
 	}
 
 	// PER-CORNER WATER SURFACE HEIGHTS, water pools only.
@@ -246,21 +252,58 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	//     blend. That is the larger of the two differences by area.
 	//   * CAVE FLOORS. A cave floor is a +Z face too, so face direction alone
 	//     paints it grassland green. The CPU path gates on the vertex being
-	//     within kSurfaceBandUU of the chunk's surface height; that height now
-	//     arrives per chunk in ChunkParams.z.
+	//     within kSurfaceBandUU of the surface ABOVE IT; that surface arrives per
+	//     chunk as a plane in ChunkParams.z (height at the chunk's XY origin) and
+	//     ChunkParams.w (its two gradients, packed).
 	//
 	// The gate is expressed chunk-locally on both sides. The CPU asks
-	// `ComponentWorldOrigin.Z + Pos.Z > ChunkSurfaceZUU - Band`; subtracting
+	// `ComponentWorldOrigin.Z + Pos.Z > SurfaceAt(Pos.xy) - Band`; subtracting
 	// ComponentWorldOrigin.Z from both sides gives exactly the test below, with
 	// the subtraction done once on the CPU in double precision. So no float32
-	// precision is spent on this world's 84 km offset, and the two paths agree
-	// bit for bit rather than approximately.
+	// precision is spent on this world's 84 km offset, and the two paths evaluate
+	// the same plane from the same quantised coefficients. They agree to float32
+	// rounding on the two products, not bit-for-bit as the single-height form
+	// did -- a vertex sitting within an ULP of the band edge could in principle
+	// resolve differently on the two renderers. That is one vertex's tint at the
+	// boundary of a 2 m band, and the pooled path is the shipping renderer.
 	//
 	// 140.0/255.0 and 200.0 are quoted from the CPU constants on purpose; if
 	// either moves, both copies have to move together.
+	//
+	// THE REFERENCE IS A PLANE, added for task #44. It was one height sampled at
+	// the chunk CENTRE against this same fixed 2 m band, which is fine at L0
+	// (3.2 m chunk) and wrong by a factor of 32 at L5 (102.4 m chunk): on a slope
+	// most of a coarse chunk's sky-facing faces fell outside the band and lost
+	// the tint, and a HORIZONTAL cut through a tilted voxel staircase is a
+	// chevron -- the lattice measured in
+	// docs/measurements/hatching-lattice-diagnosis-2026-08-03.txt. The band is
+	// unchanged at 2 m on purpose: widening it with chunk size was the cheaper
+	// candidate and it would have paid for the slope with the cave guard.
+	//
+	// TRANSCRIPTION of VoxelClimate::UnpackSurfaceGradients / SurfaceZRelAt
+	// (VoxelClimateProbe.h), which is also what the component path evaluates on
+	// the CPU. Both halves of the mirror move together or the two renderers
+	// disagree about where the ground is. Packed 0 -- water's params, the pool's
+	// hidden entry, single-chunk mode -- decodes to a flat plane, i.e. to exactly
+	// the behaviour that was here before.
 	const uint QPositive = (Packed.x >> 4) & 0xfu;
 	const float kSurfaceBandUU = 200.0f;
-	const bool bNearSurface = Decoded.PositionUU.z > (ChunkSurfaceZRelUU - kSurfaceBandUU);
+	float SurfaceDZDX = 0.0f;
+	float SurfaceDZDY = 0.0f;
+	if (ChunkSurfaceGradPacked > 0.0f)
+	{
+		// Integer split. floor(x/4096) is also exact for a 12+12 field -- checked
+		// over all 4095 x 4095 packings, zero mismatches -- because the quotient
+		// needs exactly the 24 bits float32 has. This form does not depend on
+		// that coincidence and is cheaper. See VoxelClimateProbe.h.
+		const uint GradBits = (uint)ChunkSurfaceGradPacked;
+		SurfaceDZDX = (float((GradBits >> 12u) & 0xFFFu) - 2048.0f) / 256.0f;
+		SurfaceDZDY = (float(GradBits & 0xFFFu) - 2048.0f) / 256.0f;
+	}
+	const float SurfaceZHereRelUU = ChunkSurfaceZRelUU
+		+ SurfaceDZDX * Decoded.PositionUU.x
+		+ SurfaceDZDY * Decoded.PositionUU.y;
+	const bool bNearSurface = Decoded.PositionUU.z > (SurfaceZHereRelUU - kSurfaceBandUU);
 	const float FaceTint = (Axis == 2u) ? ((QPositive != 0u) ? 1.0f : 0.0f)
 	                                    : (140.0f / 255.0f);
 
