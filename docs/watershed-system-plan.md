@@ -419,6 +419,40 @@ Translucent overdraw is the render-thread risk (F7); the sheet adds draw
 calls proportional to *visible basins*, not world size, and work item 5's
 gate is a measured `VoxelPerfRun post-warmup` frame, not a component timing.
 
+**Correction, 2026-08-03 (work item 4).** Two claims in the R0 row above are
+wrong, and both were found by trying to photograph a lake rather than by
+reading:
+
+1. "`RefreshImplicitWater` ... will pick up lake/river cells the moment the
+   ImplicitFn includes them" — it does not consult the ImplicitFn at all; it
+   re-derives the ceiling itself and skipped cavern-less columns. Fixed at
+   `90686fa`.
+2. "its 192-brick/tick budget already bounds it" — the budget bounds the
+   brick COUNT, which was never the cost. A brick cost three full amplifier
+   columns per padded cell (1,000 of them) because the pad was built
+   z-outermost and every memo under it holds exactly one column; and 89% of
+   the bricks offered were lake interior that emits no faces by design. One
+   refresh of a 19.6 m lake was 38,025 candidates and 199 ticks, so every
+   capture landed mid-rebuild and photographed a partial sheet. Fixed at
+   `708f5a4`: 4,225 candidates, 23 ticks, 0 empty.
+
+**And a third thing this section does not account for at all: a still water
+surface does not render.** `ApplyWaterBrickPooled` puts the brick's foam
+activity in `ChunkParams.y`, the vertex factory writes that straight into
+vertex colour A, and the implicit path passes `Activity = 0` — correctly, since
+still water has no foam. But A is what makes water visible in `M_WaterVoxel`:
+with `Activity = 0` a provably complete, correctly placed 4,225-brick sheet
+2.4 m under the camera is invisible (`lake-still-water-activity0.png`), and the
+same frame with `Activity = 1` is covered edge to edge
+(`lake-still-water-activity1.png`). That A/B is a diagnostic, not a fix —
+shipping `Activity = 1` would put whitewater on every still lake, which is the
+thing the activity signal exists to prevent. **This affects every implicit
+water surface, not just baked lakes: cavern lakes are static and pass
+`Activity = 0` too.** The fix is a material change in `M_WaterVoxel` (give
+water a base appearance that does not depend on the foam channel), which is a
+`.uasset` authoring decision and deliberately not guessed at here. Work item 4
+is NOT complete until it lands, and work item 5 stays unstarted behind it.
+
 ### 5.3 Being in it
 
 Underwater/swim tests must consult actual water (CA fill, implicit field via
