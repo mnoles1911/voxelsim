@@ -308,6 +308,34 @@ def check_against_bake(q, land, dumps, tx0, ty0):
 
 # --------------------------------------------------------------------------- lakes
 
+def water_area_m2(b: dict) -> float:
+    """How much water this basin's surface actually covers, m^2.
+
+    NOT ``area_m2``, AND THIS IS A TRAP WORTH THE PARAGRAPH. The registry's
+    ``area_m2`` is the depression's area at its SPILL level -- the size of the
+    hole -- because that is what the registry is for. The water sits at
+    ``surface_m``, and for an endorheic basin those are wildly different
+    things: the largest lake in this world is 2,377 ha of BOWL holding 33 ha of
+    WATER, because its balance settles 549 m below its own outlet.
+
+    Using area_m2 as a lake area therefore overstates by 73x on that one basin
+    and by some amount on every basin that is not overflowing -- which is 8,374
+    of 21,942 of them. It read as plausible, which is what made it dangerous:
+    the number is real, it is just the answer to a different question.
+
+    The right answer is on the wire already: A(h) is the hypsometric curve the
+    balance was solved on, so the water area is that curve read at the surface.
+    For an overflowing lake surface == spill and this returns area_m2 exactly,
+    so there is one rule and not two.
+    """
+    lv = b.get("hyps_levels_m") or []
+    ar = b.get("hyps_areas_m2") or []
+    if len(lv) < 2:
+        return float(b["area_m2"]) if b["surface_m"] >= b["spill_m"] else 0.0
+    return float(np.interp(float(b["surface_m"]), np.asarray(lv, np.float64),
+                           np.asarray(ar, np.float64)))
+
+
 def load_dumps(dump_dir: pathlib.Path, consts):
     """Registered basins per tile, from lake_survey dumps, one bake version.
 
@@ -326,9 +354,12 @@ def load_dumps(dump_dir: pathlib.Path, consts):
     for r in lake_survey._load(dump_dir):
         vers.add(int(r["bake_version"]))
         fps.add(r.get("bake_fingerprint", ""))
+        rows = lake_survey._refilter(r, filt, wb)
+        for b in rows:
+            b["water_area_m2"] = water_area_m2(b)
         recs[(r["tile"][0], r["tile"][1])] = {
             "meta": r,
-            "basins": lake_survey._refilter(r, filt, wb),
+            "basins": rows,
             "npz": pathlib.Path(r["_path"]).with_suffix(".npz"),
         }
     if not recs:
@@ -498,11 +529,11 @@ def main() -> int:
             cy = int(round((ty - ty0) * tpx + b["seed_px"][1] * scale))
             if not (0 <= cx < W and 0 <= cy < H):
                 continue
-            r = max(np.sqrt(b["area_m2"] / np.pi) / px_m, 0.5)
+            r = max(np.sqrt(b["water_area_m2"] / np.pi) / px_m, 0.5)
             ki = KIND_ORDER.index(b["kind_name"])
             if r <= 0.5:
-                if b["area_m2"] > kind_area[cy, cx]:
-                    kind_idx[cy, cx], kind_area[cy, cx] = ki, b["area_m2"]
+                if b["water_area_m2"] > kind_area[cy, cx]:
+                    kind_idx[cy, cx], kind_area[cy, cx] = ki, b["water_area_m2"]
                 continue
             ri = int(min(np.ceil(r), 8))
             sub = (yy[8 - ri:9 + ri, 8 - ri:9 + ri] ** 2 +
@@ -512,9 +543,9 @@ def main() -> int:
             sm = sub[y0 - (cy - ri):sub.shape[0] - ((cy + ri + 1) - y1),
                      x0 - (cx - ri):sub.shape[1] - ((cx + ri + 1) - x1)]
             win = (slice(y0, y1), slice(x0, x1))
-            take = sm & (b["area_m2"] > kind_area[win])
+            take = sm & (b["water_area_m2"] > kind_area[win])
             kind_idx[win] = np.where(take, ki, kind_idx[win])
-            kind_area[win] = np.where(take, b["area_m2"], kind_area[win])
+            kind_area[win] = np.where(take, b["water_area_m2"], kind_area[win])
     for ki, k in enumerate(KIND_ORDER):
         m = kind_idx == ki
         if not m.any():
@@ -535,7 +566,7 @@ def main() -> int:
     FIG_W, FIG_H = 19.5, 15.2
     MAP_W = 0.585
     fig = plt.figure(figsize=(FIG_W, FIG_H), dpi=130)
-    axm = fig.add_axes([0.004, 0.300, MAP_W, 0.677])
+    axm = fig.add_axes([0.004, 0.330, MAP_W, 0.647])
     axm.imshow(np.clip(rgb, 0, 1), origin="upper", interpolation="nearest")
     axm.set_axis_off()
 
@@ -606,11 +637,11 @@ def main() -> int:
             f"{label} of {npool} with a raster here: ({tx},{ty}), {prov.lower()}\n"
             f"P/PET {pm / max(pet, 1):.2f}   {len(d['basins'])} basins, "
             f"{drawn} hold water\n"
-            f"15.36 km at {epx_m:.0f} m/px -- REAL extents", fontsize=8.6)
+            f"extents filled at {epx_m:.0f} m/px, the survey raster", fontsize=8.6)
         return drawn
 
     def wetness(kv):
-        return sum(b["area_m2"] for b in kv[1]["basins"] if b["kind"] >= bs.KIND_SEASONAL)
+        return sum(b["water_area_m2"] for b in kv[1]["basins"] if b["kind"] >= bs.KIND_SEASONAL)
 
     def dryness(kv):
         return sum(1 for b in kv[1]["basins"] if b["kind"] <= bs.KIND_SEASONAL)
@@ -644,15 +675,15 @@ def main() -> int:
         aa = 0.0
         for b in d["basins"]:
             n_by_kind[b["kind_name"]] += 1
-            a_by_kind[b["kind_name"]] += b["area_m2"]
+            a_by_kind[b["kind_name"]] += b["water_area_m2"]
             if b["kind"] >= bs.KIND_SEASONAL:
                 c += 1
-                aa += b["area_m2"]
+                aa += b["water_area_m2"]
         per_tile_lakes.append(c)
         per_tile_lake_ha.append(aa / 1e4)
     per_tile_lakes = np.array(per_tile_lakes)
     per_tile_lake_ha = np.array(per_tile_lake_ha)
-    lake_areas = np.array([b["area_m2"] for d in dumps.values()
+    lake_areas = np.array([b["water_area_m2"] for d in dumps.values()
                            for b in d["basins"] if b["kind"] >= bs.KIND_SEASONAL])
     surveyed_land_m2 = 0.0
     for (tx, ty) in dumps:
@@ -674,7 +705,7 @@ def main() -> int:
               label=f"{k:<17s} {n_by_kind[k]:>5,d}   {a_by_kind[k] / 1e4:>9,.0f} ha")
         for k in KIND_ORDER]
 
-    axl = fig.add_axes([0.603, 0.300, 0.393, 0.255])
+    axl = fig.add_axes([0.603, 0.330, 0.393, 0.235])
     axl.set_axis_off()
     l1 = axl.legend(handles=ch_handles, loc="upper left", fontsize=8.8,
                     title="CHANNELS -- PREDICTED, over all %d coarse tiles"
@@ -729,7 +760,9 @@ def main() -> int:
         f"              terrain and far less in deserts, so this network is Earth-like in the wet provinces and correctly sparse in the arid ones.\n"
         f"    CHECKED     {agree_line}\n"
         f"\n"
-        f"LAKE SPREAD over the {len(dumps)} baked tiles ({tile_km2:.0f} km2 each):\n"
+        f"LAKE SPREAD over the {len(dumps)} baked tiles ({tile_km2:.0f} km2 each).  AREA IS THE WATER SURFACE, read off each basin's own hypsometric curve\n"
+        f"    at its datum -- NOT the registry's area_m2, which is the size of the HOLE at its spill.  For an endorheic basin those differ enormously:\n"
+        f"    the biggest lake here is 2,377 ha of BOWL holding 33 ha of WATER, because its balance settles 549 m below its own outlet.\n"
         f"    per tile  water bodies (seasonal or wetter) {spread(per_tile_lakes, '{:.0f}')}      their area {spread(per_tile_lake_ha, '{:,.0f}')} ha\n"
         f"    per lake  area {spread(lake_areas / 1e4, '{:,.2f}')} ha.  A {px_m:.0f} m pixel is {px_m * px_m / 1e4:.1f} ha and the median water body is {np.median(lake_areas) / 1e4:.2f} ha,\n"
         f"              so ONE PIXEL IS VERY NEARLY TO SCALE.  Lakes are drawn at their own radius with a half-pixel floor -- no marker, no size\n"
