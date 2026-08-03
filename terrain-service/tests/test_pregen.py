@@ -695,13 +695,50 @@ def test_pregen_refuses_an_unreadable_identity_record(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_codec_raw_is_the_default():
+def test_resolve_codec_unspecified_stays_raw_even_though_the_cli_says_zstd():
+    """The FUNCTION's fallback and the CLI's default are deliberately different.
+
+    The CLI defaults to zstd (production stores at 33 MB, not 190). This
+    function must not: it is a library answering for a caller that expressed no
+    preference, CI deliberately does not install ``zstandard``, and CODEC_RAW is
+    the only answer that never needs an optional package. Keep them apart.
+    """
     from terrain_service import tile_codec as tc
     from terrain_service.pregen import _resolve_codec
 
     assert _resolve_codec("raw") == tc.CODEC_RAW
     assert _resolve_codec("") == tc.CODEC_RAW
     assert _resolve_codec(None) == tc.CODEC_RAW
+
+
+def test_cli_default_codec_is_zstd():
+    """Guards the owner's 2026-08-03 decision to store fine tiles compressed.
+
+    Asserted on the parser rather than by running a bake, so it holds on a box
+    without ``zstandard`` -- where the run would (correctly) refuse.
+    """
+    from terrain_service.pregen import build_parser
+
+    args = build_parser().parse_args(["--seed", "1", "--radius", "0"])
+    assert args.codec == "zstd"
+
+    # And the opt-out still works, because a box without zstandard needs one.
+    assert build_parser().parse_args(
+        ["--seed", "1", "--radius", "0", "--codec", "raw"]
+    ).codec == "raw"
+
+
+def test_codec_is_not_part_of_tile_identity():
+    """A RAW tile and a ZSTD tile of the same ground are the SAME world.
+
+    This is what makes the default switch safe for tiles already on disk: the
+    identity payload carries no codec, so nothing already baked is orphaned and
+    the client reads both. If a codec key ever appears here, every existing
+    fine tile silently leaves its own namespace.
+    """
+    from terrain_service.bake.pipeline import bake_identity_payload
+
+    assert not [k for k in bake_identity_payload() if "codec" in k.lower()]
 
 
 def test_resolve_codec_zstd_or_a_clear_refusal():

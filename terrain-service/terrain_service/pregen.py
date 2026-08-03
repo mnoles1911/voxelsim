@@ -739,6 +739,23 @@ def _resolve_codec(name: str) -> int | None:
     when ``zstandard`` is missing would write uncompressed tiles into a cache
     whose operator believes they are compressed, and the size only shows up
     later as a bandwidth bill. Ask for zstd and not have it: fail here.
+
+    **The CLI default became ``zstd`` on 2026-08-03** (owner's call: store at
+    33 MB, not 190). This function's own fallback for ``""``/``None`` stays
+    ``CODEC_RAW`` on purpose -- it is the library-safe answer for a caller that
+    expressed no preference, and CI deliberately does not install ``zstandard``.
+    The two are allowed to differ: the CLI is a production tool making a
+    production choice, the function is a library that must not require an
+    optional package to answer a question nobody asked.
+
+    CODEC IS NOT PART OF TILE IDENTITY. ``bake_identity_payload`` covers
+    ``bake_version``, ``stage_order``, ``geometry``, ``constants`` and
+    ``provinces`` -- no codec -- so a RAW tile and a ZSTD tile of the same
+    coordinates share a ``fine_provider_id`` and decode to identical planes.
+    That is what makes this switch safe for the tiles already on disk: nothing
+    is orphaned and the client reads both. It also means "same id implies same
+    bytes" is false across a codec change, which matters to anything that
+    treats the id as an ETag; the id addresses the WORLD, not the file.
     """
     from . import tile_codec as tc
 
@@ -748,9 +765,12 @@ def _resolve_codec(name: str) -> int | None:
     if name == "zstd":
         if not tc.HAVE_ZSTD:
             raise SystemExit(
-                "error: --codec zstd needs the 'zstandard' package, which is "
-                "not installed here. Install it, or pass --codec raw. Refusing "
-                "to silently write uncompressed tiles under a compressed flag."
+                "error: the fine-tier codec is 'zstd', which needs the "
+                "'zstandard' package, and it is not installed here. NOTE THAT "
+                "ZSTD IS THE DEFAULT as of 2026-08-03, so you can see this "
+                "without having passed --codec at all: either install "
+                "zstandard, or pass --codec raw explicitly. Refusing to "
+                "silently write uncompressed tiles under a compressed flag."
             )
         return tc.CODEC_ZSTD
     raise SystemExit(f"error: unknown --codec {name!r} (want 'raw' or 'zstd')")
@@ -825,7 +845,13 @@ def superblock_gate_verdict(
     )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from running it so DEFAULTS ARE TESTABLE.
+
+    Split out when the fine-tier codec default became ``zstd``: asserting a
+    default by reading ``--help`` text tests the sentence, not the value, and
+    the two drift. A test can now parse a minimal argv and read the field.
+    """
     parser = argparse.ArgumentParser(
         description="Pre-generate tiles for a given seed and launch radius"
     )
@@ -1086,16 +1112,19 @@ def main() -> int:
     parser.add_argument(
         "--codec",
         choices=("raw", "zstd"),
-        default="raw",
+        default="zstd",
         help=(
-            "Fine-tier block codec. 'raw' (default, and what every tile in "
-            "existence was written with) never depends on a compression "
-            "library. 'zstd' compresses ~6x (measured 201.4 -> 33.4 MB on tile "
-            "(-5,2), planes bit-identical on round trip) and needs the "
-            "'zstandard' package here plus a client that can decode it -- see "
-            "tools/fetch-zstd.ps1. There is deliberately no 'auto': a flag "
-            "that quietly fell back to raw would fill a cache with "
-            "uncompressed tiles its operator believed were compressed."
+            "Fine-tier block codec. 'zstd' is the DEFAULT as of 2026-08-03: it "
+            "compresses ~6x (measured 201.4 -> 33.4 MB on tile (-5,2), planes "
+            "bit-identical on round trip), which is the difference between "
+            "~58 GB and ~9.7 GB for a 289-tile world, and the owner chose to "
+            "store at 33 MB going forward. It needs the 'zstandard' package "
+            "here and a client that can decode it (tools/fetch-zstd.ps1). "
+            "'raw' never depends on a compression library and is what every "
+            "tile written before this date used; pass it explicitly on a box "
+            "without zstandard. There is deliberately no 'auto': a flag that "
+            "quietly fell back to raw would fill a cache with uncompressed "
+            "tiles its operator believed were compressed."
         ),
     )
     parser.add_argument(
@@ -1112,6 +1141,11 @@ def main() -> int:
         ),
     )
 
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.print_conditioning_digest:

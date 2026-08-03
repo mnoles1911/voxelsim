@@ -145,7 +145,16 @@ whenever doing so raises FPS.* Concretely:
 * **Rendering, and the water CA tick** (§4).
 
 Tiles are **content-addressed** (`fine_provider_id` = coarse provider id +
-`BAKE_VERSION` + bake fingerprint), so identical ids guarantee identical bytes.
+`BAKE_VERSION` + bake fingerprint), so identical ids guarantee identical
+**decoded planes**.
+
+Not identical *bytes*, and the difference now matters: the identity payload
+(`bake_version`, `stage_order`, `geometry`, `constants`, `provinces`) carries
+**no codec**, so the same tile stored `CODEC_RAW` and `CODEC_ZSTD` shares one
+id and two different files. That is deliberate — it is what lets the codec
+default change without orphaning a single baked tile — but anything treating
+the id as an ETag or a byte-level checksum must key on `(id, codec)` instead.
+The id addresses the world, not the file.
 That makes them cacheable, CDN-able, and shareable across every player on the
 seed — the marginal cost of the Nth visitor is a cache hit.
 
