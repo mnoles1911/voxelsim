@@ -59,13 +59,31 @@ this script against the converted file. This mirrors gen_terrain_textures.py
 numpy nor Pillow, so any pixel-format conversion has to happen outside the
 editor's Python before this script runs.
 
-NOTE: there is no sky material yet, and none of this repo's
-create_*_material.py scripts (create_voxel_material.py, create_ocean_material.py,
-create_water_voxel_material.py, create_clipmap_material.py -- all terrain/water)
-makes one. These textures have nowhere to render once imported. If nothing
-shows up on screen after running this script, that is expected -- it is not
-evidence the import failed. Check the log output (or the asset registry)
-for the actual pass/fail signal, not the viewport.
+THIS SCRIPT IS NOW LOAD-BEARING, AND IT WAS NOT WHEN IT WAS WRITTEN. The
+original text here said there was no sky material and that these textures had
+"nowhere to render once imported". befb438/2284c5e made that false: they shipped
+M_NightSky and M_SkyAtmosphereDome (built by create_sky_material.py and
+create_sky_atmosphere_dome_material.py), and both hold hard package references
+to /Game/Voxel/T_SkyStarmap -- M_NightSky also to /Game/Voxel/T_MoonColor.
+
+So skipping this script no longer costs nothing; it costs the stars and the
+moon. And because the .uassets this writes are gitignored build output
+(.gitignore:82-84 -- T_SkyStarmap alone is 38.8 MB), EVERY checkout starts with
+the materials present and the textures absent. Observed 2026-08-02: a checkout
+where only fetch-sky-assets.ps1 had been run rendered a starless night sky while
+logging "VoxelSky clock RESOLVED" perfectly happily. The signal was:
+
+    LogMaterial: Warning: M_NightSky: Requesting an invalid TextureIndex! (1 / 1)
+    LoadErrors: ... /Game/Voxel/M_NightSky, a dependent package
+                /Game/Voxel/T_SkyStarmap was not available.
+
+WHY NOTHING CATCHES THAT FOR YOU. VoxelSkyDomeActor.cpp:135-141 guards the
+MATERIALS -- a missing material sets bAtmosphereMaterialValid false and
+ApplyDomeCvars then refuses to show the dome at all (:341), loudly. That guard
+does not extend to textures: a material with an unresolved texture reference
+still loads as an object, so the guard passes and the IsSky dome is shown
+anyway. A missing texture is therefore a SILENT degrade, where a missing
+material is a refusal. Grep for 'invalid TextureIndex' to tell them apart.
 """
 
 import os
@@ -171,11 +189,12 @@ def main():
             % (len(failures), len(SPECS), ", ".join(failures)))
 
     unreal.log(
-        "import_sky_textures: all %d textures imported. NOTE -- there is no "
-        "sky material yet (none of create_voxel_material.py / "
-        "create_ocean_material.py / create_water_voxel_material.py / "
-        "create_clipmap_material.py makes one), so these textures have "
-        "nowhere to render. That is expected." % len(SPECS))
+        "import_sky_textures: all %d textures imported. These ARE rendered: "
+        "M_NightSky samples T_SkyStarmap and T_MoonColor, M_SkyAtmosphereDome "
+        "samples T_SkyStarmap. If a run logs 'M_NightSky: Requesting an "
+        "invalid TextureIndex' or 'T_SkyStarmap ... was not available', the "
+        "import did not reach that checkout -- the .uassets are gitignored "
+        "build output, so re-run this script there." % len(SPECS))
 
 
 main()
