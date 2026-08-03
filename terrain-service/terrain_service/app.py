@@ -45,6 +45,12 @@ Configuration via environment:
                        UNPINNED/UNVERIFIED defaults, which is fine for
                        TERRAIN_DIFFUSION_DRY_RUN=1 but is refused for a real
                        (non-dry-run) call.
+
+The first tile this server GENERATES for a world (as opposed to serves from
+cache) writes or confirms that world's ``world-identity.json`` -- what
+checkpoint, what conditioning bytes, what version made it. A request that
+would add tiles under an identity the world disagrees with fails with 500
+instead of appending them. See world_manifest.py.
 """
 
 from __future__ import annotations
@@ -117,6 +123,22 @@ def create_app(provider=None, cache: TileCache | None = None) -> Flask:
     )
     cache = cache or TileCache(os.environ.get("TERRAIN_CACHE_DIR", "tile-cache"))
 
+    #: (provider_id, seed) -> the verdict from world_manifest, computed once.
+    _identity_verdicts: dict[tuple[str, int], tuple[bool, str]] = {}
+
+    def _world_identity(seed: int) -> tuple[bool, str]:
+        key = (provider.provider_id, seed)
+        if key not in _identity_verdicts:
+            from .world_manifest import record_world_identity
+
+            verdict = record_world_identity(
+                cache, provider, seed, provider.provider_id
+            )
+            if verdict[1]:
+                app.logger.warning("world identity: %s", verdict[1])
+            _identity_verdicts[key] = verdict
+        return _identity_verdicts[key]
+
     @app.get("/healthz")
     def healthz() -> dict:
         return {"ok": True, "provider": provider.provider_id}
@@ -137,6 +159,17 @@ def create_app(provider=None, cache: TileCache | None = None) -> Flask:
 
         data = cache.get(provider.provider_id, seed, x, y, scale)
         if data is None:
+            # ADDING to a world, which is the moment its identity has to be on
+            # record and has to agree. This server is the "keeps generating for
+            # years" half of docs/world-generation-architecture.md: the tile it
+            # writes in 2027 must have come from the same inputs as the one it
+            # wrote in 2026, and nothing else downstream can tell. Checked only
+            # on the write path (a cache hit adds nothing to the world) and
+            # memoised per (namespace, seed), so it costs one hash pass over
+            # the conditioning rasters per seed per process.
+            ok, msg = _world_identity(seed)
+            if not ok:
+                abort(500, msg)
             data = tile_codec.encode(provider.generate(seed, x, y, scale))
             cache.put(provider.provider_id, seed, x, y, scale, data)
         return Response(

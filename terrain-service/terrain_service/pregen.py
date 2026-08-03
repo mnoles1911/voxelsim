@@ -28,6 +28,25 @@ order-independent. An on-demand frontier that bakes a tile the moment its ring
 lands would build each superblock from whatever happened to exist at that
 moment, and since a shipped tile is never regenerated, that choice is
 permanent. See ``pipeline.HYDROLOGY_RESIDUALS`` #1.
+
+EVERY MODE RECORDS THE WORLD'S IDENTITY
+---------------------------------------
+Before the first tile, each mode writes (or confirms) ``world-identity.json``
+in the world directory it is about to write into -- coarse mode under
+``provider_id``, bake mode under ``fine_provider_id``, since those are two
+different worlds' worth of artifacts. It carries the checkpoint sha256, the
+conditioning digest, the sha256 of each conditioning file, the
+terrain-diffusion version and a timestamp, and a run whose identity disagrees
+with a world that already has one is refused before it generates anything.
+
+Automatic, with no flag to forget: the 289-tile world that can never be
+extended was lost because nobody wrote this down at the time. See
+``world_manifest.py``,
+docs/measurements/world-identity-not-reproducible-2026-08-03.txt (the
+cross-machine finding) and
+docs/measurements/etopo-build-not-reproducible-2026-08-02.txt (why the two
+built conditioning files have no builder, and why that turned out NOT to be
+what froze that particular world).
 """
 
 from __future__ import annotations
@@ -41,6 +60,7 @@ from pathlib import Path
 from . import tile_codec
 from .cache import TileCache
 from .app import _make_provider
+from .world_manifest import record_world_identity
 
 
 #: The bake reads coarse tiles from the same namespace it writes the fine tier
@@ -151,6 +171,25 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
     return enc(**kwargs)
 
 
+def _record_identity(cache: TileCache, provider, seed: int, namespace_id) -> bool:
+    """Record (or confirm) what made this world, and say so on stderr.
+
+    Not a flag. The world that cannot be extended today was lost to a bring-up
+    that had no reason to think of this, and any switch this needed would have
+    been off that day too -- see world_manifest.py.
+    """
+    ok, msg = record_world_identity(cache, provider, seed, namespace_id)
+    if msg:
+        print(msg, file=sys.stderr)
+    if not ok:
+        print(
+            "Refusing to write into a world whose identity this run does not "
+            "match. Nothing has been generated.",
+            file=sys.stderr,
+        )
+    return ok
+
+
 def _run_bake(args, provider, cache: TileCache) -> int:
     """Bake mode: coarse pass, then hydrology pass, then the tiles.
 
@@ -177,6 +216,12 @@ def _run_bake(args, provider, cache: TileCache) -> int:
     # method; the provider snapshots it at construction the way it does
     # provider_id, so a config mutated afterwards cannot repoint a live cache.)
     fine_provider_id = provider.fine_provider_id
+
+    # The fine tier is its OWN world directory (bake identity included), so it
+    # carries its own identity record -- and it records the coarse provider_id
+    # it was baked from, which the directory name alone only half tells you.
+    if not _record_identity(cache, provider, args.seed, fine_provider_id):
+        return 1
 
     if args.scale != COARSE_SCALE:
         print(
@@ -756,7 +801,12 @@ def main() -> int:
             "COMPATIBILITY ONLY: write into an existing cache namespace "
             "verbatim (e.g. resume tiles generated under the pre-v2 "
             "provider_id). Defeats every identity guarantee -- see "
-            "DiffusionConfig.provider_id_override."
+            "DiffusionConfig.provider_id_override. It is NOT a way to resolve "
+            "an identity mismatch: the world's own world-identity.json still "
+            "records the checkpoint and conditioning hashes this run actually "
+            "has, and still refuses when they disagree. Forcing two different "
+            "generations into one namespace gives one world with a seam in it "
+            "and no error anywhere -- see world_manifest.py."
         ),
     )
     parser.add_argument(
@@ -874,6 +924,9 @@ def main() -> int:
 
     if args.mode == "bake":
         return _run_bake(args, provider, cache)
+
+    if not _record_identity(cache, provider, args.seed, provider.provider_id):
+        return 1
 
     # Generate tile coordinates in (2*radius+1)^2 square
     tiles_to_generate = []

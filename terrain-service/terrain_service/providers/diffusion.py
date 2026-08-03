@@ -1143,13 +1143,21 @@ def verify_checkpoint_sha256(path: "str | Path", expected: str) -> None:
 # At bring-up it downloads the WorldClim 2.1 10-arc-minute bio rasters and
 # reads data/global/etopo_10m.tif; synthetic_map._compute_map_stats derives
 # statistics from them that CONDITION generation. Those files are generation
-# inputs with none of the checkpoint's protections: tools/fetch_etopo.py
-# builds etopo_10m.tif by resampling whichever NOAA product was reachable
-# (its candidate list spans a _bed and a _surface variant), so two boxes can
-# easily hold different bytes. Before this, that produced different terrain
-# under an IDENTICAL provider_id -- silently, into one cache namespace, and
-# stamped identically into edit logs, so EditLog::checkProvider() could not
+# inputs with none of the checkpoint's protections: etopo_10m.tif used to be
+# BUILT per box by tools/fetch_etopo.py, resampling whichever NOAA product was
+# reachable (its candidate list spanned a _bed and a _surface variant), so two
+# boxes easily held different bytes. Before this, that produced different
+# terrain under an IDENTICAL provider_id -- silently, into one cache namespace,
+# and stamped identically into edit logs, so EditLog::checkProvider() could not
 # see the very divergence it exists to refuse.
+#
+# Since 2026-08-02 the six files are PINNED BYTES obtained by
+# tools/fetch_conditioning.py and verified against
+# data/conditioning-artifacts.json, because the canonical etopo_10m.tif turned
+# out never to have been a build output at all and could not be rebuilt by any
+# settings -- see terrain_service/conditioning_artifacts.py. This digest is
+# still the thing that decides identity; the pins are how a second box gets
+# into a position to compute the same one.
 # ---------------------------------------------------------------------------
 
 
@@ -1169,8 +1177,9 @@ class ConditioningDataMissing(FileNotFoundError):
             "to compute a conditioning digest (and therefore refusing to claim a "
             "provider identity) for data this process cannot see. These rasters "
             "condition generation via terrain_diffusion's synthetic_map."
-            "_compute_map_stats. Run the pipeline once to fetch WorldClim, then "
-            "`python tools/fetch_etopo.py` from terrain-service/, or point "
+            "_compute_map_stats. Run `python tools/fetch_conditioning.py` from "
+            "terrain-service/ to obtain the PINNED bytes -- it verifies every "
+            "file's sha256 and fails rather than substituting -- or point "
             "TERRAIN_CONDITIONING_ROOT at the directory that has them."
         )
 
@@ -1214,13 +1223,38 @@ def compute_conditioning_digest(
     Raises ``ConditioningDataMissing`` if any listed file is absent -- see
     that exception for why refusing beats inventing.
     """
+    digests = conditioning_file_digests(files, root)
+    lines = [f"{n}:{digests[n]}" for n in sorted(files)]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def conditioning_file_digests(
+    files: "tuple[str, ...] | list[str]" = DEFAULT_CONDITIONING_FILES,
+    root: "str | Path | None" = None,
+) -> dict[str, str]:
+    """Per-file sha256 of the conditioning rasters: ``{relative name: sha256}``.
+
+    The same bytes ``compute_conditioning_digest`` folds into one number, kept
+    ITEMISED. The digest alone answers "is this the same conditioning data?";
+    it cannot answer "which file moved?", and on 2026-08-03 that second
+    question was the whole investigation -- four of the six files matched
+    across machines and the two that did not were exactly the two
+    ``tools/bootstrap_pod.sh`` BUILDS rather than downloads
+    (``etopo_10m.tif``, and the ``synthetic_map_stats.json`` derived from it).
+    Recovering that took a manual hash-by-hash comparison against a pod that
+    no longer exists. ``world_manifest`` records this mapping with every world
+    so the next such comparison is a diff of two files already on disk.
+
+    Raises ``ConditioningDataMissing`` for the same reason the digest does:
+    inventing an identity for data this process cannot see is the failure
+    mode, not the safety net.
+    """
     resolved = resolve_conditioning_root(root)
-    names = sorted(files)
+    names = sorted(set(files))
     missing = [n for n in names if not (resolved / n).is_file()]
     if missing:
         raise ConditioningDataMissing(resolved, missing)
-    lines = [f"{n}:{_sha256_of_file(resolved / n)}" for n in names]
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return {n: _sha256_of_file(resolved / n) for n in names}
 
 
 def verify_conditioning_digest(
@@ -1248,11 +1282,14 @@ def verify_conditioning_digest(
         raise ValueError(
             f"conditioning data mismatch under {str(resolve_conditioning_root(root))!r}: "
             f"config pins {config.conditioning_digest!r}, this box has {actual!r} -- "
-            "refusing to generate. The most likely cause is a different ETOPO source: "
-            "tools/fetch_etopo.py tries several NOAA URLs including both a '_bed' and "
-            "a '_surface' variant, so whichever was reachable decides the bytes. Copy "
-            "the canonical data/global across, or mint a new DiffusionConfig with the "
-            "new digest (this rolls provider_id, so the two tile sets never collide)."
+            "refusing to generate. Run `python tools/fetch_conditioning.py "
+            "--verify-only` from terrain-service/: it names WHICH of the six files "
+            "differs and prints both hashes, which is the fact worth having (knowing "
+            "the digest moved is not). The usual cause is a locally BUILT "
+            "etopo_10m.tif or a synthetic_map_stats.json derived from one -- neither "
+            "reproduces the pinned bytes. Fix the data, or mint a new DiffusionConfig "
+            "with the new digest (this rolls provider_id, so the two tile sets never "
+            "collide). Do NOT use provider_id_override to force the old namespace."
         )
 
 

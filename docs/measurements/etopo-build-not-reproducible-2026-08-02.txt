@@ -1,0 +1,212 @@
+etopo_10m.tif was never a build output
+======================================
+2026-08-02.  Box: the 2026-08-02 Windows workstation.  No GPU used.
+
+FOLLOWS ON FROM
+---------------
+    docs/measurements/world-identity-not-reproducible-2026-08-03.txt
+
+which is the pod measurement that started this: same seed, same commit, same
+checkpoint bundle, different world on a different machine. Read that one first.
+This document is the forensics on its two suspect files, and FINDING 3 below
+CORRECTS its attribution of the frozen 289-tile world. The two are halves of
+one investigation, not rival accounts.
+
+WHY THIS WAS MEASURED
+---------------------
+The same seed + same code + same checkpoint bundle produced a different world
+on a fresh pod. Of the six files compute_conditioning_digest() hashes, the four
+downloaded WorldClim rasters were byte-identical everywhere and the two that
+bootstrap_pod.sh BUILDS were not:
+
+    etopo_10m.tif             9a45dd6dc5b0959c  9,344,975 B  here
+                              3a0e8ebe4d54b15c  8,442,844 B  on a fresh pod
+    synthetic_map_stats.json  8fe9d083f10a0daf     12,297 B  here
+                              2dd3181f0ca32210     12,570 B  on a fresh pod
+
+The standing hypothesis (bootstrap_pod.sh section 7, written 2026-08-02) was
+that fetch_etopo.py drifts because it tries four NOAA URLs -- including both a
+_bed and a _surface variant of ETOPO 2022 -- and then resamples through
+whatever rasterio/GDAL the pod resolved, whose TIFF writer defaults are not
+stable across versions. The proposed fix was to pin the URL, pin the
+resampling, and strip metadata; failing that, publish the pair as an artifact.
+
+This measurement was taken to choose between those two. It found a third thing.
+
+FINDING 1: THE CANONICAL FILE WAS NOT PRODUCED BY fetch_etopo.py, AND CANNOT BE
+-------------------------------------------------------------------------------
+Read straight out of the file's own TIFF tags (tifffile, no rasterio needed):
+
+  a) IT IS UNCOMPRESSED.  Compression tag = NONE.
+       2160 x 1080 x float32          = 9,331,200 B
+       + tags (1080 strip offsets +
+         1080 strip byte counts +
+         geokeys + header)            =    13,775 B
+       ------------------------------------------
+       total                          = 9,344,975 B   <- exactly its length
+
+     fetch_etopo.py has always written compress="deflate". Deflate of these
+     very pixels is 7,439,420 B, and that number barely moves across zlib
+     levels 1-9 (7,463,877 at level 1, 7,459,283 at level 9). There is no
+     compression setting that makes a deflate writer emit 9,344,975 B.
+
+  b) IT CARRIES ETOPO'S OWN GEOREFERENCING, not WorldClim's.
+       etopo_10m.tif        GeoAsciiParams 'WGS 84 + EGM2008 height|WGS 84|
+                                            EGM2008 height|'
+                            GDAL_NODATA    '-99999'
+                            ModelPixelScale z = 1.0
+       wc2.1_10m_bio_1.tif  GeoAsciiParams 'WGS 84|'
+                            GDAL_NODATA    '-3.39999999999999996e+038'
+                            ModelPixelScale z = 0.0
+
+     fetch_etopo.py writes profile = ref.profile.copy() taken from
+     wc2.1_10m_bio_1.tif. A copied profile carries the REFERENCE's CRS and
+     nodata. It cannot emit the source's vertical datum. No URL choice, GDAL
+     version, resampling kernel or compression setting changes that.
+
+  c) IT PREDATES THE SCRIPT BY 24 DAYS.
+       etopo_10m.tif mtime      2026-06-28 17:00:03
+       fetch_etopo.py first commit 66aecae, 2026-07-22 03:08:35
+
+     The file is a hand-made gdal_translate/gdalwarp downsample. The script was
+     written later, to describe what had been done, and does not match it.
+
+  Which ETOPO product: _bed, confirmed from the pixels.
+       Greenland centre  (72N, 40W)   -151.5 m   (_surface reads about +3000)
+       West Antarctica   (78S, 100W) -1360.2 m   (_surface reads about +1800)
+       East Antarctica   (80S, 90E)   +463.2 m
+       Amazon            (0, 60W)     +125.0 m
+       full range        -10721.4 .. +7562.2 m
+
+FINDING 2: THE POD'S COPY DIFFERS IN PIXELS, NOT JUST IN CONTAINER
+------------------------------------------------------------------
+If the pod's 8,442,844 B file held the same elevations in a different
+container, some codec applied to the canonical pixels would land on that
+length. None does. Same array, written by tifffile at rowsperstrip=1:
+
+    deflate                  7,439,420
+    deflate + predictor 3    6,011,456
+    LZW + predictor 3        7,473,209
+    no compression           9,337,952
+    LZW                      9,153,174
+    packbits                 9,413,552
+    ---------------------------------
+    POD FILE                 8,442,844   <- matches none of them
+
+8,442,844 sits between deflate and no-compression of the canonical pixels, and
+deflate is monotone enough in zlevel (7.46 M .. 7.44 M) to rule the whole
+family out. The pod's raster holds DIFFERENT ELEVATIONS -- consistent with a
+different source product and/or a different resampling path, i.e. the original
+URL-list hypothesis, which is real but is only the second-largest effect.
+
+CONSEQUENCE FOR THE FIX
+-----------------------
+"Make the build byte-deterministic" cannot recover the shipping world, because
+the shipping world's bytes were never a build output. Determinism is still
+worth having -- two pods asked to build the same NEW world must not get two --
+but the pinned artifact is not a fallback for a hard-to-determinise build. It
+is the only representation these two files have.
+
+FINDING 3: THE FROZEN 289-TILE WORLD IS NOT RECOVERABLE, AND CONDITIONING IS
+NOT WHY
+---------------------------------------------------------------------------
+tile-cache/manifest.json records provider_id
+terrain-diffusion-unlabeled-71e2b362e3241e71 with checkpoint_sha256
+bf4ad0b6...4518b and seed 424242, so provider_id() can be re-derived on the CPU
+and checked against candidate inputs. Swept:
+
+  * 4 candidate synthetic_map_stats.json copies found anywhere on the box
+    (12,297 B 8fe9d083 current; three 13,058 B a1d3a1ab copies from 2026-06-28
+    under D:\terrain-diffusion\{,trace\,trace_singletile\}) x the one
+    etopo_10m.tif that exists x the four WorldClim rasters;
+  * 67 commits across ALL branches since 2026-07-15 that touched
+    terrain-service/terrain_service/ (git archive per commit, so world_shape,
+    CLIMATE_CALIBRATION, _tile_format_fingerprint and IDENTITY_SCHEMA_VERSION
+    all move with the revision);
+  * 4 config variants each (defaults, climate_calibration off, on, scale 8).
+
+  Result: 58 distinct provider_ids. 71e2b362e3241e71 is NOT AMONG THEM.
+
+  The current pair reproduces 71c23145bb325579 (confirming the brief's number
+  and the method). The 2026-06-28 stats copies give 612edc5169c76948.
+
+The conditioning side is ruled out as the cause of THIS world's loss:
+etopo_10m.tif has not changed since 2026-06-28 and synthetic_map_stats.json has
+not changed since 2026-08-01 17:45, while the EARLIEST tile in the frozen
+world's seed directory was written 2026-08-01 20:16:59 (the directory's own
+mtime, 23:43, is when the bake finished, not when it started; the earlier
+number is the one that matters, and it is still two and a half hours after the
+stats file settled). So the conditioning digest at bake time was c49e052e...,
+the same value this box computes today. Meanwhile the last commit that could
+have changed the identity payload before the bake (56257c8, climate calibration
+re-fit) landed at 2026-08-01 20:12:13 -- FOUR MINUTES AND FORTY-SIX SECONDS
+before the first tile -- and already yields 71c23145bb325579, not
+71e2b362e3241e71.
+
+That four-minute gap is worth stating precisely rather than rounding: it is far
+too short for another commit to have landed in between, which is exactly why
+the working tree, and not any committed revision, has to be where the missing
+identity came from.
+
+So the frozen world was baked from a working tree whose identity-bearing code
+was never committed. That is a different failure from the one this task set out
+to fix, it is not fixed by pinning artifacts, and no artifact on this box can
+undo it. The nine owner-approved vistas cannot be recovered by re-deriving the
+world; they can only be re-approved against a new one.
+
+WHAT WAS DONE ABOUT IT
+----------------------
+  * data/conditioning-artifacts.json  -- sha256 + size pinned for all SIX
+    conditioning files, not just the two flaky ones, with the measured reason
+    per file and an explicitly OPEN hosting decision for the two built ones.
+  * terrain_service/conditioning_artifacts.py -- pure verdict over the pins;
+    digest_from_pins() derives the expected conditioning_digest WITHOUT the
+    files, and a test asserts it equals compute_conditioning_digest().
+  * tools/fetch_conditioning.py -- verify, download-with-sha-check, and FAIL
+    with a per-file report. --expect-provider-id answers "can this box extend
+    that world?" in one second, on the CPU.
+  * tools/fetch_etopo.py -- one pinned URL (no fallback list), explicit nodata
+    through the reproject, every GTiff creation option stated, PAM disabled,
+    and it now REFUSES to run without --i-am-starting-a-new-world.
+  * bootstrap_pod.sh section 7 -- builds nothing it can download, and dies
+    instead of warning.
+
+RESOLVED 2026-08-03: WHERE THE BYTES LIVE
+-----------------------------------------
+The hosting decision that this document left open has been made and carried
+out. Recorded in the "hosting" block of data/conditioning-artifacts.json:
+
+  * etopo_10m.tif and synthetic_map_stats.json are assets on the DEDICATED
+    release tag `conditioning-v1`:
+        https://github.com/mnoles1911/voxelsim/releases/tag/conditioning-v1
+    Not a code release; the tag is never advanced. These two have no upstream
+    publisher and no builder that reproduces them, so that release is their
+    only representation.
+  * The four WorldClim rasters keep UPSTREAM's zip URL, addressed as
+    `<zip-url>#<member>` and extracted once per run. Deliberately NOT mirrored:
+    worldclim.org says "Redistribution or commercial use is not allowed without
+    prior permission", and a public release asset is redistribution.
+  * REJECTED: committing the 9,344,975 B binary, and git-lfs. Both are
+    permanent in every clone forever; lfs adds a quota that can silently stop
+    serving.
+
+The pin, not the host, is what makes this safe. A GitHub tag is mutable and
+upstream can re-cut a zip; neither matters, because fetch_conditioning.py
+hashes what arrived BEFORE installing it, and never overwrites a file that is
+present and wrong.
+
+VERIFIED END TO END, 2026-08-03. From an empty directory, with no conditioning
+data of any kind:
+
+    python tools/fetch_conditioning.py --root <empty dir>
+
+fetched all six, and the production compute_conditioning_digest() over the
+result returned
+
+    c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2
+
+giving, with checkpoint bc5cb9d75e3bbe39e8d38c71934fb4560558125ae4cc2803317a5c-
+7a5313ae1d, provider_id terrain-diffusion-unlabeled-80b9ca451a23eae4.
+
+A fresh pod can now reproduce that world. The 289-tile world remains frozen for
+the separate reason in FINDING 3, and nothing here changes that.

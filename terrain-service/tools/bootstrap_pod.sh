@@ -29,6 +29,15 @@
 #   CKPT_REPO     HF bundle id                   (default xandergos/terrain-diffusion-30m)
 #   PROBE_SEED    seed used for the probe tile   (default 20260719)
 #   ALLOW_SMALL_DISK=1   skip the 60 GB check (you will regret this)
+#   EXPECT_PROVIDER_ID   the world this pod must be able to EXTEND. Step 7
+#                        computes the provider_id this pod's artifacts +
+#                        checkpoint would generate, and DIES if it differs.
+#                        Set it whenever the pod is meant to add tiles to an
+#                        existing world -- the alternative is finding out after
+#                        the bake, when the only remaining "fix" is
+#                        --provider-id-override, which is not a fix: it puts
+#                        two different planets in one namespace with a seam in
+#                        the middle and no error anywhere.
 
 set -euo pipefail
 
@@ -284,75 +293,113 @@ echo "export CKPT_SHA=\"$SHA\"" >> "$ENV_FILE"
 ok "checkpoint sha256 $SHA"
 
 # ---------------------------------------------------------------------------
-# 7. WorldClim + ETOPO reference rasters
+# 7. conditioning data -- PINNED BYTES, verified, or this pod stops here
+#
+# This step used to BUILD two of the six files compute_conditioning_digest()
+# hashes, and that is why a world could not be extended by a second machine.
+# Measured on a fresh pod, 2026-08-03
+# (docs/measurements/world-identity-not-reproducible-2026-08-03.txt):
+#
+#     etopo_10m.tif            9,344,975 B here vs 8,442,844 B on the pod
+#     synthetic_map_stats.json    12,297 B      vs    12,570 B
+#
+# -- which moves the conditioning digest, which moves provider_id, which makes
+# the new tiles a different world.
+#
+# The 2026-08-02 diagnosis went further than "the build drifts", and the
+# finding changed the fix (docs/measurements/etopo-build-not-reproducible-
+# 2026-08-02.txt, and the module docstring of
+# terrain_service/conditioning_artifacts.py):
+#
+#   THE SHIPPING WORLD'S etopo_10m.tif WAS NEVER A BUILD OUTPUT. It is
+#   uncompressed (2160x1080 float32 = 9,331,200 B + 13,775 B of tags is exactly
+#   its length) and carries ETOPO's own vertical datum -- "WGS 84 + EGM2008
+#   height", GDAL_NODATA -99999 -- neither of which fetch_etopo.py can emit,
+#   because it copies its profile from wc2.1_10m_bio_1.tif and writes deflate.
+#   Its mtime also predates fetch_etopo.py's first commit by 24 days.
+#
+# So pinning the build was never going to recover it. The two files have to be
+# DOWNLOADED as artifacts, exactly the way the checkpoint already is, and that
+# is what tools/fetch_conditioning.py does: hash what is here against
+# data/conditioning-artifacts.json, fetch what is missing from the pinned URLs,
+# verify the sha256 of what arrived, and EXIT NON-ZERO -- naming every file and
+# both hashes -- if the result is not byte-for-byte the pinned set.
+#
+# THE HOSTING DECISION WAS MADE ON 2026-08-03, and it is recorded in the
+# "hosting" block of data/conditioning-artifacts.json rather than only here:
+#
+#   * etopo_10m.tif and synthetic_map_stats.json are assets on the DEDICATED
+#     release tag conditioning-v1. Not a code release, never advanced. These
+#     two have no upstream publisher and no builder that reproduces them, so
+#     that release is their only representation.
+#   * The four WorldClim rasters keep UPSTREAM's own zip URL, addressed as
+#     "<zip-url>#<member>". They are deliberately NOT mirrored: worldclim.org
+#     says "Redistribution or commercial use is not allowed without prior
+#     permission", and a public release asset is redistribution.
+#
+# Committing the 9 MB binary, or git-lfs, were both rejected: permanent in
+# every clone forever, and lfs adds a quota that can silently stop serving.
+#
+# The pin, not the host, is what makes any of this safe. A GitHub tag is
+# mutable and upstream can re-cut a zip; neither matters, because every file is
+# hashed BEFORE it is installed. A fresh pod can now reproduce the pinned world
+# from nothing -- verified end to end into an empty directory on 2026-08-03,
+# digest c49e052e..., provider_id ...80b9ca451a23eae4.
 # ---------------------------------------------------------------------------
-say "7/8 reference rasters (WorldClim + ETOPO)"
+say "7/8 conditioning data (pinned artifacts)"
 mkdir -p data/global
 
-if have rasters && [ -f data/global/etopo_10m.tif ]; then
-  ok "data/global/etopo_10m.tif already built"
-else
-  # WorldClim auto-downloads on first pipeline run and PROMPTS FOR CONSENT
-  # on stdin -- which hangs an unattended script forever. `yes` answers it.
-  #
-  # CALL THE DOWNLOADER DIRECTLY, do not run an inference probe for its side
-  # effect. This used to be `probe_tile.py ... || true`, relying on the probe
-  # failing LATE -- after _compute_map_stats had fetched WorldClim on its way
-  # to the missing ETOPO file. That stopped working when identity schema v2
-  # (2026-07-22) added the conditioning gate: probe_tile.py builds a
-  # DiffusionConfig with no conditioning_digest, so it defaults to UNVERIFIED
-  # and verify_conditioning_digest refuses BEFORE any download happens. The
-  # `|| true` swallowed it and the next line died with "WorldClim did not
-  # land", with nothing in the log explaining why. A fresh pod could not
-  # bootstrap at all.
-  #
-  # _ensure_wc_files is the function whose entire job is this download. It
-  # has no identity gate and nothing to regress when the schema changes again.
-  if [ ! -f data/global/wc2.1_10m_bio_1.tif ]; then
-    say "    downloading WorldClim (a few hundred MB)"
-    yes | timeout 3600 python3 -c \
-      'from terrain_diffusion.inference.synthetic_map import _ensure_wc_files; _ensure_wc_files()' \
-      || true
-  fi
-  [ -f data/global/wc2.1_10m_bio_1.tif ] \
-    || die "WorldClim did not land in $TS_DIR/data/global/.
-    The warm-up run should have fetched it. Check $LOG for what it did
-    instead -- if it prompted for something other than consent, answer it
-    once by hand with:  cd $TS_DIR && python3 tools/probe_tile.py $CKPT_DIR $SHA"
-
-  # terrain-diffusion's synthetic_map._compute_map_stats opens the RELATIVE
-  # path data/global/etopo_10m.tif. Its README tells you to download NOAA's
-  # 30 arc-SECOND GeoTIFF, but the filename it reads is a 10 arc-MINUTE
-  # downsample that NOAA does not publish -- so it has to be built.
-  python3 tools/fetch_etopo.py \
-    || die "ETOPO build failed. tools/fetch_etopo.py prints a manual
-    download fallback; follow it, then re-run this script."
-  mark rasters
-  ok "data/global/etopo_10m.tif built"
-fi
-
-# The DERIVED conditioning cache -- quantile tables built from the five
-# rasters above. It is in DEFAULT_CONDITIONING_FILES, so the digest (and
-# therefore every provider_id) covers it.
+# ONE COMMAND GETS ALL SIX. fetch_conditioning.py pulls the two release assets
+# and extracts the four WorldClim members from upstream's zip, hashing each
+# against data/conditioning-artifacts.json before putting it in place.
 #
-# THAT CREATES A DEADLOCK THIS STEP EXISTS TO BREAK. Upstream writes this file
-# lazily, on the first pipeline run, from _load_stats_cache's miss path. But
-# verify_conditioning_digest refuses to run inference while any listed file is
-# absent -- so on a fresh pod nothing can ever create it, and step 8 dies with
-# "conditioning data missing" naming a file no documented command produces.
+# This replaced a call to terrain_diffusion's _ensure_wc_files, which had to be
+# fed by `yes |` because it PROMPTS FOR CONSENT on stdin and hangs an
+# unattended script forever, and which verified nothing about what it got. The
+# prompt is gone with it. (Historical note, in case anyone reinstates it: it
+# must be called DIRECTLY. It used to be reached via `probe_tile.py ... ||
+# true`, relying on the probe failing LATE, after WorldClim had been fetched on
+# the way to the missing ETOPO file. Identity schema v2 added a conditioning
+# gate that made the probe fail BEFORE any download, the `|| true` swallowed
+# it, and a fresh pod could not bootstrap at all.)
 #
-# Built explicitly here instead. Deterministic given the rasters and the
-# config's own frequency_mult/drop_water_pct, which are read from
-# WorldShapeConfig rather than repeated, so this cannot drift from what
-# inference will actually ask for. Deliberately OUTSIDE the `have rasters`
-# branch: a pod whose rasters are stamped but whose cache was deleted must
-# still rebuild it.
+# Non-fatal here on purpose: the stats file may still need building from a
+# just-downloaded etopo, and the same gate runs again below to decide.
+say "    fetching pinned conditioning artifacts (~60 MB)"
+python3 tools/fetch_conditioning.py || true
+
+[ -f data/global/wc2.1_10m_bio_1.tif ] \
+  || die "WorldClim did not land in $TS_DIR/data/global/.
+  fetch_conditioning.py should have extracted it from upstream's zip. Check
+  $LOG for what it said instead -- a network failure and a REJECTED sha256
+  are different problems and it names which one it hit."
+
+# synthetic_map_stats.json NOW HAS A URL, so on a normal pod the fetch above
+# already supplied it and this function returns immediately. It is kept for the
+# case where the release is unreachable and the operator is knowingly starting
+# a NEW world, and because it documents the deadlock it was written to break.
+#
+# THE DEADLOCK: upstream writes this file lazily, on the first pipeline run,
+# from _load_stats_cache's miss path. But verify_conditioning_digest refuses to
+# run inference while any listed file is absent -- so on a pod that has never
+# had it, nothing could ever create it, and step 8 died with "conditioning data
+# missing" naming a file no documented command produces.
+#
+# It needs etopo_10m.tif to exist, so it runs after the fetch. Ordering note:
+# the gate runs LAST, so whatever path produced these files, the same check
+# decides -- and a BUILT stats file will not match the pin, which is correct:
+# it is a different world and the gate says so.
 #
 # NOTE: takes a couple of minutes -- it reads all five global rasters and
-# builds 64-knot quantile tables per channel.
-if [ -f data/global/synthetic_map_stats.json ]; then
-  ok "synthetic_map_stats.json already built"
-else
+# builds 64-knot quantile tables per channel. It is deterministic given the
+# rasters and the config's own frequency_mult/drop_water_pct, which are read
+# from WorldShapeConfig rather than repeated, so this cannot drift from what
+# inference will actually ask for. "Deterministic GIVEN THE RASTERS" is doing
+# real work in that sentence: it inherits etopo_10m.tif's bytes exactly, which
+# is why it drifted on the pod.
+build_stats() {
+  if [ -f data/global/synthetic_map_stats.json ]; then return 0; fi
+  [ -f data/global/etopo_10m.tif ] || return 0
   say "    building synthetic_map_stats.json (reads all five rasters; ~2 min)"
   python3 -c 'from terrain_service.providers.diffusion import DiffusionConfig; from terrain_diffusion.inference.synthetic_map import make_synthetic_map_factory; ws = DiffusionConfig().world_shape; make_synthetic_map_factory(frequency_mult=list(ws.frequency_mult), seed=0, drop_water_pct=ws.drop_water_pct)' \
     || die "could not build synthetic_map_stats.json. Without it the
@@ -361,8 +408,52 @@ else
     || die "synthetic_map_stats.json still absent after the build ran.
     STATS_CACHE_PATH is CWD-RELATIVE ('data/global/...'), so this must run
     from $TS_DIR -- check the working directory before anything else."
-  ok "synthetic_map_stats.json built"
+}
+
+build_stats
+
+# THE GATE. Verifies all six by sha256 and fails with a full per-file report.
+#
+# NO `|| true`, NO warn-and-continue, and deliberately NOT stamped: a stamp
+# would let a pod whose data/global was later edited report success from a
+# touch file. Hashing 25 MB takes under a second against 22.5 s per tile.
+#
+# EXPECT_PROVIDER_ID (optional) is the world this pod has been asked to EXTEND.
+# When set, the id these artifacts + this checkpoint would produce is computed
+# and compared, so "this pod cannot generate into that world" is discovered
+# now, in one second, instead of after a bake. It is a hard failure, and the
+# answer to it is never --provider-id-override: that flag returns a namespace
+# verbatim and would put two different planets in one directory with a seam in
+# the middle and no error anywhere.
+say "    verifying the six conditioning files against their pins"
+if ! python3 tools/fetch_conditioning.py --verify-only \
+       --checkpoint-sha256 "$SHA" \
+       ${EXPECT_PROVIDER_ID:+--expect-provider-id "$EXPECT_PROVIDER_ID"}; then
+  die "conditioning data is NOT the pinned set -- this pod cannot generate
+  tiles that join the pinned world, so it stops here rather than producing a
+  second planet under the first one's seed.
+
+  Read the per-file report above: it names which of the six differ and gives
+  both hashes. Then, depending on what it said:
+
+    * 'No download URL is pinned for ...' -- a conditioning file was added to
+      the pin set without being hosted. Attach it to the conditioning-v1
+      release, put the asset URL in its 'sources' array, commit, and re-run.
+    * a download was REJECTED on its sha256 -- the host served something other
+      than the pinned bytes. That is the check working. Do not edit the pin to
+      match what arrived; find out why it changed.
+    * a file is present but WRONG -- this box built its own. Move it aside
+      (do not delete it: it is the only evidence of what any tiles already
+      here were generated from) and re-run. The fetcher will not overwrite it
+      for you, and there is no flag that makes it.
+    * you are deliberately starting a NEW world -- then say so:
+        python3 tools/fetch_etopo.py --i-am-starting-a-new-world
+      and rebuild synthetic_map_stats.json from it. The new world gets its own
+      provider_id and its own namespace, which is correct.
+
+  Do NOT reach for --provider-id-override to make a mismatch go away."
 fi
+ok "all six conditioning files match their pins"
 
 # ---------------------------------------------------------------------------
 # 8. validation -- the gate
