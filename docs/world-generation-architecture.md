@@ -77,6 +77,31 @@ tiles are 127× smaller than fine tiles, completing a superblock is cheap:
 256 × 1.5 MB = 384 MB of coarse data buys catchment-correct bakes for
 246 km of world.
 
+### The consequence: the coarse frontier must lead the fine frontier
+
+The gate is not free at the edge of generated space, and this was measured on
+the shipped world rather than reasoned about. The 20260719 world is 17×17 coarse
+tiles (−16…0 on both axes). Superblocks are 4-aligned, so a tile can only bake
+when its whole 4×4 block exists: **256 of the 289 tiles qualify and 33 do not,
+and the 33 are exactly the index-0 row and column.** 19 of them are land. The
+lake survey baked precisely those 256 — not by choosing a tidy 16×16, but
+because the gate refused the rest.
+
+This is not an artifact of one world's dimensions; it is what the frontier
+always looks like. In an infinite world the newest region's outer tiles can
+never bake, because the neighbours that would complete their block have not
+been generated yet.
+
+So **coarse generation must run at least one full superblock-block ahead of
+where fine baking is allowed** — one block, not one tile, and aligned to the
+block grid rather than to the player. Sizing it off the player's position
+produces a ragged frontier that stalls whenever someone walks toward a corner.
+This is cheap for exactly the reason above (coarse tiles are 127× smaller), and
+it is the concrete scheduling rule the bake service needs.
+
+A world that wants no permanently-unbakeable edge must also choose dimensions
+that are a multiple of the superblock stride. 17 is not.
+
 ### The pyramid must be capped, and the cap is visible in-game
 
 An infinite world cannot have an infinite superblock. Choosing a maximum level
