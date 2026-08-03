@@ -291,6 +291,10 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         "elevation": result.elevation_m,
         "flow": result.flow,
         "flow_plane": result.flow,
+        # bake_ver 8: the B5 basin registry. Passed as the BakeResult's own
+        # tuple -- including when it is EMPTY, which is a statement ("surveyed,
+        # holds nothing") and not an absence.
+        "basins": result.basins,
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #

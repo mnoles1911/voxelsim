@@ -3,6 +3,9 @@
 `vxc.lakesurvey.v1` -- 12 tiles, seed 20260719, bake_version 7, fingerprint `440587d46334eab7`.
 
 Registry filter: depth >= 2.0 m, area >= 2500 m2, spill above sea level (0 m), tile-spanning basins EXCLUDED.
+
+**These numbers describe the bake_version above and no other.** `roughness_seed` takes `BAKE_VERSION` as an input (`pipeline.py:1130`), so bumping it reseeds the B1 roughness field and therefore changes the terrain everywhere -- which is the documented intent of a bump ('a bake change yields a new world'), and is why a survey does not survive one. Measured across the 7->8 bump on tile (-2,-4): 6,237 depression components became 5,905 (-5.3%) and 151 registered basins became 144 (-4.6%). Same order of magnitude, different world. Re-run the dumps after any bump -- and rebuild the flow pyramid first, which the bump also invalidates.
+
 Water balance: PET = 300 + 25T + 0.05T^3 (floor 100 mm/yr), Budyko n = 2, lake if >= 0.5 m deep, salt if P/PET < 0.35, seasonal if CV >= 55%.
 
 ## Per tile

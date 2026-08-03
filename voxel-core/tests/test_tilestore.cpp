@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -54,6 +55,14 @@ std::filesystem::path fineFixturePath() {
 // the one carrying one block of each mode.
 std::filesystem::path fineFlowFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_flow_512.vxtl";
+}
+
+// The golden tile carrying a SECTION_BASIN_TABLE (watershed plan P1,
+// bake_ver 8), same provenance and the same skip-if-absent rule. Regenerate
+// with `python terrain-service/tools/make_basin_fixture.py`, whose docstring
+// lists what each of its five rows is there to break.
+std::filesystem::path fineBasinFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
 }
 
 // The CODEC_ZSTD twin of vxtl_v2_golden_512.vxtl: the SAME control lattice,
@@ -2906,3 +2915,165 @@ VXC_TEST(vxtl_v2_zstd_real_frames_decode_identically_to_codec_raw) {
 }
 
 #endif // VXC_WITH_ZSTD
+
+
+// ---------------------------------------------------------------------------
+// SECTION_BASIN_TABLE (watershed plan P1). Cross-language: the table below was
+// written by terrain_service/tile_codec.py against the same document, with no
+// code shared with this decoder.
+// ---------------------------------------------------------------------------
+
+VXC_TEST(vxtl_v2_basin_table_matches_the_python_encoder) {
+    const std::filesystem::path path = fineBasinFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNone));
+    CHECK(tile->hasBasins());
+    CHECK(tile->hasFlow()); // the table must coexist with another optional section
+    CHECK_EQ(int(tile->basins().size()), 5);
+
+    // Every kind appears. A decoder that reads `kind` as a bool passes an
+    // all-lake table and fails here.
+    uint32_t kindMask = 0;
+    for (const BasinEntry& b : tile->basins()) kindMask |= (1u << b.kind);
+    CHECK_EQ(int(kindMask), int((1u << kBasinKindCount) - 1u));
+
+    // id 0: overflowing, surface EXACTLY at the spill.
+    const BasinEntry& b0 = tile->basins()[0];
+    CHECK_EQ(int(b0.basinId), 0);
+    CHECK_EQ(int(b0.kind), int(kBasinLakeOverflowing));
+    CHECK(b0.holdsWater());
+    CHECK_EQ(int(b0.spillMm), 1234500);
+    CHECK_EQ(int(b0.surfaceMm), 1234500);
+    CHECK_EQ(int(b0.seedX), 40);
+    CHECK_EQ(int(b0.seedY), 12);
+    CHECK_EQ(int(b0.bboxX0), 30);
+    CHECK_EQ(int(b0.bboxY1), 40);
+    CHECK_EQ(int(b0.outletX), 29);
+
+    // id 1: terminal, standing below its own outlet.
+    CHECK_EQ(int(tile->basins()[1].kind), int(kBasinLakeTerminal));
+    CHECK(tile->basins()[1].surfaceMm < tile->basins()[1].spillMm);
+    CHECK(tile->basins()[1].holdsWater());
+
+    // id 2: NEGATIVE elevations, and a one-pixel extent. The bake's registry
+    // refuses a basin at or below sea level, so this row exists only to
+    // exercise the i32 sign -- which would otherwise stay untested until the
+    // first below-sea world.
+    const BasinEntry& b2 = tile->basins()[2];
+    CHECK_EQ(int(b2.spillMm), -2500);
+    CHECK_EQ(int(b2.surfaceMm), -7300);
+    CHECK_EQ(int(b2.bboxX0), int(b2.bboxX1));
+    CHECK_EQ(int(b2.bboxY0), int(b2.bboxY1));
+
+    // id 3 and 4 are dry: kind alone says so, and holdsWater() must agree.
+    CHECK(!tile->basins()[3].holdsWater());
+    CHECK(!tile->basins()[4].holdsWater());
+
+    // id 4 reaches the LAST pixel on both axes -- an off-by-one in the bounds
+    // check refuses the whole tile rather than clipping quietly.
+    CHECK_EQ(int(tile->basins()[4].bboxX1), int(tile->size()) - 1);
+    CHECK_EQ(int(tile->basins()[4].bboxY1), int(tile->size()) - 1);
+
+    // Ids are 0..n-1 in order, which is what makes indexing by id meaningful.
+    for (size_t i = 0; i < tile->basins().size(); ++i) {
+        CHECK_EQ(int(tile->basins()[i].basinId), int(i));
+    }
+}
+
+VXC_TEST(vxtl_v2_basin_table_is_refused_when_it_is_wrong) {
+    const std::filesystem::path path = fineBasinFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> good = readFileBytes(path);
+    CHECK(good.has_value());
+
+    // Find the basin section's file offset from the section table, rather
+    // than hardcoding it: the fixture's layout may change and a test that
+    // corrupts the wrong bytes would pass for the wrong reason.
+    uint16_t nSections = 0;
+    std::memcpy(&nSections, good->data() + kFineHeaderBytes - 2, 2);
+    uint64_t basinOff = 0, basinLen = 0;
+    for (uint16_t i = 0; i < nSections; ++i) {
+        const size_t e = kFineHeaderBytes + static_cast<size_t>(i) * kFineSectionEntryBytes;
+        uint32_t id = 0;
+        uint64_t off = 0, len = 0;
+        std::memcpy(&id, good->data() + e, 4);
+        std::memcpy(&off, good->data() + e + 4, 8);
+        std::memcpy(&len, good->data() + e + 12, 8);
+        if (id == kSectionBasinTable) { basinOff = off; basinLen = len; }
+    }
+    CHECK(basinLen == kBasinTableHeaderBytes + 5 * kBasinEntryBytes);
+
+    auto refused = [&](const std::vector<uint8_t>& bad, FineError want) {
+        FineError err = FineError::kNone;
+        std::optional<FineTile> t = FineTile::parse(bad, {}, &err);
+        CHECK(!t.has_value());
+        CHECK_EQ(int(err), int(want));
+    };
+
+    // A row size this build does not know: refuse, never read 33-byte records
+    // out of a 32-byte stream.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff) + 2] = 33;
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // A count that disagrees with the section length.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff) + 4] = 6;
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // A kind outside the enum.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff) + kBasinTableHeaderBytes + 26] = 9;
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // Water standing ABOVE its own outlet -- the one field error that would
+    // otherwise flood terrain rather than fail.
+    {
+        std::vector<uint8_t> bad = *good;
+        const size_t surfAt = static_cast<size_t>(basinOff) + kBasinTableHeaderBytes + 22;
+        const int32_t tooHigh = 2000000000;
+        std::memcpy(bad.data() + surfAt, &tooHigh, 4);
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // Nonzero reserved bytes: this decoder does not know what they mean.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff) + kBasinTableHeaderBytes + 27] = 1;
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // The flag without the section: refused, in both directions. flags sits at
+    // byte 31 -- 25 v1-positional header bytes, then block_log2/predictor/
+    // quant/codec and bake_ver.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags &= static_cast<uint16_t>(~kFineFlagBasinsPresent);
+        std::memcpy(bad.data() + 31, &flags, 2);
+        refused(bad, FineError::kBadSectionTable);
+    }
+    // An UNKNOWN flag bit is still refused whole -- the property that lets the
+    // two halves of this format move in lockstep instead of drifting.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags |= 0x8000;
+        std::memcpy(bad.data() + 31, &flags, 2);
+        refused(bad, FineError::kBadHeader);
+    }
+}

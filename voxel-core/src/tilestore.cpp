@@ -400,6 +400,64 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
     return r.atEnd();
 }
 
+// SECTION_BASIN_TABLE (watershed plan P1, bake_ver 8). A flat table, so this
+// is a straight read -- but every field is CHECKED, because a basin row is a
+// gameplay instruction: it says "flood-fill from here, up to this level", and
+// a bbox reaching outside the tile or a surface above its own spill would put
+// water where there is none. `tileSize` is the grid edge the row must fit in.
+bool parseBasinTable(const uint8_t* file, uint64_t off, uint64_t len, uint32_t tileSize,
+                     std::vector<BasinEntry>& out) {
+    if (len < kBasinTableHeaderBytes) return false;
+    ByteReader r(file + off, static_cast<size_t>(len));
+    uint16_t version, entryBytes;
+    uint32_t count;
+    if (!r.u16(version) || version != kBasinTableVersion) return false;
+    // A row size this build does not know is bytes written by a different
+    // revision of the table. Refusing beats reading 33-byte records out of a
+    // 32-byte stream and getting plausible garbage.
+    if (!r.u16(entryBytes) || entryBytes != kBasinEntryBytes) return false;
+    if (!r.u32(count)) return false;
+    if (len != kBasinTableHeaderBytes + static_cast<uint64_t>(count) * kBasinEntryBytes) {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        BasinEntry b;
+        uint32_t spill = 0, surface = 0;
+        if (!r.u16(b.basinId)) return false;
+        if (!r.u16(b.seedX) || !r.u16(b.seedY)) return false;
+        if (!r.u16(b.bboxX0) || !r.u16(b.bboxY0) || !r.u16(b.bboxX1) || !r.u16(b.bboxY1)) {
+            return false;
+        }
+        if (!r.u16(b.outletX) || !r.u16(b.outletY)) return false;
+        if (!r.u32(spill) || !r.u32(surface)) return false;
+        b.spillMm = static_cast<int32_t>(spill);
+        b.surfaceMm = static_cast<int32_t>(surface);
+        if (!r.u8(b.kind) || b.kind >= kBasinKindCount) return false;
+        for (int k = 0; k < 5; ++k) {
+            uint8_t reserved;
+            if (!r.u8(reserved) || reserved != 0) return false;
+        }
+
+        // Ids are 0..n-1 in order, because the client INDEXES by id and the
+        // bake orders basins by (min_y, min_x) of extent so the id is a pure
+        // function of the surface. A gap or a repeat means two processes could
+        // disagree about which basin is "3".
+        if (b.basinId != i) return false;
+        if (b.bboxX0 > b.bboxX1 || b.bboxY0 > b.bboxY1) return false;
+        if (b.bboxX1 >= tileSize || b.bboxY1 >= tileSize) return false;
+        if (b.seedX < b.bboxX0 || b.seedX > b.bboxX1) return false;
+        if (b.seedY < b.bboxY0 || b.seedY > b.bboxY1) return false;
+        // Water standing above its own outlet is not a lake, it is a bug: the
+        // outlet would carry the excess away.
+        if (b.surfaceMm > b.spillMm) return false;
+        out.push_back(b);
+    }
+    return r.atEnd();
+}
+
 } // namespace
 
 const char* fineErrorName(FineError e) {
@@ -417,6 +475,7 @@ const char* fineErrorName(FineError e) {
     case FineError::kDecompressFailed: return "decompress-failed";
     case FineError::kBadPayload: return "bad-payload";
     case FineError::kValueOutOfRange: return "value-out-of-range";
+    case FineError::kBadBasinTable: return "bad-basin-table";
     }
     return "unknown";
 }
@@ -484,7 +543,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     if (compressed && !decompressor.valid()) return reject(FineError::kNoDecompressor);
     if (!r.u16(h.bakeVer)) return reject(FineError::kBadHeader);
     if (!r.u16(h.flags)) return reject(FineError::kBadHeader);
-    if ((h.flags & ~kFineFlagFlowPresent) != 0) return reject(FineError::kBadHeader);
+    if ((h.flags & ~kFineFlagsKnown) != 0) return reject(FineError::kBadHeader);
     if (!r.i32(h.baseOffsetMm)) return reject(FineError::kBadHeader);
     // §3: absolute only.
     if (!r.u8(h.parentScale) || h.parentScale != 0) return reject(FineError::kBadHeader);
@@ -501,7 +560,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
     if (tableEnd > fileSize) return reject(FineError::kBadSectionTable);
 
-    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec;
+    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec;
     struct Extent {
         uint64_t begin, end;
     };
@@ -540,6 +599,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         case kSectionElevData: elevDataSec = ref; break;
         case kSectionFlowIndex: flowIndexSec = ref; break;
         case kSectionFlowData: flowDataSec = ref; break;
+        case kSectionBasinTable: basinSec = ref; break;
         default: break; // see (b): unknown ids are ignored but still bounded
         }
     }
@@ -557,6 +617,17 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     }
     if (!wantFlow && (flowIndexSec.present || flowDataSec.present)) {
         return reject(FineError::kBadSectionTable);
+    }
+    // Flag and section must agree in BOTH directions, same as flow: a table
+    // with the flag clear is bytes this decoder would ignore, and a flag with
+    // no table is a client that would silently place no water.
+    const bool wantBasins = (h.flags & kFineFlagBasinsPresent) != 0;
+    if (wantBasins != basinSec.present) return reject(FineError::kBadSectionTable);
+
+    std::vector<BasinEntry> basins;
+    if (wantBasins && !parseBasinTable(bytes.data(), basinSec.offset, basinSec.length,
+                                       h.size, basins)) {
+        return reject(FineError::kBadBasinTable);
     }
 
     FineTile tile;
@@ -582,6 +653,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         return reject(FineError::kBadBlockIndex);
     }
 
+    tile.basins_ = std::move(basins);
     tile.bytes_ = std::move(bytes);
     return tile;
 }

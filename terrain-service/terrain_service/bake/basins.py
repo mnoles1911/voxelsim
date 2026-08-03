@@ -45,8 +45,7 @@ format carries.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
-from typing import Iterable, Sequence
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -67,7 +66,8 @@ __all__ = [
     "aridity_index",
     "reopened_surface",
     "depression_components",
-    "component_stats",
+    "SEA_LEVEL_M",
+    "BasinSurvey",
     "hypsometry",
     "equilibrium_level",
     "classify",

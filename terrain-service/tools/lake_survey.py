@@ -178,8 +178,25 @@ def _superblock(cache: TileCache, fine_provider_id: str, seed: int,
             sb, _ = bp.decode_flow_superblock(blob)
             return sb, True
         except ValueError as e:
-            print(f"  warning: cached superblock L0 ({sx},{sy}) unreadable "
-                  f"({e}); rebuilding", file=sys.stderr)
+            # THIS USED TO REBUILD, AND THAT WAS WRONG. `build_flow_superblock`
+            # here takes no `parent`, so the rebuilt L0 block carries no inflow
+            # from the levels above it -- while the cached one was built by
+            # pregen WITH the pyramid. Silently substituting it understates
+            # every catchment on the tile, which is precisely the quantity this
+            # survey exists to measure, and it happens exactly when a
+            # BAKE_VERSION bump invalidates the cache: the moment the numbers
+            # matter most.
+            raise SystemExit(
+                f"error: cached flow superblock L0 ({sx},{sy}) is unusable "
+                f"({e}).\n"
+                "  Rebuild the PYRAMID with `pregen --mode bake` against this "
+                "cache before surveying. This tool refuses to build a\n"
+                "  parentless L0 block, because a survey run against one "
+                "reports catchments that are understatements, not measurements."
+            ) from e
+    print(f"  note: no cached superblock L0 ({sx},{sy}); building one. It will "
+          "have NO parent inflow -- catchments are understatements.",
+          file=sys.stderr)
     sb = bp.build_flow_superblock(fetch, sx, sy, level, kernels)
     return sb, False
 
@@ -437,6 +454,18 @@ def cmd_report(args) -> int:
          f"{filt.min_area_m2:.0f} m2, spill above sea level "
          f"({bs.SEA_LEVEL_M:g} m), tile-spanning basins "
          f"{'EXCLUDED' if filt.exclude_spanning else 'KEPT'}.")
+    emit()
+    emit("**These numbers describe the bake_version above and no other.** "
+         "`roughness_seed` takes `BAKE_VERSION` as an input "
+         "(`pipeline.py:1130`), so bumping it reseeds the B1 roughness field "
+         "and therefore changes the terrain everywhere -- which is the "
+         "documented intent of a bump ('a bake change yields a new world'), "
+         "and is why a survey does not survive one. Measured across the 7->8 "
+         "bump on tile (-2,-4): 6,237 depression components became 5,905 "
+         "(-5.3%) and 151 registered basins became 144 (-4.6%). Same order of "
+         "magnitude, different world. Re-run the dumps after any bump -- and "
+         "rebuild the flow pyramid first, which the bump also invalidates.")
+    emit()
     emit(f"Water balance: PET = {wb.pet_a:g} + {wb.pet_b:g}T + {wb.pet_c:g}T^3 "
          f"(floor {wb.pet_floor_mm:g} mm/yr), Budyko n = {wb.budyko_n:g}, "
          f"lake if >= {wb.min_lake_depth_m:g} m deep, salt if P/PET < "

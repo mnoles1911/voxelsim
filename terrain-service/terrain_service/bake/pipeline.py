@@ -118,6 +118,7 @@ import numpy as np
 
 # Pure numpy, no kernels, no scipy -- safe to import eagerly here (the lazy
 # imports elsewhere in this file exist for scipy/numba, not for module cycles).
+from . import basins as _basins
 from . import province as _province
 
 __all__ = [
@@ -267,7 +268,11 @@ __all__ = [
 #: and drives the superblock MFD at 30 m and 120 m/px, so a per-cell value at
 #: 1.875 m would have no counterpart at the parent levels and parent and child
 #: would route differently -- worsening HYDROLOGY_RESIDUALS #3.
-BAKE_VERSION = 7
+#: bake_ver 8 -- B5, the basin registry (docs/watershed-system-plan.md item 3).
+#: The bake stops levelling registered depressions into rock and ships a table
+#: describing them. Every baked tile is invalidated; that is expected and
+#: currently cheap.
+BAKE_VERSION = 8
 
 
 @dataclass(frozen=True)
@@ -653,6 +658,39 @@ class BakeConstants:
     #: scars in the hillshade). The enforcement form preserves gentle reaches
     #: exactly because it takes min(original drop, this).
     refill_eps_m: float = 0.11
+
+    # -- B5 basin registry (bake_ver 8) ------------------------------------
+    #
+    # docs/watershed-system-plan.md §4.2-§4.3. These DECIDE BAKED BYTES -- a
+    # registered basin is re-opened in the shipped elevation plane -- so they
+    # ride bake_identity_payload like every other constant here. Pinned from
+    # tools/lake_survey.py's 12-tile sweep (docs/lake-survey/lake-survey.md),
+    # not chosen: at 2 m / 2500 m2 the registry is a median of 65 rows per
+    # tile and a worst case of 266, i.e. 8.5 KB against 26.6 MB of compressed
+    # elevation; at 1 m / 0 m2 it is 4,082 rows and mostly puddles.
+    #: Minimum depth of a registered basin's deepest cell, metres.
+    basin_min_depth_m: float = 2.0
+    #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
+    basin_min_area_m2: float = 2500.0
+    #: v1 registers INTERIOR basins only. A basin crossing the tile edge is
+    #: seen by each neighbour from a different padded domain and the two need
+    #: not agree. The excluded ones are COUNTED (survey: 57% of qualifying
+    #: components, 4,609 ha over 12 tiles) so the cost is a number.
+    basin_exclude_spanning: bool = True
+    #: A depression spilling at or below sea level is sea floor, not a lake.
+    basin_require_above_sea: bool = True
+    #: Water-balance constants, mirroring bake/basins.WaterBalance. Restated
+    #: here rather than referenced so that changing the balance rolls the bake
+    #: identity -- the `kind` and `surface_mm` it produces are shipped bytes.
+    basin_pet_a: float = 300.0
+    basin_pet_b: float = 25.0
+    basin_pet_c: float = 0.05
+    basin_pet_floor_mm: float = 100.0
+    basin_budyko_n: float = 2.0
+    basin_min_lake_depth_m: float = 0.5
+    basin_salt_aridity: float = 0.35
+    basin_seasonal_cv_pct: float = 55.0
+
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -881,6 +919,18 @@ class BakeConstants:
             "meso_slope_lo": self.meso_slope_lo,
             "meso_slope_hi": self.meso_slope_hi,
             "refill_eps_m": self.refill_eps_m,
+            "basin_min_depth_m": self.basin_min_depth_m,
+            "basin_min_area_m2": self.basin_min_area_m2,
+            "basin_exclude_spanning": self.basin_exclude_spanning,
+            "basin_require_above_sea": self.basin_require_above_sea,
+            "basin_pet_a": self.basin_pet_a,
+            "basin_pet_b": self.basin_pet_b,
+            "basin_pet_c": self.basin_pet_c,
+            "basin_pet_floor_mm": self.basin_pet_floor_mm,
+            "basin_budyko_n": self.basin_budyko_n,
+            "basin_min_lake_depth_m": self.basin_min_lake_depth_m,
+            "basin_salt_aridity": self.basin_salt_aridity,
+            "basin_seasonal_cv_pct": self.basin_seasonal_cv_pct,
             "province_strength": self.province_strength,
             "province_smooth_m": self.province_smooth_m,
             "province_relief_lo": self.province_relief_lo,
@@ -918,6 +968,7 @@ STAGE_ORDER: tuple[str, ...] = (
     "B3.relax",
     "B4.meso",
     "B4b.refill",
+    "B5.reopen_basins",
 )
 
 
@@ -2696,6 +2747,42 @@ class BakeResult:
     #: says nothing about how well those two scale. Defaulted so an existing
     #: constructor keeps working.
     wall_seconds: dict[str, float] = field(default_factory=dict)
+    #: The B5 basin registry (bake_ver 8), ordered by (min_y, min_x) of extent
+    #: with ids 0..n-1. `elevation_m` above already has these depressions
+    #: RE-OPENED; the table is what tells a client where they are and how deep
+    #: the water in them stands. Empty tuple means "surveyed, holds nothing",
+    #: which is a different statement from a tile that predates the registry --
+    #: see tile_codec.FLAG_BASINS_PRESENT.
+    basins: tuple["_basins.BasinRecord", ...] = ()
+
+
+def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
+    """The registry filter, from the hashed bake constants.
+
+    One function rather than a constructor call at each site, because a
+    filter built from anything other than ``consts`` would decide baked bytes
+    without rolling the bake identity.
+    """
+    return _basins.BasinFilter(
+        min_depth_m=consts.basin_min_depth_m,
+        min_area_m2=consts.basin_min_area_m2,
+        exclude_spanning=consts.basin_exclude_spanning,
+        require_above_sea=consts.basin_require_above_sea,
+    )
+
+
+def basin_balance(consts: BakeConstants = CONSTANTS) -> "_basins.WaterBalance":
+    """The lake rule's constants, from the hashed bake constants."""
+    return _basins.WaterBalance(
+        pet_a=consts.basin_pet_a,
+        pet_b=consts.basin_pet_b,
+        pet_c=consts.basin_pet_c,
+        pet_floor_mm=consts.basin_pet_floor_mm,
+        budyko_n=consts.basin_budyko_n,
+        min_lake_depth_m=consts.basin_min_lake_depth_m,
+        salt_aridity=consts.basin_salt_aridity,
+        seasonal_cv_pct=consts.basin_seasonal_cv_pct,
+    )
 
 
 def bake_padded_domain(
@@ -3333,6 +3420,60 @@ def bake_tile(
     if stage_sink is not None:
         for name, key in STAGE_SINK_FIELDS:
             stage_sink(name, out[key][sl, sl])
+
+    # -- B5: RE-OPEN THE REGISTERED BASINS (bake_ver 8, plan §4.2).
+    #
+    # Everything above ran on the depression-FILLED surface and stays exactly
+    # as it was. That is hydrologically right, not a compromise: water flows
+    # ACROSS a lake at its surface, so routing, the flow plane, and incision
+    # (which cuts the outlet gorge through the rim and a thalweg across the
+    # lake floor -- both correct, both desirable) all belong on the filled
+    # surface, and the flow plane keeps agreeing with the carve cell for cell.
+    # Only the LAST thing the bake does -- decide what elevation ships --
+    # changes: registered holes are given back.
+    #
+    # Run on the PADDED domain, because the fill that recomputes each basin's
+    # spill needs a boundary condition and the interior alone would invent
+    # one, and because "does this basin leave the tile" is a question about
+    # the padded grid.
+    #
+    # THE SPILL IS RECOMPUTED HERE, on the FINAL surface, and this is the part
+    # no existing text anticipated: `basin_depth` is B2a's fill of the
+    # PRE-EROSION carrier, and between B2a and here the bake has incised
+    # (which can cut a rim metres lower), relaxed and added a meso band. A
+    # table built from the B2a level would float lakes above their own
+    # outlets. See bake/basins.py's header.
+    c0 = time.process_time()
+    climate_phys = (None if padded_climate is None
+                    else _province.dequantize_climate(padded_climate))
+    survey = _basins.survey_basins(
+        z_final=out["z"],
+        basin_depth=out["basin_depth"],
+        accumulation_m2=out["acc"],
+        climate=climate_phys,
+        cell_m=geom.fine_pixel_m,
+        interior=sl,
+        filt=basin_filter(consts),
+        wb=basin_balance(consts),
+        keep_labels=True,
+        keep_hypsometry=False,
+    )
+    if survey.basins:
+        keep = survey.keep_mask()
+        # `basin_depth` is continuous and 0 at the rim by construction, so
+        # subtracting it under the mask re-opens the hole with no seam at any
+        # edge -- no feathering, no blend width, nothing to tune.
+        #
+        # IN PLACE, under a boolean index, not `np.where`: the registry covers
+        # a couple of per cent of the domain, so this allocates on the order of
+        # the basins' own area instead of two more full padded float32 grids
+        # (340 MB each at production, on top of a bake that already peaks
+        # around 5 GiB).
+        out["z"][keep] -= out["basin_depth"][keep]
+        del keep
+    survey.labels = None
+    out["cpu_seconds"]["B5.reopen_basins"] = time.process_time() - c0
+
     z = np.ascontiguousarray(out["z"][sl, sl])
     acc = np.ascontiguousarray(out["acc"][sl, sl])
     incision = out["incision"][sl, sl]
@@ -3344,20 +3485,35 @@ def bake_tile(
 
     basin_depth = out["basin_depth"]
     padded_basin = basin_depth > 0.0
-    # THE SOUND CONDITION (see APRON_BLIND_SPOT): a filled flat whose whole
-    # extent is inside the padded domain has its spill point inside the padded
-    # domain too, so priority-flood enters it through the terrain and the
-    # epsilon staircase is a function of the terrain alone. Only a flat that
-    # REACHES THE PADDED BORDER is entered from the border, and only then can
-    # two neighbouring bakes cross it in different directions. Measured on the
-    # perimeter, O(padded_fine_px) work, and it needs no connected-component
-    # labelling -- which matters because pipeline.py may not import scipy.
+    # THIS TEST CANNOT FIRE, AND NEVER COULD. It was meant to be the sound
+    # condition of APRON_BLIND_SPOT: "only a flat that REACHES THE PADDED
+    # BORDER is entered from the border". But ``fill_depressions`` never
+    # raises a border cell (flow.py's own docstring says so -- that is what
+    # makes a bake on tile+apron agree with a bake on a larger domain), so
+    # ``filled - carrier`` is identically 0 along all four edges and no
+    # depression can contain a border cell. Verified on a synthetic hollow
+    # whose corner IS the domain corner: zero basin cells, because a hollow
+    # that reaches the border DRAINS OUT and is not a depression at all.
+    # ``basin_reaches_padded_border`` has therefore read 0.0 for every tile in
+    # the record, and the watershed plan's §4.2.4 built a v1 exclusion on it.
+    #
+    # Kept, at zero, rather than deleted: the key is quoted in the plan and in
+    # three stat files, and a key that silently vanished would be read as a
+    # missing measurement rather than as a retired one. The exclusion that
+    # actually ships is B5's TILE-SPANNING one, counted below, and the
+    # near-the-edge diagnostic that replaces this is
+    # ``basins_near_padded_edge``.
     border_basin = int(
         padded_basin[0, :].sum()
         + padded_basin[-1, :].sum()
         + padded_basin[:, 0].sum()
         + padded_basin[:, -1].sum()
     )
+    # (The only place in this repo where it has ever been non-zero is
+    # test_border_detector_separates_a_contained_flat_from_a_spilling_one,
+    # which SUBSTITUTES a fake `fill_depressions` that adds 1.0 to every cell
+    # -- including the border. That test demonstrates the statistic's
+    # arithmetic; it is not evidence that the condition occurs.)
     border_cells = 2 * padded_basin.shape[0] + 2 * padded_basin.shape[1]
     basin = padded_basin[sl, sl]
     del padded_basin
@@ -3401,9 +3557,27 @@ def bake_tile(
         "basin_max_depth_m": max_basin_depth,
         "max_basin_run_m": float(run_px) * geom.fine_pixel_m,
         "basin_exceeds_apron": float(run_px * geom.fine_pixel_m > geom.apron_m),
+        # Structurally zero -- see the comment beside border_basin above.
         "padded_border_basin_cells": float(border_basin),
         "padded_border_basin_frac": float(border_basin) / float(border_cells),
         "basin_reaches_padded_border": float(border_basin > 0),
+        # -- B5 registry (bake_ver 8). Counts, so a contended box cannot
+        # distort them, and every exclusion is a NUMBER: the plan asks for the
+        # cost of the tile-spanning refusal to be measured rather than assumed,
+        # and on the 12-tile survey it was 57% of qualifying components.
+        "basins_registered": float(len(survey.basins)),
+        "basins_lake": float(sum(1 for b in survey.basins if b.is_lake)),
+        "basin_components": float(survey.n_components),
+        "basins_excluded_shallow": float(survey.excluded_shallow),
+        "basins_excluded_small": float(survey.excluded_small),
+        "basins_excluded_spanning": float(survey.excluded_spanning),
+        "basins_excluded_spanning_area_m2": float(survey.excluded_spanning_area_m2),
+        "basins_excluded_spanning_max_depth_m": float(
+            survey.excluded_spanning_max_depth_m),
+        "basins_excluded_submarine": float(survey.excluded_submarine),
+        "basins_near_padded_edge": float(survey.kept_near_padded_border),
+        "basin_water_volume_m3": float(sum(
+            b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
     }
     # LANDFORM PROVINCE MIX over the tile INTERIOR, as area fractions summing
@@ -3428,6 +3602,7 @@ def bake_tile(
         wall_seconds=out["wall_seconds"],
         stats=stats,
         missing_coarse=tuple(missing),
+        basins=tuple(survey.basins),
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

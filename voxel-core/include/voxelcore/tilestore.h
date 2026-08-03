@@ -127,6 +127,64 @@ enum FineSectionId : uint32_t {
     kSectionElevData = 2,
     kSectionFlowIndex = 3,
     kSectionFlowData = 4,
+    // The per-tile basin registry (docs/watershed-system-plan.md P1, bake_ver
+    // 8). A flat table of tens of rows, never a plane -- the bake decides
+    // where the lakes are and how high they stand, and this is the whole of
+    // what the client needs to put water in them.
+    kSectionBasinTable = 5,
+};
+
+// SECTION_BASIN_TABLE payload layout, mirroring terrain_service/tile_codec.py.
+//
+//   u16 table_version | u16 entry_bytes | u32 count | count * entry_bytes
+//
+// `entry_bytes` is redundant with the section length, and deliberately so: a
+// decoder that disagrees with the encoder about the row size gets a mismatch
+// it can refuse, instead of reading 33-byte records out of a 32-byte stream
+// and producing plausible garbage.
+inline constexpr uint16_t kBasinTableVersion = 1;
+inline constexpr size_t kBasinTableHeaderBytes = 8;
+inline constexpr size_t kBasinEntryBytes = 32;
+
+// What kind of place a registered depression is (bake/basins.py's KIND_*).
+// The ORDER is load-bearing: >= kBasinLakeTerminal means "holds standing
+// water", which is the only test most callers need.
+enum BasinKind : uint8_t {
+    kBasinDryPlaya = 0,
+    kBasinSaltFlat = 1,
+    kBasinSeasonal = 2,
+    kBasinLakeTerminal = 3,
+    kBasinLakeOverflowing = 4,
+    kBasinKindCount = 5,
+};
+
+// One registered basin. 32 bytes on the wire and in memory -- this struct is
+// filled field by field from the byte reader, never memcpy'd over the file,
+// so no packing pragma is needed and none is relied on.
+//
+// Pixel coordinates are TILE-LOCAL, in the same space as the elevation plane,
+// so a client indexes them with no transform. Elevations are ABSOLUTE
+// millimetres, NOT relative to baseOffsetMm: a basin is read by gameplay code
+// that never touches the control-point datum, and sharing one would couple a
+// water query to the elevation codec's internals.
+struct BasinEntry {
+    uint16_t basinId = 0;
+    //: Deepest cell -- the client's flood-fill seed.
+    uint16_t seedX = 0, seedY = 0;
+    //: Inclusive extent. The flood fill is bounded by this, which is what
+    //: makes the per-basin cost O(bbox) instead of O(tile).
+    uint16_t bboxX0 = 0, bboxY0 = 0, bboxX1 = 0, bboxY1 = 0;
+    //: Spill cell -- the head of the outlet channel.
+    uint16_t outletX = 0, outletY = 0;
+    //: Fill level on the FINAL surface, and the equilibrium water surface.
+    //: surfaceMm <= spillMm always; they are equal when the basin overflows,
+    //: and surfaceMm sits at the floor when it is dry.
+    int32_t spillMm = 0;
+    int32_t surfaceMm = 0;
+    uint8_t kind = kBasinDryPlaya;
+
+    //: True when this basin holds standing water at equilibrium.
+    bool holdsWater() const { return kind >= kBasinLakeTerminal; }
 };
 
 enum FineBlockMode : uint8_t {
@@ -147,6 +205,12 @@ inline constexpr uint8_t kPredMed = 1;
 // undefined flag can only mean the bytes were produced by something this
 // decoder does not understand.
 inline constexpr uint16_t kFineFlagFlowPresent = 0x1;
+// §3 `flags` bit1 (bake_ver 8): SECTION_BASIN_TABLE is present. Set even when
+// the table has ZERO rows -- "this tile was surveyed and holds nothing" and
+// "this tile predates the registry" are different facts and a client that
+// conflated them would put no water in a world that has some.
+inline constexpr uint16_t kFineFlagBasinsPresent = 0x2;
+inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasinsPresent;
 
 // True for codec values the FORMAT defines. Says nothing about whether this
 // process can decode them -- see fineCodecNeedsDecompressor below.
@@ -244,6 +308,7 @@ enum class FineError : uint8_t {
     kDecompressFailed, // decode: the injected decompressor rejected the frame
     kBadPayload,       // decode: payload length wrong for the block's mode
     kValueOutOfRange,  // decode: a reconstructed value left the element's range
+    kBadBasinTable,    // §P1 table: wrong version/row size, bad count, bad row
 };
 
 // Stable short name, for logs. Never null.
@@ -330,6 +395,14 @@ public:
     int32_t quantMm() const { return fineQuantMm(h_.quant); }
     int32_t baseOffsetMm() const { return h_.baseOffsetMm; }
     bool hasFlow() const { return (h_.flags & kFineFlagFlowPresent) != 0; }
+    // True when the tile carries a basin table AT ALL. An empty table with
+    // this true means "no basins here"; this false means "baked before the
+    // registry existed", and the two must not be conflated.
+    bool hasBasins() const { return (h_.flags & kFineFlagBasinsPresent) != 0; }
+    // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
+    // `basins()[i].basinId == i` and a row means the same basin in every
+    // process. Empty when hasBasins() is false.
+    const std::vector<BasinEntry>& basins() const { return basins_; }
 
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
@@ -371,6 +444,7 @@ private:
     FineTileHeader h_;
     FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_;
+    std::vector<BasinEntry> basins_;
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
 };
