@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 22
+#define VXC_WORLDGEN_VERSION_USH 23
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -290,6 +290,9 @@ static const int64_t kDetailGradCapKQ10 = 512;
 // pool's cap is deliberately ABOVE 1.0 -- it is the only band that can disturb a
 // voxel quantisation band, and doing so requires twice the carrier gradient.
 static const int64_t kMicroGradCapKQ10 = 1229; // v21: 1.5 -> 1.2, see amplifier.cpp
+// v23 MIRROR: amplifier.cpp kFineDetailSumCapKQ10. The cap on the SUM of the two
+// pools, fine tier only -- a per-pool cap lets the total reach 2.2x the carrier.
+static const int64_t kFineDetailSumCapKQ10 = 1024;
 static const int64_t kMicroGradFloorMmPerM = 200;
 // v15. kRillMaxAbsMm * 1000 / kRillAcrossMm = 300 * 1000 / 1600, static_asserted
 // == 187 on the CPU side BECAUSE it is a literal here. Do not fold this into an
@@ -1615,6 +1618,25 @@ SurfaceEval evalSurface(uint64_t seed, int64_t vx, int64_t vy)
             const int64_t capQ10 = truncDiv(allowedGradMmPerM * 1024, detailGradMmPerM);
             const int64_t scaleQ10 = 1024 - truncDiv(engageQ10 * (1024 - capQ10), 1024);
             detailMm = truncDiv(detailMm * scaleQ10, 1024);
+        }
+    }
+    // THE COMBINED CAP -- MIRROR of amplifier.cpp's block at the rejoin.
+    // Capping each pool against the carrier and then ADDING them licenses a
+    // total of up to 2.2x the carrier gradient while each pool is individually
+    // compliant, which is how v19's split defeated the guarantee task #21 was
+    // for. Fine tier only; the coarse tier stays bit-identical.
+    if ((pxMm <= kFineTierMaxPixelMm) && engageQ10 > 0)
+    {
+        const int64_t sumGradMmPerM = detailGradMmPerM + microGradMmPerM;
+        int64_t allowedSumMmPerM = truncDiv(kFineDetailSumCapKQ10 * slopeMmPerM, 1024);
+        if (allowedSumMmPerM < kFineDetailGradFloorMmPerM)
+            allowedSumMmPerM = kFineDetailGradFloorMmPerM;
+        if (sumGradMmPerM > allowedSumMmPerM)
+        {
+            const int64_t capQ10 = truncDiv(allowedSumMmPerM * 1024, sumGradMmPerM);
+            const int64_t scaleQ10 = 1024 - truncDiv(engageQ10 * (1024 - capQ10), 1024);
+            detailMm = truncDiv(detailMm * scaleQ10, 1024);
+            microDetailMm = truncDiv(microDetailMm * scaleQ10, 1024);
         }
     }
     // The pools rejoin after both caps -- MIRROR of amplifier.cpp.

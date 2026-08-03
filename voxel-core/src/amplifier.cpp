@@ -1120,6 +1120,41 @@ constexpr int64_t kFineDetailGradFloorMmPerM = 50;
 // 1.82 m an uncapped micro pool leaves on that ground. It is also the value the
 // owner approved when this was first raised.
 constexpr int64_t kMicroGradCapKQ10 = 1229;  // 1.2 x carrier gradient
+//
+// SPLIT PER TIER 2026-08-03, because the sweep above was measured on ONE
+// COARSE gentle site and does not describe the fine tier at all.
+//
+// Re-measured on the fine tier across 11 windows on 4 baked tiles whose fine
+// CARRIER drains (<1% stranded), paired on identical windows:
+//
+//     ver   median added stranding   mean    median sinks
+//     v14         0.3 %              5.3 %        2
+//     v18         0.0 %              4.2 %        0
+//     v22        11.3 %             16.0 %        5
+//
+// Per site at tile centres (carrier / v14 / v18 / v22): (-7,-2) 39.7% grade
+// reads 0.5 / 4.8 / 0.5 / 35.5; (-3,-3) 59.7% reads 0.0 / 0.0 / 0.0 / 11.5.
+// The step is at v19 -- letting the micro pool exceed the carrier gradient,
+// 1.5x then 1.2x -- and v21's reduction recovered only 40.6 -> 35.5 at the
+// worst site. The residual recorded in
+// docs/measurements/micro-grad-cap-2026-08-01.txt as "1.2% stranded" came from
+// a SINGLE site; on this corpus it is 10-35%.
+//
+// The independent confirmation, from the other direction: the amplifier's
+// detail band was measured taking an alpine carrier from 0 interior sinks and
+// 0.0% stranded to 1625 sinks and 87.9% stranded, mean flow path 224 m -> 29 m.
+// The bake ships a heightfield that drains BY CONTRACT and the client puts the
+// pits back.
+//
+// The coarse value is deliberately untouched: v21's terracing counter-argument
+// -- the reason this was loosened at all -- was measured on coarse gentle
+// ground, and coarse ground is where the engagement ramp already switches the
+// cap off below 3600 mm of relief. Changing both at once would confound the
+// two measurements again, which is how the 1.2 came to be trusted.
+constexpr int64_t kFineMicroGradCapKQ10 = 1229;  // TUNED BELOW; see the sweep
+// The cap on the SUM of the two pools, fine tier only. See the block at the
+// rejoin in amplify() for why a per-pool cap is not enough.
+constexpr int64_t kFineDetailSumCapKQ10 = 1024;  // 1.0 x carrier gradient
 static_assert(kMicroGradCapKQ10 > 1024,
               "at or below 1.0 the micro pool cannot disturb a quantisation band at ANY "
               "slope -- the gradient required scales with the carrier's, which is exactly "
@@ -1608,7 +1643,8 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
         // form, same engagement blend, same truncating divide as the routing
         // pool below -- two pools, one shape of arithmetic, so the HLSL mirror
         // stays a copy rather than a second implementation.
-        int64_t allowedMicroMmPerM = kMicroGradCapKQ10 * slopeMmPerM / 1024;
+        const int64_t microCapKQ10 = fine ? kFineMicroGradCapKQ10 : kMicroGradCapKQ10;
+        int64_t allowedMicroMmPerM = microCapKQ10 * slopeMmPerM / 1024;
         if (allowedMicroMmPerM < kMicroGradFloorMmPerM)
             allowedMicroMmPerM = kMicroGradFloorMmPerM;
         if (microGradMmPerM > allowedMicroMmPerM) {
@@ -1633,6 +1669,31 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     // The pools rejoin here, after both caps. When engagement is zero neither
     // cap ran and this is a plain sum, which is what keeps flat coarse classes
     // bit-for-bit with v13 exactly as v14 left them.
+    //
+    // THE COMBINED CAP, added 2026-08-03 on the FINE tier only.
+    //
+    // Capping each pool against the carrier and then ADDING them licenses a
+    // total up to (kDetailGradCapKQ10 + kFineMicroGradCapKQ10) / 1024 = 2.2x
+    // the carrier gradient, while each pool is individually "compliant". That
+    // is how v19's split defeated the thing task #21 was for: detail must not
+    // be able to reverse the carrier's downhill, and a 2.2x sum plainly can.
+    //
+    // It also explains why tuning the micro multiplier does almost nothing.
+    // Measured across four fine sites, 1.2x -> 1.0x moved stranded area by at
+    // most 1.6 points (35.5 -> 35.4, 11.5 -> 11.5, 0.1 -> 0.2, 77.2 -> 75.6):
+    // it only takes the worst-case sum from 2.2x to 2.0x.
+    if (fine && engageQ10 > 0) {
+        const int64_t sumGradMmPerM = detailGradMmPerM + microGradMmPerM;
+        int64_t allowedSumMmPerM = kFineDetailSumCapKQ10 * slopeMmPerM / 1024;
+        if (allowedSumMmPerM < kFineDetailGradFloorMmPerM)
+            allowedSumMmPerM = kFineDetailGradFloorMmPerM;
+        if (sumGradMmPerM > allowedSumMmPerM) {
+            const int64_t capQ10 = allowedSumMmPerM * 1024 / sumGradMmPerM;
+            const int64_t scaleQ10 = 1024 - engageQ10 * (1024 - capQ10) / 1024;
+            detailMm = detailMm * scaleQ10 / 1024;
+            microDetailMm = microDetailMm * scaleQ10 / 1024;
+        }
+    }
     detailMm += microDetailMm;
 
     SurfaceEval s;
