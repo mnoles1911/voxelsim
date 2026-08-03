@@ -163,7 +163,7 @@ mutable state**:
 | | where it lives | why |
 |---|---|---|
 | **ocean** | global sea-level constant | trivially consistent everywhere |
-| **lake surfaces** | *should be* a baked datum | the bake's depression fill is what creates the basin; a lake at equilibrium is content, and making the CA rediscover it every session wastes work and invites divergence |
+| **lake surfaces** | *should be* a baked datum | a lake at equilibrium is content, and making the CA rediscover it every session wastes work and invites divergence |
 | **river bed + discharge** | baked | `channel.h` already carries `waterLineMm` with banks constrained to contain it |
 | **flowing / disturbed water** | runtime CA | genuinely mutable state |
 
@@ -172,9 +172,30 @@ own `kWaterCAVersion`, treated as world-breaking exactly like worldgen. That
 determinism is what makes multiplayer water tractable (§5). `swe.h`,
 `rivernet.h` and `rivercouple.h` complete the runtime side.
 
-**Open:** ocean handling has not been verified end-to-end, and lake surfaces
-are not currently baked datums. Both need checking before this section can be
-called settled.
+### AUDITED 2026-08-03 — three corrections, see `water-production-plan.md`
+
+**Nothing places water hydrologically at runtime.** There are three placement
+paths and none is hydrology: cavern flood levels (a hash of the seed,
+underground, 40% dry), an ocean breach that only fires when a player digs into
+it (`NotifyTerrainVoxelsCleared` skips anything at `Z >= 0`, so the sea is not
+water until then), and developer pours. Surface lakes are implemented nowhere.
+`ChannelField` has **zero references** outside its own tests and bench.
+
+**The depression fill DESTROYS basins, it does not create them.** The sentence
+that used to sit in the lake row above was backwards. `fill_depressions` is
+drainage *enforcement* — it levels basins into rock, and B4b re-runs it as the
+last step before the codec, because *"'The carrier drains' is a CONTRACT
+(0 sinks)"* (`pipeline.py:2931`). The bake ships a **pit-free heightfield by
+contract**, so there is nowhere for a lake to sit. The conclusion (lakes should
+be baked content) survives; the work is larger than serialising something that
+already exists. The raster is one deleted line away (`pipeline.py:3058`,
+`basin_depth` — 135 m deep over 2.2% of the wet exemplar); the decision and the
+format are not.
+
+**Sea level is not a constant anywhere.** It is 14 unnamed `0` literals across
+four languages, and `world_map.py:325` draws published maps at −3.0 m instead.
+The underwater test is `CameraZ < 0` with no terrain check, so a dry cavern
+below sea level reads as underwater.
 
 ## 5. Edits: seed plus delta, for terrain *and* water
 
@@ -185,10 +206,18 @@ ever re-shipped — the delta is kilobytes against 190 MB.
 
 This is the Minecraft / Space Engineers model and it is the right one.
 
-Water edits work the same way *because the CA is bit-deterministic*: same
-terrain, same initial state, same edits in the same order ⇒ the same water on
-every client. Dam a river and every client's CA independently produces the same
-flood. **The server's job is ordering, not simulation.**
+**CORRECTED 2026-08-03.** This section used to claim water edits replicate the
+same way *because* the CA is bit-deterministic — same terrain, same edits, same
+order ⇒ the same water everywhere, with the server merely ordering. That is
+true in principle and **is not what ships.** `NM_Client` never steps its own
+CA; it mirrors server fill-diffs via `MulticastWaterDiffs` →
+`setReplicatedFill`. The server simulates; the client displays.
+
+Keep it that way. ADR-0005 proves water cannot be replayed in bounded time, so
+a late joiner needs a snapshot regardless — which makes deterministic replay
+insufficient on its own. The work is to *shrink what the diffs carry*, and that
+is the strongest argument for maximising the baked-content share: content does
+not tick and does not replicate.
 
 The dependency worth naming: this holds only while every client has *identical
 terrain underneath*. A client that baked against an incomplete superblock would
@@ -265,7 +294,28 @@ rather than a mystery. Keep it that way — never let the single-player path
    single-player.
 7. **Cap the hydrology pyramid** — a world-design decision (§2).
 
-Not on this list, and deliberately: mass-baking the world. Two known defects
-would be baked in permanently — the L1 hydrology gap above, and task #24's
-coarse-tier drainage regression (69% stranded at the steepest bin against a
-17.5% baseline). Fix before spending the storage.
+Not on this list, and deliberately: mass-baking the world. Defects baked in now
+are permanent, because a shipped tile is never regenerated.
+
+**Corrected 2026-08-03.** This previously blocked on "task #24's coarse-tier
+drainage regression, 69% stranded at the steepest bin". That figure is **stale
+and was misframed**, and re-measuring inverted it:
+
+* The coarse row reads **24.2% at v22**, not 69%. v21's micro-cap reduction
+  already fixed it; the 69% was real at v17/v18 only.
+* The "4× regression" was a **labelling artifact** —
+  `tools/drainage-ladder.ps1` labels rows by whole-tile p50 grade while probing
+  an off-centre 384 m quadrant. Re-sorted by the grade actually probed, both
+  ladders are monotone and 69% is not an outlier; v14's 17.5% was the anomaly.
+* **The live defect is on the FINE tier, not the coarse one** (task #47).
+  Median added stranding across paired windows: v14 0.3%, v18 0.0%,
+  **v22 11.3%** (mean 16.0%). The step is at v19 — letting the micro pool
+  exceed the carrier gradient — not at v17.
+
+So the blockers before mass-baking are: the **fine-tier micro cap** (#47), the
+**L1 hydrology gap**, and **world identity reproducibility** (#46), without
+which a mass-baked world cannot be extended later anyway.
+
+And never quote a single ladder row: on one tile at v22 the amplified stranded
+figure ranges 1.3% to 93.2% across windows. Report the row, its carrier, and
+the spread.
