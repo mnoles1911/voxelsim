@@ -1214,13 +1214,38 @@ def compute_conditioning_digest(
     Raises ``ConditioningDataMissing`` if any listed file is absent -- see
     that exception for why refusing beats inventing.
     """
+    digests = conditioning_file_digests(files, root)
+    lines = [f"{n}:{digests[n]}" for n in sorted(files)]
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def conditioning_file_digests(
+    files: "tuple[str, ...] | list[str]" = DEFAULT_CONDITIONING_FILES,
+    root: "str | Path | None" = None,
+) -> dict[str, str]:
+    """Per-file sha256 of the conditioning rasters: ``{relative name: sha256}``.
+
+    The same bytes ``compute_conditioning_digest`` folds into one number, kept
+    ITEMISED. The digest alone answers "is this the same conditioning data?";
+    it cannot answer "which file moved?", and on 2026-08-03 that second
+    question was the whole investigation -- four of the six files matched
+    across machines and the two that did not were exactly the two
+    ``tools/bootstrap_pod.sh`` BUILDS rather than downloads
+    (``etopo_10m.tif``, and the ``synthetic_map_stats.json`` derived from it).
+    Recovering that took a manual hash-by-hash comparison against a pod that
+    no longer exists. ``world_manifest`` records this mapping with every world
+    so the next such comparison is a diff of two files already on disk.
+
+    Raises ``ConditioningDataMissing`` for the same reason the digest does:
+    inventing an identity for data this process cannot see is the failure
+    mode, not the safety net.
+    """
     resolved = resolve_conditioning_root(root)
-    names = sorted(files)
+    names = sorted(set(files))
     missing = [n for n in names if not (resolved / n).is_file()]
     if missing:
         raise ConditioningDataMissing(resolved, missing)
-    lines = [f"{n}:{_sha256_of_file(resolved / n)}" for n in names]
-    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+    return {n: _sha256_of_file(resolved / n) for n in names}
 
 
 def verify_conditioning_digest(

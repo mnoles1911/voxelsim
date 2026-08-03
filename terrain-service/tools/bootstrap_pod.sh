@@ -285,6 +285,52 @@ ok "checkpoint sha256 $SHA"
 
 # ---------------------------------------------------------------------------
 # 7. WorldClim + ETOPO reference rasters
+#
+# THESE TWO STEPS ARE WHY A WORLD CANNOT BE EXTENDED BY A SECOND MACHINE, and
+# fixing that is a NEXT STEP this script does not yet take. Measured
+# 2026-08-03 (docs/measurements/world-identity-not-reproducible-2026-08-03.txt):
+# of the six files compute_conditioning_digest() hashes, the four DOWNLOADED
+# WorldClim rasters were byte-identical on a fresh pod and the two BUILT here
+# were not --
+#
+#     etopo_10m.tif            9,344,975 B here vs 8,442,844 B on the pod
+#     synthetic_map_stats.json    12,297 B      vs    12,570 B
+#
+# -- which moves the conditioning digest, which moves provider_id, which makes
+# the new tiles a different world. Two independent causes, both structural:
+#
+#   * tools/fetch_etopo.py tries four NOAA URLs in order, including both a
+#     _bed and a _surface variant of ETOPO 2022, so WHICHEVER IS REACHABLE
+#     THAT DAY decides the bytes; and it then resamples through whatever
+#     rasterio/GDAL the pod resolved, whose TIFF writer defaults (tiling,
+#     compression, metadata) are not stable across versions. That is enough on
+#     its own to explain a 902 KB length difference.
+#   * synthetic_map_stats.json is DERIVED from etopo, so it inherits that drift
+#     and adds its own.
+#
+# THE FIX IS TO DOWNLOAD THEM, NOT BUILD THEM -- exactly as the WorldClim block
+# below already downloads its four. The shape of it:
+#
+#   1. Build the pair ONCE (the copies on the 2026-08-02 box are a known-good
+#      candidate: etopo 9a45dd6dc5b0959c, stats 8fe9d083f10a0daf).
+#   2. Publish them somewhere with immutable, content-addressed URLs.
+#      NO HOSTING LOCATION IS CHOSEN HERE ON PURPOSE. It is a ~9 MB binary and
+#      a small JSON; git-lfs, a release asset, an object-store bucket and the
+#      HF checkpoint repo are all plausible and they differ in who pays, who
+#      can revoke it, and whether a pod behind a proxy can reach it. Pick it
+#      deliberately. DO NOT commit the 9 MB blob into this git repo without
+#      that decision being made explicitly -- it is permanent in every clone.
+#   3. Pin each file's sha256 in this script and verify after download, the
+#      way $SHA already gates the checkpoint. A silent substitution here is a
+#      new planet.
+#   4. Keep fetch_etopo.py as the documented fallback for building the pair
+#      from scratch, but make it print loudly that a locally built raster will
+#      NOT match the published one and starts a world of its own.
+#
+# Until that lands, the guarantee is the weaker one world_manifest.py provides:
+# every world records the sha256 of all six conditioning files, so a machine
+# that cannot reproduce a world is told which file moved instead of silently
+# generating a second planet into the first one's directory.
 # ---------------------------------------------------------------------------
 say "7/8 reference rasters (WorldClim + ETOPO)"
 mkdir -p data/global

@@ -103,6 +103,18 @@ def main():
     print(f"provider_id: {pid}")
     print(f"cache      : {cache.path(pid, a.seed, 0, 0, cfg.scale).parent}")
 
+    # This tool writes tiles straight into the cache, so it owes the world the
+    # same identity record pregen writes -- a world extended by whichever tool
+    # was handy must not be half-documented. Note --conditioning-root: this
+    # tool hashes the root it is pointed at, which is the root the model reads.
+    from terrain_service.world_manifest import record_world_identity
+
+    ok, msg = record_world_identity(cache, provider, a.seed, pid)
+    if msg:
+        print(msg)
+    if not ok:
+        return 2
+
     if a.verify:
         x, y = a.verify
         raw = cache.get(pid, a.seed, x, y, cfg.scale)
