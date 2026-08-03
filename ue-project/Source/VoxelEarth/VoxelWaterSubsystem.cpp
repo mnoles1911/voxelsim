@@ -4,6 +4,8 @@
 #include "VoxelEarth.h"
 #include "VoxelEditRelay.h"
 #include "VoxelWaterChunkComponent.h"
+#include "VoxelFineTileStreamer.h"  // CoarseTileForWorldMm -- one addressing rule
+#include "VoxelTileCodec.h"         // GetFineTileDecompressor -- the CODEC_ZSTD boundary
 #include "VoxelWorldSubsystem.h"
 
 // ADR-0006 water pool (voxel.Water.GPU): a SECOND INSTANCE of the terrain
@@ -159,6 +161,136 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 }
 } // namespace
 
+// Baked lakes with their own fine-tile source (watershed plan work item 4).
+//
+// WHY THIS OWNS A SECOND SAMPLER instead of borrowing the terrain's. The fine
+// tier is streamed by FVoxelFineTileStreamer, which lives inside
+// FVoxelWorldImpl -- a struct defined only in VoxelWorldSubsystem.cpp -- and
+// keeps its vxc::FineTileSampler private behind an FRWLock. Reaching it would
+// mean a public accessor on a subsystem this file already documents as
+// belonging to someone else, and the same reasoning that made this file build
+// its own Amplifier applies unchanged.
+//
+// THE DUPLICATION IS CHEAPER THAN IT LOOKS, which is what makes it acceptable
+// rather than merely convenient. vxc::FineTileSampler decodes lazily, ONE
+// 256x256 block at a time, and a LakeSampler only ever reads the blocks
+// covering a basin's bbox -- the survey's median basin is 0.59 ha, about 1,700
+// fine pixels. So this holds the tile headers and the handful of blocks the
+// lakes near the player actually occupy, not the 201 MB lattice.
+//
+// The path layout is NOT restated here: vxc::formatFineTileCacheKey is the
+// same function FVoxelFineTileStreamer::LocalPathFor uses, so the two cannot
+// drift, and CoarseTileForWorldMm is its addressing rule rather than a second
+// copy of the arithmetic.
+class FLakeWaterSampler final : public vxc::IWaterSampler
+{
+public:
+	FLakeWaterSampler(uint64 InSeed, FString InRoot, std::string InProviderId)
+		: Tiles(InSeed), Lakes(Tiles), Root(MoveTemp(InRoot)), ProviderId(MoveTemp(InProviderId))
+	{
+		Tiles.setDecompressor(VoxelEarth::GetFineTileDecompressor());
+	}
+
+	int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override
+	{
+		EnsureTileFor(vx, vy);
+		return Lakes.waterSurfaceMmAtVoxel(vx, vy);
+	}
+
+	uint64 TilesLoaded() const { return Loaded; }
+	uint64 TilesMissing() const { return Missing.Num(); }
+	uint64 TilesRefused() const { return Refused; }
+	size_t ResidentMasks() const { return Lakes.residentMaskCount(); }
+
+private:
+	// Loads the fine tile under this voxel column if it is not already
+	// resident. A tile that is absent or refused is remembered, so a world
+	// with no fine tier costs one stat() per tile for the whole session rather
+	// than one per query.
+	void EnsureTileFor(int64_t vx, int64_t vy)
+	{
+		const vxc::TileCoord T = FVoxelFineTileStreamer::CoarseTileForWorldMm(
+			vx * vxc::kVoxelSizeMm, vy * vxc::kVoxelSizeMm);
+		if (Tiles.findTile(T.x, T.y) != nullptr)
+		{
+			return;
+		}
+		const uint64 Key = (uint64(uint32(T.x)) << 32) | uint64(uint32(T.y));
+		if (Missing.Contains(Key))
+		{
+			return;
+		}
+		const std::string CacheKey = vxc::formatFineTileCacheKey(ProviderId, Tiles.seed(), T.x, T.y);
+		const FString Path = FPaths::Combine(Root, FString(CacheKey.c_str()) + TEXT(".vxtl"));
+		vxc::FineError Err = vxc::FineError::kNone;
+		if (!Tiles.loadTileFile(std::filesystem::path(*Path), &Err))
+		{
+			Missing.Add(Key);
+			// A tile that is simply not baked is expected and silent. Bytes
+			// that ARE there and do not parse are not: that is a corrupt or
+			// foreign-version tile, and silently treating it as "no lake here"
+			// is how a world loses its water without anyone noticing.
+			if (Err != vxc::FineError::kFileUnreadable)
+			{
+				++Refused;
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Lake tier: fine tile (%d,%d) at %s was REFUSED (%s). Its lakes will be absent."),
+				       T.x, T.y, *Path, ANSI_TO_TCHAR(vxc::fineErrorName(Err)));
+			}
+			return;
+		}
+		++Loaded;
+	}
+
+	vxc::FineTileSampler Tiles;
+	vxc::LakeSampler Lakes;
+	FString Root;
+	std::string ProviderId;
+	TSet<uint64> Missing;
+	uint64 Loaded = 0;
+	uint64 Refused = 0;
+};
+
+// Resolves -VoxelFineTileDir / -VoxelFineTileProviderId with the SAME
+// precedence UVoxelWorldSubsystem::Initialize uses (switch wins, then
+// DefaultFineTileDir in DefaultGame.ini, then nothing). Restated here rather
+// than shared because the alternative is a public accessor on another
+// subsystem; the rule is three lines and the ini keys are the same two
+// strings, and a divergence shows up immediately as "terrain is fine, water
+// says there are no lakes".
+std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
+{
+	FString Dir;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), Dir) && GConfig)
+	{
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileDir"), Dir, GGameIni);
+	}
+	if (Dir.IsEmpty())
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Lake tier DISABLED: no -VoxelFineTileDir. Baked lakes need the fine tier "
+		            "(the basin table lives in the .vxtl); caverns and the ocean are unaffected."));
+		return std::make_unique<vxc::NullWaterSampler>();
+	}
+	if (FPaths::IsRelative(Dir))
+	{
+		Dir = FPaths::Combine(FPaths::ProjectContentDir(), Dir);
+		FPaths::CollapseRelativeDirectories(Dir);
+	}
+	FString ProviderId;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), ProviderId) && GConfig)
+	{
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileProviderId"), ProviderId, GGameIni);
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Lake tier ENABLED: root=%s provider=%s seed=%llu. Lakes come from the baked basin "
+	            "table (bake_ver 8); a tile baked before it carries none and answers dry."),
+	       *Dir, *ProviderId, (unsigned long long)Seed);
+	return std::make_unique<FLakeWaterSampler>(Seed, Dir, std::string(TCHAR_TO_UTF8(*ProviderId)));
+}
+
 // FVoxelWaterImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWaterSubsystem.h (UHT-parsed) never sees a voxel-core header (same
 // pattern as FVoxelWorldImpl in VoxelWorldSubsystem.cpp).
@@ -168,6 +300,7 @@ struct FVoxelWaterImpl
 		: Terrain(InTerrain)
 		, Tiles(InTerrain.GetSeed())
 		, Amp(InTerrain.GetSeed(), Tiles)
+		, Water(MakeWaterSampler(InTerrain.GetSeed()))
 		, Mob(
 			  // The implicit static flood field (C7, docs/cavern-design.md SS5.1):
 			  // worldgen-owned, deterministic, ZERO storage. caverns.h's
@@ -195,10 +328,16 @@ struct FVoxelWaterImpl
 			  // AT the datum instead of snapping to the 10 cm lattice.
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
 			  {
-				  const vxc::ColumnSample& Col = Amp.columnCached(vx, vy);
-				  return vxc::implicitWaterFill(vz, Col.surfaceMm,
-				      Water->waterSurfaceMmAtVoxel(vx, vy),
-				      vxc::cavernFloodedAt(Col.cavern, vz));
+				  if (vxc::cavernFloodedAt(Amp.columnCached(vx, vy).cavern, vz))
+				  {
+					  return 255;
+				  }
+				  const int32_t SurfMm = Water->waterSurfaceMmAtVoxel(vx, vy);
+				  if (SurfMm == vxc::kNoWaterMm)
+				  {
+					  return 0;
+				  }
+				  return vxc::implicitWaterFill(vz, GroundMmAt(vx, vy), SurfMm, false);
 			  },
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
 			  { return Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; })
@@ -210,6 +349,51 @@ struct FVoxelWaterImpl
 	}
 
 	UVoxelWorldSubsystem& Terrain;
+
+	// THE GROUND UNDER A BAKED LAKE MUST COME FROM THE TERRAIN'S OWN AMPLIFIER,
+	// not from `Amp` below, and this is the one place in this file where that
+	// distinction is load-bearing rather than a documented caveat.
+	//
+	// `Amp` is built over a SyntheticTileSampler (see its comment): under
+	// -VoxelTileDir it is amplifying a DIFFERENT WORLD from the one on screen.
+	// For cavern flood levels that has been a known, tolerated inaccuracy. For
+	// a baked lake it is fatal: the datum comes from the BAKED surface, so
+	// bounding it below with the synthetic surface would put the water tens or
+	// hundreds of metres away from its own bed -- buried in rock, or a sheet
+	// hanging in the air -- and neither would look like a bug in the water
+	// code.
+	//
+	// UVoxelWorldSubsystem::GetSurfaceHeightUU is the terrain's own amplifier
+	// column, is documented as a pure query safe from the game thread, and is
+	// what AVoxelClipmapActor and the movement component already use for
+	// exactly this "where is the ground here" question. So the lake half uses
+	// it, and the cavern half is left on `Amp` unchanged -- fixing that is the
+	// column-accessor follow-up this file has been asking for and is not this
+	// change.
+	//
+	// MEMOISED PER COLUMN because the ImplicitFn's caller sweeps z innermost:
+	// without it a 26 m brick column costs 260 amplifier evaluations for one
+	// answer that cannot change.
+	int32_t GroundMmAt(int64_t vx, int64_t vy)
+	{
+		if (bGroundMemoValid && vx == GroundMemoVx && vy == GroundMemoVy)
+		{
+			return GroundMemoMm;
+		}
+		const double UU = Terrain.GetSurfaceHeightUU(double(vx) * VoxelCoords::VoxelSizeUU,
+		                                             double(vy) * VoxelCoords::VoxelSizeUU);
+		// 1 UU = 10 mm (VoxelCoords.h: VoxelSizeUU 10 UU/voxel == kVoxelSizeMm
+		// 100 mm/voxel). Rounded, not truncated, so the bound does not bias a
+		// centimetre low and shave the bottom voxel off every lake.
+		GroundMemoMm = int32_t(FMath::RoundToDouble(UU * 10.0));
+		GroundMemoVx = vx;
+		GroundMemoVy = vy;
+		bGroundMemoValid = true;
+		return GroundMemoMm;
+	}
+	int64_t GroundMemoVx = 0, GroundMemoVy = 0;
+	int32_t GroundMemoMm = 0;
+	bool bGroundMemoValid = false;
 
 	// OUR OWN worldgen sampler, not UVoxelWorldSubsystem's. That subsystem is
 	// another agent's file and exposes no column/cavern accessor, so — exactly
@@ -226,26 +410,20 @@ struct FVoxelWaterImpl
 	vxc::SyntheticTileSampler Tiles;
 	vxc::Amplifier Amp;
 
-	// BAKED LAKES, and the reason this is a pointer to an interface rather
-	// than a LakeSampler. A LakeSampler needs a vxc::FineTileSampler&, which
-	// this process owns nowhere: the fine tier is streamed by
-	// FVoxelFineTileStreamer (VoxelFineTileStreamer.h), which keeps its
-	// sampler PRIVATE behind an FRWLock and exposes only an ITileSampler proxy
-	// -- correctly, because FineTileSampler is not safe for concurrent
-	// queries. So the seam is here and the injection is a host decision.
+	// BAKED LAKES (watershed plan work item 4). An interface pointer, not a
+	// LakeSampler by value, because "no fine tier" is a SUPPORTED configuration
+	// and not a null check at every call: with no baked tiles this is a
+	// NullWaterSampler answering kNoWaterMm everywhere, and the client behaves
+	// exactly as it did before lakes existed.
 	//
-	// WHAT IS AND IS NOT DONE, stated plainly rather than left as a TODO
-	// nobody reads: the composition, the extent rule, the datum and the
-	// partial fill are all shipped and tested (voxelcore/lakes.h,
-	// tests/test_lakes.cpp, and a cross-language fixture against the bake's
-	// own definition). What is NOT done is handing this member a real
-	// LakeSampler, which needs FVoxelFineTileStreamer to expose its sampler
-	// under the same lock its proxy already takes. Until it does, this is a
-	// NullWaterSampler and the client behaves EXACTLY as it did before --
-	// no lake, no regression, and no pretence that there is one.
+	// MakeWaterSampler below resolves -VoxelFineTileDir with the same precedence
+	// UVoxelWorldSubsystem uses, so a run that has fine terrain has lakes and a
+	// run that does not, does not -- there is no third state where the water and
+	// the ground disagree about which world this is.
 	//
-	// MUST outlive Mob: the ImplicitFn captures `this` and dereferences it.
-	std::unique_ptr<vxc::IWaterSampler> Water = std::make_unique<vxc::NullWaterSampler>();
+	// MUST be declared before Mob: the ImplicitFn captures `this` and
+	// dereferences this member on every voxel it is asked about.
+	std::unique_ptr<vxc::IWaterSampler> Water;
 
 	// MUST be declared before CA: makeSolidFn() hands the CA a callable that
 	// captures the mobilizer, so the mobilizer has to outlive it.
@@ -2387,11 +2565,32 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			{
 				const int64 Vx = int64(Bx) * vxc::WaterBrick8::kEdge;
 				const int64 Vy = int64(By) * vxc::WaterBrick8::kEdge;
-				const int32 FloodZMm = Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm;
-				if (FloodZMm == INT32_MIN)
+				// THE CEILING IS THE HIGHER OF THE TWO IMPLICIT WATER SOURCES,
+				// and it used to be only the first.
+				//
+				// This filter read `cavern.floodZMm` alone, so a column with no
+				// CAVERN was skipped outright -- and a baked surface lake lives
+				// in exactly such a column. The ImplicitFn below would have
+				// filled it correctly; it was simply never asked, because the
+				// candidate sweep never offered the brick. The watershed plan
+				// SS5.2 asserts the opposite ("RefreshImplicitWater ... will
+				// pick up lake cells the moment the ImplicitFn includes them"),
+				// and that is wrong: this loop does not consult the ImplicitFn,
+				// it re-derives the ceiling itself. Measured before the fix, at
+				// a lake with 19.6 m of water standing over the camera's own
+				// column: "0 candidate brick(s)".
+				//
+				// So the ceiling is now max(cavern flood, lake datum). Both are
+				// "water fills open air below this level in this column", which
+				// is the same shape by construction (voxelcore/lakes.h), so
+				// this is one max() and not a second code path.
+				const int32 CavernZMm = Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm;
+				const int32 LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
+				if (CavernZMm == INT32_MIN && LakeZMm == vxc::kNoWaterMm)
 				{
-					continue; // dry column
+					continue; // dry column: no cavern below it and no lake on it
 				}
+				const int32 FloodZMm = FMath::Max(CavernZMm, LakeZMm);
 				// Only bricks whose bottom sits below the flood level can hold
 				// any water at all.
 				const int64 FloodBrickZ = vxc::floorDiv(int64(FloodZMm) / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
