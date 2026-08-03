@@ -134,20 +134,26 @@ elevation and flow planes bit-identical on round trip. So the real numbers are:
 That materially changes the streaming story — a player's visible surroundings
 are under two megabytes.
 
-**Neither end can use it yet, for two separate reasons** (task #43):
+**Both ends can now use it** (task #43 — this paragraph previously said neither
+could, and that is out of date):
 
-* `pregen` has **no `--codec` flag**, and `codec` reaches `_encode_fine` only
-  if a caller passes it, so "every tile pregen has ever written is
-  uncompressed" — including all 17 in the cache today.
-* The client cannot decode `CODEC_ZSTD` at all. `VoxelTileCodec.h` records that
-  the plan assumed UE 5.8 ships zstd in `Engine/Source/ThirdParty` and it does
-  not: "no zstd.h, no zstd*.lib, no zstd module, and no .Build.cs anywhere ...
-  There IS no engine-provided C zstd to borrow here today." The build confirms
-  it, logging `no zstd module found` and dropping `CODEC_ZSTD` support, so such
-  a tile is refused with `kNoDecompressor` rather than mis-decoded.
+* `pregen --codec {raw,zstd}` exists, defaulting to `raw`. There is
+  deliberately **no `auto`**: a flag that quietly fell back to raw would fill a
+  cache with uncompressed tiles its operator believed were compressed.
+* The client decodes `CODEC_ZSTD` by binding a zstd at **runtime**, through the
+  platform loader, from `Binaries/ThirdParty/zstd/Win64/libzstd.dll`
+  (`TryRegisterRuntimeZstd`, fetched by `tools/fetch-zstd.ps1`). The original
+  measurement still holds — UE 5.8's binary distribution ships no C/C++ zstd —
+  and it is *why* the decoder is injected rather than linked: `ThirdParty/Blosc`
+  already statically links a zstd into the same binary, and a second copy of
+  those C symbols at a version nobody chose fails as **wrong terrain, not a link
+  error**. With no DLL present, a `CODEC_ZSTD` tile is still refused whole with
+  `kNoDecompressor` and never decoded as zeros.
 
-Both are plumbing against a ratio that is already known. Size storage and
-egress from 33 MB, not 190.
+**What has not happened is the migration.** Every fine tile in the cache today
+is still `CODEC_RAW`, because the flag defaults to raw and nothing has been
+re-baked with it. Sizing storage and egress from 33 MB is now a decision to
+make, not a blocker to clear.
 
 Client-side caching is already built and already bounded: a **12 GiB LRU**
 keyed on `<provider_id>/<seed>/s16/<x>_<y>`, with identity validation that
