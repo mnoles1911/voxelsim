@@ -4065,6 +4065,28 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 		       SpawnPitchDegrees);
 	}
 
+	// -VoxelSpawnYaw=<degrees, 0 = +X, 90 = +Y>: added for the W3 entrance
+	// captures, and the paragraph above is the reason it did not exist sooner.
+	// Fixing yaw at +X is right for a VISTA -- two shots of one column then
+	// differ only in the quantity being varied -- but it makes a DIRECTIONAL
+	// feature unphotographable unless it happens to face -X. The v25 entrance
+	// cavities are exactly that: a hillside mouth opens toward the downhill
+	// side, and at the grassland site vxc_caveprobe measured every one of them
+	// opening toward -Y. With yaw pinned at 0 the only available frames were of
+	// the back of the hill.
+	//
+	// The DEFAULT IS STILL 0 and the switch is still absent from every existing
+	// command line, so the archive stays shot-to-shot comparable; this only lets
+	// a capture say which way it is looking when that is the thing being varied.
+	// State the yaw in the writeup whenever it is non-zero.
+	float SpawnYawDegrees = 0.f;
+	const bool bHasSpawnYaw = FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnYaw="), SpawnYawDegrees);
+	if (bHasSpawnYaw)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnYaw override: camera yaw %.1f deg (0 = +X, 90 = +Y)."),
+		       SpawnYawDegrees);
+	}
+
 	// GetSurfaceHeightUU is the PURE WORLDGEN column height -- it ignores caving.
 	// At a column where a cavern or cave void breaches down from (or up to) the
 	// surface, the worldgen surface is open air and a pawn spawned there+5m falls
@@ -4126,7 +4148,9 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	}
 
 	const FVector SpawnLocation(SpawnWorldX, SpawnWorldY, GroundTopUU + SpawnHeightAboveSurfaceUU);
-	const FRotator SpawnRotation = bHasSpawnPitch ? FRotator(SpawnPitchDegrees, 0.f, 0.f) : FRotator::ZeroRotator;
+	const FRotator SpawnRotation = (bHasSpawnPitch || bHasSpawnYaw)
+		                           ? FRotator(SpawnPitchDegrees, SpawnYawDegrees, 0.f)
+		                           : FRotator::ZeroRotator;
 	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
 	RestartPlayerAtTransform(NewPlayer, SpawnTransform);

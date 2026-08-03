@@ -838,10 +838,23 @@ VXC_TEST(cave_entrance_daylights_sideways_on_real_relief) {
     //
     // v25 gets mouths out of the SAME construct as dolines, by clipping the
     // cavity's roof against the real ground: where the ground falls away the
-    // roof becomes the hillside, and the chamber opens through it. The
-    // signature asserted here is a roofed entrance void whose rock cover is
-    // THINNER than the roof clamp -- which only the entrance exception can
-    // produce, and only where a void has met falling ground.
+    // roof becomes the hillside, and the chamber opens through it.
+    //
+    // THE SIGNATURE, AND THE ONE THAT DID NOT WORK. This test first asserted "a
+    // roofed entrance void with cover thinner than the 6 m roof clamp", which
+    // looks like a hillside signature and is not one: near the rim the lens roof
+    // pinches to nothing, so the cover there is just the drawn floor depth,
+    // [5, 9) m, which is under 6 m for more than half of all sites on DEAD FLAT
+    // ground. It measures the lens, not the hill, and it passed vacuously.
+    //
+    // What actually separates the two is WHICH SURFACE CLIPPED THE ROOF, and
+    // the open set's shape is the readout: the cavity is open to the sky exactly
+    // where the ground clipped it. On flat ground that is a compact disc around
+    // the axis, strictly interior to the footprint. On falling ground it is
+    // pushed off-axis and reaches the footprint RIM, because out there the hill
+    // has cut the roof away completely -- which is a horizontal mouth. So this
+    // asserts an open column in the OUTER FIFTH of the footprint, which a bore
+    // cannot produce and a flat-ground doline does not.
     SyntheticTileSampler tiles(kSeed);
     Amplifier amp(kSeed, tiles);
     int64_t ei = 0, ej = 0;
@@ -850,15 +863,22 @@ VXC_TEST(cave_entrance_daylights_sideways_on_real_relief) {
     const int64_t nvx = floorDiv(n.xMm, int64_t(kVoxelSizeMm));
     const int64_t nvy = floorDiv(n.yMm, int64_t(kVoxelSizeMm));
 
-    int64_t footprint = 0, roofed = 0, thinRoof = 0, floorSpots = 0;
+    int64_t footprint = 0, roofed = 0, rimOpen = 0, floorSpots = 0, maxRSq = 0;
+    int32_t openMinSurfMm = INT32_MAX, openMaxSurfMm = INT32_MIN;
+    // Two passes -- "the outer fifth" is meaningless before the footprint
+    // radius is known, and the radius is a per-site hash draw.
     for (int64_t dy = -160; dy <= 160; dy += 2)
         for (int64_t dx = -160; dx <= 160; dx += 2) {
             const ColumnSample col = amp.column(nvx + dx, nvy + dy);
             if (col.cave.shaftMarginSq <= 0) continue;
             ++footprint;
-            if (col.cave.shaftDepthMinMm <= 0) continue;
-            ++roofed;
-            if (col.cave.shaftDepthMinMm < kCaveRoofMinMm) ++thinRoof;
+            if (dx * dx + dy * dy > maxRSq) maxRSq = dx * dx + dy * dy;
+            if (col.cave.shaftDepthMinMm > 0) {
+                ++roofed;
+                continue;
+            }
+            if (col.surfaceMm < openMinSurfMm) openMinSurfMm = col.surfaceMm;
+            if (col.surfaceMm > openMaxSurfMm) openMaxSurfMm = col.surfaceMm;
             // Somewhere to stand inside it: the solid voxel under the void.
             const int64_t floorVz =
                 floorDiv(int64_t(col.surfaceMm) - col.cave.shaftDepthMaxMm - kVoxelSizeMm / 2,
@@ -866,13 +886,27 @@ VXC_TEST(cave_entrance_daylights_sideways_on_real_relief) {
                 1;
             if (Amplifier::materialAt(col, floorVz) != MAT_AIR) ++floorSpots;
         }
-    std::printf("    [caves] entrance on real terrain: %lld footprint columns, %lld roofed, "
-                "%lld with cover thinner than the %lld mm clamp, %lld with a solid floor\n",
-                (long long)footprint, (long long)roofed, (long long)thinRoof,
-                (long long)kCaveRoofMinMm, (long long)floorSpots);
+    for (int64_t dy = -160; dy <= 160 && maxRSq > 0; dy += 2)
+        for (int64_t dx = -160; dx <= 160; dx += 2) {
+            const ColumnSample col = amp.column(nvx + dx, nvy + dy);
+            if (col.cave.shaftMarginSq <= 0 || col.cave.shaftDepthMinMm > 0) continue;
+            if ((dx * dx + dy * dy) * 25 >= maxRSq * 16) ++rimOpen; // r >= 0.8 R
+        }
+    std::printf("    [caves] entrance on real terrain: %lld footprint columns (r=%.1f m), "
+                "%lld roofed, %lld open in the outer fifth (the hillside mouth), ground across "
+                "the opening %.1f..%.1f m, %lld standable floor spots\n",
+                (long long)footprint, std::sqrt(double(maxRSq)) * kVoxelSizeMm / 1000.0,
+                (long long)roofed, (long long)rimOpen,
+                openMinSurfMm == INT32_MAX ? 0.0 : openMinSurfMm / 1000.0,
+                openMaxSurfMm == INT32_MIN ? 0.0 : openMaxSurfMm / 1000.0, (long long)floorSpots);
     CHECK(footprint > 0);
     CHECK(roofed > 0);
-    CHECK(thinRoof > 0);
+    // The mouth itself: the cavity daylights at its own rim, which only falling
+    // ground can do. A bore cannot, and a flat-ground doline does not.
+    CHECK(rimOpen > 0);
+    // ...and the ground really is falling across the opening, so the line above
+    // is about the hill and not about an unlucky rim column.
+    CHECK(openMaxSurfMm - openMinSurfMm > 2000);
     // Mobs (plan 5.6): an entrance a player can walk into needs ground under it.
     CHECK(floorSpots > 0);
 }

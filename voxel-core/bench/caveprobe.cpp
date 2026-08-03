@@ -107,6 +107,12 @@
 //     --headroom M       walkable headroom for the floor-area stat (default 1.8)
 //     --steep MM         slope threshold in mm of relief per metre that counts
 //                        a column as STEEP for the entrance split (default 300)
+//     --scale N          tile raster scale: 1 = the 30 m COARSE tier (default),
+//                        16 = the FINE tier, which is what the editor renders
+//                        and therefore the only tier a capture site may be
+//                        chosen on -- the amplifier branches on the pitch
+//     --coarse-dir D     s1 tile dir supplying CLIMATE behind a --scale 16 run
+//                        (the fine tier carries elevation and flow, no climate)
 //     --connect N        connectivity flood-fill sample box edge (default 192
 //                        samples at 0.4 m = 76.8 m); 0 disables it
 //     --out PREFIX       output path prefix (default ./caveprobe)
@@ -292,7 +298,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr,
                      "usage: vxc_caveprobe <tiledir|--synthetic> <seed> [--origin XM YM]\n"
                      "       [--span M] [--px N] [--max-depth M] [--headroom M] [--steep MM]\n"
-                     "       [--connect N] [--out PREFIX] [--no-images] [--section-only]\n");
+                     "       [--connect N] [--scale N] [--coarse-dir D] [--out PREFIX] [--no-images]\n"
+                     "       [--section-only]\n");
         return 2;
     }
     const std::string dir = argv[1];
@@ -307,7 +314,8 @@ int main(int argc, char** argv) {
     // and again at 128 m -- so the box is sized to the feature, and the count
     // of open shaft nodes actually inside it is printed next to the result.
     int64_t maxDepthM = 45, steepMmPerM = 300, connectN = 512;
-    int px = 512;
+    int px = 512, tileScale = 1;
+    std::string coarseDir;
     bool images = true, sectionOnly = false, connectAtSet = false;
     double connectAtXM = 0, connectAtYM = 0;
     std::string outPrefix = "caveprobe";
@@ -319,6 +327,10 @@ int main(int argc, char** argv) {
             i += 2;
         } else if (a == "--span" && i + 1 < argc) {
             spanM = std::strtod(argv[++i], nullptr);
+        } else if (a == "--scale" && i + 1 < argc) {
+            tileScale = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
+        } else if (a == "--coarse-dir" && i + 1 < argc) {
+            coarseDir = argv[++i];
         } else if (a == "--px" && i + 1 < argc) {
             px = static_cast<int>(std::strtol(argv[++i], nullptr, 10));
         } else if (a == "--max-depth" && i + 1 < argc) {
@@ -353,9 +365,28 @@ int main(int argc, char** argv) {
     }
 
     // --- world ---------------------------------------------------------------
+    // TIER, AND IT IS NOT COSMETIC -- this tool measured the wrong world until
+    // W3's capture pass. The amplifier BRANCHES on the raster pitch
+    // (vxc::isFineTier): a different detail octave table, a different band
+    // split, a different channel-to-lattice mapping. Caves live in DEPTH SPACE
+    // under that surface, so a change of tier moves every cave in the world --
+    // docs/underground-system-plan.md section 2.5 says exactly this about v23.
+    // And the editor renders the FINE tier by default (ue-project/Config/
+    // DefaultGame.ini DefaultFineTileDir). So every entrance site this tool has
+    // ever named for a capture was named on a surface the game does not draw.
+    //
+    // The two tiers are also two different FILE FORMATS and two different
+    // samplers -- v1 flat tiles through TileGridSampler at s1, v2 block-coded
+    // tiles through FineTileSampler at s16 -- which is why pointing --scale 16
+    // at the s16 directory rejected all 17 tiles rather than loading them: the
+    // v1 parser was reading a v2 header. Both paths are wired here now, and the
+    // fine path takes the coarse sampler as its CLIMATE source exactly as the
+    // runtime does (the fine tier carries elevation and flow, never climate).
     SyntheticTileSampler synth(seed);
     TileGridSampler grid(seed, 1);
+    FineTileSampler fine(seed, &grid);
     ITileSampler* tiles = &synth;
+    const bool wantFine = tileScale != 1;
     if (dir != "--synthetic") {
         int loaded = 0, rejected = 0;
         std::error_code ec;
@@ -363,18 +394,47 @@ int main(int argc, char** argv) {
             if (e.path().extension() != ".vxtl") continue;
             std::optional<std::vector<uint8_t>> bytes = probeReadFileBytes(e.path());
             if (!bytes) { ++rejected; continue; }
-            std::optional<TileData> parsed = TileData::parse(bytes->data(), bytes->size());
-            if (!parsed) { ++rejected; continue; }
-            if (!grid.loadTile(std::move(*parsed))) { ++rejected; continue; }
+            if (wantFine) {
+                FineError err = FineError::kNone;
+                if (!fine.loadTile(*bytes, &err)) {
+                    std::fprintf(stderr, "  fine tile %s rejected (FineError %d)\n",
+                                 e.path().filename().string().c_str(), static_cast<int>(err));
+                    ++rejected;
+                    continue;
+                }
+            } else {
+                std::optional<TileData> parsed = TileData::parse(bytes->data(), bytes->size());
+                if (!parsed) { ++rejected; continue; }
+                if (!grid.loadTile(std::move(*parsed))) { ++rejected; continue; }
+            }
             ++loaded;
         }
-        std::printf("tiles loaded=%d rejected=%d scale=%d pixelSizeMm=%d\n", loaded, rejected,
-                    (int)grid.scale(), grid.pixelSizeMm());
+        // The fine tier carries no climate, so a fine run ALSO wants the coarse
+        // set behind it -- without it every column gets the bland default and
+        // the biome, topsoil and surface material are all wrong. Not fatal
+        // (caves read none of them), but it is stated rather than silent.
+        int coarseLoaded = 0;
+        if (wantFine && !coarseDir.empty()) {
+            for (auto& e : std::filesystem::directory_iterator(coarseDir, ec)) {
+                if (e.path().extension() != ".vxtl") continue;
+                std::optional<std::vector<uint8_t>> bytes = probeReadFileBytes(e.path());
+                if (!bytes) continue;
+                std::optional<TileData> parsed = TileData::parse(bytes->data(), bytes->size());
+                if (!parsed) continue;
+                if (grid.loadTile(std::move(*parsed))) ++coarseLoaded;
+            }
+        }
+        std::printf("tiles loaded=%d rejected=%d tier=%s pixelSizeMm=%d coarse-climate tiles=%d%s\n",
+                    loaded, rejected, wantFine ? "FINE (s16)" : "coarse (s1)",
+                    wantFine ? fine.pixelSizeMm() : grid.pixelSizeMm(), coarseLoaded,
+                    (wantFine && coarseLoaded == 0)
+                        ? "   <-- NO CLIMATE: biome/topsoil/surface material are defaults"
+                        : "");
         if (loaded == 0) {
             std::fprintf(stderr, "no tiles loaded from %s\n", dir.c_str());
             return 1;
         }
-        tiles = &grid;
+        tiles = wantFine ? static_cast<ITileSampler*>(&fine) : static_cast<ITileSampler*>(&grid);
     }
     Amplifier amp(seed, *tiles);
 
@@ -428,12 +488,11 @@ int main(int argc, char** argv) {
     // proxies -- "is there a void near a free face" -- and they were the only
     // entrance geometry this tool could see while an entrance was a bore. The
     // entrance is now a cavity that reports its own shape per column, so ask it
-    // directly instead: how much ground lies over one, how much of that is
+    // directly instead: how much ground lies over one, and how much of that is
     // ROOFED (a doline's overhanging lip, a mouth's ceiling) rather than open to
-    // the sky, and how much of the roofed part carries LESS cover than the roof
-    // clamp -- which is the signature of a cavity that has met falling ground,
-    // i.e. a horizontal mouth rather than a bowl.
-    int64_t entCols = 0, entOpenCols = 0, entRoofedCols = 0, entThinRoofCols = 0;
+    // the sky. That split is a region-wide statistic and it is honest; what it
+    // cannot do is separate a mouth from a doline -- see the note at the print.
+    int64_t entCols = 0, entOpenCols = 0, entRoofedCols = 0;
     int64_t entRoofedFlat = 0, entRoofedSteep = 0;
     // floors
     int64_t floorCols[kCaveFamilyCount] = {0, 0, 0, 0};
@@ -533,7 +592,6 @@ int main(int argc, char** argv) {
                     if (col.cave.shaftDepthMinMm > 0) {
                         ++entRoofedCols;
                         if (steep) ++entRoofedSteep; else ++entRoofedFlat;
-                        if (col.cave.shaftDepthMinMm < kCaveRoofMinMm) ++entThinRoofCols;
                     } else {
                         ++entOpenCols;
                     }
@@ -989,11 +1047,18 @@ int main(int argc, char** argv) {
                 "lip and hillside ceiling\n",
                 (long long)entRoofedCols, 100.0 * entRoofedCols / std::max<int64_t>(1, entCols),
                 (long long)entRoofedFlat, (long long)entRoofedSteep);
-    std::printf("  ... of which cover thinner than the %lld mm roof clamp: %lld (%.1f%% of "
-                "the footprint) -- a cavity meeting falling ground, i.e. a HORIZONTAL "
-                "MOUTH\n",
-                (long long)kCaveRoofMinMm, (long long)entThinRoofCols,
-                100.0 * entThinRoofCols / std::max<int64_t>(1, entCols));
+    // WHAT THIS SPLIT DOES *NOT* TELL YOU, recorded because the first
+    // version of this tool got it wrong and the wrong number was reported
+    // onward. "Roof thinner than the 6 m clamp" looks like a
+    // horizontal-mouth statistic and is not one: near the cavity rim the
+    // lens roof pinches to nothing, so the cover there is just the drawn
+    // floor depth, [5, 9) m, which is under 6 m for more than half of all
+    // sites ON DEAD FLAT GROUND. It measures the lens, not the hill. The
+    // open/roofed split above is real; the mouth-versus-doline question is
+    // about the SHAPE of the open set, needs the per-site footprint radius,
+    // and is answered per site in the site list below.
+    std::printf("  (mouth vs doline is a per-SITE question -- see the site list below; a\n"
+                "   roof-thickness threshold cannot answer it, see the comment here)\n");
 
     std::printf("\n--- floor area and headroom (5.6: where can a mob stand?) ---\n");
     std::printf("%-9s %14s %14s %12s %12s\n", "family", "floor spots", "m^2/km^2", "columns",
@@ -1145,6 +1210,93 @@ int main(int argc, char** argv) {
                             nd.depthMm / 1000.0,
                             isShaft ? (breaks ? "   [breaks surface]" : "   [GATED OPEN BUT SEALED]")
                                     : "");
+                // ENTRANCE SHAPE PER SITE (v25) -- so a capture is aimed at
+                // a site whose type has been VERIFIED rather than assumed.
+                // Three of nine vista sites picked by eye were wrong once
+                // already, and a mislabelled capture is worse than none
+                // because it becomes evidence in the owner's judgement.
+                //
+                // THE DISCRIMINATOR, AND THE ONE THAT DID NOT WORK. The
+                // first version of this classified a "horizontal mouth" as
+                // a column whose entrance roof is thinner than the 6 m roof
+                // clamp. That metric is CONTAMINATED and it briefly had me
+                // reporting 55% of every footprint as mouth: near the rim
+                // the lens roof pinches to nothing, so the cover there is
+                // just the cavity FLOOR DEPTH -- drawn from [5, 9) m -- and
+                // dips under a 6 m clamp on dead flat ground for more than
+                // half of all sites. It measures the lens, not the hill.
+                //
+                // What actually separates a hillside mouth from a doline is
+                // WHICH SURFACE CLIPPED THE ROOF. The cavity is open to the
+                // sky wherever the ground clipped it and roofed wherever
+                // its own lens did, so the shape of the OPEN set is the
+                // answer: on flat ground it is a compact disc around the
+                // axis, strictly interior to the footprint; on falling
+                // ground it is pushed off-axis and reaches the footprint
+                // RIM, because that is where the hill has cut the roof away
+                // entirely. So: centroid offset of the open set, and how
+                // much of it sits in the outer fifth of the footprint.
+                if (isShaft) {
+                    int64_t fpCols = 0, openCols = 0, roofCols = 0;
+                    int64_t openXMm = 0, openYMm = 0;
+                    int64_t fpMaxRSqMm = 0, openMaxRSqMm = 0;
+                    int32_t openMinSurfMm = INT32_MAX, openMaxSurfMm = INT32_MIN;
+                    // Two passes: the footprint radius has to be known
+                    // before "outer fifth" means anything.
+                    for (int64_t dy = -160; dy <= 160; dy += 2)
+                        for (int64_t dx = -160; dx <= 160; dx += 2) {
+                            const ColumnSample fc = amp.column(nvx + dx, nvy + dy);
+                            if (fc.cave.shaftMarginSq <= 0) continue;
+                            const int64_t rSq = (dx * dx + dy * dy) * kVoxelSizeMm * kVoxelSizeMm;
+                            if (rSq > fpMaxRSqMm) fpMaxRSqMm = rSq;
+                            ++fpCols;
+                            if (fc.cave.shaftDepthMinMm > 0) { ++roofCols; continue; }
+                            ++openCols;
+                            openXMm += dx * kVoxelSizeMm;
+                            openYMm += dy * kVoxelSizeMm;
+                            if (rSq > openMaxRSqMm) openMaxRSqMm = rSq;
+                            if (fc.surfaceMm < openMinSurfMm) openMinSurfMm = fc.surfaceMm;
+                            if (fc.surfaceMm > openMaxSurfMm) openMaxSurfMm = fc.surfaceMm;
+                        }
+                    const double fpRM = std::sqrt(double(fpMaxRSqMm)) / 1000.0;
+                    const double openRM = std::sqrt(double(openMaxRSqMm)) / 1000.0;
+                    int64_t rimOpen = 0;
+                    if (fpMaxRSqMm > 0)
+                        for (int64_t dy = -160; dy <= 160; dy += 2)
+                            for (int64_t dx = -160; dx <= 160; dx += 2) {
+                                const ColumnSample fc = amp.column(nvx + dx, nvy + dy);
+                                if (fc.cave.shaftMarginSq <= 0) continue;
+                                if (fc.cave.shaftDepthMinMm > 0) continue;
+                                const int64_t rSq =
+                                    (dx * dx + dy * dy) * kVoxelSizeMm * kVoxelSizeMm;
+                                if (rSq * 25 >= fpMaxRSqMm * 16) ++rimOpen; // r >= 0.8 R
+                            }
+                    const double cxM =
+                        openCols ? double(openXMm) / double(openCols) / 1000.0 : 0.0;
+                    const double cyM =
+                        openCols ? double(openYMm) / double(openCols) / 1000.0 : 0.0;
+                    const double offM = std::sqrt(cxM * cxM + cyM * cyM);
+                    const bool mouth = rimOpen > 0;
+                    std::printf("             shape: %s -- footprint r=%.1f m (%lld cols), "
+                                "open %lld / roofed %lld; open set centroid (%+.1f, %+.1f) m "
+                                "off-axis %.1f m, reaches r=%.1f m, %lld col(s) in the outer "
+                                "fifth; ground across the opening %.1f..%.1f m\n",
+                                mouth ? "MOUTH (opens at the rim)" : "doline (opens on axis)",
+                                fpRM, (long long)fpCols, (long long)openCols,
+                                (long long)roofCols, cxM, cyM, offM, openRM,
+                                (long long)rimOpen,
+                                openMinSurfMm == INT32_MAX ? 0.0 : openMinSurfMm / 1000.0,
+                                openMaxSurfMm == INT32_MIN ? 0.0 : openMaxSurfMm / 1000.0);
+                    // The capture path offers ONE yaw (+X: VoxelEarthGameMode
+                    // fixes it so two shots of a column differ only in the
+                    // quantity being varied), so a mouth is shootable head-on
+                    // only when its opening is displaced toward -X.
+                    if (mouth && cxM < -0.5)
+                        std::printf("             SHOOTABLE at yaw 0: -VoxelSpawnAt=%.1f,%.1f (METRES) "
+                                    "looking +X from %.1f m west\n",
+                                    nd.xMm / 1000.0 + 3.0 * cxM,
+                                    nd.yMm / 1000.0 + 3.0 * cyM, -3.0 * cxM);
+                }
                 ++listed;
             }
         if (!listed) std::printf("  (none in this region)\n");
@@ -1178,7 +1330,6 @@ int main(int argc, char** argv) {
     d.u64(static_cast<uint64_t>(mouthCols));
     d.u64(static_cast<uint64_t>(entCols));
     d.u64(static_cast<uint64_t>(entRoofedCols));
-    d.u64(static_cast<uint64_t>(entThinRoofCols));
     std::printf("\ncaveprobe census digest=%016llx  (kWorldGenVersion=%u)\n",
                 (unsigned long long)d.h, kWorldGenVersion);
     if (attrMismatch || memoMismatch) return 1;

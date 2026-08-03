@@ -72,6 +72,12 @@ param(
     # reproduces every pre-existing capture exactly: ground spawn, level camera.
     [double]$SpawnAltM = 0,
     [double]$SpawnPitch = 0,
+    # Yaw in degrees, 0 = +X (the historical fixed value), 90 = +Y. Added for
+    # the v25 entrance captures: a hillside cave mouth faces downhill, so with
+    # yaw pinned at 0 a site whose mouth opens toward -Y can only be
+    # photographed from behind the hill. Default 0 keeps every existing command
+    # line byte-identical.
+    [double]$SpawnYaw = 0,
     [int]$Width = 2560,
     [int]$Height = 1440,
     [int]$TimeoutSec = 420,
@@ -161,11 +167,14 @@ if ($SpawnAltM -ne 0) {
 if ($SpawnPitch -ne 0) {
     $argList += "-VoxelSpawnPitch=$($SpawnPitch.ToString([cultureinfo]::InvariantCulture))"
 }
+if ($SpawnYaw -ne 0) {
+    $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
+}
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
 $argList += $ExtraArgs
 
 $sun = if ($TimeScale -eq 0) { "sun frozen $TimeOfDay $Date" } else { "sun MOVING x$TimeScale from $TimeOfDay $Date -- NOT reproducible" }
-$pose = if ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0) { "alt +${SpawnAltM}m pitch ${SpawnPitch}deg" } else { "GROUND spawn, level camera (landform will NOT read)" }
+$pose = if ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0 -or $SpawnYaw -ne 0) { "alt +${SpawnAltM}m pitch ${SpawnPitch}deg yaw ${SpawnYaw}deg" } else { "GROUND spawn, level camera facing +X (landform will NOT read)" }
 Write-Host "capture '$Name' at $SpawnAt, $pose, settling ${SettleSec}s, ${Width}x${Height}, $sun" -ForegroundColor Cyan
 $started = Get-Date
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
