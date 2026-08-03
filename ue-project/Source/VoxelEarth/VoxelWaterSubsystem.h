@@ -412,6 +412,58 @@ public:
 	bool VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
 	                              uint64& OutReloadedVolume, int32& OutLiveMobilized, int32& OutReloadedMobilized);
 
+	// --- LAKE SHEETS AT RANGE (docs/watershed-system-plan.md item 5, §5.2) ----
+	//
+	// The near field meshes implicit water inside a 52 m brick disc and nothing
+	// outside it, so a 2 km lake is ABSENT from every vista. AVoxelWaterSheetActor
+	// draws the rest as flat translucent rectangles at the datum; these three
+	// methods are the only thing it needs from the water tier, and they are here
+	// rather than on the actor because this subsystem already owns the ONE
+	// fine-tier lake reader and a second one would be a second world.
+	//
+	// All three are no-ops (return 0/false) when there is no fine tier -- the
+	// same supported "no baked lakes" configuration MakeWaterSampler logs.
+
+	// The bbox and datum of one baked basin, in world UU. A copy, deliberately:
+	// the voxel-core registry it comes from is owned by a tile that can be
+	// evicted, and an actor holding a pointer across a rebuild would dangle.
+	struct FLakeSheetBasin
+	{
+		int32 TileX = 0;
+		int32 TileY = 0;
+		int32 BasinId = 0;
+		double MinXUU = 0.0, MinYUU = 0.0, MaxXUU = 0.0, MaxYUU = 0.0;
+		double SurfaceZUU = 0.0;
+	};
+
+	// Which fine tile a world point falls in. Exposed so a caller can walk the
+	// tiles of a region ONE PER TICK rather than asking for the whole region at
+	// once -- a fine tile is tens of MB on disk, and a 10 km square is up to 9
+	// of them, which is a multi-second game-thread stall if taken in one gather.
+	static void FineTileForWorldUU(double XUU, double YUU, int32& OutTileX, int32& OutTileY);
+
+	// Every water-holding basin of ONE fine tile whose bbox meets the square of
+	// half-extent RadiusUU around (CenterXUU, CenterYUU). Loads that tile, so it
+	// is game-thread only and does disk I/O; the caller budgets it. Returns the
+	// number appended.
+	int32 GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU, double CenterYUU,
+	                                  double RadiusUU, TArray<FLakeSheetBasin>& Out) const;
+
+	// One basin's wet extent as world-UU rectangles at the given decimation
+	// (`StepPx` fine pixels per emitted cell, >= 1). Appends; returns the count.
+	// False-y (0 rectangles) also means "this basin's tile would not resolve",
+	// which is why OutUnresolved is separate from an empty result: a lake that
+	// failed to decode must not read as a lake with no water in it.
+	int32 BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx, TArray<FBox2D>& OutRectsUU,
+	                          bool& bOutResolved) const;
+
+	// The XY footprint the implicit-water refresh is CURRENTLY meshing, plus the
+	// z span of its brick disc, so the sheet can cut an exact hole where the near
+	// field already draws water. False before the first refresh has run.
+	// The rectangle is inclusive of the whole 65-brick disc, i.e. exactly what
+	// RefreshImplicitWater sweeps -- not an approximation of it.
+	bool GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const;
+
 private:
 	TUniquePtr<FVoxelWaterImpl> Impl;
 

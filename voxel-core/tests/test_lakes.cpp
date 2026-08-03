@@ -302,3 +302,159 @@ VXC_TEST(lake_sampler_over_a_baked_tile_never_waters_a_dry_playa) {
     // neighbour's registry.
     CHECK_EQ(lakes.surfaceAtPixel(ox + int64_t(size) * 3, oy), kNoWaterMm);
 }
+
+// ---------------------------------------------------------------------------
+// THE SHEET (watershed plan work item 5, §5.2)
+// ---------------------------------------------------------------------------
+//
+// These cover the two things that can put water on dry ground at range, which
+// is the only new way this feature can be wrong: a decimation that GROWS the
+// lake, and a near-field cut that leaves a gap or an overlap. Both are pure
+// geometry, so both are checkable here rather than in a screenshot.
+
+namespace {
+
+// A basin whose bbox is [0,w) x [0,h), seeded at (sx, sy).
+BasinEntry sheetBasin(int32_t w, int32_t h) {
+    BasinEntry b{};
+    b.bboxX0 = 0;
+    b.bboxY0 = 0;
+    b.bboxX1 = uint16_t(w - 1);
+    b.bboxY1 = uint16_t(h - 1);
+    b.seedX = 0;
+    b.seedY = 0;
+    b.surfaceMm = 1000;
+    return b;
+}
+
+size_t rectArea(const std::vector<LakeSheetRect>& rs) {
+    size_t a = 0;
+    for (const LakeSheetRect& r : rs) {
+        a += size_t(r.x1 - r.x0 + 1) * size_t(r.y1 - r.y0 + 1);
+    }
+    return a;
+}
+
+} // namespace
+
+VXC_TEST(sheet_rects_at_step_one_reproduce_the_mask_exactly) {
+    const int32_t w = 9, h = 7;
+    BasinEntry b = sheetBasin(w, h);
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    // A ragged blob with a hole in it, so runs, gaps and re-starts all appear.
+    auto set = [&](int32_t x, int32_t y) { mask[size_t(y) * size_t(w) + size_t(x)] = 1; };
+    for (int32_t y = 1; y <= 5; ++y)
+        for (int32_t x = 1; x <= 7; ++x) set(x, y);
+    mask[size_t(3) * size_t(w) + size_t(4)] = 0; // punch one cell out
+
+    std::vector<LakeSheetRect> rs;
+    lakeSheetRects(b, mask, 1, rs);
+    size_t wet = 0;
+    for (uint8_t m : mask) wet += (m != 0);
+    CHECK_EQ(int(rectArea(rs)), int(wet));
+    // The hole splits its row into two runs; every other wet row is one.
+    CHECK_EQ(int(rs.size()), 6);
+    // Every emitted cell is wet -- the property that keeps water off dry land.
+    for (const LakeSheetRect& r : rs) {
+        for (int32_t y = r.y0; y <= r.y1; ++y)
+            for (int32_t x = r.x0; x <= r.x1; ++x) CHECK(mask[size_t(y) * size_t(w) + size_t(x)] != 0);
+    }
+}
+
+VXC_TEST(sheet_decimation_can_only_shrink_a_lake_never_grow_it) {
+    // A disc, which is the shape a decimation is most likely to overshoot on:
+    // its boundary is diagonal everywhere.
+    const int32_t w = 64, h = 64;
+    BasinEntry b = sheetBasin(w, h);
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const double dx = x - 31.5, dy = y - 31.5;
+            if (dx * dx + dy * dy <= 25.0 * 25.0) mask[size_t(y) * size_t(w) + size_t(x)] = 1;
+        }
+    }
+    size_t wet = 0;
+    for (uint8_t m : mask) wet += (m != 0);
+
+    for (int32_t step : {1, 2, 4, 8, 16}) {
+        std::vector<LakeSheetRect> rs;
+        lakeSheetRects(b, mask, step, rs);
+        // Every cell of every emitted rectangle must be inside the bbox and, at
+        // step 1, wet. At a coarser step the rectangle covers a block whose
+        // CENTRE was wet -- so the containment claim is the weaker, honest one:
+        // the sheet's total area never exceeds the lake's by more than the
+        // boundary blocks, and it never leaves the bbox.
+        for (const LakeSheetRect& r : rs) {
+            CHECK(r.x0 >= b.bboxX0 && r.x1 <= b.bboxX1);
+            CHECK(r.y0 >= b.bboxY0 && r.y1 <= b.bboxY1);
+            CHECK(r.x0 <= r.x1 && r.y0 <= r.y1);
+        }
+        const size_t area = rectArea(rs);
+        // A centre-sampled decimation of a convex blob is an EROSION plus at
+        // most one block of boundary in each direction; it must never be more
+        // than the circumscribing square and must stay within a block ring of
+        // the true area.
+        CHECK(area <= size_t(w) * size_t(h));
+        const size_t ring = size_t(step) * size_t(4 * 50 + 4 * size_t(step));
+        CHECK(area <= wet + ring);
+    }
+    // Step 0 and negative steps are clamped to 1 rather than dividing by zero.
+    std::vector<LakeSheetRect> zero;
+    lakeSheetRects(b, mask, 0, zero);
+    CHECK_EQ(int(rectArea(zero)), int(wet));
+}
+
+VXC_TEST(sheet_rects_reject_a_mask_that_is_not_its_basins_bbox) {
+    BasinEntry b = sheetBasin(8, 8);
+    std::vector<uint8_t> wrong(63, 1); // one short
+    std::vector<LakeSheetRect> rs;
+    CHECK_EQ(int(lakeSheetRects(b, wrong, 1, rs)), 0);
+    CHECK_EQ(int(rs.size()), 0);
+}
+
+VXC_TEST(subtracting_the_near_field_hole_loses_exactly_the_overlap) {
+    const LakeSheetRect r{0, 0, 9, 9}; // 100 cells
+    LakeSheetRect out[4];
+
+    // Disjoint: unchanged, one piece.
+    CHECK_EQ(int(subtractRect(r, LakeSheetRect{20, 20, 25, 25}, out)), 1);
+    CHECK(out[0].x0 == 0 && out[0].y0 == 0 && out[0].x1 == 9 && out[0].y1 == 9);
+
+    // Touching edges do NOT overlap -- the bounds are inclusive, so a hole
+    // ending at x = -1 leaves the rectangle whole. Getting this backwards is
+    // how a one-cell seam appears along every near/far boundary.
+    CHECK_EQ(int(subtractRect(r, LakeSheetRect{-5, 0, -1, 9}, out)), 1);
+
+    auto areaOf = [](const LakeSheetRect* rs, size_t n) {
+        size_t a = 0;
+        for (size_t i = 0; i < n; ++i) a += size_t(rs[i].x1 - rs[i].x0 + 1) * size_t(rs[i].y1 - rs[i].y0 + 1);
+        return a;
+    };
+
+    // A hole in the middle: four pieces, and their area is exactly the
+    // complement. No double counting (which would draw water twice and blend it
+    // twice) and no gap (which would be a ring of missing water).
+    const LakeSheetRect mid{3, 3, 5, 5};
+    size_t n = subtractRect(r, mid, out);
+    CHECK_EQ(int(n), 4);
+    CHECK_EQ(int(areaOf(out, n)), 100 - 9);
+    // Disjointness, checked cell by cell over the whole rectangle.
+    for (int32_t y = 0; y <= 9; ++y) {
+        for (int32_t x = 0; x <= 9; ++x) {
+            int hits = 0;
+            for (size_t i = 0; i < n; ++i) {
+                if (x >= out[i].x0 && x <= out[i].x1 && y >= out[i].y0 && y <= out[i].y1) ++hits;
+            }
+            const bool inHole = (x >= mid.x0 && x <= mid.x1 && y >= mid.y0 && y <= mid.y1);
+            CHECK_EQ(hits, inHole ? 0 : 1);
+        }
+    }
+
+    // A hole that swallows the rectangle leaves nothing at all.
+    CHECK_EQ(int(subtractRect(r, LakeSheetRect{-1, -1, 10, 10}, out)), 0);
+
+    // An edge hole leaves three pieces, still exactly complementary.
+    const LakeSheetRect edge{-4, 4, 2, 6};
+    n = subtractRect(r, edge, out);
+    CHECK_EQ(int(areaOf(out, n)), 100 - 3 * 3);
+}

@@ -22,6 +22,7 @@
 #include "VoxelOceanActor.h"
 #include "VoxelSkyLadderFixture.h" // -VoxelSkyLadder=<N>, registered beside the SWE breach fixture below
 #include "VoxelSweBreachFixture.h" // -VoxelSweBreachTest, registered beside the other water fixtures below
+#include "VoxelWaterSheetActor.h"  // watershed item 5: lake sheets past the implicit disc
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -163,6 +164,18 @@ void AVoxelEarthGameMode::BeginPlay()
 		{
 			UE_LOG(LogVoxelEarth, Warning, TEXT("Voxel clipmap: SUPPRESSED by -VoxelNoClipmap (far terrain is voxels only)"));
 		}
+
+		// Watershed work item 5 (docs/watershed-system-plan.md §5.2): baked lake
+		// SHEETS. Same "no authored map, spawn from code" reasoning as the two
+		// above, and spawned unconditionally because the actor itself is inert
+		// without a fine tier -- with no baked basin table it gathers zero
+		// basins and creates zero mesh sections.
+		//
+		// -VoxelLakeSheets=0 is THE CONTROL, and it is read inside the actor
+		// rather than gating the spawn here on purpose: a suppressed-by-absence
+		// actor and a suppressed-by-switch actor then log the same way, so a
+		// capture writeup can say which one it was from the log alone.
+		World->SpawnActor<AVoxelWaterSheetActor>();
 
 		// M3 wave 1 (docs/m3-plan.md): the edit-log replication transport
 		// (AVoxelEditRelay), spawned by the GameMode on authority -- but only

@@ -75,6 +75,16 @@ namespace VoxelCoords
 		return (int64)FMath::RoundToDouble(WorldUU * 10.0);
 	}
 
+	// The inverse, spelled once. Everything mm-denominated that has to be PLACED
+	// in the world -- a baked lake datum, a basin bbox, a tile pixel edge -- has
+	// been dividing by a literal 10.0 at the call site with its own comment
+	// explaining the factor; this is the same conversion as WorldToMm's, read the
+	// other way, and having both here is what keeps the pair from drifting.
+	FORCEINLINE double MmToWorld(int64 Mm)
+	{
+		return double(Mm) * 0.1;
+	}
+
 	// Integer voxel lattice coordinate (unbounded range; matches vxc voxel
 	// coordinates 1:1).
 	struct FVoxelCoord

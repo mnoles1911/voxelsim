@@ -491,6 +491,77 @@ cannot see — Fresnel-weighted, so near zero when looked down into.
 Work item 4's rendering half is now an owner judgement on the W6 captures, not
 an open defect; work item 5 stays unstarted behind that judgement.
 
+**Correction, 2026-08-03 (work item 5). The clipmap-band row above understated
+the gap by two orders of magnitude, and the fix is wider than "the clipmap
+bands".** The row reads as though R0 covers the near field and the clipmap
+covers 1–16.4 km, leaving water missing only at range. It does not. R0's water
+is `RefreshImplicitWater`'s **52 m disc**, and the voxel ring cascade runs to
+4 km — so water was absent from **26 m outward**, over ground that is voxels,
+not clipmap, for the first four kilometres of it. Basin 1 of tile (-12,-5) is
+2.0 × 2.4 km; 99.9% of it could never be drawn at any pose. `AVoxelWaterSheetActor`
+therefore draws sheets from the implicit disc's own edge outward, not from the
+clipmap's inner hole.
+
+**What was measured before building it, because the sheet would have been
+pointless otherwise.** The clipmap samples the COARSE tier (`Impl->Tiles`,
+30 m/px), which is the diffusion model's own output — the bake's B5 re-open
+writes the hole into the FINE tile only. So the far terrain need not have
+contained the basin at all, and a sheet at the datum would have been buried.
+Measured over basin 1's 801,409-cell extent (which reproduces the registry's
+281.7 ha exactly): coarse ground runs a median **5.1 m below** the datum, and
+only **0.9%** of the lake's area sits above it; through the clipmap's actual
+256 m vertex lattice, median 4.5 m below and **6.2%** above. The bowl survives
+into the coarse tier. That was not a foregone conclusion and is the reason
+work item 5 is buildable without a fine-tier far field.
+
+**The handover is a rectangle subtraction, not a fade.** Sheet and voxel water
+are coplanar at the datum, so an overlap is a z-fight *and* a doubled
+translucent blend, and a gap is a ring of missing water. `vxc::subtractRect`
+cuts the implicit disc's exact footprint out of the sheet, and the cut is
+applied only when that disc is actually meshing water at that basin's datum —
+the disc is bounded in z as well as xy, so a camera 30 m above the lake has no
+near-field water to hand over to and must not have a hole cut for it.
+
+**Measured frame cost, at the pose the 2 km capture was taken from**
+(2560×1440, static perf leg, post-warmup, two runs per config):
+
+| | p50 ms | p95 ms |
+| --- | --- | --- |
+| sheets ON | 7.819 / 7.860 | 8.780 / 8.767 |
+| sheets OFF | 7.803 / 7.811 | 8.671 / 8.633 |
+| **delta (means)** | **+0.032** | **+0.121** |
+
+Same-config spread is 0.041/0.008 ms at p50 and 0.013/0.038 ms at p95, so the
+p50 delta is inside the noise and the **p95 delta is not**: the sheet costs
+about **0.12 ms at p95**, 0.7% of a 16.7 ms budget, in a frame where the lake
+covers roughly 30% of the pixels. §7's "sheets add bounded overdraw" is now a
+number rather than a claim. The water rebuild was re-measured in the same wave
+and did not regress: 4,225 candidates, 23 ticks, 1,812 ms.
+
+**Two things the captures show that are worth knowing before judging them.**
+First, the sheet is ONE translucent surface where the near field is a meshed
+shell whose faces blend more than once, so the same material reads lighter
+across the seam — measured at the handover, blueness +44.5 on the sheet side
+against +76.8 on the voxel side, with no gap between them. Second, the 10 km
+frames contain a large blue wedge in the mid-ground that is **present in the
+no-sheet control** and is therefore not this feature: it is the pre-existing
+clipmap inner-hole seam, and it would have been reported as a sheet bug if the
+control had not been taken.
+
+**§5.3 is done and was verified in-engine rather than by reading.** The
+underwater/swim predicate needed no new code — item 1 routed it through
+`IsUnderwaterAtWorld` and item 4 put the lake datum into `implicitFillAt` — but
+"needs no change" is a claim, so it was photographed: a camera at z = 356.3 m,
+over worldgen ground at 345.5 m, with sea level at 0, logs `Ocean: camera
+entered water`. Nothing but the baked datum can return true there; the old
+camera test and `IsOpenSeaAtWorld` both say dry.
+
+**What work item 5 does NOT do.** The scan radius is 10 km (the range this
+section's own verification names), because a fine tile holds its whole
+compressed `.vxtl` resident and the clipmap's 65.5 km half-extent would have
+asked for ~81 of them, ~3 GB. Basins beyond 10 km draw no sheet: a bounded,
+logged absence rather than an unbounded load. `-VoxelLakeSheetRangeM` moves it.
+
 ### 5.3 Being in it
 
 Underwater/swim tests must consult actual water (CA fill, implicit field via
@@ -668,9 +739,16 @@ A/B hillshade of a kept basin (visual bisection convention); suite green.*
 top fill. *Unblocks: seeing it. Verified: §11's script — capture + dig-drain
 leg + ledger/shortfall assertions.*
 
-**5. Lake sheets in the clipmap bands + swim/underwater against the datum.**
-*Unblocks: lakes at range; honest shorelines in vistas. Verified: capture at
-2–10 km; `VoxelPerfRun post-warmup` frame delta measured, not predicted.*
+**5. Lake sheets in the clipmap bands + swim/underwater against the datum —
+DONE on this branch.** `AVoxelWaterSheetActor` draws a flat translucent
+rectangle set per baked basin at its own datum, from the same extent masks the
+near field consumes, cutting the implicit disc's exact footprint out of itself.
+The swim/underwater half needed no new code and was verified in-engine anyway.
+Read §5.2's 2026-08-03 correction before touching it: the gap was from 26 m,
+not from the clipmap's inner hole. *Verified: captures at 2 km and 10 km, each
+with its no-sheet control, plus the near/far handover and a submerged frame;
+`VoxelPerfRun post-warmup` p95 delta **+0.121 ms** at 2560×1440 against a
+same-config noise floor of 0.013–0.038 ms.*
 
 **6. ADR-0005 UE-side hook.**
 Write the water blob + mobilized set beside the edit log; load-back;

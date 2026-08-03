@@ -197,6 +197,22 @@ public:
 		return Lakes.waterSurfaceMmAtVoxel(vx, vy);
 	}
 
+	// Work item 5's sheet half. Same load-then-ask shape as the column query
+	// above, so a sheet and a voxel disc over the same lake can never be reading
+	// two different tile sets.
+	const std::vector<vxc::BasinEntry>* basinsForTile(int32_t tx, int32_t ty) override
+	{
+		EnsureTile(tx, ty);
+		return Lakes.basinsForTile(tx, ty);
+	}
+	const std::vector<uint8_t>* extentMaskFor(int32_t tx, int32_t ty, uint16_t id) override
+	{
+		EnsureTile(tx, ty);
+		return Lakes.extentMaskFor(tx, ty, id);
+	}
+	uint32_t tilePixels() const override { return Tiles.tileSize(); }
+	int32_t pixelSizeMm() const override { return Tiles.pixelSizeMm(); }
+
 	uint64 TilesLoaded() const { return Loaded; }
 	uint64 TilesMissing() const { return Missing.Num(); }
 	uint64 TilesRefused() const { return Refused; }
@@ -211,6 +227,12 @@ private:
 	{
 		const vxc::TileCoord T = FVoxelFineTileStreamer::CoarseTileForWorldMm(
 			vx * vxc::kVoxelSizeMm, vy * vxc::kVoxelSizeMm);
+		EnsureTile(T.x, T.y);
+	}
+
+	void EnsureTile(int32_t Tx, int32_t Ty)
+	{
+		const vxc::TileCoord T{Tx, Ty};
 		if (Tiles.findTile(T.x, T.y) != nullptr)
 		{
 			return;
@@ -4944,6 +4966,149 @@ bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 	// edited overlay -- which is exactly what the seabed test needs: a pit a
 	// player dug into land is not an ocean, and its edited ground is.
 	return IsOpenSeaAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
+}
+
+// --- LAKE SHEETS AT RANGE (watershed plan item 5, §5.2) ---------------------
+//
+// All three of these are thin: the registry, the extent rule and the
+// decomposition all live in voxelcore/lakes.h, and what is here is the world-UU
+// arithmetic plus the tile enumeration. That split is the point -- the geometry
+// is unit-tested in ctest without an engine, and the engine half cannot express
+// a different lake shape than the near field's because it reads the same masks
+// through the same sampler.
+
+void UVoxelWaterSubsystem::FineTileForWorldUU(double XUU, double YUU, int32& OutTileX, int32& OutTileY)
+{
+	const vxc::TileCoord T =
+		FVoxelFineTileStreamer::CoarseTileForWorldMm(VoxelCoords::WorldToMm(XUU), VoxelCoords::WorldToMm(YUU));
+	OutTileX = T.x;
+	OutTileY = T.y;
+}
+
+int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU,
+                                                        double CenterYUU, double RadiusUU,
+                                                        TArray<FLakeSheetBasin>& Out) const
+{
+	if (!Impl || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // loads a tile file; see the header
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(TileX, TileY);
+	if (Basins == nullptr)
+	{
+		return 0; // no fine tier, tile absent, or baked before the registry
+	}
+	// Read AFTER the tile is resolved: both are 0 until one has loaded.
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return 0;
+	}
+
+	const int64 OxPx = int64(TileX) * TileSize, OyPx = int64(TileY) * TileSize;
+	const int32 Before = Out.Num();
+	for (size_t i = 0; i < Basins->size(); ++i)
+	{
+		const vxc::BasinEntry& B = (*Basins)[i];
+		if (!B.holdsWater())
+		{
+			continue; // a dry playa has no sheet, by the same rule the sampler uses
+		}
+		// Inclusive pixel bbox -> world UU, taking the OUTER edge of the last
+		// pixel so the rectangle covers the pixels rather than their centres
+		// (the same convention BuildLakeSheetRects uses).
+		FLakeSheetBasin Info;
+		Info.TileX = TileX;
+		Info.TileY = TileY;
+		Info.BasinId = int32(i);
+		Info.MinXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX0) * PixelMm);
+		Info.MinYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY0) * PixelMm);
+		Info.MaxXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX1 + 1) * PixelMm);
+		Info.MaxYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY1 + 1) * PixelMm);
+		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(B.surfaceMm));
+		if (Info.MaxXUU < CenterXUU - RadiusUU || Info.MinXUU > CenterXUU + RadiusUU ||
+		    Info.MaxYUU < CenterYUU - RadiusUU || Info.MinYUU > CenterYUU + RadiusUU)
+		{
+			continue;
+		}
+		Out.Add(Info);
+	}
+	return Out.Num() - Before;
+}
+
+int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx,
+                                                 TArray<FBox2D>& OutRectsUU, bool& bOutResolved) const
+{
+	bOutResolved = false;
+	if (!Impl || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread());
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(Basin.TileX, Basin.TileY);
+	if (Basins == nullptr || Basin.BasinId < 0 || size_t(Basin.BasinId) >= Basins->size())
+	{
+		return 0;
+	}
+	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
+	const std::vector<uint8_t>* Mask =
+		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+	if (Mask == nullptr)
+	{
+		// The tile or one of its elevation blocks would not decode. Reporting
+		// this apart from "no water" is the whole reason bOutResolved exists:
+		// a lake that failed to load looks exactly like a lake that is dry.
+		return 0;
+	}
+	bOutResolved = true;
+
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return 0;
+	}
+	const int64 OxPx = int64(Basin.TileX) * TileSize, OyPx = int64(Basin.TileY) * TileSize;
+
+	std::vector<vxc::LakeSheetRect> Rects;
+	vxc::lakeSheetRects(B, *Mask, FMath::Max(StepPx, 1), Rects);
+
+	const int32 Before = OutRectsUU.Num();
+	OutRectsUU.Reserve(OutRectsUU.Num() + int32(Rects.size()));
+	for (const vxc::LakeSheetRect& R : Rects)
+	{
+		OutRectsUU.Add(FBox2D(
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x0) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y0) * PixelMm)),
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x1 + 1) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y1 + 1) * PixelMm))));
+	}
+	return OutRectsUU.Num() - Before;
+}
+
+bool UVoxelWaterSubsystem::GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const
+{
+	if (!Impl || !Impl->bImplicitCenterValid)
+	{
+		return false;
+	}
+	// EXACTLY the sweep in RefreshImplicitWater: bricks [C-R, C+R] inclusive on
+	// each axis, each vxc::WaterBrick8::kEdge voxels of VoxelCoords::VoxelSizeUU.
+	// Derived from the same two constants rather than restated as metres, so a
+	// change to the disc cannot leave the sheet cutting the wrong hole.
+	const double BrickUU = double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU;
+	const VoxelCoords::FVoxelCoord C = Impl->LastImplicitCenterBrick;
+	OutXY = FBox2D(FVector2D(double(C.X - kImplicitRadiusBricks) * BrickUU,
+	                         double(C.Y - kImplicitRadiusBricks) * BrickUU),
+	               FVector2D(double(C.X + kImplicitRadiusBricks + 1) * BrickUU,
+	                         double(C.Y + kImplicitRadiusBricks + 1) * BrickUU));
+	OutMinZUU = double(C.Z - kImplicitRadiusBricksZ) * BrickUU;
+	OutMaxZUU = double(C.Z + kImplicitRadiusBricksZ + 1) * BrickUU;
+	return true;
 }
 
 void UVoxelWaterSubsystem::GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,

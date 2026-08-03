@@ -156,6 +156,36 @@ public:
     // cache lazily, and pretending otherwise would be a lie the caller might
     // thread on.
     virtual int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) = 0;
+
+    // ---- THE SHEET HALF (watershed plan work item 5, §5.2) ----------------
+    //
+    // `waterSurfaceMmAtVoxel` answers "is there water over THIS column", which
+    // is the only question the near field's brick sweep asks. A sheet asks the
+    // other one: "which lakes are near me, and where does each one END". That
+    // cannot be reconstructed from a per-column query without walking every
+    // column in a 10 km disc, so the registry the sampler already holds is
+    // exposed rather than re-derived.
+    //
+    // DEFAULTED TO "NOTHING HERE", not pure virtual, for the same reason
+    // NullWaterSampler exists at all: a client with no fine tier is a supported
+    // configuration, and it should draw no sheets by construction rather than
+    // by a null check at the call site.
+    //
+    // The pointers are borrowed and stay valid until the sampler is destroyed
+    // or the underlying tile is evicted; a caller that holds one across a tile
+    // load is holding a dangling pointer, which is why the UE actor copies what
+    // it needs into world space in the same call.
+    virtual const std::vector<BasinEntry>* basinsForTile(int32_t /*tx*/, int32_t /*ty*/) { return nullptr; }
+    // The 1-byte-per-cell wet mask over `basinsForTile(tx,ty)[id]`'s bbox, in
+    // the layout `lakeExtentFill` writes. nullptr when the tile or the basin is
+    // not resolvable -- which must NOT be read as "this basin is dry".
+    virtual const std::vector<uint8_t>* extentMaskFor(int32_t /*tx*/, int32_t /*ty*/, uint16_t /*id*/) {
+        return nullptr;
+    }
+    // Tile edge in fine pixels, and mm per fine pixel: what turns a tile-local
+    // bbox into world millimetres. 0 means "this sampler has no tiles".
+    virtual uint32_t tilePixels() const { return 0; }
+    virtual int32_t pixelSizeMm() const { return 0; }
 };
 
 // Answers kNoWaterMm everywhere. The client's default, so "no fine tier
@@ -238,6 +268,24 @@ public:
         return best;
     }
 
+    // ---- IWaterSampler's sheet half, over the index this class already builds.
+    const std::vector<BasinEntry>* basinsForTile(int32_t tx, int32_t ty) override {
+        TileIndex* idx = indexFor(tx, ty);
+        return idx == nullptr ? nullptr : idx->basins;
+    }
+    const std::vector<uint8_t>* extentMaskFor(int32_t tx, int32_t ty, uint16_t id) override {
+        TileIndex* idx = indexFor(tx, ty);
+        if (idx == nullptr || idx->basins == nullptr || id >= idx->basins->size()) return nullptr;
+        const std::vector<uint8_t>& m = maskFor(*idx, id, tx, ty);
+        // An EMPTY mask is `maskFor`'s "could not resolve" (it already counted
+        // an unresolved basin), not a dry one -- a dry basin has a mask full of
+        // zeroes, not no mask. Collapsing the two here would let the sheet draw
+        // nothing for a tile that failed to decode and call it a shoreline.
+        return m.empty() ? nullptr : &m;
+    }
+    uint32_t tilePixels() const override { return tiles_.tileSize(); }
+    int32_t pixelSizeMm() const override { return tiles_.pixelSizeMm(); }
+
     // Diagnostics, so a bug is a number rather than an impression.
     size_t residentMaskCount() const { return maskCount_; }
     // Basins skipped because their tile is not loaded or a block failed to
@@ -316,6 +364,111 @@ private:
     int32_t memoMm_ = kNoWaterMm;
     bool memoValid_ = false;
 };
+
+// ---------------------------------------------------------------------------
+// THE SHEET (watershed plan work item 5, §5.2)
+// ---------------------------------------------------------------------------
+//
+// WHAT PROBLEM THIS SOLVES, precisely. `RefreshImplicitWater` meshes water only
+// inside a 65-brick disc -- 52 m across. A lake is 2 km across. So beyond 26 m
+// a baked lake is simply ABSENT: not dim, not low-detail, absent. Every vista,
+// every screenshot from a ridge, every flight over the basin shows a dry hole
+// where the water is. That is the whole of work item 5's first half.
+//
+// WHY RECTANGLES AND NOT A HEIGHTFIELD. The sheet is FLAT by construction --
+// the datum is one number for the whole basin (§5.1) -- so the only thing its
+// geometry has to express is its OUTLINE. A rectangle decomposition of the wet
+// mask says exactly that and nothing else: no vertex carries a height, no
+// vertex can disagree with its neighbour, and the whole basin is a few hundred
+// triangles instead of the 1.6 million a per-cell grid over an 800k-cell extent
+// would be.
+//
+// WHY THE MASK IS DECIMATED RATHER THAN MESHED AT 1.875 m. At the range this
+// exists for, the shoreline's own pixel is far below the screen-space error of
+// the terrain it meets: the clipmap draws that ground at 256 m per vertex. A
+// decimation that keeps the outline within ~20 m is therefore invisible against
+// its own backdrop while costing 1/100th of the triangles. `step` is the
+// caller's, not a constant here, because the right value is a function of range
+// and the caller is the only one who knows it.
+//
+// THE DECIMATED CELL IS WET IFF ITS CENTRE CELL IS WET, which is the choice
+// that keeps the sheet INSIDE the lake. "Wet if any cell in the block is wet"
+// grows the lake by up to a step in every direction and floats water over dry
+// ground at the shore -- the exact artefact §5.1 spends its ground bound
+// avoiding in the near field. Eroding by a centre sample can only ever lose a
+// sliver of real water at the rim, which the near-field voxels draw anyway.
+
+// One wet rectangle, in tile-local FINE PIXELS, inclusive on all four sides.
+struct LakeSheetRect {
+    int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+};
+
+// Decomposes a basin's extent mask into axis-aligned rectangles at `step` fine
+// pixels, merging along X. Appends to `out`; returns the number appended.
+//
+// ROW RUNS, NOT A FULL RECTANGLE COVER. Merging in one axis is O(cells) and
+// gives a convex lake ~one rectangle per row; a full 2D cover would give fewer
+// primitives for a cost (and a bug surface) this does not need, since the
+// rectangles are coplanar and abut exactly -- there is no crack to open between
+// two of them however they are cut.
+template <class MaskT>
+size_t lakeSheetRects(const BasinEntry& b, const MaskT& mask, int32_t step,
+                      std::vector<LakeSheetRect>& out) {
+    if (step < 1) step = 1;
+    const int32_t w = int32_t(b.bboxX1) - int32_t(b.bboxX0) + 1;
+    const int32_t h = int32_t(b.bboxY1) - int32_t(b.bboxY0) + 1;
+    if (w <= 0 || h <= 0) return 0;
+    if (mask.size() != size_t(w) * size_t(h)) return 0;
+    const size_t before = out.size();
+    // Half a step, floored: the centre of a step-sized block. For step 1 this
+    // is the cell itself, so a step of 1 reproduces the mask exactly.
+    const int32_t half = step / 2;
+    for (int32_t cy = 0; cy < h; cy += step) {
+        const int32_t sy = (cy + half < h) ? (cy + half) : (h - 1);
+        int32_t runStart = -1;
+        for (int32_t cx = 0; cx < w; cx += step) {
+            const int32_t sx = (cx + half < w) ? (cx + half) : (w - 1);
+            const bool wet = mask[size_t(sy) * size_t(w) + size_t(sx)] != 0;
+            if (wet && runStart < 0) {
+                runStart = cx;
+            } else if (!wet && runStart >= 0) {
+                out.push_back(LakeSheetRect{b.bboxX0 + runStart, b.bboxY0 + cy,
+                                            b.bboxX0 + cx - 1,
+                                            b.bboxY0 + std::min(cy + step, h) - 1});
+                runStart = -1;
+            }
+        }
+        if (runStart >= 0) {
+            out.push_back(LakeSheetRect{b.bboxX0 + runStart, b.bboxY0 + cy, b.bboxX0 + w - 1,
+                                        b.bboxY0 + std::min(cy + step, h) - 1});
+        }
+    }
+    return out.size() - before;
+}
+
+// `r` minus `hole`, as up to four rectangles written to `out`; returns how many.
+// 0 means `r` is entirely inside `hole` and vanishes.
+//
+// THIS IS THE NEAR/FAR HANDOVER, and it is a subtraction rather than a fade
+// because the two water surfaces are COPLANAR: the sheet and the near field's
+// voxel water both sit at the datum, so an overlap is a z-fight AND a doubled
+// translucent blend, and a gap is a ring of missing water. Only an exact cut
+// gives neither, and an exact cut is available precisely because the near
+// field's disc is an axis-aligned box in brick space.
+inline size_t subtractRect(const LakeSheetRect& r, const LakeSheetRect& hole, LakeSheetRect out[4]) {
+    // Disjoint (inclusive bounds, so touching edges do NOT overlap).
+    if (hole.x1 < r.x0 || hole.x0 > r.x1 || hole.y1 < r.y0 || hole.y0 > r.y1) {
+        out[0] = r;
+        return 1;
+    }
+    size_t n = 0;
+    if (hole.y0 > r.y0) out[n++] = LakeSheetRect{r.x0, r.y0, r.x1, hole.y0 - 1};        // below
+    if (hole.y1 < r.y1) out[n++] = LakeSheetRect{r.x0, hole.y1 + 1, r.x1, r.y1};        // above
+    const int32_t my0 = std::max(r.y0, hole.y0), my1 = std::min(r.y1, hole.y1);
+    if (hole.x0 > r.x0) out[n++] = LakeSheetRect{r.x0, my0, hole.x0 - 1, my1};          // left
+    if (hole.x1 < r.x1) out[n++] = LakeSheetRect{hole.x1 + 1, my0, r.x1, my1};          // right
+    return n;
+}
 
 // The composed predicate of §5.1, as one function so the client's binding site
 // and the tests cannot express it differently.
