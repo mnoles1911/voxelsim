@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/cave_families.h"
 #include "voxelcore/caves.h"
 #include "voxelcore/connectivity.h"
 #include "voxelcore/generator.h"
@@ -660,4 +661,210 @@ VXC_TEST(cave_volume_fraction_is_cave_like_not_sponge_like) {
                 100.0 * frac);
     CHECK(frac > 0.001); // caves exist
     CHECK(frac < 0.15);  // ...and the ground is still ground
+}
+
+// --- per-family census (W1c of docs/underground-system-plan.md) -------------
+//
+// The three tests below exist because every number the underground redesign
+// will be judged on -- how much of the void is crevice, how many entrances
+// there are, whether there is anywhere for a mob to stand -- was previously
+// unmeasurable: caves.h flattens tunnels and crevices into one untagged
+// segs[] array, and nothing anywhere counted caverns separately from tunnels.
+// voxelcore/cave_families.h recovers the labels by differencing the SHIPPING
+// predicate over controlled lattice variants (see that header). vxc_caveprobe
+// reports the same statistics over a chosen world region with pictures; these
+// are the cheap ctest gates on the same quantities, so a retune that quietly
+// deletes a whole family or seals the network fails the build rather than
+// waiting to be noticed in a screenshot.
+//
+// The thresholds are deliberately wide. They are "this family still exists and
+// has not run away", not a pin of today's tuning -- W2 through W8 are all
+// EXPECTED to move these numbers, and a gate that has to be edited on every
+// commit is a gate nobody reads.
+
+VXC_TEST(cave_family_attribution_is_exact) {
+    // The load-bearing claim of cave_families.h: the attribution is not an
+    // approximation. At every voxel, (tunnel | crevice | shaft) must equal
+    // caveCarveAt's own answer, and the recomputed lattice must reproduce the
+    // ColumnSample's memoised cave column. If a future change to caves.h adds
+    // a fourth thing to segs[], or makes the tunnel emission read crevHash,
+    // this fails here rather than silently skewing every census that uses it.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    int64_t voxels = 0, mismatches = 0, columns = 0, memoMismatches = 0;
+    for (int64_t x = -512; x <= 512; x += 7)
+        for (int64_t y = -512; y <= 512; y += 11) {
+            const ColumnSample col = amp.column(x, y);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            ++columns;
+            if (cv.full.count != col.cave.count ||
+                cv.full.shaftMarginSq != col.cave.shaftMarginSq ||
+                cv.full.shaftDepthMaxMm != col.cave.shaftDepthMaxMm)
+                ++memoMismatches;
+            for (int32_t s = 0; s < cv.full.count && s < col.cave.count; ++s)
+                if (cv.full.segs[s].marginSq != col.cave.segs[s].marginSq ||
+                    cv.full.segs[s].depthMm != col.cave.segs[s].depthMm)
+                    ++memoMismatches;
+
+            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            for (int64_t vz = topVz; vz > topVz - 450; --vz) {
+                if (Amplifier::stratigraphyAt(col, vz) == MAT_AIR) continue;
+                ++voxels;
+                bool truth = false;
+                const uint32_t m = caveFamilyMaskAt(cv, col.cavern, col.surfaceMm,
+                                                    col.bedrockDepthMm, vz, truth);
+                if (caveFamilyMaskIsCavePass(m) != truth) ++mismatches;
+            }
+        }
+    std::printf("    [caves] attribution: %lld voxels over %lld columns, %lld family "
+                "mismatches, %lld lattice/memo mismatches\n",
+                (long long)voxels, (long long)columns, (long long)mismatches,
+                (long long)memoMismatches);
+    CHECK(voxels > 0);
+    CHECK_EQ(mismatches, 0);
+    CHECK_EQ(memoMismatches, 0);
+}
+
+VXC_TEST(cave_per_family_volume_and_entrance_census) {
+    // FOOTPRINT, not stride, is what decides whether this test can see an
+    // entrance. Sinkhole candidate nodes are 102.4 m apart and 1-in-4 gated,
+    // so a +/-51.2 m box (the footprint most of this file uses) usually
+    // contains NO open shaft and reports "zero entrances exist" -- a property
+    // of the box, not of the world. It did exactly that when this test was
+    // first written. +/-102.4 m with a coarser stride costs the same and
+    // covers a full shaft period on both axes.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    int64_t solid = 0, columns = 0, colsWithAny = 0, perforated = 0;
+    int64_t famVox[kCaveFamilyCount] = {0, 0, 0, 0};
+    int64_t famCols[kCaveFamilyCount] = {0, 0, 0, 0};
+    for (int64_t x = -1024; x <= 1024; x += 11)
+        for (int64_t y = -1024; y <= 1024; y += 13) {
+            const ColumnSample col = amp.column(x, y);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            ++columns;
+            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            uint32_t colMask = 0;
+            bool topCarved = false;
+            for (int64_t vz = topVz; vz > topVz - 450; --vz) {
+                if (Amplifier::stratigraphyAt(col, vz) == MAT_AIR) continue;
+                ++solid;
+                bool truth = false;
+                const uint32_t m = caveFamilyMaskAt(cv, col.cavern, col.surfaceMm,
+                                                    col.bedrockDepthMm, vz, truth);
+                if (!m) continue;
+                if (vz == topVz) topCarved = true;
+                colMask |= m;
+                for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
+                    if (m & (1u << f)) ++famVox[f];
+            }
+            if (colMask) ++colsWithAny;
+            for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
+                if (colMask & (1u << f)) ++famCols[f];
+            if (topCarved) ++perforated;
+        }
+    CHECK(solid > 0);
+    CHECK(columns > 0);
+    static const char* kName[kCaveFamilyCount] = {"tunnel", "crevice", "shaft", "cavern"};
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
+        std::printf("    [caves] family %-8s %10lld voxels (%.4f%% of the solid band), "
+                    "%lld columns (%.3f%%)\n",
+                    kName[f], (long long)famVox[f], 100.0 * double(famVox[f]) / double(solid),
+                    (long long)famCols[f], 100.0 * double(famCols[f]) / double(columns));
+    std::printf("    [caves] entrances: %lld of %lld sampled surface columns are perforated "
+                "(%.4f%%); %lld columns (%.2f%%) have some cave beneath\n",
+                (long long)perforated, (long long)columns,
+                100.0 * double(perforated) / double(columns), (long long)colsWithAny,
+                100.0 * double(colsWithAny) / double(columns));
+
+    // Every family the generator set claims to have must actually be present.
+    // "Crevices fire" was previously only evidenced indirectly, by a segment
+    // count exceeding four; this counts their voxels.
+    CHECK(famVox[CAVE_FAM_TUNNEL] > 0);
+    CHECK(famVox[CAVE_FAM_CREVICE] > 0);
+    CHECK(famVox[CAVE_FAM_SHAFT] > 0);
+    // Tunnels dominate the void by construction (crevices are thin slabs
+    // riding tunnels, shafts are ~1.4 m bores).
+    CHECK(famVox[CAVE_FAM_TUNNEL] > famVox[CAVE_FAM_CREVICE]);
+    CHECK(famVox[CAVE_FAM_SHAFT] < famVox[CAVE_FAM_TUNNEL]);
+    // The surface is not a colander. Same statement as the roof test's
+    // shaft-column bound, but stated on CARVED surface voxels rather than on
+    // columns that merely fall inside a shaft radius.
+    CHECK(perforated * 200 < columns);
+    // ...and it is not sealed either: entrances exist in this footprint.
+    CHECK(perforated > 0);
+}
+
+VXC_TEST(cave_floor_area_and_headroom_budget) {
+    // Plan 5.6: mobs are coming, and they are a client of every generator.
+    // "Navigable floor and headroom" is currently an assertion about tube
+    // diameters; this measures the thing that actually matters -- solid ground
+    // with continuous walkable air above it, per family -- so a future spawn
+    // system inherits a measured surface budget instead of a guess, and so a
+    // passage rework that quietly leaves nowhere to stand is caught.
+    constexpr int64_t kHeadVox = 18; // 1.8 m of clearance
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+
+    int64_t columns = 0, floorSpots[kCaveFamilyCount] = {0, 0, 0, 0};
+    int64_t floorCols = 0, headroomSumVox = 0;
+    std::vector<uint32_t> fam(451, 0);
+    std::vector<uint8_t> air(451, 0);
+    for (int64_t x = -1024; x <= 1024; x += 11)
+        for (int64_t y = -1024; y <= 1024; y += 13) {
+            const ColumnSample col = amp.column(x, y);
+            const CaveColumnVariants cv = caveColumnVariantsFor(kSeed, x, y, col.surfaceMm);
+            ++columns;
+            const int64_t topVz = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            for (int64_t k = 0; k <= 450; ++k) {
+                const int64_t vz = topVz - k;
+                if (Amplifier::stratigraphyAt(col, vz) == MAT_AIR) {
+                    fam[size_t(k)] = 0;
+                    air[size_t(k)] = 1;
+                    continue;
+                }
+                bool truth = false;
+                const uint32_t m = caveFamilyMaskAt(cv, col.cavern, col.surfaceMm,
+                                                    col.bedrockDepthMm, vz, truth);
+                fam[size_t(k)] = m;
+                air[size_t(k)] = m ? 1 : 0;
+            }
+            bool anyHere = false;
+            for (int64_t k = 1; k <= 450; ++k) {
+                if (air[size_t(k)]) continue;             // not solid ground
+                if (!fam[size_t(k - 1)]) continue;        // the air above is not cave air
+                int64_t clear = 0;
+                for (; clear < kHeadVox; ++clear) {
+                    const int64_t kk = k - 1 - clear;
+                    if (kk < 0) break; // ran out of the scanned band: open to the sky
+                    if (!air[size_t(kk)]) break;
+                }
+                if (clear < kHeadVox) continue;
+                const int32_t f = caveDominantFamily(fam[size_t(k - 1)]);
+                if (f < 0) continue;
+                ++floorSpots[f];
+                headroomSumVox += clear;
+                anyHere = true;
+            }
+            if (anyHere) ++floorCols;
+        }
+
+    int64_t total = 0;
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f) total += floorSpots[f];
+    static const char* kName[kCaveFamilyCount] = {"tunnel", "crevice", "shaft", "cavern"};
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
+        std::printf("    [caves] standable floor, %-8s %lld spots\n", kName[f],
+                    (long long)floorSpots[f]);
+    std::printf("    [caves] standable floor: %lld spots over %lld sampled columns "
+                "(%.2f%% of columns), mean clearance %.2f m at a %.1f m requirement\n",
+                (long long)total, (long long)columns, 100.0 * double(floorCols) / double(columns),
+                total ? double(headroomSumVox) * kVoxelSizeMm / 1000.0 / double(total) : 0.0,
+                double(kHeadVox * kVoxelSizeMm) / 1000.0);
+
+    CHECK(columns > 0);
+    // There is somewhere to stand, and it is a routine feature rather than a
+    // curiosity: a walkable tunnel floor under at least 1% of sampled columns.
+    CHECK(total > 0);
+    CHECK(floorSpots[CAVE_FAM_TUNNEL] > 0);
+    CHECK(floorCols * 100 > columns);
 }

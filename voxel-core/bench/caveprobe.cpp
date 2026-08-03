@@ -129,6 +129,7 @@
 #include <vector>
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/cave_families.h"
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
 #include "voxelcore/connectivity.h"
@@ -139,28 +140,18 @@ using namespace vxc;
 namespace {
 
 // --- families ---------------------------------------------------------------
-// Bit positions, because a voxel can legitimately belong to more than one (a
-// shaft bottom IS a backbone node, so its lowest voxels are inside four
-// tunnels as well). Everything that needs a single label uses kFamPriority.
-enum : uint32_t {
-    FAM_TUNNEL = 0,
-    FAM_CREVICE = 1,
-    FAM_SHAFT = 2,
-    FAM_CAVERN = 3,
-    kFamCount = 4,
-};
-const char* kFamName[kFamCount] = {"tunnel", "crevice", "shaft", "cavern"};
-// Shaft first: it is the entrance, and an entrance that gets relabelled
-// "tunnel" because its bottom sits on a junction is the one attribution
-// mistake that would make the plan's headline stat meaningless.
-const uint32_t kFamPriority[kFamCount] = {FAM_SHAFT, FAM_CAVERN, FAM_TUNNEL, FAM_CREVICE};
+// The attribution itself lives in voxelcore/cave_families.h so that this tool
+// and test_caves.cpp cannot drift apart about what a "crevice voxel" is; see
+// that header for why differencing the shipping predicate is the only honest
+// way to label a carved voxel. Everything below is presentation.
+const char* kFamName[kCaveFamilyCount] = {"tunnel", "crevice", "shaft", "cavern"};
 
 struct Rgb {
     uint8_t r, g, b;
 };
 // Deliberately far apart in hue AND in luminance, so the plan views survive
 // being looked at on a bad monitor or printed to a grey PDF.
-const Rgb kFamColour[kFamCount] = {
+const Rgb kFamColour[kCaveFamilyCount] = {
     {90, 150, 255},  // tunnel  -- blue
     {80, 230, 210},  // crevice -- cyan
     {255, 80, 60},   // shaft   -- red
@@ -257,69 +248,6 @@ bool writePng(const std::string& path, const std::vector<uint8_t>& rgb, int w, i
     const size_t wrote = std::fwrite(out.data(), 1, out.size(), f);
     std::fclose(f);
     return wrote == out.size();
-}
-
-// --- lattice variants (see the header comment's attribution argument) --------
-
-// A crevHash whose gate is CLOSED. caveCreviceGateOpen tests
-// ((h >> 61) & 7) == 0, so any value with a set bit in 61..63 closes it.
-constexpr uint64_t kCrevHashClosed = 1ull << 61;
-
-struct ColumnCaves {
-    CaveColumn full;    // tunnels + crevices + shaft (== ColumnSample::cave)
-    CaveColumn tunnel;  // tunnels only
-    CaveColumn tunCrev; // tunnels + crevices, no shaft
-};
-
-ColumnCaves caveVariantsFor(uint64_t seed, int64_t vx, int64_t vy, int32_t surfaceMm) {
-    ColumnCaves out;
-    if (surfaceMm < kCaveMinSurfaceMm) return out; // matches caveColumnFor's own guard
-    const int64_t ci = floorDiv(vx * kVoxelSizeMm, kCaveLatticeMm);
-    const int64_t cj = floorDiv(vy * kVoxelSizeMm, kCaveLatticeMm);
-    const CaveLattice L = caveLatticeFor(seed, ci, cj);
-
-    CaveLattice lns = L;
-    lns.shaftNodeSlot = -1;
-    CaveLattice lt = lns;
-    for (CaveLatticeEdge& e : lt.edges) e.crevHash = kCrevHashClosed;
-
-    out.full = caveColumnFromLattice(L, vx, vy);
-    out.tunCrev = caveColumnFromLattice(lns, vx, vy);
-    out.tunnel = caveColumnFromLattice(lt, vx, vy);
-    return out;
-}
-
-// The shaft branch of caveCarveAt, evaluated on its own. Kept verbatim in
-// shape so a reader can diff it against caves.h:553-564; the cross-check
-// counter in main() is what proves it has not drifted.
-bool inShaftBranch(const CaveColumn& c, int32_t surfaceMm, int64_t vz) {
-    if (c.shaftMarginSq <= 0) return false;
-    if (vz < kCaveMinVoxelZ) return false;
-    if (surfaceMm < kCaveMinSurfaceMm) return false;
-    const int64_t depthMm =
-        static_cast<int64_t>(surfaceMm) - (vz * kVoxelSizeMm + kVoxelSizeMm / 2);
-    if (depthMm < 0) return false;
-    return depthMm <= static_cast<int64_t>(c.shaftDepthMaxMm);
-}
-
-// Family bitmask for one voxel of one column. `famAny` is the ground truth the
-// mask is checked against by the caller.
-uint32_t familyMaskAt(const ColumnCaves& cv, const CavernColumn& cav, int32_t surfaceMm,
-                      int32_t bedrockDepthMm, int64_t vz, bool& caveTruth) {
-    uint32_t m = 0;
-    caveTruth = caveCarveAt(cv.full, surfaceMm, bedrockDepthMm, vz);
-    if (inShaftBranch(cv.full, surfaceMm, vz)) m |= 1u << FAM_SHAFT;
-    const bool tun = caveCarveAt(cv.tunnel, surfaceMm, bedrockDepthMm, vz);
-    if (tun) m |= 1u << FAM_TUNNEL;
-    if (!tun && caveCarveAt(cv.tunCrev, surfaceMm, bedrockDepthMm, vz)) m |= 1u << FAM_CREVICE;
-    if (cavernCarveAt(cav, surfaceMm, bedrockDepthMm, vz)) m |= 1u << FAM_CAVERN;
-    return m;
-}
-
-int32_t dominantFamily(uint32_t mask) {
-    for (uint32_t k = 0; k < kFamCount; ++k)
-        if (mask & (1u << kFamPriority[k])) return static_cast<int32_t>(kFamPriority[k]);
-    return -1;
 }
 
 // --- tile loading (same as vxc_riverprobe) -----------------------------------
@@ -489,21 +417,21 @@ int main(int argc, char** argv) {
     // counters
     int64_t colsSampled = 0, colsSteep = 0;
     int64_t solidBandVox = 0, carvedVox = 0;
-    int64_t famVox[kFamCount] = {0, 0, 0, 0};
-    int64_t famCols[kFamCount] = {0, 0, 0, 0};
+    int64_t famVox[kCaveFamilyCount] = {0, 0, 0, 0};
+    int64_t famCols[kCaveFamilyCount] = {0, 0, 0, 0};
     int64_t colsWithAny = 0;
     // entrances
-    int64_t perfCols[kFamCount] = {0, 0, 0, 0}; // surface voxel of the column is carved
+    int64_t perfCols[kCaveFamilyCount] = {0, 0, 0, 0}; // surface voxel of the column is carved
     int64_t perfColsAny = 0, perfColsFlat = 0, perfColsSteep = 0;
     int64_t mouthCols = 0, mouthColsFlat = 0, mouthColsSteep = 0; // sideways daylighting
     // floors
-    int64_t floorCols[kFamCount] = {0, 0, 0, 0};
-    int64_t floorSpots[kFamCount] = {0, 0, 0, 0};
+    int64_t floorCols[kCaveFamilyCount] = {0, 0, 0, 0};
+    int64_t floorSpots[kCaveFamilyCount] = {0, 0, 0, 0};
     int64_t floorColsAny = 0;
-    int64_t headroomSumMm[kFamCount] = {0, 0, 0, 0};
+    int64_t headroomSumMm[kCaveFamilyCount] = {0, 0, 0, 0};
     // depth histogram, 5 m bands
     const int kDepthBands = static_cast<int>((maxDepthM + 4) / 5) + 1;
-    std::vector<int64_t> depthHist(static_cast<size_t>(kDepthBands) * kFamCount, 0);
+    std::vector<int64_t> depthHist(static_cast<size_t>(kDepthBands) * kCaveFamilyCount, 0);
     // self-checks
     int64_t attrMismatch = 0, memoMismatch = 0;
     int64_t minRoofMm = 1ll << 40, maxCarveDepthMm = 0;
@@ -538,7 +466,7 @@ int main(int argc, char** argv) {
                 const bool steep = slopeMmPerM >= steepMmPerM;
                 if (steep) ++colsSteep;
 
-                const ColumnCaves cv = caveVariantsFor(seed, vx, vy, col.surfaceMm);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm);
                 if (cv.full.count != col.cave.count ||
                     cv.full.shaftMarginSq != col.cave.shaftMarginSq)
                     ++memoMismatch;
@@ -558,11 +486,9 @@ int main(int argc, char** argv) {
                     }
                     ++solidBandVox;
                     bool truth = false;
-                    const uint32_t m = familyMaskAt(cv, col.cavern, col.surfaceMm,
+                    const uint32_t m = caveFamilyMaskAt(cv, col.cavern, col.surfaceMm,
                                                     col.bedrockDepthMm, vz, truth);
-                    const bool carvedByCave = (m & ((1u << FAM_TUNNEL) | (1u << FAM_CREVICE) |
-                                                    (1u << FAM_SHAFT))) != 0;
-                    if (carvedByCave != truth) ++attrMismatch;
+                    if (caveFamilyMaskIsCavePass(m) != truth) ++attrMismatch;
 
                     fam[static_cast<size_t>(k)] = m;
                     airCol[static_cast<size_t>(k)] = m ? 1 : 0;
@@ -576,18 +502,18 @@ int main(int argc, char** argv) {
                         static_cast<int64_t>(col.surfaceMm) - (vz * kVoxelSizeMm + kVoxelSizeMm / 2);
                     if (depthMm > maxCarveDepthMm) maxCarveDepthMm = depthMm;
                     // Roof cover, excluding the shaft (the one designed breach).
-                    if (!(m & (1u << FAM_SHAFT)) && depthMm < minRoofMm) minRoofMm = depthMm;
+                    if (!(m & (1u << CAVE_FAM_SHAFT)) && depthMm < minRoofMm) minRoofMm = depthMm;
                     const int band = std::min(kDepthBands - 1,
                                               static_cast<int>(depthMm / 5000));
-                    for (uint32_t f = 0; f < kFamCount; ++f)
+                    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                         if (m & (1u << f)) {
                             ++famVox[f];
-                            ++depthHist[static_cast<size_t>(band) * kFamCount + f];
+                            ++depthHist[static_cast<size_t>(band) * kCaveFamilyCount + f];
                         }
                 }
 
                 if (colMask) ++colsWithAny;
-                for (uint32_t f = 0; f < kFamCount; ++f)
+                for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                     if (colMask & (1u << f)) ++famCols[f];
 
                 // Perforation: the column's own top solid voxel is carved, i.e.
@@ -596,7 +522,7 @@ int main(int argc, char** argv) {
                 if (fam[0]) {
                     ++perfColsAny;
                     if (steep) ++perfColsSteep; else ++perfColsFlat;
-                    for (uint32_t f = 0; f < kFamCount; ++f)
+                    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                         if (fam[0] & (1u << f)) ++perfCols[f];
                 }
 
@@ -648,14 +574,14 @@ int main(int argc, char** argv) {
                         if (!airCol[static_cast<size_t>(kk)]) { clear = false; break; }
                     }
                     if (!clear) continue;
-                    const int32_t f = dominantFamily(fam[static_cast<size_t>(k - 1)]);
+                    const int32_t f = caveDominantFamily(fam[static_cast<size_t>(k - 1)]);
                     if (f < 0) continue;
                     ++floorSpots[f];
                     headroomSumMm[f] += hv * kVoxelSizeMm;
                     colFloorMask |= 1u << f;
                 }
                 if (colFloorMask) ++floorColsAny;
-                for (uint32_t f = 0; f < kFamCount; ++f)
+                for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                     if (colFloorMask & (1u << f)) ++floorCols[f];
 
                 if (images) {
@@ -667,7 +593,7 @@ int main(int argc, char** argv) {
                     putPx(imgDepth, px, ix, iy, base);
                     putPx(imgThick, px, ix, iy, base);
                     if (topVoidIdx >= 0) {
-                        const int32_t f = dominantFamily(fam[static_cast<size_t>(topVoidIdx)]);
+                        const int32_t f = caveDominantFamily(fam[static_cast<size_t>(topVoidIdx)]);
                         if (f >= 0) putPx(imgClass, px, ix, iy, kFamColour[f]);
                         putPx(imgDepth, px, ix, iy,
                               rampBlueRed(static_cast<double>(topVoidIdx) /
@@ -704,16 +630,16 @@ int main(int argc, char** argv) {
                 const int64_t vx = (axis == 0) ? x0 + static_cast<int64_t>(i) * stride : cx;
                 const int64_t vy = (axis == 0) ? cy : y0 + static_cast<int64_t>(i) * stride;
                 const ColumnSample col = amp.column(vx, vy);
-                const ColumnCaves cv = caveVariantsFor(seed, vx, vy, col.surfaceMm);
+                const CaveColumnVariants cv = caveColumnVariantsFor(seed, vx, vy, col.surfaceMm);
                 for (int64_t r = 0; r < h; ++r) {
                     const int64_t vz = zTop - r; // row 0 = top of image
                     const MaterialId strat = Amplifier::stratigraphyAt(col, vz);
                     Rgb c{12, 14, 20}; // sky
                     if (strat != MAT_AIR) {
                         bool truth = false;
-                        const uint32_t m = familyMaskAt(cv, col.cavern, col.surfaceMm,
+                        const uint32_t m = caveFamilyMaskAt(cv, col.cavern, col.surfaceMm,
                                                         col.bedrockDepthMm, vz, truth);
-                        const int32_t f = dominantFamily(m);
+                        const int32_t f = caveDominantFamily(m);
                         if (f >= 0) {
                             c = kFamColour[f];
                         } else if (strat == MAT_BEDROCK) {
@@ -976,7 +902,7 @@ int main(int argc, char** argv) {
                 maxCarveDepthMm / 1000.0,
                 minRoofMm == (1ll << 40) ? 0.0 : minRoofMm / 1000.0, kCaveRoofMinMm / 1000.0);
     std::printf("%-9s %14s %10s %14s %8s\n", "family", "voxels", "%band", "columns", "%cols");
-    for (uint32_t f = 0; f < kFamCount; ++f)
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
         std::printf("%-9s %14lld %9.4f%% %14lld %7.3f%%\n", kFamName[f], (long long)famVox[f],
                     100.0 * famVox[f] / bandD, (long long)famCols[f], 100.0 * famCols[f] / colsD);
 
@@ -998,7 +924,7 @@ int main(int argc, char** argv) {
     std::printf("  on steep ground: %lld (%.1f per km^2 of steep ground)\n",
                 (long long)perfColsSteep,
                 static_cast<double>(perfColsSteep) / std::max(1e-9, colsSteep * sampleAreaM2 / 1e6));
-    for (uint32_t f = 0; f < kFamCount; ++f)
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
         if (perfCols[f])
             std::printf("  by family: %-8s %lld\n", kFamName[f], (long long)perfCols[f]);
     std::printf("sideways daylighting mouths (columns): %lld total, %lld flat, %lld steep\n",
@@ -1007,7 +933,7 @@ int main(int argc, char** argv) {
     std::printf("\n--- floor area and headroom (5.6: where can a mob stand?) ---\n");
     std::printf("%-9s %14s %14s %12s %12s\n", "family", "floor spots", "m^2/km^2", "columns",
                 "mean head m");
-    for (uint32_t f = 0; f < kFamCount; ++f) {
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f) {
         const double m2 = floorSpots[f] * sampleAreaM2;
         std::printf("%-9s %14lld %14.0f %12lld %12.2f\n", kFamName[f], (long long)floorSpots[f],
                     m2 / std::max(1e-9, regionKm2), (long long)floorCols[f],
@@ -1022,16 +948,16 @@ int main(int argc, char** argv) {
                 kFamName[3]);
     for (int b = 0; b < kDepthBands; ++b) {
         int64_t rowTotal = 0;
-        for (uint32_t f = 0; f < kFamCount; ++f)
-            rowTotal += depthHist[static_cast<size_t>(b) * kFamCount + f];
+        for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
+            rowTotal += depthHist[static_cast<size_t>(b) * kCaveFamilyCount + f];
         if (!rowTotal) continue;
         char label[32];
         std::snprintf(label, sizeof(label), "%d-%d m", b * 5, b * 5 + 5);
         std::printf("%-12s %12lld %12lld %12lld %12lld\n", label,
-                    (long long)depthHist[static_cast<size_t>(b) * kFamCount + 0],
-                    (long long)depthHist[static_cast<size_t>(b) * kFamCount + 1],
-                    (long long)depthHist[static_cast<size_t>(b) * kFamCount + 2],
-                    (long long)depthHist[static_cast<size_t>(b) * kFamCount + 3]);
+                    (long long)depthHist[static_cast<size_t>(b) * kCaveFamilyCount + 0],
+                    (long long)depthHist[static_cast<size_t>(b) * kCaveFamilyCount + 1],
+                    (long long)depthHist[static_cast<size_t>(b) * kCaveFamilyCount + 2],
+                    (long long)depthHist[static_cast<size_t>(b) * kCaveFamilyCount + 3]);
     }
 
     std::printf("\n--- passage direction (tell #2: the lattice's cardinal lock) ---\n");
@@ -1172,7 +1098,7 @@ int main(int argc, char** argv) {
     Digest d;
     d.u64(static_cast<uint64_t>(carvedVox));
     d.u64(static_cast<uint64_t>(solidBandVox));
-    for (uint32_t f = 0; f < kFamCount; ++f) {
+    for (uint32_t f = 0; f < kCaveFamilyCount; ++f) {
         d.u64(static_cast<uint64_t>(famVox[f]));
         d.u64(static_cast<uint64_t>(famCols[f]));
         d.u64(static_cast<uint64_t>(floorSpots[f]));
