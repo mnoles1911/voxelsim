@@ -165,3 +165,14 @@ if(VXC_BUILD_GPU_HARNESS)
       -Wall -Wextra -Werror -Wno-missing-field-initializers)
   endif()
 endif()
+
+# --- vxc_bankprobe: the item-7 BANK-INTEGRITY probe. Voxel-scale leak count
+# along the channels the BAKE carved into the .vxtl v2 fine tier, carrier-only
+# against full v23 detail, with the waterline measured from the carve rather
+# than predicted from a discharge nothing has baked yet. Decides whether the
+# graded water plane (P2) needs a detail-band bank term. -------------------
+add_executable(vxc_bankprobe bankprobe.cpp)
+target_link_libraries(vxc_bankprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_bankprobe PRIVATE -Wall -Wextra -Werror)
+endif()
