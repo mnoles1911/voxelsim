@@ -1,0 +1,123 @@
+THE SLOPE HATCHING IS A BIOME-TINT GATE, NOT LOD GEOMETRY
+=========================================================
+2026-08-03. Site (-38400,-38400), tundra/glacial, alt +1200 m pitch -20 deg,
+sun frozen 12:00 03-20. Ladder in bake-out/hatching-ab/ (8 frames + 1:1 crops).
+
+THE ARTIFACT
+------------
+A repeating chevron / triangle lattice on sloped terrain, visible at distance
+and absent up close. Owner confirmed 2026-08-03 that it is NOT desired, and
+supplied the decisive clue: "the hatching color and effect goes away when
+player is close up. The visual pattern only appears at a distance and typically
+on sloped terrain."
+
+BOTH INITIAL HYPOTHESES WERE WRONG, AND COULD NOT HAVE BEEN RIGHT
+-----------------------------------------------------------------
+I proposed (1) LOD mesh decimation revealing a directional triangulation, and
+(2) material / normal MIP aliasing at grazing angles. Neither is possible here:
+
+  * there is no Nanite and no UStaticMesh LOD chain -- coarse levels are
+    mip-downsampled voxels RE-MESHED from scratch, never a simplified fine
+    mesh, so there is no decimation to reveal;
+  * `M_VoxelTerrain` has no albedo texture and no normal map. It is driven by
+    vertex colour plus a small biome LUT.
+
+So r.MipMapLoDBias, r.ForceLOD, mip bias and normal-map toggles are all no-ops
+on this terrain. Reasoning from the symptom instead of from the material was
+the error.
+
+WHAT IT ACTUALLY IS
+-------------------
+LOD-driven, but through the VERTEX-COLOUR path.
+
+`VoxelQuadVertexFactory.ush:261-265,297` gates the biome tint on
+
+    Decoded.PositionUU.z > (ChunkSurfaceZRelUU - 200.0f)
+
+i.e. a FIXED 2 m band below a surface height sampled ONCE PER CHUNK CENTRE
+(`VoxelWorldSubsystem.cpp:10196`). Mirrored on the CPU path in
+`VoxelClimateProbe.cpp:154-167`.
+
+A chunk is 3.2 m across at L0 but 51.2 m at L4 and 102.4 m at L5. On a slope
+the real surface varies far more than 2 m across a coarse chunk, so most of its
+sky-facing faces fall OUTSIDE the band and lose the biome tint entirely. A
+horizontal plane cut through a tilted voxel staircase is exactly a
+triangle/chevron.
+
+That single mechanism predicts every observation: slope dependence, distance
+dependence, the colour change, the chunk-scale cell size, and why the flat
+desert vista is nearly clean.
+
+THE EVIDENCE, WITH CONTROLS
+---------------------------
+  rung  varied                          result
+  00    nothing (baseline)              period 44.2 px, contrast 109.6
+  01    LOD one level COARSER           period 44.2 -> 82.1 px (~2x, one LOD
+                                        step). INTERNAL CONTROL: the mid ridge,
+                                        whose ring assignment did NOT change,
+                                        stayed at 48.8 px.
+  03    camera 400 m (not 1200)         pattern bigger on screen, otherwise
+                                        unchanged (contrast 112.1 vs 109.6).
+                                        Rings key off HORIZONTAL distance from
+                                        the anchor, not camera height -- this
+                                        RULES OUT screen-space, grazing-angle
+                                        and mip explanations. The pattern is
+                                        world-locked.
+  04    camera 60 m                     the owner's clue under instruments: in
+                                        ONE settled frame, ground near the
+                                        anchor (L0-L2) is completely clean and
+                                        the lattice switches on across a ring
+                                        boundary and intensifies outward.
+                                        Near-field contrast 50.7, neutral dark
+                                        (186,172,153); far-field 102.7,
+                                        saturated brown (138,115,89).
+  07    side-face tint forced to full   NO CHANGE (contrast 108.6, period
+                                        identical). Not the cause.
+  06    the 2 m surface gate REMOVED    LATTICE DISAPPEARS. Contrast
+                                        109.6 -> 43.7; dark population shifts
+                                        from saturated brown (122,102,85) to
+                                        neutral grey (186,173,158) -- what is
+                                        left is ordinary shading, not a second
+                                        material.
+
+The dark is WARMER than the light, which is why this was never a shadow.
+
+  02    LOD one level FINER             INVALID -- doubling the ring radii blew
+                                        the 80M-quad GPU pool and left 105,014
+                                        chunks UNDRAWN. Not "the artifact went
+                                        away"; missing terrain. Renamed on disk
+                                        to say so.
+  05    voxel.Debug.Rings               NO-OP -- it tints UVoxelChunkComponent
+                                        and the default renderer is the GPU
+                                        pool, which ignores it. Terrain pixels
+                                        byte-identical to 00, so it doubles as
+                                        a determinism check on the capture rig.
+
+WHAT THIS IS NOT
+----------------
+Rung 06 is a DIAGNOSTIC, not a proposed fix. Removing that gate is what paints
+cave floors grassland green -- the regression the gate was added to prevent
+(`VoxelChunkComponent.cpp:192-200`). Both shader edits were reverted and the
+file hash verified back to 8685AE04.
+
+One frame per rung. The 06 result is a single settled capture.
+
+NOT TUNDRA-SPECIFIC: the same lattice appears in the rainforest and taiga
+vistas in world-maps/seed20260719/vistas/ as green-tread/brown-riser, so any
+fix must be checked across biomes.
+
+WHAT A FIX HAS TO DO
+--------------------
+Keep cave floors untinted while tinting a coarse chunk's sky-facing faces on a
+slope. The gate's problem is that it compares a per-voxel z against a
+per-CHUNK-CENTRE surface height with a tolerance that does not scale with chunk
+size. Candidates, cheapest first:
+
+  1. scale the 2 m band with chunk edge length (3.2 m at L0 -> 102.4 m at L5),
+     so the band always spans the surface variation a chunk can contain;
+  2. sample the surface height per-COLUMN rather than per-chunk-centre;
+  3. use the face normal (sky-facing vs enclosed) rather than a height band,
+     which is what the gate is really trying to approximate.
+
+All three need the cave-floor case re-checked, which is what the gate exists
+for. Settle-counter discipline applies to every capture judging any of them.
