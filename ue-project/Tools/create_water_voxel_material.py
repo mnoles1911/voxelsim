@@ -218,7 +218,17 @@ def main():
     # exponentials, and the two-colour lerp below already puts the red loss in
     # the right place by construction.
     absorb_rate = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -960, -560)
-    absorb_rate.set_editor_property("r", -1.0 / 250.0)
+    #
+    # W7: D = 250 -> 160 UU (2.5 m -> 1.6 m). The owner's phrasing is about
+    # voxels STACKING: "as water voxels stack on top of one another there should
+    # be a depth effect". A voxel is 10 cm, so the interesting range is the first
+    # few tens of centimetres to a couple of metres, and at D = 250 that whole
+    # band sat in the flattest part of the curve -- 30 cm of water reached only
+    # depth01 0.11, so a pool several voxels deep looked the same as one voxel.
+    # At D = 160: 30 cm -> 0.17, 1 m -> 0.46, 2 m -> 0.71, 5 m -> 0.96. The cue
+    # now moves where the player actually sees it accumulate, and deep basins
+    # still saturate (10 m -> 0.998).
+    absorb_rate.set_editor_property("r", -1.0 / 160.0)
     absorb_exponent = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, -650)
     if not mel.connect_material_expressions(thickness, "", absorb_exponent, "A"):
         raise RuntimeError("connect thickness -> absorb_exponent.A failed")
@@ -262,14 +272,20 @@ def main():
     # lerps resolve to their shallow ends, which are the old constants. Depth
     # can only ever ADD darkness from there. There is no input for which this
     # is brighter than the shipped water.
-    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))
+    # W7: "more blue colour". Blue is lifted and red pulled down at BOTH ends,
+    # which raises saturation without raising luminance -- the shallow end is
+    # no brighter than the shipped colour, it is bluer.
+    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.035, 0.26, 0.68, 1.0))
     deep_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -400)
     # Deep end: the same hue, darkened and desaturated toward the absorption
     # the real effect is modelling. Deliberately NOT the authored
     # (0.012, 0.055, 0.16), which is nearly black -- a 2.5 m pond hitting that
     # would read as a hole in the ground. This is roughly a third of the
     # shallow value, so a deep body darkens visibly without going to ink.
-    deep_tint.set_editor_property("constant", unreal.LinearColor(0.018, 0.085, 0.20, 1.0))
+    # W7: the owner asked for DARK BLUE at depth, not near-black. Red and green
+    # come down, blue holds -- so the deep end reads unmistakably blue while
+    # getting darker, instead of desaturating toward ink as it deepens.
+    deep_tint.set_editor_property("constant", unreal.LinearColor(0.008, 0.055, 0.24, 1.0))
 
     water_tint = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -450)
     if not mel.connect_material_expressions(shallow_tint, "", water_tint, "A"):
@@ -300,12 +316,28 @@ def main():
     # TRANSPARENT, so a shoreline reads lighter only because more of the lit bed
     # shows through it. Deep water is untouched at 0.72, which is where the
     # near-white regression was actually judged.
-    shallow_opacity.set_editor_property("r", 0.35)
+    #
+    # W7, FROM THE OWNER JUDGING W6 IN GAME: "make the water voxels less
+    # transparent, more blue colour, and as water voxels stack on top of one
+    # another there should be a depth effect -- shallow pools more easily seen
+    # through, deeper water dark blue and non-transparent."
+    #
+    # So the RANGE W6 opened up is kept and its ends are pushed apart further,
+    # rather than sliding the whole thing opaque: shallow stays see-through on
+    # purpose (0.35 -> 0.42, still the most transparent this material has been
+    # below the old 0.55), and the deep end goes to genuinely opaque.
+    shallow_opacity.set_editor_property("r", 0.42)
     deep_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -270)
-    # Deep opacity rises, but nowhere near the authored 0.86. 0.72 keeps a
-    # deep body readable as WATER rather than as a painted surface -- you can
-    # still make out the bed through it, which is most of what sells depth.
-    deep_opacity.set_editor_property("r", 0.72)
+    # W7: 0.72 -> 0.98. The owner asked for deep water to be NON-TRANSPARENT.
+    # Not 1.0: a hair of transmission keeps the deep tint from flattening into
+    # a painted decal at grazing angles, and the Fresnel term below still adds
+    # to this, so 0.98 already composites as opaque looking down into a basin.
+    #
+    # This is the opposite direction from the near-WHITE regression, which was
+    # the surface getting brighter and lower-contrast. Deep water here gets
+    # darker, bluer and more opaque; shallow water is the only thing that stays
+    # readable through, which is exactly the depth cue being asked for.
+    deep_opacity.set_editor_property("r", 0.98)
     depth_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -300)
     if not mel.connect_material_expressions(shallow_opacity, "", depth_opacity, "A"):
         raise RuntimeError("connect shallow_opacity -> depth_opacity.A failed")
