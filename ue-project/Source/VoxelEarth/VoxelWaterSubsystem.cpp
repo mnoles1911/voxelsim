@@ -371,9 +371,17 @@ struct FVoxelWaterImpl
 	// column-accessor follow-up this file has been asking for and is not this
 	// change.
 	//
-	// MEMOISED PER COLUMN because the ImplicitFn's caller sweeps z innermost:
-	// without it a 26 m brick column costs 260 amplifier evaluations for one
-	// answer that cannot change.
+	// MEMOISED PER COLUMN, and the memo is only worth anything because
+	// BuildWaterFillPad sweeps z INNERMOST. That was an assumption in this
+	// comment and a falsehood in the code until 2026-08-03 -- the pad was built
+	// z-outermost, so this memo, LakeSampler's and BOTH Amplifier::columnCached
+	// memos missed on every one of the 1,000 cells in a brick. See
+	// BuildWaterFillPad for the measurement. Do not reorder that loop nest
+	// without reading it.
+	//
+	// Note the miss is not merely an amplifier column: GetSurfaceHeightUU also
+	// fires FVoxelFineTileStreamer::RequestFootprint, so a missing memo puts a
+	// streaming request on the game thread per voxel rather than per column.
 	int32_t GroundMmAt(int64_t vx, int64_t vy)
 	{
 		if (bGroundMemoValid && vx == GroundMemoVx && vy == GroundMemoVy)
@@ -446,6 +454,19 @@ struct FVoxelWaterImpl
 	// Bricks the implicit pass still owes a mesh, drained under a per-tick
 	// budget exactly like DirtyBricks.
 	TArray<VoxelCoords::FVoxelCoord> PendingImplicitBricks;
+
+	// Drain accounting for the CURRENT implicit refresh -- see the block in
+	// RefreshImplicitWater that resets them. These answer "did the water disc
+	// finish building before this frame was judged", which nothing else in the
+	// engine or in tools/voxel-capture.ps1's settle check can answer.
+	uint64 ImplicitRefreshSerial = 0;
+	int32 ImplicitCandidatesAtRebuild = 0;
+	int32 ImplicitDrainTicks = 0;
+	double ImplicitDrainMs = 0.0;
+	int32 ImplicitBricksMeshed = 0;
+	int32 ImplicitBricksEmpty = 0;
+	int32 ImplicitBricksSkippedInterior = 0;
+	bool bImplicitDrainReported = false;
 
 	// Reservoir v0 (docs/voxel-earth-implementation-plan.md SS3.7): breach-
 	// boundary voxel coordinates that continuously top up to 255 fill units
@@ -1702,19 +1723,53 @@ struct FWaterFillPad
 // Fills a pad from any per-cell RAW fill source, exactly once per padded cell.
 // The two producers (the CA's WaterBrick8 + apron, and the mobilizer's implicit
 // flood field) differ only in this functor.
+//
+// Z IS THE INNERMOST LOOP, AND THAT IS THE WHOLE POINT OF THIS FUNCTION'S
+// SHAPE. It used to be the outermost, chosen so the writes were a straight
+// append into the Z-major layout below instead of a scattered store. That
+// traded a few hundred nanoseconds of store locality for a catastrophe,
+// because the implicit producer's functor is not a memory read -- it is a
+// worldgen query, and EVERY layer between here and worldgen memoises exactly
+// one column:
+//
+//   * vxc::Amplifier::columnCached  -- "valid until this thread's next
+//     columnCached call" (amplifier.h). Reached TWICE per cell, through two
+//     different Amplifier instances that do not share a memo: once via
+//     UVoxelWorldSubsystem::IsSolidAtVoxel -> World::materialAt ->
+//     Amplifier::materialAt(vx,vy,vz), and once via the ImplicitFn's own
+//     `Amp.columnCached(vx, vy).cavern`.
+//   * FVoxelWaterImpl::GroundMmAt   -- one entry, and it also fires
+//     FVoxelFineTileStreamer::RequestFootprint on every miss.
+//   * vxc::LakeSampler              -- one entry, on the fine PIXEL.
+//
+// A one-entry memo hits only when consecutive calls share (vx, vy). With Z
+// outermost, X changes on EVERY call, so all four memos missed on all 1,000
+// cells of every brick: three full amplifier columns and a streamer footprint
+// request per cell, ~1.4 us each, ~1.4 ms per brick. At the 192-brick tick
+// budget that is ~277 ms of game thread per tick and ~59 s to drain one
+// implicit refresh of a lake -- which is why a baked lake rendered as scattered
+// bricks rather than a sheet: the candidate list never came close to draining
+// before the shot, and any 0.8 m of camera movement restarted it.
+//
+// With Z innermost the same 1,000 cells touch 100 columns, each ten times in a
+// row, and every one of those memos does the job its own comment claims. The
+// scattered store through At() is the correct trade at three orders of
+// magnitude. Measured cost of one amplifier column: 0.469 us (vxc_bench,
+// brick 8, 640,000 columns in 300.1 ms).
+//
+// The CA producer is indifferent to the order -- it reads a resident brick --
+// so this is one loop nest for both rather than a second specialised one.
 template <typename FillFn>
 void BuildWaterFillPad(FWaterFillPad& OutPad, const FillFn& Fn)
 {
-	int32 Idx = 0;
-	for (int32 Z = -1; Z <= FWaterFillPad::kEdge; ++Z)
+	for (int32 Y = -1; Y <= FWaterFillPad::kEdge; ++Y)
 	{
-		for (int32 Y = -1; Y <= FWaterFillPad::kEdge; ++Y)
+		for (int32 X = -1; X <= FWaterFillPad::kEdge; ++X)
 		{
-			for (int32 X = -1; X <= FWaterFillPad::kEdge; ++X)
+			for (int32 Z = -1; Z <= FWaterFillPad::kEdge; ++Z)
 			{
-				// Same index order FWaterFillPad::At computes, so this is a
-				// straight append rather than a scattered write.
-				OutPad.Fill[Idx++] = Fn(X, Y, Z);
+				OutPad.Fill[(X + 1) + FWaterFillPad::kPad * ((Y + 1) + FWaterFillPad::kPad * (Z + 1))] =
+					Fn(X, Y, Z);
 			}
 		}
 	}
@@ -2554,6 +2609,9 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		Impl.LastImplicitCenterBrick = Center;
 		Impl.bImplicitCenterValid = true;
 		Impl.PendingImplicitBricks.Reset();
+		// Zeroed HERE, not in the counter block below: the sweep that follows
+		// is what increments it.
+		Impl.ImplicitBricksSkippedInterior = 0;
 
 		// Cheap reject, one column query per brick COLUMN rather than 512 per
 		// brick: the flood level is a per-site constant across its whole reach
@@ -2594,8 +2652,86 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				// Only bricks whose bottom sits below the flood level can hold
 				// any water at all.
 				const int64 FloodBrickZ = vxc::floorDiv(int64(FloodZMm) / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
+
+				// THE INTERIOR OF A LAKE IS NOT A CANDIDATE, and skipping it is
+				// what makes a lake affordable rather than merely correct.
+				//
+				// A brick whose whole padded neighbourhood is full water emits
+				// NO faces -- that is the property this file already relies on
+				// to keep a large lake cheap ("interior bricks emit no faces --
+				// which is exactly what keeps a large lake affordable"). But it
+				// was still OFFERED, meshed, and discovered empty at full price.
+				// Measured at the 19.6 m lake on tile (-12,-5): 38,025
+				// candidates of which 33,800 -- 89% -- were interior bricks that
+				// produced nothing, 4,225 real surface bricks underneath them.
+				// The drain took 199 ticks, so EVERY capture and every walked
+				// step landed mid-rebuild and photographed a partial sheet.
+				//
+				// The two brackets below are PROOFS, not margins, which is the
+				// only kind of skip allowed here: an over-eager one punches a
+				// hole in a water surface, and that is the exact bug this whole
+				// change is repairing.
+				//
+				//   ceiling  UVoxelWorldSubsystem::GetSurfaceUpperBoundMm is a
+				//            provable upper bound on the amplified ground over
+				//            the brick's PADDED footprint, so every voxel whose
+				//            bottom is at or above it is worldgen air. One call
+				//            per brick COLUMN (it does not depend on Bz) and
+				//            cheaper than one amplifier column.
+				//   floor    the datum, sampled at the four corners of that same
+				//            padded footprint. The footprint is 10 voxels = 1.0 m
+				//            and a fine tile pixel is 1.875 m, so the footprint
+				//            touches at most 2x2 pixels and the four corners hit
+				//            every one of them -- this is exhaustive over the
+				//            pixels, not a sample of them. All four must agree
+				//            and be wet; a shoreline anywhere in the footprint
+				//            makes them disagree and the brick stays a candidate.
+				//
+				// CAVERN COLUMNS ARE EXCLUDED ENTIRELY. cavernFloodedAt fills
+				// open cave air regardless of the ground, so "above the surface
+				// bound" proves nothing about a cavern's water and the bracket
+				// does not apply. Such a column keeps exactly today's behaviour.
+				//
+				// EDITED BRICKS: the bound is pure worldgen and does not see the
+				// overlay, but an edit inside the water funnels through
+				// NotifyTerrainVoxelsCleared -> mobilizeEditRegion, which hands
+				// the brick to the CA and takes it out of the implicit path
+				// altogether (implicitFillAt returns 0 for a mobilized brick).
+				// So a brick this skip can reach is one no edit has touched.
+				const bool bLakeOnlyColumn = (CavernZMm == INT32_MIN) && (LakeZMm != vxc::kNoWaterMm);
+				int64 GroundUpperMm = MIN_int64;
+				bool bDatumUniform = false;
+				if (bLakeOnlyColumn)
+				{
+					const int64 Px0 = Vx - 1, Py0 = Vy - 1;
+					const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
+					GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
+					bDatumUniform = Impl.Water->waterSurfaceMmAtVoxel(Px0, Py0) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py0) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px0, Py1) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py1) == LakeZMm;
+				}
+				const bool bCanSkipInterior = bLakeOnlyColumn && bDatumUniform && GroundUpperMm != MIN_int64;
+
 				for (int32 Bz = Center.Z - kImplicitRadiusBricksZ; Bz <= Center.Z + kImplicitRadiusBricksZ; ++Bz)
 				{
+					if (bCanSkipInterior)
+					{
+						// The padded z span this brick's mesh actually reads:
+						// voxel bottoms from (Bz*8 - 1) to (Bz*8 + 8), inclusive.
+						const int64 PadBottomMm = (int64(Bz) * vxc::WaterBrick8::kEdge - 1) * vxc::kVoxelSizeMm;
+						const int64 PadTopMm = (int64(Bz) * vxc::WaterBrick8::kEdge + vxc::WaterBrick8::kEdge) *
+						                       vxc::kVoxelSizeMm;
+						// Every padded cell is above the ground (so open air),
+						// AND every padded cell's bottom is a full voxel below
+						// the datum (so fill 255, no partial top). Uniform 255
+						// over the whole pad: no face anywhere in the brick.
+						if (PadBottomMm >= GroundUpperMm && PadTopMm + vxc::kVoxelSizeMm <= int64(LakeZMm))
+						{
+							++Impl.ImplicitBricksSkippedInterior;
+							continue;
+						}
+					}
 					if (int64(Bz) > FloodBrickZ)
 					{
 						continue;
@@ -2609,8 +2745,31 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		// water actually in front of the camera has to mesh in the first few
 		// ticks, not after the whole 25 m disc has been walked.
 		UE_LOG(LogVoxelWater, Log,
-		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s)"),
-		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num());
+		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s), ")
+		       TEXT("%d proven-interior brick(s) skipped"),
+		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num(),
+		       Impl.ImplicitBricksSkippedInterior);
+
+		// DRAIN ACCOUNTING, and it exists because the absence of it cost a
+		// whole diagnosis. A baked lake rendered as scattered bricks, and the
+		// candidate count above -- the only number this function reported --
+		// looked healthy (42,250) in exactly the run where the sheet was
+		// broken, because the defect was that the list never DRAINED. The
+		// counters below say how far it got and what it cost, so "the lake is
+		// patchy" is answerable from the log instead of from a screenshot.
+		//
+		// NOTE FOR CAPTURES: tools/voxel-capture.ps1's settle check reads the
+		// TERRAIN streaming counters (jobsInFlight/pendingJobs/unloaded) and
+		// knows nothing about this queue. A frame can be fully terrain-settled
+		// with the water disc still half-built, which is precisely what a
+		// "settled" lake capture looked like before this line existed.
+		Impl.ImplicitRefreshSerial++;
+		Impl.ImplicitCandidatesAtRebuild = Impl.PendingImplicitBricks.Num();
+		Impl.ImplicitDrainTicks = 0;
+		Impl.ImplicitDrainMs = 0.0;
+		Impl.ImplicitBricksMeshed = 0;
+		Impl.ImplicitBricksEmpty = 0;
+		Impl.bImplicitDrainReported = false;
 		Impl.PendingImplicitBricks.Sort(
 			[Center](const VoxelCoords::FVoxelCoord& A, const VoxelCoords::FVoxelCoord& B)
 			{
@@ -2624,6 +2783,7 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 
 	int32 MeshesThisTick = 0;
 	int32 Built = 0;
+	const double DrainT0 = FPlatformTime::Seconds();
 	while (Impl.PendingImplicitBricks.Num() > 0 && MeshesThisTick < kMaxImplicitMeshesPerTick)
 	{
 		const VoxelCoords::FVoxelCoord BrickCoord = Impl.PendingImplicitBricks.Pop(EAllowShrinking::No);
@@ -2681,8 +2841,10 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				Impl.ImplicitChunkComponents.Remove(BrickCoord);
 			}
 			ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, BrickCoord);
+			++Impl.ImplicitBricksEmpty;
 			continue;
 		}
+		++Impl.ImplicitBricksMeshed;
 
 		// Same corner-height treatment as the CA path, and it costs this path very
 		// little: the implicit field is a per-site FLOOD LEVEL, so within one
@@ -2745,10 +2907,45 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		++Built;
 	}
 
-	if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() == 0)
+	if (MeshesThisTick > 0)
 	{
-		UE_LOG(LogVoxelWater, Verbose, TEXT("RefreshImplicitWater: candidate list drained; %d implicit water component(s) live."),
+		Impl.ImplicitDrainTicks++;
+		Impl.ImplicitDrainMs += (FPlatformTime::Seconds() - DrainT0) * 1000.0;
+	}
+
+	// ONE Log line per refresh, at the moment the disc is complete -- which is
+	// the only moment at which "the lake is a sheet" is a claim the frame can
+	// support. Log rather than Verbose on purpose: a capture is judged from
+	// this line, and `us/brick` is what makes a regression in the memo chain
+	// (see BuildWaterFillPad) visible as a number instead of as a patchy shot.
+	if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() == 0 && !Impl.bImplicitDrainReported)
+	{
+		Impl.bImplicitDrainReported = true;
+		const int32 Total = Impl.ImplicitBricksMeshed + Impl.ImplicitBricksEmpty;
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RefreshImplicitWater: DRAINED refresh #%llu -- %d candidate(s) in %d tick(s), %.1f ms total ")
+		       TEXT("(%.1f us/brick, %.1f ms/tick); %d brick(s) meshed, %d empty, %d skipped as proven interior; ")
+		       TEXT("%d implicit component(s) live."),
+		       (unsigned long long)Impl.ImplicitRefreshSerial, Impl.ImplicitCandidatesAtRebuild,
+		       Impl.ImplicitDrainTicks, Impl.ImplicitDrainMs,
+		       Total > 0 ? (Impl.ImplicitDrainMs * 1000.0) / double(Total) : 0.0,
+		       Impl.ImplicitDrainTicks > 0 ? Impl.ImplicitDrainMs / double(Impl.ImplicitDrainTicks) : 0.0,
+		       Impl.ImplicitBricksMeshed, Impl.ImplicitBricksEmpty, Impl.ImplicitBricksSkippedInterior,
 		       Impl.ImplicitChunkComponents.Num());
+	}
+	// UNDRAINED is the failure this instrumentation exists for, and it is
+	// silent by construction otherwise: the queue simply stays long while the
+	// frame looks fine. Report it periodically rather than once, because how
+	// FAR it got per tick is the diagnosis.
+	else if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() > 0 && (Impl.ImplicitDrainTicks % 60) == 0)
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RefreshImplicitWater: refresh #%llu STILL DRAINING -- %d of %d candidate(s) left after %d tick(s), ")
+		       TEXT("%.1f ms so far (%.1f ms/tick); %d meshed, %d empty."),
+		       (unsigned long long)Impl.ImplicitRefreshSerial, Impl.PendingImplicitBricks.Num(),
+		       Impl.ImplicitCandidatesAtRebuild, Impl.ImplicitDrainTicks, Impl.ImplicitDrainMs,
+		       Impl.ImplicitDrainMs / double(FMath::Max(Impl.ImplicitDrainTicks, 1)),
+		       Impl.ImplicitBricksMeshed, Impl.ImplicitBricksEmpty);
 	}
 	(void)Built;
 }

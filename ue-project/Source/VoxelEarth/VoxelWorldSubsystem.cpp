@@ -14489,6 +14489,22 @@ bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOu
 	return true;
 }
 
+int64 UVoxelWorldSubsystem::GetSurfaceUpperBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const
+{
+	if (!Impl)
+	{
+		return MIN_int64;
+	}
+	// The amplifier's own decline sentinel is kSurfaceBoundDeclined (INT64_MAX,
+	// amplifier.h:79) -- "I will not bound this". Translated to MIN_int64 here
+	// because the header promises callers ONE no-information value, and a
+	// caller that forgot to test would then compare against a bound that admits
+	// nothing rather than one that admits everything. Failing closed is the
+	// only safe direction for a rejection test.
+	const int64_t Bound = Impl->Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx1, Vy1);
+	return Bound == vxc::kSurfaceBoundDeclined ? MIN_int64 : int64(Bound);
+}
+
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const
 {
 	if (!Impl)
