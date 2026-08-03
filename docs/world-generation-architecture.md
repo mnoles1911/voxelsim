@@ -35,9 +35,21 @@ catchment upstream of a cell. A river arriving at a tile edge may drain
 hundreds of km that lie outside the tile.
 
 Bake a tile in isolation and it sees only the drainage born inside itself. The
-river entering from off-tile has zero upstream area, so it gets no incision:
-**you do not get wrong water, you get wrong mountains** — a valley that fades
-out at the tile boundary, or never forms.
+river entering from off-tile has zero upstream area, so it gets no incision.
+
+**How much this actually damages the terrain was measured, and the answer is
+"almost none" — which is not the argument this doc used to make.** An earlier
+version claimed *"you do not get wrong water, you get wrong mountains"*: valleys
+fading out at the tile boundary. Baking a tile with and without its injected
+inflow moved **zero elevation cells** past the 100 mm wire LSB and changed
+**5 of 67M flow cells**.
+
+The superblock earns its place on **determinism**, not on visible relief. Those
+5 cells are 5 cells where two clients that baked the same coordinates against
+different neighbour sets disagree permanently about the ground — and in
+multiplayer that is a correctness failure, not a quality one. The reasoning
+above is why you would *expect* large damage; the measurement is what actually
+happens, and where they conflict the measurement wins.
 
 So the tile needs catchment context, and the superblock is it: route flow at
 *coarse* resolution over a large span, and hand each fine bake the discharge
