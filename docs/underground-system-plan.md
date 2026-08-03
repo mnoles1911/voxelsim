@@ -1,11 +1,11 @@
 # Underground system redesign — caves, tunnels, caverns
 
-**Status:** PLAN (evidence + diagnosis + design; no worldgen code rides with
-this doc). Written against `main` at v23 (`kWorldGenVersion = 23`, core.h:236),
-after PR #199 (fine micro cap). The §1 evidence pack is **partial** — the box's
-editor was ceded to higher-priority capture work mid-session; every un-shot row
-is labelled NOT YET CAPTURED with its reproduction command. Author: agent
-session 2026-08-03, from Matt's verbatim complaint below.
+**Status:** PLAN, revised same-day against **Matt's answers to §7** (all six
+answered 2026-08-03; three changed this plan's assumed defaults — the deltas
+are recorded in §7). Written against `main` at v23 (`kWorldGenVersion = 23`,
+core.h:236). The §1 evidence pack is being re-shot from the labelled backlog
+now that the box's editor is free again. Author: agent session 2026-08-03,
+from Matt's verbatim complaint below.
 
 > "Right now, it looks terrible the caves and tunnels don't look
 > believable/realistic. Caves look very computer made with procedural shapes.
@@ -38,7 +38,9 @@ what they protect. The redesign therefore does not remove the entrance
 mechanism — it re-shapes it into caused, place-dependent forms (§5.1 G5:
 doline funnels, collapse mouths, widened slope mouths, stream sinks) that
 keep the same anchors, the same sparse-rate discipline and the same
-connectivity theorem. Details and quotes in §2.3.
+connectivity theorem. Details and quotes in §2.3. **Matt has since named the
+entrance portfolio himself, almost item for item (§7 Q6), so it is this
+plan's headline deliverable, not a sub-item.**
 
 ---
 
@@ -70,10 +72,10 @@ being dropped — the rows are the shot list for whoever gets the editor next.
 | capture | file / status | settle at shutter | what it shows |
 |---|---|---|---|
 | Tunnel interior, savanna tile `2_-8`, spawn `38400,-115200`, `-VoxelCaveTest -VoxelCaveSettle=120` | `caves-tunnel-B-savanna-0.png` — **CAPTURED** | `jobsInFlight=0 pendingJobs=0 pendingUnload=0` (full line: `loaded=47083 unloaded=566 … underground=1 deepTracked=18923 deepWithGeometry=506`) | A pristine M4 tunnel from inside: 3.5 m-tall void, camera 15.0 m below surface, 1.5 m above floor; capture-time probes `+X=3.1m -X=0.5m +Y=8.0m -Y=2.7m +Z=1.9m -Z=1.0m`. The constant-calibre capsule shape of §2.1 is what is on screen. |
-| Sinkhole shaft from below (the owner's vertical-shaft complaint, photographed up the bore), grassland tile `-1_1` | **NOT YET CAPTURED** — reproduce: `-VoxelSpawnAt=-7680,23040 -VoxelGICaveTest -VoxelGICaveSettle=120` + frozen-sun args | — | The 1.0–1.7 m radius perfectly vertical cylinder of §2.3, daylight mouth overhead. |
+| Sinkhole shaft from below (the owner's vertical-shaft complaint, photographed up the bore), grassland tile `-1_1`, `-VoxelSpawnAt=-7680,23040 -VoxelGICaveTest -VoxelGICaveSettle=120` | `caves-shaft-updaylight-grassland-0.png` — **CAPTURED** (re-shot with the box exclusively free) | `jobsInFlight=0 pendingJobs=0 pendingUnload=0` (`loaded=60071 … deepTracked=22258`) | Shaft at `(-7670,23150)` m, cave floor 21.9 m below daylight; camera in the cave looking 55° up the bore at the lit mouth. The §2.3 vertical cylinder, from the bottom. |
 | Shaft mouth from the air (the same shaft seen from the surface) | **NOT YET CAPTURED** — parse `sinkhole shaft at (X,Y)` from the previous run's log, then `tools\voxel-capture.ps1 -SpawnAt 'X/100,Y/100' -SpawnAltM 45 -SpawnPitch -62 -SettleSec 240` | — | The clean uncased hole in undisturbed ground — no funnel, no debris, no cause. |
-| Tunnel interior, grassland tile `-1_1` (second biome) | **NOT YET CAPTURED** — `-VoxelSpawnAt=-7680,23040 -VoxelCaveTest -VoxelCaveSettle=120` | — | Paired with the savanna interior: two tunnel interiors ~146 km apart in different biomes, expected indistinguishable (§2.4 — the generator takes no biome input, so this pair is the biome-insensitivity evidence). |
-| Tunnel interior, tundra tile `-3_-3` (third biome) | **NOT YET CAPTURED** — `-VoxelSpawnAt=-38400,-38400 -VoxelCaveTest -VoxelCaveSettle=120` | — | Same pairing, colder climate. |
+| Tunnel interior, grassland tile `-1_1` (second biome), `-VoxelSpawnAt=-7680,23040 -VoxelCaveTest -VoxelCaveSettle=120` | `caves-tunnel-A-grassland-0.png` — **CAPTURED** | `jobsInFlight=0 pendingJobs=0 pendingUnload=0` (`loaded=47709 … deepTracked=19019`) | 2.5 m-tall void, 21.8 m below surface. Paired with the savanna interior ~146 km away: same generator, no biome input (§2.4) — the biome-insensitivity evidence, now on film. |
+| Tunnel interior, tundra tile `-3_-3` (third biome), `-VoxelSpawnAt=-38400,-38400 -VoxelCaveTest -VoxelCaveSettle=120` | `caves-tunnel-C-tundra-0.png` — **CAPTURED** | `jobsInFlight=0 pendingJobs=0 pendingUnload=0` (`loaded=56843 … deepTracked=19039`) | 4.5 m-tall void, 21.0 m below surface, third biome, same character. |
 | Cavern interior, computed framing | **NOT YET CAPTURED** — `-VoxelSpawnAt=-7680,23040 -VoxelCavernShot=120 -VoxelCavernAt=-7680,23040` | — | The coaxial ellipsoid-stack room of §2.2. |
 
 One caveat on the delivered frame, stated rather than argued away: batch 1
@@ -93,7 +95,15 @@ worldgen):
   is the owner's "vertical shaft that shoots straight up," photographed from
   the bottom.
 * `-VoxelCavernShot` — measures a cavern room and frames it
-  (`VoxelWorldSubsystem.cpp:13849-14290`).
+  (`VoxelWorldSubsystem.cpp:13849-14290`). **Fixture bug found while
+  shooting:** its `-VoxelCavernAt=<X>,<Y>` origin never survives parsing —
+  `FParse::Value` for an FString stops at the comma by default, unlike
+  `-VoxelSpawnAt`, which passes `bShouldStopOnSeparator=false`
+  (VoxelEarthGameMode.cpp:76). Unquoted, the origin silently falls back to
+  (0,0); on this tile cache that is off the baked set and the fine-tier gate
+  kills the run. Workaround: quote the value on the command line
+  (`-VoxelCavernAt="-7680,23040"`); fix: pass
+  `bShouldStopOnSeparator=false` like the spawn parser does.
 
 Two capture-session facts worth recording: (a) the default capture spawn
 (`-84480,53760`) is no longer inside the baked fine-tile set — the fine-tier
@@ -231,7 +241,7 @@ Does **not** vary today — and this is the whole of Matt's third paragraph:
   surface has no closed sinks — and then the cave pass perforates it with
   shafts the hydrology never saw. Today that is cosmetically survivable
   because shafts are ~1.4 m wide; any karst-scale entrance work has to face
-  it head-on (§5, item W8).
+  it head-on (§5, item W9).
 * Streaming: the underground footprint is sized from the cave band — the
   38.4 m near band is set by the cave pass's maximum carve depth
   (docs/status.md "Underground streaming"). **Deepening the cave band is
@@ -346,7 +356,7 @@ bound its scope:
   whole domain afterwards** (docs/worldgen-variety-plan.md:311-316); if
   bake-side karst is ever attempted the mask must come from the **superblock**
   raster so coarse and fine hydrology agree about where sinks are allowed.
-  Everything in §5 except W8 therefore stays strictly **below** the baked
+  Everything in §5 except W9 therefore stays strictly **below** the baked
   surface, where the bake's hydrology guarantees are untouched.
 * **The validation gap.** The Earth reference corpus has **no karst site**
   (terrain-service/tools/earth_reference.py:1755-1757, "deliberately omitted
@@ -443,66 +453,95 @@ isolated crawlway fragments are acceptable *only* because they are a strict
 subset gated to regions that already have the connected network (and the
 flood-fill share in test_caves stays the acceptance gate).
 
-**G5 — Entrances (replaces the uniform cylinder shafts).**
+**G5 — The entrance portfolio (THE HEADLINE — listed first in spirit even
+though numbered fifth; the other generators exist so that these entrances
+lead somewhere worth entering).**
+
+A reading that must be stated, not silently resolved: Matt's Q5 answer says
+"no sinkhole entrances" and his Q6 answer lists "sinkholes" among the
+entrance kinds he wants. This plan reads Q5 as rejecting the **current
+construct** — the hash-placed, perfectly vertical, uncased cylinder with no
+funnel, no debris and no cause — and Q6 as naming the landforms that should
+replace it. If that reading is wrong, one line from Matt corrects it and the
+doline/sinkhole items below come out; nothing else in the plan depends on
+them alone.
+
 The three §2.3 guarantees stay; the *shape and the cause* change. Same gated
 backbone-crossing anchor nodes, same sparse rate discipline (measured
 perforated fraction), but the construct drawn at an open node depends on the
-place:
+place. The four kinds, exactly the four Matt named in Q6:
 
-* **Doline funnel** (karst areas, gentle ground): an inverted cone from a
-  surface bowl (2–6 m across) tapering to passage width at node depth, with a
-  hash-tilted axis (up to ~15° off vertical). The surface expression is a
-  visible depression, not a clean hole. The funnel is carved in depth space by
-  the same shaft mechanism — one extra radius-vs-depth ramp — so it is still
-  the ONE roof-clamp exception, still lands on a backbone node.
-* **Collapse mouth** (over shallow chambers): where a G2 room's roof cover is
-  under a threshold at an open entrance node, the entrance is a wider, rubble-
-  rimmed crater into the room. Cause: the void below.
-* **Slope mouths** (steep ground): already free from depth space; G1's
-  calibre variation makes them irregular. On high-relief columns the entrance
-  gate *prefers* to spend its budget here (a mouth-widening term rather than a
-  new bore), which is exactly "caves and crevices are much more of a thing in
-  mountainous regions."
-* **Stream sinks** (karst + high flow accumulation): where the flow plane's
-  channel bit is set near an open entrance node, the funnel snaps to the
-  channel cell — a creek that visibly disappears underground. (Below-surface
-  only; the baked hydrology is not modified — W8 is the version of this that
-  would be.)
+* **Horizontal mouths in mountainsides** (steep ground): already free from
+  depth space (caves.h:64-68); G1's calibre variation makes them irregular,
+  and on high-relief columns the entrance gate *spends its budget here* — a
+  mouth-widening term (flared aperture, sometimes into a G2 entrance chamber)
+  rather than a new bore. This is "caves are much more of a thing in
+  mountainous regions" made mechanical.
+* **Dolines and collapse craters** (gentle ground): an inverted cone from a
+  surface bowl (2–6 m across) tapering to passage width at node depth, axis
+  hash-tilted up to ~15° off vertical — a visible depression with a cause,
+  not a clean hole. Carved by the same shaft mechanism (one extra
+  radius-vs-depth ramp), so still the ONE roof-clamp exception, still landing
+  on a backbone node. Collapse variant: where a G2 room's roof cover is under
+  a threshold at an open node, a wider rubble-rimmed crater into the room —
+  the void below is the visible cause. Dense in karst; rare and subdued
+  (soil-pipe scale) outside it.
+* **Sinkholes** in the landform sense are the doline/collapse items above —
+  bowls and craters, never the current naked cylinder, per the Q5/Q6 reading.
+* **Stream sinks / swallets** (the most causally-motivated of the four): where
+  the flow plane's channel bit is set near an open entrance node, the funnel
+  snaps to the channel cell — a streambed that visibly disappears underground
+  into the system. The flow plane already ships on every tile and has zero
+  consumers (docs/w3-channel-carving.md:212-216), so this entrance is driven
+  by data that already exists, and it is the entrance a player *finds by
+  following terrain* rather than by luck. Below-surface carve only in v1; the
+  baked hydrology is not modified (W9 is the version that would), and where
+  the sunk water goes is deliberately left to the watershed plan (§7 Q4).
 
-Entrance **rate** becomes field-driven (karst and mountains get more,
-plains/arid get few), with a floor: the average "≥ 1 entrance per N m²
-connected to the backbone" guarantee is kept per lithology class rather than
-globally uniform, and the perforation stat in test_caves becomes per-class.
+**Flat ground, answered plainly rather than waved at.** Horizontal mouths do
+not exist on flat terrain — that is what the cylinders were for. Under the
+new scheme: flat **karst** ground gets dolines and swallets in numbers (that
+is where dolines belong on Earth); flat **non-karst** ground becomes
+**entrance-poor on purpose** — a low, non-zero floor of subdued collapse
+entrances keeps the per-region "findable on a walk, connected to the
+backbone" guarantee alive at a much longer walk, and the barren-underground
+contrast is the approved Q1 trade. The per-class perforation stat in
+test_caves is the acceptance gate that the floor actually holds.
 
-**G6 — Underground water (extend, don't replace).**
-Per-site flood levels generalise to a **quantized regional water table**:
-level hashed per cavern coarse cell (204.8 m grid, the cell structure already
-exists) with the per-site value clamped toward its cell level — nearby sites
-stop disagreeing arbitrarily, perched pools still occur, and deep storeys
-flood more often than entrance chambers. Precipitation (bio_12) biases the
-wet-site fraction: arid ground has drier caves. No CA change: mobilization is
-already the shipped handoff, and `kWaterCAVersion` does not move. This item
-must be coordinated with `docs/watershed-system-plan.md` (2026-08-03): once
-surface streams are real, "where does a sinking creek's water go" stops being
-rhetorical, and the honest v1 answer is *nowhere visible* — stream sinks are
-entrance geometry only, with cave-to-watershed routing left to that plan's
-machinery rather than invented here.
+**G6 — Underground water: PARKED (Matt, Q4: "stay dry until watershed work
+is done").**
+The designed extension — quantized regional water tables per cavern coarse
+cell, precipitation-biased wet fractions — is recorded here and deliberately
+NOT scheduled. No new water coupling of any kind ships with this redesign;
+coordination happens against `docs/watershed-system-plan.md` (being built now
+on `claude/watershed-build`, BAKE_VERSION 7→8 landed there) once that work
+settles. One explicit decision rides with parking it, flagged rather than
+made silently: **v23 already floods 60% of cavern sites**
+(caverns.h:265-272). "Stay dry until watershed" can mean (a) leave the
+shipped per-site floods as they are, or (b) raise the dry threshold to ~100%
+during the redesign (a one-constant change inside the same v24 bump). This
+plan assumes (a) — do not touch shipped behaviour without being asked — and
+Matt can flip it in one line.
 
 ### 5.2 The field coupling (what pushes what, and why)
 
-Inputs, all already per-column in the amplifier or pure hash: climate
-(bio_1 temp, bio_12 precip, bio_15 precip seasonality — amplifier.cpp:185-249),
-carrier relief/slope (evalSurface), flow plane (fine tier; §5.4 for the coarse
-story), lithology overlay (new, hashed), plus surfaceMm as today.
+Inputs, all already per-column in the amplifier or pure hash: carrier
+relief/slope (evalSurface), flow plane (fine tier; §5.4 for the coarse
+story), temperature (bio_1, amplifier.cpp:185-249), lithology overlay (new,
+hashed), plus surfaceMm as today. **Precipitation coupling is deliberately
+absent**: it was this plan's original wetness term, and it is parked with the
+rest of the water story (Q4, "do not couple to precipitation yet") —
+water *throughput* comes from the flow plane, which is terrain-derived and
+already shipped, not from climate. When the watershed work settles,
+re-introducing a precip bias is a tuning pass, not a redesign.
 
 | field | pushes | physical reading |
 |---|---|---|
-| lithology = CARBONATE × wetness (bio_12) × throughput (flow log₂) | G1 density + calibre up, G2 site rate up (multi-storey), G5 dolines + stream sinks | karst: dissolution needs soluble rock AND water moving through it |
-| relief/slope high | G3 fracture rate + size up, G5 slope-mouth budget up, G1 vertical sinuosity up | mechanical fracture, cliff daylighting, steep hydraulic gradients |
-| bio_12 low (arid) + lithology ≠ carbonate | everything sparser; G6 drier | no water, no dissolution — Matt's desert-plains intuition, made causal |
-| cold (bio_1) + high relief | G3 up, G1 unchanged | frost shattering; (glacial caves stay out — no ice) |
+| lithology = CARBONATE × throughput (flow-plane log₂ accumulation) | G1 density + calibre up, G2 site rate up (multi-storey), G5 dolines + swallets | karst: dissolution needs soluble rock AND water moving through it — **this pair is what delivers Matt's Q6 "caves in both karst and non-karst areas, the latter rarer and smaller": two different KINDS of system, not one system at two densities** |
+| relief/slope high | G3 fracture rate + size up, G5 horizontal-mouth budget up, G1 vertical sinuosity up | mechanical fracture, cliff daylighting, steep hydraulic gradients |
+| cold (bio_1) + high relief | G3 up | frost shattering; (glacial caves stay out — no ice) |
 | flow-plane channel bit + carbonate | G5 stream sinks | creeks sink where limestone crops out |
-| low relief + non-carbonate + dry | near-barren underground | some places SHOULD be boring — that contrast is what makes karst legible |
+| low relief + non-carbonate | near-barren underground (low entrance floor, small fracture caves only) | some places SHOULD be boring — that contrast is what makes karst legible, and Matt approved it (Q1) |
 
 The gates are smooth (Q10 multipliers on the existing hash-gate thresholds and
 radius spans, smoothstepped on the blended fields — the same shape as the
@@ -580,9 +619,90 @@ docs/status.md M4), with karst regions above it and plains below; (2) every
 work item below ships with the volume/perforation stats re-measured and a
 resident-quad + leg comparison at a karst-dense site before it is accepted.
 Deep streaming: anything that deepens the band moves the underground
-streaming footprint (§2.5) and is priced separately (W9).
+streaming footprint (§2.5) and is gated by W8's streaming acceptance measurement (§5.7).
 
 ---
+
+### 5.6 What the generator set owes exploration — and the mobs that are coming (Q2)
+
+Matt's answer to "what are caves for": *"Traversal, spectacle, exploration,
+eventually fighting mobs."* Not primarily a resource space. Exploration and
+mobs each place obligations on the generators, and they are cheaper stated
+now than retrofitted:
+
+**Exploration (legibility, landmarks, a sense of going somewhere):**
+* **Distinct place-shapes** are the landmark budget: a junction node, a
+  chamber with pillars, a crevice slot, a swallet shaft of light — each
+  family reads differently, so "I've been here" and "this leads somewhere
+  new" are visually decidable. This is an argument for the overlap-of-
+  families design over any single tuned generator, independent of realism.
+* **Gradient toward reward:** passages widen toward chambers (G1 calibre
+  interpolation makes that free: bias the node-end radius up near open
+  cavern sites), so following the growing passage is a learnable strategy —
+  the underground equivalent of "caused variety."
+* **Orientation:** daylight shafts of the doline/collapse entrances and the
+  strike-aligned fracture fabric (G3) give directional cues; the old
+  everywhere-the-same lattice gave none.
+
+**Mobs (not a generator, but a client of every generator):**
+* **Navigable floor and headroom guarantees.** Tunnels are already 2.4–5.6 m
+  bores and cavern floors are already flat-clamped (caverns.h:222-223) —
+  keep both as *invariants* under G1/G2 rework: minimum walkable calibre on
+  backbone edges, flat-floor area preserved in chambers. `pathfind.h` prices
+  air cheap, so the connected component IS the mob navmesh; the flood-fill
+  share test is therefore a gameplay guarantee, not just a worldgen stat.
+* **Spawn surfaces.** Chamber floor area and crawlway mouths are the natural
+  spawn sets; the W1 instruments should print per-family floor-area stats so
+  a future spawn system has a measured surface budget instead of a guess.
+* **Sightlines and cover.** Waypointed passages (G1) create corners; pillars
+  (G2) create cover. Both are combat affordances the current straight
+  capsules and empty ellipsoids lack — the same changes that fix the look
+  fix the fight.
+* **No involuntary pits on main routes.** Storey-to-storey connections on
+  the backbone must be traversable both ways (inclined passages, collapse
+  ramps), never sheer drops; drops are allowed off-backbone as deliberate
+  hazard/spectacle. This constrains §5.7's connector geometry.
+
+### 5.7 Depth: layered storeys and a rare reachable bottom (Q3 — now IN)
+
+Matt: *"Yes keep going down — can reach bottom in rare instances."* Bedrock
+sits at 180–220 m (amplifier.cpp bedrock band); today's tunnels stop at
+~37 m and cavern chains at ~100 m, so more than half the rock column is
+empty. The design:
+
+* **Storey 1 (9–37 m):** the reworked G1/G3 band, unchanged in depth.
+* **Storey 2 (~40–110 m):** the G2 chamber band plus a second, sparser
+  passage lattice at a coarser spacing (51.2 m) linking chamber sites —
+  same lattice mathematics, different constants, its own hash channels.
+* **Storey 3 (~110–175 m, karst-weighted):** rare, large galleries; mostly
+  reached through storey-2 chains. Outside karst, storey 3 barely exists.
+* **The bottom, rare by construction:** a 1-in-N gate (tuned to "rare
+  instances", e.g. one per several km²) on deep-storey sites drops a final
+  chamber whose floor is the bedrock margin itself — the player stands on
+  the world's basement rock. Reachability rides the same structural-
+  connectivity argument as everything else: the chain anchors on a backbone
+  node. All three bedrock guards stay untouched (caves.h's two + the
+  MAT_BEDROCK refusal in materialAt, amplifier.cpp:2356-2361) — the floor
+  is *reached*, never *breached*.
+* **Connectors:** inclined ramp passages and collapse chimneys between
+  storeys, traversable per §5.6's no-involuntary-pit rule on backbone
+  routes.
+
+**The explicit streaming price (this is why depth was priced separately).**
+The underground streaming footprint is derived from the carve envelope: the
+38.4 m near band exists because the deepest cave voxel is ~36.8 m down
+(docs/status.md "Underground streaming"). Deepening the envelope to ~175 m
+multiplies the potential deep chunk volume by ~4.5×; the mitigations are that
+the deep set is only tracked when the anchor is underground and deep
+(`deepTracked` already exists — the savanna capture ran at deepTracked=18923
+for a 15 m cave), that storeys 2–3 are sparse by construction so most deep
+chunks mesh to zero quads, and that the deep sight radius
+(`voxel.Stream.UndergroundSightM`) bounds the active volume. The acceptance
+gate for W8 is therefore a **leg + capture pair at a deep karst site**
+showing frame time and resident-quad counts against the standing perf
+records, before any constant ships. If the measured cost is unacceptable,
+the fallback is fewer, larger deep voids (cheaper per visible volume than
+many small ones — greedy-mesher quads scale with surface, not volume).
 
 ## 6. Work list (cheapest first, each independently testable)
 
@@ -599,22 +719,26 @@ harness runs per-item on branch builds, the version event ships once.
   generalised to depth slices) so every later item has a cheap picture that
   doesn't need the editor. (b) A `-VoxelCaveTest`-family site-list mode
   (accept a coordinate list, produce the §1 pack in one run). (c) Per-class
-  perforation/volume stats in test_caves. *Verify: images exist for today's
-  system; stats match status.md's recorded numbers.*
+  perforation/volume stats in test_caves, plus per-family **floor-area**
+  stats (§5.6 — the future spawn system's surface budget). *Verify: images
+  exist for today's system; stats match status.md's recorded numbers.*
 * **W2 — G1 passages** (waypoints, calibre, undulation). The single highest
   visible-change-per-effort item: it fixes tells 2 and 3 everywhere at once.
   *Verify: A/B interior captures at one fixed cave; flood-fill share; a
   plan-view image showing the direction histogram flattening.*
-* **W3 — G5 entrance portfolio, minimum version:** doline funnel replaces the
-  naked cylinder (same nodes, same rate), slope-mouth widening term.
+* **W3 — G5 entrance portfolio, minimum version (the headline lands here):**
+  doline funnel replaces the naked cylinder (same nodes, same rate) and the
+  horizontal-mouth widening term ships for steep ground. Swallets wait for
+  W6 only because they need the flow-plane plumbing.
   *Verify: A/B of the §1 shaft capture — same node, funnel vs cylinder; the
-  surface aerial showing a bowl instead of a hole; perforation stat
-  unchanged.*
+  surface aerial showing a bowl instead of a hole; a mountainside mouth
+  capture; perforation stat unchanged.*
 * **W4 — G2 chambers** (offsets, elongation, pillars, breakdown).
   *Verify: A/B CavernShot pair; plan-view symmetry visibly broken.*
-* **W5 — Field coupling v1, no new data:** climate + relief gates on G1/G3/G5
-  density, calibre and crevice rate (no lithology yet, no flow yet). This
-  alone delivers "mountains have more and bigger caves than desert plains."
+* **W5 — Field coupling v1, no new data:** temperature + relief gates on
+  G1/G3/G5 density, calibre and crevice rate (no lithology yet, no flow yet,
+  and — per Q4 — no precipitation). This alone delivers "mountains have more
+  and bigger caves than desert plains."
   *Verify: tunnel-interior + aerial pairs at tundra vs savanna vs a
   high-relief site; the W1 plan-view at both showing density difference; global
   volume within budget.*
@@ -624,18 +748,25 @@ harness runs per-item on branch builds, the version event ships once.
   site added to the corpus (§4). *Verify: karst-region capture set; walk from
   a stream sink into a multi-storey system; flow-plane SRV parity in
   vxc_gpu.*
-* **W7 — G4 crawlways + G6 water table.**
-  *Verify: crawlway interior captures; flooded-storey capture; waterca suite
-  untouched.*
-* **W8 — Bake-side karst surface (deliberately last, own decision point):**
+* **W7 — G4 crawlways.**
+  *Verify: crawlway interior captures; per-class volume stats within budget.*
+* **W8 — Depth: storeys 2–3, connectors, and the rare bottom (§5.7 —
+  ordered now at Matt's direction, no longer parked).** Ships in two halves:
+  (a) worldgen — the deeper lattices and the 1-in-N bottom gate, verified by
+  the W1 cross-section imager and connectivity stats; (b) the streaming
+  acceptance gate — a leg + capture pair at a deep karst site against the
+  standing perf records **before** the constants ship. The two halves land
+  together or (a) waits.
+* **W9 — Bake-side karst surface (deliberately last, own decision point):**
   closed depressions via the B2a gate **with the mask derived from the
   superblock raster** (the recorded trap, worldgen-variety-plan.md:311-316),
-  BAKE_VERSION roll, tiles re-baked. Only this item makes the *surface*
-  karst-shaped; everything before it is subsurface-only and bake-safe.
-* **W9 — Depth (own decision point):** bedrock sits at 180–220 m and the
-  tunnel band stops at ~37 m; a second, deeper passage+chamber storey is the
-  Minecraft-like "it keeps going down" move. Priced separately because it
-  grows the underground streaming footprint (§2.5), not just worldgen.
+  BAKE_VERSION roll, tiles re-baked, coordinated with the watershed work
+  which owns the bake's hydrology invariants now. Only this item makes the
+  *surface* karst-shaped; everything before it is subsurface-only and
+  bake-safe.
+* **PARKED, explicitly:** G6 regional water tables and any precipitation
+  coupling (Q4 — until the watershed system lands); sea caves, lava tubes,
+  glacier caves (§4, unchanged).
 
 ### The first milestone Matt can walk into
 
@@ -649,56 +780,55 @@ complaint at once; the biome coupling (W5/W6) is the second visit.
 
 ---
 
-## 7. Open questions for Matt — answers change the plan, so they are asked, not assumed
+## 7. Matt's answers (2026-08-03) and what they changed
 
-Each of these is a direction call, not something the code can answer. The plan
-above picks a defensible default for every one; a different answer reshapes
-the work list, so cheapest to answer them before W2 starts.
+The six questions below were asked with a stated default each; Matt answered
+all six the same day. Answers are quoted verbatim; **three changed the plan**
+and the deltas are marked. The original question texts are in this doc's git
+history (first commit on this branch).
 
-1. **Encounter rate, and its flip side.** Today the underground is uniform:
-   one entrance per ~205 m square everywhere, caves under 13.7% of columns
-   everywhere. The field-coupled design makes it *regional*: karst and
-   mountain country dense (more than today), dry plains on plain rock nearly
-   barren. That contrast is what makes the variety legible — but it means
-   whole areas where a player finds almost nothing underground. How much of
-   the world should be cave-rich, and is "boring underground here, on
-   purpose" acceptable? (Default assumed: yes, with the global average held
-   near today's.)
-2. **What are caves FOR?** Traversal space (routes through mountains —
-   passages/G1 matter most), resource space (something worth going down for —
-   chambers/G2 and depth/W9 matter most), hazard space (crawlways, water,
-   drops — G4/G6), or a mix? The generator set survives any answer but the
-   ORDER of W4–W7 doesn't. (Default assumed: traversal + spectacle first,
-   W2→W3→W4.)
-3. **Depth.** Bedrock is at 180–220 m; tunnels stop at ~37 m, cavern chains
-   at ~100 m. Should the world go deep (layered storeys, Minecraft-like
-   "it keeps going down"), and should a player be able to reach a bottom?
-   W9 prices this separately because it grows the underground **streaming**
-   footprint, not just worldgen. (Default assumed: deferred decision; nothing
-   above depends on it.)
-4. **Flooded caves.** The per-site flood + dig-to-drain mobilization already
-   ships; G6 upgrades it to regional water tables and couples it to
-   precipitation, and the watershed plan makes surface water real. Wanted, or
-   should caves stay mostly dry until the watershed work settles? (Default
-   assumed: wanted, sequenced after W6 and coordinated with that plan.)
-5. **Is a lithology field acceptable as new work?** Real cave genesis is
-   rock-type-driven; karst dissolution caves — the most natural-reading cave
-   systems on Earth — cannot exist without a "carbonate here" field, and §4
-   argues a hashed overlay is the honest way to get one (the provinces plan
-   reached the same conclusion and cut it from Tier 1 on scope). It is a
-   substantial addition: new worldgen field, karst reference DTM for
-   validation, flow-plane GPU plumbing. In or out? (The plan carries it as
-   W6; without it, W5's climate+relief coupling still delivers the
-   mountains-vs-plains contrast, and dolines lose their cause.)
-6. **How much may the underground change the SURFACE?** Dolines, collapse
-   craters and sinking streams are the visible half of karst and what makes
-   it read as natural from above — but the surface is currently the bake's
-   business, and bake-side karst has a recorded trap (B2a gate undone by
-   B4b; superblock mask required — §4). W3's funnels perturb only the top few
-   metres at sparse points; W8 is the real surface-karst decision with a
-   BAKE_VERSION roll and re-baked tiles attached. Where is the line?
-   (Default assumed: W3-level perturbation yes, W8 parked for its own
-   decision.)
+1. **Encounter rate.** *"Yes."* — Default held. Regional contrast approved,
+   including deliberately barren underground (folded into §5.2's coupling
+   table and the flat-ground paragraph in G5).
+2. **What are caves for.** *"Traversal, spectacle, exploration, eventually
+   fighting mobs."* — Default (traversal + spectacle first) survives, with
+   two additions: **exploration is a first-class goal** and **mobs are
+   coming**. New §5.6 records what the generator set owes both — landmark
+   variety, reward gradients, floor/headroom/sightline invariants, spawn
+   surfaces, and the no-involuntary-pits rule — so none of it is retrofitted
+   later. Not primarily a resource space.
+3. **Depth.** *"Yes keep going down — can reach bottom in rare instances."*
+   — **CHANGED from the deferred default.** Depth is in: layered storeys and
+   a rare reachable bottom, designed in §5.7, ordered as W8 with an explicit
+   streaming acceptance gate (the pricing that was the reason for deferral
+   is now the gate instead).
+4. **Flooded caves.** *"Stay dry until water shed work is done."* —
+   **CHANGED from "wanted, sequenced after W6."** G6 and all precipitation
+   coupling are PARKED (§5.1 G6, §5.2); coordination target is
+   `docs/watershed-system-plan.md` (`claude/watershed-build`, BAKE_VERSION
+   7→8 landed there). One flagged sub-decision: v23 already floods 60% of
+   cavern sites; this plan leaves that shipped behaviour untouched unless
+   Matt says otherwise.
+5. **Lithology.** *"Open to this but no sinkhole entrances. We need cave
+   entrances to occur in very natural looking ways on our terrain surface.
+   Defer to you if lithology is the right approach."* — Decision taken (by
+   the coordinating session, with the deferral explicit): **the field is
+   IN**, because Q6's own requirement — karst and non-karst cave systems,
+   the latter rarer and smaller — is precisely what a lithology field
+   expresses and is awkward to fake with climate and relief alone: those can
+   modulate *density*, not produce two different *kinds* of system. The
+   entrance half of this answer is handled by the Q5/Q6 reading stated at
+   the top of G5.
+6. **Surface expression.** *"Dolines and collapse craters are allowed. But
+   there should also be sideways cave mouth entrances in which caves open
+   horizontally in mountain side, sinkholes, and stream beds that disappear
+   underground and flow down into cave systems. Obviously we want caves in
+   both karst and non karst areas. The latter being rarer and smaller cave
+   systems."* — This is the G5 portfolio, near item-for-item, and it
+   promoted entrances to the plan's headline. The apparent Q5/Q6
+   contradiction on "sinkholes" is resolved by a stated reading (G5, first
+   paragraph), not silently. Bake-side surface karst remains its own later
+   decision (W9).
 
 ## 8. What this plan does NOT do
 
