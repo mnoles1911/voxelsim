@@ -79,9 +79,12 @@ There is also a data dependency that is easy to miss: terrain-diffusion's
 `synthetic_map._compute_map_stats` opens **relative** paths under
 `data/global/`, so everything must run from `terrain-service/`. WorldClim
 auto-downloads on first run **and prompts for consent on stdin** (which hangs
-unattended scripts). ETOPO must be *built*, not downloaded: the code reads
+unattended scripts). ETOPO looks like it must be *built*: the code reads
 `etopo_10m.tif`, a 10 arc-**minute** downsample, while the README points at
-NOAA's 30 arc-**second** product — see `tools/fetch_etopo.py`.
+NOAA's 30 arc-**second** product. Building it per box is what made a world
+un-extendable, so it is now a pinned artifact — see
+`tools/fetch_conditioning.py` and
+`docs/measurements/etopo-build-not-reproducible-2026-08-02.txt`.
 
 ## 3. Pin a checkpoint AND the conditioning data into `DiffusionConfig`
 
@@ -123,9 +126,14 @@ input:
    2.1 10-arc-minute bio rasters and reads `data/global/etopo_10m.tif`, and
    `synthetic_map._compute_map_stats` derives statistics from them that
    condition generation. Two boxes with different copies produce different
-   terrain. `tools/fetch_etopo.py` *builds* `etopo_10m.tif` from whichever
-   NOAA product was reachable (its candidate list includes both a `_bed` and
-   a `_surface` variant), so this divergence is likely, not theoretical.
+   terrain, and that divergence is measured, not theoretical: a fresh pod
+   produced an `etopo_10m.tif` 902,131 bytes shorter than this box's. The six
+   files are therefore **pinned bytes**, listed with their sha256 in
+   `data/conditioning-artifacts.json` and obtained by
+   `tools/fetch_conditioning.py`, which verifies and fails rather than
+   substituting. `tools/fetch_etopo.py` *builds* a raster and cannot reproduce
+   the pinned one — it now says so and requires
+   `--i-am-starting-a-new-world`.
 
 Get the conditioning digest for this box (run from `terrain-service/`, the
 directory containing `data/global` — the path is relative and resolved from

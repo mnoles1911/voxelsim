@@ -88,7 +88,7 @@ def main() -> int:
         print(f"ERROR: {e}")
         print(f"Run from the directory containing {resolve_conditioning_root()}, "
               f"and build ETOPO first:")
-        print("  python tools/fetch_etopo.py")
+        print("  python tools/fetch_conditioning.py")
         return 2
 
     config = DiffusionConfig(checkpoint_id=checkpoint_dir,

@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "description": "Pinned bytes for every file compute_conditioning_digest() hashes. See terrain_service/conditioning_artifacts.py for why each field exists.",
+  "measured": "docs/measurements/etopo-build-not-reproducible-2026-08-02.txt",
+  "expected_conditioning_digest": "c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2",
+  "artifacts": [
+    {
+      "name": "etopo_10m.tif",
+      "sha256": "9a45dd6dc5b0959cde00d64cc348aa5f731b31ceb7537d638a1162afa12d1254",
+      "size": 9344975,
+      "origin": "built",
+      "sources": [],
+      "builder": "tools/fetch_etopo.py",
+      "builder_reproduces_pin": false,
+      "note": "MEASURED 2026-08-02: these bytes were NOT produced by tools/fetch_etopo.py and cannot be. The file is uncompressed (Compression=NONE; 2160x1080 float32 = 9,331,200 B + 13,775 B of tags = exactly its length) and it carries ETOPO's OWN georeferencing -- GeoAsciiParams 'WGS 84 + EGM2008 height', GDAL_NODATA '-99999', ModelPixelScale z=1.0 -- whereas fetch_etopo.py writes profile=ref.profile.copy() from wc2.1_10m_bio_1.tif, which would stamp 'WGS 84|', nodata -3.4e+38, z=0.0, and compress=deflate. Its mtime (2026-06-28) also predates fetch_etopo.py's first commit (66aecae, 2026-07-22) by 24 days. It is a gdal_translate/gdalwarp downsample of the ETOPO 2022 60s _bed product made by hand. Pixel content is _bed, confirmed: Greenland centre -151 m and West Antarctica -1360 m (the _surface product reads about +3000 m and +1800 m there). There is no URL yet -- see hosting_decision_required."
+    },
+    {
+      "name": "synthetic_map_stats.json",
+      "sha256": "8fe9d083f10a0dafc3a37e3da9c8a206ca6a110fdcb56052372e94642147b1d3",
+      "size": 12297,
+      "origin": "built",
+      "sources": [],
+      "builder": "tools/bootstrap_pod.sh step 7 (terrain_diffusion.inference.synthetic_map)",
+      "builder_reproduces_pin": false,
+      "note": "Derived from etopo_10m.tif plus the four WorldClim rasters, so it inherits etopo's drift and adds its own. Rebuilt from the real WorldClim rasters on 2026-08-01 (the previous 13,058 B copies still on the 2026-08-02 box hash a1d3a1abd05030bf and were built from FAKE climate)."
+    },
+    {
+      "name": "wc2.1_10m_bio_1.tif",
+      "sha256": "f61633ffac9d44ed220442b3f7171a06f931726668bfbe9d07d53700b257d8cf",
+      "size": 3790814,
+      "origin": "downloaded",
+      "sources": [],
+      "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
+      "builder_reproduces_pin": true,
+      "note": "WorldClim 2.1 10m, published 2019-02-28 and byte-identical on every box measured. Fetched by upstream's own downloader (it ships as one zip, so there is no per-file URL to pin); the pin is the check on what that downloader produced."
+    },
+    {
+      "name": "wc2.1_10m_bio_4.tif",
+      "sha256": "a1bacac2f3d645284ee506fdde14226d7c2cafd5997a2af2f802f45e3550ae19",
+      "size": 3765363,
+      "origin": "downloaded",
+      "sources": [],
+      "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
+      "builder_reproduces_pin": true,
+      "note": "WorldClim 2.1 10m."
+    },
+    {
+      "name": "wc2.1_10m_bio_12.tif",
+      "sha256": "1e823e951ace0186c6eadd7368b4d0385c8f51cc952282c0f2d640bf7790fea5",
+      "size": 1963655,
+      "origin": "downloaded",
+      "sources": [],
+      "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
+      "builder_reproduces_pin": true,
+      "note": "WorldClim 2.1 10m."
+    },
+    {
+      "name": "wc2.1_10m_bio_15.tif",
+      "sha256": "6e16bf2e37752932cdeb2b209d1e06ba1a154ac012c372e56bc98e774cdfa6c6",
+      "size": 3496057,
+      "origin": "downloaded",
+      "sources": [],
+      "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
+      "builder_reproduces_pin": true,
+      "note": "WorldClim 2.1 10m."
+    }
+  ],
+  "hosting_decision_required": {
+    "owner_decision": "UNRESOLVED -- terrain-service/tools/fetch_conditioning.py FAILS until this is filled in.",
+    "what": "etopo_10m.tif (9,344,975 B) and synthetic_map_stats.json (12,297 B) need immutable, content-addressed URLs. Fill in each artifact's 'sources' array; the sha256 above is already the acceptance test, so a wrong or substituted file is refused rather than adopted.",
+    "why_not_decided_here": "It is a ~9 MB binary. git-lfs, a GitHub release asset, an object-store bucket and the HuggingFace checkpoint repo are all workable and they differ in who pays, who can revoke it, and whether a pod behind a proxy can reach it. Committing the blob straight into this git repo is permanent in every clone forever, so it must be chosen deliberately, not by whoever touched this file last.",
+    "recommendation": "Attach both files to a GitHub release on this repo (e.g. tag 'conditioning-v1') and put the two release-asset URLs here. Rationale: release assets are already reachable by anything that can clone the repo (no new credential, no new bill), they do not enter every clone the way a committed blob or git-lfs pointer does, and the sha256 pin makes GitHub's mutable-tag behaviour irrelevant. The HuggingFace checkpoint repo is the runner-up and is better if pods are ever cut off from github.com. Whoever decides: put the two URLs in 'sources' and set this field to the decision and the date."
+  }
+}

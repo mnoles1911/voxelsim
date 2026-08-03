@@ -397,7 +397,7 @@ def test_allow_incomplete_superblock_is_advertised_in_help():
 # never written down. Two of the six conditioning files are BUILT by
 # bootstrap_pod.sh rather than downloaded and came out different there. See
 # world_manifest.py and
-# docs/measurements/world-identity-not-reproducible-2026-08-03.txt.
+# docs/measurements/etopo-build-not-reproducible-2026-08-02.txt.
 #
 # world_identity_verdict is pure for the same reason superblock_gate_verdict
 # is: the policy must be testable without a GPU or 25 MB of rasters.

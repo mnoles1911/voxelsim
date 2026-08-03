@@ -168,7 +168,8 @@ Read `/workspace/bringup.log`. Then:
 | probe exits **3**, `cuda.is_available() is False` | torch/driver mismatch | `rm /workspace/.bringup/torch` and re-run command 1 |
 | `MISMATCH -- channel_mapping needs adjusting` | model channels differ from `EXPECTED_CHANNELS` | a config edit in `providers/diffusion.py`, not a redesign — paste the issue lines to Claude |
 | `WorldClim did not land` | the consent prompt wasn't answered | run `cd /workspace/voxelsim/terrain-service && python3 tools/probe_tile.py $CKPT_DIR $CKPT_SHA` once by hand |
-| ETOPO build failed | NOAA moved the file again | `tools/fetch_etopo.py` prints a manual-download fallback |
+| `conditioning data is NOT the pinned set` | this box's `data/global` differs from `data/conditioning-artifacts.json` | read the per-file report — it names which of the six moved and prints both hashes. If it says *no download URL is pinned*, the hosting decision in that file has not been made yet. **Never** answer this with `--provider-id-override` |
+| `this box cannot reproduce <provider_id>` | `EXPECT_PROVIDER_ID` was set and the artifacts + checkpoint produce a different id | if the conditioning set verified OK, the difference is the checkpoint or identity-bearing generation code — check out the commit that made that world |
 | `no tile in the scan had usable land` | seed's neighbourhood is ocean | `--scan-radius 3 --stride 5 --rescan` |
 | shell hangs with no output | you pasted a heredoc | Ctrl-C. Never paste heredocs — see below |
 
@@ -220,11 +221,19 @@ automatically now; this list exists so nobody "helpfully" undoes one.
    `coarse_model` / `base_model` / `decoder_model` out of it via
    `subfolder=`. The bundle is **`xandergos/terrain-diffusion-30m`**. A
    `-90m` bundle also exists — different resolution, not a newer version.
-5. **ETOPO must be built, not downloaded.** `_compute_map_stats` opens the
-   relative path `data/global/etopo_10m.tif`. The README says to download
+5. **ETOPO is a PINNED ARTIFACT, not a build.** `_compute_map_stats` opens
+   the relative path `data/global/etopo_10m.tif`. The README says to download
    NOAA's 30 arc-**second** GeoTIFF, but the filename it reads is a 10
-   arc-**minute** downsample NOAA doesn't publish. `tools/fetch_etopo.py`
-   resamples one onto the WorldClim grid.
+   arc-**minute** downsample NOAA doesn't publish — so it looks like something
+   you build, and `tools/fetch_etopo.py` used to build it per pod. That is what
+   made a world un-extendable: the shipping `etopo_10m.tif` turns out never to
+   have been a build output at all (it is uncompressed and carries ETOPO's own
+   vertical datum, neither of which the script can emit — see
+   `docs/measurements/etopo-build-not-reproducible-2026-08-02.txt`). Use
+   `tools/fetch_conditioning.py`, which verifies all six conditioning files
+   against pinned sha256s and **fails** rather than substituting.
+   `fetch_etopo.py` still exists but now refuses to run without
+   `--i-am-starting-a-new-world`, because that is exactly what it does.
 6. **WorldClim prompts for consent on stdin** on first run, which hangs any
    unattended script forever. The bootstrap feeds it from `yes`.
 7. **Everything must run from `terrain-service/`.** Both WorldClim and ETOPO

@@ -170,3 +170,62 @@ def test_cli_fails_loudly_on_all_ocean(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["pick_origin.py", str(p)])
     assert pick_origin.main() == 1
     assert capsys.readouterr().out.strip() == ""
+
+
+# --------------------------------------------------------------------------
+# bootstrap_pod.sh's conditioning gate
+#
+# These read the SCRIPT TEXT, which is a blunt instrument and is chosen
+# deliberately. The gate cannot be unit tested any other way -- it needs a pod,
+# a GPU and 25 MB of rasters -- and the specific regressions below are the ones
+# that already happened once each. A grep that fails loudly when someone
+# reintroduces `|| true` is worth more than no check at all.
+# --------------------------------------------------------------------------
+
+BOOTSTRAP = (Path(__file__).resolve().parent.parent / "tools" / "bootstrap_pod.sh").read_text(
+    encoding="utf-8"
+)
+
+
+def test_bootstrap_verifies_conditioning_against_the_pins():
+    assert "tools/fetch_conditioning.py" in BOOTSTRAP
+
+
+def test_the_conditioning_gate_is_not_swallowed():
+    """The gate is the whole fix. `|| true` on it, or `|| warn`, would restore
+    exactly the 2026-08-03 behaviour: a pod that reports success and then
+    generates a second planet under the first one's seed."""
+    gate_lines = [
+        ln for ln in BOOTSTRAP.splitlines()
+        if "fetch_conditioning.py --verify-only" in ln
+    ]
+    assert gate_lines, "the verifying gate call disappeared"
+    for ln in gate_lines:
+        assert "|| true" not in ln
+        assert "|| warn" not in ln
+
+
+def test_bootstrap_does_not_build_the_etopo_raster_as_a_normal_step():
+    """fetch_etopo.py now requires --i-am-starting-a-new-world. Bootstrap must
+    not pass it: building the raster is how the drift got in, and a bring-up
+    script is exactly the place where 'just make it work' wins arguments."""
+    for ln in BOOTSTRAP.splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("#"):
+            continue
+        if not stripped.startswith("python3 tools/fetch_etopo.py"):
+            continue
+        # The one allowed mention is inside a die() message telling a human how
+        # to deliberately start a new world. An actual invocation would not
+        # carry the acknowledgement flag, because bootstrap cannot acknowledge
+        # anything on the operator's behalf.
+        assert "--i-am-starting-a-new-world" in stripped, (
+            "bootstrap is building etopo again; it must fetch the pinned artifact"
+        )
+
+
+def test_bootstrap_still_refuses_to_recommend_the_override():
+    """--provider-id-override would force two different planets into one
+    namespace with a seam and no error. The script may name it; it must not
+    suggest reaching for it."""
+    assert "Do NOT reach for --provider-id-override" in BOOTSTRAP
