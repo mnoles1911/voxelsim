@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 25;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 26;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -230,6 +230,44 @@ namespace
 	// adding an entrance-bearing region to kBandOnlyRegions (which does not feed
 	// this pin), not to kRegions -- the same argument the savanna and fine-tier
 	// gaps above are parked under.
+
+	// v26 DID NOT MOVE IT EITHER, and this is the cleanest differential of the
+	// three because the whole harness was run BOTH WAYS on the same box.
+	//
+	// v26 (docs/underground-system-plan.md W4) rebuilds the G2 chamber: the
+	// four-room chain leans instead of stacking, each room is an ellipse in
+	// plan with its own hashed heading and elongation, a world-space field of
+	// pillars is left standing inside the rooms, and a per-column rubble rise
+	// replaces the flat floor. Every cavern in the world changes shape.
+	//
+	// HOW IT WAS ESTABLISHED (again without the editor -- the box's one slot was
+	// held by the watershed work for the whole session):
+	//
+	//   1. DIRECTLY. voxel-core/bench/gpu_harness.cpp's per-region "exercised:"
+	//      line reports 0 cavern columns for BOTH fixtures this pin folds
+	//      ("origin" and "far-negative" are these two verbatim). It cannot be
+	//      otherwise: these are compareDepthVox == 0 fixtures, so the compared
+	//      cells are the surface brick only, and cavernCarveAt refuses any voxel
+	//      shallower than kCaveRoofMinMm = 6 m while a brick is 3.2 m tall.
+	//   2. DIFFERENTIALLY, and this time by BUILDING BOTH. The harness was run
+	//      at v26 with the new cavern fixture disabled, and then again with
+	//      caverns.h / worldgen.ush / core.h / the prebuilt SPIR-V stashed back
+	//      to v25. Both runs print the identical digest 2921d08fd179c25c over
+	//      all eleven pre-existing regions, 50,304 columns and 10,143,744 cells.
+	//      The v26 chamber therefore touches none of them, and this pin -- whose
+	//      two fixtures are among those eleven -- cannot have moved.
+	//
+	// The prediction on record is that voxel.GPU.VerifyRegion still prints
+	// b2b5d2f1044caa35 at v26. Anyone with the editor should confirm it
+	// absolutely.
+	//
+	// AND THE GAP THIS PIN HAS BEEN CARRYING IS NOW HALF CLOSED ON THE OTHER
+	// SIDE: vxc_gpu gained a cavern-bearing fixture at v26 (the pass had been
+	// mirrored, compiled, linted and NEVER COMPARED, which its own "exercised:"
+	// line had been reporting as "0 cavern column(s)" since the line was added
+	// at v25). That fixture does not feed this constant, deliberately -- the
+	// same argument as the entrance one above -- but the mirror it verifies is
+	// the mirror this constant is a statement about the surface half of.
 
 	struct FRegionSpec
 	{

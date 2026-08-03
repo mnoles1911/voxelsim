@@ -414,10 +414,16 @@ VXC_TEST(amplifier_deep_column_golden_digest) {
     // surface on a gated column -- including turning some of them to air, which
     // no previous version of this digest has ever covered. The cave, cavern and
     // bedrock geometry is untouched; what moved is the surface shell itself.
-    // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11; and
+    // kWorldGenVersion 26 (plan W4): moves because the cavern chamber shape
+    // changed -- rooms lean, elongate, grow pillars and gain rubble floors --
+    // and the CHECK above already proves this digest genuinely covers cavern
+    // columns, so a v26 that did not move this number would be the interesting
+    // result rather than a safe one.
+    // (was 0xF88B88DB9D9341AA at v5, 0x3384824A6CF22450 at v6..v11;
     //  0xB125856533E5C174 at the 700 mm cut of v12, which was measured and
-    //  rejected before it shipped -- see the Wave C retry notes)
-    CHECK_EQ(d.h, 0xA429D263050DB344ull);
+    //  rejected before it shipped -- see the Wave C retry notes;
+    //  0xA429D263050DB344 at v12..v25)
+    CHECK_EQ(d.h, 0x7FDF3F7675524C5Full);
 }
 
 VXC_TEST(generated_brick_matches_pointwise_queries) {

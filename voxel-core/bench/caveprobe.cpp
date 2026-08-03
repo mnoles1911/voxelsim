@@ -69,6 +69,20 @@
 //  * CONNECTIVITY: flood-fill component count and largest-component share of
 //    a decimated sub-box, the same statistic test_caves.cpp uses, so any
 //    entrance or passage rework can be shown not to have shattered the graph.
+//  * W4 CHAMBER SHAPE (v26), as an A/B against a CONTROL rather than as a
+//    number: plan anisotropy, room-to-room stack drift, enclosed rock islands
+//    (which is what a pillar is, measured topologically), half-turn defect and
+//    within-room floor step, each reduced twice on the same columns -- once
+//    from the shipping predicate and once with cave_families.h's
+//    `cavernSiteWithoutChamberShape`, i.e. v25's coaxial round pillar-free
+//    flat-floored chamber out of the v26 world. The control is the half that
+//    matters: a one-arm asymmetry number is satisfied by roof, bedrock and
+//    region clipping, all of which were already true at v25, which is the same
+//    contamination that made W3's first mouth metric wrong.
+//  * PER-CAVERN-SITE CHAMBER GEOMETRY, and a SEARCHED vxc_gpu fixture origin
+//    for each -- because a third of sites hash to no pillars at all and both a
+//    capture and a GPU fixture placed on one of those would be testing the
+//    pillar term by not containing it.
 //
 // ---------------------------------------------------------------------------
 // IMAGES (PNG, written directly -- no venv, no PIL, no editor)
@@ -119,6 +133,12 @@
 //                        the thing that changed (cave_families.h explains why
 //                        this is done by differencing rather than by building
 //                        the v24 tree)
+//     --cavern-ab-off    skip the W4 chamber-shape A/B. It is ON by default and
+//                        should stay on: it is what turns "plan-view symmetry
+//                        is broken" from an assertion into a measurement, and
+//                        it costs only the columns a cavern actually reaches
+//                        (~0.5% of them). See the W4 report block for what the
+//                        control arm is and why one arm alone proves nothing.
 //     --connect N        connectivity flood-fill sample box edge (default 192
 //                        samples at 0.4 m = 76.8 m); 0 disables it
 //     --out PREFIX       output path prefix (default ./caveprobe)
@@ -323,6 +343,7 @@ int main(int argc, char** argv) {
     int64_t maxDepthM = 45, steepMmPerM = 300, connectN = 512;
     int px = 512, tileScale = 1;
     bool entranceCavityOff = false;
+    bool cavernAbOff = false;
     std::string coarseDir;
     bool images = true, sectionOnly = false, connectAtSet = false;
     double connectAtXM = 0, connectAtYM = 0;
@@ -360,6 +381,8 @@ int main(int argc, char** argv) {
             outPrefix = argv[++i];
         } else if (a == "--entrance-off") {
             entranceCavityOff = true;
+        } else if (a == "--cavern-ab-off") {
+            cavernAbOff = true;
         } else if (a == "--no-images") {
             images = false;
         } else if (a == "--section-only") {
@@ -513,6 +536,37 @@ int main(int argc, char** argv) {
     // depth histogram, 5 m bands
     const int kDepthBands = static_cast<int>((maxDepthM + 4) / 5) + 1;
     std::vector<int64_t> depthHist(static_cast<size_t>(kDepthBands) * kCaveFamilyCount, 0);
+    // W4 (v26) PLAN-VIEW SYMMETRY, MEASURED AS A DIFFERENCE.
+    //
+    // The plan's Verify line for W4 is "plan-view symmetry visibly broken", and
+    // a single-arm asymmetry number cannot carry that: a v25 cavern footprint
+    // already reads asymmetric wherever the roof clamp truncates it against a
+    // slope, the bedrock clamp cuts its bottom off, or this region clips it at
+    // the edge. Reporting one arm would be the W3 mouth-metric mistake again --
+    // a statistic satisfied by geometry other than the one under test.
+    //
+    // So both arms are reduced here, on the same columns, same seed, same
+    // terrain, same shipping predicate, differing only by cave_families.h's
+    // `cavernSiteWithoutChamberShape` (v25's coaxial, round, pillar-free,
+    // flat-floored chamber out of the v26 world). The CONTROL is what proves
+    // each statistic can report "symmetric"; the difference is the finding.
+    std::vector<uint8_t> cavMaskReal(static_cast<size_t>(px) * px, 0);
+    std::vector<uint8_t> cavMaskPlain(static_cast<size_t>(px) * px, 0);
+    // The column's carving segments, kept so the breakdown statistic can
+    // compare floors PER ROOM. Two adjacent columns are in the same room
+    // exactly when they carry a segment with the same zCenterMm (room centres
+    // are distinct and at most one site reaches any column), so no site lookup
+    // is needed. Asked per room because a column's LOWEST floor is dominated
+    // by the step where one room's footprint ends and the next room's deeper
+    // floor takes over -- chain geometry, not rubble.
+    std::vector<int32_t> cavSegZ(static_cast<size_t>(px) * px * kMaxCavernSegs, 0);
+    std::vector<int32_t> cavSegFloor(static_cast<size_t>(px) * px * kMaxCavernSegs, 0);
+    std::vector<uint8_t> cavSegN(static_cast<size_t>(px) * px, 0);
+    std::vector<int32_t> cavSegZP(static_cast<size_t>(px) * px * kMaxCavernSegs, 0);
+    std::vector<int32_t> cavSegFloorP(static_cast<size_t>(px) * px * kMaxCavernSegs, 0);
+    std::vector<uint8_t> cavSegNP(static_cast<size_t>(px) * px, 0);
+    int64_t cavPlainCols = 0, cavRealCols = 0, pillarCols = 0;
+
     // self-checks
     int64_t attrMismatch = 0, memoMismatch = 0;
     int64_t minRoofMm = 1ll << 40, maxCarveDepthMm = 0;
@@ -596,6 +650,55 @@ int main(int argc, char** argv) {
                 if (colMask) ++colsWithAny;
                 for (uint32_t f = 0; f < kCaveFamilyCount; ++f)
                     if (colMask & (1u << f)) ++famCols[f];
+
+                // --- W4 A/B: this column's cavern plan cell, both arms ------
+                //
+                // A column is "in the plan mask" if any ROOM CENTRE voxel
+                // carves there. That is exact rather than a sample: marginSq>0
+                // already means dz==0 satisfies the ellipsoid test and a room
+                // centre is always above its own floor, so this asks the
+                // shipping cavernCarveAt instead of re-deriving anything. It
+                // is also what makes a pillar visible -- a pillar column emits
+                // no segments at all.
+                if (!cavernAbOff) {
+                    const size_t cell = static_cast<size_t>(iy) * px + ix;
+                    const int64_t si = floorDiv(vx * kVoxelSizeMm, kCavernCoarseMm);
+                    const int64_t sj = floorDiv(vy * kVoxelSizeMm, kCavernCoarseMm);
+                    const CavernCandidates cands = cavernCandidatesFor(seed, si, sj);
+                    const CavernColumn plain = col.surfaceMm < kCaveMinSurfaceMm
+                                                   ? CavernColumn{}
+                                                   : cavernColumnWithoutChamberShape(
+                                                         seed, cands, vx, vy, amp.surfaceAtFn());
+                    for (int32_t arm = 0; arm < 2; ++arm) {
+                        const CavernColumn& cc = arm ? plain : col.cavern;
+                        std::vector<uint8_t>& mk = arm ? cavMaskPlain : cavMaskReal;
+                        std::vector<int32_t>& sz = arm ? cavSegZP : cavSegZ;
+                        std::vector<int32_t>& sf = arm ? cavSegFloorP : cavSegFloor;
+                        std::vector<uint8_t>& sn = arm ? cavSegNP : cavSegN;
+                        for (int32_t sg = 0; sg < cc.count; ++sg) {
+                            const int64_t cvz =
+                                floorDiv(static_cast<int64_t>(cc.segs[sg].zCenterMm) -
+                                             kVoxelSizeMm / 2,
+                                         static_cast<int64_t>(kVoxelSizeMm));
+                            if (!cavernCarveAt(cc, col.surfaceMm, col.bedrockDepthMm, cvz))
+                                continue;
+                            mk[cell] = 1;
+                            const size_t si2 = cell * kMaxCavernSegs + sn[cell];
+                            sz[si2] = cc.segs[sg].zCenterMm;
+                            sf[si2] = cc.segs[sg].zFloorMm;
+                            ++sn[cell];
+                        }
+                    }
+                    if (cavMaskReal[cell]) ++cavRealCols;
+                    if (cavMaskPlain[cell]) ++cavPlainCols;
+                    // A PILLAR COLUMN, measured rather than asked of the pillar
+                    // field: the control arm has chamber here and the shipping
+                    // arm has solid rock. (It also counts columns the offsets
+                    // moved the room away from, which is why this is reported
+                    // as a bound and the topological hole count below is the
+                    // statistic that isolates pillars.)
+                    if (cavMaskPlain[cell] && !cavMaskReal[cell]) ++pillarCols;
+                }
 
                 // Entrance shape, straight off the reduction.
                 if (col.cave.shaftMarginSq > 0) {
@@ -1071,6 +1174,226 @@ int main(int argc, char** argv) {
     std::printf("  (mouth vs doline is a per-SITE question -- see the site list below; a\n"
                 "   roof-thickness threshold cannot answer it, see the comment here)\n");
 
+    // --- W4 (v26): plan-view chamber symmetry, v26 vs the v25-shape control --
+    if (!cavernAbOff && (cavRealCols > 0 || cavPlainCols > 0)) {
+        struct ArmStats {
+            int64_t area = 0, comps = 0, holes = 0;
+            double anisoMax = 1.0, anisoAreaWeighted = 1.0;
+            int64_t driftMm = 0, d180PerMille = 0, floorStepMm = 0;
+        };
+        const double cellM = stride * kVoxelSizeMm / 1000.0;
+
+        auto analyse = [&](const std::vector<uint8_t>& mask, const std::vector<int32_t>& segZ,
+                           const std::vector<int32_t>& segF, const std::vector<uint8_t>& segN) {
+            ArmStats a;
+            // (1) COMPONENTS + ANISOTROPY. Second moments of each 8-connected
+            // component; the eigenvalue ratio of a 2x2 symmetric matrix in
+            // closed form. A disc reads ~1 however rough its edge is, which is
+            // what makes this the statistic for "round in plan" rather than a
+            // boundary-noise statistic.
+            std::vector<int32_t> comp(mask.size(), -1);
+            std::vector<int32_t> stack;
+            double anisoWeighted = 0.0;
+            int64_t weightedArea = 0;
+            for (int cy = 0; cy < px; ++cy)
+                for (int cx = 0; cx < px; ++cx) {
+                    const size_t s0 = static_cast<size_t>(cy) * px + cx;
+                    if (!mask[s0] || comp[s0] >= 0) continue;
+                    const int32_t id = static_cast<int32_t>(a.comps++);
+                    stack.clear();
+                    stack.push_back(static_cast<int32_t>(s0));
+                    comp[s0] = id;
+                    std::vector<int32_t> cells;
+                    while (!stack.empty()) {
+                        const int32_t t = stack.back();
+                        stack.pop_back();
+                        cells.push_back(t);
+                        const int tx = t % px, ty = t / px;
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                const int nx = tx + dx, ny = ty + dy;
+                                if (nx < 0 || ny < 0 || nx >= px || ny >= px) continue;
+                                const size_t ns = static_cast<size_t>(ny) * px + nx;
+                                if (!mask[ns] || comp[ns] >= 0) continue;
+                                comp[ns] = id;
+                                stack.push_back(static_cast<int32_t>(ns));
+                            }
+                    }
+                    a.area += static_cast<int64_t>(cells.size());
+                    if (cells.size() < 64) continue; // slivers carry no shape
+                    double sx = 0, sy = 0;
+                    for (int32_t t : cells) {
+                        sx += t % px;
+                        sy += t / px;
+                    }
+                    sx /= double(cells.size());
+                    sy /= double(cells.size());
+                    double mxx = 0, myy = 0, mxy = 0;
+                    for (int32_t t : cells) {
+                        const double ex = (t % px) - sx, ey = (t / px) - sy;
+                        mxx += ex * ex;
+                        myy += ey * ey;
+                        mxy += ex * ey;
+                    }
+                    mxx /= double(cells.size());
+                    myy /= double(cells.size());
+                    mxy /= double(cells.size());
+                    const double tr = mxx + myy;
+                    const double disc = std::sqrt((mxx - myy) * (mxx - myy) + 4 * mxy * mxy);
+                    const double lo = tr - disc;
+                    const double ratio = lo > 1e-9 ? (tr + disc) / lo : 64.0;
+                    if (ratio > a.anisoMax) a.anisoMax = ratio;
+                    anisoWeighted += ratio * double(cells.size());
+                    weightedArea += static_cast<int64_t>(cells.size());
+                    // (2) HALF-TURN DEFECT for this component, exact on the
+                    // grid: the centroid is carried doubled so p = 2c - i lands
+                    // on a cell and no resampling can manufacture a defect.
+                    const int64_t cx2 = static_cast<int64_t>(std::llround(2 * sx));
+                    const int64_t cy2 = static_cast<int64_t>(std::llround(2 * sy));
+                    int64_t unmatched = 0;
+                    for (int32_t t : cells) {
+                        const int64_t rx = cx2 - (t % px), ry = cy2 - (t / px);
+                        if (rx < 0 || ry < 0 || rx >= px || ry >= px) {
+                            ++unmatched;
+                            continue;
+                        }
+                        if (!mask[static_cast<size_t>(ry) * px + rx]) ++unmatched;
+                    }
+                    a.d180PerMille += unmatched * 1000 / static_cast<int64_t>(cells.size());
+                }
+            if (weightedArea > 0) a.anisoAreaWeighted = anisoWeighted / double(weightedArea);
+            if (a.comps > 0) a.d180PerMille /= a.comps;
+
+            // (3) HOLES == PILLARS. 4-connected runs of non-mask cells that
+            // never reach the grid border: rock completely enclosed by chamber
+            // in plan. A union of ellipses cannot produce one.
+            {
+                std::vector<uint8_t> seen(mask.size(), 0);
+                for (int cy = 0; cy < px; ++cy)
+                    for (int cx = 0; cx < px; ++cx) {
+                        const size_t s0 = static_cast<size_t>(cy) * px + cx;
+                        if (mask[s0] || seen[s0]) continue;
+                        bool border = false;
+                        stack.clear();
+                        stack.push_back(static_cast<int32_t>(s0));
+                        seen[s0] = 1;
+                        while (!stack.empty()) {
+                            const int32_t t = stack.back();
+                            stack.pop_back();
+                            const int tx = t % px, ty = t / px;
+                            if (tx == 0 || ty == 0 || tx == px - 1 || ty == px - 1) border = true;
+                            const int nb[4] = {tx > 0 ? t - 1 : -1, tx < px - 1 ? t + 1 : -1,
+                                               ty > 0 ? t - px : -1, ty < px - 1 ? t + px : -1};
+                            for (int k = 0; k < 4; ++k) {
+                                if (nb[k] < 0 || mask[size_t(nb[k])] || seen[size_t(nb[k])])
+                                    continue;
+                                seen[size_t(nb[k])] = 1;
+                                stack.push_back(nb[k]);
+                            }
+                        }
+                        if (!border) ++a.holes;
+                    }
+            }
+
+            // (4) STACK DRIFT. Largest plan distance between the centroids of
+            // two DIFFERENT room slices (a room is one distinct zCenterMm).
+            // A coaxial chain puts every slice on one axis, so the control
+            // arm's value here is the statistic's own noise floor -- the
+            // wall-roughness wobble, which v25 already had.
+            {
+                std::vector<int32_t> zs;
+                std::vector<double> sxv, syv;
+                std::vector<int64_t> nv;
+                for (size_t c2 = 0; c2 < mask.size(); ++c2)
+                    for (int32_t k = 0; k < segN[c2]; ++k) {
+                        const int32_t z = segZ[c2 * kMaxCavernSegs + k];
+                        size_t idx = zs.size();
+                        for (size_t q = 0; q < zs.size(); ++q)
+                            if (zs[q] == z) {
+                                idx = q;
+                                break;
+                            }
+                        if (idx == zs.size()) {
+                            zs.push_back(z);
+                            sxv.push_back(0);
+                            syv.push_back(0);
+                            nv.push_back(0);
+                        }
+                        sxv[idx] += double(c2 % px);
+                        syv[idx] += double(c2 / px);
+                        ++nv[idx];
+                    }
+                for (size_t q = 0; q < zs.size(); ++q)
+                    for (size_t r = q + 1; r < zs.size(); ++r) {
+                        if (nv[q] < 64 || nv[r] < 64) continue;
+                        const double dx = sxv[q] / double(nv[q]) - sxv[r] / double(nv[r]);
+                        const double dy = syv[q] / double(nv[q]) - syv[r] / double(nv[r]);
+                        // Rooms of DIFFERENT sites are not comparable, and two
+                        // sites are at least a coarse cell apart, so anything
+                        // beyond one site's own reach is skipped.
+                        const double dMm = std::sqrt(dx * dx + dy * dy) * cellM * 1000.0;
+                        if (dMm > double(kCavernMaxReachMm)) continue;
+                        if (int64_t(dMm) > a.driftMm) a.driftMm = int64_t(dMm);
+                    }
+            }
+
+            // (5) FLOOR STEP == BREAKDOWN. Mean |floor difference| between
+            // 4-adjacent columns that share a ROOM (same zCenterMm). Asked per
+            // room because a column's lowest floor is dominated by the step
+            // where one room ends and the next room's deeper floor takes over,
+            // which is chain geometry rather than rubble. A machined floor
+            // gives exactly 0.
+            {
+                int64_t sum = 0, pairs = 0;
+                for (int cy = 0; cy < px; ++cy)
+                    for (int cx = 0; cx + 1 < px; ++cx) {
+                        const size_t A = static_cast<size_t>(cy) * px + cx, B = A + 1;
+                        for (int32_t ka = 0; ka < segN[A]; ++ka)
+                            for (int32_t kb = 0; kb < segN[B]; ++kb) {
+                                if (segZ[A * kMaxCavernSegs + ka] != segZ[B * kMaxCavernSegs + kb])
+                                    continue;
+                                sum += std::llabs(int64_t(segF[A * kMaxCavernSegs + ka]) -
+                                                  segF[B * kMaxCavernSegs + kb]);
+                                ++pairs;
+                            }
+                    }
+                a.floorStepMm = pairs ? sum / pairs : 0;
+            }
+            return a;
+        };
+
+        const ArmStats R = analyse(cavMaskReal, cavSegZ, cavSegFloor, cavSegN);
+        const ArmStats P = analyse(cavMaskPlain, cavSegZP, cavSegFloorP, cavSegNP);
+        std::printf("\n--- W4 chamber shape: plan-view symmetry, v26 vs the v25-shape control "
+                    "---\n");
+        std::printf("(both arms are the SAME sites, terrain, seed and shipping predicate; the\n"
+                    " control differs only by cave_families.h cavernSiteWithoutChamberShape.\n"
+                    " The control is what proves each statistic can report SYMMETRIC at all --\n"
+                    " a one-arm asymmetry number is satisfied by roof, bedrock and region\n"
+                    " clipping, all of which were already true at v25.)\n");
+        std::printf("%-34s %15s %15s\n", "statistic", "v26 (shipping)", "v25-shape ctl");
+        std::printf("%-34s %15lld %15lld\n", "cavern plan columns", (long long)cavRealCols,
+                    (long long)cavPlainCols);
+        std::printf("%-34s %15lld %15lld\n", "plan components", (long long)R.comps,
+                    (long long)P.comps);
+        std::printf("%-34s %13.2f:1 %13.2f:1\n", "plan anisotropy (area-weighted)",
+                    R.anisoAreaWeighted, P.anisoAreaWeighted);
+        std::printf("%-34s %13.2f:1 %13.2f:1\n", "plan anisotropy (worst room)", R.anisoMax,
+                    P.anisoMax);
+        std::printf("%-34s %13.1f m %13.1f m\n", "room-to-room stack drift", R.driftMm / 1000.0,
+                    P.driftMm / 1000.0);
+        std::printf("%-34s %15lld %15lld\n", "enclosed rock islands (PILLARS)", (long long)R.holes,
+                    (long long)P.holes);
+        std::printf("%-34s %10lld/1000 %10lld/1000\n", "half-turn defect",
+                    (long long)R.d180PerMille, (long long)P.d180PerMille);
+        std::printf("%-34s %12lld mm %12lld mm\n", "floor step within a room (RUBBLE)",
+                    (long long)R.floorStepMm, (long long)P.floorStepMm);
+        std::printf("columns the shipping arm turned to rock that the control carved: %lld\n"
+                    "  (an UPPER BOUND on pillar area, not a pillar count -- the offsets also\n"
+                    "   move a room off a column. The enclosed-island row isolates pillars.)\n",
+                    (long long)pillarCols);
+    }
+
     std::printf("\n--- floor area and headroom (5.6: where can a mob stand?) ---\n");
     std::printf("%-9s %14s %14s %12s %12s\n", "family", "floor spots", "m^2/km^2", "columns",
                 "mean head m");
@@ -1221,6 +1544,113 @@ int main(int argc, char** argv) {
                             nd.depthMm / 1000.0,
                             isShaft ? (breaks ? "   [breaks surface]" : "   [GATED OPEN BUT SEALED]")
                                     : "");
+                // CHAMBER SHAPE PER SITE (v26, plan W4) -- so a capture or a
+                // vxc_gpu fixture is aimed at a chamber whose shape has been
+                // READ rather than assumed. Three of nine vista sites picked
+                // by eye were wrong once already; the same discipline the
+                // entrance shape lines above exist for applies here, and it
+                // matters more, because a third of sites have no pillars at
+                // all and a fixture placed on one of those would test the
+                // pillar term by not containing it.
+                if (isCavern) {
+                    const CavernSite cs = cavernSiteFor(seed, i, j, nd, amp.surfaceAtFn());
+                    if (cs.valid) {
+                        std::printf("             chamber: anchor z %.1f m; pillars r=%.1f m%s; "
+                                    "rubble amp %.2f m%s\n",
+                                    cs.anchorZMm / 1000.0, cs.pillarRadiusMm / 1000.0,
+                                    cs.pillarRadiusMm == 0 ? " [THIS SITE HAS NONE]" : "",
+                                    cs.breakdownAmpMm / 1000.0,
+                                    cs.breakdownAmpMm == 0 ? " [flat floors]" : "");
+                        for (int32_t c = 0; c < kCavernChildCount; ++c) {
+                            const CavernChild& ch = cs.children[c];
+                            const double offX = (ch.xMm - cs.anchorXMm) / 1000.0;
+                            const double offY = (ch.yMm - cs.anchorYMm) / 1000.0;
+                            std::printf("               room %d: axis %+6.1f,%+6.1f m from "
+                                        "anchor  z %.1f m  long r %.1f m  short r %.1f m  "
+                                        "elong %.2f:1  floor %.1f m\n",
+                                        c, offX, offY, ch.zMm / 1000.0, ch.rxyMm / 1000.0,
+                                        ch.rxyMm * 1024.0 / ch.elongQ10 / 1000.0,
+                                        ch.elongQ10 / 1024.0, ch.zFloorMm / 1000.0);
+                        }
+                        // A vxc_gpu FIXTURE ORIGIN, chosen by SEARCH rather
+                        // than by eye -- the discipline gpu_harness.cpp's own
+                        // fixture comments demand, and the one the cave-band
+                        // fixture skipped when it asserted in a comment that a
+                        // gated-open sinkhole was inside it and never checked.
+                        //
+                        // What makes a cavern fixture good is not "sits on the
+                        // chamber": a block entirely inside one room compares
+                        // only the interior and would pass with the wall test,
+                        // the pillar term and the elongation all wrong. So the
+                        // score is the distance from a HALF-AND-HALF split of
+                        // the block's columns, which forces both sides of the
+                        // chamber boundary into the compared volume, with a
+                        // hard requirement that the block also contain at
+                        // least one PILLAR column (a column the chamber would
+                        // otherwise carve and the pillar field turns to rock).
+                        const int64_t kFixN = 96; // 9.6 m, the dispatch width
+                        int64_t bestVx = 0, bestVy = 0, bestScore = -1, bestCav = 0, bestPil = 0;
+                        const int64_t aVx = floorDiv(cs.anchorXMm, (int64_t)kVoxelSizeMm);
+                        const int64_t aVy = floorDiv(cs.anchorYMm, (int64_t)kVoxelSizeMm);
+                        const int64_t sI = floorDiv(cs.anchorXMm, kCavernCoarseMm);
+                        const int64_t sJ = floorDiv(cs.anchorYMm, kCavernCoarseMm);
+                        const CavernCandidates fcands = cavernCandidatesFor(seed, sI, sJ);
+                        for (int64_t oy = -400; oy <= 400; oy += 40)
+                            for (int64_t ox = -400; ox <= 400; ox += 40) {
+                                int64_t cav = 0, pil = 0;
+                                for (int64_t qy = 0; qy < kFixN; qy += 6)
+                                    for (int64_t qx = 0; qx < kFixN; qx += 6) {
+                                        const int64_t cvx = aVx + ox + qx;
+                                        const int64_t cvy = aVy + oy + qy;
+                                        const ColumnSample q = amp.column(cvx, cvy);
+                                        bool anyReal = false;
+                                        for (int32_t sg = 0; sg < q.cavern.count; ++sg) {
+                                            const int64_t qz = floorDiv(
+                                                (int64_t)q.cavern.segs[sg].zCenterMm -
+                                                    kVoxelSizeMm / 2,
+                                                (int64_t)kVoxelSizeMm);
+                                            if (cavernCarveAt(q.cavern, q.surfaceMm,
+                                                              q.bedrockDepthMm, qz))
+                                                anyReal = true;
+                                        }
+                                        if (anyReal) { ++cav; continue; }
+                                        const CavernColumn pc = cavernColumnWithoutChamberShape(
+                                            seed, fcands, cvx, cvy, amp.surfaceAtFn());
+                                        for (int32_t sg = 0; sg < pc.count; ++sg) {
+                                            const int64_t qz = floorDiv(
+                                                (int64_t)pc.segs[sg].zCenterMm - kVoxelSizeMm / 2,
+                                                (int64_t)kVoxelSizeMm);
+                                            if (cavernCarveAt(pc, q.surfaceMm, q.bedrockDepthMm,
+                                                              qz)) {
+                                                ++pil;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                const int64_t total = (kFixN / 6) * (kFixN / 6);
+                                if (cav == 0 || pil == 0) continue;
+                                const int64_t score = total - std::llabs(2 * cav - total);
+                                if (score > bestScore) {
+                                    bestScore = score;
+                                    bestVx = aVx + ox;
+                                    bestVy = aVy + oy;
+                                    bestCav = cav;
+                                    bestPil = pil;
+                                }
+                            }
+                        if (bestScore >= 0)
+                            std::printf("               vxc_gpu fixture: origin voxel (%lld, "
+                                        "%lld), %lldx%lld columns -- %lld%% of a decimated "
+                                        "sample is chamber and %lld sample(s) are pillar rock\n",
+                                        (long long)bestVx, (long long)bestVy, (long long)kFixN,
+                                        (long long)kFixN,
+                                        (long long)(100 * bestCav / ((kFixN / 6) * (kFixN / 6))),
+                                        (long long)bestPil);
+                        else
+                            std::printf("               vxc_gpu fixture: none found near this "
+                                        "site (no block has both chamber and pillar rock)\n");
+                    }
+                }
                 // ENTRANCE SHAPE PER SITE (v25) -- so a capture is aimed at
                 // a site whose type has been VERIFIED rather than assumed.
                 // Three of nine vista sites picked by eye were wrong once

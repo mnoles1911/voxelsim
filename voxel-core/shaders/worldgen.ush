@@ -80,7 +80,7 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 25
+#define VXC_WORLDGEN_VERSION_USH 26
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -2391,7 +2391,8 @@ bool caveCarveAt(GpuCaveColumn cc, int surfaceMm, int bedrockDepthMm, int64_t vz
 // --- M4 cave pass v2 cavern pass -------------------------------------------
 // Bit-exact mirror of voxelcore/caverns.h. Read that header for WHY sites are
 // hash-gated backbone-crossing nodes 204.8 m apart, why each open site is a
-// COAXIAL chain of four ellipsoid rooms descending from the anchor, and why
+// LEANING chain of four elongated ellipsoid rooms descending from the anchor
+// (worldgen v26 / plan W4 -- offsets, elongation, pillars, breakdown), and why
 // the per-voxel roof/bedrock/sea clamps are LOAD-BEARING here rather than
 // backstops (caverns anchor at absolute z, so a level room under sloping
 // terrain has no draped-depth guarantee to fall back on). The code below is a
@@ -2415,8 +2416,8 @@ static const int64_t kCavernRxySpanMm = 16000;
 static const int64_t kCavernRxyMaxMm = kCavernRxyMinMm + kCavernRxySpanMm;
 static const int64_t kCavernRz0MinMm = 4000;
 static const int64_t kCavernRz0SpanMm = 6000;
-static const int64_t kCavernRzDeepMinMm = 12000;
-static const int64_t kCavernRzDeepSpanMm = 28000;
+static const int64_t kCavernRzDeepMinMm = 16000; // v26: load-bearing, see caverns.h (b)
+static const int64_t kCavernRzDeepSpanMm = 24000;
 static const int64_t kCavernFloorDropMinMm = 3000;
 static const int64_t kCavernFloorDropSpanMm = 12000;
 static const int64_t kCavernStepDownMinMm = 2000;
@@ -2429,10 +2430,12 @@ static const int64_t kCavernRoughMaxQ10 = 1331; // 1024 + kCavernRoughAmpQ10
 // caveNode()'s own depth ceiling (kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm).
 static const int64_t kCavernNodeDepthSafeMinMm = 18000;
 static const int64_t kCavernNodeDepthSafeMaxMm = 34000;
-// (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024 = (28000 * 1331) / 1024, i.e.
-// the widest a roughened room radius can reach from the anchor. Written as a
-// literal rather than the expression so no `/` appears at file scope.
-static const int64_t kCavernMaxReachMm = 36394;
+// v26: kCavernMaxAxisDriftMm + (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024
+// = 3 * 7008 + (28000 * 1331) / 1024 = 21024 + 36394, i.e. the widest a
+// roughened room can reach from the ANCHOR once the chain's own axis drift is
+// included. Written as a literal rather than the expression so no `/` appears
+// at file scope.
+static const int64_t kCavernMaxReachMm = 57418;
 static const int64_t kCavernMaxReachSqMm = kCavernMaxReachMm * kCavernMaxReachMm;
 static const int64_t kCavernFloodMinMm = 800;
 static const int64_t kCavernFloodSpanMm = 2400;
@@ -2447,9 +2450,39 @@ static const int kMaxCavernSegs = 4;
 // does not fit in int.
 static const int kCavernDryZMm = (int)0x80000000u;
 
-static const uint CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
+static const uint CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step/shape)
 static const uint CH_CAVERN_ROUGH = 23; // per-column wall roughness
 static const uint CH_CAVERN_FLOOD = 25; // per-site flood level
+static const uint CH_CAVERN_SHAPE = 53;     // v26 per-site pillar radius + rubble amplitude
+static const uint CH_CAVERN_PILLAR = 54;    // v26 per-pillar-cell gate/jitter/radius
+static const uint CH_CAVERN_BREAKDOWN = 55; // v26 per-column rubble noise
+
+// --- v26 (plan W4) chamber shape -------------------------------------------
+// Long-axis headings as Q12 cos/sin pairs. Eight of them span the whole space
+// because an ellipse is unchanged by a half turn. Integer literals on both
+// sides -- caverns.h explains why these are not computed.
+static const int64_t kCavernDirOne = 4096; // 1 << 12; the shift is spelled as a
+                                           // literal 12 at every use site, per
+                                           // tools/lint-shader-ub.py.
+static const int kCavernDirCosQ12[8] = {4096, 3784, 2896, 1568, 0, -1568, -2896, -3784};
+static const int kCavernDirSinQ12[8] = {0, 1568, 2896, 3784, 4096, 3784, 2896, 1568};
+static const int64_t kCavernElongMinQ10 = 1200;
+static const int64_t kCavernElongSpanQ10 = 1000;
+static const int64_t kCavernOffsetMinMm = 1500;
+static const int64_t kCavernOffsetSpanMm = 5500;
+static const int64_t kCavernPillarLatticeMm = 8000;
+static const int64_t kCavernPillarJitterMm = 1500;
+static const uint64_t kCavernPillarCellGateMask = 1;
+static const int64_t kCavernPillarRadiusMinMm = 700;
+static const int64_t kCavernPillarRadiusSpanMm = 1100;
+static const uint64_t kCavernPillarNoneThreshold10 = 341;
+// 1024 - kCavernPillarNoneThreshold10, as a literal so no `/` is at file scope.
+static const uint64_t kCavernPillarRemapDen = 683;
+static const int64_t kCavernPillarAxisClearMm = 4000;
+static const int64_t kCavernPillarAxisClearSqMm =
+    kCavernPillarAxisClearMm * kCavernPillarAxisClearMm;
+static const int64_t kCavernBreakdownLatticeMm = 3200;
+static const int64_t kCavernBreakdownMaxMm = 1500;
 
 // vxc::cavernHashField10 â€” unsigned 10-bit field -> [0, spanMm), multiply-
 // then-shift, never a division. The CPU takes a `shift` parameter; here the
@@ -2461,22 +2494,78 @@ int64_t cavernField10(uint64_t hShifted, int64_t spanMm)
     return (int64_t)(((hShifted & 0x3FFULL) * (uint64_t)spanMm) >> 10);
 }
 
+// vxc::cavernAbs.
+int64_t cavernAbs(int64_t v) { return v < 0 ? -v : v; }
+
+// vxc::cavernPillarRadiusForSite -- this site's pillar radius, 0 for a site
+// with no pillars. Reads the 10-bit field at bit 10 of the site's
+// CH_CAVERN_SHAPE word.
+int64_t cavernPillarRadiusForSite(uint64_t shapeHash)
+{
+    const uint64_t f = (shapeHash >> 10) & 0x3FFULL;
+    if (f < kCavernPillarNoneThreshold10) return 0;
+    // Both operands below are uint64_t. `f` is a 10-bit masked field and the
+    // early return above guarantees f >= kCavernPillarNoneThreshold10, so the
+    // subtraction cannot wrap; the divide is unsigned on both sides, and the
+    // CPU form in caverns.h is the same expression on the same types.
+    // lint-shader-ub: allow SIGNED_DIVISION - unsigned operands, see above
+    const uint64_t remapped = ((f - kCavernPillarNoneThreshold10) * (uint64_t)kCavernPillarRadiusSpanMm) / kCavernPillarRemapDen;
+    return kCavernPillarRadiusMinMm + (int64_t)remapped;
+}
+
+// vxc::cavernPillarAt -- one hash, one lattice cell (exhaustive: a pillar
+// provably never leaves its own cell, caverns.h static_assert (d)).
+bool cavernPillarAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t siteRadiusMm)
+{
+    if (siteRadiusMm <= 0) return false;
+    const int64_t pi = floorDiv(xMm, kCavernPillarLatticeMm);
+    const int64_t pj = floorDiv(yMm, kCavernPillarLatticeMm);
+    const uint64_t h = hash2(seed, pi, pj, CH_CAVERN_PILLAR);
+    if ((h & kCavernPillarCellGateMask) != 0) return false;
+    const int64_t cx = pi * kCavernPillarLatticeMm + (kCavernPillarLatticeMm / 2) -
+                       kCavernPillarJitterMm + cavernField10(h >> 1, 2 * kCavernPillarJitterMm);
+    const int64_t cy = pj * kCavernPillarLatticeMm + (kCavernPillarLatticeMm / 2) -
+                       kCavernPillarJitterMm + cavernField10(h >> 11, 2 * kCavernPillarJitterMm);
+    const int64_t rMm = truncDiv(siteRadiusMm * (512 + cavernField10(h >> 21, 512)), 1024);
+    const int64_t dx = xMm - cx, dy = yMm - cy;
+    return dx * dx + dy * dy < rMm * rMm;
+}
+
+// vxc::cavernBreakdownAt -- millimetres of rubble on this column, [0, ampMm).
+int64_t cavernBreakdownAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t ampMm)
+{
+    if (ampMm <= 0) return 0;
+    const int64_t n = clamp64(
+        valueNoise2(seed, xMm, yMm, kCavernBreakdownLatticeMm, CH_CAVERN_BREAKDOWN) + 32768, 0,
+        65535);
+    return truncDiv(n * ampMm, 65536);
+}
+
 struct GpuCaveNode
 {
     int64_t xMm, yMm, depthMm;
 };
 
-// vxc::CavernSite. xy is always the anchor's (every room is coaxial), so only
-// the per-room z, radii and floor are carried.
+// vxc::CavernSite. Since v26 the rooms are no longer coaxial, so the per-room
+// xy, long-axis heading and elongation ratio are carried too, along with the
+// two per-site fields (pillar radius, rubble amplitude). Kernel-local, so no
+// cross-kernel buffer layout moves.
 struct GpuCavernSite
 {
     bool valid;
-    int64_t anchorZMm;
+    int64_t anchorXMm, anchorYMm, anchorZMm;
+    int64_t childXMm[kCavernChildCount];
+    int64_t childYMm[kCavernChildCount];
     int64_t childZMm[kCavernChildCount];
     int64_t childRxyMm[kCavernChildCount];
     int64_t childRzMm[kCavernChildCount];
     int64_t childFloorZMm[kCavernChildCount];
+    int childDirCosQ12[kCavernChildCount];
+    int childDirSinQ12[kCavernChildCount];
+    int childElongQ10[kCavernChildCount];
     int floodZMm;
+    int pillarRadiusMm;
+    int breakdownAmpMm;
 };
 
 // vxc::CavernColumn.
@@ -2502,15 +2591,24 @@ GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode n
 {
     GpuCavernSite site;
     site.valid = false;
+    site.anchorXMm = 0;
+    site.anchorYMm = 0;
     site.anchorZMm = 0;
     site.floodZMm = kCavernDryZMm;
+    site.pillarRadiusMm = 0;
+    site.breakdownAmpMm = 0;
     [unroll]
     for (int q = 0; q < kCavernChildCount; ++q)
     {
+        site.childXMm[q] = 0;
+        site.childYMm[q] = 0;
         site.childZMm[q] = 0;
         site.childRxyMm[q] = 0;
         site.childRzMm[q] = 0;
         site.childFloorZMm[q] = 0;
+        site.childDirCosQ12[q] = (int)kCavernDirOne;
+        site.childDirSinQ12[q] = 0;
+        site.childElongQ10[q] = 1024;
     }
 
     const int siteSurfaceMm = evalSurface(seed, floorDiv(node.xMm, (int64_t)kVoxelSizeMm),
@@ -2518,10 +2616,19 @@ GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode n
                                   .surfaceMm;
     if (siteSurfaceMm < kCavernMinSurfaceMm) return site; // beach/ocean guard on the SITE
 
+    site.anchorXMm = node.xMm;
+    site.anchorYMm = node.yMm;
     site.anchorZMm = (int64_t)siteSurfaceMm - node.depthMm;
 
+    // v26 per-room word bit budget: 0..9 rxy, 10..19 rz, 20..29 floor drop,
+    // 30..39 step down, 40..49 sideways step, 50..59 elongation, 60..62
+    // heading.
     int64_t maxFloorZMm = (int64_t)0x8000000000000000ULL; // INT64_MIN
     int64_t prevZMm = site.anchorZMm;
+    int64_t prevXMm = site.anchorXMm;
+    int64_t prevYMm = site.anchorYMm;
+    int64_t prevDirCos = kCavernDirOne;
+    int64_t prevDirSin = 0;
     for (int c = 0; c < kCavernChildCount; ++c)
     {
         const uint64_t h = hash3(seed, fi, fj, (int64_t)c, CH_CAVERN_SITE);
@@ -2534,16 +2641,42 @@ GpuCavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, GpuCaveNode n
             kCavernFloorDropMinMm + cavernField10(h >> 20, kCavernFloorDropSpanMm);
         const int64_t stepDownMm =
             isRoot ? 0 : kCavernStepDownMinMm + cavernField10(h >> 30, kCavernStepDownSpanMm);
+        const int64_t offsetMm =
+            isRoot ? 0 : kCavernOffsetMinMm + cavernField10(h >> 40, kCavernOffsetSpanMm);
+        const int64_t elongQ10 = kCavernElongMinQ10 + cavernField10(h >> 50, kCavernElongSpanQ10);
+        const int dirIdx = (int)((h >> 60) & 7ULL);
 
+        // The sideways step is taken along the PARENT's long axis -- that is
+        // what keeps the elongation ratio out of the chain's overlap bound
+        // (caverns.h static_assert (a)). floorDiv, not >>: prevDirCos/Sin can
+        // be negative.
         const int64_t zMm = isRoot ? site.anchorZMm : prevZMm - stepDownMm;
+        const int64_t xMm = isRoot ? site.anchorXMm
+                                   : prevXMm + floorDiv(offsetMm * prevDirCos, kCavernDirOne);
+        const int64_t yMm = isRoot ? site.anchorYMm
+                                   : prevYMm + floorDiv(offsetMm * prevDirSin, kCavernDirOne);
         prevZMm = zMm;
+        prevXMm = xMm;
+        prevYMm = yMm;
+        prevDirCos = (int64_t)kCavernDirCosQ12[dirIdx];
+        prevDirSin = (int64_t)kCavernDirSinQ12[dirIdx];
 
+        site.childXMm[c] = xMm;
+        site.childYMm[c] = yMm;
         site.childZMm[c] = zMm;
         site.childRxyMm[c] = rxyMm;
         site.childRzMm[c] = rzMm;
         site.childFloorZMm[c] = zMm - floorDropMm;
+        site.childDirCosQ12[c] = kCavernDirCosQ12[dirIdx];
+        site.childDirSinQ12[c] = kCavernDirSinQ12[dirIdx];
+        site.childElongQ10[c] = (int)elongQ10;
         if (site.childFloorZMm[c] > maxFloorZMm) maxFloorZMm = site.childFloorZMm[c];
     }
+
+    // v26 pillars and rubble, both per SITE.
+    const uint64_t shapeHash = hash2(seed, fi, fj, CH_CAVERN_SHAPE);
+    site.pillarRadiusMm = (int)cavernPillarRadiusForSite(shapeHash);
+    site.breakdownAmpMm = (int)cavernField10(shapeHash >> 32, kCavernBreakdownMaxMm);
 
     // Flood level: 40% of open sites dry, else a level just above the highest
     // room floor, clamped below the anchor and above zero.
@@ -2609,8 +2742,9 @@ GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfa
                 node.depthMm > kCavernNodeDepthSafeMaxMm)
                 continue;
 
-            // Every room shares the anchor's xy (coaxial chain), so this
-            // distance is computed ONCE per column, not once per room.
+            // Distance to the ANCHOR, for the reach reject only -- since v26
+            // the rooms no longer share an xy, so this is a bound (the reach
+            // constant includes the chain's worst-case axis drift).
             const int64_t ex = xMm - node.xMm;
             const int64_t ey = yMm - node.yMm;
             const int64_t dxySq = ex * ex + ey * ey;
@@ -2631,24 +2765,76 @@ GpuCavernColumn cavernColumnFor(uint64_t seed, int64_t vx, int64_t vy, int surfa
                                         32768),
                         kCavernRoughMinQ10, kCavernRoughMaxQ10);
 
+            // v26 rubble: one noise sample for the column, shared by every
+            // room of this site exactly as the roughness sample is.
+            const int64_t breakdownMm =
+                cavernBreakdownAt(seed, xMm, yMm, (int64_t)site.breakdownAmpMm);
+
+            // Set before the pillar reject below, or a column standing in a
+            // pillar would report the site dry.
+            cv.floodZMm = site.floodZMm;
+
+            int pendingMarginSq[kMaxCavernSegs];
+            int pendingZCenterMm[kMaxCavernSegs];
+            int pendingZFloorMm[kMaxCavernSegs];
+            [unroll]
+            for (int q = 0; q < kMaxCavernSegs; ++q)
+            {
+                pendingMarginSq[q] = 0;
+                pendingZCenterMm[q] = 0;
+                pendingZFloorMm[q] = 0;
+            }
+            int pendingCount = 0;
+            bool nearAnyAxis = false;
             for (int c = 0; c < kCavernChildCount; ++c)
             {
+                const int64_t rx = xMm - site.childXMm[c];
+                const int64_t ry = yMm - site.childYMm[c];
+                if (rx * rx + ry * ry < kCavernPillarAxisClearSqMm) nearAnyAxis = true;
+
+                // v26 elongation: into the room's own frame, then stretch the
+                // across-axis component. Magnitudes only (both get squared),
+                // so every shift here has a non-negative operand.
+                const int64_t dcos = (int64_t)site.childDirCosQ12[c];
+                const int64_t dsin = (int64_t)site.childDirSinQ12[c];
+                const int64_t alongMm = cavernAbs(rx * dcos + ry * dsin) >> 12;
+                const int64_t acrossMm =
+                    truncDiv((cavernAbs(ry * dcos - rx * dsin) >> 12) *
+                                 (int64_t)site.childElongQ10[c],
+                             1024);
+                const int64_t dSqEff = alongMm * alongMm + acrossMm * acrossMm;
+
                 const int64_t rxyMm = site.childRxyMm[c];
                 const int64_t rzMm = site.childRzMm[c];
                 const int64_t rxySq = rxyMm * rxyMm;
                 const int64_t rxySqRough = truncDiv(rxySq * roughQ10, 1024);
-                if (dxySq >= rxySqRough) continue; // this room doesn't reach here
-                const int64_t marginSq = truncDiv(rzMm * rzMm * (rxySqRough - dxySq), rxySqRough);
+                if (dSqEff >= rxySqRough) continue; // this room doesn't reach here
+                const int64_t marginSq = truncDiv(rzMm * rzMm * (rxySqRough - dSqEff), rxySqRough);
                 if (marginSq <= 0) continue;
+                if (pendingCount < kMaxCavernSegs)
+                {
+                    pendingMarginSq[pendingCount] = (int)marginSq;
+                    pendingZCenterMm[pendingCount] = (int)site.childZMm[c];
+                    pendingZFloorMm[pendingCount] = (int)(site.childFloorZMm[c] + breakdownMm);
+                    pendingCount += 1;
+                }
+            }
+
+            // v26 pillars: a column standing in one is solid rock top to
+            // bottom, which emitting nothing expresses exactly -- so
+            // cavernCarveAt stays byte-for-byte the v25 predicate.
+            if (!nearAnyAxis && cavernPillarAt(seed, xMm, yMm, (int64_t)site.pillarRadiusMm))
+                continue;
+            for (int ps = 0; ps < pendingCount; ++ps)
+            {
                 if (cv.count < kMaxCavernSegs)
                 {
-                    cv.marginSq[cv.count] = (int)marginSq;
-                    cv.zCenterMm[cv.count] = (int)site.childZMm[c];
-                    cv.zFloorMm[cv.count] = (int)site.childFloorZMm[c];
+                    cv.marginSq[cv.count] = pendingMarginSq[ps];
+                    cv.zCenterMm[cv.count] = pendingZCenterMm[ps];
+                    cv.zFloorMm[cv.count] = pendingZFloorMm[ps];
                     cv.count += 1;
                 }
             }
-            cv.floodZMm = site.floodZMm;
         }
     }
     return cv;

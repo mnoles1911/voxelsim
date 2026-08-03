@@ -799,6 +799,130 @@ harness runs per-item on branch builds, the version event ships once.
   *Verify* capture above is still outstanding.
 * **W4 — G2 chambers** (offsets, elongation, pillars, breakdown).
   *Verify: A/B CavernShot pair; plan-view symmetry visibly broken.*
+
+  **LANDED at kWorldGenVersion 26.** All four terms shipped, and the wave's
+  real content is the second half of the Verify line rather than the first:
+  "plan-view symmetry visibly broken" is a claim about a NUMBER, so W4 built
+  the number and then built the control that makes it mean anything.
+
+  What changed. The v25 chamber was, provably, one roughened DISC in plan:
+  every room shared the anchor's xy (coaxial), rx == ry so every room was
+  round, and the only asymmetric term — the wall-roughness noise — was a
+  boundary wobble shared by all four rooms. Four rooms drew four concentric
+  circles. v26: children 1-3 step SIDEWAYS as well as down; every room is an
+  ellipse with its own hashed heading (one of 8, as an integer Q12 cos/sin
+  pair) and elongation ratio (1.17-2.15 : 1); a world-space field of pairwise
+  disjoint PILLARS is left standing inside the rooms; and a per-column rubble
+  rise turns the flat floor into a breakdown surface. `cavernCarveAt` is
+  byte-for-byte the v25 per-voxel predicate — the whole change lives in the
+  per-site and per-column tiers, and vxc_bench measures no amplify-stage cost
+  (429.6 vs 429.0 ms at 8^3, 328.9 vs 339.4 ms at 16^3, i.e. inside noise).
+
+  **THE COAXIAL PROOF HAD TO BE REBUILT, and one constant is load-bearing
+  because of it.** v25's connectivity argument was that dxy == 0 makes two
+  ellipsoids' overlap EXACTLY the 1D test |dz| < rz0 + rz1. An offset kills
+  that and there is no simple exact overlap test for two ellipsoids at a
+  general displacement. The replacement is a WITNESS COLUMN — the child's own
+  axis, where the child contributes its full rz and the parent contributes
+  h = rz_parent·sqrt(1 - dEff²/R²) — which is again a 1D test and again
+  static_assert-able against hashed minimums. Two things exist only to make it
+  hold: the sideways step is taken ALONG THE PARENT'S LONG AXIS (so the
+  elongation ratio never amplifies dEff, and dEff is just the step length),
+  and `kCavernRzDeepMinMm` rose 12 m -> 16 m so a deep room's rz exceeds the
+  largest possible step by a 2 m overlap floor. That floor is not decoration:
+  at 0 the chain would be "provably connected" through a hairline a 100 mm
+  voxel grid can round away. Measured on 60 real sites, the tightest observed
+  room-to-room overlap at the child axis is 7.96 m against the 2.00 m floor.
+  Pillars get two independent guards, both asserted: discs are pairwise
+  DISJOINT (so the field can never tile the plane), and pillars are suppressed
+  within 4 m of every room axis — wider than the worst-case 3.03 m throat, so
+  no draw can put rock in the chain's neck or on the anchor point the tunnel
+  network meets. The chain's DEPTH envelope does not move (the flat-floor
+  clamp bounds the bottom, not rz, and breakdown only ever raises floors).
+
+  **THE STATISTIC, AND WHY IT IS A DIFFERENCE.** A one-arm asymmetry number
+  would have repeated W3's mouth-metric error exactly: a v25 cavern footprint
+  ALREADY reads asymmetric wherever the roof clamp truncates it against a
+  slope, the bedrock clamp cuts its bottom off, or the sampled region clips it.
+  So `cave_families.h` gained `cavernSiteWithoutChamberShape` — v25's coaxial,
+  round, pillar-free, flat-floored chamber out of the v26 world, built the same
+  way the W3 entrance control is (neutralise fields of the shipping struct; no
+  worldgen edited, nothing mirrored, no digest can move) — and every statistic
+  is reduced twice on the same columns, terrain, seed and shipping predicate.
+
+  Measured, seed 20260719, synthetic sampler, at the cavern site on lattice
+  (24,-24), world (625.6, -588.8) m (v26 shipping vs the v25-shape control):
+  plan anisotropy **1.47:1 vs 1.01:1**; room-to-room stack drift **14.2 m vs
+  1.0 m**; enclosed rock islands in plan — which is what a pillar IS, measured
+  topologically rather than by asking the pillar field whether it fired —
+  **11 vs 0**; half-turn defect 213/1000 vs 35/1000; floor step within a room
+  **47 mm vs 0 mm**. At the second site, lattice (-16,-16): 1.83:1 vs 1.09:1,
+  15.3 m vs 1.1 m, 0 vs 0 islands, 25 mm vs 0 mm. The ctest gate
+  (`cavern_plan_symmetry_...`) runs the same pair over 12 flat sites and reads
+  2.00:1 vs 1.09:1, 10.3 m vs 1.8 m, 51 vs 1 islands, 53 mm vs 0 mm.
+
+  **Two of the four control bounds are NOT zero, and saying so is the point.**
+  The floor step really is exactly 0 on the control, because a v25 floor is a
+  plane. Anisotropy and stack drift are not, because the wall-roughness noise
+  v25 already had wobbles a disc's boundary by up to 15% of its radius: that
+  moves a slice centroid by over a metre and can occasionally pinch off a
+  one-cell rock island. Those two bounds are therefore stated as the
+  statistic's measured NOISE FLOOR and the gate requires the real arm to beat
+  the floor by a margin, not merely to be above zero. Asserting the control was
+  zero would have made the gate assert something false and read the real arm's
+  margin as larger than it is.
+
+  Also fixed, and worth recording as the same class of error one level down:
+  the per-room floor statistic was first written as the column's LOWEST floor,
+  and the control then read HIGHER than the shipping arm (1200 mm vs 534 mm) —
+  because that number is dominated by the step where one room's footprint ends
+  and the next room's deeper floor takes over, which is chain geometry and not
+  rubble at all. Asked per room it is 0 on the control by construction.
+
+  **THE CAVERN PASS IS NOW EXERCISED BY vxc_gpu, and it never was before.**
+  The per-region "exercised:" line W3 added had been reporting "0 cavern
+  column(s)" for every fixture since the day it was added — so
+  `cavernColumnFor`, `cavernSiteFor` and `cavernCarveAt`, roughly 200 lines of
+  the worldgen.ush mirror including a per-column division and a four-room
+  reduction, had never been compared between CPU and GPU at all. W4 rewrote all
+  of it, which is exactly the wave where that would have shipped a real
+  divergence. Closed by a `cavern` fixture at voxel (6456, -6049), 96x96
+  columns over the chain's own 91 m depth envelope, **found by search rather
+  than by eye**: `vxc_caveprobe` gained a per-site line that scans blocks
+  around each open cavern site and scores them on how close to a HALF-AND-HALF
+  chamber/rock split they are, rejecting any block containing no pillar column.
+  The chosen block reports 49% chamber and pillar rock inside it, and the
+  harness now prints `exercised: 614 cave / 0 entrance / 4536 cavern
+  column(s) of 9216`. **The site mattered as much as the block**: a third of
+  cavern sites hash to no pillars at all, the first site the search was run
+  against was one of them, and a fixture there would have exercised the pillar
+  mirror by not containing it — the same shape of hole this whole paragraph is
+  about. CPU/GPU bit-exact on an AMD RX 7800 XT over 59,520 columns and
+  18.8M cells.
+
+  The UE-side `kExpectedCpuDigest` pin did not move, and this time it was
+  established by BUILDING BOTH: the harness was run at v26 with the new cavern
+  fixture disabled, and again with caverns.h / worldgen.ush / core.h / the
+  prebuilt SPIR-V stashed back to v25. Both print the identical digest
+  `2921d08fd179c25c` over all eleven pre-existing regions, 50,304 columns and
+  10,143,744 cells. Version pin rolled to 26 and the UE module recompiled
+  clean.
+
+  **No rendered frame exists for any of this.** The box's one editor slot was
+  held by the watershed work for the whole session, so the *Verify* line's A/B
+  CavernShot pair is outstanding. The capture sites are picked and verified
+  rather than guessed: `docs/measurements/w4-cavern-site-shapes.txt` lists
+  every open cavern site in a 1.6 km box with its four rooms' axes, radii,
+  headings and elongations, plus whether the site has pillars at all — which
+  is the thing a capture must not be wrong about.
+
+  Still open from this item: the plan-view *half-turn defect* is the weakest of
+  the four statistics (213 vs 35 per mille) because the roughness wobble
+  dominates it; it is reported as a diagnostic and NOT gated on. And the
+  breakdown amplitude is capped at 1.5 m by the throat argument
+  (`kCavernBreakdownMaxMm < kCavernFloorDropMinMm`), which reads as 53 mm of
+  floor change per metre — a gentle rubble surface, and a number the owner's
+  eye should be the arbiter of rather than this note.
 * **W5 — Field coupling v1, no new data:** temperature + relief gates on
   G1/G3/G5 density, calibre and crevice rate (no lithology yet, no flow yet,
   and — per Q4 — no precipitation). This alone delivers "mountains have more

@@ -103,6 +103,61 @@ inline CaveLattice caveLatticeWithoutEntranceCavity(CaveLattice L) {
     return L;
 }
 
+// THE v25 CHAMBER, OUT OF THE v26 WORLD -- the control panel for W4's A/B,
+// and the reason W4's symmetry statistic is a measurement rather than an
+// assertion.
+//
+// WHY A CONTROL IS NOT OPTIONAL HERE. "Plan-view symmetry is visibly broken"
+// is a claim about a NUMBER going up, and a number that goes up proves
+// nothing unless the same number can be shown to come out LOW on geometry
+// that really is symmetric. Any plan-view asymmetry statistic has three ways
+// to read high for reasons that have nothing to do with the chamber: the roof
+// clamp truncates a room against a slope into a crescent; the bedrock clamp
+// cuts its bottom off; the sampled region clips it at the edge. All three
+// were already true at v25. Measuring one arm and reporting "asymmetric"
+// would therefore have been the W3 mouth-metric mistake again -- a statistic
+// satisfied by geometry other than the one under test.
+//
+// Differencing removes all three at once, because both arms see the SAME
+// terrain, the same clamps, the same region and the same sites, and differ in
+// exactly the four terms W4 added. The v25 value is the control that proves
+// the statistic can report "symmetric" at all.
+//
+// Built the same way the entrance control is: by neutralising fields of the
+// shipping struct, not by editing worldgen and not by building a v25 tree.
+// Nothing here is mirrored in the shader and nothing here can move a digest.
+//
+// NOT neutralised, deliberately: kCavernRzDeepMinMm's v26 rise from 12 m to
+// 16 m. That is a room SIZE change, not a shape one -- it makes deep rooms
+// taller, which no symmetry statistic reads -- and reverting it here would
+// make the two arms differ in something the A/B is not about.
+inline CavernSite cavernSiteWithoutChamberShape(CavernSite s) {
+    for (int32_t c = 0; c < kCavernChildCount; ++c) {
+        s.children[c].xMm = s.anchorXMm; // coaxial again: no leaning chain
+        s.children[c].yMm = s.anchorYMm;
+        s.children[c].dirCosQ12 = static_cast<int32_t>(kCavernDirOne); // round in plan again
+        s.children[c].dirSinQ12 = 0;
+        s.children[c].elongQ10 = 1024;
+    }
+    s.pillarRadiusMm = 0; // no pillars
+    s.breakdownAmpMm = 0; // flat machined floors
+    return s;
+}
+
+// The v25-shaped cavern column for a site out of the v26 world. Goes through
+// the shipping reduction (`cavernColumnFromSites`), so the roughness sample,
+// the reach reject, the segment cap and `cavernCarveAt` are all the real
+// ones -- only the site's shape fields differ.
+template <typename SurfaceFn>
+inline CavernColumn cavernColumnWithoutChamberShape(uint64_t seed, const CavernCandidates& cands,
+                                                    int64_t vx, int64_t vy,
+                                                    const SurfaceFn& surfaceAt) {
+    return cavernColumnFromSites(
+        seed, cands, vx, vy, [&](int64_t fi, int64_t fj, const CaveNode& node) {
+            return cavernSiteWithoutChamberShape(cavernSiteFor(seed, fi, fj, node, surfaceAt));
+        });
+}
+
 template <typename SurfaceFn>
 inline CaveColumnVariants caveColumnVariantsFor(uint64_t seed, int64_t vx, int64_t vy,
                                                 int32_t surfaceMm, const SurfaceFn& surfaceAt,

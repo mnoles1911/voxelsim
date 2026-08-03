@@ -1,0 +1,105 @@
+
+vxc_caveprobe  seed=20260719  kWorldGenVersion=26
+region centre=(-395.0, -408.0) m  span=204.8 m  256x256 samples  stride=0.8 m (0.0419 km^2)
+scan band: surface .. 45 m down (450 voxels)   headroom=1.8 m   steep>=300 mm/m
+
+--- self-check (a wrong instrument must say so) ---
+family attribution vs caveCarveAt : 0 mismatched voxels (exact)
+lattice recompute vs ColumnSample : 0 mismatched columns (exact)
+
+--- volume and occupancy ---
+solid voxels in band = 29556736   carved = 823405 (2.786% of the band)
+columns with any cave beneath: 11482 / 65536 (17.52%)
+deepest carve = 45.1 m below surface; thinnest non-shaft roof = 8.4 m (clamp 6.0 m)
+family            voxels      %band        columns    %cols
+tunnel            290855    0.9841%           8844  13.495%
+crevice             6183    0.0209%            172   0.262%
+shaft              10794    0.0365%            152   0.232%
+cavern            526824    1.7824%           3321   5.067%
+
+--- entrances (the plan's headline: is the network findable on a walk?) ---
+ground: 31108 flat / 34428 steep columns (steep >= 300 mm/m)
+perforated surface columns (you would fall in): 42 (0.06409% of the surface, 1001.4 sample-columns per km^2)
+  on flat ground : 32 (1607.3 per km^2 of flat ground)
+  on steep ground: 10 (453.8 per km^2 of steep ground)
+  by family: shaft    42
+sideways daylighting mouths (columns): 77 total, 52 flat, 25 steep
+entrance cavity footprint: 160 columns (0.2441% of the surface, 2441 m^2/km^2)
+  open to the sky : 41 (25.6% of the footprint) -- the doline mouth
+  roofed          : 119 (74.4%), 88 flat / 31 steep -- overhanging lip and hillside ceiling
+  (mouth vs doline is a per-SITE question -- see the site list below; a
+   roof-thickness threshold cannot answer it, see the comment here)
+
+--- W4 chamber shape: plan-view symmetry, v26 vs the v25-shape control ---
+(both arms are the SAME sites, terrain, seed and shipping predicate; the
+ control differs only by cave_families.h cavernSiteWithoutChamberShape.
+ The control is what proves each statistic can report SYMMETRIC at all --
+ a one-arm asymmetry number is satisfied by roof, bedrock and region
+ clipping, all of which were already true at v25.)
+statistic                           v26 (shipping)   v25-shape ctl
+cavern plan columns                           3558            3410
+plan components                                  1               1
+plan anisotropy (area-weighted)             1.83:1          1.09:1
+plan anisotropy (worst room)                1.83:1          1.09:1
+room-to-room stack drift                    15.3 m           1.1 m
+enclosed rock islands (PILLARS)                  0               0
+half-turn defect                           83/1000         55/1000
+floor step within a room (RUBBLE)            25 mm            0 mm
+columns the shipping arm turned to rock that the control carved: 702
+  (an UPPER BOUND on pillar area, not a pillar count -- the offsets also
+   move a room off a column. The enclosed-island row isolates pillars.)
+
+--- floor area and headroom (5.6: where can a mob stand?) ---
+family       floor spots       m^2/km^2      columns  mean head m
+tunnel              7406         113007         7394         1.80
+crevice              150           2289          150         1.80
+shaft                118           1801          118         1.80
+cavern               225           3433          225         1.80
+columns with any standable floor: 7813 (11.922%)
+
+--- depth distribution (5.7: how much of the rock column is used?) ---
+band               tunnel      crevice        shaft       cavern
+0-5 m                   0            0         4081            0
+5-10 m                698            0         3917            0
+10-15 m             38578          145          750            0
+15-20 m             72064         2454          750         3381
+20-25 m             82459         2589          750        30275
+25-30 m             71238          944          546        82663
+30-35 m             25731           51            0       119055
+35-40 m                87            0            0       137001
+40-45 m                 0            0            0       151305
+45-50 m                 0            0            0         3144
+
+--- passage direction (tell #2: the lattice's cardinal lock) ---
+  0- 15 deg   11.59%  #######################
+ 15- 30 deg   12.06%  ########################
+ 30- 45 deg    6.06%  ############
+ 45- 60 deg    4.13%  ########
+ 60- 75 deg    5.33%  ##########
+ 75- 90 deg   11.42%  ######################
+ 90-105 deg    8.47%  ################
+105-120 deg    9.76%  ###################
+120-135 deg    6.71%  #############
+135-150 deg    1.25%  ##
+150-165 deg   10.06%  ####################
+165-180 deg   13.16%  ##########################
+SEGMENT lock: 44.63% of tunnel axis length lies within 15 deg of due E or due N (isotropic would be 33.3%)
+ROUTING lock: over 54 backbone runs of 8 cells (205 m), net heading departs from due E/N by 2.84 deg on average, 6.50 deg worst -- the network runs grid-cardinal at range whatever the segments do
+total tunnel axis length in region: 2328 m (55508 m per km^2)
+
+--- generator sites in region (what W3/W4 must re-provide) ---
+shaft nodes : 1 open of 4 candidates (25%) = 23.8 entrances/km^2, one per 205 m square
+cavern sites: 1 open of 1 candidates (100%) = 23.8 sites/km^2
+
+--- entrance and cavern sites, world metres (feed to -VoxelSpawnAt) ---
+  shaft     lattice(-16,-20) at (-390.2, -493.1) m  surface 1027.7 m  node depth 28.6 m   [breaks surface]
+             shape: doline (opens on axis) -- footprint r=5.7 m (2501 cols), open 650 / roofed 1851; open set centroid (-0.2, -0.3) m off-axis 0.3 m, reaches r=3.2 m, 0 col(s) in the outer fifth; ground across the opening 1026.7..1028.4 m
+  cavern    lattice(-16,-16) at (-395.4, -407.7) m  surface 1039.4 m  node depth 31.0 m
+             chamber: anchor z 1008.3 m; pillars r=0.0 m [THIS SITE HAS NONE]; rubble amp 0.43 m
+               room 0: axis   +0.0,  +0.0 m from anchor  z 1008.3 m  long r 21.2 m  short r 14.5 m  elong 1.46:1  floor 1003.7 m
+               room 1: axis   +4.7,  +2.0 m from anchor  z 995.7 m  long r 25.5 m  short r 19.7 m  elong 1.30:1  floor 984.2 m
+               room 2: axis   +4.7,  +8.7 m from anchor  z 985.9 m  long r 15.1 m  short r 7.9 m  elong 1.92:1  floor 973.6 m
+               room 3: axis   +7.0, +14.2 m from anchor  z 981.1 m  long r 26.8 m  short r 20.3 m  elong 1.32:1  floor 977.9 m
+               vxc_gpu fixture: origin voxel (-4155, -4238), 96x96 columns -- 50% of a decimated sample is chamber and 115 sample(s) are pillar rock
+
+caveprobe census digest=36f3315cef5fb8c3  (kWorldGenVersion=26)

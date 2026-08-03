@@ -3025,6 +3025,47 @@ int main(int argc, char** argv) {
         {"entrance", 51 - 64, -1011 - 64, 128, 128, 30000, 1,
          static_cast<int32_t>((kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm + kCaveWaypointDipMm +
                                kCaveRadiusMaxMm) / kVoxelSizeMm)},
+        // AND ONE REGION THAT REACHES A CAVERN CHAMBER (worldgen v26).
+        //
+        // THE FOURTH TIME, AND THIS ONE WAS FOUND BY THE INSTRUMENT RATHER
+        // THAN BY AN ACCIDENT. The per-region "exercised:" line added below at
+        // v25 reported, from the day it was added, that the cavern pass was
+        // covered by NO fixture in this harness at all: every region printed
+        // "0 cavern column(s)". So `cavernColumnFor`, `cavernSiteFor` and
+        // `cavernCarveAt` -- roughly 200 lines of the worldgen.ush mirror,
+        // including a per-column division and a four-room reduction -- had
+        // never been compared between CPU and GPU. W4 rewrote all of it
+        // (offsets, elongation, pillars, breakdown), which is exactly the wave
+        // in which an unexercised pass would have shipped a real divergence.
+        //
+        // WHAT MAKES THIS FIXTURE A TEST RATHER THAN A GESTURE. A block placed
+        // in the MIDDLE of a chamber compares only interior air and would pass
+        // with the wall test, the elongation and the pillar field all wrong,
+        // so the origin is not the anchor. It was found by search, with
+        //   vxc_caveprobe --synthetic 20260719 --origin 625 -589 --span 204.8
+        // whose per-site "vxc_gpu fixture" line scans blocks around each open
+        // cavern site and scores them on how close to a HALF-AND-HALF split of
+        // chamber and rock they are, rejecting any block that contains no
+        // PILLAR column. This one reports 49% chamber and pillar rock inside
+        // it, so the chamber boundary, the elongated wall and a standing
+        // pillar are all in the compared volume rather than nearby.
+        //
+        // The site also matters, not just the block: a THIRD of cavern sites
+        // hash to no pillars at all, and the first site this search was run
+        // against was one of them. A fixture there would have exercised the
+        // pillar mirror by not containing it -- the same shape of hole this
+        // whole comment exists about. The site at lattice (24,-24), world
+        // (625.6, -588.8) m, has pillars r=1.5 m and rubble amplitude 0.77 m.
+        //
+        // The depth is the cavern chain's own envelope, spelled from the
+        // constants amplifier.cpp derives kMaxCavernCarveBelowSiteSurfaceMm
+        // from -- anchor depth, three chain steps, and the flat-floor drop
+        // that (not the room radius) bounds the bottom.
+        {"cavern", 6456, -6049, 96, 96, 30000, 1,
+         static_cast<int32_t>((kCaveNodeDepthMinMm + kCaveNodeDepthSpanMm +
+                               (kCavernChildCount - 1) *
+                                   (kCavernStepDownMinMm + kCavernStepDownSpanMm) +
+                               kCavernFloorDropMinMm + kCavernFloorDropSpanMm) / kVoxelSizeMm)},
     };
 
     Digest gpuDigest;

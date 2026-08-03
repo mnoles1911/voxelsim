@@ -47,22 +47,82 @@
 //    stay exactly as before, and every child still carries an own-center
 //    flat floor, so C7 has a well-defined basin to flood.
 //
-// WHY COAXIAL (children 1-3 share the anchor's xy, not an independent offset)
+// ---------------------------------------------------------------------------
+// W4 (worldgen v26): THE CHAMBER SHAPE. Read this before retuning anything.
+// ---------------------------------------------------------------------------
+// The owner's complaint that started the underground redesign was that caves
+// look "very computer made with procedural shapes." W3 rebuilt how you get IN;
+// this is what you find once you are inside, and the two specific tells it
+// kills are SYMMETRY IN PLAN and CONSTANT CROSS-SECTION.
+//
+// Up to v25 a cavern site's plan view was, provably, a single roughened DISC:
+// every room shared the anchor's xy (coaxial, see below), rx == ry so every
+// room was round, and the one asymmetric term — the wall-roughness noise —
+// was a boundary wobble shared by all four rooms. Four rooms therefore drew
+// four concentric circles and the whole site read as a stack of pancakes on a
+// plumb line. Four terms break that, all of them per-SITE or per-COLUMN and
+// none of them costing the per-voxel loop anything new:
+//
+//   OFFSETS      children 1-3 step SIDEWAYS as well as down, so the chain
+//                leans instead of stacking. The plan footprint stops being
+//                concentric and the four rooms stop sharing one axis.
+//   ELONGATION   rx != ry: each room gets its own hashed long-axis heading
+//                (one of 8, as an integer Q12 cos/sin pair) and its own
+//                hashed elongation ratio, so a room is an ellipse in plan and
+//                the chain's rooms disagree about which way they point.
+//   PILLARS      a world-space field of disjoint rock columns left standing
+//                inside the rooms — the single most recognisable feature of a
+//                real chamber, and the thing that most obviously cannot come
+//                out of one ellipsoid formula.
+//   BREAKDOWN    a per-column rubble rise on the flat floor, so the floor is
+//                a lumpy collapse surface rather than a machined plane.
+//
+// WHERE THE COAXIAL PROOF WENT, AND WHAT REPLACED IT. The v25 argument was
+// that dxy == 0 makes two ellipsoids' overlap EXACTLY the 1D interval test
+// |dz| < rz0 + rz1, which is static_assert-able against hashed minimums. An
+// offset breaks that, and two ellipsoids at a general displacement have no
+// simple exact overlap test. So the proof is rebuilt around a WITNESS COLUMN
+// instead — the child's own axis:
+//
+//   * at the child's axis the child's vertical half-extent is its full rz;
+//   * the parent's half-extent there is h = rz_parent * sqrt(1 - dEff^2/R^2),
+//     where dEff is the offset measured in the PARENT's own elongated frame
+//     and R is the parent's roughened long semi-axis;
+//   * so the two rooms' z-intervals at that one column overlap by at least
+//     min(2h, rz_child - step + h).
+//
+// Both terms are bounded below by constants, which is what the static_asserts
+// below pin. Two constants exist only to make that bound hold and must not be
+// retuned without redoing it: the step is taken ALONG THE PARENT'S LONG AXIS
+// (so the elongation ratio never amplifies dEff — dEff is then just the step
+// length), and kCavernRzDeepMinMm is >= the largest possible step plus a
+// 2 m overlap floor. The flood-fill test in test_caverns.cpp is still the
+// arbiter; these asserts are what make it a check rather than the argument.
+//
+// WHY PILLARS CANNOT SEAL A ROOM. Two independent guards, both asserted:
+// pillar discs are pairwise DISJOINT (radius + jitter is under half the
+// pillar lattice), so they can never tile the plane and the complement of a
+// disjoint union of discs is connected; and pillars are SUPPRESSED within
+// kCavernPillarAxisClearMm of every room's axis, which is wider than the
+// worst-case room-to-room throat, so the chain's connecting neck and the
+// anchor point the tunnel network meets are always open rock-free space.
+//
+// WHAT THIS COST. The v25 note below — "dxySq is computed ONCE PER COLUMN and
+// reused for all 4 children" — is no longer true: offsets and per-room
+// headings mean each room needs its own (ex, ey). That work is inside the
+// rare full-reduction tier (columns within reach of an open site), not in the
+// per-voxel loop, and `cavernCarveAt` is byte-for-byte the v25 predicate.
+//
+// WHY COAXIAL (the v25 argument, kept because it is why child 0 still is)
 // ---------------------------------------------------------------------------
 // Two ellipsoids of revolution (rx == ry == rxy, semi-axis rz) centred a
 // displacement (dxy, dz) apart do NOT have a simple exact overlap test in
 // general — but if dxy == 0 (same xy, i.e. coaxial), the two ellipsoids'
 // horizontal cross-sections at any given z are full circles on the SAME axis,
-// so overlap reduces EXACTLY to the 1D interval test |dz| < rz0 + rz1. That
-// is what makes the connectivity argument for a 4-room chain a clean,
-// static_assert-able fact instead of an approximation: build the chain with
-// zero horizontal offset between consecutive rooms, and the same worst-case
-// static_assert style caves.h already uses (compare hashed MINIMUMS) proves
-// every consecutive pair overlaps, hence (transitively) the whole chain's
-// union is one connected blob for every possible hash draw. It also means
-// distance-to-anchor (dxySq) is now computed ONCE PER COLUMN and reused for
-// all 4 children instead of once per child — a real cost reduction, keeping
-// faith with "the perf pass just landed 2.75x, do not give it back."
+// so overlap reduces EXACTLY to the 1D interval test |dz| < rz0 + rz1. Child
+// 0 still sits exactly on the anchor for precisely this reason: it is the
+// room the tunnel network meets, and its containment of the anchor point is
+// what makes connectivity to the tunnels structural rather than statistical.
 //
 // ---------------------------------------------------------------------------
 // WHY THIS RIDES THE EXISTING PER-COLUMN REDUCTION (design doc §0)
@@ -212,9 +272,24 @@ inline constexpr int64_t kCavernRz0MaxMm = kCavernRz0MinMm + kCavernRz0SpanMm;
 
 // Children 1..3's vertical semi-axis: the actual "use the new depth" room,
 // independently hashed per room, up to 40 m tall (80 m full height) each.
-inline constexpr int64_t kCavernRzDeepMinMm = 12000;  // 12 m
-inline constexpr int64_t kCavernRzDeepSpanMm = 28000; // -> [12, 40) m
+//
+// v26 RAISED THE FLOOR OF THIS RANGE FROM 12 m, and it is a load-bearing
+// constant, not a taste one: the offset chain's overlap proof needs the
+// child's own rz to exceed the largest possible downward step by the 2 m
+// overlap floor (see kCavernMinChainOverlapMm and the static_assert). Lower
+// it and consecutive rooms stop being provably connected. The ceiling is
+// unchanged at 40 m, and the chain's DEPTH envelope does not move at all --
+// the flat-floor clamp, not rz, is what bounds how deep a room carves
+// (amplifier.cpp's kMaxCavernCarveBelowSiteSurfaceMm derivation).
+inline constexpr int64_t kCavernRzDeepMinMm = 16000;  // 16 m
+inline constexpr int64_t kCavernRzDeepSpanMm = 24000; // -> [16, 40) m
 inline constexpr int64_t kCavernRzDeepMaxMm = kCavernRzDeepMinMm + kCavernRzDeepSpanMm;
+
+// Vertical overlap a consecutive room pair is guaranteed at the child's own
+// axis, in mm. Not a tuning knob: at 0 the chain would be "provably connected"
+// through a hairline that a 100 mm voxel grid can round away, which is the
+// difference between a proof and a proof about the continuum.
+inline constexpr int64_t kCavernMinChainOverlapMm = 2000;
 
 // Flat floor, own-center-relative for every room (a chain of 40-80 m tall
 // rooms sharing one floor reference stopped making sense once the rooms are
@@ -239,6 +314,116 @@ inline constexpr int64_t kCavernRoughAmpQ10 = 307;     // +/-0.3 of 1024
 inline constexpr int64_t kCavernRoughMinQ10 = 1024 - kCavernRoughAmpQ10; // 717 (~0.70)
 inline constexpr int64_t kCavernRoughMaxQ10 = 1024 + kCavernRoughAmpQ10; // 1331 (~1.30)
 
+// The SMALLEST a roughened horizontal semi-axis can ever be, squared. Every
+// W4 bound below is stated against this worst case rather than against the
+// nominal radius, because the roughness sample is per-COLUMN and the proof
+// has to hold at the one column the witness argument uses.
+inline constexpr int64_t kCavernRxyRoughMinSqMm =
+    (kCavernRxyMinMm * kCavernRxyMinMm) * kCavernRoughMinQ10 / 1024; // ~1.008e8, r ~ 10.04 m
+
+// Compile-time integer square root (Newton). Used ONLY to state the bounds
+// below in metres rather than in squared millimetres -- nothing at runtime
+// calls it, and nothing in worldgen.ush mirrors it: the shader sees the
+// resulting literals.
+constexpr int64_t cavernIsqrt(int64_t v) {
+    if (v <= 0) return 0;
+    int64_t x = v, y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    return x;
+}
+
+// --- W4 (v26): elongation ---------------------------------------------------
+
+// Long-axis heading, as an integer Q12 cosine/sine pair. Eight headings
+// 22.5 degrees apart span the whole space because an ellipse is unchanged by
+// a half turn, so three hash bits are the entire direction field.
+//
+// These are LITERALS, not a computed table: `src/` and `include/` are
+// float-free, and a table built by a constexpr trig routine would be a second
+// implementation to keep bit-identical with the shader. The pairs are not
+// exactly unit (|v|^2 is within 4e-6 of 4096^2, i.e. the ellipse is within
+// two parts per million of the intended axis ratio); that is deliberate and
+// harmless, and the offset-chain proof below carries an explicit slack term
+// for it rather than pretending it away.
+inline constexpr int32_t kCavernDirCount = 8;
+inline constexpr int64_t kCavernDirShift = 12;
+inline constexpr int64_t kCavernDirOne = 1 << kCavernDirShift; // 4096
+inline constexpr int32_t kCavernDirCosQ12[kCavernDirCount] = {4096, 3784,  2896,  1568,
+                                                              0,    -1568, -2896, -3784};
+inline constexpr int32_t kCavernDirSinQ12[kCavernDirCount] = {0,    1568, 2896, 3784,
+                                                              4096, 3784, 2896, 1568};
+
+// Elongation ratio, Q10. The SHORT semi-axis is rxy * 1024 / elongQ10, so the
+// long axis (and hence the site's reach) is unchanged and every W4 term below
+// only ever makes a room narrower. That is not an aesthetic choice: growing
+// the long axis instead would move kCavernMaxReachMm and with it the 2x2
+// candidate-corner exhaustiveness argument, for a shape change that narrowing
+// already delivers.
+inline constexpr int64_t kCavernElongMinQ10 = 1200;  // 1.17 : 1
+inline constexpr int64_t kCavernElongSpanQ10 = 1000; // -> [1.17, 2.15) : 1
+inline constexpr int64_t kCavernElongMaxQ10 = kCavernElongMinQ10 + kCavernElongSpanQ10;
+
+// --- W4 (v26): the leaning chain -------------------------------------------
+
+// How far child c's axis steps sideways from child c-1's, ALONG THE PARENT'S
+// OWN LONG AXIS (see the header's witness-column proof: taking the step along
+// that axis is what keeps the elongation ratio out of the overlap bound).
+inline constexpr int64_t kCavernOffsetMinMm = 1500;  // 1.5 m
+inline constexpr int64_t kCavernOffsetSpanMm = 5500; // -> [1.5, 7.0) m per step
+inline constexpr int64_t kCavernOffsetMaxMm = kCavernOffsetMinMm + kCavernOffsetSpanMm;
+
+// Slack for the Q12 direction decode. The step is applied as two floorDivs by
+// 4096 and then re-measured by two more, so both the step LENGTH and its
+// residual across-axis component carry a truncation error; both are bounded
+// by a couple of millimetres (the derivation is in the header). 8 mm is a
+// generous cover, and it is carried explicitly so the bound below is a bound
+// and not an approximation.
+inline constexpr int64_t kCavernOffsetSlackMm = 8;
+inline constexpr int64_t kCavernOffsetBoundMm = kCavernOffsetMaxMm + kCavernOffsetSlackMm;
+
+// The furthest any room's axis can drift from the anchor.
+inline constexpr int64_t kCavernMaxAxisDriftMm = (kCavernChildCount - 1) * kCavernOffsetBoundMm;
+
+// The worst-case THROAT: the radius of the disc around a child's axis that is
+// guaranteed to lie inside its parent's plan footprint as well. This is what
+// the pillar axis clearance has to cover.
+inline constexpr int64_t kCavernThroatRadiusMm =
+    cavernIsqrt(kCavernRxyRoughMinSqMm) - kCavernOffsetBoundMm;
+
+// --- W4 (v26): pillars ------------------------------------------------------
+
+// A world-space field of rock columns left standing. Keyed on a world lattice
+// rather than on the site, so pillars keep a constant real-world spacing
+// whatever size the room is, and so the field is a per-column question the
+// reduction can answer with one hash.
+inline constexpr int64_t kCavernPillarLatticeMm = 8000; // 8 m
+inline constexpr int64_t kCavernPillarJitterMm = 1500;  // +/- about the cell centre
+inline constexpr uint64_t kCavernPillarCellGateMask = 1; // bit 0 == 0 -> this cell has one
+inline constexpr int64_t kCavernPillarRadiusMinMm = 700;
+inline constexpr int64_t kCavernPillarRadiusSpanMm = 1100; // site radius in [0.7, 1.8) m
+inline constexpr int64_t kCavernPillarRadiusMaxMm =
+    kCavernPillarRadiusMinMm + kCavernPillarRadiusSpanMm;
+// A third of sites carry no pillars at all: the 10-bit site field below this
+// threshold means "none", the rest is remapped onto the radius range.
+inline constexpr uint64_t kCavernPillarNoneThreshold10 = 341;
+// Pillar-free radius around EVERY room axis. Load-bearing twice over: it keeps
+// the anchor point (which the tunnel network meets) open, and it covers the
+// worst-case room-to-room throat so a pillar can never sever the chain.
+inline constexpr int64_t kCavernPillarAxisClearMm = 4000;
+inline constexpr int64_t kCavernPillarAxisClearSqMm =
+    kCavernPillarAxisClearMm * kCavernPillarAxisClearMm;
+
+// --- W4 (v26): breakdown ----------------------------------------------------
+
+// Rubble on the floor: a per-column rise added to the room's flat-floor clamp.
+// Bounded strictly under kCavernFloorDropMinMm so it can never rise to the
+// room centre and pinch the chain's throat shut (asserted below).
+inline constexpr int64_t kCavernBreakdownLatticeMm = 3200; // 3.2 m
+inline constexpr int64_t kCavernBreakdownMaxMm = 1500;     // site amplitude in [0, 1.5) m
+
 // --- child-0 depth safety window (design doc §3.6) --------------------------
 // Only child 0 needs this: it is the only room tied to the shallow (9-34 m)
 // tunnel-node depth, so it is the only one that can threaten the roof.
@@ -254,12 +439,14 @@ inline constexpr int64_t kCavernNodeDepthSafeMaxMm =
 
 // --- candidate reach (design doc §3.4) --------------------------------------
 
-// Safe bound on the widest a roughened room radius can reach from the anchor
-// (there is no per-child xy offset any more -- every room shares the
-// anchor's xy, see "why coaxial" above -- so this is purely the widest
-// radius scaled by the roughness ceiling; linear, not the tighter
-// sqrt(roughness) the marginSq formula implies -- conservative on purpose).
-inline constexpr int64_t kCavernMaxReachMm = (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024;
+// Safe bound on how far a roughened room can reach from the ANCHOR: the
+// widest radius scaled by the roughness ceiling (linear, not the tighter
+// sqrt(roughness) the marginSq formula implies -- conservative on purpose),
+// plus, since v26, the furthest a room's own axis can have drifted from the
+// anchor down the leaning chain. Elongation contributes nothing because it
+// only ever narrows the short axis (see kCavernElongMinQ10).
+inline constexpr int64_t kCavernMaxReachMm =
+    kCavernMaxAxisDriftMm + (kCavernRxyMaxMm * kCavernRoughMaxQ10) / 1024;
 inline constexpr int64_t kCavernMaxReachSqMm = kCavernMaxReachMm * kCavernMaxReachMm;
 
 // --- flood level (design doc §5.1, approved as designed) --------------------
@@ -279,17 +466,78 @@ inline constexpr int32_t kMaxCavernSegs = 4; // tight == kCavernChildCount: the 
 
 // --- structural invariants, checked at compile time -------------------------
 
-// Chain overlap, step 0->1: child 1 must overlap child 0 for EVERY possible
-// hash draw. Coaxial (dxy=0), so overlap is the exact 1D test
-// stepDown < rz0 + rz1; checked against the worst case (both radii and the
-// step at their least/most overlap-hostile values).
-static_assert(kCavernStepDownMinMm + kCavernStepDownSpanMm < kCavernRz0MinMm + kCavernRzDeepMinMm,
-              "child 1 must overlap child 0 (coaxial 1D interval test) for every "
-              "possible hashed radius/step, or the chain is not guaranteed connected");
-// Chain overlap, steps 1->2 and 2->3: both ends use the "deep room" range.
-static_assert(kCavernStepDownMinMm + kCavernStepDownSpanMm < 2 * kCavernRzDeepMinMm,
-              "consecutive deep rooms must overlap for every possible hashed radius/"
-              "step, or the chain is not guaranteed connected");
+// --- v26 chain overlap: the witness-column proof --------------------------
+// The header's WHERE THE COAXIAL PROOF WENT block states the argument; these
+// are its two halves. Both are worst-case over every possible hash draw.
+//
+// (a) HORIZONTAL. Every child's axis must land strictly inside its parent's
+//     roughened plan footprint, or the parent has no vertical extent at all
+//     at the witness column and there is nothing to overlap. The step is
+//     taken along the parent's long axis, so the elongation ratio does not
+//     enter and the effective offset is just the step length (plus the Q12
+//     decode slack).
+static_assert(kCavernOffsetBoundMm * kCavernOffsetBoundMm < kCavernRxyRoughMinSqMm,
+              "a cavern room's axis must stay inside its parent room's narrowest possible "
+              "plan footprint, or the chain is not guaranteed connected");
+// (b) VERTICAL. At the witness column the child contributes its full rz and
+//     the parent contributes h > 0, so the overlap is at least
+//     rz_child - step. Pinned against a 2 m floor so the guarantee survives
+//     the 100 mm voxel grid rather than only the continuum.
+static_assert(kCavernRzDeepMinMm >=
+                  kCavernStepDownMinMm + kCavernStepDownSpanMm + kCavernMinChainOverlapMm,
+              "a deep room's vertical semi-axis must exceed the largest possible chain step "
+              "by the overlap floor, or consecutive rooms can meet in a hairline");
+// (b') And the same for the room the whole argument is weakest at: child 0 is
+//      the SHALLOW room, so it is child 1's rz that carries the pair -- which
+//      is what (b) states -- but child 0 must still contribute a real h, and
+//      h is bounded below by its own rz times the horizontal margin from (a).
+//      This is that bound, squared, against the 1 m half-overlap it has to
+//      beat. It is the assert that fails first if the offset range is widened.
+static_assert(kCavernRz0MinMm * kCavernRz0MinMm *
+                      (kCavernRxyRoughMinSqMm - kCavernOffsetBoundMm * kCavernOffsetBoundMm) /
+                      kCavernRxyRoughMinSqMm >=
+                  (kCavernMinChainOverlapMm / 2) * (kCavernMinChainOverlapMm / 2),
+              "the shallowest possible parent room must still have real vertical extent at "
+              "its child's axis, or the chain's throat is a point");
+
+// --- v26 pillars: two independent reasons they cannot seal a room ---------
+// (c) Pillar discs are pairwise disjoint, so the field can never tile the
+//     plane and the complement of the union is connected. Adjacent cell
+//     centres are one lattice apart and each disc reaches at most
+//     radius + jitter from its cell centre.
+static_assert(2 * (kCavernPillarRadiusMaxMm + kCavernPillarJitterMm) < kCavernPillarLatticeMm,
+              "cavern pillars must never touch, or a pillar field could wall a room off");
+// (d) A pillar never leaves its own lattice cell, which is what makes the
+//     single-cell lookup in cavernPillarAt exhaustive rather than a 3x3 scan.
+static_assert(kCavernPillarRadiusMaxMm + kCavernPillarJitterMm <= kCavernPillarLatticeMm / 2,
+              "a cavern pillar must stay inside its own lattice cell, or cavernPillarAt's "
+              "one-cell lookup can miss the pillar covering the column");
+// (e) The pillar-free clearance around every room axis covers the worst-case
+//     room-to-room throat, so no draw can put rock in the chain's neck -- and
+//     since child 0's axis IS the anchor, none can plug the point the tunnel
+//     network meets either.
+static_assert(kCavernPillarAxisClearMm >= kCavernThroatRadiusMm,
+              "the pillar-free radius around a room axis must cover the worst-case throat "
+              "between consecutive rooms, or a pillar can sever the chain");
+// (f) ...and it is still narrower than the narrowest room, or pillars would
+//     be structurally impossible in a small elongated room and the feature
+//     would be silently dead there. (Short semi-axis = long / elongation.)
+static_assert(kCavernPillarAxisClearMm * kCavernElongMaxQ10 / 1024 <
+                  cavernIsqrt(kCavernRxyRoughMinSqMm),
+              "the pillar-free radius must fit inside the narrowest possible room, or "
+              "pillars can never appear in one");
+// (g) A pillar can never bridge the clearance from one side to the other.
+static_assert(kCavernPillarAxisClearMm > 2 * kCavernPillarRadiusMaxMm,
+              "a pillar must be unable to span the axis clearance");
+
+// --- v26 breakdown --------------------------------------------------------
+// (h) Rubble can raise a floor but never to the room centre, so the witness
+//     column's overlap window -- which sits at the parent's centre height --
+//     is never buried. Also why the depth envelope in amplifier.cpp does not
+//     move: breakdown only ever REMOVES carve, never adds it.
+static_assert(kCavernBreakdownMaxMm < kCavernFloorDropMinMm,
+              "breakdown must never raise a room floor to its own centre, or it can pinch "
+              "the chain throat shut");
 
 // The depth safety window must be non-empty and must sit inside the range
 // caveNode() can actually produce (kCaveNodeDepthMinMm..+kCaveNodeDepthSpanMm)
@@ -315,9 +563,18 @@ static_assert(2 * kCavernMaxReachMm < kCavernCoarseMm - kCaveLatticeMm,
 // --- hash channels -----------------------------------------------------------
 // Extends caves.h's registry (20, 21, 24, 30, 31 — see the authoritative
 // table in hash.h). APPEND ONLY, never renumber.
-inline constexpr uint32_t CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step)
+inline constexpr uint32_t CH_CAVERN_SITE = 22;  // per-room geometry (radii/floor/step/shape)
 inline constexpr uint32_t CH_CAVERN_ROUGH = 23; // per-column wall roughness
 inline constexpr uint32_t CH_CAVERN_FLOOD = 25; // per-site flood level
+// v26 (W4). Three ids rather than one because the three fields are keyed on
+// DIFFERENT grids -- per site (fi, fj), per world pillar cell, per world
+// column -- and sharing a channel across key spaces is exactly the aliasing
+// the registry exists to make impossible. The per-ROOM shape fields (offset,
+// heading, elongation) needed no channel at all: they ride in the unused top
+// 24 bits of CH_CAVERN_SITE's existing per-room word.
+inline constexpr uint32_t CH_CAVERN_SHAPE = 53;     // per-site pillar radius + rubble amplitude
+inline constexpr uint32_t CH_CAVERN_PILLAR = 54;    // per-pillar-cell gate/jitter/radius
+inline constexpr uint32_t CH_CAVERN_BREAKDOWN = 55; // per-column rubble noise
 
 // --- small helpers -----------------------------------------------------------
 
@@ -326,6 +583,64 @@ inline constexpr uint32_t CH_CAVERN_FLOOD = 25; // per-site flood level
 // needs at most four independent fields out of one 64-bit hash.
 constexpr int64_t cavernHashField10(uint64_t h, int32_t shift, int64_t spanMm) {
     return static_cast<int64_t>((((h >> shift) & 0x3FFu) * static_cast<uint64_t>(spanMm)) >> 10);
+}
+
+// |v|, spelled out rather than pulled from <cstdlib>: this header is compiled
+// into the shader mirror by hand and `abs` there is a different function.
+constexpr int64_t cavernAbs(int64_t v) { return v < 0 ? -v : v; }
+
+// --- W4 (v26): pillars ------------------------------------------------------
+
+// This site's pillar radius, or 0 for a site with no pillars at all. Reads the
+// 10-bit field at bit 10 of the site's CH_CAVERN_SHAPE word: the bottom
+// kCavernPillarNoneThreshold10 of the range means "none", the rest is
+// remapped onto [min, min + span). One division, once per site.
+constexpr int64_t cavernPillarRadiusForSite(uint64_t shapeHash) {
+    const uint64_t f = (shapeHash >> 10) & 0x3FFu;
+    if (f < kCavernPillarNoneThreshold10) return 0;
+    return kCavernPillarRadiusMinMm +
+           static_cast<int64_t>(((f - kCavernPillarNoneThreshold10) *
+                                 static_cast<uint64_t>(kCavernPillarRadiusSpanMm)) /
+                                (1024 - kCavernPillarNoneThreshold10));
+}
+
+// True if this column stands inside a pillar of a site whose pillar radius is
+// `siteRadiusMm`. One hash, one lattice cell -- exhaustive because a pillar
+// provably never leaves its own cell (static_assert (d) above).
+//
+// The per-cell radius is a fraction in [0.5, 1.0) of the site's, so a room's
+// pillars vary in girth instead of being a set of identical posts. Bit
+// budget of the cell word: 0 gate, 1..10 x jitter, 11..20 y jitter,
+// 21..30 radius fraction.
+constexpr bool cavernPillarAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t siteRadiusMm) {
+    if (siteRadiusMm <= 0) return false;
+    const int64_t pi = floorDiv(xMm, kCavernPillarLatticeMm);
+    const int64_t pj = floorDiv(yMm, kCavernPillarLatticeMm);
+    const uint64_t h = hash2(seed, pi, pj, CH_CAVERN_PILLAR);
+    if ((h & kCavernPillarCellGateMask) != 0) return false;
+    const int64_t cx = pi * kCavernPillarLatticeMm + kCavernPillarLatticeMm / 2 -
+                       kCavernPillarJitterMm + cavernHashField10(h, 1, 2 * kCavernPillarJitterMm);
+    const int64_t cy = pj * kCavernPillarLatticeMm + kCavernPillarLatticeMm / 2 -
+                       kCavernPillarJitterMm + cavernHashField10(h, 11, 2 * kCavernPillarJitterMm);
+    const int64_t rMm = siteRadiusMm * (512 + cavernHashField10(h, 21, 512)) / 1024;
+    const int64_t dx = xMm - cx, dy = yMm - cy;
+    return dx * dx + dy * dy < rMm * rMm;
+}
+
+// --- W4 (v26): breakdown ----------------------------------------------------
+
+// Millimetres of rubble on this column, in [0, ampMm). The clamp is not
+// defensive noise: valueNoise2 is a convex combination of four 16-bit hashes
+// so it cannot leave [-32768, 32767], and the clamp is what states that as a
+// checked fact on both sides of the CPU/GPU mirror instead of as a comment.
+// The numerator is non-negative afterwards, so the truncating divide matches
+// the shader's without a floorDiv correction.
+constexpr int64_t cavernBreakdownAt(uint64_t seed, int64_t xMm, int64_t yMm, int64_t ampMm) {
+    if (ampMm <= 0) return 0;
+    const int64_t n = clampi64(
+        valueNoise2(seed, xMm, yMm, kCavernBreakdownLatticeMm, CH_CAVERN_BREAKDOWN) + 32768, 0,
+        65535);
+    return n * ampMm / 65536;
 }
 
 // --- site gate + candidacy ---------------------------------------------------
@@ -349,17 +664,29 @@ constexpr bool cavernDepthIsSafe(int64_t nodeDepthMm) {
 // --- per-site geometry (the rare "full reduction" tier) ---------------------
 
 struct CavernChild {
-    int64_t zMm = 0;     // absolute center (xy is always the site's anchor xy)
-    int64_t rxyMm = 0;   // horizontal semi-axis (rx == ry: oblate spheroid)
-    int64_t rzMm = 0;    // vertical semi-axis
-    int64_t zFloorMm = 0; // absolute flat-floor clamp, own-center-relative
+    // v26: xy is per-room. Child 0 still sits exactly on the anchor (that is
+    // what makes its containment of the anchor point, and hence connectivity
+    // to the tunnel network, structural); children 1-3 lean off down the
+    // chain. See the header's W4 block.
+    int64_t xMm = 0, yMm = 0; // absolute room axis
+    int64_t zMm = 0;          // absolute center
+    int64_t rxyMm = 0;        // LONG horizontal semi-axis
+    int64_t rzMm = 0;         // vertical semi-axis
+    int64_t zFloorMm = 0;     // absolute flat-floor clamp, own-center-relative
+    // v26 elongation. The short semi-axis is rxyMm * 1024 / elongQ10, oriented
+    // perpendicular to (dirCosQ12, dirSinQ12).
+    int32_t dirCosQ12 = static_cast<int32_t>(kCavernDirOne);
+    int32_t dirSinQ12 = 0;
+    int32_t elongQ10 = 1024;
 };
 
 struct CavernSite {
     bool valid = false;
     int64_t anchorXMm = 0, anchorYMm = 0, anchorZMm = 0;
     CavernChild children[kCavernChildCount] = {};
-    int32_t floodZMm = INT32_MIN; // INT32_MIN = dry (or invalid)
+    int32_t floodZMm = INT32_MIN;  // INT32_MIN = dry (or invalid)
+    int32_t pillarRadiusMm = 0;    // v26; 0 = this site has no pillars
+    int32_t breakdownAmpMm = 0;    // v26; 0 = this site has a clean floor
 };
 
 // Full geometry for the cavern site anchored at backbone-crossing node
@@ -389,8 +716,16 @@ constexpr CavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, const 
     site.anchorYMm = node.yMm;
     site.anchorZMm = static_cast<int64_t>(siteSurfaceMm) - node.depthMm;
 
+    // v26 per-room word bit budget (one hash, as before -- W4's shape fields
+    // ride in bits the v25 decode left on the floor):
+    //   0..9   long horizontal semi-axis      30..39  downward chain step
+    //   10..19 vertical semi-axis             40..49  sideways chain step
+    //   20..29 flat-floor drop                50..59  elongation ratio
+    //                                         60..62  long-axis heading
     int64_t maxFloorZMm = INT64_MIN;
     int64_t prevZMm = site.anchorZMm;
+    int64_t prevXMm = site.anchorXMm, prevYMm = site.anchorYMm;
+    int64_t prevDirCos = kCavernDirOne, prevDirSin = 0;
     for (int32_t c = 0; c < kCavernChildCount; ++c) {
         const uint64_t h = hash3(seed, fi, fj, c, CH_CAVERN_SITE);
         const bool isRoot = (c == 0);
@@ -402,17 +737,49 @@ constexpr CavernSite cavernSiteFor(uint64_t seed, int64_t fi, int64_t fj, const 
             kCavernFloorDropMinMm + cavernHashField10(h, 20, kCavernFloorDropSpanMm);
         const int64_t stepDownMm =
             isRoot ? 0 : kCavernStepDownMinMm + cavernHashField10(h, 30, kCavernStepDownSpanMm);
+        const int64_t offsetMm =
+            isRoot ? 0 : kCavernOffsetMinMm + cavernHashField10(h, 40, kCavernOffsetSpanMm);
+        const int64_t elongQ10 = kCavernElongMinQ10 + cavernHashField10(h, 50, kCavernElongSpanQ10);
+        const int32_t dirIdx = static_cast<int32_t>((h >> 60) & 7u);
 
+        // THE SIDEWAYS STEP IS TAKEN ALONG THE PARENT'S LONG AXIS, not along
+        // this room's own and not along a free direction. That is the whole
+        // reason the overlap proof survives an offset at all: measured in the
+        // parent's elongated frame the step has no across-axis component, so
+        // the elongation ratio never amplifies it and the horizontal bound is
+        // just the step length (static_assert (a)). floorDiv, not >>, so the
+        // truncation is the same one the shader's mirror performs.
         const int64_t zMm = isRoot ? site.anchorZMm : prevZMm - stepDownMm;
+        const int64_t xMm = isRoot ? site.anchorXMm
+                                   : prevXMm + floorDiv(offsetMm * prevDirCos, kCavernDirOne);
+        const int64_t yMm = isRoot ? site.anchorYMm
+                                   : prevYMm + floorDiv(offsetMm * prevDirSin, kCavernDirOne);
         prevZMm = zMm;
+        prevXMm = xMm;
+        prevYMm = yMm;
+        prevDirCos = kCavernDirCosQ12[dirIdx];
+        prevDirSin = kCavernDirSinQ12[dirIdx];
 
         CavernChild& ch = site.children[c];
+        ch.xMm = xMm;
+        ch.yMm = yMm;
         ch.zMm = zMm;
         ch.rxyMm = rxyMm;
         ch.rzMm = rzMm;
         ch.zFloorMm = zMm - floorDropMm;
+        ch.dirCosQ12 = kCavernDirCosQ12[dirIdx];
+        ch.dirSinQ12 = kCavernDirSinQ12[dirIdx];
+        ch.elongQ10 = static_cast<int32_t>(elongQ10);
         if (ch.zFloorMm > maxFloorZMm) maxFloorZMm = ch.zFloorMm;
     }
+
+    // v26 pillars and breakdown, both per SITE: how developed the pillar field
+    // is here and how much rubble is on the floors. Own channel rather than
+    // more bits of the flood word -- see the channel block above.
+    const uint64_t shapeHash = hash2(seed, fi, fj, CH_CAVERN_SHAPE);
+    site.pillarRadiusMm = static_cast<int32_t>(cavernPillarRadiusForSite(shapeHash));
+    site.breakdownAmpMm =
+        static_cast<int32_t>(cavernHashField10(shapeHash, 32, kCavernBreakdownMaxMm));
 
     // Flood level: 40% dry, else a level a bit above the highest room floor
     // (typically child 0's, the shallowest room -- so a wet site reads as a
@@ -531,8 +898,10 @@ constexpr CavernColumn cavernColumnFromSites(uint64_t seed, const CavernCandidat
             const int64_t fj = cand.fj;
             const CaveNode& node = cand.node;
 
-            // Every room in the chain shares this xy (see "why coaxial"), so
-            // this distance is computed ONCE per column, not once per room.
+            // Distance to the ANCHOR, for the reach reject only. Since v26 the
+            // rooms no longer share an xy, so this is a bound (the reach term
+            // includes the chain's worst-case axis drift) rather than the
+            // per-room distance it also used to be.
             const int64_t ex = xMm - node.xMm;
             const int64_t ey = yMm - node.yMm;
             const int64_t dxySq = ex * ex + ey * ey;
@@ -551,21 +920,66 @@ constexpr CavernColumn cavernColumnFromSites(uint64_t seed, const CavernCandidat
                            kCavernRoughAmpQ10 / 32768,
                 kCavernRoughMinQ10, kCavernRoughMaxQ10);
 
+            // v26 rubble: one noise sample for the column, shared by every
+            // room of this site exactly as the roughness sample is.
+            const int64_t breakdownMm =
+                cavernBreakdownAt(seed, xMm, yMm, site.breakdownAmpMm);
+
+            // The site's flood level is a property of the site, not of what
+            // this particular column turned out to contain -- set it before
+            // the pillar reject below, or a column standing in a pillar would
+            // report the site dry.
+            out.floodZMm = site.floodZMm;
+
+            // Per-room reduction. Two things are accumulated in one pass: the
+            // segments, and whether this column is close enough to ANY room's
+            // axis to be exempt from pillars (static_assert (e) -- that
+            // exemption is what keeps the chain's throat and the anchor point
+            // open whatever the pillar field does).
+            CavernSeg pending[kMaxCavernSegs] = {};
+            int32_t pendingCount = 0;
+            bool nearAnyAxis = false;
             for (int32_t c = 0; c < kCavernChildCount; ++c) {
                 const CavernChild& ch = site.children[c];
+                const int64_t rx = xMm - ch.xMm;
+                const int64_t ry = yMm - ch.yMm;
+                if (rx * rx + ry * ry < kCavernPillarAxisClearSqMm) nearAnyAxis = true;
+
+                // v26 elongation: rotate into the room's own frame and stretch
+                // the across-axis component. Magnitudes only (both are about
+                // to be squared), so every shift below has a non-negative
+                // operand and needs no floorDiv correction to match the
+                // shader.
+                const int64_t alongMm =
+                    cavernAbs(rx * ch.dirCosQ12 + ry * ch.dirSinQ12) >> kCavernDirShift;
+                const int64_t acrossMm =
+                    ((cavernAbs(ry * ch.dirCosQ12 - rx * ch.dirSinQ12) >> kCavernDirShift) *
+                     ch.elongQ10) /
+                    1024;
+                const int64_t dSqEff = alongMm * alongMm + acrossMm * acrossMm;
+
                 const int64_t rxySq = ch.rxyMm * ch.rxyMm;
                 const int64_t rxySqRough = rxySq * roughQ10 / 1024;
-                if (dxySq >= rxySqRough) continue; // this room doesn't reach here
-                const int64_t marginSq = ch.rzMm * ch.rzMm * (rxySqRough - dxySq) / rxySqRough;
+                if (dSqEff >= rxySqRough) continue; // this room doesn't reach here
+                const int64_t marginSq = ch.rzMm * ch.rzMm * (rxySqRough - dSqEff) / rxySqRough;
                 if (marginSq <= 0) continue;
-                if (out.count < kMaxCavernSegs) {
-                    out.segs[out.count].marginSq = static_cast<int32_t>(marginSq);
-                    out.segs[out.count].zCenterMm = static_cast<int32_t>(ch.zMm);
-                    out.segs[out.count].zFloorMm = static_cast<int32_t>(ch.zFloorMm);
-                    ++out.count;
+                if (pendingCount < kMaxCavernSegs) {
+                    pending[pendingCount].marginSq = static_cast<int32_t>(marginSq);
+                    pending[pendingCount].zCenterMm = static_cast<int32_t>(ch.zMm);
+                    pending[pendingCount].zFloorMm =
+                        static_cast<int32_t>(ch.zFloorMm + breakdownMm);
+                    ++pendingCount;
                 }
             }
-            out.floodZMm = site.floodZMm;
+
+            // v26 pillars: a column standing in one is solid rock top to
+            // bottom, which is what makes a pillar a pillar rather than a
+            // bump. Emitting nothing is exactly that, and it leaves
+            // cavernCarveAt byte-for-byte the v25 predicate.
+            if (!nearAnyAxis && cavernPillarAt(seed, xMm, yMm, site.pillarRadiusMm)) continue;
+            for (int32_t s = 0; s < pendingCount; ++s) {
+                if (out.count < kMaxCavernSegs) out.segs[out.count++] = pending[s];
+            }
         }
     }
     return out;

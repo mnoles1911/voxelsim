@@ -78,6 +78,16 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     {CH_CAVERN_SITE, 1, "CH_CAVERN_SITE"},
     {CH_CAVERN_ROUGH, 1, "CH_CAVERN_ROUGH"},
     {CH_CAVERN_FLOOD, 1, "CH_CAVERN_FLOOD"},
+    // v26 chamber shape (plan W4). Three ids for three DIFFERENT key spaces:
+    // CH_CAVERN_SHAPE is keyed on the site's lattice node (fi, fj),
+    // CH_CAVERN_PILLAR on a world 8 m pillar cell and CH_CAVERN_BREAKDOWN on
+    // a world 3.2 m noise lattice. Sharing one id across those would correlate
+    // a room's pillar field with the site draw at the cells where the grids
+    // happen to agree -- the same class of bug the CH_CAVE_ENTRANCE_RIM note
+    // above records.
+    {CH_CAVERN_SHAPE, 1, "CH_CAVERN_SHAPE"},
+    {CH_CAVERN_PILLAR, 1, "CH_CAVERN_PILLAR"},
+    {CH_CAVERN_BREAKDOWN, 1, "CH_CAVERN_BREAKDOWN"},
     // detail_rill.h
     {CH_RILL, 1, "CH_RILL"},
     // detail_bedding.h

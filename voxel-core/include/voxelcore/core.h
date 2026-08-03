@@ -270,7 +270,29 @@ namespace vxc {
 //
 // TILES DO NOT NEED REGENERATING: caves are runtime worldgen only and the bake
 // computes no underground data. Saved edit logs invalidate as usual.
-inline constexpr uint32_t kWorldGenVersion = 25;
+// v26 (plan W4) -- G2 CHAMBER SHAPE. The cavern chain leans (children step
+// sideways along their parent's long axis as well as down), every room is an
+// ellipse in plan with its own hashed heading and elongation ratio, a
+// world-space field of disjoint pillars is left standing inside the rooms, and
+// a per-column rubble rise turns the flat floor into a breakdown surface.
+// caverns.h's W4 block carries the geometry and the rebuilt connectivity
+// proof; `cavernCarveAt` is byte-for-byte the v25 per-voxel predicate, so the
+// whole change lives in the per-site and per-column tiers.
+//
+// Three new hash channels (CH_CAVERN_SHAPE/_PILLAR/_BREAKDOWN, ids 53-55);
+// the per-ROOM shape fields needed none, riding in the top 24 bits
+// CH_CAVERN_SITE's per-room word already left unused.
+//
+// kCavernRzDeepMinMm rose 12 m -> 16 m as a load-bearing part of the offset
+// chain's overlap proof, NOT as a size preference. The chain's DEPTH envelope
+// (amplifier.cpp's kMaxCavernCarveBelowSiteSurfaceMm = 91000) does not move:
+// the flat-floor clamp bounds the bottom, not rz, and breakdown only ever
+// raises floors.
+//
+// TILES DO NOT NEED REGENERATING, same as v24/v25: caves are runtime worldgen
+// only and the bake computes no underground data. Saved edit logs invalidate
+// as usual.
+inline constexpr uint32_t kWorldGenVersion = 26;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
 

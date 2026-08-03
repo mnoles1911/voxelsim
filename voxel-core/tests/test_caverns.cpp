@@ -9,11 +9,13 @@
 // decimated-sample-grid flood-fill technique (every 4th voxel) for the
 // connectivity tests.
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <vector>
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/cave_families.h"
 #include "voxelcore/caverns.h"
 #include "voxelcore/connectivity.h"
 #include "vxctest.h"
@@ -146,7 +148,14 @@ VXC_TEST(cavern_golden_digest) {
         }
     }
     // GOLDEN(cavern_layer) â€” new for the M4 cave pass v2 cavern system.
-    CHECK_EQ(d.h, 0xFB45CBD3F95E65C4ull);
+    // kWorldGenVersion 26 (plan W4) is the first version to move it: the
+    // chamber shape changed (offsets, elongation, pillars, breakdown), so
+    // every field this digest walks -- marginSq, zCenterMm, zFloorMm and the
+    // segment count -- moves with it. Pinned against a CONSTANT surface, so
+    // this number is a statement about the cavern construct alone; nothing
+    // about terrain can drag it.
+    // (was 0xFB45CBD3F95E65C4 at v1..v25)
+    CHECK_EQ(d.h, 0xB87B2128B39244CDull);
 }
 
 // --- chain geometry: consecutive rooms overlap for real hashed sites --------
@@ -159,6 +168,7 @@ VXC_TEST(cavern_chain_rooms_overlap_pairwise_for_real_sites) {
     // argument, same spirit as caves.h's own connectivity tests).
     int64_t sitesChecked = 0;
     int64_t maxSpanMm = 0;
+    int64_t minChainOverlapMm = 1ll << 40;
     for (int64_t fj = 0; fj <= 800 && sitesChecked < 60; fj += kCavernCoarseLatticeRatio) {
         for (int64_t fi = 0; fi <= 800 && sitesChecked < 60; fi += kCavernCoarseLatticeRatio) {
             if (!cavernSiteGateOpen(kSeed, fi, fj)) continue;
@@ -176,11 +186,52 @@ VXC_TEST(cavern_chain_rooms_overlap_pairwise_for_real_sites) {
                 CHECK(ch.rzMm > 0);
                 if (c > 0) {
                     const CavernChild& prev = site.children[c - 1];
-                    // Coaxial 1D interval overlap, exact (see caverns.h "why
-                    // coaxial"): |dz| < rz[c-1] + rz[c].
                     const int64_t dz = prev.zMm - ch.zMm;
                     CHECK(dz > 0); // strictly descending
-                    CHECK(dz < prev.rzMm + ch.rzMm);
+
+                    // v26 WITNESS-COLUMN OVERLAP, measured -- the direct
+                    // counterpart of caverns.h's static_asserts (a), (b) and
+                    // (b'), evaluated at real hashed sites instead of at
+                    // worst-case constants.
+                    //
+                    // The v25 form of this check was the coaxial 1D test
+                    // `dz < prev.rz + ch.rz`. That is no longer the right
+                    // question -- the rooms are not coaxial -- and, worse, it
+                    // still PASSES on v26 geometry, because a small offset
+                    // barely moves the projected intervals. A check that
+                    // survives the change it is supposed to police is a check
+                    // that has stopped testing anything, so it is replaced
+                    // rather than kept alongside.
+                    //
+                    // At the child's own axis: the child contributes its full
+                    // rz; the parent contributes h, its vertical half-extent
+                    // at that xy, taken at the WORST possible roughness draw.
+                    const int64_t rx = ch.xMm - prev.xMm;
+                    const int64_t ry = ch.yMm - prev.yMm;
+                    const int64_t alongMm =
+                        cavernAbs(rx * prev.dirCosQ12 + ry * prev.dirSinQ12) >> kCavernDirShift;
+                    const int64_t acrossMm =
+                        ((cavernAbs(ry * prev.dirCosQ12 - rx * prev.dirSinQ12) >>
+                          kCavernDirShift) *
+                         prev.elongQ10) /
+                        1024;
+                    const int64_t dEffSq = alongMm * alongMm + acrossMm * acrossMm;
+                    const int64_t rSqRough =
+                        prev.rxyMm * prev.rxyMm * kCavernRoughMinQ10 / 1024;
+                    CHECK(dEffSq < rSqRough); // (a): the child's axis is inside the parent
+                    const int64_t hMm =
+                        cavernIsqrt(prev.rzMm * prev.rzMm * (rSqRough - dEffSq) / rSqRough);
+                    // The overlap interval at that column is
+                    // [max(ch.z - ch.rz, prev.z - h), min(ch.z + ch.rz, prev.z + h)].
+                    const int64_t lo = std::max(ch.zMm - ch.rzMm, prev.zMm - hMm);
+                    const int64_t hi = std::min(ch.zMm + ch.rzMm, prev.zMm + hMm);
+                    CHECK(hi - lo >= kCavernMinChainOverlapMm);
+                    // ...and it has to survive the rubble, which raises both
+                    // rooms' floors under that same column.
+                    const int64_t floorCap = std::max(ch.zFloorMm, prev.zFloorMm) +
+                                             kCavernBreakdownMaxMm;
+                    CHECK(hi > floorCap);
+                    if (hi - lo < minChainOverlapMm) minChainOverlapMm = hi - lo;
                 }
                 const int64_t bottom = ch.zMm - ch.rzMm;
                 if (bottom < lowestMm) lowestMm = bottom;
@@ -192,8 +243,11 @@ VXC_TEST(cavern_chain_rooms_overlap_pairwise_for_real_sites) {
     }
     CHECK(sitesChecked > 0);
     std::printf("    [caverns] chain geometry: %lld real sites checked, all pairwise "
-                "overlaps hold; widest observed vertical span %.1f m\n",
-                static_cast<long long>(sitesChecked), static_cast<double>(maxSpanMm) / 1000.0);
+                "overlaps hold; widest observed vertical span %.1f m; tightest measured "
+                "room-to-room overlap at the child axis %.2f m (floor %.2f m)\n",
+                static_cast<long long>(sitesChecked), static_cast<double>(maxSpanMm) / 1000.0,
+                static_cast<double>(minChainOverlapMm) / 1000.0,
+                static_cast<double>(kCavernMinChainOverlapMm) / 1000.0);
     // The whole point of the chain is genuine multi-storey depth: this
     // should be well beyond a single 12 m-tall room.
     CHECK(maxSpanMm > 30000);
@@ -278,24 +332,45 @@ VXC_TEST(cavern_flood_fill_shares_a_component_with_the_wider_tunnel_network) {
     }
     CHECK(anchorComp >= 0);
 
-    bool reachesBeyondCavern = false;
+    // THE CRITERION IS "REACHES REAL TUNNEL", NOT "REACHES A DISTANCE.
+    //
+    // It used to be the latter: a sample further from the anchor than
+    // kCavernMaxReachMm. That is a WORST-CASE constant over every possible
+    // hash draw, not this site's actual size, and it silently became
+    // impossible to satisfy at worldgen v26 -- the leaning chain raised the
+    // worst-case reach to 57 m while this box is only 80 m across, so no
+    // sample inside it can be further from the anchor than the bound. The
+    // test failed while the flood fill was reporting 729,037 of 735,258
+    // samples in the anchor's single component, i.e. it failed on its own
+    // yardstick rather than on connectivity.
+    //
+    // What the test is actually for is "the cavern is not a self-contained
+    // bubble", so ask that directly: some sample in the anchor's component
+    // must be carved by the TUNNEL system and by no cavern room at all. That
+    // is a statement about the geometry under test rather than about a
+    // constant, and it cannot be satisfied by making the rooms bigger.
+    bool reachesTunnel = false;
+    int64_t furthestMm = 0;
     if (anchorComp >= 0) {
         for (const VoxelCoord& v : r.components[size_t(anchorComp)].voxels) {
+            const int64_t wx = x0 + v.x * kStep, wy = y0 + v.y * kStep, wz = z0 + v.z * kStep;
             const int64_t dvx = (v.x - sa) * kStep * kVoxelSizeMm;
             const int64_t dvy = (v.y - sb) * kStep * kVoxelSizeMm;
-            if (dvx * dvx + dvy * dvy > kCavernMaxReachSqMm) {
-                reachesBeyondCavern = true;
-                break;
-            }
+            const int64_t dSq = dvx * dvx + dvy * dvy;
+            if (dSq > furthestMm * furthestMm) furthestMm = cavernIsqrt(dSq);
+            if (reachesTunnel) continue;
+            if (flatCavernCarve(wx, wy, wz)) continue; // inside a room: not the proof
+            const CaveColumn tc = caveColumnFor(kSeed, wx, wy, kFlatSurfaceMm, flatSurfaceAt);
+            if (caveCarveAt(tc, kFlatSurfaceMm, kFlatBedrockMm, wz)) reachesTunnel = true;
         }
     }
     std::printf("    [caverns] flood fill at site (%lld,%lld): %d component(s), %zu "
-                "samples total, anchor's component has %zu samples and %s beyond the "
-                "cavern's own max reach\n",
+                "samples total, anchor's component has %zu samples reaching %.1f m from the "
+                "anchor and %s pure-tunnel voxels outside every cavern room\n",
                 static_cast<long long>(fs.fi), static_cast<long long>(fs.fj), s.count,
                 s.total, anchorComp >= 0 ? r.components[size_t(anchorComp)].size() : size_t(0),
-                reachesBeyondCavern ? "DOES extend" : "does NOT extend");
-    CHECK(reachesBeyondCavern);
+                furthestMm / 1000.0, reachesTunnel ? "DOES include" : "does NOT include");
+    CHECK(reachesTunnel);
 }
 
 // --- safety rule 1: bedrock is never breached, whatever depth it is at -----
@@ -498,6 +573,310 @@ VXC_TEST(cavern_roof_clamp_is_load_bearing_on_sloped_real_terrain) {
     CHECK_EQ(columnsFullyRefused, 0); // pinned: no clamp erases a whole column any more
     CHECK(clampedVoxels > 0);         // but the roof clamp does still truncate real rooms
     CHECK(columnsPartlyClamped > 0);
+}
+
+// --- W4 (v26): plan-view symmetry, against a control ------------------------
+//
+// THE ACCEPTANCE GATE FOR W4, AND WHY IT IS A DIFFERENCE AND NOT A NUMBER.
+//
+// The plan's Verify line for this wave is "plan-view symmetry visibly broken."
+// A statistic that only says "the footprint is asymmetric" cannot carry that,
+// because a v25 cavern footprint ALREADY reads asymmetric whenever the roof
+// clamp truncates it against a slope, the bedrock clamp cuts its bottom off,
+// or the sampled window clips it. Reporting one arm would repeat exactly the
+// error W3 made with its "thin roof means horizontal mouth" figure: a number
+// satisfied by geometry other than the one under test.
+//
+// So every statistic below is measured TWICE on the same sites, the same
+// seed, the same terrain and the same shipping predicate, with the only
+// difference being cave_families.h's `cavernSiteWithoutChamberShape` — v25's
+// coaxial, round, pillar-free, flat-floored chamber out of the v26 world.
+// The control arm is what proves each statistic can report "symmetric" at
+// all; the real arm is what shows it does not. If W4's terms were ever
+// deleted the two arms would coincide and this test fails, which is the
+// property a gate has to have.
+//
+// Flat terrain deliberately: it removes the three contaminating clips
+// outright, so what is left is the chamber and nothing else.
+namespace {
+
+struct PlanStats {
+    int64_t areaCols = 0;
+    int64_t anisoQ10 = 1024;   // lambda_max / lambda_min of the plan mask, Q10
+    int64_t driftMm = 0;       // furthest apart two room-centre slice centroids sit
+    int64_t holes = 0;         // enclosed rock islands in plan == pillars
+    int64_t d180PerMille = 0;  // cells with no partner under a half turn about the centroid
+    int64_t floorStepMm = 0;   // mean |floor difference| between 4-adjacent mask columns
+};
+
+// Plan-view statistics for one site, from the SHIPPING predicate.
+//
+// A column is "in the mask" if any room's own centre voxel carves there --
+// exact, because marginSq > 0 already means dz == 0 satisfies the ellipsoid
+// test and a room centre is always above its own floor, so this asks
+// cavernCarveAt rather than re-deriving anything. It is also what makes
+// pillars visible here: a pillar column emits no segments at all.
+template <typename ColFn>
+PlanStats planStatsFor(const CavernSite& site, const ColFn& colAt, int64_t stepMm) {
+    const int32_t kN = 121; // 121 x 1 m = 121 m, wider than 2x the max reach
+    const int64_t half = kN / 2;
+    std::vector<uint8_t> mask(size_t(kN) * kN, 0);
+    // Floor height PER ROOM, not the column's lowest floor. The first version
+    // of this took the minimum over the column's segments, and the control arm
+    // then read HIGHER than the real one (1200 mm vs 534 mm) -- because that
+    // number is dominated by the step where one room's footprint ends and the
+    // next room's deeper floor takes over, which is chain geometry and not
+    // rubble at all. Asked per room the v25 floor is a plane and the statistic
+    // is exactly 0, which is what makes the real arm's value mean "breakdown".
+    std::vector<int64_t> floorZ(size_t(kN) * kN * kCavernChildCount, 0);
+    std::vector<uint8_t> hasRoom(size_t(kN) * kN * kCavernChildCount, 0);
+    // One plan slice per room centre. Two rooms whose slices have the same
+    // centroid are stacked on one axis; that is the v25 chamber, and the
+    // spread of these centroids is the statistic that says so.
+    int64_t sliceSumX[kCavernChildCount] = {}, sliceSumY[kCavernChildCount] = {},
+            sliceN[kCavernChildCount] = {};
+
+    PlanStats st;
+    int64_t sumX = 0, sumY = 0;
+    for (int32_t iy = 0; iy < kN; ++iy)
+        for (int32_t ix = 0; ix < kN; ++ix) {
+            const int64_t xMm = site.anchorXMm + (ix - half) * stepMm;
+            const int64_t yMm = site.anchorYMm + (iy - half) * stepMm;
+            const int64_t vx = floorDiv(xMm, int64_t(kVoxelSizeMm));
+            const int64_t vy = floorDiv(yMm, int64_t(kVoxelSizeMm));
+            const CavernColumn c = colAt(vx, vy);
+            if (c.count == 0) continue;
+            bool any = false;
+            for (int32_t s = 0; s < c.count; ++s) {
+                const int64_t vz = floorDiv(int64_t(c.segs[s].zCenterMm) - kVoxelSizeMm / 2,
+                                            int64_t(kVoxelSizeMm));
+                if (!cavernCarveAt(c, kFlatSurfaceMm, kFlatBedrockMm, vz)) continue;
+                any = true;
+                for (int32_t k = 0; k < kCavernChildCount; ++k)
+                    if (c.segs[s].zCenterMm == int32_t(site.children[k].zMm)) {
+                        sliceSumX[k] += xMm;
+                        sliceSumY[k] += yMm;
+                        ++sliceN[k];
+                        const size_t fi2 = (size_t(iy) * kN + ix) * kCavernChildCount + k;
+                        floorZ[fi2] = c.segs[s].zFloorMm;
+                        hasRoom[fi2] = 1;
+                    }
+            }
+            if (!any) continue;
+            mask[size_t(iy) * kN + ix] = 1;
+            sumX += ix;
+            sumY += iy;
+            ++st.areaCols;
+        }
+    if (st.areaCols == 0) return st;
+
+    // (1) ANISOTROPY -- "round in plan", the first tell. Second moments of the
+    // mask; the eigenvalue ratio of a 2x2 symmetric matrix in closed form.
+    const int64_t cx2 = 2 * sumX / st.areaCols, cy2 = 2 * sumY / st.areaCols; // doubled centroid
+    int64_t mxx = 0, myy = 0, mxy = 0;
+    for (int32_t iy = 0; iy < kN; ++iy)
+        for (int32_t ix = 0; ix < kN; ++ix) {
+            if (!mask[size_t(iy) * kN + ix]) continue;
+            const int64_t dx = 2 * ix - cx2, dy = 2 * iy - cy2; // doubled, so integer
+            mxx += dx * dx;
+            myy += dy * dy;
+            mxy += dx * dy;
+        }
+    mxx /= st.areaCols;
+    myy /= st.areaCols;
+    mxy /= st.areaCols;
+    {
+        const int64_t tr = mxx + myy;
+        const int64_t disc = cavernIsqrt((mxx - myy) * (mxx - myy) + 4 * mxy * mxy);
+        const int64_t lo = tr - disc;
+        st.anisoQ10 = lo > 0 ? (tr + disc) * 1024 / lo : (1024 * 64);
+    }
+
+    // (2) STACK DRIFT -- "the rooms share one axis", the second tell. Largest
+    // plan distance between any two room-centre slice centroids. Exactly zero
+    // for a coaxial chain, by construction and not by luck.
+    for (int32_t a = 0; a < kCavernChildCount; ++a)
+        for (int32_t b = a + 1; b < kCavernChildCount; ++b) {
+            if (sliceN[a] == 0 || sliceN[b] == 0) continue;
+            const int64_t dx = sliceSumX[a] / sliceN[a] - sliceSumX[b] / sliceN[b];
+            const int64_t dy = sliceSumY[a] / sliceN[a] - sliceSumY[b] / sliceN[b];
+            const int64_t d = cavernIsqrt(dx * dx + dy * dy);
+            if (d > st.driftMm) st.driftMm = d;
+        }
+
+    // (3) HOLES -- pillars, counted topologically rather than by asking the
+    // pillar field whether it fired. A hole is a 4-connected run of non-mask
+    // cells that never reaches the grid border, i.e. rock completely enclosed
+    // by chamber in plan. Nothing in a union of ellipses can produce one.
+    {
+        std::vector<uint8_t> seen(size_t(kN) * kN, 0);
+        std::vector<int32_t> stack;
+        for (int32_t iy = 0; iy < kN; ++iy)
+            for (int32_t ix = 0; ix < kN; ++ix) {
+                const int32_t s0 = iy * kN + ix;
+                if (mask[size_t(s0)] || seen[size_t(s0)]) continue;
+                bool touchesBorder = false;
+                stack.clear();
+                stack.push_back(s0);
+                seen[size_t(s0)] = 1;
+                while (!stack.empty()) {
+                    const int32_t s = stack.back();
+                    stack.pop_back();
+                    const int32_t sx = s % kN, sy = s / kN;
+                    if (sx == 0 || sy == 0 || sx == kN - 1 || sy == kN - 1) touchesBorder = true;
+                    const int32_t nb[4] = {sx > 0 ? s - 1 : -1, sx < kN - 1 ? s + 1 : -1,
+                                           sy > 0 ? s - kN : -1, sy < kN - 1 ? s + kN : -1};
+                    for (int32_t k = 0; k < 4; ++k) {
+                        if (nb[k] < 0 || mask[size_t(nb[k])] || seen[size_t(nb[k])]) continue;
+                        seen[size_t(nb[k])] = 1;
+                        stack.push_back(nb[k]);
+                    }
+                }
+                if (!touchesBorder) ++st.holes;
+            }
+    }
+
+    // (4) HALF-TURN DEFECT -- general plan point symmetry. The doubled
+    // centroid keeps the reflection an exact grid map, so no interpolation
+    // enters and the number is not an artefact of resampling.
+    {
+        int64_t unmatched = 0;
+        for (int32_t iy = 0; iy < kN; ++iy)
+            for (int32_t ix = 0; ix < kN; ++ix) {
+                if (!mask[size_t(iy) * kN + ix]) continue;
+                // Point reflection through the centroid c is p = 2c - i. The
+                // centroid is carried DOUBLED (cx2 == 2c) for exactly this
+                // reason: 2c - i is then an integer grid cell, so the map is
+                // exact and no resampling can manufacture a defect.
+                const int64_t px = cx2 - ix, py = cy2 - iy;
+                if (px < 0 || py < 0 || px >= kN || py >= kN) {
+                    ++unmatched;
+                    continue;
+                }
+                if (!mask[size_t(py) * kN + size_t(px)]) ++unmatched;
+            }
+        st.d180PerMille = unmatched * 1000 / st.areaCols;
+    }
+
+    // (5) FLOOR STEP -- breakdown. Mean absolute floor difference between
+    // 4-adjacent columns THAT CONTAIN THE SAME ROOM. A machined flat floor
+    // gives exactly 0; rubble gives a value everywhere. See the floorZ
+    // declaration for why "the same room" is the load-bearing part.
+    {
+        int64_t sum = 0, pairs = 0;
+        for (int32_t k = 0; k < kCavernChildCount; ++k)
+            for (int32_t iy = 0; iy < kN; ++iy)
+                for (int32_t ix = 0; ix + 1 < kN; ++ix) {
+                    const size_t a = (size_t(iy) * kN + ix) * kCavernChildCount + k;
+                    const size_t b = a + kCavernChildCount;
+                    if (!hasRoom[a] || !hasRoom[b]) continue;
+                    sum += floorZ[a] > floorZ[b] ? floorZ[a] - floorZ[b] : floorZ[b] - floorZ[a];
+                    ++pairs;
+                }
+        st.floorStepMm = pairs ? sum / pairs : 0;
+    }
+    return st;
+}
+
+} // namespace
+
+VXC_TEST(cavern_plan_symmetry_is_broken_and_the_control_proves_the_statistic_can_see_symmetry) {
+    int64_t sites = 0;
+    int64_t realAnisoSum = 0, plainAnisoSum = 0;
+    int64_t realDriftSum = 0, plainDriftMax = 0;
+    int64_t realHolesTotal = 0, plainHolesTotal = 0, sitesWithPillars = 0;
+    int64_t realD180Sum = 0, plainD180Sum = 0;
+    int64_t realFloorSum = 0, plainFloorMax = 0;
+    int64_t anisoBothWays = 0;
+
+    for (int64_t fj = 0; fj <= 800 && sites < 12; fj += kCavernCoarseLatticeRatio) {
+        for (int64_t fi = 0; fi <= 800 && sites < 12; fi += kCavernCoarseLatticeRatio) {
+            if (!cavernSiteGateOpen(kSeed, fi, fj)) continue;
+            const CaveNode node = caveNode(kSeed, fi, fj);
+            if (!cavernDepthIsSafe(node.depthMm)) continue;
+            const CavernSite site = cavernSiteFor(kSeed, fi, fj, node, flatSurfaceAt);
+            if (!site.valid) continue;
+            ++sites;
+
+            const int64_t si = floorDiv(site.anchorXMm, kCavernCoarseMm);
+            const int64_t sj = floorDiv(site.anchorYMm, kCavernCoarseMm);
+            // The candidate block the anchor's own cell sees. Both arms go
+            // through the SAME shipping reduction with the SAME candidates;
+            // only the site's shape fields differ.
+            const CavernCandidates cands = cavernCandidatesFor(kSeed, si, sj);
+            const PlanStats real = planStatsFor(site, [&](int64_t vx, int64_t vy) {
+                return cavernColumnFromCandidates(kSeed, cands, vx, vy, flatSurfaceAt);
+            }, 1000);
+            const PlanStats plain = planStatsFor(site, [&](int64_t vx, int64_t vy) {
+                return cavernColumnWithoutChamberShape(kSeed, cands, vx, vy, flatSurfaceAt);
+            }, 1000);
+            if (real.areaCols == 0 || plain.areaCols == 0) continue;
+
+            realAnisoSum += real.anisoQ10;
+            plainAnisoSum += plain.anisoQ10;
+            realDriftSum += real.driftMm;
+            if (plain.driftMm > plainDriftMax) plainDriftMax = plain.driftMm;
+            realHolesTotal += real.holes;
+            plainHolesTotal += plain.holes;
+            if (real.holes > 0) ++sitesWithPillars;
+            realD180Sum += real.d180PerMille;
+            plainD180Sum += plain.d180PerMille;
+            realFloorSum += real.floorStepMm;
+            if (plain.floorStepMm > plainFloorMax) plainFloorMax = plain.floorStepMm;
+            if (real.anisoQ10 > plain.anisoQ10) ++anisoBothWays;
+        }
+    }
+    CHECK(sites >= 8);
+    if (sites == 0) return;
+
+    const double aReal = double(realAnisoSum) / double(sites) / 1024.0;
+    const double aPlain = double(plainAnisoSum) / double(sites) / 1024.0;
+    std::printf("    [caverns] W4 plan symmetry over %lld flat sites, v26 vs the v25-shape "
+                "control:\n"
+                "               anisotropy   %.2f : 1   vs   %.2f : 1   (control ~1 = round)\n"
+                "               stack drift  %.1f m      vs   %.1f m     (control 0 = coaxial)\n"
+                "               plan holes   %lld total  vs   %lld       (holes ARE pillars)\n"
+                "               half-turn defect %lld/1000 vs %lld/1000\n"
+                "               floor step   %lld mm     vs   %lld mm    (control 0 = machined)\n",
+                static_cast<long long>(sites), aReal, aPlain,
+                double(realDriftSum) / double(sites) / 1000.0, double(plainDriftMax) / 1000.0,
+                static_cast<long long>(realHolesTotal), static_cast<long long>(plainHolesTotal),
+                static_cast<long long>(realD180Sum / sites),
+                static_cast<long long>(plainD180Sum / sites),
+                static_cast<long long>(realFloorSum / sites),
+                static_cast<long long>(plainFloorMax));
+
+    // THE CONTROL SIDE FIRST. These are the assertions that make the real
+    // side mean something; if any of them fails, the statistic is reading
+    // something other than the chamber and the real side's numbers are not
+    // evidence of anything.
+    //
+    // Two of the four control bounds are NOT zero, and the difference between
+    // them is the honest part of this gate. The floor step is exactly zero
+    // because a v25 floor really is a plane. The others are not, because the
+    // wall-roughness noise -- which v25 already had -- wobbles a disc's
+    // boundary by up to 15% of its radius: that moves a slice centroid by
+    // over a metre and can occasionally pinch off a one-cell rock island. So
+    // those two bounds are stated as the statistic's measured NOISE FLOOR,
+    // and the real arm has to beat the floor by a wide margin rather than
+    // merely be above zero. Pretending the floor was zero would have made
+    // this gate assert something false about the control and then read the
+    // real arm's margin as larger than it is.
+    CHECK(plainAnisoSum / sites < 1024 * 115 / 100); // a concentric disc is round in plan
+    CHECK(plainDriftMax < 2500);                     // roughness wobble only; no real axis drift
+    CHECK(plainHolesTotal * 4 < 12);                 // ellipsoids enclose essentially no rock
+    CHECK_EQ(plainFloorMax, 0);                      // the v25 floor is a machined plane, exactly
+
+    // ...and the real side, each beating the control by a margin rather than
+    // beating zero.
+    CHECK(realAnisoSum / sites >= 1024 * 135 / 100); // rooms are ellipses, not circles
+    CHECK(realAnisoSum >= plainAnisoSum * 3 / 2);
+    CHECK(realDriftSum / sites >= 4000);             // the chain leans, metres not millimetres
+    CHECK(realDriftSum / sites >= plainDriftMax * 3);
+    CHECK(realHolesTotal >= plainHolesTotal * 8 + 8); // pillars, not pinched-off noise
+    CHECK(sitesWithPillars * 2 >= sites);             // and most sites have them
+    CHECK(realFloorSum / sites > 30);                 // floors are rubble, not planes
+    CHECK(anisoBothWays * 2 >= sites);                // per site, not just on average
 }
 
 // --- storage bound ------------------------------------------------------------
