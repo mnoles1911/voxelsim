@@ -72,6 +72,12 @@ param(
     # reproduces every pre-existing capture exactly: ground spawn, level camera.
     [double]$SpawnAltM = 0,
     [double]$SpawnPitch = 0,
+    # Yaw in degrees. The capture path's historical framing yaw is 45 and that
+    # is what an unpassed -SpawnYaw still produces, so leaving this alone keeps
+    # a run byte-identical to the archive. Passed, it is the only way to swing
+    # the camera around a fixed column; see the pitch note below for why the
+    # engine treats this switch and -SpawnPitch as a pair.
+    [double]$SpawnYaw = 45,
     [int]$Width = 2560,
     [int]$Height = 1440,
     [int]$TimeoutSec = 420,
@@ -160,6 +166,12 @@ if ($SpawnAltM -ne 0) {
 }
 if ($SpawnPitch -ne 0) {
     $argList += "-VoxelSpawnPitch=$($SpawnPitch.ToString([cultureinfo]::InvariantCulture))"
+}
+# 45 is the engine-side default for the capture framing, so passing it would be
+# a no-op that changes the command line for nothing -- same "an unchanged
+# command line is what makes it checkable" argument as the block above.
+if ($SpawnYaw -ne 45) {
+    $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
 }
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
 $argList += $ExtraArgs
@@ -286,6 +298,45 @@ if (Test-Path $LogPath) {
                        "the switches did NOT reach the ordinary spawn path (an editor built before they existed, " +
                        "or a fixture switch that poses its own camera took the spawn). This image is a GROUND " +
                        "shot; do not read landform from it.")
+    }
+
+    # THE POSE AT THE SHUTTER, WHICH IS THE ONLY POSE THAT FRAMED ANYTHING, AND
+    # WHICH DISAGREED WITH THE LINE ABOVE FOR THE WHOLE LIFE OF -SpawnPitch.
+    #
+    # "Spawn pose APPLIED" is written at spawn and reads the control rotation
+    # back off the controller, so it is honest about that instant -- and that
+    # instant is ~150 s before the frame. The game mode's screenshot timer then
+    # re-posed the camera to a hard-coded pitch -40 yaw 45 immediately before
+    # requesting the shot, discarding -VoxelSpawnPitch entirely. Every capture
+    # taken through this script without a fixture switch was framed at -40/45
+    # while its log stated the requested pitch, and a -89 request and a -42
+    # request produced the same picture. Three settled cave frames were binned
+    # over it before anyone read the second line.
+    #
+    # The engine now honours the switch, but the lesson generalises past the one
+    # bug: a pose that is accepted at spawn is not a pose that survives to the
+    # shutter, and only the engine can say which one framed the image. So print
+    # what the CAMERA MANAGER reported at the moment of the screenshot request,
+    # and compare it against what was asked for rather than leaving that to
+    # whoever opens the log.
+    $shot1 = @(Select-String -Path $LogPath -Pattern 'Capture: cam loc=.*rot=\(pitch (-?[\d.]+) yaw (-?[\d.]+)\)') |
+             Select-Object -First 1
+    if ($shot1) {
+        $gotPitch = [double]$shot1.Matches[0].Groups[1].Value
+        $gotYaw   = [double]$shot1.Matches[0].Groups[2].Value
+        Write-Host ("  SHUTTER pose: " + ($shot1.Line -replace '^.*Capture: ', ''))
+        $wantPitch = if ($SpawnPitch -ne 0) { $SpawnPitch } else { -40 }
+        if ([Math]::Abs($gotPitch - $wantPitch) -gt 0.5 -or [Math]::Abs($gotYaw - $SpawnYaw) -gt 0.5) {
+            Write-Warning ("FRAMING NOT AS REQUESTED: asked for pitch $wantPitch yaw $SpawnYaw, the shutter " +
+                           "fired at pitch $gotPitch yaw $gotYaw. This image is NOT the framing you asked for -- " +
+                           "report it as unusable rather than as the requested pose. (pitch -40 yaw 45 exactly " +
+                           "means the game mode's fallback framing overrode the switches; an editor built before " +
+                           "2026-08-03 always does this.)")
+        }
+    } else {
+        Write-Warning ("no 'Capture: cam loc=' line in the log -- the pose that actually framed this image " +
+                       "could not be read. 'Spawn pose APPLIED' is NOT a substitute: it is written ~150 s " +
+                       "earlier and has already been observed to disagree with the shutter.")
     }
 
     $errs = Select-String -Path $LogPath -Pattern 'Fatal|Assertion failed' | Select-Object -First 3

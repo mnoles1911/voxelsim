@@ -1574,10 +1574,66 @@ void AVoxelEarthGameMode::BeginPlay()
 						// both the controller AND the pawn (belt and braces -
 						// the first capture attempt showed control rotation
 						// alone not reflected in the captured view).
-						PC->SetControlRotation(FRotator(-40.f, 45.f, 0.f));
+						//
+						// THIS BRANCH SILENTLY DISCARDED -VoxelSpawnPitch FOR THE
+						// WHOLE LIFE OF THAT SWITCH, and the pose logging added
+						// alongside it could not see the loss. RestartPlayer
+						// (search "Spawn pose APPLIED") parses -VoxelSpawnPitch,
+						// builds FRotator(Pitch, 0, 0), hands it to
+						// RestartPlayerAtTransform and then reads it straight back
+						// off PC->GetControlRotation() -- which reports the
+						// requested value, correctly, because at that instant it
+						// IS the control rotation. Then this ran, ~150 s later and
+						// one line before the shutter, and overwrote it with a
+						// hard-coded -40/45 on both the controller and the pawn.
+						//
+						// So every capture ever taken through tools/voxel-capture.ps1
+						// without a fixture switch was framed at pitch -40 yaw 45
+						// no matter what was asked for, while its log stated the
+						// requested pitch. Measured on the archive: the W6 lake
+						// frame's log carries "Spawn pose APPLIED: ... control
+						// pitch -55.0 deg, yaw 0.0 deg" and, from the same run,
+						// "Capture: ... rot=(pitch -40.0 yaw 45.0)". A -89 request
+						// and a -42 request produced indistinguishable near-horizon
+						// frames because they were byte-identical framings. Three
+						// settled, correctly-sited cave frames were thrown away as
+						// "the pitch did not take" -- it never had.
+						//
+						// The tell was always in the log and nobody was reading it:
+						// this branch uses yaw 45 and the spawn path uses yaw 0, so
+						// a "Capture:" line reading yaw 45.0 is proof the override
+						// fired. tools/voxel-capture.ps1 now prints that line next
+						// to the pose line and compares the two, which is what makes
+						// a recurrence loud instead of silent.
+						//
+						// Defaults are UNCHANGED (-40/45), so every capture in the
+						// archive taken without these switches remains reproducible
+						// byte for byte; only an explicit request now survives to
+						// the shutter.
+						float ShotPitch = -40.f;
+						float ShotYaw = 45.f;
+						float RequestedPitch = 0.f;
+						if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnPitch="), RequestedPitch))
+						{
+							ShotPitch = RequestedPitch;
+						}
+						// -VoxelSpawnYaw is new and exists only here, because yaw is
+						// the other half of a framing and this is the only place
+						// that has ever set it. It deliberately defaults to THIS
+						// branch's historical 45, not to the spawn path's 0: the
+						// point of the switch is to vary one quantity against the
+						// archive, and defaulting it to 0 would silently re-frame
+						// every -VoxelSpawnPitch capture by 45 degrees as well.
+						float RequestedYaw = 0.f;
+						if (FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnYaw="), RequestedYaw))
+						{
+							ShotYaw = RequestedYaw;
+						}
+						const FRotator Look(ShotPitch, ShotYaw, 0.f);
+						PC->SetControlRotation(Look);
 						if (APawn* P = PC->GetPawn())
 						{
-							P->SetActorRotation(FRotator(-40.f, 45.f, 0.f));
+							P->SetActorRotation(Look);
 						}
 					}
 					// Two captures, 2s apart, with the camera pose logged at
