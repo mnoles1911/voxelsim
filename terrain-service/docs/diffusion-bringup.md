@@ -77,14 +77,18 @@ export PYTHONPATH=/workspace/terrain-diffusion:$PYTHONPATH
 
 There is also a data dependency that is easy to miss: terrain-diffusion's
 `synthetic_map._compute_map_stats` opens **relative** paths under
-`data/global/`, so everything must run from `terrain-service/`. WorldClim
-auto-downloads on first run **and prompts for consent on stdin** (which hangs
-unattended scripts). ETOPO looks like it must be *built*: the code reads
-`etopo_10m.tif`, a 10 arc-**minute** downsample, while the README points at
-NOAA's 30 arc-**second** product. Building it per box is what made a world
-un-extendable, so it is now a pinned artifact — see
-`tools/fetch_conditioning.py` and
-`docs/measurements/etopo-build-not-reproducible-2026-08-02.txt`.
+`data/global/`, so everything must run from `terrain-service/`. ETOPO looks
+like it must be *built*: the code reads `etopo_10m.tif`, a 10 arc-**minute**
+downsample, while the README points at NOAA's 30 arc-**second** product.
+Building it per box is what made a world un-extendable, so all six conditioning
+files are now pinned artifacts fetched by `tools/fetch_conditioning.py`, which
+hashes each one before installing it. That also replaced terrain-diffusion's
+WorldClim downloader, which prompted for consent on stdin and hung unattended
+scripts. See `docs/measurements/world-identity-not-reproducible-2026-08-03.txt`
+(the cross-machine finding) and
+`docs/measurements/etopo-build-not-reproducible-2026-08-02.txt` (why the built
+pair has no builder — and why that turned out not to be what froze the
+289-tile world).
 
 ## 3. Pin a checkpoint AND the conditioning data into `DiffusionConfig`
 

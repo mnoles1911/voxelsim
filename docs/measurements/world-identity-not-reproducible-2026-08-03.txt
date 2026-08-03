@@ -2,6 +2,25 @@ WORLD IDENTITY IS NOT REPRODUCIBLE ACROSS MACHINES
 ==================================================
 2026-08-03, on a fresh Vast.ai RTX 4090 pod, seed 20260719.
 
+STATUS -- READ THIS FIRST (updated 2026-08-03, later the same day)
+------------------------------------------------------------------
+The cross-machine finding below stands and has been FIXED: all six conditioning
+files are now pinned artifacts with URLs, and a fresh box reproduces
+conditioning digest c49e052e... from an empty directory (verified end to end).
+
+But ONE CONCLUSION IN THIS DOCUMENT WAS WRONG and has been corrected in place,
+in the section marked CORRECTED below. This document originally blamed the
+frozen 289-tile world on the conditioning drift it had just found. That is not
+what froze it. The follow-on measurement,
+
+    docs/measurements/etopo-build-not-reproducible-2026-08-02.txt
+
+(dated 08-02 for the box it ran on; written after this one) ruled conditioning
+out for THAT world and found the real cause. The two documents are two halves
+of one investigation, not competing accounts: this one is the observation and
+the general fix, that one is the forensics on the specific world and on where
+the two built files actually came from. Read this one first.
+
 FINDING
 -------
 The same seed, the same repo commit and the same checkpoint bundle id produce a
@@ -9,6 +28,9 @@ DIFFERENT WORLD on a new machine. The 289-tile world in
 `terrain-diffusion-unlabeled-71e2b362e3241e71` -- the one carrying all nine
 owner-approved vistas, 17 baked fine tiles and the whole standing map set --
 cannot be extended by any new pod. It is frozen: usable, never growable.
+(It is frozen for a DIFFERENT reason than the one this document first gave;
+see CORRECTED below. The conditioning problem was real and is fixed; that
+world is still frozen and always will be.)
 
 This matters far beyond one world. docs/world-generation-architecture.md
 commits to an INFINITE world that a server keeps generating as players explore,
@@ -38,8 +60,12 @@ content-addressed design is sound and this is an INPUT problem, not a sampler
 problem. That is the difference between "pin the inputs" and "the architecture
 does not work".
 
-ROOT CAUSE: TWO OF THE SIX CONDITIONING FILES ARE BUILT, NOT DOWNLOADED
------------------------------------------------------------------------
+ROOT CAUSE OF THE CROSS-MACHINE DIFFERENCE: TWO OF THE SIX CONDITIONING FILES
+ARE BUILT, NOT DOWNLOADED
+-----------------------------------------------------------------------------
+(This is the cause of the pod-vs-workstation difference measured above, and it
+is now fixed. It is NOT the cause of the 289-tile world being frozen -- see
+CORRECTED, below.)
 `compute_conditioning_digest` hashes the BYTES of six files. Comparing this
 box against the fresh pod:
 
@@ -64,11 +90,88 @@ Both feed the conditioning digest, so the digest, the provider_id and therefore
 the world all move with them.
 
 Uploading this box's pair to the pod moved provider_id 191538c21b32bf64 ->
-80b9ca451a23eae4 and changed the tile bytes, confirming the causal chain. It
-did NOT reach 71e2b362e3241e71, so at least one further input of the original
-world (most plausibly the checkpoint bundle, whose sha was never recorded for
-that run) is also unrecovered. The original conditioning pair died with the pod
-that built it.
+80b9ca451a23eae4 and changed the tile bytes, confirming the causal chain.
+
+
+CORRECTED: WHY THE 289-TILE WORLD IS ACTUALLY FROZEN
+----------------------------------------------------
+WHAT THIS DOCUMENT ORIGINALLY SAID, AND IT WAS WRONG:
+
+    "It did NOT reach 71e2b362e3241e71, so at least one further input of the
+     original world (most plausibly the checkpoint bundle, whose sha was never
+     recorded for that run) is also unrecovered. The original conditioning pair
+     died with the pod that built it."
+
+The first sentence's observation is right -- uploading the pair did not reach
+71e2b362e3241e71 -- but the explanation attached to it was a guess, and the
+guess was wrong in the part that mattered: it implied the frozen world's
+conditioning was lost, and therefore that pinning the artifacts might recover
+it. It cannot. The original conditioning pair did NOT die with any pod. It is
+sitting on this workstation, unchanged, and it was already there at bake time.
+
+The disproof, measured 2026-08-02..03 (etopo-build-not-reproducible-2026-08-02
+.txt, FINDING 3), in two parts:
+
+  1. THE CONDITIONING AT BAKE TIME WAS TODAY'S CONDITIONING. From file mtimes:
+
+       etopo_10m.tif              last modified  2026-06-28 17:00
+       synthetic_map_stats.json   last modified  2026-08-01 17:45
+       earliest tile in that world's seed directory
+                                  written        2026-08-01 20:16:59
+
+     Both conditioning files predate the first tile of the bake and neither has
+     been touched since. So the conditioning digest in force when that world
+     was generated was c49e052e... -- the identical value this box computes
+     today, and the identical value a fresh pod now reproduces from the pinned
+     artifacts. Conditioning drift cannot explain a world baked BEFORE any
+     drift occurred.
+
+  2. NO COMBINATION OF INPUTS PRODUCES ITS provider_id. tile-cache/manifest
+     .json records 71e2b362e3241e71 with its checkpoint sha256 and seed, so
+     provider_id() can be re-derived on the CPU and swept against candidates:
+
+       4 candidate synthetic_map_stats.json copies found anywhere on the box
+         x the one etopo_10m.tif that exists
+         x 67 commits on all branches since 2026-07-15 that touched
+           terrain_service/ (git archive per commit, so world_shape,
+           CLIMATE_CALIBRATION, _tile_format_fingerprint and
+           IDENTITY_SCHEMA_VERSION all move with the revision)
+         x 4 config variants each
+
+       Result: 58 distinct provider_ids. 71e2b362e3241e71 is NOT AMONG THEM.
+
+     The current pair reproduces 71c23145bb325579, which confirms the method
+     works. The last commit that could have changed the identity payload before
+     the bake (56257c8, climate calibration re-fit) landed 2026-08-01 20:12:13
+     -- four minutes before the first tile was written -- and it too yields
+     71c23145bb325579, not 71e2b362e3241e71.
+
+THE ACTUAL CAUSE: the frozen world was baked from a WORKING TREE whose
+identity-bearing code was never committed. Something in that tree fed
+provider_id and no revision in the repository contains it. (The four-minute gap
+between the last relevant commit and the first tile fits: the bake was launched
+mid-edit.)
+
+WHAT THAT MEANS, PLAINLY:
+
+  * No artifact, pin, release or download can undo it. The bytes were never
+    the problem and hosting them changes nothing about that world.
+  * The nine owner-approved vistas cannot be recovered by re-deriving the
+    world. They can only be RE-APPROVED against a new one.
+  * This is a distinct failure from the one this document set out to describe,
+    with a distinct fix: pregen now writes world-identity.json before the first
+    tile, automatically and with no flag to skip it, so the identity of a bake
+    is recorded at the moment it is made rather than reconstructed afterwards.
+    See terrain_service/world_manifest.py.
+
+WHY THE ORIGINAL GUESS WAS PLAUSIBLE AND STILL WRONG: two independent
+reproducibility defects were live at once -- conditioning that differed across
+machines, and identity-bearing code that was never committed. The first was
+found first, it was real, and it was sufficient to explain a cross-machine
+difference, so it got charged with the frozen world as well. Nothing in the
+original measurement tested that attribution; the mtimes above take one minute
+to check and were not checked. That is the lesson worth keeping: a real cause
+found is not the cause of every symptom in view.
 
 WHY THE GUARDS DID THEIR JOB
 ----------------------------
@@ -79,18 +182,43 @@ together -- which is precisely what that flag would have done -- the result
 would have been one namespace containing two different planets, with a seam
 somewhere in the middle and no error anywhere. Checking cost one 11-second tile.
 
-WHAT TO FIX
------------
-1. `etopo_10m.tif` and `synthetic_map_stats.json` must become PINNED ARTIFACTS
-   -- built once, content-hashed, published, and downloaded by the bootstrap
-   like the WorldClim rasters already are. Rebuilding them per machine is what
-   makes a world unextendable.
-2. Record the full identity triple (checkpoint sha256, conditioning digest,
-   provider_id) with every world at creation, in the world's own directory.
-   The original world's triple was never written down, which is why it cannot
-   be reconstructed even in principle now.
-3. Make the bootstrap FAIL, not warn, if a requested provider_id cannot be
-   reproduced from the artifacts it has.
+WHAT TO FIX -- ALL THREE ARE DONE (2026-08-03)
+----------------------------------------------
+1. DONE. `etopo_10m.tif` and `synthetic_map_stats.json` are PINNED ARTIFACTS
+   with URLs. All six conditioning files carry a sha256 + size in
+   terrain-service/data/conditioning-artifacts.json, and every one of them has
+   a source: the two built files are assets on the dedicated `conditioning-v1`
+   release (they have no upstream publisher and no builder that reproduces
+   them), and the four WorldClim rasters point at upstream's own zip as
+   `<zip-url>#<member>` -- deliberately NOT mirrored, because WorldClim's terms
+   forbid redistribution. `tools/fetch_conditioning.py` fetches all six and
+   verifies each sha256 BEFORE installing it, and refuses to overwrite a file
+   that is present and wrong, since that file is the only evidence of what any
+   tiles already on the box came from.
+
+   VERIFIED END TO END, 2026-08-03: from an empty directory, the tool produced
+   all six files; the production `compute_conditioning_digest()` over them
+   returns c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2,
+   which with checkpoint bc5cb9d7...13ae1d gives provider_id
+   terrain-diffusion-unlabeled-80b9ca451a23eae4. A second machine can now
+   extend that world.
+
+2. DONE. `terrain_service/world_manifest.py` writes `world-identity.json` into
+   each world directory before the first tile -- checkpoint sha256, conditioning
+   digest, per-file conditioning hashes, terrain-diffusion version, timestamp --
+   and a run whose identity disagrees with a world that already has one is
+   refused before it generates anything. Automatic, with no flag to skip.
+
+   NOTE, given the correction above: this is the fix that would have PREVENTED
+   the loss of the 289-tile world. Item 1 would not have. The world was frozen
+   by uncommitted identity-bearing code, and only a record written at bake time
+   could have caught that.
+
+3. DONE. `bootstrap_pod.sh` step 7 DIES rather than warns, and
+   `fetch_conditioning.py --expect-provider-id` answers "can this box extend
+   that world?" on the CPU in one second, before a GPU is billed. The answer to
+   a mismatch is never an identity override: that would put two planets in one
+   namespace with a seam in the middle and no error anywhere.
 
 THE WORLD GENERATED AFTER THIS FINDING
 --------------------------------------
@@ -103,5 +231,16 @@ THE WORLD GENERATED AFTER THIS FINDING
   synthetic_map_stats sha256 prefix 8fe9d083f10a0daf, 12,297 bytes
   per-tile cost       9.9 s on an RTX 4090 (not the 22.5 s previously assumed)
 
-This triple IS recorded, and both conditioning files exist on this box, so this
-world is reproducible -- which is the whole point of writing it down here.
+This triple IS recorded, and as of 2026-08-03 all six conditioning files are
+downloadable and hash-verified, so this world is reproducible ON A MACHINE THAT
+HAS NEVER SEEN IT -- which is the whole point of writing it down here, and is
+the thing that was not true of 71e2b362e3241e71.
+
+SEE ALSO
+--------
+  docs/measurements/etopo-build-not-reproducible-2026-08-02.txt
+      The forensics: three proofs from the file's own TIFF tags that
+      etopo_10m.tif was never a build output and cannot be produced by
+      fetch_etopo.py, that the pod's copy differs in PIXELS and not merely in
+      container, and (FINDING 3) the sweep that ruled conditioning out as the
+      cause of the frozen world and located the real one.

@@ -4,7 +4,7 @@ WHY THIS EXISTS
 ---------------
 On 2026-08-03 the same seed, the same repo commit and the same checkpoint
 bundle id produced a DIFFERENT WORLD on a fresh pod
-(docs/measurements/etopo-build-not-reproducible-2026-08-02.txt). The
+(docs/measurements/world-identity-not-reproducible-2026-08-03.txt). The
 289-tile world that carries every owner-approved vista cannot be extended by
 any machine, ever, and the reason it cannot be extended is NOT that the
 sampler is unstable -- the control in that measurement is byte-identical on a
@@ -257,7 +257,7 @@ def world_identity_verdict(existing: dict, current: dict) -> tuple[bool, str]:
             "the ones already there, and nothing downstream could tell the two "
             "apart afterwards: one namespace, two planets, a seam somewhere in "
             "the middle and no error anywhere (see "
-            "docs/measurements/etopo-build-not-reproducible-2026-08-02.txt)."
+            "docs/measurements/world-identity-not-reproducible-2026-08-03.txt)."
             "\n  Restore the inputs the world was made from -- the manifest "
             "names each file that moved -- or generate into a NEW world by "
             "letting the changed input roll provider_id, which is what it is "

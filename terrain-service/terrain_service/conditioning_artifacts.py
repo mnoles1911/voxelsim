@@ -8,7 +8,8 @@ This module is the other half: making the six files something a second machine
 can actually obtain, so the answer to "which file moved" can be "none".
 
 WHAT WAS MEASURED (2026-08-02, see
-docs/measurements/etopo-build-not-reproducible-2026-08-02.txt)
+docs/measurements/etopo-build-not-reproducible-2026-08-02.txt, which follows on
+from docs/measurements/world-identity-not-reproducible-2026-08-03.txt)
 -----------------------------------------------------------------
 The earlier diagnosis was that ``tools/fetch_etopo.py`` drifts because it tries
 four NOAA URLs (including both a ``_bed`` and a ``_surface`` variant) and then
@@ -62,6 +63,28 @@ representation these two files have. Hence:
   * ``tools/fetch_etopo.py`` still builds the pair, but says in plain words
     that what it built starts a world of its own.
 
+WHERE THE BYTES LIVE (decided 2026-08-03)
+-----------------------------------------
+Every pin now carries at least one URL, so "which file moved" can finally be
+answered with "none". They are not all in the same place, and the split is
+deliberate:
+
+  * ``etopo_10m.tif`` and ``synthetic_map_stats.json`` are assets on the
+    dedicated release tag ``conditioning-v1``. That tag is not a code release
+    and is never advanced. These two have no upstream publisher and no builder
+    that reproduces them, so the release is their only representation.
+  * The four WorldClim rasters point at UPSTREAM's own zip, as
+    ``<zip-url>#<member>`` -- see ``split_source``. They are deliberately NOT
+    mirrored onto the release: worldclim.org's terms say "Redistribution or
+    commercial use is not allowed without prior permission", and a public
+    release asset is redistribution. Their sha256 pins still apply, so a
+    substituted or truncated download from upstream is refused exactly as a
+    substituted release asset would be.
+
+The pin, not the host, is what makes this safe. A GitHub tag is mutable and
+upstream can re-cut a zip; neither matters, because ``fetch_conditioning.py``
+hashes what arrived BEFORE installing it.
+
 WHY THE EXPECTED DIGEST IS DERIVED, NOT WRITTEN DOWN TWICE
 ----------------------------------------------------------
 ``compute_conditioning_digest`` hashes the string ``name:sha256`` per file,
@@ -84,7 +107,10 @@ DEFAULT_PINS_PATH = Path(__file__).resolve().parent.parent / "data" / "condition
 
 #: Bumped when the SHAPE of conditioning-artifacts.json changes. Same rule as
 #: ``world_manifest.MANIFEST_SCHEMA``: a newer schema is refused, not guessed at.
-PINS_SCHEMA = 1
+#:
+#: 2 (2026-08-03): the hosting decision was made, so ``hosting_decision_required``
+#: became ``hosting``, and ``sources`` entries gained the ``#member`` form.
+PINS_SCHEMA = 2
 
 
 class ConditioningPinsError(RuntimeError):
@@ -101,10 +127,12 @@ class ArtifactPin:
     #: ``"downloaded"`` (upstream publishes these bytes) or ``"built"`` (some
     #: process on some box produced them, and that process is not a source).
     origin: str
-    #: Immutable URLs to try in order. EMPTY for the two built artifacts until
-    #: the hosting decision in the manifest is made -- see
-    #: ``hosting_decision_required``. Empty is not "fall back to building": it
-    #: is a hard failure with an explanation.
+    #: URLs to try in order, each either a direct URL or ``<zip-url>#<member>``
+    #: for a file upstream only publishes inside an archive. Never empty: a pin
+    #: with no source is a file a fresh box cannot obtain, which is the exact
+    #: state that froze the 289-tile world, and ``test_conditioning_artifacts``
+    #: refuses it. Order is preference, not fallback-to-building -- if every
+    #: source fails, that is a hard failure with a per-file report.
     sources: tuple[str, ...] = ()
     #: The command that CAN produce a file of this kind, for the record.
     builder: str | None = None
@@ -112,13 +140,34 @@ class ArtifactPin:
     #: for etopo_10m.tif and synthetic_map_stats.json: measured, not assumed.
     builder_reproduces_pin: bool = False
     note: str = ""
+    #: Where the bytes came from and under what terms. Load-bearing: it is why
+    #: the four WorldClim rasters are pinned to upstream's zip rather than
+    #: mirrored onto the release beside the other two.
+    provenance: str = ""
+
+
+def split_source(source: str) -> "tuple[str, str | None]":
+    """``"<url>#<member>"`` -> ``(url, member)``; a plain URL -> ``(url, None)``.
+
+    Upstream publishes the four WorldClim rasters only as one 49.9 MB zip of
+    all 19 bio variables, so there is no per-file URL to pin. A ``#member``
+    fragment names the wanted entry inside it. Fragments are not sent over the
+    wire, so the same string is still a working URL for anything that ignores
+    this convention -- it just gets the zip.
+    """
+    base, sep, member = source.partition("#")
+    return (base, member) if (sep and member) else (source, None)
 
 
 @dataclass(frozen=True)
 class ArtifactPins:
     expected_conditioning_digest: str
     pins: tuple[ArtifactPin, ...]
-    hosting_decision_required: dict = field(default_factory=dict)
+    #: The recorded hosting decision: what was chosen, when, and what was
+    #: rejected. Kept in the manifest rather than in a commit message because
+    #: the next person to touch a ``sources`` array needs to know that "just
+    #: commit the blob" was considered and refused.
+    hosting: dict = field(default_factory=dict)
 
     def by_name(self) -> dict[str, ArtifactPin]:
         return {p.name: p for p in self.pins}
@@ -163,6 +212,7 @@ def load_pins(path: "str | Path | None" = None) -> ArtifactPins:
                     builder=item.get("builder"),
                     builder_reproduces_pin=bool(item.get("builder_reproduces_pin", False)),
                     note=item.get("note", ""),
+                    provenance=item.get("provenance", ""),
                 )
             )
         except (KeyError, TypeError, ValueError) as e:
@@ -173,7 +223,7 @@ def load_pins(path: "str | Path | None" = None) -> ArtifactPins:
     return ArtifactPins(
         expected_conditioning_digest=raw.get("expected_conditioning_digest", ""),
         pins=tuple(pins),
-        hosting_decision_required=raw.get("hosting_decision_required", {}) or {},
+        hosting=raw.get("hosting", {}) or {},
     )
 
 

@@ -1,7 +1,10 @@
 {
-  "schema": 1,
-  "description": "Pinned bytes for every file compute_conditioning_digest() hashes. See terrain_service/conditioning_artifacts.py for why each field exists.",
-  "measured": "docs/measurements/etopo-build-not-reproducible-2026-08-02.txt",
+  "schema": 2,
+  "description": "Pinned bytes for every file compute_conditioning_digest() hashes, and a URL a fresh box can get each one from. See terrain_service/conditioning_artifacts.py for why each field exists.",
+  "measured": [
+    "docs/measurements/world-identity-not-reproducible-2026-08-03.txt",
+    "docs/measurements/etopo-build-not-reproducible-2026-08-02.txt"
+  ],
   "expected_conditioning_digest": "c49e052e75da7a3cd8cb61742df9df86553c117d42e2f61730cf7a0ec64e48d2",
   "artifacts": [
     {
@@ -9,66 +12,88 @@
       "sha256": "9a45dd6dc5b0959cde00d64cc348aa5f731b31ceb7537d638a1162afa12d1254",
       "size": 9344975,
       "origin": "built",
-      "sources": [],
+      "sources": [
+        "https://github.com/mnoles1911/voxelsim/releases/download/conditioning-v1/etopo_10m.tif"
+      ],
       "builder": "tools/fetch_etopo.py",
       "builder_reproduces_pin": false,
-      "note": "MEASURED 2026-08-02: these bytes were NOT produced by tools/fetch_etopo.py and cannot be. The file is uncompressed (Compression=NONE; 2160x1080 float32 = 9,331,200 B + 13,775 B of tags = exactly its length) and it carries ETOPO's OWN georeferencing -- GeoAsciiParams 'WGS 84 + EGM2008 height', GDAL_NODATA '-99999', ModelPixelScale z=1.0 -- whereas fetch_etopo.py writes profile=ref.profile.copy() from wc2.1_10m_bio_1.tif, which would stamp 'WGS 84|', nodata -3.4e+38, z=0.0, and compress=deflate. Its mtime (2026-06-28) also predates fetch_etopo.py's first commit (66aecae, 2026-07-22) by 24 days. It is a gdal_translate/gdalwarp downsample of the ETOPO 2022 60s _bed product made by hand. Pixel content is _bed, confirmed: Greenland centre -151 m and West Antarctica -1360 m (the _surface product reads about +3000 m and +1800 m there). There is no URL yet -- see hosting_decision_required."
+      "note": "MEASURED 2026-08-02: these bytes were NOT produced by tools/fetch_etopo.py and cannot be. The file is uncompressed (Compression=NONE; 2160x1080 float32 = 9,331,200 B + 13,775 B of tags = exactly its length) and it carries ETOPO's OWN georeferencing -- GeoAsciiParams 'WGS 84 + EGM2008 height', GDAL_NODATA '-99999', ModelPixelScale z=1.0 -- whereas fetch_etopo.py writes profile=ref.profile.copy() from wc2.1_10m_bio_1.tif, which would stamp 'WGS 84|', nodata -3.4e+38, z=0.0, and compress=deflate. Its mtime (2026-06-28) also predates fetch_etopo.py's first commit (66aecae, 2026-07-22) by 24 days. It is a gdal_translate/gdalwarp downsample of the ETOPO 2022 60s _bed product made by hand. Pixel content is _bed, confirmed: Greenland centre -151 m and West Antarctica -1360 m (the _surface product reads about +3000 m and +1800 m there). Because it has no builder and no upstream publisher, the release asset above is its ONLY representation.",
+      "provenance": "Derived from NOAA NCEI ETOPO 2022 60 arc-second _bed (doi:10.25921/fd45-gt74), a U.S. Government work in the public domain."
     },
     {
       "name": "synthetic_map_stats.json",
       "sha256": "8fe9d083f10a0dafc3a37e3da9c8a206ca6a110fdcb56052372e94642147b1d3",
       "size": 12297,
       "origin": "built",
-      "sources": [],
+      "sources": [
+        "https://github.com/mnoles1911/voxelsim/releases/download/conditioning-v1/synthetic_map_stats.json"
+      ],
       "builder": "tools/bootstrap_pod.sh step 7 (terrain_diffusion.inference.synthetic_map)",
       "builder_reproduces_pin": false,
-      "note": "Derived from etopo_10m.tif plus the four WorldClim rasters, so it inherits etopo's drift and adds its own. Rebuilt from the real WorldClim rasters on 2026-08-01 (the previous 13,058 B copies still on the 2026-08-02 box hash a1d3a1abd05030bf and were built from FAKE climate)."
+      "note": "Derived from etopo_10m.tif plus the four WorldClim rasters, so it inherits etopo's drift and adds its own. Rebuilt from the real WorldClim rasters on 2026-08-01 17:45 (the previous 13,058 B copies still on the 2026-08-02 box hash a1d3a1abd05030bf and were built from FAKE climate). It holds quantile tables only -- no WorldClim pixels -- so it is redistributable where the rasters it was computed from are not.",
+      "provenance": "64-knot quantile tables computed from etopo_10m.tif and the four WorldClim rasters."
     },
     {
       "name": "wc2.1_10m_bio_1.tif",
       "sha256": "f61633ffac9d44ed220442b3f7171a06f931726668bfbe9d07d53700b257d8cf",
       "size": 3790814,
       "origin": "downloaded",
-      "sources": [],
+      "sources": [
+        "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_10m_bio.zip#wc2.1_10m_bio_1.tif"
+      ],
       "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
       "builder_reproduces_pin": true,
-      "note": "WorldClim 2.1 10m, published 2019-02-28 and byte-identical on every box measured. Fetched by upstream's own downloader (it ships as one zip, so there is no per-file URL to pin); the pin is the check on what that downloader produced."
+      "note": "WorldClim 2.1 10m, published 2019-02-28 and byte-identical on every box measured. Upstream ships all 19 bio variables as one 49,869,449 B zip, so the source is the zip URL with a '#member' fragment; fetch_conditioning.py downloads it once per run and extracts only the four members it needs, hashing each BEFORE installing it. NOT MIRRORED on the conditioning-v1 release on purpose: worldclim.org/about.html says 'Redistribution or commercial use is not allowed without prior permission.' The pin is the check on what upstream served, not a substitute for upstream.",
+      "provenance": "WorldClim 2.1 (Fick & Hijmans 2017). Free for academic and other non-commercial use; redistribution not permitted without prior permission, hence no mirror."
     },
     {
       "name": "wc2.1_10m_bio_4.tif",
       "sha256": "a1bacac2f3d645284ee506fdde14226d7c2cafd5997a2af2f802f45e3550ae19",
       "size": 3765363,
       "origin": "downloaded",
-      "sources": [],
+      "sources": [
+        "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_10m_bio.zip#wc2.1_10m_bio_4.tif"
+      ],
       "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
       "builder_reproduces_pin": true,
-      "note": "WorldClim 2.1 10m."
+      "note": "WorldClim 2.1 10m. Same zip as bio_1; see that entry for why it is not mirrored.",
+      "provenance": "WorldClim 2.1 (Fick & Hijmans 2017). Redistribution not permitted without prior permission."
     },
     {
       "name": "wc2.1_10m_bio_12.tif",
       "sha256": "1e823e951ace0186c6eadd7368b4d0385c8f51cc952282c0f2d640bf7790fea5",
       "size": 1963655,
       "origin": "downloaded",
-      "sources": [],
+      "sources": [
+        "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_10m_bio.zip#wc2.1_10m_bio_12.tif"
+      ],
       "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
       "builder_reproduces_pin": true,
-      "note": "WorldClim 2.1 10m."
+      "note": "WorldClim 2.1 10m. Same zip as bio_1; see that entry for why it is not mirrored.",
+      "provenance": "WorldClim 2.1 (Fick & Hijmans 2017). Redistribution not permitted without prior permission."
     },
     {
       "name": "wc2.1_10m_bio_15.tif",
       "sha256": "6e16bf2e37752932cdeb2b209d1e06ba1a154ac012c372e56bc98e774cdfa6c6",
       "size": 3496057,
       "origin": "downloaded",
-      "sources": [],
+      "sources": [
+        "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_10m_bio.zip#wc2.1_10m_bio_15.tif"
+      ],
       "builder": "terrain_diffusion.inference.synthetic_map._ensure_wc_files",
       "builder_reproduces_pin": true,
-      "note": "WorldClim 2.1 10m."
+      "note": "WorldClim 2.1 10m. Same zip as bio_1; see that entry for why it is not mirrored.",
+      "provenance": "WorldClim 2.1 (Fick & Hijmans 2017). Redistribution not permitted without prior permission."
     }
   ],
-  "hosting_decision_required": {
-    "owner_decision": "UNRESOLVED -- terrain-service/tools/fetch_conditioning.py FAILS until this is filled in.",
-    "what": "etopo_10m.tif (9,344,975 B) and synthetic_map_stats.json (12,297 B) need immutable, content-addressed URLs. Fill in each artifact's 'sources' array; the sha256 above is already the acceptance test, so a wrong or substituted file is refused rather than adopted.",
-    "why_not_decided_here": "It is a ~9 MB binary. git-lfs, a GitHub release asset, an object-store bucket and the HuggingFace checkpoint repo are all workable and they differ in who pays, who can revoke it, and whether a pod behind a proxy can reach it. Committing the blob straight into this git repo is permanent in every clone forever, so it must be chosen deliberately, not by whoever touched this file last.",
-    "recommendation": "Attach both files to a GitHub release on this repo (e.g. tag 'conditioning-v1') and put the two release-asset URLs here. Rationale: release assets are already reachable by anything that can clone the repo (no new credential, no new bill), they do not enter every clone the way a committed blob or git-lfs pointer does, and the sha256 pin makes GitHub's mutable-tag behaviour irrelevant. The HuggingFace checkpoint repo is the runner-up and is better if pods are ever cut off from github.com. Whoever decides: put the two URLs in 'sources' and set this field to the decision and the date."
+  "hosting": {
+    "decided": "2026-08-03",
+    "decided_by": "owner",
+    "choice": "GitHub release assets on this repo, under the dedicated tag 'conditioning-v1', for the two BUILT artifacts. The four WorldClim rasters keep upstream's own zip URL.",
+    "release": "https://github.com/mnoles1911/voxelsim/releases/tag/conditioning-v1",
+    "rationale": "Release assets are reachable by anything that can clone this repo -- no new credential and no new bill -- and they do not enter every clone the way a committed blob or a git-lfs pointer does. The tag is dedicated and never advanced, so it carries no source meaning and nothing about a code release can move it. GitHub tags are mutable in principle; the sha256 pins make that irrelevant, because fetch_conditioning.py hashes what arrived before installing it and refuses anything else.",
+    "why_worldclim_is_not_mirrored": "worldclim.org/about.html: 'The data are freely available for academic use and other non-commercial use. Redistribution or commercial use is not allowed without prior permission.' Uploading the four rasters to a public release would be redistribution. They stay on upstream's zip URL, pinned by sha256 so a substituted or corrupted download is refused exactly as a substituted release asset would be.",
+    "runner_up": "The HuggingFace checkpoint repo, which is better if pods are ever cut off from github.com but not from huggingface.co. If that day comes, add its URL as a SECOND entry in each 'sources' array rather than replacing the first: the arrays are tried in order and the sha256 pin makes a second mirror free of risk.",
+    "rejected": "Committing the 9,344,975 B binary into git, or git-lfs. Both are permanent in every clone forever, and git-lfs additionally adds a quota that can silently stop serving."
   }
 }

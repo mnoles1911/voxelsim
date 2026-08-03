@@ -18,9 +18,11 @@ from terrain_service.conditioning_artifacts import (
     WRONG_BYTES,
     ArtifactPin,
     ArtifactPins,
+    PINS_SCHEMA,
     ConditioningPinsError,
     digest_from_pins,
     load_pins,
+    split_source,
     verdict_from_observations,
     verify_root,
 )
@@ -69,18 +71,78 @@ def test_the_two_built_artifacts_are_marked_as_not_reproducible_by_their_builder
         assert by_name[wc].builder_reproduces_pin is True
 
 
-def test_hosting_decision_is_recorded_as_open_while_the_urls_are_empty():
-    """The two built artifacts have no sources yet. That is a DECISION NOT MADE,
-    and it must stay visible: an empty source list with no explanation reads as
-    an oversight and gets 'fixed' by whoever is in a hurry."""
-    pins = load_pins()
-    by_name = pins.by_name()
-    unhosted = [n for n, p in by_name.items() if not p.sources and p.origin == "built"]
-    if unhosted:
-        h = pins.hosting_decision_required
-        assert h, f"{unhosted} have no sources and no hosting_decision_required block"
-        assert h.get("recommendation")
-        assert "UNRESOLVED" in h.get("owner_decision", "")
+def test_every_artifact_has_a_pinned_sha_and_a_source_to_get_it_from():
+    """THE point of this manifest, as one assertion.
+
+    A pin with no URL says "these are the right bytes" and gives no way to
+    obtain them, which is exactly the state that froze the 289-tile world: the
+    bootstrap named the file it needed and stopped. Both halves are required of
+    every artifact, forever -- a seventh conditioning file added with a hash and
+    no host has to fail here, in a second, and not on a pod after a bake.
+    """
+    for p in load_pins().pins:
+        assert len(p.sha256) == 64 and set(p.sha256) <= set("0123456789abcdef"), (
+            f"{p.name} has no usable sha256 pin"
+        )
+        assert p.size > 0, f"{p.name} has no pinned size"
+        assert p.sources, (
+            f"{p.name} is pinned but has NO source URL, so a fresh box cannot "
+            f"obtain it. Attach it to the conditioning-v1 release and put the "
+            f"asset URL in its 'sources'."
+        )
+        for s in p.sources:
+            url, member = split_source(s)
+            assert url.startswith("https://"), f"{p.name}: {s!r} is not an https URL"
+            if member is not None:
+                assert url.endswith(".zip"), (
+                    f"{p.name}: {s!r} names a member but is not an archive"
+                )
+
+
+def test_the_two_files_with_no_upstream_are_hosted_on_our_own_release():
+    """etopo_10m.tif and synthetic_map_stats.json have no publisher and no
+    builder that reproduces them (measured 2026-08-02), so the release asset is
+    their ONLY representation. If either ever points somewhere else, that is a
+    change of custody and it should be deliberate."""
+    by_name = load_pins().by_name()
+    for name in ("etopo_10m.tif", "synthetic_map_stats.json"):
+        assert by_name[name].sources == (
+            f"https://github.com/mnoles1911/voxelsim/releases/download/conditioning-v1/{name}",
+        )
+
+
+def test_worldclim_points_at_upstream_and_is_not_mirrored():
+    """worldclim.org: 'Redistribution or commercial use is not allowed without
+    prior permission.' Attaching these four to a public release would be
+    redistribution, so they stay on upstream's zip -- and the sha256 pin, not
+    the host, is what makes that safe."""
+    by_name = load_pins().by_name()
+    for name in ("wc2.1_10m_bio_1.tif", "wc2.1_10m_bio_4.tif",
+                 "wc2.1_10m_bio_12.tif", "wc2.1_10m_bio_15.tif"):
+        (source,) = by_name[name].sources
+        url, member = split_source(source)
+        assert url == "https://geodata.ucdavis.edu/climate/worldclim/2_1/base/wc2.1_10m_bio.zip"
+        assert member == name
+        assert "releases/download" not in source, f"{name} must not be mirrored"
+
+
+def test_the_hosting_decision_is_recorded_with_what_it_rejected():
+    """The decision stays in the manifest, not only in a commit message: the
+    next person to add a source needs to know that committing the blob and
+    git-lfs were considered and refused, or they will reach for one of them."""
+    h = load_pins().hosting
+    assert h.get("decided"), "the hosting decision has no date"
+    assert h.get("choice") and h.get("rationale")
+    assert h.get("rejected"), "a decision with no rejected alternative is a note"
+    assert h.get("why_worldclim_is_not_mirrored")
+    assert "conditioning-v1" in h.get("release", "")
+
+
+def test_split_source_understands_plain_urls_and_zip_members():
+    assert split_source("https://x/y.tif") == ("https://x/y.tif", None)
+    assert split_source("https://x/y.zip#a.tif") == ("https://x/y.zip", "a.tif")
+    # A trailing bare '#' is a URL with an empty fragment, not an archive.
+    assert split_source("https://x/y.zip#") == ("https://x/y.zip#", None)
 
 
 # --------------------------------------------------------------------------
@@ -222,7 +284,7 @@ def test_missing_manifest_is_refused(tmp_path):
 
 def test_malformed_artifact_entry_is_refused(tmp_path):
     p = tmp_path / "pins.json"
-    p.write_text(json.dumps({"schema": 1, "artifacts": [{"name": "a.tif"}]}))
+    p.write_text(json.dumps({"schema": PINS_SCHEMA, "artifacts": [{"name": "a.tif"}]}))
     with pytest.raises(ConditioningPinsError, match="malformed"):
         load_pins(p)
 
@@ -231,6 +293,6 @@ def test_empty_artifact_list_is_refused(tmp_path):
     """An empty pin set verifies successfully against every possible box, which
     is the most dangerous way for this check to fail."""
     p = tmp_path / "pins.json"
-    p.write_text(json.dumps({"schema": 1, "artifacts": []}))
+    p.write_text(json.dumps({"schema": PINS_SCHEMA, "artifacts": []}))
     with pytest.raises(ConditioningPinsError, match="no artifacts"):
         load_pins(p)

@@ -26,6 +26,21 @@ has been made deterministic, but it produces a DIFFERENT file, and a different
 file is a different world. ``--allow-build`` exists so that starting a new
 world is possible; it is not a fallback and it is never automatic.
 
+WHERE IT FETCHES FROM
+---------------------
+``etopo_10m.tif`` and ``synthetic_map_stats.json`` come from the dedicated
+``conditioning-v1`` release on this repo -- not a code release, never advanced.
+The four WorldClim rasters come from upstream's own zip, addressed as
+``<zip-url>#<member>``, because their terms forbid mirroring. The archive is
+downloaded once per run and only the four needed members are extracted.
+
+Neither host is trusted. Every file, from either place, is hashed against
+``data/conditioning-artifacts.json`` BEFORE it is put in place, so a mutated
+tag, a re-cut upstream zip or a truncated transfer is refused rather than
+adopted. And a file that is already present and WRONG is never overwritten:
+there is no flag for it, because that file is usually the only evidence of what
+the tiles already on the box were generated from.
+
 Usage:
     python3 tools/fetch_conditioning.py                 # verify + download
     python3 tools/fetch_conditioning.py --verify-only   # no network
@@ -37,10 +52,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import tempfile
 import urllib.request
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -48,6 +65,7 @@ from terrain_service.conditioning_artifacts import (  # noqa: E402
     ConditioningPinsError,
     load_pins,
     sha256_of_file,
+    split_source,
     verify_root,
 )
 
@@ -58,61 +76,133 @@ BLD = "\033[1m"
 RST = "\033[0m"
 
 
-def _download(url: str, dest: Path, expect_sha: str, expect_size: int) -> bool:
-    """Fetch ``url`` into ``dest`` only if it hashes to ``expect_sha``.
+def _stream(url: str, into: Path) -> None:
+    """Download ``url`` to ``into``, with a progress line. Raises on failure."""
+    req = urllib.request.Request(url, headers={"User-Agent": "voxelsim-bringup"})
+    with urllib.request.urlopen(req, timeout=300) as r, open(into, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
+            got += len(chunk)
+            if total:
+                print(f"\r      {got / 1e6:.1f} / {total / 1e6:.1f} MB", end="", flush=True)
+        print()
 
-    Downloads to a sibling temp file and renames on success, so an interrupted
-    or substituted download can never leave a plausible-looking wrong file
-    where the next run will trust it because it is present.
+
+def _accept(tmp: Path, dest: Path, expect_sha: str, expect_size: int) -> bool:
+    """Install ``tmp`` as ``dest`` ONLY if it is byte-for-byte the pinned file.
+
+    The hash check happens here, before the rename, so an interrupted,
+    truncated or substituted fetch can never leave a plausible-looking wrong
+    file where the next run will trust it because it is present. That is the
+    whole difference between this and ``curl -o``.
     """
-    tmp = None
-    try:
-        print(f"    trying {url}")
-        req = urllib.request.Request(url, headers={"User-Agent": "voxelsim-bringup"})
-        fd, tmpname = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.")
-        tmp = Path(tmpname)
-        with urllib.request.urlopen(req, timeout=120) as r, os.fdopen(fd, "wb") as f:
-            total = int(r.headers.get("Content-Length") or 0)
-            got = 0
-            while True:
-                chunk = r.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                got += len(chunk)
-                if total:
-                    print(f"\r      {got / 1e6:.1f} / {total / 1e6:.1f} MB", end="", flush=True)
-            print()
-        actual = sha256_of_file(tmp)
-        size = tmp.stat().st_size
-        if actual != expect_sha or size != expect_size:
-            print(
-                f"{RED}      REJECTED: got sha256 {actual} ({size:,} B), "
-                f"pinned is {expect_sha} ({expect_size:,} B){RST}"
-            )
-            return False
-        tmp.replace(dest)
-        tmp = None
-        print(f"{GRN}      verified {expect_sha[:16]}{RST}")
-        return True
-    except Exception as e:  # noqa: BLE001 -- any failure means "try the next URL"
-        print(f"      failed: {e}")
+    actual = sha256_of_file(tmp)
+    size = tmp.stat().st_size
+    if actual != expect_sha or size != expect_size:
+        print(
+            f"{RED}      REJECTED: got sha256 {actual} ({size:,} B), "
+            f"pinned is {expect_sha} ({expect_size:,} B){RST}"
+        )
         return False
-    finally:
-        if tmp is not None and tmp.exists():
-            tmp.unlink()
+    tmp.replace(dest)
+    print(f"{GRN}      verified {expect_sha[:16]}{RST}")
+    return True
+
+
+class Fetcher:
+    """Gets pinned bytes from ``<url>`` or ``<zip-url>#<member>`` sources.
+
+    The zip case exists because upstream publishes the four WorldClim rasters
+    only inside one 49.9 MB archive of all 19 bio variables, and mirroring them
+    beside the other two artifacts is not allowed (worldclim.org: "Redistribution
+    or commercial use is not allowed without prior permission"). Downloading
+    that archive once per RUN rather than once per FILE is the only reason this
+    is a class and not a function -- four separate fetches would be 200 MB.
+    """
+
+    def __init__(self) -> None:
+        self._zips: dict[str, Path] = {}
+        self._scratch: list[Path] = []
+
+    def close(self) -> None:
+        for p in self._scratch:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        self._scratch.clear()
+        self._zips.clear()
+
+    def _zip(self, url: str, workdir: Path) -> Path:
+        got = self._zips.get(url)
+        if got is not None:
+            return got
+        print(f"    downloading archive {url}")
+        fd, name = tempfile.mkstemp(dir=str(workdir), prefix=".wc-archive.", suffix=".zip")
+        os.close(fd)
+        path = Path(name)
+        self._scratch.append(path)
+        _stream(url, path)
+        self._zips[url] = path
+        return path
+
+    def fetch(self, source: str, dest: Path, expect_sha: str, expect_size: int) -> bool:
+        """Try one source. Returns True only if ``dest`` now holds the pinned bytes."""
+        url, member = split_source(source)
+        tmp = None
+        try:
+            print(f"    trying {source}")
+            fd, name = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.")
+            # Close the descriptor immediately and work by path. Holding the fd
+            # across the extract below leaks it on any early failure, and on
+            # Windows an open handle makes the cleanup unlink() raise
+            # PermissionError -- which would escape the `finally` and crash the
+            # whole run instead of falling through to the next source.
+            os.close(fd)
+            tmp = Path(name)
+            if member is None:
+                _stream(url, tmp)
+            else:
+                archive = self._zip(url, dest.parent)
+                with zipfile.ZipFile(archive) as zf:
+                    # Members can be nested; match on the basename so the pin
+                    # does not have to know upstream's directory layout.
+                    names = [n for n in zf.namelist() if PurePosixPath(n).name == member]
+                    if not names:
+                        raise KeyError(f"{member} is not in {url}")
+                    with zf.open(names[0]) as src, open(tmp, "wb") as out:
+                        shutil.copyfileobj(src, out, 1 << 20)
+                print(f"      extracted {member}")
+            ok = _accept(tmp, dest, expect_sha, expect_size)
+            if ok:
+                tmp = None
+            return ok
+        except Exception as e:  # noqa: BLE001 -- any failure means "try the next source"
+            print(f"      failed: {e}")
+            return False
+        finally:
+            if tmp is not None and tmp.exists():
+                tmp.unlink()
 
 
 def _hosting_block(pins) -> str:
-    h = pins.hosting_decision_required or {}
-    if not h:
-        return ""
+    """Printed only when some pin has NO source at all -- i.e. never, now that
+    the decision is made. Kept because the condition can come back: a seventh
+    conditioning file added without a URL lands here rather than in a bake."""
+    h = pins.hosting or {}
     return (
-        f"\n{BLD}THE HOSTING DECISION IS STILL OPEN.{RST}\n"
-        f"  status: {h.get('owner_decision', '(unset)')}\n"
-        f"  what:   {h.get('what', '')}\n"
-        f"  why it is not decided in code: {h.get('why_not_decided_here', '')}\n"
-        f"  recommendation: {h.get('recommendation', '')}\n"
+        f"\n{BLD}A PINNED FILE HAS NO SOURCE URL.{RST}\n"
+        f"  The hosting decision for the existing set was made on "
+        f"{h.get('decided', '(undated)')}: {h.get('choice', '(unrecorded)')}\n"
+        f"  Release: {h.get('release', '(none)')}\n"
+        f"  A new pin has to be hosted the same way -- attach the file to that\n"
+        f"  release and put its URL in this artifact's 'sources' array. Do NOT\n"
+        f"  commit the blob: {h.get('rejected', '')}\n"
     )
 
 
@@ -169,26 +259,32 @@ def main() -> int:
 
     # --- download whatever is missing ------------------------------------
     if not verdict.ok and not args.verify_only:
-        for st in verdict.statuses:
-            if st.state == "ok":
-                continue
-            pin = st.pin
-            if st.state == "wrong-bytes":
-                # Do NOT silently overwrite. A file that is present and wrong is
-                # a fact worth stopping on: it usually means this box built its
-                # own, and quietly replacing it would erase the evidence of what
-                # any tiles already here were generated from.
-                print(
-                    f"{YLW}    {pin.name} is present but is NOT the pinned bytes; "
-                    f"leaving it alone. Move it aside and re-run to replace it.{RST}"
-                )
-                continue
-            if not pin.sources:
-                continue
-            print(f"  fetching {pin.name}")
-            for url in pin.sources:
-                if _download(url, root / pin.name, pin.sha256, pin.size):
-                    break
+        fetcher = Fetcher()
+        try:
+            for st in verdict.statuses:
+                if st.state == "ok":
+                    continue
+                pin = st.pin
+                if st.state == "wrong-bytes":
+                    # Do NOT silently overwrite. A file that is present and wrong
+                    # is a fact worth stopping on: it usually means this box built
+                    # its own, and quietly replacing it would erase the evidence of
+                    # what any tiles already here were generated from. There is no
+                    # flag to force it either -- moving the file aside by hand is
+                    # the point, because that keeps the evidence.
+                    print(
+                        f"{YLW}    {pin.name} is present but is NOT the pinned bytes; "
+                        f"leaving it alone. Move it aside and re-run to replace it.{RST}"
+                    )
+                    continue
+                if not pin.sources:
+                    continue
+                print(f"  fetching {pin.name}")
+                for source in pin.sources:
+                    if fetcher.fetch(source, root / pin.name, pin.sha256, pin.size):
+                        break
+        finally:
+            fetcher.close()
         verdict = verify_root(root, pins)
 
     print()
@@ -211,11 +307,29 @@ def main() -> int:
             names = ", ".join(p.name for p in unhosted)
             print(
                 f"{RED}  No download URL is pinned for: {names}{RST}\n"
-                f"{RED}  These are the two files bootstrap used to BUILD, and building them{RST}\n"
-                f"{RED}  does not reproduce them -- see terrain_service/conditioning_artifacts.py.{RST}",
+                f"{RED}  Building these does not reproduce them -- see{RST}\n"
+                f"{RED}  terrain_service/conditioning_artifacts.py.{RST}",
                 file=sys.stderr,
             )
             print(_hosting_block(pins), file=sys.stderr)
+        if verdict.wrong:
+            names = ", ".join(s.name for s in verdict.wrong)
+            print(
+                f"{RED}  Present but NOT the pinned bytes: {names}{RST}\n"
+                f"{RED}  These were left exactly as they are, on purpose. Such a file is{RST}\n"
+                f"{RED}  usually one this box built for itself, and it is the ONLY evidence{RST}\n"
+                f"{RED}  of what any tiles already in this cache were generated from --{RST}\n"
+                f"{RED}  overwriting it would destroy the only way to identify them later.{RST}\n"
+                f"{RED}  Move each one aside (mv it, do not rm it) and re-run; the pinned{RST}\n"
+                f"{RED}  copy will then be downloaded and verified.{RST}",
+                file=sys.stderr,
+            )
+        if args.verify_only and (verdict.missing and not unhosted):
+            print(
+                f"{YLW}  --verify-only was given, so nothing was downloaded. Re-run without{RST}\n"
+                f"{YLW}  it to fetch the missing files from their pinned sources.{RST}",
+                file=sys.stderr,
+            )
         if args.allow_build:
             print(
                 f"{YLW}--allow-build was given. Build the pair with:{RST}\n"

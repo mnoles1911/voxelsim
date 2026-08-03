@@ -41,8 +41,12 @@ with a world that already has one is refused before it generates anything.
 
 Automatic, with no flag to forget: the 289-tile world that can never be
 extended was lost because nobody wrote this down at the time. See
-``world_manifest.py`` and
-docs/measurements/etopo-build-not-reproducible-2026-08-02.txt.
+``world_manifest.py``,
+docs/measurements/world-identity-not-reproducible-2026-08-03.txt (the
+cross-machine finding) and
+docs/measurements/etopo-build-not-reproducible-2026-08-02.txt (why the two
+built conditioning files have no builder, and why that turned out NOT to be
+what froze that particular world).
 """
 
 from __future__ import annotations

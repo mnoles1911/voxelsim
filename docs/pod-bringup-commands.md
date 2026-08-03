@@ -229,13 +229,26 @@ automatically now; this list exists so nobody "helpfully" undoes one.
    made a world un-extendable: the shipping `etopo_10m.tif` turns out never to
    have been a build output at all (it is uncompressed and carries ETOPO's own
    vertical datum, neither of which the script can emit — see
-   `docs/measurements/etopo-build-not-reproducible-2026-08-02.txt`). Use
-   `tools/fetch_conditioning.py`, which verifies all six conditioning files
-   against pinned sha256s and **fails** rather than substituting.
-   `fetch_etopo.py` still exists but now refuses to run without
-   `--i-am-starting-a-new-world`, because that is exactly what it does.
-6. **WorldClim prompts for consent on stdin** on first run, which hangs any
-   unattended script forever. The bootstrap feeds it from `yes`.
+   `docs/measurements/etopo-build-not-reproducible-2026-08-02.txt`, and
+   `docs/measurements/world-identity-not-reproducible-2026-08-03.txt` for the
+   cross-machine finding that started it). Use
+   `tools/fetch_conditioning.py`, which downloads all six conditioning files
+   from their pinned sources, verifies each sha256 **before** installing it,
+   and **fails** rather than substituting. `fetch_etopo.py` still exists but
+   now refuses to run without `--i-am-starting-a-new-world`, because that is
+   exactly what it does.
+6. **`fetch_conditioning.py` gets WorldClim too, so nothing prompts.**
+   `etopo_10m.tif` and `synthetic_map_stats.json` come from the dedicated
+   `conditioning-v1` release on this repo; the four WorldClim rasters come from
+   upstream's own zip (`<zip-url>#<member>`), which the tool downloads once and
+   extracts the four needed members from. WorldClim is **not** mirrored on the
+   release on purpose — their terms forbid redistribution. This replaces
+   terrain-diffusion's `_ensure_wc_files`, which prompted for consent on stdin
+   and hung any unattended script forever (the bootstrap used to feed it `yes`)
+   and which verified nothing about what it got.
+   A file that is present but **wrong** is never overwritten, and there is no
+   flag that makes it: that file is the only evidence of what any tiles already
+   on the box were generated from. Move it aside by hand and re-run.
 7. **Everything must run from `terrain-service/`.** Both WorldClim and ETOPO
    resolve against the *current directory*.
 8. **Never paste a heredoc into a web terminal.** It gets silently
