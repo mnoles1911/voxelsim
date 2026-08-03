@@ -4018,6 +4018,53 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCameraHigh override: spawning %.0fm above the surface"), CameraHighMeters);
 	}
 
+	// -VoxelSpawnAltM=<meters>: THE VISTA SWITCH, and the reason it exists is a
+	// wrong conclusion that the capture path made unavoidable. Every headless
+	// screenshot to date spawned a pawn ON the terrain (+5m) looking dead level,
+	// which photographs the slope the pawn is standing on and nothing else.
+	// Eight such captures were reviewed and the world -- 12.5 km of vertical
+	// span with a 6,125 m massif in it -- was reasonably read as FLAT. A
+	// stitched heightmap had to be built to establish that the terrain was fine
+	// and the CAMERA was the problem: there was no altitude or pitch control
+	// anywhere on the capture path.
+	//
+	// This is deliberately NOT a rename of -VoxelCameraHigh above. That switch
+	// is M2 Band 3's clipmap-ring check and its captures are still compared
+	// against each other; this one is the capture harness's own knob
+	// (tools/voxel-capture.ps1 -SpawnAltM) in the units that script speaks, and
+	// it wins when both are passed because it is the more specific request.
+	//
+	// Absent (or <= 0): nothing changes -- the default +5m ground spawn stands,
+	// so every capture and flight leg taken before this switch existed is still
+	// byte-comparable.
+	float SpawnAltMeters = 0.f;
+	const bool bHasSpawnAlt =
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnAltM="), SpawnAltMeters) && SpawnAltMeters > 0.f;
+	if (bHasSpawnAlt)
+	{
+		SpawnHeightAboveSurfaceUU = double(SpawnAltMeters) * 100.0; // meters -> UU (1 UU = 1 cm)
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelSpawnAltM override: spawning %.1f m above the terrain surface at the spawn column."),
+		       SpawnAltMeters);
+	}
+
+	// -VoxelSpawnPitch=<degrees, NEGATIVE = looking DOWN>: the other half of the
+	// same fix. Altitude alone gets the camera above the landform and then
+	// points it at the horizon, so the landform is off the bottom of the frame;
+	// what shows relief is height PLUS downward pitch. Yaw is deliberately left
+	// at 0 (+X) so that two captures of the same column differ only in the
+	// quantity being varied -- the whole archive is compared shot-to-shot.
+	//
+	// Absent: the rotation stays FRotator::ZeroRotator, which is exactly what
+	// this function passed before the switch existed.
+	float SpawnPitchDegrees = 0.f;
+	const bool bHasSpawnPitch = FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnPitch="), SpawnPitchDegrees);
+	if (bHasSpawnPitch)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelSpawnPitch override: camera pitch %.1f deg (negative = looking down)."),
+		       SpawnPitchDegrees);
+	}
+
 	// GetSurfaceHeightUU is the PURE WORLDGEN column height -- it ignores caving.
 	// At a column where a cavern or cave void breaches down from (or up to) the
 	// surface, the worldgen surface is open air and a pawn spawned there+5m falls
@@ -4079,7 +4126,36 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	}
 
 	const FVector SpawnLocation(SpawnWorldX, SpawnWorldY, GroundTopUU + SpawnHeightAboveSurfaceUU);
-	const FTransform SpawnTransform(FRotator::ZeroRotator, SpawnLocation);
+	const FRotator SpawnRotation = bHasSpawnPitch ? FRotator(SpawnPitchDegrees, 0.f, 0.f) : FRotator::ZeroRotator;
+	const FTransform SpawnTransform(SpawnRotation, SpawnLocation);
 
 	RestartPlayerAtTransform(NewPlayer, SpawnTransform);
+
+	// READ THE POSE BACK OFF THE CONTROLLER, do not echo the switches. Both of
+	// the above are requests: the altitude is relative to a surface height this
+	// function had to probe for, and the pitch reaches the camera only via the
+	// controller (AVoxelEarthFlyPawn sets bUseControllerRotationPitch in its
+	// constructor, and AGameModeBase::FinishRestartPlayer is what copies the
+	// spawn transform's rotation into the control rotation). A pose that is
+	// accepted on the command line and then silently does not stick is the exact
+	// failure this capture path has already been burned by, so state the
+	// achieved altitude and pitch and let the log be the evidence.
+	//
+	// FRotator::NormalizeAxis on the pitch: GetControlRotation() returns it
+	// wrapped into [0,360), so a -25 deg request reads back as 335 and looks
+	// like it was ignored when it was not.
+	if (bHasSpawnAlt || bHasSpawnPitch)
+	{
+		const APlayerController* PC = Cast<APlayerController>(NewPlayer);
+		const APawn* PosedPawn = NewPlayer->GetPawn();
+		const FRotator AchievedRot = PC ? PC->GetControlRotation() : FRotator::ZeroRotator;
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Spawn pose APPLIED: column (%.1f, %.1f) m, ground top z=%.1f m, camera z=%.1f m ")
+		       TEXT("(= %.1f m above the surface), control pitch %.1f deg, yaw %.1f deg%s."),
+		       SpawnWorldX / 100.0, SpawnWorldY / 100.0, GroundTopUU / 100.0,
+		       PosedPawn ? PosedPawn->GetActorLocation().Z / 100.0 : SpawnLocation.Z / 100.0,
+		       SpawnHeightAboveSurfaceUU / 100.0,
+		       FRotator::NormalizeAxis(AchievedRot.Pitch), FRotator::NormalizeAxis(AchievedRot.Yaw),
+		       PC ? TEXT("") : TEXT(" (no PlayerController -- pitch NOT verified)"));
+	}
 }

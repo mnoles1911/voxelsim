@@ -41,10 +41,22 @@
 # deliberately -- -TimeOfDay 06:30 -- to photograph a sunrise; do not get one by
 # accident from a long settle.
 #
+# THE THIRD THING THAT MAKES CAPTURES LIE, AND IT LIED FOR EIGHT SHOTS. Until
+# -SpawnAltM/-SpawnPitch existed there was no altitude or pitch control anywhere
+# on this path: every capture put a pawn ON the terrain surface at the spawn
+# column, looking dead level, which frames the slope the pawn is standing on.
+# Eight such captures were reviewed together and the world was reasonably called
+# FLAT -- a world that spans 12.5 km vertically and contains a 6,125 m massif.
+# It took a stitched heightmap to establish that the terrain was fine and the
+# CAMERA was the problem. A ground-level shot is evidence about ground cover and
+# material, and it is NOT evidence about landform; if the question is landform,
+# pass -SpawnAltM and a negative -SpawnPitch, and say which in the writeup.
+#
 # Usage:
 #   tools\voxel-capture.ps1 -Name v10-alpine -SpawnAt '-65000,60000'
 #   tools\voxel-capture.ps1 -Name v10-wide  -SpawnAt '-84480,53760' -SettleSec 150
 #   tools\voxel-capture.ps1 -Name sunrise   -TimeOfDay 06:30
+#   tools\voxel-capture.ps1 -Name vista     -SpawnAt '7680,7680' -SpawnAltM 2000 -SpawnPitch -25 -SettleSec 150
 
 param(
     [Parameter(Mandatory=$true)][string]$Name,
@@ -54,6 +66,12 @@ param(
     # Long by default. The flight legs settle during a 90 s preflight, and this
     # is the one parameter where being wrong is silent.
     [int]$SettleSec = 120,
+    # THE VISTA CONTROLS (see the header). Metres ABOVE the terrain surface at
+    # the spawn column, and camera pitch in degrees with NEGATIVE looking down.
+    # Both default to 0, which passes NOTHING on the command line and therefore
+    # reproduces every pre-existing capture exactly: ground spawn, level camera.
+    [double]$SpawnAltM = 0,
+    [double]$SpawnPitch = 0,
     [int]$Width = 2560,
     [int]$Height = 1440,
     [int]$TimeoutSec = 420,
@@ -130,11 +148,25 @@ $argList = @(
     "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))",
     "-VoxelScreenshotAfter=$SettleSec"
 )
+# SAME InvariantCulture ARGUMENT AS -VoxelTimeScale ABOVE, and it bites harder
+# here: on a comma-decimal machine "-VoxelSpawnPitch=-22,5" reaches FParse::Value,
+# which stops at the comma, and the capture is taken at -22 deg while the script
+# reports -22.5. Appended only when non-zero so a default run's command line is
+# byte-identical to what it was before these switches existed -- the engine side
+# treats an absent switch and a zero one the same, but an unchanged command line
+# is the thing that makes that checkable.
+if ($SpawnAltM -ne 0) {
+    $argList += "-VoxelSpawnAltM=$($SpawnAltM.ToString([cultureinfo]::InvariantCulture))"
+}
+if ($SpawnPitch -ne 0) {
+    $argList += "-VoxelSpawnPitch=$($SpawnPitch.ToString([cultureinfo]::InvariantCulture))"
+}
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
 $argList += $ExtraArgs
 
 $sun = if ($TimeScale -eq 0) { "sun frozen $TimeOfDay $Date" } else { "sun MOVING x$TimeScale from $TimeOfDay $Date -- NOT reproducible" }
-Write-Host "capture '$Name' at $SpawnAt, settling ${SettleSec}s, ${Width}x${Height}, $sun" -ForegroundColor Cyan
+$pose = if ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0) { "alt +${SpawnAltM}m pitch ${SpawnPitch}deg" } else { "GROUND spawn, level camera (landform will NOT read)" }
+Write-Host "capture '$Name' at $SpawnAt, $pose, settling ${SettleSec}s, ${Width}x${Height}, $sun" -ForegroundColor Cyan
 $started = Get-Date
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 if (-not $p.WaitForExit($TimeoutSec * 1000)) {
@@ -180,6 +212,38 @@ if (Test-Path $LogPath) {
                        "terrain that had not streamed in. Raise -SettleSec, or check the " +
                        "spawn is inside the generated tile set, before believing the image.")
     }
+
+    # A HIGH `peak loaded` IS NOT EVIDENCE OF SETTLING, AND IT PASSED A CAPTURE
+    # THAT HAD NOT SETTLED. 2026-08-02, first desert vista: peak loaded=195,915
+    # against a healthy band of ~40-60k for these shots. Read as a settle check
+    # it looked like the BEST capture of the nine -- five times more terrain
+    # than any other. It was the opposite. At the shutter the world was at
+    # jobsInFlight=336, pendingJobs=941, unloaded=448,127: pure load/unload
+    # churn, and `peak` was measuring the churn. Re-shot with a 420 s settle it
+    # lands at 44,081, i.e. the honest number is the SMALLER one.
+    #
+    # `peak` and `final` cannot tell those two states apart, because a thrashing
+    # world and a large settled world both report big numbers. The queue depths
+    # can: a settled world has nothing in flight and nothing pending. So read
+    # them, and say so out loud rather than leaving it to whoever opens the log.
+    $q = @(Select-String -Path $LogPath -Pattern 'jobsInFlight=(\d+).*?pendingJobs=(\d+)') | Select-Object -Last 1
+    $un = @(Select-String -Path $LogPath -Pattern 'unloaded=(\d+)') | Select-Object -Last 1
+    if ($q) {
+        $inFlight = [int]$q.Matches[0].Groups[1].Value
+        $pending  = [int]$q.Matches[0].Groups[2].Value
+        $unloaded = if ($un) { [int]$un.Matches[0].Groups[1].Value } else { -1 }
+        Write-Host ("  settle: jobsInFlight={0} pendingJobs={1} unloaded={2}" -f
+                    $inFlight, $pending, $unloaded)
+        if ($inFlight -gt 0 -or $pending -gt 0) {
+            Write-Warning ("NOT SETTLED at the shutter: jobsInFlight=$inFlight pendingJobs=$pending. " +
+                           "The world was still streaming when the frame was taken, however large " +
+                           "'peak loaded' looks. Raise -SettleSec and re-shoot; do not judge this image.")
+        }
+    } else {
+        Write-Warning ("no jobsInFlight/pendingJobs line in the log -- 'peak loaded' ALONE cannot " +
+                       "distinguish a settled capture from a thrashing one. Treat this capture's " +
+                       "settle state as unknown.")
+    }
     # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not
     # streamed yet" and looks identical in the image: black gaps in otherwise
     # finished terrain. The fine tier is where this first showed up, because its
@@ -206,6 +270,22 @@ if (Test-Path $LogPath) {
         Write-Warning ("no 'VoxelSky clock RESOLVED' line in the log -- either this build predates the " +
                        "day/night clock or the sky subsystem did not initialise. The sun in this image is " +
                        "whatever the static rig was left at; do not compare it against a pinned capture.")
+    }
+
+    # THE POSE THE FRAME WAS ACTUALLY TAKEN FROM, read back rather than echoed
+    # from the switches -- same argument as the sky line above. -SpawnAltM is
+    # relative to a surface height the engine has to probe for, so "I asked for
+    # 2000 m" and "the camera was 2000 m above the terrain" are different claims,
+    # and the pitch only reaches the camera through the controller. The engine
+    # logs what it ACHIEVED; surface it here so nobody has to open the log.
+    $pose = @(Select-String -Path $LogPath -SimpleMatch 'Spawn pose APPLIED:') | Select-Object -First 1
+    if ($pose) {
+        Write-Host ("  pose: " + ($pose.Line -replace '^.*Spawn pose APPLIED: ', ''))
+    } elseif ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0) {
+        Write-Warning ("-SpawnAltM/-SpawnPitch were passed but no 'Spawn pose APPLIED' line is in the log -- " +
+                       "the switches did NOT reach the ordinary spawn path (an editor built before they existed, " +
+                       "or a fixture switch that poses its own camera took the spawn). This image is a GROUND " +
+                       "shot; do not read landform from it.")
     }
 
     $errs = Select-String -Path $LogPath -Pattern 'Fatal|Assertion failed' | Select-Object -First 3

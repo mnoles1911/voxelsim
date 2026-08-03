@@ -22,7 +22,7 @@ from rasterio.warp import transform as warp_transform
 from terrain_service.bake import pipeline as bp
 from terrain_service.bake import province as _province
 
-ROOT = pathlib.Path("D:/vox-int/terrain-service/data/earth_reference")
+ROOT = pathlib.Path(__file__).resolve().parents[2] / "data" / "earth_reference"
 WC = "D:/terrain-diffusion/data/global"
 G, C = bp.PRODUCTION, bp.CONSTANTS
 N = 512                      # 512 px at 30 m = 15.4 km, one tile's worth

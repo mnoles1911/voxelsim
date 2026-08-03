@@ -102,4 +102,4 @@ every province. Two cautions learned the hard way on 2026-08-02:
 
 Keep the images under ~10 MB; a 20.7 MB PNG failed to upload. `matplotlib` is
 not in the system python — use `D:\terrain-diffusion\.venv\Scripts\python.exe`
-with `PYTHONPATH=D:\vox-int\terrain-service`.
+with `PYTHONPATH=D:\voxelsim\terrain-service`.
