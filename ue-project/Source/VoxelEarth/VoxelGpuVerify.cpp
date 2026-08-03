@@ -70,7 +70,7 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 22;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 23;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
@@ -116,6 +116,28 @@ namespace
 	// corner where the 2x2 climate block straddles the CV threshold. It holds
 	// 2,133 SAVANNA columns against 1,963 TEMPERATE_FOREST, so the boundary
 	// between them is set by the faded-bilinear blend of the byte v22 moved.
+	//
+	// v23 DID NOT MOVE IT EITHER, AND FOR THE SAME KIND OF REASON. v23 caps the
+	// SUM of the two detail pools instead of each pool separately, and it is
+	// gated on `fine` -- so it can only change the FINE tier. Both fixture
+	// regions are COARSE tier (30000 mm pitch), so v23's branch is never taken
+	// here and the fold is arithmetically bound to be unchanged. Re-measured
+	// through UE's own RDG path anyway: b2b5d2f1044caa35, identical.
+	//
+	// So read this pin correctly. It confirms that v23 did not disturb the
+	// coarse tier -- which IS worth confirming, because the coarse path was
+	// supposed to be untouched and vxc_bench --radius 16 --digest independently
+	// agrees (cca9b86e78da033e, byte-identical to main). It says NOTHING about
+	// whether v23's fine-tier change is right; nothing in the CPU/GPU parity
+	// gate exercises it. The evidence for v23 is the drainage measurement
+	// (stranded area 35.5% -> 3.6% on the worst clean site) plus the
+	// same-ground terracing A/B, not this constant.
+	//
+	// A FINE-TIER FIXTURE IS THE GAP TO CLOSE. Like the savanna one above it
+	// belongs in kBandOnlyRegions, at a pitch <= kFineTierMaxPixelMm and on
+	// ground steep enough that the summed detail gradient actually exceeds the
+	// carrier -- otherwise the new cap is inert there too and the fixture would
+	// be decorative.
 	// vxc_gpu passes bit-exact on it; this path does not run it yet.
 	//
 	// Measured 2026-08-01 at kWorldGenVersion 22 by a standalone mirror of the
