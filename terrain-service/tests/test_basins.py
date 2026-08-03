@@ -384,3 +384,84 @@ def test_outlet_is_the_lowest_cell_on_the_rim():
             rim |= np.roll(np.roll(mask, dy, 0), dx, 1)
     rim &= ~mask
     assert float(z_open[oy, ox]) == pytest.approx(float(z_open[rim].min()), abs=1e-4)
+
+
+# --------------------------------------------------------------------------- extent
+
+
+def test_lake_extent_is_the_component_that_holds_the_seed_not_the_threshold():
+    """Two bowls under ONE bbox: the fill must return only the seeded one.
+
+    This is the whole reason a lake's footprint is a flood fill rather than
+    ``z_open <= surface``. A bbox large enough to contain two hollows -- or a
+    hillside that merely happens to lie below the water level -- passes the
+    threshold everywhere, and a client that drew that would flood dry ground.
+    """
+    zl, dl = _bowl(depth_m=20.0, cx=60.0, cy=100.0, radius=25.0, ramp=0.0)
+    zr, dr = _bowl(depth_m=20.0, cx=140.0, cy=100.0, radius=25.0, ramp=0.0)
+    z_open = np.minimum(bs.reopened_surface(zl, dl), bs.reopened_surface(zr, dr))
+    surface = 100.0 - 5.0                       # 5 m of water in each bowl
+    both = z_open <= surface
+    assert both[100, 60] and both[100, 140]     # the threshold takes both
+
+    m = bs.lake_extent_mask(z_open, (60, 100), surface,
+                            (0, 0, z_open.shape[1] - 1, z_open.shape[0] - 1))
+    assert m[100, 60]
+    assert not m[100, 140]
+    assert m.sum() < both.sum()
+    # ... and seeding the other bowl returns the other component, disjointly.
+    m2 = bs.lake_extent_mask(z_open, (140, 100), surface,
+                             (0, 0, z_open.shape[1] - 1, z_open.shape[0] - 1))
+    assert not (m & m2).any()
+    assert (m | m2).sum() == both.sum()
+
+
+def test_lake_extent_agrees_with_the_registry_area_it_ships_beside():
+    """A basin filled to its SPILL must cover exactly the area the registry
+    recorded for it.
+
+    The two numbers travel together on the wire (``area_m2`` in the survey,
+    ``bbox``+``seed``+``surface_mm`` in the table), and a footprint that
+    disagrees with its own row is a shoreline that does not close. Both are
+    8-connected components of the same surface, so this is exact, not close.
+    """
+    z, d = _bowl(depth_m=20.0, ramp=0.05)
+    acc = np.full(z.shape, 1.0e6, np.float32)
+    s = bs.survey_basins(
+        z_final=z, basin_depth=d, accumulation_m2=acc,
+        climate=_climate(z.shape, temp_c=5.0, precip_mm=3000.0),
+        cell_m=CELL_M,
+        filt=bs.BasinFilter(min_depth_m=1.0, min_area_m2=0.0,
+                            exclude_spanning=False, require_above_sea=False))
+    b = s.basins[0]
+    assert b.kind == bs.KIND_LAKE_OVERFLOWING          # so surface == spill
+    m = bs.lake_extent_mask(bs.reopened_surface(z, d), b.seed_px, b.surface_m,
+                            b.bbox_px)
+    assert int(m.sum()) == b.area_cells
+    assert float(m.sum()) * CELL_M ** 2 == pytest.approx(b.area_m2)
+
+
+def test_lake_extent_of_a_dry_basin_is_empty_rather_than_an_error():
+    """A playa's ``surface_m`` is its floor, so nothing is at or below it minus
+    epsilon. That is an answer, not a failure -- the client must be able to ask
+    about every registered basin, including the dry ones."""
+    z, d = _bowl(depth_m=20.0, ramp=0.05)
+    z_open = bs.reopened_surface(z, d)
+    fy, fx = np.unravel_index(int(np.argmin(z_open)), z_open.shape)
+    floor = float(z_open[fy, fx])
+    assert not bs.lake_extent_mask(z_open, (fx, fy), floor - 0.001).any()
+    # Exactly AT the floor is one cell, not zero: the datum is inclusive.
+    assert bs.lake_extent_mask(z_open, (fx, fy), floor).sum() >= 1
+
+
+def test_lake_extent_is_clipped_by_the_bbox_it_is_given():
+    """The bbox is not decoration: it bounds the fill, so a decoder cannot be
+    walked across the tile by a corrupt seed and a high surface."""
+    z, d = _bowl(depth_m=20.0, ramp=0.0)
+    z_open = bs.reopened_surface(z, d)
+    full = bs.lake_extent_mask(z_open, (100, 100), 95.0)
+    clipped = bs.lake_extent_mask(z_open, (100, 100), 95.0, (90, 90, 110, 110))
+    assert clipped.sum() < full.sum()
+    assert not clipped[:90].any() and not clipped[111:].any()
+    with pytest.raises(ValueError):
+        bs.lake_extent_mask(z_open, (10, 10), 95.0, (90, 90, 110, 110))

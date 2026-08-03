@@ -16,6 +16,7 @@
 #include "voxelcore/amplifier.h"
 #include "voxelcore/bytes.h"
 #include "voxelcore/caverns.h"
+#include "voxelcore/lakes.h"
 #include "voxelcore/mesher.h"
 // W4 shallow water (docs/adr/0004-swe-fixed-point-coupling.md). This include is
 // the first one anywhere in the repo: swe.h shipped complete, tested and
@@ -174,8 +175,31 @@ struct FVoxelWaterImpl
 			  // the column's flood level" -- and WaterMobilizer applies the other
 			  // half (is the cell actually open air) itself, so this callback
 			  // stays a pure worldgen query.
+			  // BAKED LAKES JOIN HERE AND NOWHERE ELSE (watershed plan §5.1,
+			  // work item 4). A baked lake datum has the SAME SHAPE as the
+			  // cavern flood level this callback already answers -- "water
+			  // fills open air below this millimetre level in this column" --
+			  // so the whole lake feature is one more term in this expression
+			  // and NOT a second mechanism. Everything downstream is
+			  // inherited: unmobilized lake water is a wall, digging the shore
+			  // fires NotifyTerrainVoxelsCleared -> mobilizeEditRegion, fill
+			  // replicates as diffs, the ledger audits to zero, and
+			  // IsUnderwaterAtWorld (work item 1) starts answering for lakes
+			  // with no second predicate written anywhere.
+			  //
+			  // vxc::implicitWaterFill is the composition itself, in
+			  // voxelcore/lakes.h rather than inline here, so the binding site
+			  // and tests/test_lakes.cpp cannot express it differently. It is
+			  // also what adds the PARTIAL TOP FILL: the topmost water voxel
+			  // carries surfaceMm's sub-voxel remainder, so the surface sits
+			  // AT the datum instead of snapping to the 10 cm lattice.
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
-			  { return vxc::cavernFloodedAt(Amp.columnCached(vx, vy).cavern, vz) ? uint8_t(255) : uint8_t(0); },
+			  {
+				  const vxc::ColumnSample& Col = Amp.columnCached(vx, vy);
+				  return vxc::implicitWaterFill(vz, Col.surfaceMm,
+				      Water->waterSurfaceMmAtVoxel(vx, vy),
+				      vxc::cavernFloodedAt(Col.cavern, vz));
+			  },
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
 			  { return Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; })
 		// NOT the bare terrain query: makeSolidFn() layers the implicit-water
@@ -201,6 +225,27 @@ struct FVoxelWaterImpl
 	// column accessor on UVoxelWorldSubsystem, which its owner must add.
 	vxc::SyntheticTileSampler Tiles;
 	vxc::Amplifier Amp;
+
+	// BAKED LAKES, and the reason this is a pointer to an interface rather
+	// than a LakeSampler. A LakeSampler needs a vxc::FineTileSampler&, which
+	// this process owns nowhere: the fine tier is streamed by
+	// FVoxelFineTileStreamer (VoxelFineTileStreamer.h), which keeps its
+	// sampler PRIVATE behind an FRWLock and exposes only an ITileSampler proxy
+	// -- correctly, because FineTileSampler is not safe for concurrent
+	// queries. So the seam is here and the injection is a host decision.
+	//
+	// WHAT IS AND IS NOT DONE, stated plainly rather than left as a TODO
+	// nobody reads: the composition, the extent rule, the datum and the
+	// partial fill are all shipped and tested (voxelcore/lakes.h,
+	// tests/test_lakes.cpp, and a cross-language fixture against the bake's
+	// own definition). What is NOT done is handing this member a real
+	// LakeSampler, which needs FVoxelFineTileStreamer to expose its sampler
+	// under the same lock its proxy already takes. Until it does, this is a
+	// NullWaterSampler and the client behaves EXACTLY as it did before --
+	// no lake, no regression, and no pretence that there is one.
+	//
+	// MUST outlive Mob: the ImplicitFn captures `this` and dereferences it.
+	std::unique_ptr<vxc::IWaterSampler> Water = std::make_unique<vxc::NullWaterSampler>();
 
 	// MUST be declared before CA: makeSolidFn() hands the CA a callable that
 	// captures the mobilizer, so the mobilizer has to outlive it.

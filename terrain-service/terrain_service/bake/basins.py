@@ -66,6 +66,7 @@ __all__ = [
     "aridity_index",
     "reopened_surface",
     "depression_components",
+    "lake_extent_mask",
     "SEA_LEVEL_M",
     "BasinSurvey",
     "hypsometry",
@@ -270,6 +271,68 @@ def depression_components(z_open: np.ndarray) -> tuple[np.ndarray, np.ndarray, i
     labels = np.zeros(z.shape, dtype=np.int32)
     n = _label8(mask, labels)
     return labels, filled, n
+
+
+def lake_extent_mask(
+    z_open: np.ndarray,
+    seed_px: tuple[int, int],
+    surface_m: float,
+    bbox_px: "tuple[int, int, int, int] | None" = None,
+) -> np.ndarray:
+    """Which cells a lake actually covers, from the four numbers on the wire.
+
+    THIS IS THE DEFINITION OF A LAKE'S FOOTPRINT and it deliberately has no
+    other inputs than a basin table row (``seed_px``, ``surface_mm``,
+    ``bbox_px``) and the re-opened ground. The client's ``IWaterSampler``
+    answers the same question at a single column; a world map answers it over
+    a raster; both must agree, so the rule lives here once:
+
+        the 8-connected component of {z_open <= surface_m}, clipped to the
+        basin's bbox, that contains the basin's seed cell.
+
+    THE THRESHOLD ALONE IS NOT ENOUGH, which is why this is a fill and not a
+    comparison: two basins can share a bbox, and any hillside below the water
+    level but outside the bowl also passes ``z_open <= surface_m``. The seed
+    is the deepest cell of the component the registry recorded, so the fill
+    can only ever return that component.
+
+    EIGHT-CONNECTED, matching ``depression_components``. Four would be the
+    better physics -- water does not squeeze through a diagonal pinch -- but
+    the registry's ``area_m2`` was measured on the 8-connected component, and
+    an extent that disagrees with the area on its own wire row is a bug that
+    only shows up as a shoreline that does not close. Physics loses to the one
+    definition, on purpose.
+
+    Returns a bool array shaped like ``z_open``. A basin whose ``surface_m``
+    is at or below its floor (a dry playa) returns all-False, which is the
+    right answer and not an error.
+    """
+    z = np.asarray(z_open, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"z_open must be 2-D, got {z.shape}")
+    h, w = z.shape
+    sx, sy = int(seed_px[0]), int(seed_px[1])
+    if not (0 <= sx < w and 0 <= sy < h):
+        raise ValueError(f"seed {seed_px} is outside the {w}x{h} grid")
+    if bbox_px is None:
+        x0, y0, x1, y1 = 0, 0, w - 1, h - 1
+    else:
+        x0, y0, x1, y1 = (int(v) for v in bbox_px)
+        if x1 < x0 or y1 < y0:
+            raise ValueError(f"inside-out bbox {bbox_px}")
+        x0, y0 = max(x0, 0), max(y0, 0)
+        x1, y1 = min(x1, w - 1), min(y1, h - 1)
+        if not (x0 <= sx <= x1 and y0 <= sy <= y1):
+            raise ValueError(f"seed {seed_px} is outside its bbox {bbox_px}")
+    out = np.zeros((h, w), bool)
+    sub = z[y0 : y1 + 1, x0 : x1 + 1]
+    wet = np.ascontiguousarray(sub <= np.float32(surface_m))
+    if not wet[sy - y0, sx - x0]:
+        return out
+    labels = np.zeros(wet.shape, np.int32)
+    _label8(wet, labels)
+    out[y0 : y1 + 1, x0 : x1 + 1] = labels == labels[sy - y0, sx - x0]
+    return out
 
 
 @flow._jit(cache=True)
