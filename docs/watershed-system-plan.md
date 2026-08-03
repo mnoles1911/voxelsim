@@ -437,21 +437,59 @@ reading:
    `708f5a4`: 4,225 candidates, 23 ticks, 0 empty.
 
 **And a third thing this section does not account for at all: a still water
-surface does not render.** `ApplyWaterBrickPooled` puts the brick's foam
-activity in `ChunkParams.y`, the vertex factory writes that straight into
-vertex colour A, and the implicit path passes `Activity = 0` — correctly, since
-still water has no foam. But A is what makes water visible in `M_WaterVoxel`:
-with `Activity = 0` a provably complete, correctly placed 4,225-brick sheet
-2.4 m under the camera is invisible (`lake-still-water-activity0.png`), and the
-same frame with `Activity = 1` is covered edge to edge
-(`lake-still-water-activity1.png`). That A/B is a diagnostic, not a fix —
-shipping `Activity = 1` would put whitewater on every still lake, which is the
-thing the activity signal exists to prevent. **This affects every implicit
-water surface, not just baked lakes: cavern lakes are static and pass
-`Activity = 0` too.** The fix is a material change in `M_WaterVoxel` (give
-water a base appearance that does not depend on the foam channel), which is a
-`.uasset` authoring decision and deliberately not guessed at here. Work item 4
-is NOT complete until it lands, and work item 5 stays unstarted behind it.
+surface has no SURFACE.** It renders — it always did — but as a flat tinted
+film with no view-dependent term, which reads as haze over the ground rather
+than as water.
+
+**Correction to what this row said before (W6).** It previously claimed that
+vertex colour A — the foam activity — "is what makes water visible in
+`M_WaterVoxel`", so that an `Activity = 0` sheet drew nothing. That is not what
+the graph does. Foam is a `LinearInterpolate` layered on top of an already
+complete colour and opacity, so with foam at 0 the material still outputs
+`lerp(0.55, 0.72, depth01)` opacity — it cannot reach zero. The A/B that
+produced the claim compared `Activity = 0` against `Activity = 1` and **never
+took a no-water control**, so "different from the foamed frame" was read as
+"absent".
+
+The control was taken at W6, same pose, same settle, same frozen sun, with
+`M_WaterVoxel` reduced to `Opacity = 0`:
+
+| frame | mean RGB | vs no-water control |
+| --- | --- | --- |
+| no-water control | (215.6, 207.0, 196.2) | — |
+| `Activity = 0` (shipped) | (155.6, 152.5, 149.6) | mean abs diff **60.0**, 99.99% of pixels >25 |
+| `Activity = 1` (foam) | (207.0, 200.5, 190.1) | mean abs diff 21.9 |
+
+The still sheet darkens the whole basin by ~60 levels. It is the **`Activity = 1`
+frame that is closer to bare terrain**, because the foam is near-white and so is
+this terrain. Two further facts from the same wave: an unlit probe material
+proved the sheet rasterises and fills the frame, and that probe read back
+`VertexColor.A = 0.000`, `AO = 0.50`, `depth01 = 0.55` — so `Activity` does
+arrive as 0, and nothing was ever gating visibility on it.
+
+**The real fix, and what landed.** Still water needed a view-dependent term, not
+a foam-independent one — it already was foam-independent. `create_water_voxel_material.py`
+now gives it a Fresnel-weighted sky reflection and an analytic sun glint off
+`MPC_VoxelSky.SunDirection`, with the same Fresnel folded into opacity so the
+surface is transparent looking down and closes up at a grazing angle. Foam
+remains a lerp on top and now also suppresses the reflection, since froth does
+not mirror. Measured at the same site, the far-versus-near blueness contrast
+that a surface produces goes from **+1.7 to +13.0**; the steep foreground is
+essentially unchanged, which is the point of a Fresnel term.
+
+**Still true, and still the reason this is wider than lakes:** every implicit
+water surface passes `Activity = 0`, so cavern pools took the same flat-film
+appearance and get the same surface now. The new terms carry no `Activity`
+dependence at all. **Not verified in a capture**, though: `-VoxelFloodTest` found
+no flooded cavern at the lake site, and the default cavern site's fine tiles are
+absent from this box's cache (tile `(-6,3)` at `s16`, `absentOnDisk=1`).
+Downgrading the fine-tier gate would have bought a frame at the cost of its
+reproducibility. One authored limitation goes with it: the sky term is gated on
+sun altitude, not on sky visibility, so an underground pool reflects a sky it
+cannot see — Fresnel-weighted, so near zero when looked down into.
+
+Work item 4's rendering half is now an owner judgement on the W6 captures, not
+an open defect; work item 5 stays unstarted behind that judgement.
 
 ### 5.3 Being in it
 
