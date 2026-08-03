@@ -758,6 +758,20 @@ def test_stage_sink_observes_every_sub_stage_and_changes_nothing():
         seen["B2a.filled"] - seen["B2d.incision_depth_m"],
         rtol=0.0, atol=1e-5,
     )
+    # The preserved lake-bed survey (docs/watershed-system-plan.md item 0):
+    # basin depth IS filled minus carrier+roughness, exactly, and the fill
+    # only ever raises, so it is non-negative everywhere. Its scalar
+    # reductions must agree with the stats the tile already ships, or the
+    # raster and the stats would describe two different bakes.
+    np.testing.assert_array_equal(
+        seen["B2a.basin_depth"],
+        seen["B2a.filled"] - seen["B0B1.carrier_rough"],
+    )
+    assert float(seen["B2a.basin_depth"].min()) >= 0.0
+    assert r.stats["basin_max_depth_m"] == float(seen["B2a.basin_depth"].max())
+    assert r.stats["basin_cells_frac"] == float(
+        (seen["B2a.basin_depth"] > 0.0).mean()
+    )
     r2 = run(None)
     np.testing.assert_array_equal(r.elevation_m, r2.elevation_m)
     np.testing.assert_array_equal(r.flow, r2.flow)

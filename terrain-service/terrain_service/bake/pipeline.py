@@ -2939,6 +2939,15 @@ def bake_padded_domain(
         "z": z,
         "carrier_plus_roughness": fine,
         "filled": filled,
+        # Depth of every depression B2a levelled into the carrier: the raster
+        # bake_tile previously reduced to four scalars and deleted. Kept as a
+        # first-class output because it is the LAKE-BED survey the watershed
+        # plan (docs/watershed-system-plan.md) sizes every decision on: where
+        # a basin was, how deep, and what fill level would flood it. Same
+        # bytes ship: this is observability, exposed via STAGE_SINK_FIELDS,
+        # never encoded. filled >= fine cell-for-cell (the fill only raises),
+        # so the field is non-negative by construction.
+        "basin_depth": np.asarray(filled - fine, dtype=np.float32),
         "eroded": eroded,
         "acc": acc64.astype(np.float32),
         "incision": depth,
@@ -2965,6 +2974,7 @@ def bake_padded_domain(
 STAGE_SINK_FIELDS: tuple[tuple[str, str], ...] = (
     ("B0B1.carrier_rough", "carrier_plus_roughness"),
     ("B2a.filled", "filled"),
+    ("B2a.basin_depth", "basin_depth"),
     ("B2c.accumulation_m2", "acc"),
     ("B2d.incision_depth_m", "incision"),
     ("B2d.incised", "eroded"),
@@ -3032,7 +3042,7 @@ def bake_tile(
     # incision it describes agree cell for cell.
     plane = flow_plane(acc, incision, gain, consts, elev_m=out["filled"][sl, sl])
 
-    basin_depth = out["filled"] - out["carrier_plus_roughness"]
+    basin_depth = out["basin_depth"]
     padded_basin = basin_depth > 0.0
     # THE SOUND CONDITION (see APRON_BLIND_SPOT): a filled flat whose whole
     # extent is inside the padded domain has its spill point inside the padded
