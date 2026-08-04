@@ -106,6 +106,19 @@ every multi-km reach by where its two ends sit:
   Ten of thirty-five still stop on a tile edge, including the 978.1 m reach,
   which still ends at 190.5 m, 6.66 km short of the sea, on the same seam.
 
+*** CORRECTED 2026-08-04 (B2). EVERYTHING FROM HERE TO THE END OF THIS SECTION
+*** IS WRONG. It measures the 165 m at the INTERIOR boundary, where nothing is
+*** injected -- the deposit lands on the PADDED border, 960 m upstream -- and it
+*** follows the wrong river: the col 5896 trunk (Q 2.316e7) is not the reach
+*** that loses 14.6%, which is a smaller river at col 2428 (Q 3.354e6). In the
+*** shipped bv12 bake that reach crosses the seam ONE FINE PIXEL (1.88 m) from
+*** where it left the upstream tile, so the position is already correct and the
+*** residual is magnitude. The fix named below -- snap to the maximum fine
+*** accumulation -- is measurably the WORST of the three candidate rules: the
+*** injection line is the outermost row of the child's own padded domain, so
+*** that accumulation carries no thalweg to snap to (p50 5.15 m2, max 2073 m2).
+*** DO NOT BUILD IT. See river-seam-position-scoping-2026-08-04.txt.
+
 WHY, AND IT IS A SECOND MECHANISM, NOT A LEFTOVER OF THE FIRST. D8 fixed the
 MAGNITUDE at the crossing. It cannot fix the POSITION. At the seam the coarse
 D8 trunk sits at 30 m column 886 (x = -157,740) and the fine trunk at column
