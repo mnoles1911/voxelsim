@@ -53,7 +53,16 @@
 // drives these runs and -VoxelScreenshotAfter owns the shutter, the framing
 // (-VoxelSpawnAltM/-VoxelSpawnPitch/-VoxelSpawnYaw) and the exit.
 
-namespace
+// NAMED, NOT ANONYMOUS, and VoxelSkyLadderFixture.cpp:892 explains why in its
+// own words -- this module builds UNITY, so an anonymous namespace here is not
+// file-local at all: its names land at global scope in a blob shared with other
+// fixtures. This file and VoxelSkyLadderFixture.cpp both declare `FRunRef` and
+// both have a `Run->...` vocabulary, so under an anonymous namespace the sky
+// ladder's unqualified `FRunRef` bound to THIS file's, and the module stopped
+// compiling with a dozen "is not a member of FOceanRun" errors pointing at the
+// other file. That is the same collision the sky ladder already fixed for
+// itself; this is the other half of it.
+namespace VoxelOceanCaptureDetail
 {
 constexpr double kUUPerM = 100.0;
 // One voxel is 10 UU. A sphere step below this leaves no gap between spheres
@@ -342,7 +351,13 @@ void Begin(FOceanRunRef Run)
 		}),
 		Run->ReportSeconds, false);
 }
-} // namespace
+} // namespace VoxelOceanCaptureDetail
+
+// Hoisted so the entry point below reads exactly as it would have with an
+// anonymous namespace, the same way VoxelSkyLadderFixture.cpp:894 does. The
+// names stay file-local in practice -- nothing outside this .cpp includes it --
+// but they are now distinct symbols under unity.
+using namespace VoxelOceanCaptureDetail;
 
 bool VoxelOceanCaptureFixture::StartFromCommandLine(UWorld* World)
 {
