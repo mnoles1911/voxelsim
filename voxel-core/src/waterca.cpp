@@ -1758,6 +1758,15 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
         for (int i = 0; i < 6; ++i) {
             const BrickKey n{a.x + kDx[i], a.y + kDy[i], a.z + kDz[i]};
             if (mobilized_.count(n) != 0 || noImplicit_.count(n) != 0) continue;
+            // The front gate (waterca.h "the front gate"). Checked HERE as well
+            // as at drain time so a permanently frozen reach beside live water
+            // cannot grow `pending_` without bound -- a refused brick is simply
+            // never queued. Refusing is safe for the same reason deferring is:
+            // a brick the front does not mobilize is still a wall.
+            if (!frontAllows(n)) {
+                ++frontGateRefusals_;
+                continue;
+            }
             pending_.insert(n);
         }
     }
@@ -1768,6 +1777,13 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
     while (done < maxBricks && !pending_.empty()) {
         const BrickKey k = *pending_.begin();
         pending_.erase(pending_.begin());
+        // Re-checked at drain time because the gate may have closed since this
+        // brick was queued (a cut logged while the queue was over budget), and
+        // the gate's answer at the moment of conversion is the one that counts.
+        // Dropping it costs no budget: it is a queue eviction, not a
+        // mobilization, and the seed loop above will re-queue it if and when
+        // the gate reopens while a neighbour is still active.
+        if (!frontAllows(k)) continue;
         mobilizeBrick(ca, k);
         ++done;
     }

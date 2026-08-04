@@ -1029,6 +1029,61 @@ public:
 
     size_t pendingFrontBricks() const { return pending_.size(); }
 
+    // --- the front gate (docs/watershed-system-plan.md §6.3.3) --------------
+    //
+    // WHY THIS EXISTS. `advanceFront` has NO LENGTH BOUND. It mobilizes the
+    // face-neighbours of every ACTIVE brick, and a freshly mobilized brick is
+    // filled and woken, so while the water it releases keeps MOVING the front
+    // keeps advancing. On a long implicit body with somewhere to drain, "keeps
+    // moving" holds all the way to the far end: a single 4-voxel shaft dug
+    // through a 25.6 m synthetic river's bed converts 100% of the reach, every
+    // brick and every unit, permanently (measured — see
+    // `waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain`
+    // and §6.3's M2). It is DRAINAGE, not disturbance, that runs away: the same
+    // front stops after one tick when there is nowhere for the water to go.
+    //
+    // WHAT IT IS. A caller-supplied predicate: true means "this brick may be
+    // mobilized by the FRONT". It is pure MECHANISM and carries no policy of
+    // its own — voxel-core neither knows nor asks why a brick is ineligible.
+    // The callers this was built for are §6.3.3's mobilization freeze (a reach
+    // the authority has decided to dry out by changing the datum instead of by
+    // converting it to voxels) and the ceiling below.
+    //
+    // WHAT IT MUST NEVER GATE, AND WHY. `mobilizeEditRegion` — the EDIT seed —
+    // is deliberately NOT gated and must never become so. The two seeds are not
+    // interchangeable (see "HOW THE FRONT ADVANCES" above): the edit seed is
+    // the only thing that responds to a player. Gate it and a player digs into
+    // a body of water and the dig silently does nothing, which is a far worse
+    // bug than the cost this gate exists to bound. The distinction is pinned by
+    // `waterca_front_gate_blocks_the_front_but_never_an_edit`.
+    //
+    // SAFETY. Refusing to mobilize can never leak water, by exactly the
+    // argument the per-tick budget already relies on: a brick the front does
+    // not mobilize is STILL A WALL (`makeSolidFn`), so its water is frozen, not
+    // duplicated and not lost. A gate is a permanent budget deferral, and the
+    // ledger cannot tell the difference.
+    //
+    // DETERMINISM. The gate is consulted on the authority only (`advanceFront`
+    // is authority-only already — see "DETERMINISM AND CLIENT/SERVER
+    // AGREEMENT"), and the caller owes the same purity the ImplicitFn owes: the
+    // answer must be a deterministic function of replicated authority state,
+    // never of wall-clock or of local frame rate. The gate itself is POLICY,
+    // not state: it is never persisted, never digested and never replicated —
+    // what replicates is the mobilized set the gate shapes.
+    //
+    // kWaterCAVersion is NOT bumped: no tick rule changes, and with no gate
+    // installed (the default) this is bit-for-bit the previous code path.
+    using FrontGateFn = std::function<bool(const BrickKey& k)>;
+    void setFrontGate(FrontGateFn gate) { frontGate_ = std::move(gate); }
+    void clearFrontGate() { frontGate_ = nullptr; }
+    bool hasFrontGate() const { return static_cast<bool>(frontGate_); }
+
+    // Times `advanceFront` declined a brick because the gate said no. This
+    // counts CONSIDERATIONS, not distinct bricks: a frozen reach beside live
+    // water is re-considered every call, so the number is a rate signal ("the
+    // gate is doing work"), not an inventory. Diagnostics only.
+    uint64_t frontGateRefusals() const { return frontGateRefusals_; }
+
     // --- ledger / audit -----------------------------------------------------
 
     // Units this mobilizer has moved out of the implicit field, and units it
@@ -1072,6 +1127,10 @@ private:
     // Scans `k`'s 512 cells; returns total implicit units present.
     uint64_t scanBrick(const BrickKey& k) const;
 
+    // The front gate's verdict for `k`: true (may mobilize) when no gate is
+    // installed. Consulted ONLY from advanceFront — see setFrontGate.
+    bool frontAllows(const BrickKey& k) const { return !frontGate_ || frontGate_(k); }
+
     // Bricks scanned and found to hold no implicit water. A pure negative
     // memo: it changes no answer, only the cost of re-asking, so it is never
     // persisted and may be dropped at any time (it is dropped wholesale on
@@ -1086,6 +1145,8 @@ private:
     mutable std::unordered_set<BrickKey, BrickKeyHash> noImplicit_;
     uint64_t debited_ = 0;
     uint64_t credited_ = 0;
+    FrontGateFn frontGate_;
+    uint64_t frontGateRefusals_ = 0;
 };
 
 // ===========================================================================

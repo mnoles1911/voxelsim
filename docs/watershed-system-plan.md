@@ -821,6 +821,21 @@ burst, which is precisely when the world can least afford it. Restoring the
 datum first means the returning river is *implicit*, and implicit water is
 free.
 
+**M4 (measured 2026-08-03, building 9a) — the hazard above only exists while
+the water is still moving, and this was predicted wrong.** The 9a release test
+was first written as "freeze the reach to a standstill, then lift the gate, and
+expect M2's runaway to resume". **It does not resume.** On C8b's harness a
+totally frozen reach settles at **tick 107** with **3** x-bricks converted (the
+dig's own halo); lifting the gate then leaves it at 3 **forever**, against the
+32 the ungated front ate. The reason is M1 restated: `advanceFront` is driven by
+the *active* set, so once the freed water stops there is nothing to seed from
+and the still-implicit river upstream is a wall again. Lifting the freeze
+mid-drain *does* reproduce M2 exactly, ledger included — so the freeze is a true
+deferral, not a loss, and the ordering rule above stands. It is simply narrower
+than it was drafted: it binds during drawdown, not after it. Both halves are
+pinned (`waterca_front_gate_release_mid_drain_reproduces_the_ungated_end_state`,
+`waterca_front_gate_release_after_settling_never_restarts_the_front`).
+
 The second hazard is that bricks mobilized during the dry spell — a player
 walked the dry bed and dug — hold no water and will not refill, leaving
 **scars exactly where players were**. This is the same defect as the
