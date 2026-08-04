@@ -176,3 +176,15 @@ target_link_libraries(vxc_bankprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_bankprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_riverribbonprobe: the far-field river producer over real tiles.
+# Counts (wet px -> centreline -> reaches -> simplified points), the width
+# distribution the bake actually drew, the screen-width table at 1/5/20 km with
+# the widening policy applied, and the datum-vs-amplified-ground headroom at the
+# centreline and at the widened edge. The numeric readout behind "can you see
+# the river from a vista". ---------------------------------------------------
+add_executable(vxc_riverribbonprobe riverribbonprobe.cpp)
+target_link_libraries(vxc_riverribbonprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_riverribbonprobe PRIVATE -Wall -Wextra -Werror)
+endif()
