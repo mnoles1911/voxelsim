@@ -85,7 +85,7 @@ struct FOceanRun
 	FTimerHandle ReportHandle;
 };
 
-using FRunRef = TSharedRef<FOceanRun, ESPMode::ThreadSafe>;
+using FOceanRunRef = TSharedRef<FOceanRun, ESPMode::ThreadSafe>;
 
 int32 ImplicitOceanCVar()
 {
@@ -128,7 +128,7 @@ int32 CarveBand(UVoxelWorldSubsystem& Terrain, double XUU, double YUU, double To
 	return Removed;
 }
 
-void RunSurvey(FRunRef Run)
+void RunSurvey(FOceanRunRef Run)
 {
 	UWorld* World = Run->World.Get();
 	UVoxelWorldSubsystem* Terrain = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -192,7 +192,7 @@ void RunSurvey(FRunRef Run)
 	LogWater(World, TEXT("survey"));
 }
 
-void RunPit(FRunRef Run)
+void RunPit(FOceanRunRef Run)
 {
 	UWorld* World = Run->World.Get();
 	UVoxelWorldSubsystem* Terrain = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -256,7 +256,7 @@ void RunPit(FRunRef Run)
 	}
 }
 
-void RunBreach(FRunRef Run)
+void RunBreach(FOceanRunRef Run)
 {
 	UWorld* World = Run->World.Get();
 	UVoxelWorldSubsystem* Terrain = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -312,7 +312,7 @@ void RunBreach(FRunRef Run)
 	LogWater(World, TEXT("breach post-dig"));
 }
 
-void Begin(FRunRef Run)
+void Begin(FOceanRunRef Run)
 {
 	if (Run->Mode == TEXT("survey"))
 	{
@@ -360,7 +360,7 @@ bool VoxelOceanCaptureFixture::StartFromCommandLine(UWorld* World)
 		return false;
 	}
 
-	FRunRef Run = MakeShared<FOceanRun, ESPMode::ThreadSafe>();
+	FOceanRunRef Run = MakeShared<FOceanRun, ESPMode::ThreadSafe>();
 	Run->World = World;
 	Run->Mode = bSurvey ? TEXT("survey") : Mode.ToLower();
 	if (SurveyRadius > 0.f)
