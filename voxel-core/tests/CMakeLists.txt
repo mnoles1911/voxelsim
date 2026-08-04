@@ -32,6 +32,7 @@ add_executable(vxc_tests
   test_sealevel.cpp
   test_lakes.cpp
   test_riverribbon.cpp
+  test_ocean.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

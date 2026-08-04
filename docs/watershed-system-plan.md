@@ -954,7 +954,7 @@ names pixels that mean something else.
   (`:3841-3850`, whose own log line ends *"NOT PERSISTED -- this is lost on
   reload."*). `kSetConveyance` has **no producer anywhere outside tests**.
 
-### 6.4 Ocean
+### 6.4 Ocean — DONE on this branch, except the captures
 
 Item 1 makes sea level one symbol (`kSeaLevelMm = 0` in `core.h`, mirrored to
 Python and HLSL by the existing constants-dump mechanism; `world_map.py:325`
@@ -965,6 +965,92 @@ proven equivalent), gives the sea real voxels only where touched, and makes
 "the plane shows through inland pits" fixable by testing the datum, not the
 camera. The 40 km visual plane stays for the far field.
 
+**What shipped, and the two corrections the work made to the paragraph above.**
+
+The term is `vxc::oceanSurfaceMmAt(groundMm)` in `lakes.h`, composed with the
+baked surface by `implicitWaterDatumMm`'s `max()` and consumed by the same
+`implicitWaterFill` lakes use. The sea is therefore *a lake whose datum is
+`kSeaLevelMm` and whose extent is every column whose **worldgen** ground lies
+below it*. `max()` rather than a precedence rule is what makes a river mouth
+one surface: at the mouth the reach's datum and the sea's **are the same
+number**, so the composition cannot introduce a step.
+
+*Correction 1: "`z < kSeaLevelMm` in open air" is not sufficient, and the
+missing half is the whole inland-pit fix.* The gate is the **column's worldgen
+ground**, not the voxel's z: a pit dug into land does not lower its column's
+worldgen ground, so the ocean term keeps answering "no sea here" however deep
+it is dug. Testing z alone would have flooded every inland pit with real
+voxels — a worse bug than the plane showing through one.
+
+*Correction 2: the reservoir was not "proven equivalent". It was proven
+wrong, three ways, and deleted.* `voxel-core/tests/test_ocean.cpp` is a
+**differential** test rather than the parity test this section asked for,
+because the two paths agree nowhere:
+
+| | Reservoir v0 | ocean term |
+|---|---|---|
+| cove cut through the coastal cliff | never settles: volume 358k → 610k fill units and **active bricks 536 → 758** between ticks 100 and 1500, still climbing; cove never reaches the datum | settles at tick 54, 197 bricks mobilized, surface 5 mm below the datum |
+| inland pit, dug in three ordinary passes | seeds a boundary cell on pass 3 and pins it at 255 **forever, in dry rock 50 voxels inland** | 0 bricks mobilized, 0 fill units |
+| deep puncture with headroom above it | stops at the puncture depth (its head is the pinned cell) | **also** stops at the puncture depth — see below |
+
+The first row is the one that matters most and was not anticipated anywhere:
+**under Reservoir v0 the sea is not water to the simulation at all.** Only the
+pinned breach cells were; the ocean beyond them is open air to the CA. So a
+breach did not *fill*, it *drained*, and the pinned cells fed it forever. The
+growing active-brick count is a live CPU leak behind every below-sea-level dig
+in the shipping build, hidden by the visual plane.
+
+**What the ocean term does *not* fix, recorded so the next person finds a
+measurement instead of a mystery.** A breach that requires water to **rise** —
+a tunnel punched into the sea at depth with headroom above it inland — stops at
+the puncture depth. The mobilized sea is already at hydrostatic equilibrium and
+therefore *inactive*, and `waterca.h`'s Phase C explores previously-dry headroom
+only through bricks in the **active** set. Diagnosis, not guess: the same dig
+against a sea small enough that the tunnel's volume perturbs its level (64×65
+voxels) *does* raise the shaft to the datum, settled at tick 8; against an
+unbounded sea it does not, settled at tick 5; and raising the front budget from
+64 to 4096 bricks/tick changes nothing, so it is not front starvation. **This
+belongs to item 10**, the CA's activity/budget half, not to item 8.
+
+**Rendering: the sea is deliberately kept out of the implicit candidate
+sweep.** `RefreshImplicitWater` is *not* given the ocean as a third ceiling,
+and that is this section's own "real voxels only where touched" rather than an
+omission. The 40 km plane already draws the untouched sea on the same datum; a
+voxel surface meshed under it would be a second coplanar translucent surface —
+the exact defect measured this month between the near-field disc and the
+far-field sheet, which agreed in geometry and disagreed in tone (+44.5 vs +76.8
+blueness) because one is a single surface and the other a shell the view ray
+crosses twice. It would also be tens of thousands of candidate bricks at any
+shore. A **mobilized** sea brick is unaffected: the CA meshes it, so the sea
+gets voxels exactly where a player has been.
+
+**`voxel.Water.ImplicitOcean`** (default 1) is the control, and it refuses to
+change under live water rather than silently reassigning cell ownership. Note
+that 0 is *not* Reservoir v0 — that does not come back.
+
+**The river mouth, and what item 7's rebase will and will not fix.** Item 7's
+in-flight `CompositeWaterSampler` composes lakes and rivers by *the same
+`max()`*, so the three terms are one max chain and the ocean stacks on top with
+no merge conflict of substance. That settles the **geometry** at a mouth, and
+settles it well: a reach's datum is bed + depth, so upstream of the mouth the
+river wins and in the estuary the sea does, and because `max()` is continuous
+there is no step where they cross — the mouth drowns flat at the datum, which
+is what an estuary is.
+
+It does **not** settle the tone, and item 7 will move the boundary rather than
+remove it. Because the sea is deliberately not meshed and a river reach *is*,
+a river mouth becomes precisely the place where near-field **voxel** water
+meets the far-field **plane** — one translucent surface against a shell the
+view ray crosses twice. That is the same pairing that measured +44.5 against
++76.8 blueness this month, and it will land in the exact frame the owner most
+wants to look at. **Measure that frame before designing anything for it**; the
+fix, if one is needed, is the same shape as the lake sheet's `subtractRect`
+handover — cut the plane where the voxels draw — and should not be built on
+a prediction.
+
+**Still outstanding, and it needs the editor:** every visual claim. The
+inland-pit capture; the breach frame with its `voxel.Water.ImplicitOcean 0`
+control; and the plane/voxel-water tone above.
 ### 6.5 The return path: what stops CA water accumulating without bound
 
 §6.3 is about how the world *responds* to an edit. This section is about what
@@ -1400,8 +1486,16 @@ to river reaches. Depends on #43 (client zstd) for shippable size.
 reaches; walk-the-river capture series source→mouth; spread of wet-reach
 fraction by province.*
 
-**8. Ocean unification (§6.4).** *Verified: breach parity test old-vs-new
-path; inland-pit capture.*
+**8. Ocean unification (§6.4) — DONE on this branch except the captures.**
+The sea is the third term of the water ImplicitFn (`oceanSurfaceMmAt` /
+`implicitWaterDatumMm` in `lakes.h`); Reservoir v0 is deleted, taking the last
+two bare sea-level literals in `ue-project` with it (item 1's "one symbol" had
+never covered that tree — `test_sea_level_contract.py` now does).
+*Verified: `voxel-core/tests/test_ocean.cpp` — eleven cases, each with its
+ocean-term-off control. The asked-for parity test could not be written: the
+two paths agree nowhere, so it is a differential test and §6.4 carries the
+table. Outstanding, needs the editor: the inland-pit capture, a breach frame
+with its control, and the plane/voxel-water tone at a breach.*
 
 **9. The edit-response layer (§6.3).** Rewritten 2026-08-03 after M1/M2 were
 measured; the old one-line item assumed a graph build that the shipped flow
