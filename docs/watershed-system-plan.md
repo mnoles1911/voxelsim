@@ -582,14 +582,362 @@ is refused by content addressing instead of desyncing quietly.
 
 | edit | mechanism | new work |
 |---|---|---|
-| **mine a lake shore / drain a lake** | existing: edit → `mobilizeEditRegion` → CA drains through the cut, diffs replicate, front self-limits | none for the session; **ADR-0005's UE-side hook** (open) for "stays drained across reloads" — without it the implicit field refills on load. Same blob doubles as the late-joiner snapshot |
+| **mine a lake shore / drain a lake** | existing: edit → `mobilizeEditRegion` → CA drains through the cut, diffs replicate, front **does *not* self-limit — see §6.3 M2** | none for the session; **ADR-0005's UE-side hook is DONE** (`VoxelWaterSubsystem.cpp:2481, 2513`, wired at `:847, :890`), so "stays drained across reloads" already holds. The blob is *not* yet the late-joiner snapshot: join-sync carries the compacted edit log only, and water arrives over subsequent `MulticastWaterDiffs` rounds (§6.3.7) |
 | **mine a channel between basins** | same as above — water follows the cut because the CA routes it; when it settles in the lower basin it *stays CA water* (mobilization is one-way) | acceptable v1; a "re-settle to datum" compaction (CA → implicit demotion for settled bricks matching a datum) is a later optimisation, listed but not required |
-| **dam a river** | v1: player builds a wall; nearby water is already mobilized (their edits touched it), CA pools behind the dam locally — real, visible, replicated | v2: a detector from sustained blockage to `kSetConveyance`, the diff **into the edit log** (they are world changes; `rivernet.h:127-149` designed them to replay byte-identically), and downstream drying driven by graph stage as a bounded per-reach *override* on the implicit datum. The graph must be built from the **baked flow plane** (`buildFromFlowPlane`, new), not `buildFromFlowAccumulation`'s local D8 — see §9.3 — and persisted (today it is per-client, 1.44 km, unpersisted) |
+| **dam a river** | v1: **nothing happens.** Measured, §6.3 M1: a wall across an undisturbed baked river settles in 1 tick and the upstream stage does not rise by one voxel, because a baked river is a *datum*, not a flow, and the untouched part of it is a wall to the CA. The row below used to claim "CA pools behind the dam locally"; that is true only of water already in motion | v2 = **§6.3**, which is bigger than this row assumed: it must supply throughflow at the deviation (M1) *and* bound mobilization (M2), not only dry the downstream. Detector → cut record **into the edit log** (`rivernet.h:127-149` designed the diffs to replay byte-identically; the log needs a record-kind byte, `editlog.h:26-31`), plus the two-component freeze/surface override. The graph is **not** the shared state and `buildFromFlowPlane` is not buildable from the shipped plane — no flow direction is on the wire (§6.3.4, §6.3.8). Today's graph is per-**authority-process** (refused on `NM_Client`, `VoxelWaterSubsystem.cpp:3652-3664`), 1.44 km, unpersisted, and its diffs are drained and discarded (`:3841-3850`) |
 | **divert a river** | `kDivertChannel`/`promoteChannel` exist and replay; the flux detector exists in `rivercouple.h` | same edit-log routing; enable only after v2 graph work |
 | **place water** | `SpawnWaterAt` funnel exists, authority-checked | unbind the `1` key from `voxel.Water.BucketFill`; make it an item with a budget |
 
 SWE stays exactly where it is: standalone-only, non-authoritative, cosmetic
 on top (`VoxelWaterSubsystem.cpp` refuses it off `NM_Standalone`).
+
+### 6.3 The edit-response layer
+
+This section answers four questions that were asked directly: what happens
+when a player dams a multi-kilometre river; whether the upstream body rises
+and floods around the dam; what happens when a player digs a canal and
+re-routes the river; and whether the old downstream channel is permanently
+rerouted and slowly dries after its water reaches the sea.
+
+**Two of the four answers changed when they were measured.** Both
+measurements are now pinned as tests in `voxel-core/tests/test_waterca.cpp`
+(section C8b), because the drafts of this section that preceded them were
+wrong in opposite directions.
+
+#### 6.3.1 Ground truth, measured
+
+**M1 — A dam on an undisturbed baked river impounds nothing at all.**
+(`waterca_mobilize_a_dam_on_an_undisturbed_river_impounds_nothing`.) A wall
+built across a synthetic baked river settles in **1 tick**, mobilizes **5
+x-bricks of 32**, and the water standing immediately upstream is at *exactly*
+the baked surface — it does not rise by one voxel, against a crest eight
+voxels above it.
+
+The reason is structural, not a tuning failure. A baked river is a *datum*,
+not a flow: every part of it the player has not touched is a **wall** to the
+CA (`waterca.h:887-894`), and the CA has no discharge to impound. The
+intuition this section was first drafted on — "the CA is volume-conserving,
+so water pools behind a wall and spills over the lowest lip" — is true of
+water that is *moving*, and the shipped tests that support it
+(`waterca_container_fills_bottom_up_never_escapes_walls`,
+`waterca_wake_region_settled_pool_flows_through_a_carved_breach`) all pour or
+breach. None of them dam a datum. **So the upstream half of "dam a river" has
+no mechanism behind it either, and §6.3 cannot be only a downstream-drying
+layer.**
+
+**M2 — One edit that lets a baked river drain mobilizes the entire river.**
+(`waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain`.)
+A single 4-voxel-wide shaft dug through the bed near the downstream end
+converts **100 % of the reach** — every x-brick, every unit of implicit water
+— and settles. `advanceFront` mobilizes the face-neighbours of every *active*
+brick (`waterca.h:1021-1028`), a freshly mobilized brick is filled and woken,
+so while the released water keeps moving the front keeps advancing. **There is
+no length bound anywhere in that loop.** It terminates when the water stops,
+which on a sloping river with an open drain means: at the source.
+
+M1 and M2 together are the whole problem. It is *drainage*, not disturbance,
+that makes mobilization run away — and the run-away is unbounded while the
+thing everyone assumed worked does not happen at all.
+
+**M3 — What an accumulated river costs.** Measured on the same synthetic
+reach (25.6 m long, 0.4 × 0.4 m channel) by serializing the real
+`WaterState` blob before and after:
+
+| | savegame blob | mobilized bricks | stored CA bricks | active bricks |
+|---|---|---|---|---|
+| untouched | **44 B** (header only) | 0 | 0 | 0 |
+| after ONE drain edit | **1 820 B** | 44 | 32 | **0** |
+
+Normalised: **10.7 mobilized bricks per metre of river per m² of channel
+cross-section.** The geometric floor for a perfectly packed body is ~2
+bricks/m/m² (a `WaterBrick8` is 512 cells at 10 cm; `core.h:238`), so a
+thin channel like this one is a ~5× worst case for packing. *The following is
+arithmetic on that measurement, not a measurement:* a realistic 20 m × 2 m
+river is 40 m² of cross-section, i.e. **80–430 permanent bricks per metre**,
+i.e. **0.04–0.22 MB of resident `WaterBrick8` per metre**. A 10 km reach is
+**0.4–2.2 GB**. That is the number that governs this design.
+
+Note the last column. `active` is **0** — it has settled, so it costs no tick
+time at all. The cost is not CPU. It is memory, savegame and the late-joiner
+snapshot, and it is permanent. See §6.5.
+
+#### 6.3.2 What this means for the four questions
+
+* **Dam a river — does the upstream body rise and flood around?** *Today, no
+  — nothing happens (M1).* With discharge supplied at the deviation, **yes,
+  and correctly**: a probe that injects throughflow at the head of the same
+  reach shows the stage rising monotonically behind the dam and spilling
+  through a notch cut in one side — the **lowest lip**, not the crest.
+  Path-of-least-resistance really is physics and not a special case
+  (`waterca.h` Phase C, hydrostatic level equalization, `:145-293`), but only
+  once something is flowing. *This probe is in the scratchpad, not committed:
+  it is evidence that the proposed mechanism produces the wanted behaviour,
+  not a pinned contract.*
+* **Does the downstream channel dry up?** Today it dries *by accident and
+  unaffordably* — the front eats it (M2) and it drains as CA water. The
+  design below makes it dry *on purpose and for free*, by changing what the
+  datum says rather than by converting the river to voxels.
+* **Canal / re-route — permanently rerouted?** The **old** channel: yes,
+  cheaply, by the same override. The **new** channel: it runs as ordinary CA
+  water for its whole length, which is affordable only because a
+  player-dug canal is tens of metres. It does **not** become a
+  baked-quality river to the sea — see the honest limit in §6.3.8.
+* **Does the old channel dry slowly, after its water reaches the sea?** Yes —
+  §6.3.5 makes that a bounded, deterministic ramp.
+
+#### 6.3.3 The mechanism: two overrides, applied at different speeds
+
+The plan's own §4.4 rule stands: *baked = equilibrium, runtime = deviation
+from equilibrium, only where players cause it.* An override does not populate
+water and does not add a second mechanism (F5). It changes the **input** to
+the one shipping mechanism — the `ImplicitFn` bound at
+`VoxelWaterSubsystem.cpp:351-363` — for a bounded set of pixels a player's
+edit named.
+
+It has **two independent components, and separating them is the load-bearing
+idea**:
+
+1. **The mobilization freeze — instantaneous, invisible, and it is the
+   bound.** From the tick the cut is logged, bricks along the affected reach
+   are ineligible for *activity-driven* mobilization. This stops M2 dead.
+   It changes nothing a player can see, because `implicitFillAt` still
+   returns the full datum and the river still renders.
+2. **The surface override — gradual, visible, and it is the look.** A
+   per-pixel reduction of the water-surface datum, ramped over time, which is
+   what makes the reach *dry*.
+
+If the two were fused, the ramp would be the enemy of the bound: during the
+minutes the surface takes to fall, the front would mobilize the reach anyway,
+and those bricks — already CA-owned — would never dry (`implicitFillAt`
+returns 0 for a mobilized brick, `waterca.h:984-987`). Freezing first and
+draining slowly is the only order that works.
+
+**The freeze must gate `advanceFront` only, never `mobilizeEditRegion`.**
+`waterca.h:904-918` names the two seeds; the edit-driven one must always fire
+or digging into a drying river would silently do nothing. This is the one
+genuinely new hook in voxel-core: a caller-supplied
+`bool(const BrickKey&)` predicate consulted by `advanceFront`, roughly ten
+lines. It moves no water, so it is not a second water mechanism.
+
+#### 6.3.4 What a reach is, and why the graph is not the shared state
+
+**A reach is not identified by a graph node id.** Segment and node ids in
+`rivernet.h` are vector indices assigned by a build over caller-supplied
+`RegionBounds` (`rivernet.h:19-27`); two peers that swept different regions
+get different ids for the same water. **That is the desync, and it is
+avoidable by not shipping ids at all.**
+
+Nor can a client re-derive the affected reach. The shipped flow plane carries
+**magnitude only** — bits 0–4 are `log2(acc m²)`, plus three flag bits
+(`tile_codec.py:194-199`). **There is no flow-direction raster on the wire**;
+D8/MFD receivers exist only inside the bake (`flow.py:215,247`). A client
+literally cannot walk downstream.
+
+So the authority resolves the course and **ships the decision, not the
+evidence** — exactly the argument `rivernet.h:136-140` already makes for
+`kDivertChannel`: *"replay must not have to re-derive the course from live CA
+state that no longer exists. The course IS the decision."* The same reasoning
+applies verbatim, and it also disposes of tile residency and tile-version
+skew in one move.
+
+**The record.** One new edit-log record kind:
+
+    cutPx, cutPy      i32 x2   the pixel the blockage sits on (absolute pixel space)
+    startTick         u64      authority fixed-step counter at the cut
+    rampTicks         u32      local drawdown duration
+    releaseFactor     u8       0 for a cut; the factor at release for a release record
+    n                 u16      course length in pixels
+    then n x { dir u8, surfaceDeltaMm i16 }   3 B per pixel
+
+`dir` is a D8 index reconstructing pixel *k* from pixel *k−1*, so the course
+costs 3 B/pixel and needs no flow data on the client. `surfaceDeltaMm` is the
+**final** dry-state drop at that pixel, computed once by the authority; the
+client only interpolates in time and needs no hydrology at all. A 5 km reach
+at 30 m/px is 167 pixels ≈ **500 B**; the hard cap below is ~1.5 KB per cut.
+
+**Why the delta tapers on its own.** The authority computes it from the flow
+plane it *does* have: the fraction of discharge lost at pixel *p* is
+`acc_cut / acc_p`, which falls as tributaries rejoin below the dam. So the
+override recovers toward zero downstream **causally and for free**, and the
+reach ends where the loss stops mattering. The surface itself follows
+`channel.h`'s own law (`waterLineMm = bed + depth·3/4`, `channel.h:263-270`)
+rather than a new one — consistent with §9.3's "reuse `channel.h`'s geometry
+and laws".
+*Unknown:* the flow byte is `log2` in 5 bits, so `acc_cut/acc_p` is quantized
+to powers of two and the taper may look stepped. Unmeasured. If it does, the
+authority can read the un-quantized `acc` from its own `.vxfl` superblocks
+(`pipeline.py:1793-1887`) instead — it is server-side and lossless.
+
+**Bounds, three of them, independent:**
+
+* `maxOverridePixels` per cut (~512 px ≈ 15 km) — a hard cap.
+* the natural taper above, which usually stops it much sooner.
+* `maxActiveCuts` on the authority. Beyond it a new cut is **refused and
+  logged**, not queued: a dam that visibly does nothing is better than an
+  unbounded world.
+
+The bound that actually does the work is none of these — it is the freeze
+(§6.3.3), which keeps the mobilized set from growing along the reach at all.
+A frozen brick that the front skips is also memoized in `noImplicit_`
+(`waterca.cpp:1760`), so re-asking is cheap.
+
+#### 6.3.5 Drying in time — bounded, deterministic, and not an animation
+
+The ramp is **a pure function of elapsed ticks, evaluated fresh every time —
+never accumulated**. That single property is what makes reload, replay and
+late join all land on the same answer with no catch-up:
+
+    elapsed_k = currentTick - (startTick + k * pixelDelayTicks)
+    factor_k  = clamp(elapsed_k / rampTicks, 0, 1)
+    surface_k = bakedSurface_k - surfaceDeltaMm_k * factor_k
+
+`pixelDelayTicks` staggers the start down the course, so drying travels as a
+drawdown wave instead of the whole reach falling at once. Both it and
+`rampTicks` are **gameplay calibration, not physics**, and are labelled as
+such for the same reason `rivercouple.h:120-122` labels
+`dischargePerFillUnit` one: a real drawdown wave moves at ~1 m/s, which would
+take 14 hours to cross 50 km. That is not a knob to be honest about later.
+
+The override floor is **not zero**, and should not be: below a dam a river
+becomes a chain of pools fed by whatever tributaries survive, which is
+exactly what the `acc_cut/acc_p` taper produces.
+
+*Unknown, and it gates this:* the ramp needs an **authoritative, replicated
+fixed-step tick counter**. The CA steps at a fixed 10 Hz (F7) and the edit log
+has **no** tick or timestamp field at all (`editlog.h:26-31`), so this is new.
+It is small, but it is a prerequisite and it is not free.
+
+#### 6.3.6 The reverse transition — where this is easiest to get wrong
+
+A release appends a **new** record carrying the factor at release, so an
+interrupted ramp resumes from where it actually was rather than from a
+predecessor that compaction might have dropped.
+
+**The order is the whole answer, and the intuitive order is the expensive
+one.** On release: **restore the datum first, lift the freeze second.** If the
+freeze lifts while the bed is still dry, the impounded water surges downstream
+as CA water and the front follows it to the sea — M2's runaway, now as a
+burst, which is precisely when the world can least afford it. Restoring the
+datum first means the returning river is *implicit*, and implicit water is
+free.
+
+The second hazard is that bricks mobilized during the dry spell — a player
+walked the dry bed and dug — hold no water and will not refill, leaving
+**scars exactly where players were**. This is the same defect as the
+canal-refill case, and it has the same fix: §6.5.
+
+#### 6.3.7 Determinism, replay, and the failure mode
+
+**What must enter the edit log, and in what order.** The cut record is
+appended in the *same batch* and *after* the terrain edit that caused it —
+otherwise replay passes through a state with a dry river and no dam. The log
+is a single ordered append-only sequence with contiguous `seq`
+(`editlog.h:85-89,144`), so ordering is free once the append site is right;
+the precedent is `PromoteDetachedIslands` running before `BroadcastNewEntries`
+for exactly this reason (`VoxelWorldSubsystem.cpp:13265-13267`).
+
+**Four shipped facts this has to be built around, all verified:**
+
+1. **The edit log has no record-kind discriminator.** It has exactly one
+   record shape — `(seq, BrickKey, vector<EditCell>)`, `editlog.h:26-31`. A
+   new kind means `kFormatVersion` 2 → 3 plus a kind byte. Additive and safe
+   (`kMinReadableFormatVersion` is 1, `editlog.h:47`), but it is a format
+   change, not a field. The variable-length precedent to follow is
+   `writePayload`/`readPayload` (`editlog.h:178-235`).
+2. **`compactLog` silently drops what it does not know about.** It already
+   drops `providerId` (`editcompact.h:43`), and saves prefer the compacted
+   copy (`VoxelWorldSubsystem.cpp:13437-13439`). A cut record that compaction
+   does not carry **will be silently lost on save and on join-sync**. This is
+   a concrete shipping bug, not a risk; it must be an explicit work item.
+3. **Late join is a compacted-log replay, chunked at 48 KB**
+   (`VoxelEarthPlayerController.cpp:483-522`,
+   `VoxelWorldSubsystem.cpp:14885-14898`). There is no voxel snapshot. Cut
+   records ride this path for free *if* (2) is fixed, and because the ramp is
+   evaluated at the current tick a late joiner arrives at the correct present
+   state rather than replaying the animation.
+4. **Water is not in the join-sync path at all.** It arrives over the
+   subsequent ~5 Hz `MulticastWaterDiffs` rounds. So a late joiner sees the
+   *implicit* world — including the override — immediately, and CA water fills
+   in behind it. That ordering is favourable here and worth not breaking.
+
+**The failure mode, stated plainly.** Two clients disagreeing about where a
+river runs is a desync, not a cosmetic bug — and **the override is the first
+piece of client-derived water state that is not a pure function of (seed,
+tiles)**. That is the new risk and it should be named as such.
+
+What bounds it is real and already shipped, not hoped for: **`NM_Client`
+never steps its own CA** (`VoxelWaterSubsystem.h:18-23`, enforced at
+`.cpp:3690`), and rivers are outright refused on clients
+(`VoxelWaterSubsystem.cpp:3652-3664`). So a client that missed a cut record
+cannot fork the simulation; the authority remains the only simulator. The
+divergence is confined to **presentation and local prediction** — the wrong
+river drawn, and swim/underwater tested against the wrong datum (work item 5
+made those consult the datum). That is a bad bug and not a corrupt world.
+
+The mitigation is to keep it in that class deliberately: cut records travel
+the **existing** ordered edit-log path and the **existing**
+`ApplyGroupedEdits` funnel (`world.h:43-47`,
+`VoxelWorldSubsystem.cpp:13144`) — no side channel, no second ordering.
+
+*Unknown, and it is not new:* the shipped UE build **never stamps
+`providerId` into the edit log** (`VoxelWorldSubsystem.cpp:2618, 13505`), so
+`EditLog::checkProvider`'s refusal (`editlog.h:70-81`) is exercised only by
+tests today. Cut records do not make that worse, but they raise the cost of
+leaving it unwired, because a cut record replayed against a different bake
+names pixels that mean something else.
+
+#### 6.3.8 What this does not do — the honest limits
+
+* **The CA has no persistent throughflow.** It settles to flat pools; a river
+  in this design is a static datum that *looks* like a river and carries
+  nothing. Everything above supplies discharge only *at a player's deviation*,
+  which is what §4.4's carve-out permits — not a world-wide river sim.
+* **A canal does not become a river.** An override is a *reduction* of a
+  datum; it cannot invent a graded water surface where the bake says dry.
+  The canal runs as CA water, bounded by its own length. A canal long enough
+  to matter is a canal expensive enough to hurt, at M3's rates.
+* **A reservoir larger than 65 536 cells does not level.** Phase C leaves an
+  over-cap component **completely unmodified** (`waterca.cpp:108`,
+  `waterca.h:213-222`). At 10 cm voxels that cap is about an 8 m × 8 m × 1 m
+  pond. Behind a real dam the surface will be the CA's local ±1 fixed point —
+  a mound, not a plane (`waterca_pooling_spreads_flat_within_tolerance`
+  states this outright for the pre-hydrostatic rule). This is a pre-existing
+  limit, it is squarely in the way of "dam a river", and nothing in this
+  section fixes it. `waterca.h:219-222` already names the intended fix (a
+  persisted per-body union-find).
+* **`buildFromFlowPlane` cannot be built from the shipped flow plane**, for
+  the reason in §6.3.4: no direction on the wire. Work item 9 names it as
+  though it were a build over existing data. It needs *either* a new
+  flow-direction bake product (another `BAKE_VERSION` bump) *or* descent of
+  the accumulation gradient as a heuristic. **This is a gap in the plan, not
+  in the code.** The design above needs the graph far less than item 9
+  assumes — the authority needs a downstream walk, not a routed graph — which
+  is the cheaper way out.
+* The dam **detector** is the least-designed part here and the biggest open
+  risk. The cheap deterministic shape is: at a candidate pixel, the baked
+  water column reads solid across the full channel width for N consecutive
+  checks — terrain-only, no CA, no wall clock. Whether that fires reliably on
+  real player dams is **unmeasured**.
+
+#### 6.3.9 Corrections to this document, found by verifying it
+
+* §6's table calls **ADR-0005's UE-side hook "(open)"** and work item 6 lists
+  it as to-do. **It is done**: `SaveWaterStateToDisk` /
+  `LoadWaterStateFromDisk` (`VoxelWaterSubsystem.cpp:2481, 2513`), wired at
+  `:847` and `:890`, with the loud three-failure-mode fallback at `:2555-2575`.
+* §3.2 says `BAKE_VERSION` is "currently 7". **It is 8**
+  (`pipeline.py:275`); the P1 bump landed in `0081d0e`.
+* §3.3's proposed `IWaterSampler` on `tiles.h` with `waterSurfaceMm(px,py)`
+  and `flowByte(px,py)` **shipped in a different shape**: `lakes.h:151-189`,
+  in **voxel** coordinates, with **no** `flowByte` accessor. The flow plane
+  still has no runtime consumer.
+* §6's table says the graph is "per-client". **It is refused on `NM_Client`**
+  (`VoxelWaterSubsystem.cpp:3652-3664`); it is per-*authority-process*, built
+  once at arm time over a 48 px / 1.44 km square (`:3592, 3695-3702`;
+  30 m pixels, `tiles.h:159-162`) and never re-centred. Unpersisted is
+  correct: the diffs are drained, logged and **discarded**
+  (`:3841-3850`, whose own log line ends *"NOT PERSISTED -- this is lost on
+  reload."*). `kSetConveyance` has **no producer anywhere outside tests**.
 
 ### 6.4 Ocean
 
@@ -602,14 +950,217 @@ proven equivalent), gives the sea real voxels only where touched, and makes
 "the plane shows through inland pits" fixable by testing the datum, not the
 camera. The 40 km visual plane stays for the far field.
 
+### 6.5 The return path: what stops CA water accumulating without bound
+
+§6.3 is about how the world *responds* to an edit. This section is about what
+happens after a year of them. It is separated because it is a different
+question with a different answer, and because it invalidates a claim in §7.
+
+#### 6.5.1 The problem, verified
+
+**`mobilized_` is insert-only.** Two insertions exist — `markMobilized`
+(`waterca.h:1052`) and `mobilizeBrick` (`waterca.cpp:1710`) — and **zero
+erasures anywhere in the tree**. `waterca.h:872` says so as doctrine:
+*"Mobilization is per-BRICK and one-way."* It is persisted and replicated.
+
+Two sets, and the distinction is the whole point:
+
+| set | what it is | does it shrink? |
+|---|---|---|
+| `active_` | what the CA steps | **yes** — settles to empty |
+| `mobilized_` | what is CA-owned rather than implicit | **never** |
+
+So a settled reservoir stops costing tick time entirely (M3 measured
+`active = 0`) and never stops costing memory, savegame bytes, and the
+late-joiner snapshot. A mobilized brick is also a **permanent hole in the
+implicit field**: `implicitFillAt` returns 0 there forever
+(`waterca.h:984-987`), so §7's "content is free at runtime" is switched off
+in that brick for the life of the world.
+
+**§7's claim is wrong as written and is corrected below.** *"The active set
+stays bounded by player activity, never world size"* is true of `active_` and
+false of `mobilized_` — and the binding word is **cumulative**, not
+**concurrent**. Concurrent activity is bounded by how many players are online.
+Cumulative activity on a year-old server is not bounded by anything.
+
+At M3's measured rate — 10.7 bricks/m/m², floor ~2 — one player who dams and
+floods a single valley writes tens of thousands of permanent bricks. Nothing
+in the system ever takes one back.
+
+#### 6.5.2 Prior art: what actually scales
+
+| game | approach | what it buys |
+|---|---|---|
+| **Minecraft** | bounds *propagation distance* (7 blocks), does not conserve volume | cost absolutely bounded; realism was never the goal |
+| **Dwarf Fortress** | volume-conserving per-cell fluid, state accumulates | **the cautionary tale — this exact failure mode, shipped**; a well-known cause of late-fort slowdown |
+| **Factorio** | fluids abstracted to a **graph** with a flow solver, not per-cell | scales to enormous factories |
+| **Terraria** | global cap on liquid updates/tick, deliberate damping | sloshing terminates |
+| **Oxygen Not Included** | full per-cell fluid | pays for it structurally in late game |
+
+Two of these map directly. Dwarf Fortress is where this design goes if
+nothing changes. Factorio is the shape that works, and it is *already* the
+shape of this system: **a river is a graph of reaches, and per-cell detail is
+only needed near a player.**
+
+**The pattern that scales in a persistent world is transient solver plus
+steady-state promotion:** simulate only what is changing, and hand the result
+back to the static layer the moment it stops. The two-layer split here is
+already exactly right — baked equilibrium plus CA deviation. **What is missing
+is the arrow back.** Mobilization promotes implicit → CA; nothing demotes
+CA → implicit. A persistent world without a return path is a memory leak with
+extra steps.
+
+**Recommendation: yes, build the return path.** The §6 table lists CA →
+implicit demotion as *"a later optimisation, listed but not required."* For
+the lake case that is fair. **For the edit-response layer it is required, and
+not as an optimisation — as correctness**, because §6.3.6's refill scars and
+§6.3's canal-refill case are both unfixable without it.
+
+#### 6.5.3 Demotion, and why the predicate must be exact rather than tolerant
+
+The obvious predicate — *inactive for N ticks AND fill matches the datum
+within tolerance* — has a bug in it. Mobilization was made one-way for a
+reason: the double-occupancy argument at `waterca.h:876-885`. A cell is one
+byte and cannot carry both accountants' water, so a demotion that hands back
+a cell whose fill merely *approximately* matches the datum creates or destroys
+the difference, silently, forever.
+
+**So demote only where the transfer is exactly volume-neutral**, and let the
+tolerance be zero:
+
+    demote brick k  iff
+      (a) k is mobilized, and
+      (b) k is not active, and no 6-face neighbour is active, and
+      (c) every cell of k holds exactly what the current
+          (override-adjusted) implicit field would give it.
+
+Condition (c) sounds unachievable and is not, because it is satisfied by the
+two cases that matter and by nothing else:
+
+* **the fully dry brick** — CA fill absent, datum 0. `0 == 0`. This is the
+  old-channel-dried-up case and the whole of the canal-refill fix.
+* **the fully submerged brick** — every cell 255, datum 255. This is the
+  drained-and-refilled-lake case.
+
+It is *not* satisfied by the **surface** brick, where the datum carries a
+partial top fill (`surfMm % 100`, §5.1) and the CA has settled to its own ±1
+fixed point. That is fine and should be stated rather than engineered around:
+one brick-shell of the water surface, 0.8 m thick, stays CA-owned. The scar
+is a rim, not a river.
+
+Condition (b) matters because demotion **restores the wall**
+(`makeSolidFn`). A wall reappearing in contact with moving water is a
+discontinuity; requiring the neighbourhood to be quiet removes the case
+entirely, and no hysteresis is needed because (c) is exact.
+
+**Determinism — the hard part, and the reason this is authority-only.**
+A demotion that depends on wall-clock, or on which client noticed first,
+desyncs. So:
+
+* **Only the authority demotes**, on exactly the argument
+  `waterca.h:931-941` already makes for mobilizing on the authority only: a
+  client's CA is a replication mirror, not a simulation, so a client running
+  its own predicate would drift the moment a packet was late.
+* **Demotion replicates as an explicit key removal**, on the existing
+  water-diff channel, alongside the fill-diffs it is consistent with. It must
+  not be inferred client-side.
+* **It does not enter the edit log.** It is not a world change a player made;
+  it is a representation change that is *by construction* observationally
+  equivalent. Putting it in the log would make replay order-dependent on a
+  budget. It belongs in the water blob, which is already
+  discardable-by-design (`waterca.h:1136-1141`) — discard it and the world
+  degrades to fully-implicit, which is exactly what demotion is trying to
+  reach anyway.
+* **Budgeted**, like the front: N bricks/tick, and deferring is always safe
+  because a deferred brick is simply still CA-owned.
+
+The invariant to assert every tick is the one that already exists:
+`implicitVolume + ca.totalVolume()` unchanged across a demotion, and
+`shortfallVolume() == 0`. If demotion is written correctly those are
+untouched by construction, which is the point of choosing an exact predicate.
+
+#### 6.5.4 Periodic re-baking — scoped, not built
+
+The owner's second proposal: re-derive equilibrium periodically and let the
+new baked datum subsume the accumulated CA state.
+
+This is the right long-run answer, and it is the *only* one that reclaims the
+surface-brick rim, the partially-filled reservoir, and the canal that
+demotion's exact predicate can never match. Requirements:
+
+* **An edit-aware bake.** The bake generates from worldgen; a dam lives in the
+  edit log. So the pipeline must apply the log, re-derive the water balance
+  (§4.3) on the edited surface, and emit a new water plane. The edit log is
+  already the complete, ordered, replayable record needed for this
+  (`editlog.h:7`), so the input exists.
+* **A discard rule**: which mobilized bricks the new datum subsumes, and proof
+  that discarding them changes no visible water. This is demotion's predicate
+  again, evaluated against the *new* datum instead of the old one — so
+  §6.5.3 is a prerequisite, not an alternative.
+
+**Correction to the premise, and it matters.** The proposal was framed on a
+`TERRAIN_VERSION` / `BAKE_VERSION` split making a water-only re-bake a cheap
+product change with terrain bytes provably unchanged. **`TERRAIN_VERSION` does
+not exist** — not in code, not in docs, not on any branch in this checkout.
+There is one `BAKE_VERSION` (`pipeline.py:275`), it is folded into
+`_bake_fingerprint()` and thus into `fine_provider_id`
+(`diffusion.py:785-830, 1049`), and the client keys every tile lookup by that
+id (`VoxelFineTileStreamer.cpp:171, 278, 506`). **So today a water-only
+re-bake re-keys the entire fine tile set and forces every client to
+re-download every tile, elevation included.**
+
+That does not kill the idea; it prices it. The split has to be *built* first —
+a water-plane section versioned independently of the elevation bytes, so the
+provider id changes for the water product only. That is a real, separable
+work item and it is the actual prerequisite. It may already be in flight in
+another worktree; it is not in this one.
+
+#### 6.5.5 The worst case, bounded independently of the average
+
+Demotion bounds the *average* — it reclaims what settles. It does nothing
+about one player deliberately flooding a large valley in one session, because
+that water is genuinely there and genuinely deviates from the datum. That
+needs a separate, blunter bound:
+
+* **A hard ceiling on `mobilized_.size()`, per world.** On reaching it, the
+  front stops advancing — `advanceFront` returns 0. This is *safe by exactly
+  the argument the front budget already relies on*: "a deferred brick is still
+  a wall" (`waterca.h:896-901`). Water freezes at the boundary rather than
+  duplicating or vanishing. Edit-driven mobilization must stay exempt, as in
+  §6.3.3, so digging never silently fails.
+* **Report it loudly.** A world at its ceiling is a world that needs a re-bake,
+  and that should be an operator-visible signal, not a silent stall.
+* **Demotion pressure first.** At high-water-mark, spend the demotion budget
+  before refusing new mobilization.
+
+The honest ordering: the ceiling is the cheapest of the three and is the only
+one that is *guaranteed* to bound the worst case. Demotion is the one that
+makes the average acceptable. Re-baking is the one that actually returns the
+world to "content is free". They are complementary and should ship in that
+order — ceiling, demotion, re-bake — because each is useful without the next.
+
 ---
 
 ## 7. Performance case
 
-* **Content is free at runtime.** An untouched lake: 0 bytes on disk beyond
-  the tile, 0 bytes on the wire, 0 CA bricks, 0 ticks. Identical economics to
-  the shipped cavern lakes. The active set stays bounded by player activity,
-  never world size — the same property the edit log gives terrain.
+* **Content is free at runtime — until it is touched, and then permanently
+  not.** An untouched lake: 0 bytes on disk beyond the tile, 0 bytes on the
+  wire, 0 CA bricks, 0 ticks. Identical economics to the shipped cavern lakes,
+  and measured: an untouched synthetic river serializes to **44 bytes**, the
+  blob header alone (§6.3, M3).
+
+  **Correction (2026-08-03).** This bullet used to end *"the active set stays
+  bounded by player activity, never world size — the same property the edit
+  log gives terrain."* That is **true of `active_` and false of
+  `mobilized_`**, and the difference is the one that matters over a world's
+  lifetime. `active_` settles to empty and costs no tick time. `mobilized_`
+  is **insert-only** — two insert sites, zero erase sites anywhere in the tree
+  (`waterca.h:1052`, `waterca.cpp:1710`) — so it is bounded by **cumulative**
+  player activity, not **concurrent**, and on a long-lived server cumulative
+  activity is not bounded by anything. It is not analogous to the edit log
+  either: the edit log is compacted (`editcompact.h`), and nothing compacts
+  the mobilized set. One drain edit was measured converting **100 %** of a
+  reach permanently. See §6.5 for the return path this needs.
 * **The CA budget is the guard rail, and it already exists** (front budget 64
   bricks/tick; catch-up cap 4 steps). Work item 10 adds the missing half:
   budget or off-thread the step *before* any feature grows the mobilized set;
@@ -769,18 +1320,67 @@ fraction by province.*
 **8. Ocean unification (§6.4).** *Verified: breach parity test old-vs-new
 path; inland-pit capture.*
 
-**9. Hydrology graph v2: `buildFromFlowPlane`, persistence, dam detector,
-graph diffs in the edit log; downstream-drying overrides.**
-*Unblocks: dam/divert as ordered, replayable gameplay. Verified: rivernet
-replay goldens against the new build; two-client dam leg — upstream rise,
-downstream decay, byte-identical replay.*
+**9. The edit-response layer (§6.3).** Rewritten 2026-08-03 after M1/M2 were
+measured; the old one-line item assumed a graph build that the shipped flow
+plane cannot support (§6.3.8) and a dam behaviour that does not happen (M1).
+Ordered so each step is useful without the next, and so the two cheap
+*bounds* land before the expensive *behaviour*.
+
+* **9a. The mobilization gate.** A caller-supplied `bool(const BrickKey&)`
+  consulted by `advanceFront` only, never `mobilizeEditRegion` (§6.3.3).
+  ~10 lines in `waterca.h`/`.cpp`, no tick rule touched, `kWaterCAVersion`
+  **not** bumped. *Unblocks: every bound below. Verified: extend
+  `waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain`
+  with a gated variant that pins the reach instead of eating it.*
+* **9b. The `mobilized_` ceiling + demotion pressure (§6.5.5).** The blunt
+  worst-case bound. Safe by the front budget's own argument. *Verified: a
+  scripted mass-mobilization that hits the ceiling and freezes rather than
+  growing; ledger and `shortfallVolume()` still exact.*
+* **9c. CA → implicit demotion (§6.5.3).** Exact predicate, authority-only,
+  budgeted, replicated as key removal, in the water blob not the edit log.
+  *Unblocks: reversibility — §6.3.6's scars and the canal-refill case.
+  Verified: drain → refill → demote → digest equals the never-touched world;
+  volume invariant asserted every tick.*
+* **9d. The tick counter.** An authoritative, replicated fixed-step counter
+  for the ramp (§6.3.5). Small, but a hard prerequisite for 9f.
+* **9e. Edit-log record kind + compaction.** `kFormatVersion` 2 → 3 with a
+  kind byte; **and `compactLog` must carry it** — today it silently drops what
+  it does not know (§6.3.7, item 2). *Verified: round-trip; a compaction test
+  that fails loudly on an unknown kind rather than dropping it; join-sync of a
+  world with live cuts.*
+* **9f. The override itself.** Authority-side course resolution + per-pixel
+  delta from the flow plane, the record, the ramp, and the two-component
+  freeze/surface split. *Verified: a two-client dam leg — upstream rise,
+  downstream decay, byte-identical replay, and the mobilized-brick count
+  bounded through the whole leg (the number M2 says is otherwise 100 %).*
+* **9g. The dam detector.** Terrain-only, deterministic, no CA (§6.3.8).
+  Last because it is the least certain and everything above is testable
+  without it — a cut can be triggered by console command until it exists.
+
+*Deliberately NOT in this item:* `buildFromFlowPlane` (§6.3.8 — the design
+needs a downstream walk, not a routed graph, and the shipped plane carries no
+direction), and re-enabling `rivercouple` promotion for production rivers.
 
 **10. Perf gates: CA step budgeted/off-thread before the mobilized set can
 grow; sheet overdraw measured.** *Verified: frame measurements under a
 scripted mass-mobilization worst case.*
 
+**11. The water-product version split, then edit-aware re-baking (§6.5.4).**
+Prerequisite is real and currently missing: a water plane versioned
+independently of the elevation bytes, so a water-only re-bake does not re-key
+every fine tile and force a full client re-download. `TERRAIN_VERSION` does
+not exist today. *Unblocks: the only mechanism that returns a worked-over
+world to "content is free". Verified: a re-bake that provably leaves elevation
+bytes and their provider id unchanged.*
+
 Parallelism note: items 1, 2 are independent; 3 blocks 4; 6 is independent of
 3–5 and can proceed anytime; 7+ are strictly after 4 proves the path.
+**Exception, and it is the useful one: 9a–9c are pure `voxel-core` and depend
+on none of the bake work.** The gate, the ceiling and demotion are testable
+today against synthetic worlds — the C8b tests already are — so the
+accumulation bound (§6.5) can land in parallel with items 3–7 rather than
+waiting behind rivers. Given that the leak is live in the shipped build and
+grows with every session, it should.
 
 ---
 
