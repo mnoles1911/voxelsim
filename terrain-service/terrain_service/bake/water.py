@@ -264,31 +264,64 @@ def runoff_field_mm_yr(padded_climate, wb, smooth_m: float, coarse_pixel_m: floa
 
 
 def discharge_source(runoff_coarse_mm_yr, fine_shape, scale: int, cell_m: float,
-                     inflow_area_m2=None):
+                     inflow_area_m2=None, inflow_q_m3_yr=None):
     """Per-cell runoff VOLUME in m^3/yr -- the seed `accumulate_mfd(source=)` wants.
 
     `runoff_coarse_mm_yr` is gathered at `y // scale`, so the result is a fine
     float64 grid built by ONE indexing operation rather than two np.repeats.
 
-    `inflow_area_m2` is the hydrology pyramid's edge injection, in m^2. It is
-    converted to a discharge by the LOCAL runoff at the injection cell, and that
-    is a PROXY, stated plainly: the superblock carries area, not discharge, so
-    the true mean runoff over the upstream catchment (which may be hundreds of
-    km away and in another climate) is not available. `bake_tile` reports the
-    fraction of total Q that entered this way, so a tile where the proxy
-    dominates is visible rather than assumed small. Fixing it properly means
-    carrying Q up the pyramid, which is task #49's business and is deliberately
-    not attempted here.
+    THE BOUNDARY CONDITION, AND THE DEFECT TASK #49 REMOVED
+    ------------------------------------------------------
+    The hydrology pyramid delivers upstream flow at this domain's edge. Which
+    quantity it delivers is the whole question:
+
+      * `inflow_q_m3_yr` -- a real DISCHARGE carried up the pyramid by
+        `pipeline.build_flow_superblock`'s second MFD sweep. Added directly,
+        because it is already in this function's own currency. USE THIS.
+
+      * `inflow_area_m2` -- upstream AREA, converted to a discharge by the LOCAL
+        runoff at the injection cell. A PROXY, and a bad one for exactly the
+        rivers worth having: it assumes the catchment has the climate of its own
+        mouth. Measured on the (-14,-4) -> (-14,-7) corridor, where runoff falls
+        217.5 -> 12.8 -> 3.6 -> 0.5 mm/yr from mountains to arid coast, it read
+        1.27e6 m^3/yr at the coastal tile against a 3.15e6 drawable threshold
+        and against 58.7e6 in the stitched coarse world. Carried, the same
+        boundary delivers 2.50e7 -- water worth 71 mm/yr of catchment rather
+        than the 3.6 mm/yr of ground it lands on.
+
+        It is wrong in BOTH directions, not merely small: where the local
+        ground is WETTER than the catchment mean the proxy over-states, and
+        re-baking (-13,-5) (local 217.5, catchment mean 156) removed two wet
+        pixels. See `pipeline.CARRIED_DISCHARGE` for the full corridor and for
+        why fixing this did not, on its own, put a river at that coast.
+
+    Both are accepted, and the fallback is deliberate rather than lazy: a
+    superblock built before task #49, or built without climate, carries no Q,
+    and silently injecting zero there would read as "no water arrives" -- the
+    same class of lie in a new place. `bake_tile` reports which one was used in
+    `water_q_inflow_carried`, so a tile still on the proxy says so.
+
+    Passing both is a caller error: the same water would enter twice.
     """
     if runoff_coarse_mm_yr is None:
         return None
+    if inflow_area_m2 is not None and inflow_q_m3_yr is not None:
+        raise ValueError(
+            "pass the pyramid's inflow as EITHER a carried discharge "
+            "(inflow_q_m3_yr) or the area proxy (inflow_area_m2), not both -- "
+            "they are two spellings of the same water"
+        )
     h, w = fine_shape
     ry = np.minimum(np.arange(h) // int(scale), runoff_coarse_mm_yr.shape[0] - 1)
     rx = np.minimum(np.arange(w) // int(scale), runoff_coarse_mm_yr.shape[1] - 1)
     runoff_m = runoff_coarse_mm_yr[np.ix_(ry, rx)] / 1000.0     # m/yr, float64
     src = runoff_m * (float(cell_m) * float(cell_m))            # m^3/yr per cell
-    if inflow_area_m2 is not None:
-        # Same conversion, at the cell the area arrives in.
+    if inflow_q_m3_yr is not None:
+        # Already m^3/yr. No conversion, no assumption about upstream climate:
+        # this is the whole point of the change.
+        src = src + np.asarray(inflow_q_m3_yr, np.float64)
+    elif inflow_area_m2 is not None:
+        # The proxy. Same conversion, at the cell the area arrives in.
         src = src + np.asarray(inflow_area_m2, np.float64) * runoff_m
     np.clip(src, 0.0, None, out=src)
     return src

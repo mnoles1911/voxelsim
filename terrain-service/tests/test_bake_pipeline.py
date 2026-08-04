@@ -306,6 +306,20 @@ def kernels(roughness=ref_roughness_world):
     )
 
 
+@pytest.fixture(scope="module")
+def _real_kernels():
+    """The REAL fill/D8/MFD, for the few tests that need actual routing.
+
+    ``ref_accumulate`` deliberately does no routing at all -- it is a locality
+    reference for the apron argument -- so a test about water ARRIVING
+    somewhere downstream cannot use it. Those tests need numba, which CI does
+    not have, hence the skip rather than a module-level import.
+    """
+    pytest.importorskip("numba")
+    pytest.importorskip("scipy")
+    return pipeline.load_kernels()
+
+
 def ramp_world(tiles=range(-3, 5), geom=TEST_GEOM):
     """A monotone ramp rising to the south-east, so ALL flow runs north-west.
 
@@ -1163,6 +1177,239 @@ def test_inject_edge_inflow_returns_zero_when_the_domains_do_not_overlap():
         d8_fn=ref_d8,
     )
     assert out.sum() == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Task #49: the pyramid carries DISCHARGE, not just area.
+# See pipeline.CARRIED_DISCHARGE.
+# ---------------------------------------------------------------------------
+
+
+def climate_world(precip_for_tile, temp_c=15.0, tiles=range(-3, 5),
+                  geom=TEST_GEOM):
+    """{(tx, ty): (4, n, n) uint8} at the requested physical values.
+
+    ``precip_for_tile(tx, ty) -> mm/yr``. Quantised exactly as the wire does,
+    so a test that reads runoff back gets the same rounding a real tile has.
+    """
+    province = pipeline._province
+    n = geom.coarse_tile_px
+    out = {}
+    for ty in tiles:
+        for tx in tiles:
+            planes = np.zeros((len(province.CLIMATE_ORDER), n, n), np.uint8)
+            vals = {"temperature": temp_c,
+                    "precipitation": float(precip_for_tile(tx, ty))}
+            for i, name in enumerate(province.CLIMATE_ORDER):
+                lo, hi = province.CLIMATE_RANGES[name]
+                v = vals.get(name, lo)
+                planes[i] = np.clip(round((v - lo) / (hi - lo) * 255.0), 0, 255)
+            out[(tx, ty)] = planes
+    return out
+
+
+def test_flow_superblock_roundtrips_the_discharge_raster():
+    """Both states survive the container, and they stay DISTINGUISHABLE.
+
+    ``q is None`` means "this block cannot say how much water" and ``q`` all
+    zeros means "none". Collapsing the two on disk would make a block built
+    without climate read as a dry continent.
+    """
+    rng = np.random.default_rng(11)
+    base = dict(
+        level=0, sx=1, sy=-2, tiles_per_side=4, cell_m=30.0,
+        origin_m=(61440.0, -122880.0),
+        acc=rng.random((8, 8), np.float32) * 1e7,
+        filled=rng.random((8, 8), np.float32) * 1000.0,
+        missing_tiles=(),
+    )
+    q = rng.random((8, 8)) * 1e9
+    with_q, _ = pipeline.decode_flow_superblock(
+        pipeline.encode_flow_superblock(
+            pipeline.FlowSuperblock(**base, q=q), 20260719)
+    )
+    assert with_q.carries_discharge
+    # float64 on the wire: the width law reads Q^0.4 from a headwater trickle
+    # to a continental mouth, and the sweep that made it is float64 throughout.
+    np.testing.assert_array_equal(with_q.q, q)
+
+    without, _ = pipeline.decode_flow_superblock(
+        pipeline.encode_flow_superblock(pipeline.FlowSuperblock(**base), 1)
+    )
+    assert without.q is None
+    assert not without.carries_discharge
+
+
+def test_a_superblock_that_predates_carried_discharge_is_refused():
+    """v2 blobs are rebuilt, not read as "no discharge".
+
+    Decoding one as v3 would come back with ``q = None`` -- the correct
+    reading -- and B6 would then quietly fall back to the local-runoff proxy in
+    a bake that had been told the pyramid carries Q. A loud rebuild is cheap
+    (a superblock is derived); a silent downgrade is the defect returning.
+    """
+    sb = pipeline.FlowSuperblock(
+        level=0, sx=0, sy=0, tiles_per_side=4, cell_m=30.0, origin_m=(0.0, 0.0),
+        acc=np.zeros((4, 4), np.float32), filled=np.zeros((4, 4), np.float32),
+    )
+    blob = bytearray(pipeline.encode_flow_superblock(sb, 1))
+    blob[4:6] = (2).to_bytes(2, "little")
+    with pytest.raises(ValueError, match="unsupported flow superblock version 2"):
+        pipeline.decode_flow_superblock(bytes(blob))
+
+
+def test_superblock_runoff_is_none_without_climate_and_zero_where_ungenerated():
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    assert pipeline.superblock_runoff_mm_yr(None, 0, 0, lv) is None
+
+    cl = climate_world(lambda tx, ty: 1500.0)
+    cl.pop((1, 1))  # the frontier has not reached this tile
+    runoff = pipeline.superblock_runoff_mm_yr(lambda x, y: cl.get((x, y)),
+                                              0, 0, lv)
+    sub = TEST_GEOM.coarse_tile_px
+    # An ungenerated tile delivers no water -- the same statement
+    # MISSING_ELEVATION_M already makes about the routing.
+    assert runoff[sub:, sub:].max() == 0.0
+    assert runoff[:sub, :sub].min() > 0.0
+    # ...and the hole does NOT bleed a fabricated cold desert into its
+    # neighbours: the smooth is coverage-normalised, so the generated quadrant
+    # is uniform to within quantisation rather than dished toward the gap.
+    live = runoff[:sub, :sub]
+    assert live.max() - live.min() < 1e-6 * live.max() + 1e-9
+
+
+def test_the_pyramid_carries_discharge_across_a_climate_boundary(_real_kernels):
+    """THE TASK #49 TEST. A river that leaves its climate zone.
+
+    Built as the failure was found: a wet upstream and an arid downstream, with
+    the mouth in the dry half. The proxy the bake used before this -- upstream
+    AREA times the LOCAL runoff at the cell the area arrives in -- reads
+    essentially nothing there, because the local runoff IS essentially nothing.
+    That is what baked three of the showcase corridor's five tiles, including
+    its mouth, at 0.000% wet while the headwaters ran.
+
+    Asserted here as a RATIO between the two constructions rather than an
+    absolute, so the test says what the defect was rather than restating a
+    tuning constant.
+    """
+    # Ground rises to the south-east, so every drop runs north-west.
+    world = ramp_world()
+    # Climate follows the ground the OTHER way: wet uplands, arid lowlands.
+    # The level-0 block at (0,0) covers tiles (0..1, 0..1) under TEST_CONSTS,
+    # whose largest tx+ty is 2 -- so the >= 3 cut puts EVERY wet tile strictly
+    # upstream of the block and leaves the destination uniformly arid. (At >= 2
+    # one wet tile falls inside the block, which raises the "local" runoff the
+    # proxy gets to use and understates the defect by three orders of
+    # magnitude: 6.5x instead of 15,000x. The corridor this models is arid the
+    # whole way down.)
+    cl = climate_world(lambda tx, ty: 2400.0 if (tx + ty) >= 3 else 30.0)
+    fetch_z = lambda x, y: world.get((x, y))          # noqa: E731
+    fetch_c = lambda x, y: cl.get((x, y))             # noqa: E731
+
+    up = pipeline.FlowLevel(level=1, geom=TEST_GEOM, consts=TEST_CONSTS)
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    parent = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, up, _real_kernels, climate_fetch=fetch_c
+    )
+    child = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, lv, _real_kernels, parent=parent, climate_fetch=fetch_c
+    )
+    assert parent.carries_discharge and child.carries_discharge
+
+    # What the pyramid delivered at this block's edge, in both currencies.
+    entries = pipeline._edge_entries(
+        child_z=child.filled, child_origin_m=child.origin_m,
+        child_cell_m=child.cell_m, src=parent,
+        d8_fn=_real_kernels.d8_receivers,
+    )
+    area_in = pipeline._scatter_entries(entries, parent.acc, child.filled.shape)
+    q_in = pipeline._scatter_entries(entries, parent.q, child.filled.shape,
+                                     dtype=np.float64)
+    assert area_in.sum() > 0.0, "no crossing at all -- the fixture drains wrong"
+
+    # (a) THE DEFECT, reproduced. The proxy converts the arriving area with the
+    #     runoff of the arid cell it arrives in.
+    local = pipeline.superblock_runoff_mm_yr(fetch_c, 0, 0, lv) / 1000.0
+    q_proxy = float((area_in * local).sum())
+    q_true = float(q_in.sum())
+    # Measured on this fixture: 9.85e5 carried against 64.5 from the proxy,
+    # i.e. 15,000x. The bound is loose because the RATIO is the statement.
+    assert q_true > 1000.0 * q_proxy, (
+        f"carried Q {q_true:.4g} is not meaningfully above the proxy's "
+        f"{q_proxy:.4g}; the fixture no longer crosses a climate boundary"
+    )
+
+    # (b) ...and the carried number is the RIGHT one: the implied
+    #     catchment-mean runoff behind the imported water lands between the
+    #     arid destination (0.074 mm/yr here) and the wet source (2,400), not
+    #     at either end. Measured: 1,131 mm/yr.
+    implied_mm = 1000.0 * q_true / float(area_in.sum())
+    assert 1000.0 * float(local.max()) < implied_mm < 2400.0
+
+    # (c) Area is UNTOUCHED by any of this -- it is what incision reads, and
+    #     the whole argument for BAKE_VERSION rather than TERRAIN_VERSION is
+    #     that the ground does not move.
+    no_climate = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, lv, _real_kernels, parent=parent
+    )
+    np.testing.assert_array_equal(no_climate.acc, child.acc)
+    np.testing.assert_array_equal(no_climate.filled, child.filled)
+    assert no_climate.q is None
+
+
+def test_discharge_source_refuses_both_currencies_at_once():
+    """The same water entering twice is a caller error, not a blend."""
+    runoff = np.full((2, 2), 500.0)
+    with pytest.raises(ValueError, match="not both"):
+        pipeline._water.discharge_source(
+            runoff, (4, 4), 2, 10.0,
+            inflow_area_m2=np.ones((4, 4)),
+            inflow_q_m3_yr=np.ones((4, 4)),
+        )
+
+
+def test_discharge_source_adds_a_carried_q_without_reweighting_it():
+    """A carried Q is already m^3/yr. Multiplying it by the local runoff again
+    is precisely the bug; assert the arithmetic, not the intent."""
+    runoff = np.zeros((2, 2))          # arid: local contribution is exactly 0
+    q_in = np.zeros((4, 4))
+    q_in[1, 1] = 5.0e7
+    src = pipeline._water.discharge_source(
+        runoff, (4, 4), 2, 10.0, inflow_q_m3_yr=q_in)
+    assert src[1, 1] == pytest.approx(5.0e7)
+    assert src.sum() == pytest.approx(5.0e7)
+    # The same boundary condition spelled as an AREA vanishes here, which is
+    # the whole defect in two lines.
+    proxy = pipeline._water.discharge_source(
+        runoff, (4, 4), 2, 10.0, inflow_area_m2=q_in)
+    assert proxy.sum() == 0.0
+
+
+def test_the_climate_planes_are_in_the_superblock_fingerprint():
+    """Since the block carries a discharge, climate decides its bytes.
+
+    Both halves matter: a block built from a different climate must get a
+    different digest, and a block built with NO climate must get exactly the
+    digest it always got -- otherwise every cached block in every world would
+    read as stale for an input none of them used.
+    """
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    world = synth_world()
+    fetch_z = lambda x, y: world.get((x, y))          # noqa: E731
+    wet = climate_world(lambda tx, ty: 2000.0)
+    dry = climate_world(lambda tx, ty: 40.0)
+
+    bare = pipeline.superblock_inputs_fingerprint(fetch_z, 0, 0, lv)
+    fp_wet = pipeline.superblock_inputs_fingerprint(
+        fetch_z, 0, 0, lv, climate_fetch=lambda x, y: wet.get((x, y)))
+    fp_dry = pipeline.superblock_inputs_fingerprint(
+        fetch_z, 0, 0, lv, climate_fetch=lambda x, y: dry.get((x, y)))
+
+    assert fp_wet != fp_dry
+    assert bare not in (fp_wet, fp_dry)
+    # The continuity half: absent climate hashes exactly as before task #49.
+    assert bare == pipeline.superblock_inputs_fingerprint(
+        fetch_z, 0, 0, lv, climate_fetch=None)
 
 
 def test_inflow_reaches_accumulate_mfd_through_bake_padded_domain():

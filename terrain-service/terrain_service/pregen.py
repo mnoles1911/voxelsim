@@ -391,6 +391,39 @@ def _record_identity(cache: TileCache, provider, seed: int, namespace_id) -> boo
     return ok
 
 
+def _inflow_currency(stats: dict) -> str:
+    """What the pyramid handed this tile at its boundary, for the run log.
+
+    Task #49. ``/proxy`` means the tile reconstructed a discharge from upstream
+    AREA times its own LOCAL runoff -- the thing that baked a river mouth
+    0.000% wet -- and it has to be legible in the run log rather than only in a
+    stats dump nobody opens. Otherwise:
+
+        /Q2.5e+07m3yr@71mm    carried discharge, and the catchment-mean runoff
+                              it implies. Compare that against the tile's own
+                              local runoff: the gap IS what #49 fixed.
+        qmax=...              the tile's largest discharge, against which
+                              "0.000%wet" can be read as "how far short".
+        drawnpad=...          drawable cells over the PADDED domain. When this
+                              is large while %wet is zero the water is in the
+                              APRON and leaves without crossing the tile --
+                              a different fault, wanting a different fix
+                              (HYDROLOGY_RESIDUALS #7).
+
+    Empty before bake_ver 10 or with the water plane disabled.
+    """
+    if "water_q_inflow_carried" not in stats:
+        return ""
+    if not stats["water_q_inflow_carried"]:
+        return "/proxy"
+    return (
+        f"/Q{stats['water_q_inflow_m3_yr']:.3g}m3yr"
+        f"@{stats['water_q_inflow_implied_runoff_mm_yr']:.0f}mm"
+        f" qmax={stats.get('water_q_max_m3_yr', 0.0):.3g}"
+        f" drawnpad={int(stats.get('water_drawn_cells', 0))}"
+    )
+
+
 def _run_bake(args, provider, cache: TileCache) -> int:
     """Bake mode: coarse pass, then hydrology pass, then the tiles.
 
@@ -455,11 +488,16 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    targets = [
+    # AN EXPLICIT TILE LIST BEATS A SQUARE for the shape of work this mode is
+    # actually asked to do. A river corridor is a line, not a block: baking
+    # (-14,-4) -> (-14,-7) plus (-13,-5) as a square costs 16 tiles at ~300
+    # CPU-s each to get the 5 that were wanted. getattr, like every other
+    # optional flag here, so tools that hand-build an args object keep working.
+    targets = list(getattr(args, "bake_targets", None) or [
         (args.center_x + dx, args.center_y + dy)
         for dx in range(-args.radius, args.radius + 1)
         for dy in range(-args.radius, args.radius + 1)
-    ]
+    ])
     generate_coarse = not args.bake_no_coarse_generate
     verify_superblocks = not args.bake_no_verify_superblocks
     cpu0 = time.process_time()
@@ -602,6 +640,11 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     level,
                     parent_fingerprint=parent_fp,
                     entry_mode=entry_mode,
+                    # Since the block carries a DISCHARGE (task #49) the climate
+                    # planes decide its bytes, so they belong in the provenance
+                    # digest. Must match what `build_flow_superblock` was given
+                    # below, or every cached block would read as stale forever.
+                    climate_fetch=fetch_climate,
                 )
                 if now_fp != sb.inputs_fingerprint:
                     stale_superblocks += 1
@@ -624,6 +667,13 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     kernels,
                     parent=parent,
                     entry_mode=entry_mode,
+                    # TASK #49: the block runs a second MFD sweep seeded by
+                    # runoff volume and carries the DISCHARGE, so a river that
+                    # leaves its climate zone arrives at the fine tier with the
+                    # water it actually gathered. Without climate here the block
+                    # carries area only and B6 falls back to the local-runoff
+                    # proxy -- which is what baked a river mouth 0.000% wet.
+                    climate_fetch=fetch_climate,
                 )
                 cache.put_flow(
                     fine_provider_id,
@@ -722,11 +772,24 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 file=sys.stderr,
             )
         if npz_dir:
+            # DISCHARGE AND THE WATER PLANE BELONG IN THE DUMP. Without them a
+            # tile that baked 0.000% wet cannot be diagnosed from the dump at
+            # all -- "no water" and "water just under the drawable threshold"
+            # look identical, and telling those two apart is the entire
+            # question task #49 was opened on. Both are None before bake_ver 9
+            # or with the plane disabled; np.savez cannot store None, so they
+            # are added only when present.
+            extra = {}
+            if result.discharge_m3_yr is not None:
+                extra["discharge_m3_yr"] = result.discharge_m3_yr
+            if result.water_surface_m is not None:
+                extra["water_surface_m"] = result.water_surface_m
             np.savez(
                 npz_dir / f"{x}_{y}.npz",
                 elevation_m=result.elevation_m,
                 accumulation_m2=result.accumulation_m2,
                 flow=result.flow,
+                **extra,
             )
         try:
             encoded = _encode_fine(
@@ -755,7 +818,8 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             f"max_catchment={result.stats['max_accumulation_km2']:.1f}km2 "
             f"incision_p99={result.stats['incision_p99_m']:.2f}m "
             f"channels={int(result.stats['channel_cells'])} "
-            f"injected={result.stats['injected_inflow_km2']:.1f}km2 "
+            f"injected={result.stats['injected_inflow_km2']:.1f}km2"
+            f"{_inflow_currency(result.stats)} "
             f"basin={result.stats['basin_cells_frac']*100:.1f}%/"
             f"{result.stats['basin_max_depth_m']:.0f}m "
             f"hydro={result.superblock_fingerprint[:12] or 'none'}",

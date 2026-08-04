@@ -45,6 +45,7 @@ from test_bake_pipeline import (  # noqa: E402
     TEST_CONSTS,
     TEST_GEOM,
     kernels,
+    ramp_world,
     ref_roughness_world,
     synth_world,
 )
@@ -200,6 +201,72 @@ def test_water_plane_moves_no_height(codec):
     assert set(s_on) - set(s_off) <= {tile_codec.SECTION_WATER_INDEX,
                                       tile_codec.SECTION_WATER_DATA}
     assert not set(s_off) - set(s_on)
+
+
+def test_carried_discharge_changes_the_water_and_nothing_else():
+    """TASK #49's HALF OF THE SPLIT. A superblock that carries Q vs one that
+    does not: the water plane must change and the GROUND must not.
+
+    This is the claim that decided the version bump. Stream-power incision reads
+    ``A^m`` -- an area law -- so carrying a discharge beside the area can only
+    reach the water plane, and BAKE_VERSION 9 -> 10 is a re-bake onto identical
+    ground rather than a new world. Reasoned about in ``CARRIED_DISCHARGE``;
+    asserted here, because the reasoning is worth 67 M control points a tile and
+    the same reasoning was available for every leak that ever happened.
+
+    The two arms differ in EXACTLY ONE FIELD of the superblock -- ``q`` --
+    which is what makes the elevation comparison a control rather than a
+    coincidence.
+    """
+    pytest.importorskip("scipy")
+    # RAMP, not synth_world: the ramp rises to the south-east so every drop runs
+    # north-west and the block's flow demonstrably CROSSES tile (0,0)'s
+    # boundary. synth_world's short-wavelength component dominates its gradient,
+    # which makes drainage local and can leave a tile with no crossing at all --
+    # which it did here, and the anti-vacuity assertion below caught it.
+    world = ramp_world()
+    k = _kernels_that_route()
+    consts = dataclasses.replace(WATER_CONSTS, superblock_max_level=0)
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=consts)
+    fetch_z = lambda x, y: world.get((x, y))            # noqa: E731
+    fetch_c = lambda x, y: _climate(x, y)               # noqa: E731
+
+    with_q = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, lv, k, climate_fetch=fetch_c)
+    assert with_q.carries_discharge
+    # The SAME block with the discharge removed -- the pre-task-#49 state, and
+    # what a cached block built without climate still hands over.
+    without_q = dataclasses.replace(with_q, q=None)
+    assert np.array_equal(with_q.acc, without_q.acc)
+
+    def bake(sb):
+        return pipeline.bake_tile(
+            world_seed=20260719, tile_x=0, tile_y=0,
+            coarse_fetch=fetch_z, climate_fetch=fetch_c,
+            kernels=k, geom=TEST_GEOM, consts=consts, inflow_source=sb,
+        )
+
+    r_q, r_proxy = bake(with_q), bake(without_q)
+
+    # ANTI-VACUITY. Both arms must actually have imported water at the boundary,
+    # or this compares two tiles that never used their superblock at all.
+    assert r_q.stats["injected_inflow_km2"] > 0.0
+    assert r_q.stats["water_q_inflow_carried"] == 1.0
+    assert r_proxy.stats["water_q_inflow_carried"] == 0.0
+    assert r_q.stats["water_q_inflow_m3_yr"] > 0.0
+
+    # THE GROUND, bit for bit. Exact equality, not a tolerance: an ULP at 3 km
+    # survives into the 100 mm wire LSB often enough to matter.
+    assert np.array_equal(r_q.elevation_m, r_proxy.elevation_m), (
+        "carrying a discharge moved a height -- it has leaked into the terrain "
+        "half and BAKE_VERSION is the wrong counter"
+    )
+    assert np.array_equal(r_q.accumulation_m2, r_proxy.accumulation_m2)
+    assert np.array_equal(r_q.flow, r_proxy.flow)
+    assert len(r_q.basins) == len(r_proxy.basins)
+
+    # ...and the DISCHARGE, which is the whole point, is not the same field.
+    assert not np.array_equal(r_q.discharge_m3_yr, r_proxy.discharge_m3_yr)
 
 
 def test_water_disabled_reproduces_a_bake_ver_8_tile_exactly():
