@@ -424,8 +424,23 @@ tile in that cache is `bake_ver 7` with no water plane.
 - **Say what a capture depicts.** Two ocean frames were served without noting
   they were synthetic fixture digs; the owner reasonably judged the shape of a
   `CarveSphere` stack as if it were terrain.
-- **Confirm a capture settled**: `jobsInFlight=0 pendingJobs=0 unloaded=0` and
-  `RefreshImplicitWater: DRAINED`. A blank frame is usually unloaded terrain.
+- **Confirm a capture settled**, and **the rule differs by altitude**:
+  `jobsInFlight=0 pendingJobs=0 unloaded=0` always, plus
+  * **near field (~10 m)** — `RefreshImplicitWater: DRAINED`;
+  * **altitude** — the ribbon actor's `River ribbons: DRAINED build`, with its
+    reach and quad counts.
+
+  `RefreshImplicitWater: DRAINED` **cannot appear in an altitude capture**: the
+  implicit disc is only 52×52×26 m around the camera, so at 1 km there is no
+  implicit water in it and the line is structurally absent. Reading that as a
+  failed settle is wrong — and worse, learning to ignore it lets a genuinely
+  unsettled *near-field* frame through. A blank frame is usually unloaded
+  terrain.
+- **The altitude ladder is 10 m, 200 m, 1 km, 5 km** (owner, 2026-08-04; 20 km
+  was judged excessive). 200 m is the one that matters most: the near-field box
+  reaches only ~26 m, so 200 m is the lowest altitude where the far-field ribbon
+  carries the river alone, and it is where a bad handover between the two would
+  show.
 - **Verify sites before shooting.** Three of nine vista sites were once wrong,
   including a "beach" in open water. One candidate shore this session was
   rejected on survey: max **+0.19 m** over 80×80 m — a shoal.
