@@ -650,6 +650,25 @@ public:
         setFillAccounted(vx, vy, vz, newFill, nullptr);
     }
 
+    // Drops every fill unit in one brick, removes the brick from the map, and
+    // returns the units removed. The CA -> implicit demotion counterpart of
+    // mobilizeBrick's crediting side; see WaterMobilizer::demoteBrick, which is
+    // the only intended caller and which may only call it once its EXACT
+    // predicate has established that the datum will hand back the identical
+    // number of units to the identical cells.
+    //
+    // DELIBERATELY DOES NOT ACTIVATE, unlike removeWaterAt. Demotion requires a
+    // quiet neighbourhood by construction, and waking a brick whose cells the
+    // implicit field has just taken back would schedule a tick over what is now
+    // a wall. It also does not touch the active set: a brick that is active is
+    // not demotable in the first place, so there is nothing to remove.
+    //
+    // On its own this is a SINK — it removes water and hands it to nobody. It
+    // is the caller's obligation to be the other accountant. Nothing in
+    // voxel-core calls it except demoteBrick, and no tick rule reads it, so
+    // kWaterCAVersion is NOT bumped.
+    uint64_t clearBrickFill(const BrickKey& k);
+
     // Re-inserts a brick into the active set WITHOUT writing any fill — the
     // savegame-load counterpart to wakeRegion()'s scheduling half (see
     // WaterState below). Waking is purely a SCHEDULING act, so this cannot
@@ -869,7 +888,7 @@ private:
 //   * the IMPLICIT FIELD, for cells in a brick that has not mobilized, or
 //   * the CA, for cells in a brick that has.
 //
-// Mobilization is per-BRICK and one-way, recorded in `mobilizedBricks()`. The
+// Mobilization is per-BRICK, recorded in `mobilizedBricks()`. The
 // total water in any bounded region is therefore always
 //
 //       implicitVolume(region) + ca.totalVolume()      [restricted to region]
@@ -892,6 +911,33 @@ private:
 // `mobilizeBrick` can then credit the FULL implicit amount into each cell
 // knowing it was empty. `shortfallVolume()` is the audit of that claim and
 // must be 0 forever (the tests assert it every tick).
+//
+// IT USED TO SAY ONE-WAY HERE, AND FOR A LONG TIME IT WAS.
+// `mobilized_` had two insert sites and ZERO erasures anywhere in the tree, and
+// this comment stated that as doctrine. It is no longer true: `demoteBrick`
+// below hands a brick back to the implicit field. The doctrine is *why* it took
+// this long, and the reason it can change now is worth being precise about,
+// because it is the same double-occupancy argument and not a relaxation of it.
+//
+// One-way was never the requirement. EXACTNESS was. The requirement is that at
+// every instant a cell has exactly one accountant, and that a handover in
+// either direction moves the same integer out of one and into the other. Going
+// implicit -> CA that is free: the cell was a wall, so it was provably empty
+// and `mobilizeBrick` can credit the full amount. Going CA -> implicit it is
+// NOT free, because the implicit field does not store anything — it computes.
+// So the only demotion that can be exact is one where the datum already
+// computes precisely what the CA is holding, cell for cell, and the transfer is
+// therefore a no-op on every byte. That is `canDemote`'s condition (c), and it
+// is why the tolerance is ZERO and must stay zero: a demotion that hands back a
+// cell whose fill merely APPROXIMATELY matches the datum creates or destroys
+// the difference, silently and forever, and there is no byte left to store it
+// in. A tolerant predicate is precisely the double-occupancy bug this class was
+// made one-way to avoid.
+//
+// What was actually wrong with one-way is that it made the system a memory
+// leak: `mobilized_` is persisted and replicated, `active_` settles to empty
+// while `mobilized_` never shrinks, and a mobilized brick is a permanent hole
+// in the implicit field. See docs/watershed-system-plan.md §6.5.
 //
 // This is also what makes the per-tick BUDGET safe. Deferring a brick's
 // mobilization can never leak water, because a deferred brick is still a wall.
@@ -1143,6 +1189,106 @@ public:
     void setCeilingRelief(CeilingReliefFn relief) { ceilingRelief_ = std::move(relief); }
     uint64_t ceilingReliefCalls() const { return ceilingReliefCalls_; }
 
+    // --- demotion: CA -> implicit (§6.5.3, work item 9c) --------------------
+    //
+    // THE RETURN PATH. Mobilization promotes implicit -> CA; without this
+    // nothing ever went the other way, and a persistent world without a return
+    // path is a memory leak with extra steps (§6.5.2 — Dwarf Fortress shipped
+    // exactly this failure mode). `active_` settles to empty; `mobilized_` is
+    // persisted, replicated, and used to grow forever. This gives bricks back.
+    //
+    // THE PREDICATE IS EXACT AND THE TOLERANCE IS ZERO. Demote `k` iff
+    //   (a) k is mobilized, and
+    //   (b) k is not active, and no 6-face neighbour is active, and
+    //   (c) EVERY cell of k already holds exactly what the implicit field
+    //       would give it — `sourceFillAt`, byte for byte, all 512.
+    // See "IT USED TO SAY ONE-WAY HERE" above for why (c) cannot be softened
+    // into "within tolerance": the implicit field computes rather than stores,
+    // so the only exact CA -> implicit transfer is one that changes no byte.
+    //
+    // (c) SOUNDS UNACHIEVABLE AND IS NOT, because two cases satisfy it and they
+    // are the two that matter (§6.5.3):
+    //   * the fully dry brick — CA fill absent, datum 0 because an override has
+    //     lowered it. This is the old-channel-dried-up case, §6.3.6's refill
+    //     scars, and the whole of the canal-refill fix.
+    //   * the fully submerged brick — every cell 255, datum 255. The
+    //     drained-and-refilled-lake case.
+    // It is NOT satisfied by the SURFACE brick, where the datum carries a
+    // partial top fill and the CA has settled to its own +/-1 fixed point. That
+    // is stated rather than engineered around: one brick-shell of the water
+    // surface stays CA-owned. The scar is a rim, not a river. Only a re-bake
+    // (§6.5.4) reclaims the rim, and it needs this predicate anyway — evaluated
+    // against the new datum instead of the old one.
+    //
+    // (b) MATTERS BECAUSE DEMOTION RESTORES THE WALL. `makeSolidFn` reports
+    // these cells solid again the instant `k` leaves `mobilized_`, and a wall
+    // reappearing in contact with moving water is a discontinuity. Requiring a
+    // quiet neighbourhood removes the case entirely, and no hysteresis is
+    // needed precisely because (c) is exact — there is no threshold to chatter
+    // across.
+    //
+    // AUTHORITY ONLY, on exactly the argument "DETERMINISM AND CLIENT/SERVER
+    // AGREEMENT" above already makes for mobilizing on the authority only: a
+    // client's CA is a replication mirror, not a simulation, so a client
+    // running this predicate would drift the moment a packet was late. The
+    // result replicates as an explicit KEY REMOVAL (`takeRecentlyDemoted`)
+    // alongside the fill-diffs it is consistent with, and must never be
+    // inferred client-side.
+    //
+    // NOT IN THE EDIT LOG. Demotion is not a world change a player made; it is
+    // a representation change that is BY CONSTRUCTION observationally
+    // equivalent. Putting it in the log would make replay order-dependent on a
+    // budget. It belongs in the water blob, which is already
+    // discardable-by-design — discard it and the world degrades to
+    // fully-implicit, which is what demotion is trying to reach anyway. No new
+    // persistence code is needed: `WaterState` serializes `mobilized_` as a
+    // set, so a demoted brick is simply a key that is no longer in it, and its
+    // fill is gone because `clearBrickFill` collapsed the brick out of the map.
+    //
+    // kWaterCAVersion is NOT bumped: no tick rule changes, and a world in which
+    // nothing is ever demoted is bit-for-bit a world without this.
+
+    // The predicate, exposed so a caller (and the tests) can ask without acting.
+    // Costs a 512-cell scan on a candidate that passes (a) and (b).
+    bool canDemote(const WaterCA& ca, const BrickKey& k) const;
+
+    // Demotes `k` if `canDemote`, and returns whether it did. The transfer is
+    // volume-neutral by construction: the units cleared from the CA are exactly
+    // the units the datum resumes claiming, because that is what (c) tested.
+    bool demoteBrick(WaterCA& ca, const BrickKey& k);
+
+    // Budgeted sweep: EXAMINES up to `maxBricks` mobilized bricks and demotes
+    // those that qualify, returning how many were demoted. The budget counts
+    // examinations rather than demotions because the 512-cell scan is the cost;
+    // a sweep that found nothing must still be bounded.
+    //
+    // The sweep walks `mobilized_` in BrickKeyLess order from a persistent
+    // cursor, wrapping at the end, so successive calls cover the whole set
+    // without re-scanning the front of it and the order is a pure function of
+    // the set's contents. Deferring is always safe: a brick not demoted this
+    // call is simply still CA-owned. The cursor is a KEY, not an iterator, so
+    // demoting out from under it is harmless.
+    static constexpr size_t kDefaultDemoteBudgetBricks = 32;
+    size_t demoteBudgeted(WaterCA& ca, size_t maxBricks = kDefaultDemoteBudgetBricks);
+
+    // Bricks demoted since the last call, in demotion order, and clears the
+    // queue. The replication feed (an explicit key removal) and the re-mesh
+    // feed, exactly mirroring takeRecentlyMobilized() — which the engine must
+    // drain FIRST when it drains both in one frame, so a brick that mobilized
+    // and demoted in the same frame lands on "implicit" rather than on
+    // "mobilized". Condition (b) makes that sequence essentially unreachable
+    // (a freshly mobilized brick is filled and woken, hence active), but the
+    // order is free to get right and expensive to discover.
+    std::vector<BrickKey> takeRecentlyDemoted();
+
+    // Lifetime totals: units handed back to the implicit field, and bricks
+    // given back. `demotedVolume()` is deliberately NOT netted out of
+    // debited_/credited_ below — those stay GROSS one-way flow counters, so
+    // their difference remains a pure audit of the wall invariant even after a
+    // brick has round-tripped.
+    uint64_t demotedVolume() const { return demoted_; }
+    uint64_t demotedBrickCount() const { return demotedBricks_; }
+
     // --- ledger / audit -----------------------------------------------------
 
     // Units this mobilizer has moved out of the implicit field, and units it
@@ -1210,6 +1356,11 @@ private:
     uint64_t ceilingRefusals_ = 0;
     CeilingReliefFn ceilingRelief_;
     uint64_t ceilingReliefCalls_ = 0;
+    std::vector<BrickKey> recentlyDemoted_;
+    BrickKey demoteCursor_{0, 0, 0}; // meaningful only while demoteCursorSet_
+    bool demoteCursorSet_ = false;
+    uint64_t demoted_ = 0;
+    uint64_t demotedBricks_ = 0;
 };
 
 // ===========================================================================

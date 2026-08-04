@@ -1063,6 +1063,30 @@ fixed point. That is fine and should be stated rather than engineered around:
 one brick-shell of the water surface, 0.8 m thick, stays CA-owned. The scar
 is a rim, not a river.
 
+**Correction, found while building this (2026-08-03).** The surface brick is
+not excluded by **rule**, it is excluded in **practice**, and the difference
+matters if anyone ever tries to "fix" it. Nothing in the shipped predicate
+treats a partial fill specially — a surface whose datum the CA happens to land
+on exactly *does* demote, correctly and for free. What excludes the real case
+is that the CA settles to its own fixed point and the datum was computed by a
+different law, so they agree only by coincidence. Measured on a brick whose
+datum has a ragged 128/100 top layer: Phase C levels it flat, the levelled
+value equals neither datum value in any of the 64 cells, and the brick stays
+CA-owned through 200 further ticks
+(`waterca_demotion_never_reclaims_a_ragged_surface_brick`).
+
+**As built.** `WaterMobilizer::canDemote` / `demoteBrick` / `demoteBudgeted` /
+`takeRecentlyDemoted`, plus `WaterCA::clearBrickFill` as the only sink.
+`demotedVolume()` is a separate counter: `debited_`/`credited_` stay **gross**
+one-way flow totals, so their difference remains a pure audit of the wall
+invariant even after a brick has round-tripped. No persistence code was needed —
+`WaterState` already serializes `mobilized_` as a set, so a demoted brick is a
+key that is no longer in it and its fill is gone because `clearBrickFill`
+collapsed the brick out of the map. The budget counts **examinations**, not
+demotions, because the 512-cell scan is the cost and a sweep that finds nothing
+must still be bounded; a persistent key cursor wraps through the set so
+successive calls cover all of it without re-scanning the front.
+
 Condition (b) matters because demotion **restores the wall**
 (`makeSolidFn`). A wall reappearing in contact with moving water is a
 discontinuity; requiring the neighbourhood to be quiet removes the case
@@ -1153,6 +1177,50 @@ one that is *guaranteed* to bound the worst case. Demotion is the one that
 makes the average acceptable. Re-baking is the one that actually returns the
 world to "content is free". They are complementary and should ship in that
 order — ceiling, demotion, re-bake — because each is useful without the next.
+
+#### 6.5.6 The adjacent landmine: a reservoir over 65,536 cells never levels
+
+Located, confirmed and **deliberately not fixed** here, so it can be scheduled
+rather than rediscovered.
+
+* **Where it lives.** `kMaxHydrostaticComponentCells = 65536`,
+  `voxel-core/src/waterca.cpp:108`. Tripped at `:1065` (`cells.size() >` cap
+  sets `overflowed`), acted on at `:1180`: an over-cap component is
+  `continue`d past and left **completely unmodified this tick** — deferred and
+  correct, never partially levelled and wrong. Contract stated at
+  `waterca.h:213-222`; `WaterCAProfile::hydroOverflowed` (`waterca.h:418`) is
+  the only instrument and it needs `-DVXC_WATER_PROFILE=ON`.
+* **The number.** 65,536 **cells**, and the cells are counted **including the
+  air** the flood walks (ADR-0003 §"Verifying the two previously-filed
+  blockers", item 1, confirmed). At 10 cm voxels that is 65.5 m³ — an 8 m × 8 m
+  × 1 m pond is 64,000 cells, just under. So the cap is reached by a pond a
+  player can throw a rock across, and reached **sooner** than that once the air
+  shell above the surface is counted.
+* **What it would take.** ADR-0003 is already the design pass and it is
+  further along than "add a union-find": it re-derived the two previously filed
+  blockers (both real, both survivable — the cell count *decomposes* into
+  persistent water-component size plus this tick's air, and every air bridge
+  lies inside the `touched` region we already pay to walk) and then filed a
+  **third, sharper** one that is the actual work: **splits** (union-find merges
+  but does not delete, and a cell draining to 0 can split a body, so the worst
+  case is today's cost plus guard overhead) and **the visited obligation**
+  (even a provably unchanged component must still have its cells marked
+  visited, so the persistent structure must carry per-body, per-brick mask
+  state, not just a count and a volume). That is a real work item with a real
+  design in hand, not a constant to raise.
+* **Does it make 9b or 9c untestable at realistic scale? No, and here is
+  why.** The cap gates *levelling*, and neither bound reads a levelled surface.
+  9b counts bricks. 9c's predicate is per-cell equality against the datum, and
+  its two qualifying shapes are unaffected: a **fully dry** brick has nothing
+  to level, and a **fully submerged** interior brick is 255 everywhere whatever
+  the surface above it is doing. What the cap *does* guarantee is that behind a
+  real dam the surface is a mound rather than a plane — so the **surface**
+  bricks are even further from the datum than §6.5.3 already says, which makes
+  demotion reclaim *less*, never *wrongly*. The tests here run below the cap,
+  and that is a statement about their size, not a hidden dependence on it.
+* **What it does block.** "Dam a river" as a *look*. It is squarely in the way
+  of §6.3.2's upstream-rise answer and should be scheduled before 9f, not
+  before 9a–9c.
 
 ---
 
@@ -1341,21 +1409,35 @@ plane cannot support (§6.3.8) and a dam behaviour that does not happen (M1).
 Ordered so each step is useful without the next, and so the two cheap
 *bounds* land before the expensive *behaviour*.
 
-* **9a. The mobilization gate.** A caller-supplied `bool(const BrickKey&)`
+* **9a. The mobilization gate — DONE on `claude/water-return`.**
+  `WaterMobilizer::setFrontGate`, a caller-supplied `bool(const BrickKey&)`
   consulted by `advanceFront` only, never `mobilizeEditRegion` (§6.3.3).
-  ~10 lines in `waterca.h`/`.cpp`, no tick rule touched, `kWaterCAVersion`
-  **not** bumped. *Unblocks: every bound below. Verified: extend
-  `waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain`
-  with a gated variant that pins the reach instead of eating it.*
-* **9b. The `mobilized_` ceiling + demotion pressure (§6.5.5).** The blunt
-  worst-case bound. Safe by the front budget's own argument. *Verified: a
-  scripted mass-mobilization that hits the ceiling and freezes rather than
-  growing; ledger and `shortfallVolume()` still exact.*
-* **9c. CA → implicit demotion (§6.5.3).** Exact predicate, authority-only,
-  budgeted, replicated as key removal, in the water blob not the edit log.
-  *Unblocks: reversibility — §6.3.6's scars and the canal-refill case.
-  Verified: drain → refill → demote → digest equals the never-touched world;
-  volume invariant asserted every tick.*
+  Checked at both seed and drain time — seed time is what keeps `pending_`
+  bounded beside a permanently frozen reach. No tick rule touched,
+  `kWaterCAVersion` **not** bumped. *Measured: the drain edit that M2 says
+  converts 32 x-bricks converts 4, leaving 913,920 of 1,044,480 implicit units
+  with the datum. Verified: three tests in C8b's own harness — the pinned
+  reach, the closed gate an edit still fires through, and both halves of
+  release (see M4 in §6.3.5 — one prediction was wrong).*
+* **9b. The `mobilized_` ceiling + demotion pressure (§6.5.5) — DONE on
+  `claude/water-return`.** `setMobilizedCeiling` / `atMobilizedCeiling` /
+  `ceilingRefusals` / `setCeilingRelief`. Safe by the front budget's own
+  argument. `mobilizeEditRegion` and `markMobilized` are exempt, so the count
+  may exceed the ceiling and the test is `>=`. *Measured: M2's runaway stops at
+  exactly 12 of 44 bricks with a ceiling of 12; the stalled queue is 12 bricks
+  at tick 200 and the same 12 at tick 4000, because refusal happens at seed
+  time. Ledger and `shortfallVolume()` exact on all 4,000 stalled ticks.*
+* **9c. CA → implicit demotion (§6.5.3) — DONE on `claude/water-return`.**
+  Exact predicate (zero tolerance), authority-only, budgeted by examinations,
+  replicated as key removal via `takeRecentlyDemoted`, in the water blob and
+  not the edit log — and needing no new persistence code at all. *Verified:
+  one unit in one cell of 512 flips demotable → not → demotable with no
+  hysteresis; demote/re-mobilize round trip conserves volume as exact integer
+  equality and returns a byte-identical digest to the never-touched world; a
+  dried reach's four scar bricks refuse demotion until the override makes them
+  exact, then hand back, and the river refills through the closed hole for
+  free. `waterca.h`'s one-way doctrine comment is rewritten to say why the
+  requirement was always exactness and never one-wayness.*
 * **9d. The tick counter.** An authoritative, replicated fixed-step counter
   for the ramp (§6.3.5). Small, but a hard prerequisite for 9f.
 * **9e. Edit-log record kind + compaction.** `kFormatVersion` 2 → 3 with a
