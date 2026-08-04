@@ -54,6 +54,39 @@ from terrain_service.providers.diffusion import (  # noqa: E402
 )
 
 
+class ReadOnlyFineCache:
+    """The real cache, with the FINE tier hidden and write-protected.
+
+    ``pregen._run_bake`` skips any tile already in the fine cache and writes
+    every tile it bakes. Both are right for production and both are wrong for a
+    DIAGNOSTIC re-bake of tiles that already shipped: the skip means the run
+    does nothing, and the write means a diagnostic run can mutate the world.
+
+    This wrapper delegates everything (coarse tiles, the flow pyramid, the
+    world identity record) to the real ``TileCache`` and overrides exactly two
+    methods: ``get_fine`` always misses, so every requested tile is baked, and
+    ``put_fine`` drops the bytes on the floor. The npz dump, which is what the
+    diagnosis reads, happens BEFORE the put and is unaffected.
+
+    Deliberately not a flag on ``pregen``: the shipped bake path has no
+    business growing a "bake it again but do not keep it" mode, and a wrapper
+    here cannot be reached by a production run.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.suppressed = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_fine(self, *a, **k):
+        return None
+
+    def put_fine(self, provider_id, seed, x, y, data):
+        self.suppressed += 1
+
+
 class CacheOnlyProvider:
     """Everything ``_run_bake`` reads off a provider, and nothing that generates.
 
@@ -115,7 +148,17 @@ def main() -> int:
                     help="ignore cached flow superblocks (an A/B needs this; "
                          "see pregen's own note on why reuse is the default)")
     ap.add_argument("--allow-incomplete-superblock", action="store_true")
+    ap.add_argument("--npz-dir", default=None,
+                    help="dump each baked tier as <x>_<y>.npz here (elevation, "
+                         "accumulation, flow, and -- the point -- the "
+                         "UNQUANTISED discharge and water plane)")
+    ap.add_argument("--diagnostic", action="store_true",
+                    help="re-bake tiles that are already in the fine cache and "
+                         "DO NOT write the result back. Only useful with "
+                         "--npz-dir; the run's whole output is the dump.")
     args = ap.parse_args()
+    if args.diagnostic and not args.npz_dir:
+        ap.error("--diagnostic without --npz-dir would bake and keep nothing")
 
     config = DiffusionConfig(
         checkpoint_label=args.checkpoint_label,
@@ -125,6 +168,10 @@ def main() -> int:
     )
     provider = CacheOnlyProvider(args.provider_id, config)
     cache = TileCache(Path(args.cache_dir))
+    if args.diagnostic:
+        cache = ReadOnlyFineCache(cache)
+        print("DIAGNOSTIC: fine tier hidden and write-protected; the only "
+              f"output is {args.npz_dir}", file=sys.stderr)
 
     print(f"coarse namespace: {provider.provider_id}", file=sys.stderr)
     print(f"fine   namespace: {provider.fine_provider_id}", file=sys.stderr)
@@ -142,14 +189,18 @@ def main() -> int:
         bake_model_parent=False,
         bake_rebuild_superblocks=args.rebuild_superblocks,
         bake_no_verify_superblocks=False,
-        bake_npz_dir=None,
+        bake_npz_dir=args.npz_dir,
         # Never generate. The provider above cannot anyway; this keeps the
         # refusal at the pregen layer where the message is legible.
         bake_no_coarse_generate=True,
         allow_incomplete_superblock=args.allow_incomplete_superblock,
         codec=args.codec,
     )
-    return pregen._run_bake(bake_args, provider, cache)
+    rc = pregen._run_bake(bake_args, provider, cache)
+    if args.diagnostic:
+        print(f"DIAGNOSTIC: {cache.suppressed} fine tile write(s) suppressed",
+              file=sys.stderr)
+    return rc
 
 
 if __name__ == "__main__":
