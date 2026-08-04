@@ -28,6 +28,15 @@ the largest catchment it found (10.2 -> 78 km2). D8 is still exactly right for
 tracing a channel centreline and for the stream-power slope term, which is why
 `d8_receivers` is a public primitive rather than an implementation detail.
 
+`accumulate_d8` is the same argument at one remove. It routes a field along that
+single-receiver forest, and it is deliberately NOT offered for the area field --
+the 45-degree artefact above is real and the ground must not inherit it. It
+exists for a field whose only consumer is a THRESHOLD (the water plane's
+`q >= q_drawable`), where MFD's splitting is not a smoother network but a reach
+whose discharge falls below the cut and comes back above it, over and over: 25-33%
+of network cells on the measured corridor have no strictly lower neighbour holding
+as much as they do. See `docs/measurements/river-fragmentation-diagnosis-*`.
+
 **Priority-flood with a real binary heap.** The reference `d8_flow` /
 `flow_accumulation` in `terrain-diffusion/terrain_diffusion/inference/postprocessing.py`
 have the right algorithms but a Python `heapq` loop, which does not survive 67 M cells.
@@ -84,6 +93,7 @@ __all__ = [
     "fill_depressions",
     "d8_receivers",
     "accumulate_mfd",
+    "accumulate_d8",
     "enforce_descent",
 ]
 
@@ -290,6 +300,30 @@ def _accumulate_mfd(z, order_asc, acc, inv_dist, p):
 
 
 @_jit(cache=True)
+def _accumulate_d8(rec, order_asc, acc):
+    """The same descending-elevation sweep, paying out to ONE receiver.
+
+    ``p -> infinity`` of ``_accumulate_mfd``, expressed exactly rather than
+    approached: the whole of a cell's accumulation goes to its steepest lower
+    neighbour and nothing is split. Sequential for the same reason -- a cell
+    must be complete before it pays out -- and it walks ``order_asc`` backwards
+    for the same reason too, so a caller can share one ``argsort`` between the
+    two sweeps.
+
+    ``rec`` is ``_d8_receivers``' flat receiver, -1 where the cell has no
+    strictly lower neighbour. After an epsilon fill that is exactly a
+    domain-border cell, so the conservation statement is the MFD one verbatim:
+    the sum over terminal cells equals the sum of the seed.
+    """
+    for i in range(order_asc.size - 1, -1, -1):
+        c = order_asc[i]
+        r = rec[c]
+        if r >= 0:
+            acc[r] += acc[c]
+    return acc
+
+
+@_jit(cache=True)
 def _descent_enforce(rec, z_ref, z, eps):
     """One topological sweep of ``z[c] = max(z[c], z[rec[c]] + min(drop, eps))``.
 
@@ -435,12 +469,48 @@ def d8_receivers(z: np.ndarray, cell_m: float) -> tuple[np.ndarray, np.ndarray]:
     return _d8_receivers(zz, cell_m)
 
 
+def _seed_accumulator(zz, cell_m, source, inflow):
+    """The float64 starting accumulation, shared by the MFD and D8 sweeps.
+
+    ONE construction for both, not two: the sweeps differ only in how a cell
+    pays out, and a second copy of the seed rules is how ``accumulate_d8`` would
+    quietly stop meaning the same thing as ``accumulate_mfd`` (see the module
+    docstring's three-currencies note in ``water.py`` for the version of that
+    mistake this repo has already made).
+    """
+    if source is None:
+        acc = np.full(zz.size, cell_m * cell_m, np.float64)
+    else:
+        src = np.ascontiguousarray(source, dtype=np.float64)
+        if src.shape != zz.shape:
+            raise ValueError(f"source shape {src.shape} != z shape {zz.shape}")
+        if not np.isfinite(src).all():
+            raise ValueError("source contains NaN or infinity")
+        if (src < 0.0).any():
+            # A negative source would make the accumulation non-monotone
+            # downstream, and every consumer (the width law, the head test, the
+            # log2 flow plane) assumes monotonicity.
+            raise ValueError("source is a per-cell quantity and must be >= 0")
+        acc = src.ravel().copy()
+    if inflow is not None:
+        inf = np.ascontiguousarray(inflow, dtype=np.float64)
+        if inf.shape != zz.shape:
+            raise ValueError(f"inflow shape {inf.shape} != z shape {zz.shape}")
+        if not np.isfinite(inf).all():
+            raise ValueError("inflow contains NaN or infinity")
+        if (inf < 0.0).any():
+            raise ValueError("inflow is an area in m^2 and must be >= 0")
+        acc += inf.ravel()
+    return acc
+
+
 def accumulate_mfd(
     z: np.ndarray,
     cell_m: float,
     p: float = 1.1,
     inflow: np.ndarray | None = None,
     *,
+    source: np.ndarray | None = None,
     return_order: bool = False,
 ) -> np.ndarray:
     """Multiple-flow-direction catchment area, in m^2, as float64.
@@ -464,6 +534,23 @@ def accumulate_mfd(
     conditions enter (plan: "inject upstream accumulation as inflow boundary conditions
     at the fine domain edge"). ``None`` means every cell starts with its own area.
 
+    ``source`` REPLACES the ``cell_m**2`` per-cell seed instead of adding to it, which
+    is what turns this sweep from an AREA field into a DISCHARGE field: seed each cell
+    with its own runoff VOLUME (``runoff_m_per_yr * cell_area``) and the sweep returns
+    m^3/yr delivered, over the identical MFD weights the area field uses. That is
+    watershed plan §4.1.1's "runoff-weighted source term instead of the constant unit
+    area", and it is one sweep rather than the two-sweeps-and-subtract form
+    ``tools/worldmaps/water.py`` used before this existed -- which was exact only
+    because that tool had no ``inflow`` to confound the subtraction. With both terms
+    live, ``A(cell_area + I_area)`` and ``A(cell_area + I_q)`` differ by
+    ``A(I_q) - A(I_area)``, which is not the discharge, so the map's construction does
+    not generalise to the bake and this parameter exists instead.
+
+    ``source`` and ``inflow`` compose: the seed is ``source + inflow``, so a caller
+    with a boundary condition in the SAME currency as its source passes both.
+    ``source=None`` is exactly ``np.full(shape, cell_m**2)`` and reproduces the area
+    sweep bit-for-bit (asserted by test).
+
     Conservation, which is the invariant to test against: every cell's contribution is
     passed along until it reaches a cell with no strictly lower neighbour, so the sum
     of the result over those terminal cells equals ``z.size * cell_m**2 + inflow.sum()``.
@@ -478,16 +565,7 @@ def accumulate_mfd(
     if not np.isfinite(p) or p <= 0.0:
         raise ValueError(f"p must be finite and > 0, got {p!r}")
 
-    acc = np.full(zz.size, cell_m * cell_m, np.float64)
-    if inflow is not None:
-        inf = np.ascontiguousarray(inflow, dtype=np.float64)
-        if inf.shape != zz.shape:
-            raise ValueError(f"inflow shape {inf.shape} != z shape {zz.shape}")
-        if not np.isfinite(inf).all():
-            raise ValueError("inflow contains NaN or infinity")
-        if (inf < 0.0).any():
-            raise ValueError("inflow is an area in m^2 and must be >= 0")
-        acc += inf.ravel()
+    acc = _seed_accumulator(zz, cell_m, source, inflow)
 
     inv_dist = (1.0 / (np.array(_DIST, np.float64) * cell_m)).astype(zz.dtype)
     # int32, not argsort's native intp: `_as_grid` has already refused any
@@ -498,6 +576,77 @@ def accumulate_mfd(
     _accumulate_mfd(zz, order, acc, inv_dist, zz.dtype.type(p))
     acc = acc.reshape(zz.shape)
     return (acc, order) if return_order else acc
+
+
+def accumulate_d8(
+    z: np.ndarray,
+    cell_m: float,
+    *,
+    source: np.ndarray | None = None,
+    inflow: np.ndarray | None = None,
+    receivers: np.ndarray | None = None,
+) -> np.ndarray:
+    """Single-receiver (D8) accumulation over the same surface, as float64.
+
+    Same signature, same seed rules, same conservation invariant and the same
+    descending-elevation sweep as `accumulate_mfd`; the only difference is that
+    a cell pays its whole accumulation to its STEEPEST lower neighbour instead
+    of splitting it across all of them. That is the ``p -> infinity`` limit of
+    the MFD weights, expressed exactly.
+
+    WHY THIS EXISTS RATHER THAN A LARGE ``p``. Three reasons, in the order they
+    bite:
+
+    1. **``p`` is not a free parameter.** ``BakeConstants.mfd_p`` is hashed into
+       ``bake_identity_payload`` (it decides the area field, hence ``A^m``,
+       hence every height) AND into ``superblock_inputs_fingerprint``. Moving it
+       moves the ground; adding a second scalar that moves only the water pass
+       means the fine tier and the hydrology pyramid route the same water two
+       different ways.
+    2. **Large ``p`` silently loses water in float32.** ``_accumulate_mfd``
+       evaluates ``(drop * inv_dist) ** p`` in ``z``'s own dtype. After an
+       epsilon fill a flat's drop is ~2 ULP of the domain's magnitude, so the
+       slope there is ~2.6e-4 at 3 km elevation, and ``2.6e-4 ** p`` underflows
+       float32 at ``p ~ 11``. Every weight becomes 0, ``tot`` is 0, and the
+       sweep treats the cell as a PIT and drops its whole accumulation -- on
+       exactly the flat, filled, near-coast ground a river reaches the sea
+       across. Measured in ``test_accumulate_d8_beats_high_p_underflow``.
+    3. **It is not actually single-receiver.** At the largest ``p`` float32
+       tolerates, a neighbour at 0.8x the steepest slope still takes 11% of the
+       flow.
+
+    NOT FOR THE AREA FIELD. The module docstring's first lesson stands: pure D8
+    routes along 8 compass directions and draws dead-straight 45-degree channels
+    in a hillshade, and the bake's area field is MFD for that reason. This is
+    for a field whose consumer is a THRESHOLD, where splitting a reach's
+    accumulation eight ways below the cut is the whole defect -- see
+    ``pipeline``'s B6 and ``docs/measurements/river-fragmentation-*``.
+
+    ``receivers`` may be supplied (flat or 2-D, -1 at a root) when the caller
+    already has ``d8_receivers(z, cell_m)[0]`` for the same surface; it is
+    recomputed otherwise. Passing a forest built on a DIFFERENT surface is a
+    caller error and is not detectable here -- the sweep would then walk an
+    order that is not descending along the forest and the result would not be
+    an accumulation at all.
+    """
+    zz = _as_grid(z, "z")
+    cell_m = float(cell_m)
+    if not np.isfinite(cell_m) or cell_m <= 0.0:
+        raise ValueError(f"cell_m must be finite and > 0, got {cell_m!r}")
+
+    if receivers is None:
+        rec, _ = _d8_receivers(zz, cell_m)
+    else:
+        rec = np.asarray(receivers)
+        if rec.size != zz.size:
+            raise ValueError(
+                f"receivers has {rec.size} entries, z has {zz.size}")
+    rec = np.ascontiguousarray(rec, dtype=np.int32).ravel()
+
+    acc = _seed_accumulator(zz, cell_m, source, inflow)
+    order = np.argsort(zz, axis=None).astype(np.int32)
+    _accumulate_d8(rec, order, acc)
+    return acc.reshape(zz.shape)
 
 
 def enforce_descent(

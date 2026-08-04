@@ -27,12 +27,27 @@
 #   .\tools\water-playtest.ps1 -Keep           # keep craters + water from last session
 #   .\tools\water-playtest.ps1 -Origin         # spawn at (0,0), which is ~sea level
 #   .\tools\water-playtest.ps1 -Swe            # arm the SWE momentum layer at boot
+#   .\tools\water-playtest.ps1 -Rivers         # arm the W3 river layer at boot
 [CmdletBinding()]
 param(
     [switch]$Origin,
     [switch]$Keep,
-    [switch]$Swe
+    [switch]$Swe,
+    # -Rivers WAS MISSING FROM THIS BLOCK while the launch line below still
+    # tested $Rivers. This script sets no strict mode, so an undeclared
+    # variable is $null, `if ($null)` is false, and the switch silently did
+    # nothing on every run -- while `-Rivers` on the command line was rejected
+    # outright by [CmdletBinding()] as an unknown parameter. The usage block
+    # above never mentioned it either, so the only surviving way to arm rivers
+    # was to type the cvar in the console, which the note further down calls
+    # "the reliable path". It was reliable because it was the only one working.
+    [switch]$Rivers
 )
+
+# A misspelt or undeclared variable is now an ERROR rather than a silent
+# $null. That is the class of bug -Rivers was, and it survived unnoticed
+# precisely because nothing complained.
+Set-StrictMode -Version Latest
 
 $ErrorActionPreference = 'Stop'
 

@@ -1210,6 +1210,1086 @@ VXC_TEST(waterca_mobilize_placing_into_an_implicit_lake_raises_no_shortfall) {
 }
 
 // ===========================================================================
+// C8b — the two facts docs/watershed-system-plan.md §6.3 is built on.
+//
+// A baked RIVER is the same shape of implicit datum as a baked lake, but it
+// is a long, thin, SLOPING one, and that difference changes the mobilizer's
+// behaviour in two ways that are not obvious from the lake tests above and
+// that §6.3's design depends on being true. Both are pinned here because both
+// were initially predicted WRONG when §6.3 was drafted.
+//
+// The synthetic river: a straight trench along +x whose bed descends one
+// voxel every kSlopeRun voxels, holding an implicit water column kRiverDepth
+// deep — a pure function of position, exactly like the production ImplicitFn
+// at VoxelWaterSubsystem.cpp:351-363.
+// ===========================================================================
+
+namespace {
+
+constexpr int64_t kRiverLen = 256;     // 25.6 m of river at 10 cm voxels
+constexpr int64_t kRiverWide = 4;
+constexpr int64_t kSlopeRun = 32;      // one voxel of fall per 3.2 m (~3%)
+constexpr int64_t kRiverBedTop = 64;
+constexpr int64_t kRiverDepth = 4;
+
+int64_t riverBedAt(int64_t vx) { return kRiverBedTop - floorDiv(vx, kSlopeRun); }
+
+// Terrain: the trench, plus a dry chamber underneath that a drain can reach,
+// plus an optional drain shaft the "player" digs through the bed, plus an
+// optional wall the "player" builds across the channel.
+constexpr int64_t kDamThick = 2;
+constexpr int64_t kDamHeight = 3 * kRiverDepth; // three times the river's own depth
+
+WaterCA::SolidFn riverTerrain(std::shared_ptr<bool> drainOpen, int64_t drainX,
+                              std::shared_ptr<bool> damBuilt = nullptr, int64_t damX = 0) {
+    return [drainOpen, drainX, damBuilt, damX](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const bool inTrenchXY = vx >= 0 && vx < kRiverLen && vy >= 0 && vy < kRiverWide;
+        if (damBuilt && *damBuilt && inTrenchXY && vx >= damX && vx < damX + kDamThick &&
+            vz < riverBedAt(vx) + kDamHeight && vz >= riverBedAt(vx))
+            return MAT_ROCK; // the wall the player builds
+        if (inTrenchXY && vz >= 0 && vz < 20) return MAT_AIR; // the dry chamber below
+        if (*drainOpen && inTrenchXY && vx >= drainX && vx < drainX + 4 && vz >= 20 &&
+            vz < riverBedAt(vx) + 1)
+            return MAT_AIR; // the shaft the dig opens
+        if (!inTrenchXY) return MAT_ROCK;
+        return vz < riverBedAt(vx) ? MAT_ROCK : MAT_AIR;
+    };
+}
+
+WaterMobilizer::ImplicitFn riverWater() {
+    return [](int64_t vx, int64_t vy, int64_t vz) -> uint8_t {
+        if (vx < 0 || vx >= kRiverLen || vy < 0 || vy >= kRiverWide) return 0;
+        const int64_t b = riverBedAt(vx);
+        return (vz >= b && vz < b + kRiverDepth) ? 255 : 0;
+    };
+}
+
+uint64_t riverImplicitVolume(const WaterMobilizer& mob) {
+    uint64_t sum = 0;
+    for (int64_t x = 0; x < kRiverLen; ++x)
+        for (int64_t y = 0; y < kRiverWide; ++y)
+            for (int64_t z = riverBedAt(x); z < riverBedAt(x) + kRiverDepth; ++z)
+                sum += mob.implicitFillAt(x, y, z);
+    return sum;
+}
+
+// Inclusive span of mobilized brick x-coordinates, in bricks.
+int64_t mobilizedXSpan(const WaterMobilizer& mob) {
+    if (mob.mobilizedBricks().empty()) return 0;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (const BrickKey& k : mob.mobilizedBricks()) {
+        lo = std::min<int64_t>(lo, k.x);
+        hi = std::max<int64_t>(hi, k.x);
+    }
+    return hi - lo + 1;
+}
+
+// Topmost voxel holding CA water in one column, or -1.
+int64_t topWaterZ(const WaterCA& ca, int64_t vx, int64_t vy) {
+    int64_t top = -1;
+    for (int64_t z = riverBedAt(vx); z < riverBedAt(vx) + 40; ++z)
+        if (ca.fillAt(vx, vy, z) > 0) top = z;
+    return top;
+}
+
+} // namespace
+
+// FACT 1 — ONE EDIT THAT LETS A BAKED RIVER DRAIN MOBILIZES THE WHOLE RIVER.
+//
+// This is the cost bound §6.3 exists to impose. `advanceFront` mobilizes the
+// face-neighbours of every ACTIVE brick, and a freshly mobilized brick is
+// filled and woken, so as long as the water it releases keeps MOVING the front
+// keeps advancing. On a sloping river with a drain at one end, "keeps moving"
+// holds all the way to the source: a single 4-voxel-wide shaft dug near the
+// downstream end converts 100% of the reach — every brick, every unit — with
+// no length bound anywhere in the loop.
+//
+// The contrast that makes the mechanism clear is FACT 2 below: with nowhere to
+// drain, the very same front stops after one tick. It is drainage, not
+// disturbance, that makes mobilization run away.
+VXC_TEST(waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16; // near the downstream end
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    CHECK(riverVolume > 0);
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+
+    // THE EDIT: dig the shaft. The three hooks a real engine edit runs.
+    *drainOpen = true;
+    const int64_t z1 = riverBedAt(kDrainX) + 1;
+    ca.invalidateSolidRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+    CHECK(mob.mobilizeEditRegion(ca, kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1) > 0);
+    ca.wakeRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+
+    // The edit itself touches only a handful of bricks.
+    CHECK(mob.mobilizedBricks().size() < size_t(8));
+
+    bool settled = false;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settled = true;
+            break;
+        }
+    }
+    CHECK(settled);
+
+    // The whole river mobilized: every x-brick of the reach, and every unit of
+    // its implicit water is now CA fill that must be ticked, replicated and
+    // persisted forever.
+    CHECK_EQ(mobilizedXSpan(mob), kRiverLen / WaterBrick8::kEdge);
+    CHECK_EQ(riverImplicitVolume(mob), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), riverVolume);
+    CHECK_EQ(mob.creditedVolume(), riverVolume);
+}
+
+// FACT 2 — DAMMING AN UNDISTURBED BAKED RIVER DOES NOTHING AT ALL.
+//
+// The intuition §6.3 was first drafted on ("the CA is volume-conserving, so
+// water pools behind a wall and spills over the lowest lip") is true of water
+// that is FLOWING. A baked river is not flowing: it is a static datum at its
+// own equilibrium, and every part of it that a player has not touched is a
+// WALL to the CA, not water. So a wall built across it dams nothing — there is
+// no discharge to impound. The stage upstream does not rise by even one voxel,
+// and the whole thing settles almost immediately.
+//
+// This is why §6.3 cannot be only a downstream-drying layer: without something
+// that supplies throughflow at the player's deviation, the UPSTREAM half of
+// "dam a river" has no mechanism behind it either.
+VXC_TEST(waterca_mobilize_a_dam_on_an_undisturbed_river_impounds_nothing) {
+    auto neverDrain = std::make_shared<bool>(false);
+    auto damBuilt = std::make_shared<bool>(false);
+    constexpr int64_t kDamX = kRiverLen / 2;
+    WaterMobilizer mob(riverWater(),
+                       riverTerrain(neverDrain, kRiverLen * 4 /* unreachable */, damBuilt, kDamX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    const int64_t bedZ = riverBedAt(kDamX);
+
+    // The baked water surface just upstream of where the dam will go: the
+    // datum says the river's top water voxel is bed + depth - 1.
+    const int64_t bakedTopZ = riverBedAt(kDamX - 1) + kRiverDepth - 1;
+
+    // THE EDIT: the player walls the channel off, three times the river's own
+    // depth. (The wall is expressed through the mobilizer's terrain half, so
+    // the implicit field stops claiming water inside the rock automatically.)
+    *damBuilt = true;
+
+    // Building the wall DESTROYS the implicit water in the cells it occupies —
+    // an intended discontinuity, documented at waterca.h:963-977 ("filling a
+    // hole destroys water either way"). Exactly the dam's own footprint
+    // through the river's water column, and nothing else.
+    const uint64_t afterDamVolume = riverImplicitVolume(mob);
+    CHECK_EQ(riverVolume - afterDamVolume,
+             uint64_t(kDamThick * kRiverWide * kRiverDepth * 255));
+
+    ca.invalidateSolidRegion(kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+    mob.mobilizeEditRegion(ca, kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+    ca.wakeRegion(kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+
+    int settledTick = -1;
+    for (int i = 1; i <= 2000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), afterDamVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settledTick = i;
+            break;
+        }
+    }
+
+    // It stops at once — there is no flow to sustain the front.
+    CHECK(settledTick >= 0);
+    CHECK(settledTick <= 5);
+
+    // Only the edit's own neighbourhood ever mobilized: the dam did NOT eat
+    // the river the way the drain in FACT 1 did.
+    CHECK(mobilizedXSpan(mob) < kRiverLen / WaterBrick8::kEdge / 4);
+
+    // And the decisive reading: the water standing just upstream of the dam is
+    // still at exactly the baked river surface. It did not rise one voxel, and
+    // it is nowhere near the crest.
+    CHECK_EQ(topWaterZ(ca, kDamX - 1, kRiverWide / 2), bakedTopZ);
+    CHECK(bakedTopZ < bedZ + kDamHeight); // crest is well clear; nothing overtopped
+}
+
+// ===========================================================================
+// C8c — the front gate (docs/watershed-system-plan.md work item 9a, §6.3.3).
+//
+// C8b/FACT 1 above measures the leak: one drain edit converts 100% of a baked
+// reach, permanently. The gate is the mechanism that bounds it — a
+// caller-supplied predicate consulted by `advanceFront` and BY NOTHING ELSE.
+// These three tests pin, in order: that it actually pins the reach FACT 1 eats;
+// that it does not — and must never — gate the EDIT seed; and that refusing is
+// a deferral rather than a loss, so lifting the gate reproduces FACT 1's end
+// state exactly, ledger included.
+//
+// They reuse C8b's synthetic river deliberately: the gate has to be shown
+// working against the very harness that measured the runaway, not a friendlier
+// one.
+// ===========================================================================
+
+namespace {
+
+// The freeze boundary, in brick x. §6.3.3's mobilization freeze is "bricks
+// along the affected reach are ineligible for activity-driven mobilization";
+// here that is every brick upstream of this line. Chosen so the shaft's own
+// edit halo (brick x 29..31) sits inside the permitted side.
+constexpr int32_t kFreezeFromBrickX = 28;
+
+WaterMobilizer::FrontGateFn freezeUpstreamOf(int32_t fromBrickX) {
+    return [fromBrickX](const BrickKey& k) { return k.x >= fromBrickX; };
+}
+
+// Implicit units still owned by the datum in river voxels upstream of a brick
+// line — what a perfect freeze at that line leaves untouched.
+uint64_t riverImplicitVolumeBelowBrickX(int32_t brickX) {
+    return static_cast<uint64_t>(brickX) * WaterBrick8::kEdge * kRiverWide * kRiverDepth * 255;
+}
+
+} // namespace
+
+// THE GATE PINS THE REACH THAT THE UNGATED FRONT EATS.
+//
+// Same river, same 4-voxel drain shaft, same 100%-conversion setup as C8b's
+// FACT 1 — with one predicate installed. The released water still drains and
+// still spreads through the chamber below (a brick holding NO implicit water is
+// not a wall, so the gate does not impede flow at all); what stops is the
+// CONVERSION of the upstream datum into permanent CA bricks.
+VXC_TEST(waterca_front_gate_pins_the_reach_the_ungated_front_would_consume) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setFrontGate(freezeUpstreamOf(kFreezeFromBrickX));
+    CHECK(mob.hasFrontGate());
+
+    *drainOpen = true;
+    const int64_t z1 = riverBedAt(kDrainX) + 1;
+    ca.invalidateSolidRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+    CHECK(mob.mobilizeEditRegion(ca, kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1) > 0);
+    ca.wakeRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+
+    bool settled = false;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        // The safety claim, asserted every tick: refusing to mobilize cannot
+        // leak water, because a brick the front skips is still a wall.
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settled = true;
+            break;
+        }
+    }
+    CHECK(settled);
+
+    // FACT 1's reading was kRiverLen/kEdge == 32 x-bricks and ZERO implicit
+    // units left. With the gate installed, exactly the four x-bricks on the
+    // permitted side of the freeze converted, and every unit upstream of it is
+    // still the datum's — free, unpersisted, unreplicated.
+    CHECK_EQ(mobilizedXSpan(mob), int64_t(kRiverLen / WaterBrick8::kEdge - kFreezeFromBrickX));
+    CHECK_EQ(riverImplicitVolume(mob), riverImplicitVolumeBelowBrickX(kFreezeFromBrickX));
+    CHECK(mob.frontGateRefusals() > 0);
+    for (const BrickKey& k : mob.mobilizedBricks()) CHECK(k.x >= kFreezeFromBrickX);
+}
+
+// THE GATE BLOCKS THE FRONT AND NEVER THE EDIT. This is the load-bearing
+// distinction (waterca.h "WHAT IT MUST NEVER GATE, AND WHY"): with a predicate
+// that refuses EVERYTHING, `mobilizeEditRegion` still converts the bricks a
+// player's dig reached — otherwise digging into a frozen reach would silently
+// do nothing — while `advanceFront` converts not one brick more, ever.
+VXC_TEST(waterca_front_gate_blocks_the_front_but_never_an_edit) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setFrontGate([](const BrickKey&) { return false; }); // freeze the world
+
+    *drainOpen = true;
+    const int64_t z1 = riverBedAt(kDrainX) + 1;
+    ca.invalidateSolidRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+
+    // THE POINT: the edit seed fires through a fully closed gate.
+    const size_t byEdit = mob.mobilizeEditRegion(ca, kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+    CHECK(byEdit > 0);
+    ca.wakeRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+
+    const std::set<BrickKey, BrickKeyLess> afterEdit = mob.mobilizedBricks();
+    CHECK_EQ(afterEdit.size(), byEdit);
+
+    for (int i = 0; i < 4000; ++i) {
+        CHECK_EQ(mob.advanceFront(ca), size_t(0)); // the front converts nothing
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0) break;
+    }
+
+    // Not one brick beyond the dig's own halo, and the queue never grew: a
+    // refused brick is not queued, so a permanently frozen reach beside live
+    // water cannot balloon `pending_`.
+    CHECK(mob.mobilizedBricks() == afterEdit);
+    CHECK_EQ(mob.pendingFrontBricks(), size_t(0));
+    CHECK(mob.frontGateRefusals() > 0);
+}
+
+namespace {
+
+// Digs C8b's drain shaft and runs the three edit hooks, with whatever gate the
+// caller has already installed. Shared by the two release tests below, which
+// differ only in WHEN the gate comes off.
+void openTheDrain(WaterMobilizer& mob, WaterCA& ca, std::shared_ptr<bool> drainOpen,
+                  int64_t drainX) {
+    *drainOpen = true;
+    const int64_t z1 = riverBedAt(drainX) + 1;
+    ca.invalidateSolidRegion(drainX, 0, 20, drainX + 3, kRiverWide - 1, z1);
+    mob.mobilizeEditRegion(ca, drainX, 0, 20, drainX + 3, kRiverWide - 1, z1);
+    ca.wakeRegion(drainX, 0, 20, drainX + 3, kRiverWide - 1, z1);
+}
+
+} // namespace
+
+// REFUSING IS DEFERRAL, NOT LOSS — WHILE THE WATER IS STILL MOVING. The gate's
+// safety argument is the front budget's own ("a deferred brick is still a
+// wall"), extended from a few ticks to as long as the caller likes. So a river
+// held back and then released MID-DRAIN lands on FACT 1's end state exactly:
+// every brick converted, every unit accounted, ledger identical to the run that
+// was never gated at all. Nothing was destroyed by freezing it.
+VXC_TEST(waterca_front_gate_release_mid_drain_reproduces_the_ungated_end_state) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setFrontGate([](const BrickKey&) { return false; });
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+
+    // Ten ticks of freeze. MEASURED: this reach takes 107 ticks to settle under
+    // a total freeze, so at tick 10 the released water is still very much in
+    // motion — which is what the next test turns out to depend on.
+    for (int i = 0; i < 10; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+    }
+    CHECK(ca.activeBrickCount() > 0);
+    CHECK(riverImplicitVolume(mob) > 0); // the datum still owns nearly all of it
+
+    mob.clearFrontGate();
+    CHECK(!mob.hasFrontGate());
+
+    bool settled = false;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settled = true;
+            break;
+        }
+    }
+    CHECK(settled);
+
+    // Exactly FACT 1's conclusions.
+    CHECK_EQ(mobilizedXSpan(mob), kRiverLen / WaterBrick8::kEdge);
+    CHECK_EQ(riverImplicitVolume(mob), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), riverVolume);
+    CHECK_EQ(mob.creditedVolume(), riverVolume);
+}
+
+// RELEASE AFTER THE REACH SETTLES CONVERTS NOTHING AT ALL — and this was
+// PREDICTED WRONG. The test above was first written as a single test that
+// froze the reach to a standstill and then released it, expecting FACT 1's
+// runaway to resume; it does not, and the reason is C8b's other measured fact.
+// The front is driven by ACTIVITY. Once the freed water has stopped moving
+// there are no active bricks to seed from, and the still-implicit river
+// upstream is once again what FACT 2 says an undisturbed datum is: a wall.
+//
+// MEASURED on this harness: a fully frozen reach settles at tick 107 with 3
+// x-bricks converted (the dig's own halo). Lifting the gate then leaves it at
+// 3 forever — 1/32nd of what the ungated front ate.
+//
+// This matters beyond the gate. §6.3.6 orders a release "restore the datum
+// first, lift the freeze second" to avoid a surge that the front would follow
+// to the sea. That hazard is real only while the reach is still draining; a
+// freeze that outlives the motion has already made the release free.
+VXC_TEST(waterca_front_gate_release_after_settling_never_restarts_the_front) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setFrontGate([](const BrickKey&) { return false; });
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+
+    int frozenSettleTick = -1;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0) {
+            frozenSettleTick = i;
+            break;
+        }
+    }
+    CHECK_EQ(frozenSettleTick, 107);
+
+    const std::set<BrickKey, BrickKeyLess> atRelease = mob.mobilizedBricks();
+    const uint64_t implicitAtRelease = riverImplicitVolume(mob);
+    CHECK_EQ(mobilizedXSpan(mob), int64_t(3)); // the dig's own halo, and nothing else
+
+    mob.clearFrontGate();
+    for (int i = 0; i < 500; ++i) {
+        CHECK_EQ(mob.advanceFront(ca), size_t(0));
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+    }
+
+    CHECK(mob.mobilizedBricks() == atRelease);
+    CHECK_EQ(riverImplicitVolume(mob), implicitAtRelease);
+}
+
+// ===========================================================================
+// C8d — the mobilized ceiling (work item 9b, §6.5.5).
+//
+// The gate above bounds a reach the authority DECIDED to freeze. The ceiling
+// bounds the case no policy sees coming — one player flooding a valley in one
+// session — by stopping the front outright at a per-world brick count. It is
+// the bluntest of §6.5's three bounds and the only one guaranteed to hold the
+// worst case.
+//
+// The same C8b drain that FACT 1 measured at 44 permanent bricks is the
+// scripted mass-mobilization here: it is the shape that runs away, so it is the
+// shape the ceiling has to stop.
+// ===========================================================================
+
+// THE CEILING FREEZES A RUNAWAY DRAIN INSTEAD OF LETTING IT GROW, and the
+// ledger is exact through the stall. FACT 1 ends at 44 mobilized bricks and
+// zero implicit units left; with a ceiling of 12 the front stops dead at 12 and
+// the datum keeps the rest.
+VXC_TEST(waterca_mobilized_ceiling_stops_a_runaway_drain_at_the_bound) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    constexpr size_t kCeiling = 12;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(kCeiling);
+    CHECK_EQ(mob.mobilizedCeiling(), kCeiling);
+    CHECK(!mob.atMobilizedCeiling());
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    CHECK(mob.mobilizedBricks().size() < kCeiling); // the dig alone is well under
+
+    // 4000 ticks, all of them stalled after the first few. The point of running
+    // long past settling is the queue reading at the bottom.
+    size_t pendingEarly = 0;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        // A brick the front refuses is still a wall, so a stalled world is
+        // degraded, never corrupt. Asserted every tick, through the stall.
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        CHECK(mob.mobilizedBricks().size() <= kCeiling);
+        if (i == 200) pendingEarly = mob.pendingFrontBricks();
+    }
+
+    // Stopped exactly at the bound, not near it.
+    CHECK_EQ(mob.mobilizedBricks().size(), kCeiling);
+    CHECK(mob.atMobilizedCeiling());
+    CHECK(mob.ceilingRefusals() > 0);
+    // FACT 1 left ZERO implicit units. The bound left most of the river alone.
+    CHECK(riverImplicitVolume(mob) > riverVolume / 2);
+    CHECK_EQ(mob.debitedVolume(), mob.creditedVolume());
+
+    // AND THE STALL DOES NOT LEAK INTO THE QUEUE IT STOPPED DRAINING. This is
+    // the reason the ceiling is tested in the seed loop and not only at drain
+    // time: candidates are not queued at all while stalled, so `pending_` is
+    // whatever was already in flight when the bound was reached and never
+    // grows after. Measured here: 12 bricks, unchanged from tick 200 to tick
+    // 4000. A ceiling that only refused at drain time would instead accumulate
+    // one entry per face of every active brick, every tick, forever.
+    CHECK(pendingEarly <= kCeiling);
+    CHECK_EQ(mob.pendingFrontBricks(), pendingEarly);
+}
+
+// THE CEILING NEVER BLOCKS AN EDIT EITHER. Same exemption as the gate's, for
+// the same reason and by a different code path: `mobilizeEditRegion` does not
+// consult it at all, so `mobilized_.size()` may legitimately exceed the
+// ceiling — which is why `atMobilizedCeiling()` is a `>=` test and not an `==`.
+// A world at its ceiling is a world that has stopped growing on its own; it is
+// not a world where digging stops working.
+VXC_TEST(waterca_mobilized_ceiling_never_blocks_an_edit) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(1); // already at the bound before anything happens
+    CHECK(!mob.atMobilizedCeiling());
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    const size_t byEdit = mob.mobilizedBricks().size();
+    CHECK(byEdit > 1); // the dig converted straight through the ceiling
+    CHECK(mob.atMobilizedCeiling());
+
+    for (int i = 0; i < 2000; ++i) {
+        CHECK_EQ(mob.advanceFront(ca), size_t(0)); // ...and the front converts none
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0) break;
+    }
+    CHECK_EQ(mob.mobilizedBricks().size(), byEdit);
+
+    // A SECOND edit, with the world already over its ceiling, still fires.
+    const int64_t upstreamX = kRiverLen / 2;
+    const int64_t z1 = riverBedAt(upstreamX) + 1;
+    ca.invalidateSolidRegion(upstreamX, 0, riverBedAt(upstreamX), upstreamX + 3, kRiverWide - 1, z1);
+    CHECK(mob.mobilizeEditRegion(ca, upstreamX, 0, riverBedAt(upstreamX), upstreamX + 3,
+                                 kRiverWide - 1, z1) > 0);
+    CHECK(mob.mobilizedBricks().size() > byEdit);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+    CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+}
+
+// DEMOTION PRESSURE RUNS BEFORE REFUSAL, NOT AFTER IT (§6.5.5). The relief hook
+// fires at the top of `advanceFront`, only at the high-water mark, and whatever
+// it frees is usable by the SAME call — so a world that can reclaim never
+// refuses in a tick it could have reclaimed in. Item 9c fills this with real
+// demotion; here the hook is exercised with a stub that raises the ceiling,
+// which is the only way to test the ORDERING independently of what relief does.
+VXC_TEST(waterca_ceiling_relief_runs_before_the_front_refuses) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(8);
+
+    int reliefCalls = 0;
+    mob.setCeilingRelief([&] {
+        ++reliefCalls;
+        mob.setMobilizedCeiling(mob.mobilizedCeiling() + 4); // "reclaimed four"
+    });
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) break;
+    }
+
+    // Relief was consulted, and because it kept giving ground the front got all
+    // the way to FACT 1's end state rather than stalling at 8.
+    CHECK(reliefCalls > 0);
+    CHECK_EQ(mob.ceilingReliefCalls(), uint64_t(reliefCalls));
+    CHECK_EQ(riverImplicitVolume(mob), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), riverVolume);
+    CHECK_EQ(mob.creditedVolume(), riverVolume);
+
+    // At most one call per advanceFront, and none while under the ceiling: the
+    // relief count is far below the tick count it took to drain the reach.
+    CHECK(mob.mobilizedBricks().size() > mob.ceilingReliefCalls());
+}
+
+// ===========================================================================
+// C8e — CA -> implicit demotion (work item 9c, §6.5.3): the return path.
+//
+// `mobilized_` had two insert sites and zero erasures, is persisted AND
+// replicated, and never shrank. `active_` settles to empty; `mobilized_` does
+// not, so a settled reservoir stops costing tick time entirely and never stops
+// costing memory, savegame bytes and the late-joiner snapshot. This is the
+// arrow back.
+//
+// EVERYTHING HERE TURNS ON THE PREDICATE BEING EXACT. The implicit field
+// computes rather than stores, so the only CA -> implicit transfer that can be
+// volume-neutral is one where the datum ALREADY computes precisely what the CA
+// holds, cell for cell. A tolerant predicate silently creates or destroys the
+// difference and there is no byte left to store it in — the double-occupancy
+// bug mobilization was made one-way to avoid. The first two tests below exist
+// to make one unit of tolerance in one cell of 512 fail loudly.
+// ===========================================================================
+
+namespace {
+
+// A sealed cube of implicit water in open air. Deliberately the simplest world
+// in which the CA is at a FIXED POINT that exactly equals the datum: full cells
+// only, walls everywhere, nothing to flow anywhere. Any deviation the tests
+// then introduce is the only deviation in it.
+constexpr int64_t kBoxEdge = 16;
+constexpr uint64_t kFullBrickVolume = uint64_t(WaterBrick8::kCells) * 255;
+
+WaterCA::SolidFn boxTerrain() {
+    return [](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const bool inside = vx >= 0 && vx < kBoxEdge && vy >= 0 && vy < kBoxEdge && vz >= 0 &&
+                            vz < kBoxEdge;
+        return inside ? MAT_AIR : MAT_ROCK;
+    };
+}
+
+// mode 0: every cell 255 — the exact fixed point.
+// mode 1: ONE cell of 4096 reads 254 instead of 255. One unit of datum, moved.
+// mode 2: a RAGGED free surface — the water is one brick deep and its top layer
+//         alternates 128/100, which is the §6.5.3 surface-brick shape: a datum
+//         carrying a partial top fill that the CA will level away.
+WaterMobilizer::ImplicitFn boxWater(std::shared_ptr<int> mode) {
+    return [mode](int64_t vx, int64_t vy, int64_t vz) -> uint8_t {
+        if (vx < 0 || vx >= kBoxEdge || vy < 0 || vy >= kBoxEdge || vz < 0 || vz >= kBoxEdge)
+            return 0;
+        if (*mode == 2) {
+            if (vz > 7) return 0;
+            if (vz == 7) return ((vx + vy) & 1) ? uint8_t(128) : uint8_t(100);
+            return 255;
+        }
+        if (*mode == 1 && vx == 3 && vy == 3 && vz == 3) return 254;
+        return 255;
+    };
+}
+
+uint64_t boxImplicitVolume(const WaterMobilizer& mob) {
+    uint64_t sum = 0;
+    for (int64_t z = 0; z < kBoxEdge; ++z)
+        for (int64_t y = 0; y < kBoxEdge; ++y)
+            for (int64_t x = 0; x < kBoxEdge; ++x) sum += mob.implicitFillAt(x, y, z);
+    return sum;
+}
+
+void settle(WaterCA& ca, int maxTicks = 64) {
+    for (int i = 0; i < maxTicks && ca.activeBrickCount() != 0; ++i) ca.step();
+}
+
+uint64_t digestOf(const WaterCA& ca, const WaterMobilizer& mob) {
+    Digest d;
+    ca.digest(d);
+    mob.digest(d);
+    return d.h;
+}
+
+} // namespace
+
+// ONE UNIT IN ONE CELL OF 512 BLOCKS DEMOTION, IN BOTH DIRECTIONS. This is the
+// single most important correctness property in item 9c and it is asserted
+// against a knife edge, not a threshold: the same brick is demotable, then not,
+// then demotable again, with one fill unit moving each time.
+VXC_TEST(waterca_demotion_predicate_is_exact_and_one_unit_of_tolerance_would_break_it) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    const BrickKey k{0, 0, 0};
+
+    CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(kFullBrickVolume));
+    settle(ca);
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+
+    // Baseline: the CA holds exactly the datum, so the transfer back would
+    // change no byte at all. Demotable.
+    CHECK(mob.canDemote(ca, k));
+
+    // (i) THE DATUM MOVES BY ONE. Nothing about the CA changes; the implicit
+    // field now says 254 where the CA holds 255, in exactly one cell. A
+    // predicate with any tolerance at all demotes here, and destroys that unit.
+    *mode = 1;
+    CHECK(!mob.canDemote(ca, k));
+    CHECK(!mob.demoteBrick(ca, k)); // and the action refuses too, not just the query
+    CHECK_EQ(mob.mobilizedBricks().count(k), size_t(1));
+    CHECK_EQ(mob.demotedBrickCount(), uint64_t(0));
+    *mode = 0;
+    CHECK(mob.canDemote(ca, k));
+
+    // (ii) THE CA MOVES BY ONE, the other way. Take one unit out and let the
+    // brick settle: Phase C redistributes it to the top layer, so the deficit
+    // lands somewhere deterministic but not where it was removed.
+    CHECK_EQ(ca.removeWaterAt(3, 3, 3, 1), uint32_t(1));
+    settle(ca);
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+    CHECK_EQ(ca.totalVolume(), kFullBrickVolume - 1);
+    CHECK(!mob.canDemote(ca, k));
+
+    // Exactly one cell of the 512 disagrees. That is the whole margin.
+    int64_t sx = -1, sy = -1, sz = -1, disagreeing = 0;
+    for (int64_t z = 0; z < 8; ++z)
+        for (int64_t y = 0; y < 8; ++y)
+            for (int64_t x = 0; x < 8; ++x)
+                if (ca.fillAt(x, y, z) != 255) {
+                    ++disagreeing;
+                    sx = x; sy = y; sz = z;
+                }
+    CHECK_EQ(disagreeing, int64_t(1));
+    CHECK_EQ(ca.fillAt(sx, sy, sz), uint8_t(254));
+
+    // (iii) Put the unit back and the brick is demotable again. No hysteresis,
+    // because there is no threshold to chatter across.
+    CHECK_EQ(ca.addWaterAt(sx, sy, sz, 1), uint32_t(1));
+    settle(ca);
+    CHECK_EQ(ca.totalVolume(), kFullBrickVolume);
+    CHECK(mob.canDemote(ca, k));
+}
+
+// THE SURFACE BRICK STAYS CA-OWNED, and §6.5.3 said so in advance. A datum with
+// a ragged partial top fill is not a CA fixed point: Phase C levels it, and the
+// levelled surface is not the datum any more, so (c) fails forever. This is the
+// honest limit — one brick-shell of the water surface never comes back, and
+// only a re-bake (§6.5.4) reclaims it. The scar is a rim, not a river.
+//
+// A CORRECTION to §6.5.3 while pinning it: the surface brick is not excluded by
+// RULE, it is excluded in PRACTICE. Nothing in the predicate treats a partial
+// fill specially — a surface whose datum the CA happens to land on exactly
+// would demote, correctly and for free. What excludes the real case is that the
+// CA settles to its own fixed point and the datum was computed by a different
+// law, so they agree only by coincidence.
+VXC_TEST(waterca_demotion_never_reclaims_a_ragged_surface_brick) {
+    auto mode = std::make_shared<int>(2);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    const BrickKey k{0, 0, 0};
+
+    const uint64_t total = boxImplicitVolume(mob);
+    CHECK(mob.mobilizeBrick(ca, k) > 0);
+    settle(ca);
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), total);
+
+    // The CA levelled the ragged top into a flat one. It is a perfectly good
+    // water surface; it just is not the datum's — and it is flat at a value the
+    // datum never held anywhere, so no cell of that layer matches.
+    CHECK(!mob.canDemote(ca, k));
+    const uint8_t levelled = ca.fillAt(0, 0, 7);
+    CHECK(levelled != 128 && levelled != 100);
+    for (int64_t y = 0; y < 8; ++y)
+        for (int64_t x = 0; x < 8; ++x) CHECK_EQ(ca.fillAt(x, y, 7), levelled);
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(1));
+
+    // Ticking longer changes nothing: this is the CA's fixed point, and the
+    // brick is CA-owned for the life of the world short of a re-bake.
+    for (int i = 0; i < 200; ++i) {
+        ca.step();
+        CHECK(!mob.canDemote(ca, k));
+    }
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), total);
+}
+
+// THE ROUND TRIP CONSERVES VOLUME EXACTLY, as integers, with no tolerance
+// anywhere — and the world comes back byte-identical to one that was never
+// touched. Demote returns the brick to the datum, the implicit field reads
+// straight through the closed hole again, and the WALL is restored so the CA
+// cannot write into cells it no longer owns.
+VXC_TEST(waterca_demote_and_remobilize_round_trip_conserves_volume_exactly) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    const BrickKey k{0, 0, 0};
+
+    const uint64_t world = boxImplicitVolume(mob);
+    CHECK_EQ(world, uint64_t(kBoxEdge * kBoxEdge * kBoxEdge) * 255);
+    const uint64_t neverTouched = digestOf(ca, mob);
+
+    CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(kFullBrickVolume));
+    settle(ca);
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(ca.totalVolume(), kFullBrickVolume);
+    // The hole mobilization punched: implicitFillAt reads 0 here even though
+    // the datum says 255, because the CA owns these cells now.
+    CHECK_EQ(mob.implicitFillAt(0, 0, 0), uint8_t(0));
+
+    CHECK(mob.demoteBrick(ca, k));
+
+    // THE INVARIANT, as exact integer equality and never a tolerance.
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(ca.totalVolume(), uint64_t(0));
+    CHECK_EQ(ca.recomputeVolume(), uint64_t(0));
+    CHECK_EQ(ca.storedBrickCount(), size_t(0));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+    CHECK_EQ(mob.demotedVolume(), kFullBrickVolume);
+    CHECK_EQ(mob.demotedBrickCount(), uint64_t(1));
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+
+    // THE HOLE IS CLOSED: the implicit field reads correctly through it again,
+    // in every one of the 512 cells, and the wall is back so the CA cannot
+    // write into cells the datum owns.
+    const WaterCA::SolidFn wall = mob.makeSolidFn();
+    for (int64_t z = 0; z < 8; ++z)
+        for (int64_t y = 0; y < 8; ++y)
+            for (int64_t x = 0; x < 8; ++x) {
+                CHECK_EQ(mob.implicitFillAt(x, y, z), uint8_t(255));
+                CHECK(wall(x, y, z) != MAT_AIR);
+            }
+
+    // Byte-identical to the world that was never touched at all.
+    CHECK_EQ(digestOf(ca, mob), neverTouched);
+
+    // RE-MOBILIZE. The datum hands back exactly what it took, and the ledger
+    // stays a pure GROSS one-way flow counter — twice the brick, both sides
+    // equal, shortfall still 0.
+    CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(kFullBrickVolume));
+    settle(ca);
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(mob.debitedVolume(), 2 * kFullBrickVolume);
+    CHECK_EQ(mob.creditedVolume(), 2 * kFullBrickVolume);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+
+    // And round again, to the same byte.
+    CHECK(mob.demoteBrick(ca, k));
+    CHECK_EQ(digestOf(ca, mob), neverTouched);
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(mob.demotedVolume(), 2 * kFullBrickVolume);
+}
+
+// A BRICK IN A LIVE NEIGHBOURHOOD IS NEVER DEMOTED — condition (b). Demotion
+// restores the wall, and a wall reappearing in contact with moving water is a
+// discontinuity. The quiet-neighbourhood test removes the case entirely rather
+// than handling it.
+VXC_TEST(waterca_demotion_refuses_while_the_neighbourhood_is_still_moving) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    const BrickKey k{0, 0, 0};
+    const BrickKey nb{1, 0, 0};
+
+    CHECK_EQ(mob.mobilizeBrick(ca, k), uint32_t(kFullBrickVolume));
+    // Mobilizing wakes the brick, so it is active immediately: (b) fails on the
+    // brick itself before any 512-cell scan is even attempted.
+    CHECK(ca.activeBricks().count(k) != 0);
+    CHECK(!mob.canDemote(ca, k));
+
+    settle(ca);
+    CHECK(mob.canDemote(ca, k));
+
+    // Now wake a FACE NEIGHBOUR and it refuses again, even though `k` itself is
+    // quiet and still holds exactly the datum.
+    CHECK_EQ(mob.mobilizeBrick(ca, nb), uint32_t(kFullBrickVolume));
+    CHECK(ca.activeBricks().count(nb) != 0);
+    CHECK(ca.activeBricks().count(k) == 0);
+    CHECK(!mob.canDemote(ca, k));
+
+    settle(ca);
+    CHECK(mob.canDemote(ca, k));
+    CHECK(mob.canDemote(ca, nb));
+}
+
+// THE BUDGETED SWEEP covers the whole mobilized set across calls without
+// re-scanning its front, and deferring is always safe because a brick it did
+// not reach is simply still CA-owned. The budget counts EXAMINATIONS, because
+// the 512-cell scan is the cost and a sweep that finds nothing must still be
+// bounded.
+VXC_TEST(waterca_demote_budgeted_sweeps_the_whole_set_across_calls) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+
+    // All eight bricks of the box.
+    for (int32_t z = 0; z < 2; ++z)
+        for (int32_t y = 0; y < 2; ++y)
+            for (int32_t x = 0; x < 2; ++x) mob.mobilizeBrick(ca, BrickKey{x, y, z});
+    settle(ca);
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(8));
+    const uint64_t world = boxImplicitVolume(mob) + ca.totalVolume();
+    CHECK_EQ(world, uint64_t(kBoxEdge * kBoxEdge * kBoxEdge) * 255);
+
+    // Three bricks per call: 3, 3, then the last 2.
+    CHECK_EQ(mob.demoteBudgeted(ca, 3), size_t(3));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(5));
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(mob.demoteBudgeted(ca, 3), size_t(3));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(2));
+    CHECK_EQ(mob.demoteBudgeted(ca, 3), size_t(2)); // examines 3, only 2 remain
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+
+    // Volume exact throughout, and an empty set is a cheap no-op rather than a
+    // spin.
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(ca.totalVolume(), uint64_t(0));
+    CHECK_EQ(mob.demoteBudgeted(ca, 32), size_t(0));
+    CHECK_EQ(mob.demotedBrickCount(), uint64_t(8));
+    CHECK_EQ(mob.demotedVolume(), 8 * kFullBrickVolume);
+}
+
+// DEMOTION REPLICATES AS AN EXPLICIT KEY REMOVAL AND SURVIVES SAVE/LOAD. The
+// removal queue mirrors takeRecentlyMobilized() exactly, and no new persistence
+// code is needed: `WaterState` serializes `mobilized_` as a set, so a demoted
+// brick is a key that is no longer in it and its fill is gone because
+// clearBrickFill collapsed the brick out of the map. A world that demoted and
+// then reloaded must not resurrect the brick as CA-owned — that would reopen
+// the hole in the implicit field with no fill behind it, which is the exact
+// lake-destroying failure WaterState was written to catch.
+VXC_TEST(waterca_demotion_replicates_as_key_removal_and_survives_save_load) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    const BrickKey kept{1, 1, 1};
+    const BrickKey given{0, 0, 0};
+
+    mob.mobilizeBrick(ca, kept);
+    mob.mobilizeBrick(ca, given);
+    settle(ca);
+    const uint64_t world = boxImplicitVolume(mob) + ca.totalVolume();
+
+    CHECK(mob.takeRecentlyDemoted().empty());
+    CHECK(mob.demoteBrick(ca, given));
+
+    // The replication feed: one explicit key removal, drained once.
+    const std::vector<BrickKey> removals = mob.takeRecentlyDemoted();
+    CHECK_EQ(removals.size(), size_t(1));
+    CHECK(removals[0] == given);
+    CHECK(mob.takeRecentlyDemoted().empty());
+
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+
+    auto mode2 = std::make_shared<int>(0);
+    WaterMobilizer mob2(boxWater(mode2), boxTerrain());
+    WaterCA ca2(mob2.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), ca2, mob2));
+
+    CHECK_EQ(mob2.mobilizedBricks().size(), size_t(1));
+    CHECK_EQ(mob2.mobilizedBricks().count(given), size_t(0));
+    CHECK_EQ(mob2.mobilizedBricks().count(kept), size_t(1));
+    CHECK_EQ(ca2.totalVolume(), ca.totalVolume());
+    CHECK_EQ(ca2.recomputeVolume(), ca2.totalVolume());
+
+    // The whole world's water, both accountants, across the save: the demoted
+    // brick's units are the datum's again and are NOT in the blob at all.
+    CHECK_EQ(boxImplicitVolume(mob2) + ca2.totalVolume(), world);
+    CHECK_EQ(mob2.implicitFillAt(0, 0, 0), uint8_t(255));
+    CHECK_EQ(digestOf(ca2, mob2), digestOf(ca, mob));
+}
+
+// 9b's HOOK, WIRED TO 9c's DEMOTION — the pairing §6.5.5 asks for ("at
+// high-water-mark, spend the demotion budget before refusing new
+// mobilization"). 9b proved the ORDERING with a stub because that was the only
+// way to test it independently of what relief does; this proves the wiring is
+// one lambda and that reclaiming actually clears the high-water mark.
+VXC_TEST(waterca_ceiling_relief_wired_to_demotion_clears_the_high_water_mark) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+
+    for (int32_t z = 0; z < 2; ++z)
+        for (int32_t y = 0; y < 2; ++y)
+            for (int32_t x = 0; x < 2; ++x) mob.mobilizeBrick(ca, BrickKey{x, y, z});
+    settle(ca);
+    const uint64_t world = boxImplicitVolume(mob) + ca.totalVolume();
+
+    mob.setMobilizedCeiling(4);
+    CHECK(mob.atMobilizedCeiling()); // 8 >= 4: over the bound, as an edit may leave it
+    mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 32); });
+
+    mob.advanceFront(ca);
+
+    CHECK_EQ(mob.ceilingReliefCalls(), uint64_t(1));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+    CHECK(!mob.atMobilizedCeiling());
+    CHECK_EQ(boxImplicitVolume(mob) + ca.totalVolume(), world);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+
+    // Under the ceiling now, relief is not consulted again.
+    mob.advanceFront(ca);
+    CHECK_EQ(mob.ceilingReliefCalls(), uint64_t(1));
+}
+
+// THE RETURN PATH END TO END, on C8b's river: §6.3.6's refill scar, made and
+// then unmade.
+//
+// A reach is frozen (9a), drained, and left as dry CA-owned bricks — a
+// permanent hole in the datum. §6.3's surface override then drops the datum to
+// 0 over that reach, which is what makes the dry bricks EXACTLY match it, and
+// demotion hands them back. When the override is released the river returns as
+// IMPLICIT water, for free, with zero CA bricks and zero savegame bytes.
+//
+// Without demotion those four bricks would read 0 from `implicitFillAt`
+// forever: the river would come back everywhere except where the player's edit
+// had been, leaving a 130,560-unit gap in the datum exactly where they stood.
+// That is the scar, and this is the test that it closes.
+VXC_TEST(waterca_demotion_closes_the_refill_scar_a_dried_reach_leaves_behind) {
+    auto drainOpen = std::make_shared<bool>(false);
+    auto overrideDry = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    constexpr int64_t kOverrideFromVx = int64_t(kFreezeFromBrickX) * WaterBrick8::kEdge; // 224
+
+    // The same river, with §6.3.3's surface override in its crudest form: a
+    // flag that drops the water datum to 0 downstream of a line.
+    WaterMobilizer::ImplicitFn datum = [overrideDry](int64_t vx, int64_t vy, int64_t vz) -> uint8_t {
+        if (vx < 0 || vx >= kRiverLen || vy < 0 || vy >= kRiverWide) return 0;
+        if (*overrideDry && vx >= kOverrideFromVx) return 0;
+        const int64_t b = riverBedAt(vx);
+        return (vz >= b && vz < b + kRiverDepth) ? 255 : 0;
+    };
+    WaterMobilizer mob(datum, riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setFrontGate(freezeUpstreamOf(kFreezeFromBrickX));
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) break;
+    }
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(4)); // the reach's four channel bricks
+    CHECK_EQ(riverImplicitVolume(mob), riverImplicitVolumeBelowBrickX(kFreezeFromBrickX));
+
+    // THE HOLE, BEFORE THE OVERRIDE. The bricks are bone dry but the datum
+    // still says 255 there, so demoting now would DESTROY 130,560 units. The
+    // predicate refuses, and this is exactly the case a tolerance would ruin.
+    const uint64_t reachUnits = uint64_t(kRiverLen - kOverrideFromVx) * kRiverWide * kRiverDepth * 255;
+    CHECK_EQ(reachUnits, uint64_t(130560));
+    for (const BrickKey& k : mob.mobilizedBricks()) {
+        CHECK_EQ(ca.fillAt(int64_t(k.x) * WaterBrick8::kEdge, 0, riverBedAt(kOverrideFromVx)),
+                 uint8_t(0));
+        CHECK(!mob.canDemote(ca, k));
+    }
+    CHECK_EQ(mob.demoteBudgeted(ca, 32), size_t(0));
+
+    // THE OVERRIDE lands: the datum over the dried reach drops to 0, which is
+    // precisely what the CA is holding there. Now — and only now — the transfer
+    // is a no-op on every byte.
+    *overrideDry = true;
+    ca.invalidateSolidCache();
+    const uint64_t underOverride = riverImplicitVolume(mob) + ca.totalVolume();
+    CHECK_EQ(mob.demoteBudgeted(ca, 32), size_t(4));
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+    CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), underOverride); // exact
+    CHECK_EQ(mob.demotedVolume(), uint64_t(0));                          // dry: nothing to hand back
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+
+    // THE RELEASE. The datum comes back over the reach, and because the hole is
+    // closed the implicit field reads straight through it: the WHOLE river is
+    // the datum's again, for zero CA bricks and zero savegame bytes.
+    *overrideDry = false;
+    ca.invalidateSolidCache();
+    CHECK_EQ(riverImplicitVolume(mob), riverVolume);
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+
+    // The counterfactual, stated as arithmetic: had the four bricks stayed
+    // mobilized, the reach would have come back 130,560 units short — the scar.
+    CHECK_EQ(riverVolume - riverImplicitVolumeBelowBrickX(kFreezeFromBrickX), reachUnits);
+}
+
+// ===========================================================================
 // WaterState — savegame persistence (waterca.h "WaterState",
 // docs/adr/0005-water-persistence.md)
 // ===========================================================================

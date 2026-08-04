@@ -165,3 +165,38 @@ if(VXC_BUILD_GPU_HARNESS)
       -Wall -Wextra -Werror -Wno-missing-field-initializers)
   endif()
 endif()
+
+# --- vxc_bankprobe: the item-7 BANK-INTEGRITY probe. Voxel-scale leak count
+# along the channels the BAKE carved into the .vxtl v2 fine tier, carrier-only
+# against full v23 detail, with the waterline measured from the carve rather
+# than predicted from a discharge nothing has baked yet. Decides whether the
+# graded water plane (P2) needs a detail-band bank term. -------------------
+add_executable(vxc_bankprobe bankprobe.cpp)
+target_link_libraries(vxc_bankprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_bankprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# --- vxc_riverribbonprobe: the far-field river producer over real tiles.
+# Counts (wet px -> centreline -> reaches -> simplified points), the width
+# distribution the bake actually drew, the screen-width table at 1/5/20 km with
+# the widening policy applied, and the datum-vs-amplified-ground headroom at the
+# centreline and at the widened edge. The numeric readout behind "can you see
+# the river from a vista". ---------------------------------------------------
+add_executable(vxc_riverribbonprobe riverribbonprobe.cpp)
+target_link_libraries(vxc_riverribbonprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_riverribbonprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# --- vxc_burialprobe: is the baked river BURIED inside the rendered terrain?
+# The bake's water datum is the SPLINE reconstruction; the drawn ground is the
+# AMPLIFIED surface. This measures, per wet pixel and at the mesher's own voxel
+# granularity (voxelcore/lakes.h implicitWaterFill, bottom-face rule), the
+# fraction of baked water that emits no water voxel at all -- with a nearby-dry
+# control for the relief the amplifier adds outside the channel. ------------
+add_executable(vxc_burialprobe burialprobe.cpp)
+target_link_libraries(vxc_burialprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_burialprobe PRIVATE -Wall -Wextra -Werror)
+endif()

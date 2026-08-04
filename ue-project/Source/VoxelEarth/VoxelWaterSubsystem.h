@@ -184,17 +184,26 @@ public:
 
 	// Dig-breach hook: called by UVoxelWorldSubsystem right after an
 	// AUTHORITATIVE TryDig/CarveSphere turns solid voxels to air (never on a
-	// client's local prediction -- breach seeding is simulation state, same
-	// authority-only rule as the CA tick itself). For every cleared voxel at
-	// or below sea level (Z<0) that borders a cell OUTSIDE this same edit
-	// which is already non-solid, Z<0, and not itself tracked CA water (i.e.
-	// genuinely pre-existing "implicit ocean", not a neighbor this same dig
-	// just carved), registers a Reservoir v0 boundary cell: seeded to full
-	// fill now and topped back up to full every fixed step thereafter for as
-	// long as it's registered (task item 2's "infinite reservoir" contract).
-	// Documented v0 simplification: a reservoir cell, once registered, is
-	// never un-registered (no support yet for "plugging" a breach back up);
-	// see the .cpp for the full rule.
+	// client's local prediction -- same authority-only rule as the CA tick
+	// itself).
+	//
+	// PURELY DIAGNOSTIC SINCE watershed plan §6.4 (work item 8). It used to run
+	// the Reservoir v0 seeding rule -- pin every below-datum cleared voxel that
+	// touched below-datum air at 255 fill units, forever. That rule could not
+	// tell the sea from a pit dug into a hillside, its pressure head was the
+	// breach rather than the datum, and because the ocean beyond the breach was
+	// not water to the simulation at all it poured unbounded volume (and an
+	// unbounded active-brick count) into a seabed the CA thought was dry.
+	// voxel-core's tests/test_ocean.cpp measures all three.
+	//
+	// The sea is now the third term of the water ImplicitFn, so a dig into it
+	// releases water through the same funnel a dug lake shore uses --
+	// NotifyTerrainRegionEdited -> WaterMobilizer::mobilizeEditRegion, which
+	// every caller of this function already calls beside it. What remains here
+	// is the log line, kept because it is the only signal an unattended
+	// headless run has that a dig opened the sea, and now reporting the DATUM
+	// TEST: cleared voxels genuinely in the sea versus cleared voxels merely
+	// below z=0 inside land.
 	void NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels);
 
 	// ADR-0003 item 2 (docs/adr/0003-hydrostatic-persistent-body.md): the
@@ -310,6 +319,55 @@ public:
 	// converted to CA water. Verification/debug read.
 	uint8 GetImplicitFillAtWorld(const FVector& WorldUU) const;
 
+	// --- "Am I in water?", for real ------------------------------------------
+	//
+	// Every underwater/swim test in the client used to be `Z < 0`: below the
+	// sea-level datum, full stop, with no terrain and no water consulted. That
+	// makes a DRY CAVERN 200 m under a mountain read as ocean -- global
+	// underwater fog, a tinted post-process, and a swimming character, inside
+	// solid rock's air pocket. It also makes every visual judgement of every
+	// later water milestone unreadable, which is why
+	// docs/watershed-system-plan.md puts fixing it first (§5.3, item 1).
+	//
+	// Two queries, deliberately separate:
+
+	// WATER THAT IS ACTUALLY THERE: the CA's fill, plus the implicit field for
+	// bricks it has not taken over yet (implicitFillAt already returns 0 once
+	// a brick is mobilized, so the two never double-count). Today that means
+	// cavern lakes and anything a player poured or breached; when the baked
+	// lake/river datum joins the implicit field (plan items 3-4 and 7) it
+	// starts answering for those too with NO change here -- which is the point
+	// of routing the test through the water datum rather than the camera.
+	// Returns 0-255 fill units, 0 for dry.
+	uint8 GetWaterFillAtWorld(const FVector& WorldUU) const;
+
+	// THE FULL PREDICATE the client should use: simulated/implicit water, OR
+	// the open sea. See IsOpenSeaAtWorld for what "the open sea" is allowed to
+	// mean before the ocean is a real datum (plan item 8).
+	bool IsUnderwaterAtWorld(const FVector& WorldUU) const;
+
+	// Sea level in UE units, from voxelcore/core.h's kSeaLevelMm -- the one
+	// symbol, converted once, so nothing in the client spells the datum as a
+	// literal again.
+	static double SeaLevelZUU();
+
+	// THE OCEAN, AS A DATUM. True when a point is in the open sea: below sea
+	// level, and standing over WORLDGEN ground that is itself below sea level
+	// (a seabed) rather than over land.
+	//
+	// The second condition is the whole fix. "Below sea level" alone is what
+	// tinted dry caverns; "below sea level over a seabed" is false inside a
+	// mountain, false in a dry pit dug into land (the worldgen ground there is
+	// still above the datum, which is why this takes the worldgen surface and
+	// NOT the edited one), and true where the sea actually is.
+	//
+	// What it still gets wrong, stated rather than hidden: a natural inland
+	// depression whose baked floor lies below sea level reads as sea. Nothing
+	// short of a real water datum can tell that apart from a bay, and supplying
+	// one is exactly what plan items 3-4 do. Until then this is strictly less
+	// wrong than the camera test, and the failure is rarer and diagnosable.
+	static bool IsOpenSeaAtWorld(double WorldZUU, double WorldgenGroundZUU);
+
 	// C8 ledger, for verification logging. Shortfall MUST be 0 forever: it
 	// counts units the implicit field gave up that the CA did not accept,
 	// which is the one way mobilization could destroy water. See waterca.h.
@@ -362,6 +420,58 @@ public:
 	// the amplifier column memo to rebuild the fresh pair's implicit field.
 	bool VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint64& OutReloadedDigest, uint64& OutLiveVolume,
 	                              uint64& OutReloadedVolume, int32& OutLiveMobilized, int32& OutReloadedMobilized);
+
+	// --- LAKE SHEETS AT RANGE (docs/watershed-system-plan.md item 5, §5.2) ----
+	//
+	// The near field meshes implicit water inside a 52 m brick disc and nothing
+	// outside it, so a 2 km lake is ABSENT from every vista. AVoxelWaterSheetActor
+	// draws the rest as flat translucent rectangles at the datum; these three
+	// methods are the only thing it needs from the water tier, and they are here
+	// rather than on the actor because this subsystem already owns the ONE
+	// fine-tier lake reader and a second one would be a second world.
+	//
+	// All three are no-ops (return 0/false) when there is no fine tier -- the
+	// same supported "no baked lakes" configuration MakeWaterSampler logs.
+
+	// The bbox and datum of one baked basin, in world UU. A copy, deliberately:
+	// the voxel-core registry it comes from is owned by a tile that can be
+	// evicted, and an actor holding a pointer across a rebuild would dangle.
+	struct FLakeSheetBasin
+	{
+		int32 TileX = 0;
+		int32 TileY = 0;
+		int32 BasinId = 0;
+		double MinXUU = 0.0, MinYUU = 0.0, MaxXUU = 0.0, MaxYUU = 0.0;
+		double SurfaceZUU = 0.0;
+	};
+
+	// Which fine tile a world point falls in. Exposed so a caller can walk the
+	// tiles of a region ONE PER TICK rather than asking for the whole region at
+	// once -- a fine tile is tens of MB on disk, and a 10 km square is up to 9
+	// of them, which is a multi-second game-thread stall if taken in one gather.
+	static void FineTileForWorldUU(double XUU, double YUU, int32& OutTileX, int32& OutTileY);
+
+	// Every water-holding basin of ONE fine tile whose bbox meets the square of
+	// half-extent RadiusUU around (CenterXUU, CenterYUU). Loads that tile, so it
+	// is game-thread only and does disk I/O; the caller budgets it. Returns the
+	// number appended.
+	int32 GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU, double CenterYUU,
+	                                  double RadiusUU, TArray<FLakeSheetBasin>& Out) const;
+
+	// One basin's wet extent as world-UU rectangles at the given decimation
+	// (`StepPx` fine pixels per emitted cell, >= 1). Appends; returns the count.
+	// False-y (0 rectangles) also means "this basin's tile would not resolve",
+	// which is why OutUnresolved is separate from an empty result: a lake that
+	// failed to decode must not read as a lake with no water in it.
+	int32 BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx, TArray<FBox2D>& OutRectsUU,
+	                          bool& bOutResolved) const;
+
+	// The XY footprint the implicit-water refresh is CURRENTLY meshing, plus the
+	// z span of its brick disc, so the sheet can cut an exact hole where the near
+	// field already draws water. False before the first refresh has run.
+	// The rectangle is inclusive of the whole 65-brick disc, i.e. exactly what
+	// RefreshImplicitWater sweeps -- not an approximation of it.
+	bool GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const;
 
 private:
 	TUniquePtr<FVoxelWaterImpl> Impl;

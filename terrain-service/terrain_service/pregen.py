@@ -291,6 +291,21 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         "elevation": result.elevation_m,
         "flow": result.flow,
         "flow_plane": result.flow,
+        # bake_ver 8: the B5 basin registry. Passed as the BakeResult's own
+        # tuple -- including when it is EMPTY, which is a statement ("surveyed,
+        # holds nothing") and not an absence.
+        "basins": result.basins,
+        # bake_ver 9: the P2 water plane. WITHOUT THIS LINE THE BAKE COMPUTES
+        # THE PLANE AND THROWS IT AWAY, which is what happened on the first
+        # corridor re-bake (2026-08-03): `--mode bake` ran the B6 stage, spent
+        # 302 CPU-s, and wrote a tile byte-for-byte the same size as the
+        # bake_ver 8 one with FLAG_WATER_PRESENT clear. Nothing said so -- see
+        # the `unencoded` guard in `_run_bake` for why that silence is now an
+        # error rather than a comment.
+        # getattr, like `basins` above and the `args` flags below: this function
+        # is called with hand-built result objects by tests and by tools outside
+        # this module, and a new BakeResult field must not break them.
+        "water_surface_m": getattr(result, "water_surface_m", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #
@@ -326,6 +341,34 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
             f"tile_codec.{enc.__name__} needs arguments this CLI cannot supply "
             f"({missing}); wire it explicitly rather than letting pregen guess."
         )
+
+    # EVERY BAKE PRODUCT MUST REACH THE ENCODER, and until 2026-08-03 one
+    # silently did not. The name-probing above is what makes this failure mode
+    # possible: a product the bake computes but `candidates` does not name is
+    # dropped without a word, and the tile that comes out is a VALID tile of
+    # the previous bake version. That is invisible in the log, invisible in the
+    # file size, and costs a full re-bake to discover -- the P2 water plane was
+    # found this way, after 302 CPU-s produced a tile with FLAG_WATER_PRESENT
+    # clear.
+    #
+    # So: for each product the BakeResult actually carries, at least one of its
+    # accepted spellings must have landed in `kwargs`. Aliases are grouped
+    # because only one of each pair can be accepted by construction.
+    for group, value in (
+        (("elevation_m", "elevation"), result.elevation_m),
+        (("flow", "flow_plane"), result.flow),
+        (("basins",), result.basins),
+        (("water_surface_m",), getattr(result, "water_surface_m", None)),
+    ):
+        if value is None:
+            continue          # the bake produced nothing; nothing to lose
+        if not any(name in kwargs for name in group):
+            raise NotImplementedError(
+                f"this bake produced {group[0]} but tile_codec.{enc.__name__} "
+                f"accepts none of {group}, so it would be DROPPED and the tile "
+                "written without it. Wire the encoder rather than shipping a "
+                "tile that silently omits a product the bake paid for."
+            )
     return enc(**kwargs)
 
 
@@ -346,6 +389,39 @@ def _record_identity(cache: TileCache, provider, seed: int, namespace_id) -> boo
             file=sys.stderr,
         )
     return ok
+
+
+def _inflow_currency(stats: dict) -> str:
+    """What the pyramid handed this tile at its boundary, for the run log.
+
+    Task #49. ``/proxy`` means the tile reconstructed a discharge from upstream
+    AREA times its own LOCAL runoff -- the thing that baked a river mouth
+    0.000% wet -- and it has to be legible in the run log rather than only in a
+    stats dump nobody opens. Otherwise:
+
+        /Q2.5e+07m3yr@71mm    carried discharge, and the catchment-mean runoff
+                              it implies. Compare that against the tile's own
+                              local runoff: the gap IS what #49 fixed.
+        qmax=...              the tile's largest discharge, against which
+                              "0.000%wet" can be read as "how far short".
+        drawnpad=...          drawable cells over the PADDED domain. When this
+                              is large while %wet is zero the water is in the
+                              APRON and leaves without crossing the tile --
+                              a different fault, wanting a different fix
+                              (HYDROLOGY_RESIDUALS #7).
+
+    Empty before bake_ver 10 or with the water plane disabled.
+    """
+    if "water_q_inflow_carried" not in stats:
+        return ""
+    if not stats["water_q_inflow_carried"]:
+        return "/proxy"
+    return (
+        f"/Q{stats['water_q_inflow_m3_yr']:.3g}m3yr"
+        f"@{stats['water_q_inflow_implied_runoff_mm_yr']:.0f}mm"
+        f" qmax={stats.get('water_q_max_m3_yr', 0.0):.3g}"
+        f" drawnpad={int(stats.get('water_drawn_cells', 0))}"
+    )
 
 
 def _run_bake(args, provider, cache: TileCache) -> int:
@@ -412,11 +488,16 @@ def _run_bake(args, provider, cache: TileCache) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    targets = [
+    # AN EXPLICIT TILE LIST BEATS A SQUARE for the shape of work this mode is
+    # actually asked to do. A river corridor is a line, not a block: baking
+    # (-14,-4) -> (-14,-7) plus (-13,-5) as a square costs 16 tiles at ~300
+    # CPU-s each to get the 5 that were wanted. getattr, like every other
+    # optional flag here, so tools that hand-build an args object keep working.
+    targets = list(getattr(args, "bake_targets", None) or [
         (args.center_x + dx, args.center_y + dy)
         for dx in range(-args.radius, args.radius + 1)
         for dy in range(-args.radius, args.radius + 1)
-    ]
+    ])
     generate_coarse = not args.bake_no_coarse_generate
     verify_superblocks = not args.bake_no_verify_superblocks
     cpu0 = time.process_time()
@@ -559,6 +640,11 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     level,
                     parent_fingerprint=parent_fp,
                     entry_mode=entry_mode,
+                    # Since the block carries a DISCHARGE (task #49) the climate
+                    # planes decide its bytes, so they belong in the provenance
+                    # digest. Must match what `build_flow_superblock` was given
+                    # below, or every cached block would read as stale forever.
+                    climate_fetch=fetch_climate,
                 )
                 if now_fp != sb.inputs_fingerprint:
                     stale_superblocks += 1
@@ -581,6 +667,13 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                     kernels,
                     parent=parent,
                     entry_mode=entry_mode,
+                    # TASK #49: the block runs a second MFD sweep seeded by
+                    # runoff volume and carries the DISCHARGE, so a river that
+                    # leaves its climate zone arrives at the fine tier with the
+                    # water it actually gathered. Without climate here the block
+                    # carries area only and B6 falls back to the local-runoff
+                    # proxy -- which is what baked a river mouth 0.000% wet.
+                    climate_fetch=fetch_climate,
                 )
                 cache.put_flow(
                     fine_provider_id,
@@ -679,11 +772,24 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 file=sys.stderr,
             )
         if npz_dir:
+            # DISCHARGE AND THE WATER PLANE BELONG IN THE DUMP. Without them a
+            # tile that baked 0.000% wet cannot be diagnosed from the dump at
+            # all -- "no water" and "water just under the drawable threshold"
+            # look identical, and telling those two apart is the entire
+            # question task #49 was opened on. Both are None before bake_ver 9
+            # or with the plane disabled; np.savez cannot store None, so they
+            # are added only when present.
+            extra = {}
+            if result.discharge_m3_yr is not None:
+                extra["discharge_m3_yr"] = result.discharge_m3_yr
+            if result.water_surface_m is not None:
+                extra["water_surface_m"] = result.water_surface_m
             np.savez(
                 npz_dir / f"{x}_{y}.npz",
                 elevation_m=result.elevation_m,
                 accumulation_m2=result.accumulation_m2,
                 flow=result.flow,
+                **extra,
             )
         try:
             encoded = _encode_fine(
@@ -697,12 +803,23 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             continue
         cache.put_fine(fine_provider_id, args.seed, x, y, encoded)
         baked += 1
+        # The water plane goes in the LOG LINE, not only in the stats dump.
+        # "wet=0.000%" is a legitimate reading on a dry tile and a symptom on a
+        # wet one, and either way it is the only place a run says out loud
+        # whether the thing the re-bake was spent on actually landed.
+        wet = result.water_surface_m
+        water_str = (
+            "none" if wet is None
+            else f"{100.0 * float(np.isfinite(wet).mean()):.3f}%wet"
+        )
         print(
             f"[{i + 1}/{len(targets)}] baked ({x},{y}) cpu={cpu:.1f}s "
+            f"water={water_str} "
             f"max_catchment={result.stats['max_accumulation_km2']:.1f}km2 "
             f"incision_p99={result.stats['incision_p99_m']:.2f}m "
             f"channels={int(result.stats['channel_cells'])} "
-            f"injected={result.stats['injected_inflow_km2']:.1f}km2 "
+            f"injected={result.stats['injected_inflow_km2']:.1f}km2"
+            f"{_inflow_currency(result.stats)} "
             f"basin={result.stats['basin_cells_frac']*100:.1f}%/"
             f"{result.stats['basin_max_depth_m']:.0f}m "
             f"hydro={result.superblock_fingerprint[:12] or 'none'}",

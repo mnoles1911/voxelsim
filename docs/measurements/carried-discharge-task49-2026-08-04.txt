@@ -1,0 +1,180 @@
+TASK #49 -- CARRYING DISCHARGE UP THE FLOW PYRAMID
+seed 20260719, bake_ver 9 -> 10, 2026-08-04
+================================================================================
+
+THE DEFECT, RESTATED FROM ITS OWN DOCSTRING
+-------------------------------------------
+`bake.water.discharge_source` converted the flow pyramid's injected upstream
+AREA into a discharge by multiplying it by the LOCAL runoff at the injection
+cell. That is right only if a river's catchment has the climate of its own
+mouth. Every river that leaves its climate zone was understated, and the
+worst case -- wet mountains draining across an arid coastal plain -- was
+understated to zero.
+
+WHAT WAS BUILT
+--------------
+`FlowSuperblock` gained `q`: a runoff-weighted discharge in m^3/yr, from a
+second MFD sweep over the same filled surface, at every level of the pyramid.
+`_edge_entries` computes the boundary crossings ONCE and both currencies are
+scattered through the same (entry cell, target cell) pairs, so area and
+discharge cross at the same cell by construction. B6 adds the carried Q
+directly instead of reconstructing one.
+
+`q is None` is a third state, distinct from zero: a block built without climate
+cannot say how much water crosses, B6 falls back to the old proxy, and the tile
+reports `water_q_inflow_carried = 0`.
+
+VERSION IMPACT -- MEASURED, NOT ARGUED
+--------------------------------------
+Stream-power incision reads A^m -- an AREA law -- so `acc` still decides the
+ground and `q` is a second raster only the water plane reads.
+
+    bake_fingerprint()  (TERRAIN half)   fe0275e105cbf77c...  UNCHANGED
+    roughness_seed(20260719)             0x7e1ec856567c4fb5   UNCHANGED
+    product_identity_payload digest      7363e22c... -> c67b065c...  CHANGED
+    TERRAIN_VERSION                      8 -> 8
+    BAKE_VERSION                         9 -> 10
+    fine_provider_id                     ...-b196f6020 -> ...-b4d02b092
+
+Directly verified on the world's own artifacts: the level-1 (-1,-1) and
+level-0 (-4,-2) flow superblocks rebuilt under bake_ver 10 are BIT-IDENTICAL
+to the shipped bake_ver 9 ones in both `filled` and `acc`. Only the new `q`
+plane is added. Water-only. No baked ground moves.
+
+Gated by tests/test_bake_terrain_identity.py::
+test_carried_discharge_changes_the_water_and_nothing_else -- the same tile
+baked against superblocks differing in EXACTLY the `q` field must produce
+bit-identical elevation, accumulation and flow, and a different discharge.
+
+THE CORRIDOR, BEFORE AND AFTER
+------------------------------
+(-14,-4) -> (-14,-7), the worst case for the proxy, re-baked in full.
+%wet is over the 8192^2 interior, read off the shipped .vxtl.
+
+  tile      local runoff  A_in     Q_in carried  implied   wet px bv9 -> bv10
+  (-14,-4)   103.6 mm/yr   66.6 km2  7.21e6 m3/yr  108 mm/yr   1,630 -> 1,906
+  (-13,-5)   217.5         41.0      6.39e6        156         4,005 -> 4,003
+  (-14,-5)    12.8        154.5      1.49e7         97             0 ->     0
+  (-14,-6)     3.6        352.9      2.50e7         71             0 ->     0
+  (-14,-7)     0.5        981.8      3.32e7         34             0 ->     0
+
+  as %wet over the 8192^2 interior:
+  (-14,-4) 0.0024% -> 0.0028%   (-13,-5) 0.0060% -> 0.0060%   rest 0.0000%
+
+"implied" is Q_in / A_in in mm/yr: the catchment-mean runoff behind the
+imported water. Compare it with the local column -- at (-14,-6) the arriving
+water is worth 71 mm/yr of catchment instead of the 3.6 mm/yr of ground it
+lands on. That factor of 20 IS the fix.
+
+In absolute terms at (-14,-6): 2.50e7 m^3/yr carried, against 1.27e6 from the
+proxy (19.7x) and against 5.87e7 in the stitched coarse world.
+
+IT CORRECTS IN BOTH DIRECTIONS, which is the sign that it is a correction and
+not a boost. (-13,-5) LOST two wet pixels: its local runoff is 217.5 mm/yr
+while its catchment mean is 156, so the proxy had been OVER-stating the water
+arriving there (41.0 km2 x 217.5 mm/yr = 8.92e6 against the true 6.39e6). A
+change that only ever added water would not be measuring anything.
+
+SANITY CHECK AGAINST THE STITCHED COARSE WORLD
+-----------------------------------------------
+`out/water-flow.npz` (tools/worldmaps/water.py, 8704^2 over all 289 coarse
+tiles, one filled surface, full connectivity, no proxy) vs the pyramid's own
+level-0 30 m discharge, per tile maximum:
+
+  tile      coarse world   pyramid L0    ratio
+  (-14,-5)    4.876e7       2.88e7       59%
+  (-14,-6)    5.872e7       2.37e7       40%
+  (-14,-7)    5.885e7       2.39e7       41%
+
+The proxy at the mouth was 1.27e6 against 5.87e7 -- 2.2%. The shortfall that
+remains is catchment truncation across block boundaries (HYDROLOGY_RESIDUALS
+#2 and #7), which this task did not touch. Within a factor of 2.5, not three
+orders of magnitude.
+
+AND THE CORRIDOR IS STILL DRY. TWO REASONS, NEITHER OF THEM THE PROXY
+----------------------------------------------------------------------
+1. (-14,-7) IS NOT A RIVER MOUTH. It is 96.2% ocean, median elevation -115 m.
+   Of its 395 cells with drawable discharge at 30 m, ZERO are above sea level.
+   0.000% wet is the correct answer there. The corridor's coastline is in
+   (-14,-6) (91.7% land), where 1,173 of 1,304 drawable cells are above sea
+   level.
+
+2. THE IMPORTED WATER DOES NOT CROSS THE TILE. Diagnosed on (-14,-5) by baking
+   it in memory and reading B6's own fields:
+
+       Q injected at the padded boundary     1.49e7 m^3/yr, 300 entry cells
+       max Q anywhere in the PADDED domain   1.32e7
+       max Q in the INTERIOR                 2.22e6
+       q_drawable                            3.147e6
+       interior cells at or above it         0
+       perennial cells (Q >= 10 L/s)         21,044
+       undrawn perennial fraction            99.3%
+
+   Discharge only increases downstream, so a 6x drop from the padded maximum
+   to the interior maximum cannot be dispersion. It proves the entire
+   downstream path of that 1.32e7 stream stays in the APRON: the pyramid
+   deposits its water 960 m outside the tile and the 1.875 m surface routes it
+   straight back out.
+
+   THE SINGLE-TERM CONTROL that settles it. The same tile, the same bake, the
+   same superblock, with EXACTLY ONE field changed -- `q` set to None, i.e. the
+   pre-task-#49 boundary condition:
+
+                                    proxy (q=None)    carried Q
+       Q injected at the boundary      (area x local)   1.49472e7, 300 cells
+       max Q, PADDED domain             3.574e6          1.324e7      3.7x
+       drawable cells, PADDED               24              142       5.9x
+       perennial cells                   20,881           21,044
+       max Q, INTERIOR                  2.219e6          2.219e6      1.00x
+       interior wet cells                    0                0
+
+   The interior maximum is IDENTICAL to four significant figures in both arms.
+   The boundary condition -- in either currency, better or worse -- contributes
+   nothing at all to the tile that ships. The 3.7x and 5.9x gains are entirely
+   inside the apron.
+
+   The interior reaches 70% of the drawable threshold on its own local runoff.
+   The tile is short of a river by a factor of 1.4, where the proxy left the
+   BOUNDARY short by a factor of 46 -- but closing the boundary gap did not
+   move the interior at all, because nothing crosses.
+
+WHAT THAT MEANS FOR WHAT IS SCOPED NEXT
+----------------------------------------
+Task #49's premise -- "discharge is faked from local runoff" -- was correct and
+is now false. Its expectation -- that fixing it would put water at the mouth --
+was not, and the two must not be conflated.
+
+The binding constraint is now HYDROLOGY_RESIDUALS #7 with #3: a level hands its
+child only what CROSSES the child's boundary, deposits it AT that boundary
+using the 30 m parent's D8 idea of where the crossing is, and the fine surface
+disagrees. Carrying a better number across the same seam cannot fix that. The
+seam has to deliver INTO the domain rather than onto its edge.
+
+Deliberately not attempted here, per the task's own instruction to stop at a
+coherent point rather than half-build both.
+
+TESTS
+-----
+  pytest (terrain-service)   531 passed / 2 skipped   (baseline 524 / 2)
+  new tests, 8:
+    test_flow_superblock_roundtrips_the_discharge_raster
+    test_a_superblock_that_predates_carried_discharge_is_refused
+    test_superblock_runoff_is_none_without_climate_and_zero_where_ungenerated
+    test_the_pyramid_carries_discharge_across_a_climate_boundary
+    test_discharge_source_refuses_both_currencies_at_once
+    test_discharge_source_adds_a_carried_q_without_reweighting_it
+    test_the_climate_planes_are_in_the_superblock_fingerprint
+    test_carried_discharge_changes_the_water_and_nothing_else
+
+Two real bugs were caught by these tests before any bake was spent: the
+crossing scatter indexed the RECEIVER instead of the ENTRY cell (inflating a
+4-crossing fixture from 8,000 to 12,000 m^2), and the superblock's runoff
+volume was mm/yr times m^2 with no /1000 (every discharge in the pyramid
+1000x too large; the climate-boundary test read 1.46e6 mm/yr of implied
+catchment runoff).
+
+COST
+----
+  bakes            5 tiles x ~300 CPU-s          1,583 CPU-s
+  diagnostics      2 in-memory bakes of (-14,-5)   ~650 CPU-s
+  pyramid          L1 + 4x L0 superblocks           ~25 CPU-s

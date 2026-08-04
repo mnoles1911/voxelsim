@@ -849,11 +849,16 @@ def test_pregen_can_reach_the_fine_encoder():
         tile_x, tile_y = -5, 3
         elevation_m = _bumpy_samples(256)
         flow = np.zeros((256, 256), np.uint8)
+        # bake_ver 8: an EMPTY registry, which is a statement ("surveyed, holds
+        # nothing") and must still set FLAG_BASINS_PRESENT -- a client cannot
+        # otherwise tell it from a tile baked before the registry existed.
+        basins = ()
 
     data = pregen._encode_fine(_R(), seed=99, provider_id="test")
     tile = tc.decode_v2(data)
     assert tile.seed == 99 and tile.x == -5 and tile.y == 3
     assert tile.flow is not None
+    assert tile.basins == []
 
 
 def test_flow_plane_blocks_pick_raw_when_it_is_smaller():

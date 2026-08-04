@@ -29,6 +29,10 @@ add_executable(vxc_tests
   test_detail_rill.cpp
   test_detail_bedding.cpp
   test_channel.cpp
+  test_sealevel.cpp
+  test_lakes.cpp
+  test_riverribbon.cpp
+  test_ocean.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

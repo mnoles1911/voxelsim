@@ -302,6 +302,120 @@ def test_inflow_none_matches_explicit_zero(_numba):
     )
 
 
+# ------------------------------------------------------- the D8 (water) sweep
+
+def test_accumulate_d8_matches_the_reference_sweep(_numba):
+    """Against the independent reference already in this file, cell for cell.
+
+    ``_d8_accumulate`` is a plain Python argsort loop written for the MFD-vs-D8
+    comparison; the kernel must agree with it EXACTLY, not approximately, since
+    every payout is a single float64 add in the same descending order.
+    """
+    filled = flow.fill_depressions(_rough())
+    rec, _ = flow.d8_receivers(filled, CELL_M)
+    assert np.array_equal(flow.accumulate_d8(filled, CELL_M),
+                          _d8_accumulate(filled, rec))
+
+
+def test_accumulate_d8_conserves_its_seed(_numba):
+    """The MFD conservation invariant, verbatim, in both currencies."""
+    rng = np.random.default_rng(11)
+    filled = flow.fill_depressions(_rough())
+    terminal = _terminal_mask(filled)
+
+    acc = flow.accumulate_d8(filled, CELL_M)
+    assert acc[terminal].sum() == pytest.approx(filled.size * CELL_AREA, rel=1e-9)
+
+    src = rng.random(filled.shape) * 4.0
+    inf = rng.random(filled.shape) * 5e4
+    q = flow.accumulate_d8(filled, CELL_M, source=src, inflow=inf)
+    assert q[terminal].sum() == pytest.approx(src.sum() + inf.sum(), rel=1e-9)
+
+
+def test_accumulate_d8_never_splits(_numba):
+    """THE PROPERTY THE WATER PASS IS FOR, stated as the diagnosis stated it.
+
+    A cell's accumulation is "split" when no strictly lower neighbour holds as
+    much as it does -- on the measured corridor that was true of 25-33% of
+    NETWORK cells under MFD, and each one is a chance for a reach to drop below
+    ``q_drawable`` and come back. Under a single-receiver rule the count must be
+    exactly 0, and MFD's must be large on the same surface, or this test would
+    pass without the kernel doing anything.
+
+    Measured on the network rather than on every cell, which is how the corridor
+    number was taken and is the only version that means anything: a hillslope
+    cell holding one cell-area has a lower neighbour holding at least as much
+    almost by definition, so the whole-domain figure (3.3% here) is dominated by
+    ground with no river on it. This surface is 96^2 and smoother than the
+    corridor, so it reads 15% where the corridor read 25-33%; the threshold
+    below is set against what this surface does, not against the corridor.
+    """
+    filled = flow.fill_depressions(_rough())
+    network = np.zeros(filled.shape, bool)
+    network[1:-1, 1:-1] = True
+
+    def split_frac(acc, sel):
+        h, w = filled.shape
+        pz = np.pad(filled.astype(np.float64), 1, constant_values=np.inf)
+        pa = np.pad(acc, 1, constant_values=-np.inf)
+        held = np.zeros(filled.shape, bool)
+        for dy, dx in _OFFSETS:
+            sl = (slice(1 + dy, 1 + dy + h), slice(1 + dx, 1 + dx + w))
+            held |= (pz[sl] < filled) & (pa[sl] >= acc * (1.0 - 1e-12))
+        return float((~held)[sel].mean())
+
+    mfd = flow.accumulate_mfd(filled, CELL_M)
+    d8 = flow.accumulate_d8(filled, CELL_M)
+    # "Network" = 50 cell areas of catchment or more, ~900 cells here.
+    network &= mfd >= 50.0 * CELL_AREA
+    assert network.sum() > 500, "the network selection must not be a handful of cells"
+
+    assert split_frac(d8, network) == 0.0
+    assert split_frac(mfd, network) > 0.10
+
+
+def test_accumulate_d8_beats_high_p_underflow(_numba):
+    """WHY THIS IS A KERNEL AND NOT A LARGER ``mfd_p``. Measured, not asserted.
+
+    ``_accumulate_mfd`` evaluates ``(drop * inv_dist) ** p`` in the surface's own
+    dtype. On float32 -- which is what the bake carries -- an epsilon-filled
+    flat's drop is a couple of ULPs of the domain's magnitude, so the weights
+    underflow to zero at a modest ``p``, ``tot`` is 0, and the sweep treats the
+    cell as a PIT and DROPS its whole accumulation. Conservation is the detector:
+    the budget stops arriving at the terminal cells.
+
+    This is not a hypothetical tuning limit. It bites on exactly the flat,
+    filled, near-sea-level ground a river has to cross to reach a coast.
+    """
+    z = _rough().astype(np.float32) + 3000.0     # a production-scale magnitude
+    filled = flow.fill_depressions(z)
+    terminal = _terminal_mask(filled)
+    budget = filled.size * CELL_AREA
+
+    lost = {}
+    for p in (1.1, 8.0, 16.0, 32.0):
+        acc = flow.accumulate_mfd(filled, CELL_M, p=p)
+        lost[p] = 1.0 - float(acc[terminal].sum()) / budget
+    assert lost[1.1] < 1e-9, "MFD at the production p conserves"
+    assert lost[32.0] > 0.5, (
+        f"expected large-p float32 underflow to swallow the budget, lost "
+        f"{lost}"
+    )
+    # The single-receiver sweep is the limit of that family and loses nothing.
+    d8 = flow.accumulate_d8(filled, CELL_M)
+    assert d8[terminal].sum() == pytest.approx(budget, rel=1e-9)
+
+
+def test_accumulate_d8_rejects_a_mismatched_forest(_numba):
+    z = _plane(16, 16, gx=0.5, gy=0.13)
+    with pytest.raises(ValueError, match="cell_m"):
+        flow.accumulate_d8(z, 0.0)
+    with pytest.raises(ValueError, match="receivers has"):
+        flow.accumulate_d8(z, CELL_M, receivers=np.zeros(9, np.int32))
+    with pytest.raises(ValueError, match=">= 0"):
+        flow.accumulate_d8(z, CELL_M, source=np.full((16, 16), -1.0))
+
+
 def test_float32_routing_agrees_with_float64(_numba):
     """The kernels specialise on dtype (float32 weights use powf); the answer must not.
 

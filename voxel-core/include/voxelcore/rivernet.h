@@ -264,11 +264,16 @@ struct RegionBounds {
     int64_t px0 = 0, py0 = 0, px1 = 0, py1 = 0;
 };
 
-// Sea level in the doctrine's world units: voxel z == 0 (core.h). A node at
-// or below this elevation is AT THE SEA, and the coupler treats it as the
-// network's terminal sink (rivercouple.h). Kept here, next to RiverNode's
-// elevationMm, because "is this node in the ocean" is a graph question.
-inline constexpr int32_t kRiverSeaLevelMm = 0;
+// Sea level for the graph. A node at or below this elevation is AT THE SEA,
+// and the coupler treats it as the network's terminal sink (rivercouple.h).
+//
+// This used to be a second, independent `= 0`. It had ZERO references
+// anywhere in the tree -- including channel.cpp, in this same subsystem,
+// which tested against a bare `0` twice. That is the whole argument for
+// core.h's kSeaLevelMm in one alias: a private copy of a shared datum does
+// not get used, it gets re-typed. Kept as a name because "is this node in
+// the ocean" is a graph question and the graph reads better for saying so.
+inline constexpr int32_t kRiverSeaLevelMm = kSeaLevelMm;
 
 // One point on a promoted channel's course: where it is, how high it is, and
 // (for the LAST point only) which existing node it lands on. World VOXEL

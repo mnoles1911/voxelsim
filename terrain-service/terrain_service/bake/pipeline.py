@@ -112,16 +112,20 @@ import json
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, ClassVar
 
 import numpy as np
 
 # Pure numpy, no kernels, no scipy -- safe to import eagerly here (the lazy
 # imports elsewhere in this file exist for scipy/numba, not for module cycles).
+from . import basins as _basins
 from . import province as _province
+from . import water as _water
 
 __all__ = [
     "BAKE_VERSION",
+    "PRODUCT_STAGE_ORDER",
+    "TERRAIN_VERSION",
     "BakeConstants",
     "BakeGeometry",
     "BakeKernels",
@@ -141,7 +145,9 @@ __all__ = [
     "estimate_peak_bytes",
     "flow_plane",
     "inject_edge_inflow",
+    "inject_edge_discharge",
     "load_kernels",
+    "superblock_runoff_mm_yr",
     "roughness_seed",
     "superblock_index",
     "superblock_inputs_fingerprint",
@@ -267,7 +273,93 @@ __all__ = [
 #: and drives the superblock MFD at 30 m and 120 m/px, so a per-cell value at
 #: 1.875 m would have no counterpart at the parent levels and parent and child
 #: would route differently -- worsening HYDROLOGY_RESIDUALS #3.
-BAKE_VERSION = 7
+#: bake_ver 8 -- B5, the basin registry (docs/watershed-system-plan.md item 3).
+#: The bake stops levelling registered depressions into rock and ships a table
+#: describing them. Every baked tile is invalidated; that is expected and
+#: currently cheap.
+#:
+#: ===========================================================================
+#: TWO COUNTERS, SPLIT AT bake_ver 9. READ THIS BEFORE BUMPING EITHER.
+#: ===========================================================================
+#: Until P2 there was ONE counter, and it did two unrelated jobs:
+#:
+#:   1. it seeded the world -- ``roughness_seed`` mixes it in, so bumping it
+#:      RE-ROLLS THE B1 ROUGHNESS FIELD EVERYWHERE and the ground itself
+#:      changes;
+#:   2. it recorded which PRODUCTS a tile carries -- the sections in the file.
+#:
+#: Those are opposite in kind, and fusing them made every additive change to
+#: the wire format cost a new world. Measured, when P2 was scoped: bumping the
+#: single counter 8 -> 9 moved ``roughness_seed(20260719)`` from
+#: 0x7e1ec856567c4fb5 to 0xc2b0bf0a8b32531f. Every basin in the 256-tile lake
+#: survey, every channel the 25-tile bank probe walked, every vista site and
+#: every spawn coordinate the owner holds describes ground that would simply
+#: stop existing -- to add a section that changes no elevation byte.
+#:
+#: So:
+#:
+#:   TERRAIN_VERSION  decides the GROUND. Feeds ``roughness_seed`` and
+#:                    ``bake_identity_payload``. Bump it when the surface
+#:                    changes -- a new stage, a new constant in
+#:                    ``BakeConstants.as_payload``, a kernel that moves a
+#:                    height. Bumping it is a NEW WORLD and invalidates every
+#:                    measurement, screenshot and site anyone holds.
+#:
+#:   BAKE_VERSION     decides the PRODUCTS. Stamped in the tile header as
+#:                    ``bake_ver`` and hashed through
+#:                    ``product_identity_payload``. Bump it when the bake emits
+#:                    something new or differently -- a section, a table
+#:                    layout, a threshold that decides written bytes. Tiles are
+#:                    re-baked, but onto IDENTICAL ground.
+#:
+#: BOTH feed ``fine_provider_id`` (via ``providers/diffusion.py``), so content
+#: addressing keeps meaning what it says: a tile whose water bytes differ never
+#: shares an id with one whose do not. That is deliberate and is the reason the
+#: product half is hashed rather than merely stamped -- the namespace holding
+#: two mutually incompatible formats under one id is the failure
+#: ``_tile_format_fingerprint`` was written to prevent.
+#:
+#: THE GATE THAT KEEPS THE SPLIT HONEST is
+#: ``tests/test_bake_terrain_identity.py``: re-baking a resident fine tile must
+#: reproduce its elevation plane BYTE FOR BYTE. If that ever fails, something
+#: has leaked from the product half into the terrain half and the split has
+#: stopped doing its job -- which is worth more than any green suite here,
+#: because the whole argument for the split is that the ground does not move.
+#:
+#: And ``test_constants_partition_is_exhaustive`` asserts every
+#: ``BakeConstants`` field lands in exactly one of ``as_payload`` (terrain) or
+#: ``product_payload`` (product). A constant in NEITHER would decide baked
+#: bytes while rolling no identity at all, which is the silent-drift failure
+#: the whitelist form of ``as_payload`` otherwise invites.
+#:
+#: bake_ver 9 -- P2: runoff-weighted discharge, water heads and the graded
+#: water plane (SECTION_WATER_INDEX/DATA). Additive: no elevation byte moves,
+#: which is exactly what the terrain-identity gate proves.
+#:
+#: bake_ver 10 -- task #49: the pyramid CARRIES Q instead of B6 reconstructing
+#: it from area times local runoff. See ``CARRIED_DISCHARGE``.
+#:
+#: WHY THIS IS A PRODUCT BUMP AND NOT A TERRAIN ONE, since that decision is
+#: worth ~67 M control points per tile and was checked rather than assumed:
+#: stream-power incision is ``K * A^m * S^n`` -- it reads the AREA field, which
+#: this change does not touch. The new discharge raster is a SECOND quantity
+#: beside it, consumed only by B6, whose whole output is the water plane. No
+#: entry in ``STAGE_ORDER`` changes, no field in ``BakeConstants.as_payload``
+#: changes, and ``tests/test_bake_terrain_identity.py`` is the gate that
+#: proves it rather than the argument above.
+#:
+#: bake_ver 11 -- the drawable threshold drops about an octave
+#: (``water_min_width_px`` 2.0 -> 1.5) and the water pass routes its discharge
+#: single-receiver (``water_flow_single_receiver``). Both are PRODUCT changes by
+#: the same argument bake_ver 10 made and both were checked the same way: the
+#: area field, ``mfd_p``, ``STAGE_ORDER`` and every field of ``as_payload`` are
+#: untouched, so ``A^m`` reads exactly what it read before. The two halves are
+#: the two measured causes of a wet mask that came out as 2,014 pieces with a
+#: longest reach of 1,113 m on a four-tile corridor -- see the constants
+#: themselves for the apportionment and
+#: ``docs/measurements/river-drawable-and-concentration-2026-08-04.txt``.
+TERRAIN_VERSION = 8
+BAKE_VERSION = 11
 
 
 @dataclass(frozen=True)
@@ -653,6 +745,39 @@ class BakeConstants:
     #: scars in the hillshade). The enforcement form preserves gentle reaches
     #: exactly because it takes min(original drop, this).
     refill_eps_m: float = 0.11
+
+    # -- B5 basin registry (bake_ver 8) ------------------------------------
+    #
+    # docs/watershed-system-plan.md §4.2-§4.3. These DECIDE BAKED BYTES -- a
+    # registered basin is re-opened in the shipped elevation plane -- so they
+    # ride bake_identity_payload like every other constant here. Pinned from
+    # tools/lake_survey.py's 12-tile sweep (docs/lake-survey/lake-survey.md),
+    # not chosen: at 2 m / 2500 m2 the registry is a median of 65 rows per
+    # tile and a worst case of 266, i.e. 8.5 KB against 26.6 MB of compressed
+    # elevation; at 1 m / 0 m2 it is 4,082 rows and mostly puddles.
+    #: Minimum depth of a registered basin's deepest cell, metres.
+    basin_min_depth_m: float = 2.0
+    #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
+    basin_min_area_m2: float = 2500.0
+    #: v1 registers INTERIOR basins only. A basin crossing the tile edge is
+    #: seen by each neighbour from a different padded domain and the two need
+    #: not agree. The excluded ones are COUNTED (survey: 57% of qualifying
+    #: components, 4,609 ha over 12 tiles) so the cost is a number.
+    basin_exclude_spanning: bool = True
+    #: A depression spilling at or below sea level is sea floor, not a lake.
+    basin_require_above_sea: bool = True
+    #: Water-balance constants, mirroring bake/basins.WaterBalance. Restated
+    #: here rather than referenced so that changing the balance rolls the bake
+    #: identity -- the `kind` and `surface_mm` it produces are shipped bytes.
+    basin_pet_a: float = 300.0
+    basin_pet_b: float = 25.0
+    basin_pet_c: float = 0.05
+    basin_pet_floor_mm: float = 100.0
+    basin_budyko_n: float = 2.0
+    basin_min_lake_depth_m: float = 0.5
+    basin_salt_aridity: float = 0.35
+    basin_seasonal_cv_pct: float = 55.0
+
     thermal_iters: int = 48
     #: Must stay <= 0.5 -- ``thermal.relax`` rejects more outright. The shed is
     #: capped by the STEEPEST over-repose pair, so that pair can at most be
@@ -761,6 +886,118 @@ class BakeConstants:
     #: depth that the tapered incision no longer cuts -- a lie about the ground
     #: as well as 7.7 MB of it. See FLOW_PLANE_SIZE.
     flow_flag_sea_taper: bool = True
+
+    # -- P2 water plane (bake_ver 9) ---------------------------------------
+    #
+    # PRODUCT constants, not terrain ones: every field below decides bytes in
+    # SECTION_WATER_*, and NONE of them can move a height. They are hashed
+    # through ``product_payload`` rather than ``as_payload``, so retuning them
+    # rolls ``fine_provider_id`` (a tile whose water differs must not share an
+    # id) without re-rolling the roughness seed (the ground must not move).
+    # See the TERRAIN_VERSION/BAKE_VERSION note at the top of this module.
+
+    #: Discharge, m^3/yr, at which a watercourse is PERENNIAL -- wet in every
+    #: month rather than after rain. 10 L/s. See ``bake.water`` for why this is
+    #: a flow rate rather than the plan's open-ended "10^3-10^4 m^3/yr", and
+    #: why it is deliberately NOT ``channel_init_area_m2``: 156 m^2 is where
+    #: the bake carves a swale, which in most climates is a dry gully.
+    water_q_perennial_m3_yr: float = 315576.0
+    #: Minimum drawn channel width, in FINE PIXELS. The Q threshold the plane
+    #: is actually written over is derived from this through the width law
+    #: (``water.q_drawable_m3_yr``), so the two cannot drift: a channel at
+    #: initiation is 1.5 m wide against a 1.875 m pixel, and phase 2 puts water
+    #: only on reaches wide enough for the raster to hold a wet bed.
+    #:
+    #: 2.0 -> 1.5 at bake_ver 11, AND IT IS A WIDTH DECISION, NOT A KNOB TURN.
+    #: The diagnosis measured what 2 px actually costs: against the corridor's
+    #: median implied runoff (q/acc = 0.1883 m/yr) a cut at 3.1467e6 m^3/yr is a
+    #: catchment-area cut at 2^23.99, a full octave above the 2^23 the design
+    #: record assumed rivers start at, and 90.29% of the DRY cells on the area
+    #: network sit within a factor of two of it. So the plane was not describing
+    #: a sparse world, it was drawing a line an octave up a network that is
+    #: densest right there.
+    #:
+    #: 1.5 px is derived, not picked at 2x: it is the width at which the ratio
+    #: comes out at 1.042 octaves (0.486x), which is what "about an octave" is
+    #: in this law's own units.
+    #:
+    #: WHAT THE NEW NUMBER SAYS ABOUT THE SMALLEST DRAWN RIVER. The threshold is
+    #: a statement about ``channel_width_m(Q)``, so the marginal reach is one
+    #: whose channel is 2.812 m across rather than 3.750 m -- at the client's
+    #: 100 mm voxels, 28 voxels rather than 37. That is still a stream you wade
+    #: rather than step over, and 1.5 px is the floor for the same reason: at
+    #: 1.0 px the marginal channel is 1.875 m, one pixel, which is a creek drawn
+    #: as a raster artefact rather than a river.
+    #:
+    #: What it is NOT is a promise about how wide the RASTER draws it. The plane
+    #: is wet where a cell's own Q clears the cut, so the drawn ribbon is however
+    #: many adjacent cells clear it -- an emergent property of the accumulation,
+    #: not of this law. That distinction is worth the paragraph because the two
+    #: were accidentally in agreement at bake_ver 10 (drawn p50 5.30 m against a
+    #: law p50 of 4.87 m) and are not at bake_ver 11. See
+    #: ``water_flow_single_receiver``, which is what changed it, and the
+    #: measurements file, which reports both.
+    #:
+    #: In flow: 3.1467e6 -> 1.5286e6 m^3/yr, i.e. 0.100 -> 0.048 m^3/s. Still
+    #: 4.8x ``water_q_perennial_m3_yr``, so §4.1's honesty clause survives --
+    #: there remain perennial reaches this raster declines to draw, and
+    #: ``water_head_mask`` still reports both counts.
+    water_min_width_px: float = 1.5
+    #: Route the water pass's DISCHARGE single-receiver (D8) instead of MFD.
+    #:
+    #: THE TERRAIN'S ROUTING IS UNTOUCHED BY THIS. ``mfd_p`` still decides the
+    #: area field, hence ``A^m``, hence every height; this flag reaches only the
+    #: one extra sweep in B6 whose output is the water plane. That separation is
+    #: why it is a PRODUCT field: it cannot move a metre of ground.
+    #:
+    #: WHY. On the measured corridor 25-33% of network cells have no strictly
+    #: lower neighbour holding as much as they do -- their entire accumulation
+    #: was split -- and a Q field consumed by a hard threshold turns each of
+    #: those splits into a dry gap in a wet reach. Walking one channel found
+    #: fifty wet-dry-wet excursions in 2,001 steps. Under any single-receiver
+    #: rule that count is 0 by construction.
+    #:
+    #: WHY NOT A LARGER ``mfd_p`` CONFINED TO THIS PASS, which was the other
+    #: candidate. Two reasons, and the second is decisive:
+    #:
+    #:   * ``mfd_p`` is hashed as a scalar into ``superblock_inputs_fingerprint``
+    #:     and drives the superblock MFD at 30 m and 120 m/px as well as the
+    #:     fine one. A second scalar that moved only the fine water sweep would
+    #:     have the pyramid and the tile routing the same water two different
+    #:     ways; threading it through the pyramid instead invalidates every
+    #:     cached superblock through a fingerprint that does not currently see
+    #:     it. Either way it is a routing change reaching a TERRAIN cache, which
+    #:     is what this whole split exists to prevent.
+    #:   * ``_accumulate_mfd`` evaluates its weights in the surface's own dtype,
+    #:     and at float32 a large ``p`` UNDERFLOWS: after the epsilon fill a
+    #:     flat's slope is ~2.6e-4, so every weight is 0 by ``p ~ 11``, the cell
+    #:     reads as a pit and its whole accumulation is dropped -- on precisely
+    #:     the flat near-coast ground the rivers have to cross. See
+    #:     ``flow.accumulate_d8``.
+    #:
+    #: WHAT IT COSTS, MEASURED, because it is not free and the cost is visible.
+    #: MFD's fan is what made the drawn ribbon wide: near a trunk the
+    #: neighbouring cells carry a share large enough to clear the cut too, so
+    #: the mask came out several pixels across. A single-receiver forest has
+    #: one-cell-wide branches by construction, so the plane becomes a
+    #: CENTRELINE: on the corridor's (-12,-5) the drawn ribbon goes from a
+    #: median 5.30 m to 1.88 m (one pixel), against a law width that says
+    #: 3.30 m. The network is right and the ribbon is now NARROWER than the
+    #: channel it describes, where before it was slightly wider.
+    #:
+    #: That is a real trade and it is deliberately NOT papered over here. The
+    #: fix, if the owner wants it, is to let ``channel_width_m(Q)`` decide
+    #: EXTENT the way ``water_depth_m(Q)`` already decides depth -- which is
+    #: more consistent than what either version does, not less -- and it is a
+    #: decision about what the world looks like rather than a defect. Nothing in
+    #: this constant should be read as having settled it.
+    #:
+    #: False reproduces the bake_ver 10 water pass exactly.
+    water_flow_single_receiver: bool = True
+    #: Write the water plane at all. False reproduces a bake_ver-8 tile's
+    #: sections exactly (no SECTION_WATER_*, flag clear), which is what the
+    #: terrain-identity gate bakes against.
+    water_plane_enabled: bool = True
 
     def __post_init__(self) -> None:
         if not 0.0 < self.thermal_rate <= 0.5:
@@ -881,6 +1118,18 @@ class BakeConstants:
             "meso_slope_lo": self.meso_slope_lo,
             "meso_slope_hi": self.meso_slope_hi,
             "refill_eps_m": self.refill_eps_m,
+            "basin_min_depth_m": self.basin_min_depth_m,
+            "basin_min_area_m2": self.basin_min_area_m2,
+            "basin_exclude_spanning": self.basin_exclude_spanning,
+            "basin_require_above_sea": self.basin_require_above_sea,
+            "basin_pet_a": self.basin_pet_a,
+            "basin_pet_b": self.basin_pet_b,
+            "basin_pet_c": self.basin_pet_c,
+            "basin_pet_floor_mm": self.basin_pet_floor_mm,
+            "basin_budyko_n": self.basin_budyko_n,
+            "basin_min_lake_depth_m": self.basin_min_lake_depth_m,
+            "basin_salt_aridity": self.basin_salt_aridity,
+            "basin_seasonal_cv_pct": self.basin_seasonal_cv_pct,
             "province_strength": self.province_strength,
             "province_smooth_m": self.province_smooth_m,
             "province_relief_lo": self.province_relief_lo,
@@ -902,6 +1151,26 @@ class BakeConstants:
             "flow_flag_sea_taper": self.flow_flag_sea_taper,
         }
 
+    #: Fields that decide PRODUCT bytes but can never move a height. The
+    #: complement of ``as_payload`` over the dataclass, and the two are
+    #: asserted to partition the field set exactly
+    #: (``test_constants_partition_is_exhaustive``) -- a field in NEITHER would
+    #: change baked bytes while rolling no identity at all, which is precisely
+    #: the drift a whitelist invites and the reason that test exists.
+    #: ClassVar, NOT a bare annotation: on a dataclass an annotated class
+    #: attribute becomes a FIELD, and this one would then appear in its own
+    #: partition test as an unclassified constant.
+    PRODUCT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "water_q_perennial_m3_yr",
+        "water_min_width_px",
+        "water_flow_single_receiver",
+        "water_plane_enabled",
+    )
+
+    def product_payload(self) -> dict:
+        """The product half of the identity. See ``PRODUCT_FIELDS``."""
+        return {name: getattr(self, name) for name in self.PRODUCT_FIELDS}
+
 
 PRODUCTION = BakeGeometry()
 CONSTANTS = BakeConstants()
@@ -918,6 +1187,19 @@ STAGE_ORDER: tuple[str, ...] = (
     "B3.relax",
     "B4.meso",
     "B4b.refill",
+    "B5.reopen_basins",
+)
+
+#: Stages that produce PRODUCTS rather than ground. Hashed into
+#: ``product_identity_payload``, never into ``bake_identity_payload`` -- B6
+#: reads the surface and writes a separate plane, and putting it in
+#: ``STAGE_ORDER`` would roll the terrain identity of every world for a stage
+#: that cannot move a height by construction.
+#:
+#: ``bake_tile`` reports timings for both lists in one ``cpu_seconds`` dict, so
+#: the split is an identity boundary and not a reporting one.
+PRODUCT_STAGE_ORDER: tuple[str, ...] = (
+    "B6.discharge_water",
 )
 
 
@@ -932,7 +1214,11 @@ def bake_identity_payload(
     under one identity.
     """
     return {
-        "bake_version": BAKE_VERSION,
+        # NAME KEPT at "bake_version" though it now carries TERRAIN_VERSION:
+        # this key is hashed into every shipped fine_provider_id, and renaming
+        # it would roll the terrain namespace of every existing world for a
+        # cosmetic reason -- the precise thing the split exists to avoid.
+        "bake_version": TERRAIN_VERSION,
         "stage_order": list(STAGE_ORDER),
         "geometry": geom.as_payload(),
         "constants": consts.as_payload(),
@@ -950,6 +1236,56 @@ def bake_fingerprint(
 ) -> str:
     return hashlib.sha256(
         json.dumps(bake_identity_payload(geom, consts), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def product_identity_payload(consts: BakeConstants = CONSTANTS) -> dict:
+    """Everything that decides which PRODUCTS a tile carries and what is in them.
+
+    The other half of ``bake_identity_payload``. Folded into
+    ``fine_provider_id`` alongside it, so a tile whose water plane differs never
+    shares an id with one whose does not -- content addressing meaning what it
+    says. What it deliberately does NOT do is reach ``roughness_seed``: bumping
+    a product constant re-bakes tiles onto identical ground rather than
+    creating a world.
+
+    Note what is absent, because it is the reason this is affordable: water
+    APPEARANCE -- translucency, colour, the depth cue, the foam channel -- is
+    client-side material work and touches no baked byte, so the W6/W7-style
+    retuning the owner does most often rolls nothing here.
+    """
+    return {
+        "bake_version": BAKE_VERSION,
+        "stage_order": list(PRODUCT_STAGE_ORDER),
+        "constants": consts.product_payload(),
+        # The section ids and flag bit the bake writes. A layout change with no
+        # constant change would otherwise be invisible to the id -- which is
+        # exactly the "namespace holding two mutually incompatible formats"
+        # failure `providers/diffusion.py::_tile_format_fingerprint` records.
+        "sections": {
+            "water_index": _codec_const("SECTION_WATER_INDEX"),
+            "water_data": _codec_const("SECTION_WATER_DATA"),
+            "water_flag": _codec_const("FLAG_WATER_PRESENT"),
+            "water_dry_sentinel": _codec_const("WATER_DRY_DEPTH"),
+            "water_depth_lsb_mm": _codec_const("WATER_DEPTH_LSB_MM"),
+        },
+    }
+
+
+def _codec_const(name: str) -> int:
+    """Read one wire constant from ``tile_codec`` without importing it eagerly.
+
+    ``tile_codec`` imports the bake lazily (for ``BAKE_VERSION``), so importing
+    it at this module's top level would close a cycle.
+    """
+    from .. import tile_codec
+
+    return int(getattr(tile_codec, name))
+
+
+def product_fingerprint(consts: BakeConstants = CONSTANTS) -> str:
+    return hashlib.sha256(
+        json.dumps(product_identity_payload(consts), sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
@@ -1080,7 +1416,7 @@ def roughness_seed(
     world_seed: int,
     origin_cells: tuple[int, int] = (0, 0),
     *,
-    bake_version: int = BAKE_VERSION,
+    bake_version: int = TERRAIN_VERSION,
     anchor_pitch_fine_px: int = 0,
 ) -> int:
     """The seed handed to ``noise.roughness``. Read ``NOISE_ANCHORING`` first.
@@ -1162,6 +1498,12 @@ class BakeKernels:
     #: a None default so pre-existing test doubles keep constructing; the
     #: pipeline refuses to bake ``incision_mode = "profile"`` without it.
     profile_incision: "Callable | None" = None
+    #: ``flow.accumulate_d8``, the water pass's single-receiver sweep. Same
+    #: None-default reason as ``profile_incision``; B6 refuses to bake with
+    #: ``water_flow_single_receiver`` set and no kernel rather than silently
+    #: falling back to MFD and shipping a plane that is not the one the
+    #: constants describe.
+    accumulate_d8: "Callable | None" = None
 
 
 _MISSING_KERNELS = (
@@ -1175,7 +1517,12 @@ _MISSING_KERNELS = (
 def load_kernels() -> BakeKernels:
     """Import the real numerics. Raises RuntimeError with a legible message."""
     try:
-        from .flow import accumulate_mfd, d8_receivers, fill_depressions
+        from .flow import (
+            accumulate_d8,
+            accumulate_mfd,
+            d8_receivers,
+            fill_depressions,
+        )
     except ImportError as exc:  # pragma: no cover - depends on sibling agents
         raise RuntimeError(_MISSING_KERNELS.format(mod="flow", err=exc)) from exc
     try:
@@ -1196,6 +1543,7 @@ def load_kernels() -> BakeKernels:
         fill_depressions=fill_depressions,
         d8_receivers=d8_receivers,
         accumulate_mfd=accumulate_mfd,
+        accumulate_d8=accumulate_d8,
         stream_power=stream_power,
         relax=relax,
         profile_incision=profile_incision,
@@ -1499,6 +1847,61 @@ What the pyramid still gets wrong. Recorded so nobody rediscovers it.
    And **a boundary-crossing pyramid delivers nothing within one child block
    of where you inject**; buying reach at the top is worth little until that
    is addressed.
+
+   SEPARATE FROM CARRIED DISCHARGE (task #49), AND NOW THE BINDING ONE. #7
+   bounds HOW MUCH catchment reaches a tile; #49 fixed HOW MUCH WATER a given
+   catchment is worth. They compose, and #49 shipped without touching this --
+   but the corridor #49 was opened on is STILL DRY, and the measurement says
+   this entry is why.
+
+   MEASURED on (-14,-5), 2026-08-04, bake_ver 10, by baking the tile in memory
+   and reading B6's own fields:
+
+     * 1.49e7 m^3/yr of carried discharge arrives across 300 entry cells;
+     * somewhere in the PADDED domain a cell carries 1.32e7 of it, so it does
+       converge into a real stream;
+     * the INTERIOR tops out at 2.22e6, against a 3.15e6 drawable threshold.
+
+   Discharge only increases downstream, so a 6x drop from the padded maximum to
+   the interior maximum is not dispersion -- it is proof that the whole
+   downstream path of that 1.32e7 stream stays in the APRON. The pyramid's
+   water enters the padded domain 960 m out and leaves again without ever
+   crossing the tile that ships.
+
+   Confirmed by a single-term control on the same tile (`q` set to None): the
+   padded maximum falls 1.324e7 -> 3.574e6 and the padded drawable count 142 ->
+   24, while the INTERIOR maximum is 2.219e6 in BOTH arms, identical to four
+   figures. The boundary condition contributes nothing to the shipped bytes.
+
+   So the tile is short of drawing a river by a factor of 1.4, where the
+   discharge proxy had it short by 46. The remaining 1.4 is this entry, plus #3
+   (the deposit lands where the 30 m parent's D8 says the flow crosses, and the
+   1.875 m surface disagrees). A better NUMBER carried across the same seam
+   cannot fix it; the seam has to deliver into the domain rather than onto its
+   edge. See ``CARRIED_DISCHARGE``.
+
+8. **Runoff disagreement between levels.** NEW with carried discharge. Each
+   level computes its own Budyko runoff over its OWN raster at its own pitch
+   and smooths it over ``province_smooth_m``, so the Q crossing a level-0
+   boundary was integrated at 30 m while a level-1 crossing was integrated at
+   120 m, and the fine tile re-derives its interior runoff on its own padded
+   climate. The same class as #3, and bounded by the same argument: climate has
+   no fine structure -- which is exactly why ``runoff_field_mm_yr`` keeps it
+   coarse and gathers with ``y // scale`` rather than materialising it fine.
+   The physical smoothing RADIUS is held constant across levels (the half-width
+   is derived from the level's own ``cell_m``), so the disagreement is
+   quantisation, not a change of filter.
+
+9. **A model-backed parent carries area but no discharge.**
+   ``build_model_superblock`` takes an elevation raster and nothing else, so
+   ``q`` is None on it and the top tile-backed level receives area at its edges
+   with no water attached. Deliberate: the model window is 3,932 km of ground
+   the climate planes have never been generated for, and fabricating a runoff
+   for it would be the very proxy task #49 deleted, at 64x the footprint. The
+   consequence is that Q is UNDERSTATED at the top level's rim rather than
+   invented, and #7 already says almost nothing arrives there anyway. Fixing it
+   means giving the model window a climate stage, which is a provider question,
+   not a pyramid one.
 """
 
 
@@ -1642,6 +2045,7 @@ def superblock_inputs_fingerprint(
     level: "FlowLevel",
     parent_fingerprint: bytes = b"",
     entry_mode: str = ENTRY_FOOTPRINT,
+    climate_fetch: "ClimateFetch | None" = None,
 ) -> bytes:
     """Digest of every input one superblock's hydrology is built from.
 
@@ -1654,13 +2058,22 @@ def superblock_inputs_fingerprint(
     with the default 4x4 block, 256 MB at level 1. That is I/O and hashing
     against a priority flood over the same ground, so it is not what decides
     whether the pyramid is affordable.
+
+    CLIMATE IS A CONDITIONAL SECOND PASS (task #49), on the ``entry_mode``
+    precedent immediately below. Since the block began carrying a DISCHARGE, the
+    climate planes decide its bytes as surely as the elevation does, and a
+    fingerprint that ignored them would say two blocks were built from the same
+    world when one had a river in it and the other did not. But hashing them
+    unconditionally would have rewritten the fingerprint of every block ever
+    cached, for an input none of them read. So: no ``climate_fetch``, digest
+    unchanged, byte for byte, exactly as before.
     """
     h = hashlib.sha256()
     h.update(_FP_DOMAIN)
     h.update(
         json.dumps(
             {
-                "bake_version": BAKE_VERSION,
+                "bake_version": TERRAIN_VERSION,
                 "level": int(level.level),
                 "sx": int(sx),
                 "sy": int(sy),
@@ -1696,6 +2109,16 @@ def superblock_inputs_fingerprint(
                 continue
             h.update(b"\x01")
             h.update(np.ascontiguousarray(src, dtype=np.float32).tobytes())
+    if climate_fetch is not None:
+        h.update(b"climate")
+        for j in range(n):
+            for i in range(n):
+                planes = climate_fetch(tx0 + i, ty0 + j)
+                if planes is None:
+                    h.update(b"\x00")
+                    continue
+                h.update(b"\x01")
+                h.update(np.ascontiguousarray(planes, dtype=np.uint8).tobytes())
     return h.digest()[:FLOW_FINGERPRINT_BYTES]
 
 
@@ -1720,6 +2143,20 @@ class FlowSuperblock:
     #: ``superblock_inputs_fingerprint`` of the world this was built from.
     #: See ORDER_DEPENDENCE. Empty only for a hand-built test fixture.
     inputs_fingerprint: bytes = b""
+    #: RUNOFF-WEIGHTED DISCHARGE, m^3/yr, over the same cells as ``acc`` and by
+    #: the same MFD sweep -- task #49. ``None`` means this block was built
+    #: without climate and CANNOT answer "how much water", only "how much
+    #: ground". That is a third state, distinct from zero, and every consumer
+    #: must branch on it rather than reading a zero as a dry catchment.
+    #:
+    #: WHY IT IS A SECOND RASTER AND NOT A REPLACEMENT. ``acc`` is what
+    #: stream-power incision reads (``A^m`` -- an AREA law), so it decides the
+    #: ground and can never be swapped for a discharge without rolling
+    #: TERRAIN_VERSION. ``q`` is what the water plane reads. Two currencies,
+    #: two consumers, one pyramid; the alternative -- reconstructing Q from
+    #: ``acc`` at the destination -- is exactly the proxy this field exists to
+    #: retire.
+    q: "np.ndarray | None" = None
 
     @property
     def size_px(self) -> int:
@@ -1738,14 +2175,28 @@ class FlowSuperblock:
     def fingerprint_hex(self) -> str:
         return self.inputs_fingerprint.hex()
 
+    @property
+    def carries_discharge(self) -> bool:
+        """True when this block can answer "how much WATER crosses here"."""
+        return self.q is not None
+
 
 _FLOW_MAGIC = b"VXFL"
 #: 1 -> 2: added the 16-byte inputs fingerprint. Old blobs are REFUSED rather
 #: than read with a zero fingerprint, because a zero fingerprint would read as
 #: "provenance unknown" everywhere and defeat the check it was added for.
-_FLOW_VERSION = 2
-#: magic, version, seed, bake_ver, level, pad, sx, sy, tiles_per_side, size,
+#:
+#: 2 -> 3 (task #49): added the optional DISCHARGE raster. Refused for the same
+#: reason: a v2 block decoded as v3 would come back with ``q = None``, which is
+#: the correct reading, but it would then silently feed the old local-runoff
+#: proxy into a bake that has been told it carries Q. The bump makes "this
+#: block predates carried discharge" a rebuild rather than a quiet downgrade.
+_FLOW_VERSION = 3
+#: magic, version, seed, bake_ver, level, has_q, sx, sy, tiles_per_side, size,
 #: cell_m, origin_x_m, origin_y_m, inputs_fingerprint, n_missing
+#:
+#: ``has_q`` occupies what was a zero pad byte, so the header LENGTH is
+#: unchanged and only the version distinguishes the two.
 _FLOW_HEADER = struct.Struct("<4sHQHBBiiHIfdd16sI")
 
 
@@ -1759,13 +2210,25 @@ def encode_flow_superblock(sb: FlowSuperblock, seed: int) -> bytes:
     filled = np.ascontiguousarray(sb.filled, dtype="<f4")
     if acc.shape != filled.shape or acc.ndim != 2 or acc.shape[0] != acc.shape[1]:
         raise ValueError("flow superblock rasters must be square and same-shaped")
+    # DISCHARGE IS float64 ON THE WIRE, unlike the two float32 planes beside it,
+    # and the reason is range rather than precision: Q at a continental mouth is
+    # order 1e10 m^3/yr while a headwater cell contributes ~1e2, and the width
+    # law reads Q^0.4 over that whole span. float32 holds it, but the MFD sweep
+    # that produced it accumulates in float64 and narrowing here would make the
+    # cached block disagree with a freshly built one -- which is the difference
+    # between a cache and a second implementation.
+    q = None
+    if sb.q is not None:
+        q = np.ascontiguousarray(sb.q, dtype="<f8")
+        if q.shape != acc.shape:
+            raise ValueError("flow superblock discharge must match the acc raster")
     head = _FLOW_HEADER.pack(
         _FLOW_MAGIC,
         _FLOW_VERSION,
         _u64(seed),
-        BAKE_VERSION,
+        TERRAIN_VERSION,
         sb.level,
-        0,
+        1 if q is not None else 0,
         sb.sx,
         sb.sy,
         sb.tiles_per_side,
@@ -1779,7 +2242,10 @@ def encode_flow_superblock(sb: FlowSuperblock, seed: int) -> bytes:
         len(sb.missing_tiles),
     )
     missing = np.asarray(sb.missing_tiles, dtype="<i4").reshape(-1, 2)
-    return head + missing.tobytes() + acc.tobytes() + filled.tobytes()
+    parts = [head, missing.tobytes(), acc.tobytes(), filled.tobytes()]
+    if q is not None:
+        parts.append(q.tobytes())
+    return b"".join(parts)
 
 
 def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
@@ -1790,7 +2256,7 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         seed,
         bake_ver,
         level,
-        _pad,
+        has_q,
         sx,
         sy,
         tiles_per_side,
@@ -1805,11 +2271,16 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         raise ValueError("bad flow superblock magic")
     if version != _FLOW_VERSION:
         raise ValueError(f"unsupported flow superblock version {version}")
-    if bake_ver != BAKE_VERSION:
-        # Cannot happen through the cache (provider_id covers BAKE_VERSION),
-        # but a stale file handed in directly must not be silently mixed in.
+    if bake_ver != TERRAIN_VERSION:
+        # TERRAIN_VERSION, not BAKE_VERSION: a superblock is a ROUTING product
+        # over the coarse ground, and it stays valid across a products-only
+        # bump. Pinning it to BAKE_VERSION would throw away every cached
+        # superblock on a bump that cannot change a single one of their bytes.
+        # Cannot happen through the cache (provider_id covers both), but a
+        # stale file handed in directly must not be silently mixed in.
         raise ValueError(
-            f"flow superblock was built by bake_ver {bake_ver}, this is {BAKE_VERSION}"
+            f"flow superblock was built by terrain_ver {bake_ver}, this is "
+            f"{TERRAIN_VERSION}"
         )
     off = _FLOW_HEADER.size
     missing = np.frombuffer(data, dtype="<i4", count=2 * n_missing, offset=off)
@@ -1819,6 +2290,12 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
     off += 4 * n
     filled = np.frombuffer(data, dtype="<f4", count=n, offset=off).reshape(size, size)
     off += 4 * n
+    q = None
+    if has_q:
+        q = np.array(
+            np.frombuffer(data, dtype="<f8", count=n, offset=off).reshape(size, size)
+        )
+        off += 8 * n
     if off != len(data):
         raise ValueError("trailing bytes in flow superblock")
     sb = FlowSuperblock(
@@ -1832,6 +2309,7 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         filled=np.array(filled),
         missing_tiles=tuple((int(a), int(b)) for a, b in missing.reshape(-1, 2)),
         inputs_fingerprint=bytes(fingerprint),
+        q=q,
     )
     return sb, seed
 
@@ -1843,6 +2321,201 @@ def _mean_downsample(a: np.ndarray, factor: int) -> np.ndarray:
     return a.reshape(h // factor, factor, w // factor, factor).mean(axis=(1, 3))
 
 
+CARRIED_DISCHARGE = """\
+Why the pyramid carries Q, and what it cost to find out it had to (task #49).
+
+THE DEFECT. ``build_flow_superblock`` accumulated one quantity -- catchment AREA
+in m^2 -- and ``bake_tile``'s B6 turned the area arriving at its boundary into a
+discharge by multiplying it by the runoff of the cell it arrived AT. That is
+right only if the catchment upstream has the climate of its own mouth, and a
+river that leaves its climate zone is precisely the case where it does not.
+
+MEASURED, seed 20260719, the (-14,-4) -> (-14,-7) corridor: a river rising in
+wet mountains and crossing an arid coastal plain. Local runoff along it falls
+103.6 -> 217.5 -> 12.8 -> 3.6 -> 0.5 mm/yr. At the mouth the proxy read
+352.9 km^2 x 3.6 mm/yr = 1.27e6 m^3/yr against a 3.15e6 drawable threshold, so
+THREE OF THE FIVE TILES BAKED 0.000% WET, INCLUDING THE MOUTH, with water only
+on the two upstream ones. The stitched coarse world, which has full
+connectivity and no proxy, reads 58.7e6 m^3/yr at the same place. Backwards for
+a river, and every river that leaves its own climate zone was broken this way.
+
+THE FIX, in one sentence: run the same MFD sweep a second time at every level
+of the pyramid with each cell seeded by its runoff VOLUME instead of its area,
+and inject the result at the same boundary crossings the area uses.
+
+FOUR PROPERTIES THAT MAKE IT CHEAP AND SAFE.
+
+1. **It reuses the crossings, it does not recompute them.** ``_edge_entries``
+   returns the (entry cell, child target cell) pairs once and both
+   ``inject_edge_inflow`` and ``inject_edge_discharge`` scatter through them.
+   Q and area therefore arrive at the SAME cell by construction rather than by
+   two implementations agreeing -- which is how the three currencies in
+   ``water.py``'s docstring happened in the first place.
+
+2. **It cannot move a height.** Stream-power incision reads ``A^m`` -- an area
+   law -- so ``acc`` still decides the ground, unchanged, and ``q`` is a second
+   raster that only the water plane reads. This is a BAKE_VERSION change, not a
+   TERRAIN_VERSION one, and ``tests/test_bake_terrain_identity.py`` is the gate
+   that says so.
+
+3. **It is one extra sweep per superblock, not per tile.** A level's raster is
+   2048^2 whatever the level, so the whole pyramid costs a handful of seconds
+   against the ~300 CPU-s a single fine tile takes.
+
+4. **"No climate" is a third state, not zero.** ``q is None`` says the block
+   cannot answer the question. B6 falls back to the old proxy in that case and
+   SAYS SO in ``water_q_inflow_carried``, because a silent zero would read as a
+   dry continent and would be the same class of failure as the proxy itself.
+
+WHAT IT DELIVERED, MEASURED ON THE CORRIDOR IT WAS OPENED ON (2026-08-04, seed
+20260719, bake_ver 10 against the shipped bake_ver 9 tiles):
+
+    tile      local runoff   Q carried in at the boundary    wet px 9 -> 10
+    (-14,-4)     103.6 mm/yr   7.21e6 @  108 mm/yr implied   1,630 -> 1,906
+    (-13,-5)     217.5         6.39e6 @  156                 4,005 -> 4,003
+    (-14,-5)      12.8         1.49e7 @   97                     0 ->     0
+    (-14,-6)       3.6         2.50e7 @   71                     0 ->     0
+    (-14,-7)       0.5         3.32e7 @   34                     0 ->     0
+
+The middle column is the whole change: the water crossing into (-14,-6) is now
+worth 71 mm/yr of catchment-mean runoff instead of the 3.6 mm/yr of the arid
+ground it lands on -- 20x more water, and 2.50e7 m^3/yr where the proxy read
+1.27e6. Against the stitched coarse world, which has full connectivity and no
+proxy, the pyramid's own 30 m discharge near the mouth is 2.37e7 against
+5.87e7: 40% of the true figure, where the proxy was 2.2% of it.
+
+IT CORRECTS IN BOTH DIRECTIONS. (-13,-5) LOST two wet pixels, because its local
+runoff (217.5) is HIGHER than its catchment mean (156) and the proxy had been
+over-stating the water arriving there. A change that only ever adds water is
+not measuring anything.
+
+AND THE CORRIDOR IS STILL DRY, WHICH IS THE HONEST HEADLINE. Two things were
+learned, and neither is the proxy:
+
+  a. **(-14,-7) is 96.2% OCEAN** (median elevation -115 m). Every one of its
+     395 drawable-Q cells at 30 m is BELOW SEA LEVEL. It was never a river
+     mouth; it is the sea the river runs into, and 0.000% wet is the right
+     answer there. The corridor's actual coastline is in (-14,-6).
+
+  b. **The imported water does not reach the tile's own trunk stream.**
+     Diagnosed on (-14,-5) by baking it in memory and reading B6's fields:
+
+         Q injected at the padded boundary   1.49e7 m^3/yr, 300 entry cells
+         max Q anywhere in the PADDED domain 1.32e7   (i.e. it does converge)
+         max Q in the INTERIOR                2.22e6
+         drawable threshold                   3.15e6
+         interior cells at or over it              0
+
+     Discharge only increases downstream, so a 6x drop from the padded maximum
+     to the interior maximum cannot be dispersion: it PROVES that the entire
+     downstream path of that 1.32e7 stream stays in the apron. The pyramid's
+     water enters 960 m outside the tile and leaves without crossing it.
+
+     THE SINGLE-TERM CONTROL, same tile, same superblock, `q` set to None:
+
+                                     proxy      carried Q
+         max Q, PADDED domain        3.574e6     1.324e7    3.7x
+         drawable cells, PADDED           24         142    5.9x
+         max Q, INTERIOR             2.219e6     2.219e6    1.00x
+         interior wet cells                0           0
+
+     The interior maximum is IDENTICAL to four figures. The boundary
+     condition, in either currency, contributes NOTHING to the tile that
+     ships; the whole gain is inside the apron.
+
+That is HYDROLOGY_RESIDUALS #7 and #3 together -- the pyramid deposits what
+crosses the boundary AT the boundary, using the 30 m parent's D8 idea of where
+it crosses, and the 1.875 m surface then routes it back out. It is a DIFFERENT
+defect from the one this task fixed, it is the one now standing between this
+corridor and its river, and it is not addressable by carrying a better number
+across the same seam. Task #49's premise -- "the discharge is faked" -- was
+correct and is now false. The premise that fixing it would wet the mouth was
+not, and the two must not be conflated in whatever is scoped next.
+
+TWO NEW RESIDUALS, recorded honestly: HYDROLOGY_RESIDUALS #8 (each level
+smooths its runoff at its own pitch) and #9 (a model-backed parent carries area
+but no discharge).
+"""
+
+
+def superblock_runoff_mm_yr(
+    climate_fetch: "ClimateFetch | None",
+    sx: int,
+    sy: int,
+    level: "FlowLevel",
+) -> "np.ndarray | None":
+    """Budyko runoff over one superblock's raster, mm/yr, or None without climate.
+
+    Assembled exactly as ``build_flow_superblock`` assembles elevation -- tile by
+    tile, mean-downsampled to the level's own pitch -- so the two rasters are
+    registered cell for cell and no resampling step can put the water somewhere
+    the ground is not.
+
+    THE SMOOTH IS OVER THE ASSEMBLED BLOCK, not per tile, and that is the whole
+    reason this is a function rather than four lines inside the build. The
+    uint8 climate wire LSBs are 0.31 C and 47 mm/yr; smoothing each tile alone
+    would leave a discontinuity at every tile join, and a discontinuity in
+    runoff is a step in Q, which the width law turns into a visible step in a
+    river. ``province_smooth_m`` is converted to the level's pitch so the
+    PHYSICAL smoothing radius is the same at every level.
+
+    A MISSING TILE CONTRIBUTES ZERO RUNOFF, deliberately, matching what
+    ``MISSING_ELEVATION_M`` already does to the routing: an ungenerated region
+    delivers no water. It is the same residual (#1) in a second currency, not a
+    new one -- and ``missing_tiles`` on the block is what records it.
+
+    Returns None when NO tile in the block has climate, which is the honest
+    answer to "how much water" and is propagated as ``FlowSuperblock.q = None``.
+    """
+    if climate_fetch is None:
+        return None
+    n_tiles = level.tiles_per_side
+    tile_px = level.geom.coarse_tile_px
+    ds = level.downsample
+    sub = tile_px // ds
+    tx0, ty0 = sx * n_tiles, sy * n_tiles
+
+    temp = np.zeros((level.size_px, level.size_px), np.float32)
+    precip = np.zeros((level.size_px, level.size_px), np.float32)
+    have = np.zeros((level.size_px, level.size_px), bool)
+    any_climate = False
+    for j in range(n_tiles):
+        for i in range(n_tiles):
+            planes = climate_fetch(tx0 + i, ty0 + j)
+            if planes is None:
+                continue
+            phys = _province.dequantize_climate(planes)
+            ys = slice(j * sub, (j + 1) * sub)
+            xs = slice(i * sub, (i + 1) * sub)
+            temp[ys, xs] = _mean_downsample(phys["temperature"], ds)
+            precip[ys, xs] = _mean_downsample(phys["precipitation"], ds)
+            have[ys, xs] = True
+            any_climate = True
+    if not any_climate:
+        return None
+
+    half = max(int(round(float(level.consts.province_smooth_m)
+                         / float(level.cell_m) / 2.0)), 1)
+    # NORMALISED smooth: a missing tile is a HOLE, not a plateau at 0 C and
+    # 0 mm/yr. Smoothing the raw arrays would drag every neighbouring cell
+    # within the 480 m influence radius toward that fabricated cold desert and
+    # invent a dry rim around every ungenerated region. Dividing by the smoothed
+    # coverage mask is the nearest-valid extension and costs one more box pass.
+    cover = _province.box_smooth(have.astype(np.float32), half)
+    safe = np.maximum(cover, np.float32(1e-6))
+    temp = _province.box_smooth(temp * have, half) / safe
+    precip = _province.box_smooth(precip * have, half) / safe
+    wb = basin_balance(level.consts)
+    pet = _basins.pet_mm_yr(temp, wb)
+    runoff = np.asarray(_basins.budyko_runoff_mm_yr(precip, pet, wb), np.float64)
+    # A tile with no climate contributes no water at all -- the same statement
+    # MISSING_ELEVATION_M already makes about the routing, in the second
+    # currency. HYDROLOGY_RESIDUALS #1, not a new residual.
+    runoff[~have] = 0.0
+    np.clip(runoff, 0.0, None, out=runoff)
+    return runoff
+
+
 def build_flow_superblock(
     coarse_fetch: CoarseFetch,
     sx: int,
@@ -1851,6 +2524,7 @@ def build_flow_superblock(
     kernels: BakeKernels,
     parent: "FlowSuperblock | None" = None,
     entry_mode: str = ENTRY_FOOTPRINT,
+    climate_fetch: "ClimateFetch | None" = None,
 ) -> FlowSuperblock:
     """Coarse hydrology over one world-anchored superblock.
 
@@ -1867,6 +2541,13 @@ def build_flow_superblock(
     its channel and would route flow along an elevation field no real cell has.
     Mean keeps the drainage divides where the 30 m data put them, which is what
     the accumulation is for.
+
+    TWO CURRENCIES SINCE TASK #49. With ``climate_fetch`` the block also carries
+    ``q``, a runoff-weighted DISCHARGE in m^3/yr from a second MFD sweep over
+    the same filled surface and the same weights. Read ``CARRIED_DISCHARGE`` for
+    why area alone could not deliver a river to the sea. Without it the block is
+    exactly what it was and ``q`` is None -- which is a refusal to answer, not a
+    dry world, and every consumer branches on it.
 
     The result carries ``inputs_fingerprint`` -- a digest of the coarse tiles
     (present AND absent) it was actually built from, chained to the parent's.
@@ -1900,9 +2581,14 @@ def build_flow_superblock(
     origin_m = (tx0 * level.geom.tile_span_m, ty0 * level.geom.tile_span_m)
 
     filled = np.asarray(kernels.fill_depressions(z), dtype=np.float32)
+    entries = None
     inflow = None
     if parent is not None:
-        inflow = inject_edge_inflow(
+        # ONE geometry, computed ONCE, used by both currencies. Area and
+        # discharge cross the boundary at the same cell because they are
+        # scattered through the same (entry, target) pairs -- not because two
+        # code paths were written to agree. See CARRIED_DISCHARGE property 1.
+        entries = _edge_entries(
             child_z=filled,
             child_origin_m=origin_m,
             child_cell_m=level.cell_m,
@@ -1910,12 +2596,49 @@ def build_flow_superblock(
             d8_fn=kernels.d8_receivers,
             entry_mode=entry_mode,
         )
+        inflow = _scatter_entries(entries, parent.acc, filled.shape)
     acc = np.asarray(
         kernels.accumulate_mfd(
             filled, level.cell_m, p=level.consts.mfd_p, inflow=inflow
         ),
         dtype=np.float32,
     )
+    del inflow
+
+    # -- THE SECOND SWEEP: DISCHARGE (task #49, CARRIED_DISCHARGE).
+    q = None
+    runoff = superblock_runoff_mm_yr(climate_fetch, sx, sy, level)
+    if runoff is not None:
+        # Per-cell runoff VOLUME, m^3/yr -- the seed accumulate_mfd(source=)
+        # wants. Same construction as water.discharge_source at the fine tier,
+        # at this level's own cell size. THE /1000 IS THE UNIT: runoff is
+        # mm/yr and the cell is m^2, so without it every discharge in the
+        # pyramid is 1000x too large (which is exactly what the climate-
+        # boundary test read the first time it ran -- 1.46e6 mm/yr of implied
+        # catchment runoff).
+        q_src = (runoff / 1000.0) * (level.cell_m * level.cell_m)
+        del runoff
+        q_in = None
+        if entries is not None and parent.q is not None:
+            q_in = _scatter_entries(entries, parent.q, filled.shape)
+        elif entries is not None:
+            # A parent that carries area but not discharge -- today only the
+            # model-backed top (build_model_superblock takes no climate). Its
+            # area still lands, so incision still sees the catchment; its water
+            # does not, and Q is UNDERSTATED at that boundary rather than
+            # invented. Deliberate: fabricating runoff for ground the model has
+            # never seen is the proxy this task exists to delete.
+            pass
+        q = np.asarray(
+            kernels.accumulate_mfd(
+                filled, level.cell_m, p=level.consts.mfd_p,
+                source=q_src, inflow=q_in,
+            ),
+            dtype=np.float64,
+        )
+        del q_src, q_in
+    del entries
+
     return FlowSuperblock(
         level=level.level,
         sx=sx,
@@ -1935,7 +2658,9 @@ def build_flow_superblock(
                 parent.inputs_fingerprint if parent is not None else b""
             ),
             entry_mode=entry_mode,
+            climate_fetch=climate_fetch,
         ),
+        q=q,
     )
 
 
@@ -1977,7 +2702,7 @@ def model_superblock_fingerprint(
     h.update(
         json.dumps(
             {
-                "bake_version": BAKE_VERSION,
+                "bake_version": TERRAIN_VERSION,
                 "cell_m": float(cell_m),
                 "origin_x_m": float(origin_m[0]),
                 "origin_y_m": float(origin_m[1]),
@@ -2081,42 +2806,55 @@ def superblock_covers(parent: FlowSuperblock, child_origin_m, child_span_m) -> b
     return ox <= cx and oy <= cy and cx + child_span_m <= ox + n and cy + child_span_m <= oy + n
 
 
-def inject_edge_inflow(
+def _edge_entries(
     child_z: np.ndarray,
     child_origin_m: tuple[float, float],
     child_cell_m: float,
     src: FlowSuperblock,
     d8_fn: Callable,
     entry_mode: str = ENTRY_FOOTPRINT,
-) -> np.ndarray:
-    """Upstream area entering the child domain, as an m^2 field on the child.
+) -> tuple[np.ndarray, np.ndarray]:
+    """WHERE the parent's through-flow crosses into the child. Geometry only.
+
+    Returns ``(src_flat, child_flat)`` -- for each boundary crossing, the flat
+    index of the PARENT cell whose accumulation crosses, and the flat index of
+    the CHILD cell it is deposited in. Both int64, same length, one entry per
+    crossing.
+
+    SPLIT OUT OF ``inject_edge_inflow`` FOR TASK #49, and the split is the point
+    rather than tidying. Since the pyramid carries two currencies -- catchment
+    area in m^2 and discharge in m^3/yr -- both must cross the boundary at
+    exactly the same cell, or the width law reads a Q that belongs to a
+    different channel than the area the incision cut. Computing the geometry
+    once and scattering two rasters through it makes that true by construction.
+    Two functions that each found their own crossings would be two
+    implementations of one rule, which is precisely how ``water.py``'s "three
+    incompatible currencies" came about.
 
     The construction, and why it is exactly conservative:
 
       * take the parent's SINGLE-receiver D8 field. Every flow path therefore
         crosses the child's boundary exactly once, at the unique parent cell
         that is outside the child and whose receiver is inside it;
-      * that cell delivers its whole accumulated area. Nothing upstream of it
+      * that cell delivers its whole accumulated total. Nothing upstream of it
         is counted separately, because those cells' receivers are outside;
-      * deposit the amount in the LOWEST child cell of a CANDIDATE SET, i.e.
-        the thalweg. Mass is preserved exactly and the water starts in the
-        channel rather than smeared across 16 px of bank.
+      * deposit in the LOWEST child cell of a CANDIDATE SET, i.e. the thalweg.
+        Mass is preserved exactly and the water starts in the channel rather
+        than smeared across 16 px of bank.
 
     ``entry_mode`` picks the candidate set -- the whole footprint, or just the
     face the flow crosses. See ``ENTRY_FOOTPRINT`` / ``ENTRY_CROSSING`` for
     which to use and why the answer depends on the parent-to-child ratio.
     Conservation is identical either way: both pick exactly one cell.
 
-    The result is meant for ``accumulate_mfd(..., inflow=...)``, which treats
-    it as extra drainage area (m^2) present at that cell before routing.
-
-    See HYDROLOGY_RESIDUALS #3 and #4 for what this still gets wrong.
+    See HYDROLOGY_RESIDUALS #3 and #4 for what this still gets wrong, and #7
+    for the far larger thing it cannot address at all.
     """
     if entry_mode not in ENTRY_MODES:
         raise ValueError(f"entry_mode must be one of {ENTRY_MODES}, got {entry_mode!r}")
     child_z = np.asarray(child_z, dtype=np.float32)
     h, w = child_z.shape
-    inflow = np.zeros((h, w), np.float32)
+    empty = (np.zeros(0, np.int64), np.zeros(0, np.int64))
 
     scell = float(src.cell_m)
     sox, soy = src.origin_m
@@ -2132,7 +2870,7 @@ def inject_edge_inflow(
     inside_y = (cy >= oy) & (cy < y1)
     inside = inside_y[:, None] & inside_x[None, :]
     if not inside.any():
-        return inflow
+        return empty
 
     rec = np.asarray(d8_fn(src.filled, scell)[0]).reshape(-1)
     flat_inside = inside.reshape(-1)
@@ -2142,16 +2880,15 @@ def inject_edge_inflow(
     entry[valid] = (~flat_inside[valid]) & flat_inside[rec[valid]]
     idx = np.flatnonzero(entry)
     if idx.size == 0:
-        return inflow
+        return empty
 
-    acc_flat = np.asarray(src.acc, dtype=np.float32).reshape(-1)
     tgt = rec[idx]
+    src_out: list[int] = []
+    child_out: list[int] = []
     # Perimeter-sized loop (a few thousand cells at most): the argmin over a
     # parent cell's child footprint does not vectorise cleanly and is not on
     # any hot path.
-    for entry_cell, src_cell, amount in zip(
-        idx.tolist(), tgt.tolist(), acc_flat[idx].tolist()
-    ):
+    for entry_cell, src_cell in zip(idx.tolist(), tgt.tolist()):
         si, sj = divmod(int(src_cell), sw)
         # Child index window covering this parent cell.
         j0 = int(np.floor((sox + sj * scell - ox) / child_cell_m))
@@ -2183,8 +2920,91 @@ def inject_edge_inflow(
             if face.any():
                 window = np.where(face, window, np.float32(np.inf))
         li, lj = np.unravel_index(int(np.argmin(window)), window.shape)
-        inflow[i0 + li, j0 + lj] += np.float32(amount)
-    return inflow
+        # THE ENTRY CELL, not its receiver. The amount delivered is the
+        # accumulation of the cell OUTSIDE the child that drains in -- the
+        # receiver's own total already includes everything else inside the
+        # child and would be counted a second time by the child's own sweep.
+        # (Storing the receiver here inflated a 4-crossing fixture from 8,000
+        # to 12,000 m^2 and the suite caught it immediately.)
+        src_out.append(int(entry_cell))
+        child_out.append((i0 + int(li)) * w + (j0 + int(lj)))
+    return (
+        np.asarray(src_out, np.int64),
+        np.asarray(child_out, np.int64),
+    )
+
+
+def _scatter_entries(
+    entries: tuple[np.ndarray, np.ndarray],
+    src_field: np.ndarray,
+    child_shape: tuple[int, int],
+    dtype=np.float32,
+) -> np.ndarray:
+    """Deposit ``src_field`` at the crossings ``_edge_entries`` found.
+
+    ``np.add.at`` rather than fancy-index assignment: two parent cells can
+    legitimately choose the SAME child cell as their thalweg (the footprint's
+    argmin is not injective), and plain assignment would drop one of them --
+    silently losing a whole catchment's worth of water at a confluence.
+    """
+    src_flat, child_flat = entries
+    out = np.zeros(child_shape, dtype)
+    if src_flat.size:
+        vals = np.asarray(src_field, np.float64).reshape(-1)[src_flat]
+        np.add.at(out.reshape(-1), child_flat, vals.astype(dtype, copy=False))
+    return out
+
+
+def inject_edge_inflow(
+    child_z: np.ndarray,
+    child_origin_m: tuple[float, float],
+    child_cell_m: float,
+    src: FlowSuperblock,
+    d8_fn: Callable,
+    entry_mode: str = ENTRY_FOOTPRINT,
+) -> np.ndarray:
+    """Upstream AREA entering the child domain, as an m^2 field on the child.
+
+    The geometry is ``_edge_entries``' -- read that for the construction and for
+    why it is exactly conservative. This is the area currency; the discharge
+    currency is ``inject_edge_discharge``, over the identical crossings.
+
+    The result is meant for ``accumulate_mfd(..., inflow=...)``, which treats
+    it as extra drainage area (m^2) present at that cell before routing.
+    """
+    entries = _edge_entries(
+        child_z, child_origin_m, child_cell_m, src, d8_fn, entry_mode
+    )
+    return _scatter_entries(entries, src.acc, np.shape(child_z))
+
+
+def inject_edge_discharge(
+    child_z: np.ndarray,
+    child_origin_m: tuple[float, float],
+    child_cell_m: float,
+    src: FlowSuperblock,
+    d8_fn: Callable,
+    entry_mode: str = ENTRY_FOOTPRINT,
+) -> "np.ndarray | None":
+    """Upstream DISCHARGE entering the child domain, m^3/yr, or None.
+
+    Task #49. The sibling of ``inject_edge_inflow`` in the second currency, at
+    the SAME crossings and the same deposit cells -- see ``CARRIED_DISCHARGE``.
+
+    Returns None when ``src`` carries no discharge (``src.q is None``), which is
+    a refusal to answer and NOT a dry boundary. The caller must branch: reading
+    a zero here as "no water arrives" would reproduce, in a new place, exactly
+    the failure this function exists to remove.
+
+    float64 out, not float32: Q spans ~1e2 at a headwater cell to ~1e10 at a
+    continental mouth and the accumulation it feeds is float64 throughout.
+    """
+    if src.q is None:
+        return None
+    entries = _edge_entries(
+        child_z, child_origin_m, child_cell_m, src, d8_fn, entry_mode
+    )
+    return _scatter_entries(entries, src.q, np.shape(child_z), dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -2696,6 +3516,52 @@ class BakeResult:
     #: says nothing about how well those two scale. Defaulted so an existing
     #: constructor keeps working.
     wall_seconds: dict[str, float] = field(default_factory=dict)
+    #: The B5 basin registry (bake_ver 8), ordered by (min_y, min_x) of extent
+    #: with ids 0..n-1. `elevation_m` above already has these depressions
+    #: RE-OPENED; the table is what tells a client where they are and how deep
+    #: the water in them stands. Empty tuple means "surveyed, holds nothing",
+    #: which is a different statement from a tile that predates the registry --
+    #: see tile_codec.FLAG_BASINS_PRESENT.
+    basins: tuple["_basins.BasinRecord", ...] = ()
+    #: Runoff-weighted discharge, m^3/yr, interior (bake_ver 9, plan P2). None
+    #: when the tile baked without climate -- there is no honest Q without a
+    #: precipitation field, and inventing one would put rivers in a world whose
+    #: climate nobody supplied.
+    discharge_m3_yr: "np.ndarray | None" = None
+    #: The graded water surface, metres absolute, NaN where dry, interior.
+    #: None for the same reason as ``discharge_m3_yr``. This is what becomes
+    #: SECTION_WATER_*; see ``bake.water`` for the laws and for the overshoot
+    #: gate that decides whether it is trustworthy.
+    water_surface_m: "np.ndarray | None" = None
+
+
+def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
+    """The registry filter, from the hashed bake constants.
+
+    One function rather than a constructor call at each site, because a
+    filter built from anything other than ``consts`` would decide baked bytes
+    without rolling the bake identity.
+    """
+    return _basins.BasinFilter(
+        min_depth_m=consts.basin_min_depth_m,
+        min_area_m2=consts.basin_min_area_m2,
+        exclude_spanning=consts.basin_exclude_spanning,
+        require_above_sea=consts.basin_require_above_sea,
+    )
+
+
+def basin_balance(consts: BakeConstants = CONSTANTS) -> "_basins.WaterBalance":
+    """The lake rule's constants, from the hashed bake constants."""
+    return _basins.WaterBalance(
+        pet_a=consts.basin_pet_a,
+        pet_b=consts.basin_pet_b,
+        pet_c=consts.basin_pet_c,
+        pet_floor_mm=consts.basin_pet_floor_mm,
+        budyko_n=consts.basin_budyko_n,
+        min_lake_depth_m=consts.basin_min_lake_depth_m,
+        salt_aridity=consts.basin_salt_aridity,
+        seasonal_cv_pct=consts.basin_seasonal_cv_pct,
+    )
 
 
 def bake_padded_domain(
@@ -2837,7 +3703,7 @@ def bake_padded_domain(
     seed = roughness_seed(
         world_seed,
         origin_cells,
-        bake_version=BAKE_VERSION,
+        bake_version=TERRAIN_VERSION,
         anchor_pitch_fine_px=consts.noise_anchor_pitch_fine_px,
     )
     origin_kw = roughness_origin_kwarg(kernels.roughness)
@@ -2922,14 +3788,25 @@ def bake_padded_domain(
     # the unbounded dependency the apron cannot cover.
     c0 = time.process_time()
     inflow = None
+    inflow_q = None
     if inflow_source is not None:
-        inflow = inject_edge_inflow(
+        # ONE set of crossings, TWO currencies (task #49, CARRIED_DISCHARGE).
+        # Area drives incision through A^m and decides the ground; discharge
+        # drives the water plane. They must enter at the same cell, and here
+        # they do because they are scattered through the same pairs.
+        _entries = _edge_entries(
             child_z=filled,
             child_origin_m=geom.padded_origin_m(tile_x, tile_y),
             child_cell_m=cell_m,
             src=inflow_source,
             d8_fn=kernels.d8_receivers,
         )
+        inflow = _scatter_entries(_entries, inflow_source.acc, filled.shape)
+        if inflow_source.q is not None:
+            inflow_q = _scatter_entries(
+                _entries, inflow_source.q, filled.shape, dtype=np.float64
+            )
+        del _entries
     # accumulate_mfd returns float64 m^2. Incision consumes it at full width;
     # the STORED field is narrowed to float32 (measured to agree to 2 ppm, and
     # 340 MB against 680 MB over the padded domain matters here) since its
@@ -3254,6 +4131,10 @@ def bake_padded_domain(
         "thermal_gain": (z - eroded).astype(np.float32),
         "d8_slope": d8_slope,
         "inflow": inflow,
+        # CARRIED DISCHARGE at the domain edge, m^3/yr, or None when the
+        # superblock cannot answer (no climate, or a pre-task-#49 block). None
+        # is NOT zero and B6 branches on it -- see CARRIED_DISCHARGE.
+        "inflow_q": inflow_q,
         "roughness_seed": seed,
         "interior_dead_ends": interior_dead_ends,
         # The COARSE province object (or None). Observability only -- nothing
@@ -3333,6 +4214,69 @@ def bake_tile(
     if stage_sink is not None:
         for name, key in STAGE_SINK_FIELDS:
             stage_sink(name, out[key][sl, sl])
+
+    # -- B5: RE-OPEN THE REGISTERED BASINS (bake_ver 8, plan §4.2).
+    #
+    # Everything above ran on the depression-FILLED surface and stays exactly
+    # as it was. That is hydrologically right, not a compromise: water flows
+    # ACROSS a lake at its surface, so routing, the flow plane, and incision
+    # (which cuts the outlet gorge through the rim and a thalweg across the
+    # lake floor -- both correct, both desirable) all belong on the filled
+    # surface, and the flow plane keeps agreeing with the carve cell for cell.
+    # Only the LAST thing the bake does -- decide what elevation ships --
+    # changes: registered holes are given back.
+    #
+    # Run on the PADDED domain, because the fill that recomputes each basin's
+    # spill needs a boundary condition and the interior alone would invent
+    # one, and because "does this basin leave the tile" is a question about
+    # the padded grid.
+    #
+    # THE SPILL IS RECOMPUTED HERE, on the FINAL surface, and this is the part
+    # no existing text anticipated: `basin_depth` is B2a's fill of the
+    # PRE-EROSION carrier, and between B2a and here the bake has incised
+    # (which can cut a rim metres lower), relaxed and added a meso band. A
+    # table built from the B2a level would float lakes above their own
+    # outlets. See bake/basins.py's header.
+    c0 = time.process_time()
+    climate_phys = (None if padded_climate is None
+                    else _province.dequantize_climate(padded_climate))
+    survey = _basins.survey_basins(
+        z_final=out["z"],
+        basin_depth=out["basin_depth"],
+        accumulation_m2=out["acc"],
+        climate=climate_phys,
+        cell_m=geom.fine_pixel_m,
+        interior=sl,
+        filt=basin_filter(consts),
+        wb=basin_balance(consts),
+        keep_labels=True,
+        keep_hypsometry=False,
+    )
+    # THE PRE-B5 SURFACE, kept for B6. It is the one the B4b refill guarantees
+    # has ZERO SINKS, which is what makes the water plane's descent chain well
+    # posed; after the re-opening below it has a hole per registered basin. A
+    # full padded float32 copy (340 MB at production) taken only when the plane
+    # will actually be built, and dropped inside B6.
+    z_pre_reopen = None
+    basin_keep_pad = None
+    if consts.water_plane_enabled and padded_climate is not None:
+        z_pre_reopen = out["z"].copy()
+    if survey.basins:
+        keep = survey.keep_mask()
+        basin_keep_pad = keep
+        # `basin_depth` is continuous and 0 at the rim by construction, so
+        # subtracting it under the mask re-opens the hole with no seam at any
+        # edge -- no feathering, no blend width, nothing to tune.
+        #
+        # IN PLACE, under a boolean index, not `np.where`: the registry covers
+        # a couple of per cent of the domain, so this allocates on the order of
+        # the basins' own area instead of two more full padded float32 grids
+        # (340 MB each at production, on top of a bake that already peaks
+        # around 5 GiB).
+        out["z"][keep] -= out["basin_depth"][keep]
+    survey.labels = None
+    out["cpu_seconds"]["B5.reopen_basins"] = time.process_time() - c0
+
     z = np.ascontiguousarray(out["z"][sl, sl])
     acc = np.ascontiguousarray(out["acc"][sl, sl])
     incision = out["incision"][sl, sl]
@@ -3342,22 +4286,204 @@ def bake_tile(
     # incision it describes agree cell for cell.
     plane = flow_plane(acc, incision, gain, consts, elev_m=out["filled"][sl, sl])
 
+    # -- B6: RUNOFF-WEIGHTED DISCHARGE AND THE GRADED WATER PLANE
+    #    (bake_ver 9, plan P2 / §4.1).
+    #
+    # WHY IT CANNOT BE DONE ANYWHERE ELSE, measured before it was built. The
+    # obvious cheap alternative is an additive pass over already-shipped tiles:
+    # read accumulation back out of the flow plane's 5 log2 bits, multiply by
+    # the local runoff, write the plane, skip the re-bake. Measured on the
+    # shipped 289-tile coarse world over 174,886 drawable river cells, that
+    # reconstruction writes 46.35% OF THE RIVER NETWORK AS DRY and agrees with
+    # the true flow class on only 74.13% of the rest.
+    #
+    # And the reason is NOT the 5-bit quantisation, which is comparatively
+    # benign (Q ratio p5/p95 = 0.732/1.366 at the bucket midpoint). It is that
+    # AREA IS THE WRONG QUANTITY. A river is wet because of where its water
+    # came from, not where it is: median local runoff at a river cell is
+    # 247 mm/yr while the catchment-mean its discharge implies is 577 mm/yr,
+    # and |mean - local| / mean is 0.571 at p50, 0.998 at p95. Exotic rivers
+    # crossing dry ground have a local runoff of ~0 and vanish entirely. No
+    # wider accumulation field on the wire would fix that; only a
+    # runoff-weighted sweep over the network gives Q, and that sweep needs the
+    # padded domain and the superblock inflow, which exist only here.
+    #
+    # ONE EXTRA MFD SWEEP, not two. `accumulate_mfd(source=)` replaces the
+    # cell-area seed with each cell's runoff VOLUME, so the sweep returns
+    # m^3/yr directly over the identical weights the area field used. (The
+    # two-sweeps-and-subtract form in tools/worldmaps/water.py is exact only
+    # because that tool has no `inflow`; with the pyramid's edge injection live
+    # the difference of the two sweeps is A(I_q) - A(I_area), which is not the
+    # discharge.)
+    c0 = time.process_time()
+    discharge = None
+    water_surface = None
+    water_stats: dict[str, float] = {}
+    runoff_coarse = _water.runoff_field_mm_yr(
+        padded_climate, basin_balance(consts), consts.province_smooth_m,
+        geom.coarse_pixel_m,
+    )
+    if consts.water_plane_enabled and runoff_coarse is not None:
+        # THE BOUNDARY CONDITION IS A DISCHARGE NOW (task #49). The pyramid
+        # carries Q, so the water arriving at this tile's edge is the water that
+        # actually fell on its catchment -- wherever that catchment is and
+        # whatever the climate there. The area proxy below is the fallback for a
+        # superblock that predates the change or was built without climate; it
+        # is what made the showcase corridor's mouth bake dry. Which one ran is
+        # reported per tile, because "the proxy is still in use here" must never
+        # be something you have to infer from the shape of a river.
+        carried_q = out["inflow_q"]
+        src = _water.discharge_source(
+            runoff_coarse, out["filled"].shape, geom.scale, geom.fine_pixel_m,
+            inflow_area_m2=(None if carried_q is not None else out["inflow"]),
+            inflow_q_m3_yr=carried_q,
+        )
+        # THE WATER PASS CONCENTRATES; THE TERRAIN PASS DOES NOT (bake_ver 11).
+        # `acc` above is the area field and is still MFD at `consts.mfd_p`: it
+        # feeds `A^m`, it decides every height, and pure D8 would put
+        # dead-straight 45-degree channels in the ground (flow.py's first
+        # lesson). Nothing here can reach it -- this is a separate sweep over
+        # the same surface whose only consumer is the `q >= q_drawable`
+        # threshold below.
+        #
+        # And a threshold is exactly what MFD is worst for. Splitting a reach's
+        # discharge across every lower neighbour does not make a smoother
+        # network, it makes one that crosses the cut and comes back: 25-33% of
+        # network cells on the measured corridor have no strictly lower
+        # neighbour holding as much as they do, and one walked channel showed
+        # fifty wet-dry-wet excursions in 2,001 steps. Under a single-receiver
+        # rule that count is 0 by construction.
+        #
+        # The forest is built on `filled`, THE SAME SURFACE THIS SWEEP RUNS
+        # OVER, not on `z_route` below. `filled` is what the elevation argsort
+        # orders and what `d8_receivers` guarantees a strictly-lower receiver
+        # on; borrowing the water surface's forest would walk an order that is
+        # not descending along it and the result would not be an accumulation.
+        # It is also B2b's own forest, so the discharge follows the same
+        # centrelines the incision's slope term was taken along.
+        if consts.water_flow_single_receiver:
+            if kernels.accumulate_d8 is None:
+                raise RuntimeError(
+                    "water_flow_single_receiver is set but this BakeKernels has "
+                    "no accumulate_d8 kernel; inject flow.accumulate_d8 or set "
+                    "the constant False (which reproduces the bake_ver 10 "
+                    "water pass)"
+                )
+            rec_q, _ = kernels.d8_receivers(out["filled"], geom.fine_pixel_m)
+            q_pad = kernels.accumulate_d8(
+                out["filled"], geom.fine_pixel_m, source=src, receivers=rec_q
+            )
+            del rec_q
+        else:
+            q_pad = kernels.accumulate_mfd(
+                out["filled"], geom.fine_pixel_m, p=consts.mfd_p, source=src
+            )
+        del src
+        q_pad = np.asarray(q_pad, np.float64)
+
+        # THE ROUTING BED IS THE PRE-B5 SURFACE. B4b's refill guarantees it has
+        # zero sinks, which is what makes a descent chain over it well posed.
+        # Post-B5 the registered basins are holes, and grading a river's water
+        # surface down into a 500 m re-opened basin would drag the whole
+        # upstream profile with it. Basin cells are written DRY here; their
+        # surface is already on the wire in SECTION_BASIN_TABLE and the client
+        # composes the two samplers.
+        z_route = np.ascontiguousarray(z_pre_reopen, np.float32)
+        rec_w, _ = kernels.d8_receivers(z_route, geom.fine_pixel_m)
+        q_draw = _water.q_drawable_m3_yr(
+            geom.fine_pixel_m, consts.water_min_width_px,
+            consts.water_q_perennial_m3_yr,
+        )
+        wet_pad, heads_pad, head_stats = _water.water_head_mask(
+            q_pad, rec_w, q_drawable=q_draw,
+            q_perennial=consts.water_q_perennial_m3_yr,
+        )
+        w_pad = _water.graded_water_surface(
+            z_route, q_pad, rec_w, wet_pad,
+            eps_m=consts.refill_eps_m, exclude=basin_keep_pad,
+            q_perennial=consts.water_q_perennial_m3_yr,
+        )
+        del rec_w
+
+        discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
+        water_surface = np.ascontiguousarray(w_pad[sl, sl])
+        wet_int = np.isfinite(water_surface)
+
+        # THE OVERSHOOT GATE, on the interior only -- the bytes that ship.
+        # Overshoot is the failure mode with NO GEOMETRIC BACKSTOP: the bank
+        # probe found no containing ground within 120 m on 736 of 1,260 stream
+        # bank sides at 10 m depth, so a head that comes out too high floods the
+        # valley rather than leaking sideways and self-correcting.
+        water_stats = {f"water_{k}": v for k, v in head_stats.items()}
+        # WHICH BOUNDARY CONDITION RAN, and how much water it delivered. The
+        # first is the honesty flag for task #49 -- 1.0 means the pyramid
+        # carried Q, 0.0 means this tile is still on the local-runoff proxy that
+        # baked a river mouth dry. The second and third are the magnitudes, so a
+        # tile whose river is mostly imported (which is what "exotic" means) is
+        # visible as a number rather than inferred from a picture.
+        q_in_total = 0.0 if carried_q is None else float(carried_q.sum())
+        water_stats.update({
+            "water_q_inflow_carried": 0.0 if carried_q is None else 1.0,
+            "water_q_inflow_m3_yr": q_in_total,
+            "water_q_inflow_entry_cells": (
+                0.0 if carried_q is None else float((carried_q > 0.0).sum())
+            ),
+            # The implied catchment-mean runoff behind the imported water:
+            # Q_in / A_in, in mm/yr. Compare it against this tile's own local
+            # runoff and the gap IS the defect, in one number. It is what
+            # `water.py`'s docstring measures as 0.571 at p50 world-wide.
+            "water_q_inflow_implied_runoff_mm_yr": (
+                1000.0 * q_in_total / float(out["inflow"].sum())
+                if (carried_q is not None and out["inflow"] is not None
+                    and float(out["inflow"].sum()) > 0.0)
+                else 0.0
+            ),
+        })
+        if wet_int.any():
+            water_stats.update({
+                f"water_{k}": v for k, v in _water.overshoot_stats(
+                    water_surface, z, discharge, wet_int,
+                    cell_m=geom.fine_pixel_m,
+                    z_route_m=np.ascontiguousarray(z_route[sl, sl]),
+                    q_perennial=consts.water_q_perennial_m3_yr,
+                ).items()
+            })
+        del wet_pad, heads_pad, w_pad, q_pad, z_route
+    del z_pre_reopen, basin_keep_pad
+    out["cpu_seconds"]["B6.discharge_water"] = time.process_time() - c0
+
+
     basin_depth = out["basin_depth"]
     padded_basin = basin_depth > 0.0
-    # THE SOUND CONDITION (see APRON_BLIND_SPOT): a filled flat whose whole
-    # extent is inside the padded domain has its spill point inside the padded
-    # domain too, so priority-flood enters it through the terrain and the
-    # epsilon staircase is a function of the terrain alone. Only a flat that
-    # REACHES THE PADDED BORDER is entered from the border, and only then can
-    # two neighbouring bakes cross it in different directions. Measured on the
-    # perimeter, O(padded_fine_px) work, and it needs no connected-component
-    # labelling -- which matters because pipeline.py may not import scipy.
+    # THIS TEST CANNOT FIRE, AND NEVER COULD. It was meant to be the sound
+    # condition of APRON_BLIND_SPOT: "only a flat that REACHES THE PADDED
+    # BORDER is entered from the border". But ``fill_depressions`` never
+    # raises a border cell (flow.py's own docstring says so -- that is what
+    # makes a bake on tile+apron agree with a bake on a larger domain), so
+    # ``filled - carrier`` is identically 0 along all four edges and no
+    # depression can contain a border cell. Verified on a synthetic hollow
+    # whose corner IS the domain corner: zero basin cells, because a hollow
+    # that reaches the border DRAINS OUT and is not a depression at all.
+    # ``basin_reaches_padded_border`` has therefore read 0.0 for every tile in
+    # the record, and the watershed plan's §4.2.4 built a v1 exclusion on it.
+    #
+    # Kept, at zero, rather than deleted: the key is quoted in the plan and in
+    # three stat files, and a key that silently vanished would be read as a
+    # missing measurement rather than as a retired one. The exclusion that
+    # actually ships is B5's TILE-SPANNING one, counted below, and the
+    # near-the-edge diagnostic that replaces this is
+    # ``basins_near_padded_edge``.
     border_basin = int(
         padded_basin[0, :].sum()
         + padded_basin[-1, :].sum()
         + padded_basin[:, 0].sum()
         + padded_basin[:, -1].sum()
     )
+    # (The only place in this repo where it has ever been non-zero is
+    # test_border_detector_separates_a_contained_flat_from_a_spilling_one,
+    # which SUBSTITUTES a fake `fill_depressions` that adds 1.0 to every cell
+    # -- including the border. That test demonstrates the statistic's
+    # arithmetic; it is not evidence that the condition occurs.)
     border_cells = 2 * padded_basin.shape[0] + 2 * padded_basin.shape[1]
     basin = padded_basin[sl, sl]
     del padded_basin
@@ -3401,11 +4527,30 @@ def bake_tile(
         "basin_max_depth_m": max_basin_depth,
         "max_basin_run_m": float(run_px) * geom.fine_pixel_m,
         "basin_exceeds_apron": float(run_px * geom.fine_pixel_m > geom.apron_m),
+        # Structurally zero -- see the comment beside border_basin above.
         "padded_border_basin_cells": float(border_basin),
         "padded_border_basin_frac": float(border_basin) / float(border_cells),
         "basin_reaches_padded_border": float(border_basin > 0),
+        # -- B5 registry (bake_ver 8). Counts, so a contended box cannot
+        # distort them, and every exclusion is a NUMBER: the plan asks for the
+        # cost of the tile-spanning refusal to be measured rather than assumed,
+        # and on the 12-tile survey it was 57% of qualifying components.
+        "basins_registered": float(len(survey.basins)),
+        "basins_lake": float(sum(1 for b in survey.basins if b.is_lake)),
+        "basin_components": float(survey.n_components),
+        "basins_excluded_shallow": float(survey.excluded_shallow),
+        "basins_excluded_small": float(survey.excluded_small),
+        "basins_excluded_spanning": float(survey.excluded_spanning),
+        "basins_excluded_spanning_area_m2": float(survey.excluded_spanning_area_m2),
+        "basins_excluded_spanning_max_depth_m": float(
+            survey.excluded_spanning_max_depth_m),
+        "basins_excluded_submarine": float(survey.excluded_submarine),
+        "basins_near_padded_edge": float(survey.kept_near_padded_border),
+        "basin_water_volume_m3": float(sum(
+            b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
     }
+    stats.update(water_stats)
     # LANDFORM PROVINCE MIX over the tile INTERIOR, as area fractions summing
     # to 1. Cheap (a mean over 512^2) and it is the only way to know whether a
     # tile actually encountered the province whose constants it was baked with
@@ -3428,6 +4573,9 @@ def bake_tile(
         wall_seconds=out["wall_seconds"],
         stats=stats,
         missing_coarse=tuple(missing),
+        basins=tuple(survey.basins),
+        discharge_m3_yr=discharge,
+        water_surface_m=water_surface,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

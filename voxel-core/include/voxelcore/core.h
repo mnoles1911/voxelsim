@@ -235,7 +235,39 @@ namespace vxc {
 // regenerating and provider_id does not roll for this.
 inline constexpr uint32_t kWorldGenVersion = 23;
 
-inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels; z=0 is sea level
+inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
+
+// SEA LEVEL, and it is a symbol because it was fourteen literals.
+//
+// The datum has always been zero, and until now that was the entire
+// specification: a trailing comment on kVoxelSizeMm above, plus a bare `0`
+// wherever anything needed it. An audit for docs/watershed-system-plan.md
+// item 1 found **21 unnamed literal-0 sea-level tests across five languages**
+// (C++ in voxel-core and ue-project, HLSL, Python, and JavaScript embedded in
+// a Python tool), three separate *named* sea-level symbols that did not agree
+// on units (kRiverSeaLevelMm in mm -- and dead, zero references anywhere --
+// rivercouple's mutable seaLevelVz in voxel z, caves.h's kCaveMinVoxelZ in
+// voxel z), and one consumer drawing every published world map three metres
+// below the game's waterline (terrain-service/tools/world_map.py). None of
+// that is findable by grepping for `0`.
+//
+// So: ONE symbol, in mm because that is the unit every elevation on the wire
+// and in the tile format uses, with a voxel-lattice twin derived from it
+// rather than written down twice. Everything that means "sea level" now says
+// so by name, and a change of datum is one edit rather than an archaeology
+// project.
+//
+// It is NOT expected to move -- the whole world model is built on z=0 being
+// the sea -- but "unlikely to change" was exactly the argument that produced
+// the twenty-one literals.
+inline constexpr int32_t kSeaLevelMm = 0;
+
+// The same datum on the voxel lattice. Exact by construction: the static
+// assert below refuses a sea level that is not a whole number of voxels,
+// because a fractional one would make the two spellings disagree silently.
+inline constexpr int64_t kSeaLevelVoxelZ = kSeaLevelMm / kVoxelSizeMm;
+static_assert(kSeaLevelVoxelZ * kVoxelSizeMm == kSeaLevelMm,
+              "kSeaLevelMm must be a whole number of voxels");
 
 using MaterialId = uint8_t;
 

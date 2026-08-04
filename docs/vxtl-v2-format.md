@@ -88,14 +88,15 @@ positionally identical to v1 so a v1 parser fails on `version`, not on garbage.
 | `quant` | `u8` | 1 = 100 mm/LSB, 2 = 250 mm/LSB |
 | `codec` | `u8` | 0 = `CODEC_RAW`, 1 = `CODEC_ZSTD` |
 | `bake_ver` | `u16` | bake algorithm + constants version |
-| `flags` | `u16` | bit0 = flow plane present |
+| `flags` | `u16` | bit0 = flow plane present, bit1 = basin table present (§6.1). Any other bit set is **rejected**. |
 | `base_offset_mm` | `i32` | per-tile elevation datum |
 | `parent_scale` | `u8` | 0 = absolute (this spec). Reserved for a future residual ladder. |
 | `reserved` | `u8[3]` | must be 0 |
 | `n_sections` | `u16` | |
 | section table | `n_sections × {u32 id, u64 offset, u64 length}` | offsets are from file start |
 
-Section ids: `ELEV_INDEX` = 1, `ELEV_DATA` = 2, `FLOW_INDEX` = 3, `FLOW_DATA` = 4.
+Section ids: `ELEV_INDEX` = 1, `ELEV_DATA` = 2, `FLOW_INDEX` = 3, `FLOW_DATA` = 4,
+`BASIN_TABLE` = 5 (§6.1).
 
 **`codec` is a field, not a constant, on purpose.** `CODEC_RAW` lets the C++ decoder land and be
 tested before any compression dependency exists; `CODEC_ZSTD` is added without touching the
@@ -215,6 +216,61 @@ flow-conditioned rill synthesis and bank undercuts.
   not truncated into the target element type. That is the one place an all-or-nothing parser can
   otherwise let corruption through as plausible data.
 
+### 6.1 Basin table (optional, `flags` bit1) — added at `bake_ver` 8
+
+The per-tile lake registry. `docs/watershed-system-plan.md` §4.2–§4.3 has the reasoning; this
+section is the bytes.
+
+A **flat table, never a plane**. The bake already knows where every depression is, how deep, and —
+from a water balance against the tile's own climate — whether it holds water; the client needs
+only enough to flood-fill each one. Tens of rows at 32 B is ~1 KB against 26.6 MB of compressed
+elevation, so the cost is noise and there is no per-pixel water plane in v2. (A per-pixel
+`water_surface` plane is the plan's P2 and is a *later* section id, not a change to this one.)
+
+Payload:
+
+| field | type | notes |
+|---|---|---|
+| `table_version` | `u16` | 1 |
+| `entry_bytes` | `u16` | 32. Redundant with the section length **on purpose** — see below. |
+| `count` | `u32` | rows |
+| rows | `count × entry_bytes` | |
+
+One row, 32 bytes:
+
+| field | type | notes |
+|---|---|---|
+| `basin_id` | `u16` | **must equal the row index.** Ids are 0..n-1 in order. |
+| `seed_px` | `2×u16` | deepest cell — the client's flood-fill seed. Tile-LOCAL pixels. |
+| `bbox_px` | `4×u16` | `x0, y0, x1, y1`, inclusive. Bounds the flood fill. |
+| `outlet_px` | `2×u16` | the spill cell: head of the outlet channel. |
+| `spill_mm` | `i32` | fill level on the FINAL surface, **absolute** mm. |
+| `surface_mm` | `i32` | equilibrium water surface, absolute mm. `<= spill_mm` always. |
+| `kind` | `u8` | 0 dry playa, 1 salt flat, 2 seasonal, 3 lake (terminal), 4 lake (overflowing) |
+| `reserved` | `u8[5]` | must be 0 |
+
+Four decisions worth stating, because a decoder that gets any of them wrong produces **water on
+terrain that has none** rather than an error:
+
+- **Elevations are absolute millimetres, NOT relative to `base_offset_mm`.** A basin is read by
+  gameplay code that never touches the control-point datum; sharing one would couple a water query
+  to the elevation codec's internals.
+- **`entry_bytes` is redundant with the section length and that is the point.** A decoder that
+  disagrees with the encoder about the row size gets a mismatch it can refuse, instead of reading
+  33-byte records out of a 32-byte stream and producing plausible garbage.
+- **An EMPTY table with bit1 set is a statement**, not an absence: "this tile was surveyed and
+  holds nothing". A tile baked before `bake_ver` 8 has bit1 clear. A client that conflated the two
+  would put no water in a world that has some, and never know.
+- **`surface_mm > spill_mm` is refused, not clamped.** Water standing above its own outlet is not a
+  lake — the outlet would carry the excess away — so it is a bug in whatever wrote the file.
+
+Both decoders also refuse: an id that is not the row index, an inside-out or out-of-tile bbox, a
+seed outside its own bbox, a `kind` outside the enum, and non-zero reserved bytes.
+
+The bake's registry filter (which depressions get a row at all) is a set of `BakeConstants`, so
+changing it rolls `bake_ver` → `fine_provider_id` → a new world, exactly like any other bake
+constant. It is **not** a decoder parameter.
+
 ## 7. Decode is a pure integer function of the bytes
 
 Non-negotiable, because these bytes are the multiplayer authority:
@@ -257,3 +313,9 @@ A codec change is not done until:
 3. A sample-for-sample check that the C++ and Python B-spline evaluations agree on the same
    lattice.
 4. Truncation/corruption is rejected cleanly, as `TileData::parse` already does for v1.
+5. For §6.1: a **basin fixture** committed and parsed by both halves
+   (`voxel-core/tests/fixtures/vxtl_v2_golden_basins_512.vxtl`, regenerated by
+   `terrain-service/tools/make_basin_fixture.py`). It must carry one row of **every** `kind` — a
+   decoder that reads `kind` as a bool passes an all-lake table — a **negative** `spill_mm` and
+   `surface_mm`, a one-pixel extent, a bbox touching the last pixel of the grid, and rows in
+   `(min_y, min_x)` order. Each refusal above needs a corrupted-copy test on both sides.

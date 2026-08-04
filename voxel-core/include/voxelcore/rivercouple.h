@@ -292,8 +292,12 @@ struct RiverCoupleConfig {
     // network; a network bigger than this is swept over several ticks.
     int32_t maxOutfallsPerTick = 256;
 
-    // Sea level, in world voxel z (core.h: z == 0). Section 3.
-    int32_t seaLevelVz = 0;
+    // Sea level, in world voxel z. Section 3. Defaulted from core.h's datum
+    // (kSeaLevelVoxelZ) rather than a bare 0 -- it stays a settable field
+    // because the coupler is also run over synthetic test worlds whose sea is
+    // somewhere else, and that is exactly the case a shared constant must not
+    // silently override.
+    int32_t seaLevelVz = static_cast<int32_t>(kSeaLevelVoxelZ);
 
     // --- section 4, channel 2 (CA -> graph promotion) ---------------------
 

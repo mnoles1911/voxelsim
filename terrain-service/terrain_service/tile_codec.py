@@ -145,8 +145,136 @@ SECTION_ELEV_INDEX = 1
 SECTION_ELEV_DATA = 2
 SECTION_FLOW_INDEX = 3
 SECTION_FLOW_DATA = 4
+#: The per-tile basin registry (docs/watershed-system-plan.md P1). A tiny
+#: flat table, not a plane: tens of rows at 32 B, so a tile grows by ~1 KB
+#: against 26.6 MB of compressed elevation.
+SECTION_BASIN_TABLE = 5
+#: The water plane (watershed plan P2, bake_ver 9). Same block machinery and
+#: element width as elevation, and the same block index -- but the VALUES are
+#: water DEPTH above the tile's own quantised bed, not an absolute surface.
+#: See WATER_DEPTH_LSB_MM for the three measured reasons.
+SECTION_WATER_INDEX = 6
+SECTION_WATER_DATA = 7
 
 FLAG_FLOW_PRESENT = 1 << 0
+FLAG_BASINS_PRESENT = 1 << 1
+#: bake_ver 9: SECTION_WATER_* is present. Set even when the plane is entirely
+#: dry, for the same reason FLAG_BASINS_PRESENT is set on an empty table: "this
+#: tile was surveyed and carries no rivers" and "this tile predates the water
+#: plane" are different facts, and a client that conflated them would draw no
+#: rivers in a world that has them and never be able to tell why.
+FLAG_WATER_PRESENT = 1 << 2
+
+# --- SECTION_WATER_* payload: DEPTH ABOVE THE QUANTISED BED ----------------
+#
+# The plane stores water DEPTH over each pixel, int16 at a 10 mm LSB, with -1
+# for dry. NOT the absolute water surface, and the three reasons are all
+# measured. The first one answers the objection everybody raises.
+#
+# 1. THE CANCELLATION, which is why depth does not inherit the bed's ripples.
+#    The obvious objection to storing depth is that the bed is quantised to
+#    100 mm and carries the meso band and the B1 roughness, so water = bed +
+#    depth would ripple by things water does not do. It does not, because the
+#    bake computes the depth against the QUANTISED bed rather than the true
+#    one:
+#
+#        bake:    depth_q = round((water_true - bed_q) / 10)
+#        client:  water   = bed_q + depth_q * 10      = water_true +/- 5 mm
+#
+#    bed_q is exactly what the client reconstructs, so the bed's own
+#    quantisation error, its meso band and its roughness all CANCEL: whatever
+#    the bed does, the stored depth absorbs the complement of it. Measured on a
+#    bed varying by 200 mm under a reach: reconstruction error 4.0 mm against a
+#    half-LSB of 5.0. (The same trick the elevation plane uses, run backwards.)
+#
+# 2. ONLY DEPTH FITS. Absolute water at a 10 mm LSB spans +/-327 m in int16
+#    while a single tile spans up to 6.5 km of relief -- so an absolute plane
+#    at a fine LSB is not representable at all, and at the elevation plane's
+#    own 100 mm LSB it is a visible staircase: measured along-flow on the
+#    shipped world, 53.73% of downstream steps on genuine river gradients have
+#    a drop under 100 mm, so more than half the network could not descend.
+#    Depth is BOUNDED by the channel-depth cap -- 18.75 m of water at 3/4 of a
+#    25 m channel -- so 10 mm in int16 leaves 17x headroom.
+#
+# 3. WHY 10 mm AND NOT 1 mm. Measured along-flow on genuine gradients (p50
+#    47.1 m/km, after excluding the 58% of river cells whose "gradient" is the
+#    epsilon-fill floor and is not terrain): at a 100 mm LSB 53.73% of steps
+#    are unrepresentable, at 10 mm 0.00%, at 1 mm also 0.00%. 1 mm buys nothing
+#    and costs 10x the headroom. Measured on a gentle reach falling 2 mm/px:
+#    reconstructed steps are 0 or -10 mm, against -100 mm treads (one whole
+#    voxel at a time) for an absolute plane at the elevation LSB.
+#
+# WHAT THIS BUYS BESIDES SMOOTHNESS, and it is the property to protect: the
+# water surface inherits the terrain's long profile automatically. Gentle where
+# the bed is gentle, a genuine fall where the bed falls, with no special case
+# for a waterfall -- Q sets depth and width, the ground sets the gradient. The
+# world's steepest along-flow drop today is 32.8 m over 30 m (47.6 deg) and
+# 0.40% of river cells exceed 45 deg; nothing exceeds 63 deg, so a vertical
+# free-fall does not exist in this terrain YET. That is a terrain question
+# (knickpoints need uplift or resistant lithology, task #20), not an encoding
+# one, and this encoding does not preclude it: a 30 m drop across one fine
+# pixel is 3,000 LSB of a 32,767 range.
+#
+# And the SHORELINE improves rather than degrades. A boolean wet mask puts the
+# waterline on a 1.875 m pixel edge -- which is what "sharp, rectangular,
+# square edges" looks like in plan view. A continuous depth field lets the
+# client find where depth crosses zero SUB-PIXEL, so the shoreline lands on a
+# contour instead of on a raster step.
+
+#: Millimetres per stored depth LSB. See point 3 above.
+WATER_DEPTH_LSB_MM = 10
+
+#: Dry. -1 rather than INT16_MIN so it is a value a DEPTH can never take (depth
+#: is non-negative by construction: water stands above its own bed), which
+#: makes the sentinel test "< 0" rather than an equality against a magic
+#: number, and leaves the whole positive range for real depths.
+#:
+#: water_depth_control_points REFUSES a wet cell that quantises to a negative
+#: depth rather than clamping it -- a silent clamp would be a wet cell reading
+#: dry to every client forever. Unreachable on real terrain: the shallowest
+#: head the law can produce is 0.22 m, 22 LSB clear of the sentinel.
+WATER_DRY_DEPTH = -1
+
+#: Largest storable depth, metres. int16 max at the 10 mm LSB.
+WATER_MAX_DEPTH_M = 32767 * WATER_DEPTH_LSB_MM / 1000.0
+
+# --- SECTION_BASIN_TABLE layout (watershed plan P1) -------------------------
+#
+# A LENGTH-PREFIXED, VERSIONED table rather than a bare array of structs. The
+# section table already gives the payload's byte length, so `count` is
+# redundant with it -- and that redundancy is the point: a decoder that
+# disagrees with the encoder about the entry size gets a mismatch it can
+# refuse, instead of reading 33-byte records out of a 32-byte stream and
+# producing plausible garbage. `entry_bytes` is what lets a later revision add
+# a field without a third section id.
+#
+#   u16 table_version, u16 entry_bytes, u32 count, then count*entry_bytes
+BASIN_TABLE_VERSION = 1
+_BASIN_TABLE_HEADER = struct.Struct("<HHI")
+
+# One basin row, 32 bytes:
+#   basin_id u16 | seed_px 2*u16 | bbox_px 4*u16 | outlet_px 2*u16
+#   spill_mm i32 | surface_mm i32 | kind u8 | reserved u8[5]
+#
+# Pixel coordinates are TILE-INTERIOR pixels in the same space as the
+# elevation plane, so a client indexes them with no transform. Elevations are
+# millimetres, the unit the rest of the format uses, absolute (NOT relative to
+# base_offset_mm): a basin table is read by gameplay code that never touches
+# the control-point datum, and making it share one would couple a water query
+# to the elevation codec's internals.
+_BASIN_ENTRY = struct.Struct("<9H2i B5s")
+BASIN_ENTRY_BYTES = 32
+_BASIN_RESERVED5 = bytes(5)
+
+#: `kind` values, mirroring bake/basins.py's KIND_* and voxelcore/tilestore.h's
+#: BasinKind. Three copies, one meaning; tests/test_basin_table.py asserts the
+#: Python pair agree and the C++ one is checked by the shared fixture.
+BASIN_KIND_DRY_PLAYA = 0
+BASIN_KIND_SALT_FLAT = 1
+BASIN_KIND_SEASONAL = 2
+BASIN_KIND_LAKE_TERMINAL = 3
+BASIN_KIND_LAKE_OVERFLOWING = 4
+BASIN_KIND_COUNT = 5
 
 # Flow byte layout (§6): bits 0-4 log2(flow accumulation m^2) clamped 0-31,
 # bit 5 channel, bit 6 bank, bit 7 deposition.
@@ -192,6 +320,14 @@ class TileV2:
     int16, LSB = `quant` mm, relative to `base_offset_mm`. NOT samples, and
     NOT residuals against the coarse s1 tile — see §2 for why.
     `flow`, if given, is one uint8 per fine pixel (§6) and sets flags bit0.
+    `basins`, if given, is the P1 registry and sets flags bit1. An EMPTY list
+    is not the same as None: a tile with no basins still says so (the flag is
+    set and the table has count 0), because "this tile has been surveyed and
+    holds nothing" and "this tile predates the registry" must not read alike.
+    `water_cp`, if given, is the P2 water plane and sets flags bit2 -- int16
+    water DEPTH above this tile's own quantised elevation lattice at a
+    `WATER_DEPTH_LSB_MM` LSB, `WATER_DRY_DEPTH` where dry. An ALL-DRY plane is
+    likewise not None, for the identical reason.
     """
 
     seed: int
@@ -208,6 +344,8 @@ class TileV2:
     scale: int = FINE_SCALE
     predictor: int = PRED_MED
     parent_scale: int = 0             # reserved (§3) — must stay 0
+    basins: "list[BasinEntry] | None" = None   # P1 registry, optional
+    water_cp: "np.ndarray | None" = None   # (size,size) int16 DEPTH cp, P2
 
     def __post_init__(self) -> None:
         assert self.scale == FINE_SCALE, f"v2 scale must be {FINE_SCALE}"
@@ -225,6 +363,14 @@ class TileV2:
         if self.flow is not None:
             assert self.flow.shape == (self.size, self.size)
             assert self.flow.dtype == np.uint8
+        if self.water_cp is not None:
+            assert self.water_cp.shape == (self.size, self.size)
+            assert self.water_cp.dtype == np.int16
+        if self.basins is not None:
+            for i, b in enumerate(self.basins):
+                assert b.basin_id == i, "basin ids must be 0..n-1 in order"
+                assert 0 <= b.bbox_px[0] <= b.bbox_px[2] < self.size
+                assert 0 <= b.bbox_px[1] <= b.bbox_px[3] < self.size
 
 
 def mm_to_control_points(elev_mm: np.ndarray, base_offset_mm: int, quant: int) -> np.ndarray:
@@ -243,6 +389,93 @@ def control_points_to_mm(cp: np.ndarray, base_offset_mm: int, quant: int) -> np.
     """elevation_mm(i,j) = base_offset_mm + int32(cp)*quant_mm (§2)."""
     q = QUANT_MM[quant]
     return base_offset_mm + cp.astype(np.int64) * q
+
+
+def water_depth_control_points(water_m, ground_m, base_offset_mm: int,
+                               quant: int) -> np.ndarray:
+    """Water surface (m, NaN = dry) + the tile's OWN elevation cp -> depth cp.
+
+    THE BED IS THE SAMPLE FIELD, in metres -- the same ``elevation_m`` this
+    tile encodes, NOT the control lattice. That distinction cost a revision and
+    is worth stating precisely, because the obvious reading is wrong twice over.
+
+    ``cp`` is a B-SPLINE CONTROL LATTICE, not the surface: the prefilter moves a
+    control point up to 5.6 m away from the sample it interpolates (measured,
+    p99 of |cp - sample| = 4.4 m on this world). Referencing the depth to
+    ``control_points_to_mm(cp)`` therefore references it to something that is
+    not the bed at all, and on real terrain it produces water below its own bed.
+
+    But ``spline(cp)`` IS the surface -- reproducing the samples is precisely
+    what the prefilter exists to do -- and the spline is what the client
+    evaluates. So with the depth taken against the sample field:
+
+        bake:    depth = water_true - sample
+        client:  water = spline(cp) + depth
+                       = water_true + (spline(cp) - sample)
+
+    The bed's ripples -- its 100 mm quantisation, the meso band, the B1
+    roughness -- are in ``sample`` AND reproduced in ``spline(cp)``, so they
+    still CANCEL. What survives is only the spline's own reconstruction
+    residual, which is a different and far smaller quantity than |cp - sample|.
+    Measured bound: see ``test_water_depth_reconstruction_bound``.
+
+    The alternative -- have the bake evaluate the normative spline itself -- was
+    rejected deliberately. It buys a few tens of millimetres and costs a SECOND
+    IMPLEMENTATION of the spline on the normative surface path, which is exactly
+    what tilestore.h's "no second implementation exists, therefore none can
+    drift" contract protects against.
+
+    NO PREFILTER, unlike ``elevation_control_points``. The elevation plane is a
+    B-spline CONTROL lattice; this is a per-pixel lookup, and a spline through a
+    field with hard dry/wet boundaries would ring across the shoreline and put
+    water above ground on the dry side of it.
+
+    Returns int16 at a ``WATER_DEPTH_LSB_MM`` LSB, ``WATER_DRY_DEPTH`` for dry.
+    """
+    w = np.asarray(water_m, dtype=np.float64)
+    g = np.asarray(ground_m, dtype=np.float64)
+    if w.shape != g.shape:
+        raise ValueError(
+            f"water plane {w.shape} does not match elevation {g.shape}")
+    wet = np.isfinite(w)
+    out = np.full(w.shape, WATER_DRY_DEPTH, np.int64)
+    if wet.any():
+        depth_mm = np.rint(w[wet] * 1000.0) - np.rint(g[wet] * 1000.0)
+        d = np.rint(depth_mm / WATER_DEPTH_LSB_MM).astype(np.int64)
+        if (d < 0).any():
+            raise ValueError(
+                f"{int((d < 0).sum())} wet cells quantise to a NEGATIVE depth "
+                f"(min {int(d.min())} LSB); water below its own bed is not a "
+                "representable state")
+        if d.max() > 32767:
+            raise ValueError(
+                f"water depth {d.max() * WATER_DEPTH_LSB_MM / 1000.0:.1f} m "
+                f"exceeds the {WATER_MAX_DEPTH_M:.1f} m the plane can store")
+        out[wet] = d
+    return out.astype(np.int16)
+
+
+def water_surface_mm_from_depth(depth_cp, ground_mm):
+    """The client's read, in Python: depth cp + elevation cp -> absolute mm.
+
+    Dry reads as ``np.iinfo(np.int32).min``, mirroring voxelcore's
+    ``kNoWaterMm``, so both sides answer "no water here" with the same number
+    rather than with two conventions kept in step by hand.
+
+    ``ground_mm`` is the RECONSTRUCTED SURFACE in absolute mm -- the spline
+    evaluated on this tile's control lattice -- never `control_points_to_mm(cp)`
+    (which is the lattice, not the surface) and never the AMPLIFIED surface.
+    Adding a depth to amplified ground would make the water inherit every rill
+    and bedding band the amplifier adds on top of the bake: metres of ripple on
+    a surface that is flat by definition.
+    """
+    d = np.asarray(depth_cp)
+    out = np.full(d.shape, np.iinfo(np.int32).min, np.int64)
+    wet = d >= 0
+    if wet.any():
+        out[wet] = (np.asarray(ground_mm)[wet].astype(np.int64)
+                    + d[wet].astype(np.int64) * WATER_DEPTH_LSB_MM)
+    return out
 
 
 # --------------------------------------------------------------- predictor (§5)
@@ -575,11 +808,161 @@ def _decode_plane(
 
 # ---------------------------------------------------------------- top level
 
+@dataclass
+class BasinEntry:
+    """One row of SECTION_BASIN_TABLE (watershed plan P1).
+
+    The wire form of `bake.basins.BasinRecord`, reduced to what a client needs
+    to put water in a hole: where to start the flood fill, how far it can
+    possibly reach, how high the water stands, and what kind of place it is.
+    Everything the bake used to DECIDE that -- hypsometry, climate, catchment
+    -- stays in the survey and never ships.
+    """
+
+    basin_id: int
+    #: Deepest cell, the client's flood-fill seed. Tile-interior pixels.
+    seed_px: tuple[int, int]
+    #: (x0, y0, x1, y1) inclusive, tile-interior pixels. The flood fill is
+    #: bounded by this, which is what makes the client cost per basin O(bbox)
+    #: rather than O(tile).
+    bbox_px: tuple[int, int, int, int]
+    #: Spill cell -- the head of the outlet channel. Meaningful for
+    #: KIND_LAKE_OVERFLOWING; carried for every row because it is also the
+    #: diagnostic that says which way a dry basin WOULD drain.
+    outlet_px: tuple[int, int]
+    #: Fill level of the basin on the FINAL surface, absolute mm.
+    spill_mm: int
+    #: Equilibrium water surface, absolute mm; == spill_mm when overflowing,
+    #: == the floor when dry.
+    surface_mm: int
+    kind: int
+
+    def pack(self) -> bytes:
+        for name, v, lo, hi in (
+            ("basin_id", self.basin_id, 0, 0xFFFF),
+            ("seed x", self.seed_px[0], 0, 0xFFFF),
+            ("seed y", self.seed_px[1], 0, 0xFFFF),
+            ("bbox x0", self.bbox_px[0], 0, 0xFFFF),
+            ("bbox y0", self.bbox_px[1], 0, 0xFFFF),
+            ("bbox x1", self.bbox_px[2], 0, 0xFFFF),
+            ("bbox y1", self.bbox_px[3], 0, 0xFFFF),
+            ("outlet x", self.outlet_px[0], 0, 0xFFFF),
+            ("outlet y", self.outlet_px[1], 0, 0xFFFF),
+            ("kind", self.kind, 0, BASIN_KIND_COUNT - 1),
+        ):
+            if not (lo <= int(v) <= hi):
+                raise ValueError(
+                    f"basin {self.basin_id}: {name} = {v} is outside [{lo}, {hi}]"
+                )
+        if self.bbox_px[0] > self.bbox_px[2] or self.bbox_px[1] > self.bbox_px[3]:
+            raise ValueError(f"basin {self.basin_id}: bbox is inside out")
+        if self.surface_mm > self.spill_mm:
+            # A water surface above its own outlet is not a lake, it is a bug:
+            # the outlet would carry the excess away. classify() clamps, so
+            # reaching here means something bypassed it.
+            raise ValueError(
+                f"basin {self.basin_id}: surface {self.surface_mm} mm is above "
+                f"spill {self.spill_mm} mm"
+            )
+        return _BASIN_ENTRY.pack(
+            self.basin_id, self.seed_px[0], self.seed_px[1],
+            self.bbox_px[0], self.bbox_px[1], self.bbox_px[2], self.bbox_px[3],
+            self.outlet_px[0], self.outlet_px[1],
+            self.spill_mm, self.surface_mm, self.kind, _BASIN_RESERVED5,
+        )
+
+    @classmethod
+    def from_record(cls, rec) -> "BasinEntry":
+        """Wire row from a `bake.basins.BasinRecord`.
+
+        Duck-typed rather than imported: this module must stay importable on a
+        box with no numba, and the bake package is only ever reached lazily
+        from here (see `elevation_control_points`).
+
+        Metres become millimetres by rounding, which is monotone, so a record
+        whose surface is at or below its spill cannot round into one that is
+        above it -- the invariant `pack` enforces.
+        """
+        return cls(
+            basin_id=int(rec.basin_id),
+            seed_px=(int(rec.seed_px[0]), int(rec.seed_px[1])),
+            bbox_px=tuple(int(v) for v in rec.bbox_px),  # type: ignore[arg-type]
+            outlet_px=(int(rec.outlet_px[0]), int(rec.outlet_px[1])),
+            spill_mm=int(round(float(rec.spill_m) * 1000.0)),
+            surface_mm=int(round(float(rec.surface_m) * 1000.0)),
+            kind=int(rec.kind),
+        )
+
+    @classmethod
+    def unpack(cls, buf: bytes, offset: int = 0) -> "BasinEntry":
+        (bid, sx, sy, x0, y0, x1, y1, ox, oy,
+         spill, surface, kind, reserved) = _BASIN_ENTRY.unpack_from(buf, offset)
+        if reserved != _BASIN_RESERVED5:
+            raise ValueError("nonzero reserved bytes in basin entry")
+        if kind >= BASIN_KIND_COUNT:
+            raise ValueError(f"unknown basin kind {kind}")
+        if x0 > x1 or y0 > y1:
+            raise ValueError("basin bbox is inside out")
+        if surface > spill:
+            raise ValueError("basin surface is above its spill")
+        return cls(basin_id=bid, seed_px=(sx, sy), bbox_px=(x0, y0, x1, y1),
+                   outlet_px=(ox, oy), spill_mm=spill, surface_mm=surface,
+                   kind=kind)
+
+
+def encode_basin_table(basins: "list[BasinEntry]") -> bytes:
+    """Serialise SECTION_BASIN_TABLE's payload.
+
+    Ids must be 0..n-1 in order. That is not decoration: the client indexes
+    the table by id, and the bake orders basins by (min_y, min_x) of extent so
+    the id is a deterministic function of the surface. A gap or a repeat means
+    two different tiles could disagree about which basin is "3".
+    """
+    for i, b in enumerate(basins):
+        if b.basin_id != i:
+            raise ValueError(
+                f"basin ids must be 0..n-1 in order; entry {i} says {b.basin_id}"
+            )
+    if len(basins) > 0xFFFF:
+        raise ValueError(f"{len(basins)} basins exceeds the u16 id space")
+    head = _BASIN_TABLE_HEADER.pack(BASIN_TABLE_VERSION, BASIN_ENTRY_BYTES,
+                                    len(basins))
+    return head + b"".join(b.pack() for b in basins)
+
+
+def decode_basin_table(payload: bytes) -> "list[BasinEntry]":
+    """Parse SECTION_BASIN_TABLE, refusing anything it cannot read exactly."""
+    if len(payload) < _BASIN_TABLE_HEADER.size:
+        raise ValueError("truncated basin table header")
+    version, entry_bytes, count = _BASIN_TABLE_HEADER.unpack_from(payload, 0)
+    if version != BASIN_TABLE_VERSION:
+        raise ValueError(f"unsupported basin table version {version}")
+    if entry_bytes != BASIN_ENTRY_BYTES:
+        raise ValueError(
+            f"basin entry size {entry_bytes} != {BASIN_ENTRY_BYTES}; these "
+            "bytes were written by a different revision of the table"
+        )
+    want = _BASIN_TABLE_HEADER.size + count * entry_bytes
+    if len(payload) != want:
+        raise ValueError(
+            f"basin table is {len(payload)} bytes, header says {want}"
+        )
+    out = [
+        BasinEntry.unpack(payload, _BASIN_TABLE_HEADER.size + i * entry_bytes)
+        for i in range(count)
+    ]
+    for i, b in enumerate(out):
+        if b.basin_id != i:
+            raise ValueError(f"basin ids are not 0..n-1 (entry {i} says {b.basin_id})")
+    return out
+
+
 def encode_v2(
     tile: TileV2,
     *,
     raw_blocks: set[tuple[int, int]] | None = None,
     flow_raw_blocks: set[tuple[int, int]] | None = None,
+    water_raw_blocks: set[tuple[int, int]] | None = None,
     compressor: Compressor | None = None,
 ) -> bytes:
     """Encode a v2 fine tile (docs/vxtl-v2-format.md §3-§6).
@@ -599,6 +982,10 @@ def encode_v2(
     zstandard dependency, since CI deliberately does not install it.
     """
     flags = FLAG_FLOW_PRESENT if tile.flow is not None else 0
+    if tile.basins is not None:
+        flags |= FLAG_BASINS_PRESENT
+    if tile.water_cp is not None:
+        flags |= FLAG_WATER_PRESENT
 
     elev_index, elev_data = _encode_plane(
         tile.elevation_cp.astype(np.int64),
@@ -620,6 +1007,29 @@ def encode_v2(
             compressor=compressor,
         )
         sections += [(SECTION_FLOW_INDEX, flow_index), (SECTION_FLOW_DATA, flow_data)]
+
+    if tile.water_cp is not None:
+        # The SAME `_encode_plane` as elevation, at the same element width --
+        # so a dry tile is 1024 CONSTANT index entries and zero data bytes, and
+        # `codec` reaches it exactly as it reaches the other two planes with no
+        # separate compression path to keep in step.
+        water_index, water_data = _encode_plane(
+            tile.water_cp.astype(np.int64),
+            block_log2=tile.block_log2,
+            codec=tile.codec,
+            elem_dtype="<i2",
+            force_raw_blocks=water_raw_blocks,
+            compressor=compressor,
+        )
+        sections += [(SECTION_WATER_INDEX, water_index),
+                     (SECTION_WATER_DATA, water_data)]
+
+    if tile.basins is not None:
+        # LAST, and uncompressed whatever `codec` says. It is a kilobyte of
+        # already-dense integers -- compressing it would buy nothing and would
+        # make the one section a client must read before it can put water
+        # anywhere depend on the injected decompressor.
+        sections.append((SECTION_BASIN_TABLE, encode_basin_table(tile.basins)))
 
     header = _HEADER.pack(MAGIC, VERSION_V2, tile.seed, tile.x, tile.y, tile.scale, tile.size)
     ext = _V2_EXT.pack(
@@ -722,6 +1132,24 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
         elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
     )
 
+    if flags & ~(FLAG_FLOW_PRESENT | FLAG_BASINS_PRESENT | FLAG_WATER_PRESENT):
+        # Same posture as the C++ parser: an undefined flag bit can only mean
+        # the bytes came from something this decoder does not understand, and
+        # reading them anyway is how a client silently mis-renders a world.
+        raise ValueError(f"unknown header flag bits set: 0x{flags:04x}")
+
+    basins = None
+    if flags & FLAG_BASINS_PRESENT:
+        if SECTION_BASIN_TABLE not in sections:
+            raise ValueError("basin flag set but SECTION_BASIN_TABLE is missing")
+        basins = decode_basin_table(sections[SECTION_BASIN_TABLE])
+        for b in basins:
+            if not (0 <= b.bbox_px[0] <= b.bbox_px[2] < size
+                    and 0 <= b.bbox_px[1] <= b.bbox_px[3] < size):
+                raise ValueError(f"basin {b.basin_id} bbox is outside the tile")
+    elif SECTION_BASIN_TABLE in sections:
+        raise ValueError("SECTION_BASIN_TABLE present but the basin flag is clear")
+
     flow = None
     if flags & FLAG_FLOW_PRESENT:
         if SECTION_FLOW_INDEX not in sections or SECTION_FLOW_DATA not in sections:
@@ -732,12 +1160,24 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
             elem_dtype="u1", out_dtype=np.uint8, decompressor=decompressor,
         )
 
+    water_cp = None
+    if flags & FLAG_WATER_PRESENT:
+        if SECTION_WATER_INDEX not in sections or SECTION_WATER_DATA not in sections:
+            raise ValueError("water flag set but water sections are missing")
+        water_cp = _decode_plane(
+            sections[SECTION_WATER_INDEX], sections[SECTION_WATER_DATA],
+            size=size, block_log2=block_log2, codec=codec,
+            elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
+        )
+    elif SECTION_WATER_INDEX in sections or SECTION_WATER_DATA in sections:
+        raise ValueError("water sections present but the water flag is clear")
+
     return TileV2(
         seed=seed, x=x, y=y, size=size,
         elevation_cp=elevation_cp,
         base_offset_mm=base_offset_mm,
         quant=quant, codec=codec, bake_ver=bake_ver,
-        block_log2=block_log2, flow=flow,
+        block_log2=block_log2, flow=flow, basins=basins, water_cp=water_cp,
         scale=scale, predictor=predictor, parent_scale=parent_scale,
     )
 
@@ -836,6 +1276,8 @@ def encode_fine(
     y: int,
     elevation_m: np.ndarray,
     flow: np.ndarray | None = None,
+    basins: "list | tuple | None" = None,
+    water_surface_m: "np.ndarray | None" = None,
     bake_ver: int | None = None,
     codec: int = CODEC_RAW,
     block_log2: int = DEFAULT_BLOCK_LOG2,
@@ -869,6 +1311,26 @@ def encode_fine(
             raise ValueError(
                 f"flow plane {flow_arr.shape} does not match elevation {cp.shape}"
             )
+    water_cp = None
+    if water_surface_m is not None:
+        # AGAINST THE SAMPLE FIELD, not `cp` -- see the derivation in
+        # `water_depth_control_points`. `cp` is a control lattice and stands up
+        # to 5.6 m from the surface; `spline(cp)`, which is what the client
+        # evaluates, does not.
+        water_cp = water_depth_control_points(
+            water_surface_m, elevation_m, base_offset_mm=base_offset_mm,
+            quant=quant
+        )
+
+    basin_rows = None
+    if basins is not None:
+        # A tuple() of zero basins is NOT None: a tile that was surveyed and
+        # holds nothing must say so, or a client cannot tell it apart from a
+        # tile baked before the registry existed.
+        basin_rows = [
+            b if isinstance(b, BasinEntry) else BasinEntry.from_record(b)
+            for b in basins
+        ]
     return encode_v2(
         TileV2(
             seed=int(seed) & 0xFFFFFFFFFFFFFFFF,
@@ -882,5 +1344,7 @@ def encode_fine(
             bake_ver=int(bake_ver),
             block_log2=int(block_log2),
             flow=flow_arr,
+            basins=basin_rows,
+            water_cp=water_cp,
         )
     )

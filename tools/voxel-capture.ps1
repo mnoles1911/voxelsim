@@ -72,6 +72,12 @@ param(
     # reproduces every pre-existing capture exactly: ground spawn, level camera.
     [double]$SpawnAltM = 0,
     [double]$SpawnPitch = 0,
+    # Yaw in degrees. The capture path's historical framing yaw is 45 and that
+    # is what an unpassed -SpawnYaw still produces, so leaving this alone keeps
+    # a run byte-identical to the archive. Passed, it is the only way to swing
+    # the camera around a fixed column; see the pitch note below for why the
+    # engine treats this switch and -SpawnPitch as a pair.
+    [double]$SpawnYaw = 45,
     [int]$Width = 2560,
     [int]$Height = 1440,
     [int]$TimeoutSec = 420,
@@ -113,10 +119,40 @@ $ShotDir = Join-Path $Root 'ue-project\Saved\Screenshots\WindowsEditor'
 #
 # So: clear it, and clear it BEFORE the one-editor check so a refused start does
 # not leave a half-prepared state.
+#
+# AND THE WATER BLOB, WHICH THIS BLOCK DID NOT CLEAR AND WHICH IS THE SAME BUG.
+# Persisted world state is TWO files, not one (tools/water-playtest.ps1 has
+# always cleared both, and says why): the `.vxlog` edit log replayed on load,
+# and the ADR-0005 `.vxwater` CA fill blob, which is irreducible simulation
+# state and therefore NOT re-derivable from seed + edit log. Only the first was
+# cleared here.
+#
+# Measured on 2026-08-04, on the first water capture ever taken through this
+# script: a breach run left 4.1 MB of `.vxwater` behind, and the NEXT run --
+# nominally a fresh baseline -- logged `LoadWaterState: restored 886,179,570
+# fill units across 38,712 stored brick(s), 17,235 mobilized brick(s)` before
+# its own dig had happened. It came up already flooded.
+#
+# That is worse here than a stale measurement, for the reason the edit-log note
+# above gives about the camera: it silently destroys an A/B. The
+# `voxel.Water.ImplicitOcean 0` control for a breach capture is a run whose
+# whole content is "no water appears" -- and run for run after the ocean-on
+# arm, it would have inherited the ocean-on arm's water and photographed it.
+# The pair would have looked like a null result and would have been evidence of
+# nothing.
 if (-not $KeepEditLog) {
     $worldDir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
     if (Test-Path $worldDir) {
-        Get-ChildItem $worldDir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+        $stale = @(Get-ChildItem $worldDir -Include *.vxlog, *.vxwater -File -Recurse -ErrorAction SilentlyContinue)
+        if ($stale.Count -gt 0) {
+            # Say what was discarded. "Discarded 4.1 MB of water blob" is the line
+            # that tells you the previous run actually poured something, and it is
+            # the only warning that a comparison you were about to make had a
+            # contaminated baseline.
+            $what = ($stale | ForEach-Object { "{0} ({1:N0} B)" -f $_.Name, $_.Length }) -join ', '
+            Write-Host "  cleared persisted world state: $what" -ForegroundColor DarkGray
+            $stale | Remove-Item -Force
+        }
     }
 }
 
@@ -160,6 +196,12 @@ if ($SpawnAltM -ne 0) {
 }
 if ($SpawnPitch -ne 0) {
     $argList += "-VoxelSpawnPitch=$($SpawnPitch.ToString([cultureinfo]::InvariantCulture))"
+}
+# 45 is the engine-side default for the capture framing, so passing it would be
+# a no-op that changes the command line for nothing -- same "an unchanged
+# command line is what makes it checkable" argument as the block above.
+if ($SpawnYaw -ne 45) {
+    $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
 }
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
 $argList += $ExtraArgs
@@ -244,6 +286,53 @@ if (Test-Path $LogPath) {
                        "distinguish a settled capture from a thrashing one. Treat this capture's " +
                        "settle state as unknown.")
     }
+    # THE WATER QUEUE, WHICH THE SETTLE CHECK ABOVE CANNOT SEE.
+    #
+    # jobsInFlight/pendingJobs are TERRAIN counters. On 2026-08-03 two lake
+    # captures were shot 8 and 36 ticks into a 199-tick water refresh with
+    # `jobsInFlight=0 pendingJobs=0 unloaded=0` -- genuinely terrain-settled and
+    # genuinely water-unsettled. The frames showed a lake as disjoint
+    # brick-shaped patches, which reads as a meshing bug and sent a whole
+    # investigation after "data or mesh?" when the answer was neither: the gaps
+    # were wherever the water queue had not reached yet.
+    #
+    # So a capture CONTAINING WATER is not settled until the implicit-water
+    # rebuild has drained, and that has its own line. Expect to add another
+    # block here the next time a subsystem starts producing geometry: this
+    # check only knows about the queues it has been taught.
+    $drained = @(Select-String -Path $LogPath -Pattern 'RefreshImplicitWater: DRAINED refresh')
+    $draining = @(Select-String -Path $LogPath -Pattern 'RefreshImplicitWater: STILL DRAINING') |
+                Select-Object -Last 1
+    $sheet = @(Select-String -Path $LogPath -Pattern 'Lake sheets: DRAINED build')
+    Write-Host ("  water: implicit DRAINED x{0}, sheet DRAINED x{1}" -f
+                $drained.Count, $sheet.Count)
+    if ($drained.Count -eq 0) {
+        if ($draining) {
+            Write-Warning ("WATER NOT SETTLED at the shutter: the implicit-water refresh was " +
+                           "STILL DRAINING and never reported DRAINED. Water in this frame is " +
+                           "PARTIAL -- missing patches are unreached queue, not missing data " +
+                           "and not a mesher bug. Raise -SettleSec and re-shoot.")
+        }
+        else {
+            Write-Warning ("no 'RefreshImplicitWater: DRAINED refresh' line in the log. Either " +
+                           "there is no water near this spawn (fine), or the water subsystem " +
+                           "never ran (not fine). This capture is NOT evidence that water is " +
+                           "absent -- check the 'Baked water tier ENABLED' line and the tile " +
+                           "provider id before concluding anything from an empty valley.")
+        }
+    }
+    # A REFUSED TILE HAS NO WATER AND LOOKS EXACTLY LIKE A DRY VALLEY. Most of
+    # the production cache is CODEC_ZSTD, and without the injected decompressor
+    # every one of those tiles is refused whole -- silently, as far as the image
+    # is concerned.
+    $refused = @(Select-String -Path $LogPath -Pattern 'was REFUSED')
+    if ($refused.Count -gt 0) {
+        Write-Warning ("$($refused.Count) fine tile(s) were REFUSED (search the log for " +
+                       "'was REFUSED'). Their lakes and rivers are ABSENT from this frame. " +
+                       "kNoDecompressor here means the runtime zstd DLL is missing -- see " +
+                       "tools/fetch-zstd.ps1.")
+    }
+
     # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not
     # streamed yet" and looks identical in the image: black gaps in otherwise
     # finished terrain. The fine tier is where this first showed up, because its
@@ -286,6 +375,53 @@ if (Test-Path $LogPath) {
                        "the switches did NOT reach the ordinary spawn path (an editor built before they existed, " +
                        "or a fixture switch that poses its own camera took the spawn). This image is a GROUND " +
                        "shot; do not read landform from it.")
+    }
+
+    # THE POSE AT THE SHUTTER, WHICH IS THE ONLY POSE THAT FRAMED ANYTHING, AND
+    # WHICH DISAGREED WITH THE LINE ABOVE FOR THE WHOLE LIFE OF -SpawnPitch.
+    #
+    # "Spawn pose APPLIED" is written at spawn and reads the control rotation
+    # back off the controller, so it is honest about that instant -- and that
+    # instant is ~150 s before the frame. The game mode's screenshot timer then
+    # re-posed the camera to a hard-coded pitch -40 yaw 45 immediately before
+    # requesting the shot, discarding -VoxelSpawnPitch entirely. Every capture
+    # taken through this script without a fixture switch was framed at -40/45
+    # while its log stated the requested pitch, and a -89 request and a -42
+    # request produced the same picture. Three settled cave frames were binned
+    # over it before anyone read the second line.
+    #
+    # The engine now honours the switch, but the lesson generalises past the one
+    # bug: a pose that is accepted at spawn is not a pose that survives to the
+    # shutter, and only the engine can say which one framed the image. So print
+    # what the CAMERA MANAGER reported at the moment of the screenshot request,
+    # and compare it against what was asked for rather than leaving that to
+    # whoever opens the log.
+    $shot1 = @(Select-String -Path $LogPath -Pattern 'Capture: cam loc=.*rot=\(pitch (-?[\d.]+) yaw (-?[\d.]+)\)') |
+             Select-Object -First 1
+    if ($shot1) {
+        $gotPitch = [double]$shot1.Matches[0].Groups[1].Value
+        $gotYaw   = [double]$shot1.Matches[0].Groups[2].Value
+        Write-Host ("  SHUTTER pose: " + ($shot1.Line -replace '^.*Capture: ', ''))
+        $wantPitch = if ($SpawnPitch -ne 0) { $SpawnPitch } else { -40 }
+        # YAW WRAPS AND THIS CHECK DID NOT, so it cried wolf on the first capture
+        # that used it: -SpawnYaw 270 reaches the shutter as -90, the engine's
+        # normalised form of the same direction, and the comparison called a
+        # correctly framed image "NOT AS REQUESTED". A false alarm on the one
+        # warning that exists to make a real framing failure loud is worse than
+        # no warning at all -- the next real one gets ignored. Compare the
+        # signed shortest angular distance instead.
+        $yawErr = [Math]::Abs((($gotYaw - $SpawnYaw) % 360 + 540) % 360 - 180)
+        if ([Math]::Abs($gotPitch - $wantPitch) -gt 0.5 -or $yawErr -gt 0.5) {
+            Write-Warning ("FRAMING NOT AS REQUESTED: asked for pitch $wantPitch yaw $SpawnYaw, the shutter " +
+                           "fired at pitch $gotPitch yaw $gotYaw. This image is NOT the framing you asked for -- " +
+                           "report it as unusable rather than as the requested pose. (pitch -40 yaw 45 exactly " +
+                           "means the game mode's fallback framing overrode the switches; an editor built before " +
+                           "2026-08-03 always does this.)")
+        }
+    } else {
+        Write-Warning ("no 'Capture: cam loc=' line in the log -- the pose that actually framed this image " +
+                       "could not be read. 'Spawn pose APPLIED' is NOT a substitute: it is written ~150 s " +
+                       "earlier and has already been observed to disagree with the shutter.")
     }
 
     $errs = Select-String -Path $LogPath -Pattern 'Fatal|Assertion failed' | Select-Object -First 3

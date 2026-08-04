@@ -1,0 +1,339 @@
+LOWERING THE DRAWABLE CUT AND CONCENTRATING THE WATER PASS
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), bake_ver 10 -> 11
+2026-08-04
+================================================================================
+
+WHAT WAS CHANGED
+----------------
+Two constants, both PRODUCT constants, neither of which can move a height.
+
+  water_min_width_px          2.0  ->  1.5
+      q_drawable              3.1467e6 -> 1.5286e6 m3/yr   (0.100 -> 0.048 m3/s)
+      implied channel width   3.750 m  -> 2.812 m
+      ratio                   0.4858 = 1.042 octaves below
+
+  water_flow_single_receiver  (new) True
+      B6's discharge sweep routes D8 (flow.accumulate_d8) instead of MFD.
+      The AREA field, mfd_p, STAGE_ORDER and every field of as_payload are
+      untouched, so A^m reads exactly what it read at bake_ver 10.
+
+THE WIDTH IS DERIVED, NOT PICKED AT 2x. q_drawable comes out of the width law,
+so an octave in Q is a specific width. Tabulated at 1.875 m/px:
+
+  min_width_px   channel width   q_drawable      m3/s     octaves below 2.0 px
+      2.00          3.750 m      3.1467e6       0.0997        0.000
+      1.75          3.281 m      2.2506e6       0.0713        0.484
+      1.50          2.812 m      1.5286e6       0.0484        1.042   <- chosen
+      1.25          2.344 m      9.6728e5       0.0307        1.702
+      1.00          1.875 m      5.5250e5       0.0175        2.510
+
+1.5 px is where "about an octave" lands in the law's own units. What it means:
+the smallest reach the plane will draw is a channel 2.812 m across -- 28 voxels
+at the client's 100 mm pitch -- rather than 3.750 m / 37 voxels. 1.0 px is the
+floor and was rejected: there the marginal channel is 1.875 m, exactly one
+pixel, which is a creek drawn as a raster artefact.
+
+The new cut is still 4.84x water_q_perennial_m3_yr, so plan section 4.1's
+honesty clause still has something to be honest about -- there remain perennial
+reaches this raster declines to draw, and water_head_mask still reports both
+counts.
+
+
+THE CONCENTRATION HALF: WHY D8 AND NOT A LARGER mfd_p
+------------------------------------------------------
+The brief named two candidates and flagged the trap. Both reasons below are
+against the mfd_p route; the second is decisive and is a measurement, not an
+argument.
+
+1. mfd_p IS HASHED IN TWO PLACES. It is in BakeConstants.as_payload (so it
+   decides the area field, hence A^m, hence every height) AND in
+   superblock_inputs_fingerprint, where it drives the superblock MFD at 30 m
+   and 120 m/px. A second scalar reaching only the fine water sweep leaves the
+   pyramid and the tile routing the same water two different ways; threading it
+   through the pyramid instead invalidates every cached superblock through a
+   fingerprint that does not currently see it. Either way a routing change
+   reaches a TERRAIN cache, which is what the TERRAIN/BAKE version split exists
+   to prevent.
+
+2. LARGE p SILENTLY LOSES WATER IN float32. _accumulate_mfd evaluates
+   (drop * inv_dist) ** p in the surface's own dtype, and the bake carries
+   float32. After the epsilon fill a flat's drop is ~2 ULP of the domain's
+   magnitude, so the slope there is ~2.6e-4 at 3 km elevation and
+   2.6e-4 ** p underflows float32 at p ~ 11. Every weight becomes 0, tot is 0,
+   the sweep reads the cell as a PIT and DROPS its whole accumulation.
+   Conservation is the detector -- fraction of the budget that never reaches a
+   terminal cell, on a float32 surface at production magnitude:
+
+     p = 1.1     lost < 1e-9
+     p = 8.0     lost   (small)
+     p = 32.0    lost > 50%
+     D8          lost < 1e-9
+
+   That is not a hypothetical tuning limit. It bites on exactly the flat,
+   filled, near-sea-level ground a river has to cross to reach a coast.
+   Asserted in tests/test_bake_flow.py::test_accumulate_d8_beats_high_p_underflow.
+
+3. And at the largest p float32 tolerates it is not single-receiver anyway: a
+   neighbour at 0.8x the steepest slope still takes 0.8^10 = 11% of the flow.
+
+DOES THIS LEAVE PARENT AND CHILD ROUTING DIFFERENTLY? The pyramid still carries
+Q under MFD; the fine tier now concentrates. That is not the trap the brief
+described, and the reason is what crosses the boundary: the superblock delivers
+a per-cell TOTAL at the tile's edge cells and the child does not re-route the
+parent's interior. Where the parent's MFD spread a trunk over several 30 m
+cells, those all land in the same valley and the child's D8 forest re-converges
+them -- the child HEALS the parent's dispersion rather than amplifying it. It is
+also unchanged from bake_ver 10 in the only respect that is measurable here: the
+injected quantities per tile are identical, because superblock_inputs_fingerprint
+saw no change and the cached blocks were rebuilt to the same fingerprints
+(64b6aecdcfcb at L1; 3f4dae81d1e2 / 6f5b1fcff952 at L0).
+
+
+ACCEPTANCE: THE STITCHED CORRIDOR, ONE GRID, LABELLED ONCE, 8-CONNECTED
+------------------------------------------------------------------------
+                                  bv10 baseline    bv11 both halves
+  wet pixels                            27,347             158,458    5.79x
+  components                             2,014                 173    -91.4%
+  longest span                         1,113 m            14,827 m    13.3x
+  components >= 2 km                         0                  36
+  components >= 5 km                         0                  14
+  components >= 10 km                        0                   1
+  pieces meeting the coast (<=1 km)        235                  43
+  longest piece reaching the coast       475 m             9,881 m    20.8x
+
+  depth m   min / p50 / p90 / max
+    bv10     0.505 / 0.728 / 1.048 / 1.077
+    bv11     0.392 / 0.482 / 0.720 / 1.073
+
+  per tile (%wet)      bv10      bv11
+    (-11,-4)         0.0080%   0.0349%
+    (-11,-5)         0.0143%   0.0894%
+    (-12,-5)         0.0088%   0.0432%
+    (-11,-6)         0.0096%   0.0687%
+
+The baseline column was re-measured here from the bv10 npz dumps rather than
+quoted, and it reproduces every published figure exactly (27,347 / 2,014 /
+1,113 m / 0 / 235 / 475 m), which is what makes the new column comparable.
+
+
+APPORTIONMENT BETWEEN THE TWO HALVES -- FOR FREE
+-------------------------------------------------
+The npz dump carries the unquantised Q, so the four arms of
+{MFD, D8} x {2.0 px, 1.5 px} are three re-thresholdings of two fields already on
+disk rather than three more corridors of bake. RAW q >= q_drawable cut, no basin
+exclusion, so all four arms are like for like:
+
+  arm                       cut m3/yr      cells   comps  longest  >=2km
+  MFD @ 2.0 px  (bv10)      3.1467e6      29,159   2,019   1,113 m     0
+  MFD @ 1.5 px  threshold   1.5286e6      91,046   4,930   4,216 m     1
+  D8  @ 2.0 px  concentrate 3.1467e6      66,668      22  11,792 m    12
+  D8  @ 1.5 px  both        1.5286e6     165,243      36  16,341 m    25
+
+BOTH HALVES HELP, AND THEY ARE NOT INTERCHANGEABLE.
+
+  * The THRESHOLD alone lengthens the longest reach 3.8x but makes the
+    fragmentation WORSE: 2,019 -> 4,930 components. Lowering the cut admits more
+    marginal cells, and MFD splits those too, so it buys more pieces of river.
+    On its own this half is half a win.
+  * CONCENTRATION alone is the larger effect on both axes: 10.6x the longest
+    reach and 92x fewer components (2,019 -> 22).
+  * TOGETHER: 16,341 m and 25 components over 2 km, against 11,792 m and 12 for
+    concentration alone. The count goes 22 -> 36, which is the threshold half's
+    marginal headwaters again -- but they now arrive as reaches rather than as
+    fragments, and the trade buys +4.5 km of longest span and 13 more
+    multi-kilometre rivers.
+
+Neither half is worse than the baseline on the number that matters. The
+threshold half IS worse than the baseline on component count when run alone, and
+that is stated rather than averaged away.
+
+
+THE NUMBER THAT MATTERS: DOES ONE RUN FROM HIGH GROUND TO THE SEA
+------------------------------------------------------------------
+In the SHIPPED RASTER, no -- but the raster is not the whole product.
+
+  longest continuous reach          14,827 m
+    head elevation                   978.1 m
+    downstream end                   190.5 m, 6.66 km short of the shoreline
+    terminates at                    the (-11,-5)/(-11,-6) TILE SEAM, not at
+                                     a coast and not at a hydrologic terminus
+
+  longest reach that touches the shoreline   7,069 m, head 58.9 m
+  longest reach within 1 km of the sea       9,881 m, head 240.4 m, ends 0.79 km out
+
+Three pieces reach a cell at elevation <= 0 and continue onto the seafloor to
+-476 m; at bv10, 127 pieces did, the longest of them 475 m and lying ENTIRELY
+below sea level (-476.0 to -476.0 m). So bv10's "water meets the coast" was
+almost entirely submarine channel, not a river arriving.
+
+WITH REGISTERED BASINS COMPOSED BACK IN -- which is what the client draws, since
+graded_water_surface writes registered-basin cells dry precisely so
+SECTION_BASIN_TABLE can supply them and CompositeWaterSampler unions the two --
+the answer changes:
+
+  raw cut (basins included)   36 components, longest 16,341 m
+  longest reach touching the sea   15,332 m, from 240.4 m elevation to -476 m
+
+So a 15.3 km river does run down to the shoreline and out onto the seafloor,
+head at 240 m. It is not a MOUNTAIN river: the components with 978 m, 1,326 m
+and 1,540 m heads all stop inland. Caveat, because it is an upper bound: a
+registered basin is drawn wet only if it actually holds a lake, so the composed
+continuity is bounded by that and has not been checked basin by basin here.
+
+
+WHAT NOW FRAGMENTS THE NETWORK -- IT IS NOT THE TWO CAUSES THAT WERE FIXED
+---------------------------------------------------------------------------
+Shipped raster 173 components; raw cut 36. The 137 extra components come from
+4.11% of cells, and they are the B5 basin exclusion -- BY DESIGN, and the client
+composes them back. At bv10 basins cost 5 components and 0 m of span; they are
+now the largest single term in the raster's component count, purely because
+everything else got better.
+
+Of the 36 raw components, classified by where the DOWNSTREAM end sits:
+
+  24  the OUTER boundary of the four-tile measurement window -- the window, not
+      a defect. The two longest (16,341 m and 15,332 m) leave the box at -476 m,
+      i.e. having already reached the sea.
+  11  an INTERIOR SEAM between two corridor tiles. This is a real product break.
+   1  inland.
+
+35 of 36 end within one pixel of a tile edge. THE INTERIOR SEAM IS THE NEXT
+DEFECT, and it was invisible before: the fine Q field does not cross a fine tile
+boundary. Each tile accumulates over its own padded domain and restarts from the
+30 m superblock injection at its edge, so where two tiles meet, the two Q values
+either side of the seam are not the same number and a hard threshold can cut
+between them. Under MFD's general fragmentation this was one break among two
+thousand; now the network is otherwise continuous and it is 8 of the 25
+multi-kilometre reaches, including the longest.
+
+Not fixed here, and deliberately not guessed at.
+
+
+THE COST: THE RASTER NOW DRAWS A CENTRELINE
+--------------------------------------------
+This is the honest negative, and it is what the brief asked to see.
+
+  raster ribbon width, m   min   p50   p90   p99    max    <=1.9 m
+    bv10                  1.88  1.88  5.62  7.50  10.61    51.67%
+    bv11                  1.88  1.88  1.88  1.88   3.75    99.21%
+
+  law width (channel_width_m(Q) at the same pixels), m
+    bv10                  3.75  4.37  5.92    --   8.85
+    bv11                  2.81  3.53  5.47    --   8.81
+
+The MEDIAN was already one pixel at bv10; what is gone is the upper tail. p90
+falls 5.62 -> 1.88 m and the widest ribbon 10.61 -> 3.75 m, so essentially every
+drawn river is now a single 1.875 m pixel -- 19 voxels at 100 mm.
+
+THE MECHANISM, so it is not mistaken for a coincidence. The plane is wet where a
+cell's own Q clears the cut, so the drawn ribbon is however many ADJACENT cells
+clear it. MFD's fan is what made it wide: beside a trunk the neighbours carried a
+share large enough to clear the cut too. A single-receiver forest has one-cell
+branches by construction. So bv10's width was a by-product of the same dispersion
+that was breaking the network -- the two cannot both be had from the mask alone,
+and bv10's apparent agreement with the law (drawn p50 5.30 m against law p50
+4.87 m on (-12,-5)) was an accident.
+
+Net: the network is now right and NARROWER than the channel it describes
+(1.88 m drawn against 3.53 m of law at p50), where before it was slightly wider.
+Depth falls the same way and for a composition reason: p50 0.728 -> 0.482 m
+because the lower cut admits many more small streams, and the floor 0.505 ->
+0.392 m is exactly water_depth_m at the new q_drawable.
+
+THE FIX IF THE OWNER WANTS IT, stated but NOT implemented, because it is a third
+change and a decision about what the world looks like: let channel_width_m(Q)
+decide EXTENT the way water_depth_m(Q) already decides depth -- dilate each wet
+cell to its own law width. That is more consistent than either version rather
+than new hydraulics, and it is the only way to get a continuous network AND a
+river as wide as the law says it is.
+
+
+TERRAIN DID NOT MOVE -- CHECKED ON ALL FOUR TILES AGAINST THE SHIPPED BYTES
+----------------------------------------------------------------------------
+TERRAIN_VERSION stays 8. The terrain fingerprint is unchanged at its pinned
+value fe0275e105cbf77c; the product fingerprint rolls to a22bc923b1948328.
+
+  tile       elevation (float32)   flow plane   accumulation   vs shipped .vxtl
+  (-11,-4)      IDENTICAL          IDENTICAL     IDENTICAL     cp + flow IDENTICAL
+  (-11,-5)      IDENTICAL          IDENTICAL     IDENTICAL     cp + flow IDENTICAL
+  (-12,-5)      IDENTICAL          IDENTICAL     IDENTICAL     cp + flow IDENTICAL
+  (-11,-6)      IDENTICAL          IDENTICAL     IDENTICAL     cp + flow IDENTICAL
+
+The first three columns are the UNQUANTISED npz fields compared bit for bit
+against the bake_ver 10 dumps, which is stricter than a control-point
+comparison: it catches a perturbation below the 100 mm wire LSB. The fourth
+re-quantises through the codec's OWN elevation_control_points (prefilter
+included) onto the shipped tile's own datum and compares against the shipped
+elevation_cp and flow plane. tools/verify_water_only_change.py, PASS 4/0.
+
+(A hand-rolled round((z*1000 - base)/quant) reported a terrain move on the first
+tile. It was the missing section-2 prefilter, not the terrain. The tool now uses
+the codec's operator, and the note is in its docstring.)
+
+NOTHING WAS WRITTEN TO THE WORLD. --diagnostic hid and write-protected the fine
+tier; the run reported 1 + 3 fine tile writes suppressed and the four shipped
+.vxtl files still carry their 2026-08-03 mtimes. The BAKE_VERSION roll moved the
+fine namespace to ...-b7817e0df, which now holds flow superblocks and a
+world-identity record and no tiles.
+
+
+TESTS, MEASURED ON THIS WORKTREE
+---------------------------------
+  pytest (terrain-service)   537 passed / 2 skipped   baseline 532 / 2   +5 new
+  ctest                      2/2, 383 cases, 0 failures   baseline 2/2, 383  OK
+
+The 5 new tests are the D8 sweep's: reference agreement, conservation in both
+currencies, the never-splits property, the float32 underflow measurement above,
+and input validation. voxel-core was configured and built from scratch in this
+worktree to take the ctest number rather than quote it; zero C++ files are
+touched. (ctest needs -C Release on this multi-config generator or both tests
+report "Not Run".)
+
+A note on the venv: pytest reads 532/2 on the system Python 3.12 and 531/1
+failed on D:/terrain-diffusion/.venv, where
+test_non_dry_run_without_backend_raises_clear_error_without_torch fails because
+torch IS installed there. That is an environment artefact and not a code
+difference; every number above is from the system interpreter.
+
+
+COST
+----
+  bakes   4 tiles   1,097.6 CPU-s  (270.4 + 301.0 + 265.2 + 261.0)
+  The first tile was baked and checked ALONE -- water 0.043%wet against bv10's
+  0.0088%, and terrain identity verified -- before the other three were spent.
+
+  measurement: decode and label only, no bake. The apportionment table cost
+  nothing extra: it is a re-threshold of npz already written.
+
+
+TOOLS ADDED
+-----------
+  tools/corridor_water_report.py
+      the acceptance report off the npz dumps rather than the cache, because
+      --diagnostic write-protects the fine tier and there is no .vxtl to read.
+      Same stitch, same sparse union-find labeller, same coastline arithmetic
+      as the two existing tools; adds the raster/law width pair, the head-and-
+      mouth elevations of the longest reaches, and --decompose.
+  tools/verify_water_only_change.py
+      the terrain guardrail on real tiles: npz vs npz unquantised, and both
+      planes against the shipped .vxtl through the codec's own quantiser.
+
+
+WHAT WAS RUN
+-------------
+  python tools/bake_tiles_from_cache.py --seed 20260719 \
+      --cache-dir D:/voxelsim/tile-cache \
+      --provider-id terrain-diffusion-unlabeled-80b9ca451a23eae4 \
+      --terrain-diffusion-version "82a0431+worldgen.c55a6382c524" \
+      --tiles="-12,-5" --npz-dir D:/tmp/riverfix-npz --diagnostic
+  (then --tiles="-11,-4 -11,-5 -11,-6")
+
+  python tools/verify_water_only_change.py --before D:/tmp/frag-npz \
+      --after D:/tmp/riverfix-npz --tiles="-11,-4 -11,-5 -12,-5 -11,-6" \
+      --cache-dir D:/voxelsim/tile-cache \
+      --ns terrain-diffusion-unlabeled-80b9ca451a23eae4-b4d02b092
+
+  python tools/corridor_water_report.py \
+      --npz-dir "bv10 baseline=D:/tmp/frag-npz" \
+      --npz-dir "bv11 both halves=D:/tmp/riverfix-npz" \
+      --tiles="-11,-4 -11,-5 -12,-5 -11,-6" --decompose

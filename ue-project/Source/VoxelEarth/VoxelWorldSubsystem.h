@@ -210,6 +210,28 @@ public:
 	// a physics engine.
 	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
 
+	// A PROVABLE UPPER BOUND, in absolute mm, on the amplified surface over
+	// every column in the inclusive voxel rectangle [Vx0, Vx1] x [Vy0, Vy1] --
+	// i.e. every voxel whose bottom sits at or above the returned value is
+	// guaranteed to be worldgen AIR, because no amplifier pass turns air into
+	// solid (the cave and cavern passes only carve). Returns INT64_MIN when the
+	// amplifier declines to bound the footprint, which callers must treat as
+	// "no information", never as a low bound.
+	//
+	// This is vxc::Amplifier::surfaceUpperBoundMm, which is where the
+	// derivation and its static_asserts live, exposed with plain types so this
+	// UHT-parsed header stays voxel-core-free by the same doctrine
+	// SampleTerrainHeightUU follows. It exists because callers that sweep a
+	// VOLUME -- the implicit-water candidate sweep is the first -- need to
+	// reject whole bricks without paying GetSurfaceHeightUU per column: this
+	// costs at most one 16x16 block of tile reads and evaluates no detail
+	// octave at all, so it is cheaper than a single amplifier column.
+	//
+	// Pure worldgen: it does NOT see the edit overlay. A caller using it to
+	// prove "all air" is proving it about the generated world, so any caller
+	// that must also respect placed voxels has to exclude edited bricks itself.
+	int64 GetSurfaceUpperBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const;
+
 	// Deterministic voxel DDA raycast (voxelcore/raycast.h) from StartUU along
 	// DirUU (need not be normalized -- normalized internally), out to
 	// MaxDistUU. Used by AVoxelEarthFlyPawn for the over-the-shoulder camera's

@@ -127,6 +127,75 @@ enum FineSectionId : uint32_t {
     kSectionElevData = 2,
     kSectionFlowIndex = 3,
     kSectionFlowData = 4,
+    // The per-tile basin registry (docs/watershed-system-plan.md P1, bake_ver
+    // 8). A flat table of tens of rows, never a plane -- the bake decides
+    // where the lakes are and how high they stand, and this is the whole of
+    // what the client needs to put water in them.
+    kSectionBasinTable = 5,
+    // The graded water-surface plane (watershed plan P2, bake_ver 9). Same
+    // block machinery, element width and DATUM as elevation -- int16 control
+    // points relative to `baseOffsetMm` at `quantMm()` -- with
+    // `kWaterDryDepth` where there is no water.
+    //
+    // Sharing the elevation datum is what makes the query cheap AND correct: a
+    // client asks "is there water over this column, and how deep" with two
+    // reads on one datum and a subtraction, instead of converting between two
+    // coordinate spaces at every voxel of a brick sweep.
+    kSectionWaterIndex = 6,
+    kSectionWaterData = 7,
+};
+
+// SECTION_BASIN_TABLE payload layout, mirroring terrain_service/tile_codec.py.
+//
+//   u16 table_version | u16 entry_bytes | u32 count | count * entry_bytes
+//
+// `entry_bytes` is redundant with the section length, and deliberately so: a
+// decoder that disagrees with the encoder about the row size gets a mismatch
+// it can refuse, instead of reading 33-byte records out of a 32-byte stream
+// and producing plausible garbage.
+inline constexpr uint16_t kBasinTableVersion = 1;
+inline constexpr size_t kBasinTableHeaderBytes = 8;
+inline constexpr size_t kBasinEntryBytes = 32;
+
+// What kind of place a registered depression is (bake/basins.py's KIND_*).
+// The ORDER is load-bearing: >= kBasinLakeTerminal means "holds standing
+// water", which is the only test most callers need.
+enum BasinKind : uint8_t {
+    kBasinDryPlaya = 0,
+    kBasinSaltFlat = 1,
+    kBasinSeasonal = 2,
+    kBasinLakeTerminal = 3,
+    kBasinLakeOverflowing = 4,
+    kBasinKindCount = 5,
+};
+
+// One registered basin. 32 bytes on the wire and in memory -- this struct is
+// filled field by field from the byte reader, never memcpy'd over the file,
+// so no packing pragma is needed and none is relied on.
+//
+// Pixel coordinates are TILE-LOCAL, in the same space as the elevation plane,
+// so a client indexes them with no transform. Elevations are ABSOLUTE
+// millimetres, NOT relative to baseOffsetMm: a basin is read by gameplay code
+// that never touches the control-point datum, and sharing one would couple a
+// water query to the elevation codec's internals.
+struct BasinEntry {
+    uint16_t basinId = 0;
+    //: Deepest cell -- the client's flood-fill seed.
+    uint16_t seedX = 0, seedY = 0;
+    //: Inclusive extent. The flood fill is bounded by this, which is what
+    //: makes the per-basin cost O(bbox) instead of O(tile).
+    uint16_t bboxX0 = 0, bboxY0 = 0, bboxX1 = 0, bboxY1 = 0;
+    //: Spill cell -- the head of the outlet channel.
+    uint16_t outletX = 0, outletY = 0;
+    //: Fill level on the FINAL surface, and the equilibrium water surface.
+    //: surfaceMm <= spillMm always; they are equal when the basin overflows,
+    //: and surfaceMm sits at the floor when it is dry.
+    int32_t spillMm = 0;
+    int32_t surfaceMm = 0;
+    uint8_t kind = kBasinDryPlaya;
+
+    //: True when this basin holds standing water at equilibrium.
+    bool holdsWater() const { return kind >= kBasinLakeTerminal; }
 };
 
 enum FineBlockMode : uint8_t {
@@ -147,6 +216,42 @@ inline constexpr uint8_t kPredMed = 1;
 // undefined flag can only mean the bytes were produced by something this
 // decoder does not understand.
 inline constexpr uint16_t kFineFlagFlowPresent = 0x1;
+// §3 `flags` bit1 (bake_ver 8): SECTION_BASIN_TABLE is present. Set even when
+// the table has ZERO rows -- "this tile was surveyed and holds nothing" and
+// "this tile predates the registry" are different facts and a client that
+// conflated them would put no water in a world that has some.
+inline constexpr uint16_t kFineFlagBasinsPresent = 0x2;
+// §3 `flags` bit2 (bake_ver 9): SECTION_WATER_* is present. Set even when the
+// plane is entirely dry, for the same reason as the basin flag above: "this
+// tile was surveyed and carries no rivers" and "this tile predates the water
+// plane" are different facts, and a client that conflated them would draw no
+// rivers in a world that has them and never be able to tell why.
+inline constexpr uint16_t kFineFlagWaterPresent = 0x4;
+inline constexpr uint16_t kFineFlagsKnown =
+    kFineFlagFlowPresent | kFineFlagBasinsPresent | kFineFlagWaterPresent;
+
+// The dry sentinel in the water plane, in CONTROL-POINT units. INT16_MIN, the
+// one value the elevation codec's own range can never legitimately carry as a
+// water surface -- see terrain_service/tile_codec.py's WATER_DRY_CP, which
+// this mirrors. A decoder must test for it BEFORE applying
+// `elevationMmFromCp`, or the sentinel becomes an ordinary (very low)
+// elevation and every dry pixel reads as water 3.2 km underground.
+inline constexpr int16_t kWaterDryDepth = -1;
+
+// Millimetres per stored water-depth LSB. Mirrors tile_codec.WATER_DEPTH_LSB_MM.
+inline constexpr int32_t kWaterDepthLsbMm = 10;
+
+// "No baked water over this column." INT32_MIN rather than a sentinel like
+// kSeaLevelMm because a lake CAN sit below sea level datum-wise in principle
+// and because `CavernColumn::floodZMm` already uses exactly this value for
+// exactly this meaning -- one convention, several producers.
+//
+// DEFINED HERE, not in lakes.h where it began: the water PLANE is decoded at
+// this level and has to answer "dry" in the same currency the lake sampler
+// answers it in, and lakes.h includes this header rather than the other way
+// round. Two constants with one meaning is how the three discharge currencies
+// happened; see bake/water.py.
+inline constexpr int32_t kNoWaterMm = INT32_MIN;
 
 // True for codec values the FORMAT defines. Says nothing about whether this
 // process can decode them -- see fineCodecNeedsDecompressor below.
@@ -244,6 +349,7 @@ enum class FineError : uint8_t {
     kDecompressFailed, // decode: the injected decompressor rejected the frame
     kBadPayload,       // decode: payload length wrong for the block's mode
     kValueOutOfRange,  // decode: a reconstructed value left the element's range
+    kBadBasinTable,    // §P1 table: wrong version/row size, bad count, bad row
 };
 
 // Stable short name, for logs. Never null.
@@ -323,6 +429,7 @@ public:
     int32_t tileX() const { return h_.x; }
     int32_t tileY() const { return h_.y; }
     uint32_t size() const { return h_.size; }
+    uint32_t blockLog2() const { return h_.blockLog2; }
     uint32_t blockDim() const { return 1u << h_.blockLog2; }
     uint32_t blocksPerAxis() const { return static_cast<uint32_t>(h_.size) >> h_.blockLog2; }
     uint32_t blockPixelCount() const { return blockDim() * blockDim(); }
@@ -330,9 +437,22 @@ public:
     int32_t quantMm() const { return fineQuantMm(h_.quant); }
     int32_t baseOffsetMm() const { return h_.baseOffsetMm; }
     bool hasFlow() const { return (h_.flags & kFineFlagFlowPresent) != 0; }
+    // True when the tile carries a basin table AT ALL. An empty table with
+    // this true means "no basins here"; this false means "baked before the
+    // registry existed", and the two must not be conflated.
+    bool hasBasins() const { return (h_.flags & kFineFlagBasinsPresent) != 0; }
+    // True when the tile carries a water plane AT ALL. Same distinction as
+    // hasBasins(): an all-dry plane with this true means "no rivers here",
+    // this false means "baked before the water plane existed".
+    bool hasWater() const { return (h_.flags & kFineFlagWaterPresent) != 0; }
+    // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
+    // `basins()[i].basinId == i` and a row means the same basin in every
+    // process. Empty when hasBasins() is false.
+    const std::vector<BasinEntry>& basins() const { return basins_; }
 
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
+    const std::vector<FineBlockEntry>& waterIndex() const { return waterIndex_; }
 
     uint8_t codec() const { return h_.codec; }
     // The decompressor this tile was parsed with. Empty for a CODEC_RAW tile.
@@ -360,6 +480,40 @@ public:
     // when the tile carries no flow plane.
     bool decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out,
                          FineError* err = nullptr) const;
+    // Same for the optional water plane (int16 cp per fine pixel, P2). False
+    // when the tile carries no water plane. Values are raw control points:
+    // compare against `kWaterDryDepth` first, then convert with
+    // `waterMmFromDepth`.
+    bool decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                          FineError* err = nullptr) const;
+
+    // Water-surface elevation from a water control point, or `kNoWaterMm` for
+    // the dry sentinel. The sentinel test lives HERE rather than at each call
+    // site precisely so it cannot be forgotten at one of them.
+    // Water surface from a stored DEPTH and the ground control point under it.
+    // The two must come from the same pixel; see the header note on
+    // kSectionWaterData for why depth is stored rather than an absolute
+    // surface, and why the ground here must be the TILE LATTICE's rather than
+    // an amplified surface.
+    // `groundMm` is the RECONSTRUCTED SURFACE at this pixel -- the spline
+    // evaluated on the control lattice, which is what Amplifier produces from
+    // an ITileSampler -- in absolute millimetres.
+    //
+    // NOT `elevationMmFromCp(cp)`. A control point is not the surface: the
+    // prefilter stands it up to 5.6 m away from the sample it interpolates
+    // (measured on this world; p99 of |cp - sample| = 4.4 m). Adding a depth to
+    // the lattice instead of to the spline is the mistake this signature exists
+    // to make impossible, and it produced a visibly non-monotone reach the
+    // first time it was written.
+    //
+    // Nor the AMPLIFIED surface: the amplifier's rills and bedding sit on top
+    // of the bake, and water added to them would ripple by metres on a surface
+    // that is flat by definition.
+    static int32_t waterMmFromDepth(int16_t depthCp, int32_t groundMm) {
+        if (depthCp < 0) return kNoWaterMm;
+        return static_cast<int32_t>(static_cast<int64_t>(groundMm) +
+                                    static_cast<int64_t>(depthCp) * kWaterDepthLsbMm);
+    }
 
     // Single control point, tile-LOCAL pixel coords. Decodes the containing
     // block on every call, so it is for tests and cold paths; anything hot
@@ -370,9 +524,11 @@ private:
     std::vector<uint8_t> bytes_;
     FineTileHeader h_;
     FineDecompressor dec_{};
-    std::vector<FineBlockEntry> elevIndex_, flowIndex_;
+    std::vector<FineBlockEntry> elevIndex_, flowIndex_, waterIndex_;
+    std::vector<BasinEntry> basins_;
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
+    uint64_t waterDataOff_ = 0, waterDataLen_ = 0;
 };
 
 // Grid of v2 fine tiles for one seed, addressed in FINE tile-pixel coordinates
@@ -490,6 +646,73 @@ private:
     FineDecompressor dec_{};
     std::unordered_map<uint64_t, Resident> tiles_;
 };
+
+// THE RECONSTRUCTED BAKE SURFACE at one fine pixel, in absolute millimetres --
+// `spline(cp)`, and the only thing `FineTile::waterMmFromDepth` will accept as
+// its `groundMm`.
+//
+// WHY THIS FUNCTION EXISTS AT ALL. There are three different "grounds" in this
+// codebase and the water plane is only correct against the middle one:
+//
+//   1. the CONTROL LATTICE       `elevationMmFromCp(cp)` / `elevationMm(px,py)`
+//      A prefiltered B-spline control point. NOT a surface: the prefilter
+//      stands it up to 5.6 m from the sample it interpolates.
+//   2. the RECONSTRUCTED SURFACE  <-- THIS. `evalCarrier` on that lattice, which
+//      is what the prefilter exists to reproduce, and what the bake subtracted:
+//      `depth = water_true - sample` (terrain_service/tile_codec.py
+//      `water_depth_control_points`). The client adds it back here.
+//   3. the AMPLIFIED SURFACE      `Amplifier::columnCached().surfaceMm`,
+//      `UVoxelWorldSubsystem::GetSurfaceHeightUU`. The reconstruction PLUS the
+//      rill, bedding and octave detail worldgen lays on top, plus the v16
+//      horizontal warp. The bake never saw any of it.
+//
+// Adding a depth to (1) puts the water hundreds of millimetres off its bed and
+// produced a visibly non-monotone reach the first time it was written. Adding a
+// depth to (3) makes a surface that is FLAT BY DEFINITION inherit every rill
+// the amplifier draws -- metres of ripple on a river. Both mistakes have been
+// made on this codebase already; this function is what a caller reaches for
+// instead of choosing.
+//
+// EVALUATED AT THE PIXEL, fx = fy = 0, because that is where the bake's depth
+// was taken: `water_depth_control_points` differences two per-pixel rasters, so
+// the datum is piecewise constant over a pixel -- which is also the physically
+// right answer, a water surface being flat across a 1.875 m cell rather than
+// draped on the sub-pixel bed.
+//
+// NO WARP, and that is the same call the bench carrier arms make
+// (bench/stagedump.cpp, bench/bankprobe.cpp): the v16 horizontal warp is a
+// worldgen term, so it belongs with the octaves on the amplified side.
+//
+// This is not a second implementation of the spline -- it calls carrier.h's
+// production `evalCarrier` on the tier's own stencil, exactly as
+// `Amplifier::evalSurface` does. There is still only one spline, so there is
+// still nothing that can drift.
+inline int32_t reconstructedGroundMm(ITileSampler& tiles, int64_t px, int64_t py) {
+    const int64_t pxMm = tiles.pixelSizeMm();
+    int64_t cp[16];
+    if (carrierPrefiltersSamples(pxMm)) {
+        // The 30 m tier ships SAMPLES, so the stencil has to be prefiltered
+        // before it is a control lattice. The fine tier does not (carrier.h
+        // static_asserts !carrierPrefiltersSamples(1875)), but branching here
+        // rather than assuming keeps this usable from a coarse-tier caller.
+        constexpr int64_t S = kCarrierPrefilterSpan;
+        int64_t raw[S * S];
+        for (int64_t b = 0; b < S; ++b) {
+            for (int64_t a = 0; a < S; ++a) {
+                raw[a + S * b] = tiles.elevationMm(px + kCarrierPrefilterLo + a,
+                                                   py + kCarrierPrefilterLo + b);
+            }
+        }
+        carrierPrefilterStencil(raw, cp);
+    } else {
+        for (int j = 0; j < 4; ++j) {
+            for (int i = 0; i < 4; ++i) {
+                cp[i + 4 * j] = tiles.elevationMm(px - 1 + i, py - 1 + j);
+            }
+        }
+    }
+    return static_cast<int32_t>(evalCarrier(cp, 0, 0, pxMm).heightMm);
+}
 
 // Reads a whole file into memory. Returns nullopt on any I/O failure.
 std::optional<std::vector<uint8_t>> readFileBytes(const std::filesystem::path& path);

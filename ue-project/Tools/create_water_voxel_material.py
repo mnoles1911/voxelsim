@@ -55,6 +55,16 @@ so each fragment computes its own thickness identically however the stack is
 composed. A scene-colour read is not, because the value it reads IS the
 partially composed stack.
 
+W6 STILL WATER (this update): gives the surface a Fresnel-weighted sky
+reflection and an analytic sun glint, both independent of the foam channel, and
+folds the same Fresnel into opacity. See "W6: THE STILL-WATER SURFACE" below for
+the measurement that motivated it and for the correction it carries -- in short,
+a settled basin was never invisible, it was a flat tinted film with no
+view-dependent term, and the claim that vertex colour A was "what makes water
+visible" does not survive reading this graph. Foam remains a lerp layered on
+top and is unchanged; the only authored constant moved is shallow opacity,
+0.55 -> 0.35.
+
 W3 "Rendering v0" MATERIAL MOTION (this update): makes the surface look like it
 is moving, material graph only, still without touching colour/opacity/refraction
 -- the sort-key doc is explicit that vertex movement and lighting-only normal
@@ -208,7 +218,17 @@ def main():
     # exponentials, and the two-colour lerp below already puts the red loss in
     # the right place by construction.
     absorb_rate = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -960, -560)
-    absorb_rate.set_editor_property("r", -1.0 / 250.0)
+    #
+    # W7: D = 250 -> 160 UU (2.5 m -> 1.6 m). The owner's phrasing is about
+    # voxels STACKING: "as water voxels stack on top of one another there should
+    # be a depth effect". A voxel is 10 cm, so the interesting range is the first
+    # few tens of centimetres to a couple of metres, and at D = 250 that whole
+    # band sat in the flattest part of the curve -- 30 cm of water reached only
+    # depth01 0.11, so a pool several voxels deep looked the same as one voxel.
+    # At D = 160: 30 cm -> 0.17, 1 m -> 0.46, 2 m -> 0.71, 5 m -> 0.96. The cue
+    # now moves where the player actually sees it accumulate, and deep basins
+    # still saturate (10 m -> 0.998).
+    absorb_rate.set_editor_property("r", -1.0 / 160.0)
     absorb_exponent = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, -650)
     if not mel.connect_material_expressions(thickness, "", absorb_exponent, "A"):
         raise RuntimeError("connect thickness -> absorb_exponent.A failed")
@@ -252,14 +272,20 @@ def main():
     # lerps resolve to their shallow ends, which are the old constants. Depth
     # can only ever ADD darkness from there. There is no input for which this
     # is brighter than the shipped water.
-    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.05, 0.25, 0.55, 1.0))
+    # W7: "more blue colour". Blue is lifted and red pulled down at BOTH ends,
+    # which raises saturation without raising luminance -- the shallow end is
+    # no brighter than the shipped colour, it is bluer.
+    shallow_tint.set_editor_property("constant", unreal.LinearColor(0.035, 0.26, 0.68, 1.0))
     deep_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -500, -400)
     # Deep end: the same hue, darkened and desaturated toward the absorption
     # the real effect is modelling. Deliberately NOT the authored
     # (0.012, 0.055, 0.16), which is nearly black -- a 2.5 m pond hitting that
     # would read as a hole in the ground. This is roughly a third of the
     # shallow value, so a deep body darkens visibly without going to ink.
-    deep_tint.set_editor_property("constant", unreal.LinearColor(0.018, 0.085, 0.20, 1.0))
+    # W7: the owner asked for DARK BLUE at depth, not near-black. Red and green
+    # come down, blue holds -- so the deep end reads unmistakably blue while
+    # getting darker, instead of desaturating toward ink as it deepens.
+    deep_tint.set_editor_property("constant", unreal.LinearColor(0.008, 0.055, 0.24, 1.0))
 
     water_tint = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -450)
     if not mel.connect_material_expressions(shallow_tint, "", water_tint, "A"):
@@ -275,14 +301,43 @@ def main():
     # at any tint. 0.18 -> 0.86 brackets the old 0.55 so a mid-depth body sits
     # close to where this material has always sat.
     shallow_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -330)
-    # Shallow opacity IS the shipped 0.55, for the same reason as the tint:
-    # thin water must be pixel-identical to what shipped.
-    shallow_opacity.set_editor_property("r", 0.55)
+    # W6: shallow opacity drops 0.55 -> 0.35. This is the ONE authored constant
+    # this change moves, and it is moved deliberately rather than as a re-tune.
+    #
+    # The owner's brief for still water is "shallow shoreline reads lighter than
+    # the middle". The 0.55 -> 0.72 bracket does express that, but only over a
+    # 0.17 range, and W6's measurement of a real lake found depth01 ~= 0.55 over
+    # most of a basin -- so nearly the whole surface sat within a few hundredths
+    # of one opacity and the shoreline gradient was, in practice, not there.
+    # 0.35 -> 0.72 doubles the range the term has to work with.
+    #
+    # THIS DOES NOT REPEAT THE "washed to near-WHITE" INCIDENT recorded above.
+    # That failure was the surface getting BRIGHTER; this makes thin water more
+    # TRANSPARENT, so a shoreline reads lighter only because more of the lit bed
+    # shows through it. Deep water is untouched at 0.72, which is where the
+    # near-white regression was actually judged.
+    #
+    # W7, FROM THE OWNER JUDGING W6 IN GAME: "make the water voxels less
+    # transparent, more blue colour, and as water voxels stack on top of one
+    # another there should be a depth effect -- shallow pools more easily seen
+    # through, deeper water dark blue and non-transparent."
+    #
+    # So the RANGE W6 opened up is kept and its ends are pushed apart further,
+    # rather than sliding the whole thing opaque: shallow stays see-through on
+    # purpose (0.35 -> 0.42, still the most transparent this material has been
+    # below the old 0.55), and the deep end goes to genuinely opaque.
+    shallow_opacity.set_editor_property("r", 0.42)
     deep_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -500, -270)
-    # Deep opacity rises, but nowhere near the authored 0.86. 0.72 keeps a
-    # deep body readable as WATER rather than as a painted surface -- you can
-    # still make out the bed through it, which is most of what sells depth.
-    deep_opacity.set_editor_property("r", 0.72)
+    # W7: 0.72 -> 0.98. The owner asked for deep water to be NON-TRANSPARENT.
+    # Not 1.0: a hair of transmission keeps the deep tint from flattening into
+    # a painted decal at grazing angles, and the Fresnel term below still adds
+    # to this, so 0.98 already composites as opaque looking down into a basin.
+    #
+    # This is the opposite direction from the near-WHITE regression, which was
+    # the surface getting brighter and lower-contrast. Deep water here gets
+    # darker, bluer and more opaque; shallow water is the only thing that stays
+    # readable through, which is exactly the depth cue being asked for.
+    deep_opacity.set_editor_property("r", 0.98)
     depth_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -320, -300)
     if not mel.connect_material_expressions(shallow_opacity, "", depth_opacity, "A"):
         raise RuntimeError("connect shallow_opacity -> depth_opacity.A failed")
@@ -417,14 +472,236 @@ def main():
     if not mel.connect_material_property(ao_multiply, "", unreal.MaterialProperty.MP_BASE_COLOR):
         raise RuntimeError("connect ao_multiply -> BaseColor failed")
 
+    # --- W6: THE STILL-WATER SURFACE ---------------------------------------
+    #
+    # WHAT THIS FIXES, stated against a measurement rather than an impression.
+    # The W5 material gives still water a colour and an opacity but no SURFACE:
+    # nothing in the graph above depends on where the viewer is standing, so a
+    # settled basin composites as a flat tinted film and reads as haze over the
+    # ground rather than as water. Measured at the tile (-12,-5) lake, camera
+    # 2.4 m over the 365.1 m datum, against a no-water control frame at the same
+    # pose: the shipped still surface moves the frame from mean RGB
+    # (215.6, 207.0, 196.2) to (155.6, 152.5, 149.6), 99.99% of pixels differing
+    # by more than 25. It was never invisible. It was a grey wash.
+    #
+    # THE CORRECTION THIS CARRIES. An earlier reading of the same lake concluded
+    # that vertex colour A -- the foam activity -- was "what makes water visible"
+    # and that a still surface therefore drew nothing. That is not what the graph
+    # does: foam is a LERP on top of an already-complete colour and opacity (see
+    # `tinted` and `opacity`), and with foam at 0 the opacity output is still
+    # 0.55..0.72. The A/B that produced the claim compared Activity 0 against
+    # Activity 1 and never took a no-water control, so "different from the foamed
+    # frame" was read as "absent". Against the control it is the ACTIVITY-0 frame
+    # that differs more (mean 60.0 vs 21.9). Nothing here rides the foam channel,
+    # and nothing needed to.
+    #
+    # WHAT A SURFACE NEEDS THAT A FILM DOES NOT HAVE: a view-dependent term.
+    # Fresnel is the whole of it -- water is nearly transparent looking straight
+    # down and nearly a mirror at a grazing angle, and that single fact is what
+    # the eye reads as "liquid surface" before any wave or glint registers.
+    #
+    # SORT-KEY POSITION, because the module docstring makes this the standing
+    # question for any addition here. This reads NO scene colour, so the ban that
+    # rules out refraction is not engaged. It does add a view-dependent term to
+    # colour and opacity, which the depth tint already did -- but note it is
+    # strictly weaker than the depth tint on this axis: two overlapping water
+    # fragments at the same pixel share a view ray and a normal, so Fresnel gives
+    # them the SAME value, where SceneDepth deliberately gives them different
+    # ones. It introduces no ordering sensitivity the buckets do not already
+    # carry.
+    sky_collection = unreal.load_object(None, "/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky")
+    if sky_collection is None:
+        raise RuntimeError("MPC_VoxelSky not found -- the sun glint needs SunDirection")
+
+    # SunDirection is written every frame by VoxelSkySubsystem (ApplySkyMaterial
+    # parameters). Reusing it rather than a constant is what keeps the glint on
+    # the actual sun: the water tracks sunrise and sunset for free, and a frozen
+    # -TimeScale 0 capture gets the sun the rest of the frame was lit by.
+    sun_dir_param = mel.create_material_expression(
+        material, unreal.MaterialExpressionCollectionParameter, -1300, 1300)
+    sun_dir_param.set_editor_property("collection", sky_collection)
+    sun_dir_param.set_editor_property("parameter_name", "SunDirection")
+
+    sun_dir3 = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1300)
+    sun_dir3.set_editor_property("r", True)
+    sun_dir3.set_editor_property("g", True)
+    sun_dir3.set_editor_property("b", True)
+    sun_dir3.set_editor_property("a", False)
+    if not mel.connect_material_expressions(sun_dir_param, "", sun_dir3, ""):
+        raise RuntimeError("connect sun_dir_param -> sun_dir3 failed")
+
+    # SUN GLINT, computed analytically instead of left to the engine's specular.
+    # The material already sets Specular 0.5 / Roughness 0.08 and that survives
+    # unchanged, but a translucent surface's specular response is the part of
+    # translucent lighting that is least reliable to author against -- the W3
+    # note above records the same lesson from the other side, where the
+    # volumetric lighting mode ignored the material normal outright. reflect(V)
+    # dot SunDirection is not subject to any of that: it is the mirror direction
+    # against this material's own rippled normal, so the glint lands exactly
+    # where the wave that produced it is.
+    refl_vec = mel.create_material_expression(material, unreal.MaterialExpressionReflectionVectorWS, -1120, 1450)
+
+    glint_dot = mel.create_material_expression(material, unreal.MaterialExpressionDotProduct, -950, 1380)
+    if not mel.connect_material_expressions(refl_vec, "", glint_dot, "A"):
+        raise RuntimeError("connect refl_vec -> glint_dot.A failed")
+    if not mel.connect_material_expressions(sun_dir3, "", glint_dot, "B"):
+        raise RuntimeError("connect sun_dir3 -> glint_dot.B failed")
+
+    glint_sat = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -800, 1380)
+    if not mel.connect_material_expressions(glint_dot, "", glint_sat, ""):
+        raise RuntimeError("connect glint_dot -> glint_sat failed")
+
+    # Exponent 900: a TIGHT lobe on purpose. The sun subtends about half a degree
+    # and a calm lake returns it as a small hard highlight; a loose lobe here is
+    # the classic way this reads as wet plastic over the whole basin instead of
+    # as one glint. This is also the term most able to re-create the near-white
+    # failure the depth-tint comment records, and keeping it narrow is what
+    # bounds the area it can affect at all.
+    # Carried on the node's own ConstExponent rather than a wired Constant: the
+    # Exponent pin is named "Exp", and a Constant wired into it would be one more
+    # node for a value that never varies. Not a style preference -- the checked
+    # connect above this is what caught the wrong pin name, and the fix that
+    # removes the pin removes the class of mistake with it.
+    glint_pow = mel.create_material_expression(material, unreal.MaterialExpressionPower, -650, 1400)
+    glint_pow.set_editor_property("const_exponent", 900.0)
+    if not mel.connect_material_expressions(glint_sat, "", glint_pow, "Base"):
+        raise RuntimeError("connect glint_sat -> glint_pow.Base failed")
+
+    # Slightly over 1 and slightly warm: a specular sun return is brighter than
+    # the sky it sits in, and clamping it to 1 is what makes a highlight read as
+    # a painted white dot rather than as light.
+    glint_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -650, 1520)
+    glint_tint.set_editor_property("constant", unreal.LinearColor(2.6, 2.45, 2.15, 1.0))
+    glint = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1440)
+    if not mel.connect_material_expressions(glint_pow, "", glint, "A"):
+        raise RuntimeError("connect glint_pow -> glint.A failed")
+    if not mel.connect_material_expressions(glint_tint, "", glint, "B"):
+        raise RuntimeError("connect glint_tint -> glint.B failed")
+
+    # SKY REFLECTION. A constant sky colour gated by sun altitude, NOT a scene
+    # capture and NOT a reflection probe: the ban in the module docstring is on
+    # reading scene COLOUR, and a probe read is the same hazard wearing a
+    # different name. SunDirection.z is the sine of the sun's altitude, so
+    # saturate() of it is 0 from dusk to dawn and the lake stops reflecting a
+    # blue sky it cannot see -- the one piece of time-of-day behaviour this term
+    # genuinely needs, and it costs one node.
+    sun_alt = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1600)
+    sun_alt.set_editor_property("r", False)
+    sun_alt.set_editor_property("g", False)
+    sun_alt.set_editor_property("b", True)
+    sun_alt.set_editor_property("a", False)
+    if not mel.connect_material_expressions(sun_dir_param, "", sun_alt, ""):
+        raise RuntimeError("connect sun_dir_param -> sun_alt failed")
+
+    day_gate = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -950, 1600)
+    if not mel.connect_material_expressions(sun_alt, "", day_gate, ""):
+        raise RuntimeError("connect sun_alt -> day_gate failed")
+
+    # KNOWN LIMITATION, stated rather than left to be discovered, and the exact
+    # counterpart of the SceneDepth-against-sky note in the depth section above.
+    # saturate(SunDirection.z) is "is the sun up", which is not the same question
+    # as "can THIS surface see the sky". A static cavern pool a hundred metres
+    # underground at noon therefore still gets a sky-blue reflection at grazing
+    # angles, from a sky it has no line of sight to. It is Fresnel-weighted, so
+    # looking down into the pool -- how a cavern pool is normally met -- it is
+    # near zero, and it is the same magnitude a surface lake gets. Fixing it
+    # properly needs a sky-visibility signal that does not exist on this vertex
+    # format: VertexColor.G is the greedy mesher's local AO, which is ~1 in the
+    # middle of any chamber large enough to hold a pool and so cannot express it.
+    # NOT VERIFIED IN A CAPTURE: -VoxelFloodTest found no flooded cavern at the
+    # lake site, and the default cavern site's fine tiles are absent from this
+    # box's cache (tile (-6,3) at s16, absentOnDisk=1). Downgrading the fine-tier
+    # gate to get a frame would have made that frame unreproducible, which is the
+    # one thing the gate exists to prevent.
+    sky_tint = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -950, 1700)
+    sky_tint.set_editor_property("constant", unreal.LinearColor(0.30, 0.46, 0.72, 1.0))
+    sky_lit = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, 1650)
+    if not mel.connect_material_expressions(sky_tint, "", sky_lit, "A"):
+        raise RuntimeError("connect sky_tint -> sky_lit.A failed")
+    if not mel.connect_material_expressions(day_gate, "", sky_lit, "B"):
+        raise RuntimeError("connect day_gate -> sky_lit.B failed")
+
+    # Fresnel with water's real normal-incidence reflectance, 0.02. The Normal
+    # input is deliberately LEFT UNCONNECTED so the node uses this material's own
+    # shading normal -- which is the panning ripple authored in the W3 section
+    # below. Connecting `normal_xyz` here instead would be a bug that compiles:
+    # that value is TANGENT space and this pin wants world space.
+    fresnel = mel.create_material_expression(material, unreal.MaterialExpressionFresnel, -650, 1650)
+    fresnel.set_editor_property("exponent", 5.0)
+    fresnel.set_editor_property("base_reflect_fraction", 0.02)
+
+    reflection = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1650)
+    if not mel.connect_material_expressions(sky_lit, "", reflection, "A"):
+        raise RuntimeError("connect sky_lit -> reflection.A failed")
+    if not mel.connect_material_expressions(fresnel, "", reflection, "B"):
+        raise RuntimeError("connect fresnel -> reflection.B failed")
+
+    surface_light = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -340, 1540)
+    if not mel.connect_material_expressions(reflection, "", surface_light, "A"):
+        raise RuntimeError("connect reflection -> surface_light.A failed")
+    if not mel.connect_material_expressions(glint, "", surface_light, "B"):
+        raise RuntimeError("connect glint -> surface_light.B failed")
+
+    # FOAM IS ADDITIVE ON TOP OF THIS, and this is the pin that makes that true
+    # in the direction that matters. Froth is a scattering medium: it is the one
+    # part of a water surface that does NOT mirror the sky, and letting the
+    # reflection survive underneath it would put a sky sheen on whitewater. The
+    # existing foam lerps on colour, opacity and roughness are unchanged and
+    # still run after this, so foam continues to win where it is present and
+    # contributes nothing at all where it is zero -- which is every still lake
+    # and every static cavern pool.
+    one_minus_foam = mel.create_material_expression(material, unreal.MaterialExpressionOneMinus, -340, 1660)
+    if not mel.connect_material_expressions(foam, "", one_minus_foam, ""):
+        raise RuntimeError("connect foam -> one_minus_foam failed")
+
+    surface_unfoamed = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -190, 1600)
+    if not mel.connect_material_expressions(surface_light, "", surface_unfoamed, "A"):
+        raise RuntimeError("connect surface_light -> surface_unfoamed.A failed")
+    if not mel.connect_material_expressions(one_minus_foam, "", surface_unfoamed, "B"):
+        raise RuntimeError("connect one_minus_foam -> surface_unfoamed.B failed")
+
+    # Masked to top faces by the SAME top_face_mask the foam uses, for the same
+    # reason given there: a submerged side wall is not a sky-facing surface and
+    # must not reflect one. This is a normal test, not VertexColor.B -- see the
+    # foam section for why B would ring every body with a stripe.
+    surface_emissive = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -40, 1600)
+    if not mel.connect_material_expressions(surface_unfoamed, "", surface_emissive, "A"):
+        raise RuntimeError("connect surface_unfoamed -> surface_emissive.A failed")
+    if not mel.connect_material_expressions(top_face_mask, "", surface_emissive, "B"):
+        raise RuntimeError("connect top_face_mask -> surface_emissive.B failed")
+
+    # EMISSIVE, not BaseColor. A reflection is light leaving the surface, not
+    # albedo: routing it through BaseColor would make it get multiplied by AO and
+    # by the diffuse lighting term, so a reflected sky would darken in an
+    # occluded corner, which is backwards.
+    if not mel.connect_material_property(surface_emissive, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+        raise RuntimeError("connect surface_emissive -> EmissiveColor failed")
+
     # Foam is nearly opaque: whitewater is a scattering medium, not a tinted
     # one, and leaving it at the depth-derived opacity would make a breaking
     # front read as pale glass over the rocks rather than as froth.
     foam_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -250)
     foam_opacity.set_editor_property("r", 0.95)
+
+    # Opacity gets the same Fresnel before foam does anything to it: looking
+    # straight down you see the bed (the "clear" half of the brief), and at a
+    # grazing angle the surface closes up into a reflective sheet (the
+    # "reflective" half). One node makes both true, and it is the same node the
+    # sky reflection is weighted by, so the surface never reflects light it is
+    # too transparent to be reflecting.
+    sheen_opacity = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -190, -200)
+    sheen_opacity.set_editor_property("r", 1.0)
+    view_opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -110, -290)
+    if not mel.connect_material_expressions(depth_opacity, "", view_opacity, "A"):
+        raise RuntimeError("connect depth_opacity -> view_opacity.A failed")
+    if not mel.connect_material_expressions(sheen_opacity, "", view_opacity, "B"):
+        raise RuntimeError("connect sheen_opacity -> view_opacity.B failed")
+    if not mel.connect_material_expressions(fresnel, "", view_opacity, "Alpha"):
+        raise RuntimeError("connect fresnel -> view_opacity.Alpha failed")
+
     opacity = mel.create_material_expression(material, unreal.MaterialExpressionLinearInterpolate, -40, -290)
-    if not mel.connect_material_expressions(depth_opacity, "", opacity, "A"):
-        raise RuntimeError("connect depth_opacity -> opacity.A failed")
+    if not mel.connect_material_expressions(view_opacity, "", opacity, "A"):
+        raise RuntimeError("connect view_opacity -> opacity.A failed")
     if not mel.connect_material_expressions(foam_opacity, "", opacity, "B"):
         raise RuntimeError("connect foam_opacity -> opacity.B failed")
     if not mel.connect_material_expressions(foam, "", opacity, "Alpha"):

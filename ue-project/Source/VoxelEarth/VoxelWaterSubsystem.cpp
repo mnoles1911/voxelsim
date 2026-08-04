@@ -4,6 +4,8 @@
 #include "VoxelEarth.h"
 #include "VoxelEditRelay.h"
 #include "VoxelWaterChunkComponent.h"
+#include "VoxelFineTileStreamer.h"  // CoarseTileForWorldMm -- one addressing rule
+#include "VoxelTileCodec.h"         // GetFineTileDecompressor -- the CODEC_ZSTD boundary
 #include "VoxelWorldSubsystem.h"
 
 // ADR-0006 water pool (voxel.Water.GPU): a SECOND INSTANCE of the terrain
@@ -16,6 +18,7 @@
 #include "voxelcore/amplifier.h"
 #include "voxelcore/bytes.h"
 #include "voxelcore/caverns.h"
+#include "voxelcore/lakes.h"
 #include "voxelcore/mesher.h"
 // W4 shallow water (docs/adr/0004-swe-fixed-point-coupling.md). This include is
 // the first one anywhere in the repo: swe.h shipped complete, tested and
@@ -80,6 +83,33 @@ static TAutoConsoleVariable<bool> CVarVoxelWaterSolidCache(
 	TEXT("ADR-0003: enable WaterCA's cross-tick terrain-solidity memo (~2.8-3.0x hydrostatic pass speedup). ")
 	TEXT("Byte-identical for as long as every terrain edit invalidates it -- see docs/adr/0003-hydrostatic-persistent-body.md. ")
 	TEXT("Set to 0 to force the uncached path (e.g. if an edit path is ever suspected of a missed invalidation)."),
+	ECVF_Default);
+
+// THE OCEAN TERM (docs/watershed-system-plan.md work item 8, §6.4).
+//
+// DEFAULT ON, because it is the feature; the cvar exists to be the CONTROL.
+// Every visual judgement this repo has got wrong this month was a frame with
+// no control beside it, and "the same shot with the term off" is the only way
+// to tell an ocean artefact from a pre-existing one. Turning it off restores
+// the pre-item-8 implicit field EXACTLY (voxel-core's
+// `ocean_term_off_is_exactly_the_pre_item_8_field` asserts that half) -- but
+// NOT Reservoir v0, which this change retires and which off-ness does not
+// bring back. See tests/test_ocean.cpp for what it did and what it cost.
+//
+// READ ON THE GAME THREAD ONCE PER MOBILIZATION SWEEP, not inside the
+// ImplicitFn: the field must be a pure, deterministic function of position for
+// as long as any brick's mobilization state depends on it, and a cvar flipped
+// mid-tick would make the wall invariant a function of wall-clock time. It is
+// therefore latched into FVoxelWaterImpl::bImplicitOcean at construction and
+// re-read only in Tick, before the fixed-step loop -- the same discipline
+// MaybeArmSwe uses for voxel.Water.SWE and for the same reason.
+static TAutoConsoleVariable<bool> CVarVoxelWaterImplicitOcean(
+	TEXT("voxel.Water.ImplicitOcean"), true,
+	TEXT("Watershed §6.4: the sea as the third term of the water ImplicitFn -- open air below ")
+	TEXT("kSeaLevelMm in columns whose WORLDGEN ground is below it. Gives the ocean the same wall, ")
+	TEXT("budgeted mobilization, ledger, replication and persistence lakes already have, and makes a ")
+	TEXT("dug inland pit stay dry by testing the datum instead of the camera. 0 = the control: no ")
+	TEXT("implicit ocean at all (NOT the retired Reservoir v0, which does not come back)."),
 	ECVF_Default);
 
 namespace
@@ -158,6 +188,181 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 }
 } // namespace
 
+// Baked lakes with their own fine-tile source (watershed plan work item 4).
+//
+// WHY THIS OWNS A SECOND SAMPLER instead of borrowing the terrain's. The fine
+// tier is streamed by FVoxelFineTileStreamer, which lives inside
+// FVoxelWorldImpl -- a struct defined only in VoxelWorldSubsystem.cpp -- and
+// keeps its vxc::FineTileSampler private behind an FRWLock. Reaching it would
+// mean a public accessor on a subsystem this file already documents as
+// belonging to someone else, and the same reasoning that made this file build
+// its own Amplifier applies unchanged.
+//
+// THE DUPLICATION IS CHEAPER THAN IT LOOKS, which is what makes it acceptable
+// rather than merely convenient. vxc::FineTileSampler decodes lazily, ONE
+// 256x256 block at a time, and a LakeSampler only ever reads the blocks
+// covering a basin's bbox -- the survey's median basin is 0.59 ha, about 1,700
+// fine pixels. So this holds the tile headers and the handful of blocks the
+// lakes near the player actually occupy, not the 201 MB lattice.
+//
+// The path layout is NOT restated here: vxc::formatFineTileCacheKey is the
+// same function FVoxelFineTileStreamer::LocalPathFor uses, so the two cannot
+// drift, and CoarseTileForWorldMm is its addressing rule rather than a second
+// copy of the arithmetic.
+class FLakeWaterSampler final : public vxc::IWaterSampler
+{
+public:
+	FLakeWaterSampler(uint64 InSeed, FString InRoot, std::string InProviderId)
+		: Tiles(InSeed), Lakes(Tiles), Rivers(Tiles), Both(Lakes, Rivers),
+		  Root(MoveTemp(InRoot)), ProviderId(MoveTemp(InProviderId))
+	{
+		Tiles.setDecompressor(VoxelEarth::GetFineTileDecompressor());
+	}
+
+	// LAKES AND RIVERS AS ONE QUERY (watershed plan §5.1). Both samplers read
+	// the SAME `Tiles`, so one EnsureTileFor covers both and there is no state
+	// in which the lake half and the river half disagree about which tiles are
+	// resident -- which is the failure the sheet half was already careful about.
+	//
+	// The composition is vxc::CompositeWaterSampler rather than a max() written
+	// here, for the reason implicitWaterFill is in lakes.h rather than inline:
+	// the binding site and the tests must not be able to express the rule
+	// differently. It takes the HIGHER datum where they overlap; they should
+	// not overlap at all (the bake writes the plane dry inside registered
+	// basins) but taking the lower would drain a lake into the river feeding it.
+	int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override
+	{
+		EnsureTileFor(vx, vy);
+		return Both.waterSurfaceMmAtVoxel(vx, vy);
+	}
+
+	// Work item 5's sheet half. Same load-then-ask shape as the column query
+	// above, so a sheet and a voxel disc over the same lake can never be reading
+	// two different tile sets.
+	const std::vector<vxc::BasinEntry>* basinsForTile(int32_t tx, int32_t ty) override
+	{
+		EnsureTile(tx, ty);
+		return Lakes.basinsForTile(tx, ty);
+	}
+	const std::vector<uint8_t>* extentMaskFor(int32_t tx, int32_t ty, uint16_t id) override
+	{
+		EnsureTile(tx, ty);
+		return Lakes.extentMaskFor(tx, ty, id);
+	}
+	uint32_t tilePixels() const override { return Tiles.tileSize(); }
+	int32_t pixelSizeMm() const override { return Tiles.pixelSizeMm(); }
+
+	uint64 TilesLoaded() const { return Loaded; }
+	uint64 TilesMissing() const { return Missing.Num(); }
+	uint64 TilesRefused() const { return Refused; }
+	size_t ResidentMasks() const { return Lakes.residentMaskCount(); }
+	size_t ResidentWaterBlocks() const { return Rivers.residentBlockCount(); }
+	// Non-zero means a river's bytes were there and did not decode, which on
+	// screen is indistinguishable from "there is no river here". Surfaced so it
+	// can be logged rather than inferred from an empty valley.
+	uint64 RiverBlocksUnresolved() const { return Rivers.unresolvedBlocks(); }
+
+private:
+	// Loads the fine tile under this voxel column if it is not already
+	// resident. A tile that is absent or refused is remembered, so a world
+	// with no fine tier costs one stat() per tile for the whole session rather
+	// than one per query.
+	void EnsureTileFor(int64_t vx, int64_t vy)
+	{
+		const vxc::TileCoord T = FVoxelFineTileStreamer::CoarseTileForWorldMm(
+			vx * vxc::kVoxelSizeMm, vy * vxc::kVoxelSizeMm);
+		EnsureTile(T.x, T.y);
+	}
+
+	void EnsureTile(int32_t Tx, int32_t Ty)
+	{
+		const vxc::TileCoord T{Tx, Ty};
+		if (Tiles.findTile(T.x, T.y) != nullptr)
+		{
+			return;
+		}
+		const uint64 Key = (uint64(uint32(T.x)) << 32) | uint64(uint32(T.y));
+		if (Missing.Contains(Key))
+		{
+			return;
+		}
+		const std::string CacheKey = vxc::formatFineTileCacheKey(ProviderId, Tiles.seed(), T.x, T.y);
+		const FString Path = FPaths::Combine(Root, FString(CacheKey.c_str()) + TEXT(".vxtl"));
+		vxc::FineError Err = vxc::FineError::kNone;
+		if (!Tiles.loadTileFile(std::filesystem::path(*Path), &Err))
+		{
+			Missing.Add(Key);
+			// A tile that is simply not baked is expected and silent. Bytes
+			// that ARE there and do not parse are not: that is a corrupt or
+			// foreign-version tile, and silently treating it as "no lake here"
+			// is how a world loses its water without anyone noticing.
+			if (Err != vxc::FineError::kFileUnreadable)
+			{
+				++Refused;
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Lake tier: fine tile (%d,%d) at %s was REFUSED (%s). Its lakes will be absent."),
+				       T.x, T.y, *Path, ANSI_TO_TCHAR(vxc::fineErrorName(Err)));
+			}
+			return;
+		}
+		++Loaded;
+	}
+
+	// DECLARATION ORDER IS LOAD-BEARING: Lakes and Rivers borrow Tiles, and
+	// Both borrows Lakes and Rivers. Reordering these members reorders their
+	// construction and binds a reference to an object that does not exist yet.
+	vxc::FineTileSampler Tiles;
+	vxc::LakeSampler Lakes;
+	vxc::RiverSampler Rivers;
+	vxc::CompositeWaterSampler Both;
+	FString Root;
+	std::string ProviderId;
+	TSet<uint64> Missing;
+	uint64 Loaded = 0;
+	uint64 Refused = 0;
+};
+
+// Resolves -VoxelFineTileDir / -VoxelFineTileProviderId with the SAME
+// precedence UVoxelWorldSubsystem::Initialize uses (switch wins, then
+// DefaultFineTileDir in DefaultGame.ini, then nothing). Restated here rather
+// than shared because the alternative is a public accessor on another
+// subsystem; the rule is three lines and the ini keys are the same two
+// strings, and a divergence shows up immediately as "terrain is fine, water
+// says there are no lakes".
+std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
+{
+	FString Dir;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileDir="), Dir) && GConfig)
+	{
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileDir"), Dir, GGameIni);
+	}
+	if (Dir.IsEmpty())
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Lake tier DISABLED: no -VoxelFineTileDir. Baked lakes need the fine tier "
+		            "(the basin table lives in the .vxtl); caverns and the ocean are unaffected."));
+		return std::make_unique<vxc::NullWaterSampler>();
+	}
+	if (FPaths::IsRelative(Dir))
+	{
+		Dir = FPaths::Combine(FPaths::ProjectContentDir(), Dir);
+		FPaths::CollapseRelativeDirectories(Dir);
+	}
+	FString ProviderId;
+	if (!FParse::Value(FCommandLine::Get(), TEXT("VoxelFineTileProviderId="), ProviderId) && GConfig)
+	{
+		GConfig->GetString(TEXT("/Script/VoxelEarth.VoxelWorldSubsystem"),
+		                   TEXT("DefaultFineTileProviderId"), ProviderId, GGameIni);
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Baked water tier ENABLED: root=%s provider=%s seed=%llu. Lakes come from the basin "
+	            "table (bake_ver 8) and rivers from the water plane (bake_ver 9); a tile baked "
+	            "before either carries it not, and answers dry for that half alone."),
+	       *Dir, *ProviderId, (unsigned long long)Seed);
+	return std::make_unique<FLakeWaterSampler>(Seed, Dir, std::string(TCHAR_TO_UTF8(*ProviderId)));
+}
+
 // FVoxelWaterImpl -- the voxel-core side of the subsystem, defined only here
 // so VoxelWaterSubsystem.h (UHT-parsed) never sees a voxel-core header (same
 // pattern as FVoxelWorldImpl in VoxelWorldSubsystem.cpp).
@@ -167,6 +372,7 @@ struct FVoxelWaterImpl
 		: Terrain(InTerrain)
 		, Tiles(InTerrain.GetSeed())
 		, Amp(InTerrain.GetSeed(), Tiles)
+		, Water(MakeWaterSampler(InTerrain.GetSeed()))
 		, Mob(
 			  // The implicit static flood field (C7, docs/cavern-design.md SS5.1):
 			  // worldgen-owned, deterministic, ZERO storage. caverns.h's
@@ -174,8 +380,84 @@ struct FVoxelWaterImpl
 			  // the column's flood level" -- and WaterMobilizer applies the other
 			  // half (is the cell actually open air) itself, so this callback
 			  // stays a pure worldgen query.
+			  // BAKED LAKES JOIN HERE AND NOWHERE ELSE (watershed plan §5.1,
+			  // work item 4). A baked lake datum has the SAME SHAPE as the
+			  // cavern flood level this callback already answers -- "water
+			  // fills open air below this millimetre level in this column" --
+			  // so the whole lake feature is one more term in this expression
+			  // and NOT a second mechanism. Everything downstream is
+			  // inherited: unmobilized lake water is a wall, digging the shore
+			  // fires NotifyTerrainVoxelsCleared -> mobilizeEditRegion, fill
+			  // replicates as diffs, the ledger audits to zero, and
+			  // IsUnderwaterAtWorld (work item 1) starts answering for lakes
+			  // with no second predicate written anywhere.
+			  //
+			  // vxc::implicitWaterFill is the composition itself, in
+			  // voxelcore/lakes.h rather than inline here, so the binding site
+			  // and tests/test_lakes.cpp cannot express it differently. It is
+			  // also what adds the PARTIAL TOP FILL: the topmost water voxel
+			  // carries surfaceMm's sub-voxel remainder, so the surface sits
+			  // AT the datum instead of snapping to the 10 cm lattice.
+			  // ...AND THE OCEAN JOINS IN THE SAME PLACE (watershed plan §6.4,
+			  // work item 8). The sea is a lake whose datum is kSeaLevelMm and
+			  // whose extent is "every column whose worldgen ground lies below
+			  // it", so it is `vxc::implicitWaterDatumMm` composing with the
+			  // baked surface by max() and NOT a fourth branch here. What that
+			  // buys, all inherited and none of it written: unmobilized sea is
+			  // a wall to the CA, a breach funnels through the SAME
+			  // NotifyTerrainRegionEdited -> mobilizeEditRegion the lakes use,
+			  // the ledger audits to zero, and the retired Reservoir v0 --
+			  // which was a cell pinned at 255 forever, could not tell a dug
+			  // pit from the sea, and poured unbounded water into a seabed the
+			  // CA thought was dry air -- is gone. voxel-core's
+			  // tests/test_ocean.cpp measures all three.
+			  //
+			  // GroundMmAt IS THE WORLDGEN AMPLIFIED SURFACE, NOT THE EDITED
+			  // OVERLAY, and here that is not a nicety, it is the whole fix: a
+			  // pit a player digs into land does not lower its column's
+			  // worldgen ground, so the ocean term keeps answering "no sea
+			  // here" however deep the pit goes. Same rule, same reason, as
+			  // IsUnderwaterAtWorld's own seabed test (work item 1).
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
-			  { return vxc::cavernFloodedAt(Amp.columnCached(vx, vy).cavern, vz) ? uint8_t(255) : uint8_t(0); },
+			  {
+				  if (vxc::cavernFloodedAt(Amp.columnCached(vx, vy).cavern, vz))
+				  {
+					  return 255;
+				  }
+				  const int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
+				  // THE z GUARD IS A PERF GUARD AND IT IS LOAD-BEARING. This
+				  // callback is the CA's HOTTEST query -- makeSolidFn() runs it
+				  // for every genuinely-open-air cell the CA touches -- and
+				  // before the ocean term a dry column returned 0 here without
+				  // ever asking for the ground. GroundMmAt is not a cheap read:
+				  // it is an amplifier column AND, per its own comment, a
+				  // FVoxelFineTileStreamer::RequestFootprint on the game
+				  // thread. Asking for it unconditionally would have put one of
+				  // those on every dry column the CA looks at, which is most of
+				  // the world.
+				  //
+				  // The guard is exact, not a heuristic: the ocean's datum is
+				  // kSeaLevelMm, and waterFillUnits' remainder for a voxel
+				  // whose BOTTOM is at or above the datum is <= 0. So at or
+				  // above kSeaLevelVoxelZ the ocean term provably contributes
+				  // nothing and the old fast path is restored verbatim. Below
+				  // the datum a column query is unavoidable -- that is the
+				  // question being asked -- and the memo makes it one per
+				  // column rather than one per voxel.
+				  const bool bOceanPossible = bImplicitOcean && vz < vxc::kSeaLevelVoxelZ;
+				  if (BakedMm == vxc::kNoWaterMm && !bOceanPossible)
+				  {
+					  return 0;
+				  }
+				  const int32_t GroundMm = GroundMmAt(vx, vy);
+				  const int32_t SurfMm =
+					  bOceanPossible ? vxc::implicitWaterDatumMm(BakedMm, GroundMm) : BakedMm;
+				  if (SurfMm == vxc::kNoWaterMm)
+				  {
+					  return 0;
+				  }
+				  return vxc::implicitWaterFill(vz, GroundMm, SurfMm, false);
+			  },
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
 			  { return Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; })
 		// NOT the bare terrain query: makeSolidFn() layers the implicit-water
@@ -186,6 +468,59 @@ struct FVoxelWaterImpl
 	}
 
 	UVoxelWorldSubsystem& Terrain;
+
+	// THE GROUND UNDER A BAKED LAKE MUST COME FROM THE TERRAIN'S OWN AMPLIFIER,
+	// not from `Amp` below, and this is the one place in this file where that
+	// distinction is load-bearing rather than a documented caveat.
+	//
+	// `Amp` is built over a SyntheticTileSampler (see its comment): under
+	// -VoxelTileDir it is amplifying a DIFFERENT WORLD from the one on screen.
+	// For cavern flood levels that has been a known, tolerated inaccuracy. For
+	// a baked lake it is fatal: the datum comes from the BAKED surface, so
+	// bounding it below with the synthetic surface would put the water tens or
+	// hundreds of metres away from its own bed -- buried in rock, or a sheet
+	// hanging in the air -- and neither would look like a bug in the water
+	// code.
+	//
+	// UVoxelWorldSubsystem::GetSurfaceHeightUU is the terrain's own amplifier
+	// column, is documented as a pure query safe from the game thread, and is
+	// what AVoxelClipmapActor and the movement component already use for
+	// exactly this "where is the ground here" question. So the lake half uses
+	// it, and the cavern half is left on `Amp` unchanged -- fixing that is the
+	// column-accessor follow-up this file has been asking for and is not this
+	// change.
+	//
+	// MEMOISED PER COLUMN, and the memo is only worth anything because
+	// BuildWaterFillPad sweeps z INNERMOST. That was an assumption in this
+	// comment and a falsehood in the code until 2026-08-03 -- the pad was built
+	// z-outermost, so this memo, LakeSampler's and BOTH Amplifier::columnCached
+	// memos missed on every one of the 1,000 cells in a brick. See
+	// BuildWaterFillPad for the measurement. Do not reorder that loop nest
+	// without reading it.
+	//
+	// Note the miss is not merely an amplifier column: GetSurfaceHeightUU also
+	// fires FVoxelFineTileStreamer::RequestFootprint, so a missing memo puts a
+	// streaming request on the game thread per voxel rather than per column.
+	int32_t GroundMmAt(int64_t vx, int64_t vy)
+	{
+		if (bGroundMemoValid && vx == GroundMemoVx && vy == GroundMemoVy)
+		{
+			return GroundMemoMm;
+		}
+		const double UU = Terrain.GetSurfaceHeightUU(double(vx) * VoxelCoords::VoxelSizeUU,
+		                                             double(vy) * VoxelCoords::VoxelSizeUU);
+		// 1 UU = 10 mm (VoxelCoords.h: VoxelSizeUU 10 UU/voxel == kVoxelSizeMm
+		// 100 mm/voxel). Rounded, not truncated, so the bound does not bias a
+		// centimetre low and shave the bottom voxel off every lake.
+		GroundMemoMm = int32_t(FMath::RoundToDouble(UU * 10.0));
+		GroundMemoVx = vx;
+		GroundMemoVy = vy;
+		bGroundMemoValid = true;
+		return GroundMemoMm;
+	}
+	int64_t GroundMemoVx = 0, GroundMemoVy = 0;
+	int32_t GroundMemoMm = 0;
+	bool bGroundMemoValid = false;
 
 	// OUR OWN worldgen sampler, not UVoxelWorldSubsystem's. That subsystem is
 	// another agent's file and exposes no column/cavern accessor, so — exactly
@@ -201,6 +536,34 @@ struct FVoxelWaterImpl
 	// column accessor on UVoxelWorldSubsystem, which its owner must add.
 	vxc::SyntheticTileSampler Tiles;
 	vxc::Amplifier Amp;
+
+	// BAKED LAKES (watershed plan work item 4). An interface pointer, not a
+	// LakeSampler by value, because "no fine tier" is a SUPPORTED configuration
+	// and not a null check at every call: with no baked tiles this is a
+	// NullWaterSampler answering kNoWaterMm everywhere, and the client behaves
+	// exactly as it did before lakes existed.
+	//
+	// MakeWaterSampler below resolves -VoxelFineTileDir with the same precedence
+	// UVoxelWorldSubsystem uses, so a run that has fine terrain has lakes and a
+	// run that does not, does not -- there is no third state where the water and
+	// the ground disagree about which world this is.
+	//
+	// MUST be declared before Mob: the ImplicitFn captures `this` and
+	// dereferences this member on every voxel it is asked about.
+	std::unique_ptr<vxc::IWaterSampler> Water;
+
+	// voxel.Water.ImplicitOcean, LATCHED (watershed plan §6.4). Declared before
+	// Mob for the same reason Water is: the ImplicitFn reads it on every voxel
+	// it is asked about.
+	//
+	// LATCHED RATHER THAN READ LIVE, and that is not a micro-optimisation. The
+	// implicit field is what makes unmobilized water a WALL to the CA
+	// (waterca.h's ownership partition), and mobilization is a ONE-WAY
+	// surrender recorded in the savegame. A field that changed shape mid-tick
+	// would let the CA walk into cells the mobilizer still owns, which is the
+	// one thing the wall exists to forbid, and the symptom would be a ledger
+	// shortfall rather than a crash. Tick re-reads it on a step boundary.
+	bool bImplicitOcean = true;
 
 	// MUST be declared before CA: makeSolidFn() hands the CA a callable that
 	// captures the mobilizer, so the mobilizer has to outlive it.
@@ -224,11 +587,23 @@ struct FVoxelWaterImpl
 	// budget exactly like DirtyBricks.
 	TArray<VoxelCoords::FVoxelCoord> PendingImplicitBricks;
 
-	// Reservoir v0 (docs/voxel-earth-implementation-plan.md SS3.7): breach-
-	// boundary voxel coordinates that continuously top up to 255 fill units
-	// every fixed step -- see UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared
-	// for the seeding rule and UVoxelWaterSubsystem::StepFixed for the top-up.
-	TSet<VoxelCoords::FVoxelCoord> ReservoirCells;
+	// Drain accounting for the CURRENT implicit refresh -- see the block in
+	// RefreshImplicitWater that resets them. These answer "did the water disc
+	// finish building before this frame was judged", which nothing else in the
+	// engine or in tools/voxel-capture.ps1's settle check can answer.
+	uint64 ImplicitRefreshSerial = 0;
+	int32 ImplicitCandidatesAtRebuild = 0;
+	int32 ImplicitDrainTicks = 0;
+	double ImplicitDrainMs = 0.0;
+	int32 ImplicitBricksMeshed = 0;
+	int32 ImplicitBricksEmpty = 0;
+	int32 ImplicitBricksSkippedInterior = 0;
+	bool bImplicitDrainReported = false;
+
+	// Reservoir v0's breach-cell set stood here (watershed plan §6.4, work
+	// item 8). Retired with the mechanism -- StepFixed's block carries the
+	// measurements; FVoxelWaterPerfSnapshot::ReservoirCells is kept and
+	// reported as 0 so the HUD/log format does not change shape mid-milestone.
 
 	// Fixed 10Hz accumulator (task item 3).
 	float TickAccumSeconds = 0.f;
@@ -518,6 +893,22 @@ void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed);
 void MaybeArmSwe(FVoxelWaterImpl& Impl, UWorld* World);
 void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason);
 void MarkSweDepthChangesDirty(FVoxelWaterImpl& Impl);
+
+// voxel.Water.ImplicitOcean (watershed plan §6.4). Re-reads the cvar on a step
+// boundary and REFUSES the change, loudly, unless the world is in the one state
+// where flipping it is safe.
+//
+// WHY A REFUSAL AND NOT JUST A LATCH ASSIGNMENT. The implicit field is what
+// makes unmobilized water a wall (voxelcore/waterca.h's ownership partition),
+// and mobilization is a one-way surrender that is SAVED. Turning the ocean ON
+// under a CA that already holds water below the datum would make the implicit
+// field claim 255 units in cells the CA already owns; the next mobilization of
+// that brick credits them a second time and the ledger reports a shortfall --
+// a number nobody watches, in a system whose only alarm is that number.
+// Turning it OFF under a mobilized set does not corrupt anything but does
+// leave already-mobilized sea sitting there, so the "control" frame would not
+// be a control. Both cases are refused with a line that says which.
+void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl);
 } // namespace
 
 // UVoxelWaterSubsystem ------------------------------------------------------
@@ -1479,19 +1870,53 @@ struct FWaterFillPad
 // Fills a pad from any per-cell RAW fill source, exactly once per padded cell.
 // The two producers (the CA's WaterBrick8 + apron, and the mobilizer's implicit
 // flood field) differ only in this functor.
+//
+// Z IS THE INNERMOST LOOP, AND THAT IS THE WHOLE POINT OF THIS FUNCTION'S
+// SHAPE. It used to be the outermost, chosen so the writes were a straight
+// append into the Z-major layout below instead of a scattered store. That
+// traded a few hundred nanoseconds of store locality for a catastrophe,
+// because the implicit producer's functor is not a memory read -- it is a
+// worldgen query, and EVERY layer between here and worldgen memoises exactly
+// one column:
+//
+//   * vxc::Amplifier::columnCached  -- "valid until this thread's next
+//     columnCached call" (amplifier.h). Reached TWICE per cell, through two
+//     different Amplifier instances that do not share a memo: once via
+//     UVoxelWorldSubsystem::IsSolidAtVoxel -> World::materialAt ->
+//     Amplifier::materialAt(vx,vy,vz), and once via the ImplicitFn's own
+//     `Amp.columnCached(vx, vy).cavern`.
+//   * FVoxelWaterImpl::GroundMmAt   -- one entry, and it also fires
+//     FVoxelFineTileStreamer::RequestFootprint on every miss.
+//   * vxc::LakeSampler              -- one entry, on the fine PIXEL.
+//
+// A one-entry memo hits only when consecutive calls share (vx, vy). With Z
+// outermost, X changes on EVERY call, so all four memos missed on all 1,000
+// cells of every brick: three full amplifier columns and a streamer footprint
+// request per cell, ~1.4 us each, ~1.4 ms per brick. At the 192-brick tick
+// budget that is ~277 ms of game thread per tick and ~59 s to drain one
+// implicit refresh of a lake -- which is why a baked lake rendered as scattered
+// bricks rather than a sheet: the candidate list never came close to draining
+// before the shot, and any 0.8 m of camera movement restarted it.
+//
+// With Z innermost the same 1,000 cells touch 100 columns, each ten times in a
+// row, and every one of those memos does the job its own comment claims. The
+// scattered store through At() is the correct trade at three orders of
+// magnitude. Measured cost of one amplifier column: 0.469 us (vxc_bench,
+// brick 8, 640,000 columns in 300.1 ms).
+//
+// The CA producer is indifferent to the order -- it reads a resident brick --
+// so this is one loop nest for both rather than a second specialised one.
 template <typename FillFn>
 void BuildWaterFillPad(FWaterFillPad& OutPad, const FillFn& Fn)
 {
-	int32 Idx = 0;
-	for (int32 Z = -1; Z <= FWaterFillPad::kEdge; ++Z)
+	for (int32 Y = -1; Y <= FWaterFillPad::kEdge; ++Y)
 	{
-		for (int32 Y = -1; Y <= FWaterFillPad::kEdge; ++Y)
+		for (int32 X = -1; X <= FWaterFillPad::kEdge; ++X)
 		{
-			for (int32 X = -1; X <= FWaterFillPad::kEdge; ++X)
+			for (int32 Z = -1; Z <= FWaterFillPad::kEdge; ++Z)
 			{
-				// Same index order FWaterFillPad::At computes, so this is a
-				// straight append rather than a scattered write.
-				OutPad.Fill[Idx++] = Fn(X, Y, Z);
+				OutPad.Fill[(X + 1) + FWaterFillPad::kPad * ((Y + 1) + FWaterFillPad::kPad * (Z + 1))] =
+					Fn(X, Y, Z);
 			}
 		}
 	}
@@ -2331,6 +2756,9 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		Impl.LastImplicitCenterBrick = Center;
 		Impl.bImplicitCenterValid = true;
 		Impl.PendingImplicitBricks.Reset();
+		// Zeroed HERE, not in the counter block below: the sweep that follows
+		// is what increments it.
+		Impl.ImplicitBricksSkippedInterior = 0;
 
 		// Cheap reject, one column query per brick COLUMN rather than 512 per
 		// brick: the flood level is a per-site constant across its whole reach
@@ -2342,16 +2770,141 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			{
 				const int64 Vx = int64(Bx) * vxc::WaterBrick8::kEdge;
 				const int64 Vy = int64(By) * vxc::WaterBrick8::kEdge;
-				const int32 FloodZMm = Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm;
-				if (FloodZMm == INT32_MIN)
+				// THE CEILING IS THE HIGHER OF THE TWO IMPLICIT WATER SOURCES,
+				// and it used to be only the first.
+				//
+				// This filter read `cavern.floodZMm` alone, so a column with no
+				// CAVERN was skipped outright -- and a baked surface lake lives
+				// in exactly such a column. The ImplicitFn below would have
+				// filled it correctly; it was simply never asked, because the
+				// candidate sweep never offered the brick. The watershed plan
+				// SS5.2 asserts the opposite ("RefreshImplicitWater ... will
+				// pick up lake cells the moment the ImplicitFn includes them"),
+				// and that is wrong: this loop does not consult the ImplicitFn,
+				// it re-derives the ceiling itself. Measured before the fix, at
+				// a lake with 19.6 m of water standing over the camera's own
+				// column: "0 candidate brick(s)".
+				//
+				// So the ceiling is now max(cavern flood, lake datum). Both are
+				// "water fills open air below this level in this column", which
+				// is the same shape by construction (voxelcore/lakes.h), so
+				// this is one max() and not a second code path.
+				//
+				// THE OCEAN IS DELIBERATELY *NOT* A THIRD CEILING HERE, and
+				// that is §6.4's own "gives the sea real voxels only where
+				// touched" rather than an omission (work item 8). The implicit
+				// field DOES report the sea -- that is what makes a breach
+				// mobilize -- but an UNTOUCHED sea must not be offered to this
+				// sweep, for two independent reasons:
+				//
+				//   1. IT IS ALREADY DRAWN. AVoxelOceanActor's 40 km plane sits
+				//      on the same datum (§6.4 keeps it for the far field). A
+				//      voxel surface meshed under it would be a SECOND
+				//      coplanar translucent surface, which is the exact defect
+				//      measured this month where the near-field disc and the
+				//      far-field sheet lined up in geometry and disagreed in
+				//      tone (+44.5 vs +76.8 blueness) because one is a single
+				//      surface and the other a shell the view ray crosses
+				//      twice.
+				//   2. IT IS EVERY BRICK. A camera at the shore has seabed
+				//      under most of the 65 x 65 x 33 brick disc; offering it
+				//      would be tens of thousands of candidates where the
+				//      lake interior-skip below is measured saving 89%.
+				//
+				// A MOBILIZED sea brick is unaffected by this: mobilization
+				// hands it to the CA, and the CA's own component map meshes it.
+				// So the sea gets voxels exactly where a player has been, which
+				// is what the sentence in the plan says.
+				const int32 CavernZMm = Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm;
+				const int32 LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
+				if (CavernZMm == INT32_MIN && LakeZMm == vxc::kNoWaterMm)
 				{
-					continue; // dry column
+					continue; // dry column: no cavern below it and no lake on it
 				}
+				const int32 FloodZMm = FMath::Max(CavernZMm, LakeZMm);
 				// Only bricks whose bottom sits below the flood level can hold
 				// any water at all.
 				const int64 FloodBrickZ = vxc::floorDiv(int64(FloodZMm) / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
+
+				// THE INTERIOR OF A LAKE IS NOT A CANDIDATE, and skipping it is
+				// what makes a lake affordable rather than merely correct.
+				//
+				// A brick whose whole padded neighbourhood is full water emits
+				// NO faces -- that is the property this file already relies on
+				// to keep a large lake cheap ("interior bricks emit no faces --
+				// which is exactly what keeps a large lake affordable"). But it
+				// was still OFFERED, meshed, and discovered empty at full price.
+				// Measured at the 19.6 m lake on tile (-12,-5): 38,025
+				// candidates of which 33,800 -- 89% -- were interior bricks that
+				// produced nothing, 4,225 real surface bricks underneath them.
+				// The drain took 199 ticks, so EVERY capture and every walked
+				// step landed mid-rebuild and photographed a partial sheet.
+				//
+				// The two brackets below are PROOFS, not margins, which is the
+				// only kind of skip allowed here: an over-eager one punches a
+				// hole in a water surface, and that is the exact bug this whole
+				// change is repairing.
+				//
+				//   ceiling  UVoxelWorldSubsystem::GetSurfaceUpperBoundMm is a
+				//            provable upper bound on the amplified ground over
+				//            the brick's PADDED footprint, so every voxel whose
+				//            bottom is at or above it is worldgen air. One call
+				//            per brick COLUMN (it does not depend on Bz) and
+				//            cheaper than one amplifier column.
+				//   floor    the datum, sampled at the four corners of that same
+				//            padded footprint. The footprint is 10 voxels = 1.0 m
+				//            and a fine tile pixel is 1.875 m, so the footprint
+				//            touches at most 2x2 pixels and the four corners hit
+				//            every one of them -- this is exhaustive over the
+				//            pixels, not a sample of them. All four must agree
+				//            and be wet; a shoreline anywhere in the footprint
+				//            makes them disagree and the brick stays a candidate.
+				//
+				// CAVERN COLUMNS ARE EXCLUDED ENTIRELY. cavernFloodedAt fills
+				// open cave air regardless of the ground, so "above the surface
+				// bound" proves nothing about a cavern's water and the bracket
+				// does not apply. Such a column keeps exactly today's behaviour.
+				//
+				// EDITED BRICKS: the bound is pure worldgen and does not see the
+				// overlay, but an edit inside the water funnels through
+				// NotifyTerrainVoxelsCleared -> mobilizeEditRegion, which hands
+				// the brick to the CA and takes it out of the implicit path
+				// altogether (implicitFillAt returns 0 for a mobilized brick).
+				// So a brick this skip can reach is one no edit has touched.
+				const bool bLakeOnlyColumn = (CavernZMm == INT32_MIN) && (LakeZMm != vxc::kNoWaterMm);
+				int64 GroundUpperMm = MIN_int64;
+				bool bDatumUniform = false;
+				if (bLakeOnlyColumn)
+				{
+					const int64 Px0 = Vx - 1, Py0 = Vy - 1;
+					const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
+					GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
+					bDatumUniform = Impl.Water->waterSurfaceMmAtVoxel(Px0, Py0) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py0) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px0, Py1) == LakeZMm &&
+					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py1) == LakeZMm;
+				}
+				const bool bCanSkipInterior = bLakeOnlyColumn && bDatumUniform && GroundUpperMm != MIN_int64;
+
 				for (int32 Bz = Center.Z - kImplicitRadiusBricksZ; Bz <= Center.Z + kImplicitRadiusBricksZ; ++Bz)
 				{
+					if (bCanSkipInterior)
+					{
+						// The padded z span this brick's mesh actually reads:
+						// voxel bottoms from (Bz*8 - 1) to (Bz*8 + 8), inclusive.
+						const int64 PadBottomMm = (int64(Bz) * vxc::WaterBrick8::kEdge - 1) * vxc::kVoxelSizeMm;
+						const int64 PadTopMm = (int64(Bz) * vxc::WaterBrick8::kEdge + vxc::WaterBrick8::kEdge) *
+						                       vxc::kVoxelSizeMm;
+						// Every padded cell is above the ground (so open air),
+						// AND every padded cell's bottom is a full voxel below
+						// the datum (so fill 255, no partial top). Uniform 255
+						// over the whole pad: no face anywhere in the brick.
+						if (PadBottomMm >= GroundUpperMm && PadTopMm + vxc::kVoxelSizeMm <= int64(LakeZMm))
+						{
+							++Impl.ImplicitBricksSkippedInterior;
+							continue;
+						}
+					}
 					if (int64(Bz) > FloodBrickZ)
 					{
 						continue;
@@ -2365,8 +2918,31 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		// water actually in front of the camera has to mesh in the first few
 		// ticks, not after the whole 25 m disc has been walked.
 		UE_LOG(LogVoxelWater, Log,
-		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s)"),
-		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num());
+		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s), ")
+		       TEXT("%d proven-interior brick(s) skipped"),
+		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num(),
+		       Impl.ImplicitBricksSkippedInterior);
+
+		// DRAIN ACCOUNTING, and it exists because the absence of it cost a
+		// whole diagnosis. A baked lake rendered as scattered bricks, and the
+		// candidate count above -- the only number this function reported --
+		// looked healthy (42,250) in exactly the run where the sheet was
+		// broken, because the defect was that the list never DRAINED. The
+		// counters below say how far it got and what it cost, so "the lake is
+		// patchy" is answerable from the log instead of from a screenshot.
+		//
+		// NOTE FOR CAPTURES: tools/voxel-capture.ps1's settle check reads the
+		// TERRAIN streaming counters (jobsInFlight/pendingJobs/unloaded) and
+		// knows nothing about this queue. A frame can be fully terrain-settled
+		// with the water disc still half-built, which is precisely what a
+		// "settled" lake capture looked like before this line existed.
+		Impl.ImplicitRefreshSerial++;
+		Impl.ImplicitCandidatesAtRebuild = Impl.PendingImplicitBricks.Num();
+		Impl.ImplicitDrainTicks = 0;
+		Impl.ImplicitDrainMs = 0.0;
+		Impl.ImplicitBricksMeshed = 0;
+		Impl.ImplicitBricksEmpty = 0;
+		Impl.bImplicitDrainReported = false;
 		Impl.PendingImplicitBricks.Sort(
 			[Center](const VoxelCoords::FVoxelCoord& A, const VoxelCoords::FVoxelCoord& B)
 			{
@@ -2380,6 +2956,7 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 
 	int32 MeshesThisTick = 0;
 	int32 Built = 0;
+	const double DrainT0 = FPlatformTime::Seconds();
 	while (Impl.PendingImplicitBricks.Num() > 0 && MeshesThisTick < kMaxImplicitMeshesPerTick)
 	{
 		const VoxelCoords::FVoxelCoord BrickCoord = Impl.PendingImplicitBricks.Pop(EAllowShrinking::No);
@@ -2437,8 +3014,10 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				Impl.ImplicitChunkComponents.Remove(BrickCoord);
 			}
 			ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, BrickCoord);
+			++Impl.ImplicitBricksEmpty;
 			continue;
 		}
+		++Impl.ImplicitBricksMeshed;
 
 		// Same corner-height treatment as the CA path, and it costs this path very
 		// little: the implicit field is a per-site FLOOD LEVEL, so within one
@@ -2501,10 +3080,45 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		++Built;
 	}
 
-	if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() == 0)
+	if (MeshesThisTick > 0)
 	{
-		UE_LOG(LogVoxelWater, Verbose, TEXT("RefreshImplicitWater: candidate list drained; %d implicit water component(s) live."),
+		Impl.ImplicitDrainTicks++;
+		Impl.ImplicitDrainMs += (FPlatformTime::Seconds() - DrainT0) * 1000.0;
+	}
+
+	// ONE Log line per refresh, at the moment the disc is complete -- which is
+	// the only moment at which "the lake is a sheet" is a claim the frame can
+	// support. Log rather than Verbose on purpose: a capture is judged from
+	// this line, and `us/brick` is what makes a regression in the memo chain
+	// (see BuildWaterFillPad) visible as a number instead of as a patchy shot.
+	if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() == 0 && !Impl.bImplicitDrainReported)
+	{
+		Impl.bImplicitDrainReported = true;
+		const int32 Total = Impl.ImplicitBricksMeshed + Impl.ImplicitBricksEmpty;
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RefreshImplicitWater: DRAINED refresh #%llu -- %d candidate(s) in %d tick(s), %.1f ms total ")
+		       TEXT("(%.1f us/brick, %.1f ms/tick); %d brick(s) meshed, %d empty, %d skipped as proven interior; ")
+		       TEXT("%d implicit component(s) live."),
+		       (unsigned long long)Impl.ImplicitRefreshSerial, Impl.ImplicitCandidatesAtRebuild,
+		       Impl.ImplicitDrainTicks, Impl.ImplicitDrainMs,
+		       Total > 0 ? (Impl.ImplicitDrainMs * 1000.0) / double(Total) : 0.0,
+		       Impl.ImplicitDrainTicks > 0 ? Impl.ImplicitDrainMs / double(Impl.ImplicitDrainTicks) : 0.0,
+		       Impl.ImplicitBricksMeshed, Impl.ImplicitBricksEmpty, Impl.ImplicitBricksSkippedInterior,
 		       Impl.ImplicitChunkComponents.Num());
+	}
+	// UNDRAINED is the failure this instrumentation exists for, and it is
+	// silent by construction otherwise: the queue simply stays long while the
+	// frame looks fine. Report it periodically rather than once, because how
+	// FAR it got per tick is the diagnosis.
+	else if (MeshesThisTick > 0 && Impl.PendingImplicitBricks.Num() > 0 && (Impl.ImplicitDrainTicks % 60) == 0)
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("RefreshImplicitWater: refresh #%llu STILL DRAINING -- %d of %d candidate(s) left after %d tick(s), ")
+		       TEXT("%.1f ms so far (%.1f ms/tick); %d meshed, %d empty."),
+		       (unsigned long long)Impl.ImplicitRefreshSerial, Impl.PendingImplicitBricks.Num(),
+		       Impl.ImplicitCandidatesAtRebuild, Impl.ImplicitDrainTicks, Impl.ImplicitDrainMs,
+		       Impl.ImplicitDrainMs / double(FMath::Max(Impl.ImplicitDrainTicks, 1)),
+		       Impl.ImplicitBricksMeshed, Impl.ImplicitBricksEmpty);
 	}
 	(void)Built;
 }
@@ -2880,6 +3494,48 @@ void FlushSweIntoCA(FVoxelWaterImpl& Impl, const TCHAR* Reason)
 	// save is therefore a brief, self-healing interruption of the sheet rather
 	// than a teardown, and no re-seeding code is needed on this side.
 	Impl.SweLastCoupledTotal = int64_t(Impl.CA.totalVolume()) + Grid.totalVolume();
+}
+
+void MaybeRelatchImplicitOcean(FVoxelWaterImpl& Impl)
+{
+	const bool bWant = CVarVoxelWaterImplicitOcean.GetValueOnGameThread();
+	if (bWant == Impl.bImplicitOcean)
+	{
+		return;
+	}
+	// The one safe state: nothing mobilized and no CA water anywhere, so there
+	// is no cell whose ownership the change could reassign. In practice that
+	// means "flip it before you touch the water", which is what a control
+	// capture does anyway.
+	const bool bSafe = Impl.Mob.mobilizedBricks().empty() && Impl.CA.totalVolume() == 0;
+	if (!bSafe)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("voxel.Water.ImplicitOcean %d REFUSED: %llu fill unit(s) of CA water and %d "
+		            "mobilized brick(s) are live, and the implicit field is what makes unmobilized "
+		            "water a wall (voxelcore/waterca.h). Changing it now would either double-credit "
+		            "cells the CA already owns (-> ledger shortfall) or leave mobilized sea behind "
+		            "in what is supposed to be the control. Set it before the first edit, or "
+		            "restart. Still running with ImplicitOcean=%d."),
+		       bWant ? 1 : 0, (unsigned long long)Impl.CA.totalVolume(),
+		       int(Impl.Mob.mobilizedBricks().size()), Impl.bImplicitOcean ? 1 : 0);
+		// The cvar is put BACK to the value actually in force, so it never lies
+		// about what the simulation is doing and so this warning fires once per
+		// attempt rather than every tick.
+		CVarVoxelWaterImplicitOcean->Set(Impl.bImplicitOcean, ECVF_SetByCode);
+		return;
+	}
+	Impl.bImplicitOcean = bWant;
+	// The implicit field just changed shape, so every brick the mobilizer
+	// previously scanned and memoised as "no implicit water here" may now hold
+	// some. That memo is a pure negative cache (waterca.h: "it changes no
+	// answer, only the cost of re-asking") but a STALE one would hide the whole
+	// new term, so the refusal above is also what guarantees this transition
+	// only ever happens with an empty mobilizer, whose memo is empty too.
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("voxel.Water.ImplicitOcean = %d (watershed §6.4). The sea is %s the water "
+	            "ImplicitFn; the retired Reservoir v0 does not come back either way."),
+	       bWant ? 1 : 0, bWant ? TEXT("a term of") : TEXT("ABSENT from"));
 }
 
 // Constructs (or tears down) the sheet to match voxel.Water.SWE. Called once
@@ -3299,20 +3955,32 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	// hydrostaticPass reads solidCacheEnabled_ at the top of its own call.
 	Impl.CA.setSolidCacheEnabled(CVarVoxelWaterSolidCache.GetValueOnGameThread());
 
-	// Reservoir v0 (SS3.7: "the implicit ocean acts as an infinite
-	// reservoir: boundary cells refill to 255 each tick while exposed"). v0
-	// simplification: tops up unconditionally once registered (no support
-	// for detecting a plugged/re-solidified breach), documented in
-	// NotifyTerrainVoxelsCleared's own doc comment.
-	for (const VoxelCoords::FVoxelCoord& Cell : Impl.ReservoirCells)
-	{
-		const uint8_t Cur = Impl.CA.fillAt(Cell.X, Cell.Y, Cell.Z);
-		if (Cur < 255)
-		{
-			Impl.CA.addWater(Cell.X, Cell.Y, Cell.Z, uint32_t(255 - Cur));
-			MarkColumnDirty(Impl, Cell.X, Cell.Y, Cell.Z, uint32_t(255 - Cur));
-		}
-	}
+	// RESERVOIR v0 USED TO BE HERE, and its retirement is watershed plan work
+	// item 8 (§6.4: "the bespoke reservoir top-up at :3307-3315 can retire once
+	// proven equivalent"). It was NOT equivalent. It was a set of breach voxels
+	// pinned to 255 fill units every tick, forever, and voxel-core's
+	// tests/test_ocean.cpp measures the three things that made it worth
+	// deleting rather than fixing:
+	//
+	//   * THE SEA WAS NOT WATER TO THE SIMULATION. Only the pinned cells were.
+	//     The ocean beyond them was open air, so a cove cut into the coast did
+	//     not fill, it DRAINED -- and because the source never turned off, the
+	//     total volume and the CA's ACTIVE BRICK COUNT both climbed for as long
+	//     as the world ran. Measured on a 4x4 breach: 358k fill units and 536
+	//     active bricks at tick 100, 610k and 758 at tick 1500, still rising.
+	//     That was a live perf leak behind every below-sea-level dig.
+	//   * IT COULD NOT TELL A DUG PIT FROM THE SEA. Its rule was "cleared, below
+	//     the datum, touching non-solid space that is also below the datum",
+	//     which the second pass of an ordinary inland dig satisfies against the
+	//     first pass's own air. Measured: an infinite spring in dry rock 50
+	//     voxels inland.
+	//   * ITS HEAD WAS THE BREACH, NOT THE DATUM. A cell pinned at 255 at
+	//     z = -9 voxels is a pressure source at z = -9.
+	//
+	// Nothing replaces it here, because nothing needs to: the sea is now a term
+	// of the implicit field (see FVoxelWaterImpl's ImplicitFn), a breach
+	// funnels through NotifyTerrainRegionEdited -> mobilizeEditRegion exactly
+	// as a dug lake shore does, and the front below carries it from there.
 
 	// C8 mobilize-on-approach: advance the implicit->CA front BEFORE stepping,
 	// so any brick this tick's water could flow into is already CA-owned. Over
@@ -3668,6 +4336,9 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 		// Cheap when nothing changed: two bool reads and a pointer compare.
 		MaybeArmSwe(*Impl, World);
 
+		// voxel.Water.ImplicitOcean, re-latched on a step boundary (§6.4).
+		MaybeRelatchImplicitOcean(*Impl);
+
 		// W3 (plan S3.7 Layer R): same placement, same reason -- an arm or a
 		// disarm must not land between the river tick and the CA step.
 		MaybeArmRivers(*Impl, World);
@@ -3781,7 +4452,12 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 		Snap.StepsPerSec = float(Impl->StepsThisWindow) / Window;
 		Snap.LastSteppedBrickCount = Impl->LastSteppedBrickCount;
 		Snap.ReplicatedBytesPerSec = float(Impl->ReplicatedBytesThisWindow) / Window;
-		Snap.ReservoirCells = Impl->ReservoirCells.Num();
+		// Always 0 since §6.4 retired Reservoir v0. Reported rather than
+		// removed so the snapshot struct, the HUD and every parsed log line
+		// keep their shape; a field that reads 0 forever is a smaller change to
+		// every consumer than a field that disappears mid-milestone. It goes
+		// when the perf snapshot is next revised.
+		Snap.ReservoirCells = 0;
 
 		Snap.TickMs = Impl->LastSnapshot.TickMs; // preserve the always-fresh field across this reassignment
 		Impl->LastSnapshot = Snap;
@@ -3845,64 +4521,60 @@ void UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::
 	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
 	if (NetMode == NM_Client)
 	{
-		return; // breach seeding is simulation state, authority-only (same rule as the CA tick)
+		return; // simulation state, authority-only (same rule as the CA tick)
 	}
 
-	TSet<VoxelCoords::FVoxelCoord> ClearedSet(ClearedVoxels);
-
-	static const VoxelCoords::FVoxelCoord kNeighborOffsets[6] = {
-		VoxelCoords::FVoxelCoord{1, 0, 0}, VoxelCoords::FVoxelCoord{-1, 0, 0}, VoxelCoords::FVoxelCoord{0, 1, 0},
-		VoxelCoords::FVoxelCoord{0, -1, 0}, VoxelCoords::FVoxelCoord{0, 0, 1}, VoxelCoords::FVoxelCoord{0, 0, -1}};
-
-	int32 NewlyBreachedCount = 0;
+	// THIS FUNCTION NO LONGER SEEDS ANYTHING (watershed plan §6.4, work item 8).
+	// It used to run the Reservoir v0 rule; the top-up loop it fed is gone from
+	// StepFixed, and that block carries the measurements that justify the
+	// deletion. The sea is now a term of the implicit field, so a dig into it
+	// releases water through the SAME funnel a dug lake shore uses --
+	// NotifyTerrainRegionEdited -> WaterMobilizer::mobilizeEditRegion -- which
+	// UVoxelWorldSubsystem already calls beside every one of the five call
+	// sites that call this one. Nothing here has to make water happen.
+	//
+	// WHAT IS LEFT IS THE LOG LINE, and it is kept rather than deleted because
+	// it is the ONLY signal an unattended headless run has that a dig actually
+	// opened the sea. The old line reported "seeded N boundary cells", which
+	// was a count of a mechanism; this one reports the DATUM TEST -- how many
+	// cleared voxels stand below sea level in a column whose WORLDGEN ground is
+	// also below it, i.e. genuinely in the sea, versus how many are merely
+	// below z=0 inside land, which is the inland pit the old rule flooded.
+	// Those two numbers side by side are exactly what the §6.4 inland-pit
+	// capture needs to read.
+	//
+	// COST: one amplifier column per distinct COLUMN below the datum, not per
+	// voxel. GroundMmAt memoises one column and GetSurfaceHeightUU also fires a
+	// fine-tile streaming request, so a per-voxel query on a carve would put
+	// thousands of them on the game thread; the dedupe below is what keeps this
+	// diagnostic from costing more than the mechanism it replaced.
+	TSet<uint64> ColumnsSeen;
+	int32 SeaVoxels = 0;
+	int32 InlandBelowDatumVoxels = 0;
 	for (const VoxelCoords::FVoxelCoord& V : ClearedVoxels)
 	{
-		if (V.Z >= 0)
+		if (V.Z >= vxc::kSeaLevelVoxelZ)
 		{
-			continue; // Reservoir v0/implicit ocean is a below-sea-level concept only (SS3.7)
+			continue; // above the datum: never sea, whatever the column says
 		}
-
-		// "adjacent cell is implicit-ocean (i.e., non-solid, z<0, outside
-		// active water)" -- crucially, a neighbor that's ALSO part of
-		// ClearedSet is newly-dug-by-this-same-edit, not pre-existing ocean;
-		// excluding it is what stops an isolated dry pocket (all neighbors
-		// solid before the dig, hence also cleared-by-this-dig, hence
-		// excluded here) from spontaneously flooding itself.
-		bool bTouchesOcean = false;
-		for (const VoxelCoords::FVoxelCoord& Off : kNeighborOffsets)
+		const int32_t GroundMm = Impl->GroundMmAt(V.X, V.Y);
+		if (vxc::oceanSurfaceMmAt(GroundMm) == vxc::kNoWaterMm)
 		{
-			const VoxelCoords::FVoxelCoord N{V.X + Off.X, V.Y + Off.Y, V.Z + Off.Z};
-			if (ClearedSet.Contains(N)) continue;
-			if (N.Z >= 0) continue;
-			if (Impl->Terrain.IsSolidAtVoxel(N.X, N.Y, N.Z)) continue;
-			if (Impl->CA.fillAt(N.X, N.Y, N.Z) != 0) continue; // already-tracked active water, not "implicit ocean"
-			bTouchesOcean = true;
-			break;
-		}
-		if (!bTouchesOcean)
-		{
+			++InlandBelowDatumVoxels; // a pit dug into land -- and it stays dry
 			continue;
 		}
-
-		if (!Impl->ReservoirCells.Contains(V))
-		{
-			Impl->ReservoirCells.Add(V);
-			++NewlyBreachedCount;
-		}
-		const uint8 Cur = Impl->CA.fillAt(V.X, V.Y, V.Z);
-		if (Cur < 255)
-		{
-			Impl->CA.addWater(V.X, V.Y, V.Z, uint32(255 - Cur));
-		}
-		MarkColumnDirty(*Impl, V.X, V.Y, V.Z, 255);
+		++SeaVoxels;
+		ColumnsSeen.Add((uint64(uint32(V.X)) << 32) | uint64(uint32(V.Y)));
 	}
 
-	if (NewlyBreachedCount > 0)
+	if (SeaVoxels > 0 || InlandBelowDatumVoxels > 0)
 	{
 		UE_LOG(LogVoxelWater, Log,
-		       TEXT("Dig breach: seeded %d Reservoir v0 boundary cell(s) (full fill, continuous top-up) out of %d cleared ")
-		       TEXT("voxel(s) examined."),
-		       NewlyBreachedCount, ClearedVoxels.Num());
+		       TEXT("Dig below the datum: %d cleared voxel(s) in %d seabed column(s) are IN THE SEA "
+		            "(worldgen ground below kSeaLevelMm) and mobilize through the implicit field; %d "
+		            "are inland pit (ground above the datum) and stay dry. %d cleared voxel(s) "
+		            "examined; Reservoir v0 retired, see StepFixed."),
+		       SeaVoxels, ColumnsSeen.Num(), InlandBelowDatumVoxels, ClearedVoxels.Num());
 	}
 }
 
@@ -4457,6 +5129,195 @@ uint8 UVoxelWaterSubsystem::GetImplicitFillAtWorld(const FVector& WorldUU) const
 	return Impl->Mob.implicitFillAt(int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU)),
 	                                 int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU)),
 	                                 int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU)));
+}
+
+uint8 UVoxelWaterSubsystem::GetWaterFillAtWorld(const FVector& WorldUU) const
+{
+	if (!Impl)
+	{
+		return 0;
+	}
+	const int64 Vx = int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU));
+	const int64 Vy = int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU));
+	const int64 Vz = int64(FMath::FloorToDouble(WorldUU.Z / VoxelCoords::VoxelSizeUU));
+	// CA first: once a brick is mobilized the CA owns it and implicitFillAt
+	// already reads 0 there, so the max of the two is the whole water column
+	// with no double count in either direction (waterca.h's ownership
+	// partition is what guarantees that, not call order here).
+	const uint8 CaFill = Impl->CA.fillAt(Vx, Vy, Vz);
+	return CaFill > 0 ? CaFill : Impl->Mob.implicitFillAt(Vx, Vy, Vz);
+}
+
+double UVoxelWaterSubsystem::SeaLevelZUU()
+{
+	// mm -> UU. VoxelCoords::VoxelSizeUU UU per vxc::kVoxelSizeMm mm.
+	return double(vxc::kSeaLevelMm) * VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm);
+}
+
+bool UVoxelWaterSubsystem::IsOpenSeaAtWorld(double WorldZUU, double WorldgenGroundZUU)
+{
+	const double SeaZ = SeaLevelZUU();
+	// Above the datum is never sea; below the seabed is rock, not sea.
+	return WorldZUU < SeaZ && WorldgenGroundZUU < SeaZ && WorldZUU >= WorldgenGroundZUU;
+}
+
+bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
+{
+	if (GetWaterFillAtWorld(WorldUU) > 0)
+	{
+		return true;
+	}
+	if (!Impl)
+	{
+		return false;
+	}
+	// GetSurfaceHeightUU is the AMPLIFIER column surface -- worldgen, not the
+	// edited overlay -- which is exactly what the seabed test needs: a pit a
+	// player dug into land is not an ocean, and its edited ground is.
+	return IsOpenSeaAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
+}
+
+// --- LAKE SHEETS AT RANGE (watershed plan item 5, §5.2) ---------------------
+//
+// All three of these are thin: the registry, the extent rule and the
+// decomposition all live in voxelcore/lakes.h, and what is here is the world-UU
+// arithmetic plus the tile enumeration. That split is the point -- the geometry
+// is unit-tested in ctest without an engine, and the engine half cannot express
+// a different lake shape than the near field's because it reads the same masks
+// through the same sampler.
+
+void UVoxelWaterSubsystem::FineTileForWorldUU(double XUU, double YUU, int32& OutTileX, int32& OutTileY)
+{
+	const vxc::TileCoord T =
+		FVoxelFineTileStreamer::CoarseTileForWorldMm(VoxelCoords::WorldToMm(XUU), VoxelCoords::WorldToMm(YUU));
+	OutTileX = T.x;
+	OutTileY = T.y;
+}
+
+int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY, double CenterXUU,
+                                                        double CenterYUU, double RadiusUU,
+                                                        TArray<FLakeSheetBasin>& Out) const
+{
+	if (!Impl || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // loads a tile file; see the header
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(TileX, TileY);
+	if (Basins == nullptr)
+	{
+		return 0; // no fine tier, tile absent, or baked before the registry
+	}
+	// Read AFTER the tile is resolved: both are 0 until one has loaded.
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return 0;
+	}
+
+	const int64 OxPx = int64(TileX) * TileSize, OyPx = int64(TileY) * TileSize;
+	const int32 Before = Out.Num();
+	for (size_t i = 0; i < Basins->size(); ++i)
+	{
+		const vxc::BasinEntry& B = (*Basins)[i];
+		if (!B.holdsWater())
+		{
+			continue; // a dry playa has no sheet, by the same rule the sampler uses
+		}
+		// Inclusive pixel bbox -> world UU, taking the OUTER edge of the last
+		// pixel so the rectangle covers the pixels rather than their centres
+		// (the same convention BuildLakeSheetRects uses).
+		FLakeSheetBasin Info;
+		Info.TileX = TileX;
+		Info.TileY = TileY;
+		Info.BasinId = int32(i);
+		Info.MinXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX0) * PixelMm);
+		Info.MinYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY0) * PixelMm);
+		Info.MaxXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX1 + 1) * PixelMm);
+		Info.MaxYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY1 + 1) * PixelMm);
+		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(B.surfaceMm));
+		if (Info.MaxXUU < CenterXUU - RadiusUU || Info.MinXUU > CenterXUU + RadiusUU ||
+		    Info.MaxYUU < CenterYUU - RadiusUU || Info.MinYUU > CenterYUU + RadiusUU)
+		{
+			continue;
+		}
+		Out.Add(Info);
+	}
+	return Out.Num() - Before;
+}
+
+int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx,
+                                                 TArray<FBox2D>& OutRectsUU, bool& bOutResolved) const
+{
+	bOutResolved = false;
+	if (!Impl || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread());
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(Basin.TileX, Basin.TileY);
+	if (Basins == nullptr || Basin.BasinId < 0 || size_t(Basin.BasinId) >= Basins->size())
+	{
+		return 0;
+	}
+	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
+	const std::vector<uint8_t>* Mask =
+		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+	if (Mask == nullptr)
+	{
+		// The tile or one of its elevation blocks would not decode. Reporting
+		// this apart from "no water" is the whole reason bOutResolved exists:
+		// a lake that failed to load looks exactly like a lake that is dry.
+		return 0;
+	}
+	bOutResolved = true;
+
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return 0;
+	}
+	const int64 OxPx = int64(Basin.TileX) * TileSize, OyPx = int64(Basin.TileY) * TileSize;
+
+	std::vector<vxc::LakeSheetRect> Rects;
+	vxc::lakeSheetRects(B, *Mask, FMath::Max(StepPx, 1), Rects);
+
+	const int32 Before = OutRectsUU.Num();
+	OutRectsUU.Reserve(OutRectsUU.Num() + int32(Rects.size()));
+	for (const vxc::LakeSheetRect& R : Rects)
+	{
+		OutRectsUU.Add(FBox2D(
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x0) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y0) * PixelMm)),
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x1 + 1) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y1 + 1) * PixelMm))));
+	}
+	return OutRectsUU.Num() - Before;
+}
+
+bool UVoxelWaterSubsystem::GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const
+{
+	if (!Impl || !Impl->bImplicitCenterValid)
+	{
+		return false;
+	}
+	// EXACTLY the sweep in RefreshImplicitWater: bricks [C-R, C+R] inclusive on
+	// each axis, each vxc::WaterBrick8::kEdge voxels of VoxelCoords::VoxelSizeUU.
+	// Derived from the same two constants rather than restated as metres, so a
+	// change to the disc cannot leave the sheet cutting the wrong hole.
+	const double BrickUU = double(vxc::WaterBrick8::kEdge) * VoxelCoords::VoxelSizeUU;
+	const VoxelCoords::FVoxelCoord C = Impl->LastImplicitCenterBrick;
+	OutXY = FBox2D(FVector2D(double(C.X - kImplicitRadiusBricks) * BrickUU,
+	                         double(C.Y - kImplicitRadiusBricks) * BrickUU),
+	               FVector2D(double(C.X + kImplicitRadiusBricks + 1) * BrickUU,
+	                         double(C.Y + kImplicitRadiusBricks + 1) * BrickUU));
+	OutMinZUU = double(C.Z - kImplicitRadiusBricksZ) * BrickUU;
+	OutMaxZUU = double(C.Z + kImplicitRadiusBricksZ + 1) * BrickUU;
+	return true;
 }
 
 void UVoxelWaterSubsystem::GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,

@@ -23,7 +23,33 @@ $PY tools/worldmaps/provinces.py    "$TILES"            # writes 03-provinces
 $PY tools/worldmaps/temperature.py  "$TILES" out/04-temperature-and-snow.png
 $PY tools/worldmaps/vista_sites.py  "$TILES" out/vista-sites.md
 $PY tools/worldmaps/vista_map.py    "$TILES" out/vista-sites.json out/07-vista-site-index.png
+$PY tools/worldmaps/water.py        "$TILES" out/05-water-placement.png \
+    --dumps out/watermap-dumps --cache out/water-flow.npz
 ```
+
+**Map 05 is a standing deliverable too**, added at the owner's request ("a
+world map overlay that shows where streams, rivers, and lakes will actually be
+placed"). It is the only one of these that draws **two different kinds of
+statement on one image**, and the rule it follows is worth repeating because
+every future water map has to follow it:
+
+* **Lakes are MEASURED.** They come from a real bake through
+  `../lake_survey.py dump`, so a tile with no dump gets NO lakes and is hatched
+  red. Nothing about a lake is ever interpolated between tiles: a lake is a
+  hole in one specific hillside and there is no estimate of one.
+* **Channels are PREDICTED**, and the word is on the image. No baked tile
+  carries a runoff-weighted discharge yet (watershed plan §4.1 is not in the
+  bake), so `water.py` runs that rule itself over the coarse 30 m plane
+  through the bake's own kernels — `fill_depressions`, `accumulate_mfd`,
+  `pet_mm_yr`, `budyko_runoff_mm_yr`.
+* **One bake version, never two.** `roughness_seed` takes `BAKE_VERSION`, so
+  tiles baked at 7 and at 8 are different worlds. The tool refuses a mixed set
+  rather than averaging them, and prints the version it drew from.
+
+The dumps are the expensive half (a full bake per tile, ~10 min and ~5 GiB on
+the pod); `water.py` itself is a couple of minutes over the coarse tiles, and
+seconds with `--cache`. Only the wettest and driest tiles' `.npz` rasters need
+to come back — the rest of the map reads only the `.json`.
 
 **Map 07 is a standing deliverable like 01-04**, added at the owner's request:
 the hillshade with a numbered pin at every screenshot site and each pin's
@@ -80,6 +106,15 @@ Downsample (120 m/px is plenty for a 261 km world) or use JPEG.
 | `vista_sites.py` | What biome and province is each screenshot site ACTUALLY at? |
 | `vista_map.py` | Where are the screenshot sites? (pins on the world hillshade) |
 | `find_site.py` | Where should I stand to photograph biome X? |
+| `water.py` | Where will streams, rivers and lakes actually be placed? |
+
+Not in this directory but held to the same conventions:
+`../lake_survey.py` (watershed plan work item 2) — where are the basins, how
+many, how deep, and which of them hold water? It calls `province_fields`
+through the bake's own object rather than re-deriving a discriminant, and its
+overlays sit beside the report in `docs/lake-survey/`. Its expensive half is a
+BAKE per tile, so it runs on the pod; the report half is numpy over the dumps
+and re-sweeps every threshold without re-baking.
 
 ## Picking screenshot sites
 

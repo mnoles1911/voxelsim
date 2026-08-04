@@ -1,0 +1,242 @@
+WHAT FRAGMENTS THE BAKED RIVER
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), bake_ver 10, 2026-08-04
+================================================================================
+
+THE CAUSE: THE TWO NETWORKS WERE CUT AT DIFFERENT HEIGHTS
+----------------------------------------------------------
+The recorded gap -- area network 4 components over 2 km with a largest span of
+4,216 m against a wet mask of ~2,000 components, longest 1,113 m, and only 36.1%
+of above-threshold area cells wet -- is an artifact of the COMPARISON, not a
+defect in the bake. `flow log2 >= 23` and `q >= q_drawable` are not the same
+threshold. Level-matched they swap, and most of the gap closes.
+
+  q_drawable                              3.1467e6 m3/yr
+  corridor median implied runoff q/acc    0.1883 m/yr
+  => q_drawable expressed as an AREA      1.671e7 m2 = 2^23.99
+  the control was cut at                  2^23      = 8.389e6 m2
+                                          ---------------------
+                                          1.99x apart
+
+Stitched corridor, one grid, 8-connected, the same labeller the record used.
+Component spans computed for EVERY component of >= 40 px, not a top-5 shortlist:
+
+                                    cells   comps  largest    span    >=1.8km  >=2km
+  AREA as reported   acc>=2^23     76,439   3,632   8,823 px  4,216 m     5       4
+  AREA re-cut at the wet level     29,159   1,298   1,792 px  2,188 m     1       1
+  Q as reported      q>=q_drawable 29,159   2,019   1,719 px  1,113 m     0       0
+  WET shipped plane                27,347   2,014   1,719 px  1,113 m     0       0
+  Q  re-cut at the 2^23 level      87,102   4,808   8,644 px  4,216 m     3       1
+
+  wet share of the area network as reported  35.1%   (the record's 36.1%)
+  wet share of the LEVEL-MATCHED area network 66.4%
+
+("Re-cut at the wet level" is the area threshold admitting the SAME NUMBER of
+cells as the wet cut: 1.6916e7 m2 = 2^24.01, within 1% of the 2^23.99 the median
+runoff implies. Two independent ways of matching the level, same answer.)
+
+APPORTIONING THE 4,216 m -> 1,113 m COLLAPSE, in log span:
+
+  threshold LEVEL      4,216 -> 2,188 m    49%   3 of the 4 >=2 km components
+  runoff WEIGHTING     2,188 -> 1,113 m    51%   the last one
+  B5 basins                    0 m          0%
+  the log2 bin                 0 m          0%
+
+The runoff-weighting half is NOT the boundary term task #49 replaced. It is
+`discharge_source`'s per-cell `runoff_m * cell_m^2` seed: q/acc is the
+CATCHMENT-MEAN runoff, and its median differs 2.8x across the four tiles
+(0.0971, 0.1790, 0.1975, 0.2705 m/yr), so one Q threshold is a spatially
+varying AREA threshold -- 2^23.47 on (-11,-5), 2^24.95 on (-11,-4). Where it
+rides near the local channel size it fragments; where it sits well above, it
+does not.
+
+AND THE RECORD'S OWN JUSTIFICATION FOR CHOOSING 23 IS OFF BY AN OCTAVE. The
+flow log2 of the corridor's wet cells:
+
+  log2  22      23      24      25     26     27
+  wet   552   7,302  10,237  6,946  1,706    391
+         2.0%  26.7%   37.4%  25.4%   6.2%   1.4%
+
+The median wet cell sits at log2 24. "log2 >= 23, where wet cells begin" is a
+whole octave below where they actually begin -- which is exactly the factor of
+two above.
+
+CANDIDATE 1 -- THE log2 BIN. RULED OUT, AND PROVABLY SO
+--------------------------------------------------------
+`floor(log2 x) >= 23` is `x >= 2^23` IDENTICALLY: a threshold placed on a bin
+EDGE is exact, and the bin's width can only blur cells inside the set, never at
+its boundary. So the byte cannot smooth the network at the threshold, whatever
+it does elsewhere. Measured rather than left as an argument, per tile, the
+byte-binned network against the unquantised field:
+
+  tile        flow byte log2>=23        acc >= 2^23              identical?
+  (-12,-5)   11,960 / 301 / 4,216 m   11,960 / 301 / 4,216 m     to the cell
+  (-11,-4)   22,883 / 366 / 2,207 m   22,883 / 366 / 2,207 m     to the cell
+  (-11,-5)   14,718 / 1,000 / 692 m   14,718 / 1,000 / 692 m     to the cell
+  (-11,-6)   24,014 / 1,948 / 987 m   26,878 / 1,965 / 987 m     2,864 cells
+
+The one difference is fully accounted for: all 2,864 cells are BELOW SEA LEVEL
+(elevation -476.0 to -199.5 m, p50 -288.1 m), where the encoder writes flow = 0.
+Zero cells above sea level differ, and the longest span is 987 m in both arms.
+
+Contribution to the gap: none.
+
+CANDIDATE 3 -- B5 BASINS WRITTEN DRY. RULED OUT
+------------------------------------------------
+`graded_water_surface` writes registered-basin cells dry and nothing else drops
+a cell, so shipped-wet against the raw `q >= q_drawable` cut is candidate 3
+exactly, with no modelling in between:
+
+  tile       q>=q_drawable   shipped wet   dropped        basin fraction
+  (-11,-5)         9,623         9,623      0   ( 0.0%)      2.9%
+  (-11,-6)         6,788         6,456    332   ( 4.9%)     17.4%
+  (-11,-4)         6,001         5,354    647   (10.8%)      2.3%
+  (-12,-5)         6,747         5,914    833   (12.3%)      3.5%
+  corridor        29,159        27,347  1,812   ( 6.2%)
+
+The tile that is 17.4% basin loses the SECOND LEAST. And what it costs in
+structure is nothing:
+
+  components  2,019 -> 2,014   (the wet mask has FEWER, not more)
+  largest     1,719 px in both, span 1,113 m in both -- the same component
+  per tile the largest component is byte-identical in size on all four
+
+Basin exclusion removes 6% of the cells and 0 m of span.
+
+CANDIDATE 2 -- MFD SPLITTING Q. REAL, LARGE, AND NOT THE AREA/WET GAP
+----------------------------------------------------------------------
+It is the mechanism by which ANY threshold on this field breaks a reach. It is
+not what separates the area network from the wet mask, because it acts on both
+identically: q and acc are two sweeps of the same kernel over the same surface,
+and they fall together at the same cells with the same ratios, equal to three
+decimals on every tile (e.g. (-12,-5): acc falls at 25.45% of downstream steps
+with p5 ratio 0.702; q falls at 25.45% with p5 ratio 0.702).
+
+PROOF ON THE SHIPPED FIELD, NOTHING RECONSTRUCTED. Water leaves a cell
+downhill, so under any SINGLE-receiver rule some strictly-lower neighbour must
+hold at least what the cell holds -- the receiver inherits all of it. Cells on
+the area network with a lower neighbour, none of which holds as much:
+
+  (-12,-5)   3,040 of 11,947   25.45%
+  (-11,-4)   6,620 of 22,873   28.94%
+  (-11,-5)   4,872 of 14,709   33.12%
+  (-11,-6)   8,232 of 26,870   30.64%
+
+A quarter to a third of the network splits its entire accumulation. Under D8
+this count is identically 0.
+
+THE CONTROL. Same refilled surface, same cell-area seed, same kernel family,
+only the routing rule differs, both cut to the wet mask's own cell count:
+
+  tile          n        MFD p=1.1                 D8 (monotone)
+  (-12,-5)   6,747   196 comps / 3,667 m       1 comp  / 7,616 m
+  (-11,-4)   6,001   111 comps /   915 m       1 comp  / 10,473 m
+  (-11,-5)   9,623   619 comps / 1,808 m       3 comps / 8,003 m
+  (-11,-6)   6,788   572 comps /   514 m       3 comps / 5,898 m
+
+100x to 600x the component count, and 2x to 11x the span.
+
+THE CAVEAT, STATED RATHER THAN BURIED. This control refills the SHIPPED,
+post-B5, interior-only surface; the bake accumulated over the padded, pre-B5
+one with the pyramid's inflow at its rim. The reconstruction's accumulation is
+therefore not the bake's -- log-ratio against it is p50 +0.35 to +1.66 and p95
++12.6 to +14.0. Both arms of the A/B run over the IDENTICAL reconstruction, so
+the comparison is internally valid and is about the routing rule alone, but its
+absolute spans are not the bake's and are not quoted as such. The
+reconstruction-free measurement above is what carries the claim on the shipped
+field.
+
+THE REACH, WALKED CELL BY CELL
+-------------------------------
+2,001 steps down the D8 receiver forest from (1780,2496) in (-12,-5) -- the
+maximum-accumulation cell at the head of the corridor's longest components --
+to the domain edge. Wet/dry run lengths along the path:
+
+  105W 14d 129W 13d 57W 2d 166W 2d 1W 20d 29W 5d 50W 6d 4W 11d 7W 2d 9W 4d 4W
+  1d 21W 2d 2W 1d 1W 3d 21W 1d 7W 1d 58W 4d 117W 7d 1W 24d 12W 1d 7W 1d 2W 1d
+  107W 1d 61W 3d 99W 2d 160W 1d 9W 15d 1W 3d 22W 13d 25W 7d 58W 3d 16W 4d 33W
+  72d 2W 2d 12W 4d 13W 15d 5W 13d 119W 2d 7W 3d 74W 13d 4W 12d 8W 1d 1W 2d 9W
+  1d 4W 1d 5W 17d
+
+ONE REACH, ONE CHANNEL, and it goes wet-dry-wet fifty times. Two distinct break
+signatures, both impossible on a monotone field:
+
+  A DEEP SPLIT AND RE-CONVERGENCE (steps 103-119)
+    103  r1700 c2481   acc 5.685e+07   q 1.00918e+07   q/qd 3.207   WET
+    104  r1699 c2480   acc 1.790e+07   q 3.17773e+06   q/qd 1.010   WET
+    105  r1698 c2479   acc 5.767e+06   q 1.02380e+06   q/qd 0.325   dry
+    ... 14 cells at q/qd 0.33 - 0.99 ...
+    118  r1685 c2479   acc 1.764e+07   q 3.13176e+06   q/qd 0.995   dry
+    119  r1684 c2479   acc 1.126e+08   q 1.99857e+07   q/qd 6.351   WET
+  A 22x collapse over four cells and a 20x recovery in one. The water went
+  sideways into a fan and came back.
+
+  A SHALLOW DIP (steps 244-261)
+    244  r1591 c2402   acc 1.967e+07   q 3.49197e+06   q/qd 1.110   WET
+    248  r1591 c2398   acc 1.736e+07   q 3.08124e+06   q/qd 0.979   dry
+    259  r1591 c2387   acc 1.370e+07   q 2.43174e+06   q/qd 0.773   dry
+    261  r1591 c2385   acc 7.391e+07   q 1.31212e+07   q/qd 4.170   WET
+  A monotone-looking decline of 1.44x that happens to cross the cut, and 13
+  cells later a tributary arrives. This is the class the LEVEL governs: the
+  whole excursion lives between 0.77 and 1.11 of the threshold.
+
+Across the corridor, 90.29% of above-area-threshold cells that are dry sit
+WITHIN A FACTOR OF TWO of the cut ((-12,-5): q/q_drawable p50 0.680, p90 0.913,
+p99 0.990; 100% within a factor of 10). The gaps are shallow, which is why
+where the cut sits decides almost everything.
+
+HOW SHARPLY THE ANSWER DEPENDS ON THE LEVEL -- (-12,-5), acc and q swept
+------------------------------------------------------------------------
+  level (2^)   AREA cells  comps  span_m  |  Q cells  comps  span_m
+     22.00        22,388     999    5098  |   23,330  1,200    5098
+     23.00        11,960     301    4216  |   11,988    305    4218
+     23.50         9,417     109    2980  |    9,422    102    2980
+     24.00         7,011      81    1138  |    7,013     89    1138
+     24.50         4,705      95     347  |    4,689     98     347
+     25.00         3,274      94     272  |    3,262     92     272
+
+One factor of two in the threshold, 23 -> 24, costs 3.7x of longest span while
+costing only 1.7x of cells. And the two columns track each other to within a
+few percent at EVERY level, which is the same statement as the headline: at
+matched levels the currency is not the variable.
+
+WHAT WAS RUN
+-------------
+Four diagnostic bakes of the shipped tiles at bake_ver 10 with the unquantised
+intermediates dumped, 1,161 CPU-s (287.8 + 316.7 + 281.4 + 275.2). The first
+tile was baked and checked ALONE before the other three were spent.
+
+  python tools/bake_tiles_from_cache.py --seed 20260719 \
+      --cache-dir D:/voxelsim/tile-cache \
+      --provider-id terrain-diffusion-unlabeled-80b9ca451a23eae4 \
+      --terrain-diffusion-version "82a0431+worldgen.c55a6382c524" \
+      --tiles="-12,-5" --npz-dir D:/tmp/frag-npz --diagnostic
+
+NOTHING WAS WRITTEN TO THE WORLD. `--diagnostic` wraps the cache so the fine
+tier is hidden (otherwise every tile is skipped as already baked) and
+write-protected; the run reported "4 fine tile write(s) suppressed" and the four
+shipped .vxtl files still carry their original mtimes. Every bake reproduced its
+shipped tile exactly -- water 0.008/0.014/0.009/0.010 %wet against the shipped
+0.0080/0.0143/0.0088/0.0096, and the wet-cell counts 5,354 / 9,623 / 5,914 /
+6,456 are equal to the shipped counts on all four.
+
+  python tools/river_break_probe.py --npz D:/tmp/frag-npz/-12_-5.npz \
+      --trace-window 1780,1830,2380,2560 --trace-steps 2000
+  python tools/river_break_probe.py --stitch --npz ... (all four)
+
+TESTS
+-----
+  pytest (terrain-service)   532 passed / 2 skipped   baseline 532 / 2   OK
+
+ctest was NOT re-run and no number is quoted for it. Zero C++ files are touched
+-- the change is two files under `terrain-service/tools/` -- and quoting a
+figure taken on another branch would be exactly the vacuous pass this record
+keeps catching.
+
+WHAT WAS NOT DONE, DELIBERATELY
+--------------------------------
+No fix. `kWorldGenVersion` untouched, `BAKE_VERSION` untouched, no GPU digest
+re-pinned, no shipped module edited. If anything here is to be acted on, the
+first question is whether `q_drawable` is at the right height at all -- it is
+derived from a 2 px minimum channel width, and the measurement above says that
+lands at 2^24 of catchment, an octave above where the record assumed rivers
+start. That is a decision about what the world should look like, not a bug.

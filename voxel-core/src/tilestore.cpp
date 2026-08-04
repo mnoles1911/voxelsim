@@ -90,7 +90,12 @@ int32_t TileGridSampler::elevationMm(int64_t px, int64_t py) {
     const TileData* t = findTile(px, py, lx, ly);
     if (!t) {
         missingTileQueries.fetch_add(1, std::memory_order_relaxed);
-        return 0;
+        // A tile that is not loaded reads as SEA LEVEL, not as "zero". The
+        // distinction is the point of the symbol: the fallback is a datum
+        // choice (a missing tile is open ocean, the same conservative posture
+        // pipeline.py's MISSING_ELEVATION_M takes on the bake side), not an
+        // arbitrary default. missingTileQueries counts every one of them.
+        return kSeaLevelMm;
     }
     const int64_t metres = t->elevationAt(lx, ly);
     return static_cast<int32_t>(metres * 1000);
@@ -395,6 +400,64 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
     return r.atEnd();
 }
 
+// SECTION_BASIN_TABLE (watershed plan P1, bake_ver 8). A flat table, so this
+// is a straight read -- but every field is CHECKED, because a basin row is a
+// gameplay instruction: it says "flood-fill from here, up to this level", and
+// a bbox reaching outside the tile or a surface above its own spill would put
+// water where there is none. `tileSize` is the grid edge the row must fit in.
+bool parseBasinTable(const uint8_t* file, uint64_t off, uint64_t len, uint32_t tileSize,
+                     std::vector<BasinEntry>& out) {
+    if (len < kBasinTableHeaderBytes) return false;
+    ByteReader r(file + off, static_cast<size_t>(len));
+    uint16_t version, entryBytes;
+    uint32_t count;
+    if (!r.u16(version) || version != kBasinTableVersion) return false;
+    // A row size this build does not know is bytes written by a different
+    // revision of the table. Refusing beats reading 33-byte records out of a
+    // 32-byte stream and getting plausible garbage.
+    if (!r.u16(entryBytes) || entryBytes != kBasinEntryBytes) return false;
+    if (!r.u32(count)) return false;
+    if (len != kBasinTableHeaderBytes + static_cast<uint64_t>(count) * kBasinEntryBytes) {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        BasinEntry b;
+        uint32_t spill = 0, surface = 0;
+        if (!r.u16(b.basinId)) return false;
+        if (!r.u16(b.seedX) || !r.u16(b.seedY)) return false;
+        if (!r.u16(b.bboxX0) || !r.u16(b.bboxY0) || !r.u16(b.bboxX1) || !r.u16(b.bboxY1)) {
+            return false;
+        }
+        if (!r.u16(b.outletX) || !r.u16(b.outletY)) return false;
+        if (!r.u32(spill) || !r.u32(surface)) return false;
+        b.spillMm = static_cast<int32_t>(spill);
+        b.surfaceMm = static_cast<int32_t>(surface);
+        if (!r.u8(b.kind) || b.kind >= kBasinKindCount) return false;
+        for (int k = 0; k < 5; ++k) {
+            uint8_t reserved;
+            if (!r.u8(reserved) || reserved != 0) return false;
+        }
+
+        // Ids are 0..n-1 in order, because the client INDEXES by id and the
+        // bake orders basins by (min_y, min_x) of extent so the id is a pure
+        // function of the surface. A gap or a repeat means two processes could
+        // disagree about which basin is "3".
+        if (b.basinId != i) return false;
+        if (b.bboxX0 > b.bboxX1 || b.bboxY0 > b.bboxY1) return false;
+        if (b.bboxX1 >= tileSize || b.bboxY1 >= tileSize) return false;
+        if (b.seedX < b.bboxX0 || b.seedX > b.bboxX1) return false;
+        if (b.seedY < b.bboxY0 || b.seedY > b.bboxY1) return false;
+        // Water standing above its own outlet is not a lake, it is a bug: the
+        // outlet would carry the excess away.
+        if (b.surfaceMm > b.spillMm) return false;
+        out.push_back(b);
+    }
+    return r.atEnd();
+}
+
 } // namespace
 
 const char* fineErrorName(FineError e) {
@@ -412,6 +475,7 @@ const char* fineErrorName(FineError e) {
     case FineError::kDecompressFailed: return "decompress-failed";
     case FineError::kBadPayload: return "bad-payload";
     case FineError::kValueOutOfRange: return "value-out-of-range";
+    case FineError::kBadBasinTable: return "bad-basin-table";
     }
     return "unknown";
 }
@@ -479,7 +543,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     if (compressed && !decompressor.valid()) return reject(FineError::kNoDecompressor);
     if (!r.u16(h.bakeVer)) return reject(FineError::kBadHeader);
     if (!r.u16(h.flags)) return reject(FineError::kBadHeader);
-    if ((h.flags & ~kFineFlagFlowPresent) != 0) return reject(FineError::kBadHeader);
+    if ((h.flags & ~kFineFlagsKnown) != 0) return reject(FineError::kBadHeader);
     if (!r.i32(h.baseOffsetMm)) return reject(FineError::kBadHeader);
     // §3: absolute only.
     if (!r.u8(h.parentScale) || h.parentScale != 0) return reject(FineError::kBadHeader);
@@ -496,7 +560,8 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
     if (tableEnd > fileSize) return reject(FineError::kBadSectionTable);
 
-    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec;
+    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec;
+    SectionRef waterIndexSec, waterDataSec;
     struct Extent {
         uint64_t begin, end;
     };
@@ -535,6 +600,9 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         case kSectionElevData: elevDataSec = ref; break;
         case kSectionFlowIndex: flowIndexSec = ref; break;
         case kSectionFlowData: flowDataSec = ref; break;
+        case kSectionBasinTable: basinSec = ref; break;
+        case kSectionWaterIndex: waterIndexSec = ref; break;
+        case kSectionWaterData: waterDataSec = ref; break;
         default: break; // see (b): unknown ids are ignored but still bounded
         }
     }
@@ -553,6 +621,28 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     if (!wantFlow && (flowIndexSec.present || flowDataSec.present)) {
         return reject(FineError::kBadSectionTable);
     }
+    // Flag and section must agree in BOTH directions, same as flow: a table
+    // with the flag clear is bytes this decoder would ignore, and a flag with
+    // no table is a client that would silently place no water.
+    const bool wantBasins = (h.flags & kFineFlagBasinsPresent) != 0;
+    if (wantBasins != basinSec.present) return reject(FineError::kBadSectionTable);
+    // Same both-directions agreement for the water plane. The "sections
+    // present, flag clear" half is the one that matters most here: those bytes
+    // would be silently ignored and every river in the tile would vanish
+    // without a single error being raised anywhere.
+    const bool wantWater = (h.flags & kFineFlagWaterPresent) != 0;
+    if (wantWater != (waterIndexSec.present && waterDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
+    if (!wantWater && (waterIndexSec.present || waterDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
+
+    std::vector<BasinEntry> basins;
+    if (wantBasins && !parseBasinTable(bytes.data(), basinSec.offset, basinSec.length,
+                                       h.size, basins)) {
+        return reject(FineError::kBadBasinTable);
+    }
 
     FineTile tile;
     tile.h_ = h;
@@ -561,6 +651,8 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     tile.elevDataLen_ = elevDataSec.length;
     tile.flowDataOff_ = flowDataSec.offset;
     tile.flowDataLen_ = flowDataSec.length;
+    tile.waterDataOff_ = waterDataSec.offset;
+    tile.waterDataLen_ = waterDataSec.length;
 
     const uint32_t perAxis = static_cast<uint32_t>(h.size) >> h.blockLog2;
     const uint32_t blocks = perAxis * perAxis;
@@ -577,6 +669,17 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         return reject(FineError::kBadBlockIndex);
     }
 
+    // Element width 2, exactly like elevation: the water plane IS an elevation
+    // plane, on the same datum, which is what lets it share every byte of this
+    // machinery instead of growing a second one to keep in step.
+    if (wantWater && !parseBlockIndex(bytes.data(), waterIndexSec.offset,
+                                      waterIndexSec.length, blocks, blockPixels,
+                                      waterDataSec.length, 2, compressed,
+                                      tile.waterIndex_)) {
+        return reject(FineError::kBadBlockIndex);
+    }
+
+    tile.basins_ = std::move(basins);
     tile.bytes_ = std::move(bytes);
     return tile;
 }
@@ -607,6 +710,25 @@ bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& o
                                        bytes_.data() + flowDataOff_,
                                        static_cast<size_t>(flowDataLen_), dim, 0, 255, dec_,
                                        fineCodecNeedsDecompressor(h_.codec), out.data(), err);
+}
+
+bool FineTile::decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                               FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (!hasWater()) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t perAxis = blocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t dim = blockDim();
+    // Filled with the DRY sentinel, not 0. 0 is a legitimate stored DEPTH
+    // (water exactly at its own bed, which is what a reach's shallow edge
+    // quantises to), so a block that failed to decode must read as the
+    // sentinel or it becomes a sheet of zero-depth water over the whole block.
+    out.assign(blockPixelCount(), kWaterDryDepth);
+    return decodeBlockPayload<int16_t>(waterIndex_[by * perAxis + bx],
+                                       bytes_.data() + waterDataOff_,
+                                       static_cast<size_t>(waterDataLen_), dim, -32768, 32767,
+                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
+                                       err);
 }
 
 bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const {
@@ -714,7 +836,7 @@ int32_t FineTileSampler::elevationMm(int64_t px, int64_t py) {
     const FineTile* t = nullptr;
     uint32_t lx, ly;
     const std::vector<int16_t>* block = blockFor(px, py, t, lx, ly);
-    if (!block) return 0;
+    if (!block) return kSeaLevelMm; // missing block == open ocean; see TileGridSampler
     return t->elevationMmFromCp((*block)[ly * t->blockDim() + lx]);
 }
 
