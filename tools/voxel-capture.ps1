@@ -256,6 +256,53 @@ if (Test-Path $LogPath) {
                        "distinguish a settled capture from a thrashing one. Treat this capture's " +
                        "settle state as unknown.")
     }
+    # THE WATER QUEUE, WHICH THE SETTLE CHECK ABOVE CANNOT SEE.
+    #
+    # jobsInFlight/pendingJobs are TERRAIN counters. On 2026-08-03 two lake
+    # captures were shot 8 and 36 ticks into a 199-tick water refresh with
+    # `jobsInFlight=0 pendingJobs=0 unloaded=0` -- genuinely terrain-settled and
+    # genuinely water-unsettled. The frames showed a lake as disjoint
+    # brick-shaped patches, which reads as a meshing bug and sent a whole
+    # investigation after "data or mesh?" when the answer was neither: the gaps
+    # were wherever the water queue had not reached yet.
+    #
+    # So a capture CONTAINING WATER is not settled until the implicit-water
+    # rebuild has drained, and that has its own line. Expect to add another
+    # block here the next time a subsystem starts producing geometry: this
+    # check only knows about the queues it has been taught.
+    $drained = @(Select-String -Path $LogPath -Pattern 'RefreshImplicitWater: DRAINED refresh')
+    $draining = @(Select-String -Path $LogPath -Pattern 'RefreshImplicitWater: STILL DRAINING') |
+                Select-Object -Last 1
+    $sheet = @(Select-String -Path $LogPath -Pattern 'Lake sheets: DRAINED build')
+    Write-Host ("  water: implicit DRAINED x{0}, sheet DRAINED x{1}" -f
+                $drained.Count, $sheet.Count)
+    if ($drained.Count -eq 0) {
+        if ($draining) {
+            Write-Warning ("WATER NOT SETTLED at the shutter: the implicit-water refresh was " +
+                           "STILL DRAINING and never reported DRAINED. Water in this frame is " +
+                           "PARTIAL -- missing patches are unreached queue, not missing data " +
+                           "and not a mesher bug. Raise -SettleSec and re-shoot.")
+        }
+        else {
+            Write-Warning ("no 'RefreshImplicitWater: DRAINED refresh' line in the log. Either " +
+                           "there is no water near this spawn (fine), or the water subsystem " +
+                           "never ran (not fine). This capture is NOT evidence that water is " +
+                           "absent -- check the 'Baked water tier ENABLED' line and the tile " +
+                           "provider id before concluding anything from an empty valley.")
+        }
+    }
+    # A REFUSED TILE HAS NO WATER AND LOOKS EXACTLY LIKE A DRY VALLEY. Most of
+    # the production cache is CODEC_ZSTD, and without the injected decompressor
+    # every one of those tiles is refused whole -- silently, as far as the image
+    # is concerned.
+    $refused = @(Select-String -Path $LogPath -Pattern 'was REFUSED')
+    if ($refused.Count -gt 0) {
+        Write-Warning ("$($refused.Count) fine tile(s) were REFUSED (search the log for " +
+                       "'was REFUSED'). Their lakes and rivers are ABSENT from this frame. " +
+                       "kNoDecompressor here means the runtime zstd DLL is missing -- see " +
+                       "tools/fetch-zstd.ps1.")
+    }
+
     # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not
     # streamed yet" and looks identical in the image: black gaps in otherwise
     # finished terrain. The fine tier is where this first showed up, because its

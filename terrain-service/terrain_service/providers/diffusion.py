@@ -822,11 +822,35 @@ def _bake_fingerprint() -> str:
     imports nothing beyond stdlib+numpy at module scope so this works on a box
     with no numba/scipy, and a silent fallback would mean an id that stopped
     covering the bake.
+
+    TWO PAYLOADS SINCE bake_ver 9, and the pairing is the point.
+    ``bake_identity_payload`` is the TERRAIN half -- what decides the ground --
+    and ``product_identity_payload`` is the PRODUCT half: which sections a tile
+    carries and the constants that fill them. Both are folded in, so content
+    addressing keeps meaning what it says: a tile whose water plane differs
+    never shares an id with one whose does not. See the TERRAIN_VERSION /
+    BAKE_VERSION note in ``bake/pipeline.py`` for why they are separate
+    counters at all.
+
+    Including the product half is what makes a water retune SAFE rather than
+    silent -- ``BakeConstants.as_payload`` is a whitelist, so a water constant
+    that fed no identity would change written bytes under an unchanged id and
+    the namespace would end up holding two mutually incompatible formats. That
+    is exactly the failure this module's own ``_tile_format_fingerprint``
+    docstring calls "especially nasty" about a codec bump.
+
+    What it does NOT cost: water APPEARANCE -- translucency, colour, the depth
+    cue, the foam channel -- is client-side material work that touches no baked
+    byte, so the retuning done most often rolls nothing here.
     """
-    from ..bake.pipeline import bake_identity_payload
+    from ..bake.pipeline import bake_identity_payload, product_identity_payload
 
     return hashlib.sha256(
-        json.dumps({"bake": bake_identity_payload()}, sort_keys=True).encode("utf-8")
+        json.dumps(
+            {"bake": bake_identity_payload(),
+             "product": product_identity_payload()},
+            sort_keys=True,
+        ).encode("utf-8")
     ).hexdigest()
 
 

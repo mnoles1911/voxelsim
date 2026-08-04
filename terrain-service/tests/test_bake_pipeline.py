@@ -150,8 +150,16 @@ def ref_d8(z, cell_m):
     return rec, best.astype(np.float32)
 
 
-def ref_accumulate(z, cell_m, p=1.1, inflow=None, *, return_order=False):
+def ref_accumulate(z, cell_m, p=1.1, inflow=None, *, source=None,
+                   return_order=False):
     """Own cell area plus any injected inflow. NO routing, on purpose.
+
+    ``source`` REPLACES the cell-area seed, exactly as the real kernel's does
+    (bake_ver 9: it is what turns the sweep from an area field into a discharge
+    field). Mirrored here rather than left to raise, because B6 always passes
+    it and a double that refused would make every orchestration test in this
+    file unrunnable -- while a double that silently IGNORED it would report a
+    discharge equal to the catchment area and quietly validate nothing.
 
     ``return_order`` is accepted because the real kernel hands B2d the
     ascending-elevation order it had to sort anyway; this double has no sweep,
@@ -164,7 +172,10 @@ def ref_accumulate(z, cell_m, p=1.1, inflow=None, *, return_order=False):
 
     Returns float64 m^2, matching the real ``accumulate_mfd``.
     """
-    a = np.full(np.shape(z), cell_m * cell_m, np.float64)
+    if source is None:
+        a = np.full(np.shape(z), cell_m * cell_m, np.float64)
+    else:
+        a = np.array(source, np.float64, copy=True)
     if inflow is not None:
         a = a + np.asarray(inflow, np.float64)
     if return_order:
@@ -722,7 +733,9 @@ def test_bake_writes_only_the_interior():
     assert r.elevation_m.shape == (f, f)
     assert r.accumulation_m2.shape == (f, f)
     assert r.flow.shape == (f, f) and r.flow.dtype == np.uint8
-    assert set(r.cpu_seconds) == set(pipeline.STAGE_ORDER)
+    assert set(r.cpu_seconds) == set(pipeline.STAGE_ORDER) | set(
+        pipeline.PRODUCT_STAGE_ORDER
+    )
     assert all(v >= 0.0 for v in r.cpu_seconds.values())
     assert r.missing_coarse == ()
     assert r.stats["relief_m"] > 0.0
@@ -1301,11 +1314,87 @@ def test_the_sea_taper_on_flags_is_off_without_an_elevation_field():
 # ---------------------------------------------------------------------------
 
 
+def test_constants_partition_is_exhaustive():
+    """Every BakeConstants field lands in EXACTLY ONE of the two identity halves.
+
+    ``as_payload`` (terrain) and ``product_payload`` (product) are both
+    whitelists, which is what lets a product constant be added without rolling
+    the terrain identity of every world -- and which is exactly why a field can
+    silently land in NEITHER and then decide baked bytes while rolling no
+    identity at all. That is the drift this asserts away.
+
+    Failing here means one of two things, both of which want a human:
+      * a new constant was added and not classified -- put it in ``as_payload``
+        if it can move a height, in ``PRODUCT_FIELDS`` if it can only change a
+        product;
+      * a constant is in both, so a product retune would re-roll the world.
+    """
+    fields = {f.name for f in dataclasses.fields(BakeConstants)}
+    terrain = set(pipeline.CONSTANTS.as_payload())
+    product = set(pipeline.CONSTANTS.product_payload())
+    assert not (terrain & product), (
+        f"constants in BOTH identity halves: {sorted(terrain & product)}"
+    )
+    assert not (terrain | product) - fields, (
+        f"identity names that are not fields: {sorted((terrain | product) - fields)}"
+    )
+    assert not fields - terrain - product, (
+        f"constants in NEITHER identity half: {sorted(fields - terrain - product)}"
+    )
+
+
+def test_product_constants_roll_only_the_product_fingerprint():
+    """A water constant must re-key the namespace WITHOUT re-rolling the world.
+
+    Both halves of that, because either alone is a bug. If the product half did
+    not move, a tile whose water bytes differ would share an id with one whose
+    do not. If the terrain half DID move, adding a section would re-roll the
+    roughness seed -- the fused-counter behaviour the split exists to end, and
+    the one that would invalidate the 256-tile lake survey, the bank probe's 25
+    tiles and every spawn site the owner holds.
+    """
+    terrain_base = pipeline.bake_fingerprint()
+    product_base = pipeline.product_fingerprint()
+    for name in BakeConstants.PRODUCT_FIELDS:
+        cur = getattr(pipeline.CONSTANTS, name)
+        alt = (not cur) if isinstance(cur, bool) else cur + 1.0
+        alt_consts = dataclasses.replace(pipeline.CONSTANTS, **{name: alt})
+        assert pipeline.product_fingerprint(alt_consts) != product_base, (
+            f"{name} does not roll the product fingerprint"
+        )
+        assert pipeline.bake_fingerprint(consts=alt_consts) == terrain_base, (
+            f"{name} re-rolls the TERRAIN fingerprint; it would move the ground"
+        )
+
+
+def test_terrain_version_bump_rerolls_the_world_and_product_does_not():
+    """The two counters do what they say. Executable, because the whole split
+    rests on it: TERRAIN_VERSION reaches the roughness seed, BAKE_VERSION must
+    not."""
+    seed8 = pipeline.roughness_seed(20260719, (0, 0), bake_version=8)
+    seed9 = pipeline.roughness_seed(20260719, (0, 0), bake_version=9)
+    assert seed8 != seed9, "TERRAIN_VERSION must reach the roughness seed"
+    # The shipped world's seed, pinned. If this moves, every measurement,
+    # screenshot and spawn site taken on seed 20260719 describes other ground.
+    assert seed8 == 0x7E1EC856567C4FB5
+    assert pipeline.TERRAIN_VERSION == 8
+    assert pipeline.bake_identity_payload()["bake_version"] == pipeline.TERRAIN_VERSION
+    assert pipeline.product_identity_payload()["bake_version"] == pipeline.BAKE_VERSION
+    # And the shipped terrain fingerprint, likewise pinned.
+    assert pipeline.bake_fingerprint().startswith("fe0275e105cbf77c")
+
+
 def test_every_bake_constant_rolls_the_fingerprint():
     """Same rule as DiffusionConfig's: a field belongs in the identity iff
-    changing it can change generated bytes. All of these can."""
+    changing it can change generated bytes. All of these can.
+
+    TERRAIN constants only since bake_ver 9 -- the product half is covered by
+    ``test_product_constants_roll_only_the_product_fingerprint``, which also
+    asserts the direction this one cannot see (that they do NOT roll terrain).
+    """
     base = pipeline.bake_fingerprint()
     seen = {base}
+    product_fields = set(BakeConstants.PRODUCT_FIELDS)
     # Alternatives that still satisfy BakeConstants' own validation.
     valid_alt = {"thermal_rate": 0.25, "flat_eps": 1e-6, "incision_mode": "depth",
                  # +0.5 would put slope_lo above slope_hi, which validation
@@ -1318,6 +1407,8 @@ def test_every_bake_constant_rolls_the_fingerprint():
                  # would put province_relief_lo above province_relief_hi.
                  "province_relief_lo": 0.05}
     for fld in dataclasses.fields(BakeConstants):
+        if fld.name in product_fields:
+            continue
         cur = getattr(pipeline.CONSTANTS, fld.name)
         if fld.name in valid_alt:
             alt = valid_alt[fld.name]
@@ -1336,7 +1427,8 @@ def test_every_bake_constant_rolls_the_fingerprint():
                 geom=dataclasses.replace(pipeline.PRODUCTION, **{fld.name: alt})
             )
         )
-    n = len(dataclasses.fields(BakeConstants)) + len(dataclasses.fields(BakeGeometry))
+    n = (len(dataclasses.fields(BakeConstants)) - len(product_fields)
+         + len(dataclasses.fields(BakeGeometry)))
     assert len(seen) == n + 1, "a bake constant is not covered by the fingerprint"
 
 
@@ -1344,9 +1436,17 @@ def test_bake_identity_payload_is_json_stable():
     import json
 
     payload = pipeline.bake_identity_payload()
-    assert payload["bake_version"] == pipeline.BAKE_VERSION
+    # TERRAIN_VERSION: the key name is historical and is hashed into every
+    # shipped fine_provider_id, so it stays even though the counter it carries
+    # was renamed. See the note beside it in pipeline.py.
+    assert payload["bake_version"] == pipeline.TERRAIN_VERSION
     assert payload["stage_order"] == list(pipeline.STAGE_ORDER)
     json.dumps(payload, sort_keys=True)  # must not raise
+
+    product = pipeline.product_identity_payload()
+    assert product["bake_version"] == pipeline.BAKE_VERSION
+    assert product["stage_order"] == list(pipeline.PRODUCT_STAGE_ORDER)
+    json.dumps(product, sort_keys=True)  # must not raise
 
 
 def test_bake_identity_keys_only_the_bake_derived_namespace(monkeypatch):

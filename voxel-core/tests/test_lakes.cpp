@@ -458,3 +458,233 @@ VXC_TEST(subtracting_the_near_field_hole_loses_exactly_the_overlap) {
     n = subtractRect(r, edge, out);
     CHECK_EQ(int(areaOf(out, n)), 100 - 3 * 3);
 }
+
+// ---------------------------------------------------------------------------
+// THE RIVER DATUM (watershed plan P2, §5.1)
+// ---------------------------------------------------------------------------
+//
+// THIS IS THE GUARD FOR THE MISTAKE THIS CODEBASE HAS NOW MADE THREE TIMES --
+// once in Python and twice in C++ -- and which nothing tested until this file.
+//
+// There are three "grounds" here (tilestore.h::reconstructedGroundMm lists
+// them) and the stored water DEPTH is only meaningful against the middle one:
+//
+//   lattice    elevationMmFromCp(cp)        the prefiltered control point
+//   spline     reconstructedGroundMm(...)   what the bake subtracted   <-- this
+//   amplified  GetSurfaceHeightUU(...)      spline + rills + bedding + warp
+//
+// Every one of them is a plausible-looking int32 of millimetres, they agree to
+// within a voxel on flat ground, and picking the wrong one throws NOTHING. It
+// draws the river at the wrong height -- and |cp - surface| reaches 5.6 m on
+// the production world, which is 56 voxels of water hanging in the air or
+// buried in the hillside.
+//
+// So this asserts the datum by CONSTRUCTION rather than by inspection: the
+// value RiverSampler returns must equal depth + spline, must NOT equal
+// depth + lattice, and the reach must come out FLAT ACROSS ITS WIDTH -- which
+// is the physical statement, and the one the fixture's deliberately rough bed
+// under a deliberately smooth reach exists to make checkable.
+
+namespace {
+
+// The P2 water golden. Its reach is 5 px wide centred on x = 128, running the
+// full height of tile (-2,-4); its bed carries sub-LSB roughness the water must
+// not inherit. See tools/make_water_fixture.py.
+std::filesystem::path waterFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_water_512.vxtl";
+}
+
+} // namespace
+
+VXC_TEST(river_datum_is_the_spline_not_the_lattice) {
+    const std::filesystem::path p = waterFixturePath();
+    if (!std::filesystem::exists(p)) {
+        std::printf("  (skip: %s absent)\n", p.string().c_str());
+        return;
+    }
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    CHECK(probe.has_value());
+    if (!probe) return;
+    CHECK(probe->hasWater());
+
+    FineTileSampler tiles(probe->seed());
+    CHECK(tiles.loadTile(bytes, &err));
+    RiverSampler rivers(tiles);
+    CHECK(rivers.prewarmTile(probe->tileX(), probe->tileY()));
+
+    const uint32_t size = probe->size();
+    const int64_t ox = int64_t(probe->tileX()) * size;
+    const int64_t oy = int64_t(probe->tileY()) * size;
+    const FineTile* t = tiles.findTile(probe->tileX(), probe->tileY());
+    CHECK(t != nullptr);
+    if (!t) return;
+    const uint32_t dim = t->blockDim();
+
+    // INTERIOR ONLY. The 4x4 carrier stencil reaches one pixel outside the
+    // queried one, so a pixel on the tile edge gathers control points from a
+    // tile that is not loaded -- FineTileSampler answers 0 mm there, by
+    // documented policy. That is a streaming question, not a datum question,
+    // and mixing the two would make this test fail for the wrong reason.
+    const uint32_t LO = 2, HI = size - 3;
+
+    size_t wet = 0, latticeDiffers = 0;
+    int64_t worstLatticeErrMm = 0;
+    for (uint32_t ly = LO; ly <= HI; ly += 7) {
+        std::vector<int16_t> depth, elev;
+        CHECK(t->decodeWaterBlock(0, ly / dim, depth));
+        CHECK(t->decodeElevBlock(0, ly / dim, elev));
+        for (uint32_t lx = LO; lx < dim && lx <= HI; ++lx) {
+            const size_t i = size_t(ly % dim) * dim + size_t(lx % dim);
+            const int16_t d = depth[i];
+            const int32_t got = rivers.surfaceAtPixel(ox + lx, oy + ly);
+            if (d < 0) {
+                // Dry must stay dry, whatever the ground says.
+                CHECK_EQ(int(got), int(kNoWaterMm));
+                continue;
+            }
+            ++wet;
+            // 1. THE DATUM IS THE SPLINE, exactly.
+            const int32_t spline =
+                FineTile::waterMmFromDepth(d, reconstructedGroundMm(tiles, ox + lx, oy + ly));
+            CHECK_EQ(int(got), int(spline));
+
+            // 2. AND IT IS NOT THE LATTICE. Counted rather than asserted per
+            //    pixel: the two coincide wherever the prefilter happened to
+            //    leave a control point on its own sample, and a test that
+            //    demanded a difference at EVERY pixel would be asserting a
+            //    property of the fixture's noise instead of the rule.
+            const int32_t lattice = FineTile::waterMmFromDepth(d, t->elevationMmFromCp(elev[i]));
+            if (lattice != got) {
+                ++latticeDiffers;
+                const int64_t e = int64_t(lattice) - int64_t(got);
+                worstLatticeErrMm = std::max<int64_t>(worstLatticeErrMm, e < 0 ? -e : e);
+            }
+        }
+    }
+
+    CHECK(wet > 0);                     // a vacuous pass is the failure mode here
+    // THE ANTI-VACUITY CLAUSE. If the lattice and the spline agreed everywhere
+    // this test would pass no matter which one the sampler used, and would go
+    // on passing after a regression. The fixture's rough bed guarantees they
+    // do not; this is what says so out loud.
+    CHECK(latticeDiffers > 0);
+    std::printf("  river datum: %zu wet px, lattice differs on %zu (worst %lld mm)\n",
+                wet, latticeDiffers, (long long)worstLatticeErrMm);
+
+    // 3. THE PHYSICAL STATEMENT: a water surface is FLAT ACROSS THE REACH.
+    //    The bed under it is not -- the fixture's `samples()` carries a
+    //    high-frequency term precisely so that a datum taken from the wrong
+    //    ground reproduces the roughness. Adding the depth to the LATTICE, or
+    //    to an amplified surface, fails here; adding it to the spline does not,
+    //    because the same ripple is in both the bed and the reconstruction and
+    //    cancels.
+    int64_t worstSpreadMm = 0, worstLatticeSpreadMm = 0;
+    size_t rows = 0;
+    for (uint32_t ly = LO; ly <= HI; ly += 13) {
+        std::vector<int16_t> depth, elev;
+        CHECK(t->decodeWaterBlock(0, ly / dim, depth));
+        CHECK(t->decodeElevBlock(0, ly / dim, elev));
+        int64_t lo = INT64_MAX, hi = INT64_MIN, llo = INT64_MAX, lhi = INT64_MIN;
+        size_t n = 0;
+        for (uint32_t lx = 126; lx <= 130; ++lx) {   // the 5 px reach
+            const size_t i = size_t(ly % dim) * dim + size_t(lx % dim);
+            if (depth[i] < 0) continue;
+            ++n;
+            const int64_t v = rivers.surfaceAtPixel(ox + lx, oy + ly);
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+            const int64_t l = FineTile::waterMmFromDepth(depth[i], t->elevationMmFromCp(elev[i]));
+            llo = std::min(llo, l);
+            lhi = std::max(lhi, l);
+        }
+        if (n < 3) continue;
+        ++rows;
+        worstSpreadMm = std::max(worstSpreadMm, hi - lo);
+        worstLatticeSpreadMm = std::max(worstLatticeSpreadMm, lhi - llo);
+    }
+    CHECK(rows > 0);
+    std::printf("  cross-section spread over %zu rows: spline %lld mm, lattice %lld mm\n",
+                rows, (long long)worstSpreadMm, (long long)worstLatticeSpreadMm);
+    // ONE VOXEL, and the bound is the format's own: the reach is flat to within
+    // the spline's reconstruction residual, which make_water_fixture.py
+    // measures at max 42 mm against a 100 mm voxel.
+    CHECK(worstSpreadMm <= 100);
+    // And the wrong datum is measurably worse, which is what makes the bound
+    // above evidence rather than a tolerance that anything would pass.
+    CHECK(worstLatticeSpreadMm > worstSpreadMm);
+}
+
+VXC_TEST(river_sampler_answers_no_water_with_nothing_loaded) {
+    FineTileSampler tiles(7);
+    RiverSampler rivers(tiles);
+    CHECK_EQ(rivers.waterSurfaceMmAtVoxel(0, 0), kNoWaterMm);
+    CHECK_EQ(rivers.surfaceAtPixel(3, 9), kNoWaterMm);
+    CHECK(!rivers.prewarmTile(0, 0));
+    CHECK_EQ(int(rivers.unresolvedBlocks()), 0);
+
+    // A tile with NO water plane answers dry rather than borrowing the
+    // elevation lattice as if it were a datum -- the bake_ver 8 case, which is
+    // most of the cache.
+    const std::filesystem::path p =
+        std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_512.vxtl";
+    if (!std::filesystem::exists(p)) return;
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    if (!probe.has_value()) return;
+    CHECK(!probe->hasWater());
+    FineTileSampler dry(probe->seed());
+    CHECK(dry.loadTile(bytes, &err));
+    RiverSampler r2(dry);
+    CHECK(!r2.prewarmTile(probe->tileX(), probe->tileY()));
+    const int64_t ox = int64_t(probe->tileX()) * probe->size();
+    const int64_t oy = int64_t(probe->tileY()) * probe->size();
+    CHECK_EQ(r2.surfaceAtPixel(ox + 100, oy + 100), kNoWaterMm);
+}
+
+// Lakes and rivers as one query. The composite must never LOWER a lake's datum
+// -- taking the min where they overlap would drain a lake into the river that
+// feeds it -- and must pass a dry answer through from either side.
+VXC_TEST(composite_takes_the_higher_datum_and_forwards_the_sheet_half) {
+    struct Fixed final : IWaterSampler {
+        int32_t mm = kNoWaterMm;
+        int32_t waterSurfaceMmAtVoxel(int64_t, int64_t) override { return mm; }
+        uint32_t tilePixels() const override { return 512; }
+        int32_t pixelSizeMm() const override { return 1875; }
+    };
+    Fixed lake, river;
+    CompositeWaterSampler both(lake, river);
+
+    lake.mm = kNoWaterMm; river.mm = kNoWaterMm;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), kNoWaterMm);
+
+    lake.mm = 5000; river.mm = kNoWaterMm;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), 5000);
+
+    lake.mm = kNoWaterMm; river.mm = 4200;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), 4200);
+
+    // Overlap: the HIGHER wins, both ways round.
+    lake.mm = 5000; river.mm = 4200;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), 5000);
+    lake.mm = 4200; river.mm = 5000;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), 5000);
+
+    // kNoWaterMm is INT32_MIN, so a NEGATIVE datum -- a reach below sea level,
+    // which a tidal mouth genuinely is -- must not be mistaken for dry.
+    lake.mm = kNoWaterMm; river.mm = -3000;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), -3000);
+    lake.mm = -5000; river.mm = -3000;
+    CHECK_EQ(both.waterSurfaceMmAtVoxel(0, 0), -3000);
+
+    // The sheet half is the LAKES, unconditionally: a river reach is not a
+    // flat disc and must never be handed to the sheet builder.
+    CHECK(both.basinsForTile(0, 0) == nullptr);
+    CHECK(both.extentMaskFor(0, 0, 0) == nullptr);
+}

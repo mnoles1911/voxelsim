@@ -441,6 +441,7 @@ def accumulate_mfd(
     p: float = 1.1,
     inflow: np.ndarray | None = None,
     *,
+    source: np.ndarray | None = None,
     return_order: bool = False,
 ) -> np.ndarray:
     """Multiple-flow-direction catchment area, in m^2, as float64.
@@ -464,6 +465,23 @@ def accumulate_mfd(
     conditions enter (plan: "inject upstream accumulation as inflow boundary conditions
     at the fine domain edge"). ``None`` means every cell starts with its own area.
 
+    ``source`` REPLACES the ``cell_m**2`` per-cell seed instead of adding to it, which
+    is what turns this sweep from an AREA field into a DISCHARGE field: seed each cell
+    with its own runoff VOLUME (``runoff_m_per_yr * cell_area``) and the sweep returns
+    m^3/yr delivered, over the identical MFD weights the area field uses. That is
+    watershed plan §4.1.1's "runoff-weighted source term instead of the constant unit
+    area", and it is one sweep rather than the two-sweeps-and-subtract form
+    ``tools/worldmaps/water.py`` used before this existed -- which was exact only
+    because that tool had no ``inflow`` to confound the subtraction. With both terms
+    live, ``A(cell_area + I_area)`` and ``A(cell_area + I_q)`` differ by
+    ``A(I_q) - A(I_area)``, which is not the discharge, so the map's construction does
+    not generalise to the bake and this parameter exists instead.
+
+    ``source`` and ``inflow`` compose: the seed is ``source + inflow``, so a caller
+    with a boundary condition in the SAME currency as its source passes both.
+    ``source=None`` is exactly ``np.full(shape, cell_m**2)`` and reproduces the area
+    sweep bit-for-bit (asserted by test).
+
     Conservation, which is the invariant to test against: every cell's contribution is
     passed along until it reaches a cell with no strictly lower neighbour, so the sum
     of the result over those terminal cells equals ``z.size * cell_m**2 + inflow.sum()``.
@@ -478,7 +496,20 @@ def accumulate_mfd(
     if not np.isfinite(p) or p <= 0.0:
         raise ValueError(f"p must be finite and > 0, got {p!r}")
 
-    acc = np.full(zz.size, cell_m * cell_m, np.float64)
+    if source is None:
+        acc = np.full(zz.size, cell_m * cell_m, np.float64)
+    else:
+        src = np.ascontiguousarray(source, dtype=np.float64)
+        if src.shape != zz.shape:
+            raise ValueError(f"source shape {src.shape} != z shape {zz.shape}")
+        if not np.isfinite(src).all():
+            raise ValueError("source contains NaN or infinity")
+        if (src < 0.0).any():
+            # A negative source would make the accumulation non-monotone
+            # downstream, and every consumer (the width law, the head test, the
+            # log2 flow plane) assumes monotonicity.
+            raise ValueError("source is a per-cell quantity and must be >= 0")
+        acc = src.ravel().copy()
     if inflow is not None:
         inf = np.ascontiguousarray(inflow, dtype=np.float64)
         if inf.shape != zz.shape:

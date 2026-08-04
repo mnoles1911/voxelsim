@@ -295,6 +295,17 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         # tuple -- including when it is EMPTY, which is a statement ("surveyed,
         # holds nothing") and not an absence.
         "basins": result.basins,
+        # bake_ver 9: the P2 water plane. WITHOUT THIS LINE THE BAKE COMPUTES
+        # THE PLANE AND THROWS IT AWAY, which is what happened on the first
+        # corridor re-bake (2026-08-03): `--mode bake` ran the B6 stage, spent
+        # 302 CPU-s, and wrote a tile byte-for-byte the same size as the
+        # bake_ver 8 one with FLAG_WATER_PRESENT clear. Nothing said so -- see
+        # the `unencoded` guard in `_run_bake` for why that silence is now an
+        # error rather than a comment.
+        # getattr, like `basins` above and the `args` flags below: this function
+        # is called with hand-built result objects by tests and by tools outside
+        # this module, and a new BakeResult field must not break them.
+        "water_surface_m": getattr(result, "water_surface_m", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #
@@ -330,6 +341,34 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
             f"tile_codec.{enc.__name__} needs arguments this CLI cannot supply "
             f"({missing}); wire it explicitly rather than letting pregen guess."
         )
+
+    # EVERY BAKE PRODUCT MUST REACH THE ENCODER, and until 2026-08-03 one
+    # silently did not. The name-probing above is what makes this failure mode
+    # possible: a product the bake computes but `candidates` does not name is
+    # dropped without a word, and the tile that comes out is a VALID tile of
+    # the previous bake version. That is invisible in the log, invisible in the
+    # file size, and costs a full re-bake to discover -- the P2 water plane was
+    # found this way, after 302 CPU-s produced a tile with FLAG_WATER_PRESENT
+    # clear.
+    #
+    # So: for each product the BakeResult actually carries, at least one of its
+    # accepted spellings must have landed in `kwargs`. Aliases are grouped
+    # because only one of each pair can be accepted by construction.
+    for group, value in (
+        (("elevation_m", "elevation"), result.elevation_m),
+        (("flow", "flow_plane"), result.flow),
+        (("basins",), result.basins),
+        (("water_surface_m",), getattr(result, "water_surface_m", None)),
+    ):
+        if value is None:
+            continue          # the bake produced nothing; nothing to lose
+        if not any(name in kwargs for name in group):
+            raise NotImplementedError(
+                f"this bake produced {group[0]} but tile_codec.{enc.__name__} "
+                f"accepts none of {group}, so it would be DROPPED and the tile "
+                "written without it. Wire the encoder rather than shipping a "
+                "tile that silently omits a product the bake paid for."
+            )
     return enc(**kwargs)
 
 
@@ -701,8 +740,18 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             continue
         cache.put_fine(fine_provider_id, args.seed, x, y, encoded)
         baked += 1
+        # The water plane goes in the LOG LINE, not only in the stats dump.
+        # "wet=0.000%" is a legitimate reading on a dry tile and a symptom on a
+        # wet one, and either way it is the only place a run says out loud
+        # whether the thing the re-bake was spent on actually landed.
+        wet = result.water_surface_m
+        water_str = (
+            "none" if wet is None
+            else f"{100.0 * float(np.isfinite(wet).mean()):.3f}%wet"
+        )
         print(
             f"[{i + 1}/{len(targets)}] baked ({x},{y}) cpu={cpu:.1f}s "
+            f"water={water_str} "
             f"max_catchment={result.stats['max_accumulation_km2']:.1f}km2 "
             f"incision_p99={result.stats['incision_p99_m']:.2f}m "
             f"channels={int(result.stats['channel_cells'])} "

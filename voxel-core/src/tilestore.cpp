@@ -561,6 +561,7 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     if (tableEnd > fileSize) return reject(FineError::kBadSectionTable);
 
     SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec;
+    SectionRef waterIndexSec, waterDataSec;
     struct Extent {
         uint64_t begin, end;
     };
@@ -600,6 +601,8 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         case kSectionFlowIndex: flowIndexSec = ref; break;
         case kSectionFlowData: flowDataSec = ref; break;
         case kSectionBasinTable: basinSec = ref; break;
+        case kSectionWaterIndex: waterIndexSec = ref; break;
+        case kSectionWaterData: waterDataSec = ref; break;
         default: break; // see (b): unknown ids are ignored but still bounded
         }
     }
@@ -623,6 +626,17 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     // no table is a client that would silently place no water.
     const bool wantBasins = (h.flags & kFineFlagBasinsPresent) != 0;
     if (wantBasins != basinSec.present) return reject(FineError::kBadSectionTable);
+    // Same both-directions agreement for the water plane. The "sections
+    // present, flag clear" half is the one that matters most here: those bytes
+    // would be silently ignored and every river in the tile would vanish
+    // without a single error being raised anywhere.
+    const bool wantWater = (h.flags & kFineFlagWaterPresent) != 0;
+    if (wantWater != (waterIndexSec.present && waterDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
+    if (!wantWater && (waterIndexSec.present || waterDataSec.present)) {
+        return reject(FineError::kBadSectionTable);
+    }
 
     std::vector<BasinEntry> basins;
     if (wantBasins && !parseBasinTable(bytes.data(), basinSec.offset, basinSec.length,
@@ -637,6 +651,8 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     tile.elevDataLen_ = elevDataSec.length;
     tile.flowDataOff_ = flowDataSec.offset;
     tile.flowDataLen_ = flowDataSec.length;
+    tile.waterDataOff_ = waterDataSec.offset;
+    tile.waterDataLen_ = waterDataSec.length;
 
     const uint32_t perAxis = static_cast<uint32_t>(h.size) >> h.blockLog2;
     const uint32_t blocks = perAxis * perAxis;
@@ -650,6 +666,16 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     if (wantFlow && !parseBlockIndex(bytes.data(), flowIndexSec.offset, flowIndexSec.length,
                                      blocks, blockPixels, flowDataSec.length, 1, compressed,
                                      tile.flowIndex_)) {
+        return reject(FineError::kBadBlockIndex);
+    }
+
+    // Element width 2, exactly like elevation: the water plane IS an elevation
+    // plane, on the same datum, which is what lets it share every byte of this
+    // machinery instead of growing a second one to keep in step.
+    if (wantWater && !parseBlockIndex(bytes.data(), waterIndexSec.offset,
+                                      waterIndexSec.length, blocks, blockPixels,
+                                      waterDataSec.length, 2, compressed,
+                                      tile.waterIndex_)) {
         return reject(FineError::kBadBlockIndex);
     }
 
@@ -684,6 +710,25 @@ bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& o
                                        bytes_.data() + flowDataOff_,
                                        static_cast<size_t>(flowDataLen_), dim, 0, 255, dec_,
                                        fineCodecNeedsDecompressor(h_.codec), out.data(), err);
+}
+
+bool FineTile::decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                               FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (!hasWater()) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t perAxis = blocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t dim = blockDim();
+    // Filled with the DRY sentinel, not 0. 0 is a legitimate stored DEPTH
+    // (water exactly at its own bed, which is what a reach's shallow edge
+    // quantises to), so a block that failed to decode must read as the
+    // sentinel or it becomes a sheet of zero-depth water over the whole block.
+    out.assign(blockPixelCount(), kWaterDryDepth);
+    return decodeBlockPayload<int16_t>(waterIndex_[by * perAxis + bx],
+                                       bytes_.data() + waterDataOff_,
+                                       static_cast<size_t>(waterDataLen_), dim, -32768, 32767,
+                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
+                                       err);
 }
 
 bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const {

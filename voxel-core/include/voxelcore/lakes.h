@@ -59,11 +59,9 @@
 
 namespace vxc {
 
-// "No baked water over this column." INT32_MIN rather than a sentinel like
-// kSeaLevelMm because a lake CAN sit below sea level datum-wise in principle
-// and because `CavernColumn::floodZMm` already uses exactly this value for
-// exactly this meaning -- one convention, two producers.
-inline constexpr int32_t kNoWaterMm = INT32_MIN;
+// `kNoWaterMm` moved to tilestore.h at bake_ver 9 -- the water PLANE is decoded
+// there and must answer "dry" in the same currency this file's lake sampler
+// does. Still one constant, one meaning; only its home changed.
 
 // Fill units (0..255, the CA's own currency) for the voxel whose BOTTOM is at
 // `zBottomMm`, under a water surface at `surfaceMm`.
@@ -469,6 +467,173 @@ inline size_t subtractRect(const LakeSheetRect& r, const LakeSheetRect& hole, La
     if (hole.x1 < r.x1) out[n++] = LakeSheetRect{hole.x1 + 1, my0, r.x1, my1};          // right
     return n;
 }
+
+// Baked RIVERS over a `FineTileSampler`, from the P2 water plane.
+//
+// The counterpart of LakeSampler and deliberately much simpler, because the
+// plane is already the answer: the bake did the non-local work (a
+// runoff-weighted accumulation sweep and a descent-enforcing pass down the D8
+// forest) and wrote the water surface per pixel, so a query here is one block
+// decode and one lookup. No flood fill, no extent mask, no registry -- the
+// asymmetry is the point, and it is why rivers cost a plane while lakes cost a
+// table.
+//
+// THREADING and COST mirror FineTileSampler exactly: the first query in a
+// block decodes it, so queries MUTATE. Call `prewarmTile` over the region of
+// interest from one thread, then read from many.
+class RiverSampler final : public IWaterSampler {
+public:
+    explicit RiverSampler(FineTileSampler& tiles) : tiles_(tiles) {}
+
+    bool prewarmTile(int32_t tx, int32_t ty) {
+        const FineTile* t = tiles_.findTile(tx, ty);
+        return t != nullptr && t->hasWater();
+    }
+
+    int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override {
+        const int32_t pxMm = tiles_.pixelSizeMm();
+        if (pxMm <= 0) return kNoWaterMm;
+        const int64_t px = floorDiv(vx * kVoxelSizeMm, pxMm);
+        const int64_t py = floorDiv(vy * kVoxelSizeMm, pxMm);
+        if (memoValid_ && px == memoPx_ && py == memoPy_) return memoMm_;
+        const int32_t mm = surfaceAtPixel(px, py);
+        memoPx_ = px;
+        memoPy_ = py;
+        memoMm_ = mm;
+        memoValid_ = true;
+        return mm;
+    }
+
+    // Same question in tile-pixel space, for tests and for the clipmap band.
+    int32_t surfaceAtPixel(int64_t px, int64_t py) {
+        const uint32_t size = tiles_.tileSize();
+        if (size == 0) return kNoWaterMm;
+        const int32_t tx = int32_t(floorDiv(px, size)), ty = int32_t(floorDiv(py, size));
+        const FineTile* t = tiles_.findTile(tx, ty);
+        // A tile that is not resident, or one baked before the water plane
+        // existed, answers DRY -- and the residency gate
+        // (FVoxelFineTileStreamer, block-until-ready) is what makes that safe:
+        // no chunk generates over a non-resident footprint, so "dry because not
+        // loaded" can never be voxelised into a desync.
+        if (t == nullptr || !t->hasWater()) return kNoWaterMm;
+        const uint32_t lx = uint32_t(px - int64_t(tx) * size);
+        const uint32_t ly = uint32_t(py - int64_t(ty) * size);
+        const uint32_t log2 = t->blockLog2();
+        const uint32_t dim = t->blockDim();
+        const uint64_t k = blockKey(tx, ty, lx >> log2, ly >> log2);
+        auto it = blocks_.find(k);
+        if (it == blocks_.end()) {
+            std::vector<int16_t> depth;
+            if (!t->decodeWaterBlock(lx >> log2, ly >> log2, depth)) {
+                ++unresolvedBlocks_;
+                return kNoWaterMm;
+            }
+            it = blocks_.emplace(k, std::move(depth)).first;
+        }
+        const size_t i = size_t(ly & (dim - 1)) * dim + size_t(lx & (dim - 1));
+        const int16_t d = it->second[i];
+        // DRY IS DECIDED BEFORE THE SPLINE, not after. The reconstruction below
+        // costs a 4x4 stencil gather, and ~99% of a production tile is dry --
+        // paying it to compute a ground we are about to throw away would put a
+        // 16-probe carrier evaluation on every voxel column of the near-field
+        // sweep, the hottest loop in the water path.
+        if (d < 0) return kNoWaterMm;
+        // THE RECONSTRUCTED SURFACE, `spline(cp)` -- not this pixel's control
+        // point, which is what this function used to pass and what the whole
+        // signature of `waterMmFromDepth` exists to prevent.
+        //
+        // The lattice was chosen here originally on the argument that a
+        // per-pixel sampler has no spline and that a sub-voxel datum offset
+        // cannot change a coarse "is there water near here" answer. The first
+        // half is no longer true (`reconstructedGroundMm` is the spline, and it
+        // is the shipped one), and the second half was never the whole story:
+        // THIS SAMPLER IS THE NEAR-FIELD DATUM. `FVoxelWaterImpl`'s ImplicitFn
+        // takes `waterSurfaceMmAtVoxel` and hands it straight to
+        // `implicitWaterFill` as the water surface, so an offset here is an
+        // offset in the rendered waterline -- and |cp - surface| reaches 5.6 m
+        // on this world, which is 56 voxels.
+        //
+        // Having ONE datum, correct, is deliberate: the alternative on the
+        // table was to keep the cheap lattice answer here and add a
+        // ground-taking overload for the near field, which is exactly the shape
+        // of the conflation that has now been made three times in this
+        // codebase. A caller cannot pick the wrong one if there is only one.
+        return FineTile::waterMmFromDepth(d, reconstructedGroundMm(tiles_, px, py));
+    }
+
+    uint32_t tilePixels() const override { return tiles_.tileSize(); }
+    int32_t pixelSizeMm() const override { return tiles_.pixelSizeMm(); }
+
+    size_t residentBlockCount() const { return blocks_.size(); }
+    // Blocks whose payload failed to decode. Non-zero means water is MISSING,
+    // which looks exactly like "there is no river here" and must not.
+    uint64_t unresolvedBlocks() const { return unresolvedBlocks_; }
+
+private:
+    static uint64_t blockKey(int32_t tx, int32_t ty, uint32_t bx, uint32_t by) {
+        return (uint64_t(uint32_t(tx)) << 44) ^ (uint64_t(uint32_t(ty)) << 24) ^
+               (uint64_t(bx) << 12) ^ uint64_t(by);
+    }
+
+    // THE DEPTH PLANE ONLY. This used to cache the elevation block beside it,
+    // on the argument that a water query always needs both -- true, but the
+    // ground it needs is `spline(cp)`, whose 4x4 stencil straddles block and
+    // tile boundaries and so cannot come from one cached block anyway.
+    // `FineTileSampler` already caches decoded elevation blocks, and
+    // `reconstructedGroundMm` reads through it, so keeping a second copy here
+    // bought nothing and cost a decode per water block.
+    FineTileSampler& tiles_;
+    std::unordered_map<uint64_t, std::vector<int16_t>> blocks_;
+    uint64_t unresolvedBlocks_ = 0;
+    int64_t memoPx_ = 0, memoPy_ = 0;
+    int32_t memoMm_ = kNoWaterMm;
+    bool memoValid_ = false;
+};
+
+// Lakes and rivers as ONE query, which is what §5.1 means by "river water goes
+// through the same ImplicitFn as lakes".
+//
+// The plan asked for this by putting lake surfaces INTO the water plane so the
+// client had one uniform query. It is done here instead, and the difference is
+// deliberate: writing a basin's surface into the plane as well would put a
+// second copy of an already-shipped fact (SECTION_BASIN_TABLE's `surfaceMm`)
+// on the wire, free to disagree with the first. Composing two samplers gives
+// the same single query with no duplicated bytes and nothing to keep in step
+// -- and the bake writes the plane DRY inside registered basins precisely so
+// the two never both answer.
+//
+// HIGHEST WINS where they overlap anyway. They should not overlap; "should
+// not" is not "cannot", and taking the lower would drain a lake into the river
+// that feeds it.
+class CompositeWaterSampler final : public IWaterSampler {
+public:
+    CompositeWaterSampler(IWaterSampler& lakes, IWaterSampler& rivers)
+        : lakes_(lakes), rivers_(rivers) {}
+
+    int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override {
+        const int32_t a = lakes_.waterSurfaceMmAtVoxel(vx, vy);
+        const int32_t b = rivers_.waterSurfaceMmAtVoxel(vx, vy);
+        if (a == kNoWaterMm) return b;
+        if (b == kNoWaterMm) return a;
+        return a > b ? a : b;
+    }
+
+    // The sheet half belongs to the lakes: a river reach is not a flat disc
+    // and cannot be drawn as one. Forwarded rather than merged so the sheet
+    // actor keeps seeing exactly the registry it already consumes.
+    const std::vector<BasinEntry>* basinsForTile(int32_t tx, int32_t ty) override {
+        return lakes_.basinsForTile(tx, ty);
+    }
+    const std::vector<uint8_t>* extentMaskFor(int32_t tx, int32_t ty, uint16_t id) override {
+        return lakes_.extentMaskFor(tx, ty, id);
+    }
+    uint32_t tilePixels() const override { return lakes_.tilePixels(); }
+    int32_t pixelSizeMm() const override { return lakes_.pixelSizeMm(); }
+
+private:
+    IWaterSampler& lakes_;
+    IWaterSampler& rivers_;
+};
 
 // The composed predicate of §5.1, as one function so the client's binding site
 // and the tests cannot express it differently.

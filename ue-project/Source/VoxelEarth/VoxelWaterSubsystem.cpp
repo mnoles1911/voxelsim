@@ -186,15 +186,27 @@ class FLakeWaterSampler final : public vxc::IWaterSampler
 {
 public:
 	FLakeWaterSampler(uint64 InSeed, FString InRoot, std::string InProviderId)
-		: Tiles(InSeed), Lakes(Tiles), Root(MoveTemp(InRoot)), ProviderId(MoveTemp(InProviderId))
+		: Tiles(InSeed), Lakes(Tiles), Rivers(Tiles), Both(Lakes, Rivers),
+		  Root(MoveTemp(InRoot)), ProviderId(MoveTemp(InProviderId))
 	{
 		Tiles.setDecompressor(VoxelEarth::GetFineTileDecompressor());
 	}
 
+	// LAKES AND RIVERS AS ONE QUERY (watershed plan §5.1). Both samplers read
+	// the SAME `Tiles`, so one EnsureTileFor covers both and there is no state
+	// in which the lake half and the river half disagree about which tiles are
+	// resident -- which is the failure the sheet half was already careful about.
+	//
+	// The composition is vxc::CompositeWaterSampler rather than a max() written
+	// here, for the reason implicitWaterFill is in lakes.h rather than inline:
+	// the binding site and the tests must not be able to express the rule
+	// differently. It takes the HIGHER datum where they overlap; they should
+	// not overlap at all (the bake writes the plane dry inside registered
+	// basins) but taking the lower would drain a lake into the river feeding it.
 	int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override
 	{
 		EnsureTileFor(vx, vy);
-		return Lakes.waterSurfaceMmAtVoxel(vx, vy);
+		return Both.waterSurfaceMmAtVoxel(vx, vy);
 	}
 
 	// Work item 5's sheet half. Same load-then-ask shape as the column query
@@ -217,6 +229,11 @@ public:
 	uint64 TilesMissing() const { return Missing.Num(); }
 	uint64 TilesRefused() const { return Refused; }
 	size_t ResidentMasks() const { return Lakes.residentMaskCount(); }
+	size_t ResidentWaterBlocks() const { return Rivers.residentBlockCount(); }
+	// Non-zero means a river's bytes were there and did not decode, which on
+	// screen is indistinguishable from "there is no river here". Surfaced so it
+	// can be logged rather than inferred from an empty valley.
+	uint64 RiverBlocksUnresolved() const { return Rivers.unresolvedBlocks(); }
 
 private:
 	// Loads the fine tile under this voxel column if it is not already
@@ -264,8 +281,13 @@ private:
 		++Loaded;
 	}
 
+	// DECLARATION ORDER IS LOAD-BEARING: Lakes and Rivers borrow Tiles, and
+	// Both borrows Lakes and Rivers. Reordering these members reorders their
+	// construction and binds a reference to an object that does not exist yet.
 	vxc::FineTileSampler Tiles;
 	vxc::LakeSampler Lakes;
+	vxc::RiverSampler Rivers;
+	vxc::CompositeWaterSampler Both;
 	FString Root;
 	std::string ProviderId;
 	TSet<uint64> Missing;
@@ -307,8 +329,9 @@ std::unique_ptr<vxc::IWaterSampler> MakeWaterSampler(uint64 Seed)
 		                   TEXT("DefaultFineTileProviderId"), ProviderId, GGameIni);
 	}
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("Lake tier ENABLED: root=%s provider=%s seed=%llu. Lakes come from the baked basin "
-	            "table (bake_ver 8); a tile baked before it carries none and answers dry."),
+	       TEXT("Baked water tier ENABLED: root=%s provider=%s seed=%llu. Lakes come from the basin "
+	            "table (bake_ver 8) and rivers from the water plane (bake_ver 9); a tile baked "
+	            "before either carries it not, and answers dry for that half alone."),
 	       *Dir, *ProviderId, (unsigned long long)Seed);
 	return std::make_unique<FLakeWaterSampler>(Seed, Dir, std::string(TCHAR_TO_UTF8(*ProviderId)));
 }

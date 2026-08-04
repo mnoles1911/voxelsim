@@ -112,7 +112,7 @@ import json
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, ClassVar
 
 import numpy as np
 
@@ -120,9 +120,12 @@ import numpy as np
 # imports elsewhere in this file exist for scipy/numba, not for module cycles).
 from . import basins as _basins
 from . import province as _province
+from . import water as _water
 
 __all__ = [
     "BAKE_VERSION",
+    "PRODUCT_STAGE_ORDER",
+    "TERRAIN_VERSION",
     "BakeConstants",
     "BakeGeometry",
     "BakeKernels",
@@ -272,7 +275,66 @@ __all__ = [
 #: The bake stops levelling registered depressions into rock and ships a table
 #: describing them. Every baked tile is invalidated; that is expected and
 #: currently cheap.
-BAKE_VERSION = 8
+#:
+#: ===========================================================================
+#: TWO COUNTERS, SPLIT AT bake_ver 9. READ THIS BEFORE BUMPING EITHER.
+#: ===========================================================================
+#: Until P2 there was ONE counter, and it did two unrelated jobs:
+#:
+#:   1. it seeded the world -- ``roughness_seed`` mixes it in, so bumping it
+#:      RE-ROLLS THE B1 ROUGHNESS FIELD EVERYWHERE and the ground itself
+#:      changes;
+#:   2. it recorded which PRODUCTS a tile carries -- the sections in the file.
+#:
+#: Those are opposite in kind, and fusing them made every additive change to
+#: the wire format cost a new world. Measured, when P2 was scoped: bumping the
+#: single counter 8 -> 9 moved ``roughness_seed(20260719)`` from
+#: 0x7e1ec856567c4fb5 to 0xc2b0bf0a8b32531f. Every basin in the 256-tile lake
+#: survey, every channel the 25-tile bank probe walked, every vista site and
+#: every spawn coordinate the owner holds describes ground that would simply
+#: stop existing -- to add a section that changes no elevation byte.
+#:
+#: So:
+#:
+#:   TERRAIN_VERSION  decides the GROUND. Feeds ``roughness_seed`` and
+#:                    ``bake_identity_payload``. Bump it when the surface
+#:                    changes -- a new stage, a new constant in
+#:                    ``BakeConstants.as_payload``, a kernel that moves a
+#:                    height. Bumping it is a NEW WORLD and invalidates every
+#:                    measurement, screenshot and site anyone holds.
+#:
+#:   BAKE_VERSION     decides the PRODUCTS. Stamped in the tile header as
+#:                    ``bake_ver`` and hashed through
+#:                    ``product_identity_payload``. Bump it when the bake emits
+#:                    something new or differently -- a section, a table
+#:                    layout, a threshold that decides written bytes. Tiles are
+#:                    re-baked, but onto IDENTICAL ground.
+#:
+#: BOTH feed ``fine_provider_id`` (via ``providers/diffusion.py``), so content
+#: addressing keeps meaning what it says: a tile whose water bytes differ never
+#: shares an id with one whose do not. That is deliberate and is the reason the
+#: product half is hashed rather than merely stamped -- the namespace holding
+#: two mutually incompatible formats under one id is the failure
+#: ``_tile_format_fingerprint`` was written to prevent.
+#:
+#: THE GATE THAT KEEPS THE SPLIT HONEST is
+#: ``tests/test_bake_terrain_identity.py``: re-baking a resident fine tile must
+#: reproduce its elevation plane BYTE FOR BYTE. If that ever fails, something
+#: has leaked from the product half into the terrain half and the split has
+#: stopped doing its job -- which is worth more than any green suite here,
+#: because the whole argument for the split is that the ground does not move.
+#:
+#: And ``test_constants_partition_is_exhaustive`` asserts every
+#: ``BakeConstants`` field lands in exactly one of ``as_payload`` (terrain) or
+#: ``product_payload`` (product). A constant in NEITHER would decide baked
+#: bytes while rolling no identity at all, which is the silent-drift failure
+#: the whitelist form of ``as_payload`` otherwise invites.
+#:
+#: bake_ver 9 -- P2: runoff-weighted discharge, water heads and the graded
+#: water plane (SECTION_WATER_INDEX/DATA). Additive: no elevation byte moves,
+#: which is exactly what the terrain-identity gate proves.
+TERRAIN_VERSION = 8
+BAKE_VERSION = 9
 
 
 @dataclass(frozen=True)
@@ -800,6 +862,33 @@ class BakeConstants:
     #: as well as 7.7 MB of it. See FLOW_PLANE_SIZE.
     flow_flag_sea_taper: bool = True
 
+    # -- P2 water plane (bake_ver 9) ---------------------------------------
+    #
+    # PRODUCT constants, not terrain ones: every field below decides bytes in
+    # SECTION_WATER_*, and NONE of them can move a height. They are hashed
+    # through ``product_payload`` rather than ``as_payload``, so retuning them
+    # rolls ``fine_provider_id`` (a tile whose water differs must not share an
+    # id) without re-rolling the roughness seed (the ground must not move).
+    # See the TERRAIN_VERSION/BAKE_VERSION note at the top of this module.
+
+    #: Discharge, m^3/yr, at which a watercourse is PERENNIAL -- wet in every
+    #: month rather than after rain. 10 L/s. See ``bake.water`` for why this is
+    #: a flow rate rather than the plan's open-ended "10^3-10^4 m^3/yr", and
+    #: why it is deliberately NOT ``channel_init_area_m2``: 156 m^2 is where
+    #: the bake carves a swale, which in most climates is a dry gully.
+    water_q_perennial_m3_yr: float = 315576.0
+    #: Minimum drawn channel width, in FINE PIXELS. The Q threshold the plane
+    #: is actually written over is derived from this through the width law
+    #: (``water.q_drawable_m3_yr``), so the two cannot drift: a channel at
+    #: initiation is 1.5 m wide against a 1.875 m pixel, and phase 2 puts water
+    #: only on reaches wide enough for the raster to hold a wet bed. At
+    #: production this lands at 3.15e6 m^3/yr = 0.100 m^3/s.
+    water_min_width_px: float = 2.0
+    #: Write the water plane at all. False reproduces a bake_ver-8 tile's
+    #: sections exactly (no SECTION_WATER_*, flag clear), which is what the
+    #: terrain-identity gate bakes against.
+    water_plane_enabled: bool = True
+
     def __post_init__(self) -> None:
         if not 0.0 < self.thermal_rate <= 0.5:
             raise ValueError(
@@ -952,6 +1041,25 @@ class BakeConstants:
             "flow_flag_sea_taper": self.flow_flag_sea_taper,
         }
 
+    #: Fields that decide PRODUCT bytes but can never move a height. The
+    #: complement of ``as_payload`` over the dataclass, and the two are
+    #: asserted to partition the field set exactly
+    #: (``test_constants_partition_is_exhaustive``) -- a field in NEITHER would
+    #: change baked bytes while rolling no identity at all, which is precisely
+    #: the drift a whitelist invites and the reason that test exists.
+    #: ClassVar, NOT a bare annotation: on a dataclass an annotated class
+    #: attribute becomes a FIELD, and this one would then appear in its own
+    #: partition test as an unclassified constant.
+    PRODUCT_FIELDS: ClassVar[tuple[str, ...]] = (
+        "water_q_perennial_m3_yr",
+        "water_min_width_px",
+        "water_plane_enabled",
+    )
+
+    def product_payload(self) -> dict:
+        """The product half of the identity. See ``PRODUCT_FIELDS``."""
+        return {name: getattr(self, name) for name in self.PRODUCT_FIELDS}
+
 
 PRODUCTION = BakeGeometry()
 CONSTANTS = BakeConstants()
@@ -971,6 +1079,18 @@ STAGE_ORDER: tuple[str, ...] = (
     "B5.reopen_basins",
 )
 
+#: Stages that produce PRODUCTS rather than ground. Hashed into
+#: ``product_identity_payload``, never into ``bake_identity_payload`` -- B6
+#: reads the surface and writes a separate plane, and putting it in
+#: ``STAGE_ORDER`` would roll the terrain identity of every world for a stage
+#: that cannot move a height by construction.
+#:
+#: ``bake_tile`` reports timings for both lists in one ``cpu_seconds`` dict, so
+#: the split is an identity boundary and not a reporting one.
+PRODUCT_STAGE_ORDER: tuple[str, ...] = (
+    "B6.discharge_water",
+)
+
 
 def bake_identity_payload(
     geom: BakeGeometry = PRODUCTION, consts: BakeConstants = CONSTANTS
@@ -983,7 +1103,11 @@ def bake_identity_payload(
     under one identity.
     """
     return {
-        "bake_version": BAKE_VERSION,
+        # NAME KEPT at "bake_version" though it now carries TERRAIN_VERSION:
+        # this key is hashed into every shipped fine_provider_id, and renaming
+        # it would roll the terrain namespace of every existing world for a
+        # cosmetic reason -- the precise thing the split exists to avoid.
+        "bake_version": TERRAIN_VERSION,
         "stage_order": list(STAGE_ORDER),
         "geometry": geom.as_payload(),
         "constants": consts.as_payload(),
@@ -1001,6 +1125,56 @@ def bake_fingerprint(
 ) -> str:
     return hashlib.sha256(
         json.dumps(bake_identity_payload(geom, consts), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+
+
+def product_identity_payload(consts: BakeConstants = CONSTANTS) -> dict:
+    """Everything that decides which PRODUCTS a tile carries and what is in them.
+
+    The other half of ``bake_identity_payload``. Folded into
+    ``fine_provider_id`` alongside it, so a tile whose water plane differs never
+    shares an id with one whose does not -- content addressing meaning what it
+    says. What it deliberately does NOT do is reach ``roughness_seed``: bumping
+    a product constant re-bakes tiles onto identical ground rather than
+    creating a world.
+
+    Note what is absent, because it is the reason this is affordable: water
+    APPEARANCE -- translucency, colour, the depth cue, the foam channel -- is
+    client-side material work and touches no baked byte, so the W6/W7-style
+    retuning the owner does most often rolls nothing here.
+    """
+    return {
+        "bake_version": BAKE_VERSION,
+        "stage_order": list(PRODUCT_STAGE_ORDER),
+        "constants": consts.product_payload(),
+        # The section ids and flag bit the bake writes. A layout change with no
+        # constant change would otherwise be invisible to the id -- which is
+        # exactly the "namespace holding two mutually incompatible formats"
+        # failure `providers/diffusion.py::_tile_format_fingerprint` records.
+        "sections": {
+            "water_index": _codec_const("SECTION_WATER_INDEX"),
+            "water_data": _codec_const("SECTION_WATER_DATA"),
+            "water_flag": _codec_const("FLAG_WATER_PRESENT"),
+            "water_dry_sentinel": _codec_const("WATER_DRY_DEPTH"),
+            "water_depth_lsb_mm": _codec_const("WATER_DEPTH_LSB_MM"),
+        },
+    }
+
+
+def _codec_const(name: str) -> int:
+    """Read one wire constant from ``tile_codec`` without importing it eagerly.
+
+    ``tile_codec`` imports the bake lazily (for ``BAKE_VERSION``), so importing
+    it at this module's top level would close a cycle.
+    """
+    from .. import tile_codec
+
+    return int(getattr(tile_codec, name))
+
+
+def product_fingerprint(consts: BakeConstants = CONSTANTS) -> str:
+    return hashlib.sha256(
+        json.dumps(product_identity_payload(consts), sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
@@ -1131,7 +1305,7 @@ def roughness_seed(
     world_seed: int,
     origin_cells: tuple[int, int] = (0, 0),
     *,
-    bake_version: int = BAKE_VERSION,
+    bake_version: int = TERRAIN_VERSION,
     anchor_pitch_fine_px: int = 0,
 ) -> int:
     """The seed handed to ``noise.roughness``. Read ``NOISE_ANCHORING`` first.
@@ -1711,7 +1885,7 @@ def superblock_inputs_fingerprint(
     h.update(
         json.dumps(
             {
-                "bake_version": BAKE_VERSION,
+                "bake_version": TERRAIN_VERSION,
                 "level": int(level.level),
                 "sx": int(sx),
                 "sy": int(sy),
@@ -1814,7 +1988,7 @@ def encode_flow_superblock(sb: FlowSuperblock, seed: int) -> bytes:
         _FLOW_MAGIC,
         _FLOW_VERSION,
         _u64(seed),
-        BAKE_VERSION,
+        TERRAIN_VERSION,
         sb.level,
         0,
         sb.sx,
@@ -1856,11 +2030,16 @@ def decode_flow_superblock(data: bytes) -> tuple[FlowSuperblock, int]:
         raise ValueError("bad flow superblock magic")
     if version != _FLOW_VERSION:
         raise ValueError(f"unsupported flow superblock version {version}")
-    if bake_ver != BAKE_VERSION:
-        # Cannot happen through the cache (provider_id covers BAKE_VERSION),
-        # but a stale file handed in directly must not be silently mixed in.
+    if bake_ver != TERRAIN_VERSION:
+        # TERRAIN_VERSION, not BAKE_VERSION: a superblock is a ROUTING product
+        # over the coarse ground, and it stays valid across a products-only
+        # bump. Pinning it to BAKE_VERSION would throw away every cached
+        # superblock on a bump that cannot change a single one of their bytes.
+        # Cannot happen through the cache (provider_id covers both), but a
+        # stale file handed in directly must not be silently mixed in.
         raise ValueError(
-            f"flow superblock was built by bake_ver {bake_ver}, this is {BAKE_VERSION}"
+            f"flow superblock was built by terrain_ver {bake_ver}, this is "
+            f"{TERRAIN_VERSION}"
         )
     off = _FLOW_HEADER.size
     missing = np.frombuffer(data, dtype="<i4", count=2 * n_missing, offset=off)
@@ -2028,7 +2207,7 @@ def model_superblock_fingerprint(
     h.update(
         json.dumps(
             {
-                "bake_version": BAKE_VERSION,
+                "bake_version": TERRAIN_VERSION,
                 "cell_m": float(cell_m),
                 "origin_x_m": float(origin_m[0]),
                 "origin_y_m": float(origin_m[1]),
@@ -2754,6 +2933,16 @@ class BakeResult:
     #: which is a different statement from a tile that predates the registry --
     #: see tile_codec.FLAG_BASINS_PRESENT.
     basins: tuple["_basins.BasinRecord", ...] = ()
+    #: Runoff-weighted discharge, m^3/yr, interior (bake_ver 9, plan P2). None
+    #: when the tile baked without climate -- there is no honest Q without a
+    #: precipitation field, and inventing one would put rivers in a world whose
+    #: climate nobody supplied.
+    discharge_m3_yr: "np.ndarray | None" = None
+    #: The graded water surface, metres absolute, NaN where dry, interior.
+    #: None for the same reason as ``discharge_m3_yr``. This is what becomes
+    #: SECTION_WATER_*; see ``bake.water`` for the laws and for the overshoot
+    #: gate that decides whether it is trustworthy.
+    water_surface_m: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -2924,7 +3113,7 @@ def bake_padded_domain(
     seed = roughness_seed(
         world_seed,
         origin_cells,
-        bake_version=BAKE_VERSION,
+        bake_version=TERRAIN_VERSION,
         anchor_pitch_fine_px=consts.noise_anchor_pitch_fine_px,
     )
     origin_kw = roughness_origin_kwarg(kernels.roughness)
@@ -3458,8 +3647,18 @@ def bake_tile(
         keep_labels=True,
         keep_hypsometry=False,
     )
+    # THE PRE-B5 SURFACE, kept for B6. It is the one the B4b refill guarantees
+    # has ZERO SINKS, which is what makes the water plane's descent chain well
+    # posed; after the re-opening below it has a hole per registered basin. A
+    # full padded float32 copy (340 MB at production) taken only when the plane
+    # will actually be built, and dropped inside B6.
+    z_pre_reopen = None
+    basin_keep_pad = None
+    if consts.water_plane_enabled and padded_climate is not None:
+        z_pre_reopen = out["z"].copy()
     if survey.basins:
         keep = survey.keep_mask()
+        basin_keep_pad = keep
         # `basin_depth` is continuous and 0 at the rim by construction, so
         # subtracting it under the mask re-opens the hole with no seam at any
         # edge -- no feathering, no blend width, nothing to tune.
@@ -3470,7 +3669,6 @@ def bake_tile(
         # (340 MB each at production, on top of a bake that already peaks
         # around 5 GiB).
         out["z"][keep] -= out["basin_depth"][keep]
-        del keep
     survey.labels = None
     out["cpu_seconds"]["B5.reopen_basins"] = time.process_time() - c0
 
@@ -3482,6 +3680,102 @@ def bake_tile(
     # stream_power tapered against, so the flow plane's channel flag and the
     # incision it describes agree cell for cell.
     plane = flow_plane(acc, incision, gain, consts, elev_m=out["filled"][sl, sl])
+
+    # -- B6: RUNOFF-WEIGHTED DISCHARGE AND THE GRADED WATER PLANE
+    #    (bake_ver 9, plan P2 / §4.1).
+    #
+    # WHY IT CANNOT BE DONE ANYWHERE ELSE, measured before it was built. The
+    # obvious cheap alternative is an additive pass over already-shipped tiles:
+    # read accumulation back out of the flow plane's 5 log2 bits, multiply by
+    # the local runoff, write the plane, skip the re-bake. Measured on the
+    # shipped 289-tile coarse world over 174,886 drawable river cells, that
+    # reconstruction writes 46.35% OF THE RIVER NETWORK AS DRY and agrees with
+    # the true flow class on only 74.13% of the rest.
+    #
+    # And the reason is NOT the 5-bit quantisation, which is comparatively
+    # benign (Q ratio p5/p95 = 0.732/1.366 at the bucket midpoint). It is that
+    # AREA IS THE WRONG QUANTITY. A river is wet because of where its water
+    # came from, not where it is: median local runoff at a river cell is
+    # 247 mm/yr while the catchment-mean its discharge implies is 577 mm/yr,
+    # and |mean - local| / mean is 0.571 at p50, 0.998 at p95. Exotic rivers
+    # crossing dry ground have a local runoff of ~0 and vanish entirely. No
+    # wider accumulation field on the wire would fix that; only a
+    # runoff-weighted sweep over the network gives Q, and that sweep needs the
+    # padded domain and the superblock inflow, which exist only here.
+    #
+    # ONE EXTRA MFD SWEEP, not two. `accumulate_mfd(source=)` replaces the
+    # cell-area seed with each cell's runoff VOLUME, so the sweep returns
+    # m^3/yr directly over the identical weights the area field used. (The
+    # two-sweeps-and-subtract form in tools/worldmaps/water.py is exact only
+    # because that tool has no `inflow`; with the pyramid's edge injection live
+    # the difference of the two sweeps is A(I_q) - A(I_area), which is not the
+    # discharge.)
+    c0 = time.process_time()
+    discharge = None
+    water_surface = None
+    water_stats: dict[str, float] = {}
+    runoff_coarse = _water.runoff_field_mm_yr(
+        padded_climate, basin_balance(consts), consts.province_smooth_m,
+        geom.coarse_pixel_m,
+    )
+    if consts.water_plane_enabled and runoff_coarse is not None:
+        src = _water.discharge_source(
+            runoff_coarse, out["filled"].shape, geom.scale, geom.fine_pixel_m,
+            inflow_area_m2=out["inflow"],
+        )
+        q_pad = kernels.accumulate_mfd(
+            out["filled"], geom.fine_pixel_m, p=consts.mfd_p, source=src
+        )
+        del src
+        q_pad = np.asarray(q_pad, np.float64)
+
+        # THE ROUTING BED IS THE PRE-B5 SURFACE. B4b's refill guarantees it has
+        # zero sinks, which is what makes a descent chain over it well posed.
+        # Post-B5 the registered basins are holes, and grading a river's water
+        # surface down into a 500 m re-opened basin would drag the whole
+        # upstream profile with it. Basin cells are written DRY here; their
+        # surface is already on the wire in SECTION_BASIN_TABLE and the client
+        # composes the two samplers.
+        z_route = np.ascontiguousarray(z_pre_reopen, np.float32)
+        rec_w, _ = kernels.d8_receivers(z_route, geom.fine_pixel_m)
+        q_draw = _water.q_drawable_m3_yr(
+            geom.fine_pixel_m, consts.water_min_width_px,
+            consts.water_q_perennial_m3_yr,
+        )
+        wet_pad, heads_pad, head_stats = _water.water_head_mask(
+            q_pad, rec_w, q_drawable=q_draw,
+            q_perennial=consts.water_q_perennial_m3_yr,
+        )
+        w_pad = _water.graded_water_surface(
+            z_route, q_pad, rec_w, wet_pad,
+            eps_m=consts.refill_eps_m, exclude=basin_keep_pad,
+            q_perennial=consts.water_q_perennial_m3_yr,
+        )
+        del rec_w
+
+        discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
+        water_surface = np.ascontiguousarray(w_pad[sl, sl])
+        wet_int = np.isfinite(water_surface)
+
+        # THE OVERSHOOT GATE, on the interior only -- the bytes that ship.
+        # Overshoot is the failure mode with NO GEOMETRIC BACKSTOP: the bank
+        # probe found no containing ground within 120 m on 736 of 1,260 stream
+        # bank sides at 10 m depth, so a head that comes out too high floods the
+        # valley rather than leaking sideways and self-correcting.
+        water_stats = {f"water_{k}": v for k, v in head_stats.items()}
+        if wet_int.any():
+            water_stats.update({
+                f"water_{k}": v for k, v in _water.overshoot_stats(
+                    water_surface, z, discharge, wet_int,
+                    cell_m=geom.fine_pixel_m,
+                    z_route_m=np.ascontiguousarray(z_route[sl, sl]),
+                    q_perennial=consts.water_q_perennial_m3_yr,
+                ).items()
+            })
+        del wet_pad, heads_pad, w_pad, q_pad, z_route
+    del z_pre_reopen, basin_keep_pad
+    out["cpu_seconds"]["B6.discharge_water"] = time.process_time() - c0
+
 
     basin_depth = out["basin_depth"]
     padded_basin = basin_depth > 0.0
@@ -3580,6 +3874,7 @@ def bake_tile(
             b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
     }
+    stats.update(water_stats)
     # LANDFORM PROVINCE MIX over the tile INTERIOR, as area fractions summing
     # to 1. Cheap (a mean over 512^2) and it is the only way to know whether a
     # tile actually encountered the province whose constants it was baked with
@@ -3603,6 +3898,8 @@ def bake_tile(
         stats=stats,
         missing_coarse=tuple(missing),
         basins=tuple(survey.basins),
+        discharge_m3_yr=discharge,
+        water_surface_m=water_surface,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

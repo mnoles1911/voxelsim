@@ -65,6 +65,21 @@ std::filesystem::path fineBasinFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
 }
 
+// The golden tiles carrying a SECTION_WATER_* plane (watershed plan P2,
+// bake_ver 9), one per codec. Regenerate with
+// `python terrain-service/tools/make_water_fixture.py`, whose docstring lists
+// what each property of the plane is there to break. The ZSTD twin matters
+// more here than elsewhere: 24 of the 38 resident production tiles are
+// CODEC_ZSTD, so a decoder that only ever saw the RAW form would be untested
+// against most of the world.
+std::filesystem::path fineWaterFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_water_512.vxtl";
+}
+std::filesystem::path fineWaterZstdFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) /
+           "vxtl_v2_golden_water_zstd_512.vxtl";
+}
+
 // The CODEC_ZSTD twin of vxtl_v2_golden_512.vxtl: the SAME control lattice,
 // block mode for block mode, with each block's payload wrapped in its own zstd
 // frame. Regenerate both from the CODEC_RAW golden with
@@ -3075,5 +3090,160 @@ VXC_TEST(vxtl_v2_basin_table_is_refused_when_it_is_wrong) {
         flags |= 0x8000;
         std::memcpy(bad.data() + 31, &flags, 2);
         refused(bad, FineError::kBadHeader);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// SECTION_WATER_* (watershed plan P2, bake_ver 9). Cross-language, same rule
+// as the basin table above: the plane was written by
+// terrain_service/tile_codec.py against the same document, sharing no code
+// with this decoder.
+//
+// The water plane's failure mode is SILENT, which is why these are exhaustive
+// about the sentinel. A basin table that mis-parses raises; a water plane that
+// mis-parses draws a river in the wrong place, or reads the dry sentinel as an
+// ordinary control point and floods the tile with water 3.2 km underground.
+// Nothing throws.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+void checkWaterFixture(const std::filesystem::path& path, const char* what,
+                       FineDecompressor dec = {}) {
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, dec, &err);
+    if (!tile.has_value() && err == FineError::kNoDecompressor) {
+        std::printf("  (skipped %s: no zstd decompressor in this build)\n", what);
+        return;
+    }
+    CHECK(tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNone));
+    CHECK(tile->hasWater());
+    CHECK_EQ(int(tile->size()), 512);
+
+    const uint32_t dim = tile->blockDim();
+    std::vector<int16_t> blk;
+
+    // 1. THE DRY HALF. Blocks (1,0) and (1,1) are entirely dry and encode as
+    //    MODE_CONSTANT at the sentinel. A decoder that zero-fills a fresh
+    //    block instead of sentinel-filling it puts water at the datum here.
+    for (uint32_t by = 0; by < 2; ++by) {
+        CHECK(tile->decodeWaterBlock(1, by, blk));
+        CHECK_EQ(int(blk.size()), int(dim * dim));
+        size_t wet = 0;
+        for (int16_t cp : blk) {
+            if (cp != kWaterDryDepth) ++wet;
+            CHECK_EQ(int(tile->waterMmFromDepth(cp, 0)), int(kNoWaterMm));
+        }
+        CHECK_EQ(int(wet), 0);
+    }
+
+    // 2. THE WET HALF, and the sentinel exactly at the block seam.
+    CHECK(tile->decodeWaterBlock(0, 0, blk));
+    CHECK_EQ(int(blk[0 * dim + 255]), int(kWaterDryDepth));   // last px of block 0
+    CHECK_EQ(int(tile->waterMmFromDepth(blk[0 * dim + 255], 0)), int(kNoWaterMm));
+
+    // 3. The reach itself: 5 px wide, centred on x=128, and WET.
+    size_t wetInRow = 0;
+    for (uint32_t lx = 120; lx < 140; ++lx) {
+        if (blk[10 * dim + lx] != kWaterDryDepth) ++wetInRow;
+    }
+    CHECK_EQ(int(wetInRow), 5);
+
+    // 4. A stored DEPTH OF ZERO is one LSB off the -1 sentinel and MUST read
+    //    as water, at exactly the bed. That is the boundary an
+    //    `if (d <= 0) dry` bug gets wrong, and it is reachable: a reach's
+    //    shallow edge quantises there.
+    bool sawZeroDepth = false;
+    for (uint32_t by = 0; by < 2; ++by) {
+        CHECK(tile->decodeWaterBlock(0, by, blk));
+        for (int16_t cp : blk) {
+            if (cp < 0) continue;
+            if (cp == 0) sawZeroDepth = true;
+            // Every non-sentinel depth must produce a real elevation.
+            CHECK(tile->waterMmFromDepth(cp, 0) != kNoWaterMm);
+        }
+    }
+    CHECK(sawZeroDepth);
+
+    // WHAT THIS TEST DELIBERATELY DOES NOT CHECK: the absolute water surface.
+    // Reconstructing it needs the ground SPLINE evaluated on the control
+    // lattice, which lives in the amplifier's carrier and not in this decoder,
+    // and `waterMmFromDepth` takes that reconstructed ground as a parameter
+    // precisely so this layer never has to guess at it. Evaluating the lattice
+    // values directly here instead would be the exact confusion the signature
+    // is shaped to prevent -- and it was: the first version of this test did
+    // that and reported a reach rising by 232 mm.
+    //
+    // The invariant IS checked, on the Python side where the spline is
+    // available, in tools/make_water_fixture.py: net fall 1.03 m over the
+    // reach, worst upward step 7 mm against a 10 mm LSB.
+}
+
+} // namespace
+
+VXC_TEST(vxtl_v2_water_plane_matches_the_python_encoder) {
+    checkWaterFixture(fineWaterFixturePath(), "RAW water fixture");
+}
+
+// The ZSTD twin carries REAL zstd frames (the Python encoder used the
+// zstandard library), so only the -DVXC_WITH_ZSTD=ON build can read it. The
+// default build still gets a check out of it, and a sharp one: the tile must be
+// REFUSED with kNoDecompressor rather than silently decoded as literal bytes.
+// That refusal is the whole reason `fineCodecNeedsDecompressor` exists, and
+// 24 of the 38 resident production tiles take this path.
+VXC_TEST(vxtl_v2_water_plane_zstd_matches_the_python_encoder) {
+#ifdef VXC_WITH_ZSTD
+    RealZstdState st;
+    checkWaterFixture(fineWaterZstdFixturePath(), "ZSTD water fixture",
+                      realDecompressor(st));
+#else
+    const std::filesystem::path path = fineWaterZstdFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(!tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNoDecompressor));
+#endif
+}
+
+VXC_TEST(vxtl_v2_water_flag_and_sections_must_agree_in_both_directions) {
+    const std::filesystem::path path = fineWaterFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> good = readFileBytes(path);
+    CHECK(good.has_value());
+
+    auto refused = [](const std::vector<uint8_t>& bytes, FineError want) {
+        FineError err = FineError::kNone;
+        std::optional<FineTile> t = FineTile::parse(bytes, {}, &err);
+        CHECK(!t.has_value());
+        CHECK_EQ(int(err), int(want));
+    };
+
+    // FLAG CLEAR, SECTIONS PRESENT. This is the direction that matters: those
+    // bytes would be silently ignored and every river in the tile would vanish
+    // with no error raised anywhere.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags &= static_cast<uint16_t>(~kFineFlagWaterPresent);
+        std::memcpy(bad.data() + 31, &flags, 2);
+        refused(bad, FineError::kBadSectionTable);
     }
 }
