@@ -1668,6 +1668,156 @@ VXC_TEST(waterca_front_gate_release_after_settling_never_restarts_the_front) {
 }
 
 // ===========================================================================
+// C8d — the mobilized ceiling (work item 9b, §6.5.5).
+//
+// The gate above bounds a reach the authority DECIDED to freeze. The ceiling
+// bounds the case no policy sees coming — one player flooding a valley in one
+// session — by stopping the front outright at a per-world brick count. It is
+// the bluntest of §6.5's three bounds and the only one guaranteed to hold the
+// worst case.
+//
+// The same C8b drain that FACT 1 measured at 44 permanent bricks is the
+// scripted mass-mobilization here: it is the shape that runs away, so it is the
+// shape the ceiling has to stop.
+// ===========================================================================
+
+// THE CEILING FREEZES A RUNAWAY DRAIN INSTEAD OF LETTING IT GROW, and the
+// ledger is exact through the stall. FACT 1 ends at 44 mobilized bricks and
+// zero implicit units left; with a ceiling of 12 the front stops dead at 12 and
+// the datum keeps the rest.
+VXC_TEST(waterca_mobilized_ceiling_stops_a_runaway_drain_at_the_bound) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    constexpr size_t kCeiling = 12;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(kCeiling);
+    CHECK_EQ(mob.mobilizedCeiling(), kCeiling);
+    CHECK(!mob.atMobilizedCeiling());
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    CHECK(mob.mobilizedBricks().size() < kCeiling); // the dig alone is well under
+
+    // 4000 ticks, all of them stalled after the first few. The point of running
+    // long past settling is the queue reading at the bottom.
+    size_t pendingEarly = 0;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        // A brick the front refuses is still a wall, so a stalled world is
+        // degraded, never corrupt. Asserted every tick, through the stall.
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        CHECK(mob.mobilizedBricks().size() <= kCeiling);
+        if (i == 200) pendingEarly = mob.pendingFrontBricks();
+    }
+
+    // Stopped exactly at the bound, not near it.
+    CHECK_EQ(mob.mobilizedBricks().size(), kCeiling);
+    CHECK(mob.atMobilizedCeiling());
+    CHECK(mob.ceilingRefusals() > 0);
+    // FACT 1 left ZERO implicit units. The bound left most of the river alone.
+    CHECK(riverImplicitVolume(mob) > riverVolume / 2);
+    CHECK_EQ(mob.debitedVolume(), mob.creditedVolume());
+
+    // AND THE STALL DOES NOT LEAK INTO THE QUEUE IT STOPPED DRAINING. This is
+    // the reason the ceiling is tested in the seed loop and not only at drain
+    // time: candidates are not queued at all while stalled, so `pending_` is
+    // whatever was already in flight when the bound was reached and never
+    // grows after. Measured here: 12 bricks, unchanged from tick 200 to tick
+    // 4000. A ceiling that only refused at drain time would instead accumulate
+    // one entry per face of every active brick, every tick, forever.
+    CHECK(pendingEarly <= kCeiling);
+    CHECK_EQ(mob.pendingFrontBricks(), pendingEarly);
+}
+
+// THE CEILING NEVER BLOCKS AN EDIT EITHER. Same exemption as the gate's, for
+// the same reason and by a different code path: `mobilizeEditRegion` does not
+// consult it at all, so `mobilized_.size()` may legitimately exceed the
+// ceiling — which is why `atMobilizedCeiling()` is a `>=` test and not an `==`.
+// A world at its ceiling is a world that has stopped growing on its own; it is
+// not a world where digging stops working.
+VXC_TEST(waterca_mobilized_ceiling_never_blocks_an_edit) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(1); // already at the bound before anything happens
+    CHECK(!mob.atMobilizedCeiling());
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    const size_t byEdit = mob.mobilizedBricks().size();
+    CHECK(byEdit > 1); // the dig converted straight through the ceiling
+    CHECK(mob.atMobilizedCeiling());
+
+    for (int i = 0; i < 2000; ++i) {
+        CHECK_EQ(mob.advanceFront(ca), size_t(0)); // ...and the front converts none
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0) break;
+    }
+    CHECK_EQ(mob.mobilizedBricks().size(), byEdit);
+
+    // A SECOND edit, with the world already over its ceiling, still fires.
+    const int64_t upstreamX = kRiverLen / 2;
+    const int64_t z1 = riverBedAt(upstreamX) + 1;
+    ca.invalidateSolidRegion(upstreamX, 0, riverBedAt(upstreamX), upstreamX + 3, kRiverWide - 1, z1);
+    CHECK(mob.mobilizeEditRegion(ca, upstreamX, 0, riverBedAt(upstreamX), upstreamX + 3,
+                                 kRiverWide - 1, z1) > 0);
+    CHECK(mob.mobilizedBricks().size() > byEdit);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+    CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+}
+
+// DEMOTION PRESSURE RUNS BEFORE REFUSAL, NOT AFTER IT (§6.5.5). The relief hook
+// fires at the top of `advanceFront`, only at the high-water mark, and whatever
+// it frees is usable by the SAME call — so a world that can reclaim never
+// refuses in a tick it could have reclaimed in. Item 9c fills this with real
+// demotion; here the hook is exercised with a stub that raises the ceiling,
+// which is the only way to test the ORDERING independently of what relief does.
+VXC_TEST(waterca_ceiling_relief_runs_before_the_front_refuses) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16;
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    mob.setMobilizedCeiling(8);
+
+    int reliefCalls = 0;
+    mob.setCeilingRelief([&] {
+        ++reliefCalls;
+        mob.setMobilizedCeiling(mob.mobilizedCeiling() + 4); // "reclaimed four"
+    });
+
+    openTheDrain(mob, ca, drainOpen, kDrainX);
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) break;
+    }
+
+    // Relief was consulted, and because it kept giving ground the front got all
+    // the way to FACT 1's end state rather than stalling at 8.
+    CHECK(reliefCalls > 0);
+    CHECK_EQ(mob.ceilingReliefCalls(), uint64_t(reliefCalls));
+    CHECK_EQ(riverImplicitVolume(mob), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), riverVolume);
+    CHECK_EQ(mob.creditedVolume(), riverVolume);
+
+    // At most one call per advanceFront, and none while under the ceiling: the
+    // relief count is far below the tick count it took to drain the reach.
+    CHECK(mob.mobilizedBricks().size() > mob.ceilingReliefCalls());
+}
+
+// ===========================================================================
 // WaterState — savegame persistence (waterca.h "WaterState",
 // docs/adr/0005-water-persistence.md)
 // ===========================================================================

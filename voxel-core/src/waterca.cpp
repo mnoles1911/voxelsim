@@ -1754,6 +1754,16 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
     static constexpr int kDy[6] = {0, 0, 1, -1, 0, 0};
     static constexpr int kDz[6] = {0, 0, 0, 0, 1, -1};
 
+    // DEMOTION PRESSURE BEFORE REFUSAL (waterca.h "the mobilized ceiling",
+    // plan §6.5.5). At most once per call, and only at the high-water mark, so
+    // a world under its ceiling pays nothing. Anything this frees is visible to
+    // both loops below -- the point is to reclaim first and refuse second.
+    if (atMobilizedCeiling() && ceilingRelief_) {
+        ++ceilingReliefCalls_;
+        ceilingRelief_();
+    }
+
+    const bool ceilinged = atMobilizedCeiling();
     for (const BrickKey& a : ca.activeBricks()) {
         for (int i = 0; i < 6; ++i) {
             const BrickKey n{a.x + kDx[i], a.y + kDy[i], a.z + kDz[i]};
@@ -1767,6 +1777,13 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
                 ++frontGateRefusals_;
                 continue;
             }
+            // Same reasoning for the ceiling: at the high-water mark a candidate
+            // is not queued at all, so a stalled world's `pending_` cannot grow
+            // for as long as the stall lasts.
+            if (ceilinged) {
+                ++ceilingRefusals_;
+                continue;
+            }
             pending_.insert(n);
         }
     }
@@ -1775,6 +1792,12 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
     // a queued brick is still a wall, so nothing can leak into it meanwhile.
     size_t done = 0;
     while (done < maxBricks && !pending_.empty()) {
+        // Re-tested every iteration, not hoisted: this call's own conversions
+        // are what usually reach the ceiling, and the brick that would cross it
+        // must be the one refused. Queued leftovers stay queued -- they are
+        // bounded (the seed loop stops queueing while stalled) and they are
+        // still walls.
+        if (atMobilizedCeiling()) break;
         const BrickKey k = *pending_.begin();
         pending_.erase(pending_.begin());
         // Re-checked at drain time because the gate may have closed since this

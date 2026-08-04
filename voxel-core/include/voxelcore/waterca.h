@@ -1084,6 +1084,65 @@ public:
     // gate is doing work"), not an inventory. Diagnostics only.
     uint64_t frontGateRefusals() const { return frontGateRefusals_; }
 
+    // --- the mobilized ceiling (docs/watershed-system-plan.md §6.5.5) -------
+    //
+    // WHAT IT BOUNDS, AND WHY IT IS SEPARATE FROM THE GATE ABOVE. The gate
+    // bounds a reach the authority has DECIDED to freeze. This bounds the case
+    // no policy sees coming: one player deliberately flooding a valley in one
+    // session. That water is genuinely there and genuinely deviates from the
+    // datum, so no predicate can reason it away — it needs a blunter bound, and
+    // §6.5.5's honest ordering is that the blunt one is the only bound
+    // GUARANTEED to hold the worst case (demotion, item 9c, makes the AVERAGE
+    // acceptable; re-baking is what actually returns a world to "content is
+    // free"). At the ceiling the front simply stops advancing.
+    //
+    // SAFETY IS THE FRONT BUDGET'S ARGUMENT AGAIN. "A deferred brick is still a
+    // wall": water freezes at the boundary rather than duplicating or
+    // vanishing, and `shortfallVolume()` stays 0 through the stall. A world at
+    // its ceiling is degraded, not corrupt.
+    //
+    // WHAT IS EXEMPT, AND IT IS NOT NEGOTIABLE. `mobilizeEditRegion` (a player
+    // dug) and `markMobilized` (replication and savegame load) are BOTH
+    // unaffected, so `mobilized_.size()` may legitimately exceed the ceiling —
+    // hence `atMobilizedCeiling()` tests `>=`. Digging must never silently
+    // fail, and a client must mirror the authority whatever the authority's
+    // budget was. Only the activity-driven front is bounded.
+    //
+    // REPORT IT LOUDLY. §6.5.5: a world at its ceiling is a world that needs a
+    // re-bake, and that must be an operator-visible signal rather than a silent
+    // stall. `atMobilizedCeiling()` is that signal; `ceilingRefusals()` is its
+    // rate. voxel-core does no logging itself, so surfacing them is the
+    // caller's half.
+    //
+    // 0 (the default) means NO ceiling, and with no ceiling set this is
+    // bit-for-bit the previous code path. kWaterCAVersion is NOT bumped.
+    void setMobilizedCeiling(size_t maxBricks) { mobilizedCeiling_ = maxBricks; }
+    size_t mobilizedCeiling() const { return mobilizedCeiling_; }
+    bool atMobilizedCeiling() const {
+        return mobilizedCeiling_ != 0 && mobilized_.size() >= mobilizedCeiling_;
+    }
+
+    // Bricks the ceiling kept the front from queueing, counted per
+    // consideration exactly as `frontGateRefusals()` is. Diagnostics only.
+    uint64_t ceilingRefusals() const { return ceilingRefusals_; }
+
+    // DEMOTION PRESSURE (§6.5.5: "at high-water-mark, spend the demotion budget
+    // before refusing new mobilization"). Called at most ONCE per
+    // `advanceFront`, at the top, and only while `atMobilizedCeiling()` — so a
+    // world under the ceiling never pays for it. Whatever it frees is visible
+    // to the rest of that same call, which is what makes the ordering
+    // "reclaim, then refuse" rather than "refuse, then reclaim next tick".
+    //
+    // This is a HOOK, not a policy: voxel-core does not decide what relieving
+    // pressure means. Item 9c fills it in with CA -> implicit demotion; a
+    // caller with nothing to give may leave it unset, and the ceiling still
+    // holds (it just holds by refusing). Like the gate, it is consulted on the
+    // authority only and owes the same determinism: no wall-clock, no local
+    // frame rate, no client-observed state.
+    using CeilingReliefFn = std::function<void()>;
+    void setCeilingRelief(CeilingReliefFn relief) { ceilingRelief_ = std::move(relief); }
+    uint64_t ceilingReliefCalls() const { return ceilingReliefCalls_; }
+
     // --- ledger / audit -----------------------------------------------------
 
     // Units this mobilizer has moved out of the implicit field, and units it
@@ -1147,6 +1206,10 @@ private:
     uint64_t credited_ = 0;
     FrontGateFn frontGate_;
     uint64_t frontGateRefusals_ = 0;
+    size_t mobilizedCeiling_ = 0; // 0 == no ceiling
+    uint64_t ceilingRefusals_ = 0;
+    CeilingReliefFn ceilingRelief_;
+    uint64_t ceilingReliefCalls_ = 0;
 };
 
 // ===========================================================================
