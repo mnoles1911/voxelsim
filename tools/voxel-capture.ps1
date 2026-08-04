@@ -119,10 +119,40 @@ $ShotDir = Join-Path $Root 'ue-project\Saved\Screenshots\WindowsEditor'
 #
 # So: clear it, and clear it BEFORE the one-editor check so a refused start does
 # not leave a half-prepared state.
+#
+# AND THE WATER BLOB, WHICH THIS BLOCK DID NOT CLEAR AND WHICH IS THE SAME BUG.
+# Persisted world state is TWO files, not one (tools/water-playtest.ps1 has
+# always cleared both, and says why): the `.vxlog` edit log replayed on load,
+# and the ADR-0005 `.vxwater` CA fill blob, which is irreducible simulation
+# state and therefore NOT re-derivable from seed + edit log. Only the first was
+# cleared here.
+#
+# Measured on 2026-08-04, on the first water capture ever taken through this
+# script: a breach run left 4.1 MB of `.vxwater` behind, and the NEXT run --
+# nominally a fresh baseline -- logged `LoadWaterState: restored 886,179,570
+# fill units across 38,712 stored brick(s), 17,235 mobilized brick(s)` before
+# its own dig had happened. It came up already flooded.
+#
+# That is worse here than a stale measurement, for the reason the edit-log note
+# above gives about the camera: it silently destroys an A/B. The
+# `voxel.Water.ImplicitOcean 0` control for a breach capture is a run whose
+# whole content is "no water appears" -- and run for run after the ocean-on
+# arm, it would have inherited the ocean-on arm's water and photographed it.
+# The pair would have looked like a null result and would have been evidence of
+# nothing.
 if (-not $KeepEditLog) {
     $worldDir = Join-Path (Split-Path $Project) 'Saved\VoxelWorlds'
     if (Test-Path $worldDir) {
-        Get-ChildItem $worldDir -Filter *.vxlog -ErrorAction SilentlyContinue | Remove-Item -Force
+        $stale = @(Get-ChildItem $worldDir -Include *.vxlog, *.vxwater -File -Recurse -ErrorAction SilentlyContinue)
+        if ($stale.Count -gt 0) {
+            # Say what was discarded. "Discarded 4.1 MB of water blob" is the line
+            # that tells you the previous run actually poured something, and it is
+            # the only warning that a comparison you were about to make had a
+            # contaminated baseline.
+            $what = ($stale | ForEach-Object { "{0} ({1:N0} B)" -f $_.Name, $_.Length }) -join ', '
+            Write-Host "  cleared persisted world state: $what" -ForegroundColor DarkGray
+            $stale | Remove-Item -Force
+        }
     }
 }
 
@@ -373,7 +403,15 @@ if (Test-Path $LogPath) {
         $gotYaw   = [double]$shot1.Matches[0].Groups[2].Value
         Write-Host ("  SHUTTER pose: " + ($shot1.Line -replace '^.*Capture: ', ''))
         $wantPitch = if ($SpawnPitch -ne 0) { $SpawnPitch } else { -40 }
-        if ([Math]::Abs($gotPitch - $wantPitch) -gt 0.5 -or [Math]::Abs($gotYaw - $SpawnYaw) -gt 0.5) {
+        # YAW WRAPS AND THIS CHECK DID NOT, so it cried wolf on the first capture
+        # that used it: -SpawnYaw 270 reaches the shutter as -90, the engine's
+        # normalised form of the same direction, and the comparison called a
+        # correctly framed image "NOT AS REQUESTED". A false alarm on the one
+        # warning that exists to make a real framing failure loud is worse than
+        # no warning at all -- the next real one gets ignored. Compare the
+        # signed shortest angular distance instead.
+        $yawErr = [Math]::Abs((($gotYaw - $SpawnYaw) % 360 + 540) % 360 - 180)
+        if ([Math]::Abs($gotPitch - $wantPitch) -gt 0.5 -or $yawErr -gt 0.5) {
             Write-Warning ("FRAMING NOT AS REQUESTED: asked for pitch $wantPitch yaw $SpawnYaw, the shutter " +
                            "fired at pitch $gotPitch yaw $gotYaw. This image is NOT the framing you asked for -- " +
                            "report it as unusable rather than as the requested pose. (pitch -40 yaw 45 exactly " +

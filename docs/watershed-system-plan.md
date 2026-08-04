@@ -1048,7 +1048,23 @@ fix, if one is needed, is the same shape as the lake sheet's `subtractRect`
 handover — cut the plane where the voxels draw — and should not be built on
 a prediction.
 
-**Still outstanding, and it needs the editor:** every visual claim. The
+**Captured 2026-08-04 — see `docs/water-map/ocean-captures.md`** for conditions,
+settle evidence, the control's pixel-diff and the tone numbers. In one line
+each: the inland pit stays dry through all three passes (0 bricks, 0 units,
+digest unchanged) with its floor 3 m below the datum and inside the camera's
+implicit-water box; the breach floods and its `ImplicitOcean 0` control is
+clean (exposure moved by 0.2/255, the pair's difference is 10x the measured
+in-session noise floor and sits on the water); and the plane/voxel tone
+mismatch **is real and is not a constant** — over one join it runs −14.1 to
++9.0 blueness against a ±0.5 instrument floor, sign flipping with viewing
+angle, on the same statistic that recorded +44.5 / +76.8 at the lake seam.
+Two things the captures also established: the **river/sea** join cannot be
+measured at all yet (no baked tile carries a reach — every fine tile in the
+cache is `bake_ver 7`), and a breach into the open sea starts a mobilisation
+front that **never stops**, because `setFrontGate`/`setMobilizedCeiling` are
+never called from `UVoxelWaterSubsystem`.
+
+**Was still outstanding, and it needed the editor:** every visual claim. The
 inland-pit capture; the breach frame with its `voxel.Water.ImplicitOcean 0`
 control; and the plane/voxel-water tone above.
 ### 6.5 The return path: what stops CA water accumulating without bound
