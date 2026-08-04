@@ -59,6 +59,10 @@
 
 namespace vxc {
 
+// Declared here and defined below, so IWaterSampler's ribbon half can hand one
+// back without moving RiverSampler above the interface it implements.
+class RiverSampler;
+
 // `kNoWaterMm` moved to tilestore.h at bake_ver 9 -- the water PLANE is decoded
 // there and must answer "dry" in the same currency this file's lake sampler
 // does. Still one constant, one meaning; only its home changed.
@@ -184,6 +188,29 @@ public:
     // bbox into world millimetres. 0 means "this sampler has no tiles".
     virtual uint32_t tilePixels() const { return 0; }
     virtual int32_t pixelSizeMm() const { return 0; }
+
+    // ---- THE RIBBON HALF (far-field FLOWING water, riverribbon.h) ----------
+    //
+    // The sheet half above is structurally lake-only -- it is a basin registry
+    // and a per-basin extent mask, and a river reach is neither. The far-field
+    // river producer needs the two objects underneath instead: the tile
+    // sampler, because riverRibbonFillWet scans the raw depth raster block by
+    // block rather than asking per pixel, and the river sampler, because
+    // riverRibbonResolveDatum takes the datum from surfaceAtPixel -- the SAME
+    // call the near field reaches through waterSurfaceMmAtVoxel, which is what
+    // makes near and far agree on height by construction rather than by tuning.
+    //
+    // EXPOSED AS BORROWED POINTERS RATHER THAN A SECOND SAMPLER, and that is
+    // the whole point: a caller that built its own FineTileSampler would have
+    // a second tile set, a second residency state and a second answer to "is
+    // this pixel wet". These hand back the ones this sampler already owns.
+    //
+    // DEFAULTED TO nullptr for the reason the sheet half is defaulted to
+    // nullptr: a client with no fine tier is supported, and it should draw no
+    // ribbons by construction. A caller must treat null as "no far-field river
+    // here", never as "this valley is dry".
+    virtual FineTileSampler* ribbonTiles() { return nullptr; }
+    virtual RiverSampler* ribbonRivers() { return nullptr; }
 };
 
 // Answers kNoWaterMm everywhere. The client's default, so "no fine tier
@@ -490,6 +517,13 @@ public:
         return t != nullptr && t->hasWater();
     }
 
+    // The ribbon half. Hands back the tile set this sampler is already reading
+    // rather than a second one, so riverRibbonFillWet's fast wet test and this
+    // class's surfaceAtPixel cannot disagree about which tiles are resident --
+    // the property riverribbonprobe measures at 0 disagreements.
+    FineTileSampler* ribbonTiles() override { return &tiles_; }
+    RiverSampler* ribbonRivers() override { return this; }
+
     int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override {
         const int32_t pxMm = tiles_.pixelSizeMm();
         if (pxMm <= 0) return kNoWaterMm;
@@ -629,6 +663,14 @@ public:
     }
     uint32_t tilePixels() const override { return lakes_.tilePixels(); }
     int32_t pixelSizeMm() const override { return lakes_.pixelSizeMm(); }
+
+    // The ribbon half is the exact mirror of the sheet half above: the sheet
+    // belongs to the lakes because a reach is not a disc, and the ribbon
+    // belongs to the rivers because a basin is not a centreline. Forwarded to
+    // the river side, so a host holding only the composite can still reach the
+    // producer without knowing how the composition was built.
+    FineTileSampler* ribbonTiles() override { return rivers_.ribbonTiles(); }
+    RiverSampler* ribbonRivers() override { return rivers_.ribbonRivers(); }
 
 private:
     IWaterSampler& lakes_;

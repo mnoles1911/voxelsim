@@ -473,6 +473,70 @@ public:
 	// RefreshImplicitWater sweeps -- not an approximation of it.
 	bool GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const;
 
+	// --- FAR-FIELD RIVER RIBBONS (docs/water-handover-2026-08-04.md Phase 4) --
+	//
+	// The lake half above draws basins. Rivers cannot use it: `basinsForTile`,
+	// `holdsWater()` and `extentMaskFor` all assume a basin, and
+	// CompositeWaterSampler forwards the sheet half to lakes on purpose --
+	// "a river reach is not a flat disc and cannot be drawn as one". So flowing
+	// water had NO far-field path at all and was invisible past the 52 m
+	// implicit disc. voxelcore/riverribbon.h is the producer; these four
+	// methods are the only thing AVoxelRiverRibbonActor needs from the water
+	// tier, and they live here for the same reason the lake sheet trio does:
+	// this subsystem owns the ONE fine-tier water reader.
+	//
+	// THE STAGES ARE SEPARATE BECAUSE THE COST IS. riverribbon.h says it
+	// outright ("the host does not call buildRiverRibbons -- it needs the
+	// stages separately so it can budget the fill across ticks"): the wet-mask
+	// fill decodes 256x256 water blocks off disk and is the expensive half,
+	// while thin/trace/simplify are near-linear scans of a mask that is ~0.01%
+	// wet. So the fill is banded across ticks and the rest runs once.
+	//
+	// All four are no-ops when there is no fine tier, the same supported
+	// "no baked water" configuration MakeWaterSampler logs.
+
+	// One centreline vertex, already in world UU. `HalfWidthUU` is HALF the
+	// width the BAKE ACTUALLY DREW at this point, not channelWidthMm's
+	// discharge law -- the ribbon has to cover the same raster the near-field
+	// voxels were meshed from or the two will not line up at the handover.
+	struct FRiverRibbonVertexUU
+	{
+		double XUU = 0.0, YUU = 0.0, ZUU = 0.0;
+		double HalfWidthUU = 0.0;
+	};
+
+	// One reach, ordered along the channel. Direction is not meaningful.
+	struct FRiverRibbonPathUU
+	{
+		TArray<FRiverRibbonVertexUU> Points;
+	};
+
+	// Opens a wet-mask window of half-extent RadiusUU around (CenterXUU,
+	// CenterYUU) and returns how many FillRiverRibbonWindowBand calls it will
+	// take to fill. Allocates one byte per fine pixel -- at the default 4 km
+	// radius that is a 4267 px square, 18 MB -- so a caller that opens a window
+	// must finish or abandon it rather than opening a second.
+	// Returns 0 when there is no fine tier or the radius is degenerate.
+	int32 BeginRiverRibbonWindow(double CenterXUU, double CenterYUU, double RadiusUU);
+
+	// Fills band `BandIndex` of the open window from the baked water plane.
+	// Game-thread only: it decodes water blocks, which is disk I/O plus zstd.
+	// Returns false if there is no open window or the index is out of range.
+	bool FillRiverRibbonWindowBand(int32 BandIndex, int64& OutWetPixels);
+
+	// Thins the filled mask to a centreline, resolves the datum at the
+	// centreline pixels ONLY (~0.3% of wet, and the only place the 16-probe
+	// spline is actually wanted), traces ordered paths and simplifies them
+	// against a one-pixel perpendicular tolerance -- the step that removes the
+	// 8-connected staircase without touching a meander. Appends to OutPaths,
+	// returns the number appended, and CLOSES the window (frees the mask).
+	int32 FinishRiverRibbonWindow(TArray<FRiverRibbonPathUU>& OutPaths, int64& OutWetPixels,
+	                              int64& OutCentrePixels, int64& OutUnresolvedBlocks);
+
+	// Frees an open window without building anything. Safe to call when none is
+	// open; that is the point -- a re-gather mid-fill must not leak 18 MB.
+	void AbandonRiverRibbonWindow();
+
 private:
 	TUniquePtr<FVoxelWaterImpl> Impl;
 
