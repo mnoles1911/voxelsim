@@ -172,13 +172,33 @@ def create_app(provider=None, cache: TileCache | None = None) -> Flask:
                 abort(500, msg)
             data = tile_codec.encode(provider.generate(seed, x, y, scale))
             cache.put(provider.provider_id, seed, x, y, scale, data)
-        return Response(
+        resp = Response(
             data,
             mimetype="application/octet-stream",
             headers={
                 "X-Provider": provider.provider_id,
                 "Cache-Control": "public, max-age=31536000, immutable",
             },
+        )
+        # BYTE RANGES (task #52). A fine tile is 32-56 MB and a client that
+        # wants one 480 m block needs about 34 KB of it; the .vxtl block index
+        # already says exactly which bytes those are (terrain_service/
+        # tile_slice.py). Without this line a Range header was silently ignored
+        # -- status 200, whole body, no Accept-Ranges -- so the addressing was
+        # unusable over HTTP no matter how precise it got.
+        #
+        # ONE range per request: make_conditional answers a multi-range request
+        # with 416, matching plenty of CDNs, so HttpRangeSource never sends one
+        # and coalesces adjacent blocks instead.
+        #
+        # Safe against the immutable Cache-Control above precisely BECAUSE the
+        # response is byte-identical forever for a given (provider, seed, x, y,
+        # scale) -- this module's own contract. A range of a body that could
+        # change under the same URL is how a client assembles two different
+        # tiles into one file.
+        resp.headers["Accept-Ranges"] = "bytes"
+        return resp.make_conditional(
+            request, accept_ranges=True, complete_length=len(data)
         )
 
     return app
