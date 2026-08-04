@@ -159,3 +159,85 @@ def test_world_map_draws_the_waterline_at_sea_level():
     assert k["beach_lower_m"] < k["sea_level_m"], (
         "the beach band's lower edge must sit BELOW sea level; if they are "
         "equal the regression this test guards cannot be detected")
+
+
+# --- the UE side, added by watershed item 8 (§6.4) --------------------------
+#
+# THE SCOPE GAP THIS CLOSES. Everything above scans voxel-core, worldgen.ush
+# and the Python. It never looked at ue-project -- and when work item 8 audited
+# that tree it found exactly two bare sea-level literals still alive, both in
+# UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared's Reservoir v0 seeding rule:
+#
+#     if (V.Z >= 0) continue;      // "below sea level only"
+#     if (N.Z >= 0) continue;      // same test, on the neighbour
+#
+# So item 1's "one symbol" was true of four languages and false of the fifth,
+# in the one file whose whole job is the datum. §6.4 retired that mechanism and
+# with it both literals. This test is what stops them coming back in a file
+# that is edited every time the water changes.
+#
+# DELIBERATELY NARROW. It checks ONE file, for ONE spelling, rather than
+# sweeping ue-project for `Z >= 0` -- which appears legitimately all over
+# VoxelGI.cpp and VoxelWorldSubsystem.cpp as array-bounds and chunk-local index
+# tests that have nothing to do with the sea. A broad grep here would be a test
+# that fails for reasons unrelated to its own subject, which is worse than no
+# test: it trains people to edit the assertion.
+WATER_SUBSYSTEM_CPP = (
+    REPO / "ue-project" / "Source" / "VoxelEarth" / "VoxelWaterSubsystem.cpp")
+
+
+def test_ue_water_subsystem_spells_sea_level_by_name():
+    """The water subsystem must say ``kSeaLevel*``, never a bare zero."""
+    if not WATER_SUBSYSTEM_CPP.is_file():
+        pytest.skip(f"{WATER_SUBSYSTEM_CPP} not present (terrain-service alone)")
+    src = WATER_SUBSYSTEM_CPP.read_text(encoding="utf-8")
+
+    # Strip comments first: the retired literals are QUOTED in the comments
+    # that explain why they are gone, and a test that forbade discussing them
+    # would force the explanation out of the file.
+    no_block = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    code = "\n".join(re.sub(r"//.*$", "", line) for line in no_block.splitlines())
+
+    bare = re.findall(r"\b[VN]\.Z\s*(?:>=|<|<=|>)\s*0\b", code)
+    assert not bare, (
+        f"{WATER_SUBSYSTEM_CPP.name} tests a voxel z against a bare 0 "
+        f"({bare}) -- that is a sea-level test spelled as a literal. Use "
+        f"vxc::kSeaLevelVoxelZ; see core.h's kSeaLevelMm comment for the "
+        f"twenty-one literals that argument produced last time.")
+
+    # ...and it must actually reference the symbol, so "no bare zeros" cannot
+    # be satisfied by a file that stopped consulting the datum at all.
+    assert "kSeaLevelVoxelZ" in code or "kSeaLevelMm" in code, (
+        f"{WATER_SUBSYSTEM_CPP.name} no longer references the sea-level "
+        f"symbol at all -- the assertion above would now pass vacuously")
+
+
+def test_reservoir_v0_stays_retired():
+    """§6.4 deleted the bespoke ocean top-up; it must not grow back.
+
+    Reservoir v0 pinned breach voxels at 255 fill units every fixed step.
+    voxel-core's ``tests/test_ocean.cpp`` measures what that cost: unbounded
+    volume AND an unbounded active-brick count into a seabed the CA thought
+    was dry air, an infinite spring in any inland pit dug in two passes, and a
+    pressure head at the breach rather than at the datum. The sea is a term of
+    the water ImplicitFn now. A second mechanism is the thing the whole plan
+    forbids, so its re-appearance should fail a test rather than a review.
+    """
+    if not WATER_SUBSYSTEM_CPP.is_file():
+        pytest.skip(f"{WATER_SUBSYSTEM_CPP} not present")
+    src = WATER_SUBSYSTEM_CPP.read_text(encoding="utf-8")
+    no_block = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    code = "\n".join(re.sub(r"//.*$", "", line) for line in no_block.splitlines())
+    # The SET and every read of it, not the string: FVoxelWaterPerfSnapshot
+    # still carries a ReservoirCells field, reported as a constant 0 so the HUD
+    # and every parsed log line keep their shape. That field is the one
+    # permitted survivor and this test must not fight it.
+    offenders = [m for m in (r"TSet<[^>]*>\s+ReservoirCells",
+                             r"Impl(?:->|\.)ReservoirCells")
+                 if re.search(m, code)]
+    assert not offenders, (
+        f"the Reservoir v0 breach-cell set is back in "
+        f"{WATER_SUBSYSTEM_CPP.name} (matched {offenders}). The ocean is the "
+        f"third term of the ImplicitFn (watershed §6.4); if a top-up is "
+        f"genuinely needed again it belongs in the implicit field, not beside "
+        f"it.")

@@ -470,11 +470,86 @@ inline size_t subtractRect(const LakeSheetRect& r, const LakeSheetRect& hole, La
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// THE OCEAN (watershed plan §6.4, work item 8)
+// ---------------------------------------------------------------------------
+//
+// THE SEA IS A LAKE WHOSE DATUM IS kSeaLevelMm AND WHOSE EXTENT IS "every
+// column whose ground lies below that datum". That sentence is the whole
+// feature, and writing it as one function beside `implicitWaterFill` rather
+// than as a predicate of its own is the point: the ocean becomes the THIRD
+// TERM of the same ImplicitFn, so it inherits — with no ocean-specific code
+// anywhere downstream — the wall (unmobilized sea is solid to the CA), the
+// budgeted one-way mobilization, the ledger, the replication and the
+// persistence that lakes already got.
+//
+// WHAT THIS REPLACES is `UVoxelWaterSubsystem`'s Reservoir v0: a set of
+// breach-seeded voxels pinned to 255 fill units every fixed step forever. That
+// mechanism had three defects this one does not have by construction, and
+// tests/test_ocean.cpp measures all three:
+//
+//   1. IT COULD NOT TELL A PIT FROM THE SEA. Its test was "this cleared voxel
+//      is below z=0 and touches a non-solid cell that is also below z=0".
+//      Dig into a hillside, below the datum, in two passes — which is just
+//      "keep digging" — and the second pass sees the first pass's own air as
+//      ocean and seeds an infinite spring inside dry rock. Measured:
+//      `reservoir_v0_floods_an_inland_pit_the_datum_test_leaves_dry`.
+//   2. ITS HEAD WAS THE BREACH, NOT THE DATUM. A cell pinned at 255 at
+//      z = -10 voxels is a pressure source at z = -10, so a shaft rising out
+//      of the tunnel equalizes to the tunnel's own roof instead of to sea
+//      level. The sea fills to the sea's surface; a pinned cell fills to its
+//      own. Measured: `breach_parity_open_shaft_*`.
+//   3. IT NEVER STOPPED. "No support for detecting a plugged/re-solidified
+//      breach" is its own doc comment; plug the hole and the spring keeps
+//      running. Mobilized water is ordinary CA water and a plugged hole simply
+//      stops feeding it.
+//
+// THE GROUND MUST BE THE WORLDGEN AMPLIFIED SURFACE, NOT THE EDITED OVERLAY,
+// and that is what makes defect 1 structurally impossible rather than merely
+// fixed. A pit a player digs into land does not lower its column's worldgen
+// ground, so `oceanSurfaceMmAt` keeps answering kNoWaterMm however deep the
+// pit goes. This is the same choice, for the same reason, that
+// `UVoxelWaterSubsystem::IsUnderwaterAtWorld` already made for the underwater
+// test in work item 1 — one rule, now shared by the fog and the water.
+//
+// STRICTLY BELOW, not at-or-below: a column whose ground sits exactly on the
+// datum is a beach with zero depth of water over it, and answering
+// kSeaLevelMm there would ask `waterFillUnits` for a zero remainder it already
+// documents as unreachable.
+constexpr int32_t oceanSurfaceMmAt(int32_t groundMm) {
+    return groundMm < kSeaLevelMm ? kSeaLevelMm : kNoWaterMm;
+}
+
+// The one datum for a column: the highest of what the bake put there (a lake
+// today, a river reach once item 7 lands) and what the sea puts there.
+//
+// MAX, and it is not arbitrary. The two can genuinely overlap — a coastal lake
+// whose surface stands above sea level on a column whose ground is still below
+// it, and, once rivers land, every river mouth, where the reach's own datum
+// descends to meet kSeaLevelMm. Taking the LOWER there would cut a step down
+// into the river at the exact frame the owner most wants to look at; taking
+// the higher makes the two surfaces coplanar at the mouth and the join
+// invisible, because at that point they are the same number.
+//
+// This is also why the ocean is composed HERE and not by giving the sea its
+// own `IWaterSampler`. A sampler answers "what did the bake put over this
+// column"; the sea is not baked, it is the datum itself, and a second sampler
+// would have to be merged with the first by exactly this max() anyway — one
+// mechanism, expressed once.
+constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm) {
+    const int32_t sea = oceanSurfaceMmAt(groundMm);
+    if (bakedSurfaceMm == kNoWaterMm) return sea;
+    if (sea == kNoWaterMm) return bakedSurfaceMm;
+    return bakedSurfaceMm > sea ? bakedSurfaceMm : sea;
+}
+
 // The composed predicate of §5.1, as one function so the client's binding site
 // and the tests cannot express it differently.
 //
 //   cavern flood      -> as today, unchanged
 //   baked lake        -> open air between the AMPLIFIED ground and the datum
+//   the ocean         -> the same, with the datum (§6.4; pass
+//                        `implicitWaterDatumMm` as `waterSurfaceMm`)
 //   otherwise         -> dry
 //
 // `groundMm` is the amplified surface for this column (Amplifier's

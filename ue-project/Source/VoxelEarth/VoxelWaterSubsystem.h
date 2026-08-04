@@ -184,17 +184,26 @@ public:
 
 	// Dig-breach hook: called by UVoxelWorldSubsystem right after an
 	// AUTHORITATIVE TryDig/CarveSphere turns solid voxels to air (never on a
-	// client's local prediction -- breach seeding is simulation state, same
-	// authority-only rule as the CA tick itself). For every cleared voxel at
-	// or below sea level (Z<0) that borders a cell OUTSIDE this same edit
-	// which is already non-solid, Z<0, and not itself tracked CA water (i.e.
-	// genuinely pre-existing "implicit ocean", not a neighbor this same dig
-	// just carved), registers a Reservoir v0 boundary cell: seeded to full
-	// fill now and topped back up to full every fixed step thereafter for as
-	// long as it's registered (task item 2's "infinite reservoir" contract).
-	// Documented v0 simplification: a reservoir cell, once registered, is
-	// never un-registered (no support yet for "plugging" a breach back up);
-	// see the .cpp for the full rule.
+	// client's local prediction -- same authority-only rule as the CA tick
+	// itself).
+	//
+	// PURELY DIAGNOSTIC SINCE watershed plan §6.4 (work item 8). It used to run
+	// the Reservoir v0 seeding rule -- pin every below-datum cleared voxel that
+	// touched below-datum air at 255 fill units, forever. That rule could not
+	// tell the sea from a pit dug into a hillside, its pressure head was the
+	// breach rather than the datum, and because the ocean beyond the breach was
+	// not water to the simulation at all it poured unbounded volume (and an
+	// unbounded active-brick count) into a seabed the CA thought was dry.
+	// voxel-core's tests/test_ocean.cpp measures all three.
+	//
+	// The sea is now the third term of the water ImplicitFn, so a dig into it
+	// releases water through the same funnel a dug lake shore uses --
+	// NotifyTerrainRegionEdited -> WaterMobilizer::mobilizeEditRegion, which
+	// every caller of this function already calls beside it. What remains here
+	// is the log line, kept because it is the only signal an unattended
+	// headless run has that a dig opened the sea, and now reporting the DATUM
+	// TEST: cleared voxels genuinely in the sea versus cleared voxels merely
+	// below z=0 inside land.
 	void NotifyTerrainVoxelsCleared(const TArray<VoxelCoords::FVoxelCoord>& ClearedVoxels);
 
 	// ADR-0003 item 2 (docs/adr/0003-hydrostatic-persistent-body.md): the
