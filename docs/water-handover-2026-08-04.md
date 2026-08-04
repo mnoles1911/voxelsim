@@ -414,10 +414,14 @@ tile in that cache is `bake_ver 7` with no water plane.
 ctest       2/2, 383 cases -- needs -C Release, or both suites report
             "Not Run" and look green
 vxc_tests   422 C++ tests, 0 failures        (claude/water-integration)
-pytest      539 passed / 2 skipped
+pytest      546 passed / 2 skipped   (was 539; #209 added 7)
 bake        ~300 CPU-s per fine tile
 tiles    D:\voxelsim\tile-cache\...-b196f6020\...\s16\   bv9
-         ...-b4d02b092   bv10 (carried Q)
+         ...-b4d02b092   bv10 (carried Q) -- CODEC_RAW, ~210 MB/tile
+         ...-b52995abb   bv12 (seam crossing + width, PR #209) <- LOAD THIS
+         ...-bd3d0ddc7   bv8, NO water plane. 38 tiles, and the newest
+                         directory by date -- do not mistake it for the
+                         newest WATER cache. Check bake_ver, not mtime.
 corridor (-11,-4) (-11,-5) (-12,-5) (-11,-6)   the one that carries water
          (-14,-4) … (-14,-7)                   dry; do not use as a test
 ```

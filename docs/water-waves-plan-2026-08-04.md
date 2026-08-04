@@ -76,17 +76,73 @@ behind A1.
 
 ## Wave C — make it true of the world, not of one corridor
 
-### C0. First: get the shipped cache to the current bake version — **this is the real gap**
+### C0. First: get the shipped cache to the current bake version — ~~the real gap~~ **DONE 2026-08-04**
 
-**There is no bv11 or bv12 cache on disk.** The newest cache carrying water is
-**bv10**. So #209's seam-crossing and width work — the thing that made a river
-reach the sea and gave it width — has **never been baked into anything the
-client can load**. Every capture taken so far is against the *narrowest* river
+The gap was real: there was no bv11 or bv12 cache on disk, so #209's
+seam-crossing and width work had never been baked into anything the client
+could load, and every capture to that date was against the *narrowest* river
 the project will ship.
 
-That, not world coverage, is what blocks seeing the milestone. Re-bake the four
-corridor tiles at the current version into a real cache namespace, and confirm
-the client loads them.
+**Closed.** The four corridor tiles are baked at bv12 and are loadable:
+
+```
+D:\voxelsim\tile-cache\terrain-diffusion-unlabeled-80b9ca451a23eae4-b52995abb
+                       \000000000135276f\s16\{-11_-4,-11_-5,-12_-5,-11_-6}.vxtl
+```
+
+172 MB of tiles (CODEC_ZSTD) + 322 MB of flow pyramid = 492 MB. **Point captures
+here.** The namespace is the one `fine_id_for()` derives from the bake
+fingerprint, so the version bump landed in its own directory: the bv10 water
+cache (`-b4d02b092`) and bv9 (`-b196f6020`) are untouched and remain the
+comparison baselines. Note bv10 is CODEC_RAW at ~210 MB/tile; bv12 is
+CODEC_ZSTD at ~45 MB, which is a codec choice, not a content difference.
+
+**Water, against bv10 on the same four tiles: 27,347 → 317,665 wet cells
+(11.6x).** Per tile 48,911 / 103,476 / 42,056 / 123,222 (0.073% / 0.154% /
+0.063% / 0.184% wet). 255 basins — 246 overflowing, 9 terminal, zero dry playa,
+salt flat or seasonal. Ribbon width p90 **7.50 m**, max **15.91 m**.
+
+**Composed the way the client draws it** (river plane ∪ the 255 lake extents,
+labelled once), reproduced off the shipped tiles: **2,679,902 composed cells**
+in 258 components; longest **20,269 m from 389.0 m to −476.0 m at 5.0% lake
+sheet**; then 17,909 m from 269.4 m; the 1,540 m head's 13,030 m component is
+**94.4% lake sheet** and still must not be quoted as a river. Lake area
+8.305 km². Every figure in §"Where that stands" above is confirmed.
+
+**One number in the record is off by five.** Composed cells measure
+**2,679,902**, not 2,679,897 — the river and lake sets are disjoint here and
+317,665 + 2,362,237 sums to 2,679,902 exactly. 0.0002%, no bearing on anything,
+but the record said 2,679,897 and it is 2,679,902. The along-channel length
+(30,577 m) and sinuosity (1.51) were **not** re-checked: no shipped tool
+computes them, so they came from an ad-hoc script that is not in the repo.
+The composition itself no longer has that problem —
+`tools/corridor_composed_reach.py` is the instrument, reusing
+`measure_corridor_fragmentation`'s labeller and `bake.basins.lake_extent_mask`
+rather than re-deriving either. C3 should quote it, not a fresh script.
+
+**Terrain did not move.** `elevation_control_points` and the flow plane are
+byte-identical to bv10 on all four tiles, on the same datum, through the
+codec's own operator. `TERRAIN_VERSION` stays 8.
+
+**The client loads them**, proven through the shipping C++ decode rather than
+inferred from the files: `vxc_riverribbonprobe` reports `loaded=4 (with a water
+plane: 4) refused=0`, 0 unresolved blocks, and 0 disagreements between the
+far-field fast fill and `RiverSampler::surfaceAtPixel`; `vxc_burialprobe`
+reports `blockDecodeFailures=0` over all 317,665 wet pixels. Both bind the
+game's own `libzstd.dll`.
+
+**The npz shortcut does not work — bake, don't encode.** Three of the four
+products `_encode_fine` needs are in the `--npz-dir` dump (elevation, flow,
+water plane); the **B5 basin registry is not**, and it cannot be recovered from
+the dump because `survey_basins` consumes padded pre-reopen state
+(`basin_depth`, padded `z`/`acc`/climate) that the dump does not carry.
+Encoding from npz would ship `basins=None`, which clears
+`FLAG_BASINS_PRESENT` — and per `TileV2`'s own contract that reads as "predates
+the registry", not "surveyed, holds nothing". So a re-bake it is: **~300 CPU-s
+per tile, 1,180 CPU-s for the corridor.** The re-bake was verified
+*bit-identical* to the diagnostic bv12 npz on all five arrays, so every
+measurement taken on `D:/tmp/seamwidth-npz` describes exactly these shipped
+tiles.
 
 ### C1. A modest region, and only once the version is settled
 
