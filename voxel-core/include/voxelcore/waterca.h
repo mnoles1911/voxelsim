@@ -1312,6 +1312,31 @@ public:
         if (mobilized_.insert(k).second) recentlyMobilized_.push_back(k);
     }
 
+    // The MIRROR of markMobilized, and the inbound half of 9c's return path:
+    // records that the AUTHORITY demoted `k`, without running the predicate and
+    // without crediting the ledger. Returns whether `k` was mobilized at all.
+    //
+    // WHY A CLIENT CANNOT JUST CALL demoteBrick. `canDemote` is a decision about
+    // whether a transfer is exact, and a client is in no position to make it: it
+    // holds a replication mirror whose fill lags the authority by up to a
+    // broadcast interval, so the 512-cell comparison would disagree with the
+    // authority's for reasons that have nothing to do with the world. Worse, it
+    // would disagree ASYMMETRICALLY — refusing where the authority accepted —
+    // and the two would diverge permanently. Demotion is authority-only (see
+    // "AUTHORITY ONLY" under the predicate above) and this is how the result
+    // arrives: as an instruction, not as a conclusion.
+    //
+    // It clears the brick's CA fill for the same reason demoteBrick does — the
+    // datum is about to start claiming those cells again, and leaving the fill
+    // behind would have both accountants holding the same water, which is the
+    // one bug this class exists to prevent. It is NOT a volume change on the
+    // client: the units move from the CA's ledger to the implicit field's, which
+    // is exactly what the authority just did.
+    //
+    // Queues into takeRecentlyDemoted() so a client re-meshes the handover on
+    // exactly the same path the authority does, mirroring markMobilized.
+    bool markDemoted(WaterCA& ca, const BrickKey& k);
+
     // Bricks mobilized since the last call, in mobilization order, and clears
     // the queue. The engine drains this to re-mesh: a mobilized brick must
     // stop being drawn as implicit water and start being drawn as CA water in
