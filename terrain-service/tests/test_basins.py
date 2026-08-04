@@ -28,6 +28,17 @@ CELL_M = 1.875
 # --------------------------------------------------------------------------- climate
 
 
+@pytest.fixture(scope="module")
+def _numba():
+    """The bake kernels need numba, which is deliberately NOT a terrain-service
+    requirement -- CI runs without it, and `flow.py` is built so importing the
+    package never needs it and only CALLING a kernel does. Every test below that
+    reaches a kernel takes this fixture so it skips cleanly there instead of
+    failing with ModuleNotFoundError. The two tests that do not take it are the
+    ones that must keep running on a numba-less box."""
+    return pytest.importorskip("numba", reason="bake kernels need numba; not a CI dep")
+
+
 def test_pet_is_monotone_over_the_whole_world_temperature_range():
     """L(T) must never decrease with temperature, including where it is floored.
 
@@ -94,7 +105,7 @@ def _climate(shape, *, temp_c, precip_mm, cv=20.0, seasonality=400.0):
     }
 
 
-def test_reopened_surface_is_exact_and_refuses_a_raised_floor():
+def test_reopened_surface_is_exact_and_refuses_a_raised_floor(_numba):
     z, d = _bowl()
     reopened = bs.reopened_surface(z, d)
     assert np.allclose(reopened, z - d)
@@ -105,7 +116,7 @@ def test_reopened_surface_is_exact_and_refuses_a_raised_floor():
         bs.reopened_surface(z, -d - 1.0)
 
 
-def test_depression_is_found_and_its_spill_is_the_rim_not_the_b2a_level():
+def test_depression_is_found_and_its_spill_is_the_rim_not_the_b2a_level(_numba):
     z, d = _bowl(depth_m=20.0)
     z_open = bs.reopened_surface(z, d)
     labels, filled, n = bs.depression_components(z_open)
@@ -118,7 +129,7 @@ def test_depression_is_found_and_its_spill_is_the_rim_not_the_b2a_level():
     assert filled[mask].max() == pytest.approx(float(z[mask].max()), abs=1e-3)
 
 
-def test_hypsometry_is_a_monotone_curve_the_balance_can_be_inverted_on():
+def test_hypsometry_is_a_monotone_curve_the_balance_can_be_inverted_on(_numba):
     z, d = _bowl()
     z_open = bs.reopened_surface(z, d)
     labels, filled, _ = bs.depression_components(z_open)
@@ -156,7 +167,7 @@ def _survey_bowl(temp_c: float, precip_mm: float, *, cv: float = 20.0,
     return s.basins[0]
 
 
-def test_same_bowl_lake_to_playa_across_a_climate_sweep():
+def test_same_bowl_lake_to_playa_across_a_climate_sweep(_numba):
     """THE RULE. One hole, one climate axis, five outcomes, in order.
 
     This is what "a wet-climate depression is a lake; the same depression in a
@@ -181,7 +192,7 @@ def test_same_bowl_lake_to_playa_across_a_climate_sweep():
     assert bs.KIND_LAKE_TERMINAL in kinds
 
 
-def test_seasonality_separates_a_seasonal_lake_from_a_dry_playa():
+def test_seasonality_separates_a_seasonal_lake_from_a_dry_playa(_numba):
     """Same annual mean, different bio_15: the only thing that can tell them apart.
 
     A monsoon desert and an even-rainfall desert receive the same millimetres
@@ -194,7 +205,7 @@ def test_seasonality_separates_a_seasonal_lake_from_a_dry_playa():
     assert dry_monsoon.kind == bs.KIND_SEASONAL
 
 
-def test_cold_basins_are_lakes_because_pet_falls_not_because_it_rains():
+def test_cold_basins_are_lakes_because_pet_falls_not_because_it_rains(_numba):
     """The temperature half of the balance, isolated.
 
     Held at a genuinely arid 200 mm/yr, the same bowl is dry in the heat and a
@@ -208,7 +219,7 @@ def test_cold_basins_are_lakes_because_pet_falls_not_because_it_rains():
     assert cold.kind >= bs.KIND_LAKE_TERMINAL
 
 
-def test_a_bigger_catchment_makes_a_deeper_lake_in_the_same_hole():
+def test_a_bigger_catchment_makes_a_deeper_lake_in_the_same_hole(_numba):
     """Inflow is the third input, and it is the one the watershed supplies."""
     small = _survey_bowl(25.0, 250.0, catchment_m2=1.0e5)
     big = _survey_bowl(25.0, 250.0, catchment_m2=5.0e7)
@@ -219,7 +230,7 @@ def test_a_bigger_catchment_makes_a_deeper_lake_in_the_same_hole():
 # --------------------------------------------------------------------------- registry
 
 
-def test_registry_filter_counts_everything_it_removes():
+def test_registry_filter_counts_everything_it_removes(_numba):
     """Each exclusion is a NUMBER, which is the point of the whole survey."""
     z, d = _bowl(depth_m=20.0)
     acc = np.full(z.shape, 1.0e6, np.float32)
@@ -241,7 +252,7 @@ def test_registry_filter_counts_everything_it_removes():
     assert huge_area.basins == [] and huge_area.excluded_small == 1
 
 
-def test_submarine_depressions_are_sea_floor_not_lakes():
+def test_submarine_depressions_are_sea_floor_not_lakes(_numba):
     """A hole whose SPILL is under water is the ocean, and shipping it as a
     lake would put a second water surface beneath the first.
 
@@ -266,7 +277,7 @@ def test_submarine_depressions_are_sea_floor_not_lakes():
     assert len(kept.basins) == 1 and kept.excluded_submarine == 1
 
 
-def test_tile_spanning_basins_are_excluded_and_their_size_recorded():
+def test_tile_spanning_basins_are_excluded_and_their_size_recorded(_numba):
     """§4.2.4's v1 rule, with the cost of it as a measured quantity."""
     # One bowl inside the interior, one straddling its edge.
     z, d = _bowl(n=200, cx=100.0, cy=100.0, radius=20.0)
@@ -295,7 +306,7 @@ def test_tile_spanning_basins_are_excluded_and_their_size_recorded():
     assert excl.basins[0].interior is True
 
 
-def test_padded_border_flag_is_a_near_miss_test_because_the_exact_one_is_dead():
+def test_padded_border_flag_is_a_near_miss_test_because_the_exact_one_is_dead(_numba):
     """``fill_depressions`` never raises a border cell, so no depression can
     contain one and a touches-the-border test can NEVER fire.
 
@@ -330,7 +341,7 @@ def test_padded_border_flag_is_a_near_miss_test_because_the_exact_one_is_dead():
     assert s.kept_near_padded_border == 1
 
 
-def test_basin_ids_are_deterministic_and_ordered_by_extent():
+def test_basin_ids_are_deterministic_and_ordered_by_extent(_numba):
     """Ids order by (min_y, min_x) of extent, per P1's schema, so a table row
     means the same basin on any box and in any re-run."""
     z_a, d_a = _bowl(n=220, cx=60.0, cy=150.0, radius=18.0)
@@ -354,7 +365,7 @@ def test_basin_ids_are_deterministic_and_ordered_by_extent():
     assert s1.basins[0].seed_px[1] < s1.basins[1].seed_px[1]
 
 
-def test_outlet_is_the_lowest_cell_on_the_rim():
+def test_outlet_is_the_lowest_cell_on_the_rim(_numba):
     """``outlet_px`` is the head of the outlet channel, and for an overflowing
     lake it is where the spillway starts -- so it has to be the saddle, not
     just any neighbour."""
@@ -389,7 +400,7 @@ def test_outlet_is_the_lowest_cell_on_the_rim():
 # --------------------------------------------------------------------------- extent
 
 
-def test_lake_extent_is_the_component_that_holds_the_seed_not_the_threshold():
+def test_lake_extent_is_the_component_that_holds_the_seed_not_the_threshold(_numba):
     """Two bowls under ONE bbox: the fill must return only the seeded one.
 
     This is the whole reason a lake's footprint is a flood fill rather than
@@ -416,7 +427,7 @@ def test_lake_extent_is_the_component_that_holds_the_seed_not_the_threshold():
     assert (m | m2).sum() == both.sum()
 
 
-def test_lake_extent_agrees_with_the_registry_area_it_ships_beside():
+def test_lake_extent_agrees_with_the_registry_area_it_ships_beside(_numba):
     """A basin filled to its SPILL must cover exactly the area the registry
     recorded for it.
 
@@ -441,7 +452,7 @@ def test_lake_extent_agrees_with_the_registry_area_it_ships_beside():
     assert float(m.sum()) * CELL_M ** 2 == pytest.approx(b.area_m2)
 
 
-def test_lake_extent_of_a_dry_basin_is_empty_rather_than_an_error():
+def test_lake_extent_of_a_dry_basin_is_empty_rather_than_an_error(_numba):
     """A playa's ``surface_m`` is its floor, so nothing is at or below it minus
     epsilon. That is an answer, not a failure -- the client must be able to ask
     about every registered basin, including the dry ones."""
@@ -454,7 +465,7 @@ def test_lake_extent_of_a_dry_basin_is_empty_rather_than_an_error():
     assert bs.lake_extent_mask(z_open, (fx, fy), floor).sum() >= 1
 
 
-def test_lake_extent_is_clipped_by_the_bbox_it_is_given():
+def test_lake_extent_is_clipped_by_the_bbox_it_is_given(_numba):
     """The bbox is not decoration: it bounds the fill, so a decoder cannot be
     walked across the tile by a corrupt seed and a high surface."""
     z, d = _bowl(depth_m=20.0, ramp=0.0)
