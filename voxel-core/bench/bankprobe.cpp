@@ -157,6 +157,11 @@
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
+// windows.h defines min/max as macros, which then eat every std::max(a, b) in
+// this file under MSVC (C2589, "'(': illegal token on right side of '::'").
+// clang/ninja never saw it, so it shipped. Same guard as burialprobe.cpp and
+// gpu_harness.cpp.
+#define NOMINMAX
 #include <windows.h>
 #else
 #include <dlfcn.h>

@@ -52,6 +52,10 @@
 #include <vector>
 
 #if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+// See bankprobe.cpp: without NOMINMAX, windows.h's min/max macros break every
+// std::max in this file under MSVC. clang/ninja does not catch it.
+#define NOMINMAX
 #include <windows.h>
 #else
 #include <dlfcn.h>
