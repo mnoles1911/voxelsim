@@ -1210,6 +1210,218 @@ VXC_TEST(waterca_mobilize_placing_into_an_implicit_lake_raises_no_shortfall) {
 }
 
 // ===========================================================================
+// C8b — the two facts docs/watershed-system-plan.md §6.3 is built on.
+//
+// A baked RIVER is the same shape of implicit datum as a baked lake, but it
+// is a long, thin, SLOPING one, and that difference changes the mobilizer's
+// behaviour in two ways that are not obvious from the lake tests above and
+// that §6.3's design depends on being true. Both are pinned here because both
+// were initially predicted WRONG when §6.3 was drafted.
+//
+// The synthetic river: a straight trench along +x whose bed descends one
+// voxel every kSlopeRun voxels, holding an implicit water column kRiverDepth
+// deep — a pure function of position, exactly like the production ImplicitFn
+// at VoxelWaterSubsystem.cpp:351-363.
+// ===========================================================================
+
+namespace {
+
+constexpr int64_t kRiverLen = 256;     // 25.6 m of river at 10 cm voxels
+constexpr int64_t kRiverWide = 4;
+constexpr int64_t kSlopeRun = 32;      // one voxel of fall per 3.2 m (~3%)
+constexpr int64_t kRiverBedTop = 64;
+constexpr int64_t kRiverDepth = 4;
+
+int64_t riverBedAt(int64_t vx) { return kRiverBedTop - floorDiv(vx, kSlopeRun); }
+
+// Terrain: the trench, plus a dry chamber underneath that a drain can reach,
+// plus an optional drain shaft the "player" digs through the bed, plus an
+// optional wall the "player" builds across the channel.
+constexpr int64_t kDamThick = 2;
+constexpr int64_t kDamHeight = 3 * kRiverDepth; // three times the river's own depth
+
+WaterCA::SolidFn riverTerrain(std::shared_ptr<bool> drainOpen, int64_t drainX,
+                              std::shared_ptr<bool> damBuilt = nullptr, int64_t damX = 0) {
+    return [drainOpen, drainX, damBuilt, damX](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        const bool inTrenchXY = vx >= 0 && vx < kRiverLen && vy >= 0 && vy < kRiverWide;
+        if (damBuilt && *damBuilt && inTrenchXY && vx >= damX && vx < damX + kDamThick &&
+            vz < riverBedAt(vx) + kDamHeight && vz >= riverBedAt(vx))
+            return MAT_ROCK; // the wall the player builds
+        if (inTrenchXY && vz >= 0 && vz < 20) return MAT_AIR; // the dry chamber below
+        if (*drainOpen && inTrenchXY && vx >= drainX && vx < drainX + 4 && vz >= 20 &&
+            vz < riverBedAt(vx) + 1)
+            return MAT_AIR; // the shaft the dig opens
+        if (!inTrenchXY) return MAT_ROCK;
+        return vz < riverBedAt(vx) ? MAT_ROCK : MAT_AIR;
+    };
+}
+
+WaterMobilizer::ImplicitFn riverWater() {
+    return [](int64_t vx, int64_t vy, int64_t vz) -> uint8_t {
+        if (vx < 0 || vx >= kRiverLen || vy < 0 || vy >= kRiverWide) return 0;
+        const int64_t b = riverBedAt(vx);
+        return (vz >= b && vz < b + kRiverDepth) ? 255 : 0;
+    };
+}
+
+uint64_t riverImplicitVolume(const WaterMobilizer& mob) {
+    uint64_t sum = 0;
+    for (int64_t x = 0; x < kRiverLen; ++x)
+        for (int64_t y = 0; y < kRiverWide; ++y)
+            for (int64_t z = riverBedAt(x); z < riverBedAt(x) + kRiverDepth; ++z)
+                sum += mob.implicitFillAt(x, y, z);
+    return sum;
+}
+
+// Inclusive span of mobilized brick x-coordinates, in bricks.
+int64_t mobilizedXSpan(const WaterMobilizer& mob) {
+    if (mob.mobilizedBricks().empty()) return 0;
+    int64_t lo = INT64_MAX, hi = INT64_MIN;
+    for (const BrickKey& k : mob.mobilizedBricks()) {
+        lo = std::min<int64_t>(lo, k.x);
+        hi = std::max<int64_t>(hi, k.x);
+    }
+    return hi - lo + 1;
+}
+
+// Topmost voxel holding CA water in one column, or -1.
+int64_t topWaterZ(const WaterCA& ca, int64_t vx, int64_t vy) {
+    int64_t top = -1;
+    for (int64_t z = riverBedAt(vx); z < riverBedAt(vx) + 40; ++z)
+        if (ca.fillAt(vx, vy, z) > 0) top = z;
+    return top;
+}
+
+} // namespace
+
+// FACT 1 — ONE EDIT THAT LETS A BAKED RIVER DRAIN MOBILIZES THE WHOLE RIVER.
+//
+// This is the cost bound §6.3 exists to impose. `advanceFront` mobilizes the
+// face-neighbours of every ACTIVE brick, and a freshly mobilized brick is
+// filled and woken, so as long as the water it releases keeps MOVING the front
+// keeps advancing. On a sloping river with a drain at one end, "keeps moving"
+// holds all the way to the source: a single 4-voxel-wide shaft dug near the
+// downstream end converts 100% of the reach — every brick, every unit — with
+// no length bound anywhere in the loop.
+//
+// The contrast that makes the mechanism clear is FACT 2 below: with nowhere to
+// drain, the very same front stops after one tick. It is drainage, not
+// disturbance, that makes mobilization run away.
+VXC_TEST(waterca_mobilize_front_consumes_an_entire_implicit_river_once_it_can_drain) {
+    auto drainOpen = std::make_shared<bool>(false);
+    constexpr int64_t kDrainX = kRiverLen - 16; // near the downstream end
+    WaterMobilizer mob(riverWater(), riverTerrain(drainOpen, kDrainX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    CHECK(riverVolume > 0);
+    CHECK_EQ(mob.mobilizedBricks().size(), size_t(0));
+
+    // THE EDIT: dig the shaft. The three hooks a real engine edit runs.
+    *drainOpen = true;
+    const int64_t z1 = riverBedAt(kDrainX) + 1;
+    ca.invalidateSolidRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+    CHECK(mob.mobilizeEditRegion(ca, kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1) > 0);
+    ca.wakeRegion(kDrainX, 0, 20, kDrainX + 3, kRiverWide - 1, z1);
+
+    // The edit itself touches only a handful of bricks.
+    CHECK(mob.mobilizedBricks().size() < size_t(8));
+
+    bool settled = false;
+    for (int i = 0; i < 4000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), riverVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settled = true;
+            break;
+        }
+    }
+    CHECK(settled);
+
+    // The whole river mobilized: every x-brick of the reach, and every unit of
+    // its implicit water is now CA fill that must be ticked, replicated and
+    // persisted forever.
+    CHECK_EQ(mobilizedXSpan(mob), kRiverLen / WaterBrick8::kEdge);
+    CHECK_EQ(riverImplicitVolume(mob), uint64_t(0));
+    CHECK_EQ(mob.debitedVolume(), riverVolume);
+    CHECK_EQ(mob.creditedVolume(), riverVolume);
+}
+
+// FACT 2 — DAMMING AN UNDISTURBED BAKED RIVER DOES NOTHING AT ALL.
+//
+// The intuition §6.3 was first drafted on ("the CA is volume-conserving, so
+// water pools behind a wall and spills over the lowest lip") is true of water
+// that is FLOWING. A baked river is not flowing: it is a static datum at its
+// own equilibrium, and every part of it that a player has not touched is a
+// WALL to the CA, not water. So a wall built across it dams nothing — there is
+// no discharge to impound. The stage upstream does not rise by even one voxel,
+// and the whole thing settles almost immediately.
+//
+// This is why §6.3 cannot be only a downstream-drying layer: without something
+// that supplies throughflow at the player's deviation, the UPSTREAM half of
+// "dam a river" has no mechanism behind it either.
+VXC_TEST(waterca_mobilize_a_dam_on_an_undisturbed_river_impounds_nothing) {
+    auto neverDrain = std::make_shared<bool>(false);
+    auto damBuilt = std::make_shared<bool>(false);
+    constexpr int64_t kDamX = kRiverLen / 2;
+    WaterMobilizer mob(riverWater(),
+                       riverTerrain(neverDrain, kRiverLen * 4 /* unreachable */, damBuilt, kDamX));
+    WaterCA ca(mob.makeSolidFn());
+
+    const uint64_t riverVolume = riverImplicitVolume(mob);
+    const int64_t bedZ = riverBedAt(kDamX);
+
+    // The baked water surface just upstream of where the dam will go: the
+    // datum says the river's top water voxel is bed + depth - 1.
+    const int64_t bakedTopZ = riverBedAt(kDamX - 1) + kRiverDepth - 1;
+
+    // THE EDIT: the player walls the channel off, three times the river's own
+    // depth. (The wall is expressed through the mobilizer's terrain half, so
+    // the implicit field stops claiming water inside the rock automatically.)
+    *damBuilt = true;
+
+    // Building the wall DESTROYS the implicit water in the cells it occupies —
+    // an intended discontinuity, documented at waterca.h:963-977 ("filling a
+    // hole destroys water either way"). Exactly the dam's own footprint
+    // through the river's water column, and nothing else.
+    const uint64_t afterDamVolume = riverImplicitVolume(mob);
+    CHECK_EQ(riverVolume - afterDamVolume,
+             uint64_t(kDamThick * kRiverWide * kRiverDepth * 255));
+
+    ca.invalidateSolidRegion(kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+    mob.mobilizeEditRegion(ca, kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+    ca.wakeRegion(kDamX, 0, bedZ, kDamX + 1, kRiverWide - 1, bedZ + kDamHeight);
+
+    int settledTick = -1;
+    for (int i = 1; i <= 2000; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        CHECK_EQ(riverImplicitVolume(mob) + ca.totalVolume(), afterDamVolume);
+        if (ca.activeBrickCount() == 0 && mob.pendingFrontBricks() == 0) {
+            settledTick = i;
+            break;
+        }
+    }
+
+    // It stops at once — there is no flow to sustain the front.
+    CHECK(settledTick >= 0);
+    CHECK(settledTick <= 5);
+
+    // Only the edit's own neighbourhood ever mobilized: the dam did NOT eat
+    // the river the way the drain in FACT 1 did.
+    CHECK(mobilizedXSpan(mob) < kRiverLen / WaterBrick8::kEdge / 4);
+
+    // And the decisive reading: the water standing just upstream of the dam is
+    // still at exactly the baked river surface. It did not rise one voxel, and
+    // it is nowhere near the crest.
+    CHECK_EQ(topWaterZ(ca, kDamX - 1, kRiverWide / 2), bakedTopZ);
+    CHECK(bakedTopZ < bedZ + kDamHeight); // crest is well clear; nothing overtopped
+}
+
+// ===========================================================================
 // WaterState — savegame persistence (waterca.h "WaterState",
 // docs/adr/0005-water-persistence.md)
 // ===========================================================================
