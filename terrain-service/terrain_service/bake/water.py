@@ -93,6 +93,8 @@ __all__ = [
     "runoff_field_mm_yr",
     "discharge_source",
     "graded_water_surface",
+    "widen_to_channel_width",
+    "WIDEN_MIN_DEPTH_M",
     "water_head_mask",
     "overshoot_stats",
     "lateral_extent_stats",
@@ -417,6 +419,146 @@ def graded_water_surface(z_route_m, q_m3_yr, receivers, wet, *, eps_m: float,
     dry = ~wet if exclude is None else ~(wet & ~exclude)
     out[dry] = np.nan
     return out
+
+
+# --------------------------------------------------------------------------- extent
+
+#: Shallowest water a widened cell may be drawn with, metres. ONE ELEVATION LSB
+#: on the wire (``tile_codec.QUANT_MM`` is 100 mm), and it is a representability
+#: floor rather than a look: the codec stores ``rint(water*1000) -
+#: rint(ground*1000)`` and refuses a wet cell that quantises negative, so a cell
+#: admitted at a hair above its own bed is a rounding coin-flip away from being
+#: an encoder error. It is also one client voxel -- below it the widened cell
+#: would carry water the renderer cannot draw, which is a wet pixel that reads
+#: dry, exactly the failure ``WATER_DRY_DEPTH`` exists to make impossible.
+WIDEN_MIN_DEPTH_M = 0.1
+
+
+def widen_to_channel_width(water_m, z_ground_m, q_m3_yr, *, cell_m: float,
+                           exclude=None, min_depth_m: float = WIDEN_MIN_DEPTH_M,
+                           q_perennial: float = Q_PERENNIAL_M3_YR):
+    """Grow the drawn plane sideways to ``channel_width_m(Q)``. Returns (w, stats).
+
+    ``graded_water_surface`` draws a CENTRELINE -- one cell per reach, because a
+    single-receiver forest has one-cell-wide branches by construction. This is
+    the other half of the same law: ``water_depth_m(Q)`` already decides how deep
+    the plane stands, and this makes ``channel_width_m(Q)`` decide how far it
+    reaches. Neither is new hydraulics; both are ``channel.h``'s published
+    exponents at the anchor this module re-anchored them on.
+
+    TWO BOUNDS, AND THE MEASUREMENT THAT SAYS WHICH ONE SHAPES THE RIVER.
+
+      * the LAW. A cell is a candidate if its centre lies within
+        ``channel_width_m(Q)/2`` of a drawn cell. On the measured corridor that
+        half-width is 0.78-2.23 fine pixels, so the ribbon is 1-5 px and its
+        width changes continuously down a reach: a headwater creek at the
+        drawable cut is 2.81 m across and a trunk at 2.4e7 m^3/yr is 8.8 m.
+      * the TERRAIN. A candidate is drawn only where the SHIPPED ground stands
+        at least ``min_depth_m`` below that reach's own water surface. Measured
+        on bv11: the ground allows p50 11-28 m and p90 47-163 m of lateral
+        extent at the drawn level, and 90-93% of wet cells have room for the
+        whole law width. So the law does the shaping and this clamp bites on the
+        7-10% that would otherwise be drawn uphill.
+
+    That order matters and is not interchangeable. A rule that took the terrain
+    first would flood a valley floor -- ``vxc_bankprobe`` found NO containing
+    ground within 120 m on 736 of 1,260 bank sides at 10 m depth, which is why
+    ``overshoot_stats`` exists at all. A rule that took the law alone would put
+    58.2% of the widened edge below drawn ground, which is what the far-field
+    experiment measured when it widened in the ground plane without a clamp.
+
+    THE WATER SURFACE IS FLAT ACROSS THE CHANNEL, not tapered, because that is
+    what a water surface is. The DEPTH therefore tapers on its own wherever the
+    bed rises toward the bank, and the codec stores depth, so the client's
+    sub-pixel zero-crossing lands on a contour of the bed rather than on the
+    raster step this function added.
+
+    NEAREST SOURCE WINS. Offsets are visited in ascending distance and a cell is
+    claimed once, so a cell reachable from two reaches takes the level of the
+    nearer one -- never the higher. Taking the maximum instead would let a large
+    river 3 px away raise the water over a small one's bank; ties inside one
+    distance ring take the higher level, which is deterministic and, at equal
+    distance, is the reach with the larger channel.
+
+    ``water_m`` is ``graded_water_surface``'s output: metres absolute, NaN dry,
+    already excluding registered basins. ``z_ground_m`` is the SHIPPED surface
+    (post-B5) -- the ground the client draws the waterline against, and the same
+    array the codec takes the depth against. ``exclude`` is the basin mask; a
+    widened cell must not spill into a re-opened basin whose surface the basin
+    table already carries.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.asarray(z_ground_m, np.float32)
+    q = np.asarray(q_m3_yr)
+    h, wd = w.shape
+    flat = w.ravel()
+    zf = z.ravel()
+    exf = None if exclude is None else np.asarray(exclude).ravel()
+
+    idx = np.flatnonzero(np.isfinite(flat))
+    stats = {
+        "width_centreline_cells": float(idx.size),
+        "width_added_cells": 0.0,
+        "width_min_depth_m": float(min_depth_m),
+    }
+    if idx.size == 0:
+        return w, stats
+
+    cy, cx = np.divmod(idx, wd)
+    lvl = flat[idx].astype(np.float64)
+    r_px = (channel_width_m(q.ravel()[idx], q_perennial) / 2.0) / float(cell_m)
+    stats["width_law_half_px_p50"] = float(np.percentile(r_px, 50))
+    stats["width_law_half_px_max"] = float(r_px.max())
+
+    # Sources sorted by their own reach, so the participants at distance d are a
+    # CONTIGUOUS TAIL and each ring costs work proportional to how many cells
+    # actually reach that far -- not to the wet set. Without this the 400 m
+    # width cap (106 px) would make the ring loop quadratic in a raster it never
+    # touches.
+    o = np.argsort(r_px, kind="stable")
+    cy, cx, lvl, r_sorted = cy[o], cx[o], lvl[o], r_px[o]
+
+    R = int(np.ceil(float(r_sorted[-1])))
+    offs = [(dy, dx)
+            for dy in range(-R, R + 1)
+            for dx in range(-R, R + 1)
+            if (dy or dx) and (dy * dy + dx * dx) <= R * R]
+    offs.sort(key=lambda t: (t[0] * t[0] + t[1] * t[1], t[0], t[1]))
+
+    added = 0
+    for dy, dx in offs:
+        d = float(np.hypot(dy, dx))
+        start = int(np.searchsorted(r_sorted, d, side="left"))
+        if start >= r_sorted.size:
+            continue
+        sy = cy[start:] + dy
+        sx = cx[start:] + dx
+        inb = (sy >= 0) & (sy < h) & (sx >= 0) & (sx < wd)
+        if not inb.any():
+            continue
+        tgt = sy[inb] * wd + sx[inb]
+        cand = lvl[start:][inb]
+        # Sparse tests only: index the candidates, never the whole grid. A
+        # per-ring pass over the padded domain would cost more than the bake.
+        free = ~np.isfinite(flat[tgt])
+        if exf is not None:
+            free &= ~exf[tgt]
+        ok = free & (zf[tgt] <= cand - float(min_depth_m))
+        if not ok.any():
+            continue
+        t = tgt[ok]
+        v = cand[ok].astype(np.float32)
+        # Claim first, then reduce: np.maximum against NaN propagates NaN, so
+        # the claim has to establish a floor before duplicates inside this ring
+        # can be resolved against each other.
+        flat[t] = np.float32(-np.inf)
+        np.maximum.at(flat, t, v)
+        added += int(np.unique(t).size)
+
+    stats["width_added_cells"] = float(added)
+    stats["width_added_frac"] = float(added) / float(idx.size + added) if (
+        idx.size + added) else 0.0
+    return w, stats
 
 
 # --------------------------------------------------------------------------- gates

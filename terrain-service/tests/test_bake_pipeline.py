@@ -2187,3 +2187,253 @@ def test_a_model_parent_does_not_make_an_incomplete_child_look_complete():
     sb = pipeline.build_flow_superblock(fetch, 0, 0, lv, kernels(), parent=parent)
     assert sb.missing_tiles == ((1, 1),)
     assert not sb.complete
+
+
+# ---------------------------------------------------------------------------
+# bake_ver 12: the pyramid's discharge, and the width law.
+# ---------------------------------------------------------------------------
+
+
+def test_the_pyramid_routes_its_discharge_single_receiver(_real_kernels):
+    """THE SEAM WIRING. The block's ``q`` IS the D8 sweep, and ``acc`` is not.
+
+    This is the defect bake_ver 12 fixes, and the test is written against the
+    thing that can silently regress -- which half of the pyramid each sweep
+    reaches -- rather than against a magnitude. The fine tier routes its
+    discharge single-receiver (bake_ver 11) and the pyramid routed its own with
+    MFD, so a river arrived at a tile's edge as a FAN while the field computed
+    from that edge was a centreline, and the consumer at the far end is a hard
+    threshold that a fan cannot clear.
+
+    WHAT THE EFFECT IS NOT. The boundary was never STARVED: measured on the real
+    (-11,-5)/(-11,-6) seam, the same 8.6e7 m^3/yr crossed either way (D8/MFD =
+    0.99 on the total) and only the spread changed -- MFD's largest single
+    crossing held 8.66e6 against D8's 2.02e7. A synthetic block small and smooth
+    enough to run in a unit test has no trunk to concentrate and reproduces
+    neither number, so the corridor measurement is the evidence for the effect
+    and this is the evidence for the wiring. See
+    ``docs/measurements/river-seam-and-width-2026-08-04.txt``.
+    """
+    world = synth_world()
+    cl = climate_world(lambda tx, ty: 900.0)
+    fetch_z = lambda x, y: world.get((x, y))          # noqa: E731
+    fetch_c = lambda x, y: cl.get((x, y))             # noqa: E731
+
+    assert TEST_CONSTS.water_pyramid_single_receiver
+    lv_d8 = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    lv_mfd = pipeline.FlowLevel(
+        level=0, geom=TEST_GEOM,
+        consts=dataclasses.replace(TEST_CONSTS,
+                                   water_pyramid_single_receiver=False))
+
+    mfd = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, lv_mfd, _real_kernels, climate_fetch=fetch_c)
+    d8 = pipeline.build_flow_superblock(
+        fetch_z, 0, 0, lv_d8, _real_kernels, climate_fetch=fetch_c)
+
+    # 1. THE AREA FIELD IS BIT-IDENTICAL. It is what stream-power incision reads
+    #    (`A^m`), so it decides every height, and this is the whole reason
+    #    bake_ver 12 is a product bump and not a terrain one.
+    np.testing.assert_array_equal(mfd.acc, d8.acc)
+    np.testing.assert_array_equal(mfd.filled, d8.filled)
+
+    # 2. THE DISCHARGE IS THE D8 SWEEP, exactly -- not "something more
+    #    concentrated". A test that only asserted a direction would pass on a
+    #    larger `mfd_p`, which is the change this deliberately is not.
+    src = pipeline.superblock_runoff_mm_yr(fetch_c, 0, 0, lv_d8) / 1000.0
+    src = src * (lv_d8.cell_m * lv_d8.cell_m)
+    want = _real_kernels.accumulate_d8(d8.filled, lv_d8.cell_m, source=src)
+    np.testing.assert_allclose(d8.q, want, rtol=0, atol=0)
+
+    # 3. ...and it is genuinely a different raster from the one that shipped.
+    assert not np.array_equal(mfd.q, d8.q)
+    assert float(d8.q.max()) >= float(mfd.q.max())
+
+    # 4. CONSERVATION is untouched: after the epsilon fill every terminal cell
+    #    is on the border, so the whole seed leaves through the edge -- the same
+    #    invariant `accumulate_mfd` states, and the reason the total crossing a
+    #    tile boundary did not move.
+    rec, _ = _real_kernels.d8_receivers(d8.filled, lv_d8.cell_m)
+    term = np.asarray(rec).ravel() < 0
+    np.testing.assert_allclose(float(d8.q.ravel()[term].sum()), float(src.sum()),
+                               rtol=1e-9)
+
+
+def test_the_pyramid_routing_rule_is_in_the_superblock_fingerprint():
+    """A cached block built with the MFD sweep must not be read as this one.
+
+    ``pregen`` REUSES a cached superblock even when its digest disagrees -- that
+    is ORDER_DEPENDENCE and it is deliberate -- so the digest is the only place
+    that can record "this block carries a differently-routed discharge". Absent
+    means MFD, on the ``entry_mode`` precedent, which is what makes every block
+    cached before bake_ver 12 read as what it actually is rather than as stale.
+    """
+    world = synth_world()
+    fetch = lambda x, y: world.get((x, y))            # noqa: E731
+    on = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    off = pipeline.FlowLevel(
+        level=0, geom=TEST_GEOM,
+        consts=dataclasses.replace(TEST_CONSTS,
+                                   water_pyramid_single_receiver=False))
+    fp_on = pipeline.superblock_inputs_fingerprint(fetch, 0, 0, on)
+    fp_off = pipeline.superblock_inputs_fingerprint(fetch, 0, 0, off)
+    assert fp_on != fp_off
+    # The OFF digest is stable -- turning the flag on must not have rewritten
+    # the fingerprint of blocks that never used it.
+    assert fp_off == pipeline.superblock_inputs_fingerprint(fetch, 0, 0, off)
+
+
+def test_the_pyramid_refuses_single_receiver_without_the_kernel():
+    """The same refusal B6 makes, for the same reason.
+
+    Falling back to MFD would ship a pyramid that is not the one the constants
+    describe, and the only symptom would be a river that stops at a seam --
+    which is exactly the bug that took a day to find the first time.
+    """
+    world = synth_world()
+    cl = climate_world(lambda tx, ty: 900.0)
+    lv = pipeline.FlowLevel(level=0, geom=TEST_GEOM, consts=TEST_CONSTS)
+    k = dataclasses.replace(kernels(), accumulate_d8=None)
+    with pytest.raises(RuntimeError, match="no accumulate_d8 kernel"):
+        pipeline.build_flow_superblock(
+            lambda x, y: world.get((x, y)), 0, 0, lv, k,
+            climate_fetch=lambda x, y: cl.get((x, y)),
+        )
+
+
+# --- the width law ---------------------------------------------------------
+
+
+def _straight_channel(n=64, depth_m=6.0, half_px=40):
+    """A V-shaped trench down column n//2 in a plane that falls to the south.
+
+    Deliberately SHALLOW-SIDED: at the 1.5 m stage the test stands water at, the
+    ground allows ~20 px of half-width, well past the widest law width in play.
+    That is what makes this fixture a test of the LAW -- if the walls bound it
+    the test measures the clamp instead, which has its own case below.
+    """
+    z = np.zeros((n, n), np.float32)
+    z += np.arange(n, dtype=np.float32)[:, None] * -0.5
+    cx = n // 2
+    d = np.abs(np.arange(n) - cx).astype(np.float32)
+    z -= np.maximum(depth_m * (1.0 - d / half_px), 0.0)[None, :]
+    return z
+
+
+def test_width_follows_the_discharge_and_stops_at_the_ground():
+    """The two bounds, each shown to bite where it should.
+
+    A trench with a constant cross-section and a discharge that grows down it:
+    the drawn ribbon must WIDEN downstream (the law is monotone in Q) and must
+    never reach a cell whose ground stands above that reach's own water surface
+    (the clamp). The second is not decoration -- widening in the ground plane
+    without one put 58.2% of a far-field ribbon's edge below drawn ground.
+    """
+    n = 64
+    z = _straight_channel(n)
+    cx = n // 2
+    water = np.full((n, n), np.nan, np.float32)
+    q = np.ones((n, n), np.float64)
+    # Q rises four orders of magnitude down the reach while the water stands a
+    # fixed 1.5 m over the trench floor, so the CLAMP is constant and any change
+    # in the drawn width is the LAW's doing alone.
+    for r in range(n):
+        q[r, cx] = 3.0e6 * (10.0 ** (2.0 * r / (n - 1)))
+        water[r, cx] = z[r, cx] + 1.5
+
+    out, stats = pipeline._water.widen_to_channel_width(water, z, q, cell_m=1.875)
+    wet = np.isfinite(out)
+    assert stats["width_added_cells"] > 0
+
+    up, down = int(wet[2].sum()), int(wet[n - 3].sum())
+    assert down > up, f"the ribbon did not widen downstream: {up} -> {down} px"
+
+    # It tracks the LAW rather than merely growing: the drawn width is within
+    # one pixel of channel_width_m(Q) wherever the trench has room for it.
+    for r in (2, n // 2, n - 3):
+        law = float(pipeline._water.channel_width_m(q[r, cx]))
+        drawn = int(wet[r].sum()) * 1.875
+        assert abs(drawn - law) <= 1.875 + 1e-9, (
+            f"row {r}: drew {drawn:.2f} m against a law width of {law:.2f} m")
+
+    # THE CLAMP. Every drawn cell stands under its own water, by at least the
+    # representability floor the codec needs.
+    assert float((out[wet] - z[wet]).min()) >= pipeline._water.WIDEN_MIN_DEPTH_M - 1e-6
+    # The centreline is untouched: widening adds cells, it never moves a level.
+    src = np.isfinite(water)
+    np.testing.assert_allclose(out[src], water[src])
+
+
+def test_width_never_leaves_a_trench_it_cannot_fill():
+    """A major river in a one-pixel slot with sheer walls stays one pixel wide."""
+    n = 48
+    z = np.full((n, n), 100.0, np.float32)
+    cx = n // 2
+    z[:, cx] = 90.0
+    q = np.ones((n, n))
+    q[:, cx] = 5.0e8
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, cx] = 92.0
+    # The law wants many pixels; the ground offers one.
+    assert float(pipeline._water.channel_width_m(5.0e8)) > 8 * 1.875
+
+    out, _ = pipeline._water.widen_to_channel_width(water, z, q, cell_m=1.875)
+    wet = np.isfinite(out)
+    assert int(wet.sum()) == n, "water escaped a slot whose walls stand 8 m above it"
+    assert wet[:, cx].all()
+
+
+def test_width_does_not_spill_into_a_registered_basin():
+    """B5 basins are written dry and must stay dry.
+
+    Their surface is already on the wire in SECTION_BASIN_TABLE and the client
+    composes the two samplers; a widened cell inside one would be a second,
+    freely-disagreeing copy of a shipped fact -- which is the reason
+    ``graded_water_surface`` excludes them in the first place.
+    """
+    n = 32
+    z = np.full((n, n), 50.0, np.float32)
+    cx = n // 2
+    z[:, cx] = 40.0
+    z[:, cx + 1:cx + 4] = 10.0          # a deep re-opened hole beside the reach
+    q = np.ones((n, n))
+    q[:, cx] = 5.0e8
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, cx] = 42.0
+    exclude = np.zeros((n, n), bool)
+    exclude[:, cx + 1:cx + 4] = True
+
+    out, _ = pipeline._water.widen_to_channel_width(
+        water, z, q, cell_m=1.875, exclude=exclude)
+    assert not np.isfinite(out[exclude]).any()
+    # ...and without the exclusion it WOULD have flooded it, so this is
+    # measuring the guard rather than a geometry that never reached.
+    loose, _ = pipeline._water.widen_to_channel_width(water, z, q, cell_m=1.875)
+    assert np.isfinite(loose[:, cx + 1]).any()
+
+
+def test_width_takes_the_nearest_reach_not_the_highest():
+    """Two reaches three pixels apart: the cell between them takes its own.
+
+    Taking the maximum level instead would let a trunk raise the water over a
+    tributary's bank from three pixels away, which draws a stamped sheet rather
+    than two rivers.
+    """
+    n = 24
+    z = np.full((n, n), 100.0, np.float32)
+    a, b = 8, 11
+    z[:, a] = 90.0
+    z[:, b] = 90.0
+    z[:, a + 1:b] = 95.0
+    q = np.ones((n, n))
+    q[:, a] = 5.0e8            # the trunk, high water
+    q[:, b] = 2.0e7            # the tributary, low water
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, a] = 99.0
+    water[:, b] = 96.0
+
+    out, _ = pipeline._water.widen_to_channel_width(water, z, q, cell_m=1.875)
+    # The cell adjacent to the tributary takes the TRIBUTARY's level, though the
+    # trunk's is higher and its law reaches that far.
+    assert np.isfinite(out[:, b - 1]).all()
+    np.testing.assert_allclose(out[:, b - 1], 96.0)
