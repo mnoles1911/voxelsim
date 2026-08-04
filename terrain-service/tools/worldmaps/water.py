@@ -14,14 +14,18 @@ same kind of statement:
   hole in a specific hillside, and there is no such thing as an estimate of
   one.
 
-  CHANNELS are PREDICTED, and the word is on the image. Section 4.1 of
-  docs/watershed-system-plan.md defines the source-point rule against a
-  runoff-weighted accumulation the bake does not yet compute (it accumulates
-  bare area today, in m^2). So this map runs that rule here, on the same
-  fields and through the same kernels the bake uses -- ``flow.fill_depressions``,
-  ``flow.accumulate_mfd``, ``basins.pet_mm_yr``, ``basins.budyko_runoff_mm_yr``
-  -- at the coarse 30 m pitch, which is the pitch of the flow superblocks the
-  bake routes against. It is what 4.1 WILL place, not what any tile carries.
+  CHANNELS come from THE COARSE TILES -- all of them -- swept here at the
+  30 m pitch, which is the pitch of the flow superblocks the bake routes
+  against. Every kernel and every constant is the shipped one:
+  ``flow.fill_depressions``, ``flow.d8_receivers``, ``flow.accumulate_d8``,
+  ``water.runoff_field_mm_yr``, ``water.discharge_source``,
+  ``water.q_drawable_m3_yr``, ``water.water_head_mask``. Nothing about the
+  water rule is defined in this file any more.
+
+  It is deliberately NOT derived from fine tiles, and that is the whole reason
+  the channel layer can be world-scale at all: 256 of 289 tiles have ever been
+  surveyed and far fewer are resident, so a fine-derived network would cover a
+  fraction of the map and would have to be hatched like the lakes are.
 
 WHY THE TWO HALVES HAVE DIFFERENT COVERAGE, which is the honest part. Lakes
 need a fine bake: ~9 minutes and ~5 GiB per 15.36 km tile. Channels need only
@@ -29,30 +33,51 @@ the coarse tiles, all 289 of which exist. So the channel network covers the
 whole world and the lake layer covers exactly the tiles that were baked. The
 legend prints both counts and the map hatches the difference.
 
+WHAT bake_ver 11 CHANGED HERE (2026-08-04), since this map is only worth
+anything if it agrees with the bake:
+
+  * **The cut.** Water is drawn at ``q_drawable``, the threshold the shipped
+    plane is written over, not at ``Q_perennial``. See ``q_drawable()`` below
+    for why the pitch passed to it is the FINE tier's and not this map's --
+    that is the one place this file exercises judgement.
+  * **D8.** The discharge sweep is single-receiver, matching
+    ``water_flow_single_receiver``. The terrain's MFD routing is untouched;
+    this map does not compute an area field at all any more.
+  * **One sweep, with ``source=``.** The old two-sweeps-and-subtract form
+    predates ``flow.accumulate_*(source=)``, which exists because of this tool.
+  * **Carried discharge changes NOTHING here**, and that is worth saying rather
+    than passing over: this map has one domain and one sweep, so every
+    catchment was always whole. The pyramid's carried-Q fix exists to bring the
+    fine tier up to what this sweep already computed.
+
 BAKE VERSION. ``roughness_seed`` takes ``BAKE_VERSION`` (pipeline.py:1130), so
 tiles baked at 7 and 8 are DIFFERENT WORLDS, not the same world measured
 twice. This tool refuses to mix them: every dump must carry the same
 ``bake_version``, and that number is printed on the image.
 
 DISCHARGE, one currency (plan 4.1.1). Q(cell) = sum over the upstream network
-of runoff(c) * cell_area, m^3/yr. ``accumulate_mfd`` always seeds each cell
-with its own area, so Q comes out as the difference of two sweeps over the
-same filled surface: one plain (catchment area, m^2) and one whose ``inflow``
-is the cell's own runoff volume. The difference is exactly the runoff-weighted
-accumulation, with no reimplementation of the sweep.
+of runoff(c) * cell_area, m^3/yr. ONE sweep, seeded per cell by
+``water.discharge_source`` through ``accumulate_*(source=)`` -- the kernel
+parameter that exists because this tool used to have to fake it with two
+sweeps and a subtraction.
 
-THRESHOLD. Q_PERENNIAL is a physical flow rate -- 10 litres a second of mean
-discharge -- not a pixel count. That is about the smallest watercourse that is
-wet all year, and anchoring on it is what stops this map being the fractal
-smear the carve thresholds would draw: the bake carves a swale at 156 m^2 of
-catchment and ``rivernet.h`` calls a channel a river at what works out to
-around 0.03 km^2, both of which are dry gullies in most climates. The
-resulting drainage density is printed on the image so the number can be argued
-with against Earth's 0.5-2 km/km^2 for perennial networks.
+TWO THRESHOLDS, AND THE MAP SHOWS BOTH. ``Q_PERENNIAL`` is the hydrologic
+statement -- 10 litres a second of mean discharge, the scale at which a
+watercourse is wet in every month. ``q_drawable`` is the raster statement: the
+smallest Q whose channel is wide enough for the shipped fine plane to hold a
+wet bed. Water is DRAWN at ``q_drawable``, because that is where the game puts
+it; the band between the two is on the map in grey, because those reaches are
+genuinely wet and the raster simply declines to draw them, and hiding that
+would let "the map is sparse" read as "the world is dry".
 
-WIDTH is ``channel.h``'s own law -- 1.5 m at threshold, w proportional to
-Q^0.3984, capped at 400 m -- re-anchored on Q_PERENNIAL instead of
-``kRiverAccumThresholdDefault``, exactly as 4.1.3 says to. The LINE WIDTHS ON
+Both beat the carve thresholds, which is why neither is one: the bake carves a
+swale at 156 m^2 of catchment and ``rivernet.h`` calls a channel a river at
+around 0.03 km^2, both dry gullies in most climates. The resulting drainage
+density is printed on the image so the number can be argued with against
+Earth's 0.5-2 km/km^2 for perennial networks.
+
+WIDTH is ``channel.h``'s own law, imported from ``bake.water`` -- 1.5 m at
+Q_PERENNIAL, w proportional to Q^0.3984, capped at 400 m. The LINE WIDTHS ON
 THE MAP ARE SYMBOLIC: a 9 m river is a fourteenth of a 120 m pixel. The
 colour, not the thickness, carries the discharge.
 
@@ -90,46 +115,74 @@ from terrain_service.bake import basins as bs              # noqa: E402
 from terrain_service.bake import flow                      # noqa: E402
 from terrain_service.bake import pipeline as bp            # noqa: E402
 from terrain_service.bake import province as bprov         # noqa: E402
+from terrain_service.bake import water as bw               # noqa: E402
 
 COARSE_PX_M = 30.0
 TILE_PX = 512
 
 # --------------------------------------------------------------------------- the rule
+#
+# NOTHING IN THIS SECTION IS DEFINED HERE ANY MORE. Every constant and every law
+# below used to be a local copy, written when this tool was the only thing in
+# the repo that had a discharge at all. `bake/water.py` now owns them and the
+# bake itself runs on them, so a copy here is a second law free to drift away
+# from the one that ships -- exactly the failure `02-biomes.png` still carries a
+# visible scar from. One law, one home.
 
-#: The perennial-stream threshold, m^3/yr. 10 L/s of MEAN discharge: the scale
-#: at which a watercourse is wet in every month rather than after rain. Plan
-#: 4.1.2 leaves this to be "calibrated on the survey" and gives its order as
-#: "10^3-10^4 m^3/yr - km^2-scale", which is not a closed unit; a mean flow
-#: rate is, and it is the quantity a hydrologist would name.
-Q_PERENNIAL_M3_YR = 10.0 * 1e-3 * 365.25 * 86400.0        # = 315,576 m^3/yr
-
-#: Class boundaries as multiples of the threshold, in the same currency: a
-#: river at 1 m^3/s and a major river at 10 m^3/s. Both are round physical
-#: flows, and channel.h's width law puts them at 9.4 m and 23.7 m wide.
-Q_RIVER_M3_YR = 100.0 * Q_PERENNIAL_M3_YR
-Q_MAJOR_M3_YR = 1000.0 * Q_PERENNIAL_M3_YR
-
-#: channel.h's hydraulic geometry, the constants themselves (kChannelRefWidthMm,
-#: kChannelWidthExpQ8/256, kChannelMaxWidthMm). Re-anchored on Q_PERENNIAL per
-#: plan 4.1.3. Kept as a function so the legend and the colour key cannot use
-#: two different laws.
-CHANNEL_REF_WIDTH_M = 1.5
-CHANNEL_WIDTH_EXP = 102.0 / 256.0
-CHANNEL_MAX_WIDTH_M = 400.0
+Q_PERENNIAL_M3_YR = bw.Q_PERENNIAL_M3_YR                  # 315,576 m^3/yr, 10 L/s
+Q_RIVER_M3_YR = bw.Q_RIVER_M3_YR                          # 1 m^3/s
+Q_MAJOR_M3_YR = bw.Q_MAJOR_M3_YR                          # 10 m^3/s
+channel_width_m = bw.channel_width_m
 
 
-def channel_width_m(q_m3_yr):
-    """channel.h's width law, re-anchored on Q_PERENNIAL. Monotone in Q."""
-    q = np.maximum(np.asarray(q_m3_yr, np.float64), Q_PERENNIAL_M3_YR)
-    w = CHANNEL_REF_WIDTH_M * (q / Q_PERENNIAL_M3_YR) ** CHANNEL_WIDTH_EXP
-    return np.minimum(w, CHANNEL_MAX_WIDTH_M)
+def q_drawable(consts, geom) -> float:
+    """The cut the SHIPPED bake actually writes water at, m^3/yr.
+
+    THIS IS THE ONE JUDGEMENT IN THIS FILE AND IT IS WORTH THE PARAGRAPH.
+
+    `bw.q_drawable_m3_yr(cell_m, min_width_px)` answers "what is the smallest Q
+    whose channel fills `min_width_px` of a `cell_m` raster". It is therefore a
+    statement about A PARTICULAR PITCH, and the temptation -- the wrong thing --
+    is to evaluate it at this map's own pitch because that is the raster being
+    drawn. Do that and the 1.5 px rule at the coarse 30 m pitch asks for a 45 m
+    wide channel, i.e. 1.6e9 m^3/yr, 51 m^3/s: a cut a thousand times above the
+    shipped one that would erase all but a handful of trunk rivers and describe
+    a world that does not exist.
+
+    The map is not trying to say what ITS raster can hold. It is trying to say
+    where the GAME will put water, and the game's water plane is written on the
+    fine tier at 1.875 m. So the pitch passed here is the fine tier's, and the
+    number that comes out is the number the bake uses -- 1.5286e6 m^3/yr at
+    `water_min_width_px` 1.5, 0.048 m^3/s. Evaluated, never hard-coded, so a
+    later change to either constant moves this map with it.
+    """
+    return bw.q_drawable_m3_yr(geom.fine_pixel_m, consts.water_min_width_px,
+                               consts.water_q_perennial_m3_yr)
 
 
-CLASSES = (
-    ("stream", Q_PERENNIAL_M3_YR, Q_RIVER_M3_YR, "#5fa8d3"),
-    ("river", Q_RIVER_M3_YR, Q_MAJOR_M3_YR, "#1f6fb2"),
-    ("major river", Q_MAJOR_M3_YR, np.inf, "#0b3d66"),
-)
+#: Colours. The first entry is NOT DRAWN WATER: it is the band that is
+#: perennially wet (>= 10 L/s) and still below the bake's drawable cut, and it
+#: is on the map in a deliberately washed-out grey-blue because leaving it off
+#: would let "the raster declines to draw it" read as "the world is dry". Every
+#: saturated blue on this map is water the bake writes.
+UNDRAWN_COLOUR = "#a3b2bd"
+
+
+def classes(q_draw):
+    """Drawn-channel classes, floored at the SHIPPED cut rather than at perennial.
+
+    Before bake_ver 11 this map's floor was `Q_PERENNIAL_M3_YR` and the caption
+    called the whole layer a prediction, because no baked tile carried a
+    runoff-weighted Q to compare against. Both halves of that have changed: the
+    bake computes this quantity now, and it draws at `q_drawable`. A map whose
+    floor is 4.8x below the shipped cut is drawing streams the game does not
+    place.
+    """
+    return (
+        ("stream", q_draw, Q_RIVER_M3_YR, "#5fa8d3"),
+        ("river", Q_RIVER_M3_YR, Q_MAJOR_M3_YR, "#1f6fb2"),
+        ("major river", Q_MAJOR_M3_YR, np.inf, "#0b3d66"),
+    )
 
 KIND_COLOUR = {
     "dry_playa": "#a87c46",
@@ -174,19 +227,38 @@ def stitch(seed_dir: pathlib.Path):
 
 
 def discharge(elev, clim, consts):
-    """Plan 4.1's Q, over the whole stitched world, through the bake's kernels.
+    """Q over the whole stitched world, by the bake's own B6 construction.
 
-    Two sweeps of ``accumulate_mfd`` over ONE filled surface:
+    THIS IS NOW A COPY OF `pipeline.bake_tile`'s WATER PASS, not a paraphrase of
+    it. Three things changed with bake_ver 11 and all three are here:
 
-      area = sweep with no inflow                -> m^2 of catchment
-      tot  = sweep seeded with each cell's own runoff volume
-      Q    = tot - area                          -> m^3/yr delivered
+    ``source=`` INSTEAD OF TWO SWEEPS AND A SUBTRACTION. This function used to
+    run ``accumulate_mfd`` twice over one filled surface and subtract, because
+    when it was written the kernel had no way to replace the per-cell seed. It
+    does now -- ``flow.accumulate_*(source=)`` exists precisely because of this
+    tool, and flow.py names it. One sweep, half the cost, and the seed is built
+    by ``bw.discharge_source``, the shipped function, at ``scale=1`` because
+    this map's climate grid and its flow grid are the same grid.
 
-    The subtraction is exact, not an approximation: ``accumulate_mfd`` always
-    starts every cell at ``cell_m**2`` and ADDS ``inflow``, and both terms
-    travel down the same MFD weights, so the difference is the accumulation of
-    ``inflow`` alone. Doing it this way rather than by rescaling the inflow
-    keeps the sweep itself untouched -- it is the shipped kernel, not a copy.
+    D8, NOT MFD, FOR THE DISCHARGE. ``consts.water_flow_single_receiver``. The
+    terrain still routes MFD everywhere it matters -- ``mfd_p`` decides the area
+    field, hence ``A^m``, hence every height -- and nothing here touches that,
+    because nothing here computes an area field at all any more. This sweep's
+    only consumer is a hard threshold, and splitting a reach's discharge across
+    every lower neighbour is what put 2,014 pieces and a 1,113 m longest reach
+    in the measured corridor. The forest is built on ``filled``, the same
+    surface the sweep runs over, exactly as B6 builds it.
+
+    CARRIED DISCHARGE IS NOT A CHANGE HERE, and this is the reason to say so
+    out loud rather than quietly not mention it: the pyramid's carried-Q fix
+    exists to make the FINE tier agree with what a single sweep over the
+    stitched coarse world already computes. There is no pyramid on this map and
+    no injection cell -- one domain, one sweep, every catchment whole. The
+    coarse world is the reference that measured the shortfall (1.27e6 against
+    58.7e6 at the corridor's coast), so this layer already had the answer the
+    fine tier has just moved from 2.2% to ~40% of.
+
+    Returns (filled, receivers, q, runoff_mm).
     """
     # Absent tiles are sea, for routing purposes only: fill_depressions needs a
     # finite domain, and MISSING_ELEVATION_M is the bake's own answer for a
@@ -195,52 +267,52 @@ def discharge(elev, clim, consts):
     z = np.where(np.isnan(elev), np.float32(bp.MISSING_ELEVATION_M), elev)
     z = np.ascontiguousarray(z, np.float32)
 
-    phys = bprov.dequantize_climate(clim)
-    # Smoothed exactly as every other climate consumer smooths: the uint8 LSBs
-    # are 0.31 C and 47 mm/yr, which is bigger than several province
-    # boundaries. province_smooth_m / coarse pitch, halved (box_smooth is two
-    # passes, total radius 2*half).
-    half = max(int(round(consts.province_smooth_m / COARSE_PX_M / 2.0)), 1)
-    temp = bprov.box_smooth(phys["temperature"], half)
-    precip = bprov.box_smooth(phys["precipitation"], half)
-    del phys
+    # Budyko runoff, smoothed the way every climate consumer smooths (the uint8
+    # wire LSBs are 0.31 C and 47 mm/yr, bigger than several province
+    # boundaries). `bw.runoff_field_mm_yr` is the bake's own routine for this
+    # and takes the same WaterBalance the lake rule uses, so a basin and its
+    # outlet river cannot disagree about how much water the sky delivers.
+    runoff_mm = bw.runoff_field_mm_yr(
+        clim, bp.basin_balance(consts), consts.province_smooth_m, COARSE_PX_M)
 
-    pet = bs.pet_mm_yr(temp, bp.basin_balance(consts))
-    runoff_mm = bs.budyko_runoff_mm_yr(precip, pet, bp.basin_balance(consts))
-    del temp, precip, pet
-
-    cell_a = COARSE_PX_M * COARSE_PX_M
     t0 = time.time()
     filled = np.asarray(flow.fill_depressions(z), np.float32)
     print(f"  fill_depressions {time.time() - t0:.0f}s", flush=True)
+    del z
+
+    # No pyramid here, so no inflow term at all: the domain edge IS the coast.
+    src = bw.discharge_source(runoff_mm, filled.shape, 1, COARSE_PX_M)
 
     t0 = time.time()
-    area = flow.accumulate_mfd(filled, COARSE_PX_M, p=consts.mfd_p)
-    print(f"  accumulate_mfd (area) {time.time() - t0:.0f}s", flush=True)
-
-    inflow = (runoff_mm.astype(np.float64) / 1000.0) * cell_a   # m^3/yr per cell
-    np.clip(inflow, 0.0, None, out=inflow)
+    rec, _ = flow.d8_receivers(filled, COARSE_PX_M)
+    print(f"  d8_receivers {time.time() - t0:.0f}s", flush=True)
     t0 = time.time()
-    tot = flow.accumulate_mfd(filled, COARSE_PX_M, p=consts.mfd_p, inflow=inflow)
-    print(f"  accumulate_mfd (runoff) {time.time() - t0:.0f}s", flush=True)
+    if consts.water_flow_single_receiver:
+        q = flow.accumulate_d8(filled, COARSE_PX_M, source=src, receivers=rec)
+        print(f"  accumulate_d8 (discharge) {time.time() - t0:.0f}s", flush=True)
+    else:
+        q = flow.accumulate_mfd(filled, COARSE_PX_M, p=consts.mfd_p, source=src)
+        print(f"  accumulate_mfd (discharge) {time.time() - t0:.0f}s", flush=True)
+    del src
+    np.clip(q, 0.0, None, out=q)
+    return filled, rec, q.astype(np.float32), runoff_mm
 
-    q = tot - area
-    del tot
-    np.clip(q, 0.0, None, out=q)          # the subtraction can leave -1e-9
-    return filled, area.astype(np.float32), q.astype(np.float32), runoff_mm
 
-
-def channel_length_km(q, filled, land, thresholds):
+def channel_length_km(q, shape, rec, land, thresholds):
     """Length of the channel network, by class, following the D8 tree.
 
     Cell COUNT x cell size overstates a diagonal reach by up to 41%. This
     walks ``d8_receivers`` -- the bake's own kernel -- and sums the true step
     distance for every channel cell whose receiver is also a channel cell, so
     a diagonal step costs sqrt(2) * 30 m and nothing is double counted.
+
+    ``rec`` is now the SAME forest the discharge was accumulated down, not a
+    second one built here. It always was the same surface; passing it makes the
+    length a measurement of the network that was actually drawn rather than of
+    a coincidentally identical one.
     """
-    rec, _ = flow.d8_receivers(filled, COARSE_PX_M)
-    rec = rec.ravel()
-    h, w = filled.shape
+    rec = np.asarray(rec).ravel()
+    h, w = shape
     has = rec >= 0
     ry, rx = np.divmod(np.where(has, rec, 0).astype(np.int64), w)
     cy, cx = np.divmod(np.arange(h * w, dtype=np.int64), w)
@@ -250,6 +322,7 @@ def channel_length_km(q, filled, land, thresholds):
     # contributes nothing, which is right: the reach ends there.
     step = np.where((ry != cy) & (rx != cx), np.sqrt(2.0), 1.0) * COARSE_PX_M
     step[~has] = 0.0
+    del ry, rx, cy, cx
     out = {}
     qf, lf = q.ravel(), land.ravel()
     for name, lo, hi, _c in thresholds:
@@ -258,7 +331,7 @@ def channel_length_km(q, filled, land, thresholds):
     return out
 
 
-def check_against_bake(q, land, dumps, tx0, ty0):
+def check_against_bake(q, land, dumps, tx0, ty0, q_draw):
     """Do the PREDICTED channels sit where the BAKE actually routes water?
 
     A predicted layer with no cross-check is an assertion, and this map draws
@@ -296,7 +369,7 @@ def check_against_bake(q, land, dumps, tx0, ty0):
         sl = (slice(j * TILE_PX, (j + 1) * TILE_PX),
               slice(i * TILE_PX, (i + 1) * TILE_PX))
         lm = land[sl]
-        ch = lm & (q[sl] >= Q_PERENNIAL_M3_YR)
+        ch = lm & (q[sl] >= q_draw)
         if ch.sum() < 50 or lm.sum() < 1000:
             continue
         base = float(np.median(accd[lm]))
@@ -427,9 +500,21 @@ def main() -> int:
     print(f"  {n_tiles} coarse tiles -> {w}x{h} px @ {COARSE_PX_M:.0f} m/px "
           f"= {w * COARSE_PX_M / 1000:.0f} km", flush=True)
 
+    Q_DRAW = q_drawable(consts, bp.PRODUCTION)
+    CLASSES = classes(Q_DRAW)
+    print(f"  drawable cut {Q_DRAW:,.0f} m3/yr = {Q_DRAW / 3.156e7:.4f} m3/s "
+          f"({consts.water_min_width_px} px at {bp.PRODUCTION.fine_pixel_m} m, "
+          f"routing {'D8' if consts.water_flow_single_receiver else 'MFD'})",
+          flush=True)
+
+    # The cache key carries the drawable cut and the routing rule, not just the
+    # perennial constant: a cache written at bake_ver 10 holds an MFD field and
+    # loading it under a D8 caption would be the map lying about its own
+    # construction. Different key -> recomputed.
     key = hashlib.sha256(
         f"{tx0},{ty0},{ntx},{nty},{n_tiles},{bp.bake_fingerprint(bp.PRODUCTION, consts)},"
-        f"{Q_PERENNIAL_M3_YR}".encode()).hexdigest()[:16]
+        f"{Q_PERENNIAL_M3_YR},{Q_DRAW},"
+        f"{bool(consts.water_flow_single_receiver)},v2".encode()).hexdigest()[:16]
     cached = None
     if args.cache and args.cache.exists():
         z = np.load(args.cache)
@@ -437,21 +522,36 @@ def main() -> int:
             cached = z
             print(f"  reusing discharge field from {args.cache}", flush=True)
     if cached is None:
-        print("computing discharge (fill + two MFD sweeps) ...", flush=True)
-        filled, area, q, runoff_mm = discharge(elev, clim, consts)
+        print("computing discharge (fill + one single-receiver sweep) ...", flush=True)
+        filled, rec, q, runoff_mm = discharge(elev, clim, consts)
         if args.cache:
-            np.savez_compressed(args.cache, key=key, q=q, area=area,
+            np.savez_compressed(args.cache, key=key, q=q, rec=rec,
                                 filled=filled, runoff_mm=runoff_mm)
     else:
-        filled, area, q = cached["filled"], cached["area"], cached["q"]
+        filled, rec, q = cached["filled"], cached["rec"], cached["q"]
         runoff_mm = cached["runoff_mm"]
     del clim
 
     land = np.isfinite(elev) & (elev > bs.SEA_LEVEL_M)
     land_km2 = float(land.sum()) * COARSE_PX_M ** 2 / 1e6
 
+    # The two counts, from the bake's own function on the bake's own cut. This
+    # is what stops "the map is sparse" reading as "the world is dry": the
+    # perennial network is the hydrologic statement and the drawn one is the
+    # raster statement, and the gap between them is a real, reported number
+    # rather than something absorbed silently by the threshold.
+    _wet, _heads, head_stats = bw.water_head_mask(
+        np.where(land, q, 0.0), rec, q_drawable=Q_DRAW,
+        q_perennial=consts.water_q_perennial_m3_yr)
+    del _wet, _heads
+    n_drawn = int(head_stats["drawn_cells"])
+    n_perennial = int(head_stats["perennial_cells"])
+    n_undrawn = n_perennial - n_drawn
+    print(f"  perennial {n_perennial:,} cells / drawn {n_drawn:,} / "
+          f"heads {int(head_stats['head_cells']):,}", flush=True)
+
     print("channel network ...", flush=True)
-    lens = channel_length_km(q, filled, land, CLASSES)
+    lens = channel_length_km(q, filled.shape, rec, land, CLASSES)
     total_km = sum(lens.values())
     del filled
 
@@ -472,7 +572,7 @@ def main() -> int:
             if a < 0.5 * tile_km2:
                 continue
             land_tiles += 1
-            km = float((land[sl] & (q[sl] >= Q_PERENNIAL_M3_YR)).sum()) * COARSE_PX_M / 1000.0
+            km = float((land[sl] & (q[sl] >= Q_DRAW)).sum()) * COARSE_PX_M / 1000.0
             per_tile_km.append(km)
             per_tile_dens.append(km / a)
     per_tile_km = np.array(per_tile_km)
@@ -482,7 +582,7 @@ def main() -> int:
     dumps, bake_ver = load_dumps(args.dumps, consts)
     print(f"  {len(dumps)} surveyed tiles at bake_ver {bake_ver}", flush=True)
 
-    agree = check_against_bake(q, land, dumps, tx0, ty0)
+    agree = check_against_bake(q, land, dumps, tx0, ty0, Q_DRAW)
     if agree:
         ratios = np.array([r for _t, r, _n, _v in agree])
         print(f"  cross-check on {len(agree)} tiles with a baked accumulation: "
@@ -557,6 +657,17 @@ def main() -> int:
     # is thick with ponds. An overflowing lake and its own outlet share cells by
     # construction, and there the outlet is the thing worth seeing.
     qmax = _maxpool(np.where(land, q, 0.0), f)[:H, :W]
+
+    # UNDER them, the perennial-but-undrawable band, in grey rather than blue.
+    # These reaches carry 10 L/s or more -- they are wet all year -- and the
+    # fine raster still declines to draw them because their channel is under
+    # 2.8 m across. Omitting them entirely would make the world look drier than
+    # it is; drawing them blue would promise water the game does not place. So
+    # they are on the map and they are not blue.
+    m_und = (qmax >= Q_PERENNIAL_M3_YR) & (qmax < Q_DRAW)
+    c = np.array(matplotlib.colors.to_rgb(UNDRAWN_COLOUR), np.float32)
+    rgb[m_und] = c * (0.55 + 0.45 * shade[m_und])[..., None]
+
     for ci, (name, lo, hi, col) in enumerate(CLASSES):
         m = (qmax >= lo) & (qmax < hi)
         m = _dilate(m, ci)         # streams 1 px, rivers 3 px, major 5 px wide
@@ -591,9 +702,10 @@ def main() -> int:
     axm.text(W * 0.02 + bar_km * 500 / px_m, y - H * 0.008, f"{bar_km:.0f} km",
              ha="center", va="bottom", fontsize=10, weight="bold")
     axm.set_title(
-        f"WHERE WATER GOES  |  seed {args.seed_label}  |  {n_tiles} coarse tiles, "
-        f"{w * COARSE_PX_M / 1000:.0f} x {h * COARSE_PX_M / 1000:.0f} km @ {px_m:.0f} m/px",
-        fontsize=12.5, weight="bold")
+        f"STREAMS, RIVERS AND LAKES  |  seed {args.seed_label}  |  "
+        f"channels from {n_tiles} COARSE tiles, lakes from {len(dumps)} FINE  |  "
+        f"{w * COARSE_PX_M / 1000:.0f} km @ {px_m:.0f} m/px",
+        fontsize=11.5, weight="bold")
 
     # ---- exemplar panels: the same code, a wet tile and a dry one ---------
     # TWO of them, side by side, because the point of classifying a hole by its
@@ -692,14 +804,22 @@ def main() -> int:
             land[j * TILE_PX:(j + 1) * TILE_PX,
                  i * TILE_PX:(i + 1) * TILE_PX].sum()) * COARSE_PX_M ** 2
 
+    n_lake_bodies = sum(n_by_kind[k] for k in
+                        ("lake_overflowing", "lake_terminal", "seasonal"))
+    n_lake_all = sum(n_by_kind.values())
+
     ch_handles = [
         Line2D([], [], color=c, lw=2.6,
-               label=f"{n:<12s} Q {lo / 3.156e7:>5.2f}-"
-                     f"{'inf' if not np.isfinite(hi) else f'{hi / 3.156e7:.0f}'} m3/s   "
+               label=f"{n:<12s} Q {lo / 3.156e7:>6.3f}-"
+                     f"{'inf' if not np.isfinite(hi) else f'{hi / 3.156e7:.0f}'} m3/s  "
                      f"w {channel_width_m(lo):.1f}-"
-                     f"{'400' if not np.isfinite(hi) else f'{channel_width_m(hi):.0f}'} m   "
+                     f"{'400' if not np.isfinite(hi) else f'{channel_width_m(hi):.0f}'} m  "
                      f"{lens[n]:,.0f} km")
         for (n, lo, hi, c) in CLASSES]
+    ch_handles.append(
+        Line2D([], [], color=UNDRAWN_COLOUR, lw=2.6,
+               label=f"{'(not drawn)':<12s} Q {Q_PERENNIAL_M3_YR / 3.156e7:6.3f}-"
+                     f"{Q_DRAW / 3.156e7:.3f} m3/s  perennial, under the cut"))
     lk_handles = [
         Patch(facecolor=KIND_COLOUR[k], edgecolor="#101010", lw=.4,
               label=f"{k:<17s} {n_by_kind[k]:>5,d}   {a_by_kind[k] / 1e4:>9,.0f} ha")
@@ -707,29 +827,31 @@ def main() -> int:
 
     axl = fig.add_axes([0.603, 0.330, 0.393, 0.235])
     axl.set_axis_off()
-    l1 = axl.legend(handles=ch_handles, loc="upper left", fontsize=8.8,
-                    title="CHANNELS -- PREDICTED, over all %d coarse tiles"
-                          % n_tiles,
-                    title_fontsize=9.8, framealpha=.95,
-                    bbox_to_anchor=(0.0, 1.0))
+    l1 = axl.legend(
+        handles=ch_handles, loc="upper left", fontsize=8.8,
+        title=("STREAMS & RIVERS -- from the %d COARSE tiles, at the SHIPPED cut\n"
+               "%s drawn cells   %s km   cut %s m3/yr, D8"
+               % (n_tiles, f"{n_drawn:,}", f"{total_km:,.0f}", f"{Q_DRAW:,.0f}")),
+        title_fontsize=9.8, framealpha=.95, bbox_to_anchor=(0.0, 1.0))
     l1._legend_box.align = "left"
     axl.add_artist(l1)
-    l2 = axl.legend(handles=lk_handles, loc="upper left", fontsize=8.8,
-                    title="LAKES -- MEASURED, %d of %d tiles baked, bake_ver %d"
-                          % (len(dumps), n_tiles, bake_ver),
-                    title_fontsize=9.8, framealpha=.95,
-                    bbox_to_anchor=(0.0, 0.74))
+    l2 = axl.legend(
+        handles=lk_handles, loc="upper left", fontsize=8.8,
+        title=("LAKES -- MEASURED from the FINE bake, %d of %d tiles, bake_ver %d\n"
+               "%s registered, %s hold water, %s ha of surface"
+               % (len(dumps), n_tiles, bake_ver, f"{n_lake_all:,}",
+                  f"{n_lake_bodies:,}", f"{lake_areas.sum() / 1e4:,.0f}")),
+        title_fontsize=9.8, framealpha=.95, bbox_to_anchor=(0.0, 0.60))
     l2._legend_box.align = "left"
 
     if agree:
         rr = np.array([r for _t, r, _n, _v in agree])
         lo = min(agree, key=lambda a: a[1])
         agree_line = (
-            f"on the {len(agree)} baked tiles whose accumulation raster is here, the bake's OWN 1.875 m\n"
-            f"                accumulation under these channels is {np.median(rr):,.0f}x the tile median.  Different currency, same PLACES: the\n"
-            f"                prediction sits on the thalwegs the shipped surface actually routes down.  The range is {rr.min():,.0f} to {rr.max():,.0f} and\n"
-            f"                THE LOW END IS REAL, not noise: tile {lo[0]} reads {lo[1]:.1f}x, and it has {lo[3]:.0f} m of relief over 15 km with 45% of\n"
-            f"                its area in depressions.  On ground that flat there is no thalweg for a prediction to sit on.")
+            f"on the {len(agree)} baked tiles whose accumulation raster is here, the bake's OWN 1.875 m accumulation under\n"
+            f"                these channels is {np.median(rr):,.0f}x the tile median.  Different currency, same PLACES: the coarse network sits on the\n"
+            f"                thalwegs the shipped surface routes down.  Range {rr.min():,.0f} to {rr.max():,.0f}, and THE LOW END IS REAL, not noise -- tile\n"
+            f"                {lo[0]} reads {lo[1]:.1f}x with {lo[3]:,.0f} m of relief over 15 km, and on ground that flat there is no thalweg to sit on.")
     else:
         agree_line = ("NOT DONE -- no dump here carries its accumulation raster, so this layer is\n"
                       "                unchecked against the bake and should be read as a proposal only.")
@@ -741,36 +863,40 @@ def main() -> int:
                 f"p90 {fmt.format(np.percentile(a, 90))} / max {fmt.format(a.max())}")
 
     txt = (
-        f"CHANNELS ARE A PREDICTION.  LAKES ARE A MEASUREMENT.  They are not the same kind of statement and the map does not blend them.\n"
-        f"  channels  plan 4.1's source-point rule, run HERE over the coarse 30 m plane through the bake's own kernels (fill_depressions, accumulate_mfd, pet, budyko).\n"
-        f"            No baked tile carries a runoff-weighted Q yet, so this is what 4.1 WILL place -- not what any tile says today.  Coverage: all {n_tiles} coarse tiles.\n"
-        f"  lakes     the shipped basin registry from a REAL bake (tools/lake_survey.py dump), filtered by pipeline.basin_filter, classified by basins.classify.\n"
-        f"            {n_unsurveyed} land-bearing tiles are hatched red: NOT BAKED, so no lake is drawn on them and none is implied.  {n_unsurveyed_ocean} unbaked tiles are all ocean.\n"
-        f"            Nothing about a lake is ever interpolated between tiles: a lake is a hole in one specific hillside, and there is no estimate of one.\n"
-        f"  version   bake_ver {bake_ver}.  roughness_seed takes BAKE_VERSION, so tiles baked at 7 and at 8 are DIFFERENT WORLDS; this tool refuses a mixed set.\n"
+        f"WHAT EACH HALF IS DERIVED FROM, because the two halves do not have the same coverage and the difference is the honest part.\n"
+        f"  channels  THE {n_tiles} COARSE TILES, stitched at 30 m and swept ONCE here through the bake's own kernels (fill_depressions, d8_receivers, accumulate_d8,\n"
+        f"            water.runoff_field_mm_yr / discharge_source / q_drawable_m3_yr / water_head_mask).  NOT from fine tiles -- only {len(dumps)} of {n_tiles} have ever been\n"
+        f"            baked, so a fine-derived network could not cover this map.  All {n_tiles} tiles, whole catchments, no pyramid and no injected boundary.\n"
+        f"  lakes     THE FINE BAKE at 1.875 m: the shipped basin registry (tools/lake_survey.py dump), filtered by pipeline.basin_filter, classified by basins.classify.\n"
+        f"            {n_unsurveyed} land-bearing tiles are hatched red: NOT BAKED, so no lake is drawn on them and none is implied ({n_unsurveyed_ocean} more unbaked tiles are all ocean).\n"
+        f"            Nothing about a lake is ever interpolated between tiles: a lake is a hole in one specific hillside.  bake_ver {bake_ver}; a mixed set is refused.\n"
         f"\n"
-        f"THRESHOLD  Q_perennial = 10 L/s of mean flow ({Q_PERENNIAL_M3_YR:,.0f} m3/yr delivered), the scale at which a watercourse is wet all year.  For contrast the bake\n"
-        f"           carves a swale at 156 m2 of catchment and rivernet.h calls a channel a river near 0.03 km2 -- both dry gullies in most of this world's climate.\n"
-        f"           Width law: channel.h's own (1.5 m at threshold, w ~ Q^0.398, cap 400 m) re-anchored on Q_perennial per 4.1.3.  LINE WIDTHS ARE SYMBOLIC:\n"
-        f"           a 9 m river is 1/13 of a {px_m:.0f} m pixel.  Colour carries the discharge; thickness only separates the three classes.\n"
+        f"THE CUT IS THE BAKE'S OWN, AND IT MOVED.  Water is drawn where Q >= q_drawable = {Q_DRAW:,.0f} m3/yr ({Q_DRAW / 3.156e7:.4f} m3/s) =\n"
+        f"           water.q_drawable_m3_yr({bp.PRODUCTION.fine_pixel_m} m, {consts.water_min_width_px} px), at the FINE tier's pitch and not this map's -- the same rule at 30 m asks for a 45 m\n"
+        f"           channel ({bw.q_drawable_m3_yr(COARSE_PX_M, consts.water_min_width_px):.1e} m3/yr) and would erase all but the trunks.  This map used to draw at Q_perennial, {Q_DRAW / Q_PERENNIAL_M3_YR:.1f}x below the shipped cut.\n"
+        f"           ROUTING IS D8 for the discharge (water_flow_single_receiver); MFD still decides the terrain -- mfd_p and the area field are untouched by this.\n"
+        f"           Width: channel.h's own law (1.5 m at Q_perennial, w ~ Q^0.398, cap 400 m).  LINE WIDTHS ARE SYMBOLIC -- a 9 m river is 1/13 of a {px_m:.0f} m pixel.\n"
+        f"\n"
+        f"WATER CELLS AT 30 m   drawn {n_drawn:,} ({100.0 * n_drawn / max(float(land.sum()), 1.0):.2f}% of land cells), of which {int(head_stats['head_cells']):,} are heads (no wet donor) -- the sources.  Perennial\n"
+        f"           (>= 10 L/s) {n_perennial:,}, so {n_undrawn:,} cells -- {100.0 * n_undrawn / max(n_perennial, 1):.1f}% of the perennial network -- are wet all year and under the cut.  Those are the GREY\n"
+        f"           threads, not blue: 4.1's honesty clause kept visible rather than absorbed by the threshold.\n"
         f"\n"
         f"CHANNEL SPREAD over the {land_tiles} tiles that are at least half land (a density averaged over open ocean would be a number about the sea):\n"
         f"    per tile  length {spread(per_tile_km, '{:,.0f}')} km      drainage density {spread(per_tile_dens, '{:.2f}')} km/km2\n"
-        f"    world     {total_km:,.0f} km of perennial channel over {land_km2:,.0f} km2 of land = {total_km / max(land_km2, 1):.2f} km/km2.  Earth runs 0.5-2 km/km2 in humid\n"
-        f"              terrain and far less in deserts, so this network is Earth-like in the wet provinces and correctly sparse in the arid ones.\n"
+        f"    world     {total_km:,.0f} km of DRAWN channel over {land_km2:,.0f} km2 of land = {total_km / max(land_km2, 1):.2f} km/km2 (Earth: 0.5-2 in humid terrain, far less in deserts).\n"
+        f"              The perennial network is denser by the count above; this figure is what gets water.\n"
         f"    CHECKED     {agree_line}\n"
         f"\n"
-        f"LAKE SPREAD over the {len(dumps)} baked tiles ({tile_km2:.0f} km2 each).  AREA IS THE WATER SURFACE, read off each basin's own hypsometric curve\n"
-        f"    at its datum -- NOT the registry's area_m2, which is the size of the HOLE at its spill.  For an endorheic basin those differ enormously:\n"
-        f"    the biggest lake here is 2,377 ha of BOWL holding 33 ha of WATER, because its balance settles 549 m below its own outlet.\n"
+        f"LAKE SPREAD over the {len(dumps)} baked tiles ({tile_km2:.0f} km2 each).  AREA IS THE WATER SURFACE, read off each basin's own hypsometric curve at its datum --\n"
+        f"    NOT the registry's area_m2, which is the size of the HOLE at its spill.  For an endorheic basin those differ enormously: the biggest lake\n"
+        f"    here is 2,377 ha of BOWL holding 33 ha of WATER, because its balance settles 549 m below its own outlet.\n"
         f"    per tile  water bodies (seasonal or wetter) {spread(per_tile_lakes, '{:.0f}')}      their area {spread(per_tile_lake_ha, '{:,.0f}')} ha\n"
-        f"    per lake  area {spread(lake_areas / 1e4, '{:,.2f}')} ha.  A {px_m:.0f} m pixel is {px_m * px_m / 1e4:.1f} ha and the median water body is {np.median(lake_areas) / 1e4:.2f} ha,\n"
-        f"              so ONE PIXEL IS VERY NEARLY TO SCALE.  Lakes are drawn at their own radius with a half-pixel floor -- no marker, no size\n"
-        f"              inflation.  Where the land looks stippled it is stippled: those are the ponds, at roughly their real size and spacing.\n"
-        f"              standing water covers {100.0 * lake_areas.sum() / max(surveyed_land_m2, 1.0):.3f}% of the land on the tiles that were baked.\n"
+        f"    per lake  area {spread(lake_areas / 1e4, '{:,.2f}')} ha.  A {px_m:.0f} m pixel is {px_m * px_m / 1e4:.1f} ha and the median water body is {np.median(lake_areas) / 1e4:.2f} ha, so ONE PIXEL IS\n"
+        f"              VERY NEARLY TO SCALE -- drawn at their own radius with a half-pixel floor, no marker and no size inflation.  Where the land looks\n"
+        f"              stippled it is stippled.  Standing water covers {100.0 * lake_areas.sum() / max(surveyed_land_m2, 1.0):.3f}% of the land on the tiles that were baked.\n"
     )
-    fig.text(0.006, 0.004, txt, fontsize=8.15, family="monospace", va="bottom",
-             linespacing=1.28)
+    fig.text(0.006, 0.004, txt, fontsize=7.9, family="monospace", va="bottom",
+             linespacing=1.25)
 
     fig.savefig(args.out, dpi=130, facecolor="white")
     mb = args.out.stat().st_size / 1e6
@@ -787,6 +913,10 @@ def main() -> int:
           "  ".join(f"{k} {n_by_kind[k]}" for k in KIND_ORDER))
     print(f"surveyed {len(dumps)}/{n_tiles} tiles at bake_ver {bake_ver}; "
           f"{n_unsurveyed} tiles carry no lake data")
+    print(f"water cells @30m: drawn {n_drawn:,}  perennial {n_perennial:,}  "
+          f"undrawn {n_undrawn:,}  heads {int(head_stats['head_cells']):,}")
+    print(f"cut q_drawable {Q_DRAW:,.0f} m3/yr; routing "
+          f"{'D8' if consts.water_flow_single_receiver else 'MFD'}")
     return 0
 
 
