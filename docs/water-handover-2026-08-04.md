@@ -80,7 +80,7 @@ Five confident explanations died this session. Two nearly became code.
 | claim | verdict | the number that killed it |
 |---|---|---|
 | The amplifier buries the river | **false** | AMPLIFIED − SPLINE inside the channel is p50 **+3 mm**, tails *smaller* than on dry banks 10–30 m away |
-| Rivers die at tile seams | **false** | 0.5–2.3% of components touch a tile edge vs a 0.39% chance baseline; 97.7–99.5% die mid-tile |
+| Rivers die at tile seams | **false at the time, now superseded** | 0.5–2.3% of components touched a tile edge vs a 0.39% chance baseline. That was true while threshold height and MFD dispersion dominated. With both fixed, **35 of 36 raw components now end within one pixel of a tile edge** — see Phase 3 |
 | Tile (-14,-7) is the river mouth | **false** | 96.2% ocean, median −115 m, all 395 drawable cells below sea level. The coastline is (-14,-6) |
 | Carrying Q up the pyramid will coalesce the wet mask | **false** | 1,954 → **2,014** components, longest span identical to the pixel |
 | The area/wet gap proves a defect | **half false** | I cut the two networks an octave apart. Level-matched, wet share goes 35.1% → **66.4%** |
@@ -212,21 +212,63 @@ This is the highest value-per-hour item on the list. The mechanism is built and
 tested; only the engine-side call sites are missing.
 
 ### Phase 3 — finish the river
-Read `claude/river-drawable-flow`'s result first. Then re-bake the corridor and
-measure against these exact baselines, **stitched into one grid and labelled
-once**, 8-connected:
 
-| | bv10 baseline |
-|---|---|
-| components | 2,014 |
-| longest span | 1,113 m |
-| components ≥ 2 km | 0 |
-| pieces meeting the coast | 235 |
-| longest piece reaching the coast | 475 m |
+**Done, and it worked.** `claude/river-drawable-flow`, merged. `BAKE_VERSION`
+10 → 11, terrain bit-identical, fingerprint unchanged at `fe0275e105cbf77c`.
 
-Widening the network while thinning every river is not a win — report the
-channel **width** distribution in metres too. Current width p50 **2.65 m**,
-p90 5.62 m, p95 7.95 m, max 10.60 m.
+| | bv10 | bv11 |
+|---|---|---|
+| components | 2,014 | **173** |
+| longest span | 1,113 m | **14,827 m** |
+| components ≥ 2 km | 0 | **36** |
+| longest piece at the coast | 475 m | **9,881 m** |
+| wet pixels | 27,347 | 158,458 |
+
+Apportioned by re-thresholding the Q already on disk, all arms like for like:
+
+| arm | comps | longest | ≥2 km |
+|---|---|---|---|
+| MFD @ 2.0 px (bv10) | 2,019 | 1,113 m | 0 |
+| MFD @ 1.5 px — threshold only | 4,930 | 4,216 m | 1 |
+| D8 @ 2.0 px — concentration only | 22 | 11,792 m | 12 |
+| D8 @ 1.5 px — both | 36 | 16,341 m | 25 |
+
+**The threshold half alone makes fragmentation worse** — the cells it admits
+are exactly the ones MFD then splits. Concentration is the larger effect on
+both axes; together they buy +4.5 km of longest reach over concentration alone.
+
+**Why D8 and not a higher `mfd_p`**, and this is a latent bug worth knowing:
+`_accumulate_mfd` evaluates weights in the surface's own dtype, and on float32
+an epsilon-filled flat's slope (~2.6e-4) **underflows at p ≈ 11** — every
+weight zero, `tot` zero, the cell reads as a pit and its entire accumulation is
+dropped. On exactly the flat near-coast ground rivers must cross. p=32 loses
+>50% of the budget; D8 loses <1e-9. Pinned by
+`test_accumulate_d8_beats_high_p_underflow`.
+
+**Three things still qualify the win.**
+
+1. **It is not yet a mountain river.** The 14,827 m reach heads at 978.1 m and
+   stops 6.66 km short of the sea, on the (-11,-5)/(-11,-6) seam. The 978 m,
+   1,326 m and 1,540 m heads all stop inland. With registered basins composed
+   back in — what the client actually draws, since the basin table supplies them
+   and `CompositeWaterSampler` unions the two — a **15,332 m** reach does run
+   from 240.4 m to the shoreline and out onto the seafloor.
+2. **The raster now draws a centreline.** Width p90 5.62 → **1.88 m**, widest
+   10.61 → 3.75 m, and **99.21% of wet pixels are a single 1.875 m pixel**
+   against a law width of 3.53 m at p50. The plane is wet where a cell's *own*
+   Q clears the cut, so MFD's fan was what made the ribbon wide — bv10's
+   agreement with the width law was an accident. **You cannot get both from the
+   mask alone.** The fix is to let `channel_width_m(Q)` decide extent the way
+   `water_depth_m(Q)` already decides depth. That is a third change and a
+   decision about what the world looks like — **it is the owner's call and it is
+   open.**
+3. **What fragments it now is neither fixed cause.** 137 of the 173 raster
+   components are the B5 basin exclusion, by design, composed client-side. Of
+   the 36 raw components, **35 end within one pixel of a tile edge** — 24 at the
+   measurement window, **11 at an interior seam**. The fine Q does not cross a
+   fine tile boundary: each tile restarts from the 30 m superblock injection.
+   That is now 8 of the 25 multi-km reaches, including the longest, and it is
+   the next binding constraint.
 
 ### Phase 4 — the far-field river actor
 `riverribbon.h` produces ordered centreline polylines (not rectangles —
@@ -298,11 +340,17 @@ tile in that cache is `bake_ver 7` with no water plane.
 ## 7. Baselines
 
 ```
-ctest    2/2, 422 C++ tests, 0 failures     (claude/water-integration)
-pytest   534 passed / 2 skipped
-bake     ~300 CPU-s per fine tile
+ctest       2/2, 383 cases -- needs -C Release, or both suites report
+            "Not Run" and look green
+vxc_tests   422 C++ tests, 0 failures        (claude/water-integration)
+pytest      539 passed / 2 skipped
+bake        ~300 CPU-s per fine tile
 tiles    D:\voxelsim\tile-cache\...-b196f6020\...\s16\   bv9
          ...-b4d02b092   bv10 (carried Q)
 corridor (-11,-4) (-11,-5) (-12,-5) (-11,-6)   the one that carries water
          (-14,-4) … (-14,-7)                   dry; do not use as a test
 ```
+
+A note on the pytest number: a terrain-diffusion venv on this box reads
+531 with 1 failure because torch is installed there. Environment artefact —
+every number here is from system Python 3.12.
