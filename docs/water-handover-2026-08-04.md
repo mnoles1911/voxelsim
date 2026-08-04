@@ -423,18 +423,24 @@ tile in that cache is `bake_ver 7` with no water plane.
 ctest       2/2, 383 cases -- needs -C Release, or both suites report
             "Not Run" and look green
 vxc_tests   422 C++ tests, 0 failures        (claude/water-integration)
-pytest      539 passed / 2 skipped
+pytest      546 passed / 2 skipped   (was 539; #209 added 7)
 bake        ~300 CPU-s per fine tile
 tiles    D:\voxelsim\tile-cache\...-b196f6020\...\s16\   bv9
-         ...-b4d02b092   bv10 (carried Q)   <-- NEWEST CACHE WITH WATER
+         ...-b4d02b092   bv10 (carried Q) -- CODEC_RAW, ~210 MB/tile
+         ...-b52995abb   bv12 (seam crossing + width, PR #209) <- LOAD THIS
+         ...-bd3d0ddc7   bv8, NO water plane. 38 tiles, and the newest
+                         directory by date -- do not mistake it for the
+                         newest WATER cache. Check bake_ver, not mtime.
+```
 
-*** THERE IS NO bv11 OR bv12 CACHE ON DISK. ***
-The seam-crossing and width work (PR #209, BAKE_VERSION 12) has never been
-baked into anything the client can load, because every bake since ran with
---diagnostic, which write-protects the fine tier. So EVERY CAPTURE TAKEN SO FAR
-SHOWS THE NARROWEST RIVER THIS PROJECT WILL SHIP -- width p90 1.88 m rather
-than 7.50 m. Task C0 in docs/water-waves-plan-2026-08-04.md fixes this and is
-the precondition for any capture being worth judging.
+**Until task C0 (PR #214) there was NO bv11 or bv12 cache at all**, because
+every bake after PR #209 ran with `--diagnostic`, which write-protects the fine
+tier. Every capture taken before that showed width p90 **1.88 m** where bv12
+gives **7.50 m** -- the narrowest river this project will ship. That is fixed,
+and the lesson stands: **a bake that does not write a loadable tile is not a
+bake**, and `--diagnostic` is the flag that makes it look like one.
+
+```
 corridor (-11,-4) (-11,-5) (-12,-5) (-11,-6)   the one that carries water
          (-14,-4) … (-14,-7)                   dry; do not use as a test
 ```
