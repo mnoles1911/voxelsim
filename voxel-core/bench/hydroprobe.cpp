@@ -262,8 +262,12 @@ void runCove(const char* label, WaterCA::HydroLargeComponentPolicy pol, size_t c
 // large component were unstable, this would never go quiet and its volume would
 // wander. Both policies are run over the identical scenario.
 void runClosedBasin(const char* label, WaterCA::HydroLargeComponentPolicy pol, int budget) {
-    const int64_t hi = 63; // 64x64 footprint, walls up to z=31 -> 131,072 cells
-    auto solid = [hi](int64_t x, int64_t y, int64_t z) -> MaterialId {
+    // constexpr, and NOT captured: an integral constant expression is usable
+    // inside the lambda without capture, and clang's -Wunused-lambda-capture
+    // makes capturing it an error under -Werror. MSVC and g++ let it pass, so
+    // this only ever shows up in CI.
+    constexpr int64_t hi = 63; // 64x64 footprint, walls to z=31 -> 131,072 cells
+    auto solid = [](int64_t x, int64_t y, int64_t z) -> MaterialId {
         if (z < 0) return MAT_ROCK;
         if (x < 0 || x > hi || y < 0 || y > hi) return MAT_ROCK;
         return MAT_AIR;
