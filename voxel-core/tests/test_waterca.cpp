@@ -2178,6 +2178,71 @@ VXC_TEST(waterca_demotion_replicates_as_key_removal_and_survives_save_load) {
     CHECK_EQ(digestOf(ca2, mob2), digestOf(ca, mob));
 }
 
+// THE CLIENT MIRRORS A DEMOTION AS AN INSTRUCTION, NOT A CONCLUSION. The
+// authority runs the exact predicate; the client runs `markDemoted` and lands
+// byte-identically, with the implicit field reading straight through the closed
+// hole again. Without this there is no inbound half at all: `markMobilized` had
+// no counterpart, so a demoted brick stayed CA-owned on every client forever —
+// the authority's datum and the client's would disagree permanently, and the
+// disagreement would be invisible until someone dug there.
+VXC_TEST(waterca_client_mirrors_a_demotion_and_lands_byte_identical) {
+    auto mode = std::make_shared<int>(0);
+    WaterMobilizer mob(boxWater(mode), boxTerrain());
+    WaterCA ca(mob.makeSolidFn());
+    auto cmode = std::make_shared<int>(0);
+    WaterMobilizer cmob(boxWater(cmode), boxTerrain());
+    WaterCA cca(cmob.makeSolidFn());
+
+    const BrickKey kept{1, 1, 1};
+    const BrickKey given{0, 0, 0};
+    for (const BrickKey& k : {kept, given}) {
+        mob.mobilizeBrick(ca, k);
+        // The client learns mobilization from the fill stream (markMobilized
+        // credits nothing; the units arrive as replicated fill).
+        cmob.markMobilized(k);
+        const int64_t ox = int64_t(k.x) * WaterBrick8::kEdge;
+        const int64_t oy = int64_t(k.y) * WaterBrick8::kEdge;
+        const int64_t oz = int64_t(k.z) * WaterBrick8::kEdge;
+        for (int64_t z = 0; z < 8; ++z)
+            for (int64_t y = 0; y < 8; ++y)
+                for (int64_t x = 0; x < 8; ++x)
+                    cca.setReplicatedFill(ox + x, oy + y, oz + z, ca.fillAt(ox + x, oy + y, oz + z));
+    }
+    settle(ca);
+    CHECK_EQ(digestOf(cca, cmob), digestOf(ca, mob));
+    const uint64_t world = boxImplicitVolume(mob) + ca.totalVolume();
+
+    // THE AUTHORITY DEMOTES, and sends the key removal its queue produced.
+    CHECK(mob.demoteBrick(ca, given));
+    const std::vector<BrickKey> removals = mob.takeRecentlyDemoted();
+    CHECK_EQ(removals.size(), size_t(1));
+
+    // THE CLIENT APPLIES IT. No predicate is run and none could be.
+    CHECK(cmob.takeRecentlyDemoted().empty());
+    for (const BrickKey& k : removals) CHECK(cmob.markDemoted(cca, k));
+
+    // Byte-identical, on both digests, and the datum owns those cells again on
+    // both sides. The ledger stays asymmetric on purpose: the client gave
+    // nothing back, it was told.
+    CHECK_EQ(digestOf(cca, cmob), digestOf(ca, mob));
+    CHECK_EQ(cca.totalVolume(), ca.totalVolume());
+    CHECK_EQ(cca.recomputeVolume(), cca.totalVolume());
+    CHECK_EQ(boxImplicitVolume(cmob) + cca.totalVolume(), world);
+    CHECK_EQ(cmob.implicitFillAt(0, 0, 0), uint8_t(255));
+    CHECK_EQ(cmob.mobilizedBricks().count(given), size_t(0));
+    CHECK_EQ(cmob.demotedBrickCount(), uint64_t(0)); // authority-side counter only
+    CHECK_EQ(mob.demotedBrickCount(), uint64_t(1));
+
+    // It queues for re-mesh on exactly the path markMobilized does, and a
+    // repeat or an unknown key is a harmless no-op (packets can duplicate).
+    const std::vector<BrickKey> clientQueue = cmob.takeRecentlyDemoted();
+    CHECK_EQ(clientQueue.size(), size_t(1));
+    CHECK(clientQueue[0] == given);
+    CHECK(!cmob.markDemoted(cca, given));
+    CHECK(!cmob.markDemoted(cca, BrickKey{9, 9, 9}));
+    CHECK_EQ(digestOf(cca, cmob), digestOf(ca, mob));
+}
+
 // 9b's HOOK, WIRED TO 9c's DEMOTION — the pairing §6.5.5 asks for ("at
 // high-water-mark, spend the demotion budget before refusing new
 // mobilization"). 9b proved the ORDERING with a stub because that was the only
@@ -2287,6 +2352,296 @@ VXC_TEST(waterca_demotion_closes_the_refill_scar_a_dried_reach_leaves_behind) {
     // The counterfactual, stated as arithmetic: had the four bricks stayed
     // mobilized, the reach would have come back 130,560 units short — the scar.
     CHECK_EQ(riverVolume - riverImplicitVolumeBelowBrickX(kFreezeFromBrickX), reachUnits);
+}
+
+// ===========================================================================
+// C8e — the OPEN-SEA BREACH: the runaway, the bound, and the ceiling above the
+// bound that neither of them can reach.
+//
+// docs/water-handover-2026-08-04.md §5 Phase 2 records the cost of leaving 9a
+// and 9b unwired, measured in the engine: a breach into the open sea spreads
+// without bound (activeBricks 19,636 -> 41,613, volume 501M -> 884M, water tick
+// 2.0 -> 2.5 s, the engine logging `runaway spread`). C8b/FACT 1 measured the
+// same shape on a synthetic river; this measures it on the case the handover
+// names, because the sea is the one implicit body with no far edge at all.
+//
+// The four tests below are, in order: the runaway reproduced; the ceiling
+// bounding it WITHOUT starving the breach; the edit seed still firing through a
+// fully closed gate on this harness; and — the one that changes the design —
+// the demonstration that above `kMaxHydrostaticComponentCells` no mobilization
+// policy can fill a breach at all, because the excavation's own cells are CA
+// territory that the mobilizer never had a say over.
+//
+// THE HARNESS. An unbounded sea on a flat rock seabed, with a dry room sealed
+// underneath it and a plug that opens a shaft between the two. Two things about
+// it are worth stating because both surprised the author:
+//
+//   * THE EXCAVATION IS NOT MOBILIZED AND CANNOT BE. `mobilizeBrick` refuses a
+//     brick that holds no implicit water (the negative memo), and the room is
+//     below the sea's datum band, so the datum reads 0 throughout it. It is CA
+//     territory from the first tick. `mobilized_` therefore counts SEA bricks
+//     and nothing else, which is exactly why a ceiling of 48 can fill a
+//     40-brick room: the room is free, and only the sea it drinks is charged.
+//   * THE SEA IS UNBOUNDED IN x AND y. Every brick in the datum band holds
+//     water, so the front can always find another one. That is the runaway.
+// ===========================================================================
+
+namespace {
+
+constexpr int64_t kSeaBedTopVz = 63;   // rock for vz <= 63, except where carved
+constexpr int64_t kSeaSurfaceVz = 79;  // sea occupies vz 64..79 -> brick z 8,9
+constexpr int64_t kRoomLoVz = 32;      // the sealed dry room, vz 32..47
+constexpr int64_t kRoomHiVz = 47;
+
+// A breach geometry: a square room [0,roomHi]^2 x [32,47] under the seabed, and
+// a square shaft [shaftLo,shaftHi]^2 joining its roof to the seafloor.
+struct Breach {
+    int64_t roomHi;
+    int64_t shaftLo;
+    int64_t shaftHi;
+    uint64_t roomFull() const {
+        return uint64_t(roomHi + 1) * uint64_t(roomHi + 1) * uint64_t(kRoomHiVz - kRoomLoVz + 1) *
+               255ull;
+    }
+    // The room's own size in bricks — its cells are in the hydrostatic
+    // component from the first drop, whatever any policy says.
+    uint64_t roomBricks() const {
+        return uint64_t(roomHi + 1) * uint64_t(roomHi + 1) *
+               uint64_t(kRoomHiVz - kRoomLoVz + 1) / uint64_t(WaterBrick8::kCells);
+    }
+};
+
+// 16x16x16 room, 4x4 shaft: 8 bricks of room, needing 8 bricks of sea.
+constexpr Breach kNarrowBreach{15, 4, 7};
+// 64x64x16 room: 128 bricks — the hydrostatic cap EXACTLY, before one drop of
+// sea has been mobilized.
+constexpr Breach kOverCapBreach{63, 24, 39};
+
+WaterMobilizer::ImplicitFn seaWater() {
+    return [](int64_t, int64_t, int64_t vz) -> uint8_t {
+        return (vz > kSeaBedTopVz && vz <= kSeaSurfaceVz) ? 255 : 0;
+    };
+}
+
+WaterCA::SolidFn seaTerrain(std::shared_ptr<bool> plugOpen, Breach b) {
+    return [plugOpen, b](int64_t vx, int64_t vy, int64_t vz) -> MaterialId {
+        if (vz > kSeaBedTopVz) return MAT_AIR; // open water, then air above it
+        if (vz >= kRoomLoVz && vz <= kRoomHiVz && vx >= 0 && vx <= b.roomHi && vy >= 0 &&
+            vy <= b.roomHi)
+            return MAT_AIR;
+        if (*plugOpen && vz > kRoomHiVz && vz <= kSeaBedTopVz && vx >= b.shaftLo &&
+            vx <= b.shaftHi && vy >= b.shaftLo && vy <= b.shaftHi)
+            return MAT_AIR;
+        return MAT_ROCK;
+    };
+}
+
+// The dig, through the three edit hooks the engine runs, exactly as
+// NotifyTerrainRegionEdited does.
+void openTheBreach(WaterMobilizer& mob, WaterCA& ca, std::shared_ptr<bool> plugOpen, Breach b) {
+    *plugOpen = true;
+    ca.invalidateSolidRegion(b.shaftLo, b.shaftLo, kRoomHiVz + 1, b.shaftHi, b.shaftHi,
+                             kSeaBedTopVz);
+    mob.mobilizeEditRegion(ca, b.shaftLo, b.shaftLo, kRoomHiVz + 1, b.shaftHi, b.shaftHi,
+                           kSeaBedTopVz);
+    ca.wakeRegion(b.shaftLo, b.shaftLo, kRoomHiVz + 1, b.shaftHi, b.shaftHi, kSeaBedTopVz);
+}
+
+uint64_t roomVolume(const WaterCA& ca, Breach b) {
+    uint64_t v = 0;
+    for (int64_t z = kRoomLoVz; z <= kRoomHiVz; ++z)
+        for (int64_t y = 0; y <= b.roomHi; ++y)
+            for (int64_t x = 0; x <= b.roomHi; ++x) v += ca.fillAt(x, y, z);
+    return v;
+}
+
+} // namespace
+
+// THE RUNAWAY, REPRODUCED. No ceiling, no gate, no demotion — the shipping
+// configuration before this change. The front follows the draining water out
+// into a sea that has no far edge, and because mobilizing a brick WAKES it, the
+// activity that drives the front is manufactured by the front itself. It is a
+// percolation front, and it does not stop.
+//
+// The reading that matters is not the absolute size — that is a function of the
+// front budget — but that every quantity is still climbing at the end of the
+// run while the thing the dig was for is barely half done.
+VXC_TEST(waterca_open_sea_breach_spreads_without_bound) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kNarrowBreach));
+    WaterCA ca(mob.makeSolidFn());
+    openTheBreach(mob, ca, plugOpen, kNarrowBreach);
+
+    size_t mobAt100 = 0, mobAt200 = 0;
+    uint64_t volAt100 = 0, volAt200 = 0;
+    for (int i = 1; i <= 400; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        // The wall invariant holds throughout: this is a cost leak, never a
+        // water leak. Every bound below rests on that being true here first.
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        if (i == 100) { mobAt100 = mob.mobilizedBricks().size(); volAt100 = ca.totalVolume(); }
+        if (i == 200) { mobAt200 = mob.mobilizedBricks().size(); volAt200 = ca.totalVolume(); }
+    }
+
+    // Monotone and still climbing at 400 — no settling point anywhere.
+    CHECK(mobAt200 > mobAt100);
+    CHECK(mob.mobilizedBricks().size() > mobAt200);
+    CHECK(volAt200 > volAt100);
+    CHECK(ca.totalVolume() > volAt200);
+    CHECK(ca.activeBrickCount() > 0);
+
+    // And the sea it has converted dwarfs the room it was supposed to fill: the
+    // room needs 8 bricks' worth of water and is not close to having it.
+    CHECK(mob.mobilizedBricks().size() > 20 * kNarrowBreach.roomBricks());
+    CHECK(roomVolume(ca, kNarrowBreach) < kNarrowBreach.roomFull() / 4);
+}
+
+// THE CEILING BOUNDS IT, AND THE SEA STILL FILLS THE BREACH TO THE DATUM. This
+// is the acceptance test the wiring exists to pass: mobilization stops climbing
+// AND the room ends up full, settled, with the ledger exact. A bound that held
+// the cost down by leaving the room half-empty would fail here.
+//
+// It does not starve because the room is free (see the harness note): a ceiling
+// of 64 buys 64 bricks of SEA, which is eight times what this room drinks.
+VXC_TEST(waterca_mobilized_ceiling_bounds_the_breach_without_starving_it) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kNarrowBreach));
+    WaterCA ca(mob.makeSolidFn());
+
+    constexpr size_t kCeiling = 64;
+    mob.setMobilizedCeiling(kCeiling);
+    mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 256); });
+    openTheBreach(mob, ca, plugOpen, kNarrowBreach);
+
+    int settledTick = -1;
+    for (int i = 1; i <= 400; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        mob.demoteBudgeted(ca, 32);
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        // THE BOUND, asserted every single tick rather than at the end. Only the
+        // front is bounded, and nothing here is an edit or a markMobilized, so
+        // the ceiling is never legitimately exceeded in this run.
+        CHECK(mob.mobilizedBricks().size() <= kCeiling);
+        if (settledTick < 0 && ca.activeBrickCount() == 0 &&
+            roomVolume(ca, kNarrowBreach) == kNarrowBreach.roomFull())
+            settledTick = i;
+    }
+
+    // Bounded, settled, and CORRECT: the room is full to the last unit.
+    CHECK(settledTick > 0);
+    CHECK(settledTick < 100);
+    CHECK_EQ(roomVolume(ca, kNarrowBreach), kNarrowBreach.roomFull());
+    CHECK_EQ(ca.activeBrickCount(), size_t(0));
+    CHECK(mob.ceilingRefusals() > 0);
+    CHECK(mob.ceilingReliefCalls() > 0);
+    CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+}
+
+// THE EDIT STILL FIRES THROUGH A FULLY CLOSED GATE — on this harness, not just
+// on C8b's river. waterca.h "WHAT IT MUST NEVER GATE, AND WHY": gate the edit
+// seed and a player digs into the sea floor and the sea silently ignores the
+// dig. Here the gate refuses every brick in the world and the breach still
+// floods, because `mobilizeEditRegion` does not consult it.
+VXC_TEST(waterca_closed_gate_still_lets_an_edit_breach_the_sea) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kNarrowBreach));
+    WaterCA ca(mob.makeSolidFn());
+
+    mob.setFrontGate([](const BrickKey&) { return false; }); // freeze the world
+    // And a ceiling of 1, already exceeded, so BOTH bounds are hard against the
+    // edit at once — `atMobilizedCeiling()` is a `>=` test precisely so an edit
+    // may cross it.
+    mob.setMobilizedCeiling(1);
+
+    openTheBreach(mob, ca, plugOpen, kNarrowBreach);
+    // THE POINT: the dig converted sea bricks with the gate shut and the ceiling
+    // already blown.
+    const std::set<BrickKey, BrickKeyLess> afterEdit = mob.mobilizedBricks();
+    CHECK(afterEdit.size() > 0);
+    CHECK(mob.atMobilizedCeiling());
+
+    // Water genuinely moves: the dig floods, it is not merely bookkeeping.
+    for (int i = 0; i < 400; ++i) {
+        CHECK_EQ(mob.advanceFront(ca), size_t(0)); // ...and the FRONT converts nothing
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+        if (ca.activeBrickCount() == 0) break;
+    }
+    CHECK(roomVolume(ca, kNarrowBreach) > 0);
+
+    // Not one brick beyond the dig's own halo, and the queue never grew.
+    CHECK(mob.mobilizedBricks() == afterEdit);
+    CHECK_EQ(mob.pendingFrontBricks(), size_t(0));
+    CHECK(mob.frontGateRefusals() > 0);
+}
+
+// THE CEILING ABOVE THE BOUND, AND IT IS NOT OURS. This test exists to stop a
+// future reader doing what the author nearly did: raising the ceiling because
+// the small case worked and assuming the fill scales with it.
+//
+// `kMaxHydrostaticComponentCells` (waterca.cpp:108, tripped at :1065, acted on
+// at :1180) leaves an over-cap component COMPLETELY unmodified — deferred, not
+// partially levelled — and the count includes air. A 64x64x16 room is 128
+// bricks on its own, so this component is over the cap before one drop of sea
+// is mobilized. And the room is not mobilized and cannot be (see the harness
+// note), so NO gate and NO ceiling has any say over its cells.
+//
+// The consequence, measured: water still enters, and then stays exactly where
+// it lands, because nothing ever levels it. The fill is therefore proportional
+// to whatever the ceiling let in and to nothing else — doubling the ceiling
+// doubles the fill and never approaches full, and the world never settles at
+// any setting. That is a linear leak, not a converging fill.
+//
+// So: this policy bounds COST. It does not, and cannot, make an over-cap breach
+// correct. Do not design as though it does.
+VXC_TEST(waterca_no_ceiling_can_fill_a_breach_over_the_hydrostatic_cap) {
+    // The room alone is the cap, exactly (65,536 cells), and the cap bites
+    // sooner than that because the flood counts air too.
+    CHECK_EQ(kOverCapBreach.roomBricks(), uint64_t(128));
+
+    struct Arm { size_t ceiling; uint64_t filled; bool quiet; };
+    Arm arms[2] = {{32, 0, false}, {64, 0, false}};
+
+    for (Arm& a : arms) {
+        auto plugOpen = std::make_shared<bool>(false);
+        WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kOverCapBreach));
+        WaterCA ca(mob.makeSolidFn());
+        mob.setMobilizedCeiling(a.ceiling);
+        mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 256); });
+        openTheBreach(mob, ca, plugOpen, kOverCapBreach);
+
+        for (int i = 1; i <= 300; ++i) {
+            mob.advanceFront(ca);
+            ca.step();
+            mob.demoteBudgeted(ca, 32);
+            CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+            CHECK(mob.mobilizedBricks().size() <= a.ceiling);
+        }
+        a.filled = roomVolume(ca, kOverCapBreach);
+        a.quiet = ca.activeBrickCount() == 0;
+    }
+
+    // The bound HOLDS — that half works exactly as designed, at both settings.
+    // What does not happen is the fill, and the way it does not happen is the
+    // worst available: the CA goes QUIET. Not slow, not still-converging —
+    // ZERO active bricks, the state every caller reads as "settled", at a level
+    // that is nowhere near the datum and will never move again. An engine
+    // waiting for `activeBrickCount() == 0` before it re-meshes or saves gets a
+    // confident, wrong answer.
+    for (const Arm& a : arms) {
+        CHECK(a.quiet);                               // reports itself settled...
+        CHECK(a.filled < kOverCapBreach.roomFull());  // ...at less than the datum
+    }
+
+    // And the damning relation: the fill tracks the CEILING, linearly, instead
+    // of converging on the datum. Twice the ceiling, twice the water in the
+    // room — because every drop that got in is still sitting where it landed.
+    CHECK(arms[1].filled > arms[0].filled);
+    const uint64_t lo = arms[0].filled, hi = arms[1].filled;
+    CHECK(hi >= lo * 15 / 10); // ~2x, generously bracketed
+    CHECK(hi <= lo * 25 / 10);
 }
 
 // ===========================================================================

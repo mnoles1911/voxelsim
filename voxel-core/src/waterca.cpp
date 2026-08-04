@@ -1910,6 +1910,26 @@ size_t WaterMobilizer::demoteBudgeted(WaterCA& ca, size_t maxBricks) {
     return demoted;
 }
 
+bool WaterMobilizer::markDemoted(WaterCA& ca, const BrickKey& k) {
+    if (mobilized_.count(k) == 0) return false;
+
+    // Same order as demoteBrick, for the same reason: clear the fill while the
+    // cells are still legitimately CA-owned, and only then erase the key, which
+    // is the instant ownership returns to the datum. The ledger is deliberately
+    // untouched -- demoted_/demotedBricks_ count what THIS mobilizer gave back,
+    // and a client gave nothing back; it was told. Exactly the asymmetry
+    // markMobilized already has against mobilizeBrick.
+    ca.clearBrickFill(k);
+    mobilized_.erase(k);
+    noImplicit_.erase(k);
+    recentlyDemoted_.push_back(k);
+
+    int64_t ox = 0, oy = 0, oz = 0;
+    brickOrigin(k, ox, oy, oz);
+    ca.invalidateSolidRegion(ox, oy, oz, ox + kEdge - 1, oy + kEdge - 1, oz + kEdge - 1);
+    return true;
+}
+
 std::vector<BrickKey> WaterMobilizer::takeRecentlyDemoted() {
     std::vector<BrickKey> out;
     out.swap(recentlyDemoted_);
