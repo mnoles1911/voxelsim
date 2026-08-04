@@ -1,0 +1,330 @@
+THE PYRAMID'S DISCHARGE, AND THE WIDTH LAW
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), bake_ver 11 -> 12
+2026-08-04
+================================================================================
+
+Two PRODUCT constants, neither of which can move a height. Both were A/B'd on
+the real corridor as separate arms, because bake_ver 11's own record shows how
+easily one change takes credit for another's effect.
+
+  water_pyramid_single_receiver  (new) True
+      build_flow_superblock's DISCHARGE sweep routes D8 instead of MFD, at
+      every level. `acc` -- the AREA field, which decides every height -- stays
+      MFD at mfd_p. Conditional key "q_single_receiver" added to
+      superblock_inputs_fingerprint, on the entry_mode precedent: absent means
+      MFD, which is what every block cached before bake_ver 12 did.
+
+  water_width_from_law           (new) True
+      channel_width_m(Q) decides the drawn EXTENT the way water_depth_m(Q)
+      already decides depth, clamped to ground standing at least 100 mm below
+      that reach's own water surface.
+
+
+================================================================================
+PART 1 -- THE SEAM. WHAT IT ACTUALLY WAS.
+================================================================================
+
+The handover's diagnosis was right about WHERE and wrong about WHAT. It read
+"the fine Q does not cross a fine tile boundary; each tile restarts from the
+30 m superblock injection". The first half is the symptom. The second half
+implies the downstream tile is STARVED, and it is not.
+
+MEASURED at the (-11,-5)/(-11,-6) seam on the shipped bv11 dumps, comparing the
+level-0 superblock's own injection against the fine tier either side.
+
+  Geometry confirmed before anything was concluded from it. Row index tracks
+  tile_y, column tracks tile_x; across the y-seam the two tiles' elevations
+  agree to a MEAN of 0.072 m (p50 0.038, p99 0.737), and across the x-seam to
+  0.420 m. The apron works for terrain. Flow runs NORTH: each tile's discharge
+  maximum is on its row 0.
+
+  At the seam, at the same world cell:
+
+    (-11,-5) row 0    trunk Q  2.354e7 m3/yr  at column 5896
+    (-11,-6) row 8191 trunk Q  7.176e5 m3/yr  at the same column   = 3.05%
+
+  q_drawable is 1.5286e6, so the downstream tile reads the trunk as dry.
+
+  THE TOTAL CROSSING THE BOUNDARY WAS NEVER SHORT. Rebuilding the superblock
+  and scattering both sweeps through the identical crossings:
+
+                              MFD (shipped)      D8         D8/MFD
+    tile (-11,-6), 832 crossings
+      injected Q, total       8.6261e7        8.5094e7       0.99
+      injected Q, max cell    8.6554e6        2.0227e7       2.34
+    tile (-11,-5), 536 crossings
+      injected Q, total       1.8288e7        1.6962e7       0.93
+      injected Q, max cell    3.8353e6        6.0753e6       1.58
+
+  So the defect is DIVISION, not attenuation. Along the seam row the coarse
+  trunk under MFD is split across three adjacent columns -- 9.50e6 / 7.08e6 /
+  2.29e6 -- while D8 puts 2.11e7 in one, against the 2.354e7 the fine tier
+  carries 180 m away. A hard threshold cannot use a fan.
+
+  A test that only checked conservation would have passed throughout the bug.
+  test_the_pyramid_routes_its_discharge_single_receiver says so explicitly.
+
+
+WHAT THE FIX BOUGHT, AND WHAT IT DID NOT
+-----------------------------------------
+Three arms, same tiles, same terrain, everything else equal. "pyramid only" is
+bv12 with water_width_from_law=False.
+
+                            bv11        pyramid only     bv12 (both)
+  wet pixels              158,458          163,643          317,665
+  components (8-conn)         173              172              149
+  longest span             14,827 m         15,028 m         15,030 m
+  components >= 2 km           36               35               35
+  components >= 5 km           14               14               14
+  components >= 10 km           1                3                3
+  longest piece at coast    9,881 m         15,028 m         15,030 m
+  ribbon width p90           1.88 m           1.88 m           7.50 m
+  ribbon width max           3.75 m           3.75 m          15.91 m
+
+The apportionment is clean and neither change costs the other anything:
+
+  * THE PYRAMID CHANGE buys reach LENGTH and the coast connection. The piece
+    that reaches the sea goes 9,881 -> 15,028 m (+52%) and the count of >=10 km
+    reaches goes 1 -> 3. It merges almost nothing (173 -> 172 components) and
+    adds 3.3% more wet pixels.
+  * THE WIDTH CHANGE buys the RIBBON and the merging. Wet pixels 1.94x, width
+    p90 4.0x, and components 172 -> 149 -- the merge is the widening's doing,
+    not the seam fix's, which is exactly what the arm exists to establish.
+
+  The one number that fell, 36 -> 35 components >= 2 km, is two reaches merging
+  into the 15,028 m one. Nothing got worse in either arm.
+
+THE SEAM IS STILL A TERMINATOR, and this is the honest residual. Classifying
+every multi-km reach by where its two ends sit:
+
+                                    bv11        bv12
+    reaches >= 2 km                   36          35
+      ending at an INTERIOR seam      11          10
+      ending only at the window       10          11
+      ending in open ground           15          14
+
+  Ten of thirty-five still stop on a tile edge, including the 978.1 m reach,
+  which still ends at 190.5 m, 6.66 km short of the sea, on the same seam.
+
+WHY, AND IT IS A SECOND MECHANISM, NOT A LEFTOVER OF THE FIRST. D8 fixed the
+MAGNITUDE at the crossing. It cannot fix the POSITION. At the seam the coarse
+D8 trunk sits at 30 m column 886 (x = -157,740) and the fine trunk at column
+880 (x = -157,905) -- 165 m apart. The injected water enters at the fine cell
+that is lowest inside that 30 m footprint and then routes on the fine surface,
+and it does not arrive where the upstream tile's own accumulation arrives:
+
+    (-11,-6) inlet row, trunk column 5896      bv11 3.05%   bv12 2.35% of upstream
+    (-11,-6) inlet row, total                  bv11 0.355   bv12 0.475 of upstream
+    (-11,-6) inlet row, wet cells              bv11 2       bv12 6
+
+  The ground at the injection row explains it. Along tile (-11,-6)'s northern
+  padded border (tile (-11,-5)'s row 512) over the 375 m spanning both channels,
+  the elevation runs 194.5-199.8 m with no incised channel at all and a maximum
+  local Q of 1.335e6 -- below the drawable cut. This is flat near-coast plain.
+  On ground like that the thalweg is decided by relief the 30 m pyramid cannot
+  see, so the concentrated discharge is injected on the wrong side of a divide a
+  few metres high, and a 960 m apron does not heal it because there is no valley
+  to fall into. The water ends up 1.3 km east.
+
+  THE FIX THAT FOLLOWS FROM THIS, not built here: place the entry cell by the
+  FINE surface's own thalweg -- the maximum fine accumulation inside the
+  crossing footprint -- instead of by its lowest elevation. It needs one extra
+  fine sweep (accumulate, find the thalweg, inject, accumulate again) and it is
+  NOT a free change: _edge_entries deliberately scatters BOTH currencies through
+  one set of crossings, so moving the entry cell moves the AREA injection too,
+  which moves incision, which moves the ground. Doing it for the discharge alone
+  breaks the property that "the width law reads a Q that belongs to the same
+  channel the incision cut". That is a design decision, not a patch.
+
+
+================================================================================
+PART 2 -- THE WIDTH LAW
+================================================================================
+
+bake_ver 11 drew a centreline: 99.21% of wet pixels were a single 1.875 m pixel
+against a law width of 3.53 m at p50. The plane is wet where a cell's OWN Q
+clears the cut, and a single-receiver forest has one-cell-wide branches by
+construction, so MFD's fan was what used to make the ribbon wide. That agreement
+was an accident of dispersion and D8 correctly removed it.
+
+WHICH BOUND SHAPES THE RIVER -- measured BEFORE the rule was designed, on the
+bv11 dumps, by walking perpendicular transects and counting contiguous pixels
+with ground <= the drawn water level:
+
+                              (-11,-5)              (-11,-6)
+    terrain-allowed width   p50 11.25  p90 46.88   p50 28.12  p90 163.12  m
+    law width               p50  3.45  p90  4.40   p50  3.78  p90   5.58  m
+    terrain allows the whole law width      90.10%              93.09%
+    no room at all (1 px)                    6.63%               4.38%
+
+  So the TERRAIN is not the binding constraint -- the LAW is. That decided the
+  design: the law shapes the ribbon and the terrain clamp bites on the 7-10%
+  that would otherwise be drawn uphill. A rule that took the terrain first would
+  flood a valley floor, which is what vxc_bankprobe's "no containing ground
+  within 120 m on 736 of 1,260 bank sides at 10 m depth" means in practice.
+
+  The law's half-width is 0.78-2.23 fine pixels over this corridor, so the
+  drawn ribbon is 1-5 px. There is no stamped band and no visible disc at that
+  scale; what varies it is Q, continuously, plus the terrain trimming one flank
+  and not the other.
+
+
+WHAT IT DREW
+------------
+Ribbon width = the narrowest contiguous wet cross-section through a pixel,
+minimised over row/col/diag/anti (tools/corridor_water_report.py). Over ALL wet
+pixels, which is what the acceptance table quotes:
+
+                        bv11      bv12
+    min                 1.88      1.88   m
+    p50                 1.88      5.30
+    p90                 1.88      7.50
+    p99                 1.88     10.61
+    max                 3.75     15.91
+    <= 1.9 m          99.21%    28.17%  of wet pixels
+
+Over CENTRELINE pixels only -- cells whose own Q clears the cut, which is the
+only population the law is a function of. After the change 48.5% of wet pixels
+are widened ones whose own Q is a hillside trickle, so a law column computed
+over every wet pixel is not apples to apples:
+
+                                    bv11      bv12
+    drawn width p50                 1.88      1.88   m
+    drawn width p90                 1.88      5.62
+    law width p50                   3.53      3.67
+    drawn/law p50                   0.53      0.63
+    drawn/law mean                  0.51      0.79
+    within one pixel of the law    59.8%     93.1%
+    under HALF the law             40.1%      1.7%
+    over TWICE the law              0.0%      0.1%
+
+  That is the statement worth keeping: the drawn ribbon now agrees with
+  channel.h's width law to within one raster pixel on 93.1% of the network,
+  against 59.8% before, and the share drawn at under half its own law width
+  falls from 40.1% to 1.7%. It does not over-draw: 0.1% exceeds twice the law.
+
+  The centreline p50 stays at 1.875 m because the law's half-width is 0.98 px
+  at the median -- half the network's channel is narrower than the raster can
+  resolve as more than one pixel, and no rule can change that at 1.875 m/px.
+
+
+DEPTHS, AND THE ONE ARTEFACT WORTH LOOKING AT IN A SCREENSHOT
+--------------------------------------------------------------
+The water surface is FLAT across the channel, because that is what a water
+surface is, so depth tapers on its own wherever the bed rises toward the bank.
+The codec stores depth, so the client's sub-pixel zero-crossing lands on a
+contour of the bed rather than on the raster step the widening added.
+
+    depth, metres, bv12        n         min    p50    p90    p99     max
+      centreline           163,643     0.392  0.499  0.724  1.046   1.073
+      widened              154,022     0.100  0.591  1.010  1.950   8.924
+
+  The centreline's range is IDENTICAL to bv11's -- widening adds cells, it
+  never moves a level.
+
+  The tail is real and is reported rather than hidden: 0.93% of widened cells
+  stand deeper than 2 m and 0.029% (91 cells of 317,665) deeper than 5 m. Those
+  are cut banks -- a cell within two pixels of the centreline whose ground drops
+  several metres, which is what the outside of a bend looks like. Physically
+  defensible, and the one thing to look at in a capture.
+
+  0 wet pixels stand above the drawn ground, in bv11 or bv12. The clamp holds
+  by construction and was checked rather than assumed.
+
+
+================================================================================
+PART 3 -- DO THE LAKES AND BASINS FILL?
+================================================================================
+Yes. Verified, not rebuilt.
+
+  255 registered basins over the four tiles -- 246 overflowing lakes, 9
+  terminal. ZERO dry playas, salt flats or seasonal basins, so lakes.h's
+  `holdsWater()` filter (kind >= kBasinLakeTerminal) removes nothing here.
+
+  total wet area   8,304,739 m2 = 8.305 km2   (2,362,237 fine cells)
+  area             p50 6,676 m2   p90 32,972   max 2,821,887 (2.82 km2)
+  depth            p50 3.03 m     p90 7.19     max 80.80 m
+  empty extents    0
+
+  floor < surface_mm <= spill_mm holds for all 255. No lake sits at its own
+  floor; none stands above its own outlet. 0 of 255 would return an empty mask
+  from lakes.h's `lakeExtentFill` (seed in bbox, surface != kNoWaterMm, and
+  elev(seed) <= surface all hold).
+
+  THE BASIN EXCLUSION IS REAL: of the 2,362,237 cells inside a registered
+  lake's extent, 0 carry river water in the bake's plane. The bake writes basin
+  cells dry by design and the client unions them back through
+  CompositeWaterSampler, exactly once, with no duplicated bytes.
+
+  Two places a registered lake could still fail to draw, neither of them a bake
+  problem: `unresolvedBasins()` caches an EMPTY mask when the tile is not
+  resident (lakes.h says explicitly that empty != dry -- watch the counter), and
+  `implicitWaterFill` requires zMm >= the AMPLIFIED ground, so the single 0.58 m
+  lake (~6 voxels) is within plausible detail-band amplitude.
+
+
+================================================================================
+PART 4 -- THE NUMBER THAT MATTERS
+================================================================================
+"Does a reach run from a mountain head to the shoreline without a break?"
+
+ON THE RASTER ALONE -- no.
+  Longest at the coast: 15,030 m, head 389.0 m, low end 10.9 m and 0.79 km from
+  the nearest sea cell. The last stretch is a coastal basin, which the bake
+  writes dry on purpose.
+  The 978.1 m, 1,326.0 m and 1,540.3 m heads all still stop inland. The 978.1 m
+  one ends at 190.5 m on the (-11,-5)/(-11,-6) seam, unchanged from bv11.
+
+COMPOSED THE WAY THE CLIENT DRAWS IT -- yes, from a foothill, not a mountain.
+Union of the river plane with the 255 lake sheets, labelled once, 8-connected:
+
+                                   bv11                    bv12
+    composed cells               2,520,690               2,679,897
+    components                         258                     258
+    longest span                    16,341 m                20,269 m
+      head                           238.9 m                 389.0 m
+      low end                       -476.0 m                -476.0 m
+      lake share of its cells         40.2%                    5.0%
+    second longest                  15,332 m                17,909 m
+      head / low                240.4 / -476.0 m       269.1 / -476.0 m
+
+  bv12's longest composed reach runs 20,269 m unbroken from 389.0 m down to
+  -476.0 m -- out onto the seafloor -- and only 5.0% of it is lake sheet, so it
+  is a river rather than a chain of lakes. bv11's longest was 16,341 m and 40.2%
+  lake. A second reach of 17,909 m also runs from 269.1 m to the seafloor.
+
+  For contrast, the 1,540.3 m head does appear in a 13,030 m composed component
+  -- but 94.4% of its cells are lake sheet. That is a lake chain, not a river,
+  and it should not be quoted as one.
+
+
+================================================================================
+GUARDRAILS
+================================================================================
+  TERRAIN_VERSION stays 8. Verified on all four tiles by
+  tools/verify_water_only_change.py, which compares the unquantised bake dumps
+  AND goes through the codec's own elevation_control_points against the shipped
+  tiles:
+
+    (-11,-4) (-11,-5) (-12,-5) (-11,-6)
+      elevation_m       IDENTICAL   (float32, exact)
+      flow plane        IDENTICAL
+      accumulation_m2   IDENTICAL
+      vs shipped .vxtl: elevation_cp IDENTICAL, flow plane IDENTICAL
+    PASS: 4 tiles, 0 problems
+
+  BAKE_VERSION 11 -> 12. Fine namespace
+  terrain-diffusion-unlabeled-80b9ca451a23eae4-b52995abb.
+
+  pytest    546 passed / 2 skipped   (baseline 539/2, +7 new)
+  ctest     2/2 passed, -C Release
+  vxc_tests 422 cases, 0 failures    (no C++ file changed; git diff --stat is
+                                      three .py files)
+
+  Cost: ~280-320 CPU-s per tile, unchanged. The width pass is sparse (it walks
+  distance rings over the wet cells, not the raster) and the extra D8 sweep in
+  the pyramid is 2048^2.
+
+  All four corridor bakes were run with --diagnostic, so no shipped tile was
+  overwritten. Dumps: D:/tmp/seamwidth-npz (bv12), D:/tmp/pyramidonly-npz (the
+  arm), against D:/tmp/riverfix-npz (bv11) and D:/tmp/frag-npz (bv10).

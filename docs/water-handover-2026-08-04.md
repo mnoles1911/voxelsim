@@ -282,6 +282,65 @@ dropped. On exactly the flat near-coast ground rivers must cross. p=32 loses
    That is now 8 of the 25 multi-km reaches, including the longest, and it is
    the next binding constraint.
 
+#### bake_ver 12 — items 2 and 3 addressed, one of them only half
+
+Added 2026-08-04 on `claude/river-seam-width`. Full numbers and method in
+`docs/measurements/river-seam-and-width-2026-08-04.txt`; terrain verified
+bit-identical on all four corridor tiles, including through the codec's own
+`elevation_control_points` against the shipped tiles.
+
+**Item 2 is done.** `water_width_from_law` lets `channel_width_m(Q)` decide the
+drawn extent, clamped to ground standing at least 100 mm below that reach's own
+water surface. Width p90 **1.88 → 7.50 m**, max 3.75 → 15.91 m. On the
+centreline pixels — the only population the law is a function of — the drawn
+ribbon now agrees with the law to within one raster pixel on **93.1%** of the
+network against 59.8% before, and the share drawn at under half its own law
+width falls **40.1% → 1.7%**. It does not over-draw (0.1% exceeds twice the
+law) and **0 wet pixels stand above the drawn ground**. Which bound shapes it
+was measured first: the terrain allows p50 11–28 m of lateral extent and 90–93%
+of wet cells have room for the whole law width, so the *law* does the shaping
+and the clamp bites on the 7–10% that would otherwise be drawn uphill.
+
+**Item 3 is half done, and the handover's mechanism for it was wrong.** The
+downstream tile was never *starved*: the same 8.6e7 m³/yr crossed the seam
+either way (D8/MFD = **0.99** on the total). It was **divided** — MFD's largest
+single crossing held 8.66e6 against D8's 2.02e7, and a hard threshold cannot use
+a fan. `water_pyramid_single_receiver` routes the pyramid's discharge sweep D8
+to match the fine tier. A/B'd as its own arm: it buys **9,881 → 15,028 m** on
+the piece that reaches the coast and **1 → 3** reaches over 10 km, while merging
+almost nothing (173 → 172 components — the merging in the combined result is the
+*widening's* doing).
+
+**What is left is a POSITION error, not a magnitude one, and it is the new
+binding constraint.** At the seam the coarse D8 trunk sits 165 m from the fine
+trunk; the injection lands at the lowest fine cell in a 30 m footprint on flat
+near-coast plain (194.5–199.8 m over 375 m, no incised channel, local Q below
+the cut), i.e. on the wrong side of a divide a few metres high, and the water
+ends up 1.3 km east. A 960 m apron cannot heal what has no valley to fall into.
+**10 of 35 multi-km reaches still end at an interior seam**, including the
+978.1 m one. The fix that follows is to place the entry cell by the *fine*
+surface's own thalweg rather than by its lowest elevation — but `_edge_entries`
+deliberately scatters BOTH currencies through one set of crossings, so moving it
+moves the area injection, hence incision, hence the ground. That is a design
+decision, not a patch.
+
+**Item 1, composed the way the client draws it: yes, from a foothill.** River
+plane ∪ the 255 lake sheets, labelled once: the longest composed reach runs
+**20,269 m unbroken from 389.0 m down to −476.0 m**, out onto the seafloor, and
+only **5.0%** of it is lake sheet — a river, not a chain of lakes. (bv11's was
+16,341 m and 40.2% lake.) A second runs 17,909 m from 269.1 m. The 978 m,
+1,326 m and 1,540 m heads still stop inland; the 1,540 m one *does* appear in a
+13,030 m composed component but it is **94.4% lake sheet** and must not be
+quoted as a river.
+
+**Lakes and basins fill — verified, not rebuilt.** 255 registered basins over
+the corridor, **246 overflowing / 9 terminal, zero dry playas, salt flats or
+seasonal**, so `holdsWater()` removes nothing here. Total **8.305 km²**, area
+p50 6,676 m² and max 2.82 km², depth **p50 3.03 m, max 80.80 m**, 0 empty
+extents, and `floor < surface ≤ spill` holds for all 255. All 2,362,237 cells
+inside a lake extent are dry in the river plane — the exclusion is exactly one
+copy of the fact, unioned back by `CompositeWaterSampler`.
+
 ### Phase 4 — the far-field river actor
 `riverribbon.h` produces ordered centreline polylines (not rectangles —
 deliberately, because `lakeSheetRects` point-samples at block centres with
