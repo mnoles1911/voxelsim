@@ -6,8 +6,18 @@ what stops you repeating a day's work.
 
 The owner's standing requirement, in their words: **realistic flowing rivers
 that start in high mountain valleys and reach all the way out to discharge into
-the sea.** That is not yet delivered. Everything below is either progress toward
-it or a thing that had to be fixed on the way.
+the sea.**
+
+**Not yet delivered, but much closer than it was.** The corridor's longest
+continuous reach went from 1,113 m to **14,827 m** on the last day of this
+session, and a basin-composed 15,332 m reach does run to the shoreline and out
+onto the seafloor. What is still missing: the mountain heads (978 m, 1,326 m,
+1,540 m) all stop inland, and rivers remain invisible beyond about 26 m because
+nothing consumes the far-field producer. Phase 3 and Phase 4 in §5 are those
+two gaps.
+
+Everything else below is either progress toward that or something that had to
+be fixed on the way.
 
 ---
 
@@ -48,7 +58,7 @@ languages.** Name which one you mean, every time:
    `tilestore.h`.
 
 **The version split works and is proven.** `TERRAIN_VERSION = 8` decides the
-ground; `BAKE_VERSION` (now 10) decides everything else. A water-only change
+ground; `BAKE_VERSION` (now 11) decides everything else. A water-only change
 re-bakes with **elevation and flow planes bit-identical**, verified by
 rebuilding superblocks and comparing `filled` and `acc` byte for byte. Use it:
 hydrology changes should cost no terrain re-key.
@@ -103,9 +113,11 @@ test, the control is broken.
 
 ## 3. What was built
 
-Eleven branches. `claude/water-integration` (`fa16d55`) merges six of them and
-is **verified: clang build clean, ctest 2/2, 422 C++ tests 0 failures, pytest
-534 passed / 2 skipped.** Nothing is on `main`.
+**All eleven branches below are merged into `claude/water-integration` and
+verified together there** — build clean, `vxc_tests` 422 with 0 failures,
+pytest 539 passed / 2 skipped. That branch is what lands on `main`, as one PR.
+Once it is merged, start from `main`; the branches are kept only for
+archaeology and you should not need to check any of them out.
 
 | branch | what it holds |
 |---|---|
@@ -119,7 +131,7 @@ is **verified: clang build clean, ctest 2/2, 422 C++ tests 0 failures, pytest
 | `claude/carry-q-corridor-test` `d1603d3` | the bv10 corridor re-bake and its negative result |
 | `claude/river-frag-diagnose` `0e0e95b` | the fragmentation diagnosis; `river_break_probe.py`; `--npz-dir` / `--diagnostic` |
 | `claude/ocean-captures` `d69db03` | three ocean captures, `VoxelOceanCaptureFixture`, the `.vxwater` fix |
-| `claude/river-drawable-flow` | **in flight at handover** — lower the cut and concentrate flow |
+| `claude/river-drawable-flow` `67af930` | lower the cut and concentrate flow — 1,113 m → 14,827 m |
 
 ### Highlights worth knowing about
 
@@ -189,15 +201,15 @@ Phase 2.
 ## 5. Phases of work, in order
 
 ### Phase 1 — land the integration
-`claude/water-integration` is verified and unmerged. Fold in the branches that
-post-date it (`ocean-captures`, `carry-q-corridor-test`, `river-frag-diagnose`,
-and `river-drawable-flow` when it reports), re-run the suites, and merge. One
-reviewable diff beats eleven.
+One PR from `claude/water-integration` into `main`. It is verified as a whole,
+not just per branch: build clean, `vxc_tests` 422 with 0 failures, pytest 539
+passed / 2 skipped. After it merges, start from `main`.
 
-The only conflicts so far were two agents *adding beside each other*: both
-`CMakeLists.txt` files and `lakes.h`. Keep both sides. **Taking one side of a
-`CMakeLists.txt` conflict silently unregisters a whole test file and still
-passes green** — check the test count, not just the exit code.
+One lesson worth keeping. Every conflict across eleven branches was two agents
+*adding beside each other* — both `CMakeLists.txt` files and `lakes.h`. Keep
+both sides. **Taking one side of a `CMakeLists.txt` conflict silently
+unregisters a whole test file and still passes green**, so check the test
+count, not just the exit code. That is why the counts are recorded in §7.
 
 ### Phase 2 — wire the return path
 **9a and 9b exist and are never called.** `setFrontGate` and
