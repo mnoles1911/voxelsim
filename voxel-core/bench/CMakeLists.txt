@@ -188,3 +188,15 @@ target_link_libraries(vxc_riverribbonprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_riverribbonprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_burialprobe: is the baked river BURIED inside the rendered terrain?
+# The bake's water datum is the SPLINE reconstruction; the drawn ground is the
+# AMPLIFIED surface. This measures, per wet pixel and at the mesher's own voxel
+# granularity (voxelcore/lakes.h implicitWaterFill, bottom-face rule), the
+# fraction of baked water that emits no water voxel at all -- with a nearby-dry
+# control for the relief the amplifier adds outside the channel. ------------
+add_executable(vxc_burialprobe burialprobe.cpp)
+target_link_libraries(vxc_burialprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_burialprobe PRIVATE -Wall -Wextra -Werror)
+endif()
