@@ -1,0 +1,257 @@
+B2 -- THE SEAM RESIDUAL IS NOT A POSITION ERROR
+seed 20260719, tiles (-11,-5) / (-11,-6), bake_ver 12
+2026-08-04
+================================================================================
+
+THE ANSWER FIRST, IN TWO PARTS.
+
+  1. THE TWO CURRENCIES ARE SEPARABLE. Moving the discharge entry cell while
+     the area entry cell stays put is a ~10-line change, water-only, and leaves
+     the terrain bit-identical. BAKE_VERSION alone; TERRAIN_VERSION untouched.
+
+  2. IT WOULD NOT FIX ANYTHING, BECAUSE THE DEFECT IS NOT POSITION. Measured on
+     the shipped bv12 dumps, the river crosses the seam into the RIGHT CELL --
+     one fine pixel, 1.88 m, from where it left the upstream tile. What it
+     loses is 14.6% of its MAGNITUDE, in that correct cell. And the fix the
+     record names -- "place the entry cell by the fine surface's own
+     accumulation maximum" -- is measurably the WORST of the three candidate
+     rules, not the best.
+
+  So: nothing was built. This is the negative, with the measurements behind it.
+
+Seven confident claims about this river have already been wrong. This document
+makes two of them explicit, because both are currently written down as fact:
+docs/measurements/river-seam-and-width-2026-08-04.txt lines 108-133 and
+docs/measurements/river-long-profile-2026-08-04.txt lines 259-272.
+
+
+================================================================================
+PART 0 -- WHERE THE OLD MEASUREMENT WENT WRONG
+================================================================================
+
+The record says: "the coarse D8 trunk sits at 30 m column 886 (x = -157,740)
+and the fine trunk at column 880 (x = -157,905) -- 165 m apart", and concludes
+that the injected water "does not arrive where the upstream tile's own
+accumulation arrives".
+
+Two things are wrong with that, and they compound.
+
+FIRST, THE 165 m WAS MEASURED AT THE WRONG LINE. `_edge_entries` is called with
+`child_z = filled` and `child_origin_m = geom.padded_origin_m(...)`, i.e. the
+PADDED domain (pipeline.py:3915-3921). The deposit therefore lands on the
+outermost 30 m ring of the padded domain -- 960 m OUTSIDE the interior, in the
+apron. The 165 m figure was taken at the INTERIOR boundary, where nothing is
+injected. Geometry, for the record:
+
+    tile (tx,ty) interior world fine rows = ty*8192 .. ty*8192+8191
+    (-11,-6) interior  rows -49152..-40961
+    (-11,-6) PADDED    rows -49664..-40449
+    so (-11,-6)'s injection line is world row -40449
+       == (-11,-5) LOCAL ROW 511, not (-11,-5) row 0.
+
+SECOND, THE WRONG RIVER WAS FOLLOWED. The reach the long profile walks -- the
+one that loses 14.6% at km 5.2 -- carries 3.354e6 m3/yr and crosses at tile
+-11 local col 2428/2429. The trunk at col 5896 that the seam record measured
+carries 2.316e7, seven times more; it is a different, larger river 2.7 km east.
+Both cross the same seam. The 14.6% belongs to the small one.
+
+  Confirmed against the long profile's own CSV (D:/tmp/longprofile-bv12.csv,
+  index 2345, chain 5221.678 m): composed row 8192 col 10620 tile (-11,-5)
+  Q 3.353682e6 -> composed row 8191 col 10621 tile (-11,-6) Q 2.864686e6. Those
+  map to tile-local (row 0, col 2428) and (row 8191, col 2429).
+
+
+================================================================================
+PART 1 -- THE DEFECT IS MAGNITUDE, AND THE POSITION IS ALREADY CORRECT
+================================================================================
+
+STRAIGHT OFF THE SHIPPED bv12 NPZ. No emulation, no re-bake.
+
+    (-11,-5) row 0     col 2428   Q 3.35368e6      the river leaving
+    (-11,-6) row 8191  col 2429   Q 2.86469e6      the river arriving
+    lateral offset                1.88 m           ONE FINE PIXEL
+    deficit                       4.89e5 m3/yr     14.6%
+
+The arrival cell is not ambiguous and the water did not land "nearby":
+
+    col   2424   2425   2426   2427   2428  |  2429  |  2430   2431   2432
+    Q     189.2  190.1  191.0  191.8  192.7 | 2.865e6| 18.19  50.17  47.53
+
+One cell holds 2.865e6; its neighbours hold ~190. The channel is exactly where
+it should be. Whatever is lost at this seam is lost as VOLUME, in the right
+place -- so no rule that changes WHERE the entry cell sits can recover it.
+
+
+================================================================================
+PART 2 -- MOVING THE ENTRY CHANGES THE ARRIVAL BY 2 METRES
+================================================================================
+
+WHERE THE REACH REALLY CROSSES THE INJECTION LINE. Traced upstream from
+(-11,-5) row 0 col 2428 by max-Q donor over the 8-neighbourhood (a 3-cell
+"one row per step" trace falls off this channel immediately -- the reach runs
+laterally, and that is how the first attempt at this measurement lost it):
+
+    the reach crosses (-11,-5) row 511 at col 2240, carrying Q 3.244e6.
+
+WHAT THE REAL PYRAMID CROSSES WITH. Superblock (-3,-2), level 0, 2048^2 @ 30 m,
+built read-only from the shipped coarse cache with `climate_fetch` wired so it
+carries q. 832 crossings into (-11,-6); 417 on the (-11,-5) face, carrying
+8.075e7 m3/yr, 94.9% of the tile's total inflow. In cols 1600..3000:
+
+        Q m3/yr    col    offset from the fine river (col 2240)
+      2.781e+06   2112              -240 m      <- the crossing for this river
+      1.665e+06   2816             +1080 m
+      1.359e+06   1792              -840 m
+      2.240e+05   2224               -30 m
+
+So the position error at the injection line is 240 m -- 128 fine px, 8 coarse
+cells -- not 165 m. The current rule cannot express it: the candidate set is
+the 16x16 fine footprint of ONE 30 m parent cell, so the deposit can move at
+most about +/-15 m whatever signal it uses.
+
+AND IT DOES NOT MATTER. Routing each candidate deposit down to the interior
+edge over (-11,-6)'s padded domain:
+
+    entry rule                                 deposit   arrives   vs true 2428
+    CURRENT (argmin z in the 30 m footprint)     2127      2429        +2 m
+    the fine river's own cell                    2240      2429        +2 m
+    argmax pre-injection fine acc, +/-240 m      2061      2227      -377 m
+
+The current rule and the fine thalweg -- 212 m apart at the border -- converge
+to the SAME cell 960 m downstream. That is the apron doing exactly what it is
+for. The named fix is the only one of the three that misses.
+
+  METHOD, AND ITS LIMIT. (-11,-6)'s padded domain is emulated over cols
+  1600..3000 by stacking its own interior with a 512-row apron taken from
+  (-11,-5)'s interior, then fill_depressions + d8_receivers from the repo's own
+  kernels. The apron strip therefore carries (-11,-5)'s incision rather than
+  (-11,-6)'s; the two agree to p50 0.012 m and p99 0.74 m across the join,
+  against (-11,-5)'s own row-to-row gradient of p50 0.037 m and p99 0.43 m, so
+  the join is within the terrain's own roughness. This emulation is only
+  corroborating: PART 1 proves the position is already right from the real bake
+  alone, and needs none of it.
+
+
+================================================================================
+PART 3 -- THE NAMED FIX IS THE WORST OPTION, AND HERE IS WHY
+================================================================================
+
+"Place the entry cell by the fine surface's own accumulation maximum" assumes
+the fine accumulation carries a thalweg at the injection line. It does not, and
+it cannot, BY CONSTRUCTION: the injection line is the OUTERMOST row of the
+child's own padded domain, so nothing upstream of it exists inside that domain.
+Measured on the emulated padded accumulation with no edge injection -- exactly
+the field the proposed extra pre-pass sweep would produce:
+
+    border row accumulation   p50 5.15 m2   max 2073 m2   (one cell = 3.52 m2)
+    at the fine river (col 2240)      4.76 m2   RANK 765 of 1400
+
+The river's own cell is at the 55th percentile of a field whose maximum is 590
+cells' worth of area. There is no thalweg in it to snap to. Snapping anyway
+sends the deposit to col 2061 and the water arrives 377 m off.
+
+ELEVATION IS NO BETTER AS A GENERAL RULE, though it happens to work at one
+radius here by coincidence:
+
+    argmin z within +/-  15 m of the crossing -> col 2104   error 255.0 m
+    argmin z within +/-  60 m                 -> col 2144   error 180.0 m
+    argmin z within +/- 120 m                 -> col 2147   error 174.4 m
+    argmin z within +/- 240 m                 -> col 2240   error   0.0 m
+    argmin z within +/- 400 m                 -> col 2325   error 159.4 m
+    argmin z within +/- 800 m                 -> col 2538   error 558.8 m
+
+Zero error at exactly +/-240 m and 159-559 m either side of it is not a rule,
+it is a fitted constant. The river's cell ranks 681 of 1400 by elevation over
+the window: it is not a local minimum at all.
+
+
+================================================================================
+PART 4 -- WHERE THE 14.6% ACTUALLY GOES
+================================================================================
+
+The fine tier and the 30 m pyramid disagree about how much water is in this
+channel, at the same line, before any placement question is asked:
+
+    fine tier, the reach at (-11,-5) row 511 col 2240        3.244e6 m3/yr
+    pyramid, crossings within +/- 60 m of col 2240           2.482e5   (5)
+    pyramid, crossings within +/-120 m                       2.544e5   (9)
+    pyramid, crossings within +/-240 m                       3.041e6  (15)
+    pyramid, crossings within +/-480 m                       3.189e6  (31)
+
+To match the fine tier's 3.244e6 the pyramid needs a 480 m-wide bite of its own
+boundary -- 31 separate crossings, by then reaching into neighbouring channels.
+Within the 240 m that actually belongs to this river it hands over 3.041e6, 6.3%
+short, and the fine routing then loses a little more on the way in. That is the
+14.6%.
+
+This is a DISCRETISATION mismatch between the tiers, not a bug: (-11,-5)
+generates this river's discharge from 256x more cells than the 30 m network
+does, and a boundary condition sampled at 30 m cannot reproduce it exactly.
+The lever on it is the MAGNITUDE the pyramid carries -- a finer pyramid level
+at the boundary, or carrying the fine tier's own Q between tiles -- and not
+where a cell is placed.
+
+WHAT WOULD HAVE TO BE TRUE for an entry-placement fix to help: the injected
+water would have to arrive somewhere other than the fine trunk. PART 1 shows it
+arrives one pixel away from it. It does not.
+
+
+================================================================================
+PART 5 -- THE SEPARATION, SCOPED BUT NOT BUILT
+================================================================================
+
+Recorded because the question was asked and because the answer is not the one
+the code's own docstring implies -- so the next person to ask does not re-derive
+it.
+
+THE TWO CURRENCIES ARE ALREADY SEPARATE DOWNSTREAM. In `bake_tile`:
+
+    _entries = _edge_entries(child_z=filled, ...)              pipeline.py:3915
+    inflow   = _scatter_entries(_entries, inflow_source.acc, ...)      -> B2c
+    inflow_q = _scatter_entries(_entries, inflow_source.q,  ...)       -> B6
+
+  * `inflow` goes to `accumulate_mfd(..., inflow=inflow)` -> `acc64` -> B2d
+    stream-power incision -> the ground.
+  * `inflow_q` goes ONLY to `_water.discharge_source(...)` at B6, which feeds
+    its own separate D8 sweep whose "only consumer is the `q >= q_drawable`
+    threshold" (pipeline.py:4459-4465).
+
+The single shared object is the `_entries` tuple. Computing a second entry set
+for the discharge and leaving `inflow` untouched leaves `acc64` bit-identical,
+hence incision bit-identical, hence the elevation plane bit-identical.
+`tools/verify_water_only_change.py` is the gate that would prove it.
+
+AND THE INVARIANT THE DOCSTRING PROTECTS IS ALREADY WEAKER THAN IT READS.
+`_edge_entries` says both currencies "must cross the boundary at exactly the
+same cell, or the width law reads a Q that belongs to a different channel than
+the area the incision cut". But bake_ver 11 deliberately routes them by
+DIFFERENT RULES over the same surface -- area by `accumulate_mfd` at
+`consts.mfd_p`, discharge by `accumulate_d8` -- so they already diverge one
+cell downstream of the shared entry. What survives today is a same-ENTRY-CELL
+invariant, not a same-channel one, and separating the entries costs strictly
+less than bv11 already spent.
+
+SO IT IS AVAILABLE, CHEAPLY, IF A LATER CHANGE NEEDS IT. It is not built here
+because nothing in PART 1-4 gives it a job.
+
+
+================================================================================
+GUARDRAILS
+================================================================================
+
+  * NO CODE WAS CHANGED. TERRAIN_VERSION is 8 and untouched; BAKE_VERSION is
+    untouched. There is nothing to verify with verify_water_only_change.py
+    because no bake ran.
+  * NO BAKE WAS RUN and NO TILE WAS WRITTEN. Every number above comes from the
+    existing bv12 diagnostic dumps at D:/tmp/seamwidth-npz (interior only,
+    8192^2, elevation_m / accumulation_m2 / flow / discharge_m3_yr /
+    water_surface_m) plus one level-0 superblock built READ-ONLY from the
+    shipped coarse cache
+    D:/voxelsim/tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/
+    000000000135276f/s1. Scratch arrays were written to D:/tmp/b2-sb-*.npy only.
+  * THERE IS THEREFORE NO OUTPUT TO LOAD. This document is diagnostic-only in
+    the strongest sense: it produced no cache, loadable or otherwise.
+  * The superblock must be built with `climate_fetch=` or `sb.q is None` and
+    every crossing reads Q = 0. That is the "refusal to answer" third state, and
+    it is silent if you do not check for it -- the first run of this probe
+    reported a 0-discharge face and looked like a finding.

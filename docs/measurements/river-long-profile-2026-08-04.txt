@@ -263,6 +263,17 @@ cell where the path crosses from tile (-11,-5) into tile (-11,-6). This is the
 ONLY step in 13,896 where Q falls between two river cells; the other four Q
 falls are the path entering a lake sheet, where Q is not defined.
 
+  *** CORRECTED 2026-08-04 (B2): the paragraph below is wrong about the
+  *** mechanism and about the fix. The reach crosses into (-11,-6) at col 2429,
+  *** ONE FINE PIXEL from where it left (-11,-5) at col 2428 -- its neighbours
+  *** carry ~190 m3/yr against its 2.865e6 -- so the water is not "slightly
+  *** short", it is in exactly the right cell with 14.6% less volume. Moving the
+  *** entry to the fine thalweg changes the arrival by 2 m. The named fix makes
+  *** it worse (arrival off by 377 m). The residual is the 30 m pyramid carrying
+  *** less Q in this channel than the fine tier does -- a discretisation
+  *** mismatch between tiers, not a placement error.
+  *** See river-seam-position-scoping-2026-08-04.txt.
+
   This is the residual mechanism the seam-and-width record named and did NOT
   fix. PR #209's single-receiver pyramid fixed the MAGNITUDE crossing a seam;
   it cannot fix the POSITION. The injected discharge enters at the lowest fine

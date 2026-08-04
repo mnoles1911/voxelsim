@@ -44,7 +44,21 @@ handover is worse than a missing one.
 Also fold in: the cap finding (A2's precondition), and that a river now reaches
 the sea.
 
-### B2. The seam residual — position, not magnitude
+### B2. The seam residual — ~~position, not magnitude~~ **CLOSED: it is magnitude, not position**
+
+> **Answered 2026-08-04, nothing built.** The currencies *are* separable — a
+> ~10-line change, terrain bit-identical, `BAKE_VERSION` alone — but it buys
+> nothing, because the premise below is false. In the shipped bv12 bake the
+> reach crosses the seam **one fine pixel (1.88 m)** from where it left the
+> upstream tile; it arrives in the right cell with 14.6% less water. Moving the
+> entry to the fine thalweg changes the arrival by **2 m**, and the fix named
+> below — snap to the maximum fine accumulation — is measurably the **worst** of
+> the three candidate rules, because the injection line is the outermost row of
+> the child's own padded domain and carries no thalweg to snap to. The 165 m was
+> measured at the *interior* boundary, where nothing is injected, and on a
+> different river. Full measurements and the separation scoping:
+> `docs/measurements/river-seam-position-scoping-2026-08-04.txt`.
+> The remaining lever is the **magnitude** the 30 m pyramid carries, not placement.
 
 10 of 35 multi-km reaches still end at an interior seam. D8 fixed the magnitude
 at the crossing; what remains is that **the coarse trunk sits 165 m from the
