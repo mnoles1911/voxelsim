@@ -239,6 +239,49 @@ that strength (a console var, per this ADR's own item-4-equivalent ask, so it
 can still be forced off in the field with no relaunch if a future edit path
 is ever suspected of a missed invalidation).
 
+## Addendum, 2026-08-04: the cap was a correctness bug, and this ADR's blockers did not gate fixing it
+
+Recorded here because the next reader of this ADR will otherwise conclude, as
+its author did, that nothing can be done about `kMaxHydrostaticComponentCells`
+until option B is built. Full numbers and method:
+`docs/measurements/hydrostatic-cap-2026-08-04.txt`.
+
+**The blockers in "3. The blocker that actually bites" are real and remain
+correct — for option B.** Splits and the visited obligation are statements about
+SKIPPING WORK ACROSS TICKS. They are not statements about computing a correct
+answer for a component the flood is walking anyway, and the distinction is the
+whole point:
+
+- There is **no union-find in this codebase and never has been**. The pass
+  re-floods from scratch every tick.
+- The **per-brick visited masks already exist** (`BrickCell::visited`), rebuilt
+  per tick.
+- Therefore the pass **already holds the exact cell set and the exact
+  `totalVol` of an over-cap component at the moment it throws them away.**
+
+**What the cap actually did.** Measured, not inferred: the flood does not stop
+at the cap, it stops RECORDING at the cap and keeps walking the component. On a
+4x-over-cap breach, **99% of every flood pop went into components whose answer
+was discarded**. The cap bought the `cells` vector, its sort, and the level
+allocation — never the traversal it was documented as bounding. And it cost the
+worst available failure: no writes means no changed bricks means zero active
+bricks, so the CA reported itself **settled** at a level nowhere near the datum.
+On a closed 64x64x32 basin that is a 23-voxel mound that never levels.
+
+**Option C is partly overtaken.** This ADR rejected "make the cap count only
+WATER" as a world-breaking change not worth spending on a deferred
+optimization. That reasoning does not transfer to a correctness fix, and the fix
+that shipped (`kWaterCAVersion` 5) did not need option C either: the cap now
+selects between two levelling paths that produce identical output, so a
+component over it is levelled rather than refused, and the air it counts no
+longer decides anything. Option C would still simplify option B if option B is
+ever built.
+
+**Option B is still deferred, on this ADR's own evidence, and nothing above
+changes that.** Phase C remains O(component) per tick for any body one touched
+brick reaches. The v5 change removes a wrong answer; it does not remove the
+work. The replay-skip invariant above is still the thing to implement against.
+
 This does NOT change the PENDING/proposed status or human-sign-off line
 above -- that decision is Matt's to make; this note only records what was
 built and proven so it need not be re-derived. One real, separate gap

@@ -535,6 +535,93 @@ VXC_TEST(waterca_hydrostatic_large_pool_multibrick_golden) {
     CHECK_EQ(d.h, 0x56BC18914355A205ull);
 }
 
+// THE TWO LEVELLING PATHS ARE THE SAME FUNCTION. The most important test in
+// this file for the kWaterCAVersion 5 change, and the one whose absence let the
+// over-cap path go unexercised entirely.
+//
+// `setHydroLargeComponentThreshold` lowers the cell count at which a component
+// takes Phase C's streaming path instead of the materialize-and-sort path
+// (waterca.h). Lowering it CANNOT change an answer -- both paths compute the
+// same bottom-up allocation over the same component, and differ only in whether
+// the cell list is materialized and sorted. So every pinned golden must
+// re-derive BYTE-IDENTICALLY at a threshold of 1, which forces every component
+// in the scenario, however tiny, down the streaming path. If this ever fails,
+// the streaming path is wrong, and no amount of "the big room looks full"
+// elsewhere in this file is evidence against that.
+//
+// Same argument the solidity memo is held to (waterca_solid_cache_*): a change
+// that cannot alter the output must be DEMONSTRATED not to, at the goldens,
+// rather than asserted. The over-cap path could otherwise only be exercised at
+// 65,537+ cells, which is far too large to pin a digest on -- which is exactly
+// why it was never pinned.
+VXC_TEST(waterca_hydrostatic_streaming_path_matches_both_goldens) {
+    // GOLDEN(waterca_container_scenario) -- the 3x3 basin.
+    {
+        WaterCA a(basin(0, 2, 0, 2));
+        a.setHydroLargeComponentThreshold(1);
+        a.addWater(1, 1, 30, 2795);
+        a.addWater(0, 0, 25, 150);
+        for (int i = 0; i < 40; ++i) a.step();
+        Digest d;
+        a.digest(d);
+        CHECK_EQ(d.h, 0x3D2224BE4A253404ull);
+    }
+    // GOLDEN(waterca_large_pool_multibrick) -- the 16x16 basin whose flood
+    // genuinely crosses brick faces in every direction and explores a real air
+    // shell, with a deliberate remainder in the top layer so the (x,y)
+    // tie-break distribution is exercised. That remainder is precisely the part
+    // the streaming path resolves by an nth_element threshold instead of by
+    // sorting the whole component, so this golden is the one that actually
+    // pins the rule.
+    {
+        WaterCA ca(basin(0, 15, 0, 15));
+        ca.setHydroLargeComponentThreshold(1);
+        CHECK_EQ(ca.addWater(7, 7, 30, 300000), uint32_t(300000));
+        CHECK(runToSettleCheckingConservation(ca, 5000));
+        CHECK_EQ(ca.totalVolume(), uint64_t(300000));
+        CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+        Digest d;
+        ca.digest(d);
+        CHECK_EQ(d.h, 0x56BC18914355A205ull);
+        // Every component in that scenario went the streaming way, and none was
+        // ever refused -- so the digest above is the streaming path's own
+        // output and not the sorted path's under another name.
+        CHECK(ca.hydroStreamedComponents() > 0);
+        CHECK(!ca.hydroGaveUp());
+    }
+}
+
+// SAME SCENARIO, EVERY THRESHOLD: a sweep rather than the two pinned points, so
+// that a bug living only at a particular component size -- an off-by-one at the
+// boundary, a partial layer with no cells, a remainder of exactly 0 or exactly
+// n-1 -- has somewhere to show up. The reference digest is taken from the
+// scenario itself at the default threshold, so this keeps working if the
+// goldens above are ever re-pinned for an unrelated reason.
+VXC_TEST(waterca_hydrostatic_threshold_never_changes_the_answer) {
+    auto run = [](size_t threshold) -> uint64_t {
+        WaterCA ca(basin(0, 15, 0, 15));
+        if (threshold) ca.setHydroLargeComponentThreshold(threshold);
+        ca.addWater(7, 7, 30, 300000);
+        ca.addWater(2, 13, 30, 45000); // a second, off-centre source
+        // 150 is comfortably past settling for this basin (the golden above
+        // settles it in well under 100), and this loop runs once per threshold.
+        for (int i = 0; i < 150; ++i) ca.step();
+        CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+        CHECK_EQ(ca.totalVolume(), uint64_t(345000));
+        Digest d;
+        ca.digest(d);
+        return d.h;
+    };
+    const uint64_t reference = run(0); // default: kMaxHydrostaticComponentCells
+    // 1 and 2 force streaming on literally everything; 511/512/513 straddle a
+    // brick; 65535/65536/65537 straddle the real constant, which is where an
+    // off-by-one in the `cells.size() > threshold` comparison would live.
+    for (size_t t : {size_t(1), size_t(2), size_t(511), size_t(512), size_t(513),
+                     size_t(65535), size_t(65536), size_t(65537)})
+        CHECK_EQ(run(t), reference);
+}
+
+
 // ---------------------------------------------------------------------------
 // Cross-tick terrain-solidity memo (waterca.h setSolidCacheEnabled)
 // ---------------------------------------------------------------------------
@@ -2492,9 +2579,30 @@ VXC_TEST(waterca_open_sea_breach_spreads_without_bound) {
     CHECK(ca.activeBrickCount() > 0);
 
     // And the sea it has converted dwarfs the room it was supposed to fill: the
-    // room needs 8 bricks' worth of water and is not close to having it.
+    // room needs 8 bricks' worth of water, and the front has converted more
+    // than twenty times that in sea it had no reason to touch.
     CHECK(mob.mobilizedBricks().size() > 20 * kNarrowBreach.roomBricks());
-    CHECK(roomVolume(ca, kNarrowBreach) < kNarrowBreach.roomFull() / 4);
+
+    // WHAT THIS TEST NO LONGER CLAIMS, and the reason is worth reading before
+    // re-tightening it. Through kWaterCAVersion 4 this also asserted the room
+    // was under a quarter full at tick 400 -- and it was, but not for the
+    // reason the sentence implied. The room is joined to the sea through the
+    // shaft, so room+sea is ONE hydrostatic component, and that component is
+    // far over kMaxHydrostaticComponentCells; Phase C therefore declined to
+    // level it at all, and the room held only what gravity and lateral flow had
+    // pushed in. At v5 the component is levelled and the room fills, WHILE the
+    // front still spreads without bound -- which is the honest shape of this
+    // failure: it is a COST leak, and it always was. Reported, not asserted, so
+    // that a future front policy is measured against a number rather than
+    // against a bound that was really measuring the hydrostatic deferral.
+    std::printf("  [runaway] %zu bricks mobilized for an %llu-brick room; room %llu/%llu "
+                "(%llu%% of datum); hydro gave up %llu time(s)\n",
+                mob.mobilizedBricks().size(), (unsigned long long)kNarrowBreach.roomBricks(),
+                (unsigned long long)roomVolume(ca, kNarrowBreach),
+                (unsigned long long)kNarrowBreach.roomFull(),
+                (unsigned long long)(roomVolume(ca, kNarrowBreach) * 100 /
+                                     kNarrowBreach.roomFull()),
+                (unsigned long long)ca.hydroDeferralEvents());
 }
 
 // THE CEILING BOUNDS IT, AND THE SEA STILL FILLS THE BREACH TO THE DATUM. This
@@ -2581,33 +2689,59 @@ VXC_TEST(waterca_closed_gate_still_lets_an_edit_breach_the_sea) {
 // future reader doing what the author nearly did: raising the ceiling because
 // the small case worked and assuming the fill scales with it.
 //
-// `kMaxHydrostaticComponentCells` (waterca.cpp:108, tripped at :1065, acted on
-// at :1180) leaves an over-cap component COMPLETELY unmodified — deferred, not
-// partially levelled — and the count includes air. A 64x64x16 room is 128
-// bricks on its own, so this component is over the cap before one drop of sea
-// is mobilized. And the room is not mobilized and cannot be (see the harness
-// note), so NO gate and NO ceiling has any say over its cells.
+// `kMaxHydrostaticComponentCells` (waterca.h) decides whether an over-cap
+// component is levelled, and the count includes air. A 64x64x16 room is 128
+// bricks -- 65,536 cells -- on its own, so this component is at the cap before
+// one drop of sea is mobilized. And the room is not mobilized and cannot be
+// (see the harness note), so NO gate and NO ceiling has any say over its cells:
+// whatever happens here is the CA's doing, not the mobilizer's.
 //
-// The consequence, measured: water still enters, and then stays exactly where
-// it lands, because nothing ever levels it. The fill is therefore proportional
-// to whatever the ceiling let in and to nothing else — doubling the ceiling
-// doubles the fill and never approaches full, and the world never settles at
-// any setting. That is a linear leak, not a converging fill.
+// THE ARMS. Same room, same ceiling, same 300 ticks; the only difference is
+// WaterCA::HydroLargeComponentPolicy.
 //
-// So: this policy bounds COST. It does not, and cannot, make an over-cap breach
-// correct. Do not design as though it does.
-VXC_TEST(waterca_no_ceiling_can_fill_a_breach_over_the_hydrostatic_cap) {
-    // The room alone is the cap, exactly (65,536 cells), and the cap bites
-    // sooner than that because the flood counts air too.
+//   kDeferOverCap    -- kWaterCAVersion 4's behaviour, kept as a kill-switch.
+//                       The component is left completely unmodified, so water
+//                       stays exactly where it lands, so the fill is
+//                       proportional to whatever the ceiling let in and to
+//                       nothing else: doubling the ceiling doubles the fill and
+//                       never approaches full. A linear leak, not a converging
+//                       fill. And the CA goes QUIET while doing it.
+//   kLevelStreaming  -- the default from v5. The same component is levelled,
+//                       so the room converges on the datum and the ceiling
+//                       stops being the thing that decides how wet it is.
+//
+// This is a differential test on purpose. "The room fills" on its own could be
+// the ceiling, the front budget, or the tick count; only the pair separates the
+// cap from every other lever, which is exactly the mistake the original version
+// of this test was written to prevent.
+VXC_TEST(waterca_over_cap_breach_fills_at_v5_and_is_a_linear_leak_at_v4) {
+    // The room alone is the cap, exactly (65,536 cells), and the cap bites at
+    // that size and not at 65,536 fill units, because the flood counts air too.
     CHECK_EQ(kOverCapBreach.roomBricks(), uint64_t(128));
+    CHECK_EQ(kOverCapBreach.roomBricks() * uint64_t(WaterBrick8::kCells),
+             uint64_t(kMaxHydrostaticComponentCells));
 
-    struct Arm { size_t ceiling; uint64_t filled; bool quiet; };
-    Arm arms[2] = {{32, 0, false}, {64, 0, false}};
+    struct Arm {
+        size_t ceiling;
+        WaterCA::HydroLargeComponentPolicy policy;
+        uint64_t filled = 0;
+        bool quiet = false;
+        bool gaveUp = false;
+        uint64_t deferredCells = 0;
+        uint64_t streamedCells = 0;
+    };
+    Arm arms[4] = {
+        {32, WaterCA::HydroLargeComponentPolicy::kDeferOverCap},
+        {64, WaterCA::HydroLargeComponentPolicy::kDeferOverCap},
+        {32, WaterCA::HydroLargeComponentPolicy::kLevelStreaming},
+        {64, WaterCA::HydroLargeComponentPolicy::kLevelStreaming},
+    };
 
     for (Arm& a : arms) {
         auto plugOpen = std::make_shared<bool>(false);
         WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kOverCapBreach));
         WaterCA ca(mob.makeSolidFn());
+        ca.setHydroLargeComponentPolicy(a.policy);
         mob.setMobilizedCeiling(a.ceiling);
         mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 256); });
         openTheBreach(mob, ca, plugOpen, kOverCapBreach);
@@ -2618,30 +2752,267 @@ VXC_TEST(waterca_no_ceiling_can_fill_a_breach_over_the_hydrostatic_cap) {
             mob.demoteBudgeted(ca, 32);
             CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
             CHECK(mob.mobilizedBricks().size() <= a.ceiling);
+            // EXACT integer equality against an independent re-sum of every
+            // stored brick -- never a tolerance. Every 16th tick because the
+            // re-sum is O(all bricks) and this loop runs four times.
+            if (i % 16 == 0) CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
         }
+        CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
         a.filled = roomVolume(ca, kOverCapBreach);
         a.quiet = ca.activeBrickCount() == 0;
+        a.gaveUp = ca.hydroGaveUp();
+        a.deferredCells = ca.worstDeferral().cells;
+        a.streamedCells = ca.hydroLargestStreamedCells();
+        std::printf("  [over-cap] %-9s ceiling %2zu -> room %10llu/%llu (%2llu%% of datum), "
+                    "quiet=%d gaveUp=%d worstDeferredCells=%llu largestStreamed=%llu\n",
+                    a.policy == WaterCA::HydroLargeComponentPolicy::kDeferOverCap ? "v4 defer"
+                                                                                  : "v5 stream",
+                    a.ceiling, (unsigned long long)a.filled,
+                    (unsigned long long)kOverCapBreach.roomFull(),
+                    (unsigned long long)(a.filled * 100 / kOverCapBreach.roomFull()),
+                    int(a.quiet), int(a.gaveUp), (unsigned long long)a.deferredCells,
+                    (unsigned long long)a.streamedCells);
     }
 
-    // The bound HOLDS — that half works exactly as designed, at both settings.
-    // What does not happen is the fill, and the way it does not happen is the
-    // worst available: the CA goes QUIET. Not slow, not still-converging —
-    // ZERO active bricks, the state every caller reads as "settled", at a level
-    // that is nowhere near the datum and will never move again. An engine
-    // waiting for `activeBrickCount() == 0` before it re-meshes or saves gets a
-    // confident, wrong answer.
+    const Arm& d32 = arms[0];
+    const Arm& d64 = arms[1];
+    const Arm& s32 = arms[2];
+    const Arm& s64 = arms[3];
+
+    // --- the finding, and it SURVIVES the v5 fix ---------------------------
+    //
+    // The bound HOLDS at both settings -- that half always worked. What does
+    // not happen is the fill, and it does not happen ON EITHER POLICY: the fill
+    // tracks the CEILING, linearly, instead of converging on the datum. Twice
+    // the ceiling, twice the water in the room.
+    //
+    // AND THAT IS CORRECT, WHICH IS THE POINT OF RUNNING BOTH ARMS. Phase C is
+    // a REDISTRIBUTION -- it can level a body, it cannot conjure one. The room
+    // needs 16.7 M fill units; a ceiling of 64 buys 64 bricks of sea, which is
+    // 8.36 M, so the room ends at exactly half however it is levelled. Fixing
+    // the hydrostatic cap was never going to fill this room, and a reader who
+    // expected it to has confused "the water is not level" with "there is not
+    // enough water". The measurements are 25% at ceiling 32 and 50% at ceiling
+    // 64 on BOTH policies, to the unit.
     for (const Arm& a : arms) {
-        CHECK(a.quiet);                               // reports itself settled...
-        CHECK(a.filled < kOverCapBreach.roomFull());  // ...at less than the datum
+        CHECK(a.quiet);
+        CHECK(a.filled < kOverCapBreach.roomFull());
+    }
+    CHECK_EQ(s32.filled, d32.filled);
+    CHECK_EQ(s64.filled, d64.filled);
+    CHECK(d64.filled > d32.filled);
+    CHECK(d64.filled >= d32.filled * 15 / 10); // ~2x, generously bracketed
+    CHECK(d64.filled <= d32.filled * 25 / 10);
+
+    // --- what DID change: the deferral is gone, and while it lasted it was
+    // --- visible ----------------------------------------------------------
+    //
+    // At ceiling 64 the room-plus-shaft-plus-mobilized-sea component clears the
+    // cap (67,584 cells against 65,536) and v4 refuses it. At ceiling 32 there
+    // is not enough water in the room for the flood's air shell to reach the
+    // cap at all, so v4 never trips -- which is worth having in the test,
+    // because it shows the cap is a function of the component's SIZE and not of
+    // the scenario's name.
+    CHECK(!d32.gaveUp);
+    CHECK_EQ(d32.streamedCells, uint64_t(0));
+    CHECK(d64.gaveUp);
+    CHECK(d64.deferredCells > uint64_t(kMaxHydrostaticComponentCells));
+
+    // v5 levels the same component instead of refusing it, and says so.
+    CHECK(!s64.gaveUp);
+    CHECK_EQ(s64.streamedCells, d64.deferredCells);
+    CHECK(s64.streamedCells > uint64_t(kMaxHydrostaticComponentCells));
+
+    // AND IT WAS NEVER SILENT AGAIN. This is the half that would have saved a
+    // day: at ceiling 64 a v4 caller holding only `activeBrickCount() == 0`
+    // gets a confident, wrong answer, and there is now a second question that
+    // gives the right one -- in an ordinary build, with no -DVXC_WATER_PROFILE
+    // anywhere. What that answer does NOT do is change the fill, which is why
+    // the assertions above are the ones they are.
+    CHECK(d64.quiet && d64.gaveUp); // "settled" and "gave up", simultaneously
+}
+
+// THE FIX ITSELF, WITH THE MOBILIZER TAKEN OUT OF THE PICTURE. The breach test
+// above deliberately cannot show it: its room is ceiling-limited, so levelling
+// changes nothing there. This one has no mobilizer, no implicit field and no
+// front -- just a walled basin larger than kMaxHydrostaticComponentCells with a
+// fixed amount of water poured into one corner, which is the smallest scenario
+// in which "does the pass level a large body" is the only question being asked.
+//
+// MEASURED (vxc_hydroprobe reports the same two arms):
+//   v4 defer   -- never settles in 3,000 ticks, and the surface is a MOUND:
+//                 z=24 over the pour corner against z=1 at the far corners. The
+//                 water arrived, gravity and lateral flow spread it as far as
+//                 their local rules reach, and then nothing ever levelled it.
+//   v5 stream  -- settles at tick 16, flat at z=3 at every corner.
+// Both conserve the ledger exactly throughout; this was never a leak.
+VXC_TEST(waterca_over_cap_closed_basin_levels_at_v5_and_never_levels_at_v4) {
+    constexpr int64_t kHi = 63; // 64x64 footprint; 64x64x32 = 131,072 cells
+    auto walled = [](int64_t x, int64_t y, int64_t z) -> MaterialId {
+        if (z < 0) return MAT_ROCK;
+        if (x < 0 || x > kHi || y < 0 || y > kHi) return MAT_ROCK;
+        return MAT_AIR;
+    };
+    // Over the cap by construction, before a drop is poured.
+    CHECK(uint64_t(kHi + 1) * uint64_t(kHi + 1) * 32ull >
+          uint64_t(kMaxHydrostaticComponentCells));
+
+    struct Arm {
+        WaterCA::HydroLargeComponentPolicy policy;
+        int settledAt = -1;
+        int nearCorner = -1, farCorner = -1;
+        bool gaveUp = false;
+        uint64_t streamed = 0;
+    };
+    Arm arms[2] = {{WaterCA::HydroLargeComponentPolicy::kDeferOverCap},
+                   {WaterCA::HydroLargeComponentPolicy::kLevelStreaming}};
+
+    for (Arm& a : arms) {
+        WaterCA ca(walled);
+        ca.setHydroLargeComponentPolicy(a.policy);
+        ca.addWater(3, 3, 30, 4000000); // one corner, high up
+        const uint64_t total = ca.totalVolume();
+        CHECK_EQ(total, uint64_t(4000000));
+        // 400 ticks: the v5 arm settles at 16, and the v4 arm is still a mound
+        // at 3,000 (measured) -- 400 is far past the point the two separate.
+        for (int t = 0; t < 400; ++t) {
+            ca.step();
+            // EXACT: integer equality, never a tolerance. Levelling an over-cap
+            // component that dropped or invented a single fill unit would be
+            // strictly worse than the deferral it replaces. The ledger is
+            // checked every tick; the independent re-sum walks every stored
+            // brick, so it is checked every 16th to keep this test's cost
+            // proportional to what it is measuring.
+            CHECK_EQ(ca.totalVolume(), total);
+            if (t % 16 == 0) CHECK_EQ(ca.recomputeVolume(), total);
+            if (ca.steppedBrickCount() == 0) { a.settledAt = t; break; }
+        }
+        CHECK_EQ(ca.recomputeVolume(), total);
+        auto topWet = [&ca](int64_t x, int64_t y) {
+            for (int64_t z = 40; z >= 0; --z)
+                if (ca.fillAt(x, y, z) > 0) return int(z);
+            return -1;
+        };
+        a.nearCorner = topWet(1, 1);   // beside where it was poured
+        a.farCorner = topWet(62, 62);  // diagonally opposite
+        a.gaveUp = ca.hydroGaveUp();
+        a.streamed = ca.hydroStreamedComponents();
+        std::printf("  [closed basin] %-9s settledAt=%-6d surface near=%d far=%d  gaveUp=%d "
+                    "streamed=%llu\n",
+                    a.policy == WaterCA::HydroLargeComponentPolicy::kDeferOverCap ? "v4 defer"
+                                                                                  : "v5 stream",
+                    a.settledAt, a.nearCorner, a.farCorner, int(a.gaveUp),
+                    (unsigned long long)a.streamed);
     }
 
-    // And the damning relation: the fill tracks the CEILING, linearly, instead
-    // of converging on the datum. Twice the ceiling, twice the water in the
-    // room — because every drop that got in is still sitting where it landed.
-    CHECK(arms[1].filled > arms[0].filled);
-    const uint64_t lo = arms[0].filled, hi = arms[1].filled;
-    CHECK(hi >= lo * 15 / 10); // ~2x, generously bracketed
-    CHECK(hi <= lo * 25 / 10);
+    const Arm& v4 = arms[0];
+    const Arm& v5 = arms[1];
+
+    // v4: a permanent mound. It never settles, and the surface is nowhere near
+    // level -- the near corner stands many voxels above the far one, forever.
+    CHECK_EQ(v4.settledAt, -1);
+    CHECK(v4.gaveUp);
+    CHECK(v4.nearCorner > v4.farCorner + 8);
+
+    // v5: settles, quickly, and FLAT. Same water, same basin, same ticks.
+    CHECK(v5.settledAt >= 0);
+    CHECK(v5.settledAt < 100);
+    CHECK(!v5.gaveUp);
+    CHECK(v5.streamed > 0);
+    // The surface is level to the voxel at opposite corners of a 64x64 basin.
+    // This is the assertion the whole change exists to make true.
+    CHECK_EQ(v5.nearCorner, v5.farCorner);
+}
+
+// VOLUME CONSERVATION ON THE STREAMING PATH, as exact integer equality and at a
+// scale where a rounding shortcut would actually pay: a genuinely over-cap
+// component, levelled, checked every tick against an independent re-sum.
+//
+// Deliberately separate from the digest equivalence tests elsewhere. A digest
+// match proves the two paths agree; it does not prove EITHER is conservative.
+// This one would still fail if both paths lost the same unit.
+VXC_TEST(waterca_over_cap_levelling_conserves_volume_to_the_unit) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kOverCapBreach));
+    WaterCA ca(mob.makeSolidFn());
+    mob.setMobilizedCeiling(64);
+    mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 256); });
+    openTheBreach(mob, ca, plugOpen, kOverCapBreach);
+
+    for (int i = 1; i <= 200; ++i) {
+        mob.advanceFront(ca);
+        const uint64_t before = ca.totalVolume();
+        ca.step();
+        // A tick moves water in exactly two ways: the mobilizer credits units
+        // in (which happens above, before the step), and step() redistributes.
+        // step() itself is a pure redistribution -- Phase READ/APPLY moves,
+        // Phase C levels -- so the ledger may not move across it AT ALL.
+        CHECK_EQ(ca.totalVolume(), before);
+        if (i % 16 == 0) CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+        CHECK_EQ(mob.shortfallVolume(), uint64_t(0));
+    }
+    CHECK_EQ(ca.recomputeVolume(), ca.totalVolume());
+    // ...and it really was the over-cap path doing the work, not a scenario
+    // that quietly stayed small.
+    CHECK(ca.hydroStreamedComponents() > 0);
+    CHECK(ca.hydroLargestStreamedCells() > uint64_t(kMaxHydrostaticComponentCells));
+    CHECK(!ca.hydroGaveUp());
+}
+
+// THE DEFERRAL RECORD SURVIVES A SAVE. The sticky half of the reporting exists
+// because a deferred component goes quiet, so the per-tick counters are back to
+// zero long before anyone asks -- and a RELOAD cannot re-derive it, for the same
+// reason: nothing will ever tick that body again. If the record did not go in
+// the blob, the next session would open a world with water parked below its own
+// equilibrium and no way at all to know.
+VXC_TEST(waterca_deferral_record_survives_save_and_load) {
+    auto plugOpen = std::make_shared<bool>(false);
+    WaterMobilizer mob(seaWater(), seaTerrain(plugOpen, kOverCapBreach));
+    WaterCA ca(mob.makeSolidFn());
+    ca.setHydroLargeComponentPolicy(WaterCA::HydroLargeComponentPolicy::kDeferOverCap);
+    mob.setMobilizedCeiling(64);
+    mob.setCeilingRelief([&] { mob.demoteBudgeted(ca, 256); });
+    openTheBreach(mob, ca, plugOpen, kOverCapBreach);
+    for (int i = 1; i <= 120; ++i) {
+        mob.advanceFront(ca);
+        ca.step();
+        mob.demoteBudgeted(ca, 32);
+    }
+    CHECK(ca.hydroGaveUp());
+    CHECK(ca.worstDeferral().cells > uint64_t(kMaxHydrostaticComponentCells));
+
+    std::vector<uint8_t> blob;
+    WaterState::serialize(ca, mob, blob);
+
+    auto plug2 = std::make_shared<bool>(false);
+    WaterMobilizer m2(seaWater(), seaTerrain(plug2, kOverCapBreach));
+    WaterCA c2(m2.makeSolidFn());
+    CHECK(WaterState::load(blob.data(), blob.size(), c2, m2));
+
+    CHECK(c2.hydroGaveUp());
+    CHECK_EQ(c2.hydroDeferralEvents(), ca.hydroDeferralEvents());
+    CHECK_EQ(c2.worstDeferral().cells, ca.worstDeferral().cells);
+    CHECK_EQ(c2.worstDeferral().volume, ca.worstDeferral().volume);
+    // The seed voxel too: a count with no coordinate is a number nobody can go
+    // and look at, which is most of why the profile counter was not enough.
+    CHECK_EQ(c2.worstDeferral().seedX, ca.worstDeferral().seedX);
+    CHECK_EQ(c2.worstDeferral().seedY, ca.worstDeferral().seedY);
+    CHECK_EQ(c2.worstDeferral().seedZ, ca.worstDeferral().seedZ);
+    // The seed must be a real voxel of the deferred body -- inside the room.
+    CHECK(c2.worstDeferral().seedZ >= kRoomLoVz);
+    CHECK(c2.worstDeferral().seedZ <= kSeaSurfaceVz);
+
+    // Re-serializing the loaded state reproduces the blob byte for byte, which
+    // is the property the rest of this format already holds itself to.
+    std::vector<uint8_t> blob2;
+    WaterState::serialize(c2, m2, blob2);
+    CHECK(blob == blob2);
+
+    // And it can be cleared, for a caller that has surfaced the condition and
+    // wants to know whether it recurs.
+    c2.clearHydroDeferralRecord();
+    CHECK(!c2.hydroGaveUp());
+    CHECK_EQ(c2.worstDeferral().cells, uint64_t(0));
 }
 
 // ===========================================================================
@@ -2905,7 +3276,9 @@ VXC_TEST(waterca_state_empty_world_round_trips) {
     WaterCA ca(mob.makeSolidFn());
     std::vector<uint8_t> blob;
     WaterState::serialize(ca, mob, blob);
-    CHECK_EQ(blob.size(), size_t(44)); // 3 versions + volume + three zero counts
+    // 3 versions + volume + three zero counts (44) + the kFormatVersion 2
+    // deferral record (48: events, seed x/y/z, cells, volume).
+    CHECK_EQ(blob.size(), size_t(92));
 
     auto plug2 = std::make_shared<bool>(false);
     WaterMobilizer m2(cavernFlood(), cavernTerrain(plug2));
@@ -2971,9 +3344,10 @@ ModeStats measureBlob(const std::vector<uint8_t>& blob, const char* label) {
     st.bricks = parsed->bricks.size();
 
     // Fixed overhead: 28-byte header, 13 bytes per brick (key + mode byte),
-    // and a counted key list for the active and mobilized sets.
+    // a counted key list for the active and mobilized sets, and the
+    // 48-byte kFormatVersion 2 deferral record (waterca.h WaterState).
     const size_t overhead = 28 + 13 * st.bricks + 8 + 12 * parsed->active.size() + 8 +
-                            12 * parsed->mobilized.size();
+                            12 * parsed->mobilized.size() + 48;
     CHECK_EQ(blob.size(), overhead + st.chosenBytes);
     st.blobBytes = blob.size();
     st.denseBlobBytes = overhead + st.denseBytes;

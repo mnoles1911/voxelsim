@@ -27,12 +27,14 @@
 //   3. ITS HEAD IS THE BREACH, NOT THE DATUM. A cell pinned at 255 at
 //      z = -9 voxels is a pressure source at z = -9.
 //
-// AND ONE THING THE NEW PATH DOES NOT FIX, recorded here rather than
-// discovered later: a breach that requires water to RISE -- a tunnel punched
-// into the sea at depth with headroom above it inland -- also stops at the
-// puncture depth, for a completely different reason that belongs to the CA and
-// not to the ocean. See `breach_deep_puncture_*` for the measurement and the
-// diagnosis.
+// A FOURTH DIFFERENCE ARRIVED LATE, at kWaterCAVersion 5: a breach that
+// requires water to RISE -- a tunnel punched into the sea at depth with
+// headroom above it inland -- used to stop at the puncture depth on BOTH paths,
+// and this file used to record a diagnosis for that which was wrong. It was the
+// hydrostatic component cap, not the CA activity rule. See
+// `breach_deep_puncture_only_the_new_path_lifts_water_to_the_datum` for the
+// measurement, the corrected mechanism, and how the control that supported the
+// old story managed to move two variables at once.
 //
 // WHAT "THE OLD PATH" IS, AND WHY IT IS TRANSCRIBED HERE. Reservoir v0 lives
 // in ue-project (UVoxelWaterSubsystem::NotifyTerrainVoxelsCleared, and the
@@ -232,6 +234,53 @@ int runNewToSettle(WaterMobilizer& mob, WaterCA& ca, int budget) {
     return budget;
 }
 
+// THE SAME RUN, BOUNDED, AND ASKING THE CA'S OWN QUESTION. Two things separate
+// this from runNewToSettle, and both were forced by kWaterCAVersion 5 turning
+// Phase C on for large components. Neither is a weakening; the pair is strictly
+// more informative than the single criterion was.
+//
+// 1. A CEILING, because THIS FIXTURE'S SEA IS UNBOUNDED IN x AND y. Every brick
+//    in the datum band holds water, so the front can always find another one.
+//    Levelling a finite piece of an infinite sea lands it a hair below the
+//    datum (see the cove test's own note on the partial top), that hair changes
+//    surface cells, changed cells keep bricks active, and active bricks feed
+//    the front -- so a correctly-levelled unbounded sea mobilizes without
+//    bound. MEASURED on this fixture (vxc_hydroprobe --cove-budget): the v4
+//    deferral stops at 197 mobilized bricks and settles at tick 54; with no
+//    ceiling under v5 it is at 8,908 bricks after 300 ticks and 31,168 bricks
+//    / 2.81e9 fill units / an 11,027,232-cell component after 1,500, with the
+//    CA still stepping. That is a runaway, not a slow convergence -- so no
+//    budget increase fixes this test, only a bound. It is the handover Phase 2
+//    finding, it is the mobilizer's to bound, and the mobilized ceiling (9b) is
+//    the thing that bounds it. Through v4 the hydrostatic deferral was doing
+//    that job by accident, which is a bad reason for a test to be fast.
+//
+// 2. `activeBrickCount() == 0` RATHER THAN the front queue being empty.
+//    advanceFront deliberately leaves refused candidates queued while the
+//    ceiling is held ("Queued leftovers stay queued -- they are bounded and
+//    they are still walls"), so pendingFrontBricks() is NOT reachable-zero
+//    under a ceiling and never was. The CA's own settling is: nothing active,
+//    and Phase C did not give up on anything -- which is exactly the pair
+//    waterca.h's "settled vs gave up" tells callers to use, so a test that
+//    checks it is checking the shipping contract.
+int runNewToCaSettle(WaterMobilizer& mob, WaterCA& ca, int budget, size_t ceiling = 256) {
+    mob.setMobilizedCeiling(ceiling);
+    for (int t = 0; t < budget; ++t) {
+        mob.advanceFront(ca);
+        ca.step();
+        CHECK_EQ(mob.shortfallVolume(), uint64_t{0});
+        // NOTE what is deliberately NOT asserted here: that Phase C did not
+        // give up. "Nothing active" and "nothing deferred" are two separate
+        // questions and this helper answers only the first -- the v4 arm of
+        // breach_deep_puncture exists precisely to reach zero active bricks
+        // WITH a deferral outstanding, so a helper that refused to return in
+        // that state could not measure the failure it was written to expose.
+        // Each caller asserts hydroGaveUp() for itself.
+        if (t > 3 && ca.activeBrickCount() == 0) return t;
+    }
+    return budget;
+}
+
 int runOldToSettle(ReservoirV0& res, WaterCA& ca, int budget) {
     for (int t = 0; t < budget; ++t) {
         res.topUp(ca);
@@ -332,7 +381,9 @@ VXC_TEST(breach_cove_ocean_term_fills_to_the_datum_and_settles) {
     w.dig(kCoveDig);
     invalidateAll(ca);
     mob.mobilizeEditRegion(ca, 0, 0, kSeaFloorVz, 3, 3, 12);
-    const int settled = runNewToSettle(mob, ca, kBudget);
+    // Bounded, and asking the CA whether IT is done -- see runNewToCaSettle for
+    // why both halves of that changed at kWaterCAVersion 5.
+    const int settled = runNewToCaSettle(mob, ca, kBudget);
 
     const int topFill = int(ca.fillAt(1, 1, kSeaTopVz));
     std::printf("  [cove/new] settled at tick %d, %zu brick(s) mobilized, %llu fill units, "
@@ -342,6 +393,7 @@ VXC_TEST(breach_cove_ocean_term_fills_to_the_datum_and_settles) {
                 (255 - topFill) * kVoxelSizeMm / 255);
 
     CHECK(settled < kBudget);                      // it SETTLES, which the old path never does
+    CHECK(!ca.hydroGaveUp());                      // ...and it is really settled, not deferred
     CHECK_EQ(topWetVz(ca, kCoveProbe), int(kSeaTopVz));  // ...at the sea's own surface voxel
     CHECK_EQ(mob.shortfallVolume(), uint64_t{0});
     // Full to one voxel below the datum, nothing above it, and the surface
@@ -352,7 +404,7 @@ VXC_TEST(breach_cove_ocean_term_fills_to_the_datum_and_settles) {
     // piece of an infinite sea, so filling the cove draws its volume from that
     // piece and the equalized level lands a fraction of a voxel below the
     // datum -- the whole mobilized body drops, exactly as a real bay would if
-    // the ocean it drew from were only 197 bricks wide. The deficit is
+    // the ocean it drew from were only a couple of hundred bricks wide. The deficit is
     // bounded by (cove volume / mobilized volume) and shrinks as the front
     // mobilizes more sea; it is a few centimetres here. What must NOT happen
     // is the surface landing a whole voxel low, which would read as a step at
@@ -393,7 +445,18 @@ VXC_TEST(reservoir_v0_pours_into_a_dry_seabed_and_never_settles) {
 
     uint64_t volAt[3] = {0, 0, 0};
     size_t activeAt[3] = {0, 0, 0};
-    const int kMarks[3] = {100, 500, 1500};
+    // 1500 -> 600, and the reason is a real measurement rather than impatience.
+    // Reservoir v0 is a SOURCE feeding an unwalled seabed, so its puddle grows
+    // without bound; at kWaterCAVersion 5 Phase C now LEVELS that puddle every
+    // tick instead of deferring it (it is far over
+    // kMaxHydrostaticComponentCells), which is correct and is also real work
+    // proportional to a body that is getting bigger every tick. Timed on this
+    // suite: 21.8 s under the v4 deferral, 196-245 s at v5, for a test whose
+    // whole finding is "this retired mechanism never settles". 600 ticks
+    // (a minute at the subsystem'''s 10 Hz) demonstrates that just as
+    // conclusively -- volume and active bricks still strictly climbing at the
+    // last mark -- and the assertions below are unchanged.
+    const int kMarks[3] = {100, 300, 600};
     int mark = 0;
     for (int t = 0; t <= kMarks[2]; ++t) {
         res.topUp(ca);
@@ -412,7 +475,7 @@ VXC_TEST(reservoir_v0_pours_into_a_dry_seabed_and_never_settles) {
 
     CHECK(seeded > 0);  // it did find the breach; this is not a null run
     // IT IS A SOURCE, not a body: volume strictly increases between every pair
-    // of marks, 1500 ticks (2.5 minutes at the subsystem's 10 Hz) in.
+    // of marks, 600 ticks (a minute at the subsystem's 10 Hz) in.
     CHECK(volAt[1] > volAt[0]);
     CHECK(volAt[2] > volAt[1]);
     // ...and the CA's own cost driver grows with it. This is the half of the
@@ -424,7 +487,7 @@ VXC_TEST(reservoir_v0_pours_into_a_dry_seabed_and_never_settles) {
 }
 
 // ===========================================================================
-// THE DEEP PUNCTURE: what the new path does NOT fix
+// THE DEEP PUNCTURE: the old path cannot lift, the new path now can
 // ===========================================================================
 //
 // A 1x1 tunnel driven inland at z = -9 (one voxel above the sea floor) that
@@ -432,29 +495,45 @@ VXC_TEST(reservoir_v0_pours_into_a_dry_seabed_and_never_settles) {
 // through the land surface. Communicating vessels: the shaft should stand at
 // the sea's surface, z = -1.
 //
-// NEITHER MECHANISM RAISES IT, and the reasons are different:
-//
 //   old   its source is a cell pinned at 255 at z = -9, so it is a head at
 //         z = -9 and there is no pressure to lift anything above the tunnel.
-//   new   the mobilized sea is already AT hydrostatic equilibrium -- every
-//         cell full to the datum, nothing to redistribute -- so it goes
-//         inactive within a few ticks, and waterca.h's Phase C explores new
-//         (previously dry) headroom only through bricks in the ACTIVE set.
-//         With no active brick beside the shaft, nothing ever notices the
-//         headroom exists.
+//         Still true, still asserted below, and unfixable without abandoning
+//         the mechanism -- which is what item 8 did.
+//   new   NOW REACHES THE DATUM (z = -1) at kWaterCAVersion 5.
 //
-// THE DIAGNOSIS IS NOT A GUESS: the same dig against a sea small enough that
-// the tunnel's own volume perturbs its level -- so the sea stays active for a
-// few more ticks -- DOES raise the shaft to the datum. Measured on a 64x65
-// voxel sea: shaft top wet z=-1, settled at tick 8. Against an unbounded sea:
-// z=-9, settled at tick 5. Raising the mobilization front budget from 64 to
-// 4096 bricks/tick changes nothing, so it is not front starvation.
+// THE DIAGNOSIS THIS TEST USED TO CARRY WAS WRONG, and it is worth reading how,
+// because the control that "proved" it was varying the wrong thing.
 //
-// This belongs to work item 10 (the CA's activity/budget half), not to item 8,
-// and it is recorded here so that the next person to look at a half-full
-// tunnel finds a measurement instead of a mystery.
+// It said: the mobilized sea is already at hydrostatic equilibrium, so it goes
+// inactive within a few ticks, and Phase C explores previously-dry headroom
+// only through bricks in the ACTIVE set -- with no active brick beside the
+// shaft, nothing ever notices the headroom exists. Its evidence was that the
+// same dig against a sea "small enough that the tunnel's own volume perturbs
+// its level" DOES raise the shaft to the datum (measured z = -1, settled tick
+// 8), while an unbounded sea stops at z = -9.
+//
+// The real mechanism was `kMaxHydrostaticComponentCells`. Sea plus tunnel plus
+// shaft is one connected component and it is far over the cap, so through v4
+// Phase C declined to level it AT ALL -- it emitted no writes, which is also
+// precisely why the body went inactive. The "small sea" control did not isolate
+// activity; a small sea is a SMALL COMPONENT, i.e. one under the cap, so what
+// that control actually varied was whether Phase C ran. Both observations are
+// explained by the cap, and the activity story explained the control only by
+// coincidence. At v5 the unbounded sea reaches the datum too, with no change to
+// the activity rule whatsoever.
+//
+// This is the same shape as every other wrong turn recorded in this file: a
+// plausible mechanism, a control that moved two variables at once, and a number
+// that fitted both. It is left here in full rather than deleted because the
+// next person to write "the diagnosis is not a guess" should read what that
+// sentence was attached to last time.
+//
+// docs/water-handover-2026-08-04.md §6 lists this as open item #55 ("rising
+// breach -- a breach needing water to RISE stops at the puncture depth...
+// Not a budget problem: 64x the front budget changed nothing"). The front
+// budget was indeed not it. The cap was.
 
-VXC_TEST(breach_deep_puncture_neither_path_lifts_water_above_the_puncture) {
+VXC_TEST(breach_deep_puncture_only_the_new_path_lifts_water_to_the_datum) {
     std::vector<Voxel> dig = box(0, 5, 0, 0, -9, -9);
     const std::vector<Voxel> up = box(5, 5, 0, 0, -8, 12);
     dig.insert(dig.end(), up.begin(), up.end());
@@ -475,22 +554,43 @@ VXC_TEST(breach_deep_puncture_neither_path_lifts_water_above_the_puncture) {
     wn.dig(dig);
     invalidateAll(can);
     mob.mobilizeEditRegion(can, 0, 0, -9, 5, 0, 12);
-    const int settled = runNewToSettle(mob, can, kBudget);
+    const int settled = runNewToCaSettle(mob, can, kBudget);
     const int newTop = topWetVz(can, probe);
 
-    std::printf("  [deep puncture] reservoir v0 top wet z=%d; ocean term top wet z=%d "
-                "(settled tick %d, %zu brick(s) mobilized); datum z=%d -- NEITHER reaches it\n",
-                oldTop, newTop, settled, mob.mobilizedBricks().size(), int(kSeaTopVz));
+    // The v4 arm, run on the same fixture in the same test, so the claim above
+    // is a measurement in this file and not a story about one.
+    CoastWorld w4;
+    WaterMobilizer mob4(oceanImplicit(w4, kOceanOn), w4.solidFn());
+    WaterCA ca4(mob4.makeSolidFn());
+    ca4.setHydroLargeComponentPolicy(WaterCA::HydroLargeComponentPolicy::kDeferOverCap);
+    w4.dig(dig);
+    invalidateAll(ca4);
+    mob4.mobilizeEditRegion(ca4, 0, 0, -9, 5, 0, 12);
+    const int settled4 = runNewToCaSettle(mob4, ca4, kBudget);
+    const int top4 = topWetVz(ca4, probe);
 
-    // Both stop at the puncture depth. Asserted rather than described so that
-    // a future change to the CA's activity rule -- which is what would fix
-    // this -- fails here loudly and gets this comment updated.
+    std::printf("  [deep puncture] reservoir v0 top wet z=%d; ocean term v4(defer) z=%d "
+                "(tick %d, gaveUp=%d); ocean term v5(stream) z=%d (tick %d, %zu brick(s)); "
+                "datum z=%d\n",
+                oldTop, top4, settled4, int(ca4.hydroGaveUp()), newTop, settled,
+                mob.mobilizedBricks().size(), int(kSeaTopVz));
+
+    // The old path stops at the puncture depth, and always will: its head IS
+    // the pinned breach cell.
     CHECK_EQ(oldTop, -9);
-    CHECK_EQ(newTop, -9);
-    // What the new path DOES get right even here: it settles, and its ledger
-    // balances. The old path is still running.
+    // v4 stops there too -- and reports itself settled while doing it, which is
+    // the failure mode the deferral reporting exists to make visible.
+    CHECK_EQ(top4, -9);
+    CHECK(ca4.hydroGaveUp());
+    // v5 lifts it the full 8 voxels to the sea's own surface.
+    CHECK_EQ(newTop, int(kSeaTopVz));
+    CHECK(!can.hydroGaveUp());
+    CHECK(can.hydroStreamedComponents() > 0);
+    // Both new-path arms settle and both ledgers balance; only the answer moved.
     CHECK(settled < kBudget);
+    CHECK(settled4 < kBudget);
     CHECK_EQ(mob.shortfallVolume(), uint64_t{0});
+    CHECK_EQ(mob4.shortfallVolume(), uint64_t{0});
 }
 
 // ===========================================================================

@@ -378,14 +378,34 @@ tile in that cache is `bake_ver 7` with no water plane.
   and what must not be re-litigated.
 - **#52 slicing**, scoped above. The only open unknown is whether the transport
   supports byte ranges.
-- **#55 rising breach** — a breach needing water to *rise* stops at the puncture
-  depth, because the mobilized sea is at equilibrium and therefore inactive, and
-  Phase C explores dry headroom only through active bricks. Not a budget
-  problem: 64× the front budget changed nothing.
-- **A reservoir over 65,536 cells never levels** (`waterca.cpp:108`, tripped at
-  `:1065`, acted on at `:1180`; the count **includes air**, so it bites sooner
-  than 65.5 m³ suggests). The real blockers are *splits* (union-find merges but
-  never deletes) and *the visited obligation* (per-body per-brick mask state).
+- **#55 rising breach — CLOSED, and the recorded diagnosis was wrong.** It was
+  never the CA activity rule. Sea + tunnel + shaft is one component far over the
+  hydrostatic cap, so Phase C declined to level it at all — which is also why
+  the body went inactive. The "small sea does reach the datum" control varied
+  two things at once: a small sea is a small *component*, i.e. one under the
+  cap. The note that 64× the front budget changed nothing was correct and
+  consistent. At `kWaterCAVersion` 5 the unbounded sea reaches the datum
+  (z −9 → −1). See `docs/measurements/hydrostatic-cap-2026-08-04.txt` §7.
+- **A reservoir over 65,536 cells never levels — FIXED at `kWaterCAVersion` 5.**
+  The cap is now a path selector, not a give-up threshold: over it, the same
+  bottom-up allocation is computed from a per-brick membership mask and a z
+  histogram, with no cell list and no sort, and refused outright unless the sum
+  of its targets equals `totalVol` as exact integers. Two things in the old
+  note are worth correcting for anyone who reads it in an archive. **The cap
+  never bounded the flood** — it stopped *recording* at the cap and kept
+  walking, so 99% of flood pops on a 4×-over breach were spent on discarded
+  answers. And **the two "real blockers" (splits, the visited obligation) gate
+  ADR-0003's option B, not correctness**: there is no union-find in the
+  codebase, the pass re-floods every tick, and the per-brick visited masks
+  already exist — so it already held the exact cell set and volume at the moment
+  it discarded them. Observability shipped with it and is always compiled:
+  `hydroGaveUp()`, `worstDeferral()`, both persisted in the water blob. **The
+  test for "the water is done" is now
+  `activeBrickCount() == 0 && !hydroGaveUp()`.** One consequence to design
+  around: correct levelling of an *unbounded* implicit sea does not terminate
+  (300 → 1500 ticks takes the cove from 8,908 to 31,168 mobilized bricks), so
+  the mobilized ceiling (9b) is no longer optional — the deferral was bounding
+  that runaway by accident.
 - **#58 MSVC** — `NOMINMAX` added to `bankprobe.cpp` and `riverribbonprobe.cpp`,
   **not verified**: there is no Visual Studio on this box. Three of five bench
   tools include `windows.h` and only the two written after the first breakage

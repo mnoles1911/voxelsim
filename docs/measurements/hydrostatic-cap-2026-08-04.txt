@@ -1,0 +1,180 @@
+kMaxHydrostaticComponentCells -- what it bounded, what it cost, what replaced it
+================================================================================
+Taken 2026-08-04 on claude/water-hydro-cap (branched from claude/water-return-wire).
+Tool: voxel-core/bench/hydroprobe.cpp (vxc_hydroprobe), plus per-test timings from
+vxc_tests. Profile lines need -DVXC_WATER_PROFILE=ON; everything else is a
+stock Release build.
+
+Baselines on the parent branch, re-measured before any change:
+    ctest -C Release      2/2 passed, 181 s
+    vxc_tests             427 cases, 0 failures
+
+
+1. THE CAP DID NOT BOUND THE FLOOD
+----------------------------------
+The flood does not stop at the cap. It stops RECORDING at the cap
+(`if (!overflowed) cells.push_back(...)`) and keeps walking the whole
+component. Measured on a 128x128x16 room (262,144 cells, 4x the cap) breached
+from an unbounded implicit sea, 300 ticks, ceiling 64, kWaterCAVersion 4:
+
+    hydroComponents      334
+    hydroOverflowed      287        (85% of all components)
+    hydroPops            74,103,006
+    hydroPopsOverflowed  73,463,796 (99.1% of all pops)
+    mean deferred component walked 255,971 cells = 3.9x the cap
+
+99% of every flood pop in that run was spent inside a component whose answer
+was then thrown away. The traversal -- which IS the cost of Phase C -- was paid
+in full. What the cap actually bought was the `cells` vector, its O(n log n)
+sort, and the level allocation. Nothing else.
+
+Corollary that mattered for the design: correctness here was never expensive.
+The pass already knew the exact cell set and (once the truncation bug below was
+fixed) the exact totalVol of an over-cap component at the moment it discarded
+them.
+
+A LATENT BUG found on the way: `totalVol` stopped accumulating the instant the
+cap tripped, because it lived inside the same `if (!overflowed)`. Harmless only
+because the value was then discarded; it would have silently destroyed volume
+the moment anyone tried to use it. Fixed.
+
+
+2. THE FAILURE MODE
+-------------------
+An over-cap component emits no writes -> no bricks change -> the whole body
+falls out of the active set -> the CA reports ZERO ACTIVE BRICKS. Every caller
+reads that as settled. Measured, closed 64x64x32 walled basin (131,072 cells,
+2x the cap), 4,000,000 fill units poured into one corner, no mobilizer at all:
+
+    policy      settles at   surface near corner   surface far corner
+    v4 defer    never (3000) z = 24                z = 1
+    v5 stream   tick 16      z = 3                 z = 3
+
+v4 leaves a 23-voxel mound over the pour point that never levels and never
+reports a problem. Both arms conserve the ledger exactly throughout; this was
+never a leak, only a wrong answer.
+
+The only instrument for this before was WaterCAProfile::hydroOverflowed, which
+needs -DVXC_WATER_PROFILE=ON and therefore does not exist in any shipping build.
+
+
+3. THE TWO ADR-0003 BLOCKERS DO NOT GATE CORRECTNESS
+----------------------------------------------------
+Verified against the code, not taken on faith.
+
+  * SPLITS ("union-find merges but never deletes"). THERE IS NO UNION-FIND IN
+    THIS CODEBASE. `grep -rn "union|find_root|bodyId|WaterBody" src/ include/`
+    returns only prose. hydrostaticPass re-floods from scratch every tick over a
+    per-tick `cache` of BrickCells whose `visited` masks are destroyed when the
+    call returns.
+  * THE VISITED OBLIGATION ("per-body, per-brick mask state"). Already present
+    and already per-tick: BrickCell carries `std::array<uint64_t,8> visited`,
+    rebuilt every call.
+
+Both are blockers for ADR-0003 OPTION B -- the persistent per-body structure
+that lets a settled body be SKIPPED across ticks. They are statements about
+avoiding work. They say nothing about computing a correct level for a component
+the flood is walking anyway. Option B remains deferred on ADR-0003's own
+evidence; it was never what stood between this pass and a correct answer.
+
+
+4. WHAT REPLACED IT
+-------------------
+The cap is now a PATH SELECTOR (kWaterCAVersion 5).
+
+  at or under 65,536 cells: unchanged from v4, literally the same code.
+  over:                     the same bottom-up allocation computed without
+                            materializing or sorting the cell list.
+
+A layer's target depends only on how many component cells share its z, so the
+flood accumulates a per-brick 512-bit MEMBERSHIP mask beside the `visited` mask
+it already keeps, and the level is read off a z histogram built from 8 popcounts
+per brick (word w of the mask IS z-layer w, because cellIndex = x + 8y + 64z).
+Memory is 64 B/brick, ~0.125 B/cell, against 16 B/cell for a FloodCell -- two
+orders of magnitude smaller -- and there is no sort at all. Only the partial
+surface layer needs a within-layer (x,y) order, and that is an nth_element to
+find the rank-`rem` coordinate, which becomes an O(1) threshold compare.
+
+CONSERVATION is checked in closed form before anything is written:
+    255*cellsBelow + base*partialN + rem  ==  totalVol
+as exact integer equality, no tolerance. A plan that fails it is REFUSED and the
+component is deferred and recorded, so a wrong predicate can only decline to
+act, never create or destroy water.
+
+EQUIVALENCE is pinned, not asserted. setHydroLargeComponentThreshold(1) forces
+every component down the streaming path; both goldens re-derive byte-identically
+(0x3D2224BE4A253404, 0x56BC18914355A205), and a threshold sweep over
+{1,2,511,512,513,65535,65536,65537} produces one digest.
+
+
+5. COST
+-------
+It is NOT uniformly more expensive. On the scenario the cap was written for it
+is dramatically cheaper, because the body settles instead of thrashing.
+
+Over-cap breach, 128x128x16 room, ceiling 64, 300 ticks:
+
+                        v4 defer        v5 stream
+    hydroPops           74,103,006      1,951,132     (38x fewer)
+    activeBricks @300   832             0
+    CA quiet at         never           tick 22
+
+Where it IS more expensive is a body that is genuinely large AND genuinely out
+of equilibrium every tick, because that is real levelling work v4 skipped:
+
+    reservoir_v0_pours_into_a_dry_seabed_and_never_settles   21.8 s -> 196-245 s
+    waterca_open_sea_breach_spreads_without_bound            <20 s  -> 78 s
+
+Both are deliberate unbounded-runaway scenarios; the first exercises a RETIRED
+mechanism. Its tick marks were cut 1500 -> 600 (the finding is unchanged: volume
+and active bricks still strictly climbing at the last mark). Suite after:
+
+    vxc_tests   432 cases, 0 failures, 213 s   (was 427 / 181 s)
+
+A settled body costs almost nothing: the apply pass reads each brick once and
+compares a byte per cell, and issues zero writes.
+
+
+6. THE RUNAWAY THIS EXPOSES, AND IT IS NOT OURS
+-----------------------------------------------
+Correct levelling of an UNBOUNDED implicit sea does not terminate. Mobilizing a
+brick adds sea at 255 into a body whose equilibrium is a hair below the datum;
+Phase C re-levels; the surface changes; changed bricks stay active; active
+bricks feed advanceFront; repeat. Measured on the test_ocean cove fixture with
+no mobilized ceiling:
+
+    ticks   mobilized bricks   volume          largest component
+    v4       (settles at 54)   197             17,103,360      -
+    v5 300                     8,908           775,950,720     3,072,800 cells
+    v5 1500                    31,168          2,810,336,640   11,027,232 cells
+
+That is a runaway, not slow convergence -- no budget increase reaches a settled
+state. Through v4 the hydrostatic deferral was bounding it BY ACCIDENT. It is
+docs/water-handover-2026-08-04.md's Phase 2 finding, it is the mobilizer's to
+bound, and the mobilized ceiling (9b) is what bounds it. The two ocean tests
+that relied on the accident now set a ceiling.
+
+Note also that `pendingFrontBricks() == 0` is not a reachable settling condition
+under a ceiling and never was: advanceFront deliberately leaves refused
+candidates queued while the ceiling is held. The CA's own settling test is
+`activeBrickCount() == 0 && !hydroGaveUp()`.
+
+
+7. THE CORRECTED DIAGNOSIS FOR HANDOVER ITEM #55
+------------------------------------------------
+"A breach needing water to RISE stops at the puncture depth" was attributed to
+the CA's activity rule: the mobilized sea reaches equilibrium, goes inactive,
+and Phase C explores previously-dry headroom only through ACTIVE bricks. Its
+evidence was that the same dig against a SMALL sea does reach the datum.
+
+That was wrong, and the control moved two variables at once. A small sea is a
+SMALL COMPONENT -- one under the cap -- so what the control actually varied was
+whether Phase C ran at all. The cap explains both observations; the activity
+story explained the control by coincidence. Measured now on the unbounded sea:
+
+    reservoir v0        top wet z = -9   (unfixable: its head IS the breach cell)
+    ocean term, v4      top wet z = -9,  reports itself settled, hydroGaveUp()
+    ocean term, v5      top wet z = -1   == the datum
+
+The recorded note that "64x the front budget changed nothing" was correct and is
+consistent: the front was never the constraint.
