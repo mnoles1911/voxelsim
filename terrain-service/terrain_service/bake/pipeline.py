@@ -358,8 +358,28 @@ __all__ = [
 #: longest reach of 1,113 m on a four-tile corridor -- see the constants
 #: themselves for the apportionment and
 #: ``docs/measurements/river-drawable-and-concentration-2026-08-04.txt``.
+#:
+#: bake_ver 12 -- the two halves bake_ver 11 left open, both PRODUCT changes on
+#: the same argument and checked the same way (``as_payload``, ``mfd_p``,
+#: ``STAGE_ORDER`` and the area field are untouched, so ``A^m`` reads what it
+#: read before):
+#:
+#:   * ``water_pyramid_single_receiver`` -- the PYRAMID's discharge sweep goes
+#:     single-receiver too, so the boundary condition a fine tile receives is
+#:     concentrated the same way the field it computes from that boundary is.
+#:     With the two disagreeing, a river arrived at a seam as a fan: measured on
+#:     (-11,-5)/(-11,-6), the same 8.6e7 m^3/yr crossed either way (D8/MFD =
+#:     0.99 on the total) but MFD's largest single crossing held 8.66e6 against
+#:     D8's 2.02e7, and the downstream tile read 3.05% of the upstream trunk at
+#:     the crossing column, under a cut it then failed. 35 of 36 raw components
+#:     ended within one pixel of a tile edge before this.
+#:   * ``water_width_from_law`` -- ``channel_width_m(Q)`` decides the drawn
+#:     extent the way ``water_depth_m(Q)`` already decides depth, clamped to
+#:     ground below the reach's own surface. bake_ver 11's plane drew a
+#:     centreline: 99.21% of wet pixels were one 1.875 m pixel against a law
+#:     width of 3.53 m at p50.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 11
+BAKE_VERSION = 12
 
 
 @dataclass(frozen=True)
@@ -994,6 +1014,72 @@ class BakeConstants:
     #:
     #: False reproduces the bake_ver 10 water pass exactly.
     water_flow_single_receiver: bool = True
+    #: Route the PYRAMID's discharge sweep single-receiver too (bake_ver 12).
+    #:
+    #: THE SAME CHANGE AS ``water_flow_single_receiver``, ONE TIER UP, and it
+    #: exists because leaving the two disagreeing is what broke the river at a
+    #: tile seam. ``build_flow_superblock`` accumulates ``q`` at 30 m with MFD
+    #: while B6 accumulates it at 1.875 m with D8, so the boundary condition a
+    #: fine tile receives is dispersed and the field it computes from that
+    #: boundary is concentrated. ``acc`` -- the AREA field, which decides every
+    #: height -- stays MFD at ``mfd_p`` at every level. This reaches ``q`` and
+    #: nothing else, which is why it is a PRODUCT field.
+    #:
+    #: WHAT THE DEFECT ACTUALLY WAS, measured on the (-11,-5)/(-11,-6) seam
+    #: before this existed, because the obvious reading is wrong. The total
+    #: water crossing into the downstream tile's padded domain was NOT short:
+    #: 8.63e7 m^3/yr under MFD against 8.51e7 under D8, a ratio of 0.99. What
+    #: differed was how it was spread. MFD delivered it through 832 crossings
+    #: whose largest single cell held 8.66e6; D8 delivers the same total with a
+    #: largest cell of 2.02e7. At the seam row the coarse trunk under MFD is
+    #: split 9.50e6 / 7.08e6 / 2.29e6 across three adjacent columns, while D8
+    #: puts 2.11e7 in one -- against the 2.35e7 the upstream FINE tile carries
+    #: 180 m away. A threshold consumer cannot use a fan: the downstream tile
+    #: read 7.18e5 at the crossing column, 3.05% of what arrived, against a
+    #: 1.53e6 cut. That is the 6.66 km the longest reach stopped short by.
+    #:
+    #: WHY NOT A WIDER APRON OR A DIFFERENT ENTRY MODE. Neither addresses it.
+    #: The apron already carries the water 960 m before the interior begins and
+    #: the loss is not attenuation, it is division; ``ENTRY_FOOTPRINT`` vs
+    #: ``ENTRY_CROSSING`` moves WHERE one crossing lands and both pick exactly
+    #: one cell per crossing, so neither changes how much any single cell holds.
+    #: And the entry mode is shared with the AREA currency, so touching it would
+    #: move the ground.
+    #:
+    #: False reproduces the bake_ver 11 pyramid exactly.
+    water_pyramid_single_receiver: bool = True
+    #: Let ``channel_width_m(Q)`` decide the drawn EXTENT the way
+    #: ``water_depth_m(Q)`` already decides depth (bake_ver 12).
+    #:
+    #: WHY IT IS NEEDED. ``water_flow_single_receiver`` made the plane a
+    #: CENTRELINE: a single-receiver forest has one-cell-wide branches by
+    #: construction, so 99.21% of wet pixels were a single 1.875 m pixel against
+    #: a law width of 3.53 m at p50. Under MFD the fan happened to widen the
+    #: ribbon and the agreement with the width law was an accident of
+    #: dispersion, not a property anything maintained. You cannot get width from
+    #: the mask alone; this reads the law directly, which is more consistent
+    #: than either previous version rather than less.
+    #:
+    #: WHAT BOUNDS IT, and both bounds are measured rather than assumed:
+    #:
+    #:   * the LAW. ``channel_width_m(Q)`` at the corridor's discharges is
+    #:     2.8-8.8 m, i.e. a half-width of 0.78-2.23 fine pixels, so the drawn
+    #:     ribbon is 1-5 px. There is no stamped band: the radius is a function
+    #:     of Q and changes continuously down a reach.
+    #:   * the TERRAIN. A widened cell is drawn only where the shipped ground
+    #:     stands below the reach's own water surface. That is not decoration:
+    #:     the far-field experiment measured 58.2% of a widened edge below drawn
+    #:     ground at 20 km when width was added in the ground plane without one.
+    #:
+    #: WHICH ONE BINDS, measured on the bv11 corridor before this was built:
+    #: the terrain allows p50 11-28 m and p90 47-163 m of lateral extent at the
+    #: drawn water level -- 90-93% of wet cells have room for the whole law
+    #: width. So the LAW does the shaping and the terrain clamp bites on the
+    #: 7-10% where it must. That is the right division of labour and it is the
+    #: opposite of what a bank-driven rule would give.
+    #:
+    #: False reproduces the bake_ver 11 centreline exactly.
+    water_width_from_law: bool = True
     #: Write the water plane at all. False reproduces a bake_ver-8 tile's
     #: sections exactly (no SECTION_WATER_*, flag clear), which is what the
     #: terrain-identity gate bakes against.
@@ -1164,6 +1250,8 @@ class BakeConstants:
         "water_q_perennial_m3_yr",
         "water_min_width_px",
         "water_flow_single_receiver",
+        "water_pyramid_single_receiver",
+        "water_width_from_law",
         "water_plane_enabled",
     )
 
@@ -2090,6 +2178,15 @@ def superblock_inputs_fingerprint(
                 # setting none of them used. Absent means ENTRY_FOOTPRINT, which
                 # is what every block built before 2026-08-03 did.
                 **({} if entry_mode == ENTRY_FOOTPRINT else {"entry_mode": entry_mode}),
+                # CONDITIONAL, on the same precedent and for the same reason.
+                # It decides the block's ``q`` raster, so it belongs in the
+                # provenance digest; absent means the MFD sweep, which is what
+                # every block built before bake_ver 12 did. A cached block whose
+                # digest lacks it is therefore correctly read as built from a
+                # different rule rather than silently reused with a dispersed
+                # discharge in it.
+                **({"q_single_receiver": True}
+                   if level.consts.water_pyramid_single_receiver else {}),
             },
             sort_keys=True,
         ).encode("utf-8")
@@ -2629,13 +2726,34 @@ def build_flow_superblock(
             # invented. Deliberate: fabricating runoff for ground the model has
             # never seen is the proxy this task exists to delete.
             pass
-        q = np.asarray(
-            kernels.accumulate_mfd(
-                filled, level.cell_m, p=level.consts.mfd_p,
-                source=q_src, inflow=q_in,
-            ),
-            dtype=np.float64,
-        )
+        # SINGLE-RECEIVER SINCE bake_ver 12, to match the fine tier's own water
+        # pass. See ``BakeConstants.water_pyramid_single_receiver`` for the
+        # measurement: MFD delivers the right TOTAL through the wrong number of
+        # cells, and the consumer at the far end is a threshold. ``acc`` above
+        # is untouched and stays MFD at ``mfd_p`` -- it is the area field and it
+        # decides the ground.
+        if level.consts.water_pyramid_single_receiver:
+            if kernels.accumulate_d8 is None:
+                raise RuntimeError(
+                    "water_pyramid_single_receiver is set but this BakeKernels "
+                    "has no accumulate_d8 kernel; inject flow.accumulate_d8 or "
+                    "set the constant False (which reproduces the bake_ver 11 "
+                    "pyramid)"
+                )
+            q = np.asarray(
+                kernels.accumulate_d8(
+                    filled, level.cell_m, source=q_src, inflow=q_in
+                ),
+                dtype=np.float64,
+            )
+        else:
+            q = np.asarray(
+                kernels.accumulate_mfd(
+                    filled, level.cell_m, p=level.consts.mfd_p,
+                    source=q_src, inflow=q_in,
+                ),
+                dtype=np.float64,
+            )
         del q_src, q_in
     del entries
 
@@ -4405,9 +4523,44 @@ def bake_tile(
         )
         del rec_w
 
+        # -- THE WIDTH LAW (bake_ver 12). The plane above is a CENTRELINE; this
+        # gives it the extent `channel_width_m(Q)` says it has, clamped to
+        # ground that actually stands below the reach's own water surface. See
+        # `BakeConstants.water_width_from_law` and `water.widen_to_channel_width`
+        # for the two bounds and for which of them was measured to do the
+        # shaping.
+        #
+        # ON THE PADDED DOMAIN, before the interior is cropped, so a reach that
+        # runs along a tile edge is widened from both sides of it rather than
+        # being cut in half by the crop.
+        #
+        # AGAINST `out["z"]`, THE SHIPPED SURFACE, not `z_route`. `z_route` is
+        # the pre-B5 bed the descent chain needed; the clamp is a statement
+        # about the ground the client draws the waterline against, which is the
+        # post-B5 one, and it is also the array `water_depth_control_points`
+        # takes the stored depth against. Using the routing bed here would admit
+        # cells that the encoder then reads as water below its own ground.
+        centreline_pad = np.isfinite(w_pad)
+        width_stats: dict[str, float] = {}
+        if consts.water_width_from_law:
+            w_pad, width_stats = _water.widen_to_channel_width(
+                w_pad, out["z"], q_pad, cell_m=geom.fine_pixel_m,
+                exclude=basin_keep_pad,
+                q_perennial=consts.water_q_perennial_m3_yr,
+            )
+
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])
         wet_int = np.isfinite(water_surface)
+        # THE GATE READS THE CENTRELINE, not the widened ribbon, and that is not
+        # a convenience. `overshoot_stats` asks "is the water the size its own Q
+        # says", and a widened cell's own Q is the trickle that happens to fall
+        # on it -- off-network by construction -- so including it would compare
+        # a trunk river's depth against a hillside cell's law and read as metres
+        # of overshoot that nothing overshot. The widened extent has its own
+        # numbers, in `width_stats`.
+        centre_int = np.ascontiguousarray(centreline_pad[sl, sl]) & wet_int
+        del centreline_pad
 
         # THE OVERSHOOT GATE, on the interior only -- the bytes that ship.
         # Overshoot is the failure mode with NO GEOMETRIC BACKSTOP: the bank
@@ -4439,15 +4592,32 @@ def bake_tile(
                 else 0.0
             ),
         })
-        if wet_int.any():
+        water_stats.update({f"water_{k}": v for k, v in width_stats.items()})
+        if centre_int.any():
             water_stats.update({
                 f"water_{k}": v for k, v in _water.overshoot_stats(
-                    water_surface, z, discharge, wet_int,
+                    water_surface, z, discharge, centre_int,
                     cell_m=geom.fine_pixel_m,
                     z_route_m=np.ascontiguousarray(z_route[sl, sl]),
                     q_perennial=consts.water_q_perennial_m3_yr,
                 ).items()
             })
+        if wet_int.any():
+            # The DRAWN ribbon against the law it is supposed to be following.
+            # Reported on the shipped interior, at the same percentiles as the
+            # law, so "wider than a centreline" is a number rather than a claim.
+            # Its own receiver forest, on the INTERIOR: the transect has to run
+            # perpendicular to the flow, and `rec_w` is indexed in padded flat
+            # coordinates that do not survive the crop. One 8192^2 D8 pass
+            # against a bake that already spends minutes on 9216^2.
+            rec_int, _ = kernels.d8_receivers(z, geom.fine_pixel_m)
+            drawn = _water.lateral_extent_stats(
+                water_surface, z, discharge, wet_int, rec_int,
+                cell_m=geom.fine_pixel_m,
+                q_perennial=consts.water_q_perennial_m3_yr,
+            )
+            del rec_int
+            water_stats.update({f"water_drawn_{k}": v for k, v in drawn.items()})
         del wet_pad, heads_pad, w_pad, q_pad, z_route
     del z_pre_reopen, basin_keep_pad
     out["cpu_seconds"]["B6.discharge_water"] = time.process_time() - c0
