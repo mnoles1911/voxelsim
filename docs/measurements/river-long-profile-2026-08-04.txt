@@ -1,0 +1,397 @@
+THE 20.3 KM RIVER, WALKED FROM ITS HEAD TO ITS MOUTH
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), bake_ver 12
+2026-08-04
+================================================================================
+
+The reach is the longest COMPOSED component of the bv12 corridor -- the river
+plane unioned with the 255 lake sheets, which is what CompositeWaterSampler
+draws -- identified in docs/measurements/river-seam-and-width-2026-08-04.txt
+Part 4. This document walks it in order instead of summarising it.
+
+REPRODUCING IT, and no re-bake was needed. The bv12 corridor was baked with
+--diagnostic so there is no .vxtl to read, but the npz dumps are still on disk
+at D:/tmp/seamwidth-npz. The basin registry is NOT in the npz; it was taken
+from the shipped tiles, which is sound because `survey_basins` reads only
+z_final, basin_depth, accumulation_m2 (MFD, untouched by bv12) and climate, so
+it is bit-identical across the change. The check that it is: 255 basins, 246
+overflowing and 9 terminal, which is exactly what the bv12 record reports.
+
+    python tools/river_long_profile.py compose \
+        --npz-dir D:/tmp/seamwidth-npz --basins D:/tmp/basins-corridor.json \
+        --tiles="-11,-4 -11,-5 -12,-5 -11,-6" --out D:/tmp/composed-bv12.npz
+    python tools/river_long_profile.py walk \
+        --composed D:/tmp/composed-bv12.npz --interval 500 \
+        --csv-out D:/tmp/longprofile-bv12.csv
+
+The composition reproduces the record's totals exactly: 2,679,897 composed
+cells, 317,665 river, 258 components, longest span 20,269 m, 5.0% lake. The
+lake fill differs by 5 cells in 2,362,237 (0.0002%) because it runs on the
+unquantised npz elevation rather than the control lattice.
+
+
+================================================================================
+THE FOUR ANSWERS
+================================================================================
+
+1. HOW DEEP AT ITS DEEPEST POINT?
+
+   There are three honest answers and the largest one is not the river.
+
+     deepest cell anywhere on the reach     3.429 m   LAKE SHEET
+       bed 7.4 m, surface 10.8 m, 22.6 km along. This is the coastal basin the
+       reach crosses at km 23, not a channel.
+     deepest RIVER-PLANE cell               3.284 m   WIDENED / CUT BANK
+       bed 51.1 m, surface 54.4 m, 21.4 km along, own Q 18.6 m3/yr -- a
+       hillside trickle. This is a cell within two pixels of the centreline
+       whose ground drops away under a flat water surface. It is the artefact
+       class the width record flagged, and it is a BANK, not a deep river.
+     deepest CHANNEL cell                   1.010 m
+       a centreline cell (own Q >= q_drawable) at 28.2 km, Q 1.307e7 m3/yr.
+
+   THE BRIEF'S CHECK, ANSWERED: ZERO of the 91 corridor-wide cells deeper than
+   5 m fall on this reach. The whole reach's maximum is 3.429 m. 496 of its
+   54,448 cells (0.91%) stand deeper than 2 m and all of them are lake sheet or
+   widened bank.
+
+     depth, metres, over the 54,448 cells of the reach
+                            n        min    p50    p90    p99     max
+       river centreline   20,565   0.408  0.555  0.820  1.010   1.010
+       river widened      31,168   0.100  0.578  1.010  1.410   3.284
+       lake sheet          2,715   0.000  1.156  2.238  3.042   3.429
+
+   The centreline maximum of 1.010 m matches the corridor-wide centreline
+   maximum of 1.073 m in the width record -- this reach carries very nearly the
+   deepest channel water in the corridor, which is what a trunk should do.
+
+   THE ANSWER TO GIVE: the river is 1.01 m deep at its deepest, at km 28.2.
+   The deepest DRAWN water on the reach is 3.43 m, in a lake at km 23.
+
+
+2. HOW WIDE AT ITS WIDEST?
+
+   Measured PERPENDICULAR to the local flow direction: the tangent is the chord
+   over +-45 m of the extracted thalweg, the ray is cast on its normal in
+   half-pixel steps, and the width is the contiguous wet run. Not a raster row
+   -- a row measurement inflates a diagonal by up to sqrt(2).
+
+   A perpendicular can point DOWNSTREAM at a tight bend and return tens of
+   metres on a 4 m river, so every headline below is guarded twice: the local
+   (+-9 m) and smoothed (+-45 m) tangents must agree to within 11 degrees, AND
+   the perpendicular must agree with the bend-immune four-axis ribbon width
+   (corridor_water_report.ribbon_width_m) to within two pixels. 7,135 of the
+   13,897 path nodes pass. The guard matters: the unguarded maximum is 22.50 m
+   at 15.2 km, where the straightness is 0.38 -- a bend, and a false number.
+
+     widest RIVER cross-section          13.12 m  at 24.6 km (submarine)
+     widest SUBAERIAL river section      11.25 m  at 12.1 km
+     widest COMPOSED section             93.75 m  at 23.0 km -- 100% lake sheet
+     four-axis ribbon over ALL reach cells   river max 10.61 m, p90 5.62 m
+                                             composed max 100.76 m
+     guarded perpendicular p50 7.50, p90 7.50, p99 9.38 m
+
+   THE ANSWER TO GIVE: the river is 13.1 m across at its widest and typically
+   7.5 m. Where it crosses the coastal lake at km 23 the drawn water is 93.8 m
+   across, but that is a lake, not the river.
+
+
+3. HOW DOES IT GROW AND CONTRACT? -- see the traverse below.
+
+
+4. HOW MUCH ELEVATION DOES IT DESCEND?
+
+     water surface, head to mouth      389.4 m  ->  -475.0 m  =  864.4 m
+     bed, head to mouth                389.0 m  ->  -476.0 m  =  865.0 m
+       of which ABOVE sea level        389.4 m  ->     0.8 m  =  388.6 m
+       of which BELOW sea level                              =  475.8 m
+
+     mean gradient over the whole walk           28.3 m/km
+     mean gradient over the SUBAERIAL 24.0 km    16.2 m/km
+
+   The single number to quote depends on what "end" means. The river descends
+   389 m from its head to the shoreline. The drawn water continues another
+   476 m down the continental slope to the seafloor, and that half of the
+   descent happens over 6.6 km at up to 216 m/km.
+
+
+================================================================================
+LENGTH: THE 20.3 KM IS A SPAN, NOT A LENGTH
+================================================================================
+This corrects an implication in the brief rather than a statement in it.
+
+  20,269 m   the EUCLIDEAN span -- `max_pairwise_m`, the distance between the
+             two furthest cells of the component via the convex hull. This is
+             the number the seam-and-width record quotes and it is correct as
+             what it is.
+  30,577 m   the ALONG-CHANNEL length of the thalweg from head to mouth.
+             Sinuosity 1.51.
+  24,046 m   the along-channel length of the SUBAERIAL river, head to shore.
+
+A river is longer than its own span. Every distance in this document is
+along-channel unless it says otherwise.
+
+HOW THE THALWEG WAS EXTRACTED, and the two ways the first attempt was wrong.
+
+  * THE MOUTH IS THE LOWEST CELL, NOT THE FURTHEST. Taking the cell at maximum
+    geodesic distance from the head gives a point 33,620 m away whose surface
+    stands at 252.3 m -- 727 m ABOVE the outlet. It is up a tributary that is
+    longer than the trunk's remaining length. The first run of this measurement
+    did exactly that and produced a profile that climbed for its whole second
+    half. Both endpoints are reported by the tool for this reason.
+
+  * THE PATH IS COST-WEIGHTED TOWARD THE CENTRELINE. After the width law the
+    ribbon is 1-5 px wide, and an unweighted shortest path hugs the inside of
+    every bend, spending long stretches on widened bank cells whose own Q is a
+    hillside trickle. Geometrically that is within two pixels and harmless; as
+    a longitudinal profile it is not, because Q, bed and depth are then read
+    off the flank. Weighting a non-centreline cell 6x puts 99.6% of the path on
+    centreline or lake cells. Before the weighting the reported Q oscillated
+    between 3e6 and 1e1 along a single kilometre.
+
+
+================================================================================
+THE TRAVERSE, EVERY 500 M, HEAD TO MOUTH
+================================================================================
+surf/bed are metres absolute at the thalweg. wDrawn is the guarded
+perpendicular chord (median in the bin); wLaw is channel_width_m(Q), which is
+continuous where the raster is quantised to 1.875 m and is therefore the only
+column that can distinguish two sections both drawn 7.50 m wide. depth is the
+mean over the cross-section; dmax is the deepest cell in the bin. m/km is the
+gradient over that 500 m.
+
+     km   surf m    bed m  wDrawn  wLaw m  depth m  dmax m    Q m3/yr  lake%   m/km
+   0.00    389.4    389.0    3.75    3.04    0.420    0.42  1.864e+06    0.0  33.31
+   0.50    372.7    372.3    3.75    3.05    0.423    0.42  1.880e+06    0.0  35.86
+   1.00    354.8    354.3    3.75    3.08    0.424    0.42  1.913e+06    0.0  33.48
+   1.50    338.0    337.6    3.75    3.73    0.502    0.50  3.096e+06    0.0  26.51
+   2.00    324.9    324.4    3.75    3.74    0.503    0.50  3.115e+06    0.0  23.79
+   2.50    313.0    312.5    3.75    3.74    0.504    0.50  3.129e+06    0.0  20.72
+   3.00    302.7    302.2    3.75    3.79    0.505    0.76  3.222e+06    0.0  18.63
+   3.50    293.4    292.9    7.50    3.80    0.494    0.62  3.243e+06    0.0  22.96
+   4.00    281.9    281.4    5.62    3.82    0.506    0.62  3.287e+06    0.0  18.13
+   4.50    272.8    272.3    5.62    3.83    0.505    0.61  3.320e+06    0.0  15.06
+   5.00    265.3    264.8    3.75    3.67    0.496    0.85  2.983e+06    0.0  15.41   <- SEAM
+   5.50    257.5    257.0    3.75    3.68    0.500    0.50  2.998e+06    0.0  12.78
+   6.00    251.1    250.6    3.75    3.69    0.500    0.50  3.015e+06    0.0   9.48
+   6.50    246.4    245.9    3.75    3.71    0.501    0.52  3.066e+06    0.0  10.37
+   7.00    241.2    240.7    5.62    3.88    0.517    0.71  3.419e+06    0.0   7.65
+   7.50    237.4    236.9    7.50    3.88    0.514    0.94  3.430e+06    0.0  13.90
+   8.00    230.5    230.0    5.62    3.91    0.521    0.59  3.492e+06    0.0  12.50
+   8.50    224.2    223.7    6.56    3.92    0.515    0.57  3.507e+06    0.0  11.28
+   9.00    218.6    218.1    7.50    3.92    0.521    0.73  3.522e+06    0.0  12.55
+   9.50    212.4    211.8    6.56    3.93    0.520    0.88  3.545e+06    0.0  12.87
+  10.00    205.5    204.9    7.50    4.05    0.532    0.92  3.826e+06    0.0  13.47
+  10.50    198.8    198.2    3.75    4.06    0.541    0.80  3.842e+06    0.0  12.55
+  11.00    192.5    192.0    5.62    4.07    0.543    0.76  3.867e+06    0.0   8.26
+  11.50    188.4    187.8    7.50    4.08    0.544    1.08  3.882e+06    0.0  13.78
+  12.00    181.5    180.9    7.50    4.15    0.546    0.67  4.060e+06    0.0  11.77
+  12.50    175.6    175.1    7.50    4.17    0.553    0.71  4.117e+06    0.0   9.01
+  13.00    171.1    170.6    5.62    4.19    0.556    0.58  4.158e+06    0.0   6.80
+  13.50    167.7    167.1    6.56    4.20    0.556    0.71  4.177e+06    0.0   7.97
+  14.00    163.7    163.2    7.50    4.22    0.559    1.18  4.220e+06    0.0   8.47
+  14.50    159.5    158.9    5.62    4.22    0.590    0.65  4.239e+06    0.0   9.06
+  15.00    155.0    154.4    7.50    4.48    0.586    1.00  4.921e+06    0.0   8.69
+  15.50    150.6    150.0    5.62    4.48    0.592    0.60  4.931e+06    0.0   5.10
+  16.00    148.1    147.5    6.56    4.49    0.588    1.01  4.942e+06    0.0   6.82
+  16.50    144.7    144.1    5.62    4.49    0.589    0.94  4.956e+06    0.0  10.82
+  17.00    139.3    138.7    5.62    4.50    0.585    0.64  4.966e+06    0.0   9.57
+  17.50    134.3    133.7    5.62    4.50    0.590    0.82  4.980e+06    0.0  12.20
+  18.00    128.2    127.6    6.56    4.51    0.591    0.79  5.009e+06    0.0  12.33
+  18.50    122.0    121.4    6.56    4.52    0.583    1.03  5.026e+06    0.0  13.16
+  19.00    115.4    114.8    5.62    4.52    0.596    0.82  5.038e+06    0.0  34.83
+  19.50     98.1     97.5    7.50    4.53    0.751    2.09  5.051e+06    0.0  28.43
+  20.00     83.9     83.1    7.50    6.04    0.768    0.85  1.042e+07    0.0  10.47   <- Q DOUBLES
+  20.50     78.6     77.9    7.50    6.08    0.774    2.19  1.060e+07    0.0  34.98
+  21.00     61.3     60.5    7.50    6.10    0.775    1.22  1.066e+07    0.0  11.09
+  21.50     55.7     55.0    7.50    6.17    0.783    3.28  1.096e+07    0.0  20.92
+  22.00     45.3     44.5    7.50    6.17    0.784    2.70  1.099e+07    0.0  55.22
+  22.50     17.9     17.1    7.50    6.17    0.784    1.28  1.100e+07    0.0  12.36
+  23.00     10.8     10.8    7.50    6.19    0.786    3.43  1.105e+07   24.7   6.35   <- LAKE
+  23.50      7.7      6.9    7.50    6.19    0.779    1.05  1.107e+07    0.0  13.76
+  24.00      0.8     -0.0    7.50    6.20    0.779    0.82  1.112e+07    0.0   0.04   <- SHORE
+  24.50      0.8     -0.0    7.50    6.20    0.770    1.62  1.114e+07    0.0   8.95
+  25.00     -3.7     -4.5    7.50    6.21    0.788    2.12  1.115e+07    0.0  28.63
+  25.50    -17.9    -18.7    7.50    6.21    0.820    1.80  1.115e+07    0.0  19.70
+  26.00    -27.7    -28.6    7.50    6.49    0.820    1.93  1.249e+07    0.0  35.91
+  26.50    -45.6    -46.4    7.50    6.50    0.820    2.50  1.251e+07    0.0 104.96
+  27.00    -98.3    -99.1    7.50    6.51    0.818    2.93  1.254e+07    0.0 199.38
+  27.50   -197.6   -198.5    7.50    6.51    0.818    1.42  1.255e+07    0.0 234.46
+  28.00   -314.6   -315.5    9.38    6.61    0.836    1.12  1.307e+07    0.0 205.23
+  28.50   -417.3   -418.1    7.50    6.61    0.866    1.10  1.307e+07    0.0 115.67
+  29.00   -474.9   -475.9    7.50    6.61    1.010    1.01  1.307e+07    0.0   0.07
+  29.50   -474.9   -475.9    7.50    6.61    1.010    1.01  1.307e+07    0.0   0.07
+  30.00   -475.0   -476.0    7.50    6.61    1.010    1.01  1.307e+07    0.0   0.07
+  30.50   -475.0   -476.0    7.50    6.61    1.010    1.01  1.307e+07    0.0   0.06
+
+Per-node CSV (13,897 rows, one per thalweg cell, with pixel and tile
+coordinates): D:/tmp/longprofile-bv12.csv, regenerated by the command above.
+
+BY FIFTHS, which is where the growth actually reads:
+
+    km        depth p50   law width p50   drawn p50     Q p50
+     0 -  5     0.504 m      3.74 m        3.75 m     3.12e6
+     5 - 10     0.520        3.88          5.62       3.43e6
+    10 - 15     0.554        4.16          7.50       4.07e6
+    15 - 20     0.593        4.50          7.50       4.98e6
+    20 - 24     0.783        6.17          7.50       1.10e7
+    24 - 31     0.821        6.51          7.50       1.25e7   (submarine)
+
+
+================================================================================
+THE SHAPE, IN ORDER
+================================================================================
+
+THE HEAD, km 0. A foothill, not a mountain: bed 389.0 m, water surface 389.4 m,
+0.42 m deep, 3.75 m wide (one raster pixel each side of nothing -- the law
+wants 3.04 m and the raster can hold 2 px). It already carries 1.86e6 m3/yr,
+which is above the drawable cut of 1.53e6, so it is a drawn channel from its
+first cell rather than a trickle that thickens.
+
+THE STEEP UPPER 3 KM. This is the steepest kilometre on the whole river: 34.6
+m/km over km 0-1, 30.0 over km 1-2. The river drops 86 m in the first 2.5 km
+and does not widen at all -- 3.75 m the entire way. A tributary at 1.6 km adds
+60% to the discharge (1.93e6 -> 3.09e6) and the law width steps 3.08 -> 3.72 m,
+which is still under two pixels, so nothing changes on the raster. Depth steps
+0.42 -> 0.50 m, and that is the only visible effect.
+
+THE FIRST WIDENING, km 3.0-4.5. The drawn ribbon reaches 7.50 m for the first
+time. The gradient has eased to 15-23 m/km.
+
+THE CONTRACTION AT km 4.5-5.0, AND IT IS A TILE SEAM. The drawn width falls
+7.50 -> 3.75 m and stays there for 1.5 km. It is not a bend and not a basin:
+the discharge itself falls, 3.354e6 -> 2.865e6 m3/yr, a 14.6% loss, at the one
+cell where the path crosses from tile (-11,-5) into tile (-11,-6). This is the
+ONLY step in 13,896 where Q falls between two river cells; the other four Q
+falls are the path entering a lake sheet, where Q is not defined.
+
+  This is the residual mechanism the seam-and-width record named and did NOT
+  fix. PR #209's single-receiver pyramid fixed the MAGNITUDE crossing a seam;
+  it cannot fix the POSITION. The injected discharge enters at the lowest fine
+  cell inside the 30 m crossing footprint, not at the fine tier's own thalweg,
+  and where those disagree the trunk restarts slightly short. Here it costs
+  14.6% of the discharge and 1.5 km of ribbon. The named fix -- place the
+  entry cell by the fine surface's own accumulation maximum -- would remove it.
+
+  IT IS THE ONLY SEAM THIS REACH CROSSES. The walk runs 5,219 m in (-11,-5)
+  and 25,358 m in (-11,-6); it never enters (-11,-4) or (-12,-5).
+
+THE LONG MIDDLE, km 5 to 19. Fourteen kilometres of a steady, slightly
+flattening river. The gradient decays from 15 m/km to 8-12 m/km and bottoms at
+5.1 m/km around km 15.5. Discharge climbs smoothly from 3.0e6 to 5.0e6 through
+three modest tributaries (+11% at km 7.0, +8% at km 10.2, +16% at km 14.9). The
+law width goes 3.67 -> 4.52 m -- less than half a pixel of growth over
+fourteen kilometres -- so the drawn ribbon holds at 5.62-7.50 m and flickers
+between them. Depth grows 0.50 -> 0.60 m, monotonically, and that is where the
+growth of this stretch is actually visible.
+
+THE KNICKPOINT AND THE BIG CONFLUENCE, km 19-20. The gradient jumps from 13 to
+34.8 m/km at km 19.0 and stays above 28 through km 19.5: the river drops 32 m
+in 1.4 km. At km 19.86, at the foot of it, the discharge DOUBLES -- 5.06e6 ->
+1.013e7, the largest single tributary on the river -- and the law width steps
+4.53 -> 5.97 m in one cell. Depth steps 0.60 -> 0.77 m across the same
+kilometre. This is the transition from an upland stream to the trunk.
+
+THE LOWER TRUNK, km 20 to 24. Full width the whole way: 7.50 m drawn against a
+law width of 6.04-6.20 m, depth flat at 0.78 m, discharge 1.04e7 climbing to
+1.11e7. The gradient is irregular -- 35 m/km at km 20.5, 11 at km 21, 55 at
+km 22, 12 at km 22.5 -- a stepped descent, not a smooth one.
+
+THE COASTAL LAKE, km 23.0. The only lake on the reach, and it is the reason the
+composed network reaches the sea while the raster-only one stops 0.79 km short.
+The river enters a registered basin at 22,999 m at a surface of 11.7 m and
+leaves it about 130 m later. Inside it the drawn water is 93.75 m across
+(four-axis 90.16 m -- the two measures agree, so this is a real sheet and not a
+bend artefact) and up to 3.43 m deep, the deepest water on the whole reach. The
+lake is 0.35% of the thalweg's nodes and 5.0% of the reach's cells. Everything
+either side of it is river.
+
+THE SHORELINE, km 24.0. The bed reaches 0 m at 23,987 m along, 78% of the way
+through the walk. The gradient is 0.04 m/km through this bin -- the flattest
+subaerial point on the river, a 500 m stretch essentially at sea level. Q
+1.11e7, depth 0.79 m, width 5.6-7.5 m.
+
+THE SUBMARINE CANYON, km 24 to 30.6. The drawn river does not stop at the
+shore. It continues 6,589 m across the shelf and down the slope, descending
+476 m -- more than half the river's total descent, in a fifth of its length.
+The gradient reaches 216 m/km over km 27-28 and 160 m/km over km 28-29, an
+order of magnitude steeper than anything above the shoreline. Two further
+discharge steps (+11% at km 25.8, +4% at km 27.9) take it to 1.307e7. Depth
+grows from 0.79 to 1.01 m, and the deepest CHANNEL water on the river is here,
+at km 28.2. It is also the widest measured river cross-section, 13.12 m at
+km 24.6.
+
+THE MOUTH, km 29 to 30.6. It ends flat. The last 1.6 km falls 0.07 m/km --
+essentially level -- at a bed of -476.0 m and a surface of -475.0 m, 1.01 m
+deep and 7.50 m wide. The river terminates on a flat seafloor, not at a delta.
+
+
+================================================================================
+THE SANITY CHECKS THE BRIEF ASKED FOR
+================================================================================
+
+DOES THE SURFACE EVER RISE DOWNSTREAM? NO, not at any scale the profile has.
+
+  The raw per-cell diff shows 230 rising steps of 13,896 (1.66%), largest
+  1,528 mm, 56.0 m of rise against 920.4 m of fall. That number is NOT a
+  defect and reporting it alone would be misleading. The bake's guarantee is
+  that the surface descends along the D8 RECEIVER CHAIN. The path measured
+  here is a least-cost route through the drawn mask, which is a different
+  object: inside a 4 px ribbon it can step sideways from one thread onto a
+  neighbouring one standing a few hundred mm higher.
+
+  The test that discriminates is scale.
+
+    resampled every  25 m (1,069 samples):  11 rises, largest 1,573 mm
+    resampled every 100 m (  263 samples):   0 rises, largest  -1 mm
+    resampled every 250 m (  105 samples):   0 rises, largest  -8 mm
+
+  Above 100 m the profile is strictly monotone. The largest excursion above
+  the running minimum anywhere on the walk is 2.60 m, at 26.6 km; excursions
+  above 0.5 m cover 0.76% of the path in 37 stretches, none longer than a few
+  metres. Nothing here needs fixing.
+
+DOES WIDTH GROW MONOTONICALLY DOWNSTREAM? NO -- and the reason splits cleanly
+into one real defect and one raster limit.
+
+    Spearman(law width,      distance along)  +0.993
+    Spearman(discharge,      distance along)  +0.993
+    Spearman(drawn width,    distance along)  +0.542
+    Spearman(drawn width, discharge)          +0.568
+
+  THE HYDROLOGY IS MONOTONE. Q rises downstream on 13,891 of 13,896 steps, and
+  the law width with it, from 3.04 m at the head to 6.61 m at the mouth. There
+  is exactly one real exception, and it is the tile seam at km 5.2 described
+  above: a 14.6% discharge loss that costs 1.5 km of ribbon width.
+
+  THE DRAWN WIDTH IS NOT MONOTONE, and mostly that is the raster. The km-block
+  median falls at 8 of 30 steps. Seven of the eight are one-pixel flickers
+  (7.50 -> 6.56 or 6.56 -> 5.62 m) at places where the DISCHARGE ROSE -- the
+  law width there is growing by hundredths of a metre against a 1.875 m pixel,
+  so which side of a pixel boundary a given cell lands on is decided by the
+  terrain clamp, not by Q. Only the km 4 -> 5 step (5.62 -> 3.75 m) has a
+  falling Q behind it.
+
+  So: the river the bake COMPUTES grows monotonically downstream except at one
+  tile seam. The river it DRAWS grows in 1.875 m steps and flickers by one
+  pixel either side of each step, which no rule can remove at this pitch.
+
+
+================================================================================
+WHAT THIS MEASUREMENT WOULD CHANGE IF IT WERE WRONG
+================================================================================
+Three things here contradict or refine what was carried in:
+
+  * "the 20.3 km river" is a 20,269 m SPAN. The river is 30,577 m long along
+    its own channel, 24,046 m of that above sea level.
+
+  * "how deep at its deepest" has no single answer. 3.43 m is a lake, 3.28 m is
+    a cut bank, 1.01 m is the channel. Only the third is the river's depth.
+    None of the 91 corridor-wide >5 m cells fall on this reach.
+
+  * The reach is not one continuous descent. 55% of its drop happens in the
+    last 22% of its length, below sea level, on the continental slope.
+
+The instrument is tools/river_long_profile.py. Its two known failure modes are
+both guarded and both fired during this measurement before they were: taking
+the furthest cell as the mouth walks up a tributary, and a perpendicular cast
+at a bend can point downstream (the unguarded width maximum, 22.50 m, is a
+bend at straightness 0.38, against a guarded 13.12 m).

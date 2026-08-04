@@ -458,6 +458,54 @@ int main(int argc, char** argv) {
                 "the amplified surface)\n",
                 datumMin / 1000.0, datumMax / 1000.0);
 
+    // WHERE THE LONGEST REACHES ACTUALLY ARE, in world METRES, because a camera
+    // has to be pointed at one. "Verify sites before shooting" is a standing
+    // rule here and it has caught three wrong vista sites including a "beach"
+    // in open water; a capture aimed by hand at a tile centre photographs
+    // whatever happens to be there, and an empty valley and a missing feature
+    // are the same picture.
+    //
+    // METRES, AND THE UNIT IS THE WHOLE POINT OF THIS COLUMN. It exists to be
+    // pasted into `-VoxelSpawnAt`, which VoxelEarthGameMode.cpp:60 documents as
+    // "(meters, world)". The first version of this printed UNREAL UNITS, which
+    // are 100x smaller, and the capture it aimed died on the fine-tier
+    // residency gate asking for tile (-1003,-492) -- a tile 1,000 tiles off the
+    // baked set. The gate caught it; a coarse-tier run would have photographed
+    // the wrong valley instead and said nothing.
+    if (!paths.empty()) {
+        std::vector<size_t> order(paths.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return lengthsMm[a] > lengthsMm[b]; });
+        const size_t show = std::min<size_t>(order.size(), 8);
+        std::printf("  LONGEST REACHES -- midpoint in world METRES, for -VoxelSpawnAt:\n");
+        std::printf("    %-8s %-9s %-26s %-9s %s\n", "len m", "width m", "mid m (x,y)", "datum m",
+                    "span m (x,y)");
+        for (size_t k = 0; k < show; ++k) {
+            const RiverRibbonPath& p = paths[order[k]];
+            if (p.pts.empty()) continue;
+            const RiverRibbonPoint& mid = p.pts[p.pts.size() / 2];
+            int64_t x0 = mid.px, x1 = mid.px, y0 = mid.py, y1 = mid.py, wSum = 0;
+            for (const RiverRibbonPoint& q : p.pts) {
+                x0 = std::min(x0, q.px);
+                x1 = std::max(x1, q.px);
+                y0 = std::min(y0, q.py);
+                y1 = std::max(y1, q.py);
+                wSum += int64_t(q.halfWidthMm) * 2;
+            }
+            // A fine pixel is 1875 mm, i.e. 1.875 m. The +half puts the point at
+            // the PIXEL CENTRE, which is what the ribbon actor anchors its
+            // vertices on.
+            const double mPerPx = double(pixelMm) / 1000.0;
+            std::printf("    %-8.0f %-9.2f (%.0f, %.0f)%*s %-9.1f (%.0f, %.0f)\n",
+                        double(lengthsMm[order[k]]) / 1000.0,
+                        double(wSum) / double(p.pts.size()) / 1000.0,
+                        (double(mid.px) + 0.5) * mPerPx, (double(mid.py) + 0.5) * mPerPx, 4, "",
+                        mid.surfaceMm / 1000.0, double(x1 - x0 + 1) * mPerPx,
+                        double(y1 - y0 + 1) * mPerPx);
+        }
+    }
+
     // --- simplification: the anti-staircase measurement ----------------------
     int64_t keptPts = 0;
     RiverSimplifyParams sp;

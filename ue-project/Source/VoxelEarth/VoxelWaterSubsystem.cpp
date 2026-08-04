@@ -33,6 +33,12 @@
 // where that stops being true. Nothing in voxel-core changed to allow it.
 #include "voxelcore/rivercouple.h"
 #include "voxelcore/rivernet.h"
+// Phase 4, the far-field river producer. Same story swe.h and rivernet.h each
+// had one milestone ago: riverribbon.h shipped complete, tested and verified
+// against RiverSampler at 0 disagreements in 5,480,281 cells, and entirely
+// unreferenced by the engine -- which is exactly why rivers were invisible
+// past the 52 m implicit disc. This file is where that stops being true.
+#include "voxelcore/riverribbon.h"
 #include "voxelcore/tiles.h"
 #include "voxelcore/waterca.h"
 
@@ -360,6 +366,29 @@ public:
 	// screen is indistinguishable from "there is no river here". Surfaced so it
 	// can be logged rather than inferred from an empty valley.
 	uint64 RiverBlocksUnresolved() const { return Rivers.unresolvedBlocks(); }
+
+	// The far-field river producer needs BOTH halves directly (Phase 4):
+	// riverRibbonFillWet reads the raw depth raster through the tile sampler,
+	// deliberately bypassing the per-pixel spline to answer "is this wet" from
+	// the one sign bit that is already decoded, and riverRibbonResolveDatum
+	// then calls RiverSampler::surfaceAtPixel at the centreline only.
+	//
+	// EXPOSING THESE IS NOT A SECOND WORLD. Both references are into the ONE
+	// `Tiles` this class owns, which is the same object waterSurfaceMmAtVoxel
+	// reads, so the ribbon cannot see a different water plane than the near
+	// field does -- riverribbon.h's own probe measures that agreement at 0
+	// disagreements in 5,480,281 cells and this is what keeps it true here.
+	// Game-thread only, like every other method on this class.
+	//
+	// These are the IWaterSampler hook, not new API: a caller reaches them
+	// through Impl->Water without knowing this class exists, and a world with
+	// no fine tier answers nullptr through NullWaterSampler's default. That is
+	// what keeps the ribbon actor free of a downcast -- UE modules build with
+	// /GR- (bUseRTTI defaults false), so dynamic_cast is not available here and
+	// a static_cast onto the wrong sampler would be silent memory corruption.
+	vxc::FineTileSampler* ribbonTiles() override { return &Tiles; }
+	vxc::RiverSampler* ribbonRivers() override { return &Rivers; }
+
 
 private:
 	// Loads the fine tile under this voxel column if it is not already
@@ -735,6 +764,15 @@ struct FVoxelWaterImpl
 	// stationary camera costs nothing. Set once the first refresh has run.
 	VoxelCoords::FVoxelCoord LastImplicitCenterBrick = {0, 0, 0};
 	bool bImplicitCenterValid = false;
+
+	// The far-field river ribbon window currently being filled, or null. Held
+	// here rather than on AVoxelRiverRibbonActor because vxc::RiverWetWindow is
+	// a voxel-core type and the actor's header is UHT-parsed; the actor drives
+	// it through the four Begin/Fill/Finish/Abandon methods on the subsystem.
+	// At most one is open at a time -- it is 18 MB at the default 4 km radius.
+	std::unique_ptr<vxc::RiverWetWindow> RibbonWindow;
+	int32 RibbonBands = 0;
+	int32 RibbonPixelMm = 0;
 
 	// Bricks the implicit pass still owes a mesh, drained under a per-tick
 	// budget exactly like DirtyBricks.
@@ -5632,6 +5670,205 @@ bool UVoxelWaterSubsystem::GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZ
 	OutMinZUU = double(C.Z - kImplicitRadiusBricksZ) * BrickUU;
 	OutMaxZUU = double(C.Z + kImplicitRadiusBricksZ + 1) * BrickUU;
 	return true;
+}
+
+// --- FAR-FIELD RIVER RIBBONS ------------------------------------------------
+//
+// The engine half of voxelcore/riverribbon.h. Same split of responsibility the
+// lake sheet trio above uses: every geometric decision is in voxel-core, where
+// it is unit-tested in ctest without an engine, and this half only addresses
+// tiles, budgets the work and converts millimetres to world units.
+//
+// ONE FINE PIXEL PER BAND ROW IS 256 PIXELS, the water block edge, because
+// riverRibbonFillWet iterates BLOCK-MAJOR and decodes each 256x256 block
+// exactly once. Handing it a band that is not block-aligned costs nothing (it
+// snaps outward internally) but handing it a one-ROW band would decode the
+// whole block row per row -- the factor of 256 the producer's own comment
+// warns about.
+namespace
+{
+// A water block is 256 fine pixels on a side; a band is one block row.
+constexpr int32 kRibbonBandRows = 256;
+} // namespace
+
+int32 UVoxelWaterSubsystem::BeginRiverRibbonWindow(double CenterXUU, double CenterYUU, double RadiusUU)
+{
+	AbandonRiverRibbonWindow();
+	if (!Impl || !Impl->Water || RadiusUU <= 0.0)
+	{
+		return 0;
+	}
+	check(IsInGameThread());
+
+	// pixelSizeMm() is a CONSTANT on the fine tier (30 m / 16 = 1875 mm), not
+	// something read back off a loaded tile, so the window can be laid out
+	// before any tile has been touched. tileSize() is not, which is why
+	// EnsureTileForPixel addresses from vxc::kFineTileSize instead.
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (PixelMm <= 0)
+	{
+		return 0;
+	}
+	const int64 CxPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU), PixelMm);
+	const int64 CyPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU), PixelMm);
+	const int64 RadiusPx = FMath::Max<int64>(1, (VoxelCoords::WorldToMm(RadiusUU) + PixelMm - 1) / PixelMm);
+	const int64 Edge = 2 * RadiusPx + 1;
+	if (Edge > INT32_MAX / 4)
+	{
+		return 0; // an unreasonable radius; the mask is one byte per pixel
+	}
+
+	Impl->RibbonWindow = std::make_unique<vxc::RiverWetWindow>();
+	Impl->RibbonWindow->resize(CxPx - RadiusPx, CyPx - RadiusPx, int32_t(Edge), int32_t(Edge));
+	Impl->RibbonPixelMm = int32(PixelMm);
+	Impl->RibbonBands = int32((Edge + kRibbonBandRows - 1) / kRibbonBandRows);
+	return Impl->RibbonBands;
+}
+
+bool UVoxelWaterSubsystem::FillRiverRibbonWindowBand(int32 BandIndex, int64& OutWetPixels)
+{
+	OutWetPixels = 0;
+	if (!Impl || !Impl->Water || !Impl->RibbonWindow || BandIndex < 0 || BandIndex >= Impl->RibbonBands)
+	{
+		return false;
+	}
+	check(IsInGameThread()); // decodes water blocks: disk I/O plus zstd
+
+	vxc::FineTileSampler* Tiles = Impl->Water->ribbonTiles();
+	if (Tiles == nullptr)
+	{
+		return false; // no fine tier; the same supported "no baked water" world
+	}
+	vxc::RiverWetWindow& Win = *Impl->RibbonWindow;
+	const int32 Y0 = BandIndex * kRibbonBandRows;
+	const int32 Rows = FMath::Min(kRibbonBandRows, Win.h - Y0);
+	if (Rows <= 0)
+	{
+		return false;
+	}
+
+	// Pull in the tiles this band needs FIRST. riverRibbonFillWet answers DRY
+	// for a tile that is not resident -- the same policy surfaceAtPixel
+	// applies -- so a band filled before its tile loaded would be a silently
+	// missing river rather than an error, which is the failure mode this whole
+	// producer exists to make visible.
+	//
+	// WARMED THROUGH waterSurfaceMmAtVoxel, the ordinary column query, rather
+	// than through a bespoke loader: that call already does load-then-ask, so
+	// one query per tile puts the tile in the SAME residency state the near
+	// field would have put it in, and there is no second code path that could
+	// load a different tile set. Addressed from vxc::kFineTileSize because
+	// FineTileSampler::tileSize() is read back OFF a loaded tile and is 0 until
+	// one is -- using it here would divide by the answer this loop exists to
+	// obtain, and no tile would ever load.
+	const int64 PixelMm = int64(Impl->RibbonPixelMm);
+	const int64 Ax0 = Win.x0, Ax1 = Win.x0 + Win.w - 1;
+	const int64 Ay0 = Win.y0 + Y0, Ay1 = Win.y0 + Y0 + Rows - 1;
+	const int64 Tile = int64(vxc::kFineTileSize);
+	for (int64 Ty = vxc::floorDiv(Ay0, Tile); Ty <= vxc::floorDiv(Ay1, Tile); ++Ty)
+	{
+		for (int64 Tx = vxc::floorDiv(Ax0, Tile); Tx <= vxc::floorDiv(Ax1, Tile); ++Tx)
+		{
+			// Any pixel inside the tile will do; take the one nearest the band
+			// so a partially covered tile is still addressed inside itself.
+			const int64 Px = FMath::Clamp(Tx * Tile, Ax0, Ax1);
+			const int64 Py = FMath::Clamp(Ty * Tile, Ay0, Ay1);
+			Impl->Water->waterSurfaceMmAtVoxel(vxc::floorDiv(Px * PixelMm, int64(vxc::kVoxelSizeMm)),
+			                                   vxc::floorDiv(Py * PixelMm, int64(vxc::kVoxelSizeMm)));
+		}
+	}
+
+	OutWetPixels = int64(vxc::riverRibbonFillWet(*Tiles, Win, 0, Y0, Win.w, Rows));
+	return true;
+}
+
+int32 UVoxelWaterSubsystem::FinishRiverRibbonWindow(TArray<FRiverRibbonPathUU>& OutPaths, int64& OutWetPixels,
+                                                    int64& OutCentrePixels, int64& OutUnresolvedBlocks)
+{
+	OutWetPixels = 0;
+	OutCentrePixels = 0;
+	OutUnresolvedBlocks = 0;
+	if (!Impl || !Impl->Water || !Impl->RibbonWindow)
+	{
+		return 0;
+	}
+	check(IsInGameThread());
+
+	vxc::RiverSampler* Rivers = Impl->Water->ribbonRivers();
+	if (Rivers == nullptr)
+	{
+		AbandonRiverRibbonWindow();
+		return 0;
+	}
+	vxc::RiverWetWindow& Win = *Impl->RibbonWindow;
+	const int32 PixelMm = Impl->RibbonPixelMm;
+
+	vxc::RiverThinField Thin;
+	vxc::riverRibbonThin(Win, PixelMm, Thin);
+	vxc::riverRibbonResolveDatum(*Rivers, Win, Thin);
+
+	std::vector<vxc::RiverRibbonPath> Paths;
+	const vxc::RiverTraceParams Trace;
+	const vxc::RiverSimplifyParams Simplify;
+	const size_t Traced = vxc::riverRibbonTrace(Win, Thin, PixelMm, Trace, Paths);
+	for (size_t i = 0; i < Paths.size(); ++i)
+	{
+		vxc::riverRibbonSimplify(Paths[i], Simplify);
+	}
+
+	OutWetPixels = int64(Thin.wetPixels);
+	OutCentrePixels = int64(Thin.centrePixels);
+	// Non-zero means a river's bytes WERE there and did not decode. On screen
+	// that is indistinguishable from a dry valley, which is why it is reported
+	// rather than inferred.
+	OutUnresolvedBlocks = int64(Rivers->unresolvedBlocks());
+
+	const int32 Before = OutPaths.Num();
+	for (const vxc::RiverRibbonPath& P : Paths)
+	{
+		FRiverRibbonPathUU Out;
+		Out.Points.Reserve(int32(P.pts.size()));
+		for (const vxc::RiverRibbonPoint& Pt : P.pts)
+		{
+			// A traced point is wet by construction, but a datum that failed to
+			// resolve is kNoWaterMm == INT32_MIN; letting that through would put
+			// a vertex 2,147 km below the world and stretch one ribbon quad
+			// across the whole scene. Dropped rather than clamped.
+			if (Pt.surfaceMm == vxc::kNoWaterMm)
+			{
+				continue;
+			}
+			FRiverRibbonVertexUU V;
+			// PIXEL CENTRE, not corner: halfWidthMm is measured about the
+			// centre of the run, so anchoring the vertex at the corner would
+			// bias the whole ribbon half a pixel (0.94 m) off the channel.
+			V.XUU = VoxelCoords::MmToWorld(Pt.px * int64(PixelMm) + int64(PixelMm) / 2);
+			V.YUU = VoxelCoords::MmToWorld(Pt.py * int64(PixelMm) + int64(PixelMm) / 2);
+			V.ZUU = VoxelCoords::MmToWorld(int64(Pt.surfaceMm));
+			V.HalfWidthUU = VoxelCoords::MmToWorld(int64(Pt.halfWidthMm));
+			Out.Points.Add(V);
+		}
+		// A path that lost points to the datum guard can fall below two, which
+		// is not a ribbon.
+		if (Out.Points.Num() >= 2)
+		{
+			OutPaths.Add(MoveTemp(Out));
+		}
+	}
+	(void)Traced;
+
+	AbandonRiverRibbonWindow();
+	return OutPaths.Num() - Before;
+}
+
+void UVoxelWaterSubsystem::AbandonRiverRibbonWindow()
+{
+	if (Impl)
+	{
+		Impl->RibbonWindow.reset();
+		Impl->RibbonBands = 0;
+		Impl->RibbonPixelMm = 0;
+	}
 }
 
 void UVoxelWaterSubsystem::GetMobilizationStats(int32& OutMobilizedBricks, uint64& OutDebited, uint64& OutCredited,

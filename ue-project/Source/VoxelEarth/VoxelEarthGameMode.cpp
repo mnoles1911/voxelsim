@@ -24,6 +24,7 @@
 #include "VoxelSkyLadderFixture.h" // -VoxelSkyLadder=<N>, registered beside the SWE breach fixture below
 #include "VoxelSweBreachFixture.h" // -VoxelSweBreachTest, registered beside the other water fixtures below
 #include "VoxelWaterSheetActor.h"  // watershed item 5: lake sheets past the implicit disc
+#include "VoxelRiverRibbonActor.h" // Phase 4: river ribbons past the implicit disc
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -177,6 +178,16 @@ void AVoxelEarthGameMode::BeginPlay()
 		// actor and a suppressed-by-switch actor then log the same way, so a
 		// capture writeup can say which one it was from the log alone.
 		World->SpawnActor<AVoxelWaterSheetActor>();
+
+		// Phase 4 (docs/water-handover-2026-08-04.md): baked river RIBBONS --
+		// the flowing-water half of the same gap the sheet above closes for
+		// lakes. Sheets cannot carry it: the sheet half of IWaterSampler is a
+		// basin registry, and a reach is not a basin. Spawned unconditionally
+		// for the same reason and with the same control discipline as the
+		// sheet -- with no fine tier the actor opens no window and creates no
+		// mesh sections, and -VoxelRiverRibbons=0 is read INSIDE the actor so
+		// suppressed-by-absence and suppressed-by-switch log differently.
+		World->SpawnActor<AVoxelRiverRibbonActor>();
 
 		// M3 wave 1 (docs/m3-plan.md): the edit-log replication transport
 		// (AVoxelEditRelay), spawned by the GameMode on authority -- but only
