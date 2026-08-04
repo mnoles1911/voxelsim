@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <iterator>
 #include <optional>
 #include <unordered_set>
 #include <utility>
@@ -728,6 +729,21 @@ uint32_t WaterCA::removeWaterAt(int64_t vx, int64_t vy, int64_t vz, uint32_t amo
     setFillAccounted(vx, vy, vz, static_cast<uint8_t>(cur - take), nullptr);
     activate(waterKeyForVoxel(vx, vy, vz));
     return take;
+}
+
+uint64_t WaterCA::clearBrickFill(const BrickKey& k) {
+    // See waterca.h: this is a SINK on its own, and only WaterMobilizer::
+    // demoteBrick may call it -- after its exact predicate has established that
+    // the implicit field will resume claiming the identical units. Written as a
+    // whole-brick erase rather than 512 setFillAccounted calls because there is
+    // no per-cell decision to make and no activity to record: the brick is
+    // leaving the CA entirely.
+    WaterBrick8* b = water_.find(k);
+    if (!b) return 0;
+    const uint64_t removed = b->volume();
+    water_.erase(k); // same homogeneous-empty collapse setFillAccounted does
+    totalVolume_ -= removed;
+    return removed;
 }
 
 uint64_t WaterCA::recomputeVolume() const {
@@ -1754,10 +1770,36 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
     static constexpr int kDy[6] = {0, 0, 1, -1, 0, 0};
     static constexpr int kDz[6] = {0, 0, 0, 0, 1, -1};
 
+    // DEMOTION PRESSURE BEFORE REFUSAL (waterca.h "the mobilized ceiling",
+    // plan §6.5.5). At most once per call, and only at the high-water mark, so
+    // a world under its ceiling pays nothing. Anything this frees is visible to
+    // both loops below -- the point is to reclaim first and refuse second.
+    if (atMobilizedCeiling() && ceilingRelief_) {
+        ++ceilingReliefCalls_;
+        ceilingRelief_();
+    }
+
+    const bool ceilinged = atMobilizedCeiling();
     for (const BrickKey& a : ca.activeBricks()) {
         for (int i = 0; i < 6; ++i) {
             const BrickKey n{a.x + kDx[i], a.y + kDy[i], a.z + kDz[i]};
             if (mobilized_.count(n) != 0 || noImplicit_.count(n) != 0) continue;
+            // The front gate (waterca.h "the front gate"). Checked HERE as well
+            // as at drain time so a permanently frozen reach beside live water
+            // cannot grow `pending_` without bound -- a refused brick is simply
+            // never queued. Refusing is safe for the same reason deferring is:
+            // a brick the front does not mobilize is still a wall.
+            if (!frontAllows(n)) {
+                ++frontGateRefusals_;
+                continue;
+            }
+            // Same reasoning for the ceiling: at the high-water mark a candidate
+            // is not queued at all, so a stalled world's `pending_` cannot grow
+            // for as long as the stall lasts.
+            if (ceilinged) {
+                ++ceilingRefusals_;
+                continue;
+            }
             pending_.insert(n);
         }
     }
@@ -1766,12 +1808,112 @@ size_t WaterMobilizer::advanceFront(WaterCA& ca, size_t maxBricks) {
     // a queued brick is still a wall, so nothing can leak into it meanwhile.
     size_t done = 0;
     while (done < maxBricks && !pending_.empty()) {
+        // Re-tested every iteration, not hoisted: this call's own conversions
+        // are what usually reach the ceiling, and the brick that would cross it
+        // must be the one refused. Queued leftovers stay queued -- they are
+        // bounded (the seed loop stops queueing while stalled) and they are
+        // still walls.
+        if (atMobilizedCeiling()) break;
         const BrickKey k = *pending_.begin();
         pending_.erase(pending_.begin());
+        // Re-checked at drain time because the gate may have closed since this
+        // brick was queued (a cut logged while the queue was over budget), and
+        // the gate's answer at the moment of conversion is the one that counts.
+        // Dropping it costs no budget: it is a queue eviction, not a
+        // mobilization, and the seed loop above will re-queue it if and when
+        // the gate reopens while a neighbour is still active.
+        if (!frontAllows(k)) continue;
         mobilizeBrick(ca, k);
         ++done;
     }
     return done;
+}
+
+bool WaterMobilizer::canDemote(const WaterCA& ca, const BrickKey& k) const {
+    // (a) it must be ours to give back.
+    if (mobilized_.count(k) == 0) return false;
+
+    // (b) quiet neighbourhood -- demotion restores the wall, and a wall
+    // reappearing in contact with moving water is a discontinuity. Cheap tests
+    // first: seven set lookups before any 512-cell scan.
+    static constexpr int kDx[6] = {1, -1, 0, 0, 0, 0};
+    static constexpr int kDy[6] = {0, 0, 1, -1, 0, 0};
+    static constexpr int kDz[6] = {0, 0, 0, 0, 1, -1};
+    const std::set<BrickKey, BrickKeyLess>& active = ca.activeBricks();
+    if (active.count(k) != 0) return false;
+    for (int i = 0; i < 6; ++i)
+        if (active.count(BrickKey{k.x + kDx[i], k.y + kDy[i], k.z + kDz[i]}) != 0) return false;
+
+    // (c) EXACT, and the tolerance is ZERO. Every one of the 512 cells must
+    // already hold precisely what the implicit field would compute for it, so
+    // that handing ownership back changes no byte and therefore cannot create
+    // or destroy the difference. sourceFillAt is the pre-handover datum -- the
+    // right question, because implicitFillAt answers 0 for a mobilized brick by
+    // definition.
+    int64_t ox = 0, oy = 0, oz = 0;
+    brickOrigin(k, ox, oy, oz);
+    for (int z = 0; z < kEdge; ++z)
+        for (int y = 0; y < kEdge; ++y)
+            for (int x = 0; x < kEdge; ++x)
+                if (ca.fillAt(ox + x, oy + y, oz + z) != sourceFillAt(ox + x, oy + y, oz + z))
+                    return false;
+    return true;
+}
+
+bool WaterMobilizer::demoteBrick(WaterCA& ca, const BrickKey& k) {
+    if (!canDemote(ca, k)) return false;
+
+    // ORDER MATTERS, and it is the exact mirror of mobilizeBrick's. There, the
+    // brick is MARKED first so the cells read as CA-owned before anything is
+    // written into them. Here, the CA's fill is CLEARED first, while the cells
+    // are still legitimately CA-owned and the implicit field still reports 0
+    // for them; only then is the key erased, which is the instant ownership
+    // returns. Neither order is observable from outside this function, but the
+    // reverse one passes through a state where both accountants claim the same
+    // cell, and that is the one bug this class exists to prevent.
+    const uint64_t handedBack = ca.clearBrickFill(k);
+    mobilized_.erase(k);
+    noImplicit_.erase(k); // the negative memo must not outlive the handover
+    recentlyDemoted_.push_back(k);
+    demoted_ += handedBack;
+    ++demotedBricks_;
+
+    // The wall is back: makeSolidFn now reports every still-wet cell of this
+    // brick solid again, so the CA's solidity memo -- which has been caching
+    // "air" for exactly those cells since mobilization -- must be dropped.
+    // Same invalidation mobilizeBrick performs for the opposite transition.
+    int64_t ox = 0, oy = 0, oz = 0;
+    brickOrigin(k, ox, oy, oz);
+    ca.invalidateSolidRegion(ox, oy, oz, ox + kEdge - 1, oy + kEdge - 1, oz + kEdge - 1);
+    return true;
+}
+
+size_t WaterMobilizer::demoteBudgeted(WaterCA& ca, size_t maxBricks) {
+    size_t demoted = 0;
+    for (size_t examined = 0; examined < maxBricks && !mobilized_.empty(); ++examined) {
+        // The cursor is a KEY, not an iterator: demoting erases from the set,
+        // and lower_bound over a key that is no longer present simply lands on
+        // the next one. Wrapping at the end is what makes successive calls
+        // sweep the whole set instead of re-scanning its front.
+        auto it = demoteCursorSet_ ? mobilized_.lower_bound(demoteCursor_) : mobilized_.begin();
+        if (it == mobilized_.end()) it = mobilized_.begin();
+        const BrickKey k = *it;
+        const auto next = std::next(it);
+        if (next == mobilized_.end()) {
+            demoteCursorSet_ = false;
+        } else {
+            demoteCursor_ = *next;
+            demoteCursorSet_ = true;
+        }
+        if (demoteBrick(ca, k)) ++demoted;
+    }
+    return demoted;
+}
+
+std::vector<BrickKey> WaterMobilizer::takeRecentlyDemoted() {
+    std::vector<BrickKey> out;
+    out.swap(recentlyDemoted_);
+    return out;
 }
 
 std::vector<BrickKey> WaterMobilizer::takeRecentlyMobilized() {
