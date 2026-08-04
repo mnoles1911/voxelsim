@@ -277,10 +277,10 @@ dropped. On exactly the flat near-coast ground rivers must cross. p=32 loses
 3. **What fragments it now is neither fixed cause.** 137 of the 173 raster
    components are the B5 basin exclusion, by design, composed client-side. Of
    the 36 raw components, **35 end within one pixel of a tile edge** — 24 at the
-   measurement window, **11 at an interior seam**. The fine Q does not cross a
-   fine tile boundary: each tile restarts from the 30 m superblock injection.
-   That is now 8 of the 25 multi-km reaches, including the longest, and it is
-   the next binding constraint.
+   measurement window, **11 at an interior seam**. ~~The fine Q does not cross a
+   fine tile boundary: each tile restarts from the 30 m superblock injection.~~
+   **That explanation is WRONG — see bake_ver 12 below. The water crosses; it
+   arrives divided.** Read the correction before acting on this paragraph.
 
 #### bake_ver 12 — items 2 and 3 addressed, one of them only half
 
@@ -327,6 +327,15 @@ decision, not a patch.
 **Item 1, composed the way the client draws it: yes, from a foothill.** River
 plane ∪ the 255 lake sheets, labelled once: the longest composed reach runs
 **20,269 m unbroken from 389.0 m down to −476.0 m**, out onto the seafloor, and
+
+> **Read that 20,269 m correctly: it is a EUCLIDEAN SPAN, hull to hull, not a
+> length.** `max_pairwise_m` measures the widest separation of the component,
+> not the distance water travels. **Along its own channel the river is
+> 30,577 m, sinuosity 1.51**, of which 24,046 m is above sea level. Quoting the
+> span as river length was an error repeated several times before the
+> longitudinal profile caught it — see
+> `docs/measurements/river-long-profile-2026-08-04.txt`.
+
 only **5.0%** of it is lake sheet — a river, not a chain of lakes. (bv11's was
 16,341 m and 40.2% lake.) A second runs 17,909 m from 269.1 m. The 978 m,
 1,326 m and 1,540 m heads still stop inland; the 1,540 m one *does* appear in a
@@ -417,7 +426,15 @@ vxc_tests   422 C++ tests, 0 failures        (claude/water-integration)
 pytest      539 passed / 2 skipped
 bake        ~300 CPU-s per fine tile
 tiles    D:\voxelsim\tile-cache\...-b196f6020\...\s16\   bv9
-         ...-b4d02b092   bv10 (carried Q)
+         ...-b4d02b092   bv10 (carried Q)   <-- NEWEST CACHE WITH WATER
+
+*** THERE IS NO bv11 OR bv12 CACHE ON DISK. ***
+The seam-crossing and width work (PR #209, BAKE_VERSION 12) has never been
+baked into anything the client can load, because every bake since ran with
+--diagnostic, which write-protects the fine tier. So EVERY CAPTURE TAKEN SO FAR
+SHOWS THE NARROWEST RIVER THIS PROJECT WILL SHIP -- width p90 1.88 m rather
+than 7.50 m. Task C0 in docs/water-waves-plan-2026-08-04.md fixes this and is
+the precondition for any capture being worth judging.
 corridor (-11,-4) (-11,-5) (-12,-5) (-11,-6)   the one that carries water
          (-14,-4) … (-14,-7)                   dry; do not use as a test
 ```
