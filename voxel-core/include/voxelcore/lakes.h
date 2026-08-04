@@ -339,7 +339,13 @@ private:
         // hasBasins() false means "baked before the registry existed", which
         // is NOT "no basins": leaving `basins` null keeps those two apart, and
         // a tile with an empty-but-present table indexes to zero candidates.
-        if (t->hasBasins()) {
+        //
+        // basinsResident() is the THIRD state, and it arrived with partial
+        // tiles: the tile declares a registry that this client has not fetched.
+        // That is also not "no basins", and it routes to the same null -- which
+        // makes extentMaskFor answer nullptr and bumps unresolvedBasins, i.e.
+        // water MISSING and counted, rather than water absent and believed.
+        if (t->hasBasins() && t->basinsResident()) {
             idx.basins = &t->basins();
             const uint32_t size = t->size();
             idx.bucketsPerAxis = size_t((size + kBucketPx - 1) / kBucketPx);

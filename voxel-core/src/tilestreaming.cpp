@@ -133,8 +133,16 @@ std::string formatFineTileCacheKey(const std::string& providerId, uint64_t seed,
 FineTileValidationResult validateAndParseFineTile(std::vector<uint8_t> bytes, uint64_t expectedSeed,
                                                    int32_t expectedX, int32_t expectedY,
                                                    const FineDecompressor& decompressor) {
+    return validateAndParseFineTilePartial(FineTileBytes::whole(std::move(bytes)), expectedSeed,
+                                           expectedX, expectedY, decompressor);
+}
+
+FineTileValidationResult validateAndParseFineTilePartial(FineTileBytes bytes, uint64_t expectedSeed,
+                                                          int32_t expectedX, int32_t expectedY,
+                                                          const FineDecompressor& decompressor) {
     FineTileValidationResult out;
-    std::optional<FineTile> parsed = FineTile::parse(std::move(bytes), decompressor, &out.error);
+    std::optional<FineTile> parsed =
+        FineTile::parsePartial(std::move(bytes), decompressor, &out.error);
     if (!parsed) {
         out.verdict = FineTileVerdict::kCorrupt;
         return out;

@@ -55,6 +55,14 @@ public:
         v = static_cast<int32_t>(u);
         return true;
     }
+    // Advances past `n` bytes without interpreting them. False (and NO advance)
+    // if fewer than `n` remain, so a short buffer cannot be skipped past into
+    // whatever follows it in memory.
+    bool skip(size_t n) {
+        if (static_cast<size_t>(end_ - p_) < n) return false;
+        p_ += n;
+        return true;
+    }
     bool atEnd() const { return p_ == end_; }
 
 private:

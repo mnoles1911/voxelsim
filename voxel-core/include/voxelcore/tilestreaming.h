@@ -278,6 +278,22 @@ FineTileValidationResult validateAndParseFineTile(std::vector<uint8_t> bytes, ui
                                                    int32_t expectedX, int32_t expectedY,
                                                    const FineDecompressor& decompressor = {});
 
+// The same validation for a tile of which only some bytes were fetched (see
+// FineTile::parsePartial and voxelcore/tilerange.h). The identity check is
+// exactly as load-bearing here as above and is in fact MORE so: a ranged read
+// asks for byte offsets taken from THIS tile's section table, so serving a
+// different tile under the same URL would produce a file that parsed cleanly
+// out of two different worlds' bytes. `Cache-Control: immutable` on the server
+// is the other half of that argument; this is the half the client owns.
+//
+// Note the verdict a partial tile can newly return: kCorrupt with
+// error == kBlockNotResident means the PREAMBLE was incomplete -- fetch more,
+// do not discard. Every other kCorrupt error still means discard and re-fetch.
+FineTileValidationResult validateAndParseFineTilePartial(FineTileBytes bytes,
+                                                          uint64_t expectedSeed, int32_t expectedX,
+                                                          int32_t expectedY,
+                                                          const FineDecompressor& decompressor = {});
+
 // --- LRU budget cache ----------------------------------------------------
 
 // Generic byte-budgeted LRU over opaque string keys, with a pin set that can
