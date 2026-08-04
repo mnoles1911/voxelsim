@@ -875,8 +875,14 @@ int main(int argc, char** argv) {
                                  "%s,%" PRId64 ",%" PRId64 ",%u,%d,%" PRId64 ",%" PRId64
                                  ",%" PRId64 ",%" PRId64 ",%" PRId64 ",%d,,\n",
                                  c.control ? "control" : "channel", c.px, c.py, c.logA, s,
-                                 depths[di], bedMm, std::llabs(shoreC - bedIdx) * kVoxelSizeMm,
-                                 haveA ? std::llabs(shoreA - bedIdx) * kVoxelSizeMm : -1, retreat,
+                                 // PRId64 is %ld where int64_t is long (Linux) and %lld where
+                                 // it is long long (Windows); std::llabs is long long on both,
+                                 // so the cast is what makes one format string correct on each.
+                                 depths[di], bedMm,
+                                 static_cast<int64_t>(std::llabs(shoreC - bedIdx)) * kVoxelSizeMm,
+                                 haveA ? static_cast<int64_t>(std::llabs(shoreA - bedIdx)) * kVoxelSizeMm
+                                       : int64_t{-1},
+                                 retreat,
                                  haveA ? 0 : 1);
             }
 
