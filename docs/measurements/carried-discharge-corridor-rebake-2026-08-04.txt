@@ -1,0 +1,203 @@
+RE-BAKING THE CORRIDOR THAT ACTUALLY CARRIES WATER, AT BAKE_VERSION 10
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), 2026-08-04
+================================================================================
+
+THE PREDICTION WAS WRONG. THE FRAGMENTS SURVIVED.
+--------------------------------------------------
+Predicted: carrying Q instead of the area x local-runoff proxy would
+substantially COALESCE the wet mask -- far fewer components, a much longer
+largest component.
+
+Measured, on the four tiles stitched into ONE grid and labelled once,
+8-connected, so a component crossing a tile seam is joined rather than counted
+twice:
+
+                            bv9 (proxy)    bv10 (carried Q)    change
+  components                     1,954              2,014        +3.1%
+  total wet px                  26,488             27,347        +3.2%
+  component size px  p50             3                  3            0
+                     p90            24                 25           +1
+                     max         1,719              1,719            0
+  component span m   p50             5                  5            0
+                     p90            43                 44           +1
+                     max         1,113              1,113            0
+  depth m  min/p50/p90/max  0.50/0.72/1.05/1.08   0.50/0.73/1.05/1.08
+
+  components by span, and the wet-pixel share they hold:
+                        bv9              bv10
+    >=  200 m      17   31.34%      17   30.83%
+    >=  500 m       4   15.78%       4   15.29%
+    >= 1000 m       1    6.49%       1    6.29%
+    >= 2000 m       0    0.00%       0    0.00%
+    >= 5000 m       0    0.00%       0    0.00%
+
+The component count went UP by 60, not down. The longest component is the SAME
+component -- 1,719 px, span 1,113 m, identical to the pixel. So are the next
+four: 1,101/1,101, 514/515, 847/847, 527/526 px, same spans, same elevations.
+The corridor's big pieces did not move at all, and the +859 net wet pixels
+arrived as ~60 new SMALL fragments, which is the opposite of coalescence.
+
+Nothing crossed 2 km in either arm.
+
+("Span" here is the exact maximum pairwise distance within a component, via its
+convex hull -- a chord, not a path length. The pixel pitch is 1.875 m.)
+
+DOES THE LONGEST COMPONENT RUN TOWARD THE COAST? NO -- IT IS 23 km INLAND.
+---------------------------------------------------------------------------
+The corridor box is 3x2 tiles, 46.1 x 30.7 km, elevation -476 to 1,861 m, with
+36,385 sea cells at the 30 m pitch (2.31% of the box, all in (-11,-6)). So
+there IS a coast here, unlike the (-14,*) corridor's supposed mouth.
+
+  the 1,113 m component: elevation 324.9 -> 353.1 m, its low end
+  23.44 km from the nearest sea cell.  Identical in bv9 and bv10.
+
+It is a mid-slope reach, not an estuary. The second and third longest sit
+24.1 km and 32.8 km out.
+
+Water does reach the coast -- it just does not arrive as a river:
+
+  wet px distance to the sea, km     bv9                  bv10
+    min / p10 / p50 / max         0.00/0.85/10.10/33.37  0.00/0.85/9.41/33.37
+    within  1 km of the sea       2,744  (10.36%)        2,830  (10.35%)
+    within  2 km                  3,083  (11.64%)        3,183  (11.64%)
+    within  5 km                  4,376  (16.52%)        4,819  (17.62%)
+    within 10 km                 13,165  (49.70%)       14,414  (52.71%)
+
+THE NUMBER THE OWNER ASKED FOR -- the longest component that ACTUALLY REACHES
+the coast, rather than the longest component anywhere:
+
+                                          bv9        bv10
+  components reaching within 1 km of sea     233        235
+  their wet pixels                         2,745      2,831
+  LONGEST such component, span               472 m      475 m
+  its size                                   179 px     180 px
+  its nearest point to the sea              0.00 km    0.00 km
+
+Water does touch the shoreline, and 2,831 wet pixels lie within a kilometre of
+it -- as 235 separate pieces. The best of them is 475 m long. Carrying Q moved
+that from 472 m: THREE METRES.
+
+WHERE THE 859 EXTRA PIXELS WENT, PER TILE
+------------------------------------------
+  tile      A_in       Q_in carried    implied  local   Q_in vs   wet px
+                                       mm/yr    mm/yr   proxy     bv9 -> bv10
+  (-11,-4)   95.7 km2   9.61e6 m3/yr    100      199     0.50x    5,775 -> 5,354
+  (-11,-5)   58.0       1.94e7          334      279     1.20x    9,261 -> 9,623
+  (-12,-5)    2.0       5.62e5          278      223     1.25x    5,914 -> 5,914
+  (-11,-6)  487.3       1.15e8          236      169     1.40x    5,538 -> 6,456
+
+"implied" is Q_in/A_in, the catchment-mean runoff behind the imported water.
+"Q_in vs proxy" is Q_in / (A_in x local runoff): how far the boundary condition
+moved. Local runoff is c09ef43's figure for each tile.
+
+THIS IS WHY THE FIX HAD LITTLE TO MOVE HERE, and it follows from how the
+corridor was chosen. c09ef43 re-selected it on "runoff high the whole way",
+precisely so the proxy would not zero it out. But a corridor whose local runoff
+matches its catchment's runoff everywhere is exactly the corridor on which the
+proxy was ALREADY nearly right: the correction lands between 0.50x and 1.40x
+here, where at the (-14,*) mouth it was 19.7x. The two selection criteria are
+in tension, and nobody noticed: "a corridor the proxy does not kill" and "a
+corridor that shows what fixing the proxy buys" are close to disjoint.
+
+It corrects downward on (-11,-4) -- catchment 100 mm/yr against 199 mm/yr of
+local ground -- and that tile LOST 421 wet pixels.
+
+(-12,-5) is the cleanest control in the set: 2.0 km2 of boundary inflow is
+negligible against its own catchment, and its wet count is EXACTLY unchanged,
+5,914 -> 5,914. A change that moved it would have meant something was wrong.
+
+WHAT THE FRAGMENTATION IS NOT: IT IS NOT THE CURRENCY
+------------------------------------------------------
+The premise behind the prediction was that area accumulates monotonically while
+the conversion to discharge multiplies by a spatially varying local runoff, so
+the fragmentation must live in that conversion. Two measurements against it.
+
+1. THE AREA NETWORK ON THE SAME STITCHED GRID, thresholded at the flow plane's
+   log2 >= 23 (where wet cells begin), labelled by the same labeller:
+
+     cells 73,575   components 3,615   largest 12.0%   wet share 36.1%
+     top by size: 8,823px/4,216m  4,049px/2,207m  3,940px/2,068m
+                  2,600px/1,887m  1,757px/1,085m
+
+   Four AREA components span >= 1.8 km and the largest spans 4,216 m, against
+   a wet-mask maximum of 1,113 m and nothing at all over 2 km. Only 36.1% of
+   above-threshold-area cells are wet. So on identical ground the area network
+   is ~3.8x longer in its best piece than the discharge network -- the gap the
+   prediction was about is real, and carrying Q closed none of it.
+
+2. THE CURRENCY IS NOT WHERE THE WEIGHTING HAPPENS. `acc` and `q_pad` are
+   produced by the SAME `kernels.accumulate_mfd` over the SAME `filled`
+   surface with the SAME `mfd_p`. They differ in the source term and in the
+   boundary term, and task #49 changed ONLY the boundary term:
+   `water.discharge_source` still seeds every interior cell with
+   `runoff_m * cell_m^2`, the spatially varying local runoff, exactly as
+   before. The per-cell runoff weighting that the prediction blamed is
+   untouched by the fix; the fix replaced how the water ARRIVING AT THE EDGE
+   is denominated.
+
+   That is consistent with everything above: the tile whose edge delivers
+   almost nothing ((-12,-5), 2.0 km2) is bit-for-bit unchanged, and the tile
+   whose edge delivers most ((-11,-6), 487.3 km2) gained the most pixels --
+   and still gained them as fragments, because the boundary is only ever a
+   rim and HYDROLOGY_RESIDUALS #7 governs what happens after it.
+
+Not established here: what DOES set the fragmentation. The candidates the
+measurements above are consistent with, none of them tested, are the sharpness
+of the `q_drawable` cut against a coarse log2 area bin (a log2 threshold
+tolerates a factor of 2 before it breaks a component; a Q threshold does not),
+MFD dispersion splitting Q below the cut and back over it, and B5 basin cells
+being written dry -- (-11,-6) is 17.4% basin with 154 registered basins. That
+needs the discharge raster along a traced channel, which needs a re-bake with
+`--bake-npz-dir`, and is deliberately not guessed at here.
+
+TERRAIN DID NOT MOVE -- CHECKED ON EVERY TILE, NOT ARGUED
+----------------------------------------------------------
+TERRAIN_VERSION 8 on both sides. Per tile, bv9 vs bv10 shipped bytes:
+
+  tile      elevation cp   flow plane     basins
+  (-11,-4)  bit-identical  bit-identical  55 = 55
+  (-11,-5)  bit-identical  bit-identical  25 = 25
+  (-12,-5)  bit-identical  bit-identical  21 = 21
+  (-11,-6)  bit-identical  bit-identical  154 = 154
+
+Same `base_offset_mm` and `quant` in each case, so the identity is of the
+SURFACE and not only of the integers. Only the water plane differs. This
+extends the commit's two-superblock check to four whole shipped tiles.
+
+The bv10 tiles went to their own namespace (...-b4d02b092) beside the bv9 ones
+(...-b196f6020); both are on disk and the comparison above reads them both.
+
+Every bake reported the carried currency in its log line
+(`injected=...km2/Q...m3yr@...mm`), so the proxy was not silently in use, and
+every one reported a non-zero `water=N%wet`, so the encoder did not drop the
+water plane as it did before c09ef43.
+
+TESTS, MEASURED ON THIS WORKTREE
+---------------------------------
+  pytest (terrain-service)   532 passed / 2 skipped      baseline 532 / 2   OK
+  ctest                      2/2, 383 cases, 0 failures  baseline 2/2, 383  OK
+
+Zero C++ files were touched; voxel-core was configured and built from scratch
+in this worktree to take the ctest number rather than quote it. (`ctest` needs
+`-C Release` on this multi-config generator or both tests report "Not Run" and
+the run looks like two failures.)
+
+COST
+----
+  bakes        4 tiles     1,151 CPU-s  (314.6 + 281.7 + 278.9 + 275.8)
+  measurement  decode and label only, no bake
+
+The first tile was baked and checked ALONE before the other three were spent,
+per the standing rule after the encoder silently dropped a water plane.
+
+TOOLS ADDED
+-----------
+  tools/measure_corridor_fragmentation.py
+      stitch N tiles, label the wet mask 8-connected with a sparse union-find
+      (the stitched grid is 16384 x 24576; an int32 label image of it is
+      1.6 GB and the wet set is 27k pixels), and report counts, sizes, spans,
+      span thresholds with their pixel shares, and depth. `--area-log2` labels
+      the flow plane's accumulated-area network the same way, as the control.
+  tools/corridor_coast_reach.py
+      the same stitch against the coastline: distance from every wet pixel to
+      the nearest sea cell, and the longest component that actually reaches it.
