@@ -20,6 +20,7 @@
 #include "VoxelEarthPlayerController.h"
 #include "VoxelEditRelay.h"
 #include "VoxelOceanActor.h"
+#include "VoxelOceanCaptureFixture.h" // -VoxelOceanSurvey / -VoxelOceanDig, registered beside the other water fixtures below
 #include "VoxelSkyLadderFixture.h" // -VoxelSkyLadder=<N>, registered beside the SWE breach fixture below
 #include "VoxelSweBreachFixture.h" // -VoxelSweBreachTest, registered beside the other water fixtures below
 #include "VoxelWaterSheetActor.h"  // watershed item 5: lake sheets past the implicit disc
@@ -2258,6 +2259,19 @@ void AVoxelEarthGameMode::BeginPlay()
 	// second possibility. A breach on a real slope tells them apart, because
 	// one produces a travelling velocity front and the other does not.
 	VoxelSweBreachFixture::StartFromCommandLine(World);
+
+	// --- the ocean captures (work item 8, §6.4) --------------------------------
+	//
+	// -VoxelOceanSurvey=<radiusM>   print GetSurfaceHeightUU over a grid
+	// -VoxelOceanDig=pit|breach     dig at -VoxelOceanDigAt=X,Y (metres)
+	//
+	// Out-of-line beside the other water fixtures, and registered here for the
+	// same reason they are: this is where anyone looking for a water fixture
+	// looks. See VoxelOceanCaptureFixture.h for why none of the four existing
+	// dig fixtures can frame a near-field water capture -- in one line, they
+	// all carve outside the +/-25.6 m xy, +/-12.8 m z box the implicit water
+	// is computed in, so their digs are meshed correctly and are invisible.
+	VoxelOceanCaptureFixture::StartFromCommandLine(World);
 
 	// --- W6 day/night acceptance ladder ---------------------------------------
 	//
