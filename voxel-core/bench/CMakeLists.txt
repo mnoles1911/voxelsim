@@ -200,3 +200,13 @@ target_link_libraries(vxc_burialprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_burialprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_hydroprobe: what kMaxHydrostaticComponentCells bounds, and what it
+# costs. The cap is the binding constraint on CA water correctness and its only
+# instrument was a VXC_WATER_PROFILE counter; this measures the deferral's size,
+# its traversal cost, and whether a shipping build can see it at all. --------
+add_executable(vxc_hydroprobe hydroprobe.cpp)
+target_link_libraries(vxc_hydroprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_hydroprobe PRIVATE -Wall -Wextra -Werror)
+endif()

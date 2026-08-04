@@ -102,11 +102,10 @@ constexpr int kHydroDx[6] = {1, -1, 0, 0, 0, 0};
 constexpr int kHydroDy[6] = {0, 0, 1, -1, 0, 0};
 constexpr int kHydroDz[6] = {0, 0, 0, 0, 1, -1};
 
-// Backstop cap on one hydrostatic component's cell count -- see waterca.h
-// "Phase C -- HYDROSTATIC" for the full rationale (the water-side flood
-// fill is deliberately unbounded; this is what keeps one enormous connected
-// body from making a single tick's pass unbounded too).
-constexpr size_t kMaxHydrostaticComponentCells = 65536;
+// kMaxHydrostaticComponentCells now lives in waterca.h (WaterCA defaults
+// hydroLargeThreshold_ to it). Read "Phase C -- HYDROSTATIC" step 1 there
+// before touching anything that uses it: it selects a LEVELLING PATH, and
+// through v4 it wrongly selected "give up".
 
 // The ONE fixed enumeration used everywhere in this file: as a cell's own
 // outgoing-flow priority (source-side cap, header "Tick rules v1") AND,
@@ -853,6 +852,15 @@ size_t WaterCA::wakeRegion(int64_t minVx, int64_t minVy, int64_t minVz, int64_t 
 
 void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                               std::set<BrickKey, BrickKeyLess>& changed) {
+    // Per-tick deferral reporting is exactly that -- per tick. The STICKY half
+    // (hydroDeferralEvents_, worstDeferral_) is deliberately not cleared here:
+    // a deferral silences the body that caused it, so by the next tick there is
+    // nothing left to observe and a per-tick-only signal would be unreadable in
+    // practice. See waterca.h, "settled vs gave up".
+    hydroDeferredComponents_ = 0;
+    hydroDeferredCells_ = 0;
+    hydroDeferredVolume_ = 0;
+
     // --- Per-brick flood cache (W2 perf fix, docs/status.md) ----------------
     // The component partition, per-component totalVol, and bottom-up level
     // allocation below are BYTE-FOR-BYTE the same as the from-scratch flood
@@ -898,9 +906,19 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         SolidMaskBrick* solidMask; // nullptr when the memo is disabled
         bool touched;
         bool queued;                     // already on the brick worklist
+        bool inComponent;                // already on `componentBricks` this component
         std::array<uint64_t, 8> visited; // 512 bits in cellIndex order
         std::array<uint64_t, 8> pending; // discovered-but-not-yet-expanded cells
-        std::array<BrickCell*, 6> nbr;   // lazily resolved, kHydroD* order
+        // Cells of THIS component living in this brick, 512 bits in cellIndex
+        // order. `visited` is global across the whole tick and cannot answer
+        // "which cells were mine"; this can, and it is what lets the over-cap
+        // path level a component without materializing its cell list. Cleared
+        // per component (componentBricks below is the list of bricks to clear).
+        // Word w IS z-layer w of the brick, because cellIndex = x + 8y + 64z --
+        // which is why a per-z histogram is 8 popcounts per brick and not a
+        // per-cell loop.
+        std::array<uint64_t, 8> member;
+        std::array<BrickCell*, 6> nbr; // lazily resolved, kHydroD* order
     };
     // Bound the memo BEFORE any node pointer below is taken: clearing it here
     // is safe precisely because nothing holds a SolidMaskBrick* yet.
@@ -921,8 +939,10 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         bc.solidMask = solidCacheEnabled_ ? &solidCache_[k] : nullptr;
         bc.touched = touched.find(k) != touched.end();
         bc.queued = false;
+        bc.inComponent = false;
         bc.visited.fill(0);
         bc.pending.fill(0);
+        bc.member.fill(0);
         bc.nbr.fill(nullptr);
         return cache.emplace(k, bc).first->second;
     };
@@ -966,8 +986,23 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // words until the brick is empty -- expanding a cell can push new pending
     // bits into a word the scan already passed, and the re-scan is 8 loads.
     std::vector<BrickCell*> brickWork;
-    auto enqueue = [&brickWork](BrickCell& b, int ci) {
+    // Every brick holding at least one cell of the component currently being
+    // flooded. Exists so `member` can be cleared in O(bricks) between
+    // components, and so the over-cap path can walk the component's cells
+    // without ever having stored them one by one.
+    std::vector<BrickCell*> componentBricks;
+    auto enqueue = [&brickWork, &componentBricks](BrickCell& b, int ci) {
         b.pending[static_cast<size_t>(ci >> 6)] |= (1ull << (ci & 63));
+        // Membership is recorded HERE, at enqueue, not at markVisited: a cell
+        // marked visited but never enqueued is a SOLID cell the flood rejected
+        // (see the solidity gate below), and a solid cell is not a member of
+        // anything. Every enqueued cell is popped exactly once and is exactly
+        // the population the small path pushes into `cells`.
+        b.member[static_cast<size_t>(ci >> 6)] |= (1ull << (ci & 63));
+        if (!b.inComponent) {
+            b.inComponent = true;
+            componentBricks.push_back(&b);
+        }
         if (!b.queued) {
             b.queued = true;
             brickWork.push_back(&b);
@@ -997,7 +1032,10 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         uint8_t fill;
     };
     std::vector<FloodCell> cells;
-    cells.reserve(kMaxHydrostaticComponentCells + 1); // grow-once, reused per seed
+    // Grow-once, reused per seed. Bounded by the DEFAULT cap even when the
+    // threshold has been lowered for a test -- the reserve is a memory bound,
+    // not a behavioural one.
+    cells.reserve(std::min(hydroLargeThreshold_, kMaxHydrostaticComponentCells) + 1);
     // Writes are DEFERRED to a single apply pass after ALL components are
     // discovered, rather than applied per-component inside the loop. This is
     // what lets the read-only brick cache above hold `water_.find` pointers
@@ -1009,6 +1047,49 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // absolute value computed from the captured totalVol, independent of
     // when it is committed.
     std::vector<std::pair<VoxelKey, uint8_t>> pendingWrites;
+
+    // --- The over-cap ("streaming") levelling plan -------------------------
+    //
+    // A component above kMaxHydrostaticComponentCells cannot afford
+    // `pendingWrites`: the engine's real runaway is 150-350x the cap, and a
+    // 20 M-cell component is ~640 MB of (VoxelKey, uint8) pairs before anything
+    // is written. It cannot afford `cells` either (16 B/cell, plus an
+    // O(n log n) sort). So instead of a list of WRITES, the over-cap path
+    // defers a PLAN: the component's per-brick membership masks (64 B per
+    // brick, ~0.125 B per cell -- two orders of magnitude smaller) plus the
+    // four numbers that turn a cell's (x,y,z) into its target.
+    //
+    // The targets are IDENTICAL to what the small path would compute. The level
+    // allocation only ever depends on how many component cells share each z --
+    // that is a histogram, obtainable from 8 popcounts per brick, and the sort
+    // exists in the small path purely to group cells by z and to order ONE
+    // layer. So:
+    //   * every layer strictly below `partialZ` -> 255;
+    //   * every layer above -> 0;
+    //   * `partialZ` itself -> `base`, plus one extra unit to the first `rem`
+    //     cells in (x,y)-ascending order -- resolved not by sorting the layer
+    //     but by nth_element'ing it once to find the rank-`rem` coordinate,
+    //     after which "is this cell one of the first `rem`" is an O(1)
+    //     lexicographic compare against that threshold. Cells in a fixed z
+    //     layer have distinct (x,y), so "strictly less than the rank-`rem`
+    //     element" selects exactly `rem` of them -- no ties to break.
+    struct LargePlan {
+        std::vector<std::pair<BrickKey, std::array<uint64_t, 8>>> bricks;
+        bool hasPartial = false; // false => totalVol filled every layer exactly
+        int64_t partialZ = 0;
+        uint64_t base = 0;
+        bool hasThreshold = false; // false => rem == 0, every partial cell gets `base`
+        int64_t thrX = 0, thrY = 0;
+    };
+    std::vector<LargePlan> largePlans;
+
+    auto largeTargetFor = [](const LargePlan& p, int64_t z, int64_t x, int64_t y) -> uint8_t {
+        if (!p.hasPartial || z < p.partialZ) return uint8_t(255);
+        if (z > p.partialZ) return uint8_t(0);
+        uint64_t v = p.base;
+        if (p.hasThreshold && (x < p.thrX || (x == p.thrX && y < p.thrY))) v += 1u;
+        return static_cast<uint8_t>(v);
+    };
 
 #ifdef VXC_WATER_PROFILE
     uint64_t popsThisComponent = 0;
@@ -1041,11 +1122,22 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // redistribution every tick, diluting the level and reactivating a
     // permanently growing footprint -- never a genuine pressure response, just
     // brick-granularity leakage. That was a real never-settling bug.
-    auto floodComponent = [&](BrickCell& seed, int seedCi, uint64_t& totalVol) -> bool {
+    //
+    // RETURNS whether the component is OVER kMaxHydrostaticComponentCells --
+    // which since kWaterCAVersion 5 selects the levelling path rather than
+    // meaning "give up" (see waterca.h). `totalVol` and `cellCount` are the
+    // component's EXACT totals either way; before v5 `totalVol` stopped
+    // accumulating the instant the cap tripped, which was harmless only because
+    // the value was then thrown away, and would have been a silent
+    // volume-destroying bug the moment anyone tried to use it.
+    auto floodComponent = [&](BrickCell& seed, int seedCi, uint64_t& totalVol,
+                              uint64_t& cellCount) -> bool {
         bool overflowed = false;
         totalVol = 0;
+        cellCount = 0;
         cells.clear();
         brickWork.clear();
+        componentBricks.clear();
         enqueue(seed, seedCi);
 #ifdef VXC_WATER_PROFILE
         popsThisComponent = 0;
@@ -1073,12 +1165,15 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
 #ifdef VXC_WATER_PROFILE
                         ++popsThisComponent;
 #endif
+                        // Unconditional -- see the RETURNS note above. The cap
+                        // gates only whether the CELL LIST is materialized.
+                        ++cellCount;
+                        totalVol += cFill;
                         if (!overflowed) {
                             cells.push_back(FloodCell{int64_t(cBrick.key.x) * kEdge + (cci & 7),
                                                       int64_t(cBrick.key.y) * kEdge + ((cci >> 3) & 7),
                                                       int64_t(cBrick.key.z) * kEdge + (cci >> 6), cFill});
-                            totalVol += cFill;
-                            if (cells.size() > kMaxHydrostaticComponentCells) overflowed = true;
+                            if (cells.size() > hydroLargeThreshold_) overflowed = true;
                         }
                         const bool canEnterAir = cFill == 255 || cFill == 0;
                         for (int i = 0; i < 6; ++i) {
@@ -1148,6 +1243,135 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
         }
         return overflowed;
     };
+
+    // Clears `member`/`inComponent` across the component just flooded. O(bricks)
+    // -- this is the same "restore the per-brick mask state" obligation
+    // ADR-0003 identifies, except that here it is paid WITHIN one tick, where
+    // the flood has already touched every one of these bricks, instead of
+    // across ticks where it would be the whole cost being avoided.
+    auto releaseComponent = [&componentBricks] {
+        for (BrickCell* bc : componentBricks) {
+            bc->member.fill(0);
+            bc->inComponent = false;
+        }
+        componentBricks.clear();
+    };
+
+    // Turns the just-flooded component's membership masks into a LargePlan.
+    // Returns false -- and writes NOTHING -- if the plan it derived would not
+    // conserve volume exactly. See the conservation check at the bottom.
+    // Both reused across components rather than reallocated per component: on a
+    // pour that keeps one large body permanently out of equilibrium this lambda
+    // runs every tick, and a fresh heap vector per call would be the only
+    // allocation in the hot path.
+    std::vector<std::pair<int64_t, int64_t>> partialLayer;
+    std::vector<uint64_t> countPerZ;
+    auto buildLargePlan = [&](uint64_t totalVol, uint64_t cellCount, LargePlan& plan) -> bool {
+        plan.bricks.clear();
+        plan.hasPartial = false;
+        plan.hasThreshold = false;
+        plan.base = 0;
+
+        // Per-z cell histogram. Word w of a brick's mask IS z-layer
+        // key.z*8 + w, so this is 8 popcounts per brick and touches no cell.
+        // Indexing is dense over the component's brick-z span, which is safe
+        // because a CONNECTED component occupies every brick-z between its
+        // extremes (any path between two cells passes through the intervening
+        // layers), so the array is at most 8 entries per brick it actually has.
+        int64_t zbLo = 0, zbHi = 0;
+        bool first = true;
+        for (BrickCell* bc : componentBricks) {
+            if (first) { zbLo = zbHi = bc->key.z; first = false; }
+            else {
+                if (bc->key.z < zbLo) zbLo = bc->key.z;
+                if (bc->key.z > zbHi) zbHi = bc->key.z;
+            }
+        }
+        if (first) return false; // no bricks: impossible for a real component
+        const size_t nz = static_cast<size_t>(zbHi - zbLo + 1) * static_cast<size_t>(kEdge);
+        countPerZ.assign(nz, 0);
+        for (BrickCell* bc : componentBricks) {
+            const size_t base = static_cast<size_t>(bc->key.z - zbLo) * static_cast<size_t>(kEdge);
+            for (size_t w = 0; w < 8; ++w)
+                if (bc->member[w])
+                    countPerZ[base + w] += static_cast<uint64_t>(std::popcount(bc->member[w]));
+        }
+
+        // Bottom-up allocation, exactly the small path's rule (waterca.h step
+        // 2): fill each layer to 255 while the volume lasts; the first layer
+        // that cannot be filled whole gets totalVol/n each plus one unit to the
+        // first totalVol%n of them; every layer above it gets 0. A layer
+        // reached with remaining==0 falls into the same branch with base=rem=0,
+        // which IS "gets 0" -- so the two cases need not be distinguished.
+        uint64_t remaining = totalVol;
+        uint64_t cellsBelow = 0; // cells in layers that came out completely full
+        uint64_t partialN = 0;
+        uint64_t rem = 0;
+        size_t partialIdx = 0;
+        for (size_t i = 0; i < nz; ++i) {
+            const uint64_t n = countPerZ[i];
+            if (n == 0) continue;
+            const uint64_t layerCap = n * 255ull;
+            if (remaining >= layerCap) {
+                remaining -= layerCap;
+                cellsBelow += n;
+                continue;
+            }
+            plan.hasPartial = true;
+            plan.partialZ = int64_t(zbLo) * kEdge + static_cast<int64_t>(i);
+            partialIdx = i;
+            partialN = n;
+            plan.base = remaining / n;
+            rem = remaining % n;
+            remaining = 0;
+            break;
+        }
+
+        // CONSERVATION, checked in closed form and as EXACT INTEGER EQUALITY --
+        // never a tolerance. This is the guard that catches a wrong predicate:
+        // the sum of every target this plan will write must be totalVol to the
+        // unit, because Phase C is a REDISTRIBUTION and has no source or sink.
+        // Levelling an over-cap component while dropping or inventing volume
+        // would be strictly worse than the deferral it replaces, so if this
+        // does not hold the plan is refused and the caller defers, loudly.
+        const uint64_t willWrite =
+            255ull * cellsBelow + (plan.hasPartial ? plan.base * partialN + rem : 0ull);
+        if (willWrite != totalVol) return false;
+        // Sanity: the histogram must account for every cell the flood counted.
+        uint64_t histTotal = 0;
+        for (size_t i = 0; i < nz; ++i) histTotal += countPerZ[i];
+        if (histTotal != cellCount) return false;
+
+        // The one layer that needs a within-layer order. nth_element, not sort:
+        // all that is wanted is the rank-`rem` (x,y), after which membership in
+        // "the first rem" is a compare.
+        if (plan.hasPartial && rem > 0) {
+            const int64_t pbz = zbLo + static_cast<int64_t>(partialIdx / 8);
+            const size_t pw = partialIdx % 8;
+            partialLayer.clear();
+            partialLayer.reserve(static_cast<size_t>(partialN));
+            for (BrickCell* bc : componentBricks) {
+                if (bc->key.z != pbz) continue;
+                uint64_t m = bc->member[pw];
+                while (m) {
+                    const int b = std::countr_zero(m);
+                    m &= m - 1;
+                    partialLayer.emplace_back(int64_t(bc->key.x) * kEdge + (b & 7),
+                                              int64_t(bc->key.y) * kEdge + ((b >> 3) & 7));
+                }
+            }
+            if (partialLayer.size() != partialN) return false;
+            std::nth_element(partialLayer.begin(),
+                             partialLayer.begin() + static_cast<ptrdiff_t>(rem), partialLayer.end());
+            plan.hasThreshold = true;
+            plan.thrX = partialLayer[static_cast<size_t>(rem)].first;
+            plan.thrY = partialLayer[static_cast<size_t>(rem)].second;
+        }
+
+        plan.bricks.reserve(componentBricks.size());
+        for (BrickCell* bc : componentBricks) plan.bricks.emplace_back(bc->key, bc->member);
+        return true;
+    };
     VXC_WP_ADD(hydroSetupNs, tHSetup);
     VXC_WP_TV(tHScan);
 
@@ -1174,26 +1398,69 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
                     // bounded-through-air / unbounded-through-water rule).
                     markVisited(seedBrick, ci);
                     uint64_t totalVol = 0;
+                    uint64_t cellCount = 0;
                     VXC_WP_INC(hydroComponents, 1);
                     VXC_WP_ADD(hydroScanNs, tHScan);
                     VXC_WP_TV(tHFlood);
-                    const bool overflowed = floodComponent(seedBrick, ci, totalVol);
+                    const bool overCap = floodComponent(seedBrick, ci, totalVol, cellCount);
                     VXC_WP_ADD(hydroFloodNs, tHFlood);
                     VXC_WP_TV(tHLevel);
 #ifdef VXC_WATER_PROFILE
-                    if (overflowed) {
+                    if (overCap) {
                         ++waterCAProfile().hydroOverflowed;
                         waterCAProfile().hydroPopsOverflowed += popsThisComponent;
                     }
 #endif
 
-                    // Too big to safely handle this tick (deferred, not
-                    // truncated-and-wrong -- see header comment), or a
-                    // trivial single-cell "component" (just the seed,
-                    // nothing reachable) that's already its own fixed
-                    // point: nothing to write. (Always has water: the seed
-                    // itself does, unconditionally.)
-                    if (overflowed || cells.size() < 2) {
+                    if (overCap) {
+                        // Over kMaxHydrostaticComponentCells: level it through
+                        // the streaming plan (default), or reproduce v4 and
+                        // leave it completely unmodified. Either way the
+                        // deferral -- if there is one -- is RECORDED, in every
+                        // build, because a component that is not levelled makes
+                        // its bricks quiet and there is no second chance to
+                        // notice (waterca.h, "settled vs gave up").
+                        bool levelled = false;
+                        if (hydroLargePolicy_ == HydroLargeComponentPolicy::kLevelStreaming) {
+                            largePlans.emplace_back();
+                            if (buildLargePlan(totalVol, cellCount, largePlans.back())) {
+                                levelled = true;
+                                ++hydroStreamed_;
+                                if (cellCount > hydroLargestStreamed_)
+                                    hydroLargestStreamed_ = cellCount;
+                            } else {
+                                // Refused on the exact-conservation check. Drop
+                                // the plan and fall through to the deferral, so
+                                // a wrong predicate costs water nothing and is
+                                // reported identically to a policy deferral.
+                                largePlans.pop_back();
+                            }
+                        }
+                        if (!levelled) {
+                            ++hydroDeferredComponents_;
+                            hydroDeferredCells_ += cellCount;
+                            hydroDeferredVolume_ += totalVol;
+                            ++hydroDeferralEvents_;
+                            if (cellCount > worstDeferral_.cells) {
+                                worstDeferral_.seedX = int64_t(seedBrick.key.x) * kEdge + x;
+                                worstDeferral_.seedY = int64_t(seedBrick.key.y) * kEdge + y;
+                                worstDeferral_.seedZ = int64_t(seedBrick.key.z) * kEdge + z;
+                                worstDeferral_.cells = cellCount;
+                                worstDeferral_.volume = totalVol;
+                            }
+                        }
+                        releaseComponent();
+                        VXC_WP_ADD(hydroLevelNs, tHLevel);
+                        VXC_WP_SET(tHScan);
+                        continue;
+                    }
+                    releaseComponent();
+
+                    // A trivial single-cell "component" (just the seed, nothing
+                    // reachable) is already its own fixed point: nothing to
+                    // write. (Always has water: the seed itself does,
+                    // unconditionally.)
+                    if (cells.size() < 2) {
                         VXC_WP_ADD(hydroLevelNs, tHLevel);
                         VXC_WP_SET(tHScan);
                         continue;
@@ -1252,6 +1519,55 @@ void WaterCA::hydrostaticPass(const std::set<BrickKey, BrickKeyLess>& touched,
     // current fill is a no-op there. Deferred to here (see pendingWrites)
     // so the brick cache above never observes a mid-pass mutation of water_.
     for (const auto& [vk, target] : pendingWrites) setFillAccounted(vk.x, vk.y, vk.z, target, &changed);
+
+    // Over-cap components, applied from their plans rather than from a
+    // materialized write list. Same deferral discipline and the same reason for
+    // it: nothing here may run while discovery is still holding `water_.find`
+    // pointers, and by this point discovery is finished.
+    //
+    // The no-op skip the small path gets for free (it captured each cell's fill
+    // at flood time) is reproduced here by reading the brick ONCE and comparing
+    // per cell, so a fully settled 20 M-cell body costs one hash per brick and
+    // a byte compare per cell, and issues zero writes -- which is what a settled
+    // ocean must cost. `wb` is re-resolved after every write because
+    // setFillAccounted may create the brick (first non-zero write into an
+    // absent one) or collapse it out of the map (last non-zero cell zeroed);
+    // that is one hash per WRITE, exactly what the pendingWrites path above
+    // pays, and it is only paid by cells that are actually changing.
+    for (const LargePlan& plan : largePlans) {
+        for (const auto& [key, mask] : plan.bricks) {
+            const WaterBrick8* wb = water_.find(key);
+            for (size_t w = 0; w < 8; ++w) {
+                uint64_t m = mask[w];
+                if (!m) continue;
+                const int64_t vz = int64_t(key.z) * kEdge + static_cast<int64_t>(w);
+                while (m) {
+                    const int b = std::countr_zero(m);
+                    m &= m - 1;
+                    const int64_t vx = int64_t(key.x) * kEdge + (b & 7);
+                    const int64_t vy = int64_t(key.y) * kEdge + ((b >> 3) & 7);
+                    const uint8_t target = largeTargetFor(plan, vz, vx, vy);
+                    const uint8_t cur =
+                        wb ? wb->cell(static_cast<int>(w) * 64 + b) : uint8_t(0);
+                    if (target == cur) continue;
+                    // Only these two writes can move the BRICK in the map: a
+                    // non-zero write into an absent brick creates it, and a
+                    // write of 0 can empty it (homogeneous-empty collapse).
+                    // Anything else mutates the existing brick in place, and
+                    // WaterMap is node-based, so `wb` survives every insert
+                    // another cell's write might trigger. Re-finding
+                    // unconditionally would double this loop's hashing against
+                    // the pendingWrites path it replaces, on exactly the
+                    // scenario (a large body actively levelling) where it is
+                    // the hot loop.
+                    const bool mayMoveBrick = (wb == nullptr) || target == 0;
+                    setFillAccounted(vx, vy, vz, target, &changed);
+                    VXC_WP_INC(hydroWrites, 1);
+                    if (mayMoveBrick) wb = water_.find(key);
+                }
+            }
+        }
+    }
     VXC_WP_ADD(hydroApplyNs, tHApply);
 }
 
@@ -1270,6 +1586,14 @@ void WaterCA::stepWithOrder(std::vector<BrickKey> order) {
     lastSteppedBrickCount_ = order.size();
 
     if (order.empty()) {
+        // A settled tick defers nothing, and must SAY so rather than leaving
+        // the previous tick's numbers standing -- these are per-tick by
+        // contract (waterca.h). The sticky record is untouched on purpose: a
+        // body that gave up is exactly the thing that produces settled ticks
+        // afterwards, so clearing it here would erase the report every time.
+        hydroDeferredComponents_ = 0;
+        hydroDeferredCells_ = 0;
+        hydroDeferredVolume_ = 0;
         active_.clear();
         return;
     }
@@ -2123,6 +2447,25 @@ void WaterState::serialize(const WaterCA& ca, const WaterMobilizer& mob,
 
     w.u64(mob.mobilizedBricks().size());
     for (const BrickKey& k : mob.mobilizedBricks()) writeKey(w, k);
+
+    // kFormatVersion 2: the hydrostatic deferral record. This is the ONE thing
+    // in the blob that is not simulation state, and it is here for a reason the
+    // "OUT, and deliberately" list in waterca.h makes precise: everything left
+    // out is DERIVED, re-askable at the cost of asking. This is not. A deferred
+    // component emits no writes, so its bricks fall out of the active set and
+    // the CA goes quiet; a reload cannot re-derive the condition because
+    // nothing will ever tick that body again. Drop it and the next session
+    // opens a world with water parked below its own equilibrium and no way to
+    // know. Five integers is a cheap price for that not being true.
+    // bytes.h has no i64; the u64 round trip is exact two's-complement both
+    // ways, and these are voxel coordinates, so the sign matters.
+    w.u64(ca.hydroDeferralEvents());
+    const WaterCA::HydroDeferral& d = ca.worstDeferral();
+    w.u64(static_cast<uint64_t>(d.seedX));
+    w.u64(static_cast<uint64_t>(d.seedY));
+    w.u64(static_cast<uint64_t>(d.seedZ));
+    w.u64(d.cells);
+    w.u64(d.volume);
 }
 
 std::optional<WaterState> WaterState::parse(const uint8_t* data, size_t size) {
@@ -2167,6 +2510,21 @@ std::optional<WaterState> WaterState::parse(const uint8_t* data, size_t size) {
 
     if (!readKeyList(r, s.active)) return std::nullopt;
     if (!readKeyList(r, s.mobilized)) return std::nullopt;
+
+    // kFormatVersion 2: the hydrostatic deferral record (see serialize).
+    uint64_t sx = 0, sy = 0, sz = 0;
+    if (!r.u64(s.hydroDeferralEvents)) return std::nullopt;
+    if (!r.u64(sx) || !r.u64(sy) || !r.u64(sz)) return std::nullopt;
+    if (!r.u64(s.worstDeferral.cells)) return std::nullopt;
+    if (!r.u64(s.worstDeferral.volume)) return std::nullopt;
+    s.worstDeferral.seedX = static_cast<int64_t>(sx);
+    s.worstDeferral.seedY = static_cast<int64_t>(sy);
+    s.worstDeferral.seedZ = static_cast<int64_t>(sz);
+    // A record that claims no events must be blank, and one that claims events
+    // must name a component. Rejecting the mismatch keeps "hydroGaveUp() is
+    // true" from ever meaning "and there is nothing to look at".
+    if ((s.hydroDeferralEvents == 0) != (s.worstDeferral.cells == 0)) return std::nullopt;
+
     if (!r.atEnd()) return std::nullopt; // trailing bytes: truncated append or garbage
     return s;
 }
@@ -2176,6 +2534,7 @@ bool WaterState::applyTo(WaterCA& ca, WaterMobilizer& mob) const {
     // mentions -- a silent merge, not a load. Refuse before writing anything.
     if (ca.storedBrickCount() != 0 || ca.totalVolume() != 0 || ca.activeBrickCount() != 0)
         return false;
+    if (ca.hydroGaveUp()) return false; // same freshness rule: no silent merge
     if (!mob.mobilizedBricks().empty()) return false;
 
     // FILLS FIRST (waterca.h explains why the order is written down even
@@ -2205,6 +2564,13 @@ bool WaterState::applyTo(WaterCA& ca, WaterMobilizer& mob) const {
     // already in the fill loaded above, which is the precondition its doc
     // comment states and the one this class exists to actually satisfy.
     for (const BrickKey& k : mobilized) mob.markMobilized(k);
+
+    // The deferral record, restored verbatim (WaterState is a friend for this
+    // one assignment). It is a REPORT, not an input: it feeds no tick decision
+    // and no digest, so restoring it cannot change what the loaded world does
+    // -- only what it is able to tell its caller about itself.
+    ca.hydroDeferralEvents_ = hydroDeferralEvents;
+    ca.worstDeferral_ = worstDeferral;
     return true;
 }
 

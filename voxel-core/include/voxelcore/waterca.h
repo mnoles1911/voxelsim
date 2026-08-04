@@ -210,16 +210,75 @@
 //      first bullet, so only the "new, previously-dry" side of a rise is
 //      ever tick-limited — an already-full column of water is never
 //      artificially capped).
-//      A hard cell-count cap per component (kMaxHydrostaticComponentCells,
-//      waterca.cpp) is the backstop against the unbounded-through-water half
-//      of this rule making one enormous connected body (a whole persistent
-//      lake/ocean, later milestones) expensive every tick something merely
-//      touches its edge: a component that would exceed the cap is left
-//      completely unmodified this tick (never partially/incorrectly
-//      equalized off a truncated view) — safe, just deferred; see
-//      docs/status.md's W2 hydrostatic note for the "active-only"
-//      optimization (e.g. a persisted per-body union-find) this should get
-//      before a real large persistent body exists.
+//      kMaxHydrostaticComponentCells (waterca.cpp) is a PATH SELECTOR, not a
+//      give-up threshold. Read the next paragraph before changing anything
+//      near it; it is the single most misread constant in this file.
+//
+//      WHAT IT USED TO BE, AND WHY THAT WAS WRONG (kWaterCAVersion<=4). It was
+//      documented as "the backstop against the unbounded-through-water half of
+//      this rule making one enormous connected body expensive every tick", and
+//      a component over it was left COMPLETELY unmodified — deferred, never
+//      partially levelled. It did not do the job claimed for it. MEASURED
+//      (vxc_hydroprobe, a 128x128x16 room breached from an unbounded implicit
+//      sea): the flood does not stop at the cap, it stops RECORDING at the cap
+//      and keeps walking the whole component, so 99% of every flood pop in that
+//      run was spent inside components whose answer was then thrown away — the
+//      traversal, which IS the cost of this pass, was paid in full. What the
+//      cap actually bought was the `cells` vector, its sort, and the level
+//      allocation, and nothing else. And what it cost was the worst available
+//      failure: the component produced no writes, so its bricks settled out of
+//      the active set, so the CA went QUIET — zero active bricks, the state
+//      every caller reads as "settled" — at a level nowhere near the datum,
+//      and never moved again. The cap counts AIR (the flood pushes air cells
+//      into the component), so it bites at roughly an 8x8x1 m pond, not at the
+//      65.5 m^3 the number suggests.
+//
+//      WHAT IT IS NOW (kWaterCAVersion>=5). Two paths, same answer, different
+//      access cost — the choice between them is invisible in the output:
+//        * AT OR UNDER the cap: unchanged from v4, literally the same code —
+//          materialize `cells`, sort by (z,x,y), allocate bottom-up. Both
+//          pinned goldens re-derive byte-identically.
+//        * OVER the cap: the same allocation computed WITHOUT materializing or
+//          sorting the cell list. A layer's target depends only on how many
+//          component cells share its z, so the flood accumulates a per-brick
+//          512-bit MEMBERSHIP mask (one bit-set per cell, alongside the
+//          `visited` mask it already keeps) and the level is read off a z
+//          histogram built from 8 popcounts per brick. Memory is O(bricks) —
+//          64 bytes per brick, ~0.125 bytes per cell against the 16 bytes a
+//          FloodCell costs — and there is no O(n log n) sort at all. Only ONE
+//          layer, the partial one at the surface, needs a within-layer
+//          (x,y)-ascending order to place the `totalVol % n` single-unit
+//          remainders, and that is resolved by an nth_element over that one
+//          layer to find the rank-`rem` (x,y), which becomes an O(1) threshold
+//          compare per cell. See applyLargeComponentPlan in waterca.cpp.
+//      Volume conservation is identical on both paths and is checked, not
+//      assumed: the streaming path re-derives the sum of the targets it is
+//      about to write in closed form and refuses to apply — falling back to the
+//      old deferral, and recording it — unless it equals `totalVol` EXACTLY, as
+//      integers, with no tolerance. A wrong predicate cannot silently create or
+//      destroy water; it can only decline to act, loudly.
+//
+//      WHY THIS DID NOT NEED THE PERSISTENT PER-BODY STRUCTURE that
+//      docs/adr/0003-hydrostatic-persistent-body.md defers, and this is the
+//      thing to understand before proposing a rewrite here: that ADR's two
+//      blockers (union-find cannot represent a SPLIT; a proven-unchanged
+//      component still owes its cells a visited marking) are blockers for
+//      SKIPPING work across ticks — option B, the O(1)-settled optimization.
+//      They say nothing about computing a correct level for a component the
+//      flood is walking anyway. There is no union-find in this file and never
+//      has been; the pass re-floods from scratch every tick, and therefore
+//      already knows the exact cell set and the exact totalVol of an over-cap
+//      component at the moment it currently throws them away. Correctness here
+//      was never gated on persistence. Performance still is, and option B is
+//      still deferred on ADR-0003's own evidence.
+//
+//      WHAT IS STILL DEFERRED, honestly: nothing about this makes a large
+//      settled body CHEAP. Phase C remains O(component) per tick for any body
+//      one touched brick reaches, exactly as it was in v4 — the over-cap path
+//      adds a bit-scan and a compare per cell on top of a flood that was
+//      already popping that cell. It removes a wrong answer; it does not remove
+//      the work. `hydroDeferredCells()` and friends below report what is
+//      happening either way, in every build.
 //   2. LEVEL COMPUTATION: for each discovered component with at least one
 //      water cell and at least 2 cells total (trivial size-1 "components"
 //      are already their own fixed point — skip), sum its total current
@@ -359,7 +418,27 @@ namespace vxc {
 // so the same terrain-edit sequence replayed against a v3 recording no longer
 // reproduces v3's (buggy, unchanging) water state. Per docs/determinism.md
 // that divergence is what the version constant exists to signal.
-inline constexpr uint32_t kWaterCAVersion = 4;
+// v5 (==5): a hydrostatic component ABOVE kMaxHydrostaticComponentCells is now
+// LEVELLED, not deferred (see "Phase C — HYDROSTATIC" step 1 and
+// HydroLargeComponentPolicy below). Deliberate world-breaking change: every
+// scenario whose largest connected component stays under the cap is
+// byte-identical to v4 (both pinned goldens re-derive unchanged, and the cap is
+// now a PATH SELECTOR rather than a give-up threshold — under it, the code is
+// literally the v4 code), but a scenario that trips the cap now converges on
+// its datum instead of going quiet at whatever level it happened to reach. The
+// v4 behaviour is still reachable at runtime via
+// setHydroLargeComponentPolicy(kDeferOverCap) — kept as a field kill-switch and
+// as the A/B arm the tests measure against — but it is no longer the default,
+// so the default tick rules changed and the constant must move.
+inline constexpr uint32_t kWaterCAVersion = 5;
+
+// Cell count above which a hydrostatic component is levelled by the streaming
+// path instead of the sort-a-materialized-list path. See "Phase C —
+// HYDROSTATIC" step 1 for what it does and, more importantly, what it stopped
+// doing at v5. Lives in the header only so WaterCA can default a member to it
+// and a test can talk about it; it is not a tuning knob and there is no reason
+// for a caller to name it.
+inline constexpr size_t kMaxHydrostaticComponentCells = 65536;
 
 #ifdef VXC_WATER_PROFILE
 // --- Opt-in per-phase step() accounting (diagnostic; OFF by default) --------
@@ -609,6 +688,113 @@ public:
     size_t steppedBrickCount() const { return lastSteppedBrickCount_; }
     size_t activeBrickCount() const { return active_.size(); }
     size_t storedBrickCount() const { return water_.size(); }
+
+    // --- Hydrostatic deferral: "settled" vs "gave up" ----------------------
+    //
+    // READ THIS BEFORE TREATING activeBrickCount()==0 AS "the water is done".
+    // It is not sufficient on its own and never was. When Phase C declines to
+    // level a component (see "Phase C — HYDROSTATIC" step 1, and
+    // HydroLargeComponentPolicy below) it emits no writes; no writes means no
+    // changed bricks; no changed bricks means the whole body settles out of the
+    // active set on the next tick. The CA then reports zero active bricks —
+    // fully settled, by every signal that existed before these accessors — at a
+    // level that may be nowhere near the body's equilibrium, and it will never
+    // move again on its own. That cost a day of measurement to find, because
+    // the only instrument was WaterCAProfile::hydroOverflowed, which needs
+    // -DVXC_WATER_PROFILE=ON and therefore does not exist in any build that
+    // ships. These accessors are always compiled. The test for "the water is
+    // done" is:
+    //
+    //     ca.activeBrickCount() == 0 && !ca.hydroGaveUp()
+    //
+    // Cost: `hydroDeferredCells()` is free (the flood pops those cells anyway
+    // and now simply counts them instead of stopping the count at the cap);
+    // everything else is a handful of adds per deferred component, of which a
+    // healthy world has none.
+    struct HydroDeferral {
+        // The seed voxel of the component — a coordinate a human or a log line
+        // can actually go and look at, which a count alone never gave anyone.
+        int64_t seedX = 0, seedY = 0, seedZ = 0;
+        uint64_t cells = 0;  // TRUE size, air included; not clamped to the cap
+        uint64_t volume = 0; // fill units the component holds, exact
+    };
+
+    // Per-tick, reset at the top of every step()/stepWithOrder(): components
+    // Phase C declined to level on the most recent tick, their total true cell
+    // count, and the fill units sitting inside them. All three are 0 on a
+    // healthy tick.
+    size_t hydroDeferredComponents() const { return hydroDeferredComponents_; }
+    uint64_t hydroDeferredCells() const { return hydroDeferredCells_; }
+    uint64_t hydroDeferredVolume() const { return hydroDeferredVolume_; }
+
+    // STICKY, and this is the half that matters. A deferral makes the body go
+    // quiet, so by the tick a caller gets round to asking, the per-tick numbers
+    // above are already back to 0 and nothing is left to see. These two survive
+    // that: `hydroDeferralEvents()` is a monotone lifetime count of components
+    // declined, and `worstDeferral()` is the largest one by cell count, with
+    // its seed voxel. Both are PERSISTED in the water blob (WaterState) and
+    // both survive save/load and late-join, because a world that gave up stays
+    // given-up across a restart and must not present itself as settled to the
+    // next session.
+    uint64_t hydroDeferralEvents() const { return hydroDeferralEvents_; }
+    const HydroDeferral& worstDeferral() const { return worstDeferral_; }
+
+    // "Some water in this world is parked below its own equilibrium and nothing
+    // will move it." The one-line question an engine tick, a save path, or a
+    // `stat water` line should be asking alongside activeBrickCount().
+    bool hydroGaveUp() const { return hydroDeferralEvents_ != 0; }
+
+    // Clears the sticky record only (never the live water). For a caller that
+    // has surfaced the condition and wants to see whether it recurs — e.g.
+    // after switching policy, or after an edit that should have unstuck it.
+    void clearHydroDeferralRecord() {
+        hydroDeferralEvents_ = 0;
+        worstDeferral_ = HydroDeferral{};
+    }
+
+    // --- What Phase C does with a component over the cap -------------------
+    // Default kLevelStreaming (kWaterCAVersion 5). kDeferOverCap reproduces
+    // v4 exactly and exists for two reasons: it is the A/B arm the tests
+    // measure the fix against, and it is a field kill-switch if the streaming
+    // path is ever suspected — over-cap components are rare and the fallback is
+    // the behaviour that shipped for a year. It is a TICK RULE, so an authority
+    // and its clients must agree on it; treat it like kWaterCAVersion, not like
+    // the solidity memo (which is a pure memo and cannot change an answer).
+    enum class HydroLargeComponentPolicy {
+        kLevelStreaming = 0, // level it, via the O(bricks)-memory streaming path
+        kDeferOverCap = 1,   // leave it completely unmodified (v4 behaviour)
+    };
+    void setHydroLargeComponentPolicy(HydroLargeComponentPolicy p) { hydroLargePolicy_ = p; }
+    HydroLargeComponentPolicy hydroLargeComponentPolicy() const { return hydroLargePolicy_; }
+
+    // The cell count above which a component takes the streaming path.
+    // kMaxHydrostaticComponentCells by default.
+    //
+    // Lowering this CANNOT CHANGE ANY ANSWER — that is the whole property, and
+    // it is what the knob exists to let a test pin. The two paths compute the
+    // same targets from the same component by construction (see waterca.h's
+    // "Phase C — HYDROSTATIC" step 1); they differ only in whether the cell
+    // list is materialized and sorted. So a scenario run with this set to 1 —
+    // every component streamed — must produce a byte-identical digest to the
+    // same scenario at the default, and
+    // waterca_hydrostatic_streaming_path_matches_both_goldens asserts exactly
+    // that at both pinned goldens. Without the knob that equivalence could only
+    // be exercised at 65,537+ cells, which is too large to pin a digest on and
+    // is precisely why the over-cap path went unverified for so long.
+    //
+    // Raising it is a real (and bad) idea: it is the memory bound on `cells`
+    // and on `pendingWrites`, and the engine's runaway components are 150-350x
+    // the default.
+    void setHydroLargeComponentThreshold(size_t cells) {
+        hydroLargeThreshold_ = cells < 1 ? 1 : cells;
+    }
+    size_t hydroLargeComponentThreshold() const { return hydroLargeThreshold_; }
+
+    // Components levelled through the streaming path (lifetime), and the
+    // largest one seen, in cells. Diagnostics: this is what a healthy world
+    // shows INSTEAD of a deferral once the fix is on.
+    uint64_t hydroStreamedComponents() const { return hydroStreamed_; }
+    uint64_t hydroLargestStreamedCells() const { return hydroLargestStreamed_; }
 
     // Deterministic digest over every stored brick (not just active ones),
     // in sorted BrickKey order — the determinism/regression-test primitive,
@@ -862,6 +1048,26 @@ private:
     std::set<BrickKey, BrickKeyLess> active_;
     uint64_t totalVolume_ = 0;
     size_t lastSteppedBrickCount_ = 0;
+
+    // Hydrostatic deferral reporting — see the accessors above. The first three
+    // are per-tick (cleared at the top of hydrostaticPass); the next two are
+    // sticky and persisted; the last three are streaming-path diagnostics.
+    // None of these feeds digest(), the ledger, or any tick decision: they are
+    // a report about the simulation, never an input to it.
+    size_t hydroDeferredComponents_ = 0;
+    uint64_t hydroDeferredCells_ = 0;
+    uint64_t hydroDeferredVolume_ = 0;
+    uint64_t hydroDeferralEvents_ = 0;
+    HydroDeferral worstDeferral_{};
+    HydroLargeComponentPolicy hydroLargePolicy_ = HydroLargeComponentPolicy::kLevelStreaming;
+    size_t hydroLargeThreshold_ = kMaxHydrostaticComponentCells;
+    uint64_t hydroStreamed_ = 0;
+    uint64_t hydroLargestStreamed_ = 0;
+
+    // WaterState::applyTo restores the sticky record verbatim (it is not
+    // re-derivable — the body that produced it is quiet by construction), and
+    // is the only thing allowed to.
+    friend class WaterState;
 };
 
 // ===========================================================================
@@ -1540,7 +1746,8 @@ private:
 class WaterState {
 public:
     static constexpr uint32_t kMagic = 0x41575856; // "VXWA" little-endian
-    static constexpr uint32_t kFormatVersion = 1;
+    // v2: appends WaterCA's hydrostatic deferral record (see serialize()).
+    static constexpr uint32_t kFormatVersion = 2;
 
     enum PayloadMode : uint8_t { kDense = 0, kSparse = 1, kRle = 2 };
 
@@ -1553,6 +1760,11 @@ public:
     std::vector<std::pair<BrickKey, BrickFill>> bricks; // BrickKeyLess-sorted
     std::vector<BrickKey> active;                       // BrickKeyLess-sorted
     std::vector<BrickKey> mobilized;                    // BrickKeyLess-sorted
+    // kFormatVersion 2. The one entry here that is a REPORT rather than
+    // simulation state, and the one entry that is not re-derivable after a
+    // load — see serialize() for why it is in the blob at all.
+    uint64_t hydroDeferralEvents = 0;
+    WaterCA::HydroDeferral worstDeferral{};
 
     // Snapshots `ca` + `mob` into `out` (appends; does not clear).
     static void serialize(const WaterCA& ca, const WaterMobilizer& mob, std::vector<uint8_t>& out);
