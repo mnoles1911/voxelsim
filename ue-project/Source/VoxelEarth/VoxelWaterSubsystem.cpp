@@ -54,6 +54,7 @@
 #include "UObject/UObjectGlobals.h"
 
 #include <memory>
+#include <algorithm>
 #include <vector>
 
 // ADR-0003 item 2/4 (docs/adr/0003-hydrostatic-persistent-body.md): toggles
@@ -112,6 +113,48 @@ static TAutoConsoleVariable<bool> CVarVoxelWaterImplicitOcean(
 	TEXT("implicit ocean at all (NOT the retired Reservoir v0, which does not come back)."),
 	ECVF_Default);
 
+// --- Watershed §6.5, work items 9b/9c: the mobilized ceiling and the return
+// --- path (docs/water-handover-2026-08-04.md Phase 2) ------------------------
+//
+// READ THE MEASUREMENT BEFORE RETUNING EITHER OF THESE. voxel-core's
+// `waterca_no_ceiling_can_fill_a_breach_over_the_hydrostatic_cap` pins the fact
+// that decides both defaults: `kMaxHydrostaticComponentCells` (waterca.cpp:108)
+// leaves an over-cap connected body COMPLETELY unlevelled, and the excavation's
+// own cells are CA territory that no mobilization policy has any say over. So
+// the ceiling is a COST bound and nothing else. It cannot make a large breach
+// fill correctly, and the value at which a breach does fill correctly (~100
+// bricks, measured) is about 170x SMALLER than a legitimate world's mobilized
+// set already is -- one savegame on this branch restored 17,235 mobilized
+// bricks. The two jobs want values three orders of magnitude apart, so this
+// cvar does exactly one of them.
+static TAutoConsoleVariable<int32> CVarVoxelWaterMobilizedCeiling(
+	TEXT("voxel.Water.MobilizedCeilingBricks"), 65536,
+	TEXT("Watershed §6.5.5 (work item 9b): hard bound on how many bricks the activity-driven ")
+	TEXT("mobilization FRONT may convert. A MEMORY/COST backstop, not a correctness knob -- it bounds ")
+	TEXT("the runaway a breach into the open sea causes (measured: activeBricks 19,636 -> 41,613, ")
+	TEXT("volume 501M -> 884M) but it does NOT make an over-cap breach level correctly; see ")
+	TEXT("kMaxHydrostaticComponentCells. Default 65,536 bricks ~= 32 MB of fill: far above any ")
+	TEXT("legitimate world (a savegame here restored 17,235) so it only ever catches a true runaway. ")
+	TEXT("Edits and replication are EXEMPT and may exceed it. 0 = no ceiling (the pre-9b behaviour)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterDemoteBudget(
+	TEXT("voxel.Water.DemoteBudgetBricks"), 32,
+	TEXT("Watershed §6.5.3 (work item 9c): how many mobilized bricks the authority EXAMINES per fixed ")
+	TEXT("step, demoting those that already hold exactly the datum. This is the return path -- without ")
+	TEXT("it `mobilized_` is insert-only and a persistent world leaks bricks, savegame and replication ")
+	TEXT("forever. The budget counts examinations, not demotions, because the 512-cell scan is the ")
+	TEXT("cost. Authority only. 0 = disabled (the pre-9c behaviour)."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterCeilingReliefBudget(
+	TEXT("voxel.Water.CeilingReliefBudgetBricks"), 256,
+	TEXT("Watershed §6.5.5: the bigger demotion sweep spent at the high-water mark, at most once per ")
+	TEXT("advanceFront and only while at the ceiling, so a world under its ceiling never pays for it. ")
+	TEXT("'Reclaim, then refuse' -- whatever this frees is visible to the rest of that same call. ")
+	TEXT("0 = refuse without reclaiming first (the ceiling still holds, it just holds by refusing)."),
+	ECVF_Default);
+
 namespace
 {
 // BrickKey <-> VoxelCoords::FVoxelCoord: this subsystem carries brick-grid
@@ -143,8 +186,28 @@ vxc::BrickKey ToBrickKey(const VoxelCoords::FVoxelCoord& C)
 // handled (encoded OR determined-absent-so-nothing-to-send) -- the caller
 // drops exactly those from its "dirty since last broadcast" set, leaving any
 // remainder (past the byte cap) for the next ~5Hz round.
-void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::WaterCA& CA, int32 MaxBytes, TArray<uint8>& OutBytes,
-                          int32& OutEncodedBrickCount, size_t& OutConsumedKeyCount)
+//
+// --- THE KEY-REMOVAL SECTION (work item 9c) ---------------------------------
+//
+// A trailing `u32 removalCount` then `i32 x,y,z` per demoted brick. waterca.h
+// requires demotion to replicate as an EXPLICIT key removal and never to be
+// inferred client-side, which is why it needs wire bytes of its own: every
+// other state change here is carried implicitly by the arrival of fill, and a
+// demotion is precisely the change whose signature is the ABSENCE of fill.
+//
+// IT GOES LAST, AND THE ORDER IS THE CONTRACT. The authority drains
+// takeRecentlyMobilized() before takeRecentlyDemoted() (waterca.h), so a brick
+// that mobilized and demoted inside one broadcast window must land on
+// "implicit" rather than "mobilized" -- putting removals after the fills makes
+// the client's apply order agree with the authority's drain order for free.
+//
+// A reader that stops after the brick array simply ignores it, so an old client
+// degrades to the pre-9c behaviour (bricks stay mobilized) rather than
+// desynchronising on a length mismatch.
+void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const std::vector<vxc::BrickKey>& Removals,
+                          const vxc::WaterCA& CA, int32 MaxBytes, TArray<uint8>& OutBytes,
+                          int32& OutEncodedBrickCount, size_t& OutConsumedKeyCount,
+                          int32& OutEncodedRemovalCount, size_t& OutConsumedRemovalCount)
 {
 	std::vector<uint8_t> Bytes;
 	vxc::ByteWriter W(Bytes);
@@ -152,6 +215,19 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 	uint32_t Encoded = 0;
 	size_t Consumed = 0;
 	constexpr size_t EntrySize = 12 + size_t(vxc::WaterBrick8::kCells); // i32 x,y,z + 512 raw fill bytes
+	constexpr size_t RemovalSize = 12;                                  // i32 x,y,z
+
+	// RESERVE FOR THE REMOVALS FIRST. A key removal is 44x cheaper than a brick
+	// and it is the message that ENDS an obligation, so letting a flood of fill
+	// crowd it out for round after round would leave clients holding bricks the
+	// authority has already given back -- the leak this item exists to close,
+	// reappearing as a replication backlog. Fill defers gracefully (it is
+	// re-sent next round because the brick is still dirty); a removal is drained
+	// from its queue exactly once, so it must not be dropped.
+	const size_t RemovalBudget = std::min(Removals.size(), size_t(64));
+	const size_t FillCap = size_t(MaxBytes) > (RemovalBudget * RemovalSize + 4)
+	                           ? size_t(MaxBytes) - RemovalBudget * RemovalSize - 4
+	                           : size_t(MaxBytes);
 
 	for (; Consumed < Keys.size(); ++Consumed)
 	{
@@ -161,7 +237,7 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 		{
 			continue; // emptied since being marked dirty -- nothing to send, but fully handled
 		}
-		if (Encoded > 0 && Bytes.size() + EntrySize > size_t(MaxBytes))
+		if (Encoded > 0 && Bytes.size() + EntrySize > FillCap)
 		{
 			break; // cap reached -- this (and later) keys wait for next round
 		}
@@ -178,6 +254,27 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 	Bytes[1] = uint8_t(Encoded >> 8);
 	Bytes[2] = uint8_t(Encoded >> 16);
 	Bytes[3] = uint8_t(Encoded >> 24);
+
+	const size_t RemovalCountOffset = Bytes.size();
+	W.u32(0); // patched below
+	uint32_t EncodedRemovals = 0;
+	size_t ConsumedRemovals = 0;
+	for (; ConsumedRemovals < Removals.size(); ++ConsumedRemovals)
+	{
+		if (Bytes.size() + RemovalSize > size_t(MaxBytes))
+		{
+			break;
+		}
+		W.i32(Removals[ConsumedRemovals].x);
+		W.i32(Removals[ConsumedRemovals].y);
+		W.i32(Removals[ConsumedRemovals].z);
+		++EncodedRemovals;
+	}
+	Bytes[RemovalCountOffset + 0] = uint8_t(EncodedRemovals);
+	Bytes[RemovalCountOffset + 1] = uint8_t(EncodedRemovals >> 8);
+	Bytes[RemovalCountOffset + 2] = uint8_t(EncodedRemovals >> 16);
+	Bytes[RemovalCountOffset + 3] = uint8_t(EncodedRemovals >> 24);
+
 	OutBytes.SetNumUninitialized((int32)Bytes.size());
 	if (!Bytes.empty())
 	{
@@ -185,6 +282,8 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const vxc::Wate
 	}
 	OutEncodedBrickCount = int32(Encoded);
 	OutConsumedKeyCount = Consumed;
+	OutEncodedRemovalCount = int32(EncodedRemovals);
+	OutConsumedRemovalCount = ConsumedRemovals;
 }
 } // namespace
 
@@ -465,6 +564,60 @@ struct FVoxelWaterImpl
 		// structural rather than a matter of call ordering (waterca.h).
 		, CA(Mob.makeSolidFn())
 	{
+		// DEMOTION PRESSURE AT THE HIGH-WATER MARK (§6.5.5, work item 9b's hook
+		// wired to 9c's sweep). advanceFront calls this at most once per call and
+		// only while at the ceiling, so a world under its ceiling pays nothing.
+		// The point of the hook rather than a demotion after the fact is that
+		// whatever it frees is visible to the rest of that same call -- "reclaim,
+		// then refuse" instead of "refuse, then reclaim next tick".
+		//
+		// AUTHORITY ONLY, enforced here because voxel-core cannot. A client's CA
+		// is a replication mirror whose fill lags the authority, so running the
+		// exact predicate against it would refuse where the authority accepted
+		// and the two would diverge permanently. In practice this is unreachable
+		// on a client (advanceFront is only called from StepFixed, which Tick
+		// runs only when NetMode != NM_Client) -- the guard is belt and braces
+		// for anyone who later finds another caller for the front.
+		//
+		// `this` is safe to capture: FVoxelWaterImpl lives in a TUniquePtr that
+		// is never moved, and Mob/CA are members, so the lambda cannot outlive
+		// them.
+		Mob.setCeilingRelief(
+			[this]
+			{
+				if (!bAuthority)
+				{
+					return;
+				}
+				const int32 Budget = CVarVoxelWaterCeilingReliefBudget.GetValueOnGameThread();
+				if (Budget > 0)
+				{
+					Mob.demoteBudgeted(CA, size_t(Budget));
+				}
+			});
+
+		// THE FRONT GATE (work item 9a) IS DELIBERATELY LEFT UNINSTALLED, and
+		// that is a measured decision rather than an omission -- see this
+		// change's commit message and the four C8e tests in voxel-core.
+		//
+		// The gate is a predicate that freezes a reach the AUTHORITY has decided
+		// to dry out by changing the datum (§6.3.3). Nothing in this engine
+		// drives such a decision yet: there is no datum-override registry and no
+		// caller that would populate one. The obvious candidate policy -- a
+		// cooldown that refuses to re-mobilize a brick just demoted, to stop the
+		// return path thrashing against the front -- was built and measured, and
+		// it is NOT shippable: its effect is non-monotonic in the cooldown length
+		// (on the reference breach, 8 steps left the runaway untouched, 10 steps
+		// made peak mobilization roughly DOUBLE the ungated run, and 16 steps
+		// fixed it) and it collapsed to no effect at all on a breach four times
+		// the size. That is a knife-edge in a chaotic response surface, not a
+		// policy, and layering it over the primitive would have hidden the real
+		// finding: what breaks a large breach is kMaxHydrostaticComponentCells,
+		// which sits upstream of every lever 9a/9b/9c provide.
+		//
+		// The seam is one line (`Mob.setFrontGate(...)`) whenever a real freeze
+		// owner appears. Until then the mechanism stays proven and unused rather
+		// than used and unjustified.
 	}
 
 	UVoxelWorldSubsystem& Terrain;
@@ -723,12 +876,34 @@ struct FVoxelWaterImpl
 	// Log-throttle for the voxel.Water.MaxActiveBricks budget warning (task
 	// item 3: "log-throttle warning (do not explode)").
 	double LastBudgetWarnWorldSeconds = -1000.0;
+	// Same, for the §6.5.5 mobilized-ceiling alarm.
+	double LastCeilingWarnWorldSeconds = -1000.0;
 
 	// --- Replication v1 (task item 1) ---------------------------------------
 	float ReplicationAccumSeconds = 0.f;
 	static constexpr float ReplicationIntervalSeconds = 0.2f; // ~5Hz
 	static constexpr int32 MaxDiffBytesPerBroadcast = 32 * 1024; // documented cap (task item 1)
 	TSet<VoxelCoords::FVoxelCoord> DirtySinceLastBroadcast;
+
+	// Demoted keys awaiting broadcast (work item 9c). A VECTOR, not a TSet, and
+	// buffered here rather than pulled from the mobilizer at broadcast time,
+	// because `takeRecentlyDemoted()` CLEARS its queue: drain it on the tick
+	// that produced it or the removals are lost. Order is preserved because it
+	// is the authority's demotion order, which is what the client must replay.
+	std::vector<vxc::BrickKey> PendingRemovals;
+
+	// Set from Tick's netmode test, and read by anything that must not run off
+	// the authority. Demotion is authority-only doctrine in waterca.h and is
+	// deliberately NOT enforced inside voxel-core (which is netmode-free), so
+	// this is where that doctrine becomes code.
+	bool bAuthority = true;
+
+	// Whether BroadcastWaterDiffs will actually run this session (authority AND
+	// networked). Gates the removal QUEUE, not the demotion itself: a standalone
+	// world demotes exactly as a server does -- it just has nobody to tell, and
+	// queueing removals nobody drains is an unbounded leak in the one
+	// configuration most likely to run for hours.
+	bool bReplicating = false;
 
 	// --- W4 shallow water, voxel.Water.SWE (ADR-0004) -----------------------
 	//
@@ -3955,6 +4130,20 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	// hydrostaticPass reads solidCacheEnabled_ at the top of its own call.
 	Impl.CA.setSolidCacheEnabled(CVarVoxelWaterSolidCache.GetValueOnGameThread());
 
+	// THE MOBILIZED CEILING (§6.5.5, work item 9b), re-read every fixed step for
+	// the same reason the solid cache is: it is pure policy, never persisted,
+	// never digested and never replicated (waterca.h), so it can be retuned live
+	// without a restart and without touching determinism. What replicates is the
+	// mobilized set the ceiling shapes, not the ceiling.
+	//
+	// Set BEFORE advanceFront below, which is the only thing it bounds. Edits
+	// and markMobilized are exempt by design and may legitimately push
+	// `mobilized_` past it -- which is why atMobilizedCeiling() is a `>=` test.
+	{
+		const int32 Ceiling = CVarVoxelWaterMobilizedCeiling.GetValueOnGameThread();
+		Impl.Mob.setMobilizedCeiling(Ceiling > 0 ? size_t(Ceiling) : size_t(0));
+	}
+
 	// RESERVOIR v0 USED TO BE HERE, and its retirement is watershed plan work
 	// item 8 (§6.4: "the bespoke reservoir top-up at :3307-3315 can retire once
 	// proven equivalent"). It was NOT equivalent. It was a set of breach voxels
@@ -4234,6 +4423,102 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	}
 	Impl.ActiveBricks = MoveTemp(NowActive);
 
+	// --- THE RETURN PATH (§6.5.3, work item 9c) -----------------------------
+	//
+	// Mobilization promotes implicit -> CA; until this call nothing ever went
+	// the other way. `active_` settles to empty, but `mobilized_` is persisted,
+	// replicated and grew forever -- a memory leak with extra steps, and the
+	// failure mode §6.5.2 names Dwarf Fortress for shipping.
+	//
+	// PLACED AFTER step() AND AFTER THE ACTIVE-SET DIFF, deliberately. The
+	// predicate's condition (b) is "k is not active and no 6-face neighbour is
+	// active", so it must read the active set this tick LEFT BEHIND, not the one
+	// it started with -- running it before step() would test a stale
+	// neighbourhood and demote a brick the tick was about to wake.
+	//
+	// AUTHORITY ONLY. StepFixed is only reached from Tick's NetMode != NM_Client
+	// branch, so this is already unreachable on a client; the explicit flag is
+	// what makes the doctrine legible at the call site, since voxel-core is
+	// netmode-free and cannot enforce it itself.
+	if (Impl.bAuthority)
+	{
+		const int32 DemoteBudget = CVarVoxelWaterDemoteBudget.GetValueOnGameThread();
+		if (DemoteBudget > 0)
+		{
+			Impl.Mob.demoteBudgeted(Impl.CA, size_t(DemoteBudget));
+		}
+	}
+
+	// DRAIN MOBILIZED FIRST, THEN DEMOTED, and waterca.h is explicit that the
+	// order is the contract: a brick that mobilized and demoted inside one frame
+	// must land on "implicit", not on "mobilized". Condition (b) makes that
+	// sequence very nearly unreachable (a freshly mobilized brick is filled and
+	// woken, hence active), but the order is free to get right here and
+	// expensive to discover in a desync months later.
+	MarkMobilizedBricksDirty(Impl);
+	for (const vxc::BrickKey& K : Impl.Mob.takeRecentlyDemoted())
+	{
+		// Re-mesh: the brick must stop being drawn as CA water and start being
+		// drawn as implicit water. RefreshImplicitWater re-adds the implicit
+		// component on its own sweep; this side just has to stop drawing the CA
+		// one, and the brick's fill is already gone (clearBrickFill collapsed it
+		// out of the map), so the ordinary emptied-brick re-mesh path handles it.
+		Impl.DirtyBricks.Add(ToCoord(K));
+		// Replicate as an EXPLICIT key removal. It must never be inferred
+		// client-side (waterca.h): the client's evidence for mobilization is the
+		// ARRIVAL of fill, and a demotion's signature is fill that stops arriving
+		// -- indistinguishable from a dropped packet.
+		//
+		// Only queued when something will actually drain it. A standalone world
+		// demotes identically; it simply has no clients to tell, and a queue
+		// nobody reads is an unbounded leak in exactly the configuration that
+		// runs longest.
+		if (Impl.bReplicating)
+		{
+			Impl.PendingRemovals.push_back(K);
+		}
+	}
+
+	// A BACKSTOP ON THE BACKLOG. The queue drains at ~5 Hz against a byte cap,
+	// so it is bounded in every healthy case; this catches the unhealthy one (a
+	// networked world with no AVoxelEditRelay, which already warns per
+	// broadcast). Dropping the OLDEST is the right end to drop from: those are
+	// the removals a client is most likely to have already been told about by a
+	// later full-brick diff, and keeping the newest keeps the queue converging
+	// on the present rather than replaying a stale past.
+	constexpr size_t kMaxPendingRemovals = 1u << 16;
+	if (Impl.PendingRemovals.size() > kMaxPendingRemovals)
+	{
+		const size_t Dropped = Impl.PendingRemovals.size() - kMaxPendingRemovals;
+		Impl.PendingRemovals.erase(Impl.PendingRemovals.begin(),
+		                           Impl.PendingRemovals.begin() + ptrdiff_t(Dropped));
+		UE_LOG(LogVoxelWater, Error,
+		       TEXT("Water key-removal backlog exceeded %llu -- dropped %llu oldest. Clients may hold bricks the ")
+		       TEXT("authority has demoted until a later diff covers them. This means removals are not being ")
+		       TEXT("broadcast at all; check for a missing AVoxelEditRelay."),
+		       (unsigned long long)kMaxPendingRemovals, (unsigned long long)Dropped);
+	}
+
+	// REPORT THE CEILING LOUDLY (§6.5.5: "a world at its ceiling is a world that
+	// needs a re-bake, and that must be an operator-visible signal rather than a
+	// silent stall"). Shares the 5 s throttle window with the active-budget
+	// warning below because the two travel together in exactly the case that
+	// matters -- a runaway breach trips both.
+	if (Impl.Mob.atMobilizedCeiling() && (NowWorldSeconds - Impl.LastCeilingWarnWorldSeconds) > 5.0)
+	{
+		Impl.LastCeilingWarnWorldSeconds = NowWorldSeconds;
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("WaterMobilizer AT CEILING: mobilized=%llu >= voxel.Water.MobilizedCeilingBricks=%llu ")
+		       TEXT("(front stalled; %llu ceiling refusals, %llu relief sweeps, %llu bricks demoted so far). ")
+		       TEXT("The world is DEGRADED, not corrupt -- a refused brick is still a wall, so nothing leaks. ")
+		       TEXT("This world wants a re-bake (§6.5.4); raising the cvar buys memory, not correctness."),
+		       (unsigned long long)Impl.Mob.mobilizedBricks().size(),
+		       (unsigned long long)Impl.Mob.mobilizedCeiling(),
+		       (unsigned long long)Impl.Mob.ceilingRefusals(),
+		       (unsigned long long)Impl.Mob.ceilingReliefCalls(),
+		       (unsigned long long)Impl.Mob.demotedBrickCount());
+	}
+
 	// Task item 3: "if steppedBrickCount exceeds a cvar cap ... log-throttle
 	// warning (do not explode)". The CA's tick contract (waterca.h) is
 	// atomic over its whole active-set snapshot -- there is no safe mid-step
@@ -4262,7 +4547,13 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 	}
 	Impl.ReplicationAccumSeconds = 0.f;
 
-	if (Impl.DirtySinceLastBroadcast.Num() == 0)
+	// BOTH QUEUES GATE THIS, and the second one is easy to forget. A demotion
+	// happens precisely when a brick has gone quiet and stopped producing fill
+	// diffs, so the common case for a key removal is a round in which
+	// DirtySinceLastBroadcast is EMPTY. Testing only the fill queue would have
+	// dropped the removals silently and left every client holding bricks the
+	// authority had already given back.
+	if (Impl.DirtySinceLastBroadcast.Num() == 0 && Impl.PendingRemovals.empty())
 	{
 		return;
 	}
@@ -4274,14 +4565,17 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 	TArray<uint8> Bytes;
 	int32 EncodedBrickCount = 0;
 	size_t ConsumedKeyCount = 0;
-	SerializeWaterDiffs(Keys, Impl.CA, FVoxelWaterImpl::MaxDiffBytesPerBroadcast, Bytes, EncodedBrickCount, ConsumedKeyCount);
+	int32 EncodedRemovalCount = 0;
+	size_t ConsumedRemovalCount = 0;
+	SerializeWaterDiffs(Keys, Impl.PendingRemovals, Impl.CA, FVoxelWaterImpl::MaxDiffBytesPerBroadcast, Bytes,
+	                    EncodedBrickCount, ConsumedKeyCount, EncodedRemovalCount, ConsumedRemovalCount);
 
 	for (size_t i = 0; i < ConsumedKeyCount; ++i)
 	{
 		Impl.DirtySinceLastBroadcast.Remove(ToCoord(Keys[i]));
 	}
 
-	if (EncodedBrickCount == 0)
+	if (EncodedBrickCount == 0 && EncodedRemovalCount == 0)
 	{
 		return; // every dirty brick this round had already emptied again -- nothing to actually tell clients
 	}
@@ -4302,13 +4596,26 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 	}
 	if (!Relay)
 	{
-		UE_LOG(LogVoxelWater, Warning, TEXT("BroadcastWaterDiffs: no AVoxelEditRelay in the world -- %d brick diffs not broadcast."),
-		       EncodedBrickCount);
-		return;
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("BroadcastWaterDiffs: no AVoxelEditRelay in the world -- %d brick diffs and %d key removals not ")
+		       TEXT("broadcast."),
+		       EncodedBrickCount, EncodedRemovalCount);
+		return; // removals stay queued -- see below for why they must
 	}
 
 	Relay->MulticastWaterDiffs(Bytes);
 	Impl.ReplicatedBytesThisWindow += Bytes.Num();
+
+	// DROP THE REMOVALS ONLY ONCE THEY ARE ACTUALLY ON THE WIRE. Fill diffs may
+	// be dropped optimistically -- a brick that still matters is still dirty and
+	// will be re-sent next round, so the queue is self-healing. A key removal has
+	// no such property: `takeRecentlyDemoted()` handed it over exactly once and
+	// nothing will ever regenerate it, so losing one here would leave clients
+	// permanently holding a brick the authority has given back, with no symptom
+	// until someone dug there. Hence: consume from the front, after the send, and
+	// keep the remainder for the next round.
+	Impl.PendingRemovals.erase(Impl.PendingRemovals.begin(),
+	                           Impl.PendingRemovals.begin() + ptrdiff_t(ConsumedRemovalCount));
 }
 } // namespace
 
@@ -4325,6 +4632,13 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 
 	UWorld* World = GetWorld();
 	const ENetMode NetMode = World ? World->GetNetMode() : NM_Standalone;
+
+	// Latch the authority answer where the pieces that must not run off it can
+	// see it. Demotion (§6.5.3) is authority-only doctrine that voxel-core is
+	// structurally unable to enforce -- it is netmode-free by design -- so the
+	// enforcement lives at the engine call sites, and they read this.
+	Impl->bAuthority = (NetMode != NM_Client);
+	Impl->bReplicating = (World != nullptr && NetMode != NM_Client && NetMode != NM_Standalone);
 
 	if (NetMode != NM_Client)
 	{
@@ -5388,9 +5702,47 @@ bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
 		Impl->DirtyBricks.Add(ToCoord(Key));
 	}
 
+	// --- THE KEY-REMOVAL SECTION (work item 9c) -----------------------------
+	//
+	// Read AFTER the fills, because that is the authority's own drain order
+	// (takeRecentlyMobilized before takeRecentlyDemoted, waterca.h) and applying
+	// them the other way round would leave a brick that mobilized and demoted in
+	// one window stuck as "mobilized" on the client forever.
+	//
+	// ABSENT IS VALID. A batch from a build that predates this section simply
+	// ends here, and so does a batch that had no demotions; both leave the
+	// client exactly where the pre-9c code left it.
+	uint32_t RemovalCount = 0;
+	if (R.u32(RemovalCount))
+	{
+		for (uint32_t i = 0; i < RemovalCount; ++i)
+		{
+			int32_t X = 0, Y = 0, Z = 0;
+			if (!R.i32(X) || !R.i32(Y) || !R.i32(Z))
+			{
+				return false;
+			}
+			const vxc::BrickKey Key{X, Y, Z};
+			// markDemoted, NOT demoteBrick. The exact predicate is a decision
+			// only the authority is entitled to make -- a client's mirror lags by
+			// up to a broadcast interval, so it would refuse where the authority
+			// accepted and the two would diverge permanently. This applies the
+			// authority's conclusion as an instruction (waterca.h "AUTHORITY
+			// ONLY"). A key that was never mobilized here is a harmless no-op,
+			// which is what makes a duplicated packet safe.
+			if (Impl->Mob.markDemoted(Impl->CA, Key))
+			{
+				Impl->DirtyBricks.Add(ToCoord(Key));
+			}
+		}
+	}
+
 	// Tear down any implicit-water components for bricks this batch converted,
-	// so the client's handover looks identical to the authority's.
+	// so the client's handover looks identical to the authority's. Drains the
+	// demotion queue markDemoted just filled as well, so the two feeds cannot
+	// accumulate on a client that never runs a fixed step.
 	MarkMobilizedBricksDirty(*Impl);
+	Impl->Mob.takeRecentlyDemoted();
 
 	// Clients render too (v0: same re-mesh path, driven by replicated state
 	// instead of a locally-stepped CA).
