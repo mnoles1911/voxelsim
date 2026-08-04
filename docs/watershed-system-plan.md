@@ -289,6 +289,16 @@ selection, not simulation.
 wide (`channel.h:234`) — narrower than the 1.875 m pixel. Phase 2 puts water
 only on reaches wide enough for the raster to hold a wet bed (~2 px, ≈4 m);
 above that line the carved swales stay dry (they already exist as landform).
+
+> **Amended at bake_ver 11 (2026-08-04): ~1.5 px, ≈2.8 m.** The 2 px line was
+> chosen as a raster argument and never checked against a catchment. Measured,
+> it is a catchment-area cut at 2^23.99 — a full octave above the 2^23 this
+> plan's own network figures assume — and 90.29% of the dry cells on the area
+> network sit within a factor of two of it, so the line was drawn through the
+> densest part of the network. Lowering it to 1.5 px puts the cut at 1.5286e6
+> m³/yr (0.048 m³/s), still 4.8× perennial, so the honesty clause below still
+> has something to be honest about. See
+> `docs/measurements/river-drawable-and-concentration-2026-08-04.txt`.
 If headwater brooks matter later, they are a detail-band term (the
 `detail_rill.h` precedent), and the bank-integrity probe (work item 7) gates
 whether the idea is viable at 10 cm scale. Not in this plan's committed

@@ -113,6 +113,10 @@ def _kernels_that_route():
         fill_depressions=flow.fill_depressions,
         d8_receivers=flow.d8_receivers,
         accumulate_mfd=flow.accumulate_mfd,
+        # The water pass's own sweep (bake_ver 11). Same reason as the three
+        # above: it is the part under test, and B6 refuses to substitute MFD
+        # for it rather than shipping a plane the constants do not describe.
+        accumulate_d8=flow.accumulate_d8,
     )
 
 

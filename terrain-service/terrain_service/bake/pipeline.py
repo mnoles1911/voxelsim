@@ -347,8 +347,19 @@ __all__ = [
 #: entry in ``STAGE_ORDER`` changes, no field in ``BakeConstants.as_payload``
 #: changes, and ``tests/test_bake_terrain_identity.py`` is the gate that
 #: proves it rather than the argument above.
+#:
+#: bake_ver 11 -- the drawable threshold drops about an octave
+#: (``water_min_width_px`` 2.0 -> 1.5) and the water pass routes its discharge
+#: single-receiver (``water_flow_single_receiver``). Both are PRODUCT changes by
+#: the same argument bake_ver 10 made and both were checked the same way: the
+#: area field, ``mfd_p``, ``STAGE_ORDER`` and every field of ``as_payload`` are
+#: untouched, so ``A^m`` reads exactly what it read before. The two halves are
+#: the two measured causes of a wet mask that came out as 2,014 pieces with a
+#: longest reach of 1,113 m on a four-tile corridor -- see the constants
+#: themselves for the apportionment and
+#: ``docs/measurements/river-drawable-and-concentration-2026-08-04.txt``.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 10
+BAKE_VERSION = 11
 
 
 @dataclass(frozen=True)
@@ -895,9 +906,94 @@ class BakeConstants:
     #: is actually written over is derived from this through the width law
     #: (``water.q_drawable_m3_yr``), so the two cannot drift: a channel at
     #: initiation is 1.5 m wide against a 1.875 m pixel, and phase 2 puts water
-    #: only on reaches wide enough for the raster to hold a wet bed. At
-    #: production this lands at 3.15e6 m^3/yr = 0.100 m^3/s.
-    water_min_width_px: float = 2.0
+    #: only on reaches wide enough for the raster to hold a wet bed.
+    #:
+    #: 2.0 -> 1.5 at bake_ver 11, AND IT IS A WIDTH DECISION, NOT A KNOB TURN.
+    #: The diagnosis measured what 2 px actually costs: against the corridor's
+    #: median implied runoff (q/acc = 0.1883 m/yr) a cut at 3.1467e6 m^3/yr is a
+    #: catchment-area cut at 2^23.99, a full octave above the 2^23 the design
+    #: record assumed rivers start at, and 90.29% of the DRY cells on the area
+    #: network sit within a factor of two of it. So the plane was not describing
+    #: a sparse world, it was drawing a line an octave up a network that is
+    #: densest right there.
+    #:
+    #: 1.5 px is derived, not picked at 2x: it is the width at which the ratio
+    #: comes out at 1.042 octaves (0.486x), which is what "about an octave" is
+    #: in this law's own units.
+    #:
+    #: WHAT THE NEW NUMBER SAYS ABOUT THE SMALLEST DRAWN RIVER. The threshold is
+    #: a statement about ``channel_width_m(Q)``, so the marginal reach is one
+    #: whose channel is 2.812 m across rather than 3.750 m -- at the client's
+    #: 100 mm voxels, 28 voxels rather than 37. That is still a stream you wade
+    #: rather than step over, and 1.5 px is the floor for the same reason: at
+    #: 1.0 px the marginal channel is 1.875 m, one pixel, which is a creek drawn
+    #: as a raster artefact rather than a river.
+    #:
+    #: What it is NOT is a promise about how wide the RASTER draws it. The plane
+    #: is wet where a cell's own Q clears the cut, so the drawn ribbon is however
+    #: many adjacent cells clear it -- an emergent property of the accumulation,
+    #: not of this law. That distinction is worth the paragraph because the two
+    #: were accidentally in agreement at bake_ver 10 (drawn p50 5.30 m against a
+    #: law p50 of 4.87 m) and are not at bake_ver 11. See
+    #: ``water_flow_single_receiver``, which is what changed it, and the
+    #: measurements file, which reports both.
+    #:
+    #: In flow: 3.1467e6 -> 1.5286e6 m^3/yr, i.e. 0.100 -> 0.048 m^3/s. Still
+    #: 4.8x ``water_q_perennial_m3_yr``, so §4.1's honesty clause survives --
+    #: there remain perennial reaches this raster declines to draw, and
+    #: ``water_head_mask`` still reports both counts.
+    water_min_width_px: float = 1.5
+    #: Route the water pass's DISCHARGE single-receiver (D8) instead of MFD.
+    #:
+    #: THE TERRAIN'S ROUTING IS UNTOUCHED BY THIS. ``mfd_p`` still decides the
+    #: area field, hence ``A^m``, hence every height; this flag reaches only the
+    #: one extra sweep in B6 whose output is the water plane. That separation is
+    #: why it is a PRODUCT field: it cannot move a metre of ground.
+    #:
+    #: WHY. On the measured corridor 25-33% of network cells have no strictly
+    #: lower neighbour holding as much as they do -- their entire accumulation
+    #: was split -- and a Q field consumed by a hard threshold turns each of
+    #: those splits into a dry gap in a wet reach. Walking one channel found
+    #: fifty wet-dry-wet excursions in 2,001 steps. Under any single-receiver
+    #: rule that count is 0 by construction.
+    #:
+    #: WHY NOT A LARGER ``mfd_p`` CONFINED TO THIS PASS, which was the other
+    #: candidate. Two reasons, and the second is decisive:
+    #:
+    #:   * ``mfd_p`` is hashed as a scalar into ``superblock_inputs_fingerprint``
+    #:     and drives the superblock MFD at 30 m and 120 m/px as well as the
+    #:     fine one. A second scalar that moved only the fine water sweep would
+    #:     have the pyramid and the tile routing the same water two different
+    #:     ways; threading it through the pyramid instead invalidates every
+    #:     cached superblock through a fingerprint that does not currently see
+    #:     it. Either way it is a routing change reaching a TERRAIN cache, which
+    #:     is what this whole split exists to prevent.
+    #:   * ``_accumulate_mfd`` evaluates its weights in the surface's own dtype,
+    #:     and at float32 a large ``p`` UNDERFLOWS: after the epsilon fill a
+    #:     flat's slope is ~2.6e-4, so every weight is 0 by ``p ~ 11``, the cell
+    #:     reads as a pit and its whole accumulation is dropped -- on precisely
+    #:     the flat near-coast ground the rivers have to cross. See
+    #:     ``flow.accumulate_d8``.
+    #:
+    #: WHAT IT COSTS, MEASURED, because it is not free and the cost is visible.
+    #: MFD's fan is what made the drawn ribbon wide: near a trunk the
+    #: neighbouring cells carry a share large enough to clear the cut too, so
+    #: the mask came out several pixels across. A single-receiver forest has
+    #: one-cell-wide branches by construction, so the plane becomes a
+    #: CENTRELINE: on the corridor's (-12,-5) the drawn ribbon goes from a
+    #: median 5.30 m to 1.88 m (one pixel), against a law width that says
+    #: 3.30 m. The network is right and the ribbon is now NARROWER than the
+    #: channel it describes, where before it was slightly wider.
+    #:
+    #: That is a real trade and it is deliberately NOT papered over here. The
+    #: fix, if the owner wants it, is to let ``channel_width_m(Q)`` decide
+    #: EXTENT the way ``water_depth_m(Q)`` already decides depth -- which is
+    #: more consistent than what either version does, not less -- and it is a
+    #: decision about what the world looks like rather than a defect. Nothing in
+    #: this constant should be read as having settled it.
+    #:
+    #: False reproduces the bake_ver 10 water pass exactly.
+    water_flow_single_receiver: bool = True
     #: Write the water plane at all. False reproduces a bake_ver-8 tile's
     #: sections exactly (no SECTION_WATER_*, flag clear), which is what the
     #: terrain-identity gate bakes against.
@@ -1067,6 +1163,7 @@ class BakeConstants:
     PRODUCT_FIELDS: ClassVar[tuple[str, ...]] = (
         "water_q_perennial_m3_yr",
         "water_min_width_px",
+        "water_flow_single_receiver",
         "water_plane_enabled",
     )
 
@@ -1401,6 +1498,12 @@ class BakeKernels:
     #: a None default so pre-existing test doubles keep constructing; the
     #: pipeline refuses to bake ``incision_mode = "profile"`` without it.
     profile_incision: "Callable | None" = None
+    #: ``flow.accumulate_d8``, the water pass's single-receiver sweep. Same
+    #: None-default reason as ``profile_incision``; B6 refuses to bake with
+    #: ``water_flow_single_receiver`` set and no kernel rather than silently
+    #: falling back to MFD and shipping a plane that is not the one the
+    #: constants describe.
+    accumulate_d8: "Callable | None" = None
 
 
 _MISSING_KERNELS = (
@@ -1414,7 +1517,12 @@ _MISSING_KERNELS = (
 def load_kernels() -> BakeKernels:
     """Import the real numerics. Raises RuntimeError with a legible message."""
     try:
-        from .flow import accumulate_mfd, d8_receivers, fill_depressions
+        from .flow import (
+            accumulate_d8,
+            accumulate_mfd,
+            d8_receivers,
+            fill_depressions,
+        )
     except ImportError as exc:  # pragma: no cover - depends on sibling agents
         raise RuntimeError(_MISSING_KERNELS.format(mod="flow", err=exc)) from exc
     try:
@@ -1435,6 +1543,7 @@ def load_kernels() -> BakeKernels:
         fill_depressions=fill_depressions,
         d8_receivers=d8_receivers,
         accumulate_mfd=accumulate_mfd,
+        accumulate_d8=accumulate_d8,
         stream_power=stream_power,
         relax=relax,
         profile_incision=profile_incision,
@@ -4229,9 +4338,46 @@ def bake_tile(
             inflow_area_m2=(None if carried_q is not None else out["inflow"]),
             inflow_q_m3_yr=carried_q,
         )
-        q_pad = kernels.accumulate_mfd(
-            out["filled"], geom.fine_pixel_m, p=consts.mfd_p, source=src
-        )
+        # THE WATER PASS CONCENTRATES; THE TERRAIN PASS DOES NOT (bake_ver 11).
+        # `acc` above is the area field and is still MFD at `consts.mfd_p`: it
+        # feeds `A^m`, it decides every height, and pure D8 would put
+        # dead-straight 45-degree channels in the ground (flow.py's first
+        # lesson). Nothing here can reach it -- this is a separate sweep over
+        # the same surface whose only consumer is the `q >= q_drawable`
+        # threshold below.
+        #
+        # And a threshold is exactly what MFD is worst for. Splitting a reach's
+        # discharge across every lower neighbour does not make a smoother
+        # network, it makes one that crosses the cut and comes back: 25-33% of
+        # network cells on the measured corridor have no strictly lower
+        # neighbour holding as much as they do, and one walked channel showed
+        # fifty wet-dry-wet excursions in 2,001 steps. Under a single-receiver
+        # rule that count is 0 by construction.
+        #
+        # The forest is built on `filled`, THE SAME SURFACE THIS SWEEP RUNS
+        # OVER, not on `z_route` below. `filled` is what the elevation argsort
+        # orders and what `d8_receivers` guarantees a strictly-lower receiver
+        # on; borrowing the water surface's forest would walk an order that is
+        # not descending along it and the result would not be an accumulation.
+        # It is also B2b's own forest, so the discharge follows the same
+        # centrelines the incision's slope term was taken along.
+        if consts.water_flow_single_receiver:
+            if kernels.accumulate_d8 is None:
+                raise RuntimeError(
+                    "water_flow_single_receiver is set but this BakeKernels has "
+                    "no accumulate_d8 kernel; inject flow.accumulate_d8 or set "
+                    "the constant False (which reproduces the bake_ver 10 "
+                    "water pass)"
+                )
+            rec_q, _ = kernels.d8_receivers(out["filled"], geom.fine_pixel_m)
+            q_pad = kernels.accumulate_d8(
+                out["filled"], geom.fine_pixel_m, source=src, receivers=rec_q
+            )
+            del rec_q
+        else:
+            q_pad = kernels.accumulate_mfd(
+                out["filled"], geom.fine_pixel_m, p=consts.mfd_p, source=src
+            )
         del src
         q_pad = np.asarray(q_pad, np.float64)
 
