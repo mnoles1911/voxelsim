@@ -77,6 +77,33 @@ constexpr int32_t tilePixelSizeMm(uint8_t scale) {
 // the magic; returns nullopt if the buffer is too short or not a .vxtl.
 std::optional<uint16_t> vxtlVersion(const uint8_t* data, size_t size);
 
+// One row of the v2 section table (§3).
+struct FineSectionEntry {
+    uint32_t id = 0;
+    uint64_t offset = 0;
+    uint64_t length = 0;
+};
+
+// Everything a RANGE FETCHER needs to decide what to ask for next, read out of
+// the head of the file: which sections exist, where they are, how long the file
+// is, and which planes the flags declare.
+//
+// DELIBERATELY NOT A VALIDATOR, and the distinction matters. This is the same
+// peek `vxtlVersion` is: it checks only enough to trust the offsets it hands
+// back (magic, version, a table that fits in the probe). The authority on
+// whether a tile is well-formed remains FineTile::parsePartial, which every
+// fetched tile still goes through and which re-reads all of this from the
+// bytes. So a header this function accepts can still be rejected there -- that
+// is the intended order, not a gap: planning a fetch and trusting a tile are
+// different decisions and only the second one is safety-critical.
+//
+// Returns false if `head` is not a v2 .vxtl or is too short to hold the whole
+// section table -- in which case the caller must re-probe with a larger head.
+// `fileSize` comes back as the end of the last section, which is what the
+// format's own "nothing past the last section" rule makes authoritative.
+bool readFineSectionTable(const uint8_t* head, size_t headLen, uint16_t& flags,
+                          uint64_t& fileSize, std::vector<FineSectionEntry>& out);
+
 // ---------------------------------------------------------------------------
 // .vxtl v2 -- the baked fine tier. docs/vxtl-v2-format.md is the FROZEN
 // CONTRACT this implements; the Python encoder
@@ -350,6 +377,14 @@ enum class FineError : uint8_t {
     kBadPayload,       // decode: payload length wrong for the block's mode
     kValueOutOfRange,  // decode: a reconstructed value left the element's range
     kBadBasinTable,    // §P1 table: wrong version/row size, bad count, bad row
+    // The bytes for this block were never fetched. NOT an error in the data and
+    // NOT a decode failure -- the tile is fine, this client simply does not hold
+    // that part of it yet. It exists as its own code because the ONLY other
+    // thing a partial tile could say is "0", and 0 on the elevation plane is
+    // SEA LEVEL: a different world, not a degraded one (tilestreaming.h states
+    // this as the rule the whole fine tier is gated on). A caller that gets
+    // this must block or refuse; it must never substitute a value.
+    kBlockNotResident,
 };
 
 // Stable short name, for logs. Never null.
@@ -383,6 +418,93 @@ struct FineBlockEntry {
     uint8_t mode = kBlockConstant;
     int16_t constCp = 0;   // the whole block's value when CONSTANT
     uint8_t residBits = 16; // 16 or 32 (§5) -- REQUIRED, not an optimisation
+};
+
+// ---------------------------------------------------------------------------
+// A SUBSET of a .vxtl file's bytes, addressed by ABSOLUTE FILE OFFSET.
+//
+// This is what lets a client hold part of a tile. The whole-file case is one
+// segment covering [0, fileSize) and is what `whole()` builds, so every
+// existing caller keeps byte-for-byte identical behaviour; a sliced client
+// holds the preamble plus whichever block payloads it fetched.
+//
+// ADDRESSING BY FILE OFFSET, not by section, is the whole trick: FineTile
+// already resolves a block to `<data section offset> + <entry.offset>`, an
+// absolute file position, so nothing above this class has to learn a second
+// coordinate system. A range fetched off disk or out of a 206 response drops
+// straight in at the offset it was requested from.
+//
+// THE ONE THING THIS CLASS MUST NEVER DO is answer a read it cannot satisfy.
+// `span()` returns nullptr for bytes that were not fetched -- it does not
+// return zeroes, and it does not return a short buffer. Every caller is
+// therefore forced to have a not-resident branch, which is the property that
+// keeps an unfetched block from decoding as flat terrain at sea level.
+class FineTileBytes {
+public:
+    FineTileBytes() = default;
+
+    // The whole file as one segment -- the shape every pre-slicing caller has.
+    static FineTileBytes whole(std::vector<uint8_t> bytes) {
+        FineTileBytes b;
+        b.fileSize_ = bytes.size();
+        b.whole_ = true;
+        if (!bytes.empty()) {
+            b.segs_.push_back(Segment{0, std::move(bytes)});
+        }
+        return b;
+    }
+
+    // An empty store for a file KNOWN to be `fileSize` bytes long. The length
+    // has to be known up front because FineTile::parse validates that the
+    // section table covers the file exactly -- a check that catches a truncated
+    // download, and which a partial reader must not lose. A range fetcher gets
+    // the number from `Content-Range: bytes a-b/<total>` or from the file's
+    // size on disk.
+    static FineTileBytes forFile(uint64_t fileSize) {
+        FineTileBytes b;
+        b.fileSize_ = fileSize;
+        return b;
+    }
+
+    // Adds one fetched range at absolute file offset `offset`. Returns false
+    // (no state change) if it runs past `fileSize()` or OVERLAPS a segment
+    // already held: overlapping segments would mean two different answers for
+    // one byte, and the only way that happens is a mis-planned fetch or a
+    // server that answered a different range than it was asked for. Refusing
+    // is how that becomes visible instead of becoming terrain. Adjacent (not
+    // overlapping) segments are merged.
+    bool addSegment(uint64_t offset, std::vector<uint8_t> data);
+
+    // Pointer to `len` contiguous bytes at file offset `off`, or nullptr if any
+    // of them was not fetched. A zero-length request is answered nullptr: there
+    // is no such thing as a useful empty payload here (a block that owns no
+    // bytes is CONSTANT and is served from the index), so returning a
+    // dereferenceable pointer for one would only ever paper over a caller bug.
+    const uint8_t* span(uint64_t off, uint64_t len) const;
+
+    bool covers(uint64_t off, uint64_t len) const { return span(off, len) != nullptr; }
+
+    uint64_t fileSize() const { return fileSize_; }
+    // How many bytes are actually held. THIS, not fileSize(), is what a partial
+    // client pays in RAM, and it is the number the measurement reports.
+    uint64_t residentBytes() const;
+    size_t segmentCount() const { return segs_.size(); }
+    // True for a store built by whole(): every byte of the file is held.
+    bool isWhole() const { return whole_; }
+
+private:
+    struct Segment {
+        uint64_t offset = 0;
+        std::vector<uint8_t> data;
+        uint64_t end() const { return offset + data.size(); }
+    };
+    // Sorted by offset, non-overlapping, non-adjacent (adjacent pairs are
+    // merged on insert). Small -- a ground-only fetch holds 2 segments, a
+    // three-plane one about 10 -- so a linear scan beats anything cleverer and
+    // keeps the ordering invariant checkable by eye.
+    std::vector<Segment> segs_;
+    uint64_t fileSize_ = 0;
+    bool whole_ = false;
 };
 
 // A parsed v2 fine tile. Owns the file bytes and the block index; block
@@ -424,6 +546,44 @@ public:
                                          const FineDecompressor& decompressor = {},
                                          FineError* err = nullptr);
 
+    // PARTIAL parse: the same all-or-nothing structural check, over a tile of
+    // which only some bytes were fetched (see FineTileBytes).
+    //
+    // WHAT MUST BE PRESENT: the header, the section table, every block index
+    // section the flags declare, and the basin table. That is the "preamble" --
+    // 62-67 KB in four disjoint regions on a shipped tile, against 32-56 MB of
+    // file -- and it is exactly the set this function validates. Anything
+    // missing from it is kBlockNotResident, distinguishable from a corrupt
+    // tile, because "I did not fetch enough" and "these bytes are wrong" call
+    // for opposite responses: fetch more, versus discard and never retry.
+    //
+    // WHAT MAY BE ABSENT: any and all DATA-section bytes. A block whose payload
+    // was not fetched is not an error here and is not decoded to zero later --
+    // decodeElevBlock/decodeFlowBlock/decodeWaterBlock refuse it with
+    // kBlockNotResident, and *BlockResident() below answers the question up
+    // front so a caller can gate instead of discovering it mid-query.
+    //
+    // Note that CONSTANT blocks are resident with zero bytes fetched: they own
+    // no data-section entry at all (their (offset=0, comp_len=0) is not a
+    // range), so they are served from `const_cp` in the index. On the shipped
+    // water plane that is 72-87% of the tile.
+    static std::optional<FineTile> parsePartial(FineTileBytes bytes,
+                                                const FineDecompressor& decompressor = {},
+                                                FineError* err = nullptr);
+
+    // Splices later-fetched bytes into an ALREADY PARSED tile, so a client can
+    // start from the preamble and pull blocks in as it needs them without
+    // re-parsing. Returns false (no state change) if a segment overlaps bytes
+    // already held or runs past the file -- see FineTileBytes::addSegment.
+    //
+    // THE ONE NON-CONST METHOD ON THIS CLASS, and it is why the class comment's
+    // "immutable, safe to share across threads" claim needs qualifying: a
+    // FineTile is immutable EXCEPT for this call, so a host that shares one
+    // across threads must make this call exclusive with every reader. The UE
+    // streamer does that with the same write lock it already takes for load and
+    // evict; a caller that cannot must fetch everything before publishing.
+    bool addFetchedBytes(uint64_t fileOffset, std::vector<uint8_t> data);
+
     const FineTileHeader& header() const { return h_; }
     uint64_t seed() const { return h_.seed; }
     int32_t tileX() const { return h_.x; }
@@ -448,11 +608,39 @@ public:
     // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
     // `basins()[i].basinId == i` and a row means the same basin in every
     // process. Empty when hasBasins() is false.
+    //
+    // MUST BE READ TOGETHER WITH basinsResident(). On a partially fetched tile
+    // this is also empty when the table simply was not downloaded, and the two
+    // are opposite facts: "this tile was surveyed and holds no lakes" versus
+    // "we do not know what lakes this tile holds". A caller that reads only
+    // this container places no water in either case, and one of those is wrong.
     const std::vector<BasinEntry>& basins() const { return basins_; }
+
+    // --- which PREAMBLE sections this client actually holds -----------------
+    //
+    // On a whole-file tile all three are true whenever the matching has*() is.
+    // On a sliced one they say what was fetched, and they exist so that "not
+    // downloaded" can never be read as "empty" -- the same distinction hasFlow()
+    // / hasBasins() / hasWater() draw between "absent from the format" and
+    // "present but empty", one level further down.
+    //
+    // A false here means every block of that plane answers NOT-RESIDENT: with
+    // no index there is no way even to know where the blocks are, let alone
+    // what is in them.
+    bool flowIndexResident() const { return flowIndex_.size() == blockCount(); }
+    bool waterIndexResident() const { return waterIndex_.size() == blockCount(); }
+    bool basinsResident() const { return basinsResident_; }
 
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
     const std::vector<FineBlockEntry>& waterIndex() const { return waterIndex_; }
+
+    // FILE offset of each plane's data section -- what an index entry's
+    // `offset` is relative to, and therefore what a range fetcher must add to
+    // it to get a byte position. 0 when the tile does not carry the plane.
+    uint64_t elevDataOffset() const { return elevDataOff_; }
+    uint64_t flowDataOffset() const { return flowDataOff_; }
+    uint64_t waterDataOffset() const { return waterDataOff_; }
 
     uint8_t codec() const { return h_.codec; }
     // The decompressor this tile was parsed with. Empty for a CODEC_RAW tile.
@@ -518,14 +706,60 @@ public:
     // Single control point, tile-LOCAL pixel coords. Decodes the containing
     // block on every call, so it is for tests and cold paths; anything hot
     // should go through decodeElevBlock or FineTileSampler's block cache.
-    bool controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const;
+    //
+    // False for an out-of-range pixel, a corrupt block, OR a block whose bytes
+    // were never fetched -- the three are told apart by `err`, and a caller
+    // that ignores it must still not substitute a value for `cp`.
+    bool controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp, FineError* err = nullptr) const;
+
+    // --- per-block residency ------------------------------------------------
+    //
+    // "Do I hold the bytes for this block?" -- answerable without decoding
+    // anything, which is what makes it usable as a GATE. True in two cases and
+    // it is worth being explicit about the second:
+    //
+    //   * the block's payload bytes were fetched, or
+    //   * the block is CONSTANT, and therefore has no payload bytes to fetch.
+    //     A CONSTANT block is fully served by `const_cp` in the index, so it is
+    //     resident the moment the index is. This is not a special case bolted
+    //     on: it is what makes a water refresh cheap, the shipped water plane
+    //     being 72-87% CONSTANT.
+    //
+    // False for out-of-range coordinates, and false for every block of a plane
+    // the tile does not carry (a flow query on a tile with no flow section).
+    bool elevBlockResident(uint32_t bx, uint32_t by) const;
+    bool flowBlockResident(uint32_t bx, uint32_t by) const;
+    bool waterBlockResident(uint32_t bx, uint32_t by) const;
+
+    // Blocks of each plane whose bytes are held (CONSTANT ones counted, per
+    // above). residentBlockCount(elev) == blockCount() for a whole-file tile.
+    uint32_t residentElevBlocks() const;
+    uint32_t residentWaterBlocks() const;
+
+    // What this tile costs in RAM as file bytes -- the whole file for a
+    // whole-file load, only the fetched regions for a sliced one. Excludes
+    // decoded block caches, which live in FineTileSampler, not here.
+    uint64_t residentFileBytes() const { return bytes_.residentBytes(); }
+    uint64_t fileSize() const { return bytes_.fileSize(); }
+    // True when this tile holds every byte of its file.
+    bool isWholeFile() const { return bytes_.isWhole(); }
 
 private:
-    std::vector<uint8_t> bytes_;
+    // Where a block's payload lives IN THE FILE, or {0,0} when it owns no bytes
+    // (CONSTANT). Shared by the residency tests and the decoders so the two can
+    // never disagree about which bytes a block needs.
+    bool blockFileSpan(const std::vector<FineBlockEntry>& index, uint64_t dataOff, uint32_t bx,
+                       uint32_t by, uint64_t& off, uint64_t& len) const;
+
+    FineTileBytes bytes_;
     FineTileHeader h_;
     FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_, waterIndex_;
     std::vector<BasinEntry> basins_;
+    // Distinguishes a fetched-and-empty basin table from an unfetched one. A
+    // bool rather than "basins_.empty()" precisely because an empty table is
+    // legitimate and means something different -- see basins().
+    bool basinsResident_ = false;
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
     uint64_t waterDataOff_ = 0, waterDataLen_ = 0;
@@ -584,6 +818,15 @@ public:
     // bytes, and a caller that cannot tell them apart chases the wrong one.
     bool loadTile(const std::vector<uint8_t>& bytes, FineError* err = nullptr);
     bool loadTileFile(const std::filesystem::path& path, FineError* err = nullptr);
+    // Stores a tile of which only some bytes were fetched. The preamble must be
+    // complete (see FineTile::parsePartial); data blocks may be absent and are
+    // then answered NOT-RESIDENT rather than 0 by every read path below.
+    bool loadTilePartial(FineTileBytes bytes, FineError* err = nullptr);
+    // Splices later-fetched bytes into a loaded tile. False if (tx,ty) is not
+    // loaded or the segment overlaps bytes already held. MUTATES a tile other
+    // threads may be reading -- see FineTile::addFetchedBytes; a host that
+    // shares this sampler must hold its write lock across this call.
+    bool addTileBytes(int32_t tx, int32_t ty, uint64_t fileOffset, std::vector<uint8_t> data);
 
     size_t tileCount() const { return tiles_.size(); }
     // Grid stride in fine pixels, taken from the first loaded tile; 0 before
@@ -615,10 +858,49 @@ public:
 
     size_t residentBlockCount() const;
 
+    // --- residency, as a PURE query -----------------------------------------
+    //
+    // Both of these are const, decode nothing, fetch nothing and mutate
+    // nothing, which is what lets a host use them as a gate on the query path
+    // under a shared lock. They answer two different questions:
+    //
+    //   blockBytesResident -- do we hold this block's FILE BYTES (or is it
+    //       CONSTANT and needs none)? i.e. could it be decoded without fetching.
+    //   blockDecoded       -- is it already in the decoded block cache? i.e.
+    //       could it be READ without mutating anything.
+    //
+    // A host whose worker threads share this sampler must gate on
+    // blockDecoded(): a query that would have to decode is a WRITE, and the
+    // shared read lock does not survive one. blockBytesResident() is what the
+    // loader checks to decide whether it still has bytes to fetch.
+    bool blockDecoded(int64_t px, int64_t py) const;
+    bool blockBytesResident(int64_t px, int64_t py) const;
+
+    // --- what residency actually costs in RAM -------------------------------
+    //
+    // Reported separately because they behave differently and the second one
+    // dominates: file bytes are what a fetch pays, decoded blocks are ~5x that
+    // for a fully warmed tile (a 32x32 grid of 256^2 int16 blocks is 134 MB
+    // against a 32-56 MB file). Slicing the FETCH without slicing the DECODE
+    // therefore leaves most of the memory on the table.
+    uint64_t residentFileBytes() const;
+    uint64_t decodedBlockBytes() const;
+
     // Same role as TileGridSampler::missingTileQueries: public so tests and
     // streaming code can assert on it directly. Atomic so a fully prewarmed
     // sampler keeps its thread-safety claim.
     std::atomic<uint64_t> missingTileQueries{0};
+    // Queries whose TILE was loaded but whose BLOCK's bytes were never fetched.
+    // Kept apart from blockDecodeFailures below for the reason FineError keeps
+    // kBlockNotResident apart from kBadPayload: this one says "fetch more", that
+    // one says "these bytes are corrupt, discard the tile". A sliced client trips
+    // this routinely and is not broken; a client tripping the other one is.
+    //
+    // It is NOT harmless, though, and must not be treated as informational: like
+    // missingTileQueries, every increment is a query that got kSeaLevelMm back
+    // from elevationMm(), and on the fine tier sea level is a different world
+    // rather than a degraded one. Nonzero means some gate did not cover a read.
+    std::atomic<uint64_t> notResidentBlockQueries{0};
     // Blocks that passed structural validation at parse time but whose payload
     // reconstructed out of range. Separate from missingTileQueries because the
     // two mean very different things: a miss is streaming not having caught

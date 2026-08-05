@@ -4,8 +4,9 @@
 #include "VoxelTileCodec.h"  // VoxelEarth::GetFineTileDecompressor -- CODEC_ZSTD host boundary
 #include "Misc/Paths.h"      // FPaths::Combine
 
-#include "voxelcore/caverns.h" // kCavernMaxReachMm -- see kFineReadMarginMm below
-#include "voxelcore/core.h"    // kVoxelSizeMm
+#include "voxelcore/caverns.h"  // kCavernMaxReachMm -- see kFineReadMarginMm below
+#include "voxelcore/core.h"     // kVoxelSizeMm
+#include "voxelcore/tilerange.h" // FileRangeSource/readFineTilePreamble -- the ranged load
 
 #include <filesystem>
 #include <optional>
@@ -21,7 +22,8 @@
 // library, and turning its answers into vxc::FineTileSampler loads/unloads.
 //
 // A future async/network loader would replace EnsureTileResident_Locked's body
-// (currently vxc::readFileBytes + vxc::validateAndParseFineTile + a full
+// (currently a vxc::FileRangeSource + vxc::readFineTilePreamble +
+// vxc::fetchFineTileBlocks + vxc::validateAndParseFineTilePartial + a full
 // prewarm, all synchronous) with a background fetch+decode that completes on
 // some later tick and is published under the exclusive lock; the public API
 // (IsFootprintResident / RequestFootprint / TickResidencyAndEviction) would
@@ -181,8 +183,31 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 
 	const FString Path = LocalPathFor(Tile);
 	const std::filesystem::path StdPath(*Path);
-	std::optional<std::vector<uint8_t>> Bytes = vxc::readFileBytes(StdPath);
-	if (!Bytes)
+
+	// RANGED READ, NOT A WHOLE-FILE SLURP (task #52). A file supports ranges
+	// natively -- seek and read -- so this needs no server, no protocol and no
+	// change to how tiles are delivered; it is the same path LocalPathFor has
+	// always built, opened once and seeked instead of slurped.
+	//
+	// WHAT IS SKIPPED, and it is the whole of the saving: the §6 FLOW plane.
+	// Nothing in ue-project reads it (grep: the only decodeFlowBlock callers in
+	// the repo are voxel-core/bench probes, which load tiles from disk
+	// themselves), and on the shipped bv12 tiles FLOW_DATA is 12.6 MB of a
+	// 51.6 MB file. Measured over the four corridor tiles, this takes the load
+	// from 179.4 MB to 133.7 MB read and from 197.4 MB to 133.7 MB held as file
+	// bytes -- a 25% cut in a read that happens synchronously on the game
+	// thread and which the header warns can block for a second or more.
+	//
+	// WHAT IS *NOT* SKIPPED, and why this is not the big win: every ELEVATION
+	// block is still fetched, because rule 1 (see the header's threading note)
+	// decodes the whole tile at load and therefore needs every one of them.
+	// Block-granular residency would take the same working set to ~400 KB read
+	// and ~1.6 MB held -- 100x further -- but it requires retiring rule 1, which
+	// is what makes the worker-facing query path a pure read under a shared
+	// lock. That is a separate change and it is deliberately not made here; see
+	// docs/tile-slicing-2026-08-04.md and the report for the measured prize.
+	vxc::FileRangeSource Source(StdPath);
+	if (!Source.ok())
 	{
 		// Not on disk (yet, or ever) -- caller keeps deferring, never a
 		// fallback. Remembered so the per-recompute prefetch loop does not
@@ -193,15 +218,36 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		KnownMissing_.insert(TileHash(Tile));
 		return false;
 	}
-	const uint64 ByteCount = Bytes->size();
 
-	// "Validate, never trust": FineTile::parse's own all-or-nothing structural
-	// check, PLUS the identity check that follows EditLog::checkProvider()'s
-	// precedent (compare a stamped identity, refuse on mismatch) rather than
-	// inventing a second mechanism. The decompressor is the sampler's, so a
-	// CODEC_ZSTD tile is decodable here exactly when this build has zstd.
-	vxc::FineTileValidationResult Validated = vxc::validateAndParseFineTile(
-		std::move(*Bytes), Seed_, Tile.x, Tile.y, Sampler_.decompressor());
+	// The preamble: header, section table, elevation index, water index, basin
+	// table. Four DISJOINT regions, not a prefix -- encode_v2 puts each plane's
+	// multi-megabyte data section immediately after its own index -- which is
+	// why this is a call into voxel-core rather than a "read the first 64 KB"
+	// here. ~62-67 KB of content in 2-4 requests.
+	vxc::FinePreambleRequest Want;
+	Want.wantFlow = false;   // see above: nothing in this module reads flow
+	Want.wantWater = true;   // lakes.h / riverribbon.h decode water lazily
+	Want.wantBasins = true;  // the lake registry; absent != empty, so fetch it
+	vxc::FineTileBytes Held;
+	vxc::FineError PreambleErr = vxc::FineError::kNone;
+	if (!vxc::readFineTilePreamble(Source, Source.fileSize(), Want, Held, &PreambleErr))
+	{
+		++CorruptLoads_;
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Fine tile (%d,%d) at %s: could not read its preamble (%hs) -- discarding, NOT using it. ")
+		       TEXT("A truncated file is caught here rather than after a block decodes to plausible terrain."),
+		       Tile.x, Tile.y, *Path, vxc::fineErrorName(PreambleErr));
+		return false;
+	}
+
+	// "Validate, never trust": FineTile::parsePartial's own all-or-nothing
+	// structural check, PLUS the identity check that follows
+	// EditLog::checkProvider()'s precedent (compare a stamped identity, refuse
+	// on mismatch) rather than inventing a second mechanism. The decompressor is
+	// the sampler's, so a CODEC_ZSTD tile is decodable here exactly when this
+	// build has zstd.
+	vxc::FineTileValidationResult Validated = vxc::validateAndParseFineTilePartial(
+		std::move(Held), Seed_, Tile.x, Tile.y, Sampler_.decompressor());
 	if (Validated.verdict == vxc::FineTileVerdict::kCorrupt)
 	{
 		++CorruptLoads_;
@@ -221,8 +267,48 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		return false;
 	}
 
+	// Now the payload bytes, in coalesced ranges planned off the indices the
+	// preamble just gave us. CONSTANT blocks are served from the index and cost
+	// no request at all -- on these tiles that is 72-87% of the water plane.
+	//
+	// EVERY non-CONSTANT elevation block, because rule 1 decodes them all below
+	// and a block whose bytes are absent would fail that decode with
+	// kBlockNotResident rather than silently yielding sea level. The residency
+	// invariant this class publishes ("resident tile => every block readable")
+	// is therefore still exactly true after this call, or the load fails.
+	if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kElevation,
+	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kElevation)))
+	{
+		++CorruptLoads_;
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Fine tile (%d,%d) at %s: elevation block fetch failed -- discarding. The file shrank or ")
+		       TEXT("changed under us between the preamble read and the payload read."),
+		       Tile.x, Tile.y, *Path);
+		return false;
+	}
+	// The water plane, which lakes.h / riverribbon.h decode lazily out of the
+	// tile's own bytes long after this function returns. It must be fetched HERE
+	// rather than on demand: those decoders run on worker threads, and an
+	// unfetched water block would answer kBlockNotResident there with no way to
+	// go and get it. 51-174 KB, and mostly one coalesced span.
+	if (Validated.tile->hasWater() &&
+	    !vxc::fetchFineTileBlocks(Source, *Validated.tile, vxc::FinePlane::kWater,
+	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kWater)))
+	{
+		++CorruptLoads_;
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Fine tile (%d,%d) at %s: water block fetch failed -- discarding."), Tile.x, Tile.y, *Path);
+		return false;
+	}
+
 	// Capture the geometry before the move below hands ownership to the sampler.
 	const int64 TileSizePx = int64(Validated.tile->size());
+	// What this tile HOLDS, which is now less than its size on disk: the flow
+	// plane's 12.6 MB (on the shipped tiles) was never read. Charging the LRU
+	// the fetched bytes rather than the file size is what makes the budget mean
+	// what it says once the two stop being equal.
+	const uint64 ByteCount = Validated.tile->residentFileBytes();
+	const uint64 FileSizeOnDisk = Source.fileSize();
 	const uint64 TileDecodedBytes =
 		uint64(Validated.tile->blockCount()) * uint64(Validated.tile->blockPixelCount()) * sizeof(int16_t);
 
@@ -280,9 +366,11 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	KeyToTile_.emplace(Key, Tile);
 
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("Fine tile (%d,%d) resident: %llu px edge, %.1f MB file + %.1f MB decoded lattice, ")
-	       TEXT("full decode %.0f ms. Resident tiles now %llu, %.2f GiB of %.2f GiB budget."),
+	       TEXT("Fine tile (%d,%d) resident: %llu px edge, %.1f MB read of a %.1f MB file in %llu range(s) ")
+	       TEXT("+ %.1f MB decoded lattice, full decode %.0f ms. Resident tiles now %llu, %.2f GiB of ")
+	       TEXT("%.2f GiB budget."),
 	       Tile.x, Tile.y, (unsigned long long)TileSizePx, double(ByteCount) / 1e6,
+	       double(FileSizeOnDisk) / 1e6, (unsigned long long)Source.requests,
 	       double(TileDecodedBytes) / 1e6, DecodeMs, (unsigned long long)Sampler_.tileCount(),
 	       double(Budget_.residentBytes()) / double(1ull << 30), double(Budget_.budgetBytes()) / double(1ull << 30));
 	return true;

@@ -201,6 +201,32 @@ are comparable rather than merely similar.
 
 ---
 
+## Owner decisions taken
+
+**Tile identity: per-section content addressing, built when the server is built.**
+(Matt, 2026-08-04.)
+
+A water-only re-bake changes **0.15-0.62%** of a tile's bytes and re-keys
+**100%** of them, because `fine_provider_id` hashes the product half of the
+fingerprint. Two ways to collect that were priced; the owner chose the safe one.
+
+Why it matters in production rather than today: the world is **289 fine tiles at
+~45 MB compressed, about 13 GB**. That cannot ship with the game and cannot be
+generated client-side (~300 CPU-s per tile), so it streams. Under the current
+scheme, improving rivers would make **every player re-download every tile they
+have cached** -- up to 13 GB for a change to a few hundred kilobytes. Per-section
+addressing makes the same update **~150 KB per tile, ~43 MB for the world**.
+
+The rejected alternative was splitting the namespace by terrain-vs-product
+fingerprint: cheaper to build, but it puts two different bakes at one path, and
+the failure mode is terrain that does not match between players.
+
+**Nothing to build yet.** There is no fine-tier fetch: tiles are files in a
+directory, and `/tile` serves only the coarse tier to anything that asks. The
+foundation already exists -- byte ranges on the server (#217) and partial tiles
+on the client (#218) -- and neither expires. What is still missing is a manifest
+so a client can learn what changed without downloading it.
+
 ## Backlog, in support of water
 
 Ordered by how much they block the milestone.
