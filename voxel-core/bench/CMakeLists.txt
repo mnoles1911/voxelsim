@@ -220,3 +220,14 @@ target_link_libraries(vxc_sliceprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_sliceprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_waterdatumprobe: WHICH producer claims water at a world position,
+#     and at what height. The first fork of any "water is at the wrong height"
+#     diagnosis -- is the height in the DATA, or manufactured by the client?
+#     See the file header for what it asks and why the sheet gather is
+#     reproduced rather than approximated.
+add_executable(vxc_waterdatumprobe waterdatumprobe.cpp)
+target_link_libraries(vxc_waterdatumprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_waterdatumprobe PRIVATE -Wall -Wextra -Werror)
+endif()
