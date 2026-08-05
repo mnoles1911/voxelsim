@@ -8,8 +8,10 @@
 #include "voxelcore/core.h"     // kVoxelSizeMm
 #include "voxelcore/tilerange.h" // FileRangeSource/readFineTilePreamble -- the ranged load
 
+#include <chrono>       // std::filesystem::file_time_type's rep -- see the retry contract
 #include <filesystem>
 #include <optional>
+#include <system_error> // std::error_code: last_write_time without exceptions
 #include <utility>
 
 // See VoxelFineTileStreamer.h's class-level comment for the full contract.
@@ -55,6 +57,34 @@ namespace
 	constexpr uint64 TileHash(vxc::TileCoord T)
 	{
 		return (uint64(uint32(T.x)) << 32) | uint64(uint32(T.y));
+	}
+
+	// voxel-core's sentence, as an FString. The explanation lives there (and is
+	// unit-tested there) rather than in this log call, because this file is the
+	// half that cannot be tested without an editor, a real bake and a
+	// deliberately stale binary -- which is precisely why its messages went
+	// unnoticed pointing at the wrong thing.
+	FString DescribeRejection(vxc::FineError Err, const vxc::FineHeaderFacts& Facts)
+	{
+		return FString(UTF8_TO_TCHAR(vxc::fineDescribeRejection(Err, Facts).c_str()));
+	}
+
+	// THE FILE'S VERSION, not its contents. Size plus last-write time is what
+	// the retry memo is keyed on (see the contract in the header): it costs one
+	// stat rather than the 60+ KB preamble read a real re-validation costs, and
+	// it changes for every one of the things that can legitimately make a
+	// refused tile loadable -- a re-bake, a download completing, a file
+	// repaired by hand. It cannot detect a rewrite that preserved both, which
+	// is why the memo is a RETRY suppressor and not a cache of verdicts:
+	// nothing is served from it, the worst case is one more restart.
+	int64 FileWriteTimeTicks(const std::filesystem::path& P)
+	{
+		std::error_code Ec;
+		const std::filesystem::file_time_type T = std::filesystem::last_write_time(P, Ec);
+		// 0 on a filesystem that will not answer: the memo then keys on size
+		// alone, which is weaker but never wrong in the dangerous direction (a
+		// stale memo only costs a retry that a session restart recovers).
+		return Ec ? int64(0) : int64(T.time_since_epoch().count());
 	}
 }
 
@@ -214,9 +244,47 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		// re-stat the same absent frontier tiles on every anchor crossing;
 		// forgotten whenever the ring centre moves (see TickResidencyAndEviction),
 		// so a tile the bake produces mid-session is still picked up.
+		//
+		// ABSENT AND REFUSED ARE NOT THE SAME STATE and must not be merged:
+		// this one resolves itself when the bake frontier arrives, the other
+		// needs a human. A file that has GONE (deleted, or moved aside for a
+		// re-bake) has no version left to remember, so its refusal memo is
+		// dropped here -- whatever appears next earns a clean set of attempts.
 		++MissingFileLoads_;
 		KnownMissing_.insert(TileHash(Tile));
+		LoadFailures_.erase(TileHash(Tile));
 		return false;
+	}
+
+	// --- HAVE WE ALREADY REFUSED THESE EXACT BYTES? -------------------------
+	//
+	// This is the whole of the infinite-retry fix, and it sits here -- after
+	// the open, before the 60+ KB preamble read -- because the file's identity
+	// is what the answer depends on. Everything below this point is work that
+	// a previously-refused file would spend again to reach the same verdict:
+	// the read, the parse, the log line. At 30 ms a frame, times four tiles,
+	// for the length of a session.
+	const uint64 Hash = TileHash(Tile);
+	const uint64 FileSizeNow = Source.fileSize();
+	const int64 WriteTimeNow = FileWriteTimeTicks(StdPath);
+	if (auto FailIt = LoadFailures_.find(Hash); FailIt != LoadFailures_.end())
+	{
+		if (FailIt->second.FileSize == FileSizeNow && FailIt->second.WriteTime == WriteTimeNow)
+		{
+			// Same bytes as last time. A permanent refusal is settled; a
+			// transient one is settled once its attempts are spent.
+			if (FailIt->second.bPermanent || FailIt->second.Attempts >= kMaxTransientLoadAttempts)
+			{
+				++SuppressedRetries_;
+				return false; // silently -- the reason was logged when it was decided
+			}
+		}
+		else
+		{
+			// The file CHANGED. That is a new fact, not a retry: a re-bake, a
+			// download that finished, or a file someone fixed. Full budget.
+			LoadFailures_.erase(FailIt);
+		}
 	}
 
 	// The preamble: header, section table, elevation index, water index, basin
@@ -230,14 +298,17 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	Want.wantBasins = true;  // the lake registry; absent != empty, so fetch it
 	vxc::FineTileBytes Held;
 	vxc::FineError PreambleErr = vxc::FineError::kNone;
-	if (!vxc::readFineTilePreamble(Source, Source.fileSize(), Want, Held, &PreambleErr))
+	vxc::FineHeaderFacts PreambleFacts;
+	if (!vxc::readFineTilePreamble(Source, Source.fileSize(), Want, Held, &PreambleErr, &PreambleFacts))
 	{
 		++CorruptLoads_;
-		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("Fine tile (%d,%d) at %s: could not read its preamble (%hs) -- discarding, NOT using it. ")
-		       TEXT("A truncated file is caught here rather than after a block decodes to plausible terrain."),
-		       Tile.x, Tile.y, *Path, vxc::fineErrorName(PreambleErr));
-		return false;
+		// A preamble read that failed on the SOURCE (kFileUnreadable: locked,
+		// being written, shrank) is the one failure here that another attempt
+		// can fix. A malformed section table is not, and asking again for it is
+		// the spin this whole path now refuses to perform.
+		return RecordLoadFailure_Locked(Tile, Path, FileSizeNow, WriteTimeNow, TEXT("preamble"),
+		                                DescribeRejection(PreambleErr, PreambleFacts),
+		                                vxc::fineErrorIsTransient(PreambleErr));
 	}
 
 	// "Validate, never trust": FineTile::parsePartial's own all-or-nothing
@@ -251,20 +322,29 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	if (Validated.verdict == vxc::FineTileVerdict::kCorrupt)
 	{
 		++CorruptLoads_;
-		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("Fine tile (%d,%d) at %s failed structural validation (%hs) -- discarding, NOT using it. ")
-		       TEXT("Re-fetch required."),
-		       Tile.x, Tile.y, *Path, vxc::fineErrorName(Validated.error));
-		return false;
+		// "failed structural validation (bad-header)" used to be the whole of
+		// this message, and it was the same words whether the file was
+		// truncated or this binary was three weeks behind the bake. It is now
+		// vxc::fineDescribeRejection's sentence, which names the file's
+		// bake_ver AND this build's ceiling; and retryWorthwhile() decides
+		// whether asking again could ever help, which for a structural refusal
+		// it cannot.
+		return RecordLoadFailure_Locked(Tile, Path, FileSizeNow, WriteTimeNow, TEXT("validation"),
+		                                DescribeRejection(Validated.error, Validated.facts),
+		                                Validated.retryWorthwhile());
 	}
 	if (Validated.verdict == vxc::FineTileVerdict::kIdentityMismatch)
 	{
 		++IdentityMismatches_;
-		UE_LOG(LogVoxelEarth, Warning, TEXT("Fine tile at %s does not match the requested identity (seed=%llu, ")
-		       TEXT("x=%d, y=%d) -- discarding, NOT using it. This is a cache-key/provider mismatch, the same class ")
-		       TEXT("of refusal EditLog::checkProvider() already models for edit-log replay."),
-		       *Path, (unsigned long long)Seed_, Tile.x, Tile.y);
-		return false;
+		return RecordLoadFailure_Locked(
+			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("identity"),
+			FString::Printf(
+				TEXT("the file parsed cleanly but carries a DIFFERENT tile's identity than the one requested ")
+				TEXT("(wanted seed=%llu x=%d y=%d). This is a cache-key/provider mismatch, the same class of ")
+				TEXT("refusal EditLog::checkProvider() already models for edit-log replay -- check ")
+				TEXT("-VoxelFineTileProviderId and the seed before suspecting the tile."),
+				(unsigned long long)Seed_, Tile.x, Tile.y),
+			/*bTransient=*/false);
 	}
 
 	// Now the payload bytes, in coalesced ranges planned off the indices the
@@ -280,11 +360,15 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kElevation)))
 	{
 		++CorruptLoads_;
-		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("Fine tile (%d,%d) at %s: elevation block fetch failed -- discarding. The file shrank or ")
-		       TEXT("changed under us between the preamble read and the payload read."),
-		       Tile.x, Tile.y, *Path);
-		return false;
+		// GENUINELY TRANSIENT, and one of the two cases that justify keeping a
+		// retry at all: the preamble read succeeded, so the file was whole a
+		// moment ago and something rewrote it underneath us. The next attempt
+		// sees the new file, whose size or timestamp differs, and starts over.
+		return RecordLoadFailure_Locked(
+			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("elev-fetch"),
+			TEXT("the elevation payload could not be read: the file shrank or changed between the preamble ")
+			TEXT("read and the payload read. Transient -- a re-bake in progress looks exactly like this."),
+			/*bTransient=*/true);
 	}
 	// The water plane, which lakes.h / riverribbon.h decode lazily out of the
 	// tile's own bytes long after this function returns. It must be fetched HERE
@@ -296,9 +380,11 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	                              vxc::fineNonConstantBlocks(*Validated.tile, vxc::FinePlane::kWater)))
 	{
 		++CorruptLoads_;
-		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("Fine tile (%d,%d) at %s: water block fetch failed -- discarding."), Tile.x, Tile.y, *Path);
-		return false;
+		return RecordLoadFailure_Locked(
+			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("water-fetch"),
+			TEXT("the water payload could not be read: the file shrank or changed between the preamble read ")
+			TEXT("and the payload read. Transient -- see elev-fetch."),
+			/*bTransient=*/true);
 	}
 
 	// Capture the geometry before the move below hands ownership to the sampler.
@@ -322,10 +408,13 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 		// sampler (like the wire spec's own single-grid-stride assumption)
 		// does not.
 		++IdentityMismatches_;
-		UE_LOG(LogVoxelEarth, Error, TEXT("Fine tile (%d,%d) at %s passed validation but FineTileSampler::loadTile ")
-		       TEXT("rejected it (likely a `size` stride mismatch against an already-loaded tile) -- discarding."),
-		       Tile.x, Tile.y, *Path);
-		return false;
+		return RecordLoadFailure_Locked(
+			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("stride"),
+			TEXT("the file passed validation but FineTileSampler::loadTile rejected it -- almost certainly a ")
+			TEXT("`size` stride mismatch against a tile already loaded in this run. The format allows `size` ")
+			TEXT("to vary per tile; this sampler (like the wire spec's own single-grid-stride assumption) ")
+			TEXT("does not."),
+			/*bTransient=*/false);
 	}
 
 	// RULE 1 (see the header's threading note): decode the WHOLE tile now, on
@@ -343,18 +432,25 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	{
 		++CorruptLoads_;
 		Sampler_.unloadTile(Tile.x, Tile.y);
-		UE_LOG(LogVoxelEarth, Error, TEXT("Fine tile (%d,%d) at %s parsed but at least one block failed to decode ")
-		       TEXT("(blockDecodeFailures=%llu) -- unloaded. A half-decoded tile is not servable: a worker query ")
-		       TEXT("into a missing block would decode on the read path, which the shared read lock cannot survive."),
-		       Tile.x, Tile.y, *Path,
-		       (unsigned long long)Sampler_.blockDecodeFailures.load(std::memory_order_relaxed));
-		return false;
+		return RecordLoadFailure_Locked(
+			Tile, Path, FileSizeNow, WriteTimeNow, TEXT("decode"),
+			FString::Printf(
+				TEXT("the file parsed but at least one block failed to DECODE (blockDecodeFailures=%llu) -- ")
+				TEXT("unloaded again. A half-decoded tile is not servable: a worker query into a missing block ")
+				TEXT("would decode on the read path, which the shared read lock cannot survive. The bytes are ")
+				TEXT("bad; re-reading them decodes them the same way."),
+				(unsigned long long)Sampler_.blockDecodeFailures.load(std::memory_order_relaxed)),
+			/*bTransient=*/false);
 	}
 	const double DecodeMs = (FPlatformTime::Seconds() - DecodeT0) * 1000.0;
 
 	DecodedBytes_ += TileDecodedBytes;
 	++TilesLoaded_;
 	KnownMissing_.erase(TileHash(Tile));
+	// It loaded, so whatever we remembered about failing to load it is wrong
+	// (the transient-with-attempts-left path is the only way to get here with
+	// an entry still present). Dropping it also frees the stored explanation.
+	LoadFailures_.erase(TileHash(Tile));
 
 	// Charge the LRU BOTH the file bytes and the decoded lattice. The decoded
 	// half is ~2/3 of the total for a production tile (134 MB of int16 lattice
@@ -374,6 +470,60 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	       double(TileDecodedBytes) / 1e6, DecodeMs, (unsigned long long)Sampler_.tileCount(),
 	       double(Budget_.residentBytes()) / double(1ull << 30), double(Budget_.budgetBytes()) / double(1ull << 30));
 	return true;
+}
+
+bool FVoxelFineTileStreamer::IsSettledFailure_Locked(vxc::TileCoord Tile) const
+{
+	const auto It = LoadFailures_.find(TileHash(Tile));
+	return It != LoadFailures_.end() &&
+	       (It->second.bPermanent || It->second.Attempts >= kMaxTransientLoadAttempts);
+}
+
+bool FVoxelFineTileStreamer::RecordLoadFailure_Locked(vxc::TileCoord Tile, const FString& Path,
+                                                      uint64 FileSize, int64 WriteTime,
+                                                      const TCHAR* ReasonTag, const FString& Why,
+                                                      bool bTransient)
+{
+	FTileLoadFailure& Entry = LoadFailures_[TileHash(Tile)];
+	if (Entry.FileSize != FileSize || Entry.WriteTime != WriteTime)
+	{
+		Entry.Attempts = 0; // a different file version: its own budget
+	}
+	Entry.FileSize = FileSize;
+	Entry.WriteTime = WriteTime;
+	Entry.bPermanent = !bTransient;
+	Entry.Why = Why;
+	++Entry.Attempts;
+
+	const bool bGivingUp = Entry.bPermanent || Entry.Attempts >= kMaxTransientLoadAttempts;
+	if (bGivingUp)
+	{
+		++GivenUpTiles_;
+		// ERROR, not Warning, and ONCE. This is the end of the road for this
+		// tile: its area stays non-resident, the gate keeps refusing to
+		// voxelize there, and nothing further will happen without a human. The
+		// old code said this at Warning and then said it again every frame,
+		// which is the same information rate as saying nothing while being
+		// considerably harder to read past.
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("Fine tile (%d,%d) REFUSED and GIVEN UP after %u attempt(s) [%s]: %s")
+		       TEXT(" File: %s (%llu bytes). NOT RETRIED until that file's size or timestamp changes -- ")
+		       TEXT("re-reading identical bytes produces an identical verdict, so a retry here can only spin. ")
+		       TEXT("This tile stays NON-RESIDENT: the residency gate will keep refusing to voxelize its area, ")
+		       TEXT("which is block-until-ready working, not a fallback. Nothing here is answered with sea level ")
+		       TEXT("unless a gate leak is also reported."),
+		       Tile.x, Tile.y, Entry.Attempts, ReasonTag, *Why, *Path, (unsigned long long)FileSize);
+	}
+	else
+	{
+		// Still transient and still in budget. Warning, because it may well fix
+		// itself on the next pass -- and bounded, because if it does not, the
+		// branch above ends it.
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Fine tile (%d,%d) load failed, attempt %u of %u [%s]: %s Will retry."),
+		       Tile.x, Tile.y, Entry.Attempts, uint32(kMaxTransientLoadAttempts), ReasonTag, *Why);
+	}
+	return false;
 }
 
 vxc::TileCoord FVoxelFineTileStreamer::CoarseTileForWorldMm(int64 WorldMmX, int64 WorldMmY)
@@ -489,7 +639,23 @@ int32_t FVoxelFineTileStreamer::ResolveNonResidentPixel(int64_t px, int64_t py)
 		// tile from re-stat'ing the filesystem millions of times; the memo is
 		// cleared whenever the ring centre moves, so a tile the bake produces
 		// mid-session is still picked up.
-		if (KnownMissing_.find(TileHash(Tile)) == KnownMissing_.end())
+		//
+		// IsSettledFailure_Locked is the same courtesy for a tile that IS on
+		// disk and was refused, and it is needed for the same reason: this
+		// branch is on the funnel every one of the ~100 unguarded consumers
+		// crosses, and the audit measured 18.7 MILLION queries into one
+		// non-resident tile in a single run. EnsureTileResident_Locked would
+		// now answer each of those cheaply -- an open and a stat rather than a
+		// 60 KB read -- but 18.7 million opens is still not a thing to do to
+		// find out something already known.
+		//
+		// The cost is that this path does not notice a file that changed under
+		// us. That is deliberate and it is not a loss: TickResidencyAndEviction
+		// re-stats every ring tile every tick and clears the memo the moment
+		// the file's size or timestamp moves, so a re-bake is still picked up
+		// within a tick -- by the loop whose job that is, not by a
+		// character-movement collision probe.
+		if (KnownMissing_.find(TileHash(Tile)) == KnownMissing_.end() && !IsSettledFailure_Locked(Tile))
 		{
 			BlockingLoads_.fetch_add(1, std::memory_order_relaxed);
 			if (EnsureTileResident_Locked(Tile))
@@ -538,6 +704,23 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 	// unattended case its protection too.
 	const bool bFirstForThisTile = LeakReportedTiles_.insert(TileHash(Tile)).second;
 
+	// IF WE ALREADY KNOW WHY, SAY SO HERE. A gate leak is what a person
+	// actually reads -- it is the fatal line, and the one that explains the
+	// black screen -- and until now it could only say "not resident and could
+	// not be loaded", which is true of an absent tile and of a refused one
+	// alike. Those need opposite responses: wait for the bake, versus rebuild
+	// the binary. The refusal was diagnosed the first time it happened; this
+	// carries that diagnosis to where it will be seen.
+	FString RefusalNote;
+	if (auto FailIt = LoadFailures_.find(TileHash(Tile)); FailIt != LoadFailures_.end())
+	{
+		RefusalNote = FString::Printf(
+			TEXT(" THIS TILE IS ON DISK AND WAS REFUSED (%s after %u attempt(s)), which is why it is not ")
+			TEXT("resident -- it is NOT an absent tile waiting on the bake: %s"),
+			FailIt->second.bPermanent ? TEXT("permanently") : TEXT("transiently"), FailIt->second.Attempts,
+			*FailIt->second.Why);
+	}
+
 	if (bLeakIsFatal_)
 	{
 		UE_LOG(LogVoxelEarth, Fatal,
@@ -546,13 +729,13 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("and on the fine tier sea level is not a fallback -- it is terrain no other client computes, so this ")
 		       TEXT("run's output would not be reproducible. Stopping instead of producing an artifact that looks fine. ")
 		       TEXT("Leaks so far=%llu, blocking loads=%llu, resident=%llu tile(s), absentOnDisk=%llu, corrupt=%llu, ")
-		       TEXT("identityMismatch=%llu. If the tile SHOULD exist, check -VoxelFineTileProviderId: it is part of the ")
-		       TEXT("cache key and of the on-disk path, and omitting it makes every lookup miss. Pass ")
-		       TEXT("-VoxelFineTileGateFatal=0 to downgrade this to an Error."),
+		       TEXT("identityMismatch=%llu, refusedTiles=%llu.%s If the tile SHOULD exist, check ")
+		       TEXT("-VoxelFineTileProviderId: it is part of the cache key and of the on-disk path, and omitting it ")
+		       TEXT("makes every lookup miss. Pass -VoxelFineTileGateFatal=0 to downgrade this to an Error."),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
 		       (unsigned long long)BlockingLoads_.load(std::memory_order_relaxed), (unsigned long long)Sampler_.tileCount(),
 		       (unsigned long long)MissingFileLoads_, (unsigned long long)CorruptLoads_,
-		       (unsigned long long)IdentityMismatches_);
+		       (unsigned long long)IdentityMismatches_, (unsigned long long)GivenUpTiles_, *RefusalNote);
 		// UE_LOG(Fatal) does not return. The sea-level answer below is
 		// unreachable here and exists only for the non-fatal path.
 	}
@@ -563,9 +746,9 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("FINE TIER GATE LEAK: elevation query at fine pixel (%lld,%lld) landed in NON-RESIDENT tile (%d,%d) ")
 		       TEXT("(%s) and is being answered with SEA LEVEL. That is a desync, not a fallback: this client's terrain, ")
 		       TEXT("collision and edits here will not match a client that has the tile. Logged once per tile; total ")
-		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal)."),
+		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal).%s"),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
-		       IsInGameThread() ? TEXT("game") : TEXT("worker"));
+		       IsInGameThread() ? TEXT("game") : TEXT("worker"), *RefusalNote);
 	}
 
 	// The sampler's own missingTileQueries bump happens inside this call, which
@@ -581,6 +764,15 @@ void FVoxelFineTileStreamer::TickResidencyAndEviction(vxc::TileCoord PlayerCoars
 	{
 		// The ring moved: everything we believed absent is worth one more look
 		// (the bake frontier advances, and this is the only thing that retries).
+		//
+		// LoadFailures_ is deliberately NOT cleared with it. Absence is a fact
+		// about the world and the frontier moves; a tile that was read and
+		// refused is a fact about those bytes and this binary, and walking the
+		// player around changes neither. Clearing it here would restore the
+		// per-frame re-read this change exists to stop -- the memo would be
+		// wiped on the same tick it was written, every tick the anchor moved.
+		// What DOES earn a fresh attempt is the file itself changing; see
+		// EnsureTileResident_Locked.
 		KnownMissing_.clear();
 		LastRingCentre_ = PlayerCoarseTile;
 	}

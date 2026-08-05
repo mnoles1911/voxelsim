@@ -15,6 +15,10 @@
 #include "voxelcore/caverns.h" // kCavernMaxReachMm -- the read margin the gate must honour
 #include "vxctest.h"
 
+#include <cstring> // std::memcpy -- MSVC supplies it transitively, libstdc++ does not
+#include <string>
+#include <vector>
+
 using namespace vxc;
 
 namespace {
@@ -355,6 +359,184 @@ VXC_TEST(validate_accepts_matching_tile) {
         CHECK_EQ(r.tile->size(), uint32_t(512));
         CHECK_EQ(r.tile->blocksPerAxis(), uint32_t(2));
     }
+}
+
+// --- telling "your build is old" from "your file is broken" ----------------
+//
+// THE REGRESSION THESE PIN. A game module built before the water plane existed
+// refused four perfectly valid bake_ver-12 tiles, and said "bad-header" -- the
+// same words a truncated file produces. The tiles were fine; the binary was
+// three weeks stale. Several minutes went into checking the tiles because that
+// is what the message told the reader to check, and the process meanwhile
+// re-read and re-refused the same bytes every frame.
+//
+// Both halves are asserted here rather than in the UE host, because the host
+// half needs an editor, a real bake and a deliberately stale binary to
+// exercise -- which is exactly why it was never exercised.
+
+VXC_TEST(validate_reports_an_unknown_flag_bit_as_a_version_skew_not_damage) {
+    // The shape of the incident: a file that is structurally perfect but
+    // declares a feature bit this build has no implementation for.
+    std::vector<uint8_t> bytes = buildConstantFineTile(42, -11, -6, 512, 8, 7);
+    CHECK(validateAndParseFineTile(std::vector<uint8_t>(bytes), 42, -11, -6).verdict ==
+          FineTileVerdict::kOk); // ...and it really is perfect, unmodified
+    uint16_t flags = 0;
+    std::memcpy(&flags, bytes.data() + 31, 2);
+    flags = static_cast<uint16_t>(flags | 0x8000u);
+    std::memcpy(bytes.data() + 31, &flags, 2);
+
+    const FineTileValidationResult r = validateAndParseFineTile(std::move(bytes), 42, -11, -6);
+    // Still refused whole -- this is not a softening.
+    CHECK(r.verdict == FineTileVerdict::kCorrupt);
+    CHECK(!r.tile.has_value());
+    // ...but with its own reason code, which "bad-header" is not.
+    CHECK(r.error == FineError::kUnknownFeature);
+    CHECK(std::string(fineErrorName(r.error)) == "unknown-feature");
+
+    // THE FACTS SURVIVE THE FAILED PARSE. Before this, everything the header
+    // said was thrown away with the tile, so no message could name a number.
+    CHECK(r.facts.magicOk);
+    CHECK(r.facts.v2Fields);
+    CHECK_EQ(int(r.facts.formatVersion), int(kFineFormatVersion));
+    CHECK_EQ(int(r.facts.bakeVer), 42);
+    CHECK_EQ(int(r.facts.unknownFlagBits()), 0x8000);
+
+    // THE MESSAGE NAMES BOTH NUMBERS -- the file's bake_ver and this build's
+    // ceiling. Either one alone is what sent the last diagnosis the wrong way.
+    const std::string why = fineDescribeRejection(r.error, r.facts);
+    CHECK(why.find("bake_ver 42") != std::string::npos);
+    CHECK(why.find("bake_ver up to " + std::to_string(kFineMaxKnownBakeVer)) != std::string::npos);
+    CHECK(why.find("0x8000") != std::string::npos);   // the bits it could not read
+    CHECK(why.find("NEWER than its reader") != std::string::npos);
+
+    // AND RE-READING IT CANNOT HELP. This is the property the streamer's
+    // bounded retry rests on: identical bytes, identical verdict, forever.
+    CHECK(!r.retryWorthwhile());
+    CHECK(!fineErrorIsTransient(r.error));
+}
+
+VXC_TEST(validate_does_not_describe_a_truncated_file_as_a_version_problem) {
+    // The other half: a genuinely broken file must NOT be blamed on the build.
+    std::vector<uint8_t> bytes = buildConstantFineTile(42, -11, -6, 512, 8, 7);
+    bytes.resize(bytes.size() / 2);
+    const FineTileValidationResult r = validateAndParseFineTile(std::move(bytes), 42, -11, -6);
+    CHECK(r.verdict == FineTileVerdict::kCorrupt);
+    CHECK(r.error != FineError::kUnknownFeature);
+    const std::string why = fineDescribeRejection(r.error, r.facts);
+    CHECK(why.find("structurally malformed") != std::string::npos);
+    CHECK(why.find("NEWER than its reader") == std::string::npos);
+    // It still carries both version numbers, so "is my build too old" -- the
+    // first question anyone asks of any refusal -- is answered here too.
+    CHECK(why.find("bake_ver 42") != std::string::npos);
+    CHECK(why.find("bake_ver up to " + std::to_string(kFineMaxKnownBakeVer)) != std::string::npos);
+    // Truncation is not transient either: the same file re-read is the same
+    // file. Only a NEW file can change this answer.
+    CHECK(!r.retryWorthwhile());
+}
+
+VXC_TEST(validate_marks_an_unfetched_preamble_as_worth_retrying) {
+    // The one refusal that legitimately deserves another attempt: bytes that
+    // never arrived. Everything else the loader sees must stop it.
+    const std::vector<uint8_t> whole = buildConstantFineTile(42, -11, -6, 512, 8, 7);
+    FineTileBytes partial = FineTileBytes::forFile(whole.size());
+    // The header only -- enough to know what the file is, not enough to parse.
+    CHECK(partial.addSegment(0, std::vector<uint8_t>(whole.begin(), whole.begin() + 43)));
+
+    const FineTileValidationResult r =
+        validateAndParseFineTilePartial(std::move(partial), 42, -11, -6);
+    CHECK(r.verdict == FineTileVerdict::kCorrupt);
+    CHECK(r.error == FineError::kBlockNotResident);
+    CHECK(r.retryWorthwhile());
+    CHECK(fineErrorIsTransient(r.error));
+    // The header facts are readable even here, so the "fetch more" message can
+    // still say what the file is.
+    CHECK(r.facts.v2Fields);
+    CHECK_EQ(int(r.facts.bakeVer), 42);
+    const std::string why = fineDescribeRejection(r.error, r.facts);
+    CHECK(why.find("INCOMPLETE, not corrupt") != std::string::npos);
+}
+
+VXC_TEST(transient_and_permanent_refusals_are_separated) {
+    // The classification the loader branches on. Spelled out one code at a
+    // time: getting a single one wrong is either a spin (permanent treated as
+    // transient) or a tile discarded that had merely not finished arriving.
+    CHECK(fineErrorIsTransient(FineError::kFileUnreadable));
+    CHECK(fineErrorIsTransient(FineError::kBlockNotResident));
+
+    CHECK(!fineErrorIsTransient(FineError::kNone));
+    CHECK(!fineErrorIsTransient(FineError::kNotVxtl));
+    CHECK(!fineErrorIsTransient(FineError::kWrongVersion));
+    CHECK(!fineErrorIsTransient(FineError::kBadHeader));
+    CHECK(!fineErrorIsTransient(FineError::kUnknownFeature));
+    CHECK(!fineErrorIsTransient(FineError::kUnknownCodec));
+    CHECK(!fineErrorIsTransient(FineError::kNoDecompressor));
+    CHECK(!fineErrorIsTransient(FineError::kBadSectionTable));
+    CHECK(!fineErrorIsTransient(FineError::kBadBlockIndex));
+    CHECK(!fineErrorIsTransient(FineError::kBadBlockCoords));
+    CHECK(!fineErrorIsTransient(FineError::kDecompressFailed));
+    CHECK(!fineErrorIsTransient(FineError::kBadPayload));
+    CHECK(!fineErrorIsTransient(FineError::kValueOutOfRange));
+    CHECK(!fineErrorIsTransient(FineError::kBadBasinTable));
+
+    // An identity mismatch parses cleanly, so its FineError is kNone -- and it
+    // must still not be retried. retryWorthwhile() is the thing to ask, not
+    // the error code alone.
+    std::vector<uint8_t> bytes = buildConstantFineTile(42, -6, 3, 512, 8, 7);
+    const FineTileValidationResult r = validateAndParseFineTile(std::move(bytes), 99, -6, 3);
+    CHECK(r.verdict == FineTileVerdict::kIdentityMismatch);
+    CHECK(!r.retryWorthwhile());
+}
+
+VXC_TEST(rejection_message_blames_the_host_for_a_missing_decompressor) {
+    // Not a version skew and not a broken tile: this build forgot to wire zstd
+    // up. Three causes, three sentences -- the whole point of the reason code.
+    FineHeaderFacts facts;
+    facts.magicOk = true;
+    facts.v2Fields = true;
+    facts.formatVersion = kFineFormatVersion;
+    facts.bakeVer = 12;
+    facts.codec = kCodecZstd;
+    const std::string why = fineDescribeRejection(FineError::kNoDecompressor, facts);
+    CHECK(why.find("HOST WIRING bug here") != std::string::npos);
+    CHECK(why.find("NEWER than its reader") == std::string::npos);
+
+    // And a file that is not a .vxtl at all says so without inventing fields.
+    const std::string notVxtl = fineDescribeRejection(FineError::kNotVxtl, FineHeaderFacts{});
+    CHECK(notVxtl.find("not a .vxtl at all") != std::string::npos);
+    CHECK(notVxtl.find("bake_ver") == std::string::npos);
+}
+
+VXC_TEST(header_facts_never_invent_a_bake_ver_for_a_non_v2_file) {
+    // `bake_ver` is a v2 EXTENSION. Reading it positionally out of a v1 file
+    // would put a fabricated number into the one message someone reads to
+    // decide whether their build is too old -- the exact failure mode this
+    // whole change exists to remove, reintroduced one layer down.
+    std::vector<uint8_t> bytes = buildConstantFineTile(42, 0, 0, 512, 8, 7);
+    const uint16_t v1 = 1;
+    std::memcpy(bytes.data() + 4, &v1, 2);
+
+    FineHeaderFacts facts;
+    CHECK(fineReadHeaderFacts(bytes.data(), bytes.size(), facts));
+    CHECK(facts.magicOk);
+    CHECK_EQ(int(facts.formatVersion), 1);
+    CHECK(!facts.v2Fields);
+    CHECK_EQ(int(facts.bakeVer), 0);
+
+    const FineTileValidationResult r = validateAndParseFineTile(std::move(bytes), 42, 0, 0);
+    CHECK(r.error == FineError::kWrongVersion);
+    const std::string why = fineDescribeRejection(r.error, r.facts);
+    CHECK(why.find(".vxtl v1") != std::string::npos);          // what the file says
+    CHECK(why.find(".vxtl v" + std::to_string(kFineFormatVersion)) != std::string::npos);
+    CHECK(why.find("bake_ver 42") == std::string::npos);       // NOT read from a v1 layout
+
+    // Too short to hold a header, and not a .vxtl at all: both report nothing
+    // rather than garbage.
+    FineHeaderFacts none;
+    CHECK(!fineReadHeaderFacts(bytes.data(), 10, none));
+    CHECK(!none.magicOk);
+    std::vector<uint8_t> junk(64, 0u);
+    CHECK(!fineReadHeaderFacts(junk.data(), junk.size(), none));
+    CHECK(!none.magicOk);
 }
 
 // --- LruBudgetCache --------------------------------------------------------

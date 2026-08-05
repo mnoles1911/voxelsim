@@ -144,12 +144,13 @@ bool BytesRangeSource::read(uint64_t offset, uint64_t length, std::vector<uint8_
 // --- preamble ---------------------------------------------------------------
 
 bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambleRequest& want,
-                          FineTileBytes& out, FineError* err) {
+                          FineTileBytes& out, FineError* err, FineHeaderFacts* facts) {
     const auto reject = [err](FineError e) {
         if (err) *err = e;
         return false;
     };
     if (err) *err = FineError::kNone;
+    if (facts) *facts = FineHeaderFacts{};
     if (fileSize < kFineHeaderBytes) return reject(FineError::kNotVxtl);
 
     out = FineTileBytes::forFile(fileSize);
@@ -160,16 +161,33 @@ bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambl
     if (!src.readClamped(0, std::min(want.headProbeBytes, fileSize), head)) {
         return reject(FineError::kFileUnreadable);
     }
+    // Read what the file CLAIMS to be before deciding anything about it. Two
+    // uses, and the second is the one that was missing: it feeds the caller's
+    // error message, and it separates the refusals below.
+    FineHeaderFacts localFacts;
+    const bool factsOk = fineReadHeaderFacts(head.data(), head.size(), localFacts);
+    if (facts) *facts = localFacts;
+
     uint16_t flags = 0;
     uint64_t tableFileSize = 0;
     std::vector<FineSectionEntry> sections;
     if (!readFineSectionTable(head.data(), head.size(), flags, tableFileSize, sections)) {
-        // Either not a v2 .vxtl, or the probe was too small to reach the end of
-        // the section table. The second is recoverable by re-probing larger, but
-        // it cannot happen with any layout this format permits at the shipped
-        // block grid (183 B of header+table against a 32 KB probe), so it is
-        // reported rather than silently retried -- a silent retry would hide a
-        // format change behind a doubled request count.
+        // readFineSectionTable answers one bool for three different situations,
+        // and flattening them into kNotVxtl told a reader with a NEWER file
+        // that their tile was not a tile. Split here, where the header facts
+        // are in hand:
+        //   * a v2 .vxtl whose format version is simply not 2 -- the reader is
+        //     behind the file (or vice versa), and kWrongVersion says so;
+        //   * anything without the magic -- genuinely not one of ours;
+        //   * a probe too small to reach the end of the section table, or a
+        //     malformed table. The first is recoverable by re-probing larger,
+        //     but it cannot happen with any layout this format permits at the
+        //     shipped block grid (183 B of header+table against a 32 KB probe),
+        //     so it is reported rather than silently retried -- a silent retry
+        //     would hide a format change behind a doubled request count.
+        if (factsOk && localFacts.formatVersion != kFineFormatVersion) {
+            return reject(FineError::kWrongVersion);
+        }
         return reject(FineError::kNotVxtl);
     }
     // The section table's own idea of the file length must match the transport's.

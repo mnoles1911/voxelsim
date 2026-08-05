@@ -253,6 +253,29 @@ struct FineTileValidationResult {
     // and would otherwise be flattened into one "corrupt" log line, which is
     // exactly the confusion tilestore.h's FineError comment warns about.
     FineError error = FineError::kNone;
+    // What the file SAYS it is, read straight off the header without
+    // validating anything, and populated for EVERY verdict including kOk.
+    //
+    // Here because a refusal message that names only the tile is half a
+    // message: the reader's own limits (kFineFormatVersion, kFineFlagsKnown,
+    // kFineMaxKnownBakeVer) are compile-time facts, but the FILE's are not,
+    // and after a failed parse there is no FineTile to ask. Pass this and
+    // `error` to fineDescribeRejection to get the sentence with both numbers
+    // in it.
+    FineHeaderFacts facts;
+
+    // Would re-reading the SAME source plausibly change this verdict?
+    //
+    // kOk and kIdentityMismatch are never transient: a tile that parsed is
+    // parsed, and bytes stamped with another tile's identity will be stamped
+    // with it again. Only a kCorrupt whose FineError is itself transient (an
+    // unfinished fetch, a file being written) can be worth another attempt.
+    // A caller that retries on anything else is spinning -- see
+    // fineErrorIsTransient, and see FVoxelFineTileStreamer for the loop this
+    // exists to stop.
+    bool retryWorthwhile() const {
+        return verdict == FineTileVerdict::kCorrupt && fineErrorIsTransient(error);
+    }
 };
 
 // Parses `bytes` (moved in; FineTile owns its bytes -- see tilestore.h) and
