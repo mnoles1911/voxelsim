@@ -994,9 +994,24 @@ class BakeConstants:
     #: a statement about ``channel_width_m(Q)``, so the marginal reach is one
     #: whose channel is 2.812 m across rather than 3.750 m -- at the client's
     #: 100 mm voxels, 28 voxels rather than 37. That is still a stream you wade
-    #: rather than step over, and 1.5 px is the floor for the same reason: at
-    #: 1.0 px the marginal channel is 1.875 m, one pixel, which is a creek drawn
-    #: as a raster artefact rather than a river.
+    #: rather than step over.
+    #:
+    #: 1.5 -> 1.0 at bake_ver 14, on the owner's call. The sentence that used to
+    #: end this paragraph called 1.5 px "the floor" because at 1.0 px the
+    #: marginal channel is 1.875 m, "a creek drawn as a raster artefact rather
+    #: than a river" -- and that argument was measuring against a river this
+    #: world does not contain. ``tools/survey_world_water.py trunk`` puts the
+    #: LARGEST river here at 14.2 m^3/s draining 1,960 km^2 (6.6% of the world's
+    #: 29,911 km^2 of land). Against a 27 m trunk a 1.9 m creek is not a raster
+    #: artefact, it is a numerous and real member of the only network there is.
+    #: The cut falls 1.5286e6 -> 5.5250e5 m^3/yr, a factor of 2.77, so about
+    #: 2.8x more network is drawn.
+    #:
+    #: 0.75 px IS the floor, and unlike the old claim it is a property of the
+    #: law rather than a judgement: ``channel_width_m`` is anchored at 1.5 m for
+    #: ``water_q_perennial_m3_yr``, so ``q_drawable_m3_yr`` SATURATES there.
+    #: 0.75 px and 0.50 px both return 3.1558e5 m^3/yr (10.0 l/s); below 0.75
+    #: the constant stops meaning anything at all.
     #:
     #: What it is NOT is a promise about how wide the RASTER draws it. The plane
     #: is wet where a cell's own Q clears the cut, so the drawn ribbon is however
@@ -1007,11 +1022,13 @@ class BakeConstants:
     #: ``water_flow_single_receiver``, which is what changed it, and the
     #: measurements file, which reports both.
     #:
-    #: In flow: 3.1467e6 -> 1.5286e6 m^3/yr, i.e. 0.100 -> 0.048 m^3/s. Still
-    #: 4.8x ``water_q_perennial_m3_yr``, so §4.1's honesty clause survives --
-    #: there remain perennial reaches this raster declines to draw, and
-    #: ``water_head_mask`` still reports both counts.
-    water_min_width_px: float = 1.5
+    #: In flow: 3.1467e6 -> 1.5286e6 -> 5.5250e5 m^3/yr, i.e. 0.100 -> 0.048 ->
+    #: 0.0175 m^3/s (99.7 -> 48.4 -> 17.5 l/s). Still 1.75x
+    #: ``water_q_perennial_m3_yr``, so §4.1's honesty clause survives -- there
+    #: remain perennial reaches this raster declines to draw, and
+    #: ``water_head_mask`` still reports both counts. At 0.75 px it would not:
+    #: the cut would equal the perennial anchor exactly.
+    water_min_width_px: float = 1.0
     #: Route the water pass's DISCHARGE single-receiver (D8) instead of MFD.
     #:
     #: THE TERRAIN'S ROUTING IS UNTOUCHED BY THIS. ``mfd_p`` still decides the
