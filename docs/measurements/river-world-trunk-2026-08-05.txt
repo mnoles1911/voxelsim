@@ -1,0 +1,370 @@
+THE WORLD'S LARGEST RIVER: WHERE IT IS, AND WHAT THE BAKE DOES WITH IT
+seed 20260719, whole world (289 coarse tiles, 8704^2 @ 30 m)
+bake_ver 14, TERRAIN_VERSION 8 unchanged, water_min_width_px 1.5 -> 1.0
+2026-08-05
+================================================================================
+
+THE TASK WAS "bake the world's largest trunk, reported by survey_world_water.py
+at 82.5 m^3/s, which through the shipped laws is 55 m wide and 5.4 m deep."
+
+82.5 m^3/s REPRODUCES EXACTLY and is not a river. The largest trunk that is on
+land is 14.2 m^3/s; the largest that the bake will actually draw is 9.87. The
+three numbers differ for two independent reasons and both are measured below.
+
+--------------------------------------------------------------------------------
+1. THE 82.5 m^3/s CELL IS ON THE ABYSSAL FLOOR
+--------------------------------------------------------------------------------
+
+    python tools/survey_world_water.py accumulate \
+        --coarse-dir .../80b9ca451a23eae4/000000000135276f/s1 \
+        --out D:/tmp/worldwater-trunk
+    -> trunk max 2.6035e+09 m3/yr = 82.5 m3/s          (reproduced, exactly)
+
+Where that cell is was never asked before:
+
+    row 3821, col 0    tile (-16,-9)    elevation -3,132 m    catchment 24,440 km2
+
+It is below sea level by three kilometres, it is against the grid's west edge,
+and its "catchment" is 82% of every land cell in the world. `fill_depressions`
+floods the ocean basin exactly as readily as a valley, so the whole planet's
+runoff converges into one submarine pit and is counted once, there. Tracing D8
+downstream from it terminates in a single step: it is a sink, not a reach.
+
+Every one of the top twelve whole-grid maxima is below sea level; the shallowest
+is at -179 m. There is no land cell anywhere near 82.5 m^3/s.
+
+    LAND cells only, D8 and MFD agreeing to 0.2%:
+
+      largest land trunk        14.18 m3/s   tile (-8,-5), z = 3 m
+      its catchment              1,960 km2 = 6.6% of the world's land
+      law at that Q              27.0 m wide, 2.89 m deep
+
+The world's land is 29,911 km2 of a 68,184 km2 extent (43.9%). The task brief's
+57,600 km2 is not this world's land area; at 84% land it could not be, and the
+Thames comparison scales with it. A 1,960 km2 catchment is a River Wear or a
+Ribble, not a Thames, and 14.2 m^3/s over 1,960 km2 is 228 mm/yr of runoff,
+which is a perfectly ordinary temperate yield. The architecture is right. The
+world is simply small and its largest basin is small.
+
+--------------------------------------------------------------------------------
+2. THE 14.2 m^3/s TRUNK IS A CHAIN OF PITS, AND THE BAKE DOES NOT DRAW IT
+--------------------------------------------------------------------------------
+
+Accumulating on the RAW, unfilled surface:
+
+      largest world trunk, unfilled       1.51 m3/s
+      largest LAND trunk,  unfilled       0.34 m3/s      (2.4% of 14.18)
+
+So 97.6% of the nominal largest river is the depression fill's invention. That
+by itself proves nothing -- the bake fills too -- so it was checked against the
+bake, by baking the trunk tile:
+
+    tile (-7,-5), 100% land, 15.3 km of main stem, coarse trunk 14.17 m3/s
+
+      bake log:   water=0.067%wet  injected=1129.6km2/Q3.95e+08m3yr@349mm
+                  qmax=3.59e+08  basin=13.4%/28m
+      npz dump:   interior discharge maximum 1.304e+06 m3/yr = 0.041 m3/s
+
+The pyramid injected 3.95e8 m^3/yr. The padded domain reached 3.59e8. The tile
+INTERIOR -- the bytes that ship -- never exceeded 1.30e6, a factor of 275 short.
+The bake also warned:
+
+    tile (-7,-5) contains a flat/basin 4239 m across, wider than the 960 m apron
+
+That is the discriminator, and it generalises. Per-tile share of LAND cells the
+fill raised at all:
+
+      wet-country block, which baked a 5.32 m3/s river     0.4 - 1.4%
+      arid corridor,     which baked a 0.85 m3/s river     0.3 - 2.4%
+      the 14.2 m3/s trunk's tiles (-7,-5)(-7,-6)(-6,-6)   10.3 - 39.6%
+
+`survey_world_water.py` now prints this as `fill%` on every block row and the
+new `trunk` subcommand ranks blocks with a `--max-fill` constraint, defaulting
+to 3%. It also prints the whole-grid maximum with its ELEVATION and refuses to
+call it a river when it is under water.
+
+--------------------------------------------------------------------------------
+3. WHAT WAS BAKED INSTEAD, AND WHY
+--------------------------------------------------------------------------------
+
+    python tools/survey_world_water.py trunk --dir D:/tmp/worldwater-trunk
+
+    BLOCKS THE BAKE CAN CARRY (every tile <= 3% filled):
+      block            n  trunk m3/s  catch km2   width  depth  fillmax  land
+      x -7..-6 y -3..-2  4      9.98       1125   23.5m  2.55m    1.8%   99.4%
+
+That is the south-coast river: 77.7 km from a 3,338 m headwater to the sea,
+monotone, low fill, 1,125 km2 at the point the block covers. It is the largest
+river in this world that is a river all the way down. Baked, 5 contiguous tiles
+along its lower and middle reaches:
+
+    tiles (-7,-1) (-6,-1) (-6,-2) (-6,-3) (-5,-3)
+    namespace terrain-diffusion-unlabeled-80b9ca451a23eae4-b8160d45a
+    cache D:/vox-trunk-cache (isolated; the shipped tile-cache is untouched)
+    1,582 CPU-s for 5 tiles, no --diagnostic, tiles are loadable
+
+--------------------------------------------------------------------------------
+4. THE DEFECT THAT MATTERS: THE TRUNK DOES NOT CROSS THE TILE
+--------------------------------------------------------------------------------
+
+Interior discharge maximum, from the npz dump, against the coarse trunk the
+same tile should be carrying:
+
+      tile      coarse trunk   bake qmax (padded)   INTERIOR max      ratio
+      (-6,-3)      9.86 m3/s       3.11e+08          9.868 m3/s       1.00
+      (-5,-3)      9.80            2.35e+08          2.389            0.24
+      (-6,-2)      9.98            3.13e+08          0.120            0.012
+      (-7,-1)     10.00            3.16e+08          0.096            0.010
+      (-6,-1)      9.98            3.16e+08          0.005            0.0005
+      (-7,-5)     14.17            3.59e+08          0.041            0.003
+
+    for contrast, the wet-country tiles, whose interiors DO carry it:
+      (-3,-4)      5.30            1.78e+08          5.316            1.00
+      (-4,-5)      4.11            1.30e+08          4.113            1.00
+
+On four of the six tiles the pyramid delivered the trunk to the padded domain
+and the interior never saw it. This is the failure `drawnpad` was added to make
+visible (pregen._inflow_note: "the water is in the APRON and leaves without
+crossing the tile") and HYDROLOGY_RESIDUALS #7 names. It is not rare and it is
+not confined to odd tiles: it took out the mouth of the river that was baked and
+the whole of the nominally-largest river in the world.
+
+(-6,-1) is the clean case: injected 6.33e8 m^3/yr, drawnpad 20 cells,
+water=0.000%wet. A tile carrying 10 m^3/s baked completely dry.
+
+THE MECHANISM IS NOT ISOLATED. Two candidates were checked and NEITHER
+separates the tiles cleanly, so neither is being claimed:
+
+  a) the apron blind spot. The bake's own warning,
+     "contains a flat/basin NNNN m across, wider than the 960 m apron":
+
+        warned and LOST   (-7,-5) 4239 m   (-7,-1) 4288 m   (-6,-1) 1942 m
+        warned and KEPT   (-6,-3) 1592 m
+        silent and LOST   (-6,-2)
+        silent and KEPT   the five wet-country tiles
+
+     It fires on the largest flats, which are also the tiles that lose it most
+     badly, but (-6,-3) carries a 9.868 m^3/s trunk straight across its
+     interior with a 1,592 m flat in it and (-6,-2) loses one without a flat
+     at all. The warning is a hint, not the discriminator.
+
+  b) basin capture. Registered-basin share is 20.9 / 23.2 / 4.0 / 2.4 / 0.7%
+     on (-7,-1)(-6,-1)(-6,-2)(-6,-3)(-5,-3). It orders the two worst tiles
+     right and then fails: (-6,-2) at 4.0% loses 99% of the trunk while
+     (-6,-3) at 2.4% loses none. Basins also cannot explain a low
+     `discharge_m3_yr`, which is written before the basin mask is applied.
+
+What IS clean is that all six tiles are EXOTIC -- the river is imported, not
+local. Local land runoff, mm/yr:
+
+      (-6,-2) 0.1    (-6,-1) 0.3    (-6,-3) 1.2    (-7,-5) 3.4
+      (-5,-3) 70.0   (-7,-1) 18.0
+      wet-country five: 608 - 1,262
+
+Every tile that loses the trunk gets essentially ALL of its discharge through
+`inject_edge_inflow`, and `APRON_BLIND_SPOT` records that injection "runs after
+the fill". The wet-country tiles make their own rivers locally and never
+exercise that path hard. That is where to look; it is not proof.
+
+--------------------------------------------------------------------------------
+5. WIDTH AND DEPTH, MEASURED, AGAINST THE LAW
+--------------------------------------------------------------------------------
+
+On (-6,-3), the tile that carries the trunk:
+
+      Q at the trunk                        9.868 m3/s
+      law: channel_width_m                  23.4 m
+      law: water_depth_m                     2.54 m
+
+      DRAWN depth,  p50 over 208,946 wet px  2.51 m
+      DRAWN depth,  p90                      2.54 m
+      raster ribbon width, p50              31.9 m
+      raster ribbon width, p90             100.8 m
+
+DEPTH IS NOT A DEFECT AND CANNOT BE ONE. `graded_water_surface` writes
+`water_depth_m(Q)` and nothing else; the drawn depth IS the law evaluated at the
+cell's own Q, so it agrees to the quantisation by construction. It agreed on the
+alpine block too (drawn max 2.052 m against a law 2.044 m at that block's
+5.32 m^3/s). The ONLY way to draw a deeper river is to route more water to it.
+"The law says 5.4 m and the bake draws 2 m" would therefore never have been a
+depth bug; it was the 82.5 figure being wrong about Q.
+
+WIDTH runs WIDER than the law, not narrower: 31.9 m drawn against 23.4 m
+predicted at p50, 100.8 m at p90. `lateral_fill` decides width from the terrain,
+so a floodplain reach spreads well past the hydraulic-geometry channel. Along
+the composed thalweg the guarded perpendicular river width is p50 6.56 m,
+p90 31.88 m, max 120.94 m -- the ribbon statistic and the perpendicular
+statistic disagree by the amount `river_long_profile.py`'s docstring predicts.
+
+--------------------------------------------------------------------------------
+6. THE THREE BLOCKS, SAME MEASUREMENT, LAND ONLY
+--------------------------------------------------------------------------------
+
+Wet pixels on cells with elevation > 0 only, ribbon width by
+corridor_water_report.ribbon_width_m, depth = water_surface - ground.
+
+  block / tile        wet px    %wet_land   q_max   law w   law d  drawn d50  ribbon p50  p90
+  ARID corridor (bv13, min_width 1.5)
+    (-11,-4)         148,232      0.2209%    0.37    6.3m   0.80m     0.56m      18.6m   42.4m
+    (-11,-5)         406,999      0.6065%    0.73    8.3m   1.02m     0.43m      15.9m   55.7m
+    (-12,-5)         179,799      0.2679%    0.85    8.8m   1.07m     0.45m      22.5m  146.2m
+    (-11,-6)         961,198      1.6592%    0.43    6.7m   0.84m     0.41m      41.2m  124.6m
+    BLOCK          1,696,228                 0.85                     0.43       29.2m   98.1m
+
+  ALPINE / wet country (bv13, min_width 1.5)
+    (-5,-5)          507,605      0.7564%    1.68   11.5m   1.36m     0.49m      13.1m   66.3m
+    (-4,-5)          407,550      0.6073%    4.11   16.5m   1.87m     0.53m      20.6m   54.4m
+    (-3,-4)          251,035      0.3741%    5.32   18.3m   2.04m     0.73m      21.2m   50.6m
+    (-4,-4)          223,226      0.3326%    3.08   14.7m   1.69m     0.63m      15.0m   37.1m
+    (-5,-4)          365,776      0.5450%    3.07   14.7m   1.68m     0.69m      20.6m   56.2m
+    BLOCK          1,755,192                 5.32                     0.58       16.9m   53.0m
+
+  WORLD TRUNK, this bake (bv14, min_width 1.0)
+    (-7,-1)          562,084      1.3837%    0.03    2.2m   0.32m     0.35m     570.0m 1048.1m  <- UNTRUSTWORTHY
+    (-6,-1)                0      0.0000%       -       -       -         -          -       -  <- trunk lost
+    (-6,-2)           75,876      0.1131%    0.12    4.0m   0.54m     0.49m      29.2m   82.2m  <- trunk lost
+    (-6,-3)          208,946      0.3114%    9.87   23.4m   2.54m     2.51m      31.9m  100.8m  <- THE TRUNK
+    (-5,-3)          114,416      0.1705%    2.39   13.3m   1.54m     0.57m      20.6m   45.0m
+    BLOCK            961,322                 9.87                     0.39      255.0m  920.1m
+
+(-6,-3) IS THE ONLY ROW THAT ANSWERS THE QUESTION. It is 1.85x the alpine
+block's trunk and 11.6x the arid one's, and it is the deepest river this project
+has drawn: 2.51 m against 0.73 and 0.56.
+
+--------------------------------------------------------------------------------
+7. SEA. WHICH FRAMES ARE TRUSTWORTHY
+--------------------------------------------------------------------------------
+
+The mouth is on a coastal tile and it landed in the known defect exactly as
+expected. Over the whole 5-tile block, including sea:
+
+      largest component   1,668,335 px   span 11,275 m
+                          elevation -407.7 -> 0.5 m
+                          ribbon width p50 591 m
+                          66.3% of every wet pixel in the block
+
+That is river water painted across the seafloor, and it drags the block's ribbon
+p50 from ~30 m to 543 m. On land, tile (-7,-1) is no better: 562,084 wet px at a
+ribbon p50 of 570 m over a 20.9%-basin coastal flat, at a maximum Q of
+0.03 m^3/s. Both are the defect, not the rainfall.
+
+    TRUSTWORTHY:      (-6,-3), (-5,-3), (-6,-2)  -- 100% land, no sea cells
+    NOT TRUSTWORTHY:  (-7,-1)  -- 60.5% land, seafloor paint + flooded flat
+    EMPTY:            (-6,-1)  -- 0 wet pixels
+
+Fly (-6,-3). Do not point a camera at (-7,-1).
+
+--------------------------------------------------------------------------------
+8. THE LONG PROFILE, COMPOSED (river plane U lake sheets)
+--------------------------------------------------------------------------------
+
+    python tools/river_long_profile.py compose --npz-dir D:/vox-trunk-npz \
+        --basins D:/tmp/trunk-basins.json --tiles="..." --out composed-trunk.npz
+    python tools/river_long_profile.py walk --composed composed-trunk.npz
+
+  longest composed reach: euclidean span 24,142 m, 551,242 cells, 48.1% lake
+  thalweg 18,274 cells, along-channel 39,558 m, sinuosity 1.64
+  water surface 1,999.2 m -> 148.2 m = 1,851.0 m of descent, 46.79 m/km
+
+  depth by class:
+    river centreline    n= 16,690  p50 2.538  p90 2.540  max  5.605
+    river widened/bank  n=269,570  p50 1.974  p90 2.534  max  7.308
+    lake sheet          n=264,982  p50 3.957  p90 16.029 max 28.644
+
+  Spearman(Q, distance along) = +1.000 on river-plane nodes (n=15,336)
+  Spearman(river width, Q)    = +0.302
+  monotonicity: 1,137 of 18,273 steps rise (6.22%); 747.5 m of rise against
+                2,598.5 m of fall
+
+THE MOUTH OF THE DRAWN RIVER IS AT 148 m, NOT AT THE SEA. The reach stops
+roughly 31 km inland because (-6,-2), (-6,-1) and (-7,-1) each lost the trunk in
+their apron (section 4). "A river from the mountains to the sea" is still not
+available on this world's largest river; "a river from 2,000 m to 148 m over
+39.6 km" is, and it is 2.5 m deep the whole way.
+
+Q rises monotonically along the walk. The 103 falls out of 18,273 steps are all
+river -> lake transitions, where the river plane is written dry on purpose.
+
+--------------------------------------------------------------------------------
+9. THE THRESHOLD CHANGE, AND THE IDENTITY GATE
+--------------------------------------------------------------------------------
+
+water_min_width_px 1.5 -> 1.0, on the owner's call:
+
+      q_drawable_m3_yr   1.5286e+06 -> 5.5250e+05 m3/yr
+                         48.4 -> 17.5 l/s      (factor 2.77)
+      marginal channel   2.812 m -> 1.875 m wide
+
+0.75 px is the real floor and it is a floor in the law, not a judgement:
+`channel_width_m` is anchored at 1.5 m for `water_q_perennial_m3_yr`, so
+`q_drawable_m3_yr` SATURATES -- 0.75 px and 0.50 px both return 3.1558e5 m^3/yr
+(10.0 l/s), which is the perennial anchor itself.
+
+MEASURED EFFECT on these five tiles. Both bakes were run in full, 1.5 and 1.0,
+into their own namespaces, and the wet counts compared off the shipped .vxtl:
+
+      tile      wet @1.5      wet @1.0     change   local runoff mm/yr
+      (-7,-1)    586,790     2,116,042    +260.6%          18.0
+      (-5,-3)     78,746       114,416     +45.3%          70.0
+      (-6,-3)    208,946       208,946      +0.0%           1.2
+      (-6,-2)     75,876        75,876      +0.0%           0.1
+      (-6,-1)          0             0      +0.0%           0.3
+
+THE "ROUGHLY 2.8x MORE NETWORK" DOES NOT ARRIVE HERE, and the reason is
+specific rather than disappointing. The threshold is a cut in Q, and a cell only
+lands in the newly-admitted band (5.5e5 to 1.53e6 m^3/yr) if enough LOCAL runoff
+accumulates on it. On (-6,-2) local runoff is 0.1 mm/yr: at 1.875 m pixels that
+is 3.5e-4 m^3/yr per cell, so reaching 5.5e5 would take 1.5e9 cells and the
+padded domain has 8.5e7. There is no intermediate-Q water on that tile AT ALL --
+the discharge field is bimodal, near-zero where it is local and ~3e8 where the
+pyramid injected it, with nothing in between for a threshold to catch.
+
+So the change is worth exactly as much as a tile has rain. It bought 3.6x on the
+one tile with 18 mm/yr and 1.45x on the one with 70, and nothing on the three
+deserts the big river crosses. On the wet-country block (608-1,262 mm/yr) it
+would be expected to pay in full; that was not re-baked here.
+
+--------------------------------------------------------------------------------
+10. TERRAIN IDENTITY
+--------------------------------------------------------------------------------
+
+TERRAIN_VERSION stays 8 and `water_min_width_px` is in `product_payload`, not
+`as_payload`, so no ground byte may move. Checked on these tiles rather than
+argued, in the shipped-vs-shipped mode -- both sides are .vxtl a client can
+load, neither run used --diagnostic:
+
+    python tools/verify_water_only_change.py \
+        --tiles="-7,-1 -6,-1 -6,-2 -6,-3 -5,-3" \
+        --cache-dir D:/vox-trunk-cache \
+        --ns-before terrain-diffusion-unlabeled-80b9ca451a23eae4-b10cf6d2c \
+        --ns-after  terrain-diffusion-unlabeled-80b9ca451a23eae4-b8160d45a
+
+    (-7,-1): bv14 -> bv14  datum SAME  elevation_cp IDENTICAL  flow IDENTICAL
+    (-6,-1): bv14 -> bv14  datum SAME  elevation_cp IDENTICAL  flow IDENTICAL
+    (-6,-2): bv14 -> bv14  datum SAME  elevation_cp IDENTICAL  flow IDENTICAL
+    (-6,-3): bv14 -> bv14  datum SAME  elevation_cp IDENTICAL  flow IDENTICAL
+    (-5,-3): bv14 -> bv14  datum SAME  elevation_cp IDENTICAL  flow IDENTICAL
+
+    PASS: 5 tile(s), 0 problem(s)
+
+The baseline half is 1,574.3 CPU-s of bake existing only to be the "before" of
+this comparison; there was no shipped bake of these tiles to compare against.
+
+pytest 584 passed / 2 skipped. ctest 2/2 with -C Release.
+
+--------------------------------------------------------------------------------
+11. WHAT SHOULD HAPPEN NEXT, in the order the numbers support
+--------------------------------------------------------------------------------
+
+1. THE APRON HANDOFF (section 4) outranks everything else here. Four of six
+   tiles dropped a 10 m^3/s river between the pyramid and the interior. Until
+   that is fixed no river in this world reaches its own mouth, and every
+   "rivers are too shallow" report is really this. The three tiles that lost it
+   all carry the flat-wider-than-the-apron warning; that is the lead.
+
+2. RIVER WATER ON THE SEAFLOOR (section 7) is now 66% of the wet pixels in any
+   block that touches a coast, and every large river in this world ends at a
+   coast. It is no longer a cosmetic defect on the edge of a corridor.
+
+3. DO NOT chase depth. It is the law evaluated at Q, exactly, and it always has
+   been. Chase Q -- which means 1 and 2.
