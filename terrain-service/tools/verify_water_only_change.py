@@ -6,6 +6,13 @@
         --tiles="-11,-4 -11,-5 -12,-5 -11,-6" \
         --cache-dir D:/voxelsim/tile-cache --ns <shipped-namespace-dir>
 
+    # or, when the new bake ran WITHOUT --diagnostic (and so wrote .vxtl
+    # rather than npz), which is the only bake whose output is loadable:
+    python tools/verify_water_only_change.py \
+        --tiles="-11,-4 -11,-5 -12,-5 -11,-6" \
+        --ns-before terrain-diffusion-...-ba9c62170 \
+        --ns-after  terrain-diffusion-...-b10cf6d2c
+
 WHY NOT JUST TRUST ``tests/test_bake_terrain_identity.py``. That test bakes a
 64^2 synthetic world with test constants. It is the right unit gate and it is
 not evidence about the shipped world: the production bake runs 8192^2 with an
@@ -49,18 +56,71 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--before", required=True, help="npz dir of the old bake")
-    ap.add_argument("--after", required=True, help="npz dir of the new bake")
+    ap.add_argument("--before", default=None, help="npz dir of the old bake")
+    ap.add_argument("--after", default=None, help="npz dir of the new bake")
     ap.add_argument("--tiles", required=True)
     ap.add_argument("--cache-dir", default="D:/voxelsim/tile-cache")
     ap.add_argument("--seed-hex", default="000000000135276f")
     ap.add_argument("--ns", default=None,
                     help="shipped fine namespace dir, to anchor the npz pair "
                          "to bytes that are in the world")
+    ap.add_argument("--ns-before", default=None,
+                    help="SHIPPED-vs-SHIPPED mode: the old namespace dir. Pair "
+                         "with --ns-after. Use this when the new bake ran "
+                         "WITHOUT --diagnostic, which is the only bake whose "
+                         "output is loadable and therefore the only one worth "
+                         "making the identity claim about.")
+    ap.add_argument("--ns-after", default=None)
     args = ap.parse_args()
 
     tiles = [tuple(int(v) for v in p.split(",")) for p in args.tiles.split()]
     bad = 0
+
+    # ---- SHIPPED vs SHIPPED. Two .vxtl namespaces, the codec's own planes,
+    # exact equality. This is weaker than the npz comparison by exactly one
+    # thing -- it reads the ground at the wire's quantisation rather than
+    # unquantised -- and stronger by exactly one thing: both sides are bytes
+    # that a client can load, so there is no dump in the argument at all. The
+    # final bake must run without --diagnostic to be loadable, and a diagnostic
+    # run writes no .vxtl, so a change cannot be verified both ways at once and
+    # this is the mode that matches what ships.
+    if args.ns_before or args.ns_after:
+        if not (args.ns_before and args.ns_after):
+            ap.error("--ns-before and --ns-after go together")
+        for (x, y) in tiles:
+            def _load(ns):
+                p = (Path(args.cache_dir) / ns / args.seed_hex / "s16"
+                     / f"{x}_{y}.vxtl")
+                return tc.decode_v2(p.read_bytes()) if p.exists() else None
+            tb, ta = _load(args.ns_before), _load(args.ns_after)
+            if tb is None or ta is None:
+                print(f"({x},{y}): MISSING .vxtl "
+                      f"(before={tb is not None} after={ta is not None})")
+                bad += 1
+                continue
+            # The DATUM has to match too, or "identical control points" would
+            # be comparing two different origins and could pass while the
+            # ground moved by exactly the datum difference.
+            ok_d = (tb.base_offset_mm == ta.base_offset_mm
+                    and tb.quant == ta.quant)
+            ok_e = np.array_equal(np.asarray(tb.elevation_cp),
+                                  np.asarray(ta.elevation_cp))
+            ok_f = np.array_equal(np.asarray(tb.flow), np.asarray(ta.flow))
+            wb = int((np.asarray(tb.water_cp) >= 0).sum()) if tb.water_cp is not None else 0
+            wa = int((np.asarray(ta.water_cp) >= 0).sum()) if ta.water_cp is not None else 0
+            print(f"({x},{y}): bv{tb.bake_ver} -> bv{ta.bake_ver}  "
+                  f"datum {'SAME' if ok_d else 'DIFFERS'}  "
+                  f"elevation_cp {'IDENTICAL' if ok_e else 'MOVED'}  "
+                  f"flow {'IDENTICAL' if ok_f else 'MOVED'}  "
+                  f"wet {wb:,} -> {wa:,} ({100.0 * (wa - wb) / max(wb, 1):+.2f}%)")
+            if not (ok_d and ok_e and ok_f):
+                bad += 1
+        print(f"\n{'FAIL' if bad else 'PASS'}: {len(tiles)} tile(s), "
+              f"{bad} problem(s)")
+        return 1 if bad else 0
+
+    if not (args.before and args.after):
+        ap.error("give either --before/--after (npz) or --ns-before/--ns-after")
     for (x, y) in tiles:
         pb = Path(args.before) / f"{x}_{y}.npz"
         pa = Path(args.after) / f"{x}_{y}.npz"
