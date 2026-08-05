@@ -1,0 +1,280 @@
+==========================================================================
+FAR-FIELD VOXEL WATER -- how far can water be drawn as VOXELS, and at
+what cost. Measured 2026-08-05 with vxc_farwaterprobe over bv13 tiles.
+==========================================================================
+
+### SITE A -- WET COUNTRY, braided reach (the wettest 480 m water block
+###           in the six wet-country tiles: 37.5% of its pixels wet)
+
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-3,-4) bakeVer=13 basins=yes(83) waterPlane=yes
+  tile (-3,-5) bakeVer=13 basins=yes(106) waterPlane=yes
+  tile (-4,-4) bakeVer=13 basins=yes(46) waterPlane=yes
+  tile (-4,-5) bakeVer=13 basins=yes(156) waterPlane=yes
+  tile (-5,-4) bakeVer=13 basins=yes(77) waterPlane=yes
+  tile (-5,-5) bakeVer=13 basins=yes(84) waterPlane=yes
+seed 20260719  tiles 6 (refused 0)  tileSize 8192 px  pixel 1875 mm
+
+=== WATER PLANE BLOCK CENSUS (480 m blocks) ===
+  blocks total            6144
+  CONSTANT dry            4218  (68.7%, zero data bytes, index-only reject)
+  CONSTANT wet            0
+  coded/raw (may be wet)  1926  (31.3%)
+  blocks with any wet px  1926
+  wet fine px total       2151866  (0.5344% of the loaded plane)
+
+camera at world (-76080.0, -65520.0) m -> brick column (-95100, -81900)
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns swept           4225
+  columns admitted wet    4225
+  proven-interior skipped 0
+  CANDIDATE BRICKS        71825
+  of those, meshed        8409  (63416 empty -- offered, meshed, discarded)
+  QUADS                   22539
+
+grid: 2503 x 2503 brick columns (2002.4 m across, padded by 1 brick)
+wet brick columns in grid: 304821 from the plane, +14056 from lake basins
+columns with datum ABOVE the amplified ground: 316048
+  depth (datum - amplified ground): p50 0.75 m  p90 0.87 m  p99 1.49 m  max 207.26 m
+
+=== PLANE-DRIVEN CANDIDATES, WHOLE DISC AT ONE LOD ===
+(no box, no vertical bound: the z range is the water column itself)
+radius   lod    voxel   wet cols    water brk     surf brk        quads         MB
+   26m     0    0.10m       3205         6410         6410         9308        1.3
+   26m     1    0.20m        793          793          793         2234        0.3
+   26m     2    0.40m        193          193          193          460        0.1
+   26m     3    0.80m         52           52           52          104        0.0
+   26m     4    1.60m         13           13           13           26        0.0
+   26m     5    3.20m          3            3            3            6        0.0
+  100m     0    0.10m      35446        70093        70093       109216       15.8
+  100m     1    0.20m       8890         8890         8890        30801        4.5
+  100m     2    0.40m       2217         2217         2217         7626        1.1
+  100m     3    0.80m        553          553          553         1311        0.2
+  100m     4    1.60m        138          138          138          314        0.0
+  100m     5    3.20m         33           33           33           87        0.0
+  500m     0    0.10m     220068       430707       430707       737614      106.9
+  500m     1    0.20m      55323        55323        55323       207333       30.1
+  500m     2    0.40m      13805        13805        13805        53322        7.7
+  500m     3    0.80m       3440         3440         3440         8948        1.3
+  500m     4    1.60m        857          857          857         2122        0.3
+  500m     5    3.20m        214          214          214          622        0.1
+ 1000m     0    0.10m     315290       634055       630523      1143384      165.7
+ 1000m     1    0.20m      79500        85211        85211       307182       44.5
+ 1000m     2    0.40m      19804        20132        20132        76724       11.1
+ 1000m     3    0.80m       4932         4972         4972        14174        2.1
+ 1000m     4    1.60m       1239         1249         1249         3468        0.5
+ 1000m     5    3.20m        310          312          312         1069        0.2
+
+=== DISTANCE CASCADE (LOD L over [base<<(L-1), base<<L)) ===
+
+base 32 m -> rings 32 64 128 256 512 1024 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        32m        10012        14654          2.1
+     1    0.20m        32m        64m         3009         9728          1.4
+     2    0.40m        64m       128m         2334         9673          1.4
+     3    0.80m       128m       256m         1016         2761          0.4
+     4    1.60m       256m       512m          408         1039          0.2
+     5    3.20m       512m      1024m           93          427          0.1
+ TOTAL                0m      1024m        16872        38282          5.5
+
+base 64 m -> rings 64 128 256 512 1024 2048 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        64m        33364        52291          7.6
+     1    0.20m        64m       128m         9338        35673          5.2
+     2    0.40m       128m       256m         4104        18933          2.7
+     3    0.80m       256m       512m         1628         4369          0.6
+     4    1.60m       512m      1024m          378         1305          0.2
+     5    3.20m      1024m      2048m            0            0          0.0
+ TOTAL                0m      2048m        48812       112571         16.3
+
+base 128 m -> rings 128 256 512 1024 2048 4096 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m       128m       107620       166542         24.1
+     1    0.20m       128m       256m        16451        70755         10.3
+     2    0.40m       256m       512m         6540        22115          3.2
+     3    0.80m       512m      1024m         1478         5079          0.7
+     4    1.60m      1024m      2048m            1            6          0.0
+     5    3.20m      2048m      4096m            0            0          0.0
+ TOTAL                0m      4096m       132090       264497         38.3
+
+NOTE: quads are pre-split. EmitWaterQuads splits some again for the
+corner field, so these are a floor. `surf brk` is the number that costs a
+mesh and a draw; `water brk` is what a naive offer-everything-wet rule costs.
+
+### SITE B -- WET COUNTRY, lake reach. DRY within 26 m, so today this
+###           camera sees NO voxel water at all -- the owner's complaint,
+###           reproduced as a number.
+
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-3,-4) bakeVer=13 basins=yes(83) waterPlane=yes
+  tile (-3,-5) bakeVer=13 basins=yes(106) waterPlane=yes
+  tile (-4,-4) bakeVer=13 basins=yes(46) waterPlane=yes
+  tile (-4,-5) bakeVer=13 basins=yes(156) waterPlane=yes
+  tile (-5,-4) bakeVer=13 basins=yes(77) waterPlane=yes
+  tile (-5,-5) bakeVer=13 basins=yes(84) waterPlane=yes
+seed 20260719  tiles 6 (refused 0)  tileSize 8192 px  pixel 1875 mm
+
+=== WATER PLANE BLOCK CENSUS (480 m blocks) ===
+  blocks total            6144
+  CONSTANT dry            4218  (68.7%, zero data bytes, index-only reject)
+  CONSTANT wet            0
+  coded/raw (may be wet)  1926  (31.3%)
+  blocks with any wet px  1926
+  wet fine px total       2151866  (0.5344% of the loaded plane)
+
+camera at world (-33360.0, -67920.0) m -> brick column (-41700, -84900)
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns swept           4225
+  columns admitted wet    0
+  proven-interior skipped 0
+  CANDIDATE BRICKS        0
+  of those, meshed        0  (0 empty -- offered, meshed, discarded)
+  QUADS                   0
+
+grid: 2503 x 2503 brick columns (2002.4 m across, padded by 1 brick)
+wet brick columns in grid: 151392 from the plane, +32627 from lake basins
+columns with datum ABOVE the amplified ground: 175164
+  depth (datum - amplified ground): p50 1.18 m  p90 1.62 m  p99 6.62 m  max 7.86 m
+
+=== PLANE-DRIVEN CANDIDATES, WHOLE DISC AT ONE LOD ===
+(no box, no vertical bound: the z range is the water column itself)
+radius   lod    voxel   wet cols    water brk     surf brk        quads         MB
+   26m     0    0.10m          0            0            0            0        0.0
+   26m     1    0.20m          0            0            0            0        0.0
+   26m     2    0.40m          0            0            0            0        0.0
+   26m     3    0.80m          0            0            0            0        0.0
+   26m     4    1.60m          0            0            0            0        0.0
+   26m     5    3.20m          0            0            0            0        0.0
+  100m     0    0.10m       1520         3192         3192         8033        1.2
+  100m     1    0.20m        412          473          473         2524        0.4
+  100m     2    0.40m        106          117          117          596        0.1
+  100m     3    0.80m         31           33           33          137        0.0
+  100m     4    1.60m          8            9            9           58        0.0
+  100m     5    3.20m          3            3            3           12        0.0
+  500m     0    0.10m      82713       197364       174108       396416       57.5
+  500m     1    0.20m      21216        34864        34685       114477       16.6
+  500m     2    0.40m       5245         6454         6454        26255        3.8
+  500m     3    0.80m       1289         1494         1494         6385        0.9
+  500m     4    1.60m        314          354          354         1576        0.2
+  500m     5    3.20m         75           78           78          393        0.1
+ 1000m     0    0.10m     163496       440327       346185       881711      127.8
+ 1000m     1    0.20m      42225        76832        72309       258200       37.4
+ 1000m     2    0.40m      10363        15228        14968        56667        8.2
+ 1000m     3    0.80m       2527         3192         3192        13657        2.0
+ 1000m     4    1.60m        611          657          657         3284        0.5
+ 1000m     5    3.20m        143          146          146          803        0.1
+
+=== DISTANCE CASCADE (LOD L over [base<<(L-1), base<<L)) ===
+
+base 32 m -> rings 32 64 128 256 512 1024 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        32m            0            0          0.0
+     1    0.20m        32m        64m            0            0          0.0
+     2    0.40m        64m       128m          489         2430          0.4
+     3    0.80m       128m       256m          699         2995          0.4
+     4    1.60m       256m       512m          157          744          0.1
+     5    3.20m       512m      1024m           69          412          0.1
+ TOTAL                0m      1024m         1414         6581          1.0
+
+base 64 m -> rings 64 128 256 512 1024 2048 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        64m            0            0          0.0
+     1    0.20m        64m       128m         1889         9288          1.3
+     2    0.40m       128m       256m         2969        12415          1.8
+     3    0.80m       256m       512m          697         2952          0.4
+     4    1.60m       512m      1024m          312         1726          0.3
+     5    3.20m      1024m      2048m            8           43          0.0
+ TOTAL                0m      2048m         5875        26424          3.8
+
+NOTE: quads are pre-split. EmitWaterQuads splits some again for the
+corner field, so these are a floor. `surf brk` is the number that costs a
+mesh and a draw; `water brk` is what a naive offer-everything-wet rule costs.
+
+### SITE C -- ARID CORRIDOR, a 100%-WET 480 m block (tile -11,-6). The
+###           worst case available anywhere in either cache.
+
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-11,-4) bakeVer=13 basins=yes(55) waterPlane=yes
+  tile (-11,-5) bakeVer=13 basins=yes(25) waterPlane=yes
+  tile (-11,-6) bakeVer=13 basins=yes(154) waterPlane=yes
+  tile (-12,-5) bakeVer=13 basins=yes(21) waterPlane=yes
+seed 20260719  tiles 4 (refused 0)  tileSize 8192 px  pixel 1875 mm
+
+=== WATER PLANE BLOCK CENSUS (480 m blocks) ===
+  blocks total            4096
+  CONSTANT dry            3235  (79.0%, zero data bytes, index-only reject)
+  CONSTANT wet            0
+  coded/raw (may be wet)  861  (21.0%)
+  blocks with any wet px  861
+  wet fine px total       2891487  (1.0772% of the loaded plane)
+
+camera at world (-154800.0, -89040.0) m -> brick column (-193500, -111300)
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns swept           4225
+  columns admitted wet    4225
+  proven-interior skipped 0
+  CANDIDATE BRICKS        71825
+  of those, meshed        8450  (63375 empty -- offered, meshed, discarded)
+  QUADS                   23549
+
+grid: 2503 x 2503 brick columns (2002.4 m across, padded by 1 brick)
+wet brick columns in grid: 4231642 from the plane, +0 from lake basins
+columns with datum ABOVE the amplified ground: 4230215
+  depth (datum - amplified ground): p50 0.91 m  p90 0.95 m  p99 0.98 m  max 1.28 m
+
+=== PLANE-DRIVEN CANDIDATES, WHOLE DISC AT ONE LOD ===
+(no box, no vertical bound: the z range is the water column itself)
+radius   lod    voxel   wet cols    water brk     surf brk        quads         MB
+   26m     0    0.10m       3205         6410         6410         9398        1.4
+   26m     1    0.20m        793         1586         1586         1586        0.2
+   26m     2    0.40m        193          193          193          386        0.1
+   26m     3    0.80m         52           52           52          104        0.0
+   26m     4    1.60m         13           13           13           26        0.0
+   26m     5    3.20m          3            3            3            6        0.0
+  100m     0    0.10m      49049        98098        98098       148748       21.6
+  100m     1    0.20m      12281        24562        24562        24902        3.6
+  100m     2    0.40m       3069         3069         3069         6138        0.9
+  100m     3    0.80m        772          772          772         1544        0.2
+  100m     4    1.60m        193          193          193          386        0.1
+  100m     5    3.20m         47           47           47           94        0.0
+  500m     0    0.10m    1200451      2418973      2418973      3637250      527.3
+  500m     1    0.20m     300176       600259       600259       610538       88.5
+  500m     2    0.40m      75052        75052        75052       151621       22.0
+  500m     3    0.80m      18768        18768        18768        37800        5.5
+  500m     4    1.60m       4693         4693         4693         9526        1.4
+  500m     5    3.20m       1172         1172         1172         2396        0.3
+ 1000m     0    0.10m    3570048      7232575      7232575     10858375     1574.0
+ 1000m     1    0.20m     892736      1784931      1784931      1832177      265.6
+ 1000m     2    0.40m     223026       223033       223033       452823       65.6
+ 1000m     3    0.80m      55691        55691        55691       112606       16.3
+ 1000m     4    1.60m      13917        13917        13917        28456        4.1
+ 1000m     5    3.20m       3470         3470         3470         7173        1.0
+
+=== DISTANCE CASCADE (LOD L over [base<<(L-1), base<<L)) ===
+
+base 32 m -> rings 32 64 128 256 512 1024 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        32m        10026        14637          2.1
+     1    0.20m        32m        64m         7536         7536          1.1
+     2    0.40m        64m       128m         3768         7536          1.1
+     3    0.80m       128m       256m         3760         7520          1.1
+     4    1.60m       256m       512m         3628         7409          1.1
+     5    3.20m       512m      1024m         2341         4890          0.7
+ TOTAL                0m      1024m        31059        49528          7.2
+
+base 64 m -> rings 64 128 256 512 1024 2048 m
+   lod    voxel       from         to     surf brk        quads           MB
+     0    0.10m         0m        64m        40138        60744          8.8
+     1    0.20m        64m       128m        30112        30636          4.4
+     2    0.40m       128m       256m        15056        30112          4.4
+     3    0.80m       256m       512m        14512        29319          4.3
+     4    1.60m       512m      1024m         9440        19419          2.8
+     5    3.20m      1024m      2048m          540         1212          0.2
+ TOTAL                0m      2048m       109798       171442         24.9
+
+NOTE: quads are pre-split. EmitWaterQuads splits some again for the
+corner field, so these are a floor. `surf brk` is the number that costs a
+mesh and a draw; `water brk` is what a naive offer-everything-wet rule costs.
