@@ -73,6 +73,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+// <cmath> for std::sqrt. MSVC and Windows clang pull it in transitively, so a
+// local build is clean and only libstdc++ (Linux g++/clang++) reports it. That
+// is the fifth CI failure of this exact shape in one session.
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
