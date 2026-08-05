@@ -91,18 +91,65 @@ param(
     [string]$Date = '03-20',
     [double]$TimeScale = 0,
     [string]$Cvars = '',
+    # THE TILE SET, AS SWITCHES RATHER THAN AS -ExtraArgs STRINGS. Which tiles a
+    # capture loaded is the single most consequential thing about it and the
+    # easiest to get silently wrong: the checked-in DefaultGame.ini points at
+    # namespace 71e2b362e3241e71, and photographing a river fix with the wrong
+    # namespace resident produces a picture of the OLD bake under the new
+    # binary, which is indistinguishable from "the fix did nothing".
+    #
+    # Empty means "leave the ini alone", so an unpassed switch reproduces every
+    # capture in the archive exactly. Passed, they are echoed in the banner and
+    # checked against the engine's own resolved lines afterwards.
+    #
+    # -FineTileDir is the cache ROOT (the streamer appends
+    # <provider_id>/<seed:016x>/s16), -CoarseTileDir is an s1 LEAF. They are not
+    # the same shape of path and swapping them fails in different ways.
+    [string]$FineTileDir = '',
+    [string]$FineProviderId = '',
+    [string]$CoarseTileDir = '',
+    # THE NO-WATER CONTROL. -VoxelRiverRibbons=0 removes the far-field river
+    # ribbon actor, which is what draws river water at any altitude above the
+    # near-field implicit disc. It is a command-line switch and not a cvar
+    # deliberately (VoxelRiverRibbonActor.h:221) because -ExecCmds lands after
+    # BeginPlay, so passing it through -Cvars would silently do nothing.
+    #
+    # WHAT IT DOES NOT CONTROL, which matters for reading a near-field diff:
+    # baked river water inside the implicit disc -- 65x65x33 bricks, +-25.6 m in
+    # xy and +-12.8 m in z about the camera brick (VoxelWaterSubsystem.cpp:3005)
+    # -- is drawn by RefreshImplicitWater and there is NO terrain-identical
+    # switch that removes it. A control at a pose whose disc contains river
+    # surface is therefore a PARTIAL control, and the diff under-reports.
+    [switch]$NoRiverRibbons,
     # Keep the persisted edit log instead of clearing it. Only for deliberately
     # photographing an EDITED world; see the note above the clear below.
     [switch]$KeepEditLog,
     [string[]]$ExtraArgs = @(),
-    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
+    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
+    # THE PROJECT TO LAUNCH, WHICH IS NOT ALWAYS THIS SCRIPT'S OWN CHECKOUT.
+    #
+    # Captures get taken from a throwaway worktree so the capture branch does
+    # not sit on top of whatever else is in flight -- but a worktree has SOURCE
+    # and no Binaries, and UnrealEditor-Cmd against a project with no built
+    # module silently falls back to a stock engine world: terrain everywhere,
+    # no voxels, no water, and a screenshot that is a photograph of nothing to
+    # do with this project. Point this at the checkout that was actually built,
+    # and say in the writeup which commit that build came from.
+    [string]$ProjectPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $Root    = (Resolve-Path "$PSScriptRoot\..").Path
-$Project = (Resolve-Path "$Root\ue-project\VoxelEarth.uproject").Path
+$Project = if ($ProjectPath) { (Resolve-Path $ProjectPath).Path }
+           else { (Resolve-Path "$Root\ue-project\VoxelEarth.uproject").Path }
+$ProjRoot = Split-Path $Project
 $LogPath = Join-Path $Root "Saved\capture-$Name.log"
-$ShotDir = Join-Path $Root 'ue-project\Saved\Screenshots\WindowsEditor'
+$ShotDir = Join-Path $ProjRoot 'Saved\Screenshots\WindowsEditor'
+if (-not (Test-Path (Join-Path $ProjRoot 'Binaries\Win64\UnrealEditor-VoxelEarth.dll'))) {
+    throw ("REFUSING TO START: $ProjRoot has no built UnrealEditor-VoxelEarth.dll. " +
+           "A capture from an unbuilt project photographs a stock engine world. " +
+           "Pass -ProjectPath at the checkout that was built.")
+}
 
 # THE EDIT LOG PERSISTS ACROSS RUNS AND OVERRIDES -VoxelSpawnAt. This script did
 # not clear it, and voxel-run-flight-leg.ps1 always has (its ground rule 11: a leg
@@ -204,11 +251,17 @@ if ($SpawnYaw -ne 45) {
     $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
 }
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
+if ($FineTileDir)    { $argList += "-VoxelFineTileDir=$FineTileDir" }
+if ($FineProviderId) { $argList += "-VoxelFineTileProviderId=$FineProviderId" }
+if ($CoarseTileDir)  { $argList += "-VoxelTileDir=$CoarseTileDir" }
+if ($NoRiverRibbons) { $argList += '-VoxelRiverRibbons=0' }
 $argList += $ExtraArgs
 
 $sun = if ($TimeScale -eq 0) { "sun frozen $TimeOfDay $Date" } else { "sun MOVING x$TimeScale from $TimeOfDay $Date -- NOT reproducible" }
 $pose = if ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0) { "alt +${SpawnAltM}m pitch ${SpawnPitch}deg" } else { "GROUND spawn, level camera (landform will NOT read)" }
-Write-Host "capture '$Name' at $SpawnAt, $pose, settling ${SettleSec}s, ${Width}x${Height}, $sun" -ForegroundColor Cyan
+$arm  = if ($NoRiverRibbons) { 'CONTROL (-VoxelRiverRibbons=0)' } else { 'river ribbons ON' }
+Write-Host "capture '$Name' at $SpawnAt, $pose, yaw $SpawnYaw, settling ${SettleSec}s, ${Width}x${Height}, $sun, $arm" -ForegroundColor Cyan
+if ($FineProviderId) { Write-Host "  fine tier: $FineTileDir  provider=$FineProviderId" -ForegroundColor DarkGray }
 $started = Get-Date
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 if (-not $p.WaitForExit($TimeoutSec * 1000)) {
@@ -331,6 +384,85 @@ if (Test-Path $LogPath) {
                        "'was REFUSED'). Their lakes and rivers are ABSENT from this frame. " +
                        "kNoDecompressor here means the runtime zstd DLL is missing -- see " +
                        "tools/fetch-zstd.ps1.")
+    }
+
+    # THE RIBBON QUEUE, WHICH IS A THIRD WATER QUEUE AND THE ONLY ONE THAT
+    # MATTERS ABOVE ~13 m.
+    #
+    # The implicit-water check above reads RefreshImplicitWater, which meshes a
+    # disc of +-25.6 m in xy and +-12.8 m in z about the CAMERA BRICK
+    # (VoxelWaterSubsystem.cpp:3005-3009). Every river in this world is below
+    # its own valley floor, so from any altitude worth photographing landform
+    # from, that disc is empty air and the implicit line reports `0 candidate
+    # brick(s)` -- correctly. Its ABSENCE at altitude is therefore expected and
+    # is NOT evidence that water failed to settle. Treating it as a settle check
+    # everywhere would condemn every altitude capture ever taken.
+    #
+    # What draws the river from altitude is the far-field ribbon actor, and it
+    # has its own drain line, its own failure modes, and no altitude gate. It
+    # meshes AT MOST ONE REACH PER TICK (VoxelRiverRibbonActor.cpp:598-621), so
+    # a scene with many reaches needs many ticks after the window fill -- which
+    # is exactly the shape of the lake-sheet bug that produced disjoint
+    # brick-shaped patches and sent an investigation after a mesher that was
+    # fine. A capture whose river is in frame is not settled until this drains.
+    $ribDrained = @(Select-String -Path $LogPath -Pattern 'River ribbons: DRAINED build') |
+                  Select-Object -Last 1
+    $ribOff  = @(Select-String -Path $LogPath -SimpleMatch 'DISABLED (-VoxelRiverRibbons=0)')
+    $ribNoTier = @(Select-String -Path $LogPath -SimpleMatch 'River ribbons: no fine water tier')
+    if ($ribDrained) {
+        Write-Host ("  ribbons: " + ($ribDrained.Line -replace '^.*River ribbons: ', ''))
+    }
+    elseif ($ribOff.Count -gt 0) {
+        Write-Host "  ribbons: DISABLED -- this is the -VoxelRiverRibbons=0 CONTROL arm" -ForegroundColor DarkGray
+    }
+    elseif ($ribNoTier.Count -gt 0) {
+        Write-Warning ("River ribbons found NO FINE WATER TIER. There is no baked river in this " +
+                       "frame at all, and an empty valley here is the tile source being wrong, " +
+                       "not the bake. Check -FineTileDir / -FineProviderId against the " +
+                       "'Baked water tier ENABLED' line.")
+    }
+    else {
+        Write-Warning ("no 'River ribbons: DRAINED build' line and the actor was not disabled -- " +
+                       "the far-field river had NOT finished meshing at the shutter, or the actor " +
+                       "never ran. River geometry in this frame is PARTIAL. Raise -SettleSec.")
+    }
+    # A ribbon build that drained with zero reaches is a legitimately dry frame
+    # OR a pose with no river in range; either way it is not evidence of water.
+    if ($ribDrained -and $ribDrained.Line -match '(\d+) reach\(es\), (\d+) quad\(s\)') {
+        if ([int]$Matches[1] -eq 0 -or [int]$Matches[2] -eq 0) {
+            Write-Warning ("the ribbon build DRAINED with $($Matches[1]) reach(es) and " +
+                           "$($Matches[2]) quad(s) -- no far-field river was drawn here. This " +
+                           "capture is not evidence about river extent.")
+        }
+    }
+
+    # FABRICATED GROUND. A fine-tier elevation query that lands in a
+    # non-resident tile is answered with SEA LEVEL -- terrain no other client
+    # computes, in frame, in a capture that looks entirely normal. Measured:
+    # a pose 4,073 m from the edge of a four-tile set produced 2,898 of these,
+    # and the capture was discarded. Under -unattended the engine makes the
+    # first one fatal (VoxelFineTileStreamer.cpp:543), which this script passes
+    # on line 174 -- so in the normal case the run dies rather than lying. Grep
+    # for it anyway: the policy is overridable, the non-fatal and aggregate
+    # variants exist, and a capture that reached the shutter with any of these
+    # in its log is not evidence about anything.
+    $leaks = @(Select-String -Path $LogPath -SimpleMatch 'FINE TIER GATE LEAK')
+    if ($leaks.Count -gt 0) {
+        Write-Warning ("$($leaks.Count) FINE TIER GATE LEAK line(s) -- elevation queries landed " +
+                       "outside baked coverage and were answered at SEA LEVEL. There is " +
+                       "FABRICATED GROUND in this frame. Discard it and move the pose further " +
+                       "inside coverage (the working margin is 4.5 km).")
+    }
+    # THE TIER THE FRAME WAS ACTUALLY DRAWN FROM, read back rather than echoed
+    # from the switches -- same argument as the sky and pose lines below. The
+    # water subsystem resolves the fine root and provider id INDEPENDENTLY of
+    # the world subsystem (VoxelWaterSubsystem.cpp:460-492), so the two can
+    # disagree, and a frame with the right terrain and the wrong water is the
+    # exact failure this whole capture exists to rule out.
+    foreach ($pat in @('Fine tier ENABLED:', 'Baked water tier ENABLED:')) {
+        $ln = @(Select-String -Path $LogPath -SimpleMatch $pat) | Select-Object -First 1
+        if ($ln) { Write-Host ("  " + ($ln.Line -replace '^.*?(?=' + [regex]::Escape($pat) + ')', '')) }
+        else     { Write-Warning "no '$pat' line -- that tier did not initialise." }
     }
 
     # CHUNKS THE GPU POOL REFUSED, which is a different failure from "not

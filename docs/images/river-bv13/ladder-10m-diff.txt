@@ -1,0 +1,14 @@
+﻿resolution        : 2560 x 1440  (3,686,400 px)
+changed pixels    : 166,167  (4.5076% at threshold 8/255)
+mean |delta|      : 0.931   max 102
+background        : signed mean -0.0100, |mean| 0.5280, bias ratio 0.019  (3,520,233 px)
+
+threshold ladder  -- a real feature contracts, a global shift does not:
+     thr   changed px   %frame  bbox (x0..x1, y0..y1)         bbox %
+       8      166,167   4.5076  0..2559, 264..1439             81.7%
+      16       86,131   2.3365  0..2559, 270..1439             81.2%
+      32        2,115   0.0574  0..2559, 273..1437             80.9%
+      64           53   0.0014  89..2506, 274..1397            73.7%
+      96            5   0.0001  420..1157, 274..294             0.4%
+     128            0   0.0000  -                                  -
+wrote             : D:\vox-rivercap\docs\captures\river-bv13\ladder-10m-diff.png

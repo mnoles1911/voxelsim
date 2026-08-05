@@ -1,0 +1,14 @@
+﻿resolution        : 2560 x 1440  (3,686,400 px)
+changed pixels    : 474,972  (12.8844% at threshold 8/255)
+mean |delta|      : 4.700   max 168
+background        : signed mean +0.0529, |mean| 1.4943, bias ratio 0.035  (3,211,428 px)
+
+threshold ladder  -- a real feature contracts, a global shift does not:
+     thr   changed px   %frame  bbox (x0..x1, y0..y1)         bbox %
+       8      474,972  12.8844  0..2559, 425..1439             70.5%
+      16      209,298   5.6776  0..2559, 425..1439             70.5%
+      32      192,637   5.2256  0..2559, 438..1439             69.6%
+      64      174,471   4.7328  0..2559, 492..1439             65.8%
+      96        7,873   0.2136  735..2430, 507..1439           42.9%
+     128        2,853   0.0774  1220..2427, 533..1439          29.7%
+wrote             : D:\vox-rivercap\docs\captures\river-bv13\owner-valley-diff.png

@@ -1,0 +1,14 @@
+﻿resolution        : 2560 x 1440  (3,686,400 px)
+changed pixels    : 29,750  (0.8070% at threshold 8/255)
+mean |delta|      : 0.616   max 178
+background        : signed mean +0.0043, |mean| 0.4103, bias ratio 0.010  (3,656,650 px)
+
+threshold ladder  -- a real feature contracts, a global shift does not:
+     thr   changed px   %frame  bbox (x0..x1, y0..y1)         bbox %
+       8       29,750   0.8070  0..2559, 0..1439              100.0%
+      16       15,101   0.4096  0..2559, 0..1439              100.0%
+      32        9,294   0.2521  7..2541, 0..1439               99.0%
+      64        4,026   0.1092  60..2490, 0..495               32.7%
+      96        2,785   0.0755  72..2225, 4..351               20.3%
+     128        2,041   0.0554  73..2220, 39..351              18.2%
+wrote             : D:\vox-rivercap\docs\captures\river-bv13\valley-width-diff.png
