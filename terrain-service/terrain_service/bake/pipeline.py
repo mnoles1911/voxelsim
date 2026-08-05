@@ -406,8 +406,29 @@ __all__ = [
 #: no search) and 7.15x the wet cells. The centreline itself is untouched, so
 #: the long profile -- and the property that the surface never rises going
 #: downstream -- is the same array bake_ver 12 produced.
+#: bake_ver 14 -- THE WATER IS MADE TO TOUCH ITSELF DOWN A SLOPE.
+#:
+#: bake_ver 13's extent rule answers "which cells are wet". Nothing answered
+#: whether the water in two adjacent cells actually TOUCHES, and the client
+#: draws one flat slab per fine pixel (``lakes.h``: the water surface is
+#: resolved by NEAREST pixel and the fill runs from ground to that surface), so
+#: two neighbours only share a voxel face when the lower one's surface reaches
+#: the higher one's bed. On a descending bed it does not, and a D8 path that
+#: steps diagonally does not share a face at all. Measured on the shipped bv13
+#: corridor: the same wet cells are 24-75 components in plan and 3,409-7,987 as
+#: drawn, and on ground steeper than 0.15 up to 20.3% of wet cells touch
+#: nothing. That is the owner's "several cubes of water placed in a general
+#: direction but disconnected going down the slope".
+#:
+#: ``water.bridge_to_face_contact`` is the whole change. It runs after whichever
+#: extent rule ran, adds the corner a diagonal step needs and raises each cell's
+#: surface to reach its face neighbours' beds. It is EXACTLY A NO-OP on ponded
+#: water -- every cell in a pool is already submerged below its neighbours'
+#: level -- so the surface stays horizontal where the water stands and becomes
+#: bed-parallel where it runs, with no slope threshold anywhere to seam the
+#: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 13
+BAKE_VERSION = 14
 
 
 @dataclass(frozen=True)
@@ -1152,6 +1173,25 @@ class BakeConstants:
     #: terrain-identity gate bakes against.
     water_plane_enabled: bool = True
 
+    #: Make the drawn water FACE-CONNECTED down a slope (bake_ver 14). See
+    #: ``water.bridge_to_face_contact`` for the rule and for the measurement
+    #: that forced it; the short version is that the extent rules above decide
+    #: WHICH CELLS are wet and nothing before this decided whether the water in
+    #: two adjacent cells actually TOUCHES, which is a different question and
+    #: the one the owner was looking at.
+    #:
+    #: Runs AFTER whichever ``water_extent_mode`` ran, so the three extent rules
+    #: keep meaning exactly what they meant. False reproduces bake_ver 13's
+    #: plane byte for byte, which is the property a constant claiming to
+    #: reproduce a previous bake has to have.
+    #:
+    #: NOT A MODE OF ``water_extent_mode``. Extent is "which cells are wet";
+    #: this is mostly "how thick is the water in a cell that already is", and
+    #: folding it into the mode enum would make the two impossible to A/B
+    #: against each other -- which is how the corridor numbers in
+    #: ``bridge_to_face_contact``'s docstring were taken.
+    water_face_contact_bridge: bool = True
+
     #: The extent rules ``water_extent_mode`` may name, in the order they
     #: shipped. A ClassVar so it is not itself a constant, and a tuple so a
     #: typo in a config is a refusal at construction rather than a bake that
@@ -1331,6 +1371,7 @@ class BakeConstants:
         "water_pyramid_single_receiver",
         "water_extent_mode",
         "water_plane_enabled",
+        "water_face_contact_bridge",
     )
 
     def product_payload(self) -> dict:
@@ -4642,6 +4683,28 @@ def bake_tile(
             )
         del rec_w
 
+        # -- CONTACT (bake_ver 14). Everything above decides WHICH CELLS are
+        # wet. Nothing above decides whether the water in two adjacent cells
+        # TOUCHES, and on a slope it does not: a flood-to-a-level rule on a
+        # descending bed leaves each column standing in its own air, and a D8
+        # path that steps diagonally leaves columns joined at a corner, which
+        # is not a face. Measured on the shipped bv13 corridor the same wet
+        # cells are 24-75 pieces in plan and 3,409-7,987 pieces as drawn.
+        #
+        # ON THE PADDED DOMAIN, for the reason the fill runs here: a reach
+        # along a tile edge must be bridged from both sides of the seam, not
+        # cut in half by the crop.
+        #
+        # AGAINST `out["z"]`, the shipped surface, because the contact test is
+        # a statement about the ground the client draws the waterline against
+        # and it is the array the codec takes the stored depth from.
+        if consts.water_face_contact_bridge:
+            w_pad, bridge_stats = _water.bridge_to_face_contact(
+                w_pad, out["z"], cell_m=geom.fine_pixel_m,
+                exclude=basin_keep_pad,
+            )
+            width_stats.update(bridge_stats)
+
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])
         wet_int = np.isfinite(water_surface)
@@ -4686,6 +4749,22 @@ def bake_tile(
             ),
         })
         water_stats.update({f"water_{k}": v for k, v in width_stats.items()})
+        if wet_int.any():
+            # THE ACCEPTANCE STATISTIC FOR bake_ver 14, on the shipped interior.
+            # "Is the river connected" was answered by labelling the wet mask
+            # until it turned out that a mask cannot see whether two adjacent
+            # columns of water touch, which on a slope they do not. This asks
+            # the client's own question -- does the lower cell's surface reach
+            # the upper cell's bed -- and a non-zero `contact_face_broken` after
+            # the bridge is a real regression rather than a distribution moving.
+            # Component labelling is left to `tools/river_column_contact.py`:
+            # see `face_contact_stats`, it is a Python loop over millions of
+            # edges and would cost more than the stage it grades.
+            water_stats.update({
+                f"water_{k}": v for k, v in _water.face_contact_stats(
+                    water_surface, z, components=False,
+                ).items()
+            })
         if centre_int.any():
             water_stats.update({
                 f"water_{k}": v for k, v in _water.overshoot_stats(

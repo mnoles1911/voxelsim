@@ -113,6 +113,8 @@ __all__ = [
     "graded_water_surface",
     "widen_to_channel_width",
     "fill_to_local_surface",
+    "bridge_to_face_contact",
+    "face_contact_stats",
     "WIDEN_MIN_DEPTH_M",
     "water_head_mask",
     "overshoot_stats",
@@ -805,6 +807,322 @@ def _fill_levels(level, rec, blocked, is_src):
                 level[c] = np.float32(np.nan)
             else:
                 level[c] = level[t]
+
+
+# --------------------------------------------------------------------------- contact
+
+def _diag_slices(h, w, dc):
+    """The four aligned views of a diagonal adjacency, as slice pairs.
+
+    ``a`` at (r, c), ``b`` at (r+1, c+dc), and the two CORNERS the flow would
+    have to pass through, ``e1`` at (r+1, c) and ``e2`` at (r, c+dc). Written
+    once because getting one of the four windows off by a row is a bug that
+    reads as "the fix does nothing on half the diagonals".
+    """
+    if dc > 0:
+        return ((slice(0, h - 1), slice(0, w - 1)),      # a
+                (slice(1, h), slice(1, w)),              # b
+                (slice(1, h), slice(0, w - 1)),          # e1 = (r+1, c)
+                (slice(0, h - 1), slice(1, w)))          # e2 = (r, c+dc)
+    return ((slice(0, h - 1), slice(1, w)),
+            (slice(1, h), slice(0, w - 1)),
+            (slice(1, h), slice(1, w)),
+            (slice(0, h - 1), slice(0, w - 1)))
+
+
+def face_contact_stats(water_m, z_ground_m, *, min_depth_m: float = 0.0,
+                       components: bool = True):
+    """How much of the drawn water actually TOUCHES the water beside it.
+
+    THE ACCEPTANCE CRITERION, computed the way the client draws rather than the
+    way the mask looks. ``lakes.h`` resolves the water surface per VOXEL COLUMN
+    by NEAREST fine pixel (``waterSurfaceMmAtVoxel``: ``floorDiv(vx*100, 1875)``),
+    so a pixel's water is one flat slab spanning ``[ground, surface]`` across all
+    18.75 voxels of its footprint, and ``implicitWaterFill`` fills a voxel iff it
+    is above the ground and below that surface. Therefore two plan-adjacent
+    pixels share a VOXEL FACE iff
+
+        surface(lower) > ground(higher)
+
+    and nothing else -- not "both are wet", which is what a mask tells you.
+
+    TWO ADJACENCIES, AND ONLY ONE OF THEM IS A FACE. A diagonal neighbour shares
+    an EDGE. Two columns touching at a corner are two objects with air between
+    them, which is precisely the owner's "several cubes of water placed in a
+    general direction but disconnected going down the slope". So the connected
+    components here are over 4-adjacency AND the overlap test, i.e. voxel
+    6-connectivity, and ``plan8_components`` is reported beside them as the
+    number the old mask-labelling probes were reading.
+
+    Returns a stats dict. Sparse throughout: the wet set is ~1-3% of a padded
+    domain and a dense label image of it is gigabytes.
+
+    ``components=False`` drops the union-find and keeps only the vectorised
+    half. That is what the BAKE asks for: the labelling is a Python loop over
+    millions of edges and would cost more than the water stage it is grading,
+    while the two numbers that gate -- how many face adjacencies fail to touch,
+    and how many cells touch nothing -- are pure numpy. The component counts are
+    the offline probe's job (``tools/river_column_contact.py``).
+    """
+    w = np.asarray(water_m)
+    z = np.asarray(z_ground_m)
+    wet = np.isfinite(w)
+    n = int(wet.sum())
+    out = {"contact_wet_cells": float(n)}
+    if n == 0:
+        return out
+
+    ry, rx = np.nonzero(wet)
+    W = w.shape[1]
+    key = ry.astype(np.int64) * W + rx
+    surf = w[ry, rx].astype(np.float64)
+    grnd = z[ry, rx].astype(np.float64)
+    md = float(min_depth_m)
+
+    parent = np.arange(n, dtype=np.int64)
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def pairs(dy, dx):
+        nk = (ry.astype(np.int64) + dy) * W + (rx.astype(np.int64) + dx)
+        inb = ((ry + dy >= 0) & (ry + dy < w.shape[0])
+               & (rx + dx >= 0) & (rx + dx < W))
+        pos = np.clip(np.searchsorted(key, nk), 0, n - 1)
+        hit = inb & (key[pos] == nk)
+        return np.flatnonzero(hit), pos[hit]
+
+    n_face = n_touch = 0
+    has_face = np.zeros(n, bool)
+    face_edges = []
+    plan_edges = []
+    for dy, dx in ((0, 1), (1, 0)):
+        ia, ib = pairs(dy, dx)
+        up_a = grnd[ia] >= grnd[ib]
+        g_hi = np.where(up_a, grnd[ia], grnd[ib])
+        s_lo = np.where(up_a, surf[ib], surf[ia])
+        ok = s_lo > g_hi + md
+        n_face += int(ia.size)
+        n_touch += int(ok.sum())
+        has_face[ia[ok]] = True
+        has_face[ib[ok]] = True
+        face_edges.append((ia[ok], ib[ok]))
+        plan_edges.append((ia, ib))
+    out.update({
+        "contact_face_adjacencies": float(n_face),
+        "contact_face_touching": float(n_touch),
+        "contact_face_broken": float(n_face - n_touch),
+        "contact_isolated_cells": float(int((~has_face).sum())),
+        "contact_isolated_frac": float((~has_face).mean()),
+    })
+    if not components:
+        return out
+    for dy, dx in ((1, 1), (1, -1)):
+        plan_edges.append(pairs(dy, dx))
+
+    def label(edges):
+        parent[:] = np.arange(n)
+        for ia, ib in edges:
+            for a, b in zip(ia.tolist(), ib.tolist()):
+                ra, rb = find(a), find(b)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+        roots = np.array([find(i) for i in range(n)], np.int64)
+        _, lab = np.unique(roots, return_inverse=True)
+        return np.bincount(lab)
+
+    face_sizes = label(face_edges)
+    plan_sizes = label(plan_edges)
+    out.update({
+        "contact_face_components": float(face_sizes.size),
+        "contact_face_largest_frac": float(face_sizes.max()) / float(n),
+        "contact_plan8_components": float(plan_sizes.size),
+        "contact_plan8_largest_frac": float(plan_sizes.max()) / float(n),
+        # The ratio IS the defect, in one number: how many times more pieces the
+        # water breaks into once you ask whether the pieces touch.
+        "contact_shatter_ratio": float(face_sizes.size) / float(plan_sizes.size),
+    })
+    return out
+
+
+def bridge_to_face_contact(water_m, z_ground_m, *, cell_m: float, exclude=None,
+                           min_depth_m: float = WIDEN_MIN_DEPTH_M):
+    """Make the drawn water CONTINUOUS DOWN A SLOPE. Returns ``(w, stats)``.
+
+    THE DEFECT THIS EXISTS FOR, in the owner's words after flying bake_ver 13:
+    "on a steeper downslope in the river, there will be several cubes of water
+    placed in a general direction but disconnected going down the slope ...
+    obvious empty space and air all around the placed water." Measured on the
+    shipped bv13 corridor, that is not a figure of speech. The same wet cells
+    labelled in plan give 24-75 components per tile and labelled the way the
+    client draws them give 3,409-7,987 -- a factor of 45 to 310 -- and on ground
+    steeper than 0.15 the share of wet cells with NO touching neighbour at all
+    runs 3.2% to 20.3%.
+
+    WHY A "FLOOD TO A LEVEL" RULE PRODUCES IT, which is the physics. Filling
+    each cell to the horizontal surface of the channel cell it drains to is
+    right for PONDED water and wrong for FLOWING water: real water running down
+    a gradient forms a thin sheet roughly parallel to the bed, not a staircase
+    of puddles. On a raster of columns the difference is visible immediately.
+    Writing g for the bed and d for the depth, two face-adjacent columns share a
+    voxel face iff ``d_lower > g_upper - g_lower``, so contact fails as soon as
+    the bed drops between adjacent pixels by more than the water is deep -- a
+    bed gradient of ``d / cell_m``, which at the measured p50 depth is 0.23-0.30.
+    On three of the four corridor tiles 13.0-16.6% of drawn cells sit above
+    their own such gradient.
+
+    THE SECOND MECHANISM, WHICH IS THE LARGER ONE AND IS PURE RASTERISATION.
+    The drawn network is 8-connected: a D8 flow path steps diagonally, and on a
+    steep reach the lateral fill adds nothing on either side because the ground
+    rises within one pixel, so the water collapses to a ONE PIXEL WIDE DIAGONAL
+    CHAIN. Diagonal columns touch at a corner, not a face. Ablated on the same
+    tiles, the diagonal alone accounts for 2,874-5,782 of the components and the
+    vertical gap for 871-4,103; each one alone shatters the river.
+
+    THE RULE, in two steps, both local and both deterministic::
+
+        CORNER   for every diagonally-adjacent wet pair with neither corner wet,
+                 wet the LOWER-bedded corner at the HIGHER of the two surfaces,
+                 provided its ground stands at least min_depth below that --
+                 the same submergence test `fill_to_local_surface` uses, applied
+                 to the corner the flow actually passes through.
+
+        BRIDGE   every wet cell's surface is raised to at least
+                 ``max over face-adjacent wet u of (ground(u) + min_depth)``.
+
+    WHY THIS IS THE BLEND THE TWO REGIMES NEED, AND WHY THERE IS NO THRESHOLD IN
+    IT. In genuinely ponded water the bridge is EXACTLY A NO-OP, by construction
+    and not by tuning: every wet cell in a pool shares one level and each is
+    submerged, so ``surface >= ground(u) + min_depth`` already holds for every
+    wet neighbour u and the max changes nothing. The raise is
+    ``max(0, drop - depth)``, which is zero on level water and grows
+    continuously with bed slope. So the surface is horizontal where the water
+    ponds and bed-parallel where it runs, the transition is the terrain's own,
+    and there is no slope constant anywhere to put a seam along the river.
+
+    THE THREE THINGS IT CANNOT DO, each a bound rather than a hope:
+
+      * **It cannot flood.** ``ground(u) + min_depth <= surface(u)`` for every
+        wet u, so a raised surface never exceeds the surface of a cell one pixel
+        away that was already drawn at it. The maximum of the water surface over
+        the wet set is therefore unchanged, and no cell is lifted above water
+        that the fill had already put beside it.
+      * **It cannot tilt still water.** See the no-op argument above; the unit
+        test asserts it on a flat pool rather than taking the argument's word.
+      * **It cannot run away.** The bridge reads BEDS only, never the surfaces
+        it is writing, so one pass is the fixed point -- there is no iteration
+        and no ordering dependence. The corner step likewise reads only the wet
+        set it was handed.
+
+    WHERE IT STOPS, HONESTLY. A diagonal whose BOTH corners stand above the
+    water is refused rather than bridged, because wetting one would put water on
+    a rise and the bridge would then drag the whole reach up to meet it. Those
+    are counted in ``bridge_corner_refused`` and are the residual the acceptance
+    statistic still sees.
+
+    ``water_m``      the plane as the extent rule leaves it: metres absolute,
+                     NaN dry, registered basins already excluded. Face-adjacent
+                     values are read but only ever raised.
+    ``z_ground_m``   the SHIPPED (post-B5) surface -- the array the codec takes
+                     the stored depth against and the one the client's waterline
+                     is drawn on, for the same reason
+                     ``fill_to_local_surface`` uses it.
+    ``exclude``      the registered-basin mask. A basin is a barrier here too: a
+                     corner inside one is left to the basin table.
+    ``min_depth_m``  the codec representability floor and one client voxel, so a
+                     bridged pair overlaps by a voxel the renderer can draw
+                     rather than by a rounding.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, np.float32)
+    if z.shape != w.shape:
+        raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
+    h, wd = w.shape
+    md = np.float32(min_depth_m)
+    ex = None if exclude is None else np.ascontiguousarray(exclude, bool)
+
+    wet = np.isfinite(w)
+    n0 = int(wet.sum())
+    stats = {
+        "bridge_corner_added": 0.0,
+        "bridge_corner_refused": 0.0,
+        "bridge_raised_cells": 0.0,
+        "bridge_min_depth_m": float(min_depth_m),
+    }
+    if n0 == 0:
+        return w, stats
+
+    # -- CORNER. Both orientations; each writes into `w`/`wet` before the next
+    # is evaluated, which is deliberate: a corner added by the first pass is a
+    # legitimate connection for the second and re-adding it would be waste.
+    added = refused = 0
+    for dc in (1, -1):
+        sa, sb, se1, se2 = _diag_slices(h, wd, dc)
+        need = wet[sa] & wet[sb] & ~wet[se1] & ~wet[se2]
+        if not need.any():
+            continue
+        lvl = np.maximum(w[sa], w[sb])
+        g1, g2 = z[se1], z[se2]
+        take1 = g1 <= g2
+        g_e = np.where(take1, g1, g2)
+        ok = need & (g_e <= lvl - md)
+        if ex is not None:
+            # A corner inside a registered basin is not ours to wet.
+            ok &= ~np.where(take1, ex[se1], ex[se2])
+        refused += int((need & ~ok).sum())
+        for which, sl in ((take1, se1), (~take1, se2)):
+            m = ok & which
+            if not m.any():
+                continue
+            sub_w = w[sl].copy()
+            sub_wet = wet[sl].copy()
+            added += int((m & ~sub_wet).sum())
+            # HIGHER WINS where one corner serves two diagonals, and the
+            # `where` is not defensive: a dry cell holds NaN, and NaN
+            # propagates through np.maximum, so a plain max would erase the
+            # level it was just given. Taking the higher keeps the corner
+            # connected to BOTH pairs instead of to whichever was visited last.
+            sub_w[m] = np.maximum(
+                np.where(sub_wet[m], sub_w[m], np.float32(-np.inf)), lvl[m])
+            sub_wet[m] = True
+            w[sl] = sub_w
+            wet[sl] = sub_wet
+
+    # -- BRIDGE. Accumulate the required floor from the BEDS of face-adjacent
+    # wet cells, then take one max. Reading `z` and never `w` is what makes the
+    # single pass exact.
+    floor = np.full(w.shape, -np.inf, np.float32)
+    for dy, dx in ((1, 0), (0, 1)):
+        sa = (slice(0, h - dy), slice(0, wd - dx))
+        sb = (slice(dy, h), slice(dx, wd))
+        both = wet[sa] & wet[sb]
+        za, zb = z[sa], z[sb]
+        np.maximum(floor[sb],
+                   np.where(both & (za > zb), za + md, np.float32(-np.inf)),
+                   out=floor[sb])
+        np.maximum(floor[sa],
+                   np.where(both & (zb > za), zb + md, np.float32(-np.inf)),
+                   out=floor[sa])
+    lift = wet & (floor > w)
+    n_lift = int(lift.sum())
+    if n_lift:
+        amounts = (floor[lift] - w[lift]).astype(np.float64)
+        w[lift] = floor[lift]
+        for p in (50, 90, 99):
+            stats[f"bridge_raise_p{p}_m"] = float(np.percentile(amounts, p))
+        stats["bridge_raise_max_m"] = float(amounts.max())
+        stats["bridge_raise_mean_m"] = float(amounts.mean())
+
+    stats["bridge_corner_added"] = float(added)
+    stats["bridge_corner_refused"] = float(refused)
+    stats["bridge_raised_cells"] = float(n_lift)
+    stats["bridge_raised_frac"] = float(n_lift) / float(n0 + added)
+    stats["bridge_cells_before"] = float(n0)
+    stats["bridge_cells_after"] = float(n0 + added)
+    return w, stats
 
 
 # --------------------------------------------------------------------------- gates

@@ -2728,3 +2728,217 @@ def test_extent_mode_is_enumerated_and_a_typo_is_refused():
         dataclasses.replace(pipeline.CONSTANTS, water_extent_mode=mode)
     with pytest.raises(ValueError, match="water_extent_mode"):
         dataclasses.replace(pipeline.CONSTANTS, water_extent_mode="lateral-fill")
+
+
+# --------------------------------------------------------------------------
+# bake_ver 14 -- face contact. See water.bridge_to_face_contact.
+# --------------------------------------------------------------------------
+
+def _diagonal_reach(n=24, drop=0.3, depth=0.2):
+    """A one-pixel-wide reach running DIAGONALLY down a plane.
+
+    This is not a contrived fixture: it is what the shipped bv13 corridor does
+    on steep ground. The D8 path steps diagonally, the lateral fill adds nothing
+    because the bed rises within one pixel to either side, and the drawn water
+    is a chain of single pixels touching at their CORNERS.
+    """
+    r = np.arange(n, dtype=np.float32)[:, None]
+    c = np.arange(n, dtype=np.float32)[None, :]
+    z = np.ascontiguousarray(100.0 - (r + c) * drop, np.float32)
+    water = np.full((n, n), np.nan, np.float32)
+    d = np.arange(n)
+    water[d, d] = z[d, d] + depth
+    return z, water
+
+
+def test_face_contact_stats_sees_the_break_the_wet_mask_cannot(_real_kernels):
+    """THE MEASUREMENT THE OLD PROBES WERE MISSING, as one assertion.
+
+    A diagonal chain is ONE component to any mask labeller -- it is 8-connected
+    by construction. The client draws one flat slab per fine pixel and two
+    diagonal slabs share a corner, not a face, so what is actually drawn is `n`
+    separate objects with air between them. Both numbers come out of the same
+    call here so they cannot be quoted apart.
+    """
+    n = 24
+    z, water = _diagonal_reach(n)
+    st = pipeline._water.face_contact_stats(water, z)
+    assert st["contact_wet_cells"] == n
+    assert st["contact_plan8_components"] == 1.0, st
+    assert st["contact_face_components"] == float(n), st
+    assert st["contact_isolated_frac"] == 1.0, st
+    assert st["contact_shatter_ratio"] == float(n), st
+
+
+def test_face_contact_bridge_connects_a_diagonal_reach(_real_kernels):
+    """THE ACCEPTANCE CRITERION: adjacent wet cells along the flow share a FACE.
+
+    Asserted as a connectivity property of the output, not by eye and not as a
+    distribution moving in the right direction.
+    """
+    n = 24
+    z, water = _diagonal_reach(n)
+    out, stats = pipeline._water.bridge_to_face_contact(water, z, cell_m=1.875)
+    st = pipeline._water.face_contact_stats(out, z)
+    assert st["contact_face_broken"] == 0.0, st
+    assert st["contact_face_components"] == 1.0, st
+    assert st["contact_isolated_cells"] == 0.0, st
+    # It bought that with ONE cell per diagonal step and nothing else.
+    assert stats["bridge_corner_added"] == float(n - 1), stats
+    assert stats["bridge_corner_refused"] == 0.0, stats
+
+
+def test_face_contact_bridge_is_exactly_a_no_op_on_ponded_water(_real_kernels):
+    """THE CONSTRAINT THAT MAKES IT SAFE, and it is exact rather than tolerated.
+
+    A still pool is a set of cells that share one level and each stands below
+    it. Every wet neighbour's bed is therefore already under this cell's
+    surface, so the bridge's max() finds nothing to raise -- not "raises very
+    little", nothing, byte for byte. That is what lets the same rule run
+    everywhere without a slope threshold, and a threshold is what would put a
+    visible seam along the river.
+
+    The bed is TILTED under the pool so this cannot pass by both sides being
+    equal; the pool is what makes the surface level, not the ground.
+    """
+    n = 40
+    z = np.ascontiguousarray(
+        50.0 - np.arange(n, dtype=np.float32)[:, None] * 0.05
+        - np.arange(n, dtype=np.float32)[None, :] * 0.02, np.float32)
+    level = float(z.max()) + 0.5
+    water = np.full((n, n), np.nan, np.float32)
+    pool = np.zeros((n, n), bool)
+    pool[6:34, 6:34] = True
+    water[pool] = np.float32(level)
+    assert (level - z[pool] >= 0.1).all(), "premise: the whole pool is submerged"
+
+    out, stats = pipeline._water.bridge_to_face_contact(water, z, cell_m=1.875)
+    assert stats["bridge_raised_cells"] == 0.0, stats
+    assert stats["bridge_corner_added"] == 0.0, stats
+    np.testing.assert_array_equal(np.isfinite(out), np.isfinite(water))
+    np.testing.assert_array_equal(out[pool], water[pool])
+    # And the cross-section is still level to the float.
+    assert out[20, 6:34].max() == out[20, 6:34].min()
+
+
+def test_face_contact_bridge_never_lifts_water_above_water_already_beside_it(
+        _real_kernels):
+    """THE NON-FLOODING BOUND, which is what makes the raise safe to be unbounded.
+
+    A wet cell stands at least ``min_depth`` under its own surface, so raising a
+    neighbour to that cell's BED can never lift it above that cell's SURFACE.
+    Two consequences, both asserted:
+
+      * the maximum of the water surface over the whole plane does not move at
+        all -- not "moves a little", the same float;
+      * every raised cell has a cell it TOUCHES whose surface is at least as
+        high, so the raise is always anchored on water that was already drawn
+        beside it rather than invented.
+
+    Without that bound the rule would be a flood with a connectivity argument
+    attached, which is what ``fill_to_local_surface``'s own docstring records
+    happening once already on this branch.
+    """
+    rng = np.random.default_rng(11)
+    n = 48
+    z, water = _diagonal_reach(n, drop=0.9, depth=0.15)
+    z = np.ascontiguousarray(z + rng.normal(0.0, 0.05, (n, n)), np.float32)
+    d = np.arange(n)
+    water[d, d] = z[d, d] + 0.15
+    out, _ = pipeline._water.bridge_to_face_contact(water, z, cell_m=1.875)
+
+    assert np.nanmax(out) == np.nanmax(water)
+    nb = np.full((n, n), -np.inf, np.float32)
+    got = np.where(np.isfinite(out), out, np.float32(-np.inf))
+    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        sl_t = (slice(max(dy, 0), n + min(dy, 0)), slice(max(dx, 0), n + min(dx, 0)))
+        sl_s = (slice(max(-dy, 0), n + min(-dy, 0)), slice(max(-dx, 0), n + min(-dx, 0)))
+        np.maximum(nb[sl_t], got[sl_s], out=nb[sl_t])
+    lifted = np.isfinite(out) & np.isfinite(water) & (out > water)
+    assert lifted.any(), "premise: this fixture must actually exercise the raise"
+    assert (out[lifted] <= nb[lifted] + 1e-5).all(), (
+        float((out[lifted] - nb[lifted]).max()))
+
+
+def test_face_contact_bridge_keeps_the_surface_descending_downstream(_real_kernels):
+    """The one property this must not break, on the reach it most affects.
+
+    A straight steep reach: every cell's surface is raised to the bed of the
+    cell above it, so the surface becomes bed-parallel -- and a bed-parallel
+    surface on a descending bed still descends. Checked cell by cell rather than
+    resampled, which is stricter than the shipped 100 m / 250 m gate.
+    """
+    n = 64
+    cx = n // 2
+    down = 0.6                                       # a 0.32 gradient at 1.875 m
+    z, water = _valley(n, 0.5, incision=0.4, depth=0.25, down=down)
+    out, stats = pipeline._water.bridge_to_face_contact(water, z, cell_m=1.875)
+    assert stats["bridge_raised_cells"] > 0, stats
+    prof = out[:, cx]
+    assert np.isfinite(prof).all()
+    assert np.all(np.diff(prof) <= 1e-6), np.diff(prof).max()
+    # ... and the reach it raised is now continuous, which is the whole point.
+    st = pipeline._water.face_contact_stats(out, z)
+    assert st["contact_face_broken"] == 0.0, st
+
+
+def test_face_contact_bridge_treats_a_registered_basin_as_a_barrier(_real_kernels):
+    """A corner inside a registered basin is not this function's to wet.
+
+    The basin's surface is already on the wire in SECTION_BASIN_TABLE and the
+    client composes the two samplers, so writing a level here would be a second
+    copy of a shipped fact, free to disagree with the first -- the same reason
+    ``fill_to_local_surface`` refuses to fill through one.
+    """
+    n = 24
+    z, water = _diagonal_reach(n)
+    excl = np.zeros((n, n), bool)
+    d = np.arange(1, n)
+    excl[d, d - 1] = True                    # every lower corner of the chain
+    excl[d - 1, d] = True                    # and every upper one
+    out, stats = pipeline._water.bridge_to_face_contact(
+        water, z, cell_m=1.875, exclude=excl)
+    assert not np.isfinite(out[excl]).any(), "the bridge wrote inside a basin"
+    assert stats["bridge_corner_added"] == 0.0, stats
+    assert stats["bridge_corner_refused"] == float(n - 1), stats
+
+
+def test_face_contact_bridge_refuses_a_corner_that_stands_above_the_water(
+        _real_kernels):
+    """WHERE IT STOPS, and it stops rather than dragging the reach up to meet it.
+
+    A diagonal whose two corners are both a rise cannot be bridged without
+    putting water on that rise, and the bridge would then raise the whole reach
+    to the rise's own bed. It is refused and counted instead, which is the
+    residual the acceptance statistic legitimately still sees.
+    """
+    n = 12
+    z, water = _diagonal_reach(n, drop=0.3, depth=0.2)
+    d = np.arange(1, n)
+    z[d, d - 1] += 5.0
+    z[d - 1, d] += 5.0
+    out, stats = pipeline._water.bridge_to_face_contact(water, z, cell_m=1.875)
+    assert stats["bridge_corner_added"] == 0.0, stats
+    assert stats["bridge_corner_refused"] == float(n - 1), stats
+    np.testing.assert_array_equal(np.isfinite(out), np.isfinite(water))
+
+
+def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_off():
+    """bake_ver 13's plane must stay reproducible, and the switch must be visible.
+
+    A constant that claims to reproduce a previous bake has to be able to, and a
+    product constant that fed no identity would change written bytes under an
+    unchanged namespace -- which is the failure ``product_identity_payload``
+    exists to make impossible.
+    """
+    assert "water_face_contact_bridge" in BakeConstants.PRODUCT_FIELDS
+    on = pipeline.product_identity_payload(pipeline.CONSTANTS)
+    off = pipeline.product_identity_payload(
+        dataclasses.replace(pipeline.CONSTANTS, water_face_contact_bridge=False))
+    assert on != off
+    assert on["bake_version"] == 14
+
+    n = 24
+    z, water = _diagonal_reach(n)
+    st = pipeline._water.face_contact_stats(water, z)
+    assert st["contact_face_components"] == float(n)
