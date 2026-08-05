@@ -231,3 +231,15 @@ target_link_libraries(vxc_waterdatumprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_waterdatumprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_farwaterprobe: how many water BRICKS and QUADS are within 100 m /
+#     500 m / 1 km of a camera, if candidates are ENUMERATED from the baked
+#     water plane rather than SEARCHED for by a dense box sweep. Reproduces
+#     today's 25.6 m box in the same run so every number has its own baseline,
+#     and tables the same counts at coarser water LODs so "reads as voxels, not
+#     a flat plane" can be sized rather than guessed.
+add_executable(vxc_farwaterprobe farwaterprobe.cpp)
+target_link_libraries(vxc_farwaterprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_farwaterprobe PRIVATE -Wall -Wextra -Werror)
+endif()

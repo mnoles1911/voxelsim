@@ -32,6 +32,7 @@ add_executable(vxc_tests
   test_channel.cpp
   test_sealevel.cpp
   test_lakes.cpp
+  test_farwater.cpp
   test_riverribbon.cpp
   test_ocean.cpp
 )
