@@ -232,6 +232,27 @@ public:
 	// that must also respect placed voxels has to exclude edited bricks itself.
 	int64 GetSurfaceUpperBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const;
 
+	// The MIRROR of the above: a guaranteed LOWER bound on the amplified
+	// surface over the rectangle, so a caller can prove a brick is entirely
+	// BURIED as cheaply as it can prove one is entirely above ground.
+	//
+	// THE IMPLICIT-WATER SWEEP IS WHAT NEEDED IT. That sweep offers every brick
+	// from its box floor up to the flood level with no lower bound from the
+	// ground at all, so in shallow water most of what it offers is rock.
+	// Measured on the bv14 braided reach: 46,475 of 67,600 bricks offered at
+	// one camera (68.8%) are provably underground, and only 12.5% of what the
+	// drain managed to mesh emitted a single quad. That -- not the disc rebuild
+	// -- is what stopped the water disc finishing
+	// (docs/measurements/water-refresh-2026-08-05.txt).
+	//
+	// Same no-information convention as GetSurfaceUpperBoundMm: MIN_int64 means
+	// "declined". For a buried-rejection test that value admits everything,
+	// which is the safe direction -- an unbounded floor offers a brick that
+	// meshes to nothing, a wrong floor deletes real water.
+	//
+	// Pure worldgen: it does NOT see the edit overlay, same as its sibling.
+	int64 GetSurfaceLowerBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const;
+
 	// ONE amplifier column, both of the worldgen facts a water client needs
 	// about it: the amplified surface in absolute mm, and the CAVERN FLOOD
 	// LEVEL for that column (INT32_MIN = "no site in reach", the sentinel
