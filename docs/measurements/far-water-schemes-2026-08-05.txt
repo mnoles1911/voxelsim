@@ -1,0 +1,220 @@
+### SITE A -- WET COUNTRY, braided reach (bv13 tiles, 6 tiles)
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-4,-4) bakeVer=13 basins=yes(46) waterPlane=yes
+  tile (-4,-5) bakeVer=13 basins=yes(156) waterPlane=yes
+  tile (-5,-4) bakeVer=13 basins=yes(77) waterPlane=yes
+  tile (-5,-5) bakeVer=13 basins=yes(84) waterPlane=yes
+seed 20260719  tiles 4 loaded (0 refused, 2 out of reach)  pixel 1875 mm
+
+camera at world (-76080.0, -65520.0) m -> brick column (-95100, -81900)
+cascade base 32 m, 6 LOD levels, outer radius 1024 m
+screen: 1920 px wide at 90 deg HFOV -> 8.181e-04 rad/px
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns admitted wet 4225,  candidate bricks 71825
+  MESHED BRICKS 8409   QUADS 22539   0.26 MiB packed
+
+=== PER-RING, EVERY SCHEME OFF ONE FIELD (base 32 m) ===
+ring    voxel     from       to |  casc brk   casc qd  vanish | A cell qd  A col qd |      B qd    B inst |  wetcell  rimcell    rim%
+   0    0.10m       0m      32m |     10037     11350       0 |    321696      5024 |      5024         0 |   321696        0    0.0%
+   1    0.20m      32m      64m |      2989      9541       0 |    191522      2989 |      2989       451 |   191522      669    0.3%
+   2    0.40m      64m     128m |      2327      7671       0 |    149437      2327 |      2327       212 |   149437      404    0.3%
+   3    0.80m     128m     256m |      1029      2750       0 |     65252      1029 |      1029       641 |    65252     1114    1.7%
+   4    1.60m     256m     512m |       406      1039       0 |     26022       406 |       406       438 |    26022      812    3.1%
+   5    3.20m     512m    1024m |        92       390       0 |      5698        91 |        91       444 |     5698      773   13.6%
+
+=== WHAT THE CASCADE IS ACTUALLY DRAWING ===
+   dist   casc quads    top faces   side faces    top cells     side %
+   100m        24393         9313        15080       586432      61.8%
+   500m        32317        12047        20270       752768      62.7%
+  1000m        32741        12151        20590       759424      62.9%
+  'top cells' is what the top faces become if EmitWaterQuads splits every one
+  of them back to 1x1 -- the cascade's worst case, and scheme A's best case.
+
+=== SCHEME x DISTANCE ===
+scheme                          dist        quads    instances   MiB real  MiB @152B  reads as voxels?
+today: 25.6 m box                26m        22539            -       0.26       3.27  YES 0.10 m step, full voxel column
+ring cascade                    100m        24393            -       0.28       3.54  YES 3.8 px min vertical step across rings
+A: heightfield @cell            100m       587096            -      85.10      85.10  NO  a film has no vertical step
+A: heightfield @column          100m         9163            -       1.33       1.33  NO  a film has no vertical step
+B: surface + instanced rim      100m         9163          551       1.36       1.36  YES 3.8 px min vertical step across rings
+  [checks]                      100m  cascade vanished columns 0   wet cells 587096   rim cells 893 (0.2%)
+ring cascade                    500m        32317            -       0.37       4.68  YES 3.8 px min vertical step across rings
+A: heightfield @cell            500m       752997            -     109.15     109.15  NO  a film has no vertical step
+A: heightfield @column          500m        11762            -       1.71       1.71  NO  a film has no vertical step
+B: surface + instanced rim      500m        11762         1725       1.81       1.81  YES 3.8 px min vertical step across rings
+  [checks]                      500m  cascade vanished columns 0   wet cells 752997   rim cells 2971 (0.4%)
+ring cascade                   1000m        32741            -       0.37       4.75  YES 3.8 px min vertical step across rings
+A: heightfield @cell           1000m       759626            -     110.11     110.11  NO  a film has no vertical step
+A: heightfield @column         1000m        11866            -       1.72       1.72  NO  a film has no vertical step
+B: surface + instanced rim     1000m        11866         2186       1.85       1.85  YES 3.8 px min vertical step across rings
+  [checks]                     1000m  cascade vanished columns 0   wet cells 759626   rim cells 3771 (0.5%)
+
+=== SCALING AT A FIXED 0.80 m CELL ===
+(cell 0.80 m; grid 2505 x 2505)
+  radius    wet cells    rim cells     interior      rim %
+     50m        11364           85        11279       0.7%
+    100m        35462          250        35212       0.7%
+    150m        69623          547        69076       0.8%
+    200m        97683         1113        96570       1.1%
+    300m       138468         1740       136728       1.3%
+    400m       178989         2440       176549       1.4%
+    500m       220024         3235       216789       1.5%
+    700m       265426         4433       260993       1.7%
+    850m       299947         5907       294040       2.0%
+   1000m       315284         6934       308350       2.2%
+
+  EXPONENT  wet/interior area  R^1.07
+  EXPONENT  rim length         R^1.46
+  B's premise needs interior ~R^2 and rim ~R^1, i.e. a gap near 1.0.
+  MEASURED GAP: -0.39
+
+NOTE: quads are pre-split; EmitWaterQuads splits some again for the corner
+field, so every quad column is a floor and the ratios are what to read.
+
+### SITE B -- WET COUNTRY, lake reach (dry within 26 m today)
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-3,-4) bakeVer=13 basins=yes(83) waterPlane=yes
+  tile (-3,-5) bakeVer=13 basins=yes(106) waterPlane=yes
+  tile (-4,-4) bakeVer=13 basins=yes(46) waterPlane=yes
+  tile (-4,-5) bakeVer=13 basins=yes(156) waterPlane=yes
+seed 20260719  tiles 4 loaded (0 refused, 2 out of reach)  pixel 1875 mm
+
+camera at world (-33360.0, -67920.0) m -> brick column (-41700, -84900)
+cascade base 32 m, 6 LOD levels, outer radius 1024 m
+screen: 1920 px wide at 90 deg HFOV -> 8.181e-04 rad/px
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns admitted wet 0,  candidate bricks 0
+  MESHED BRICKS 0   QUADS 0   0.00 MiB packed
+
+=== PER-RING, EVERY SCHEME OFF ONE FIELD (base 32 m) ===
+ring    voxel     from       to |  casc brk   casc qd  vanish | A cell qd  A col qd |      B qd    B inst |  wetcell  rimcell    rim%
+   0    0.10m       0m      32m |         0         0       0 |         0         0 |         0         0 |        0        0    0.0%
+   1    0.20m      32m      64m |         0         0       0 |         0         0 |         0         0 |        0        0    0.0%
+   2    0.40m      64m     128m |       415      1765       0 |     24032       378 |       378       421 |    24032      693    2.9%
+   3    0.80m     128m     256m |       709      2920       0 |     40528       634 |       634      1127 |    40528     2182    5.4%
+   4    1.60m     256m     512m |       157       773       0 |      9355       145 |       145       730 |     9355     1566   16.7%
+   5    3.20m     512m    1024m |        72       405       0 |      5196        72 |        72       542 |     5196     1418   27.3%
+
+=== WHAT THE CASCADE IS ACTUALLY DRAWING ===
+   dist   casc quads    top faces   side faces    top cells     side %
+   100m          487           96          391         6144      80.3%
+   500m         5427         1175         4252        73728      78.3%
+  1000m         5844         1248         4596        78400      78.6%
+  'top cells' is what the top faces become if EmitWaterQuads splits every one
+  of them back to 1x1 -- the cascade's worst case, and scheme A's best case.
+
+=== SCHEME x DISTANCE ===
+scheme                          dist        quads    instances   MiB real  MiB @152B  reads as voxels?
+today: 25.6 m box                26m            0            -       0.00       0.00  YES 0.10 m step, full voxel column
+ring cascade                    100m          487            -       0.01       0.07  YES 3.8 px min vertical step across rings
+A: heightfield @cell            100m         6087            -       0.88       0.88  NO  a film has no vertical step
+A: heightfield @column          100m           96            -       0.01       0.01  NO  a film has no vertical step
+B: surface + instanced rim      100m           96          181       0.02       0.02  YES 3.8 px min vertical step across rings
+  [checks]                      100m  cascade vanished columns 0   wet cells 6087   rim cells 308 (5.1%)
+ring cascade                    500m         5427            -       0.06       0.79  YES 3.8 px min vertical step across rings
+A: heightfield @cell            500m        73574            -      10.67      10.67  NO  a film has no vertical step
+A: heightfield @column          500m         1152            -       0.17       0.17  NO  a film has no vertical step
+B: surface + instanced rim      500m         1152         2246       0.30       0.30  YES 3.8 px min vertical step across rings
+  [checks]                      500m  cascade vanished columns 0   wet cells 73574   rim cells 4382 (6.0%)
+ring cascade                   1000m         5844            -       0.07       0.85  YES 3.8 px min vertical step across rings
+A: heightfield @cell           1000m        78866            -      11.43      11.43  NO  a film has no vertical step
+A: heightfield @column         1000m         1225            -       0.18       0.18  NO  a film has no vertical step
+B: surface + instanced rim     1000m         1225         2788       0.35       0.35  YES 3.8 px min vertical step across rings
+  [checks]                     1000m  cascade vanished columns 0   wet cells 78866   rim cells 5792 (7.3%)
+
+=== SCALING AT A FIXED 0.80 m CELL ===
+(cell 0.80 m; grid 2505 x 2505)
+  radius    wet cells    rim cells     interior      rim %
+     50m            0            0            0       0.0%
+    100m         1531          145         1386       9.5%
+    150m        11798          562        11236       4.8%
+    200m        27936         1503        26433       5.4%
+    300m        54624         3213        51411       5.9%
+    400m        66569         4741        61828       7.1%
+    500m        82764         6147        76617       7.4%
+    700m       100022         8921        91101       8.9%
+    850m       128073        11425       116648       8.9%
+   1000m       163571        13785       149786       8.4%
+
+  EXPONENT  wet/interior area  R^1.70
+  EXPONENT  rim length         R^1.84
+  B's premise needs interior ~R^2 and rim ~R^1, i.e. a gap near 1.0.
+  MEASURED GAP: -0.14
+
+NOTE: quads are pre-split; EmitWaterQuads splits some again for the corner
+field, so every quad column is a floor and the ratios are what to read.
+
+### SITE C -- ARID CORRIDOR, 100%-wet block (bv14 tiles, 4 tiles)
+zstd: bound from 'C:/Program Files/Git/mingw64/bin/libzstd.dll'
+  tile (-11,-5) bakeVer=14 basins=yes(25) waterPlane=yes
+  tile (-11,-6) bakeVer=14 basins=yes(154) waterPlane=yes
+  tile (-12,-5) bakeVer=14 basins=yes(21) waterPlane=yes
+seed 20260719  tiles 3 loaded (0 refused, 1 out of reach)  pixel 1875 mm
+
+camera at world (-154800.0, -89040.0) m -> brick column (-193500, -111300)
+cascade base 32 m, 6 LOD levels, outer radius 1024 m
+screen: 1920 px wide at 90 deg HFOV -> 8.181e-04 rad/px
+
+=== TODAY: the 25.6 m box (65 x 65 x 33 bricks) ===
+  columns admitted wet 4225,  candidate bricks 71825
+  MESHED BRICKS 8450   QUADS 23549   0.27 MiB packed
+
+=== PER-RING, EVERY SCHEME OFF ONE FIELD (base 32 m) ===
+ring    voxel     from       to |  casc brk   casc qd  vanish | A cell qd  A col qd |      B qd    B inst |  wetcell  rimcell    rim%
+   0    0.10m       0m      32m |     10048     26708       0 |    321696      5024 |      5024         0 |   321696        0    0.0%
+   1    0.20m      32m      64m |      7520      7616       0 |    241244      3760 |      3760         0 |   241244        0    0.0%
+   2    0.40m      64m     128m |      3760      7568       0 |    241244      3760 |      3760         0 |   241244        0    0.0%
+   3    0.80m     128m     256m |      3768      7604       0 |    241244      3768 |      3768         0 |   241244        0    0.0%
+   4    1.60m     256m     512m |      3620      7451       0 |    232128      3620 |      3620       204 |   232128      316    0.1%
+   5    3.20m     512m    1024m |      2382      4947       0 |    152730      2382 |      2382       314 |   152730      652    0.4%
+
+=== WHAT THE CASCADE IS ACTUALLY DRAWING ===
+   dist   casc quads    top faces   side faces    top cells     side %
+   100m        37940        10592        27348       677888      72.1%
+   500m        56517        19751        36766      1264064      65.1%
+  1000m        61614        22189        39425      1420096      64.0%
+  'top cells' is what the top faces become if EmitWaterQuads splits every one
+  of them back to 1x1 -- the cascade's worst case, and scheme A's best case.
+
+=== SCHEME x DISTANCE ===
+scheme                          dist        quads    instances   MiB real  MiB @152B  reads as voxels?
+today: 25.6 m box                26m        23549            -       0.27       3.41  YES 0.10 m step, full voxel column
+ring cascade                    100m        37940            -       0.43       5.50  YES 3.8 px min vertical step across rings
+A: heightfield @cell            100m       678852            -      98.41      98.41  NO  a film has no vertical step
+A: heightfield @column          100m        10592            -       1.54       1.54  NO  a film has no vertical step
+B: surface + instanced rim      100m        10592            0       1.54       1.54  YES 3.8 px min vertical step across rings
+  [checks]                      100m  cascade vanished columns 0   wet cells 678852   rim cells 0 (0.0%)
+ring cascade                    500m        56517            -       0.65       8.19  YES 3.8 px min vertical step across rings
+A: heightfield @cell            500m      1265061            -     183.38     183.38  NO  a film has no vertical step
+A: heightfield @column          500m        19751            -       2.86       2.86  NO  a film has no vertical step
+B: surface + instanced rim      500m        19751          182       2.87       2.87  YES 3.8 px min vertical step across rings
+  [checks]                      500m  cascade vanished columns 0   wet cells 1265061   rim cells 283 (0.0%)
+ring cascade                   1000m        61614            -       0.71       8.93  YES 3.8 px min vertical step across rings
+A: heightfield @cell           1000m      1422538            -     206.21     206.21  NO  a film has no vertical step
+A: heightfield @column         1000m        22189            -       3.22       3.22  NO  a film has no vertical step
+B: surface + instanced rim     1000m        22189          518       3.25       3.25  YES 3.8 px min vertical step across rings
+  [checks]                     1000m  cascade vanished columns 0   wet cells 1422538   rim cells 941 (0.1%)
+
+=== SCALING AT A FIXED 0.80 m CELL ===
+(cell 0.80 m; grid 2505 x 2505)
+  radius    wet cells    rim cells     interior      rim %
+     50m        12256            0        12256       0.0%
+    100m        49080            0        49080       0.0%
+    150m       110396            0       110396       0.0%
+    200m       196364            0       196364       0.0%
+    300m       441788            0       441788       0.0%
+    400m       785456            0       785456       0.0%
+    500m      1200575          650      1199925       0.1%
+    700m      2076229         2023      2074206       0.1%
+    850m      2819182         3263      2815919       0.1%
+   1000m      3570988         4422      3566566       0.1%
+
+  EXPONENT  wet/interior area  R^1.91
+  EXPONENT  rim length         R^2.80
+  B's premise needs interior ~R^2 and rim ~R^1, i.e. a gap near 1.0.
+  MEASURED GAP: -0.89
+
+NOTE: quads are pre-split; EmitWaterQuads splits some again for the corner
+field, so every quad column is a floor and the ratios are what to read.
