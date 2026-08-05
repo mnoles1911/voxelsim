@@ -221,6 +221,18 @@ if(NOT MSVC)
   target_compile_options(vxc_sliceprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_waterrefreshprobe: what a FLIGHT costs the near-field water disc,
+# per SECOND of flight rather than per rebuild. Runs today's full-disc rebuild
+# and voxelcore/waterwindow.h's shift-and-fill over the same path on the same
+# real tiles, meshes with meshBrick<8> at the client's own 192/tick budget, and
+# checks every frame that the two hold an identical live brick set. The numeric
+# readout behind "is the full-disc rebuild actually the bottleneck". ---------
+add_executable(vxc_waterrefreshprobe waterrefreshprobe.cpp)
+target_link_libraries(vxc_waterrefreshprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_waterrefreshprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_waterdatumprobe: WHICH producer claims water at a world position,
 #     and at what height. The first fork of any "water is at the wrong height"
 #     diagnosis -- is the height in the DATA, or manufactured by the client?
@@ -230,4 +242,28 @@ add_executable(vxc_waterdatumprobe waterdatumprobe.cpp)
 target_link_libraries(vxc_waterdatumprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_waterdatumprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# --- vxc_farwaterprobe: how many water BRICKS and QUADS are within 100 m /
+#     500 m / 1 km of a camera, if candidates are ENUMERATED from the baked
+#     water plane rather than SEARCHED for by a dense box sweep. Reproduces
+#     today's 25.6 m box in the same run so every number has its own baseline,
+#     and tables the same counts at coarser water LODs so "reads as voxels, not
+#     a flat plane" can be sized rather than guessed.
+add_executable(vxc_farwaterprobe farwaterprobe.cpp)
+target_link_libraries(vxc_farwaterprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_farwaterprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# --- vxc_farwaterschemes: the ring cascade against the two proposed
+#     alternatives -- (A) a displaced heightfield strip, (B) that surface plus an
+#     instanced rim -- all four schemes counted off ONE shared water field so a
+#     difference between rows is a difference between SCHEMES. Also measures the
+#     scaling exponents of rim length and interior area at a fixed cell size,
+#     which is the test B's whole argument rests on.
+add_executable(vxc_farwaterschemes farwaterschemes.cpp)
+target_link_libraries(vxc_farwaterschemes PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_farwaterschemes PRIVATE -Wall -Wextra -Werror)
 endif()

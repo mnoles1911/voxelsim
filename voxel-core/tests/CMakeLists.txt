@@ -17,6 +17,7 @@ add_executable(vxc_tests
   test_tilerange.cpp
   test_counters.cpp
   test_waterca.cpp
+  test_waterwindow.cpp
   test_connectivity.cpp
   test_collapse.cpp
   test_rivernet.cpp
@@ -32,6 +33,7 @@ add_executable(vxc_tests
   test_channel.cpp
   test_sealevel.cpp
   test_lakes.cpp
+  test_farwater.cpp
   test_riverribbon.cpp
   test_ocean.cpp
 )

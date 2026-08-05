@@ -14511,6 +14511,22 @@ int64 UVoxelWorldSubsystem::GetSurfaceUpperBoundMm(int64 Vx0, int64 Vy0, int64 V
 	return Bound == vxc::kSurfaceBoundDeclined ? MIN_int64 : int64(Bound);
 }
 
+int64 UVoxelWorldSubsystem::GetSurfaceLowerBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const
+{
+	if (!Impl)
+	{
+		return MIN_int64;
+	}
+	// The amplifier's decline sentinel here is kSurfaceLowerBoundDeclined
+	// (INT64_MIN, amplifier.h:88), which is already MIN_int64 -- so unlike its
+	// sibling this needs no translation, and the header's one no-information
+	// value holds. Left explicit rather than returned bare, because the two
+	// sentinels being equal is a coincidence of representation and not a
+	// guarantee either header makes.
+	const int64_t Bound = Impl->Voxels.amplifier().surfaceLowerBoundMm(Vx0, Vy0, Vx1, Vy1);
+	return Bound == vxc::kSurfaceLowerBoundDeclined ? MIN_int64 : int64(Bound);
+}
+
 double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) const
 {
 	if (!Impl)
