@@ -232,6 +232,37 @@ public:
 	// that must also respect placed voxels has to exclude edited bricks itself.
 	int64 GetSurfaceUpperBoundMm(int64 Vx0, int64 Vy0, int64 Vx1, int64 Vy1) const;
 
+	// ONE amplifier column, both of the worldgen facts a water client needs
+	// about it: the amplified surface in absolute mm, and the CAVERN FLOOD
+	// LEVEL for that column (INT32_MIN = "no site in reach", the sentinel
+	// vxc::CavernColumn::floodZMm uses). Returns false, leaving the outputs at
+	// 0 / INT32_MIN, when there is no world yet.
+	//
+	// THIS EXISTS BECAUSE THE ALTERNATIVE COST A WEEK. UVoxelWaterSubsystem
+	// could not reach a cavern column here and so built a SECOND vxc::Amplifier
+	// over a SyntheticTileSampler -- which, on a baked run, is a different world
+	// from the one on screen. On 2026-08-04 that put its cavern flood levels at
+	// 606.166 m over ground the renderer draws at 77.6 m, and the near-field
+	// water sweep dutifully offered a 52 m disc of water 528 m up, following the
+	// camera. That file's own comment had predicted it and named this accessor
+	// as the fix ("a public column accessor on UVoxelWorldSubsystem, which its
+	// owner must add"); the lake half had already been moved onto
+	// GetSurfaceHeightUU for the same reason a day earlier.
+	//
+	// BOTH FROM ONE CALL, not two accessors, and that is the point rather than
+	// an optimisation: a caller that took the ground from here and the cavern
+	// from anywhere else could reintroduce exactly the defect this repairs.
+	//
+	// Plain int types so this UHT-parsed header stays voxel-core-free by the
+	// same doctrine GetSurfaceUpperBoundMm and SampleTerrainHeightUU follow --
+	// vxc::cavernWaterAt/cavernWaterCeilingMm take the flood LEVEL for this
+	// reason and callers hand it straight over.
+	//
+	// Game thread only, like GetSurfaceHeightUU, and for the same reason: it
+	// prefetches the fine-tile footprint before evaluating the column.
+	bool GetWorldgenSurfaceAndCavernFloodMm(int64 Vx, int64 Vy, int32& OutSurfaceMm,
+	                                        int32& OutCavernFloodZMm) const;
+
 	// Deterministic voxel DDA raycast (voxelcore/raycast.h) from StartUU along
 	// DirUU (need not be normalized -- normalized internally), out to
 	// MaxDistUU. Used by AVoxelEarthFlyPawn for the over-the-shoulder camera's

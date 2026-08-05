@@ -54,6 +54,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "voxelcore/caverns.h"
 #include "voxelcore/core.h"
 #include "voxelcore/tilestore.h"
 
@@ -768,6 +769,48 @@ constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm)
 // `columnCached(vx, vy).surfaceMm`); it is what excludes a cave under the
 // lakebed, and the mobilizer's own terrain half re-checks solidity per cell
 // anyway. `waterSurfaceMm` is kNoWaterMm for a dry column.
+// "This column can hold no implicit water at any height", for
+// `implicitWaterCeilingMm` below. NOT kNoWaterMm: a ceiling is an int64 because
+// it is compared against absolute voxel/brick millimetres, and reusing an int32
+// sentinel in an int64 comparison is exactly the shape of trap this file's
+// `waterSurfaceMm == kNoWaterMm` guards exist to avoid.
+inline constexpr int64_t kNoImplicitWaterMm = INT64_MIN;
+
+// THE NEAR-FIELD BRICK SWEEP'S PER-COLUMN CEILING (VoxelWaterSubsystem.cpp's
+// `RefreshImplicitWater`), as one function so the sweep and the tests cannot
+// express it differently -- the same reason `implicitWaterFill` lives here
+// rather than at the binding site.
+//
+// WHY THE SWEEP NEEDS ITS OWN RULE AT ALL. The sweep does not consult the
+// ImplicitFn; it re-derives the water ceiling per column and offers every brick
+// at or below it. So it can offer bricks the fill would decline (wasted work)
+// and, far worse, it decides what the fill is ever ASKED about -- a brick the
+// sweep never offers is water that silently does not exist. Both directions
+// have now cost a diagnosis each.
+//
+// THE TWO TERMS ARE NOT SYMMETRIC, and that asymmetry is the whole content of
+// this function. Cavern water is bounded ABOVE by the ground: it is underground
+// by construction (see `cavernWaterCeilingMm`). Lake, river and sea water is
+// bounded BELOW by it: the datum stands above the bed, so a datum above the
+// ground is the ordinary WET case and clamping it would empty every lake in the
+// world. One max(), two opposite relationships to the same number.
+//
+// THE OCEAN IS DELIBERATELY ABSENT, matching the sweep: an untouched sea is
+// already drawn by AVoxelOceanActor's plane, and offering it here would be tens
+// of thousands of candidates at every shoreline. See RefreshImplicitWater's own
+// comment for the two independent reasons.
+constexpr int64_t implicitWaterCeilingMm(int32_t cavernFloodZMm, int32_t bakedSurfaceMm,
+                                         int64_t groundMm) {
+    const int64_t cav = cavernWaterCeilingMm(cavernFloodZMm, groundMm);
+    const int64_t baked =
+        bakedSurfaceMm == kNoWaterMm ? kNoImplicitWaterMm : static_cast<int64_t>(bakedSurfaceMm);
+    return cav > baked ? cav : baked;
+}
+constexpr int64_t implicitWaterCeilingMm(const CavernColumn& cavern, int32_t bakedSurfaceMm,
+                                         int64_t groundMm) {
+    return implicitWaterCeilingMm(cavern.floodZMm, bakedSurfaceMm, groundMm);
+}
+
 constexpr uint8_t implicitWaterFill(int64_t vz, int32_t groundMm, int32_t waterSurfaceMm,
                                     bool cavernFlooded) {
     if (cavernFlooded) return 255;
