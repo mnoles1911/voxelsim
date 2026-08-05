@@ -12,6 +12,7 @@ endif()
 add_library(voxelcore STATIC
   src/amplifier.cpp
   src/tilestore.cpp
+  src/tilerange.cpp
   src/tilestreaming.cpp
   src/waterca.cpp
   src/rivernet.cpp

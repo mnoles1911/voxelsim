@@ -116,13 +116,37 @@
 //
 // SYNCHRONOUS LOADING, NOT ASYNC -- BY SCOPE, NOT OVERSIGHT. Today's only
 // transport is a local directory mirroring terrain-service's cache layout
-// (cache.py), read with vxc::readFileBytes on the calling thread, exactly
-// like MakeTileSampler's existing -VoxelTileDir path. A single fine tile is
-// ~22-28 MB compressed and decodes to ~128 MB, so a cold ring shift that has
-// to load several at once WILL block whatever thread calls
-// TickResidencyAndEviction for the duration of those reads and decodes.
-// Moving this to a background loader is future work -- see the .cpp's top
-// comment for what that would need.
+// (cache.py), read on the calling thread, exactly like MakeTileSampler's
+// existing -VoxelTileDir path. A single fine tile is ~22-28 MB compressed and
+// decodes to ~128 MB, so a cold ring shift that has to load several at once
+// WILL block whatever thread calls TickResidencyAndEviction for the duration
+// of those reads and decodes. Moving this to a background loader is future
+// work -- see the .cpp's top comment for what that would need.
+//
+// --- THE READ IS RANGED, THE DECODE IS NOT (task #52) -------------------
+//
+// EnsureTileResident_Locked no longer slurps the whole file. It seeks: the
+// preamble (header, section table, elevation index, water index, basin table --
+// four DISJOINT regions, not a prefix), then the elevation and water payload
+// blocks in coalesced ranges, all through vxc::FileRangeSource. The §6 FLOW
+// plane is never read at all, because nothing in this module decodes it.
+// Measured over the four shipped bv12 corridor tiles that is 179.4 MB -> 133.7
+// MB read and held, a 25% cut in a read that happens on the game thread.
+//
+// WHAT IS DELIBERATELY *NOT* DONE, because it is where the rest of the money is
+// and it is not a small change: residency is still per-TILE, and rule 1 above
+// still decodes every block of a tile at load. So a footprint that needs nine
+// 480 m blocks still costs the whole tile -- ~34 MB read and ~168 MB held --
+// where block-granular residency would cost ~400 KB read and ~1.6 MB held, a
+// further 100x on both. Retiring rule 1 means the funnel's residency test
+// (FVoxelFineTileSamplerProxy::elevationMm) has to become per-BLOCK
+// (vxc::FineTileSampler::blockDecoded exists for exactly that), the LRU has to
+// evict blocks rather than tiles, and the ring prefetch has to mean something
+// other than "the whole tile". The voxel-core half of that is built and tested
+// (voxelcore/tilerange.h, vxc_sliceprobe); this file is what has not been
+// converted, and doing it blind -- no CI job builds ue-project -- on the one
+// path standing between this feature and a silent desync is not a trade worth
+// making in the same change as the read.
 
 #include "CoreMinimal.h" // FString/uint64/int64 -- see VoxelCoords.h for the same self-containment reasoning
 #include "Misc/ScopeRWLock.h"

@@ -151,22 +151,98 @@ nothing at all.
   four 30-50 MB tiles: 206 throughout, bytes identical to the file-read path.
 * `pytest` 568 passed / 2 skipped (546/2 before).
 
-## 6. What is NOT built
+## 6. The client half (added the same day)
 
-**The C++ client still reads whole files.** `vxc::FineTileSampler::loadTile`
-takes a complete tile and `decode`s all three planes eagerly; there is no
-partial `FineTile`. Wiring the client to this needs, in order:
+Items 1 and 2 below are now built and tested; item 3 turned out not to be the
+point.
 
-1. a `FineTile` that can hold a *subset* of blocks and answer
-   `kBlockNotResident` rather than 0 for the rest -- 0 is sea level, and
-   `tilestreaming.h` is explicit that a sea-level fallback on the fine tier is a
-   different world, not a degraded one;
-2. `FineTileSampler` to consult `dilatedBlockCoverage` (which already exists,
-   and already computes exactly the block set used for the measurement above)
-   before answering a query, and to block rather than substitute;
-3. an HTTP transport in the UE host. There is none today -- the streamer builds
-   a local path and reads it. Until that exists, the file-read path is where
-   slicing pays, and it needs only items 1 and 2.
+**There is no network fetch of fine tiles in the shipping client, and there is
+no plan for one to appear soon.** Tiles arrive as files in a directory. So the
+saving this buys today is *not* transfer, and quoting the 100-700x of §4 as a
+bandwidth number would be quoting a saving the game cannot take. What it buys
+is **bytes read from disk** -- a file supports ranges natively, so `seek` +
+`read` needs no server, no protocol and no change to delivery -- and **peak
+memory**, which is the larger of the two.
+
+Built:
+
+* **`FineTileBytes`** (`voxelcore/tilestore.h`) -- a sparse, file-offset-addressed
+  byte store. `FineTileBytes::whole()` is the pre-existing shape, so every
+  whole-file caller is byte-for-byte unchanged; a sliced client holds the
+  preamble plus whatever blocks it fetched. `span()` returns **nullptr** for
+  bytes that were not fetched. It does not return zeroes and it does not return
+  a short buffer, which is what forces every caller to have a not-resident
+  branch.
+* **`FineTile::parsePartial`**, `elevBlockResident` / `flowBlockResident` /
+  `waterBlockResident`, and `FineError::kBlockNotResident`. A CONSTANT block is
+  resident with zero bytes fetched -- it owns none. An unfetched block's decoder
+  **leaves the caller's buffer untouched** and returns false; there is a test
+  that fills it with a sentinel and asserts the sentinel survives, because
+  "returns false" and "does not write sea level into your buffer" are different
+  guarantees and only the second one is safe.
+* **`flowIndexResident()` / `waterIndexResident()` / `basinsResident()`** -- the
+  third state that partial tiles introduced. `hasBasins()` false means "baked
+  before the registry existed"; `hasBasins() && basins().empty()` means
+  "surveyed, no lakes"; and now `hasBasins() && !basinsResident()` means "we do
+  not know". `lakes.h` consults it and routes the third case to the same
+  `unresolvedBasins` counter the others use, i.e. water **missing and counted**
+  rather than water absent and believed.
+* **`voxelcore/tilerange.h`** -- `planBlockRanges` (offset-ordered, coalescing,
+  CONSTANT-dropping), `readFineTilePreamble` (the four disjoint regions),
+  `fetchFineTileBlocks`, and a `RangeSource` interface with `FileRangeSource`
+  and `BytesRangeSource`. Deliberately **no HTTP client**: voxel-core has zero
+  third-party dependencies and links into a UE binary, so the transport is
+  injected exactly as the zstd decompressor is. The interface is the
+  HTTP-readiness; when a fetch exists, it implements `RangeSource` and
+  everything above it already works.
+* **`vxc_sliceprobe`** -- the C++ measurement, and an independent check on §4:
+  it issues byte-identical requests to the Python fetcher (`ground-1blk`
+  284,036-414,121 B in 4 requests, matching §4's table exactly) and verifies
+  every fetched block against a whole-file decode.
+
+Measured over the four bv12 corridor tiles, per tile, with `--verify`:
+
+| working set | req | disk bytes | held = file + decoded |
+|---|---|---|---|
+| whole file (today) | 1 | 32.1-51.6 MB | **166-186 MB** = 32-52 + 134 |
+| `streamer-load` (what the streamer now does) | 5 | 25.9-39.0 MB | 160-173 MB = 26-39 + 134 |
+| `ground-1blk` 9 blocks, dilated | 4 | 284-414 KB | **1.45-1.58 MB** = 0.27-0.40 + 1.18 |
+| `water-only` every wet block + basins | 4 | 106-236 KB | — |
+
+**Peak memory is dominated by DECODE, not by the read** -- 134 MB of int16
+lattice against a 32-52 MB file, 72% of the total. That is the single most
+important number here, because it means slicing the fetch alone moves the
+smaller half. The two are separate changes and
+`FineTileSampler::residentFileBytes()` / `decodedBlockBytes()` report them
+apart so nobody has to guess which one a change moved.
+
+## 7. What is still not built
+
+**The UE streamer's residency is still per-TILE.** `EnsureTileResident_Locked`
+now reads in ranges and skips the flow plane entirely (nothing in `ue-project`
+decodes flow; `FLOW_DATA` is 12.6 MB of a 51.6 MB tile), which takes the four
+tiles from 179.4 MB to 133.7 MB read and held -- 25%. But **rule 1** (the
+header's threading note: a tile is fully decoded at load, which is what makes
+the worker-facing query path a pure read under a shared lock) still forces every
+elevation block to be fetched and decoded.
+
+Retiring rule 1 is where the remaining 100x is, and it is a bigger change than
+it looks:
+
+* `FVoxelFineTileSamplerProxy::elevationMm`'s residency test must become
+  per-BLOCK. `vxc::FineTileSampler::blockDecoded()` exists for exactly this and
+  is a pure const lookup, so the shared lock survives -- but this is the funnel
+  that ~100 unguarded consumers pass through, and it is the one line standing
+  between the fine tier and a silent desync.
+* `IsFootprintResident` / `RequestFootprint` must walk blocks, not tiles.
+* the LRU must evict blocks rather than tiles, and "prefetch the ring" must come
+  to mean something other than "fetch whole tiles".
+
+It is not done here for a reason worth writing down: **no CI job builds
+`ue-project`** (`.github/workflows/ci.yml` builds voxel-core only, on three
+compilers), and the editor was unavailable. Making that change blind, on the
+desync gate, in the same commit as the read change, is not a trade worth taking.
+The voxel-core half it needs is built and tested.
 
 **Server-side, a range still reads the whole file into memory.** `TileCache.get`
 is `path.read_bytes()`, so a 183-byte range costs a 32 MB read on the server.
