@@ -58,6 +58,25 @@ public:
 	// because there the table row and the quads are genuinely different uploads.
 	void SetChunkQuads(TArray<FVoxelChunkQuad>&& InQuads, TArray<uint32>&& InCornerHeights, float InActivity);
 
+	// THE CASCADE LEVEL. A far-field water brick is still 8x8x8 cells; the cells
+	// are (10 cm << Level) instead of 10 cm, so LOD 5 draws a 25.6 m brick from
+	// exactly the meshBrick<8> output a 0.8 m brick produces.
+	//
+	// THE HEADER COMMENT ABOVE USED TO SAY THIS COULD NOT HAPPEN -- "v0 active
+	// water only ever renders at the true-voxel scale ... never mip-leveled".
+	// That was true while water stopped at 25.6 m. The distance cascade
+	// (voxelcore/farwater.h) is what makes it false, and the scale is the ONLY
+	// part of terrain's ring machinery that comes with it: there is no
+	// cross-fade and no ApplyRingFadeParams here, because ring boundaries are
+	// hidden by the coarse column's MEAN datum (see FarWaterAccumulator) rather
+	// than by blending two levels of the same surface.
+	//
+	// Mirrors UVoxelChunkComponent::SetLevel exactly, including the fact that
+	// CalcBounds has to scale with it or a coarse brick is frustum-culled
+	// against a footprint 32x too small.
+	void SetLevel(int32 InLevel);
+	int32 GetLevel() const { return ChunkLevel; }
+
 	//~ Begin UPrimitiveComponent Interface
 	virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
@@ -92,6 +111,10 @@ private:
 	// obvious candidate) inherits a real 1/255 quantisation here that the pooled
 	// path does not have, and the two would then differ by up to half a step.
 	uint8 ChunkActivity = 0;
+
+	// 0 = the near field, which is every brick the CA owns and every brick
+	// inside the cascade's first ring. See SetLevel.
+	int32 ChunkLevel = 0;
 
 	// vxc::WaterBrick8::kEdge (8), duplicated as a plain int32 rather than
 	// pulling in a voxel-core header (doctrine: this UHT-parsed header stays

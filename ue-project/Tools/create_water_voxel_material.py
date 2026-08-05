@@ -768,8 +768,9 @@ def main():
     #
     # A cell at fill f drops its top boundary by (1 - f) * one voxel: a full
     # cell does not move, an almost-empty one sits almost on the floor.
-    # 10.0 is VoxelCoords::VoxelSizeUU -- 10 unreal units per 10 cm voxel, the
-    # same constant VoxelQuadDecode.ush quotes as VOXEL_SIZE_UU.
+    # The drop is ONE CELL, and how big a cell is is now a PARAMETER rather
+    # than the literal 10.0 this graph carried until the distance cascade
+    # landed. See `cell_size_uu` below.
     one_minus_fill = mel.create_material_expression(material, unreal.MaterialExpressionOneMinus, -500, 200)
     if not mel.connect_material_expressions(vertex_color, "R", one_minus_fill, ""):
         raise RuntimeError("connect vertex_color.R -> one_minus_fill failed")
@@ -780,10 +781,46 @@ def main():
     if not mel.connect_material_expressions(vertex_color, "B", drop_amount, "B"):
         raise RuntimeError("connect vertex_color.B -> drop_amount.B failed")
 
-    # (0, 0, -VoxelSizeUU): straight down, one voxel at full drop. Multiplying
-    # a float3 by the scalar above broadcasts, so this stays one node.
-    down_one_voxel = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -200, 380)
-    down_one_voxel.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, -10.0, 1.0))
+    # (0, 0, -1) * VoxelSizeUU: straight down, ONE CELL at full drop.
+    #
+    # THIS WAS A LITERAL -10.0 AND THAT IS WHY THE FAR-FIELD CASCADE STOPPED.
+    # The drop has to be one CELL, and past the first ring a cell is not 10 cm.
+    # World Position Offset is in WORLD units, so scaling the component does
+    # nothing to it: a LOD 5 brick draws 3.2 m cells and would still drop their
+    # tops by 10 cm, leaving the partially-filled surface cell of every coarse
+    # column standing up to 3.1 m proud of where its corner heights say it is.
+    # That is a visible step at EVERY ring boundary -- the exact artefact the
+    # coarse column's MEAN datum (voxelcore/farwater.h, FarWaterAccumulator)
+    # exists to prevent, reintroduced one layer further down the pipe.
+    #
+    # A SCALAR PARAMETER, to be driven by ONE MID PER LEVEL rather than one per
+    # brick: there are six levels and thousands of bricks, so the per-brick cost
+    # of this is nil. The consumer is not written yet -- see
+    # docs/far-voxel-water-plan.md 4.1, which names this parameter as the
+    # blocker it is -- and until it exists NOTHING sets it.
+    #
+    # THE DEFAULT IS WHAT MAKES THAT SAFE. 10.0 is VoxelCoords::VoxelSizeUU, the
+    # literal this node replaces, so every current consumer -- the sheet actor,
+    # the ribbon actor, the CA path, the near-field implicit path, all of which
+    # bind the base material with no MID at all -- draws exactly what it drew
+    # before this parameter existed, bit for bit.
+    #
+    # The ripple branch below is deliberately NOT scaled by this: it is a
+    # +/-1.5 UU surface bob, a property of water rather than of the lattice it
+    # is sampled on, and multiplying it up to +/-48 UU at LOD 5 would make the
+    # far field visibly boil.
+    cell_size_uu = mel.create_material_expression(material, unreal.MaterialExpressionScalarParameter, -420, 380)
+    cell_size_uu.set_editor_property("parameter_name", "VoxelSizeUU")
+    cell_size_uu.set_editor_property("default_value", 10.0)
+
+    down_axis = mel.create_material_expression(material, unreal.MaterialExpressionConstant3Vector, -420, 460)
+    down_axis.set_editor_property("constant", unreal.LinearColor(0.0, 0.0, -1.0, 1.0))
+
+    down_one_voxel = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, 380)
+    if not mel.connect_material_expressions(down_axis, "", down_one_voxel, "A"):
+        raise RuntimeError("connect down_axis -> down_one_voxel.A failed")
+    if not mel.connect_material_expressions(cell_size_uu, "", down_one_voxel, "B"):
+        raise RuntimeError("connect cell_size_uu -> down_one_voxel.B failed")
 
     world_position_offset = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -50, 300)
     if not mel.connect_material_expressions(down_one_voxel, "", world_position_offset, "A"):

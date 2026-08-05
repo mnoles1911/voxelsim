@@ -40,7 +40,12 @@ public:
 	{
 		static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
 
-		constexpr float VoxelSizeUU = float(VoxelCoords::VoxelSizeUU);
+		// THE CASCADE SCALE, and it is the only thing a far-field brick does
+		// differently. Quads stay in brick-local CELL units (0..8 on each axis)
+		// at every level -- meshBrick<8> does not know what level it ran at --
+		// so this is the one place the level turns into world units, exactly as
+		// FVoxelChunkSceneProxy's `LevelVoxelSizeUU` is for terrain.
+		const float VoxelSizeUU = float(VoxelCoords::VoxelSizeUU) * float(1 << Component->ChunkLevel);
 
 		const int32 NumQuads = Component->ChunkQuads.Num();
 		// SetChunkQuads check()s this, so a mismatch is a caller bug and not a
@@ -465,9 +470,27 @@ FPrimitiveSceneProxy* UWaterChunkComponent::CreateSceneProxy()
 	return new FWaterChunkSceneProxy(this);
 }
 
+void UWaterChunkComponent::SetLevel(int32 InLevel)
+{
+	if (ChunkLevel == InLevel)
+	{
+		return;
+	}
+	ChunkLevel = InLevel;
+	// Both, and neither is optional. The proxy bakes the scale into its vertex
+	// positions, so it has to be rebuilt; the bounds are computed from the level
+	// too, and a stale bound on a coarse brick culls geometry that is on screen.
+	MarkRenderStateDirty();
+	UpdateBounds();
+}
+
 FBoxSphereBounds UWaterChunkComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
-	const float Extent = float(kBrickEdgeVoxels) * float(VoxelCoords::VoxelSizeUU);
+	// Scaled by the level for the same reason UVoxelChunkComponent::CalcBounds
+	// is: a LOD 5 brick is 25.6 m on a side, and bounding it as 0.8 m makes the
+	// renderer cull the far half of the cascade the moment its centre leaves the
+	// frustum.
+	const float Extent = float(kBrickEdgeVoxels) * float(VoxelCoords::VoxelSizeUU) * float(1 << ChunkLevel);
 	const FBox LocalBox(FVector::ZeroVector, FVector(Extent, Extent, Extent));
 	return FBoxSphereBounds(LocalBox).TransformBy(LocalToWorld);
 }
