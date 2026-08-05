@@ -41,6 +41,7 @@
 #include "voxelcore/riverribbon.h"
 #include "voxelcore/tiles.h"
 #include "voxelcore/waterca.h"
+#include "voxelcore/waterwindow.h"
 
 #include "Components/SceneComponent.h"
 #include "Engine/World.h"
@@ -836,6 +837,40 @@ struct FVoxelWaterImpl
 	// stationary camera costs nothing. Set once the first refresh has run.
 	VoxelCoords::FVoxelCoord LastImplicitCenterBrick = {0, 0, 0};
 	bool bImplicitCenterValid = false;
+
+	// The brick box the implicit sweep last covered. Held alongside the centre
+	// (which GetImplicitWaterDiscUU and the drain's distance sort still want)
+	// because the SWEEP is now a difference against this rather than a rebuild
+	// from the centre. See voxelcore/waterwindow.h for why that is an identity
+	// and not an approximation, and
+	// docs/measurements/water-refresh-2026-08-05.txt for what it costs.
+	vxc::WaterWindow LastImplicitWindow;
+
+	// Per-COLUMN sweep results, keyed by brick column, for the columns the
+	// window currently covers.
+	//
+	// THIS CACHE IS THE SAVING, not the region maths. The expensive half of the
+	// sweep is one datum resolve plus one amplified-ground bound per column; the
+	// vertical loop over it is nearly free. A camera step that changes only
+	// altitude enters a whole new brick layer while entering ZERO new columns,
+	// and finds every one of them already here.
+	struct FImplicitColumn
+	{
+		int32 CavernZMm = INT32_MIN;
+		int32 LakeZMm = vxc::kNoWaterMm;
+		int64 FloodBrickZ = 0;
+		int64 GroundUpperMm = MIN_int64;
+		int64 GroundFloorMm = MIN_int64;
+		bool bCanSkipInterior = false;
+		bool bAdmitted = false;
+	};
+	TMap<FIntPoint, FImplicitColumn> ImplicitColumns;
+
+	// Counters for ONE window step, so the log line can say what the step cost
+	// rather than what the box contains.
+	int32 ImplicitColumnsSwept = 0;
+	int32 ImplicitBricksEvicted = 0;
+	int32 ImplicitBricksBuriedSkipped = 0;
 
 	// The far-field river ribbon window currently being filled, or null. Held
 	// here rather than on AVoxelRiverRibbonActor because vxc::RiverWetWindow is
@@ -3036,247 +3071,340 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		int32(vxc::floorDiv(CamVx, vxc::WaterBrick8::kEdge)), int32(vxc::floorDiv(CamVy, vxc::WaterBrick8::kEdge)),
 		int32(vxc::floorDiv(CamVz, vxc::WaterBrick8::kEdge))};
 
-	if (!Impl.bImplicitCenterValid || Center != Impl.LastImplicitCenterBrick)
+	// THE WINDOW, not the centre, is what the sweep is keyed on now.
+	//
+	// The candidate predicate below does not mention the camera -- a column is
+	// wet or it is not, a brick is under its flood level or it is not, a brick
+	// is proven-interior or it is not. The camera contributes only the BOX that
+	// clips that predicate. So a camera step does not invalidate the candidate
+	// set; it only moves the box, and the bricks in the overlap are provably
+	// unchanged and already meshed.
+	//
+	// That is why this is a DIFFERENCE and not a rebuild, and why the result is
+	// bit-identical to the rebuild it replaces rather than an approximation of
+	// it. voxelcore/waterwindow.h carries the argument in full and
+	// voxel-core/tests/test_waterwindow.cpp pins it;
+	// docs/measurements/water-refresh-2026-08-05.txt is what it is worth.
+	const vxc::WaterWindow NewWindow =
+		vxc::waterWindowAt(Center.X, Center.Y, Center.Z, kImplicitRadiusBricks, kImplicitRadiusBricksZ);
+
+	if (!Impl.bImplicitCenterValid || NewWindow != Impl.LastImplicitWindow)
 	{
+		const vxc::WaterWindow OldWindow =
+			Impl.bImplicitCenterValid ? Impl.LastImplicitWindow : vxc::WaterWindow{};
 		Impl.LastImplicitCenterBrick = Center;
+		Impl.LastImplicitWindow = NewWindow;
 		Impl.bImplicitCenterValid = true;
-		Impl.PendingImplicitBricks.Reset();
 		// Zeroed HERE, not in the counter block below: the sweep that follows
-		// is what increments it.
+		// is what increments them.
 		Impl.ImplicitBricksSkippedInterior = 0;
+		Impl.ImplicitColumnsSwept = 0;
+		Impl.ImplicitBricksEvicted = 0;
+		Impl.ImplicitBricksBuriedSkipped = 0;
 
-		// Cheap reject, one column query per brick COLUMN rather than 512 per
-		// brick: the flood level is a per-site constant across its whole reach
-		// disc, so a column that is dry has no flooded brick anywhere in its
-		// stack and the entire vertical run is skipped.
-		for (int32 By = Center.Y - kImplicitRadiusBricks; By <= Center.Y + kImplicitRadiusBricks; ++By)
+		// ------------------------------------------------------------------
+		// 1. EVICT what left the window.
+		//
+		// THIS IS ALSO A LEAK FIX. Before the window existed, a rebuild simply
+		// Reset() the pending list and re-swept the new box; a brick that had
+		// left the box was never revisited, so its UWaterChunkComponent was
+		// never destroyed. Nothing anywhere pruned by distance. Flying
+		// therefore accumulated implicit water components without bound --
+		// every 0.8 m step left a one-brick-wide shell of them behind the
+		// camera, all still registered and still drawing.
+		// ------------------------------------------------------------------
 		{
-			for (int32 Bx = Center.X - kImplicitRadiusBricks; Bx <= Center.X + kImplicitRadiusBricks; ++Bx)
+			vxc::WaterWindow Gone[vxc::kWaterWindowMaxRegions];
+			const int NumGone = vxc::waterWindowDifference(OldWindow, NewWindow, Gone);
+			for (int R = 0; R < NumGone; ++R)
 			{
-				const int64 Vx = int64(Bx) * vxc::WaterBrick8::kEdge;
-				const int64 Vy = int64(By) * vxc::WaterBrick8::kEdge;
-				// THE CEILING IS THE HIGHER OF THE TWO IMPLICIT WATER SOURCES,
-				// and it used to be only the first.
-				//
-				// This filter read `cavern.floodZMm` alone, so a column with no
-				// CAVERN was skipped outright -- and a baked surface lake lives
-				// in exactly such a column. The ImplicitFn below would have
-				// filled it correctly; it was simply never asked, because the
-				// candidate sweep never offered the brick. The watershed plan
-				// SS5.2 asserts the opposite ("RefreshImplicitWater ... will
-				// pick up lake cells the moment the ImplicitFn includes them"),
-				// and that is wrong: this loop does not consult the ImplicitFn,
-				// it re-derives the ceiling itself. Measured before the fix, at
-				// a lake with 19.6 m of water standing over the camera's own
-				// column: "0 candidate brick(s)".
-				//
-				// So the ceiling is now max(cavern flood, lake datum). Both are
-				// "water fills open air below this level in this column", which
-				// is the same shape by construction (voxelcore/lakes.h), so
-				// this is one max() and not a second code path.
-				//
-				// THE OCEAN IS DELIBERATELY *NOT* A THIRD CEILING HERE, and
-				// that is §6.4's own "gives the sea real voxels only where
-				// touched" rather than an omission (work item 8). The implicit
-				// field DOES report the sea -- that is what makes a breach
-				// mobilize -- but an UNTOUCHED sea must not be offered to this
-				// sweep, for two independent reasons:
-				//
-				//   1. IT IS ALREADY DRAWN. AVoxelOceanActor's 40 km plane sits
-				//      on the same datum (§6.4 keeps it for the far field). A
-				//      voxel surface meshed under it would be a SECOND
-				//      coplanar translucent surface, which is the exact defect
-				//      measured this month where the near-field disc and the
-				//      far-field sheet lined up in geometry and disagreed in
-				//      tone (+44.5 vs +76.8 blueness) because one is a single
-				//      surface and the other a shell the view ray crosses
-				//      twice.
-				//   2. IT IS EVERY BRICK. A camera at the shore has seabed
-				//      under most of the 65 x 65 x 33 brick disc; offering it
-				//      would be tens of thousands of candidates where the
-				//      lake interior-skip below is measured saving 89%.
-				//
-				// A MOBILIZED sea brick is unaffected by this: mobilization
-				// hands it to the CA, and the CA's own component map meshes it.
-				// So the sea gets voxels exactly where a player has been, which
-				// is what the sentence in the plan says.
-				//
-				// FROM THE TERRAIN'S OWN AMPLIFIER, and this line is the whole
-				// of the 2026-08-04 floating-disc defect. It read
-				// `Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm` -- this file's
-				// private Amplifier over a SyntheticTileSampler, i.e. a
-				// DIFFERENT WORLD on any baked run. At the owner's camera that
-				// world's ground is 638.451 m against the 77.6 m on screen, so
-				// its cavern flood levels reached 606.166 m, the ceiling below
-				// came out above the candidate box's floor at 605.6 m, and the
-				// sweep offered one brick in each of 511 columns: a flat slab of
-				// water 528 m in the air, carried along with the camera.
-				// "511 candidate brick(s)" is verbatim what the log said.
-				const int32 CavernZMm = Impl.CavernFloodMmAt(Vx, Vy);
-				const int32 LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
-				if (CavernZMm == INT32_MIN && LakeZMm == vxc::kNoWaterMm)
+				const vxc::WaterWindow& G = Gone[R];
+				for (int64 By = G.y0; By <= G.y1; ++By)
 				{
-					continue; // dry column: no cavern below it and no lake on it
-				}
-
-				// THE PADDED FOOTPRINT'S GROUND BOUND, now for EVERY admitted
-				// column rather than only the lake-only ones below. It bounds
-				// the cavern term from above (`vxc::implicitWaterCeilingMm`) as
-				// well as proving a lake's interior, and both need the same
-				// number over the same footprint.
-				const int64 Px0 = Vx - 1, Py0 = Vy - 1;
-				const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
-				const int64 GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
-				// MIN_int64 is the accessor's "no information" -- never a low
-				// bound (its own header says so). MAX_int64 is what "do not
-				// bound the cavern term" reads as in the ceiling below, i.e.
-				// exactly the behaviour this line had before the ground bound
-				// existed. Failing OPEN here, not closed: an unbounded ceiling
-				// offers a brick that meshes to nothing, a wrong bound deletes
-				// a lake.
-				const int64 GroundCeilMm = GroundUpperMm == MIN_int64 ? MAX_int64 : GroundUpperMm;
-
-				// max(cavern flood bounded by the ground, baked datum), as ONE
-				// function in voxel-core so this sweep and
-				// tests/test_lakes.cpp's regression cannot express it
-				// differently. Only bricks whose bottom sits below it can hold
-				// any water at all.
-				const int64 FloodZMm = vxc::implicitWaterCeilingMm(CavernZMm, LakeZMm, GroundCeilMm);
-				if (FloodZMm == vxc::kNoImplicitWaterMm)
-				{
-					continue; // a cavern in reach, but none of its water is in this column
-				}
-				const int64 FloodBrickZ = vxc::floorDiv(FloodZMm / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
-
-				// THE INTERIOR OF A LAKE IS NOT A CANDIDATE, and skipping it is
-				// what makes a lake affordable rather than merely correct.
-				//
-				// A brick whose whole padded neighbourhood is full water emits
-				// NO faces -- that is the property this file already relies on
-				// to keep a large lake cheap ("interior bricks emit no faces --
-				// which is exactly what keeps a large lake affordable"). But it
-				// was still OFFERED, meshed, and discovered empty at full price.
-				// Measured at the 19.6 m lake on tile (-12,-5): 38,025
-				// candidates of which 33,800 -- 89% -- were interior bricks that
-				// produced nothing, 4,225 real surface bricks underneath them.
-				// The drain took 199 ticks, so EVERY capture and every walked
-				// step landed mid-rebuild and photographed a partial sheet.
-				//
-				// The two brackets below are PROOFS, not margins, which is the
-				// only kind of skip allowed here: an over-eager one punches a
-				// hole in a water surface, and that is the exact bug this whole
-				// change is repairing.
-				//
-				//   ceiling  UVoxelWorldSubsystem::GetSurfaceUpperBoundMm is a
-				//            provable upper bound on the amplified ground over
-				//            the brick's PADDED footprint, so every voxel whose
-				//            bottom is at or above it is worldgen air. One call
-				//            per brick COLUMN (it does not depend on Bz) and
-				//            cheaper than one amplifier column.
-				//   floor    the datum, sampled at the four corners of that same
-				//            padded footprint. The footprint is 10 voxels = 1.0 m
-				//            and a fine tile pixel is 1.875 m, so the footprint
-				//            touches at most 2x2 pixels and the four corners hit
-				//            every one of them -- this is exhaustive over the
-				//            pixels, not a sample of them. All four must agree
-				//            and be wet; a shoreline anywhere in the footprint
-				//            makes them disagree and the brick stays a candidate.
-				//
-				// CAVERN COLUMNS ARE EXCLUDED FROM THIS SKIP, still. The bracket
-				// proves a brick is UNIFORM 255 -- open air below a single flat
-				// datum -- and a cavern column's water is bounded by rock and
-				// room walls, not by one datum, so "above the surface bound"
-				// says nothing about whether its brick has faces in it. (The
-				// ceiling above now DOES bound cavern water by the ground; that
-				// is a different question, and it is why this paragraph no
-				// longer claims caverns ignore the ground entirely.)
-				//
-				// EDITED BRICKS: the bound is pure worldgen and does not see the
-				// overlay, but an edit inside the water funnels through
-				// NotifyTerrainVoxelsCleared -> mobilizeEditRegion, which hands
-				// the brick to the CA and takes it out of the implicit path
-				// altogether (implicitFillAt returns 0 for a mobilized brick).
-				// So a brick this skip can reach is one no edit has touched.
-				const bool bLakeOnlyColumn = (CavernZMm == INT32_MIN) && (LakeZMm != vxc::kNoWaterMm);
-				bool bDatumUniform = false;
-				if (bLakeOnlyColumn)
-				{
-					// GroundUpperMm over this same padded footprint is already
-					// in hand from the ceiling above -- it used to be fetched
-					// here, for lake-only columns only.
-					bDatumUniform = Impl.Water->waterSurfaceMmAtVoxel(Px0, Py0) == LakeZMm &&
-					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py0) == LakeZMm &&
-					                Impl.Water->waterSurfaceMmAtVoxel(Px0, Py1) == LakeZMm &&
-					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py1) == LakeZMm;
-				}
-				const bool bCanSkipInterior = bLakeOnlyColumn && bDatumUniform && GroundUpperMm != MIN_int64;
-
-				for (int32 Bz = Center.Z - kImplicitRadiusBricksZ; Bz <= Center.Z + kImplicitRadiusBricksZ; ++Bz)
-				{
-					if (bCanSkipInterior)
+					for (int64 Bx = G.x0; Bx <= G.x1; ++Bx)
 					{
-						// The padded z span this brick's mesh actually reads:
-						// voxel bottoms from (Bz*8 - 1) to (Bz*8 + 8), inclusive.
-						const int64 PadBottomMm = (int64(Bz) * vxc::WaterBrick8::kEdge - 1) * vxc::kVoxelSizeMm;
-						const int64 PadTopMm = (int64(Bz) * vxc::WaterBrick8::kEdge + vxc::WaterBrick8::kEdge) *
-						                       vxc::kVoxelSizeMm;
-						// Every padded cell is above the ground (so open air),
-						// AND every padded cell's bottom is a full voxel below
-						// the datum (so fill 255, no partial top). Uniform 255
-						// over the whole pad: no face anywhere in the brick.
-						if (PadBottomMm >= GroundUpperMm && PadTopMm + vxc::kVoxelSizeMm <= int64(LakeZMm))
+						for (int64 Bz = G.z0; Bz <= G.z1; ++Bz)
 						{
-							++Impl.ImplicitBricksSkippedInterior;
-							continue;
+							const VoxelCoords::FVoxelCoord C{int32(Bx), int32(By), int32(Bz)};
+							if (TObjectPtr<UWaterChunkComponent>* Existing = Impl.ImplicitChunkComponents.Find(C))
+							{
+								if (*Existing)
+								{
+									(*Existing)->DestroyComponent();
+								}
+								Impl.ImplicitChunkComponents.Remove(C);
+								++Impl.ImplicitBricksEvicted;
+							}
+							ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, C);
 						}
 					}
-					if (int64(Bz) > FloodBrickZ)
+				}
+			}
+			// Columns that left the FOOTPRINT stop being cached. A step that
+			// only changes altitude leaves the footprint alone and drops none,
+			// which is the point: it then sweeps zero columns.
+			vxc::WaterWindow GoneCols[vxc::kWaterWindowMaxColumnRegions];
+			const int NumGoneCols = vxc::waterWindowColumnDifference(OldWindow, NewWindow, GoneCols);
+			for (int R = 0; R < NumGoneCols; ++R)
+			{
+				const vxc::WaterWindow& G = GoneCols[R];
+				for (int64 By = G.y0; By <= G.y1; ++By)
+				{
+					for (int64 Bx = G.x0; Bx <= G.x1; ++Bx)
 					{
-						continue;
+						Impl.ImplicitColumns.Remove(FIntPoint(int32(Bx), int32(By)));
 					}
-					Impl.PendingImplicitBricks.Add(VoxelCoords::FVoxelCoord{Bx, By, Bz});
 				}
 			}
 		}
 
-		// Farthest first, because the drain below Pop()s from the BACK: the
-		// water actually in front of the camera has to mesh in the first few
-		// ticks, not after the whole 25 m disc has been walked.
-		UE_LOG(LogVoxelWater, Log,
-		       TEXT("RefreshImplicitWater: rebuilt at brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- %d candidate brick(s), ")
-		       TEXT("%d proven-interior brick(s) skipped"),
-		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.PendingImplicitBricks.Num(),
-		       Impl.ImplicitBricksSkippedInterior);
+		// ------------------------------------------------------------------
+		// 2. The per-COLUMN sweep, unchanged in what it computes.
+		//
+		// Cheap reject, one column query per brick COLUMN rather than 512 per
+		// brick: the flood level is a per-site constant across its whole reach
+		// disc, so a column that is dry has no flooded brick anywhere in its
+		// stack and the entire vertical run is skipped.
+		// ------------------------------------------------------------------
+		auto EvaluateColumn = [&Impl](int32 Bx, int32 By) -> FVoxelWaterImpl::FImplicitColumn
+		{
+			FVoxelWaterImpl::FImplicitColumn Col;
+			const int64 Vx = int64(Bx) * vxc::WaterBrick8::kEdge;
+			const int64 Vy = int64(By) * vxc::WaterBrick8::kEdge;
+
+			// THE CEILING IS THE HIGHER OF THE TWO IMPLICIT WATER SOURCES, and
+			// it used to be only the first. This filter read `cavern.floodZMm`
+			// alone, so a column with no CAVERN was skipped outright -- and a
+			// baked surface lake lives in exactly such a column. Measured
+			// before the fix, at a lake with 19.6 m of water standing over the
+			// camera's own column: "0 candidate brick(s)".
+			//
+			// THE OCEAN IS DELIBERATELY *NOT* A THIRD CEILING HERE (work item
+			// 8): it is already drawn by AVoxelOceanActor's 40 km plane, and it
+			// would be every brick in the box. A MOBILIZED sea brick is
+			// unaffected -- the CA's own component map meshes it.
+			//
+			// FROM THE TERRAIN'S OWN AMPLIFIER: this line is the whole of the
+			// 2026-08-04 floating-disc defect. It read `Impl.Amp.columnCached`,
+			// this file's private Amplifier over a SyntheticTileSampler, i.e. a
+			// DIFFERENT WORLD on any baked run -- which put a flat slab of
+			// water 528 m in the air, carried along with the camera.
+			Col.CavernZMm = Impl.CavernFloodMmAt(Vx, Vy);
+			Col.LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
+			if (Col.CavernZMm == INT32_MIN && Col.LakeZMm == vxc::kNoWaterMm)
+			{
+				return Col; // dry column: no cavern below it and no lake on it
+			}
+
+			// THE PADDED FOOTPRINT'S GROUND BOUND. It bounds the cavern term
+			// from above (`vxc::implicitWaterCeilingMm`) as well as proving a
+			// lake's interior, and both need the same number over the same
+			// footprint.
+			const int64 Px0 = Vx - 1, Py0 = Vy - 1;
+			const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
+			Col.GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
+			// MIN_int64 is the accessor's "no information" -- never a low
+			// bound. MAX_int64 is what "do not bound the cavern term" reads as
+			// below. Failing OPEN here, not closed: an unbounded ceiling offers
+			// a brick that meshes to nothing, a wrong bound deletes a lake.
+			const int64 GroundCeilMm = Col.GroundUpperMm == MIN_int64 ? MAX_int64 : Col.GroundUpperMm;
+
+			const int64 FloodZMm = vxc::implicitWaterCeilingMm(Col.CavernZMm, Col.LakeZMm, GroundCeilMm);
+			if (FloodZMm == vxc::kNoImplicitWaterMm)
+			{
+				return Col; // a cavern in reach, but none of its water is in this column
+			}
+			Col.FloodBrickZ = vxc::floorDiv(FloodZMm / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
+			Col.bAdmitted = true;
+
+			// THE FLOOR, which this sweep has never had, and which the
+			// measurement says is the binding cost rather than the rebuild.
+			//
+			// The vertical run starts at the BOX FLOOR with no lower bound from
+			// the ground at all, so in shallow water most of what it offers is
+			// buried rock. Measured on the bv14 braided reach: of 67,600 bricks
+			// offered at one camera, 46,475 (68.8%) are provably underground,
+			// and only 12.5% of what the drain actually meshed emitted a single
+			// quad. The disc could not finish building because seven eighths of
+			// its budget went on rock.
+			//
+			// `surfaceLowerBoundMm` is the exact mirror of the ceiling above --
+			// a GUARANTEED lower bound on the amplified ground over the same
+			// padded footprint -- so a brick whose padded TOP is at or below it
+			// has every padded cell inside rock, fill 0 everywhere, and
+			// therefore no face anywhere. That is a PROOF, the only kind of
+			// skip allowed here, and it is checked rather than argued:
+			// vxc_waterrefreshprobe meshes every brick this rejects and fails
+			// on a single non-empty one.
+			//
+			// CAVERN COLUMNS ARE EXCLUDED. A cavern's water is bounded by rock
+			// and room walls, not by the surface, so "below the ground" says
+			// nothing about whether its brick has faces -- the whole point of a
+			// cavern lake is that it is under the ground.
+			//
+			// Declining to bound fails OPEN (MIN_int64 rejects nothing), the
+			// same direction the ceiling term fails.
+			const bool bLakeOnlyColumn = (Col.CavernZMm == INT32_MIN) && (Col.LakeZMm != vxc::kNoWaterMm);
+			if (bLakeOnlyColumn)
+			{
+				Col.GroundFloorMm = Impl.Terrain.GetSurfaceLowerBoundMm(Px0, Py0, Px1, Py1);
+			}
+
+			// THE INTERIOR OF A LAKE IS NOT A CANDIDATE, and skipping it is
+			// what makes a lake affordable rather than merely correct. A brick
+			// whose whole padded neighbourhood is full water emits NO faces.
+			// Measured at the 19.6 m lake on tile (-12,-5): 38,025 candidates
+			// of which 33,800 -- 89% -- were interior bricks that produced
+			// nothing.
+			//
+			// The datum floor is sampled at the four corners of the padded
+			// footprint. The footprint is 10 voxels = 1.0 m and a fine tile
+			// pixel is 1.875 m, so it touches at most 2x2 pixels and the four
+			// corners hit every one of them -- exhaustive over the pixels, not
+			// a sample of them. All four must agree and be wet; a shoreline
+			// anywhere in the footprint makes them disagree and the brick stays
+			// a candidate.
+			//
+			// EDITED BRICKS: the bound is pure worldgen and does not see the
+			// overlay, but an edit inside the water funnels through
+			// NotifyTerrainVoxelsCleared -> mobilizeEditRegion, which hands the
+			// brick to the CA and takes it out of the implicit path altogether.
+			bool bDatumUniform = false;
+			if (bLakeOnlyColumn)
+			{
+				bDatumUniform = Impl.Water->waterSurfaceMmAtVoxel(Px0, Py0) == Col.LakeZMm &&
+				                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py0) == Col.LakeZMm &&
+				                Impl.Water->waterSurfaceMmAtVoxel(Px0, Py1) == Col.LakeZMm &&
+				                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py1) == Col.LakeZMm;
+			}
+			Col.bCanSkipInterior = bLakeOnlyColumn && bDatumUniform && Col.GroundUpperMm != MIN_int64;
+			return Col;
+		};
+
+		// ------------------------------------------------------------------
+		// 3. SWEEP only what entered.
+		// ------------------------------------------------------------------
+		const int32 PendingBefore = Impl.PendingImplicitBricks.Num();
+		vxc::WaterWindow Fresh[vxc::kWaterWindowMaxRegions];
+		const int NumFresh = vxc::waterWindowDifference(NewWindow, OldWindow, Fresh);
+		for (int R = 0; R < NumFresh; ++R)
+		{
+			const vxc::WaterWindow& G = Fresh[R];
+			for (int64 By64 = G.y0; By64 <= G.y1; ++By64)
+			{
+				for (int64 Bx64 = G.x0; Bx64 <= G.x1; ++Bx64)
+				{
+					const int32 Bx = int32(Bx64), By = int32(By64);
+					const FIntPoint ColKey(Bx, By);
+					FVoxelWaterImpl::FImplicitColumn* Col = Impl.ImplicitColumns.Find(ColKey);
+					if (!Col)
+					{
+						Col = &Impl.ImplicitColumns.Add(ColKey, EvaluateColumn(Bx, By));
+						++Impl.ImplicitColumnsSwept;
+					}
+					if (!Col->bAdmitted)
+					{
+						continue;
+					}
+					for (int64 Bz64 = G.z0; Bz64 <= G.z1; ++Bz64)
+					{
+						const int32 Bz = int32(Bz64);
+						// The padded z span this brick's mesh actually reads:
+						// voxel bottoms from (Bz*8 - 1) to (Bz*8 + 8).
+						const int64 PadBottomMm = (int64(Bz) * vxc::WaterBrick8::kEdge - 1) * vxc::kVoxelSizeMm;
+						const int64 PadTopMm =
+							(int64(Bz) * vxc::WaterBrick8::kEdge + vxc::WaterBrick8::kEdge) * vxc::kVoxelSizeMm;
+						if (Col->bCanSkipInterior)
+						{
+							// Every padded cell above the ground (open air) AND
+							// every padded cell's bottom a full voxel below the
+							// datum (fill 255, no partial top): uniform 255 over
+							// the whole pad, so no face anywhere in the brick.
+							if (PadBottomMm >= Col->GroundUpperMm &&
+							    PadTopMm + vxc::kVoxelSizeMm <= int64(Col->LakeZMm))
+							{
+								++Impl.ImplicitBricksSkippedInterior;
+								continue;
+							}
+						}
+						if (Col->GroundFloorMm != MIN_int64 && PadTopMm <= Col->GroundFloorMm)
+						{
+							++Impl.ImplicitBricksBuriedSkipped;
+							continue;
+						}
+						if (int64(Bz) > Col->FloodBrickZ)
+						{
+							continue;
+						}
+						Impl.PendingImplicitBricks.Add(VoxelCoords::FVoxelCoord{Bx, By, Bz});
+					}
+				}
+			}
+		}
+
+		// Verbose, not Log: a window step happens up to ~37 times a second at
+		// flight speed. The old per-REBUILD line was already firing that often
+		// and was tolerable only because a rebuild was rare enough to be
+		// interesting; a step is not. The judgeable moment -- "the disc is
+		// complete" -- is the DRAINED line below, and that stays at Log.
+		UE_LOG(LogVoxelWater, Verbose,
+		       TEXT("RefreshImplicitWater: window step to brick (%d,%d,%d) [cam (%.0f,%.0f,%.0f) UU] -- ")
+		       TEXT("%d column(s) swept, %d brick(s) added, %d evicted, %d proven-interior, %d proven-buried; ")
+		       TEXT("%d pending"),
+		       Center.X, Center.Y, Center.Z, CameraUU.X, CameraUU.Y, CameraUU.Z, Impl.ImplicitColumnsSwept,
+		       Impl.PendingImplicitBricks.Num() - PendingBefore, Impl.ImplicitBricksEvicted,
+		       Impl.ImplicitBricksSkippedInterior, Impl.ImplicitBricksBuriedSkipped,
+		       Impl.PendingImplicitBricks.Num());
 
 		// DRAIN ACCOUNTING, and it exists because the absence of it cost a
 		// whole diagnosis. A baked lake rendered as scattered bricks, and the
-		// candidate count above -- the only number this function reported --
-		// looked healthy (42,250) in exactly the run where the sheet was
-		// broken, because the defect was that the list never DRAINED. The
-		// counters below say how far it got and what it cost, so "the lake is
-		// patchy" is answerable from the log instead of from a screenshot.
+		// candidate count -- the only number this function reported -- looked
+		// healthy (42,250) in exactly the run where the sheet was broken,
+		// because the defect was that the list never DRAINED.
 		//
 		// NOTE FOR CAPTURES: tools/voxel-capture.ps1's settle check reads the
-		// TERRAIN streaming counters (jobsInFlight/pendingJobs/unloaded) and
-		// knows nothing about this queue. A frame can be fully terrain-settled
-		// with the water disc still half-built, which is precisely what a
-		// "settled" lake capture looked like before this line existed.
+		// TERRAIN streaming counters and knows nothing about this queue. A
+		// frame can be fully terrain-settled with the water disc still
+		// half-built.
+		//
+		// The serial no longer advances per REBUILD, because there is no
+		// rebuild -- it advances per window step, and the drain counters
+		// accumulate across steps rather than resetting. Resetting them here
+		// would report the last 0.8 m step's cost as the whole disc's.
 		Impl.ImplicitRefreshSerial++;
 		Impl.ImplicitCandidatesAtRebuild = Impl.PendingImplicitBricks.Num();
-		Impl.ImplicitDrainTicks = 0;
-		Impl.ImplicitDrainMs = 0.0;
-		Impl.ImplicitBricksMeshed = 0;
-		Impl.ImplicitBricksEmpty = 0;
-		Impl.bImplicitDrainReported = false;
-		Impl.PendingImplicitBricks.Sort(
-			[Center](const VoxelCoords::FVoxelCoord& A, const VoxelCoords::FVoxelCoord& B)
-			{
-				const int64 Da = int64(A.X - Center.X) * (A.X - Center.X) + int64(A.Y - Center.Y) * (A.Y - Center.Y) +
-				                 int64(A.Z - Center.Z) * (A.Z - Center.Z);
-				const int64 Db = int64(B.X - Center.X) * (B.X - Center.X) + int64(B.Y - Center.Y) * (B.Y - Center.Y) +
-				                 int64(B.Z - Center.Z) * (B.Z - Center.Z);
-				return Da > Db;
-			});
+		// Armed only when the queue goes from EMPTY to non-empty, i.e. once per
+		// drain EPISODE. Re-arming it on every window step would fire the
+		// DRAINED line ~13 times a second while flying, since an incremental
+		// step's handful of bricks drains inside one tick -- turning the one
+		// line that says "the disc is complete, this frame can be judged" into
+		// the noisiest thing in the log.
+		if (PendingBefore == 0 && Impl.PendingImplicitBricks.Num() > 0)
+		{
+			Impl.bImplicitDrainReported = false;
+		}
+
+		// Farthest first WITHIN THE NEW BATCH, because the drain below Pop()s
+		// from the BACK. Only the newly added range is sorted: the rest of the
+		// queue is already ordered and re-sorting it every 0.8 m step would put
+		// back an O(n log n) per-step cost of exactly the kind this change
+		// removes.
+		if (Impl.PendingImplicitBricks.Num() > PendingBefore)
+		{
+			VoxelCoords::FVoxelCoord* Begin = Impl.PendingImplicitBricks.GetData() + PendingBefore;
+			VoxelCoords::FVoxelCoord* End = Impl.PendingImplicitBricks.GetData() + Impl.PendingImplicitBricks.Num();
+			std::sort(Begin, End,
+			          [Center](const VoxelCoords::FVoxelCoord& A, const VoxelCoords::FVoxelCoord& B)
+			          {
+				          const int64 Da = int64(A.X - Center.X) * (A.X - Center.X) +
+				                           int64(A.Y - Center.Y) * (A.Y - Center.Y) +
+				                           int64(A.Z - Center.Z) * (A.Z - Center.Z);
+				          const int64 Db = int64(B.X - Center.X) * (B.X - Center.X) +
+				                           int64(B.Y - Center.Y) * (B.Y - Center.Y) +
+				                           int64(B.Z - Center.Z) * (B.Z - Center.Z);
+				          return Da > Db;
+			          });
+		}
 	}
 
 	int32 MeshesThisTick = 0;
@@ -3285,6 +3413,20 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 	while (Impl.PendingImplicitBricks.Num() > 0 && MeshesThisTick < kMaxImplicitMeshesPerTick)
 	{
 		const VoxelCoords::FVoxelCoord BrickCoord = Impl.PendingImplicitBricks.Pop(EAllowShrinking::No);
+		// A QUEUED BRICK CAN OUTLIVE THE WINDOW THAT QUEUED IT, and meshing it
+		// would put water back outside the disc after the eviction pass above
+		// had just destroyed its component.
+		//
+		// The queue is no longer Reset() on a camera step -- that reset is the
+		// thing this change removes -- so entries survive across steps and a
+		// slow drain can still be holding bricks the camera has since left
+		// behind. Testing containment at POP is what keeps the queue consistent
+		// without an O(n) filter on every step: the check is three comparisons
+		// and the work it skips is a whole mesh.
+		if (!Impl.LastImplicitWindow.contains(BrickCoord.X, BrickCoord.Y, BrickCoord.Z))
+		{
+			continue;
+		}
 		const vxc::BrickKey Key = ToBrickKey(BrickCoord);
 		const int64_t Ox = int64_t(Key.x) * vxc::WaterBrick8::kEdge;
 		const int64_t Oy = int64_t(Key.y) * vxc::WaterBrick8::kEdge;
