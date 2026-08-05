@@ -540,10 +540,27 @@ constexpr uint32_t kDetailOctaveCount = sizeof(kDetailOctaves) / sizeof(kDetailO
 constexpr Octave kFineDetailOctaves[] = {
     // --- SHAPING band: slope- and curvature-gated, vanishes on flats.
     // One octave, not two: 3.2 m is the first wavelength the 1.875 m raster
-    // cannot resolve. PROVISIONAL amplitude -- 500 mm at 1.6 m continued down a
-    // lambda^0.8 ramp gives 500 * 2^0.8 ~= 870, rounded to 900. The plan requires
-    // this be set by probe measurement against the fine tier's measured S2, and
-    // that measurement does not exist yet. Do not tune it by eye.
+    // cannot resolve.
+    //
+    // AMPLITUDE IS STILL PROVISIONAL, BUT NOT FOR THE REASON THIS COMMENT USED
+    // TO GIVE. It used to derive 900 mm (500 mm at 1.6 m continued down a
+    // lambda^0.8 ramp) and say the calibrating measurement "does not exist
+    // yet". Both halves were wrong by 2026-08-05: the shipped value is 100, not
+    // 900 -- v18 lowered it for an unrelated rib-length reason -- and
+    // `vxc_terrainprobe --calibrate --fine-dir` HAS been run, three times on
+    // 2026-08-01 (docs/measurements/geomorphon-v21-2026-08-01.txt Section 8).
+    //
+    // It is open because the probe gave three different answers on three sites
+    // INSIDE ONE TILE: amp_3200 = 488 (flat), 1253 (mid), 332 (steep) -- a 3.8x
+    // spread that is not noise (r^2 above 0.96, residuals 7.5-8.3%). The steep
+    // site solved H_used = 1.025, outside the fBm range, so it cannot simply be
+    // averaged in. The recorded verdict was "the measurement is possible and its
+    // answer is NOT YET", and no number was proposed.
+    //
+    // Closing this needs three things that still do not exist: a defined
+    // calibration-site corpus, a rule for combining sites, and a re-run of v18's
+    // rib-length measurement. Until then: do not tune it by eye, and do not
+    // "fix" it by averaging the three rows above. Task #3.
     {3200, 100},
     // --- MICRORELIEF band: floored, because decimetre roughness is a property
     // of the material and not of the gradient. Unchanged from the coarse table:

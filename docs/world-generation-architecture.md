@@ -393,8 +393,22 @@ no latitude bands, no Hadley cell, no seasons. And the patch refuses to claim
 which compass direction the dry side faces, because two coordinate swaps sit
 between it and the rendered world; it claims only that the effect is
 *consistent*. Finally, the acceptance criterion the plan wrote was "deserts
-**visibly** downwind of ranges", and **no screenshot backs that up** — the
-statistical case is strong and the visual confirmation is missing.
+**visibly** downwind of ranges", and no screenshot backs that up.
+
+**CLOSED 2026-08-05 on the statistics.** The owner was shown that the visual
+confirmation was missing and accepted the statistical case instead: *"i accept
+statistics for 3"*. So the −0.734 correlation, the 0.493-vs-1.393 multiplier
+split, and 34.7% → 40.4% of land under 400 mm/yr are the acceptance record for
+this feature. This is the owner's call and it is recorded here so nobody
+re-opens it as an outstanding gap.
+
+Note what that does and does not settle: it settles that the rain shadow is
+**real and consistent**, which is what the statistics measure. It does not
+settle which compass direction the dry side faces in the rendered world — two
+coordinate swaps still sit between the patch and the screen, and only a
+screenshot could ever resolve that. If a player ever reports the dry side
+being on the wrong side of a range, this is the first thing to check, and the
+statistics above will not have been wrong.
 
 ### 6.3 The savanna gate asked for a contradiction
 
@@ -974,8 +988,10 @@ Win10/11 SDK, plus the `UE_BUILD_RUNNER` variable. Reference box cost:
 * **World identity is not reproducible** — see `world-identity-not-reproducible-2026-08-03.txt`
   and `etopo-build-not-reproducible-2026-08-02.txt`. A mass-baked world cannot be
   extended later without this.
-* **The "deserts visibly downwind of ranges" acceptance criterion has no
-  screenshot** (§6.2).
+* ~~The "deserts visibly downwind of ranges" acceptance criterion has no
+  screenshot~~ — **closed 2026-08-05**, accepted on the statistics by the owner
+  (§6.2). The residual is which compass direction the dry side faces, which
+  statistics cannot answer.
 
 ---
 

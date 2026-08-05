@@ -233,6 +233,31 @@ namespace vxc {
 // WIRE FORMAT UNCHANGED. All four climate bytes were already carried and
 // blended; only which byte classifyBiome reads moved. Tiles do not need
 // regenerating and provider_id does not roll for this.
+//
+// --- v23: CAP THE SUM OF THE TWO DETAIL POOLS, NOT EACH ONE SEPARATELY ------
+//
+// Everything above this line describes v22 (the savanna gate). v23 is a
+// different change in a different file and is recorded here because the
+// constant below is the only place a reader looks.
+//
+// The bake ships a heightfield that drains BY CONTRACT -- zero interior sinks
+// -- and the client's detail band was putting the pits back. Measured on an
+// alpine carrier: 0 interior sinks -> 1625, 0.0% stranded -> 87.9%, mean flow
+// path 224 m -> 29 m.
+//
+// The cause was the SPLIT, not the multiplier. v19 divided the detail band into
+// a routing pool and a micro pool, capped each against the carrier gradient
+// SEPARATELY, and then summed them -- so the TOTAL could reach 2.2x the carrier
+// gradient while each pool was individually "compliant". That defeats the
+// guarantee task #21 exists for: detail must never be able to reverse the
+// carrier's downhill. v23 caps the sum.
+//
+// The obvious move -- tightening the micro multiplier -- was the WRONG fix, and
+// task #47 had attributed the regression to exactly that. See commit 0609be1.
+//
+// STILL OPEN after v23 (tasks #47/#48): the 11-window paired corpus was never
+// re-run, and v23 has never been judged for visible terracing, which its own
+// commit message demands.
 inline constexpr uint32_t kWorldGenVersion = 23;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
