@@ -1,0 +1,384 @@
+THE RIVER FILLS THE VALLEY: EXTENT FROM THE TERRAIN, NOT FROM A FORMULA
+seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6)
+bake_ver 12 -> 13, TERRAIN_VERSION 8 unchanged
+2026-08-04
+================================================================================
+
+WHAT WAS WRONG, in the owner's words after flying it:
+
+    "the river water is only being placed over a narrow path rather than
+    actually flooding and filling in the terrain to the left and right. the
+    river cuts a straight path across a valley floor. the water has a depth of
+    approximately 8 voxels. however, to the left and right of the water
+    channel, there is empty air, not a river bank."
+
+That is a true report and it is measurable. bake_ver 12 decided extent with
+`channel_width_m(Q)` -- discharge in, metres of width out -- and painted the
+result as a ribbon. Over the corridor that ribbon is 5.30 m wide at p50 and
+7.50 m at p90: a formula's width, nearly constant, independent of the valley it
+crosses. The ground beside it is already under water and the bake did not know.
+
+bake_ver 13 replaces the rule. A cell is wet when it stands below the surface of
+the water it drains into. Nothing about discharge enters; the terrain decides.
+
+WHERE THE OUTPUT IS. Namespace
+`terrain-diffusion-unlabeled-80b9ca451a23eae4-ba9c62170`, seed 000000000135276f,
+s16 -- a FRESH namespace created by the BAKE_VERSION roll, holding four
+loadable .vxtl tiles. Nothing in any existing namespace was touched; the bv12
+tiles this document compares against are still in `-b52995abb`.
+
+    python tools/bake_tiles_from_cache.py --seed 20260719 \
+        --cache-dir D:/voxelsim/tile-cache \
+        --provider-id terrain-diffusion-unlabeled-80b9ca451a23eae4 \
+        "--tiles=-11,-4 -11,-5 -12,-5 -11,-6" --codec zstd \
+        --npz-dir D:/tmp/latfill-npz
+
+    282-307 CPU-s per tile (1,191 CPU-s for four), against ~300 before. The
+    fill itself is one topological sweep over the D8 forest -- no heap, no
+    search -- and costs about 3 CPU-s.
+
+    Tile size barely moves, which is worth knowing before anyone worries about
+    9x the wet cells: (-11,-4) 51,602,491 -> 51,654,204 bytes (+0.10%),
+    (-11,-5) 47,721,389 -> 48,024,569 (+0.64%). The water sections are small
+    next to the elevation control points.
+
+
+================================================================================
+1. THE CROSS-SECTION. This is the change.
+================================================================================
+
+--- SITE A. Tile (-12,-5), pixel (row 850, col 2627), on the trunk
+    (Q = 2.61e7 m^3/yr). Sampled along the perpendicular to the local flow
+    direction, taken from the drawn centreline's own principal axis, (-0.585,
+    +0.811).
+
+  offset_m   ground_m   bv12 water   bv13 water
+    -35.62    349.120        air          air        <- the left valley wall
+    -31.88    348.961        air          air
+    -30.00    348.791        air          WET  349.046
+    -22.50    348.398        air          WET  349.105
+    -15.00    348.058        air          WET  349.105
+     -7.50    348.044        air          WET  349.105
+     -3.75    348.044      WET 349.105    WET  349.105   <- all bv12 ever drew
+      0.00    348.044      WET 349.105    WET  349.105
+      3.75    348.046      WET 349.106    WET  349.105
+      7.50    348.056        air          WET  349.105
+     15.00    348.059        air          WET  349.105
+     30.00    348.292        air          WET  349.081
+     45.00    348.491        air          WET  349.027
+     52.50    348.863        air          WET  348.968
+     56.25    348.852        air          WET  348.968
+     58.12    348.898        air          air        <- the right valley wall
+     63.75    348.987        air          air
+
+  drawn width          bv12   9.38 m        bv13  86.25 m
+  ground below the bv12 waterline and drawn DRY at bv12:  47 cells of this
+                                                          one section
+  bv13 surface across the section:  348.968 .. 349.105 m, spread 0.137 m over
+                                    86 m -- a 0.16% cross-slope, 1.4 wire LSBs
+
+Read the ground column. From -30 m to +56 m the valley floor sits at 348.0-348.9
+while the water stands at 349.105. Eighty-six metres of floor were UNDER THE
+WATERLINE AND DRAWN AS AIR. That is the owner's observation, in numbers, and it
+is not a rendering problem: the bake never wrote those cells.
+
+Both ends of the bv13 fill stop on rising ground, not on a parameter. The left
+edge stops at -31.88 m where the floor reaches 348.961; the right at +58.12 m
+where it reaches 348.898. There is no width term in the rule that could have
+put them there.
+
+--- SITE B. Tile (-11,-4), pixel (row 5242, col 6094), Q = 9.09e6 m^3/yr. An
+    ASYMMETRIC section, which is the case a formula cannot represent at all.
+
+  offset_m   ground_m   bv12 water   bv13 water
+    -48.75    383.169        air          air
+    -46.88    383.310        air          air        <- fill stops here, left
+    -45.00    382.310        air          WET  382.749
+    -30.00    382.024        air          WET  382.749
+    -15.00    382.023        air          WET  382.750
+     -1.88    382.022      WET 382.755    WET  382.752
+      0.00    382.022      WET 382.755    WET  382.755   <- all bv12 ever drew
+      1.88    382.022      WET 382.755    WET  382.752
+      9.38    382.021        air          WET  382.752
+     11.25    382.458        air          WET  382.752
+     13.12    386.277        air          air        <- fill stops here, right
+     16.88    393.664        air          air
+
+  drawn width          bv12   5.62 m        bv13  58.12 m   (45 m left, 13 m right)
+  bv13 surface across the section:  382.749 .. 382.755 m, spread 0.006 m over 58 m
+
+The right bank is a wall -- 382.02 to 393.66 in eleven metres -- and the fill
+stops on it. The left is a flat floor and the fill runs 45 m out to where the
+ground turns up. Same river, same discharge, same cross-section: 45 m one way
+and 13 m the other, because that is what the valley is. bv12 drew 2.81 m each
+side of the centreline and could not have drawn anything else.
+
+
+================================================================================
+2. THE RULE, AND THE THREE THAT WERE TRIED BEFORE IT
+================================================================================
+
+    level(c) = the water surface of the FIRST DRAWN CHANNEL CELL on c's own
+               downstream D8 path        (NaN if there is none)
+    wet(c)  <=>  z_ground(c) <= level(c) - 0.1 m
+
+Height Above Nearest Drainage, inverted. `water.fill_to_local_surface`.
+0.1 m is `WIDEN_MIN_DEPTH_M`, the codec's own representability floor, unchanged.
+
+--- (a) THE FIRST VERSION ANCHORED ON THE NEAREST CHANNEL -- carry each reach's
+surface outward, stop where the ground rises above it. It is the reading the
+words invite and it is wrong by two orders of magnitude. Measured on these four
+tiles, running on bv12's own plane and elevation:
+
+                          bv12 ribbon    nearest-anchored flood
+  wet cells                  317,665              66,546,420    x209
+  share of tile wet        0.06-0.18%              9.3-39.7%
+  added depth p50                  -                    7.8 m
+  added depth max                  -                   78.0 m
+  distance from channel p50        -              550 - 630 m
+
+  per tile:  (-11,-4)  48,911 ->  6,217,059   x127   9.264%wet
+             (-11,-5) 103,476 -> 18,599,065   x180  27.715%wet
+             (-12,-5)  42,056 -> 15,065,567   x358  22.449%wet
+             (-11,-6) 123,222 -> 26,664,729   x216  39.734%wet
+
+Nothing is wrong with the flood. The level is simply never RE-ANCHORED: a cell
+one step off a channel that runs along a ledge is below that channel's surface,
+and so is the cell below it, and the cell below that. The nearest channel does
+not change as you descend, so the fill runs down the hillside carrying a level
+it left behind, and stands 8 m deep on a slope. This is the "getting it wrong
+in the easy direction floods a continent" failure, found by running the rule
+rather than by reasoning about it. Note that (-11,-5) has NO ground below sea
+level at all and still floods 27.7% of itself, so this is not the coastline.
+
+--- (b) A CONNECTED FLOOD SANDWICHED between the source reach's bed and its
+surface (`bed(s) <= z(c) <= level(s) - 0.1`), which is the obvious repair: water
+spreading out of a channel cannot stand deeper than that channel. It bounds the
+DEPTH and not the extent. 9,339,092 cells overall (x29.4) and, on the coastal
+tile (-11,-6), 7,041,016 at 10.5% wet with a median cell 306 m from any channel
+and 0.38 m deep. A continent flooded at 40 cm.
+
+--- (c) A PER-STATION PERPENDICULAR RAY-MARCH with the same sandwich, which is
+level and local by construction because a ray cannot route around an obstacle.
+It marches unobstructed across a plain instead: on (-11,-6), 2,088,938 cells at
+a p50 drawn width of 610 m and a p90 of 1,782 m. It is also NARROWER than (d)
+everywhere else, so it loses on both counts.
+
+--- (d) THE FLOW PATH, which ships. It needed nothing added to bound it -- no
+distance cap, no width term, no relief term. The hillside cell above a channel
+at 460 m gets 460 m, not the 500 m reach it happens to be nearest, and is dry.
+The first version had a 512-px (one apron) safety cap; it was DELETED once the
+anchor was right, because a fill that needs a radius to stop is a formula
+wearing a flood's clothes.
+
+All four were measured on the same inputs. (a), (b) and (c) are recorded here so
+the next person does not re-derive them.
+
+
+================================================================================
+3. THE CORRIDOR
+================================================================================
+
+`tools/measure_corridor_fragmentation.py`, both namespaces, same argv:
+
+                                        bv12            bv13
+  wet cells                          317,665       2,891,487    x9.10
+  components                             149             163
+  px-share on reaches >=  500 m       98.77%          99.49%
+  px-share on reaches >= 5000 m       66.31%          79.54%
+  wire depth  p50 / max            0.54 / 8.92 m   0.60 / 1.07 m
+  longest by span                     15,030 m        15,077 m
+
+  per tile, %wet:   (-11,-4)  0.0729 -> 0.2209
+                    (-11,-5)  0.1542 -> 0.6065
+                    (-12,-5)  0.0627 -> 0.2679
+                    (-11,-6)  0.1836 -> 3.2134     <- see section 5
+
+Four-axis ribbon width and unquantised depth over every drawn cell of the four
+tiles (`corridor_water_report.ribbon_width_m` on the npz):
+
+                          bv12                       bv13
+  ALL wet    width p50/p90/max   5.30 /  7.50 / 15.91 m   71.59 / 1850.85 / 2190.00 m
+             depth p50/p90/max   0.543 / 0.848 / 8.924    0.605 / 0.956 / 1.073 m
+             one-pixel share            28.17%                  1.63%
+  ABOVE SEA  width p50/p90/max   5.30 /  5.62 / 15.91 m   30.00 / 103.12 / 458.74 m
+             depth p50/p90/max   0.533 / 0.781 / 8.924    0.432 / 0.693 / 1.073 m
+             one-pixel share            30.83%                  2.62%
+
+The bv12 row reproduces the recorded baseline exactly (p90 7.50 m, max 15.91 m),
+which is the check that these two columns are comparable.
+
+READ THE BV12 WIDTH COLUMN AS THE DIAGNOSIS. p50 5.30 and p90 5.62 above sea
+level: half a metre of spread across nine tenths of the network, on terrain that
+ranges from a gorge to a floodplain. That is not a river, it is a stamp. At
+bv13 the same statistic is 30.00 / 103.12 / 458.74 -- the width now VARIES,
+which is the only thing a terrain-driven rule can be judged on.
+
+DEPTH DID NOT GROW. p50 0.533 -> 0.432 m above sea level, max 8.924 -> 1.073 m.
+The water spread; it did not deepen. The 8.924 m maximum bv12 carried was a
+WIDENED cell, not a centreline one -- a cell two pixels from a channel whose
+ground stood 8.9 m below that channel's water surface, drawn at the channel's
+level because the width law said it was in range. That class of cell is what
+this change removes.
+
+Basins, from `tools/corridor_composed_reach.py`:
+
+  basins 255  (9 lake_terminal, 246 lake_overflowing)   -- unchanged
+  lake area total 8.305 km^2                            -- unchanged
+  composed cells (river U lake sheets) 2,679,897 -> 5,253,724
+
+BASINS ARE UNTOUCHED AND HAD TO BE. `survey_basins` reads z_final, basin_depth,
+accumulation_m2 and climate -- all terrain -- so a product change cannot move
+them, and 255 / 8.305 km^2 coming back identical is that argument executed.
+
+
+================================================================================
+4. THE TWO PROPERTIES THAT HAD TO SURVIVE
+================================================================================
+
+--- THE SURFACE MUST NEVER RISE GOING DOWNSTREAM.
+
+`tools/river_long_profile.py walk`, the longest composed component, head to
+mouth, same argv as the bv12 record:
+
+                                       bv12                 bv13
+  raw path steps that rise      230 of 13,896 (1.66%)  231 of 13,042 (1.77%)
+  resampled every  25 m            11 rises              15 rises
+  resampled every 100 m             0 rises               0 rises
+  resampled every 250 m             0 rises               0 rises
+  descent, water surface        389.4 -> -475.0 m     389.4 -> -475.1 m
+
+ZERO RISES AT 100 m AND AT 250 m, which is the property as it was stated. The
+raw-step count is unchanged in character: the walk's own notes record that a
+single-step rise inside a ribbon is a lateral hop across the section rather than
+a defect, and 98.3% of the rising steps start on a centreline cell.
+
+There is a stronger version of the same check, run over the WHOLE drawn plane
+rather than one walked reach -- for every wet cell with a wet D8 receiver,
+does the surface fall?
+
+    tile      bv12 rising pairs        bv13 rising pairs
+   (-11,-4)   778 of 39,977   max 4.821 m      3 of 140,998   max 0.284 m
+   (-11,-5)   906 of 82,964   max 1.413 m     13 of 395,920   max 0.075 m
+   (-12,-5)   367 of 27,616   max 0.620 m      2 of 168,609   max 0.111 m
+
+The new plane is two orders of magnitude cleaner on this, and it is not a
+coincidence: a filled cell and its receiver share one float by construction, so
+the only steps that can rise are the ones bv12 had already.
+
+--- THE WATER SURFACE ACROSS A CROSS-SECTION MUST BE LEVEL.
+
+Exactly, for a bank cell that drains straight into the reach: it inherits the
+reach cell's float, the same number. NOT exactly for a cell whose steepest
+descent is diagonal -- it reaches the channel a row or two downstream and
+inherits that row's surface, which is lower by the channel's own gradient. The
+honest bound is therefore
+
+    spread across a section  <=  gradient  x  lateral offset
+
+and that is what the unit test asserts, at that bound rather than at a round
+number. Measured on the corridor, level spread within a contiguous wet run:
+
+                            bv12               bv13
+  (-11,-5)   p90 / max    0.457 / 2.052 m   0.307 / 2.104 m
+  (-11,-6)   p90 / max    1.086 / 19.391    0.321 / 20.238
+
+  |step| between ADJACENT wet cells, metres:
+  (-11,-5)   bv12  p50 0.0002  p90 0.1050  p99 0.6671
+             bv13  p50 0.0000  p90 0.0408  p99 0.3458
+  (-11,-6)   bv12  p50 0.0001  p90 0.0691  p99 0.7465
+             bv13  p50 0.0000  p90 0.0020  p99 0.1346
+
+THE FILL'S SURFACE IS FLATTER THAN THE ONE IT REPLACES at every percentile to
+p99. The two sites in section 1 spread 0.137 m over 86 m and 0.006 m over 58 m.
+The maxima are the same in both columns because they belong to the centreline,
+which neither version touches.
+
+--- AND THE CENTRELINE ITSELF IS BIT-IDENTICAL, which is why both properties
+were safe to begin with. The drawable set is `q >= q_drawable = 1.528564e6`, and
+`discharge_m3_yr` is in the npz, so this is directly checkable rather than
+argued:
+
+    (-11,-4)  centreline cells 23,389  all present and BIT-IDENTICAL: True
+    (-12,-5)  centreline cells 28,974  all present and BIT-IDENTICAL: True
+
+Every cell that changed value or disappeared is a bv12 WIDENED cell -- 9,016 of
+25,522 on (-11,-4), 1,520 of 13,082 on (-12,-5) -- which is the formula's own
+output being replaced, and is the entire point.
+
+
+================================================================================
+5. THE ONE THING THAT NEEDS A DECISION: THE SEA
+================================================================================
+
+Tile (-11,-6) holds the mouth. Its %wet goes 0.1836 -> 3.2134, far out of line
+with the other three (which land at 0.22-0.61%), and the reason is a single
+number:
+
+    bv12   27,623 of   123,222 wet cells have ground <= 0 m   (22.4%)
+    bv13  1,195,259 of 2,156,457                              (55.4%)
+
+THE RIVER PLANE IS BEING PAINTED OVER THE SEAFLOOR, and the lateral fill
+amplifies it 43x. Mechanically it is correct: the reach descends to -475 m, its
+water surface at the mouth is about 0 m, and every submarine cell genuinely
+drains to it and genuinely stands below it. The fill has no way to know that
+something else already draws that water.
+
+It is not a valley being drowned. Above sea level the corridor's width is
+p50 30.00 m and p90 103.12 m and every edge sits on rising ground. Excluding the
+submarine cells the change is 290,042 -> 1,696,228, a factor of 5.85, and the
+depth distribution goes DOWN. The flooding is bounded on land.
+
+But it makes the headline reach statistic meaningless: the longest composed
+component is now 21,370 m with a four-axis ribbon width of p50 1,164 m, and that
+number is the sea, not a river. THE CLEAN INLAND REACH TO QUOTE INSTEAD is
+rank 1 -- 14,837 m span, 207,931 cells, 4.3% lake, 190.5 -> 978.4 m.
+
+THE REMEDY IS ONE LINE AND IT IS NOT MINE TO TAKE. `fill_to_local_surface`
+already accepts a barrier mask, and the argument for using it here is the one
+this module's own docstring makes about lakes: a registered basin's surface is
+on the wire and "writing it into the plane as well would be a second copy of a
+shipped fact, free to disagree with the first". The ocean is the same case.
+Passing `exclude |= (z_ground <= 0)` would stop the fill at the shoreline. It
+was NOT done here, for two reasons:
+
+  * it would also remove bv12's own 27,623 submarine cells, which is a change
+    to existing deliberate behaviour and outside what this task was asked to
+    change -- `docs/measurements/river-long-profile-2026-08-04.txt` uses "the
+    composed reach runs out onto the seafloor" to identify the mouth;
+  * the ocean surface is live work in another subsystem and the two should be
+    decided together, not raced.
+
+The number is here so the decision is made on it rather than on a screenshot.
+
+
+================================================================================
+6. TERRAIN IDENTITY
+================================================================================
+
+    python tools/verify_water_only_change.py \
+        --before D:/tmp/seamwidth-npz --after D:/tmp/latfill-npz \
+        "--tiles=-11,-4 -11,-5 -12,-5 -11,-6" \
+        --cache-dir D:/voxelsim/tile-cache \
+        --ns terrain-diffusion-unlabeled-80b9ca451a23eae4-b52995abb
+
+    (-11,-4): elevation IDENTICAL  flow IDENTICAL  accumulation IDENTICAL
+        vs shipped .vxtl: elevation_cp IDENTICAL  flow plane IDENTICAL  (bv12, quant 100 mm)
+    (-11,-5): ... IDENTICAL          (all four the same)
+    (-12,-5): ... IDENTICAL
+    (-11,-6): ... IDENTICAL
+    PASS: 4 tile(s), 0 problem(s)
+
+Both halves: the unquantised float32 arrays agree, AND the codec's own
+`elevation_control_points` on the shipped bv12 tile agree with the new bake.
+The second is the one that matters -- a hand-rolled quantiser has produced a
+false "terrain moved" alarm on this system before, and `quant == 1` is the CODE
+for 100 mm per control point, not the value 1 mm.
+
+TERRAIN_VERSION stays 8. `bake_fingerprint()` is unchanged (the test pins it at
+fe0275e105cbf77c); only `product_identity_payload` moved, which is what put the
+output in a new fine namespace.
+
+Suites: pytest 576 passed / 2 skipped (568 + 8 new), ctest 2/2 with -C Release.
+No C++ file was touched; `bakeVer` is read into the header and never gated on,
+so a bv13 tile loads on the current client.

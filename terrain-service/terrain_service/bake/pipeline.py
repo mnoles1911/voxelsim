@@ -373,13 +373,41 @@ __all__ = [
 #:     D8's 2.02e7, and the downstream tile read 3.05% of the upstream trunk at
 #:     the crossing column, under a cut it then failed. 35 of 36 raw components
 #:     ended within one pixel of a tile edge before this.
-#:   * ``water_width_from_law`` -- ``channel_width_m(Q)`` decides the drawn
+#:   * ``water_width_from_law`` (retired at bake_ver 13, where it became
+#:     ``water_extent_mode == "law"``) -- ``channel_width_m(Q)`` decides the drawn
 #:     extent the way ``water_depth_m(Q)`` already decides depth, clamped to
 #:     ground below the reach's own surface. bake_ver 11's plane drew a
 #:     centreline: 99.21% of wet pixels were one 1.875 m pixel against a law
 #:     width of 3.53 m at p50.
+#:
+#: bake_ver 13 -- ``water_extent_mode`` replaces the width law with a LATERAL
+#: FILL: a cell is wet when it stands below the surface of the water it drains
+#: into (``water.fill_to_local_surface``). A PRODUCT change on the same
+#: argument as 10/11/12 and checked the same way -- ``as_payload``, ``mfd_p``,
+#: ``STAGE_ORDER`` and the area field are untouched, so ``A^m`` reads what it
+#: read before and ``tests/test_bake_terrain_identity.py`` is the gate that
+#: proves the ground did not move rather than the sentence that asserts it.
+#:
+#: WHAT WAS WRONG, flown and reported by the owner: the river "cuts a straight
+#: path across a valley floor ... to the left and right of the water channel,
+#: there is empty air, not a river bank". bake_ver 12 painted a ribbon of
+#: formula-decided width. It draws 3.5 m at p50 where the terrain at the drawn
+#: level allows p50 11-28 m and p90 47-163 m, so the water stopped at a number
+#: rather than at the ground.
+#:
+#: WHAT IS DIFFERENT ABOUT IT. Every previous extent rule read DISCHARGE. This
+#: one reads the ground and the water's own surface and nothing else: no width,
+#: no radius, no relief term. Extent therefore stops being a property of Q and
+#: becomes a property of the valley, which is the point -- the same river is
+#: wide on a floodplain and narrow in a gorge.
+#:
+#: WHAT IT COSTS AND WHAT IT MOVES, measured on the corridor before it shipped:
+#: about 3 CPU-s per tile (one topological sweep over the D8 forest, no heap,
+#: no search) and 7.15x the wet cells. The centreline itself is untouched, so
+#: the long profile -- and the property that the surface never rises going
+#: downstream -- is the same array bake_ver 12 produced.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 12
+BAKE_VERSION = 13
 
 
 @dataclass(frozen=True)
@@ -1048,10 +1076,15 @@ class BakeConstants:
     #:
     #: False reproduces the bake_ver 11 pyramid exactly.
     water_pyramid_single_receiver: bool = True
-    #: Let ``channel_width_m(Q)`` decide the drawn EXTENT the way
-    #: ``water_depth_m(Q)`` already decides depth (bake_ver 12).
+    #: HOW FAR THE DRAWN WATER REACHES SIDEWAYS (bake_ver 13). One of
+    #: ``EXTENT_MODES``; the long note below walks all three in the order they
+    #: shipped, because each one is best read as the answer to what the previous
+    #: one got wrong.
     #:
-    #: WHY IT IS NEEDED. ``water_flow_single_receiver`` made the plane a
+    #: --- ``"law"``, bake_ver 12, RETIRED. Let ``channel_width_m(Q)`` decide
+    #: the drawn EXTENT the way ``water_depth_m(Q)`` already decides depth.
+    #:
+    #: WHY IT WAS NEEDED. ``water_flow_single_receiver`` made the plane a
     #: CENTRELINE: a single-receiver forest has one-cell-wide branches by
     #: construction, so 99.21% of wet pixels were a single 1.875 m pixel against
     #: a law width of 3.53 m at p50. Under MFD the fan happened to widen the
@@ -1078,14 +1111,59 @@ class BakeConstants:
     #: 7-10% where it must. That is the right division of labour and it is the
     #: opposite of what a bank-driven rule would give.
     #:
-    #: False reproduces the bake_ver 11 centreline exactly.
-    water_width_from_law: bool = True
+    #: That reading survived one flight. The measurement it rests on is sound
+    #: and is quoted again below; what it got wrong was which side of the
+    #: division of labour the interesting cases live on.
+    #:
+    #: --- THE THREE MODES.
+    #:
+    #:   ``"centreline"``    the plane as ``graded_water_surface`` leaves it,
+    #:                       one cell per reach. bake_ver 11.
+    #:   ``"law"``           a ribbon ``channel_width_m(Q)`` across, clamped to
+    #:                       ground below the reach's own surface. bake_ver 12.
+    #:   ``"lateral_fill"``  fill to the local water surface: a cell is wet when
+    #:                       it stands below the surface of the water it drains
+    #:                       into. bake_ver 13, and the shipped rule. See
+    #:                       ``water.fill_to_local_surface``.
+    #:
+    #: WHY THE LAW HAD TO GO, in the owner's own observation: the river "cuts a
+    #: straight path across a valley floor ... to the left and right of the
+    #: water channel, there is empty air, not a river bank". Both previous modes
+    #: decide extent from DISCHARGE -- one cell, or ``channel_width_m(Q)`` of
+    #: them -- and neither can know that the ground beside a reach is already
+    #: below that reach's own waterline. On the measured corridor it is, by a
+    #: wide margin: the terrain allows p50 11-28 m and p90 47-163 m of lateral
+    #: extent at the drawn level while the law draws 3.5 m at p50, which is the
+    #: 99.21%-of-wet-pixels-are-one-pixel symptom seen from the other side. A
+    #: formula cannot tell a floodplain from a gorge at equal Q. The ground can.
+    #:
+    #: THE VERSION THAT WAS TRIED AND MEASURED WRONG, recorded here because it
+    #: is the reading the words invite and it is a continent-flooder: carrying
+    #: each reach's surface outward to the NEAREST channel and stopping where
+    #: the ground rises above it takes the corridor from 317,665 wet cells to
+    #: 66,546,420 -- 27-40% of a tile, median added depth 7.8 m, median cell
+    #: 550-630 m from any channel. Nothing is wrong with the flood; the level is
+    #: simply never re-anchored as it descends a hillside, because the nearest
+    #: channel does not change. ``water.fill_to_local_surface`` anchors on the
+    #: FLOW PATH instead and the same corridor comes out at 7.15x.
+    water_extent_mode: str = "lateral_fill"
     #: Write the water plane at all. False reproduces a bake_ver-8 tile's
     #: sections exactly (no SECTION_WATER_*, flag clear), which is what the
     #: terrain-identity gate bakes against.
     water_plane_enabled: bool = True
 
+    #: The extent rules ``water_extent_mode`` may name, in the order they
+    #: shipped. A ClassVar so it is not itself a constant, and a tuple so a
+    #: typo in a config is a refusal at construction rather than a bake that
+    #: silently drew a centreline.
+    EXTENT_MODES: ClassVar[tuple[str, ...]] = ("centreline", "law", "lateral_fill")
+
     def __post_init__(self) -> None:
+        if self.water_extent_mode not in self.EXTENT_MODES:
+            raise ValueError(
+                f"water_extent_mode={self.water_extent_mode!r} is not one of "
+                f"{list(self.EXTENT_MODES)}"
+            )
         if not 0.0 < self.thermal_rate <= 0.5:
             raise ValueError(
                 f"thermal_rate={self.thermal_rate} is outside (0, 0.5]; "
@@ -1251,7 +1329,7 @@ class BakeConstants:
         "water_min_width_px",
         "water_flow_single_receiver",
         "water_pyramid_single_receiver",
-        "water_width_from_law",
+        "water_extent_mode",
         "water_plane_enabled",
     )
 
@@ -4521,33 +4599,48 @@ def bake_tile(
             eps_m=consts.refill_eps_m, exclude=basin_keep_pad,
             q_perennial=consts.water_q_perennial_m3_yr,
         )
-        del rec_w
 
-        # -- THE WIDTH LAW (bake_ver 12). The plane above is a CENTRELINE; this
-        # gives it the extent `channel_width_m(Q)` says it has, clamped to
-        # ground that actually stands below the reach's own water surface. See
-        # `BakeConstants.water_width_from_law` and `water.widen_to_channel_width`
-        # for the two bounds and for which of them was measured to do the
-        # shaping.
+        # -- THE EXTENT (bake_ver 13). The plane above is a CENTRELINE -- a
+        # single-receiver forest has one-cell-wide branches by construction --
+        # and this decides how far sideways the drawn water reaches. See
+        # `BakeConstants.water_extent_mode` for the three rules and for the
+        # owner observation that retired the middle one.
+        #
+        # `lateral_fill` is the shipped rule: a cell is wet when it stands below
+        # the surface of the water it drains into, so the TERRAIN decides the
+        # width and the same discharge comes out wide on a floodplain and narrow
+        # in a gorge. The `law` branch is bake_ver 12's ribbon, kept because a
+        # constant that claims to reproduce a previous bake has to be able to.
         #
         # ON THE PADDED DOMAIN, before the interior is cropped, so a reach that
-        # runs along a tile edge is widened from both sides of it rather than
+        # runs along a tile edge is filled from both sides of it rather than
         # being cut in half by the crop.
         #
         # AGAINST `out["z"]`, THE SHIPPED SURFACE, not `z_route`. `z_route` is
-        # the pre-B5 bed the descent chain needed; the clamp is a statement
-        # about the ground the client draws the waterline against, which is the
-        # post-B5 one, and it is also the array `water_depth_control_points`
-        # takes the stored depth against. Using the routing bed here would admit
-        # cells that the encoder then reads as water below its own ground.
+        # the pre-B5 bed the descent chain needed; the wetness test is a
+        # statement about the ground the client draws the waterline against,
+        # which is the post-B5 one, and it is also the array
+        # `water_depth_control_points` takes the stored depth against. Using the
+        # routing bed here would admit cells that the encoder then reads as
+        # water below its own ground. Outside the registered basins the two are
+        # the same array cell for cell -- B5 subtracts `basin_depth` only under
+        # `keep` -- which is what lets the fill's connectivity argument (every
+        # wet cell has a wet descending path to the channel) hold on the surface
+        # actually tested rather than on the one the forest was built on.
         centreline_pad = np.isfinite(w_pad)
         width_stats: dict[str, float] = {}
-        if consts.water_width_from_law:
+        if consts.water_extent_mode == "lateral_fill":
+            w_pad, width_stats = _water.fill_to_local_surface(
+                w_pad, out["z"], rec_w, cell_m=geom.fine_pixel_m,
+                exclude=basin_keep_pad,
+            )
+        elif consts.water_extent_mode == "law":
             w_pad, width_stats = _water.widen_to_channel_width(
                 w_pad, out["z"], q_pad, cell_m=geom.fine_pixel_m,
                 exclude=basin_keep_pad,
                 q_perennial=consts.water_q_perennial_m3_yr,
             )
+        del rec_w
 
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])
