@@ -1,0 +1,295 @@
+THE `ELEV_DATA` DIGEST CHURN DOES NOT EXIST. THE RE-DOWNLOAD DOES.
+==================================================================
+2026-08-04. Measured on this workstation against the tiles already in
+D:/voxelsim/tile-cache. No tile in the world was modified by any of it.
+
+STATUS -- READ THIS FIRST
+-------------------------
+The backlog item this investigation was opened on
+(docs/water-waves-plan-2026-08-04.md backlog #2, restated in
+docs/water-handover-2026-08-04.md section 1) says:
+
+    "A water-only re-bake leaves the elevation plane bit-identical but changes
+     the tile's identity -- 696 of 603,979,776 control points, 1 mm each --
+     because no flow superblock is retained under a fine namespace."
+
+Every clause of that is false, and the three of them are false for three
+different reasons:
+
+  * 696 is 0. Re-measured on the same nine tile pairs, through the codec's
+    own decoder: ZERO of 603,979,776 elevation control points differ.
+  * "1 mm each" is a unit error of 100x. `quant == 1` is the CODE for
+    `QUANT_100MM`, whose LSB is 100 mm (`tile_codec.py:125-127`). One LSB is
+    one voxel edge (`kVoxelSizeMm`), not a millimetre. Had the 696 been real
+    it would have been 69.6 m of moved ground, not 0.7 m.
+  * The superblock retention story has no difference to explain. `acc` and
+    `filled` -- the two ground-bearing halves of a superblock -- are
+    BYTE-IDENTICAL across four independent rebuilds of the pyramid.
+
+What IS real is the cost, and it is much larger than the item claims. A
+water-only re-bake changes 0.15-0.62% of a tile's bytes and forces the client
+to re-fetch 100% of them. That is caused by `fine_provider_id`, which is in
+the client's on-disk path AND in its LRU cache key, hashing the PRODUCT half
+of the bake fingerprint. It has nothing to do with determinism.
+
+WHAT WAS MEASURED
+-----------------
+Four fine namespaces are on disk for provider
+`terrain-diffusion-unlabeled-80b9ca451a23eae4`, seed 20260719:
+
+  suffix       bake_ver  codec  tiles  tile size      written
+  -b196f6020   9         zstd   9      31.8- 56.4 MB  2026-08-03 19:35-20:03
+  -b4d02b092   10        RAW    9     191.1-211.7 MB  2026-08-03 22:12-23:12
+  -b52995abb   12        zstd   4      32.1- 51.6 MB  2026-08-04 15:21-15:29
+  -b7817e0df   (flow only, 5 superblocks, no tiles)
+
+1. NINE TILE PAIRS, bv9 vs bv10. This is the exact population the "696 of
+   603,979,776" figure was taken over: 9 x 8192^2 = 603,979,776.
+
+     tile      cp differing   flow differing   base_offset_mm   quant
+     -11,-4    0              0                1000000 = both   1 = both
+     -11,-5    0              0                 800000 = both   1 = both
+     -11,-6    0              0                -100000 = both   1 = both
+     -12,-5    0              0                1100000 = both   1 = both
+     -13,-5    0              0                 900000 = both   1 = both
+     -14,-4    0              0                1600000 = both   1 = both
+     -14,-5    0              0                 600000 = both   1 = both
+     -14,-6    0              0                 400000 = both   1 = both
+     -14,-7    0              0                -500000 = both   1 = both
+
+     TOTAL 0 of 603,979,776 control points and 0 flow cells differ.
+
+   Decoded with `tile_codec.decode_v2`, i.e. the codec's own operator, so the
+   section 2 prefilter chain is the shipped one and not a re-implementation.
+   The datum matches on every tile, so this is an identity of the SURFACE and
+   not only of the integers.
+
+2. FOUR TILE PAIRS, bv12 vs bv10 (the corridor). 0 of 268,435,456 control
+   points and 0 flow cells differ. Only the water plane moved: 40,519 /
+   122,905 / 103,821 / 46,785 water cells on (-12,-5) / (-11,-6) / (-11,-5) /
+   (-11,-4).
+
+3. SECTION BY SECTION, bv9 vs bv12 -- a THREE-VERSION water-only span:
+
+     tile     identical sections                                     differing
+     -11,-4   ELEV_INDEX ELEV_DATA FLOW_INDEX FLOW_DATA BASIN_TABLE  WATER_*
+     -11,-5   ELEV_INDEX ELEV_DATA FLOW_INDEX FLOW_DATA BASIN_TABLE  WATER_*
+     -11,-6   ELEV_INDEX ELEV_DATA FLOW_INDEX FLOW_DATA BASIN_TABLE  WATER_*
+     -12,-5   ELEV_INDEX ELEV_DATA FLOW_INDEX FLOW_DATA BASIN_TABLE  WATER_*
+
+   The `ELEV_DATA` section digest that the backlog item says churns is the
+   SAME 8 bytes on both sides of a bv9 -> bv12 re-bake, on all four tiles.
+
+   What that costs in bytes, per tile:
+
+     tile     total     changed (WATER_INDEX+WATER_DATA)   share
+     -11,-4   51.6 MB   0.088 MB                           0.17%
+     -11,-5   47.7 MB   0.178 MB                           0.37%
+     -11,-6   32.1 MB   0.198 MB                           0.62%
+     -12,-5   48.0 MB   0.073 MB                           0.15%
+
+   A bv12 tile is 71.7-75.3% ELEV_DATA, 24.4-27.9% FLOW_DATA and 0.1-0.6%
+   WATER_DATA. The whole of the first two is reusable across a water re-bake
+   and is re-fetched anyway.
+
+4. THE ACCEPTANCE TEST, RUN DIRECTLY. Tile (-12,-5) re-baked today from the
+   coarse cache at `main` (e126ecd), write-protected via
+   `bake_tiles_from_cache.py --diagnostic`, 313.5 CPU-s, and its elevation
+   plane put through `tile_codec.elevation_control_points` and the real block
+   encoder:
+
+     base_offset_mm   1100000 fresh == 1100000 shipped
+     quant            1 (LSB 100 mm) both
+     control points   0 of 67,108,864 differ
+     flow cells       0 of 67,108,864 differ
+     ELEV_DATA        sha256 3dd4993d25d93aeb, 34,348,881 B  -- BOTH SIDES
+     ELEV_INDEX       sha256 27b10cd4864e1f86                -- BOTH SIDES
+
+   `3dd4993d` is also the bv9 tile's `ELEV_DATA` digest. Three bakes, three
+   BAKE_VERSIONs, one elevation section.
+
+5. THE FLOW PYRAMID REBUILD IS BYTE-DETERMINISTIC. Five superblocks, four
+   independent builds (bv9 wrote them in on-wire format v2, the rest v3):
+
+     block              acc          filled       q
+     flow0/-3_-1.vxfl   identical    identical    differs only at bv12
+     flow0/-3_-2.vxfl   identical    identical    differs only at bv12
+     flow0/-4_-1.vxfl   identical    identical    differs only at bv12
+     flow0/-4_-2.vxfl   identical    identical    differs only at bv12
+     flow1/-1_-1.vxfl   identical    identical    differs only at bv12
+
+   Every one of the four builds carries a DIFFERENT `inputs_fingerprint`
+   (b429f1d10265 / 3f4dae81d1e2 / d006f05acd9f / 3f4dae81d1e2 at flow0/-3_-1),
+   so these are genuinely separate builds from separate namespaces and not one
+   cached answer read four times. `q` differs at bv12 and only at bv12, which
+   is `water_pyramid_single_receiver` doing exactly what its docstring says:
+   reaching `q` and nothing else. `acc` -- the area field that decides every
+   height -- never moved.
+
+   So "no superblock is retained, so the pyramid is rebuilt, and THAT
+   DIFFERENCE rides through incision" fails at the last clause. There is no
+   difference. Retaining the superblock would save the rebuild's CPU (1.7 s
+   for five blocks in the run above, against 313.5 s for the tile) and change
+   zero bytes.
+
+WHY THE ORIGINAL MEASUREMENT WENT WRONG
+---------------------------------------
+Almost certainly the bv9-vs-bv10 pair, which is the only pair with 9 tiles.
+Those two namespaces do not differ numerically -- measurement 1 -- but their
+`ELEV_DATA` bytes differ completely, because bv9 was written CODEC_ZSTD and
+bv10 CODEC_RAW. 47.6 MB against 210.7 MB on the same tile.
+
+That trap is already written down, in `pregen._resolve_codec`'s own docstring:
+
+    "CODEC IS NOT PART OF TILE IDENTITY. ... a RAW tile and a ZSTD tile of the
+     same coordinates share a `fine_provider_id` and decode to identical
+     planes. ... It also means 'same id implies same bytes' is false across a
+     codec change, WHICH MATTERS TO ANYTHING THAT TREATS THE ID AS AN ETAG."
+
+The CLI default flipped raw -> zstd on 2026-08-03, between the bv10 bake
+(22:12) and the bv12 one. So the nine-tile pair straddles the flip. A digest
+comparison across it reads 100% changed and means nothing about the ground.
+The 696 itself is not reproducible from the shipped tiles at all; the standing
+warning about hand-rolled quantisers missing the section 2 prefilter is the
+likeliest second half of it.
+
+THE REAL PROBLEM, RESTATED FROM MEASUREMENT
+-------------------------------------------
+The client finds a fine tile at
+
+    <root>/<fine_provider_id>/<seed:016x>/s16/<x>_<y>.vxtl
+
+built by `vxc::formatFineTileCacheKey(ProviderId_, Seed_, x, y)`
+(voxel-core/src/tilestreaming.cpp:125), which is the SAME string used as the
+LRU cache key (VoxelFineTileStreamer.cpp:164-173). `fine_provider_id` is
+`fine_id_for(provider_id)` = provider id + the bake fingerprint, and that
+fingerprint hashes BOTH halves:
+
+    _tile_format_fingerprint() = sha256({"bake": bake_identity_payload(),
+                                         "product": product_identity_payload()})
+                                          (providers/diffusion.py:846-854)
+
+So a PRODUCT-only bump moves the path and the cache key, and the client
+re-fetches every byte of every tile whether or not one changed. Byte-stable
+elevation buys nothing against that, and it is already byte-stable.
+
+One further fact worth having before anyone prices a fetch optimisation:
+there is no fine-tier transport. `terrain_service/app.py` has exactly two
+routes, `/healthz` and `/tile`, and `/tile` serves the COARSE tier only, with
+no ETag and no conditional request. Fine tiles reach the client as files in a
+directory named by `-VoxelFineTileDir` + `-VoxelFineTileProviderId`. "Every
+client re-downloads every tile" describes a distribution system that has not
+been built yet.
+
+WHAT THE THREE CANDIDATE FIXES ARE WORTH
+----------------------------------------
+1. MAKE THE RE-BAKE BYTE-DETERMINISTIC. Already true. Measurements 1, 2, 3
+   and 4. Nothing to build.
+
+2. RETAIN THE FLOW SUPERBLOCK ACROSS A WATER-ONLY RE-BAKE. Measurement 5: it
+   cannot change a byte, because the rebuilt pyramid already reproduces
+   exactly. It is a CPU saving of about 1.7 s against a 313.5 s tile, i.e.
+   0.5%, and it is worth building only if someone wants that 0.5%. It is not
+   a fix for this.
+
+   (Note that within one namespace superblocks ARE already retained and
+   reused: the re-bake in measurement 4 loaded all five from cache in 1.7 s
+   and re-verified their fingerprints.)
+
+3. STOP THE IDENTITY DEPENDING ON BYTES THAT DID NOT CHANGE. The only live
+   option, but NOT in the form the backlog item imagines. There is no need
+   for a coarser quantisation tolerance or a fuzzy content hash: the bytes are
+   already identical, exactly, so an exact per-section or per-block content
+   address captures the entire saving. Measurement 3 says that saving is
+   99.4-99.85% of the transfer.
+
+   This is where the design decision the owner has to make actually sits, and
+   it is stated in the section below rather than chosen here.
+
+THE DECISION, AND WHY IT IS NOT MINE TO MAKE
+--------------------------------------------
+Two ways to collect the 99.4-99.85%, with different risks:
+
+  A. PER-SECTION / PER-BLOCK CONTENT ADDRESSING (task #52's shape). Leave
+     `fine_provider_id` exactly as it is -- one world, one namespace, two
+     different bakes always distinguishable -- and let a client ask for the
+     sections or blocks it does not already hold. Nothing about what a world
+     IS changes; the only new thing is that bytes are named by their content
+     as well as by their path. `.vxtl` v2 already frames every block
+     independently and the index already carries
+     (offset, comp_len, mode, const_cp, resid_bits), so the format needs no
+     change. Cost is entirely in the transport, which does not exist yet.
+
+  B. SPLIT THE NAMESPACE: address the terrain-bearing sections under
+     `bake_fingerprint()` (the terrain half) and the product sections under
+     `product_fingerprint()`. Cheaper for the client -- the elevation path
+     simply stops moving -- but it puts two different bakes' tiles at one
+     path, which is the collision the content-addressing rule exists to
+     forbid. It would need the per-section identity checked explicitly rather
+     than implied by the directory, and getting that wrong is exactly the
+     "one namespace containing two different planets" failure the
+     world-identity work spent a day on.
+
+A is safe and needs a transport first. B is cheap and moves a load-bearing
+guarantee. Which is right depends on whether fine tiles are ever going to be
+served over a wire at all, and that is the owner's call, not a measurement.
+
+Recommendation, offered and not acted on: do NOTHING until there is a fetch
+to optimise. Today the re-download is a directory name changing on one
+workstation. The measurement above will still be true when a transport
+exists, and it says the whole of the elevation and flow planes will be
+reusable when it does.
+
+WHAT WAS RULED OUT ALONG THE WAY
+--------------------------------
+* NUMBA PARFOR FUSION IN `thermal._step`. The module docstring's safety
+  argument ("two passes ... no cell writes to a neighbour") holds only if the
+  two `prange` loops are not fused, and nothing in the repo disables fusion.
+  Checked rather than assumed, with NUMBA_DEBUG_ARRAY_OPT_STATS=1 over a cold
+  cache: "After fusion, function _step has 2 parallel for-loop(s) #{0, 1}."
+  Not fused, so the barrier between the passes stands and there is no race.
+  `thermal.relax` on the production field path also returned one digest over
+  five repeats at 2048^2 x 48 iterations.
+
+* THREAD COUNT / FLOAT NON-ASSOCIATIVITY generally. Nothing in the bake sets
+  NUMBA_NUM_THREADS; it is 12 here. There is no float atomic add and no
+  parallel reduction anywhere in the bake -- `accumulate_mfd`,
+  `accumulate_d8` and `fill_depressions` are all explicitly sequential. This
+  was never going to be the cause once measurement 5 came back identical.
+
+LATENT, FOUND WHILE LOOKING, NOT FIXED HERE
+-------------------------------------------
+`incise._profile_levels` reasons explicitly against stable-sort tie-breaking
+("a float32 tie breaks that: argsort(kind='stable') then orders the pair by
+index, so a donor can be visited BEFORE its receiver") and its own fallback
+uses `kind="stable"` (incise.py:781). In production the order is handed in
+from `accumulate_mfd(return_order=True)`, which uses the DEFAULT sort kind
+(flow.py:575, and flow.py:647 for `accumulate_d8`). Deterministic on one
+machine and one NumPy, so it is not this bug; it is a portability edge, and
+NumPy 2.x changed the 32-bit sort to a CPU-feature-dispatched implementation.
+Worth an aligned `kind="stable"` if anyone is in there anyway.
+
+TOOLS AND COST
+--------------
+  tools/compare_fine_namespaces.py   added by this investigation: decode two
+      baked namespaces through the codec and report, per tile, differing
+      control points / flow cells / water cells, the datum on each side, and
+      a per-section digest table. This is the instrument that answers "did
+      the ground move between these two bakes" from SHIPPED BYTES, with no
+      npz dump and no re-bake; `verify_water_only_change.py` answers the same
+      question but needs both bakes' npz dirs, which a shipped namespace
+      does not have.
+
+  cost   1 diagnostic re-bake, 323.6 CPU-s, no world modified
+         3 namespace comparisons, decode only
+
+TESTS, ON THIS WORKTREE
+-----------------------
+  pytest (terrain-service)   546 passed / 2 skipped      baseline 546 / 2   OK
+  ctest -C Release           2/2 passed (vxc_tests 319.15 s)                OK
+  vxc_tests                  432 [PASS], 0 [FAIL]        baseline 432 / 0   OK
+
+Zero C++ files were touched; voxel-core was configured and built from scratch
+in this worktree to take those two numbers rather than quote them. `ctest`
+needs `-C Release` on this multi-config generator or both tests report "Not
+Run" and a clean run looks like two failures.
