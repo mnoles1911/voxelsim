@@ -256,6 +256,20 @@ if(NOT MSVC)
   target_compile_options(vxc_farwaterprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_farwaterenum: does the far-field CANDIDATE SOURCE deliver the one
+#     property the whole cascade rests on -- that most of the baked water plane
+#     is rejected out of the block INDEX, with no bytes fetched and no decode?
+#     Reports the REALISED rate over the cascade's own window rather than the
+#     flattering plane-wide census, counts the plane/basin union's overlap
+#     (which must be zero, or every cost below it is double-counted), and prices
+#     the delivered thing in bricks, quads and bytes against today's 25.6 m box
+#     at the same camera. Built to run on WET COUNTRY, not the arid corridor.
+add_executable(vxc_farwaterenum farwaterenum.cpp)
+target_link_libraries(vxc_farwaterenum PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_farwaterenum PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_farwaterschemes: the ring cascade against the two proposed
 #     alternatives -- (A) a displaced heightfield strip, (B) that surface plus an
 #     instanced rim -- all four schemes counted off ONE shared water field so a

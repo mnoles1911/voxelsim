@@ -200,16 +200,16 @@ struct Col {
 // CORNER HEIGHTS (`BuildWaterCornerField` / `EmitWaterQuads`), not by which
 // cell the quad lands in. A 1.6 m cell can still put its surface at the right
 // millimetre.
+// AND IT IS NOW `farWaterFill` FROM THE HEADER, NOT A COPY OF IT.
+//
+// This function was written here first and `farwater.h` grew the identical rule
+// in the same change, which left the measurement and the shipping rule as two
+// separate expressions of the same thing -- the exact arrangement lakes.h's
+// `implicitWaterFill` exists to prevent, reintroduced. #228 verified
+// `farWaterFill` at 0 vanished columns at every ring; a probe that quietly
+// diverged from it would be certifying a rule the client does not run.
 uint8_t coarseWaterFill(int64_t zBottomMm, int32_t groundMm, int32_t surfaceMm, int64_t cellMm) {
-    if (cellMm == int64_t(kVoxelSizeMm)) {
-        return implicitWaterFill(zBottomMm / int64_t(kVoxelSizeMm), groundMm, surfaceMm, false);
-    }
-    if (surfaceMm == kNoWaterMm) return 0;
-    if (zBottomMm + cellMm <= groundMm) return 0; // entirely inside rock
-    const int64_t rem = int64_t(surfaceMm) - zBottomMm;
-    if (rem <= 0) return 0;
-    if (rem >= cellMm) return 255;
-    return uint8_t((rem * 255 + cellMm / 2) / cellMm);
+    return farWaterFill(zBottomMm, groundMm, surfaceMm, cellMm);
 }
 
 } // namespace
