@@ -1,5 +1,32 @@
 # Water system — handover
 
+> ## STILL CURRENT AS HISTORY — read the two live documents first (2026-08-05)
+>
+> This is **how the system got here**, and it is the best record of that. It is
+> not the current state. Before acting on anything below, read:
+>
+> * **`docs/watershed-system-plan.md`** — how the water system works today: the
+>   five stages, the constants and who owns them, the file map, the version
+>   rules, and the exact probe commands.
+> * **`docs/water-deep-dive-brief-2026-08-05.md`** — what is still wrong,
+>   ranked, and the seventeen explanations already falsified.
+>
+> **What has moved since this was written.** `BAKE_VERSION` was 11 here; it is
+> now **14** — `bake_ver` 12 added seam concentration and law-driven width,
+> 13 replaced width with a **lateral fill** off the ground, and 14 makes the
+> water **touch itself down a slope**. `TERRAIN_VERSION` is still 8 and no
+> elevation byte has moved through any of it.
+>
+> **Phase 4 is done** (`docs/river-farfield-actor-2026-08-04.md`), and so is the
+> hydrostatic cap. **Phase 5, the two-renderer tone seam, is still open.**
+>
+> **Every number below is from the four-tile arid corridor**, which sits at
+> about the world's 80th percentile for runoff. The default test region is now
+> the **wet alpine block**; see `docs/water-wet-country-2026-08-05.md`.
+>
+> Two numbers below have been corrected in place: the ELEV_DATA control-point
+> difference (§1) and the 20,269 m river (§5, already caveated).
+
 Written 2026-08-04, at the end of the session that built most of what is
 described here. Read the first two sections before touching anything; they are
 what stops you repeating a day's work.
@@ -15,6 +42,10 @@ onto the seafloor. What is still missing: the mountain heads (978 m, 1,326 m,
 1,540 m) all stop inland, and rivers remain invisible beyond about 26 m because
 nothing consumes the far-field producer. Phase 3 and Phase 4 in §5 are those
 two gaps.
+
+> **Phase 4 has since closed** — the ribbon actor ships. Beyond 25.6 m a river
+> is now drawn, but as flat quads, which the owner has rejected on sight; the
+> ring cascade is the agreed replacement and is half-built. Brief §4.3.
 
 Everything else below is either progress toward that or something that had to
 be fixed on the way.
@@ -58,17 +89,29 @@ languages.** Name which one you mean, every time:
    `tilestore.h`.
 
 **The version split works and is proven.** `TERRAIN_VERSION = 8` decides the
-ground; `BAKE_VERSION` (now 11) decides everything else. A water-only change
+ground; `BAKE_VERSION` (11 when this was written; **14** today) decides
+everything else. A water-only change
 re-bakes with **elevation and flow planes bit-identical**, verified by
 rebuilding superblocks and comparing `filled` and `acc` byte for byte. Use it:
 hydrology changes should cost no terrain re-key.
 
 **Caveat on that:** bit-identical *planes* still produce a different
 `ELEV_DATA` digest when the flow superblock is not retained across the re-bake
-(no superblock is retained under a fine namespace, so the pyramid is rebuilt
-and the difference rides through incision). Measured: **696 of 603,979,776
-control points, 1 mm each**. Physically nothing moved; on the wire the tile is
-a new identity and forces a client re-download. Unresolved.
+(no superblock is retained under a fine namespace, so the pyramid is rebuilt).
+Physically nothing moves; on the wire the tile is a new identity and forces a
+client re-download. Unresolved.
+
+> **CORRECTED 2026-08-05.** This paragraph used to claim the re-bake left
+> **696 of 603,979,776 control points different by 1 mm each**, and that the
+> difference "rides through incision". **Both halves are wrong. The real
+> difference is zero.** The comparison put a ZSTD-coded tile against a RAW one,
+> which invents differences, and `quant == 1` was read as "1 mm" when it is the
+> **code for 100 mm** — a 100× unit error. It reached a PR before it was caught.
+> Re-verified through the codec's own `elevation_control_points` operator:
+> elevation IDENTICAL and flow plane IDENTICAL on all four corridor tiles and on
+> all six wet-block tiles. See `docs/measurements/river-lateral-fill-2026-08-04.txt`
+> §6. **Always compare through the codec's own operator, never a hand-rolled
+> quantiser** — that has produced a false "terrain moved" alarm here before.
 
 **The `.vxtl` format is already sliceable.** Every block is compressed on its
 own with no state across boundaries, and the index carries
@@ -351,6 +394,13 @@ inside a lake extent are dry in the river plane — the exclusion is exactly one
 copy of the fact, unioned back by `CompositeWaterSampler`.
 
 ### Phase 4 — the far-field river actor
+
+> **DONE, 2026-08-04.** `VoxelRiverRibbonActor` consumes the producer and the
+> widening question below was settled by measurement — the policy is to draw at
+> the width the bake drew, with no screen-width floor. Full record:
+> `docs/river-farfield-actor-2026-08-04.md`. The paragraph below describes the
+> gap as it stood before that landed.
+
 `riverribbon.h` produces ordered centreline polylines (not rectangles —
 deliberately, because `lakeSheetRects` point-samples at block centres with
 `TargetCellsPerSide = 128` and gives a ~15 m axis-aligned staircase the owner

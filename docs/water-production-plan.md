@@ -1,5 +1,31 @@
 # Production water: what exists, what is missing, and the order to build it
 
+> ## SUPERSEDED — 2026-08-05
+>
+> **Do not plan from this document.** For how the water system works today, read
+> **`docs/watershed-system-plan.md`**. For what is still wrong with it, read
+> **`docs/water-deep-dive-brief-2026-08-05.md`**.
+>
+> This is kept because its reasoning is still worth reading — the
+> deterministic-content vs mutable-state split (§4), the multiplayer argument
+> (§6) and the "measure before you predict" performance discipline (§7) all
+> still hold. What has gone stale:
+>
+> * **The four blocking facts are no longer blocking.** F1 (no lake basins) and
+>   F4 (no water datum reaches the client) were both closed by the water plane
+>   and the basin registry, at `bake_ver` 9 and 8. F5 (ocean handled
+>   cosmetically) was closed when the sea became a real datum.
+> * **Every version number here is wrong now.** It says `kWorldGenVersion` 10 →
+>   11; it is **23**. `BAKE_VERSION` is **14**. `TERRAIN_VERSION` — which this
+>   document predates entirely — is **8**.
+> * **§9's work list and §10's branch triage are entirely spent.** The branches
+>   it audits were merged or deleted; the work items landed by other routes.
+> * **§3 is titled "the four blocking facts" and lists five** (F1–F5).
+>
+> One thing here that is still exactly true and worth carrying forward: *"State
+> the worldgen version beside any water figure"* (§7). Every absolute number in
+> this file expired when the versions moved, and it said so itself.
+
 **Written 2026-08-02.** Answers the owner's question:
 
 > "My assumption at the moment is that our game does not actually have the

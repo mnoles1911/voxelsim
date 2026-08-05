@@ -1,5 +1,12 @@
 # Fetching a fine tile in pieces (task #52)
 
+> **Current (2026-08-05).** This is the transport work behind the water
+> system's biggest production cost: a water-only re-bake changes 0.15–0.62% of a
+> tile's bytes and re-keys **100%** of them, which at 289 tiles and ~13 GB means
+> improving rivers would make every player re-download everything they have
+> cached. Slicing plus per-section content addressing turns that into roughly
+> 150 KB per tile. Context: `docs/watershed-system-plan.md` §7.
+
 Written 2026-08-04. Measured on the four bv12 corridor tiles at
 `tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-b52995abb/000000000135276f/s16/`.
 

@@ -1,5 +1,22 @@
 # Phase 4 — the far-field river actor
 
+> **Current, with one caveat about its numbers (noted 2026-08-05).** The
+> decision this document records — draw at the width the bake drew, no
+> screen-width floor — still stands, and the widening measurement behind it is
+> still the reason. But **every capture and width figure here is against
+> `bake_ver` 10**, which is the most fragmented and narrowest river this project
+> has produced; the bake is now at **14**, via law-driven width (12), lateral
+> fill (13) and slope face contact (14). Nothing in the actor or the producer is
+> pinned to a bake version, so the probe and the three captures can be re-run
+> unchanged — and should be, before any of these numbers is quoted as current.
+>
+> How the system works today: `docs/watershed-system-plan.md`. What is still
+> wrong with it: `docs/water-deep-dive-brief-2026-08-05.md`.
+>
+> The "52 m implicit disc" below is the **diameter** of the near-field box. Its
+> reach from the camera is **±25.6 m horizontally and ±12.8 m vertically**, and
+> the vertical half is what binds at altitude.
+
 Written 2026-08-04. Closes the Phase 4 gap in `docs/water-handover-2026-08-04.md`
 §5: `voxelcore/riverribbon.h` produced ordered centreline polylines and
 **nothing consumed them**, so flowing water was invisible beyond the 52 m

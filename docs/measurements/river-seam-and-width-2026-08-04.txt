@@ -2,6 +2,23 @@ THE PYRAMID'S DISCHARGE, AND THE WIDTH LAW
 seed 20260719, tiles (-11,-4) (-11,-5) (-12,-5) (-11,-6), bake_ver 11 -> 12
 2026-08-04
 ================================================================================
+[ NOTE ADDED 2026-08-05 -- the measurements below stand; two READINGS of them
+  do not. Nothing here is deleted; read the corrections alongside.
+
+  1. THE "165 m POSITION ERROR" AT THE SEAM IS NOT THE BINDING CONSTRAINT.
+     That 165 m was measured at an INTERIOR boundary, where nothing is
+     injected, and on a different river. In the shipped bv12 bake the reach
+     crosses one fine pixel (1.88 m) from where it left the upstream tile. The
+     residual is MAGNITUDE, not position, and the named fix -- snap to maximum
+     fine accumulation -- measured as the WORST of three candidate rules.
+     Closing measurement: river-seam-position-scoping-2026-08-04.txt.
+
+  2. THE WIDTH LAW NO LONGER DECIDES DRAWN EXTENT. `water_width_from_law` was
+     retired at bake_ver 13 in favour of a lateral fill off the ground
+     (`water.fill_to_local_surface`), because a formula-decided ribbon stopped
+     at a number rather than at the valley wall. bake_ver 14 then added slope
+     face contact. Current width figures: docs/watershed-system-plan.md §11.
+================================================================================
 
 Two PRODUCT constants, neither of which can move a height. Both were A/B'd on
 the real corridor as separate arms, because bake_ver 11's own record shows how

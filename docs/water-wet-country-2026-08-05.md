@@ -1,5 +1,20 @@
 # Wet country: the alpine block, baked at bv13
 
+> **Current (2026-08-05).** This is why the wet alpine block is now the default
+> place to measure water, and what changed when it became so. Two notes:
+>
+> * Its numbers are **`bake_ver` 13**, in cache root `D:\vox-wet-cache`,
+>   namespace `…-ba9c62170`. A `bake_ver` **14** bake of the same six tiles
+>   exists in the same root under `…-b10cf6d2c`; it adds slope face contact and
+>   the numbers here have not been re-taken against it.
+> * The probe figures quoted from this block elsewhere — 0.560% wet, 467 pieces,
+>   424.9 km of channel — come from a specific window, and getting the window
+>   wrong silently reports a dry world. The exact command is in
+>   `docs/watershed-system-plan.md` §10.
+>
+> How the system works: `docs/watershed-system-plan.md`. What is wrong with it:
+> `docs/water-deep-dive-brief-2026-08-05.md`.
+
 Every water number in this project came from one four-tile corridor. This
 records a second region chosen for the opposite reason — the most runoff in the
 world rather than merely enough of it — and what changed.

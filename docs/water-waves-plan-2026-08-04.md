@@ -1,5 +1,32 @@
 # Water: waves A–C and the backlog behind them
 
+> ## SUPERSEDED — 2026-08-05
+>
+> **Do not take work from this document.** How the system works today is
+> **`docs/watershed-system-plan.md`**; what is still wrong with it, and in what
+> order it matters, is **`docs/water-deep-dive-brief-2026-08-05.md`**.
+>
+> Where the waves ended up:
+>
+> * **Wave A landed.** The river ribbon actor is shipped
+>   (`docs/river-farfield-actor-2026-08-04.md`), the hydrostatic cap is fixed at
+>   `kWaterCAVersion` 5, and the longitudinal profile was measured.
+> * **B1 was done** — the corrected seam mechanism is in the handover and in
+>   §5 of the current design document.
+> * **B2 closed with a negative result**, already recorded inline below: the
+>   seam residual is **magnitude, not position**, and the named fix measured as
+>   the worst of three candidates.
+> * **B3 (the two-renderer tone seam) is still open and still unmeasured at a
+>   river mouth.** It is the brief's §4.7.
+> * **C0 landed. C1 was overtaken**: rather than a 16–25 tile block, six wet
+>   alpine tiles were baked, on the selection rule this document argues for —
+>   see `docs/water-wet-country-2026-08-05.md`.
+>
+> **Two numbers below are wrong and are corrected in place:** the "20,269 m
+> river" is a euclidean span, not a length (the river is 30,577 m along its own
+> channel), and the "696 control points, 1 mm each" difference was really
+> **zero**.
+
 Written 2026-08-04 after PRs #207–#211 landed. This is the plan being executed
 autonomously. `docs/water-handover-2026-08-04.md` is the state of the world;
 this is the order of work against it.
@@ -10,8 +37,10 @@ basins filled. Water placement determined by bake, filling terrain features cut
 by erosion.*
 
 **Where that stands.** On one four-tile corridor, composed the way the client
-draws it, a river runs **20,269 m from 389.0 m to −476.0 m**, 5.0% lake sheet,
-at a width that follows its own discharge (p90 7.50 m, max 15.91 m). 255 basins
+draws it, a river spans **20,269 m from 389.0 m to −476.0 m** — that is the
+euclidean hull-to-hull span, and **along its own channel it is 30,577 m,
+sinuosity 1.51** — 5.0% lake sheet, at a width that follows its own discharge
+(p90 7.50 m, max 15.91 m). 255 basins
 fill, none dry. That is the milestone met **on one corridor of four tiles out of
 289**. Wave C is what makes it true of the world.
 
@@ -118,8 +147,9 @@ salt flat or seasonal. Ribbon width p90 **7.50 m**, max **15.91 m**.
 
 **Composed the way the client draws it** (river plane ∪ the 255 lake extents,
 labelled once), reproduced off the shipped tiles: **2,679,902 composed cells**
-in 258 components; longest **20,269 m from 389.0 m to −476.0 m at 5.0% lake
-sheet**; then 17,909 m from 269.4 m; the 1,540 m head's 13,030 m component is
+in 258 components; longest **spanning 20,269 m from 389.0 m to −476.0 m at 5.0%
+lake sheet** — 30,577 m along its own channel; then 17,909 m from 269.4 m (also
+a span); the 1,540 m head's 13,030 m component is
 **94.4% lake sheet** and still must not be quoted as a river. Lake area
 8.305 km². Every figure in §"Where that stands" above is confirmed.
 
@@ -260,10 +290,17 @@ Ordered by how much they block the milestone.
    dry headroom only through active bricks. Not a budget problem: 64× the front
    budget changed nothing. Likely entangled with #60; check before building.
 2. **`ELEV_DATA` digest churn.** A water-only re-bake leaves the elevation plane
-   bit-identical but changes the tile's identity — 696 of 603,979,776 control
-   points, 1 mm each — because no flow superblock is retained under a fine
-   namespace. Physically nothing moves; on the wire every client re-downloads.
-   This gets worse with every Wave C tile.
+   bit-identical but changes the tile's identity, because no flow superblock is
+   retained under a fine namespace. Physically nothing moves; on the wire every
+   client re-downloads. This gets worse with every Wave C tile.
+
+   > **CORRECTED 2026-08-05.** This paragraph used to say the re-bake left
+   > "696 of 603,979,776 control points, 1 mm each" different. **The real
+   > difference is zero.** That reading came from comparing a ZSTD-coded tile
+   > against a RAW one, which invents differences, and from reading
+   > `quant == 1` as "1 mm" when it is the **code for 100 mm** — a 100× unit
+   > error. The identity still churns; the ground genuinely does not move at
+   > all. See `docs/measurements/river-lateral-fill-2026-08-04.txt` §6.
 3. **#52 — slicing.** Already scoped: blocks are individually framed, the index
    carries `(offset, comp_len, …)`, ZSTD median block 34,008 B against a 32–56 MB
    tile. The only open unknown is whether the transport supports byte ranges.

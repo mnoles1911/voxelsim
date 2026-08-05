@@ -1,5 +1,25 @@
 # W3, visible half: river channel carving
 
+> **Still the reference for `channel.h`; its status lines are stale
+> (2026-08-05).** The geometry, the three defects it fixed, the argument for not
+> putting a channel term in `evalSurface`, and the wiring recipe are all still
+> good. What has moved:
+>
+> * **`kWorldGenVersion` is now 23**, not the 10 this document says. That
+>   sentence was true when written and is quoted elsewhere as if it still were.
+> * **`channel.h` is still not wired into `evalSurface`.** That part has not
+>   changed.
+> * **The laws now have a second home and a different anchor.**
+>   `terrain-service/terrain_service/bake/water.py` mirrors this file's Q8 fixed
+>   point in floating point — same exponents (102/256 and 90/256), same caps,
+>   same ¾ waterline — but re-anchored on a **perennial discharge of 10 L/s**
+>   rather than on `kRiverAccumThresholdDefault`. That is a change of anchor,
+>   not of law, and the bake is what actually decides where water goes today.
+> * The `Q` values in this document's tables are **flow-accumulation units**, not
+>   m³/yr. Do not compare them with the bake's discharge figures.
+>
+> How the water system works end to end: `docs/watershed-system-plan.md`.
+
 **Status, 2026-07-29.** `voxelcore/channel.h` + `src/channel.cpp` landed:
 discharge-driven channel geometry, a graded bed that descends strictly to the
 sea, and a cut/fill cross-section whose banks hold water. Tested

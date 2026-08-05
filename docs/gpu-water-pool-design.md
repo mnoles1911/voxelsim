@@ -1,5 +1,24 @@
 # Water surface pool (`voxel.Water.GPU`)
 
+> **Current, but read it knowing it is written as a document plus errata
+> (2026-08-05).** This is still the reference for how the translucent water
+> surface is drawn and sorted. Its problem is layering: original claims are left
+> in place with `CORRECTED` and `SUPERSEDED` blocks stacked on top, so a
+> paragraph and its retraction are both present and a skim picks up the wrong
+> constant. **The current values, so you do not have to reconstruct them:**
+>
+> * opacity is **0.18–0.95, varying with depth and foam** — the `0.55` constant
+>   that the sorting argument in "Translucent sorting" is built on is dead;
+> * the pool draws **4–8 spatial sort buckets**, at **64 water bricks (51.2 m)**
+>   of world space each, capped at 12; the single sort key is gone;
+> * the near-field sweep this document calls a "65×65×33 brick disc — 52×52×26 m"
+>   reaches **±25.6 m horizontally and ±12.8 m vertically** from the camera.
+>
+> The `-VoxelWaterParityTest` protocol near the end is durable and is currently
+> buried inside an errata quote.
+>
+> How the water system works end to end: `docs/watershed-system-plan.md`.
+
 The water half of ADR-0006, `docs/gpu-g4-parity-plan.md` item 4. That item
 called it "a separate, near-identical instance of the terrain pool". This
 records how near-identical it actually turned out to be, since the answer was
