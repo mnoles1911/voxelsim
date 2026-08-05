@@ -688,3 +688,303 @@ VXC_TEST(composite_takes_the_higher_datum_and_forwards_the_sheet_half) {
     CHECK(both.basinsForTile(0, 0) == nullptr);
     CHECK(both.extentMaskFor(0, 0, 0) == nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// THE NEAR-FIELD SWEEP OFFERS NOTHING OVER DRY GROUND
+// ---------------------------------------------------------------------------
+//
+// THE TEST WHOSE ABSENCE LET A 52 m DISC OF WATER FLY AROUND FOLLOWING THE
+// CAMERA.
+//
+// On 2026-08-04 the owner flew at 618.4 m over ground at 78 m and a disc of
+// water appeared 527 m above the terrain. Every datum producer -- lake, river,
+// composite, ocean -- read DRY at that column, against every bake of the seed
+// on disk. The water was manufactured by `RefreshImplicitWater`'s candidate
+// sweep, which takes its ceiling as max(cavern flood level, baked datum) and
+// was reading the cavern half from an Amplifier over a DIFFERENT WORLD --
+// surface 638.451 m where the renderer draws 77.6 m, so flood levels reaching
+// 606.166 m. The camera-centred box's floor sits at
+// 618.4 - 16 bricks * 8 voxels * 0.1 m = 605.6 m, so 606.166 m admitted exactly
+// ONE brick per column: a flat slab at the box floor. 511 of them, which is
+// verbatim what the session log reported.
+//
+// Sixteen captures and a dozen probes missed it because EVERY ONE OF THEM
+// SAMPLED NEAR THE WATER. So the assertion this file was missing is the
+// negative one: over dry ground, at altitude, the sweep offers ZERO. That is
+// what the first test below is, and the brick arithmetic is spelled out rather
+// than collapsed to a ceiling comparison because the slab formed BETWEEN the
+// ceiling and the candidate list.
+namespace {
+
+// RefreshImplicitWater's sweep, exactly: bricks [C-R, C+R] on x/y and
+// [C-Rz, C+Rz] on z, a column rejected outright when it can hold no water at
+// any height, and every brick at or below the column ceiling offered.
+//
+// The three constants are restated from the UE translation unit (they live in
+// VoxelWaterSubsystem.cpp, which has no test harness -- the other half of why
+// this bug survived). vxc_waterdatumprobe restates the same three for the same
+// reason and its comment says so.
+constexpr int64_t kSweepRadiusBricks = 32;
+constexpr int64_t kSweepRadiusBricksZ = 16;
+constexpr int64_t kSweepBrickEdge = 8; // WaterBrick8::kEdge
+
+struct SweepColumn {
+    CavernColumn cavern;
+    int32_t bakedMm = kNoWaterMm;
+    int64_t groundMm = 0;
+};
+
+// `column(bx, by)` returns the SweepColumn at that BRICK's origin.
+template <class ColumnFn>
+int64_t sweepCandidateBricks(int64_t camVx, int64_t camVy, int64_t camVz, ColumnFn&& column) {
+    const int64_t cx = floorDiv(camVx, kSweepBrickEdge);
+    const int64_t cy = floorDiv(camVy, kSweepBrickEdge);
+    const int64_t cz = floorDiv(camVz, kSweepBrickEdge);
+    int64_t candidates = 0;
+    for (int64_t by = cy - kSweepRadiusBricks; by <= cy + kSweepRadiusBricks; ++by)
+        for (int64_t bx = cx - kSweepRadiusBricks; bx <= cx + kSweepRadiusBricks; ++bx) {
+            const SweepColumn col = column(bx, by);
+            const int64_t ceilingMm = implicitWaterCeilingMm(col.cavern, col.bakedMm, col.groundMm);
+            if (ceilingMm == kNoImplicitWaterMm) continue;
+            const int64_t topBrickZ = floorDiv(ceilingMm / int64_t(kVoxelSizeMm), kSweepBrickEdge);
+            for (int64_t bz = cz - kSweepRadiusBricksZ; bz <= cz + kSweepRadiusBricksZ; ++bz)
+                if (bz <= topBrickZ) ++candidates;
+        }
+    return candidates;
+}
+
+// A column carrying a cavern site's flood level. `segs` is the number of rooms
+// actually reaching THIS column -- zero for the overwhelming majority of them,
+// because `floodZMm` is a per-SITE value stamped onto every column inside the
+// site's ~36 m reach disc.
+SweepColumn cavernSiteColumn(int32_t floodZMm, int32_t segs, int64_t groundMm) {
+    SweepColumn c;
+    c.cavern.floodZMm = floodZMm;
+    c.cavern.count = segs;
+    for (int32_t i = 0; i < segs && i < kMaxCavernSegs; ++i) {
+        c.cavern.segs[i].marginSq = 1;
+        c.cavern.segs[i].zCenterMm = floodZMm;
+        c.cavern.segs[i].zFloorMm = floodZMm - 1000;
+    }
+    c.groundMm = groundMm;
+    return c;
+}
+
+} // namespace
+
+// The owner's frame, in the numbers the log and the overlay reported: camera
+// 618.4 m, ground 78.0 m, every datum producer dry, and a cavern flood level of
+// 606.166 m over the disc. ZERO bricks. Without the ground bound in
+// `cavernWaterCeilingMm` case 2 returns 4225 and case 3 returns 4225 -- one per
+// column, the slab; the owner's frame had a cavern site in reach of 511 of the
+// 4225 and got 511.
+VXC_TEST(implicit_sweep_offers_nothing_over_dry_ground_at_altitude) {
+    const int64_t camVx = -1603970, camVy = -853968; // world (-160397.0, -85396.8) m
+    const int64_t camVz = 6184;                      // 618.4 m
+    const int64_t groundMm = 77997;                  // the overlay's 78.0 m
+
+    // 1. Nothing in the column at all: no cavern site in reach, no baked datum.
+    {
+        const int64_t n = sweepCandidateBricks(camVx, camVy, camVz, [&](int64_t, int64_t) {
+            SweepColumn c;
+            c.groundMm = groundMm;
+            return c;
+        });
+        CHECK_EQ(n, int64_t(0));
+    }
+
+    // 2. THE MEASURED CASE. A cavern site is in reach of the column and its
+    //    flood level -- derived from the wrong world's 638 m surface -- stands
+    //    at 606.166 m, just inside the box floor at 605.6 m. The datum is dry.
+    //    The ground at 78 m is the only fact that can save this.
+    {
+        const int64_t n = sweepCandidateBricks(camVx, camVy, camVz, [&](int64_t, int64_t) {
+            return cavernSiteColumn(606166, /*segs=*/0, groundMm);
+        });
+        CHECK_EQ(n, int64_t(0));
+    }
+
+    // 3. ...and still zero where the column DOES contain cavern air, which 4 of
+    //    the owner's 511 did. "There is a real room here" is not a licence to
+    //    put water 528 m above the ground that room is cut into.
+    {
+        const int64_t n = sweepCandidateBricks(camVx, camVy, camVz, [&](int64_t, int64_t) {
+            return cavernSiteColumn(606166, /*segs=*/2, groundMm);
+        });
+        CHECK_EQ(n, int64_t(0));
+    }
+
+    // 4. The per-voxel rule agrees with the per-column ceiling that bounds it,
+    //    at the box-floor voxel the disc was actually drawn on. These are one
+    //    rule in two shapes, and a disagreement between them is either a hole
+    //    in a lake or a slab in the sky.
+    const CavernColumn wrongWorld = cavernSiteColumn(606166, 2, groundMm).cavern;
+    const int64_t floorVz =
+        (floorDiv(camVz, kSweepBrickEdge) - kSweepRadiusBricksZ) * kSweepBrickEdge;
+    CHECK_EQ(floorVz, int64_t(6056));                     // 605.6 m, the disc's height
+    CHECK(cavernFloodedAt(wrongWorld, floorVz));          // half the predicate says yes
+    CHECK(!cavernWaterAt(wrongWorld, floorVz, groundMm)); // the whole rule says no
+}
+
+// THE OTHER DIRECTION, and it is what makes the test above a fix rather than a
+// mute button. A skip that swallows real water is the exact defect this sweep
+// has already been repaired for twice -- a baked lake that was offered no
+// bricks at all, and a lake interior offered and meshed at full price. So: the
+// same sweep, over water that is really there, must still offer it.
+VXC_TEST(implicit_sweep_still_offers_real_cavern_and_lake_water) {
+    // A flooded cavern 200 m down: ground 300 m, flood 100 m, camera in the
+    // room at 99 m.
+    {
+        const int64_t camVz = 990;
+        const int64_t n = sweepCandidateBricks(0, 0, camVz, [](int64_t, int64_t) {
+            return cavernSiteColumn(100000, /*segs=*/2, 300000);
+        });
+        const int64_t cz = floorDiv(camVz, kSweepBrickEdge);
+        const int64_t top = floorDiv(int64_t(100000) / int64_t(kVoxelSizeMm), kSweepBrickEdge);
+        const int64_t perColumn = top - (cz - kSweepRadiusBricksZ) + 1;
+        const int64_t columns = (2 * kSweepRadiusBricks + 1) * (2 * kSweepRadiusBricks + 1);
+        CHECK(perColumn > 0);
+        CHECK_EQ(n, perColumn * columns);
+    }
+
+    // A baked lake standing ABOVE its bed -- the ordinary wet case, and the one
+    // that forbids clamping the baked term by the ground the way the cavern
+    // term is clamped. Ground 20 m, datum 25 m, camera just over the surface.
+    {
+        const int64_t n = sweepCandidateBricks(0, 0, 260, [](int64_t, int64_t) {
+            SweepColumn c;
+            c.bakedMm = 25000;
+            c.groundMm = 20000;
+            return c;
+        });
+        CHECK(n > 0);
+    }
+
+    // ...and the ceiling itself, so the asymmetry is asserted rather than
+    // implied by a brick count: the cavern term is bounded ABOVE by the ground,
+    // the baked term is not bounded by it at all.
+    const CavernColumn none;
+    CHECK_EQ(implicitWaterCeilingMm(none, 25000, 20000), int64_t(25000));
+    CHECK_EQ(implicitWaterCeilingMm(cavernSiteColumn(30000, 2, 20000).cavern, kNoWaterMm, 20000),
+             int64_t(20000));
+    CHECK_EQ(implicitWaterCeilingMm(cavernSiteColumn(15000, 2, 20000).cavern, kNoWaterMm, 20000),
+             int64_t(15000));
+    CHECK_EQ(implicitWaterCeilingMm(none, kNoWaterMm, 20000), kNoImplicitWaterMm);
+
+    // kNoWaterMm is INT32_MIN and a ceiling is an int64: a legitimately
+    // NEGATIVE datum (a tidal reach below sea level) must not read as dry, and
+    // the dry sentinel must not read as "water at a very low elevation".
+    CHECK_EQ(implicitWaterCeilingMm(none, -3000, -10000), int64_t(-3000));
+    CHECK(implicitWaterCeilingMm(none, kNoWaterMm, -10000) < int64_t(-3000));
+}
+
+// THE GROUND BOUND CAN ONLY EVER REMOVE WATER, AND ONLY FROM OPEN SKY.
+//
+// The implicit field is what makes unmobilized water a WALL to the CA, so a
+// change to it that ADDS water anywhere is a ledger shortfall rather than a
+// crash -- water quietly appearing, blamed later on serialization or on
+// replication. This is the exhaustive version of "it can only remove": every
+// flood level, ground and z in a range that straddles both, checked as integer
+// equality and implication, never as a tolerance.
+//
+// The third claim is the one that makes the bound safe to ship: where the flood
+// level is at or below the ground -- which is every cavern in a world whose
+// flood levels were derived from the surface being drawn -- the new predicate
+// is BIT-IDENTICAL to the old one. The bound is a no-op on correct data and a
+// hard stop on the disagreement between two worlds.
+VXC_TEST(cavern_ground_bound_only_removes_and_the_ceiling_bounds_it) {
+    const int32_t kFloods[] = {INT32_MIN, -5000, 0, 1, 12345, 77997, 606166};
+    const int64_t kGrounds[] = {-8000, 0, 20000, 77997, 300000};
+    for (int32_t flood : kFloods) {
+        for (int64_t ground : kGrounds) {
+            const int64_t ceiling = cavernWaterCeilingMm(flood, ground);
+            bool identical = true;
+            for (int64_t vz = -200; vz <= 7000; vz += 7) {
+                const bool oldRule = cavernFloodedAtLevel(flood, vz);
+                const bool newRule = cavernWaterAt(flood, vz, ground);
+                // 1. NEVER ADDS: the new rule is a subset of the old one.
+                CHECK(!newRule || oldRule);
+                // 2. THE CEILING BOUNDS THE PER-VOXEL RULE. A voxel the rule
+                //    fills must lie under the ceiling the sweep offers bricks
+                //    up to -- otherwise the sweep withholds water that exists,
+                //    which is the failure mode this sweep has already had twice.
+                if (newRule) CHECK(vz * kVoxelSizeMm < ceiling);
+                if (oldRule != newRule) identical = false;
+            }
+            // 3. A NO-OP ON CORRECT DATA: a flood level at or below the ground
+            //    (every cavern whose site surface is the surface on screen)
+            //    gives exactly the old answer at every z.
+            if (flood == INT32_MIN || int64_t(flood) <= ground) CHECK(identical);
+        }
+    }
+
+    // And the sentinel is not a very low elevation: a dry column has no ceiling
+    // at all, which is a different thing from a ceiling below every voxel.
+    CHECK_EQ(cavernWaterCeilingMm(INT32_MIN, 300000), INT64_MIN);
+    CHECK(!cavernWaterAt(INT32_MIN, -100000, 300000));
+}
+
+// UNLOADING A TILE MUST TAKE ITS LAKE INDEX WITH IT.
+//
+// `LakeSampler::TileIndex::basins` is a pointer BORROWED from a resident
+// FineTile; `FineTileSampler::unloadTile` destroys that tile. Before this test
+// the index was built once and never revalidated, so the query after an unload
+// read freed memory -- and what a freed BasinEntry draws is a lake sheet at an
+// arbitrary Z. Not reachable in the shipping client only because
+// FLakeWaterSampler owns a private sampler that never unloads; the streamer
+// already calls unloadTile, so a byte budget on the lake tier is all it takes.
+//
+// The assertion is deliberately "answers DRY", not "does not crash": reading
+// freed memory usually does not crash, which is the entire problem.
+VXC_TEST(lake_sampler_index_does_not_outlive_its_tile) {
+    const std::filesystem::path p =
+        std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
+    if (!std::filesystem::exists(p)) {
+        std::printf("  (skip: %s absent)\n", p.string().c_str());
+        return;
+    }
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    CHECK(probe.has_value());
+    if (!probe) return;
+
+    // A basin that actually holds water, so "wet before, dry after" is a real
+    // transition rather than two dry answers.
+    const BasinEntry* wet = nullptr;
+    for (const BasinEntry& b : probe->basins()) {
+        if (b.holdsWater()) {
+            wet = &b;
+            break;
+        }
+    }
+    if (wet == nullptr) {
+        std::printf("  (skip: fixture has no water-holding basin)\n");
+        return;
+    }
+    const int32_t tx = probe->tileX(), ty = probe->tileY();
+    const uint32_t size = probe->size();
+    const int64_t sx = int64_t(tx) * size + wet->seedX;
+    const int64_t sy = int64_t(ty) * size + wet->seedY;
+
+    FineTileSampler s(probe->seed());
+    CHECK(s.loadTile(bytes, &err));
+    LakeSampler lakes(s);
+    CHECK(lakes.prewarmTile(tx, ty));
+    CHECK(lakes.surfaceAtPixel(sx, sy) != kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) != nullptr);
+
+    CHECK(s.unloadTile(tx, ty));
+    CHECK_EQ(lakes.surfaceAtPixel(sx, sy), kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) == nullptr);
+    CHECK(lakes.extentMaskFor(tx, ty, 0) == nullptr);
+
+    // Reloading the same bytes gives a DIFFERENT FineTile object, so the index
+    // must be rebuilt against it rather than resurrected -- and the answer must
+    // come back.
+    CHECK(s.loadTile(bytes, &err));
+    CHECK(lakes.surfaceAtPixel(sx, sy) != kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) != nullptr);
+}

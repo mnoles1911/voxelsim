@@ -14553,6 +14553,48 @@ double UVoxelWorldSubsystem::GetSurfaceHeightUU(double WorldX, double WorldY) co
 	return double(Col.surfaceMm) / 10.0; // mm -> UU (1 UU = 10 mm)
 }
 
+bool UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm(int64 Vx, int64 Vy, int32& OutSurfaceMm,
+                                                              int32& OutCavernFloodZMm) const
+{
+	OutSurfaceMm = 0;
+	OutCavernFloodZMm = INT32_MIN; // vxc::CavernColumn::floodZMm's "dry / no site in reach"
+	if (!Impl)
+	{
+		return false;
+	}
+
+	// The same fine-tier prefetch, on the same game-thread condition, and for
+	// the same reason as GetSurfaceHeightUU above -- see its comment. Kept
+	// identical rather than skipped: UVoxelWaterSubsystem's ground query used to
+	// route through GetSurfaceHeightUU and therefore through this prefetch, and
+	// this accessor replaces that call.
+	if (Impl->FineStreamer && IsInGameThread())
+	{
+		const int64 MmX = Vx * int64(vxc::kVoxelSizeMm);
+		const int64 MmY = Vy * int64(vxc::kVoxelSizeMm);
+		Impl->FineStreamer->RequestFootprint(MmX, MmY, MmX + 1, MmY + 1);
+	}
+
+	// column(), NOT columnCached(). Two reasons, and the second is not
+	// hypothetical:
+	//
+	//   1. columnCached hands back a REFERENCE into a per-thread memo that the
+	//      next columnCached call on this thread invalidates. Handing one across
+	//      a subsystem boundary would be a dangling read waiting for a caller
+	//      that keeps it.
+	//   2. amplifier.cpp's cavern SITE memo is a `static thread_local` slot
+	//      table keyed by (seed, fi, fj) ALONE -- not by which surface function
+	//      produced the site. Two Amplifiers over two different tile samplers on
+	//      one thread therefore share sites, and the second one gets the first
+	//      one's world. That is a separate defect (filed, not fixed here), but
+	//      it is the reason this accessor exists at all: the whole point is that
+	//      the water subsystem stops running a second Amplifier.
+	const vxc::ColumnSample Col = Impl->Voxels.amplifier().column(Vx, Vy);
+	OutSurfaceMm = Col.surfaceMm;
+	OutCavernFloodZMm = Col.cavern.floodZMm;
+	return true;
+}
+
 double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const
 {
 	if (!Impl)

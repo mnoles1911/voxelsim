@@ -360,6 +360,34 @@ struct CavernSiteSlot {
     CavernSite value;
 };
 
+// ---------------------------------------------------------------------------
+// FILED, NOT FIXED: THIS MEMO IS KEYED BY (seed, fi, fj) AND NOT BY WHICH WORLD
+// ---------------------------------------------------------------------------
+// A CavernSite is a function of (seed, fi, fj, node, `surfaceAt`) -- the site's
+// anchor z is `surfaceAt(node.xMm, node.yMm) - node.depthMm` and its flood
+// level is clamped under that anchor, so the SURFACE FUNCTION is as much an
+// input as the seed is. The key below omits it, and the table is
+// `static thread_local`: shared by every Amplifier on the thread, not per
+// instance.
+//
+// So two Amplifiers over two different ITileSamplers, used on one thread,
+// silently share sites and the second one is served the first one's world.
+// Which world you get depends on call ORDER. Bit-exact determinism of a single
+// amplifier is unaffected -- one sampler, one answer, always -- which is why no
+// existing test sees it.
+//
+// THE GAME HAS EXACTLY THAT SHAPE: UVoxelWorldSubsystem's amplifier and
+// UVoxelWaterSubsystem's private one, two samplers, one game thread. A probe
+// written on 2026-08-04 hit this and had to run each sweep on its own thread to
+// get a valid measurement.
+//
+// NOT FIXED HERE, deliberately. The honest key is a per-Amplifier identity or a
+// per-instance table, both of which change the hottest allocation in worldgen,
+// and this file is on the determinism contract. It is filed with the measured
+// evidence so the fix is a decision rather than a discovery. The water
+// subsystem no longer runs a second Amplifier (VoxelWaterSubsystem.cpp,
+// 2026-08-04), which removes the one known instance of the shape but not the
+// trap.
 template <typename SurfaceFn>
 const CavernSite& cachedCavernSite(uint64_t seed, int64_t fi, int64_t fj, const CaveNode& node,
                                    const SurfaceFn& surfaceAt) {

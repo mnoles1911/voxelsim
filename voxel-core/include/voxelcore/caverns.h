@@ -632,10 +632,78 @@ constexpr bool cavernCarveAt(const CavernColumn& col, int32_t surfaceMm, int32_t
 // air, i.e. `Amplifier::materialAt(col, vz) == MAT_AIR` — is the caller's
 // job, since that needs the full ColumnSample this header doesn't have.
 // Callers: `cavernFloodedAt(col.cavern, vz) && materialAt(col, vz) == MAT_AIR`.
-constexpr bool cavernFloodedAt(const CavernColumn& col, int64_t vz) {
-    if (col.floodZMm == INT32_MIN) return false;
+// Split off the column so a client that can only carry the LEVEL across an
+// interface boundary still calls this expression rather than a second copy of
+// it. UVoxelWorldSubsystem's header is voxel-core-free by doctrine, so the one
+// number the water subsystem gets back from the terrain's amplifier is an
+// int32 flood level -- and it must not have to reconstruct a CavernColumn, nor
+// re-derive "below the flood level", to use it.
+constexpr bool cavernFloodedAtLevel(int32_t floodZMm, int64_t vz) {
+    if (floodZMm == INT32_MIN) return false;
     const int64_t zAbs = vz * kVoxelSizeMm + kVoxelSizeMm / 2;
-    return zAbs < static_cast<int64_t>(col.floodZMm);
+    return zAbs < static_cast<int64_t>(floodZMm);
+}
+
+constexpr bool cavernFloodedAt(const CavernColumn& col, int64_t vz) {
+    return cavernFloodedAtLevel(col.floodZMm, vz);
+}
+
+// THE OTHER HALF OF THE PREDICATE, IN THE ONLY CURRENCY A CLIENT ACTUALLY HAS:
+// cavern water stands BELOW the ground.
+//
+// `cavernFloodedAt` above answers one question -- "is this voxel below the
+// column's flood level" -- and leaves "and the voxel is cave air" to the
+// caller. Every shipping caller pairs it with a SOLIDITY query instead of
+// `materialAt` (WaterMobilizer's terrain half, VoxelWaterSubsystem.cpp), and
+// OPEN SKY IS NOT SOLID. So above the ground the pair degenerates to "below the
+// flood level" and a flood level standing above the querying column's ground
+// fills open air with water.
+//
+// THIS IS REACHABLE IN A CORRECT WORLD, not only a misconfigured one, which is
+// why the bound belongs here rather than in a caller's guard. `cavernSiteFor`
+// clamps the flood below the SITE's anchor -- the site's own surface minus its
+// depth -- and a column at the far edge of the site's ~36 m reach can sit lower
+// than that down a slope. No cavern room and no cave tunnel reaches above that
+// column's own surface (`cavernCarveAt`/`caveCarveAt` both require
+// kCaveRoofMinMm of rock above every carved voxel), so water there is never in
+// a cave and this bound can only ever remove water from open sky.
+//
+// AND IT IS WHAT A WRONG GROUND LOOKS LIKE. Measured 2026-08-04 at the owner's
+// floating water disc: the client's water subsystem was amplifying a
+// SyntheticTileSampler whose surface at that column is 638.451 m against the
+// 77.6 m the renderer draws, so its cavern flood levels reached 606.166 m --
+// 528 m of open sky, 511 columns, one brick each. That mismatch is fixed at its
+// source (the water subsystem now reads the terrain's own amplifier), but the
+// disc could only ever be DRAWN because nothing downstream asserted the one
+// thing that is true of cavern water by construction.
+//
+// The voxel BOTTOM against the ground, matching lakes.h's `implicitWaterFill`
+// ("zMm < groundMm -> not open air") rather than `cavernFloodedAt`'s cell
+// centre: one rule for "is this cell above the ground", shared by both terms.
+constexpr bool cavernWaterAt(int32_t floodZMm, int64_t vz, int64_t groundMm) {
+    if (vz * kVoxelSizeMm >= groundMm) return false;
+    return cavernFloodedAtLevel(floodZMm, vz);
+}
+constexpr bool cavernWaterAt(const CavernColumn& col, int64_t vz, int64_t groundMm) {
+    return cavernWaterAt(col.floodZMm, vz, groundMm);
+}
+
+// The same rule as a per-COLUMN ceiling, for the near-field brick sweep, which
+// asks "can ANY voxel of this column hold water" once per column rather than
+// once per voxel. INT64_MIN when the column can hold none at any height.
+//
+// CONSERVATIVE BY CONSTRUCTION, which is what makes it safe to reject a brick
+// on: `groundMm` may be an UPPER BOUND over a footprint
+// (UVoxelWorldSubsystem::GetSurfaceUpperBoundMm) rather than the ground at this
+// exact column, and the ceiling returned is then an upper bound too -- so this
+// can never withhold a brick `cavernWaterAt` would have filled.
+constexpr int64_t cavernWaterCeilingMm(int32_t floodZMm, int64_t groundMm) {
+    if (floodZMm == INT32_MIN) return INT64_MIN;
+    const int64_t flood = static_cast<int64_t>(floodZMm);
+    return flood < groundMm ? flood : groundMm;
+}
+constexpr int64_t cavernWaterCeilingMm(const CavernColumn& col, int64_t groundMm) {
+    return cavernWaterCeilingMm(col.floodZMm, groundMm);
 }
 
 } // namespace vxc
