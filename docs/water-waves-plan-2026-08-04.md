@@ -201,6 +201,30 @@ are comparable rather than merely similar.
 
 ---
 
+## Priority, from the owner (2026-08-04)
+
+**Underground water and flooded caverns are NOT a priority.** What matters is
+water the player sees from the surface: rivers, lakes, the ocean, and the CA
+behaviour around them.
+
+This does not retire the cavern work already done. `VoxelWaterSubsystem` was
+reading cavern flood levels from the **procedural** world while the screen
+showed the **baked** one, and that put a disc of water 527 m in the sky (PR
+#222). That was fixed because it was a *surface-visible* defect, not because
+caverns matter.
+
+What it de-prioritises, concretely:
+
+* **#63** — the cavern site memo shared across two worlds. Real, and it can make
+  caverns differ between runs, but nothing the player sees depends on it today.
+* `GetCavernFloodZUU` and `FindFloodedCavernNear`, still on the wrong
+  amplifier. They are `-VoxelCavernShot` camera-placement tools; nothing renders
+  or mobilises from them.
+* **#53**, the shelved cave/underground rework, stays shelved.
+
+**The test that decides whether cavern work is in scope:** can the player see it
+without digging? If not, it waits.
+
 ## Owner decisions taken
 
 **Tile identity: per-section content addressing, built when the server is built.**

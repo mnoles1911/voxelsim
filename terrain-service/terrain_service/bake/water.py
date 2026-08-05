@@ -43,7 +43,14 @@ BACKSTOP. A water head that comes out too high does not leak sideways and
 self-correct; it floods the whole valley. Hence:
 
   * the head is taken from Q and the long profile and from nothing else -- no
-    term in `water_surface_m` reads local relief, a bank height, or a rim;
+    term in `water_surface_m` reads local relief, a bank height, or a rim.
+    THAT IS ABOUT THE HEAD, NOT THE EXTENT, and bake_ver 13 makes the
+    distinction load bearing: `fill_to_local_surface` decides how far the
+    drawn water reaches by reading the ground and nothing else. The two are
+    not in tension -- how DEEP the water stands is a hydraulic question the
+    terrain cannot answer, and how FAR it spreads at that depth is a question
+    only the terrain can. Reading relief into the head is what has no
+    backstop; reading it into the extent is what gives the extent one;
   * OVERSHOOT IS THE PRIMARY FAILURE MODE and is gated on, not assumed away.
     `overshoot_stats` measures how much deeper the plane stands than its own
     law allows, and `lateral_extent_stats` measures how far the resulting
@@ -54,9 +61,18 @@ self-correct; it floods the whole valley. Hence:
 
 WHAT IS DELIBERATELY NOT HERE
 -----------------------------
-* **No new hydraulics.** Width and depth are `channel.h`'s published laws, at
-  its own exponents, re-anchored per §4.1.3. Two implementations of one law is
-  how the three currencies above happened.
+* **No new hydraulics.** DEPTH is `channel.h`'s published law, at its own
+  exponent, re-anchored per §4.1.3. Two implementations of one law is how the
+  three currencies above happened.
+
+  WIDTH is no longer taken from the law at all (bake_ver 13). It was, and it
+  was wrong in the specific way the law cannot see: `channel_width_m(Q)` is a
+  statement about a channel in equilibrium with its discharge, and the bake
+  does not draw a channel, it draws which CELLS OF THIS RASTER are under
+  water. On a valley floor those are not the same thing by a factor of ten.
+  `channel_width_m` and `q_for_width_m` are still here and still exact --
+  `q_drawable_m3_yr` needs the inverse to turn a raster pitch into a discharge
+  threshold, which is a question about the law and is answered by it.
 * **No lakes.** A registered basin's surface is on the wire already
   (SECTION_BASIN_TABLE, bake_ver 8) and `LakeSampler` reads it. Writing it into
   the plane as well would be a second copy of a shipped fact, free to disagree
@@ -72,6 +88,8 @@ WHAT IS DELIBERATELY NOT HERE
 from __future__ import annotations
 
 import numpy as np
+
+from . import flow as _flow
 
 __all__ = [
     "Q_PERENNIAL_M3_YR",
@@ -94,6 +112,7 @@ __all__ = [
     "discharge_source",
     "graded_water_surface",
     "widen_to_channel_width",
+    "fill_to_local_surface",
     "WIDEN_MIN_DEPTH_M",
     "water_head_mask",
     "overshoot_stats",
@@ -559,6 +578,233 @@ def widen_to_channel_width(water_m, z_ground_m, q_m3_yr, *, cell_m: float,
     stats["width_added_frac"] = float(added) / float(idx.size + added) if (
         idx.size + added) else 0.0
     return w, stats
+
+
+# --------------------------------------------------------------------------- fill
+
+def fill_to_local_surface(water_m, z_ground_m, receivers, *, cell_m: float,
+                          exclude=None,
+                          min_depth_m: float = WIDEN_MIN_DEPTH_M):
+    """Fill sideways to the LOCAL water surface. Returns ``(w, stats)``.
+
+    THE RULE THIS REPLACES, AND WHY. ``widen_to_channel_width`` paints a ribbon
+    ``channel_width_m(Q)`` across -- discharge in, metres of width out. That is
+    a formula deciding extent, and on the measured corridor it decides a ribbon
+    1-5 px wide while the terrain at the drawn water level allows p50 11-28 m
+    and p90 47-163 m. The result is a river that crosses a valley floor as a
+    strip with open air, not bank, on either side of it. THE TERRAIN SHOULD
+    SHAPE THE WATER: the same discharge belongs wide and shallow on a
+    floodplain and narrow and deep in a gorge, and only the ground can say
+    which one this is.
+
+    THE RULE::
+
+        level(c) = the water surface of the FIRST DRAWN CHANNEL CELL on c's own
+                   downstream D8 path            (NaN if there is none)
+        wet(c)  <=>  z_ground(c) <= level(c) - min_depth_m
+
+    That is Height Above Nearest Drainage, inverted: a cell is inundated when
+    it stands below the surface of the water it would flow into.
+
+    WHY THE LEVEL COMES FROM THE FLOW PATH AND NOT FROM THE NEAREST CHANNEL,
+    which is the whole design and was decided by measurement rather than by
+    argument. "Nearest" is the reading the words invite -- carry each reach's
+    surface outward, stop where the ground rises above it -- and it FLOODS THE
+    CONTINENT. Run on the corridor's four bv12 tiles it takes 317,665 wet cells
+    to 66,546,420, a factor of 209, covering 27-40% of a tile with water whose
+    median added DEPTH is 7.8 m and whose maximum is 78 m; the median cell sits
+    550-630 m from any channel. The mechanism is not exotic and it is not a bug
+    in the flood: a cell one step off a channel that lies on a ledge is below
+    that channel's surface, and so is the cell below it, and the cell below
+    that -- the nearest channel never changes as you descend, so the level is
+    never re-anchored and the fill runs down the hillside carrying a level it
+    left behind. Water does not stand 8 m deep on a hillside; it runs back to
+    the river. See ``docs/measurements/river-lateral-fill-2026-08-04.txt``.
+
+    Anchoring on the flow path fixes exactly that, because the level a cell
+    inherits is the surface of the water it actually drains into. The hillside
+    cell above a channel at 460 m gets 460 m, not the 500 m reach it happens to
+    be nearest, and it is dry. Nothing else had to be added -- no distance cap,
+    no width term, no relief term. THE CAP THAT WAS IN THE FIRST VERSION IS
+    GONE ON PURPOSE: a fill that needs a radius to stop is a formula wearing a
+    flood's clothes.
+
+    THE THREE PROPERTIES THIS HAS BY CONSTRUCTION. Two are exact; the third is
+    bounded by a quantity of the river's own, and is stated as that bound rather
+    than rounded up to "level".
+
+      * **Connected.** If ``c`` is wet then so is its receiver: they share a
+        level, and the receiver is strictly lower on the surface the forest was
+        built on. So every wet cell has a wet descending path to the channel,
+        which is what "connected to the channel" has to mean for water.
+      * **Level across a section, to the channel's own gradient.** A bank cell
+        that drains STRAIGHT into the reach inherits its float exactly -- the
+        same number, not a tolerance. A cell whose steepest descent is DIAGONAL
+        arrives a row or two downstream and inherits that row's surface, so the
+        honest bound on a section's spread is ``gradient x lateral offset``,
+        which is what the unit test asserts. Measured on the corridor that is
+        p90 0.29-0.88 m against the shipped ribbon's own p90 of 0.46-2.07 m:
+        this surface is FLATTER than the one it replaces, and the adjacent-cell
+        step distribution agrees at every percentile up to p99.
+      * **Descends downstream.** The level field is piecewise the centreline
+        surface, and ``graded_water_surface`` already guarantees that never
+        rises going down. This function does not touch a single drawn cell's
+        value; it only decides which further cells share one.
+
+    WHY IT CANNOT RUN AWAY. The wet set around a reach is ``{c : c drains to
+    this reach and stands below its surface}``. Ground rises monotonically as
+    you walk up a flow path, so that set is a collar whose edge is where the
+    ground crosses the level -- there is no path by which a level can be
+    carried into terrain that a lower reach already owns, because such terrain
+    drains to the lower reach and takes ITS number.
+
+    IT AGREES WITH THE LAKE HALF. ``basins.lake_extent_mask`` defines a lake as
+    the cells below a surface that are connected to the seed; this is the same
+    sentence with the level made a per-cell field instead of a scalar and the
+    channel in place of the seed, so "filling" means one thing across the bake.
+
+    ``water_m``  ``graded_water_surface``'s output: metres absolute, NaN dry,
+    registered basins already excluded. Every finite cell keeps its own value.
+    ``z_ground_m``  the SHIPPED (post-B5) surface, for the reason
+    ``widen_to_channel_width`` used it: it is the ground the client draws the
+    waterline against and the array the codec takes the stored depth against.
+    Outside the registered basins it is the routing surface cell for cell, so
+    the descent that makes the wet set connected holds on the array actually
+    tested.
+    ``receivers``  ``d8_receivers(z_route, ...)[0]`` -- the SAME forest
+    ``graded_water_surface`` graded along, so the water plane and its extent
+    cannot disagree about which way the river runs.
+    ``exclude``  the registered-basin mask. A basin is a BARRIER, not merely a
+    hole: its surface is on the wire in ``SECTION_BASIN_TABLE`` and the client
+    composes the two samplers, so a cell whose water would arrive through a
+    basin is left to the basin's own row rather than given a second, disagreeing
+    level here.
+    ``min_depth_m``  the codec representability floor, see ``WIDEN_MIN_DEPTH_M``.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, np.float32)
+    if z.shape != w.shape:
+        raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
+    rec = np.ascontiguousarray(receivers, dtype=np.int32).ravel()
+    if rec.size != w.size:
+        raise ValueError(
+            f"receivers has {rec.size} cells, water has {w.size}")
+    blocked = (
+        np.zeros(w.size, np.uint8) if exclude is None
+        else np.ascontiguousarray(exclude, bool).ravel().view(np.uint8)
+    )
+
+    src = np.isfinite(w)
+    n_src = int(src.sum())
+    stats = {
+        "width_centreline_cells": float(n_src),
+        "width_added_cells": 0.0,
+        "width_added_frac": 0.0,
+        "width_min_depth_m": float(min_depth_m),
+    }
+    if n_src == 0:
+        return w, stats
+
+    level = np.full(w.size, np.nan, np.float32)
+    level[src.ravel()] = w.ravel()[src.ravel()]
+    _fill_levels(level, rec, blocked, src.ravel().view(np.uint8))
+
+    reached = np.isfinite(level)
+    hand = z.ravel() - level                       # Height Above Nearest Drainage
+    wet = reached & (hand <= -np.float32(min_depth_m))
+    wet |= src.ravel()
+    flat = w.ravel()
+    flat[wet & ~src.ravel()] = level[wet & ~src.ravel()]
+
+    added = int(wet.sum()) - n_src
+    stats["width_added_cells"] = float(added)
+    stats["width_added_frac"] = (
+        float(added) / float(n_src + added) if (n_src + added) else 0.0
+    )
+    # HOW MUCH OF THE DOMAIN EVEN HAS AN ANSWER. A cell whose flow path leaves
+    # the tile, or ends in a registered basin, without meeting drawn water has
+    # NO local surface and is dry for want of a number rather than for want of
+    # room. Reporting it separates "the terrain contained the water here" from
+    # "nothing here drains to a drawn river", which look identical in a wet
+    # count and mean opposite things.
+    stats["fill_drains_to_channel_cells"] = float(int(reached.sum()))
+    stats["fill_drains_to_channel_frac"] = float(reached.mean())
+    # THE MARGIN THE FILL STOPPED ON. `hand` is metres of ground above the local
+    # water surface; on the cells that drain to a channel and stayed DRY it is
+    # how much freeboard the terrain had. A p50 of centimetres would mean the
+    # extent is riding on the codec's own LSB and the picture is one rounding
+    # away from changing; metres means the ground decided it.
+    dry_reached = reached & ~wet
+    if dry_reached.any():
+        h = hand[dry_reached]
+        for p in (50, 90):
+            stats[f"fill_dry_freeboard_p{p}_m"] = float(np.percentile(h, p))
+    if added:
+        stats["fill_added_depth_p50_m"] = float(
+            np.median(-hand[wet & ~src.ravel()]))
+        stats["fill_added_depth_max_m"] = float(
+            (-hand[wet & ~src.ravel()]).max())
+    return w, stats
+
+
+@_flow._jit(cache=True)
+def _fill_levels(level, rec, blocked, is_src):
+    """Carry each drawn cell's water surface UP its own donors. In place.
+
+    One topological sweep in receiver-before-donor order, the same shape as
+    ``flow._descent_enforce`` and for the same reason: ``rec`` is a receiver
+    forest on a surface where every receiver is strictly lower, so it is an
+    acyclic forest and one pass down-then-up is the exact answer rather than an
+    iteration to convergence.
+
+    Three kinds of cell terminate a chain and none of them is an ordering
+    accident:
+
+      * a DRAWN cell (``is_src``) -- it already carries its own graded surface
+        and is what every cell above it inherits;
+      * a BLOCKED cell (a registered basin) -- its level is NaN, so everything
+        draining through it inherits NaN and is dry here, leaving that water to
+        the basin table that already describes it;
+      * a ROOT (``rec < 0``) -- the flow path left the domain without meeting
+        drawn water, so there is no local surface and NaN is the honest answer.
+
+    The stack is grown by doubling rather than allocated at ``n``: a full-domain
+    int32 stack is 340 MB at production for a chain depth that is in practice
+    thousands.
+    """
+    n = level.size
+    done = np.zeros(n, np.uint8)
+    for i in range(n):
+        if is_src[i] != 0:
+            done[i] = 1
+        elif blocked[i] != 0:
+            done[i] = 1
+            level[i] = np.float32(np.nan)
+    stack = np.empty(1024, np.int32)
+    for start in range(n):
+        if done[start] != 0:
+            continue
+        top = 0
+        c = start
+        while True:
+            if top >= stack.size:
+                bigger = np.empty(2 * stack.size, np.int32)
+                bigger[:top] = stack[:top]
+                stack = bigger
+            stack[top] = c
+            top += 1
+            done[c] = 1
+            t = rec[c]
+            if t < 0 or done[t] != 0:
+                break
+            c = t
+        for i in range(top - 1, -1, -1):
+            c = stack[i]
+            t = rec[c]
+            if t < 0:
+                level[c] = np.float32(np.nan)
+            else:
+                level[c] = level[t]
 
 
 # --------------------------------------------------------------------------- gates

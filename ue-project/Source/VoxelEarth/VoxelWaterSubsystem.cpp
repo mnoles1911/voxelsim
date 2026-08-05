@@ -546,46 +546,17 @@ struct FVoxelWaterImpl
 			  // worldgen ground, so the ocean term keeps answering "no sea
 			  // here" however deep the pit goes. Same rule, same reason, as
 			  // IsUnderwaterAtWorld's own seabed test (work item 1).
+			  // THE BODY IS A MEMBER FUNCTION, NOT A LAMBDA BODY, and that is
+			  // not tidiness. VerifyWaterDiskRoundTrip builds a SECOND
+			  // WaterMobilizer over "the same implicit-flood / terrain-solidity
+			  // callbacks" to prove the on-disk blob reloads to the same digest,
+			  // and it did that by restating this expression. Two copies of the
+			  // implicit field is two answers to "is this cell a wall", and the
+			  // round-trip verifier would report the difference as a
+			  // SERIALIZATION bug. One body, both callers -- see
+			  // ImplicitFillAtVoxel below.
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
-			  {
-				  if (vxc::cavernFloodedAt(Amp.columnCached(vx, vy).cavern, vz))
-				  {
-					  return 255;
-				  }
-				  const int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
-				  // THE z GUARD IS A PERF GUARD AND IT IS LOAD-BEARING. This
-				  // callback is the CA's HOTTEST query -- makeSolidFn() runs it
-				  // for every genuinely-open-air cell the CA touches -- and
-				  // before the ocean term a dry column returned 0 here without
-				  // ever asking for the ground. GroundMmAt is not a cheap read:
-				  // it is an amplifier column AND, per its own comment, a
-				  // FVoxelFineTileStreamer::RequestFootprint on the game
-				  // thread. Asking for it unconditionally would have put one of
-				  // those on every dry column the CA looks at, which is most of
-				  // the world.
-				  //
-				  // The guard is exact, not a heuristic: the ocean's datum is
-				  // kSeaLevelMm, and waterFillUnits' remainder for a voxel
-				  // whose BOTTOM is at or above the datum is <= 0. So at or
-				  // above kSeaLevelVoxelZ the ocean term provably contributes
-				  // nothing and the old fast path is restored verbatim. Below
-				  // the datum a column query is unavoidable -- that is the
-				  // question being asked -- and the memo makes it one per
-				  // column rather than one per voxel.
-				  const bool bOceanPossible = bImplicitOcean && vz < vxc::kSeaLevelVoxelZ;
-				  if (BakedMm == vxc::kNoWaterMm && !bOceanPossible)
-				  {
-					  return 0;
-				  }
-				  const int32_t GroundMm = GroundMmAt(vx, vy);
-				  const int32_t SurfMm =
-					  bOceanPossible ? vxc::implicitWaterDatumMm(BakedMm, GroundMm) : BakedMm;
-				  if (SurfMm == vxc::kNoWaterMm)
-				  {
-					  return 0;
-				  }
-				  return vxc::implicitWaterFill(vz, GroundMm, SurfMm, false);
-			  },
+			  { return ImplicitFillAtVoxel(vx, vy, vz); },
 			  [this](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
 			  { return Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; })
 		// NOT the bare terrain query: makeSolidFn() layers the implicit-water
@@ -651,26 +622,37 @@ struct FVoxelWaterImpl
 
 	UVoxelWorldSubsystem& Terrain;
 
-	// THE GROUND UNDER A BAKED LAKE MUST COME FROM THE TERRAIN'S OWN AMPLIFIER,
-	// not from `Amp` below, and this is the one place in this file where that
-	// distinction is load-bearing rather than a documented caveat.
+	// EVERY WORLDGEN FACT THE WATER PATH USES COMES FROM THE TERRAIN'S OWN
+	// AMPLIFIER, not from `Amp` below. That used to read "the ground under a
+	// baked lake must", with the cavern half explicitly left behind; the cavern
+	// half joined it on 2026-08-04 and the paragraph below is why.
 	//
 	// `Amp` is built over a SyntheticTileSampler (see its comment): under
 	// -VoxelTileDir it is amplifying a DIFFERENT WORLD from the one on screen.
-	// For cavern flood levels that has been a known, tolerated inaccuracy. For
-	// a baked lake it is fatal: the datum comes from the BAKED surface, so
+	// For cavern flood levels that was a known, tolerated inaccuracy until it
+	// was measured. For a baked lake it is fatal: the datum comes from the
+	// BAKED surface, so
 	// bounding it below with the synthetic surface would put the water tens or
 	// hundreds of metres away from its own bed -- buried in rock, or a sheet
 	// hanging in the air -- and neither would look like a bug in the water
 	// code.
 	//
-	// UVoxelWorldSubsystem::GetSurfaceHeightUU is the terrain's own amplifier
-	// column, is documented as a pure query safe from the game thread, and is
-	// what AVoxelClipmapActor and the movement component already use for
-	// exactly this "where is the ground here" question. So the lake half uses
-	// it, and the cavern half is left on `Amp` unchanged -- fixing that is the
-	// column-accessor follow-up this file has been asking for and is not this
-	// change.
+	// UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm is the terrain's
+	// own amplifier column, documented as a game-thread query, and it now
+	// answers BOTH halves. So does this memo.
+	//
+	// THE CAVERN HALF FOLLOWED THE LAKE HALF OFF `Amp` ON 2026-08-04, and the
+	// paragraph above used to end "fixing that is the column-accessor follow-up
+	// this file has been asking for and is not this change". It became this
+	// change the day the tolerated inaccuracy was measured: at the owner's
+	// camera the synthetic surface is 638.451 m where the renderer draws 77.6 m,
+	// so `Amp`'s cavern flood levels stood at 606.166 m and the near-field sweep
+	// offered 511 bricks of water 528 m above the ground -- a 52 m disc, in open
+	// sky, following the camera. Nothing about that was specific to caverns
+	// being approximate; the two Amplifiers simply describe different planets.
+	//
+	// ONE CALL FOR BOTH is not an optimisation, it is the invariant: a ground
+	// from here and a flood level from anywhere else is the defect, restated.
 	//
 	// MEMOISED PER COLUMN, and the memo is only worth anything because
 	// BuildWaterFillPad sweeps z INNERMOST. That was an assumption in this
@@ -680,29 +662,102 @@ struct FVoxelWaterImpl
 	// BuildWaterFillPad for the measurement. Do not reorder that loop nest
 	// without reading it.
 	//
-	// Note the miss is not merely an amplifier column: GetSurfaceHeightUU also
-	// fires FVoxelFineTileStreamer::RequestFootprint, so a missing memo puts a
+	// Note the miss is not merely an amplifier column: the accessor also fires
+	// FVoxelFineTileStreamer::RequestFootprint, so a missing memo puts a
 	// streaming request on the game thread per voxel rather than per column.
-	int32_t GroundMmAt(int64_t vx, int64_t vy)
+	//
+	// WHAT THIS COSTS THAT THE OLD SHAPE DID NOT, stated rather than discovered:
+	// a DRY column used to answer the ImplicitFn from `Amp` alone and never
+	// reach the terrain. It now pays one terrain column, memoised, on its first
+	// voxel. That is one per column, not one per voxel, and it is unavoidable --
+	// "is there a cavern under this column" cannot be answered by the wrong
+	// world. UNMEASURED in a running editor (see this change's report).
+	void EnsureWorldgenColumn(int64_t vx, int64_t vy)
 	{
 		if (bGroundMemoValid && vx == GroundMemoVx && vy == GroundMemoVy)
 		{
-			return GroundMemoMm;
+			return;
 		}
-		const double UU = Terrain.GetSurfaceHeightUU(double(vx) * VoxelCoords::VoxelSizeUU,
-		                                             double(vy) * VoxelCoords::VoxelSizeUU);
-		// 1 UU = 10 mm (VoxelCoords.h: VoxelSizeUU 10 UU/voxel == kVoxelSizeMm
-		// 100 mm/voxel). Rounded, not truncated, so the bound does not bias a
-		// centimetre low and shave the bottom voxel off every lake.
-		GroundMemoMm = int32_t(FMath::RoundToDouble(UU * 10.0));
+		int32_t SurfaceMm = 0;
+		int32_t FloodZMm = INT32_MIN;
+		// A false return is "no world yet" (transient Entry map). The outputs
+		// are already the safe pair -- ground 0, no cavern -- so there is
+		// nothing to branch on: this must not invent water either way.
+		Terrain.GetWorldgenSurfaceAndCavernFloodMm(vx, vy, SurfaceMm, FloodZMm);
+		GroundMemoMm = SurfaceMm;
+		CavernFloodMemoMm = FloodZMm;
 		GroundMemoVx = vx;
 		GroundMemoVy = vy;
 		bGroundMemoValid = true;
+	}
+	// Absolute mm of the amplified surface. Exact now rather than rounded off a
+	// UU double: the accessor hands back the amplifier's own `surfaceMm`, which
+	// is what `GetSurfaceHeightUU` divided by 10 to make the double this used to
+	// round back. Same number, one conversion fewer.
+	int32_t GroundMmAt(int64_t vx, int64_t vy)
+	{
+		EnsureWorldgenColumn(vx, vy);
 		return GroundMemoMm;
+	}
+	// vxc::CavernColumn::floodZMm for this column, INT32_MIN where there is no
+	// site in reach.
+	int32_t CavernFloodMmAt(int64_t vx, int64_t vy)
+	{
+		EnsureWorldgenColumn(vx, vy);
+		return CavernFloodMemoMm;
 	}
 	int64_t GroundMemoVx = 0, GroundMemoVy = 0;
 	int32_t GroundMemoMm = 0;
+	int32_t CavernFloodMemoMm = INT32_MIN;
 	bool bGroundMemoValid = false;
+
+	// THE IMPLICIT STATIC WATER FIELD (C7, docs/cavern-design.md SS5.1;
+	// watershed plan §5.1 for baked lakes and §6.4 for the ocean), as one
+	// function because two callers need the identical answer -- see the note at
+	// the Mob initialiser above.
+	//
+	// The composition itself is voxel-core's (`cavernWaterAt`,
+	// `implicitWaterDatumMm`, `implicitWaterFill`) so the binding site and
+	// tests/test_lakes.cpp cannot express it differently.
+	uint8_t ImplicitFillAtVoxel(int64_t vx, int64_t vy, int64_t vz)
+	{
+		const int32_t CavernFloodMm = CavernFloodMmAt(vx, vy);
+		const int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
+		// THE z GUARD IS A PERF GUARD AND IT IS LOAD-BEARING. This callback is
+		// the CA's HOTTEST query -- makeSolidFn() runs it for every
+		// genuinely-open-air cell the CA touches.
+		//
+		// The guard is exact, not a heuristic: the ocean's datum is
+		// kSeaLevelMm, and waterFillUnits' remainder for a voxel whose BOTTOM
+		// is at or above the datum is <= 0. So at or above kSeaLevelVoxelZ the
+		// ocean term provably contributes nothing.
+		const bool bOceanPossible = bImplicitOcean && vz < vxc::kSeaLevelVoxelZ;
+		if (CavernFloodMm == INT32_MIN && BakedMm == vxc::kNoWaterMm && !bOceanPossible)
+		{
+			return 0;
+		}
+		const int32_t GroundMm = GroundMmAt(vx, vy);
+		// CAVERN WATER IS BOUNDED ABOVE BY THE GROUND, which is `cavernWaterAt`
+		// rather than the bare `cavernFloodedAt` this used to call. That
+		// predicate is only half of the pair caverns.h documents ("... &&
+		// materialAt(col, vz) == MAT_AIR"); the other half here is the
+		// mobilizer's terrain SOLIDITY query, and open sky is not solid. So
+		// above the ground the pair degenerated to "below the flood level" and
+		// a flood level above this column's ground filled open air. See
+		// cavernWaterAt's comment for why that is reachable even when both
+		// halves DO come from the same world.
+		if (vxc::cavernWaterAt(CavernFloodMm, vz, int64_t(GroundMm)))
+		{
+			return 255;
+		}
+		const int32_t SurfMm =
+			bOceanPossible ? vxc::implicitWaterDatumMm(BakedMm, GroundMm) : BakedMm;
+		if (SurfMm == vxc::kNoWaterMm)
+		{
+			return 0;
+		}
+		return vxc::implicitWaterFill(vz, GroundMm, SurfMm, false);
+	}
 
 	// OUR OWN worldgen sampler, not UVoxelWorldSubsystem's. That subsystem is
 	// another agent's file and exposes no column/cavern accessor, so — exactly
@@ -714,8 +769,25 @@ struct FVoxelWaterImpl
 	// CAVEAT, and the reason for the warning logged in OnWorldBeginPlay: a run
 	// launched with -VoxelTileDir uses a real tile-grid sampler over there and
 	// this synthetic one over here, so the surfaces disagree and cavern flood
-	// levels would be computed against the wrong terrain. Follow-up: a public
-	// column accessor on UVoxelWorldSubsystem, which its owner must add.
+	// levels are computed against the wrong terrain.
+	//
+	// THAT CAVEAT CAME DUE ON 2026-08-04 AND IS NO LONGER TOLERATED ON THE
+	// WATER PATH. Measured at the owner's camera: 638.451 m of ground here
+	// against 77.6 m on screen, so flood levels at 606.166 m and a 52 m disc of
+	// water 528 m in the air. The implicit field (ImplicitFillAtVoxel) and the
+	// near-field sweep (RefreshImplicitWater) now both take the cavern flood
+	// level from UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm --
+	// the column accessor the paragraph above was waiting for -- alongside the
+	// ground the lake half already took from there.
+	//
+	// WHAT STILL READS THIS AMPLIFIER, so it is a list and not a surprise:
+	// GetCavernFloodZUU and FindFloodedCavernNear, the -VoxelCavernShot camera
+	// placement tools. They answer "where is a flooded cavern to photograph",
+	// nothing renders or mobilises from them, and moving them needs a full
+	// ColumnSample (materialAt, not just the flood level) across the same
+	// boundary. On a baked run they will point at the synthetic world's caverns
+	// -- which is the same defect, still open, in a tool rather than in the
+	// world.
 	vxc::SyntheticTileSampler Tiles;
 	vxc::Amplifier Amp;
 
@@ -3028,16 +3100,53 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				// hands it to the CA, and the CA's own component map meshes it.
 				// So the sea gets voxels exactly where a player has been, which
 				// is what the sentence in the plan says.
-				const int32 CavernZMm = Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm;
+				//
+				// FROM THE TERRAIN'S OWN AMPLIFIER, and this line is the whole
+				// of the 2026-08-04 floating-disc defect. It read
+				// `Impl.Amp.columnCached(Vx, Vy).cavern.floodZMm` -- this file's
+				// private Amplifier over a SyntheticTileSampler, i.e. a
+				// DIFFERENT WORLD on any baked run. At the owner's camera that
+				// world's ground is 638.451 m against the 77.6 m on screen, so
+				// its cavern flood levels reached 606.166 m, the ceiling below
+				// came out above the candidate box's floor at 605.6 m, and the
+				// sweep offered one brick in each of 511 columns: a flat slab of
+				// water 528 m in the air, carried along with the camera.
+				// "511 candidate brick(s)" is verbatim what the log said.
+				const int32 CavernZMm = Impl.CavernFloodMmAt(Vx, Vy);
 				const int32 LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
 				if (CavernZMm == INT32_MIN && LakeZMm == vxc::kNoWaterMm)
 				{
 					continue; // dry column: no cavern below it and no lake on it
 				}
-				const int32 FloodZMm = FMath::Max(CavernZMm, LakeZMm);
-				// Only bricks whose bottom sits below the flood level can hold
+
+				// THE PADDED FOOTPRINT'S GROUND BOUND, now for EVERY admitted
+				// column rather than only the lake-only ones below. It bounds
+				// the cavern term from above (`vxc::implicitWaterCeilingMm`) as
+				// well as proving a lake's interior, and both need the same
+				// number over the same footprint.
+				const int64 Px0 = Vx - 1, Py0 = Vy - 1;
+				const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
+				const int64 GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
+				// MIN_int64 is the accessor's "no information" -- never a low
+				// bound (its own header says so). MAX_int64 is what "do not
+				// bound the cavern term" reads as in the ceiling below, i.e.
+				// exactly the behaviour this line had before the ground bound
+				// existed. Failing OPEN here, not closed: an unbounded ceiling
+				// offers a brick that meshes to nothing, a wrong bound deletes
+				// a lake.
+				const int64 GroundCeilMm = GroundUpperMm == MIN_int64 ? MAX_int64 : GroundUpperMm;
+
+				// max(cavern flood bounded by the ground, baked datum), as ONE
+				// function in voxel-core so this sweep and
+				// tests/test_lakes.cpp's regression cannot express it
+				// differently. Only bricks whose bottom sits below it can hold
 				// any water at all.
-				const int64 FloodBrickZ = vxc::floorDiv(int64(FloodZMm) / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
+				const int64 FloodZMm = vxc::implicitWaterCeilingMm(CavernZMm, LakeZMm, GroundCeilMm);
+				if (FloodZMm == vxc::kNoImplicitWaterMm)
+				{
+					continue; // a cavern in reach, but none of its water is in this column
+				}
+				const int64 FloodBrickZ = vxc::floorDiv(FloodZMm / vxc::kVoxelSizeMm, vxc::WaterBrick8::kEdge);
 
 				// THE INTERIOR OF A LAKE IS NOT A CANDIDATE, and skipping it is
 				// what makes a lake affordable rather than merely correct.
@@ -3073,10 +3182,14 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				//            and be wet; a shoreline anywhere in the footprint
 				//            makes them disagree and the brick stays a candidate.
 				//
-				// CAVERN COLUMNS ARE EXCLUDED ENTIRELY. cavernFloodedAt fills
-				// open cave air regardless of the ground, so "above the surface
-				// bound" proves nothing about a cavern's water and the bracket
-				// does not apply. Such a column keeps exactly today's behaviour.
+				// CAVERN COLUMNS ARE EXCLUDED FROM THIS SKIP, still. The bracket
+				// proves a brick is UNIFORM 255 -- open air below a single flat
+				// datum -- and a cavern column's water is bounded by rock and
+				// room walls, not by one datum, so "above the surface bound"
+				// says nothing about whether its brick has faces in it. (The
+				// ceiling above now DOES bound cavern water by the ground; that
+				// is a different question, and it is why this paragraph no
+				// longer claims caverns ignore the ground entirely.)
 				//
 				// EDITED BRICKS: the bound is pure worldgen and does not see the
 				// overlay, but an edit inside the water funnels through
@@ -3085,13 +3198,12 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 				// altogether (implicitFillAt returns 0 for a mobilized brick).
 				// So a brick this skip can reach is one no edit has touched.
 				const bool bLakeOnlyColumn = (CavernZMm == INT32_MIN) && (LakeZMm != vxc::kNoWaterMm);
-				int64 GroundUpperMm = MIN_int64;
 				bool bDatumUniform = false;
 				if (bLakeOnlyColumn)
 				{
-					const int64 Px0 = Vx - 1, Py0 = Vy - 1;
-					const int64 Px1 = Vx + vxc::WaterBrick8::kEdge, Py1 = Vy + vxc::WaterBrick8::kEdge;
-					GroundUpperMm = Impl.Terrain.GetSurfaceUpperBoundMm(Px0, Py0, Px1, Py1);
+					// GroundUpperMm over this same padded footprint is already
+					// in hand from the ceiling above -- it used to be fetched
+					// here, for lake-only columns only.
 					bDatumUniform = Impl.Water->waterSurfaceMmAtVoxel(Px0, Py0) == LakeZMm &&
 					                Impl.Water->waterSurfaceMmAtVoxel(Px1, Py0) == LakeZMm &&
 					                Impl.Water->waterSurfaceMmAtVoxel(Px0, Py1) == LakeZMm &&
@@ -6062,8 +6174,12 @@ bool UVoxelWaterSubsystem::VerifyWaterDiskRoundTrip(uint64& OutLiveDigest, uint6
 
 	FVoxelWaterImpl& I = *Impl;
 	vxc::WaterMobilizer FreshMob(
-		[&I](int64_t vx, int64_t vy, int64_t vz) -> uint8_t
-		{ return vxc::cavernFloodedAt(I.Amp.columnCached(vx, vy).cavern, vz) ? uint8_t(255) : uint8_t(0); },
+		// THE LIVE FIELD ITSELF, not a restatement of it. This lambda used to
+		// carry its own copy of the implicit expression, and it had already
+		// drifted: it knew about caverns and nothing about baked lakes or the
+		// ocean, so a world with either reloaded to a different digest and the
+		// verifier would have blamed serialization.
+		[&I](int64_t vx, int64_t vy, int64_t vz) -> uint8_t { return I.ImplicitFillAtVoxel(vx, vy, vz); },
 		[&I](int64_t vx, int64_t vy, int64_t vz) -> vxc::MaterialId
 		{ return I.Terrain.IsSolidAtVoxel(vx, vy, vz) ? vxc::MAT_ROCK : vxc::MAT_AIR; });
 	vxc::WaterCA FreshCA(FreshMob.makeSolidFn());

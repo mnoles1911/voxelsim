@@ -54,6 +54,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "voxelcore/caverns.h"
 #include "voxelcore/core.h"
 #include "voxelcore/tilestore.h"
 
@@ -331,9 +332,39 @@ private:
     }
 
     TileIndex* indexFor(int32_t tx, int32_t ty) {
-        auto it = index_.find(key(tx, ty));
-        if (it != index_.end()) return &it->second;
         const FineTile* t = tiles_.findTile(tx, ty);
+        auto it = index_.find(key(tx, ty));
+        if (it != index_.end()) {
+            // RESIDENCY IS RE-CHECKED ON EVERY HIT, not only on the miss that
+            // built the entry, and this is a lifetime rule rather than a
+            // freshness one. `TileIndex::basins` is a pointer BORROWED from a
+            // resident FineTile -- while `FineTileSampler::unloadTile` destroys
+            // that tile. A cached entry outliving its tile does not answer
+            // stale, it answers FREED MEMORY, and what that draws is a lake
+            // sheet at an arbitrary Z. (The masks go with it: they are indexed
+            // by that tile's own bbox.)
+            //
+            // NOT REACHABLE TODAY, and that is exactly why it is worth one hash
+            // lookup: FLakeWaterSampler owns a private FineTileSampler that
+            // never unloads, so nothing calls unloadTile underneath this map --
+            // but the STREAMER already calls it, and the day the lake tier gets
+            // a byte budget this becomes live with no other change. A floating
+            // sheet at an arbitrary height is the defect this project spent
+            // 2026-08-04 chasing from the other end.
+            //
+            // THE THIRD STATE IS WHY THIS IS NOT JUST A NULL CHECK. A partial
+            // tile (bake_ver 12) can be resident with its basin table NOT yet
+            // fetched, and can then gain it. `basins == nullptr` cached against
+            // a tile that now has a resident registry is a tile whose lakes
+            // would stay invisible forever, so that transition invalidates too.
+            const bool bExpectBasins = t != nullptr && t->hasBasins() && t->basinsResident();
+            const bool bValid = t != nullptr && (bExpectBasins ? it->second.basins == &t->basins()
+                                                              : it->second.basins == nullptr);
+            if (bValid) return &it->second;
+            index_.erase(it);
+            // The column memo answered from the entry just dropped.
+            memoValid_ = false;
+        }
         if (t == nullptr) return nullptr;
         TileIndex idx;
         // hasBasins() false means "baked before the registry existed", which
@@ -768,6 +799,48 @@ constexpr int32_t implicitWaterDatumMm(int32_t bakedSurfaceMm, int32_t groundMm)
 // `columnCached(vx, vy).surfaceMm`); it is what excludes a cave under the
 // lakebed, and the mobilizer's own terrain half re-checks solidity per cell
 // anyway. `waterSurfaceMm` is kNoWaterMm for a dry column.
+// "This column can hold no implicit water at any height", for
+// `implicitWaterCeilingMm` below. NOT kNoWaterMm: a ceiling is an int64 because
+// it is compared against absolute voxel/brick millimetres, and reusing an int32
+// sentinel in an int64 comparison is exactly the shape of trap this file's
+// `waterSurfaceMm == kNoWaterMm` guards exist to avoid.
+inline constexpr int64_t kNoImplicitWaterMm = INT64_MIN;
+
+// THE NEAR-FIELD BRICK SWEEP'S PER-COLUMN CEILING (VoxelWaterSubsystem.cpp's
+// `RefreshImplicitWater`), as one function so the sweep and the tests cannot
+// express it differently -- the same reason `implicitWaterFill` lives here
+// rather than at the binding site.
+//
+// WHY THE SWEEP NEEDS ITS OWN RULE AT ALL. The sweep does not consult the
+// ImplicitFn; it re-derives the water ceiling per column and offers every brick
+// at or below it. So it can offer bricks the fill would decline (wasted work)
+// and, far worse, it decides what the fill is ever ASKED about -- a brick the
+// sweep never offers is water that silently does not exist. Both directions
+// have now cost a diagnosis each.
+//
+// THE TWO TERMS ARE NOT SYMMETRIC, and that asymmetry is the whole content of
+// this function. Cavern water is bounded ABOVE by the ground: it is underground
+// by construction (see `cavernWaterCeilingMm`). Lake, river and sea water is
+// bounded BELOW by it: the datum stands above the bed, so a datum above the
+// ground is the ordinary WET case and clamping it would empty every lake in the
+// world. One max(), two opposite relationships to the same number.
+//
+// THE OCEAN IS DELIBERATELY ABSENT, matching the sweep: an untouched sea is
+// already drawn by AVoxelOceanActor's plane, and offering it here would be tens
+// of thousands of candidates at every shoreline. See RefreshImplicitWater's own
+// comment for the two independent reasons.
+constexpr int64_t implicitWaterCeilingMm(int32_t cavernFloodZMm, int32_t bakedSurfaceMm,
+                                         int64_t groundMm) {
+    const int64_t cav = cavernWaterCeilingMm(cavernFloodZMm, groundMm);
+    const int64_t baked =
+        bakedSurfaceMm == kNoWaterMm ? kNoImplicitWaterMm : static_cast<int64_t>(bakedSurfaceMm);
+    return cav > baked ? cav : baked;
+}
+constexpr int64_t implicitWaterCeilingMm(const CavernColumn& cavern, int32_t bakedSurfaceMm,
+                                         int64_t groundMm) {
+    return implicitWaterCeilingMm(cavern.floodZMm, bakedSurfaceMm, groundMm);
+}
+
 constexpr uint8_t implicitWaterFill(int64_t vz, int32_t groundMm, int32_t waterSurfaceMm,
                                     bool cavernFlooded) {
     if (cavernFlooded) return 255;
