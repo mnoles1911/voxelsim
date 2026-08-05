@@ -13547,6 +13547,77 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 	Seed = ParsedSeed;
 
+	// -VoxelCaveControl=<entrance-off|chamber-off|both>: RENDER THE CONTROL ARM
+	// of W3's and W4's A/B pairs (voxelcore/amplifier.h CaveControlBits).
+	//
+	// Resolved here, before Impl exists, because the mask has to be set before a
+	// single column is sampled -- the amplifier's lattice and site memos key on
+	// it, so a late flip would be honoured but a chunk already meshed would not
+	// be re-meshed, and the frame would be a blend of the two arms.
+	//
+	// IT REFUSES TO ENGAGE WITHOUT -VoxelNoGpuMesh, and that refusal is the
+	// whole reason this is safe to have. The control transforms are NOT mirrored
+	// in worldgen.ush, and GPU meshing is ON by default for the entire cascade,
+	// so with the GPU producer running the mask would be honoured only by the
+	// chunks that happened to fall back to the CPU worker: a world half
+	// controlled and half not, in one frame, with nothing in the image saying
+	// which parts were which. tools/voxel-ablate.ps1's header describes that
+	// exact failure ("the first bracket edited only the CPU while the GPU ...
+	// kept the old value") and it is why that harness refuses to start unless it
+	// finds the constant in both files. Same rule, enforced at runtime.
+	//
+	// The cost is that an A/B taken this way is taken on the CPU producer, which
+	// is ~32-38% slower to settle and is not the default render path. That is
+	// acceptable and must be STATED with the frames: BOTH arms are on the CPU
+	// producer, so the pair still differs in exactly one term, which is the
+	// property the A/B needs. What it is not is a statement about the GPU path.
+	{
+		FString CaveControlArg;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCaveControl="), CaveControlArg))
+		{
+			uint32 Mask = vxc::kCaveCtlNone;
+			if (CaveControlArg.Equals(TEXT("entrance-off"), ESearchCase::IgnoreCase))
+			{
+				Mask = vxc::kCaveCtlNoEntranceCavity;
+			}
+			else if (CaveControlArg.Equals(TEXT("chamber-off"), ESearchCase::IgnoreCase))
+			{
+				Mask = vxc::kCaveCtlNoChamberShape;
+			}
+			else if (CaveControlArg.Equals(TEXT("both"), ESearchCase::IgnoreCase))
+			{
+				Mask = vxc::kCaveCtlNoEntranceCavity | vxc::kCaveCtlNoChamberShape;
+			}
+			else
+			{
+				UE_LOG(LogVoxelEarth, Fatal,
+				       TEXT("-VoxelCaveControl=%s is not a known arm. Use entrance-off (W3: the v24 throat ")
+				       TEXT("out of the v25 world), chamber-off (W4: the v25 chamber out of the v26 world), ")
+				       TEXT("or both."),
+				       *CaveControlArg);
+			}
+
+			if (VoxelStreamAdmission::GpuMeshEnabled())
+			{
+				UE_LOG(LogVoxelEarth, Fatal,
+				       TEXT("-VoxelCaveControl=%s requires -VoxelNoGpuMesh. The control transforms exist only ")
+				       TEXT("on the CPU producer (they are not mirrored in worldgen.ush), and GPU meshing is on ")
+				       TEXT("by default for the whole cascade, so this run would have rendered a world that is ")
+				       TEXT("part control arm and part shipping arm with nothing in the image to say which. ")
+				       TEXT("Re-launch with -VoxelNoGpuMesh -- and shoot the OTHER arm with -VoxelNoGpuMesh too, ")
+				       TEXT("or the pair differs in the producer as well as in the term under test."),
+				       *CaveControlArg);
+			}
+
+			vxc::setCaveControlMask(Mask);
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("VoxelCaveControl: CONTROL ARM ENGAGED (%s, mask 0x%x) on the CPU producer. This world is ")
+			       TEXT("NOT the shipping world -- every frame from this run is a control frame and must be ")
+			       TEXT("labelled as one."),
+			       *CaveControlArg, Mask);
+		}
+	}
+
 	// Track B2 ("real .vxtl terrain tiles as a selectable tile source"):
 	// -VoxelTileDir=<path> selects a terrain-service tile-cache directory as
 	// the world's tile source instead of the synthetic sampler.
@@ -13951,8 +14022,21 @@ bool UVoxelWorldSubsystem::FindCavernPose(FVector& OutCameraUU, FRotator& OutLoo
 
 	double OriginX = 0.0, OriginY = 0.0;
 	{
+		// bShouldStopOnSeparator=FALSE, and its absence meant -VoxelCavernAt HAD
+		// NEVER WORKED. FParse::Value's default treats ',' as a token separator,
+		// so "-VoxelCavernAt=-817840,2316450" arrived here as "-817840", the
+		// Split then failed, and OriginX/OriginY silently stayed (0,0) -- the
+		// switch parsed, reported nothing, and searched the world origin. On a
+		// fine-tier run that is not even a wrong picture: the search walked into
+		// a tile that is not resident and the run died on the residency gate,
+		// which is how this was finally noticed. -VoxelSpawnAt passes `false`
+		// explicitly for exactly this reason (see ParseSpawnColumnUU); this is
+		// the same switch shape and wanted the same argument.
+		//
+		// It now also SAYS where it is searching, because "the switch was
+		// accepted" and "the switch took effect" were indistinguishable here.
 		FString AtValue;
-		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCavernAt="), AtValue))
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCavernAt="), AtValue, /*bShouldStopOnSeparator=*/false))
 		{
 			FString Xs, Ys;
 			if (AtValue.Split(TEXT(","), &Xs, &Ys))
@@ -13960,7 +14044,16 @@ bool UVoxelWorldSubsystem::FindCavernPose(FVector& OutCameraUU, FRotator& OutLoo
 				OriginX = FCString::Atod(*Xs);
 				OriginY = FCString::Atod(*Ys);
 			}
+			else
+			{
+				UE_LOG(LogVoxelEarth, Fatal,
+				       TEXT("-VoxelCavernAt=%s malformed (expected X,Y in UU). Refusing to silently search the ")
+				       TEXT("world origin instead, which is what this did before the parse was fixed."),
+				       *AtValue);
+			}
 		}
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCavernShot: searching from origin (%.0f, %.0f) UU = (%.1f, %.1f) m."),
+		       OriginX, OriginY, OriginX / 100.0, OriginY / 100.0);
 	}
 	const bool bAllowFlooded = FParse::Param(FCommandLine::Get(), TEXT("VoxelCavernFlooded"));
 
@@ -14206,8 +14299,46 @@ void UVoxelWorldSubsystem::TickCavernShot(float DeltaSeconds)
 		{
 			return; // no pawn yet; do not consume settle time
 		}
+		// -VoxelCavernPose=<X>,<Y>,<Z>,<pitch>,<yaw> in UU: SKIP the search and
+		// use this exact pose. Added for W4's A/B pair, and the pair cannot be
+		// taken without it.
+		//
+		// FindCavernPose walks to the middle of the biggest room it can find and
+		// measures the walls to place the camera. That is right for a standalone
+		// vista and WRONG for an A/B: the control arm's rooms are a different
+		// shape (that is the whole point), so the search legitimately arrives at
+		// a different camera, and the resulting pair differs in the geometry AND
+		// in where it was photographed from. Two frames like that cannot be
+		// compared -- which is the same failure as photographing a control from a
+		// different site, arriving by a subtler route.
+		//
+		// So: shoot the shipping arm, read the pose it computed off its own
+		// "ACTUAL cam=" line, and hand that pose to the control arm here.
 		FString Report;
-		if (!FindCavernPose(CavernShotCameraUU, CavernShotLookRot, Report))
+		FString PoseArg;
+		bool bPinned = false;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelCavernPose="), PoseArg, /*bShouldStopOnSeparator=*/false))
+		{
+			TArray<FString> Parts;
+			PoseArg.ParseIntoArray(Parts, TEXT(","), /*InCullEmpty=*/true);
+			if (Parts.Num() != 5)
+			{
+				UE_LOG(LogVoxelEarth, Fatal,
+				       TEXT("-VoxelCavernPose=%s malformed: expected X,Y,Z,pitch,yaw in UU (5 values, got %d). ")
+				       TEXT("Take them from the shipping arm's 'VoxelCavernShot: ACTUAL cam=' log line."),
+				       *PoseArg, Parts.Num());
+			}
+			CavernShotCameraUU = FVector(FCString::Atod(*Parts[0]), FCString::Atod(*Parts[1]),
+			                             FCString::Atod(*Parts[2]));
+			CavernShotLookRot = FRotator(float(FCString::Atod(*Parts[3])), float(FCString::Atod(*Parts[4])), 0.f);
+			bPinned = true;
+			Report = FString::Printf(
+				TEXT("pose PINNED by -VoxelCavernPose (search skipped): cam=(%.0f,%.0f,%.0f) ")
+				TEXT("rot=(pitch %.1f yaw %.1f). This frame is comparable ONLY against the frame the pose came from."),
+				CavernShotCameraUU.X, CavernShotCameraUU.Y, CavernShotCameraUU.Z,
+				CavernShotLookRot.Pitch, CavernShotLookRot.Yaw);
+		}
+		if (!bPinned && !FindCavernPose(CavernShotCameraUU, CavernShotLookRot, Report))
 		{
 			UE_LOG(LogVoxelEarth, Error, TEXT("VoxelCavernShot: %s"), *Report);
 			bCavernShotFailed = true;

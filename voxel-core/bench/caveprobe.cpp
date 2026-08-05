@@ -1728,15 +1728,37 @@ int main(int argc, char** argv) {
                                 (long long)rimOpen,
                                 openMinSurfMm == INT32_MAX ? 0.0 : openMinSurfMm / 1000.0,
                                 openMaxSurfMm == INT32_MIN ? 0.0 : openMaxSurfMm / 1000.0);
-                    // The capture path offers ONE yaw (+X: VoxelEarthGameMode
-                    // fixes it so two shots of a column differ only in the
-                    // quantity being varied), so a mouth is shootable head-on
-                    // only when its opening is displaced toward -X.
-                    if (mouth && cxM < -0.5)
-                        std::printf("             SHOOTABLE at yaw 0: -VoxelSpawnAt=%.1f,%.1f (METRES) "
-                                    "looking +X from %.1f m west\n",
-                                    nd.xMm / 1000.0 + 3.0 * cxM,
-                                    nd.yMm / 1000.0 + 3.0 * cyM, -3.0 * cxM);
+                    // THE CAMERA POSE FOR THIS MOUTH -- and the first version of
+                    // this line framed a wall.
+                    //
+                    // It stood the camera off along the WHOLE opening centroid,
+                    // (3*cxM, 3*cyM), and then told the caller to look down +X.
+                    // Those are the same direction only when cyM is 0. At the
+                    // first site it was ever used on -- lattice(-280,900),
+                    // centroid (-3.2, -2.5) -- the node sits 38 deg off +X, so
+                    // yaw 0 pointed the camera past the mouth into the hillside
+                    // beside it, and the capture came back a full frame of rock.
+                    // The gate `cxM < -0.5` was the same mistake wearing a
+                    // different hat: it asked whether the opening leaned -X,
+                    // when what matters is only that a mouth HAS an opening
+                    // direction, and it silently suppressed the pose for every
+                    // mouth that opens north or south.
+                    //
+                    // Both are gone. The bearing is derived from the same
+                    // centroid the standoff is: yaw = atan2(-cyM, -cxM), i.e.
+                    // camera-to-node, in the engine's convention (0 = +X, 90 =
+                    // +Y). -VoxelSpawnYaw exists now (W3 added it for exactly
+                    // this), so there is no longer a reason to only report the
+                    // mouths that happen to face -X.
+                    if (mouth && offM > 0.5) {
+                        const double yawDeg = std::atan2(-cyM, -cxM) * 180.0 / 3.14159265358979323846;
+                        std::printf("             SHOOTABLE: -VoxelSpawnAt=%.1f,%.1f "
+                                    "-VoxelSpawnYaw=%.1f -VoxelSpawnPitch=0 (METRES) "
+                                    "-- stands %.1f m out on the opening's own bearing and "
+                                    "looks back at the node\n",
+                                    nd.xMm / 1000.0 + 3.0 * cxM, nd.yMm / 1000.0 + 3.0 * cyM,
+                                    yawDeg, 3.0 * offM);
+                    }
                 }
                 ++listed;
             }

@@ -164,10 +164,16 @@ $argList = @(
 if ($SpawnAltM -ne 0) {
     $argList += "-VoxelSpawnAltM=$($SpawnAltM.ToString([cultureinfo]::InvariantCulture))"
 }
-if ($SpawnPitch -ne 0) {
+# EXPLICIT ZERO IS NOT ABSENT, and conflating them cost a frame. The capture
+# path's built-in default is pitch -40 yaw 45, so "-SpawnYaw 0" -- which is what
+# vxc_caveprobe's own SHOOTABLE line asks for, a mouth framed head-on along +X --
+# used to emit nothing and photograph the site at yaw 45 instead. Emit whenever
+# the caller NAMED the parameter, zero or not; omit only when they did not, which
+# keeps every pre-existing command line byte-identical.
+if ($SpawnPitch -ne 0 -or $PSBoundParameters.ContainsKey('SpawnPitch')) {
     $argList += "-VoxelSpawnPitch=$($SpawnPitch.ToString([cultureinfo]::InvariantCulture))"
 }
-if ($SpawnYaw -ne 0) {
+if ($SpawnYaw -ne 0 -or $PSBoundParameters.ContainsKey('SpawnYaw')) {
     $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
 }
 if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
@@ -295,6 +301,33 @@ if (Test-Path $LogPath) {
                        "the switches did NOT reach the ordinary spawn path (an editor built before they existed, " +
                        "or a fixture switch that poses its own camera took the spawn). This image is a GROUND " +
                        "shot; do not read landform from it.")
+    }
+
+    # THE SHUTTER POSE, WHICH IS A DIFFERENT CLAIM FROM THE SPAWN POSE, and the
+    # difference silently invalidated the framing of every capture this script
+    # ever took. VoxelEarthGameMode's screenshot path re-aimed the camera to a
+    # hard-coded (-40, 45) one line before FScreenshotRequest, AFTER
+    # InitNewPlayer had honoured -VoxelSpawnPitch/-VoxelSpawnYaw and logged
+    # "Spawn pose APPLIED". Both lines were true; only the second one was the
+    # photograph. So print them side by side and say so out loud when they
+    # disagree -- the frame is the shutter line, always.
+    $shutter = @(Select-String -Path $LogPath -SimpleMatch 'Shutter pose APPLIED:') | Select-Object -First 1
+    if ($shutter) {
+        Write-Host ("  shutter: " + ($shutter.Line -replace '^.*Shutter pose APPLIED: ', ''))
+        if ($shutter.Line -match 'pitch\s+(-?[\d.]+) deg, yaw\s+(-?[\d.]+) deg') {
+            $shotPitch = [double]$Matches[1]
+            $shotYaw   = [double]$Matches[2]
+            if ([math]::Abs($shotPitch - $SpawnPitch) -gt 0.5 -or [math]::Abs($shotYaw - $SpawnYaw) -gt 0.5) {
+                Write-Warning ("SHUTTER POSE DISAGREES WITH THE REQUEST: asked pitch $SpawnPitch yaw $SpawnYaw, " +
+                               "the frame was taken at pitch $shotPitch yaw $shotYaw. Report the SHUTTER pose, " +
+                               "not the request -- or re-shoot if the requested pose was the point.")
+            }
+        }
+    } else {
+        Write-Warning ("no 'Shutter pose APPLIED' line in the log -- either a fixture switch " +
+                       "(-VoxelCavernShot, -VoxelGICaveTest, -VoxelVistaShot, ...) posed its own camera " +
+                       "and that fixture's own log line is the authority on framing, or this editor predates " +
+                       "the shutter-pose read-back and its framing is NOT established by this log.")
     }
 
     $errs = Select-String -Path $LogPath -Pattern 'Fatal|Assertion failed' | Select-Object -First 3

@@ -2,6 +2,9 @@
 
 #include "voxelcore/biome.h"
 #include "voxelcore/carrier.h"
+// The two A/B control transforms (amplifier.h CaveControlBits). Header-only,
+// pure, and reachable here ONLY under a mask that is 0 in every shipping path.
+#include "voxelcore/cave_families.h"
 
 #include "voxelcore/detail_bedding.h"
 #include "voxelcore/detail_rill.h"
@@ -9,6 +12,20 @@
 #include <atomic>
 
 namespace vxc {
+
+// The A/B control mask (amplifier.h). Zero unless a debug switch sets it, and
+// zero is the only value any shipping path ever holds -- see the header for why
+// this is not a worldgen change and cannot move a digest. Relaxed atomics: it is
+// written once before sampling starts and then only read, so all this buys is
+// the absence of a data race on the read side.
+namespace {
+std::atomic<uint32_t> gCaveControlMask{0};
+}
+uint32_t caveControlMask() { return gCaveControlMask.load(std::memory_order_relaxed); }
+void setCaveControlMask(uint32_t mask) {
+    gCaveControlMask.store(mask, std::memory_order_relaxed);
+}
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -276,6 +293,7 @@ struct CaveLatticeSlot {
     bool valid = false;
     uint64_t seed = 0;
     int64_t ci = 0, cj = 0;
+    uint32_t ctl = 0; // amplifier.h caveControlMask(), part of the KEY -- see below
     CaveLattice value;
 };
 
@@ -291,12 +309,21 @@ const CaveLattice& cachedCaveLattice(uint64_t seed, int64_t ci, int64_t cj,
                                      const SurfaceFn& surfaceAt) {
     static thread_local CaveLatticeSlot slots[kCaveLatticeSlots];
     CaveLatticeSlot& s = slots[slotIndex(seed, ci, cj, kCaveLatticeSlots)];
-    if (s.valid && s.seed == seed && s.ci == ci && s.cj == cj) return s.value;
+    // The control mask is in the key, not just applied on miss: a mask flipped
+    // between two sweeps would otherwise be served the previous arm's lattice
+    // out of this table and the A/B would silently share cells. At the only
+    // value any shipping path uses (0) this compare is against a constant 0 and
+    // every stored entry is byte-identical to what it was before the field
+    // existed.
+    const uint32_t ctl = caveControlMask();
+    if (s.valid && s.seed == seed && s.ci == ci && s.cj == cj && s.ctl == ctl) return s.value;
     s.value = caveLatticeFor(seed, ci, cj, surfaceAt);
+    if (ctl & kCaveCtlNoEntranceCavity) s.value = caveLatticeWithoutEntranceCavity(s.value);
     s.valid = true;
     s.seed = seed;
     s.ci = ci;
     s.cj = cj;
+    s.ctl = ctl;
     return s.value;
 }
 
@@ -369,6 +396,7 @@ struct CavernSiteSlot {
     bool valid = false;
     uint64_t seed = 0;
     int64_t fi = 0, fj = 0;
+    uint32_t ctl = 0; // same argument as CaveLatticeSlot::ctl
     CavernSite value;
 };
 
@@ -377,12 +405,15 @@ const CavernSite& cachedCavernSite(uint64_t seed, int64_t fi, int64_t fj, const 
                                    const SurfaceFn& surfaceAt) {
     static thread_local CavernSiteSlot slots[kCavernSiteSlots];
     CavernSiteSlot& s = slots[slotIndex(seed, fi, fj, kCavernSiteSlots)];
-    if (s.valid && s.seed == seed && s.fi == fi && s.fj == fj) return s.value;
+    const uint32_t ctl = caveControlMask();
+    if (s.valid && s.seed == seed && s.fi == fi && s.fj == fj && s.ctl == ctl) return s.value;
     s.value = cavernSiteFor(seed, fi, fj, node, surfaceAt);
+    if (ctl & kCaveCtlNoChamberShape) s.value = cavernSiteWithoutChamberShape(s.value);
     s.valid = true;
     s.seed = seed;
     s.fi = fi;
     s.fj = fj;
+    s.ctl = ctl;
     return s.value;
 }
 

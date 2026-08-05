@@ -177,6 +177,44 @@ inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
 //    see surfaceBoundsMm -- so only `elev` grows, from 32 KB to 41.5 KB.
 inline constexpr int64_t kSurfaceBoundMaxCornersPerAxis = 72;
 
+// ---------------------------------------------------------------------------
+// THE RENDERED CONTROL ARM (debug only, OFF in every shipping path).
+//
+// cave_families.h already builds W3's and W4's controls by neutralising fields
+// of the shipping structs -- the v24 bore out of the v25 world, the v25 chamber
+// out of the v26 world -- and that is how both waves' STATISTICS were measured.
+// But those helpers were reachable only from vxc_caveprobe and test_caves, so
+// the *Verify* lines' rendered A/B pairs had no control frame available at all:
+// there was no way to ask the engine to draw the world without the term.
+//
+// A capture that shows a feature is PRESENT is worth very little without the
+// frame where it is absent, taken from the same pose in the same world -- this
+// project has been burned four separate times by a missing control, including
+// once by a W3 frame captioned "new entrance from below" that was photographing
+// an unchanged v24 throat. So the two transforms are made reachable at runtime,
+// through a mask that is ZERO unless a debug switch sets it.
+//
+// WHAT THIS IS NOT. It is not a worldgen change and it cannot move a digest:
+// with the mask at 0 (the only value any shipping path ever sets) the memo keys,
+// the call sequence and the returned bytes are exactly what they were. It is
+// also NOT mirrored in worldgen.ush, so it can only be honoured by the CPU
+// mesher -- the caller is responsible for forcing -VoxelNoGpuMesh, and the UE
+// side refuses to engage the mask without it rather than rendering a world that
+// is half controlled and half not. That half-controlled world is precisely the
+// failure tools/voxel-ablate.ps1 exists to prevent.
+enum CaveControlBits : uint32_t {
+    kCaveCtlNone = 0u,
+    kCaveCtlNoEntranceCavity = 1u << 0, // W3: entranceReachMm -> 0, leaving the v24 throat
+    kCaveCtlNoChamberShape = 1u << 1,   // W4: coaxial, round, pillar-free, flat-floored rooms
+};
+
+// Read/set the process-wide control mask. Set it ONCE, before any column is
+// sampled: the amplifier's lattice and site memos carry the mask in their keys
+// (so a flip cannot serve a stale entry), but nothing invalidates work already
+// handed to the streamer.
+uint32_t caveControlMask();
+void setCaveControlMask(uint32_t mask);
+
 class Amplifier {
 public:
     Amplifier(uint64_t seed, ITileSampler& tiles)

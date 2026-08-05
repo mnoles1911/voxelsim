@@ -1574,11 +1574,47 @@ void AVoxelEarthGameMode::BeginPlay()
 						// both the controller AND the pawn (belt and braces -
 						// the first capture attempt showed control rotation
 						// alone not reflected in the captured view).
-						PC->SetControlRotation(FRotator(-40.f, 45.f, 0.f));
+						//
+						// AND IT OVERRODE -VoxelSpawnPitch/-VoxelSpawnYaw FOR
+						// EVERY CAPTURE EVER TAKEN ON THIS PATH. InitNewPlayer
+						// parses those switches, poses the pawn, reads the pose
+						// back off the controller and logs "Spawn pose APPLIED"
+						// -- all of which was true and all of which was undone
+						// here, one line before the shutter, because this branch
+						// is what an ordinary -VoxelScreenshotAfter capture
+						// lands in. The log said -25 deg, the frame was -40/45,
+						// and nothing anywhere disagreed. The v25 entrance work
+						// added -VoxelSpawnYaw specifically so a hillside mouth
+						// could be photographed from downhill; it could not
+						// have worked.
+						//
+						// So the hard-coded pose is now the DEFAULT and not the
+						// law: absent both switches this is byte-identical to
+						// what it always did (every archived capture stays
+						// comparable), and present either one the requested pose
+						// survives to the shutter. Read back below, at the
+						// shutter, rather than trusted -- the spawn-time
+						// read-back cannot see this assignment.
+						float ShutterPitch = -40.f;
+						float ShutterYaw = 45.f;
+						const bool bReqPitch =
+							FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnPitch="), ShutterPitch);
+						const bool bReqYaw =
+							FParse::Value(FCommandLine::Get(), TEXT("VoxelSpawnYaw="), ShutterYaw);
+						const FRotator ShutterRot(ShutterPitch, ShutterYaw, 0.f);
+						PC->SetControlRotation(ShutterRot);
 						if (APawn* P = PC->GetPawn())
 						{
-							P->SetActorRotation(FRotator(-40.f, 45.f, 0.f));
+							P->SetActorRotation(ShutterRot);
 						}
+						UE_LOG(LogVoxelEarth, Log,
+						       TEXT("Shutter pose APPLIED: pitch %.1f deg, yaw %.1f deg (%s). This is the pose the ")
+						       TEXT("FRAME is taken at; 'Spawn pose APPLIED' above is the pose the PAWN spawned at, ")
+						       TEXT("and until today they could differ silently."),
+						       ShutterPitch, ShutterYaw,
+						       (bReqPitch || bReqYaw)
+						           ? TEXT("requested on the command line")
+						           : TEXT("built-in capture default, no -VoxelSpawnPitch/-VoxelSpawnYaw given"));
 					}
 					// Two captures, 2s apart, with the camera pose logged at
 					// each request so a framing failure is diagnosable from
