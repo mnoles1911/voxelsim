@@ -497,7 +497,7 @@ int main(int argc, char** argv) {
                             const int32_t g = amp.surfaceMm(nvx, nvy);
                             const int32_t d = both.waterSurfaceMmAtVoxel(nvx, nvy);
                             const uint8_t fill = implicitWaterFill(oz + z, g, d, false);
-                            return fill >= 8 ? MaterialId(1) : MAT_AIR;
+                            return fill >= 8 ? MaterialId(1) : MaterialId(MAT_AIR);
                         },
                         raw);
                     if (!raw.empty()) {
@@ -818,7 +818,7 @@ int main(int argc, char** argv) {
                                                 cy + (y < 0 ? -1 : (y >= int(edge) ? 1 : 0)));
                             const uint8_t fill =
                                 coarseWaterFill((oz + z) * cellMm, n.groundMm, n.datumMm, cellMm);
-                            return fill >= 8 ? MaterialId(1) : MAT_AIR;
+                            return fill >= 8 ? MaterialId(1) : MaterialId(MAT_AIR);
                         },
                         raw);
                     out.quads += raw.size();
