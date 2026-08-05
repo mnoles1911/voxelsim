@@ -1602,9 +1602,22 @@ def test_product_constants_roll_only_the_product_fingerprint():
     """
     terrain_base = pipeline.bake_fingerprint()
     product_base = pipeline.product_fingerprint()
+    # An enumerated constant has no "+1"; its alternative has to be another
+    # member, and it has to be a DIFFERENT member or this test would pass
+    # vacuously on the one field whose values are not numbers.
+    named_alt = {
+        "water_extent_mode": next(
+            m for m in BakeConstants.EXTENT_MODES
+            if m != pipeline.CONSTANTS.water_extent_mode
+        ),
+    }
     for name in BakeConstants.PRODUCT_FIELDS:
         cur = getattr(pipeline.CONSTANTS, name)
-        alt = (not cur) if isinstance(cur, bool) else cur + 1.0
+        if name in named_alt:
+            alt = named_alt[name]
+        else:
+            alt = (not cur) if isinstance(cur, bool) else cur + 1.0
+        assert alt != cur
         alt_consts = dataclasses.replace(pipeline.CONSTANTS, **{name: alt})
         assert pipeline.product_fingerprint(alt_consts) != product_base, (
             f"{name} does not roll the product fingerprint"
@@ -2437,3 +2450,281 @@ def test_width_takes_the_nearest_reach_not_the_highest():
     # trunk's is higher and its law reaches that far.
     assert np.isfinite(out[:, b - 1]).all()
     np.testing.assert_allclose(out[:, b - 1], 96.0)
+
+
+# ---------------------------------------------------------------------------
+
+
+# bake_ver 13: extent from the terrain, not from a formula.
+#
+# EVERY FIXTURE HERE USES A REALISTIC VALLEY GRADIENT, and that is not
+# decoration. The rule anchors a cell's water level on the reach it DRAINS TO,
+# so on a floor that falls downstream faster than it falls toward the channel
+# the D8 arrow points along the valley and the fill correctly declines to reach.
+# The measured corridor falls 389 m over 30,577 m of channel -- 0.024 m per
+# 1.875 m pixel -- so a fixture at 0.25 m/px is a 13% grade, is nothing in this
+# world, and quietly tests the opposite of what it says. (It was written that
+# way first and it failed for exactly this reason.)
+
+_DOWN = 0.02   # m per pixel along the valley, the corridor's own mean gradient
+
+
+def _flow_forest(z, cell_m=1.875):
+    """A D8 receiver forest on a sink-filled copy of `z`, as B6 builds one."""
+    from terrain_service.bake import flow
+
+    rec, _ = flow.d8_receivers(
+        flow.fill_depressions(np.ascontiguousarray(z, np.float32)), cell_m)
+    return rec
+
+
+def _valley(n, lateral, incision=1.0, depth=1.5, down=_DOWN):
+    """A trench down the middle of a floor that falls `down` m/px downstream.
+
+    Returns `(z, water)`. `lateral` is the cross-valley gradient in m/px, which
+    is the only thing that differs between the floodplain and the gorge below.
+    """
+    cx = n // 2
+    z = (100.0
+         - np.arange(n, dtype=np.float32)[:, None] * down
+         + np.abs(np.arange(n) - cx).astype(np.float32)[None, :] * lateral)
+    z = np.ascontiguousarray(z, np.float32)
+    z[:, cx] -= incision
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, cx] = z[:, cx] + depth
+    return z, water
+
+
+def test_lateral_fill_widens_on_a_floodplain_and_stays_narrow_in_a_gorge():
+    """THE POINT OF THE CHANGE, as one assertion.
+
+    Two reaches with the SAME incision carrying the SAME depth of water down the
+    SAME gradient. One sits in a floor that rises 0.05 m per pixel to either
+    side, the other in a slot that rises 4 m. A width law reads only Q and would
+    draw them identically, because Q is identical. The terrain says they are not
+    the same river, and after this change the bake says so too.
+    """
+    n = 96
+    mid = n // 2
+    got = {}
+    for name, lateral in (("pan", 0.05), ("slot", 4.0)):
+        z, water = _valley(n, lateral)
+        out, _ = pipeline._water.fill_to_local_surface(
+            water, z, _flow_forest(z), cell_m=1.875)
+        got[name] = int(np.isfinite(out[mid]).sum())
+
+    assert got["pan"] > 12, got
+    assert got["slot"] <= 3, got
+    # And the ratio, so a future change that narrows the pan or floods the slot
+    # fails here rather than in a screenshot.
+    assert got["pan"] >= 8 * got["slot"], got
+
+
+def test_lateral_fill_cross_section_is_level_to_the_channels_own_gradient():
+    """THE OWNER'S SECOND TESTABLE PROPERTY, stated as tightly as it is true.
+
+    "If the left bank and right bank of one cross-section sit at different
+    heights, the fill is wrong." A bank cell that drains STRAIGHT into the reach
+    inherits the reach cell's float exactly -- not to a tolerance, the same
+    number. What is not exact is the cell whose steepest descent is DIAGONAL:
+    it reaches the channel a row or two downstream and inherits that row's
+    surface, which is lower by the channel's own gradient. So the honest bound
+    is not zero, it is THE CHANNEL'S OWN FALL over the offset:
+
+        spread across a section  <=  gradient * lateral offset
+
+    and it is asserted here at that bound rather than at a round number. On the
+    measured corridor this is worth p90 0.29-0.88 m against the shipped ribbon's
+    own p90 of 0.46-2.07 m, i.e. the fill's surface is FLATTER than the one it
+    replaces; the adjacent-cell step distribution says the same thing at every
+    percentile to p99. See docs/measurements/river-lateral-fill-2026-08-04.txt.
+
+    The bed is deliberately ASYMMETRIC -- the left flank rises twice as fast as
+    the right -- so a rule that tapered the surface with distance, or with the
+    local bed, is caught here rather than passing on a symmetric fixture.
+    """
+    n = 64
+    cx = n // 2
+    x = np.arange(n, dtype=np.float32)[None, :]
+    z = np.ascontiguousarray(
+        100.0 - np.arange(n, dtype=np.float32)[:, None] * _DOWN
+        + np.maximum(cx - x, 0.0) * 0.08 + np.maximum(x - cx, 0.0) * 0.04,
+        np.float32)
+    z[:, cx] -= 1.0
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, cx] = z[:, cx] + 1.5
+
+    out, _ = pipeline._water.fill_to_local_surface(
+        water, z, _flow_forest(z), cell_m=1.875)
+    asym = 0
+    rows = range(4, n - 4)
+    for r in rows:
+        cols = np.flatnonzero(np.isfinite(out[r]))
+        assert cols.size >= 3, (r, cols)
+        lvl = out[r, cols]
+        offset = max(cx - cols.min(), cols.max() - cx)
+        assert lvl.max() - lvl.min() <= _DOWN * offset + 1e-4, (
+            r, offset, np.unique(lvl))
+        # the cells immediately either side of the channel drain straight in,
+        # so THEY are exact.
+        assert out[r, cx - 1] == out[r, cx] == out[r, cx + 1], r
+        asym += (cx - cols.min()) != (cols.max() - cx)
+    # The gentler right flank reaches further on most sections. Without this a
+    # symmetric fixture would make the assertions above pass for free.
+    assert asym > len(list(rows)) // 2, asym
+
+
+def test_lateral_fill_does_not_run_down_a_hillside():
+    """THE FAILURE THAT KILLED THE FIRST VERSION, kept as a test.
+
+    A channel on a LEDGE with a cliff beside it. Every cell down that cliff is
+    below the channel's water surface and 8-connected to it, so a fill anchored
+    on the NEAREST channel admits the whole slope -- which is how the first
+    implementation turned 317,665 corridor cells into 66,546,420 at a median
+    added depth of 7.8 m. Anchored on the flow path instead, the cliff cells
+    take the level of what they drain into, which is not this reach.
+
+    The fixture asserts its own premise first: if the cliff were NOT below the
+    channel's waterline this test would pass without testing anything.
+    """
+    n = 48
+    ledge = 12
+    z = np.zeros((n, n), np.float32)
+    z += np.arange(n, dtype=np.float32)[:, None] * -_DOWN
+    z[:, ledge + 1:] -= 40.0                                   # a 40 m cliff
+    z[:, ledge] -= 1.0                                         # the channel
+    z = np.ascontiguousarray(z, np.float32)
+    water = np.full((n, n), np.nan, np.float32)
+    water[:, ledge] = z[:, ledge] + 0.9
+
+    cliff = np.zeros((n, n), bool)
+    cliff[:, ledge + 2:] = True
+    assert (z[cliff] < water[:, ledge].min() - 1.0).all(), (
+        "premise: the whole cliff must stand below the channel's waterline"
+    )
+
+    out, stats = pipeline._water.fill_to_local_surface(
+        water, z, _flow_forest(z), cell_m=1.875)
+    assert not np.isfinite(out[cliff]).any(), (
+        f"{int(np.isfinite(out[cliff]).sum())} cells of cliff face drawn wet"
+    )
+    # Whatever it did add stands no deeper than the channel's own 0.9 m.
+    if stats["width_added_cells"]:
+        assert stats["fill_added_depth_max_m"] <= 0.9 + 1e-4
+
+
+def test_lateral_fill_is_connected_and_never_deeper_than_its_own_reach():
+    """Every wet cell has a wet DESCENDING path to a drawn cell.
+
+    That is what "connected to the channel" has to mean for water, and here it
+    is a property of the rule rather than a check the rule performs: a cell and
+    its receiver share a level and the receiver is lower. Walked explicitly on
+    NOISY ground, because the argument is only as good as the forest it assumes.
+    """
+    rng = np.random.default_rng(7)
+    n = 80
+    cx = n // 2
+    z, water = _valley(n, 0.05, incision=0.6, depth=1.1)
+    z = np.ascontiguousarray(z + rng.normal(0.0, 0.02, (n, n)), np.float32)
+    water[:, cx] = z[:, cx] + 1.1
+    rec = _flow_forest(z)
+
+    out, _ = pipeline._water.fill_to_local_surface(water, z, rec, cell_m=1.875)
+    wet = np.isfinite(out).ravel()
+    src = np.isfinite(water).ravel()
+    zf = z.ravel()
+    of = out.ravel()
+    rf = np.asarray(rec, np.int64).ravel()
+    walked = 0
+    for c in np.flatnonzero(wet & ~src):
+        cur = int(c)
+        steps = 0
+        while not src[cur]:
+            nxt = int(rf[cur])
+            assert nxt >= 0, f"{c} drains off the domain but is wet"
+            assert wet[nxt], f"{c} is wet but its receiver {nxt} is dry"
+            assert of[nxt] == of[c], "the path changed level"
+            cur = nxt
+            steps += 1
+            assert steps < n * n
+        # and it never stands deeper than the reach it belongs to
+        assert of[c] - zf[c] <= of[cur] - zf[cur] + 1e-4
+        walked += 1
+    assert walked > 100, walked
+
+
+def test_lateral_fill_leaves_the_centreline_untouched():
+    """The fill ADDS cells. It must not move one that was already drawn.
+
+    The guardrail on this change is that the water surface still never rises
+    going downstream, and that property belongs to ``graded_water_surface``.
+    This is the assertion that the extent step cannot break it: every finite
+    cell of the input is the same float in the output.
+    """
+    n = 56
+    cx = n // 2
+    z, water = _valley(n, 0.03, incision=0.8, depth=1.0)
+    out, _ = pipeline._water.fill_to_local_surface(
+        water, z, _flow_forest(z), cell_m=1.875)
+    src = np.isfinite(water)
+    np.testing.assert_array_equal(out[src], water[src])
+    assert np.isfinite(out).sum() > src.sum()
+    assert np.all(np.diff(out[:, cx]) <= 0.0)
+
+
+def test_lateral_fill_treats_a_registered_basin_as_a_barrier():
+    """A basin is not merely a hole in the output; water may not pass THROUGH it.
+
+    Its surface is already on the wire in SECTION_BASIN_TABLE and the client
+    composes the two samplers, so a cell whose water would arrive by way of a
+    basin has to be left to the basin's own row -- writing it here would be a
+    second, freely-disagreeing copy of a shipped fact.
+    """
+    n = 40
+    z, water = _valley(n, 0.02, incision=1.0, depth=1.5)
+    rec = _flow_forest(z)
+    excl = np.zeros((n, n), bool)
+    excl[20, :] = True                      # a basin straddling the whole reach
+    water[excl] = np.nan                    # as graded_water_surface leaves it
+
+    out, _ = pipeline._water.fill_to_local_surface(
+        water, z, rec, cell_m=1.875, exclude=excl)
+    assert not np.isfinite(out[excl]).any(), "the fill wrote inside a basin"
+    free, _ = pipeline._water.fill_to_local_surface(water, z, rec, cell_m=1.875)
+    assert np.isfinite(out).sum() < np.isfinite(free).sum(), (
+        "excluding a basin removed nothing; the mask is not doing anything"
+    )
+
+
+def test_lateral_fill_is_dry_where_nothing_drains_to_drawn_water():
+    """No local surface, no water -- and the count is reported, not swallowed.
+
+    A cell whose flow path leaves the domain without meeting drawn water has no
+    answer to inherit. That is a different thing from "the terrain contained the
+    water here" and the two look identical in a wet count, so the stats separate
+    them.
+    """
+    n = 32
+    z = np.ascontiguousarray(
+        np.broadcast_to(100.0 - np.arange(n, dtype=np.float32)[:, None] * _DOWN,
+                        (n, n)), np.float32)
+    water = np.full((n, n), np.nan, np.float32)     # nothing drawn at all
+    out, stats = pipeline._water.fill_to_local_surface(
+        water, z, _flow_forest(z), cell_m=1.875)
+    assert not np.isfinite(out).any()
+    assert stats["width_added_cells"] == 0.0
+    assert "fill_drains_to_channel_frac" not in stats  # no sources, no report
+
+    z2, w2 = _valley(n, 0.02)
+    out2, stats2 = pipeline._water.fill_to_local_surface(
+        w2, z2, _flow_forest(z2), cell_m=1.875)
+    assert 0.0 < stats2["fill_drains_to_channel_frac"] <= 1.0
+    assert np.isfinite(out2).sum() > np.isfinite(w2).sum()
+
+
+def test_extent_mode_is_enumerated_and_a_typo_is_refused():
+    """A misspelt mode must be a refusal, not a silent centreline."""
+    for mode in BakeConstants.EXTENT_MODES:
+        dataclasses.replace(pipeline.CONSTANTS, water_extent_mode=mode)
+    with pytest.raises(ValueError, match="water_extent_mode"):
+        dataclasses.replace(pipeline.CONSTANTS, water_extent_mode="lateral-fill")
