@@ -255,3 +255,15 @@ target_link_libraries(vxc_farwaterprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_farwaterprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_farwaterschemes: the ring cascade against the two proposed
+#     alternatives -- (A) a displaced heightfield strip, (B) that surface plus an
+#     instanced rim -- all four schemes counted off ONE shared water field so a
+#     difference between rows is a difference between SCHEMES. Also measures the
+#     scaling exponents of rim length and interior area at a fixed cell size,
+#     which is the test B's whole argument rests on.
+add_executable(vxc_farwaterschemes farwaterschemes.cpp)
+target_link_libraries(vxc_farwaterschemes PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_farwaterschemes PRIVATE -Wall -Wextra -Werror)
+endif()
