@@ -2495,7 +2495,7 @@ def _valley(n, lateral, incision=1.0, depth=1.5, down=_DOWN):
     return z, water
 
 
-def test_lateral_fill_widens_on_a_floodplain_and_stays_narrow_in_a_gorge():
+def test_lateral_fill_widens_on_a_floodplain_and_stays_narrow_in_a_gorge(_real_kernels):
     """THE POINT OF THE CHANGE, as one assertion.
 
     Two reaches with the SAME incision carrying the SAME depth of water down the
@@ -2520,7 +2520,7 @@ def test_lateral_fill_widens_on_a_floodplain_and_stays_narrow_in_a_gorge():
     assert got["pan"] >= 8 * got["slot"], got
 
 
-def test_lateral_fill_cross_section_is_level_to_the_channels_own_gradient():
+def test_lateral_fill_cross_section_is_level_to_the_channels_own_gradient(_real_kernels):
     """THE OWNER'S SECOND TESTABLE PROPERTY, stated as tightly as it is true.
 
     "If the left bank and right bank of one cross-section sit at different
@@ -2574,7 +2574,7 @@ def test_lateral_fill_cross_section_is_level_to_the_channels_own_gradient():
     assert asym > len(list(rows)) // 2, asym
 
 
-def test_lateral_fill_does_not_run_down_a_hillside():
+def test_lateral_fill_does_not_run_down_a_hillside(_real_kernels):
     """THE FAILURE THAT KILLED THE FIRST VERSION, kept as a test.
 
     A channel on a LEDGE with a cliff beside it. Every cell down that cliff is
@@ -2613,7 +2613,7 @@ def test_lateral_fill_does_not_run_down_a_hillside():
         assert stats["fill_added_depth_max_m"] <= 0.9 + 1e-4
 
 
-def test_lateral_fill_is_connected_and_never_deeper_than_its_own_reach():
+def test_lateral_fill_is_connected_and_never_deeper_than_its_own_reach(_real_kernels):
     """Every wet cell has a wet DESCENDING path to a drawn cell.
 
     That is what "connected to the channel" has to mean for water, and here it
@@ -2653,7 +2653,7 @@ def test_lateral_fill_is_connected_and_never_deeper_than_its_own_reach():
     assert walked > 100, walked
 
 
-def test_lateral_fill_leaves_the_centreline_untouched():
+def test_lateral_fill_leaves_the_centreline_untouched(_real_kernels):
     """The fill ADDS cells. It must not move one that was already drawn.
 
     The guardrail on this change is that the water surface still never rises
@@ -2672,7 +2672,7 @@ def test_lateral_fill_leaves_the_centreline_untouched():
     assert np.all(np.diff(out[:, cx]) <= 0.0)
 
 
-def test_lateral_fill_treats_a_registered_basin_as_a_barrier():
+def test_lateral_fill_treats_a_registered_basin_as_a_barrier(_real_kernels):
     """A basin is not merely a hole in the output; water may not pass THROUGH it.
 
     Its surface is already on the wire in SECTION_BASIN_TABLE and the client
@@ -2696,7 +2696,7 @@ def test_lateral_fill_treats_a_registered_basin_as_a_barrier():
     )
 
 
-def test_lateral_fill_is_dry_where_nothing_drains_to_drawn_water():
+def test_lateral_fill_is_dry_where_nothing_drains_to_drawn_water(_real_kernels):
     """No local surface, no water -- and the count is reported, not swallowed.
 
     A cell whose flow path leaves the domain without meeting drawn water has no
