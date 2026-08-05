@@ -103,6 +103,40 @@ jobs:
               sys.exit(1)
           print("float-ban clean")
 
+  # No CI job compiles the Unreal module -- see .github/workflows/ue-build.yml
+  # for the measurement that says why (the engine is a 30 GB install; a hosted
+  # runner has a 14 GB disk). This job is the engine-free substitute for the
+  # one defect class that has actually shipped because of that gap.
+  #
+  # VoxelSweBreachFixture.cpp and VoxelOceanCaptureFixture.cpp each declared
+  # `using FRunRef` for a different type with internal linkage. Separate
+  # translation units make that correct C++; UBT concatenates a module's .cpp
+  # files into unity blobs, and in one blob the two names are one scope. The
+  # default build failed. `-DisableUnity` hid it, which is how it shipped
+  # (PR #210). Nothing in review, in a `-DisableUnity` build, or in any other
+  # CI job here can see that class.
+  #
+  # The lint models the scope rules rather than banning anonymous namespaces
+  # (~30 files use them correctly): a name is a hazard when it is reachable by
+  # UNQUALIFIED lookup at file scope, which includes anonymous-namespace
+  # members, file-scope statics, and -- the mechanism that actually fired --
+  # a named namespace hoisted by a file-scope `using namespace`. Aliases and
+  # variables collide when they DIFFER, functions when their signatures MATCH,
+  # types always. Findings are silenced one at a time by an annotation that
+  # must carry a reason; unused annotations are failures, as in shader-ub-lint.
+  #
+  # Runs on ubuntu because it needs nothing but Python and the source tree.
+  unity-collision-lint:
+    name: Unity internal-linkage collision lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Lint ue-project modules for unity name collisions
+        run: python tools/lint-unity-collisions.py
+
   # ADR-0001 determinism surface: the M0 gate passed on AMD and failed on
   # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.ush's
   # floorDiv derived its flooring correction from `a % b` and HLSL leaves `%`
