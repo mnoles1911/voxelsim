@@ -1,0 +1,309 @@
+================================================================
+vxc_waterrefreshprobe -- near-field water disc, per second of flight
+Generated 2026-08-05T19:49:15Z on claude/water-ring-invalidation
+================================================================
+
+##### CASE 1: bv14, low pass over the braided reach (2 m AGL, 15 m/s)
+# tiles: /d/voxelsim/tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-b10cf6d2c/000000000135276f/s16
+
+zstd: bound from 'libzstd.dll'
+seed 20260719  tiles 4 (refused 0)  pixel 1875 mm  tile span 15360.0 m
+
+flight: start (-154960, -89360) m, heading 45 deg, 15 m/s, 2 m AGL, climb 0.0 m/s, 10 s at 60 fps  -> 150 m travelled
+
+=== GROUND-FLOOR PROOF CHECK at the start camera ===
+  today's sweep offers      67600 brick(s)
+  the ground floor rejects  46475 (68.8%)
+  of those, NON-EMPTY       0   <- must be 0
+
+=== FULL-DISC REBUILD (today) ===
+  frames                       600  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.3 /s
+    candidate columns swept     56192.5 /s
+    candidate bricks offered   899080.0 /s
+    BRICKS RE-MESHED            11520.0 /s
+      of those, non-empty        1440.0 /s
+    QUADS REGENERATED            4053.3 /s
+    bricks evicted                  0.0 /s
+    queued then DISCARDED      880838.4 /s  (swept, never meshed)
+    cpu in sweep                 134.79 ms/s
+    cpu in mesh                  459.47 ms/s
+  WORST SINGLE FRAME
+    sweep                        15.824 ms   (4225 columns, 67600 offered)
+    sweep + mesh                 24.299 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                        15.824 ms   (4225 columns)
+    sweep + mesh                 24.299 ms
+  QUEUE
+    longest                    67408 brick(s)
+    frames with work pending   600 of 600 (100.0%)
+
+=== INCREMENTAL SHIFT-AND-FILL (waterwindow.h) ===
+  frames                       600  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.3 /s
+    candidate columns swept      2125.3 /s
+    candidate bricks offered    34004.8 /s
+    BRICKS RE-MESHED            11520.0 /s
+      of those, non-empty        1440.0 /s
+    QUADS REGENERATED            4038.2 /s
+    bricks evicted              27244.8 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                  17.81 ms/s
+    cpu in mesh                  453.19 ms/s
+  WORST SINGLE FRAME
+    sweep                         9.608 ms   (4225 columns, 67600 offered)
+    sweep + mesh                 16.880 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         2.722 ms   (129 columns)
+    sweep + mesh                 13.174 ms
+  QUEUE
+    longest                    67408 brick(s)
+    frames with work pending   600 of 600 (100.0%)
+
+=== INCREMENTAL + PROVEN GROUND FLOOR (surfaceLowerBoundMm) ===
+  frames                       600  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.3 /s
+    candidate columns swept      2125.3 /s
+    candidate bricks offered    10626.5 /s
+    BRICKS RE-MESHED             9284.4 /s
+      of those, non-empty        3713.8 /s
+    QUADS REGENERATED           10428.8 /s
+    bricks evicted               8514.0 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                   5.86 ms/s
+    cpu in mesh                  378.55 ms/s
+  WORST SINGLE FRAME
+    sweep                         6.333 ms   (4225 columns, 21125 offered)
+    sweep + mesh                 14.017 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         0.970 ms   (129 columns)
+    sweep + mesh                 12.234 ms
+  QUEUE
+    longest                    20933 brick(s)
+    frames with work pending   447 of 600 (74.5%)
+
+=== EQUIVALENCE ===
+  OK: identical live brick set on all 600 frames.
+
+=== INCREMENTAL vs FULL, per second of flight ===
+  columns swept       56192.5 ->     2125.3   (26.4x less)
+  bricks offered     899080.0 ->    34004.8   (26.4x less)
+  bricks re-meshed    11520.0 ->    11520.0   (1.0x less)
+  quads                4053.3 ->     4038.2   (1.0x less)
+  WORST FRAME          24.299 ms ->  16.880 ms   (1.4x less)
+  worst sweep          15.824 ms ->   9.608 ms   (1.6x less)
+  WORST IN FLIGHT      24.299 ms ->  13.174 ms   (1.8x less)  <- the stutter
+
+=== IS THE MESHER SATURATED? (budget 192/tick at 60 fps = 11520 bricks/s) ===
+  FULL-DISC REBUILD                  demand  899080.0 /s  = 78.05x capacity   queue peak 67408   NEVER EMPTY
+  INCREMENTAL                        demand   34004.8 /s  =  2.95x capacity   queue peak 67408   NEVER EMPTY
+  INCREMENTAL + GROUND FLOOR         demand   10626.5 /s  =  0.92x capacity   queue peak 20933
+  non-empty share of what was meshed: full 12.5%, incr 12.5%, grounded 40.0%
+
+##### CASE 2: bv14, SAME SITE at flight altitude (40 m AGL, 30 m/s)
+
+zstd: bound from 'libzstd.dll'
+seed 20260719  tiles 4 (refused 0)  pixel 1875 mm  tile span 15360.0 m
+
+flight: start (-154960, -89360) m, heading 45 deg, 30 m/s, 40 m AGL, climb 0.0 m/s, 5 s at 60 fps  -> 150 m travelled
+
+=== GROUND-FLOOR PROOF CHECK at the start camera ===
+  today's sweep offers      0 brick(s)
+  the ground floor rejects  0 (0.0%)
+  of those, NON-EMPTY       0   <- must be 0
+
+=== FULL-DISC REBUILD (today) ===
+  frames                       300  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                26.6 /s
+    candidate columns swept    112385.0 /s
+    candidate bricks offered        0.0 /s
+    BRICKS RE-MESHED                0.0 /s
+      of those, non-empty           0.0 /s
+    QUADS REGENERATED               0.0 /s
+    bricks evicted                  0.0 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                  68.87 ms/s
+    cpu in mesh                    0.00 ms/s
+  WORST SINGLE FRAME
+    sweep                         3.723 ms   (4225 columns, 0 offered)
+    sweep + mesh                  3.723 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         3.723 ms   (4225 columns)
+    sweep + mesh                  3.723 ms
+  QUEUE
+    longest                    0 brick(s)
+    frames with work pending   0 of 300 (0.0%)
+
+=== INCREMENTAL SHIFT-AND-FILL (waterwindow.h) ===
+  frames                       300  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                26.6 /s
+    candidate columns swept      4250.6 /s
+    candidate bricks offered        0.0 /s
+    BRICKS RE-MESHED                0.0 /s
+      of those, non-empty           0.0 /s
+    QUADS REGENERATED               0.0 /s
+    bricks evicted                  0.0 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                   3.92 ms/s
+    cpu in mesh                    0.00 ms/s
+  WORST SINGLE FRAME
+    sweep                         3.813 ms   (4225 columns, 0 offered)
+    sweep + mesh                  3.813 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         0.384 ms   (129 columns)
+    sweep + mesh                  0.384 ms
+  QUEUE
+    longest                    0 brick(s)
+    frames with work pending   0 of 300 (0.0%)
+
+=== INCREMENTAL + PROVEN GROUND FLOOR (surfaceLowerBoundMm) ===
+  frames                       300  (133 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                26.6 /s
+    candidate columns swept      4250.6 /s
+    candidate bricks offered        0.0 /s
+    BRICKS RE-MESHED                0.0 /s
+      of those, non-empty           0.0 /s
+    QUADS REGENERATED               0.0 /s
+    bricks evicted                  0.0 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                   4.82 ms/s
+    cpu in mesh                    0.00 ms/s
+  WORST SINGLE FRAME
+    sweep                         4.670 ms   (4225 columns, 0 offered)
+    sweep + mesh                  4.670 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         0.408 ms   (129 columns)
+    sweep + mesh                  0.408 ms
+  QUEUE
+    longest                    0 brick(s)
+    frames with work pending   0 of 300 (0.0%)
+
+=== EQUIVALENCE ===
+  OK: identical live brick set on all 300 frames.
+
+=== INCREMENTAL vs FULL, per second of flight ===
+  columns swept      112385.0 ->     4250.6   (26.4x less)
+  bricks offered          0.0 ->        0.0   (0.0x less)
+  bricks re-meshed        0.0 ->        0.0   (0.0x less)
+  quads                   0.0 ->        0.0   (0.0x less)
+  WORST FRAME           3.723 ms ->   3.813 ms   (1.0x less)
+  worst sweep           3.723 ms ->   3.813 ms   (1.0x less)
+  WORST IN FLIGHT       3.723 ms ->   0.384 ms   (9.7x less)  <- the stutter
+
+=== IS THE MESHER SATURATED? (budget 192/tick at 60 fps = 11520 bricks/s) ===
+  FULL-DISC REBUILD                  demand       0.0 /s  =  0.00x capacity   queue peak 0
+  INCREMENTAL                        demand       0.0 /s  =  0.00x capacity   queue peak 0
+  INCREMENTAL + GROUND FLOOR         demand       0.0 /s  =  0.00x capacity   queue peak 0
+  non-empty share of what was meshed: full 0.0%, incr 0.0%, grounded 0.0%
+
+  NOTE: the box offered ZERO bricks over this whole flight. The sweep ran
+  133 times and produced nothing, because kImplicitRadiusBricksZ = 16 puts
+  the box floor 12.8 m under the camera and the water is further down than
+  that. This is not a measurement of meshing cost -- it is a measurement of
+  the sweep running for nothing. Re-run at a lower --agl for the other case.
+
+##### CASE 3: vox-wet-cache, DENSE reach (2 m AGL, 15 m/s)
+# tiles: /d/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-ba9c62170/000000000135276f/s16
+
+zstd: bound from 'libzstd.dll'
+seed 20260719  tiles 6 (refused 0)  pixel 1875 mm  tile span 15360.0 m
+
+flight: start (-52840, -51040) m, heading 45 deg, 15 m/s, 2 m AGL, climb 0.0 m/s, 10 s at 60 fps  -> 150 m travelled
+
+=== GROUND-FLOOR PROOF CHECK at the start camera ===
+  today's sweep offers      61940 brick(s)
+  the ground floor rejects  38466 (62.1%)
+  of those, NON-EMPTY       0   <- must be 0
+
+=== FULL-DISC REBUILD (today) ===
+  frames                       600  (139 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.9 /s
+    candidate columns swept     58727.5 /s
+    candidate bricks offered   899925.2 /s
+    BRICKS RE-MESHED            11520.0 /s
+      of those, non-empty        1567.2 /s
+    QUADS REGENERATED           12115.2 /s
+    bricks evicted                  0.0 /s
+    queued then DISCARDED      881982.1 /s  (swept, never meshed)
+    cpu in sweep                 134.10 ms/s
+    cpu in mesh                  456.31 ms/s
+  WORST SINGLE FRAME
+    sweep                        14.949 ms   (4225 columns, 69027 offered)
+    sweep + mesh                 24.439 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                        14.949 ms   (4225 columns)
+    sweep + mesh                 24.439 ms
+  QUEUE
+    longest                    68835 brick(s)
+    frames with work pending   600 of 600 (100.0%)
+
+=== INCREMENTAL SHIFT-AND-FILL (waterwindow.h) ===
+  frames                       600  (139 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.9 /s
+    candidate columns swept      2125.3 /s
+    candidate bricks offered    33846.6 /s
+    BRICKS RE-MESHED            11520.0 /s
+      of those, non-empty        1479.9 /s
+    QUADS REGENERATED           11138.9 /s
+    bricks evicted              27385.1 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                  20.61 ms/s
+    cpu in mesh                  452.90 ms/s
+  WORST SINGLE FRAME
+    sweep                        11.216 ms   (4225 columns, 61940 offered)
+    sweep + mesh                 19.735 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         3.057 ms   (129 columns)
+    sweep + mesh                 13.763 ms
+  QUEUE
+    longest                    65781 brick(s)
+    frames with work pending   600 of 600 (100.0%)
+
+=== INCREMENTAL + PROVEN GROUND FLOOR (surfaceLowerBoundMm) ===
+  frames                       600  (139 with a moved window)
+  PER SECOND OF FLIGHT
+    window rebuilds                13.9 /s
+    candidate columns swept      2125.3 /s
+    candidate bricks offered    11281.3 /s
+    BRICKS RE-MESHED             9622.3 /s
+      of those, non-empty        3796.9 /s
+    QUADS REGENERATED           37515.7 /s
+    bricks evicted               9122.0 /s
+    queued then DISCARDED           0.0 /s  (swept, never meshed)
+    cpu in sweep                   7.20 ms/s
+    cpu in mesh                  404.58 ms/s
+  WORST SINGLE FRAME
+    sweep                         8.718 ms   (4225 columns, 23474 offered)
+    sweep + mesh                 17.238 ms
+  WORST FRAME IN STEADY FLIGHT (excludes the spawn build)
+    sweep                         0.784 ms   (129 columns)
+    sweep + mesh                 13.304 ms
+  QUEUE
+    longest                    23282 brick(s)
+    frames with work pending   454 of 600 (75.7%)
+
+=== EQUIVALENCE ===
+  OK: identical live brick set on all 600 frames.
+
+=== INCREMENTAL vs FULL, per second of flight ===
+  columns swept       58727.5 ->     2125.3   (27.6x less)
+  bricks offered     899925.2 ->    33846.6   (26.6x less)
+  bricks re-meshed    11520.0 ->    11520.0   (1.0x less)
+  quads               12115.2 ->    11138.9   (1.1x less)
+  WORST FRAME          24.439 ms ->  19.735 ms   (1.2x less)
+  worst sweep          14.949 ms ->  11.216 ms   (1.3x less)
+  WORST IN FLIGHT      24.439 ms ->  13.763 ms   (1.8x less)  <- the stutter
+
+=== IS THE MESHER SATURATED? (budget 192/tick at 60 fps = 11520 bricks/s) ===
+  FULL-DISC REBUILD                  demand  899925.2 /s  = 78.12x capacity   queue peak 68835   NEVER EMPTY
+  INCREMENTAL                        demand   33846.6 /s  =  2.94x capacity   queue peak 65781   NEVER EMPTY
+  INCREMENTAL + GROUND FLOOR         demand   11281.3 /s  =  0.98x capacity   queue peak 23282
+  non-empty share of what was meshed: full 13.6%, incr 12.8%, grounded 39.5%

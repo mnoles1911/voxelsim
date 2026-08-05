@@ -221,6 +221,18 @@ if(NOT MSVC)
   target_compile_options(vxc_sliceprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_waterrefreshprobe: what a FLIGHT costs the near-field water disc,
+# per SECOND of flight rather than per rebuild. Runs today's full-disc rebuild
+# and voxelcore/waterwindow.h's shift-and-fill over the same path on the same
+# real tiles, meshes with meshBrick<8> at the client's own 192/tick budget, and
+# checks every frame that the two hold an identical live brick set. The numeric
+# readout behind "is the full-disc rebuild actually the bottleneck". ---------
+add_executable(vxc_waterrefreshprobe waterrefreshprobe.cpp)
+target_link_libraries(vxc_waterrefreshprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_waterrefreshprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_waterdatumprobe: WHICH producer claims water at a world position,
 #     and at what height. The first fork of any "water is at the wrong height"
 #     diagnosis -- is the height in the DATA, or manufactured by the client?
