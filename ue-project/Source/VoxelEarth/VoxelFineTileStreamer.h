@@ -293,6 +293,19 @@ public:
 	uint64 IdentityMismatchLoadsSinceStart() const { return IdentityMismatches_; }
 	uint64 MissingFileLoadsSinceStart() const { return MissingFileLoads_; }
 	uint64 TilesLoadedSinceStart() const { return TilesLoaded_; }
+	// Tiles PRESENT on disk that this build has stopped trying to load (see
+	// the retry contract in the .cpp). Distinct from absentOnDisk in the way
+	// that matters: an absent tile is a frontier the bake has not reached and
+	// it will load itself when it arrives; a refused one will not, ever, until
+	// the file or this binary changes. A nonzero value here with a black
+	// screen IS the diagnosis.
+	// Counts give-UPS, so a tile that is refused, re-baked, and refused again
+	// counts twice. That is the intent: each one is a separate event a person
+	// has to act on.
+	uint64 RefusedTileCount() const { return GivenUpTiles_; }
+	// Load attempts skipped because the same bytes had already been refused --
+	// the size of the spin that is no longer happening.
+	uint64 SuppressedRetriesSinceStart() const { return SuppressedRetries_; }
 	// THE GATE-LEAK DETECTOR. Any nonzero value means some query reached the
 	// sampler over a non-resident tile and was answered with sea level -- i.e.
 	// the block-until-ready gate did not cover something it had to, and this
@@ -342,6 +355,63 @@ private:
 	// for the non-fatal case, so the expression reads as the fallback it is.
 	int32_t ReportGateLeak_Locked(vxc::TileCoord Tile, int64_t px, int64_t py);
 
+	// --- THE RETRY CONTRACT -------------------------------------------------
+	//
+	// A load that failed falls into exactly one of two classes, and before this
+	// they were the same class:
+	//
+	//   TRANSIENT -- the bytes were not all there. The file was locked, was
+	//     being written, or shrank under the read (vxc::fineErrorIsTransient).
+	//     Another attempt is the ONLY way this resolves, so it gets
+	//     kMaxTransientLoadAttempts of them.
+	//   PERMANENT -- the bytes were read and structurally refused, or carry
+	//     another tile's identity. Re-reading them produces the identical
+	//     verdict by construction. One attempt, then stop.
+	//
+	// Both are then memoised against the FILE VERSION -- its size and
+	// last-write time -- rather than forever. That is what keeps this from
+	// breaking the caller that legitimately depends on re-reading: a re-bake,
+	// a finished download or a repaired file changes one of those two numbers
+	// and earns a completely fresh set of attempts, automatically, with no
+	// session restart and no cache to clear. What it will NOT do is read the
+	// same bytes a second time and log the same refusal again.
+	//
+	// Deliberately NOT cleared with KnownMissing_ when the ring centre moves.
+	// Absence is a fact about the WORLD and the bake frontier advances;
+	// a structural refusal is a fact about these bytes and this binary, and
+	// walking the player around changes neither.
+	struct FTileLoadFailure
+	{
+		uint64 FileSize = 0;    // as of the attempt that failed
+		int64 WriteTime = 0;    // std::filesystem::last_write_time ticks, 0 if unavailable
+		uint32 Attempts = 0;    // against THIS file version only
+		bool bPermanent = false;
+		// The refusal, already spelled out (vxc::fineDescribeRejection). Kept
+		// so a gate leak over this tile can name the cause instead of leaving
+		// whoever reads the leak to go and find the earlier line.
+		FString Why;
+	};
+	// Give up after this many TRANSIENT failures against one file version. 3
+	// rather than 1 because a tile being rewritten by the bake genuinely does
+	// produce a short read or two; rather than unbounded because a file that
+	// is still unreadable on the third pass is not going to become readable on
+	// the ten-thousandth, and the caller has no way to tell the difference.
+	static constexpr uint32 kMaxTransientLoadAttempts = 3;
+	// Records one failed attempt, logs it (Warning while attempts remain,
+	// Error on the attempt that gives up), and returns false so call sites can
+	// `return RecordLoadFailure_Locked(...)`. Caller must hold Lock_
+	// exclusively. `Why` must already read as a complete sentence.
+	bool RecordLoadFailure_Locked(vxc::TileCoord Tile, const FString& Path, uint64 FileSize,
+	                              int64 WriteTime, const TCHAR* ReasonTag, const FString& Why,
+	                              bool bTransient);
+	// True when this tile's last load failed and its attempts are spent, WITHOUT
+	// touching the filesystem. For the query funnel, which crosses this branch
+	// millions of times a run and must not open a file to learn something it
+	// already knows; EnsureTileResident_Locked does the stat'ing version, so a
+	// changed file is still noticed by the residency tick. Caller must hold
+	// Lock_ (shared is enough, but every current caller holds it exclusively).
+	bool IsSettledFailure_Locked(vxc::TileCoord Tile) const;
+
 	FString RootDir_;
 	std::string ProviderId_;
 	uint64 Seed_;
@@ -362,12 +432,20 @@ private:
 	// frontier tiles forever; cleared whenever the ring centre moves, so a
 	// tile that appears on disk mid-session is still picked up.
 	std::unordered_set<uint64> KnownMissing_;
+	// Tiles that ARE on disk and whose load failed, keyed by tile hash. See the
+	// retry contract above: this is the thing that turns "retry forever at 30
+	// ms" into "attempt, refuse, say why, stop".
+	std::unordered_map<uint64, FTileLoadFailure> LoadFailures_;
 	vxc::TileCoord LastRingCentre_{INT32_MIN, INT32_MIN};
 	uint64 DecodedBytes_ = 0;
 	uint64 CorruptLoads_ = 0;
 	uint64 IdentityMismatches_ = 0;
 	uint64 MissingFileLoads_ = 0;
 	uint64 TilesLoaded_ = 0;
+	// Distinct tile/file-version pairs this streamer has stopped retrying, and
+	// the attempts that stop saved. Both are diagnostics only.
+	uint64 GivenUpTiles_ = 0;
+	uint64 SuppressedRetries_ = 0;
 	// Gate-leak bookkeeping. Written only under Lock_ held exclusively (the
 	// funnel's cold path is the only writer) but READ without it by
 	// MaybeLogCounters on the game thread, so atomic: a torn or racing read of

@@ -8,9 +8,11 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -257,6 +259,26 @@ inline constexpr uint16_t kFineFlagWaterPresent = 0x4;
 inline constexpr uint16_t kFineFlagsKnown =
     kFineFlagFlowPresent | kFineFlagBasinsPresent | kFineFlagWaterPresent;
 
+// The newest `bake_ver` whose ON-TILE FEATURES this build implements -- i.e.
+// the last bake_ver that added a section id or a flag bit that the parser
+// above now understands. bake_ver 9 introduced SECTION_WATER_* and
+// kFineFlagWaterPresent; 10-12 are product bumps over the same layout, so
+// this build reads everything up to and including 12.
+//
+// REPORTING ONLY. Nothing rejects a tile on this number and nothing may start
+// to: the format's compatibility rule is the FLAGS and the section table (an
+// unknown section id is ignored; an unknown flag bit is refused), and a
+// second, redundant version gate would refuse tiles that are perfectly
+// readable the moment the counter is bumped for a reason that never touched
+// the wire. What it is for is the one sentence a refusal has to be able to
+// say: "this file is bake_ver 12 and this build understands up to N". Without
+// both numbers, a stale binary and a corrupt file produce the same message,
+// which is exactly how one stale DLL cost an evening.
+//
+// Bump this in the same commit that teaches the parser a new flag bit or
+// section id, never on its own.
+inline constexpr uint16_t kFineMaxKnownBakeVer = 12;
+
 // The dry sentinel in the water plane, in CONTROL-POINT units. INT16_MIN, the
 // one value the elevation codec's own range can never legitimately carry as a
 // water surface -- see terrain_service/tile_codec.py's WATER_DRY_CP, which
@@ -368,6 +390,20 @@ enum class FineError : uint8_t {
     kNotVxtl,          // no "VXTL" magic, or too short to hold it
     kWrongVersion,     // a .vxtl, but not v2
     kBadHeader,        // a §3 field outside the contract, incl. a short header
+    // A well-formed §3 header that declares a FEATURE this build does not
+    // implement -- today, a `flags` bit outside kFineFlagsKnown. Split out of
+    // kBadHeader because the two point in OPPOSITE directions: kBadHeader says
+    // the file is broken, kUnknownFeature says the READER is old, and a reason
+    // code that cannot tell them apart sends whoever reads the log to check
+    // the tile when they should be checking their binary. (That is not
+    // hypothetical: a game module built before the water plane existed
+    // rejected four perfectly valid bake_ver-12 tiles as "bad-header", and the
+    // message pointed away from the cause for the whole of the diagnosis.)
+    //
+    // NOT a softer verdict: the tile is still refused whole, for the reason
+    // fineCodecKnown's comment gives -- bytes this decoder does not understand
+    // must never be half-read into terrain. Only the EXPLANATION changes.
+    kUnknownFeature,
     kUnknownCodec,     // `codec` is neither CODEC_RAW nor CODEC_ZSTD
     kNoDecompressor,   // CODEC_ZSTD declared and no decompressor was injected
     kBadSectionTable,  // §3 table: out of bounds, overlapping, duplicated, missing
@@ -389,6 +425,93 @@ enum class FineError : uint8_t {
 
 // Stable short name, for logs. Never null.
 const char* fineErrorName(FineError e);
+
+// CAN RE-READING THE SAME SOURCE PLAUSIBLY CHANGE THIS ANSWER?
+//
+// This is the distinction a retrying loader has to be able to make and could
+// not make before, and its absence is what turned one stale binary into a
+// process that re-read, re-rejected and re-logged the same four tiles every
+// frame for the length of a session while showing nothing on screen.
+//
+//   true  -- the SOURCE was incomplete or moved under us: bytes that never
+//            arrived (kBlockNotResident: fetch more), or a read that failed
+//            against a file being written, locked, or truncated mid-download
+//            (kFileUnreadable). Retrying is the correct response and is the
+//            only way these ever resolve.
+//   false -- the bytes were read and are STRUCTURALLY refused. Reading the
+//            identical bytes again produces the identical verdict, so a retry
+//            is a spin: it cannot make progress, it cannot fail loudly, and it
+//            costs a log line and a seek every time round. A caller must stop
+//            and surface the refusal instead. (What CAN change the answer is
+//            the FILE changing -- a re-bake, a completed download, or a
+//            rebuilt reader. That is a new fact to notice, not a retry.)
+//
+// Deliberately a total switch over the enum with no default, so adding a
+// FineError forces a decision here rather than silently defaulting to one of
+// two behaviours that are equally wrong for half the codes.
+constexpr bool fineErrorIsTransient(FineError e) {
+    switch (e) {
+    case FineError::kFileUnreadable:
+    case FineError::kBlockNotResident:
+        return true;
+    case FineError::kNone:
+    case FineError::kNotVxtl:
+    case FineError::kWrongVersion:
+    case FineError::kBadHeader:
+    case FineError::kUnknownFeature:
+    case FineError::kUnknownCodec:
+    case FineError::kNoDecompressor:
+    case FineError::kBadSectionTable:
+    case FineError::kBadBlockIndex:
+    case FineError::kBadBlockCoords:
+    case FineError::kDecompressFailed:
+    case FineError::kBadPayload:
+    case FineError::kValueOutOfRange:
+    case FineError::kBadBasinTable:
+        return false;
+    }
+    return false;
+}
+
+// The §3 header fields a REFUSAL MESSAGE needs, read with NO validation at all.
+//
+// Separate from FineTileHeader on purpose: that struct is the output of a
+// parse that SUCCEEDED, and every interesting refusal happens before there is
+// one. These are the numbers a human needs to place the blame -- what the file
+// says it is -- gathered even when the file is about to be thrown away.
+struct FineHeaderFacts {
+    bool magicOk = false;      // the four "VXTL" bytes were there
+    uint16_t formatVersion = 0;
+    // True when formatVersion == kFineFormatVersion, i.e. the v2 header layout
+    // applies and the fields below were actually read. On a v1 (or unknown)
+    // file they are left at 0 rather than read out of a layout that does not
+    // hold: `bake_ver` is a v2 extension and reading it positionally from a v1
+    // file would invent a number and put it in an error message.
+    bool v2Fields = false;
+    uint16_t bakeVer = 0;
+    uint16_t flags = 0;
+    uint8_t codec = 0;
+    // The bits `flags` sets that this build has no implementation for. Nonzero
+    // is the signature of a reader older than its tiles.
+    uint16_t unknownFlagBits() const {
+        return static_cast<uint16_t>(flags & static_cast<uint16_t>(~kFineFlagsKnown));
+    }
+};
+
+// Fills `out` from the head of a .vxtl. False (and `out` left default) only if
+// `head` is null, shorter than kFineHeaderBytes, or lacks the magic -- in
+// which case there is nothing to say about the file beyond "not a .vxtl".
+bool fineReadHeaderFacts(const uint8_t* head, size_t headLen, FineHeaderFacts& out);
+
+// One sentence explaining a refusal, naming BOTH numbers wherever the reader's
+// own limits are half the story. Never empty, safe for any (error, facts)
+// pair including a default-constructed FineHeaderFacts.
+//
+// This lives in voxel-core rather than in the host's log call because it is
+// the part that has to be RIGHT and the host is the part that cannot be unit
+// tested -- checking it needed a UE editor, a real bake and a deliberately
+// stale binary, which is why nobody ever checked it.
+std::string fineDescribeRejection(FineError e, const FineHeaderFacts& facts);
 
 // mm per LSB for §3 `quant`. 0 for an unsupported value.
 constexpr int32_t fineQuantMm(uint8_t quant) {

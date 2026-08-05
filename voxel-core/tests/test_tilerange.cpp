@@ -18,6 +18,7 @@
 #include "voxelcore/tilerange.h"
 
 #include <algorithm>  // std::equal
+#include <cstring>    // std::memcpy -- MSVC supplies it transitively, libstdc++ does not
 #include <filesystem>
 #include <optional>
 
@@ -586,4 +587,59 @@ VXC_TEST(truncated_file_is_refused_rather_than_silently_short) {
     FineError err = FineError::kNone;
     CHECK(!readFineTilePreamble(src, src.fileSize(), FinePreambleRequest{}, held, &err));
     CHECK_EQ(int(err), int(FineError::kBadSectionTable));
+}
+
+VXC_TEST(preamble_separates_a_newer_format_from_a_broken_file) {
+    // readFineSectionTable answers one bool for three situations, and the
+    // preamble used to flatten all three into kNotVxtl -- so a client reading a
+    // tile written by a NEWER format was told its file was not a .vxtl. That is
+    // the same defect as "bad-header" for an unknown flag bit, one layer down:
+    // a reason code that cannot distinguish an old reader from a broken file.
+    const auto bytes = loadFixture(goldenPath());
+    if (!bytes) return;
+
+    // A version this build does not read. Everything else about the file is
+    // untouched and perfect.
+    {
+        std::vector<uint8_t> future(*bytes);
+        const uint16_t v3 = 3;
+        std::memcpy(future.data() + 4, &v3, 2);
+        BytesRangeSource src(future);
+        FineTileBytes held;
+        FineError err = FineError::kNone;
+        FineHeaderFacts facts;
+        CHECK(!readFineTilePreamble(src, src.fileSize(), FinePreambleRequest{}, held, &err, &facts));
+        CHECK_EQ(int(err), int(FineError::kWrongVersion));
+        // The facts come back even though the read failed -- that is what the
+        // out-param is for, and the message needs them.
+        CHECK(facts.magicOk);
+        CHECK_EQ(int(facts.formatVersion), 3);
+        CHECK(!facts.v2Fields); // v2 field offsets do not apply to a v3 file
+    }
+
+    // Not one of ours at all: still kNotVxtl, and no facts to report.
+    {
+        std::vector<uint8_t> junk(*bytes);
+        junk[0] = 'X';
+        BytesRangeSource src(junk);
+        FineTileBytes held;
+        FineError err = FineError::kNone;
+        FineHeaderFacts facts;
+        CHECK(!readFineTilePreamble(src, src.fileSize(), FinePreambleRequest{}, held, &err, &facts));
+        CHECK_EQ(int(err), int(FineError::kNotVxtl));
+        CHECK(!facts.magicOk);
+    }
+
+    // And a good file still reports its facts on SUCCESS, so a caller can log
+    // what it loaded without re-reading the header.
+    {
+        BytesRangeSource src(*bytes);
+        FineTileBytes held;
+        FineHeaderFacts facts;
+        CHECK(readFineTilePreamble(src, src.fileSize(), FinePreambleRequest{}, held, nullptr, &facts));
+        CHECK(facts.magicOk);
+        CHECK(facts.v2Fields);
+        CHECK_EQ(int(facts.formatVersion), int(kFineFormatVersion));
+        CHECK_EQ(int(facts.unknownFlagBits()), 0);
+    }
 }

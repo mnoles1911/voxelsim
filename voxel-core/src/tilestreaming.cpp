@@ -141,6 +141,13 @@ FineTileValidationResult validateAndParseFineTilePartial(FineTileBytes bytes, ui
                                                           int32_t expectedX, int32_t expectedY,
                                                           const FineDecompressor& decompressor) {
     FineTileValidationResult out;
+    // BEFORE the move -- `bytes` is consumed by the parse below and the header
+    // has to be readable for the FAILING cases, which are precisely the ones
+    // that have nothing else left to report. One span lookup over bytes the
+    // parse is about to read anyway; nothing is copied and nothing is
+    // validated here.
+    fineReadHeaderFacts(bytes.span(0, kFineHeaderBytes), kFineHeaderBytes, out.facts);
+
     std::optional<FineTile> parsed =
         FineTile::parsePartial(std::move(bytes), decompressor, &out.error);
     if (!parsed) {

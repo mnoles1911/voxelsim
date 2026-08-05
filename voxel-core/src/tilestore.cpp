@@ -4,6 +4,7 @@
 #include <cstddef>  // std::ptrdiff_t -- MSVC gets it transitively, libstdc++ does not
 #include <cstdint>  // UINT64_MAX
 #include <fstream>
+#include <string>   // fineDescribeRejection -- std::string/std::to_string
 
 #include "voxelcore/bytes.h"
 #include "voxelcore/core.h"
@@ -574,6 +575,7 @@ const char* fineErrorName(FineError e) {
     case FineError::kNotVxtl: return "not-a-vxtl";
     case FineError::kWrongVersion: return "wrong-version";
     case FineError::kBadHeader: return "bad-header";
+    case FineError::kUnknownFeature: return "unknown-feature";
     case FineError::kUnknownCodec: return "unknown-codec";
     case FineError::kNoDecompressor: return "no-decompressor";
     case FineError::kBadSectionTable: return "bad-section-table";
@@ -586,6 +588,123 @@ const char* fineErrorName(FineError e) {
     case FineError::kBlockNotResident: return "block-not-resident";
     }
     return "unknown";
+}
+
+bool fineReadHeaderFacts(const uint8_t* head, size_t headLen, FineHeaderFacts& out) {
+    out = FineHeaderFacts{};
+    if (head == nullptr || headLen < kFineHeaderBytes) return false;
+    ByteReader r(head, headLen);
+
+    uint8_t m0, m1, m2, m3;
+    if (!r.u8(m0) || !r.u8(m1) || !r.u8(m2) || !r.u8(m3)) return false;
+    if (m0 != 'V' || m1 != 'X' || m2 != 'T' || m3 != 'L') return false;
+    out.magicOk = true;
+    if (!r.u16(out.formatVersion)) return false;
+
+    // A file that is not v2 gets NOTHING further reported about it. The v2
+    // fields below are positional and a v1 file's bytes at those offsets mean
+    // something else entirely -- printing them would put a fabricated
+    // `bake_ver` into the very message someone is reading to decide whether
+    // their build is too old.
+    if (out.formatVersion != kFineFormatVersion) return true;
+
+    // Skips spelled out field by field for the same reason
+    // readFineSectionTable spells them out: a §3 layout change must break here
+    // loudly rather than quietly report `flags` as `bake_ver`.
+    if (!r.skip(8 + 4 + 4 + 1 + 2)) return true;  // seed, x, y, scale, size
+    if (!r.skip(1 + 1 + 1)) return true;          // blockLog2, predictor, quant
+    if (!r.u8(out.codec)) return true;
+    if (!r.u16(out.bakeVer)) return true;
+    if (!r.u16(out.flags)) return true;
+    out.v2Fields = true;
+    return true;
+}
+
+namespace {
+
+std::string hex16(uint16_t v) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string s = "0x";
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        s.push_back(kDigits[(v >> shift) & 0xf]);
+    }
+    return s;
+}
+
+} // namespace
+
+std::string fineDescribeRejection(FineError e, const FineHeaderFacts& facts) {
+    // WHAT THE FILE CLAIMS TO BE. Half of every version-skew message, and the
+    // half a corrupt-file message can also carry harmlessly.
+    std::string fileSays;
+    if (!facts.magicOk) {
+        fileSays = " The file has no VXTL magic.";
+    } else {
+        fileSays = " File: .vxtl v" + std::to_string(facts.formatVersion);
+        if (facts.v2Fields) {
+            fileSays += ", bake_ver " + std::to_string(facts.bakeVer) + ", flags " +
+                        hex16(facts.flags) + ", codec " + std::to_string(unsigned(facts.codec));
+        }
+        fileSays += ".";
+    }
+    // WHAT THIS BUILD CAN READ. The other half, and the one that was missing:
+    // without it "bad-header" is a statement about the tile with no way to
+    // read it as a statement about the reader.
+    // "up to N (last format-affecting bake)" rather than a bare "up to N",
+    // because kFineMaxKnownBakeVer deliberately LAGS the bake pipeline's
+    // counter: bake_ver bumps that change no section and no flag need no
+    // reader change, and a message that read them as "you are behind" would
+    // start blaming the build for every unrelated refusal.
+    const std::string buildSays = " This build: .vxtl v" + std::to_string(kFineFormatVersion) +
+                                  ", known flags " + hex16(kFineFlagsKnown) + ", bake_ver up to " +
+                                  std::to_string(kFineMaxKnownBakeVer) +
+                                  " (last format-affecting bake).";
+
+    switch (e) {
+    case FineError::kNone:
+        return "no error.";
+    case FineError::kUnknownFeature:
+        return "REFUSED BY THIS BUILD, NOT BY THE FILE: it declares feature flag bit(s) " +
+               hex16(facts.unknownFlagBits()) + " that this build does not implement." + fileSays +
+               buildSays +
+               " A tile NEWER than its reader looks exactly like this. Rebuild the game module "
+               "against the current voxel-core before suspecting the tile or re-baking it.";
+    case FineError::kWrongVersion:
+        return "the .vxtl format version is not the one this build reads." + fileSays + buildSays +
+               " If the file's version is the HIGHER number, this build is too old.";
+    case FineError::kUnknownCodec:
+        return "the `codec` byte names a compression this build does not know." + fileSays +
+               buildSays + " A codec added after this build was made looks exactly like this.";
+    case FineError::kNoDecompressor:
+        return "the file is compressed and no decompressor was injected into this build -- a HOST "
+               "WIRING bug here, not a problem with the tile." +
+               fileSays;
+    case FineError::kFileUnreadable:
+        return "a read against the file failed: it may be locked, still being written, or "
+               "truncated under us. Transient -- worth retrying." +
+               fileSays;
+    case FineError::kBlockNotResident:
+        return "the bytes for this part of the tile were never fetched. INCOMPLETE, not corrupt -- "
+               "fetch more and retry; do not discard." +
+               fileSays;
+    case FineError::kNotVxtl:
+        return "not a .vxtl at all: no VXTL magic, or too short to hold a header.";
+    case FineError::kBadHeader:
+    case FineError::kBadSectionTable:
+    case FineError::kBadBlockIndex:
+    case FineError::kBadBlockCoords:
+    case FineError::kDecompressFailed:
+    case FineError::kBadPayload:
+    case FineError::kValueOutOfRange:
+    case FineError::kBadBasinTable:
+        break;
+    }
+    // The genuinely-malformed codes. They still carry both version numbers,
+    // because "is my build too old" is the first question anyone asks of any
+    // refusal and answering it here is what keeps the next reason code from
+    // becoming the next bad-header.
+    return std::string("the file is structurally malformed (") + fineErrorName(e) + ")." +
+           fileSays + buildSays;
 }
 
 std::optional<FineTile> FineTile::parse(const uint8_t* data, size_t size,
@@ -669,7 +788,12 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     if (compressed && !decompressor.valid()) return reject(FineError::kNoDecompressor);
     if (!r.u16(h.bakeVer)) return reject(FineError::kBadHeader);
     if (!r.u16(h.flags)) return reject(FineError::kBadHeader);
-    if ((h.flags & ~kFineFlagsKnown) != 0) return reject(FineError::kBadHeader);
+    // STILL REFUSED WHOLE -- only the reason code changes. An undefined flag
+    // bit is the format's own "this file carries something you do not
+    // implement" signal, and by far its likeliest cause is a reader older than
+    // its tiles rather than damaged bytes. kBadHeader said the opposite and
+    // cost an evening saying it; see FineError::kUnknownFeature.
+    if ((h.flags & ~kFineFlagsKnown) != 0) return reject(FineError::kUnknownFeature);
     if (!r.i32(h.baseOffsetMm)) return reject(FineError::kBadHeader);
     // §3: absolute only.
     if (!r.u8(h.parentScale) || h.parentScale != 0) return reject(FineError::kBadHeader);

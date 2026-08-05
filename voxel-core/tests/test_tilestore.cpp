@@ -3082,14 +3082,16 @@ VXC_TEST(vxtl_v2_basin_table_is_refused_when_it_is_wrong) {
         refused(bad, FineError::kBadSectionTable);
     }
     // An UNKNOWN flag bit is still refused whole -- the property that lets the
-    // two halves of this format move in lockstep instead of drifting.
+    // two halves of this format move in lockstep instead of drifting -- but as
+    // kUnknownFeature, not kBadHeader: an undefined flag is what a tile NEWER
+    // than its reader looks like, and it must not be reported as damage.
     {
         std::vector<uint8_t> bad = *good;
         uint16_t flags = 0;
         std::memcpy(&flags, bad.data() + 31, 2);
         flags |= 0x8000;
         std::memcpy(bad.data() + 31, &flags, 2);
-        refused(bad, FineError::kBadHeader);
+        refused(bad, FineError::kUnknownFeature);
     }
 }
 
