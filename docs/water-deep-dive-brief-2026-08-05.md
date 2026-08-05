@@ -258,6 +258,29 @@ water surface 1,728 m, on a 3,865 m reach.
 Both carry all six tiles. That is an **A/B pair on identical ground** — the
 version split guarantees the terrain is bit-identical between them — so the
 slope fix can be judged by flying the same reach twice rather than by argument.
+Terrain identity verified 6/6: `elevation_cp` identical through the codec's own
+operator, flow identical, both sides CODEC_RAW at quant 100 mm.
+
+**bake_ver 14 does real work here**, measured on those tiles: isolated drawn
+cells **3.13% → 0.084%**, broken face pairs **42,410 → 15**, connected pieces as
+actually drawn **85,098 → 4,118** while pieces in plan stayed at 1,165 — i.e. the
+network was always connected, the *drawing* of it was not. Walking 40 cells
+downstream from the steep site, bake_ver 13 draws water in **6** of them and
+bake_ver 14 draws **all 40**. That is the owner's "several cubes of water placed
+in a general direction, disconnected going down the slope", measured.
+
+Three verified sites, all read from the bake_ver 14 bytes and all at least
+2.5 km inside the block — see `water-wet-country-bv14-2026-08-05.md`:
+
+| | `-VoxelSpawnAt` | yaw | water depth |
+|---|---|---|---|
+| river (valley trunk, widest water in the block) | `-33582,-74092` | 102 | 1.43 m |
+| lake (alpine, spawn on the **dry bank**) | `-39661,-57292` | 326 | 45.4 m |
+| steep cascade (falls 852 m over 2.5 km) | `-49608,-55126` | 310 | 3.80 m |
+
+The lake spawn is on dry bank deliberately: `-VoxelSpawnAltM` measures from the
+terrain surface, which under a lake is the **bed**, so 12 m over that one puts
+the camera 33 m underwater.
 The bake_ver 14 namespace string matches the arid corridor's because it is
 content-addressed off the bake fingerprint and the bake config is the same;
 isolation is by **cache root**, not by identity. Do not "fix" this.
