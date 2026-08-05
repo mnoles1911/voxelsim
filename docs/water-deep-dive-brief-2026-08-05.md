@@ -58,8 +58,10 @@ Preserve this. It is the only reason water can be iterated at all.
 * **Ocean is a real datum**, not a special case bolted on.
 * **The greedy mesher is already optimal on water tops.** `meshBrick<8>` hits
   the theoretical 64:1 maximum. Any proposal that "reduces water geometry" is
-  competing against a win already banked. `vxc::Quad` is **12 B**, not 152 B —
-  that error appeared in a plan and inverted a cost comparison.
+  competing against a win already banked. `vxc::Quad` is **9 B** (nine
+  `uint8_t` fields; compiled `sizeof` = 9, and the packed GPU quad is 8 B). A
+  cascade-branch plan claimed 152 B, which inverted a cost comparison; an
+  earlier draft of this brief said 12 B, also wrong.
 * **Near-field mesh budget has exactly 8% headroom.** With the underground
   ground-floor fix, demand against the 11,520 bricks/s drain is **0.92x**.
   Before it, 78x. Any change that grows the near-field window breaks this: a
@@ -246,6 +248,25 @@ looked at.**
 A live playtest site on that block, verified: `-VoxelSpawnAt=-64019,-69172`,
 water surface 1,728 m, on a 3,865 m reach.
 
+**The wet block now exists at both bake versions**, in the same cache root:
+
+| provider under `D:\vox-wet-cache` | bake_ver | what it has |
+|---|---|---|
+| `...-ba9c62170` | 13 | lateral fill only |
+| `...-b10cf6d2c` | 14 | + slope face contact |
+
+Both carry all six tiles. That is an **A/B pair on identical ground** — the
+version split guarantees the terrain is bit-identical between them — so the
+slope fix can be judged by flying the same reach twice rather than by argument.
+The bake_ver 14 namespace string matches the arid corridor's because it is
+content-addressed off the bake fingerprint and the bake config is the same;
+isolation is by **cache root**, not by identity. Do not "fix" this.
+
+To point the editor at the wet block, set `-VoxelFineTileDir=D:\vox-wet-cache`
+and `-VoxelFineTileProviderId=` one of the two above. The coarse
+`-VoxelTileDir` stays on `D:\voxelsim\tile-cache\...\s1`; the two roots being
+different is deliberate.
+
 ---
 
 ## 7. Traps that have each cost hours
@@ -267,6 +288,11 @@ water surface 1,728 m, on a 3,865 m reach.
 * **`Build.bat` exits 0 on `RulesError`.** Gate on `Result: Succeeded`.
 * **Blank captures are usually unloaded terrain**, not a rendering bug. The log
   says which.
+* **`vxc_riverribbonprobe --origin` is the region's low CORNER, not its
+  centre.** Get it wrong and the probe samples unbaked ground and cheerfully
+  reports a dry world — 0.09–0.13% wet instead of 0.560%. It reports no error,
+  because as far as it knows there simply is no water there. A working command
+  for the wet block: `--origin -40960 -40960 --region 16384`.
 
 ---
 

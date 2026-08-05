@@ -31,10 +31,18 @@ wrong by a factor this large:
 2. IT FILLS THE DEPRESSIONS FIRST. `accumulate_mfd`'s own docstring says a raw
    surface parks each pit's catchment in the pit, and at 30 m over a whole
    world that is not a detail: unfilled, the world's largest trunk read 1.5
-   m^3/s, which is 0.6% of the water the sky delivers to it. Filled, it reads
-   82.5 m^3/s and the arid corridor's mouth reproduces the 5.87e7 m^3/yr
-   already recorded in `pipeline`'s carried-discharge note. That agreement is
-   the check that this tool is measuring the same world the bake does.
+   m^3/s, which is 0.6% of the water the sky delivers to it. Filled, the arid
+   corridor's mouth reproduces the 5.87e7 m^3/yr already recorded in
+   `pipeline`'s carried-discharge note. That agreement is the check that this
+   tool is measuring the same world the bake does.
+
+   BUT FILLING ALSO FLOODS THE OCEAN. This docstring used to cite an 82.5
+   m^3/s figure here as "the world's largest trunk". It is not a river: it is
+   a SUBMARINE SINK at -3132 m, created because `fill_depressions` does not
+   know the sea floor is not land and happily fills ocean basins. Any
+   whole-world ranking off this tool must exclude cells below sea level before
+   it means anything. The number stood in three documents before it was
+   caught.
 
 3. IT ACCUMULATES OVER THE WHOLE WORLD, NOT A WINDOW. A catchment leaves any
    window smaller than itself, and the hydrology pyramid is precisely the
