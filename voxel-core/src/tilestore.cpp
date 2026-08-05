@@ -1,6 +1,8 @@
 #include "voxelcore/tilestore.h"
 
 #include <algorithm>
+#include <cstddef>  // std::ptrdiff_t -- MSVC gets it transitively, libstdc++ does not
+#include <cstdint>  // UINT64_MAX
 #include <fstream>
 
 #include "voxelcore/bytes.h"
@@ -339,12 +341,17 @@ struct SectionRef {
 //                 parse and still have an individually corrupt block; that is
 //                 inherent, not an oversight, and it is why the sampler keeps
 //                 blockDecodeFailures separate from missing tiles.
-bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
+//
+// `indexData` is the index section's bytes, already resolved out of the
+// (possibly partial) byte store -- this function is never handed a whole-file
+// pointer plus an offset, because on a sliced tile there IS no whole-file
+// pointer and "file + off" would silently address the wrong segment.
+bool parseBlockIndex(const uint8_t* indexData, uint64_t indexLen,
                      uint32_t blockCount, uint32_t blockPixels, uint64_t dataLen,
                      uint32_t bytesPerSample, bool compressed,
                      std::vector<FineBlockEntry>& out) {
     if (indexLen != static_cast<uint64_t>(blockCount) * kFineBlockEntryBytes) return false;
-    ByteReader r(file + indexOff, static_cast<size_t>(indexLen));
+    ByteReader r(indexData, static_cast<size_t>(indexLen));
 
     out.clear();
     out.reserve(blockCount);
@@ -405,10 +412,10 @@ bool parseBlockIndex(const uint8_t* file, uint64_t indexOff, uint64_t indexLen,
 // gameplay instruction: it says "flood-fill from here, up to this level", and
 // a bbox reaching outside the tile or a surface above its own spill would put
 // water where there is none. `tileSize` is the grid edge the row must fit in.
-bool parseBasinTable(const uint8_t* file, uint64_t off, uint64_t len, uint32_t tileSize,
+bool parseBasinTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize,
                      std::vector<BasinEntry>& out) {
     if (len < kBasinTableHeaderBytes) return false;
-    ByteReader r(file + off, static_cast<size_t>(len));
+    ByteReader r(tableData, static_cast<size_t>(len));
     uint16_t version, entryBytes;
     uint32_t count;
     if (!r.u16(version) || version != kBasinTableVersion) return false;
@@ -460,6 +467,106 @@ bool parseBasinTable(const uint8_t* file, uint64_t off, uint64_t len, uint32_t t
 
 } // namespace
 
+bool readFineSectionTable(const uint8_t* head, size_t headLen, uint16_t& flags,
+                          uint64_t& fileSize, std::vector<FineSectionEntry>& out) {
+    out.clear();
+    if (head == nullptr || headLen < kFineHeaderBytes) return false;
+    ByteReader r(head, headLen);
+    uint8_t m0, m1, m2, m3;
+    if (!r.u8(m0) || !r.u8(m1) || !r.u8(m2) || !r.u8(m3)) return false;
+    if (m0 != 'V' || m1 != 'X' || m2 != 'T' || m3 != 'L') return false;
+    uint16_t version;
+    if (!r.u16(version) || version != kFineFormatVersion) return false;
+
+    // Skip to the two fields this peek actually needs. Offsets are spelled out
+    // rather than "skip 30" so a header layout change breaks here loudly
+    // instead of silently reading `flags` out of `bake_ver`.
+    if (!r.skip(8 + 4 + 4 + 1 + 2)) return false;   // seed, x, y, scale, size
+    if (!r.skip(1 + 1 + 1 + 1 + 2)) return false;   // blockLog2, predictor, quant, codec, bakeVer
+    if (!r.u16(flags)) return false;
+    if (!r.skip(4 + 1 + 3)) return false;           // baseOffsetMm, parentScale, reserved
+
+    uint16_t nSections;
+    if (!r.u16(nSections)) return false;
+
+    const uint64_t tableBytes = static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
+    if (kFineHeaderBytes + tableBytes > headLen) return false;  // probe too small: re-probe
+
+    fileSize = kFineHeaderBytes + tableBytes;
+    out.reserve(nSections);
+    for (uint16_t i = 0; i < nSections; ++i) {
+        FineSectionEntry e;
+        if (!r.u32(e.id) || !r.u64(e.offset) || !r.u64(e.length)) return false;
+        if (e.length > UINT64_MAX - e.offset) return false;
+        fileSize = std::max(fileSize, e.offset + e.length);
+        out.push_back(e);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// FineTileBytes -- the sparse, offset-addressed byte store behind a partial
+// tile. See the header for why span() must never fabricate a byte.
+// ---------------------------------------------------------------------------
+
+bool FineTileBytes::addSegment(uint64_t offset, std::vector<uint8_t> data) {
+    if (data.empty()) return true;                       // nothing to hold
+    const uint64_t end = offset + data.size();
+    if (end < offset) return false;                      // overflow
+    if (end > fileSize_) return false;                   // past the file
+
+    // Overlap check against everything held. Refusing rather than merging is
+    // the point (see the header): two answers for one byte can only come from a
+    // mis-planned fetch or a transport that served a range other than the one
+    // requested, and both must be loud.
+    size_t insertAt = segs_.size();
+    for (size_t i = 0; i < segs_.size(); ++i) {
+        if (offset < segs_[i].end() && segs_[i].offset < end) return false;
+        if (segs_[i].offset > offset && i < insertAt) insertAt = i;
+    }
+
+    segs_.insert(segs_.begin() + static_cast<std::ptrdiff_t>(insertAt),
+                 Segment{offset, std::move(data)});
+
+    // Merge with the neighbour on either side when they are exactly adjacent,
+    // so a coalesced plan that arrives as several requests still presents each
+    // block's payload as one contiguous span.
+    if (insertAt + 1 < segs_.size() && segs_[insertAt].end() == segs_[insertAt + 1].offset) {
+        Segment& a = segs_[insertAt];
+        Segment& b = segs_[insertAt + 1];
+        a.data.insert(a.data.end(), b.data.begin(), b.data.end());
+        segs_.erase(segs_.begin() + static_cast<std::ptrdiff_t>(insertAt) + 1);
+    }
+    if (insertAt > 0 && segs_[insertAt - 1].end() == segs_[insertAt].offset) {
+        Segment& a = segs_[insertAt - 1];
+        Segment& b = segs_[insertAt];
+        a.data.insert(a.data.end(), b.data.begin(), b.data.end());
+        segs_.erase(segs_.begin() + static_cast<std::ptrdiff_t>(insertAt));
+    }
+    // A store that has been added to piecemeal is no longer "the whole file" as
+    // a CLAIM, even if the segments happen to cover it; isWhole() means "built
+    // by whole()", and nothing depends on it being the tighter statement.
+    return true;
+}
+
+const uint8_t* FineTileBytes::span(uint64_t off, uint64_t len) const {
+    if (len == 0) return nullptr;             // see the header: never useful
+    const uint64_t end = off + len;
+    if (end < off) return nullptr;            // overflow
+    for (const Segment& s : segs_) {
+        if (off >= s.offset && end <= s.end()) {
+            return s.data.data() + static_cast<size_t>(off - s.offset);
+        }
+    }
+    return nullptr;                           // not fetched -- NOT zeroes
+}
+
+uint64_t FineTileBytes::residentBytes() const {
+    uint64_t n = 0;
+    for (const Segment& s : segs_) n += s.data.size();
+    return n;
+}
+
 const char* fineErrorName(FineError e) {
     switch (e) {
     case FineError::kNone: return "none";
@@ -476,6 +583,7 @@ const char* fineErrorName(FineError e) {
     case FineError::kBadPayload: return "bad-payload";
     case FineError::kValueOutOfRange: return "value-out-of-range";
     case FineError::kBadBasinTable: return "bad-basin-table";
+    case FineError::kBlockNotResident: return "block-not-resident";
     }
     return "unknown";
 }
@@ -487,6 +595,12 @@ std::optional<FineTile> FineTile::parse(const uint8_t* data, size_t size,
 
 std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
                                         const FineDecompressor& decompressor, FineError* err) {
+    return FineTile::parsePartial(FineTileBytes::whole(std::move(bytes)), decompressor, err);
+}
+
+std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
+                                               const FineDecompressor& decompressor,
+                                               FineError* err) {
     if (err) *err = FineError::kNone;
     // Every failing return below funnels through this, so "returned nullopt"
     // and "recorded a reason" can never drift apart.
@@ -495,8 +609,20 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         return std::nullopt;
     };
 
-    const size_t fileSize = bytes.size();
-    ByteReader r(bytes.data(), fileSize);
+    const uint64_t fileSize = bytes.fileSize();
+
+    // THE FIXED HEADER MUST BE HELD. On a whole-file load this is trivially
+    // true; on a sliced one it is the first thing the head probe buys. Note the
+    // reason code: a header that was never fetched is kBlockNotResident (fetch
+    // more), NOT kBadHeader (throw the tile away) -- the two call for opposite
+    // responses and a client that confused them would either retry forever on
+    // corrupt bytes or discard a tile it merely had not finished reading.
+    const uint8_t* head = bytes.span(0, kFineHeaderBytes);
+    if (head == nullptr) {
+        return reject(fileSize < kFineHeaderBytes ? FineError::kNotVxtl
+                                                  : FineError::kBlockNotResident);
+    }
+    ByteReader r(head, kFineHeaderBytes);
 
     uint8_t m0, m1, m2, m3;
     if (!r.u8(m0) || !r.u8(m1) || !r.u8(m2) || !r.u8(m3)) return reject(FineError::kNotVxtl);
@@ -555,10 +681,17 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     uint16_t nSections;
     if (!r.u16(nSections)) return reject(FineError::kBadHeader);
 
-    const uint64_t tableEnd =
-        static_cast<uint64_t>(kFineHeaderBytes) +
-        static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
+    const uint64_t tableBytes = static_cast<uint64_t>(nSections) * kFineSectionEntryBytes;
+    const uint64_t tableEnd = static_cast<uint64_t>(kFineHeaderBytes) + tableBytes;
     if (tableEnd > fileSize) return reject(FineError::kBadSectionTable);
+
+    // The table is its own read because the header reader above is bounded to
+    // the 43 header bytes -- on a partial tile there is no single buffer that
+    // spans both, and pretending otherwise is how a sliced parse reads a
+    // section entry out of whatever happened to follow in memory.
+    const uint8_t* tableData = tableBytes == 0 ? head : bytes.span(kFineHeaderBytes, tableBytes);
+    if (tableData == nullptr) return reject(FineError::kBlockNotResident);
+    ByteReader table(tableData, static_cast<size_t>(tableBytes));
 
     SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec;
     SectionRef waterIndexSec, waterDataSec;
@@ -572,7 +705,9 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     for (uint16_t i = 0; i < nSections; ++i) {
         uint32_t id;
         uint64_t off, len;
-        if (!r.u32(id) || !r.u64(off) || !r.u64(len)) return reject(FineError::kBadSectionTable);
+        if (!table.u32(id) || !table.u64(off) || !table.u64(len)) {
+            return reject(FineError::kBadSectionTable);
+        }
 
         // In bounds, no overflow, and never on top of the header/table.
         if (off > fileSize) return reject(FineError::kBadSectionTable);
@@ -638,10 +773,34 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
         return reject(FineError::kBadSectionTable);
     }
 
+    // Resolves one PREAMBLE section's bytes. The distinction it carries is the
+    // one this whole partial path exists for: nullptr with the section declared
+    // present means "not fetched yet" (kBlockNotResident, go and get it), never
+    // "corrupt" and never an empty buffer that would parse as zero entries.
+    const auto preamble = [&bytes](const SectionRef& s) -> const uint8_t* {
+        return bytes.span(s.offset, s.length);
+    };
+
+    // A DECLARED-BUT-UNFETCHED preamble section is not an error -- it is the
+    // normal state of a client that asked for ground only and never wanted the
+    // flow index. What must not happen is for it to be mistaken for an EMPTY
+    // one: hasBasins() with an empty table means "surveyed, no basins here",
+    // and an unfetched table must not read as that. Hence a residency flag per
+    // section rather than an empty container standing in for both.
+    //
+    // ELEV_INDEX is the one exception and is required: it is 20 KB, it is
+    // always inside the head probe (it is the first section), and every other
+    // accessor on this class is meaningless without it.
     std::vector<BasinEntry> basins;
-    if (wantBasins && !parseBasinTable(bytes.data(), basinSec.offset, basinSec.length,
-                                       h.size, basins)) {
-        return reject(FineError::kBadBasinTable);
+    bool basinsResident = false;
+    if (wantBasins) {
+        const uint8_t* basinData = preamble(basinSec);
+        if (basinData != nullptr) {
+            if (!parseBasinTable(basinData, basinSec.length, h.size, basins)) {
+                return reject(FineError::kBadBasinTable);
+            }
+            basinsResident = true;
+        }
     }
 
     FineTile tile;
@@ -659,30 +818,139 @@ std::optional<FineTile> FineTile::parse(std::vector<uint8_t> bytes,
     const uint32_t dim = 1u << h.blockLog2;
     const uint32_t blockPixels = dim * dim;
 
-    if (!parseBlockIndex(bytes.data(), elevIndexSec.offset, elevIndexSec.length, blocks,
-                         blockPixels, elevDataSec.length, 2, compressed, tile.elevIndex_)) {
+    const uint8_t* elevIndexData = preamble(elevIndexSec);
+    if (elevIndexData == nullptr) return reject(FineError::kBlockNotResident);
+    if (!parseBlockIndex(elevIndexData, elevIndexSec.length, blocks, blockPixels,
+                         elevDataSec.length, 2, compressed, tile.elevIndex_)) {
         return reject(FineError::kBadBlockIndex);
     }
-    if (wantFlow && !parseBlockIndex(bytes.data(), flowIndexSec.offset, flowIndexSec.length,
-                                     blocks, blockPixels, flowDataSec.length, 1, compressed,
-                                     tile.flowIndex_)) {
-        return reject(FineError::kBadBlockIndex);
+    if (wantFlow) {
+        const uint8_t* flowIndexData = preamble(flowIndexSec);
+        if (flowIndexData != nullptr) {
+            if (!parseBlockIndex(flowIndexData, flowIndexSec.length, blocks, blockPixels,
+                                 flowDataSec.length, 1, compressed, tile.flowIndex_)) {
+                return reject(FineError::kBadBlockIndex);
+            }
+        }
     }
 
     // Element width 2, exactly like elevation: the water plane IS an elevation
     // plane, on the same datum, which is what lets it share every byte of this
     // machinery instead of growing a second one to keep in step.
-    if (wantWater && !parseBlockIndex(bytes.data(), waterIndexSec.offset,
-                                      waterIndexSec.length, blocks, blockPixels,
-                                      waterDataSec.length, 2, compressed,
-                                      tile.waterIndex_)) {
-        return reject(FineError::kBadBlockIndex);
+    if (wantWater) {
+        const uint8_t* waterIndexData = preamble(waterIndexSec);
+        if (waterIndexData != nullptr) {
+            if (!parseBlockIndex(waterIndexData, waterIndexSec.length, blocks, blockPixels,
+                                 waterDataSec.length, 2, compressed, tile.waterIndex_)) {
+                return reject(FineError::kBadBlockIndex);
+            }
+        }
     }
 
+    tile.basinsResident_ = basinsResident;
     tile.basins_ = std::move(basins);
     tile.bytes_ = std::move(bytes);
     return tile;
 }
+
+// ---------------------------------------------------------------------------
+// Per-block residency, and the decoders that respect it.
+//
+// ONE function decides which bytes a block needs, and both the residency test
+// and the decoder call it. That is deliberate: if the gate and the reader
+// computed the span separately, they could disagree by an entry -- the gate
+// would say "resident", the decoder would find nothing, and the caller would be
+// holding a plausible-looking block of zeroes. Sea level, silently.
+// ---------------------------------------------------------------------------
+
+bool FineTile::blockFileSpan(const std::vector<FineBlockEntry>& index, uint64_t dataOff,
+                             uint32_t bx, uint32_t by, uint64_t& off, uint64_t& len) const {
+    const uint32_t perAxis = blocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return false;
+    const size_t i = static_cast<size_t>(by) * perAxis + bx;
+    if (i >= index.size()) return false;      // plane not carried by this tile
+    const FineBlockEntry& e = index[i];
+    if (e.mode == kBlockConstant) {
+        // Trap #1 (docs/tile-slicing-2026-08-04.md §2): a CONSTANT block's
+        // (offset=0, comp_len=0) is NOT a range. Byte 0 of the data section
+        // belongs to some other block. It owns nothing and needs nothing.
+        off = 0;
+        len = 0;
+        return true;
+    }
+    off = dataOff + e.offset;
+    len = e.compLen;
+    return true;
+}
+
+bool FineTile::elevBlockResident(uint32_t bx, uint32_t by) const {
+    uint64_t off = 0, len = 0;
+    if (!blockFileSpan(elevIndex_, elevDataOff_, bx, by, off, len)) return false;
+    return len == 0 || bytes_.covers(off, len);
+}
+
+bool FineTile::flowBlockResident(uint32_t bx, uint32_t by) const {
+    if (!hasFlow()) return false;
+    uint64_t off = 0, len = 0;
+    if (!blockFileSpan(flowIndex_, flowDataOff_, bx, by, off, len)) return false;
+    return len == 0 || bytes_.covers(off, len);
+}
+
+bool FineTile::waterBlockResident(uint32_t bx, uint32_t by) const {
+    if (!hasWater()) return false;
+    uint64_t off = 0, len = 0;
+    if (!blockFileSpan(waterIndex_, waterDataOff_, bx, by, off, len)) return false;
+    return len == 0 || bytes_.covers(off, len);
+}
+
+uint32_t FineTile::residentElevBlocks() const {
+    const uint32_t perAxis = blocksPerAxis();
+    uint32_t n = 0;
+    for (uint32_t by = 0; by < perAxis; ++by)
+        for (uint32_t bx = 0; bx < perAxis; ++bx)
+            if (elevBlockResident(bx, by)) ++n;
+    return n;
+}
+
+uint32_t FineTile::residentWaterBlocks() const {
+    if (!hasWater()) return 0;
+    const uint32_t perAxis = blocksPerAxis();
+    uint32_t n = 0;
+    for (uint32_t by = 0; by < perAxis; ++by)
+        for (uint32_t bx = 0; bx < perAxis; ++bx)
+            if (waterBlockResident(bx, by)) ++n;
+    return n;
+}
+
+bool FineTile::addFetchedBytes(uint64_t fileOffset, std::vector<uint8_t> data) {
+    return bytes_.addSegment(fileOffset, std::move(data));
+}
+
+namespace {
+
+// Stands in for the data-section base of a CONSTANT block. decodeBlockPayload
+// takes the CONSTANT branch before it looks at `data` at all, so this is never
+// dereferenced -- it exists only so "resident" and "non-null" can stay the same
+// test for every mode. Returning nullptr for a CONSTANT block instead would
+// make the cheapest and commonest case on the water plane (72-87% of it) look
+// not-resident and block a client that in fact holds everything it needs.
+const uint8_t kConstantBlockNoData = 0;
+
+// The data-section base a decoder needs, or nullptr when the block's bytes were
+// never fetched. Returns the base the block's `offset` is relative to, not the
+// block's own start, so decodeBlockPayload's existing "e.offset into data"
+// contract is unchanged.
+const uint8_t* planeDataFor(const FineTileBytes& bytes, const FineBlockEntry& e,
+                            uint64_t dataOff, uint64_t dataLen) {
+    if (e.mode == kBlockConstant) return &kConstantBlockNoData;
+    if (e.compLen == 0) return nullptr;
+    if (e.offset > dataLen || e.compLen > dataLen - e.offset) return nullptr;
+    const uint8_t* p = bytes.span(dataOff + e.offset, e.compLen);
+    if (p == nullptr) return nullptr;
+    return p - static_cast<size_t>(e.offset);
+}
+
+} // namespace
 
 bool FineTile::decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
                                FineError* err) const {
@@ -690,12 +958,20 @@ bool FineTile::decodeElevBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& o
     const uint32_t perAxis = blocksPerAxis();
     if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
     const uint32_t dim = blockDim();
+    const FineBlockEntry& e = elevIndex_[by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, elevDataOff_, elevDataLen_);
+    if (base == nullptr) {
+        // NOT ZEROES, and this is the single most important branch in the file.
+        // `out` is left untouched and false is returned with kBlockNotResident,
+        // because filling it with 0 would put this block's terrain at SEA LEVEL
+        // -- a different world from the one every other client computes, and one
+        // that would surface as a rendering bug somewhere far from here.
+        return fail(err, FineError::kBlockNotResident);
+    }
     out.assign(blockPixelCount(), 0);
-    return decodeBlockPayload<int16_t>(elevIndex_[by * perAxis + bx],
-                                       bytes_.data() + elevDataOff_,
-                                       static_cast<size_t>(elevDataLen_), dim, -32768, 32767,
-                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
-                                       err);
+    return decodeBlockPayload<int16_t>(e, base, static_cast<size_t>(elevDataLen_), dim, -32768,
+                                       32767, dec_, fineCodecNeedsDecompressor(h_.codec),
+                                       out.data(), err);
 }
 
 bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& out,
@@ -704,12 +980,19 @@ bool FineTile::decodeFlowBlock(uint32_t bx, uint32_t by, std::vector<uint8_t>& o
     if (!hasFlow()) return fail(err, FineError::kBadBlockCoords);
     const uint32_t perAxis = blocksPerAxis();
     if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    // The tile declares a flow plane but this client never fetched its index,
+    // so there is no way to know where the block is. Not-resident, not corrupt.
+    // (Also the bounds check that keeps the indexing below defined on a sliced
+    // tile, where flowIndex_ is legitimately empty.)
+    if (!flowIndexResident()) return fail(err, FineError::kBlockNotResident);
     const uint32_t dim = blockDim();
+    const FineBlockEntry& e = flowIndex_[by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, flowDataOff_, flowDataLen_);
+    if (base == nullptr) return fail(err, FineError::kBlockNotResident);
     out.assign(blockPixelCount(), 0);
-    return decodeBlockPayload<uint8_t>(flowIndex_[by * perAxis + bx],
-                                       bytes_.data() + flowDataOff_,
-                                       static_cast<size_t>(flowDataLen_), dim, 0, 255, dec_,
-                                       fineCodecNeedsDecompressor(h_.codec), out.data(), err);
+    return decodeBlockPayload<uint8_t>(e, base, static_cast<size_t>(flowDataLen_), dim, 0, 255,
+                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
+                                       err);
 }
 
 bool FineTile::decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
@@ -718,24 +1001,36 @@ bool FineTile::decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& 
     if (!hasWater()) return fail(err, FineError::kBadBlockCoords);
     const uint32_t perAxis = blocksPerAxis();
     if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    // Index not fetched: not-resident, NOT dry. See decodeWaterBlock's payload
+    // branch below -- the same argument, one level earlier.
+    if (!waterIndexResident()) return fail(err, FineError::kBlockNotResident);
     const uint32_t dim = blockDim();
+    const FineBlockEntry& e = waterIndex_[by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, waterDataOff_, waterDataLen_);
+    if (base == nullptr) {
+        // Distinct from the dry sentinel below ON PURPOSE. "Not fetched" and
+        // "no water here" are different facts: filling with kWaterDryDepth and
+        // returning true would make an unfetched reach read as a dry riverbed,
+        // which is exactly the class of silent loss the water plane's own
+        // present/absent flag exists to prevent.
+        return fail(err, FineError::kBlockNotResident);
+    }
     // Filled with the DRY sentinel, not 0. 0 is a legitimate stored DEPTH
     // (water exactly at its own bed, which is what a reach's shallow edge
     // quantises to), so a block that failed to decode must read as the
     // sentinel or it becomes a sheet of zero-depth water over the whole block.
     out.assign(blockPixelCount(), kWaterDryDepth);
-    return decodeBlockPayload<int16_t>(waterIndex_[by * perAxis + bx],
-                                       bytes_.data() + waterDataOff_,
-                                       static_cast<size_t>(waterDataLen_), dim, -32768, 32767,
-                                       dec_, fineCodecNeedsDecompressor(h_.codec), out.data(),
-                                       err);
+    return decodeBlockPayload<int16_t>(e, base, static_cast<size_t>(waterDataLen_), dim, -32768,
+                                       32767, dec_, fineCodecNeedsDecompressor(h_.codec),
+                                       out.data(), err);
 }
 
-bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp) const {
-    if (lx >= h_.size || ly >= h_.size) return false;
+bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp, FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (lx >= h_.size || ly >= h_.size) return fail(err, FineError::kBadBlockCoords);
     const uint32_t dim = blockDim();
     std::vector<int16_t> block;
-    if (!decodeElevBlock(lx >> h_.blockLog2, ly >> h_.blockLog2, block)) return false;
+    if (!decodeElevBlock(lx >> h_.blockLog2, ly >> h_.blockLog2, block, err)) return false;
     cp = block[(ly & (dim - 1)) * dim + (lx & (dim - 1))];
     return true;
 }
@@ -813,14 +1108,81 @@ const std::vector<int16_t>* FineTileSampler::blockFor(int64_t px, int64_t py,
     auto bit = res.blocks.find(key);
     if (bit == res.blocks.end()) {
         std::vector<int16_t> decoded;
-        if (!res.tile.decodeElevBlock(bx, by, decoded)) {
-            blockDecodeFailures.fetch_add(1, std::memory_order_relaxed);
+        FineError err = FineError::kNone;
+        if (!res.tile.decodeElevBlock(bx, by, decoded, &err)) {
+            // TWO COUNTERS, because they mean opposite things and the response
+            // to each is opposite. kBlockNotResident: this client holds the tile
+            // but not this block's bytes -- fetch them, the data is fine.
+            // Anything else: the bytes are here and they are wrong -- discard
+            // the tile, re-fetching will not help. Flattening the two into
+            // blockDecodeFailures would make a sliced client look permanently
+            // corrupt on every un-fetched block.
+            if (err == FineError::kBlockNotResident) {
+                notResidentBlockQueries.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                blockDecodeFailures.fetch_add(1, std::memory_order_relaxed);
+            }
             return nullptr;
         }
         bit = res.blocks.emplace(key, std::move(decoded)).first;
     }
     tile = &res.tile;
     return &bit->second;
+}
+
+bool FineTileSampler::blockDecoded(int64_t px, int64_t py) const {
+    if (tileSize_ == 0) return false;
+    const int64_t sz = static_cast<int64_t>(tileSize_);
+    auto it = tiles_.find(tileKey(static_cast<int32_t>(floorDiv(px, sz)),
+                                  static_cast<int32_t>(floorDiv(py, sz))));
+    if (it == tiles_.end()) return false;
+    const Resident& res = it->second;
+    const uint32_t fx = static_cast<uint32_t>(floorMod(px, sz));
+    const uint32_t fy = static_cast<uint32_t>(floorMod(py, sz));
+    const uint8_t log2 = res.tile.header().blockLog2;
+    const uint32_t perAxis = res.tile.blocksPerAxis();
+    return res.blocks.find((fy >> log2) * perAxis + (fx >> log2)) != res.blocks.end();
+}
+
+bool FineTileSampler::blockBytesResident(int64_t px, int64_t py) const {
+    if (tileSize_ == 0) return false;
+    const int64_t sz = static_cast<int64_t>(tileSize_);
+    auto it = tiles_.find(tileKey(static_cast<int32_t>(floorDiv(px, sz)),
+                                  static_cast<int32_t>(floorDiv(py, sz))));
+    if (it == tiles_.end()) return false;
+    const FineTile& t = it->second.tile;
+    const uint8_t log2 = t.header().blockLog2;
+    return t.elevBlockResident(static_cast<uint32_t>(floorMod(px, sz)) >> log2,
+                               static_cast<uint32_t>(floorMod(py, sz)) >> log2);
+}
+
+uint64_t FineTileSampler::residentFileBytes() const {
+    uint64_t n = 0;
+    for (const auto& kv : tiles_) n += kv.second.tile.residentFileBytes();
+    return n;
+}
+
+uint64_t FineTileSampler::decodedBlockBytes() const {
+    uint64_t n = 0;
+    for (const auto& kv : tiles_) {
+        for (const auto& b : kv.second.blocks) {
+            n += static_cast<uint64_t>(b.second.size()) * sizeof(int16_t);
+        }
+    }
+    return n;
+}
+
+bool FineTileSampler::loadTilePartial(FineTileBytes bytes, FineError* err) {
+    std::optional<FineTile> parsed = FineTile::parsePartial(std::move(bytes), dec_, err);
+    if (!parsed) return false;
+    return loadTile(std::move(*parsed));
+}
+
+bool FineTileSampler::addTileBytes(int32_t tx, int32_t ty, uint64_t fileOffset,
+                                   std::vector<uint8_t> data) {
+    auto it = tiles_.find(tileKey(tx, ty));
+    if (it == tiles_.end()) return false;
+    return it->second.tile.addFetchedBytes(fileOffset, std::move(data));
 }
 
 bool FineTileSampler::controlPointAt(int64_t px, int64_t py, int16_t& cp) {

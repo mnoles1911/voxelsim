@@ -60,6 +60,25 @@
 //    never converges. -VoxelWaterParityTest shipped without a self-quit once
 //    and cost a session 2h40m of wall clock and 16,384 s of CPU.
 
+// WHY THE NAMES BELOW CARRY A `SweBreach` PREFIX INSTEAD OF READING CLEANLY.
+//
+// This is an anonymous namespace, and UBT builds this module UNITY: several
+// .cpp files are concatenated into one translation unit, at which point every
+// anonymous namespace in the blob is the SAME scope. `FRunRef` and
+// `kMaxTerrainPolls` were previously spelled bare here, and
+// VoxelSkyLadderFixture.cpp declares both names too -- it puts them in
+// `namespace VoxelSkyLadderDetail` but then hoists the whole namespace with a
+// file-scope `using namespace` (line 894), which puts them right back into
+// unqualified lookup for the rest of the blob. Compiling the concatenation
+// gives `error C2872: 'FRunRef': ambiguous symbol`, and the same for
+// kMaxTerrainPolls.
+//
+// Today those two files land in DIFFERENT unity blobs, so the build passes.
+// That is luck, not design: UBT partitions the module's .cpp files by
+// accumulated size in alphabetical order, so adding one file to this module
+// can slide the boundary and break a build that has nothing to do with the
+// change. This is the same defect that stopped the module compiling in
+// PR #210, and it is caught now by tools/lint-unity-collisions.py.
 namespace
 {
 // --- Tunables, all overridable and all logged ------------------------------
@@ -125,7 +144,7 @@ constexpr float kDefaultSampleSeconds = 8.f;
 
 // Polls.
 constexpr float kPollIntervalSeconds = 2.f;
-constexpr int32 kMaxTerrainPolls = 30; // 60 s
+constexpr int32 kSweBreachMaxTerrainPolls = 30; // 60 s
 constexpr int32 kMaxSettlePolls = 20;  // 40 s
 
 // Absolute watchdog, measured from the moment the fixture is scheduled. Sized
@@ -368,27 +387,27 @@ struct FSweBreachRun
 	FTimerHandle QuitHandle;
 };
 
-using FRunRef = TSharedRef<FSweBreachRun, ESPMode::ThreadSafe>;
+using FSweBreachRunRef = TSharedRef<FSweBreachRun, ESPMode::ThreadSafe>;
 
 // Stage forward declarations -- the sequence, in order.
-void StageBegin(FRunRef Run);
-void StageTerrainPoll(FRunRef Run);
-void StageCarveAndSurvey(FRunRef Run);
-void StagePour(FRunRef Run);
-void StageSettlePoll(FRunRef Run);
-void StageArmSwe(FRunRef Run);
-void StagePreBreachReport(FRunRef Run);
-void StageBreach(FRunRef Run);
-void StageSample(FRunRef Run);
-void StageFinalReport(FRunRef Run);
-void Finish(FRunRef Run, const TCHAR* Reason);
+void StageBegin(FSweBreachRunRef Run);
+void StageTerrainPoll(FSweBreachRunRef Run);
+void StageCarveAndSurvey(FSweBreachRunRef Run);
+void StagePour(FSweBreachRunRef Run);
+void StageSettlePoll(FSweBreachRunRef Run);
+void StageArmSwe(FSweBreachRunRef Run);
+void StagePreBreachReport(FSweBreachRunRef Run);
+void StageBreach(FSweBreachRunRef Run);
+void StageSample(FSweBreachRunRef Run);
+void StageFinalReport(FSweBreachRunRef Run);
+void Finish(FSweBreachRunRef Run, const TCHAR* Reason);
 
-FORCEINLINE UWorld* WorldOf(const FRunRef& Run)
+FORCEINLINE UWorld* WorldOf(const FSweBreachRunRef& Run)
 {
 	return Run->World.Get();
 }
 
-void SetTimerOnce(FRunRef Run, FTimerHandle& Handle, float Delay, TFunction<void(FRunRef)> Fn)
+void SetTimerOnce(FSweBreachRunRef Run, FTimerHandle& Handle, float Delay, TFunction<void(FSweBreachRunRef)> Fn)
 {
 	UWorld* W = WorldOf(Run);
 	if (!W)
@@ -399,7 +418,7 @@ void SetTimerOnce(FRunRef Run, FTimerHandle& Handle, float Delay, TFunction<void
 	                              false);
 }
 
-void SetTimerLooping(FRunRef Run, FTimerHandle& Handle, float Interval, TFunction<void(FRunRef)> Fn)
+void SetTimerLooping(FSweBreachRunRef Run, FTimerHandle& Handle, float Interval, TFunction<void(FSweBreachRunRef)> Fn)
 {
 	UWorld* W = WorldOf(Run);
 	if (!W)
@@ -415,7 +434,7 @@ void SetTimerLooping(FRunRef Run, FTimerHandle& Handle, float Interval, TFunctio
 // EVERY exit goes through here, including the watchdog and every "subsystems
 // not ready" bail. Clears the whole timer set first so nothing can re-enter a
 // stage after the final line, then arms the one timer that ends the process.
-void Finish(FRunRef Run, const TCHAR* Reason)
+void Finish(FSweBreachRunRef Run, const TCHAR* Reason)
 {
 	if (Run->bFinishing)
 	{
@@ -443,7 +462,7 @@ void Finish(FRunRef Run, const TCHAR* Reason)
 }
 
 // --- Pose ------------------------------------------------------------------
-void PoseCamera(FRunRef Run)
+void PoseCamera(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
@@ -493,7 +512,7 @@ void LogProbeLine(const TCHAR* Tag, int32 SampleIdx, double ElapsedSeconds, cons
 	       C.VelYMmPerSec, Speed, AlongOut, C.FluxXFillPerTick, C.FluxYFillPerTick);
 }
 
-void SampleAllProbes(const TCHAR* Tag, FRunRef Run, int32 SampleIdx, double ElapsedSeconds, bool bTrackPeaks)
+void SampleAllProbes(const TCHAR* Tag, FSweBreachRunRef Run, int32 SampleIdx, double ElapsedSeconds, bool bTrackPeaks)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -531,7 +550,7 @@ void SampleAllProbes(const TCHAR* Tag, FRunRef Run, int32 SampleIdx, double Elap
 
 // The settled-level report: the one that answers "does the pooled water sit
 // where the basin's own geometry says it should?".
-void LogLevelReport(const TCHAR* Phase, FRunRef Run)
+void LogLevelReport(const TCHAR* Phase, FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -587,7 +606,7 @@ void LogLevelReport(const TCHAR* Phase, FRunRef Run)
 // Returns the number of SWE-OWNED columns whose bed disagrees with the live
 // terrain, or -1 if the sheet is not armed. That number is the gate on
 // everything downstream: it is hypothesis (b), measured.
-int32 LogBedAudit(const TCHAR* Phase, FRunRef Run)
+int32 LogBedAudit(const TCHAR* Phase, FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -644,7 +663,7 @@ int32 LogBedAudit(const TCHAR* Phase, FRunRef Run)
 	return A.SweOwnedMismatched;
 }
 
-void LogGlobalLine(const TCHAR* Tag, FRunRef Run, int32 SampleIdx, double ElapsedSeconds)
+void LogGlobalLine(const TCHAR* Tag, FSweBreachRunRef Run, int32 SampleIdx, double ElapsedSeconds)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -678,7 +697,7 @@ void LogGlobalLine(const TCHAR* Tag, FRunRef Run, int32 SampleIdx, double Elapse
 // ===========================================================================
 
 // Stage 1: resolve subsystems, choose the site, pose, start the residency poll.
-void StageBegin(FRunRef Run)
+void StageBegin(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWorldSubsystem* Terrain = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -845,13 +864,13 @@ void StageBegin(FRunRef Run)
 	       TEXT("to go quiet BEFORE carving (poll %.0fs, cap %d) -- a carve into a chunk that has not streamed is a ")
 	       TEXT("survey of the wrong ground."),
 	       Run->CameraUU.X, Run->CameraUU.Y, Run->CameraUU.Z, Run->CameraRot.Pitch, Run->CameraRot.Yaw,
-	       kPollIntervalSeconds, kMaxTerrainPolls);
+	       kPollIntervalSeconds, kSweBreachMaxTerrainPolls);
 
 	SetTimerLooping(Run, Run->TerrainPollHandle, kPollIntervalSeconds, &StageTerrainPoll);
 }
 
 // Stage 2: hold the pose until streaming goes quiet.
-void StageTerrainPoll(FRunRef Run)
+void StageTerrainPoll(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWorldSubsystem* Terrain = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -871,11 +890,11 @@ void StageTerrainPoll(FRunRef Run)
 	UE_LOG(LogVoxelEarth, Log,
 	       TEXT("VoxelSweBreachTest terrain-poll %d/%d: inFlight=%d pendingJob=%d pendingGT=%d pendingUnload=%d ")
 	       TEXT("loaded/s=%.1f -> %s"),
-	       Run->TerrainPolls, kMaxTerrainPolls, Snap.JobsInFlight, Snap.PendingJobQueueDepth,
+	       Run->TerrainPolls, kSweBreachMaxTerrainPolls, Snap.JobsInFlight, Snap.PendingJobQueueDepth,
 	       Snap.PendingGameThreadQueueDepth, Snap.PendingUnloadQueueDepth, Snap.ChunksLoadedPerSec,
 	       bQuiet ? TEXT("QUIET") : TEXT("still streaming"));
 
-	if (!bQuiet && Run->TerrainPolls < kMaxTerrainPolls)
+	if (!bQuiet && Run->TerrainPolls < kSweBreachMaxTerrainPolls)
 	{
 		return;
 	}
@@ -885,14 +904,14 @@ void StageTerrainPoll(FRunRef Run)
 		UE_LOG(LogVoxelEarth, Warning,
 		       TEXT("VoxelSweBreachTest: terrain did NOT go quiet within %d polls; continuing anyway. The survey below ")
 		       TEXT("may disagree with what is finally resident."),
-		       kMaxTerrainPolls);
+		       kSweBreachMaxTerrainPolls);
 	}
 	SetTimerOnce(Run, Run->StageHandle, 0.5f, &StageCarveAndSurvey);
 }
 
 // Stage 3: carve the basin, survey it, and derive spill level, capacity, pour
 // volume, expected settled level, rim and probe set.
-void StageCarveAndSurvey(FRunRef Run)
+void StageCarveAndSurvey(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWorldSubsystem* Terrain = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -1118,7 +1137,7 @@ void StageCarveAndSurvey(FRunRef Run)
 }
 
 // Stage 4: pour the measured volume into the measured basin.
-void StagePour(FRunRef Run)
+void StagePour(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -1202,7 +1221,7 @@ void StagePour(FRunRef Run)
 }
 
 // Stage 5: wait for the pool to stop moving.
-void StageSettlePoll(FRunRef Run)
+void StageSettlePoll(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -1246,7 +1265,7 @@ void StageSettlePoll(FRunRef Run)
 // the basin exactly, and exercises the seeding path (forcePromote over every
 // water-bearing column with a real bed) -- which is precisely the code the
 // bed-seating hypothesis is about.
-void StageArmSwe(FRunRef Run)
+void StageArmSwe(FSweBreachRunRef Run)
 {
 	if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Water.SWE")))
 	{
@@ -1272,7 +1291,7 @@ void StageArmSwe(FRunRef Run)
 
 // Stage 7: the pre-breach state of record -- the bed audit and the settled
 // level report, taken while nothing has been dug.
-void StagePreBreachReport(FRunRef Run)
+void StagePreBreachReport(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -1323,7 +1342,7 @@ void StagePreBreachReport(FRunRef Run)
 // via UVoxelWorldSubsystem::CarveSphere -- the same edit-log authority path
 // digging uses, so the terrain-edit notifications (which wake the CA and drive
 // the coupler's puncture test) fire exactly as they do for a player.
-void StageBreach(FRunRef Run)
+void StageBreach(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWorldSubsystem* Terrain = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
@@ -1383,7 +1402,7 @@ void StageBreach(FRunRef Run)
 
 // Stage 9: the surge time series. One global line and one line per probe
 // column per sample, at the subsystem's own 10 Hz fixed-step cadence.
-void StageSample(FRunRef Run)
+void StageSample(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	if (!W)
@@ -1419,7 +1438,7 @@ void StageSample(FRunRef Run)
 }
 
 // Stage 10: the closing state of record, the verdict line, and the exit.
-void StageFinalReport(FRunRef Run)
+void StageFinalReport(FSweBreachRunRef Run)
 {
 	UWorld* W = WorldOf(Run);
 	UVoxelWaterSubsystem* Water = W ? W->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -1596,7 +1615,7 @@ void StageFinalReport(FRunRef Run)
 	}
 
 	FScreenshotRequest::RequestScreenshot(TEXT("VoxelSweBreach_3_settled"), false, true);
-	SetTimerOnce(Run, Run->StageHandle, 2.f, [](FRunRef R) { Finish(R, TEXT("sequence complete")); });
+	SetTimerOnce(Run, Run->StageHandle, 2.f, [](FSweBreachRunRef R) { Finish(R, TEXT("sequence complete")); });
 }
 
 } // namespace
@@ -1614,7 +1633,7 @@ bool VoxelSweBreachFixture::StartFromCommandLine(UWorld* World)
 		return false;
 	}
 
-	FRunRef Run = MakeShared<FSweBreachRun, ESPMode::ThreadSafe>();
+	FSweBreachRunRef Run = MakeShared<FSweBreachRun, ESPMode::ThreadSafe>();
 	Run->World = World;
 	Run->DelaySeconds = Delay;
 

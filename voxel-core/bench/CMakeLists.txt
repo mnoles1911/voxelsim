@@ -210,3 +210,24 @@ target_link_libraries(vxc_hydroprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_hydroprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_sliceprobe: what reading PART of a fine tile actually costs (task
+# #52). Disk bytes, requests, held file bytes and decoded lattice bytes for
+# realistic working sets against the whole-file read the client does today,
+# with every fetched block verified byte-identical to a whole-file decode. ---
+add_executable(vxc_sliceprobe sliceprobe.cpp)
+target_link_libraries(vxc_sliceprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_sliceprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
+# --- vxc_waterdatumprobe: WHICH producer claims water at a world position,
+#     and at what height. The first fork of any "water is at the wrong height"
+#     diagnosis -- is the height in the DATA, or manufactured by the client?
+#     See the file header for what it asks and why the sheet gather is
+#     reproduced rather than approximated.
+add_executable(vxc_waterdatumprobe waterdatumprobe.cpp)
+target_link_libraries(vxc_waterdatumprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_waterdatumprobe PRIVATE -Wall -Wextra -Werror)
+endif()
