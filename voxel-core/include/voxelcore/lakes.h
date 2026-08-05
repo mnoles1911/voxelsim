@@ -332,9 +332,39 @@ private:
     }
 
     TileIndex* indexFor(int32_t tx, int32_t ty) {
-        auto it = index_.find(key(tx, ty));
-        if (it != index_.end()) return &it->second;
         const FineTile* t = tiles_.findTile(tx, ty);
+        auto it = index_.find(key(tx, ty));
+        if (it != index_.end()) {
+            // RESIDENCY IS RE-CHECKED ON EVERY HIT, not only on the miss that
+            // built the entry, and this is a lifetime rule rather than a
+            // freshness one. `TileIndex::basins` is a pointer BORROWED from a
+            // resident FineTile -- while `FineTileSampler::unloadTile` destroys
+            // that tile. A cached entry outliving its tile does not answer
+            // stale, it answers FREED MEMORY, and what that draws is a lake
+            // sheet at an arbitrary Z. (The masks go with it: they are indexed
+            // by that tile's own bbox.)
+            //
+            // NOT REACHABLE TODAY, and that is exactly why it is worth one hash
+            // lookup: FLakeWaterSampler owns a private FineTileSampler that
+            // never unloads, so nothing calls unloadTile underneath this map --
+            // but the STREAMER already calls it, and the day the lake tier gets
+            // a byte budget this becomes live with no other change. A floating
+            // sheet at an arbitrary height is the defect this project spent
+            // 2026-08-04 chasing from the other end.
+            //
+            // THE THIRD STATE IS WHY THIS IS NOT JUST A NULL CHECK. A partial
+            // tile (bake_ver 12) can be resident with its basin table NOT yet
+            // fetched, and can then gain it. `basins == nullptr` cached against
+            // a tile that now has a resident registry is a tile whose lakes
+            // would stay invisible forever, so that transition invalidates too.
+            const bool bExpectBasins = t != nullptr && t->hasBasins() && t->basinsResident();
+            const bool bValid = t != nullptr && (bExpectBasins ? it->second.basins == &t->basins()
+                                                              : it->second.basins == nullptr);
+            if (bValid) return &it->second;
+            index_.erase(it);
+            // The column memo answered from the entry just dropped.
+            memoValid_ = false;
+        }
         if (t == nullptr) return nullptr;
         TileIndex idx;
         // hasBasins() false means "baked before the registry existed", which

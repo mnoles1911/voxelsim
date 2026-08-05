@@ -923,3 +923,68 @@ VXC_TEST(cavern_ground_bound_only_removes_and_the_ceiling_bounds_it) {
     CHECK_EQ(cavernWaterCeilingMm(INT32_MIN, 300000), INT64_MIN);
     CHECK(!cavernWaterAt(INT32_MIN, -100000, 300000));
 }
+
+// UNLOADING A TILE MUST TAKE ITS LAKE INDEX WITH IT.
+//
+// `LakeSampler::TileIndex::basins` is a pointer BORROWED from a resident
+// FineTile; `FineTileSampler::unloadTile` destroys that tile. Before this test
+// the index was built once and never revalidated, so the query after an unload
+// read freed memory -- and what a freed BasinEntry draws is a lake sheet at an
+// arbitrary Z. Not reachable in the shipping client only because
+// FLakeWaterSampler owns a private sampler that never unloads; the streamer
+// already calls unloadTile, so a byte budget on the lake tier is all it takes.
+//
+// The assertion is deliberately "answers DRY", not "does not crash": reading
+// freed memory usually does not crash, which is the entire problem.
+VXC_TEST(lake_sampler_index_does_not_outlive_its_tile) {
+    const std::filesystem::path p =
+        std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
+    if (!std::filesystem::exists(p)) {
+        std::printf("  (skip: %s absent)\n", p.string().c_str());
+        return;
+    }
+    std::ifstream in(p, std::ios::binary);
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)),
+                               std::istreambuf_iterator<char>());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> probe = FineTile::parse(bytes.data(), bytes.size(), {}, &err);
+    CHECK(probe.has_value());
+    if (!probe) return;
+
+    // A basin that actually holds water, so "wet before, dry after" is a real
+    // transition rather than two dry answers.
+    const BasinEntry* wet = nullptr;
+    for (const BasinEntry& b : probe->basins()) {
+        if (b.holdsWater()) {
+            wet = &b;
+            break;
+        }
+    }
+    if (wet == nullptr) {
+        std::printf("  (skip: fixture has no water-holding basin)\n");
+        return;
+    }
+    const int32_t tx = probe->tileX(), ty = probe->tileY();
+    const uint32_t size = probe->size();
+    const int64_t sx = int64_t(tx) * size + wet->seedX;
+    const int64_t sy = int64_t(ty) * size + wet->seedY;
+
+    FineTileSampler s(probe->seed());
+    CHECK(s.loadTile(bytes, &err));
+    LakeSampler lakes(s);
+    CHECK(lakes.prewarmTile(tx, ty));
+    CHECK(lakes.surfaceAtPixel(sx, sy) != kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) != nullptr);
+
+    CHECK(s.unloadTile(tx, ty));
+    CHECK_EQ(lakes.surfaceAtPixel(sx, sy), kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) == nullptr);
+    CHECK(lakes.extentMaskFor(tx, ty, 0) == nullptr);
+
+    // Reloading the same bytes gives a DIFFERENT FineTile object, so the index
+    // must be rebuilt against it rather than resurrected -- and the answer must
+    // come back.
+    CHECK(s.loadTile(bytes, &err));
+    CHECK(lakes.surfaceAtPixel(sx, sy) != kNoWaterMm);
+    CHECK(lakes.basinsForTile(tx, ty) != nullptr);
+}
