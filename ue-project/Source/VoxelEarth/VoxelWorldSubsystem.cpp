@@ -6091,8 +6091,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	{
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Fine tier (5s window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
-		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu | blockingLoads=%llu gateLeaks=%llu ")
-		       TEXT("| ringRadius=%d"),
+		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu refusedTiles=%llu retriesSuppressed=%llu ")
+		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d"),
 		       (unsigned long long)FineStreamer->ResidentTileCount(),
 		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
 		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
@@ -6101,6 +6101,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)FineStreamer->MissingFileLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->CorruptTileLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->IdentityMismatchLoadsSinceStart(),
+		       // refusedTiles is the one to read next to a black screen: a tile
+		       // PRESENT on disk that this build has stopped trying to load.
+		       // absentOnDisk resolves itself when the bake arrives; this does
+		       // not. retriesSuppressed is the spin that is no longer happening.
+		       (unsigned long long)FineStreamer->RefusedTileCount(),
+		       (unsigned long long)FineStreamer->SuppressedRetriesSinceStart(),
 		       (unsigned long long)FineStreamer->BlockingLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->GateLeaksSinceStart(),
 		       FineStreamer->RingRadiusTiles());

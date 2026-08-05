@@ -234,8 +234,15 @@ struct FinePreambleRequest {
 // `fileSize` must be the file's true length (FileRangeSource::fileSize(), or a
 // 206's Content-Range total). Returns false, with `err` set, if the tile is not
 // a v2 .vxtl, if a declared section is missing, or on any read failure.
+//
+// `facts` (optional) comes back filled from the head probe whenever there was a
+// header to read -- INCLUDING on failure, which is the case it exists for. A
+// refusal that cannot say what the file claimed to be cannot distinguish a
+// reader that is too old from a file that is broken, and the two want opposite
+// responses from whoever reads the log. Pair it with fineDescribeRejection.
 bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambleRequest& want,
-                          FineTileBytes& out, FineError* err = nullptr);
+                          FineTileBytes& out, FineError* err = nullptr,
+                          FineHeaderFacts* facts = nullptr);
 
 // Which plane a fetch is for. The three share all their machinery -- one block
 // index, one data section, the same entry layout -- so this selects rather than
