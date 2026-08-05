@@ -35,6 +35,27 @@
 // is buried) and vxc_burialprobe (does the near field offer water to the
 // mesher?). Same shape of tool, same reason.
 //
+// WHAT IT FOUND, and the reason --cam-z exists at all. None of the producers
+// above was responsible: at that column every one of them reads DRY and the
+// highest water within a kilometre is a river at 115.8 m. The disc came from
+// the NEAR-FIELD sweep, and the sweep's arithmetic is correct -- it is fed a
+// ground from a different world. `FVoxelWaterImpl` declares
+// `vxc::SyntheticTileSampler Tiles;` and builds its Amplifier over it, so on a
+// baked run the cavern half amplifies the PROCEDURAL world. Reproduced at the
+// owner's exact centre brick (-200497, -106746, 773):
+//
+//   ground from the BAKED tiles      77.623 m   ceiling 41.197 m   0 candidates
+//   ground from the SYNTHETIC tiles 638.451 m   ceiling 606.166 m  511 candidates
+//
+// 511 is exactly what the session log reported. 606.166 m lands in the box's
+// FLOOR brick (605.6 m), so each admitted column contributes exactly one brick
+// -- which is why the disc is a single flat slab at 605.6 m, 528 m above ground
+// the synthetic world thinks is at 638 m. The file being probed predicted this
+// in its own comment: "under -VoxelTileDir it is amplifying a DIFFERENT WORLD
+// from the one on screen ... for cavern flood levels that has been a known,
+// tolerated inaccuracy". It is only invisible near the ground, which is where
+// every previous capture was taken.
+//
 // Usage:
 //   vxc_waterdatumprobe <tiledir> [--at Xm Ym] [--radius M] [--span M]
 //                       [--band LOm HIm] [--zstd PATH]
@@ -46,6 +67,9 @@
 //              2000)
 //   --band     report every resident basin whose surface falls in [LO, HI] m
 //              (default 500 700)
+//   --cam-z    camera altitude in METRES. Reproduces RefreshImplicitWater's
+//              candidate sweep at that altitude and reports how many bricks it
+//              would offer -- see the section comment for why that matters.
 
 #include <algorithm>
 #include <cinttypes>
@@ -56,6 +80,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -69,8 +94,11 @@
 #endif
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/caverns.h"
 #include "voxelcore/lakes.h"
+#include "voxelcore/tiles.h"
 #include "voxelcore/tilestore.h"
+#include "voxelcore/waterca.h"
 
 using namespace vxc;
 
@@ -171,6 +199,8 @@ int main(int argc, char** argv) {
     double atXm = -160398.2, atYm = -85408.4;
     double radiusM = 10000.0, spanM = 2000.0;
     double bandLoM = 500.0, bandHiM = 700.0;
+    double camZm = 0.0;
+    bool haveCamZ = false;
     for (int i = 2; i < argc; ++i) {
         const char* a = argv[i];
         if (!std::strcmp(a, "--at") && i + 2 < argc) {
@@ -185,6 +215,9 @@ int main(int argc, char** argv) {
             bandLoM = std::strtod(argv[i + 1], nullptr);
             bandHiM = std::strtod(argv[i + 2], nullptr);
             i += 2;
+        } else if (!std::strcmp(a, "--cam-z") && i + 1 < argc) {
+            camZm = std::strtod(argv[++i], nullptr);
+            haveCamZ = true;
         } else if (!std::strcmp(a, "--zstd") && i + 1 < argc) {
             zstdPath = argv[++i];
         }
@@ -451,6 +484,124 @@ int main(int argc, char** argv) {
     }
     if (found == 0) {
         std::printf("  NONE. A sheet at that height cannot be coming from this tile set.\n");
+    }
+
+    // ---- RefreshImplicitWater's candidate sweep, reproduced ----------------
+    //
+    // WHY THIS IS HERE AND NOT ONLY IN THE UE ACTOR. The sweep's candidate
+    // filter does NOT consult the ImplicitFn -- it re-derives the water ceiling
+    // itself, as max(cavern flood level, lake datum), and offers every brick at
+    // or below it. So the sweep can offer bricks the fill function would then
+    // decline, and it can offer bricks the fill function AGREES with for the
+    // wrong reason. Neither is visible from a column query, and both are
+    // invisible in a screenshot taken anywhere near real water.
+    //
+    // The constants are voxel-core's own, so this cannot drift from the actor:
+    // kImplicitRadiusBricks = 32 and kImplicitRadiusBricksZ = 16 are restated
+    // here only because they live in the UE translation unit.
+    if (haveCamZ) {
+        // THE SWEEP IS RUN TWICE, OVER TWO DIFFERENT WORLDS, and that is the
+        // whole point of this section.
+        //
+        // `FVoxelWaterImpl` declares `vxc::SyntheticTileSampler Tiles;` and
+        // builds its Amplifier over it, so the cavern half of the water
+        // subsystem amplifies the PROCEDURAL world even when the run is on
+        // baked tiles. Its own comment calls that out ("under -VoxelTileDir it
+        // is amplifying a DIFFERENT WORLD from the one on screen ... for cavern
+        // flood levels that has been a known, tolerated inaccuracy"). The lake
+        // half was moved off it on 2026-08-03; the cavern half was not.
+        //
+        // So "real" below is what the sweep SHOULD see, and "synthetic" is what
+        // it actually sees. Printing both is what turns a code-reading claim
+        // into a measurement.
+        SyntheticTileSampler synthTiles(seed);
+        Amplifier synthAmp(seed, synthTiles);
+        constexpr int32_t kRadiusBricks = 32;
+        constexpr int32_t kRadiusBricksZ = 16;
+        const int64_t edge = int64_t(WaterBrick8::kEdge);
+        const int64_t camVx = floorDiv(int64_t(atXm * 1000.0), int64_t(kVoxelSizeMm));
+        const int64_t camVy = floorDiv(int64_t(atYm * 1000.0), int64_t(kVoxelSizeMm));
+        const int64_t camVz = floorDiv(int64_t(camZm * 1000.0), int64_t(kVoxelSizeMm));
+        const int64_t cx = floorDiv(camVx, edge), cy = floorDiv(camVy, edge);
+        const int64_t cz = floorDiv(camVz, edge);
+        const double boxFloorM = double(cz - kRadiusBricksZ) * double(edge) *
+                                 double(kVoxelSizeMm) / 1000.0;
+        const double boxCeilM = double(cz + kRadiusBricksZ + 1) * double(edge) *
+                                double(kVoxelSizeMm) / 1000.0;
+        std::printf("\n=== RefreshImplicitWater CANDIDATE SWEEP at camera z %.1f m ===\n", camZm);
+        std::printf("  centre brick (%lld, %lld, %lld); box z spans %.1f .. %.1f m\n", (long long)cx,
+                    (long long)cy, (long long)cz, boxFloorM, boxCeilM);
+
+        const int64_t floorVz = (cz - kRadiusBricksZ) * edge;
+        auto sweep = [&](const char* which, Amplifier& useAmp, bool useLakes) {
+            int64_t candidates = 0, columnsAdmitted = 0, columnsByCavern = 0, columnsByLake = 0;
+            int64_t columnsWithCavernAir = 0;
+            int32_t highestFlood = INT32_MIN;
+            for (int64_t by = cy - kRadiusBricks; by <= cy + kRadiusBricks; ++by) {
+                for (int64_t bx = cx - kRadiusBricks; bx <= cx + kRadiusBricks; ++bx) {
+                    const int64_t vX = bx * edge, vY = by * edge;
+                    const int32_t cavernZMm = useAmp.columnCached(vX, vY).cavern.floodZMm;
+                    const int32_t lakeZMm =
+                        useLakes ? both.waterSurfaceMmAtVoxel(vX, vY) : kNoWaterMm;
+                    if (cavernZMm == INT32_MIN && lakeZMm == kNoWaterMm) continue; // dry column
+                    ++columnsAdmitted;
+                    if (cavernZMm != INT32_MIN) ++columnsByCavern;
+                    if (lakeZMm != kNoWaterMm) ++columnsByLake;
+                    // A cavern flood level does NOT mean this column HAS cavern
+                    // air. `CavernColumn::floodZMm`'s own comment says INT32_MIN
+                    // means "dry OR no site in reach", so a non-sentinel value
+                    // only says a site is in REACH; `count` is what says a room
+                    // actually reaches this column. Counted apart because that
+                    // difference is the whole question.
+                    if (useAmp.columnCached(vX, vY).cavern.count > 0) ++columnsWithCavernAir;
+                    const int32_t floodZMm = cavernZMm > lakeZMm ? cavernZMm : lakeZMm;
+                    if (floodZMm > highestFlood) highestFlood = floodZMm;
+                    const int64_t floodBrickZ =
+                        floorDiv(int64_t(floodZMm) / int64_t(kVoxelSizeMm), edge);
+                    for (int64_t bz = cz - kRadiusBricksZ; bz <= cz + kRadiusBricksZ; ++bz) {
+                        if (bz > floodBrickZ) continue;
+                        ++candidates;
+                    }
+                }
+            }
+            const ColumnSample& camCol = useAmp.columnCached(camVx, camVy);
+            std::printf("  --- ground from the %s sampler ---\n", which);
+            std::printf("    amplified ground at the camera column   : %.3f m\n",
+                        double(camCol.surfaceMm) / 1000.0);
+            std::printf("    columns past the dry-column reject      : %lld of %d "
+                        "(cavern %lld, lake %lld, with cavern AIR %lld)\n",
+                        (long long)columnsAdmitted,
+                        (2 * kRadiusBricks + 1) * (2 * kRadiusBricks + 1),
+                        (long long)columnsByCavern, (long long)columnsByLake,
+                        (long long)columnsWithCavernAir);
+            if (highestFlood != INT32_MIN) {
+                std::printf("    highest max(cavernFlood, lakeDatum)     : %.3f m\n",
+                            double(highestFlood) / 1000.0);
+            }
+            std::printf("    cavernFloodedAt at the box floor (%.1f m): %s\n", boxFloorM,
+                        cavernFloodedAt(camCol.cavern, floorVz) ? "TRUE -- floods OPEN SKY"
+                                                                : "false");
+            std::printf("    CANDIDATE BRICKS OFFERED                : %lld\n",
+                        (long long)candidates);
+        };
+        // EACH SWEEP RUNS ON ITS OWN THREAD, and that is correctness, not
+        // parallelism. amplifier.cpp memoises cavern SITES in a
+        // `static thread_local` slot table keyed by (seed, fi, fj) ONLY -- not
+        // by which `surfaceAt` produced them. Two Amplifiers over two different
+        // tile samplers on one thread therefore share sites, and the second one
+        // silently reports the first one's world. Running them on separate
+        // threads gives each a clean table. (The game has exactly this shape --
+        // the terrain's Amplifier and FVoxelWaterImpl::Amp, two samplers, one
+        // game thread -- which is worth its own look.)
+        std::thread(
+            [&] { sweep("REAL (baked tiles, what is on screen)", amp, true); })
+            .join();
+        std::thread([&] {
+            sweep("SYNTHETIC (FVoxelWaterImpl::Tiles, what the cavern half reads)", synthAmp,
+                  true);
+        }).join();
+        std::printf("  (a camera %.0f m above dry ground must offer ZERO in both)\n",
+                    camZm - double(amp.columnCached(camVx, camVy).surfaceMm) / 1000.0);
     }
     return 0;
 }
