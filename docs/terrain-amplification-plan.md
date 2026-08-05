@@ -1,5 +1,59 @@
 ﻿# Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
 
+> ## STATUS SUPERSEDED 2026-08-05 — this plan finished, and one of its phases was later reversed
+>
+> **For what the amplifier does today, read `docs/world-generation-architecture.md` §7.**
+> This file is kept for its design reasoning — band ownership, the carrier, the
+> determinism constraints, the production argument — all of which still holds.
+> Its *status* block below stops at worldgen **v9** with Phase 3 in progress and
+> Phase 4 not started. **The amplifier is now at v23**, and all four phases
+> landed.
+>
+> **The most misleading thing you could take from this file: Phase 4, the 3D
+> density band.** It landed at v12 — and was **deleted again at v20**, because it
+> turned out to be the cause of the visible banding the owner had complained
+> about for weeks. Measured at site (−69094, 38426), seed 20260719: the top solid
+> voxel moved on **88.61% of 262,144 columns**, by up to ±300 mm, at a dominant
+> wavelength of **10.04 m** and a stripe angle of **78.7°**. Every earlier probe
+> missed it because the term never touches `amp.surfaceMm` — it displaces voxel
+> *placement* off that surface by up to 3.5 voxels, so a heightfield probe is
+> structurally blind to it. It was also shown untunable rather than mistuned
+> (overhangs 0.01% → 0.54% → 1.97% → 3.57% across contrast passes; every setting
+> either banded or inert). **Removed at v20 (`ecda4b6`, `cf0b807`) and
+> owner-confirmed in a live editor session: "YES THIS LOOKS GOOD. PASS".** The
+> banding is closed. Do not reopen it from this document.
+>
+> **What landed after the status block below was written:**
+>
+> | version | change |
+> |---|---|
+> | v10–v12 | Phase 3 (curvature gate, rill, bedding wired into `evalSurface`; the 25.6 m / 6.4 m landform octaves deleted on a fine world), then Phase 4's 3D density band |
+> | v13–v15 | prefilter the carrier, gate detail on relief not gradient, cap the detail ladder's gradient at the carrier's own |
+> | v16–v18 | horizontal carrier warp against straight contour terracing; Hurst-0.8 micro ladder; the fine ladder's budget moved to sub-metre |
+> | v18 (bake) | the meso band was **withdrawn from the client** and moved into the bake as B4 |
+> | v19 | split the detail cap into two pools — **this is the regression that is still open** |
+> | v20 | 3D density band removed |
+> | v21 | the micro gradient cap comes down, 1.5× → 1.2× (both tiers: `kMicroGradCapKQ10` and `kFineMicroGradCapKQ10`) |
+> | v22 | savanna's biome gate moved from `bio_4` to `bio_15` |
+> | v23 | cap the **sum** of the two fine-tier detail pools (`kFineDetailSumCapKQ10 = 1024`, fine tier only) |
+>
+> **Still open from this plan's programme**, both written up in
+> `world-generation-architecture.md` §11:
+>
+> * The **fine tier's drainage regression at v19** — 11.3% median added stranding
+>   at v22. v23 helps a great deal at four sites (35.5% → 3.6% at the worst), but
+>   the 11-window paired corpus was never re-run afterwards and v23 has never
+>   been judged for visible terracing.
+> * **`kFineDetailOctaves`' amplitude.** The calibration probe *has* now been run
+>   against a real fine tile and returned three answers spanning **3.8× inside
+>   one tile**. The honest state is "measured, and the answer is not yet".
+>
+> Two related notes: `docs/rescued/terrain-amplification-plan-agent-a2d207d0.md`
+> is a longer working copy of this same plan captured at v12 — same caveats, more
+> of them. And this plan's own numbers for tile size and bake cost have been
+> re-measured since: **201.4 MB raw / 33.4 MB zstd** per fine tile, ~130–165
+> CPU-s.
+
 **Status, updated 2026-07-29.** **Phase 0 and Phase 1 (v9) are LANDED**, merged as **PR #171**
 (`0e55c4c`, `cf9aa46`, `e9fb524`) — worldgen is at **v9** (`core.h:54`), `ctest` is green, and
 `vxc_gpu` passes bit-exact on AMD. **Phase 2 is LANDED**, merged as **PR #176**: server bake

@@ -299,8 +299,10 @@ w3 = tq^3                                          # sum == 6*1024^3, all >= 0
 ```
 
 Stencil for cell `px`: control points `px-1 .. px+2` (`vxc::kCarrierStencilLo/Hi` in `tiles.h`).
-This is the same carrier shipped in worldgen v9 — see `amplifier.cpp`'s carrier block for the
-overflow and bound arguments.
+This is the same carrier *stencil* shipped in worldgen v9 — see `amplifier.cpp`'s carrier block
+for the overflow and bound arguments. The stencil and the weights above are unchanged; what the
+carrier does around them is not. v13 added a prefilter and moved detail gating from gradient to
+relief, and v16 added a horizontal warp to break straight contour terracing. Worldgen is at v23.
 
 ## 9. Conformance
 

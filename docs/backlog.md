@@ -489,6 +489,21 @@ rainfall, no rain shadow, no continentality. So no landmass scale produces a dry
 interior. Either author the precipitation raster (`make_conditioning.py` does
 this) or patch `synthetic_map.py` to couple it. See `docs/worldgen-levers.md` §2.
 
+> **DONE 2026-08-01 — both halves.** `synthetic_map.py` was patched to couple
+> precipitation to terrain (an orographic rain-shadow pass; the patch is
+> `terrain-service/patches/terrain-diffusion-worldgen.patch`, parameters at
+> `providers/diffusion.py:549-566`). Measured: correlation between the upwind
+> barrier and the rainfall multiplier **−0.734**; mean multiplier **0.493**
+> behind a barrier over 600 m against **1.393** with none. Separately, the
+> conditioning statistics were rebuilt from the real WorldClim rasters — the
+> previous file had used hand-written latitude formulas substituted when
+> WorldClim was unreachable, which held precipitation to **7.8%** of its
+> encodable range over land. The shipped world now measures **DESERT 9.74%,
+> RAINFOREST 4.73%**, all eight mappable biomes non-zero. Note the rebuild alone
+> was not enough: deserts only appeared after a monotone remap of the model's
+> *output* in `adapt_raster_to_tile` (`3b511e3`, `56257c8`). See
+> `docs/world-generation-architecture.md` §6.1–6.2.
+
 **Narrow `diffusion.py`'s bio_12 quantization range** from 0..12000 to ~0..4000
 mm/yr, and bio_1 from ±40 to ~±30 °C. Precipitation currently occupies 23 of 256
 codes — 1 LSB is 47 mm/yr, coarser than the distinctions the biome thresholds

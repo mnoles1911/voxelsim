@@ -20,6 +20,19 @@ RAINFOREST, TAIGA and SAVANNA are plant-community names, derived from the
 Whittaker axes (temperature × precipitation × seasonality) that actually decide
 what grows. Use it as the primary species-palette selector.
 
+> **Which "seasonality" — updated 2026-08-05, worldgen v22.** The classifier uses
+> **both**, and they are different channels. Temperature seasonality (`bio_4`)
+> still drives the cold-winter distinctions. **SAVANNA's gate reads
+> `bio_15` — the variability of monthly *precipitation*** — because savanna is a
+> wet season and a dry season, not hot summers and cold winters. The old
+> temperature-seasonality gate was not mistuned, it was **unsatisfiable**: over
+> 437,571 WorldClim land pixels between ±60°, the maximum `bio_4` anywhere with
+> `bio_1 >= 18 °C` is **1,084** against a threshold of 1,500 — zero pixels of
+> Earth qualified. `kBiomeSeasonalHighU8` was deleted;
+> `kBiomePrecipSeasonalHighU8 = 89` (70% CV) replaced it. Anything selecting a
+> savanna palette should key on precipitation variability, not on temperature
+> swing. See `docs/world-generation-architecture.md` §6.3.
+
 **Biome alone will place trees badly.** Three modulators are required, and none
 of them is the province map:
 

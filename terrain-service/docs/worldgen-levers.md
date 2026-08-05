@@ -78,21 +78,59 @@ fraction and temperature vary between seeds; topology does not. Earth's
 continents come from plate tectonics — long linear features, coherent cratons —
 and a histogram cannot encode that.
 
-### Climate is only half-coupled to terrain
+### Climate coupling to terrain — updated 2026-08-05
 
 From `finalize_synthetic_map`:
 
-* **Temperature IS coupled to elevation** — a real lapse rate,
+* **Temperature is coupled to elevation** — a real lapse rate,
   `temp += lapse * max(0, elev)`, so mountains are cold.
-* **Precipitation is NOT coupled to anything.** It is an independent Perlin
-  field with its own seed, never touched by elevation or distance from ocean.
+* **Precipitation is coupled to elevation too, since 2026-08-01** — an
+  orographic rain-shadow pass. It is **rain shadow only**; there is still **no
+  continentality**, so distance from the ocean does nothing on its own.
 
-**There is no orographic rainfall, no rain shadow, and no continentality.**
+**The rain-shadow pass, and where it lives.** The code is a patch this repo owns
+against upstream `synthetic_map.py`:
+`terrain-service/patches/terrain-diffusion-worldgen.patch`, applied by
+`bootstrap_pod.sh`, pinned to upstream `82a0431`. Its parameters are
+`WorldShapeConfig` fields (`providers/diffusion.py:549-566`):
+`orographic_enabled=True`, `oro_wind_from_deg=270.0`,
+`oro_probe_wavelengths=(0.15, 0.30, 0.60, 1.20)` (fractions of the elevation
+base wavelength), `oro_barrier_m=1200`, `oro_upslope_m=600`,
+`oro_shadow_strength=0.75`, `oro_enhance_strength=0.60`, `oro_sea_blend_m=200`.
 
-**Consequence, measured:** bigger continents do NOT get dry interiors. A
-315,000 km² landmass generated at `frequency_mult[0]=0.4` still classified
-DESERT 0.0%. If you want deserts, the *precipitation* channel has to be
-conditioned — the elevation channel will not produce them at any scale.
+For each land cell it looks upwind at four probe distances, takes the largest
+elevation the wind had to climb (`barrier`), and applies
+`(1 + 0.60·enhance) · (1 − 0.75·shadow)` — ramped in over the first 200 m inland
+so coasts do not step. **The wind is a single fixed global bearing**: no
+latitude bands, no Hadley cell, no seasons.
+
+**Measured:** correlation between upwind barrier and the rainfall multiplier is
+**−0.734**. Mean multiplier is **0.493 behind a barrier over 600 m** against
+**1.393** with no barrier. Land under 400 mm/yr went 34.7% → 40.4%. Seam-free by
+construction (the elevation noise is re-sampled at absolute world coordinates);
+`tools/orographic_check.py` measures max|diff| = 0.0.
+
+**Do not claim which compass direction the dry side faces.** Two coordinate
+swaps sit between this pass and the rendered world. The patch claims only that
+the effect is *consistent*, and so should you.
+
+> **What this section used to say, and why it was true then.** It said
+> precipitation was an independent Perlin field, that there was no orographic
+> rainfall at all, and that a 315,000 km² landmass generated at
+> `frequency_mult[0]=0.4` still classified **DESERT 0.0%**. That measurement was
+> correct at the time and it is what motivated the fix. It was compounded by a
+> second problem: `synthetic_map_stats.json` had been built from **hand-written
+> latitude formulas** substituted when WorldClim was unreachable, so
+> precipitation spanned only **7.8%** of its encodable range over land. Both are
+> fixed. The shipped world now measures **DESERT 9.74%, RAINFOREST 4.73%** over
+> 289 tiles with all eight mappable biomes non-zero.
+>
+> One correction to keep, because it caught people out: **the stats rebuild
+> alone did not produce deserts.** After both halves of that work the coarse
+> census still read DESERT 0.00%. What made deserts exist was a later monotone
+> remap of the *model's output* in `adapt_raster_to_tile` (`3b511e3`,
+> re-fit in `56257c8`). Fixing the input distribution is not the same as fixing
+> the output distribution.
 
 ---
 

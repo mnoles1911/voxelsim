@@ -1,5 +1,33 @@
 # Worldgen variety — making the world feel alive
 
+> ## OUTCOME RECORDED 2026-08-05 — this plan mostly executed. Read the result, not the proposal.
+>
+> **Current state lives in `docs/world-generation-architecture.md` §6.** This
+> file is kept because the *reasoning* and the two falsified hypotheses below
+> are worth not re-running. Where it and the architecture document disagree, the
+> architecture document is right.
+>
+> | wave | what happened |
+> |---|---|
+> | **1a** rebuild `synthetic_map_stats.json` from real rasters | **SHIPPED** (`8ce2890`), pinned (`49bb67b`, `41a73a4`) |
+> | **1b** couple precipitation to terrain | **SHIPPED** — orographic rain shadow, correlation −0.734, mean multiplier 0.493 behind a >600 m barrier |
+> | **2a** savanna's gate | **SHIPPED as worldgen v22** (`2fce31a`) — but *not* the way this plan proposed; see the correction below |
+> | **2b** elevation tails | **HALF shipped.** Tails stretched (`elev_gain` 1.6). `cond_snr[0]` was tested at 0.15 and **REJECTED** — see the correction below |
+> | **3a** re-measure the coarse tier | **SHIPPED** — `measurements/geomorphon-v21-2026-08-01.txt` |
+> | **3b** gate the coarse shaping octaves | **NOT APPLIED.** Still open, still conditional on one more measurement |
+> | **3c** unblock the PROVISIONAL amplitude | **RUN, and it said "not yet"** — see the correction below |
+> | **4** landform provinces Tier 1 | **SHIPPED at `BAKE_VERSION` 7** (`4f9a6e7`) |
+>
+> **Two "before" numbers in this file are softer than they read.** The 7.8%
+> precipitation-range figure is a real measurement. "DESERT 1.84% / SAVANNA
+> 0.00%" is a classification of the *sketch* recorded in plan prose only, never
+> in a measurement file — quote it as indicative. And the rebuild alone did
+> **not** fix deserts: the coarse census still read DESERT 0.00% after both
+> halves of Wave 1, and what made deserts exist was a later monotone remap of
+> the model's output in `adapt_raster_to_tile` (`3b511e3`, `56257c8`). The world
+> now measures **DESERT 9.74%, RAINFOREST 4.73%**, all eight mappable biomes
+> non-zero.
+
 ## Context
 
 The owner's complaint: the world reads as monotonous. Terrain character should
@@ -188,6 +216,23 @@ So **no amount of conditioning work reaches SAVANNA.** Re-derive
 `kBiomeSeasonalHighU8` against the real WorldClim joint distribution. Small
 change, rolls `kWorldGenVersion`.
 
+> **CORRECTION — what actually shipped, worldgen v22 (`2fce31a`).** The
+> diagnosis above is right and the prescription is wrong. **No `bio_4`
+> threshold fixes savanna, because `bio_4` is the wrong variable.** At
+> `bio_4 >= 200` the gate calls Houston, Brisbane and Miami savanna while still
+> rejecting the Serengeti, the Cerrado and Tsavo. Real savanna is a wet season
+> and a dry season, which is `bio_15` (variability of monthly precipitation),
+> not hot summers and cold winters.
+>
+> So `kBiomeSeasonalHighU8` was **deleted, not re-derived**, and
+> `classifyBiome`'s third argument moved to `bio_15` with a 70% threshold —
+> `kBiomePrecipSeasonalHighU8 = 89` (`biome.h:184`). The 70% was derived twice
+> and agreed: `sqrt(4/8) = 70.7%` from the physical definition of a 4-wet-month
+> regime, and 15.57% of Earth's land empirically against the real ~15.6%. Wire
+> format unchanged; `provider_id` did not roll. Every mention of
+> `kBiomeSeasonalHighU8` in this file refers to a symbol that no longer exists.
+> See `measurements/biome-gates-2026-08-01.txt` §2.
+
 ### 2b. Elevation tails — the model compresses them, not the sketch
 
 The cached table implies 22.6% of land above 1000 m; delivered is 1.4%. Likely
@@ -205,6 +250,27 @@ Pair it with a **lower** `cond_snr[0]` (0.3 -> ~0.15) to force obedience.
 **`worldgen-levers.md:108` documents `cond_snr` backwards** — `t = atan(snr)`,
 `cond = cos(t)*sketch + sin(t)*noise` (`world_pipeline.py:975`, `:932`), so
 **lower means tighter**. Fix that line while you are there.
+
+> **CORRECTION — what shipped, and what did not.**
+>
+> * **The `cond_snr` documentation fix landed.** `worldgen-levers.md:108` now
+>   reads "LOWER IS TIGHTER" with the mixing-angle formula.
+> * **`cond_snr[0]` itself was NOT lowered.** Shipped value is still **0.30**
+>   (`providers/diffusion.py:525`). Tested at 0.15 and rejected: tightening it
+>   *reduced* relief — land above 1 km fell 27.05% → 24.87% and land fraction
+>   40.5% → 37.7%. `measurements/elevation-tails-2026-08-01.txt` records
+>   "Shipping keeps 0.30." Anyone reading "the SNR was lowered" is reading a
+>   proposal, not the world.
+> * **The tails were stretched and that did ship:** `elev_gain = 1.6`,
+>   `elev_gain_power = 2.0` (`diffusion.py:590-591`). Land above 1 km 24.31% →
+>   **27.05%**, above 2 km 5.29% → **8.07%**, coarse max 4,799 → **7,465 m**. A
+>   gain of 2.0 was rejected as visible clipping (table asks 11,628 m, model
+>   returns 8,144 m).
+> * **The premise above was itself wrong.** "The table implies 22.6% of land
+>   above 1000 m; delivered is 1.4%" conflated two quantities — the 1.4% was
+>   *local relief per 2 km window*, not elevation above 1000 m. At gain 1.0 the
+>   model **over-delivers** (table 22.2%, model 24.31%). The tail stretch was
+>   still worth shipping; the stated diagnosis was not the reason.
 
 Unknown, and it needs a measurement rather than an argument: how much 2 km-scale
 relief responds to a coarse-table change. That statistic is produced by the
@@ -251,6 +317,25 @@ measurement against the fine tier's measured S2, and that measurement does not
 exist yet. Do not tune it by eye."* The comment is also **stale**: it describes
 900, v18 shipped 100 for an unrelated rib-length reason. `vxc_terrainprobe
 --calibrate --fine-dir` is the tool and **appears never to have been run**.
+
+> **CORRECTION — it HAS been run, three times, on 2026-08-01.** Both flags exist
+> and compose (`bench/terrainprobe.cpp:48`, `:52-55`), and the runs are recorded
+> in `measurements/geomorphon-v21-2026-08-01.txt` §8. The item is still open for
+> a different reason: **the measurement gave three different answers.**
+>
+> | site | H_used | r² | amp_3200 | amp_1600 | amp_400 | amp_200 |
+> |---|---|---|---|---|---|---|
+> | flat | 0.607 | 0.959 | 488 | 343 | 157 | 101 |
+> | mid | 0.704 | 0.964 | 1253 | 770 | 323 | 175 |
+> | steep | 1.025 | 0.983 | 332 | 310 | 92 | 24 |
+> | **shipped** | | | **100** | **100** | **400** | **200** |
+>
+> `amp_3200` spans **3.8× across three sites inside one tile**, and it is not
+> noise (residuals 7.5–8.3%, r² above 0.96). `H_used = 1.025` on the steep site
+> is outside the fBm range, so that row cannot be averaged in. Recorded verdict:
+> *"the measurement is possible and its answer is 'NOT YET'"* — **no number was
+> proposed.** Closing it needs a defined calibration-site corpus, a rule for
+> combining sites, and a re-run of v18's rib-length measurement.
 
 ---
 

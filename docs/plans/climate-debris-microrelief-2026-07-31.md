@@ -1,7 +1,35 @@
 # Climate-conditioned erosion, debris fields, biome micro-relief
 
-**Status:** planned, not started. Written 2026-07-31, after an audit of the pipeline against
-the Gaea/Quadspinner stage model (primitives → structural → erosion → post-process/surface).
+**Status, updated 2026-08-05: Gap 1 is largely closed, Gaps 2 and 3 are untouched.**
+Written 2026-07-31, after an audit of the pipeline against the Gaea/Quadspinner
+stage model (primitives → structural → erosion → post-process/surface).
+
+> **Gap 1 — "the bake has no climate conditioning at all" — was closed by
+> landform provinces Tier 1** (`BAKE_VERSION` 7, commit `4f9a6e7`, 2026-08-01).
+> The grep below now returns matches in `province.py`, `pipeline.py`,
+> `basins.py` and `water.py`. Erosion is no longer byte-identical everywhere:
+> `province.py` builds six **per-cell parameter fields** from the terrain and its
+> climate — `profile_K_dt` (the incision coefficient this plan asked for),
+> `a_crit_m2`, `stream_m`, `gate_q`, `meso_amp15_m`, `meso_amp11_m` — consumed by
+> `incise.py` via `field_scale` and `noise.py` via `amp_scale`.
+>
+> Two details of how it was done, because they are load-bearing and this plan did
+> not anticipate them. Provinces are a **per-cell field, never a per-tile constant
+> set** — two adjacent tiles baked with different constants disagree along their
+> shared edge. And every climate discriminant is **smoothed to landform scale
+> before it reaches a threshold**, because climate arrives at 30 m and uint8
+> quantised (precipitation's least significant bit is 47 mm/yr) and would
+> otherwise print 30 m blocks into the erosion intensity.
+>
+> **Stage A below is therefore partly redundant.** What Tier 1 did not do:
+> per-material weathering rates and climate-varying repose angles (`stream_n` and
+> `incision_cap_m` were left out on purpose — they are numba kernel scalars).
+>
+> **Gaps 2 (debris and boulder fields) and 3 (biome-varying micro-roughness) are
+> unstarted.** Both are client-side and neither is blocked.
+>
+> Current pipeline state: `docs/world-generation-architecture.md`, §6.5 for
+> provinces.
 
 ## What the audit found
 

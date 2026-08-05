@@ -1,5 +1,42 @@
 # Where the 30 m → 10 cm pipeline stops looking like Earth
 
+> ## HISTORICAL — every number here is from a world we no longer generate
+>
+> **Read `docs/world-generation-architecture.md` for the current pipeline.**
+>
+> This report was measured **2026-07-29, at the worldgen v12 era**, on a
+> **different world** — the unpinned `…UNPINNED-UNVERIFIEDDATA-27ac04bc…`
+> provider, seed `000000000135276f`, **not** the shipped `20260719` world, and
+> before the conditioning statistics were rebuilt from real climate data. Do not
+> quote a number out of this file as a current fact.
+>
+> **What has landed since, which this report predates:**
+>
+> * **v13/v14/v15** capped the client detail ladder's gradient at the carrier's
+>   own — the direct answer to §10 item 1 below.
+> * **v16–v19** added the carrier warp, the meso band (later moved into the
+>   bake), and the two-pool cap.
+> * **v20** deleted the 3D density band. That was the cause of the banding the
+>   owner complained about; it is **solved and owner-confirmed**.
+> * **v21–v23** brought the micro cap down, fixed the savanna gate, and capped
+>   the *sum* of the two fine-tier detail pools.
+> * The **conditioning statistics were rebuilt from real WorldClim rasters**, and
+>   precipitation is now coupled to terrain. The world this report measured had
+>   neither.
+>
+> **The specific figure most often quoted from here and most often wrong:** the
+> *"~0.3–0.6 m RMS added roughness regardless of class"* in §1 is a **worldgen
+> v12** number. v13/v14/v18 were built against it and the fine tier is now
+> largely fixed (~80 mm total excursion on a fine plain, computed from shipped
+> constants). Every `frac_ridge_peak` value in this file is likewise v12-era.
+>
+> **Why this file is kept, and kept whole:** it is the origin of the
+> geomorphology metric battery and of the warnings in §9 of the architecture
+> document — which metrics are blind to a spectrum-matched fake, why
+> `curvature_asymmetry` is unreadable on a quantised surface, and why the 30 m
+> realism gates pass a surface that is visibly not a plain. **The method is
+> current. The numbers are not.**
+
 *Measured 2026-07-29 on the `terrain-diffusion-unlabeled-UNPINNED-UNVERIFIEDDATA-27ac04bc8c6b7b7d`
 world, seed `000000000135276f`. Every number below is reproducible from the commands in
 §9; nothing here is read off a screenshot.*

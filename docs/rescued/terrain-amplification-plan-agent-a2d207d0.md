@@ -1,5 +1,22 @@
 ﻿# Terrain amplification redesign — 30 m diffusion tiles → 10 cm voxels
 
+> ## RESCUED WORKING COPY — SUPERSEDED 2026-08-05
+>
+> This is an agent's longer working copy of `docs/terrain-amplification-plan.md`,
+> captured at worldgen **v12**. It is kept because it holds detail the committed
+> plan does not. It is **not** a current description of anything.
+>
+> **Read `docs/world-generation-architecture.md` §7 for what the amplifier does
+> today** (worldgen v23), and the same file's §11 for what is still open.
+>
+> **The one claim here that will actively mislead you: "Phase 4 is landed."** The
+> 3D density band landed at v12 and was **deleted again at v20**, because it was
+> the cause of the visible banding the owner complained about for weeks — it
+> moved the top solid voxel on **88.61%** of columns at a 10.04 m wavelength
+> while never touching the height field, which is why every heightfield probe
+> missed it. Removed at `ecda4b6` / `cf0b807` and owner-confirmed: **"YES THIS
+> LOOKS GOOD. PASS"**. Closed.
+
 **Status, updated 2026-07-29 (second pass, folding in v10–v12 and the statistical validation
 programme).** **Phases 0–4 are all LANDED.** Worldgen is at **v12** (`core.h:105`), `ctest` is
 green, and `vxc_gpu` passes bit-exact on AMD (cross-vendor NVIDIA parity is still owed — no NVIDIA

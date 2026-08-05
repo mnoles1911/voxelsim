@@ -1,7 +1,12 @@
 # Landform provinces — process-varying bake rules
 
-**Status:** Tier 1 IMPLEMENTED at `BAKE_VERSION` 7 (2026-08-01), uncommitted.
-Tiers 2 and 3 still design. Written against `BAKE_VERSION` 6 and worldgen v21.
+**Status, updated 2026-08-05:** Tier 1 **SHIPPED** at `BAKE_VERSION` 7
+(commit `4f9a6e7`, 2026-08-01) — it is on `main`, not uncommitted as this line
+used to say. Tiers 2 and 3 are still design. The body below was written against
+`BAKE_VERSION` 6 and worldgen v21; **`BAKE_VERSION` has since advanced to 14**
+(all water work — the ground did not move) and `kWorldGenVersion` to 23.
+
+Current end-to-end state: `docs/world-generation-architecture.md` §6.5.
 
 See "Tier 1 as built" at the bottom for what shipped, what was measured, and the
 one finding that should change the recommended order.
@@ -206,6 +211,22 @@ DESERT 1.84% and SAVANNA 0.00%. That is why three biomes are unreachable in the
 shipped seed, and it is structural rather than unlucky — a different seed does
 not fix it. The fix is conditioning contrast, for which `tools/make_conditioning.py`
 and the custom-GeoTIFF path (`world_pipeline.py:779-819`) already exist.
+
+> **FIXED 2026-08-01 — this paragraph describes a world we no longer generate.**
+> Precipitation **is** coupled to terrain now: an orographic rain-shadow pass in
+> `finalize_synthetic_map` (the code is in
+> `terrain-service/patches/terrain-diffusion-worldgen.patch`; parameters at
+> `providers/diffusion.py:549-566`). Correlation between the upwind barrier and
+> the rainfall multiplier is **−0.734**; the mean multiplier is **0.493 behind a
+> barrier over 600 m** against **1.393** with none. There is still no
+> continentality and the wind is a single fixed global bearing.
+>
+> The conditioning statistics were also rebuilt from the real WorldClim rasters
+> — the previous file had used hand-written latitude formulas substituted when
+> WorldClim was unreachable. The shipped world now measures **DESERT 9.74% and
+> RAINFOREST 4.73%** over 289 tiles, with all eight mappable biomes non-zero. So
+> `ARID` is tunable and judgeable today. See
+> `docs/world-generation-architecture.md` §6.1–6.2.
 
 This matters for provinces directly: `ARID` cannot be tuned, judged, or even
 encountered until the conditioning produces dry climate at all.
