@@ -1,0 +1,258 @@
+RIVER CAPTURES WITH BOTH 2026-08-04 FIXES IN THE BUILD
+PR #221 (rivers fill their valley, bake_ver 12 -> 13) and PR #222 (the water
+system reads the world on screen)
+2026-08-05
+================================================================================
+
+WHAT THIS FILE IS. The conditions for nine capture pairs, and the measured
+number each frame has to be checked against. It contains NO statement about how
+any frame looks. That judgement is the owner's; the conditions are mine, and
+they are what decide whether a frame is worth judging at all.
+
+Every pose was shot TWICE, back to back, differing in one switch:
+`-VoxelRiverRibbons=0` removes the far-field river ribbon actor and nothing
+else. Files are in `docs/images/river-bv13/`: `<pose>-on.png`, `<pose>-off.png`,
+`<pose>-diff.png` (a heat image) and `<pose>-diff.txt` (the numbers).
+
+BUILD. main at f52077e (e9c7ffe = PR #222 merge, plus one docs commit).
+`UnrealEditor-VoxelEarth.dll` relinked 2026-08-05 00:01 against the
+`voxel-core` static library rebuilt 2026-08-04 23:59. The captures were taken
+from worktree `claude/river-bv13-captures` but launched against the built
+project in `D:\voxelsim\ue-project` -- a worktree has source and no Binaries,
+and an unbuilt project photographs a stock engine world.
+
+TILES.
+  root     D:/voxelsim/tile-cache
+  provider terrain-diffusion-unlabeled-80b9ca451a23eae4-ba9c62170
+  seed     000000000135276f (20260719), s16
+  bake_ver 13, READ FROM THE TILE BYTES of all four .vxtl files, not from the
+           directory date. (`-bd3d0ddc7` is the newest fine directory here by
+           mtime and is bv8 with no water plane at all.)
+  Both tiers were confirmed from the engine's own resolved lines in every run:
+  `Fine tier ENABLED: root=... provider=...` and `Baked water tier ENABLED:
+  root=... provider=...`. The water subsystem resolves those keys
+  independently of the world subsystem, so a frame can have the right terrain
+  and the wrong water; they agreed in all 18 runs.
+
+  Coverage is FOUR tiles and the wet-cell counts on the wire reproduce the
+  measurement document exactly:
+      (-11,-4)   148,232      (-11,-5)   406,999
+      (-11,-6) 2,156,457      (-12,-5)   179,799
+  (-11,-6) is river-lateral-fill-2026-08-04.txt's own stated 2,156,457.
+
+SUN. Frozen, 12:00 on 03-20, TimeScale 0, in both arms of every pair.
+RESOLUTION. 2560 x 1440. SETTLE. 300 s of game time before the shutter.
+
+VALIDITY, ALL NINE POSES, BOTH ARMS:
+  * jobsInFlight=0  pendingJobs=0  unloaded=0 at the shutter.
+  * ZERO `FINE TIER GATE LEAK` lines. Under `-unattended` the first leak is
+    fatal, so a run that reached a shutter had no fabricated sea-level ground
+    in frame.
+  * Shutter pose equals the requested pitch/yaw in every run (checked against
+    the camera manager's own readback, not against the spawn line -- the spawn
+    line reports yaw 0 because yaw is applied at the shutter, not at spawn).
+  * No `was REFUSED` tiles, no undrawn chunks.
+
+THE TWO SETTLE LINES, AND WHY ONE IS ABSENT ON PURPOSE. Near field needs
+`RefreshImplicitWater: DRAINED`; altitude needs `River ribbons: DRAINED build`.
+The implicit disc is 65x65x33 bricks about the camera -- +-25.6 m in xy and only
++-12.8 m in z -- so above about 13 m over the water it is empty air and reports
+no drain line. Its absence at altitude is STRUCTURAL, not a failure. Every pose
+below has the drain evidence appropriate to its height.
+
+
+================================================================================
+1. THE POSES
+================================================================================
+
+Widths are the CONTIGUOUS wet run through the point, minimised over azimuth (a
+transect taken along a river measures its length, not its width). Depth is from
+the wire's own depth plane. Clearance is the distance to the nearest UNBAKED
+tile; the working margin is 4.5 km, because a pose 4,073 m out once produced
+2,898 gate leaks. Measured with terrain-service/tools/river_capture_probe.py.
+
+--- owner-valley                       THE VALLEY THE OWNER PHOTOGRAPHED
+    column (-160874.5, -85643.1) m, tile (-11,-6)
+    ground top z 90.4 m, camera z 111.9 m (= 21.5 m above the surface)
+    shutter pitch -10.0, yaw 6.7            clearance 6,517 m
+    ribbons DRAINED: 52 reaches, 993 quads, 1 below one pixel
+    implicit disc rebuilt: 0 candidate bricks
+    diff 474,972 px (12.88%), bias ratio 0.035
+    MEASURED: the widest fill in range is 272 m out on bearing 6.7 deg --
+      cross-section 97.50 m, depth p50 0.761 m / max 0.769 m, surface 83.03 m
+      over an 82.26 m floor.
+
+    HOW CLOSE THIS IS TO THEIR FRAME. Position exact. Altitude: they reported
+    "~112 m"; 21.5 m above a 90.4 m surface lands the camera at 111.9 m, so
+    their figure reads as an ABSOLUTE altitude and is reproduced to 0.1 m.
+    YAW IS NOT RECOVERABLE from their report and is the one thing not matched;
+    6.7 deg was chosen to aim at the widest fill within 1.2 km.
+
+--- owner-valley-yaw258                SAME COLUMN, SECOND BEARING
+    identical column, altitude and pitch; shutter yaw -102.0 (= 258)
+    ribbons DRAINED: 52 reaches, 993 quads, 1 below one pixel
+    implicit disc rebuilt: 0 candidate bricks
+    diff 119,797 px (3.25%), bias ratio 0.006
+    One yaw guess is a guess; two bracket it.
+
+    NOTE, AND IT IS THE ONE LIMITATION ON BOTH OWNER FRAMES: tile (-11,-6) is
+    the COASTAL tile, where river water is painted over the seafloor and the
+    lateral fill amplifies it from 27,623 to 1,195,259 cells (section 5 of the
+    measurement doc). That artifact is NOT in these two frames: there is no
+    ground below 0 m within 2 km of this column, and a line-of-sight march from
+    camera z 111.9 m finds no visible sea cell on any bearing tested out to
+    6 km -- the terrain occludes it. The nearest sea is 2,775 m away.
+
+--- valley-width                       THE WIDTH SHOT (inland tile)
+    column (-160079.1, -75599.1) m, tile (-11,-5)
+    ground top z 223.1 m, camera z 373.1 m (= 150 m above the surface)
+    shutter pitch -30.0, yaw 110.0          clearance 6,479 m
+    ribbons DRAINED: 120 reaches, 2070 quads, 0 below one pixel
+    implicit disc rebuilt: 0 candidate bricks
+    diff 29,750 px (0.81%), bias ratio 0.010
+    MEASURED: cross-section 116.25 m at azimuth 110 deg; depth p50 0.722 m /
+      max 0.733 m; surface 223.83 m over a 223.10 m floor. Tile (-11,-5) has
+      no ground below sea level anywhere, so no seafloor artifact is possible.
+
+--- width-86m                          THE DOC'S HEADLINE WIDTH, SHOOTABLE
+    column (-162959.1, -84239.1) m, tile (-11,-6)
+    ground top z 147.9 m, camera z 297.9 m (= 150 m above the surface)
+    shutter pitch -30.0, yaw 140.0          clearance 6,001 m
+    ribbons DRAINED: 35 reaches, 606 quads, 0 below one pixel
+    implicit disc rebuilt: 0 candidate bricks
+    diff 74,021 px (2.01%), bias ratio 0.004
+    MEASURED: cross-section 86.25 m at azimuth 140 deg -- the same number the
+      measurement doc quotes for its Site A -- depth p50 0.526 m / max 0.592 m,
+      surface 148.48 m over a 147.91 m floor. On the coastal tile, but at a
+      148 m water surface with no sea cell in line of sight on any of 36
+      bearings from this camera height.
+
+--- ladder-10m / -200m / -1km / -5km   ALTITUDE IS THE ONLY VARIABLE
+    column (-161999.1, -75983.4) m, tile (-11,-5), clearance 7,009 m
+    ground top z 249.7 m; camera z 259.7 / 449.7 / 1,249.7 / 5,249.7 m
+    shutter pitch -20.0, yaw -20.0 (= 340) at all four rungs
+    MEASURED at the column: cross-section 58.12 m at azimuth 70 deg; depth
+      p50 0.332 m / max 0.477 m; surface 250.12 m over a 249.70 m floor.
+
+      rung    ribbons DRAINED            implicit disc      diff (bias ratio)
+      10 m    110 reach / 1790 quad / 0  DRAINED, 16,328 candidates,
+                                         4,082 meshed       166,167 px 4.51% (0.019)
+      200 m   110 reach / 1790 quad / 0  0 candidates        18,632 px 0.51% (0.004)
+      1 km    110 reach / 1790 quad / 0  0 candidates        23,837 px 0.65% (0.000)
+      5 km    110 reach / 1790 quad / 8  0 candidates           841 px 0.02% (0.001)
+
+    THE 10 m RUNG IS THE ONLY PARTIAL CONTROL IN THE SET. At 10 m the camera
+    sits 9.6 m above the water, i.e. INSIDE the implicit disc, and there is no
+    terrain-identical switch that removes baked river water from that disc --
+    `-VoxelRiverRibbons=0` removes only the far field. Its 4.51% diff therefore
+    UNDER-states the water in frame. Every other pose is above the disc and its
+    control is complete.
+
+    THE 5 km RUNG QUANTIFIES ITS OWN LIMIT: 841 changed pixels, 0.023% of the
+    frame, and NOTHING at all above threshold 64 -- while the same 110 reaches
+    are built, 8 of them now below one pixel wide. This is the documented
+    sub-pixel regime, measured. `-VoxelRiverRibbonMinPx` stays 0.
+
+--- dry-altitude                       THE DISC-IN-THE-SKY REGRESSION CHECK
+    column (-160679.1, -61799.1) m, tile (-11,-5)
+    ground top z 1,014.9 m, camera z 2,014.9 m (= 1000 m above the surface)
+    shutter pitch -60.0, yaw 45.0           clearance 7,079 m
+    ribbons DRAINED: 19 reaches, 940 quads, 7 below one pixel
+    implicit disc rebuilt: 0 candidate bricks
+    diff 103,007 px (2.79%), bias ratio 0.007
+    MEASURED: nearest wet cell 2,700 m, measured ACROSS tile boundaries.
+
+
+================================================================================
+2. THE DISC IN THE SKY, MEASURED RATHER THAN LOOKED AT
+================================================================================
+
+The PR #222 failure put a disc of water about 527 m in the air, following the
+camera, because the near-field half was amplifying the PROCEDURAL world while
+the screen showed the BAKED one. The frame is the weak way to check that. The
+strong way is the disc's own brick count, which is a direct measurement of the
+quantity that bug moved:
+
+    pose            camera z     implicit disc rebuild
+    valley-width       373.1 m   0 candidate brick(s)
+    ladder-200m        449.7 m   0 candidate brick(s)
+    ladder-1km       1,249.7 m   0 candidate brick(s)
+    dry-altitude     2,014.9 m   0 candidate brick(s)
+    ladder-5km       5,249.7 m   0 candidate brick(s)
+
+Zero at every altitude, across three different columns and a 4.9 km spread of
+height. No water surface exists anywhere within +-25.6 m horizontally and
++-12.8 m vertically of any of those cameras.
+
+AND THE ZEROS ARE NOT VACUOUS, which is the part that makes them worth
+anything. The same mechanism at the 10 m rung reports 16,328 candidate bricks
+and 4,082 meshed. So the disc is live, it does produce geometry when water is
+near the camera, and it produces none at altitude. A frame with no water
+anywhere would be consistent with the subsystem silently never running; these
+numbers are not.
+
+
+================================================================================
+3. THE ONE SITE THAT WAS ASKED FOR AND NOT SHOT
+================================================================================
+
+The lateral-fill measurement site -- tile (-12,-5), row 850, col 2627, the
+86.25 m cross-section -- WAS NOT PHOTOGRAPHED, deliberately.
+
+Its world position is (-179393.44, -75205.31) m. Tile (-12,-5) spans
+y [-76800, -61440], so the site sits 1,594.7 m from that tile's y-minimum edge,
+and the tile beyond it, (-12,-6), IS NOT BAKED. Clearance is therefore 1,594.7 m
+against a 4,500 m rule -- 2,905 m short. That is the condition that produced
+2,898 gate leaks and one discarded capture last time.
+
+The reading was verified rather than assumed, because the failure mode here is
+an axis convention. `BakeGeometry.padded_origin_cells` has row tracking tile_y
+and column tracking tile_x, both INCREASING, so interior row 0 is the tile's
+MINIMUM y. Reading row 850 from the other end would put the site 13.8 km from
+the edge instead of 1.6 km. The convention was confirmed by reproducing the
+document's own published numbers from these coordinates:
+
+    ground 348.0437 m (doc 348.044), water 349.1055 m (doc 349.105)
+
+Both possible conventions put the site within 1,594.7 m of an unbaked edge
+(the other end is 1,594.7 m from tile (-12,-4), also unbaked), so the site is
+unshootable either way and the conclusion does not depend on the convention.
+
+WHAT WAS SHOT INSTEAD. `width-86m` -- a different reach of the same bake whose
+cross-section measures the SAME 86.25 m, at 6,001 m of clearance. The headline
+number is reproduced at a legal pose rather than approximated at an illegal one.
+
+
+================================================================================
+4. TWO THINGS THAT ARE WRONG WITH THIS SET, STATED PLAINLY
+================================================================================
+
+(a) NO POSE IN THIS TILE SET CAN BE GENUINELY FREE OF RIVER. The driest column
+    that also clears 4.5 km is 3,401 m from the nearest water, and the ribbon
+    actor's scan radius is 4,000 m. So `dry-altitude` has 19 reaches in frame
+    and could not have had zero. For the disc-in-the-sky question this is
+    harmless -- arguably better, per section 2 -- but "over dry ground" here
+    means "over ground with no water within 2.7 km", not "no river in frame".
+
+(b) I FIRST MEASURED THAT DRYNESS WRONG, and it is worth recording because the
+    error was invisible. The first search ran the distance transform PER TILE
+    and reported 4,684 m for a column that sits 359 m from its own tile edge
+    with a wet neighbour tile just past it; the true cross-tile answer is
+    2,700 m. Every interesting column in a four-tile set is near a boundary, so
+    this was the normal case, not a corner case. It was caught only because the
+    ribbon actor built 19 reaches at a pose whose stated nearest water was
+    beyond its 4,000 m scan radius -- two instruments disagreeing. The probe's
+    `dry` subcommand now mosaics all baked tiles before transforming.
+
+
+================================================================================
+5. REPRODUCING
+================================================================================
+
+    tools\river-bv13-capture-set.ps1 -SettleSec 300
+    tools\river-bv13-capture-set.ps1 -WhatIfPoses          # plan only
+    python terrain-service\tools\river_capture_probe.py verify
+    python terrain-service\tools\river_capture_probe.py section -160874.5 -85643.1
+
+The capture script refuses to start against a project with no built module, and
+refuses to start at all while another editor is alive.

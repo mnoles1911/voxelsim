@@ -1,0 +1,14 @@
+﻿resolution        : 2560 x 1440  (3,686,400 px)
+changed pixels    : 103,007  (2.7942% at threshold 8/255)
+mean |delta|      : 1.270   max 156
+background        : signed mean +0.0070, |mean| 0.9905, bias ratio 0.007  (3,583,393 px)
+
+threshold ladder  -- a real feature contracts, a global shift does not:
+     thr   changed px   %frame  bbox (x0..x1, y0..y1)         bbox %
+       8      103,007   2.7942  0..2559, 0..1439              100.0%
+      16       14,399   0.3906  0..2559, 0..1439              100.0%
+      32        3,338   0.0905  61..2559, 0..1439              97.6%
+      64        1,931   0.0524  287..2559, 0..1028             63.4%
+      96          942   0.0256  297..1712, 292..366             2.9%
+     128           30   0.0008  723..737, 329..339              0.0%
+wrote             : D:\vox-rivercap\docs\captures\river-bv13\dry-altitude-diff.png
