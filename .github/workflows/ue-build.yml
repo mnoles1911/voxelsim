@@ -1,0 +1,179 @@
+# Compile the Unreal module.
+#
+# ---------------------------------------------------------------------------
+# READ THIS FIRST: THIS WORKFLOW DOES NOT RUN ON GITHUB-HOSTED RUNNERS, AND
+# CANNOT BE MADE TO. It is gated OFF until someone points it at a machine that
+# has Unreal Engine on it. Everything below is measured, not assumed.
+# ---------------------------------------------------------------------------
+#
+# WHY THERE IS NO HOSTED-RUNNER OPTION
+#
+#   * The engine this project builds against, D:\UE_5.8, is 30.0 GB across
+#     251,158 files (measured 2026-08-04). A standard GitHub-hosted runner --
+#     ubuntu-latest or windows-latest, public or private repo -- has 14 GB of
+#     SSD. The engine does not fit, before counting the checkout, the
+#     toolchain, or ~2 GB of build intermediates.
+#   * It cannot be installed per-job either. It is an Epic Games Launcher
+#     Installed Build (Engine/Build/InstalledBuild.txt is present); acquiring
+#     it needs an authenticated Epic account and EULA acceptance, and building
+#     the engine from the EpicGames/UnrealEngine source repo is hours per job.
+#   * The trimmed-engine trick does not apply. MinimalUE, the tool behind the
+#     "compile UE on hosted runners" posts, is documented as code-PLUGINS
+#     only, tops out at UE 5.1, and its own README says the trimmed engine
+#     cannot be redistributed under the EULA. This repo needs a full Editor
+#     target for 5.8 with Engine, RenderCore, RHI, a custom
+#     FPrimitiveSceneProxy and a custom vertex factory.
+#   * DO NOT be fooled by `Component.Unreal` in the windows-latest software
+#     manifest. Those four entries (Component.Unreal, .Android, .Debugger,
+#     .Ide) are Visual Studio's Unreal INTEGRATION components -- debug
+#     visualizers and project templates. They contain no engine.
+#
+# WHAT A RUNNER NEEDS TO TURN THIS ON
+#
+#   1. Windows, with UE 5.8 installed, and MSVC + the Windows 10/11 SDK. The
+#      reference box builds with VS 14.51.36247 and Windows SDK 10.0.26100.
+#   2. A repo variable UE_BUILD_RUNNER holding that runner's labels as a JSON
+#      array, e.g. ["self-hosted","windows","unreal"]. Until it is set, the
+#      job below is SKIPPED.
+#   3. Optionally a repo variable UE_ROOT if the engine is not at D:\UE_5.8.
+#
+#   CAUTION: a skipped job reports as a PASS to branch protection. Do not mark
+#   this check "required" until UE_BUILD_RUNNER is actually set, or it will
+#   wave everything through while compiling nothing -- the precise failure
+#   this workflow exists to prevent.
+#
+# COST, MEASURED ON THE REFERENCE BOX (Ryzen 5 5600X, 6C/12T, 64 GB)
+#
+#     cmake configure                                   3.9 s
+#     voxel-core, MSVC Release, from scratch           112.4 s
+#     VoxelEarthEditor, cold (no Intermediate/,         89.0 s   24 actions
+#       no Binaries/), unity, Result: Succeeded
+#     ---------------------------------------------------------
+#     total, fresh checkout to linked editor DLL     ~ 3 min 25 s
+#
+#   One caveat, stated rather than smoothed over: rebuilding a SINGLE touched
+#   unity blob measured 236.3 s and 236.0 s on two separate runs -- slower
+#   than the entire 24-action cold build above, which is anomalous and was
+#   not explained. Whatever the cause, both figures are minutes, so plan on
+#   under ~6 minutes for this job and it is affordable per-PR either way.
+#
+#   The trigger is paths-filtered: the module only breaks when
+#   ue-project/ or voxel-core/ changes (the module links voxelcore.lib and
+#   includes its headers, so a voxel-core header edit can break the UE side
+#   with nothing under ue-project/ touched at all).
+#
+# WHAT THIS CATCHES THAT NOTHING ELSE DOES
+#
+#   A compile would have caught both of the game-side breakages this repo has
+#   eaten: the unity FRunRef collision (PR #210) and the integration branch
+#   that did not build the editor at all. It does NOT catch a runtime
+#   regression -- per-block streamer residency (PR #218) needs a smoke RUN,
+#   which is a separate and much more expensive job than this one.
+
+name: UE module build
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Delete Intermediate/ and Binaries/ before building"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "ue-project/**"
+      - "voxel-core/**"
+      - ".github/workflows/ue-build.yml"
+  pull_request:
+    paths:
+      - "ue-project/**"
+      - "voxel-core/**"
+      - ".github/workflows/ue-build.yml"
+
+jobs:
+  voxel-earth-editor:
+    name: VoxelEarthEditor Win64 Development
+    # Skipped -- not failed, and not silently passed by a fake step -- until a
+    # runner with the engine exists. See the header.
+    if: ${{ vars.UE_BUILD_RUNNER != '' }}
+    # The fallback label is never used: the `if` above skips the job whenever
+    # the variable is unset. It is here so the expression stays valid rather
+    # than resolving to fromJSON('') on every unconfigured repo.
+    runs-on: ${{ vars.UE_BUILD_RUNNER != '' && fromJSON(vars.UE_BUILD_RUNNER) || 'ubuntu-24.04' }}
+    env:
+      UE_ROOT: ${{ vars.UE_ROOT || 'D:\UE_5.8' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Optional full rebuild
+        if: ${{ inputs.full_rebuild }}
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force ue-project/Intermediate -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force ue-project/Binaries     -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force build/voxel-core-msvc   -ErrorAction SilentlyContinue
+
+      # VoxelEarth.Build.cs links a PREBUILT voxelcore.lib and throws a
+      # BuildException if it cannot find one, so this is not optional and the
+      # order is not negotiable. The path and the Release config are what
+      # Build.cs searches for; `-B build` (as the voxel-core-msvc CI job uses)
+      # is a DIFFERENT directory and will not be found.
+      - name: Build voxel-core (MSVC, Release)
+        shell: pwsh
+        run: |
+          cmake -S voxel-core -B build/voxel-core-msvc
+          cmake --build build/voxel-core-msvc --config Release
+
+      # THE FLAGS, AND WHY EACH ONE IS THERE.
+      #
+      #   no -DisableUnity        Unity is the default and unity is where
+      #                           internal-linkage collisions surface. A job
+      #                           passing -DisableUnity would have gone green
+      #                           on the PR #210 defect. Never add it here.
+      #   -DisableAdaptiveUnity   UBT reads `git status` and pulls locally
+      #                           MODIFIED files OUT of their unity blob. That
+      #                           is why the author of the colliding fixture
+      #                           never saw it: the file they were editing was
+      #                           compiled standalone. A CI checkout is clean
+      #                           so this is usually a no-op, but "usually" is
+      #                           not a property worth relying on.
+      #   -WaitMutex              a self-hosted box may have an editor or
+      #                           another build holding the UBT mutex.
+      #   -NoHotReloadFromIDE     never produce a hot-reload DLL from CI.
+      - name: Build VoxelEarthEditor (unity)
+        shell: pwsh
+        run: |
+          & "$env:UE_ROOT\Engine\Build\BatchFiles\Build.bat" `
+              VoxelEarthEditor Win64 Development `
+              -project="${{ github.workspace }}\ue-project\VoxelEarth.uproject" `
+              -WaitMutex -NoHotReloadFromIDE -DisableAdaptiveUnity `
+              2>&1 | Tee-Object -FilePath build-ue.log
+          exit 0
+
+      # Build.bat's EXIT CODE LIES. A fresh worktree with no voxelcore.lib
+      # fails with `RulesError: could not find voxelcore.lib` and the shell
+      # pipeline still exits 0 -- documented in docs/status.md, where it cost
+      # a session an editor that died with "The game module 'VoxelEarth' could
+      # not be found". The build is green if and only if UBT printed
+      # `Result: Succeeded`. This step, not the one above, is the gate.
+      - name: Verify the build actually succeeded
+        shell: pwsh
+        run: |
+          $log = Get-Content build-ue.log -Raw
+          if ($log -notmatch 'Result:\s*Succeeded') {
+            Write-Host "::error::UBT did not report 'Result: Succeeded'."
+            $log -split "`n" |
+              Select-String -Pattern 'error|ERROR|RulesError|Result:' |
+              Select-Object -First 40 |
+              ForEach-Object { Write-Host $_.Line.Trim() }
+            exit 1
+          }
+          Write-Host "Result: Succeeded"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ue-build-log
+          path: build-ue.log
