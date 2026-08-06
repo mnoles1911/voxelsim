@@ -411,6 +411,108 @@ int main(int argc, char** argv) {
                 "writes basins DRY so these should be rare)\n",
                 thin.wideRuns, kRiverRunScanCap, double(kRiverRunScanCap * pixelMm) / 1000.0);
 
+    // =======================================================================
+    // THE WATER-SURFACE GRADIENT, and whether it can carry a flow DIRECTION.
+    // =======================================================================
+    //
+    // WHY THIS EXISTS. docs/water-flow-effects-plan-2026-08-06.md ranks the ways
+    // to make a river look like it is flowing, and the whole ranking turns on one
+    // unmeasured number. Option A -- derive a direction from the gradient of the
+    // water surface, the way Minecraft's FlowingFluid::getFlow derives one from
+    // neighbouring fluid levels -- is FREE: the near-field mesher already
+    // computes that gradient for its normal, and ChunkParams.w is a documented
+    // free per-brick float. Option B ships the bake's own D8 receiver, which is
+    // correct everywhere but costs a BAKE_VERSION roll and, until per-section
+    // content addressing lands, ~13 GB of re-download.
+    //
+    // The risk that decides between them: the depth plane is int16 at a 10 mm
+    // LSB, and a large share of a river's apparent "gradient" is the
+    // epsilon-fill floor rather than terrain. Where the drop across the stencil
+    // quantises to zero the direction is undefined -- and flat reaches are
+    // exactly where a real river's motion reads most strongly.
+    //
+    // THE STENCIL IS +/-1 FINE PIXEL, NOT +/-1 BRICK, and that is a correction to
+    // the plan. A brick is 8 voxels = 0.8 m, so a +/-1-brick stencil spans 1.6 m
+    // -- SUB-PIXEL against an 1875 mm water plane. It would sample the same
+    // stored control point on both sides and read exactly zero almost
+    // everywhere, which would have looked like a devastating result and been an
+    // artefact of the measurement. +/-1 pixel spans 3.75 m.
+    //
+    // WHAT THIS DOES NOT MEASURE: angular agreement against the bake's D8
+    // receiver. That needs `rec_w` dumped from a diagnostic bake (pipeline.py
+    // computes it at :4729 and deletes it at :4784) and is not available to a
+    // tile-reading probe. So this answers "is a direction DEFINED here", not "is
+    // it the RIGHT direction". A pass here is necessary, not sufficient.
+    {
+        const double spanMm = 2.0 * double(pixelMm); // centred difference, +/-1 px
+        int64_t centredOk = 0;    // all four neighbours wet -> a centred difference exists
+        int64_t resolved = 0;     // ...and the drop clears the 10 mm quantisation
+        int64_t flatQuantised = 0;// ...and it does not
+        int64_t centreCells = 0, centreResolved = 0;
+        std::vector<double> slopes; // m/km, for percentiles
+        slopes.reserve(1 << 16);
+
+        for (int32_t y = 1; y + 1 < win.h; ++y) {
+            for (int32_t x = 1; x + 1 < win.w; ++x) {
+                const size_t si = win.at(x, y);
+                if (!win.wet[si]) continue;
+                const int32_t sxp = rivers.surfaceAtPixel(win.x0 + x + 1, win.y0 + y);
+                const int32_t sxm = rivers.surfaceAtPixel(win.x0 + x - 1, win.y0 + y);
+                const int32_t syp = rivers.surfaceAtPixel(win.x0 + x, win.y0 + y + 1);
+                const int32_t sym = rivers.surfaceAtPixel(win.x0 + x, win.y0 + y - 1);
+                const bool isCentre = !thin.centre.empty() && thin.centre[si] != 0;
+                if (isCentre) ++centreCells;
+                if (sxp == kNoWaterMm || sxm == kNoWaterMm || syp == kNoWaterMm ||
+                    sym == kNoWaterMm)
+                    continue; // no centred difference: this is a bank cell
+                ++centredOk;
+                const double gx = double(sxp - sxm) / spanMm;
+                const double gy = double(syp - sym) / spanMm;
+                const double mag = std::sqrt(gx * gx + gy * gy);
+                // The smallest drop the wire can express across this stencil.
+                // Below it the direction is not weakly determined, it is absent.
+                const double lsbSlope = 10.0 / spanMm;
+                if (mag >= lsbSlope) {
+                    ++resolved;
+                    if (isCentre) ++centreResolved;
+                    if (slopes.size() < slopes.capacity()) slopes.push_back(mag * 1000.0);
+                } else {
+                    ++flatQuantised;
+                }
+            }
+        }
+
+        std::printf("\n=== WATER-SURFACE GRADIENT: can it carry a flow direction? ===\n");
+        std::printf("  stencil           : +/-1 fine pixel = %.2f m span (NOT +/-1 brick, which is "
+                    "sub-pixel here and would read zero)\n", spanMm / 1000.0);
+        std::printf("  wet cells with a centred difference : %" PRId64 " (%.1f%% of wet; the rest "
+                    "are bank cells with a dry neighbour)\n",
+                    centredOk, wet ? 100.0 * double(centredOk) / double(wet) : 0.0);
+        std::printf("  ...of those, DIRECTION RESOLVES     : %" PRId64 " (%.2f%%)\n", resolved,
+                    centredOk ? 100.0 * double(resolved) / double(centredOk) : 0.0);
+        std::printf("  ...quantised to zero (no direction) : %" PRId64 " (%.2f%%)\n", flatQuantised,
+                    centredOk ? 100.0 * double(flatQuantised) / double(centredOk) : 0.0);
+        std::printf("  centreline cells                    : %" PRId64 ", resolving %" PRId64
+                    " (%.2f%%)\n",
+                    centreCells, centreResolved,
+                    centreCells ? 100.0 * double(centreResolved) / double(centreCells) : 0.0);
+        if (!slopes.empty()) {
+            std::sort(slopes.begin(), slopes.end());
+            auto pct = [&](double p) {
+                size_t i = size_t(p * double(slopes.size() - 1));
+                return slopes[i];
+            };
+            std::printf("  |grad| where it resolves, m/km      : p10 %.1f  p50 %.1f  p90 %.1f  "
+                        "max %.1f\n",
+                        pct(0.10), pct(0.50), pct(0.90), slopes.back());
+        }
+        std::printf("  READ THIS AS: the percentage on the 'DIRECTION RESOLVES' line is the share "
+                    "of interior wet cells\n"
+                    "  where a gradient-derived flow direction exists at all. Option A in the flow "
+                    "plan is viable only\n"
+                    "  if it is high; the magnitude is a usable SPEED proxy either way.\n");
+    }
+
     std::vector<RiverRibbonPath> paths;
     RiverTraceParams tp;
     riverRibbonTrace(win, thin, pixelMm, tp, paths);

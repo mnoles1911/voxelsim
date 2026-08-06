@@ -442,3 +442,61 @@ VXC_TEST(ribbon_carries_the_reconstructed_datum_unchanged) {
         CHECK_EQ(p.surfaceMm, 250000 - int32_t(p.px) * 37);
     }
 }
+
+// ORIENTATION. A ribbon used to be symmetric and its point order meaningless.
+// It is not any more: anything that shows the water MOVING needs a sign, and
+// riverRibbonOrient supplies it by reading `graded_water_surface`'s invariant
+// directly -- the water surface never rises going downstream -- rather than by
+// estimating a gradient.
+//
+// This matters because the obvious alternative was MEASURED AND FAILED. Across
+// a +/-1-pixel stencil the water-surface gradient resolves above the depth
+// plane's 10 mm LSB on only 37.9% of centreline cells on the wet alpine block
+// (vxc_riverribbonprobe), against a pre-registered bar of 90%. The endpoint
+// comparison has no such failure mode: it is two integers.
+VXC_TEST(ribbon_orients_downstream_whichever_way_it_was_traced) {
+    // A reach descending in +x. Whichever end the tracer started from, the
+    // oriented path must run from the HIGHER surface to the LOWER one.
+    RiverWetWindow win = makeWindow(80, 11);
+    for (int32_t x = 2; x < 78; ++x) setWet(win, x, 5, 250000 - x * 37);
+
+    RiverThinField thin;
+    riverRibbonThin(win, kPx, thin);
+    std::vector<RiverRibbonPath> paths;
+    riverRibbonTrace(win, thin, kPx, RiverTraceParams{}, paths);
+    CHECK_EQ(paths.size(), size_t(1));
+
+    riverRibbonOrient(paths);
+    CHECK(paths[0].pts.front().surfaceMm > paths[0].pts.back().surfaceMm);
+
+    // Reverse it by hand and orient again: the result must be identical, which
+    // is what makes this independent of the tracer's walk direction.
+    const int64_t headPx = paths[0].pts.front().px;
+    std::reverse(paths[0].pts.begin(), paths[0].pts.end());
+    const size_t flipped = riverRibbonOrient(paths);
+    CHECK_EQ(flipped, size_t(1));
+    CHECK_EQ(paths[0].pts.front().px, headPx);
+    CHECK(paths[0].pts.front().surfaceMm > paths[0].pts.back().surfaceMm);
+}
+
+// STANDING WATER HAS NO FLOW DIRECTION, and the orienter must say so rather
+// than invent one. A reach whose ends sit at the same surface height is a pool
+// or a lake sheet the tracer picked up; suppressing motion there is correct,
+// and it is the same reason the probe reports lake cells separately.
+VXC_TEST(ribbon_orient_reports_flat_reaches_instead_of_guessing) {
+    RiverWetWindow win = makeWindow(80, 11);
+    for (int32_t x = 2; x < 78; ++x) setWet(win, x, 5, 250000); // dead level
+
+    RiverThinField thin;
+    riverRibbonThin(win, kPx, thin);
+    std::vector<RiverRibbonPath> paths;
+    riverRibbonTrace(win, thin, kPx, RiverTraceParams{}, paths);
+    CHECK_EQ(paths.size(), size_t(1));
+
+    const int64_t headPx = paths[0].pts.front().px;
+    size_t flat = 0;
+    const size_t flipped = riverRibbonOrient(paths, &flat);
+    CHECK_EQ(flipped, size_t(0));
+    CHECK_EQ(flat, size_t(1));
+    CHECK_EQ(paths[0].pts.front().px, headPx); // left exactly as traced
+}

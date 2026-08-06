@@ -12,6 +12,16 @@
 | Uphill or downhill for us? | **Downhill. Do not change it.** Uphill is a connectivity device for a system with no global solve. We have a global solve, and uphill cannot produce discharge, which every consumer we have reads. |
 | How do we get a flowing effect? | Ship the flow direction the bake already computes and throws away, and drive the water material's *existing* panning ripple and vertex-offset terms with it. The first move is a probe run, not a bake. |
 
+> **STEP 1 HAS BEEN RUN, AND OPTION A FAILED. Updated 2026-08-06, same day.**
+>
+> The pre-registered bar was a gradient-derived direction on **≥ 90%** of centreline cells. Measured on the wet alpine block: **37.94%** (154,419 of 407,042). It fails *worse* on the centreline (37.9%) than on interior wet cells generally (75.7%) — and the centreline is the one place flow direction matters. Full record: `docs/measurements/water-surface-gradient-2026-08-06.txt`.
+>
+> **What replaced it, and it is better than the thing that failed:** `riverRibbonOrient` in `voxel-core/include/voxelcore/riverribbon.h`. A reach is an *ordered polyline*, so its tangent is already a direction; the only missing piece was its sign, and that comes from comparing the surface height at the two **ends** of the reach. That reads `graded_water_surface`'s invariant directly instead of estimating a derivative from it — two integers, no quantisation failure mode, exact rather than heuristic, and reaches that are level are reported as flat rather than assigned a direction they do not have.
+>
+> **The gradient's MAGNITUDE survives** as a free speed proxy (p50 9.4 m/km where it resolves). It is only the *direction* that is dead.
+>
+> One method correction, made before measuring: the plan below specifies a ±1-**brick** stencil (1.6 m), which is **sub-pixel** against an 1875 mm water plane — both taps land on the same stored control point and read exactly zero. That would have looked catastrophic and been an artefact. The measurement used ±1 **fine pixel** (3.75 m).
+
 ---
 
 ## 1. What Dynamic Waters actually does

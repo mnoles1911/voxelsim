@@ -123,12 +123,67 @@ struct RiverRibbonPoint {
     int32_t halfWidthMm = 0;
 };
 
-// One reach, ordered head to foot along the channel (or foot to head -- the
-// direction is not meaningful here and nothing downstream depends on it; a
-// ribbon is symmetric).
+// One reach, ordered along the channel.
+//
+// IT USED TO BE UNORIENTED, and the comment here said so: "head to foot along
+// the channel (or foot to head -- the direction is not meaningful here and
+// nothing downstream depends on it; a ribbon is symmetric)." That was true
+// while a ribbon was only a shape. It stopped being true the moment anything
+// wanted to show the water MOVING, because motion has a sign.
+//
+// `riverRibbonOrient` now guarantees pts[0] is UPSTREAM of pts.back(), so the
+// polyline runs downstream and its tangent is the flow direction.
 struct RiverRibbonPath {
     std::vector<RiverRibbonPoint> pts;
 };
+
+// Order a reach downstream: pts[0] upstream, pts.back() at the mouth.
+//
+// WHY THIS IS EXACT AND NOT A HEURISTIC. `graded_water_surface` enforces that
+// the water surface NEVER RISES GOING DOWNSTREAM (water-system-architecture
+// §5) -- the whole extent stage rests on it, because without it water flows
+// uphill somewhere and the fill rules chase it. So comparing the surface
+// height at the two ends of a reach reads that invariant directly. There is no
+// gradient estimate, no threshold, and nothing to tune.
+//
+// AND IT IS THE DIRECTION SOURCE THAT SURVIVED MEASUREMENT. The obvious
+// alternative was to derive flow from the gradient of the water surface, the
+// way Minecraft's FlowingFluid::getFlow derives one from neighbouring fluid
+// levels -- free, since the near-field mesher already computes that gradient
+// for its normal. Measured on the wet alpine block with vxc_riverribbonprobe:
+// across a +/-1-pixel (3.75 m) stencil the direction resolves above the depth
+// plane's 10 mm LSB on only **37.9% of centreline cells** (154,419 of 407,042).
+// The pre-registered bar was 90%. The centreline is exactly where flow matters,
+// so gradient-as-direction is dead there; its MAGNITUDE is still a usable free
+// speed proxy (p50 9.4 m/km where it resolves).
+//
+// A reach whose ends are equal is left as it is and reported: that is standing
+// water -- a lake sheet caught by the tracer, or a pool -- and it has no flow
+// direction because it has no flow. Suppressing motion there is correct.
+//
+// Returns the number of reaches that were REVERSED, which is only interesting
+// as a sanity figure: over many reaches it should sit near half, because the
+// tracer's walk direction has nothing to do with which way the water goes.
+inline size_t riverRibbonOrient(std::vector<RiverRibbonPath>& paths,
+                                size_t* flatOut = nullptr) {
+    size_t reversed = 0, flat = 0;
+    for (RiverRibbonPath& p : paths) {
+        if (p.pts.size() < 2) continue;
+        const int32_t a = p.pts.front().surfaceMm;
+        const int32_t b = p.pts.back().surfaceMm;
+        if (a == kNoWaterMm || b == kNoWaterMm) continue; // datum not resolved; leave alone
+        if (a == b) {
+            ++flat;
+            continue;
+        }
+        if (a < b) { // front is LOWER, so the reach currently runs upstream
+            std::reverse(p.pts.begin(), p.pts.end());
+            ++reversed;
+        }
+    }
+    if (flatOut) *flatOut = flat;
+    return reversed;
+}
 
 // The wet mask over a rectangular window of fine pixels, with the datum
 // already resolved for every wet cell.
@@ -806,6 +861,10 @@ inline size_t buildRiverRibbons(FineTileSampler& tiles, RiverSampler& rivers, Ri
     riverRibbonResolveDatum(rivers, win, thin);
     const size_t n = riverRibbonTrace(win, thin, pixelMm, trace, out);
     for (size_t i = out.size() - n; i < out.size(); ++i) riverRibbonSimplify(out[i], simplify);
+    // Orient AFTER simplification: Douglas-Peucker keeps the endpoints, so the
+    // comparison reads the same two surface heights either way, and doing it
+    // once at the end covers every path the host produced.
+    riverRibbonOrient(out);
     return n;
 }
 

@@ -1,0 +1,108 @@
+WATER-SURFACE GRADIENT AS A FLOW-DIRECTION SOURCE -- MEASURED, AND IT FAILS
+2026-08-06, wet alpine block, bake_ver 14
+
+WHY THIS WAS RUN
+----------------
+docs/water-flow-effects-plan-2026-08-06.md ranks the ways to make a river look
+like it is flowing. The whole ranking turned on one unmeasured number, and the
+plan's own instruction was "do not write a material node until step 1 has a
+number".
+
+Option A was to derive a flow direction from the gradient of the water surface
+-- the trick vanilla Minecraft uses (FlowingFluid::getFlow derives a vector from
+neighbouring fluid levels rather than storing one), and the mechanism the
+Dynamic Waters mod is presumed to inherit. It is FREE for us: the near-field
+mesher already computes that gradient for its normal
+(VoxelWaterChunkComponent.cpp:184-191) and ChunkParams.w is a documented free
+per-brick float. No wire bytes, no BAKE_VERSION roll, no re-download.
+
+Option B is to ship the bake's own D8 receiver, which is correct everywhere but
+costs a BAKE_VERSION roll and ~13 GB of re-download until per-section content
+addressing lands.
+
+THE PRE-REGISTERED TEST, set before running
+-------------------------------------------
+  On wet cells that lie on a river centreline, a gradient-derived direction
+  must exist on >= 90% of cells.
+
+COMMAND
+-------
+  cd D:\voxelsim\build\voxel-core-msvc\bench\Release
+  .\vxc_riverribbonprobe.exe ^
+    "D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-b10cf6d2c/000000000135276f/s16" ^
+    --origin -40960 -40960 --region 16384
+
+  6 tiles loaded, 0 refused, 0 undecodable. 1,541,081 wet pixels.
+
+A CORRECTION TO THE PLAN'S METHOD, made before measuring
+--------------------------------------------------------
+The plan specified a +/-1-BRICK stencil (1.6 m). That is SUB-PIXEL against an
+1875 mm water plane: both taps land on the same stored control point and the
+gradient reads exactly zero almost everywhere. It would have produced a
+catastrophic-looking result that was an artefact of the measurement, not a fact
+about the data. The stencil used is +/-1 FINE PIXEL = 3.75 m span.
+
+RESULT
+------
+  wet cells with a centred difference   1,016,826   66.0% of wet
+      (the other 34% are bank cells with a dry neighbour -- no centred
+       difference exists there at all)
+
+  of those, DIRECTION RESOLVES            769,633   75.69%
+  quantised to zero (no direction)         247,193   24.31%
+
+  CENTRELINE CELLS                        407,042
+  centreline cells resolving              154,419   37.94%   <-- THE NUMBER
+
+  |grad| where it resolves, m/km
+      p10   3.7
+      p50   9.4
+      p90  61.4
+      max  54,865.9   (absurd -- 54 m per metre; a datum discontinuity,
+                       probably a river/lake boundary. NOT investigated.)
+
+VERDICT: FAIL, 37.94% against a bar of 90%
+------------------------------------------
+Option A is DEAD as a direction source. The failure is concentrated exactly
+where it hurts most: the centreline resolves WORSE (37.9%) than interior wet
+cells generally (75.7%), and the centreline is the one place a river's flow
+direction matters.
+
+The mechanism is the depth plane's 10 mm LSB against a graded surface that is
+deliberately flat along much of a reach. graded_water_surface enforces that the
+surface never RISES downstream; on a low-slope reach that means it does not
+change at all across 3.75 m, so the stored value is identical on both taps.
+
+WHAT SURVIVES
+-------------
+The MAGNITUDE is still a free and usable SPEED proxy where it resolves (p50
+9.4 m/km). Nothing here argues against using it for that.
+
+WHAT REPLACED IT, and why it is better than the thing that failed
+-----------------------------------------------------------------
+riverRibbonOrient (voxel-core/include/voxelcore/riverribbon.h). A reach is an
+ORDERED polyline, so its tangent is a direction; the only missing piece was its
+sign. That sign comes from comparing the surface height at the two ENDS of the
+reach, which reads graded_water_surface's invariant directly instead of
+estimating a derivative from it.
+
+  - It is two integers, not a finite difference, so it has no quantisation
+    failure mode. The endpoints of a 3 km reach differ by metres, not by
+    fractions of an LSB.
+  - It is exact rather than heuristic: the invariant it depends on is the one
+    the whole extent stage already rests on.
+  - Reaches whose ends are level are REPORTED as flat rather than assigned a
+    direction. That is standing water, and it has no flow direction because it
+    has no flow.
+  - Costs nothing: no new data, no bake change, no BAKE_VERSION roll.
+
+Pinned by ribbon_orients_downstream_whichever_way_it_was_traced and
+ribbon_orient_reports_flat_reaches_instead_of_guessing.
+
+WHAT THIS DOES NOT MEASURE
+--------------------------
+Angular agreement against the bake's own D8 receiver. That needs rec_w dumped
+from a diagnostic bake (pipeline.py computes it at :4729 and deletes it at
+:4784) and is not available to a tile-reading probe. So this answers "is a
+direction DEFINED here", not "is it the RIGHT direction". For Option A that
+distinction never mattered -- it failed the weaker test.
