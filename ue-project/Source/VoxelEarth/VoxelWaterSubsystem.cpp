@@ -1297,12 +1297,26 @@ void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		int32 OceanOn = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerOcean="), OceanOn);
 		Impl->MarkerWater = std::make_unique<vxc::LockedWaterSampler>(*Impl->Water);
-		Terrain->InstallWaterMarker(Impl->MarkerWater.get(), OceanOn != 0);
-		UE_LOG(LogVoxelWater, Warning,
-		       TEXT("VoxelWaterMarker: ON (ocean %s). Water is drawn as SOLID magenta MAT_WATERMARK voxels ")
-		       TEXT("through the TERRAIN path, so it is visible at full clipmap range rather than only inside ")
-		       TEXT("the +/-25.6 m near-field disc. This is a debug instrument."),
-		       OceanOn != 0 ? TEXT("INCLUDED") : TEXT("excluded"));
+		// ANNOUNCE ONLY WHAT ACTUALLY HAPPENED. InstallWaterMarker refuses when
+		// the GPU mesh fork is on, and this line used to print regardless -- so
+		// a refused run still said "water is drawn as SOLID magenta", which is
+		// the precise shape of misleading evidence the refusal exists to
+		// prevent. The terrain side has already logged the reason at Error.
+		if (Terrain->InstallWaterMarker(Impl->MarkerWater.get(), OceanOn != 0))
+		{
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("VoxelWaterMarker: ON (ocean %s). Water is drawn as SOLID magenta MAT_WATERMARK voxels ")
+			       TEXT("through the TERRAIN path, so it is visible at full clipmap range rather than only inside ")
+			       TEXT("the +/-25.6 m near-field disc. This is a debug instrument."),
+			       OceanOn != 0 ? TEXT("INCLUDED") : TEXT("excluded"));
+		}
+		else
+		{
+			// Drop the sampler we just built: nothing borrows it now, and
+			// leaving it live invites a later reader into thinking it is
+			// installed.
+			Impl->MarkerWater.reset();
+		}
 	}
 }
 

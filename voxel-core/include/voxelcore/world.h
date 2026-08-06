@@ -29,7 +29,9 @@ public:
     // Amplifier::setWaterMarker documents why; the practical reason here is
     // that a session-lifetime brick cache would otherwise serve pre-marker
     // bricks alongside marked ones.
-    void setWaterMarker(IWaterSampler* sampler) { amp_.setWaterMarker(sampler); }
+    void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) {
+        amp_.setWaterMarker(sampler, includeOcean);
+    }
     const GeneratedWorld<B>& generated() const { return gen_; }
     const EditLog& log() const { return log_; }
     const ChunkMap<B>& editedBricks() const { return overlay_; }

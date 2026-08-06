@@ -13701,24 +13701,63 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	                                   FineRingRadius);
 }
 
-void UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean)
+bool UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean)
 {
 	if (!Impl)
 	{
 		UE_LOG(LogVoxelEarth, Error,
 		       TEXT("InstallWaterMarker: no world impl -- the marker was requested before Initialize ran."));
-		return;
+		return false;
 	}
-	Impl->Voxels.setWaterMarker(Sampler, bIncludeOcean);
 	if (!Sampler)
 	{
+		Impl->Voxels.setWaterMarker(nullptr, bIncludeOcean);
 		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterMarker: uninstalled."));
-		return;
+		return true;
 	}
+
+	// REFUSING TO INSTALL beside the GPU mesh fork, because a HALF-marked frame
+	// is the one outcome worse than no frame.
+	//
+	// The marker is written by Amplifier::column, which is the CPU producer.
+	// worldgen.ush has no MAT_WATERMARK branch, so every chunk the fork takes
+	// comes back with the water simply absent -- and the fork takes levels 0..5
+	// of unedited chunks, which is most of a settled vista. The result is a
+	// picture in which some water is drawn and some is not, with nothing on
+	// screen to say which is which. That is indistinguishable from the bake
+	// having put water in the wrong place, which is the exact question this
+	// instrument exists to answer.
+	//
+	// Measured 2026-08-06: a marker capture taken with the fork on had 14,848 of
+	// 44,873 chunks produced GPU-side. It was re-shot rather than judged.
+	//
+	// AND THE SWITCH IS NOT WHAT EVERY DOC SAID IT WAS. `voxel.GPU` is not a
+	// cvar -- the tree only registers `voxel.GPU.*` children -- so the
+	// `-ExecCmds="voxel.GPU 0"` that the handoff and the old message here both
+	// called mandatory set nothing and reported nothing. The gate is
+	// -VoxelNoGpuMesh, on the command line, for the reason GpuMeshEnabled()
+	// gives: -ExecCmds lands after streaming has begun. This refusal exists
+	// because a gate spelled as a cvar that does not exist reads as deliberate
+	// care and fails without a word.
+	if (VoxelStreamAdmission::GpuMeshEnabled())
+	{
+		Impl->Voxels.setWaterMarker(nullptr, bIncludeOcean);
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("VoxelWaterMarker: REFUSED -- the GPU mesh fork is ON, and it produces chunks through ")
+		       TEXT("worldgen.ush, which has no MAT_WATERMARK branch. Marking only the CPU-produced chunks ")
+		       TEXT("would give a frame where some water is drawn and some is silently missing, which cannot ")
+		       TEXT("be told apart from the bake placing water wrongly. Re-run with -VoxelNoGpuMesh on the ")
+		       TEXT("COMMAND LINE. Note 'voxel.GPU 0' does NOT do this: no such cvar exists, and -ExecCmds ")
+		       TEXT("lands after streaming has begun anyway. The marker is NOT installed for this run."));
+		return false;
+	}
+
+	Impl->Voxels.setWaterMarker(Sampler, bIncludeOcean);
 	UE_LOG(LogVoxelEarth, Warning,
 	       TEXT("VoxelWaterMarker: INSTALLED. Water is drawn as SOLID MAT_WATERMARK voxels; this is a debug ")
-	       TEXT("instrument and the world is not shippable in this state. worldgen.ush has no MAT_WATERMARK ")
-	       TEXT("branch, so run with voxel.GPU 0 or the GPU path will disagree with the CPU path."));
+	       TEXT("instrument and the world is not shippable in this state. The GPU mesh fork is off for this ")
+	       TEXT("run (-VoxelNoGpuMesh), which is a precondition -- see the refusal above this line."));
+	return true;
 }
 
 void UVoxelWorldSubsystem::Deinitialize()

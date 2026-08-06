@@ -2263,8 +2263,15 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // DEBUG WATER MARKER. One query per column, only when installed. The
     // sampler composes river plane, lake table and sea datum itself, so there
     // is nothing to decide here.
-    if (waterMarker_ != nullptr)
-        col.waterSurfaceMm = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+    if (waterMarker_ != nullptr) {
+        const int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+        // implicitWaterDatumMm is lakes.h's own composition -- max(baked, sea)
+        // with the kNoWaterMm cases handled -- so the marker and the near-field
+        // sweep cannot disagree about where the sea is.
+        col.waterSurfaceMm = waterMarkerOcean_
+                                 ? implicitWaterDatumMm(baked, col.surfaceMm)
+                                 : baked;
+    }
 
     // Topsoil deepens with rainfall and thins with slope; +/-25% hash jitter
     // breaks up contour-following layer boundaries. See the constant block for

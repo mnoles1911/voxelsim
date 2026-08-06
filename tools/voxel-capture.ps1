@@ -250,7 +250,46 @@ if ($SpawnPitch -ne 0) {
 if ($SpawnYaw -ne 45) {
     $argList += "-VoxelSpawnYaw=$($SpawnYaw.ToString([cultureinfo]::InvariantCulture))"
 }
-if ($Cvars) { $argList += "-ExecCmds=`"$Cvars`"" }   # embed the quotes; see the leg script
+# EVERY `voxel.*` NAME IN -Cvars MUST BE A REGISTERED CVAR, checked against the
+# source rather than trusted.
+#
+# 2026-08-06: a capture ran with `-Cvars 'voxel.GPU 0'`, which the water-marker
+# handoff called mandatory. THERE IS NO CVAR NAMED voxel.GPU -- the tree only
+# registers voxel.GPU.* children -- so it set nothing, printed nothing, and the
+# run went ahead on exactly the path the switch existed to disable. A wrong cvar
+# NAME is worse than a wrong value: a value that is out of range gets clamped and
+# logged, while a name that does not exist is indistinguishable from success in
+# every artefact the run produces.
+#
+# Only `voxel.*` is checked. Engine names (r.*, t.*, sg.*) are registered inside
+# the engine, not in this tree, so demanding a match would reject valid ones.
+if ($Cvars) {
+    $names = [regex]::Matches($Cvars, '(?:^|\|)\s*([A-Za-z_][\w.]*)') |
+             ForEach-Object { $_.Groups[1].Value } |
+             Where-Object { $_ -like 'voxel.*' }
+    if ($names) {
+        $srcDirs = @((Join-Path $Root 'ue-project\Source'), (Join-Path $Root 'voxel-core')) |
+                   Where-Object { Test-Path $_ }
+        $registered = @(Select-String -Path (Get-ChildItem $srcDirs -Recurse -Include *.cpp, *.h -File) `
+                                      -Pattern 'TEXT\("(voxel\.[\w.]*)"\)' -AllMatches |
+                        ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value }) |
+                      Sort-Object -Unique
+        foreach ($n in $names) {
+            if ($registered -notcontains $n) {
+                $near = @($registered | Where-Object { $_ -like "$n*" }) | Select-Object -First 6
+                $hint = if ($near) { " Did you mean one of: $($near -join ', ')?" }
+                        else { '' }
+                throw ("REFUSING TO START: -Cvars names '$n', which is NOT a registered cvar anywhere in " +
+                       "ue-project\Source or voxel-core.$hint A name that does not exist is set silently and " +
+                       "leaves no trace in the log, so the capture would look correctly gated and not be. " +
+                       "If the thing you want is a command-line switch rather than a cvar -- several of them " +
+                       "are, deliberately, because -ExecCmds lands after streaming has begun -- pass it " +
+                       "through -ExtraArgs instead. The GPU mesh fork is -VoxelNoGpuMesh.")
+            }
+        }
+    }
+    $argList += "-ExecCmds=`"$Cvars`""   # embed the quotes; see the leg script
+}
 if ($FineTileDir)    { $argList += "-VoxelFineTileDir=$FineTileDir" }
 if ($FineProviderId) { $argList += "-VoxelFineTileProviderId=$FineProviderId" }
 if ($CoarseTileDir)  { $argList += "-VoxelTileDir=$CoarseTileDir" }
@@ -402,6 +441,46 @@ if (Test-Path $LogPath) {
                        "'was REFUSED'). Their lakes and rivers are ABSENT from this frame. " +
                        "kNoDecompressor here means the runtime zstd DLL is missing -- see " +
                        "tools/fetch-zstd.ps1.")
+    }
+
+    # THE WATER MARKER AND THE GPU MESH FORK, WHICH MUST NOT BOTH BE ON.
+    #
+    # -VoxelWaterMarker=1 fills every column between ground and the baked water
+    # surface with solid MAT_WATERMARK voxels, written by Amplifier::column --
+    # the CPU producer. worldgen.ush has no MAT_WATERMARK branch, so every chunk
+    # the GPU mesh fork takes comes back with the water absent, and the fork
+    # takes levels 0..5 of unedited chunks. The frame is then part-marked with
+    # nothing on screen to say which part, which is indistinguishable from the
+    # bake having placed water wrongly -- the exact question the marker exists to
+    # answer. Measured 2026-08-06: 14,848 of 44,873 chunks came back GPU-side on
+    # a marker capture that had to be thrown away.
+    #
+    # InstallWaterMarker now refuses this pairing itself, so on a current binary
+    # the REFUSED line is what appears. Both are checked, because a capture taken
+    # with an older binary produces the half-marked frame and no refusal at all.
+    if ($ExtraArgs -match 'VoxelWaterMarker') {
+        $forkOn   = @(Select-String -Path $LogPath -SimpleMatch 'GPU mesh fork ENABLED')
+        $refusedM = @(Select-String -Path $LogPath -SimpleMatch 'VoxelWaterMarker: REFUSED')
+        $installed = @(Select-String -Path $LogPath -SimpleMatch 'VoxelWaterMarker: INSTALLED')
+        if ($refusedM.Count -gt 0) {
+            Write-Warning ("THE WATER MARKER WAS REFUSED and this frame has NO marked water at all. The GPU " +
+                           "mesh fork was on. Re-run with -ExtraArgs '-VoxelNoGpuMesh' -- and note that " +
+                           "'voxel.GPU 0' is NOT that switch and never was.")
+        }
+        elseif ($forkOn.Count -gt 0) {
+            Write-Warning ("THE WATER MARKER RAN BESIDE THE GPU MESH FORK. This frame is PART-MARKED: chunks " +
+                           "produced by worldgen.ush carry no MAT_WATERMARK, and nothing on screen " +
+                           "distinguishes them from genuinely dry ground. DO NOT JUDGE WATER PLACEMENT FROM " +
+                           "IT. Re-run with -ExtraArgs '-VoxelNoGpuMesh'.")
+        }
+        elseif ($installed.Count -eq 0) {
+            Write-Warning ("-VoxelWaterMarker was passed but the log carries neither 'INSTALLED' nor " +
+                           "'REFUSED'. The marker never reached InstallWaterMarker, so this frame shows " +
+                           "ordinary water drawing and is not a marker capture.")
+        }
+        else {
+            Write-Host "  water marker: INSTALLED, GPU mesh fork off" -ForegroundColor DarkGray
+        }
     }
 
     # THE RIBBON QUEUE, WHICH IS A THIRD WATER QUEUE AND THE ONLY ONE THAT

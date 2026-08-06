@@ -226,7 +226,16 @@ public:
     // bring-up, before any worker touches the amplifier. The sampler itself
     // mutates on query (it decodes blocks lazily), which is why the member is
     // mutable and why `column()` can stay const.
-    void setWaterMarker(IWaterSampler* sampler) { waterMarker_ = sampler; }
+    // `includeOcean` composes the sea datum in, the same way lakes.h's
+    // `implicitWaterDatumMm` does for the near-field sweep -- the sampler alone
+    // carries only the baked lakes and rivers, because the ocean is not on the
+    // wire (it is `ground < kSeaLevelMm`, decided at the call site). Pass false
+    // to mark inland water only: near a coast a marked ocean fills the frame
+    // and a river shot is unreadable.
+    void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) {
+        waterMarker_ = sampler;
+        waterMarkerOcean_ = includeOcean;
+    }
     IWaterSampler* waterMarker() const { return waterMarker_; }
     bool waterMarkerEnabled() const { return waterMarker_ != nullptr; }
 
@@ -431,6 +440,7 @@ private:
     uint64_t id_;
     // Debug only; nullptr in every shipping configuration. See setWaterMarker.
     IWaterSampler* waterMarker_ = nullptr;
+    bool waterMarkerOcean_ = true;
 };
 
 } // namespace vxc

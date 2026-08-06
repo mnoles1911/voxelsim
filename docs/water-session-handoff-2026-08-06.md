@@ -64,15 +64,27 @@ tools\voxel-capture.ps1 -Name water-marker-wet-trunk `
   -CoarseTileDir 'D:\vox-wet-cache\terrain-diffusion-unlabeled-80b9ca451a23eae4\000000000135276f\s1' `
   -FineTileDir  'D:\vox-wet-cache' `
   -FineProviderId 'terrain-diffusion-unlabeled-80b9ca451a23eae4-b10cf6d2c' `
-  -Cvars 'voxel.GPU 0' `
-  -ExtraArgs '-VoxelWaterMarker=1','-VoxelWaterMarkerOcean=0'
+  -ExtraArgs '-VoxelWaterMarker=1','-VoxelWaterMarkerOcean=0','-VoxelNoGpuMesh'
 ```
 
 Four things in that command are load-bearing:
 
-* **`voxel.GPU 0` is mandatory.** `worldgen.ush` has no `MAT_WATERMARK` branch,
-  so the GPU path disagrees with the CPU path while the marker is on. Mirroring
-  it is the top open task.
+* **`-VoxelNoGpuMesh` is mandatory, and `voxel.GPU 0` DOES NOT WORK.**
+  `worldgen.ush` has no `MAT_WATERMARK` branch, so the GPU path disagrees with
+  the CPU path while the marker is on — but **there is no cvar named
+  `voxel.GPU`** anywhere in the tree, only `voxel.GPU.*` children, so
+  `-Cvars 'voxel.GPU 0'` sets nothing and fails silently. The fork is gated on a
+  command-line switch by deliberate design: `GpuMeshEnabled()`
+  (`VoxelWorldSubsystem.cpp:1654`) reads `-VoxelNoGpuMesh`, and the comment above
+  it says why — *"-ExecCmds lands after streaming has already begun, so a cvar
+  would fork a run half way through."* **Taken with the wrong gate, 2026-08-06:**
+  the log said `VoxelGpuMesh: GPU mesh fork ENABLED` and the fork dispatched and
+  delivered **14,848 chunks** of 44,873 loaded, all of them from the path with no
+  marker branch. The frame is `VoxelVerify00135.png`; do not judge it. The
+  re-shoot with `-VoxelNoGpuMesh` is `VoxelVerify00137.png`.
+  **Check the log for `GPU mesh fork ENABLED` on every marker capture** — its
+  absence is the only proof the gate took. Mirroring `MAT_WATERMARK` into
+  `worldgen.ush` remains the top open task and retires this whole hazard.
 * **`-FineTileDir` is the cache ROOT; `-CoarseTileDir` is an s1 LEAF.** Different
   shapes. Swapping them fails in different ways.
 * **The spawn is the trunk, not the tile centre** — the highest-discharge cell
@@ -91,7 +103,9 @@ wet tiles look RAW at 229 MB, but confirm), and a leg that did not settle.
 
 1. **Mirror `MAT_WATERMARK` into `voxel-core/shaders/worldgen.ush`** and re-gate
    with `vxc_gpu`. Until then the marker is CPU-only.
-2. **Take the capture above** and let the owner judge it. Do not offer a verdict.
+2. **Taken 2026-08-06** — `VoxelVerify00137.png`, 44,740 chunks, `jobsInFlight=0
+   pendingJobs=0 unloaded=0`, 0 tiles refused, GPU mesh fork off. **Awaiting the
+   owner's judgement.** Do not offer a verdict.
 3. **Decide whether `water_inject_at_interior_rim` becomes the default.** Rolls
    `bake_ver`; invalidates every baked water plane.
 4. **F3 — put slope in the depth law.** Falsifiable acceptance test already

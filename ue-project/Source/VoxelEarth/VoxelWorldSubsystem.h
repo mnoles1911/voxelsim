@@ -53,7 +53,14 @@ public:
 	// only baked lakes and rivers, because the ocean is not on the wire. Pass
 	// false to mark inland water only; near a coast a marked ocean fills the
 	// frame and a river shot is unreadable. Pass nullptr to uninstall.
-	void InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean = true);
+	//
+	// RETURNS FALSE IF THE MARKER WAS REFUSED, which happens when the GPU mesh
+	// fork is on -- see the refusal in the .cpp for why that pairing cannot be
+	// allowed to produce a frame. Callers must not announce a marked world
+	// without checking: a log line saying water is drawn as magenta when it is
+	// not is the same silent-wrong-evidence failure the refusal exists to stop.
+	// Uninstalling (nullptr) always returns true.
+	bool InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean = true);
 	UVoxelWorldSubsystem();
 	// Declared (not defaulted) here and defined in the .cpp: TUniquePtr<FVoxelWorldImpl>'s
 	// destructor needs FVoxelWorldImpl's full definition, which this
