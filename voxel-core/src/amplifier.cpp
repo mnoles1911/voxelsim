@@ -2265,6 +2265,24 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // is nothing to decide here.
     if (waterMarker_ != nullptr) {
         const int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+        // See Amplifier::waterMarkerColumnsMarked. Counted BEFORE the ocean
+        // composition so `marked` means "the baked plane had water over this
+        // column", which is the thing being judged; a sea-only column would
+        // otherwise inflate the count on a coastal shot with -...Ocean=1.
+        markerQueried_.fetch_add(1, std::memory_order_relaxed);
+        if (baked != kNoWaterMarkerMm) {
+            markerMarked_.fetch_add(1, std::memory_order_relaxed);
+            // MARKED IS NOT THE SAME AS DRAWN, and conflating them cost another
+            // round on 2026-08-06. stratigraphyAt only returns MAT_WATERMARK on
+            // the `depthMm < 0` branch -- ABOVE this column's own amplified
+            // surface. So a column whose baked water surface lies at or below
+            // that surface is counted `marked` and still emits not one marker
+            // voxel. This counter is the difference between "the bake says
+            // water is here" and "a magenta voxel can exist here", which is the
+            // line between a data question and a rendering question.
+            if (int64_t(baked) > int64_t(col.surfaceMm))
+                markerAboveGround_.fetch_add(1, std::memory_order_relaxed);
+        }
         // implicitWaterDatumMm is lakes.h's own composition -- max(baked, sea)
         // with the kNoWaterMm cases handled -- so the marker and the near-field
         // sweep cannot disagree about where the sea is.

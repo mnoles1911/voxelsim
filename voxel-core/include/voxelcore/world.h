@@ -32,6 +32,12 @@ public:
     void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) {
         amp_.setWaterMarker(sampler, includeOcean);
     }
+    // See Amplifier::waterMarkerColumnsMarked -- the two numbers that separate
+    // "the marker is not wired up" from "the camera never looked at water" from
+    // "the water is there and something downstream will not draw it".
+    int64_t waterMarkerColumnsQueried() const { return amp_.waterMarkerColumnsQueried(); }
+    int64_t waterMarkerColumnsMarked() const { return amp_.waterMarkerColumnsMarked(); }
+    int64_t waterMarkerColumnsAboveGround() const { return amp_.waterMarkerColumnsAboveGround(); }
     const GeneratedWorld<B>& generated() const { return gen_; }
     const EditLog& log() const { return log_; }
     const ChunkMap<B>& editedBricks() const { return overlay_; }

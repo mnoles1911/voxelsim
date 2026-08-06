@@ -113,6 +113,29 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, )
 	// read zeros forever and drop every water surface to the floor of its cell --
 	// see this struct's own NOTE ON NAMING, and docs/gpu-g2-draw-path.md.
 	SHADER_PARAMETER_SRV(StructuredBuffer<uint>, QuadCornerHeights)
+
+	// DEBUG WATER MARKER visibility, driven by voxel.WaterMarker.Opacity.
+	//
+	// 1 = solid magenta (the default when the marker is on at all), 0 = the
+	// marker's voxels are discarded entirely, anything between = dithered
+	// see-through so the VOLUME the marker fills can be read rather than just
+	// its outer skin.
+	//
+	// WHY IT RIDES HERE AND NOT IN A MATERIAL PARAMETER COLLECTION. The material
+	// cannot see this uniform buffer, so the value is smuggled to it in the
+	// marker quad's G channel (see the .ush) -- G carries ambient occlusion,
+	// which a debug marker has no use for. An MPC was the obvious alternative
+	// and was rejected: create_sky_material.py documents that an unresolved
+	// CollectionParameter does NOT fail to compile, it compiles to ZERO, which
+	// is the same silent-nothing failure mode that has already cost this
+	// instrument a full session.
+	//
+	// A RUNTIME CVAR IS SAFE HERE, unlike -VoxelNoGpuMesh and friends. Those had
+	// to be command-line switches because -ExecCmds lands after streaming has
+	// begun and they decide what gets GENERATED. This decides only how an
+	// already-generated quad is SHADED, so flipping it mid-session is exactly
+	// the intended use and needs no re-mesh.
+	SHADER_PARAMETER(float, WaterMarkerOpacity)
 END_GLOBAL_SHADER_PARAMETER_STRUCT()
 
 // WHERE THIS DRAW STARTS IN THE POOL, in quads. Bound PER BATCH ELEMENT.

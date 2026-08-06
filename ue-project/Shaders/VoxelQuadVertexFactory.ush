@@ -338,14 +338,57 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// unaffected in every path.
 	const bool bWater = (VoxelVF.WaterMode != 0u);
 	const float TerrainTintR = bNearSurface ? FaceTint : 0.0f;
-	const float ColorR = bWater ? Decoded.CornerHeight : TerrainTintR;
-	const float ColorB = bWater ? Decoded.TopBoundary : ChunkClimate.x;
+
+	// DEBUG WATER MARKER (vxc::MAT_WATERMARK == 15), and the one place in this
+	// renderer where a material id can still be trusted.
+	//
+	// THIS IS THE PATH THAT ACTUALLY DRAWS. voxel.Stream.GPU is on by default, so
+	// terrain streams as packed quads through this factory and NOT through
+	// UVoxelChunkComponent's vertex builder. The marker was written against that
+	// builder, which is why it was invisible for a whole session: its geometry
+	// exists (120,072 quads measured on one pose with the pool off) and the
+	// pooled renderer simply never carried the distinction.
+	//
+	// AND THE ID IS RELIABLE HERE, which it is not on the CPU path.
+	// VoxelClimateProbe.h records why R had to stop carrying the id: an
+	// exposure-proof probe measured VertexColor.R * 255 arriving as ~6-8 where
+	// the CPU wrote 4, so every categorical threshold read 0. That transform is
+	// the FColor vertex-attribute path. Decoded.MaterialId is unpacked from the
+	// quad's own bits inside this shader and never touches it, so an exact
+	// integer compare is sound.
+	//
+	// The sentinel is the same one the material decodes: R=1, B=0, A=0. B and A
+	// are temperature and precipitation, which a marker voxel has no use for --
+	// it is an instrument, not terrain, and must not take a biome colour.
+	//
+	// This is deliberately a per-id branch on one id. It is also the smallest
+	// possible instance of the thing biomes need next: per-material appearance
+	// in the pooled renderer. If this reads correctly, the same hook generalises
+	// to a real per-id lookup here, where the id survives.
+	const bool bMarker = (!bWater) && (Decoded.MaterialId == 15u);
+
+	const float ColorR = bWater ? Decoded.CornerHeight : (bMarker ? 1.0f : TerrainTintR);
+	const float ColorB = bWater ? Decoded.TopBoundary : (bMarker ? 0.0f : ChunkClimate.x);
+	const float ColorA = bMarker ? 0.0f : ChunkClimate.y;
+
+	// G carries the marker's OPACITY instead of ambient occlusion, because the
+	// material has no other way to hear about voxel.WaterMarker.Opacity -- it
+	// cannot read this factory's uniform buffer. AO is meaningless on a marker
+	// voxel: the material replaces its base colour with a flat magenta after the
+	// detail multiply, so nothing downstream consumes G for shading here.
+	//
+	// The material multiplies this into the ring-fade factor ahead of
+	// DitherTemporalAA, so a value below 1 dithers the marker away per pixel and
+	// the volume becomes see-through rather than a solid skin. Reusing the fade
+	// path is deliberate -- it is already Masked with a calibrated
+	// OpacityMaskClipValue, so no blend-mode change and no new translucency cost.
+	const float ColorG = bMarker ? VoxelVF.WaterMarkerOpacity : Decoded.AmbientOcclusion;
 
 	Intermediates.Color = half4(
 		(half)ColorR,
-		(half)Decoded.AmbientOcclusion,
+		(half)ColorG,
 		(half)ColorB,
-		(half)ChunkClimate.y);
+		(half)ColorA);
 
 	// World-planar UVs on the face's two in-plane axes, matching the CPU
 	// path's "position / 100, wrapped to a 32 m period". The wrap keeps the

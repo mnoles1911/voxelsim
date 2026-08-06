@@ -7,6 +7,30 @@
 #include "DataDrivenShaderPlatformInfo.h"
 #include "CommonRenderResources.h"
 
+// How visible the DEBUG WATER MARKER's magenta voxels are. Only ever has an
+// effect when the marker is installed at all (-VoxelWaterMarker=1), because
+// nothing else emits vxc::MAT_WATERMARK.
+//
+//   1    solid magenta -- where the bake says water is
+//   0.3  dithered see-through -- the marker's VOLUME rather than its skin, so a
+//        river's depth and a lake's basin can be read against the ground under
+//        them
+//   0    discarded entirely -- an A/B against the same frame with no re-mesh
+//        and no relaunch, which is the comparison that says whether a magenta
+//        shape is hiding landform
+//
+// Runtime cvar rather than a command-line switch, and that distinction has bitten
+// this project: -VoxelNoGpuMesh and -VoxelRiverRibbons must be command line
+// because -ExecCmds lands after streaming has begun and they decide what is
+// GENERATED. This only decides how an existing quad is SHADED, so it is safe to
+// flip mid-session -- which is the whole point of a debug toggle.
+TAutoConsoleVariable<float> CVarVoxelWaterMarkerOpacity(
+	TEXT("voxel.WaterMarker.Opacity"),
+	1.0f,
+	TEXT("Debug water marker visibility: 1 solid, 0 hidden, between = dithered see-through so the ")
+	TEXT("filled VOLUME is readable. Needs -VoxelWaterMarker=1; nothing else emits MAT_WATERMARK."),
+	ECVF_RenderThreadSafe);
+
 IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadVertexFactoryParameters, "VoxelVF");
 IMPLEMENT_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelQuadRangeParameters, "VoxelRange");
 
@@ -88,6 +112,7 @@ void FVoxelQuadVertexFactory::InitRHI(FRHICommandListBase& RHICmdList)
 		Parameters.LevelScale = LevelScale;
 		Parameters.PoolMode = bPoolMode ? 1u : 0u;
 		Parameters.WaterMode = bWaterMode ? 1u : 0u;
+		Parameters.WaterMarkerOpacity = FMath::Clamp(CVarVoxelWaterMarkerOpacity.GetValueOnAnyThread(), 0.0f, 1.0f);
 		// Both SRVs must be non-null even in single-chunk mode: an unbound SRV
 		// in a uniform buffer is a validation failure, not a tolerated no-op.
 		Parameters.ChunkOrigins = ChunkOriginsSRV.IsValid() ? ChunkOriginsSRV : QuadBufferSRV;

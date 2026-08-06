@@ -8,6 +8,8 @@
 // material). Later versions add erosion stamps, riverbed carving, caves,
 // vegetation placement.
 
+#include <atomic> // the debug water marker's column counters
+
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
 
@@ -239,6 +241,39 @@ public:
     IWaterSampler* waterMarker() const { return waterMarker_; }
     bool waterMarkerEnabled() const { return waterMarker_ != nullptr; }
 
+    // HOW MANY COLUMNS THE MARKER ACTUALLY MARKED, because "I see no magenta"
+    // is otherwise unfalsifiable.
+    //
+    // 2026-08-06 cost the session twice over: a capture whose marker had been
+    // silently disabled by the GPU mesh fork, and then a capture where the
+    // marker was genuinely installed, genuinely queried, and still put nothing
+    // on screen. Neither the log nor the image could tell those apart from
+    // "the bake has no water here" -- which is the ONE question the instrument
+    // exists to answer, so the instrument was unable to fail honestly.
+    //
+    // `queried` counts columns that reached the marker at all; `marked` counts
+    // those that came back with water over them. marked == 0 against a large
+    // queried is the signature of a wiring fault; both small is a camera that
+    // never looked at water; marked large with nothing on screen is a DRAWING
+    // problem (thin band, coarse LOD sampling) and not a data one.
+    //
+    // Relaxed atomics: they are incremented from the mesher pool, nothing
+    // branches on them, and they are read once for a log line.
+    int64_t waterMarkerColumnsQueried() const {
+        return markerQueried_.load(std::memory_order_relaxed);
+    }
+    int64_t waterMarkerColumnsMarked() const {
+        return markerMarked_.load(std::memory_order_relaxed);
+    }
+    // Of the marked columns, how many carry water ABOVE their own amplified
+    // surface -- i.e. how many can actually emit a magenta voxel. See the
+    // increment site: stratigraphyAt returns MAT_WATERMARK only above the
+    // surface, so `marked - aboveGround` is water the marker knows about and
+    // structurally cannot draw.
+    int64_t waterMarkerColumnsAboveGround() const {
+        return markerAboveGround_.load(std::memory_order_relaxed);
+    }
+
     // Full stratigraphy for the column through voxel (vx, vy).
     ColumnSample column(int64_t vx, int64_t vy) const;
 
@@ -441,6 +476,11 @@ private:
     // Debug only; nullptr in every shipping configuration. See setWaterMarker.
     IWaterSampler* waterMarker_ = nullptr;
     bool waterMarkerOcean_ = true;
+    // See waterMarkerColumnsMarked(). Touched only when waterMarker_ is set, so
+    // a shipping run pays nothing.
+    mutable std::atomic<int64_t> markerQueried_{0};
+    mutable std::atomic<int64_t> markerMarked_{0};
+    mutable std::atomic<int64_t> markerAboveGround_{0};
 };
 
 } // namespace vxc

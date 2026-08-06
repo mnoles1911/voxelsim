@@ -5785,6 +5785,41 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// that matters.
 	}
 
+	// THE DEBUG WATER MARKER'S OWN CENSUS. Printed only once the marker has been
+	// queried at all, so an ordinary run's log is byte-unchanged.
+	//
+	// "I see no magenta" was unfalsifiable until this line existed, and that
+	// cost a whole session on 2026-08-06: first a capture whose marker had been
+	// silently voided by the GPU mesh fork, then a capture where the marker was
+	// installed, queried, and returning real water -- and still put nothing on
+	// screen, because a ~0.5 m band over a 2.65 m river is thinner than the
+	// coarse cells that fill a vista (L3 0.8 m, L4 1.6 m, L5 3.2 m) and
+	// makeCoarseBrick point-samples ONE representative level-0 voxel per cell.
+	// Three unrelated faults, one identical symptom, and no number anywhere that
+	// could tell them apart.
+	//
+	// How to read it:
+	//   marked == 0, queried large  -> WIRING. The sampler sees no water at all.
+	//   both small                  -> the camera never looked at water.
+	//   marked large, none on screen-> DRAWING, not data. Check the band
+	//                                  thickness against the ring level in frame
+	//                                  before suspecting the bake.
+	if (Voxels.waterMarkerColumnsQueried() > 0)
+	{
+		const int64 Queried = Voxels.waterMarkerColumnsQueried();
+		const int64 Marked = Voxels.waterMarkerColumnsMarked();
+		const int64 Above = Voxels.waterMarkerColumnsAboveGround();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel water marker (cumulative): columns queried=%lld marked=%lld (%.4f%%) ")
+		       TEXT("aboveGround=%lld (%.4f%% of marked). aboveGround is the one that can DRAW: ")
+		       TEXT("stratigraphyAt emits MAT_WATERMARK only above a column's amplified surface, so ")
+		       TEXT("marked-aboveGround is water the marker knows about and structurally cannot show."),
+		       (long long)Queried, (long long)Marked,
+		       Queried > 0 ? 100.0 * double(Marked) / double(Queried) : 0.0,
+		       (long long)Above,
+		       Marked > 0 ? 100.0 * double(Above) / double(Marked) : 0.0);
+	}
+
 	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2). Independent of
 	// VoxelStreamAdmission::GpuMeshEnabled() above -- the CPU worker arm's
 	// windows are worth reading on a CPU-only run too, and a run with the fork

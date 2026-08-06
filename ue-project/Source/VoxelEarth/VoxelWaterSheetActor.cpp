@@ -96,6 +96,16 @@ void AVoxelWaterSheetActor::BeginPlay()
 	{
 		bEnabled = (Flag != 0);
 	}
+	// -VoxelWaterMarkerOnly=1 wins over the switch above: the marker view exists
+	// so ONE renderer describes where water is. Sheets draw the same baked lakes
+	// in blue at ~15 m rectangles, which is a second, coarser answer overlaid on
+	// the one being judged. See VoxelWaterSubsystem.cpp's note at the near-field
+	// call site for the report that prompted this.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly"))
+	    || (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly="), Flag) && Flag != 0))
+	{
+		bEnabled = false;
+	}
 
 	// SCAN RADIUS: 10 km, and this is a MEMORY decision, not a taste one.
 	//

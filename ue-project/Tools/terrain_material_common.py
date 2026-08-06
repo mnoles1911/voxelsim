@@ -329,6 +329,39 @@ def build_terrain_base_color(
     variation = b.add(b.add(b.const(1.0), fine), coarse)
     base = b.mul(base, variation)
 
+    # --- DEBUG WATER MARKER override ----------------------------------------
+    #
+    # Decodes the sentinel VoxelQuadVertexFactory.ush writes for
+    # vxc::MAT_WATERMARK: R=1, B=0, A=0. Applied LAST, after the detail multiply,
+    # so the marker is one flat colour rather than magenta with fBm dragged
+    # through it -- it is an instrument, and it has to read as "not terrain" at a
+    # glance.
+    #
+    # WHY A SENTINEL AND NOT A PALETTE LOOKUP. This graph has no palette texture
+    # sample at all; PALETTE_TEXTURE above is a dead constant. VoxelClimateProbe.h
+    # records the measurement that removed it -- VertexColor.R * 255 arrived as
+    # ~6-8 where the CPU wrote 4, so categorical id thresholds all read 0. The
+    # POOLED path does the id compare in the shader on the quad's own bits, where
+    # it is exact, and only then encodes this three-channel sentinel. That is the
+    # difference between this and the palette lookup that had to be abandoned.
+    #
+    # The thresholds are loose because only the ENDPOINTS (0 and 1) are fixed
+    # points of the per-channel transform; anything near them may have moved, and
+    # a tight epsilon would reintroduce exactly the failure being avoided.
+    #
+    # COST, STATED: ground at p1 temperature AND p1 precipitation also reads
+    # (0,0) and would go magenta. That is the coldest-and-driest corner of the
+    # world, in a debug mode that is already not shippable.
+    marker_color = b.vector("WaterMarkerColor", 0.90, 0.00, 0.90)
+    is_marker = b.mul(
+        b.mul(
+            b.one_minus(b.ramp(vertex_color, "B", b.const(0.02), b.const(0.06))),
+            b.one_minus(b.ramp(vertex_color, "A", b.const(0.02), b.const(0.06))),
+        ),
+        b.ramp(vertex_color, "R", b.const(0.94), b.const(0.98)),
+    )
+    base = b.lerp(base, "", marker_color, "", b.saturate(is_marker))
+
     # --- generation-time debug bisect ---------------------------------------
     #
     # VOXEL_MATERIAL_DEBUG=<n> in the environment when the material is authored

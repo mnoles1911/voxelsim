@@ -164,6 +164,24 @@ static TAutoConsoleVariable<int32> CVarVoxelWaterCeilingReliefBudget(
 
 namespace
 {
+// -VoxelWaterMarkerOnly=1: draw ONLY the debug marker's magenta voxels, with the
+// near-field implicit disc, the lake sheets and the river ribbons all silent.
+//
+// Resolved ONCE from the command line, like every other switch that decides what
+// gets built rather than how it is shaded (see GpuMeshEnabled's note on why
+// -ExecCmds is too late for those). It is read every tick, hence the static.
+bool VoxelWaterMarkerOnly()
+{
+	static const bool bOnly = []
+	{
+		int32 Flag = 0;
+		return FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly="), Flag)
+			       ? Flag != 0
+			       : FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly"));
+	}();
+	return bOnly;
+}
+
 // BrickKey <-> VoxelCoords::FVoxelCoord: this subsystem carries brick-grid
 // coordinates (NOT voxel coordinates) through UE-visible plumbing as
 // FVoxelCoord, per that struct's W2 doc comment (VoxelCoords.h) -- these two
@@ -5042,7 +5060,22 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 	// with no replication at all. What does have to replicate is which bricks
 	// have MOBILIZED, because that is simulation state -- see
 	// ApplyReplicatedWaterDiffs.
-	if (World)
+	// -VoxelWaterMarkerOnly=1 SUPPRESSES THE REAL WATER RENDERERS, so the marker
+	// is the only thing on screen describing where water is.
+	//
+	// The owner's report, flying the marker 2026-08-06: "flying close to the
+	// magenta water renders the blue water and ribbon which looks conflicting --
+	// debugging and diagnosing this would be easier if we just showed magenta
+	// cubic voxel blocks." Three renderers overlap inside 25.6 m -- the
+	// near-field implicit disc here, the lake sheets and the river ribbons -- and
+	// each draws the SAME baked water in a different colour, at a different
+	// resolution, with a different extent rule. Judging the marker's geometry
+	// through that is judging four things at once.
+	//
+	// The other two read their own -VoxelLakeSheets=0 / -VoxelRiverRibbons=0
+	// inside their actors; this switch turns all three off together so the view
+	// is one flag rather than three that can disagree.
+	if (World && !VoxelWaterMarkerOnly())
 	{
 		if (APlayerController* PC = World->GetFirstPlayerController())
 		{

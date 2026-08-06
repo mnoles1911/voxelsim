@@ -103,6 +103,15 @@ void AVoxelRiverRibbonActor::BeginPlay()
 	{
 		bEnabled = (Flag != 0);
 	}
+	// -VoxelWaterMarkerOnly=1 wins over the switch above, for the same reason the
+	// lake sheets honour it: the ribbon draws the SAME baked river as a flat
+	// swept quad at the centreline width, so it overlays a second answer on the
+	// geometry the marker is being judged for.
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly"))
+	    || (FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerOnly="), Flag) && Flag != 0))
+	{
+		bEnabled = false;
+	}
 	double RangeM = 0.0;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRiverRibbonRangeM="), RangeM) && RangeM > 1.0)
 	{
