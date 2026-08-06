@@ -500,3 +500,85 @@ VXC_TEST(ribbon_orient_reports_flat_reaches_instead_of_guessing) {
     CHECK_EQ(flat, size_t(1));
     CHECK_EQ(paths[0].pts.front().px, headPx); // left exactly as traced
 }
+
+// FLOW DIRECTION AT A POINT. This is what carries a direction to the NEAR-FIELD
+// voxel water, which is the half of the world where "make it look like it is
+// flowing" has to be answered -- a scrolling flat quad is what the owner
+// rejected outright.
+//
+// Integer-only, per this header's own rule: the tangent comes back as the raw
+// segment delta and the distance as its square, so there is no sqrt and no
+// rounding before the caller sees it.
+VXC_TEST(river_flow_dir_points_downstream_at_a_nearby_point) {
+    RiverWetWindow win = makeWindow(80, 11);
+    for (int32_t x = 2; x < 78; ++x) setWet(win, x, 5, 250000 - x * 37);
+
+    RiverThinField thin;
+    riverRibbonThin(win, kPx, thin);
+    std::vector<RiverRibbonPath> paths;
+    riverRibbonTrace(win, thin, kPx, RiverTraceParams{}, paths);
+    riverRibbonOrient(paths);
+    CHECK_EQ(paths.size(), size_t(1));
+
+    // A point sitting right on the channel: the tangent must run in +x, which
+    // is the descending direction for this reach.
+    const RiverFlowSample on = riverFlowDirAt(paths, 40, 5, 8);
+    CHECK(on.valid);
+    CHECK(on.dx > 0);
+    CHECK_EQ(on.dy, int64_t(0));
+    CHECK_EQ(on.dist2Px, int64_t(0));
+
+    // A point two pixels off the channel still gets the reach's direction, and
+    // reports the squared offset rather than a rounded distance.
+    const RiverFlowSample off = riverFlowDirAt(paths, 40, 7, 8);
+    CHECK(off.valid);
+    CHECK(off.dx > 0);
+    CHECK_EQ(off.dist2Px, int64_t(4));
+
+    // Outside the search radius there is no answer, and the caller is expected
+    // to suppress motion rather than receive a stale one.
+    const RiverFlowSample far = riverFlowDirAt(paths, 40, 60, 8);
+    CHECK(!far.valid);
+}
+
+// STANDING WATER YIELDS NO DIRECTION. A level reach is a lake or a pool the
+// tracer picked up; handing back a direction for it would animate a lake.
+VXC_TEST(river_flow_dir_declines_on_a_level_reach) {
+    RiverWetWindow win = makeWindow(80, 11);
+    for (int32_t x = 2; x < 78; ++x) setWet(win, x, 5, 250000); // dead level
+
+    RiverThinField thin;
+    riverRibbonThin(win, kPx, thin);
+    std::vector<RiverRibbonPath> paths;
+    riverRibbonTrace(win, thin, kPx, RiverTraceParams{}, paths);
+    riverRibbonOrient(paths);
+
+    const RiverFlowSample s = riverFlowDirAt(paths, 40, 5, 8);
+    CHECK(!s.valid);
+}
+
+// THE INTEGER PROJECTION MUST CLAMP TO THE SEGMENT, not to its infinite line.
+// Past the end of a reach the nearest point is the ENDPOINT, so the distance
+// grows; a projection onto the unclamped line would report the perpendicular
+// offset instead and would light up water that is nowhere near the river.
+VXC_TEST(river_flow_dir_clamps_past_the_end_of_a_reach) {
+    // Long enough to survive RiverTraceParams' 120 m minimum: 76 px at 1.875 m
+    // is 142 m. A 20 px reach is 37.5 m and gets dropped, which is what this
+    // test asserted on its first draft -- the failure was the test's, not the
+    // clamp's.
+    RiverWetWindow win = makeWindow(80, 11);
+    for (int32_t x = 2; x < 78; ++x) setWet(win, x, 5, 250000 - x * 37);
+
+    RiverThinField thin;
+    riverRibbonThin(win, kPx, thin);
+    std::vector<RiverRibbonPath> paths;
+    riverRibbonTrace(win, thin, kPx, RiverTraceParams{}, paths);
+    riverRibbonOrient(paths);
+    CHECK_EQ(paths.size(), size_t(1));
+
+    // Well beyond the downstream end, on the reach's own row. An unclamped
+    // projection would call this distance 0.
+    const RiverFlowSample past = riverFlowDirAt(paths, 110, 5, 64);
+    CHECK(past.valid);
+    CHECK(past.dist2Px > int64_t(0));
+}

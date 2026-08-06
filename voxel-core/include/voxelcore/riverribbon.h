@@ -868,4 +868,104 @@ inline size_t buildRiverRibbons(FineTileSampler& tiles, RiverSampler& rivers, Ri
     return n;
 }
 
+// ---------------------------------------------------------------------------
+// FLOW DIRECTION AT A POINT, from the oriented reaches
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS IS FOR. The near field draws water as REAL VOXELS, and that is the
+// half of the world where "make the river look like it is flowing" has to be
+// answered -- a scrolling flat quad is the thing the owner rejected outright
+// ("I don't want to use lighting or shadow gimmicks. I want to physically
+// change the geometry"). So the direction has to reach the voxel water, not
+// just the ribbon.
+//
+// WHY NOT THE WATER-SURFACE GRADIENT, which would have been free: MEASURED AND
+// FAILED. Across a +/-1-pixel stencil it resolves above the depth plane's 10 mm
+// LSB on only 37.9% of centreline cells (docs/measurements/
+// water-surface-gradient-2026-08-06.txt), against a pre-registered bar of 90%.
+// It fails worst exactly on the centreline. A reach tangent has no such
+// failure mode: the reach is an ordered polyline and riverRibbonOrient has
+// already given it a sign from an invariant rather than from a derivative.
+//
+// THE COST MODEL, stated because it decides where this may be called. This is a
+// linear scan over reaches with a cheap bounding-box reject, NOT a spatial
+// index. That is correct for the near field -- the implicit box is +/-25.6 m
+// (VoxelWaterSubsystem.cpp) and only a handful of reaches can intersect it --
+// and it is WRONG for a whole-window sweep at the ribbon actor's 4 km scan
+// radius, where 1,345 reaches were traced on one measured block. Call it per
+// water BRICK (0.8 m), not per voxel, and not over the far window.
+// INTEGER, because this header is integer-only and says so at the top ("no
+// float, no double, no sqrt"). The tangent is returned as the RAW segment
+// delta in fine pixels and the distance as its SQUARE, so nothing here needs a
+// square root. The caller normalises -- the engine side is float-native and a
+// direction is only ever consumed as one, so the division belongs there rather
+// than as a rounding error baked into the library.
+struct RiverFlowSample {
+    bool valid = false;      // false = no reach within the search radius
+    int64_t dx = 0, dy = 0;  // downstream tangent, UNNORMALISED, fine pixels
+    int64_t dist2Px = 0;     // SQUARED distance to the nearest point on that reach
+};
+
+// Nearest oriented reach to (px, py), and its downstream tangent there.
+//
+// `paths` MUST have been through riverRibbonOrient, or the sign is whatever the
+// tracer happened to walk. There is no way to check that here, which is why
+// buildRiverRibbons orients unconditionally at the end.
+//
+// A reach left FLAT by the orienter (both ends at the same surface height) is
+// standing water and is skipped: it has no flow direction because it has no
+// flow, and inventing one for a lake is worse than showing none. Callers get
+// `valid == false` and should suppress motion, exactly as the CA-activity gate
+// does for player-disturbed water.
+inline RiverFlowSample riverFlowDirAt(const std::vector<RiverRibbonPath>& paths, int64_t px,
+                                      int64_t py, int64_t searchRadiusPx) {
+    RiverFlowSample out;
+    int64_t bestD2 = searchRadiusPx * searchRadiusPx;
+
+    for (const RiverRibbonPath& p : paths) {
+        if (p.pts.size() < 2) continue;
+        // A flat reach carries no direction. Cheap to test and it is the whole
+        // lake case.
+        const int32_t a = p.pts.front().surfaceMm, b = p.pts.back().surfaceMm;
+        if (a == kNoWaterMm || b == kNoWaterMm || a == b) continue;
+
+        for (size_t i = 0; i + 1 < p.pts.size(); ++i) {
+            const int64_t x0 = p.pts[i].px, y0 = p.pts[i].py;
+            const int64_t ex = p.pts[i + 1].px - x0, ey = p.pts[i + 1].py - y0;
+            const int64_t len2 = ex * ex + ey * ey;
+            if (len2 <= 0) continue;
+
+            // Closest point on the SEGMENT, clamped to its ends so the answer
+            // is the distance to the polyline and not to its infinite line.
+            //
+            // Kept in integers by scaling: the closest point is
+            // (x0,y0) + (num/len2)*(ex,ey), so the offset from the query point
+            // is ((px-x0)*len2 - num*ex, ...) over len2, and comparing squared
+            // distances means comparing those numerators against bestD2*len2^2.
+            // Everything stays exact; nothing is rounded before the comparison.
+            const int64_t wx = px - x0, wy = py - y0;
+            int64_t num = wx * ex + wy * ey;
+            if (num < 0) num = 0;
+            if (num > len2) num = len2;
+            const int64_t offx = wx * len2 - num * ex;
+            const int64_t offy = wy * len2 - num * ey;
+
+            // d2 = (offx^2 + offy^2) / len2^2, compared as
+            // offx^2 + offy^2 < bestD2 * len2^2 to stay integral. len2 is
+            // bounded by the simplifier's chord length, so this does not
+            // overflow int64 at any world coordinate we address.
+            const int64_t lhs = offx * offx + offy * offy;
+            const int64_t rhs = bestD2 * len2 * len2;
+            if (lhs >= rhs) continue;
+
+            bestD2 = lhs / (len2 * len2);
+            out.valid = true;
+            out.dx = ex;
+            out.dy = ey;
+            out.dist2Px = bestD2;
+        }
+    }
+    return out;
+}
+
 } // namespace vxc
