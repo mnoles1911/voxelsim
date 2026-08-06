@@ -19,6 +19,17 @@ public:
         : amp_(seed, tiles), gen_(amp_), log_(seed, B, std::move(providerId)) {}
 
     const Amplifier& amplifier() const { return amp_; }
+
+    // DEBUG WATER MARKER passthrough. `amplifier()` is deliberately const --
+    // nothing in normal operation may reconfigure worldgen after construction
+    // -- so this is the one narrow door, named for exactly what it does rather
+    // than handing out a mutable Amplifier.
+    //
+    // MUST be called during bring-up, before any worker touches the world.
+    // Amplifier::setWaterMarker documents why; the practical reason here is
+    // that a session-lifetime brick cache would otherwise serve pre-marker
+    // bricks alongside marked ones.
+    void setWaterMarker(IWaterSampler* sampler) { amp_.setWaterMarker(sampler); }
     const GeneratedWorld<B>& generated() const { return gen_; }
     const EditLog& log() const { return log_; }
     const ChunkMap<B>& editedBricks() const { return overlay_; }

@@ -51,6 +51,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -219,6 +220,44 @@ public:
 class NullWaterSampler final : public IWaterSampler {
 public:
     int32_t waterSurfaceMmAtVoxel(int64_t, int64_t) override { return kNoWaterMm; }
+};
+
+// A water sampler that is safe to query from many threads at once.
+//
+// WHY IT HAS TO EXIST. Every real IWaterSampler here MUTATES on query -- the
+// first read inside a block decodes it, the first read inside a basin builds
+// that basin's extent mask -- so the contract is "prewarm from one thread, then
+// read from many". That contract is satisfiable for the near-field sweep, which
+// knows its region in advance. It is NOT satisfiable for the debug water
+// marker: `Amplifier::column` is called from the mesher worker pool at whatever
+// columns the streamer happens to want, so there is no moment at which the
+// region of interest is known and no thread on which to prewarm it.
+//
+// Rather than make every sampler thread-safe -- which would put a lock on the
+// near-field path, the hottest loop in the water system, to serve a debug mode
+// -- the lock lives here and only the debug path pays it.
+//
+// Contention is real and accepted: marker mode serialises one tile-block decode
+// across the mesher pool. It is an instrument, not a shipping path.
+class LockedWaterSampler final : public IWaterSampler {
+public:
+    explicit LockedWaterSampler(IWaterSampler& inner) : inner_(&inner) {}
+
+    int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override {
+        std::lock_guard<std::mutex> guard(m_);
+        return inner_->waterSurfaceMmAtVoxel(vx, vy);
+    }
+
+    // The sheet half is NOT forwarded, deliberately. It hands out BORROWED
+    // pointers into the inner sampler's own storage (see IWaterSampler), and a
+    // lock held only for the duration of this call would not protect the caller
+    // while it reads through them. The marker never asks these questions; a
+    // future caller that needs them must solve that lifetime problem rather
+    // than inherit a lock that looks like it helps.
+
+private:
+    IWaterSampler* inner_;
+    std::mutex m_;
 };
 
 // Baked lakes over a `FineTileSampler`.

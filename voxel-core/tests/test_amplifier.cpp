@@ -6,8 +6,12 @@
 #include "voxelcore/biome.h"
 #include "voxelcore/detail_bedding.h" // v12: the overhang/banding phase test
 #include "voxelcore/generator.h"
-#include "voxelcore/lakes.h" // IWaterSampler: amplifier.h only forward-declares it
+#include "voxelcore/lakes.h"
+#include "voxelcore/world.h"  // World::setWaterMarker passthrough // IWaterSampler: amplifier.h only forward-declares it
+#include <atomic>
 #include <cstdio>
+#include <thread>
+#include <vector>
 
 
 #include "vxctest.h"
@@ -1196,4 +1200,39 @@ VXC_TEST(water_marker_is_not_carved_by_caves) {
     const int64_t top = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
     for (int64_t vz = top + 1; vz <= top + 25; ++vz)
         CHECK_EQ(Amplifier::materialAt(col, vz), MAT_WATERMARK);
+}
+
+VXC_TEST(locked_water_sampler_forwards_and_serialises) {
+    // The marker is queried from the mesher worker pool, where the "prewarm on
+    // one thread then read from many" contract every real sampler documents
+    // cannot be satisfied -- the streamer picks the columns. This wrapper is
+    // what makes the debug path safe without putting a lock on the near-field
+    // path that the shipping water renderer uses.
+    FlatWaterSampler inner(12345);
+    LockedWaterSampler locked(inner);
+    CHECK_EQ(locked.waterSurfaceMmAtVoxel(1, 2), 12345);
+
+    // Hammer it from several threads; under TSAN or a debug CRT an unguarded
+    // inner would show here, and the values must all be the forwarded one.
+    std::atomic<int> bad{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < 2000; ++i)
+                if (locked.waterSurfaceMmAtVoxel(i, -i) != 12345) ++bad;
+        });
+    for (auto& th : ts) th.join();
+    CHECK_EQ(bad.load(), 0);
+}
+
+VXC_TEST(world_installs_the_marker_without_a_mutable_amplifier) {
+    // vxc::World::amplifier() is const on purpose. The passthrough is the one
+    // narrow door, so a caller cannot reach in and reconfigure worldgen for any
+    // other reason.
+    SyntheticTileSampler tiles(kSeed);
+    World<8> w(kSeed, tiles);
+    CHECK(!w.amplifier().waterMarkerEnabled());
+    FlatWaterSampler water(1000);
+    w.setWaterMarker(&water);
+    CHECK(w.amplifier().waterMarkerEnabled());
 }
