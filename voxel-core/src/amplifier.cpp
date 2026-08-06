@@ -2329,6 +2329,66 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
         static const int64_t kDir[8][2] = {{1, 0},  {-1, 0}, {0, 1},  {0, -1},
                                            {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
         int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+
+        // THE SURFACE DESCENDS AS A RAMP, NOT AS A STAIRCASE.
+        //
+        // The stored surface is ONE value per fine pixel (1875 mm), so on a
+        // descending bed the drawn water is a flat plateau, a hard drop at the
+        // cell boundary, another plateau. The owner's report: "large square
+        // volumes of water are incrementally placed on the slope and the water
+        // level of each jumped awkwardly by several meters each block. real
+        // water on this slope would slope and descend in a smoother manner that
+        // matched the underlying terrain slope."
+        //
+        // So interpolate between the stored samples instead of stepping between
+        // them. Bilinear over the four surrounding pixel centres, weights in
+        // 1/256 to stay integer (this file is integer-only), and DRY neighbours
+        // are dropped with the weights renormalised over the wet ones -- a dry
+        // sample is not a zero, it is an absence, and averaging it in would drag
+        // the surface into the ground at every bank.
+        //
+        // IT CANNOT TILT STANDING WATER, which is the property that makes this
+        // safe to apply everywhere: on a lake all four samples are equal, so any
+        // convex combination of them is that same value. The interpolation is
+        // self-cancelling exactly where a slope would be wrong, and only bites
+        // where the samples genuinely differ.
+        // tilestore.h's finePixelMm(16). Named here rather than called because
+        // this is a hot path and the scale is fixed for the baked fine tier.
+        constexpr int64_t kFinePixelMm = 1875;
+        if (baked != kNoWaterMarkerMm) {
+            const int64_t vxMm = vx * int64_t(kVoxelSizeMm);
+            const int64_t vyMm = vy * int64_t(kVoxelSizeMm);
+            const int64_t wpx = floorDiv(vxMm - kFinePixelMm / 2, kFinePixelMm);
+            const int64_t wpy = floorDiv(vyMm - kFinePixelMm / 2, kFinePixelMm);
+            // Offset of this voxel from the (px,py) sample centre, in 1/256 of a
+            // pixel. Both are in [0,256) by construction of the floorDiv above.
+            const int64_t wx =
+                ((vxMm - (wpx * kFinePixelMm + kFinePixelMm / 2)) * 256) / kFinePixelMm;
+            const int64_t wy =
+                ((vyMm - (wpy * kFinePixelMm + kFinePixelMm / 2)) * 256) / kFinePixelMm;
+
+            auto sampleAtPixel = [&](int64_t sx, int64_t sy) {
+                const int64_t cx = (sx * kFinePixelMm + kFinePixelMm / 2) / int64_t(kVoxelSizeMm);
+                const int64_t cy = (sy * kFinePixelMm + kFinePixelMm / 2) / int64_t(kVoxelSizeMm);
+                return waterMarker_->waterSurfaceMmAtVoxel(cx, cy);
+            };
+            const int32_t s00 = sampleAtPixel(wpx, wpy);
+            const int32_t s10 = sampleAtPixel(wpx + 1, wpy);
+            const int32_t s01 = sampleAtPixel(wpx, wpy + 1);
+            const int32_t s11 = sampleAtPixel(wpx + 1, wpy + 1);
+
+            const int64_t w00 = (256 - wx) * (256 - wy);
+            const int64_t w10 = wx * (256 - wy);
+            const int64_t w01 = (256 - wx) * wy;
+            const int64_t w11 = wx * wy;
+
+            int64_t acc = 0, wsum = 0;
+            if (s00 != kNoWaterMarkerMm) { acc += int64_t(s00) * w00; wsum += w00; }
+            if (s10 != kNoWaterMarkerMm) { acc += int64_t(s10) * w10; wsum += w10; }
+            if (s01 != kNoWaterMarkerMm) { acc += int64_t(s01) * w01; wsum += w01; }
+            if (s11 != kNoWaterMarkerMm) { acc += int64_t(s11) * w11; wsum += w11; }
+            if (wsum > 0) baked = static_cast<int32_t>(acc / wsum);
+        }
         for (int64_t step = 1; step <= waterMarkerFillPx_ && baked == kNoWaterMarkerMm; ++step) {
             for (int d = 0; d < 8; ++d) {
                 const int32_t neighbourMm = waterMarker_->waterSurfaceMmAtVoxel(
