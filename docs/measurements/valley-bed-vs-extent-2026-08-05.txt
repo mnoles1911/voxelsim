@@ -1,0 +1,156 @@
+STAGE 0: IS THERE A BED FOR THE RIVER? -- measured 2026-08-05
+==============================================================
+
+TWO QUESTIONS, ONE ANSWERED CLEANLY AND ONE ANSWERED, THEN RETRACTED, THEN
+ANSWERED AGAIN. Read the retraction: the first answer was wrong in DIRECTION,
+not merely in magnitude, and the way it was wrong is reusable.
+
+--------------------------------------------------------------------------------
+PART 1 -- THE TERRAIN. Settled: the valley form is the source's, and the bake's
+net contribution to channel geometry is small.
+--------------------------------------------------------------------------------
+
+All four bake stages dumped over one 1920 m window on tile (-4,-4) via
+dump_stage_heightfields.py --bake --stages, so every number is on the SAME
+1.875 m lattice with no interpolation anywhere.
+
+  per-stage vertical change, metres, positive = surface moved DOWN, channel cells
+
+        B2d incision      S1f -> S1b     p50  20.90   p90  25.00   p99  25.00
+        B3  relax         S1b -> B3      p50  -0.12   p90   1.93
+        B4+B4b+B5         B3  -> FINAL   p50 -12.60   p90  -5.02
+        NET vs carrier    S1a -> FINAL   p50   3.41   p90  14.42
+
+  INCISION IS CAP-BOUND OVER MOST OF THE NETWORK. p90 and p99 both sit exactly
+  at 25.00 m, incise.py's cap_m. The cap, not the physics, sets the depth on the
+  majority of channel cells.
+
+  THE LATER STAGES PUT 12.6 m BACK of the 20.9 m cut. The shipped channel is the
+  residue of two large opposing operations. Anything tuned against the incision
+  depth is not tuning the shipped surface.
+
+  OFF-NETWORK CONTROL, same lattice, no interpolation:
+        net S1a -> FINAL, non-channel   p50  0.02 m
+        net S1a -> FINAL, channel       p50  3.41 m
+
+  Off the network the bake reproduces its own carrier to 2 cm. The broad valley
+  form is the SOURCE's and is preserved. There is no missing lateral erosion in
+  the sense of "the valleys are the wrong shape". No terrain re-bake is
+  indicated by anything in this file.
+
+--------------------------------------------------------------------------------
+PART 2 -- THE WIDTH. RETRACTED AND RE-MEASURED.
+--------------------------------------------------------------------------------
+
+FIRST ANSWER (WRONG): "the terrain offers 11.2 m, the law asks 9.0 m, the bake
+draws 3.8 m -- the extent rule leaves 3x the room unused."
+
+HOW IT WAS WRONG. The transects were taken perpendicular to a hand-walked trunk
+path, and the path was built from d8_receivers(fill_depressions(SHIPPED
+surface)). The bake accumulated discharge on a DIFFERENT surface -- the B2a
+fill, before meso, refill and reopen-basins. So the walked path is not the path
+the water took, and the transects were not reliably perpendicular to flow. An
+oblique transect inflates width by 1/cos.
+
+HOW IT WAS CAUGHT. Discharge along that path swung over seven orders of
+magnitude (1.2e6 -> 77 -> 7.1e6 -> 2.0e7 -> 281 -> 2.7e7 -> ... -> 9.7e7 m3/yr)
+and DECREASED downstream on 13.6% of steps. Discharge cannot decrease along a
+true D8 path. The path was wrong, not the world.
+
+SECOND ANSWER, using the bake's own instrument. `water.lateral_extent_stats`
+samples wet cells and steps perpendicular to EACH CELL'S OWN D8 receiver -- no
+path walking, so the failure above cannot occur. Receivers from
+d8_receivers(shipped surface), no fill, which is the call pipeline.py:4785
+makes. "drawn" comes from the same function with a substitute ground field that
+is -inf on drawn-wet cells and +inf elsewhere, so its `ground <= water` test
+becomes exactly "is this cell drawn" -- same geometry, same sampling, no
+reimplementation.
+
+  wet alpine block, bake_ver 13, 20,000 sampled transects per tile, metres
+
+    tile      stat     p50    p90    p95    p99     law p50   drawn/law p50
+    -4,-4     drawn   18.8   58.3   78.8  123.8       1.5        11.25
+              room    24.4   86.2  125.6  166.9                  (room 13.75)
+    -5,-5     drawn   16.9  103.3  157.5  241.9       1.5        10.00
+              room    20.6  138.8  170.6  241.9                  (room 12.50)
+    -3,-4     drawn   28.1   73.1   90.0  138.8       1.5        17.50
+              room    37.5   90.0  123.8  165.0                  (room 22.50)
+
+  THE DRAWN RIVER IS 10-17x WIDER THAN THE LAW, NOT NARROWER. The bake's own
+  overshoot gate `ratio_over_4_frac` fires on 79.9%, 80.8% and 87.5% of sampled
+  cells on the three tiles.
+
+  The extent rule uses 75-82% of the room available to it (drawn/room p50), not
+  a third. The room is not going unused.
+
+RECONCILING THIS WITH water-deep-dive-brief 4.1, WHICH SAYS THE OPPOSITE. Both
+are right; they are different populations.
+
+  * 4.1 measures the CENTRELINE at km 20 of one composed reach, where Q is high:
+    law 18.2 m, drawn 3.75 m. Too NARROW.
+  * This measures the p50 over 20,000 randomly sampled wet cells, where the
+    median wet cell is a sub-perennial headwater whose law width is FLOORED at
+    1.5 m (water-wet-country-2026-08-05.md makes the same point about depth:
+    "the median wet cell in both regions is a sub-perennial headwater at the
+    floor, not a river"). Too WIDE, by 10-17x.
+
+  So the drawn width is roughly 20 m EVERYWHERE: far too wide at headwaters, too
+  narrow at trunks. THE DEFECT IS THAT DRAWN WIDTH BARELY TRACKS DISCHARGE AT
+  ALL -- which is exactly what Spearman(drawn width, Q) = +0.457 against
+  Spearman(law width, distance) = +0.728 already said, now with the two ends of
+  the distribution measured separately.
+
+  The cause is structural: `fill_to_local_surface` decides extent by asking how
+  much ground lies below the local water surface. That is a property of terrain
+  flatness, which is roughly scale-free, not of river size. Discharge enters only
+  through the water surface's own height, which moves as Q^0.352 -- far too
+  weakly to shape the width.
+
+--------------------------------------------------------------------------------
+WRONG TURNS, recorded so they are not repeated
+--------------------------------------------------------------------------------
+
+  1. COMPARING THE BAKED SURFACE AGAINST BILINEAR 30 m SOURCE IS USELESS HERE.
+     It gave an 8.6 m "notch". But bilinear over a 30 m grid sits ABOVE a
+     sub-pixel apex on concave ground and BELOW it on convex ground, and
+     channel/non-channel splits almost perfectly along concave/convex -- so the
+     sign pattern that looks like incision is what interpolation bias produces
+     anyway. The loose bound on that bias was 9.1 m p50 on channel cells, the
+     same order as the signal. Only the same-lattice stage dump can separate them.
+
+  2. dump_stage_heightfields.py's "S1" IS NOT THE SHIPPED SURFACE. It is the
+     B3.relaxed stage sink; B4 meso, B4b refill and B5 reopen_basins all run
+     after it and together move the channel 12.6 m. Taking it as the bake output
+     put the ground ~7 m too low and inflated water depth from 0.90 m to 7.60 m,
+     which is how it was caught -- 7.60 m contradicts the 0.6 m in
+     water-wet-country-2026-08-05.md. The tool's docstring ("S1 after B3 thermal
+     relaxation (= the bake)") was true when written and is now STALE.
+
+  3. HAND-WALKING A TRUNK TO GET FLOW DIRECTION. See Part 2. The bake already
+     has an instrument that takes the perpendicular from each cell's own
+     receiver; use it. This is the third time in this file that reimplementing
+     something the bake already does produced a wrong answer.
+
+--------------------------------------------------------------------------------
+WHAT THIS FILE DOES AND DOES NOT SUPPORT
+--------------------------------------------------------------------------------
+
+  SUPPORTS:
+   * No terrain re-bake, no lateral erosion stage, no shipped bed correction.
+     The valley form is the source's and the net channel slot is 3.4 m.
+   * The extent rule is the target -- but for FAILING TO TRACK DISCHARGE, not
+     for being too tight. It is too wide at headwaters and too narrow at trunks.
+   * `cap_m` binding at p90/p99 is a real terrain-bake finding. Filed, not acted
+     on; it is not a water defect.
+
+  DOES NOT SUPPORT:
+   * Any claim that the terrain lacks room. It does not.
+   * Any claim about the discharge-loss mechanism (trunks reading 0.041 m3/s
+     against 3.95e8 m3/yr injected). That is a SEPARATE mechanism, on other
+     tiles, and nothing here measures it. Tile (-4,-4)'s own trunk grows
+     0.039 -> 3.08 m3/s and looks healthy.
+
+  Tiles: wet alpine block, seed 20260719, provider
+  terrain-diffusion-unlabeled-80b9ca451a23eae4, cache root D:/vox-wet-cache,
+  npz dumps D:/vox-wet-npz. Fine namespaces -ba9c62170 (bake_ver 13) and
+  -b10cf6d2c (bake_ver 14) differ in one header byte and share elevation.

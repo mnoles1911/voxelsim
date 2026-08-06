@@ -1209,6 +1209,27 @@ class BakeConstants:
     #: ``bridge_to_face_contact``'s docstring were taken.
     water_face_contact_bridge: bool = True
 
+    #: Inject the DISCHARGE currency where the parent's flow crosses into the
+    #: SHIPPED INTERIOR, instead of where it crosses into the padded domain.
+    #: The fix for HYDROLOGY_RESIDUALS #7 -- see `_edge_entries`' own docstring
+    #: for the geometry and the bounded double count it accepts.
+    #:
+    #: WATER ONLY, BY CONSTRUCTION. The AREA currency keeps the padded-rim
+    #: crossings, so `acc` is unchanged, so `A^m` is unchanged, so the incision
+    #: and every shipped elevation byte are unchanged. This constant may
+    #: therefore roll `bake_ver` and must never roll `TERRAIN_VERSION`;
+    #: tools/verify_water_only_change.py is what proves it did not.
+    #:
+    #: IT DELIBERATELY BREAKS THE "ONE SET OF CROSSINGS, TWO CURRENCIES"
+    #: INVARIANT at the B2c call site, and that is the trade to watch. With this
+    #: on, a cell can carry a discharge whose matching upstream AREA never
+    #: arrived -- the water says "big river" where the ground was incised for a
+    #: small one. That is the honest state of affairs (#7 loses area too) but it
+    #: means channel geometry and channel water are no longer derived from the
+    #: same boundary condition, which is exactly the class of drift
+    #: `_edge_entries` was split out to prevent. Measure both.
+    water_inject_at_interior_rim: bool = False
+
     #: The extent rules ``water_extent_mode`` may name, in the order they
     #: shipped. A ClassVar so it is not itself a constant, and a tuple so a
     #: typo in a config is a refusal at construction rather than a bake that
@@ -1389,6 +1410,11 @@ class BakeConstants:
         "water_extent_mode",
         "water_plane_enabled",
         "water_face_contact_bridge",
+        # PRODUCT, not payload: it moves the discharge currency only. The area
+        # currency, and therefore every height, is untouched -- which is the
+        # whole point of the constant and is what verify_water_only_change.py
+        # checks.
+        "water_inject_at_interior_rim",
     )
 
     def product_payload(self) -> dict:
@@ -3067,8 +3093,31 @@ def _edge_entries(
     src: FlowSuperblock,
     d8_fn: Callable,
     entry_mode: str = ENTRY_FOOTPRINT,
+    target_slice: "slice | None" = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """WHERE the parent's through-flow crosses into the child. Geometry only.
+
+    ``target_slice`` names the rectangle (same slice on both axes) the water
+    must be delivered INTO, as indices of ``child_z``. None means the whole
+    child array, which is the PADDED domain and is the historical behaviour.
+
+    PASSING THE INTERIOR HERE IS THE FIX FOR HYDROLOGY_RESIDUALS #7. With the
+    default, an entry cell is one outside the padded domain draining in -- so a
+    stream can enter the padded domain, run its whole downstream path through
+    the 960 m apron, and leave again without ever crossing the tile that ships.
+    Measured on (-7,-5): 3.95e8 m^3/yr injected, 3.59e8 converging into one
+    padded stream, and 1.30e6 in the interior. See
+    docs/measurements/f6-pyramid-delivers-to-apron-2026-08-05.txt.
+
+    THE DOUBLE COUNT THIS INTRODUCES, and why it is accepted rather than
+    engineered around. With a target inside the child, an entry cell can lie in
+    the APRON, and the parent's accumulation there already includes the apron's
+    own local runoff -- which the child ALSO generates and routes inward. That
+    water is counted twice. Bounded by the apron's local yield: 62.7 km^2 of
+    apron at (-7,-5)'s 5.7 mm/yr is 3.6e5 m^3/yr against 3.95e8 injected, i.e.
+    0.1%. Removing it means suppressing the child's own source in the apron,
+    which would change the accumulation the incision reads and so could not stay
+    water-only. Measured, small, and stated rather than hidden.
 
     Returns ``(src_flat, child_flat)`` -- for each boundary crossing, the flat
     index of the PARENT cell whose accumulation crosses, and the flat index of
@@ -3114,14 +3163,24 @@ def _edge_entries(
     sox, soy = src.origin_m
     sh, sw = src.acc.shape
     ox, oy = child_origin_m
-    x1 = ox + w * child_cell_m
-    y1 = oy + h * child_cell_m
+    # The TARGET rectangle in child indices. `ox`/`oy` stay the padded origin
+    # below, because the deposit index still addresses the padded array; only
+    # the "is this inside" test and the footprint clamp move.
+    if target_slice is None:
+        ti0, ti1, tj0, tj1 = 0, h, 0, w
+    else:
+        ti0, ti1 = int(target_slice.start), int(target_slice.stop)
+        tj0, tj1 = ti0, ti1
+    tx0 = ox + tj0 * child_cell_m
+    ty0 = oy + ti0 * child_cell_m
+    x1 = ox + tj1 * child_cell_m
+    y1 = oy + ti1 * child_cell_m
 
-    # Parent cells whose CENTRE lies inside the child extent.
+    # Parent cells whose CENTRE lies inside the target extent.
     cx = sox + (np.arange(sw, dtype=np.float64) + 0.5) * scell
     cy = soy + (np.arange(sh, dtype=np.float64) + 0.5) * scell
-    inside_x = (cx >= ox) & (cx < x1)
-    inside_y = (cy >= oy) & (cy < y1)
+    inside_x = (cx >= tx0) & (cx < x1)
+    inside_y = (cy >= ty0) & (cy < y1)
     inside = inside_y[:, None] & inside_x[None, :]
     if not inside.any():
         return empty
@@ -3149,8 +3208,11 @@ def _edge_entries(
         j1 = int(np.ceil((sox + (sj + 1) * scell - ox) / child_cell_m))
         i0 = int(np.floor((soy + si * scell - oy) / child_cell_m))
         i1 = int(np.ceil((soy + (si + 1) * scell - oy) / child_cell_m))
-        i0, i1 = max(0, i0), min(h, i1)
-        j0, j1 = max(0, j0), min(w, j1)
+        # Clamp to the TARGET rectangle, not merely to the array: a parent cell
+        # straddling the target's edge must deposit inside it, never in the
+        # margin the target was chosen to exclude.
+        i0, i1 = max(ti0, i0), min(ti1, i1)
+        j0, j1 = max(tj0, j0), min(tj1, j1)
         if i0 >= i1 or j0 >= j1:
             continue
         window = child_z[i0:i1, j0:j1]
@@ -4057,9 +4119,30 @@ def bake_padded_domain(
         )
         inflow = _scatter_entries(_entries, inflow_source.acc, filled.shape)
         if inflow_source.q is not None:
-            inflow_q = _scatter_entries(
-                _entries, inflow_source.q, filled.shape, dtype=np.float64
-            )
+            if consts.water_inject_at_interior_rim:
+                # HYDROLOGY_RESIDUALS #7. A SECOND set of crossings, taken
+                # against the shipped interior rather than the padded domain,
+                # so the water is delivered into the tile instead of onto the
+                # apron it then drains out of. The area currency above keeps
+                # the padded-rim crossings untouched, which is what keeps this
+                # change water-only. See the constant's own note for the
+                # invariant this trades away.
+                _q_entries = _edge_entries(
+                    child_z=filled,
+                    child_origin_m=geom.padded_origin_m(tile_x, tile_y),
+                    child_cell_m=cell_m,
+                    src=inflow_source,
+                    d8_fn=kernels.d8_receivers,
+                    target_slice=geom.interior(),
+                )
+                inflow_q = _scatter_entries(
+                    _q_entries, inflow_source.q, filled.shape, dtype=np.float64
+                )
+                del _q_entries
+            else:
+                inflow_q = _scatter_entries(
+                    _entries, inflow_source.q, filled.shape, dtype=np.float64
+                )
         del _entries
     # accumulate_mfd returns float64 m^2. Incision consumes it at full width;
     # the STORED field is narrowed to float32 (measured to agree to 2 ppm, and
@@ -4765,6 +4848,18 @@ def bake_tile(
                 else 0.0
             ),
         })
+        # THE INTERIOR DISCHARGE MAXIMUM, which is the number HYDROLOGY_RESIDUALS
+        # #7 turns on and which nothing reported until now. `water_q_max_m3_yr`
+        # above is the PADDED maximum, and the gap between the two IS the
+        # residual: on (-7,-5) it was 3.59e8 padded against 1.30e6 interior, a
+        # stream that converged inside the apron and drained back out without
+        # ever crossing the tile that ships. Discharge only increases
+        # downstream, so padded >> interior cannot be dispersion.
+        water_stats["water_q_interior_max_m3_yr"] = float(discharge.max())
+        water_stats["water_q_apron_loss_ratio"] = (
+            float(head_stats["q_max_m3_yr"]) / float(discharge.max())
+            if float(discharge.max()) > 0.0 else 0.0
+        )
         water_stats.update({f"water_{k}": v for k, v in width_stats.items()})
         if wet_int.any():
             # THE ACCEPTANCE STATISTIC FOR bake_ver 14, on the shipped interior.

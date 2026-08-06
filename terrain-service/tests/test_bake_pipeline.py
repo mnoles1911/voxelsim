@@ -2942,3 +2942,89 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     z, water = _diagonal_reach(n)
     st = pipeline._water.face_contact_stats(water, z)
     assert st["contact_face_components"] == float(n)
+
+
+def _staircase_parent(n=6, cell=40.0):
+    """Parent that drains strictly east, with a distinguishable accumulation."""
+    return pipeline.FlowSuperblock(
+        level=0, sx=0, sy=0, tiles_per_side=1, cell_m=cell, origin_m=(0.0, 0.0),
+        acc=np.tile(np.arange(1, n + 1, dtype=np.float32), (n, 1)) * 1000.0,
+        filled=np.tile(
+            np.arange(n, 0, -1, dtype=np.float32) * 10.0, (n, 1)),
+        missing_tiles=(),
+        q=np.tile(np.arange(1, n + 1, dtype=np.float64), (n, 1)) * 7.0,
+    )
+
+
+def test_target_slice_none_matches_the_full_slice():
+    """The default must be exactly the historical behaviour.
+
+    Not a tautology: `target_slice=None` and `slice(0, n)` travel different
+    branches, and if they disagreed every shipped tile would move the day the
+    parameter was added.
+    """
+    src = _staircase_parent()
+    child = np.zeros((12, 12), np.float32)
+    child[5, 5] = -1.0
+    common = dict(child_origin_m=(0.0, 0.0), child_cell_m=20.0, src=src,
+                  d8_fn=ref_d8)
+    a = pipeline.inject_edge_inflow(child_z=child, **common)
+    b = pipeline._scatter_entries(
+        pipeline._edge_entries(child_z=child, target_slice=slice(0, 12),
+                               **common),
+        src.acc, child.shape)
+    assert np.array_equal(a, b)
+
+
+def test_target_slice_delivers_into_the_inner_rect_not_onto_its_edge():
+    """HYDROLOGY_RESIDUALS #7: crossings taken against the INTERIOR.
+
+    With the default, an entry cell is one outside the whole child. Restricted
+    to the inner rectangle, the crossing moves inward -- which is the entire
+    content of the fix, and the reason a stream that only ever runs through the
+    apron stops being counted as if it had reached the tile.
+    """
+    src = _staircase_parent()
+    child = np.zeros((12, 12), np.float32)
+    # A thalweg inside the footprint of parent cell (row 2, col 2).
+    child[5, 4] = -1.0
+    inner = slice(4, 8)  # world [80, 160) on both axes
+    entries = pipeline._edge_entries(
+        child_z=child, child_origin_m=(0.0, 0.0), child_cell_m=20.0,
+        src=src, d8_fn=ref_d8, target_slice=inner)
+    got = pipeline._scatter_entries(entries, src.acc, child.shape)
+
+    # Parent cells whose centre is inside [80,160) are rows/cols {2,3}. The
+    # staircase drains east, so the crossings are (2,1) and (3,1) -- and NOT
+    # (2,2)->(2,3), whose receiver's area is already inside.
+    assert got.sum() == pytest.approx(src.acc[2, 1] + src.acc[3, 1])
+    # EVERY deposit lands inside the target rectangle.
+    ys, xs = np.nonzero(got)
+    assert ys.min() >= inner.start and ys.max() < inner.stop
+    assert xs.min() >= inner.start and xs.max() < inner.stop
+    # And it found the thalweg rather than smearing across the footprint.
+    assert got[5, 4] == pytest.approx(src.acc[2, 1])
+
+
+def test_interior_rim_injection_moves_discharge_but_not_area():
+    """The constant is water-only by construction; assert it, do not assume it.
+
+    The area currency must keep the padded-rim crossings so `acc`, and
+    therefore `A^m` and every shipped height, cannot move.
+    """
+    src = _staircase_parent()
+    child = np.zeros((12, 12), np.float32)
+    child[5, 4] = -1.0
+    common = dict(child_origin_m=(0.0, 0.0), child_cell_m=20.0, src=src,
+                  d8_fn=ref_d8)
+    padded = pipeline._edge_entries(child_z=child, **common)
+    inner = pipeline._edge_entries(child_z=child, target_slice=slice(4, 8),
+                                   **common)
+    area_padded = pipeline._scatter_entries(padded, src.acc, child.shape)
+    q_padded = pipeline._scatter_entries(inner, src.q, child.shape,
+                                         dtype=np.float64)
+    # The two currencies now enter at DIFFERENT cells. That is the invariant
+    # `water_inject_at_interior_rim` knowingly trades away; pinning it here so
+    # the trade stays visible rather than becoming folklore.
+    assert np.nonzero(area_padded)[0].tolist() != np.nonzero(q_padded)[0].tolist()
+    assert q_padded.sum() == pytest.approx(src.q[2, 1] + src.q[3, 1])

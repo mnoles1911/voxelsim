@@ -1,0 +1,159 @@
+F6: THE PYRAMID DELIVERS WATER ONTO THE TILE'S EDGE, NOT INTO IT
+================================================================
+Measured 2026-08-05 on tile (-7,-5), bake_ver 14, seed 20260719.
+
+This is a SECOND measurement of a mechanism the codebase already names and
+already measured once: `pipeline.HYDROLOGY_RESIDUALS` #7, which flags itself as
+"SEPARATE FROM CARRIED DISCHARGE (task #49), AND NOW THE BINDING ONE". The value
+here is the magnitude -- on (-14,-5) it cost a factor of 6, here it costs 276 --
+and a second currency showing the same loss independently.
+
+THE MECHANISM, restated. `_edge_entries` finds parent cells that are OUTSIDE the
+child and drain INTO it. "The child" is the PADDED domain, whose border is 960 m
+outside the interior that ships. A stream can therefore enter the padded domain,
+run its whole downstream path through the apron, and leave again without ever
+crossing the tile that ships. Nothing is lost numerically; the water is
+delivered to the wrong 960 m.
+
+--------------------------------------------------------------------------------
+DISCHARGE CURRENCY
+--------------------------------------------------------------------------------
+
+  From the bake's own honesty flags (bake_tile stats, this run):
+
+    water_q_inflow_carried                1        real discharge, NOT the proxy
+    water_q_inflow_m3_yr                  3.94646e8
+    water_q_inflow_entry_cells            586
+    water_q_inflow_implied_runoff_mm_yr   349.4    a healthy wet catchment
+    water_q_max_m3_yr                     3.58669e8   <- PADDED domain maximum
+    water_q_drawable_m3_yr                552496
+
+  From the shipped tile (D:/vox-trunk-npz/-7_-5.npz, interior 8192^2):
+
+    discharge_m3_yr max                   1.303623e6  <- INTERIOR maximum
+                                          = 0.041 m3/s
+
+  3.95e8 injected -> 3.59e8 converges into one padded stream (91% of it) ->
+  1.30e6 in the interior. A 276x drop.
+
+  DISCHARGE ONLY INCREASES DOWNSTREAM. A 276x fall from the padded maximum to
+  the interior maximum cannot be dispersion, dilution or averaging. It is proof
+  that the entire downstream path of that 3.59e8 stream stays in the apron.
+
+  The pyramid is NOT at fault and neither is task #49. The level-0 superblock
+  (-2,-2) covering this tile carries discharge (q max 8.418e8 m3/yr = 26.7
+  m3/s), the carried flag is 1, and the implied catchment runoff of 349 mm/yr is
+  exactly what a real upstream catchment should look like. The water is
+  computed, carried, and handed over correctly. It is handed over 960 m too far
+  out.
+
+--------------------------------------------------------------------------------
+AREA CURRENCY -- the same loss, independently
+--------------------------------------------------------------------------------
+
+  SINGLE RUN, both numbers from the same bake -- no cross-run inference:
+
+    injected_inflow_km2                   1129.64  km2 injected at the padded rim
+    INTERIOR max accumulation             227.38   km2
+    tile area                             235.9    km2
+    ratio                                 4.97x
+
+  THIS ALSO VALIDATES THE DISCHARGE CHAIN ABOVE. The re-bake's interior max
+  accumulation is 227.38 km2 and the shipped npz's is 2.27381e8 m2 = 227.38 km2
+  -- identical. So this bake reproduces the shipped tile, and the interior
+  discharge maximum of 1.304e6 m3/yr read from that npz is this run's interior
+  maximum too. The padded (3.587e8) and interior (1.304e6) figures are therefore
+  the same bake, demonstrated rather than assumed.
+
+  WHY THE TWO CURRENCIES LOSE BY DIFFERENT FACTORS (4.97x vs 276x) WITHOUT
+  DISAGREEING. The interior's largest catchment, 227.38 km2, is essentially the
+  tile's own area of 235.9 km2 -- i.e. entirely self-generated, with the
+  imported 1,129 km2 contributing nothing. The area ratio looks milder only
+  because the tile makes a lot of its own area. Discharge has no such floor on
+  an arid tile (local runoff ~5.7 mm/yr), so the same geometric failure shows
+  its true size there. One mechanism, two views.
+
+  The interior's largest catchment is essentially the tile's own area. Over a
+  thousand km2 of imported catchment arrives at the padded rim and none of it
+  reaches the shipped interior.
+
+  This matters beyond water: accumulation drives incision through A^m, so #7
+  understates the TERRAIN's channel network too, not only its water.
+
+--------------------------------------------------------------------------------
+WHY THIS TILE IS THE ONE
+--------------------------------------------------------------------------------
+
+  basin_cells_frac        0.1339     13.4% of the tile is depression
+  basins_registered       139        (64 classified lake)
+  max_basin_run_m         4239.4
+
+  survey_world_water.py's docstring: the largest accumulation ON LAND in this
+  world is 14.2 m3/s draining 1,960 km2, and its lower reaches cross tiles that
+  are 10-40% filled depression. (-7,-5) is one of them at 13.4%. Tiles that
+  already baked large rivers are 0.3-2.4% filled.
+
+  Two other numbers from this bake worth carrying:
+
+    water_undrawn_perennial_frac   0.568   57% of the perennially-wet network
+                                           is below the raster's drawable width
+    water_width_added_frac         0.910   91% of drawn cells come from the
+                                           lateral fill, only 5,759 from the
+                                           centreline
+    water_fill_dry_freeboard_p50_m 348.3   the median cell that drains to a
+                                           channel sits 348 m above it
+
+--------------------------------------------------------------------------------
+FIX SKETCH -- NOT VERIFIED. Do not treat as a result.
+--------------------------------------------------------------------------------
+
+  The residual's own prescription: "a better NUMBER carried across the same seam
+  cannot fix it; the seam has to deliver into the domain rather than onto its
+  edge."
+
+  Compute the crossings against the INTERIOR rectangle instead of the padded
+  one, and inject the discharge currency there. Two properties make it worth
+  measuring first:
+
+   * it is exactly the prescription above, and it is a change of RECTANGLE, not
+     of physics -- `_edge_entries` already takes the child rect as an argument;
+   * IT CAN BE WATER-ONLY. Leave the AREA injection at the padded rim untouched
+     so incision, and therefore the shipped ground, stay bit-identical and
+     TERRAIN_VERSION does not roll. Move only the discharge currency, which
+     rolls bake_ver. tools/verify_water_only_change.py proves the split held.
+
+  RISKS TO MEASURE, not to argue away:
+
+   * the deposit lands where the 30 m parent's D8 says the flow crosses, and the
+     1.875 m interior surface may disagree about which side of an interfluve it
+     is on (residual #3, bounded by one 30 m cell, heals within a few hundred
+     metres -- but the healing distance is now inside the shipped tile);
+   * a stream that genuinely only clips the apron must still contribute nothing;
+   * conservation: inject at the interior rim INSTEAD of the padded rim for the
+     discharge currency, never both, or the same water enters twice;
+   * the apron's own q becomes understated. That is acceptable only because the
+     apron is discarded -- but `overshoot_stats` and the contact gates read the
+     interior, so check none of them silently depend on apron q.
+
+--------------------------------------------------------------------------------
+A TRAP FOUND ON THE WAY
+--------------------------------------------------------------------------------
+
+  `tools/dump_stage_heightfields.py::_coarse_fetch` returns `.elevation` ONLY
+  and discards the climate planes. `bake_tile` without a `climate_fetch` has
+  `padded_climate = None`, so `runoff_field_mm_yr` returns None and the ENTIRE
+  B6 water pass is skipped -- silently, with `water_stats` simply absent rather
+  than zero. Anyone using that tool to investigate water gets a bake with no
+  water in it and no error. Cost one 281 s bake to notice.
+
+REPRODUCING
+
+  Tiles:      D:/vox-trunk-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/
+              000000000135276f/s1   (289 coarse tiles)
+  Superblock: same root, -b8160d45a/000000000135276f/flow0/-2_-2.vxfl
+  Shipped:    D:/vox-trunk-npz/-7_-5.npz
+
+  Load the cached superblock via decode_flow_superblock (it returns
+  (FlowSuperblock, seed) -- a tuple, not a bare superblock), pass BOTH a
+  coarse_fetch and a climate_fetch to bake_tile, and read stats. ~280 s cpu,
+  ~5 GiB peak; do not run two at once.
