@@ -1,4 +1,4 @@
-"""B5: the bake keeps the hole (docs/watershed-system-plan.md item 3, §4.2).
+"""B5: the bake keeps the hole (docs/water-system-architecture.md item 3, §4.2).
 
 Two claims are worth a test here and the rest is covered by test_basins.py:
 

@@ -73,10 +73,6 @@ AREA CURRENCY -- the same loss, independently
   an arid tile (local runoff ~5.7 mm/yr), so the same geometric failure shows
   its true size there. One mechanism, two views.
 
-  The interior's largest catchment is essentially the tile's own area. Over a
-  thousand km2 of imported catchment arrives at the padded rim and none of it
-  reaches the shipped interior.
-
   This matters beyond water: accumulation drives incision through A^m, so #7
   understates the TERRAIN's channel network too, not only its water.
 
@@ -104,10 +100,47 @@ WHY THIS TILE IS THE ONE
                                            channel sits 348 m above it
 
 --------------------------------------------------------------------------------
-FIX SKETCH -- NOT VERIFIED. Do not treat as a result.
+THE FIX, MEASURED. `water_inject_at_interior_rim`, off by default.
 --------------------------------------------------------------------------------
 
-  The residual's own prescription: "a better NUMBER carried across the same seam
+  Crossings taken against the INTERIOR rectangle instead of the padded one, for
+  the DISCHARGE currency only. Both arms in one process, superblock loaded once
+  and shared, so the only difference is the constant.
+
+    tile      metric                    OFF          ON        change
+    -7,-5     interior max Q      1.30362e6   3.91347e8       x300.20
+              = m3/s                  0.041       12.40
+              padded / interior     275.133       1.004
+              drawn cells             45099      118701
+              undrawn perennial       0.568       0.479
+              inflow m3/yr        3.94646e8   3.95458e8        +0.2%
+
+    -14,-5    interior max Q       2.2185e6   1.38127e7         x6.23
+              = m3/s                 0.0703      0.4377
+              padded / interior      5.97228     1.01348
+              drawn cells            120980      139542
+              inflow m3/yr        1.49472e7   1.39647e7        -6.6%
+
+  THE OFF ARM REPRODUCES THE REPO'S OWN INDEPENDENT MEASUREMENT of (-14,-5)
+  exactly. HYDROLOGY_RESIDUALS #7 records "the INTERIOR tops out at 2.22e6",
+  "somewhere in the PADDED domain a cell carries 1.32e7", and "a 6x drop". This
+  harness read 2.2185e6, 1.32495e7 and 5.97. That validates the harness, not
+  just the fix.
+
+  WATER-ONLY, ASSERTED. On both tiles, elevation, accumulation and flow are
+  bit-identical between arms: 0 of 67,108,864 cells differ, max|diff| exactly 0.
+
+  THE INFLOW MOVES IN BOTH DIRECTIONS, AND THAT IS CORRECT. On (-7,-5) it rises
+  0.2% -- the predicted apron double count, estimated at 0.1% beforehand. On
+  (-14,-5) it FALLS 6.6%, because parent cells whose flow crosses the padded rim
+  but never reaches the interior are now correctly excluded. A stream that only
+  clips the apron no longer counts as having reached the tile, which was listed
+  as a risk to watch and is behaving as intended.
+
+  STILL TO DECIDE: whether the default flips. That rolls bake_ver and
+  invalidates every baked water plane in every cache root.
+
+  The residual's own prescription, for the record: "a better NUMBER carried across the same seam
   cannot fix it; the seam has to deliver into the domain rather than onto its
   edge."
 

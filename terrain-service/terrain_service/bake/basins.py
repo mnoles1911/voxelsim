@@ -2,7 +2,7 @@
 
 WHAT THIS IS FOR
 ----------------
-``docs/watershed-system-plan.md`` §4.2-§4.3. The bake fills every depression
+``docs/water-system-architecture.md`` §4.2-§4.3. The bake fills every depression
 into rock (`flow.fill_depressions` at B2a, again at B4b) because *drainage
 enforcement* is a contract the whole downstream cascade depends on. The
 watershed plan re-opens the ones a player would notice, as a final step, and

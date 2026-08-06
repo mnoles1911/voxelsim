@@ -273,7 +273,7 @@ __all__ = [
 #: and drives the superblock MFD at 30 m and 120 m/px, so a per-cell value at
 #: 1.875 m would have no counterpart at the parent levels and parent and child
 #: would route differently -- worsening HYDROLOGY_RESIDUALS #3.
-#: bake_ver 8 -- B5, the basin registry (docs/watershed-system-plan.md item 3).
+#: bake_ver 8 -- B5, the basin registry (docs/water-system-architecture.md item 3).
 #: The bake stops levelling registered depressions into rock and ships a table
 #: describing them. Every baked tile is invalidated; that is expected and
 #: currently cheap.
@@ -817,7 +817,7 @@ class BakeConstants:
 
     # -- B5 basin registry (bake_ver 8) ------------------------------------
     #
-    # docs/watershed-system-plan.md §4.2-§4.3. These DECIDE BAKED BYTES -- a
+    # docs/water-system-architecture.md §4.2-§4.3. These DECIDE BAKED BYTES -- a
     # registered basin is re-opened in the shipped elevation plane -- so they
     # ride bake_identity_payload like every other constant here. Pinned from
     # tools/lake_survey.py's 12-tile sweep (docs/lake-survey/lake-survey.md),
@@ -4456,7 +4456,7 @@ def bake_padded_domain(
         # Depth of every depression B2a levelled into the carrier: the raster
         # bake_tile previously reduced to four scalars and deleted. Kept as a
         # first-class output because it is the LAKE-BED survey the watershed
-        # plan (docs/watershed-system-plan.md) sizes every decision on: where
+        # plan (docs/water-system-architecture.md) sizes every decision on: where
         # a basin was, how deep, and what fill level would flood it. Same
         # bytes ship: this is observability, exposed via STAGE_SINK_FIELDS,
         # never encoded. filled >= fine cell-for-cell (the fill only raises),

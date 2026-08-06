@@ -2,7 +2,7 @@
 
 WHAT THIS MODULE IS FOR
 -----------------------
-`docs/watershed-system-plan.md` item 7 / §4.1. The bake already knows where
+`docs/water-system-architecture.md` item 7 / §4.1. The bake already knows where
 every channel is -- `accumulate_mfd` gives catchment AREA and `flow_plane`
 writes its log2 -- but area is not water. Two catchments of identical area in a
 rainforest and a desert carry wildly different rivers, and until this module

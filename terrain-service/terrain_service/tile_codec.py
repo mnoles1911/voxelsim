@@ -145,7 +145,7 @@ SECTION_ELEV_INDEX = 1
 SECTION_ELEV_DATA = 2
 SECTION_FLOW_INDEX = 3
 SECTION_FLOW_DATA = 4
-#: The per-tile basin registry (docs/watershed-system-plan.md P1). A tiny
+#: The per-tile basin registry (docs/water-system-architecture.md P1). A tiny
 #: flat table, not a plane: tens of rows at 32 B, so a tile grows by ~1 KB
 #: against 26.6 MB of compressed elevation.
 SECTION_BASIN_TABLE = 5
