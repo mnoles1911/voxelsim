@@ -365,24 +365,30 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 	// possible instance of the thing biomes need next: per-material appearance
 	// in the pooled renderer. If this reads correctly, the same hook generalises
 	// to a real per-id lookup here, where the id survives.
-	const bool bMarker = (!bWater) && (Decoded.MaterialId == 15u);
+	const bool bMarker = (!bWater) && (Decoded.MaterialId == 15u)
+	                     && (VoxelVF.WaterMarkerOpacity >= 0.5f);
 
 	const float ColorR = bWater ? Decoded.CornerHeight : (bMarker ? 1.0f : TerrainTintR);
 	const float ColorB = bWater ? Decoded.TopBoundary : (bMarker ? 0.0f : ChunkClimate.x);
 	const float ColorA = bMarker ? 0.0f : ChunkClimate.y;
 
-	// G carries the marker's OPACITY instead of ambient occlusion, because the
-	// material has no other way to hear about voxel.WaterMarker.Opacity -- it
-	// cannot read this factory's uniform buffer. AO is meaningless on a marker
-	// voxel: the material replaces its base colour with a flat magenta after the
-	// detail multiply, so nothing downstream consumes G for shading here.
+	// G STAYS AMBIENT OCCLUSION, INCLUDING ON MARKER QUADS. It briefly carried
+	// voxel.WaterMarker.Opacity so the material could dither the marker away,
+	// and that was wrong in a way worth recording: the GI pixel path scales G
+	// (`VertexColorWithGI.g *= lerp(1, Ambient, Weight)` below), and the GI
+	// volume only covers about +/-38 m around the camera. So the marker went
+	// see-through EXACTLY when flown close to -- reported as "flying close to
+	// the magenta blocks changes the rendering such that water volume is
+	// transparent and completely see through". Overloading a channel the
+	// renderer already modulates makes the debug signal a function of lighting.
 	//
-	// The material multiplies this into the ring-fade factor ahead of
-	// DitherTemporalAA, so a value below 1 dithers the marker away per pixel and
-	// the volume becomes see-through rather than a solid skin. Reusing the fade
-	// path is deliberate -- it is already Masked with a calibrated
-	// OpacityMaskClipValue, so no blend-mode change and no new translucency cost.
-	const float ColorG = bMarker ? VoxelVF.WaterMarkerOpacity : Decoded.AmbientOcclusion;
+	// Visibility is therefore binary and decided HERE, where the uniform is
+	// readable: below 0.5 the quad simply does not take the sentinel and renders
+	// as ordinary terrain, which is the A/B ("is a magenta shape hiding
+	// landform?") without a re-mesh or a relaunch. Dithered see-through needs a
+	// channel nothing else touches, or a real material parameter; it is not
+	// worth a lighting-dependent instrument.
+	const float ColorG = Decoded.AmbientOcclusion;
 
 	Intermediates.Color = half4(
 		(half)ColorR,

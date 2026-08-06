@@ -186,11 +186,38 @@ public:
         const int64_t s = int64_t(1) << level;
         int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
         for (int i = 0; i < B * B; ++i) {
+            const ColumnSample& col = grid.cols[i];
             const int64_t top0 =
-                floorDiv(grid.cols[i].surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+                floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
             const int64_t lo = floorDiv(top0 - s / 2, s);
             vzMin = lo < vzMin ? lo : vzMin;
             vzMax = lo > vzMax ? lo : vzMax;
+
+            // THE DEBUG WATER MARKER STANDS ABOVE THE SURFACE, so this band has
+            // to reach it or the bricks holding it are never generated.
+            //
+            // This is the other half of the widening Amplifier::surfaceUpperBoundMm
+            // already pays for, and it was missing. The symptom is specific and
+            // was reported exactly: a lake's shoreline draws magenta while its
+            // MIDDLE is see-through, and flying closer makes it worse.
+            //
+            // The asymmetry is the tell. A level-0 brick is 8 voxels = 0.8 m, so
+            // only water within 0.8 m of the bed shares the surface brick and
+            // gets meshed -- the shallow rim. At level 5 a brick spans 8 coarse
+            // cells of 3.2 m = 25.6 m and happens to swallow the whole water
+            // column, so distant lakes look solid. Approaching one swaps coarse
+            // for fine and hollows it out, which reads as chunks failing to load
+            // and is nothing of the kind.
+            //
+            // Costs nothing when the marker is off: waterSurfaceMm is
+            // kNoWaterMarkerMm on every column unless a sampler is installed.
+            if (col.waterSurfaceMm != kNoWaterMarkerMm &&
+                int64_t(col.waterSurfaceMm) > int64_t(col.surfaceMm)) {
+                const int64_t wtop0 =
+                    floorDiv(int64_t(col.waterSurfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
+                const int64_t whi = floorDiv(wtop0 - s / 2, s);
+                if (whi > vzMax) vzMax = whi;
+            }
         }
         bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
         bzMax = static_cast<int32_t>(floorDiv(vzMax, B));

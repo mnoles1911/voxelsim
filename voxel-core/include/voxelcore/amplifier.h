@@ -481,6 +481,10 @@ private:
     mutable std::atomic<int64_t> markerQueried_{0};
     mutable std::atomic<int64_t> markerMarked_{0};
     mutable std::atomic<int64_t> markerAboveGround_{0};
+    // How far the marker's lateral fill searches for a water level, in FINE
+    // PIXELS. See the search in amplifier.cpp: 8 rays, so the cost is 8*N
+    // sampler queries per column and only in a marker session.
+    int64_t waterMarkerFillPx_ = 8;
 };
 
 } // namespace vxc

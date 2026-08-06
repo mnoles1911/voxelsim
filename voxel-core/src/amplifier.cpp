@@ -2264,7 +2264,67 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // sampler composes river plane, lake table and sea datum itself, so there
     // is nothing to decide here.
     if (waterMarker_ != nullptr) {
-        const int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+        // LATERAL FILL AT VOXEL RESOLUTION, not at the water plane's.
+        //
+        // THE PROBLEM, measured: the baked water plane holds ONE wet/dry
+        // decision and ONE surface height per FINE PIXEL -- 1,875 mm
+        // (tile_codec.PIXEL_SIZE_MM[16]) against a 100 mm voxel, so 18.75x
+        // coarser laterally. The waterline can therefore only ever land on a
+        // 1.875 m boundary. Flying it, the owner's report was exactly that:
+        // "the magenta water volumes just stop in very blocky, multi meter
+        // sized, square edges - expectation is that water fills the river bed
+        // and meets the bank at the 10cm per voxel scale."
+        //
+        // It is not the extent rule being timid. `fill_to_local_surface`
+        // already uses 75-82% of the room the terrain offers (§11a F2). It is
+        // the grid that rule runs on.
+        //
+        // THE FIX, and why it is sound rather than a fudge: WATER IS LEVEL. A
+        // column touching a wet cell is under that cell's water if its own
+        // ground is below that surface. So take the highest surface among the
+        // neighbouring samples and let the per-voxel test in stratigraphyAt --
+        // which compares against `col.surfaceMm`, the AMPLIFIED 10 cm ground --
+        // decide where the waterline actually falls. The fill then stops where
+        // the terrain rises through the surface, at voxel resolution, instead
+        // of at a raster boundary.
+        //
+        // IT CANNOT RUN AWAY, and that is the property worth stating. The
+        // surface propagates at most one pixel per query, and a column is only
+        // wet while its ground stays below it -- so a bank higher than the
+        // water stops it dead, and the reach of the fill is a fact about the
+        // terrain rather than a radius anyone tuned.
+        //
+        // 10 cm water is DERIVED, never stored: one fine tile is 15,360 m
+        // across, so a stored 10 cm water raster would be 153,600^2 = 2.4e10
+        // cells per tile. The datum stays coarse and the client resolves it
+        // against the amplified surface -- which is what §6.6 already says the
+        // model is ("baked water is a datum -- a height field the client fills
+        // up to"), and was not true of the code until now.
+        //
+        // A fine pixel is 18.75 voxels, so the offsets are not a whole number
+        // of pixels; +/-19 lands in the adjacent pixel reliably, which is all
+        // this needs.
+        // REACH: one pixel is not enough, measured by eye and reported. A bed
+        // 20 m wide whose wet mask runs down the middle needs the search to
+        // travel far enough to FIND the water body's level, and 1.9 m does not.
+        // Eight rays out to `waterMarkerFillPx_` pixels approximate a disc for
+        // 8*N queries instead of (2N+1)^2 -- 64 against 289 at the default 8,
+        // and the rays are along and diagonal to the axes a channel tends to
+        // run. Debug-only cost: nothing queries this unless the marker is
+        // installed. -VoxelWaterMarkerFillPx tunes it.
+        const int64_t kPixelVoxels = 19; // 1875 mm / 100 mm, rounded up
+        static const int64_t kDir[8][2] = {{1, 0},  {-1, 0}, {0, 1},  {0, -1},
+                                           {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
+        int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+        for (int d = 0; d < 8; ++d) {
+            for (int64_t step = 1; step <= waterMarkerFillPx_; ++step) {
+                const int32_t neighbourMm = waterMarker_->waterSurfaceMmAtVoxel(
+                    vx + kDir[d][0] * step * kPixelVoxels,
+                    vy + kDir[d][1] * step * kPixelVoxels);
+                if (neighbourMm == kNoWaterMarkerMm) continue;
+                if (baked == kNoWaterMarkerMm || neighbourMm > baked) baked = neighbourMm;
+            }
+        }
         // See Amplifier::waterMarkerColumnsMarked. Counted BEFORE the ocean
         // composition so `marked` means "the baked plane had water over this
         // column", which is the thing being judged; a sea-only column would
