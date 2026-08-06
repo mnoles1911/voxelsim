@@ -151,6 +151,55 @@ if (-not (Test-Path (Join-Path $ProjRoot 'Binaries\Win64\UnrealEditor-VoxelEarth
            "Pass -ProjectPath at the checkout that was built.")
 }
 
+# REFUSE A CAPTURE THAT WOULD LINK A STALE GENERATOR.
+#
+# voxel-core is a SEPARATE CMake static library. The UE build only LINKS
+# voxelcore.lib -- nothing in UBT's dependency graph knows about its sources, so
+# `Build.bat` prints "Result: Succeeded" while linking a generator hours out of
+# date, and the failure is not a link error, it is WRONG TERRAIN.
+# VoxelEarth.Build.cs has a guard for this and deliberately makes it a WARNING
+# ("the lib may legitimately be newer than a comment-only edit, and failing the
+# build on a timestamp would be worse than the problem") -- which is the right
+# call for a build and the wrong one for a capture. A warning in a build log
+# does not travel to a capture taken hours later by someone reading a PNG.
+#
+# MEASURED, 2026-08-06, and it cost most of a session: every capture that day
+# linked a voxelcore.lib from the previous night. Marker instrumentation added
+# to amplifier.cpp was silently absent from two consecutive investigations, and
+# the DLL's own timestamp looked fresh throughout -- the DLL is the wrong
+# artefact to check, because amplifier.cpp does not go into it.
+#
+# There is a second trap behind the first: rebuilding voxelcore.lib does NOT
+# relink the DLL, because UBT still sees no changed input. Both are checked.
+$VoxelCoreRoot = Join-Path $Root 'voxel-core'
+$VoxelCoreLib = @(
+    (Join-Path $Root 'build\voxel-core-msvc\Release\voxelcore.lib'),
+    (Join-Path $Root 'build\voxel-core-msvc\voxelcore.lib')
+) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($VoxelCoreLib -and (Test-Path $VoxelCoreRoot)) {
+    $libTime = (Get-Item $VoxelCoreLib).LastWriteTimeUtc
+    $newest = Get-ChildItem $VoxelCoreRoot -Recurse -Include *.cpp, *.h, *.hpp, *.inl -File `
+              -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending |
+              Select-Object -First 1
+    if ($newest -and $newest.LastWriteTimeUtc -gt $libTime) {
+        throw ("REFUSING TO START: voxelcore.lib is STALE (lib $libTime UTC, newest source " +
+               "$($newest.LastWriteTimeUtc) UTC -- $($newest.Name)). This capture would " +
+               "photograph an OUT-OF-DATE GENERATOR while every log line looks healthy, and " +
+               "Build.bat will still say 'Result: Succeeded' because UBT does not track " +
+               "voxel-core's sources. Rebuild it:`n" +
+               "  cmake --build build/voxel-core-msvc --config Release`n" +
+               "Then force a RELINK -- rebuilding the lib alone does not trigger one:`n" +
+               "  touch a file under ue-project/Source/VoxelEarth, then re-run Build.bat")
+    }
+    $dll = Join-Path $ProjRoot 'Binaries\Win64\UnrealEditor-VoxelEarth.dll'
+    if ((Get-Item $dll).LastWriteTimeUtc -lt $libTime) {
+        throw ("REFUSING TO START: UnrealEditor-VoxelEarth.dll is OLDER than voxelcore.lib " +
+               "(dll $((Get-Item $dll).LastWriteTimeUtc) UTC, lib $libTime UTC), so the lib was " +
+               "rebuilt and never linked in. UBT sees no changed input and will not relink on " +
+               "its own. Touch a file under ue-project/Source/VoxelEarth and re-run Build.bat.")
+    }
+}
+
 # THE EDIT LOG PERSISTS ACROSS RUNS AND OVERRIDES -VoxelSpawnAt. This script did
 # not clear it, and voxel-run-flight-leg.ps1 always has (its ground rule 11: a leg
 # measured without clearing it is not cold). The consequence here is worse than a
