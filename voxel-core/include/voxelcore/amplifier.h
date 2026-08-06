@@ -16,12 +16,37 @@
 
 namespace vxc {
 
+// Forward declaration ONLY. lakes.h pulls in tilestore.h, and amplifier.h is
+// included almost everywhere; the marker stores a pointer and calls through it
+// exclusively from the .cpp, so the heavy header stays out of this one.
+class IWaterSampler;
+
+//: The marker's own copy of lakes.h/tilestore.h's `kNoWaterMm`. Mirrored rather
+//: than included for the reason above, and static_asserted equal in
+//: amplifier.cpp so the two cannot drift.
+inline constexpr int32_t kNoWaterMarkerMm = INT32_MIN;
+
+//: Deepest water the marker will bound for. The shipped water plane is int16 at
+//: a 10 mm LSB (tile_codec.WATER_DEPTH_LSB_MM), so no expressible depth exceeds
+//: this. Used by surfaceUpperBoundMm; see the note there for why the bound is a
+//: constant rather than a query.
+inline constexpr int64_t kWaterMarkerMaxDepthMm = 32767 * 10;
+
 struct ColumnSample {
     int32_t surfaceMm = 0;      // terrain surface elevation, mm above sea level
     int32_t topsoilMm = 0;      // layer thickness below surface
     int32_t subsoilMm = 0;      // layer thickness below topsoil
     int32_t bedrockDepthMm = 0; // depth below surface where bedrock begins
     MaterialId surfaceMat = MAT_TOPSOIL; // biome surface material, voxelcore/biome.h
+
+    // DEBUG WATER MARKER (off by default). Absolute mm of the baked water
+    // surface over this column, or kNoWaterMm. Populated only when the
+    // Amplifier has been given a water sampler; `kNoWaterMm` therefore means
+    // BOTH "marker mode is off" and "no water here", which is deliberate --
+    // stratigraphyAt is a static function of (ColumnSample, vz), so the mode
+    // has to ride on the sample rather than widen the signature, exactly as
+    // `cave` and `cavern` do.
+    int32_t waterSurfaceMm = kNoWaterMarkerMm;
 
     // M4 cave pass (voxelcore/caves.h): the tube axes passing near this column,
     // already reduced to the per-voxel test's two numbers. Carried in the
@@ -183,6 +208,27 @@ public:
         : seed_(seed), tiles_(&tiles), id_(nextId()) {}
 
     uint64_t seed() const { return seed_; }
+
+    // --- DEBUG WATER MARKER -------------------------------------------------
+    //
+    // Give the amplifier a water sampler and every column between its ground
+    // and its water surface voxelises as MAT_WATERMARK. Pass nullptr (the
+    // default) and nothing changes -- `waterSurfaceMm` stays kNoWaterMm and
+    // stratigraphyAt takes its historical path.
+    //
+    // AN IWaterSampler RATHER THAN A NEW ITileSampler METHOD, because
+    // CompositeWaterSampler already composes the river plane, the lake table
+    // and the sea datum, and re-deriving any of that here would be a fourth
+    // copy of a shipped fact. `lakes.h:implicitWaterDatumMm` is the same
+    // composition the near-field sweep uses.
+    //
+    // BORROWED, NOT OWNED, and NOT thread-safe to install: set it once during
+    // bring-up, before any worker touches the amplifier. The sampler itself
+    // mutates on query (it decodes blocks lazily), which is why the member is
+    // mutable and why `column()` can stay const.
+    void setWaterMarker(IWaterSampler* sampler) { waterMarker_ = sampler; }
+    IWaterSampler* waterMarker() const { return waterMarker_; }
+    bool waterMarkerEnabled() const { return waterMarker_ != nullptr; }
 
     // Full stratigraphy for the column through voxel (vx, vy).
     ColumnSample column(int64_t vx, int64_t vy) const;
@@ -383,6 +429,8 @@ private:
     uint64_t seed_;
     ITileSampler* tiles_;
     uint64_t id_;
+    // Debug only; nullptr in every shipping configuration. See setWaterMarker.
+    IWaterSampler* waterMarker_ = nullptr;
 };
 
 } // namespace vxc

@@ -47,7 +47,16 @@ PALETTE = [
     ("PERMAFROST",     0.52, 0.51,  0.49,  True),
     ("MUD",            0.22, 0.19,  0.155, False),
     ("CLAY",           0.44, 0.34,  0.26,  False),
-    ("_RESERVED",      0.50, 0.45,  0.40,  False),
+    # DEBUG INSTRUMENT, not world content -- vxc::MAT_WATERMARK. Solid voxels
+    # standing where the bake says water is, so the water model can be judged at
+    # full clipmap range instead of through the near-field renderer's 25.6 m
+    # bubble. Only ever produced under -VoxelWaterMarker=1.
+    #
+    # BIOME_TINT IS FALSE AND THAT IS THE POINT: a tinted marker would take the
+    # surrounding biome colour and stop being legible as a marker. Magenta
+    # because nothing in the natural palette above is anywhere near it, so a
+    # single glance separates "water goes here" from ground.
+    ("WATERMARK",      0.90, 0.00,  0.90,  False),
 ]
 
 PALETTE_WIDTH = 16

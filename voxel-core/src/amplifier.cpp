@@ -2,6 +2,7 @@
 
 #include "voxelcore/biome.h"
 #include "voxelcore/carrier.h"
+#include "voxelcore/lakes.h"   // IWaterSampler, kNoWaterMm -- debug marker only
 
 #include "voxelcore/detail_bedding.h"
 #include "voxelcore/detail_rill.h"
@@ -9,6 +10,12 @@
 #include <atomic>
 
 namespace vxc {
+
+// The marker mirrors kNoWaterMm rather than including lakes.h into
+// amplifier.h (see the forward declaration there). Pin them together.
+static_assert(kNoWaterMarkerMm == kNoWaterMm,
+              "amplifier.h's kNoWaterMarkerMm must equal tilestore.h's kNoWaterMm; "
+              "they are the same sentinel and the marker compares against both");
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -2081,7 +2088,25 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
                                        int64_t vy1) const {
     int64_t lo = 0, hi = 0;
     if (!surfaceBoundsMm(vx0, vy0, vx1, vy1, lo, hi)) return kSurfaceBoundDeclined;
-    return hi;
+    if (waterMarker_ == nullptr) return hi;
+    // DEBUG WATER MARKER BREAKS THIS BOUND'S SOUNDNESS ARGUMENT, so it is paid
+    // for here rather than discovered later. The declaration in amplifier.h
+    // says callers use this as "everything above here is provably air", and
+    // that rests on materialAt being unconditionally MAT_AIR above the surface.
+    // With the marker installed it is not: a column carries solid magenta up to
+    // its water surface. A chunk skipped on the old bound would then be a
+    // stretch of river that simply is not there, appearing and disappearing
+    // with the camera -- which reads as a placement bug and would cost days.
+    //
+    // The widening is a CONSTANT rather than a max over the rect, because a
+    // per-rect water query would cost a block decode on the streaming admission
+    // path this function exists to keep cheap. Water depth is bounded by the
+    // wire format (int16 at 10 mm, tilestore.h), so
+    //     waterSurface <= ground + kWaterMarkerMaxDepthMm
+    // everywhere the plane can express it; the sea is bounded by its own datum.
+    // Conservative, sound, and only ever on in a debug session.
+    const int64_t marked = hi + kWaterMarkerMaxDepthMm;
+    return marked > int64_t(kSeaLevelMm) ? marked : int64_t(kSeaLevelMm);
 }
 
 int64_t Amplifier::surfaceLowerBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
@@ -2235,6 +2260,12 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     ColumnSample col;
     col.surfaceMm = s.surfaceMm;
 
+    // DEBUG WATER MARKER. One query per column, only when installed. The
+    // sampler composes river plane, lake table and sea datum itself, so there
+    // is nothing to decide here.
+    if (waterMarker_ != nullptr)
+        col.waterSurfaceMm = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
+
     // Topsoil deepens with rainfall and thins with slope; +/-25% hash jitter
     // breaks up contour-following layer boundaries. See the constant block for
     // why the slope term is a retained fraction rather than a subtracted depth.
@@ -2379,7 +2410,18 @@ MaterialId Amplifier::stratigraphyAt(const ColumnSample& col, int64_t vz) {
     // sparse, aperiodic and driven by the bake's flow plane, which is the shape
     // that does not have this failure mode.
     const int64_t depthMm = static_cast<int64_t>(col.surfaceMm) - centreMm;
-    if (depthMm < 0) return MAT_AIR;
+    if (depthMm < 0) {
+        // DEBUG WATER MARKER: solid magenta between the ground and the baked
+        // water surface. This is the ONLY place in the amplifier that returns
+        // a non-air material ABOVE a column's own surface, which is why
+        // surfaceUpperBoundMm has to be widened for it -- see the note there.
+        // kNoWaterMm is INT32_MIN, so the comparison is false both when the
+        // marker is off and where there is no water.
+        if (col.waterSurfaceMm != kNoWaterMarkerMm &&
+            centreMm <= static_cast<int64_t>(col.waterSurfaceMm))
+            return static_cast<MaterialId>(MAT_WATERMARK);
+        return MAT_AIR;
+    }
     if (depthMm < col.topsoilMm) return col.surfaceMat;
     if (depthMm < col.topsoilMm + col.subsoilMm) {
         // Coarse subsoil under sandy surfaces; and under a BARE_ROCK surface
@@ -2402,7 +2444,10 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
     // touches either. Refusing MAT_BEDROCK here is the third and last of the
     // independent bedrock guards (caves.h documents the other two) â€” even a
     // mis-tuned constant table cannot punch a hole in the world's floor.
-    if (m == MAT_AIR || m == MAT_BEDROCK) return m;
+    // MAT_WATERMARK joins the early-out: it stands ABOVE the surface, where no
+    // carve can reach, and letting the cave test run on it would be asking a
+    // below-surface predicate about an above-surface voxel.
+    if (m == MAT_AIR || m == MAT_BEDROCK || m == MAT_WATERMARK) return m;
     // MAT_AIR is an enumerator and `m` is a MaterialId variable, so a bare
     // `cond ? MAT_AIR : m` mixes an enumerated and a non-enumerated operand â€”
     // gcc's -Wextra rejects that (clang does not), so name the type explicitly.

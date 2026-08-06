@@ -6,6 +6,7 @@
 #include "voxelcore/biome.h"
 #include "voxelcore/detail_bedding.h" // v12: the overhang/banding phase test
 #include "voxelcore/generator.h"
+#include "voxelcore/lakes.h" // IWaterSampler: amplifier.h only forward-declares it
 #include <cstdio>
 
 
@@ -1093,3 +1094,106 @@ VXC_TEST(amplifier_solid_below_bound_golden_digest) {
     CHECK_EQ(d.h, 0x94F4B64F8B4E95D8ull);
 }
 
+
+// --- DEBUG WATER MARKER -----------------------------------------------------
+//
+// A flat water sampler standing at a fixed absolute height, so the expected
+// answer is arithmetic rather than another copy of the amplifier.
+namespace {
+class FlatWaterSampler final : public IWaterSampler {
+public:
+    explicit FlatWaterSampler(int32_t mm) : mm_(mm) {}
+    int32_t waterSurfaceMmAtVoxel(int64_t, int64_t) override { return mm_; }
+private:
+    int32_t mm_;
+};
+} // namespace
+
+VXC_TEST(water_marker_is_off_until_a_sampler_is_installed) {
+    // The default MUST be bit-identical to no marker at all: every shipping
+    // configuration runs with waterMarker_ == nullptr, and a marker that
+    // altered anything by merely existing would be a worldgen change.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    CHECK(!amp.waterMarkerEnabled());
+    const ColumnSample col = amp.column(1234, -567);
+    CHECK_EQ(col.waterSurfaceMm, kNoWaterMarkerMm);
+    // Above the surface is air, all the way up.
+    const int64_t top = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+    for (int64_t vz = top + 1; vz <= top + 40; ++vz)
+        CHECK_EQ(Amplifier::stratigraphyAt(col, vz), MAT_AIR);
+}
+
+VXC_TEST(water_marker_fills_from_the_ground_to_the_water_surface) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    const ColumnSample dry = amp.column(1234, -567);
+    // Stand the water 5 m above this column's own ground.
+    const int32_t waterMm = dry.surfaceMm + 5000;
+    FlatWaterSampler water(waterMm);
+    amp.setWaterMarker(&water);
+    CHECK(amp.waterMarkerEnabled());
+
+    const ColumnSample col = amp.column(1234, -567);
+    CHECK_EQ(col.surfaceMm, dry.surfaceMm);   // the marker moves no ground
+    CHECK_EQ(col.waterSurfaceMm, waterMm);
+
+    const int64_t top = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+    // The topmost solid ground voxel is untouched...
+    CHECK(Amplifier::stratigraphyAt(col, top) != MAT_AIR);
+    CHECK(Amplifier::stratigraphyAt(col, top) != MAT_WATERMARK);
+    // ...everything from there up to the waterline is marked...
+    int marked = 0;
+    for (int64_t vz = top + 1; vz * kVoxelSizeMm + kVoxelSizeMm / 2 <= waterMm; ++vz) {
+        CHECK_EQ(Amplifier::stratigraphyAt(col, vz), MAT_WATERMARK);
+        ++marked;
+    }
+    CHECK(marked >= 45);   // ~5 m of 10 cm voxels
+    // ...and above the waterline it is air again.
+    const int64_t above = waterMm / kVoxelSizeMm + 2;
+    CHECK_EQ(Amplifier::stratigraphyAt(col, above), MAT_AIR);
+}
+
+VXC_TEST(water_marker_widens_the_sky_band_bound_or_it_would_punch_holes) {
+    // surfaceUpperBoundMm is what lets the streamer skip a chunk as provably
+    // all air. Its soundness rests on materialAt being unconditionally MAT_AIR
+    // above the surface, which the marker breaks. If this bound does not move,
+    // marked chunks get skipped and rivers vanish depending on where the camera
+    // is -- which reads as a placement bug, not a rendering one.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    const int64_t dryBound = amp.surfaceUpperBoundMm(0, 0, 31, 31);
+    if (dryBound == kSurfaceBoundDeclined) return;   // nothing to prove here
+
+    FlatWaterSampler water(0);
+    amp.setWaterMarker(&water);
+    const int64_t wetBound = amp.surfaceUpperBoundMm(0, 0, 31, 31);
+    CHECK(wetBound > dryBound);
+    // And it must bound the deepest water the wire format can express.
+    CHECK(wetBound >= dryBound + kWaterMarkerMaxDepthMm);
+
+    // Every marked voxel in the rect must sit at or below the bound -- the
+    // property the streamer actually relies on.
+    for (int64_t vx = 0; vx < 32; vx += 7)
+        for (int64_t vy = 0; vy < 32; vy += 7) {
+            const ColumnSample col = amp.column(vx, vy);
+            const int64_t topWater = int64_t(col.waterSurfaceMm) / kVoxelSizeMm;
+            CHECK(topWater * kVoxelSizeMm <= wetBound);
+        }
+}
+
+VXC_TEST(water_marker_is_not_carved_by_caves) {
+    // materialAt runs the cave and cavern passes on anything that is not air or
+    // bedrock. A marker voxel stands ABOVE the surface, where a below-surface
+    // carve predicate has no business being asked -- so it early-outs, and this
+    // pins that rather than trusting the carve to decline on its own.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    const ColumnSample dry = amp.column(4096, 4096);
+    FlatWaterSampler water(dry.surfaceMm + 3000);
+    amp.setWaterMarker(&water);
+    const ColumnSample col = amp.column(4096, 4096);
+    const int64_t top = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+    for (int64_t vz = top + 1; vz <= top + 25; ++vz)
+        CHECK_EQ(Amplifier::materialAt(col, vz), MAT_WATERMARK);
+}

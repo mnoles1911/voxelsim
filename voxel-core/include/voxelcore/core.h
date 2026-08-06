@@ -319,6 +319,18 @@ enum Material : MaterialId {
     MAT_MUD = 13,          // ocean floor / future wetland surface
     MAT_CLAY = 14,         // fine sediment; headroom for future
                             // floodplain/riverbank biomes (M4 rounds 2-3)
+    // DEBUG INSTRUMENT, not world content. Solid magenta voxels standing where
+    // the bake says water is, so the water model can be judged at full clipmap
+    // range instead of through the near-field renderer's 25.6 m horizontal /
+    // 12.8 m vertical bubble. Off unless -VoxelWaterMarker=1.
+    //
+    // It is a MATERIAL rather than a render mode because that is what makes it
+    // free: solid voxels go down the terrain path and inherit view distance,
+    // the LOD chain, the greedy mesher and the capture harness with no new
+    // machinery. It is also the one thing in this enum that is SOLID ABOVE THE
+    // SURFACE -- see Amplifier::surfaceUpperBoundMm, whose soundness argument
+    // that argument depends on.
+    MAT_WATERMARK = 15,
     kMaterialCount
 };
 

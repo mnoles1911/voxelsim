@@ -120,6 +120,20 @@ VXC_TEST(mesher_solid_apron_culls_border_faces) {
     CHECK_EQ(mesh(f).size(), size_t(0));
 }
 
+// THE SYNTHETIC BRICKS BELOW MUST NOT TRACK `kMaterialCount`.
+//
+// They drew materials with `% (kMaterialCount - 1)`, so APPENDING a material --
+// which core.h explicitly allows and calls safe -- silently changed the INPUT to
+// the golden digests and failed `mesher_golden_digests_are_stable`. That reads
+// as "the mesher changed" when nothing about the mesher moved; it was
+// MAT_WATERMARK being appended. The golden tests the MESHER, so its input is
+// pinned here instead.
+//
+// 14 is what `kMaterialCount - 1` evaluated to when these digests were
+// recorded (MAT_AIR..MAT_CLAY = 15 entries), so the recorded goldens are
+// unchanged by this.
+inline constexpr uint64_t kMesherTestMaterialSpan = 14;
+
 VXC_TEST(mesher_area_conservation_random_brick) {
     // Total merged quad area per (axis,dir) must equal the brute-force count
     // of visible faces — greedy merging may never create or drop faces.
@@ -129,7 +143,7 @@ VXC_TEST(mesher_area_conservation_random_brick) {
             for (int x = -1; x <= B; ++x) {
                 const uint64_t h = hash3(321, x, y, z, 77);
                 f.at(x, y, z) = (h % 100 < 45)
-                                    ? static_cast<MaterialId>(1 + h / 100 % (kMaterialCount - 1))
+                                    ? static_cast<MaterialId>(1 + h / 100 % kMesherTestMaterialSpan)
                                     : static_cast<MaterialId>(MAT_AIR);
             }
     const auto quads = mesh(f);
@@ -190,7 +204,7 @@ uint64_t goldenDigest(int fillPct, uint64_t salt, size_t* quadCount) {
                 const uint64_t h = hash3(salt, x, y, z, 77);
                 f.at(x, y, z) =
                     (h % 100 < static_cast<uint64_t>(fillPct))
-                        ? static_cast<MaterialId>(1 + h / 100 % (kMaterialCount - 1))
+                        ? static_cast<MaterialId>(1 + h / 100 % kMesherTestMaterialSpan)
                         : static_cast<MaterialId>(MAT_AIR);
             }
     std::vector<Quad> q;
