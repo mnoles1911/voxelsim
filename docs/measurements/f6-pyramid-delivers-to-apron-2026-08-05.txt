@@ -121,6 +121,20 @@ THE FIX, MEASURED. `water_inject_at_interior_rim`, off by default.
               drawn cells            120980      139542
               inflow m3/yr        1.49472e7   1.39647e7        -6.6%
 
+  REGRESSION ARM -- a tile that does NOT suffer #7:
+
+    -4,-4     interior max Q      9.71616e7   9.71616e7         x1.00
+              padded / interior     1.05639     1.05639
+              drawn cells            306437      307991         +0.5%
+              inflow m3/yr         6.0024e7   8.02189e6         -86.6%
+
+  Its apron loss ratio was ALREADY 1.056, i.e. the water was already arriving,
+  and the interior maximum comes out bit-identical. The fix does nothing where
+  nothing was broken. Its inflow falls 87% with no downstream change at all,
+  which is the same honest-accounting effect as (-14,-5): the wet block makes
+  its own river (containment 0.85) and the imported water was never reaching the
+  interior to begin with.
+
   THE OFF ARM REPRODUCES THE REPO'S OWN INDEPENDENT MEASUREMENT of (-14,-5)
   exactly. HYDROLOGY_RESIDUALS #7 records "the INTERIOR tops out at 2.22e6",
   "somewhere in the PADDED domain a cell carries 1.32e7", and "a 6x drop". This

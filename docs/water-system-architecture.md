@@ -735,6 +735,11 @@ loaded once and shared, so the constant is the only difference:
 |---|---|---|---|
 | **-7,-5** | 1.30e6 → **3.91e8** m³/yr (0.041 → **12.40 m³/s**) | 275.1 → **1.004** | 45,099 → 118,701 |
 | **-14,-5** | 2.22e6 → **1.38e7** m³/yr (0.070 → **0.438 m³/s**) | 5.97 → **1.013** | 120,980 → 139,542 |
+| -4,-4 *(control)* | 9.72e7 → **9.72e7**, bit-identical | 1.056 → 1.056 | 306,437 → 307,991 |
+
+The third row is the regression control: a tile whose water was already arriving
+(apron ratio 1.056) comes out with an **identical** interior maximum. The fix
+does nothing where nothing was broken.
 
 12.40 m³/s against the 14.2 m³/s `survey_world_water.py trunk` calls the largest
 accumulation on land: (-7,-5) now carries essentially the whole river.
