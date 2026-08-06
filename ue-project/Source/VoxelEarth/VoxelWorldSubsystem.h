@@ -22,12 +22,38 @@ struct FVoxelWorldImpl;
 // (lock-free), while chunks touched by edits are meshed on the game thread
 // via the overlay-aware World::materialAt. Also hosts dig/place (edit-log
 // authority path) queried by AVoxelEarthPlayerController.
+// Forward declaration only -- this header is UHT-parsed and deliberately sees no
+// voxel-core types, so InstallWaterMarker takes the pointer opaquely.
+//
+// IT MUST STAY ABOVE UCLASS(). UHT requires the class declaration to follow
+// UCLASS() immediately; anything in between is "Found 'namespace' when
+// expecting class while parsing class", which does not name the real problem.
+namespace vxc { class IWaterSampler; }
+
 UCLASS()
 class VOXELEARTH_API UVoxelWorldSubsystem : public UTickableWorldSubsystem
 {
 	GENERATED_BODY()
 
 public:
+	// DEBUG WATER MARKER (-VoxelWaterMarker=1). Makes every column between its
+	// ground and the baked water surface voxelise as MAT_WATERMARK -- solid
+	// magenta -- so water placement can be judged at full clipmap range instead
+	// of through the near-field renderer's 25.6 m horizontal / 12.8 m vertical
+	// bubble.
+	//
+	// CALL ONCE, DURING BRING-UP, BEFORE ANY WORKER TOUCHES THE WORLD. The
+	// brick caches are session-lifetime, so installing later would leave
+	// pre-marker bricks resident beside marked ones. `Sampler` is BORROWED and
+	// must outlive this subsystem; it must also be safe to call from many
+	// threads, because Amplifier::column runs on the mesher pool --
+	// vxc::LockedWaterSampler is what makes an ordinary sampler safe to pass.
+	// `bIncludeOcean` composes the sea datum in, as lakes.h's
+	// implicitWaterDatumMm does for the near-field sweep -- the sampler carries
+	// only baked lakes and rivers, because the ocean is not on the wire. Pass
+	// false to mark inland water only; near a coast a marked ocean fills the
+	// frame and a river shot is unreadable. Pass nullptr to uninstall.
+	void InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean = true);
 	UVoxelWorldSubsystem();
 	// Declared (not defaulted) here and defined in the .cpp: TUniquePtr<FVoxelWorldImpl>'s
 	// destructor needs FVoxelWorldImpl's full definition, which this

@@ -807,6 +807,19 @@ struct FVoxelWaterImpl
 	// dereferences this member on every voxel it is asked about.
 	std::unique_ptr<vxc::IWaterSampler> Water;
 
+	// DEBUG WATER MARKER (-VoxelWaterMarker=1). `Water` above is documented
+	// GAME-THREAD ONLY -- every real sampler decodes lazily on query -- and
+	// Amplifier::column runs on the MESHER WORKER POOL, so the terrain side
+	// cannot borrow `Water` directly without racing its tile decode from many
+	// threads at once. This wraps it behind a mutex; the lock is paid only by
+	// the debug path, never by the near-field sweep.
+	//
+	// DECLARED AFTER `Water` so it is DESTROYED BEFORE it: it holds a raw
+	// reference to the sampler it wraps. And it must outlive the terrain
+	// amplifier's use of it, which is why Deinitialize clears the marker before
+	// this struct goes away.
+	std::unique_ptr<vxc::LockedWaterSampler> MarkerWater;
+
 	// voxel.Water.ImplicitOcean, LATCHED (watershed plan §6.4). Declared before
 	// Mob for the same reason Water is: the ImplicitFn reads it on every voxel
 	// it is asked about.
@@ -1260,10 +1273,51 @@ void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	}
 
 	Impl = MakeUnique<FVoxelWaterImpl>(*Terrain);
+
+	// DEBUG WATER MARKER (-VoxelWaterMarker=1, -VoxelWaterMarkerOcean=0).
+	//
+	// Installed HERE and nowhere else, for three reasons that are all lifetime
+	// or threading rather than taste:
+	//
+	//  * this subsystem already owns the composed lake+river sampler, so the
+	//    marker reuses it instead of standing up a second FineTileSampler over
+	//    the same tiles;
+	//  * Initialize ran InitializeDependency<UVoxelWorldSubsystem> above, so the
+	//    terrain world exists, and both Initializes are well before any mesher
+	//    job -- which matters because the brick caches are session-lifetime and
+	//    a later install would leave unmarked bricks resident beside marked ones;
+	//  * the sampler must be reachable from worker threads, which `Water` is
+	//    not. LockedWaterSampler is what makes it so.
+	int32 MarkerOn = 0;
+	const bool bMarker = FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarker="), MarkerOn)
+		                     ? MarkerOn != 0
+		                     : FParse::Param(FCommandLine::Get(), TEXT("VoxelWaterMarker"));
+	if (bMarker)
+	{
+		int32 OceanOn = 1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerOcean="), OceanOn);
+		Impl->MarkerWater = std::make_unique<vxc::LockedWaterSampler>(*Impl->Water);
+		Terrain->InstallWaterMarker(Impl->MarkerWater.get(), OceanOn != 0);
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("VoxelWaterMarker: ON (ocean %s). Water is drawn as SOLID magenta MAT_WATERMARK voxels ")
+		       TEXT("through the TERRAIN path, so it is visible at full clipmap range rather than only inside ")
+		       TEXT("the +/-25.6 m near-field disc. This is a debug instrument."),
+		       OceanOn != 0 ? TEXT("INCLUDED") : TEXT("excluded"));
+	}
 }
 
 void UVoxelWaterSubsystem::Deinitialize()
 {
+	// THE MARKER IS A BORROWED POINTER INTO Impl->MarkerWater. Terrain may
+	// outlive water, so clear it before this subsystem's impl goes away or the
+	// amplifier is left dereferencing freed memory on the next mesher job.
+	if (Impl && Impl->MarkerWater)
+	{
+		if (UVoxelWorldSubsystem* Terrain = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
+		{
+			Terrain->InstallWaterMarker(nullptr);
+		}
+	}
 	// ADR-0005: autosave the water blob on shutdown, mirroring
 	// UVoxelWorldSubsystem::Deinitialize's edit-log autosave lifetime exactly --
 	// authority only, and only for a world that genuinely began play (see

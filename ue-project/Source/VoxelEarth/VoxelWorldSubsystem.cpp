@@ -59,6 +59,7 @@
 // -- only referenced from this .cpp's file-local MakeTileSampler factory and
 // FVoxelWorldImpl's Tiles/GridTiles members, never from the UHT-parsed
 // header (same PImpl doctrine as every other voxel-core include here).
+#include "voxelcore/lakes.h"
 #include "voxelcore/tilestore.h"
 #include "voxelcore/world.h"
 
@@ -13698,6 +13699,26 @@ void UVoxelWorldSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	Impl = MakeUnique<FVoxelWorldImpl>(Seed, TileDir, TileScale, FineTileDir, FineProviderId, FineBudgetBytes,
 	                                   FineRingRadius);
+}
+
+void UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool bIncludeOcean)
+{
+	if (!Impl)
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("InstallWaterMarker: no world impl -- the marker was requested before Initialize ran."));
+		return;
+	}
+	Impl->Voxels.setWaterMarker(Sampler, bIncludeOcean);
+	if (!Sampler)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelWaterMarker: uninstalled."));
+		return;
+	}
+	UE_LOG(LogVoxelEarth, Warning,
+	       TEXT("VoxelWaterMarker: INSTALLED. Water is drawn as SOLID MAT_WATERMARK voxels; this is a debug ")
+	       TEXT("instrument and the world is not shippable in this state. worldgen.ush has no MAT_WATERMARK ")
+	       TEXT("branch, so run with voxel.GPU 0 or the GPU path will disagree with the CPU path."));
 }
 
 void UVoxelWorldSubsystem::Deinitialize()
