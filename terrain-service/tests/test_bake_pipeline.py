@@ -3028,3 +3028,102 @@ def test_interior_rim_injection_moves_discharge_but_not_area():
     # the trade stays visible rather than becoming folklore.
     assert np.nonzero(area_padded)[0].tolist() != np.nonzero(q_padded)[0].tolist()
     assert q_padded.sum() == pytest.approx(src.q[2, 1] + src.q[3, 1])
+
+
+# ---------------------------------------------------------------------------
+# F3: SLOPE IN THE DEPTH LAW
+# ---------------------------------------------------------------------------
+#
+# water_depth_m was Leopold & Maddock hydraulic geometry -- depth from discharge
+# and nothing else -- which is a fit to lowland rivers at roughly constant
+# slope. This world's long profile runs 173 -> 29 m/km on the wet block alone,
+# so a law with no S in it puts too much water on steep upper reaches and too
+# little on flat lower ones.
+
+
+def test_slope_term_is_bit_identical_at_the_reference_gradient():
+    """The property that keeps every existing measurement valid.
+
+    Architecture §4 records observed depth matching the Q law to three
+    significant figures across three decades of discharge. The slope term
+    enters as a RATIO against SLOPE_REF_M_PER_M precisely so that agreement is
+    preserved exactly rather than approximately -- if this drifts, every depth
+    number in the docs silently stops describing the bake.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    q = np.array([1e6, 1e7, 1e8, 1e9])
+    base = w.water_depth_m(q)
+    at_ref = w.water_depth_m(q, slope=np.full(q.shape, w.SLOPE_REF_M_PER_M))
+    assert np.array_equal(base, at_ref)
+
+
+def test_slope_term_makes_steep_reaches_shallower_and_flat_ones_deeper():
+    """The whole point of F3, in the direction normal-depth flow requires.
+
+    depth goes as (Q / sqrt(S)) ** (3/5), so S enters as S ** -0.3: steeper is
+    shallower. The current law has this term missing entirely, which is why
+    bridge_to_face_contact exists as a hand-built substitute for it.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    q = np.full(3, 1e7)
+    base = w.water_depth_m(q)
+    steep = w.water_depth_m(q, slope=np.full(3, 0.173))  # the block's head
+    flat = w.water_depth_m(q, slope=np.full(3, 0.029))   # its mouth
+
+    assert np.all(steep < base)
+    assert np.all(flat > base)
+
+
+def test_slope_term_clamps_instead_of_diverging_on_the_epsilon_fill_floor():
+    """A near-zero slope must not send depth to infinity.
+
+    58% of river cells sit on the epsilon-fill floor, where the "slope" is not
+    terrain at all but the fill's own increment. Unclamped, S ** -0.3 diverges
+    there -- on the majority of the network.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    q = np.full(4, 1e7)
+    base = w.water_depth_m(q)
+    at_zero = w.water_depth_m(q, slope=np.zeros(4))
+
+    assert np.all(np.isfinite(at_zero))
+    assert np.all(at_zero <= base * (w.SLOPE_RATIO_MIN ** w.SLOPE_DEPTH_EXP) + 1e-9)
+
+
+def test_slope_to_receiver_measures_a_diagonal_step_as_root_two():
+    """Treating every D8 step as one cell would overstate diagonals by 41%.
+
+    The receiver forest is the bake's own, and it is the same one the
+    incision's slope term was taken along -- so a depth law reading it is
+    reading the geometry the channel was actually cut with.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    # 2x2, cell 1 m. Cell 3 (bottom-right) drains diagonally to cell 0, one
+    # metre down; cell 1 drains orthogonally to cell 0, also one metre down.
+    z = np.array([[0.0, 1.0], [1.0, 1.0]], np.float64)
+    rec = np.array([[0, 0], [0, 0]], np.int64)  # everything points at cell 0
+
+    s = w.slope_to_receiver(z, rec, cell_m=1.0)
+    assert s[0, 0] == 0.0                       # a pit points at itself
+    assert s[0, 1] == pytest.approx(1.0)        # orthogonal: 1 m over 1 m
+    assert s[1, 1] == pytest.approx(1.0 / np.sqrt(2.0))  # diagonal: 1 m over sqrt(2) m
+
+
+def test_slope_in_depth_is_off_by_default():
+    """Flipping it rolls bake_ver and invalidates every baked water plane.
+
+    Same cost as water_inject_at_interior_rim, which is why the two should be
+    decided together and rolled once.
+    """
+    from terrain_service.bake.pipeline import BakeConstants
+
+    assert BakeConstants().water_slope_in_depth is False
+    assert "water_slope_in_depth" in BakeConstants.PRODUCT_FIELDS

@@ -197,17 +197,59 @@ def channel_depth_m(q_m3_yr, q_perennial: float = Q_PERENNIAL_M3_YR):
     return np.minimum(d, CHANNEL_MAX_DEPTH_M)
 
 
-def water_depth_m(q_m3_yr, q_perennial: float = Q_PERENNIAL_M3_YR):
+#: Reference along-flow gradient for the slope term, m/m. The law is UNCHANGED
+#: at this slope, so every depth already measured against it still holds --
+#: architecture §4 records observed depth matching the Q law to three
+#: significant figures across three decades of discharge, and nothing here is
+#: allowed to move that. 47.1 m/km is the world's measured p50 along-flow
+#: gradient.
+SLOPE_REF_M_PER_M = 0.0471
+
+#: Exponent on the slope ratio. Normal-depth (Manning) flow gives
+#: ``d ∝ (Q / sqrt(S)) ** (3/5)`` = ``Q**0.6 * S**-0.3``, so the slope term is
+#: ``S ** -0.3``. Only the SLOPE half is taken: the Q exponent stays at
+#: CHANNEL_DEPTH_EXP because that half is measured and correct, and swapping
+#: 0.3516 for 0.6 would break the agreement rather than improve it.
+SLOPE_DEPTH_EXP = -0.3
+
+#: Clamp on the slope ratio before the exponent. Without it a near-zero slope
+#: -- and 58% of river cells sit on the epsilon-fill floor, where the "slope"
+#: is not terrain at all -- sends depth to infinity. 1/16..16 in the ratio is
+#: 2.0x..0.5x in depth, which is a correction and not a new law.
+SLOPE_RATIO_MIN = 1.0 / 16.0
+SLOPE_RATIO_MAX = 16.0
+
+
+def water_depth_m(q_m3_yr, q_perennial: float = Q_PERENNIAL_M3_YR, slope=None):
     """Design water depth: channel.h's 3/4 of channel depth.
 
-    THIS IS THE HEAD, and it is a function of Q and nothing else. See the
-    module docstring: the bank probe found no containing ground within 120 m on
-    58% of stream bank sides at 10 m depth, so there is no geometry to fall
-    back on and none is consulted.
+    WITHOUT ``slope`` THIS IS THE HISTORICAL LAW, a function of Q and nothing
+    else. See the module docstring: the bank probe found no containing ground
+    within 120 m on 58% of stream bank sides at 10 m depth, so there is no
+    geometry to fall back on and none is consulted.
+
+    WITH ``slope`` (F3). Leopold & Maddock is a fit to lowland rivers at roughly
+    constant slope, and this world's long profile runs 173 -> 29 m/km on one
+    block. A law with no slope in it therefore puts too much water on steep
+    upper reaches -- where it then cannot stay connected -- and too little on
+    flat lower ones. ``bridge_to_face_contact`` is a hand-built correction for
+    exactly that missing term, which gives this change its acceptance test:
+    **with slope in the law the bridge should become close to a no-op on steep
+    reaches.** If it is still doing heavy lifting, the depth model is still
+    wrong and this constant should go back off rather than be tuned.
+
+    The slope enters as a RATIO against SLOPE_REF_M_PER_M, so at the reference
+    gradient the returned depth is bit-identical to the historical law and every
+    existing measurement survives. Steeper than reference -> shallower water;
+    flatter -> deeper. That is the direction normal-depth flow requires and the
+    direction F3 says we currently have backwards.
     """
-    return channel_depth_m(q_m3_yr, q_perennial) * (
-        WATER_DEPTH_NUM / WATER_DEPTH_DEN
-    )
+    d = channel_depth_m(q_m3_yr, q_perennial) * (WATER_DEPTH_NUM / WATER_DEPTH_DEN)
+    if slope is None:
+        return d
+    s = np.maximum(np.asarray(slope, np.float64), 0.0)
+    ratio = np.clip(s / SLOPE_REF_M_PER_M, SLOPE_RATIO_MIN, SLOPE_RATIO_MAX)
+    return d * ratio**SLOPE_DEPTH_EXP
 
 
 def q_for_width_m(width_m: float,
@@ -402,8 +444,44 @@ def water_head_mask(q_m3_yr, receivers, *, q_drawable: float,
 
 # --------------------------------------------------------------------------- the plane
 
+def slope_to_receiver(z_route_m, receivers, cell_m: float):
+    """Along-flow gradient at every cell, m/m, from the bake's OWN D8 forest.
+
+    REUSED, NOT RE-DERIVED, and that is deliberate: three wrong answers in one
+    session came from re-deriving something the bake already computes -- flow
+    direction, the perpendicular transect, and which surface discharge was
+    accumulated on. The receiver forest is the same one the incision's slope
+    term was taken along, so a depth law reading this is reading the same
+    geometry the channel was cut with.
+
+    Diagonal steps are sqrt(2) longer and are measured as such; treating every
+    D8 step as one cell would overstate diagonal gradients by 41%.
+    """
+    z = np.asarray(z_route_m, np.float64)
+    rec = np.asarray(receivers)
+    flat = z.ravel()
+    recf = rec.ravel()
+    n = flat.size
+    w = z.shape[1]
+
+    idx = np.arange(n)
+    drop = flat - flat[recf]
+    # Step length: 1 cell orthogonally, sqrt(2) diagonally. A receiver differing
+    # in BOTH row and column is a diagonal.
+    dr = np.abs(idx // w - recf // w)
+    dc = np.abs(idx % w - recf % w)
+    steps = np.where((dr == 1) & (dc == 1), np.sqrt(2.0), 1.0) * float(cell_m)
+    # A pit points at itself: zero drop over zero distance. Report zero slope
+    # rather than a divide, and let the clamp in water_depth_m handle it.
+    slope = np.zeros(n, np.float64)
+    moved = recf != idx
+    np.divide(drop, steps, out=slope, where=moved)
+    return np.maximum(slope, 0.0).reshape(z.shape)
+
+
 def graded_water_surface(z_route_m, q_m3_yr, receivers, wet, *, eps_m: float,
-                         exclude=None, q_perennial: float = Q_PERENNIAL_M3_YR):
+                         exclude=None, q_perennial: float = Q_PERENNIAL_M3_YR,
+                         slope_in_depth: bool = False, cell_m: float = 1.875):
     """The graded water surface, metres absolute, NaN where dry.
 
     `desired = bed + water_depth(Q)` and then ONE descent-enforcing sweep down
@@ -430,7 +508,15 @@ def graded_water_surface(z_route_m, q_m3_yr, receivers, wet, *, eps_m: float,
 
     z = np.ascontiguousarray(z_route_m, dtype=np.float32)
     desired = z.copy()
-    add = water_depth_m(np.asarray(q_m3_yr)[wet], q_perennial).astype(np.float32)
+    # F3: the depth law gains a slope term, off unless the bake asks for it.
+    # The slope comes from the SAME receiver forest this function is about to
+    # run enforce_descent down, so the depth and the descent constraint are
+    # reading one geometry rather than two that can disagree.
+    slope_wet = None
+    if slope_in_depth:
+        slope_wet = slope_to_receiver(z, receivers, cell_m)[wet]
+    add = water_depth_m(np.asarray(q_m3_yr)[wet], q_perennial,
+                        slope=slope_wet).astype(np.float32)
     desired[wet] = z[wet] + add
     del add
 

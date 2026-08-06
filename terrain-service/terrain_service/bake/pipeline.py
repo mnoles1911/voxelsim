@@ -1230,6 +1230,34 @@ class BakeConstants:
     #: `_edge_entries` was split out to prevent. Measure both.
     water_inject_at_interior_rim: bool = False
 
+    #: F3: put SLOPE in the depth law. Off by default -- flipping it rolls
+    #: ``bake_ver`` and invalidates every baked water plane, exactly as
+    #: ``water_inject_at_interior_rim`` does, so the two should be decided
+    #: together and rolled once rather than twice.
+    #:
+    #: WHAT IS WRONG WITHOUT IT. ``water_depth_m`` is Leopold & Maddock
+    #: hydraulic geometry: depth depends on discharge and NOTHING ELSE. That is
+    #: a fit to lowland rivers at roughly constant slope, and this world's long
+    #: profile runs 173 -> 29 m/km on the wet block alone. Normal-depth flow
+    #: says depth goes as ``(Q / sqrt(S)) ** (3/5)``, so a law with no S in it
+    #: puts too much water on steep upper reaches -- where it then cannot stay
+    #: connected -- and too little on flat lower ones.
+    #:
+    #: ONLY THE SLOPE HALF IS TAKEN. The Q exponent stays at
+    #: ``CHANNEL_DEPTH_EXP``: architecture §4 records observed depth matching
+    #: the Q law to three significant figures across three decades of
+    #: discharge, and swapping 0.3516 for normal-depth's 0.6 would break an
+    #: agreement that is currently exact. The slope enters as a ratio against
+    #: ``SLOPE_REF_M_PER_M``, so at the reference gradient the law is
+    #: BIT-IDENTICAL and every existing measurement survives.
+    #:
+    #: THE ACCEPTANCE TEST IS ALREADY WRITTEN, and it is falsifiable:
+    #: ``bridge_to_face_contact`` is a hand-built correction for this missing
+    #: term, so with slope in the law the bridge should become close to a no-op
+    #: on steep reaches. If it is still doing heavy lifting, the depth model is
+    #: still wrong and this goes back off rather than getting tuned.
+    water_slope_in_depth: bool = False
+
     #: The extent rules ``water_extent_mode`` may name, in the order they
     #: shipped. A ClassVar so it is not itself a constant, and a tuple so a
     #: typo in a config is a refusal at construction rather than a bake that
@@ -1415,6 +1443,10 @@ class BakeConstants:
         # whole point of the constant and is what verify_water_only_change.py
         # checks.
         "water_inject_at_interior_rim",
+        # PRODUCT, not payload: it changes the water plane's stored depths and
+        # nothing else. No elevation byte moves, which is what
+        # verify_water_only_change.py exists to prove.
+        "water_slope_in_depth",
     )
 
     def product_payload(self) -> dict:
@@ -4739,6 +4771,8 @@ def bake_tile(
             z_route, q_pad, rec_w, wet_pad,
             eps_m=consts.refill_eps_m, exclude=basin_keep_pad,
             q_perennial=consts.water_q_perennial_m3_yr,
+            slope_in_depth=consts.water_slope_in_depth,
+            cell_m=geom.fine_pixel_m,
         )
 
         # -- THE EXTENT (bake_ver 13). The plane above is a CENTRELINE -- a
