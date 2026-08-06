@@ -741,7 +741,75 @@ struct FVoxelWaterImpl
 	uint8_t ImplicitFillAtVoxel(int64_t vx, int64_t vy, int64_t vz)
 	{
 		const int32_t CavernFloodMm = CavernFloodMmAt(vx, vy);
-		const int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
+		int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
+
+		// LATERAL FILL AT VOXEL RESOLUTION (-VoxelWaterLateralFillPx=<n>, off by
+		// default).
+		//
+		// WHAT IS ALREADY RIGHT, so this is not what it looks like. The fill
+		// below is ALREADY per-voxel against the AMPLIFIED 10 cm ground:
+		// GroundMmAt is ground #3, and implicitWaterFill even carries the
+		// topmost voxel's sub-voxel remainder so the surface sits AT the datum
+		// instead of snapping to the lattice. The waterline is not the problem.
+		//
+		// WHAT IS WRONG is the DOMAIN. waterSurfaceMmAtVoxel answers kNoWaterMm
+		// outside the baked wet mask, and that mask is one decision per FINE
+		// PIXEL -- 1,875 mm (tile_codec.PIXEL_SIZE_MM[16]) against a 100 mm
+		// voxel. So the per-voxel waterline is computed inside cells the bake
+		// called wet and NOT COMPUTED AT ALL one cell over, and the edge snaps to
+		// a 1.875 m boundary. Flying it, the owner's words: "the magenta water
+		// volumes just stop in very blocky, multi meter sized, square edges -
+		// expectation is that water fills the river bed and meets the bank at the
+		// 10cm per voxel scale."
+		//
+		// So this extends the DOMAIN of the datum, not the fill rule. A dry
+		// column takes the surface of the NEAREST wet cell within n pixels and
+		// then faces the same per-voxel test it always did.
+		//
+		// NEAREST, NOT HIGHEST, and that distinction is a bug I already wrote
+		// once: a max over the search area lets a column inherit a level from up
+		// to n pixels UPSTREAM, which on a descending bed fills a wedge that
+		// thickens downstream -- more multi-metre slabs on steep reaches,
+		// manufactured by the fix meant to help. Water beside a bank takes the
+		// level of the water beside it.
+		//
+		// IT CANNOT RUN AWAY: a column is only wet while its amplified ground is
+		// below that surface, so a bank higher than the water stops it dead and
+		// the reach of the fill is a fact about the terrain rather than a radius
+		// anyone tuned. The radius bounds the SEARCH, not the flood.
+		//
+		// OFF BY DEFAULT because this is the CA's hottest query and it adds up to
+		// 8n sampler calls to a dry miss. Turn it on to judge the shape; measure
+		// before considering it for default.
+		if (BakedMm == vxc::kNoWaterMm)
+		{
+			static const int32 LateralPx = []
+			{
+				int32 N = 0;
+				FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterLateralFillPx="), N);
+				return FMath::Clamp(N, 0, 32);
+			}();
+			if (LateralPx > 0)
+			{
+				constexpr int64_t kPixelVoxels = 19; // 1875 mm / 100 mm, rounded up
+				static const int64_t kDir[8][2] = {{1, 0}, {-1, 0}, {0, 1},  {0, -1},
+				                                   {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+				for (int64_t Step = 1; Step <= LateralPx && BakedMm == vxc::kNoWaterMm; ++Step)
+				{
+					for (int D = 0; D < 8; ++D)
+					{
+						const int32_t N = Water->waterSurfaceMmAtVoxel(
+							vx + kDir[D][0] * Step * kPixelVoxels,
+							vy + kDir[D][1] * Step * kPixelVoxels);
+						if (N == vxc::kNoWaterMm) continue;
+						// Lowest within the ring: the ring can straddle two
+						// levels on a slope, and the lower one cannot cover
+						// ground the higher one would not have.
+						if (BakedMm == vxc::kNoWaterMm || N < BakedMm) BakedMm = N;
+					}
+				}
+			}
+		}
 		// THE z GUARD IS A PERF GUARD AND IT IS LOAD-BEARING. This callback is
 		// the CA's HOTTEST query -- makeSolidFn() runs it for every
 		// genuinely-open-air cell the CA touches.

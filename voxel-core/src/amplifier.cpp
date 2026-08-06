@@ -2312,17 +2312,33 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
         // and the rays are along and diagonal to the axes a channel tends to
         // run. Debug-only cost: nothing queries this unless the marker is
         // installed. -VoxelWaterMarkerFillPx tunes it.
+        // NEAREST wet neighbour, not the highest one in the neighbourhood.
+        //
+        // The first version of this took the MAX over the search area, and that
+        // was wrong in a way that would have made the owner's other complaint
+        // worse. On a descending bed the upstream cell's surface is higher, so
+        // a max lets a downstream column inherit a level from up to 15 m
+        // upstream and fill to it -- a wedge thickening downstream, i.e. more of
+        // the multi-metre slabs on steep reaches, manufactured by the fix meant
+        // to help. Water beside a bank takes the level of the water BESIDE it.
+        //
+        // Rings outward, first hit wins. The search stops at the first radius
+        // that finds water, so a column in open ground pays the full radius once
+        // and a column at the waterline pays one ring.
         const int64_t kPixelVoxels = 19; // 1875 mm / 100 mm, rounded up
         static const int64_t kDir[8][2] = {{1, 0},  {-1, 0}, {0, 1},  {0, -1},
                                            {1, 1},  {1, -1}, {-1, 1}, {-1, -1}};
         int32_t baked = waterMarker_->waterSurfaceMmAtVoxel(vx, vy);
-        for (int d = 0; d < 8; ++d) {
-            for (int64_t step = 1; step <= waterMarkerFillPx_; ++step) {
+        for (int64_t step = 1; step <= waterMarkerFillPx_ && baked == kNoWaterMarkerMm; ++step) {
+            for (int d = 0; d < 8; ++d) {
                 const int32_t neighbourMm = waterMarker_->waterSurfaceMmAtVoxel(
                     vx + kDir[d][0] * step * kPixelVoxels,
                     vy + kDir[d][1] * step * kPixelVoxels);
                 if (neighbourMm == kNoWaterMarkerMm) continue;
-                if (baked == kNoWaterMarkerMm || neighbourMm > baked) baked = neighbourMm;
+                // Within a ring, prefer the LOWEST surface found: on a slope the
+                // ring can straddle two levels, and taking the lower one cannot
+                // flood ground the higher one would not have covered anyway.
+                if (baked == kNoWaterMarkerMm || neighbourMm < baked) baked = neighbourMm;
             }
         }
         // See Amplifier::waterMarkerColumnsMarked. Counted BEFORE the ocean
