@@ -262,6 +262,24 @@ $pose = if ($SpawnAltM -ne 0 -or $SpawnPitch -ne 0) { "alt +${SpawnAltM}m pitch 
 $arm  = if ($NoRiverRibbons) { 'CONTROL (-VoxelRiverRibbons=0)' } else { 'river ribbons ON' }
 Write-Host "capture '$Name' at $SpawnAt, $pose, yaw $SpawnYaw, settling ${SettleSec}s, ${Width}x${Height}, $sun, $arm" -ForegroundColor Cyan
 if ($FineProviderId) { Write-Host "  fine tier: $FineTileDir  provider=$FineProviderId" -ForegroundColor DarkGray }
+# EPIC'S MCP SERVER IS LIVE DURING THIS CAPTURE, and it is worth saying so.
+# ue-project/Config/DefaultEditorPerProjectUserSettings.ini sets
+# bAutoStartServer=True, so every editor launch binds 127.0.0.1:8000/mcp --
+# including this one. Two consequences a silent launch would hide:
+#
+#   * an editor holding port 8000 is invisible until something else fails to
+#     bind it, and this script's own "refuse to start if an editor is running"
+#     guard is the only thing standing between two captures and that conflict;
+#   * the window is USELESS FOR INTERACTIVE WORK. -VoxelScreenshotAfter quits
+#     the editor ~3 s after the shot (VoxelEarthGameMode), so the server is up
+#     for seconds. To drive the editor over MCP, launch it WITHOUT this script
+#     and leave it running -- there is no harness switch for that, because
+#     the quit is engine-side and a PowerShell flag cannot suppress it.
+#
+# There is also no command-line opt-OUT: ShouldAutoStartServer() only ever
+# forces the server ON (-ModelContextProtocolStartServer) and otherwise reads
+# the ini. Disabling it for a clean measurement leg means editing the ini.
+Write-Host "  MCP: http://127.0.0.1:8000/mcp live for this launch (ini bAutoStartServer=True); editor quits ~3s after the shot" -ForegroundColor DarkGray
 $started = Get-Date
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 if (-not $p.WaitForExit($TimeoutSec * 1000)) {

@@ -84,7 +84,9 @@ param(
     # TOO" above. Same three defaults as tools/voxel-run-flight-leg.ps1.
     [string]$TimeOfDay = '12:00',
     [string]$Date = '03-20',
-    [double]$TimeScale = 0
+    [double]$TimeScale = 0,
+    # Keep Epic's MCP server up for this leg (default: off, see below).
+    [switch]$Mcp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -113,6 +115,7 @@ if ($ClearEditLog) {
 
 $argList = @(
     "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', "-abslog=`"$LogPath`"",
+
     # InvariantCulture: PowerShell interpolates a [double] with the CURRENT
     # culture, so on a comma-decimal machine "-VoxelTimeScale=0,5" reaches
     # FParse::Value, which stops at the comma, and the fill silently runs
@@ -121,6 +124,26 @@ $argList = @(
     "-VoxelDate=$Date",
     "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))"
 ) + $ExtraArgs
+# MCP OFF FOR MEASUREMENT LEGS.
+#
+# ue-project/Config/DefaultEditorPerProjectUserSettings.ini sets
+# bAutoStartServer=True, so EVERY editor launch binds 127.0.0.1:8000 and builds
+# Epic's MCP tool registry -- including a timing leg, where nothing asked for it
+# and nobody is connected. The cost is probably small; the point is that it is
+# unmeasured, and a leg is supposed to differ from its pair in exactly one thing.
+#
+# ShouldAutoStartServer() has NO command-line opt-out -- the param can only
+# force the server ON -- so this uses UE's generic ini override, which beats the
+# ini value for this process only and leaves the file alone. Pass -Mcp to keep
+# the server up for a leg you actually intend to drive.
+#
+# Appended rather than placed in the array literal on purpose: a `$(if ...)`
+# that yields nothing inserts a $null into the array, and Start-Process passes
+# that to the editor as an empty argument.
+if (-not $Mcp) {
+    $argList += '-ini:EditorPerProjectUserSettings:[/Script/ModelContextProtocolEngine.ModelContextProtocolSettings]:bAutoStartServer=False'
+}
+
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 
 $deadline = (Get-Date).AddSeconds($BudgetSec)

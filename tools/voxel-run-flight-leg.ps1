@@ -110,7 +110,9 @@ param(
     [string]$Date = '03-20',
     [double]$TimeScale = 0,
     [switch]$KeepEditLog,
-    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe'
+    [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
+    # Keep Epic's MCP server up for this leg (default: off, see below).
+    [switch]$Mcp
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,6 +140,7 @@ if (-not $KeepEditLog) {
 
 $argList = @(
     "`"$Project`"", '-game', '-nosplash', '-unattended', '-sm6', '-dx12',
+
     "-abslog=`"$LogPath`"",
     "-ResX=$Width", "-ResY=$Height", '-WinX=0', '-WinY=0',
     "-VoxelSpawnAt=$SpawnAt",
@@ -161,6 +164,26 @@ $argList = @(
 ) + $ExtraArgs
 
 $started = Get-Date
+# MCP OFF FOR MEASUREMENT LEGS.
+#
+# ue-project/Config/DefaultEditorPerProjectUserSettings.ini sets
+# bAutoStartServer=True, so EVERY editor launch binds 127.0.0.1:8000 and builds
+# Epic's MCP tool registry -- including a timing leg, where nothing asked for it
+# and nobody is connected. The cost is probably small; the point is that it is
+# unmeasured, and a leg is supposed to differ from its pair in exactly one thing.
+#
+# ShouldAutoStartServer() has NO command-line opt-out -- the param can only
+# force the server ON -- so this uses UE's generic ini override, which beats the
+# ini value for this process only and leaves the file alone. Pass -Mcp to keep
+# the server up for a leg you actually intend to drive.
+#
+# Appended rather than placed in the array literal on purpose: a `$(if ...)`
+# that yields nothing inserts a $null into the array, and Start-Process passes
+# that to the editor as an empty argument.
+if (-not $Mcp) {
+    $argList += '-ini:EditorPerProjectUserSettings:[/Script/ModelContextProtocolEngine.ModelContextProtocolSettings]:bAutoStartServer=False'
+}
+
 $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList $argList
 $p.WaitForExit($TimeoutSec * 1000) | Out-Null
 
