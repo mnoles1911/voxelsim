@@ -8,10 +8,39 @@ and what the intended direction is. **It supersedes
 `docs/water-deep-dive-brief-2026-08-05.md`, both of which are now redirect
 stubs.**
 
-**Consolidated 2026-08-05.** Against `main`, `TERRAIN_VERSION` 8, `BAKE_VERSION`
-14, `kWorldGenVersion` 23, `kWaterCAVersion` 5. Every number was read from the
-code or measured with a probe; where a number came from somewhere else it says
-so.
+**Consolidated 2026-08-05, updated 2026-08-06.** Against `main`,
+`TERRAIN_VERSION` 8, `BAKE_VERSION` **15**, `kWorldGenVersion` 23,
+`kWaterCAVersion` 5. Every number was read from the code or measured with a
+probe; where a number came from somewhere else it says so.
+
+> **What changed at `bake_ver` 15 (2026-08-06).** Three constants that were off
+> by default were flipped **together**, because each one alone rolls the version
+> and invalidates every baked water plane:
+>
+> * `water_inject_at_interior_rim` — **F6, now ON.** §11a's fix, measured 300× on
+>   tile (-7,-5).
+> * `water_slope_in_depth` — **F3, now ON.** The depth law gains a slope term.
+>   Bit-identical at the reference gradient (47.1 m/km) so every depth number in
+>   this document still describes the bake; 0.68× on the wet block's steep head,
+>   1.16× at its flat mouth. §11a F3 is no longer open.
+> * `water_slope_in_extent` — **new, now ON.** The same missing physics in the
+>   extent rule, so water concentrates on steep ground instead of spreading as a
+>   sheet. It scales `fill_to_local_surface`'s depth threshold by gradient rather
+>   than capping its reach — a radius cap is explicitly retired in that
+>   function's docstring after a measured 209× flood.
+>
+> First measured effect, tile (-5,-4): wet fraction **0.554% → 1.014%**, drawn
+> cells **371,599 → 680,748**, injected discharge **1.5e7 → 2.65e7 m³/yr**.
+>
+> **And a defect this surfaced, which is probably larger than any of them.**
+> `basin_exclude_spanning` defaults **True**, so a basin touching the tile's
+> interior edge is dropped from the registry — and B5 re-opens the hole ONLY
+> under `survey.keep_mask()`. A dropped basin therefore keeps its depression
+> **filled** and ships as solid ground: a large lake becomes a flat plain. Large
+> lakes are exactly the ones that span tiles. The world survey found 1,322
+> spanning components against 997 kept, and **more lake area excluded (4,609 ha)
+> than retained (3,596 ha)** — but that is `bake_ver` 7 on 12 tiles, so every
+> bake now prints its own `span_drop=` figure instead of citing a stale one.
 
 **The three questions this file answers, in order:**
 
@@ -765,7 +794,7 @@ discharge whose matching upstream *area* never arrived.
 
 Full record: `docs/measurements/f6-pyramid-delivers-to-apron-2026-08-05.txt`.
 
-### F3 — the depth law has no slope in it — **open**
+### F3 — the depth law has no slope in it — **FIXED at bake_ver 15**
 
 `water_depth_m(Q)` is Leopold–Maddock hydraulic geometry: depth depends on
 discharge and nothing else. That is a fit to lowland rivers at roughly constant
@@ -779,7 +808,7 @@ acceptance test: **with slope in the depth law, the bridge should become close
 to a no-op on steep reaches.** If it is still doing heavy lifting, the depth
 model is still wrong.
 
-### F2 — the drawn width barely tracks discharge — **open**
+### F2 — the drawn width barely tracks discharge — **open**, and the lever is not the width law
 
 Measured with the bake's own `lateral_extent_stats`, 20,000 transects per tile,
 perpendicular taken from each cell's own D8 receiver:
@@ -806,6 +835,20 @@ mechanism behind Spearman(drawn width, Q) = +0.457.
 
 The rule already uses **75–82%** of the room available to it, so this is not a
 case of the terrain withholding space.
+
+**AND THE OBVIOUS FIX IS THE WRONG KNOB.** Raising `CHANNEL_WIDTH_EXP` barely
+widens the drawn river, because `lateral_fill` never reads the width law — a
+cell is wet when it stands below the surface of the water it drains into. The
+width exponent only moves `q_drawable_m3_yr` (the threshold is *derived* from
+the law), which changes how much of the network is drawn at all and can delete
+headwaters if raised.
+
+Under the shipped rule the lever on width is the **depth** exponent: a deeper
+trunk stands its water surface higher, and a higher surface floods further
+laterally before the ground rises through it. That is also why
+`water_slope_in_depth` (F3) moves drawn width as a side effect. Recorded in
+`docs/measurements/channel-exponents-confluence-2026-08-06.txt`, together with
+why the exaggerated exponents the owner asked for are not yet flipped.
 
 ### And one that is NOT wrong: the terrain
 
