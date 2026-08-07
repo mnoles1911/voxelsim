@@ -1,0 +1,84 @@
+TILE-SPANNING LAKES: WHAT IS DROPPED, AND WHAT HAPPENS TO THE HOLE
+2026-08-07, wet alpine block, bake_ver 15. Wave 2 of the water plan.
+
+THE QUESTION
+------------
+`basin_exclude_spanning` defaults TRUE, so a basin whose extent touches the
+tile's interior edge is dropped from the registry. A world survey found 1322
+spanning components against 997 kept -- and MORE LAKE AREA excluded (4609 ha)
+than retained (3596 ha). If that generalised it would be the largest open water
+defect in the project.
+
+Two things had to be established: what happens to a dropped basin's HOLE, and
+whether the 57% figure survives at the current bake version.
+
+ANSWER 1: THE HOLE IS NOT DUG. THE LAKE SIMPLY DOES NOT EXIST.
+--------------------------------------------------------------
+Read out of the code, pipeline.py B5.reopen_basins:
+
+    out["z"][keep] -= out["basin_depth"][keep]
+
+`keep = survey.keep_mask()`, and basins.py:671-684 confirms keep_mask is built
+from `kept_labels` -- REGISTERED basins only. A dropped basin is not in it.
+
+So the depression that B2a filled for routing STAYS FILLED in the shipped
+ground. The failure mode is NOT a dry pit where a lake should be (which is what
+I expected and said out loud before checking). It is:
+
+  * no lake registered, so nothing fills it;
+  * the ground artificially FLAT at the fill level, because the fill is never
+    subtracted back out.
+
+A large tile-spanning lake therefore ships as a flat plain. That is less
+alarming than a pit and still wrong: the terrain is not the terrain, and the
+lake is missing.
+
+ANSWER 2: ON THIS BLOCK THE LOSS IS ~9% BY AREA, NOT 57%
+---------------------------------------------------------
+`pregen`'s per-tile line now prints `span_drop=<count>/<area>ha@<maxdepth>m`
+(added 2026-08-06) so this stops being a stale citation. Six tiles, bake_ver 15:
+
+    tile        kept basin      dropped (spanning)
+    (-5,-4)     1.1% / 22 m     29 basins /  25 ha @ 21 m
+    (-4,-4)     0.5% / 34 m     12 basins /  18 ha @ 40 m
+    (-3,-4)     0.9% / 46 m     18 basins /  24 ha @ 41 m
+    (-5,-5)     1.7% / 44 m     29 basins /  35 ha @ 34 m
+    (-4,-5)     2.4% / 36 m     16 basins /  22 ha @ 40 m
+    (-3,-5)     1.5% / 40 m     19 basins /  22 ha @ 20 m
+
+    total dropped: 123 basins, 146 ha
+    tile area 15.36 km square = 23,593 ha; kept basin coverage 0.5-2.4%
+    => kept area is roughly 118-566 ha per tile, ~1,500 ha over the block
+
+So dropped area is about **9% of lake area on this block**, not the 56% the
+world survey implied. The dropped basins are also SHALLOWER on average than the
+kept maxima on four of six tiles.
+
+WHY THE WORLD FIGURE DOES NOT GENERALISE. The survey (docs/lake-survey/) is 12
+tiles at bake_ver 7 -- eight versions stale -- and its own text warns the
+numbers do not survive a bump, citing a measured -5.3% component change across
+7->8 alone. Its area total is also dominated by ONE tile: (-13,-6) contributes
+2358 of the 4609 ha from 69 components, i.e. **51% of the world's excluded lake
+area comes from a single tile**. That tile is not in the wet alpine block.
+
+VERDICT
+-------
+Real defect, not an emergency, and NOT the thing to fix first on this block.
+Two consequences worth carrying:
+
+  * the fix (global lake id + BASIN_TABLE_VERSION 2, stop excluding spanning
+    basins) is still correct and still wanted -- a lake crossing a seam is
+    registered independently by each side "and the two need not agree"
+    (lake-survey.md:56), with nothing in the codec to reconcile them;
+  * but it should be scheduled on the evidence of a WORLD survey at bake_ver 15,
+    not on this block, because the loss is concentrated in tiles this block does
+    not contain. Re-running the survey is the prerequisite, and it is cheap
+    relative to acting on a stale number.
+
+CORRECTION ON THE RECORD
+------------------------
+I flagged this to the owner as possibly "the largest open water defect in the
+project" before measuring it, on the strength of the 57% figure and a guess that
+the hole was being dug. Both halves were wrong: the hole is not dug, and on the
+block we actually look at, the loss is ~9%. The 57% is real but is a
+component count on 12 stale tiles, half of whose excluded area is one tile.
