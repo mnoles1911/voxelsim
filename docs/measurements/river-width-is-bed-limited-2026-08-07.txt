@@ -1,0 +1,57 @@
+CAN THE RIVERS BE MADE DRAMATICALLY WIDER BY ADDING WATER?  No.
+Tile (-4,-4), seed 20260719, bake_ver 17. Measured 2026-08-07.
+
+THE QUESTION. The owner, flying the marker: "the magenta water blocks should be
+filling out laterally... the river volume is not filling all of the open air
+tiles to its left, right, front and center". The probe measures the DRAWN river
+at 1.62 px = 3.04 m mean width (thinning ratio on the baked wet mask). So: how
+much water would it take to make that 20 m?
+
+METHOD. `--diagnostic --npz-dir` re-bakes without writing the world and dumps
+`elevation_m` and `water_surface_m` -- THE BAKE'S OWN GROUND, not a Python
+reconstruction (see the retraction in water-surface-roughness-2026-08-07.txt).
+On a 2048 px = 3.84 km window centred on the wettest block, flood UPHILL ONLY
+from the drawn surface: a dry cell joins when its ground lies under the level it
+would inherit, raised by delta. Uphill-only is what stops it becoming the
+documented "nearest channel floods the continent" failure; water spreads onto
+banks, not down hillsides.
+
+  delta_m    wet px     x base    implied mean width m
+   0.00      137,096    1.384x           4.21
+   0.25      148,290    1.497x           4.55
+   0.50      159,639    1.612x           4.90
+   1.00      181,139    1.829x           5.56
+   2.00      223,995    2.262x           6.88
+   4.00      303,801    3.067x           9.32
+   8.00      439,028    4.433x          13.48
+
+THE RESULT. Raising every river by TWO METRES only doubles its width, to 6.9 m.
+EIGHT metres of extra depth -- an absurd river -- still lands at 13.5 m, short
+of 20. Width grows roughly as delta^0.4, which is the signature of a V, not of
+a floodplain. THE RIVERS ARE NARROW BECAUSE THE BED IS NARROW, not because they
+are under-filled.
+
+CONFIRMED INDEPENDENTLY by a real bake. A diagnostic bake at 1.5x reference
+depth (CHANNEL_REF_DEPTH_M 0.3 -> 0.45, which is just inside the designed
+ceiling of 1.57x) moved tile (-4,-4) from 0.543% to 0.659% wet -- 21% more
+water for 50% more depth. That is the same curve.
+
+THIS REVERSES SOMETHING I WROTE. The pressure-test of the pasted watershed plan
+rejected its carve proposal partly on "room p50 20.6-37.5 m against a law asking
+1.5 m, and fill_to_local_surface already uses 75-82% of it... not a case of the
+terrain withholding space." That cannot be reconciled with the table above: if
+there were 20-37 m of room at the water's level, a 2 m rise would not stop at
+6.9 m. Whatever that figure measured, it was not width available at the drawn
+water surface. The carve proposal deserves reconsideration ON THIS EVIDENCE --
+which is a change of position, and the owner should know it is one.
+
+WHAT IT DOES NOT SAY. It does not say carve. Carving costs a TERRAIN_VERSION
+roll -- TERRAIN_VERSION IS the noise seed input, so 8->9 re-rolls B1 roughness
+on every tile and is A NEW WORLD -- and the owner has already declined that for
+now. It also does not say the current width is wrong; a 3 m mountain stream is
+a real thing. It says only that ADDING WATER CANNOT MAKE THESE RIVERS WIDE, so
+any plan that promises width by tuning depth, the depth exponent, or the extent
+rule is promising something the terrain will not give.
+
+CAVEAT: one 3.84 km window on one tile, chosen as the wettest. Worth repeating
+on a low-gradient tile before treating the exponent 0.4 as general.
