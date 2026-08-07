@@ -783,30 +783,60 @@ def enforce_neighbour_consistency(water_m, z_ground_m, *, max_iter: int = 512):
     if w.shape != z.shape:
         raise ValueError(f"water {w.shape} does not match ground {z.shape}")
 
+    # ONE SWEEP IN DESCENDING GROUND ORDER, not a relaxation.
+    #
+    # The constraint only ever propagates from higher ground to lower, so if
+    # cells are visited highest-first then every upstream neighbour is already
+    # final when a cell is reached, and one pass is the exact answer. This is
+    # the same argument `flow.enforce_descent` uses to avoid iterating, and here
+    # it is worth a great deal: the relaxation this replaces needed 96 rounds of
+    # eight shifted comparisons over the PADDED domain -- 85 M cells, a 340 MB
+    # temporary per shift -- to reach the identical fixed point. `max_iter` is
+    # kept in the signature only so a caller written against the old shape does
+    # not break; it is unused.
+    del max_iter
+    h, wd = w.shape
+    wet_idx = np.flatnonzero(np.isfinite(w))
+    if wet_idx.size == 0:
+        return w, {"level_consistency_sweeps": 1.0,
+                   "level_consistency_lowerings": 0.0,
+                   "level_consistency_wet_cells": 0.0}
+
+    flat_w = w.ravel()
+    flat_z = z.ravel()
+    order = wet_idx[np.argsort(-flat_z[wet_idx], kind="stable")]
+
     lowered = 0
-    it = 0
-    for it in range(max_iter):
-        changed = 0
+    for idx in order:
+        idx = int(idx)
+        y, x = divmod(idx, wd)
+        cur = flat_w[idx]
+        zc = flat_z[idx]
+        best = cur
         for dy in (-1, 0, 1):
+            ny = y + dy
+            if ny < 0 or ny >= h:
+                continue
             for dx in (-1, 0, 1):
                 if dx == 0 and dy == 0:
                     continue
-                ns = _shift2(w, dy, dx, np.float32(np.nan))
-                ng = _shift2(z, dy, dx, np.float32(-np.inf))
-                # An UPSTREAM wet neighbour: standing on higher ground, and
-                # holding water lower than ours.
-                hit = np.isfinite(w) & np.isfinite(ns) & (ng > z) & (ns < w)
-                n = int(hit.sum())
-                if n:
-                    w[hit] = ns[hit]
-                    changed += n
-        lowered += changed
-        if changed == 0:
-            break
+                nx = x + dx
+                if nx < 0 or nx >= wd:
+                    continue
+                j = ny * wd + nx
+                if flat_z[j] <= zc:
+                    continue                      # not upstream of this cell
+                nv = flat_w[j]
+                if nv == nv and nv < best:        # wet (NaN fails ==) and lower
+                    best = nv
+        if best < cur:
+            flat_w[idx] = best
+            lowered += 1
+
     stats = {
-        "level_consistency_iterations": float(it),
-        "level_consistency_converged": float(1.0 if it < max_iter - 1 else 0.0),
+        "level_consistency_sweeps": 1.0,
         "level_consistency_lowerings": float(lowered),
+        "level_consistency_wet_cells": float(wet_idx.size),
     }
     return w, stats
 

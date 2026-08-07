@@ -3296,7 +3296,7 @@ def test_neighbour_consistency_removes_uphill_water_without_drying_a_cell():
     after_wet = np.isfinite(out) & (out > z)
     assert int(after_wet.sum()) == int(before_wet.sum())
 
-    assert stats["level_consistency_converged"] == 1.0
+    assert stats["level_consistency_sweeps"] == 1.0
     assert stats["level_consistency_lowerings"] > 0
 
 
