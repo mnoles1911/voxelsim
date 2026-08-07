@@ -639,20 +639,40 @@ int main(int argc, char** argv) {
         size_t flatReaches = 0;
         riverRibbonOrient(paths, &flatReaches);
 
+        // SPLIT BY WHETHER THE TRACER JUMPED, which is the whole discrimination.
+        //
+        // These points are RAW (this runs before simplification), so consecutive
+        // points on a genuine channel walk are 8-CONNECTED -- one pixel apart,
+        // orthogonally or diagonally. A larger gap means the tracer stitched
+        // across something: a confluence, or a centreline hopping between two
+        // adjacent water bodies. A rise across such a gap says nothing about the
+        // plane; a rise between two TOUCHING pixels cannot be blamed on tracing
+        // and is the surface genuinely climbing.
         int64_t steps = 0, rises = 0, risesOverVoxel = 0;
-        int32_t worstRiseMm = 0;
-        std::vector<int32_t> riseMm;
+        int64_t adjSteps = 0, adjRises = 0, adjRisesOverVoxel = 0;
+        int32_t worstRiseMm = 0, worstAdjRiseMm = 0;
+        std::vector<int32_t> riseMm, adjRiseMm;
         for (const RiverRibbonPath& p : paths) {
             for (size_t i = 0; i + 1 < p.pts.size(); ++i) {
                 const int32_t a = p.pts[i].surfaceMm, b = p.pts[i + 1].surfaceMm;
                 if (a == kNoWaterMm || b == kNoWaterMm) continue;
+                const int64_t dx = p.pts[i + 1].px - p.pts[i].px;
+                const int64_t dy = p.pts[i + 1].py - p.pts[i].py;
+                const bool adjacent = (dx * dx + dy * dy) <= 2; // 8-connected
                 ++steps;
+                if (adjacent) ++adjSteps;
                 const int32_t d = b - a;   // > 0 == the surface went UP downstream
                 if (d > 0) {
                     ++rises;
                     if (d > int32_t(kVoxelSizeMm)) ++risesOverVoxel;
                     if (d > worstRiseMm) worstRiseMm = d;
                     riseMm.push_back(d);
+                    if (adjacent) {
+                        ++adjRises;
+                        if (d > int32_t(kVoxelSizeMm)) ++adjRisesOverVoxel;
+                        if (d > worstAdjRiseMm) worstAdjRiseMm = d;
+                        adjRiseMm.push_back(d);
+                    }
                 }
             }
         }
@@ -666,6 +686,19 @@ int main(int argc, char** argv) {
             std::sort(riseMm.begin(), riseMm.end());
             std::printf("  rise mm           : p50 %d  p90 %d  max %d\n",
                         riseMm[riseMm.size() / 2], riseMm[(riseMm.size() * 9) / 10], worstRiseMm);
+        }
+        // THE LINE THAT DECIDES WHAT TO FIX.
+        std::printf("  -- of which TOUCHING-PIXEL steps (tracing cannot explain these) --\n");
+        std::printf("  adjacent steps    : %" PRId64 "  (%.1f%% of all steps)\n", adjSteps,
+                    steps ? 100.0 * double(adjSteps) / double(steps) : 0.0);
+        std::printf("  ...that RISE      : %" PRId64 " (%.4f%% of adjacent)   over one voxel: %"
+                    PRId64 "\n", adjRises,
+                    adjSteps ? 100.0 * double(adjRises) / double(adjSteps) : 0.0,
+                    adjRisesOverVoxel);
+        if (!adjRiseMm.empty()) {
+            std::sort(adjRiseMm.begin(), adjRiseMm.end());
+            std::printf("  rise mm           : p50 %d  p90 %d  max %d\n", adjRiseMm[adjRiseMm.size() / 2],
+                        adjRiseMm[(adjRiseMm.size() * 9) / 10], worstAdjRiseMm);
         }
         std::printf("  READ THIS CAREFULLY. enforce_descent guarantees non-increasing surface along\n"
                     "  the D8 RECEIVER FOREST. This walks the traced MEDIAL AXIS, which is a\n"
