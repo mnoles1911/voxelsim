@@ -1302,6 +1302,11 @@ class BakeConstants:
     #: Lateral reach of that settling, in cells. 8 = 15 m, which is a riverbed;
     #: see settle_to_adjacent_level for why the bound is the safety argument.
     water_settle_max_iter: int = 8
+    #: Hold each channel cell's settled spread to the volume its OWN discharge
+    #: supports -- width(Q) x depth(Q) x cell length. The budget therefore grows
+    #: down the river as the watershed does, which is the only bound here that
+    #: is conserved rather than chosen. See water.apply_discharge_budget.
+    water_settle_discharge_budget: bool = True
 
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
@@ -1520,6 +1525,7 @@ class BakeConstants:
         # nothing about the ground.
         "water_settle_to_level",
         "water_settle_max_iter",
+        "water_settle_discharge_budget",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -4941,7 +4947,10 @@ def bake_tile(
         if consts.water_settle_to_level:
             w_pad, settle_stats = _water.settle_to_adjacent_level(
                 w_pad, out["z"], min_depth_m=_water.WIDEN_MIN_DEPTH_M,
-                max_iter=int(consts.water_settle_max_iter))
+                max_iter=int(consts.water_settle_max_iter),
+                q_m3_yr=(q_pad if consts.water_settle_discharge_budget
+                         else None),
+                cell_m=geom.fine_pixel_m)
             width_stats.update(settle_stats)
 
         if consts.water_level_neighbour_consistency:

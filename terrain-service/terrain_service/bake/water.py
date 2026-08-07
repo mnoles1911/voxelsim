@@ -94,6 +94,7 @@ from . import flow as _flow
 __all__ = [
     "enforce_neighbour_consistency",
     "settle_to_adjacent_level",
+    "apply_discharge_budget",
     "Q_PERENNIAL_M3_YR",
     "Q_RIVER_M3_YR",
     "Q_MAJOR_M3_YR",
@@ -759,7 +760,8 @@ SLOPE_EXTENT_MAX = 8.0
 
 
 def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
-                             max_iter: int = 8):
+                             max_iter: int = 8, q_m3_yr=None,
+                             cell_m: float = 1.875):
     """Let water spread sideways onto ground that lies BELOW it. ``(w, stats)``.
 
     THE DEFECT, measured on tile (-4,-4) at bake_ver 17 against the bake's own
@@ -818,6 +820,10 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     sweeps = 0
     rounds = 0
     w_before = np.array(w, copy=True)
+    # Every drawn cell owns itself; everything else is unowned until it inherits
+    # a level from a neighbour.
+    own = np.where(np.isfinite(w), np.arange(w.size).reshape(w.shape), -1
+                   ).astype(np.int64)
     # THE RELAXATION. Spreading once and draining once is not water finding its
     # level, it is one splash and one runoff. Water that runs off a perched
     # shelf has to be allowed to SETTLE AGAIN lower down, and what settles there
@@ -830,12 +836,18 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     # which is why the sweep count ships in the per-tile log.
     for rounds in range(1, 33):
         added_round, drained_round = _settle_round(
-            w, z, floor, int(max_iter))
+            w, z, floor, int(max_iter), own=own)
         added_total += added_round
         drained_total += drained_round
         sweeps += 1
         if added_round == drained_round:
             break
+    if q_m3_yr is not None:
+        w, bstats = apply_discharge_budget(w, water_m, z, own, q_m3_yr,
+                                           cell_m=cell_m)
+        budget_stats = bstats
+    else:
+        budget_stats = {}
     stats = {
         "settle_rounds": float(rounds),
         "settle_sweeps": float(sweeps),
@@ -844,10 +856,98 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
         "settle_kept_cells": float(int(np.isfinite(w).sum())
                                   - int(np.isfinite(w_before).sum())),
     }
+    stats.update(budget_stats)
     return w, stats
 
 
-def _settle_round(w, z, floor, max_iter):
+def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
+                           q_perennial=Q_PERENNIAL_M3_YR):
+    """Hold each channel cell's spread to the water it actually carries.
+
+    THE DEFECT THIS CLOSES. Everything upstream of here decides extent by
+    GEOMETRY ALONE -- is this ground under that level -- and never asks whether
+    enough water EXISTS to fill what it just filled. That is why spreading has
+    to be argued down with drain rules and iteration counts: nothing in it is
+    conserved, so nothing in it has a natural stopping point.
+
+    Discharge gives one. Leopold & Maddock already tell this module how big a
+    river of a given Q is -- ``channel_width_m`` and ``water_depth_m`` -- so
+    their product is the wetted CROSS-SECTION that discharge supports, and over
+    one cell of channel length that is a volume::
+
+        budget(c) = channel_width_m(Q_c) * water_depth_m(Q_c) * cell_m
+
+    AND IT VARIES ALONG THE RIVER, which is the point. Q is a per-cell field
+    that grows every time a tributary joins, so a headwater cell gets a small
+    budget and the trunk below a confluence gets a large one, from the same
+    rule. The budget is not a constant being tuned; it is the watershed.
+
+    WHAT IT BUYS. The same river runs WIDE AND SHALLOW on a flat valley floor
+    and NARROW AND DEEP in a gorge, because the terrain decides the shape of a
+    fixed volume rather than the volume being decided by the terrain. And water
+    physically cannot spread past what it carries, no matter how flat the floor
+    is or how many times the relaxation iterates.
+
+    HOW A CELL IS CHARGED. Every settled cell carries ``own``, the flat index of
+    the drawn channel cell whose surface it inherited, propagated alongside the
+    level during the spread. Its volume is depth x cell area. Per owner the
+    settled cells are then kept DEEPEST FIRST until the budget runs out, which
+    is the discrete form of lowering that owner's water surface until the
+    cross-section fits -- the shallow rim goes first, exactly as a falling
+    level would strand it.
+
+    The drawn channel itself is never charged and never removed: it is the
+    cross-section the budget is written against, not a claimant on it.
+    """
+    w = np.asarray(w, np.float32)
+    drawn = np.isfinite(np.asarray(w_drawn, np.float32))
+    added = np.isfinite(w) & ~drawn
+    n_added = int(added.sum())
+    stats = {"budget_added_in": float(n_added)}
+    if n_added == 0:
+        return w, stats
+
+    cell_area = float(cell_m) * float(cell_m)
+    idx = np.flatnonzero(added.ravel())
+    owner = np.asarray(own, np.int64).ravel()[idx]
+    depth = (w.ravel()[idx] - np.asarray(z, np.float32).ravel()[idx]).astype(np.float64)
+    depth = np.maximum(depth, 0.0)
+    vol = depth * cell_area
+
+    qf = np.asarray(q_m3_yr, np.float64).ravel()
+    valid = owner >= 0
+    if not valid.all():
+        idx, owner, depth, vol = idx[valid], owner[valid], depth[valid], vol[valid]
+    q_own = qf[owner]
+    budget = (channel_width_m(q_own, q_perennial)
+              * water_depth_m(q_own, q_perennial)
+              * float(cell_m))
+
+    # Deepest first within each owner, then a running total per owner: the
+    # discrete form of dropping that owner's surface until the section fits.
+    order = np.lexsort((-depth, owner))
+    o_s, v_s, b_s = owner[order], vol[order], budget[order]
+    start = np.empty(o_s.size, bool)
+    start[0] = True
+    start[1:] = o_s[1:] != o_s[:-1]
+    run = np.cumsum(v_s)
+    base = np.maximum.accumulate(np.where(start, run - v_s, -np.inf))
+    keep_s = (run - base) <= b_s
+    keep = np.zeros(o_s.size, bool)
+    keep[order] = keep_s
+
+    dropped = idx[~keep]
+    flat = w.ravel()
+    flat[dropped] = np.float32(np.nan)
+    stats.update({
+        "budget_kept": float(int(keep.sum())),
+        "budget_dropped": float(int(dropped.size)),
+        "budget_dropped_frac": float(dropped.size / max(n_added, 1)),
+    })
+    return w, stats
+
+
+def _settle_round(w, z, floor, max_iter, own=None):
     """One spread-then-drain round, in place on `w`. Returns (added, drained)."""
     added_total = 0
     first_wet = ~np.isfinite(w)   # dry at the START of this round
@@ -855,14 +955,27 @@ def _settle_round(w, z, floor, max_iter):
         wet = np.isfinite(w)
         lvl = np.where(wet, w, -np.inf).astype(np.float32)
         best = np.full_like(lvl, -np.inf)
+        # Carry the OWNER of the winning level with the level itself, so a
+        # settled cell knows which channel cell's cross-section it is charged
+        # against. Without this the budget has no one to bill.
+        best_own = np.full(w.shape, -1, np.int64) if own is not None else None
         for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0),
                        (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            best = np.maximum(best, _shift2(lvl, dy, dx, -np.inf))
+            cand = _shift2(lvl, dy, dx, -np.inf)
+            if best_own is None:
+                best = np.maximum(best, cand)
+            else:
+                take = cand > best
+                best = np.where(take, cand, best)
+                best_own = np.where(take, _shift2(own, dy, dx, np.int64(-1)),
+                                    best_own)
         new = (~wet) & np.isfinite(best) & (best > -1e30) & (z <= best - floor)
         n = int(new.sum())
         if n == 0:
             break
         w[new] = best[new]
+        if own is not None:
+            own[new] = best_own[new]
         added_total += n
     # AND NOW LET IT DRAIN, which is the half that makes this settling rather
     # than spreading. Measured without it, the spread has NO equilibrium: 8
