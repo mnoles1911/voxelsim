@@ -1,0 +1,13 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-b901833bd
+tiles: [(-5, -4), (-3, -4), (-5, -5), (-4, -5), (-3, -5)]
+[coarse] 20/20 ring tiles available (generate=False) cpu=0.0s
+[flow L1] 1 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed  cpu=0.6s
+[flow L0] 4 superblock(s) @ 30 m/px, span 61 km  fp=3d3c80deb245,4c8482ae6f68,a79fab8d28ee,c35c5715fa63  cpu=0.8s
+[1/5] baked (-5,-4) cpu=352.8s water=1.014%wet max_catchment=173.3km2 incision_p99=25.00m channels=48149077 injected=148.1km2/Q2.65e+07m3yr@179mm qmax=1.84e+08 drawnpad=680748 basin=1.1%/22m bridge=31050@0.19m lvl=428561 span_drop=29/25ha@21m hydro=3d3c80deb245
+[2/5] baked (-3,-4) cpu=379.7s water=0.527%wet max_catchment=266.1km2 incision_p99=25.00m channels=61068940 injected=84.9km2/Q7.8e+07m3yr@918mm qmax=1.93e+08 drawnpad=353855 basin=0.9%/46m bridge=41700@0.34m lvl=186577 span_drop=16/22ha@40m hydro=c35c5715fa63
+[3/5] baked (-5,-5) cpu=316.0s water=1.300%wet max_catchment=75.2km2 incision_p99=16.78m channels=26591131 injected=20.6km2/Q1.65e+05m3yr@8mm qmax=5.31e+07 drawnpad=872533 basin=1.7%/44m bridge=44341@0.10m lvl=478211 span_drop=18/24ha@41m hydro=a79fab8d28ee
+[4/5] baked (-4,-5) cpu=350.0s water=1.028%wet max_catchment=171.3km2 incision_p99=25.00m channels=41731447 injected=50.0km2/Q1.81e+06m3yr@36mm qmax=1.31e+08 drawnpad=689838 basin=2.4%/36m bridge=29482@0.19m lvl=397573 span_drop=29/35ha@34m hydro=4c8482ae6f68
+  warning: tile (-3,-5) contains a flat/basin 1003 m across, wider than the 960 m apron. Elevations still agree across the seam (the effect is sub-ULP, below the 100 mm wire LSB) but its ROUTING may not -- see pipeline.APRON_BLIND_SPOT.
+[5/5] baked (-3,-5) cpu=376.7s water=0.896%wet max_catchment=145.2km2 incision_p99=25.00m channels=60091888 injected=285.7km2/Q2.02e+08m3yr@707mm qmax=2.26e+08 drawnpad=601330 basin=1.5%/40m bridge=23016@0.23m lvl=361837 span_drop=19/22ha@20m hydro=4c8482ae6f68
+Bake complete: baked=5 skipped=0 unencoded=0 total=5 incomplete_superblocks=0 stale_superblocks=0 cpu_seconds=1805.9

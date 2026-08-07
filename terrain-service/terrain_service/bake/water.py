@@ -192,14 +192,42 @@ CHANNEL_REF_DEPTH_M = 0.3
 #: against Earth's 2.8 -> 26 m and 0.39 -> 2.8 m, with both ends still off their
 #: caps. That is the change that answers "why are rivers a maximum of 2 m deep?".
 #:
-#: WHAT BLOCKS IT: at 166/128 the voxel-core test
-#: ``channel_is_continuous_across_confluences`` fails its ``cs.inBed`` check --
-#: a sample taken AT a river junction reports itself outside the channel bed.
-#: Wider channels should make that assertion EASIER to satisfy, not harder, so
-#: the failure is not understood, and an unexplained failure in channel
-#: CONTINUITY is exactly the class that produces disconnected rivers. Flipping a
-#: number that rolls bake_ver on an unexplained red test is not a trade worth
-#: taking; the constants below stay at Earth's values until it is explained.
+#: WHAT BLOCKS IT -- EXPLAINED 2026-08-07, and the answer is "do not flip these".
+#: The ``cs.inBed`` red was the symptom, not the disease. Building voxel-core at
+#: 166/128 and running the suite, the load-bearing failures are these, and they
+#: are not about confluences at all::
+#:
+#:     test_channel.cpp:199  CHECK(bigW >= 40'000 && bigW <= 90'000)
+#:     test_channel.cpp:200  CHECK(bigD >=  4'000 && bigD <= 12'000)
+#:
+#: ``bigQ`` there is a catchment 10,000x the drawable threshold -- a major
+#: river -- and those bounds are a deliberate guard with the comment "that lands
+#: on a physically sensible river: tens of metres wide, several metres deep".
+#: At 166/128 that same river measures 400 m wide and 25 m deep: 4.4x over the
+#: width ceiling and 2x over the depth ceiling. The width also hits
+#: CHANNEL_MAX_WIDTH_M (400.0) exactly, i.e. it is not merely large, it is
+#: SATURATED, so beyond that point discharge stops changing the river at all.
+#:
+#: That also disposes of the "wider channels should make inBed EASIER" puzzle
+#: that parked this for days. The fixture valley in that test is ~18 m across.
+#: A 400 m channel does not widen it, it swallows it -- every reach influences
+#: every cell and the reaches overlap wholesale. inBed failing under geometry
+#: that large is a consequence of the breached bound, not independent evidence
+#: of a continuity bug. (Mechanism consistent with the numbers; not separately
+#: instrumented, because the bound alone settles the decision.)
+#:
+#: The remaining reds at 166/128 -- test_channel.cpp:222-223 -- are just the
+#: pinned decade-by-decade table restating the old exponents. Those would be
+#: updated by such a change, not violated by it. Do not mistake them for
+#: evidence either way.
+#:
+#: SO: 166/128 is rejected on its own merits, not deferred. If the owner still
+#: wants more dramatic rivers -- and the ask was real -- the lever is NOT this
+#: exponent pair, because the drawn width is set by ``fill_to_local_surface``
+#: spreading to the local level, and the probe measures the drawn river at
+#: 1.62 px = 3.04 m mean width against 20-37 m of available valley floor. Raise
+#: what the water SPREADS to, and revisit CHANNEL_MAX_WIDTH_M, before touching
+#: an exponent whose own test says the result stops being a river.
 #:
 #: The plumbing is ready: both are now identity-covered bake constants (see
 #: BakeConstants.channel_width_exp_q8), so flipping them is a two-line change
