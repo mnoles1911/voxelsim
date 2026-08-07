@@ -700,6 +700,44 @@ int main(int argc, char** argv) {
             std::printf("  rise mm           : p50 %d  p90 %d  max %d\n", adjRiseMm[adjRiseMm.size() / 2],
                         adjRiseMm[(adjRiseMm.size() * 9) / 10], worstAdjRiseMm);
         }
+        // THE LONG PROFILE, because the rise count cannot see the failure mode
+        // of any rule that fixes rises by LOWERING water: a perfectly flat
+        // river has zero rises and is also ruined. Report the gradient the
+        // reaches actually descend at, so flattening shows up as the drop per
+        // kilometre collapsing rather than as a number that looks like success.
+        {
+            std::vector<double> gradMPerKm;
+            double totalDropM = 0.0, totalLenM = 0.0;
+            for (const RiverRibbonPath& p : paths) {
+                if (p.pts.size() < 2) continue;
+                const int32_t a = p.pts.front().surfaceMm, b = p.pts.back().surfaceMm;
+                if (a == kNoWaterMm || b == kNoWaterMm) continue;
+                double lenM = 0.0;
+                for (size_t i = 0; i + 1 < p.pts.size(); ++i) {
+                    const double ddx = double(p.pts[i + 1].px - p.pts[i].px);
+                    const double ddy = double(p.pts[i + 1].py - p.pts[i].py);
+                    lenM += std::sqrt(ddx * ddx + ddy * ddy) * (double(pixelMm) / 1000.0);
+                }
+                if (lenM <= 0.0) continue;
+                const double dropM = double(a - b) / 1000.0;  // oriented: a is upstream
+                totalDropM += dropM;
+                totalLenM += lenM;
+                gradMPerKm.push_back(dropM / (lenM / 1000.0));
+            }
+            std::printf("  -- LONG PROFILE (the check a rise count cannot make) --\n");
+            if (!gradMPerKm.empty()) {
+                std::sort(gradMPerKm.begin(), gradMPerKm.end());
+                std::printf("  reach gradient m/km: p10 %.1f  p50 %.1f  p90 %.1f\n",
+                            gradMPerKm[gradMPerKm.size() / 10],
+                            gradMPerKm[gradMPerKm.size() / 2],
+                            gradMPerKm[(gradMPerKm.size() * 9) / 10]);
+                std::printf("  aggregate          : %.1f m of drop over %.1f km = %.1f m/km\n",
+                            totalDropM, totalLenM / 1000.0,
+                            totalLenM > 0.0 ? totalDropM / (totalLenM / 1000.0) : 0.0);
+            }
+            std::printf("  A LEVELLING RULE THAT FLATTENS THE RIVER SHOWS UP HERE, NOT ABOVE.\n");
+        }
+
         std::printf("  READ THIS CAREFULLY. enforce_descent guarantees non-increasing surface along\n"
                     "  the D8 RECEIVER FOREST. This walks the traced MEDIAL AXIS, which is a\n"
                     "  different path -- it can cross between adjacent reaches at a stitch, and a\n"
