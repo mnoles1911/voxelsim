@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 14
+BAKE_VERSION = 15
 
 
 @dataclass(frozen=True)
@@ -1228,7 +1228,7 @@ class BakeConstants:
     #: means channel geometry and channel water are no longer derived from the
     #: same boundary condition, which is exactly the class of drift
     #: `_edge_entries` was split out to prevent. Measure both.
-    water_inject_at_interior_rim: bool = False
+    water_inject_at_interior_rim: bool = True
 
     #: F3: put SLOPE in the depth law. Off by default -- flipping it rolls
     #: ``bake_ver`` and invalidates every baked water plane, exactly as
@@ -1256,7 +1256,7 @@ class BakeConstants:
     #: term, so with slope in the law the bridge should become close to a no-op
     #: on steep reaches. If it is still doing heavy lifting, the depth model is
     #: still wrong and this goes back off rather than getting tuned.
-    water_slope_in_depth: bool = False
+    water_slope_in_depth: bool = True
 
     #: The same missing physics as ``water_slope_in_depth``, in the EXTENT rule
     #: instead of the depth law. Off by default; separate from the depth flag so
@@ -1278,7 +1278,7 @@ class BakeConstants:
     #: flood's clothes") after a measured 209x flood, and scaling the threshold
     #: keeps connectedness, levelness and downstream descent intact because it
     #: changes which cells clear the bar, never where a level came from.
-    water_slope_in_extent: bool = False
+    water_slope_in_extent: bool = True
 
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.

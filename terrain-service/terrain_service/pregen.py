@@ -822,6 +822,21 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             f"{_inflow_currency(result.stats)} "
             f"basin={result.stats['basin_cells_frac']*100:.1f}%/"
             f"{result.stats['basin_max_depth_m']:.0f}m "
+            # LAKES THIS TILE THREW AWAY, and it belongs on the same line as the
+            # ones it kept. `basin_exclude_spanning` defaults TRUE, so a basin
+            # touching the interior edge is dropped from the registry -- and B5
+            # re-opens the hole ONLY under `survey.keep_mask()`, so a dropped
+            # basin keeps its depression FILLED and ships as solid ground. A
+            # large lake becomes a flat plain and nothing in the log said so.
+            #
+            # The world survey that measured this (docs/lake-survey/) found 1322
+            # spanning components against 997 kept -- more lake AREA excluded
+            # than retained -- but it is bake_ver 7 against today's 14 and it is
+            # 12 tiles. Printing it per tile is how that number stops being
+            # stale: every bake now states its own.
+            f"span_drop={int(result.stats.get('basins_excluded_spanning', 0))}"
+            f"/{result.stats.get('basins_excluded_spanning_area_m2', 0.0) / 1e4:.0f}ha"
+            f"@{result.stats.get('basins_excluded_spanning_max_depth_m', 0.0):.0f}m "
             f"hydro={result.superblock_fingerprint[:12] or 'none'}",
             file=sys.stderr,
         )

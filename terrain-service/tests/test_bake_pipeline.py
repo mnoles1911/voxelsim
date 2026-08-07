@@ -2954,7 +2954,11 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     off = pipeline.product_identity_payload(
         dataclasses.replace(pipeline.CONSTANTS, water_face_contact_bridge=False))
     assert on != off
-    assert on["bake_version"] == 14
+    # 14 -> 15 on 2026-08-06, when F6 and the two slope terms were flipped on
+    # together. The literal is deliberate: it forces a conscious edit at every
+    # roll instead of letting the version drift silently, which is why this is
+    # pinned rather than read from pipeline.BAKE_VERSION.
+    assert on["bake_version"] == 15
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -3135,16 +3139,34 @@ def test_slope_to_receiver_measures_a_diagonal_step_as_root_two():
     assert s[1, 1] == pytest.approx(1.0 / np.sqrt(2.0))  # diagonal: 1 m over sqrt(2) m
 
 
-def test_slope_in_depth_is_off_by_default():
-    """Flipping it rolls bake_ver and invalidates every baked water plane.
+def test_the_water_physics_constants_are_on_and_identity_covered():
+    """The three that were flipped together at bake_ver 15, 2026-08-06.
 
-    Same cost as water_inject_at_interior_rim, which is why the two should be
-    decided together and rolled once.
+    They were each off by default while unproven, and flipping any one of them
+    rolls bake_ver and invalidates every baked water plane -- so they were
+    decided together and rolled ONCE rather than three times:
+
+      * water_inject_at_interior_rim -- F6. The pyramid delivered discharge onto
+        the tile's 960 m apron instead of into the tile. Measured 300x on
+        (-7,-5): 0.041 -> 12.40 m3/s.
+      * water_slope_in_depth -- F3. Leopold & Maddock depth has no slope term,
+        on a profile running 173 -> 29 m/km.
+      * water_slope_in_extent -- the same missing physics in the extent rule, so
+        water concentrates on steep ground instead of spreading as a sheet.
+
+    Identity coverage is the half that must never regress: a product constant
+    that fed no identity would change written bytes under an unchanged
+    namespace, which is exactly what product_identity_payload exists to prevent.
     """
     from terrain_service.bake.pipeline import BakeConstants
 
-    assert BakeConstants().water_slope_in_depth is False
-    assert "water_slope_in_depth" in BakeConstants.PRODUCT_FIELDS
+    c = BakeConstants()
+    assert c.water_inject_at_interior_rim is True
+    assert c.water_slope_in_depth is True
+    assert c.water_slope_in_extent is True
+    for name in ("water_inject_at_interior_rim", "water_slope_in_depth",
+                 "water_slope_in_extent"):
+        assert name in BakeConstants.PRODUCT_FIELDS
 
 
 def test_channel_exponents_match_the_mirror():
