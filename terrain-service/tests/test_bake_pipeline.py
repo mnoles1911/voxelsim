@@ -2958,7 +2958,7 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # together. The literal is deliberate: it forces a conscious edit at every
     # roll instead of letting the version drift silently, which is why this is
     # pinned rather than read from pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 15
+    assert on["bake_version"] == 16
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -3256,3 +3256,67 @@ def test_slope_in_extent_narrows_a_steep_reach_and_leaves_a_floodplain_alone():
     assert flat_on >= steep_on, "a floodplain must not end up narrower than a gorge"
     # And the narrowing must be a slope effect, not a blanket reduction.
     assert (steep_off - steep_on) > (flat_off - flat_on)
+
+
+def test_neighbour_consistency_removes_uphill_water_without_drying_a_cell():
+    """The two properties that make this pass safe to apply unconditionally.
+
+    Measured motivation: on tile (-4,-4) at bake_ver 15, 13.59% of downstream
+    steps along traced reaches have the water surface RISING (p90 627 mm
+    against a 100 mm wire LSB), and 100% of them are between touching pixels.
+    enforce_descent does not cover it -- it guarantees descent along the D8
+    RECEIVER FOREST, and two adjacent channel pixels can drain to different
+    receivers.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    # A ground ramp descending in +x, with one cell holding water ABOVE the
+    # water of its uphill neighbour -- the impossible state.
+    z = np.zeros((3, 6), np.float32)
+    for x in range(6):
+        z[:, x] = 10.0 - x
+    water = np.full((3, 6), np.nan, np.float32)
+    water[1, :] = z[1, :] + 0.5
+    water[1, 3] = z[1, 3] + 3.0          # stands above its uphill feeder
+
+    assert water[1, 3] > water[1, 2]     # the defect exists in the fixture
+    out, stats = w.enforce_neighbour_consistency(water, z)
+
+    # Property 1: no wet cell stands higher than adjacent water on higher ground.
+    for x in range(1, 6):
+        if np.isfinite(out[1, x]) and np.isfinite(out[1, x - 1]):
+            assert out[1, x] <= out[1, x - 1] + 1e-6
+
+    # Property 2: IT CANNOT DRY A CELL. The replacement value is an upstream
+    # neighbour's surface and that neighbour stands on higher ground, so the new
+    # surface still clears this cell's own ground. This is what makes the pass
+    # safe to run everywhere rather than only on flagged cells.
+    before_wet = np.isfinite(water)
+    after_wet = np.isfinite(out) & (out > z)
+    assert int(after_wet.sum()) == int(before_wet.sum())
+
+    assert stats["level_consistency_converged"] == 1.0
+    assert stats["level_consistency_lowerings"] > 0
+
+
+def test_neighbour_consistency_leaves_a_consistent_plane_alone():
+    """It must be a no-op where nothing is wrong, or it is a smoothing filter.
+
+    The rule that was tried FIRST -- equalise every connected adjacent pair,
+    "water finds its level" -- fails this: it drags a legitimate downstream
+    gradient toward the global minimum, measured at a median 925 mm drop on
+    essentially every wet cell. A river has a gradient by definition.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    z = np.zeros((3, 6), np.float32)
+    for x in range(6):
+        z[:, x] = 10.0 - x
+    water = np.full((3, 6), np.nan, np.float32)
+    water[1, :] = z[1, :] + 0.5          # constant depth on a descending bed
+
+    out, stats = w.enforce_neighbour_consistency(water, z)
+    np.testing.assert_allclose(out[1, :], water[1, :], atol=1e-6)
+    assert stats["level_consistency_lowerings"] == 0.0

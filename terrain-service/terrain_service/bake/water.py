@@ -92,6 +92,7 @@ import numpy as np
 from . import flow as _flow
 
 __all__ = [
+    "enforce_neighbour_consistency",
     "Q_PERENNIAL_M3_YR",
     "Q_RIVER_M3_YR",
     "Q_MAJOR_M3_YR",
@@ -726,6 +727,97 @@ SLOPE_EXTENT_EXP = 1.0
 #: inundate every marginal cell.
 SLOPE_EXTENT_MIN = 1.0 / 4.0
 SLOPE_EXTENT_MAX = 8.0
+
+
+def enforce_neighbour_consistency(water_m, z_ground_m, *, max_iter: int = 512):
+    """No cell's water may stand higher than adjacent water on HIGHER ground.
+
+    THE DEFECT THIS FIXES, measured before it was written. On tile (-4,-4) at
+    bake_ver 15, 13.59% of downstream steps along traced reaches have the water
+    surface RISING -- p90 627 mm against a 100 mm wire LSB, max 4 m -- and 100%
+    of them are between 8-CONNECTED pixels, so tracing explains none of it. The
+    owner saw it from the air: "the magenta blocks actually seem to flow
+    slightly up hill".
+
+    WHY `enforce_descent` DOES NOT ALREADY COVER THIS. It guarantees a
+    non-increasing surface along the D8 RECEIVER FOREST, and it does. Two pixels
+    can sit side by side on the drawn channel and drain to DIFFERENT receivers,
+    in which case the sweep never compares them; `fill_to_local_surface` then
+    hands each the level of the reach IT drains into. The guarantee is real and
+    simply does not cover the pairs a player walks along.
+
+    THE RULE, and it is a physical impossibility rather than a smoothing. Take
+    adjacent cells ``c`` and ``b`` with ``ground[b] > ground[c]``, both wet. If
+    ``S[c] > S[b]`` then, since ``S[b] > ground[b]``, we have
+    ``S[c] > ground[b]`` -- c's water stands above b's GROUND, so nothing
+    separates them and they are one body. One body has one level, and water
+    runs to the lower one. So ``S[c] := S[b]``.
+
+    IT CANNOT DRY A CELL, structurally, which is what makes it safe to apply
+    unconditionally: the new value is an upstream neighbour's surface, that
+    neighbour stands on higher ground, so the new surface still clears this
+    cell's own ground. Measured: wet count unchanged to 0.00%.
+
+    IT IS NOT "WATER FINDS ITS LEVEL", and that distinction was bought with a
+    measurement. Equalising every connected adjacent pair -- the obvious rule --
+    removes 98% of the rises and drops the surface a median 925 mm on
+    essentially EVERY wet cell, because a flowing channel has a gradient by
+    definition and min-propagation is transitive, so it chains the global
+    minimum up the whole network and flattens the long profile. This rule is
+    directional: only a cell standing higher than its own feeder is lowered.
+
+    COST, measured on (-4,-4) to convergence (96 iterations): rises 561,643 ->
+    0, wet count unchanged, surface lowered on 274,817 cells (75% of wet) by
+    p50 634 mm. That 75% of the plane violates a physical impossibility is
+    itself the finding -- the level assignment is not seamed at rare junctions,
+    it is systematically inconsistent, which is what
+    water-system-architecture §11b means by two authorities composed with
+    nothing forcing them to agree.
+
+    ``water_m``  metres absolute, NaN dry. Modified into a copy and returned.
+    ``z_ground_m``  the SHIPPED surface, the same array
+    ``fill_to_local_surface`` tests against.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, dtype=np.float32)
+    if w.shape != z.shape:
+        raise ValueError(f"water {w.shape} does not match ground {z.shape}")
+
+    lowered = 0
+    it = 0
+    for it in range(max_iter):
+        changed = 0
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                ns = _shift2(w, dy, dx, np.float32(np.nan))
+                ng = _shift2(z, dy, dx, np.float32(-np.inf))
+                # An UPSTREAM wet neighbour: standing on higher ground, and
+                # holding water lower than ours.
+                hit = np.isfinite(w) & np.isfinite(ns) & (ng > z) & (ns < w)
+                n = int(hit.sum())
+                if n:
+                    w[hit] = ns[hit]
+                    changed += n
+        lowered += changed
+        if changed == 0:
+            break
+    stats = {
+        "level_consistency_iterations": float(it),
+        "level_consistency_converged": float(1.0 if it < max_iter - 1 else 0.0),
+        "level_consistency_lowerings": float(lowered),
+    }
+    return w, stats
+
+
+def _shift2(a, dy, dx, fill):
+    """`a` shifted by (dy, dx), edges filled. Local to the consistency pass."""
+    out = np.full_like(a, fill)
+    h, wd = a.shape
+    out[max(0, -dy):h - max(0, dy), max(0, -dx):wd - max(0, dx)] = \
+        a[max(0, dy):h - max(0, -dy), max(0, dx):wd - max(0, -dx)]
+    return out
 
 
 def fill_to_local_surface(water_m, z_ground_m, receivers, *, cell_m: float,

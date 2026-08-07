@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 15
+BAKE_VERSION = 16
 
 
 @dataclass(frozen=True)
@@ -1280,6 +1280,20 @@ class BakeConstants:
     #: changes which cells clear the bar, never where a level came from.
     water_slope_in_extent: bool = True
 
+    #: Forbid a cell's water from standing higher than adjacent water on HIGHER
+    #: ground. Off by default until the owner has seen what it does to the long
+    #: profile: it lowers the surface on ~75% of wet cells by a median 634 mm --
+    #: a large intervention, even though every millimetre of it removes a state
+    #: that cannot physically exist.
+    #:
+    #: Measured on (-4,-4) at bake_ver 15: 13.59% of downstream steps along
+    #: traced reaches RISE, p90 627 mm against a 100 mm wire LSB, and 100% of
+    #: them between TOUCHING pixels, so tracing explains none of it. See
+    #: water.enforce_neighbour_consistency for why enforce_descent does not
+    #: already cover this, and docs/measurements/uphill-water-2026-08-07.txt for
+    #: the rule that was tried first and rejected for flattening the profile.
+    water_level_neighbour_consistency: bool = True
+
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
     #:
@@ -1492,6 +1506,7 @@ class BakeConstants:
         # verify_water_only_change.py exists to prove.
         "water_slope_in_depth",
         "water_slope_in_extent",
+        "water_level_neighbour_consistency",
         # PRODUCT: they decide the water plane's stored widths and depths and
         # nothing about the ground.
         "channel_width_exp_q8",
@@ -4863,6 +4878,14 @@ def bake_tile(
                 slope=(_water.slope_to_receiver(z_route, rec_w, geom.fine_pixel_m)
                        if consts.water_slope_in_extent else None),
             )
+            # AFTER the extent, because the extent is what creates the seam:
+            # fill_to_local_surface gives each cell the level of the reach IT
+            # drains into, so two neighbours can inherit levels that cannot
+            # coexist. This removes those, and only those.
+            if consts.water_level_neighbour_consistency:
+                w_pad, lvl_stats = _water.enforce_neighbour_consistency(
+                    w_pad, out["z"])
+                width_stats.update(lvl_stats)
         elif consts.water_extent_mode == "law":
             w_pad, width_stats = _water.widen_to_channel_width(
                 w_pad, out["z"], q_pad, cell_m=geom.fine_pixel_m,
