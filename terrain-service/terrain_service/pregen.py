@@ -840,6 +840,8 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             # heavy lifting, the depth model is still wrong."
             f"bridge={int(result.stats.get('water_bridge_raised_cells', 0))}"
             f"@{result.stats.get('water_bridge_raise_p50_m', 0.0):.2f}m "
+            f"settle={int(result.stats.get('water_settle_added_cells', 0))}"
+            f"/{int(result.stats.get('water_settle_sweeps', 0))}sw "
             f"lvl={int(result.stats.get('water_level_consistency_lowerings', 0))} "
             f"span_drop={int(result.stats.get('basins_excluded_spanning', 0))}"
             f"/{result.stats.get('basins_excluded_spanning_area_m2', 0.0) / 1e4:.0f}ha"

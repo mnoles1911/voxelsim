@@ -1294,6 +1294,15 @@ class BakeConstants:
     #: the rule that was tried first and rejected for flattening the profile.
     water_level_neighbour_consistency: bool = True
 
+    #: Let water spread sideways onto ground below it, after the flow-path fill
+    #: has run. OFF until measured: the module's own history has a lateral rule
+    #: that multiplied the wet set by 209x, so this ships dark and is turned on
+    #: by a bake that has the before/after in hand.
+    water_settle_to_level: bool = False
+    #: Lateral reach of that settling, in cells. 8 = 15 m, which is a riverbed;
+    #: see settle_to_adjacent_level for why the bound is the safety argument.
+    water_settle_max_iter: int = 8
+
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
     #:
@@ -1509,6 +1518,8 @@ class BakeConstants:
         "water_level_neighbour_consistency",
         # PRODUCT: they decide the water plane's stored widths and depths and
         # nothing about the ground.
+        "water_settle_to_level",
+        "water_settle_max_iter",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -4920,6 +4931,19 @@ def bake_tile(
         # as a hand-built substitute for the slope term F3 now supplies, so how
         # much it is still doing is F3's own acceptance test. The per-tile log
         # prints both counters so the trade is visible rather than assumed.
+        # WATER FINDS ITS OWN LEVEL. Measured on tile (-4,-4) at bake_ver 17,
+        # 168,708 cells -- 59 hectares on ONE tile -- lay dry with adjacent
+        # water standing p50 0.90 m above them, because `_fill_levels` only
+        # carries a level UP a drawn cell's donors and a bed cell upstream of
+        # nothing drawn gets NaN. Runs BEFORE the consistency pass so anything
+        # it adds is held to the same no-water-above-its-upstream-neighbour
+        # rule as everything else.
+        if consts.water_settle_to_level:
+            w_pad, settle_stats = _water.settle_to_adjacent_level(
+                w_pad, out["z"], min_depth_m=_water.WIDEN_MIN_DEPTH_M,
+                max_iter=int(consts.water_settle_max_iter))
+            width_stats.update(settle_stats)
+
         if consts.water_level_neighbour_consistency:
             w_pad, lvl_stats = _water.enforce_neighbour_consistency(
                 w_pad, out["z"])

@@ -93,6 +93,7 @@ from . import flow as _flow
 
 __all__ = [
     "enforce_neighbour_consistency",
+    "settle_to_adjacent_level",
     "Q_PERENNIAL_M3_YR",
     "Q_RIVER_M3_YR",
     "Q_MAJOR_M3_YR",
@@ -755,6 +756,120 @@ SLOPE_EXTENT_EXP = 1.0
 #: inundate every marginal cell.
 SLOPE_EXTENT_MIN = 1.0 / 4.0
 SLOPE_EXTENT_MAX = 8.0
+
+
+def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
+                             max_iter: int = 8):
+    """Let water spread sideways onto ground that lies BELOW it. ``(w, stats)``.
+
+    THE DEFECT, measured on tile (-4,-4) at bake_ver 17 against the bake's own
+    ``elevation_m`` (not a Python reconstruction -- see the retraction in
+    ``docs/measurements/water-surface-roughness-2026-08-07.txt``)::
+
+        dry cells touching water                     285,518
+        ...whose ground is BELOW that water          169,759  (59.5%)
+        how far below                       p50 0.90 m  p90 2.64 m
+
+    In the 0.1-5 m band that is 168,708 cells = 59 HECTARES of channel floor,
+    on ONE tile, standing dry with water 90 cm above it in the very next cell.
+    Not registered basins: the count is flat from 5 m to 25 m, so the deep holes
+    that carry their own surface on the wire are not what makes it.
+
+    WHY IT HAPPENS, and it is not a tuning miss. ``_fill_levels`` carries a
+    drawn cell's surface UP ITS OWN DONORS -- the cells that flow INTO it. A
+    cell in the riverbed that is upstream of nothing drawn, or whose flow path
+    leaves the tile first, terminates at a root and gets NaN. The code says so
+    itself: such a cell is "dry for want of a number rather than for want of
+    room". That is a single path lookup, not water settling, so it has no way
+    to notice that the cell beside it is under water.
+
+    THE RULE. A dry cell joins at its highest adjacent water surface when its
+    ground lies at least ``min_depth_m`` below it. Iterated, because a filled
+    cell is then itself a neighbour -- this is the "water finds its own level"
+    the path lookup cannot express.
+
+    WHY IT DOES NOT FLOOD THE CONTINENT, which is the failure this whole
+    module is shaped around (``fill_to_local_surface`` records a "nearest
+    channel" variant taking 317,665 wet cells to 66,546,420, a factor of 209).
+    Two reasons, and the second is the load-bearing one:
+
+      * It never invents a level. A cell can only take a surface that already
+        exists next to it, so no level is carried away from the water that
+        owns it -- which is exactly the mechanism of the 209x flood, where a
+        level was carried down a hillside and never re-anchored.
+      * ``max_iter`` BOUNDS THE LATERAL REACH, at 8 cells = 15 m by default,
+        and the bound is honest rather than incidental: the measured shortfall
+        is p50 0.90 m of depth in a bed a few cells wide, so a fill that needs
+        more than 15 m of reach is no longer filling a riverbed. If a future
+        bake wants unbounded settling it must argue for it and re-measure the
+        209x, not raise a number quietly.
+
+    It cannot lower a cell, cannot touch a drawn cell, and cannot raise any
+    existing surface -- so ``graded_water_surface``'s downstream descent and
+    the basin table's ownership both survive unchanged.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, np.float32)
+    if z.shape != w.shape:
+        raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
+    floor = np.float32(min_depth_m)
+    added_total = 0
+    sweeps = 0
+    for _ in range(int(max_iter)):
+        wet = np.isfinite(w)
+        lvl = np.where(wet, w, -np.inf).astype(np.float32)
+        best = np.full_like(lvl, -np.inf)
+        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            best = np.maximum(best, _shift2(lvl, dy, dx, -np.inf))
+        new = (~wet) & np.isfinite(best) & (best > -1e30) & (z <= best - floor)
+        n = int(new.sum())
+        sweeps += 1
+        if n == 0:
+            break
+        w[new] = best[new]
+        added_total += n
+    # AND NOW LET IT DRAIN, which is the half that makes this settling rather
+    # than spreading. Measured without it, the spread has NO equilibrium: 8
+    # sweeps add 705k cells at p50 1.04 m depth and p90 13.1 m from existing
+    # water, 24 sweeps add 1,510k at p50 1.34 m and p90 28.7 m, and it is still
+    # growing at the cap. That is the module's documented failure -- a level
+    # carried away from the water that owns it and never re-anchored -- so
+    # `max_iter` was not a safety bound, it was the only thing stopping it.
+    #
+    # THE RULE: an ADDED cell may not hold water perched above dry ground it
+    # could run off onto. If its steepest-descent neighbour is dry and lies
+    # below its surface, the water leaves. Iterated, so a whole perched sheet
+    # unwinds from its downhill edge inward.
+    #
+    # Drawn cells are never removed: a river drains by definition, and its
+    # escape is the wet cell downstream, not dry ground. What survives is water
+    # that is either the channel itself or genuinely impounded -- which is what
+    # "water finds its own level" means once the water is allowed to leave.
+    drained_total = 0
+    if added_total:
+        added = np.isfinite(w) & ~np.isfinite(np.asarray(water_m, np.float32))
+        for _ in range(int(max_iter) * 4):
+            wet = np.isfinite(w)
+            esc = np.zeros(w.shape, bool)
+            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                gn = _shift2(z, dy, dx, np.float32(np.inf))
+                wn = _shift2(wet.astype(np.uint8), dy, dx, np.uint8(0)) != 0
+                esc |= (~wn) & (gn < w - floor)
+            gone = added & wet & esc
+            k = int(gone.sum())
+            if k == 0:
+                break
+            w[gone] = np.float32(np.nan)
+            drained_total += k
+    stats = {
+        "settle_sweeps": float(sweeps),
+        "settle_added_cells": float(added_total),
+        "settle_drained_cells": float(drained_total),
+        "settle_kept_cells": float(added_total - drained_total),
+    }
+    return w, stats
 
 
 def enforce_neighbour_consistency(water_m, z_ground_m, *, max_iter: int = 512):
