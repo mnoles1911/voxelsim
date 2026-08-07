@@ -4878,14 +4878,6 @@ def bake_tile(
                 slope=(_water.slope_to_receiver(z_route, rec_w, geom.fine_pixel_m)
                        if consts.water_slope_in_extent else None),
             )
-            # AFTER the extent, because the extent is what creates the seam:
-            # fill_to_local_surface gives each cell the level of the reach IT
-            # drains into, so two neighbours can inherit levels that cannot
-            # coexist. This removes those, and only those.
-            if consts.water_level_neighbour_consistency:
-                w_pad, lvl_stats = _water.enforce_neighbour_consistency(
-                    w_pad, out["z"])
-                width_stats.update(lvl_stats)
         elif consts.water_extent_mode == "law":
             w_pad, width_stats = _water.widen_to_channel_width(
                 w_pad, out["z"], q_pad, cell_m=geom.fine_pixel_m,
@@ -4915,6 +4907,23 @@ def bake_tile(
                 exclude=basin_keep_pad,
             )
             width_stats.update(bridge_stats)
+
+        # LAST, AND THAT ORDERING WAS BOUGHT WITH A WASTED BAKE. This ran
+        # BEFORE `bridge_to_face_contact` at bake_ver 16 and the bridge undid
+        # it: the bridge RAISES a cell's surface to reach its neighbours' beds,
+        # which is the exact inverse operation. Measured, the pass removed 100%
+        # of the violations offline and only 3% survived to the shipped tile
+        # (560,616 -> 544,544).
+        #
+        # Running it last means it can BREAK face contact the bridge just
+        # established. That tension is real and is the point: the bridge exists
+        # as a hand-built substitute for the slope term F3 now supplies, so how
+        # much it is still doing is F3's own acceptance test. The per-tile log
+        # prints both counters so the trade is visible rather than assumed.
+        if consts.water_level_neighbour_consistency:
+            w_pad, lvl_stats = _water.enforce_neighbour_consistency(
+                w_pad, out["z"])
+            width_stats.update(lvl_stats)
 
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])

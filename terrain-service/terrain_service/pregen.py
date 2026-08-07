@@ -834,6 +834,13 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             # than retained -- but it is bake_ver 7 against today's 14 and it is
             # 12 tiles. Printing it per tile is how that number stops being
             # stale: every bake now states its own.
+            # HOW MUCH bridge_to_face_contact IS DOING, which is F3's own
+            # acceptance test: "with slope in the depth law the bridge should
+            # become close to a no-op on steep reaches. If it is still doing
+            # heavy lifting, the depth model is still wrong."
+            f"bridge={int(result.stats.get('bridge_raised_cells', 0))}"
+            f"@{result.stats.get('bridge_raise_p50_m', 0.0):.2f}m "
+            f"lvl={int(result.stats.get('level_consistency_lowerings', 0))} "
             f"span_drop={int(result.stats.get('basins_excluded_spanning', 0))}"
             f"/{result.stats.get('basins_excluded_spanning_area_m2', 0.0) / 1e4:.0f}ha"
             f"@{result.stats.get('basins_excluded_spanning_max_depth_m', 0.0):.0f}m "
