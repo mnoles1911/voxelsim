@@ -34,6 +34,29 @@ inline constexpr int32_t kNoWaterMarkerMm = INT32_MIN;
 //: constant rather than a query.
 inline constexpr int64_t kWaterMarkerMaxDepthMm = 32767 * 10;
 
+//: HOW THICK THE MARKER IS, measured up from the ground -- NOT up to the water
+//: surface.
+//:
+//: The marker used to fill every voxel between the ground and the baked water
+//: surface, which is solid magenta all the way down a lake. That is 40 m of
+//: voxels to show a surface nobody can see inside, and it cost the thing it was
+//: meant to help: a 40 m column is FIFTY 8-voxel bricks where dry ground needs
+//: one, so the deepest water -- the INTERIOR of every lake and river -- became
+//: fifty times more expensive to generate than its own shoreline. Flown, that
+//: read exactly as reported: "many voxel chunks unload when it gets close, then
+//: the chunks reload except for the ones in the interior of the river and lake
+//: water bodies", with the interiors never returning.
+//:
+//: A placement instrument does not need volume. It needs to say WHERE water is,
+//: and 3 m of magenta hugging the ground says that from any angle a player will
+//: ever see it from, at the cost of ~4 bricks instead of ~50.
+//:
+//: WHAT IT GIVES UP, stated: the marker no longer shows how DEEP the water is,
+//: and its top is no longer the true water surface on anything deeper than this.
+//: Depth is a number the probes report far better than an eye can judge from a
+//: magenta block, and the owner's question was always placement.
+inline constexpr int64_t kWaterMarkerHeightMm = 3000;
+
 struct ColumnSample {
     int32_t surfaceMm = 0;      // terrain surface elevation, mm above sea level
     int32_t topsoilMm = 0;      // layer thickness below surface
@@ -238,6 +261,12 @@ public:
         waterMarker_ = sampler;
         waterMarkerOcean_ = includeOcean;
     }
+    // How far the marker searches sideways for a water level, in FINE PIXELS.
+    // ZERO IS THE DEFAULT AND IT IS NOT A TASTE DECISION -- see
+    // waterMarkerFillPx_ for the measurement. Non-zero costs 8*n LOCKED water
+    // sampler queries on EVERY column in the world, wet or dry, and dry is
+    // 99.4% of them.
+    void setWaterMarkerFillPx(int64_t px) { waterMarkerFillPx_ = px < 0 ? 0 : px; }
     IWaterSampler* waterMarker() const { return waterMarker_; }
     bool waterMarkerEnabled() const { return waterMarker_ != nullptr; }
 
@@ -482,9 +511,36 @@ private:
     mutable std::atomic<int64_t> markerMarked_{0};
     mutable std::atomic<int64_t> markerAboveGround_{0};
     // How far the marker's lateral fill searches for a water level, in FINE
-    // PIXELS. See the search in amplifier.cpp: 8 rays, so the cost is 8*N
-    // sampler queries per column and only in a marker session.
-    int64_t waterMarkerFillPx_ = 8;
+    // PIXELS. See the search in amplifier.cpp.
+    //
+    // ZERO BY DEFAULT, MEASURED. Same pose, 90 s of streaming, marker only:
+    //
+    //   marker off                 51,063 chunks, settled (0 in flight, 0 pending)
+    //   marker on, search 8 px     19,162 chunks, NOT settled (96 in flight, 860 pending)
+    //   marker on, search off      51,059 chunks, settled
+    //
+    // The whole 2.7x regression was this search and nothing else -- with it off
+    // the marker is free. It costs 8*n LOCKED water-sampler queries on EVERY
+    // column, and 99.4% of columns are dry, so the world pays for a waterline
+    // refinement it has no water to refine.
+    //
+    // Turn it on with -VoxelWaterMarkerFillPx=<n> when inspecting a waterline
+    // and accept the slowdown; leave it off to fly the world.
+    //
+    // EIGHT WAS A MEASURED DISASTER for a second reason worth keeping. The search hands a dry column the water
+    // level of the nearest wet cell within the radius, and the per-voxel test
+    // then wets it wherever its ground is below that level. At 8 px (15 m) on a
+    // valley floor that is almost every column, so the marker stopped being a
+    // waterline and became a flood: 35.6 MILLION quads against ~1.8 M on the
+    // same site with the marker working correctly, with the streamer unable to
+    // keep up with the player and terrain chunks arriving minutes late.
+    //
+    // One pixel is what an edge actually needs. The defect being fixed is that
+    // the baked wet mask is quantised to 1,875 mm, so the waterline snaps to a
+    // cell boundary; reaching ONE cell past the mask is enough for the
+    // amplified 10 cm ground to decide where the water really ends. Anything
+    // beyond that is not resolving an edge, it is inventing water.
+    int64_t waterMarkerFillPx_ = 0;
 };
 
 } // namespace vxc

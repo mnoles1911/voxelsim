@@ -32,6 +32,7 @@ public:
     void setWaterMarker(IWaterSampler* sampler, bool includeOcean = true) {
         amp_.setWaterMarker(sampler, includeOcean);
     }
+    void setWaterMarkerFillPx(int64_t px) { amp_.setWaterMarkerFillPx(px); }
     // See Amplifier::waterMarkerColumnsMarked -- the two numbers that separate
     // "the marker is not wired up" from "the camera never looked at water" from
     // "the water is there and something downstream will not draw it".

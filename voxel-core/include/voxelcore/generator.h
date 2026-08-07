@@ -213,8 +213,20 @@ public:
             // kNoWaterMarkerMm on every column unless a sampler is installed.
             if (col.waterSurfaceMm != kNoWaterMarkerMm &&
                 int64_t(col.waterSurfaceMm) > int64_t(col.surfaceMm)) {
+                // CAPPED, and the cap is what makes this affordable. Reaching
+                // the true surface of a 40 m lake means fifty 8-voxel bricks
+                // where dry ground needs one, and the deepest water is a
+                // basin's INTERIOR -- so the middle of every lake became fifty
+                // times the work of its shoreline and stopped coming back at
+                // all. Amplifier::column caps the marker to a
+                // kWaterMarkerHeightMm slab for the same reason; this must
+                // agree with it or the band and the fill disagree about which
+                // bricks can hold magenta.
+                const int64_t markerTopMm =
+                    std::min(int64_t(col.waterSurfaceMm),
+                             int64_t(col.surfaceMm) + kWaterMarkerHeightMm);
                 const int64_t wtop0 =
-                    floorDiv(int64_t(col.waterSurfaceMm) - kVoxelSizeMm / 2, kVoxelSizeMm);
+                    floorDiv(markerTopMm - kVoxelSizeMm / 2, kVoxelSizeMm);
                 const int64_t whi = floorDiv(wtop0 - s / 2, s);
                 if (whi > vzMax) vzMax = whi;
             }

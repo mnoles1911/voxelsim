@@ -13788,6 +13788,22 @@ bool UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool 
 	}
 
 	Impl->Voxels.setWaterMarker(Sampler, bIncludeOcean);
+	// -VoxelWaterMarkerFillPx=<n>: how far the marker searches sideways for a
+	// water level. OFF unless asked for, and the reason is measured rather than
+	// cautious -- same pose, 90 s, marker only: 51,063 chunks settled with the
+	// search off against 19,162 still churning with it at 8 px. It costs 8*n
+	// LOCKED water-sampler queries on EVERY column, and 99.4% of columns are
+	// dry, so the whole world pays to refine a waterline it does not have.
+	int32 FillPx = 0;
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarkerFillPx="), FillPx);
+	Impl->Voxels.setWaterMarkerFillPx(FMath::Clamp(FillPx, 0, 32));
+	if (FillPx > 0)
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("VoxelWaterMarker: lateral fill search %d px -- this SLOWS STREAMING roughly 2.7x "
+		            "at 8 px (measured). Use it to inspect a waterline, not to fly the world."),
+		       FillPx);
+	}
 	UE_LOG(LogVoxelEarth, Warning,
 	       TEXT("VoxelWaterMarker: INSTALLED. Water is drawn as SOLID MAT_WATERMARK voxels; this is a debug ")
 	       TEXT("instrument and the world is not shippable in this state. The GPU mesh fork is off for this ")

@@ -2105,7 +2105,11 @@ int64_t Amplifier::surfaceUpperBoundMm(int64_t vx0, int64_t vy0, int64_t vx1,
     //     waterSurface <= ground + kWaterMarkerMaxDepthMm
     // everywhere the plane can express it; the sea is bounded by its own datum.
     // Conservative, sound, and only ever on in a debug session.
-    const int64_t marked = hi + kWaterMarkerMaxDepthMm;
+    // kWaterMarkerHeightMm, not kWaterMarkerMaxDepthMm: the marker is capped to
+    // a slab that thick above the ground, so bounding for the wire format's
+    // maximum expressible depth (327 m) would declare a third of a kilometre of
+    // sky as possibly-solid and admit chunks that can only ever be air.
+    const int64_t marked = hi + kWaterMarkerHeightMm;
     return marked > int64_t(kSeaLevelMm) ? marked : int64_t(kSeaLevelMm);
 }
 
@@ -2388,6 +2392,16 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
             if (s01 != kNoWaterMarkerMm) { acc += int64_t(s01) * w01; wsum += w01; }
             if (s11 != kNoWaterMarkerMm) { acc += int64_t(s11) * w11; wsum += w11; }
             if (wsum > 0) baked = static_cast<int32_t>(acc / wsum);
+        }
+
+        // CAP THE MARKER'S THICKNESS. See kWaterMarkerHeightMm: filling the
+        // whole column made a lake's interior fifty times more expensive to
+        // generate than its shoreline, which is why the interiors were the
+        // chunks that never came back. The top of a 3 m slab and the top of a
+        // 40 m one look identical from outside the water.
+        if (baked != kNoWaterMarkerMm) {
+            const int64_t capped = int64_t(col.surfaceMm) + kWaterMarkerHeightMm;
+            if (int64_t(baked) > capped) baked = static_cast<int32_t>(capped);
         }
         for (int64_t step = 1; step <= waterMarkerFillPx_ && baked == kNoWaterMarkerMm; ++step) {
             for (int d = 0; d < 8; ++d) {
