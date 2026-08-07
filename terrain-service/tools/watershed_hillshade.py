@@ -317,13 +317,20 @@ def annotate(img: Image.Image, tiles, x0: int, y0: int, n: int, cell_m: float,
         d.text((px + 6, py + 6), f"{tx},{ty}", fill=(255, 255, 255, 190))
 
     # Scale bar: the only way to check by eye that the pitch is what the header
-    # claims. Sized to a round number of km near a tenth of the image.
-    km = max(1, int(round(img.width * cell_m / 1000.0 / 10.0)))
+    # claims. A 1-2-5 step near a tenth of the image width, so a sub-kilometre
+    # mosaic gets a bar that fits inside it instead of one rounded up to 1 km
+    # and drawn off the edge.
+    target_km = img.width * cell_m / 1000.0 / 10.0
+    km = min((1, 2, 5, 10, 20, 50, 100, 200, 500),
+             key=lambda v: abs(np.log(v / max(target_km, 1e-6))))
+    if km > target_km * 3:  # sub-kilometre image: label in metres instead
+        km = target_km
     barpx = int(km * 1000.0 / cell_m)
     bx, by = 14, img.height - 34
     d.rectangle([bx - 6, by - 18, bx + barpx + 6, by + 12], fill=(0, 0, 0, 150))
     d.rectangle([bx, by, bx + barpx, by + 5], fill=(255, 255, 255, 230))
-    d.text((bx, by - 16), f"{km} km   {cell_m:.2f} m/px", fill=(255, 255, 255, 230))
+    lab = f"{km:g} km" if km >= 1 else f"{km * 1000:.0f} m"
+    d.text((bx, by - 16), f"{lab}   {cell_m:.2f} m/px", fill=(255, 255, 255, 230))
 
     # Depth legend, drawn from the same ramp function the image uses so it
     # cannot drift out of step with it.
@@ -390,8 +397,16 @@ def peak_rss_gb() -> float | None:
 
         pmc = PMC()
         pmc.cb = ctypes.sizeof(PMC)
-        ok = ctypes.windll.psapi.GetProcessMemoryInfo(
-            ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
+        # The argtypes/restype are NOT optional. Without them ctypes treats a
+        # HANDLE as c_int, GetCurrentProcess's pseudo-handle is truncated on
+        # win64, and the call fails silently -- which is how this returned None
+        # on its first run and reported no memory figure at all.
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        fn = ctypes.windll.psapi.GetProcessMemoryInfo
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(PMC), ctypes.c_uint32]
+        fn.restype = ctypes.c_int
+        ok = fn(kernel32.GetCurrentProcess(), ctypes.byref(pmc), pmc.cb)
         return pmc.PeakWorkingSetSize / 1e9 if ok else None
     except Exception:
         return None
@@ -434,6 +449,13 @@ def main() -> int:
     ap.add_argument("--no-water", action="store_true")
     ap.add_argument("--lake-outlines", action="store_true",
                     help="outline registered wet basins from SECTION_BASIN_TABLE")
+    ap.add_argument("--min-basin-px", type=int, default=2,
+                    help="skip basins whose bbox is smaller than this at OUTPUT "
+                         "resolution. The wet block registers 552 wet basins "
+                         "over six tiles and most are alpine tarns a few fine "
+                         "cells across; at 7.5 m/px their boxes degenerate to "
+                         "yellow specks that read as water rather than as "
+                         "annotation. 0 draws all of them.")
     ap.add_argument("--no-annotate", action="store_true")
     ap.add_argument("--depth-lo", type=float, default=0.05, help="ramp floor, m")
     ap.add_argument("--depth-hi", type=float, default=20.0, help="ramp ceiling, m")
@@ -490,7 +512,7 @@ def main() -> int:
     nowater = np.zeros((H, W), dtype=bool)
 
     basin_boxes: list[tuple] = []
-    n_missing = n_nowater = 0
+    n_missing = n_nowater = n_basin_small = 0
     total_wet = 0
     total_cells = 0
 
@@ -515,15 +537,21 @@ def main() -> int:
         st = reduce_tile(tile, f, elev[sy:sy + n, sx:sx + n], water[sy:sy + n, sx:sx + n])
         present[sy:sy + n, sx:sx + n] = True
         has_water = tile.water_cp is not None
-        nb = 0
+        nb = n_small = 0
         if a.lake_outlines and tile.basins:
             for b in tile.basins:
-                if b.kind in WET_BASIN_KINDS:
-                    bx0, by0, bx1, by1 = b.bbox_px
-                    basin_boxes.append((sx + bx0 // f, sy + by0 // f,
-                                        sx + bx1 // f, sy + by1 // f,
-                                        b.kind, b.surface_mm / 1000.0))
-                    nb += 1
+                if b.kind not in WET_BASIN_KINDS:
+                    continue
+                bx0, by0, bx1, by1 = b.bbox_px
+                ox0, oy0 = sx + bx0 // f, sy + by0 // f
+                ox1, oy1 = sx + bx1 // f, sy + by1 // f
+                if max(ox1 - ox0, oy1 - oy0) < a.min_basin_px:
+                    n_small += 1
+                    continue
+                basin_boxes.append((ox0, oy0, ox1, oy1, b.kind,
+                                    b.surface_mm / 1000.0))
+                nb += 1
+            n_basin_small += n_small
 
         if has_water:
             total_wet += st["wet_cells"]
@@ -559,7 +587,8 @@ def main() -> int:
     if a.lake_outlines and basin_boxes:
         draw_basins(img, basin_boxes)
         print(f"# basins     {len(basin_boxes)} wet basins outlined (bbox, not "
-              f"shoreline)", file=sys.stderr)
+              f"shoreline); {n_basin_small} smaller than --min-basin-px="
+              f"{a.min_basin_px} skipped", file=sys.stderr)
 
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     img.save(a.out)

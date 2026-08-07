@@ -1,0 +1,103 @@
+WHY THE EXAGGERATED EXPONENTS FAIL channel_is_continuous_across_confluences
+2026-08-06 (investigated 2026-08-07). Explains a blocker; does not clear it.
+
+THE DECISION BEING BLOCKED
+--------------------------
+The owner asked for dramatic rivers: "I think we change the exponents to force
+more dramatic rivers even though it's different than earth. Exaggeration is ok
+to keep things interesting."
+
+Target values, width/depth exponents in Q8: 166/128 (0.6484 / 0.5000) against
+Earth's 102/90 (0.3984 / 0.3516). Over the 256x discharge span between a
+drawable headwater and the largest trunk that is 4.2 -> 154 m of width and
+0.50 -> 7.9 m of depth, against Earth's 2.8 -> 26 m and 0.39 -> 2.8 m. Both
+ends stay off the 400 m / 25 m caps.
+
+At those values, voxel-core's channel_is_continuous_across_confluences fails
+its `cs.inBed` assertion -- a sample taken AT a river junction reports itself
+outside the channel bed. Wider channels should make that assertion EASIER, so
+the failure was not understood and the change was backed out rather than
+shipped on an unexplained red in channel CONTINUITY.
+
+THE MECHANISM, read out of the code
+-----------------------------------
+voxel-core/src/channel.cpp, ChannelField::evaluate (:228-275):
+
+  * candidates are the reaches registered in the sample's grid cell;
+  * a candidate is skipped if `dMm > channelInfluenceMm(width, depth)`, so the
+    influence radius grows with BOTH width and depth;
+  * the winner is the reach with the LOWEST cross-section target, not the
+    nearest one -- ":264 Deepest cut wins: at a confluence the trunk's lower
+    bed must swallow the tributary's, or the join is a step";
+  * `out.inBed = dMm <= halfW` (:272) then uses the WINNING reach's half-width
+    and the sample's distance TO THAT REACH.
+
+Raising the depth exponent 0.3516 -> 0.5 makes a large trunk far deeper
+(3.6 m -> 10.6 m at this world's maximum Q). `channelTargetMm` for a point at
+lateral distance d from that trunk is `bed + (d - halfW)/runPerRise`, so a much
+lower bed wins the lowest-target comparison at a much greater d. At a confluence
+the TRUNK therefore wins even where the sample sits on the TRIBUTARY's
+centreline -- and at that distance `dMm > halfW` of the trunk, so `inBed` is
+false.
+
+So the failure is a real geometric consequence of deeper channels under the
+deepest-cut-wins rule, not a defect in the exponent change. What it says is:
+deeper trunks dominate a wider radius, and a confluence node can be classified
+as BANK of the trunk rather than BED of its own reach.
+
+WHAT STILL HOLDS
+----------------
+The continuity property the test exists to defend is unaffected. In the failing
+run only the `inBed` checks failed; `cs.bedMm <= nodeBedMm[fromNode]` -- "the
+trunk swallows the tributary, no step up" -- passed on every confluence. The bed
+remains single-valued, continuous and descending.
+
+BLAST RADIUS TODAY: NONE ON SHIPPED WATER
+-----------------------------------------
+`ChannelField` is UNWIRED. channel.h:26-31 states it: "Until then nothing here
+changes worldgen's output, so kWorldGenVersion is UNTOUCHED". Confirmed by
+search: no reference in amplifier.cpp, worldgen.ush, or anything in
+ue-project/Source. Its only consumers are its own tests, vxc_riverprobe, and the
+Python-side exponent-drift gate.
+
+The width and depth the SHIPPED water uses come from terrain_service/bake/
+water.py, which mirrors the same laws independently.
+
+THE FINDING THAT MATTERS MORE THAN THE BLOCKER
+----------------------------------------------
+Changing the WIDTH exponent will barely widen the drawn river.
+
+The shipped extent rule is `lateral_fill` (BakeConstants.water_extent_mode
+default), and it does not read the width law at all: a cell is wet when it
+stands below the surface of the water it drains into. Architecture §11a records
+the consequence already -- "Drawn width is roughly 20 m everywhere... discharge
+enters only through the surface height", Spearman(drawn width, Q) = +0.457.
+
+So under the shipped rule the lever on width is the DEPTH exponent, not the
+width exponent: a deeper trunk stands its water surface higher, and a higher
+surface floods further laterally before the ground rises through it. The width
+exponent only moves `q_drawable_m3_yr` (the drawable threshold is derived from
+the width law), which changes how much of the network is drawn at all -- a
+separate and more dangerous knob, since raising it can delete headwaters.
+
+That reframes the owner's request: dramatic rivers come from the depth exponent
+under lateral_fill, and the width exponent should be reviewed for what it does
+to the drawable threshold before it is moved.
+
+NOT DONE, AND WHY
+-----------------
+The exponents were NOT flipped in this session. bake_ver 15 changed three other
+water constants at once (F6 and the two slope terms), and stacking the exponents
+into the same bake would make the resulting A/B unreadable -- there would be no
+way to attribute a visible change to either. One change at a time, so the
+picture means something.
+
+The plumbing is ready: both exponents are now identity-covered bake constants
+(BakeConstants.channel_width_exp_q8 / channel_depth_exp_q8). Before flipping:
+
+  1. decide whether `inBed` at a confluence is a property worth keeping under
+     deep channels, or whether the assertion should narrow to the continuity
+     check it was really written to defend;
+  2. measure what the width exponent does to `q_drawable_m3_yr` and how much of
+     the drawn network disappears at 166/256;
+  3. flip depth first, alone, and look at it.
