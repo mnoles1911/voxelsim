@@ -1,0 +1,59 @@
+WATER SURFACE ROUGHNESS vs GROUND ROUGHNESS -- tile (-4,-4), seed 20260719
+Measured 2026-08-07. Adjacent wet CHANNEL cell pairs (4 directions), n=940,745.
+Ground and water surface both on the tile's own 1 mm quantised lattice, so they
+compare without evaluating the spline. Voxel = 100 mm.
+
+              p50      p90    >100mm (1 voxel)   >300mm (3 voxels)
+bv15 ground     1mm      9mm        0.0%              0.0%
+     depth     30mm    600mm       35.2%             18.6%
+     SURFACE   30mm    594mm       35.5%             18.6%
+bv16 ground     1mm      9mm        0.0%              0.0%
+     depth     20mm    570mm       32.6%             17.2%
+     SURFACE   24mm    561mm       33.0%             17.3%
+bv17 ground     1mm      9mm        0.0%              0.0%
+     depth     20mm    500mm       32.0%             16.3%
+     SURFACE   22mm    496mm       32.3%             16.3%
+
+THE RESULT: the ground under the rivers is smooth to within a millimetre --
+ZERO percent of neighbouring cells differ by even one voxel. The water surface
+laid on that ground jumps more than THREE voxels between neighbours a sixth of
+the time. The owner's "manmade magenta staircase, not a natural water flow" is
+the WATER surface, not the terrain. Every fix so far has adjusted depth, and
+|d SURFACE| tracks |d depth| almost exactly (22 vs 20, 496 vs 500) because the
+ground contributes nothing: surface = ground + depth, and ground is flat here,
+so the surface simply inherits every discontinuity the depth law produces.
+
+WHY DEPTH IS DISCONTINUOUS: depth is assigned per cell from a local law
+(Q, slope) and neighbouring cells get materially different values. The
+construction is backwards. A river surface is smooth and monotone by physics
+and the BED is what varies; deriving surface = ground + f(local Q) inverts that
+and hands the surface the bed's noise plus the law's.
+
+RETRACTED IN THE SAME SESSION -- two metrics I reported that do not hold up:
+
+1. "62% of downhill wet steps rise" (uphill_check.py, all three bake versions).
+   Real number, misleading quantity. It recomputes steepest descent on the
+   shipped ground, and on these reaches the ground drop is p50 4 mm -- ONE
+   quantisation step. The descent direction is therefore chosen by rounding
+   noise among near-ties, so "downhill" is close to a random direction and a
+   surface that varies +-270 mm rises about half the time by construction.
+   61.66% is consistent with noise. Do not read it as "62% of the river flows
+   uphill". The >1 m tail (9,860 cells) is still meaningful; the headline is not.
+
+2. The downstream/upstream split of those rises (80.6% rising downstream vs
+   24.5% upstream, which looked like a physics inversion). It assumed the low 5
+   bits of `flow` are log2 discharge. They are not clean discharge:
+   corr(q, ground) = +0.108 over channel cells (a discharge field should be
+   NEGATIVE -- big rivers sit low), and depth is non-monotone in q
+   (q=6 -> 1260mm, q=18 -> 720mm, q=24 -> 2330mm). Discarded. Identify the
+   field before splitting anything by it again.
+
+What does survive from that dead end, because it does not depend on direction:
+on the steps examined, ground drop was p50 4 mm while depth changed p50 270 mm,
+and depth change exceeded ground drop in 100.0% of cases. The height comes from
+the depth field, not from the terrain.
+
+NEXT: build the surface first -- smooth and monotone along the network -- then
+take depth = surface - ground, instead of the reverse. Measure with this same
+script; the target is |d SURFACE| >100mm falling from 32% toward the ground's
+0.0%, WITHOUT flattening the long profile (bv17 aggregate gradient 205.7 m/km).
