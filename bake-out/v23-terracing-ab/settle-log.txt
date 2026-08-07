@@ -1,0 +1,69 @@
+﻿v23-savanna-t2_-8-ground  spawn=38400,-115200 alt=0m pitch=0deg settle=180s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=44686 final=44686
+    undrawn chunks: 0
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\v23-terracing-ab\v23-savanna-t2_-8-ground.png
+v23-taiga-t-7_-2-ground  spawn=-102390,-23670 alt=0m pitch=0deg settle=180s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=42230 final=42230
+    undrawn chunks: 0
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\v23-terracing-ab\v23-taiga-t-7_-2-ground.png
+v23-taiga-t-7_-2-low120  spawn=-102390,-23670 alt=120m pitch=-20deg settle=240s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=42230 final=42230
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=233.1 m (= 120.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\v23-terracing-ab\v23-taiga-t-7_-2-low120.png
+v23-taiga-t-7_-2-vista  spawn=-102390,-23670 alt=1200m pitch=-20deg settle=420s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=42151 final=42151
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=1313.1 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\v23-terracing-ab\v23-taiga-t-7_-2-vista.png
+v23-tundra-t-3_-3-ground  spawn=-38400,-38400 alt=0m pitch=0deg settle=180s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=55920 final=55920
+    undrawn chunks: 0
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\v23-terracing-ab\v23-tundra-t-3_-3-ground.png
+v23-tundra-t-3_-3-low120  spawn=-38400,-38400 alt=120m pitch=-20deg settle=240s
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=55937 final=55937
+    undrawn chunks: 0
+    pose: column (-38400.0, -38400.0) m, ground top z=3263.1 m, camera z=3383.1 m (= 120.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    fine: ENABLED: root=D:\voxelsim\tile-cache provider=terrain-diffusion-unlabeled-71e2b362e3241e71-b2dffc351 seed=20260719 pitch=1875 mm/px ringRadius=0 budget=12.00 GiB. Chunks whose fine footprint is not resident are BLOCKED, never generated from a coarse guess.
+    tree before: head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    tree after:  head=0609be1 worldgen ush=23 cpp=23 lib=2026-08-02T23:53:43 dll=2026-08-02T23:56:31
+    TREE STABLE: True
+    SETTLED: True
+    file: NONE

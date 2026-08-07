@@ -1,0 +1,63 @@
+﻿diff --git a/tools/voxel-measure-guard.ps1 b/tools/voxel-measure-guard.ps1
+index f84714a..847a6f7 100644
+--- a/tools/voxel-measure-guard.ps1
++++ b/tools/voxel-measure-guard.ps1
+@@ -40,18 +40,49 @@ param(
+ 
+ $ErrorActionPreference = 'Stop'
+ 
+-# Processes that make a measurement untrustworthy if they are running.
+-# UnrealEditor*: another game/editor on the GPU. cl/link/UnrealBuildTool/MSBuild:
+-# a build saturating the cores. cmake/ninja: a voxel-core build.
+-$ContendingNames = @(
+-    'UnrealEditor', 'UnrealEditor-Cmd', 'UnrealBuildTool',
+-    'cl', 'link', 'MSBuild', 'cmake', 'ninja', 'vxc_tests'
+-)
++# Two classes, because presence and contention are not the same thing.
++#
++# PRESENCE IS ENOUGH for an editor: it holds the GPU, VRAM and the project's
++# Saved/ directory even when it is sitting at an idle frame, and two editors is
++# the exact scenario the one-editor rule exists for.
++$ContendByPresence = @('UnrealEditor', 'UnrealEditor-Cmd')
++
++# PRESENCE IS NOT ENOUGH for build tools. MSBuild keeps worker nodes alive for
++# reuse long after a build finishes -- this guard's first version reported
++# "BOX CONTENDED -- MSBuild x7" against seven processes that had used 0.00s of
++# CPU in the previous six seconds. A guard that cries wolf gets ignored, which
++# would cost more than the false negative it was protecting against. So these
++# are judged on whether they are actually BURNING CPU.
++$ContendByCpu = @('UnrealBuildTool', 'cl', 'link', 'MSBuild', 'cmake', 'ninja', 'vxc_tests')
++
++# CPU-seconds consumed within the sample window before a build tool counts.
++# Deliberately low: a real compile pins a core, so anything genuinely working
++# clears this by an order of magnitude, and idle nodes sit at exactly 0.
++$CpuBusyThresholdSec = 0.25
+ 
+ function Get-Contenders {
+-    param([int[]]$ExceptPids = @())
+-    @(Get-Process -Name $ContendingNames -ErrorAction SilentlyContinue |
++    param([int[]]$ExceptPids = @(), [double]$WindowSec = 2.0)
++
++    $found = @()
++    $found += @(Get-Process -Name $ContendByPresence -ErrorAction SilentlyContinue |
+         Where-Object { $ExceptPids -notcontains $_.Id })
++
++    $before = @{}
++    foreach ($p in @(Get-Process -Name $ContendByCpu -ErrorAction SilentlyContinue |
++                     Where-Object { $ExceptPids -notcontains $_.Id })) {
++        $before[$p.Id] = $p.CPU
++    }
++    if ($before.Count -gt 0) {
++        Start-Sleep -Milliseconds ([int]($WindowSec * 1000))
++        foreach ($p in @(Get-Process -Name $ContendByCpu -ErrorAction SilentlyContinue |
++                         Where-Object { $ExceptPids -notcontains $_.Id })) {
++            # A process that appeared DURING the window counts: it is new work,
++            # and we cannot prove it was idle.
++            $delta = if ($before.ContainsKey($p.Id)) { $p.CPU - $before[$p.Id] } else { [double]::MaxValue }
++            if ($delta -ge $CpuBusyThresholdSec) { $found += $p }
++        }
++    }
++    @($found)
+ }
+ 
+ function Format-Contenders {

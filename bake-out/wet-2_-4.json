@@ -1,0 +1,128 @@
+{
+  "tile": [
+    -2,
+    -4
+  ],
+  "seed": 20260719,
+  "production_geometry": true,
+  "geometry": {
+    "coarse_tile_px": 512,
+    "coarse_pixel_m": 30.0,
+    "scale": 16,
+    "apron_coarse_px": 32
+  },
+  "fine_tile_px": 8192,
+  "km2": 235.9296,
+  "fingerprint": "440587d46334eab777838710726af30d37b632c86d670c7589a06dc8687b975f",
+  "cpu_seconds_bake": 304.796875,
+  "wall_seconds_bake": 113.89040389982983,
+  "cpu_seconds_superblock": 1.390625,
+  "cpu_seconds_encode": 4.515625,
+  "wall_seconds_encode": 4.546974399825558,
+  "cpu_stages": {
+    "B0.carrier": 1.546875,
+    "B1.roughness": 9.5,
+    "B2a.fill_depressions": 11.75,
+    "B2b.d8_receivers": 2.828125,
+    "B2c.accumulate_mfd": 13.203125,
+    "B2d.stream_power": 54.6875,
+    "B3.relax": 182.546875,
+    "B4.meso": 12.890625,
+    "B4b.refill": 11.84375
+  },
+  "wall_stages": {
+    "B0.carrier": 1.5738170000258833,
+    "B1.roughness": 9.82266839989461,
+    "B2a.fill_depressions": 11.944932300131768,
+    "B2b.d8_receivers": 0.37311519985087216,
+    "B2c.accumulate_mfd": 12.318756900029257,
+    "B2d.stream_power": 25.100781799992546,
+    "B3.relax": 26.238396600121632,
+    "B4.meso": 10.596612199908122,
+    "B4b.refill": 11.902246099896729
+  },
+  "numba_threads": "12 (max 12)",
+  "mem_before": {
+    "peak_working_set": 261009408,
+    "working_set": 177446912,
+    "peak_commit": 962691072,
+    "commit": 878874624
+  },
+  "mem_after_bake": {
+    "peak_working_set": 5311610880,
+    "working_set": 799412224,
+    "peak_commit": 6022008832,
+    "commit": 1500893184
+  },
+  "mem_after_encode": {
+    "peak_working_set": 5311610880,
+    "working_set": 1002545152,
+    "peak_commit": 6022008832,
+    "commit": 1707155456
+  },
+  "estimate_peak_bytes": 5435817984,
+  "stats": {
+    "relief_m": 4239.84423828125,
+    "max_accumulation_km2": 84.321096,
+    "cells_above_1km2": 196816.0,
+    "incision_mean_m": 13.325482368469238,
+    "incision_p99_m": 25.0,
+    "channel_cells": 59166005.0,
+    "injected_inflow_km2": 28.803348,
+    "interior_dead_ends": 0.0,
+    "superblock_missing_tiles": 0.0,
+    "superblock_complete": 1.0,
+    "basin_cells_frac": 0.02165253460407257,
+    "basin_max_depth_m": 135.21563720703125,
+    "max_basin_run_m": 1038.75,
+    "basin_exceeds_apron": 1.0,
+    "padded_border_basin_cells": 0.0,
+    "padded_border_basin_frac": 0.0,
+    "basin_reaches_padded_border": 0.0,
+    "peak_bytes_estimate": 5435817984.0,
+    "province_fluvial_frac": 0.9417526125907898,
+    "province_glacial_frac": 0.05781993642449379,
+    "province_arid_frac": 0.0,
+    "province_lowland_frac": 0.0004274932434782386,
+    "province_climate": 1.0
+  },
+  "missing_coarse": [],
+  "bytes": {
+    "raw": 201367675,
+    "zlib": 51371621,
+    "zstd": 45601025,
+    "zstd_elev_only": 36699694
+  },
+  "elev_plane": {
+    "blocks": 1024,
+    "constant": 0,
+    "coded": 1024,
+    "raw": 0,
+    "resid_bits_32": 0,
+    "payload_bytes_raw": 134217728,
+    "payload_bytes_zlib": 40492711,
+    "payload_bytes_lzma": null,
+    "payload_bytes_zstd": 36679131
+  },
+  "flow_plane": {
+    "blocks": 1024,
+    "constant": 0,
+    "coded": 0,
+    "raw": 1024,
+    "resid_bits_32": 0,
+    "payload_bytes_raw": 67108864,
+    "payload_bytes_zlib": 10837827,
+    "payload_bytes_lzma": null,
+    "payload_bytes_zstd": 8880811
+  },
+  "lattice_reconstruction_mm": {
+    "quant_mm": 100,
+    "interior_mean_abs_mm": 12.27616838409963,
+    "interior_p99_abs_mm": 33.094618055736646,
+    "interior_max_abs_mm": 49.9755859375,
+    "border_max_abs_mm": 49.08447265625
+  },
+  "base_offset_mm": 2600000,
+  "quant_mm": 100,
+  "path": "D:\\voxelsim\\bake-out\\-2_-4.vxtl"
+}

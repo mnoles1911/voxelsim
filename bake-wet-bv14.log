@@ -1,0 +1,14 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-b10cf6d2c
+tiles: [(-5, -4), (-4, -4), (-3, -4), (-5, -5), (-4, -5), (-3, -5)]
+[coarse] 20/20 ring tiles available (generate=False) cpu=0.0s
+[flow L1] 1 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed  cpu=9.3s
+[flow L0] 4 superblock(s) @ 30 m/px, span 61 km  fp=3d3c80deb245,4c8482ae6f68,a79fab8d28ee,c35c5715fa63  cpu=26.5s
+[1/6] baked (-5,-4) cpu=407.9s water=0.554%wet max_catchment=173.3km2 incision_p99=25.00m channels=48149077 injected=148.1km2/Q1.5e+07m3yr@101mm qmax=1.7e+08 drawnpad=371599 basin=1.1%/22m hydro=3d3c80deb245
+[2/6] baked (-4,-4) cpu=416.9s water=0.351%wet max_catchment=70.0km2 incision_p99=25.00m channels=53503304 injected=73.7km2/Q6e+07m3yr@815mm qmax=1.03e+08 drawnpad=235235 basin=0.5%/34m hydro=c35c5715fa63
+[3/6] baked (-3,-4) cpu=414.4s water=0.390%wet max_catchment=266.1km2 incision_p99=25.00m channels=61068940 injected=84.9km2/Q7.58e+07m3yr@894mm qmax=1.78e+08 drawnpad=261512 basin=0.9%/46m hydro=c35c5715fa63
+[4/6] baked (-5,-5) cpu=318.4s water=0.773%wet max_catchment=75.2km2 incision_p99=16.78m channels=26591131 injected=20.6km2/Q1.62e+06m3yr@79mm qmax=5.31e+07 drawnpad=518569 basin=1.7%/44m hydro=a79fab8d28ee
+[5/6] baked (-4,-5) cpu=372.0s water=0.617%wet max_catchment=171.3km2 incision_p99=25.00m channels=41731447 injected=50.0km2/Q4.5e+07m3yr@900mm qmax=1.31e+08 drawnpad=414250 basin=2.4%/36m hydro=4c8482ae6f68
+  warning: tile (-3,-5) contains a flat/basin 1003 m across, wider than the 960 m apron. Elevations still agree across the seam (the effect is sub-ULP, below the 100 mm wire LSB) but its ROUTING may not -- see pipeline.APRON_BLIND_SPOT.
+[6/6] baked (-3,-5) cpu=385.6s water=0.598%wet max_catchment=145.2km2 incision_p99=25.00m channels=60091888 injected=285.7km2/Q1.99e+08m3yr@696mm qmax=1.71e+08 drawnpad=400977 basin=1.5%/40m hydro=4c8482ae6f68
+Bake complete: baked=6 skipped=0 unencoded=0 total=6 incomplete_superblocks=0 stale_superblocks=0 cpu_seconds=2386.2

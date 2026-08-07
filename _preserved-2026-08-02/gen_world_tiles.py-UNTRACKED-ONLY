@@ -1,0 +1,162 @@
+﻿"""Generate terrain-diffusion tiles INTO the existing world's cache, by tile coord.
+
+Why this exists rather than `gen_reference_tile.py`: that tool takes raw pixel
+origins and writes standalone files, which is fine for a one-off but wrong for
+what we need now. To validate terrain per biome we need tiles that (a) join the
+world already in `tile-cache`, so a tile has the 3x3 coarse ring a fine bake
+requires, and (b) are named the way `cache.py` names them, so every downstream
+tool finds them without being told.
+
+The tile convention is `providers/diffusion.py`'s: tile (x, y) covers pixels
+`i1 = y*TILE_SIZE, j1 = x*TILE_SIZE`. Getting that transposed produces a
+plausible-looking tile of the WRONG PLACE, which no later check would catch --
+so `--verify` regenerates a tile that already exists on disk and compares bytes
+before any new generation is trusted.
+
+CPU only on this box (torch is +cpu, no CUDA): ~179 s per 512^2 tile. Must run
+with cwd D:\\terrain-diffusion because `synthetic_map.py` opens `data/global/`
+by relative path.
+
+  gen_world_tiles.py --verify -5 3
+  gen_world_tiles.py --tiles "-5,3 -4,3 10,-7" [--seed 20260719]
+"""
+import argparse, os, struct, sys, time
+import numpy as np
+
+TILE = 512
+HDR = "<4sHQiiBH"
+CACHE_ROOT = r"D:\voxelsim\tile-cache"
+
+# THE LEGACY CACHE IS ORPHANED, and this is why the default is computed rather
+# than written down. `tile-cache\terrain-diffusion-unlabeled-3e11cf157a836c70`
+# holds 25 tiles that every terrain measurement in this project has been made
+# against -- but `DiffusionConfig().provider_id()` now returns
+# `terrain-diffusion-unlabeled-UNPINNED-UNVERIFIEDDATA-27ac04bc8c6b7b7d`, so the
+# shipping code would never look in that directory and cannot reproduce its
+# contents: regenerating tile (-5,3) with the current WorldShapeConfig differs
+# from the cached one on 100% of cells at a mean of 2340 m.
+#
+# So those tiles are a fossil of an older identity scheme. They are still real
+# diffusion output and still fine to look at, but they are NOT the world the
+# game makes, and validating against them answers a question nobody asked.
+# Everything from here targets the provider_id the code actually produces.
+#
+# The UNPINNED / UNVERIFIEDDATA in that id are themselves worth noticing: the
+# checkpoint is not pinned and the conditioning data has never been hashed, so
+# even the current world is not reproducible *by identity*. Within one config it
+# is self-consistent, which is what validation needs; across a checkpoint change
+# it silently is not.
+
+
+def tile_path(cache_root, seed, tx, ty):
+    return os.path.join(cache_root, f"{seed:016x}", "s1", f"{tx}_{ty}.vxtl")
+
+
+def encode(elev_i16, seed, tx, ty):
+    size = elev_i16.shape[0]
+    return struct.pack(HDR, b"VXTL", 1, seed & 0xFFFFFFFFFFFFFFFF, tx, ty, 1, size) + \
+        np.ascontiguousarray(elev_i16, dtype="<i2").tobytes()
+
+
+def decode_elev(path):
+    b = open(path, "rb").read()
+    off = struct.calcsize(HDR)
+    size = struct.unpack_from(HDR, b, 0)[6]
+    return np.frombuffer(b, dtype="<i2", count=size * size, offset=off).reshape(size, size)
+
+
+def describe(e):
+    g = np.hypot(*np.gradient(e.astype(np.float64), 30.0)) * 100.0
+    land = e > 0
+    return (f"relief {int(e.min())}..{int(e.max())} m  land {land.mean()*100:5.1f}%  "
+            f"p50 grade {np.percentile(g[land], 50):5.1f}%  p95 {np.percentile(g[land], 95):6.1f}%"
+            if land.any() else
+            f"relief {int(e.min())}..{int(e.max())} m  land   0.0%  (all ocean)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tiles", default="", help='space-separated "x,y" pairs')
+    ap.add_argument("--verify", nargs=2, type=int, metavar=("X", "Y"),
+                    help="regenerate an EXISTING tile and byte-compare; run this first")
+    ap.add_argument("--seed", type=int, default=0x135276F)  # the world already in cache
+    ap.add_argument("--cache", default=None, help="defaults to the CURRENT provider_id under tile-cache")
+    ap.add_argument("--threads", type=int, default=6)
+    a = ap.parse_args()
+
+    os.environ.setdefault("OMP_NUM_THREADS", str(a.threads))
+    os.environ.setdefault("MKL_NUM_THREADS", str(a.threads))
+
+    import torch
+    from terrain_diffusion.inference.world_pipeline import WorldPipeline
+
+    # THE WORLD-SHAPING KWARGS. providers/diffusion.py's DiffusionWorldConfig
+    # forwards these to from_pretrained, and they define which world the seed
+    # names. Omitting them takes upstream's defaults, which produced a tile that
+    # differed from the cached one on 99.94% of cells at a mean of 487 m -- a
+    # perfectly plausible tile of a completely different planet. Kept in sync
+    # with that dataclass by the --verify path, which is the only thing that
+    # actually proves it.
+    from terrain_service.providers.diffusion import DiffusionConfig, WorldShapeConfig
+    world_kwargs = WorldShapeConfig().as_pipeline_kwargs()
+    if a.cache is None:
+        a.cache = os.path.join(CACHE_ROOT, DiffusionConfig().provider_id())
+    print(f"cache: {a.cache}")
+
+    t0 = time.time()
+    w = WorldPipeline.from_pretrained("xandergos/terrain-diffusion-30m", seed=a.seed,
+                                      log_mode="quiet", **world_kwargs)
+    w.to("cuda" if torch.cuda.is_available() else "cpu")
+    w.bind(hdf5_file=None)
+    print(f"pipeline ready in {time.time()-t0:.1f}s, seed {w.seed} (0x{w.seed:x})")
+
+    def gen(tx, ty):
+        # providers/diffusion.py: i1 = y*TILE_SIZE, j1 = x*TILE_SIZE.
+        i1, j1 = ty * TILE, tx * TILE
+        out = w.get(i1, j1, i1 + TILE, j1 + TILE, with_climate=False)
+        e = out["elev"].detach().float().cpu().numpy()
+        return np.clip(np.rint(e), -32768, 32767).astype(np.int16)
+
+    if a.verify:
+        tx, ty = a.verify
+        p = tile_path(a.cache, a.seed, tx, ty)
+        if not os.path.exists(p):
+            print(f"VERIFY IMPOSSIBLE: {p} does not exist")
+            return 2
+        t = time.time()
+        mine, theirs = gen(tx, ty), decode_elev(p)
+        same = np.array_equal(mine, theirs)
+        d = np.abs(mine.astype(int) - theirs.astype(int))
+        print(f"verify ({tx},{ty}) in {time.time()-t:.0f}s: "
+              f"{'BYTE-IDENTICAL' if same else 'DIFFERS'}  "
+              f"max|d|={d.max()} mean|d|={d.mean():.3f} differing={100*(d>0).mean():.2f}%")
+        print(f"  {describe(theirs)}")
+        if not same:
+            print("  Do NOT generate new tiles until this matches: they would be a "
+                  "different world and would not join the cached set.")
+        return 0 if same else 1
+
+    coords = []
+    for tok in a.tiles.split():
+        x, y = tok.split(",")
+        coords.append((int(x), int(y)))
+    if not coords:
+        print("nothing to do; pass --tiles or --verify")
+        return 2
+
+    for tx, ty in coords:
+        p = tile_path(a.cache, a.seed, tx, ty)
+        if os.path.exists(p):
+            print(f"({tx:4d},{ty:4d}) exists, skipping   {describe(decode_elev(p))}")
+            continue
+        t = time.time()
+        e = gen(tx, ty)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(encode(e, a.seed, tx, ty))
+        print(f"({tx:4d},{ty:4d}) {time.time()-t:5.0f}s  {describe(e)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

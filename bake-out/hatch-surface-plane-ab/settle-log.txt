@@ -1,0 +1,136 @@
+﻿fix-tundra-vista  spawn=-38400,-38400 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=332 pendingJobs=240 unloaded=0
+    streaming: peak loaded=43110
+    undrawn chunks: 0
+    pose: column (-38400.0, -38400.0) m, ground top z=3263.3 m, camera z=4463.3 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: False
+    file: NONE
+fix-taiga-vista  spawn=-102390,-23670 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=-1 pendingJobs=-1 unloaded=-1
+    streaming: peak loaded=0
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=1313.1 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: False
+    file: NONE
+fix-rainforest-vista  spawn=-23040,-53760 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=61575
+    undrawn chunks: 0
+    pose: column (-23040.0, -53760.0) m, ground top z=1395.6 m, camera z=2595.6 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\fix-rainforest-vista.png
+fix-cave  spawn=-38400,-38400 alt=0m pitch=0deg settle=240s extra=-VoxelCaveTest=30
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=225
+    streaming: peak loaded=57635
+    undrawn chunks: 0
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    cave: searching for a cave near spawn in 30.0s (capture driven by -VoxelScreenshotAfter)
+    cave: found a 4.5m-tall cave void at (-3840500,-3839500,323826), floor 323676, 21.0m below surface, 7.1m from spawn (near band).
+    cave: parked at (-3840350,-3839500,323826), 21.0m below surface, 1.50m above the cave floor; clearance +X=2.0m -X=10.0m +Y=2.0m -Y=1.0m; looking yaw 180 pitch -12 (standoff 150UU)
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\fix-cave.png
+fix-tundra-vista  spawn=-38400,-38400 alt=1200m pitch=-20deg settle=600s extra=
+    settle: jobsInFlight=332 pendingJobs=240 unloaded=0
+    streaming: peak loaded=43110
+    undrawn chunks: 0
+    pose: column (-38400.0, -38400.0) m, ground top z=3263.3 m, camera z=4463.3 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: False
+    file: NONE
+fix-taiga-vista  spawn=-102390,-23670 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=-1 pendingJobs=-1 unloaded=-1
+    streaming: peak loaded=0
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=1313.1 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: False
+    file: NONE
+fix-tundra-vista  spawn=-38400,-38400 alt=1200m pitch=-20deg settle=600s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=56411
+    undrawn chunks: 0
+    pose: column (-38400.0, -38400.0) m, ground top z=3263.3 m, camera z=4463.3 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\fix-tundra-vista.png
+fix-taiga-vista  spawn=-102390,-23670 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=42464
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=1313.1 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    tree after:  head=eb50ca6 dirtyfiles=0 vf.ush=29131F07 dll=2026-08-03T00:28:53
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\fix-taiga-vista.png
+base-tundra-vista  spawn=-38400,-38400 alt=1200m pitch=-20deg settle=600s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=56402
+    undrawn chunks: 0
+    pose: column (-38400.0, -38400.0) m, ground top z=3263.3 m, camera z=4463.3 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    tree after:  head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\base-tundra-vista.png
+base-cave  spawn=-38400,-38400 alt=0m pitch=0deg settle=240s extra=-VoxelCaveTest=30
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=230
+    streaming: peak loaded=57635
+    undrawn chunks: 0
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    cave: searching for a cave near spawn in 30.0s (capture driven by -VoxelScreenshotAfter)
+    cave: found a 4.5m-tall cave void at (-3840500,-3839500,323826), floor 323676, 21.0m below surface, 7.1m from spawn (near band).
+    cave: parked at (-3840350,-3839500,323826), 21.0m below surface, 1.50m above the cave floor; clearance +X=2.0m -X=10.0m +Y=2.0m -Y=1.0m; looking yaw 180 pitch -12 (standoff 150UU)
+    tree before: head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    tree after:  head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\base-cave.png
+base-taiga-vista  spawn=-102390,-23670 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=42506
+    undrawn chunks: 0
+    pose: column (-102390.0, -23670.0) m, ground top z=113.1 m, camera z=1313.1 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    tree after:  head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\base-taiga-vista.png
+base-rainforest-vista  spawn=-23040,-53760 alt=1200m pitch=-20deg settle=420s extra=
+    settle: jobsInFlight=0 pendingJobs=0 unloaded=0
+    streaming: peak loaded=61437
+    undrawn chunks: 0
+    pose: column (-23040.0, -53760.0) m, ground top z=1395.6 m, camera z=2595.6 m (= 1200.0 m above the surface), control pitch -20.0 deg, yaw 0.0 deg.
+    sky:  12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s. Requested 03-20 (day-of-year 79); the calendar's reachable dates are 7.61 real days apart at DaysPerYear=48.0.
+    tree before: head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    tree after:  head=eb50ca6 dirtyfiles=4 vf.ush=8685AE04 dll=2026-08-03T01:15:17
+    TREE STABLE: True
+    SETTLED: True
+    file: D:\voxelsim\bake-out\hatch-surface-plane-ab\base-rainforest-vista.png

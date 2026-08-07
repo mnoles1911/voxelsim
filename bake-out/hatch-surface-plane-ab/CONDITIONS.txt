@@ -1,0 +1,147 @@
+TASK #44 SLOPE HATCHING -- A/B CONDITIONS
+=========================================
+2026-08-03
+
+NO VERDICT HERE. These are eight settled frames and the conditions they were
+taken under. I have not judged whether the hatching is resolved and I have not
+looked at them to try; my readings of this class of image have been wrong in
+both directions. The owner judges.
+
+WHAT IS BEING COMPARED
+----------------------
+  base-*   main (1362b39). The biome-tint gate as it stands: a vertex is
+           "near the surface" if its z clears a surface height sampled ONCE at
+           the CHUNK CENTRE, minus a fixed 2 m band.
+  fix-*    claude/hatch-surface-plane (d644cd4). The same 2 m band, against a
+           PLANE fitted through four corner samples of the same surface.
+
+Four files differ and nothing else: VoxelClimateProbe.h, VoxelChunkComponent.cpp,
+VoxelWorldSubsystem.cpp, VoxelQuadVertexFactory.ush. Both arms were built and
+shot from the SAME worktree (D:\vox-hatch) against the same tiles, same seed,
+same sun and the same poses, so the pair differs by the gate and by nothing else.
+
+WHY THE GATE IS THE SUSPECT
+---------------------------
+docs/measurements/hatching-lattice-diagnosis-2026-08-03.txt. A chunk is 3.2 m
+across at L0 but 102.4 m at L5. On a slope the real surface crosses tens of
+metres inside one coarse chunk, so most of its sky-facing faces fall outside a
+2 m band and lose the tint -- and a HORIZONTAL plane cut through a tilted voxel
+staircase is a chevron. Rung 06 of that ladder removed the gate entirely and the
+lattice went with it.
+
+THE ACCEPTANCE TARGET IS AN EXISTING FRAME, AND SO IS THE TRAP
+--------------------------------------------------------------
+bake-out/hatching-ab/06-shader-NO-2m-surface-gate.png is the frame confirmed to
+resolve the hatching. It is a DIAGNOSTIC, not a fix: it deletes the gate, which
+paints cave floors grassland green. So the fix has to satisfy two things that
+pull against each other --
+
+  * on slopes it should look like 06 (lattice gone), and
+  * underground it must NOT look like 06 (cave floors still rock).
+
+fix-tundra-vista.png is shot at exactly the pose of hatching-ab's 00 and 06 --
+site (-38400,-38400), 1200 m, pitch -20, sun frozen 12:00 03-20, 2560x1440 --
+so those three frames are directly comparable. base-tundra-vista.png is the same
+pose rebuilt in this worktree, so the pair here does not depend on the older
+capture's tree state.
+
+THE PAIRS
+---------
+  tundra-vista       (-3,-3)  -38400,-38400    TUNDRA_ALPINE / GLACIAL
+  taiga-vista        (-7,-2)  -102390,-23670   TAIGA / GLACIAL
+  rainforest-vista   (-2,-4)  -23040,-53760    RAINFOREST / FLUVIAL
+  cave               (-3,-3)  -38400,-38400    underground, -VoxelCaveTest
+
+THREE BIOMES BECAUSE ONE IS NOT ENOUGH. The diagnosis records the same lattice
+in the rainforest and taiga vistas as green-tread/brown-riser. A fix verified
+only on the frame it was designed against is not verified.
+
+THE CAVE PAIR IS THE REGRESSION CHECK
+-------------------------------------
+-VoxelCaveTest finds a REAL worldgen cave void near spawn and parks the pawn in
+it. Nothing is dug -- those chunks are meshed only because streaming genuinely
+reached that depth, which is what makes this honest rather than a carved
+chamber. Both arms found the SAME void and posed the SAME camera, read back from
+their own logs:
+
+    found a 4.5m-tall cave void at (-3840500,-3839500,323826), floor 323676,
+    21.0m below surface, 7.1m from spawn
+    parked at (-3840350,-3839500,323826), 21.0m below surface, 1.50m above the
+    cave floor; looking yaw 180 pitch -12
+
+READ base-cave.png AGAINST fix-cave.png. The claim under test is that they are
+the SAME -- that the fix changed nothing underground. A floor 21 m below its own
+column's surface fails a 2 m test under either gate; that is the design intent,
+and this pair is the evidence for or against it.
+
+FIXED FOR EVERY FRAME
+---------------------
+  2560x1440. Sun FROZEN at 12:00 on 03-20 (-VoxelTimeScale 0), read back from
+  each log as "12:00 on 03-20 (day-of-year 79) at epoch 12600.000 s".
+  Seed 20260719. Coarse tiles s1 under provider
+  terrain-diffusion-unlabeled-71e2b362e3241e71; fine tier provider
+  ...-b2dffc351. Edit log cleared before every run (it persists across runs and
+  OVERRIDES -VoxelSpawnAt, which has previously moved a camera while the
+  filename kept saying the old site).
+
+SETTLE DISCIPLINE, AND A RULE THAT WAS CORRECTED HERE
+-----------------------------------------------------
+The rule this set was started under was "any non-zero value means the frame is
+not settled and must be excluded, not argued". That is right for a stationary
+capture and too broad in general, and the cave frame is what exposed it:
+fix-cave reports unloaded=225 and can never report anything else, because the
+fixture teleports the pawn 21 m underground mid-run and surface chunks unload BY
+DESIGN. Applying the rule literally there does not measure settledness, it
+measures whether the fixture moved the camera -- which is already known. The
+corrected rule, and the one this set is judged under:
+
+    jobsInFlight == 0 AND pendingJobs == 0 are REQUIRED for any judged frame.
+    unloaded must be 0 for a STATIONARY capture; for a fixture that deliberately
+    moves the camera (teleport, flight leg), unloaded is expected to be non-zero
+    and is not evidence either way. State which kind the frame is.
+
+  frame                     kind        jobsInFlight/pendingJobs/unloaded  peak loaded
+  base-tundra-vista         STATIONARY  0 / 0 / 0                          56,402
+  fix-tundra-vista          STATIONARY  0 / 0 / 0                          56,411
+  base-taiga-vista          STATIONARY  0 / 0 / 0                          42,506
+  fix-taiga-vista           STATIONARY  0 / 0 / 0                          42,464
+  base-rainforest-vista     STATIONARY  0 / 0 / 0                          61,437
+  fix-rainforest-vista      STATIONARY  0 / 0 / 0                          61,575
+  base-cave                 TELEPORT    0 / 0 / 230                        57,635
+  fix-cave                  TELEPORT    0 / 0 / 225                        57,635
+
+All eight report 0 undrawn chunks, so no black gap in any of these images is GPU
+pool exhaustion. All eight report TREE STABLE -- HEAD, the vertex factory's
+source hash and the editor DLL's timestamp were re-read after the shutter and
+matched what they were before it.
+
+THE PAIRED peak loaded COUNTS ARE THEMSELVES A RESULT. Each pair settles to
+within 0.2% of the same resident chunk count on the same settle budget
+(56,402/56,411; 42,506/42,464; 61,437/61,575; 57,635/57,635). The fix costs four
+Amplifier::column calls per chunk apply where the baseline paid one, and the
+open question was whether that would slow streaming enough to matter. On this
+evidence it did not: neither arm needed a longer settle than the other to reach
+the same world.
+
+TWO THINGS THAT WENT WRONG, RECORDED BECAUSE THEY NEARLY REACHED THE OUTPUT
+---------------------------------------------------------------------------
+1. CONTENTION. This box runs one editor at a time, and for part of this run a
+   second agent was also capturing on it. Three of my captures had their editors
+   terminated mid-settle -- logs stopping abruptly, no crash marker, no fatal
+   line, 32 GB free. That is a scheduling collision, not a defect in the build.
+   The affected frames were re-shot at FULL settle on an exclusive box rather
+   than re-taken with a shorter one.
+
+2. I MISREAD MY OWN LOG AND NEARLY DISCARDED A GOOD FRAME. settle-log.txt is
+   append-only and holds one entry per ATTEMPT, so fix-tundra-vista appears
+   twice: once for the killed attempt at jobsInFlight=332 pendingJobs=240, and
+   once for the 600 s re-shoot at 0/0/0. A grep that matched the FIRST entry
+   said the delivered frame was unsettled. It is not -- its log carries 120
+   streaming samples and a final timestamp matching the screenshot's. When
+   reading this file, take the LAST entry for a frame name, not the first.
+
+The tundra site is shot at a 600 s settle rather than the 420 s the other vistas
+get. At 420 s it was still at jobsInFlight=332 pendingJobs=240: it is the
+3,582 m relief alpine tile and it streams far more than the others. Raising the
+settle is the sanctioned response to a non-zero queue depth; arguing the frame
+is not.
