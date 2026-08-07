@@ -814,7 +814,43 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
         raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
     floor = np.float32(min_depth_m)
     added_total = 0
+    drained_total = 0
     sweeps = 0
+    rounds = 0
+    w_before = np.array(w, copy=True)
+    # THE RELAXATION. Spreading once and draining once is not water finding its
+    # level, it is one splash and one runoff. Water that runs off a perched
+    # shelf has to be allowed to SETTLE AGAIN lower down, and what settles there
+    # may perch in turn. So the two halves alternate to a fixed point.
+    #
+    # It terminates, and not by a cap: `spread` only ever adds cells and `drain`
+    # only ever removes cells it itself added this call, so a round that changes
+    # nothing ends it. The outer bound is a runaway guard, not the mechanism --
+    # if it is ever hit, that is a bug to report rather than a setting to raise,
+    # which is why the sweep count ships in the per-tile log.
+    for rounds in range(1, 33):
+        added_round, drained_round = _settle_round(
+            w, z, floor, int(max_iter))
+        added_total += added_round
+        drained_total += drained_round
+        sweeps += 1
+        if added_round == drained_round:
+            break
+    stats = {
+        "settle_rounds": float(rounds),
+        "settle_sweeps": float(sweeps),
+        "settle_added_cells": float(added_total),
+        "settle_drained_cells": float(drained_total),
+        "settle_kept_cells": float(int(np.isfinite(w).sum())
+                                  - int(np.isfinite(w_before).sum())),
+    }
+    return w, stats
+
+
+def _settle_round(w, z, floor, max_iter):
+    """One spread-then-drain round, in place on `w`. Returns (added, drained)."""
+    added_total = 0
+    first_wet = ~np.isfinite(w)   # dry at the START of this round
     for _ in range(int(max_iter)):
         wet = np.isfinite(w)
         lvl = np.where(wet, w, -np.inf).astype(np.float32)
@@ -824,7 +860,6 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
             best = np.maximum(best, _shift2(lvl, dy, dx, -np.inf))
         new = (~wet) & np.isfinite(best) & (best > -1e30) & (z <= best - floor)
         n = int(new.sum())
-        sweeps += 1
         if n == 0:
             break
         w[new] = best[new]
@@ -848,7 +883,7 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     # "water finds its own level" means once the water is allowed to leave.
     drained_total = 0
     if added_total:
-        added = np.isfinite(w) & ~np.isfinite(np.asarray(water_m, np.float32))
+        added = np.isfinite(w) & first_wet
         for _ in range(int(max_iter) * 4):
             wet = np.isfinite(w)
             esc = np.zeros(w.shape, bool)
@@ -863,13 +898,7 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
                 break
             w[gone] = np.float32(np.nan)
             drained_total += k
-    stats = {
-        "settle_sweeps": float(sweeps),
-        "settle_added_cells": float(added_total),
-        "settle_drained_cells": float(drained_total),
-        "settle_kept_cells": float(added_total - drained_total),
-    }
-    return w, stats
+    return added_total, drained_total
 
 
 def enforce_neighbour_consistency(water_m, z_ground_m, *, max_iter: int = 512):
