@@ -57,3 +57,55 @@ NEXT: build the surface first -- smooth and monotone along the network -- then
 take depth = surface - ground, instead of the reverse. Measure with this same
 script; the target is |d SURFACE| >100mm falling from 32% toward the ground's
 0.0%, WITHOUT flattening the long profile (bv17 aggregate gradient 205.7 m/km).
+
+
+=============================================================================
+CORRECTION, SAME DAY, BEFORE ANYONE BUILDS ON THE ABOVE.
+
+THE |d ground| COLUMN IS NOT THE GROUND. Retract the headline claim ("the
+ground under the rivers is smooth to within a millimetre, so the staircase is
+in the water, not the terrain"). It is not established.
+
+The disproof comes from the client, which is the authority on what it draws.
+A capture at column (-60688, -51716) logs:
+
+    pose: ... ground top z=1809.2 m
+
+That column lies inside fine tile (-4,-4). Reconstructing that tile in Python
+the way this measurement did -- base_offset_mm + elevation_cp * quant -- gives a
+tile that spans 2287.5..2312.5 m. The client's ground is ~480 m BELOW the entire
+range my reconstruction admits. So `elevation_cp + base_offset` is not the
+drawn ground, and a gradient taken from it alone is not the drawn ground's
+gradient.
+
+The per-tile reliefs say the same thing without the client's help. Across the
+six wet-block tiles the WITHIN-tile relief is 14.19, 15.56, 17.33, 22.03, 25.03
+and 41.88 m, while the BETWEEN-tile base offsets run 991 m to 2921 m. Tiles
+that share an edge would then differ by hundreds of metres across that edge
+while never varying more than ~25 m inside it. No continuous terrain does that.
+The relief lives in a component I was not reading.
+
+WHAT STILL STANDS, because it never used ground:
+  |d depth| between adjacent wet channel cells is p50 20 mm, p90 500 mm, and
+  exceeds one 100 mm voxel for 32.0% of adjacent pairs (bv17). Depth is read
+  straight off water_cp at a known LSB. The depth field really does jump
+  several voxels between neighbours, and it really did improve bv15 -> bv17
+  (35.2% -> 32.0% over one voxel, p90 600 -> 500 mm).
+
+WHAT DOES NOT STAND: that those depth jumps become surface jumps. surface =
+ground + depth, and if the true ground falls where depth grows the surface can
+be smooth while depth is rough -- which is exactly what a river does, since a
+deepening pool sits in a dropping bed. The |d SURFACE| row above is
+|d depth| plus a ground term that was ~0 by construction, so it measured
+nothing independent.
+
+THE LESSON, and it is the same one as [[voxelsim-draw-path-2k]] and the
+retracted transect: THERE ARE THREE GROUNDS -- the sample field, the
+reconstructed spline (the water datum), and the amplified surface the player
+sees -- and I reimplemented the reconstruction in Python instead of calling the
+one the client uses. Do not compute ground in Python for this purpose again.
+`vxc_riverribbonprobe` already reconstructs it the client's way and already has
+a LONG PROFILE section; measure surface gradient and surface roughness THERE.
+
+STATUS: the question "is the drawn water surface rough at voxel scale, and is
+that what the owner sees as a staircase" is REOPENED and unmeasured.
