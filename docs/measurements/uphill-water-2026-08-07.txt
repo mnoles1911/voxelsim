@@ -1,0 +1,96 @@
+WATER THAT CLIMBS: CONFIRMED, LOCATED, AND ONE CANDIDATE FIX PRICED
+2026-08-07, wet alpine block tile (-4,-4), bake_ver 14 and 15.
+
+THE REPORT
+----------
+The owner, flying the magenta marker at bake_ver 15: "possible I see a spot or
+two where the magenta blocks actually seem to flow slightly up hill when they
+should be descending down path of least resistance in a mountain river valleys."
+
+CONFIRMED, AND IT IS NOT NEW
+----------------------------
+vxc_riverribbonprobe, along ORIENTED reaches, surface = reconstructed ground +
+baked depth (ground #2, resolved through RiverSampler):
+
+    bake_ver 14   46,726 downstream steps   8,469 RISE (18.12%)   3,437 > 1 voxel
+                  p50 33 mm   p90 527 mm   max 4,775 mm
+    bake_ver 15   81,983 downstream steps  11,142 RISE (13.59%)   4,479 > 1 voxel
+                  p50 40 mm   p90 627 mm   max 3,996 mm
+
+bake_ver 15 is better as a FRACTION and worse in absolute count, which is what
+more drawn water should do. p90 627 mm against a 100 mm wire LSB: this is
+metre-scale, visible, and not quantisation.
+
+IT IS NOT A TRACING ARTEFACT
+-----------------------------
+Split by whether the two points are 8-CONNECTED (a genuine channel walk) or
+farther apart (the tracer stitching a confluence, or a centreline hopping
+between two adjacent water bodies):
+
+    adjacent steps    81,983  = 100.0% of all steps
+    of which RISE     11,142  = every single rise
+
+There are no non-adjacent steps at all, so tracing explains NONE of it.
+
+WHY THE INVARIANT DID NOT CATCH IT
+-----------------------------------
+`enforce_descent` guarantees a non-increasing surface along the D8 RECEIVER
+FOREST, and it does. Two pixels can sit side by side on the drawn channel and
+drain to DIFFERENT receivers -- the sweep never compares them to each other.
+`fill_to_local_surface` then hands each cell the level of the reach IT drains
+into, so neighbours legitimately inherit different levels and the seam between
+them is a step the eye walks straight over.
+
+The guarantee is real. It just does not cover the pairs a player traverses.
+
+A CANDIDATE FIX, PROTOTYPED OFFLINE AND NOT SHIPPED
+----------------------------------------------------
+Rule A -- "water finds its level": adjacent wet cells whose water is connected
+are one body, take the lower, iterate.
+
+    rises      415,005 -> 8,405   (-98.0%)
+    wet cells  unchanged
+    COST       surface lowered on 363,843 of 364,354 cells, p50 925 mm
+
+REJECTED. "Water finds its level" is true of STANDING water and false of a
+river: a flowing channel has a gradient by definition, so min-propagation is
+transitive and chains the global minimum up the whole network. It flattens the
+long profile. The measurement is what caught it -- the rule looked right.
+
+Rule B -- non-increasing DOWNSTREAM: for a cell with an upstream wet neighbour
+(one standing on higher ground), the surface may not exceed that neighbour's.
+Water cannot be higher than the water feeding it. Only ever lowers.
+
+    rises      415,005 -> 22      (-100.0%)
+    wet cells  unchanged (+0.00%)
+    COST       surface lowered on 219,410 cells (60% of wet), p50 547 mm,
+               p90 1,643 mm, max 5,405 mm
+
+NOT SHIPPED, for two reasons that are the honest state rather than caution:
+
+  1. IT DID NOT CONVERGE. The relaxation hit its 60-iteration cap at 59, so the
+     figures above are an INCOMPLETE relaxation and the true cost is unbounded
+     so far. A fix whose price is still moving is not priced.
+  2. The prototype uses `elevation_cp` -- the CONTROL LATTICE -- as ground, to
+     decide which neighbour is upstream. The lattice stands up to 5.6 m off the
+     surface it interpolates, which is the exact proxy error this file criticises
+     in its own first paragraph. Before/after under one consistent definition is
+     still informative about the DELTA; the absolute cost is not trustworthy.
+
+That 60% of cells violate "not higher than your feeder" by a median half metre
+is itself a finding: the level assignment is not merely seamed at rare
+junctions, it is systematically inconsistent between neighbours. That points at
+the composition -- per-reach levels stitched together -- rather than at a bug in
+any one rule, and it is the same thing water-system-architecture §11b already
+names as the intended fix: ONE surface field from ONE solve, instead of two
+authorities composed at runtime with nothing forcing them to agree.
+
+WHAT WOULD SETTLE IT
+--------------------
+  * re-run Rule B to true convergence with a higher cap, and on the
+    RECONSTRUCTED surface rather than the lattice;
+  * check the long profile before/after with river_long_profile.py, since the
+    failure mode of any lowering rule is a flattened profile and the rise count
+    alone cannot see that;
+  * only then decide whether it belongs in the bake behind a constant, or
+    whether it is a patch over a composition that should be replaced.
