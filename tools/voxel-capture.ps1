@@ -178,7 +178,15 @@ $VoxelCoreLib = @(
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($VoxelCoreLib -and (Test-Path $VoxelCoreRoot)) {
     $libTime = (Get-Item $VoxelCoreLib).LastWriteTimeUtc
-    $newest = Get-ChildItem $VoxelCoreRoot -Recurse -Include *.cpp, *.h, *.hpp, *.inl -File `
+    # src AND include ONLY, matching VoxelEarth.Build.cs's own staleness scan.
+    # tests/ and bench/ do NOT build into voxelcore.lib -- they are their own
+    # targets -- so scanning the whole tree refuses a capture whenever a test
+    # file was touched, which is a false alarm that trains people to ignore the
+    # guard. Measured the day this was written: editing test_amplifier.cpp
+    # refused a capture whose generator was perfectly current.
+    $scanDirs = @((Join-Path $VoxelCoreRoot 'src'), (Join-Path $VoxelCoreRoot 'include')) |
+                Where-Object { Test-Path $_ }
+    $newest = Get-ChildItem $scanDirs -Recurse -Include *.cpp, *.h, *.hpp, *.inl -File `
               -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending |
               Select-Object -First 1
     if ($newest -and $newest.LastWriteTimeUtc -gt $libTime) {
