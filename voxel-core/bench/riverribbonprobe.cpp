@@ -608,6 +608,78 @@ int main(int argc, char** argv) {
         }
     }
 
+    // =======================================================================
+    // DOES THE WATER SURFACE EVER RISE GOING DOWNSTREAM?
+    // =======================================================================
+    //
+    // The owner, flying bake_ver 15: "possible I see a spot or two where the
+    // magenta blocks actually seem to flow slightly up hill when they should be
+    // descending down path of least resistance in a mountain river valleys."
+    //
+    // It should be impossible. `graded_water_surface` runs `enforce_descent`
+    // over the D8 receiver forest, so the stored surface is non-increasing
+    // downstream BY CONSTRUCTION. This checks the claim on the shipped tiles,
+    // ALONG THE REACH -- which is the only direction the question means
+    // anything in. A river's neighbours across the channel are at the same
+    // level and its neighbours over the bank belong to a different reach, so
+    // "compare against the downhill neighbour" answers a different question and
+    // answers it wrongly.
+    //
+    // ONE METHOD TRAP, AND IT ALREADY CAUGHT ME. Recomputing steepest descent
+    // from the tile's ELEVATION CONTROL POINTS and comparing there reports 51%
+    // of wet cells rising at bv14 -- an alarming number and a worthless one,
+    // because the control lattice stands up to 5.6 m off the surface it
+    // interpolates (tilestore.h's three-grounds note). Descent computed on the
+    // lattice is not descent on the ground. The reaches below carry
+    // `surfaceMm` resolved through `RiverSampler`, i.e. reconstructed ground
+    // plus baked depth -- ground #2, the datum's own surface.
+    //
+    // Reaches are ORIENTED first, so "downstream" is pts[0] -> pts.back().
+    {
+        size_t flatReaches = 0;
+        riverRibbonOrient(paths, &flatReaches);
+
+        int64_t steps = 0, rises = 0, risesOverVoxel = 0;
+        int32_t worstRiseMm = 0;
+        std::vector<int32_t> riseMm;
+        for (const RiverRibbonPath& p : paths) {
+            for (size_t i = 0; i + 1 < p.pts.size(); ++i) {
+                const int32_t a = p.pts[i].surfaceMm, b = p.pts[i + 1].surfaceMm;
+                if (a == kNoWaterMm || b == kNoWaterMm) continue;
+                ++steps;
+                const int32_t d = b - a;   // > 0 == the surface went UP downstream
+                if (d > 0) {
+                    ++rises;
+                    if (d > int32_t(kVoxelSizeMm)) ++risesOverVoxel;
+                    if (d > worstRiseMm) worstRiseMm = d;
+                    riseMm.push_back(d);
+                }
+            }
+        }
+        std::printf("\n=== DOES THE SURFACE RISE DOWNSTREAM? (along oriented reaches) ===\n");
+        std::printf("  reaches oriented  : %zu   (%zu level end-to-end -- standing water, no "
+                    "direction)\n", paths.size(), flatReaches);
+        std::printf("  downstream steps  : %" PRId64 "\n", steps);
+        std::printf("  ...that RISE      : %" PRId64 " (%.4f%%)   over one voxel: %" PRId64 "\n",
+                    rises, steps ? 100.0 * double(rises) / double(steps) : 0.0, risesOverVoxel);
+        if (!riseMm.empty()) {
+            std::sort(riseMm.begin(), riseMm.end());
+            std::printf("  rise mm           : p50 %d  p90 %d  max %d\n",
+                        riseMm[riseMm.size() / 2], riseMm[(riseMm.size() * 9) / 10], worstRiseMm);
+        }
+        std::printf("  READ THIS CAREFULLY. enforce_descent guarantees non-increasing surface along\n"
+                    "  the D8 RECEIVER FOREST. This walks the traced MEDIAL AXIS, which is a\n"
+                    "  different path -- it can cross between adjacent reaches at a stitch, and a\n"
+                    "  centreline that wanders laterally samples cells that inherited their level\n"
+                    "  from different reaches. So a non-zero count here is NOT proof that the\n"
+                    "  stored plane violates its own guarantee.\n"
+                    "  What it IS: the surface along the channel a player actually sees. A rise\n"
+                    "  under the 100 mm wire LSB cannot be seen; a metre-scale one is water\n"
+                    "  visibly climbing a valley, which is what was reported from the air.\n"
+                    "  To separate the two, split these by whether they fall at a reach JOIN or\n"
+                    "  mid-reach -- mid-reach rises cannot be blamed on tracing.\n");
+    }
+
     // --- simplification: the anti-staircase measurement ----------------------
     int64_t keptPts = 0;
     RiverSimplifyParams sp;
