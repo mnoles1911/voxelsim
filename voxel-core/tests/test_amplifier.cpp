@@ -1140,21 +1140,34 @@ VXC_TEST(water_marker_fills_from_the_ground_to_the_water_surface) {
 
     const ColumnSample col = amp.column(1234, -567);
     CHECK_EQ(col.surfaceMm, dry.surfaceMm);   // the marker moves no ground
-    CHECK_EQ(col.waterSurfaceMm, waterMm);
+
+    // CAPPED AT kWaterMarkerHeightMm ABOVE THE GROUND, not carried to the true
+    // water surface. This test asserted the full column until 2026-08-06 and
+    // that contract was the instrument's own performance bug: 5 m here is
+    // harmless, but a 40 m lake is FIFTY 8-voxel bricks where dry ground needs
+    // one, and the deepest water is a basin's INTERIOR -- so lake middles cost
+    // fifty times their own shorelines and stopped streaming in at all. The
+    // marker answers WHERE water is, and a 3 m slab answers that identically
+    // from outside the water.
+    const int32_t expectMm =
+        static_cast<int32_t>(std::min<int64_t>(waterMm, int64_t(col.surfaceMm) + kWaterMarkerHeightMm));
+    CHECK_EQ(col.waterSurfaceMm, expectMm);
+    CHECK(expectMm < waterMm);   // the fixture's 5 m really does exercise the cap
 
     const int64_t top = floorDiv(col.surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
     // The topmost solid ground voxel is untouched...
     CHECK(Amplifier::stratigraphyAt(col, top) != MAT_AIR);
     CHECK(Amplifier::stratigraphyAt(col, top) != MAT_WATERMARK);
-    // ...everything from there up to the waterline is marked...
+    // ...everything from there up to the CAPPED top is marked...
     int marked = 0;
-    for (int64_t vz = top + 1; vz * kVoxelSizeMm + kVoxelSizeMm / 2 <= waterMm; ++vz) {
+    for (int64_t vz = top + 1; vz * kVoxelSizeMm + kVoxelSizeMm / 2 <= expectMm; ++vz) {
         CHECK_EQ(Amplifier::stratigraphyAt(col, vz), MAT_WATERMARK);
         ++marked;
     }
-    CHECK(marked >= 45);   // ~5 m of 10 cm voxels
-    // ...and above the waterline it is air again.
-    const int64_t above = waterMm / kVoxelSizeMm + 2;
+    CHECK(marked >= 25);   // ~3 m of 10 cm voxels
+    // ...and above it air again -- including BELOW the true water surface,
+    // which is the whole point of the cap.
+    const int64_t above = expectMm / kVoxelSizeMm + 2;
     CHECK_EQ(Amplifier::stratigraphyAt(col, above), MAT_AIR);
 }
 
@@ -1173,8 +1186,14 @@ VXC_TEST(water_marker_widens_the_sky_band_bound_or_it_would_punch_holes) {
     amp.setWaterMarker(&water);
     const int64_t wetBound = amp.surfaceUpperBoundMm(0, 0, 31, 31);
     CHECK(wetBound > dryBound);
-    // And it must bound the deepest water the wire format can express.
-    CHECK(wetBound >= dryBound + kWaterMarkerMaxDepthMm);
+    // And it must bound the marker's own CAPPED height, not the deepest water
+    // the wire format can express. It bounded the latter until 2026-08-06, and
+    // that was 327 m of declared-possibly-solid sky admitting chunks that can
+    // only ever be air. The marker now stops kWaterMarkerHeightMm above the
+    // ground, so this is the honest bound -- and it must agree with the cap in
+    // Amplifier::column and coarseSurfaceBrickRange, or the band and the fill
+    // disagree about which bricks can hold magenta.
+    CHECK(wetBound >= dryBound + kWaterMarkerHeightMm);
 
     // Every marked voxel in the rect must sit at or below the bound -- the
     // property the streamer actually relies on.

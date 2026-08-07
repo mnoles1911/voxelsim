@@ -159,6 +159,50 @@ Q_MAJOR_M3_YR = 1000.0 * Q_PERENNIAL_M3_YR
 #: fighting it.
 CHANNEL_REF_WIDTH_M = 1.5
 CHANNEL_REF_DEPTH_M = 0.3
+#: EXAGGERATED ON PURPOSE, 2026-08-06, and it is a design decision rather than a
+#: correction. Earth's downstream hydraulic geometry is width ∝ Q^0.40 and
+#: depth ∝ Q^0.35 (Leopold & Maddock), and this world reproduced those exponents
+#: exactly -- architecture §4 measured width 2.07x against a predicted 2.07 and
+#: depth 1.91x against 1.92. The laws were right and the RESULT was boring: over
+#: the 256x discharge span between a drawable headwater and the largest trunk,
+#: Earth's exponents give 2.8 m -> 26 m of width and 0.39 m -> 2.8 m of depth, so
+#: every river in the world reads as roughly the same size. The owner has pushed
+#: on this twice -- "Why are rivers a maximum of 2 m deep?" -- and the answer was
+#: that nothing was broken, the exponents were simply Earth's.
+#:
+#: His decision, in his words: "I think we change the exponents to force more
+#: dramatic rivers even though it's different than earth. Exaggeration is ok to
+#: keep things interesting."
+#:
+#: At 166/256 and 128/256 the same span gives 4.2 m -> 154 m wide and 0.50 m ->
+#: 7.9 m deep: a headwater you can still step over, and a trunk that is
+#: unmistakably a major river. Both stay inside their caps (400 m, 25 m), which
+#: is what stops the law going flat at the top end -- at 0.75 the width cap
+#: starts binding and the biggest rivers would all clamp to the same size, which
+#: is the current problem again in a new place.
+#:
+#: THESE ARE MIRRORED IN channel.h AS Q8 FIXED POINT and the two must move
+#: together; the mirror is asserted by test_channel_exponents_match_the_mirror.
+#: NOT YET FLIPPED. The owner decided to exaggerate ("I think we change the
+#: exponents to force more dramatic rivers even though it's different than
+#: earth. Exaggeration is ok to keep things interesting") and 166/128 is the
+#: value that does it: over the 256x span between a drawable headwater and the
+#: largest trunk it gives 4.2 -> 154 m of width and 0.50 -> 7.9 m of depth,
+#: against Earth's 2.8 -> 26 m and 0.39 -> 2.8 m, with both ends still off their
+#: caps. That is the change that answers "why are rivers a maximum of 2 m deep?".
+#:
+#: WHAT BLOCKS IT: at 166/128 the voxel-core test
+#: ``channel_is_continuous_across_confluences`` fails its ``cs.inBed`` check --
+#: a sample taken AT a river junction reports itself outside the channel bed.
+#: Wider channels should make that assertion EASIER to satisfy, not harder, so
+#: the failure is not understood, and an unexplained failure in channel
+#: CONTINUITY is exactly the class that produces disconnected rivers. Flipping a
+#: number that rolls bake_ver on an unexplained red test is not a trade worth
+#: taking; the constants below stay at Earth's values until it is explained.
+#:
+#: The plumbing is ready: both are now identity-covered bake constants (see
+#: BakeConstants.channel_width_exp_q8), so flipping them is a two-line change
+#: that correctly re-keys the tiles it affects.
 CHANNEL_WIDTH_EXP = 102.0 / 256.0  # 0.3984, channel.h's kChannelWidthExpQ8
 CHANNEL_DEPTH_EXP = 90.0 / 256.0   # 0.3516, channel.h's kChannelDepthExpQ8
 CHANNEL_MAX_WIDTH_M = 400.0
@@ -670,9 +714,24 @@ def widen_to_channel_width(water_m, z_ground_m, q_m3_yr, *, cell_m: float,
 
 # --------------------------------------------------------------------------- fill
 
+#: Exponent on the slope ratio for the EXTENT threshold. Gentler than the depth
+#: term's -0.3 and in the opposite sense: this raises the bar a cell must clear
+#: to count as inundated, so steeper ground needs to stand FURTHER below the
+#: water surface before it is called wet.
+SLOPE_EXTENT_EXP = 1.0
+
+#: Clamp on the extent slope ratio. The floor matters more than the ceiling:
+#: 58% of river cells sit on the epsilon-fill floor where the "slope" is the
+#: fill's own increment, and there the threshold must not collapse to zero and
+#: inundate every marginal cell.
+SLOPE_EXTENT_MIN = 1.0 / 4.0
+SLOPE_EXTENT_MAX = 8.0
+
+
 def fill_to_local_surface(water_m, z_ground_m, receivers, *, cell_m: float,
                           exclude=None,
-                          min_depth_m: float = WIDEN_MIN_DEPTH_M):
+                          min_depth_m: float = WIDEN_MIN_DEPTH_M,
+                          slope=None):
     """Fill sideways to the LOCAL water surface. Returns ``(w, stats)``.
 
     THE RULE THIS REPLACES, AND WHY. ``widen_to_channel_width`` paints a ribbon
@@ -799,7 +858,39 @@ def fill_to_local_surface(water_m, z_ground_m, receivers, *, cell_m: float,
 
     reached = np.isfinite(level)
     hand = z.ravel() - level                       # Height Above Nearest Drainage
-    wet = reached & (hand <= -np.float32(min_depth_m))
+
+    # THE SLOPE TERM. Off unless a slope field is handed in.
+    #
+    # WHAT IT FIXES. The rule above spreads water sideways to the local surface
+    # with no reference to how steep the ground is, so the same discharge makes
+    # the same sheet on a floodplain and on a 17% mountainside. Flying it, the
+    # owner: "for rivers flowing down steep surfaces the placement of water does
+    # not make sense such that the magenta voxels are not being placed on a
+    # downslope where gravity would actually guide and push the water on a path
+    # of least resistance", and the descent read as "a manmade magenta
+    # staircase, not a natural water flow falling down a gulley".
+    #
+    # He is describing water that failed to CONCENTRATE. Fast water on a steep
+    # bed occupies less cross-section for the same Q, so it should run as a
+    # thread in the steepest line rather than pond across the slope.
+    #
+    # NOT A RADIUS CAP, and that is deliberate: this function's own docstring
+    # retired one -- "a fill that needs a radius to stop is a formula wearing a
+    # flood's clothes" -- after a measured 209x flood. This scales the DEPTH
+    # THRESHOLD instead, which keeps every property the rule has by
+    # construction. Connectedness, levelness across a section and downstream
+    # descent all survive because the threshold changes WHICH cells clear the
+    # bar, never where a level came from.
+    #
+    # The physical reading: a cell 5 cm below the water surface on a steep bed
+    # is not inundated, it is draining. On a floodplain the same 5 cm is a
+    # backwater. Same rule, and the ground says which.
+    md = np.float32(min_depth_m)
+    if slope is not None:
+        s = np.maximum(np.asarray(slope, np.float64).ravel(), 0.0)
+        ratio = np.clip(s / SLOPE_REF_M_PER_M, SLOPE_EXTENT_MIN, SLOPE_EXTENT_MAX)
+        md = (np.float64(min_depth_m) * ratio**SLOPE_EXTENT_EXP).astype(np.float32)
+    wet = reached & (hand <= -md)
     wet |= src.ravel()
     flat = w.ravel()
     flat[wet & ~src.ravel()] = level[wet & ~src.ravel()]

@@ -188,64 +188,41 @@ VXC_TEST(channel_width_and_depth_scale_with_discharge) {
     // it around 10000^0.4 = 40x the reference width, depth ~ Q^0.35 around
     // 25x. Bounded generously either side so this tests the shape of the
     // law, not the exact rounding of the mantissa tables.
-    // MEASURED AT THIS WORLD'S OWN LARGEST RIVER, not at an arbitrary decade.
-    // The biggest discharge anywhere on land is 3.91e8 m3/yr against a
-    // perennial anchor of 3.16e5, i.e. about 1240x -- so that is the number
-    // that decides whether a trunk reads as a trunk. 10000x used to be the
-    // probe here and is now past the width cap under the exaggerated
-    // exponents, which would have tested the CLAMP rather than the law.
-    const int64_t bigQ = qRef * 1240;
+    const int64_t bigQ = qRef * 10000;
     const int64_t bigW = channelWidthMm(bigQ), bigD = channelDepthMm(bigQ);
-    // A major river: well over 100 m wide and deep enough to drown in, which
-    // is the whole point of moving off Earth's exponents.
-    CHECK(bigW >= 100'000 && bigW <= 200'000);
-    CHECK(bigD >= 8'000 && bigD <= 14'000);
-    // AND STILL OFF BOTH CAPS. If the world's largest river clamps, every
-    // large river clamps to the SAME size and the exaggeration has recreated
-    // the flatness it was meant to cure, one decade higher up.
-    CHECK(bigW < kChannelMaxWidthMm);
-    CHECK(bigD < kChannelMaxDepthMm);
+    CHECK(bigW >= kChannelRefWidthMm * 30);
+    CHECK(bigW <= kChannelRefWidthMm * 50);
+    CHECK(bigD >= kChannelRefDepthMm * 18);
+    CHECK(bigD <= kChannelRefDepthMm * 32);
+    // ...and that lands on a physically sensible river: tens of metres wide,
+    // several metres deep.
+    CHECK(bigW >= 40'000 && bigW <= 90'000);
+    CHECK(bigD >= 4'000 && bigD <= 12'000);
 
     // Depth grows more slowly than width, as hydraulic geometry requires --
     // rivers get wide faster than they get deep.
     CHECK(bigW * kChannelRefDepthMm > bigD * kChannelRefWidthMm);
 
-    // Checked against the ideal power law, decade by decade, and the TOLERANCE
-    // is the test rather than the numbers: the integer law must track
-    // 1500*m^(166/256) and 300*m^(128/256) to better than 1.6%, which is what
-    // says the log2/exp2 pair is really computing a power law and not merely
-    // something monotone.
-    //
-    // THE EXACT INTEGER PINS ARE GONE ON PURPOSE. They encoded the OLD
-    // exponents and nothing else -- changing 0.3984 to 0.6484 failed six of
-    // them while every property this test exists to defend still held. A pin
-    // that only restates the current constant does not defend a behaviour, it
-    // just has to be rewritten whenever the constant is a decision rather than
-    // a mistake. Determinism is still covered: the ideal columns are computed
-    // from the SAME Q8 constants the law uses, so a mantissa-table regression
-    // moves one and not the other.
-    //
-    // Capped rows are skipped: above the cap the law is flat by design and
-    // comparing it to an uncapped ideal would fail for the right reason.
+    // Pinned against the ideal power law, decade by decade. The ideal
+    // columns are 1500*m^0.4 and 300*m^0.35 evaluated exactly; the integer
+    // law tracks them to better than 1.6% across four decades, which is
+    // what says the log2/exp2 pair is really computing a power law and not
+    // merely something monotone.
     struct Row {
-        int64_t mult;
-        double idealW, idealD;
+        int64_t mult, width, idealW, depth, idealD;
     };
     const Row rows[] = {
-        {1, 1500.0, 300.0},
-        {10, 6676.0, 949.0},
-        {100, 29714.0, 3000.0},
-        {1000, 132252.0, 9487.0},
+        {1, 1500, 1500, 300, 300},
+        {10, 3744, 3768, 670, 672},
+        {100, 9376, 9464, 1512, 1504},
+        {1000, 23488, 23773, 3400, 3366},
+        {10000, 58880, 59716, 7632, 7536},
     };
     for (const Row& r : rows) {
-        const int64_t w = channelWidthMm(qRef * r.mult);
-        const int64_t d = channelDepthMm(qRef * r.mult);
-        if (w < kChannelMaxWidthMm) {
-            CHECK(std::abs(double(w) - r.idealW) * 63.0 <= r.idealW); // < 1.6%
-        }
-        if (d < kChannelMaxDepthMm) {
-            CHECK(std::abs(double(d) - r.idealD) * 63.0 <= r.idealD);
-        }
+        CHECK_EQ(channelWidthMm(qRef * r.mult), r.width);
+        CHECK_EQ(channelDepthMm(qRef * r.mult), r.depth);
+        CHECK(std::abs(r.width - r.idealW) * 63 <= r.idealW); // < 1.6%
+        CHECK(std::abs(r.depth - r.idealD) * 63 <= r.idealD);
     }
 }
 

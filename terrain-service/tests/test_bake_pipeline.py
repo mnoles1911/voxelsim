@@ -2361,13 +2361,31 @@ def test_width_follows_the_discharge_and_stops_at_the_ground():
     up, down = int(wet[2].sum()), int(wet[n - 3].sum())
     assert down > up, f"the ribbon did not widen downstream: {up} -> {down} px"
 
-    # It tracks the LAW rather than merely growing: the drawn width is within
-    # one pixel of channel_width_m(Q) wherever the trench has room for it.
+    # It tracks the LAW rather than merely growing -- but bounded by the GROUND,
+    # which is the second half of this test's own title and which the
+    # exaggerated exponents (2026-08-06) made bite for the first time.
+    #
+    # The trench is a fixed cross-section. Under Earth's exponents the law never
+    # asked for more room than it had, so "drawn == law" held everywhere and the
+    # clamp was only exercised by the explicit check below. Under width ∝ Q^0.648
+    # the law asks for 116 m at the bottom of this reach and the trench offers
+    # 88 m, so the drawn width is now VALLEY-LIMITED there. That is the rule
+    # working, and it is what the owner asked for -- "drawn width and depth
+    # should be a function of how much water the river carries AND the
+    # underlying ground terrain at a certain point."
+    #
+    # So the assertion is drawn == min(law, room), which is a stronger statement
+    # than the old one: it says the law is followed wherever there is room and
+    # the ground wins where there is not.
     for r in (2, n // 2, n - 3):
         law = float(pipeline._water.channel_width_m(q[r, cx]))
         drawn = int(wet[r].sum()) * 1.875
-        assert abs(drawn - law) <= 1.875 + 1e-9, (
-            f"row {r}: drew {drawn:.2f} m against a law width of {law:.2f} m")
+        room = float(np.isfinite(z[r]).sum()) * 1.875
+        expect = min(law, room)
+        assert drawn <= law + 1.875 + 1e-9, (
+            f"row {r}: drew {drawn:.2f} m, MORE than the law's {law:.2f} m")
+        assert abs(drawn - expect) <= 1.875 + 1e-9, (
+            f"row {r}: drew {drawn:.2f} m against min(law {law:.2f}, room {room:.2f})")
 
     # THE CLAMP. Every drawn cell stands under its own water, by at least the
     # representability floor the codec needs.
@@ -3127,3 +3145,92 @@ def test_slope_in_depth_is_off_by_default():
 
     assert BakeConstants().water_slope_in_depth is False
     assert "water_slope_in_depth" in BakeConstants.PRODUCT_FIELDS
+
+
+def test_channel_exponents_match_the_mirror():
+    """water.py and channel.h must agree, and the identity must cover both.
+
+    The laws live in two places on purpose -- Python decides the baked plane,
+    channel.h's fixed point decides what the client computes -- and the docs
+    say they "agree by construction". They only agree by construction if
+    something checks, because nothing in either file can see the other.
+
+    The identity half matters more than the arithmetic half. These were module
+    constants outside every payload, so editing them changed written bytes
+    under an unchanged fine_provider_id: a namespace holding two mutually
+    incompatible waters with no way to tell them apart.
+    """
+    import re
+    from pathlib import Path
+
+    from terrain_service.bake import water as w
+    from terrain_service.bake.pipeline import BakeConstants
+
+    c = BakeConstants()
+    assert w.CHANNEL_WIDTH_EXP == c.channel_width_exp_q8 / 256.0
+    assert w.CHANNEL_DEPTH_EXP == c.channel_depth_exp_q8 / 256.0
+    assert "channel_width_exp_q8" in BakeConstants.PRODUCT_FIELDS
+    assert "channel_depth_exp_q8" in BakeConstants.PRODUCT_FIELDS
+
+    header = Path(__file__).resolve().parents[2] / "voxel-core/include/voxelcore/channel.h"
+    src = header.read_text(encoding="utf-8", errors="ignore")
+    wq8 = int(re.search(r"kChannelWidthExpQ8\s*=\s*(\d+)", src).group(1))
+    dq8 = int(re.search(r"kChannelDepthExpQ8\s*=\s*(\d+)", src).group(1))
+    assert wq8 == c.channel_width_exp_q8, "channel.h width exponent drifted from the bake"
+    assert dq8 == c.channel_depth_exp_q8, "channel.h depth exponent drifted from the bake"
+
+
+def test_slope_in_extent_narrows_a_steep_reach_and_leaves_a_floodplain_alone():
+    """Water concentrates on a slope and spreads on the flat, from one rule.
+
+    The owner's report, flying the marker: water "not being placed on a
+    downslope where gravity would actually guide and push the water on a path
+    of least resistance". That is water failing to CONCENTRATE -- fast water on
+    a steep bed occupies less cross-section for the same discharge.
+
+    Asserted as a COMPARISON rather than an absolute count, because the point
+    is the difference between steep and flat, not a tuned number.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    n = 48
+    cx = n // 2
+
+    def run(drop_per_row, slope_on):
+        # A V-shaped cross-section descending in +y at drop_per_row metres.
+        z = np.zeros((n, n), np.float32)
+        for r in range(n):
+            for c in range(n):
+                z[r, c] = 100.0 - r * drop_per_row + abs(c - cx) * 0.05
+        # Receivers must CONVERGE on the channel, or nothing off-centre drains
+        # into it and the rule correctly refuses to spread -- the level is
+        # anchored on the first drawn cell of a cell's own downstream path, not
+        # on the nearest one. A first draft of this fixture pointed every column
+        # straight down and measured no fill at all, from either arm.
+        rec = np.zeros(n * n, np.int64)
+        for r in range(n):
+            for c in range(n):
+                if r + 1 >= n:
+                    rec[r * n + c] = r * n + c
+                    continue
+                step = 0 if c == cx else (1 if c < cx else -1)
+                rec[r * n + c] = (r + 1) * n + (c + step)
+        water = np.full((n, n), np.nan, np.float32)
+        water[:, cx] = z[:, cx] + 0.6
+        slope = w.slope_to_receiver(z, rec.reshape(n, n), cell_m=1.875) if slope_on else None
+        out, _ = w.fill_to_local_surface(
+            water, z, rec.reshape(n, n), cell_m=1.875, slope=slope)
+        return int(np.isfinite(out).sum())
+
+    # Flat-ish reach: the slope term must barely touch it.
+    flat_off = run(0.002, False)
+    flat_on = run(0.002, True)
+    # Steep reach: it must narrow.
+    steep_off = run(0.30, False)
+    steep_on = run(0.30, True)
+
+    assert steep_on < steep_off, "the slope term did not narrow a steep reach"
+    assert flat_on >= steep_on, "a floodplain must not end up narrower than a gorge"
+    # And the narrowing must be a slope effect, not a blanket reduction.
+    assert (steep_off - steep_on) > (flat_off - flat_on)

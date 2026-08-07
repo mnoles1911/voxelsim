@@ -1258,6 +1258,50 @@ class BakeConstants:
     #: still wrong and this goes back off rather than getting tuned.
     water_slope_in_depth: bool = False
 
+    #: The same missing physics as ``water_slope_in_depth``, in the EXTENT rule
+    #: instead of the depth law. Off by default; separate from the depth flag so
+    #: the two can be measured apart, since they fix different halves of one
+    #: complaint.
+    #:
+    #: ``fill_to_local_surface`` spreads water sideways to the local surface with
+    #: no reference to gradient, so the same discharge makes the same sheet on a
+    #: floodplain and on a mountainside. The owner, flying it: water "not being
+    #: placed on a downslope where gravity would actually guide and push the
+    #: water on a path of least resistance", descending as "a manmade magenta
+    #: staircase, not a natural water flow falling down a gulley". That is water
+    #: failing to CONCENTRATE -- fast water on a steep bed occupies less
+    #: cross-section for the same Q.
+    #:
+    #: It scales the fill's DEPTH THRESHOLD by gradient rather than capping its
+    #: reach. A radius cap is explicitly retired in that function's own
+    #: docstring ("a fill that needs a radius to stop is a formula wearing a
+    #: flood's clothes") after a measured 209x flood, and scaling the threshold
+    #: keeps connectedness, levelness and downstream descent intact because it
+    #: changes which cells clear the bar, never where a level came from.
+    water_slope_in_extent: bool = False
+
+    #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
+    #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
+    #:
+    #: THEY ARE HERE BECAUSE THEY DECIDE BAKED BYTES AND WERE NOT COVERED.
+    #: ``water.py`` held them as module constants outside every payload, so
+    #: editing them changed the written water plane under an UNCHANGED
+    #: ``fine_provider_id`` -- the namespace would hold two mutually
+    #: incompatible waters and no consumer could tell them apart. That is
+    #: precisely the failure ``providers/diffusion.py``'s
+    #: ``_tile_format_fingerprint`` docstring calls "especially nasty" about a
+    #: codec bump, and ``_bake_fingerprint``'s own note says the product half is
+    #: folded in "so a water constant that fed no identity would change written
+    #: bytes under an unchanged id". These fed no identity. Now they do.
+    #:
+    #: Recorded, not read: the laws still take their exponents from
+    #: ``water.py``'s module constants. These fields exist to make the identity
+    #: honest about a value that decides bytes. If the two ever disagree the
+    #: bake is lying about what it produced, which
+    #: ``test_channel_exponents_match_the_mirror`` refuses.
+    channel_width_exp_q8: int = 102
+    channel_depth_exp_q8: int = 90
+
     #: The extent rules ``water_extent_mode`` may name, in the order they
     #: shipped. A ClassVar so it is not itself a constant, and a tuple so a
     #: typo in a config is a refusal at construction rather than a bake that
@@ -1447,6 +1491,11 @@ class BakeConstants:
         # nothing else. No elevation byte moves, which is what
         # verify_water_only_change.py exists to prove.
         "water_slope_in_depth",
+        "water_slope_in_extent",
+        # PRODUCT: they decide the water plane's stored widths and depths and
+        # nothing about the ground.
+        "channel_width_exp_q8",
+        "channel_depth_exp_q8",
     )
 
     def product_payload(self) -> dict:
@@ -4808,6 +4857,11 @@ def bake_tile(
             w_pad, width_stats = _water.fill_to_local_surface(
                 w_pad, out["z"], rec_w, cell_m=geom.fine_pixel_m,
                 exclude=basin_keep_pad,
+                # The slope field comes from the SAME receiver forest the fill
+                # walks, so the extent and the flow direction cannot disagree
+                # about which way the ground falls.
+                slope=(_water.slope_to_receiver(z_route, rec_w, geom.fine_pixel_m)
+                       if consts.water_slope_in_extent else None),
             )
         elif consts.water_extent_mode == "law":
             w_pad, width_stats = _water.widen_to_channel_width(
