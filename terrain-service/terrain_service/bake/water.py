@@ -127,6 +127,9 @@ __all__ = [
     "water_head_mask",
     "overshoot_stats",
     "lateral_extent_stats",
+    "local_water_levels",
+    "LEVEL_BAND_MM",
+    "LEVEL_BAND_DILATE_PX",
 ]
 
 
@@ -768,7 +771,8 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
                              max_iter: int = 8, q_m3_yr=None,
                              cell_m: float = 1.875,
                              budget_smooth_iter: int = 4,
-                             level_smooth_iters: int = 12):
+                             level_smooth_iters: int = 12,
+                             dried_out=None):
     """Let water spread sideways onto ground that lies BELOW it. ``(w, stats)``.
 
     THE DEFECT, measured on tile (-4,-4) at bake_ver 17 against the bake's own
@@ -816,6 +820,29 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     It cannot lower a cell, cannot touch a drawn cell, and cannot raise any
     existing surface -- so ``graded_water_surface``'s downstream descent and
     the basin table's ownership both survive unchanged.
+
+    ``dried_out``, if given, is a bool array of the domain's shape into which
+    this function ORs the cells THE DISCHARGE BUDGET REFUSED -- cells it had
+    spread water onto and that conservation then took back. It is written for
+    ``local_water_levels``, whose one hard requirement is that it must never
+    hand a level to such a cell: the band would let the client put back at 10 cm
+    exactly the water the budget removed at 1.875 m.
+
+    THE BUDGET'S REFUSALS AND NOTHING ELSE, and the distinction is the whole
+    point rather than an implementation detail. Later stages dry cells too --
+    ``equalize_lateral_levels`` alone costs 14.5% of the wet set -- but they do
+    it by LOWERING A LEVEL, and a band built on the final levels already agrees
+    with them: the cell gets the new, lower surface and stands above it, which
+    is the correct answer. The budget is different in kind. It says there is not
+    enough water in the river to wet this cell AT ALL, which is a statement
+    about volume that no amount of geometry can express, and it is the one
+    decision the client cannot be allowed to re-litigate at a finer pitch.
+    (Refusing every dried cell instead was tried, and it took the band to zero
+    on the pipeline's own bake fixture -- the entire collar there is cells some
+    later stage lowered past.)
+
+    Nothing else is computed differently when it is passed, and passing None
+    (the default) costs nothing at all.
     """
     w = np.array(water_m, dtype=np.float32, copy=True)
     z = np.ascontiguousarray(z_ground_m, np.float32)
@@ -849,12 +876,21 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
         sweeps += 1
         if added_round == drained_round:
             break
+    # The high-water mark of the spread, taken IMMEDIATELY BEFORE the budget and
+    # differenced IMMEDIATELY AFTER it, so what lands in `dried_out` is the
+    # budget's refusals alone and not the level smoothing's -- see the docstring
+    # for why only the budget's count.
+    spread_wet = (np.isfinite(w)
+                  if (dried_out is not None and q_m3_yr is not None) else None)
     if q_m3_yr is not None:
         w, bstats = apply_discharge_budget(w, water_m, z, own, q_m3_yr,
                                            cell_m=cell_m,
                                            min_depth_m=min_depth_m,
                                            smooth_iter=int(budget_smooth_iter))
         budget_stats = bstats
+        if spread_wet is not None:
+            np.logical_or(dried_out, spread_wet & ~np.isfinite(w),
+                          out=dried_out)
     else:
         budget_stats = {}
     if level_smooth_iters > 0:
@@ -873,6 +909,67 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     }
     stats.update(budget_stats)
     return w, stats
+
+
+def _fill_to_volume(group, base, volume, cell_area):
+    """The ONE level per group at which a given volume of water is conserved.
+
+    THE SOLVE THIS MODULE KEEPS NEEDING, in one place. Conserving a volume must
+    REDISTRIBUTE it, not delete the surplus -- the same water spread wide is
+    shallow -- and both callers learned that the expensive way:
+    ``apply_discharge_budget``'s first version refused cells past the budget and
+    could not produce a wide-and-shallow river on a flat floor, and
+    ``equalize_lateral_levels``' first version simply deleted the water it
+    lowered and shipped 17-31% less water per tile.
+
+    With a group's cells sorted by ``base`` ascending, taking the k lowest at
+    level L holds ``(k*L - S_k) * cell_area``, where ``S_k`` is the running sum
+    of their bases. Invert it::
+
+        L_k = (volume / cell_area + S_k) / k
+
+    and the answer is the largest k whose own base still lies under ``L_k`` --
+    add the next slot up and the water no longer reaches it. One lexsort and two
+    cumulative sums for the whole tile; no iteration and no tolerance.
+
+    ``group``   integer label per row. Rows sharing a label share a level.
+    ``base``    the bottom of each row's slot: ground for a dry cell, ground for
+                a wet one being re-solved from scratch.
+    ``volume``  per ROW, and constant within a group -- the group's volume. Per
+                row rather than per group because ``apply_discharge_budget``
+                already carries it that way (budget follows the owner's Q).
+    ``cell_area``  m^2 per row, or 1.0 to work in metre-cells.
+
+    Returns ``(level, n_groups)`` with ``level`` per row IN INPUT ORDER, every
+    row of a group carrying that group's level, and ``-inf`` for a group that
+    holds nothing at all.
+    """
+    group = np.asarray(group)
+    base = np.asarray(base, np.float64)
+    volume = np.asarray(volume, np.float64)
+    order = np.lexsort((base, group))
+    g_s, b_s, v_s = group[order], base[order], volume[order]
+    start = np.empty(g_s.size, bool)
+    start[0] = True
+    start[1:] = g_s[1:] != g_s[:-1]
+    heads = np.flatnonzero(start)
+    gid = np.cumsum(start) - 1                          # group index per row
+    pos = np.arange(g_s.size)
+    k = (pos - heads[gid] + 1).astype(np.float64)       # 1-based rank in group
+    csum = np.cumsum(b_s)
+    S_k = csum - (csum - b_s)[heads[gid]]               # running sum of bases
+    L_k = (v_s / cell_area + S_k) / k
+    ok = L_k >= b_s                                     # water still reaches it
+
+    # The level is L at the LARGEST k that still holds, and it applies to EVERY
+    # cell in the group -- so take a per-group max and broadcast it back, rather
+    # than a running max, which would give each cell a different answer
+    # depending on where it sits in the sort.
+    sel = np.maximum.reduceat(np.where(ok, pos, -1), heads)[gid]
+    lvl_sorted = np.where(sel >= 0, L_k[np.maximum(sel, 0)], -np.inf)
+    lvl = np.empty(g_s.size, np.float64)
+    lvl[order] = lvl_sorted
+    return lvl, int(heads.size)
 
 
 def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
@@ -932,16 +1029,10 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
     # beside them, because the correct answer to "this ground is under the
     # waterline" is for the WATERLINE TO FALL and the section to widen.
     #
-    # So per owner, solve for the level instead. With the owner's cells sorted
-    # by ground ascending, taking the k lowest at level L holds
-    # ``(k*L - S_k) * cell_area`` of water, where S_k is the running sum of
-    # their grounds. Invert it::
-    #
-    #     L_k = (budget / cell_area + S_k) / k
-    #
-    # and the answer is the largest k whose own ground still lies under L_k --
-    # add the next cell up and the water no longer reaches it. One lexsort and
-    # two cumulative sums for the whole tile; no iteration and no tolerance.
+    # So per owner, solve for the level instead -- ``_fill_to_volume``, which is
+    # the same solve ``equalize_lateral_levels`` re-places its lowered water
+    # with, factored out so the module has one answer to "what level holds this
+    # volume" rather than two that can drift apart.
     cell_area = float(cell_m) * float(cell_m)
     flat_w = w.ravel()
     flat_z = np.asarray(z, np.float32).ravel()
@@ -960,27 +1051,8 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
               * water_depth_m(qf[owner], q_perennial)
               * float(cell_m))
 
-    order = np.lexsort((ground, owner))
-    cells = idx[order]
-    o_s, g_s, b_s = owner[order], ground[order], budget[order]
-    start = np.empty(o_s.size, bool)
-    start[0] = True
-    start[1:] = o_s[1:] != o_s[:-1]
-    heads = np.flatnonzero(start)
-    gid = np.cumsum(start) - 1                          # group index per row
-    pos = np.arange(o_s.size)
-    k = (pos - heads[gid] + 1).astype(np.float64)       # 1-based rank in group
-    csum = np.cumsum(g_s)
-    S_k = csum - (csum - g_s)[heads[gid]]               # running sum of grounds
-    L_k = (b_s / cell_area + S_k) / k
-    ok = L_k >= g_s                                     # water still reaches it
-
-    # The section's level is L at the LARGEST k that still holds, and it applies
-    # to every cell in the section -- so take a per-group max and broadcast it
-    # back, rather than a running max, which would give each cell a different
-    # answer depending on where it sits in the sort.
-    sel = np.maximum.reduceat(np.where(ok, pos, -1), heads)[gid]
-    lvl = np.where(sel >= 0, L_k[np.maximum(sel, 0)], -np.inf)
+    lvl, n_sections = _fill_to_volume(owner, ground, budget, cell_area)
+    cells, o_s, g_s = idx, owner, ground
 
     # NEVER RAISE. graded_water_surface already decided the drawn surface and
     # guarantees it never rises going downstream; the budget may only take water
@@ -1033,7 +1105,7 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
 
     kept = int(np.isfinite(new_w).sum())
     stats.update({
-        "budget_sections": float(heads.size),
+        "budget_sections": float(n_sections),
         "budget_cells_in": float(cells.size),
         "budget_cells_kept": float(kept),
         "budget_dropped": float(cells.size - kept),
@@ -1405,11 +1477,40 @@ LATERAL_LEVEL_TOL_M = 0.1
 #: would keep working rather than doing nothing.
 LATERAL_LEVEL_MAX_ITER = 8
 
+#: How many RINGS -- through water as well as onto dry ground -- a pond may
+#: carry its displaced water looking for somewhere to put it.
+#:
+#: IT IS NOT WHAT STOPS THE SPREAD, and that distinction is the whole safety
+#: argument. ``fill_to_local_surface`` records a lateral rule that took 317,665
+#: wet cells to 66,546,420 -- a factor of 209 -- because a LEVEL was carried
+#: outward with nothing conserved, and its docstring's verdict is that "a fill
+#: that needs a radius to stop is a formula wearing a flood's clothes". The
+#: re-placement here is bounded by a VOLUME: a pond may only spend the water the
+#: levelling took off it, and every cell it wets is charged at the depth needed
+#: to bring that cell up to the water beside it.
+#:
+#: THAT IS DEMONSTRATED, NOT ASSERTED. Run the same rings with the budget
+#: removed and the measured crop goes 63,466 -> 82,119 wet at 8 rings and
+#: 171,532 at 32 -- the 209x flood, reproduced on demand. With the budget in
+#: place::
+#:
+#:     rings      4        8       16       32       64
+#:     wet    57,741   59,372   60,073   60,502   60,548
+#:     >1vox   1.548%   1.524%   1.509%   1.498%   1.497%
+#:
+#: 32 and 64 are the same answer to four figures, so the volume is what stops
+#: it. 16 is where the curve has flattened, and there the whole stage costs
+#: 2.2 s on a 2048^2 crop against the levelling's own 1.8 s.
+LATERAL_SPREAD_ROUNDS = 16
+
 
 def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
                             min_depth_m: float = WIDEN_MIN_DEPTH_M,
                             tol_m: float = LATERAL_LEVEL_TOL_M,
-                            max_iter: int = LATERAL_LEVEL_MAX_ITER):
+                            max_iter: int = LATERAL_LEVEL_MAX_ITER,
+                            conserve_volume: bool = True,
+                            spread_rounds: int = LATERAL_SPREAD_ROUNDS,
+                            dried=None, exclude=None, cell_m: float = 1.0):
     """Adjacent water that is not the same river reach must stand level. ``(w, stats)``.
 
     THE DEFECT, in the owner's words, watching the magenta markers in the
@@ -1515,42 +1616,93 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
     0.6% fewer wet cells. The reach bound is doing a little work, not none, and
     ``lateral_sweeps`` says so on every tile.
 
+    LEVELLING DOES NOT DESTROY WATER, IT SPREADS IT
+    -----------------------------------------------
+    THE DEFECT IN THE RULE ABOVE, measured end to end rather than offline: at
+    bake_ver 21 the tile carried 17-31% LESS water than at bake_ver 17 -- tile
+    (-4,-4) went 364,354 -> 249,900 wet cells, -31.4%. The surface was fixed and
+    the water was gone, and the owner's complaint has always been water FAILING
+    TO FILL low ground. A rule that only ever removes is working against the
+    thing it was written for.
+
+    IT IS THE SAME MISTAKE ``apply_discharge_budget`` ALREADY MADE. Its first
+    version refused cells past the budget and deleted the surplus, and it had to
+    be rewritten as a per-section level solve because "conserving a volume must
+    REDISTRIBUTE it, not delete it". Read its docstring; this is that lesson,
+    applied to the second rule in the module that took water away.
+
+    WHERE THE WATER GOES. When a perched cell is lowered to match its
+    neighbour, the volume that comes off does not vanish -- it runs into the
+    water beside it, and that water covers more ground. So the rule now runs in
+    two phases:
+
+      1. **The sweeps above**, unchanged, which decide the levelling and, for
+         every cell they lower, record WHICH neighbour it was lowered toward.
+         Following those links to a cell that was never lowered partitions the
+         lowered water into PONDS, and ponds whose cells touch are pooled into
+         one body of water with one budget.
+      2. **Spend that budget sideways.** The levelled plane is not re-solved --
+         every cell the sweeps touched keeps exactly the surface they gave it --
+         and the water they took is spent wetting DRY GROUND that lies below the
+         surface of the water next to it, deepest first, until it runs out. A
+         new cell joins at its neighbour's surface, so the water that arrives is
+         flush with the water it came from.
+
+    THE TWO ANSWERS THAT LOOK RIGHT AND ARE NOT, both measured on the 2048 crop
+    of tile (-4,-4) before this one was written, against the delete-only rule's
+    54,908 wet cells and 1.54% of adjacent pairs over one voxel::
+
+        re-solve each pond against its INPUT level     63,725 wet   20.21% >1vox
+        re-solve each pond against its LEVELLED bottom 50,562 wet    6.31% >1vox
+
+    The first conserves 99.3% of the volume by standing 14,599 of the 26,790
+    lowered cells back up -- it gives the water back by UNDOING THE RULE, and
+    20.21% is where the plane started. The second is worse than deleting on both
+    counts: flattening a pond onto its lowest cell throws away more water than
+    the levelling did and drops the level out from under the water beside it.
+    Both are recorded in the code where the ceiling is chosen, because "conserve
+    the volume" sounds like one instruction and is at least three.
+
+    WHAT IT COSTS AND BUYS, same crop, 8 sweeps, tol one voxel, 16 rings::
+
+                              wet    >100mm  >300mm  dry-below   volume
+        bv18 shipped       63,466    20.76%   5.05%      9,215   106,121 m3
+        delete-only        54,908     1.54%   0.51%      8,717    83,016 m3
+        THIS RULE          60,073     1.51%   0.52%     10,155    96,271 m3
+
+    The levelling is untouched -- 1.51% against the delete-only 1.54%, and the
+    over-300 mm steps are identical -- while 5,165 of the 8,558 cells the
+    levelling cost come back and the water on the tile goes from -21.8% to
+    -9.3%. It puts back 57% of what it took; the rest is water the ground beside
+    it had no room for under a surface nothing is allowed to raise.
+
+    THE ONE THING THAT GOT WORSE, and it is not smoothed over: dry cells lying
+    0.1-5 m below adjacent water go 8,717 -> 10,155, past even the 9,215 the
+    plane started with. Spreading water makes more shoreline, and a shoreline is
+    where dry ground meets water above it. Split by depth the shallow band
+    (0.1-0.3 m) IMPROVES, 3,663 -> 3,169; the whole increase is the 0.3-5 m band,
+    5,054 -> 6,986, which is the new frontier the extra 5,165 wet cells exposed
+    and could not afford to cross.
+
     "dry-below" counts cells standing dry with adjacent water at least one voxel
-    above their own ground -- the owner's second symptom -- and it improves
-    9.3% even though this rule can only ever REMOVE water: a level that stops
-    being perched stops being above the ground next to it. The -14.5% wet is the
-    real cost and it is the same asymmetry
-    ``docs/measurements/water-settling-bv18-2026-08-08.txt`` records for the
-    level relaxation: a cell may be lowered to a neighbour's level but a cell
-    that stops clearing ``min_depth_m`` is gone for good.
+    above their own ground -- the owner's second symptom -- and even the
+    delete-only version improved it 9.3%, because a level that stops being
+    perched stops being above the ground next to it. Conserving the volume
+    attacks it from the other side as well, by putting the water INTO that
+    ground.
 
-    IT CAN NEVER RAISE, so the ceiling ``graded_water_surface`` sanctioned holds
-    by construction rather than by a clamp -- every write is a strict decrease
-    and the function asserts it before returning. That guarantee is not
-    decorative: a missing ceiling on settled cells is what let the relaxation
-    walk water up banks at bake_ver 18, which is the regression this rule exists
-    to finish cleaning up rather than repeat.
-
-    AND IT CANNOT FLOOD. It never wets a dry cell -- the wet set can only
-    shrink, and ``lateral_wet_before``/``lateral_wet_after`` say so on every
-    tile -- so the 209x flood ``fill_to_local_surface`` documents has no way in.
-
-    WHAT IT DELIBERATELY DOES NOT DO
-    --------------------------------
-    * **It does not fill the open air.** The owner's second symptom -- low
-      ground beside the river that should be under water -- is an EXTENT
-      question and ``settle_to_adjacent_level`` owns it. Re-spreading here would
-      undo the discharge budget that ran between them, which is the only bound
-      in this module that is conserved rather than chosen.
+    WHAT IT STILL DELIBERATELY DOES NOT DO
+    --------------------------------------
+    * **It does not re-spread water it did not itself take.** Only ponds
+      containing a cell this rule lowered are solved at all; everywhere else the
+      plane is returned untouched, so the extent the discharge budget chose
+      stands except where this rule disturbed it.
     * **It does not touch the drawn channel's long profile.** Along-channel
       pairs are exempt and the tolerance is wider than the median along-flow
       step, so a reach that legitimately descends keeps descending.
     * **It does not equalise across dry ground.** Two pools with a bar between
-      them stay at their own levels, because the rule only compares wet
+      them stay at their own levels, because the levelling only compares wet
       neighbours.
-    * **It does not raise, ever**, so it cannot answer "there should be more
-      water here". That is the settling stage's job and this one's silence
-      about it is deliberate.
 
     ``water_m``   metres absolute, NaN dry. Copied; the input is not modified.
     ``z_ground_m``  the SHIPPED surface, the same array every other extent stage
@@ -1562,6 +1714,20 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
     exemption a statement about conveyed discharge rather than about the D8
     forest, and it must be the centreline rather than the final wet mask -- with
     the final mask every settled cell would claim a river's right to a gradient.
+    ``conserve_volume``  run phase 2. With it OFF this is the bake_ver 21 rule,
+    exactly, including the 17-31% of the tile's water it deletes; that branch is
+    kept so a bake can be reproduced and so the trade can be measured, not
+    because it is a defensible setting.
+    ``dried``  bool, the cells the discharge budget and the level smoothing
+    stranded on purpose -- ``settle_to_adjacent_level``'s ``dried_out``. Never
+    re-wetted. None means "nothing was stranded", which is true for a caller
+    that did not run the budget and a LIE for one that did, so the pipeline
+    always passes it.
+    ``exclude``  the registered-basin mask, for the reason
+    ``fill_to_local_surface`` takes one: a basin ships its own surface in
+    ``SECTION_BASIN_TABLE`` and must not be given a second, disagreeing level.
+    ``cell_m``  metres per cell, for the ``lateral_volume_*`` counters only --
+    every cell has the same area, so it cancels out of the solve itself.
     """
     w = np.array(water_m, dtype=np.float32, copy=True)
     z = np.ascontiguousarray(z_ground_m, np.float32)
@@ -1574,6 +1740,7 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
 
     tol = np.float32(tol_m)
     floor = np.float32(min_depth_m)
+    w_in = np.asarray(water_m, np.float32)
     wet_before = int(np.isfinite(w).sum())
 
     # THE RECEIVER LINK AS A DIRECTION, not an index, and as one uint8 plane.
@@ -1587,12 +1754,28 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
 
     before = _lateral_step_count(w, float(tol_m))
     lowered = np.zeros(w.shape, bool)
-    drop = np.zeros(w.shape, np.float64)
-    dried = 0
+    dried_cells = 0
+    drawn_held = 0
     sweeps = 0
+    wd = w.shape[1]
+    # The flat offset of each of `_LATERAL_NB`, for turning "the neighbour that
+    # won" into "the cell it belongs to" without materialising a shifted index
+    # grid. `_shift2(a, dy, dx)[y, x]` is `a[y + dy, x + dx]`, and it fills the
+    # edge, so a finite candidate is always a real in-bounds neighbour.
+    off_flat = np.array([dy * wd + dx for dy, dx in _LATERAL_NB], np.int64)
+    # WHICH POND EACH CELL'S LEVEL CAME FROM. `root[c]` starts as `c` and is
+    # replaced by the root of whichever neighbour lowered it, so after the
+    # sweeps every lowered cell points at a cell that was NEVER lowered -- a
+    # local minimum of the water surface -- and the cells sharing a root are the
+    # pond phase 2 conserves. It is int32 rather than int64 for the reason
+    # `_receiver_dir_code` exists: 340 MB against 680 MB at the padded
+    # production size, and it is only allocated when phase 2 will run.
+    root = np.arange(w.size, dtype=np.int32) if conserve_volume else None
+    lvl = best = bestk = None
     for sweeps in range(1, int(max_iter) + 1):
         lvl = np.where(np.isfinite(w), w, np.float32(np.inf)).astype(np.float32)
         best = np.full(w.shape, np.float32(np.inf), np.float32)
+        bestk = np.full(w.shape, np.uint8(8)) if conserve_volume else None
         for k, (dy, dx) in enumerate(_LATERAL_NB):
             # ALONG-CHANNEL, and therefore entitled to a gradient: both cells
             # carry drawn discharge and one flows straight into the other.
@@ -1605,33 +1788,74 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
                    | (_shift2(code, dy, dx, np.uint8(8)) == np.uint8(_LATERAL_OPP[k])))
             )
             cand = _shift2(lvl, dy, dx, np.float32(np.inf)) + tol
-            best = np.minimum(best, np.where(exempt, np.float32(np.inf), cand))
+            cand = np.where(exempt, np.float32(np.inf), cand)
+            if conserve_volume:
+                better = cand < best
+                bestk[better] = np.uint8(k)
+                best = np.where(better, cand, best)
+            else:
+                best = np.minimum(best, cand)
         hit = np.isfinite(w) & np.isfinite(best) & (best < w - 1e-6)
         if not hit.any():
             break
-        drop[hit] += (w[hit] - best[hit]).astype(np.float64)
         w[hit] = best[hit]
         lowered |= hit
-        # A cell that no longer clears its own bed by one voxel is gone. That is
-        # the honest consequence and not a side effect: the water that was
-        # standing there was only standing there because it was perched.
-        gone = hit & ((w - z) < floor)
+        if conserve_volume:
+            hidx = np.flatnonzero(hit.ravel())
+            root[hidx] = root[hidx + off_flat[bestk.ravel()[hidx]]]
+        thin = hit & ((w - z) < floor)
+        # A DRAWN CELL IS NEVER DRIED. It is the channel the whole water plane
+        # exists to draw, and `apply_discharge_budget` already refuses the same
+        # thing for the same reason. Held at its bed plus one voxel, never above
+        # the surface it came in with, so the ceiling still holds.
+        held = thin & dr
+        if held.any():
+            w[held] = np.minimum(w_in[held], z[held] + floor)
+            drawn_held += int(held.sum())
+        # A cell that no longer clears its own bed by one voxel is gone from the
+        # levelled plane. Phase 2 can put it back: it is still a member of its
+        # pond and still owns the volume it came in with.
+        gone = thin & ~dr
         if gone.any():
-            dried += int(gone.sum())
+            dried_cells += int(gone.sum())
             w[gone] = np.float32(np.nan)
 
-    # THE GUARANTEE, CHECKED RATHER THAN CLAIMED. Every write above is a strict
-    # decrease, so no cell may end above the surface it came in with -- which is
-    # what keeps `graded_water_surface`'s ceiling and what a ceiling bug already
-    # broke once on this branch.
-    w_in = np.asarray(water_m, np.float32)
+    del code, lvl, best, bestk
+
+    # -- PHASE 2. The water the sweeps took off the high cells, put back.
+    #
+    # EVERY COUNTER EXISTS IN EVERY BRANCH. An absent stat reads as zero in the
+    # per-tile log and this module has three times now drawn a false conclusion
+    # from one, so "the sweeps lowered nothing so there was nothing to re-place"
+    # writes the same keys as a full run rather than leaving the log to guess.
+    vol_stats = dict(_LATERAL_CONSERVE_ZEROS)
+    if conserve_volume and lowered.any():
+        w, vol_stats = _replace_levelled_volume(
+            w, w_in, z, lowered, root,
+            min_depth_m=float(min_depth_m), cell_m=float(cell_m),
+            spread_rounds=int(spread_rounds), tol_m=float(tol_m),
+            dried=dried, exclude=exclude)
+    del root
+
+    # THE GUARANTEE, CHECKED RATHER THAN CLAIMED. Phase 1 only ever writes a
+    # strict decrease and phase 2 caps every cell that came in wet at its own
+    # input level, so no cell may end above the surface it came in with -- which
+    # is what keeps `graded_water_surface`'s ceiling and what a ceiling bug
+    # already broke once on this branch.
     both = np.isfinite(w) & np.isfinite(w_in)
     if both.any() and bool((w[both] > w_in[both] + 1e-6).any()):
         raise AssertionError(
-            "equalize_lateral_levels raised a water level; it may only lower")
+            "equalize_lateral_levels raised a water level above its ceiling")
+    del both
 
-    d = drop[lowered]
-    return w, {
+    # THE DROP, MEASURED AGAINST THE INPUT rather than accumulated over the
+    # sweeps, because phase 2 gives some of it back and a counter that reported
+    # the sweeps' drop would describe a plane that was never returned.
+    moved = np.isfinite(w) & np.isfinite(w_in)
+    d = (w_in[moved] - w[moved]).astype(np.float64)
+    d = d[d > 1e-6]
+    wet_after = int(np.isfinite(w).sum())
+    stats = {
         # 1.0 says THIS STAGE RAN. Absent-stat zeros have twice been read as
         # "nothing to fix" when the truth was "never executed" -- see the
         # locals() guard note at the monotone stage in pipeline.py -- so the
@@ -1643,13 +1867,429 @@ def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
         "lateral_steps_over_tol_before": float(before),
         "lateral_steps_over_tol_after": float(_lateral_step_count(w, float(tol_m))),
         "lateral_lowered_cells": float(int(lowered.sum())),
-        "lateral_dried_cells": float(dried),
+        "lateral_dried_cells": float(dried_cells),
+        "lateral_drawn_held_wet": float(drawn_held),
         "lateral_wet_before": float(wet_before),
-        "lateral_wet_after": float(int(np.isfinite(w).sum())),
+        "lateral_wet_after": float(wet_after),
+        "lateral_wet_delta": float(wet_after - wet_before),
         "lateral_drop_p50_m": float(np.percentile(d, 50)) if d.size else 0.0,
         "lateral_drop_p90_m": float(np.percentile(d, 90)) if d.size else 0.0,
         "lateral_drop_max_m": float(d.max()) if d.size else 0.0,
+        # 1.0 says PHASE 2 RAN, written in both branches for the same reason the
+        # stage flag above is: a counter that is absent reads as zero, and
+        # "conserved nothing" and "never executed" must not look alike.
+        "lateral_conserve_ran": 1.0 if conserve_volume else 0.0,
     }
+    stats.update(vol_stats)
+    return w, stats
+
+
+#: Every counter ``_replace_levelled_volume`` reports, at zero. Written whenever
+#: the re-placement has nothing to do, so that "nothing to re-place" and "never
+#: executed" cannot read alike in the per-tile log -- the specific class of false
+#: conclusion this module has already drawn three times in one session.
+_LATERAL_CONSERVE_ZEROS = {
+    "lateral_conserve_ponds": 0.0,
+    "lateral_conserve_members": 0.0,
+    "lateral_conserve_rings": 0.0,
+    "lateral_conserve_admitted": 0.0,
+    "lateral_conserve_conduits": 0.0,
+    "lateral_conserve_wetted": 0.0,
+    "lateral_volume_in_m3": 0.0,
+    "lateral_volume_taken_m3": 0.0,
+    "lateral_volume_placed_m3": 0.0,
+    "lateral_volume_unplaced_m3": 0.0,
+    "lateral_volume_replaced_frac": 1.0,
+}
+
+
+def _replace_levelled_volume(w, w_in, z, lowered, root, *,
+                             min_depth_m, cell_m, spread_rounds, tol_m,
+                             dried=None, exclude=None):
+    """Put the water the levelling took off the high cells back on the map.
+
+    ``(w, stats)``. See ``equalize_lateral_levels`` for the argument; this is
+    the mechanism. The levelled plane is NOT re-solved -- every cell the sweeps
+    touched keeps exactly the surface they gave it -- and the water they took
+    off is spent, pond by pond, wetting dry ground that lies below the surface
+    of the water beside it.
+
+    ``w`` is modified in place and returned.
+    """
+    shape = w.shape
+    n = w.size
+    fw, fz, fwin = w.ravel(), z.ravel(), w_in.ravel()
+    wet_in = np.isfinite(fwin)
+    low = lowered.ravel()
+    floor = float(min_depth_m)
+    tol = float(tol_m)
+    cell_area = float(cell_m) * float(cell_m)
+
+    # -- THE PONDS. `root` was written one link at a time, so a cell lowered in
+    # sweep 1 can point at a cell whose own root moved in sweep 3. Pointer
+    # jumping resolves the chain; the sweeps bound it to `max_iter` links, so a
+    # handful of doublings is exact. It cannot loop forever because it is a
+    # fixed count, and a label that fails to resolve only splits a pond in two,
+    # which loses a little pooling rather than any water.
+    lid = np.flatnonzero(low)
+    for _ in range(4):
+        root[lid] = root[root[lid]]
+
+    # A cell that was never lowered still has `root[c] == c`, so the only
+    # members that are not lowered cells are the pond bottoms themselves.
+    act = np.zeros(n, bool)
+    act[root[lid]] = True
+    member = (low | act) & wet_in
+    midx = np.flatnonzero(member)
+    if midx.size == 0:
+        return w, dict(_LATERAL_CONSERVE_ZEROS)
+    mgrp = root[midx]
+    uniq = np.unique(mgrp)
+    n_g = uniq.size
+    ginv_m = np.searchsorted(uniq, mgrp).astype(np.int32)
+
+    # -- ONE BUDGET PER BODY OF WATER. The sweeps partition the lowered cells
+    # into one pond per local minimum, and on the measured tile that is 5,355
+    # ponds over 31,957 cells -- six cells each. Six cells is a puddle, not a
+    # body of water: a puddle that took water off a bank has nowhere within its
+    # own six cells to put it, while the puddle next to it has a dry hole and no
+    # water to fill it. Held apart, the rule could place 27% of what it took.
+    #
+    # Ponds whose cells TOUCH are the same water, so their surpluses are pooled.
+    # It does not merge across dry ground and it does not change a single level;
+    # it only decides whose water pays for which hole.
+    ginv_m, n_g = _merge_touching(midx, ginv_m, n_g, w.shape)
+
+    # THE VOLUME EACH POND CAME IN WITH, in metre-cells; the area cancels out of
+    # the solve and is only put back for the reported m^3.
+    mdepth = np.maximum(fwin[midx].astype(np.float64) - fz[midx], 0.0)
+    vol_in = np.bincount(ginv_m, weights=mdepth, minlength=n_g)
+    # ...and what it is holding after the levelling, so the difference is
+    # exactly the water this rule has to find somewhere else to put.
+    lev_m = fw[midx].astype(np.float64)
+    lev_depth = np.where(np.isfinite(lev_m),
+                         np.maximum(lev_m - fz[midx], 0.0), 0.0)
+    vol_lev = np.bincount(ginv_m, weights=lev_depth, minlength=n_g)
+    # WHAT THE LEVELLED PLANE IS NOT ALLOWED TO BECOME, learned by measuring
+    # the two obvious answers and rejecting both. On the 2048 crop of tile
+    # (-4,-4), against a delete-only rule at 54,908 wet cells and 1.54% of
+    # adjacent pairs over one voxel:
+    #
+    #   * SOLVE THE POND AGAINST ITS INPUT LEVEL. Conserves 99.3% of the volume
+    #     and gives back 63,725 wet cells -- and leaves 20.21% of pairs over one
+    #     voxel, which is the 20.76% it started at. The water comes back by
+    #     UN-LOWERING the perched cells, i.e. by undoing the rule. 14,599 of the
+    #     26,790 lowered cells stood back up.
+    #   * SOLVE THE POND AGAINST ITS LEVELLED BOTTOM. 50,562 wet and 6.31% over
+    #     one voxel -- WORSE THAN DELETING ON BOTH COUNTS. Flattening every
+    #     member down to the pond's lowest cell throws away more water than the
+    #     levelling did, and the level then falls out from under the water
+    #     beside the pond, which is where the new steps come from.
+    #
+    # So the levelled plane is not re-solved at all. Every cell the sweeps
+    # touched keeps exactly the surface they gave it, and the displaced water is
+    # placed SIDEWAYS, into dry ground that lies below the surface of the water
+    # next to it -- the owner's second symptom, paid for with the water his
+    # first symptom cost.
+
+    # -- THE CANDIDATE SET, reusing `root` in place as the pond label so the
+    # domain-sized int32 is paid for once. -1 is "not a candidate".
+    root.fill(-1)
+    root[midx] = ginv_m
+    cgrp = root
+
+    # WHAT MAY BE WETTED. Not a cell the discharge budget stranded -- putting
+    # water back there would double-count the only bound in this module that is
+    # conserved rather than chosen -- and not a registered basin, which ships
+    # its own surface on the wire.
+    elig = ~wet_in
+    if dried is not None:
+        elig &= ~np.ascontiguousarray(dried, bool).ravel()
+    if exclude is not None:
+        elig &= ~np.ascontiguousarray(exclude, bool).ravel()
+
+    # -- THE SURPLUS: what the levelling actually took off this pond.
+    budget = np.maximum(vol_in - vol_lev, 0.0)
+    surplus = budget.copy()
+
+    # -- SPREAD IT, RING BY RING, and the level a new cell joins at is the
+    # LEVELLED surface of the neighbour that reached it -- so the water that
+    # arrives is flush with the water it came from and the levelling the sweeps
+    # just did is not re-broken by the re-placement.
+    #
+    # WETNESS ONLY EVER GROWS HERE, which is what keeps every wet cell joined to
+    # the pond: a cell is admitted by a neighbour that is under water AT THE
+    # MOMENT IT ADMITS IT and nothing ever takes that water back, so there is no
+    # way to end up with water behind a sill that later drained.
+    ok_m = np.isfinite(lev_m)
+    src_i, src_l, src_g = midx[ok_m], lev_m[ok_m], ginv_m[ok_m]
+    got_i, got_l = [], []
+    admitted = 0
+    rings = 0
+    wetm = np.isfinite(fw)
+    conduits = 0
+    for rings in range(1, max(1, int(spread_rounds)) + 1):
+        n_i, n_g_, n_l = _lateral_admit_ring(cgrp, elig, fz, fw, wetm, src_i,
+                                             src_l, src_g, shape, floor, tol)
+        if n_i.size == 0:
+            break
+        # Water already on the map costs the pond nothing and only carries its
+        # own level onward; dry ground has to be paid for.
+        via = wetm[n_i]
+        conduits += int(via.sum())
+        d_i, d_g, d_l = n_i[~via], n_g_[~via], n_l[~via]
+        admitted += int(d_i.size)
+        keep, spent = _lateral_wet_prefix(d_g, fz[d_i].astype(np.float64),
+                                          d_l, budget, n_g)
+        budget -= spent
+        got_i.append(d_i[keep])
+        got_l.append(d_l[keep])
+        # WRITTEN NOW, not at the end: the next ring measures whether the water
+        # around a cell agrees, and it has to see the water this ring placed.
+        fw[d_i[keep]] = d_l[keep].astype(np.float32)
+        wetm[d_i[keep]] = True
+        # ONLY PONDS WITH WATER LEFT KEEP LOOKING. A pond that has placed
+        # everything it took stops spreading, so the reach is bounded by the
+        # volume as well as by the ring count.
+        src_i = np.concatenate((n_i[via], d_i[keep]))
+        src_l = np.concatenate((n_l[via], d_l[keep]))
+        src_g = np.concatenate((n_g_[via], d_g[keep]))
+        alive = budget[src_g] > 1e-9
+        src_i, src_l, src_g = src_i[alive], src_l[alive], src_g[alive]
+        if src_i.size == 0:
+            break
+
+    wetted = int(sum(a.size for a in got_i))
+
+    came_in = float(vol_in.sum())
+    took = float(surplus.sum())
+    placed = took - float(budget.sum())
+    return w, {
+        "lateral_conserve_ponds": float(n_g),
+        "lateral_conserve_members": float(midx.size),
+        "lateral_conserve_rings": float(rings),
+        "lateral_conserve_admitted": float(admitted),
+        "lateral_conserve_conduits": float(conduits),
+        "lateral_conserve_wetted": float(wetted),
+        # HOW MUCH OF WHAT THE LEVELLING TOOK WAS PUT BACK ON THE MAP, which is
+        # the number the whole of phase 2 exists for. `unplaced` is water the
+        # terrain beside the pond had no room for under the levelled surface --
+        # the honest residue, and the one thing this rule still destroys.
+        "lateral_volume_in_m3": came_in * cell_area,
+        "lateral_volume_taken_m3": took * cell_area,
+        "lateral_volume_placed_m3": placed * cell_area,
+        "lateral_volume_unplaced_m3": (took - placed) * cell_area,
+        "lateral_volume_replaced_frac": (placed / took) if took > 0 else 1.0,
+    }
+
+
+def _merge_touching(midx, gid, n_g, shape):
+    """Relabel so that pond labels which touch become one. ``(gid, n_g)``.
+
+    Connected components on the LABEL graph, not on the domain: the graph has
+    one node per pond and an edge wherever two ponds have adjacent cells, which
+    on the measured tile is a few tens of thousands of edges against tens of
+    millions of cells. Hook-and-jump (each round points every label at the
+    smallest label it touches, then compresses the chains) settles it in a
+    handful of rounds instead of the O(diameter) a label diffusion over the grid
+    would need on something as long and thin as a river.
+    """
+    wd = int(shape[1])
+    x = (midx % wd).astype(np.int64)
+    ea, eb = [], []
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        keep = np.ones(midx.size, bool)
+        if dx > 0:
+            keep &= x < wd - 1
+        elif dx < 0:
+            keep &= x > 0
+        src = midx[keep]
+        nb = src + (dy * wd + dx)
+        m = (nb >= 0) & (nb < shape[0] * shape[1])
+        if not m.any():
+            continue
+        # `midx` is sorted, so searchsorted is the cell -> pond lookup; a
+        # domain-sized map is exactly the array this stage is trying not to
+        # allocate a second time.
+        pos = np.searchsorted(midx, nb[m])
+        pos = np.minimum(pos, midx.size - 1)
+        hit = midx[pos] == nb[m]
+        if not hit.any():
+            continue
+        a = gid[keep][m][hit]
+        b = gid[pos[hit]]
+        d = a != b
+        if d.any():
+            ea.append(a[d])
+            eb.append(b[d])
+    if not ea:
+        return gid, n_g
+    a = np.concatenate(ea)
+    b = np.concatenate(eb)
+    lab = np.arange(n_g, dtype=np.int64)
+    for _ in range(64):
+        lo = np.minimum(lab[a], lab[b])
+        hi = np.maximum(lab[a], lab[b])
+        nxt = lab.copy()
+        np.minimum.at(nxt, hi, lo)
+        for _ in range(32):
+            jump = nxt[nxt]
+            if np.array_equal(jump, nxt):
+                break
+            nxt = jump
+        if np.array_equal(nxt, lab):
+            break
+        lab = nxt
+    uniq = np.unique(lab)
+    return np.searchsorted(uniq, lab[gid]).astype(np.int32), int(uniq.size)
+
+
+def _lateral_admit_ring(cgrp, elig, fz, fw, wetm, src, lev, grp, shape,
+                        floor, tol):
+    """One ring of dry ground reached by the ponds. ``(idx, group, level)``.
+
+    COMPACT, not domain-sized, and that is deliberate: the obvious version is
+    four more arrays the size of the padded tile per ring, and this stage
+    already counts its temporaries in hundreds of megabytes. Everything here is
+    proportional to the wet fringe of the ponds.
+
+    ``src``/``lev``/``grp`` are the cells that are CURRENTLY UNDER WATER, the
+    surface each stands at, and which pond it belongs to. A dry cell is reached
+    when a neighbour's surface stands at least ``floor`` above its ground, and
+    it joins at THAT neighbour's surface -- which is
+    ``settle_to_adjacent_level``'s rule ("joins at its highest adjacent water
+    surface"), so the water that arrives is flush with the water it came from.
+
+    WATER ALREADY ON THE MAP IS A CONDUIT, and that is what makes the
+    re-placement work at all. A perched film on a bank does not physically drain
+    into the four cells beside it; it drains into the RIVER, and the low ground
+    the river should have filled may be a dozen cells further along. Restricted
+    to the pond's own fringe the rule could only place 25% of the water it took.
+    So an untouched wet cell adjacent to a pond is picked up as a source at ITS
+    OWN surface: it hands the pond's water onward without changing its own level
+    by a millimetre and without costing the pond anything, because it is already
+    wet.
+
+    Nothing is ever reached across DRY ground, because every source is wet. That
+    is what keeps a hole behind a sill unreachable until the sill itself is
+    under water.
+    """
+    empty = (np.empty(0, np.int64), np.empty(0, np.int32), np.empty(0, np.float64))
+    if src.size == 0:
+        return empty
+    wd = int(shape[1])
+    x = (src % wd).astype(np.int64)
+    nb_all, lv_all, gr_all = [], [], []
+    for dy, dx in _LATERAL_NB:
+        keep = np.ones(src.size, bool)
+        if dx > 0:
+            keep &= x < wd - 1
+        elif dx < 0:
+            keep &= x > 0
+        nb = src[keep] + (dy * wd + dx)
+        m = (nb >= 0) & (nb < cgrp.size)
+        nb, lv, gr = nb[m], lev[keep][m], grp[keep][m]
+        m2 = (cgrp[nb] < 0) & (
+            wetm[nb] | (elig[nb] & ((lv - fz[nb]) >= floor)))
+        if m2.any():
+            nb_all.append(nb[m2])
+            lv_all.append(lv[m2])
+            gr_all.append(gr[m2])
+    if not nb_all:
+        return empty
+    nb = np.concatenate(nb_all)
+    lv = np.concatenate(lv_all)
+    gr = np.concatenate(gr_all)
+    # A cell reached from two ponds joins the one whose water stands HIGHEST --
+    # the one that would spill into it first. Sorting by (cell, level) puts that
+    # offer last in each run of a cell, and the run also collapses the duplicate
+    # entries the eight directions produce.
+    order = np.lexsort((lv, nb))
+    nb, lv, gr = nb[order], lv[order], gr[order]
+    last = np.empty(nb.size, bool)
+    last[-1] = True
+    last[:-1] = nb[1:] != nb[:-1]
+    nb, lv, gr = nb[last], lv[last], gr[last]
+    # A conduit passes on ITS OWN surface, not the one that reached it. That is
+    # the difference between handing water along a river and pouring a bank's
+    # level into it.
+    lv = np.where(wetm[nb], fw[nb].astype(np.float64), lv)
+
+    # A NEW CELL MAY ONLY JOIN WATER THAT ALREADY AGREES WITH ITSELF, and this
+    # is what stops the re-placement undoing the levelling it is paying for. A
+    # dry cell wedged between two wet regions a metre apart in level has no one
+    # surface to join: whichever it takes, it steps against the other. So the
+    # water around it is measured, and it is admitted only if that water is
+    # already within one tolerance of itself -- then it joins at the highest of
+    # them and is within tolerance of every one of its wet neighbours by
+    # construction. Without this the rule recovered the water and took adjacent
+    # pairs over one voxel from 1.54% back to 4.03%.
+    dry = ~wetm[nb]
+    if dry.any():
+        d_nb = nb[dry]
+        hi = np.full(d_nb.size, -np.inf)
+        lo = np.full(d_nb.size, np.inf)
+        xn = (d_nb % wd).astype(np.int64)
+        for dy, dx in _LATERAL_NB:
+            k2 = np.ones(d_nb.size, bool)
+            if dx > 0:
+                k2 &= xn < wd - 1
+            elif dx < 0:
+                k2 &= xn > 0
+            j = d_nb + (dy * wd + dx)
+            k2 &= (j >= 0) & (j < cgrp.size)
+            v = fw[np.where(k2, j, 0)].astype(np.float64)
+            v = np.where(k2 & np.isfinite(v), v, np.nan)
+            good = np.isfinite(v)
+            hi = np.where(good, np.maximum(hi, v), hi)
+            lo = np.where(good, np.minimum(lo, v), lo)
+        agree = (hi - lo) <= tol + 1e-6
+        lv_d = np.where(agree, hi, -np.inf)
+        lv[dry] = lv_d
+        ok_d = agree & ((lv_d - fz[d_nb]) >= floor)
+        drop = np.zeros(nb.size, bool)
+        drop[np.flatnonzero(dry)[~ok_d]] = True
+        if drop.any():
+            nb, lv, gr = nb[~drop], lv[~drop], gr[~drop]
+            if nb.size == 0:
+                return empty
+    # Claimed, so the next ring cannot offer them a second, disagreeing level.
+    cgrp[nb] = gr
+    return nb, gr, lv
+
+
+def _lateral_wet_prefix(grp, base, lev, budget, n_g):
+    """Which reached cells the pond can actually afford. ``(wet, spent)``.
+
+    THE SAME SORTED-CUMULATIVE SOLVE AS ``_fill_to_volume``, with the two
+    unknowns swapped. There the level is unknown and every cell under it is
+    wet; here the LEVEL IS ALREADY FIXED -- a reached cell joins at the surface
+    of the water beside it or it is not flush with it -- so what the volume has
+    to decide is HOW MANY cells, not how deep.
+
+    DEEPEST FIRST, by ground ascending, because that is where water goes and
+    because the alternative reads as a bug: filling the cheap rim and leaving
+    the hole in the middle of it dry is not a shoreline anyone would draw.
+    Cost is monotone along that order, so the affordable set is a PREFIX and
+    one segmented cumulative sum answers it for every pond at once.
+    """
+    if grp.size == 0:
+        return np.zeros(0, bool), np.zeros(n_g)
+    order = np.lexsort((base, grp))
+    g_s = grp[order]
+    cost = np.maximum(lev[order] - base[order], 0.0)
+    start = np.empty(g_s.size, bool)
+    start[0] = True
+    start[1:] = g_s[1:] != g_s[:-1]
+    heads = np.flatnonzero(start)
+    gid = np.cumsum(start) - 1
+    csum = np.cumsum(cost)
+    run = csum - (csum - cost)[heads[gid]]      # cost of this cell and all
+    fits = run <= budget[g_s] + 1e-12           # deeper ones in the same pond
+    wet = np.zeros(g_s.size, bool)
+    wet[order] = fits
+    spent = np.bincount(g_s[fits], weights=cost[fits], minlength=n_g)
+    return wet, spent
 
 
 #: The 8-neighbourhood, in a FIXED order, because ``_receiver_dir_code`` stores
@@ -2489,3 +3129,189 @@ def lateral_extent_stats(water_m, z_ground_m, q_m3_yr, wet, receivers, *,
     if control is not None:
         stats.update(_summarise(control, "control_", False))
     return stats
+
+
+# --------------------------------------------------------------------- level band
+
+#: How far ABOVE its local water level a dry pixel's ground may stand and still
+#: be worth a level, in millimetres.
+#:
+#: DERIVED, NOT TUNED. ``voxel-core/src/amplifier.cpp`` carries
+#: ``static_assert(kFineDetailMaxAtMaxSlopeMm == 2280)`` -- a compile-time bound
+#: on how far the client's amplified 10 cm surface can depart from the carrier
+#: this bake ships, on the fine tier, with every gate at its maximum at once. So
+#: a pixel whose reconstructed ground stands more than 2280 mm above its local
+#: level cannot contain a single 10 cm voxel below that level, and a level there
+#: would be bytes that can never change a picture. 2400 is that bound rounded
+#: up, and the rounding is the only free parameter in it.
+#:
+#: IF THE AMPLIFIER'S LADDER MOVES this number is wrong in the dangerous
+#: direction -- too small is a waterline that silently stops short. That
+#: static_assert is the tripwire: it fires on any change to the detail bound,
+#: and this comment is the second place to look when it does.
+LEVEL_BAND_MM = 2400.0
+
+#: Radius, in fine pixels, of the MIN-FILTER the band predicate applies to the
+#: ground before comparing it against the level.
+#:
+#: WHY THE PIXEL'S OWN GROUND IS THE WRONG TEST. ``carrier.h`` sets
+#: ``kCarrierWarpMaxMm = 500``: the client displaces where a column reads the
+#: carrier by up to half a metre laterally, and ``tiles.h`` turns that into
+#: ``kCarrierMaxWarpPx == 1`` at the 1.875 m fine pitch. On top of that the
+#: client evaluates a cubic B-spline whose support is 4x4 control points, so the
+#: surface inside one pixel's footprint is a function of its neighbours too. A
+#: pixel whose CENTRE stands above the level can therefore still have its drawn
+#: ground below it, and testing the centre alone loses exactly the waterline
+#: pixels the band exists to serve.
+#:
+#: 2 = one pixel for the warp, one for the spline's reach, and it errs
+#: deliberately wide: over-dilating costs bytes for cells that will never hold
+#: water, under-dilating costs a visible gap in the shoreline. Measured on
+#: shipped tile (-4,-4) through this very function, the dilation roughly doubles
+#: the band -- 344,676 cells at radius 0, 514,247 at 1 and 674,421 at 2, i.e.
+#: 0.51% of the tile against 1.01% -- and the water plane costs 2.46x, 2.97x and
+#: 3.43x of its unbanded self under CODEC_ZSTD. If the byte cost ever has to
+#: come down, this is the cheaper of the two knobs (the other is
+#: ``tile_codec.WATER_NO_LEVEL``) and 1 is the value with an argument behind it.
+LEVEL_BAND_DILATE_PX = 2
+
+
+def _min_filter_box(a, r: int):
+    """Separable min over a (2r+1)^2 box, EDGE-CLAMPED. Radius 0 is identity.
+
+    Clamped rather than wrapped: this runs on the PADDED domain, where the cells
+    outside the interior are real neighbouring ground, and rolling the far edge
+    in would compare a pixel against terrain 15 km away.
+    """
+    r = int(r)
+    if r <= 0:
+        return a
+    out = a
+    for axis in (0, 1):
+        n = out.shape[axis]
+        acc = out
+        for k in range(1, r + 1):
+            lo = np.concatenate(
+                [np.take(out, [0] * k, axis=axis),
+                 np.take(out, np.arange(0, n - k), axis=axis)], axis=axis)
+            hi = np.concatenate(
+                [np.take(out, np.arange(k, n), axis=axis),
+                 np.take(out, [n - 1] * k, axis=axis)], axis=axis)
+            acc = np.minimum(acc, np.minimum(lo, hi))
+        out = acc
+    return out
+
+
+def local_water_levels(water_m, z_ground_m, receivers, *, exclude=None,
+                       dried=None, band_mm: float = LEVEL_BAND_MM,
+                       dilate_px: int = LEVEL_BAND_DILATE_PX):
+    """The level band: a local water surface for DRY cells near water.
+
+    Returns ``(level_m, stats)``. ``level_m`` is metres absolute on banded cells
+    and NaN everywhere else -- INCLUDING on every wet cell, because a wet cell
+    already carries its surface in ``water_m`` and
+    ``tile_codec.water_depth_control_points`` refuses a cell that claims both.
+
+    WHAT THE OWNER SEES WITHOUT IT. The waterline meets the bank in blocky
+    multi-metre steps. It has to: the plane says WET or DRY at 1.875 m, and the
+    ground the client draws is amplified to 10 cm, so the shoreline can only
+    land on a pixel edge while the ground under it moves by metres inside that
+    pixel. Shipping the LEVEL instead of the verdict lets the client resolve
+    ``ground(voxel) < level`` at its own pitch against its own ground, and the
+    waterline lands on a contour.
+
+    THIS IS A FINAL STAGE AND IT RE-RUNS THE FILL. IT MUST. There is already a
+    ``level`` array inside ``fill_to_local_surface``, and reusing it is the
+    obvious shortcut and is wrong: by the time the plane ships that array is
+    stale by six stages. ``bridge_to_face_contact``,
+    ``settle_to_adjacent_level`` (with ``apply_discharge_budget`` and
+    ``smooth_level_field`` inside it), ``enforce_neighbour_consistency``,
+    ``equalize_lateral_levels`` and ``enforce_upstream_monotone`` all move drawn
+    surfaces after it, and the last three only ever LOWER them. A band built on
+    the stale field would hand the client a waterline metres above the water the
+    tile actually carries, on exactly the banks the whole feature is for. So the
+    fill runs again here, on the FINAL wet set and the same receiver forest.
+
+    ``dried`` is the cells the pipeline drew wet and then took back --
+    principally ``apply_discharge_budget``'s refusals. They are FORCED to no
+    level. This is the one rule with no slack in it: a stranded cell has ground
+    below its neighbours' water by construction, so it is exactly the cell a
+    band would flood, and flooding it would put back at 10 cm the water that
+    conservation just removed at 1.875 m.
+
+    ``exclude`` is the registered-basin mask, and it is a BARRIER here for the
+    reason it is one in ``fill_to_local_surface``: a basin's surface ships in
+    ``SECTION_BASIN_TABLE`` and the client composes the two samplers, so a
+    second and disagreeing level must not be laid over it.
+
+    RUN ON THE PADDED DOMAIN, before the crop. A reach on a tile edge has to be
+    banded from both sides of the seam or the collar is cut in half at every
+    tile boundary -- the identical argument that puts the fill and the bridge on
+    the padded domain, and the identical visible failure if it is ignored.
+    """
+    w = np.asarray(water_m, np.float32)
+    z = np.asarray(z_ground_m, np.float32)
+    if z.shape != w.shape:
+        raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
+    wet = np.isfinite(w)
+    level = np.full(w.shape, np.nan, np.float32)
+    stats = {
+        "level_band_ran": 1.0,
+        "level_band_wet_cells": float(int(wet.sum())),
+        "level_band_mm": float(band_mm),
+        "level_band_dilate_px": float(int(dilate_px)),
+        "level_band_cells": 0.0,
+        "level_band_frac": 0.0,
+        "level_band_dried_refused": 0.0,
+        "level_band_clamped_at_ground": 0.0,
+    }
+    if not wet.any():
+        # No drawn water means no level anywhere, and that is a statement rather
+        # than a gap: the counters above still ship, so a dry tile and a stage
+        # that never ran cannot read alike in the log. This module has twice
+        # been fooled by a counter that was absent rather than small.
+        return level, stats
+
+    rec = np.ascontiguousarray(receivers, np.int32).ravel()
+    if rec.size != w.size:
+        raise ValueError(f"receivers has {rec.size} cells, water has {w.size}")
+    blocked = (
+        np.zeros(w.size, np.uint8) if exclude is None
+        else np.ascontiguousarray(exclude, bool).ravel().view(np.uint8)
+    )
+
+    lvl = np.full(w.size, np.nan, np.float32)
+    lvl[wet.ravel()] = w.ravel()[wet.ravel()]
+    _fill_levels(lvl, rec, blocked, wet.ravel().view(np.uint8).copy())
+    lvl = lvl.reshape(w.shape)
+
+    # HEIGHT ABOVE THE LOCAL SURFACE, taken on the MIN-FILTERED ground -- see
+    # LEVEL_BAND_DILATE_PX for why the pixel's own centre is not the test. The
+    # STORED value is still ``level - z[p]``, against the pixel's OWN ground, so
+    # the client's existing ``ground + cp * LSB`` arithmetic is untouched; only
+    # the admission test is dilated.
+    reached = np.isfinite(lvl)
+    zmin = _min_filter_box(z, int(dilate_px))
+    band = reached & ~wet & ((zmin - lvl) * 1000.0 <= float(band_mm))
+
+    if dried is not None:
+        d = np.asarray(dried, bool)
+        refused = int((band & d).sum())
+        band &= ~d
+        stats["level_band_dried_refused"] = float(refused)
+
+    level[band] = lvl[band]
+    stats["level_band_cells"] = float(int(band.sum()))
+    stats["level_band_frac"] = float(band.mean())
+    # Banded cells standing at or BELOW their own level. They are legal -- the
+    # fill can refuse a cell for want of ``min_depth_m`` -- and the encoder
+    # clamps them to ``WATER_LEVEL_MAX_CP`` so they can never read as water at
+    # the bake's own surface. A count that ran away here would mean the band had
+    # started describing cells that ought to be wet, which is a different bug
+    # and one worth seeing in the log rather than inferring.
+    if band.any():
+        rel = (z[band] - lvl[band]).astype(np.float64)
+        stats["level_band_clamped_at_ground"] = float(int((rel <= 0.0).sum()))
+        stats["level_band_reach_p50_m"] = float(np.percentile(rel, 50))
+        stats["level_band_reach_p90_m"] = float(np.percentile(rel, 90))
+    return level, stats

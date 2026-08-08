@@ -1,0 +1,99 @@
+THE LATERAL LEVEL RULE, MADE TO SPREAD WATER INSTEAD OF DELETE IT. Same tile,
+same window as lateral-level-rule-2026-08-08.txt: tile (-4,-4), npz-lvl2
+replayed offline, 2048 px on the wettest region, 63,466 wet cells. 2026-08-08.
+
+THE DEFECT. The rule shipped at bake_ver 21 forces adjacent wet cells to share a
+level by LOWERING ONLY. It fixed the surface -- adjacent-cell steps over one
+voxel 20.76% -> 1.54% on this crop -- and it DELETED the water it lowered.
+End to end the tile carried 17-31% less water than at bake_ver 17; (-4,-4) went
+364,354 -> 249,900 wet cells. The owner's complaint has always been water
+FAILING to fill low ground, so a rule that only removes works against its own
+purpose.
+
+THE FIX, in one sentence: levelling water does not destroy it, it spreads it.
+This is the lesson apply_discharge_budget already paid for -- its first version
+deleted the surplus, could not make a wide-and-shallow river on a flat floor,
+and had to become a per-section level solve. The level solve is now a shared
+helper, `_fill_to_volume`.
+
+HOW IT WORKS NOW
+  1. The lowering sweeps are UNCHANGED, and each one records which neighbour a
+     cell was lowered toward. Following those links to a cell that was never
+     lowered partitions the lowered water into PONDS; ponds whose cells touch
+     are pooled into one body of water with one budget.
+  2. The levelled plane is NOT re-solved. Every cell the sweeps touched keeps
+     exactly the surface they gave it -- verified bit-identical on the crop.
+  3. Each pond spends the water it lost wetting DRY GROUND that lies below the
+     surface of the water beside it, deepest first, at that water's own level,
+     reached ring by ring THROUGH THE WATER BODY as well as across the fringe.
+
+TWO ANSWERS THAT LOOK RIGHT AND ARE NOT, both measured before the third was
+written, against the delete-only rule's 54,908 wet / 1.54% over one voxel:
+  re-solve each pond against its INPUT level     63,725 wet   20.21% >1vox
+  re-solve each pond against its LEVELLED bottom 50,562 wet    6.31% >1vox
+The first conserves 99.3% of the volume by standing 14,599 of the 26,790 lowered
+cells back up -- it gives the water back by UNDOING THE RULE, and 20.21% is
+where the plane started. The second is worse than deleting on both counts:
+flattening a pond onto its lowest cell throws away more water than the levelling
+did and drops the level out from under the water beside it.
+
+THREE MECHANISMS THAT EACH MOVED THE NUMBER, in the order they were needed:
+  * per-pond budgets only, fringe only        57,530 wet, 25% of the water placed
+  * + conduits through existing water         57,911 wet, 27%
+  * + budgets pooled across touching ponds    61,933 wet, but 4.03% >1vox
+  * + a new cell may only join water that
+    already agrees with itself to one voxel   60,073 wet, 1.51% >1vox
+The last one is load-bearing: a dry cell wedged between two wet regions a metre
+apart in level has no one surface to join, and admitting it re-broke the
+levelling the water was paying for.
+
+RESULT, 8 sweeps, tol one voxel, 16 rings
+                       wet    >100mm  >300mm  dry-below  volume
+  bv18 shipped      63,466    20.76%   5.05%      9,215  106,121 m3
+  delete-only       54,908     1.54%   0.51%      8,717   83,016 m3   -13.5% wet
+  THIS RULE         60,073     1.51%   0.52%     10,155   96,271 m3    -5.3% wet
+The levelling is untouched -- 1.51% against 1.54%, and the over-300 mm steps are
+identical -- while 5,165 of the 8,558 cells the levelling cost come back and the
+water goes from -21.8% to -9.3%. It re-places 57.4% of what it takes; the other
+9,850 m3 is water the ground beside it had no room for under a surface nothing
+is allowed to raise.
+
+THE BOUND IS THE VOLUME, DEMONSTRATED. Remove the budget and run the same rings:
+63,466 -> 82,119 wet at 8 rings and 171,532 at 32, which is fill_to_local_
+surface's 209x flood reproduced on demand. With the budget in place:
+  rings      4        8       16       32       64
+  wet    57,741   59,372   60,073   60,502   60,548
+  >1vox   1.548%   1.524%   1.509%   1.498%   1.497%
+32 and 64 agree to four figures. 16 is where the curve flattens; the whole stage
+costs 2.1 s on the crop against the levelling's own 1.9 s.
+
+WHAT GOT WORSE, recorded rather than smoothed over. Dry cells lying 0.1-5 m
+below adjacent water go 8,717 -> 10,155, past even the 9,215 the plane started
+with. Spreading water makes more shoreline and a shoreline is where dry ground
+meets water above it. Split by depth the SHALLOW band (0.1-0.3 m) improves,
+3,663 -> 3,169; the whole increase is 0.3-5 m, 5,054 -> 6,986, the new frontier
+the extra 5,165 wet cells exposed and could not afford to cross.
+
+THE TRADE THE OWNER MAY STILL WANT TO MAKE. Every additional wet cell past this
+point costs surface smoothness, and the two ends of that trade are measured
+above: 54,908 wet at 1.54%, or 63,725 wet at 20.21% (which is the rule switched
+off in all but name). There is no setting between them that is free.
+
+CAVEATS
+ * OFFLINE. This is the shipped bv18 plane replayed, not a bake. No bake was run.
+ * NO DRIED MASK. The npz does not carry the cells the discharge budget
+   stranded, and in the bake those are refused as recipients. Blocking a random
+   half of the dry cells as a sensitivity test gives 57,760 wet (-9.0%) and
+   1.52% over one voxel, so the real recovery lies between that and 60,073.
+ * Receivers are recomputed on the shipped post-B5 elevation while the bake
+   routes on the pre-B5 surface, the same caveat the first measurement records.
+
+INVARIANTS, checked on this crop and in tests/test_bake_pipeline.py
+ * no cell that came in wet ends above its input level (phase 2 never touches
+   one), and the function still asserts it before returning
+ * no drawn channel cell is ever dried -- new in this change; the previous rule
+   could and did dry them
+ * no cell the discharge budget stranded is re-wetted
+ * nothing is reached across dry ground: a hole behind a sill stays dry
+ * the delete-only branch is kept (water_lateral_conserve_volume=False) so
+   bake_ver 21 stays reproducible

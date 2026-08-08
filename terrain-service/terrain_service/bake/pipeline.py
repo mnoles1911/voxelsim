@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 21
+BAKE_VERSION = 22
 
 
 @dataclass(frozen=True)
@@ -1337,6 +1337,66 @@ class BakeConstants:
     #: better, so the trade is his to make and this ships dark.
     water_lateral_equal_level: bool = True
 
+    #: Put the water that rule levels off the high cells back on the map,
+    #: instead of deleting it. See ``water.equalize_lateral_levels``.
+    #:
+    #: WHY IT IS NOT OPTIONAL IN PRACTICE. Measured end to end, the delete-only
+    #: rule shipped 17-31% LESS water per tile than bake_ver 17 -- tile (-4,-4)
+    #: went 364,354 -> 249,900 wet cells -- and the owner has said repeatedly
+    #: that more water looks better and that his complaint is water FAILING to
+    #: fill low ground. Replayed on the 2048 crop of that tile, conserving takes
+    #: the wet cells from 54,908 back to 60,073 and the water from -21.8% to
+    #: -9.3% while leaving the levelling exactly where it was: 1.51% of adjacent
+    #: pairs over one voxel against the delete-only 1.54%.
+    #:
+    #: The off branch is kept so bake_ver 21 can be reproduced, not because it
+    #: is a defensible setting.
+    water_lateral_conserve_volume: bool = True
+    #: How far, in rings through the water, a pond may carry its displaced
+    #: water looking for ground to put it on. The VOLUME is what stops the
+    #: spread -- 32 and 64 rings give the same answer, and with the budget
+    #: removed the same rings reproduce the 209x flood -- so this caps the work
+    #: rather than the answer. See ``water.LATERAL_SPREAD_ROUNDS``.
+    water_lateral_spread_rounds: int = 16
+
+    #: Put the water LEVEL on the wire for DRY cells near water, so the client
+    #: can resolve the waterline at its own 10 cm pitch instead of at the bake's
+    #: 1.875 m one. See ``water.local_water_levels`` for the stage and
+    #: ``tile_codec.WATER_NO_LEVEL`` for the encoding.
+    #:
+    #: THE COMPLAINT IT ANSWERS is the owner's oldest one about water: the
+    #: waterline meets the bank in blocky multi-metre steps. Nothing in the
+    #: water module can fix that, because the staircase is not an error in where
+    #: the water goes -- it is the 18.75x gap between the pitch the bake decides
+    #: wetness at and the pitch the client draws ground at. The only fix is to
+    #: stop shipping the verdict and ship the question.
+    #:
+    #: OFF UNTIL THE OWNER HAS SEEN IT, and until a client reads the band: the
+    #: bytes are inert on today's client (every reader tests ``< 0`` for dry, so
+    #: a band value reads as dry, bit for bit) but they are not free. Measured
+    #: on shipped tile (-4,-4) at bake_ver 15, water plane only, CODEC_ZSTD:
+    #: 0.645 MB today against 2.215 MB banded, 3.43x, on a band covering 1.01%
+    #: of the tile. Tile (-5,-5): 1.402 -> 4.939 MB, 3.52x. Against a whole
+    #: compressed tile that is single-digit percent; against the water plane
+    #: alone it is not, and it is the owner's call.
+    #:
+    #: TWO KNOBS IF IT HAS TO COME DOWN, both measured and both bigger than any
+    #: retuning of the band predicate: ``tile_codec.WATER_NO_LEVEL`` (emitting
+    #: -1 instead of -32768 costs 1.646 MB rather than 2.215, and under
+    #: CODEC_RAW 1.03x rather than 1.99x) and ``water_level_band_dilate_px``
+    #: (2.46x at radius 0, 2.97x at 1, 3.43x at 2).
+    water_level_plane_enabled: bool = False
+    #: Band width in millimetres. Derived from the client's own detail bound --
+    #: see ``water.LEVEL_BAND_MM``, which is where the derivation and the
+    #: tripwire live. A constant here so that changing it rolls the product
+    #: identity rather than silently re-keying the plane under an unchanged id.
+    water_level_band_mm: float = 2400.0
+    #: Min-filter radius, fine pixels, for the band predicate. See
+    #: ``water.LEVEL_BAND_DILATE_PX``: the client's carrier warp reaches one
+    #: pixel and the B-spline's support another, so a pixel whose centre is high
+    #: can still draw ground below the level.
+    water_level_band_dilate_px: int = 2
+
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
     #:
@@ -1558,6 +1618,15 @@ class BakeConstants:
         "water_level_smooth_iters",
         "water_enforce_upstream_monotone",
         "water_lateral_equal_level",
+        "water_lateral_conserve_volume",
+        "water_lateral_spread_rounds",
+        # PRODUCT: they add values to the water plane at cells that are DRY, and
+        # a dry cell's stored value cannot move a height by construction -- the
+        # encoder refuses any dry cell that encodes >= 0. The ground is
+        # untouched, which is what verify_water_only_change.py checks.
+        "water_level_plane_enabled",
+        "water_level_band_mm",
+        "water_level_band_dilate_px",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -1663,6 +1732,14 @@ def product_identity_payload(consts: BakeConstants = CONSTANTS) -> dict:
             "water_flag": _codec_const("FLAG_WATER_PRESENT"),
             "water_dry_sentinel": _codec_const("WATER_DRY_DEPTH"),
             "water_depth_lsb_mm": _codec_const("WATER_DEPTH_LSB_MM"),
+            # The level band's wire meaning. Here for the reason the sentinel
+            # above is: these three numbers decide how a client reads a negative
+            # value, and moving one with no constant change would be invisible
+            # to the id -- the "namespace holding two mutually incompatible
+            # formats" failure this dict exists to refuse.
+            "water_no_level": _codec_const("WATER_NO_LEVEL"),
+            "water_level_min_cp": _codec_const("WATER_LEVEL_MIN_CP"),
+            "water_level_max_cp": _codec_const("WATER_LEVEL_MAX_CP"),
         },
     }
 
@@ -3994,6 +4071,13 @@ class BakeResult:
     #: SECTION_WATER_*; see ``bake.water`` for the laws and for the overshoot
     #: gate that decides whether it is trustworthy.
     water_surface_m: "np.ndarray | None" = None
+    #: The level band, metres absolute, NaN off-band, interior. Finite ONLY on
+    #: cells that ``water_surface_m`` says are DRY -- the two describe the same
+    #: final water and the encoder refuses a cell that claims both. None when
+    #: ``water_level_plane_enabled`` is off, which is the default; it rides in
+    #: the SAME plane as the depths (see ``tile_codec.WATER_NO_LEVEL``) rather
+    #: than in a section of its own.
+    water_level_m: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -4800,6 +4884,7 @@ def bake_tile(
     c0 = time.process_time()
     discharge = None
     water_surface = None
+    water_level = None
     water_stats: dict[str, float] = {}
     runoff_coarse = _water.runoff_field_mm_yr(
         padded_climate, basin_balance(consts), consts.province_smooth_m,
@@ -4975,6 +5060,30 @@ def bake_tile(
         # nothing drawn gets NaN. Runs BEFORE the consistency pass so anything
         # it adds is held to the same no-water-above-its-upstream-neighbour
         # rule as everything else.
+        # CELLS THE DISCHARGE BUDGET REFUSED. Only collected when the level band
+        # is on, because it is the only consumer: a cell conservation stranded
+        # must be refused a level, or the client puts back at 10 cm the water
+        # the budget removed at 1.875 m. Filled from INSIDE
+        # `settle_to_adjacent_level`, because that is where the budget runs and
+        # the pipeline cannot see those cells from out here.
+        #
+        # THE BUDGET'S REFUSALS AND NOT THE LATER STAGES'. `equalize_lateral_
+        # levels` and `enforce_upstream_monotone` dry cells too, but they do it
+        # by LOWERING A LEVEL -- and the band, which is rebuilt on the FINAL
+        # levels, already agrees with them. Refusing those as well was tried and
+        # took the band to zero cells on this module's own bake fixture.
+        #
+        # THE SECOND CONSUMER is `equalize_lateral_levels`, which re-places the
+        # water it levels off the high cells into dry ground and must never put
+        # it back into a cell the budget stranded -- that would double-count the
+        # only bound in this module that is conserved rather than chosen. So the
+        # mask is collected whenever EITHER stage wants it.
+        dried_pad = (np.zeros(w_pad.shape, bool)
+                     if (consts.water_level_plane_enabled
+                         or (consts.water_lateral_equal_level
+                             and consts.water_lateral_conserve_volume))
+                     else None)
+
         if consts.water_settle_to_level:
             w_pad, settle_stats = _water.settle_to_adjacent_level(
                 w_pad, out["z"], min_depth_m=_water.WIDEN_MIN_DEPTH_M,
@@ -4982,7 +5091,8 @@ def bake_tile(
                 q_m3_yr=(q_pad if consts.water_settle_discharge_budget
                          else None),
                 cell_m=geom.fine_pixel_m,
-                level_smooth_iters=int(consts.water_level_smooth_iters))
+                level_smooth_iters=int(consts.water_level_smooth_iters),
+                dried_out=dried_pad)
             width_stats.update(settle_stats)
 
         if consts.water_level_neighbour_consistency:
@@ -5019,10 +5129,24 @@ def bake_tile(
         if consts.water_lateral_equal_level:
             w_pad, lat_stats = _water.equalize_lateral_levels(
                 w_pad, out["z"], rec_w, centreline_pad,
-                min_depth_m=_water.WIDEN_MIN_DEPTH_M)
+                min_depth_m=_water.WIDEN_MIN_DEPTH_M,
+                # LEVELLING SPREADS WATER, IT DOES NOT DESTROY IT. Without this
+                # the rule shipped 17-31% less water per tile than bake_ver 17
+                # and the owner's complaint has always been water failing to
+                # fill low ground. `dried_pad` is what the budget stranded and
+                # is refused; `basin_keep_pad` ships its own surface on the
+                # wire and must not be given a second one.
+                conserve_volume=consts.water_lateral_conserve_volume,
+                spread_rounds=int(consts.water_lateral_spread_rounds),
+                dried=dried_pad, exclude=basin_keep_pad,
+                cell_m=geom.fine_pixel_m)
             width_stats.update(lat_stats)
         else:
             width_stats["lateral_equal_ran"] = 0.0
+            # BOTH BRANCHES, for the reason above: an absent counter reads as
+            # zero, and "the re-placement found nothing to do" must not look
+            # like "the stage never ran".
+            width_stats["lateral_conserve_ran"] = 0.0
 
         # THE HARD RULE, LAST, ASSUMING NOTHING. No water may stand above its
         # own upstream water. graded_water_surface established this and every
@@ -5040,6 +5164,41 @@ def bake_tile(
                 w_pad, rec_w, out["z"],
                 min_depth_m=_water.WIDEN_MIN_DEPTH_M)
             width_stats.update(mono_stats)
+
+        # -- THE LEVEL BAND, LAST AND ON THE PADDED DOMAIN. Every stage above
+        # decides WHERE water is at 1.875 m. This one hands the client what it
+        # needs to decide where the WATERLINE is at 10 cm: the local water level
+        # over the dry cells beside the water. See `water.local_water_levels`
+        # for why it re-runs the fill instead of reusing the one inside
+        # `fill_to_local_surface` (that array is stale by six stages, all of
+        # which move drawn surfaces and three of which only lower them), and
+        # `tile_codec.WATER_NO_LEVEL` for why it rides in the existing plane as
+        # negative values that every current reader already treats as dry.
+        #
+        # AFTER the monotone rule, because a band taken before it would describe
+        # water that no longer exists at the height it was measured at. BEFORE
+        # the crop, for the reason the fill and the bridge run padded: a reach on
+        # a tile edge must be banded from both sides of the seam or the collar is
+        # cut in half at every tile boundary -- and a seam in a shoreline is the
+        # most visible artifact this whole module can produce.
+        #
+        # THE FLAG IS WRITTEN IN BOTH BRANCHES, like `lateral_equal_ran`: a
+        # counter that is ABSENT reads as zero in the per-tile log, and this
+        # module has twice shipped a stage that never executed while its log
+        # line read as "nothing to fix".
+        if consts.water_level_plane_enabled:
+            lvl_pad, band_stats = _water.local_water_levels(
+                w_pad, out["z"], rec_w,
+                exclude=basin_keep_pad,
+                dried=dried_pad,
+                band_mm=float(consts.water_level_band_mm),
+                dilate_px=int(consts.water_level_band_dilate_px))
+            width_stats.update(band_stats)
+            water_level = np.ascontiguousarray(lvl_pad[sl, sl])
+            del lvl_pad
+        else:
+            width_stats["level_band_ran"] = 0.0
+        del dried_pad
 
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])
@@ -5266,6 +5425,7 @@ def bake_tile(
         basins=tuple(survey.basins),
         discharge_m3_yr=discharge,
         water_surface_m=water_surface,
+        water_level_m=water_level,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

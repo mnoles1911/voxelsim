@@ -2958,7 +2958,7 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # together. The literal is deliberate: it forces a conscious edit at every
     # roll instead of letting the version drift silently, which is why this is
     # pinned rather than read from pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 21
+    assert on["bake_version"] == 22
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -3519,10 +3519,16 @@ def test_lateral_equal_level_is_a_product_constant_that_ships_dark():
     # The rest of this test is what still matters -- identity coverage, and a
     # counter that cannot be confused with "did not run".
     assert c.water_lateral_equal_level is True
-    assert "water_lateral_equal_level" in BakeConstants.PRODUCT_FIELDS
-    assert "water_lateral_equal_level" not in c.as_payload(), (
-        "it cannot move a height, so it belongs in the PRODUCT half only"
-    )
+    # ...and it CONSERVES the water it levels off, because the delete-only rule
+    # shipped 17-31% less water per tile and the owner's complaint is water
+    # failing to fill low ground.
+    assert c.water_lateral_conserve_volume is True
+    for name in ("water_lateral_equal_level", "water_lateral_conserve_volume",
+                 "water_lateral_spread_rounds"):
+        assert name in BakeConstants.PRODUCT_FIELDS
+        assert name not in c.as_payload(), (
+            "it cannot move a height, so it belongs in the PRODUCT half only"
+        )
 
     z, rec, drawn, water = _lateral_fixture_two_banks()
     _, stats = w.equalize_lateral_levels(water, z, rec, drawn)
@@ -3572,31 +3578,47 @@ def test_lateral_equal_level_actually_executes_in_the_bake(_real_kernels):
     # running the ON path and asserting the OFF value.
     off = run(water_lateral_equal_level=False)
     on = run(water_lateral_equal_level=True)
+    # The re-placement is a stage inside a stage, so it needs its own flag in
+    # both branches for the same reason -- and a bake with the levelling ON and
+    # the conservation OFF is the bake_ver 21 plane, which has to stay
+    # reproducible.
+    keep = run(water_lateral_equal_level=True,
+               water_lateral_conserve_volume=False)
 
     assert off.stats["water_lateral_equal_ran"] == 0.0
     assert on.stats["water_lateral_equal_ran"] == 1.0
+    assert off.stats["water_lateral_conserve_ran"] == 0.0
+    assert keep.stats["water_lateral_conserve_ran"] == 0.0
+    assert on.stats["water_lateral_conserve_ran"] == 1.0
     # It did real work on real water -- not a no-op that would make the flag
     # meaningless.
     assert on.stats["water_lateral_steps_over_tol_before"] > 0.0
     assert (on.stats["water_lateral_steps_over_tol_after"]
             < on.stats["water_lateral_steps_over_tol_before"])
     assert on.stats["water_lateral_lowered_cells"] > 0.0
-    assert on.stats["water_lateral_wet_after"] <= on.stats["water_lateral_wet_before"]
+    # CONSERVING MEANS MORE WATER SURVIVES, and that is the whole point of the
+    # inner stage: the delete-only arm is the floor, never the other way round.
+    assert (on.stats["water_lateral_wet_after"]
+            >= keep.stats["water_lateral_wet_after"])
+    assert int(np.isfinite(on.water_surface_m).sum()) >= int(
+        np.isfinite(keep.water_surface_m).sum())
 
     # PRODUCT, not payload: the ground is untouched, which is what
     # tools/verify_water_only_change.py checks on real tiles.
     np.testing.assert_array_equal(off.elevation_m, on.elevation_m)
-    assert int(np.isfinite(on.water_surface_m).sum()) <= int(
-        np.isfinite(off.water_surface_m).sum())
+    np.testing.assert_array_equal(off.elevation_m, keep.elevation_m)
 
 
-def test_lateral_equal_level_never_wets_a_cell_so_it_cannot_flood():
-    """The 209x flood has no way in: the wet set can only shrink.
+def test_lateral_equal_level_is_bounded_by_volume_not_by_a_radius():
+    """The 209x flood has no way in: the rule cannot place water it did not take.
 
     ``fill_to_local_surface`` records a lateral rule that took 317,665 wet cells
-    to 66,546,420. Every lateral rule in this module is measured against that
-    number, and this one is safe for a structural reason rather than a tuned
-    one -- it never assigns a level to a dry cell.
+    to 66,546,420 by carrying a LEVEL outward with nothing conserved. This one
+    does wet dry cells -- it has to, or the levelling simply deletes 17-31% of
+    the tile's water -- but every cell it wets is paid for out of the water it
+    just took off a perched cell, so the total can only fall. Run with the reach
+    quadrupled it is the SAME answer, which is the volume doing the stopping and
+    not the ring count.
     """
     import numpy as np
     from terrain_service.bake import water as w
@@ -3608,10 +3630,447 @@ def test_lateral_equal_level_never_wets_a_cell_so_it_cannot_flood():
     rec = np.full((48, 48), -1, np.int64)
     drawn = np.zeros((48, 48), bool)
 
+    def vol(a):
+        m = np.isfinite(a)
+        return float(np.maximum(a[m] - z[m], 0.0).sum())
+
     out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
-    wet_in = np.isfinite(water)
-    wet_out = np.isfinite(out)
-    assert not np.any(wet_out & ~wet_in), "a dry cell was wetted"
-    assert stats["lateral_wet_after"] <= stats["lateral_wet_before"]
+    wet_in, wet_out = np.isfinite(water), np.isfinite(out)
+    # Water is MOVED, never invented: no drawn cell here, so there is not even
+    # the one exception the drawn channel is allowed.
+    assert vol(out) <= vol(water) + 1e-4, "the rule invented water"
+    assert stats["lateral_volume_placed_m3"] <= (
+        stats["lateral_volume_taken_m3"] + 1e-4)
+    # ...and no cell that came in wet stands higher than it came in.
     fin = wet_out & wet_in
     assert np.all(out[fin] <= water[fin] + 1e-6), "a level was raised"
+
+    far, _ = w.equalize_lateral_levels(water, z, rec, drawn, spread_rounds=64)
+    np.testing.assert_allclose(np.nan_to_num(far, nan=-1.0),
+                               np.nan_to_num(out, nan=-1.0), atol=1e-5,
+                               err_msg="the reach, not the volume, is the bound")
+
+    off, off_stats = w.equalize_lateral_levels(water, z, rec, drawn,
+                                               conserve_volume=False)
+    assert off_stats["lateral_conserve_ran"] == 0.0
+    assert stats["lateral_conserve_ran"] == 1.0
+    # The delete-only branch is what this replaces, and it must still be there
+    # and must still be worse on water.
+    assert vol(off) <= vol(out) + 1e-9
+
+
+def test_lateral_equal_level_re_places_water_instead_of_deleting_it():
+    """A perched cell drains into the hole beside it, not out of the world.
+
+    THE DEFECT THIS CLOSES, measured end to end: the delete-only rule shipped
+    17-31% less water per tile than bake_ver 21's predecessor, and the owner's
+    complaint has always been water FAILING to fill low ground.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    # a pond at 10.0, a cell perched a metre above it, and a dry hole on the
+    # pond's far side whose floor is under the pond's own surface
+    z = np.array([[9.5, 9.0, 9.0, 10.0, 30.0]], np.float32)
+    water = np.array([[np.nan, 10.0, 10.0, 11.0, np.nan]], np.float32)
+    rec = np.full(5, -1, np.int64)
+    drawn = np.zeros((1, 5), bool)
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+    assert out[0, 3] < 11.0 - 1e-6, "the perched cell kept its perch"
+    assert np.isfinite(out[0, 0]), "the water was deleted instead of moved"
+    assert out[0, 0] == pytest.approx(10.0, abs=1e-4), \
+        "the hole did not join the water beside it at its own level"
+    assert stats["lateral_conserve_wetted"] == 1.0
+
+    # and NOT if the discharge budget stranded that cell on purpose: putting it
+    # back would double-count the only bound in the module that is conserved.
+    dried = np.zeros((1, 5), bool)
+    dried[0, 0] = True
+    out2, _ = w.equalize_lateral_levels(water, z, rec, drawn, dried=dried)
+    assert not np.isfinite(out2[0, 0]), "a budget-stranded cell was re-wetted"
+
+    # nor across a barrier: a deeper hole behind a wall of dry ground is not
+    # reachable, however much water the pond is holding.
+    z3 = np.array([[9.5, 9.0, 9.0, 10.0, 30.0, 0.0]], np.float32)
+    out3, _ = w.equalize_lateral_levels(
+        np.array([[np.nan, 10.0, 10.0, 11.0, np.nan, np.nan]], np.float32),
+        z3, np.full(6, -1, np.int64), np.zeros((1, 6), bool))
+    assert not np.isfinite(out3[0, 5]), "water crossed a barrier"
+
+
+def test_lateral_equal_level_never_dries_the_drawn_channel():
+    """A dry drawn channel is what the whole water plane exists to refuse.
+
+    ``apply_discharge_budget`` already makes this exception for its own
+    conservation; the levelling has to make it too, because most of a 1-2 px
+    channel's neighbours are floodplain and are not exempt from the rule.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    rng = np.random.default_rng(4242)
+    z = rng.uniform(0.0, 4.0, (32, 32)).astype(np.float32)
+    water = np.where(rng.random((32, 32)) < 0.5,
+                     z + rng.uniform(0.15, 2.0, (32, 32)), np.nan).astype(np.float32)
+    rec = np.full(32 * 32, -1, np.int64)
+    drawn = (rng.random((32, 32)) < 0.08) & np.isfinite(water)
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+    assert np.all(np.isfinite(out[drawn])), "a drawn channel cell was dried"
+    assert stats["lateral_drawn_held_wet"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# THE LEVEL BAND (water_level_plane_enabled): a water LEVEL for DRY cells near
+# water, so the client can put the waterline on a contour of the 10 cm ground it
+# draws instead of on an edge of the bake's 1.875 m pixel.
+#
+# The identity coverage matters as much as the numerics here. The band changes
+# baked bytes, and a constant that changes bytes without rolling an id is the
+# "namespace holding two mutually incompatible waters" failure this module has
+# a whole docstring about.
+# ---------------------------------------------------------------------------
+
+
+
+def _band_bake_consts():
+    """(world, climate, consts) for the level-band integration tests.
+
+    THREE THINGS ARE PINNED HERE RATHER THAN INHERITED, each because inheriting
+    it made a band test say something other than what it claims:
+
+    * ``synth_world`` and a perennial threshold of 100 m^3/yr, so the toy tile
+      comes out PARTLY wet. At the threshold the other water tests use, this
+      geometry floods every one of its 1024 cells -- and a band is a collar of
+      DRY ground beside water, so a fully wet tile makes every assertion below
+      vacuously true while reading as a pass.
+    * ``water_lateral_equal_level`` OFF. It is a neighbouring stage under active
+      revision; leaving it on makes these tests re-test its tuning, and the band
+      stage runs after it either way, reading only the final surface.
+    """
+    world = synth_world()
+    cl = climate_world(lambda tx, ty: 3000.0)
+    consts = dataclasses.replace(
+        TEST_CONSTS, water_q_perennial_m3_yr=100.0,
+        water_lateral_equal_level=False)
+    return world, cl, consts
+
+
+def test_level_band_constants_are_product_only():
+    """The three band constants decide the water plane and nothing about the
+    ground, so they belong in the PRODUCT half of the identity and in NEITHER
+    the terrain half nor no half at all."""
+    c = BakeConstants()
+    # OFF by default: the bytes are inert on today's client, but they are not
+    # free -- 3.4x the water plane, measured. Turning it on is the owner's call.
+    assert c.water_level_plane_enabled is False
+    for name in ("water_level_plane_enabled", "water_level_band_mm",
+                 "water_level_band_dilate_px"):
+        assert name in BakeConstants.PRODUCT_FIELDS
+        assert name not in c.as_payload(), (
+            f"{name} cannot move a height, so it belongs in the PRODUCT half only"
+        )
+    # The wire meaning of a negative value is in the product identity too: a
+    # sentinel that moved with no constant change would otherwise be invisible.
+    sections = pipeline.product_identity_payload()["sections"]
+    assert sections["water_no_level"] == -32768
+    assert sections["water_level_min_cp"] == -32767
+    assert sections["water_level_max_cp"] == -2
+
+
+def test_level_band_does_not_touch_the_terrain_identity():
+    """Enabling the band must not re-roll the world. It writes values at DRY
+    cells in a plane the ground never reads."""
+    base = pipeline.bake_fingerprint()
+    on = dataclasses.replace(pipeline.CONSTANTS, water_level_plane_enabled=True)
+    assert pipeline.bake_fingerprint(consts=on) == base
+    assert pipeline.product_fingerprint(on) != pipeline.product_fingerprint()
+
+
+def _band_fixture():
+    """A one-cell-wide river in a V valley, with a dry bank rising away from it.
+
+    Ground falls 1 m per row downstream so the receiver forest is a single
+    chain per column; the river occupies the valley floor and every other cell
+    drains into it.
+    """
+    import numpy as np
+
+    h = wdt = 32
+    col = np.abs(np.arange(wdt) - wdt // 2).astype(np.float32)
+    z = (col[None, :] * 0.5 - np.arange(h, dtype=np.float32)[:, None] * 1.0)
+    z = np.ascontiguousarray(z, np.float32)
+    water = np.full((h, wdt), np.nan, np.float32)
+    water[:, wdt // 2] = z[:, wdt // 2] + 0.4
+    return z, water
+
+
+def test_local_water_levels_bands_the_bank_and_stops(_real_kernels):
+    """A level reaches the dry bank beside the water and stops where the ground
+    climbs past the band, and it never lands on a wet cell."""
+    import numpy as np
+    from terrain_service.bake import flow as bflow
+    from terrain_service.bake import water as w
+
+    z, water = _band_fixture()
+    rec, _ = bflow.d8_receivers(z, 1.875)
+
+    level, stats = w.local_water_levels(water, z, rec)
+    wet = np.isfinite(water)
+    band = np.isfinite(level)
+
+    assert stats["level_band_ran"] == 1.0
+    assert band.any(), "nothing was banded at all"
+    assert not (band & wet).any(), (
+        "a wet cell got a level; the encoder refuses a cell that claims both"
+    )
+    # The band is a COLLAR, not a flood. It cannot cover the whole dry domain.
+    assert band.sum() < (~wet).sum()
+    # It stops where the ground climbs past the band. The ground rises 0.5 m per
+    # column away from the river, so at 2.4 m of band the reach is a few columns
+    # -- and the dilation is what makes the exact number a range rather than a
+    # value worth pinning.
+    reach = np.abs(np.flatnonzero(band.any(axis=0)) - z.shape[1] // 2).max()
+    assert 3 <= reach <= 10, f"band reached {reach} columns; that is not a collar"
+    # Every banded cell's level is a real water surface that exists on this
+    # tile, never something interpolated into being.
+    assert np.all(np.isin(np.unique(level[band]), np.unique(water[wet])))
+
+
+def test_local_water_levels_refuses_a_dried_cell(_real_kernels):
+    """A cell the discharge budget stranded must get NO level.
+
+    A stranded cell has ground below its neighbours' water by construction, so
+    it is precisely the cell a band would flood -- and flooding it would put
+    back at 10 cm the water conservation removed at 1.875 m.
+    """
+    import numpy as np
+    from terrain_service.bake import flow as bflow
+    from terrain_service.bake import water as w
+
+    z, water = _band_fixture()
+    rec, _ = bflow.d8_receivers(z, 1.875)
+    free, _ = w.local_water_levels(water, z, rec)
+    banded = np.isfinite(free)
+    assert banded.any()
+
+    dried = banded.copy()          # pretend the budget stranded the whole band
+    held, stats = w.local_water_levels(water, z, rec, dried=dried)
+    assert not np.isfinite(held).any(), "a dried cell was handed a level"
+    assert stats["level_band_dried_refused"] == float(int(banded.sum()))
+
+
+def test_local_water_levels_is_empty_on_a_dry_tile(_real_kernels):
+    """A tile with no drawn water bands nothing -- and still says so. A counter
+    that is ABSENT reads as zero in the log, which is how this module twice
+    shipped a stage that never executed."""
+    import numpy as np
+    from terrain_service.bake import flow as bflow
+    from terrain_service.bake import water as w
+
+    z, _ = _band_fixture()
+    rec, _ = bflow.d8_receivers(z, 1.875)
+    level, stats = w.local_water_levels(
+        np.full(z.shape, np.nan, np.float32), z, rec)
+    assert not np.isfinite(level).any()
+    assert stats["level_band_ran"] == 1.0
+    assert stats["level_band_cells"] == 0.0
+
+
+def test_level_band_executes_in_the_bake_and_moves_no_ground(_real_kernels):
+    """The stage must RUN, the log must be able to tell that it did, and the
+    ground and the WET SET must both be untouched.
+
+    The wet-set half is the safety property the whole encoding rests on: the
+    band adds values at cells that are dry and changes nothing about which cells
+    are wet, so an old client -- which tests "< 0" and sees only dry -- behaves
+    bit-identically. If the band could move one wet cell that argument is void.
+    """
+    import numpy as np
+
+    world, cl, base = _band_bake_consts()
+
+    def run(**kw):
+        c = dataclasses.replace(base, **kw)
+        return pipeline.bake_tile(
+            world_seed=20260719, tile_x=0, tile_y=0,
+            coarse_fetch=lambda x, y: world.get((x, y)),
+            climate_fetch=lambda x, y: cl.get((x, y)),
+            kernels=_real_kernels, geom=TEST_GEOM, consts=c)
+
+    off = run(water_level_plane_enabled=False)
+    on = run(water_level_plane_enabled=True)
+
+    assert off.stats["water_level_band_ran"] == 0.0
+    assert on.stats["water_level_band_ran"] == 1.0
+    assert off.water_level_m is None
+    assert on.water_level_m is not None
+    assert on.stats["water_level_band_cells"] > 0.0, (
+        "the stage ran and banded nothing; the test would be vacuous"
+    )
+
+    # NO GROUND MOVED. PRODUCT, not payload.
+    np.testing.assert_array_equal(off.elevation_m, on.elevation_m)
+    # NO WET CELL MOVED, elementwise -- the safety property, on a real bake.
+    np.testing.assert_array_equal(
+        np.isfinite(off.water_surface_m), np.isfinite(on.water_surface_m))
+    wet = np.isfinite(off.water_surface_m)
+    np.testing.assert_array_equal(off.water_surface_m[wet],
+                                  on.water_surface_m[wet])
+    # And the band lands only where the tile is dry.
+    assert not np.any(np.isfinite(on.water_level_m) & wet)
+
+
+def test_baked_band_encodes_and_no_dry_cell_reads_as_water(_real_kernels):
+    """End to end: bake with the band on, encode, decode, and check that the
+    bytes a client receives say exactly what the bake meant.
+
+    The load-bearing assertion is the last one. A dry cell encoding >= 0 is not
+    a rendering glitch; it is water added to every client that reads the tile.
+    """
+    import numpy as np
+
+    from terrain_service import tile_codec as tc
+
+    world, cl, base = _band_bake_consts()
+    c = dataclasses.replace(base, water_level_plane_enabled=True)
+    res = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        climate_fetch=lambda x, y: cl.get((x, y)),
+        kernels=_real_kernels, geom=TEST_GEOM, consts=c)
+
+    n = res.elevation_m.shape[0]
+    blk = max(1, n.bit_length() - 2)
+    data = tc.encode_fine(
+        seed=20260719, x=0, y=0, elevation_m=res.elevation_m,
+        water_surface_m=res.water_surface_m, water_level_m=res.water_level_m,
+        block_log2=blk)
+    back = tc.decode_v2(data)
+    cp = back.water_cp
+    assert cp is not None
+
+    wet = np.isfinite(res.water_surface_m)
+    assert wet.any() and (~wet).any()
+    # THE ONE THAT MATTERS.
+    assert np.all(cp[~wet] < 0), "a dry cell encoded as water"
+    assert np.all(cp[wet] >= 0), "a wet cell encoded as dry"
+    # The band is really on the wire, and it is really the tile's own levels.
+    band = np.isfinite(res.water_level_m)
+    assert band.any()
+    assert np.all((cp[band] >= tc.WATER_LEVEL_MIN_CP)
+                  & (cp[band] <= tc.WATER_LEVEL_MAX_CP))
+    # Off-band dry cells carry the no-level sentinel, not a stale -1.
+    assert np.all(cp[~wet & ~band] == tc.WATER_NO_LEVEL)
+    # And the client's read of a band value lands back on the level the bake
+    # meant, wherever the at-or-above-ground clamp did not bite.
+    ground_mm = np.rint(res.elevation_m * 1000.0).astype(np.int64)
+    got = tc.water_level_mm_from_cp(cp, ground_mm)
+    free = band & (cp < tc.WATER_LEVEL_MAX_CP)
+    if free.any():
+        np.testing.assert_allclose(
+            got[free], np.rint(res.water_level_m[free] * 1000.0), atol=10)
+
+
+def test_band_off_is_byte_identical_to_a_bake_that_never_heard_of_it(
+        _real_kernels):
+    """With the constant off, the encoded tile must be the SAME BYTES as before
+    the band existed -- not merely equivalent.
+
+    This is what "ships OFF by default" has to mean for a change that touches
+    the encoder: the water plane still carries -1 for dry, so every tile already
+    in the cache and every tile baked tomorrow under the default agree.
+    """
+    import numpy as np
+
+    from terrain_service import tile_codec as tc
+
+    world, cl, base = _band_bake_consts()
+    c = base
+    res = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        climate_fetch=lambda x, y: cl.get((x, y)),
+        kernels=_real_kernels, geom=TEST_GEOM, consts=c)
+    assert res.water_level_m is None
+
+    n = res.elevation_m.shape[0]
+    blk = max(1, n.bit_length() - 2)
+    kw = dict(seed=20260719, x=0, y=0, elevation_m=res.elevation_m,
+              water_surface_m=res.water_surface_m, block_log2=blk)
+    assert tc.encode_fine(**kw) == tc.encode_fine(water_level_m=None, **kw)
+    cp = tc.decode_v2(tc.encode_fine(**kw)).water_cp
+    dry = ~np.isfinite(res.water_surface_m)
+    assert np.all(cp[dry] == tc.WATER_DRY_DEPTH), (
+        "the legacy dry sentinel moved with the feature OFF"
+    )
+
+
+def test_the_discharge_budget_refusals_reach_the_band(_real_kernels):
+    """The plumbing the band's one hard rule depends on, end to end.
+
+    The budget runs INSIDE settle_to_adjacent_level, so the pipeline cannot see
+    which cells it stranded from outside; settle has to hand them out. This
+    checks the whole chain -- budget strands cells, dried_out receives exactly
+    those cells, local_water_levels refuses exactly those cells -- because each
+    link is invisible on its own and the failure is silent: the band would look
+    fine and the client would quietly restore water conservation removed.
+    """
+    import numpy as np
+    from terrain_service.bake import flow as bflow
+    from terrain_service.bake import water as w
+
+    # A BOWL, so the settled water cannot simply run off, and a discharge far
+    # too small to fill it. Geometry alone floods the whole basin; conservation
+    # keeps almost none of it, and the difference is the set under test.
+    n = 24
+    c = (n - 1) // 2
+    yy, xx = np.mgrid[0:n, 0:n]
+    z = (((xx - c) ** 2 + (yy - c) ** 2) * 0.01).astype(np.float32)
+    drawn = np.full((n, n), np.nan, np.float32)
+    drawn[c, c] = z[c, c] + 1.0
+
+    dried = np.zeros((n, n), bool)
+    settled, stats = w.settle_to_adjacent_level(
+        drawn, z, min_depth_m=w.WIDEN_MIN_DEPTH_M, max_iter=16,
+        q_m3_yr=np.full((n, n), 50.0), cell_m=1.875, level_smooth_iters=0,
+        dried_out=dried)
+    assert stats["budget_dropped"] > 0.0, "the budget stranded nothing"
+    assert int(dried.sum()) == int(stats["budget_dropped"])
+    # Exactly the cells that went from wet to dry across the budget, no others.
+    assert not np.any(dried & np.isfinite(settled))
+
+    rec, _ = bflow.d8_receivers(z, 1.875)
+    free, free_stats = w.local_water_levels(settled, z, rec)
+    held, held_stats = w.local_water_levels(settled, z, rec, dried=dried)
+
+    # Without the refusal the band covers every stranded cell -- which is the
+    # failure, stated as a measurement rather than asserted away.
+    assert np.all(np.isfinite(free)[dried]), (
+        "the band did not even reach the stranded cells; the test is vacuous"
+    )
+    assert not np.any(np.isfinite(held) & dried), "a stranded cell got a level"
+    assert held_stats["level_band_dried_refused"] == float(int(dried.sum()))
+    assert held_stats["level_band_cells"] < free_stats["level_band_cells"]
+
+
+def test_settle_writes_nothing_to_dried_out_without_a_budget():
+    """No discharge field means no budget, and no budget means no refusals --
+    not a set of cells that the level smoothing or the drain happened to take
+    back. Those are LEVEL decisions and the band already agrees with them."""
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    n = 24
+    c = (n - 1) // 2
+    yy, xx = np.mgrid[0:n, 0:n]
+    z = (((xx - c) ** 2 + (yy - c) ** 2) * 0.01).astype(np.float32)
+    drawn = np.full((n, n), np.nan, np.float32)
+    drawn[c, c] = z[c, c] + 1.0
+
+    dried = np.zeros((n, n), bool)
+    w.settle_to_adjacent_level(
+        drawn, z, min_depth_m=w.WIDEN_MIN_DEPTH_M, max_iter=16, q_m3_yr=None,
+        cell_m=1.875, level_smooth_iters=8, dried_out=dried)
+    assert not dried.any()

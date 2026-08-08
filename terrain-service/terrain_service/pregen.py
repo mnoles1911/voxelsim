@@ -306,6 +306,13 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         # is called with hand-built result objects by tests and by tools outside
         # this module, and a new BakeResult field must not break them.
         "water_surface_m": getattr(result, "water_surface_m", None),
+        # The level band rides in the SAME plane as the depths, so this is not a
+        # second product on the wire -- but it is a second product of the BAKE,
+        # and the guard below treats it as one for exactly the reason the water
+        # plane itself is guarded: a product this dict does not name is dropped
+        # in silence and the tile that comes out is a valid tile of the previous
+        # configuration.
+        "water_level_m": getattr(result, "water_level_m", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #
@@ -359,6 +366,7 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         (("flow", "flow_plane"), result.flow),
         (("basins",), result.basins),
         (("water_surface_m",), getattr(result, "water_surface_m", None)),
+        (("water_level_m",), getattr(result, "water_level_m", None)),
     ):
         if value is None:
             continue          # the bake produced nothing; nothing to lose
@@ -784,6 +792,8 @@ def _run_bake(args, provider, cache: TileCache) -> int:
                 extra["discharge_m3_yr"] = result.discharge_m3_yr
             if result.water_surface_m is not None:
                 extra["water_surface_m"] = result.water_surface_m
+            if getattr(result, "water_level_m", None) is not None:
+                extra["water_level_m"] = result.water_level_m
             np.savez(
                 npz_dir / f"{x}_{y}.npz",
                 elevation_m=result.elevation_m,
