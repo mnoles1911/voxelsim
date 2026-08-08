@@ -844,7 +844,8 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
             break
     if q_m3_yr is not None:
         w, bstats = apply_discharge_budget(w, water_m, z, own, q_m3_yr,
-                                           cell_m=cell_m)
+                                           cell_m=cell_m,
+                                           min_depth_m=min_depth_m)
         budget_stats = bstats
     else:
         budget_stats = {}
@@ -861,6 +862,7 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
 
 
 def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
+                           min_depth_m=WIDEN_MIN_DEPTH_M,
                            q_perennial=Q_PERENNIAL_M3_YR):
     """Hold each channel cell's spread to the water it actually carries.
 
@@ -907,42 +909,93 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
     if n_added == 0:
         return w, stats
 
+    # THE SECTION SOLVE. Conserving a volume must REDISTRIBUTE it, not delete
+    # the surplus: the same water spread wide is shallow. The first version of
+    # this function refused cells past the budget and left the channel's own
+    # level alone, which truncates the spread instead of lowering the surface,
+    # so on a flat floor it could never produce the wide-and-shallow river the
+    # budget was supposed to buy. It also left cells sitting below the water
+    # beside them, because the correct answer to "this ground is under the
+    # waterline" is for the WATERLINE TO FALL and the section to widen.
+    #
+    # So per owner, solve for the level instead. With the owner's cells sorted
+    # by ground ascending, taking the k lowest at level L holds
+    # ``(k*L - S_k) * cell_area`` of water, where S_k is the running sum of
+    # their grounds. Invert it::
+    #
+    #     L_k = (budget / cell_area + S_k) / k
+    #
+    # and the answer is the largest k whose own ground still lies under L_k --
+    # add the next cell up and the water no longer reaches it. One lexsort and
+    # two cumulative sums for the whole tile; no iteration and no tolerance.
     cell_area = float(cell_m) * float(cell_m)
-    idx = np.flatnonzero(added.ravel())
+    flat_w = w.ravel()
+    flat_z = np.asarray(z, np.float32).ravel()
+    cand = np.isfinite(w).ravel()
+    idx = np.flatnonzero(cand)
     owner = np.asarray(own, np.int64).ravel()[idx]
-    depth = (w.ravel()[idx] - np.asarray(z, np.float32).ravel()[idx]).astype(np.float64)
-    depth = np.maximum(depth, 0.0)
-    vol = depth * cell_area
+    # A drawn cell owns itself, so every candidate has an owner; anything that
+    # somehow does not is left exactly as it was rather than guessed at.
+    keep_as_is = owner < 0
+    if keep_as_is.any():
+        idx, owner = idx[~keep_as_is], owner[~keep_as_is]
+    ground = flat_z[idx].astype(np.float64)
 
     qf = np.asarray(q_m3_yr, np.float64).ravel()
-    valid = owner >= 0
-    if not valid.all():
-        idx, owner, depth, vol = idx[valid], owner[valid], depth[valid], vol[valid]
-    q_own = qf[owner]
-    budget = (channel_width_m(q_own, q_perennial)
-              * water_depth_m(q_own, q_perennial)
+    budget = (channel_width_m(qf[owner], q_perennial)
+              * water_depth_m(qf[owner], q_perennial)
               * float(cell_m))
 
-    # Deepest first within each owner, then a running total per owner: the
-    # discrete form of dropping that owner's surface until the section fits.
-    order = np.lexsort((-depth, owner))
-    o_s, v_s, b_s = owner[order], vol[order], budget[order]
+    order = np.lexsort((ground, owner))
+    cells = idx[order]
+    o_s, g_s, b_s = owner[order], ground[order], budget[order]
     start = np.empty(o_s.size, bool)
     start[0] = True
     start[1:] = o_s[1:] != o_s[:-1]
-    run = np.cumsum(v_s)
-    base = np.maximum.accumulate(np.where(start, run - v_s, -np.inf))
-    keep_s = (run - base) <= b_s
-    keep = np.zeros(o_s.size, bool)
-    keep[order] = keep_s
+    heads = np.flatnonzero(start)
+    gid = np.cumsum(start) - 1                          # group index per row
+    pos = np.arange(o_s.size)
+    k = (pos - heads[gid] + 1).astype(np.float64)       # 1-based rank in group
+    csum = np.cumsum(g_s)
+    S_k = csum - (csum - g_s)[heads[gid]]               # running sum of grounds
+    L_k = (b_s / cell_area + S_k) / k
+    ok = L_k >= g_s                                     # water still reaches it
 
-    dropped = idx[~keep]
-    flat = w.ravel()
-    flat[dropped] = np.float32(np.nan)
+    # The section's level is L at the LARGEST k that still holds, and it applies
+    # to every cell in the section -- so take a per-group max and broadcast it
+    # back, rather than a running max, which would give each cell a different
+    # answer depending on where it sits in the sort.
+    sel = np.maximum.reduceat(np.where(ok, pos, -1), heads)[gid]
+    lvl = np.where(sel >= 0, L_k[np.maximum(sel, 0)], -np.inf)
+
+    # NEVER RAISE. graded_water_surface already decided the drawn surface and
+    # guarantees it never rises going downstream; the budget may only take water
+    # AWAY from a section, never add height that guarantee did not sanction.
+    drawn_lvl = flat_w[o_s].astype(np.float64)
+    lvl = np.minimum(lvl, drawn_lvl)
+
+    is_drawn = drawn.ravel()[cells]
+    wetted = (lvl - g_s) >= float(min_depth_m)
+    new_w = np.where(wetted, lvl, np.nan)
+    # A drawn cell is never removed by its own budget: it IS the section the
+    # budget is written against, and a dry drawn channel is what the whole
+    # water plane exists to refuse.
+    keep_drawn = is_drawn & ~wetted
+    new_w[keep_drawn] = flat_w[cells][keep_drawn]
+
+    drop_m = (drawn_lvl - np.where(np.isfinite(new_w), new_w, drawn_lvl))
+    flat_w[cells] = new_w.astype(np.float32)
+
+    kept = int(np.isfinite(new_w).sum())
     stats.update({
-        "budget_kept": float(int(keep.sum())),
-        "budget_dropped": float(int(dropped.size)),
-        "budget_dropped_frac": float(dropped.size / max(n_added, 1)),
+        "budget_sections": float(heads.size),
+        "budget_cells_in": float(cells.size),
+        "budget_cells_kept": float(kept),
+        "budget_dropped": float(cells.size - kept),
+        "budget_level_drop_p50_m": float(np.percentile(drop_m[is_drawn], 50))
+        if is_drawn.any() else 0.0,
+        "budget_level_drop_p90_m": float(np.percentile(drop_m[is_drawn], 90))
+        if is_drawn.any() else 0.0,
     })
     return w, stats
 
