@@ -3320,3 +3320,289 @@ def test_neighbour_consistency_leaves_a_consistent_plane_alone():
     out, stats = w.enforce_neighbour_consistency(water, z)
     np.testing.assert_allclose(out[1, :], water[1, :], atol=1e-6)
     assert stats["level_consistency_lowerings"] == 0.0
+
+
+def _lateral_fixture_two_banks():
+    """A flat reach with a channel and two banks holding DIFFERENT levels.
+
+    The left bank inherited its surface from a channel cell further upstream --
+    which is exactly what ``fill_to_local_surface`` does when two side-by-side
+    cells drain to different receivers -- so it stands 800 mm above the water on
+    the other side of the same river. Both banks are floodplain, not channel.
+    """
+    import numpy as np
+
+    n = 6
+    z = np.full((5, n), 20.0, np.float32)
+    z[2, :] = 10.0          # the bed
+    z[1, :] = 10.3          # left bank
+    z[3, :] = 10.3          # right bank
+    rec = np.full((5, n), -1, np.int64)
+    for x in range(n):
+        rec[1, x] = 2 * n + x          # both banks drain into the channel
+        rec[3, x] = 2 * n + x
+        if x < n - 1:
+            rec[2, x] = 2 * n + x + 1  # the channel runs +x
+    drawn = np.zeros((5, n), bool)
+    drawn[2, :] = True
+    water = np.full((5, n), np.nan, np.float32)
+    water[2, :] = 11.0
+    water[3, :] = 11.0
+    water[1, :] = 11.8                  # perched, from an upstream reach
+    return z, rec, drawn, water
+
+
+def test_lateral_equal_level_levels_two_banks_that_inherited_different_levels():
+    """The defect the rule exists for: one bank perched, the other not.
+
+    Measured motivation, on the shipped bv18 plane of tile (-4,-4) in a 2048^2
+    window: 20.76% of adjacent wet pairs differ by more than one voxel and 61.4%
+    of those pairs drain to DIFFERENT receivers, so no rule enforced along the
+    D8 forest -- which is every level rule in the module -- ever compares them.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    z, rec, drawn, water = _lateral_fixture_two_banks()
+    assert water[1, 2] - water[3, 2] == pytest.approx(0.8)   # the defect exists
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+
+    tol = w.LATERAL_LEVEL_TOL_M
+    # The two banks end level with the channel between them, to the tolerance.
+    for x in range(6):
+        assert np.isfinite(out[1, x])
+        assert out[1, x] <= out[2, x] + tol + 1e-5
+        assert out[3, x] == pytest.approx(11.0)
+    # It LOWERED; it did not raise anything, anywhere.
+    assert out[1, 2] < water[1, 2]
+    fin = np.isfinite(out) & np.isfinite(water)
+    assert np.all(out[fin] <= water[fin] + 1e-6)
+    # And it did not dry the bank: 11.1 still clears 10.3 by well over a voxel.
+    assert stats["lateral_dried_cells"] == 0.0
+    assert stats["lateral_wet_after"] == stats["lateral_wet_before"]
+    assert stats["lateral_lowered_cells"] == 6.0
+    assert stats["lateral_steps_over_tol_after"] == 0.0
+    assert stats["lateral_steps_over_tol_before"] > 0.0
+
+
+def test_lateral_equal_level_does_not_cross_a_genuine_barrier():
+    """Two pools with dry ground between them keep their own levels.
+
+    This is the property that separates the rule from "water finds its level"
+    globally. It only ever compares two cells that are BOTH already wet, so a
+    bar of dry ground is not something it can reach across -- which is why the
+    rule needs no barrier test of its own, and why it cannot join two bodies of
+    water the terrain keeps apart.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    z = np.full((3, 9), 30.0, np.float32)
+    z[1, 1:4] = 10.0        # upper pool floor
+    z[1, 4] = 20.0          # THE BAR -- above both water surfaces
+    z[1, 5:8] = 5.0         # lower pool floor, 5 m down
+    rec = np.full((3, 9), -1, np.int64)
+    drawn = np.zeros((3, 9), bool)
+    water = np.full((3, 9), np.nan, np.float32)
+    water[1, 1:4] = 11.0
+    water[1, 5:8] = 6.0
+    assert z[1, 4] > max(11.0, 6.0)     # it really is a barrier
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+
+    np.testing.assert_allclose(out[1, 1:4], 11.0, atol=1e-6)
+    np.testing.assert_allclose(out[1, 5:8], 6.0, atol=1e-6)
+    assert not np.isfinite(out[1, 4])
+    assert stats["lateral_lowered_cells"] == 0.0
+    assert stats["lateral_steps_over_tol_before"] == 0.0
+    assert stats["lateral_wet_after"] == stats["lateral_wet_before"]
+
+
+def test_lateral_equal_level_leaves_a_descending_river_descending():
+    """A reach falling 300 mm per cell -- three voxels -- must not be flattened.
+
+    This is the failure the tolerance exists to prevent, and it is not
+    hypothetical: at ``tol = 0`` the same rule took the drawn channel's median
+    along-flow step on tile (-4,-4) from 14.5 mm to 0.0 mm. That is
+    ``enforce_neighbour_consistency``'s documented "IT IS NOT WATER FINDS ITS
+    LEVEL" reproduced exactly -- min-propagation is transitive, so without a
+    tolerance it chains the downstream minimum up the whole network.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    m = 12
+    z = np.full((3, m), 30.0, np.float32)
+    z[1, :] = 10.0 - 0.3 * np.arange(m)          # 300 mm per cell
+    rec = np.full((3, m), -1, np.int64)
+    for x in range(m - 1):
+        rec[1, x] = m + x + 1
+    drawn = np.zeros((3, m), bool)
+    drawn[1, :] = True
+    water = np.full((3, m), np.nan, np.float32)
+    water[1, :] = z[1, :] + 0.5
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+
+    np.testing.assert_allclose(out[1, :], water[1, :], atol=1e-6)
+    assert stats["lateral_lowered_cells"] == 0.0
+    assert stats["lateral_dried_cells"] == 0.0
+    assert stats["lateral_sweeps"] == 1.0        # nothing to do, one look
+    # And the descent itself survives, step by step.
+    assert np.all(np.diff(out[1, :]) < 0.0)
+
+
+def test_lateral_equal_level_exemption_is_the_drawn_channel_not_the_forest():
+    """A perched cell that drains into the river is NOT entitled to a gradient.
+
+    The exemption is "both cells carry drawn discharge AND one is the other's
+    receiver". Exempting every along-flow pair instead -- the reading the D8
+    forest invites -- protects the defect, because a bank cell's receiver IS the
+    channel cell beside it. Measured on the crop, that wider exemption leaves
+    3.91% of pairs over one voxel against 0.87% and 9,548 cells dry below
+    adjacent water against 8,367.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    z, rec, drawn, water = _lateral_fixture_two_banks()
+    # The perched bank's receiver is the channel cell directly below it, so the
+    # pair IS along-flow -- and it is still lowered, because the bank carries no
+    # drawn discharge.
+    assert rec[1, 2] == 2 * 6 + 2
+    out, _ = w.equalize_lateral_levels(water, z, rec, drawn)
+    assert out[1, 2] < 11.8, "an along-flow pair off the channel must not be exempt"
+
+    # THE OTHER HALF. A step between two cells that ARE both drawn channel and
+    # ARE consecutive on the flow path is a flowing reach's own surface, and the
+    # rule must leave it exactly alone however large it is. Same geometry, same
+    # 700 mm step, one bit of `drawn` different.
+    n = 6
+    z2 = np.full((3, n), 30.0, np.float32)
+    z2[1, :] = 10.0 - 0.05 * np.arange(n)
+    rec2 = np.full((3, n), -1, np.int64)
+    for x in range(n - 1):
+        rec2[1, x] = n + x + 1
+    water2 = np.full((3, n), np.nan, np.float32)
+    water2[1, :] = z2[1, :] + 0.5
+    water2[1, 2] += 0.7                       # a 700 mm step, both sides
+    drawn2 = np.zeros((3, n), bool)
+
+    off, _ = w.equalize_lateral_levels(water2, z2, rec2, drawn2)
+    assert off[1, 2] < water2[1, 2] - 0.5, "off the channel it must be levelled"
+
+    drawn2[1, :] = True
+    on, stats_on = w.equalize_lateral_levels(water2, z2, rec2, drawn2)
+    np.testing.assert_allclose(on[1, :], water2[1, :], atol=1e-6)
+    assert stats_on["lateral_lowered_cells"] == 0.0
+
+
+def test_lateral_equal_level_is_a_product_constant_that_ships_dark():
+    """Identity coverage, and a flag that cannot be confused with "did not run".
+
+    Both halves have bitten this module. A water constant outside every payload
+    changes written bytes under an unchanged ``fine_provider_id``; and a counter
+    that is ABSENT reads as zero in the per-tile log, which is how the monotone
+    stage reported "mono=0>0" for an entire session while never executing at
+    all. So the pipeline writes ``water_lateral_equal_ran`` in BOTH branches:
+    0.0 means off, 1.0 means the rest of the counters are real.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+    from terrain_service.bake.pipeline import BakeConstants
+
+    c = BakeConstants()
+    assert c.water_lateral_equal_level is False, "must ship dark"
+    assert "water_lateral_equal_level" in BakeConstants.PRODUCT_FIELDS
+    assert "water_lateral_equal_level" not in c.as_payload(), (
+        "it cannot move a height, so it belongs in the PRODUCT half only"
+    )
+
+    z, rec, drawn, water = _lateral_fixture_two_banks()
+    _, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+    assert stats["lateral_equal_ran"] == 1.0
+    # Every counter that could read as "nothing was wrong" is accompanied by the
+    # flag, and the before/after pair is what makes the stage's work visible.
+    for key in ("lateral_steps_over_tol_before", "lateral_steps_over_tol_after",
+                "lateral_lowered_cells", "lateral_dried_cells",
+                "lateral_wet_before", "lateral_wet_after", "lateral_sweeps",
+                "lateral_tol_m"):
+        assert key in stats
+
+
+def test_lateral_equal_level_actually_executes_in_the_bake(_real_kernels):
+    """The stage must RUN, and the log must be able to tell that it did.
+
+    This is the module's own worst bug, not a hypothetical. The monotone stage
+    was guarded by ``locals().get("rec_w") is not None`` with ``del rec_w`` 70
+    lines above, so it never executed in any bake -- while the per-tile log
+    printed ``mono=0>0`` from the stats dict's default and read as "zero
+    violations, nothing to fix". A unit test on the function alone would have
+    passed throughout. So this bakes a real tile both ways and checks the flag
+    in BOTH branches, plus the one invariant the constant claims: it is a
+    PRODUCT constant, so no elevation byte may move.
+    """
+    import dataclasses
+
+    import numpy as np
+
+    world = ramp_world()
+    cl = climate_world(lambda tx, ty: 3000.0)
+
+    def run(**kw):
+        # A low perennial threshold, so this small synthetic tile actually
+        # carries drawn water; at the production threshold it is bone dry and
+        # the test would pass vacuously on an empty plane.
+        c = dataclasses.replace(TEST_CONSTS, water_q_perennial_m3_yr=1.0, **kw)
+        return pipeline.bake_tile(
+            world_seed=20260719, tile_x=0, tile_y=0,
+            coarse_fetch=lambda x, y: world.get((x, y)),
+            climate_fetch=lambda x, y: cl.get((x, y)),
+            kernels=_real_kernels, geom=TEST_GEOM, consts=c)
+
+    off = run()
+    on = run(water_lateral_equal_level=True)
+
+    assert off.stats["water_lateral_equal_ran"] == 0.0
+    assert on.stats["water_lateral_equal_ran"] == 1.0
+    # It did real work on real water -- not a no-op that would make the flag
+    # meaningless.
+    assert on.stats["water_lateral_steps_over_tol_before"] > 0.0
+    assert (on.stats["water_lateral_steps_over_tol_after"]
+            < on.stats["water_lateral_steps_over_tol_before"])
+    assert on.stats["water_lateral_lowered_cells"] > 0.0
+    assert on.stats["water_lateral_wet_after"] <= on.stats["water_lateral_wet_before"]
+
+    # PRODUCT, not payload: the ground is untouched, which is what
+    # tools/verify_water_only_change.py checks on real tiles.
+    np.testing.assert_array_equal(off.elevation_m, on.elevation_m)
+    assert int(np.isfinite(on.water_surface_m).sum()) <= int(
+        np.isfinite(off.water_surface_m).sum())
+
+
+def test_lateral_equal_level_never_wets_a_cell_so_it_cannot_flood():
+    """The 209x flood has no way in: the wet set can only shrink.
+
+    ``fill_to_local_surface`` records a lateral rule that took 317,665 wet cells
+    to 66,546,420. Every lateral rule in this module is measured against that
+    number, and this one is safe for a structural reason rather than a tuned
+    one -- it never assigns a level to a dry cell.
+    """
+    import numpy as np
+    from terrain_service.bake import water as w
+
+    rng = np.random.default_rng(20260808)
+    z = rng.uniform(0.0, 5.0, (48, 48)).astype(np.float32)
+    water = np.where(rng.random((48, 48)) < 0.3,
+                     z + rng.uniform(0.2, 3.0, (48, 48)), np.nan).astype(np.float32)
+    rec = np.full((48, 48), -1, np.int64)
+    drawn = np.zeros((48, 48), bool)
+
+    out, stats = w.equalize_lateral_levels(water, z, rec, drawn)
+    wet_in = np.isfinite(water)
+    wet_out = np.isfinite(out)
+    assert not np.any(wet_out & ~wet_in), "a dry cell was wetted"
+    assert stats["lateral_wet_after"] <= stats["lateral_wet_before"]
+    fin = wet_out & wet_in
+    assert np.all(out[fin] <= water[fin] + 1e-6), "a level was raised"

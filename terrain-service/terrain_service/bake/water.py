@@ -93,6 +93,9 @@ from . import flow as _flow
 
 __all__ = [
     "enforce_neighbour_consistency",
+    "equalize_lateral_levels",
+    "LATERAL_LEVEL_TOL_M",
+    "LATERAL_LEVEL_MAX_ITER",
     "settle_to_adjacent_level",
     "apply_discharge_budget",
     "smooth_level_field",
@@ -1159,8 +1162,13 @@ def smooth_level_field(water_m, z_ground_m, drawn, *, min_depth_m,
     ceiling = (np.asarray(cap, np.float32) if cap is not None
                else np.asarray(water_m, np.float32))
     if np.isnan(ceiling).all():
-        raise ValueError("smooth_level_field: ceiling is empty; nothing would "
-                         "constrain the relaxation and water would climb")
+        # A TILE WITH NO DRAWN WATER IS LEGAL, NOT A BUG. This used to raise,
+        # which would abort a bake on any dry tile -- the guard was written to
+        # catch "the ceiling never got wired up" and could not tell that apart
+        # from "there is genuinely no water here". Nothing to relax, so return
+        # unchanged and say so in the stats rather than taking the bake down.
+        return w, {"level_smooth_iters": 0.0, "level_smooth_dried": 0.0,
+                   "level_smooth_no_water": 1.0}
     fixed = np.zeros(w.shape, bool) if cap is not None else (
         np.asarray(drawn, bool) & np.isfinite(w))
     floor = np.float32(min_depth_m)
@@ -1366,6 +1374,346 @@ def enforce_neighbour_consistency(water_m, z_ground_m, *, max_iter: int = 512):
         "level_consistency_wet_cells": float(wet_idx.size),
     }
     return w, stats
+
+
+# --------------------------------------------------------------------------- level
+
+#: How far two ADJACENT wet cells are allowed to disagree about the water
+#: surface, metres. ONE WIRE LSB (``tile_codec.QUANT_MM`` is 100 mm) and one
+#: client voxel, the same quantity ``WIDEN_MIN_DEPTH_M`` is anchored on. It is
+#: not a smoothing strength: below one voxel the difference cannot be stored,
+#: cannot be drawn, and cannot be the staircase the owner is looking at, so a
+#: rule that chased it would be moving water no one can see.
+#:
+#: IT IS ALSO WHAT KEEPS THE LONG PROFILE. Measured on the crop below, the
+#: median along-flow step between adjacent DRAWN cells is 14.5 mm -- well inside
+#: one voxel -- so at this tolerance the rule cannot propagate a level down a
+#: reach at all. At ``tol = 0`` it can, and does: the drawn channel's median
+#: along-flow drop went 14.5 mm -> 0.0 mm, i.e. the river's own gradient was
+#: erased. That is the failure ``enforce_neighbour_consistency`` documents under
+#: "IT IS NOT WATER FINDS ITS LEVEL", reproduced exactly, and the tolerance is
+#: the thing that prevents it.
+LATERAL_LEVEL_TOL_M = 0.1
+
+#: Sweeps, which BOUNDS THE LATERAL REACH at 8 cells = 15 m, the same bound and
+#: the same argument as ``settle_to_adjacent_level``'s ``max_iter``: a
+#: disagreement that needs more than 15 m of reach to resolve is not a river
+#: cross-section. Measured on the crop below, 8 sweeps against 32 is 0.87%
+#: against 0.34% of pairs left over one voxel, for 0.6% fewer wet cells -- the
+#: bound is not what decides the answer, but note that 8 sweeps IS reached on
+#: real data, so this is a live bound rather than a formality and raising it
+#: would keep working rather than doing nothing.
+LATERAL_LEVEL_MAX_ITER = 8
+
+
+def equalize_lateral_levels(water_m, z_ground_m, receivers, drawn, *,
+                            min_depth_m: float = WIDEN_MIN_DEPTH_M,
+                            tol_m: float = LATERAL_LEVEL_TOL_M,
+                            max_iter: int = LATERAL_LEVEL_MAX_ITER):
+    """Adjacent water that is not the same river reach must stand level. ``(w, stats)``.
+
+    THE DEFECT, in the owner's words, watching the magenta markers in the
+    editor: "on one side of the river, there are magenta blocks climbing up and
+    over the bank and hill - on the other side of the river water there is open
+    air and space that the river should fill to level the basin". Both halves at
+    once, on opposite banks of the same channel.
+
+    WHY THE STAGES ALREADY HERE CANNOT SEE IT. Every level guarantee in this
+    module is enforced ALONG THE D8 RECEIVER FOREST. ``graded_water_surface``
+    grades down it, ``enforce_descent`` descends down it, and
+    ``enforce_upstream_monotone`` re-checks it last. Measured on tile (-4,-4) at
+    bake_ver 18 that last pass finds **zero** violations before it even runs, so
+    the water IS monotone along the flow network while the owner watches it
+    climb a bank. A forest is a set of one-dimensional chains: two cells lying
+    SIDE BY SIDE that drain to DIFFERENT receivers are each perfectly monotone
+    along their own chain and are never compared to one another. They inherit
+    their levels from different channel cells at different stations of the
+    river, so they stand at different heights a couple of metres apart across
+    the same water -- one perched on a bank, the other leaving low ground dry.
+    One mechanism, both symptoms.
+
+    THE MEASUREMENT THAT MOTIVATED IT, on the shipped ``npz-lvl2`` plane, in a
+    2048^2 window centred on the wettest part of tile (-4,-4) -- 63,466 wet
+    cells and 214,901 adjacent wet pairs::
+
+        |dS| between adjacent wet cells   p50 16.8   p90 189.7   p99 667.7 mm
+        pairs over 100 mm (one voxel)     44,622     20.76%
+        pairs over 300 mm                 10,860      5.05%
+
+        of the 44,622 pairs over one voxel:
+            38.6%  are along-flow      (one cell is the other's receiver)
+             9.0%  share a receiver but are not along-flow
+            52.4%  drain to DIFFERENT receivers
+
+    So **61.4% of every visible step is between two cells that the receiver
+    forest never compares**, which is the hypothesis, quantified. Splitting the
+    same 44,622 by whether the drawn channel is involved: 4.2% are
+    channel-to-channel, 14.4% channel-to-floodplain and 81.4% are between two
+    cells that carry no drawn discharge at all.
+
+    THE RULE::
+
+        for every adjacent (8-connected) wet pair (a, b):
+            S[a] <= S[b] + tol_m          unless (a, b) is an ALONG-CHANNEL pair
+
+        ALONG-CHANNEL  <=>  a and b are BOTH drawn channel cells
+                            AND one is the other's D8 receiver
+
+    enforced by LOWERING the higher cell, iterated to a fixed point.
+
+    WHY A BARRIER CANNOT BE THE EXCEPTION, which is the reading the words
+    invite. Between two cells that TOUCH there is nothing to be a barrier except
+    their own beds, and the sill between them is ``max(z[a], z[b])``. Both cells
+    are wet, so ``S[a] > z[a]`` and ``S[b] > z[b]``; if ``S[a] > S[b]`` then
+    ``S[a] > z[b]`` as well, and ``S[a] > z[a]`` always -- the higher water
+    clears the sill whichever bed is higher. **Two adjacent wet cells at
+    different levels are a physical impossibility with no exceptions**, so a
+    barrier test between them would never fire. A barrier is a statement about
+    two pools separated by DRY ground, and this rule never crosses dry ground:
+    it only ever compares two cells that are both already under water. That is
+    what stops it joining pools that terrain keeps apart.
+
+    WHY THE EXCEPTION IS FLOW, AND ONLY ON THE DRAWN CHANNEL. The one thing that
+    entitles adjacent water to a height difference is that it is MOVING: a
+    graded river's surface falls downstream by its own energy slope, and
+    ``graded_water_surface`` computed exactly that fall from ``channel.h``'s
+    laws. A floodplain, bank or backwater cell conveys no drawn discharge -- it
+    is standing water, and standing water is level. Exempting every along-flow
+    pair instead of only the channel ones protects the defect itself, because a
+    perched bank cell drains straight into the river beside it and would be
+    exempt on that basis alone. Measured across the crop, exempting every
+    along-flow pair rather than only the channel ones leaves 3.91% of pairs over
+    one voxel against 0.87%, and 9,548 cells dry below adjacent water against
+    8,367, for 5.1% more water kept -- i.e. it keeps water by keeping it
+    perched, which is the thing being complained about.
+
+    THE EXEMPTION CANNOT FULLY PROTECT THE PROFILE, AND THAT IS MEASURED RATHER
+    THAN HOPED. The drawn channel is 1-2 px wide, so most of a channel cell's
+    neighbours are floodplain, not channel, and those pairs are not exempt: a
+    channel cell standing above the standing water beside it is lowered to it.
+    The effect on the long profile is p90 399 -> 255 mm with the MEDIAN step
+    intact (14.5 -> 14.9 mm) and rises essentially unchanged (0.32% -> 0.35%),
+    so reaches still descend -- the steepest decile is pulled toward the water
+    it is actually touching. Widening the exemption to every drawn-to-drawn pair
+    regardless of flow direction was tried and changes the profile p90 by 0.4 mm,
+    which says the clipping is not coming from channel-to-channel pairs at all
+    and that the wider exemption buys nothing.
+
+    WHAT IT COSTS AND BUYS, measured on the same crop, 8 sweeps, tol one voxel::
+
+                            wet    >100mm  >300mm    p90     p99   dry-below
+        baseline bv18    63,466    20.76%   5.05%  190 mm  668 mm     9,227
+        THIS RULE        54,252     0.87%   0.21%  100 mm  100 mm     8,367
+                         -14.5%      -96%    -96%    -47%    -85%      -9.3%
+
+        its own counter: adjacent pairs over tolerance  44,622 -> 1,580
+        drawn channel long profile   p50 14.5 -> 14.9 mm, p90 399 -> 255 mm,
+                                     rises 0.32% -> 0.35% of steps
+
+    The 1,580 that survive are the exempt along-channel steps and whatever 8
+    sweeps did not reach: 32 sweeps take it to 606 and roughness to 0.34%, for
+    0.6% fewer wet cells. The reach bound is doing a little work, not none, and
+    ``lateral_sweeps`` says so on every tile.
+
+    "dry-below" counts cells standing dry with adjacent water at least one voxel
+    above their own ground -- the owner's second symptom -- and it improves
+    9.3% even though this rule can only ever REMOVE water: a level that stops
+    being perched stops being above the ground next to it. The -14.5% wet is the
+    real cost and it is the same asymmetry
+    ``docs/measurements/water-settling-bv18-2026-08-08.txt`` records for the
+    level relaxation: a cell may be lowered to a neighbour's level but a cell
+    that stops clearing ``min_depth_m`` is gone for good.
+
+    IT CAN NEVER RAISE, so the ceiling ``graded_water_surface`` sanctioned holds
+    by construction rather than by a clamp -- every write is a strict decrease
+    and the function asserts it before returning. That guarantee is not
+    decorative: a missing ceiling on settled cells is what let the relaxation
+    walk water up banks at bake_ver 18, which is the regression this rule exists
+    to finish cleaning up rather than repeat.
+
+    AND IT CANNOT FLOOD. It never wets a dry cell -- the wet set can only
+    shrink, and ``lateral_wet_before``/``lateral_wet_after`` say so on every
+    tile -- so the 209x flood ``fill_to_local_surface`` documents has no way in.
+
+    WHAT IT DELIBERATELY DOES NOT DO
+    --------------------------------
+    * **It does not fill the open air.** The owner's second symptom -- low
+      ground beside the river that should be under water -- is an EXTENT
+      question and ``settle_to_adjacent_level`` owns it. Re-spreading here would
+      undo the discharge budget that ran between them, which is the only bound
+      in this module that is conserved rather than chosen.
+    * **It does not touch the drawn channel's long profile.** Along-channel
+      pairs are exempt and the tolerance is wider than the median along-flow
+      step, so a reach that legitimately descends keeps descending.
+    * **It does not equalise across dry ground.** Two pools with a bar between
+      them stay at their own levels, because the rule only compares wet
+      neighbours.
+    * **It does not raise, ever**, so it cannot answer "there should be more
+      water here". That is the settling stage's job and this one's silence
+      about it is deliberate.
+
+    ``water_m``   metres absolute, NaN dry. Copied; the input is not modified.
+    ``z_ground_m``  the SHIPPED surface, the same array every other extent stage
+    tests against.
+    ``receivers``  ``d8_receivers(z_route, ...)[0]`` -- the SAME forest
+    ``graded_water_surface`` graded along, flat ``y*w + x``, -1 at a root.
+    ``drawn``  the drawn-centreline mask: ``isfinite(graded_water_surface(...))``
+    BEFORE any widening, filling or settling. It is what makes the along-flow
+    exemption a statement about conveyed discharge rather than about the D8
+    forest, and it must be the centreline rather than the final wet mask -- with
+    the final mask every settled cell would claim a river's right to a gradient.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, np.float32)
+    if z.shape != w.shape:
+        raise ValueError(f"water {w.shape} and ground {z.shape} disagree")
+    dr = np.ascontiguousarray(drawn, bool)
+    if dr.shape != w.shape:
+        raise ValueError(f"drawn {dr.shape} and water {w.shape} disagree")
+    rec = np.asarray(receivers, np.int64).reshape(w.shape)
+
+    tol = np.float32(tol_m)
+    floor = np.float32(min_depth_m)
+    wet_before = int(np.isfinite(w).sum())
+
+    # THE RECEIVER LINK AS A DIRECTION, not an index, and as one uint8 plane.
+    # `rec` is a flat index, so answering "is my receiver the neighbour at
+    # (dy, dx)" from it directly costs an int64 grid the size of the domain --
+    # 680 MB at the padded production size, on top of a stage that already
+    # complains about 340 MB temporaries. Reduced once to the direction each
+    # cell flows in, the same question is a uint8 compare and the shifted copy
+    # is 85 MB.
+    code = _receiver_dir_code(rec, w.shape)
+
+    before = _lateral_step_count(w, float(tol_m))
+    lowered = np.zeros(w.shape, bool)
+    drop = np.zeros(w.shape, np.float64)
+    dried = 0
+    sweeps = 0
+    for sweeps in range(1, int(max_iter) + 1):
+        lvl = np.where(np.isfinite(w), w, np.float32(np.inf)).astype(np.float32)
+        best = np.full(w.shape, np.float32(np.inf), np.float32)
+        for k, (dy, dx) in enumerate(_LATERAL_NB):
+            # ALONG-CHANNEL, and therefore entitled to a gradient: both cells
+            # carry drawn discharge and one flows straight into the other.
+            # `code == k` is "my receiver is that neighbour"; the shifted
+            # compare against the OPPOSITE direction is "that neighbour's
+            # receiver is me".
+            exempt = (
+                dr & _shift2(dr, dy, dx, False)
+                & ((code == np.uint8(k))
+                   | (_shift2(code, dy, dx, np.uint8(8)) == np.uint8(_LATERAL_OPP[k])))
+            )
+            cand = _shift2(lvl, dy, dx, np.float32(np.inf)) + tol
+            best = np.minimum(best, np.where(exempt, np.float32(np.inf), cand))
+        hit = np.isfinite(w) & np.isfinite(best) & (best < w - 1e-6)
+        if not hit.any():
+            break
+        drop[hit] += (w[hit] - best[hit]).astype(np.float64)
+        w[hit] = best[hit]
+        lowered |= hit
+        # A cell that no longer clears its own bed by one voxel is gone. That is
+        # the honest consequence and not a side effect: the water that was
+        # standing there was only standing there because it was perched.
+        gone = hit & ((w - z) < floor)
+        if gone.any():
+            dried += int(gone.sum())
+            w[gone] = np.float32(np.nan)
+
+    # THE GUARANTEE, CHECKED RATHER THAN CLAIMED. Every write above is a strict
+    # decrease, so no cell may end above the surface it came in with -- which is
+    # what keeps `graded_water_surface`'s ceiling and what a ceiling bug already
+    # broke once on this branch.
+    w_in = np.asarray(water_m, np.float32)
+    both = np.isfinite(w) & np.isfinite(w_in)
+    if both.any() and bool((w[both] > w_in[both] + 1e-6).any()):
+        raise AssertionError(
+            "equalize_lateral_levels raised a water level; it may only lower")
+
+    d = drop[lowered]
+    return w, {
+        # 1.0 says THIS STAGE RAN. Absent-stat zeros have twice been read as
+        # "nothing to fix" when the truth was "never executed" -- see the
+        # locals() guard note at the monotone stage in pipeline.py -- so the
+        # flag is written by the caller in BOTH branches and every counter
+        # below exists only when it is 1.0.
+        "lateral_equal_ran": 1.0,
+        "lateral_tol_m": float(tol_m),
+        "lateral_sweeps": float(sweeps),
+        "lateral_steps_over_tol_before": float(before),
+        "lateral_steps_over_tol_after": float(_lateral_step_count(w, float(tol_m))),
+        "lateral_lowered_cells": float(int(lowered.sum())),
+        "lateral_dried_cells": float(dried),
+        "lateral_wet_before": float(wet_before),
+        "lateral_wet_after": float(int(np.isfinite(w).sum())),
+        "lateral_drop_p50_m": float(np.percentile(d, 50)) if d.size else 0.0,
+        "lateral_drop_p90_m": float(np.percentile(d, 90)) if d.size else 0.0,
+        "lateral_drop_max_m": float(d.max()) if d.size else 0.0,
+    }
+
+
+#: The 8-neighbourhood, in a FIXED order, because ``_receiver_dir_code`` stores
+#: an index into it on every cell of the domain and the two must agree.
+_LATERAL_NB = ((0, 1), (0, -1), (1, 0), (-1, 0),
+               (1, 1), (1, -1), (-1, 1), (-1, -1))
+#: ``_LATERAL_OPP[k]`` is the index of ``-_LATERAL_NB[k]``: the direction that
+#: points back. 8 (no receiver) has no opposite and is never looked up.
+_LATERAL_OPP = tuple(_LATERAL_NB.index((-dy, -dx)) for dy, dx in _LATERAL_NB)
+
+
+def _receiver_dir_code(rec, shape):
+    """Which of ``_LATERAL_NB`` each cell's D8 receiver is; 8 where there is none.
+
+    IN ROW BANDS, and that is the whole reason this is a function. The direct
+    expression is ``rec - arange(n)``, which materialises an int64 grid the size
+    of the padded domain -- 680 MB at production, inside the bake's peak stage,
+    for a quantity that compresses to one byte a cell. The band is sized by
+    cells rather than rows so a narrow test grid and an 9216^2 bake both cost
+    about the same temporary.
+
+    A root (``rec < 0``) is written 8 last, after the direction scan, so a
+    negative index cannot alias onto a real offset and invent a flow link that
+    does not exist.
+    """
+    h, wd = shape
+    r = np.asarray(rec, np.int64).reshape(h, wd)
+    code = np.full((h, wd), np.uint8(8))
+    band = max(1, int(4_000_000 // max(wd, 1)))
+    for y0 in range(0, h, band):
+        y1 = min(y0 + band, h)
+        base = (np.arange(y0, y1, dtype=np.int64)[:, None] * wd
+                + np.arange(wd, dtype=np.int64)[None, :])
+        step = r[y0:y1] - base
+        blk = code[y0:y1]
+        for k, (dy, dx) in enumerate(_LATERAL_NB):
+            blk[step == (dy * wd + dx)] = np.uint8(k)
+        blk[r[y0:y1] < 0] = np.uint8(8)
+    return code
+
+
+#: Slack in the before/after counter, metres. 0.1 mm -- a thousandth of the
+#: wire LSB, and it exists for a float32 reason rather than a physical one: a
+#: cell written as ``neighbour + 0.1`` comes back 0.10000038 apart in float32,
+#: so a counter testing ``> 0.1`` exactly would report every cell the rule just
+#: FIXED as still broken. That is a stat that reads as "the stage did nothing",
+#: which is the specific class of false conclusion this module has already
+#: drawn twice.
+_LATERAL_COUNT_EPS_M = 1e-4
+
+
+def _lateral_step_count(w, tol_m: float) -> int:
+    """Adjacent wet pairs whose surfaces differ by more than ``tol_m``.
+
+    Four offsets, not eight: an unordered pair counted twice would double the
+    number and make the before/after ratio right for the wrong reason.
+    """
+    bar = np.float32(float(tol_m) + _LATERAL_COUNT_EPS_M)
+    total = 0
+    for dy, dx in ((0, 1), (1, 0), (1, 1), (1, -1)):
+        nb = _shift2(w, dy, dx, np.float32(np.nan))
+        d = np.abs(w - nb)
+        total += int((d > bar).sum())   # NaN compares False
+    return total
 
 
 def _shift2(a, dy, dx, fill):

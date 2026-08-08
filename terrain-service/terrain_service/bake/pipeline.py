@@ -1315,6 +1315,28 @@ class BakeConstants:
     #: after every stage that can break it. See enforce_upstream_monotone.
     water_enforce_upstream_monotone: bool = True
 
+    #: Two adjacent wet cells that are not the same flowing reach must stand at
+    #: the same level, to within one wire LSB. See
+    #: ``water.equalize_lateral_levels``.
+    #:
+    #: WHY IT IS NEEDED AT ALL, given the monotone rule above says the water is
+    #: already monotone. Every level guarantee in the water module is enforced
+    #: ALONG THE D8 RECEIVER FOREST, and a forest is a set of one-dimensional
+    #: chains -- two cells side by side that drain to DIFFERENT receivers are
+    #: each monotone along their own chain and are never compared. Measured on
+    #: the shipped bv18 plane, tile (-4,-4), 2048^2 window: 20.76% of adjacent
+    #: wet pairs differ by more than one voxel, and 61.4% of those pairs are
+    #: ones the forest never compares. That is the owner's "magenta blocks
+    #: climbing up and over the bank" on one side of a river with open air on
+    #: the other, in one mechanism.
+    #:
+    #: OFF UNTIL THE OWNER HAS SEEN IT. The rule only ever LOWERS water, and on
+    #: the measured crop it costs 14.5% of the wet cells to take the over-one-
+    #: voxel steps from 20.76% to 0.87% and the cells lying dry below adjacent
+    #: water from 9,227 to 8,367. He has previously said more water looked
+    #: better, so the trade is his to make and this ships dark.
+    water_lateral_equal_level: bool = False
+
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
     #:
@@ -1535,6 +1557,7 @@ class BakeConstants:
         "water_settle_discharge_budget",
         "water_level_smooth_iters",
         "water_enforce_upstream_monotone",
+        "water_lateral_equal_level",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -4966,6 +4989,40 @@ def bake_tile(
             w_pad, lvl_stats = _water.enforce_neighbour_consistency(
                 w_pad, out["z"])
             width_stats.update(lvl_stats)
+
+        # WATER STANDS LEVEL ACROSS A CHANNEL, not only down it. Everything
+        # above this line -- the grading, the descent, the consistency pass and
+        # the monotone re-check below -- reasons along the D8 RECEIVER FOREST,
+        # and two cells side by side that drain to different receivers are
+        # never compared by any of them. Measured on the shipped bv18 plane
+        # that is 61.4% of every adjacent-pair step over one voxel. See
+        # `water.equalize_lateral_levels`.
+        #
+        # AFTER the consistency pass, because that one is the exact answer in a
+        # single ground-ordered sweep and re-running it is free of value; and
+        # BEFORE the monotone rule, which its own docstring says must be last
+        # and must assume nothing.
+        #
+        # IT CAN BREAK FACE CONTACT, the same tension the monotone rule below
+        # already carries and for the same reason: `bridge_to_face_contact`
+        # RAISES a cell to reach its neighbours' beds and this lowers cells to
+        # match their neighbours' surfaces. `water_contact_face_broken` in the
+        # per-tile log is where that shows up, and it is the number to read
+        # before deciding whether the bridge still earns its place.
+        #
+        # THE FLAG IS WRITTEN IN BOTH BRANCHES ON PURPOSE. A counter that is
+        # absent reads as zero in the per-tile log, and "zero violations" has
+        # twice in this module's history meant "the stage never executed" --
+        # see the locals() guard note at the monotone stage below. 0.0 here
+        # means OFF; 1.0 means it ran and the rest of the lateral_* counters
+        # are real.
+        if consts.water_lateral_equal_level:
+            w_pad, lat_stats = _water.equalize_lateral_levels(
+                w_pad, out["z"], rec_w, centreline_pad,
+                min_depth_m=_water.WIDEN_MIN_DEPTH_M)
+            width_stats.update(lat_stats)
+        else:
+            width_stats["lateral_equal_ran"] = 0.0
 
         # THE HARD RULE, LAST, ASSUMING NOTHING. No water may stand above its
         # own upstream water. graded_water_surface established this and every
