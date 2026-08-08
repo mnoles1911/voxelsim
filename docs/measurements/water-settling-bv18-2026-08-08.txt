@@ -84,3 +84,44 @@ them AND able to drain away downhill, which says the drawn channel is not
 always on the lowest ground -- the owner's own diagnosis, "it solves on a
 different surface than we draw". That is a routing change, not an extent one,
 and it is the next thing.
+
+
+=============================================================================
+CONFIGURATION SWEEP AFTER THE CEILING FIX. Tile (-4,-4), 2026-08-08.
+
+The ceiling bug (settled cells had no ceiling, so relaxation walked them up
+banks) is fixed: the cap is now the level each cell SETTLED at. That changed the
+trade materially, so all three candidate configurations were re-measured.
+
+                              wet   vs base   dry-below   >1vox    p90
+  baseline bv17           364,354      --      161,082    17.4%   338 mm
+  lean: settle+drain only 419,967   +15.3%     123,717    21.2%   421 mm
+  budget + smooth 4       316,926   -13.0%     121,693    23.7%   285 mm
+  budget + smooth 12      261,803   -28.1%      97,518    13.8%   147 mm  <- default
+
+SMOOTH 4 IS WORSE THAN BOTH ENDS on roughness (23.7% against 21.2% and 13.8%).
+The trade is NOT monotonic, so "split the difference" is not available and the
+choice is genuinely binary: lean for volume, smooth 12 for quality.
+
+WHY SMOOTH 12 IS THE DEFAULT DESPITE BEING THE DRIEST, and this is the part the
+raw wet count hides. The owner's complaint was not "there is too little water",
+it was "the water is not filling the lower spots where we expect it, while
+climbing the bank on the other side". The metric for THAT is dry-below -- ground
+lying under the water beside it -- and smooth 12 has the best figure by a wide
+margin: 97,518 against a 161,082 baseline, down 39%. It carries less water
+overall because it stops putting water where water would not stand, and fills
+more of the places that should be wet. Roughness is also 13.8% against a 17.4%
+baseline with p90 down from 338 to 147 mm, so the staircase improves at the same
+time.
+
+The -28% wet is still a real cost and remains the open risk: it is the one thing
+made worse, and the owner has previously said more water looked better. If it
+reads as too dry in the editor, `lean` is the fallback and it is one constant
+away (water_settle_discharge_budget=False, water_level_smooth_iters=0).
+
+THE HARD RULE reports mono=0>0 -- ZERO violations before it even runs, on every
+configuration above. The drawn water is already monotone along the D8 receiver
+forest while the owner watches it climb terrain in the editor, so the climbing
+is NOT a bake-ordering bug. Prime suspect: the water plane is decided against
+the baked 1.875 m ground, and the player sees the AMPLIFIED surface carrying
+10 cm relief the plane cannot know about. Untested.
