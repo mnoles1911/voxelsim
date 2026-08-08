@@ -1307,6 +1307,10 @@ class BakeConstants:
     #: down the river as the watershed does, which is the only bound here that
     #: is conserved rather than chosen. See water.apply_discharge_budget.
     water_settle_discharge_budget: bool = True
+    #: Relax the settled water surface with the drawn channel held fixed, so the
+    #: floodplain is a smooth interpolation of the river rather than a mosaic of
+    #: inherited levels. See water.smooth_level_field.
+    water_level_smooth_iters: int = 12
 
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
@@ -1526,6 +1530,7 @@ class BakeConstants:
         "water_settle_to_level",
         "water_settle_max_iter",
         "water_settle_discharge_budget",
+        "water_level_smooth_iters",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -4950,7 +4955,8 @@ def bake_tile(
                 max_iter=int(consts.water_settle_max_iter),
                 q_m3_yr=(q_pad if consts.water_settle_discharge_budget
                          else None),
-                cell_m=geom.fine_pixel_m)
+                cell_m=geom.fine_pixel_m,
+                level_smooth_iters=int(consts.water_level_smooth_iters))
             width_stats.update(settle_stats)
 
         if consts.water_level_neighbour_consistency:
