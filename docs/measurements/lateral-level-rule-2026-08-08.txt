@@ -1,0 +1,75 @@
+THE LATERAL EQUAL-LEVEL RULE -- why water climbed one bank while the other side
+stood dry. Tile (-4,-4), npz-lvl2 replayed offline, 2048 px window on the
+wettest region: 63,466 wet cells, 214,901 adjacent wet pairs. 2026-08-08.
+
+THE OWNER, in game: "on one side of the river, there are magenta blocks climbing
+up and over the bank and hill - on the other side of the river water there is
+open air and space that the river should fill to level the basin."
+
+WHY NO EXISTING RULE CAUGHT IT. Every monotonicity rule in this module compares
+a cell to its UPSTREAM neighbour along the D8 receiver forest.
+`enforce_upstream_monotone` measures ZERO violations on real tiles and it is
+telling the truth -- verified with a planted violation (before=1, after=0). But
+two cells lying SIDE BY SIDE that drain to DIFFERENT receivers are never
+compared by any of them. Each is perfectly monotone along its own chain while
+standing at a different height a few metres across the same channel.
+
+MEASURED, adjacent wet pairs, |difference in water surface|:
+  p50 16.8   p90 189.7   p99 667.7   max 2,642 mm
+  over 100 mm (one voxel): 44,622 = 20.76%
+  over 300 mm            : 10,860 =  5.05%
+
+ATTRIBUTION of those 44,622 steps:
+  along-flow (one is the other's receiver)      38.6%
+  same receiver, not along-flow                  9.0%
+  DIFFERENT RECEIVERS                           52.4%
+So 61.4% of every visible step is between cells no D8-forest rule compares.
+By membership: 4.2% channel-channel, 14.4% channel-floodplain,
+81.4% FLOODPLAIN-FLOODPLAIN -- the collar, not the river.
+
+For scale: the along-flow drop between adjacent DRAWN cells is p50 14.5 mm, one
+seventh of a voxel. The legitimate river gradient is far below the artifact,
+which is what makes a one-voxel tolerance safe.
+
+THE RULE. For every 8-connected adjacent wet pair, S[a] <= S[b] + 100 mm (the
+wire LSB), enforced by LOWERING ONLY, 8 sweeps, EXCEPT along-channel pairs --
+both cells drawn AND one is the other's receiver.
+
+TWO FINDINGS THAT SHAPED IT:
+ * A BARRIER BETWEEN TWO ADJACENT WET CELLS IS IMPOSSIBLE. The sill between
+   neighbours is max(z[a],z[b]) and the higher water always clears it. So the
+   barrier idea applies to DRY ground, and the rule gets it for free by only
+   ever comparing two already-wet cells: it never crosses dry ground, so it
+   cannot join pools the terrain keeps apart.
+ * THE EXEMPTION MUST BE THE DRAWN CHANNEL, NOT THE FOREST. A perched bank
+   cell's receiver IS the river beside it, so exempting all along-flow pairs
+   protects the very defect being fixed: 3.91% residual against 0.87%, and
+   9,548 dry-below against 8,367.
+
+EFFECT (8 sweeps, tol one voxel):
+  wet                63,466 -> 54,252   (-14.5%)
+  steps over 100 mm   20.76% -> 0.87%
+  steps over 300 mm    5.05% -> 0.21%
+  p99 step            668 mm -> 100 mm
+  dry-below-by-a-voxel 9,227 -> 8,367   (-9.3%)
+  long profile        p50 14.5 -> 14.9 mm, p90 399 -> 255 mm
+It never raises a level (asserted before return) and never wets a dry cell, so
+the ceiling guarantee and the 209x flood bound both hold structurally rather
+than by tuning.
+
+CAVEATS, recorded rather than smoothed over:
+ * Receivers are NOT in the npz -- `flow` is the packed accumulation/flag plane,
+   not a direction. The attribution above recomputes a D8 forest on the shipped
+   post-B5 elevation while the bake routes on the PRE-B5 surface. Direction and
+   magnitude are not in doubt; the exact 61.4% could move a few points.
+ * The 8-sweep bound is LIVE, not slack: 32 sweeps takes the residual from 1,580
+   to 606 pairs for 0.6% fewer wet cells. 8 matches settle_to_adjacent_level's
+   documented 15 m reach. A real trade, not a formality.
+ * -14.5% wet is the owner's call. This rule only ever removes water, and he has
+   said more water looked better.
+ * Not yet measured end-to-end on a real bake -- everything above is the shipped
+   plane replayed offline.
+
+Ships OFF (water_lateral_equal_level=False), identity-covered, counters written
+in BOTH branches so "off" and "ran and found nothing" cannot read alike -- that
+confusion has produced two false conclusions in this session already.
