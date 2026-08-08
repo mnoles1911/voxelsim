@@ -761,7 +761,8 @@ SLOPE_EXTENT_MAX = 8.0
 
 def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
                              max_iter: int = 8, q_m3_yr=None,
-                             cell_m: float = 1.875):
+                             cell_m: float = 1.875,
+                             budget_smooth_iter: int = 4):
     """Let water spread sideways onto ground that lies BELOW it. ``(w, stats)``.
 
     THE DEFECT, measured on tile (-4,-4) at bake_ver 17 against the bake's own
@@ -845,7 +846,8 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
     if q_m3_yr is not None:
         w, bstats = apply_discharge_budget(w, water_m, z, own, q_m3_yr,
                                            cell_m=cell_m,
-                                           min_depth_m=min_depth_m)
+                                           min_depth_m=min_depth_m,
+                                           smooth_iter=int(budget_smooth_iter))
         budget_stats = bstats
     else:
         budget_stats = {}
@@ -862,7 +864,7 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
 
 
 def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
-                           min_depth_m=WIDEN_MIN_DEPTH_M,
+                           min_depth_m=WIDEN_MIN_DEPTH_M, smooth_iter: int = 4,
                            q_perennial=Q_PERENNIAL_M3_YR):
     """Hold each channel cell's spread to the water it actually carries.
 
@@ -973,6 +975,37 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
     # AWAY from a section, never add height that guarantee did not sanction.
     drawn_lvl = flat_w[o_s].astype(np.float64)
     lvl = np.minimum(lvl, drawn_lvl)
+
+    # SMOOTH THE DROP ALONG THE RIVER. Solving each section in isolation
+    # doubled the drawn surface's roughness (17.4% -> 36.1% of adjacent wet
+    # pairs differing by more than one voxel): two neighbouring cells owned by
+    # different channel cells settled at different levels and the water stepped
+    # between them, which is the "manmade magenta staircase" complaint exactly.
+    #
+    # The sections are not independent. They are a CHAIN down the river,
+    # carrying a surface graded_water_surface already made descend smoothly, so
+    # what has to stay smooth is not the level -- that legitimately falls
+    # downstream -- but the DROP this budget applies to it. Averaging the drop
+    # over neighbouring channel cells is a diffusion along that chain, since the
+    # drawn channel is a thin connected curve; the level then keeps its own
+    # gradient and only the correction is continuous.
+    if smooth_iter > 0:
+        drop_field = np.full(w.size, np.nan)
+        drop_field[o_s] = drawn_lvl - lvl
+        drop2 = drop_field.reshape(w.shape)
+        for _ in range(int(smooth_iter)):
+            acc = np.where(np.isfinite(drop2), drop2, 0.0)
+            cnt = np.isfinite(drop2).astype(np.float64)
+            tot = acc.copy()
+            num = cnt.copy()
+            for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                tot += _shift2(acc, dy, dx, 0.0)
+                num += _shift2(cnt, dy, dx, 0.0)
+            sm = np.where(num > 0, tot / np.maximum(num, 1.0), np.nan)
+            drop2 = np.where(np.isfinite(drop2), sm, np.nan)
+        lvl = drawn_lvl - np.maximum(drop2.ravel()[o_s], 0.0)
+        lvl = np.minimum(lvl, drawn_lvl)
 
     is_drawn = drawn.ravel()[cells]
     wetted = (lvl - g_s) >= float(min_depth_m)
