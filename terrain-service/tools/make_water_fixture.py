@@ -125,7 +125,13 @@ def main() -> int:
     cp_true = cp.copy()   # before the deliberate zero-depth poke below
 
     # -- the properties this fixture exists to carry, asserted before writing --
-    wet = cp != tc.WATER_DRY_DEPTH
+    # WETNESS IS `>= 0`, NOT `!= -1`. Identical today, because this fixture is
+    # built without a level band and the encoder then emits only -1 and depths.
+    # It stops being identical the moment anything hands this generator a plane
+    # carrying levels: -1 is no longer the only negative (see
+    # tile_codec.WATER_NO_LEVEL), and a level of -30000 would be classified WET
+    # here and blow the depth_err assert below with a nonsense number.
+    wet = cp >= 0
     assert wet.any() and (~wet).any(), "need both wet and dry cells"
     assert (cp[:, 256:] == tc.WATER_DRY_DEPTH).all(), "the right half must be dry"
     # The sentinel must sit ON a block boundary, both sides.

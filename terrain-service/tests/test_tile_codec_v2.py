@@ -961,3 +961,196 @@ def test_v2_zstd_fixture_decodes_with_the_real_zstd_decoder():
     assert tile.codec == tc.CODEC_ZSTD
     raw = tc.decode_v2(FIXTURE_PATH.read_bytes())
     np.testing.assert_array_equal(tile.elevation_cp, raw.elevation_cp)
+
+
+# ---------------------------------------------------------------------------
+# THE LEVEL BAND (tile_codec.WATER_NO_LEVEL): a water LEVEL for DRY cells.
+#
+# The band puts values in -32767..-2 into the SAME int16 plane that already
+# carries depths, relying on the fact that every reader tests "< 0" for dry. So
+# the two things these tests have to hold are (a) the plane still round-trips
+# bit for bit through the block codec with those values in it, and (b) turning
+# the band on cannot move a single WET cell -- which is the entire safety
+# argument, and the only reason the band is allowed to share the plane.
+# ---------------------------------------------------------------------------
+
+
+def _band_planes(size: int, block_log2: int):
+    """(water_m, ground_m, level_m): one MIXED block carrying wet, band and
+    sentinel together, and one block left entirely at NO_LEVEL."""
+    bs = 1 << block_log2
+    ground = np.full((size, size), 100.0)
+    water = np.full((size, size), np.nan)
+    level = np.full((size, size), np.nan)
+    # Block (0,0): a river down the middle in a V-shaped valley, a band on both
+    # banks, sentinel elsewhere -- the MIXED case.
+    ground[0:bs, 0:bs] = 100.0 + np.abs(np.arange(bs) - bs // 2)[None, :] * 0.05
+    mid = slice(bs // 2 - 2, bs // 2 + 3)
+    water[0:bs, mid] = 100.35
+    for dx in range(3, 14):
+        for col in (bs // 2 - dx, bs // 2 + dx):
+            level[0:bs, col] = 100.35
+    # Block (1,1) is untouched: an all-NO_LEVEL block, which is the case a
+    # decoder is most likely to get wrong, because const_cp is a signed i16
+    # field sitting at exactly its minimum.
+    return water, ground, level
+
+
+def test_level_band_round_trips_through_the_codec():
+    """Negative band values, an all-INT16_MIN CONSTANT block and a mixed block
+    all survive encode -> decode unchanged."""
+    size, block_log2 = 512, 8
+    water, ground, level = _band_planes(size, block_log2)
+    cp = tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM,
+                                       level_m=level)
+    assert cp.dtype == np.int16
+    # All three populations are present, or this test is vacuous.
+    assert (cp >= 0).any(), "no wet cells"
+    assert ((cp >= tc.WATER_LEVEL_MIN_CP) & (cp <= tc.WATER_LEVEL_MAX_CP)).any()
+    assert (cp == tc.WATER_NO_LEVEL).any()
+    bs = 1 << block_log2
+    assert np.all(cp[bs:2 * bs, bs:2 * bs] == tc.WATER_NO_LEVEL)
+
+    elev = np.zeros((size, size), np.int16)
+    tile = tc.TileV2(seed=1, x=0, y=0, size=size, elevation_cp=elev,
+                     block_log2=block_log2, water_cp=cp)
+    back = tc.decode_v2(tc.encode_v2(tile))
+    np.testing.assert_array_equal(back.water_cp, cp)
+
+    # And the all-sentinel block really is CONSTANT at INT16_MIN, rather than a
+    # coded block that happens to decode right: const_cp is the one i16 field on
+    # the wire that has to carry -32768 now, and MODE_CONSTANT is the only path
+    # that puts a plane value there.
+    idx, _ = tc._encode_plane(cp.astype(np.int64), block_log2=block_log2,
+                              codec=tc.CODEC_RAW, elem_dtype="<i2")
+    nb = size >> block_log2
+    entry = tc._BLOCK_ENTRY.unpack_from(idx, (1 * nb + 1) * tc._BLOCK_ENTRY.size)
+    assert entry[2] == tc.MODE_CONSTANT
+    assert entry[3] == tc.WATER_NO_LEVEL == -32768
+    assert entry[1] == 0, "a CONSTANT block must own no data bytes"
+
+
+@pytest.mark.skipif(not tc.HAVE_ZSTD, reason="zstandard not installed")
+def test_level_band_round_trips_under_zstd():
+    """Same plane, the codec that actually ships. INT16_MIN is the value most
+    likely to be mangled by a byte-width or sign mistake, and CODEC_ZSTD is the
+    path with the most of both."""
+    size, block_log2 = 512, 8
+    water, ground, level = _band_planes(size, block_log2)
+    cp = tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM,
+                                       level_m=level)
+    tile = tc.TileV2(seed=1, x=0, y=0, size=size,
+                     elevation_cp=np.zeros((size, size), np.int16),
+                     block_log2=block_log2, codec=tc.CODEC_ZSTD, water_cp=cp)
+    back = tc.decode_v2(tc.encode_v2(tile))
+    np.testing.assert_array_equal(back.water_cp, cp)
+
+
+def test_band_leaves_the_wet_set_bit_identical():
+    """THE SAFETY PROPERTY. Turning the band on may not move one wet cell.
+
+    This is why the band is allowed to live in the depth plane at all: a value
+    in -32767..-2 reads as dry through every "< 0" test that exists, so an old
+    client behaves EXACTLY as it did. That claim is worthless if the encoder
+    also perturbs the depths while it is in there, so the two planes are
+    compared elementwise on the wet set rather than statistically.
+    """
+    size, block_log2 = 512, 8
+    water, ground, level = _band_planes(size, block_log2)
+    off = tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM)
+    on = tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM,
+                                       level_m=level)
+    wet = np.isfinite(water)
+    assert wet.any()
+    np.testing.assert_array_equal(on[wet], off[wet])
+    # OFF is byte-for-byte the legacy plane: dry is -1 and nothing else.
+    assert set(np.unique(off[~wet]).tolist()) == {tc.WATER_DRY_DEPTH}
+    # ON, every dry cell is either a band value or the no-level sentinel, and
+    # never anything a client could read as depth.
+    d = on[~wet]
+    assert np.all((d == tc.WATER_NO_LEVEL)
+                  | ((d >= tc.WATER_LEVEL_MIN_CP) & (d <= tc.WATER_LEVEL_MAX_CP)))
+    # Passing no level at all is bit-identical to not passing the argument.
+    none = tc.water_depth_control_points(
+        water, ground, 0, tc.QUANT_100MM, level_m=None)
+    np.testing.assert_array_equal(none, off)
+
+
+def test_no_dry_cell_ever_encodes_non_negative():
+    """A positive value at a dry cell adds water to every client, silently and
+    forever. The encoder clamps at WATER_LEVEL_MAX_CP rather than trusting the
+    producer, and re-checks the finished plane before returning it.
+
+    A level ABOVE its cell's ground is a legal state, not a bug: the lateral
+    fill refuses a cell for want of min_depth_m, and the discharge budget
+    strands cells the geometry alone would have flooded. So the encoder cannot
+    reject them -- it has to represent them as "no water at this ground".
+    """
+    size = 256
+    ground = np.zeros((size, size))
+    water = np.full((size, size), np.nan)     # everything dry
+    # Levels from 10 m BELOW the ground to 10 m ABOVE it.
+    level = np.linspace(-10.0, 10.0, size)[None, :].repeat(size, 0)
+    cp = tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM,
+                                       level_m=level)
+    assert (cp < 0).all(), "a dry cell encoded as water"
+    assert cp.max() == tc.WATER_LEVEL_MAX_CP, "the clamp did not bite"
+    # The FLOOR is the int16 range, not the band width. See WATER_LEVEL_MIN_CP:
+    # clamping to the band width would RAISE a level, and raising a level adds
+    # water on exactly the cliff pixels the dilated predicate admits.
+    assert cp.min() == -1000, "a level 10 m down must survive as -1000"
+    # Reconstruction is the client's own arithmetic, and it must land back on
+    # the level it was given wherever the clamp did not bite.
+    got = tc.water_level_mm_from_cp(cp, np.zeros((size, size), np.int64))
+    free = cp < tc.WATER_LEVEL_MAX_CP
+    np.testing.assert_allclose(got[free], np.rint(level * 1000.0)[free], atol=5)
+
+
+def test_encoder_refuses_a_level_on_a_wet_cell():
+    """The depth plane and the level plane must agree about the final wet set.
+
+    They come from one producer describing one body of water; if they disagree
+    then one is stale, and staleness is the exact failure the band stage exists
+    to avoid -- the level inside fill_to_local_surface is six stages out of date
+    by the time the plane ships.
+    """
+    size = 64
+    ground = np.zeros((size, size))
+    water = np.full((size, size), np.nan)
+    water[0, 0] = 1.0
+    level = np.full((size, size), np.nan)
+    level[0, 0] = 1.0                  # wet AND levelled: a disagreement
+    with pytest.raises(ValueError, match="BOTH a depth and a level"):
+        tc.water_depth_control_points(water, ground, 0, tc.QUANT_100MM,
+                                      level_m=level)
+
+
+def test_level_reader_honours_both_no_level_sentinels():
+    """-1 and -32768 both mean "no level here". A reader honouring only the new
+    one would answer "water at ground - 10 mm" on every tile baked before the
+    band existed -- a 10 mm film of water over every dry pixel in the world."""
+    ground = np.array([[0, 0, 0, 0]], np.int64)
+    cp = np.array([[tc.WATER_DRY_DEPTH, tc.WATER_NO_LEVEL,
+                    tc.WATER_LEVEL_MAX_CP, 5]], np.int16)
+    nolevel = np.iinfo(np.int32).min
+    got = tc.water_level_mm_from_cp(cp, ground)
+    assert got[0, 0] == nolevel and got[0, 1] == nolevel
+    assert got[0, 2] == -20     # a band value: ground + (-2) * 10 mm
+    assert got[0, 3] == 50      # a depth reads through the same arithmetic
+    # And the DEPTH reader is unmoved by the band: every negative is still "no
+    # water", which is exactly what an old client does with these bytes.
+    surf = tc.water_surface_mm_from_depth(cp, ground)
+    assert (surf[0, :3] == nolevel).all()
+    assert surf[0, 3] == 50
+
+
+def test_encode_fine_refuses_a_level_with_no_water_plane():
+    """A band with no depth plane to ride in would be silently dropped -- the
+    same class of failure as pregen's name probe dropping the water plane
+    itself, which cost a 302 CPU-s bake to discover."""
+    n = 64
+    with pytest.raises(ValueError, match="without water_surface_m"):
+        tc.encode_fine(seed=1, x=0, y=0,
+                       elevation_m=np.zeros((n, n)),
+                       water_level_m=np.full((n, n), np.nan),
+                       block_log2=4)

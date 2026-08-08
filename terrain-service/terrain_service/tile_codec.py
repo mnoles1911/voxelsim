@@ -238,6 +238,105 @@ WATER_DRY_DEPTH = -1
 #: Largest storable depth, metres. int16 max at the 10 mm LSB.
 WATER_MAX_DEPTH_M = 32767 * WATER_DEPTH_LSB_MM / 1000.0
 
+# --- THE LEVEL BAND: a water LEVEL for DRY cells near water -----------------
+#
+# THE COMPLAINT THIS ANSWERS, in the owner's terms: the waterline meets the bank
+# in blocky multi-metre steps. It has to, today. The plane says WET or DRY at a
+# 1.875 m pitch, so the client can only put the shoreline on a pixel edge -- and
+# the ground it actually DRAWS is the amplified 10 cm surface, which rises and
+# falls by metres inside one of those pixels. The bake and the client are
+# answering the same question at pitches 18.75x apart, and the staircase is the
+# difference.
+#
+# The fix is not more resolution. It is to stop shipping the ANSWER and ship the
+# QUESTION: give a dry pixel near water the LOCAL WATER LEVEL, and let the client
+# resolve `ground(voxel) < level` at its own 10 cm pitch, against the ground it
+# is drawing. The waterline then lands on a contour of the amplified surface
+# instead of on a raster step, and it costs no new plane.
+#
+# THE ENCODING, and why it is negatives rather than a new section:
+#
+#     v >= 0                 wet; depth = v * WATER_DEPTH_LSB_MM   (UNCHANGED)
+#     -32767 <= v <= -2      DRY, and the local water level is
+#                            reconstructedGround + v * WATER_DEPTH_LSB_MM
+#     v == -1                no level (LEGACY dry; never emitted by a new
+#                            encoder, still read as "no level" forever)
+#     v == -32768            no level (what a new encoder emits)
+#
+# EVERY EXISTING READER TESTS `< 0` FOR DRY. Swept across voxel-core, ue-project
+# and terrain-service before this landed: the single production decode path is
+# `FineTile::waterMmFromDepth` (voxelcore/tilestore.h), `if (depthCp < 0) return
+# kNoWaterMm;`, its Python mirror `water_surface_mm_from_depth` below is
+# `d >= 0`, and the two constant-block fast paths in bench/farwaterprobe.cpp are
+# `constCp < 0 => whole block dry`. Nothing anywhere tests `== -1`, nothing
+# reconstructs a depth from a negative, and nothing averages or lerps a raw
+# control point. So a band value reads as DRY on an old client, bit for bit.
+# That property is the entire reason the band is encoded as negatives in the
+# existing plane instead of as a fourth section -- an old client is not merely
+# tolerant of the new bytes, it is UNAFFECTED by them.
+#
+# WHY -2 AND NOT -1 IS THE TOP OF THE BAND. -1 has to keep meaning "no level"
+# for every tile already baked, so it cannot also mean "level is 10 mm below the
+# ground". -2 costs 10 mm of a quantity that is about to be compared against a
+# 100 mm voxel.
+
+#: "This cell is dry and this tile has no level for it." What a level-aware
+#: encoder emits outside the band. ``WATER_DRY_DEPTH`` (-1) means the same thing
+#: and is what every tile baked before the band carries; a reader must treat the
+#: two identically.
+#:
+#: MEASURED COST OF CHOOSING -32768 OVER -1, on shipped tile (-4,-4) at
+#: bake_ver 15, water plane only: the sentinel change ALONE (no band at all)
+#: takes the plane from 0.645 MB to 0.858 MB under CODEC_ZSTD and from 62.1 MB
+#: to 124.3 MB under CODEC_RAW -- because a -32768 sea beside a +2000 river
+#: makes MED residuals that no longer fit 16 bits, flipping every coded block to
+#: ``resid_bits=32``. With the band on, emitting -1 instead would cost 1.646 MB
+#: rather than 2.215 MB (zstd) and 63.9 MB rather than 123.8 MB (raw) -- under
+#: CODEC_RAW, which is what every tile in the cache is written with today, the
+#: sentinel choice is the ENTIRE cost of the feature: 1.03x with -1 against
+#: 1.99x with -32768, and the band itself is nearly free either way. The
+#: THE DISTINCT SENTINEL IS PROBABLY NOT WORTH IT -- MEASURED, NOT YET TAKEN.
+#: It buys exactly one thing: a tile can say "I was surveyed for levels and this
+#: cell has none" as against "I predate levels entirely". `bake_ver` already
+#: answers that, and it is on every tile header. The cost is not marginal: on
+#: CODEC_RAW, which is what every tile in the cache is written with today, the
+#: sentinel choice is the ENTIRE cost of the feature -- 1.99x with -32768
+#: against 1.03x with -1 -- because a -32768 sea beside a +2000 river makes MED
+#: residuals that no longer fit 16 bits and flips every coded block to
+#: resid_bits=32. That is roughly 13 GB -> 26 GB across the cache to encode an
+#: answer the header already gives.
+#:
+#: NOT CHANGED YET, DELIBERATELY. Two tests pin -32768 and a concurrent rewrite
+#: of the lateral rule was touching the same module; making a format decision
+#: while two things move is how you end up debugging both. The feature ships
+#: OFF, so nothing pays this cost today. Change this line, update
+#: test_level_band_constants_are_product_only and
+#: test_level_band_round_trips_through_the_codec, and re-measure before the
+#: first bake that enables water_level_plane_enabled.
+WATER_NO_LEVEL = -32768
+
+#: Inclusive bounds of the level band. A stored ``v`` in ``[MIN, MAX]`` means
+#: "dry, and the water level here is ``ground + v * WATER_DEPTH_LSB_MM``".
+#:
+#: THE FLOOR IS NOT COSMETIC AND MUST NOT BE RAISED TO THE BAND WIDTH. It is
+#: tempting to clamp at -``WATER_LEVEL_BAND_MM``/LSB (= -240) since a level more
+#: than the band below the ground can never produce a voxel -- and on the
+#: pixel's OWN ground that is true. It is false once the band's dilation is in
+#: play: a steep pixel is admitted because a neighbour two pixels away stands at
+#: the level, and clamping its stored value to -240 would tell the client the
+#: water is 2.4 m below a ground much further up than that. The client's carrier
+#: warp lets that column read the neighbour's low ground, and it would then fill
+#: the difference. MEASURED on shipped tiles (-4,-4) and (-5,-5) at the shipped
+#: dilation, the worst |level - ground| over banded cells is 22.2 m and 26.0 m
+#: -- so the clamp would invent up to 24 m of water on a cliff. Clamping only
+#: ever RAISES a level, and raising a level adds water. Keep the full range.
+#:
+#: The int16 floor itself is never reached on real terrain: clamps at
+#: WATER_LEVEL_MIN_CP were 0 of 674,421 and 0 of 1,635,171 banded cells on those
+#: two tiles. It is a representability bound, not a working limit.
+WATER_LEVEL_MIN_CP = -32767
+WATER_LEVEL_MAX_CP = -2
+
 # --- SECTION_BASIN_TABLE layout (watershed plan P1) -------------------------
 #
 # A LENGTH-PREFIXED, VERSIONED table rather than a bare array of structs. The
@@ -326,8 +425,10 @@ class TileV2:
     holds nothing" and "this tile predates the registry" must not read alike.
     `water_cp`, if given, is the P2 water plane and sets flags bit2 -- int16
     water DEPTH above this tile's own quantised elevation lattice at a
-    `WATER_DEPTH_LSB_MM` LSB, `WATER_DRY_DEPTH` where dry. An ALL-DRY plane is
-    likewise not None, for the identical reason.
+    `WATER_DEPTH_LSB_MM` LSB, negative where dry. An ALL-DRY plane is
+    likewise not None, for the identical reason. A negative is not necessarily
+    just "dry": see `WATER_NO_LEVEL` for the level band that `-32767..-2`
+    carries, which every reader that tests `< 0` already handles correctly.
     """
 
     seed: int
@@ -392,7 +493,7 @@ def control_points_to_mm(cp: np.ndarray, base_offset_mm: int, quant: int) -> np.
 
 
 def water_depth_control_points(water_m, ground_m, base_offset_mm: int,
-                               quant: int) -> np.ndarray:
+                               quant: int, level_m=None) -> np.ndarray:
     """Water surface (m, NaN = dry) + the tile's OWN elevation cp -> depth cp.
 
     THE BED IS THE SAMPLE FIELD, in metres -- the same ``elevation_m`` this
@@ -431,6 +532,20 @@ def water_depth_control_points(water_m, ground_m, base_offset_mm: int,
     water above ground on the dry side of it.
 
     Returns int16 at a ``WATER_DEPTH_LSB_MM`` LSB, ``WATER_DRY_DEPTH`` for dry.
+
+    ``level_m`` is the OPTIONAL level band (see ``WATER_NO_LEVEL``): the local
+    water surface in metres absolute over DRY cells that lie near water, NaN
+    everywhere else. When it is None -- the default, and what every caller did
+    before the band existed -- this function is bit-identical to what it always
+    was, which is the property ``test_band_leaves_the_wet_set_bit_identical``
+    holds it to.
+
+    It is an error for ``level_m`` to be finite on a WET cell. The two arrays
+    come from the same producer describing the same final water, and if they
+    disagree about which cells are wet then one of them is stale -- the exact
+    failure this whole stage exists to avoid, since the band's own reason for
+    being is that the level inside ``fill_to_local_surface`` went stale five
+    stages ago.
     """
     w = np.asarray(water_m, dtype=np.float64)
     g = np.asarray(ground_m, dtype=np.float64)
@@ -438,7 +553,8 @@ def water_depth_control_points(water_m, ground_m, base_offset_mm: int,
         raise ValueError(
             f"water plane {w.shape} does not match elevation {g.shape}")
     wet = np.isfinite(w)
-    out = np.full(w.shape, WATER_DRY_DEPTH, np.int64)
+    dry_fill = WATER_DRY_DEPTH if level_m is None else WATER_NO_LEVEL
+    out = np.full(w.shape, dry_fill, np.int64)
     if wet.any():
         depth_mm = np.rint(w[wet] * 1000.0) - np.rint(g[wet] * 1000.0)
         d = np.rint(depth_mm / WATER_DEPTH_LSB_MM).astype(np.int64)
@@ -452,6 +568,43 @@ def water_depth_control_points(water_m, ground_m, base_offset_mm: int,
                 f"water depth {d.max() * WATER_DEPTH_LSB_MM / 1000.0:.1f} m "
                 f"exceeds the {WATER_MAX_DEPTH_M:.1f} m the plane can store")
         out[wet] = d
+
+    if level_m is not None:
+        lv = np.asarray(level_m, dtype=np.float64)
+        if lv.shape != w.shape:
+            raise ValueError(
+                f"level plane {lv.shape} does not match water {w.shape}")
+        band = np.isfinite(lv)
+        if (band & wet).any():
+            raise ValueError(
+                f"{int((band & wet).sum())} cells carry BOTH a depth and a "
+                "level; the level band describes dry cells only, so the two "
+                "arrays disagree about the final wet set")
+        if band.any():
+            rel_mm = np.rint(lv[band] * 1000.0) - np.rint(g[band] * 1000.0)
+            v = np.rint(rel_mm / WATER_DEPTH_LSB_MM).astype(np.int64)
+            # CLAMP TO -2, NEVER TO A POSITIVE. A dry cell whose level stands at
+            # or above its own ground is not a contradiction -- the fill can
+            # refuse a cell for want of `min_depth_m`, and the discharge budget
+            # can strand one that the geometry alone would have flooded -- but a
+            # POSITIVE value there would read as a DEPTH on every client and add
+            # water to a cell the bake deliberately left dry. -2 says "the level
+            # is 20 mm under this pixel's ground": no water at the bake's own
+            # surface, and water only where the client's 10 cm ground dips below
+            # it, which is precisely the sub-pixel waterline the band is for.
+            v = np.clip(v, WATER_LEVEL_MIN_CP, WATER_LEVEL_MAX_CP)
+            out[band] = v
+
+    # THE ASSERTION THAT MATTERS, and it is checked on the finished plane rather
+    # than on any one branch: a cell that is dry must never encode >= 0. A
+    # positive value at a dry cell is not a rendering glitch, it is water added
+    # to every client that reads the tile, silently and forever.
+    bad = (~wet) & (out >= 0)
+    if bad.any():
+        raise ValueError(
+            f"{int(bad.sum())} DRY cells encoded to a non-negative value "
+            f"(max {int(out[bad].max())}); every client would read those as "
+            "water the bake did not place")
     return out.astype(np.int16)
 
 
@@ -475,6 +628,36 @@ def water_surface_mm_from_depth(depth_cp, ground_mm):
     if wet.any():
         out[wet] = (np.asarray(ground_mm)[wet].astype(np.int64)
                     + d[wet].astype(np.int64) * WATER_DEPTH_LSB_MM)
+    return out
+
+
+def water_level_mm_from_cp(cp, ground_mm):
+    """The LEVEL a cell knows about, wet or dry, in absolute mm. The band read.
+
+    ``water_surface_mm_from_depth`` above answers "is there water standing here,
+    and how high" -- the question a client asks about the BAKE's 1.875 m pixel.
+    This answers "what height would water reach here if the ground let it",
+    which is the question a client asks about a 10 cm VOXEL, and it is the whole
+    point of the band: the caller compares this against the ground it is
+    actually drawing and gets a waterline on a contour rather than on a pixel
+    edge.
+
+    Note the arithmetic is IDENTICAL in both cases -- ``ground + cp * LSB`` --
+    and only the sentinels are excluded. That is not a coincidence, it is the
+    encoding: a depth and a level are the same offset from the same datum, and
+    the sign only says whether the bake already placed water there.
+
+    Dry-with-no-level reads as ``np.iinfo(np.int32).min``, matching
+    ``kNoWaterMm`` and this module's other reader. BOTH sentinels are honoured:
+    ``WATER_DRY_DEPTH`` (-1, every tile baked before the band) and
+    ``WATER_NO_LEVEL`` (-32768).
+    """
+    c = np.asarray(cp).astype(np.int64)
+    out = np.full(c.shape, np.iinfo(np.int32).min, np.int64)
+    has = (c >= 0) | ((c >= WATER_LEVEL_MIN_CP) & (c <= WATER_LEVEL_MAX_CP))
+    if has.any():
+        out[has] = (np.asarray(ground_mm)[has].astype(np.int64)
+                    + c[has] * WATER_DEPTH_LSB_MM)
     return out
 
 
@@ -1278,6 +1461,7 @@ def encode_fine(
     flow: np.ndarray | None = None,
     basins: "list | tuple | None" = None,
     water_surface_m: "np.ndarray | None" = None,
+    water_level_m: "np.ndarray | None" = None,
     bake_ver: int | None = None,
     codec: int = CODEC_RAW,
     block_log2: int = DEFAULT_BLOCK_LOG2,
@@ -1316,11 +1500,16 @@ def encode_fine(
         # AGAINST THE SAMPLE FIELD, not `cp` -- see the derivation in
         # `water_depth_control_points`. `cp` is a control lattice and stands up
         # to 5.6 m from the surface; `spline(cp)`, which is what the client
-        # evaluates, does not.
+        # evaluates, does not. The level band takes the same datum for the same
+        # reason: it is the same offset from the same ground.
         water_cp = water_depth_control_points(
             water_surface_m, elevation_m, base_offset_mm=base_offset_mm,
-            quant=quant
+            quant=quant, level_m=water_level_m
         )
+    elif water_level_m is not None:
+        raise ValueError(
+            "water_level_m was given without water_surface_m; a level band "
+            "with no water plane to carry it would be silently dropped")
 
     basin_rows = None
     if basins is not None:
