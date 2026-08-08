@@ -116,9 +116,36 @@ inline int64 CeilSqrtI64(int64 V)
 // Mirrors Amplifier::stratigraphyAt: a voxel's centre is vz*100+50 mm and it
 // is air iff surfaceMm - centre < 0. Caves and caverns only ever REMOVE solid,
 // never add it, so nothing above this can be solid.
+//
+// THE DEBUG WATER MARKER BREAKS THAT LAST SENTENCE, AND THIS BOUND FEEDS TWO
+// LEVEL-0-ONLY EMPTINESS GATES. `stratigraphyAt` emits MAT_WATERMARK for every
+// voxel between the ground and the marker's capped water surface, so above
+// `surfaceMm` is NOT air when the marker is on. Both the per-brick skip and the
+// chunk band derive from this function, both run only at level 0, and both are
+// on by default -- so with a 0.8 m brick against a 3 m marker slab, every brick
+// above the bed was declared all-air and never meshed. The surviving stub has
+// no top face (a face needs an air neighbour) and the material is one-sided, so
+// the player looks straight through it. That is the "transparent middle in the
+// first LOD ring, solid magenta far away" report: near field skipped, far
+// levels mesh with FNeverSkipBrick and are unaffected.
+//
+// `Amplifier::surfaceUpperBoundMm` already pays exactly this widening and says
+// why; `generator.h`'s `coarseSurfaceBrickRange` carries the same expression
+// but has NO CALLER in the shipping client -- the level-0 job builds its own
+// grid and gates with a SkipBrick lambda instead. The fix had landed next to
+// the bug rather than on it. Deliberately mirrors that capped expression so the
+// two cannot disagree about which bricks can hold magenta. Costs nothing when
+// the marker is off: waterSurfaceMm is kNoWaterMarkerMm on every column.
 inline int64 ColumnSurfaceTopVoxel(const vxc::ColumnSample& Col)
 {
-	return vxc::floorDiv(int64(Col.surfaceMm) - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm));
+	int64 Top = vxc::floorDiv(int64(Col.surfaceMm) - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm));
+	if (Col.waterSurfaceMm != vxc::kNoWaterMarkerMm && int64(Col.waterSurfaceMm) > int64(Col.surfaceMm))
+	{
+		const int64 CappedMm = FMath::Min(int64(Col.waterSurfaceMm),
+		                                  int64(Col.surfaceMm) + vxc::kWaterMarkerHeightMm);
+		Top = FMath::Max(Top, vxc::floorDiv(CappedMm - vxc::kVoxelSizeMm / 2, int64(vxc::kVoxelSizeMm)));
+	}
+	return Top;
 }
 
 // Lowest level-0 voxel z at which this column can hold AIR. A conservative
