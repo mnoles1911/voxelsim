@@ -857,7 +857,7 @@ def settle_to_adjacent_level(water_m, z_ground_m, *, min_depth_m: float,
         w, sm_stats = smooth_level_field(
             w, z, np.isfinite(np.asarray(water_m, np.float32)),
             min_depth_m=min_depth_m, iters=int(level_smooth_iters),
-            cap=w_before)
+            cap=np.array(w, copy=True))
         budget_stats.update(sm_stats)
     stats = {
         "settle_rounds": float(rounds),
@@ -1077,8 +1077,18 @@ def smooth_level_field(water_m, z_ground_m, drawn, *, min_depth_m,
     # baseline. So the channel relaxes too, under a ceiling: no cell may end
     # above the surface `graded_water_surface` gave it, which is what keeps the
     # downstream-descent guarantee that ceiling encodes.
+    # THE CEILING MUST COVER EVERY CELL, INCLUDING THE ONES SETTLING ADDED.
+    # It used to be the ORIGINAL drawn surface, which is NaN wherever settling
+    # put new water -- and NaN fails the finite test, so those cells had no
+    # ceiling at all and the averaging could raise them without limit. That is
+    # water climbing up and over a bank, which is exactly what the owner saw in
+    # the editor at bake_ver 18. The cap is now the level each cell actually
+    # SETTLED at, so relaxation can only ever take water down.
     ceiling = (np.asarray(cap, np.float32) if cap is not None
                else np.asarray(water_m, np.float32))
+    if np.isnan(ceiling).all():
+        raise ValueError("smooth_level_field: ceiling is empty; nothing would "
+                         "constrain the relaxation and water would climb")
     fixed = np.zeros(w.shape, bool) if cap is not None else (
         np.asarray(drawn, bool) & np.isfinite(w))
     floor = np.float32(min_depth_m)
