@@ -1,0 +1,86 @@
+WATER FINDS ITS LEVEL -- bake_ver 18, wet alpine block, seed 20260719.
+Namespace terrain-diffusion-unlabeled-80b9ca451a23eae4-ba6ff22d6. 2026-08-08.
+
+THE OWNER'S COMPLAINT: "the water blocks are not being placed correctly.
+Gravity and physics would naturally cause the water to spread out to fill the
+terrain and level out." He was right, and the measurement I first offered
+against it was wrong -- it flooded UPHILL ONLY, so it measured bank above the
+waterline rather than floor below it. See river-width-is-bed-limited for that
+retraction; do not use its conclusion.
+
+THE DEFECT, on the bake's own elevation_m at bv17:
+  dry cells touching water            285,518
+  ...whose ground is BELOW that water 169,759  (59.5%),  p50 0.90 m below
+  in the 0.1-5 m band: 168,708 cells = 59 hectares of channel floor, ONE tile,
+  standing dry with water 90 cm above it in the next cell.
+
+CAUSE: `_fill_levels` carries a level only UP a drawn cell's own donors, so a
+bed cell upstream of nothing drawn terminates at a root and gets NaN -- "dry for
+want of a number rather than for want of room", in the code's own words. One
+path lookup, so it can never notice water standing beside it.
+
+WHAT SHIPPED, in the order the measurements forced:
+
+ 1. SPREAD. A dry cell joins at its highest adjacent water surface when its
+    ground is min_depth below it. Alone this has NO equilibrium: 8 sweeps add
+    705k cells, 24 add 1,510k, still growing at the cap, depth and reach both
+    creeping up. That is the documented 209x flood -- a level carried away from
+    the water that owns it. max_iter was not a safety bound, it was the only
+    thing stopping it.
+ 2. DRAIN. An added cell may not hold water perched above dry ground it could
+    run off onto. Drawn cells exempt: a river drains by definition and its
+    escape is the wet cell downstream.
+ 3. RELAX 1+2 TO A FIXED POINT. Converges in 3 rounds, spreading 2,398,366
+    cells and draining 2,327,675 of them -- 97% of everything it tries runs
+    back off. This is the answer to "how do we stop it spreading at one z
+    level": not a cap, a rule.
+ 4. DISCHARGE BUDGET. width(Q) x depth(Q) x cell_m per channel cell, so the
+    allowance GROWS DOWN THE RIVER as the watershed does. Verified on a
+    synthetic flat trough: at headwater Q it keeps 0 of 120 spread cells, at
+    trunk Q all 120. Same terrain, discharge decides.
+ 5. SECTION SOLVE, because a budget must REDISTRIBUTE not delete. L_k =
+    (budget/area + S_k)/k over cells sorted by ground; the answer is the
+    largest k whose ground is still under L_k. On a flat bench: headwater 2
+    cells wide at 0.18 m, trunk 20 cells wide at 0.35 m.
+ 6. CAPPED LEVEL RELAXATION over the whole surface INCLUDING the channel. The
+    step below is why: pinning the channel locked in the roughness, because the
+    section solve lowers each drawn cell independently and that is where the
+    discontinuity is born.
+
+THE PROGRESSION, tile (-4,-4). "dry-below" = cells dry with adjacent water above
+them; ">1vox" = adjacent wet pairs whose surfaces differ by over 100 mm:
+
+                              wet    dry-below   >1vox   p90 step
+  baseline (bv17)         364,354     161,082    17.4%    338 mm
+  spread only, 24 sweeps 1,874,965     40,683    36.1%    663 mm
+  spread+drain, 1 round     433,034    122,124    18.5%      -
+  relaxed, no budget        419,967    123,717    21.2%      -
+  budget, section solve     381,722    122,534    36.1%    663 mm
+  + drop smoothed           385,128    138,906    33.2%    676 mm
+  + level relax, channel pinned 377,709 141,718   32.4%    658 mm
+  + level relax, CHANNEL FREE   304,223 110,317   17.8%    193 mm  <- shipped
+  (same, 4 smoothing iters)     341,734 127,664   27.1%    305 mm
+
+Every variant before the last traded one of the owner's complaints for the
+other. The last moves both: dry ground below adjacent water -32%, and the step
+between neighbouring water cells -43% at p90, BELOW the baseline it started
+from. Fewer smoothing iterations keep more water and are worse on both quality
+metrics, so 12 is measured, not cautious.
+
+THE COST: 10.7-16.5% less wet area per tile, and the owner has said more water
+looked better. The mechanism is an asymmetry rather than physics -- the
+relaxation may raise a level only to its ceiling but may dry a cell
+permanently, so iterations drift the surface down. water_level_smooth_iters is
+the dial. Bake time roughly doubles, ~790 s/tile.
+
+WATER-ONLY, VERIFIED. verify_water_only_change bv17 -> bv18, all six tiles:
+datum SAME, elevation_cp IDENTICAL, flow IDENTICAL. PASS, 0 problems.
+  (-5,-4) 680,748 -> 591,878   (-4,-4) 364,354 -> 304,223
+  (-3,-4) 353,855 -> 302,605   (-5,-5) 872,533 -> 779,243
+  (-4,-5) 689,838 -> 601,597   (-3,-5) 601,330 -> 535,322
+
+STILL OPEN: 110,317 cells on tile (-4,-4) remain dry below the water beside
+them AND able to drain away downhill, which says the drawn channel is not
+always on the lowest ground -- the owner's own diagnosis, "it solves on a
+different surface than we draw". That is a routing change, not an extent one,
+and it is the next thing.
