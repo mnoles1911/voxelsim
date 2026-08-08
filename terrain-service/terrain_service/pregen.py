@@ -844,6 +844,8 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             f"/{int(result.stats.get('water_settle_rounds', 0))}r"
             f"-{int(result.stats.get('water_settle_drained_cells', 0))}dr"
             f"-{int(result.stats.get('water_budget_dropped', 0))}bud "
+            f"mono={int(result.stats.get('water_monotone_violations_before', 0))}"
+            f">{int(result.stats.get('water_monotone_violations_after', 0))} "
             f"lvl={int(result.stats.get('water_level_consistency_lowerings', 0))} "
             f"span_drop={int(result.stats.get('basins_excluded_spanning', 0))}"
             f"/{result.stats.get('basins_excluded_spanning_area_m2', 0.0) / 1e4:.0f}ha"

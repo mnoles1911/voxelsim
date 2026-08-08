@@ -96,6 +96,7 @@ __all__ = [
     "settle_to_adjacent_level",
     "apply_discharge_budget",
     "smooth_level_field",
+    "enforce_upstream_monotone",
     "Q_PERENNIAL_M3_YR",
     "Q_RIVER_M3_YR",
     "Q_MAJOR_M3_YR",
@@ -1039,6 +1040,77 @@ def apply_discharge_budget(w, w_drawn, z, own, q_m3_yr, *, cell_m,
         if is_drawn.any() else 0.0,
     })
     return w, stats
+
+
+def enforce_upstream_monotone(water_m, receivers, z_ground_m, *, min_depth_m,
+                              max_iter: int = 64):
+    """No water may stand above its own upstream water. ``(w, stats)``.
+
+    THE OWNER'S RULE, in his words: "there should be a hard rule that magenta
+    blocks can NEVER spawn or be placed on a z-level above the previous existing
+    upstream magenta water block. They can only spread to be equal or down and
+    lower than the previous existing magenta voxel."
+
+    WHY IT HAS TO LIVE HERE, AT THE END, AND NOT BE INHERITED FROM AN EARLIER
+    STAGE. `graded_water_surface` establishes exactly this property when it
+    builds the river -- and then `widen_to_channel_width`,
+    `fill_to_local_surface`, `bridge_to_face_contact`, the settling relaxation
+    and the discharge budget all run afterwards, and every one of them can
+    break it. That is the shape of this whole module's bug history: a stage
+    fixes the measurement it was written for and quietly violates an invariant
+    an earlier stage guaranteed, and nothing re-checks. So this re-checks, last,
+    and it is the only stage entitled to assume nothing.
+
+    WHY IT LOWERS RATHER THAN RAISES. `flow.enforce_descent` restores the same
+    monotonicity by RAISING the upstream cell, which is right when the thing
+    being fixed is a bed that dams. Here it would be wrong: raising upstream
+    water is precisely the "water climbing up and over the bank" the owner is
+    looking at. Water leaves a violation by going DOWN, so the receiver is
+    lowered to its lowest donor, never the other way.
+
+    A cell lowered under its own bed goes dry, which is the honest consequence:
+    the water that was there had nowhere to stand.
+    """
+    w = np.array(water_m, dtype=np.float32, copy=True)
+    z = np.ascontiguousarray(z_ground_m, np.float32)
+    rec = np.ascontiguousarray(receivers, np.int64).ravel()
+    flat = w.ravel()
+    floor = np.float32(min_depth_m)
+
+    def _violations():
+        wet = np.isfinite(flat)
+        src = np.flatnonzero(wet)
+        r = rec[src]
+        ok = r >= 0
+        src, r = src[ok], r[ok]
+        live = np.isfinite(flat[r])
+        return src[live], r[live]
+
+    src0, r0 = _violations()
+    before = int((flat[r0] > flat[src0] + 1e-6).sum())
+
+    swept = 0
+    for swept in range(1, int(max_iter) + 1):
+        src, r = _violations()
+        if src.size == 0:
+            break
+        # lowest donor wins: np.minimum.at accumulates duplicate receivers
+        cand = np.full(flat.size, np.inf, np.float64)
+        np.minimum.at(cand, r, flat[src].astype(np.float64))
+        touched = np.isfinite(cand) & np.isfinite(flat) & (cand < flat - 1e-6)
+        if not touched.any():
+            break
+        flat[touched] = cand[touched].astype(np.float32)
+        dry = touched & ((flat - z.ravel()) < floor)
+        flat[dry] = np.float32(np.nan)
+
+    src1, r1 = _violations()
+    after = int((flat[r1] > flat[src1] + 1e-6).sum())
+    return w, {
+        "monotone_violations_before": float(before),
+        "monotone_violations_after": float(after),
+        "monotone_sweeps": float(swept),
+    }
 
 
 def smooth_level_field(water_m, z_ground_m, drawn, *, min_depth_m,

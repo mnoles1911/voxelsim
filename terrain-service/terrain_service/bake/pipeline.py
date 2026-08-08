@@ -1311,6 +1311,9 @@ class BakeConstants:
     #: floodplain is a smooth interpolation of the river rather than a mosaic of
     #: inherited levels. See water.smooth_level_field.
     water_level_smooth_iters: int = 12
+    #: No drawn water may stand above its own upstream water. Checked LAST,
+    #: after every stage that can break it. See enforce_upstream_monotone.
+    water_enforce_upstream_monotone: bool = True
 
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
@@ -1531,6 +1534,7 @@ class BakeConstants:
         "water_settle_max_iter",
         "water_settle_discharge_budget",
         "water_level_smooth_iters",
+        "water_enforce_upstream_monotone",
         "channel_width_exp_q8",
         "channel_depth_exp_q8",
     )
@@ -4963,6 +4967,22 @@ def bake_tile(
             w_pad, lvl_stats = _water.enforce_neighbour_consistency(
                 w_pad, out["z"])
             width_stats.update(lvl_stats)
+
+        # THE HARD RULE, LAST, ASSUMING NOTHING. No water may stand above its
+        # own upstream water. graded_water_surface established this and every
+        # stage since -- widening, lateral fill, the bridge, settling, the
+        # budget -- can break it. This is the only stage that re-checks, and it
+        # runs after all of them on purpose.
+        # `locals()` because this is the ONLY water stage that runs outside the
+        # branch building the receiver forest, and a path with no forest has no
+        # upstream to be monotone against -- that is "not applicable", not a
+        # violation to silently skip under a bare name error.
+        if (consts.water_enforce_upstream_monotone
+                and locals().get("rec_w") is not None):
+            w_pad, mono_stats = _water.enforce_upstream_monotone(
+                w_pad, rec_w, out["z"],
+                min_depth_m=_water.WIDEN_MIN_DEPTH_M)
+            width_stats.update(mono_stats)
 
         discharge = np.ascontiguousarray(q_pad[sl, sl].astype(np.float32))
         water_surface = np.ascontiguousarray(w_pad[sl, sl])
