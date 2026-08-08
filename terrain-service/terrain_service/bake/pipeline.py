@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 17
+BAKE_VERSION = 18
 
 
 @dataclass(frozen=True)
@@ -1298,7 +1298,7 @@ class BakeConstants:
     #: has run. OFF until measured: the module's own history has a lateral rule
     #: that multiplied the wet set by 209x, so this ships dark and is turned on
     #: by a bake that has the before/after in hand.
-    water_settle_to_level: bool = False
+    water_settle_to_level: bool = True
     #: Lateral reach of that settling, in cells. 8 = 15 m, which is a riverbed;
     #: see settle_to_adjacent_level for why the bound is the safety argument.
     water_settle_max_iter: int = 8
