@@ -2958,7 +2958,7 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # together. The literal is deliberate: it forces a conscious edit at every
     # roll instead of letting the version drift silently, which is why this is
     # pinned rather than read from pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 20
+    assert on["bake_version"] == 21
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -3513,7 +3513,12 @@ def test_lateral_equal_level_is_a_product_constant_that_ships_dark():
     from terrain_service.bake.pipeline import BakeConstants
 
     c = BakeConstants()
-    assert c.water_lateral_equal_level is False, "must ship dark"
+    # ENABLED at bake_ver 21, deliberately: it replaces smooth_level_field,
+    # taking adjacent-cell steps over one voxel from 20.76% to 0.87% where the
+    # smoothing reached 13.8%, and without the smoothing's one-way water loss.
+    # The rest of this test is what still matters -- identity coverage, and a
+    # counter that cannot be confused with "did not run".
+    assert c.water_lateral_equal_level is True
     assert "water_lateral_equal_level" in BakeConstants.PRODUCT_FIELDS
     assert "water_lateral_equal_level" not in c.as_payload(), (
         "it cannot move a height, so it belongs in the PRODUCT half only"
@@ -3561,7 +3566,11 @@ def test_lateral_equal_level_actually_executes_in_the_bake(_real_kernels):
             climate_fetch=lambda x, y: cl.get((x, y)),
             kernels=_real_kernels, geom=TEST_GEOM, consts=c)
 
-    off = run()
+    # BOTH ARMS EXPLICIT. `off` used to rely on the default, which made the
+    # test silently change meaning the moment the constant was enabled at
+    # bake_ver 21 -- the arm that proves "off is distinguishable from on" was
+    # running the ON path and asserting the OFF value.
+    off = run(water_lateral_equal_level=False)
     on = run(water_lateral_equal_level=True)
 
     assert off.stats["water_lateral_equal_ran"] == 0.0

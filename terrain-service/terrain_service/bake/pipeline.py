@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 20
+BAKE_VERSION = 21
 
 
 @dataclass(frozen=True)
@@ -1310,7 +1310,7 @@ class BakeConstants:
     #: Relax the settled water surface with the drawn channel held fixed, so the
     #: floodplain is a smooth interpolation of the river rather than a mosaic of
     #: inherited levels. See water.smooth_level_field.
-    water_level_smooth_iters: int = 12
+    water_level_smooth_iters: int = 0
     #: No drawn water may stand above its own upstream water. Checked LAST,
     #: after every stage that can break it. See enforce_upstream_monotone.
     water_enforce_upstream_monotone: bool = True
@@ -1335,7 +1335,7 @@ class BakeConstants:
     #: voxel steps from 20.76% to 0.87% and the cells lying dry below adjacent
     #: water from 9,227 to 8,367. He has previously said more water looked
     #: better, so the trade is his to make and this ships dark.
-    water_lateral_equal_level: bool = False
+    water_lateral_equal_level: bool = True
 
     #: The hydraulic-geometry exponents, Q8, mirroring channel.h's
     #: ``kChannelWidthExpQ8`` / ``kChannelDepthExpQ8``.
