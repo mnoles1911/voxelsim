@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 19
+BAKE_VERSION = 20
 
 
 @dataclass(frozen=True)
@@ -4910,7 +4910,6 @@ def bake_tile(
                 exclude=basin_keep_pad,
                 q_perennial=consts.water_q_perennial_m3_yr,
             )
-        del rec_w
 
         # -- CONTACT (bake_ver 14). Everything above decides WHICH CELLS are
         # wet. Nothing above decides whether the water in two adjacent cells
@@ -4973,12 +4972,13 @@ def bake_tile(
         # stage since -- widening, lateral fill, the bridge, settling, the
         # budget -- can break it. This is the only stage that re-checks, and it
         # runs after all of them on purpose.
-        # `locals()` because this is the ONLY water stage that runs outside the
-        # branch building the receiver forest, and a path with no forest has no
-        # upstream to be monotone against -- that is "not applicable", not a
-        # violation to silently skip under a bare name error.
-        if (consts.water_enforce_upstream_monotone
-                and locals().get("rec_w") is not None):
+        # NO locals() GUARD. It used to say `locals().get("rec_w") is not None`,
+        # and `del rec_w` ran 70 lines above, so this stage NEVER EXECUTED in any
+        # bake -- while the log printed mono=0>0 from the stats dict's default
+        # and read as "zero violations, nothing to fix". A guard written to make
+        # skipping safe made it invisible instead. Second time in one session a
+        # counter read zero because the value was absent rather than small.
+        if consts.water_enforce_upstream_monotone:
             w_pad, mono_stats = _water.enforce_upstream_monotone(
                 w_pad, rec_w, out["z"],
                 min_depth_m=_water.WIDEN_MIN_DEPTH_M)
