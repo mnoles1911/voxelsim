@@ -1,0 +1,78 @@
+// VoxelFluidContract.ush
+//
+// THE SHARED CONTRACT between the PBF solver (VoxelFluidSim.usf), the
+// occupancy/collision volume (VoxelFluidOccupancy/VoxelFluidCollision.ush)
+// and, later, the screen-space fluid renderer. Owned by the integrator; the
+// solver and collision passes each include this and neither may redefine any
+// of it. Change it here or not at all -- two copies of a layout is how the
+// water plane once shipped with a stale comment pointing at a constant that
+// did not exist.
+//
+// Part of the water re-architecture (docs/water-rearchitecture-plan-2026-08-09.md):
+// particles are PRESENTATION. Nothing in these buffers is ever authoritative
+// state -- volumes live in integer ledgers on the CPU. So this file is
+// deliberately float-typed and deliberately outside worldgen.ush's digest
+// (see VoxelQuadPoolWrite.usf:41-48 for why new kernels stay out of it).
+
+#ifndef VOXEL_FLUID_CONTRACT_USH
+#define VOXEL_FLUID_CONTRACT_USH
+
+// ---- units ---------------------------------------------------------------
+// Positions and velocities are in UU (1 UU = 1 cm, so one 10 cm voxel = 10 UU),
+// world-relative to FluidOriginUU to keep float precision at world scale --
+// the world spans tens of km and float UU loses sub-voxel precision past ~1 km,
+// which at particle scale is fatal. Every kernel adds/subtracts the origin at
+// the boundary, never mid-math.
+
+// Rest spacing: one particle per 10 cm cell at rest density = matches the
+// voxel grid, which is what makes despawn-to-fill-units bookkeeping exact:
+// one particle == one voxel of water == 255 fill units == 1 L.
+#define VOXEL_FLUID_REST_SPACING_UU  10.0f
+// Smoothing kernel support radius h. 2.5x spacing is the PBF-standard band
+// (Macklin & Mueller use ~2-3x); also the hash grid cell size.
+#define VOXEL_FLUID_KERNEL_H_UU      25.0f
+// Hard cap the buffers are sized for. The plan's budget math: a 1 m^3/s river
+// with ~100 s of visible residence is ~100k sustained; 300k is the ceiling
+// the spike must measure, not a target.
+#define VOXEL_FLUID_MAX_PARTICLES    (300u * 1024u)
+
+// ---- particle layout ------------------------------------------------------
+// AoS, 32 bytes, two float4s -- coalesced pairs, no packing cleverness until
+// the spike measures a reason for it.
+//   P0: xyz = position UU (origin-relative), w = asuint(flags)
+//   P1: xyz = velocity UU/s,                 w = spawn batch id (float)
+// Flags (bits of asuint(P0.w)):
+#define VOXEL_FLUID_FLAG_ALIVE       (1u << 0)
+#define VOXEL_FLUID_FLAG_DESPAWN_BASIN    (1u << 1)  // crossed into a basin extent
+#define VOXEL_FLUID_FLAG_DESPAWN_BOUNDARY (1u << 2)  // left the active region
+struct FVoxelFluidParticle
+{
+    float4 P0;
+    float4 P1;
+};
+
+// The two structured buffers every consumer binds by these names:
+//   StructuredBuffer<FVoxelFluidParticle>   Particles       (read passes)
+//   RWStructuredBuffer<FVoxelFluidParticle> ParticlesRW     (sim passes)
+// plus the live-count buffer:
+//   RWStructuredBuffer<uint> ParticleCounts   [0]=alive, [1]=despawnedBasin,
+//                                             [2]=despawnedBoundary, [3]=spawnedTotal
+// CONSERVATION IS THE TEST: spawnedTotal - despawnedBasin - despawnedBoundary
+// == alive, asserted every frame on readback. A counter that cannot prove
+// itself is how three false conclusions happened in one session.
+
+// ---- occupancy volume (collision) -----------------------------------------
+// 1 bit per 10 cm voxel over the active region, 512^3 bits = 16 MB, packed
+// x-major into uints (32 voxels per uint along x).
+//   Buffer<uint> / RWBuffer<uint>  FluidOccupancyBits
+//   int3  FluidVolumeOriginVoxel   // world voxel coord of bit (0,0,0)
+//   uint  FluidVolumeDimVoxels     // 512
+// Provided by VoxelFluidCollision.ush (the ONLY file that reads the bits):
+//   bool VoxelFluidSolidAtVoxel(int3 worldVoxel);  // outside volume => solid,
+//        // so particles can never escape through an unbuilt edge -- the same
+//        // "blocked, never guessed" rule the fine tier uses for terrain.
+//   float3 VoxelFluidResolveCollision(float3 posUU, float3 prevPosUU);
+//        // projects a penetrating particle out along the face normal of the
+//        // voxel it entered, killing the normal velocity component.
+
+#endif // VOXEL_FLUID_CONTRACT_USH
