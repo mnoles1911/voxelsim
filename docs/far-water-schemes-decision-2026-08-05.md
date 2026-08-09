@@ -1,5 +1,12 @@
 # Distant water: the ring cascade against a heightfield strip and an instanced rim
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for measurements/history].** This decides between three schemes for
+> extending *voxel* water out to 1 km (ring cascade wins). The re-architecture
+> does not extend voxel water outward at all — see the ring-cascade plan's own
+> banner. The measurement methodology (greedy-mesher merge factors, the
+> rim-vs-interior scaling law) is reusable evidence, not reusable direction.
+
 Measured 2026-08-05 with `vxc_farwaterschemes` over the same three sites PR #226
 used. Raw output: `docs/measurements/far-water-schemes-2026-08-05.txt`.
 

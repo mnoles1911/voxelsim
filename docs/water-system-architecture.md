@@ -1,5 +1,15 @@
 # Water in this world: how it works, end to end
 
+> **STATUS 2026-08-09: [PARTIALLY CURRENT].** The re-architecture
+> (`docs/water-rearchitecture-plan-2026-08-09.md`) is now the authoritative
+> direction; this file's river-shape bake/draw pipeline (§5, §6.1–6.4, §11,
+> §11a, §11b — lateral fill, face contact, the ring cascade, the near-field
+> voxel box, the exponent problem) is **superseded as the thing we draw**, but
+> stays load-bearing **as data** feeding faucets, ribbons and the routing
+> graph. **§6 draw-path facts, §12a settled claims, and §14 rules-that-cost-hours
+> remain load-bearing and are not superseded by anything.** See
+> `docs/water-architecture.md` for the consolidated current picture.
+
 **What this is.** The durable design document for the water system — what
 `world-generation-architecture.md` is for the land. It is the single place that
 says how water works, what is wrong with it, what has already been proved wrong,

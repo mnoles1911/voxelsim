@@ -1,5 +1,11 @@
 # Water system — handover
 
+> **STATUS 2026-08-09: [CURRENT].** Kept as the session record of how the
+> baked-river-shape work got here, corrected in place where numbers moved
+> (see its own 2026-08-05 banner below). `water-system-architecture.md`
+> classifies this file as current history, not superseded, and that still
+> holds. Read `docs/water-architecture.md` for the current direction.
+
 > ## STILL CURRENT AS HISTORY — read the two live documents first (2026-08-05)
 >
 > This is **how the system got here**, and it is the best record of that. It is

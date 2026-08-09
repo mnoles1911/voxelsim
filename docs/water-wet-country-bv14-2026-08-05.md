@@ -1,5 +1,9 @@
 # Wet country, re-baked at bv14, with three verified spawn sites
 
+> **STATUS 2026-08-09: [CURRENT].** Measurement record (ground-identity proof,
+> voxel-connectivity improvement at bv14) independent of which solver draws
+> the water. Still valid evidence about the bake's data quality.
+
 The owner asked to fly rivers in wet alpine country and was flown down the arid
 corridor instead. This is the data half of the correction: the six wet tiles
 re-baked with the current water rules, the ground proved not to have moved, and

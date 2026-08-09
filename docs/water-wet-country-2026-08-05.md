@@ -1,5 +1,9 @@
 # Wet country: the alpine block, baked at bv13
 
+> **STATUS 2026-08-09: [CURRENT].** Region-selection rationale and measurement
+> record; independent of which solver draws the water. Still the reason the
+> wet alpine block is the default measurement region under the re-architecture.
+
 > **Current (2026-08-05).** This is why the wet alpine block is now the default
 > place to measure water, and what changed when it became so. Two notes:
 >

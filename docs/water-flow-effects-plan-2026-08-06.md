@@ -1,5 +1,14 @@
 # Making rivers look like they are flowing
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for measurements/history].** This entire plan is about faking flow on
+> the *baked, near-field-voxel-drawn* river (ripple direction from the water
+> gradient, ribbon orientation). Under the re-architecture, near-field flowing
+> water is real PBF particle motion, not a directional shading trick, so the
+> problem this plan solves goes away at the source. The gradient-direction
+> negative result (37.94% usable) and the D8-vs-gradient measurement remain
+> valid data. See `docs/water-architecture.md`.
+
 **What this is.** A plan for the effect the owner asked for — *"realistic, flowing type effects rather than static cubic water voxels that just sit statically — some sort of flowing, directional effect through the watershed"* — and an answer to the specific question he raised about the Minecraft mod **Dynamic Waters**: whether we should be pathfinding water uphill from the ocean rather than downhill from the divide.
 
 **Written 2026-08-06.** Against `main`, `TERRAIN_VERSION` 8, `BAKE_VERSION` 14, `kWorldGenVersion` 23, `kWaterCAVersion` 5. Every number below either says which file or measurement record it came from, or says that it is an estimate. `docs/water-system-architecture.md` is the durable design document; this plan sits under it and changes none of its settled conclusions.

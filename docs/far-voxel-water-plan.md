@@ -1,5 +1,14 @@
 # Far-field voxel water — measurement, verdict, and the plan
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for measurements/history].** This is the ring-cascade plan to extend
+> *real voxel water* out to 500 m–1 km. The re-architecture does not extend
+> voxel water outward at all: near field becomes PBF + screen-space fluid, and
+> mid/far stays ribbons and sheets unchanged, so the gap this plan closes is
+> closed a different way. The `farwater.h` LOD/fill primitives it shipped are
+> bench-only and unwired into UE — see the deprecation audit,
+> `docs/water-deprecation-audit-2026-08-09.md`. See `docs/water-architecture.md`.
+
 Written 2026-08-05 on `claude/far-voxel-water`. The owner's ask: **real voxel
 water out to 500 m – 1 km.** Today it stops at 25.6 m and everything beyond is
 flat quads, which they described as looking terrible within 1 km.

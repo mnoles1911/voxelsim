@@ -1,5 +1,7 @@
 # Water re-architecture: reconciling the Hybrid Voxel-PBF blueprint against the game
 
+> **STATUS 2026-08-09: [CURRENT — AUTHORITATIVE].** This is the approved direction for the whole water system: static baked basins + one GPU PBF solver + scalar hydrology authority, replacing the baked-flowing-water-shape direction. Every other water doc in `docs/` is now read against this one. Entry point: `docs/water-architecture.md`.
+
 ## Context
 
 After weeks of baking the *shape* of flowing water and drawing it (culminating in

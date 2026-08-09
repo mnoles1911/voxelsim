@@ -1,5 +1,12 @@
 # Water: waves A–C and the backlog behind them
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for history].** Already superseded once (2026-08-05, banner below) by
+> `water-system-architecture.md`, which is itself now partially superseded.
+> The ribbon actor and hydrostatic cap it tracked as landed are shipped and
+> current; the open item it names (B3, the two-renderer tone seam on the
+> baked near-field river) is moot once Phase 5 retires that draw path.
+
 > ## SUPERSEDED — 2026-08-05
 >
 > **Do not take work from this document.** How the system works today is

@@ -1,5 +1,10 @@
 # MOVED — see `water-system-architecture.md`
 
+> **STATUS 2026-08-09: [CURRENT].** This redirect is still accurate. Note that
+> its target, `water-system-architecture.md`, is now itself
+> [PARTIALLY CURRENT] under the re-architecture — see
+> `docs/water-architecture.md` for the current single entry point.
+
 This file's content was not superseded; it was **renamed**. It is now
 `docs/water-system-architecture.md`, which is to water what
 `world-generation-architecture.md` is to land.

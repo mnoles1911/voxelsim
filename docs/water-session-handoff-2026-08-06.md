@@ -1,5 +1,12 @@
 # Water session handoff — 2026-08-06
 
+> **STATUS 2026-08-09: [PARTIALLY CURRENT].** The F6 pyramid-injection fix and
+> its discharge measurements remain load-bearing — the re-architecture still
+> needs correct Q for faucet placement/rates (Phase 1). The magenta-marker
+> capture task, and F2/F3 (drawn-width and depth-law tuning of the near-field
+> river shape), are superseded: the shape being tuned here is what Phase 5
+> retires from the near-field draw. See `docs/water-architecture.md`.
+
 Branch **`claude/f6-interior-rim-injection`**, 7 commits ahead of `main`.
 Read `docs/water-system-architecture.md` first — it is the durable design doc
 and it already contains everything below in permanent form. This file is the

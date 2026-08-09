@@ -1,5 +1,10 @@
 # SUPERSEDED — see `water-system-architecture.md`
 
+> **STATUS 2026-08-09: [CURRENT].** This redirect is still accurate. Note that
+> its target, `water-system-architecture.md`, is now itself
+> [PARTIALLY CURRENT] under the re-architecture — see
+> `docs/water-architecture.md` for the current single entry point.
+
 This was the input brief for a deep-dive session: what the water system was,
 what was settled, what had been falsified, and where the cracks were. The
 deep dive happened on 2026-08-05 and its results are folded into

@@ -1,5 +1,12 @@
 # Water surface pool (`voxel.Water.GPU`)
 
+> **STATUS 2026-08-09: [CURRENT].** Shipped rendering infrastructure (sort
+> buckets, translucent-sort argument, chunk-table free list). The
+> re-architecture's Phase 4 screen-space fluid pass is a new, separate
+> presentation path for PBF particles; this pool keeps drawing lake sheets,
+> the voxel-binned fallback/debug arm (§6 of the re-architecture plan), and
+> whatever the frozen CA still meshes. See `docs/water-architecture.md`.
+
 > **Current, but read it knowing it is written as a document plus errata
 > (2026-08-05).** This is still the reference for how the translucent water
 > surface is drawn and sorted. Its problem is layering: original claims are left

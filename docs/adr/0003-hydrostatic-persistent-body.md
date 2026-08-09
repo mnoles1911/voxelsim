@@ -1,5 +1,10 @@
 # ADR-0003: Hydrostatic pass — cross-tick terrain-solidity memo, and deferral of the persistent per-water-body structure
 
+> **STATUS 2026-08-09: [CURRENT].** Shipped CA performance/correctness work
+> (the solidity memo, the hydrostatic-cap correctness fix). The re-architecture
+> freezes the CA as-is rather than extending it, which is exactly the
+> maintenance state this ADR already leaves it in. See `docs/water-architecture.md`.
+
 - **Status:** proposed
 - **Date:** 2026-07-21
 - **Doctrine sections affected:** none by the code that ships with this ADR

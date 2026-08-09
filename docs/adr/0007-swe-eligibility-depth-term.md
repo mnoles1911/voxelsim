@@ -1,5 +1,11 @@
 # ADR-0007: A depth term in the SWE eligibility predicate, so thin films stay CA-owned
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for history].** Proposed, never implemented ("Nothing has been
+> implemented. Human sign-off: REQUIRED"), and it amends ADR-0004, which is
+> itself now the shelved SWE fallback rather than the active direction. The
+> thin-film/eligibility problem it diagnoses only matters if SWE is revived.
+
 - **Status:** proposed
 - **Date:** 2026-07-29
 - **Doctrine sections affected:** NONE. §2.3's integer-only rule is kept; no

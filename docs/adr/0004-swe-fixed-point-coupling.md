@@ -1,5 +1,15 @@
 # ADR-0004: W4 shallow water — a fixed-point reduced SWE, and the CA↔SWE coupling
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept as the documented fallback].** The owner reaffirmed PBF as the single
+> flowing-water solver and rejected salvaging SWE; the re-architecture's own
+> words: "SWE and the conveyor design are shelved with their analysis on
+> record — if PBF's Phase 0 numbers fail, that analysis is the documented
+> fallback, not a restart." The fixed-point numerics analysis here is sound
+> and the code ships inert (`voxel.Water.SWE`, default 0); it is not the active
+> direction. Do not enable the coupler or build on it without re-opening this
+> decision. See `docs/water-architecture.md`.
+
 - **Status:** proposed
 - **Date:** 2026-07-21
 - **Doctrine sections affected:** **NONE.** This is the headline result and it

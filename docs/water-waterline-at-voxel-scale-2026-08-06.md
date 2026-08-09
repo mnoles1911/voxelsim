@@ -1,5 +1,14 @@
 # Deciding the waterline at 10 cm, against the ground we actually draw
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for history].** This plan fixes the blocky waterline of the *baked
+> river drawn as near-field voxels*. Under the re-architecture, near-field
+> rivers are PBF particles rendered as a continuous screen-space fluid surface,
+> so the 1.875 m raster vs. 10 cm voxel edge problem this plan solves is retired
+> along with the near-field voxel draw path (Phase 5). The three-grounds
+> naming (§1) and the "never read the amplifier for the water surface" rule
+> remain correct and are restated in `docs/water-architecture.md`.
+
 **What this is.** The plan for the three problems the owner named on 2026-08-06,
 after flying the magenta marker:
 

@@ -1,5 +1,13 @@
 # Water session progress — night of 2026-08-06/07
 
+> **STATUS 2026-08-09: [PARTIALLY CURRENT].** The bake-correctness measurements
+> (consistency-pass ordering, F3's bridge-becomes-a-no-op acceptance test, the
+> depth-jump statistics) remain load-bearing — they are quality-of-data work on
+> the water plane the re-architecture still ships as faucet/ribbon data. The
+> open items aimed at the near-field draw (the banded level field for a 10 cm
+> waterline, "ponding before spilling" on the drawn shape) are superseded by
+> Phase 5 retiring that draw path. See `docs/water-architecture.md`.
+
 Branch `claude/f6-interior-rim-injection`. Written for the owner waking up, and
 for whoever picks this up next. Everything below is measured; where a number was
 retracted it is left in with the retraction, not deleted.

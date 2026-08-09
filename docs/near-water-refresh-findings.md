@@ -1,5 +1,12 @@
 # The near-field water disc: what the rebuild actually costs
 
+> **STATUS 2026-08-09: [CURRENT].** This is a shipped-infrastructure
+> performance record (`waterwindow.h`, incremental refresh, the ground-floor
+> fix). The re-architecture retires *river* meshing from the near-field
+> implicit path at Phase 5, but lakes keep using implicit fill (Phase 2's
+> "sheet actor + implicit fill" hooks), so this window/incremental machinery
+> and its ground-floor fix remain load-bearing for whatever stays on that path.
+
 Written 2026-08-05 on `claude/water-ring-invalidation`. Raw numbers in
 `docs/measurements/water-refresh-2026-08-05.txt`, produced by
 `vxc_waterrefreshprobe` over the bv14 tiles and `D:/vox-wet-cache`.

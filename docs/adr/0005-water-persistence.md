@@ -1,5 +1,12 @@
 # ADR-0005: Persisting water — the CA fill is irreducible state, and the mobilized set cannot be saved without it
 
+> **STATUS 2026-08-09: [CURRENT].** Shipped CA persistence design (`WaterState`).
+> Stays load-bearing for the frozen CA (bucket pours, cave floods). The
+> re-architecture's scalar hydrology (basin ledgers, routing graph) needs its
+> own persistence, on the same "irreducible state, not re-derivable by replay"
+> argument this ADR made first — read it before designing that. See
+> `docs/water-architecture.md`.
+
 - **Status:** **ACCEPTED** (Matt, 2026-07-22) — implemented as `WaterState`
   (`voxel-core/include/voxelcore/waterca.h`).
 - **Date:** 2026-07-21

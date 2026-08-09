@@ -1,5 +1,14 @@
 # Production water: what exists, what is missing, and the order to build it
 
+> **STATUS 2026-08-09: [SUPERSEDED by `docs/water-rearchitecture-plan-2026-08-09.md`
+> — kept for history].** This was already superseded once (see the banner
+> immediately below, from 2026-08-05) by `water-system-architecture.md`, which
+> is itself now partially superseded by the re-architecture. Its
+> deterministic-content/mutable-state reasoning and the "measure before you
+> predict" discipline are still sound in spirit, but the concrete work list
+> (§9) targets baking lake/river datums and wiring `ChannelField` into
+> worldgen — superseded by static basins + PBF. See `docs/water-architecture.md`.
+
 > ## SUPERSEDED — 2026-08-05
 >
 > **Do not plan from this document.** For how the water system works today, read
