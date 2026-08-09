@@ -49,10 +49,15 @@ void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
     segments_.clear();
     outgoingSegmentOfNode_.clear();
     extraOutgoing_.clear();
+    headwaterNodes_.clear();
+    diffLog_.clear();
     totalStorage_ = 0;
     totalInjected_ = 0;
     totalOutflowToOutlets_ = 0;
     totalWithdrawn_ = 0;
+    bakedScanned_ = 0;
+    bakedUnresolved_ = 0;
+    bakedChannelCells_ = 0;
     seed_ = seed;
 
     const int64_t w = b.px1 - b.px0 + 1;
@@ -178,6 +183,209 @@ void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
     }
 }
 
+// ---------------------------------------------------------------------------
+// buildFromBakedWater (see rivernet.h's header comment)
+// ---------------------------------------------------------------------------
+namespace {
+
+// One scanned pixel of the baked planes.
+struct BakedCell {
+    int32_t surfaceMm = 0;
+    uint8_t accumLog2 = 0;
+    bool qualifies = false;
+};
+
+// The STRICT TOTAL ORDER downstream must decrease along. Water surface first
+// (water runs down its own surface), then accumulation, then the canonical
+// (py,px) pixel index. Total and strict, so no cycle can close -- which is the
+// property that lets the builder skip the topological sort the D8 path needs.
+bool bakedLess(const BakedCell& a, size_t ia, const BakedCell& b, size_t ib) {
+    if (a.surfaceMm != b.surfaceMm) return a.surfaceMm < b.surfaceMm;
+    if (a.accumLog2 != b.accumLog2) return a.accumLog2 > b.accumLog2;
+    return ia < ib;
+}
+
+} // namespace
+
+uint32_t RiverNetwork::buildFromBakedWater(IBakedWaterSource& source, uint64_t seed,
+                                           const BakedWaterBuildParams& params) {
+    nodes_.clear();
+    segments_.clear();
+    outgoingSegmentOfNode_.clear();
+    extraOutgoing_.clear();
+    headwaterNodes_.clear();
+    diffLog_.clear();
+    totalStorage_ = 0;
+    totalInjected_ = 0;
+    totalOutflowToOutlets_ = 0;
+    totalWithdrawn_ = 0;
+    bakedScanned_ = 0;
+    bakedUnresolved_ = 0;
+    bakedChannelCells_ = 0;
+    seed_ = seed;
+
+    const RegionBounds& b = params.bounds;
+    const int64_t w = b.px1 - b.px0 + 1;
+    const int64_t h = b.py1 - b.py0 + 1;
+    if (w <= 0 || h <= 0) return 0;
+
+    const int64_t pixelSizeMm = source.pixelSizeMm();
+    if (pixelSizeMm <= 0) return 0;
+
+    const size_t count = static_cast<size_t>(w) * static_cast<size_t>(h);
+    const auto idxOf = [&](int64_t px, int64_t py) -> size_t {
+        return static_cast<size_t>((py - b.py0) * w + (px - b.px0));
+    };
+
+    // ONE SCAN, py-outer/px-inner, so index i is already the canonical
+    // (py,px) traversal order the D8 builder assigns node ids in. Keeping the
+    // two builders on ONE ordering convention is what lets a caller reason
+    // about node ids without asking which builder made the graph.
+    std::vector<BakedCell> cells(count);
+    for (int64_t py = b.py0; py <= b.py1; ++py) {
+        for (int64_t px = b.px0; px <= b.px1; ++px) {
+            const size_t i = idxOf(px, py);
+            ++bakedScanned_;
+
+            uint8_t flow = 0;
+            if (!source.flowAt(px, py, flow)) {
+                ++bakedUnresolved_;
+                continue;
+            }
+            if (!flowIsChannel(flow)) continue;
+            ++bakedChannelCells_;
+            const uint8_t accum = flowAccumLog2(flow);
+            if (accum < params.minAccumLog2) continue;
+
+            int32_t surfaceMm = 0;
+            bool wet = false;
+            if (!source.waterAt(px, py, surfaceMm, wet)) {
+                ++bakedUnresolved_;
+                if (!params.admitUnresolvedWater) continue;
+                // The ordering fallback (see BakedWaterBuildParams): a surface
+                // low enough that every resolved cell outranks it, so an
+                // unresolved cell can only ever be a terminal.
+                surfaceMm = INT32_MIN + 1;
+                wet = true;
+            } else if (params.requireWet && !wet) {
+                continue;
+            }
+
+            cells[i].surfaceMm = surfaceMm;
+            cells[i].accumLog2 = accum;
+            cells[i].qualifies = true;
+        }
+    }
+
+    // Node ids in the canonical order (== ascending i).
+    std::vector<int32_t> nodeIdOfPixel(count, -1);
+    for (size_t i = 0; i < count; ++i) {
+        if (!cells[i].qualifies) continue;
+        const int64_t px = b.px0 + static_cast<int64_t>(i % static_cast<size_t>(w));
+        const int64_t py = b.py0 + static_cast<int64_t>(i / static_cast<size_t>(w));
+        RiverNode n;
+        // The pixel CENTRE, matching buildFromFlowAccumulation... except that
+        // one takes the pixel's low corner. Both are one pixel of a 1.875 m
+        // grid apart and neither is wrong, but they must not differ, so this
+        // takes the corner too. The basin spillway compensates on its side
+        // (basinledger.h's outletVoxel centres the outlet) because a saddle is
+        // a point on the ground, not a cell of the graph.
+        n.vx = floorDiv(px * pixelSizeMm, static_cast<int64_t>(kVoxelSizeMm));
+        n.vy = floorDiv(py * pixelSizeMm, static_cast<int64_t>(kVoxelSizeMm));
+        // THE WATER SURFACE, not the bed. A RiverNode's elevationMm is what
+        // promoteChannel's strictly-descending check and rivercouple.h's
+        // outfall both read, and for a graph whose geometry came from the water
+        // plane the water surface is the consistent answer -- the bed under a
+        // 3 m river is 3 m below the thing the graph is modelling.
+        n.elevationMm = cells[i].surfaceMm;
+        nodeIdOfPixel[i] = static_cast<int32_t>(nodes_.size());
+        nodes_.push_back(n);
+    }
+
+    outgoingSegmentOfNode_.assign(nodes_.size(), kNoSegment);
+    std::vector<uint8_t> hasIncoming(nodes_.size(), 0);
+
+    for (size_t i = 0; i < count; ++i) {
+        if (nodeIdOfPixel[i] < 0) continue;
+        const int64_t px = b.px0 + static_cast<int64_t>(i % static_cast<size_t>(w));
+        const int64_t py = b.py0 + static_cast<int64_t>(i / static_cast<size_t>(w));
+
+        // Among the neighbours strictly BELOW this cell in the total order,
+        // take the LOWEST one in that same order -- lowest water surface, then
+        // greatest accumulation, then lowest pixel index. Using one order for
+        // both the "is this downstream" test and the "which downstream" choice
+        // is what makes the result a pure function of the planes: there is no
+        // second rule that could disagree with the first, and no dependence on
+        // the compass array's iteration order.
+        int bestK = -1;
+        size_t bestIdx = 0;
+        for (int k = 0; k < kD8Count; ++k) {
+            const int64_t nx = px + kD8Dx[k], ny = py + kD8Dy[k];
+            if (nx < b.px0 || nx > b.px1 || ny < b.py0 || ny > b.py1) continue;
+            const size_t ni = idxOf(nx, ny);
+            if (nodeIdOfPixel[ni] < 0) continue;
+            if (!bakedLess(cells[ni], ni, cells[i], i)) continue;
+            if (bestK >= 0 && !bakedLess(cells[ni], ni, cells[bestIdx], bestIdx)) continue;
+            bestK = k;
+            bestIdx = ni;
+        }
+        if (bestK < 0) continue; // terminal: leaves the region, or is the graph's low point
+
+        RiverSegment seg;
+        seg.fromNode = static_cast<uint32_t>(nodeIdOfPixel[i]);
+        seg.toNode = static_cast<uint32_t>(nodeIdOfPixel[bestIdx]);
+        seg.lengthMm =
+            pixelSizeMm * (kD8Diagonal[bestK] ? kDiagNumerator : kCardNumerator) / kCardNumerator;
+        // BUILD-TIME DISCHARGE IS CATCHMENT AREA IN m^2 here -- see the header
+        // comment's item 4 for why this is a third meaning and not a bug.
+        seg.discharge = flowAccumM2(cells[i].accumLog2);
+        seg.storage = 0;
+        seg.conveyance = 255;
+        seg.travelMillis = std::max<int64_t>(1, seg.lengthMm / kFlowVelocityMmPerMilli);
+
+        const uint32_t segId = static_cast<uint32_t>(segments_.size());
+        outgoingSegmentOfNode_[seg.fromNode] = segId;
+        hasIncoming[seg.toNode] = 1;
+        segments_.push_back(seg);
+    }
+
+    for (uint32_t n = 0; n < static_cast<uint32_t>(nodes_.size()); ++n) {
+        if (!hasIncoming[n]) headwaterNodes_.push_back(n);
+    }
+    return static_cast<uint32_t>(segments_.size());
+}
+
+std::vector<uint32_t> RiverNetwork::headwaterSegments() const {
+    std::vector<uint32_t> out;
+    out.reserve(headwaterNodes_.size());
+    for (uint32_t n : headwaterNodes_) {
+        const uint32_t seg = outgoingSegment(n);
+        if (seg != kNoSegment) out.push_back(seg);
+    }
+    return out;
+}
+
+uint32_t RiverNetwork::nearestSegmentToVoxel(int64_t vx, int64_t vy, int64_t maxDistMm) const {
+    uint32_t best = kNoSegment;
+    int64_t bestDist = 0;
+    for (size_t i = 0; i < segments_.size(); ++i) {
+        const RiverNode& n = nodes_[segments_[i].fromNode];
+        // The SAME integer metric channelStepLengthMm uses (major + minor *
+        // (181-128)/128), so "nearest" here and "how long is that reach" there
+        // cannot disagree about what distance means. No floats, no sqrt.
+        const int64_t dx = std::abs(n.vx - vx) * kVoxelSizeMm;
+        const int64_t dy = std::abs(n.vy - vy) * kVoxelSizeMm;
+        const int64_t major = std::max(dx, dy), minor = std::min(dx, dy);
+        const int64_t d = major + minor * (kDiagNumerator - kCardNumerator) / kCardNumerator;
+        if (d > maxDistMm) continue;
+        if (best == kNoSegment || d < bestDist) {
+            best = static_cast<uint32_t>(i);
+            bestDist = d;
+        }
+    }
+    return best;
+}
+
 void RiverNetwork::injectInflow(uint32_t segId, int32_t amount) {
     if (segId >= segments_.size() || amount <= 0) return;
     segments_[segId].storage += amount;
@@ -188,6 +396,16 @@ void RiverNetwork::injectInflow(uint32_t segId, int32_t amount) {
 void RiverNetwork::setConveyance(uint32_t segId, uint8_t factor0to255) {
     if (segId >= segments_.size()) return;
     segments_[segId].conveyance = factor0to255;
+    // Recorded AFTER the range check, so a log never carries a diff that replay
+    // would reject. Off by default -- see rivernet.h's "the diff log, as a
+    // RECORDING".
+    if (recordDiffs_) {
+        diffLog_.push_back(RiverDiffRecord{.kind = RiverDiffKind::kSetConveyance,
+                                           .segId = segId,
+                                           .value = factor0to255,
+                                           .headNode = 0,
+                                           .course = {}});
+    }
 }
 
 int32_t RiverNetwork::withdrawToCoupler(uint32_t segId, int32_t amount) {
@@ -293,6 +511,16 @@ uint32_t RiverNetwork::promoteChannel(uint32_t headNode, const std::vector<River
         segments_.push_back(seg);
         fromNode = toNode;
     }
+    // ONLY ON SUCCESS. Every rejection above returns kNoSegment having mutated
+    // nothing, so a log that recorded them would carry records replay must
+    // reject again -- harmless, but a lie about what happened.
+    if (recordDiffs_) {
+        diffLog_.push_back(RiverDiffRecord{.kind = RiverDiffKind::kDivertChannel,
+                                           .segId = firstNewSeg,
+                                           .value = 255,
+                                           .headNode = headNode,
+                                           .course = course});
+    }
     return firstNewSeg;
 }
 
@@ -388,6 +616,165 @@ int64_t RiverNetwork::recomputeTotalStorage() const {
     int64_t sum = 0;
     for (const RiverSegment& s : segments_) sum += s.storage;
     return sum;
+}
+
+RiverNetwork::RoutingSnapshot RiverNetwork::captureRoutingState() const {
+    RoutingSnapshot snap;
+    snap.segs.reserve(segments_.size());
+    for (const RiverSegment& s : segments_) {
+        snap.segs.push_back(RoutingSnapshot::Seg{s.discharge, s.storage, s.conveyance});
+    }
+    snap.totalStorage = totalStorage_;
+    snap.totalInjected = totalInjected_;
+    snap.totalOutflowToOutlets = totalOutflowToOutlets_;
+    snap.totalWithdrawn = totalWithdrawn_;
+    return snap;
+}
+
+bool RiverNetwork::restoreRoutingState(const RoutingSnapshot& snap) {
+    // VALIDATE EVERYTHING BEFORE MUTATING ANYTHING, the same rule
+    // promoteChannel follows and for a stronger reason: a half-restored ledger
+    // is a conservation invariant that fails for the rest of the session, and
+    // every conservation assertion downstream would then be measuring the load
+    // rather than the sim.
+    if (snap.segs.size() != segments_.size()) return false;
+    int64_t sum = 0;
+    for (const RoutingSnapshot::Seg& s : snap.segs) {
+        if (s.storage < 0) return false;
+        sum += s.storage;
+    }
+    if (sum != snap.totalStorage) return false;
+    if (snap.totalStorage < 0 || snap.totalInjected < 0 || snap.totalOutflowToOutlets < 0 ||
+        snap.totalWithdrawn < 0) {
+        return false;
+    }
+    if (snap.totalStorage + snap.totalOutflowToOutlets + snap.totalWithdrawn !=
+        snap.totalInjected) {
+        return false;
+    }
+
+    for (size_t i = 0; i < segments_.size(); ++i) {
+        segments_[i].discharge = snap.segs[i].discharge;
+        segments_[i].storage = snap.segs[i].storage;
+        segments_[i].conveyance = snap.segs[i].conveyance;
+    }
+    totalStorage_ = snap.totalStorage;
+    totalInjected_ = snap.totalInjected;
+    totalOutflowToOutlets_ = snap.totalOutflowToOutlets;
+    totalWithdrawn_ = snap.totalWithdrawn;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// RiverNetState -- see rivernet.h's PERSISTENCE section for the byte layout
+// ---------------------------------------------------------------------------
+namespace {
+
+// ByteWriter carries no i64 (nothing needed one until now), and adding one to
+// bytes.h would touch a header five other wire formats share. Casting through
+// u64 here is exact -- two's complement round-trips bit for bit -- and keeps
+// the change inside this file.
+void writeI64(ByteWriter& w, int64_t v) { w.u64(static_cast<uint64_t>(v)); }
+bool readI64(ByteReader& r, int64_t& v) {
+    uint64_t u = 0;
+    if (!r.u64(u)) return false;
+    v = static_cast<int64_t>(u);
+    return true;
+}
+
+} // namespace
+
+void RiverNetState::serialize(const RiverNetwork& net, std::vector<uint8_t>& out) {
+    ByteWriter w(out);
+    w.u32(kMagic);
+    w.u32(kRiverNetVersion);
+
+    const std::vector<RiverDiffRecord>& diffs = net.diffLog();
+    w.u32(static_cast<uint32_t>(diffs.size()));
+    for (const RiverDiffRecord& d : diffs) {
+        w.u8(static_cast<uint8_t>(d.kind));
+        w.u32(d.segId);
+        w.u8(d.value);
+        w.u32(d.headNode);
+        w.u32(static_cast<uint32_t>(d.course.size()));
+        for (const RiverChannelPoint& p : d.course) {
+            writeI64(w, p.vx);
+            writeI64(w, p.vy);
+            w.i32(p.elevationMm);
+            w.u32(p.existingNode);
+        }
+    }
+
+    const RiverNetwork::RoutingSnapshot snap = net.captureRoutingState();
+    w.u32(static_cast<uint32_t>(snap.segs.size()));
+    for (const RiverNetwork::RoutingSnapshot::Seg& s : snap.segs) {
+        w.i32(s.discharge);
+        w.i32(s.storage);
+        w.u8(s.conveyance);
+    }
+    writeI64(w, snap.totalStorage);
+    writeI64(w, snap.totalInjected);
+    writeI64(w, snap.totalOutflowToOutlets);
+    writeI64(w, snap.totalWithdrawn);
+}
+
+bool RiverNetState::load(const uint8_t* data, size_t size, RiverNetwork& net) {
+    ByteReader r(data, size);
+    uint32_t magic = 0, version = 0, diffCount = 0;
+    if (!r.u32(magic) || magic != kMagic) return false;
+    if (!r.u32(version) || version != kRiverNetVersion) return false;
+    if (!r.u32(diffCount)) return false;
+    // A diff is at least 14 bytes on the wire, so a count that could not
+    // possibly be backed by the remaining bytes fails here rather than after
+    // reserving memory for it.
+    if (static_cast<size_t>(diffCount) > size / 14 + 1) return false;
+
+    std::vector<RiverDiffRecord> diffs;
+    diffs.reserve(diffCount);
+    for (uint32_t i = 0; i < diffCount; ++i) {
+        RiverDiffRecord d;
+        uint8_t kind = 0;
+        uint32_t courseLen = 0;
+        if (!r.u8(kind) || !r.u32(d.segId) || !r.u8(d.value) || !r.u32(d.headNode) ||
+            !r.u32(courseLen)) {
+            return false;
+        }
+        if (kind > static_cast<uint8_t>(RiverDiffKind::kDivertChannel)) return false;
+        d.kind = static_cast<RiverDiffKind>(kind);
+        if (static_cast<size_t>(courseLen) > size / 24 + 1) return false;
+        d.course.resize(courseLen);
+        for (uint32_t c = 0; c < courseLen; ++c) {
+            if (!readI64(r, d.course[c].vx) || !readI64(r, d.course[c].vy) ||
+                !r.i32(d.course[c].elevationMm) || !r.u32(d.course[c].existingNode)) {
+                return false;
+            }
+        }
+        diffs.push_back(std::move(d));
+    }
+
+    uint32_t segCount = 0;
+    if (!r.u32(segCount)) return false;
+    if (static_cast<size_t>(segCount) > size / 9 + 1) return false;
+    RiverNetwork::RoutingSnapshot snap;
+    snap.segs.resize(segCount);
+    for (uint32_t i = 0; i < segCount; ++i) {
+        if (!r.i32(snap.segs[i].discharge) || !r.i32(snap.segs[i].storage) ||
+            !r.u8(snap.segs[i].conveyance)) {
+            return false;
+        }
+    }
+    if (!readI64(r, snap.totalStorage) || !readI64(r, snap.totalInjected) ||
+        !readI64(r, snap.totalOutflowToOutlets) || !readI64(r, snap.totalWithdrawn)) {
+        return false;
+    }
+    if (!r.atEnd()) return false;
+
+    // Diffs FIRST: kDivertChannel adds segments, so the snapshot's count is a
+    // statement about the POST-replay graph. Replayed through applyGraphDiff so
+    // the load path and the live path are the same code -- which is what makes
+    // the round trip byte-exact rather than merely plausible.
+    for (const RiverDiffRecord& d : diffs) net.applyGraphDiff(d);
+    return net.restoreRoutingState(snap);
 }
 
 void RiverNetwork::digest(Digest& d) const {

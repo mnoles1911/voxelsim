@@ -194,10 +194,65 @@
 // outfall back-pressures the reach, its storage rises, and that is the same
 // "stage rises" mechanism the dam already uses. See rivercouple.h.
 
+// -----------------------------------------------------------------------
+// buildFromBakedWater (v1 generation, water re-architecture Phase 2)
+// -----------------------------------------------------------------------
+// buildFromFlowAccumulation above runs its OWN D8 over the elevation lattice,
+// which means the graph's geometry is the client's opinion about where rivers
+// are, while the rivers the PLAYER SEES are the bake's water plane. Those two
+// disagree -- the bake's channels come from a full hydrology pass with carried
+// discharge, monotone settling and bank carving, none of which a 16-line D8
+// reproduces -- and once the graph is the AUTHORITY for how much water a reach
+// carries (plan §4/§5), a graph that runs down a different valley than the
+// drawn river is not an approximation, it is a different river.
+//
+// So this second builder constructs the same graph from the SHIPPED PLANES:
+// the water plane says where water is and how high it stands, and the flow
+// plane's channel bit + log2 accumulation say which of those cells is a
+// channel and how much catchment is behind it. Both are already on the wire
+// and already what the renderer draws.
+//
+//   1. A pixel QUALIFIES as a node iff its flow byte has the CHANNEL bit and
+//      its log2 accumulation is >= minAccumLog2 (and, when requireWet, the
+//      water plane calls it wet -- see BakedWaterBuildParams).
+//   2. DOWNSTREAM IS THE WATER SURFACE, not the ground. Each qualifying pixel
+//      routes to the LOWEST of its qualifying 8-neighbours under one strict
+//      total order: water surface ascending, then accumulation DESCENDING,
+//      then pixel index ascending. So the lowest surface wins, ties go to the
+//      bigger river, and the remainder is broken canonically. Ordering on the
+//      water
+//      surface is both the physically right answer (water flows down its own
+//      surface, not down the bed) and what makes the result ACYCLIC for free:
+//      every edge strictly decreases a total order, so no cycle can close.
+//      Flat reaches -- where the bake's surface is exactly equal across
+//      several cells -- fall through to accumulation and then to pixel index,
+//      which is deterministic but arbitrary. Documented rather than fixed:
+//      exact routing over a flat pool is a basin question, not a channel one,
+//      and the basin table already answers it.
+//   3. HEADWATERS are the qualifying nodes with NO incoming segment, exposed
+//      as headwaterNodes()/headwaterSegments() -- the emitters Phase 3 hangs
+//      its faucets on. THE APPROXIMATION, stated plainly: a reach that enters
+//      the region from outside its bounds has no in-edge inside the region and
+//      is therefore reported as a head, so the region's upstream rim is full of
+//      false heads. A caller placing faucets must either build over a region
+//      wider than the one it emits in, or wait for the bake's own
+//      `water_head_mask` (computed at water.py:480-525 and currently DISCARDED
+//      at pipeline.py:5300), which Phase 1 ships and which is the exact answer.
+//   4. `discharge` at build time means UPSTREAM CATCHMENT AREA IN m^2 here,
+//      decoded from the flow byte's log2 bucket -- a THIRD meaning for that
+//      field, and the reason the two builders are separate entry points rather
+//      than one with a flag. buildFromFlowAccumulation's build-time discharge
+//      is mm/yr of accumulated rainfall; after the first step() both mean the
+//      routed outflow. A caller converting build-time discharge into a
+//      baseflow rate must know which builder produced the graph.
+//
+// The old builder is KEPT and unchanged. Nothing that ships today moves.
+
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
 
+#include "voxelcore/bytes.h"
 #include "voxelcore/core.h"
 #include "voxelcore/tiles.h"
 
@@ -223,7 +278,47 @@ namespace vxc {
 // topology can grow -- so a persisted graph-diff log or a recorded session
 // from before this is no longer reproducible against it. Per
 // docs/determinism.md that divergence is exactly what the constant signals.
-inline constexpr uint32_t kRiverNetVersion = 3;
+//
+// v4 (water re-architecture Phase 2): buildFromBakedWater adds a SECOND
+// generation path, and RiverNetState persists a graph's diff log and routing
+// state. No existing generation rule and no routing rule changed -- the pinned
+// golden (tests/test_rivernet.cpp, 0xEC84E0B592821C38) is BYTE-IDENTICAL to v3
+// and the D8 builder's arithmetic is untouched. The bump is for the same reason
+// v3's was: a persisted graph-diff log now exists, and a log recorded against a
+// build that had no buildFromBakedWater and no RiverNetState is not
+// reproducible against one that does. Per docs/determinism.md that divergence
+// is exactly what the constant signals.
+inline constexpr uint32_t kRiverNetVersion = 4;
+
+// ---------------------------------------------------------------------------
+// THE FLOW BYTE (docs/vxtl-v2-format.md §6; terrain_service/tile_codec.py:378-383)
+// ---------------------------------------------------------------------------
+//
+// bits 0-4: log2 of the upstream flow accumulation in m^2, clamped 0..31.
+// bit 5: channel. bit 6: bank. bit 7: deposition.
+//
+// THE THIRD COPY OF THIS, and it is a copy on purpose rather than an accident:
+// tile_codec.py owns the encoder's names, docs/vxtl-v2-format.md owns the
+// prose, and until now the C++ side decoded the plane to raw bytes and named
+// none of its bits -- FVoxelFineTileStreamer.cpp:223 says outright that nothing
+// in ue-project reads it. These live HERE rather than in tilestore.h only
+// because tilestore.h is being changed by the basin-table-v2 work concurrently;
+// they belong beside the decoder and should move there when that lands.
+inline constexpr uint8_t kFlowLog2Mask = 0x1F;
+inline constexpr uint8_t kFlowBitChannel = 1u << 5;
+inline constexpr uint8_t kFlowBitBank = 1u << 6;
+inline constexpr uint8_t kFlowBitDeposition = 1u << 7;
+
+constexpr uint8_t flowAccumLog2(uint8_t flowByte) { return uint8_t(flowByte & kFlowLog2Mask); }
+constexpr bool flowIsChannel(uint8_t flowByte) { return (flowByte & kFlowBitChannel) != 0; }
+// The log2 bucket back to an area in m^2, saturating rather than wrapping: the
+// top bucket is 2^31 m^2 = 2,147 km^2 of catchment, which int32 cannot hold as
+// a discharge, and a wrapped negative discharge would make a trunk reach look
+// like a headwater.
+constexpr int32_t flowAccumM2(uint8_t flowByte) {
+    const int32_t log2 = int32_t(flowAccumLog2(flowByte));
+    return log2 >= 31 ? INT32_MAX : int32_t(int64_t(1) << log2);
+}
 
 // Default minimum accumulated rainfall, in mm/yr summed over the upstream
 // catchment, for a pixel to become a river node.
@@ -262,6 +357,74 @@ struct RiverSegment {
 // Inclusive tile-pixel rectangle (same pixel space as ITileSampler).
 struct RegionBounds {
     int64_t px0 = 0, py0 = 0, px1 = 0, py1 = 0;
+};
+
+// ---------------------------------------------------------------------------
+// THE BAKED WATER + FLOW PLANES, as buildFromBakedWater needs them
+// ---------------------------------------------------------------------------
+//
+// AN INTERFACE RATHER THAN A FineTileSampler& and that is deliberate twice
+// over. First, it keeps this header's documented dependency set intact --
+// rivernet.h depends on tiles.h and nothing else, exactly as waterca.h is
+// terrain-free, and reaching for tilestore.h here would put the whole fine-tile
+// decoder behind every include of the routing graph. Second, it is what makes
+// the builder testable at all: a synthetic source is twenty lines, where a
+// fixture tile that carries a plausible river is a bake.
+//
+// The concrete adapter over the shipped fine tier is
+// `vxc::FineTileBakedWaterSource` in voxelcore/basinledger.h, which is where
+// the other baked-hydrology adapters live.
+class IBakedWaterSource {
+public:
+    virtual ~IBakedWaterSource() = default;
+
+    // Fine-tile pixel pitch in mm (1875 on the shipped tier).
+    virtual int32_t pixelSizeMm() const = 0;
+
+    // The water plane at one FINE pixel. `outSurfaceMm` is the absolute water
+    // surface and `outWet` distinguishes a genuinely wet cell from a dry cell
+    // that merely carries a level band (tilestore.h `waterCpIsWet`) -- the
+    // distinction the level band exists for, and one a channel test must
+    // respect or the graph grows a node in every dry collar cell.
+    //
+    // False means UNRESOLVABLE (tile absent, block not fetched, plane missing),
+    // which is not "dry": the builder skips the pixel and counts it, so a graph
+    // built over a half-streamed region is short a reach and says so, rather
+    // than silently routing a river into a hole.
+    virtual bool waterAt(int64_t px, int64_t py, int32_t& outSurfaceMm, bool& outWet) = 0;
+
+    // The flow byte at one FINE pixel (channel bit + log2 accumulation; see
+    // kFlowBitChannel above). Same false-means-unresolvable contract.
+    virtual bool flowAt(int64_t px, int64_t py, uint8_t& outFlow) = 0;
+};
+
+// Knobs for buildFromBakedWater. Every default is the conservative one: take
+// the bake at its word, require both the channel bit and standing water, and
+// let the caller loosen it.
+struct BakedWaterBuildParams {
+    // Inclusive FINE-pixel rectangle to build over.
+    RegionBounds bounds{};
+
+    // Minimum log2(catchment m^2) for a channel cell to become a node. 0 admits
+    // every channel cell the bake marked. This is the direct analogue of
+    // buildFromFlowAccumulation's accumThreshold and it is in a DIFFERENT UNIT
+    // (a log2 bucket of area, not mm/yr of rain), which is the same currency
+    // warning the header comment gives for `discharge`.
+    uint8_t minAccumLog2 = 0;
+
+    // Require the water plane to call the cell WET, not merely banded. On is
+    // correct for "the rivers the player sees"; off lets the graph follow a
+    // baked channel through a reach the bake left dry (a seasonal wash), which
+    // is a legitimate thing to want and a wrong default.
+    bool requireWet = true;
+
+    // When the water plane cannot resolve a cell but the flow plane can, admit
+    // it using the elevation-free fallback surface of INT32_MIN+1 so ordering
+    // still works. OFF by default: a river routed through unresolved cells is
+    // exactly the "silently routing into a hole" case waterAt's contract warns
+    // about. Left as a knob only because a caller doing a coarse survey over a
+    // partially streamed region may genuinely prefer a rough graph to none.
+    bool admitUnresolvedWater = false;
 };
 
 // Sea level for the graph. A node at or below this elevation is AT THE SEA,
@@ -329,9 +492,52 @@ public:
                                    const RegionBounds& bounds,
                                    int64_t accumThreshold = kRiverAccumThresholdDefault);
 
+    // v1 generation from the SHIPPED water + flow planes (see the header
+    // comment "buildFromBakedWater"). Clears any previously built graph,
+    // ledgers, diff log and headwater set, exactly as the D8 builder does.
+    // Returns the number of segments built; 0 means the region carries no
+    // baked channel that met `minAccumLog2` (check bakedCellsUnresolved()
+    // before concluding it is dry).
+    uint32_t buildFromBakedWater(IBakedWaterSource& source, uint64_t seed,
+                                 const BakedWaterBuildParams& params);
+
+    // Nodes with NO incoming segment -- the headwaters, in ascending node id.
+    // Empty for a graph built by buildFromFlowAccumulation (which does not
+    // compute them) even though that graph has heads; ask buildFromBakedWater
+    // for them, or derive them the way test_rivernet.cpp's determinism test
+    // does. See the header comment for what makes these APPROXIMATE.
+    const std::vector<uint32_t>& headwaterNodes() const { return headwaterNodes_; }
+    // The outgoing segment of each headwater node, i.e. exactly the segment ids
+    // an emitter should injectInflow into. Same order as headwaterNodes(); a
+    // head with no outgoing segment (an isolated one-cell channel) is omitted,
+    // so this can be shorter.
+    std::vector<uint32_t> headwaterSegments() const;
+
+    // Cells buildFromBakedWater asked about and could not resolve (see
+    // IBakedWaterSource). NON-ZERO MEANS THE GRAPH IS SHORT REACHES, which
+    // looks exactly like a dry valley -- the ran-flag half of the pair with
+    // bakedCellsScanned().
+    uint64_t bakedCellsUnresolved() const { return bakedUnresolved_; }
+    uint64_t bakedCellsScanned() const { return bakedScanned_; }
+    uint64_t bakedChannelCells() const { return bakedChannelCells_; }
+
     const std::vector<RiverNode>& nodes() const { return nodes_; }
     const std::vector<RiverSegment>& segments() const { return segments_; }
     uint32_t segmentCount() const { return static_cast<uint32_t>(segments_.size()); }
+
+    // The segment whose FROM node is nearest (Chebyshev-with-diagonal-weighting
+    // in world mm, the same integer metric channelStepLengthMm uses) to a world
+    // VOXEL position, or kNoSegment when the graph is empty or nothing lies
+    // within `maxDistMm`. O(segments); intended for the once-per-spill lookup
+    // the basin spillway does, not for a per-tick sweep.
+    //
+    // THE SPILLWAY'S ENTRY POINT. `BasinEntry::outletX/Y` names the saddle a
+    // lake overflows at; this turns that into the reach the overflow joins.
+    // Refusing beyond maxDistMm is what keeps a spill from teleporting into an
+    // unrelated valley when the graph does not happen to cover the outlet --
+    // the caller then refunds the units to the basin (see
+    // basinledger.h `routeSpills`) and the lake back-pressures instead.
+    uint32_t nearestSegmentToVoxel(int64_t vx, int64_t vy, int64_t maxDistMm) const;
 
     // The segment rooted at `nodeId` (i.e. fromNode == nodeId), or
     // kNoSegment if that node has no outgoing segment (a terminal/outlet
@@ -417,6 +623,66 @@ public:
     // totalStorage() (tests only; O(segments)).
     int64_t recomputeTotalStorage() const;
 
+    // --- the diff log, as a RECORDING (persistence, Phase 2) ----------------
+    //
+    // The header's "Hydrology graph-diff" section already establishes that a
+    // log of RiverDiffRecords replayed against a freshly built graph reproduces
+    // the same topology and conveyance. What did not exist is anything that
+    // KEEPS the log, so a session's dams and diversions died with the process.
+    //
+    // Recording is OFF by default and, when off, costs one bool test in
+    // setConveyance and one in promoteChannel -- so an unarmed graph runs the
+    // arithmetic it always ran and the pinned golden cannot move.
+    //
+    // applyGraphDiff dispatches THROUGH setConveyance/promoteChannel, so
+    // replaying a log into a recording graph rebuilds an identical log. That is
+    // the property that makes save -> load -> save byte-identical, and
+    // test_rivernet's round-trip asserts it rather than assuming it.
+    //
+    // ONLY SUCCESSFUL CHANGES ARE RECORDED: promoteChannel rejects
+    // conservatively and a rejected promotion mutates nothing, so logging it
+    // would put a record in the log that replay would reject again -- harmless
+    // but a lie about what happened.
+    void setDiffRecording(bool on) { recordDiffs_ = on; }
+    bool diffRecording() const { return recordDiffs_; }
+    const std::vector<RiverDiffRecord>& diffLog() const { return diffLog_; }
+    void clearDiffLog() { diffLog_.clear(); }
+
+    // --- routing state, for persistence -------------------------------------
+    //
+    // The diff log carries the DECISIONS; this carries the WATER. They are
+    // different facts and both have to survive a reload: replaying the log
+    // rebuilds the dams, but not the reservoir that had piled up behind one.
+    struct RoutingSnapshot {
+        struct Seg {
+            int32_t discharge = 0;
+            int32_t storage = 0;
+            uint8_t conveyance = 255;
+
+            friend bool operator==(const Seg&, const Seg&) = default;
+        };
+        std::vector<Seg> segs;
+        int64_t totalStorage = 0;
+        int64_t totalInjected = 0;
+        int64_t totalOutflowToOutlets = 0;
+        int64_t totalWithdrawn = 0;
+
+        friend bool operator==(const RoutingSnapshot&, const RoutingSnapshot&) = default;
+    };
+
+    RoutingSnapshot captureRoutingState() const;
+
+    // Overwrites every segment's storage/discharge/conveyance and all four
+    // ledger totals. ALL-OR-NOTHING: returns false and mutates nothing if the
+    // snapshot's segment count differs from this graph's (a blob for a
+    // different region, or one whose diff log did not replay), if the totals
+    // fail the header's exact-integer identity
+    //     totalStorage + totalOutflowToOutlets + totalWithdrawn == totalInjected,
+    // or if the per-segment storages do not sum to totalStorage. A partially
+    // applied snapshot is a conservation ledger that lies for the rest of the
+    // session, and the whole point of the ledger is that it does not.
+    bool restoreRoutingState(const RoutingSnapshot& snap);
+
     // Deterministic digest over every segment, in id (== build/vector)
     // order -- already canonical, no separate sort needed (see header
     // comment "Graph model").
@@ -441,6 +707,64 @@ private:
     int64_t totalInjected_ = 0;
     int64_t totalOutflowToOutlets_ = 0;
     int64_t totalWithdrawn_ = 0;
+
+    // buildFromBakedWater's outputs and its ran-flags.
+    std::vector<uint32_t> headwaterNodes_;
+    uint64_t bakedScanned_ = 0;
+    uint64_t bakedUnresolved_ = 0;
+    uint64_t bakedChannelCells_ = 0;
+
+    bool recordDiffs_ = false;
+    std::vector<RiverDiffRecord> diffLog_;
+};
+
+// ---------------------------------------------------------------------------
+// PERSISTENCE (water re-architecture Phase 2)
+// ---------------------------------------------------------------------------
+//
+// WHAT IS SAVED AND WHY IT IS TWO THINGS. A river graph after a session is
+// (base topology from the region) + (the decisions a player made) + (the water
+// currently in the reaches). The base is rebuilt by running the same builder
+// over the same region, so it is not in the blob. The other two are, and they
+// are separate sections because they fail differently: a diff log that will not
+// replay is a corrupt save, while routing state that does not match is merely a
+// graph built over different bounds -- and the second must not be able to make
+// the first unreadable.
+//
+// Little-endian, integer only, bytes.h primitives -- the same shape
+// WaterState and EditLog use.
+//
+//   u32 magic, u32 kRiverNetVersion
+//   u32 diffCount, then per diff:
+//       u8 kind, u32 segId, u8 value, u32 headNode,
+//       u32 courseLen, then per point: i64 vx, i64 vy, i32 elevationMm,
+//                                      u32 existingNode
+//   u32 segCount, then per segment: i32 discharge, i32 storage, u8 conveyance
+//   i64 totalStorage, i64 totalInjected, i64 totalOutflowToOutlets,
+//   i64 totalWithdrawn
+//
+// VERSIONED ON kRiverNetVersion, not on a private counter, and that is the
+// whole compatibility story: the routing math IS the meaning of `storage`, so a
+// blob written by different math must be refused rather than reinterpreted --
+// the identical argument WaterState makes for kWaterCAVersion.
+struct RiverNetState {
+    static constexpr uint32_t kMagic = 0x54534E52; // "RNST" little-endian
+
+    // Appends the graph's diff log and routing state to `out`; does not clear.
+    static void serialize(const RiverNetwork& net, std::vector<uint8_t>& out);
+
+    // Decodes, validates, then applies to an ALREADY BUILT `net` -- diffs first
+    // (which may add segments, so the routing section's count is checked
+    // against the POST-replay graph), then the routing snapshot.
+    //
+    // False on bad magic, a version mismatch, truncation, trailing bytes, an
+    // implausible count, a diff that fails to replay into a topology matching
+    // the snapshot's segment count, or a snapshot that fails
+    // restoreRoutingState's ledger identity. On a false the graph may have had
+    // diffs applied -- which is why the caller's correct response is to discard
+    // the graph and rebuild it, exactly as LoadWaterState discards and reverts
+    // to the implicit field.
+    static bool load(const uint8_t* data, size_t size, RiverNetwork& net);
 };
 
 } // namespace vxc

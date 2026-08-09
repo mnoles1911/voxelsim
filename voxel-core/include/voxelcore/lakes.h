@@ -148,6 +148,60 @@ size_t lakeExtentFill(const BasinEntry& b, ElevFn&& elev, std::vector<uint8_t>& 
 
 // What the composed ImplicitFn asks, and the only thing this layer answers.
 //
+// ---------------------------------------------------------------------------
+// THE LEDGER-DELTA HOOK (water re-architecture Phase 2)
+// ---------------------------------------------------------------------------
+//
+// A basin's datum on the wire is its BAKED EQUILIBRIUM surface -- where the
+// climate says the lake stands when nothing has happened to it. Runtime
+// hydrology moves it: rain routed down the graph fills a lake, a player
+// breaches a sill and drains one. The authoritative "how far from equilibrium
+// is this basin now" scalar is a per-basin int64 volume delta living in
+// voxelcore/basinledger.h, and THIS interface is the one seam through which the
+// drawn water asks about it.
+//
+// ONE SEAM, not two, and that is the whole reason it is here rather than at the
+// two call sites. `LakeSampler::surfaceAtPixel` feeds the near-field implicit
+// fill, and the sheet gather feeds the far-field rectangles; if each applied
+// the delta itself, the near field and the far field could disagree about how
+// high a lake stands, which is the exact seam the sheet was careful to close
+// when it shipped.
+//
+// THE DEFAULT IS THE BAKED SURFACE. An implementation that holds no delta for a
+// basin must return `baked.surfaceMm` unchanged, and a sampler with no datum
+// source at all behaves bit-identically to the version before this existed --
+// which is what keeps every shipped lake, and every pinned test, where it was.
+//
+// KNOWN v0 LIMIT, written down because it is visible rather than theoretical:
+// the EXTENT does not move with the datum. Masks are built once against the
+// baked `surfaceMm` (see `maskFor`), so a lake credited up towards its sill
+// renders at the correct HEIGHT inside the outline it had when it was at
+// equilibrium, and a drained one keeps the wider outline. In the near field the
+// per-voxel `zMm >= amplifiedGroundMm` bound hides the second case entirely and
+// most of the first; the far-field sheet shows both. The fix is a mask taken at
+// the sill, which is cheap to build and expensive to keep for every basin --
+// deferred until basin table v2 ships an extent the client does not have to
+// reconstruct.
+//
+// SECOND KNOWN v0 LIMIT: a DRY basin credited water does not draw. `indexFor`
+// skips every row where `holdsWater()` is false, so a playa or a salt flat is
+// not in the bucket index at all and `surfaceAtPixel` never reaches its datum.
+// The LEDGER still tracks it correctly -- the volume is real, it spills at the
+// right level, and it persists -- it simply is not rendered. Admitting dry rows
+// to the index would build an extent mask for every playa in every tile whether
+// or not one ever fills, which is the cost the index exists to avoid; the right
+// fix is to admit a row when the ledger reports a non-zero delta for it, and it
+// needs the index to be invalidated on the first credit rather than only on a
+// tile change.
+class IBasinDatumSource {
+public:
+    virtual ~IBasinDatumSource() = default;
+    // Absolute mm the basin's surface stands at RIGHT NOW. `baked` is the row
+    // as shipped; returning `baked.surfaceMm` is the correct answer for a basin
+    // this source knows nothing about.
+    virtual int32_t basinDatumMm(int32_t tx, int32_t ty, const BasinEntry& baked) = 0;
+};
+
 // An interface rather than a concrete class because two implementations
 // already matter: `LakeSampler` over baked tiles, and "nothing is baked here"
 // -- a client with no fine tier must still run, with the ocean and the caverns
@@ -190,6 +244,30 @@ public:
     // bbox into world millimetres. 0 means "this sampler has no tiles".
     virtual uint32_t tilePixels() const { return 0; }
     virtual int32_t pixelSizeMm() const { return 0; }
+
+    // The LEDGER-ADJUSTED datum for one row of `basinsForTile` (see
+    // IBasinDatumSource above). Every consumer of a basin's height must ask
+    // this instead of reading `BasinEntry::surfaceMm` directly, or the far
+    // field will draw a lake at a height the near field has already left.
+    //
+    // Defaulted to the baked surface, so a sampler that has no ledger -- and
+    // every existing caller that has not been taught about one -- behaves
+    // exactly as it did before Phase 2.
+    virtual int32_t basinDatumMm(int32_t /*tx*/, int32_t /*ty*/, const BasinEntry& baked) {
+        return baked.surfaceMm;
+    }
+
+    // Binds the ledger, and drops whatever the sampler memoised against the
+    // datum it had before.
+    //
+    // THESE ARE ON THE INTERFACE, not on LakeSampler, for the reason
+    // ribbonTiles()/ribbonRivers() are: UE modules build with /GR- so there is
+    // no dynamic_cast, a static_cast onto the wrong sampler is silent memory
+    // corruption, and the host holds only an IWaterSampler*. Defaulted to no-ops
+    // so a world with no fine tier -- or with a sampler that has no basins --
+    // ignores a ledger it could not use anyway.
+    virtual void setBasinDatumSource(IBasinDatumSource* /*source*/) {}
+    virtual void invalidateBasinDatumMemo() {}
 
     // ---- THE RIBBON HALF (far-field FLOWING water, riverribbon.h) ----------
     //
@@ -284,6 +362,29 @@ public:
 
     explicit LakeSampler(FineTileSampler& tiles) : tiles_(tiles) {}
 
+    // --- the ledger-delta hook (see IBasinDatumSource) ----------------------
+    //
+    // Borrowed and optional; null (the default) means every basin stands at its
+    // baked equilibrium and this class runs the arithmetic it always ran. The
+    // source must outlive the sampler.
+    void setBasinDatumSource(IBasinDatumSource* source) override {
+        datum_ = source;
+        memoValid_ = false; // the memo below caches a DATUM, not a mask
+    }
+    IBasinDatumSource* datumSource() const { return datum_; }
+
+    // Drops the one-entry column memo. A host must call this whenever it moves
+    // a basin's ledger delta, because the memo answers "the surface over this
+    // pixel" and a credit changes that answer without changing the pixel. One
+    // entry deep, so this is not a cache flush, it is a single bool -- and the
+    // alternative (a generation counter threaded through the ledger) buys
+    // nothing at this size.
+    void invalidateBasinDatumMemo() override { memoValid_ = false; }
+
+    int32_t basinDatumMm(int32_t tx, int32_t ty, const BasinEntry& baked) override {
+        return datum_ == nullptr ? baked.surfaceMm : datum_->basinDatumMm(tx, ty, baked);
+    }
+
     // Decodes and indexes the tile's registry. Optional -- queries do it on
     // demand -- but doing it up front is what makes the query path a pure
     // read. False when the tile is not loaded.
@@ -328,7 +429,13 @@ public:
             if (mask.empty()) continue;
             const int32_t w = int32_t(b.bboxX1) - int32_t(b.bboxX0) + 1;
             if (!mask[size_t(ly - b.bboxY0) * size_t(w) + size_t(lx - b.bboxX0)]) continue;
-            if (b.surfaceMm > best) best = b.surfaceMm;
+            // THE LEDGER-ADJUSTED DATUM, not the bare wire field. With no datum
+            // source this is `b.surfaceMm` and the comparison below is
+            // byte-identical to what shipped; with one, a credited basin stands
+            // higher here and therefore in the implicit fill, the marker and
+            // every test that reads through this sampler, all at once.
+            const int32_t datumMm = basinDatumMm(tx, ty, b);
+            if (datumMm > best) best = datumMm;
         }
         return best;
     }
@@ -458,6 +565,7 @@ private:
     }
 
     FineTileSampler& tiles_;
+    IBasinDatumSource* datum_ = nullptr;
     std::unordered_map<uint64_t, TileIndex> index_;
     size_t maskCount_ = 0;
     uint64_t unresolved_ = 0;
@@ -679,6 +787,11 @@ public:
 
     uint32_t tilePixels() const override { return tiles_.tileSize(); }
     int32_t pixelSizeMm() const override { return tiles_.pixelSizeMm(); }
+    // No basins here, so no datum to adjust -- but this sampler DOES hold a
+    // one-entry column memo over the same composite query, and a caller
+    // invalidating the lake half must be able to invalidate this one in the
+    // same call or a stale answer survives a pixel longer than it should.
+    void invalidateBasinDatumMemo() override { memoValid_ = false; }
 
     size_t residentBlockCount() const { return blocks_.size(); }
     // Blocks whose payload failed to decode. Non-zero means water is MISSING,
@@ -745,6 +858,22 @@ public:
     }
     uint32_t tilePixels() const override { return lakes_.tilePixels(); }
     int32_t pixelSizeMm() const override { return lakes_.pixelSizeMm(); }
+    // The ledger datum belongs to the lakes for the same reason the registry
+    // does: a river reach has no basin row to adjust.
+    int32_t basinDatumMm(int32_t tx, int32_t ty, const BasinEntry& baked) override {
+        return lakes_.basinDatumMm(tx, ty, baked);
+    }
+    void setBasinDatumSource(IBasinDatumSource* source) override {
+        lakes_.setBasinDatumSource(source);
+    }
+    void invalidateBasinDatumMemo() override {
+        // BOTH halves. The river sampler holds no basins, but it holds its own
+        // one-entry column memo over the SAME composite query, so leaving it
+        // warm would let a stale lake answer survive one pixel longer than the
+        // lake sampler's own.
+        lakes_.invalidateBasinDatumMemo();
+        rivers_.invalidateBasinDatumMemo();
+    }
 
     // The ribbon half is the exact mirror of the sheet half above: the sheet
     // belongs to the lakes because a reach is not a disc, and the ribbon

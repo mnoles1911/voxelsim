@@ -16,6 +16,9 @@
 // voxel-core is UE-header-free C++20; safe to include directly from a UE
 // module .cpp (same doctrine note as VoxelWorldSubsystem.cpp).
 #include "voxelcore/amplifier.h"
+// Water re-architecture Phase 2: the scalar hydrology authority. The ledger,
+// the client-reconstructed capacity curve and the two fine-tier adapters.
+#include "voxelcore/basinledger.h"
 #include "voxelcore/bytes.h"
 #include "voxelcore/caverns.h"
 #include "voxelcore/lakes.h"
@@ -229,10 +232,47 @@ vxc::BrickKey ToBrickKey(const VoxelCoords::FVoxelCoord& C)
 // A reader that stops after the brick array simply ignores it, so an old client
 // degrades to the pre-9c behaviour (bricks stay mobilized) rather than
 // desynchronising on a length mismatch.
+//
+// --- THE BASIN-LEDGER SECTION (water re-architecture Phase 2) ---------------
+//
+// A third trailing section: `u32 tag, u32 version, u32 count`, then `u64
+// basinId, i64 delta` per basin.
+//
+// WHY THIS CHANNEL RATHER THAN A NEW ONE. The plan's §5 promise is that
+// "nothing particle-shaped crosses the wire; scalars replicate", and the
+// scalars are TINY -- 16 bytes per lake that moved, against 524 bytes per water
+// brick. Standing up a second multicast for a payload three orders of magnitude
+// smaller than the one already going out at the same 5 Hz would be a second
+// thing to keep in step for no bytes saved. It rides along.
+//
+// WHY IT IS SAFE TO APPEND. The two sections above already establish the
+// pattern and the reader already honours it: `ApplyReplicatedWaterDiffs` reads
+// the removal count with `if (R.u32(...))` and treats absence as "a batch from
+// a build that predates this section". A third section inherits that exactly --
+// an old client stops after the removals and is merely a client whose lakes do
+// not move, which is the pre-Phase-2 behaviour rather than a desync.
+//
+// THE TAG IS NOT DECORATION. Sections 1 and 2 are positional, which was fine
+// while there were two of them and it is not fine at three: a new client
+// reading an old batch that happens to have trailing bytes would take them for
+// a basin count. The tag makes a section that is not this section
+// unmistakable, and the version beside it makes a FOURTH section addable
+// without this argument having to be had again.
+//
+// CAPPED, and capped at rows rather than at bytes: 256 basins is 4 KB out of
+// the 32 KB round, and there is no world in which more than 256 lakes change
+// level in 200 ms for any reason other than a bug. The remainder waits, exactly
+// as deferred fill does.
+constexpr uint32 kBasinSectionTag = 0x44534E42; // "BNSD" little-endian
+constexpr uint32 kBasinSectionVersion = 1;
+constexpr size_t kMaxBasinRowsPerBroadcast = 256;
+
 void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const std::vector<vxc::BrickKey>& Removals,
+                          const std::vector<std::pair<uint64_t, int64_t>>& BasinRows,
                           const vxc::WaterCA& CA, int32 MaxBytes, TArray<uint8>& OutBytes,
                           int32& OutEncodedBrickCount, size_t& OutConsumedKeyCount,
-                          int32& OutEncodedRemovalCount, size_t& OutConsumedRemovalCount)
+                          int32& OutEncodedRemovalCount, size_t& OutConsumedRemovalCount,
+                          int32& OutEncodedBasinCount, size_t& OutConsumedBasinCount)
 {
 	std::vector<uint8_t> Bytes;
 	vxc::ByteWriter W(Bytes);
@@ -249,10 +289,19 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const std::vect
 	// reappearing as a replication backlog. Fill defers gracefully (it is
 	// re-sent next round because the brick is still dirty); a removal is drained
 	// from its queue exactly once, so it must not be dropped.
+	constexpr size_t BasinRowSize = 16; // u64 id + i64 delta
 	const size_t RemovalBudget = std::min(Removals.size(), size_t(64));
-	const size_t FillCap = size_t(MaxBytes) > (RemovalBudget * RemovalSize + 4)
-	                           ? size_t(MaxBytes) - RemovalBudget * RemovalSize - 4
-	                           : size_t(MaxBytes);
+	// RESERVE FOR THE BASINS TOO, and for the same reason as the removals: a
+	// basin row is 33x cheaper than a brick, and a lake whose level moved is a
+	// GAMEPLAY fact -- it is what a returning player sees from the ridge -- so
+	// letting a flood of fill crowd it out round after round would leave clients
+	// looking at a lake the authority drained minutes ago. 12 bytes of section
+	// header on top of the rows.
+	const size_t BasinBudget = std::min(BasinRows.size(), kMaxBasinRowsPerBroadcast);
+	const size_t Reserved = RemovalBudget * RemovalSize + 4 + BasinBudget * BasinRowSize +
+	                        (BasinBudget > 0 ? 12u : 0u);
+	const size_t FillCap =
+	    size_t(MaxBytes) > Reserved ? size_t(MaxBytes) - Reserved : size_t(MaxBytes);
 
 	for (; Consumed < Keys.size(); ++Consumed)
 	{
@@ -300,6 +349,36 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const std::vect
 	Bytes[RemovalCountOffset + 2] = uint8_t(EncodedRemovals >> 16);
 	Bytes[RemovalCountOffset + 3] = uint8_t(EncodedRemovals >> 24);
 
+	// --- THE BASIN-LEDGER SECTION -------------------------------------------
+	//
+	// EMITTED ONLY WHEN THERE IS SOMETHING IN IT, so a world with no lakes
+	// moving puts not one extra byte on the wire and an old client sees a batch
+	// byte-identical to the one it saw before Phase 2.
+	uint32_t EncodedBasins = 0;
+	size_t ConsumedBasins = 0;
+	if (!BasinRows.empty())
+	{
+		W.u32(kBasinSectionTag);
+		W.u32(kBasinSectionVersion);
+		const size_t BasinCountOffset = Bytes.size();
+		W.u32(0); // patched below
+		for (; ConsumedBasins < BasinRows.size(); ++ConsumedBasins)
+		{
+			if (EncodedBasins >= kMaxBasinRowsPerBroadcast ||
+			    Bytes.size() + BasinRowSize > size_t(MaxBytes))
+			{
+				break;
+			}
+			W.u64(BasinRows[ConsumedBasins].first);
+			W.u64(uint64_t(BasinRows[ConsumedBasins].second)); // two's complement, exact
+			++EncodedBasins;
+		}
+		Bytes[BasinCountOffset + 0] = uint8_t(EncodedBasins);
+		Bytes[BasinCountOffset + 1] = uint8_t(EncodedBasins >> 8);
+		Bytes[BasinCountOffset + 2] = uint8_t(EncodedBasins >> 16);
+		Bytes[BasinCountOffset + 3] = uint8_t(EncodedBasins >> 24);
+	}
+
 	OutBytes.SetNumUninitialized((int32)Bytes.size());
 	if (!Bytes.empty())
 	{
@@ -309,6 +388,8 @@ void SerializeWaterDiffs(const std::vector<vxc::BrickKey>& Keys, const std::vect
 	OutConsumedKeyCount = Consumed;
 	OutEncodedRemovalCount = int32(EncodedRemovals);
 	OutConsumedRemovalCount = ConsumedRemovals;
+	OutEncodedBasinCount = int32(EncodedBasins);
+	OutConsumedBasinCount = ConsumedBasins;
 }
 } // namespace
 
@@ -408,6 +489,22 @@ public:
 	vxc::FineTileSampler* ribbonTiles() override { return &Tiles; }
 	vxc::RiverSampler* ribbonRivers() override { return &Rivers; }
 
+	// --- the Phase 2 ledger seam (voxelcore/lakes.h IBasinDatumSource) -------
+	//
+	// Three one-liners, and all three are forwards rather than new behaviour:
+	// the composite already routes the datum question to the lake half, and
+	// these let the host bind a ledger to it without knowing this class exists
+	// (same /GR- argument as ribbonTiles above).
+	int32_t basinDatumMm(int32_t tx, int32_t ty, const vxc::BasinEntry& baked) override
+	{
+		EnsureTile(tx, ty);
+		return Both.basinDatumMm(tx, ty, baked);
+	}
+	void setBasinDatumSource(vxc::IBasinDatumSource* Source) override
+	{
+		Both.setBasinDatumSource(Source);
+	}
+	void invalidateBasinDatumMemo() override { Both.invalidateBasinDatumMemo(); }
 
 private:
 	// Loads the fine tile under this voxel column if it is not already
@@ -741,6 +838,17 @@ struct FVoxelWaterImpl
 	uint8_t ImplicitFillAtVoxel(int64_t vx, int64_t vy, int64_t vz)
 	{
 		const int32_t CavernFloodMm = CavernFloodMmAt(vx, vy);
+		// THE LAKE TERM IS LEDGER-ADJUSTED, and there is no code here that says
+		// so, which is the point. `waterSurfaceMmAtVoxel` reaches
+		// LakeSampler::surfaceAtPixel, which asks `basinDatumMm`, which is the
+		// one seam the basin ledger binds to (voxelcore/lakes.h
+		// IBasinDatumSource). So a credited basin rises in the near field with
+		// ZERO change to this function -- and, more importantly, it rises by
+		// the same number the far-field sheet uses, because both went through
+		// that seam rather than each applying a delta of its own.
+		//
+		// The name stays `BakedMm` because that is still what it is when no
+		// ledger is bound, which is every world without a fine tier.
 		int32_t BakedMm = Water->waterSurfaceMmAtVoxel(vx, vy);
 
 		// LATERAL FILL AT VOXEL RESOLUTION (-VoxelWaterLateralFillPx=<n>, off by
@@ -905,6 +1013,58 @@ struct FVoxelWaterImpl
 	// amplifier's use of it, which is why Deinitialize clears the marker before
 	// this struct goes away.
 	std::unique_ptr<vxc::LockedWaterSampler> MarkerWater;
+
+	// --- THE SCALAR HYDROLOGY AUTHORITY (water re-architecture Phase 2) ------
+	//
+	// A basin's wire datum is where the CLIMATE says the lake stands. These four
+	// are what makes it move: an int64 volume per basin, the curve that turns
+	// that volume into a level, and the seam through which the drawn water asks.
+	//
+	// DECLARATION ORDER IS LOAD-BEARING a fourth time in this struct, and the
+	// chain is one-directional: BasinDatum borrows Basins, Basins borrows
+	// BasinCapacity, BasinCapacity borrows BasinTerrain, BasinTerrain borrows
+	// the FineTileSampler that `Water` above owns. Declared in that order, so
+	// they are DESTROYED in the reverse of it and nothing is ever holding a
+	// reference to something already gone. All four are declared AFTER `Water`
+	// for the same reason.
+	//
+	// ALL FOUR ARE NULL unless the fine tier resolved (EnsureBasinLedger below),
+	// because with no basin table there is nothing to keep a ledger of, and a
+	// null here is the same supported "no fine tier" configuration `Water` is
+	// already a NullWaterSampler for.
+	std::unique_ptr<vxc::FineTileBasinTerrain> BasinTerrain;
+	std::unique_ptr<vxc::ClientHypsometryProvider> BasinCapacity;
+	std::unique_ptr<vxc::BasinLedger> Basins;
+	std::unique_ptr<vxc::BasinLedgerDatumSource> BasinDatum;
+
+	// Basins whose delta has moved since the last ~5 Hz broadcast, as packed
+	// BasinId keys. A TSet, so a basin credited ten times in one window costs
+	// one row on the wire -- the scalar's whole replication advantage is that
+	// its size is a function of how many lakes changed, not of how much they
+	// changed or how often.
+	TSet<uint64> BasinDirtySinceLastBroadcast;
+	// Session audit for the ledger's hand-offs, so a silent Phase 2 is
+	// distinguishable from an inactive one.
+	int64 BasinSpillUnitsRouted = 0;
+	int64 BasinSpillUnitsRefunded = 0;
+	int64 BasinReplicatedRows = 0;
+
+	// The routing-graph half of the hydrology blob, held from load until the
+	// graph exists to apply it to.
+	//
+	// WHY IT HAS TO WAIT. The ledger can be restored the moment the world
+	// begins play -- it is just numbers. The graph cannot: `Rivers` is null
+	// until voxel.Water.Rivers is armed, and a RiverNetState blob is meaningless
+	// without the base topology it was recorded against. So the bytes sit here
+	// and MaybeArmRivers applies them the instant it has built a graph, which is
+	// also the only moment at which the segment-count check in
+	// restoreRoutingState means anything.
+	//
+	// CONSUMED EXACTLY ONCE. A second arm over different bounds must NOT get
+	// these bytes: the graph would be a different graph, restoreRoutingState
+	// would refuse it, and the refusal would be logged every time the player
+	// toggled the cvar.
+	std::vector<uint8_t> PendingHydroGraphBlob;
 
 	// voxel.Water.ImplicitOcean, LATCHED (watershed plan §6.4). Declared before
 	// Mob for the same reason Water is: the ImplicitFn reads it on every voxel
@@ -1305,6 +1465,12 @@ FString GetWaterSaveFilePath(uint64 Seed);
 bool SaveWaterStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed);
 void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed);
 
+// Water re-architecture Phase 2, same forward-declaration reason: defined below
+// beside the persistence code, called from OnWorldBeginPlay above.
+void EnsureBasinLedger(FVoxelWaterImpl& Impl);
+bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed);
+void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed);
+
 // W4 (ADR-0004). Same forward-declaration reason as the three above: these are
 // defined down beside StepFixed (they lean on MarkColumnDirty and on the
 // meshing helpers' brick bookkeeping), but Tick() and SaveWaterState() are
@@ -1374,6 +1540,12 @@ void UVoxelWaterSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	//    a later install would leave unmarked bricks resident beside marked ones;
 	//  * the sampler must be reachable from worker threads, which `Water` is
 	//    not. LockedWaterSampler is what makes it so.
+	// Phase 2: stand the basin ledger up and bind it to the sampler, so from
+	// here on every consumer of a lake's height reads the LEDGER'S level rather
+	// than the wire's. With no fine tier this is a no-op and the world behaves
+	// exactly as it did before.
+	EnsureBasinLedger(*Impl);
+
 	int32 MarkerOn = 0;
 	const bool bMarker = FParse::Value(FCommandLine::Get(), TEXT("VoxelWaterMarker="), MarkerOn)
 		                     ? MarkerOn != 0
@@ -1487,6 +1659,13 @@ void UVoxelWaterSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	if (InWorld.GetNetMode() != NM_Client)
 	{
 		LoadWaterStateFromDisk(*Impl, Impl->Terrain.GetSeed());
+		// Phase 2's blob, from its OWN file and with its OWN failure handling --
+		// a separate call rather than a tail of the one above because
+		// LoadWaterStateFromDisk returns early on all three of its failure modes,
+		// and "the CA blob was missing" must not silently also mean "every lake
+		// forgot where it stood". Same NM_Client rule: a joining client mirrors
+		// the scalars through the diff channel, it does not load them.
+		LoadHydroStateFromDisk(*Impl, Impl->Terrain.GetSeed());
 	}
 
 	// Dedicated server: no viewport, so no render chunks -- but the CA still
@@ -3034,6 +3213,159 @@ void MarkMobilizedBricksDirty(FVoxelWaterImpl& Impl)
 	}
 }
 
+// --- THE BASIN LEDGER: host, hand-offs and persistence (Phase 2) ------------
+//
+// voxelcore/basinledger.h carries the design; what is here is the wiring: build
+// the four objects over the fine tier this subsystem already streams, bind the
+// datum seam, drain the spill queue into the routing graph, and put the whole
+// thing on disk.
+//
+// WHY IT IS A SEPARATE SAVE FILE. `<seed>.vxhydro`, beside `<seed>.vxwater`
+// beside `<seed>.vxlog`. Appending to the water blob was the first design and
+// it is not possible: `vxc::WaterState::parse` REFUSES TRAILING BYTES by
+// contract (waterca.h), and relaxing that would weaken the one check that turns
+// a truncated water save into a refusal instead of a half-applied world.
+//
+// It is also the better answer on ADR-0005's own argument. The ADR put water in
+// its own file rather than in the edit log because it invalidates on
+// kWaterCAVersion and is discardable without discarding terrain edits. Hydrology
+// invalidates on kRiverNetVersion and kBasinLedgerVersion, which move for
+// completely different reasons -- so a third file is the same reasoning applied
+// once more, and it means a stale routing-math bump cannot cost a player their
+// drained caverns.
+//
+// SAME ATOMIC WRITE, SAME LOUD FALLBACK. Everything below reuses
+// WriteWaterBytesAtomic and mirrors LoadWaterState's three failure modes, so a
+// missing or refused hydrology blob reads as "every lake is back at its baked
+// equilibrium" and SAYS SO, rather than looking like a world where nothing ever
+// happened.
+
+// Builds the ledger stack over the fine tier and binds it to the sampler.
+// Idempotent, and a no-op when there is no fine tier: `ribbonTiles()` is the
+// IWaterSampler hook that answers null for NullWaterSampler, which is exactly
+// the "no baked tiles" configuration.
+void EnsureBasinLedger(FVoxelWaterImpl& Impl)
+{
+	if (Impl.Basins || !Impl.Water)
+	{
+		return;
+	}
+	vxc::FineTileSampler* Tiles = Impl.Water->ribbonTiles();
+	if (Tiles == nullptr)
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("Basin ledger DISABLED: no fine tier, so there is no basin table to keep a volume ledger of. ")
+		       TEXT("Lakes stand at their baked equilibrium, exactly as before Phase 2."));
+		return;
+	}
+	// Built in dependency order; see the declaration comment in FVoxelWaterImpl
+	// for why the order is load-bearing on the way out as well as in.
+	Impl.BasinTerrain = std::make_unique<vxc::FineTileBasinTerrain>(*Tiles);
+	Impl.BasinCapacity = std::make_unique<vxc::ClientHypsometryProvider>(*Impl.BasinTerrain);
+	Impl.Basins = std::make_unique<vxc::BasinLedger>(*Impl.BasinCapacity);
+	Impl.BasinDatum = std::make_unique<vxc::BasinLedgerDatumSource>(*Impl.Basins);
+	Impl.Water->setBasinDatumSource(Impl.BasinDatum.get());
+
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("Basin ledger ENABLED (kBasinLedgerVersion %u): lake datums now read surfaceMm + h(volume delta). ")
+	       TEXT("Capacity comes from a CLIENT-RECONSTRUCTED hypsometry (v1 tiles ship none); it is replaced by the ")
+	       TEXT("baked curve when basin table v2 lands, with no change above the provider interface."),
+	       vxc::kBasinLedgerVersion);
+}
+
+// The fine grid stride the ledger needs before it can turn a tile-local outlet
+// pixel into world voxels. Not knowable until a tile is resident, so it is
+// pushed in lazily rather than at construction -- and refusing to spill until it
+// is known beats guessing 8192 and routing a lake's overflow into the wrong
+// valley (basinledger.h `setTilePixels`).
+void SyncBasinTileStride(FVoxelWaterImpl& Impl)
+{
+	if (!Impl.BasinCapacity || !Impl.Water)
+	{
+		return;
+	}
+	const uint32 Stride = Impl.Water->tilePixels();
+	if (Stride != 0 && Impl.BasinCapacity->tilePixels() != Stride)
+	{
+		Impl.BasinCapacity->setTilePixels(Stride);
+	}
+}
+
+// Moves `Units` into a basin, keeping every consumer of its height in step.
+//
+// THE THREE THINGS A CREDIT HAS TO DO, and forgetting any one of them is a
+// visible bug rather than an inefficiency: move the scalar, drop the sampler's
+// one-entry column memo (or the near field answers the old height for one more
+// pixel), and mark the basin for the next replication round.
+// A NEGATIVE `Units` DEBITS, and routes to the ledger's own debit() rather than
+// to a credit of a negative number, because the two have different bounds:
+// credit is bounded above by the sill (the excess spills), debit is bounded
+// below by the basin going empty (it cannot invent water by draining past its
+// own floor). Returning the magnitude actually moved keeps one contract for
+// both directions.
+int64 CreditBasinAndSync(FVoxelWaterImpl& Impl, vxc::BasinId Id, int64 Units)
+{
+	if (!Impl.Basins || Units == 0)
+	{
+		return 0;
+	}
+	SyncBasinTileStride(Impl);
+	const int64 Moved = Units > 0 ? Impl.Basins->credit(Id, Units) : Impl.Basins->debit(Id, -Units);
+	if (Moved > 0)
+	{
+		Impl.Water->invalidateBasinDatumMemo();
+		Impl.BasinDirtySinceLastBroadcast.Add(Id.v);
+	}
+	return Moved;
+}
+
+// Drains the ledger's spill queue into the routing graph, ledgered on both
+// sides: whatever the graph will not take comes back to the basin it came from
+// and back-pressures the lake, rather than disappearing.
+//
+// NO GRAPH IS NOT AN ERROR. voxel.Water.Rivers is off by default, so the common
+// case is that there is nothing to route into -- every spill event is then
+// refunded, the lake sits above its sill, and `BasinSpillUnitsRefunded` says
+// so. That is the honest behaviour for a world with no downstream: the water is
+// real and there is nowhere for it to go.
+void RouteBasinSpills(FVoxelWaterImpl& Impl)
+{
+	if (!Impl.Basins || Impl.Basins->pendingSpill().empty())
+	{
+		return;
+	}
+	// One fine pixel of reach. The baked outlet is "the saddle the basin spills
+	// over" and the graph's nodes sit on the same 1.875 m lattice, so a spill
+	// that cannot find a reach within one pixel is not near its own channel and
+	// must refuse rather than search outward into a neighbouring valley.
+	const int64 MaxReachMm = Impl.Water ? int64(Impl.Water->pixelSizeMm()) : 1875;
+	int64 Refunded = 0;
+	const int64 Routed = vxc::routeSpills(
+		*Impl.Basins,
+		[&](int64 Vx, int64 Vy, int64 Units, int32 /*SpillMm*/) -> int64
+		{
+			if (!Impl.Rivers)
+			{
+				return 0;
+			}
+			const uint32 Seg = Impl.Rivers->nearestSegmentToVoxel(Vx, Vy, MaxReachMm);
+			if (Seg == vxc::RiverNetwork::kNoSegment)
+			{
+				return 0;
+			}
+			const int32 Amount = int32(vxc::clampi64(Units, 0, INT32_MAX));
+			Impl.Rivers->injectInflow(Seg, Amount);
+			return int64(Amount);
+		},
+		&Refunded);
+	Impl.BasinSpillUnitsRouted += Routed;
+	Impl.BasinSpillUnitsRefunded += Refunded;
+	if (Refunded > 0)
+	{
+		Impl.Water->invalidateBasinDatumMemo(); // a refund raised a lake back up
+	}
+}
+
 // --- ADR-0005 water persistence -------------------------------------------
 //
 // The blob is a SIBLING of the terrain edit log, written into the same
@@ -3095,7 +3427,25 @@ bool SaveWaterStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
 	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
 	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
 	const FString Path = GetWaterSaveFilePath(Seed);
-	if (!WriteWaterBytesAtomic(Path, OutBytes))
+	const bool bWaterWritten = WriteWaterBytesAtomic(Path, OutBytes);
+
+	// Phase 2's blob goes out from HERE rather than from each call site, so
+	// every path that saves water saves hydrology -- the Deinitialize autosave,
+	// the console command and any future one -- and none of them can be added
+	// later having forgotten it.
+	//
+	// ATTEMPTED EVEN IF THE WATER BLOB FAILED. The two are independent files
+	// with independent version gates (see SaveHydroStateToDisk), and losing the
+	// player's lake levels because a different file could not be renamed is not
+	// a trade this makes on its own.
+	if (!SaveHydroStateToDisk(Impl, Seed))
+	{
+		UE_LOG(LogVoxelWater, Error,
+		       TEXT("SaveWaterState: the water blob %s, but the HYDROLOGY blob failed to write -- lake levels and ")
+		       TEXT("the routing graph will revert to baked equilibrium on the next load."),
+		       bWaterWritten ? TEXT("was written") : TEXT("also failed"));
+	}
+	if (!bWaterWritten)
 	{
 		return false;
 	}
@@ -3189,6 +3539,194 @@ void LoadWaterStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
 	       TEXT("LoadWaterState: restored %llu fill units across %llu stored brick(s), %llu mobilized brick(s) from %s -- waterDigest=0x%016llX"),
 	       (unsigned long long)Impl.CA.totalVolume(), (unsigned long long)Impl.CA.storedBrickCount(),
 	       (unsigned long long)Impl.Mob.mobilizedBricks().size(), *Path, (unsigned long long)D.h);
+}
+
+// --- Phase 2 hydrology persistence: <seed>.vxhydro --------------------------
+//
+// TWO INDEPENDENT SECTIONS in one length-prefixed container, and the
+// independence is the design: a routing blob that will not apply (a graph
+// rebuilt over different bounds, a kRiverNetVersion bump) must not cost the
+// player their lake levels, and vice versa. Each section carries its own magic
+// and its own version inside voxel-core, so this container only has to say how
+// long each one is.
+//
+//   u32 magic, u32 kHydroFormatVersion
+//   u32 ledgerBytes, <BasinLedgerState blob>
+//   u32 graphBytes,  <RiverNetState blob>   (graphBytes == 0 when unarmed)
+//
+// The lengths are what let a reader skip a section it cannot use instead of
+// losing its place in the stream -- the same job `entry_bytes` does in the
+// basin table and for the same reason.
+constexpr uint32 kHydroMagic = 0x59485856; // "VXHY" little-endian
+constexpr uint32 kHydroFormatVersion = 1;
+
+FString GetHydroSaveFilePath(uint64 Seed)
+{
+	return FPaths::ProjectSavedDir() / TEXT("VoxelWorlds") / FString::Printf(TEXT("%llu.vxhydro"), (unsigned long long)Seed);
+}
+
+bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
+{
+	if (!Impl.Basins)
+	{
+		return true; // no fine tier: nothing to persist, and not a failure
+	}
+	std::vector<uint8_t> Ledger;
+	vxc::BasinLedgerState::serialize(*Impl.Basins, Ledger);
+
+	std::vector<uint8_t> Graph;
+	if (Impl.Rivers)
+	{
+		vxc::RiverNetState::serialize(*Impl.Rivers, Graph);
+	}
+
+	std::vector<uint8_t> Bytes;
+	vxc::ByteWriter W(Bytes);
+	W.u32(kHydroMagic);
+	W.u32(kHydroFormatVersion);
+	W.u32(uint32(Ledger.size()));
+	// ByteWriter appends through the vector it was handed, so interleaving these
+	// bulk inserts with its u32s is exact -- it holds the container, not an
+	// iterator that a reallocation could invalidate.
+	Bytes.insert(Bytes.end(), Ledger.begin(), Ledger.end());
+	W.u32(uint32(Graph.size()));
+	Bytes.insert(Bytes.end(), Graph.begin(), Graph.end());
+
+	TArray<uint8> OutBytes;
+	OutBytes.SetNumUninitialized((int32)Bytes.size());
+	if (!Bytes.empty())
+	{
+		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
+	}
+
+	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
+	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
+	const FString Path = GetHydroSaveFilePath(Seed);
+	if (!WriteWaterBytesAtomic(Path, OutBytes))
+	{
+		return false;
+	}
+
+	vxc::Digest D;
+	Impl.Basins->digest(D);
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("SaveHydroState: wrote %d bytes to %s -- %llu basin(s) off equilibrium (sum %lld units, %lld spilled, ")
+	       TEXT("%lld routed, %lld refunded, %lld replicated rows), %u graph segment(s), %llu graph diff(s). ")
+	       TEXT("Capacity provider: %llu curve(s) built over %llu cell(s), %llu unresolved, %llu apron miss(es). ")
+	       TEXT("basinDigest=0x%016llX"),
+	       OutBytes.Num(), *Path, (unsigned long long)Impl.Basins->basinCount(),
+	       (long long)Impl.Basins->sumOfDeltas(), (long long)Impl.Basins->totalSpilled(),
+	       (long long)Impl.BasinSpillUnitsRouted, (long long)Impl.BasinSpillUnitsRefunded,
+	       (long long)Impl.BasinReplicatedRows,
+	       Impl.Rivers ? Impl.Rivers->segmentCount() : 0u,
+	       (unsigned long long)(Impl.Rivers ? Impl.Rivers->diffLog().size() : 0u),
+	       // THE RAN-FLAGS for the half of Phase 2 that has no other symptom: a
+	       // zero here says the curve builder was NEVER ASKED, which is a
+	       // different fact from "no lake moved", and `apronMisses` says how
+	       // many shorelines were integrated against a 4x4 stencil that reached
+	       // a block nobody had fetched.
+	       (unsigned long long)(Impl.BasinCapacity ? Impl.BasinCapacity->hypsometryBuilds() : 0ull),
+	       (unsigned long long)(Impl.BasinCapacity ? Impl.BasinCapacity->hypsometryCells() : 0ull),
+	       (unsigned long long)(Impl.BasinCapacity ? Impl.BasinCapacity->unresolvedBasins() : 0ull),
+	       (unsigned long long)(Impl.BasinTerrain ? Impl.BasinTerrain->apronMisses() : 0ull),
+	       (unsigned long long)D.h);
+	return true;
+}
+
+void LoadHydroStateFromDisk(FVoxelWaterImpl& Impl, uint64 Seed)
+{
+	if (!Impl.Basins)
+	{
+		return;
+	}
+	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
+	{
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("LoadHydroState: -VoxelNoLoad passed -- skipping; every lake starts at its baked equilibrium."));
+		return;
+	}
+	const FString Path = GetHydroSaveFilePath(Seed);
+	if (!FPaths::FileExists(Path))
+	{
+		// A missing hydrology blob beside an EXISTING water save is the loud
+		// case, by the same reasoning ADR-0005 uses: that world was played, its
+		// lakes may have risen or been drained, and all of it is now back at the
+		// climate's equilibrium.
+		if (FPaths::FileExists(GetWaterSaveFilePath(Seed)))
+		{
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("LoadHydroState: a water save exists but there is NO hydrology blob at %s -- every lake ")
+			       TEXT("reverts to its BAKED EQUILIBRIUM level and the routing graph starts empty. Expected only ")
+			       TEXT("for a save that predates Phase 2; otherwise the blob was lost."),
+			       *Path);
+		}
+		return;
+	}
+
+	TArray<uint8> Bytes;
+	if (!FFileHelper::LoadFileToArray(Bytes, *Path))
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("LoadHydroState: %s exists but could NOT be READ -- lakes revert to baked equilibrium."), *Path);
+		return;
+	}
+
+	vxc::ByteReader R(Bytes.GetData(), size_t(Bytes.Num()));
+	uint32_t Magic = 0, Version = 0, LedgerBytes = 0;
+	if (!R.u32(Magic) || Magic != kHydroMagic || !R.u32(Version) || Version != kHydroFormatVersion ||
+	    !R.u32(LedgerBytes))
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("LoadHydroState: %s (%d bytes) is not a v%u hydrology blob -- REFUSED. Lakes revert to baked ")
+		       TEXT("equilibrium."),
+		       *Path, Bytes.Num(), kHydroFormatVersion);
+		return;
+	}
+	// The header is 12 bytes; sections follow it in order and their lengths must
+	// stay inside the file. Checked before either is read, so a garbage length
+	// cannot walk off the end of the buffer.
+	const size_t Total = size_t(Bytes.Num());
+	if (size_t(LedgerBytes) + 16 > Total)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("LoadHydroState: %s has an out-of-range ledger section -- REFUSED."),
+		       *Path);
+		return;
+	}
+	const uint8* LedgerAt = Bytes.GetData() + 12;
+	if (LedgerBytes > 0 && !vxc::BasinLedgerState::load(LedgerAt, size_t(LedgerBytes), *Impl.Basins))
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("LoadHydroState: the basin-ledger section of %s was REFUSED by vxc::BasinLedgerState::load ")
+		       TEXT("(stale kBasinLedgerVersion -- engine is now v%u -- corrupt, or a failed sum cross-check). ")
+		       TEXT("Every lake reverts to its BAKED EQUILIBRIUM level."),
+		       *Path, vxc::kBasinLedgerVersion);
+		// Fall through: a bad ledger must not also cost the routing graph.
+	}
+
+	const uint8* GraphLenAt = LedgerAt + LedgerBytes;
+	vxc::ByteReader R2(GraphLenAt, Total - 12 - size_t(LedgerBytes));
+	uint32_t GraphBytes = 0;
+	if (!R2.u32(GraphBytes) || size_t(GraphBytes) + 16 + size_t(LedgerBytes) > Total)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("LoadHydroState: %s has an out-of-range graph section -- graph not restored."),
+		       *Path);
+		GraphBytes = 0;
+	}
+	if (GraphBytes > 0)
+	{
+		// HELD, NOT APPLIED. There is no graph yet -- see PendingHydroGraphBlob.
+		const uint8* GraphAt = GraphLenAt + 4;
+		Impl.PendingHydroGraphBlob.assign(GraphAt, GraphAt + GraphBytes);
+	}
+
+	Impl.Water->invalidateBasinDatumMemo();
+	vxc::Digest D;
+	Impl.Basins->digest(D);
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("LoadHydroState: restored %llu basin(s) off equilibrium (sum %lld units) from %s; %d graph byte(s) ")
+	       TEXT("held for the next voxel.Water.Rivers arm. basinDigest=0x%016llX"),
+	       (unsigned long long)Impl.Basins->basinCount(), (long long)Impl.Basins->sumOfDeltas(), *Path,
+	       int32(Impl.PendingHydroGraphBlob.size()), (unsigned long long)D.h);
 }
 
 // How far around the camera implicit lake surfaces are built, in water bricks
@@ -4558,6 +5096,47 @@ void MaybeArmRivers(FVoxelWaterImpl& Impl, UWorld* World)
 	Impl.RiverPromotions = 0;
 	Impl.bRiverRefusalLogged = false;
 
+	// --- Phase 2: the graph is now the persisted scalar authority ------------
+	//
+	// Recording FIRST, so a dam placed one tick after the arm is in the log.
+	Impl.Rivers->setDiffRecording(true);
+
+	// Then the held blob, if this session loaded one. CONSUMED EXACTLY ONCE
+	// (see PendingHydroGraphBlob): a second arm over different bounds builds a
+	// different graph, restoreRoutingState would refuse it, and re-offering the
+	// bytes every toggle would turn one honest refusal into a log spam.
+	if (!Impl.PendingHydroGraphBlob.empty())
+	{
+		std::vector<uint8_t> Blob;
+		Blob.swap(Impl.PendingHydroGraphBlob);
+		if (vxc::RiverNetState::load(Blob.data(), Blob.size(), *Impl.Rivers))
+		{
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("voxel.Water.Rivers: restored the saved graph state -- %llu diff(s) replayed, %lld storage ")
+			       TEXT("units back in the reaches (injected %lld, out to outlets %lld)."),
+			       (unsigned long long)Impl.Rivers->diffLog().size(), (long long)Impl.Rivers->totalStorage(),
+			       (long long)Impl.Rivers->totalInjected(), (long long)Impl.Rivers->totalOutflowToOutlets());
+		}
+		else
+		{
+			// LOUD, and specifically about WHY: the overwhelmingly likely cause
+			// is that the graph was saved anchored somewhere else, because the
+			// region is centred on the player's viewpoint at arm time.
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("voxel.Water.Rivers: the saved graph state was REFUSED (%d bytes, this graph has %u ")
+			       TEXT("segments). Most likely it was recorded over DIFFERENT REGION BOUNDS -- the region is ")
+			       TEXT("centred on the player's viewpoint at arm time -- or by a different kRiverNetVersion ")
+			       TEXT("(engine is now v%u). Dams and in-flight water from that session are gone; the graph ")
+			       TEXT("itself is fine and starts empty."),
+			       int32(Blob.size()), Impl.Rivers->segmentCount(), vxc::kRiverNetVersion);
+			// A partial diff replay may have landed (RiverNetState::load says
+			// so). Rebuild from scratch so the graph is not a half-replayed
+			// hybrid of two sessions.
+			Impl.Rivers->buildFromFlowAccumulation(Impl.Tiles, Impl.Terrain.GetSeed(), Bounds);
+			Impl.Rivers->setDiffRecording(true);
+		}
+	}
+
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("voxel.Water.Rivers 1: built a %lldx%lld-pixel (%lld m) river graph around voxel (%lld,%lld): ")
 	       TEXT("%d nodes, %u segments, in %.2f ms. Ticking at 1 Hz; the ocean (voxel z=0) is the sink."),
@@ -4644,6 +5223,22 @@ void StepFixed(FVoxelWaterImpl& Impl, double NowWorldSeconds)
 	// promotion detector's sampling cost (rivercouple.h section 4: a hard
 	// budget of order 10^5 hashed CA probes per pass, independent of how big
 	// the graph is) is paid once a second instead of ten times.
+	// SILL FAUCETS (Phase 2). Whatever the basin ledger overflowed since the
+	// last step joins the reach nearest its baked outlet -- the first consumer,
+	// ever, of `BasinEntry::outletX/Y`, which has been on the wire since
+	// bake_ver 8 and read by nothing. Ledgered on both sides: what the graph
+	// will not take is refunded to the lake, which then sits above its sill and
+	// back-pressures, rather than evaporating.
+	//
+	// OUTSIDE the river block, and every fixed step rather than at the graph's
+	// 1 Hz, precisely BECAUSE the common case is that there is no graph
+	// (voxel.Water.Rivers is off by default). A queue that were only drained
+	// when a graph existed would grow for the whole session in every default
+	// run. Draining it here refunds instead, which is both bounded and the
+	// honest answer: a lake with nowhere to spill to rises past its sill.
+	// Costs one empty-vector test per step when nothing has overflowed.
+	RouteBasinSpills(Impl);
+
 	if (Impl.RiverCoupler && Impl.Rivers &&
 	    NowWorldSeconds - Impl.RiverLastTickWorldSeconds >= FVoxelWaterImpl::RiverStepSeconds)
 	{
@@ -4999,7 +5594,15 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 	// DirtySinceLastBroadcast is EMPTY. Testing only the fill queue would have
 	// dropped the removals silently and left every client holding bricks the
 	// authority had already given back.
-	if (Impl.DirtySinceLastBroadcast.Num() == 0 && Impl.PendingRemovals.empty())
+	// THREE QUEUES GATE THIS NOW. The basin queue is the Phase 2 addition and it
+	// has the removals' problem in a sharper form: a lake rising is precisely a
+	// change that produces NO dirty bricks (it is a scalar, not a CA cell), so
+	// the common case for a basin row is a round in which both other queues are
+	// empty. Testing only those two would have dropped every lake level change
+	// on the floor and left the authority's lakes and the clients' lakes at
+	// permanently different heights.
+	if (Impl.DirtySinceLastBroadcast.Num() == 0 && Impl.PendingRemovals.empty() &&
+	    Impl.BasinDirtySinceLastBroadcast.Num() == 0)
 	{
 		return;
 	}
@@ -5008,20 +5611,45 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 	Keys.reserve(Impl.DirtySinceLastBroadcast.Num());
 	for (const VoxelCoords::FVoxelCoord& C : Impl.DirtySinceLastBroadcast) Keys.push_back(ToBrickKey(C));
 
+	// The basin rows, read LIVE from the ledger rather than snapshotted when the
+	// basin was marked dirty. A basin credited five times in this window
+	// replicates its CURRENT delta once, which is the whole reason the authority
+	// is a level-independent volume: there is no history to replay, only a
+	// number to agree on.
+	//
+	// SORTED BY KEY, so the payload is deterministic for a given set of moved
+	// basins -- the TSet's own iteration order is not, and a wire format whose
+	// bytes depend on hash order is one that cannot be diffed or golden-tested.
+	std::vector<std::pair<uint64_t, int64_t>> BasinRows;
+	if (Impl.Basins && Impl.BasinDirtySinceLastBroadcast.Num() > 0)
+	{
+		BasinRows.reserve(size_t(Impl.BasinDirtySinceLastBroadcast.Num()));
+		for (uint64 Key : Impl.BasinDirtySinceLastBroadcast)
+		{
+			BasinRows.emplace_back(Key, Impl.Basins->deltaUnits(vxc::BasinId{Key}));
+		}
+		std::sort(BasinRows.begin(), BasinRows.end(),
+		          [](const std::pair<uint64_t, int64_t>& A, const std::pair<uint64_t, int64_t>& B)
+		          { return A.first < B.first; });
+	}
+
 	TArray<uint8> Bytes;
 	int32 EncodedBrickCount = 0;
 	size_t ConsumedKeyCount = 0;
 	int32 EncodedRemovalCount = 0;
 	size_t ConsumedRemovalCount = 0;
-	SerializeWaterDiffs(Keys, Impl.PendingRemovals, Impl.CA, FVoxelWaterImpl::MaxDiffBytesPerBroadcast, Bytes,
-	                    EncodedBrickCount, ConsumedKeyCount, EncodedRemovalCount, ConsumedRemovalCount);
+	int32 EncodedBasinCount = 0;
+	size_t ConsumedBasinCount = 0;
+	SerializeWaterDiffs(Keys, Impl.PendingRemovals, BasinRows, Impl.CA,
+	                    FVoxelWaterImpl::MaxDiffBytesPerBroadcast, Bytes, EncodedBrickCount, ConsumedKeyCount,
+	                    EncodedRemovalCount, ConsumedRemovalCount, EncodedBasinCount, ConsumedBasinCount);
 
 	for (size_t i = 0; i < ConsumedKeyCount; ++i)
 	{
 		Impl.DirtySinceLastBroadcast.Remove(ToCoord(Keys[i]));
 	}
 
-	if (EncodedBrickCount == 0 && EncodedRemovalCount == 0)
+	if (EncodedBrickCount == 0 && EncodedRemovalCount == 0 && EncodedBasinCount == 0)
 	{
 		return; // every dirty brick this round had already emptied again -- nothing to actually tell clients
 	}
@@ -5051,6 +5679,16 @@ void BroadcastWaterDiffs(FVoxelWaterImpl& Impl, UWorld& World, float DeltaTime)
 
 	Relay->MulticastWaterDiffs(Bytes);
 	Impl.ReplicatedBytesThisWindow += Bytes.Num();
+
+	// The basin rows are DROPPED ONLY ONCE THEY ARE ON THE WIRE, by the same
+	// rule the removals below follow: a row that missed the cap is still a
+	// disagreement between the authority's lake and the client's, and it stays
+	// queued until it has actually been sent.
+	for (size_t i = 0; i < ConsumedBasinCount && i < BasinRows.size(); ++i)
+	{
+		Impl.BasinDirtySinceLastBroadcast.Remove(BasinRows[i].first);
+	}
+	Impl.BasinReplicatedRows += int64(EncodedBasinCount);
 
 	// DROP THE REMOVALS ONLY ONCE THEY ARE ACTUALLY ON THE WIRE. Fill diffs may
 	// be dropped optimistically -- a brick that still matters is still dirty and
@@ -6012,7 +6650,14 @@ int32 UVoxelWaterSubsystem::GatherLakeSheetBasinsInTile(int32 TileX, int32 TileY
 		Info.MinYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY0) * PixelMm);
 		Info.MaxXUU = VoxelCoords::MmToWorld((OxPx + B.bboxX1 + 1) * PixelMm);
 		Info.MaxYUU = VoxelCoords::MmToWorld((OyPx + B.bboxY1 + 1) * PixelMm);
-		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(B.surfaceMm));
+		// THE LEDGER-ADJUSTED DATUM, not the bare wire field (Phase 2). The near
+		// field already reads it -- ImplicitFillAtVoxel goes through
+		// waterSurfaceMmAtVoxel, which goes through LakeSampler::surfaceAtPixel,
+		// which asks the same seam -- so if the sheet kept reading surfaceMm a
+		// credited lake would render at two different heights depending on
+		// whether you were inside the 52 m disc. That seam was closed once
+		// already when the sheet shipped and this is what keeps it closed.
+		Info.SurfaceZUU = VoxelCoords::MmToWorld(int64(Impl->Water->basinDatumMm(TileX, TileY, B)));
 		if (Info.MaxXUU < CenterXUU - RadiusUU || Info.MinXUU > CenterXUU + RadiusUU ||
 		    Info.MaxYUU < CenterYUU - RadiusUU || Info.MinYUU > CenterYUU + RadiusUU)
 		{
@@ -6284,6 +6929,57 @@ int32 UVoxelWaterSubsystem::FinishRiverRibbonWindow(TArray<FRiverRibbonPathUU>& 
 	return OutPaths.Num() - Before;
 }
 
+// --- THE BASIN VOLUME LEDGER: the public surface (Phase 2) ------------------
+
+int64 UVoxelWaterSubsystem::CreditBasinVolume(int32 TileX, int32 TileY, int32 LocalBasinId, int64 Units,
+                                              int32& OutLevelMm, int32& OutBakedMm)
+{
+	OutLevelMm = 0;
+	OutBakedMm = 0;
+	if (!Impl || !Impl->Basins || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // may load a tile and build a hypsometry; see FineTileBasinTerrain
+
+	// Resolve the ROW first, through the sampler that already streams the tile,
+	// so "no such basin" is answered before any ledger state is touched and the
+	// baked datum is available to report against.
+	const std::vector<vxc::BasinEntry>* Rows = Impl->Water->basinsForTile(TileX, TileY);
+	if (Rows == nullptr || LocalBasinId < 0 || size_t(LocalBasinId) >= Rows->size())
+	{
+		return 0;
+	}
+	const vxc::BasinEntry& Row = (*Rows)[size_t(LocalBasinId)];
+	OutBakedMm = Row.surfaceMm;
+
+	const vxc::BasinId Id = vxc::BasinId::fromTile(TileX, TileY, uint16(LocalBasinId));
+	const int64 Accepted = CreditBasinAndSync(*Impl, Id, Units);
+	OutLevelMm = Impl->Water->basinDatumMm(TileX, TileY, Row);
+	return Accepted;
+}
+
+void UVoxelWaterSubsystem::GetBasinLedgerStats(bool& bOutLedgerActive, int32& OutBasins, int64& OutSumUnits,
+                                               int64& OutSpilledUnits, int64& OutRoutedUnits,
+                                               int64& OutRefundedUnits) const
+{
+	bOutLedgerActive = Impl && Impl->Basins;
+	OutBasins = 0;
+	OutSumUnits = 0;
+	OutSpilledUnits = 0;
+	OutRoutedUnits = 0;
+	OutRefundedUnits = 0;
+	if (!bOutLedgerActive)
+	{
+		return;
+	}
+	OutBasins = int32(Impl->Basins->basinCount());
+	OutSumUnits = Impl->Basins->sumOfDeltas();
+	OutSpilledUnits = Impl->Basins->totalSpilled();
+	OutRoutedUnits = Impl->BasinSpillUnitsRouted;
+	OutRefundedUnits = Impl->BasinSpillUnitsRefunded;
+}
+
 void UVoxelWaterSubsystem::AbandonRiverRibbonWindow()
 {
 	if (Impl)
@@ -6394,6 +7090,70 @@ bool UVoxelWaterSubsystem::ApplyReplicatedWaterDiffs(const TArray<uint8>& Bytes)
 			{
 				Impl->DirtyBricks.Add(ToCoord(Key));
 			}
+		}
+	}
+
+	// --- THE BASIN-LEDGER SECTION (Phase 2) ---------------------------------
+	//
+	// TAG-GATED, unlike the two positional sections above, because this is the
+	// third one and positional would now be ambiguous -- see SerializeWaterDiffs
+	// for the argument. A batch from a build that predates this section, or one
+	// in which no lake moved, simply has nothing here and the loop never runs.
+	//
+	// APPLIED WITH restoreDelta, NOT credit(). A client is a MIRROR: the
+	// authority already decided how much of a credit the basin kept and how much
+	// spilled, and re-running that decision here against a locally reconstructed
+	// hypsometry (which may differ if the client has different tiles resident)
+	// would let the two drift and would double-count the spill. The authority
+	// sends the CONCLUSION -- this basin's delta is now N -- and this applies it,
+	// exactly as markMobilized/markDemoted apply the authority's conclusions
+	// above rather than re-deriving them.
+	uint32_t BasinTag = 0;
+	if (R.u32(BasinTag) && BasinTag == kBasinSectionTag)
+	{
+		uint32_t Version = 0, BasinCount = 0;
+		if (!R.u32(Version) || !R.u32(BasinCount))
+		{
+			return false;
+		}
+		if (Version != kBasinSectionVersion)
+		{
+			// A future version's rows are not parseable here, and guessing at
+			// them would put lakes at invented levels. Stop reading -- the fills
+			// and removals above have already been applied and are still valid.
+			UE_LOG(LogVoxelWater, Warning,
+			       TEXT("ApplyReplicatedWaterDiffs: basin section is v%u, this build reads v%u. Lake levels will not ")
+			       TEXT("track the server."),
+			       Version, kBasinSectionVersion);
+		}
+		else if (Impl->Basins)
+		{
+			for (uint32_t i = 0; i < BasinCount; ++i)
+			{
+				uint64_t Key = 0, Raw = 0;
+				if (!R.u64(Key) || !R.u64(Raw))
+				{
+					return false;
+				}
+				if (Key == 0)
+				{
+					continue; // kNoBasin is not a basin; a row for it is noise
+				}
+				Impl->Basins->restoreDelta(vxc::BasinId{Key}, int64_t(Raw));
+			}
+			// Re-seat the running totals so the mirror's own conserves() stays
+			// true. It is a FICTION on a client -- these deltas were credited on
+			// the server, not here -- and it is the right fiction: the
+			// alternative is a client whose conservation check reads as broken
+			// for the whole session, which would make the one instrument that
+			// catches a real leak useless exactly where a leak is hardest to
+			// see.
+			Impl->Basins->restoreTotals();
+			// The sampler memoises one column's datum, and every drawn lake
+			// height reads through it. Not dropping it here is a lake that
+			// visibly lags the server by one query.
+			Impl->Water->invalidateBasinDatumMemo();
+			Impl->BasinReplicatedRows += int64(BasinCount);
 		}
 	}
 
@@ -6568,6 +7328,79 @@ void SpawnWaterAtCrosshair(UWorld* World, uint32 Amount, const TCHAR* Caller)
 	UE_LOG(LogVoxelWater, Log, TEXT("%s: requested %u, placed %u at (%.0f,%.0f,%.0f)"), Caller, Amount, Placed,
 	       TargetUU.X, TargetUU.Y, TargetUU.Z);
 }
+
+// The one thing that makes Phase 2 VISIBLE without a single particle.
+//
+// The plan calls Phase 2 "shippable on its own -- lakes visibly rise/spill/drain
+// with zero particles", and until Phase 3 there is no gameplay source of inflow
+// to a basin, so without this the whole authority layer is correct, tested, and
+// impossible for anyone to look at. This is the crank you turn to look at it.
+//
+// Units are WaterCA fill units (255 per 10 cm voxel, so 255,000,000 is 1000 m^3
+// of water). A basin is named the way the v1 wire names it -- its fine tile and
+// its row index -- which `voxel.Water.Sheets`' own logging already prints, and
+// which GatherLakeSheetBasinsInTile hands out as FLakeSheetBasin::BasinId.
+FAutoConsoleCommandWithWorldAndArgs CVarVoxelWaterCreditBasin(
+	TEXT("voxel.Water.CreditBasin"),
+	TEXT("voxel.Water.CreditBasin <tileX> <tileY> <basinId> <units> -- dev tool: adds <units> (WaterCA fill units, ")
+	TEXT("255 per 10 cm voxel) to one basin's volume ledger. The lake rises to the level its hypsometry says that ")
+	TEXT("volume stands at, and anything past its baked sill spills to the outlet. Negative units debit."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (!World)
+			{
+				return;
+			}
+			if (Args.Num() < 4)
+			{
+				UE_LOG(LogVoxelWater, Warning,
+				       TEXT("voxel.Water.CreditBasin <tileX> <tileY> <basinId> <units> -- needs four arguments."));
+				return;
+			}
+			UVoxelWaterSubsystem* Water = World->GetSubsystem<UVoxelWaterSubsystem>();
+			if (!Water)
+			{
+				return;
+			}
+			const int32 Tx = FCString::Atoi(*Args[0]);
+			const int32 Ty = FCString::Atoi(*Args[1]);
+			const int32 Id = FCString::Atoi(*Args[2]);
+			const int64 Units = FCString::Atoi64(*Args[3]);
+
+			int32 LevelMm = 0, BakedMm = 0;
+			const int64 Accepted = Water->CreditBasinVolume(Tx, Ty, Id, Units, LevelMm, BakedMm);
+
+			bool bActive = false;
+			int32 Basins = 0;
+			int64 Sum = 0, Spilled = 0, Routed = 0, Refunded = 0;
+			Water->GetBasinLedgerStats(bActive, Basins, Sum, Spilled, Routed, Refunded);
+			if (!bActive)
+			{
+				UE_LOG(LogVoxelWater, Warning,
+				       TEXT("voxel.Water.CreditBasin: no basin ledger in this world -- it needs the fine tier ")
+				       TEXT("(-VoxelFineTileDir), because the basin table lives in the .vxtl."));
+				return;
+			}
+			if (Accepted == 0 && Units > 0)
+			{
+				// REFUSED, and the two reasons look identical on screen, so say
+				// both: the tile may not be streamed in yet, or there may be no
+				// such row.
+				UE_LOG(LogVoxelWater, Warning,
+				       TEXT("voxel.Water.CreditBasin: basin (%d,%d)#%d took NOTHING. Either fine tile (%d,%d) is not ")
+				       TEXT("loaded yet (fly over it first), or it has no row %d, or its elevation blocks would not ")
+				       TEXT("decode. Nothing was invented."),
+				       Tx, Ty, Id, Tx, Ty, Id);
+				return;
+			}
+			UE_LOG(LogVoxelWater, Log,
+			       TEXT("voxel.Water.CreditBasin: basin (%d,%d)#%d accepted %lld units -- surface %d mm -> %d mm ")
+			       TEXT("(baked equilibrium %d mm). Ledger now: %d basin(s) off equilibrium, sum %lld units, ")
+			       TEXT("%lld spilled (%lld routed to the graph, %lld refunded)."),
+			       Tx, Ty, Id, (long long)Accepted, BakedMm, LevelMm, BakedMm, Basins, (long long)Sum,
+			       (long long)Spilled, (long long)Routed, (long long)Refunded);
+		}));
 
 FAutoConsoleCommandWithWorldAndArgs CVarVoxelSpawnWater(
 	TEXT("voxel.SpawnWater"),

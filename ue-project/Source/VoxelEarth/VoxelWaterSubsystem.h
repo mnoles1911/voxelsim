@@ -473,6 +473,39 @@ public:
 	// RefreshImplicitWater sweeps -- not an approximation of it.
 	bool GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const;
 
+	// --- THE BASIN VOLUME LEDGER (water re-architecture Phase 2) --------------
+	//
+	// The authoritative water state for standing water is a signed int64 volume
+	// per basin, against the baked equilibrium the bake shipped. These two are
+	// the whole of what a caller outside this file needs: move the scalar, and
+	// read what it did. Everything else -- the capacity curve, the spillway, the
+	// save blob, the replication rows -- follows from the scalar and lives in
+	// the .cpp beside voxel-core.
+	//
+	// PLAIN INTEGER TYPES ONLY, because this header is UHT-parsed and must never
+	// see a voxel-core type (the same rule FVoxelWaterImpl exists to keep). A
+	// basin is named the way the v1 wire names it: its tile plus its tile-local
+	// row index.
+
+	// Adds `Units` (one unit == one WaterCA fill unit == 1/255 of a 10 cm voxel)
+	// to a basin, spilling whatever will not fit below its baked sill.
+	//
+	// Returns the amount ACCEPTED -- `Units` when the basin resolves, 0 when it
+	// does not (no fine tier, tile not streamed, no such row). A caller keeping
+	// its own ledger must use the return value and never the request. `OutLevelMm`
+	// and `OutBakedMm` report where the lake now stands and where the bake said
+	// it stands, so the difference is legible without a second query.
+	int64 CreditBasinVolume(int32 TileX, int32 TileY, int32 LocalBasinId, int64 Units,
+	                        int32& OutLevelMm, int32& OutBakedMm);
+
+	// Ledger session stats. `OutBasins` is how many are off equilibrium;
+	// `OutSpilledUnits` is what has left basins over their sills; `OutRouted` and
+	// `OutRefunded` split that into what the routing graph took and what came
+	// back. bLedgerActive false means there is no fine tier and none of the rest
+	// means anything -- which is a different fact from every counter reading 0.
+	void GetBasinLedgerStats(bool& bOutLedgerActive, int32& OutBasins, int64& OutSumUnits,
+	                         int64& OutSpilledUnits, int64& OutRoutedUnits, int64& OutRefundedUnits) const;
+
 	// --- FAR-FIELD RIVER RIBBONS (docs/water-handover-2026-08-04.md Phase 4) --
 	//
 	// The lake half above draws basins. Rivers cannot use it: `basinsForTile`,
