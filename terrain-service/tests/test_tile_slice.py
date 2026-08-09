@@ -110,10 +110,33 @@ def test_ground_only_preamble_is_one_request(blob, monkeypatch):
     monkeypatch.setattr(ts, "HEAD_PROBE_BYTES",
                         sum(pre0.sections[tc.SECTION_ELEV_INDEX]))
     src = ts.BytesRangeSource(blob)
-    pre = ts.read_preamble(src, want_flow=False, want_water=False, want_basins=False)
+    pre = ts.read_preamble(src, want_flow=False, want_water=False,
+                           want_basins=False, want_heads=False)
     assert src.requests == 1
     assert pre.flow is None and pre.water is None and pre.basins is None
+    assert pre.heads is None
     assert pre.elevation is not None
+
+
+def test_a_bake_ver_24_tile_slices_and_carries_its_headwaters():
+    """THE THIRD PARSER. This module has its own copy of the unknown-flag rule,
+    so a new flag bit refuses the tile HERE even when tile_codec and tilestore
+    both accept it -- which would make every bake_ver 24 tile unsliceable.
+
+    (Not hypothetical for this format: the two-halves-in-lockstep property is
+    exactly what FLAG_HEADS_PRESENT trades on, and a third half nobody counted
+    is how that property quietly stops holding.)
+    """
+    tile = _tile()
+    tile.bake_ver = 24
+    tile.heads = [tc.HeadEntry(px=(3, 1), q_m3_yr=0),
+                  tc.HeadEntry(px=(1, 9), q_m3_yr=230_000_001)]
+    blob = tc.encode_v2(tile)
+    pre = ts.read_preamble(ts.BytesRangeSource(blob))
+    assert pre.heads == tile.heads
+    assert pre.preamble_bytes > 0
+    # And a client that does not want them does not pay for them.
+    assert ts.read_preamble(ts.BytesRangeSource(blob), want_heads=False).heads is None
 
 
 def test_preamble_matches_the_header(blob):

@@ -250,6 +250,10 @@ class TilePreamble:
     flow: PlaneIndex | None = None
     water: PlaneIndex | None = None
     basins: "list[tc.BasinEntry] | None" = None
+    #: SECTION_HEADWATERS (bake_ver 24), when asked for and present. Same
+    #: three-state rule as `basins`: None is "not fetched or not carried", an
+    #: empty list is "surveyed, no reach starts here".
+    heads: "list[tc.HeadEntry] | None" = None
 
     @property
     def block_dim_px(self) -> int:
@@ -269,7 +273,8 @@ class TilePreamble:
             if s in self.sections
         )
         basin = self.sections.get(tc.SECTION_BASIN_TABLE, (0, 0))[1]
-        return fixed + idx + basin
+        heads = self.sections.get(tc.SECTION_HEADWATERS, (0, 0))[1]
+        return fixed + idx + basin + heads
 
     def plane(self, section_index_id: int) -> PlaneIndex | None:
         return {
@@ -309,7 +314,13 @@ def _parse_fixed_head(head: bytes) -> dict:
     bs = 1 << block_log2
     if size == 0 or size % bs != 0:
         raise ValueError(f"size {size} not a multiple of the block edge {bs}")
-    if flags & ~(tc.FLAG_FLOW_PRESENT | tc.FLAG_BASINS_PRESENT | tc.FLAG_WATER_PRESENT):
+    # THE THIRD COPY OF THE UNKNOWN-FLAG RULE (tile_codec.decode_v2 and
+    # tilestore.h are the other two), and it has to move with them: a bit this
+    # slicer does not know refuses the tile, so bake_ver 24's FLAG_HEADS_PRESENT
+    # would have made every new tile unsliceable while the two parsers the
+    # change was written against both accepted it.
+    if flags & ~(tc.FLAG_FLOW_PRESENT | tc.FLAG_BASINS_PRESENT | tc.FLAG_WATER_PRESENT
+                 | tc.FLAG_HEADS_PRESENT):
         raise ValueError(f"unknown header flag bits set: 0x{flags:04x}")
 
     table_len = n_sections * tc._SECTION_ENTRY.size
@@ -332,7 +343,8 @@ def _parse_fixed_head(head: bytes) -> dict:
 
 
 def read_preamble(source: "RangeSource", *, want_flow: bool = True,
-                  want_water: bool = True, want_basins: bool = True) -> TilePreamble:
+                  want_water: bool = True, want_basins: bool = True,
+                  want_heads: bool = True) -> TilePreamble:
     """Header + section table + the requested plane indices + basin table.
 
     Two rounds at most. The first is a single ``HEAD_PROBE_BYTES`` read, which
@@ -356,6 +368,10 @@ def read_preamble(source: "RangeSource", *, want_flow: bool = True,
         wanted.append(tc.SECTION_WATER_INDEX)
     if want_basins and (fields["flags"] & tc.FLAG_BASINS_PRESENT):
         wanted.append(tc.SECTION_BASIN_TABLE)
+    # Beside the basin table at the end of the file, so it costs no extra
+    # round trip: the two are adjacent and coalesce into one range.
+    if want_heads and (fields["flags"] & tc.FLAG_HEADS_PRESENT):
+        wanted.append(tc.SECTION_HEADWATERS)
 
     have: dict[int, bytes] = {}
     todo: list[int] = []
@@ -398,6 +414,8 @@ def read_preamble(source: "RangeSource", *, want_flow: bool = True,
         water=plane_for(tc.SECTION_WATER_INDEX, tc.SECTION_WATER_DATA, "<i2", np.int16),
         basins=(tc.decode_basin_table(have[tc.SECTION_BASIN_TABLE])
                 if tc.SECTION_BASIN_TABLE in have else None),
+        heads=(tc.decode_headwaters(have[tc.SECTION_HEADWATERS])
+               if tc.SECTION_HEADWATERS in have else None),
     )
 
 

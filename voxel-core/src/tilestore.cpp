@@ -413,27 +413,39 @@ bool parseBlockIndex(const uint8_t* indexData, uint64_t indexLen,
 // gameplay instruction: it says "flood-fill from here, up to this level", and
 // a bbox reaching outside the tile or a surface above its own spill would put
 // water where there is none. `tileSize` is the grid edge the row must fit in.
-bool parseBasinTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize,
-                     std::vector<BasinEntry>& out) {
+bool parseBasinTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize, int32_t tileX,
+                     int32_t tileY, std::vector<BasinEntry>& out) {
     if (len < kBasinTableHeaderBytes) return false;
     ByteReader r(tableData, static_cast<size_t>(len));
     uint16_t version, entryBytes;
     uint32_t count;
-    if (!r.u16(version) || version != kBasinTableVersion) return false;
+    if (!r.u16(version)) return false;
+    if (version != kBasinTableVersionV1 && version != kBasinTableVersionV2) return false;
+    const bool v2 = version == kBasinTableVersionV2;
     // A row size this build does not know is bytes written by a different
-    // revision of the table. Refusing beats reading 33-byte records out of a
-    // 32-byte stream and getting plausible garbage.
-    if (!r.u16(entryBytes) || entryBytes != kBasinEntryBytes) return false;
+    // revision of the table. Refusing beats reading 81-byte records out of an
+    // 80-byte stream and getting plausible garbage. CHECKED AS A PAIR with the
+    // version: a v2 label over 32-byte rows is not "an old table relabelled",
+    // it is bytes neither revision wrote, and reading it either way is a guess.
+    const uint64_t rowBytes = v2 ? kBasinEntryBytesV2 : kBasinEntryBytes;
+    if (!r.u16(entryBytes) || entryBytes != rowBytes) return false;
     if (!r.u32(count)) return false;
-    if (len != kBasinTableHeaderBytes + static_cast<uint64_t>(count) * kBasinEntryBytes) {
+    if (len != kBasinTableHeaderBytes + static_cast<uint64_t>(count) * rowBytes) {
         return false;
     }
+    // Where this tile's interior pixel (0,0) sits in the world, for validating
+    // the v2 absolute fields against the tile-local ones. int64 throughout: the
+    // product overflows int32 at |tile| >= 262,144, and a wrapped origin would
+    // turn a bounds check into a coin toss.
+    const int64_t worldOx = static_cast<int64_t>(tileX) * static_cast<int64_t>(tileSize);
+    const int64_t worldOy = static_cast<int64_t>(tileY) * static_cast<int64_t>(tileSize);
 
     out.clear();
     out.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         BasinEntry b;
         uint32_t spill = 0, surface = 0;
+        b.tableVersion = version;
         if (!r.u16(b.basinId)) return false;
         if (!r.u16(b.seedX) || !r.u16(b.seedY)) return false;
         if (!r.u16(b.bboxX0) || !r.u16(b.bboxY0) || !r.u16(b.bboxX1) || !r.u16(b.bboxY1)) {
@@ -453,6 +465,11 @@ bool parseBasinTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize,
         // bake orders basins by (min_y, min_x) of extent so the id is a pure
         // function of the surface. A gap or a repeat means two processes could
         // disagree about which basin is "3".
+        //
+        // THAT ID IS TILE-LOCAL AND ALWAYS WAS. Two tiles sharing a lake number
+        // it differently, because each numbers only what it can see; v2's
+        // `globalId` is the one that says they are the same lake, which is why
+        // the two could coexist without breaking this rule.
         if (b.basinId != i) return false;
         if (b.bboxX0 > b.bboxX1 || b.bboxY0 > b.bboxY1) return false;
         if (b.bboxX1 >= tileSize || b.bboxY1 >= tileSize) return false;
@@ -461,7 +478,92 @@ bool parseBasinTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize,
         // Water standing above its own outlet is not a lake, it is a bug: the
         // outlet would carry the excess away.
         if (b.surfaceMm > b.spillMm) return false;
+
+        if (v2) {
+            uint32_t floor = 0, wx0 = 0, wy0 = 0, wx1 = 0, wy1 = 0, wox = 0, woy = 0;
+            if (!r.u64(b.globalId)) return false;
+            if (!r.u64(b.capacityLitres)) return false;
+            if (!r.u32(floor)) return false;
+            if (!r.u32(wx0) || !r.u32(wy0) || !r.u32(wx1) || !r.u32(wy1)) return false;
+            if (!r.u32(wox) || !r.u32(woy)) return false;
+            if (!r.u8(b.spanFlags)) return false;
+            if ((b.spanFlags & ~kBasinSpanCrossesTile) != 0) return false;
+            for (int k = 0; k < 3; ++k) {
+                uint8_t reserved;
+                if (!r.u8(reserved) || reserved != 0) return false;
+            }
+            b.floorMm = static_cast<int32_t>(floor);
+            b.worldX0 = static_cast<int32_t>(wx0);
+            b.worldY0 = static_cast<int32_t>(wy0);
+            b.worldX1 = static_cast<int32_t>(wx1);
+            b.worldY1 = static_cast<int32_t>(wy1);
+            b.worldOutletX = static_cast<int32_t>(wox);
+            b.worldOutletY = static_cast<int32_t>(woy);
+
+            if (b.worldX0 > b.worldX1 || b.worldY0 > b.worldY1) return false;
+            // THE RUNTIME'S KEY CONTRACT (basinledger.h): bit 63 is that
+            // type's "tile-local v1 key" tag and 0 is its "not a basin", so an
+            // id violating either would be silently dropped by the ledger --
+            // no lake, no error, at the far end of a save/replicate path.
+            // Refused here, where the bytes arrive, rather than there.
+            if (b.globalId == 0 || (b.globalId & (uint64_t(1) << 63)) != 0) return false;
+            // The floor is under the water by definition. Above the surface
+            // means the two came off different components, and a client would
+            // then compute a negative standing depth from the row.
+            if (b.floorMm > b.surfaceMm) return false;
+            // THE ANCHOR IS A CELL OF THIS COMPONENT, so it lies in the
+            // component's own extent. If it does not, the identity and the
+            // extent describe two different basins -- and since the client's
+            // union rule reads both, it would merge the wrong pair.
+            const int64_t fx = b.globalIdWorldX(), fy = b.globalIdWorldY();
+            if (fx < b.worldX0 || fx > b.worldX1 || fy < b.worldY0 || fy > b.worldY1) {
+                return false;
+            }
+            // The clipped view must be the world view seen through this tile:
+            // the local bbox, mapped out to world coordinates, has to lie
+            // inside the unclipped one. This is the check that catches a row
+            // built with the wrong tile origin -- which would put a lake a
+            // whole tile away from where the client floods it.
+            if (worldOx + b.bboxX0 < b.worldX0 || worldOx + b.bboxX1 > b.worldX1) return false;
+            if (worldOy + b.bboxY0 < b.worldY0 || worldOy + b.bboxY1 > b.worldY1) return false;
+        }
         out.push_back(b);
+    }
+    return r.atEnd();
+}
+
+// SECTION_HEADWATERS (water re-architecture Phase 1, bake_ver 24). Same shape
+// and the same posture as the basin table: every field checked, because a head
+// row is also a gameplay instruction -- "emit this much water, here".
+bool parseHeadwaterTable(const uint8_t* tableData, uint64_t len, uint32_t tileSize,
+                         std::vector<HeadEntry>& out) {
+    if (len < kHeadwaterTableHeaderBytes) return false;
+    ByteReader r(tableData, static_cast<size_t>(len));
+    uint16_t version, entryBytes;
+    uint32_t count;
+    if (!r.u16(version) || version != kHeadwaterTableVersion) return false;
+    if (!r.u16(entryBytes) || entryBytes != kHeadwaterEntryBytes) return false;
+    if (!r.u32(count)) return false;
+    if (len != kHeadwaterTableHeaderBytes + static_cast<uint64_t>(count) * kHeadwaterEntryBytes) {
+        return false;
+    }
+
+    out.clear();
+    out.reserve(count);
+    int64_t prev = -1;
+    for (uint32_t i = 0; i < count; ++i) {
+        HeadEntry h;
+        if (!r.u16(h.px) || !r.u16(h.py)) return false;
+        if (!r.u32(h.qM3PerYear)) return false;
+        if (h.px >= tileSize || h.py >= tileSize) return false;
+        // STRICTLY ascending by (y, x). Free for the producer (it walks a
+        // raster mask) and load-bearing for the consumer: a repeated point is
+        // one faucet emitted twice, i.e. twice the water in one place, which
+        // no downstream conservation check could attribute.
+        const int64_t key = (static_cast<int64_t>(h.py) << 17) | h.px;
+        if (key <= prev) return false;
+        prev = key;
+        out.push_back(h);
     }
     return r.atEnd();
 }
@@ -585,6 +687,7 @@ const char* fineErrorName(FineError e) {
     case FineError::kBadPayload: return "bad-payload";
     case FineError::kValueOutOfRange: return "value-out-of-range";
     case FineError::kBadBasinTable: return "bad-basin-table";
+    case FineError::kBadHeadwaterTable: return "bad-headwater-table";
     case FineError::kBlockNotResident: return "block-not-resident";
     }
     return "unknown";
@@ -697,6 +800,7 @@ std::string fineDescribeRejection(FineError e, const FineHeaderFacts& facts) {
     case FineError::kBadPayload:
     case FineError::kValueOutOfRange:
     case FineError::kBadBasinTable:
+    case FineError::kBadHeadwaterTable:
         break;
     }
     // The genuinely-malformed codes. They still carry both version numbers,
@@ -817,7 +921,7 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     if (tableData == nullptr) return reject(FineError::kBlockNotResident);
     ByteReader table(tableData, static_cast<size_t>(tableBytes));
 
-    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec;
+    SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec, headSec;
     SectionRef waterIndexSec, waterDataSec;
     struct Extent {
         uint64_t begin, end;
@@ -862,6 +966,7 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
         case kSectionBasinTable: basinSec = ref; break;
         case kSectionWaterIndex: waterIndexSec = ref; break;
         case kSectionWaterData: waterDataSec = ref; break;
+        case kSectionHeadwaters: headSec = ref; break;
         default: break; // see (b): unknown ids are ignored but still bounded
         }
     }
@@ -896,6 +1001,11 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     if (!wantWater && (waterIndexSec.present || waterDataSec.present)) {
         return reject(FineError::kBadSectionTable);
     }
+    // Fourth section, same both-directions rule, same reason: a head table
+    // whose flag is clear would be silently ignored and every faucet in the
+    // tile would go missing without a word.
+    const bool wantHeads = (h.flags & kFineFlagHeadsPresent) != 0;
+    if (wantHeads != headSec.present) return reject(FineError::kBadSectionTable);
 
     // Resolves one PREAMBLE section's bytes. The distinction it carries is the
     // one this whole partial path exists for: nullptr with the section declared
@@ -920,10 +1030,22 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     if (wantBasins) {
         const uint8_t* basinData = preamble(basinSec);
         if (basinData != nullptr) {
-            if (!parseBasinTable(basinData, basinSec.length, h.size, basins)) {
+            if (!parseBasinTable(basinData, basinSec.length, h.size, h.x, h.y, basins)) {
                 return reject(FineError::kBadBasinTable);
             }
             basinsResident = true;
+        }
+    }
+
+    std::vector<HeadEntry> heads;
+    bool headsResident = false;
+    if (wantHeads) {
+        const uint8_t* headData = preamble(headSec);
+        if (headData != nullptr) {
+            if (!parseHeadwaterTable(headData, headSec.length, h.size, heads)) {
+                return reject(FineError::kBadHeadwaterTable);
+            }
+            headsResident = true;
         }
     }
 
@@ -973,6 +1095,8 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
 
     tile.basinsResident_ = basinsResident;
     tile.basins_ = std::move(basins);
+    tile.headsResident_ = headsResident;
+    tile.heads_ = std::move(heads);
     tile.bytes_ = std::move(bytes);
     return tile;
 }

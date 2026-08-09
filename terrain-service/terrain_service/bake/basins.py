@@ -70,6 +70,9 @@ __all__ = [
     "SEA_LEVEL_M",
     "BasinSurvey",
     "hypsometry",
+    "capacity_m3",
+    "global_basin_id",
+    "world_px_from_global_id",
     "equilibrium_level",
     "classify",
     "survey_basins",
@@ -127,12 +130,28 @@ class BasinFilter:
     min_depth_m: float = 2.0
     #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
     min_area_m2: float = 2500.0
-    #: Refuse basins whose extent leaves the tile INTERIOR (§4.2.4). Such a
-    #: basin is registered independently by each tile that sees it, from a
-    #: different padded domain, and the two need not agree; it also has a
-    #: catchment crossing the seam. v1 excludes them and COUNTS them, so the
-    #: cost of the exclusion is a number rather than an assumption.
-    exclude_spanning: bool = True
+    #: Refuse basins whose extent leaves the tile INTERIOR (§4.2.4).
+    #:
+    #: DEFAULT FLIPPED TO FALSE AT BASIN TABLE v2 (basin table v2 / bake_ver
+    #: 24). v1 refused them because "the two sides need not agree" and nothing
+    #: on the wire could reconcile them. v2 puts a GLOBAL IDENTITY on every row
+    #: -- ``global_id``, the basin's deepest cell in absolute world pixels --
+    #: plus the component's absolute extent, so the two sides can be matched by
+    #: a client instead of dropped by the bake. See ``global_basin_id`` for the
+    #: anchor's derivation and its honest failure mode.
+    #:
+    #: WHAT THE EXCLUSION COST, measured (docs/measurements/
+    #: spanning-basin-loss-2026-08-07.txt, wet alpine block, 6 tiles, bake_ver
+    #: 15): 123 basins / 146 ha dropped, ~9% of lake area on that block (the
+    #: often-quoted 57% is a component count on 12 tiles at bake_ver 7 and half
+    #: its area is ONE tile). And the hole was never dug: B5 only subtracts
+    #: ``basin_depth`` under ``keep_mask``, so a dropped basin ships as a flat
+    #: plain at the fill level -- wrong ground AND no lake.
+    #:
+    #: THE PRICE OF FLIPPING IT, stated where the flip happens: re-opening
+    #: those holes MOVES THE SHIPPED GROUND, so this is a TERRAIN-half constant
+    #: (``BakeConstants.as_payload``) and flipping it re-keys the world.
+    exclude_spanning: bool = False
     #: Refuse depressions whose spill is at or below sea level. Those are sea
     #: floor: the ocean already covers them, and a "lake surface" there would
     #: be a second water plane under the first.
@@ -376,18 +395,35 @@ def _label8(mask, labels):
 
 
 @flow._jit(cache=True)
-def _component_stats(labels, z_open, filled, acc, n, margin):
+def _component_stats(labels, z_open, filled, acc, n, margin, oy, ox, ih, iw):
     """One pass for every per-component scalar, plus the outlet.
 
     Returns, all indexed by ``label - 1``:
       area, floor_m, spill_m, seed_y, seed_x, y0, x0, y1, x1,
-      catchment_m2, touches_border, outlet_y, outlet_x
+      catchment_m2, touches_border, outlet_y, outlet_x,
+      inner_cells, inner_seed_y, inner_seed_x
 
     The outlet is the LOWEST cell on the final surface that is adjacent to the
     component but outside it -- the saddle the basin spills over, i.e. the
     head of the outlet channel. Found here rather than by a second pass
     because a component's rim is not a slice and re-scanning per component
     would be O(n_components * area).
+
+    ``oy/ox/ih/iw`` bound the tile INTERIOR inside the padded grid, and the
+    three ``inner_*`` outputs are what basin table v2 needs to ship a
+    tile-spanning basin at all:
+
+    * ``inner_cells`` -- how much of the component lies in THIS tile. Zero
+      means the component is entirely in the apron: it is a neighbour's basin
+      seen through the pad, and registering it would ship a lake in a tile
+      that contains none of it. (The apron adds 62 km^2 around a 236 km^2
+      tile, so this is 26% more area of other people's basins, not a corner
+      case.)
+    * ``inner_seed_*`` -- the deepest cell of the component WITHIN the
+      interior. The wire's ``seed_px`` is a client flood-fill seed and must be
+      a pixel the client's own tile actually has; for a spanning basin the
+      true floor can sit in the apron or in the neighbour. The true floor is
+      still recorded, in absolute world pixels, as the identity anchor.
     """
     h, w = labels.shape
     area = np.zeros(n, np.int64)
@@ -404,6 +440,10 @@ def _component_stats(labels, z_open, filled, acc, n, margin):
     out_y = np.full(n, -1, np.int64)
     out_x = np.full(n, -1, np.int64)
     out_z = np.full(n, np.inf, np.float64)
+    inner = np.zeros(n, np.int64)
+    inner_floor = np.full(n, np.inf, np.float64)
+    inner_y = np.full(n, -1, np.int64)
+    inner_x = np.full(n, -1, np.int64)
     dy = np.array((-1, 1, 0, 0, -1, -1, 1, 1), np.int64)
     dx = np.array((0, 0, -1, 1, -1, 1, -1, 1), np.int64)
     for y in range(h):
@@ -417,6 +457,12 @@ def _component_stats(labels, z_open, filled, acc, n, margin):
                     floor[i] = zv
                     seed_y[i] = y
                     seed_x[i] = x
+                if oy <= y < oy + ih and ox <= x < ox + iw:
+                    inner[i] += 1
+                    if zv < inner_floor[i]:
+                        inner_floor[i] = zv
+                        inner_y[i] = y
+                        inner_x[i] = x
                 fv = filled[y, x]
                 if fv > spill[i]:
                     spill[i] = fv
@@ -449,7 +495,142 @@ def _component_stats(labels, z_open, filled, acc, n, margin):
                     out_y[lj - 1] = y
                     out_x[lj - 1] = x
     return (area, floor, spill, seed_y, seed_x, y0, x0, y1, x1,
-            catch, border, out_y, out_x)
+            catch, border, out_y, out_x, inner, inner_y, inner_x)
+
+
+# --------------------------------------------------------------------- identity
+
+
+#: Coordinate bias inside ``global_basin_id``: world pixels are signed and the
+#: packed field is not, so each axis is stored as ``px + BASIN_ID_AXIS_BIAS`` in
+#: 31 bits. 2^30 px is +/-1.07e9 px = +/-2.01 million km at 1.875 m/px, i.e.
+#: +/-131,072 tiles -- far outside any world this project will bake, and a
+#: coordinate past it RAISES rather than folding onto another basin's id.
+BASIN_ID_AXIS_BIAS = 1 << 30
+#: Bit 62, set on every id this function issues. Two jobs, both required by
+#: ``voxelcore/basinledger.h``'s ``BasinId``, which is what the runtime keys its
+#: per-basin ledger by:
+#:
+#:   * bit 63 must be CLEAR -- the runtime tags tile-local v1 keys with it, and
+#:     an id that set it would be refused as malformed;
+#:   * the id must be NON-ZERO -- 0 is that type's ``kNoBasin``, so an id of 0
+#:     would silently mean "not a basin" instead of naming one.
+#:
+#: A constant high bit buys both at once (and, being outside the two coordinate
+#: fields, costs no range).
+BASIN_ID_TAG = 1 << 62
+
+
+def global_basin_id(world_x: int, world_y: int) -> int:
+    """The cross-tile identity of a basin: its deepest cell, packed.
+
+        id = BASIN_ID_TAG | ((x + BIAS) << 31) | (y + BIAS)
+
+    where ``(world_x, world_y)`` is the basin's FLOOR cell in absolute world
+    FINE-PIXEL coordinates (1.875 m/px at production). Two adjacent tiles that
+    both register the same physical basin emit the same id with no cross-tile
+    communication at bake time.
+
+    WHY A PACKING AND NOT A HASH. A hash would need a collision argument; this
+    is a bijection over the coordinate plane, so it has none to make -- two
+    basins share an id only if they share a floor cell, in which case they are
+    the same basin. It also stays READABLE: ``world_px_from_global_id`` gives
+    the lake's deepest pixel straight back, so an id in a log is a place you
+    can go and look at.
+
+    WHY BIASED 31-BIT FIELDS RATHER THAN TWO'S-COMPLEMENT u32 HALVES, which is
+    the obvious packing and is WRONG HERE: a negative world x sets the high bit
+    of its u32 half, i.e. bit 63 of the id -- which ``voxelcore/basinledger.h``
+    reserves as its "this key is a v1 tile-local id" tag, so ``fromGlobal``
+    refuses it. The wet alpine block is at tiles (-5,-5)..(-3,-4), so EVERY
+    basin in the world we actually look at has a negative world x: the naive
+    packing would have been rejected by the runtime for the entire shipped
+    world while passing every encoder test. See BASIN_ID_TAG.
+
+    WHY THE FLOOR CELL AND NOT THE SPILL SADDLE, which is the other obvious
+    anchor and was the first candidate. Both are argmins over the component,
+    so both are cheap and both are stable under a pure translation of the
+    domain. They differ under TRUNCATION, which is the case that matters:
+
+    * Every registered basin is a CLOSED depression within its own padded
+      domain. ``fill_depressions`` never raises a border cell (flow.py's own
+      docstring), so a hollow reaching the padded border drains out and is not
+      a depression at all -- verified on a synthetic hollow whose corner is
+      the domain corner: 0 basin cells.
+    * So a basin big enough to reach one tile's padded border is simply ABSENT
+      from that tile rather than half-registered. The remaining hazard is the
+      in-between one: a pit whose true outlet lies outside the pad but which
+      still fills to a LOWER saddle inside it. That tile records a shallower
+      basin with a DIFFERENT spill and a DIFFERENT outlet -- but the SAME
+      deepest cell, because the pit itself is in the pad either way.
+
+    The floor therefore survives the one case the saddle does not, which is
+    why it is the anchor.
+
+    WHAT IT DOES NOT PROMISE. It is exact agreement only where the two tiles'
+    padded surfaces agree over the overlap, and they are not guaranteed
+    bit-identical there (APRON_BLIND_SPOT measured the apron's own guarantee
+    already violated on ~1.05% of the shipped interior). A one-cell move of
+    the argmin, or a tie between two equally deep cells resolved on different
+    scan windows, yields two ids for one lake. That is why the row ALSO
+    carries the component's absolute extent and its spill: the client's union
+    rule is "same global_id, OR absolute extents overlap and spill levels
+    agree" and the id is the fast path, not the only path.
+    """
+    bx = int(world_x) + BASIN_ID_AXIS_BIAS
+    by = int(world_y) + BASIN_ID_AXIS_BIAS
+    if not (0 <= bx < (1 << 31) and 0 <= by < (1 << 31)):
+        # Folding is the failure that looks like data: a wrapped coordinate
+        # produces a perfectly valid id belonging to a different lake.
+        raise ValueError(
+            f"world pixel ({world_x}, {world_y}) is outside the basin id's "
+            f"+/-{BASIN_ID_AXIS_BIAS} px range"
+        )
+    return BASIN_ID_TAG | (bx << 31) | by
+
+
+def world_px_from_global_id(gid: int) -> tuple[int, int]:
+    """Inverse of `global_basin_id`: the floor cell, signed, as (x, y)."""
+    return ((((int(gid) >> 31) & 0x7FFFFFFF) - BASIN_ID_AXIS_BIAS),
+            ((int(gid) & 0x7FFFFFFF) - BASIN_ID_AXIS_BIAS))
+
+
+def capacity_m3(hyps_levels, hyps_areas, surface_m: float, spill_m: float) -> float:
+    """Water the basin can still TAKE before it spills, m^3.
+
+        capacity = INTEGRAL from surface_m to spill_m of A(h) dh
+
+    i.e. the headroom above the equilibrium surface, which is what Phase 2's
+    spillway rule needs: a ledger delta beyond this routes to the outlet. An
+    overflowing lake therefore has capacity 0 -- correct, not degenerate: it
+    is already at its spill and every extra litre leaves by the outlet.
+
+    TRAPEZOIDAL OVER THE SAME KNOTS ``equilibrium_level`` INVERTS. A(h) is
+    sampled at ``hyps_levels`` (a linear ladder from floor to spill) and the
+    balance solve already treats it as piecewise linear between them
+    (``np.interp``); integrating the same interpolant keeps one description of
+    the basin's shape rather than two that could disagree about where the
+    water sits. The true A(h) is a step function (a CDF of cell elevations),
+    and the trapezoid of its linear interpolant is the midpoint rule on the
+    steps -- unbiased rather than one-sided, which a left- or right-Riemann
+    sum would not be.
+    """
+    levels = np.asarray(hyps_levels, dtype=np.float64)
+    areas = np.asarray(hyps_areas, dtype=np.float64)
+    lo = float(surface_m)
+    hi = float(spill_m)
+    if levels.size < 2 or hi <= lo:
+        return 0.0
+    lo = min(max(lo, float(levels[0])), float(levels[-1]))
+    hi = min(max(hi, float(levels[0])), float(levels[-1]))
+    if hi <= lo:
+        return 0.0
+    knots = np.concatenate(([lo], levels[(levels > lo) & (levels < hi)], [hi]))
+    a = np.interp(knots, levels, areas)
+    # The trapezoid written out rather than np.trapz/np.trapezoid: the name of
+    # that function changed between numpy versions and this box's answer must
+    # not depend on which one is installed -- it decides shipped bytes.
+    return float(np.sum(0.5 * (a[:-1] + a[1:]) * np.diff(knots)))
 
 
 # --------------------------------------------------------------------------- records
@@ -466,9 +647,15 @@ class BasinRecord:
     """
 
     basin_id: int
-    #: Deepest cell, the client's flood-fill seed. Interior pixels.
+    #: Deepest cell IN THIS TILE, the client's flood-fill seed. Interior
+    #: pixels, always inside ``bbox_px``. For a tile-spanning basin this is
+    #: NOT the basin's floor -- the floor may be in the apron or in the
+    #: neighbour -- and ``world_floor_px``/``floor_m`` carry that instead.
     seed_px: tuple[int, int]
-    #: (x0, y0, x1, y1) inclusive, interior pixels.
+    #: (x0, y0, x1, y1) inclusive, interior pixels, CLIPPED to the tile. The
+    #: unclipped extent is ``world_bbox_px``; the clip is what keeps the wire
+    #: row's u16 fields meaningful for a spanning basin (a client indexes its
+    #: own plane with them and cannot address a pixel it does not have).
     bbox_px: tuple[int, int, int, int]
     #: Cells in the depression at the spill level, and that area in m^2.
     area_cells: int
@@ -506,6 +693,31 @@ class BasinRecord:
     #: Hypsometry: level in metres, wetted area in m^2, both ascending.
     hyps_levels_m: tuple[float, ...] = ()
     hyps_areas_m2: tuple[float, ...] = ()
+
+    # -- basin table v2 (bake_ver 24) -------------------------------------
+    #: Cross-tile identity: the floor cell packed by ``global_basin_id``.
+    global_id: int = 0
+    #: The floor cell in ABSOLUTE world fine pixels -- the identity anchor
+    #: itself, kept beside the packed form so a record is legible without
+    #: unpacking. Equals ``seed_px + world origin`` for a basin that lies
+    #: wholly inside its tile.
+    world_floor_px: tuple[int, int] = (0, 0)
+    #: The component's UNCLIPPED extent in absolute world fine pixels, as this
+    #: tile's padded domain sees it. This is what lets a client union two
+    #: tiles' rows when the ids disagree: the two extents overlap because each
+    #: tile sees into the other through its apron, whereas the CLIPPED
+    #: ``bbox_px`` pair would merely abut at the seam.
+    world_bbox_px: tuple[int, int, int, int] = (0, 0, 0, 0)
+    #: The outlet in absolute world fine pixels. The clipped ``outlet_px`` is
+    #: clamped into the tile and is a lie for a basin that spills outside it;
+    #: this is the truth, and it is what a spillway faucet must use.
+    world_outlet_px: tuple[int, int] = (0, 0)
+    #: Headroom between ``surface_m`` and ``spill_m``, m^3. See ``capacity_m3``.
+    capacity_m3: float = 0.0
+    #: Cells of this component that lie in THIS tile's interior. A component
+    #: with none of them is a neighbour's basin seen through the apron and is
+    #: never registered.
+    interior_cells: int = 0
 
     @property
     def depth_m(self) -> float:
@@ -551,6 +763,12 @@ class BasinRecord:
             "balance_area_m2": self.balance_area_m2,
             "hyps_levels_m": list(self.hyps_levels_m),
             "hyps_areas_m2": list(self.hyps_areas_m2),
+            "global_id": self.global_id,
+            "world_floor_px": list(self.world_floor_px),
+            "world_bbox_px": list(self.world_bbox_px),
+            "world_outlet_px": list(self.world_outlet_px),
+            "capacity_m3": self.capacity_m3,
+            "interior_cells": self.interior_cells,
         }
         return d
 
@@ -650,9 +868,30 @@ class BasinSurvey:
     #: Components that pass depth+area+sea but leave the tile interior. This
     #: is the "cost of the tile-spanning exclusion" §4.2.4 asks to be counted,
     #: with their area and depth so it is a size and not just a count.
+    #:
+    #: THE NAME IS NOW HALF RIGHT AND IS KEPT ANYWAY. Since basin table v2 they
+    #: are only DROPPED when ``exclude_spanning`` is on; with the shipped
+    #: default off this counts what QUALIFIED as spanning, and
+    #: ``kept_spanning`` below says how many of them were registered. The key
+    #: is quoted by the shipped per-tile stats, by tests and by
+    #: docs/measurements/spanning-basin-loss-2026-08-07.txt, and a counter that
+    #: vanished would read as a missing measurement rather than a renamed one.
     excluded_spanning: int = 0
     excluded_spanning_area_m2: float = 0.0
     excluded_spanning_max_depth_m: float = 0.0
+    #: Components that qualify on depth+area+sea but have NOT ONE CELL in the
+    #: tile interior: entirely apron, i.e. a neighbour's basin seen through
+    #: the pad. Always refused (there is no ``exclude`` switch, because
+    #: shipping one would put a lake in a tile that contains none of it), and
+    #: counted so the refusal is a number. Structurally zero while
+    #: ``exclude_spanning`` is on, since such a component is spanning first.
+    excluded_outside: int = 0
+    #: Registered basins whose extent LEAVES the tile interior -- the ones v1
+    #: dropped and v2 keeps. Counted separately from ``basins`` because the
+    #: cross-tile union is only exercised by these, so "did this tile ship any
+    #: work for the client's union rule" must be answerable from the stats.
+    kept_spanning: int = 0
+    kept_spanning_area_m2: float = 0.0
     #: Registered basins that come within ``border_margin_px`` of the padded
     #: edge. A diagnostic, not an exclusion -- see BasinFilter.
     kept_near_padded_border: int = 0
@@ -703,6 +942,7 @@ def survey_basins(
     hyps_levels: int = 32,
     keep_labels: bool = False,
     keep_hypsometry: bool = True,
+    world_origin_px: tuple[int, int] = (0, 0),
 ) -> BasinSurvey:
     """Re-open, re-fill, register and classify every depression in one grid.
 
@@ -717,6 +957,13 @@ def survey_basins(
 
     ``interior`` is the slice that crops the padded domain to the tile, used
     only to convert pixel coordinates and to decide ``BasinRecord.interior``.
+
+    ``world_origin_px`` is the ABSOLUTE world fine-pixel coordinate ``(x, y)``
+    of interior pixel (0, 0) -- i.e. ``(tile_x, tile_y) * fine_tile_px``. It is
+    what turns this tile's local view into the cross-tile identity of basin
+    table v2 (``global_id`` and the ``world_*`` fields); the (0, 0) default
+    makes world coordinates equal to interior ones, which is what a
+    single-domain caller (``tools/lake_survey.py``, the unit tests) wants.
     """
     z_open = reopened_surface(z_final, basin_depth)
     labels, filled, n = depression_components(z_open)
@@ -730,11 +977,6 @@ def survey_basins(
     if n == 0:
         return survey
 
-    acc = np.ascontiguousarray(accumulation_m2, dtype=np.float32)
-    (area, floor, spill, seed_y, seed_x, by0, bx0, by1, bx1,
-     catch, border, out_y, out_x) = _component_stats(
-         labels, z_open, filled, acc, n, int(filt.border_margin_px))
-
     ox = oy = 0
     iw = z_open.shape[1]
     ih = z_open.shape[0]
@@ -743,6 +985,16 @@ def survey_basins(
         oy = ox
         iw = int(interior.stop) - ox
         ih = iw
+    # World fine-pixel coordinate of interior (0, 0). Everything absolute on a
+    # v2 row is `local + this`, and nothing else in this module knows where the
+    # tile is -- which is what keeps the survey a pure function of its arrays.
+    wox, woy = int(world_origin_px[0]), int(world_origin_px[1])
+
+    acc = np.ascontiguousarray(accumulation_m2, dtype=np.float32)
+    (area, floor, spill, seed_y, seed_x, by0, bx0, by1, bx1,
+     catch, border, out_y, out_x, inner, inner_y, inner_x) = _component_stats(
+         labels, z_open, filled, acc, n, int(filt.border_margin_px),
+         oy, ox, ih, iw)
 
     coarse_ratio = 1
     if climate is not None:
@@ -771,6 +1023,15 @@ def survey_basins(
                 survey.excluded_spanning_max_depth_m, depth)
             if filt.exclude_spanning:
                 continue
+            # NOT ONE CELL IN THIS TILE. An apron-only component belongs to a
+            # neighbour and nothing else: it has no seed the client could
+            # index, and B5 would subtract its depth entirely outside the
+            # shipped crop. Refused unconditionally -- see excluded_outside.
+            if int(inner[i]) == 0:
+                survey.excluded_outside += 1
+                continue
+            survey.kept_spanning += 1
+            survey.kept_spanning_area_m2 += float(area[i]) * cell_area
         if border[i]:
             survey.kept_near_padded_border += 1
         keep.append(((int(by0[i]), int(bx0[i])), i))
@@ -806,20 +1067,39 @@ def survey_basins(
         kind, surface = classify(h_star, float(floor[i]), float(spill[i]),
                                  precip_mm=precip, pet_mm=pet, precip_cv=cv, wb=wb)
 
-        sy = int(seed_y[i]) - oy
-        sx = int(seed_x[i]) - ox
+        # THE CLIPPED VIEW (what a client indexes) AND THE ABSOLUTE ONE (what
+        # identifies the basin) are computed side by side here, and the split
+        # is the whole of basin table v2:
+        #
+        #   * every quantity that DECIDES the basin -- floor, spill, surface,
+        #     kind, hypsometry, capacity, climate sample -- is taken from the
+        #     component as the PADDED domain sees it, so two tiles sharing a
+        #     basin compute the same numbers rather than two clipped ones that
+        #     could never be reconciled;
+        #   * every quantity a client uses to ADDRESS pixels -- seed, bbox,
+        #     outlet -- is clipped/clamped into this tile, because a client
+        #     cannot index a pixel its plane does not contain.
+        #
+        # For a basin that lies wholly inside its tile the two agree exactly
+        # and nothing about v1's behaviour changes.
+        sy = int(inner_y[i]) - oy
+        sx = int(inner_x[i]) - ox
+        cx0 = min(max(int(bx0[i]) - ox, 0), iw - 1)
+        cy0 = min(max(int(by0[i]) - oy, 0), ih - 1)
+        cx1 = min(max(int(bx1[i]) - ox, 0), iw - 1)
+        cy1 = min(max(int(by1[i]) - oy, 0), ih - 1)
         rec = BasinRecord(
             basin_id=basin_id,
             seed_px=(sx, sy),
-            bbox_px=(int(bx0[i]) - ox, int(by0[i]) - oy,
-                     int(bx1[i]) - ox, int(by1[i]) - oy),
+            bbox_px=(cx0, cy0, cx1, cy1),
             area_cells=int(area[i]),
             area_m2=float(area[i]) * cell_area,
             floor_m=float(floor[i]),
             spill_m=float(spill[i]),
             surface_m=surface,
             kind=kind,
-            outlet_px=(int(out_x[i]) - ox, int(out_y[i]) - oy),
+            outlet_px=(min(max(int(out_x[i]) - ox, 0), iw - 1),
+                       min(max(int(out_y[i]) - oy, 0), ih - 1)),
             catchment_m2=float(catch[i]),
             near_padded_border=bool(border[i]),
             interior=(int(bx0[i]) >= ox and int(by0[i]) >= oy
@@ -836,6 +1116,22 @@ def survey_basins(
                            if keep_hypsometry else ()),
             hyps_areas_m2=(tuple(float(v) for v in areas_m2)
                            if keep_hypsometry else ()),
+            # -- v2. The hypsometry is integrated HERE, unconditionally, and
+            # that is why `keep_hypsometry` stays off in the bake: the curve
+            # is computed for every basin either way (four lines above) and
+            # `keep_hypsometry` only decides whether the 66 floats are also
+            # STORED on the record. Capacity needs the curve, not the copy.
+            global_id=global_basin_id(int(seed_x[i]) - ox + wox,
+                                      int(seed_y[i]) - oy + woy),
+            world_floor_px=(int(seed_x[i]) - ox + wox,
+                            int(seed_y[i]) - oy + woy),
+            world_bbox_px=(int(bx0[i]) - ox + wox, int(by0[i]) - oy + woy,
+                           int(bx1[i]) - ox + wox, int(by1[i]) - oy + woy),
+            world_outlet_px=(int(out_x[i]) - ox + wox,
+                             int(out_y[i]) - oy + woy),
+            capacity_m3=capacity_m3(levels_m, areas_m2, surface,
+                                    float(spill[i])),
+            interior_cells=int(inner[i]),
         )
         survey.basins.append(rec)
         survey.kept_volume_m3 += float(

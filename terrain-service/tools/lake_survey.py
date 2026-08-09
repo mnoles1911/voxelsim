@@ -262,6 +262,12 @@ def cmd_dump(args) -> int:
         cell_m=geom.fine_pixel_m,
         interior=interior,
         filt=DUMP_FILTER,
+        # WHERE THIS TILE IS. Without it every tile's basins would be measured
+        # as if the world began at their own corner, so `global_id` -- the
+        # thing that says two tiles are looking at ONE lake -- would collide
+        # across the survey instead of matching. The dump already sweeps whole
+        # blocks of tiles, which is exactly where that shows up.
+        world_origin_px=(tx * geom.fine_tile_px, ty * geom.fine_tile_px),
     )
     print(f"  survey {time.process_time() - c1:.0f} s cpu: "
           f"{survey.n_components} components, {len(survey.basins)} recorded",

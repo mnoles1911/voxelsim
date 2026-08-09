@@ -1641,7 +1641,23 @@ def test_terrain_version_bump_rerolls_the_world_and_product_does_not():
     assert pipeline.bake_identity_payload()["bake_version"] == pipeline.TERRAIN_VERSION
     assert pipeline.product_identity_payload()["bake_version"] == pipeline.BAKE_VERSION
     # And the shipped terrain fingerprint, likewise pinned.
-    assert pipeline.bake_fingerprint().startswith("fe0275e105cbf77c")
+    #
+    # MOVED fe0275e105cbf77c -> 7b960cbe6419968d at bake_ver 24, when
+    # `basin_exclude_spanning` flipped to False (basin table v2 gave spanning
+    # basins a global identity, so they are registered instead of dropped).
+    # That constant lives in the TERRAIN half because B5 re-opens registered
+    # holes in the shipped elevation plane, so this literal moving is the
+    # change being honest rather than a break.
+    #
+    # WHAT ACTUALLY MOVES, precisely, because "a new world" would overstate it:
+    # `roughness_seed` is a pure function of TERRAIN_VERSION and is UNCHANGED
+    # (asserted above), so the carrier, the noise and every stage before B5
+    # produce the identical surface. The only consumer of the flipped constant
+    # is B5's subtraction, so the ground differs ONLY inside the footprints of
+    # tile-spanning basins -- 123 of them / 146 ha over the six wet-alpine
+    # tiles, which ship today as a flat plain at the fill level. Everything
+    # else is byte-identical ground under a new namespace, i.e. a re-bake.
+    assert pipeline.bake_fingerprint().startswith("7b960cbe6419968d")
 
 
 def test_every_bake_constant_rolls_the_fingerprint():
@@ -2955,10 +2971,12 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
         dataclasses.replace(pipeline.CONSTANTS, water_face_contact_bridge=False))
     assert on != off
     # 14 -> 15 on 2026-08-06, when F6 and the two slope terms were flipped on
-    # together. The literal is deliberate: it forces a conscious edit at every
-    # roll instead of letting the version drift silently, which is why this is
-    # pinned rather than read from pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 23
+    # together; 23 -> 24 on 2026-08-09 for basin table v2 + SECTION_HEADWATERS
+    # (water re-architecture Phase 1). The literal is deliberate: it forces a
+    # conscious edit at every roll instead of letting the version drift
+    # silently, which is why this is pinned rather than read from
+    # pipeline.BAKE_VERSION.
+    assert on["bake_version"] == 24
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -4017,6 +4035,94 @@ def test_band_off_is_byte_identical_to_a_bake_that_never_heard_of_it(
     assert np.all(cp[dry] == tc.WATER_DRY_DEPTH), (
         "the legacy dry sentinel moved with the feature OFF"
     )
+
+
+def test_headwaters_reach_the_wire_with_their_discharge(_real_kernels):
+    """bake_ver 24: the head mask stops being computed and thrown away.
+
+    `water_head_mask` has returned this since bake_ver 9 and B6 has `del`'d it
+    unused on every tile since. It is the faucet list Phase 3 spawns from, so
+    "the bake computed it" is worth nothing until it is bytes a client can
+    read -- which is the exact failure the water plane hit in 2026-08-03 (302
+    CPU-s, FLAG_WATER_PRESENT clear, nothing said so).
+    """
+    import numpy as np
+
+    from terrain_service import tile_codec as tc
+
+    world, cl, base = _band_bake_consts()
+    res = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        climate_fetch=lambda x, y: cl.get((x, y)),
+        kernels=_real_kernels, geom=TEST_GEOM, consts=base)
+
+    assert res.water_heads is not None, "the head stage did not run"
+    assert res.stats["heads_ran"] == 1.0
+    assert res.stats["heads_count"] == float(len(res.water_heads))
+    assert len(res.water_heads) > 0, (
+        "a wet toy tile with no head at all means the mask, not the plumbing, "
+        "is what this test is measuring")
+    # Interior pixels, in raster order, and every head is WET -- a faucet on
+    # dry ground is water from nowhere.
+    n = res.elevation_m.shape[0]
+    xs, ys, qs = (res.water_heads[:, 0], res.water_heads[:, 1],
+                  res.water_heads[:, 2])
+    assert xs.min() >= 0 and xs.max() < n and ys.min() >= 0 and ys.max() < n
+    keys = ys * (1 << 17) + xs
+    assert np.all(np.diff(keys) > 0), "heads must be strictly (y, x) ordered"
+    assert np.all(np.isfinite(res.water_surface_m[ys, xs])), "a head on dry ground"
+    assert np.all(qs > 0)
+    # The reported maximum is the one the u32 field has to hold, and the
+    # headroom fraction is how close this world is to needing a wider field.
+    # abs=1: the stat is the float maximum and the array is already ROUNDED to
+    # the wire's integer m^3/yr, so they agree to within half an LSB by
+    # construction. (Rounded, not truncated -- a truncation here would bias
+    # every faucet rate down.)
+    assert res.stats["heads_q_max_m3_yr"] == pytest.approx(float(qs.max()), abs=1.0)
+    assert 0.0 < res.stats["heads_q_u32_frac"] < 1.0
+    # The padded count is >= the interior one by construction (the apron has
+    # heads too, and they are the NEIGHBOUR's to ship).
+    assert res.stats["heads_padded_count"] >= res.stats["heads_count"]
+
+    blk = max(1, n.bit_length() - 2)
+    back = tc.decode_v2(tc.encode_fine(
+        seed=20260719, x=0, y=0, elevation_m=res.elevation_m,
+        heads=res.water_heads, block_log2=blk))
+    assert back.heads is not None and len(back.heads) == len(res.water_heads)
+    assert [h.px for h in back.heads] == [(int(x), int(y)) for x, y in zip(xs, ys)]
+    assert [h.q_m3_yr for h in back.heads] == [int(q) for q in qs]
+
+
+def test_the_head_section_can_be_switched_off_and_is_a_product_constant():
+    """A product that cannot be turned off cannot be A/B'd, and one that rides
+    no identity would change written bytes under an unchanged namespace."""
+    assert "water_head_points_enabled" in BakeConstants.PRODUCT_FIELDS
+    on = pipeline.product_identity_payload(pipeline.CONSTANTS)
+    off = pipeline.product_identity_payload(
+        dataclasses.replace(pipeline.CONSTANTS, water_head_points_enabled=False))
+    assert on != off
+    # And the section id / flag bit are in the identity too: a layout change
+    # with no constant change would otherwise be invisible to the namespace.
+    assert on["sections"]["headwaters_flag"] == 1 << 3
+    assert on["sections"]["basin_table"] == 2
+
+
+def test_headwaters_off_produces_no_heads_but_still_says_the_stage_ran(
+        _real_kernels):
+    """The three-state rule, at the stage level: with the switch off there is
+    no head array at all, and `heads_ran` says 0 rather than leaving a zero
+    count to be read as "this tile has no rivers"."""
+    world, cl, base = _band_bake_consts()
+    res = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        climate_fetch=lambda x, y: cl.get((x, y)),
+        kernels=_real_kernels, geom=TEST_GEOM,
+        consts=dataclasses.replace(base, water_head_points_enabled=False))
+    assert res.water_heads is None
+    assert res.stats["heads_ran"] == 0.0
+    assert res.stats["heads_count"] == 0.0
 
 
 def test_the_discharge_budget_refusals_reach_the_band(_real_kernels):

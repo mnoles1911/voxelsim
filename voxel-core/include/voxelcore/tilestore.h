@@ -172,6 +172,12 @@ enum FineSectionId : uint32_t {
     // coordinate spaces at every voxel of a brick sweep.
     kSectionWaterIndex = 6,
     kSectionWaterData = 7,
+    // Headwater points (water re-architecture Phase 1, bake_ver 24): the cells
+    // where drawn water STARTS and the discharge at each. A flat table like the
+    // basin registry -- a head is a point, not a plane -- and it is the faucet
+    // list the fluid solver spawns from. The bake has computed this mask since
+    // bake_ver 9 and discarded it unused on every tile until now.
+    kSectionHeadwaters = 8,
 };
 
 // SECTION_BASIN_TABLE payload layout, mirroring terrain_service/tile_codec.py.
@@ -182,9 +188,31 @@ enum FineSectionId : uint32_t {
 // decoder that disagrees with the encoder about the row size gets a mismatch
 // it can refuse, instead of reading 33-byte records out of a 32-byte stream
 // and producing plausible garbage.
-inline constexpr uint16_t kBasinTableVersion = 1;
+//
+// VERSION 2 (bake_ver 24) APPENDS 48 bytes and changes nothing in front of
+// them, so bytes 0..31 of a v2 row are a whole v1 row positionally. BOTH ARE
+// ACCEPTED: v1 tiles are on disk in shipped namespaces today, and a reader
+// that refused them would strand every world baked before this one.
+inline constexpr uint16_t kBasinTableVersionV1 = 1;
+inline constexpr uint16_t kBasinTableVersionV2 = 2;
+// The newest layout this build WRITES about / expects from a fresh bake. Kept
+// as the old name because it is quoted in the fixture tools.
+inline constexpr uint16_t kBasinTableVersion = kBasinTableVersionV2;
 inline constexpr size_t kBasinTableHeaderBytes = 8;
 inline constexpr size_t kBasinEntryBytes = 32;
+inline constexpr size_t kBasinEntryBytesV2 = 80;
+// `spanFlags` bit0: this row's extent leaves this tile, i.e. expect a partner
+// row in a neighbour describing the same lake.
+inline constexpr uint8_t kBasinSpanCrossesTile = 0x1;
+
+// `globalId`'s coordinate packing, mirroring bake/basins.py. Each axis is
+// stored as `world_px + kBasinIdAxisBias` in 31 bits, under a constant bit-62
+// tag -- which keeps bit 63 clear and the id non-zero, both required by
+// basinledger.h's BasinId (it tags v1 tile-local keys with bit 63 and reserves
+// 0 for "not a basin"). The bias spans +/-1.07e9 px = +/-2.01 million km at
+// 1.875 m/px; a coordinate past it is refused at bake time rather than folded.
+inline constexpr int64_t kBasinIdAxisBias = int64_t(1) << 30;
+inline constexpr uint64_t kBasinIdTag = uint64_t(1) << 62;
 
 // What kind of place a registered depression is (bake/basins.py's KIND_*).
 // The ORDER is load-bearing: >= kBasinLakeTerminal means "holds standing
@@ -223,8 +251,93 @@ struct BasinEntry {
     int32_t surfaceMm = 0;
     uint8_t kind = kBasinDryPlaya;
 
+    // --- basin table v2 (bake_ver 24) ------------------------------------
+    //
+    // Which layout this row came from. 1 means the v2 fields below are
+    // ABSENT, not zero, and a consumer must branch on it rather than read a
+    // zero identity: every v1 row would otherwise claim to be the same lake
+    // (the one whose floor is world pixel 0,0) and a union by id would merge
+    // the entire world into it.
+    uint16_t tableVersion = kBasinTableVersionV1;
+    bool hasV2() const { return tableVersion >= kBasinTableVersionV2; }
+
+    //: CROSS-TILE IDENTITY: the basin's floor cell in absolute world fine
+    //: pixels, packed as kBasinIdTag | ((x + BIAS) << 31) | (y + BIAS). Two
+    //: tiles that both register one physical basin write the same value with
+    //: no cross-tile communication at bake time. A packing, not a hash -- so
+    //: there is no collision argument to make, and `globalIdWorldX/Y` read it
+    //: back as a place you can go and look at.
+    //:
+    //: BIASED 31-BIT FIELDS UNDER A CONSTANT BIT-62 TAG, not two's-complement
+    //: u32 halves, and the reason is basinledger.h: that header reserves bit
+    //: 63 for "this key is a v1 tile-local id" and 0 for "not a basin". A
+    //: negative world x sets bit 63 under the naive packing, and the wet
+    //: alpine block is entirely at negative tiles -- so every basin in the
+    //: world we actually look at would have been refused by the ledger.
+    //:
+    //: ITS LIMIT, stated where it is defined: the two tiles agree only where
+    //: their padded surfaces agree over the overlap, which the apron makes
+    //: almost always true and does not guarantee. A client must therefore
+    //: treat matching ids as the FAST PATH of its union and fall back to
+    //: "world bboxes overlap and spillMm agree" -- both fields are here for
+    //: exactly that reason.
+    uint64_t globalId = 0;
+    //: Headroom between surfaceMm and spillMm, in LITRES. u64 because a real
+    //: lake overflows u32 immediately: 566 ha (the wet block's largest kept
+    //: coverage) at 0.76 m already reaches 4.295e9 litres.
+    uint64_t capacityLitres = 0;
+    //: The deepest cell's elevation, absolute mm. NOT necessarily the ground
+    //: under seedX/seedY: for a spanning basin the floor can be in the
+    //: neighbour. floorMm <= surfaceMm <= spillMm.
+    int32_t floorMm = 0;
+    //: The component's UNCLIPPED extent in absolute world fine pixels. The
+    //: u16 bbox above is clipped to this tile so a client can index its own
+    //: plane; this is the whole basin, and it is what the union rule compares.
+    int32_t worldX0 = 0, worldY0 = 0, worldX1 = 0, worldY1 = 0;
+    //: The spill saddle in absolute world fine pixels -- the true one, where
+    //: outletX/outletY are clamped into this tile and are a lie for a basin
+    //: that spills outside it. A spillway faucet must use this.
+    int32_t worldOutletX = 0, worldOutletY = 0;
+    //: kBasinSpan* bits.
+    uint8_t spanFlags = 0;
+
+    //: True when this basin's extent leaves this tile -- i.e. a partner row
+    //: exists in a neighbour and the two describe one lake.
+    bool crossesTile() const { return (spanFlags & kBasinSpanCrossesTile) != 0; }
+    int32_t globalIdWorldX() const {
+        return static_cast<int32_t>(static_cast<int64_t>((globalId >> 31) & 0x7FFFFFFFull) -
+                                    kBasinIdAxisBias);
+    }
+    int32_t globalIdWorldY() const {
+        return static_cast<int32_t>(static_cast<int64_t>(globalId & 0x7FFFFFFFull) -
+                                    kBasinIdAxisBias);
+    }
+
     //: True when this basin holds standing water at equilibrium.
     bool holdsWater() const { return kind >= kBasinLakeTerminal; }
+};
+
+// SECTION_HEADWATERS payload layout, mirroring terrain_service/tile_codec.py.
+//
+//   u16 table_version | u16 entry_bytes | u32 count | count * 8 bytes
+//   row: u16 px | u16 py | u32 q_m3_yr
+//
+// Rows are STRICTLY ordered by (y, x), which is both free (the bake walks a
+// raster mask) and load-bearing: a duplicate point is the same faucet emitted
+// twice, i.e. twice the water at one place.
+inline constexpr uint16_t kHeadwaterTableVersion = 1;
+inline constexpr size_t kHeadwaterTableHeaderBytes = 8;
+inline constexpr size_t kHeadwaterEntryBytes = 8;
+
+// One headwater: where a reach starts, and what it carries.
+struct HeadEntry {
+    //: Tile-local pixel, same space as the elevation plane.
+    uint16_t px = 0, py = 0;
+    //: Discharge AT that cell, m^3/yr -- the faucet rate. Divide by 31'557'600
+    //: for m^3/s. u32 holds the world's observed maximum (2.3e8) 18x over; the
+    //: ENCODER refuses anything larger rather than saturating, because a
+    //: saturated rate is a plausible number that silently understates a river.
+    uint32_t qM3PerYear = 0;
 };
 
 enum FineBlockMode : uint8_t {
@@ -256,8 +369,12 @@ inline constexpr uint16_t kFineFlagBasinsPresent = 0x2;
 // plane" are different facts, and a client that conflated them would draw no
 // rivers in a world that has them and never be able to tell why.
 inline constexpr uint16_t kFineFlagWaterPresent = 0x4;
-inline constexpr uint16_t kFineFlagsKnown =
-    kFineFlagFlowPresent | kFineFlagBasinsPresent | kFineFlagWaterPresent;
+// §3 `flags` bit3 (bake_ver 24): SECTION_HEADWATERS is present. Set even when
+// the tile has no heads, for the third time and the same reason: "surveyed, no
+// reach starts here" and "baked before headwaters existed" are different facts.
+inline constexpr uint16_t kFineFlagHeadsPresent = 0x8;
+inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasinsPresent |
+                                            kFineFlagWaterPresent | kFineFlagHeadsPresent;
 
 // The newest `bake_ver` whose ON-TILE FEATURES this build implements -- i.e.
 // the last bake_ver that added a section id or a flag bit that the parser
@@ -277,7 +394,13 @@ inline constexpr uint16_t kFineFlagsKnown =
 //
 // Bump this in the same commit that teaches the parser a new flag bit or
 // section id, never on its own.
-inline constexpr uint16_t kFineMaxKnownBakeVer = 12;
+//
+// 12 -> 24 at basin table v2: this commit teaches the parser BOTH a new
+// section id (kSectionHeadwaters) and a new flag bit (kFineFlagHeadsPresent),
+// which is exactly the rule above. 13-23 were product bumps over an unchanged
+// layout, which is why the counter lagged twelve versions behind the bake and
+// was right to.
+inline constexpr uint16_t kFineMaxKnownBakeVer = 24;
 
 // The dry sentinel in the water plane, in CONTROL-POINT units. INT16_MIN, the
 // one value the elevation codec's own range can never legitimately carry as a
@@ -426,6 +549,7 @@ enum class FineError : uint8_t {
     kBadPayload,       // decode: payload length wrong for the block's mode
     kValueOutOfRange,  // decode: a reconstructed value left the element's range
     kBadBasinTable,    // §P1 table: wrong version/row size, bad count, bad row
+    kBadHeadwaterTable, // SECTION_HEADWATERS: wrong version/row size, bad row/order
     // The bytes for this block were never fetched. NOT an error in the data and
     // NOT a decode failure -- the tile is fine, this client simply does not hold
     // that part of it yet. It exists as its own code because the ONLY other
@@ -741,6 +865,10 @@ public:
     // hasBasins(): an all-dry plane with this true means "no rivers here",
     // this false means "baked before the water plane existed".
     bool hasWater() const { return (h_.flags & kFineFlagWaterPresent) != 0; }
+    // True when the tile carries a headwater table AT ALL. Same distinction
+    // again: an empty table with this true means "no reach starts here", this
+    // false means "baked before headwaters existed" (bake_ver < 24).
+    bool hasHeads() const { return (h_.flags & kFineFlagHeadsPresent) != 0; }
     // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
     // `basins()[i].basinId == i` and a row means the same basin in every
     // process. Empty when hasBasins() is false.
@@ -751,6 +879,13 @@ public:
     // "we do not know what lakes this tile holds". A caller that reads only
     // this container places no water in either case, and one of those is wrong.
     const std::vector<BasinEntry>& basins() const { return basins_; }
+
+    // The headwater points, ordered by (y, x), each with the discharge at that
+    // cell. Empty when hasHeads() is false, and -- exactly as for basins() --
+    // ALSO empty on a partial tile whose table was not fetched, which is why
+    // headsResident() exists beside it. A faucet list that is empty because
+    // nothing was downloaded looks identical to a dry tile otherwise.
+    const std::vector<HeadEntry>& heads() const { return heads_; }
 
     // --- which PREAMBLE sections this client actually holds -----------------
     //
@@ -766,6 +901,7 @@ public:
     bool flowIndexResident() const { return flowIndex_.size() == blockCount(); }
     bool waterIndexResident() const { return waterIndex_.size() == blockCount(); }
     bool basinsResident() const { return basinsResident_; }
+    bool headsResident() const { return headsResident_; }
 
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
@@ -913,10 +1049,12 @@ private:
     FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_, waterIndex_;
     std::vector<BasinEntry> basins_;
+    std::vector<HeadEntry> heads_;
     // Distinguishes a fetched-and-empty basin table from an unfetched one. A
     // bool rather than "basins_.empty()" precisely because an empty table is
     // legitimate and means something different -- see basins().
     bool basinsResident_ = false;
+    bool headsResident_ = false;
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
     uint64_t waterDataOff_ = 0, waterDataLen_ = 0;

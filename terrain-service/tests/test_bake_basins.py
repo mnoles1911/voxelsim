@@ -238,7 +238,11 @@ def test_the_registry_filter_rides_the_bake_identity():
     for field, value in (
         ("basin_min_depth_m", 3.0),
         ("basin_min_area_m2", 10000.0),
-        ("basin_exclude_spanning", False),
+        # True is the NON-default since bake_ver 24 (v2 gave spanning basins a
+        # global identity, so they are registered rather than dropped). It is
+        # still a terrain-half constant: switching it changes which holes B5
+        # re-opens, i.e. the shipped ground.
+        ("basin_exclude_spanning", True),
         ("basin_require_above_sea", False),
         ("basin_salt_aridity", 0.4),
         ("basin_budyko_n", 1.5),
@@ -248,6 +252,114 @@ def test_the_registry_filter_rides_the_bake_identity():
             TEST_GEOM, dataclasses.replace(TEST_CONSTS, **{field: value}))
         assert moved != base, f"{field} does not roll the bake fingerprint"
     assert "B5.reopen_basins" in pipeline.STAGE_ORDER
+
+
+def seam_crater_world(depth_m=40.0, radius=2.0, at_gx=8.0, at_gy=3.5,
+                      tiles=range(-3, 5), geom=TEST_GEOM):
+    """``ramp_world`` with a crater punched at a WORLD coarse coordinate.
+
+    ``crater_world`` above centres its crater inside one tile, which is the
+    case v1 could already handle. This one places it in world space so it can
+    be put ON a tile boundary -- the case v2 exists for, and the only way to
+    exercise two bakes that must agree about one basin without talking.
+    """
+    n = geom.coarse_tile_px
+    world = ramp_world(tiles=tiles, geom=geom)
+    for (tx, ty), z in world.items():
+        gx = np.arange(n)[None, :] + tx * n
+        gy = np.arange(n)[:, None] + ty * n
+        r = np.hypot(gx - at_gx, gy - at_gy)
+        world[(tx, ty)] = (
+            z - np.maximum(0.0, depth_m * (1.0 - (r / radius) ** 2))
+        ).astype(np.float32)
+    return world
+
+
+def test_a_seam_crater_is_registered_by_both_tiles_with_one_global_id():
+    """THE HEADLINE OF BASIN TABLE v2, end to end through two real bakes.
+
+    v1 dropped this basin from BOTH tiles and left the ground flat at the fill
+    level where the lake should be -- 123 basins / 146 ha over the six
+    wet-alpine tiles (docs/measurements/spanning-basin-loss-2026-08-07.txt).
+    v2 registers it on both sides, and the two rows can be matched because both
+    name the basin after its deepest cell in absolute world pixels.
+
+    Two SEPARATE bake_tile calls with different tile coordinates: nothing is
+    shared between them but the coarse world, which is exactly the isolation
+    two production bakes have (they may not even run on the same machine).
+    """
+    pytest.importorskip("scipy")
+    consts = _permissive(TEST_CONSTS)
+    # The crater straddles the boundary between tiles (0,0) and (1,0): its
+    # centre is the first coarse column of tile 1, and its 2-cell radius
+    # (60 m, 32 fine px) sits well inside both tiles' 120 m aprons -- which is
+    # the condition for both to see a CLOSED depression at all.
+    world = seam_crater_world(at_gx=float(TEST_GEOM.coarse_tile_px))
+    baked = {}
+    for tx in (0, 1):
+        baked[tx] = pipeline.bake_tile(
+            world_seed=20260719, tile_x=tx, tile_y=0,
+            coarse_fetch=lambda x, y: world.get((x, y)),
+            kernels=real_fill_kernels(), geom=TEST_GEOM, consts=consts)
+
+    left = max(baked[0].basins, key=lambda b: b.area_cells)
+    right = max(baked[1].basins, key=lambda b: b.area_cells)
+
+    # 1. Both tiles kept it, and both know it is not wholly theirs.
+    assert not left.interior and not right.interior
+    assert baked[0].stats["basins_spanning_kept"] >= 1.0
+    assert baked[1].stats["basins_spanning_kept"] >= 1.0
+
+    # 2. ONE IDENTITY, from two bakes that never met.
+    assert left.global_id == right.global_id
+    assert left.world_floor_px == right.world_floor_px
+    assert basins.world_px_from_global_id(left.global_id) == left.world_floor_px
+
+    # 3. The absolute extents overlap, which is the client's fallback union
+    #    rule (ids can disagree if the two padded surfaces ever differ over
+    #    the overlap -- see basins.global_basin_id).
+    ax0, ay0, ax1, ay1 = left.world_bbox_px
+    bx0, by0, bx1, by1 = right.world_bbox_px
+    assert ax0 <= bx1 and bx0 <= ax1 and ay0 <= by1 and by0 <= ay1
+
+    # 4. The local views differ and each addresses its OWN pixels: this is
+    #    what v1 could not express and why it dropped the basin instead.
+    n = TEST_GEOM.fine_tile_px
+    for rec in (left, right):
+        assert 0 <= rec.seed_px[0] < n and 0 <= rec.seed_px[1] < n
+        assert rec.bbox_px[0] <= rec.seed_px[0] <= rec.bbox_px[2]
+        assert rec.bbox_px[1] <= rec.seed_px[1] <= rec.bbox_px[3]
+        assert 0 <= rec.bbox_px[0] <= rec.bbox_px[2] < n
+    assert left.seed_px != right.seed_px
+
+    # 5. AND THE HOLE IS DUG ON BOTH SIDES. The measurement doc's finding was
+    #    that a dropped basin does not leave a pit -- it leaves the fill, i.e.
+    #    a flat plain where a lake belongs. Both tiles must now be below the
+    #    spill at their own seed, or the seam has a step in it.
+    for tx, rec in ((0, left), (1, right)):
+        sx, sy = rec.seed_px
+        assert baked[tx].elevation_m[sy, sx] < rec.spill_m
+
+
+def test_a_tile_ships_no_basin_that_lies_entirely_in_its_apron():
+    """The apron is 26% more area than the tile at production, all of it
+    somebody else's basins. Registering one would put a lake in a tile that
+    contains none of it -- and B5 would subtract its depth outside the crop."""
+    pytest.importorskip("scipy")
+    consts = _permissive(TEST_CONSTS)
+    # A crater centred one whole tile away, so it lands in tile (0,0)'s apron
+    # only when seen from there.
+    world = seam_crater_world(at_gx=-2.5, at_gy=3.5, radius=1.5)
+    r = pipeline.bake_tile(
+        world_seed=20260719, tile_x=0, tile_y=0,
+        coarse_fetch=lambda x, y: world.get((x, y)),
+        kernels=real_fill_kernels(), geom=TEST_GEOM, consts=consts)
+    n = TEST_GEOM.fine_tile_px
+    for b in r.basins:
+        assert b.interior_cells > 0
+        assert 0 <= b.bbox_px[0] <= b.bbox_px[2] < n
+        assert 0 <= b.bbox_px[1] <= b.bbox_px[3] < n
+    assert "basins_excluded_outside" in r.stats
 
 
 def test_the_bake_hands_the_registry_to_the_encoder():

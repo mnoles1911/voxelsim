@@ -313,6 +313,10 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         # in silence and the tile that comes out is a valid tile of the previous
         # configuration.
         "water_level_m": getattr(result, "water_level_m", None),
+        # bake_ver 24: SECTION_HEADWATERS. Same rule as the water plane above,
+        # and the same failure if it is left out -- the bake computes the heads
+        # and the tile ships without them, silently and at full size.
+        "heads": getattr(result, "water_heads", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #
@@ -367,6 +371,7 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         (("basins",), result.basins),
         (("water_surface_m",), getattr(result, "water_surface_m", None)),
         (("water_level_m",), getattr(result, "water_level_m", None)),
+        (("heads",), getattr(result, "water_heads", None)),
     ):
         if value is None:
             continue          # the bake produced nothing; nothing to lose
@@ -857,9 +862,24 @@ def _run_bake(args, provider, cache: TileCache) -> int:
             f"mono={int(result.stats.get('water_monotone_violations_before', 0))}"
             f">{int(result.stats.get('water_monotone_violations_after', 0))} "
             f"lvl={int(result.stats.get('water_level_consistency_lowerings', 0))} "
-            f"span_drop={int(result.stats.get('basins_excluded_spanning', 0))}"
+            # `span_drop=` UP TO bake_ver 23, renamed here because it stopped
+            # being true: basin table v2 REGISTERS tile-spanning basins, so
+            # this counts what qualified as spanning, not what was dropped, and
+            # `basins_v2=.../Nspan` beside it says how many were written. The
+            # old label is left in this comment so a grep for it lands on the
+            # explanation (docs/measurements/spanning-basin-loss-2026-08-07.txt
+            # quotes the old form).
+            f"span={int(result.stats.get('basins_excluded_spanning', 0))}"
             f"/{result.stats.get('basins_excluded_spanning_area_m2', 0.0) / 1e4:.0f}ha"
             f"@{result.stats.get('basins_excluded_spanning_max_depth_m', 0.0):.0f}m "
+            # bake_ver 24. `heads` carries its ran-flag with it -- "-" means the
+            # head stage did not run at all, which a 0 must not be allowed to
+            # mean.
+            f"basins_v{int(result.stats.get('basins_table_version', 0))}"
+            f"={int(result.stats.get('basins_registered', 0))}"
+            f"/{int(result.stats.get('basins_spanning_kept', 0))}span "
+            f"heads={int(result.stats.get('heads_count', 0)) if result.stats.get('heads_ran', 0.0) else '-'}"
+            f"@{result.stats.get('heads_q_u32_frac', 0.0) * 100:.1f}%u32 "
             f"hydro={result.superblock_fingerprint[:12] or 'none'}",
             file=sys.stderr,
         )

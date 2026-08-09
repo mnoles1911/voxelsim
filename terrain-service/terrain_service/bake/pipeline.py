@@ -427,8 +427,34 @@ __all__ = [
 #: level -- so the surface stays horizontal where the water stands and becomes
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
+#:
+#: bake_ver 24 -- WATER RE-ARCHITECTURE PHASE 1: basin table v2 + headwaters
+#: (docs/water-rearchitecture-plan-2026-08-09.md). Three wire changes and one
+#: behaviour change, and the last of them is the one to read twice:
+#:
+#:   * SECTION_BASIN_TABLE grows a v2 row (80 B against 32 B, the first 32
+#:     positionally identical): `global_id` -- the basin's floor cell in
+#:     absolute world pixels, so two tiles sharing a lake agree on what it is
+#:     without talking to each other -- plus `floor_mm`, `capacity_l` (the
+#:     headroom integral over the hypsometry the bake already computed and
+#:     discarded), the component's absolute extent and its absolute outlet.
+#:   * SECTION_HEADWATERS is new: the head points and their Q, computed since
+#:     bake_ver 9 and deleted unused at the end of B6 ever since.
+#:   * `basin_exclude_spanning` flips to False.
+#:
+#: THIS IS NOT A WATER-ONLY BUMP, unlike 9-23, and the plan's Phase 1 line
+#: saying `verify_water_only_change` must PASS is wrong on this point. B5
+#: re-opens registered holes in the SHIPPED ELEVATION PLANE, so admitting
+#: tile-spanning basins digs holes that previously shipped as flat ground: 123
+#: basins / 146 ha over the six wet-alpine tiles, up to 41 m deep
+#: (docs/measurements/spanning-basin-loss-2026-08-07.txt). `basin_exclude_
+#: spanning` is in `as_payload` for exactly that reason and always has been, so
+#: the flip re-keys the TERRAIN namespace as well as the product one. That is
+#: the intended trade -- those tiles ship a plain where a lake belongs today --
+#: but it invalidates sites, screenshots and measurements, so it is the
+#: integrator's call to make deliberately, not a side effect to discover.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 23
+BAKE_VERSION = 24
 
 
 @dataclass(frozen=True)
@@ -828,13 +854,32 @@ class BakeConstants:
     basin_min_depth_m: float = 2.0
     #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
     basin_min_area_m2: float = 2500.0
-    #: v1 registers INTERIOR basins only. A basin crossing the tile edge is
-    #: seen by each neighbour from a different padded domain and the two need
-    #: not agree. The excluded ones are COUNTED (survey: 57% of qualifying
-    #: components, 4,609 ha over 12 tiles) so the cost is a number.
-    basin_exclude_spanning: bool = True
+    #: FLIPPED TO FALSE AT bake_ver 24 (basin table v2). v1 registered INTERIOR
+    #: basins only, because a basin crossing the tile edge is seen by each
+    #: neighbour from a different padded domain "and the two need not agree",
+    #: with nothing on the wire to reconcile them. v2 puts a global identity on
+    #: every row (`basins.global_basin_id`) plus the component's absolute
+    #: extent, so the two sides can be matched instead of dropped.
+    #:
+    #: THIS IS A TERRAIN-HALF CONSTANT AND IT STAYS ONE. B5 re-opens registered
+    #: holes in the SHIPPED elevation plane, so admitting spanning basins digs
+    #: holes that used to ship as flat ground -- measured on the wet alpine
+    #: block, 123 basins / 146 ha per six tiles that shipped as a plain at the
+    #: fill level (docs/measurements/spanning-basin-loss-2026-08-07.txt). It is
+    #: therefore NOT a water-only change: `verify_water_only_change.py` will
+    #: report elevation differences inside exactly those footprints, and that
+    #: is the change working, not the guard failing.
+    basin_exclude_spanning: bool = False
     #: A depression spilling at or below sea level is sea floor, not a lake.
     basin_require_above_sea: bool = True
+    #: Rungs of the hypsometric curve A(h) per basin, floor to spill. It has
+    #: always been 32 (bake/basins.py's default) and has always decided
+    #: `surface_mm` through the equilibrium solve; it is written down here now
+    #: because bake_ver 24 also integrates that curve into the shipped
+    #: `capacity_l`, and a constant that decides shipped bytes while riding no
+    #: identity is the drift `test_constants_partition_is_exhaustive` exists to
+    #: catch. PRODUCT, not terrain: no height reads it.
+    basin_hyps_levels: int = 32
     #: Water-balance constants, mirroring bake/basins.WaterBalance. Restated
     #: here rather than referenced so that changing the balance rolls the bake
     #: identity -- the `kind` and `surface_mm` it produces are shipped bytes.
@@ -1359,6 +1404,21 @@ class BakeConstants:
     #: rather than the answer. See ``water.LATERAL_SPREAD_ROUNDS``.
     water_lateral_spread_rounds: int = 16
 
+    #: Ship the headwater points (bake_ver 24, water re-architecture Phase 1).
+    #:
+    #: The mask has existed since bake_ver 9 -- ``water.water_head_mask``
+    #: returns it, B6 has computed it on every tile since, and B6 has ``del``'d
+    #: it unused at the end of every one of those bakes. It is the faucet list
+    #: the PBF solver spawns from (plan §4: "headwater faucets ... rate = baked
+    #: Q"), and nothing else in the bake can produce it: a head is defined
+    #: against the padded discharge field and the D8 forest, both of which exist
+    #: only inside B6.
+    #:
+    #: A gate rather than an unconditional emit, for the reason every other
+    #: water constant here has one: a product that cannot be turned off cannot
+    #: be A/B'd, and the section costs bytes on every tile.
+    water_head_points_enabled: bool = True
+
     #: Put the water LEVEL on the wire for DRY cells near water, so the client
     #: can resolve the waterline at its own 10 cm pitch instead of at the bake's
     #: 1.875 m one. See ``water.local_water_levels`` for the stage and
@@ -1620,6 +1680,12 @@ class BakeConstants:
         "water_lateral_equal_level",
         "water_lateral_conserve_volume",
         "water_lateral_spread_rounds",
+        # PRODUCT: the headwater section is a new product and nothing reads it
+        # before an elevation byte is written. bake_ver 24.
+        "water_head_points_enabled",
+        # PRODUCT: it decides `surface_mm` and the v2 `capacity_l` -- two wire
+        # fields -- through the hypsometric curve, and no height reads A(h).
+        "basin_hyps_levels",
         # PRODUCT: they add values to the water plane at cells that are DRY, and
         # a dry cell's stored value cannot move a height by construction -- the
         # encoder refuses any dry cell that encodes >= 0. The ground is
@@ -1740,6 +1806,15 @@ def product_identity_payload(consts: BakeConstants = CONSTANTS) -> dict:
             "water_no_level": _codec_const("WATER_NO_LEVEL"),
             "water_level_min_cp": _codec_const("WATER_LEVEL_MIN_CP"),
             "water_level_max_cp": _codec_const("WATER_LEVEL_MAX_CP"),
+            # bake_ver 24. The basin ROW LAYOUT is in here for the same reason
+            # the sentinels are: v1 and v2 rows are both valid tables under one
+            # flag bit, so the only thing that keeps a v1-row namespace and a
+            # v2-row namespace apart is this number.
+            "basin_table": _codec_const("BASIN_TABLE_VERSION"),
+            "basin_entry_bytes": _codec_const("BASIN_ENTRY_BYTES_V2"),
+            "headwaters": _codec_const("SECTION_HEADWATERS"),
+            "headwaters_flag": _codec_const("FLAG_HEADS_PRESENT"),
+            "headwater_entry_bytes": _codec_const("HEADWATER_ENTRY_BYTES"),
         },
     }
 
@@ -4078,6 +4153,13 @@ class BakeResult:
     #: the SAME plane as the depths (see ``tile_codec.WATER_NO_LEVEL``) rather
     #: than in a section of its own.
     water_level_m: "np.ndarray | None" = None
+    #: Headwater points, ``(n, 3)`` int64 of ``(x, y, q_m3_yr)`` in
+    #: tile-interior pixels, ordered by (y, x) -- SECTION_HEADWATERS (bake_ver
+    #: 24). None means the stage did not run (no climate, or
+    #: ``water_head_points_enabled`` off), which an EMPTY array does not: "no
+    #: reach starts in this tile" is a surveyed fact and ships as a zero-row
+    #: table. Same three-state rule as ``basins`` and the water plane.
+    water_heads: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -4815,8 +4897,19 @@ def bake_tile(
         interior=sl,
         filt=basin_filter(consts),
         wb=basin_balance(consts),
+        hyps_levels=consts.basin_hyps_levels,
         keep_labels=True,
+        # STILL FALSE AT bake_ver 24, and that is not the plan's "flip
+        # keep_hypsometry" item being skipped -- it is that item read against
+        # the code. The curve is computed for EVERY basin unconditionally
+        # (basins.py, inside the keep loop); this flag only decides whether its
+        # 66 floats are also copied onto the record. `capacity_l` integrates
+        # the curve where it is computed, so the copy buys nothing but memory.
         keep_hypsometry=False,
+        # WHERE THIS TILE IS, in absolute world fine pixels -- the only input
+        # the cross-tile identity needs, and the reason a basin can be named
+        # the same thing by two bakes that never meet.
+        world_origin_px=(tile_x * geom.fine_tile_px, tile_y * geom.fine_tile_px),
     )
     # THE PRE-B5 SURFACE, kept for B6. It is the one the B4b refill guarantees
     # has ZERO SINKS, which is what makes the water plane's descent chain well
@@ -4885,6 +4978,7 @@ def bake_tile(
     discharge = None
     water_surface = None
     water_level = None
+    water_heads = None
     water_stats: dict[str, float] = {}
     runoff_coarse = _water.runoff_field_mm_yr(
         padded_climate, basin_balance(consts), consts.province_smooth_m,
@@ -5297,6 +5391,52 @@ def bake_tile(
             )
             del rec_int
             water_stats.update({f"water_drawn_{k}": v for k, v in drawn.items()})
+
+        # -- THE HEADS GO ON THE WIRE (bake_ver 24). `heads_pad` has been
+        # computed on every tile since bake_ver 9 and deleted, one line below,
+        # on every one of them. This is the whole of "ship them".
+        #
+        # CROPPED TO THE INTERIOR, and the crop is safe rather than lossy: a
+        # head is a wet cell with no wet D8 DONOR, and a donor is an adjacent
+        # cell, so an interior cell's donors are all inside the padded domain
+        # by construction. The heads dropped here are the apron's own, which
+        # are the neighbouring tile's to ship (and which it will, from its own
+        # interior). What is NOT dropped is the one that matters most: a reach
+        # entering the domain has no donor at all and is a head carrying the
+        # full trunk Q -- see SECTION_HEADWATERS on why the field is a u32.
+        #
+        # Raster order is (y, x) ascending straight out of `argwhere`, which
+        # is exactly the order the section requires, so the encoder's ordering
+        # check is a free assertion rather than a sort.
+        if consts.water_head_points_enabled:
+            hy, hx = np.nonzero(heads_pad[sl, sl])
+            hq = np.asarray(q_pad[sl, sl], np.float64)[hy, hx]
+            water_heads = np.stack(
+                (hx.astype(np.int64), hy.astype(np.int64),
+                 np.rint(hq).astype(np.int64)), axis=1)
+            water_stats.update({
+                # A RAN-FLAG, not just a count. Three absent-stat zeros
+                # produced false conclusions this session; "no heads in this
+                # tile" and "the head stage did not run" are different facts
+                # and zero cannot carry both.
+                #
+                # NOT prefixed `water_`, deliberately: that prefix is itself a
+                # ran-flag (test_water_disabled_reproduces_a_bake_ver_8_tile_
+                # exactly asserts NO `water_*` key exists when the plane is
+                # off), and these five must be present-and-zero in that case
+                # rather than absent. Two conventions, both honest, and the
+                # names keep them from colliding.
+                "heads_ran": 1.0,
+                "heads_count": float(water_heads.shape[0]),
+                "heads_q_max_m3_yr": float(hq.max()) if hq.size else 0.0,
+                # Headroom against the wire's u32 ceiling, as a ratio. It is
+                # the number that says how close this world is to needing a
+                # wider field, and it costs one division.
+                "heads_q_u32_frac": (
+                    float(hq.max()) / float(_codec_const("HEADWATER_Q_MAX"))
+                    if hq.size else 0.0),
+                "heads_padded_count": float(heads_pad.sum()),
+            })
         del wet_pad, heads_pad, w_pad, q_pad, z_route
     del z_pre_reopen, basin_keep_pad
     out["cpu_seconds"]["B6.discharge_water"] = time.process_time() - c0
@@ -5395,6 +5535,26 @@ def bake_tile(
             survey.excluded_spanning_max_depth_m),
         "basins_excluded_submarine": float(survey.excluded_submarine),
         "basins_near_padded_edge": float(survey.kept_near_padded_border),
+        # -- basin table v2 (bake_ver 24). `basins_excluded_spanning` above is
+        # now a count of what QUALIFIED as spanning, not of what was dropped;
+        # these say what was actually kept, so the two together answer "did
+        # the exclusion flip take effect on this tile" without inference.
+        # Written in BOTH branches (they come off the survey, which always
+        # runs) -- an absent stat reading as zero produced three false
+        # conclusions this session and is a standing rule.
+        "basins_spanning_kept": float(survey.kept_spanning),
+        "basins_spanning_kept_area_m2": float(survey.kept_spanning_area_m2),
+        "basins_excluded_outside": float(survey.excluded_outside),
+        "basins_capacity_m3": float(sum(b.capacity_m3 for b in survey.basins)),
+        # Ran-flags, not counts: "this bake writes v2 rows" and "this bake
+        # writes heads" must be readable off a tile's stats even when the
+        # counts are legitimately zero.
+        "basins_table_version": float(_codec_const("BASIN_TABLE_VERSION")),
+        "heads_ran": 0.0,
+        "heads_count": 0.0,
+        "heads_q_max_m3_yr": 0.0,
+        "heads_q_u32_frac": 0.0,
+        "heads_padded_count": 0.0,
         "basin_water_volume_m3": float(sum(
             b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
@@ -5426,6 +5586,7 @@ def bake_tile(
         discharge_m3_yr=discharge,
         water_surface_m=water_surface,
         water_level_m=water_level,
+        water_heads=water_heads,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

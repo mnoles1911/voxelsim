@@ -98,6 +98,12 @@ def main() -> int:
         basins=BASINS,
         bake_ver=8,
         block_log2=BLOCK_LOG2,
+        # PINNED TO v1, and this file stays a v1 fixture forever. v2 arrived at
+        # bake_ver 24 and has its own generator (make_basin_v2_fixture.py); the
+        # compatibility claim -- that tiles already on disk in shipped
+        # namespaces keep decoding -- is worth nothing if the artefact that
+        # tests it silently follows the encoder's current default.
+        basin_table_version=tc.BASIN_TABLE_VERSION_V1,
     )
     # Prove it before writing it: a fixture that does not round-trip through
     # its own encoder cannot be evidence about anyone else's decoder.

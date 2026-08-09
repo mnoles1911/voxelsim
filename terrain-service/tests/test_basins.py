@@ -306,6 +306,138 @@ def test_tile_spanning_basins_are_excluded_and_their_size_recorded(_numba):
     assert excl.basins[0].interior is True
 
 
+def test_a_spanning_basin_gets_the_same_global_id_from_both_sides(_numba):
+    """THE CROSS-TILE IDENTITY CLAIM, on one surface seen twice.
+
+    Two neighbouring tiles never talk to each other at bake time. What makes a
+    lake that straddles their seam ONE lake is that both of them name it after
+    the same physical thing: its deepest cell, in absolute world pixels. This
+    is that property, exercised the way the bake produces it -- the same
+    surface cropped into two overlapping padded domains with different world
+    origins, which is exactly what two adjacent bakes see.
+
+    The two windows here are 40 px apart with the bowl in the shared strip, and
+    the bowl's own rim is inside BOTH windows -- which is not a convenience,
+    it is the condition under which a basin is registered at all: a hollow that
+    reaches the padded border drains out of the domain and is not a depression
+    (see BasinFilter.border_margin_px). A basin too big for a tile's pad is
+    absent from that tile rather than disagreeing with the neighbour.
+    """
+    # One 200 px world with a bowl straddling world x = 100. Two 80 px tiles
+    # meet there -- A owns world x 20..99, B owns 100..179 -- and each pads 20
+    # px past its own edge, so each sees the WHOLE bowl and each sees it leave
+    # its own interior.
+    z, d = _bowl(n=200, cx=100.0, cy=60.0, radius=14.0, depth_m=20.0)
+    acc = np.full(z.shape, 1.0e6, np.float32)
+    filt = bs.BasinFilter(min_depth_m=1.0, min_area_m2=0.0,
+                          exclude_spanning=False, require_above_sea=False)
+
+    def survey(x0, world0):
+        """One tile: the padded window x in [x0, x0+120), y in [0, 120)."""
+        return bs.survey_basins(
+            z_final=z[0:120, x0:x0 + 120], basin_depth=d[0:120, x0:x0 + 120],
+            accumulation_m2=acc[0:120, x0:x0 + 120],
+            # Deliberately DRY enough that the lake settles below its spill
+            # (measured on this bowl: 250 mm/yr still overflows, 120 does not):
+            # an overflowing lake has capacity 0 on both sides and the capacity
+            # agreement below would then be vacuously true.
+            climate=_climate((120, 120), temp_c=20.0, precip_mm=120.0),
+            cell_m=CELL_M, interior=slice(20, 100), filt=filt,
+            world_origin_px=world0)
+
+    a = survey(0, (20, 20))      # interior world x 20..99
+    b = survey(80, (100, 20))    # interior world x 100..179
+    assert len(a.basins) == 1 and len(b.basins) == 1
+    ra, rb = a.basins[0], b.basins[0]
+
+    # 1. THE IDENTITY AGREES, with no communication between the two calls.
+    assert ra.global_id == rb.global_id
+    assert ra.world_floor_px == rb.world_floor_px == (100, 60)
+    assert bs.world_px_from_global_id(ra.global_id) == (100, 60)
+
+    # 2. Both know they are half a lake, and both say so.
+    assert not ra.interior and not rb.interior
+    assert a.kept_spanning == b.kept_spanning == 1
+    assert a.excluded_spanning == b.excluded_spanning == 1  # counted, not dropped
+
+    # 3. The physics agrees too -- the numbers that DECIDE the lake come from
+    #    the component, not from the crop, or the two rows could never be
+    #    reconciled even with a matching id.
+    assert ra.spill_m == pytest.approx(rb.spill_m)
+    assert ra.floor_m == pytest.approx(rb.floor_m)
+    assert ra.surface_m == pytest.approx(rb.surface_m)
+    assert ra.capacity_m3 == pytest.approx(rb.capacity_m3)
+    assert ra.capacity_m3 > 0.0, "a terminal lake must have headroom to spill"
+    assert ra.area_cells == rb.area_cells
+
+    # 4. THE FALLBACK PATH: the absolute extents OVERLAP (each tile sees into
+    #    the other through its apron), so a client can union these two rows
+    #    even if the ids ever disagreed. Clipped bboxes could not do this --
+    #    they only abut at the seam.
+    ax0, ay0, ax1, ay1 = ra.world_bbox_px
+    bx0, by0, bx1, by1 = rb.world_bbox_px
+    assert (ax0, ay0, ax1, ay1) == (bx0, by0, bx1, by1)
+    assert ax0 <= bx1 and bx0 <= ax1 and ay0 <= by1 and by0 <= ay1
+
+    # 5. The LOCAL views differ, which is the whole reason 1-4 are needed: each
+    #    tile's seed and clipped bbox address its own pixels only.
+    assert ra.seed_px != rb.seed_px
+    assert 0 <= ra.seed_px[0] < 80 and 0 <= ra.seed_px[1] < 80
+    assert 0 <= rb.seed_px[0] < 80 and 0 <= rb.seed_px[1] < 80
+    assert ra.interior_cells > 0 and rb.interior_cells > 0
+    assert ra.interior_cells + rb.interior_cells <= ra.area_cells
+
+
+def test_a_basin_wholly_in_the_apron_is_the_neighbours_and_is_refused(_numba):
+    """It has no pixel in this tile: no seed a client could index, and B5 would
+    subtract its depth entirely outside the shipped crop.
+
+    Not a corner case at production scale -- the apron adds 62 km^2 around a
+    236 km^2 tile, so a quarter again of every tile's padded domain is other
+    tiles' basins. Refused unconditionally and counted, because "we found 40
+    basins and shipped 31" has to be a number.
+    """
+    z, d = _bowl(n=200, cx=30.0, cy=30.0, radius=12.0, depth_m=20.0)
+    acc = np.full(z.shape, 1.0e6, np.float32)
+    s = bs.survey_basins(
+        z_final=z, basin_depth=d, accumulation_m2=acc,
+        climate=_climate(z.shape, temp_c=20.0, precip_mm=1500.0),
+        cell_m=CELL_M, interior=slice(80, 160),
+        filt=bs.BasinFilter(min_depth_m=1.0, min_area_m2=0.0,
+                            exclude_spanning=False, require_above_sea=False))
+    assert s.basins == []
+    assert s.excluded_outside == 1
+    assert s.kept_spanning == 0
+
+
+def test_capacity_is_the_headroom_to_the_spill_and_zero_when_overflowing(_numba):
+    """`capacity_m3` is what Phase 2's spillway rule compares a ledger against.
+
+    Two properties matter and neither is obvious from the name: it is measured
+    from the EQUILIBRIUM SURFACE (not the floor), and it is exactly 0 for a
+    lake already standing at its spill -- correct, since every extra litre
+    leaves by the outlet.
+    """
+    z, d = _bowl(depth_m=20.0)
+    z_open = bs.reopened_surface(z, d)
+    labels, filled, _ = bs.depression_components(z_open)
+    mask = labels == 1
+    spill = float(filled[mask].max())
+    floor = float(z_open[mask].min())
+    levels, areas = bs.hypsometry(z_open[mask], spill, CELL_M ** 2)
+
+    full = bs.capacity_m3(levels, areas, floor, spill)
+    half = bs.capacity_m3(levels, areas, (floor + spill) / 2.0, spill)
+    assert bs.capacity_m3(levels, areas, spill, spill) == 0.0
+    assert 0.0 < half < full
+    # A bowl is wider at the top, so the upper half holds MORE than half the
+    # volume -- a monotone A(h) is the property the trapezoid integrates.
+    assert half > full / 2.0
+    # Bounded by the two rectangles the true volume must sit between.
+    assert full <= areas[-1] * (spill - floor)
+    assert full >= areas[0] * (spill - floor)
+
+
 def test_padded_border_flag_is_a_near_miss_test_because_the_exact_one_is_dead(_numba):
     """``fill_depressions`` never raises a border cell, so no depression can
     contain one and a touches-the-border test can NEVER fire.

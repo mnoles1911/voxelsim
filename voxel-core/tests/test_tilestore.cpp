@@ -65,6 +65,17 @@ std::filesystem::path fineBasinFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
 }
 
+// The golden tile carrying a BASIN TABLE v2 and a SECTION_HEADWATERS (water
+// re-architecture Phase 1, bake_ver 24). A SECOND file rather than an edit to
+// the one above, deliberately: v1 tiles are on disk in shipped namespaces, and
+// the claim "this build still reads them" is worth nothing if the artefact
+// that tests it follows the encoder's current default. Regenerate with
+// `python terrain-service/tools/make_basin_v2_fixture.py`, whose docstring
+// lists what each row and each head is there to break.
+std::filesystem::path fineBasinV2FixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_v2_512.vxtl";
+}
+
 // The golden tiles carrying a SECTION_WATER_* plane (watershed plan P2,
 // bake_ver 9), one per codec. Regenerate with
 // `python terrain-service/tools/make_water_fixture.py`, whose docstring lists
@@ -3093,6 +3104,364 @@ VXC_TEST(vxtl_v2_basin_table_is_refused_when_it_is_wrong) {
         std::memcpy(bad.data() + 31, &flags, 2);
         refused(bad, FineError::kUnknownFeature);
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// BASIN TABLE v2 + SECTION_HEADWATERS (water re-architecture Phase 1,
+// bake_ver 24). Cross-language, same provenance and the same rule: the file
+// below was written by terrain_service/tile_codec.py with no code shared with
+// this decoder.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Finds one section's (offset, length) by walking the file's own section
+// table, rather than hardcoding it: the fixture's layout may change and a test
+// that corrupted the wrong bytes would pass for the wrong reason.
+bool findSection(const std::vector<uint8_t>& bytes, uint32_t wantId, uint64_t& off,
+                 uint64_t& len) {
+    uint16_t nSections = 0;
+    std::memcpy(&nSections, bytes.data() + kFineHeaderBytes - 2, 2);
+    for (uint16_t i = 0; i < nSections; ++i) {
+        const size_t e = kFineHeaderBytes + static_cast<size_t>(i) * kFineSectionEntryBytes;
+        uint32_t id = 0;
+        uint64_t o = 0, l = 0;
+        std::memcpy(&id, bytes.data() + e, 4);
+        std::memcpy(&o, bytes.data() + e + 4, 8);
+        std::memcpy(&l, bytes.data() + e + 12, 8);
+        if (id == wantId) {
+            off = o;
+            len = l;
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+VXC_TEST(vxtl_v2_basin_table_v2_matches_the_python_encoder) {
+    const std::filesystem::path path = fineBasinV2FixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNone));
+    CHECK(tile->hasBasins());
+    CHECK(tile->hasHeads());
+    CHECK(tile->basinsResident());
+    CHECK(tile->headsResident());
+    CHECK_EQ(int(tile->basins().size()), 5);
+    CHECK_EQ(int(tile->header().bakeVer), 24);
+
+    // Where this tile's pixel (0,0) is in the world -- the transform every
+    // absolute field below is checked against, and the one a client needs to
+    // union rows across a seam.
+    const int64_t wox = static_cast<int64_t>(tile->tileX()) * tile->size();
+    const int64_t woy = static_cast<int64_t>(tile->tileY()) * tile->size();
+
+    int spanning = 0, floorOutsideTile = 0;
+    uint64_t maxCapacity = 0;
+    bool sawZeroCapacity = false;
+    for (const BasinEntry& b : tile->basins()) {
+        CHECK(b.hasV2());
+        CHECK_EQ(int(b.tableVersion), int(kBasinTableVersionV2));
+        // The clipped view is the world view seen through this tile.
+        CHECK(wox + b.bboxX0 >= b.worldX0);
+        CHECK(wox + b.bboxX1 <= b.worldX1);
+        CHECK(woy + b.bboxY0 >= b.worldY0);
+        CHECK(woy + b.bboxY1 <= b.worldY1);
+        // The identity anchor is a cell of this component, and it reads back
+        // as a place: a packing, not a hash.
+        CHECK(b.globalIdWorldX() >= b.worldX0 && b.globalIdWorldX() <= b.worldX1);
+        CHECK(b.globalIdWorldY() >= b.worldY0 && b.globalIdWorldY() <= b.worldY1);
+        // NEGATIVE world coordinates: this tile is (-2,-4), like the wet
+        // alpine block, and the anchor packs through two's complement. A
+        // decoder that read the halves as unsigned lands 4 billion px away.
+        CHECK(b.globalIdWorldX() < 0);
+        CHECK(b.globalIdWorldY() < 0);
+        // basinledger.h's BasinId contract, on the bytes the runtime is
+        // actually handed: bit 63 is its "tile-local v1 key" tag and 0 is its
+        // "not a basin". An id breaking either would be dropped by the ledger
+        // with no error anywhere -- no lake, no message. This is why the
+        // packing biases 31-bit fields instead of using u32 halves.
+        CHECK(b.globalId != 0);
+        CHECK_EQ(int((b.globalId >> 63) & 1u), 0);
+        CHECK(b.floorMm <= b.surfaceMm);
+        CHECK(b.surfaceMm <= b.spillMm);
+        if (b.crossesTile()) ++spanning;
+        if (b.globalIdWorldX() < wox || b.globalIdWorldX() >= wox + tile->size()) {
+            ++floorOutsideTile;
+        }
+        maxCapacity = std::max(maxCapacity, b.capacityLitres);
+        if (b.capacityLitres == 0) sawZeroCapacity = true;
+    }
+
+    // THE ROW v2 EXISTS FOR: a tile-spanning basin whose DEEPEST CELL is in
+    // the neighbour. A decoder that assumed the anchor is a local pixel, or
+    // that seedPx is the floor, puts the lake in the wrong place. v1 could not
+    // express this row at all, which is why it dropped such basins -- 123 of
+    // them / 146 ha over the six wet-alpine tiles.
+    CHECK_EQ(spanning, 2); // both directions, left edge and right edge
+    CHECK(floorOutsideTile >= 1);
+
+    // Capacity is u64 LITRES. A decoder reading 32 bits truncates the big pan.
+    CHECK(maxCapacity > 0xFFFFFFFFull);
+    CHECK_EQ(int(maxCapacity == 8000000000000ull), 1);
+    // And exactly 0 for the overflowing lake: it is already at its spill, so
+    // its headroom is nil. Not "missing".
+    CHECK(sawZeroCapacity);
+    CHECK_EQ(int(tile->basins()[0].kind), int(kBasinLakeOverflowing));
+    CHECK_EQ(int(tile->basins()[0].capacityLitres), 0);
+
+    // The heads: ordered by (y, x), one at u32 max (a decoder reading Q as
+    // int32 gets a negative faucet rate) and one at exactly 0 (allowed, and
+    // not the same thing as an absent row).
+    CHECK_EQ(int(tile->heads().size()), 4);
+    int64_t prev = -1;
+    for (const HeadEntry& h : tile->heads()) {
+        CHECK(h.px < tile->size() && h.py < tile->size());
+        const int64_t key = (static_cast<int64_t>(h.py) << 17) | h.px;
+        CHECK(key > prev);
+        prev = key;
+    }
+    CHECK_EQ(int(tile->heads()[0].qM3PerYear), 0);
+    CHECK_EQ(int(tile->heads()[3].qM3PerYear == 4294967295u), 1);
+    // x DESCENDS between rows 0 and 1 while y ascends: a decoder that sorted
+    // by (x, y) would have refused this file.
+    CHECK(tile->heads()[1].px < tile->heads()[0].px);
+    CHECK(tile->heads()[1].py > tile->heads()[0].py);
+}
+
+VXC_TEST(vxtl_v1_basin_rows_still_decode_and_report_no_identity) {
+    // THE COMPATIBILITY CLAIM. Tiles written before bake_ver 24 are in shipped
+    // namespaces; refusing them would strand every world baked so far. And a
+    // v1 row's MISSING identity must read as missing -- if hasV2() lied, every
+    // v1 basin would claim to be the lake whose floor is world pixel (0,0) and
+    // a union by id would merge the entire world into one.
+    const std::filesystem::path path = fineBasinFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(tile.has_value());
+    CHECK_EQ(int(tile->basins().size()), 5);
+    CHECK(!tile->hasHeads());
+    CHECK(tile->heads().empty());
+    for (const BasinEntry& b : tile->basins()) {
+        CHECK(!b.hasV2());
+        CHECK_EQ(int(b.tableVersion), int(kBasinTableVersionV1));
+        CHECK_EQ(int(b.globalId == 0), 1);
+        CHECK_EQ(int(b.capacityLitres == 0), 1);
+        CHECK(!b.crossesTile());
+    }
+}
+
+VXC_TEST(vxtl_v2_basin_table_v2_is_refused_when_it_is_wrong) {
+    const std::filesystem::path path = fineBasinV2FixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> good = readFileBytes(path);
+    CHECK(good.has_value());
+    uint64_t basinOff = 0, basinLen = 0;
+    CHECK(findSection(*good, kSectionBasinTable, basinOff, basinLen));
+    CHECK(basinLen == kBasinTableHeaderBytes + 5 * kBasinEntryBytesV2);
+
+    auto refused = [&](const std::vector<uint8_t>& bad, FineError want) {
+        FineError err = FineError::kNone;
+        std::optional<FineTile> t = FineTile::parse(bad, {}, &err);
+        CHECK(!t.has_value());
+        CHECK_EQ(int(err), int(want));
+    };
+    // Byte offsets inside row 0: the v1 head is 32 bytes, then the v2 tail.
+    const size_t row0 = static_cast<size_t>(basinOff) + kBasinTableHeaderBytes;
+    const size_t tail0 = row0 + kBasinEntryBytes;
+
+    // THE VERSION AND THE ROW SIZE ARE CHECKED AS A PAIR. A v1 label over
+    // 80-byte rows is not "an old table relabelled" -- it is bytes neither
+    // revision wrote, and reading it either way is a guess.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff)] = 1; // version 1, rows still 80 B
+        refused(bad, FineError::kBadBasinTable);
+    }
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff) + 2] = 32; // entry_bytes 32 at v2
+        refused(bad, FineError::kBadBasinTable);
+    }
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(basinOff)] = 3; // a version nobody wrote
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // The identity anchor outside the basin's own extent: the id and the
+    // extent would then describe two different basins, and the client's union
+    // rule reads BOTH, so it would merge the wrong pair.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint64_t gid = 0;
+        std::memcpy(&gid, bad.data() + tail0, 8);
+        gid += (uint64_t(1) << 31) * 4000; // move the anchor 4000 px east
+        std::memcpy(bad.data() + tail0, &gid, 8);
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // An id with the runtime's tile-local tag bit set, or a zero id: both are
+    // values basinledger.h's BasinId refuses, so a tile carrying one would
+    // lose that lake at the ledger with no error raised anywhere.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint64_t gid = 0;
+        std::memcpy(&gid, bad.data() + tail0, 8);
+        gid |= uint64_t(1) << 63;
+        std::memcpy(bad.data() + tail0, &gid, 8);
+        refused(bad, FineError::kBadBasinTable);
+    }
+    {
+        std::vector<uint8_t> bad = *good;
+        const uint64_t zero = 0;
+        std::memcpy(bad.data() + tail0, &zero, 8);
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // A world bbox that no longer contains this tile's own clipped bbox --
+    // the check that catches a row built with the wrong tile origin, which
+    // would put a lake a whole tile away from where the client floods it.
+    {
+        std::vector<uint8_t> bad = *good;
+        int32_t wx0 = 0;
+        std::memcpy(&wx0, bad.data() + tail0 + 20, 4);
+        const int32_t moved = wx0 + 4000;
+        std::memcpy(bad.data() + tail0 + 20, &moved, 4);
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // An inside-out world bbox.
+    {
+        std::vector<uint8_t> bad = *good;
+        int32_t wx0 = 0;
+        std::memcpy(&wx0, bad.data() + tail0 + 20, 4);
+        const int32_t past = wx0 - 1;
+        std::memcpy(bad.data() + tail0 + 28, &past, 4); // worldX1 < worldX0
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // A floor above its own surface: the two came off different components,
+    // and a client would compute a negative standing depth from the row.
+    {
+        std::vector<uint8_t> bad = *good;
+        const int32_t tooHigh = 2000000000;
+        std::memcpy(bad.data() + tail0 + 16, &tooHigh, 4); // floorMm
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // An unknown span-flag bit: same rule as the header flags -- bytes this
+    // build does not implement are refused, not guessed at.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[tail0 + 44] = 0x02;
+        refused(bad, FineError::kBadBasinTable);
+    }
+    // Nonzero reserved bytes in the v2 tail.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[tail0 + 47] = 1;
+        refused(bad, FineError::kBadBasinTable);
+    }
+}
+
+VXC_TEST(vxtl_v2_headwater_table_is_refused_when_it_is_wrong) {
+    const std::filesystem::path path = fineBasinV2FixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> good = readFileBytes(path);
+    CHECK(good.has_value());
+    uint64_t headOff = 0, headLen = 0;
+    CHECK(findSection(*good, kSectionHeadwaters, headOff, headLen));
+    CHECK(headLen == kHeadwaterTableHeaderBytes + 4 * kHeadwaterEntryBytes);
+
+    auto refused = [&](const std::vector<uint8_t>& bad, FineError want) {
+        FineError err = FineError::kNone;
+        std::optional<FineTile> t = FineTile::parse(bad, {}, &err);
+        CHECK(!t.has_value());
+        CHECK_EQ(int(err), int(want));
+    };
+    const size_t row0 = static_cast<size_t>(headOff) + kHeadwaterTableHeaderBytes;
+
+    // A row size this build does not know.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(headOff) + 2] = 12;
+        refused(bad, FineError::kBadHeadwaterTable);
+    }
+    // A version this build does not know.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(headOff)] = 7;
+        refused(bad, FineError::kBadHeadwaterTable);
+    }
+    // A count that disagrees with the section length.
+    {
+        std::vector<uint8_t> bad = *good;
+        bad[static_cast<size_t>(headOff) + 4] = 5;
+        refused(bad, FineError::kBadHeadwaterTable);
+    }
+    // A head outside the tile: the client would spawn a faucet off the plane.
+    {
+        std::vector<uint8_t> bad = *good;
+        const uint16_t past = 4000;
+        std::memcpy(bad.data() + row0, &past, 2);
+        refused(bad, FineError::kBadHeadwaterTable);
+    }
+    // OUT OF ORDER -- which is how a DUPLICATE point gets in, and a duplicate
+    // point is one faucet emitted twice, i.e. twice the water in one place.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t y0 = 0;
+        std::memcpy(&y0, bad.data() + row0 + 2, 2);
+        const uint16_t later = static_cast<uint16_t>(y0 + 500);
+        std::memcpy(bad.data() + row0 + 2, &later, 2);
+        refused(bad, FineError::kBadHeadwaterTable);
+    }
+    // The section without its flag: those bytes would be silently ignored and
+    // every faucet in the tile would go missing without a word. flags sit at
+    // byte 31 (see the v1 basin refusal test for the layout).
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags &= static_cast<uint16_t>(~kFineFlagHeadsPresent);
+        std::memcpy(bad.data() + 31, &flags, 2);
+        refused(bad, FineError::kBadSectionTable);
+    }
+}
+
+VXC_TEST(the_reader_declares_the_features_it_learned_with_this_bake) {
+    // The rule tilestore.h states for kFineMaxKnownBakeVer: bump it in the
+    // same commit that teaches the parser a new flag bit or section id, never
+    // on its own. bake_ver 24 taught it both, so this is that bump asserted
+    // rather than remembered -- and the refusal message quotes this number, so
+    // a stale one sends whoever reads the log to check the wrong thing.
+    CHECK_EQ(int(kFineMaxKnownBakeVer), 24);
+    CHECK_EQ(int(kFineFlagsKnown & kFineFlagHeadsPresent), int(kFineFlagHeadsPresent));
+    CHECK_EQ(int(kFineFlagHeadsPresent), 0x8);
+    CHECK_EQ(int(kSectionHeadwaters), 8);
+    CHECK_EQ(int(kBasinEntryBytesV2), 80);
+    // The v2 row is the v1 row plus a suffix -- the property that let the
+    // layout grow without a second section id.
+    CHECK(kBasinEntryBytesV2 > kBasinEntryBytes);
+    CHECK(std::string(fineErrorName(FineError::kBadHeadwaterTable)) ==
+          "bad-headwater-table");
 }
 
 

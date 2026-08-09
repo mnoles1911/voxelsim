@@ -155,6 +155,13 @@ SECTION_BASIN_TABLE = 5
 #: See WATER_DEPTH_LSB_MM for the three measured reasons.
 SECTION_WATER_INDEX = 6
 SECTION_WATER_DATA = 7
+#: Headwater points (water re-architecture Phase 1, bake_ver 24): the cells
+#: where drawn water STARTS, with the discharge at each. A flat table like the
+#: basin registry and for the same reason -- it is a few thousand points, not a
+#: plane -- and it is the faucet list the PBF solver spawns from. The bake has
+#: computed this mask since bake_ver 9 (`water.water_head_mask`) and deleted it
+#: unused at the end of B6 ever since.
+SECTION_HEADWATERS = 8
 
 FLAG_FLOW_PRESENT = 1 << 0
 FLAG_BASINS_PRESENT = 1 << 1
@@ -164,6 +171,17 @@ FLAG_BASINS_PRESENT = 1 << 1
 #: plane" are different facts, and a client that conflated them would draw no
 #: rivers in a world that has them and never be able to tell why.
 FLAG_WATER_PRESENT = 1 << 2
+#: bake_ver 24: SECTION_HEADWATERS is present. Set even when the tile has no
+#: heads at all, for the third time and the same reason: "surveyed, no reaches
+#: start here" and "baked before headwaters existed" are different facts.
+#:
+#: ADDING A FLAG BIT IS A HARD BREAK BY DESIGN. Both parsers refuse an unknown
+#: bit (see `decode_v2` and tilestore.h `kFineFlagsKnown`), so an old client
+#: handed one of these tiles refuses it loudly instead of drawing a world with
+#: half the water missing. That is exactly why this rides a BAKE_VERSION roll
+#: (23 -> 24): the product namespace changes with it, so an old client never
+#: meets a new tile under an id it thinks it understands.
+FLAG_HEADS_PRESENT = 1 << 3
 
 # --- SECTION_WATER_* payload: DEPTH ABOVE THE QUANTISED BED ----------------
 #
@@ -348,10 +366,20 @@ WATER_LEVEL_MAX_CP = -2
 # a field without a third section id.
 #
 #   u16 table_version, u16 entry_bytes, u32 count, then count*entry_bytes
-BASIN_TABLE_VERSION = 1
+#
+# VERSION 2 (water re-architecture Phase 1, bake_ver 24) APPENDS to the row and
+# changes nothing in front of it: bytes 0..31 of a v2 row are positionally
+# identical to a whole v1 row, so the two layouts differ only by a suffix and
+# `entry_bytes` is what tells them apart. That is the mechanism this header was
+# built with in mind ("`entry_bytes` is what lets a later revision add a field
+# without a third section id") and it is used exactly as written. Both decoders
+# here and in tilestore.cpp accept BOTH, because v1 tiles are on disk today.
+BASIN_TABLE_VERSION_V1 = 1
+BASIN_TABLE_VERSION_V2 = 2
+BASIN_TABLE_VERSION = BASIN_TABLE_VERSION_V2
 _BASIN_TABLE_HEADER = struct.Struct("<HHI")
 
-# One basin row, 32 bytes:
+# One v1 basin row, 32 bytes:
 #   basin_id u16 | seed_px 2*u16 | bbox_px 4*u16 | outlet_px 2*u16
 #   spill_mm i32 | surface_mm i32 | kind u8 | reserved u8[5]
 #
@@ -362,8 +390,105 @@ _BASIN_TABLE_HEADER = struct.Struct("<HHI")
 # the control-point datum, and making it share one would couple a water query
 # to the elevation codec's internals.
 _BASIN_ENTRY = struct.Struct("<9H2i B5s")
-BASIN_ENTRY_BYTES = 32
+BASIN_ENTRY_BYTES_V1 = 32
+#: The v1 name, kept pointing at the v1 size. NOT re-aimed at v2: it is quoted
+#: by the committed v1 fixture generator and by voxelcore's `kBasinEntryBytes`,
+#: and a constant that silently changed size under an unchanged name is how a
+#: reader ends up parsing 80-byte rows out of a 32-byte stream.
+BASIN_ENTRY_BYTES = BASIN_ENTRY_BYTES_V1
 _BASIN_RESERVED5 = bytes(5)
+
+# The v2 tail, 48 more bytes immediately after those 32 (row total 80):
+#
+#   global_id u64 | capacity_l u64 | floor_mm i32
+#   world_bbox 4*i32 | world_outlet 2*i32 | span_flags u8 | reserved u8[3]
+#
+# WHAT EACH ONE IS FOR, since a wire field with no consumer is how `spill_mm`
+# and `outlet_px` sat unread for four bake versions:
+#
+# * `global_id` -- the basin's FLOOR CELL in absolute world fine pixels, packed
+#   (`bake.basins.global_basin_id`). Two tiles that both register one physical
+#   basin write the same id with no cross-tile communication in the bake. It is
+#   a packing, not a hash, so there is no collision argument to make and the id
+#   reads back as a place you can go and look at.
+#
+# * `capacity_l` -- LITRES (dm^3) of headroom between `surface_mm` and
+#   `spill_mm`. The unit is picked by an overflow bound, not by taste:
+#     - realistic worst case, wet alpine block: kept basin coverage tops out at
+#       2.4% of a 23,593 ha tile = 566 ha, against a 46 m deepest spill, so
+#       5.66e6 m^2 * 46 m = 2.6e8 m^3 = 2.6e11 litres;
+#     - absurd worst case, the whole padded domain 46 m deep: 2.99e8 m^2 *
+#       6553.4 m (the elevation plane's own int16 span at 100 mm) = 1.96e12
+#       m^3 = 1.96e15 litres.
+#   u32 dies immediately -- 4.295e9 litres is 4.3e6 m^3, which is 0.76 m of
+#   water over that same 566 ha lake -- and u32 in m^3 survives the realistic
+#   case but not the absurd one. u64 litres clears the absurd case by 9,400x
+#   and keeps a 1-litre LSB, so the ledger never has to reason about rounding.
+#
+# * `floor_mm` -- the deepest cell's elevation, absolute mm. v1 shipped the
+#   spill and the surface but never the bottom, so a client could not turn a
+#   volume into a level (it needs floor, surface and A(h)) nor tell a 2 m pond
+#   from a 46 m lake standing at the same surface.
+#
+# * `world_bbox` / `world_outlet` -- the component's UNCLIPPED extent and its
+#   spill saddle, absolute world fine pixels. The u16 `bbox_px`/`outlet_px` in
+#   front are clipped and clamped into the tile so a client can index its own
+#   plane with them; for a tile-spanning basin those are a local VIEW and these
+#   are the truth. The client's union rule reads these: two rows are one lake
+#   when their ids match, or when their world bboxes overlap and their spills
+#   agree -- see the design note in bake/basins.py:global_basin_id for why the
+#   second clause has to exist.
+#
+# * `span_flags` bit0 -- this row's extent leaves this tile, i.e. "expect a
+#   partner row in a neighbour". Derivable from world_bbox vs the tile, but a
+#   client that has not fetched the neighbour needs to know it is looking at
+#   half a lake without doing that arithmetic on every row of every tile.
+_BASIN_ENTRY_V2_TAIL = struct.Struct("<2Qi6iB3s")
+BASIN_ENTRY_BYTES_V2 = 80
+_BASIN_RESERVED3 = bytes(3)
+#: `span_flags` bit0: the basin's extent leaves this tile's interior.
+BASIN_SPAN_CROSSES_TILE = 1 << 0
+#: `global_id`'s coordinate packing, mirroring `bake.basins`. Two biased 31-bit
+#: fields under a constant bit-62 tag; bit 63 stays CLEAR and the id is never
+#: 0, both required by voxelcore/basinledger.h's `BasinId` (it tags v1
+#: tile-local keys with bit 63 and reserves 0 as "not a basin").
+BASIN_ID_AXIS_BIAS = 1 << 30
+BASIN_ID_TAG = 1 << 62
+#: Litres per cubic metre -- the capacity field's LSB.
+CAPACITY_L_PER_M3 = 1000
+#: u64 ceiling, asserted at pack time rather than trusted (see the bound above).
+CAPACITY_L_MAX = (1 << 64) - 1
+
+_BASIN_ENTRY_BYTES_BY_VERSION = {
+    BASIN_TABLE_VERSION_V1: BASIN_ENTRY_BYTES_V1,
+    BASIN_TABLE_VERSION_V2: BASIN_ENTRY_BYTES_V2,
+}
+
+# --- SECTION_HEADWATERS layout (water re-architecture Phase 1) --------------
+#
+# Same shape as the basin table -- u16 version, u16 entry_bytes, u32 count --
+# for the same reason, and deliberately NOT a plane: a head is a point.
+#
+#   px u16 | py u16 | q_m3_yr u32          (8 bytes, tile-interior pixels)
+#
+# WHY u32 AND WHAT IT COSTS. Q at a head is small by construction (a head is
+# the most upstream drawable cell), but a reach that ENTERS the tile's padded
+# domain from outside has no donor inside it and is a head too, carrying the
+# full trunk discharge. The largest such value seen on the shipped world is
+# 2.3e8 m^3/yr, against a u32 ceiling of 4.295e9 -- 18x of headroom, and 136
+# m^3/s in the units hydrology uses, which is a large river but not a Rhine.
+# The encoder REFUSES a head above the ceiling rather than saturating: a
+# saturated faucet rate would be a plausible number that silently understates
+# a river, and the bake failing loudly is the cheaper outcome.
+HEADWATER_TABLE_VERSION = 1
+_HEADWATER_TABLE_HEADER = struct.Struct("<HHI")
+_HEADWATER_ENTRY = struct.Struct("<2HI")
+HEADWATER_ENTRY_BYTES = 8
+HEADWATER_Q_MAX = (1 << 32) - 1
+#: The numpy view of one row, for the vectorised encode/decode path -- a tile
+#: can carry thousands of heads and a Python loop over struct.pack is the kind
+#: of avoidable cost that turns into a bake regression nobody attributes.
+_HEADWATER_DTYPE = np.dtype([("x", "<u2"), ("y", "<u2"), ("q", "<u4")])
 
 #: `kind` values, mirroring bake/basins.py's KIND_* and voxelcore/tilestore.h's
 #: BasinKind. Three copies, one meaning; tests/test_basin_table.py asserts the
@@ -447,6 +572,17 @@ class TileV2:
     parent_scale: int = 0             # reserved (§3) — must stay 0
     basins: "list[BasinEntry] | None" = None   # P1 registry, optional
     water_cp: "np.ndarray | None" = None   # (size,size) int16 DEPTH cp, P2
+    #: Headwater points (Phase 1, bake_ver 24), sets flags bit3. An EMPTY list
+    #: is not None, for the third time and the same reason as `basins` and
+    #: `water_cp`: "surveyed, no reaches start here" is a fact.
+    heads: "list[HeadEntry] | None" = None
+    #: Which SECTION_BASIN_TABLE layout to WRITE. Explicit rather than inferred
+    #: from whether the rows carry v2 fields: "these rows have no identity" and
+    #: "this tile is a v1 tile" are different statements, and a v2 bake that
+    #: quietly emitted a v1 table because one row was built wrong is exactly
+    #: the silent downgrade `_pack_v2_tail` refuses. Only the v1 fixture
+    #: generator sets this.
+    basin_table_version: int = BASIN_TABLE_VERSION
 
     def __post_init__(self) -> None:
         assert self.scale == FINE_SCALE, f"v2 scale must be {FINE_SCALE}"
@@ -1000,10 +1136,19 @@ class BasinEntry:
     possibly reach, how high the water stands, and what kind of place it is.
     Everything the bake used to DECIDE that -- hypsometry, climate, catchment
     -- stays in the survey and never ships.
+
+    THE v2 FIELDS ARE OPTIONAL IN THIS CLASS AND ONLY IN THIS CLASS: a row
+    decoded from a v1 tile leaves them None, which is a fact a caller must be
+    able to see ("this tile predates global identity") rather than a zero it
+    would mistake for "capacity zero, floor at sea level". `pack` at v2 refuses
+    a row that has none of them, so the None state can only ever arrive from a
+    v1 tile, never be written into a new one.
     """
 
     basin_id: int
-    #: Deepest cell, the client's flood-fill seed. Tile-interior pixels.
+    #: Deepest cell IN THIS TILE, the client's flood-fill seed. Tile-interior
+    #: pixels. For a tile-spanning basin this is not the basin's floor; that
+    #: is `world_floor_px`, unpacked from `global_id`.
     seed_px: tuple[int, int]
     #: (x0, y0, x1, y1) inclusive, tile-interior pixels. The flood fill is
     #: bounded by this, which is what makes the client cost per basin O(bbox)
@@ -1020,7 +1165,48 @@ class BasinEntry:
     surface_mm: int
     kind: int
 
-    def pack(self) -> bytes:
+    # -- basin table v2. None on a row decoded from a v1 tile; see the class
+    # docstring. All coordinates are ABSOLUTE world fine pixels.
+    global_id: "int | None" = None
+    #: Headroom from `surface_mm` to `spill_mm`, LITRES. See the layout note.
+    capacity_l: "int | None" = None
+    #: The basin's deepest cell, absolute mm. Not necessarily under `seed_px`.
+    floor_mm: "int | None" = None
+    #: Unclipped extent (x0, y0, x1, y1), absolute world fine pixels.
+    world_bbox_px: "tuple[int, int, int, int] | None" = None
+    #: The spill saddle in absolute world fine pixels -- the true one, where
+    #: `outlet_px` above is clamped into this tile.
+    world_outlet_px: "tuple[int, int] | None" = None
+    #: BASIN_SPAN_* bits.
+    span_flags: int = 0
+
+    @property
+    def has_v2(self) -> bool:
+        """True when this row carries the v2 fields (identity and capacity)."""
+        return self.global_id is not None
+
+    @property
+    def world_floor_px(self) -> "tuple[int, int] | None":
+        """The identity anchor, unpacked from `global_id`.
+
+        Mirrors `bake.basins.world_px_from_global_id` -- two biased 31-bit
+        fields under a constant bit-62 tag. Duplicated rather than imported
+        because this module must stay importable with no bake package (and no
+        numba) present; `tests/test_basin_table.py` pins the two together.
+        """
+        if self.global_id is None:
+            return None
+        return (((self.global_id >> 31) & 0x7FFFFFFF) - BASIN_ID_AXIS_BIAS,
+                (self.global_id & 0x7FFFFFFF) - BASIN_ID_AXIS_BIAS)
+
+    def pack(self, version: int = BASIN_TABLE_VERSION) -> bytes:
+        if version == BASIN_TABLE_VERSION_V2:
+            return self._pack_v1() + self._pack_v2_tail()
+        if version == BASIN_TABLE_VERSION_V1:
+            return self._pack_v1()
+        raise ValueError(f"unsupported basin table version {version}")
+
+    def _pack_v1(self) -> bytes:
         for name, v, lo, hi in (
             ("basin_id", self.basin_id, 0, 0xFFFF),
             ("seed x", self.seed_px[0], 0, 0xFFFF),
@@ -1054,6 +1240,62 @@ class BasinEntry:
             self.spill_mm, self.surface_mm, self.kind, _BASIN_RESERVED5,
         )
 
+    def _pack_v2_tail(self) -> bytes:
+        if not self.has_v2:
+            # A v2 table with a v1-shaped row in it would ship zeros as an
+            # identity -- every such basin claiming to be the lake whose floor
+            # is world pixel (0, 0). Refuse instead.
+            raise ValueError(
+                f"basin {self.basin_id}: cannot write a v2 row without the v2 "
+                "fields (global_id/capacity_l/floor_mm/world_bbox_px/"
+                "world_outlet_px); it came from a v1 tile or was built by hand"
+            )
+        wb = self.world_bbox_px
+        wo = self.world_outlet_px
+        if wb is None or wo is None or self.capacity_l is None or self.floor_mm is None:
+            raise ValueError(f"basin {self.basin_id}: incomplete v2 fields")
+        if not (0 < int(self.global_id) <= 0xFFFFFFFFFFFFFFFF):
+            raise ValueError(f"basin {self.basin_id}: global_id out of u64 range")
+        if int(self.global_id) & (1 << 63):
+            # voxelcore/basinledger.h tags v1 tile-local keys with bit 63 and
+            # refuses a global id that sets it, so an id written with that bit
+            # would be dropped by the runtime ledger while passing every
+            # encoder check here. See bake.basins.BASIN_ID_TAG.
+            raise ValueError(
+                f"basin {self.basin_id}: global_id sets bit 63, which the "
+                "runtime reserves for tile-local keys")
+        if not (0 <= int(self.capacity_l) <= CAPACITY_L_MAX):
+            raise ValueError(
+                f"basin {self.basin_id}: capacity {self.capacity_l} litres is "
+                f"outside [0, {CAPACITY_L_MAX}]"
+            )
+        if wb[0] > wb[2] or wb[1] > wb[3]:
+            raise ValueError(f"basin {self.basin_id}: world bbox is inside out")
+        if self.floor_mm > self.surface_mm:
+            # The floor is under the water by definition; above it means the
+            # surface and the floor came from different components.
+            raise ValueError(
+                f"basin {self.basin_id}: floor {self.floor_mm} mm is above its "
+                f"own surface {self.surface_mm} mm"
+            )
+        fx, fy = self.world_floor_px  # type: ignore[misc]
+        if not (wb[0] <= fx <= wb[2] and wb[1] <= fy <= wb[3]):
+            # The anchor IS a cell of the component, so it is inside the
+            # component's own extent. If it is not, the id and the extent were
+            # measured on two different basins and the client's union rule --
+            # which reads both -- would silently merge the wrong pair.
+            raise ValueError(
+                f"basin {self.basin_id}: the global_id anchor ({fx}, {fy}) is "
+                f"outside its own world bbox {wb}"
+            )
+        if self.span_flags & ~BASIN_SPAN_CROSSES_TILE:
+            raise ValueError(f"basin {self.basin_id}: unknown span flag bits")
+        return _BASIN_ENTRY_V2_TAIL.pack(
+            int(self.global_id), int(self.capacity_l), int(self.floor_mm),
+            int(wb[0]), int(wb[1]), int(wb[2]), int(wb[3]),
+            int(wo[0]), int(wo[1]), int(self.span_flags), _BASIN_RESERVED3,
+        )
+
     @classmethod
     def from_record(cls, rec) -> "BasinEntry":
         """Wire row from a `bake.basins.BasinRecord`.
@@ -1065,7 +1307,29 @@ class BasinEntry:
         Metres become millimetres by rounding, which is monotone, so a record
         whose surface is at or below its spill cannot round into one that is
         above it -- the invariant `pack` enforces.
+
+        A record from a pre-v2 `basins.py` has no `global_id` attribute, so the
+        v2 fields come through `getattr`: this function is called with
+        hand-built record objects by tools and tests, and the shipped path must
+        not depend on any of them growing a field on the same day.
         """
+        gid = getattr(rec, "global_id", None)
+        v2: dict = {}
+        if gid:
+            cap_m3 = float(getattr(rec, "capacity_m3", 0.0))
+            v2 = dict(
+                global_id=int(gid),
+                # Rounded, not truncated -- litres are the LSB, so a truncation
+                # here would bias every basin's headroom down by half a litre
+                # and a ledger that fills a lake exactly would never spill.
+                capacity_l=int(round(max(cap_m3, 0.0) * CAPACITY_L_PER_M3)),
+                floor_mm=int(round(float(rec.floor_m) * 1000.0)),
+                world_bbox_px=tuple(int(v) for v in rec.world_bbox_px),
+                world_outlet_px=(int(rec.world_outlet_px[0]),
+                                 int(rec.world_outlet_px[1])),
+                span_flags=(0 if getattr(rec, "interior", True)
+                            else BASIN_SPAN_CROSSES_TILE),
+            )
         return cls(
             basin_id=int(rec.basin_id),
             seed_px=(int(rec.seed_px[0]), int(rec.seed_px[1])),
@@ -1074,10 +1338,12 @@ class BasinEntry:
             spill_mm=int(round(float(rec.spill_m) * 1000.0)),
             surface_mm=int(round(float(rec.surface_m) * 1000.0)),
             kind=int(rec.kind),
+            **v2,
         )
 
     @classmethod
-    def unpack(cls, buf: bytes, offset: int = 0) -> "BasinEntry":
+    def unpack(cls, buf: bytes, offset: int = 0,
+               version: int = BASIN_TABLE_VERSION_V1) -> "BasinEntry":
         (bid, sx, sy, x0, y0, x1, y1, ox, oy,
          spill, surface, kind, reserved) = _BASIN_ENTRY.unpack_from(buf, offset)
         if reserved != _BASIN_RESERVED5:
@@ -1088,19 +1354,64 @@ class BasinEntry:
             raise ValueError("basin bbox is inside out")
         if surface > spill:
             raise ValueError("basin surface is above its spill")
-        return cls(basin_id=bid, seed_px=(sx, sy), bbox_px=(x0, y0, x1, y1),
-                   outlet_px=(ox, oy), spill_mm=spill, surface_mm=surface,
-                   kind=kind)
+        if not (x0 <= sx <= x1 and y0 <= sy <= y1):
+            # The seed is the client's flood-fill start and the bbox is the
+            # bound on that fill, so a seed outside it fills nothing (or, worse,
+            # something else). The C++ parser has always refused this; the
+            # Python one did not, and a fixture generator got it wrong once.
+            raise ValueError(f"basin {bid}: seed is outside its own bbox")
+        row = cls(basin_id=bid, seed_px=(sx, sy), bbox_px=(x0, y0, x1, y1),
+                  outlet_px=(ox, oy), spill_mm=spill, surface_mm=surface,
+                  kind=kind)
+        if version == BASIN_TABLE_VERSION_V1:
+            return row
+        if version != BASIN_TABLE_VERSION_V2:
+            raise ValueError(f"unsupported basin table version {version}")
+        (gid, cap, floor, wx0, wy0, wx1, wy1, owx, owy,
+         span, reserved3) = _BASIN_ENTRY_V2_TAIL.unpack_from(
+             buf, offset + BASIN_ENTRY_BYTES_V1)
+        if reserved3 != _BASIN_RESERVED3:
+            raise ValueError("nonzero reserved bytes in basin entry v2 tail")
+        if span & ~BASIN_SPAN_CROSSES_TILE:
+            raise ValueError(f"basin {bid}: unknown span flag bits 0x{span:02x}")
+        if wx0 > wx1 or wy0 > wy1:
+            raise ValueError(f"basin {bid}: world bbox is inside out")
+        if floor > surface:
+            raise ValueError(f"basin {bid}: floor is above its own surface")
+        row.global_id = gid
+        row.capacity_l = cap
+        row.floor_mm = floor
+        row.world_bbox_px = (wx0, wy0, wx1, wy1)
+        row.world_outlet_px = (owx, owy)
+        row.span_flags = span
+        fx, fy = row.world_floor_px  # type: ignore[misc]
+        if not (wx0 <= fx <= wx1 and wy0 <= fy <= wy1):
+            raise ValueError(
+                f"basin {bid}: the global_id anchor ({fx}, {fy}) is outside "
+                f"its own world bbox {(wx0, wy0, wx1, wy1)}")
+        return row
 
 
-def encode_basin_table(basins: "list[BasinEntry]") -> bytes:
+def encode_basin_table(basins: "list[BasinEntry]",
+                       version: int = BASIN_TABLE_VERSION) -> bytes:
     """Serialise SECTION_BASIN_TABLE's payload.
 
     Ids must be 0..n-1 in order. That is not decoration: the client indexes
     the table by id, and the bake orders basins by (min_y, min_x) of extent so
     the id is a deterministic function of the surface. A gap or a repeat means
     two different tiles could disagree about which basin is "3".
+
+    (That per-tile id is NOT the cross-tile one. Two tiles sharing a lake will
+    number it differently, because each numbers only what it can see; the row's
+    `global_id` is what says they are the same lake. Keeping both is why v2
+    could be additive.)
+
+    `version` exists for the fixture generators and for reproducing a v1 table
+    byte for byte; the bake always writes the current version.
     """
+    entry_bytes = _BASIN_ENTRY_BYTES_BY_VERSION.get(version)
+    if entry_bytes is None:
+        raise ValueError(f"unsupported basin table version {version}")
     for i, b in enumerate(basins):
         if b.basin_id != i:
             raise ValueError(
@@ -1108,22 +1419,29 @@ def encode_basin_table(basins: "list[BasinEntry]") -> bytes:
             )
     if len(basins) > 0xFFFF:
         raise ValueError(f"{len(basins)} basins exceeds the u16 id space")
-    head = _BASIN_TABLE_HEADER.pack(BASIN_TABLE_VERSION, BASIN_ENTRY_BYTES,
-                                    len(basins))
-    return head + b"".join(b.pack() for b in basins)
+    head = _BASIN_TABLE_HEADER.pack(version, entry_bytes, len(basins))
+    return head + b"".join(b.pack(version) for b in basins)
 
 
 def decode_basin_table(payload: bytes) -> "list[BasinEntry]":
-    """Parse SECTION_BASIN_TABLE, refusing anything it cannot read exactly."""
+    """Parse SECTION_BASIN_TABLE, refusing anything it cannot read exactly.
+
+    BOTH LAYOUTS ARE ACCEPTED -- v1 (32-byte rows) and v2 (80-byte rows) -- and
+    the pairing of `table_version` with `entry_bytes` is checked rather than
+    either one alone: a v2 version over 32-byte rows is not "an old table with
+    a new label", it is bytes from something neither revision wrote.
+    """
     if len(payload) < _BASIN_TABLE_HEADER.size:
         raise ValueError("truncated basin table header")
     version, entry_bytes, count = _BASIN_TABLE_HEADER.unpack_from(payload, 0)
-    if version != BASIN_TABLE_VERSION:
+    want_bytes = _BASIN_ENTRY_BYTES_BY_VERSION.get(version)
+    if want_bytes is None:
         raise ValueError(f"unsupported basin table version {version}")
-    if entry_bytes != BASIN_ENTRY_BYTES:
+    if entry_bytes != want_bytes:
         raise ValueError(
-            f"basin entry size {entry_bytes} != {BASIN_ENTRY_BYTES}; these "
-            "bytes were written by a different revision of the table"
+            f"basin entry size {entry_bytes} != {want_bytes} for table version "
+            f"{version}; these bytes were written by a different revision of "
+            "the table"
         )
     want = _BASIN_TABLE_HEADER.size + count * entry_bytes
     if len(payload) != want:
@@ -1131,12 +1449,132 @@ def decode_basin_table(payload: bytes) -> "list[BasinEntry]":
             f"basin table is {len(payload)} bytes, header says {want}"
         )
     out = [
-        BasinEntry.unpack(payload, _BASIN_TABLE_HEADER.size + i * entry_bytes)
+        BasinEntry.unpack(payload, _BASIN_TABLE_HEADER.size + i * entry_bytes,
+                          version)
         for i in range(count)
     ]
     for i, b in enumerate(out):
         if b.basin_id != i:
             raise ValueError(f"basin ids are not 0..n-1 (entry {i} says {b.basin_id})")
+    return out
+
+
+# ------------------------------------------------------------- headwaters
+
+
+@dataclass
+class HeadEntry:
+    """One row of SECTION_HEADWATERS: where a reach starts and how much it carries.
+
+    `px` is the tile-interior pixel and `q_m3_yr` is the discharge AT that
+    cell, i.e. the faucet rate a Phase 3 emitter spawns at (m^3/yr; divide by
+    31,557,600 for m^3/s).
+    """
+
+    px: tuple[int, int]
+    q_m3_yr: int
+
+    def pack(self) -> bytes:
+        x, y = int(self.px[0]), int(self.px[1])
+        if not (0 <= x <= 0xFFFF and 0 <= y <= 0xFFFF):
+            raise ValueError(f"headwater pixel {self.px} is outside u16")
+        if not (0 <= int(self.q_m3_yr) <= HEADWATER_Q_MAX):
+            raise ValueError(
+                f"headwater at {self.px}: Q = {self.q_m3_yr} m^3/yr is outside "
+                f"[0, {HEADWATER_Q_MAX}] -- see SECTION_HEADWATERS on why this "
+                "refuses rather than saturates"
+            )
+        return _HEADWATER_ENTRY.pack(x, y, int(self.q_m3_yr))
+
+
+def encode_headwaters(heads: "list[HeadEntry]") -> bytes:
+    """Serialise SECTION_HEADWATERS' payload.
+
+    ORDERED BY (y, x), STRICTLY, and that is enforced rather than assumed. The
+    producer walks a raster mask so the order falls out for free; making it a
+    contract buys two things: a duplicate point (the same faucet emitted twice,
+    i.e. twice the water) cannot pass, and a client may binary-search the table
+    by row instead of scanning it.
+    """
+    if len(heads) > 0xFFFFFFFF:
+        raise ValueError(f"{len(heads)} headwaters exceeds the u32 count")
+    prev = (-1, -1)
+    for h in heads:
+        key = (int(h.px[1]), int(h.px[0]))
+        if key <= prev:
+            raise ValueError(
+                f"headwaters must be strictly ordered by (y, x); {h.px} follows "
+                f"{(prev[1], prev[0])}"
+            )
+        prev = key
+    head = _HEADWATER_TABLE_HEADER.pack(HEADWATER_TABLE_VERSION,
+                                        HEADWATER_ENTRY_BYTES, len(heads))
+    return head + b"".join(h.pack() for h in heads)
+
+
+def encode_headwater_arrays(xs, ys, qs) -> bytes:
+    """`encode_headwaters` from three parallel arrays, without the objects.
+
+    The bake has thousands of heads per tile as numpy arrays already; building
+    a `HeadEntry` for each only to throw it away is pure allocation. Same bytes,
+    same refusals -- the ordering and range checks are the vectorised form of
+    the ones above, not a relaxed version of them.
+    """
+    x = np.asarray(xs, dtype=np.int64)
+    y = np.asarray(ys, dtype=np.int64)
+    q = np.asarray(qs, dtype=np.float64)
+    if not (x.shape == y.shape == q.shape) or x.ndim != 1:
+        raise ValueError("headwater arrays must be 1-D and the same length")
+    if x.size and (x.min() < 0 or x.max() > 0xFFFF or y.min() < 0 or y.max() > 0xFFFF):
+        raise ValueError("headwater pixel outside u16")
+    if x.size and (np.nanmin(q) < 0.0 or np.nanmax(q) > HEADWATER_Q_MAX):
+        raise ValueError(
+            f"headwater Q outside [0, {HEADWATER_Q_MAX}] m^3/yr (max seen "
+            f"{np.nanmax(q):.4g}) -- see SECTION_HEADWATERS on why this refuses "
+            "rather than saturates"
+        )
+    key = y * (1 << 17) + x
+    if x.size > 1 and np.any(np.diff(key) <= 0):
+        raise ValueError("headwaters must be strictly ordered by (y, x)")
+    rows = np.empty(x.size, dtype=_HEADWATER_DTYPE)
+    rows["x"] = x
+    rows["y"] = y
+    # ROUNDED. Q is a float32/64 field and the wire is integer m^3/yr; a
+    # truncation would bias every faucet rate down, which over a tile of heads
+    # is a systematic loss of water rather than a rounding wash.
+    rows["q"] = np.rint(q).astype(np.uint32)
+    head = _HEADWATER_TABLE_HEADER.pack(HEADWATER_TABLE_VERSION,
+                                        HEADWATER_ENTRY_BYTES, int(x.size))
+    return head + rows.tobytes()
+
+
+def decode_headwaters(payload: bytes) -> "list[HeadEntry]":
+    """Parse SECTION_HEADWATERS, refusing anything it cannot read exactly."""
+    if len(payload) < _HEADWATER_TABLE_HEADER.size:
+        raise ValueError("truncated headwater table header")
+    version, entry_bytes, count = _HEADWATER_TABLE_HEADER.unpack_from(payload, 0)
+    if version != HEADWATER_TABLE_VERSION:
+        raise ValueError(f"unsupported headwater table version {version}")
+    if entry_bytes != HEADWATER_ENTRY_BYTES:
+        raise ValueError(
+            f"headwater entry size {entry_bytes} != {HEADWATER_ENTRY_BYTES}; "
+            "these bytes were written by a different revision of the table"
+        )
+    want = _HEADWATER_TABLE_HEADER.size + count * entry_bytes
+    if len(payload) != want:
+        raise ValueError(
+            f"headwater table is {len(payload)} bytes, header says {want}")
+    rows = np.frombuffer(payload, dtype=_HEADWATER_DTYPE,
+                         count=count, offset=_HEADWATER_TABLE_HEADER.size)
+    out = [HeadEntry(px=(int(r["x"]), int(r["y"])), q_m3_yr=int(r["q"]))
+           for r in rows]
+    prev = (-1, -1)
+    for h in out:
+        key = (h.px[1], h.px[0])
+        if key <= prev:
+            raise ValueError(
+                f"headwaters are not strictly ordered by (y, x) at {h.px}")
+        prev = key
     return out
 
 
@@ -1169,6 +1607,8 @@ def encode_v2(
         flags |= FLAG_BASINS_PRESENT
     if tile.water_cp is not None:
         flags |= FLAG_WATER_PRESENT
+    if tile.heads is not None:
+        flags |= FLAG_HEADS_PRESENT
 
     elev_index, elev_data = _encode_plane(
         tile.elevation_cp.astype(np.int64),
@@ -1212,7 +1652,17 @@ def encode_v2(
         # already-dense integers -- compressing it would buy nothing and would
         # make the one section a client must read before it can put water
         # anywhere depend on the injected decompressor.
-        sections.append((SECTION_BASIN_TABLE, encode_basin_table(tile.basins)))
+        sections.append((SECTION_BASIN_TABLE,
+                         encode_basin_table(tile.basins, tile.basin_table_version)))
+
+    if tile.heads is not None:
+        # Beside the basin table and uncompressed for the same two reasons: it
+        # is dense integers, and it is read before any water can be placed.
+        for h in tile.heads:
+            if not (0 <= h.px[0] < tile.size and 0 <= h.px[1] < tile.size):
+                raise ValueError(
+                    f"headwater {h.px} is outside the {tile.size}px tile")
+        sections.append((SECTION_HEADWATERS, encode_headwaters(tile.heads)))
 
     header = _HEADER.pack(MAGIC, VERSION_V2, tile.seed, tile.x, tile.y, tile.scale, tile.size)
     ext = _V2_EXT.pack(
@@ -1315,7 +1765,8 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
         elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
     )
 
-    if flags & ~(FLAG_FLOW_PRESENT | FLAG_BASINS_PRESENT | FLAG_WATER_PRESENT):
+    if flags & ~(FLAG_FLOW_PRESENT | FLAG_BASINS_PRESENT | FLAG_WATER_PRESENT
+                 | FLAG_HEADS_PRESENT):
         # Same posture as the C++ parser: an undefined flag bit can only mean
         # the bytes came from something this decoder does not understand, and
         # reading them anyway is how a client silently mis-renders a world.
@@ -1355,12 +1806,24 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
     elif SECTION_WATER_INDEX in sections or SECTION_WATER_DATA in sections:
         raise ValueError("water sections present but the water flag is clear")
 
+    heads = None
+    if flags & FLAG_HEADS_PRESENT:
+        if SECTION_HEADWATERS not in sections:
+            raise ValueError("headwater flag set but SECTION_HEADWATERS is missing")
+        heads = decode_headwaters(sections[SECTION_HEADWATERS])
+        for h in heads:
+            if not (0 <= h.px[0] < size and 0 <= h.px[1] < size):
+                raise ValueError(f"headwater {h.px} is outside the tile")
+    elif SECTION_HEADWATERS in sections:
+        raise ValueError("SECTION_HEADWATERS present but the headwater flag is clear")
+
     return TileV2(
         seed=seed, x=x, y=y, size=size,
         elevation_cp=elevation_cp,
         base_offset_mm=base_offset_mm,
         quant=quant, codec=codec, bake_ver=bake_ver,
         block_log2=block_log2, flow=flow, basins=basins, water_cp=water_cp,
+        heads=heads,
         scale=scale, predictor=predictor, parent_scale=parent_scale,
     )
 
@@ -1460,6 +1923,7 @@ def encode_fine(
     elevation_m: np.ndarray,
     flow: np.ndarray | None = None,
     basins: "list | tuple | None" = None,
+    heads: "list | tuple | np.ndarray | None" = None,
     water_surface_m: "np.ndarray | None" = None,
     water_level_m: "np.ndarray | None" = None,
     bake_ver: int | None = None,
@@ -1467,6 +1931,7 @@ def encode_fine(
     block_log2: int = DEFAULT_BLOCK_LOG2,
     base_offset_mm: int | None = None,
     quant: int | None = None,
+    basin_table_version: int = BASIN_TABLE_VERSION,
 ) -> bytes:
     """Encode one baked fine tier straight from the bake's SAMPLE field.
 
@@ -1520,6 +1985,17 @@ def encode_fine(
             b if isinstance(b, BasinEntry) else BasinEntry.from_record(b)
             for b in basins
         ]
+    head_rows = None
+    if heads is not None:
+        # A tuple() of zero heads is NOT None, exactly as for `basins`.
+        # Accepts either HeadEntry rows or the bake's own (N, 3) integer array
+        # of (x, y, q) -- the latter is what `BakeResult.water_heads` is, and
+        # converting it here keeps the array form out of the wire code.
+        head_rows = [
+            h if isinstance(h, HeadEntry)
+            else HeadEntry(px=(int(h[0]), int(h[1])), q_m3_yr=int(h[2]))
+            for h in heads
+        ]
     return encode_v2(
         TileV2(
             seed=int(seed) & 0xFFFFFFFFFFFFFFFF,
@@ -1534,6 +2010,8 @@ def encode_fine(
             block_log2=int(block_log2),
             flow=flow_arr,
             basins=basin_rows,
+            heads=head_rows,
             water_cp=water_cp,
+            basin_table_version=int(basin_table_version),
         )
     )
