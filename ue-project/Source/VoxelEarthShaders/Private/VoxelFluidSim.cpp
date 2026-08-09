@@ -170,6 +170,9 @@ namespace
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, BlockSums)
+			// The sorted arrays' length (total hashed particles), published by
+			// the last lane -- the bound every sorted-domain kernel reads.
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SortedCount)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -190,6 +193,10 @@ namespace
 	// shader declares them RWStructuredBuffer (one declaration serves every
 	// kernel), so they bind as UAVs -- the same note FVoxelMeshCountCS carries
 	// at VoxelGpuWorldGen.cpp:148-151.
+	// Since the perf pass this kernel also builds the SORTED position array
+	// (GridPositions in, OutPositions out): position + packed frozen cell key
+	// per hashed particle, cell-grouped, which is what the constraint kernels
+	// gather from.
 	class FVoxelFluidScatterCS : public FVoxelFluidShader
 	{
 	public:
@@ -198,14 +205,21 @@ namespace
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellStarts)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellEntries)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellHash)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellRank)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPositions)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
 	// --- FluidDensityLambdaMain ---------------------------------------------
+	// SORTED DOMAIN since the perf pass: InPositions is the cell-grouped
+	// (position + frozen key) array, the thread bound is the GPU-side
+	// InSortedCount, and the kernel no longer references SimSlotCount,
+	// GridPositions or InCellEntries -- removed here rather than left bound,
+	// because a bound-but-unread parameter is how a stale binding hides.
 	class FVoxelFluidDensityLambdaCS : public FVoxelFluidShader
 	{
 	public:
@@ -213,13 +227,11 @@ namespace
 		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidDensityLambdaCS, FVoxelFluidShader);
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER(uint32, SimSlotCount)
 			SHADER_PARAMETER(float, RestDensity)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellStarts)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellCounts)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InSortedCount)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, Lambdas)
 		END_SHADER_PARAMETER_STRUCT()
 	};
@@ -232,14 +244,12 @@ namespace
 		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidDeltaPosCS, FVoxelFluidShader);
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER(uint32, SimSlotCount)
 			SHADER_PARAMETER(float, RestDensity)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InLambdas)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellStarts)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellCounts)
-			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InSortedCount)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPositions)
 			// The collision read (VoxelFluidResolveCollision inside the dp
 			// clamp). GroundZLocalUU left the struct with the fallback plane:
@@ -257,7 +267,6 @@ namespace
 		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidFinalizeCS, FVoxelFluidShader);
 
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
-			SHADER_PARAMETER(uint32, SimSlotCount)
 			SHADER_PARAMETER(float, Dt)
 			SHADER_PARAMETER(float, BoundaryHalfExtentUU)
 			SHADER_PARAMETER(FVector3f, BoundaryCenterLocalUU)
@@ -265,7 +274,12 @@ namespace
 			SHADER_PARAMETER(FVector3f, BasinBoxMinLocalUU)
 			SHADER_PARAMETER(FVector3f, BasinBoxMaxLocalUU)
 			SHADER_PARAMETER(float, BasinDatumZLocalUU)
+			// Sorted domain (perf pass): InPositions is the final sorted
+			// iterate, InCellEntries the sorted -> slot map corrections are
+			// written back through, InSortedCount the thread bound.
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InSortedCount)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, FreeList)
@@ -589,12 +603,17 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 
 	// ---- transient buffers (die with the graph; sized to the slot bound) ---
 	const uint32 Slots = Args.SimSlotBound;
+	// PredictedG is SLOT-indexed (integrate output, the grid build's input);
+	// SortedA/SortedB are the CELL-GROUPED constraint ping-pong the scatter
+	// seeds (position + packed frozen cell key in w) -- the perf pass moved
+	// the whole constraint loop into sorted index space so neighbour gathers
+	// read contiguous float4 runs instead of hash-scatter-ordered slots.
 	FRDGBufferRef PredictedG = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.Predicted0"));
-	FRDGBufferRef PredictedA = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.PredictedA"));
-	FRDGBufferRef PredictedB = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.PredictedB"));
+	FRDGBufferRef SortedA = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.SortedA"));
+	FRDGBufferRef SortedB = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.SortedB"));
 	FRDGBufferRef LambdasRDG = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(4, Slots), TEXT("VoxelFluid.Lambdas"));
 	FRDGBufferRef CellHashRDG = GraphBuilder.CreateBuffer(
@@ -609,6 +628,11 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		FRDGBufferDesc::CreateStructuredDesc(4, kHashCells), TEXT("VoxelFluid.CellStarts"));
 	FRDGBufferRef BlockSumsRDG = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(4, kScanBlock), TEXT("VoxelFluid.BlockSums"));
+	// One uint: the sorted arrays' length this frame, written by ScanSums and
+	// read by every sorted-domain kernel as its thread bound. GPU-owned so the
+	// CPU never needs to know the alive count to dispatch correctly.
+	FRDGBufferRef SortedCountRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, 1), TEXT("VoxelFluid.SortedCount"));
 
 	// ---- GPU timing bracket (begin) ---------------------------------------
 	// RQT_AbsoluteTime pair as untracked NeverCull passes. Same-pipe compute
@@ -728,6 +752,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	{
 		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScanSumsCS::FParameters>();
 		Params->BlockSums = GraphBuilder.CreateUAV(BlockSumsRDG);
+		Params->SortedCount = GraphBuilder.CreateUAV(SortedCountRDG);
 		TShaderMapRef<FVoxelFluidScanSumsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.ScanSums"),
 		                             Shader, Params, FIntVector(1, 1, 1)); // one group, by design
@@ -743,33 +768,37 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	{
 		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScatterCS::FParameters>();
 		Params->SimSlotCount = Slots;
+		Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
 		Params->CellStarts = GraphBuilder.CreateUAV(CellStartsRDG);
 		Params->CellEntries = GraphBuilder.CreateUAV(CellEntriesRDG);
 		Params->ParticleCellHash = GraphBuilder.CreateUAV(CellHashRDG);
 		Params->ParticleCellRank = GraphBuilder.CreateUAV(CellRankRDG);
+		Params->OutPositions = GraphBuilder.CreateUAV(SortedA); // seeds the sorted ping-pong
 		TShaderMapRef<FVoxelFluidScatterCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.Scatter"),
 		                             Shader, Params, GroupsForSlots(Slots));
 	}
 
 	// ---- passes 9..: constraint iterations --------------------------------
-	// Ping-pong: iteration 0 reads the grid predictions (G) and writes A;
-	// after that A<->B. Neighbour topology stays frozen against G throughout
-	// (see the shader's DensityLambda header comment).
+	// SORTED-SPACE ping-pong (the perf pass): the scatter seeded SortedA with
+	// cell-grouped (position + frozen key) entries; iteration 0 reads A and
+	// writes B, then B<->A. Neighbour topology stays frozen throughout -- it
+	// rides in each entry's w lane, which DeltaPos copies forward -- so no
+	// kernel here binds the slot-space predictions at all. Thread bounds are
+	// the GPU-side SortedCount; the dispatch width stays the slot bound
+	// (sorted count <= slots always, extra lanes early-out on one cached read).
 	const float RestDensity = ComputeRestDensity();
-	FRDGBufferRef CurIn = PredictedG;
-	FRDGBufferRef CurOut = PredictedA;
+	FRDGBufferRef CurIn = SortedA;
+	FRDGBufferRef CurOut = SortedB;
 	for (int32 It = 0; It < Args.Iterations; ++It)
 	{
 		{
 			auto* Params = GraphBuilder.AllocParameters<FVoxelFluidDensityLambdaCS::FParameters>();
-			Params->SimSlotCount = Slots;
 			Params->RestDensity = RestDensity;
-			Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
 			Params->InPositions = GraphBuilder.CreateSRV(CurIn);
 			Params->InCellStarts = GraphBuilder.CreateSRV(CellStartsRDG);
 			Params->InCellCounts = GraphBuilder.CreateSRV(CellCountsRDG);
-			Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
+			Params->InSortedCount = GraphBuilder.CreateSRV(SortedCountRDG);
 			Params->Lambdas = GraphBuilder.CreateUAV(LambdasRDG);
 			TShaderMapRef<FVoxelFluidDensityLambdaCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 			FComputeShaderUtils::AddPass(GraphBuilder,
@@ -778,14 +807,12 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		}
 		{
 			auto* Params = GraphBuilder.AllocParameters<FVoxelFluidDeltaPosCS::FParameters>();
-			Params->SimSlotCount = Slots;
 			Params->RestDensity = RestDensity;
-			Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
 			Params->InPositions = GraphBuilder.CreateSRV(CurIn);
 			Params->InLambdas = GraphBuilder.CreateSRV(LambdasRDG);
 			Params->InCellStarts = GraphBuilder.CreateSRV(CellStartsRDG);
 			Params->InCellCounts = GraphBuilder.CreateSRV(CellCountsRDG);
-			Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
+			Params->InSortedCount = GraphBuilder.CreateSRV(SortedCountRDG);
 			Params->OutPositions = GraphBuilder.CreateUAV(CurOut);
 			Args.Occupancy->BindShaderParameters(GraphBuilder, *Params);
 			TShaderMapRef<FVoxelFluidDeltaPosCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
@@ -793,7 +820,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 			                             RDG_EVENT_NAME("VoxelFluid.DeltaPos(it %d)", It),
 			                             Shader, Params, GroupsForSlots(Slots));
 		}
-		const FRDGBufferRef Next = (CurOut == PredictedA) ? PredictedB : PredictedA;
+		const FRDGBufferRef Next = CurIn;
 		CurIn = CurOut;
 		CurOut = Next;
 	}
@@ -801,7 +828,6 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	// ---- pass: finalize ----------------------------------------------------
 	{
 		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidFinalizeCS::FParameters>();
-		Params->SimSlotCount = Slots;
 		Params->Dt = Args.Dt;
 		Params->BoundaryHalfExtentUU = Args.BoundaryHalfExtentUU;
 		Params->BoundaryCenterLocalUU = Args.BoundaryCenterLocalUU;
@@ -810,6 +836,8 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->BasinBoxMaxLocalUU = Args.BasinBoxMaxLocalUU;
 		Params->BasinDatumZLocalUU = Args.BasinDatumZLocalUU;
 		Params->InPositions = GraphBuilder.CreateSRV(CurIn);
+		Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
+		Params->InSortedCount = GraphBuilder.CreateSRV(SortedCountRDG);
 		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
 		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
 		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);

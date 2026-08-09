@@ -266,6 +266,10 @@ struct FVoxelFluidLifecycle
 	bool bFaucetGatherEverRan = false;
 	double NextFaucetRefreshSeconds = 0.0;
 	uint64 HeadFaucetParticlesEmitted = 0;
+	// Discharge the window could not afford as particles, routed through the
+	// scalar graph instead (backpressure). Units are ledger units (1/255 vox).
+	int64 FaucetVirtualUnitsRouted = 0;
+	int64 FaucetVirtualUnitsRefused = 0;
 
 	// --- sill faucets (spill events owed to the fluid) ----------------------
 	struct FSillFaucet
@@ -1139,6 +1143,37 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		// overflow is RE-CARRIED, never dropped.
 		if (bFaucets)
 		{
+			// POPULATION BACKPRESSURE, learned from the first faucet demo. The
+			// 21 headwaters near the wet trunk legitimately carry ~8 m^3/s --
+			// the emission maths was RIGHT -- but a 51 m window cannot hold a
+			// real river's throughput: the buffer pinned at its 307k cap, the
+			// sim hit 857 ms/frame, and the choked sim never advanced the flow
+			// far enough to drain out the boundary. So faucets throttle as the
+			// alive count approaches a soft ceiling, and the discharge that is
+			// NOT emitted as particles is routed AROUND the window as scalar
+			// graph inflow at the faucet's own cell -- the water still flows,
+			// the ledgers still close, and the particles only ever model the
+			// share of the river the window can afford to carry. Virtualised
+			// litres are counted (FaucetVirtualLitres) so the perf line can
+			// say how much of the river is scalar right now.
+			// (Local fetch: the function-scope snapshot is taken further down,
+			// after spawn assembly. One extra lock per tick; the ramp only
+			// needs a value at most a readback-latency stale, which any landed
+			// snapshot is anyway.)
+			const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
+			const uint32 AliveNow = Snapshot.bValid ? Snapshot.Alive : 0u;
+			const uint32 SoftCap = uint32(VoxelFluidSim::kMaxParticles / 2);      // 153k
+			const uint32 RampWidth = SoftCap / 2;                                  // full->zero over 76k
+			float EmitScale = 1.0f;
+			if (AliveNow >= SoftCap)
+			{
+				EmitScale = 0.0f;
+			}
+			else if (AliveNow + RampWidth > SoftCap)
+			{
+				EmitScale = float(SoftCap - AliveNow) / float(RampWidth);
+			}
+
 			const int64 DtMicros = int64(double(DeltaTime) * 1.0e6);
 			const int64 DefaultQ = int64(FMath::Max(0.0f, CVarVoxelFluidFaucetDefaultQ.GetValueOnGameThread()));
 			for (FVoxelFluidLifecycle::FHeadFaucet& F : L.HeadFaucets)
@@ -1149,11 +1184,28 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				{
 					continue;
 				}
-				const int64 Emit = FMath::Min(Owed, int64(Budget));
-				if (Emit < Owed)
+				const int64 Wanted = int64(double(Owed) * EmitScale);
+				const int64 Emit = FMath::Min(Wanted, int64(Budget));
+				const int64 Virtual = Owed - Emit;
+				if (Virtual > 0)
 				{
-					// Give the un-emitted remainder back to the accumulator.
-					F.Acc.carry += (Owed - Emit) * vxc::kFluidFaucetCarryPerParticle;
+					// Not carried, ROUTED: carrying builds unbounded debt the
+					// window can never repay (the river never stops). The
+					// surplus flows through the scalar graph instead, injected
+					// at the faucet's own cell; refusal (no graph armed) is
+					// counted, not lost silently.
+					UVoxelWaterSubsystem* WaterNow =
+						GetWorld() ? GetWorld()->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
+					const int64 VirtualUnits = vxc::fluidParticleUnits(Virtual);
+					int64 Accepted = 0;
+					if (WaterNow != nullptr)
+					{
+						Accepted = WaterNow->InjectRiverInflowNearVoxel(
+							int64(F.WorldPos.X / 10.0), int64(F.WorldPos.Y / 10.0),
+							VirtualUnits, kBoundaryInjectReachMm);
+					}
+					L.FaucetVirtualUnitsRouted += Accepted;
+					L.FaucetVirtualUnitsRefused += (VirtualUnits - Accepted);
 				}
 				if (Emit <= 0)
 				{

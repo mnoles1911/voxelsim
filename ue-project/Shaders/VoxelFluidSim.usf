@@ -29,6 +29,10 @@
 //      because its output is digested; this sim's output is pixels, and the
 //      density sum over a neighbourhood contains the same terms whatever their
 //      order, so the divergence is float-summation ulps, not structure.
+//      (The perf pass added CELL-SORTED position arrays, built from these same
+//      ranks -- see FluidScatterMain. That groups entries by cell for memory
+//      locality; it does NOT fix the order within a cell, so this posture is
+//      unchanged.)
 //   2. ParticleCounts is maintained by InterlockedAdd. Counter VALUES are
 //      exact (integer atomics); only the order of increments varies.
 // The prefix-sum over cell counts, by contrast, follows the house 3-kernel
@@ -162,14 +166,24 @@ RWStructuredBuffer<FVoxelFluidParticle> ParticlesRW;
 RWStructuredBuffer<uint> ParticleCounts;
 
 // Solver-internal, all transient except FreeList/SlotCounters:
-// Predicted positions. xyz = position (origin-relative UU), w = 1 alive / 0
-// dead -- carried in w so the grid and constraint kernels never need to touch
-// the particle buffer for liveness.
+// Position buffers. TWO ADDRESS SPACES share these declarations, per pass:
+//   SLOT space (FluidIntegrateMain writes OutPositions; the grid-build
+//   kernels read it back as GridPositions): xyz = predicted position
+//   (origin-relative UU), w = 1 alive / 0 dead -- liveness carried in w so
+//   the grid kernels never touch the particle buffer.
+//   SORTED space (FluidScatterMain writes OutPositions; the constraint
+//   ping-pong and FluidFinalizeMain read/write it after that): entries are
+//   CELL-GROUPED in CellStarts order; xyz = position, w = asfloat(packed
+//   frozen cell key -- FluidPackCellKey). Dead slots never scatter, so every
+//   sorted entry is alive and the w lane is free for the key. That one lane
+//   is what lets the gather kernels read a single contiguous float4 per
+//   candidate where they used to read entry id + GridPositions + position
+//   (36 B, hash-scatter order) -- the measured 100k cost lived there.
 RWStructuredBuffer<float4> OutPositions;
 StructuredBuffer<float4>   InPositions;
-// The iteration-0 predictions the grid was built from. Neighbour TOPOLOGY is
-// frozen against these for all constraint iterations (standard PBF: the grid
-// is built once per step); only distances use the current iterate.
+// Slot-space predictions the grid was built from (read by the grid build and
+// the scatter's sorted-copy; the constraint kernels no longer bind it --
+// their frozen topology rides in the sorted w lane).
 StructuredBuffer<float4>   GridPositions;
 
 RWStructuredBuffer<uint>  CellCounts;        // [HASH_CELLS] occupancy
@@ -181,8 +195,13 @@ RWStructuredBuffer<uint>  ParticleCellRank;  // [MAX_PARTICLES] within-bucket ra
 StructuredBuffer<uint>    InCellStarts;      // read-only bindings for the gather kernels
 StructuredBuffer<uint>    InCellCounts;
 StructuredBuffer<uint>    InCellEntries;
-RWStructuredBuffer<float> Lambdas;           // [MAX_PARTICLES]
+RWStructuredBuffer<float> Lambdas;           // [MAX_PARTICLES], SORTED index space
 StructuredBuffer<float>   InLambdas;
+// Number of entries in the sorted arrays this frame == hashed (alive)
+// particles. One uint, written by FluidScanSumsMain (the kernel that has the
+// total in hand for free), read by every sorted-domain kernel as its bound.
+RWStructuredBuffer<uint>  SortedCount;       // [1]
+StructuredBuffer<uint>    InSortedCount;
 
 // Persistent slot allocator (see FluidSpawnMain):
 //   FreeList     [MAX_PARTICLES] slot ids returned by despawn
@@ -223,13 +242,58 @@ int3 FluidCellCoord(float3 posUU)
 	return int3(floor(posUU / VOXEL_FLUID_KERNEL_H_UU));
 }
 
-// Teschner et al. spatial hash. Buckets can collide; every gather kernel
-// filters entries by exact cell coord (see FluidDensityLambdaMain), so a
+// Frozen-cell key: cell coords masked to 10 bits per axis and packed into 30
+// bits. The mask is the IDENTITY for every cell the live volume can produce
+// (positions in [0, 5120] UU are cells 0..204; transient out-of-box
+// predictions stay orders of magnitude inside 1024 cells), and two distinct
+// cells only share a key at >= 1024 cells (25,600 UU) apart -- 5x the whole
+// active volume -- so comparing keys is an EXACT cell-equality test for any
+// two particles that could ever share a hash bucket. The key rides in the
+// sorted position's w lane (see the buffer comment above).
+uint FluidPackCellKey(int3 c)
+{
+	return (uint(c.x) & 0x3ffu)
+	     | ((uint(c.y) & 0x3ffu) << 10)
+	     | ((uint(c.z) & 0x3ffu) << 20);
+}
+
+// Neighbour key: per-axis +/-1 in masked coordinate space. uint(dx) wraps
+// -1 to 0xffffffff, the add wraps mod 2^32 and the mask reduces mod 1024 --
+// exactly the arithmetic FluidPackCellKey applied, so
+// FluidOffsetCellKey(pack(c), d) == pack(c + d) always.
+uint FluidOffsetCellKey(uint key, int dx, int dy, int dz)
+{
+	const uint x = ((key & 0x3ffu) + uint(dx)) & 0x3ffu;
+	const uint y = (((key >> 10) & 0x3ffu) + uint(dy)) & 0x3ffu;
+	const uint z = (((key >> 20) & 0x3ffu) + uint(dz)) & 0x3ffu;
+	return x | (y << 10) | (z << 20);
+}
+
+// Teschner et al. spatial hash over the MASKED coords (so hashing a cell and
+// hashing its packed key are bit-identical -- one definition below routes
+// through the other). Buckets can collide; every gather kernel filters
+// entries by exact frozen-cell KEY (see FluidDensityLambdaMain), so a
 // collision only costs candidate tests, never a wrong density.
+// DISTRIBUTION, MEASURED (this pass, offline histogram over realistic
+// occupied-cell sets -- settled 100k pool, 20^3 dam block, 6x6x200 column):
+// walked-candidate inflation from bucket collisions is ~1.09-1.13x mean,
+// which is the birthday-collision floor for ~6-8k occupied cells in 64k
+// buckets, not clustering; the 10-bit masking does not degrade it (it
+// slightly improves the tails), and a Wang-hash mix measured no better. The
+// one case that inflates (2.8x) is ~80k occupied cells -- a 200x200-cell
+// water film -- where the 64k-bucket table is simply over capacity; no hash
+// function fixes a load factor > 1.
+uint FluidHashKey(uint key)
+{
+	const uint h = ((key & 0x3ffu) * 73856093u)
+	             ^ (((key >> 10) & 0x3ffu) * 19349663u)
+	             ^ (((key >> 20) & 0x3ffu) * 83492791u);
+	return h & (VOXEL_FLUID_HASH_CELLS - 1u);
+}
+
 uint FluidHashCell(int3 c)
 {
-	const uint h = (uint(c.x) * 73856093u) ^ (uint(c.y) * 19349663u) ^ (uint(c.z) * 83492791u);
-	return h & (VOXEL_FLUID_HASH_CELLS - 1u);
+	return FluidHashKey(FluidPackCellKey(c));
 }
 
 // Wang hash -> [0,1) float triplet, for spawn jitter. Deterministic in
@@ -387,7 +451,24 @@ void FluidIntegrateMain(uint3 DTid : SV_DispatchThreadID)
 		OutPositions[i] = float4(0.0f, 0.0f, 0.0f, 0.0f); // dead: w = 0
 		return;
 	}
-	const float3 v = P.P1.xyz + float3(0.0f, 0.0f, -VOXEL_FLUID_GRAVITY_UU) * Dt;
+	float3 v = P.P1.xyz + float3(0.0f, 0.0f, -VOXEL_FLUID_GRAVITY_UU) * Dt;
+	// CFL CLAMP -- the cure for the measured death spiral, not a nicety. At
+	// 100k particles the first timed run read simGpuMs p50 20.7 with a ~51 ms
+	// settled tail: a slow frame grows Dt, big Dt drives particles deep into
+	// each other before three constraint iterations can answer, over-dense
+	// clusters balloon every neighbour gather, the frame gets slower, Dt
+	// grows again. Bounding the per-step travel to 0.4h breaks the loop at
+	// its first link: no step may create overlap deeper than the constraint
+	// solver comfortably resolves. Waterfalls still fall -- 0.4h/step at the
+	// clamped 1/30 s floor is 3 m/s of resolved motion, and anything faster
+	// is slowed, never tunnelled (same doctrine as the collision walk).
+	const float maxStepUU = 0.4f * VOXEL_FLUID_KERNEL_H_UU;
+	const float velCapUU = maxStepUU / max(Dt, 1e-4f);
+	const float speed = length(v);
+	if (speed > velCapUU)
+	{
+		v *= velCapUU / speed;
+	}
 	const float3 p = P.P0.xyz + v * Dt;
 	OutPositions[i] = float4(p, 1.0f);
 }
@@ -475,6 +556,16 @@ void FluidScanSumsMain(uint3 GTid : SV_GroupThreadID)
 		GroupMemoryBarrierWithGroupSync();
 	}
 
+	// The last lane's INCLUSIVE sum is the grand total over CellCounts == the
+	// number of hashed (alive) particles == the sorted arrays' length this
+	// frame. Published from here because this kernel has it in hand for free;
+	// every sorted-domain kernel reads it as its thread bound.
+	if (g == VOXEL_FLUID_SCAN_BLOCK - 1u)
+	{
+		// lint-shader-ub: allow UNGUARDED_WRITE - SortedCount is a one-element buffer and 0 is its only index
+		SortedCount[0] = FluidScanShared[g];
+	}
+
 	BlockSums[g] = FluidScanShared[g] - v;
 }
 
@@ -489,6 +580,18 @@ void FluidScanAddMain(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
 }
 
 // ---- kernel: scatter -------------------------------------------------------
+// Two jobs in one pass over the slots:
+//   1. CellEntries[sorted] = slot -- the sorted -> slot map FluidFinalizeMain
+//      writes corrections back through.
+//   2. THE SORTED POSITION ARRAY: each hashed particle's predicted position
+//      is copied to its sorted location with its packed frozen cell key in w.
+//      This is the cure for the measured gather cost: after this pass the
+//      constraint kernels never touch a slot-indexed buffer again -- every
+//      neighbourhood is a handful of contiguous float4 runs, and adjacent
+//      sorted threads walk almost the same runs.
+// The sorted write is a scatter (random destination), but it happens ONCE per
+// frame per particle (1.6 MB at 100k) versus the hundreds of reads per
+// particle it converts from random to contiguous.
 [numthreads(VOXEL_FLUID_GROUP, 1, 1)]
 void FluidScatterMain(uint3 DTid : SV_DispatchThreadID)
 {
@@ -502,41 +605,59 @@ void FluidScatterMain(uint3 DTid : SV_DispatchThreadID)
 	{
 		return;
 	}
-	CellEntries[CellStarts[h] + ParticleCellRank[i]] = i;
+	// dst < total hashed particles by the scan's construction (rank < the
+	// cell's count, CellStarts is the exclusive sum of the counts), and the
+	// buffers are sized MAX_PARTICLES >= that total.
+	const uint dst = CellStarts[h] + ParticleCellRank[i];
+	// lint-shader-ub: allow UNGUARDED_WRITE - dst bounded by the scan: rank < cell count, start is the exclusive prefix, buffers sized MAX_PARTICLES
+	CellEntries[dst] = i;
+	const float4 gp = GridPositions[i];
+	// lint-shader-ub: allow UNGUARDED_WRITE - same dst bound as the CellEntries write above
+	OutPositions[dst] = float4(gp.xyz, asfloat(FluidPackCellKey(FluidCellCoord(gp.xyz))));
 }
 
 // ---- kernel: density + lambda ----------------------------------------------
 // rho_i = sum_j W_poly6(|p_i - p_j|); C_i = rho_i / rho0 - 1;
 // lambda_i = -C_i / (sum_k |grad_k C_i|^2 + eps).   (Macklin-Mueller eq. 9-11)
 //
-// Neighbour topology comes from GridPositions (the iteration-0 predictions
-// the grid was built over); distances use InPositions (the current iterate).
-// Per-iteration motion is clamped to 0.1h, so the topology stays a superset
-// of the true neighbourhood across 2-4 iterations -- h has 2.5x spacing of
-// slack (contract line 31-33).
+// SORTED DOMAIN (the perf pass). This kernel used to run one thread per SLOT
+// and chase CellEntries through hash-scatter order: 4 B entry id + 16 B
+// GridPositions (cell refilter) + 16 B InPositions per candidate, all
+// effectively random -- ~36 B of uncoalesced traffic x ~450 candidates x 6
+// gather dispatches, which is where the measured 20-28 ms p50 at 100k lived.
+// It now runs one thread per SORTED ENTRY over the cell-grouped array the
+// scatter built: each candidate is ONE contiguous float4 (position + frozen
+// cell key in w), neighbour cells are walked as index RANGES, and adjacent
+// threads are spatially adjacent particles whose 27-cell windows overlap
+// almost entirely -- the 1.6 MB iterate stays L2-resident instead of
+// thrashing DRAM.
 //
-// THE CELL-EQUALITY CHECK IS LOAD-BEARING. Two of the 27 walked cells can
-// hash to one bucket; without the check, every particle in that bucket would
-// be visited twice and counted twice into the density. Requiring the entry's
-// own cell (recomputed from the same GridPositions value the count kernel
-// hashed -- bit-identical math) to equal the cell being walked makes bucket
-// collisions cost candidate tests only.
+// Neighbour topology stays frozen against the iteration-0 predictions
+// (standard PBF): the sorted ranges WERE built from them, and each entry
+// carries its frozen cell key in w, which the ping-pong copies forward
+// untouched. Distances use the current iterate, as before; per-iteration
+// motion is clamped to 0.1h, so the topology stays a superset of the true
+// neighbourhood across 2-4 iterations -- h has 2.5x spacing of slack.
+//
+// THE KEY CHECK IS STILL LOAD-BEARING, in its cheaper form. Two of the 27
+// walked cells can hash to one bucket; without the check, every particle in
+// that bucket would be visited twice and counted twice into the density.
+// Comparing the entry's packed frozen cell key (bit-identical to what the
+// count kernel hashed -- FluidHashCell routes through FluidPackCellKey)
+// against the walked cell's key makes bucket collisions cost candidate tests
+// only, exactly as the old exact-coord compare did, for zero extra bytes.
 [numthreads(VOXEL_FLUID_GROUP, 1, 1)]
 void FluidDensityLambdaMain(uint3 DTid : SV_DispatchThreadID)
 {
-	const uint i = DTid.x;
-	if (i >= SimSlotCount)
+	const uint s = DTid.x;
+	if (s >= InSortedCount[0])
 	{
-		return;
-	}
-	if (GridPositions[i].w == 0.0f)
-	{
-		Lambdas[i] = 0.0f;
-		return;
+		return; // beyond the live sorted range (dead slots never scatter)
 	}
 
-	const float3 pi = InPositions[i].xyz;
-	const int3 baseCell = FluidCellCoord(GridPositions[i].xyz);
+	const float4 self = InPositions[s];
+	const float3 pi = self.xyz;
+	const uint baseKey = asuint(self.w);
 	const float h2 = VOXEL_FLUID_KERNEL_H_UU * VOXEL_FLUID_KERNEL_H_UU;
 
 	float density = 0.0f;
@@ -547,25 +668,26 @@ void FluidDensityLambdaMain(uint3 DTid : SV_DispatchThreadID)
 	for (int dy = -1; dy <= 1; ++dy)
 	for (int dx = -1; dx <= 1; ++dx)
 	{
-		const int3 nc = baseCell + int3(dx, dy, dz);
-		const uint bucket = FluidHashCell(nc);
+		const uint nKey = FluidOffsetCellKey(baseKey, dx, dy, dz);
+		const uint bucket = FluidHashKey(nKey);
 		const uint start = InCellStarts[bucket];
 		const uint count = InCellCounts[bucket];
 		for (uint k = 0u; k < count; ++k)
 		{
-			const uint j = InCellEntries[start + k];
-			if (any(FluidCellCoord(GridPositions[j].xyz) != nc))
+			const uint j = start + k;
+			const float4 pj = InPositions[j];
+			if (asuint(pj.w) != nKey)
 			{
 				continue; // bucket collision: entry belongs to a different cell
 			}
-			const float3 d = pi - InPositions[j].xyz;
+			const float3 d = pi - pj.xyz;
 			const float r2 = dot(d, d);
 			if (r2 >= h2)
 			{
 				continue;
 			}
 			density += FluidPoly6(r2);
-			if (j != i)
+			if (j != s)
 			{
 				const float3 g = FluidSpikyGrad(d, r2) / RestDensity;
 				gradSelf += g;
@@ -576,30 +698,28 @@ void FluidDensityLambdaMain(uint3 DTid : SV_DispatchThreadID)
 	sumGrad2 += dot(gradSelf, gradSelf);
 
 	const float C = density / RestDensity - 1.0f;
-	Lambdas[i] = -C / (sumGrad2 + VOXEL_FLUID_CFM_EPSILON);
+	Lambdas[s] = -C / (sumGrad2 + VOXEL_FLUID_CFM_EPSILON);
 }
 
 // ---- kernel: position correction -------------------------------------------
 // dp_i = (1/rho0) * sum_j (lambda_i + lambda_j + s_corr) grad W_spiky(p_i-p_j)
 // then the collision resolve.                        (Macklin-Mueller eq. 12-14)
+// Sorted domain, same shape as FluidDensityLambdaMain (see its header for the
+// whole story); lambdas are sorted-indexed too, so the extra read per REAL
+// neighbour is 4 contiguous bytes. The output carries the frozen cell key
+// forward in w -- the ping-pong must never lose the topology.
 [numthreads(VOXEL_FLUID_GROUP, 1, 1)]
 void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 {
-	const uint i = DTid.x;
-	if (i >= SimSlotCount)
+	const uint s = DTid.x;
+	if (s >= InSortedCount[0])
 	{
 		return;
 	}
-	const float4 self = InPositions[i];
-	if (GridPositions[i].w == 0.0f)
-	{
-		OutPositions[i] = self; // dead slots ride through unchanged (w stays 0)
-		return;
-	}
-
+	const float4 self = InPositions[s];
 	const float3 pi = self.xyz;
-	const float lambdaI = InLambdas[i];
-	const int3 baseCell = FluidCellCoord(GridPositions[i].xyz);
+	const uint baseKey = asuint(self.w);
+	const float lambdaI = InLambdas[s];
 	const float h2 = VOXEL_FLUID_KERNEL_H_UU * VOXEL_FLUID_KERNEL_H_UU;
 	const float wDq = FluidPoly6(VOXEL_FLUID_SCORR_DQ2);
 
@@ -609,22 +729,23 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 	for (int dy = -1; dy <= 1; ++dy)
 	for (int dx = -1; dx <= 1; ++dx)
 	{
-		const int3 nc = baseCell + int3(dx, dy, dz);
-		const uint bucket = FluidHashCell(nc);
+		const uint nKey = FluidOffsetCellKey(baseKey, dx, dy, dz);
+		const uint bucket = FluidHashKey(nKey);
 		const uint start = InCellStarts[bucket];
 		const uint count = InCellCounts[bucket];
 		for (uint k = 0u; k < count; ++k)
 		{
-			const uint j = InCellEntries[start + k];
-			if (j == i)
+			const uint j = start + k;
+			if (j == s)
 			{
 				continue;
 			}
-			if (any(FluidCellCoord(GridPositions[j].xyz) != nc))
+			const float4 pj = InPositions[j];
+			if (asuint(pj.w) != nKey)
 			{
 				continue;
 			}
-			const float3 d = pi - InPositions[j].xyz;
+			const float3 d = pi - pj.xyz;
 			const float r2 = dot(d, d);
 			if (r2 >= h2)
 			{
@@ -646,7 +767,7 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 	}
 
 	const float3 corrected = FluidResolveCollision(pi + dp, pi);
-	OutPositions[i] = float4(corrected, 1.0f);
+	OutPositions[s] = float4(corrected, self.w); // w: frozen key rides along
 }
 
 // ---- kernel: finalize ------------------------------------------------------
@@ -666,14 +787,25 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 //      credits the lake rather than leaking into the graph;
 //   4. boundary despawn (left the active box) -> flag, counter, free list;
 //   5. survivors count into ParticleCounts[0] and write back position+velocity.
+//
+// SORTED DOMAIN: one thread per sorted entry, mapped back to its slot through
+// CellEntries (the sorted -> slot map the scatter built). Alive slots and
+// sorted entries are the same set by construction -- every alive slot was
+// hashed (integrate marks w=1 exactly for alive flags) and every hashed slot
+// scattered exactly once -- so the conservation counting is per-slot
+// identical to the slot-domain original; the flag check below is defensive,
+// not load-bearing. The ParticlesRW reads/writes are slot-indexed (random
+// order) exactly as before: that traffic is once per particle per frame and
+// the contract's AoS layout is not this file's to change.
 [numthreads(VOXEL_FLUID_GROUP, 1, 1)]
 void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 {
-	const uint i = DTid.x;
-	if (i >= SimSlotCount)
+	const uint s = DTid.x;
+	if (s >= InSortedCount[0])
 	{
 		return;
 	}
+	const uint i = InCellEntries[s]; // slot ids < SimSlotCount, by the hash-count dispatch bound
 	FVoxelFluidParticle P = ParticlesRW[i];
 	uint flags = asuint(P.P0.w);
 	if ((flags & VOXEL_FLUID_FLAG_ALIVE) == 0u)
@@ -681,7 +813,7 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		return;
 	}
 
-	float3 pNew = InPositions[i].xyz;
+	float3 pNew = InPositions[s].xyz;
 	float3 pOld = P.P0.xyz;
 #if VOXEL_FLUID_HAS_COLLISION
 	{
@@ -718,6 +850,7 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		FreeList[top] = i;
 		P.P0 = float4(pNew, asfloat(flags));
 		P.P1 = float4(v, P.P1.w);
+		// lint-shader-ub: allow UNGUARDED_WRITE - i is a slot id from CellEntries, which the scatter only fills with ids below the hash-count dispatch bound (SimSlotCount <= MAX_PARTICLES)
 		ParticlesRW[i] = P;
 		return;
 	}
@@ -735,6 +868,7 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		FreeList[top] = i;
 		P.P0 = float4(pNew, asfloat(flags));
 		P.P1 = float4(v, P.P1.w);
+		// lint-shader-ub: allow UNGUARDED_WRITE - same CellEntries slot-id bound as the basin write above
 		ParticlesRW[i] = P;
 		return;
 	}
@@ -742,5 +876,6 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 	InterlockedAdd(ParticleCounts[0], 1u); // alive
 	P.P0 = float4(pNew, asfloat(flags));
 	P.P1 = float4(v, P.P1.w);
+	// lint-shader-ub: allow UNGUARDED_WRITE - same CellEntries slot-id bound as the basin write above
 	ParticlesRW[i] = P;
 }
