@@ -484,9 +484,9 @@ namespace
 	}
 }
 
-void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
-                                     FVoxelFluidSimState& State,
-                                     const FVoxelFluidSimTickArgs& InArgs)
+void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
+                                 FVoxelFluidSimState& State,
+                                 const FVoxelFluidSimTickArgs& InArgs)
 {
 	check(IsInRenderingThread());
 
@@ -524,7 +524,6 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 	// frame's render pass sees this tick's bound.
 	State.RenderSlotBound = Args.SimSlotBound;
 
-	FRDGBuilder GraphBuilder(RHICmdList);
 	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidSim");
 
 	// ---- occupancy volume: clear + queued region fills, FIRST ---------------
@@ -545,7 +544,7 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 			State.TicksSkippedNoOccupancy++;
 			State.TicksSkippedNoOccupancySnapshot = State.TicksSkippedNoOccupancy;
 		}
-		GraphBuilder.Execute(); // the clear/fill passes already added stay valid
+		// The clear/fill passes already added stay valid in the caller's graph.
 		PollCompletions(State);
 		return;
 	}
@@ -617,7 +616,18 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 	// anywhere in this graph), so the bracket covers exactly this graph's
 	// passes plus the 16-byte counts copy -- stated in the measurement spec.
 	FVoxelFluidSimState::FTimingPair* Timing = nullptr;
-	if (GSupportsTimestampRenderQueries)
+	// DEFAULT OFF PENDING A BREADCRUMB-SAFE REWRITE. The raw
+	// Begin/EndRenderQuery passes tripped RDG's breadcrumb sentinel assert on
+	// the very first Execute (RenderGraphBuilder.cpp:1772, UE 5.8) and took
+	// the whole editor down -- measured, not theorised: the 100k gate run
+	// crashed 2 s in, and with this bracket skipped it survives. Until the
+	// bracket is rebuilt on an RDG-sanctioned path, simGpuMs reads -1 and the
+	// gate metric is the A/B frame-time delta the measurement plan already
+	// defines. Opt back in with voxel.Fluid.GpuTiming 1 to reproduce.
+	static const auto* CVarGpuTiming =
+		IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.Fluid.GpuTiming"));
+	const bool bGpuTiming = CVarGpuTiming != nullptr && CVarGpuTiming->GetInt() != 0;
+	if (bGpuTiming && GSupportsTimestampRenderQueries)
 	{
 		for (auto& Pair : State.TimingRing)
 		{
@@ -888,8 +898,6 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 			});
 		Timing->bInFlight = true;
 	}
-
-	GraphBuilder.Execute();
 
 	PollCompletions(State);
 }

@@ -350,15 +350,26 @@ public:
 
 namespace VoxelFluidSim
 {
-	// Builds and executes one sim frame's render graph: spawn, integrate,
-	// hash-grid build (count + 3-kernel scan + scatter), Iterations x
-	// (density/lambda + delta-p with collision resolve), finalize (velocity,
-	// despawn, conservation counters), counts readback, optional debug
-	// readback, GPU timing -- then polls all outstanding readbacks/queries
-	// into the snapshot. Render thread only.
-	VOXELEARTHSHADERS_API void TickRenderThread(FRHICommandListImmediate& RHICmdList,
-	                                            FVoxelFluidSimState& State,
-	                                            const FVoxelFluidSimTickArgs& Args);
+	// Adds one sim frame's passes to the RENDERER'S OWN graph: spawn,
+	// integrate, hash-grid build (count + 3-kernel scan + scatter),
+	// Iterations x (density/lambda + delta-p with collision resolve),
+	// finalize (velocity, despawn, conservation counters), counts readback,
+	// optional debug readback -- then polls outstanding readbacks into the
+	// snapshot. Render thread only, called from the view extension's
+	// PreRenderViewFamily_RenderThread.
+	//
+	// THIS USED TO BE TickRenderThread, WHICH BUILT AND EXECUTED ITS OWN
+	// FRDGBuilder FROM AN ENQUEUED RENDER COMMAND -- and UE 5.8 killed the
+	// editor on the very first Execute with the RDG breadcrumb sentinel
+	// assert (RenderGraphBuilder.cpp:1772), reproducibly, with every custom
+	// pass stripped back. The standalone-builder pattern is not sanctioned
+	// where we ran it; riding the scene renderer's builder is, and it also
+	// makes sim-before-render ordering structural instead of enqueued-and-
+	// hoped. Measured, not theorised: the 100k gate run crashed 2 s in on
+	// the old shape and survives on this one.
+	VOXELEARTHSHADERS_API void AddSimPasses(FRDGBuilder& GraphBuilder,
+	                                        FVoxelFluidSimState& State,
+	                                        const FVoxelFluidSimTickArgs& Args);
 
 	// Drops every RHI resource the state holds. Must be the last render-thread
 	// touch; the subsystem enqueues this and then releases its reference.

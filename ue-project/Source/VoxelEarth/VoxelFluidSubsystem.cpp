@@ -130,6 +130,14 @@ namespace
 		TEXT("(the bv23 fallback carries no Q). Default 8e6 ~= 253 particles/s."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<int32> CVarVoxelFluidGpuTiming(
+		TEXT("voxel.Fluid.GpuTiming"), 0,
+		TEXT("EXPERIMENTAL: raw render-query GPU timing bracket around the fluid "
+		     "graph. Crashed RDG's breadcrumb assert on first Execute in UE 5.8; "
+		     "off until rebuilt on a sanctioned path. The gate metric is the A/B "
+		     "frame-time delta while this is off."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<int32> CVarVoxelFluidMaxSpawnPerTick(
 		TEXT("voxel.Fluid.MaxSpawnPerTick"), 4096,
 		TEXT("Shared per-tick particle budget for ALL lifecycle emission (camera ")
@@ -971,9 +979,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	Super::Tick(DeltaTime);
 
 	UWorld* World = GetWorld();
-	if (World == nullptr || !Lifecycle.IsValid())
+	if (World == nullptr)
 	{
 		return;
+	}
+	// CREATE, do not gate. Lifecycle was only ever constructed inside
+	// ReleaseSimState() -- the DISABLE path -- so on the first tick it was null
+	// and this function returned silently forever: voxel.Fluid.Enable 1 did
+	// nothing, no perf line, no error. The measurement harness's NOT-RUN rule
+	// is what caught it. A missing member on the happy path is constructed,
+	// not treated as "not applicable".
+	if (!Lifecycle.IsValid())
+	{
+		Lifecycle = MakeUnique<FVoxelFluidLifecycle>();
 	}
 
 	if (CVarVoxelFluidEnable.GetValueOnGameThread() == 0)
@@ -1194,14 +1212,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	// sim-state pointer, so an Enable-cycle (new sim state object) re-links
 	// automatically and a cvar flip to 0 turns the passes off next frame.
 	const bool bRenderCVarOn = CVarVoxelFluidRender.GetValueOnGameThread() != 0;
-	if (bRenderCVarOn && !L.RenderExtension.IsValid())
+	// The extension is created whenever the FLUID runs, not only when the
+	// renderer cvar is on: it now carries the solver's passes too (the sim
+	// rides the renderer's graph via PreRenderViewFamily -- see AddSimPasses'
+	// comment for the standalone-builder crash that forced this). Rendering
+	// stays gated inside the extension by Settings.bEnabled.
+	if (!L.RenderExtension.IsValid())
 	{
 		L.RenderState = MakeShared<FVoxelFluidRenderState, ESPMode::ThreadSafe>();
 		L.RenderExtension = FSceneViewExtensions::NewExtension<FVoxelFluidRenderExtension>(
 			World, L.RenderState);
 		UE_LOG(LogVoxelFluid, Display,
-		       TEXT("Fluid renderer registered (scene view extension, PrePostProcessPass; ")
-		       TEXT("passes visible in ProfileGPU as VoxelFluidRender.*)"));
+		       TEXT("Fluid view extension registered (sim passes at PreRenderViewFamily, ")
+		       TEXT("render passes at PrePostProcessPass; ProfileGPU: VoxelFluidSim/-Render.*)"));
 	}
 	if (L.RenderState.IsValid())
 	{
@@ -1279,15 +1302,17 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			bDebugDraw && (!Snapshot.bValid || Snapshot.Alive <= kDebugDrawMaxParticles);
 		Args.DebugSlotCount = Args.SimSlotBound;
 
-		TSharedPtr<FVoxelFluidSimState, ESPMode::ThreadSafe> StatePtr = SimState;
-		TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> OccPtr = Occupancy;
-		ENQUEUE_RENDER_COMMAND(VoxelFluidSimTick)(
-			[StatePtr, OccPtr, Args](FRHICommandListImmediate& RHICmdList)
-			{
-				// OccPtr is captured for LIFETIME (Args.Occupancy is the raw
-				// pointer the tick uses); see FVoxelFluidSimTickArgs.
-				VoxelFluidSim::TickRenderThread(RHICmdList, *StatePtr, Args);
-			});
+		// Post to the mailbox; the view extension consumes it exactly once at
+		// PreRenderViewFamily and adds the passes to the renderer's graph.
+		// (The ENQUEUE_RENDER_COMMAND + own-FRDGBuilder shape that stood here
+		// crashed UE 5.8's breadcrumb assert on first Execute -- AddSimPasses'
+		// comment carries the account.)
+		{
+			FScopeLock Guard(&L.RenderState->Lock);
+			L.RenderState->PendingSimArgs = Args;
+			L.RenderState->OccupancyKeepAlive = Occupancy;
+			L.RenderState->SimState = SimState;
+		}
 	}
 
 	// ---- conservation: asserted on every readback generation ---------------

@@ -53,8 +53,10 @@
 #include "RHI.h"
 #include "SceneViewExtension.h"
 #include "Templates/SharedPointer.h"
+#include "VoxelFluidSim.h"  // FVoxelFluidSimTickArgs -- the sim-tick mailbox
 
 class FVoxelFluidSimState;
+class FVoxelFluidOccupancyVolume;
 
 // Game-thread-authored, render-thread-consumed settings. Marshalled by value
 // under FVoxelFluidRenderState::Lock every subsystem tick; the render thread
@@ -120,6 +122,18 @@ public:
 	// the renderer to the new buffers automatically.
 	TSharedPtr<FVoxelFluidSimState, ESPMode::ThreadSafe> SimState;
 
+	// THE SIM-TICK MAILBOX. The subsystem posts at most one FVoxelFluidSimTickArgs
+	// per game tick; PreRenderViewFamily_RenderThread consumes it exactly once
+	// and adds the sim passes to the RENDERER'S graph. This replaced an
+	// ENQUEUE_RENDER_COMMAND that built its own FRDGBuilder -- UE 5.8's RDG
+	// breadcrumb sentinel assert killed the editor on the first standalone
+	// Execute (RenderGraphBuilder.cpp:1772; see AddSimPasses' comment).
+	// Consume-once also makes multi-view-family frames sim exactly once.
+	TOptional<FVoxelFluidSimTickArgs> PendingSimArgs;
+	// Lifetime anchor for PendingSimArgs->Occupancy (a raw pointer, same
+	// pattern the old enqueue documented).
+	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> OccupancyKeepAlive;
+
 	// -- written by the render thread under Lock --
 	FVoxelFluidRenderStats Stats;
 
@@ -155,6 +169,12 @@ public:
 	virtual void SetupViewFamily(FSceneViewFamily& InViewFamily) override {}
 	virtual void SetupView(FSceneViewFamily& InViewFamily, FSceneView& InView) override {}
 	virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override {}
+	// The sim rides the renderer's graph HERE, before scene rendering, so the
+	// solver's writes are ordered before the splat pass reads them and before
+	// anything else this frame samples the water.
+	virtual void PreRenderViewFamily_RenderThread(FRDGBuilder& GraphBuilder,
+	                                              FSceneViewFamily& InViewFamily) override;
+
 	virtual void PrePostProcessPass_RenderThread(FRDGBuilder& GraphBuilder, const FSceneView& InView,
 	                                             const FPostProcessingInputs& Inputs) override;
 	//~ End ISceneViewExtension

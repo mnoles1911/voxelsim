@@ -175,7 +175,40 @@ bool FVoxelFluidRenderExtension::IsActiveThisFrame_Internal(
 		return false;
 	}
 	FScopeLock Guard(&State->Lock);
-	return State->Settings.bEnabled && State->SimState.IsValid();
+	// Render OR sim: the extension now carries the solver's passes too
+	// (PreRenderViewFamily), so a pending sim tick keeps the extension active
+	// even while voxel.Fluid.Render is 0. Each pass site early-outs on its
+	// own gate.
+	return State->SimState.IsValid()
+	       && (State->Settings.bEnabled || State->PendingSimArgs.IsSet());
+}
+
+void FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread(
+	FRDGBuilder& GraphBuilder, FSceneViewFamily& InViewFamily)
+{
+	// Consume the mailbox exactly once; a second view family this frame sims
+	// nothing (and pays nothing).
+	TOptional<FVoxelFluidSimTickArgs> Args;
+	TSharedPtr<FVoxelFluidSimState, ESPMode::ThreadSafe> Sim;
+	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> OccAnchor;
+	{
+		FScopeLock Guard(&State->Lock);
+		Sim = State->SimState;
+		if (State->PendingSimArgs.IsSet())
+		{
+			Args = State->PendingSimArgs;
+			State->PendingSimArgs.Reset();
+			OccAnchor = State->OccupancyKeepAlive;
+		}
+	}
+	if (!Args.IsSet() || !Sim.IsValid())
+	{
+		return;
+	}
+	// OccAnchor keeps Args->Occupancy alive across this scope; the raw
+	// pointer inside Args is the one the passes bind (contract: one origin,
+	// one volume).
+	VoxelFluidSim::AddSimPasses(GraphBuilder, *Sim, Args.GetValue());
 }
 
 void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
