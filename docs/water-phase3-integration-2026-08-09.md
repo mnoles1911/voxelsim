@@ -195,3 +195,176 @@ Leave C running 10+ minutes: `violations=0`, `scalarViolations=0`,
 `spillRefunded + emitted` closing against `spillClaimed`, then
 `voxel.Fluid.Enable 0` and read the teardown line (refunds + any stated LOST
 units).
+
+---
+
+## Addendum: spike (b) / Phase 4 — the screen-space fluid renderer (2026-08-09)
+
+Appended by the renderer build; everything above is the integrator's and is
+unchanged. This section records what was built, the compositing decision and
+its evidence, the offline verification, and the measurement runs the
+integrator should do (captures judged by the owner, standing rule).
+
+### What was built
+
+`voxel.Fluid.Render 1` (default **0** — off; `DebugDraw` points remain the
+fallback view) draws the alive particles as a smooth fluid surface:
+depth splat → separable bilateral smooth → normals → Beer–Lambert +
+constant-sky Fresnel shade → composite against the **opaque** scene depth.
+Particles never touch the voxel mesher. Files:
+
+- `ue-project/Shaders/VoxelFluidRender.usf` — the five kernels + the mirrored
+  material law (every shading constant cites its line in
+  `Tools/create_water_voxel_material.py`).
+- `Source/VoxelEarthShaders/Public/VoxelFluidRender.h` + `Private/VoxelFluidRender.cpp`
+  — the scene-view extension, pass builder, GPU timing.
+- `VoxelFluidSim.h/.cpp` — one surgical addition: `RenderSlotBound`
+  (render-thread published splat width; the renderer reads `Particles` + this
+  and nothing else of the sim state).
+- `VoxelFluidSubsystem.cpp` — cvars, per-tick settings marshal (fluid origin,
+  sun from `UVoxelSkySubsystem`, radii), teardown ordering, `renderMs` in the
+  perf line.
+
+### The compositing hook, and the evidence for it
+
+**Chosen: `FSceneViewExtensionBase::PrePostProcessPass_RenderThread`** (via
+`FWorldSceneViewExtension`, registered lazily by the subsystem) — the
+project's first post-opaque render hook.
+
+- It is the engine's sanctioned "add RDG passes against scene textures" seam;
+  UE 5.8 engine plugins ship on this exact override (verified in this box's
+  tree: `ColorCorrectRegions`, `CompositeCore`, `PostProcessMaterialChainGraph`).
+- It runs after all scene rendering, before post processing — the fluid
+  tone-maps/blooms with the scene like the shipped water material does, and
+  the opaque depth is final.
+- One deviation from the naive recipe, found the hard way: the hook's
+  `FPostProcessingInputs` argument is **Renderer/Internal** and does not
+  compile from a project-scope module (UBT exposes `Internal/` includes only
+  to engine-scope modules; verified in `UEBuildModule.cs`, and verified
+  empirically — the include fails on its own sibling headers). The pass
+  therefore leaves `Inputs` unused and gets the same uniform buffer through
+  the **public** accessor built for exactly this situation:
+  `UE::FXRenderingUtils::GetOrCreateSceneTextureUniformBuffer`
+  (`FXRenderingUtils.h`, RENDERER_API), plus `GetRawViewRectUnsafe` for the
+  view rect. No Build.cs change, no engine-module pretence.
+- The rejected alternative — a translucent screen-quad material fed by a
+  material parameter collection — cannot bind the particle StructuredBuffer
+  at all (MPCs carry scalars/vectors), and re-enters the sort-key machinery
+  whose hazards the water material documents.
+
+Ordering: the subsystem enqueues the solver tick during the game tick, scene
+rendering is enqueued after it, render commands execute in order — so the
+splat always sees this frame's finalized particle positions.
+
+### Pass architecture and buffers (numbers at 2560×1440, half-res 1280×720)
+
+| # | pass (ProfileGPU name) | what | target, format, size |
+|---|---|---|---|
+| 1 | `VoxelFluidRender.Splat(n slots)` | instanced camera-facing quads, vertex-pulled by `SV_InstanceID` from the contract buffer (no vertex factory, no vertex buffer); PS computes sphere-impostor front depth; particles fully behind the opaque depth are killed here so they can neither pull the smooth through a wall nor tint water in front of one | MRT0 depth `R32_FLOAT` 1280×720 **3.69 MB** (BlendOp **MIN** = nearest surface, order-free); MRT1 thickness `R16F` 1280×720 **1.84 MB** (additive, order-free) |
+| 2 | `VoxelFluidRender.SmoothX` | separable bilateral (depth-aware Gaussian), X | `R32_FLOAT` UAV 1280×720, 3.69 MB |
+| 3 | `VoxelFluidRender.SmoothY` | same, Y | `R32_FLOAT` UAV 1280×720, 3.69 MB |
+| 4 | `VoxelFluidRender.ShadeComposite` | full-res fullscreen triangle: depth-aware upsample (4-tap, silhouette-rejecting), smallest-difference finite-difference normals, Beer–Lambert by thickness, constant-sky Fresnel + glint, `SrcAlpha/InvSrcAlpha` into scene colour, `discard` wherever fluid depth >= scene depth | writes SceneColor (no new target) |
+
+Total transient working set ~= **12.9 MB**, all RDG-pooled. Raster splats
+over compute scatter was argued, not assumed: a scatter's per-thread
+footprint loop is unbounded in the near field (a close particle covers
+thousands of half-res pixels), while MIN/ADD blending is the rasteriser's
+native atomic — and both blends are commutative, which is what makes an
+unsorted particle draw correct. StructuredBuffer SRVs in a VS are SM5-legal,
+so the renderer stays inside the solver's own SM5 gate.
+
+Splat-vs-scatter, half resolution, and the depth-kill margin (one particle
+radius, so half-buried bed particles still contribute) are all v0 decisions
+the owner's screenshots can overturn cheaply — each is one pass or one
+constant.
+
+### Same-water guarantees (and the one stated approximation)
+
+- Beer–Lambert mirrors the shipped material constant-for-constant: 160 UU
+  folding depth, shallow (0.035, 0.26, 0.68) → deep (0.008, 0.055, 0.24),
+  opacity 0.42 → 0.98, Fresnel F0 0.02 exp 5, sky tint (0.30, 0.46, 0.72)
+  gated by `saturate(sunDir.z)`, glint tint/power (2.6, 2.45, 2.15)/900. Each
+  cites its source line in the .usf.
+- **Thickness is volume-normalised**: the impostor sphere at the default
+  15 UU radius has ~14x the volume of the 10 cm voxel of water a particle IS
+  (contract :27-29), so the accumulated chord is rescaled by
+  `RestSpacing^3 / ((4/3)*pi*R^3)` — without this, particle water reads ~14x
+  deeper/inkier than the datum water beside it. Radius changes stay
+  volume-correct automatically.
+- Sun comes from the same ephemeris that feeds the material's MPC
+  (`UVoxelSkySubsystem`, toward-the-sun convention, `VoxelEphemeris.h:48`).
+- **Stated approximation**: the material's tint is lit by the translucent
+  lighting path; a post-opaque pass has no light grid, so v0 lights the tint
+  with `0.18 + 0.82 * saturate(N.sunDir) * dayGate` — the only two invented
+  constants in the pass, flagged in the .usf. No scene-colour read anywhere
+  (ban 1 — the composite is a hardware blend); refraction is absent at v0
+  (the sanctioned normal-perturbed depth trick is a later knob).
+- Scene captures / reflection captures skip the pass (presentation layer;
+  a capture re-running it would double the cost invisibly).
+
+### Verification done here (no editor launched, per constraints)
+
+- **UBT: `Result: Succeeded`** (VoxelEarthEditor Win64 Development,
+  MSVC 14.51), zero warnings after the one deprecation fix
+  (`GetProjectionMatrix` → `GetViewToClip`).
+- **Offline dxc** (`tools/dxc`): all five entry points compile to **both
+  DXIL and SPIR-V** — `-T vs_6_0/ps_6_0/cs_6_0 -E <entry> -O3
+  -D SM5_PROFILE=1 -D COMPILER_HLSL=1 [-spirv -fspv-target-env=vulkan1.1]`,
+  include root = a junction dir mapping `Engine -> UE_5.8/Engine/Shaders` and
+  `VoxelEarth -> ue-project/Shaders` (the reusable offline pattern for any
+  /VoxelEarth shader). 10/10 green. `tools/lint-shader-ub.py`: clean.
+- Not verified here (needs the editor): pixels on screen, renderMs numbers.
+  That is the measurement section below.
+
+### Perf line change
+
+`renderMs=<x.xx>|pending|off` now sits after `simGpuMs` in the 1 Hz line.
+`off` = cvar 0; `pending` = armed but no pass has completed a GPU timing
+(includes "nothing spawned yet"); a number = newest completed GPU time of the
+whole `VoxelFluidRender` span, measured with the same `RQT_AbsoluteTime`
+bracket as `simGpuMs`, so the two are directly comparable. The ran-flag rule
+holds: a renderer that never ran can never print `0.00`.
+
+### F. Renderer measurement runs (integrator)
+
+All PIE/game, one editor per box; conditions + captures per standing rules,
+no verdicts. The GPU budget context (plan, risk #1): frame p50 15.16 /
+p95 20.94 ms at 1440p with the tail being GPU — **the number that matters is
+the p95 delta with the renderer on**, not the p50.
+
+**F1. Cost at the spike population (the gate number)**
+```
+voxel.Fluid.Enable 1
+; wait for "initial fill COMPLETE" in the log, then:
+voxel.Fluid.Render 1
+voxel.Fluid.Spawn 5000        ; then re-run at 100000 for the spike population
+```
+Read: `renderMs` at 5 k and 100 k alive; `ProfileGPU` once at each population
+for the per-pass split (`VoxelFluidRender.Splat/SmoothX/SmoothY/
+ShadeComposite`); `stat unitgraph` p95 with `voxel.Fluid.Render 0` vs `1`
+(everything else identical) — that A/B delta is the budget verdict.
+
+**F2. Same-water A/B (the look gate)**
+At a lake-survey site with datum water in frame (site verified first, per the
+site-verification tools): one capture pair, `voxel.Fluid.Render 0/1`, same
+pose, dam-break pool beside the lake. The particle pool and the lake should
+read as the same water (tint, depth darkening, sky sheen). Conditions in the
+caption; owner judges.
+
+**F3. Composite correctness probes**
+- Fluid behind a ridge: walk the camera so terrain occludes the pool —
+  no water shows through (the splat depth-kill and the composite discard
+  both fire).
+- Grazing angle at the pool: Fresnel brightens toward the horizon and the
+  surface goes more opaque (the material's own opacity fold, mirrored).
+- `voxel.Fluid.Render.RadiusUU 10` vs `25`: surface tightness changes,
+  water COLOUR does not (thickness normalisation holds).
+- `voxel.Fluid.Render.SmoothRadiusPx 1` vs `12`: marbles vs sheet — pick by
+  capture, not by taste.
+
+**F4. Cvar surface for these runs**
+```
+voxel.Fluid.Render                0|1   (default 0)
+voxel.Fluid.Render.RadiusUU       15    (sprite radius, UU)
+voxel.Fluid.Render.SmoothRadiusPx 6     (bilateral radius, half-res px, 1..32)
+```

@@ -284,6 +284,16 @@ public:
 	// Monotone tick counter, render thread. Doubles as readback generation.
 	uint64 TickGeneration = 0;
 
+	// THE RENDERER'S ACCESSOR (screen-space fluid pass, VoxelFluidRender.*):
+	// the dispatch/instance width the last executed sim tick ran at, i.e. how
+	// many slots of Particles are worth splatting. Written by TickRenderThread,
+	// read by FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread --
+	// both render thread, no lock. Stays at its last value across skipped
+	// ticks (the particles didn't move, but they still exist and still draw);
+	// 0 until the first real tick, which is the renderer's "nothing yet" gate.
+	// The renderer reads Particles + this and NOTHING else of the sim state.
+	uint32 RenderSlotBound = 0;
+
 	// ---- cross-thread snapshot (the ONLY game-thread-readable part) --------
 
 	// Lock-protected because writer (render thread, on readback completion)

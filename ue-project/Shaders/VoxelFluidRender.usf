@@ -1,0 +1,455 @@
+// VoxelFluidRender.usf -- the Phase 0 spike (b) / Phase 4 screen-space fluid
+// renderer (docs/water-rearchitecture-plan-2026-08-09.md #6 "the fluid half
+// lands now", Phase 4 row): splat the PBF particles' depths, bilateral-smooth
+// them, reconstruct normals, shade with the SHIPPED water material's exact
+// Beer-Lambert / constant-sky-Fresnel model, and composite against the opaque
+// scene depth. Particles never touch the voxel mesher -- that is the point of
+// this renderer existing (the mesher's ~893 bricks/s of headroom vs the
+// ~6,100/s a churning river would demand, per the plan).
+//
+// THE TWO MATERIAL BANS, carried forward verbatim from
+// Tools/create_water_voxel_material.py:44-56 and honoured here:
+//   1. NO SCENE-COLOUR READ. Nothing in this file samples scene colour; the
+//      composite is a hardware alpha blend (SrcAlpha/InvSrcAlpha), which is
+//      the same thing the shipped translucent water does and is NOT a shader
+//      read of the partially-composed stack. Refraction at v0 is therefore
+//      ABSENT (the sanctioned alternative -- a normal-perturbed *depth* trick
+//      -- is a later knob, not a requirement).
+//   2. REFLECTIONS STAY CONSTANT-SKY FRESNEL. The sky term below is the
+//      material's own model (create_water_voxel_material.py:581-631): constant
+//      sky tint, gated by saturate(sunDir.z), weighted by Fresnel(F0=0.02,
+//      exp 5). No probe, no capture, no dynamic reflection.
+//
+// Reading scene DEPTH is allowed and load-bearing: depth is written by the
+// opaque pass and is invariant to translucent draw order (the material's own
+// docstring makes exactly this distinction for its thickness term).
+//
+// Layout-shaped things (particle struct, flags, rest spacing) come from
+// VoxelFluidContract.ush and are not restated. Like VoxelFluidSim.usf, this
+// file is deliberately OUTSIDE worldgen.ush's determinism digest -- pixels,
+// not authority.
+//
+// PASS CHAIN (all half-resolution except the final composite):
+//   1. FluidRenderSplatVS/PS  -- instanced camera-facing quads, one per alive
+//      particle, vertex-pulled from the contract's StructuredBuffer by
+//      SV_InstanceID (no vertex factory, no vertex buffer). The PS computes
+//      the sphere-impostor front depth and writes MRT0 = view-space depth
+//      (BlendOp MIN keeps the nearest surface) and MRT1 = thickness (additive,
+//      volume-normalised -- see THICKNESS NORMALISATION below).
+//   2. FluidRenderSmoothCS x2 -- separable depth-aware (bilateral) blur of the
+//      depth buffer. Two passes, X then Y, driven by StepDir.
+//   3. FluidRenderScreenVS + FluidRenderShadePS -- full-resolution composite:
+//      depth-aware upsample of the smoothed half-res depth, view-space normal
+//      from smallest-difference finite differences, Beer-Lambert by
+//      accumulated thickness, constant-sky Fresnel, alpha-blend into scene
+//      colour, discarding wherever fluid depth >= opaque scene depth.
+//
+// WHY RASTER SPLATS AND NOT A COMPUTE SCATTER (the decision the plan asks each
+// spike to argue): a compute scatter with InterlockedMin covers each
+// particle's footprint with a serial per-thread pixel loop, and the footprint
+// is unbounded in the near field (a particle 30 cm from the camera covers
+// thousands of half-res pixels). The rasteriser is the hardware unit whose
+// entire job is turning a variable-size footprint into parallel pixel work,
+// and BlendOp MIN on an R32F target is the atomic-min it replaces. The cost
+// is one degenerate-triangle cull per dead slot, which the VS pays in four
+// instructions. StructuredBuffer SRVs in a vertex shader are SM5-legal, so
+// this stays inside the solver's own SM5 gate.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelFluidContract.ush"
+
+// ---- shared constants -------------------------------------------------------
+
+// "No fluid here" sentinel for the depth buffers. The splat target is cleared
+// to this and MIN-blended; anything at or above half of it reads as empty.
+// 1e30 rather than FLT_MAX so arithmetic on it (sentinel - z) cannot overflow.
+#define VOXEL_FLUID_DEPTH_SENTINEL     1.0e30f
+#define VOXEL_FLUID_DEPTH_EMPTY(z)     ((z) >= 0.5e30f)
+
+// ---- the shipped water material's law, mirrored constant for constant ------
+// Source of truth: Tools/create_water_voxel_material.py. If that material is
+// recalibrated these move WITH it -- particle water and datum water must read
+// as the SAME water (the plan's own acceptance bar for this pass).
+
+// :244-246 (W7) -- Beer-Lambert folding depth, UU. depth01 = 1 - exp(-t/160).
+#define VOXEL_FLUID_ABSORB_FOLD_UU     160.0f
+// :279 -- shallow tint, "pinned to the shipped blue".
+#define VOXEL_FLUID_SHALLOW_TINT       float3(0.035f, 0.26f, 0.68f)
+// :289 -- deep tint, "dark blue at depth, not near-black".
+#define VOXEL_FLUID_DEEP_TINT          float3(0.008f, 0.055f, 0.24f)
+// :330 / :343 (W7) -- opacity ends. Shallow stays see-through on purpose.
+#define VOXEL_FLUID_SHALLOW_OPACITY    0.42f
+#define VOXEL_FLUID_DEEP_OPACITY       0.98f
+// :617 -- constant sky reflection tint (NOT a probe; see ban 2).
+#define VOXEL_FLUID_SKY_TINT           float3(0.30f, 0.46f, 0.72f)
+// :627-629 -- Fresnel: water's real normal-incidence reflectance and the
+// Schlick exponent the material node uses.
+#define VOXEL_FLUID_FRESNEL_F0         0.02f
+#define VOXEL_FLUID_FRESNEL_EXP        5.0f
+// :566 / :573 -- analytic sun glint: power and slightly-warm over-1 tint.
+#define VOXEL_FLUID_GLINT_POWER        900.0f
+#define VOXEL_FLUID_GLINT_TINT         float3(2.6f, 2.45f, 2.15f)
+
+// DIFFUSE APPROXIMATION, stated rather than hidden: the shipped material
+// routes its tint through BaseColor and lets the translucent lighting path
+// light it. A post-opaque full-screen pass has no forward light grid, so v0
+// approximates that lighting as ambient + one Lambert term against the same
+// sun the sky term is gated by. These two constants are the ONLY invented
+// numbers in this file; everything else is mirrored. Owner judges screenshots.
+#define VOXEL_FLUID_DIFFUSE_AMBIENT    0.18f
+#define VOXEL_FLUID_DIFFUSE_SUN        0.82f
+
+// ---- parameters ------------------------------------------------------------
+// One loose-uniform block per entry point family, bound via the C++ parameter
+// structs in VoxelFluidRender.cpp. Same discipline as VoxelFluidSim.usf: a
+// name here must appear in exactly one BEGIN_SHADER_PARAMETER_STRUCT or it is
+// an unbound symbol that compiles and reads zero.
+
+// -- splat pass --
+StructuredBuffer<FVoxelFluidParticle> Particles;
+uint     SplatSlotCount;          // dispatch width == solver slot bound
+float    ParticleRadiusUU;        // render radius (voxel.Fluid.Render.RadiusUU)
+float    ThicknessScale;          // volume normalisation, see PS
+float3   FluidOriginTranslatedWorld; // fluid origin + PreViewTranslation (camera-relative, so float is exact enough)
+float4x4 TranslatedWorldToView;
+float4x4 ViewToClip;
+float2   FullViewRectMin;         // scene-texture pixel offset of the view rect
+float4   InvDeviceZToWorldZ;      // View.InvDeviceZToWorldZTransform
+Texture2D<float> SceneDepthTexture; // full-res opaque device depth
+
+// -- smooth pass --
+Texture2D<float>   SmoothInDepth;
+RWTexture2D<float> SmoothOutDepth;
+int2  SmoothTextureSize;
+int2  SmoothStepDir;              // (1,0) then (0,1)
+int   SmoothRadiusPx;             // voxel.Fluid.Render.SmoothRadiusPx
+float SmoothDepthSigmaUU;         // range sigma; CPU passes 1.5 * radius
+
+// -- shade pass --
+Texture2D<float> FluidDepthTexture;     // smoothed, half-res
+Texture2D<float> FluidThicknessTexture; // half-res
+SamplerState     BilinearClampSampler;
+float2 ShadeHalfTexSize;
+float2 ShadeViewRectMin;          // on the scene colour target
+float2 ShadeViewRectSize;
+float2 InvProjDiag;               // (1/Proj[0][0], 1/Proj[1][1]) -- symmetric proj assumed; TAA jitter is sub-pixel and ignored
+float3 SunDirView;                // TOWARD the sun (ephemeris convention), rotated into view space
+float  SunDayGate;                // saturate(sunDirWorld.z), computed CPU-side
+// (SceneDepthTexture + InvDeviceZToWorldZ are shared with the splat block.)
+
+// ---- helpers ---------------------------------------------------------------
+
+// Common.ush's ConvertFromDeviceZ, restated here because this file includes
+// only Platform.ush (Common.ush drags the view uniform buffer in, which this
+// pass deliberately does not bind -- every view quantity it needs is passed
+// explicitly, which is also what keeps the file offline-dxc-compilable).
+float FluidSceneViewZ(float DeviceZ)
+{
+	return DeviceZ * InvDeviceZToWorldZ[0] + InvDeviceZToWorldZ[1] +
+	       1.0f / (DeviceZ * InvDeviceZToWorldZ[2] - InvDeviceZToWorldZ[3]);
+}
+
+// View-space position from a view-rect-local pixel centre and a view-space
+// depth. NDC y is negated (clip y up, pixel y down).
+float3 FluidViewPosFromPixel(float2 LocalPixel, float2 RectSize, float ViewZ)
+{
+	float2 Ndc = (LocalPixel / RectSize) * 2.0f - 1.0f;
+	Ndc.y = -Ndc.y;
+	return float3(Ndc * InvProjDiag * ViewZ, ViewZ);
+}
+
+// ===========================================================================
+// 1. depth + thickness splat
+// ===========================================================================
+
+struct FFluidSplatVSOut
+{
+	float4 Position    : SV_Position;
+	float2 CornerUV    : TEXCOORD0; // -1..1 across the sprite
+	float  CenterViewZ : TEXCOORD1;
+};
+
+// Two CCW triangles of a quad, indexed by SV_VertexID 0..5.
+static const float2 kFluidSplatCorners[6] =
+{
+	float2(-1, -1), float2(1, -1), float2(-1, 1),
+	float2( 1, -1), float2(1,  1), float2(-1, 1)
+};
+
+FFluidSplatVSOut FluidRenderSplatVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID)
+{
+	FFluidSplatVSOut Out = (FFluidSplatVSOut)0;
+
+	// Dead / out-of-bounds slots emit a vertex the clipper rejects (z > w).
+	// All six vertices of the instance agree, so the triangles are fully
+	// clipped -- the four-instruction cost per dead slot the header states.
+	FVoxelFluidParticle P = Particles[min(InstanceId, VOXEL_FLUID_MAX_PARTICLES - 1u)];
+	const uint Flags = asuint(P.P0.w);
+	if (InstanceId >= SplatSlotCount || (Flags & VOXEL_FLUID_FLAG_ALIVE) == 0u)
+	{
+		Out.Position = float4(0.0f, 0.0f, 2.0f, 1.0f);
+		return Out;
+	}
+
+	const float2 Corner = kFluidSplatCorners[VertexId];
+	const float3 CenterTW = P.P0.xyz + FluidOriginTranslatedWorld;
+	const float3 CenterView = mul(float4(CenterTW, 1.0f), TranslatedWorldToView).xyz;
+
+	// Camera-facing quad built in view space; UE view space is X right, Y up,
+	// Z forward. A centre-depth billboard slightly under-covers a very close
+	// sphere's projected ellipse; accepted at v0 (the splat is smoothed anyway).
+	const float3 CornerView = CenterView + float3(Corner * ParticleRadiusUU, 0.0f);
+
+	Out.Position = mul(float4(CornerView, 1.0f), ViewToClip);
+	Out.CornerUV = Corner;
+	Out.CenterViewZ = CenterView.z;
+	return Out;
+}
+
+struct FFluidSplatPSOut
+{
+	float Depth     : SV_Target0; // view-space Z of the impostor front surface (MIN blend)
+	float Thickness : SV_Target1; // volume-normalised chord (ADD blend)
+};
+
+FFluidSplatPSOut FluidRenderSplatPS(FFluidSplatVSOut In)
+{
+	const float R2 = dot(In.CornerUV, In.CornerUV);
+	clip(1.0f - R2); // outside the sphere's silhouette
+
+	// Sphere impostor: front surface toward the camera (smaller view Z).
+	const float HalfChord = sqrt(1.0f - R2) * ParticleRadiusUU;
+	const float SurfViewZ = In.CenterViewZ - HalfChord;
+
+	// Occlusion kill against the OPAQUE depth: a particle fully behind a wall
+	// must contribute neither depth (the smooth would drag it through) nor
+	// thickness (it would tint water in front of the wall). One radius of
+	// margin keeps particles half-buried in the bed contributing, which is
+	// most of a river's bottom layer. Full-res depth is point-looked-up at
+	// this half-res pixel's origin corner -- half-res splat, stated cost.
+	const int2 FullPixel = int2(In.Position.xy) * 2 + int2(FullViewRectMin);
+	const float SceneViewZ = FluidSceneViewZ(SceneDepthTexture.Load(int3(FullPixel, 0)).r);
+	clip((SceneViewZ + ParticleRadiusUU) - SurfViewZ);
+
+	// THICKNESS NORMALISATION. The raw chord integral over the sprite is the
+	// impostor sphere's volume, (4/3)*pi*R^3 -- but the particle IS one 10 cm
+	// voxel of water, volume RestSpacing^3 (contract :27-29). At the default
+	// R = 15 UU the sphere is ~14x the real volume, and unscaled thickness
+	// would drive the Beer-Lambert term ~14x too deep -- particle water would
+	// read as a different, inkier water than the datum water right next to it.
+	// ThicknessScale = RestSpacing^3 / ((4/3)*pi*R^3), computed CPU-side, makes
+	// the accumulated thickness converge to the true water-column depth.
+	FFluidSplatPSOut Out;
+	Out.Depth = SurfViewZ;
+	Out.Thickness = 2.0f * HalfChord * ThicknessScale;
+	return Out;
+}
+
+// ===========================================================================
+// 2. separable bilateral depth smooth
+// ===========================================================================
+// Depth-aware Gaussian: spatial falloff by pixel distance, range falloff by
+// view-Z difference, so the blur rounds particle bumps into a fluid sheet but
+// does NOT bleed across silhouette edges (the classic SSF bilateral,
+// van der Laan et al. 2009). Separated X/Y: not mathematically identical to
+// the full 2D bilateral, but the standard cost control and visually
+// indistinguishable here -- the same trade every SSF implementation ships.
+
+[numthreads(8, 8, 1)]
+void FluidRenderSmoothCS(uint3 ThreadId : SV_DispatchThreadID)
+{
+	const int2 Pixel = int2(ThreadId.xy);
+	if (Pixel.x >= SmoothTextureSize.x || Pixel.y >= SmoothTextureSize.y)
+	{
+		return;
+	}
+
+	const float CenterZ = SmoothInDepth[Pixel];
+	if (VOXEL_FLUID_DEPTH_EMPTY(CenterZ))
+	{
+		SmoothOutDepth[Pixel] = CenterZ; // empty stays empty
+		return;
+	}
+
+	// sigma = radius/2 puts the kernel edge at 2 sigma -- the usual truncation.
+	const float SpatialSigma = max(float(SmoothRadiusPx) * 0.5f, 0.5f);
+	const float InvTwoSpatialSigma2 = rcp(2.0f * SpatialSigma * SpatialSigma);
+	const float InvTwoDepthSigma2 = rcp(2.0f * SmoothDepthSigmaUU * SmoothDepthSigmaUU);
+
+	float Sum = 0.0f;
+	float WeightSum = 0.0f;
+	[loop]
+	for (int I = -SmoothRadiusPx; I <= SmoothRadiusPx; ++I)
+	{
+		const int2 TapPixel = clamp(Pixel + I * SmoothStepDir, int2(0, 0), SmoothTextureSize - 1);
+		const float TapZ = SmoothInDepth[TapPixel];
+		if (VOXEL_FLUID_DEPTH_EMPTY(TapZ))
+		{
+			continue; // empty neighbours contribute nothing (no sentinel bleed)
+		}
+		const float Dz = TapZ - CenterZ;
+		const float W = exp(-float(I * I) * InvTwoSpatialSigma2 - Dz * Dz * InvTwoDepthSigma2);
+		Sum += TapZ * W;
+		WeightSum += W;
+	}
+	// CenterZ itself always contributed (I == 0, W == 1), so WeightSum >= 1.
+	SmoothOutDepth[Pixel] = Sum / WeightSum;
+}
+
+// ===========================================================================
+// 3. shade + composite
+// ===========================================================================
+
+void FluidRenderScreenVS(uint VertexId : SV_VertexID, out float4 OutPosition : SV_Position)
+{
+	// The standard single fullscreen triangle from SV_VertexID (0,1,2).
+	const float2 Uv = float2(uint2(VertexId << 1, VertexId) & 2u);
+	OutPosition = float4(Uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
+}
+
+// Depth-aware upsample of the half-res smoothed depth at a full-res pixel:
+// the four surrounding half-res taps, bilinear-weighted, but taps that
+// disagree with the nearest (minimum-Z) tap by more than a tolerance are
+// rejected -- so a full-res pixel near a fluid silhouette snaps to the fluid
+// side instead of averaging fluid with the sentinel or with a far surface.
+// Returns the sentinel when all four taps are empty.
+float FluidUpsampleDepth(float2 HalfPixel)
+{
+	const float2 Base = HalfPixel - 0.5f;
+	const float2 Frac = frac(Base);
+	const int2 P0 = int2(floor(Base));
+
+	float TapZ[4];
+	float TapW[4];
+	TapW[0] = (1.0f - Frac.x) * (1.0f - Frac.y);
+	TapW[1] = Frac.x * (1.0f - Frac.y);
+	TapW[2] = (1.0f - Frac.x) * Frac.y;
+	TapW[3] = Frac.x * Frac.y;
+
+	float MinZ = VOXEL_FLUID_DEPTH_SENTINEL;
+	[unroll]
+	for (int I = 0; I < 4; ++I)
+	{
+		const int2 Offset = int2(I & 1, I >> 1);
+		const int2 Tap = clamp(P0 + Offset, int2(0, 0), int2(ShadeHalfTexSize) - 1);
+		TapZ[I] = FluidDepthTexture.Load(int3(Tap, 0));
+		MinZ = min(MinZ, TapZ[I]);
+	}
+	if (VOXEL_FLUID_DEPTH_EMPTY(MinZ))
+	{
+		return VOXEL_FLUID_DEPTH_SENTINEL;
+	}
+
+	// Tolerance: a couple of particle radii. Scaled off the smooth range sigma
+	// so the two agree about what counts as "the same surface".
+	const float Tolerance = 2.0f * SmoothDepthSigmaUU;
+	float Sum = 0.0f;
+	float WeightSum = 0.0f;
+	[unroll]
+	for (int J = 0; J < 4; ++J)
+	{
+		if (abs(TapZ[J] - MinZ) <= Tolerance)
+		{
+			Sum += TapZ[J] * TapW[J];
+			WeightSum += TapW[J];
+		}
+	}
+	return WeightSum > 0.0f ? Sum / WeightSum : MinZ;
+}
+
+float4 FluidRenderShadePS(float4 SvPosition : SV_Position) : SV_Target0
+{
+	const float2 LocalPixel = SvPosition.xy - ShadeViewRectMin;
+	const float2 HalfPixel = LocalPixel * 0.5f;
+
+	const float FluidZ = FluidUpsampleDepth(HalfPixel);
+	if (VOXEL_FLUID_DEPTH_EMPTY(FluidZ))
+	{
+		discard; // no fluid on this pixel
+	}
+
+	// "Write only where fluid depth < scene depth" -- the composite's one rule.
+	const int2 FullPixel = int2(SvPosition.xy);
+	const float SceneViewZ = FluidSceneViewZ(SceneDepthTexture.Load(int3(FullPixel, 0)).r);
+	if (FluidZ >= SceneViewZ)
+	{
+		discard;
+	}
+
+	// --- view-space surface position + normal ------------------------------
+	// Finite differences over ONE half-res texel (= 2 full-res pixels), taking
+	// whichever side differs least -- the standard silhouette guard: at an
+	// edge, the small-difference side is the one still on this surface.
+	const float3 PosView = FluidViewPosFromPixel(LocalPixel, ShadeViewRectSize, FluidZ);
+
+	const float ZXp = FluidUpsampleDepth(HalfPixel + float2(1, 0));
+	const float ZXm = FluidUpsampleDepth(HalfPixel - float2(1, 0));
+	const float ZYp = FluidUpsampleDepth(HalfPixel + float2(0, 1));
+	const float ZYm = FluidUpsampleDepth(HalfPixel - float2(0, 1));
+
+	// A neighbour that is empty falls back to the centre depth (flat surface
+	// assumption at the silhouette -- better than a spike toward the sentinel).
+	const float SafeZXp = VOXEL_FLUID_DEPTH_EMPTY(ZXp) ? FluidZ : ZXp;
+	const float SafeZXm = VOXEL_FLUID_DEPTH_EMPTY(ZXm) ? FluidZ : ZXm;
+	const float SafeZYp = VOXEL_FLUID_DEPTH_EMPTY(ZYp) ? FluidZ : ZYp;
+	const float SafeZYm = VOXEL_FLUID_DEPTH_EMPTY(ZYm) ? FluidZ : ZYm;
+
+	float3 DDX;
+	if (abs(SafeZXp - FluidZ) <= abs(SafeZXm - FluidZ))
+	{
+		DDX = FluidViewPosFromPixel(LocalPixel + float2(2, 0), ShadeViewRectSize, SafeZXp) - PosView;
+	}
+	else
+	{
+		DDX = PosView - FluidViewPosFromPixel(LocalPixel - float2(2, 0), ShadeViewRectSize, SafeZXm);
+	}
+	float3 DDY;
+	if (abs(SafeZYp - FluidZ) <= abs(SafeZYm - FluidZ))
+	{
+		DDY = FluidViewPosFromPixel(LocalPixel + float2(0, 2), ShadeViewRectSize, SafeZYp) - PosView;
+	}
+	else
+	{
+		DDY = PosView - FluidViewPosFromPixel(LocalPixel - float2(0, 2), ShadeViewRectSize, SafeZYm);
+	}
+
+	// Left-handed view space (X right, Y up-in-clip -- but pixel Y runs down,
+	// so DDY points down-screen): cross(DDY, DDX) gives the camera-facing
+	// orientation; flip defensively if a degenerate edge produced the other.
+	float3 N = normalize(cross(DDY, DDX));
+	if (N.z > 0.0f)
+	{
+		N = -N;
+	}
+
+	const float3 ToEye = normalize(-PosView);
+
+	// --- Beer-Lambert by accumulated thickness (the material's :184-244) ----
+	const float Thickness =
+		FluidThicknessTexture.SampleLevel(BilinearClampSampler,
+		                                  (HalfPixel + 0.5f) / ShadeHalfTexSize, 0).r;
+	const float Depth01 = 1.0f - exp(-max(Thickness, 0.0f) / VOXEL_FLUID_ABSORB_FOLD_UU);
+	const float3 Tint = lerp(VOXEL_FLUID_SHALLOW_TINT, VOXEL_FLUID_DEEP_TINT, Depth01);
+	const float Opacity = lerp(VOXEL_FLUID_SHALLOW_OPACITY, VOXEL_FLUID_DEEP_OPACITY, Depth01);
+
+	// --- constant-sky Fresnel + glint (the material's :560-631) -------------
+	const float Fresnel = VOXEL_FLUID_FRESNEL_F0 +
+	                      (1.0f - VOXEL_FLUID_FRESNEL_F0) *
+	                          pow(1.0f - saturate(dot(N, ToEye)), VOXEL_FLUID_FRESNEL_EXP);
+	const float3 SkyReflection = VOXEL_FLUID_SKY_TINT * SunDayGate * Fresnel;
+	const float3 Glint = VOXEL_FLUID_GLINT_TINT * SunDayGate *
+	                     pow(saturate(dot(reflect(-ToEye, N), SunDirView)),
+	                         VOXEL_FLUID_GLINT_POWER);
+
+	// --- diffuse approximation (stated at the top of the file) -------------
+	const float Lighting = VOXEL_FLUID_DIFFUSE_AMBIENT +
+	                       VOXEL_FLUID_DIFFUSE_SUN * saturate(dot(N, SunDirView)) * SunDayGate;
+
+	// The material folds the same Fresnel into opacity (:581 section header),
+	// so grazing water occludes more -- mirrored here.
+	const float Alpha = saturate(Opacity + Fresnel * (1.0f - Opacity));
+
+	// Hardware SrcAlpha/InvSrcAlpha does the compositing; nothing here read
+	// the scene colour (ban 1).
+	return float4(Tint * Lighting + SkyReflection + Glint, Alpha);
+}

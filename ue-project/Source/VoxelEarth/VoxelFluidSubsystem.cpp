@@ -7,8 +7,11 @@
 
 #include "VoxelFluidSim.h"       // VoxelEarthShaders -- the render-thread solver
 #include "VoxelFluidOccupancy.h" // VoxelEarthShaders -- the collision volume
+#include "VoxelFluidRender.h"    // VoxelEarthShaders -- the screen-space fluid renderer (Phase 4)
 #include "VoxelWorldSubsystem.h"
 #include "VoxelWaterSubsystem.h"
+#include "VoxelSkySubsystem.h"   // sun direction for the renderer's constant-sky Fresnel
+#include "SceneViewExtension.h"  // FSceneViewExtensions::NewExtension
 #include "VoxelCoords.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
@@ -159,6 +162,34 @@ namespace
 		TEXT("differing word. Debug only -- it costs a 16 MiB readback per cycle."),
 		ECVF_Default);
 
+	// ---- the screen-space fluid renderer (Phase 4 / spike b) ---------------
+	// OFF by default -- the perf plan's rule: the pass must be measurable and
+	// budgetable before it is on anywhere, and DrawDebugPoint remains the
+	// fallback view. Enabling costs 4 GPU passes at half resolution
+	// (splat MRT, smooth x2, shade) whose cost lands in the perf line as
+	// renderMs and in ProfileGPU under "VoxelFluidRender".
+	TAutoConsoleVariable<int32> CVarVoxelFluidRender(
+		TEXT("voxel.Fluid.Render"), 0,
+		TEXT("Screen-space fluid rendering for the PBF particles (splat depth -> ")
+		TEXT("bilateral smooth -> normals -> Beer-Lambert shade -> composite vs opaque ")
+		TEXT("depth). 0 (default) = off; DrawDebugPoint stays the debug view. ")
+		TEXT("Requires voxel.Fluid.Enable 1. GPU cost reported as renderMs in the ")
+		TEXT("1 Hz Fluid perf line and attributed per-pass in ProfileGPU."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarVoxelFluidRenderRadius(
+		TEXT("voxel.Fluid.Render.RadiusUU"), 15.0f,
+		TEXT("Sprite radius of a splatted particle, UU. Default 1.5x the 10 UU rest ")
+		TEXT("spacing so neighbours' impostors overlap into a closed surface. ")
+		TEXT("Thickness stays volume-correct at any radius (normalised in-shader)."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarVoxelFluidRenderSmoothRadius(
+		TEXT("voxel.Fluid.Render.SmoothRadiusPx"), 6,
+		TEXT("Bilateral depth-smooth radius in half-res pixels (two separable ")
+		TEXT("passes). Bigger = sheetier fluid, more GPU. Clamped 1..32."),
+		ECVF_Default);
+
 	UVoxelFluidSubsystem* FindFluidSubsystem(UWorld* World)
 	{
 		return World ? World->GetSubsystem<UVoxelFluidSubsystem>() : nullptr;
@@ -279,6 +310,18 @@ struct FVoxelFluidLifecycle
 
 	// Cells of the initial fill, centre-out, precomputed at latch.
 	TArray<FIntVector> InitialCellOrder;
+
+	// --- the screen-space renderer (voxel.Fluid.Render) ---------------------
+	// Both live in the lifecycle (not the header) so the file-ownership of
+	// this feature stays in the .cpp, and so ReleaseSimState's fresh-lifecycle
+	// reset tears the renderer down with everything else. The extension is
+	// created lazily on the first tick that sees the cvar at 1 and stays
+	// registered (inert -- IsActiveThisFrame declines) when it drops back to
+	// 0; the engine registry holds only a weak reference, so dropping these
+	// shared pointers at teardown destroys it, and any in-flight frame's
+	// gathered snapshot keeps it alive exactly long enough.
+	TSharedPtr<FVoxelFluidRenderState, ESPMode::ThreadSafe> RenderState;
+	TSharedPtr<FVoxelFluidRenderExtension, ESPMode::ThreadSafe> RenderExtension;
 };
 
 // ---------------------------------------------------------------------------
@@ -864,6 +907,17 @@ void UVoxelFluidSubsystem::ReleaseSimState()
 			L.PendingBoundaryUnits -= Accepted;
 		}
 	}
+	// Renderer teardown FIRST: flip the shared settings off so a frame already
+	// in flight declines cleanly, and unlink the sim state so the extension
+	// can never splat buffers that ReleaseRenderThread is about to null. The
+	// shared pointers themselves die with the Lifecycle reset below.
+	if (L.RenderState.IsValid())
+	{
+		FScopeLock Guard(&L.RenderState->Lock);
+		L.RenderState->Settings.bEnabled = false;
+		L.RenderState->SimState.Reset();
+	}
+
 	if (L.PendingBasinCreditUnits > 0 || L.PendingBoundaryUnits > 0)
 	{
 		// Stated loss, not silent: these units left the particle domain and
@@ -1135,6 +1189,58 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	L.PerfFaucetEmitted += FaucetEmittedThisTick;
 	L.PerfSpillEmitted += SpillEmittedThisTick;
 
+	// ---- screen-space renderer hookup (voxel.Fluid.Render, Phase 4) --------
+	// Created lazily; refreshed every tick with by-value settings + the live
+	// sim-state pointer, so an Enable-cycle (new sim state object) re-links
+	// automatically and a cvar flip to 0 turns the passes off next frame.
+	const bool bRenderCVarOn = CVarVoxelFluidRender.GetValueOnGameThread() != 0;
+	if (bRenderCVarOn && !L.RenderExtension.IsValid())
+	{
+		L.RenderState = MakeShared<FVoxelFluidRenderState, ESPMode::ThreadSafe>();
+		L.RenderExtension = FSceneViewExtensions::NewExtension<FVoxelFluidRenderExtension>(
+			World, L.RenderState);
+		UE_LOG(LogVoxelFluid, Display,
+		       TEXT("Fluid renderer registered (scene view extension, PrePostProcessPass; ")
+		       TEXT("passes visible in ProfileGPU as VoxelFluidRender.*)"));
+	}
+	if (L.RenderState.IsValid())
+	{
+		// Sun for the constant-sky Fresnel + the diffuse approximation --
+		// same ephemeris the water material's SunDirection MPC entry is fed
+		// from (VoxelSkySubsystem), same toward-the-sun convention
+		// (VoxelEphemeris.h:48). A sky subsystem that never ticked returns a
+		// zeroed state (JulianDay 0); the renderer then keeps its overhead-sun
+		// default rather than computing a sun at the eastern horizon out of
+		// zeros -- mirrors the material reading an un-driven MPC default.
+		FVector3f SunDirWorld(0.0f, 0.0f, 1.0f);
+		float SunDayGate = 1.0f;
+		if (UVoxelSkySubsystem* Sky = World->GetSubsystem<UVoxelSkySubsystem>())
+		{
+			const FVoxelSkyState& SkyState = Sky->GetSkyState();
+			if (SkyState.JulianDay != 0.0)
+			{
+				const double AltRad = FMath::DegreesToRadians(SkyState.SunAltitudeDeg);
+				const double AzRad = FMath::DegreesToRadians(SkyState.SunAzimuthDeg);
+				SunDirWorld = FVector3f(float(FMath::Cos(AltRad) * FMath::Cos(AzRad)),
+				                        float(FMath::Cos(AltRad) * FMath::Sin(AzRad)),
+				                        float(FMath::Sin(AltRad)));
+				SunDayGate = FMath::Clamp(float(FMath::Sin(AltRad)), 0.0f, 1.0f);
+			}
+		}
+
+		FScopeLock Guard(&L.RenderState->Lock);
+		L.RenderState->Settings.bEnabled =
+			bRenderCVarOn && bOriginLatched && CumulativeSpawnRequested > 0;
+		L.RenderState->Settings.FluidOriginWorld = FluidOriginWorld;
+		L.RenderState->Settings.ParticleRadiusUU =
+			CVarVoxelFluidRenderRadius.GetValueOnGameThread();
+		L.RenderState->Settings.SmoothRadiusPx =
+			CVarVoxelFluidRenderSmoothRadius.GetValueOnGameThread();
+		L.RenderState->Settings.SunDirWorld = SunDirWorld;
+		L.RenderState->Settings.SunDayGate = SunDayGate;
+		L.RenderState->SimState = SimState;
+	}
+
 	const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
 
 	// ---- drive the GPU (only once something has ever spawned) --------------
@@ -1326,13 +1432,31 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		                           : L.LastVerifyResult == 2 ? TEXT("stale")
 		                                                     : TEXT("pending");
 
+		// renderMs: off (cvar 0), pending (armed but no pass has completed a
+		// GPU timing yet -- includes "no particles spawned"), or the newest
+		// completed GPU time of the VoxelFluidRender pass span. The ran-flag
+		// rule again: a renderer that silently never ran must not print 0.00.
+		FString RenderField;
+		if (!bRenderCVarOn)
+		{
+			RenderField = TEXT("off");
+		}
+		else
+		{
+			const FVoxelFluidRenderStats RenderStats =
+				L.RenderState.IsValid() ? L.RenderState->GetStats() : FVoxelFluidRenderStats();
+			RenderField = (RenderStats.FramesRendered == 0 || RenderStats.RenderGpuMs < 0.0f)
+			                  ? TEXT("pending")
+			                  : FString::Printf(TEXT("%.2f"), RenderStats.RenderGpuMs);
+		}
+
 		UE_LOG(LogVoxelFluid, Display,
 		       TEXT("Fluid perf %s alive=%u spawned=%u requested=%llu despawnBasin=%u ")
-		       TEXT("despawnBoundary=%u simGpuMs=%.2f iters=%d slots=%llu violations=%llu ")
+		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s iters=%d slots=%llu violations=%llu ")
 		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s ")
 		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu%s"),
 		       StateMarker, Snapshot.Alive, Snapshot.SpawnedTotal, CumulativeSpawnRequested,
-		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs,
+		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs, *RenderField,
 		       FMath::Clamp(CVarVoxelFluidIterations.GetValueOnGameThread(), 1, 8),
 		       FMath::Min<uint64>(CumulativeSpawnRequested, VoxelFluidSim::kMaxParticles),
 		       ConservationViolations, *FaucetField, L.PerfSpillEmitted, *SinkBasinField, BoundaryRate,

@@ -519,6 +519,10 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 	}
 
 	State.TickGeneration++;
+	// Publish the splat width for the screen-space renderer (see the member's
+	// comment in VoxelFluidSim.h). Set before the graph builds so the same
+	// frame's render pass sees this tick's bound.
+	State.RenderSlotBound = Args.SimSlotBound;
 
 	FRDGBuilder GraphBuilder(RHICmdList);
 	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidSim");
@@ -906,6 +910,9 @@ void VoxelFluidSim::ReleaseRenderThread(FVoxelFluidSimState& State)
 	State.bDebugReadbackInFlight = false;
 	State.OccupancyReadback.Reset();
 	State.bOccupancyReadbackInFlight = false;
+	// The renderer gates on Particles validity AND this; zero both so a
+	// released state can never advertise stale splat work.
+	State.RenderSlotBound = 0;
 	for (auto& Pair : State.TimingRing)
 	{
 		Pair.Begin.SafeRelease();
