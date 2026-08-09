@@ -284,6 +284,13 @@ public:
 		uint64 RegionsApplied = 0;    // dispatched
 		uint64 WordsWritten = 0;      // output words the dispatches covered
 		uint64 BrickWordsUploaded = 0;
+		// Times AddPasses has run, ever. The ORDERING GUARD's counter: the
+		// solver checkf's that this advanced by exactly one inside its own
+		// graph build, before any solver pass was added -- RDG will not catch
+		// a stale volume for you (reading last frame's terrain is a valid
+		// buffer read), so the integrator's rule "AddPasses BEFORE solver
+		// passes, same graph" is enforced with this rather than with hope.
+		uint64 AddPassesCount = 0;
 	};
 	FStats GetStats() const;
 

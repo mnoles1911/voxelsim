@@ -506,6 +506,81 @@ public:
 	void GetBasinLedgerStats(bool& bOutLedgerActive, int32& OutBasins, int64& OutSumUnits,
 	                         int64& OutSpilledUnits, int64& OutRoutedUnits, int64& OutRefundedUnits) const;
 
+	// --- PHASE 3 LIFECYCLE ACCESSORS (water re-architecture, faucet/sink) -----
+	//
+	// The PBF fluid host (UVoxelFluidSubsystem) is the only intended caller of
+	// the four groups below. They exist because this subsystem owns the ONE
+	// fine-tier water reader, the basin ledger and the routing graph, and the
+	// fluid host must never grow a second copy of any of them (the same
+	// argument the lake-sheet and ribbon accessor groups make above). Plain
+	// types only: this header stays voxel-core-free by doctrine.
+
+	// One headwater faucet: where a baked reach starts and the discharge it
+	// carries. QM3PerYear is 0 when the source could not supply a rate (the
+	// pre-bv24 fallback below) -- the caller substitutes its own default, and
+	// 0 must never be read as "dry".
+	struct FVoxelHeadwaterFaucet
+	{
+		double XUU = 0.0, YUU = 0.0; // fine-pixel centre, world UU
+		double QM3PerYear = 0.0;     // discharge at the head (tilestore.h HeadEntry)
+	};
+
+	// Every headwater inside the square of half-extent RadiusUU around the
+	// centre. TWO SOURCES, tried in order:
+	//   1. The baked SECTION_HEADWATERS table (bake_ver 24, FineTile::heads())
+	//      -- the exact answer, with per-head Q. Used whenever any overlapped
+	//      tile has a resident heads table; bOutFromBakedHeads true.
+	//   2. FALLBACK for bv23-and-older tiles (the running bake has not landed):
+	//      RiverNetwork::buildFromBakedWater over the same box, taking its
+	//      headwaterNodes(). Q is unknown there (build-time discharge is a
+	//      catchment AREA, a different unit -- rivernet.h) so QM3PerYear is 0,
+	//      and rivernet.h's own caveat applies: reaches ENTERING the box from
+	//      outside read as heads, so the box rim can carry false faucets.
+	//      bOutFromBakedHeads false.
+	// Game-thread only (decodes tile blocks). Returns the number appended.
+	int32 GatherHeadwaterFaucets(double CenterXUU, double CenterYUU, double RadiusUU,
+	                             TArray<FVoxelHeadwaterFaucet>& Out, bool& bOutFromBakedHeads);
+
+	// Adds `Units` (WaterCA fill units, the graph's own storage currency) to
+	// the river segment nearest to world voxel (Vx, Vy) within MaxReachMm.
+	// Returns the units ACCEPTED: all of them when a segment was found, 0 when
+	// there is no graph (voxel.Water.Rivers off) or none is in reach -- never
+	// a partial. The boundary-sink v1 path: the caller keeps refused units
+	// pending and retries, so nothing is dropped between the two subsystems.
+	int64 InjectRiverInflowNearVoxel(int64 Vx, int64 Vy, int64 Units, int64 MaxReachMm);
+
+	// One basin-ledger spill event held for the fluid to emit as particles
+	// (a "sill faucet"). BasinKey is the ledger's packed basin key, opaque
+	// here; give it back verbatim to RefundSpillUnits for anything not
+	// emitted. Units are WaterCA fill units (255 per particle -- the
+	// conversion constant lives in voxelcore/fluidlifecycle.h).
+	struct FVoxelFluidSpillFaucet
+	{
+		uint64 BasinKey = 0;
+		int64 Units = 0;
+		double OutletXUU = 0.0, OutletYUU = 0.0; // the baked saddle, world UU
+		double SpillZUU = 0.0;                   // the sill elevation (faucet datum)
+	};
+
+	// Registers (bEnabled true) or clears the world-UU XY box inside which
+	// basin spill events are HELD for the fluid instead of routed into the
+	// graph. While enabled, RouteBasinSpills parks matching events in a queue
+	// the fluid drains below; entries not drained within a grace window are
+	// refunded to their basins, so a fluid host that dies mid-session cannot
+	// strand water. Clearing refunds everything still held.
+	void SetFluidSpillIntercept(bool bEnabled, double MinXUU = 0.0, double MinYUU = 0.0,
+	                            double MaxXUU = 0.0, double MaxYUU = 0.0);
+
+	// Takes every held spill event (the caller now OWES those units: emit them
+	// as particles or refund them). Returns the number appended.
+	int32 DrainFluidSpillFaucets(TArray<FVoxelFluidSpillFaucet>& Out);
+
+	// Returns spill units the fluid could not emit to the basin they spilled
+	// from (vxc::BasinLedger::refundSpill -- the lake back-pressures above its
+	// sill, exactly as a graph refusal does). Returns the units actually
+	// refunded.
+	int64 RefundSpillUnits(uint64 BasinKey, int64 Units);
+
 	// --- FAR-FIELD RIVER RIBBONS (docs/water-handover-2026-08-04.md Phase 4) --
 	//
 	// The lake half above draws basins. Rivers cannot use it: `basinsForTile`,

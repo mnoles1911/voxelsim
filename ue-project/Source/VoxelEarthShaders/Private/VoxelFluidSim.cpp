@@ -6,6 +6,7 @@
 
 #include "VoxelFluidSim.h"
 
+#include "VoxelFluidOccupancy.h" // the collision volume (AddPasses + parameter binding)
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
@@ -64,6 +65,21 @@ namespace
 		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 		{
 			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+
+		// COLLISION IS LIVE (integration pass; contract "RATIFIED" item 5).
+		// One unconditional define, no permutation dimension: the occupancy
+		// volume gates on the same SM5 the solver does
+		// (FVoxelFluidOccupancyVolume::IsSupportedOnCurrentRHI), so there is
+		// no platform that could run the solver and not the volume -- a
+		// permutation would double the compile count to cover a state the
+		// host refuses to enter (TickRenderThread skips, counted, when the
+		// volume is absent).
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VOXEL_FLUID_HAS_COLLISION"), 1);
 		}
 	};
 
@@ -218,7 +234,6 @@ namespace
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER(uint32, SimSlotCount)
 			SHADER_PARAMETER(float, RestDensity)
-			SHADER_PARAMETER(float, GroundZLocalUU)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InLambdas)
@@ -226,6 +241,11 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellCounts)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPositions)
+			// The collision read (VoxelFluidResolveCollision inside the dp
+			// clamp). GroundZLocalUU left the struct with the fallback plane:
+			// the compiled shader no longer references it and a bound-but-
+			// unread parameter is how a stale binding hides.
+			VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -240,11 +260,18 @@ namespace
 			SHADER_PARAMETER(uint32, SimSlotCount)
 			SHADER_PARAMETER(float, Dt)
 			SHADER_PARAMETER(float, BoundaryHalfExtentUU)
+			SHADER_PARAMETER(FVector3f, BoundaryCenterLocalUU)
+			SHADER_PARAMETER(uint32, BasinSinkEnabled)
+			SHADER_PARAMETER(FVector3f, BasinBoxMinLocalUU)
+			SHADER_PARAMETER(FVector3f, BasinBoxMaxLocalUU)
+			SHADER_PARAMETER(float, BasinDatumZLocalUU)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, FreeList)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SlotCounters)
+			// The full-step anti-tunnelling walk (contract item 7).
+			VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 		END_SHADER_PARAMETER_STRUCT()
 	};
 }
@@ -412,6 +439,24 @@ namespace
 			State.LatestCounts.SimGpuMs = NewGpuMs;
 		}
 
+		if (State.bOccupancyReadbackInFlight && State.OccupancyReadback->IsReady())
+		{
+			const uint64 Bytes = uint64(vxc::kFluidVolumeWords) * sizeof(uint32);
+			const void* Src = State.OccupancyReadback->Lock(uint32(Bytes));
+			if (Src != nullptr)
+			{
+				TArray<uint32> Words;
+				Words.SetNumUninitialized(int32(vxc::kFluidVolumeWords));
+				FMemory::Memcpy(Words.GetData(), Src, Bytes);
+				State.OccupancyReadback->Unlock();
+
+				FScopeLock Lock(&State.SnapshotLock);
+				State.OccupancyVerifyWords = MoveTemp(Words);
+				State.OccupancyVerifySnapshotGeneration = State.OccupancyReadbackGeneration;
+			}
+			State.bOccupancyReadbackInFlight = false;
+		}
+
 		if (State.bDebugReadbackInFlight && State.DebugReadback->IsReady())
 		{
 			const uint32 Bytes = State.DebugReadbackSlots * sizeof(VoxelFluidSim::FParticleCPU);
@@ -457,10 +502,49 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 		return;
 	}
 
+	// COLLISION IS NOT OPTIONAL. The kernels are compiled with the occupancy
+	// read baked in (ModifyCompilationEnvironment above), so a tick without a
+	// volume is refused and COUNTED rather than run against unbound bits.
+	// A skipped tick freezes the water for a frame, which is the designed
+	// "blocked, never guessed" behaviour; the counter keeps it visible.
+	if (Args.Occupancy == nullptr || !FVoxelFluidOccupancyVolume::IsSupportedOnCurrentRHI())
+	{
+		{
+			FScopeLock Lock(&State.SnapshotLock);
+			State.TicksSkippedNoOccupancy++;
+			State.TicksSkippedNoOccupancySnapshot = State.TicksSkippedNoOccupancy;
+		}
+		PollCompletions(State);
+		return;
+	}
+
 	State.TickGeneration++;
 
 	FRDGBuilder GraphBuilder(RHICmdList);
 	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidSim");
+
+	// ---- occupancy volume: clear + queued region fills, FIRST ---------------
+	// Same graph, before any solver pass, or a substep collides against last
+	// frame's terrain -- and RDG will NOT catch that (a stale-but-valid buffer
+	// read is not an error). Enforced, not trusted: the AddPassesCount guard
+	// below fails the build of any refactor that moves the fill into a
+	// different graph or after the solver passes.
+	const uint64 OccupancySerialBefore = Args.Occupancy->GetStats().AddPassesCount;
+	FRDGBufferRef OccupancyBits = Args.Occupancy->AddPasses(GraphBuilder);
+	checkf(Args.Occupancy->GetStats().AddPassesCount == OccupancySerialBefore + 1,
+	       TEXT("occupancy AddPasses must run exactly once, in this graph, before the solver passes"));
+	if (OccupancyBits == nullptr)
+	{
+		// The RHI refused the volume (no compute). Counted, not silent.
+		{
+			FScopeLock Lock(&State.SnapshotLock);
+			State.TicksSkippedNoOccupancy++;
+			State.TicksSkippedNoOccupancySnapshot = State.TicksSkippedNoOccupancy;
+		}
+		GraphBuilder.Execute(); // the clear/fill passes already added stay valid
+		PollCompletions(State);
+		return;
+	}
 
 	// ---- persistent buffers -----------------------------------------------
 	// Allocated once, cleared once, re-registered every frame. See the
@@ -566,25 +650,32 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 		                             Shader, Params, FIntVector(1, 1, 1));
 	}
 
-	// ---- pass 2: spawn (optional) -----------------------------------------
-	if (Args.Spawn.Count > 0)
+	// ---- pass 2: spawn dispatches (0..N per tick) -------------------------
+	// One dispatch per request; RDG serialises them on the shared UAVs, which
+	// is required -- two spawn passes race on the freelist top otherwise. The
+	// subsystem bounds the list (faucet count is bounded by the emit budget).
+	for (const FVoxelFluidSpawnRequest& Spawn : Args.Spawns)
 	{
+		if (Spawn.Count == 0)
+		{
+			continue;
+		}
 		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidSpawnCS::FParameters>();
-		Params->SpawnCount = Args.Spawn.Count;
-		Params->SpawnMode = Args.Spawn.Mode;
-		Params->SpawnSeed = Args.Spawn.Seed;
-		Params->SpawnEdge = CubeEdgeForCount(Args.Spawn.Count);
-		Params->SpawnBatchId = Args.Spawn.BatchId;
-		Params->SpawnCenterLocalUU = Args.Spawn.CenterLocalUU;
-		Params->SpawnVelUU = Args.Spawn.VelocityUU;
+		Params->SpawnCount = Spawn.Count;
+		Params->SpawnMode = Spawn.Mode;
+		Params->SpawnSeed = Spawn.Seed;
+		Params->SpawnEdge = CubeEdgeForCount(Spawn.Count);
+		Params->SpawnBatchId = Spawn.BatchId;
+		Params->SpawnCenterLocalUU = Spawn.CenterLocalUU;
+		Params->SpawnVelUU = Spawn.VelocityUU;
 		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
 		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
 		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);
 		Params->SlotCounters = GraphBuilder.CreateUAV(SlotCountersRDG);
 		TShaderMapRef<FVoxelFluidSpawnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder,
-		                             RDG_EVENT_NAME("VoxelFluid.Spawn(%u)", Args.Spawn.Count),
-		                             Shader, Params, GroupsForSlots(Args.Spawn.Count));
+		                             RDG_EVENT_NAME("VoxelFluid.Spawn(%u)", Spawn.Count),
+		                             Shader, Params, GroupsForSlots(Spawn.Count));
 	}
 
 	// ---- pass 3: integrate -------------------------------------------------
@@ -675,7 +766,6 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 			auto* Params = GraphBuilder.AllocParameters<FVoxelFluidDeltaPosCS::FParameters>();
 			Params->SimSlotCount = Slots;
 			Params->RestDensity = RestDensity;
-			Params->GroundZLocalUU = Args.GroundZLocalUU;
 			Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
 			Params->InPositions = GraphBuilder.CreateSRV(CurIn);
 			Params->InLambdas = GraphBuilder.CreateSRV(LambdasRDG);
@@ -683,6 +773,7 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 			Params->InCellCounts = GraphBuilder.CreateSRV(CellCountsRDG);
 			Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
 			Params->OutPositions = GraphBuilder.CreateUAV(CurOut);
+			Args.Occupancy->BindShaderParameters(GraphBuilder, *Params);
 			TShaderMapRef<FVoxelFluidDeltaPosCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 			FComputeShaderUtils::AddPass(GraphBuilder,
 			                             RDG_EVENT_NAME("VoxelFluid.DeltaPos(it %d)", It),
@@ -699,11 +790,17 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 		Params->SimSlotCount = Slots;
 		Params->Dt = Args.Dt;
 		Params->BoundaryHalfExtentUU = Args.BoundaryHalfExtentUU;
+		Params->BoundaryCenterLocalUU = Args.BoundaryCenterLocalUU;
+		Params->BasinSinkEnabled = Args.bBasinSinkEnabled ? 1u : 0u;
+		Params->BasinBoxMinLocalUU = Args.BasinBoxMinLocalUU;
+		Params->BasinBoxMaxLocalUU = Args.BasinBoxMaxLocalUU;
+		Params->BasinDatumZLocalUU = Args.BasinDatumZLocalUU;
 		Params->InPositions = GraphBuilder.CreateSRV(CurIn);
 		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
 		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
 		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);
 		Params->SlotCounters = GraphBuilder.CreateUAV(SlotCountersRDG);
+		Args.Occupancy->BindShaderParameters(GraphBuilder, *Params);
 		TShaderMapRef<FVoxelFluidFinalizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
 		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.Finalize"),
 		                             Shader, Params, GroupsForSlots(Slots));
@@ -759,6 +856,23 @@ void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
 		}
 	}
 
+	// The occupancy VERIFY readback (voxel.Fluid.Occupancy.Verify): the whole
+	// 16 MiB volume, copied AFTER this graph's fill passes so the snapshot is
+	// exactly what this tick's solver collided against. Single-buffered and
+	// debug-only; the game thread byte-compares one region per landed snapshot
+	// against vxc::fluidFillRegion, the CPU reference.
+	if (Args.bVerifyOccupancy && !State.bOccupancyReadbackInFlight)
+	{
+		if (!State.OccupancyReadback.IsValid())
+		{
+			State.OccupancyReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelFluid.OccupancyVerify"));
+		}
+		AddEnqueueCopyPass(GraphBuilder, State.OccupancyReadback.Get(), OccupancyBits,
+		                   uint32(vxc::kFluidVolumeWords * sizeof(uint32)));
+		State.OccupancyReadbackGeneration = State.TickGeneration;
+		State.bOccupancyReadbackInFlight = true;
+	}
+
 	// ---- GPU timing bracket (end) ------------------------------------------
 	if (Timing != nullptr)
 	{
@@ -790,6 +904,8 @@ void VoxelFluidSim::ReleaseRenderThread(FVoxelFluidSimState& State)
 	}
 	State.DebugReadback.Reset();
 	State.bDebugReadbackInFlight = false;
+	State.OccupancyReadback.Reset();
+	State.bOccupancyReadbackInFlight = false;
 	for (auto& Pair : State.TimingRing)
 	{
 		Pair.Begin.SafeRelease();

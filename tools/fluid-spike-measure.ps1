@@ -28,6 +28,14 @@ param(
     [int]$Particles = 100000,
     [int]$Seconds = 90,
     [int]$Emit = 0,
+    # Phase 3 integration arms (docs/water-phase3-integration-2026-08-09.md):
+    # -Faucets drives the headwater/sill faucet lifecycle + both sinks;
+    # -Verify runs the GPU-vs-CPU occupancy gate for the whole window;
+    # -DefaultQ overrides voxel.Fluid.Faucets.DefaultQ (m^3/yr) for a visible
+    # lake rise in a short window. Pass -Particles 0 to run faucets-only.
+    [switch]$Faucets,
+    [switch]$Verify,
+    [double]$DefaultQ = 0,
     [string]$SpawnAt = '-60688,-51716',
     [string]$Name = "fluid-spike-$([int]($Particles/1000))k"
 )
@@ -42,7 +50,12 @@ if (Get-Process UnrealEditor -ErrorAction SilentlyContinue) {
 
 # -ExecCmds is fine here (unlike the mesh-producer forks) because the fluid
 # subsystem reads its cvars per tick, not once at streaming start.
-$Cmds = "voxel.Fluid.Enable 1, voxel.Fluid.Spawn $Particles" + $(if ($Emit -gt 0) { ", voxel.Fluid.Emit $Emit" } else { "" })
+$Cmds = "voxel.Fluid.Enable 1"
+if ($Particles -gt 0) { $Cmds += ", voxel.Fluid.Spawn $Particles" }
+if ($Emit -gt 0)      { $Cmds += ", voxel.Fluid.Emit $Emit" }
+if ($Faucets)         { $Cmds += ", voxel.Fluid.Faucets 1" }
+if ($Verify)          { $Cmds += ", voxel.Fluid.Occupancy.Verify 1" }
+if ($DefaultQ -gt 0)  { $Cmds += ", voxel.Fluid.Faucets.DefaultQ $DefaultQ" }
 
 & $Editor "D:\voxelsim\ue-project\VoxelEarth.uproject" -game -windowed -ResX=2560 -ResY=1440 `
     "-VoxelSpawnAt=$SpawnAt" -VoxelSpawnAltM=60 -VoxelTimeOfDay=12:00 -VoxelTimeScale=0 `
@@ -65,12 +78,34 @@ $Perf | Select-Object -First 3 | Write-Output
 Write-Output "..."
 $Perf | Select-Object -Last 3 | Write-Output
 
-# Sim ms percentiles, if the line carries 'sim=<ms>ms' per the spike spec.
-$Ms = $Perf | ForEach-Object { if ($_ -match 'sim=([0-9.]+)ms') { [double]$Matches[1] } } | Sort-Object
+# Sim GPU ms percentiles ('simGpuMs=<ms>' -- the shipped perf-line field; the
+# spike-era 'sim=<ms>ms' form is kept as a fallback so old logs still parse).
+$Ms = $Perf | ForEach-Object {
+    if ($_ -match 'simGpuMs=([0-9.]+)') { [double]$Matches[1] }
+    elseif ($_ -match 'sim=([0-9.]+)ms') { [double]$Matches[1] }
+} | Where-Object { $_ -ge 0 } | Sort-Object
 if ($Ms.Count -gt 0) {
     $p50 = $Ms[[int]($Ms.Count * 0.5)]
     $p95 = $Ms[[math]::Min($Ms.Count - 1, [int]($Ms.Count * 0.95))]
-    Write-Output ("sim ms: p50 {0:N2}  p95 {1:N2}  n {2}" -f $p50, $p95, $Ms.Count)
+    Write-Output ("sim GPU ms: p50 {0:N2}  p95 {1:N2}  n {2}" -f $p50, $p95, $Ms.Count)
 }
 $Viol = $Perf | Where-Object { $_ -match 'CONSERVATION' -and $_ -notmatch 'ok' }
 if ($Viol) { Write-Output "CONSERVATION VIOLATIONS:"; $Viol | Write-Output } else { Write-Output "conservation: no violations logged" }
+
+# Phase 3 arms: scalar-ledger violations, occupancy verify verdicts, and the
+# last lifecycle ledger line -- each reported as ran/did-not-run explicitly.
+$Scalar = Select-String -Path $Log -Pattern 'SCALAR LEDGER VIOLATION' | ForEach-Object Line
+if ($Scalar) { Write-Output "SCALAR LEDGER VIOLATIONS:"; $Scalar | Write-Output }
+elseif ($Faucets) { Write-Output "scalar ledger: no violations logged" }
+if ($Verify) {
+    $Fails = $Perf | Where-Object { $_ -match 'verify=FAIL' }
+    $Pass = ($Perf | Where-Object { $_ -match 'verify=pass' }).Count
+    if ($Fails) { Write-Output "OCCUPANCY VERIFY FAILURES:"; $Fails | Select-Object -First 5 | Write-Output }
+    elseif ($Pass -gt 0) { Write-Output "occupancy verify: $Pass pass line(s), zero failures" }
+    else { Write-Output "occupancy verify: NEVER REACHED pass/fail (fill incomplete or stale-skipped all window) -- not evidence it passes" }
+}
+if ($Faucets) {
+    $Ledger = Select-String -Path $Log -Pattern 'Fluid ledger:' | ForEach-Object Line
+    if ($Ledger) { Write-Output "last ledger line:"; $Ledger | Select-Object -Last 1 | Write-Output }
+    else { Write-Output "faucets: NO ledger line -- the lifecycle emitted nothing (no heads in range, or DefaultQ 0)" }
+}

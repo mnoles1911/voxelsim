@@ -95,5 +95,30 @@ struct FVoxelFluidParticle
 //     changes VoxelFluidSolidAtVoxel's indexing (per-axis modulo) and lands as
 //     a versioned edit HERE when taken -- consumers must not assume flatness
 //     beyond this file's word.
+//
+// RATIFIED, INTEGRATION PASS (2026-08-09, collision + lifecycle wired):
+//  5. VOXEL_FLUID_HAS_COLLISION is now 1 in every shipping compile (set by
+//     FVoxelFluidShader::ModifyCompilationEnvironment). Consequences of item 1
+//     that are now LIVE rather than planned: FluidOriginUU is the occupancy
+//     volume's minimum corner, particle positions live in [0, 5120] UU, and
+//     the boundary despawn box is therefore NOT origin-centred any more --
+//     FluidFinalizeMain tests |p - BoundaryCenterLocalUU| > half extent, with
+//     the centre uploaded per frame ((2560,2560,2560) for the flat volume).
+//  6. THE BASIN SINK (v1, one basin). FluidFinalizeMain flags an alive
+//     particle DESPAWN_BASIN when BasinSinkEnabled != 0 and the particle sits
+//     inside [BasinBoxMinLocalUU, BasinBoxMaxLocalUU] with z at or below
+//     BasinDatumZLocalUU (the lake's LIVE, ledger-adjusted surface). Counted
+//     in ParticleCounts[1]; the CPU credits the scalar ledger at exactly
+//     vxc::kFluidLedgerUnitsPerParticle == 255 units per despawn (one
+//     particle == one 10 cm voxel == 1 L == 255 WaterCA fill units --
+//     derivation and the factor-of-255 test live in
+//     voxelcore/fluidlifecycle.h). One basin per frame is a stated v1 limit,
+//     not a layout: a table upload replaces the four uniforms when needed.
+//  7. VELOCITY AT A WALL. The solver's finalize walks the FULL step (stored
+//     position -> constrained position) through VoxelFluidResolveCollisionEx
+//     and, when blocked, lifts the stored previous position onto the contact
+//     plane before deriving v = (x - x_prev)/dt -- item 2's ratified recipe,
+//     now the implementation. Per-iteration DeltaPos correction keeps using
+//     the position-only projection; it derives no velocity.
 
 #endif // VOXEL_FLUID_CONTRACT_USH

@@ -243,6 +243,25 @@ public:
 	// a physics engine.
 	bool IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const;
 
+	// --- Water re-architecture Phase 3: the fluid occupancy edit-dirty hook --
+	//
+	// Registers (unset TFunction clears) the listener UVoxelFluidSubsystem
+	// uses to keep its GPU collision volume in step with terrain. Fired, with
+	// an INCLUSIVE world-voxel box, from exactly the two call sites
+	// VoxelFluidOccupancy.h documents:
+	//   * FVoxelWorldImpl::MarkChunkDirtyForRemesh, LEVEL-0 KEYS ONLY (a mip
+	//     key would fill the volume at the wrong grain) -- terrain EDITS,
+	//     reached from ApplyGroupedEdits;
+	//   * FVoxelWorldImpl::ApplyMeshResult, level 0 -- terrain ARRIVING, so a
+	//     chunk streaming in inside the volume replaces the unbuilt-solid
+	//     placeholder bits.
+	// The listener runs on the game thread, must be cheap (it is called per
+	// dirtied/delivered chunk), and must tolerate boxes far outside any fluid
+	// volume -- it does its own clipping. This is a NOTIFICATION hook only;
+	// nothing about meshing or streaming reads anything back from it.
+	void SetFluidTerrainDirtyListener(
+		TFunction<void(int64 MinVx, int64 MinVy, int64 MinVz, int64 MaxVx, int64 MaxVy, int64 MaxVz)> Listener);
+
 	// A PROVABLE UPPER BOUND, in absolute mm, on the amplified surface over
 	// every column in the inclusive voxel rectangle [Vx0, Vx1] x [Vy0, Vy1] --
 	// i.e. every voxel whose bottom sits at or above the returned value is

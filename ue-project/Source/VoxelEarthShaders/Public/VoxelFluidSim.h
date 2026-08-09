@@ -37,6 +37,7 @@
 
 class FRDGPooledBuffer;
 class FRHICommandListImmediate;
+class FVoxelFluidOccupancyVolume;
 
 // ---- contract mirror -------------------------------------------------------
 // C++ cannot include VoxelFluidContract.ush, so the constants the CPU side
@@ -147,13 +148,47 @@ struct FVoxelFluidSimTickArgs
 	// never under-estimate it, which is the safe direction -- a dead slot
 	// costs one flag test, a missed live slot would be a frozen particle.
 	uint32 SimSlotBound = 0;
-	// Fallback collision plane (origin-relative), used only while
-	// VOXEL_FLUID_HAS_COLLISION is 0 -- see VoxelFluidSim.usf.
+	// Fallback collision plane (origin-relative). DEAD in shipping compiles:
+	// VOXEL_FLUID_HAS_COLLISION is 1 (contract item 5) and the shader strips
+	// the parameter. Kept so an isolated no-collision compile of the .usf
+	// still has its plane.
 	float GroundZLocalUU = 0.0f;
-	// Despawn box half extent around the fluid origin. Default is half the
-	// contract's 512-voxel active region edge (51.2 m cube -> 2560 UU).
+	// Despawn box: half extent around BoundaryCenterLocalUU. With collision
+	// live the fluid origin is the occupancy volume's MIN corner, so the box
+	// centre is (2560, 2560, 2560) -- uploaded, not assumed (contract item 5).
 	float BoundaryHalfExtentUU = 2560.0f;
-	FVoxelFluidSpawnRequest Spawn;
+	FVector3f BoundaryCenterLocalUU = FVector3f::ZeroVector;
+
+	// THE COLLISION VOLUME. When set, TickRenderThread calls
+	// Occupancy->AddPasses on ITS OWN FRDGBuilder before any solver pass and
+	// binds the result into DeltaPos/Finalize -- the "same graph, fills
+	// first" ordering rule, enforced by a checkf against
+	// FStats::AddPassesCount. When null (or the RHI refuses the volume), the
+	// sim SKIPS the tick and counts it: with the collision define baked on
+	// there is no fallback path to silently run without terrain.
+	// LIFETIME: raw pointer; the enqueuing game thread captures its owning
+	// TSharedPtr in the same render-command lambda, which is what keeps this
+	// alive for the duration of the render-thread call.
+	FVoxelFluidOccupancyVolume* Occupancy = nullptr;
+
+	// Basin sink v1 (contract item 6): one basin's clipped box + live datum,
+	// origin-local UU. bBasinSinkEnabled false leaves the kernel's test off.
+	bool bBasinSinkEnabled = false;
+	FVector3f BasinBoxMinLocalUU = FVector3f::ZeroVector;
+	FVector3f BasinBoxMaxLocalUU = FVector3f::ZeroVector;
+	float BasinDatumZLocalUU = 0.0f;
+
+	// Spawn dispatches this tick, in order: at most one dam-break block plus
+	// every faucet (camera faucet, headwater faucets, sill faucets) that owes
+	// particles this frame. Each entry is one FluidSpawnMain dispatch; the
+	// subsystem enforces the per-tick particle budget before queueing.
+	TArray<FVoxelFluidSpawnRequest, TInlineAllocator<8>> Spawns;
+
+	// voxel.Fluid.Occupancy.Verify: also copy the whole 16 MiB occupancy
+	// buffer back this tick (single-buffered; skipped while one is in flight)
+	// so the game thread can byte-compare a region against the CPU reference.
+	bool bVerifyOccupancy = false;
+
 	// Debug-draw support: also read back the first DebugSlotCount particle
 	// structs this frame (bounded, see FVoxelFluidSimState::kDebugMaxSlots).
 	bool bReadbackDebugSlots = false;
@@ -220,6 +255,20 @@ public:
 	uint64 DebugReadbackGeneration = 0;
 	bool bDebugReadbackInFlight = false;
 
+	// Occupancy verify readback (voxel.Fluid.Occupancy.Verify): the whole
+	// 16 MiB bit volume, single-buffered, debug only. Copied AFTER the frame's
+	// fill passes so the snapshot is exactly what this tick's solver collided
+	// against.
+	TUniquePtr<FRHIGPUBufferReadback> OccupancyReadback;
+	uint64 OccupancyReadbackGeneration = 0;
+	bool bOccupancyReadbackInFlight = false;
+
+	// Ticks refused because Args.Occupancy was null or the volume could not
+	// register (unsupported RHI). Non-zero belongs in the perf line: with the
+	// collision define baked on, "sim silently ran without terrain" is not a
+	// state this system is allowed to have.
+	uint64 TicksSkippedNoOccupancy = 0;
+
 	// GPU timing: RQT_AbsoluteTime query pairs bracketing the sim pass span,
 	// issued as untracked NeverCull RDG passes at the start/end of the graph.
 	// Results are microseconds; polled non-blocking, so a value is always one
@@ -247,6 +296,12 @@ public:
 	TArray<FVector3f> DebugAlivePositionsLocal;
 	uint64 DebugSnapshotGeneration = 0;
 
+	// The landed occupancy-verify snapshot (all kFluidVolumeWords words), and
+	// which tick it was copied on. Consumed by MOVE (TakeOccupancyVerifyWords)
+	// because it is 16 MiB and the game thread compares it once.
+	TArray<uint32> OccupancyVerifyWords;
+	uint64 OccupancyVerifySnapshotGeneration = 0;
+
 	// Game-thread accessors (copy out under the lock).
 	FVoxelFluidCountsSnapshot GetLatestCounts() const
 	{
@@ -259,6 +314,28 @@ public:
 		Out = DebugAlivePositionsLocal;
 		OutGeneration = DebugSnapshotGeneration;
 	}
+	// Moves the landed verify snapshot out (empties the stored one). Returns
+	// false when no NEW snapshot has landed since the last take.
+	bool TakeOccupancyVerifyWords(TArray<uint32>& Out, uint64& OutGeneration, uint64 LastTakenGeneration)
+	{
+		FScopeLock Lock(&SnapshotLock);
+		if (OccupancyVerifySnapshotGeneration == 0 ||
+		    OccupancyVerifySnapshotGeneration == LastTakenGeneration || OccupancyVerifyWords.Num() == 0)
+		{
+			return false;
+		}
+		Out = MoveTemp(OccupancyVerifyWords);
+		OccupancyVerifyWords.Reset();
+		OutGeneration = OccupancyVerifySnapshotGeneration;
+		return true;
+	}
+	// Skipped-tick counter, game-thread readable (see TicksSkippedNoOccupancy).
+	uint64 GetTicksSkippedNoOccupancy() const
+	{
+		FScopeLock Lock(&SnapshotLock);
+		return TicksSkippedNoOccupancySnapshot;
+	}
+	uint64 TicksSkippedNoOccupancySnapshot = 0; // written under SnapshotLock by the render thread
 };
 
 namespace VoxelFluidSim

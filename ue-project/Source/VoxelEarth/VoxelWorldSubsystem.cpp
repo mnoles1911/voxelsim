@@ -4062,6 +4062,29 @@ private:
 	// direct-to-pool path, which already requires the pool to exist.
 	TWeakObjectPtr<USceneComponent> GpuPoolRoot;
 
+public:
+	// Water re-architecture Phase 3: the fluid occupancy edit-dirty listener
+	// (UVoxelWorldSubsystem::SetFluidTerrainDirtyListener -- public because
+	// that method assigns it). Called with an inclusive world-voxel box from
+	// MarkChunkDirtyForRemesh (level 0 only) and ApplyMeshResult (level 0).
+	// Unset for every session that never enables the fluid; both call sites
+	// test before invoking, so the cost of the hook to a fluid-less run is
+	// one branch.
+	TFunction<void(int64, int64, int64, int64, int64, int64)> FluidTerrainDirtyListener;
+
+	// Fires the listener for one level-0 chunk key's voxel footprint.
+	void NotifyFluidTerrainDirtyChunk(const VoxelCoords::FVoxelChunkKey& Key)
+	{
+		const int64 Edge = VoxelCoords::ChunkEdgeVoxels;
+		const int64 MinVx = int64(Key.X) * Edge;
+		const int64 MinVy = int64(Key.Y) * Edge;
+		const int64 MinVz = int64(Key.Z) * Edge;
+		FluidTerrainDirtyListener(MinVx, MinVy, MinVz, MinVx + Edge - 1, MinVy + Edge - 1,
+		                          MinVz + Edge - 1);
+	}
+
+private:
+
 	// Gives back whatever geometry a record is holding, on either path, and
 	// leaves the record geometry-less.
 	//
@@ -10884,6 +10907,17 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 	const bool bGpuResident = GpuQuads.IsValid();
 	const int32 NumQuads = bGpuResident ? GpuQuadCount : Quads.Num();
 
+	// Phase 3 fluid hook (VoxelFluidOccupancy.h call site 2): terrain
+	// ARRIVING. A chunk delivered inside the fluid's collision volume must
+	// replace the unbuilt-solid placeholder bits, or water piles up against
+	// terrain that is visibly not there. Level 0 only, same grain rule as the
+	// edit hook; fired regardless of quad count (an all-air chunk clearing to
+	// empty is exactly the case that frees frozen water).
+	if (Key.Level == 0 && FluidTerrainDirtyListener)
+	{
+		NotifyFluidTerrainDirtyChunk(Key.Key);
+	}
+
 	// docs/debug-tooling-plan.md P1 "Memory" row: ResidentQuads tracks
 	// currently-loaded quads (not the cumulative TotalQuadsLoaded below), so
 	// it must be decremented by whatever this record held before, regardless
@@ -11957,6 +11991,16 @@ void FVoxelWorldImpl::MarkChunkDirtyForRemesh(const VoxelCoords::FVoxelLevelChun
 	// shape and nothing in the system would report it. Cheap when parking is off
 	// (one empty-map lookup).
 	EvictParkedKey(LevelKey);
+
+	// Phase 3 fluid hook (VoxelFluidOccupancy.h call site 1): BEFORE the
+	// untracked early-return below, because an edit to a chunk the streamer
+	// does not currently track still changed terrain the fluid collides with.
+	// LEVEL-0 KEYS ONLY -- a mip key names coarse cells and would fill the
+	// collision volume at the wrong grain.
+	if (LevelKey.Level == 0 && FluidTerrainDirtyListener)
+	{
+		NotifyFluidTerrainDirtyChunk(LevelKey.Key);
+	}
 
 	VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 	if (!Rec)
@@ -14776,6 +14820,15 @@ bool UVoxelWorldSubsystem::IsSolidAtVoxel(int64 Vx, int64 Vy, int64 Vz) const
 	// dug voxel must read back as non-solid immediately, and a placed one as
 	// solid, for walk-mode collision to agree with what dig/place just did.
 	return Impl->Voxels.materialAt(Vx, Vy, Vz) != vxc::MAT_AIR;
+}
+
+void UVoxelWorldSubsystem::SetFluidTerrainDirtyListener(
+	TFunction<void(int64 MinVx, int64 MinVy, int64 MinVz, int64 MaxVx, int64 MaxVy, int64 MaxVz)> Listener)
+{
+	if (Impl)
+	{
+		Impl->FluidTerrainDirtyListener = MoveTemp(Listener);
+	}
 }
 
 bool UVoxelWorldSubsystem::RaycastVoxelWorld(const FVector& StartUU, const FVector& DirUU, double MaxDistUU,

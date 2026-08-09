@@ -41,12 +41,12 @@
 #include "/VoxelEarth/VoxelFluidContract.ush"
 
 // ---- collision -------------------------------------------------------------
-// The occupancy/collision pass is built in parallel (VoxelFluidCollision.ush,
-// another agent). Until it lands, this file must compile and run standalone,
-// so the two contract entry points are reached only behind this define and a
-// ground-plane fallback stands in for them. The C++ side does not set the
-// define yet; when the collision pass lands, its owner flips it via
-// ModifyCompilationEnvironment and the fallback disappears.
+// LIVE since the integration pass (contract "RATIFIED" item 5):
+// FVoxelFluidShader::ModifyCompilationEnvironment sets
+// VOXEL_FLUID_HAS_COLLISION=1 for every shipping compile, so the contract
+// entry points are the real path and the ground-plane #else arm below is kept
+// only for isolated/offline compiles of this file (dxc smoke tests) -- the
+// engine never takes it.
 #ifndef VOXEL_FLUID_HAS_COLLISION
 #define VOXEL_FLUID_HAS_COLLISION 0
 #endif
@@ -130,7 +130,23 @@
 uint   SimSlotCount;        // dispatch bound over particle slots (CPU high-water bound)
 float  Dt;                  // clamped on the CPU; never <= 0 when a pass runs
 float  GroundZLocalUU;      // fallback collision plane, origin-relative
-float  BoundaryHalfExtentUU;// despawn box half extent around the fluid origin
+float  BoundaryHalfExtentUU;// despawn box half extent around BoundaryCenterLocalUU
+// Centre of the boundary despawn box, origin-relative UU. NOT the origin any
+// more: with collision live the origin is the occupancy volume's MIN corner
+// (contract item 1/5), so the active box is [0, 5120]^3 and its centre is
+// (2560, 2560, 2560). Uploaded rather than derived so the no-collision debug
+// arm (centre 0) and the shipping arm share one kernel.
+float3 BoundaryCenterLocalUU;
+// ---- basin sink v1 (contract item 6): one basin's clipped box + live datum -
+// A particle inside the box at or below the datum has entered standing water:
+// it despawns to the scalar ledger (DESPAWN_BASIN, ParticleCounts[1]) and the
+// CPU credits 255 ledger units for it. BasinSinkEnabled 0 disables the test
+// entirely (no basin resolved, or the feature is off) -- an all-zero box must
+// never act as a sink at the origin.
+uint   BasinSinkEnabled;
+float3 BasinBoxMinLocalUU;
+float3 BasinBoxMaxLocalUU;
+float  BasinDatumZLocalUU;
 float  RestDensity;         // computed CPU-side from the rest lattice (see .cpp)
 uint   SpawnCount;
 uint   SpawnMode;
@@ -636,13 +652,20 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 // ---- kernel: finalize ------------------------------------------------------
 // v = (p_new - p_old) / dt, despawn checks, counter maintenance, and the
 // alive reduction. Order of operations per particle:
-//   1. derive + clamp velocity;
-//   2. boundary despawn (left the active box) -> flag, counter, free list;
-//   3. basin despawn -- NOT IMPLEMENTED IN THIS SPIKE. There is no basin data
-//      until Phase 1/2 ship the registry (plan Phase 1-2); the flag and the
-//      ParticleCounts[1] slot exist per the contract and stay at zero, which
-//      the subsystem's conservation check treats as a real zero, not absence;
-//   4. survivors count into ParticleCounts[0] and write back position+velocity.
+//   1. FULL-STEP collision walk pOld -> pNew (contract items 2/7): the
+//      per-iteration DeltaPos correction resolves only its own small dp, so a
+//      fast prediction that crossed a thin wall during INTEGRATE would never
+//      have been walked at all. The walk here from the stored (known-free)
+//      start-of-step position is the anti-tunnelling guarantee; when it
+//      blocks, x_prev's normal component is lifted onto the contact plane so
+//      the derived velocity has EXACTLY zero approach speed.
+//   2. derive + clamp velocity from the (possibly corrected) positions;
+//   3. basin despawn (contract item 6): inside the uploaded basin box at or
+//      below the live datum -> DESPAWN_BASIN, ParticleCounts[1], free list.
+//      Tested BEFORE the boundary so a basin clipped against the region edge
+//      credits the lake rather than leaking into the graph;
+//   4. boundary despawn (left the active box) -> flag, counter, free list;
+//   5. survivors count into ParticleCounts[0] and write back position+velocity.
 [numthreads(VOXEL_FLUID_GROUP, 1, 1)]
 void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 {
@@ -658,8 +681,22 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		return;
 	}
 
-	const float3 pNew = InPositions[i].xyz;
-	const float3 pOld = P.P0.xyz;
+	float3 pNew = InPositions[i].xyz;
+	float3 pOld = P.P0.xyz;
+#if VOXEL_FLUID_HAS_COLLISION
+	{
+		float3 n;
+		bool blocked;
+		pNew = VoxelFluidResolveCollisionEx(pNew, pOld, n, blocked);
+		if (blocked)
+		{
+			// Exact zero normal velocity: move pOld onto the contact plane, so
+			// v = (pNew - pOld)/dt below has no component along n. This is the
+			// contract's own ratified recipe (item 2), verbatim.
+			pOld -= n * dot(pOld - pNew, n);
+		}
+	}
+#endif
 	float3 v = (pNew - pOld) / Dt;
 	const float speed = length(v);
 	if (speed > VOXEL_FLUID_MAX_SPEED_UU)
@@ -667,10 +704,28 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		v *= VOXEL_FLUID_MAX_SPEED_UU / speed;
 	}
 
-	// Boundary despawn: outside the active box around the fluid origin. The
-	// box is origin-centred (positions are origin-relative, contract line
-	// 21-26), so this is a component-wise abs test.
-	const bool bOutside = any(abs(pNew) > BoundaryHalfExtentUU);
+	// Basin sink v1 (contract item 6). Enabled flag first: an unset box is
+	// all zeros and must not act as a sink at the volume corner.
+	if (BasinSinkEnabled != 0u &&
+	    all(pNew >= BasinBoxMinLocalUU) && all(pNew <= BasinBoxMaxLocalUU) &&
+	    pNew.z <= BasinDatumZLocalUU)
+	{
+		flags = VOXEL_FLUID_FLAG_DESPAWN_BASIN; // ALIVE cleared by assignment
+		InterlockedAdd(ParticleCounts[1], 1u);
+		uint top;
+		InterlockedAdd(SlotCounters[0], 1u, top);
+		// lint-shader-ub: allow UNGUARDED_WRITE - top is the freelist cursor; pushes are 1:1 with previously-ALIVE slots and there are at most VOXEL_FLUID_MAX_PARTICLES of those, which is the buffer's exact size (same argument as the boundary branch below)
+		FreeList[top] = i;
+		P.P0 = float4(pNew, asfloat(flags));
+		P.P1 = float4(v, P.P1.w);
+		ParticlesRW[i] = P;
+		return;
+	}
+
+	// Boundary despawn: outside the active box. Centre is uploaded (contract
+	// item 5: with collision live the origin is the volume's MIN corner, so
+	// the box is centred at (2560,2560,2560), not at the origin).
+	const bool bOutside = any(abs(pNew - BoundaryCenterLocalUU) > BoundaryHalfExtentUU);
 	if (bOutside)
 	{
 		flags = VOXEL_FLUID_FLAG_DESPAWN_BOUNDARY; // ALIVE cleared by assignment

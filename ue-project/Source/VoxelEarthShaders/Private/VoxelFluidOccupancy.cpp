@@ -21,7 +21,7 @@ namespace
 	// Mirrors of the shader's own arithmetic. Named rather than inlined,
 	// because every one of them is a place the host and the kernel could
 	// silently disagree about how big something is.
-	constexpr int32 kBrickEdge = vxc::kFluidBrickEdge;              // 8
+	constexpr int32 kFluidOccBrickEdge = vxc::kFluidBrickEdge;              // 8
 	constexpr int32 kVoxelsPerWord = vxc::kFluidBitsPerWord;        // 32
 	constexpr int32 kBricksPerWordX = vxc::kFluidBricksPerWordX;    // 4
 	constexpr int32 kBrickWords = vxc::kFluidBrickWords;            // 16
@@ -222,7 +222,7 @@ bool FVoxelFluidOccupancyVolume::UpdateRegion(FVoxelFluidOccupancyRegion&& Regio
 		                           TEXT("(%d voxels in x, %d in y/z) -- use SnapRegion"),
 		                           Region.MinVoxel.X, Region.MinVoxel.Y, Region.MinVoxel.Z,
 		                           Region.SizeVoxels.X, Region.SizeVoxels.Y, Region.SizeVoxels.Z,
-		                           kVoxelsPerWord, kBrickEdge);
+		                           kVoxelsPerWord, kFluidOccBrickEdge);
 	}
 	else if (int64(Region.BrickBits.Num()) != vxc::fluidRegionBrickWordCount(Ref))
 	{
@@ -323,6 +323,7 @@ FRDGBufferRef FVoxelFluidOccupancyVolume::AddPasses(FRDGBuilder& GraphBuilder)
 	TArray<FVoxelFluidOccupancyRegion> ToApply;
 	{
 		FScopeLock Lock(&QueueLock);
+		Stats.AddPassesCount++; // the solver's same-graph ordering guard reads this
 		bDoClear = bClearPending;
 		bClearPending = false;
 		if (bDoClear)
@@ -415,7 +416,7 @@ FRDGBufferRef FVoxelFluidOccupancyVolume::AddPasses(FRDGBuilder& GraphBuilder)
 // Every one of these is a number that appears in more than one place; a
 // mismatch is a partially filled volume, and a partially filled volume is
 // solid where it should be air, which reads as terrain rather than as a bug.
-static_assert(kBrickEdge == 8, "FluidOccupancyFillMain shifts by 3 for the brick index");
+static_assert(kFluidOccBrickEdge == 8, "FluidOccupancyFillMain shifts by 3 for the brick index");
 static_assert(kVoxelsPerWord == 32, "FluidOccupancyFillMain shifts by 5 for the word index");
 static_assert(kBricksPerWordX == 4, "FluidOccupancyFillMain's unrolled gather is four bricks wide");
 static_assert(kBrickWords == 16, "FluidOccupancyFillMain multiplies the brick index by 16");

@@ -1049,6 +1049,25 @@ struct FVoxelWaterImpl
 	int64 BasinSpillUnitsRefunded = 0;
 	int64 BasinReplicatedRows = 0;
 
+	// --- Phase 3 sill-faucet intercept (see SetFluidSpillIntercept) ---------
+	// While enabled, spill events whose baked outlet falls inside the box are
+	// HELD here for the fluid host instead of routed into the graph. Each
+	// entry carries the wall-clock second it was parked, so RouteBasinSpills
+	// can refund anything a dead or stalled fluid host never drained -- held
+	// units are OWED water, and the timeout is what keeps "owed" from decaying
+	// into "lost".
+	bool bFluidSpillInterceptEnabled = false;
+	double FluidSpillBoxMinXUU = 0.0, FluidSpillBoxMinYUU = 0.0;
+	double FluidSpillBoxMaxXUU = 0.0, FluidSpillBoxMaxYUU = 0.0;
+	struct FFluidHeldSpill
+	{
+		vxc::BasinSpillEvent Event;
+		double HeldSinceSeconds = 0.0;
+	};
+	std::vector<FFluidHeldSpill> FluidSpillHeld;
+	int64 FluidSpillUnitsClaimed = 0;  // handed to the fluid host, session total
+	int64 FluidSpillUnitsTimedOut = 0; // refunded by the grace-window flush
+
 	// The routing-graph half of the hydrology blob, held from load until the
 	// graph exists to apply it to.
 	//
@@ -3330,6 +3349,36 @@ int64 CreditBasinAndSync(FVoxelWaterImpl& Impl, vxc::BasinId Id, int64 Units)
 // real and there is nowhere for it to go.
 void RouteBasinSpills(FVoxelWaterImpl& Impl)
 {
+	// --- Phase 3 sill-faucet housekeeping, BEFORE the queue drain ----------
+	// Held events are water the fluid host owes; two ways they stop being
+	// held: the host drains them (DrainFluidSpillFaucets), or this flush
+	// refunds them -- on intercept disable, or after a grace window that a
+	// live host can never hit (it drains every tick; 10 s is ~600 ticks).
+	if (!Impl.FluidSpillHeld.empty())
+	{
+		constexpr double kFluidSpillGraceSeconds = 10.0;
+		const double Now = FPlatformTime::Seconds();
+		for (auto It = Impl.FluidSpillHeld.begin(); It != Impl.FluidSpillHeld.end();)
+		{
+			if (!Impl.bFluidSpillInterceptEnabled ||
+			    Now - It->HeldSinceSeconds > kFluidSpillGraceSeconds)
+			{
+				const int64 Back = Impl.Basins ? Impl.Basins->refundSpill(It->Event.basin, It->Event.units) : 0;
+				Impl.FluidSpillUnitsTimedOut += Back;
+				Impl.BasinSpillUnitsRefunded += Back;
+				if (Back > 0 && Impl.Water)
+				{
+					Impl.Water->invalidateBasinDatumMemo();
+				}
+				It = Impl.FluidSpillHeld.erase(It);
+			}
+			else
+			{
+				++It;
+			}
+		}
+	}
+
 	if (!Impl.Basins || Impl.Basins->pendingSpill().empty())
 	{
 		return;
@@ -3339,25 +3388,53 @@ void RouteBasinSpills(FVoxelWaterImpl& Impl)
 	// that cannot find a reach within one pixel is not near its own channel and
 	// must refuse rather than search outward into a neighbouring valley.
 	const int64 MaxReachMm = Impl.Water ? int64(Impl.Water->pixelSizeMm()) : 1875;
+
+	// An explicit drain rather than vxc::routeSpills, because the Phase 3
+	// sill-faucet intercept needs the BASIN ID of each event (to refund what
+	// the fluid cannot emit) and routeSpills' inject callback deliberately
+	// does not carry it. The graph-or-refund arm below is routeSpills'
+	// documented semantics verbatim: clamp what the graph took, refund the
+	// remainder to the basin it came from.
+	const double Now = FPlatformTime::Seconds();
+	int64 Routed = 0;
 	int64 Refunded = 0;
-	const int64 Routed = vxc::routeSpills(
-		*Impl.Basins,
-		[&](int64 Vx, int64 Vy, int64 Units, int32 /*SpillMm*/) -> int64
+	for (const vxc::BasinSpillEvent& E : Impl.Basins->drainSpillEvents())
+	{
+		// Phase 3 intercept: an outlet inside the fluid's active region is the
+		// fluid's to emit as particles (a sill FAUCET), not the graph's to
+		// route. Held, timestamped, and owed -- the flush above refunds it if
+		// the fluid host never drains it.
+		if (Impl.bFluidSpillInterceptEnabled)
 		{
-			if (!Impl.Rivers)
+			const FVector OutletUU =
+				VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{E.outletVx, E.outletVy, 0});
+			if (OutletUU.X >= Impl.FluidSpillBoxMinXUU && OutletUU.X <= Impl.FluidSpillBoxMaxXUU &&
+			    OutletUU.Y >= Impl.FluidSpillBoxMinYUU && OutletUU.Y <= Impl.FluidSpillBoxMaxYUU)
 			{
-				return 0;
+				Impl.FluidSpillHeld.push_back({E, Now});
+				Impl.FluidSpillUnitsClaimed += E.units;
+				continue;
 			}
-			const uint32 Seg = Impl.Rivers->nearestSegmentToVoxel(Vx, Vy, MaxReachMm);
-			if (Seg == vxc::RiverNetwork::kNoSegment)
+		}
+
+		int64 Took = 0;
+		if (Impl.Rivers)
+		{
+			const uint32 Seg = Impl.Rivers->nearestSegmentToVoxel(E.outletVx, E.outletVy, MaxReachMm);
+			if (Seg != vxc::RiverNetwork::kNoSegment)
 			{
-				return 0;
+				const int32 Amount = int32(vxc::clampi64(E.units, 0, INT32_MAX));
+				Impl.Rivers->injectInflow(Seg, Amount);
+				Took = int64(Amount);
 			}
-			const int32 Amount = int32(vxc::clampi64(Units, 0, INT32_MAX));
-			Impl.Rivers->injectInflow(Seg, Amount);
-			return int64(Amount);
-		},
-		&Refunded);
+		}
+		Routed += Took;
+		const int64 Back = E.units - Took;
+		if (Back > 0)
+		{
+			Refunded += Impl.Basins->refundSpill(E.basin, Back);
+		}
+	}
 	Impl.BasinSpillUnitsRouted += Routed;
 	Impl.BasinSpillUnitsRefunded += Refunded;
 	if (Refunded > 0)
@@ -6978,6 +7055,189 @@ void UVoxelWaterSubsystem::GetBasinLedgerStats(bool& bOutLedgerActive, int32& Ou
 	OutSpilledUnits = Impl->Basins->totalSpilled();
 	OutRoutedUnits = Impl->BasinSpillUnitsRouted;
 	OutRefundedUnits = Impl->BasinSpillUnitsRefunded;
+}
+
+// --- PHASE 3 LIFECYCLE ACCESSORS (see the header block) ---------------------
+
+int32 UVoxelWaterSubsystem::GatherHeadwaterFaucets(double CenterXUU, double CenterYUU, double RadiusUU,
+                                                   TArray<FVoxelHeadwaterFaucet>& Out,
+                                                   bool& bOutFromBakedHeads)
+{
+	bOutFromBakedHeads = false;
+	if (!Impl || !Impl->Water || RadiusUU <= 0.0)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // decodes tile blocks (fallback arm) / walks tile tables
+
+	vxc::FineTileSampler* Tiles = Impl->Water->ribbonTiles();
+	if (Tiles == nullptr)
+	{
+		return 0;
+	}
+	const int64 PixelMm = int64(Tiles->pixelSizeMm());
+	const uint32 TileSize = Tiles->tileSize();
+	if (PixelMm <= 0 || TileSize == 0)
+	{
+		return 0;
+	}
+
+	const int64 MinPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU - RadiusUU), PixelMm);
+	const int64 MaxPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU + RadiusUU), PixelMm);
+	const int64 MinPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU - RadiusUU), PixelMm);
+	const int64 MaxPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU + RadiusUU), PixelMm);
+	const int32 Before = Out.Num();
+
+	// Source 1: the baked SECTION_HEADWATERS table (bake_ver 24). Exact points
+	// with per-head Q. "Any overlapped tile has a RESIDENT table" is the
+	// eligibility test -- a tile that merely predates bv24 must not veto the
+	// tiles that carry the data.
+	const int32 Tx0 = int32(vxc::floorDiv(MinPx, int64(TileSize)));
+	const int32 Tx1 = int32(vxc::floorDiv(MaxPx, int64(TileSize)));
+	const int32 Ty0 = int32(vxc::floorDiv(MinPy, int64(TileSize)));
+	const int32 Ty1 = int32(vxc::floorDiv(MaxPy, int64(TileSize)));
+	bool bAnyHeadsTable = false;
+	for (int32 Ty = Ty0; Ty <= Ty1; ++Ty)
+	{
+		for (int32 Tx = Tx0; Tx <= Tx1; ++Tx)
+		{
+			const vxc::FineTile* T = Tiles->findTile(Tx, Ty);
+			if (T == nullptr || !T->hasHeads() || !T->headsResident())
+			{
+				continue;
+			}
+			bAnyHeadsTable = true;
+			const int64 Ox = int64(Tx) * int64(TileSize);
+			const int64 Oy = int64(Ty) * int64(TileSize);
+			for (const vxc::HeadEntry& H : T->heads())
+			{
+				const int64 Px = Ox + int64(H.px);
+				const int64 Py = Oy + int64(H.py);
+				if (Px < MinPx || Px > MaxPx || Py < MinPy || Py > MaxPy)
+				{
+					continue;
+				}
+				FVoxelHeadwaterFaucet F;
+				// Pixel CENTRE, the same convention every other consumer of a
+				// fine pixel uses (a corner-anchored faucet is half a pixel --
+				// 0.94 m -- off its channel).
+				F.XUU = VoxelCoords::MmToWorld(Px * PixelMm + PixelMm / 2);
+				F.YUU = VoxelCoords::MmToWorld(Py * PixelMm + PixelMm / 2);
+				F.QM3PerYear = double(H.qM3PerYear);
+				Out.Add(F);
+			}
+		}
+	}
+	if (bAnyHeadsTable)
+	{
+		bOutFromBakedHeads = true;
+		return Out.Num() - Before;
+	}
+
+	// Source 2 (bv23 fallback): a throwaway baked-water graph over the same
+	// box; its no-incoming-segment nodes are the heads. rivernet.h's caveat is
+	// inherited knowingly: reaches ENTERING the box read as heads at the rim,
+	// and Q is unknowable here (build-time discharge is catchment AREA, not a
+	// rate), so QM3PerYear stays 0 and the caller substitutes its default.
+	vxc::FineTileBakedWaterSource Source(*Tiles);
+	vxc::RiverNetwork Net;
+	vxc::BakedWaterBuildParams Params;
+	Params.bounds = vxc::RegionBounds{MinPx, MinPy, MaxPx, MaxPy};
+	Net.buildFromBakedWater(Source, Impl->Terrain.GetSeed(), Params);
+	for (const uint32 NodeId : Net.headwaterNodes())
+	{
+		const vxc::RiverNode& N = Net.nodes()[size_t(NodeId)];
+		const FVector C = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{N.vx, N.vy, 0});
+		FVoxelHeadwaterFaucet F;
+		F.XUU = C.X;
+		F.YUU = C.Y;
+		F.QM3PerYear = 0.0;
+		Out.Add(F);
+	}
+	return Out.Num() - Before;
+}
+
+int64 UVoxelWaterSubsystem::InjectRiverInflowNearVoxel(int64 Vx, int64 Vy, int64 Units, int64 MaxReachMm)
+{
+	if (!Impl || !Impl->Rivers || Units <= 0 || MaxReachMm <= 0)
+	{
+		return 0;
+	}
+	const uint32 Seg = Impl->Rivers->nearestSegmentToVoxel(Vx, Vy, MaxReachMm);
+	if (Seg == vxc::RiverNetwork::kNoSegment)
+	{
+		return 0;
+	}
+	// injectInflow takes int32; a >2^31-unit hand-off (8.4 GL in one call)
+	// would only happen on a pathological backlog, but looping costs nothing
+	// and truncating would break the all-or-nothing contract the header gives.
+	int64 Remaining = Units;
+	while (Remaining > 0)
+	{
+		const int32 Chunk = int32(vxc::clampi64(Remaining, 0, INT32_MAX));
+		Impl->Rivers->injectInflow(Seg, Chunk);
+		Remaining -= int64(Chunk);
+	}
+	return Units;
+}
+
+void UVoxelWaterSubsystem::SetFluidSpillIntercept(bool bEnabled, double MinXUU, double MinYUU,
+                                                  double MaxXUU, double MaxYUU)
+{
+	if (!Impl)
+	{
+		return;
+	}
+	Impl->bFluidSpillInterceptEnabled = bEnabled;
+	Impl->FluidSpillBoxMinXUU = MinXUU;
+	Impl->FluidSpillBoxMinYUU = MinYUU;
+	Impl->FluidSpillBoxMaxXUU = MaxXUU;
+	Impl->FluidSpillBoxMaxYUU = MaxYUU;
+	// Disabling refunds everything still held -- RouteBasinSpills' flush does
+	// it on the next fixed step, which keeps the refund on the same code path
+	// (and the same counters) as the grace-window timeout.
+}
+
+int32 UVoxelWaterSubsystem::DrainFluidSpillFaucets(TArray<FVoxelFluidSpillFaucet>& Out)
+{
+	if (!Impl || Impl->FluidSpillHeld.empty())
+	{
+		return 0;
+	}
+	const int32 Before = Out.Num();
+	for (const auto& Held : Impl->FluidSpillHeld)
+	{
+		const FVector OutletUU = VoxelCoords::VoxelToWorldCenter(
+			VoxelCoords::FVoxelCoord{Held.Event.outletVx, Held.Event.outletVy, 0});
+		FVoxelFluidSpillFaucet F;
+		F.BasinKey = Held.Event.basin.v;
+		F.Units = Held.Event.units;
+		F.OutletXUU = OutletUU.X;
+		F.OutletYUU = OutletUU.Y;
+		F.SpillZUU = VoxelCoords::MmToWorld(int64(Held.Event.spillMm));
+		Out.Add(F);
+	}
+	Impl->FluidSpillHeld.clear();
+	return Out.Num() - Before;
+}
+
+int64 UVoxelWaterSubsystem::RefundSpillUnits(uint64 BasinKey, int64 Units)
+{
+	if (!Impl || !Impl->Basins || Units <= 0)
+	{
+		return 0;
+	}
+	const int64 Given = Impl->Basins->refundSpill(vxc::BasinId{BasinKey}, Units);
+	if (Given > 0)
+	{
+		Impl->BasinSpillUnitsRefunded += Given;
+		if (Impl->Water)
+		{
+			Impl->Water->invalidateBasinDatumMemo(); // the lake rose back up
+		}
+		Impl->BasinDirtySinceLastBroadcast.Add(BasinKey);
+	}
+	return Given;
 }
 
 void UVoxelWaterSubsystem::AbandonRiverRibbonWindow()
