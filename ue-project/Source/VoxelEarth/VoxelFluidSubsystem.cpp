@@ -1162,7 +1162,12 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			// snapshot is anyway.)
 			const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
 			const uint32 AliveNow = Snapshot.bValid ? Snapshot.Alive : 0u;
-			const uint32 SoftCap = uint32(VoxelFluidSim::kMaxParticles / 2);      // 153k
+			// kMaxParticles/3 = 102k: the MEASURED knee. 100k settled costs
+			// simGpuMs 2.4 (sorted gathers); the first backpressure run let the
+			// pool reach 156k and paid 21 ms -- deep piles compress and the
+			// constraint cost is superlinear in local density, so the cap sits
+			// at the scale the measurements actually cleared.
+			const uint32 SoftCap = uint32(VoxelFluidSim::kMaxParticles / 3);
 			const uint32 RampWidth = SoftCap / 2;                                  // full->zero over 76k
 			float EmitScale = 1.0f;
 			if (AliveNow >= SoftCap)
