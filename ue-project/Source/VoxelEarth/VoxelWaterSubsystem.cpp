@@ -114,6 +114,19 @@ static TAutoConsoleVariable<bool> CVarVoxelWaterSolidCache(
 // therefore latched into FVoxelWaterImpl::bImplicitOcean at construction and
 // re-read only in Tick, before the fixed-step loop -- the same discipline
 // MaybeArmSwe uses for voxel.Water.SWE and for the same reason.
+// Phase 5 of the water re-architecture (docs/water-rearchitecture-plan-2026-08-09.md):
+// stop drawing the baked river plane as near-field voxel water. Lakes, ocean
+// and cavern flood still draw; the far-field ribbons still read the plane
+// directly; the PBF fluid owns near-field rivers. 0 restores the old draw for
+// A/B. The magenta debug marker reads the same sampler, so with this on it
+// shows lakes only. Read in Tick, pushed into the sampler's atomic -- the
+// sampler is queried on worker threads.
+static TAutoConsoleVariable<int32> CVarVoxelWaterRetireBakedRivers(
+	TEXT("voxel.Water.RetireBakedRivers"), 1,
+	TEXT("Phase 5: near-field rivers come from the fluid sim, not the baked plane. ")
+	TEXT("Lakes/ocean/caverns unaffected; far-field ribbons unaffected. 0 = old draw."),
+	ECVF_Default);
+
 static TAutoConsoleVariable<bool> CVarVoxelWaterImplicitOcean(
 	TEXT("voxel.Water.ImplicitOcean"), true,
 	TEXT("Watershed §6.4: the sea as the third term of the water ImplicitFn -- open air below ")
@@ -438,7 +451,26 @@ public:
 	int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) override
 	{
 		EnsureTileFor(vx, vy);
+		// PHASE 5: the baked river plane is RETIRED from the near-field draw.
+		// Rivers near the player are the PBF sim's job; this sampler answers
+		// with lakes only (ocean and cavern flood are separate terms in the
+		// caller). The plane keeps shipping and keeps feeding the far-field
+		// ribbons (ribbonRivers() hands the river half out directly) and the
+		// faucet placement -- DATA now, not shape. Atomic because this is the
+		// CA's hottest query and it runs on workers; the flag is pushed from
+		// the cvar on the game thread.
+		if (bRetireBakedRivers.load(std::memory_order_relaxed))
+		{
+			return Lakes.waterSurfaceMmAtVoxel(vx, vy);
+		}
 		return Both.waterSurfaceMmAtVoxel(vx, vy);
+	}
+
+	std::atomic<bool> bRetireBakedRivers{true};
+
+	void setRetireBakedRivers(bool bRetire) override
+	{
+		bRetireBakedRivers.store(bRetire, std::memory_order_relaxed);
 	}
 
 	// Work item 5's sheet half. Same load-then-ask shape as the column query
@@ -5813,6 +5845,11 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 
 		// voxel.Water.ImplicitOcean, re-latched on a step boundary (§6.4).
 		MaybeRelatchImplicitOcean(*Impl);
+		if (Impl->Water)
+		{
+			Impl->Water->setRetireBakedRivers(
+				CVarVoxelWaterRetireBakedRivers.GetValueOnGameThread() != 0);
+		}
 
 		// W3 (plan S3.7 Layer R): same placement, same reason -- an arm or a
 		// disarm must not land between the river tick and the CA step.

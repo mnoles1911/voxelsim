@@ -35,6 +35,8 @@ param(
     # lake rise in a short window. Pass -Particles 0 to run faucets-only.
     [switch]$Faucets,
     [switch]$Verify,
+    [switch]$Render,
+    [switch]$GpuTiming,
     [double]$DefaultQ = 0,
     [string]$SpawnAt = '-60688,-51716',
     [string]$Name = "fluid-spike-$([int]($Particles/1000))k"
@@ -55,11 +57,20 @@ if ($Particles -gt 0) { $Cmds += ", voxel.Fluid.Spawn $Particles" }
 if ($Emit -gt 0)      { $Cmds += ", voxel.Fluid.Emit $Emit" }
 if ($Faucets)         { $Cmds += ", voxel.Fluid.Faucets 1" }
 if ($Verify)          { $Cmds += ", voxel.Fluid.Occupancy.Verify 1" }
+if ($Render)          { $Cmds += ", voxel.Fluid.Render 1" }
+if ($GpuTiming)       { $Cmds += ", voxel.Fluid.GpuTiming 1" }
 if ($DefaultQ -gt 0)  { $Cmds += ", voxel.Fluid.Faucets.DefaultQ $DefaultQ" }
 
-& $Editor "D:\voxelsim\ue-project\VoxelEarth.uproject" -game -windowed -ResX=2560 -ResY=1440 `
-    "-VoxelSpawnAt=$SpawnAt" -VoxelSpawnAltM=60 -VoxelTimeOfDay=12:00 -VoxelTimeScale=0 `
-    "-ExecCmds=$Cmds" "-abslog=$Log" -VoxelNoGpuMesh 2>$null &
+# Start-Process with ONE manually-quoted argument string. Two traps live here:
+# a trailing '&' is bash, not PowerShell 5.1; and the array form of
+# -ArgumentList mangles the -ExecCmds quoting (5.1 re-quotes whole elements,
+# UE then reads `-ExecCmds=voxel.Fluid.Enable` with no value and the run
+# reports NOT RUN). Quote it ourselves, pass one string.
+$EditorArgs = "`"D:\voxelsim\ue-project\VoxelEarth.uproject`" -game -windowed " +
+    "-ResX=2560 -ResY=1440 -VoxelSpawnAt=$SpawnAt -VoxelSpawnAltM=60 " +
+    "-VoxelTimeOfDay=12:00 -VoxelTimeScale=0 " +
+    "-ExecCmds=`"$Cmds`" -abslog=`"$Log`" -VoxelNoGpuMesh"
+Start-Process -FilePath $Editor -ArgumentList $EditorArgs
 Start-Sleep -Seconds ($Seconds + 60)   # boot + settle + measure window
 Get-Process UnrealEditor -ErrorAction SilentlyContinue | Stop-Process -Force
 

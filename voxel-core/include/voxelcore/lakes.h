@@ -215,6 +215,13 @@ public:
     // thread on.
     virtual int32_t waterSurfaceMmAtVoxel(int64_t vx, int64_t vy) = 0;
 
+    // Phase 5 of the water re-architecture: the engine flips this each tick
+    // from voxel.Water.RetireBakedRivers. When retired, an implementation
+    // that composes rivers and lakes must answer with LAKES ONLY -- rivers
+    // near the player are the fluid sim's job and the plane is data, not
+    // shape. Default no-op so null/test samplers need not care.
+    virtual void setRetireBakedRivers(bool) {}
+
     // ---- THE SHEET HALF (watershed plan work item 5, §5.2) ----------------
     //
     // `waterSurfaceMmAtVoxel` answers "is there water over THIS column", which
