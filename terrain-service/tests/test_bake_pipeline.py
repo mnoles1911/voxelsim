@@ -2958,7 +2958,7 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # together. The literal is deliberate: it forces a conscious edit at every
     # roll instead of letting the version drift silently, which is why this is
     # pinned rather than read from pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 22
+    assert on["bake_version"] == 23
 
     n = 24
     z, water = _diagonal_reach(n)
@@ -3764,7 +3764,11 @@ def test_level_band_constants_are_product_only():
     c = BakeConstants()
     # OFF by default: the bytes are inert on today's client, but they are not
     # free -- 3.4x the water plane, measured. Turning it on is the owner's call.
-    assert c.water_level_plane_enabled is False
+    # ENABLED at bake_ver 23, deliberately: the client read path (tilestore.h
+    # waterMmFromDepth and lakes.h) now decodes the band, so shipping it dark
+    # would put the bytes on the wire and never draw them. What this test is
+    # really for is the rest -- identity coverage and the PRODUCT/terrain split.
+    assert c.water_level_plane_enabled is True
     for name in ("water_level_plane_enabled", "water_level_band_mm",
                  "water_level_band_dilate_px"):
         assert name in BakeConstants.PRODUCT_FIELDS
@@ -3782,10 +3786,14 @@ def test_level_band_constants_are_product_only():
 def test_level_band_does_not_touch_the_terrain_identity():
     """Enabling the band must not re-roll the world. It writes values at DRY
     cells in a plane the ground never reads."""
-    base = pipeline.bake_fingerprint()
+    # BOTH ARMS EXPLICIT. These used to compare an explicit `on` against the
+    # DEFAULT, so the moment the default flipped the test compared on-against-on
+    # and asserted they differed. Third time this session a check quietly
+    # stopped checking because one side of it rode on a default.
+    off = dataclasses.replace(pipeline.CONSTANTS, water_level_plane_enabled=False)
     on = dataclasses.replace(pipeline.CONSTANTS, water_level_plane_enabled=True)
-    assert pipeline.bake_fingerprint(consts=on) == base
-    assert pipeline.product_fingerprint(on) != pipeline.product_fingerprint()
+    assert pipeline.bake_fingerprint(consts=on) == pipeline.bake_fingerprint(consts=off)
+    assert pipeline.product_fingerprint(on) != pipeline.product_fingerprint(off)
 
 
 def _band_fixture():
@@ -3987,7 +3995,11 @@ def test_band_off_is_byte_identical_to_a_bake_that_never_heard_of_it(
     from terrain_service import tile_codec as tc
 
     world, cl, base = _band_bake_consts()
-    c = base
+    # EXPLICITLY OFF. This said `c = base` and relied on the constant's default
+    # being False; when the default flipped at bake_ver 23 the test kept its
+    # name and stopped testing what the name says. Fourth time in this session
+    # a check rode on a default and quietly inverted.
+    c = dataclasses.replace(base, water_level_plane_enabled=False)
     res = pipeline.bake_tile(
         world_seed=20260719, tile_x=0, tile_y=0,
         coarse_fetch=lambda x, y: world.get((x, y)),

@@ -647,7 +647,13 @@ public:
         // paying it to compute a ground we are about to throw away would put a
         // 16-probe carrier evaluation on every voxel column of the near-field
         // sweep, the hottest loop in the water path.
-        if (d < 0) return kNoWaterMm;
+        // Only the two SENTINELS are dry. A band cp is negative but carries a
+        // level, and it is exactly the collar of pixels where the waterline
+        // needs resolving -- returning kNoWaterMm for it would throw away the
+        // whole feature at the one place it matters. The early-out's argument
+        // survives: the sentinels still cover everything outside the collar,
+        // which is ~97-99% of a tile, so only the collar pays the spline.
+        if (d == kWaterDryDepth || d == kWaterNoLevel) return kNoWaterMm;
         // THE RECONSTRUCTED SURFACE, `spline(cp)` -- not this pixel's control
         // point, which is what this function used to pass and what the whole
         // signature of `waterMmFromDepth` exists to prevent.

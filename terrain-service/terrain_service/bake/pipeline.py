@@ -428,7 +428,7 @@ __all__ = [
 #: bed-parallel where it runs, with no slope threshold anywhere to seam the
 #: river. TERRAIN_VERSION does not move: no ground byte changes.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 22
+BAKE_VERSION = 23
 
 
 @dataclass(frozen=True)
@@ -1385,7 +1385,7 @@ class BakeConstants:
     #: -1 instead of -32768 costs 1.646 MB rather than 2.215, and under
     #: CODEC_RAW 1.03x rather than 1.99x) and ``water_level_band_dilate_px``
     #: (2.46x at radius 0, 2.97x at 1, 3.43x at 2).
-    water_level_plane_enabled: bool = False
+    water_level_plane_enabled: bool = True
     #: Band width in millimetres. Derived from the client's own detail bound --
     #: see ``water.LEVEL_BAND_MM``, which is where the derivation and the
     #: tripwire live. A constant here so that changing it rolls the product

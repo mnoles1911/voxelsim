@@ -287,6 +287,19 @@ inline constexpr uint16_t kFineMaxKnownBakeVer = 12;
 // elevation and every dry pixel reads as water 3.2 km underground.
 inline constexpr int16_t kWaterDryDepth = -1;
 
+//: The other "no level here" sentinel, emitted by encoders that ship the level
+//: band. Distinct from kWaterDryDepth only so a tile can say "surveyed for
+//: levels, none at this cell" as against "predates levels"; both decode to
+//: kNoWaterMm. Mirrors tile_codec.WATER_NO_LEVEL.
+inline constexpr int16_t kWaterNoLevel = -32768;
+
+//: How far BELOW its own ground a dry pixel's level may be and still be worth
+//: shipping. Mirrors tile_codec.WATER_LEVEL_BAND_MM, and it is derived rather
+//: than tuned: amplifier.cpp static_asserts fine-tier |amplified - carrier| <=
+//: 2280 mm, so a pixel standing further than that above its level cannot hold a
+//: single 10 cm voxel below it.
+inline constexpr int32_t kWaterLevelBandMm = 2400;
+
 // Millimetres per stored water-depth LSB. Mirrors tile_codec.WATER_DEPTH_LSB_MM.
 inline constexpr int32_t kWaterDepthLsbMm = 10;
 
@@ -820,11 +833,32 @@ public:
     // Nor the AMPLIFIED surface: the amplifier's rills and bedding sit on top
     // of the bake, and water added to them would ripple by metres on a surface
     // that is flat by definition.
+    // THE LEVEL BAND. A NEGATIVE cp other than the sentinels is not "dry", it
+    // is "dry HERE, and the local water level is this far BELOW the ground".
+    // The bake ships it for a collar of dry pixels around every wet one so the
+    // client can resolve the waterline against the ground it actually draws, at
+    // 10 cm, instead of inheriting the bake's 1.875 m pixel edge -- which is
+    // what makes a shoreline meet a bank in blocky multi-metre steps.
+    //
+    // Encoding the band as negatives is the whole compatibility argument: every
+    // reader that predates it tests `< 0` and sees dry, so an old client reads a
+    // new tile bit-identically. This function is the ONE place in C++ that
+    // decodes the plane, which is why widening it here is the whole change.
     static int32_t waterMmFromDepth(int16_t depthCp, int32_t groundMm) {
-        if (depthCp < 0) return kNoWaterMm;
+        if (depthCp == kWaterDryDepth || depthCp == kWaterNoLevel) return kNoWaterMm;
+        // Both branches are the same arithmetic -- a positive cp is a depth
+        // ABOVE the ground, a band cp is a level BELOW it, and the sign already
+        // says which. Keeping one expression is deliberate: two would be two
+        // things to keep agreeing about the datum.
         return static_cast<int32_t>(static_cast<int64_t>(groundMm) +
                                     static_cast<int64_t>(depthCp) * kWaterDepthLsbMm);
     }
+
+    // Is this cp a WET cell, as against dry-with-a-level or no level at all?
+    // `waterMmFromDepth` returns a finite surface for both wet and banded
+    // cells, so anything that means "is there water standing here" must ask
+    // this and not test the surface for kNoWaterMm.
+    static constexpr bool waterCpIsWet(int16_t depthCp) { return depthCp >= 0; }
 
     // Single control point, tile-LOCAL pixel coords. Decodes the containing
     // block on every call, so it is for tests and cold paths; anything hot
