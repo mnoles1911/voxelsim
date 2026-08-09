@@ -22,6 +22,7 @@ add_executable(vxc_tests
   test_collapse.cpp
   test_rivernet.cpp
   test_rivercouple.cpp
+  test_basinledger.cpp
   test_pathfind.cpp
   test_regiongraph.cpp
   test_caves.cpp
@@ -36,6 +37,7 @@ add_executable(vxc_tests
   test_farwater.cpp
   test_riverribbon.cpp
   test_ocean.cpp
+  test_fluidoccupancy.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)

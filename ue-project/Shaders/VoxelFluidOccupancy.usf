@@ -1,0 +1,175 @@
+// VoxelFluidOccupancy.usf -- the builder for the PBF collision volume.
+//
+// Fills the 512^3 occupancy bitfield VoxelFluidContract.ush:64-69 describes,
+// one dirty box at a time, from packed brick solidity the host uploads. The
+// READER is VoxelFluidCollision.ush and it is the only reader; this is the
+// only writer. Phase 0 spike (c) of
+// docs/water-rearchitecture-plan-2026-08-09.md.
+//
+// ---------------------------------------------------------------------------
+// WHERE SOLIDITY COMES FROM, AND WHY NOT FROM VoxelizeMain
+// ---------------------------------------------------------------------------
+//
+// The obvious source is the GPU worldgen chain's OutCells (worldgen.ush:2582-
+// 2596, one uint material per cell) -- occupancy would be a reduction of a
+// grid the mesher already computes. It was investigated first and rejected for
+// three reasons, in ascending order of how expensive the mistake would be:
+//
+//   1. NO RESIDENCY. OutCells is an RDG transient created inside
+//      AddRegionPasses (VoxelGpuWorldGen.cpp:612-614) and gone when the graph
+//      executes. Nothing keeps it. Occupancy would have to re-dispatch the
+//      whole ColumnMain -> VoxelizeMain chain, raster upload included, for
+//      terrain that is already meshed and resident -- 4,096 chunk regions to
+//      cover one 51.2 m volume, none of which need re-meshing.
+//
+//   2. IT IS BLIND TO EDITS, BY CONSTRUCTION. A chunk containing (or merely
+//      bordering) an edited brick is never GPU-meshed: it takes the
+//      overlay-aware game-thread path
+//      (FVoxelWorldImpl::ChunkHasEditedBrick, VoxelWorldSubsystem.cpp:6783-
+//      6814). Worldgen output is the pure generated function; the edit overlay
+//      is applied on the CPU by World::materialAt (voxelcore/world.h:46-53).
+//      So sourcing occupancy from VoxelizeMain would be wrong exactly where
+//      the plan's own scenario tests live -- "dig a channel from a river",
+//      "breach a lake into a valley" (plan, Verification). Water would flow
+//      through the trench walls and over the dug channel floor.
+//
+//   3. IT WOULD DRAG THE FLUID INTO THE WORLDGEN VERSION LOCK. worldgen.ush is
+//      compiled two ways and pinned by a determinism digest, and new kernels
+//      are deliberately kept out of it (VoxelQuadPoolWrite.usf:41-48;
+//      VoxelFluidContract.ush:13-15 says the same about this contract). A
+//      fluid kernel inside it could not be touched without a SPIR-V respin.
+//
+// SO THE SOURCE IS THE MESHER'S OWN SOURCE: vxc::World, overlay included --
+// the same brickAt() the game-thread mesher reads. The host packs each brick's
+// solidity to 1 bit with vxc::packBrickSolidBits
+// (voxelcore/fluidoccupancy.h) and uploads 64 bytes per brick instead of 2 KB
+// of materials. Two consequences worth stating out loud:
+//
+//   * The GPU never sees a material id. isSolidForFluid lives in ONE place, on
+//     the CPU, and there is no HLSL mirror of the material enum to drift.
+//   * A full 512^3 volume is 16 MB of bits either way; as materials it would
+//     be 512 MB. The bit packing is what makes region uploads affordable at
+//     all.
+//
+// ---------------------------------------------------------------------------
+// WHY THIS IS A COMPUTE PASS AND NOT A CPU-SIDE MEMCPY
+// ---------------------------------------------------------------------------
+//
+// The host has BRICKS (8^3 blocks, bits in brick-local order); the volume
+// wants X-MAJOR words spanning 32 voxels along x -- four bricks per word. Doing
+// that transpose on the CPU means keeping a 16 MB system-memory shadow of the
+// volume and then uploading a dirty box as a scatter of 64-byte row fragments
+// through RHI locks. That is precisely the render-thread lock/memcpy pattern
+// Wave D spent a wave removing (VoxelQuadPoolWrite.usf:28-40), for bytes the
+// GPU would end up owning anyway. Here the upload is ONE contiguous buffer of
+// brick bits and the transpose is 64 threads' worth of shifts.
+//
+// ---------------------------------------------------------------------------
+// ALIGNMENT: WHY REGIONS ARE SNAPPED RATHER THAN CLAMPED
+// ---------------------------------------------------------------------------
+//
+// One output word is 32 voxels of x, owned by exactly one thread, written
+// whole. If a region began part-way through a word the kernel would need a
+// read-modify-write, and two regions dispatched into the same graph could then
+// race on the shared word -- a data race whose symptom is a few stray solid
+// voxels near a chunk border, which is unfindable. So the host snaps every
+// region OUTWARD to 32 voxels in x and 8 (one brick) in y and z
+// (vxc::fluidSnapRegion), and every write here is a full word with no atomics
+// and no ordering between regions. The cost is at most three extra brick
+// columns per region, and the host can always produce them.
+//
+// THE CLEAR IS NOT HERE. A whole-volume clear to "all solid" is
+// AddClearUAVPass on the host side (VoxelFluidOccupancy.cpp) -- RDG already
+// has a clear and a kernel that only stores a constant would be a second
+// mechanism for it. All-solid rather than all-air is the "blocked, never
+// guessed" rule: an unbuilt volume freezes particles, it does not leak them.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelFluidContract.ush"
+
+// ---------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------
+
+// The volume, in its write mode. Same name as VoxelFluidCollision.ush's
+// read-only declaration and deliberately so -- one name, one meaning. The two
+// declarations can never meet: nothing includes both files.
+RWBuffer<uint> FluidOccupancyBits;
+
+// The host's upload: every brick of this region, packed x-fastest inside each
+// brick (vxc::fluidBrickBitIndex == Brick<8>::cellIndex) and x-fastest across
+// bricks, 16 words each. Structured rather than typed because it is a plain
+// linear array the CPU writes once per dispatch.
+StructuredBuffer<uint> FluidRegionBrickBits;
+
+// 512. From the contract; a uniform rather than a literal so a smaller volume
+// is a host change.
+uint FluidVolumeDimVoxels;
+
+// The region, in VOLUME-LOCAL voxels. Min is 32-aligned in x and 8-aligned in
+// y/z; Size likewise. Both guaranteed by vxc::fluidSnapRegion on the host and
+// re-checked by FVoxelFluidOccupancyVolume::UpdateRegion before dispatch.
+uint3 FluidRegionMinVoxel;
+uint3 FluidRegionSizeVoxels;
+
+// ---------------------------------------------------------------------------
+// FluidOccupancyFillMain
+// ---------------------------------------------------------------------------
+//
+// ONE THREAD PER OUTPUT WORD. Each gathers the four brick rows that share it.
+//
+// Thread mapping: x = the region's 32-voxel word column, y = region-local
+// voxel y, z = region-local voxel z (from the dispatch's z dimension, since
+// the group is flat in z). 8x8x1 rather than a flat 64x1x1 because a flat
+// mapping over a full-volume rebuild needs 4,194,304/64 = 65,536 groups in one
+// dimension and the D3D12 per-dimension dispatch limit is 65,535 -- an
+// off-by-one that would only ever fire on the largest possible region.
+//
+// Mirror of vxc::fluidFillRegion / vxc::fluidRegionWordFromBricks.
+[numthreads(8, 8, 1)]
+void FluidOccupancyFillMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint regionWordsX = FluidRegionSizeVoxels.x >> 5u;   // 32 voxels/word
+	if (tid.x >= regionWordsX || tid.y >= FluidRegionSizeVoxels.y ||
+	    tid.z >= FluidRegionSizeVoxels.z)
+	{
+		// The group size rounds up on x and y, so the tail threads of the last
+		// group are real and must not write. This is also the bound that makes
+		// the store below provably in range.
+		return;
+	}
+
+	const uint regionBricksX = FluidRegionSizeVoxels.x >> 3u;  // 8 voxels/brick
+	const uint regionBricksY = FluidRegionSizeVoxels.y >> 3u;
+
+	const uint iby = tid.y >> 3u, by = tid.y & 7u;
+	const uint ibz = tid.z >> 3u, bz = tid.z & 7u;
+
+	// A brick's x-row is 8 CONSECUTIVE bits, because bx is the fastest term of
+	// the brick bit index. So a row is one shifted byte, not eight bit tests.
+	// (fluidBrickBitIndex(0, by, bz) = 8*by + 64*bz.)
+	const uint rowBit = (by << 3u) + (bz << 6u);
+	const uint rowWord = rowBit >> 5u;
+	const uint rowShift = rowBit & 31u;
+
+	uint packed = 0u;
+	[unroll]
+	for (uint k = 0u; k < 4u; ++k)   // four bricks share one 32-voxel word
+	{
+		const uint ibx = tid.x * 4u + k;
+		const uint brickBase = (ibx + regionBricksX * (iby + regionBricksY * ibz)) * 16u;
+		// lint-shader-ub: allow VARIABLE_SHIFT - rowShift is `rowBit & 31u` a few lines above, so it is provably in 0..31, below the operand's 32-bit width
+		const uint row = (FluidRegionBrickBits[brickBase + rowWord] >> rowShift) & 0xFFu;
+		// lint-shader-ub: allow VARIABLE_SHIFT - k is the [unroll]ed counter of a loop with a literal bound of 4, so the distance is 0, 8, 16 or 24
+		packed |= row << (k * 8u);
+	}
+
+	// x-major volume addressing: 32 voxels per word along x, rows along x, then
+	// y, then z. Identical to vxc::fluidVolumeWordIndex.
+	const uint wordsPerRow = FluidVolumeDimVoxels >> 5u;
+	const uint lx = FluidRegionMinVoxel.x + tid.x * 32u;
+	const uint ly = FluidRegionMinVoxel.y + tid.y;
+	const uint lz = FluidRegionMinVoxel.z + tid.z;
+	// lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid inside the region, and the host refuses any region not wholly inside the volume (FVoxelFluidOccupancyVolume::UpdateRegion, via vxc::fluidRegionInBounds), so lx/ly/lz are all below FluidVolumeDimVoxels and the index is below wordsPerRow*Dim*Dim, which is the buffer's exact size
+	FluidOccupancyBits[(lz * FluidVolumeDimVoxels + ly) * wordsPerRow + (lx >> 5u)] = packed;
+}

@@ -1,0 +1,691 @@
+// VoxelFluidSim.usf -- the Phase 0 spike (a) PBF solver kernels
+// (docs/water-rearchitecture-plan-2026-08-09.md, "Compute-PBF prototype").
+//
+// Position Based Fluids after Macklin & Mueller 2013: predict positions under
+// gravity, build a spatial hash over the predictions, then iterate the density
+// constraint (poly6 density -> lambda -> delta-p with the s_corr artificial
+// pressure term), and finally derive velocity from the position change. One
+// simulation step per frame; the constraint loop is driven from the CPU as
+// repeated DensityLambda/DeltaPos dispatches over ping-ponged position buffers.
+//
+// Everything layout-shaped lives in VoxelFluidContract.ush and is NOT restated
+// here -- particle struct, flags, units, rest spacing, kernel radius, max
+// particle count, the ParticleCounts slot meanings. This file may only ADD
+// solver-internal buffers and constants.
+//
+// WHY THIS IS A PLAIN /VoxelEarth/ SHADER AND NOT A worldgen.ush KERNEL.
+// Same reasoning as VoxelQuadPoolWrite.usf:41-48: the determinism digest pins
+// a hash over worldgen.ush, and a float fluid sim has no business inside that
+// contract. Particles are presentation (contract header, lines 12-15); nothing
+// here is authoritative state, so float math and atomics are acceptable where
+// worldgen would forbid them.
+//
+// DETERMINISM POSTURE, STATED ONCE. Two places in this file are order-
+// nondeterministic on purpose:
+//   1. The hash-grid build assigns a particle its within-cell rank via
+//      InterlockedAdd, so the ORDER of particles inside a cell varies run to
+//      run. The alternative -- the fully deterministic route -- is a particle
+//      sort (radix over cell ids, ~4 more dispatches). Worldgen pays that cost
+//      because its output is digested; this sim's output is pixels, and the
+//      density sum over a neighbourhood contains the same terms whatever their
+//      order, so the divergence is float-summation ulps, not structure.
+//   2. ParticleCounts is maintained by InterlockedAdd. Counter VALUES are
+//      exact (integer atomics); only the order of increments varies.
+// The prefix-sum over cell counts, by contrast, follows the house 3-kernel
+// scan (worldgen's ScanBlocks/ScanSums/ScanAdd shape) rather than a global
+// atomic cursor: a dam break puts thousands of particles into a handful of
+// cells, and a scan has no contention hot spot where a per-cell atomic
+// allocator would serialise exactly there.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelFluidContract.ush"
+
+// ---- collision -------------------------------------------------------------
+// The occupancy/collision pass is built in parallel (VoxelFluidCollision.ush,
+// another agent). Until it lands, this file must compile and run standalone,
+// so the two contract entry points are reached only behind this define and a
+// ground-plane fallback stands in for them. The C++ side does not set the
+// define yet; when the collision pass lands, its owner flips it via
+// ModifyCompilationEnvironment and the fallback disappears.
+#ifndef VOXEL_FLUID_HAS_COLLISION
+#define VOXEL_FLUID_HAS_COLLISION 0
+#endif
+#if VOXEL_FLUID_HAS_COLLISION
+#include "/VoxelEarth/VoxelFluidCollision.ush"
+#endif
+
+// ---- solver constants (internal -- everything shared is in the contract) ---
+
+// Gravity, straight down. 980 UU/s^2 == 9.8 m/s^2 at 1 UU = 1 cm.
+#define VOXEL_FLUID_GRAVITY_UU        980.0f
+
+// Poly6 normalisation, 315 / (64 * pi * h^9) with h = 25 UU (contract line 33).
+// h^9 = 3.8146973e12; 64*pi*h^9 = 7.67034e14. The C++ mirror
+// (VoxelFluidSim.cpp, VoxelFluidSim::kPoly6CoeffUU) re-derives this in double
+// precision and an automation test pins the two against each other, so a
+// drifted literal fails a test instead of shipping a subtly wrong density.
+#define VOXEL_FLUID_POLY6_COEFF       4.10673e-13f
+
+// Spiky gradient magnitude, 45 / (pi * h^6). h^6 = 2.44140625e8;
+// pi*h^6 = 7.6699039e8. Mirrored and tested the same way as the poly6 coeff.
+#define VOXEL_FLUID_SPIKY_GRAD_COEFF  5.86709e-8f
+
+// CFM relaxation epsilon in lambda's denominator (Macklin-Mueller eq. 11).
+// Scale-dependent: gradients here are divided by rest density, so sum|grad|^2
+// lands around 1e-3..1e-1 for a compressed neighbourhood; 1e-4 keeps lambda
+// finite for isolated particles without visibly softening the constraint.
+// A spike knob, not a calibrated value -- the spike measures cost, not fidelity.
+#define VOXEL_FLUID_CFM_EPSILON       1.0e-4f
+
+// s_corr artificial pressure (Macklin-Mueller eq. 13): -k * (W(r)/W(dq))^n.
+// k = 0.1, n = 4, dq = 0.3h are the paper's own suggested values.
+#define VOXEL_FLUID_SCORR_K           0.1f
+#define VOXEL_FLUID_SCORR_N           4
+// (0.3 * 25)^2 = 56.25 -- dq squared, precomputed for FluidPoly6(r2).
+#define VOXEL_FLUID_SCORR_DQ2         56.25f
+
+// Per-iteration position correction clamp, 0.1h. The paper does not clamp;
+// this exists because the first frames of a dam break start at exact rest
+// spacing under full gravity and a single bad lambda (before the constraint
+// has any neighbours settled) can otherwise fling a particle across the grid.
+#define VOXEL_FLUID_MAX_DELTA_P_UU    2.5f
+
+// Speed cap, 20 m/s. With h = 25 UU and dt <= 1/30 s the tunneling-free bound
+// is roughly h/dt = 750 UU/s per constraint iteration; 2000 UU/s over a full
+// step keeps the fallback plane reliable while letting a dam break look like
+// one. The real collision pass owns its own tunneling story (plan spike c).
+#define VOXEL_FLUID_MAX_SPEED_UU      2000.0f
+
+// ---- hash grid -------------------------------------------------------------
+// 2^16 buckets. Chosen to be exactly VOXEL_FLUID_SCAN_BLOCK^2 so the house
+// 3-kernel scan covers it with its single-workgroup middle kernel (the same
+// 256*256 bound worldgen's ScanSumsMain has, VoxelGpuWorldGen.cpp:44).
+// 300k particles over 64k buckets is ~4.6 mean occupancy if fully spread;
+// clustering makes some buckets long, which the per-entry cell check absorbs.
+#define VOXEL_FLUID_HASH_CELLS        (64u * 1024u)
+#define VOXEL_FLUID_SCAN_BLOCK        256u
+#if VOXEL_FLUID_HASH_CELLS != (VOXEL_FLUID_SCAN_BLOCK * VOXEL_FLUID_SCAN_BLOCK)
+#error "The 3-kernel scan's single-workgroup ScanSums covers exactly SCAN_BLOCK^2 cells"
+#endif
+
+// Group size for the per-particle kernels. 64 matches every other kernel in
+// the project (VoxelGpuWorldGen.cpp's dispatches); the scan kernels use 256
+// because the scan's block size IS its group size.
+#define VOXEL_FLUID_GROUP             64
+
+// Sentinel for "this slot took no part in the grid this frame" (dead slot).
+#define VOXEL_FLUID_NO_CELL           0xffffffffu
+
+// ---- spawn -----------------------------------------------------------------
+#define VOXEL_FLUID_SPAWN_MODE_BLOCK  0u   // dam-break lattice
+#define VOXEL_FLUID_SPAWN_MODE_FAUCET 1u   // jittered point stream
+// Lattice jitter, +/- half of this. Breaks the perfect-lattice symmetry that
+// otherwise makes the first constraint iterations degenerate (every gradient
+// pair cancels exactly).
+#define VOXEL_FLUID_SPAWN_JITTER_UU   2.0f
+// Faucet emission disc radius.
+#define VOXEL_FLUID_FAUCET_JITTER_UU  30.0f
+
+// ---- loose parameters ($Globals, bound by name from the C++ param structs) -
+uint   SimSlotCount;        // dispatch bound over particle slots (CPU high-water bound)
+float  Dt;                  // clamped on the CPU; never <= 0 when a pass runs
+float  GroundZLocalUU;      // fallback collision plane, origin-relative
+float  BoundaryHalfExtentUU;// despawn box half extent around the fluid origin
+float  RestDensity;         // computed CPU-side from the rest lattice (see .cpp)
+uint   SpawnCount;
+uint   SpawnMode;
+uint   SpawnSeed;
+uint   SpawnEdge;           // lattice edge (block mode): SpawnEdge^3 >= SpawnCount
+float  SpawnBatchId;
+float3 SpawnCenterLocalUU;
+float3 SpawnVelUU;
+
+// ---- buffers ---------------------------------------------------------------
+// Contract-named (VoxelFluidContract.ush lines 54-59):
+RWStructuredBuffer<FVoxelFluidParticle> ParticlesRW;
+RWStructuredBuffer<uint> ParticleCounts;
+
+// Solver-internal, all transient except FreeList/SlotCounters:
+// Predicted positions. xyz = position (origin-relative UU), w = 1 alive / 0
+// dead -- carried in w so the grid and constraint kernels never need to touch
+// the particle buffer for liveness.
+RWStructuredBuffer<float4> OutPositions;
+StructuredBuffer<float4>   InPositions;
+// The iteration-0 predictions the grid was built from. Neighbour TOPOLOGY is
+// frozen against these for all constraint iterations (standard PBF: the grid
+// is built once per step); only distances use the current iterate.
+StructuredBuffer<float4>   GridPositions;
+
+RWStructuredBuffer<uint>  CellCounts;        // [HASH_CELLS] occupancy
+RWStructuredBuffer<uint>  CellStarts;        // [HASH_CELLS] exclusive prefix sum
+RWStructuredBuffer<uint>  BlockSums;         // [SCAN_BLOCK] scan carry
+RWStructuredBuffer<uint>  CellEntries;       // [MAX_PARTICLES] slot ids, cell-grouped
+RWStructuredBuffer<uint>  ParticleCellHash;  // [MAX_PARTICLES] bucket, or NO_CELL
+RWStructuredBuffer<uint>  ParticleCellRank;  // [MAX_PARTICLES] within-bucket rank
+StructuredBuffer<uint>    InCellStarts;      // read-only bindings for the gather kernels
+StructuredBuffer<uint>    InCellCounts;
+StructuredBuffer<uint>    InCellEntries;
+RWStructuredBuffer<float> Lambdas;           // [MAX_PARTICLES]
+StructuredBuffer<float>   InLambdas;
+
+// Persistent slot allocator (see FluidSpawnMain):
+//   FreeList     [MAX_PARTICLES] slot ids returned by despawn
+//   SlotCounters [0] = free-list top, [1] = alloc high water
+RWStructuredBuffer<uint> FreeList;
+RWStructuredBuffer<uint> SlotCounters;
+
+// ---- helpers ---------------------------------------------------------------
+
+float FluidPoly6(float r2)
+{
+	const float h2 = VOXEL_FLUID_KERNEL_H_UU * VOXEL_FLUID_KERNEL_H_UU;
+	if (r2 >= h2)
+	{
+		return 0.0f;
+	}
+	const float t = h2 - r2;
+	return VOXEL_FLUID_POLY6_COEFF * t * t * t;
+}
+
+// Gradient of the spiky kernel w.r.t. particle i's position, for d = p_i - p_j.
+// Zero-guarded at tiny r: two coincident particles have no defined direction,
+// and the s_corr term is what pushes them apart on the next iteration anyway.
+float3 FluidSpikyGrad(float3 d, float r2)
+{
+	const float h = VOXEL_FLUID_KERNEL_H_UU;
+	const float r = sqrt(r2);
+	if (r >= h || r < 1.0e-4f)
+	{
+		return float3(0.0f, 0.0f, 0.0f);
+	}
+	const float t = h - r;
+	return (-VOXEL_FLUID_SPIKY_GRAD_COEFF * t * t / r) * d;
+}
+
+int3 FluidCellCoord(float3 posUU)
+{
+	return int3(floor(posUU / VOXEL_FLUID_KERNEL_H_UU));
+}
+
+// Teschner et al. spatial hash. Buckets can collide; every gather kernel
+// filters entries by exact cell coord (see FluidDensityLambdaMain), so a
+// collision only costs candidate tests, never a wrong density.
+uint FluidHashCell(int3 c)
+{
+	const uint h = (uint(c.x) * 73856093u) ^ (uint(c.y) * 19349663u) ^ (uint(c.z) * 83492791u);
+	return h & (VOXEL_FLUID_HASH_CELLS - 1u);
+}
+
+// Wang hash -> [0,1) float triplet, for spawn jitter. Deterministic in
+// (seed, index) so a repeated dam break under a fixed seed spawns identically.
+uint FluidWangHash(uint x)
+{
+	x = (x ^ 61u) ^ (x >> 16);
+	x *= 9u;
+	x = x ^ (x >> 4);
+	x *= 0x27d4eb2du;
+	x = x ^ (x >> 15);
+	return x;
+}
+
+float3 FluidHash3(uint seed)
+{
+	const uint a = FluidWangHash(seed);
+	const uint b = FluidWangHash(a);
+	const uint c = FluidWangHash(b);
+	return float3(a & 0xffffu, b & 0xffffu, c & 0xffffu) * (1.0f / 65536.0f);
+}
+
+// Collision resolve: the contract entry point when the collision pass exists,
+// a ground plane otherwise. The fallback needs no velocity fix-up because
+// velocity is DERIVED from positions in FluidFinalizeMain -- clamping the
+// position to the plane is exactly what kills the normal component.
+float3 FluidResolveCollision(float3 posUU, float3 prevPosUU)
+{
+#if VOXEL_FLUID_HAS_COLLISION
+	return VoxelFluidResolveCollision(posUU, prevPosUU);
+#else
+	if (posUU.z < GroundZLocalUU)
+	{
+		posUU.z = GroundZLocalUU;
+	}
+	return posUU;
+#endif
+}
+
+// ---- kernel: frame begin ---------------------------------------------------
+// Zeroes the alive slot only. Alive is REDUCED from scratch every frame by
+// FluidFinalizeMain, while spawned/despawned accumulate for the sim's
+// lifetime -- that split is what makes the CPU conservation assert a real
+// measurement (contract lines 60-63): alive is counted independently of the
+// counters it is checked against, so agreement proves the pipeline rather
+// than proving that x == x.
+[numthreads(1, 1, 1)]
+void FluidFrameBeginMain(uint3 DTid : SV_DispatchThreadID)
+{
+	ParticleCounts[0] = 0u;
+}
+
+// ---- kernel: spawn ---------------------------------------------------------
+// One thread per requested particle. Slot allocation: pop the free list if it
+// has entries, else take a fresh slot below the contract cap. FREELIST OVER
+// COMPACTION, and the reasons are structural, not taste:
+//   1. Slot indices stay stable for the particle's whole life, so the SSF
+//      renderer (spike b) and the debug readback can hold an index across
+//      frames without a remap table.
+//   2. Compaction is O(alive) buffer traffic every frame (32 B x up to 300k,
+//      ~10 MB/frame of pure copying) to reclaim what despawn already tells us
+//      for free; the freelist is O(despawned-this-frame).
+//   3. The cost of holes -- dead slots between live ones -- is one flag test
+//      per slot in the per-particle kernels, which are all bound by the same
+//      high-water dispatch anyway.
+//
+// The pop is the standard guarded decrement: a thread that decrements an
+// empty list observes 0 or a wrapped value, restores its decrement, and falls
+// through to the fresh-slot path. Net counter change of a failed pop is zero.
+//
+// A spawn that finds the buffer full allocates nothing and does NOT touch
+// spawnedTotal -- so conservation still balances when the cap is hit; the
+// drop shows up as spawnedTotal falling short of what the CPU requested,
+// which the subsystem's perf line makes visible (requested vs spawned).
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidSpawnMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint t = DTid.x;
+	if (t >= SpawnCount)
+	{
+		return;
+	}
+
+	// --- allocate a slot ---
+	uint slot = VOXEL_FLUID_NO_CELL;
+	uint oldTop;
+	InterlockedAdd(SlotCounters[0], 0xffffffffu, oldTop); // -1 mod 2^32
+	if (oldTop == 0u || oldTop > VOXEL_FLUID_MAX_PARTICLES)
+	{
+		// Free list was empty (0, or wrapped by concurrent underflow): undo.
+		InterlockedAdd(SlotCounters[0], 1u);
+		uint fresh;
+		InterlockedAdd(SlotCounters[1], 1u, fresh);
+		if (fresh >= VOXEL_FLUID_MAX_PARTICLES)
+		{
+			InterlockedAdd(SlotCounters[1], 0xffffffffu); // undo: -1 mod 2^32
+			return; // full: dropped, uncounted -- see header comment
+		}
+		slot = fresh;
+	}
+	else
+	{
+		slot = FreeList[oldTop - 1u];
+	}
+
+	// --- position + velocity ---
+	float3 pos;
+	float3 vel;
+	if (SpawnMode == VOXEL_FLUID_SPAWN_MODE_BLOCK)
+	{
+		// Rest-spacing lattice centred on SpawnCenterLocalUU, with a small
+		// deterministic jitter (see VOXEL_FLUID_SPAWN_JITTER_UU).
+		const uint e = max(SpawnEdge, 1u);
+		const float3 ijk = float3(t % e, (t / e) % e, t / (e * e));
+		// "half" is an HLSL type name, hence halfEdge.
+		const float3 halfEdge = 0.5f * float3(e - 1u, e - 1u, e - 1u);
+		const float3 jitter = (FluidHash3(t ^ SpawnSeed) - 0.5f) * VOXEL_FLUID_SPAWN_JITTER_UU;
+		pos = SpawnCenterLocalUU + (ijk - halfEdge) * VOXEL_FLUID_REST_SPACING_UU + jitter;
+		vel = SpawnVelUU;
+	}
+	else
+	{
+		// Faucet: jittered disc at the emit point, carrying the stream velocity.
+		const float3 j = (FluidHash3(t ^ SpawnSeed) - 0.5f) * 2.0f;
+		pos = SpawnCenterLocalUU + float3(j.xy * VOXEL_FLUID_FAUCET_JITTER_UU, 0.0f);
+		vel = SpawnVelUU;
+	}
+
+	FVoxelFluidParticle P;
+	P.P0 = float4(pos, asfloat(VOXEL_FLUID_FLAG_ALIVE));
+	P.P1 = float4(vel, SpawnBatchId);
+	ParticlesRW[slot] = P;
+	InterlockedAdd(ParticleCounts[3], 1u); // spawnedTotal
+}
+
+// ---- kernel: integrate -----------------------------------------------------
+// Gravity + explicit Euler prediction. Velocity is NOT written back here --
+// the final velocity comes from the position delta in FluidFinalizeMain
+// (standard PBF), which folds gravity, constraint corrections and collision
+// into one consistent value. XSPH viscosity is deliberately deferred (the
+// brief's "later"): it needs a neighbour gather over final velocities, i.e.
+// one more full pass, and the spike's question is cost, not smoothness.
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidIntegrateMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	const FVoxelFluidParticle P = ParticlesRW[i];
+	const uint flags = asuint(P.P0.w);
+	if ((flags & VOXEL_FLUID_FLAG_ALIVE) == 0u)
+	{
+		OutPositions[i] = float4(0.0f, 0.0f, 0.0f, 0.0f); // dead: w = 0
+		return;
+	}
+	const float3 v = P.P1.xyz + float3(0.0f, 0.0f, -VOXEL_FLUID_GRAVITY_UU) * Dt;
+	const float3 p = P.P0.xyz + v * Dt;
+	OutPositions[i] = float4(p, 1.0f);
+}
+
+// ---- kernel: hash-grid count ----------------------------------------------
+// Counting half of counting + prefix-sum + scatter. The InterlockedAdd's
+// return value doubles as the particle's within-cell rank, which is what
+// makes the scatter a plain indexed write with no second atomic pass.
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidHashCountMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	const float4 gp = GridPositions[i];
+	if (gp.w == 0.0f)
+	{
+		ParticleCellHash[i] = VOXEL_FLUID_NO_CELL;
+		return;
+	}
+	const uint h = FluidHashCell(FluidCellCoord(gp.xyz));
+	uint rank;
+	InterlockedAdd(CellCounts[h], 1u, rank);
+	ParticleCellHash[i] = h;
+	ParticleCellRank[i] = rank;
+}
+
+// ---- kernels: the 3-kernel exclusive scan over CellCounts ------------------
+// Same shape as worldgen's ScanBlocks/ScanSums/ScanAdd (the house style for
+// exactly this problem), rewritten here because those live inside
+// worldgen.ush's digest and this file must stay out of it.
+
+groupshared uint FluidScanShared[VOXEL_FLUID_SCAN_BLOCK];
+
+// Per-256-block exclusive scan; block totals to BlockSums.
+[numthreads(VOXEL_FLUID_SCAN_BLOCK, 1, 1)]
+void FluidScanBlocksMain(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
+{
+	const uint g = GTid.x;
+	const uint idx = Gid.x * VOXEL_FLUID_SCAN_BLOCK + g;
+	const uint v = (idx < VOXEL_FLUID_HASH_CELLS) ? CellCounts[idx] : 0u;
+	FluidScanShared[g] = v;
+	GroupMemoryBarrierWithGroupSync();
+
+	// Hillis-Steele inclusive scan; two barriers per step so the read of the
+	// lagged element and the write of the sum can never race.
+	[unroll]
+	for (uint offset = 1u; offset < VOXEL_FLUID_SCAN_BLOCK; offset <<= 1u)
+	{
+		const uint t = (g >= offset) ? FluidScanShared[g - offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		FluidScanShared[g] += t;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	if (idx < VOXEL_FLUID_HASH_CELLS)
+	{
+		CellStarts[idx] = FluidScanShared[g] - v; // inclusive -> exclusive
+	}
+	if (g == VOXEL_FLUID_SCAN_BLOCK - 1u)
+	{
+		BlockSums[Gid.x] = FluidScanShared[g];
+	}
+}
+
+// Single workgroup scans the 256 block totals in place (exclusive). This is
+// the kernel that caps the table at SCAN_BLOCK^2 cells -- see the #error at
+// the top of the file.
+[numthreads(VOXEL_FLUID_SCAN_BLOCK, 1, 1)]
+void FluidScanSumsMain(uint3 GTid : SV_GroupThreadID)
+{
+	const uint g = GTid.x;
+	const uint v = BlockSums[g];
+	FluidScanShared[g] = v;
+	GroupMemoryBarrierWithGroupSync();
+
+	[unroll]
+	for (uint offset = 1u; offset < VOXEL_FLUID_SCAN_BLOCK; offset <<= 1u)
+	{
+		const uint t = (g >= offset) ? FluidScanShared[g - offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		FluidScanShared[g] += t;
+		GroupMemoryBarrierWithGroupSync();
+	}
+
+	BlockSums[g] = FluidScanShared[g] - v;
+}
+
+[numthreads(VOXEL_FLUID_SCAN_BLOCK, 1, 1)]
+void FluidScanAddMain(uint3 GTid : SV_GroupThreadID, uint3 Gid : SV_GroupID)
+{
+	const uint idx = Gid.x * VOXEL_FLUID_SCAN_BLOCK + GTid.x;
+	if (idx < VOXEL_FLUID_HASH_CELLS)
+	{
+		CellStarts[idx] += BlockSums[Gid.x];
+	}
+}
+
+// ---- kernel: scatter -------------------------------------------------------
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidScatterMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	const uint h = ParticleCellHash[i];
+	if (h == VOXEL_FLUID_NO_CELL)
+	{
+		return;
+	}
+	CellEntries[CellStarts[h] + ParticleCellRank[i]] = i;
+}
+
+// ---- kernel: density + lambda ----------------------------------------------
+// rho_i = sum_j W_poly6(|p_i - p_j|); C_i = rho_i / rho0 - 1;
+// lambda_i = -C_i / (sum_k |grad_k C_i|^2 + eps).   (Macklin-Mueller eq. 9-11)
+//
+// Neighbour topology comes from GridPositions (the iteration-0 predictions
+// the grid was built over); distances use InPositions (the current iterate).
+// Per-iteration motion is clamped to 0.1h, so the topology stays a superset
+// of the true neighbourhood across 2-4 iterations -- h has 2.5x spacing of
+// slack (contract line 31-33).
+//
+// THE CELL-EQUALITY CHECK IS LOAD-BEARING. Two of the 27 walked cells can
+// hash to one bucket; without the check, every particle in that bucket would
+// be visited twice and counted twice into the density. Requiring the entry's
+// own cell (recomputed from the same GridPositions value the count kernel
+// hashed -- bit-identical math) to equal the cell being walked makes bucket
+// collisions cost candidate tests only.
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidDensityLambdaMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	if (GridPositions[i].w == 0.0f)
+	{
+		Lambdas[i] = 0.0f;
+		return;
+	}
+
+	const float3 pi = InPositions[i].xyz;
+	const int3 baseCell = FluidCellCoord(GridPositions[i].xyz);
+	const float h2 = VOXEL_FLUID_KERNEL_H_UU * VOXEL_FLUID_KERNEL_H_UU;
+
+	float density = 0.0f;
+	float3 gradSelf = float3(0.0f, 0.0f, 0.0f);
+	float sumGrad2 = 0.0f;
+
+	for (int dz = -1; dz <= 1; ++dz)
+	for (int dy = -1; dy <= 1; ++dy)
+	for (int dx = -1; dx <= 1; ++dx)
+	{
+		const int3 nc = baseCell + int3(dx, dy, dz);
+		const uint bucket = FluidHashCell(nc);
+		const uint start = InCellStarts[bucket];
+		const uint count = InCellCounts[bucket];
+		for (uint k = 0u; k < count; ++k)
+		{
+			const uint j = InCellEntries[start + k];
+			if (any(FluidCellCoord(GridPositions[j].xyz) != nc))
+			{
+				continue; // bucket collision: entry belongs to a different cell
+			}
+			const float3 d = pi - InPositions[j].xyz;
+			const float r2 = dot(d, d);
+			if (r2 >= h2)
+			{
+				continue;
+			}
+			density += FluidPoly6(r2);
+			if (j != i)
+			{
+				const float3 g = FluidSpikyGrad(d, r2) / RestDensity;
+				gradSelf += g;
+				sumGrad2 += dot(g, g);
+			}
+		}
+	}
+	sumGrad2 += dot(gradSelf, gradSelf);
+
+	const float C = density / RestDensity - 1.0f;
+	Lambdas[i] = -C / (sumGrad2 + VOXEL_FLUID_CFM_EPSILON);
+}
+
+// ---- kernel: position correction -------------------------------------------
+// dp_i = (1/rho0) * sum_j (lambda_i + lambda_j + s_corr) grad W_spiky(p_i-p_j)
+// then the collision resolve.                        (Macklin-Mueller eq. 12-14)
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	const float4 self = InPositions[i];
+	if (GridPositions[i].w == 0.0f)
+	{
+		OutPositions[i] = self; // dead slots ride through unchanged (w stays 0)
+		return;
+	}
+
+	const float3 pi = self.xyz;
+	const float lambdaI = InLambdas[i];
+	const int3 baseCell = FluidCellCoord(GridPositions[i].xyz);
+	const float h2 = VOXEL_FLUID_KERNEL_H_UU * VOXEL_FLUID_KERNEL_H_UU;
+	const float wDq = FluidPoly6(VOXEL_FLUID_SCORR_DQ2);
+
+	float3 dp = float3(0.0f, 0.0f, 0.0f);
+
+	for (int dz = -1; dz <= 1; ++dz)
+	for (int dy = -1; dy <= 1; ++dy)
+	for (int dx = -1; dx <= 1; ++dx)
+	{
+		const int3 nc = baseCell + int3(dx, dy, dz);
+		const uint bucket = FluidHashCell(nc);
+		const uint start = InCellStarts[bucket];
+		const uint count = InCellCounts[bucket];
+		for (uint k = 0u; k < count; ++k)
+		{
+			const uint j = InCellEntries[start + k];
+			if (j == i)
+			{
+				continue;
+			}
+			if (any(FluidCellCoord(GridPositions[j].xyz) != nc))
+			{
+				continue;
+			}
+			const float3 d = pi - InPositions[j].xyz;
+			const float r2 = dot(d, d);
+			if (r2 >= h2)
+			{
+				continue;
+			}
+			const float wRatio = FluidPoly6(r2) / wDq;
+			const float w2 = wRatio * wRatio;
+			const float sCorr = -VOXEL_FLUID_SCORR_K * w2 * w2; // ^VOXEL_FLUID_SCORR_N (=4)
+			dp += (lambdaI + InLambdas[j] + sCorr) * FluidSpikyGrad(d, r2);
+		}
+	}
+	dp /= RestDensity;
+
+	// Stability clamp -- see VOXEL_FLUID_MAX_DELTA_P_UU.
+	const float dpLen = length(dp);
+	if (dpLen > VOXEL_FLUID_MAX_DELTA_P_UU)
+	{
+		dp *= VOXEL_FLUID_MAX_DELTA_P_UU / dpLen;
+	}
+
+	const float3 corrected = FluidResolveCollision(pi + dp, pi);
+	OutPositions[i] = float4(corrected, 1.0f);
+}
+
+// ---- kernel: finalize ------------------------------------------------------
+// v = (p_new - p_old) / dt, despawn checks, counter maintenance, and the
+// alive reduction. Order of operations per particle:
+//   1. derive + clamp velocity;
+//   2. boundary despawn (left the active box) -> flag, counter, free list;
+//   3. basin despawn -- NOT IMPLEMENTED IN THIS SPIKE. There is no basin data
+//      until Phase 1/2 ship the registry (plan Phase 1-2); the flag and the
+//      ParticleCounts[1] slot exist per the contract and stay at zero, which
+//      the subsystem's conservation check treats as a real zero, not absence;
+//   4. survivors count into ParticleCounts[0] and write back position+velocity.
+[numthreads(VOXEL_FLUID_GROUP, 1, 1)]
+void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
+{
+	const uint i = DTid.x;
+	if (i >= SimSlotCount)
+	{
+		return;
+	}
+	FVoxelFluidParticle P = ParticlesRW[i];
+	uint flags = asuint(P.P0.w);
+	if ((flags & VOXEL_FLUID_FLAG_ALIVE) == 0u)
+	{
+		return;
+	}
+
+	const float3 pNew = InPositions[i].xyz;
+	const float3 pOld = P.P0.xyz;
+	float3 v = (pNew - pOld) / Dt;
+	const float speed = length(v);
+	if (speed > VOXEL_FLUID_MAX_SPEED_UU)
+	{
+		v *= VOXEL_FLUID_MAX_SPEED_UU / speed;
+	}
+
+	// Boundary despawn: outside the active box around the fluid origin. The
+	// box is origin-centred (positions are origin-relative, contract line
+	// 21-26), so this is a component-wise abs test.
+	const bool bOutside = any(abs(pNew) > BoundaryHalfExtentUU);
+	if (bOutside)
+	{
+		flags = VOXEL_FLUID_FLAG_DESPAWN_BOUNDARY; // ALIVE cleared by assignment
+		InterlockedAdd(ParticleCounts[2], 1u);
+		uint top;
+		InterlockedAdd(SlotCounters[0], 1u, top);
+		FreeList[top] = i;
+		P.P0 = float4(pNew, asfloat(flags));
+		P.P1 = float4(v, P.P1.w);
+		ParticlesRW[i] = P;
+		return;
+	}
+
+	InterlockedAdd(ParticleCounts[0], 1u); // alive
+	P.P0 = float4(pNew, asfloat(flags));
+	P.P1 = float4(v, P.P1.w);
+	ParticlesRW[i] = P;
+}

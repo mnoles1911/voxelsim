@@ -1,0 +1,457 @@
+// VoxelFluidCollision.ush -- particle vs terrain, over the occupancy bitfield.
+//
+// The two entry points VoxelFluidContract.ush:70-76 promises, and nothing
+// else. This is the ONLY file that reads FluidOccupancyBits; the solver calls
+// VoxelFluidResolveCollision and never touches a bit itself, which is what
+// keeps the packing in one place (VoxelFluidOccupancy.usf writes it, this
+// reads it, voxelcore/fluidoccupancy.h defines it and vxc_tests proves it).
+//
+// Part of Phase 0 spike (c), docs/water-rearchitecture-plan-2026-08-09.md.
+//
+// ---------------------------------------------------------------------------
+// THE CPU REFERENCE IS voxelcore/fluidoccupancy.h AND THIS MIRRORS IT
+// ---------------------------------------------------------------------------
+//
+// Every constant and every branch below has a named counterpart there, and
+// tests/test_fluidoccupancy.cpp pins the behaviour -- including a
+// cross-check against voxelcore/raycast.h, the project's authoritative integer
+// Amanatides & Woo walk, on the same geometry. The mirror is maintained by
+// hand, exactly as worldgen.ush mirrors amplifier.h. If you change a rule
+// here, change it there, and the test tells you whether you got it right
+// without launching an editor.
+//
+// Conventions taken verbatim from raycast.h so there is one set in the repo:
+//   faceAxis  0=x 1=y 2=z, and -1 when the segment STARTS inside solid, so no
+//             face was crossed (raycast.h:22-24)
+//   faceSign  +1 == entered moving in +axis, i.e. through the voxel's -axis
+//             face (raycast.h:20-22)
+//   ties      simultaneous crossings step ONE axis at a time, lowest first
+//             (raycast.h:74-80)
+//
+// ---------------------------------------------------------------------------
+// THE ONE THING THE HOST MUST GUARANTEE
+// ---------------------------------------------------------------------------
+//
+// FluidOriginUU (the contract's float precision origin, :20-25) MUST equal
+// FluidVolumeOriginVoxel * VOXEL_FLUID_VOXEL_UU.
+//
+// That is: the origin particle positions are relative to IS the volume's own
+// minimum corner. Then a position maps to a voxel by one floor and one integer
+// add, with no extra binding to thread through and nothing for the solver and
+// the collision pass to disagree about. The alternative -- letting the two
+// origins drift apart -- needs a third quantity that both passes must be given
+// consistently, and the failure mode of getting it wrong is water colliding
+// with terrain that is offset by a few metres, which reads as a worldgen bug.
+//
+// It costs nothing. Both origins only move when the active region recentres,
+// and a recentre already forces a full volume rebuild; the extra work is one
+// constant subtraction over <=300k particles. FVoxelFluidOccupancyVolume::
+// GetOriginUU() (VoxelFluidOccupancy.h) is the host-side accessor that keeps
+// the two in step, and it is the value the solver must rebase to.
+
+#ifndef VOXEL_FLUID_COLLISION_USH
+#define VOXEL_FLUID_COLLISION_USH
+
+#include "/VoxelEarth/VoxelFluidContract.ush"
+
+// ---------------------------------------------------------------------------
+// Constants (mirror of voxelcore/fluidoccupancy.h)
+// ---------------------------------------------------------------------------
+
+// One 10 cm terrain voxel in UU. This is vxc::kVoxelSizeMm (core.h:263) in UU
+// and is NOT the contract's VOXEL_FLUID_REST_SPACING_UU: the two are equal
+// today and mean different things (terrain lattice vs PBF rest spacing), so
+// neither is defined in terms of the other. Mirror of vxc::kFluidVoxelUU.
+#define VOXEL_FLUID_VOXEL_UU  10.0f
+
+// THE ANTI-TUNNELLING BUDGET. Mirror of vxc::kFluidMaxCollisionSteps, and the
+// number the spike exists to justify.
+//
+//   Motion per substep is v*dt UU. The walk crosses one voxel boundary per
+//   step and a diagonal segment crosses up to sqrt(3) times as many boundaries
+//   as an axis-aligned one of the same length, so the budget covers
+//
+//       v_max = VOXEL_FLUID_MAX_COLLISION_STEPS * VOXEL_FLUID_VOXEL_UU
+//               / (dt * sqrt(3))          (worst case, diagonal)
+//
+//   Against the plan's worst case -- a 40 m waterfall, v = sqrt(2*g*h) =
+//   sqrt(2*9.81*40) = 28.0 m/s = 2800 UU/s -- and PBF substeps of 1/240..1/60:
+//
+//       steps=8,  dt=1/60   ->  2771 UU/s   FAILS the 40 m waterfall by 1 %
+//       steps=16, dt=1/60   ->  5543 UU/s = 55.4 m/s, a 157 m fall
+//       steps=16, dt=1/120  -> 11086 UU/s = 111 m/s,  a 627 m fall
+//       steps=16, dt=1/240  -> 22170 UU/s = 222 m/s
+//
+//   8 is the obvious budget and it misses the plan's own named case at the
+//   slow end of the substep range. 16 clears it by 1.98x there -- a 157 m fall
+//   -- and costs nothing typical: the walk exits at the first solid voxel or
+//   when the segment is spent, so a particle drifting at 1 m/s does ONE
+//   iteration. test_fluidoccupancy.cpp asserts the waterfall case, the exact
+//   cap, and the "8 would have failed" arithmetic, so these cannot rot.
+//
+//   RAISING IT IS ALMOST FREE. The loop is [loop], not unrolled, so a bigger
+//   budget adds no code and no cost to particles that exit early; 24 steps
+//   covers 83 m/s (a 352 m fall) and 32 covers 111 m/s (a 627 m fall). 16 is
+//   chosen because 40 m is the stated requirement and going over budget clamps
+//   rather than leaks -- not because 16 is a limit.
+#define VOXEL_FLUID_MAX_COLLISION_STEPS  16
+
+// AND THE BUDGET IS NOT A LEAK. Running out of steps with segment remaining
+// clamps the particle to the last boundary the walk VERIFIED, rather than
+// letting it continue. Above the supported speed a particle is SLOWED, never
+// passed through a wall -- so the numbers above are a speed limit and not a
+// tunnelling threshold, and the visible symptom of getting them wrong is
+// sluggish water instead of invisibly leaking water.
+
+// One resolve pass clamps one axis; a corner needs up to three, and cannot
+// need a fourth. Mirror of vxc::kFluidMaxResolveIterations.
+#define VOXEL_FLUID_MAX_RESOLVE_ITERATIONS  3
+
+// How far outside the face the projected position sits. 0.01 UU = 0.1 mm.
+// Sized against float precision, not physics: the volume is 5120 UU across, so
+// origin-relative positions reach ~5120 where a float32 ULP is ~4.9e-4 UU. The
+// skin is ~20 ULP -- big enough that re-flooring the corrected position lands
+// in the free voxel rather than back on the boundary, small enough to be
+// invisible at 1/1000 of a voxel. Mirror of vxc::kFluidCollisionSkinUU.
+#define VOXEL_FLUID_COLLISION_SKIN_UU  0.01f
+
+// "This axis never crosses a boundary." Any value above 1 works (the walk
+// clamps at t>1); finite rather than inf so it survives arithmetic.
+#define VOXEL_FLUID_NO_CROSSING_T  1e30f
+
+// ---------------------------------------------------------------------------
+// Bindings (VoxelFluidContract.ush:64-69)
+// ---------------------------------------------------------------------------
+//
+// Declared here rather than in the contract because the contract is included
+// by the WRITER too (VoxelFluidOccupancy.usf), which needs the RWBuffer form
+// of the same name. One name, one meaning, two access modes, and the two
+// declarations can never meet: nothing includes both this file and the
+// occupancy kernel.
+Buffer<uint> FluidOccupancyBits;
+// World voxel coordinate of bit (0,0,0).
+int3 FluidVolumeOriginVoxel;
+// 512. A uniform rather than a literal so a future half-resolution or
+// quarter-extent volume is a host change, not a shader edit; every use below
+// derives from it.
+uint FluidVolumeDimVoxels;
+
+// ---------------------------------------------------------------------------
+// The bit read
+// ---------------------------------------------------------------------------
+
+// OUTSIDE THE VOLUME IS SOLID. This is the rule the whole collision model
+// rests on (VoxelFluidContract.ush:70-73): a particle can never escape through
+// an unbuilt edge, the same "blocked, never guessed" convention the fine
+// terrain tier uses. The opposite convention drains a river into the void the
+// first time the volume lags the camera by a frame, and it looks like a solver
+// bug rather than a residency bug.
+//
+// Mirror of vxc::fluidSolidAtVoxel.
+bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
+{
+	const int3 l = worldVoxel - FluidVolumeOriginVoxel;
+	const int dim = (int)FluidVolumeDimVoxels;
+	if (any(l < 0) || any(l >= dim))
+	{
+		return true;
+	}
+
+	// x-major packing: 32 voxels per word along x, rows along x then y then z.
+	const uint wordsPerRow = FluidVolumeDimVoxels >> 5u;
+	const uint index = ((uint)l.z * FluidVolumeDimVoxels + (uint)l.y) * wordsPerRow
+	                 + ((uint)l.x >> 5u);
+	// lint-shader-ub: allow VARIABLE_SHIFT - the distance is masked to 0..31 by the & 31u in the expression itself, so it is provably below the 32-bit left operand's width
+	return (FluidOccupancyBits[index] & (1u << ((uint)l.x & 31u))) != 0u;
+}
+
+// Volume-local UU -> world voxel. One floor and one integer add, which is what
+// the FluidOriginUU == FluidVolumeOriginVoxel * VOXEL_FLUID_VOXEL_UU rule at
+// the top of this file buys.
+int3 VoxelFluidVoxelForPosUU(float3 posUU)
+{
+	return (int3)floor(posUU / VOXEL_FLUID_VOXEL_UU) + FluidVolumeOriginVoxel;
+}
+
+bool VoxelFluidSolidAtPosUU(float3 posUU)
+{
+	return VoxelFluidSolidAtVoxel(VoxelFluidVoxelForPosUU(posUU));
+}
+
+// ---------------------------------------------------------------------------
+// The voxel-line walk
+// ---------------------------------------------------------------------------
+
+struct FVoxelFluidWalkHit
+{
+	bool  Hit;
+	int3  Voxel;          // first solid voxel entered, WORLD coordinates
+	int   FaceAxis;       // 0/1/2, or -1 when the segment started inside solid
+	int   FaceSign;       // +1 == entered moving in +axis
+	float TEnter;         // segment parameter of the crossing, or of the last
+	                      // verified boundary when BudgetExhausted
+	bool  StartedInside;
+	bool  BudgetExhausted;
+};
+
+// Float Amanatides & Woo from prevPosUU to posUU. Mirror of
+// vxc::fluidWalkVoxelLine.
+//
+// WHY A WALK AND NOT AN ENDPOINT TEST. A PBF substep can move a particle
+// several voxels; testing only the destination sails straight through a 10 cm
+// wall whenever the far side happens to be air, which is every wall. The walk
+// is what makes "a 10 cm wall stops a particle at any plausible speed" true
+// rather than true-at-low-speed.
+FVoxelFluidWalkHit VoxelFluidWalkVoxelLine(float3 prevPosUU, float3 posUU)
+{
+	FVoxelFluidWalkHit outHit;
+	outHit.Hit = false;
+	outHit.FaceAxis = -1;
+	outHit.FaceSign = 0;
+	outHit.TEnter = 0.0f;
+	outHit.StartedInside = false;
+	outHit.BudgetExhausted = false;
+
+	const int3 localStart = (int3)floor(prevPosUU / VOXEL_FLUID_VOXEL_UU);
+	const int3 startVoxel = localStart + FluidVolumeOriginVoxel;
+	// A plain array, not an int3: the walk indexes it by the axis it chose each
+	// step, and dynamic component indexing of a VECTOR forces DXC to spill the
+	// whole vector to scratch memory on every write. An array is already
+	// addressable.
+	int v[3] = { startVoxel.x, startVoxel.y, startVoxel.z };
+	outHit.Voxel = startVoxel;
+
+	if (VoxelFluidSolidAtVoxel(startVoxel))
+	{
+		// raycast.h:42-48's case: no face was crossed, so no projection
+		// direction can be derived. Reported, never guessed.
+		outHit.Hit = true;
+		outHit.StartedInside = true;
+		return outHit;
+	}
+
+	const float3 d = posUU - prevPosUU;
+
+	float tMax[3], tDelta[3];
+	int step[3];
+	{
+		const float pv[3] = { prevPosUU.x, prevPosUU.y, prevPosUU.z };
+		const float dv[3] = { d.x, d.y, d.z };
+		const float lv[3] = { (float)localStart.x, (float)localStart.y, (float)localStart.z };
+		[unroll]
+		for (int a = 0; a < 3; ++a)
+		{
+			if (dv[a] > 0.0f)
+			{
+				step[a] = 1;
+				tMax[a] = ((lv[a] + 1.0f) * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else if (dv[a] < 0.0f)
+			{
+				step[a] = -1;
+				tMax[a] = (lv[a] * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = -VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else
+			{
+				step[a] = 0;
+				tMax[a] = VOXEL_FLUID_NO_CROSSING_T;
+				tDelta[a] = VOXEL_FLUID_NO_CROSSING_T;
+			}
+		}
+	}
+
+	float tLast = 0.0f;
+	// [loop], not unrolled: 16 copies of a buffer load and a branch is a lot of
+	// instruction cache for a loop that typically runs once.
+	[loop]
+	for (int i = 0; i < VOXEL_FLUID_MAX_COLLISION_STEPS; ++i)
+	{
+		// Ties step one axis at a time, lowest first -- raycast.h:74-80.
+		int axis;
+		if (tMax[0] <= tMax[1] && tMax[0] <= tMax[2])      { axis = 0; }
+		else if (tMax[1] <= tMax[2])                       { axis = 1; }
+		else                                               { axis = 2; }
+
+		if (tMax[axis] > 1.0f)
+		{
+			return outHit;   // segment exhausted, nothing in the way
+		}
+
+		tLast = tMax[axis];
+		v[axis] += step[axis];
+		tMax[axis] += tDelta[axis];
+
+		const int3 vNow = int3(v[0], v[1], v[2]);
+		if (VoxelFluidSolidAtVoxel(vNow))
+		{
+			outHit.Hit = true;
+			outHit.Voxel = vNow;
+			outHit.FaceAxis = axis;
+			outHit.FaceSign = step[axis];
+			outHit.TEnter = tLast;
+			return outHit;
+		}
+	}
+
+	// Budget spent with segment left. The last voxel entered was tested and is
+	// empty, so tLast is a verified-safe place to stop.
+	outHit.BudgetExhausted = true;
+	outHit.TEnter = tLast;
+	return outHit;
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+struct FVoxelFluidCollision
+{
+	float3 PosUU;        // corrected position
+	float3 Normal;       // outward normal(s) of the blocking face(s), or 0
+	bool   Blocked;
+	bool   StartedInside;
+	bool   SpeedClamped;  // the step budget capped the motion
+	int    Iterations;    // resolve passes that clamped an axis; 0 == free
+};
+
+// The full result. Mirror of vxc::fluidResolveCollision.
+//
+// WHY IT ITERATES. One pass clamps one axis, and the clamped position can
+// still lie inside a different solid voxel -- a particle driven into a corner
+// has to come out of two or three faces. Each pass clamps a NEW axis (the mask
+// refuses a repeat), so the loop is bounded by three and terminates by
+// construction rather than by a tolerance.
+FVoxelFluidCollision VoxelFluidResolveCollisionFull(float3 posUU, float3 prevPosUU)
+{
+	FVoxelFluidCollision res;
+	res.PosUU = posUU;
+	res.Normal = float3(0.0f, 0.0f, 0.0f);
+	res.Blocked = false;
+	res.StartedInside = false;
+	res.SpeedClamped = false;
+	res.Iterations = 0;
+
+	uint clampedAxes = 0u;
+
+	[loop]
+	for (int iter = 0; iter < VOXEL_FLUID_MAX_RESOLVE_ITERATIONS; ++iter)
+	{
+		const FVoxelFluidWalkHit h = VoxelFluidWalkVoxelLine(prevPosUU, res.PosUU);
+		res.Iterations = iter + 1;
+
+		if (h.StartedInside)
+		{
+			// Nowhere sound to project to. Hold: the particle stops where it
+			// was instead of being teleported somewhere plausible. This is
+			// also what a particle inside a not-yet-built region does, since
+			// unbuilt reads as solid.
+			res.PosUU = prevPosUU;
+			res.Blocked = true;
+			res.StartedInside = true;
+			return res;
+		}
+
+		if (h.BudgetExhausted)
+		{
+			res.PosUU = prevPosUU + (res.PosUU - prevPosUU) * h.TEnter;
+			res.SpeedClamped = true;
+			return res;
+		}
+
+		if (!h.Hit)
+		{
+			res.Iterations = iter;   // this pass found nothing; motion is free
+			return res;
+		}
+
+		// lint-shader-ub: allow VARIABLE_SHIFT - FaceAxis is 0, 1 or 2 here: the only other value it can hold is -1 for StartedInside, and that branch returned above, as did !Hit
+		const uint axisBit = 1u << (uint)h.FaceAxis;
+		if ((clampedAxes & axisBit) != 0u)
+		{
+			// Same axis twice. Unreachable with the projection below (the
+			// clamp plus skin puts the position in the free voxel along that
+			// axis), so getting here means the volume changed under us
+			// mid-resolve or the skin is too small. Hold rather than loop.
+			res.PosUU = prevPosUU;
+			res.Blocked = true;
+			return res;
+		}
+		clampedAxes |= axisBit;
+
+		// The blocking face plane, in volume-local UU. FaceSign +1 means the
+		// walk came in through the voxel's LOW face, so the free side is below.
+		const int3 localVoxel = h.Voxel - FluidVolumeOriginVoxel;
+		const int localV = (h.FaceAxis == 0) ? localVoxel.x
+		                 : (h.FaceAxis == 1) ? localVoxel.y
+		                                     : localVoxel.z;
+
+		float corrected;
+		float normalComponent;
+		if (h.FaceSign > 0)
+		{
+			corrected = (float)localV * VOXEL_FLUID_VOXEL_UU - VOXEL_FLUID_COLLISION_SKIN_UU;
+			normalComponent = -1.0f;
+		}
+		else
+		{
+			corrected = ((float)localV + 1.0f) * VOXEL_FLUID_VOXEL_UU + VOXEL_FLUID_COLLISION_SKIN_UU;
+			normalComponent = 1.0f;
+		}
+
+		if (h.FaceAxis == 0)      { res.PosUU.x = corrected; res.Normal.x = normalComponent; }
+		else if (h.FaceAxis == 1) { res.PosUU.y = corrected; res.Normal.y = normalComponent; }
+		else                      { res.PosUU.z = corrected; res.Normal.z = normalComponent; }
+
+		res.Blocked = true;
+	}
+
+	return res;
+}
+
+// THE CONTRACT ENTRY POINT (VoxelFluidContract.ush:74-76). Projects a
+// penetrating particle out along the face normal of the voxel it entered and
+// returns the corrected position.
+//
+// ON "KILLING THE NORMAL VELOCITY COMPONENT". PBF derives velocity as
+// (x - x_prev)/dt, so projecting x is most of the job -- but it leaves a
+// residual approach velocity of (penetration depth)/dt along the normal,
+// because x_prev is still on the far side. To kill it exactly the solver must
+// also lift x_prev's normal component onto the projected plane, and that needs
+// the normal, which this signature has nowhere to return.
+//
+// So: use VoxelFluidResolveCollisionEx below in the solver's integrate step.
+// This wrapper exists because the contract names it, it is correct as a pure
+// position projection, and a caller that only needs "put it back outside"
+// should not have to declare two out-parameters.
+float3 VoxelFluidResolveCollision(float3 posUU, float3 prevPosUU)
+{
+	return VoxelFluidResolveCollisionFull(posUU, prevPosUU).PosUU;
+}
+
+// The form the PBF integrate step should call.
+//
+//   float3 n;
+//   bool blocked;
+//   pos = VoxelFluidResolveCollisionEx(pos, prevPos, n, blocked);
+//   if (blocked)
+//   {
+//       // exact zero normal velocity: move prevPos onto the same plane, then
+//       // the solver's own v = (pos - prevPos)/dt has no normal component.
+//       prevPos -= n * dot(prevPos - pos, n);
+//   }
+//
+// Tangential motion is untouched, which is the free-slip wall the blueprint's
+// collision model asks for. A friction term, if one is ever wanted, belongs in
+// the solver on the tangential remainder -- not here.
+float3 VoxelFluidResolveCollisionEx(float3 posUU, float3 prevPosUU,
+                                    out float3 outNormal, out bool outBlocked)
+{
+	const FVoxelFluidCollision res = VoxelFluidResolveCollisionFull(posUU, prevPosUU);
+	outNormal = res.Normal;
+	outBlocked = res.Blocked;
+	return res.PosUU;
+}
+
+#endif // VOXEL_FLUID_COLLISION_USH

@@ -74,5 +74,26 @@ struct FVoxelFluidParticle
 //   float3 VoxelFluidResolveCollision(float3 posUU, float3 prevPosUU);
 //        // projects a penetrating particle out along the face normal of the
 //        // voxel it entered, killing the normal velocity component.
+//
+// RATIFIED CLARIFICATIONS (integrator, 2026-08-09, after both sides built):
+//  1. FluidOriginUU == FluidVolumeOriginVoxel * 10.0f, always. One origin,
+//     computed in one place (FVoxelFluidOccupancyVolume::GetOriginUU); the
+//     solver never derives its own. Positions then live in [0, 5120] UU where
+//     a float32 ULP is 5 um.
+//  2. The SOLVER calls VoxelFluidResolveCollisionEx (same file), not the bare
+//     entry point above. The bare form cannot kill normal velocity exactly:
+//     PBF derives v = (x - x_prev)/dt, so correcting x alone leaves a residual
+//     approach velocity of penetration/dt. Ex returns the contact normal so
+//     the solver lifts x_prev onto the same plane. The bare form stays for
+//     simple consumers (debug probes).
+//  3. The collision walk budget is 16 steps => max supported speed 5,543 UU/s
+//     at dt=1/60 (a 157 m waterfall; the plan's named 40 m case needs 2,800).
+//     Over budget CLAMPS to the last verified boundary -- water above the
+//     supported speed is slowed, never passed through a wall.
+//  4. PLANNED, NOT YET CONTRACT: toroidal (wrap-around) volume addressing, so
+//     recentring invalidates ~1/50 of the volume instead of all 16 MiB. It
+//     changes VoxelFluidSolidAtVoxel's indexing (per-axis modulo) and lands as
+//     a versioned edit HERE when taken -- consumers must not assume flatness
+//     beyond this file's word.
 
 #endif // VOXEL_FLUID_CONTRACT_USH

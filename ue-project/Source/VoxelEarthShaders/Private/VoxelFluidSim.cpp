@@ -1,0 +1,898 @@
+// VoxelFluidSim.cpp -- RDG pass builder for the Phase 0 PBF solver spike.
+// See VoxelFluidSim.h for the ownership/lifetime doctrine and
+// VoxelFluidSim.usf for the solver itself; this file is the plumbing between
+// them, following VoxelGpuWorldGen.cpp's shape (FGlobalShader compute passes,
+// per-kernel parameter structs, IMPLEMENT_GLOBAL_SHADER off a virtual path).
+
+#include "VoxelFluidSim.h"
+
+#include "GlobalShader.h"
+#include "RenderGraphBuilder.h"
+#include "RenderGraphUtils.h"
+#include "ShaderParameterStruct.h"
+#include "RHIGPUReadback.h"
+#include "DataDrivenShaderPlatformInfo.h"
+#include "RenderingThread.h"
+#include "Misc/AutomationTest.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogVoxelFluid, Log, All);
+
+// Macro, not a const TCHAR*, for the same reason VoxelGpuWorldGen.cpp:24
+// gives: IMPLEMENT_GLOBAL_SHADER stringizes its path argument.
+#define VOXEL_FLUID_SIM_USF "/VoxelEarth/VoxelFluidSim.usf"
+
+// The HLSL contract struct is two float4s (VoxelFluidContract.ush:48-52). If
+// the CPU mirror ever stops being 32 bytes the debug readback silently
+// misaligns, so assert it here rather than debug it as "the points draw in
+// the wrong place" (the same guard VoxelGpuWorldGen.cpp:29 keeps for columns).
+static_assert(sizeof(VoxelFluidSim::FParticleCPU) == 32,
+              "FParticleCPU must match FVoxelFluidParticle byte for byte");
+
+namespace
+{
+	// ---- solver-internal constants mirrored from VoxelFluidSim.usf ---------
+	// Everything CONTRACT-shaped is mirrored in the header; these are the
+	// solver's own knobs, needed CPU-side for sizing and dispatch.
+
+	// VoxelFluidSim.usf VOXEL_FLUID_HASH_CELLS / _SCAN_BLOCK / _GROUP.
+	constexpr uint32 kHashCells = 64u * 1024u;
+	constexpr uint32 kScanBlock = 256u;
+	constexpr uint32 kGroupSize = 64u;
+	static_assert(kHashCells == kScanBlock * kScanBlock,
+	              "single-workgroup ScanSums covers exactly ScanBlock^2 cells");
+
+	// The shader's kernel-coefficient literals (VoxelFluidSim.usf:70,76),
+	// restated ONCE here so the automation tests can pin them against the
+	// double-precision derivations in VoxelFluidSim::Poly6CoeffUU et al.
+	constexpr double kShaderPoly6CoeffLiteral = 4.10673e-13;
+	constexpr double kShaderSpikyGradCoeffLiteral = 5.86709e-8;
+
+	// ---- shared compile policy ---------------------------------------------
+	// SM5, NOT SM6, and that is deliberate honesty rather than a missed memo:
+	// the brief's pattern file gates on SM6 because worldgen genuinely does
+	// 64-bit integer math (VoxelGpuWorldGen.cpp:66-70). These kernels do
+	// float3/uint math only, and the repo's own precedent for such kernels --
+	// FVoxelQuadTotalCS at VoxelGpuWorldGen.cpp:232 -- says gating on SM6
+	// anyway "would be harmless but dishonest about what it requires".
+	class FVoxelFluidShader : public FGlobalShader
+	{
+	public:
+		FVoxelFluidShader() = default;
+		FVoxelFluidShader(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+			: FGlobalShader(Initializer) {}
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+	};
+
+	// --- FluidFrameBeginMain: zero the alive slot ---------------------------
+	class FVoxelFluidFrameBeginCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidFrameBeginCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidFrameBeginCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidSpawnMain -----------------------------------------------------
+	class FVoxelFluidSpawnCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidSpawnCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidSpawnCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SpawnCount)
+			SHADER_PARAMETER(uint32, SpawnMode)
+			SHADER_PARAMETER(uint32, SpawnSeed)
+			SHADER_PARAMETER(uint32, SpawnEdge)
+			SHADER_PARAMETER(float, SpawnBatchId)
+			SHADER_PARAMETER(FVector3f, SpawnCenterLocalUU)
+			SHADER_PARAMETER(FVector3f, SpawnVelUU)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, FreeList)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SlotCounters)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidIntegrateMain -------------------------------------------------
+	class FVoxelFluidIntegrateCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidIntegrateCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidIntegrateCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER(float, Dt)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPositions)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidHashCountMain -------------------------------------------------
+	class FVoxelFluidHashCountCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidHashCountCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidHashCountCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellHash)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellRank)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- the 3-kernel scan --------------------------------------------------
+	class FVoxelFluidScanBlocksCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidScanBlocksCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidScanBlocksCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellStarts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, BlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelFluidScanSumsCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidScanSumsCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidScanSumsCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, BlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelFluidScanAddCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidScanAddCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidScanAddCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellStarts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, BlockSums)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidScatterMain ---------------------------------------------------
+	// CellStarts/ParticleCellHash/ParticleCellRank are read-only here but the
+	// shader declares them RWStructuredBuffer (one declaration serves every
+	// kernel), so they bind as UAVs -- the same note FVoxelMeshCountCS carries
+	// at VoxelGpuWorldGen.cpp:148-151.
+	class FVoxelFluidScatterCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidScatterCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidScatterCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellStarts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, CellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellHash)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCellRank)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidDensityLambdaMain ---------------------------------------------
+	class FVoxelFluidDensityLambdaCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidDensityLambdaCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidDensityLambdaCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER(float, RestDensity)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellStarts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float>, Lambdas)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidDeltaPosMain --------------------------------------------------
+	class FVoxelFluidDeltaPosCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidDeltaPosCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidDeltaPosCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER(float, RestDensity)
+			SHADER_PARAMETER(float, GroundZLocalUU)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, GridPositions)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float>, InLambdas)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellStarts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCellEntries)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<float4>, OutPositions)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- FluidFinalizeMain --------------------------------------------------
+	class FVoxelFluidFinalizeCS : public FVoxelFluidShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelFluidFinalizeCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelFluidFinalizeCS, FVoxelFluidShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SimSlotCount)
+			SHADER_PARAMETER(float, Dt)
+			SHADER_PARAMETER(float, BoundaryHalfExtentUU)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<float4>, InPositions)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, FreeList)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, SlotCounters)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+}
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidFrameBeginCS,    VOXEL_FLUID_SIM_USF, "FluidFrameBeginMain",    SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidSpawnCS,         VOXEL_FLUID_SIM_USF, "FluidSpawnMain",         SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidIntegrateCS,     VOXEL_FLUID_SIM_USF, "FluidIntegrateMain",     SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidHashCountCS,     VOXEL_FLUID_SIM_USF, "FluidHashCountMain",     SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidScanBlocksCS,    VOXEL_FLUID_SIM_USF, "FluidScanBlocksMain",    SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidScanSumsCS,      VOXEL_FLUID_SIM_USF, "FluidScanSumsMain",      SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidScanAddCS,       VOXEL_FLUID_SIM_USF, "FluidScanAddMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidScatterCS,       VOXEL_FLUID_SIM_USF, "FluidScatterMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidDensityLambdaCS, VOXEL_FLUID_SIM_USF, "FluidDensityLambdaMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidDeltaPosCS,      VOXEL_FLUID_SIM_USF, "FluidDeltaPosMain",      SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelFluidFinalizeCS,      VOXEL_FLUID_SIM_USF, "FluidFinalizeMain",      SF_Compute);
+
+// Here and not in the header: this TU has the complete FRDGPooledBuffer type.
+// See the matching comment in VoxelFluidSim.h.
+FVoxelFluidSimState::FVoxelFluidSimState() = default;
+FVoxelFluidSimState::~FVoxelFluidSimState() = default;
+
+// ---- pure math mirrors (unit-tested) ---------------------------------------
+
+double VoxelFluidSim::Poly6CoeffUU()
+{
+	const double H = double(kKernelHUU);
+	return 315.0 / (64.0 * UE_DOUBLE_PI * FMath::Pow(H, 9.0));
+}
+
+double VoxelFluidSim::SpikyGradCoeffUU()
+{
+	const double H = double(kKernelHUU);
+	return 45.0 / (UE_DOUBLE_PI * FMath::Pow(H, 6.0));
+}
+
+double VoxelFluidSim::Poly6UU(double R2)
+{
+	const double H2 = double(kKernelHUU) * double(kKernelHUU);
+	if (R2 >= H2)
+	{
+		return 0.0;
+	}
+	const double T = H2 - R2;
+	return Poly6CoeffUU() * T * T * T;
+}
+
+int32 VoxelFluidSim::RestLatticeNeighbourCount()
+{
+	// All integer lattice offsets of kRestSpacingUU strictly inside radius
+	// kKernelHUU, self included. h/spacing = 2.5, so offsets live in [-2, 2].
+	int32 Count = 0;
+	for (int32 X = -2; X <= 2; ++X)
+	for (int32 Y = -2; Y <= 2; ++Y)
+	for (int32 Z = -2; Z <= 2; ++Z)
+	{
+		const double R2 = double(X * X + Y * Y + Z * Z)
+		                * double(kRestSpacingUU) * double(kRestSpacingUU);
+		if (R2 < double(kKernelHUU) * double(kKernelHUU))
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+float VoxelFluidSim::ComputeRestDensity()
+{
+	double Sum = 0.0;
+	for (int32 X = -2; X <= 2; ++X)
+	for (int32 Y = -2; Y <= 2; ++Y)
+	for (int32 Z = -2; Z <= 2; ++Z)
+	{
+		const double R2 = double(X * X + Y * Y + Z * Z)
+		                * double(kRestSpacingUU) * double(kRestSpacingUU);
+		Sum += Poly6UU(R2);
+	}
+	return float(Sum);
+}
+
+uint32 VoxelFluidSim::CubeEdgeForCount(uint32 Count)
+{
+	if (Count == 0)
+	{
+		return 0;
+	}
+	uint32 Edge = uint32(FMath::CeilToInt(FMath::Pow(double(Count), 1.0 / 3.0)));
+	// Float cube roots are not exact; walk to the smallest edge whose cube
+	// holds Count rather than trusting the rounding either way.
+	while (Edge > 1 && (Edge - 1) * (Edge - 1) * (Edge - 1) >= Count)
+	{
+		--Edge;
+	}
+	while (uint64(Edge) * Edge * Edge < Count)
+	{
+		++Edge;
+	}
+	return Edge;
+}
+
+// ---- the tick --------------------------------------------------------------
+
+namespace
+{
+	FIntVector GroupsForSlots(uint32 Slots)
+	{
+		return FIntVector(FMath::DivideAndRoundUp(Slots, kGroupSize), 1, 1);
+	}
+
+	// Polls every outstanding counts/debug readback and timing query into the
+	// snapshot. Non-blocking throughout: a result that is not ready stays in
+	// flight for the next tick's poll.
+	void PollCompletions(FVoxelFluidSimState& State)
+	{
+		// Timing first, so a counts snapshot updated below carries the newest
+		// completed GPU time.
+		float NewGpuMs = -1.0f;
+		for (auto& Pair : State.TimingRing)
+		{
+			if (!Pair.bInFlight)
+			{
+				continue;
+			}
+			uint64 BeginMicros = 0;
+			uint64 EndMicros = 0;
+			// End was issued after Begin, so if End has a result, Begin does.
+			if (RHIGetRenderQueryResult(Pair.End.GetReference(), EndMicros, false) &&
+			    RHIGetRenderQueryResult(Pair.Begin.GetReference(), BeginMicros, false))
+			{
+				NewGpuMs = float(double(EndMicros - BeginMicros) / 1000.0);
+				Pair.bInFlight = false;
+			}
+		}
+
+		for (auto& Slot : State.CountsRing)
+		{
+			if (!Slot.bInFlight || !Slot.Readback->IsReady())
+			{
+				continue;
+			}
+			uint32 Counts[4] = { 0, 0, 0, 0 };
+			const void* Src = Slot.Readback->Lock(sizeof(Counts));
+			if (Src != nullptr)
+			{
+				FMemory::Memcpy(Counts, Src, sizeof(Counts));
+				Slot.Readback->Unlock();
+
+				FScopeLock Lock(&State.SnapshotLock);
+				// Late arrivals must never regress a newer snapshot.
+				if (Slot.Generation >= State.LatestCounts.Generation)
+				{
+					State.LatestCounts.Alive = Counts[0];
+					State.LatestCounts.DespawnedBasin = Counts[1];
+					State.LatestCounts.DespawnedBoundary = Counts[2];
+					State.LatestCounts.SpawnedTotal = Counts[3];
+					State.LatestCounts.Generation = Slot.Generation;
+					State.LatestCounts.bValid = true;
+				}
+			}
+			Slot.bInFlight = false;
+		}
+
+		if (NewGpuMs >= 0.0f)
+		{
+			FScopeLock Lock(&State.SnapshotLock);
+			State.LatestCounts.SimGpuMs = NewGpuMs;
+		}
+
+		if (State.bDebugReadbackInFlight && State.DebugReadback->IsReady())
+		{
+			const uint32 Bytes = State.DebugReadbackSlots * sizeof(VoxelFluidSim::FParticleCPU);
+			const void* Src = State.DebugReadback->Lock(Bytes);
+			if (Src != nullptr)
+			{
+				const auto* P = static_cast<const VoxelFluidSim::FParticleCPU*>(Src);
+				TArray<FVector3f> Positions;
+				Positions.Reserve(State.DebugReadbackSlots);
+				for (uint32 i = 0; i < State.DebugReadbackSlots; ++i)
+				{
+					if (P[i].Flags & VoxelFluidSim::kFlagAlive)
+					{
+						Positions.Add(P[i].Pos);
+					}
+				}
+				State.DebugReadback->Unlock();
+
+				FScopeLock Lock(&State.SnapshotLock);
+				State.DebugAlivePositionsLocal = MoveTemp(Positions);
+				State.DebugSnapshotGeneration = State.DebugReadbackGeneration;
+			}
+			State.bDebugReadbackInFlight = false;
+		}
+	}
+}
+
+void VoxelFluidSim::TickRenderThread(FRHICommandListImmediate& RHICmdList,
+                                     FVoxelFluidSimState& State,
+                                     const FVoxelFluidSimTickArgs& InArgs)
+{
+	check(IsInRenderingThread());
+
+	FVoxelFluidSimTickArgs Args = InArgs;
+	Args.Iterations = FMath::Clamp(Args.Iterations, 1, 8);
+	Args.SimSlotBound = FMath::Min(Args.SimSlotBound, kMaxParticles);
+	if (Args.Dt <= 0.0f || Args.SimSlotBound == 0)
+	{
+		// Nothing can run (velocity derivation divides by Dt; zero slots means
+		// nothing was ever spawned). Still poll, so results already in flight
+		// keep landing.
+		PollCompletions(State);
+		return;
+	}
+
+	State.TickGeneration++;
+
+	FRDGBuilder GraphBuilder(RHICmdList);
+	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidSim");
+
+	// ---- persistent buffers -----------------------------------------------
+	// Allocated once, cleared once, re-registered every frame. See the
+	// lifetime doctrine at the top of VoxelFluidSim.h.
+	const bool bFirstFrame = !State.bBuffersInitialized;
+	if (bFirstFrame)
+	{
+		State.Particles = AllocatePooledBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FParticleCPU), kMaxParticles),
+			TEXT("VoxelFluid.Particles"));
+		State.Counts = AllocatePooledBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 4),
+			TEXT("VoxelFluid.ParticleCounts"));
+		State.FreeList = AllocatePooledBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), kMaxParticles),
+			TEXT("VoxelFluid.FreeList"));
+		State.SlotCounters = AllocatePooledBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2),
+			TEXT("VoxelFluid.SlotCounters"));
+		State.bBuffersInitialized = true;
+		UE_LOG(LogVoxelFluid, Display,
+		       TEXT("Fluid sim buffers allocated: particles %u KB, freelist %u KB (cap %u particles)"),
+		       kMaxParticles * 32 / 1024, kMaxParticles * 4 / 1024, kMaxParticles);
+	}
+
+	FRDGBufferRef ParticlesRDG = GraphBuilder.RegisterExternalBuffer(State.Particles, TEXT("VoxelFluid.Particles"));
+	FRDGBufferRef CountsRDG = GraphBuilder.RegisterExternalBuffer(State.Counts, TEXT("VoxelFluid.ParticleCounts"));
+	FRDGBufferRef FreeListRDG = GraphBuilder.RegisterExternalBuffer(State.FreeList, TEXT("VoxelFluid.FreeList"));
+	FRDGBufferRef SlotCountersRDG = GraphBuilder.RegisterExternalBuffer(State.SlotCounters, TEXT("VoxelFluid.SlotCounters"));
+
+	if (bFirstFrame)
+	{
+		// One-time zeroing: all flags dead, all counters zero. The free list
+		// body needs no clear -- entries above the (zeroed) top are never read.
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(ParticlesRDG), 0u);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CountsRDG), 0u);
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(SlotCountersRDG), 0u);
+	}
+
+	// ---- transient buffers (die with the graph; sized to the slot bound) ---
+	const uint32 Slots = Args.SimSlotBound;
+	FRDGBufferRef PredictedG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.Predicted0"));
+	FRDGBufferRef PredictedA = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.PredictedA"));
+	FRDGBufferRef PredictedB = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(16, Slots), TEXT("VoxelFluid.PredictedB"));
+	FRDGBufferRef LambdasRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, Slots), TEXT("VoxelFluid.Lambdas"));
+	FRDGBufferRef CellHashRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, Slots), TEXT("VoxelFluid.CellHash"));
+	FRDGBufferRef CellRankRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, Slots), TEXT("VoxelFluid.CellRank"));
+	FRDGBufferRef CellEntriesRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, Slots), TEXT("VoxelFluid.CellEntries"));
+	FRDGBufferRef CellCountsRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, kHashCells), TEXT("VoxelFluid.CellCounts"));
+	FRDGBufferRef CellStartsRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, kHashCells), TEXT("VoxelFluid.CellStarts"));
+	FRDGBufferRef BlockSumsRDG = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(4, kScanBlock), TEXT("VoxelFluid.BlockSums"));
+
+	// ---- GPU timing bracket (begin) ---------------------------------------
+	// RQT_AbsoluteTime pair as untracked NeverCull passes. Same-pipe compute
+	// passes execute in declaration order here (no async compute flags
+	// anywhere in this graph), so the bracket covers exactly this graph's
+	// passes plus the 16-byte counts copy -- stated in the measurement spec.
+	FVoxelFluidSimState::FTimingPair* Timing = nullptr;
+	if (GSupportsTimestampRenderQueries)
+	{
+		for (auto& Pair : State.TimingRing)
+		{
+			if (!Pair.bInFlight)
+			{
+				Timing = &Pair;
+				break;
+			}
+		}
+	}
+	if (Timing != nullptr)
+	{
+		if (!Timing->Begin.IsValid())
+		{
+			Timing->Begin = RHICreateRenderQuery(RQT_AbsoluteTime);
+			Timing->End = RHICreateRenderQuery(RQT_AbsoluteTime);
+		}
+		FRHIRenderQuery* Query = Timing->Begin.GetReference();
+		GraphBuilder.AddPass(RDG_EVENT_NAME("VoxelFluid.TimeBegin"), ERDGPassFlags::NeverCull,
+			[Query](FRHICommandListImmediate& InRHICmdList)
+			{
+				InRHICmdList.EndRenderQuery(Query);
+			});
+	}
+
+	AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(CellCountsRDG), 0u);
+
+	// ---- pass 1: frame begin (zero the alive slot) ------------------------
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidFrameBeginCS::FParameters>();
+		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
+		TShaderMapRef<FVoxelFluidFrameBeginCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.FrameBegin"),
+		                             Shader, Params, FIntVector(1, 1, 1));
+	}
+
+	// ---- pass 2: spawn (optional) -----------------------------------------
+	if (Args.Spawn.Count > 0)
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidSpawnCS::FParameters>();
+		Params->SpawnCount = Args.Spawn.Count;
+		Params->SpawnMode = Args.Spawn.Mode;
+		Params->SpawnSeed = Args.Spawn.Seed;
+		Params->SpawnEdge = CubeEdgeForCount(Args.Spawn.Count);
+		Params->SpawnBatchId = Args.Spawn.BatchId;
+		Params->SpawnCenterLocalUU = Args.Spawn.CenterLocalUU;
+		Params->SpawnVelUU = Args.Spawn.VelocityUU;
+		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
+		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
+		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);
+		Params->SlotCounters = GraphBuilder.CreateUAV(SlotCountersRDG);
+		TShaderMapRef<FVoxelFluidSpawnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder,
+		                             RDG_EVENT_NAME("VoxelFluid.Spawn(%u)", Args.Spawn.Count),
+		                             Shader, Params, GroupsForSlots(Args.Spawn.Count));
+	}
+
+	// ---- pass 3: integrate -------------------------------------------------
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidIntegrateCS::FParameters>();
+		Params->SimSlotCount = Slots;
+		Params->Dt = Args.Dt;
+		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
+		Params->OutPositions = GraphBuilder.CreateUAV(PredictedG);
+		TShaderMapRef<FVoxelFluidIntegrateCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.Integrate"),
+		                             Shader, Params, GroupsForSlots(Slots));
+	}
+
+	// ---- passes 4-8: hash grid (count, 3-kernel scan, scatter) ------------
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidHashCountCS::FParameters>();
+		Params->SimSlotCount = Slots;
+		Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
+		Params->CellCounts = GraphBuilder.CreateUAV(CellCountsRDG);
+		Params->ParticleCellHash = GraphBuilder.CreateUAV(CellHashRDG);
+		Params->ParticleCellRank = GraphBuilder.CreateUAV(CellRankRDG);
+		TShaderMapRef<FVoxelFluidHashCountCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.HashCount"),
+		                             Shader, Params, GroupsForSlots(Slots));
+	}
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScanBlocksCS::FParameters>();
+		Params->CellCounts = GraphBuilder.CreateUAV(CellCountsRDG);
+		Params->CellStarts = GraphBuilder.CreateUAV(CellStartsRDG);
+		Params->BlockSums = GraphBuilder.CreateUAV(BlockSumsRDG);
+		TShaderMapRef<FVoxelFluidScanBlocksCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.ScanBlocks"),
+		                             Shader, Params, FIntVector(kHashCells / kScanBlock, 1, 1));
+	}
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScanSumsCS::FParameters>();
+		Params->BlockSums = GraphBuilder.CreateUAV(BlockSumsRDG);
+		TShaderMapRef<FVoxelFluidScanSumsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.ScanSums"),
+		                             Shader, Params, FIntVector(1, 1, 1)); // one group, by design
+	}
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScanAddCS::FParameters>();
+		Params->CellStarts = GraphBuilder.CreateUAV(CellStartsRDG);
+		Params->BlockSums = GraphBuilder.CreateUAV(BlockSumsRDG);
+		TShaderMapRef<FVoxelFluidScanAddCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.ScanAdd"),
+		                             Shader, Params, FIntVector(kHashCells / kScanBlock, 1, 1));
+	}
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidScatterCS::FParameters>();
+		Params->SimSlotCount = Slots;
+		Params->CellStarts = GraphBuilder.CreateUAV(CellStartsRDG);
+		Params->CellEntries = GraphBuilder.CreateUAV(CellEntriesRDG);
+		Params->ParticleCellHash = GraphBuilder.CreateUAV(CellHashRDG);
+		Params->ParticleCellRank = GraphBuilder.CreateUAV(CellRankRDG);
+		TShaderMapRef<FVoxelFluidScatterCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.Scatter"),
+		                             Shader, Params, GroupsForSlots(Slots));
+	}
+
+	// ---- passes 9..: constraint iterations --------------------------------
+	// Ping-pong: iteration 0 reads the grid predictions (G) and writes A;
+	// after that A<->B. Neighbour topology stays frozen against G throughout
+	// (see the shader's DensityLambda header comment).
+	const float RestDensity = ComputeRestDensity();
+	FRDGBufferRef CurIn = PredictedG;
+	FRDGBufferRef CurOut = PredictedA;
+	for (int32 It = 0; It < Args.Iterations; ++It)
+	{
+		{
+			auto* Params = GraphBuilder.AllocParameters<FVoxelFluidDensityLambdaCS::FParameters>();
+			Params->SimSlotCount = Slots;
+			Params->RestDensity = RestDensity;
+			Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
+			Params->InPositions = GraphBuilder.CreateSRV(CurIn);
+			Params->InCellStarts = GraphBuilder.CreateSRV(CellStartsRDG);
+			Params->InCellCounts = GraphBuilder.CreateSRV(CellCountsRDG);
+			Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
+			Params->Lambdas = GraphBuilder.CreateUAV(LambdasRDG);
+			TShaderMapRef<FVoxelFluidDensityLambdaCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder,
+			                             RDG_EVENT_NAME("VoxelFluid.DensityLambda(it %d)", It),
+			                             Shader, Params, GroupsForSlots(Slots));
+		}
+		{
+			auto* Params = GraphBuilder.AllocParameters<FVoxelFluidDeltaPosCS::FParameters>();
+			Params->SimSlotCount = Slots;
+			Params->RestDensity = RestDensity;
+			Params->GroundZLocalUU = Args.GroundZLocalUU;
+			Params->GridPositions = GraphBuilder.CreateSRV(PredictedG);
+			Params->InPositions = GraphBuilder.CreateSRV(CurIn);
+			Params->InLambdas = GraphBuilder.CreateSRV(LambdasRDG);
+			Params->InCellStarts = GraphBuilder.CreateSRV(CellStartsRDG);
+			Params->InCellCounts = GraphBuilder.CreateSRV(CellCountsRDG);
+			Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
+			Params->OutPositions = GraphBuilder.CreateUAV(CurOut);
+			TShaderMapRef<FVoxelFluidDeltaPosCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(GraphBuilder,
+			                             RDG_EVENT_NAME("VoxelFluid.DeltaPos(it %d)", It),
+			                             Shader, Params, GroupsForSlots(Slots));
+		}
+		const FRDGBufferRef Next = (CurOut == PredictedA) ? PredictedB : PredictedA;
+		CurIn = CurOut;
+		CurOut = Next;
+	}
+
+	// ---- pass: finalize ----------------------------------------------------
+	{
+		auto* Params = GraphBuilder.AllocParameters<FVoxelFluidFinalizeCS::FParameters>();
+		Params->SimSlotCount = Slots;
+		Params->Dt = Args.Dt;
+		Params->BoundaryHalfExtentUU = Args.BoundaryHalfExtentUU;
+		Params->InPositions = GraphBuilder.CreateSRV(CurIn);
+		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
+		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
+		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);
+		Params->SlotCounters = GraphBuilder.CreateUAV(SlotCountersRDG);
+		TShaderMapRef<FVoxelFluidFinalizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(GraphBuilder, RDG_EVENT_NAME("VoxelFluid.Finalize"),
+		                             Shader, Params, GroupsForSlots(Slots));
+	}
+
+	// ---- readbacks ---------------------------------------------------------
+	// The 16-byte counts copy, every frame -- the 4-byte QuadTotal pattern
+	// (VoxelGpuMeshJobManager.cpp:205-217) at 4x the width. This is the whole
+	// per-frame CPU cost of the conservation assert.
+	{
+		FVoxelFluidSimState::FCountsReadback* Free = nullptr;
+		for (auto& Slot : State.CountsRing)
+		{
+			if (!Slot.bInFlight)
+			{
+				Free = &Slot;
+				break;
+			}
+		}
+		if (Free != nullptr)
+		{
+			if (!Free->Readback.IsValid())
+			{
+				Free->Readback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelFluid.CountsReadback"));
+			}
+			AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), CountsRDG, 4 * sizeof(uint32));
+			Free->Generation = State.TickGeneration;
+			Free->bInFlight = true;
+		}
+		else
+		{
+			// Counted, not silent: if this climbs, the GPU is >2 frames behind
+			// and the perf line's counts are correspondingly stale.
+			State.CountsReadbackSkips++;
+		}
+	}
+
+	if (Args.bReadbackDebugSlots && !State.bDebugReadbackInFlight)
+	{
+		const uint32 DebugSlots =
+			FMath::Min(FMath::Min(Args.DebugSlotCount, FVoxelFluidSimState::kDebugMaxSlots), Slots);
+		if (DebugSlots > 0)
+		{
+			if (!State.DebugReadback.IsValid())
+			{
+				State.DebugReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelFluid.DebugReadback"));
+			}
+			AddEnqueueCopyPass(GraphBuilder, State.DebugReadback.Get(), ParticlesRDG,
+			                   DebugSlots * sizeof(FParticleCPU));
+			State.DebugReadbackSlots = DebugSlots;
+			State.DebugReadbackGeneration = State.TickGeneration;
+			State.bDebugReadbackInFlight = true;
+		}
+	}
+
+	// ---- GPU timing bracket (end) ------------------------------------------
+	if (Timing != nullptr)
+	{
+		FRHIRenderQuery* Query = Timing->End.GetReference();
+		GraphBuilder.AddPass(RDG_EVENT_NAME("VoxelFluid.TimeEnd"), ERDGPassFlags::NeverCull,
+			[Query](FRHICommandListImmediate& InRHICmdList)
+			{
+				InRHICmdList.EndRenderQuery(Query);
+			});
+		Timing->bInFlight = true;
+	}
+
+	GraphBuilder.Execute();
+
+	PollCompletions(State);
+}
+
+void VoxelFluidSim::ReleaseRenderThread(FVoxelFluidSimState& State)
+{
+	check(IsInRenderingThread());
+	State.Particles.SafeRelease();
+	State.Counts.SafeRelease();
+	State.FreeList.SafeRelease();
+	State.SlotCounters.SafeRelease();
+	for (auto& Slot : State.CountsRing)
+	{
+		Slot.Readback.Reset();
+		Slot.bInFlight = false;
+	}
+	State.DebugReadback.Reset();
+	State.bDebugReadbackInFlight = false;
+	for (auto& Pair : State.TimingRing)
+	{
+		Pair.Begin.SafeRelease();
+		Pair.End.SafeRelease();
+		Pair.bInFlight = false;
+	}
+	State.bBuffersInitialized = false;
+}
+
+// ---- automation tests -------------------------------------------------------
+// CPU-side pins for every piece of solver logic that does not need a GPU:
+// the shader-mirror coefficients, the rest-density lattice, the spawn edge,
+// and the conservation predicate the subsystem asserts with. Run headlessly:
+//   UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 \
+//     -ExecCmds="Automation RunTests VoxelEarth.Fluid; Quit"
+// (same harness as VoxelGpuGeometryPoolTests.cpp).
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+namespace
+{
+	constexpr EAutomationTestFlags kFluidTestFlags = EAutomationTestFlags::EditorContext
+	                                               | EAutomationTestFlags::ClientContext
+	                                               | EAutomationTestFlags::EngineFilter;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidKernelCoeffTest,
+	"VoxelEarth.Fluid.KernelCoefficients", kFluidTestFlags)
+
+bool FVoxelFluidKernelCoeffTest::RunTest(const FString& Parameters)
+{
+	// The shader carries these as float literals (VoxelFluidSim.usf); if
+	// either drifts from its derivation the density constraint is silently
+	// wrong everywhere. 1e-5 relative -- literal precision, not float math.
+	const double Poly6 = VoxelFluidSim::Poly6CoeffUU();
+	const double Spiky = VoxelFluidSim::SpikyGradCoeffUU();
+	TestTrue(TEXT("poly6 literal matches derivation"),
+	         FMath::Abs(Poly6 - kShaderPoly6CoeffLiteral) / Poly6 < 1e-5);
+	TestTrue(TEXT("spiky grad literal matches derivation"),
+	         FMath::Abs(Spiky - kShaderSpikyGradCoeffLiteral) / Spiky < 1e-5);
+
+	// Kernel shape sanity: positive inside support, exactly zero at/after h.
+	TestTrue(TEXT("W(0) > 0"), VoxelFluidSim::Poly6UU(0.0) > 0.0);
+	TestTrue(TEXT("W monotone"), VoxelFluidSim::Poly6UU(100.0) > VoxelFluidSim::Poly6UU(400.0));
+	TestEqual(TEXT("W(h^2) == 0"), VoxelFluidSim::Poly6UU(625.0), 0.0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidRestDensityTest,
+	"VoxelEarth.Fluid.RestDensity", kFluidTestFlags)
+
+bool FVoxelFluidRestDensityTest::RunTest(const FString& Parameters)
+{
+	// h = 2.5x spacing puts exactly 81 lattice sites (offsets with
+	// i^2+j^2+k^2 <= 6) inside the kernel support, self included.
+	TestEqual(TEXT("rest lattice site count"), VoxelFluidSim::RestLatticeNeighbourCount(), 81);
+
+	// The summed kernel must approximate the ideal number density
+	// 1/spacing^3 = 1e-3 per UU^3 -- that agreement is what makes
+	// "density / RestDensity - 1" a meaningful constraint. Within 5%.
+	const double Rest = double(VoxelFluidSim::ComputeRestDensity());
+	const double Ideal = 1.0 / FMath::Pow(double(VoxelFluidSim::kRestSpacingUU), 3.0);
+	TestTrue(TEXT("rest density near ideal number density"),
+	         FMath::Abs(Rest / Ideal - 1.0) < 0.05);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidCubeEdgeTest,
+	"VoxelEarth.Fluid.CubeEdge", kFluidTestFlags)
+
+bool FVoxelFluidCubeEdgeTest::RunTest(const FString& Parameters)
+{
+	const uint32 Cases[] = { 1, 2, 7, 8, 9, 26, 27, 28, 999, 1000, 5000, 100000, 300 * 1024 };
+	for (uint32 Count : Cases)
+	{
+		const uint32 Edge = VoxelFluidSim::CubeEdgeForCount(Count);
+		TestTrue(FString::Printf(TEXT("edge^3 holds %u"), Count),
+		         uint64(Edge) * Edge * Edge >= Count);
+		if (Edge > 1)
+		{
+			TestTrue(FString::Printf(TEXT("edge minimal for %u"), Count),
+			         uint64(Edge - 1) * (Edge - 1) * (Edge - 1) < Count);
+		}
+	}
+	TestEqual(TEXT("zero count -> zero edge"), VoxelFluidSim::CubeEdgeForCount(0), 0u);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidConservationTest,
+	"VoxelEarth.Fluid.Conservation", kFluidTestFlags)
+
+bool FVoxelFluidConservationTest::RunTest(const FString& Parameters)
+{
+	using VoxelFluidSim::CheckConservation;
+	// The exact predicate the subsystem asserts with every readback
+	// (one definition, VoxelFluidSim.h) -- alive, basin, boundary, spawned.
+	TestTrue(TEXT("all zero balances (the idle case)"), CheckConservation(0, 0, 0, 0));
+	TestTrue(TEXT("spawned == alive"), CheckConservation(100, 0, 0, 100));
+	TestTrue(TEXT("spawn minus despawns"), CheckConservation(70, 10, 20, 100));
+	TestFalse(TEXT("leaked particle detected"), CheckConservation(71, 10, 20, 100));
+	TestFalse(TEXT("lost particle detected"), CheckConservation(69, 10, 20, 100));
+	TestFalse(TEXT("despawn without spawn detected"), CheckConservation(0, 0, 1, 0));
+	return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS
