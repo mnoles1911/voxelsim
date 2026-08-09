@@ -888,13 +888,17 @@ bool PinCVar(const TCHAR* Name, const TCHAR* Value, FString& OutActual)
 
 } // namespace VoxelSkyLadderDetail
 
-// Hoisted so the entry point below reads exactly as it would have with an
-// anonymous namespace. The names stay file-local in practice -- nothing outside
-// this .cpp includes it -- but they are now distinct symbols under unity.
-using namespace VoxelSkyLadderDetail;
-
 bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 {
+	// INSIDE the function, not at file scope. The file-scope form leaked into
+	// whatever unity chunk happened to be concatenated after this file, and
+	// the chunk boundaries move every time a file is ADDED to the module --
+	// so adding VoxelFluidSubsystem.cpp made VoxelSweBreachFixture.cpp's own
+	// SetTimerOnce/StageBegin ambiguous against this namespace's, two files
+	// that never mention each other. A using-directive in a unity build is
+	// only safe inside a scope.
+	using namespace VoxelSkyLadderDetail;
+
 	// The Value-or-Param idiom every switch in this module uses
 	// (VoxelEarthGameMode.cpp:2147-2150): bare -VoxelSkyLadder takes the default,
 	// -VoxelSkyLadder=<N> overrides it. FParse::Param requires a delimiter after
