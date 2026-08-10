@@ -2976,7 +2976,7 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # conscious edit at every roll instead of letting the version drift
     # silently, which is why this is pinned rather than read from
     # pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 24
+    assert on["bake_version"] == 26
 
     n = 24
     z, water = _diagonal_reach(n)

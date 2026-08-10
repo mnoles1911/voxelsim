@@ -67,7 +67,7 @@ namespace
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyDayLengthSeconds(
-		TEXT("voxel.Sky.DayLengthSeconds"), 2400.0f,
+		TEXT("voxel.Sky.DayLengthSeconds"), 3600.0f,
 		TEXT("Wall-clock seconds per game day. Default 2400 = a 40-minute day. DOUBLED from 1200 ")
 		TEXT("on 2026-08-09: at 1200 the sky visibly moved while you stood still. This is the one ")
 		TEXT("knob that sets the whole sky's angular rate -- the sun, the moon and the star field ")

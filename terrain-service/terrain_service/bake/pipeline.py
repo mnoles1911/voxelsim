@@ -454,7 +454,7 @@ __all__ = [
 #: but it invalidates sites, screenshots and measurements, so it is the
 #: integrator's call to make deliberately, not a side effect to discover.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 24
+BAKE_VERSION = 26
 
 
 @dataclass(frozen=True)
@@ -851,9 +851,9 @@ class BakeConstants:
     # tile and a worst case of 266, i.e. 8.5 KB against 26.6 MB of compressed
     # elevation; at 1 m / 0 m2 it is 4,082 rows and mostly puddles.
     #: Minimum depth of a registered basin's deepest cell, metres.
-    basin_min_depth_m: float = 2.0
+    basin_min_depth_m: float = 1.0
     #: Minimum footprint at the spill level, m^2. 2500 m^2 is 50 m across.
-    basin_min_area_m2: float = 2500.0
+    basin_min_area_m2: float = 100.0
     #: FLIPPED TO FALSE AT bake_ver 24 (basin table v2). v1 registered INTERIOR
     #: basins only, because a basin crossing the tile edge is seen by each
     #: neighbour from a different padded domain "and the two need not agree",
