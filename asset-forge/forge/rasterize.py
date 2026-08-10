@@ -14,12 +14,12 @@ from __future__ import annotations
 import numpy as np
 
 from . import materials
-from .grid import VOXEL_M, VoxelGrid, m_to_vox
+from .grid import VoxelGrid, m_to_vox
 from .skeleton import Skeleton
 from .spec import get
 
 
-def bounds(skel: Skeleton, spec: dict) -> tuple[np.ndarray, tuple[int, int, int]]:
+def bounds(skel: Skeleton, spec: dict, voxel_m: float) -> tuple[np.ndarray, tuple[int, int, int]]:
     """Grid origin (voxels) and shape, with room for wood and foliage."""
     pad_m = float(skel.radius.max())
     if get(spec, "foliage.enabled"):
@@ -27,10 +27,10 @@ def bounds(skel: Skeleton, spec: dict) -> tuple[np.ndarray, tuple[int, int, int]
             pad_m,
             float(get(spec, "foliage.clump_radius_m")) + abs(float(get(spec, "foliage.droop_m"))),
         )
-    pad = int(np.ceil(m_to_vox(pad_m))) + 2
+    pad = int(np.ceil(m_to_vox(pad_m, voxel_m))) + 2
 
-    lo = np.floor(m_to_vox(skel.pos.min(axis=0))).astype(np.int64) - pad
-    hi = np.ceil(m_to_vox(skel.pos.max(axis=0))).astype(np.int64) + pad
+    lo = np.floor(m_to_vox(skel.pos.min(axis=0), voxel_m)).astype(np.int64) - pad
+    hi = np.ceil(m_to_vox(skel.pos.max(axis=0), voxel_m)).astype(np.int64) + pad
     lo[2] = 0  # the base sits on the ground plane; nothing below it
     shape = tuple(int(v) for v in (hi - lo + 1))
     return lo, shape
@@ -41,8 +41,8 @@ def wood(grid: VoxelGrid, skel: Skeleton, spec: dict, origin: np.ndarray) -> Non
     core = materials.resolve(get(spec, "materials.core"))
     core_mat = core if core != bark else None
 
-    pos_vox = m_to_vox(skel.pos) - origin
-    r_vox = m_to_vox(skel.radius)
+    pos_vox = m_to_vox(skel.pos, grid.voxel_m) - origin
+    r_vox = m_to_vox(skel.radius, grid.voxel_m)
     parents, children = skel.segments()
 
     for pi, ci in zip(parents, children):
@@ -73,7 +73,7 @@ def foliage(
     density = float(get(spec, "foliage.density"))
     squash = float(get(spec, "foliage.squash"))
     droop = float(get(spec, "foliage.droop_m"))
-    r_vox = m_to_vox(float(get(spec, "foliage.clump_radius_m")))
+    r_vox = m_to_vox(float(get(spec, "foliage.clump_radius_m")), grid.voxel_m)
 
     # Clumps go on every twig, not only on the branch tips. Tips alone are few,
     # which forces each clump to be large to fill the crown, and a crown built
@@ -102,8 +102,8 @@ def foliage(
 
     placed = 0
     for k, i in enumerate(cand):
-        c = m_to_vox(skel.pos[i]) - origin + offsets[k]
-        c[2] -= m_to_vox(droop)
+        c = m_to_vox(skel.pos[i], grid.voxel_m) - origin + offsets[k]
+        c[2] -= m_to_vox(droop, grid.voxel_m)
         grid.blob(
             c, max(radii[k], 1.0), leaf, rng, density=density, squash=squash, only_air=True
         )

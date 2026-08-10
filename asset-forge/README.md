@@ -31,6 +31,19 @@ Opens <http://127.0.0.1:8731/> in your browser. Left panel is every parameter
 as a slider, grouped; the middle is a gallery of variants; click one for a
 large render, its measurements and **Keep to library**.
 
+- **Inspect in 3D** — click any tree and the detail view opens an orbit viewer:
+  drag to spin, scroll to zoom, **Reset view** to reframe. **Flat** switches
+  back to the fast isometric render. The server sends only surface voxels
+  (a solid trunk's interior never leaves the machine), so a 135k-voxel oak
+  arrives as ~105k instanced cubes and draws in one call. Hand-written WebGL2 —
+  no library to vendor, works offline.
+- **Describe a change in plain language** — the box above the sliders takes
+  things like *"shorter and more gnarled, sparser canopy"* and moves the
+  sliders for you, listing what it changed and why. It edits the same spec a
+  slider drag does, so the change is validated, clamped, visible as moved
+  sliders, and undoable with **Revert**. Needs `anthropic` installed and
+  `ANTHROPIC_API_KEY` set; without a credential the box says so and everything
+  else works normally.
 - **Generate / More / Reroll** — a fresh batch, the next block of seeds, or a
   random seed range.
 - **auto-regenerate** — regenerates when you release a slider, not during the
@@ -41,7 +54,9 @@ large render, its measurements and **Keep to library**.
   measurements. The Library tab lists everything kept, with download links.
 - **Save spec** writes the current sliders back to `specs/<name>.json`. Change
   the species name first to fork a new species instead of overwriting.
-- **Contact sheet** dumps the current gallery to `out/` as one page.
+- **Library** entries each carry **Inspect in 3D**, **More like this** (loads
+  that tree's approved spec and generates a fresh block of seeds from it), and
+  **Delete** (removes the entry's files from disk, with a confirm).
 - `#seed=N` in the URL opens that variant directly, so a particular tree can be
   bookmarked or handed to someone.
 
@@ -66,6 +81,43 @@ stdlib `http.server` and a hand-written page. Output lands in `out/`.
 seed and measured height, anything the health check flagged marked in the
 corner. That sheet is the actual product — choosing is the designer's job and
 it happens by eye.
+
+## Voxel size
+
+Each species carries its own **Voxel size** (the `resolution_cm` slider):
+10, 5, 2.5, 2 or 1 cm. The engine's terrain is 10 cm, which is the default; at
+2 cm a real twig is several voxels across instead of being rounded up to the
+one-voxel minimum, which is a visible gain on foliage and thin branches.
+
+**The cost is cubic** — 2 cm is 125× the voxels of 10 cm for the same tree.
+Measured on the species set:
+
+    temperate-sapling   10 cm      8,026 vox   0.1 s        2 cm    981,091 vox   0.5 s
+    tundra-pine         10 cm     25,406 vox   0.2 s        2 cm  3,107,527 vox   1.4 s
+    temperate-oak       10 cm    108,556 vox   0.4 s        2 cm 13,378,565 vox   5.4 s
+    jungle-emergent     10 cm    353,000 vox   0.6 s        2 cm 54,007,589 vox  42.3 s
+
+So the app keeps three resolutions separate, and says which one you are looking
+at rather than leaving it ambiguous:
+
+- **Gallery tiles** always build at 10 cm (`ASSET_FORGE_PREVIEW_CM`). The
+  skeleton is resolution-independent, so a 10 cm preview and a 2 cm export are
+  the same tree sampled differently — and no 260-pixel thumbnail can show 2 cm
+  detail. A 2 cm species' gallery takes 3.5 s, not 165 s.
+- **The 3D viewer** shows the finest size that fits its instance budget
+  (`ASSET_FORGE_MAX_VIEWER_VOXELS`, default 2.5M). Small species show at their
+  authored size; a 2 cm oak shows at 5 cm and the caption says
+  *"shown at 5 cm (exports at 2 cm)"*.
+- **Exports** (`.vox`, `.vxa`, Keep to library) always use the authored size.
+
+`pipeline.build` refuses a grid over `ASSET_FORGE_MAX_GRID_MB` (default 3 GB)
+before allocating, with the dimensions and the way out, rather than thrashing
+the machine. The 28 m emergent at 2 cm needs 1.8 GB and 42 s — it works, but it
+is the ceiling of what dense storage handles. Brick-backed storage would cut
+that roughly fivefold and is the next step if 2 cm becomes the default for the
+largest species.
+
+From the command line: `python -m forge.cli gen specs/tundra-pine.json --res 2`.
 
 ## Species
 

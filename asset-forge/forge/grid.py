@@ -1,16 +1,22 @@
 """The voxel grid, and the primitives that draw into it.
 
 Everything here works in VOXELS, not metres. The conversion happens once, at
-the pipeline boundary, against `VOXEL_M`.
+the pipeline boundary, against the grid's own `voxel_m`.
 
-The important rule in this file is the minimum thickness rule. The engine's
-voxels are 10 cm (`kVoxelSizeMm = 100`), and a real twig is thinner than that.
-If we drew branches by their true radius, every branch under 10 cm across would
-either vanish or land on an arbitrary side of a rounding decision, and a crown
-could end up not touching its trunk. So `capsule()` always draws the segment's
-centreline with a face-connected voxel traversal first, and only then thickens
-it. Connectivity is therefore something we guarantee, not something we measure
-afterwards and hope for.
+Voxel size is per-grid, not global. The engine's terrain is 10 cm
+(`kVoxelSizeMm = 100`), but a tree can be authored finer: at 2 cm a real twig
+is several voxels across instead of being rounded up to the one-voxel floor.
+The cost is cubic -- 2 cm is 125x the voxels of 10 cm for the same tree -- so
+resolution is a deliberate per-species choice, and previews are generated
+coarse while exports are generated at the authored size.
+
+The important rule in this file is the minimum thickness rule. Whatever the
+resolution, some branch is always thinner than one voxel. If we drew branches
+by their true radius, those would either vanish or land on an arbitrary side of
+a rounding decision, and a crown could end up not touching its trunk. So
+`capsule()` always draws the segment's centreline with a face-connected voxel
+traversal first, and only then thickens it. Connectivity is therefore something
+we guarantee, not something we measure afterwards and hope for.
 """
 
 from __future__ import annotations
@@ -20,26 +26,38 @@ import math
 
 import numpy as np
 
-VOXEL_M = 0.10  # metres per voxel, matches vxc::kVoxelSizeMm = 100
+VOXEL_M = 0.10  # default metres per voxel, matches vxc::kVoxelSizeMm = 100
 
 
-def m_to_vox(metres: float) -> float:
-    return metres / VOXEL_M
+def m_to_vox(metres, voxel_m: float = VOXEL_M):
+    """Metres -> voxels at a given resolution. Works on scalars and arrays."""
+    return metres / voxel_m
+
+
+def dense_bytes(shape) -> int:
+    """Memory one dense grid of this shape would take, in bytes."""
+    n = 1
+    for s in shape:
+        n *= int(s)
+    return n
 
 
 class VoxelGrid:
     """Dense uint8 material grid indexed [x, y, z], z up.
 
-    Dense rather than sparse because even the largest tree we expect (a 30 m
-    jungle emergent, 300 voxels tall) is a few megabytes, and dense keeps every
-    drawing primitive a plain numpy slice.
+    Dense rather than brick-sparse: it keeps every drawing primitive a plain
+    numpy slice, and even a 28 m tree at 2 cm fits (about 1.7 GB peak, which is
+    why `pipeline.build` guards the allocation rather than letting it thrash).
+    A brick-backed store would cut that roughly fivefold and is the right next
+    step if 2 cm becomes the default for the largest species.
     """
 
-    __slots__ = ("data", "origin")
+    __slots__ = ("data", "origin", "voxel_m")
 
-    def __init__(self, shape: tuple[int, int, int], origin: tuple[int, int, int] = (0, 0, 0)):
+    def __init__(self, shape, origin=(0, 0, 0), voxel_m: float = VOXEL_M):
         self.data = np.zeros(shape, dtype=np.uint8)
         self.origin = np.asarray(origin, dtype=np.int64)
+        self.voxel_m = float(voxel_m)
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -116,9 +134,14 @@ class VoxelGrid:
             # the generator's speed.
             return
 
-        # Half-voxel steps: consecutive balls always overlap, so the thickened
-        # body cannot be beaded even at the taper's thin end.
-        steps = max(1, int(math.ceil(length / 0.5)))
+        # Step along the segment by a fraction of the THINNER end's radius,
+        # floored at half a voxel. Consecutive balls still overlap (spacing
+        # below the smaller radius guarantees it), so the body cannot bead --
+        # but a thick trunk no longer pays a stamp every half voxel. At 10 cm
+        # this is nearly the old behaviour; at 2 cm, where a trunk is 40 voxels
+        # across, it is the difference between usable and not.
+        rmin = max(min(r0_vox, r1_vox), 0.5)
+        steps = max(1, int(math.ceil(length / max(0.5, rmin * 0.6))))
         ts = np.linspace(0.0, 1.0, steps + 1)
         for t in ts:
             c = p0 + (p1 - p0) * t
@@ -174,6 +197,7 @@ class VoxelGrid:
         out = VoxelGrid(
             (xs[-1] - xs[0] + 1, ys[-1] - ys[0] + 1, zs[-1] - zs[0] + 1),
             tuple(self.origin + np.array([xs[0], ys[0], zs[0]])),
+            self.voxel_m,
         )
         out.data[:] = self.data[xs[0] : xs[-1] + 1, ys[0] : ys[-1] + 1, zs[0] : zs[-1] + 1]
         return out
@@ -235,19 +259,38 @@ class VoxelGrid:
 # --- primitives -------------------------------------------------------------
 
 
+_GROWTH = 1.04
+_LOG_GROWTH = math.log(_GROWTH)
+
+
 def _quantize(r: float) -> float:
-    """Round radius to quarter voxels so the offset cache actually hits."""
-    return max(0.5, round(float(r) * 4.0) / 4.0)
+    """Round radius so the offset cache actually hits.
+
+    Quarter-voxel steps while radii are small, then RELATIVE steps above a few
+    voxels. At 2 cm a foliage clump is ~20 voxels across and jitters
+    continuously, so absolute quarter-voxel buckets would mint a hundred
+    distinct 30k-element offset arrays and the cache would hold hundreds of
+    megabytes of them. Relative bucketing keeps the entry count flat as
+    resolution rises, at a sub-percent error in clump radius.
+    """
+    r = max(0.5, float(r))
+    if r <= 4.0:
+        return round(r * 4.0) / 4.0
+    # Geometric buckets ~4% apart: constant number of cache entries per decade
+    # of radius, however fine the lattice gets.
+    return _GROWTH ** round(math.log(r) / _LOG_GROWTH)
 
 
-@functools.lru_cache(maxsize=512)
+@functools.lru_cache(maxsize=192)
 def _ball_offsets(r: float):
     R = int(math.floor(r))
-    a = np.arange(-R, R + 1, dtype=np.int64)
+    a = np.arange(-R, R + 1, dtype=np.int32)
     dx, dy, dz = np.meshgrid(a, a, a, indexing="ij")
-    m = (dx * dx + dy * dy + dz * dz) <= r * r + 1e-6
+    # int32 rather than int64: at 2 cm these arrays dominate the cache, and no
+    # tree is anywhere near 2 billion voxels on an axis.
+    m = (dx.astype(np.int64) ** 2 + dy.astype(np.int64) ** 2 + dz.astype(np.int64) ** 2) <= r * r + 1e-6
     if not m.any():
-        z = np.zeros(1, dtype=np.int64)
+        z = np.zeros(1, dtype=np.int32)
         return z, z, z
     return dx[m].copy(), dy[m].copy(), dz[m].copy()
 

@@ -44,6 +44,12 @@ PARAMS: tuple[Param, ...] = (
       help="Free text for the designer; ignored by the generator."),
     P("height_m", "Height (m)", 12.0, 1.0, 40.0, 0.25, group="general",
       help="Ground to the top of the crown."),
+    P("resolution_cm", "Voxel size", "10", kind="choice", group="general",
+      choices=("10", "5", "2.5", "2", "1"),
+      help="Edge length of one voxel. The engine's terrain is 10 cm; finer makes "
+           "real twigs instead of one-voxel minimums, but cost is cubic — 2 cm is "
+           "125x the voxels of 10 cm. Previews always render coarse; this is the "
+           "size the asset exports at."),
 
     P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.05, 1.60, 0.01, group="trunk"),
     P("trunk.clear_frac", "Branch-free height", 0.35, 0.0, 0.90, 0.01, group="trunk",
@@ -224,11 +230,16 @@ def validate(spec: dict) -> tuple[dict, Report]:
         rep.warnings.append(
             "trunk.clear_frac reaches above the crown: the crown will be sparse or empty"
         )
+    # Half a voxel depends on the voxel size, so this warning has to be
+    # resolution-aware: 4.5 cm twigs are under the floor at 10 cm and more than
+    # two voxels thick at 2 cm.
     tip = get(out, "growth.tip_radius_m")
-    if tip < 0.05:
+    half_voxel = float(get(out, "resolution_cm")) / 100.0 / 2.0
+    if tip < half_voxel:
         rep.warnings.append(
-            f"growth.tip_radius_m {tip} m is under half a voxel; twigs will be drawn "
-            "at the one-voxel minimum instead"
+            f"growth.tip_radius_m {tip} m is under half a voxel at "
+            f"{get(out, 'resolution_cm')} cm; twigs will be drawn at the one-voxel "
+            "minimum instead"
         )
     return out, rep
 

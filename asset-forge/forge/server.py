@@ -24,6 +24,7 @@ import traceback
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -38,6 +39,18 @@ LIBRARY = ROOT / "library"
 TILE_PX = 260
 DETAIL_PX = 820
 MAX_JOBS = 6
+
+# Gallery tiles always generate at a COARSE resolution regardless of what the
+# species is authored at. The skeleton is resolution-independent, so a 10 cm
+# preview and a 2 cm export are the same tree sampled differently -- and a
+# twelve-tile gallery at 2 cm would be a minute of compute for detail no
+# 260-pixel thumbnail can show.
+PREVIEW_CM = float(os.environ.get("ASSET_FORGE_PREVIEW_CM", "10"))
+
+# Ceiling on instances sent to the browser's 3D viewer. Above this the voxels
+# are thinned by a fixed stride -- a 2 cm emergent has tens of millions of
+# surface voxels, which is a 200 MB download and a stalled tab.
+MAX_VIEWER_VOXELS = int(os.environ.get("ASSET_FORGE_MAX_VIEWER_VOXELS", "2500000"))
 
 
 # --- generation jobs --------------------------------------------------------
@@ -58,6 +71,7 @@ class Job:
     spec: dict
     seeds: list[int]
     scale: int
+    preview_cm: float = 10.0
     tiles: dict[int, Tile] = field(default_factory=dict)
     done: int = 0
     cancelled: bool = False
@@ -96,8 +110,8 @@ class Forge:
         self.lock = threading.Lock()
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
-        self.tile_cache: dict[tuple[str, int, int], Tile] = {}
-        self.tile_order: list[tuple[str, int, int]] = []
+        self.tile_cache: dict[tuple, Tile] = {}
+        self.tile_order: list[tuple] = []
 
     def _cache_get(self, key) -> Tile | None:
         with self.lock:
@@ -115,8 +129,15 @@ class Forge:
     def start(self, spec: dict, seeds: list[int]) -> Job:
         # One scale for the whole batch so tiles are comparable by size, the
         # same reason contact sheets do it.
-        scale = render.scale_for([render.predicted_extent(spec)], TILE_PX)
-        job = Job(id=uuid.uuid4().hex[:12], spec=spec, seeds=seeds, scale=scale)
+        # The COARSER of the two: previews never go finer than PREVIEW_CM, but a
+        # species authored coarser than that is previewed as authored rather
+        # than being needlessly refined.
+        preview_cm = max(PREVIEW_CM, float(specmod.get(spec, "resolution_cm")))
+        scale = render.scale_for(
+            [render.predicted_extent(spec, preview_cm / 100.0)], TILE_PX
+        )
+        job = Job(id=uuid.uuid4().hex[:12], spec=spec, seeds=seeds, scale=scale,
+                  preview_cm=preview_cm)
         with self.lock:
             self.jobs[job.id] = job
             self.order.append(job.id)
@@ -131,12 +152,12 @@ class Forge:
         for seed in job.seeds:
             if job.cancelled:
                 return
-            key = (digest, seed, job.scale)
+            key = (digest, seed, job.scale, job.preview_cm)
             tile = self._cache_get(key)
             if tile is None:
                 tile = Tile(seed=seed)
                 try:
-                    tree = pipeline.build(job.spec, seed)
+                    tree = pipeline.build(job.spec, seed, resolution_cm=job.preview_cm)
                     img = render.render(tree.grid, scale=job.scale)
                     buf = io.BytesIO()
                     img.save(buf, "PNG")
@@ -183,6 +204,28 @@ def encode_voxels(grid) -> bytes:
     pos[:, 0], pos[:, 1], pos[:, 2] = xs, ys, zs
     header = struct.pack("<IIII", *(int(v) for v in grid.shape), int(xs.size))
     return header + pos.tobytes() + mats.tobytes()
+
+
+def viewer_resolution(spec: dict) -> float:
+    """Finest voxel size the browser can be asked to draw for this species.
+
+    Never finer than the species is authored at, and never so fine that the
+    instance count blows past the viewer budget. A 28 m emergent at 2 cm has
+    tens of millions of surface voxels; showing it at 5 cm is a far better
+    answer than shipping 200 MB and stalling the tab. The export is unaffected
+    -- this only governs what gets drawn.
+    """
+    authored = float(specmod.get(spec, "resolution_cm"))
+    for cm in sorted({authored, 2.5, 5.0, 10.0}):
+        if cm < authored:
+            continue
+        nx, ny, nz = render.predicted_extent(spec, cm / 100.0)
+        # Measured: a tree's surface voxels come to about 2.3% of its bounding
+        # box (an oak at 5 cm is 436k surface out of 18.7M cells). Good enough
+        # to pick a tier; the tier only has to be roughly right.
+        if nx * ny * nz * 0.023 <= MAX_VIEWER_VOXELS:
+            return cm
+    return 10.0
 
 
 def keep(spec: dict, seed: int) -> dict:
@@ -348,7 +391,10 @@ class Handler(BaseHTTPRequestHandler):
             # is exactly the tree the thumbnail showed.
             job = FORGE.get(q.get("job", ""))
             spec = job.spec if job else self._spec_from_query(q)
-            tree = pipeline.build(spec, int(q["seed"]))
+            # Same tier as the 3D viewer: inspecting shows the finest voxel
+            # size that is practical, exporting always uses the authored one.
+            tree = pipeline.build(spec, int(q["seed"]),
+                                  resolution_cm=viewer_resolution(spec))
             buf = io.BytesIO()
             render.render(tree.grid, target_px=DETAIL_PX).save(buf, "PNG")
             return self._send(200, buf.getvalue(), "image/png", cache=True)
@@ -366,9 +412,17 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "unknown tree"}, 404)
                 spec, _ = specmod.load(d / "spec.json")
                 seed = json.loads((d / "meta.json").read_text(encoding="utf-8"))["seed"]
-            tree = pipeline.build(spec, seed, connectivity=False)
-            return self._send(200, encode_voxels(tree.grid), "application/octet-stream",
-                              cache=True)
+            cm = viewer_resolution(spec)
+            tree = pipeline.build(spec, seed, connectivity=False, resolution_cm=cm)
+            body = encode_voxels(tree.grid)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Voxel-Cm", f"{cm:g}")
+            self.send_header("X-Authored-Cm", f"{float(specmod.get(spec, 'resolution_cm')):g}")
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            return self.wfile.write(body)
 
         if path == "/api/library":
             return self._json(library_list())

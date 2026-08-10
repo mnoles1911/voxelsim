@@ -57,16 +57,24 @@ EDIT_SCHEMA = {
 
 
 def available() -> tuple[bool, str]:
+    """Is a plain-language edit actually possible right now?
+
+    Constructing `Anthropic()` is NOT a credential check — it succeeds with no
+    key and only fails at request time with "Could not resolve authentication
+    method". Inspect the resolved credential instead, so the UI can say the box
+    is unconfigured rather than letting the designer type a request and hit an
+    error.
+    """
     try:
-        import anthropic  # noqa: F401
+        import anthropic
     except ImportError:
         return False, "the `anthropic` package is not installed (pip install anthropic)"
     try:
-        import anthropic
-
-        anthropic.Anthropic()
-    except Exception as exc:  # no credential resolvable
-        return False, f"no Anthropic credential found ({exc.__class__.__name__})"
+        client = anthropic.Anthropic()
+    except Exception as exc:
+        return False, f"client setup failed ({exc.__class__.__name__})"
+    if not (getattr(client, "api_key", None) or getattr(client, "auth_token", None)):
+        return False, "set ANTHROPIC_API_KEY (or run `ant auth login`) and restart"
     return True, ""
 
 

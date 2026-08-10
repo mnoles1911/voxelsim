@@ -1,0 +1,102 @@
+{
+  "spec": {
+    "name": "temperate-sapling",
+    "notes": "Small young broadleaf, for filling forest floor and clearings. Deliberately close to temperate-oak so the two can be compared as a size family rather than two unrelated species.",
+    "height_m": 4.5,
+    "resolution_cm": "10",
+    "trunk": {
+      "radius_base_m": 0.13,
+      "clear_frac": 0.22,
+      "lean_deg": 5.0,
+      "lean_dir_deg": 120.0,
+      "wander": 0.28,
+      "buttress": 0.0
+    },
+    "crown": {
+      "shape": "sphere",
+      "radius_m": 1.5,
+      "height_frac": 0.72,
+      "center_frac": 0.62,
+      "shell": 0.2,
+      "squash": 1.0,
+      "lean_deg": 0.0,
+      "lean_dir_deg": 0.0,
+      "points": 600
+    },
+    "growth": {
+      "step_m": 0.18,
+      "influence_m": 1.3,
+      "kill_m": 0.28,
+      "gravity": -0.08,
+      "phototropism": 0.18,
+      "inertia": 0.4,
+      "jitter": 0.07,
+      "max_iter": 240,
+      "tip_radius_m": 0.03,
+      "radius_exp": 2.2
+    },
+    "foliage": {
+      "enabled": true,
+      "min_order": 1,
+      "clump_radius_m": 0.25,
+      "density": 0.62,
+      "coverage": 0.85,
+      "clump_jitter": 0.35,
+      "droop_m": 0.08,
+      "squash": 0.9
+    },
+    "variation": {
+      "amount": 1.0,
+      "height": 0.18,
+      "crown_radius": 0.18,
+      "trunk_radius": 0.18,
+      "shape": 0.12,
+      "lean_deg": 7.0,
+      "droop": 0.25,
+      "density": 0.12,
+      "rotate": true
+    },
+    "materials": {
+      "bark": "bark",
+      "core": "heartwood",
+      "leaf": "leaf_broadleaf"
+    }
+  },
+  "stats": {
+    "seed": 4,
+    "spec_hash": "87da25134023785d",
+    "nodes": 395,
+    "segments": 394,
+    "max_order": 4,
+    "iterations": 23,
+    "targets_left": 1,
+    "clumps": 313,
+    "voxel_cm": 2.0,
+    "height_m": 3.94,
+    "footprint_m": [
+      3.62,
+      3.58
+    ],
+    "grid_mb": 7.7,
+    "extent_vox": [
+      181,
+      179,
+      197
+    ],
+    "voxels": 997414,
+    "by_material": {
+      "16": 19879,
+      "17": 2408,
+      "19": 975127
+    },
+    "ground_contact": 102,
+    "ms_grow": 15.5,
+    "ms_raster": 337.8,
+    "wood_connected": 1.0,
+    "wood_detached": 0,
+    "attached_frac": 1.0,
+    "detached": 5,
+    "ms_total": 678.4
+  },
+  "problems": []
+}

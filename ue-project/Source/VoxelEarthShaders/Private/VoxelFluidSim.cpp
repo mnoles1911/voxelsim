@@ -519,14 +519,6 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	FVoxelFluidSimTickArgs Args = InArgs;
 	Args.Iterations = FMath::Clamp(Args.Iterations, 1, 8);
 	Args.SimSlotBound = FMath::Min(Args.SimSlotBound, kMaxParticles);
-	if (Args.Dt <= 0.0f || Args.SimSlotBound == 0)
-	{
-		// Nothing can run (velocity derivation divides by Dt; zero slots means
-		// nothing was ever spawned). Still poll, so results already in flight
-		// keep landing.
-		PollCompletions(State);
-		return;
-	}
 
 	// COLLISION IS NOT OPTIONAL. The kernels are compiled with the occupancy
 	// read baked in (ModifyCompilationEnvironment above), so a tick without a
@@ -544,12 +536,6 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		return;
 	}
 
-	State.TickGeneration++;
-	// Publish the splat width for the screen-space renderer (see the member's
-	// comment in VoxelFluidSim.h). Set before the graph builds so the same
-	// frame's render pass sees this tick's bound.
-	State.RenderSlotBound = Args.SimSlotBound;
-
 	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelFluidSim, "VoxelFluidSim");
 
 	// ---- occupancy volume: clear + queued region fills, FIRST ---------------
@@ -558,6 +544,16 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	// read is not an error). Enforced, not trusted: the AddPassesCount guard
 	// below fails the build of any refactor that moves the fill into a
 	// different graph or after the solver passes.
+	//
+	// AND BEFORE THE NOTHING-TO-SIMULATE EARLY-OUT BELOW, which is the half
+	// that was missing (measured 2026-08-10, Saved/owner-playtest-round3.log --
+	// see ShouldTickSim in VoxelFluidSim.h for the full account). Building the
+	// volume is not part of simulating the water: it is the precondition for
+	// there being any. Faucets refuse to emit into unbuilt occupancy, so a
+	// solver that only maintains the volume once particles exist can never get
+	// its first particle -- 8.5 minutes of that run's log with zero AddPasses
+	// calls and every faucet deferring. An idle tick now costs one clear (once)
+	// plus up to MaxRegionsPerFlush fills and nothing else.
 	const uint64 OccupancySerialBefore = Args.Occupancy->GetStats().AddPassesCount;
 	FRDGBufferRef OccupancyBits = Args.Occupancy->AddPasses(GraphBuilder);
 	checkf(Args.Occupancy->GetStats().AddPassesCount == OccupancySerialBefore + 1,
@@ -574,6 +570,22 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		PollCompletions(State);
 		return;
 	}
+
+	if (Args.Dt <= 0.0f || Args.SimSlotBound == 0)
+	{
+		// No SOLVER work can run (velocity derivation divides by Dt; zero slots
+		// means nothing has ever spawned). The occupancy passes above stay in
+		// the caller's graph -- that is the point of this ordering. Still poll,
+		// so results already in flight keep landing.
+		PollCompletions(State);
+		return;
+	}
+
+	State.TickGeneration++;
+	// Publish the splat width for the screen-space renderer (see the member's
+	// comment in VoxelFluidSim.h). Set before the graph builds so the same
+	// frame's render pass sees this tick's bound.
+	State.RenderSlotBound = Args.SimSlotBound;
 
 	// ---- persistent buffers -----------------------------------------------
 	// Allocated once, cleared once, re-registered every frame. See the
@@ -1046,6 +1058,32 @@ bool FVoxelFluidCubeEdgeTest::RunTest(const FString& Parameters)
 		}
 	}
 	TestEqual(TEXT("zero count -> zero edge"), VoxelFluidSim::CubeEdgeForCount(0), 0u);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidTickGateTest,
+	"VoxelEarth.Fluid.TickGate", kFluidTestFlags)
+
+bool FVoxelFluidTickGateTest::RunTest(const FString& Parameters)
+{
+	using VoxelFluidSim::ShouldTickSim;
+	const float Dt = 1.0f / 60.0f;
+
+	// THE REGRESSION THIS PINS (Saved/owner-playtest-round3.log, 2026-08-10).
+	// The gate used to read `bOriginLatched && CumulativeSpawnRequested > 0`,
+	// and since the occupancy volume is only ever built inside a sim tick while
+	// every faucet refuses to emit into an unbuilt cell, nothing could ever
+	// start: 8.5 minutes, spawned=0, 174,840 deferred faucet-ticks, AddPasses
+	// never called once. An idle frame MUST still tick.
+	TestTrue(TEXT("latched with nothing ever spawned still ticks (builds occupancy)"),
+	         ShouldTickSim(/*bOriginLatched*/ true, Dt));
+	TestTrue(TEXT("latched with water alive ticks"), ShouldTickSim(true, Dt));
+
+	// The two things that genuinely cannot run.
+	TestFalse(TEXT("no origin, no tick"), ShouldTickSim(false, Dt));
+	TestFalse(TEXT("zero dt, no tick (velocity derivation divides by it)"),
+	          ShouldTickSim(true, 0.0f));
+	TestFalse(TEXT("negative dt, no tick"), ShouldTickSim(true, -0.001f));
 	return true;
 }
 

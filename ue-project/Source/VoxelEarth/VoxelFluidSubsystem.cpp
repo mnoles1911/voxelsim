@@ -291,6 +291,13 @@ struct FVoxelFluidLifecycle
 	// its exact carry the moment its cell lands. Printed as deferredNoOcc.
 	uint64 FaucetTicksDeferredNoOccupancy = 0;
 	int32 FaucetsDeferredNoOccupancyNow = 0; // faucets deferred on the last tick
+	// ...and how many of those were deferred because the emit point is not in
+	// the box AT ALL, which is a different bug report: an unbuilt cell clears
+	// in seconds, an emit point outside the window never does (the window is
+	// centred on the CAMERA, so flying puts the terrain below its floor).
+	// Split out because the merged number cost a playtest to interpret.
+	uint64 FaucetTicksDeferredOutsideVolume = 0;
+	int32 FaucetsDeferredOutsideVolumeNow = 0;
 	// Discharge the window could not afford as particles, routed through the
 	// scalar graph instead (backpressure). Units are ledger units (1/255 vox).
 	int64 FaucetVirtualUnitsRouted = 0;
@@ -472,12 +479,30 @@ void UVoxelFluidSubsystem::NotifyTerrainDirty(int64 MinVx, int64 MinVy, int64 Mi
 	L.RegionsQueuedTotal++;
 }
 
+int32 UVoxelFluidSubsystem::GroundVoxelZAtCamera() const
+{
+	// The analytic surface is fine for a WINDOW ANCHOR (metres of slack both
+	// ways); it is NOT fine for faucet Z, which is documented separately.
+	UWorld* W = GetWorld();
+	UVoxelWorldSubsystem* WS = W ? W->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	const FVector Cam = LastViewOriginUU;
+	const double GroundUU = WS ? WS->GetSurfaceHeightUU(Cam.X, Cam.Y) : Cam.Z;
+	return int32(FMath::FloorToDouble(GroundUU / 10.0));
+}
+
 void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
 {
+	LastViewOriginUU = ViewOriginUU;
 	const VoxelCoords::FVoxelCoord CamVoxel = VoxelCoords::WorldToVoxel(ViewOriginUU);
 	const int32 Half = vxc::kFluidVolumeDimVoxels / 2;
 	OriginVoxel = FIntVector(int32(CamVoxel.X) - Half, int32(CamVoxel.Y) - Half,
-	                         int32(CamVoxel.Z) - Half);
+	                         // Z ANCHORS TO THE GROUND, NOT THE CAMERA. The
+	                         // round-3 playtest flew at 80 m and every faucet
+	                         // landed 55 m BELOW the box floor -- water lives
+	                         // on terrain, so the window does too: floor sits
+	                         // ~13 m under the surface at the camera's column
+	                         // (caves/pools), leaving ~38 m of air above it.
+	                         GroundVoxelZAtCamera() - 128);
 	// THE one-origin rule (contract item 1): FluidOriginUU == volume min
 	// corner * 10, computed from the same voxel triple SetOriginVoxel gets.
 	FluidOriginWorld = FVector(double(OriginVoxel.X), double(OriginVoxel.Y), double(OriginVoxel.Z)) *
@@ -1262,6 +1287,20 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			const int64 DtMicros = int64(double(DeltaTime) * 1.0e6);
 			const int64 DefaultQ = int64(FMath::Max(0.0f, CVarVoxelFluidFaucetDefaultQ.GetValueOnGameThread()));
 			L.FaucetsDeferredNoOccupancyNow = 0;
+			L.FaucetsDeferredOutsideVolumeNow = 0;
+			// One helper for both faucet loops: defer, and record WHICH KIND of
+			// deferral it was (unbuilt yet vs never in the box). The volume is
+			// asked the containment question only on the deferral path.
+			const auto CountDeferral = [&L, this](const FIntVector& WorldVoxel)
+			{
+				L.FaucetTicksDeferredNoOccupancy++;
+				L.FaucetsDeferredNoOccupancyNow++;
+				if (!Occupancy.IsValid() || !Occupancy->ContainsWorldVoxel(WorldVoxel))
+				{
+					L.FaucetTicksDeferredOutsideVolume++;
+					L.FaucetsDeferredOutsideVolumeNow++;
+				}
+			};
 			for (FVoxelFluidLifecycle::FHeadFaucet& F : L.HeadFaucets)
 			{
 				// DEFER INTO UNBUILT OCCUPANCY (playtest fix 2026-08-09). The
@@ -1279,12 +1318,11 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				// seconds.) Emitting nowhere is the right answer -- a headwater
 				// with no terrain under it has nothing to run down.
 				const VoxelCoords::FVoxelCoord EmitVoxel = VoxelCoords::WorldToVoxel(F.WorldPos);
-				if (!Occupancy.IsValid() ||
-				    !Occupancy->IsRegionBuilt(FIntVector(int32(EmitVoxel.X), int32(EmitVoxel.Y),
-				                                         int32(EmitVoxel.Z))))
+				const FIntVector EmitWorldVoxel(int32(EmitVoxel.X), int32(EmitVoxel.Y),
+				                                int32(EmitVoxel.Z));
+				if (!Occupancy.IsValid() || !Occupancy->IsRegionBuilt(EmitWorldVoxel))
 				{
-					L.FaucetTicksDeferredNoOccupancy++;
-					L.FaucetsDeferredNoOccupancyNow++;
+					CountDeferral(EmitWorldVoxel);
 					continue;
 				}
 				const int64 Q = F.QM3PerYear > 0.0 ? int64(F.QM3PerYear) : DefaultQ;
@@ -1336,12 +1374,11 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				// the existing path), so a sill over an unfilled corner of the
 				// volume waits instead of spraying into rock.
 				const VoxelCoords::FVoxelCoord SillVoxel = VoxelCoords::WorldToVoxel(S.WorldPos);
-				if (!Occupancy.IsValid() ||
-				    !Occupancy->IsRegionBuilt(FIntVector(int32(SillVoxel.X), int32(SillVoxel.Y),
-				                                         int32(SillVoxel.Z))))
+				const FIntVector SillWorldVoxel(int32(SillVoxel.X), int32(SillVoxel.Y),
+				                                int32(SillVoxel.Z));
+				if (!Occupancy.IsValid() || !Occupancy->IsRegionBuilt(SillWorldVoxel))
 				{
-					L.FaucetTicksDeferredNoOccupancy++;
-					L.FaucetsDeferredNoOccupancyNow++;
+					CountDeferral(SillWorldVoxel);
 					continue;
 				}
 				const int64 MaxParticles = vxc::fluidWholeParticlesFromUnits(S.UnitsRemaining);
@@ -1440,10 +1477,17 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 
 	const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
 
-	// ---- drive the GPU (only once something has ever spawned) --------------
+	// ---- drive the GPU (every frame the origin is latched) -----------------
+	//
+	// NOT "once something has ever spawned", which is what stood here and which
+	// deadlocked the whole feature: the occupancy volume is only ever built
+	// inside the sim tick, and faucets refuse to emit into occupancy that is
+	// not built. See VoxelFluidSim::ShouldTickSim for the measured account. A
+	// tick with SimSlotBound == 0 runs the volume's clear/fills and returns
+	// before any solver pass.
 	const float SimDt = FMath::Min(DeltaTime, kMaxSimDtSeconds);
 	const bool bVerify = CVarVoxelFluidOccVerify.GetValueOnGameThread() != 0;
-	if (bOriginLatched && CumulativeSpawnRequested > 0 && SimDt > 0.0f)
+	if (VoxelFluidSim::ShouldTickSim(bOriginLatched, SimDt))
 	{
 		const bool bDebugDraw = CVarVoxelFluidDebugDraw.GetValueOnGameThread() != 0;
 
@@ -1627,15 +1671,24 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		}
 
 		// deferredNoOccupancy: emitters that skipped this tick because their
-		// point sits in occupancy the initial fill has not reached (or outside
-		// the volume). "off" when the lifecycle is not armed, "<now>/<total>"
-		// otherwise -- a live count beside a cumulative one, so a steady
-		// non-zero left number means a faucet is permanently out of the box
-		// rather than merely waiting for the fill.
+		// point sits in occupancy the initial fill has not reached, or outside
+		// the volume entirely. "off" when the lifecycle is not armed,
+		// "<now>(outside=<now>)/<total>(outside=<total>)" otherwise.
+		//
+		// THE (outside=) SPLIT IS THE WHOLE VALUE OF THIS FIELD, and it is here
+		// because the merged form could not tell the two apart in
+		// Saved/owner-playtest-round3.log: unbuilt clears in seconds, outside
+		// never clears. outside == 0 with a steady non-zero left number means
+		// the fill is not landing; outside == the left number means the
+		// emitters are not in the box (the window follows the CAMERA, so flying
+		// well above the ground leaves the terrain below its floor).
 		const FString DeferredField =
 			!bFaucets ? FString(TEXT("off"))
-			          : FString::Printf(TEXT("%d/%llu"), L.FaucetsDeferredNoOccupancyNow,
-			                            L.FaucetTicksDeferredNoOccupancy);
+			          : FString::Printf(TEXT("%d(outside=%d)/%llu(outside=%llu)"),
+			                            L.FaucetsDeferredNoOccupancyNow,
+			                            L.FaucetsDeferredOutsideVolumeNow,
+			                            L.FaucetTicksDeferredNoOccupancy,
+			                            L.FaucetTicksDeferredOutsideVolume);
 		const uint64 BasinRate = uint64(Snapshot.DespawnedBasin) - L.LastPerfBasinDespawns;
 		const uint64 BoundaryRate = uint64(Snapshot.DespawnedBoundary) - L.LastPerfBoundaryDespawns;
 		L.LastPerfBasinDespawns = uint64(Snapshot.DespawnedBasin);

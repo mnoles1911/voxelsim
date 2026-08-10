@@ -89,7 +89,7 @@ def _occlusion(data: np.ndarray, coords: tuple[np.ndarray, ...]) -> np.ndarray:
     return dens[coords].astype(np.float32)
 
 
-def predicted_extent(spec: dict) -> tuple[int, int, int]:
+def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
     """Roughly how many voxels a tree from this spec will occupy.
 
     Used to choose one rendering scale for a whole batch without having to
@@ -105,7 +105,7 @@ def predicted_extent(spec: dict) -> tuple[int, int, int]:
     crown_h = float(get(spec, "height_m")) * float(get(spec, "crown.height_frac"))
     shear = math.tan(math.radians(float(get(spec, "crown.lean_deg")))) * crown_h
     span = 2.0 * (crown + clump) + shear + 1.0
-    return (int(span / 0.10), int(span / 0.10), int(height / 0.10))
+    return (int(span / voxel_m), int(span / voxel_m), int(height / voxel_m))
 
 
 def grid_extent(grid: VoxelGrid) -> tuple[int, int, int]:

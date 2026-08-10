@@ -371,6 +371,31 @@ namespace VoxelFluidSim
 	                                        FVoxelFluidSimState& State,
 	                                        const FVoxelFluidSimTickArgs& Args);
 
+	// Whether the caller must post a sim tick this frame. THE GATE IS THE
+	// ORIGIN, NEVER THE PARTICLE COUNT, and it is a named function precisely so
+	// that the second cannot creep back into it.
+	//
+	// THE DEADLOCK THIS EXISTS TO PREVENT, measured 2026-08-10
+	// (Saved/owner-playtest-round3.log). The occupancy volume's clear and its
+	// queued region fills ride the SOLVER's graph -- AddSimPasses is the only
+	// caller of FVoxelFluidOccupancyVolume::AddPasses -- while every faucet
+	// refuses to emit into occupancy that is not built yet
+	// (FVoxelFluidOccupancyVolume::IsRegionBuilt). Gate the tick on "has
+	// anything ever spawned" and the two rules close a loop with no way in:
+	// nothing spawns because no cell is built, and no cell is built because
+	// nothing spawned. The log ran 8.5 minutes with occupancy=512/0 (all 512
+	// cells packed and handed to the volume), spawned=0, deferredNoOccupancy=6
+	// for 174,840 faucet-ticks, and NOT ONE LogVoxelFluidOccupancy line --
+	// AddPasses never ran at all, so the built-cell mask never had a bit set.
+	//
+	// An idle tick is cheap and it is not a no-op: it is the tick that builds
+	// the volume the first faucet needs (see AddSimPasses, which runs the
+	// occupancy passes BEFORE its own nothing-to-simulate early-out).
+	inline bool ShouldTickSim(bool bOriginLatched, float Dt)
+	{
+		return bOriginLatched && Dt > 0.0f;
+	}
+
 	// Drops every RHI resource the state holds. Must be the last render-thread
 	// touch; the subsystem enqueues this and then releases its reference.
 	VOXELEARTHSHADERS_API void ReleaseRenderThread(FVoxelFluidSimState& State);

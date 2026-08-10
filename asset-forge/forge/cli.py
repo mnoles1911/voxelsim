@@ -45,7 +45,7 @@ def _label(tree: pipeline.Tree) -> str:
 
 def cmd_gen(args) -> int:
     s, path = _load(args.spec)
-    tree = pipeline.build(s, args.seed)
+    tree = pipeline.build(s, args.seed, resolution_cm=getattr(args, "res", None))
     problems = pipeline.health(tree)
 
     out = Path(args.out) if args.out else OUT / specmod.get(s, "name")
@@ -64,7 +64,8 @@ def cmd_gen(args) -> int:
     st = tree.stats
     print(f"{stem}")
     print(f"  {st['height_m']:.1f} m tall, footprint {st['footprint_m'][0]:.1f} x "
-          f"{st['footprint_m'][1]:.1f} m, {st['extent_vox']} voxels")
+          f"{st['footprint_m'][1]:.1f} m, {st['extent_vox']} voxels "
+          f"at {st['voxel_cm']:g} cm ({st['grid_mb']:,.0f} MB grid)")
     print(f"  {st['voxels']:,} solid voxels, {st['nodes']:,} skeleton nodes, "
           f"max branch order {st['max_order']}")
     print(f"  materials: " + ", ".join(
@@ -271,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--seed", type=int, default=1)
     g.add_argument("--out")
     g.add_argument("--px", type=int, default=640)
+    g.add_argument("--res", help="voxel size in cm; overrides the spec (e.g. --res 2)")
     g.set_defaults(fn=cmd_gen)
 
     b = sub.add_parser("batch", help="generate many seeds and a contact sheet")

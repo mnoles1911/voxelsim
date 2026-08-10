@@ -53,6 +53,18 @@ async function boot() {
     .map((s) => `<option value="${s.name}">${s.name}</option>`)
     .join("");
 
+  fetch("/api/nl-status")
+    .then((r) => r.json())
+    .then((s) => {
+      if (!s.available) {
+        $("ask").disabled = true;
+        $("askGo").disabled = true;
+        $("ask").placeholder = `Plain-language edits unavailable — ${s.reason}`;
+      } else {
+        $("askMsg").textContent = s.model;
+      }
+    });
+
   await refreshLibrary();
   // Open on a representative species rather than whatever sorts first.
   const first = specs.find((s) => s.name === "temperate-oak") ?? specs[0];
@@ -271,6 +283,7 @@ function openDetail(seed, t) {
     .join("");
 
   const rows = [
+    ["voxel size", `${s.voxel_cm ?? 10} cm (preview)`],
     ["height", `${(s.height_m ?? 0).toFixed(1)} m`],
     ["footprint", `${(s.footprint_m || [0, 0]).map((v) => v.toFixed(1)).join(" × ")} m`],
     ["extent", `${(s.extent_vox || []).join(" × ")} voxels`],
@@ -294,6 +307,51 @@ function openDetail(seed, t) {
   $("overlay").classList.remove("hidden");
 }
 
+/* --- plain-language edits ---------------------------------------------- */
+
+async function askEdit() {
+  const request = $("ask").value.trim();
+  if (!request) return;
+  $("askGo").disabled = true;
+  $("askMsg").textContent = "thinking…";
+  $("askEdits").innerHTML = "";
+
+  try {
+    const r = await fetch("/api/nl-edit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec: state.spec, request }),
+    }).then((x) => x.json());
+
+    if (r.error) {
+      $("askMsg").textContent = r.error;
+      return;
+    }
+    if (!r.edits.length) {
+      $("askMsg").textContent = "no parameters changed";
+      $("askEdits").innerHTML = `<div class="askedit">${escape(r.explanation || "")}</div>`;
+      return;
+    }
+
+    // The model edits the same spec the sliders do, so the panel just rebuilds
+    // and the moved sliders show exactly what changed.
+    state.spec = r.spec;
+    buildParams();
+    $("askMsg").textContent = `${r.edits.length} parameter${r.edits.length === 1 ? "" : "s"} changed`;
+    $("askEdits").innerHTML =
+      `<div class="askedit">${escape(r.explanation)}</div>` +
+      r.edits
+        .map((e) => `<div class="askedit">· <b>${escape(e.label)}</b> → <code>${escape(String(e.value))}</code>${e.why ? ` — ${escape(e.why)}` : ""}</div>`)
+        .join("");
+    for (const w of r.warnings || []) toast(w);
+    generate();
+  } catch {
+    $("askMsg").textContent = "request failed";
+  } finally {
+    $("askGo").disabled = false;
+  }
+}
+
 /* --- 3D --------------------------------------------------------------- */
 
 async function loadVoxels(url) {
@@ -301,12 +359,23 @@ async function loadVoxels(url) {
   const token = ++state.viewToken;
   $("viewHint").textContent = "loading…";
   try {
-    const buf = await fetch(url).then((r) => r.arrayBuffer());
+    const res = await fetch(url);
+    const shown = res.headers.get("X-Voxel-Cm");
+    const authored = res.headers.get("X-Authored-Cm");
+    const buf = await res.arrayBuffer();
     if (token !== state.viewToken) return; // a newer tree was opened meanwhile
     const { offsets, colors, dims, count } = Viewer.decode(buf, state.palette);
     state.viewer.setInstances(offsets, colors, dims);
+    // Say plainly when the viewer had to step coarser than the asset is
+    // authored at, so nobody mistakes the preview lattice for the export.
+    const note =
+      shown && authored && shown !== authored
+        ? ` · shown at ${shown} cm (exports at ${authored} cm)`
+        : shown
+        ? ` · ${shown} cm voxels`
+        : "";
     $("viewHint").textContent =
-      `${count.toLocaleString()} surface voxels · drag to spin · scroll to zoom`;
+      `${count.toLocaleString()} surface voxels${note} · drag to spin · scroll to zoom`;
   } catch {
     if (token === state.viewToken) $("viewHint").textContent = "3D load failed";
   }
@@ -472,6 +541,14 @@ function wire() {
     $("species").innerHTML = specs.map((s) => `<option value="${s.name}">${s.name}</option>`).join("");
     $("species").value = cur;
   };
+  $("askGo").onclick = askEdit;
+  $("ask").addEventListener("keydown", (e) => {
+    // Enter applies; Shift+Enter is a newline.
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      askEdit();
+    }
+  });
   $("view3d").onclick = () => setView("3d");
   $("view2d").onclick = () => setView("2d");
   $("viewReset").onclick = () => state.viewer?.reset();

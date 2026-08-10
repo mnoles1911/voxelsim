@@ -107,6 +107,8 @@ private:
 	// Latches the fluid origin (== occupancy volume min corner) centred on
 	// the camera, queues the initial fill, and arms the spill intercept.
 	void LatchOrigin(const FVector& ViewOriginUU);
+	int32 GroundVoxelZAtCamera() const;
+	FVector LastViewOriginUU = FVector::ZeroVector;
 
 	// Drains the occupancy region queue under the pack budget.
 	void ProcessOccupancyQueue();

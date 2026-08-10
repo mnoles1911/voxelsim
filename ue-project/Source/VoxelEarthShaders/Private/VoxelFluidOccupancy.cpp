@@ -8,6 +8,7 @@
 #include "DataDrivenShaderPlatformInfo.h"
 #include "PixelFormat.h"
 #include "RenderingThread.h"
+#include "Misc/AutomationTest.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelFluidOccupancy, Log, All);
 
@@ -203,6 +204,13 @@ void FVoxelFluidOccupancyVolume::MarkCellsBuilt_Locked(const FIntVector& MinVoxe
 bool FVoxelFluidOccupancyVolume::IsRegionBuilt(const FIntVector& WorldVoxel) const
 {
 	FScopeLock Lock(&QueueLock);
+	// THE ONE CONVERSION. The built-cell grid is VOLUME-LOCAL (the header's
+	// LOCAL space) and so is every write to it: MarkCellsBuilt_Locked takes a
+	// region's local MinVoxel, and RecentreTo renames the cells rather than
+	// moving them. So the query is one subtraction and one divide, with NO WRAP
+	// -- the wrap offset belongs to STORAGE addressing on the GPU and applying
+	// it here would ask about a different cell.
+	//
 	// int64 through the subtraction: world voxel coordinates span the planet.
 	const int64 Local[3] = {int64(WorldVoxel.X) - OriginVoxel.X,
 	                        int64(WorldVoxel.Y) - OriginVoxel.Y,
@@ -218,6 +226,22 @@ bool FVoxelFluidOccupancyVolume::IsRegionBuilt(const FIntVector& WorldVoxel) con
 	}
 	const int32 Bit = (Cell[2] * BuiltCellsPerAxis + Cell[1]) * BuiltCellsPerAxis + Cell[0];
 	return (BuiltCellBits[Bit >> 6] & (uint64(1) << (Bit & 63))) != 0;
+}
+
+bool FVoxelFluidOccupancyVolume::ContainsWorldVoxel(const FIntVector& WorldVoxel) const
+{
+	FScopeLock Lock(&QueueLock);
+	const int64 Local[3] = {int64(WorldVoxel.X) - OriginVoxel.X,
+	                        int64(WorldVoxel.Y) - OriginVoxel.Y,
+	                        int64(WorldVoxel.Z) - OriginVoxel.Z};
+	for (int32 A = 0; A < 3; ++A)
+	{
+		if (Local[A] < 0 || Local[A] >= DimVoxels)
+		{
+			return false;
+		}
+	}
+	return true;
 }
 
 FVector FVoxelFluidOccupancyVolume::GetOriginUU() const
@@ -956,3 +980,145 @@ static_assert(vxc::kFluidRecentreStepVoxels % kVoxelsPerWord == 0,
 static_assert(vxc::kFluidRecentreStepVoxels % kFluidOccBrickEdge == 0,
               "a recentre step must keep entering slabs brick-aligned for the packer");
 static_assert(kRebaseGroupX == 64, "FluidRebaseParticlesMain declares [numthreads(64,1,1)]");
+
+// ---- automation tests -------------------------------------------------------
+// No GPU and no render graph: the built-cell grid is plain state, and the
+// coordinate convention it lives in is exactly what a faucet's emit gate
+// depends on. Run headlessly:
+//   UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 \
+//     -ExecCmds="Automation RunTests VoxelEarth.Fluid; Quit"
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidOccupancyBuiltCellsTest,
+	"VoxelEarth.Fluid.OccupancyBuiltCells",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext
+		| EAutomationTestFlags::EngineFilter)
+
+bool FVoxelFluidOccupancyBuiltCellsTest::RunTest(const FString& Parameters)
+{
+	using FVolume = FVoxelFluidOccupancyVolume;
+	constexpr int32 E = FVolume::BuiltCellVoxels;   // 64
+	constexpr int32 Dim = FVolume::DimVoxels;       // 512
+
+	// A planet-scale origin, because the world->local subtraction is the step
+	// the query gets wrong if anybody "simplifies" it: these are the real
+	// numbers from Saved/owner-playtest-round3.log's origin latch line.
+	const FIntVector Origin(-612406, -507706, 19209);
+
+	FVolume Volume;
+	Volume.SetOriginVoxel(Origin);
+	{
+		// AddPasses is what normally consumes the clear, and it needs a graph.
+		// Clearing the flag by hand is the whole reason this test is a friend:
+		// everything below is about the grid, not about the dispatch.
+		FScopeLock Lock(&Volume.QueueLock);
+		Volume.bClearPending = false;
+	}
+
+	TestFalse(TEXT("nothing is built before any region lands"),
+	          Volume.IsRegionBuilt(Origin + FIntVector(10, 10, 10)));
+
+	// --- mark whole cells, ask in WORLD coordinates -------------------------
+	// Centre, an edge cell, and the far corner cell: the three places an
+	// off-by-a-cell or a missing origin subtraction shows up differently.
+	const FIntVector Cells[] = {FIntVector(4, 4, 4), FIntVector(0, 3, 7), FIntVector(7, 7, 7),
+	                            FIntVector(0, 0, 0)};
+	for (const FIntVector& Cell : Cells)
+	{
+		{
+			FScopeLock Lock(&Volume.QueueLock);
+			Volume.MarkCellsBuilt_Locked(Cell * E, FIntVector(E, E, E));
+		}
+		// Every corner and the middle of the cell, in world voxels.
+		const int32 Offsets[] = {0, 1, E / 2, E - 1};
+		for (int32 Ox : Offsets)
+		{
+			for (int32 Oy : Offsets)
+			{
+				for (int32 Oz : Offsets)
+				{
+					const FIntVector World = Origin + Cell * E + FIntVector(Ox, Oy, Oz);
+					TestTrue(FString::Printf(TEXT("cell (%d,%d,%d)+(%d,%d,%d) reads built"),
+					                         Cell.X, Cell.Y, Cell.Z, Ox, Oy, Oz),
+					         Volume.IsRegionBuilt(World));
+					TestTrue(TEXT("...and is inside the volume"), Volume.ContainsWorldVoxel(World));
+				}
+			}
+		}
+		// The cell one over on each axis must NOT have been promoted (that is
+		// the failure a >= vs > in the mark's floor would produce).
+		for (int32 A = 0; A < 3; ++A)
+		{
+			FIntVector Neighbour = Cell;
+			Neighbour[A] += 1;
+			if (Neighbour[A] >= FVolume::BuiltCellsPerAxis)
+			{
+				continue;
+			}
+			bool bIsAlreadyMarked = false;
+			for (const FIntVector& Other : Cells)
+			{
+				bIsAlreadyMarked |= (Other == Neighbour);
+			}
+			if (bIsAlreadyMarked)
+			{
+				continue; // marked by another case in this list
+			}
+			TestFalse(TEXT("the next cell over is not promoted"),
+			          Volume.IsRegionBuilt(Origin + Neighbour * E));
+		}
+	}
+
+	// --- outside the window is never built, and says so separately ----------
+	const FIntVector Outside[] = {Origin - FIntVector(1, 0, 0), Origin - FIntVector(0, 0, 1),
+	                              Origin + FIntVector(Dim, 0, 0),
+	                              Origin + FIntVector(0, 0, Dim),
+	                              // The playtest's own case: the faucets sat
+	                              // ~55 m under the window's floor.
+	                              Origin - FIntVector(0, 0, 551)};
+	for (const FIntVector& World : Outside)
+	{
+		TestFalse(TEXT("outside the window is not built"), Volume.IsRegionBuilt(World));
+		TestFalse(TEXT("outside the window is not contained"), Volume.ContainsWorldVoxel(World));
+	}
+
+	// --- a partial region does NOT promote its cell -------------------------
+	{
+		FScopeLock Lock(&Volume.QueueLock);
+		Volume.MarkCellsBuilt_Locked(FIntVector(2, 2, 2) * E, FIntVector(32, 8, 8));
+	}
+	TestFalse(TEXT("a sub-cell edit region leaves its cell unbuilt"),
+	          Volume.IsRegionBuilt(Origin + FIntVector(2, 2, 2) * E));
+
+	// --- the toroidal recentre RENAMES cells; a world voxel keeps its answer -
+	{
+		// One step on x, two on y: the built cell (4,4,4) becomes (3,2,4) and
+		// the same WORLD voxel must still read built.
+		const FIntVector Step(E, 2 * E, 0);
+		TArray<FVoxelFluidOccupancyRefillCell> Refill;
+		FIntVector Delta = FIntVector::ZeroValue;
+		FString Error;
+		const FIntVector WorldInCentreCell = Origin + FIntVector(4, 4, 4) * E + FIntVector(3, 5, 7);
+		TestTrue(TEXT("recentre by whole steps is accepted"),
+		         Volume.RecentreTo(Origin + Step, Refill, Delta, Error));
+		TestTrue(TEXT("the reported delta is the step"), Delta == Step);
+		TestTrue(TEXT("a built world voxel survives the slide"),
+		         Volume.IsRegionBuilt(WorldInCentreCell));
+		// The slab that entered on +x is unbuilt: its far-x column of cells.
+		TestFalse(TEXT("the entering slab is unbuilt"),
+		          Volume.IsRegionBuilt(Origin + Step + FIntVector(7, 4, 4) * E));
+		TestTrue(TEXT("the entering cells were handed back"), Refill.Num() > 0);
+		// And a world voxel that left the window is outside, not built.
+		TestFalse(TEXT("what slid out is no longer contained"),
+		          Volume.ContainsWorldVoxel(Origin + FIntVector(0, 0, 0)));
+	}
+
+	// --- a hard reset throws the grid away ----------------------------------
+	Volume.SetOriginVoxel(Origin + FIntVector(0, 0, 4096));
+	TestFalse(TEXT("SetOriginVoxel clears every built bit"),
+	          Volume.IsRegionBuilt(Origin + FIntVector(0, 0, 4096) + FIntVector(4, 4, 4) * E));
+	return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS

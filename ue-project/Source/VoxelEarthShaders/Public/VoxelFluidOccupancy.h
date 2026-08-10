@@ -340,6 +340,19 @@ public:
 	// Any thread. Written under the same lock as the queue, once per flush.
 	bool IsRegionBuilt(const FIntVector& WorldVoxel) const;
 
+	// Is this WORLD voxel inside the window at all? The containment half of
+	// IsRegionBuilt, which is defined in terms of this so the two can never
+	// drift apart.
+	//
+	// IT EXISTS SO A DEFERRAL CAN SAY WHICH KIND IT IS. "Deferred" covers two
+	// states that look identical to a caller and are nothing alike: a cell the
+	// initial fill has not reached (clears in seconds, wait) and an emit point
+	// that is not in the box at all (never clears -- the camera is 55 m above
+	// the terrain the faucets sit on, say). One is patience, the other is a
+	// placement bug, and a counter that merges them costs a playtest to
+	// separate.
+	bool ContainsWorldVoxel(const FIntVector& WorldVoxel) const;
+
 	// Edge of the built-tracking cell, in voxels. Matches the host's
 	// initial-fill granularity by construction (static_assert in the .cpp).
 	static constexpr int32 BuiltCellVoxels = 64;
@@ -569,6 +582,15 @@ private:
 	              "grid, or a recentre shifts the built bits by a fractional cell");
 
 	int32 MaxRegionsPerFlush = 32;
+
+#if WITH_DEV_AUTOMATION_TESTS
+	// The mark -> IsRegionBuilt round trip is the invariant the faucet gate
+	// rests on, and the mark side is only reachable through AddPasses, i.e.
+	// through a render graph. Rather than make the mark public (it must stay a
+	// consequence of a region actually reaching the GPU), the one test that
+	// pins the coordinate convention gets in here.
+	friend class FVoxelFluidOccupancyBuiltCellsTest;
+#endif
 
 	mutable FCriticalSection QueueLock;
 	TArray<FVoxelFluidOccupancyRegion> PendingRegions;
