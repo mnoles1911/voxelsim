@@ -42,6 +42,15 @@ _PROFILES = {
 SHAPES = tuple(_PROFILES)
 
 
+def profile_for(shape: str):
+    """Radius-vs-height profile for a crown shape.
+
+    Shared with the whorl growth model so `crown.shape` governs the silhouette
+    under either growth model rather than only under space colonization.
+    """
+    return _PROFILES.get(shape, _PROFILES["sphere"])
+
+
 def crown_bounds(spec: dict) -> tuple[float, float]:
     """(bottom, top) of the crown in metres above ground."""
     height = get(spec, "height_m")

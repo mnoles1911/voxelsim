@@ -111,6 +111,46 @@ def foliage(
     return placed
 
 
+def frond_blades(
+    grid: VoxelGrid,
+    skel: Skeleton,
+    spec: dict,
+    origin: np.ndarray,
+    rng: np.random.Generator,
+) -> int:
+    """Leaf blades along each frond's midrib.
+
+    Not clumps on twigs: the blade is widest about a third of the way out and
+    tapers to a point at both ends, and it is flattened vertically because a
+    palm leaf is a plane of leaflets, not a sausage. Stamping a squashed
+    ellipsoid at every midrib node draws exactly that, and at voxel resolution
+    a dense row of overlapping ellipsoids *is* a blade.
+    """
+    if not get(spec, "foliage.enabled") or skel.along is None:
+        return 0
+
+    leaf = materials.resolve(get(spec, "materials.leaf"))
+    width = float(get(spec, "frond.width_m"))
+    squash = float(get(spec, "foliage.squash"))
+    density = float(get(spec, "foliage.density"))
+    jitter = float(get(spec, "foliage.clump_jitter"))
+
+    cand = np.flatnonzero((skel.order >= 1) & (skel.along > 0.0))
+    placed = 0
+    for i in cand:
+        s = float(skel.along[i])
+        # Peak just inboard of centre, zero at both ends.
+        profile = (4.0 * s * (1.0 - s)) ** 0.55 if 0.0 < s < 1.0 else 0.0
+        w = width * profile * (1.0 + jitter * (rng.random() - 0.5) * 0.5)
+        r_vox = m_to_vox(w, grid.voxel_m)
+        if r_vox < 0.6:
+            continue
+        c = m_to_vox(skel.pos[i], grid.voxel_m) - origin
+        grid.blob(c, r_vox, leaf, rng, density=density, squash=squash, only_air=True)
+        placed += 1
+    return placed
+
+
 def ground_contact(grid: VoxelGrid) -> int:
     """How many solid voxels sit on the bottom slab.
 

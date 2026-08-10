@@ -110,6 +110,17 @@ struct FluidFaucetAccumulator {
         return particles;
     }
 
+    // Returns particles addMicros paid out but the host could not emit this
+    // tick (per-tick anti-burst cap, emission budget) back to the schedule:
+    // the exact inverse of the payout, so a clamped faucet streams its
+    // backlog out over later ticks instead of dumping it -- and instead of
+    // dropping it. The HOST bounds what it carries back (an unbounded
+    // carry-back against a rate cap is unpayable debt; the subsystem routes
+    // anything beyond ~1 s of rate through the scalar graph instead).
+    void carryBackParticles(int64_t particles) {
+        if (particles > 0) carry += particles * kFluidFaucetCarryPerParticle;
+    }
+
     void reset() { carry = 0; }
 };
 

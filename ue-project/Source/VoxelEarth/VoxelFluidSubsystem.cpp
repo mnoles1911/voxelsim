@@ -71,6 +71,33 @@ namespace
 	// there. 150 UU/s = 1.5 m/s, a brisk river.
 	constexpr float kEdgeInflowSpeedUU = 150.0f;
 
+	// Spring/sill emission velocity (owner playtest fix: faucets "blast water
+	// orbs up and out"). A spring used to seep with ZERO velocity straight
+	// onto the pool already standing at its own emit point; every new particle
+	// landed inside the previous ones' kernel radius and the density
+	// constraint ejected the clump. Now a spring emits already MOVING the way
+	// the terrain falls (finite-differenced at refresh, below), so each tick's
+	// particles vacate the emit point before the next tick's arrive.
+	// 150 UU/s = 1.5 m/s along the downhill tangent (task band 100-200), with
+	// a slight downward bias so the stream hugs the slope instead of arcing.
+	constexpr float kSpringSeepSpeedUU = 150.0f;
+	constexpr float kSpringSeepDownSpeedUU = 50.0f;
+	// Finite-difference half-step for the downhill probe, UU. 100 UU = 1 m:
+	// wide enough to read the channel's fall rather than one voxel's stair
+	// edge, narrow enough to stay inside the gully the head sits in.
+	constexpr float kDownhillProbeHalfStepUU = 100.0f;
+	// Slope below which the probe reports "flat" and the faucet seeps in
+	// place with no velocity (a plateau spring pools, correctly). 0.005 =
+	// 0.5 % -- comfortably under the p50 river gradient (0.94 %).
+	constexpr float kDownhillMinSlope = 0.005f;
+
+	// Sill faucets drain their owed units at a stream's pace, not as one
+	// dump: before this cap a spill event's whole backlog went out in a
+	// single tick bounded only by the shared budget (4096 particles AT ONE
+	// POINT -- the other faucet blast). 253/s matches the DefaultQ worked
+	// example, so a sill reads like one more river mouth.
+	constexpr double kSillDrainPerSecond = 253.0;
+
 	// How far from the volume centre the boundary sink searches for a river
 	// segment to inject into (world mm). The region's own half-diagonal is
 	// ~36 m; 64 m adds margin for a channel just outside the cube. Beyond it,
@@ -123,6 +150,14 @@ namespace
 		TEXT("Draw alive fluid particles as debug points (game-thread readback; ")
 		TEXT("capped at 5000 alive -- above that it draws nothing and says so in ")
 		TEXT("the perf line)."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarVoxelFluidDebugFaucets(
+		TEXT("voxel.Fluid.DebugFaucets"), 1,
+		TEXT("Draw a beacon (sphere + vertical line) at every active faucet each tick: ")
+		TEXT("MAGENTA = springs, sill outlets and the camera faucet; ORANGE = edge ")
+		TEXT("inflows (the river crossing the region boundary). Default 1 so a playtest ")
+		TEXT("always knows where the water is supposed to be coming from; 0 hides them."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarVoxelFluidFaucets(
@@ -212,6 +247,34 @@ namespace
 		return World ? World->GetSubsystem<UVoxelFluidSubsystem>() : nullptr;
 	}
 
+	// Downhill emission velocity at a faucet: central finite difference of the
+	// amplifier surface (GetSurfaceHeightUU -- the same authority the faucet's
+	// own Z comes from; NEVER rebuilt in Python or re-derived elsewhere), game
+	// thread, called once per faucet at refresh and cached on the faucet.
+	// Returns zero on flat ground: a plateau spring seeps in place and pools,
+	// which is correct -- the blast fix is the moving stream on SLOPES, where
+	// the owner saw the orbs.
+	FVector3f ComputeDownhillVelocityUU(UVoxelWorldSubsystem& WorldSub, double XUU, double YUU,
+	                                    float SpeedUU)
+	{
+		const double D = double(kDownhillProbeHalfStepUU);
+		const double GradX =
+			(WorldSub.GetSurfaceHeightUU(XUU + D, YUU) - WorldSub.GetSurfaceHeightUU(XUU - D, YUU)) /
+			(2.0 * D);
+		const double GradY =
+			(WorldSub.GetSurfaceHeightUU(XUU, YUU + D) - WorldSub.GetSurfaceHeightUU(XUU, YUU - D)) /
+			(2.0 * D);
+		const double SlopeMag = FMath::Sqrt(GradX * GradX + GradY * GradY);
+		if (SlopeMag < double(kDownhillMinSlope))
+		{
+			return FVector3f::ZeroVector;
+		}
+		// Downhill = -gradient, normalised in XY; slight downward bias so the
+		// stream follows the slope instead of arcing off it.
+		return FVector3f(float(-GradX / SlopeMag) * SpeedUU, float(-GradY / SlopeMag) * SpeedUU,
+		                 -kSpringSeepDownSpeedUU);
+	}
+
 	FAutoConsoleCommandWithWorldAndArgs GVoxelFluidSpawnCmd(
 		TEXT("voxel.Fluid.Spawn"),
 		TEXT("voxel.Fluid.Spawn [count] -- seed a dam-break block of fluid particles ")
@@ -268,9 +331,18 @@ struct FVoxelFluidLifecycle
 	{
 		FVector WorldPos = FVector::ZeroVector; // z resolved at refresh (surface + offset)
 		double QM3PerYear = 0.0;                // 0 == source had no rate; DefaultQ applies
-		FVector3f Velocity = FVector3f::ZeroVector; // edge inflow only; a spring seeps
+		// Edge inflow: along the channel. Spring: down the terrain gradient
+		// (ComputeDownhillVelocityUU, cached at refresh) -- a spring that
+		// seeped at zero velocity stacked particles onto its own pool and the
+		// constraint blasted them (owner playtest fix).
+		FVector3f Velocity = FVector3f::ZeroVector;
 		bool bEdgeInflow = false;
 		vxc::FluidFaucetAccumulator Acc;
+		// Source backpressure (owner ask #3: continuous streaming, no bursts):
+		// rolling 1 s window of what this faucet actually emitted, clamped to
+		// its own rate. Preserved across refresh with Acc.
+		double WindowStartSeconds = 0.0;
+		int64 EmittedThisWindow = 0;
 	};
 	TArray<FHeadFaucet> HeadFaucets;
 	bool bHeadsFromBakedTable = false;
@@ -309,6 +381,9 @@ struct FVoxelFluidLifecycle
 		uint64 BasinKey = 0;
 		int64 UnitsRemaining = 0;
 		FVector WorldPos = FVector::ZeroVector;
+		// Downhill at the outlet (cached when the event arrives): spill water
+		// leaves the saddle moving the way the far slope falls.
+		FVector3f Velocity = FVector3f::ZeroVector;
 	};
 	TArray<FSillFaucet> SillFaucets;
 	int64 SpillUnitsClaimed = 0;
@@ -711,10 +786,17 @@ void UVoxelFluidSubsystem::RefreshHeadwaterFaucets(double NowSeconds)
 		}
 		else
 		{
-			// A spring seeps out of the ground and runs downhill from there, so
-			// it emits just above the drawn ground with no velocity of its own.
+			// A spring seeps out of the ground just above the drawn surface --
+			// and MOVING DOWNHILL (playtest fix: a zero-velocity spring stacks
+			// every emission onto the pool standing at its own emit point and
+			// the density constraint ejects the clump as flying orbs). The
+			// downhill tangent is finite-differenced from the same surface
+			// authority the Z comes from, here at refresh (game thread, four
+			// GetSurfaceHeightUU calls per spring per 10 s), cached on the
+			// faucet. Flat ground returns zero and the spring pools in place.
 			const double GroundZ = WorldSub->GetSurfaceHeightUU(H.XUU, H.YUU);
 			F.WorldPos = FVector(H.XUU, H.YUU, GroundZ + kLifecycleFaucetHeightUU);
+			F.Velocity = ComputeDownhillVelocityUU(*WorldSub, H.XUU, H.YUU, kSpringSeepSpeedUU);
 		}
 		F.QM3PerYear = H.QM3PerYear;
 		for (const FVoxelFluidLifecycle::FHeadFaucet& O : Old)
@@ -723,6 +805,11 @@ void UVoxelFluidSubsystem::RefreshHeadwaterFaucets(double NowSeconds)
 			    FMath::IsNearlyEqual(O.WorldPos.Y, F.WorldPos.Y, 1.0))
 			{
 				F.Acc = O.Acc;
+				// The anti-burst window travels with the accumulator: dropping
+				// it at refresh would hand every faucet a fresh second and a
+				// refresh-aligned burst.
+				F.WindowStartSeconds = O.WindowStartSeconds;
+				F.EmittedThisWindow = O.EmittedThisWindow;
 				break;
 			}
 		}
@@ -811,6 +898,7 @@ void UVoxelFluidSubsystem::DrainSillSpills()
 	{
 		return;
 	}
+	UVoxelWorldSubsystem* WorldSub = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
 	TArray<UVoxelWaterSubsystem::FVoxelFluidSpillFaucet> Events;
 	Water->DrainFluidSpillFaucets(Events);
 	for (const UVoxelWaterSubsystem::FVoxelFluidSpillFaucet& E : Events)
@@ -824,6 +912,13 @@ void UVoxelFluidSubsystem::DrainSillSpills()
 		S.BasinKey = E.BasinKey;
 		S.UnitsRemaining = E.Units;
 		S.WorldPos = FVector(E.OutletXUU, E.OutletYUU, E.SpillZUU + kLifecycleFaucetHeightUU);
+		// Spill water leaves the saddle down the far slope, same fix as the
+		// springs (cached once here -- the outlet does not move).
+		if (WorldSub != nullptr)
+		{
+			S.Velocity = ComputeDownhillVelocityUU(*WorldSub, E.OutletXUU, E.OutletYUU,
+			                                       kSpringSeepSpeedUU);
+		}
 		L.SillFaucets.Add(S);
 	}
 }
@@ -1208,6 +1303,17 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			S.Mode = Mode;
 			S.CenterLocalUU = ClampLocal(FVector3f(CenterWorld - FluidOriginWorld));
 			S.VelocityUU = Vel;
+			// Faucet emissions jitter along a short LINE perpendicular to the
+			// stream (playtest fix: a disc at one point piles particles onto
+			// the standing pool at the source and the constraint blasts them).
+			// Zero when the stream is still -- the shader falls back to its
+			// disc there.
+			const float SpeedXYSq = Vel.X * Vel.X + Vel.Y * Vel.Y;
+			if (Mode == 1 && SpeedXYSq > 1.0f)
+			{
+				const float InvLen = FMath::InvSqrt(SpeedXYSq);
+				S.JitterDirUU = FVector3f(-Vel.Y * InvLen, Vel.X * InvLen, 0.0f);
+			}
 			S.Seed = uint32(GFrameCounter) * 97u + uint32(Spawns.Num());
 			S.BatchId = SpawnBatchCounter;
 			SpawnBatchCounter += 1.0f;
@@ -1331,9 +1437,39 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				{
 					continue;
 				}
+				// SOURCE ANTI-BURST (owner ask #3: per-tick streaming at the
+				// flow rate, never bulk dumps). Two clamps on top of the
+				// budget, both derived from the faucet's OWN rate:
+				//   (a) per tick <= ceil(2 x rate x dt): a stall's backlog
+				//       (addMicros pays out the whole gap in one call -- a
+				//       2 s hitch at 253/s is a 507-particle dump without
+				//       this) streams out at at most 2x pace instead;
+				//   (b) rolling 1 s window <= ceil(rate): "recent emissions
+				//       haven't cleared" can never compound -- the source
+				//       neighbourhood gets a full second to drain before the
+				//       faucet may exceed its own rate again.
+				// What the clamps hold back is CARRIED (up to ~1 s of rate,
+				// carryBackParticles -- the exact inverse of the payout);
+				// only the remainder routes through the scalar graph below,
+				// exactly as backpressure surplus always has.
+				const double RatePerSec =
+					double(Q) * 1000.0 / double(vxc::kFluidSecondsPerYear);
+				const int64 PerTickCap = FMath::Max<int64>(
+					1, int64(FMath::CeilToDouble(2.0 * RatePerSec * double(DeltaTime))));
+				const int64 WindowCap =
+					FMath::Max<int64>(1, int64(FMath::CeilToDouble(RatePerSec)));
+				if (Now >= F.WindowStartSeconds + 1.0)
+				{
+					F.WindowStartSeconds = Now;
+					F.EmittedThisWindow = 0;
+				}
+				const int64 WindowLeft = FMath::Max<int64>(0, WindowCap - F.EmittedThisWindow);
 				const int64 Wanted = int64(double(Owed) * EmitScale);
-				const int64 Emit = FMath::Min(Wanted, int64(Budget));
-				const int64 Virtual = Owed - Emit;
+				const int64 Emit =
+					FMath::Min(FMath::Min3(Wanted, int64(Budget), PerTickCap), WindowLeft);
+				const int64 CarryBack = FMath::Min(Owed - Emit, WindowCap);
+				F.Acc.carryBackParticles(CarryBack);
+				const int64 Virtual = Owed - Emit - CarryBack;
 				if (Virtual > 0)
 				{
 					// Not carried, ROUTED: carrying builds unbounded debt the
@@ -1359,6 +1495,7 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 					continue;
 				}
 				PushSpawn(uint32(Emit), 1, F.WorldPos, F.Velocity);
+				F.EmittedThisWindow += Emit;
 				Budget -= int32(Emit);
 				L.HeadFaucetParticlesEmitted += uint64(Emit);
 				FaucetEmittedThisTick += uint32(Emit);
@@ -1382,10 +1519,16 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 					continue;
 				}
 				const int64 MaxParticles = vxc::fluidWholeParticlesFromUnits(S.UnitsRemaining);
-				const int64 Emit = FMath::Min(MaxParticles, int64(Budget));
+				// Drain at a stream's pace (kSillDrainPerSecond), not in one
+				// budget-sized dump at a single point: the un-emitted units
+				// simply stay owed on the entry, which is the carry the sill
+				// path always had. Same anti-burst shape as the headwaters.
+				const int64 SillPerTickCap = FMath::Max<int64>(
+					1, int64(FMath::CeilToDouble(2.0 * kSillDrainPerSecond * double(DeltaTime))));
+				const int64 Emit = FMath::Min3(MaxParticles, int64(Budget), SillPerTickCap);
 				if (Emit > 0)
 				{
-					PushSpawn(uint32(Emit), 1, S.WorldPos, FVector3f::ZeroVector);
+					PushSpawn(uint32(Emit), 1, S.WorldPos, S.Velocity);
 					Budget -= int32(Emit);
 					S.UnitsRemaining -= vxc::fluidParticleUnits(Emit);
 					L.SpillParticlesEmitted += uint64(Emit);
@@ -1634,6 +1777,39 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		else
 		{
 			bDebugDrawSkippedTooMany = true;
+		}
+	}
+
+	// ---- faucet beacons (voxel.Fluid.DebugFaucets, default ON) -------------
+	// Every active faucet gets a bright marker + vertical beacon each tick, so
+	// a playtest can see where water is SUPPOSED to enter without reading the
+	// log: MAGENTA = springs, sill outlets and the camera faucet (point
+	// sources); ORANGE = edge inflows (the river crossing the boundary). Cheap
+	// by construction -- the gather caps emitters at kMaxHeadFaucets (32).
+	if (CVarVoxelFluidDebugFaucets.GetValueOnGameThread() != 0 && bOriginLatched)
+	{
+		const auto DrawBeacon = [World](const FVector& Pos, const FColor& Color)
+		{
+			DrawDebugSphere(World, Pos, 30.0f, 12, Color, /*bPersistent*/ false,
+			                /*LifeTime*/ -1.0f, /*DepthPriority*/ 0, /*Thickness*/ 3.0f);
+			DrawDebugLine(World, Pos, Pos + FVector(0.0, 0.0, 2000.0), Color,
+			              /*bPersistent*/ false, /*LifeTime*/ -1.0f, /*DepthPriority*/ 0,
+			              /*Thickness*/ 8.0f);
+		};
+		if (bFaucets)
+		{
+			for (const FVoxelFluidLifecycle::FHeadFaucet& F : L.HeadFaucets)
+			{
+				DrawBeacon(F.WorldPos, F.bEdgeInflow ? FColor::Orange : FColor::Magenta);
+			}
+			for (const FVoxelFluidLifecycle::FSillFaucet& S : L.SillFaucets)
+			{
+				DrawBeacon(S.WorldPos, FColor::Magenta);
+			}
+		}
+		if (bFaucetLatched && EmitPerSecond > 0.0f)
+		{
+			DrawBeacon(FaucetCenterWorld, FColor::Magenta);
 		}
 	}
 

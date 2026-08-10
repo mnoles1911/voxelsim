@@ -38,12 +38,26 @@ large render, its measurements and **Keep to library**.
   arrives as ~105k instanced cubes and draws in one call. Hand-written WebGL2 —
   no library to vendor, works offline.
 - **Describe a change in plain language** — the box above the sliders takes
-  things like *"shorter and more gnarled, sparser canopy"* and moves the
-  sliders for you, listing what it changed and why. It edits the same spec a
-  slider drag does, so the change is validated, clamped, visible as moved
-  sliders, and undoable with **Revert**. Needs `anthropic` installed and
-  `ANTHROPIC_API_KEY` set; without a credential the box says so and everything
-  else works normally.
+  things like *"much shorter, gnarled, sparser canopy"* and moves the sliders
+  for you. It runs **entirely in-app**: no network, no model, no API key. A
+  fixed vocabulary of ~200 design phrases (`forge/language.py`) maps onto
+  parameter recipes written against how the generator actually works — so
+  "twiggier" becomes a smaller consumption radius plus more growth targets,
+  because there is no branch-count slider to turn.
+
+  It understands intensity (*slightly / much / extremely*), negation (*not so
+  tall*, *less droopy*), silhouettes (*flat-topped*, *conical*, *columnar*),
+  switches (*dead*, *leafless*, *needles*, *in blossom*) and explicit numbers
+  (*height 8*, *crown radius 3*). Clause boundaries are respected, so in
+  "much shorter, sparser" the *much* applies to the height only.
+
+  Two properties matter more than breadth here. It is **deterministic** — the
+  same sentence always produces the same edit, which is what you want from a
+  box you will type into a hundred times. And when it does not recognise a
+  word it **says so** rather than silently doing nothing; an unknown word is a
+  gap in the vocabulary to fill, not a failure to debug. Edits land in the same
+  spec a slider drag does, so they are validated, clamped, visible as moved
+  sliders, and undoable with **Revert**.
 - **Generate / More / Reroll** — a fresh batch, the next block of seeds, or a
   random seed range.
 - **auto-regenerate** — regenerates when you release a slider, not during the
@@ -119,19 +133,63 @@ largest species.
 
 From the command line: `python -m forge.cli gen specs/tundra-pine.json --res 2`.
 
+## Growth models
+
+One algorithm could not make every tree. Species differ in *structure*, not
+just in parameter values — a conifer's tiers, a palm's fronds and a willow's
+strands are three different things, and expressing them all as "small ragged
+spheres on twigs" is why our palm was a lollipop and our willow was a ball.
+`growth.model` picks the backend; two post-passes add structure any backend can
+carry.
+
+**`colonize`** — space colonization (Runions et al. 2007). Branches grow toward
+scattered targets and consume them on arrival, so competition for space
+produces the pattern. Right for irregular broadleaf crowns; it is the default
+and still what most species use.
+
+**`whorl`** — rings of branches up a straight leader, each arcing out with lift
+at the trunk and droop at the tip, plus forward-angled side shoots. This is
+what a conifer *is*: a ring laid down each growing season. Colonization can
+only make a crown that is cone-*shaped*, never one that is actually tiered.
+Used by `tundra-pine` and `columnar-cypress`.
+
+**`frond`** — an unbranched trunk carrying a crown of long arcing leaves. A
+palm has no branches at all, so the blade gets its own rasterizer: a squashed
+ellipsoid at every midrib node, widest a third of the way out and tapering to a
+point at both ends. Used by `coast-palm`. Blades must be narrower than their
+spacing or the crown closes into a disc — twelve fronds at 0.34 m reads as a
+palm, fourteen at 0.55 m reads as a plate.
+
+**Strands** (`strand.count`) — long thin branches that ignore targets and
+simply fall. This is the one thing colonization structurally cannot do, and it
+is exactly what a weeping willow is; the same pass gives lianas and hanging
+moss. Anchors are biased toward the crown edge so strands form a curtain rather
+than a beard down the middle. Used by `weeping-willow`.
+
+**Roots** (`roots.count`) — ridges arching out of the base and back down to the
+ground. Distinct from `trunk.buttress`, which only multiplies the trunk radius
+near the ground: that thickens a cylinder, it does not make a root. Used by
+`jungle-emergent`, `baobab` and `temperate-oak`.
+
+Growth model and silhouette stay separate: every model reuses the same
+`crown.shape` profiles, so `tundra-pine` is whorl + cone (tiered spruce) and
+`columnar-cypress` is whorl + column (narrow evergreen) from the same code.
+
 ## Species
 
-    temperate-oak       large broadleaf, the baseline
+    temperate-oak       large broadleaf, the baseline, surface roots
     temperate-sapling   small young broadleaf
     river-broadleaf     dense drooping riverbank tree
     birch               slender, pale bark, narrow crown
     cherry-blossom      small flowering, blossom instead of leaf
     hawthorn-scrub      low gnarled hedgerow scrub
-    tundra-pine         boreal conifer
-    jungle-emergent     30 m rainforest giant with buttress roots
-    coast-palm          bare leaning trunk, a few big fronds
+    tundra-pine         boreal conifer, tiered (whorl model)
+    jungle-emergent     30 m rainforest giant, surface roots
+    coast-palm          bare leaning trunk, arcing fronds (frond model)
+    weeping-willow      trailing strand curtain (strand pass)
+    columnar-cypress    narrow evergreen column (whorl model)
     savanna-acacia      flat umbrella crown
-    baobab              enormous trunk, small sparse crown
+    baobab              enormous trunk, small sparse crown, surface roots
     desert-dead         standing deadwood, no foliage
 
 Proportions for birch, cherry, hawthorn, palm and baobab were taken from the

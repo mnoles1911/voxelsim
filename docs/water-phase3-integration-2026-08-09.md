@@ -512,3 +512,113 @@ change made to `VoxelFluidSubsystem.cpp` by this work -- two lines.
 - **Not verified here** (needs the editor): that a recentre looks right, and the
   refill latency at speed. Nothing calls `RecentreTo` yet, so there is nothing
   in-editor to look at until the subsystem policy above is wired.
+
+---
+
+## Addendum: owner playtest fixes — faucet blast, stuck orbs, faucet beacons (2026-08-09)
+
+Appended by the playtest-fix pass; everything above is unchanged. Owner
+feedback on the PBF water: (1) faucets "blast water orbs up and out
+explosively"; (2) landed particles "just sit on mountainsides" instead of
+flowing downhill and pooling; (3) wants water to stream out per tick at the
+flow rate, never as bulk dumps; plus a request for visible faucet markers.
+
+### Root causes found (file:line at this commit)
+
+1. **The blast is over-density at the source, twice over.**
+   - A SPRING emitted with ZERO velocity at one point 30 UU above the ground
+     (`VoxelFluidSubsystem.cpp`, RefreshHeadwaterFaucets' spring arm: `F.Velocity`
+     never set), and the spawn kernel jittered in a 30 UU XY disc around that
+     one point (`VoxelFluidSim.usf`, faucet arm of `FluidSpawnMain`). Every
+     tick's particles landed inside the standing pool at the emit point --
+     inside each other's 25 UU kernel radius -- and the density constraint
+     resolved the overlap the only way it can: by ejecting the clump. That IS
+     the orb fountain.
+   - The schedule allowed bursts: `FluidFaucetAccumulator::addMicros` pays the
+     WHOLE elapsed backlog out in one call (correct -- it is drift-free by
+     design), and the only per-tick bound between it and the spawn kernel was
+     the shared `voxel.Fluid.MaxSpawnPerTick` budget (4096). A 2 s hitch at
+     253/s put a 507-particle dump on one point in one tick. Sill faucets were
+     worse: `Emit = min(owedParticles, Budget)` -- an entire spill event's
+     backlog in one tick, bounded only by the budget.
+   - Verified while here: the deferral path (unbuilt occupancy) does NOT
+     accrue a backlog -- it skips `addMicros` entirely, so no dump on
+     fill-completion. The dump risk was hitches and clamp surpluses, both now
+     capped.
+
+2. **Stuck orbs: two findings, one fix and one statement.**
+   - The finalize contact response is structurally correct -- tangential
+     velocity DOES survive contact (`FluidFinalizeMain` lifts only the normal
+     component of `pOld`), so the "resolve leaves v=0" hypothesis is FALSE for
+     single-face contact. But the lift used one dot-product projection against
+     an ACCUMULATED normal that is non-unit at corners (`(1,0,1)` from a
+     two-axis resolve), which under-corrects and leaves a residual approach
+     speed of `(|n|^2 - 1) * dot(d, n)`. Replaced with the exact per-axis
+     form (pOld's clamped-axis components set equal to pNew's) -- identical
+     for one face, exact at corners, tangential untouched. Contract item 7
+     amended in place; `VoxelFluidCollision.ush`'s usage comment updated.
+   - The rest is REAL PHYSICS, stated rather than faked: a voxel slope is a
+     staircase of flat 10 cm treads; an isolated particle at rest on a tread
+     has zero tangential force (gravity is normal to the tread) and no PBF
+     neighbours to push it, so a lone droplet sticks -- as a real droplet
+     does. The cure is emission coherence (fix 1): particles emitted as a
+     moving line arrive as a STREAM whose density gradient pushes the front
+     forward over the step edges, exactly like real water on stairs.
+   - XSPH viscosity was considered and stays deferred: it needs a
+     neighbour gather over FINAL velocities -- one more full sorted-domain
+     pass PLUS pulling velocities through `CellEntries -> ParticlesRW`
+     slot-indexed reads, which is precisely the random-access traffic the
+     perf pass spent its effort removing (the 20-28 ms at 100k lived there).
+     Not paid for a smoothing nicety while emission coherence is the actual
+     fix; revisit only if the owner's captures still read "grainy" after
+     this pass.
+
+### What changed
+
+- **Springs and sills emit MOVING DOWNHILL** (`kSpringSeepSpeedUU` 150 UU/s
+  along the terrain gradient, 50 UU/s downward bias). The direction is
+  central-finite-differenced from `GetSurfaceHeightUU` (+/-100 UU) -- the
+  same surface authority the faucet Z uses, never rebuilt elsewhere -- on the
+  game thread, cached per faucet at gather refresh (springs, 4 calls per
+  spring per 10 s) or event arrival (sills, once). Flat ground (< 0.5 %
+  slope) keeps zero velocity: a plateau spring pools in place, correctly.
+  Edge inflows already carried the channel direction; unchanged.
+- **Emission is a line, not a point**: faucet-mode spawns jitter along a
+  +/-30 UU LINE perpendicular to the stream velocity (new `SpawnJitterDirUU`
+  uniform / `FVoxelFluidSpawnRequest::JitterDirUU`, host-computed as the
+  horizontal perpendicular; zero falls back to the old disc for still
+  sources), plus a +/-1 UU isotropic break so the line's constraint gradients
+  cannot cancel in pairs.
+- **Source anti-burst, per faucet** (the owner's ask #3): per-tick emission
+  <= ceil(2 x rate x dt) and a rolling 1 s window <= ceil(rate), both derived
+  from the faucet's OWN Q. What the clamps hold back is carried -- up to ~1 s
+  of rate via the new `FluidFaucetAccumulator::carryBackParticles` (exact
+  inverse of the payout; `test_fluidlifecycle.cpp fluid_faucet_carry_back`)
+  -- and only the remainder routes through the scalar graph, exactly as the
+  backpressure surplus always has. Sill faucets drain at
+  `kSillDrainPerSecond` (253/s, the DefaultQ worked example) instead of
+  budget-sized dumps; their surplus stays owed on the entry as before. The
+  ledgers still close: nothing new is dropped anywhere.
+- **Faucet beacons**: `voxel.Fluid.DebugFaucets` (default **1**) draws a
+  sphere + 20 m vertical line at every active faucet each tick -- MAGENTA
+  for springs, sill outlets and the camera faucet; ORANGE for edge inflows.
+
+### Verification done here (no editor launched, per constraints)
+
+- UBT `Result: Succeeded` (VoxelEarthEditor Win64 Development).
+- Offline dxc: all 11 `VoxelFluidSim.usf` entry points to both DXIL and
+  SPIR-V with `VOXEL_FLUID_HAS_COLLISION=1`, 22/22 green.
+  `lint-shader-ub.py`: `VoxelFluidCollision.ush` / `VoxelFluidContract.ush`
+  clean; `VoxelFluidSim.usf` is a float-typed solver file the integer-kernel
+  lint has never been clean on (20 findings at the previous commit, all
+  scientific-literal/float false positives; this pass adds 2 more of that
+  same class and no new write/shift/division findings).
+- `vxc_tests` 585 PASS / 0 FAIL, incl. the new `fluid_faucet_carry_back` case
+  (carry-back then re-drain equals never having taken the particles out).
+- NOT verified here (needs the editor): the look. Next run, expect: streams
+  leaving springs sideways-downhill as a ribbon instead of a fountain;
+  spill saddles trickling continuously; magenta/orange beacons at every
+  source (turn off with `voxel.Fluid.DebugFaucets 0` for captures);
+  mid-slope stream fronts advancing over voxel steps where lone droplets
+  still legitimately stick. Captures at the pinned poses, conditions
+  stated, owner judges.

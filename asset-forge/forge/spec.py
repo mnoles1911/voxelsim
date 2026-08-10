@@ -77,6 +77,12 @@ PARAMS: tuple[Param, ...] = (
     P("crown.points", "Growth targets", 900, 80, 5000, 10, kind="int", group="crown",
       help="More targets means denser, finer branching and a slower generate."),
 
+    P("growth.model", "Growth model", "colonize", kind="choice", group="growth",
+      choices=("colonize", "whorl", "frond"),
+      help="How branches are placed. 'colonize' grows toward scattered targets and "
+           "suits irregular broadleaf crowns. 'whorl' builds rings of branches up a "
+           "straight leader, which is what a conifer actually is — a spruce's tiers "
+           "are a real structure, not an irregular crown that happens to look tiered."),
     P("growth.step_m", "Segment length (m)", 0.35, 0.08, 1.50, 0.01, group="growth"),
     P("growth.influence_m", "Reach (m)", 3.0, 0.4, 14.0, 0.1, group="growth",
       help="How far a branch tip can see a growth target."),
@@ -91,6 +97,65 @@ PARAMS: tuple[Param, ...] = (
     P("growth.tip_radius_m", "Twig radius (m)", 0.045, 0.01, 0.40, 0.005, group="growth"),
     P("growth.radius_exp", "Branch thickness falloff", 2.30, 1.50, 3.50, 0.05, group="growth",
       help="Murray's law exponent. 2 splits thickness evenly, 3 keeps parents thick."),
+
+    P("whorl.count", "Whorls", 11, 3, 30, 1, kind="int", group="whorl",
+      help="Rings of branches up the trunk. More rings, denser tiers."),
+    P("whorl.branches", "Branches per whorl", 5, 2, 10, 1, kind="int", group="whorl"),
+    P("whorl.stagger", "Whorl rotation", 0.42, 0.0, 1.0, 0.01, group="whorl",
+      help="How far each ring is rotated from the one below. Near 0 lines branches "
+           "up into visible columns; the default keeps them interleaved."),
+    P("whorl.rise", "Branch lift at the trunk", 0.28, -0.5, 1.0, 0.01, group="whorl",
+      help="How much a branch angles upward where it leaves the trunk, before "
+           "gravity takes over further out."),
+    P("whorl.droop", "Branch droop at the tip", 0.55, 0.0, 2.0, 0.01, group="whorl"),
+    P("whorl.sub", "Sub-branches per branch", 2, 0, 5, 1, kind="int", group="whorl"),
+    P("whorl.sub_angle", "Sub-branch spread", 38.0, 5.0, 80.0, 1.0, group="whorl"),
+    P("whorl.irregular", "Irregularity", 0.22, 0.0, 1.0, 0.01, group="whorl",
+      help="Random variation in ring spacing and branch length, so tiers are not "
+           "mechanically even."),
+    P("whorl.leader", "Leader above the top whorl", 0.03, 0.0, 0.4, 0.01, group="whorl",
+      help="Bare spire left above the highest ring."),
+
+    P("frond.count", "Fronds", 14, 3, 40, 1, kind="int", group="frond"),
+    P("frond.length_m", "Frond length (m)", 2.6, 0.4, 8.0, 0.1, group="frond"),
+    P("frond.width_m", "Blade width (m)", 0.55, 0.05, 2.5, 0.05, group="frond",
+      help="Half-width of the leaf blade at its widest point, roughly a third of the "
+           "way along the midrib."),
+    P("frond.rise", "Frond lift", 0.85, -0.5, 2.0, 0.01, group="frond",
+      help="How steeply a frond leaves the crown before arcing over. High values give "
+           "the upright shuttlecock of a young palm; low values a flat spread."),
+    P("frond.droop", "Frond droop", 1.15, 0.0, 3.0, 0.01, group="frond"),
+    P("frond.dead", "Hanging dead fronds", 0.15, 0.0, 0.6, 0.01, group="frond",
+      help="Share of fronds that have collapsed and hang against the trunk — the "
+           "skirt of brown leaves under a real palm's crown."),
+    P("frond.irregular", "Frond irregularity", 0.25, 0.0, 1.0, 0.01, group="frond"),
+
+    P("roots.count", "Surface roots", 0, 0, 16, 1, kind="int", group="roots",
+      help="Roots radiating from the base as visible ridges. Zero for most species. "
+           "This is real geometry, unlike Root flare, which only thickens the trunk."),
+    P("roots.length_m", "Root length (m)", 1.8, 0.3, 8.0, 0.1, group="roots"),
+    P("roots.rise", "Root arch", 0.35, 0.0, 1.5, 0.01, group="roots",
+      help="How far a root humps above ground before running back down to it."),
+    P("roots.thickness", "Root thickness", 0.55, 0.05, 1.0, 0.01, group="roots",
+      help="Root radius where it leaves the trunk, as a fraction of the trunk's."),
+    P("roots.irregular", "Root irregularity", 0.30, 0.0, 1.0, 0.01, group="roots"),
+
+    P("strand.count", "Trailing strands", 0, 0, 400, 5, kind="int", group="strand",
+      help="Long thin branches hanging from the crown. Zero for most species; this is "
+           "what makes a weeping willow, and the same pass gives lianas and hanging "
+           "moss. Space colonization cannot produce these — targets are consumed on "
+           "arrival, so a branch stops rather than trails."),
+    P("strand.length_m", "Strand length (m)", 2.5, 0.3, 12.0, 0.1, group="strand"),
+    P("strand.from_frac", "Hang from", 0.35, 0.0, 1.0, 0.01, group="strand",
+      help="How high up the crown strands start. 0 hangs from everywhere, 1 only from "
+           "the very top."),
+    P("strand.outer", "Prefer the crown edge", 0.7, 0.0, 1.0, 0.01, group="strand",
+      help="Bias toward anchors far from the trunk, so strands form a curtain around "
+           "the crown rather than a beard down the middle."),
+    P("strand.drift", "Strand drift", 0.16, 0.0, 0.8, 0.01, group="strand",
+      help="How much a strand wanders as it falls."),
+    P("strand.spread", "Strand flare", 0.18, -0.5, 1.0, 0.01, group="strand",
+      help="Outward lean as a strand descends. Negative tucks them under the crown."),
 
     P("foliage.enabled", "Foliage", True, kind="bool", group="foliage"),
     P("foliage.min_order", "Leaves from branch order", 2, 0, 8, 1, kind="int", group="foliage"),

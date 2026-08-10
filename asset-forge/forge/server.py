@@ -334,11 +334,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/schema":
             return self._json({"params": specmod.ui_schema(), "groups": list(specmod.GROUPS)})
 
-        if path == "/api/nl-status":
-            from . import nl
+        if path == "/api/vocabulary":
+            from . import language
 
-            ok, why = nl.available()
-            return self._json({"available": ok, "reason": why, "model": nl.MODEL})
+            return self._json(language.vocabulary())
 
         if path == "/api/palette":
             return self._json(
@@ -485,17 +484,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"spec": spec, "warnings": rep.warnings,
                                "hash": specmod.spec_hash(spec)})
 
-        if path == "/api/nl-edit":
-            from . import nl
+        if path == "/api/interpret":
+            from . import language
 
-            ok, why = nl.available()
-            if not ok:
-                return self._json({"error": why}, 503)
             spec, _ = specmod.validate(body.get("spec") or {})
             request = str(body.get("request", "")).strip()
             if not request:
                 return self._json({"error": "say what you want changed"}, 400)
-            return self._json(nl.edit(spec, request))
+            return self._json(language.interpret(spec, request))
 
         if path == "/api/save-spec":
             spec, rep = specmod.validate(body.get("spec") or {})

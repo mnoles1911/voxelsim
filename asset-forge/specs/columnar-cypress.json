@@ -1,0 +1,75 @@
+{
+  "crown": {
+    "center_frac": 0.52,
+    "height_frac": 0.94,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 900,
+    "radius_m": 1.1,
+    "shape": "column",
+    "shell": 0.3,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.2,
+    "coverage": 0.98,
+    "density": 0.75,
+    "droop_m": 0.15,
+    "enabled": true,
+    "min_order": 1,
+    "squash": 0.7
+  },
+  "growth": {
+    "gravity": -0.12,
+    "inertia": 0.45,
+    "influence_m": 3.0,
+    "jitter": 0.05,
+    "kill_m": 0.7,
+    "max_iter": 260,
+    "model": "whorl",
+    "phototropism": 0.1,
+    "radius_exp": 2.3,
+    "step_m": 0.2,
+    "tip_radius_m": 0.03
+  },
+  "height_m": 13.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_needle"
+  },
+  "name": "columnar-cypress",
+  "notes": "Narrow evergreen column. Same whorl model as tundra-pine, but a column crown profile instead of a cone \u2014 the growth model and the silhouette are separate choices.",
+  "resolution_cm": "10",
+  "trunk": {
+    "buttress": 0.0,
+    "clear_frac": 0.06,
+    "lean_deg": 1.5,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.2,
+    "wander": 0.05
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 6,
+    "count": 24,
+    "droop": 0.3,
+    "irregular": 0.3,
+    "leader": 0.02,
+    "rise": 0.45,
+    "stagger": 0.42,
+    "sub": 1,
+    "sub_angle": 38.0
+  }
+}

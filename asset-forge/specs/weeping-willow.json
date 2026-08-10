@@ -1,0 +1,92 @@
+{
+  "crown": {
+    "center_frac": 0.72,
+    "height_frac": 0.62,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1500,
+    "radius_m": 5.2,
+    "shape": "hanging",
+    "shell": 0.75,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.25,
+    "coverage": 0.9,
+    "density": 0.62,
+    "droop_m": 0.3,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 1.4
+  },
+  "frond": {
+    "count": 14,
+    "dead": 0.15,
+    "droop": 1.15,
+    "irregular": 0.25,
+    "length_m": 2.6,
+    "rise": 0.85,
+    "width_m": 0.55
+  },
+  "growth": {
+    "gravity": -0.35,
+    "inertia": 0.45,
+    "influence_m": 2.6,
+    "jitter": 0.05,
+    "kill_m": 0.45,
+    "max_iter": 260,
+    "model": "colonize",
+    "phototropism": 0.1,
+    "radius_exp": 2.3,
+    "step_m": 0.28,
+    "tip_radius_m": 0.035
+  },
+  "height_m": 12.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_broadleaf"
+  },
+  "name": "weeping-willow",
+  "notes": "Classic weeping willow. Needs the strand pass: space colonization consumes its targets on arrival, so a branch reaching the crown edge stops there and can never trail. Strands ignore targets and simply fall.",
+  "resolution_cm": "10",
+  "strand": {
+    "count": 200,
+    "drift": 0.16,
+    "from_frac": 0.25,
+    "length_m": 5.0,
+    "outer": 0.8,
+    "spread": 0.16
+  },
+  "trunk": {
+    "buttress": 0.3,
+    "clear_frac": 0.24,
+    "lean_deg": 6.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.46,
+    "wander": 0.3
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
+  }
+}

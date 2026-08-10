@@ -76,6 +76,26 @@ VXC_TEST(fluid_faucet_accumulator_no_drift) {
     CHECK_EQ(acc.carry, totalCarry % kFluidFaucetCarryPerParticle);
 }
 
+VXC_TEST(fluid_faucet_carry_back) {
+    // The anti-burst clamp's other half: particles paid out by addMicros that
+    // the host could not emit this tick go BACK on the schedule, exactly --
+    // carry-back then re-drain must equal never having taken them out.
+    FluidFaucetAccumulator acc;
+    const int64_t q = 8'000'000;
+    const int64_t owed = acc.addMicros(q, 5'000'000);  // 5 s stall backlog
+    CHECK_EQ(owed, int64_t(1267));                     // floor(5 * 253.506)
+    const int64_t emitted = 9;                         // per-tick cap took 9
+    acc.carryBackParticles(owed - emitted);
+    // Draining the accumulator dry now owes exactly the carried-back count
+    // (zero additional wall time, so nothing new accrues).
+    CHECK_EQ(acc.carry / kFluidFaucetCarryPerParticle, owed - emitted);
+    // And a negative/zero carry-back is a no-op, matching addMicros' edges.
+    const int64_t before = acc.carry;
+    acc.carryBackParticles(0);
+    acc.carryBackParticles(-3);
+    CHECK_EQ(acc.carry, before);
+}
+
 VXC_TEST(fluid_faucet_accumulator_edges) {
     FluidFaucetAccumulator acc;
     CHECK_EQ(acc.addMicros(0, 1'000'000), int64_t(0));

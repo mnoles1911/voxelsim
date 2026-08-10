@@ -22,7 +22,7 @@ import numpy as np
 
 from . import materials, rasterize
 from .grid import VoxelGrid, dense_bytes
-from .skeleton import Skeleton, grow
+from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
 from .spec import get, realize as spec_realize, spec_hash
 
 
@@ -71,7 +71,11 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
     # differ in height, spread and lean and not only in twig placement.
     live, _ = spec_realize(spec, rng)
 
-    skel = grow(live, rng)
+    model = get(live, "growth.model")
+    skel = {"whorl": grow_whorl, "frond": grow_frond}.get(model, grow)(live, rng)
+    if model != "frond":
+        skel = add_strands(skel, live, rng)
+    skel = add_roots(skel, live, rng)
     t_grow = time.perf_counter()
 
     origin, shape = rasterize.bounds(skel, live, voxel_m)
@@ -85,7 +89,8 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         )
     grid = VoxelGrid(shape, tuple(origin), voxel_m)
     rasterize.wood(grid, skel, live, origin)
-    clumps = rasterize.foliage(grid, skel, live, origin, rng)
+    clumps = (rasterize.frond_blades if model == "frond" else rasterize.foliage)(
+        grid, skel, live, origin, rng)
     t_raster = time.perf_counter()
 
     grid = grid.crop()

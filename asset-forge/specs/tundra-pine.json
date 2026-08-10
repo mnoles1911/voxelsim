@@ -12,8 +12,8 @@
   },
   "foliage": {
     "clump_jitter": 0.3,
-    "clump_radius_m": 0.3,
-    "coverage": 0.92,
+    "clump_radius_m": 0.22,
+    "coverage": 0.98,
     "density": 0.72,
     "droop_m": 0.1,
     "enabled": true,
@@ -27,6 +27,7 @@
     "jitter": 0.05,
     "kill_m": 0.32,
     "max_iter": 320,
+    "model": "whorl",
     "phototropism": 0.06,
     "radius_exp": 2.5,
     "step_m": 0.22,
@@ -39,7 +40,8 @@
     "leaf": "leaf_needle"
   },
   "name": "tundra-pine",
-  "notes": "Boreal conifer. Cone crown, drooping branches, needles. Sits on podzol and permafrost surfaces.",
+  "notes": "Boreal conifer. Uses the whorl growth model: rings of branches up a straight leader, which is what a conifer actually is. Sits on podzol and permafrost surfaces.",
+  "resolution_cm": "10",
   "trunk": {
     "buttress": 0.1,
     "clear_frac": 0.16,
@@ -47,5 +49,27 @@
     "lean_dir_deg": 0.0,
     "radius_base_m": 0.22,
     "wander": 0.06
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 6,
+    "count": 14,
+    "droop": 0.9,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
   }
 }

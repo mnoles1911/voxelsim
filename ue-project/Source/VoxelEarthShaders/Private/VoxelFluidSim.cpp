@@ -122,6 +122,7 @@ namespace
 			SHADER_PARAMETER(float, SpawnBatchId)
 			SHADER_PARAMETER(FVector3f, SpawnCenterLocalUU)
 			SHADER_PARAMETER(FVector3f, SpawnVelUU)
+			SHADER_PARAMETER(FVector3f, SpawnJitterDirUU)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<FVoxelFluidParticle>, ParticlesRW)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ParticleCounts)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, FreeList)
@@ -730,6 +731,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->SpawnBatchId = Spawn.BatchId;
 		Params->SpawnCenterLocalUU = Spawn.CenterLocalUU;
 		Params->SpawnVelUU = Spawn.VelocityUU;
+		Params->SpawnJitterDirUU = Spawn.JitterDirUU;
 		Params->ParticlesRW = GraphBuilder.CreateUAV(ParticlesRDG);
 		Params->ParticleCounts = GraphBuilder.CreateUAV(CountsRDG);
 		Params->FreeList = GraphBuilder.CreateUAV(FreeListRDG);

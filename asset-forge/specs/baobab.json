@@ -20,6 +20,15 @@
     "min_order": 2,
     "squash": 0.7
   },
+  "frond": {
+    "count": 14,
+    "dead": 0.15,
+    "droop": 1.15,
+    "irregular": 0.25,
+    "length_m": 2.6,
+    "rise": 0.85,
+    "width_m": 0.55
+  },
   "growth": {
     "gravity": 0.02,
     "inertia": 0.4,
@@ -27,6 +36,7 @@
     "jitter": 0.1,
     "kill_m": 0.6,
     "max_iter": 260,
+    "model": "colonize",
     "phototropism": 0.06,
     "radius_exp": 2.6,
     "step_m": 0.34,
@@ -40,6 +50,22 @@
   },
   "name": "baobab",
   "notes": "Enormous water-storing trunk under a small sparse crown. After vengi's tree_baobab: the trunk is most of the tree.",
+  "resolution_cm": "10",
+  "roots": {
+    "count": 8,
+    "irregular": 0.4,
+    "length_m": 2.8,
+    "rise": 0.6,
+    "thickness": 0.45
+  },
+  "strand": {
+    "count": 0,
+    "drift": 0.16,
+    "from_frac": 0.35,
+    "length_m": 2.5,
+    "outer": 0.7,
+    "spread": 0.18
+  },
   "trunk": {
     "buttress": 1.0,
     "clear_frac": 0.55,
@@ -58,5 +84,16 @@
     "rotate": true,
     "shape": 0.12,
     "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
   }
 }

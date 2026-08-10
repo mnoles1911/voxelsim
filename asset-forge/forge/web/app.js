@@ -53,16 +53,11 @@ async function boot() {
     .map((s) => `<option value="${s.name}">${s.name}</option>`)
     .join("");
 
-  fetch("/api/nl-status")
+  fetch("/api/vocabulary")
     .then((r) => r.json())
-    .then((s) => {
-      if (!s.available) {
-        $("ask").disabled = true;
-        $("askGo").disabled = true;
-        $("ask").placeholder = `Plain-language edits unavailable — ${s.reason}`;
-      } else {
-        $("askMsg").textContent = s.model;
-      }
+    .then((v) => {
+      state.vocabulary = v;
+      $("askMsg").textContent = `${v.concepts.length} things I understand`;
     });
 
   await refreshLibrary();
@@ -313,11 +308,10 @@ async function askEdit() {
   const request = $("ask").value.trim();
   if (!request) return;
   $("askGo").disabled = true;
-  $("askMsg").textContent = "thinking…";
   $("askEdits").innerHTML = "";
 
   try {
-    const r = await fetch("/api/nl-edit", {
+    const r = await fetch("/api/interpret", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ spec: state.spec, request }),
@@ -327,30 +321,46 @@ async function askEdit() {
       $("askMsg").textContent = r.error;
       return;
     }
-    if (!r.edits.length) {
-      $("askMsg").textContent = "no parameters changed";
-      $("askEdits").innerHTML = `<div class="askedit">${escape(r.explanation || "")}</div>`;
-      return;
-    }
 
-    // The model edits the same spec the sliders do, so the panel just rebuilds
+    const parts = [];
+    if (r.understood.length) {
+      parts.push(...r.understood.map((u) => `<div class="askedit">· ${escape(u)}</div>`));
+    }
+    // An unrecognised word is a gap in the vocabulary, not a silent no-op —
+    // always say which words went unused.
+    if (r.ignored.length) {
+      parts.push(
+        `<div class="askedit miss">didn't understand: ${r.ignored.map(escape).join(", ")}</div>`
+      );
+    }
+    if (r.edits.length) {
+      parts.push(
+        ...r.edits.map(
+          (e) => `<div class="askedit">&nbsp;&nbsp;<b>${escape(e.label)}</b> <code>${fmtVal(e.from)} → ${fmtVal(e.to)}</code></div>`
+        )
+      );
+    }
+    $("askEdits").innerHTML = parts.join("");
+    $("askMsg").textContent = r.edits.length
+      ? `${r.edits.length} parameter${r.edits.length === 1 ? "" : "s"} changed`
+      : "nothing recognised";
+
+    if (!r.edits.length) return;
+    // Writes to the same spec a slider drag does, so the panel just rebuilds
     // and the moved sliders show exactly what changed.
     state.spec = r.spec;
     buildParams();
-    $("askMsg").textContent = `${r.edits.length} parameter${r.edits.length === 1 ? "" : "s"} changed`;
-    $("askEdits").innerHTML =
-      `<div class="askedit">${escape(r.explanation)}</div>` +
-      r.edits
-        .map((e) => `<div class="askedit">· <b>${escape(e.label)}</b> → <code>${escape(String(e.value))}</code>${e.why ? ` — ${escape(e.why)}` : ""}</div>`)
-        .join("");
     for (const w of r.warnings || []) toast(w);
     generate();
   } catch {
-    $("askMsg").textContent = "request failed";
+    $("askMsg").textContent = "interpret failed";
   } finally {
     $("askGo").disabled = false;
   }
 }
+
+const fmtVal = (v) =>
+  typeof v === "number" ? (Number.isInteger(v) ? v : v.toFixed(2)) : String(v);
 
 /* --- 3D --------------------------------------------------------------- */
 

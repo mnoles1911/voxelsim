@@ -14,11 +14,20 @@
     "clump_jitter": 0.2,
     "clump_radius_m": 0.95,
     "coverage": 1.0,
-    "density": 0.55,
+    "density": 0.75,
     "droop_m": 0.26,
     "enabled": true,
     "min_order": 1,
-    "squash": 0.4
+    "squash": 0.45
+  },
+  "frond": {
+    "count": 12,
+    "dead": 0.15,
+    "droop": 1.35,
+    "irregular": 0.32,
+    "length_m": 3.4,
+    "rise": 1.0,
+    "width_m": 0.34
   },
   "growth": {
     "gravity": -0.46,
@@ -27,6 +36,7 @@
     "jitter": 0.03,
     "kill_m": 1.7,
     "max_iter": 260,
+    "model": "frond",
     "phototropism": 0.05,
     "radius_exp": 2.6,
     "step_m": 0.55,
@@ -39,7 +49,8 @@
     "leaf": "leaf_jungle"
   },
   "name": "coast-palm",
-  "notes": "Bare leaning trunk under a few big fronds. After vengi's tree_palm. Few growth targets on purpose -- a palm has a handful of huge leaves, not a canopy.",
+  "notes": "Bare leaning trunk under a crown of arcing fronds. Uses the frond growth model: a palm has no branches at all, so clumps-on-twigs could only ever make a lollipop.",
+  "resolution_cm": "10",
   "trunk": {
     "buttress": 0.3,
     "clear_frac": 0.8,
@@ -58,5 +69,16 @@
     "rotate": true,
     "shape": 0.12,
     "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
   }
 }

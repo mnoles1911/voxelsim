@@ -130,6 +130,9 @@ struct FVoxelFluidSpawnRequest
 	uint32 Mode = 0;           // 0 = block lattice (dam break), 1 = faucet
 	FVector3f CenterLocalUU = FVector3f::ZeroVector;
 	FVector3f VelocityUU = FVector3f::ZeroVector;
+	// Faucet mode only: unit direction of the emission line (host-computed
+	// horizontal perpendicular of VelocityUU). Zero = legacy point/disc.
+	FVector3f JitterDirUU = FVector3f::ZeroVector;
 	uint32 Seed = 0;
 	float BatchId = 0.0f;
 };

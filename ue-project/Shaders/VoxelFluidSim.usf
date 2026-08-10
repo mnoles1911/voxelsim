@@ -127,7 +127,9 @@
 // otherwise makes the first constraint iterations degenerate (every gradient
 // pair cancels exactly).
 #define VOXEL_FLUID_SPAWN_JITTER_UU   2.0f
-// Faucet emission disc radius.
+// Faucet emission half-extent: half-length of the emission LINE when the host
+// supplies SpawnJitterDirUU (perpendicular to the stream), radius of the
+// legacy disc when it does not (zero vector).
 #define VOXEL_FLUID_FAUCET_JITTER_UU  30.0f
 
 // ---- loose parameters ($Globals, bound by name from the C++ param structs) -
@@ -159,6 +161,12 @@ uint   SpawnEdge;           // lattice edge (block mode): SpawnEdge^3 >= SpawnCo
 float  SpawnBatchId;
 float3 SpawnCenterLocalUU;
 float3 SpawnVelUU;
+// Faucet mode only: unit direction of the emission LINE, host-computed as the
+// horizontal perpendicular of the stream velocity. Zero = legacy XY disc.
+// A line across the flow reads as a stream front; a disc at one point piles
+// particles onto each other at the source, which is half of the measured
+// "faucet blasts orbs" failure (the constraint ejects the over-dense clump).
+float3 SpawnJitterDirUU;
 
 // ---- buffers ---------------------------------------------------------------
 // Contract-named (VoxelFluidContract.ush lines 54-59):
@@ -416,9 +424,27 @@ void FluidSpawnMain(uint3 DTid : SV_DispatchThreadID)
 	}
 	else
 	{
-		// Faucet: jittered disc at the emit point, carrying the stream velocity.
+		// Faucet. Emission shape (owner playtest fix, docs/water-phase3-
+		// integration-2026-08-09.md "faucet emission" addendum): a short LINE
+		// perpendicular to the stream when the host supplies the direction, so
+		// consecutive ticks lay particles down as a front that flows away,
+		// instead of a disc stacking new particles onto the standing water at
+		// one point until the density constraint blasts them out.
 		const float3 j = (FluidHash3(t ^ SpawnSeed) - 0.5f) * 2.0f;
-		pos = SpawnCenterLocalUU + float3(j.xy * VOXEL_FLUID_FAUCET_JITTER_UU, 0.0f);
+		if (dot(SpawnJitterDirUU, SpawnJitterDirUU) > 1.0e-6f)
+		{
+			pos = SpawnCenterLocalUU + SpawnJitterDirUU * (j.x * VOXEL_FLUID_FAUCET_JITTER_UU);
+		}
+		else
+		{
+			// No stream direction (a still source): the legacy XY disc.
+			pos = SpawnCenterLocalUU + float3(j.xy * VOXEL_FLUID_FAUCET_JITTER_UU, 0.0f);
+		}
+		// Small isotropic break on top, same reason the block lattice jitters:
+		// a perfect line/disc makes the first constraint gradients cancel in
+		// pairs. Fresh hash chain so it is uncorrelated with the line offset.
+		const float3 j2 = FluidHash3(FluidWangHash(t ^ SpawnSeed) ^ 0x9e3779b9u) - 0.5f;
+		pos += j2 * VOXEL_FLUID_SPAWN_JITTER_UU;
 		vel = SpawnVelUU;
 	}
 
@@ -822,10 +848,23 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		pNew = VoxelFluidResolveCollisionEx(pNew, pOld, n, blocked);
 		if (blocked)
 		{
-			// Exact zero normal velocity: move pOld onto the contact plane, so
-			// v = (pNew - pOld)/dt below has no component along n. This is the
-			// contract's own ratified recipe (item 2), verbatim.
-			pOld -= n * dot(pOld - pNew, n);
+			// Exact zero normal velocity, exact tangential survival -- the
+			// contract's item 2 recipe in its PER-AXIS form. n's non-zero
+			// components mark the clamped axes (the resolve's normals are
+			// axis-aligned, +/-1 per face); copying pNew's component into pOld
+			// on exactly those axes makes v = (pNew - pOld)/dt below zero
+			// along every contact normal and UNTOUCHED along the free axes,
+			// so a particle landing on a slope keeps its downhill motion.
+			// For single-face contact this is bit-identical to the dot form
+			// (pOld -= n * dot(pOld - pNew, n)); for a corner (n non-unit,
+			// e.g. (1,0,1)) the dot form under-corrects and leaves a residual
+			// approach speed of (|n|^2 - 1) * dot(d, n) -- per-axis is the
+			// exact generalization, not a new rule. StartedInside returns
+			// n = 0 with pNew == pOld, so this is a no-op there and the
+			// derived velocity is zero, as before.
+			pOld.x = (n.x != 0.0f) ? pNew.x : pOld.x;
+			pOld.y = (n.y != 0.0f) ? pNew.y : pOld.y;
+			pOld.z = (n.z != 0.0f) ? pNew.z : pOld.z;
 		}
 	}
 #endif

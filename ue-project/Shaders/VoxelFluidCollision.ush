@@ -495,9 +495,14 @@ float3 VoxelFluidResolveCollision(float3 posUU, float3 prevPosUU)
 //   pos = VoxelFluidResolveCollisionEx(pos, prevPos, n, blocked);
 //   if (blocked)
 //   {
-//       // exact zero normal velocity: move prevPos onto the same plane, then
-//       // the solver's own v = (pos - prevPos)/dt has no normal component.
-//       prevPos -= n * dot(prevPos - pos, n);
+//       // exact zero normal velocity: copy pos's component into prevPos on
+//       // each CLAMPED axis (n's non-zero components), then the solver's own
+//       // v = (pos - prevPos)/dt has no component along any contact normal
+//       // and full tangential motion along the free axes. (The earlier
+//       // prevPos -= n * dot(prevPos - pos, n) form is identical for one
+//       // clamped axis but under-corrects at corners, where n is non-unit,
+//       // e.g. (1,0,1) -- FluidFinalizeMain carries the arithmetic.)
+//       prevPos.x = (n.x != 0.0f) ? pos.x : prevPos.x;   // and y, z alike
 //   }
 //
 // Tangential motion is untouched, which is the free-slip wall the blueprint's

@@ -26,6 +26,8 @@
 //   voxel.Fluid.Emit <perSec>       -- camera faucet stream; 0 stops it
 //   voxel.Fluid.Iterations N        -- PBF constraint iterations (default 3, clamp 1..8)
 //   voxel.Fluid.DebugDraw 1         -- DrawDebugPoint for <= 5k alive particles
+//   voxel.Fluid.DebugFaucets        -- beacon at every active faucet (default 1;
+//                                      magenta = springs/sills/camera, orange = edge inflows)
 //   voxel.Fluid.Faucets 1           -- headwater + sill faucets and the sinks (default 0)
 //   voxel.Fluid.Faucets.DefaultQ    -- m^3/yr for heads with no baked Q (default 8e6 ~= 253/s)
 //   voxel.Fluid.MaxSpawnPerTick     -- shared faucet emit budget, particles (default 4096)
