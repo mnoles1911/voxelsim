@@ -133,6 +133,32 @@ largest species.
 
 From the command line: `python -m forge.cli gen specs/tundra-pine.json --res 2`.
 
+## Canopy structure
+
+The single biggest lever on whether a broadleaf reads as a tree or as broccoli
+is **`foliage.separation`** — the minimum distance between clump centres, as a
+multiple of clump radius.
+
+This was found by putting our output beside treegen-pinegen's published sample
+renders (`out/vs-treegen.png`). Their crowns break into distinct masses with
+daylight between them and the branch architecture visible through; ours filled
+the entire crown envelope into one continuous solid. The cause was placing a
+clump on every qualifying twig at 85-98% coverage with a radius large enough to
+overlap its neighbours, so the union was always a shell.
+
+Raising coverage or lowering it does not fix this. Twigs are dense, so any
+coverage high enough to fill the crown also packs the clumps until they fuse.
+The fix is to thin candidates by *distance* before the coverage roll — greedy
+dart-throwing with a spatial hash — so clump centres keep their distance
+whatever the twig density.
+
+On a 14 m oak the range runs from 405 clumps at separation 1.0 (a solid mass)
+to 27 at 3.0 (bare branches with pom-poms). Around **1.9 with a clump radius of
+0.8 m** the crown keeps its volume while gaining gaps and showing its boughs,
+which is the target. Conifers want less (1.4-1.5, so tiers stay dense),
+a weeping willow much less (1.3, its curtain should read solid), a sparse birch
+more (2.0).
+
 ## Growth models
 
 One algorithm could not make every tree. Species differ in *structure*, not

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import materials
+from . import biomes as biomelib, kinds as kindlib, materials
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class Param:
     choices: tuple[str, ...] = ()
     group: str = "general"
     help: str = ""
+    kinds: tuple[str, ...] = ()   # asset kinds this row applies to; () = all of them
 
 
 P = Param
@@ -42,8 +43,13 @@ PARAMS: tuple[Param, ...] = (
     P("name", "Species name", "unnamed", kind="text", group="general"),
     P("notes", "Notes", "", kind="text", group="general",
       help="Free text for the designer; ignored by the generator."),
-    P("height_m", "Height (m)", 12.0, 1.0, 40.0, 0.25, group="general",
-      help="Ground to the top of the crown."),
+    P("kind", "Asset kind", "tree", kind="choice", group="general",
+      choices=kindlib.KEYS,
+      help="What sort of asset this is. It decides which parameters apply and "
+           "which generator runs — a rock has no trunk, crown or foliage."),
+    P("height_m", "Height (m)", 12.0, 0.3, 40.0, 0.1, group="general",
+      help="Ground to the top of the crown. The floor is low enough for ground "
+           "cover; rocks ignore this and use their own size."),
     P("resolution_cm", "Voxel size", "10", kind="choice", group="general",
       choices=("10", "5", "2.5", "2", "1"),
       help="Edge length of one voxel. The engine's terrain is 10 cm; finer makes "
@@ -162,7 +168,15 @@ PARAMS: tuple[Param, ...] = (
     P("foliage.clump_radius_m", "Clump radius (m)", 0.65, 0.15, 3.0, 0.05, group="foliage"),
     P("foliage.density", "Clump density", 0.60, 0.05, 1.0, 0.01, group="foliage"),
     P("foliage.coverage", "Clump coverage", 0.80, 0.0, 1.0, 0.01, group="foliage",
-      help="Share of eligible twigs that carry a clump."),
+      help="Share of surviving twigs that carry a clump, after separation has "
+           "thinned them."),
+    P("foliage.separation", "Clump separation", 1.7, 0.3, 4.0, 0.05, group="foliage",
+      help="Minimum distance between clump centres, as a multiple of clump radius. "
+           "Below about 1.6 neighbouring clumps overlap and the canopy fuses into "
+           "one solid mass; above it the crown breaks into distinct boughs of "
+           "foliage with daylight between them and the branch structure visible "
+           "through. This is the single biggest lever on whether a broadleaf reads "
+           "as a tree or as broccoli."),
     P("foliage.clump_jitter", "Clump variation", 0.35, 0.0, 1.0, 0.01, group="foliage",
       help="Random spread in clump size and position. Zero makes the canopy a lattice "
            "of identical spheres."),
@@ -187,6 +201,66 @@ PARAMS: tuple[Param, ...] = (
     P("variation.rotate", "Random facing", True, kind="bool", group="variation",
       help="Point each individual's lean in a random direction. Cheap and it does more "
            "for a forest than any other single knob."),
+
+    *tuple(
+        P(f"biomes.{b.key}", b.label, 0.0, 0.0, 1.0, 0.05, group="biome",
+          kinds=b.hosts,
+          help=f"How common this species is in {b.label.lower()} ({b.climate}). "
+               f"Zero means it never appears there. Surface: {b.surface}.")
+        for b in biomelib.HOSTING
+    ),
+
+    P("placement.abundance", "Abundance", 0.5, 0.0, 1.0, 0.01, group="placement",
+      help="Overall frequency of this species where it does occur, before the "
+           "per-biome weights are applied."),
+    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 60.0, 0.5, group="placement",
+      help="Closest two individuals may stand. Roughly the canopy diameter for a "
+           "closed forest, much larger for savanna or desert."),
+    P("placement.cluster", "Grows in stands", 0.3, 0.0, 1.0, 0.01, group="placement",
+      help="0 scatters individuals evenly; 1 gathers them into groves with open "
+           "ground between."),
+    P("placement.elev_min_m", "Lowest elevation (m)", 0.0, -10.0, 4000.0, 10.0,
+      group="placement", help="Metres above sea level. The engine's sea level is z=0."),
+    P("placement.elev_max_m", "Highest elevation (m)", 2000.0, 0.0, 5000.0, 10.0,
+      group="placement",
+      help="Above the treeline nothing but tundra/alpine is classified anyway "
+           "(900 m at 0 C, rising ~150 m per degree), so this mainly separates "
+           "lowland species from montane ones inside a biome."),
+    P("placement.slope_max_pct", "Steepest ground (% grade)", 45.0, 0.0, 70.0, 1.0,
+      group="placement",
+      help="Ground steeper than this will not carry the species. Stated as a grade "
+           "in percent, the same currency the engine's cliff gate uses — above 70% "
+           "(~35 degrees) the ground classifies as bare rock and carries nothing."),
+    P("placement.water_max_m", "Distance to water (m)", 0.0, 0.0, 500.0, 5.0,
+      group="placement",
+      help="0 means it does not care. Above 0, the species only appears within this "
+           "distance of a watercourse — riverbank willows and jungle understorey."),
+
+    P("rock.size_m", "Size (m)", 1.6, 0.2, 12.0, 0.1, group="rock",
+      help="Longest dimension of the boulder."),
+    P("rock.lumps", "Lumps", 5, 1, 16, 1, kind="int", group="rock",
+      help="How many overlapping masses the rock is built from. One gives a clean "
+           "ovoid; more gives a knobbly, weathered boulder."),
+    P("rock.spread", "Lump spread", 0.42, 0.0, 1.0, 0.01, group="rock",
+      help="How far the lumps scatter from the centre. High values make a broken "
+           "pile rather than a single stone."),
+    P("rock.flatten", "Flatten", 0.72, 0.15, 2.0, 0.01, group="rock",
+      help="Vertical squash. Below 1 gives a slab; above 1 a standing stone."),
+    P("rock.elongate", "Elongate", 1.25, 0.4, 3.0, 0.01, group="rock"),
+    P("rock.angular", "Angularity", 0.45, 0.0, 1.0, 0.01, group="rock",
+      help="Slices flat faces off the mass. 0 is a rounded river cobble, 1 a "
+           "freshly fractured block."),
+    P("rock.facets", "Facet count", 4, 0, 10, 1, kind="int", group="rock"),
+    P("rock.erode", "Erosion", 0.35, 0.0, 1.0, 0.01, group="rock",
+      help="Removes weakly-attached voxels, rounding sharp protrusions and "
+           "pitting the surface."),
+    P("rock.bury", "Buried fraction", 0.22, 0.0, 0.7, 0.01, group="rock",
+      help="How much of the stone sits below ground. Everything under z=0 is cut "
+           "away, so this controls how settled it looks rather than adding volume."),
+    P("rock.rubble", "Rubble", 0.15, 0.0, 1.0, 0.01, group="rock",
+      help="Loose stones scattered around the base."),
+    P("materials.rock", "Rock", "rock", kind="choice", group="rock",
+      choices=("rock", "bedrock", "gravel", "sand", "clay", "permafrost", "snow")),
 
     P("materials.bark", "Bark", "bark", kind="choice", group="materials",
       choices=materials.WOOD_NAMES),
@@ -423,8 +497,23 @@ def realize(spec: dict, rng) -> tuple[dict, Report]:
     return patch(spec, changes)
 
 
-def ui_schema() -> list[dict]:
-    """The slider table, as data. Feeds the web UI and the language prompt."""
+def params_for(kind: str) -> tuple[Param, ...]:
+    """Parameters that apply to an asset kind.
+
+    Mostly derived from each parameter's GROUP, so adding a parameter to an
+    existing group picks up the right kinds automatically and a new kind is one
+    entry in `kinds.py`. A row may narrow that further with `kinds=` when the
+    group is right but the row is not -- the biome weights are the case: bare
+    rock is a legitimate place for a boulder and an impossible one for an oak.
+    """
+    allowed = set(kindlib.groups_for(kind))
+    return tuple(p for p in PARAMS
+                 if p.group in allowed and kindlib.applies(p.kinds, kind))
+
+
+def ui_schema(kind: str | None = None) -> list[dict]:
+    """The slider table, as data. Feeds the web UI and the language box."""
+    rows = params_for(kind) if kind else PARAMS
     return [
         {
             "path": p.path,
@@ -438,5 +527,5 @@ def ui_schema() -> list[dict]:
             "group": p.group,
             "help": p.help,
         }
-        for p in PARAMS
+        for p in rows
     ]

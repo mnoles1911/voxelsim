@@ -122,6 +122,19 @@ namespace
 	constexpr double kFaucetRefreshSeconds = 10.0;
 	constexpr double kSinkRefreshSeconds = 1.0;
 
+	// ---- emission backpressure geometry + the age-recycling band ------------
+	// The soft cap is the MEASURED knee (see the backpressure comment in Tick):
+	// faucet emission ramps from full at kAliveRampStart down to zero at
+	// kAliveSoftCap. The age sink (contract item 9) is anchored to the SAME
+	// geometry: its valve opens at 60% of the ramp start and is fully open AT
+	// the ramp start, so recycling always outpaces inflow before the throttle
+	// can engage -- the round-6 jam (population ratcheted into the soft cap,
+	// faucets throttled to zero, nothing ever despawned) cannot re-form.
+	constexpr uint32 kAliveSoftCap = VoxelFluidSim::kMaxParticles / 3;   // 102,400
+	constexpr uint32 kAliveRampWidth = kAliveSoftCap / 2;                // 51,200
+	constexpr uint32 kAliveRampStart = kAliveSoftCap - kAliveRampWidth;  // 51,200
+	constexpr uint32 kAgePopStart = (kAliveRampStart * 3u) / 5u;         // 30,720
+
 	// voxel.Fluid.Spawn with no argument.
 	constexpr int32 kDefaultSpawnCount = 5000;
 
@@ -174,12 +187,30 @@ namespace
 		TEXT("(the bv23 fallback carries no Q). Default 8e6 ~= 253 particles/s."),
 		ECVF_Default);
 
+	TAutoConsoleVariable<float> CVarVoxelFluidFaucetQMult(
+		TEXT("voxel.Fluid.Faucets.QMult"), 1.0f,
+		TEXT("Multiplier on every faucet's discharge (springs, edges, sills). ")
+		TEXT("Owner tuning knob for how much water the world visibly carries."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<int32> CVarVoxelFluidGpuTiming(
 		TEXT("voxel.Fluid.GpuTiming"), 0,
 		TEXT("EXPERIMENTAL: raw render-query GPU timing bracket around the fluid "
 		     "graph. Crashed RDG's breadcrumb assert on first Execute in UE 5.8; "
 		     "off until rebuilt on a sanctioned path. The gate metric is the A/B "
 		     "frame-time delta while this is off."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarVoxelFluidMaxAgeSec(
+		TEXT("voxel.Fluid.MaxAgeSec"), 75.0f,
+		TEXT("How long a water particle may live, in seconds, before it is quietly ")
+		TEXT("recycled: despawned as a boundary exit and its volume carried on ")
+		TEXT("downstream through the river graph (owner playtest round 6 fix -- ")
+		TEXT("water that pools in terrain pockets never reaches a spatial sink, so ")
+		TEXT("without this the population fills the buffer and every faucet ")
+		TEXT("throttles to zero). The sim shortens the age automatically as the ")
+		TEXT("particle count climbs toward the emission throttle, so faucets keep ")
+		TEXT("a constant stream. 0 disables recycling (the pre-fix behaviour)."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarVoxelFluidMaxSpawnPerTick(
@@ -415,6 +446,7 @@ struct FVoxelFluidLifecycle
 	uint64 PerfSpillEmitted = 0;
 	uint64 LastPerfBasinDespawns = 0;
 	uint64 LastPerfBoundaryDespawns = 0;
+	uint64 LastPerfRecycled = 0; // age recycles (subset of boundary despawns)
 
 	// --- occupancy verify ---------------------------------------------------
 	int32 VerifyCursor = 0;
@@ -1172,7 +1204,6 @@ void UVoxelFluidSubsystem::ReleaseSimState()
 	EmitCarry = 0.0f;
 	PendingSpawnCount = 0;
 	CumulativeSpawnRequested = 0;
-	SpawnBatchCounter = 0.0f;
 	LastConservationGeneration = 0;
 	ConservationViolations = 0;
 	LastDebugDrawGeneration = 0;
@@ -1293,6 +1324,12 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	TArray<FVoxelFluidSpawnRequest, TInlineAllocator<8>> Spawns;
 	uint32 FaucetEmittedThisTick = 0;
 	uint32 SpillEmittedThisTick = 0;
+	// The age sink's clock (contract item 9): world game time, one read per
+	// tick -- the SAME value goes into every spawn's birth stamp and into the
+	// finalize kernel's NowSeconds, so a particle spawned this tick has age
+	// exactly zero. Game time (starts near zero), not FPlatformTime (OS
+	// uptime), so float keeps millisecond precision for sessions of days.
+	const float NowGameSec = float(World->GetTimeSeconds());
 	if (bOriginLatched)
 	{
 		const auto PushSpawn = [&](uint32 Count, uint32 Mode, const FVector& CenterWorld,
@@ -1315,8 +1352,9 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				S.JitterDirUU = FVector3f(-Vel.Y * InvLen, Vel.X * InvLen, 0.0f);
 			}
 			S.Seed = uint32(GFrameCounter) * 97u + uint32(Spawns.Num());
-			S.BatchId = SpawnBatchCounter;
-			SpawnBatchCounter += 1.0f;
+			// Birth stamp for the age sink (P1.w -- the float batch id that
+			// stood here was verified unread by everything downstream).
+			S.SpawnTimeSec = NowGameSec;
 			CumulativeSpawnRequested += Count;
 			Spawns.Add(S);
 		};
@@ -1373,13 +1411,15 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			// snapshot is anyway.)
 			const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
 			const uint32 AliveNow = Snapshot.bValid ? Snapshot.Alive : 0u;
-			// kMaxParticles/3 = 102k: the MEASURED knee. 100k settled costs
+			// kAliveSoftCap = 102k: the MEASURED knee. 100k settled costs
 			// simGpuMs 2.4 (sorted gathers); the first backpressure run let the
 			// pool reach 156k and paid 21 ms -- deep piles compress and the
 			// constraint cost is superlinear in local density, so the cap sits
-			// at the scale the measurements actually cleared.
-			const uint32 SoftCap = uint32(VoxelFluidSim::kMaxParticles / 3);
-			const uint32 RampWidth = SoftCap / 2;                                  // full->zero over 76k
+			// at the scale the measurements actually cleared. (Constants hoisted
+			// to the namespace so the age-recycling band is derived from the
+			// same geometry -- see their comment block.)
+			const uint32 SoftCap = kAliveSoftCap;
+			const uint32 RampWidth = kAliveRampWidth; // emission full -> zero over 51,200..102,400
 			float EmitScale = 1.0f;
 			if (AliveNow >= SoftCap)
 			{
@@ -1431,7 +1471,12 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 					CountDeferral(EmitWorldVoxel);
 					continue;
 				}
-				const int64 Q = F.QM3PerYear > 0.0 ? int64(F.QM3PerYear) : DefaultQ;
+				// voxel.Fluid.Faucets.QMult: owner-facing flow multiplier for
+				// tuning how much water the world carries. Applied to EVERY
+				// faucet's discharge; the ledgers scale with it, so the books
+				// still close -- it is more water, not phantom water.
+				const int64 Q = int64(double(F.QM3PerYear > 0.0 ? F.QM3PerYear : double(DefaultQ))
+				                      * FMath::Max(0.0f, CVarVoxelFluidFaucetQMult.GetValueOnGameThread()));
 				int64 Owed = F.Acc.addMicros(Q, DtMicros);
 				if (Owed <= 0)
 				{
@@ -1644,6 +1689,12 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		Args.BoundaryCenterLocalUU =
 			FVector3f(kBoundaryHalfExtentUU, kBoundaryHalfExtentUU, kBoundaryHalfExtentUU);
 		Args.Occupancy = Occupancy.Get();
+		// Age recycling (contract item 9): same clock as the spawn stamps; band
+		// anchored to the emission ramp so recycling opens before throttling.
+		Args.NowSeconds = NowGameSec;
+		Args.MaxAgeSec = FMath::Max(0.0f, CVarVoxelFluidMaxAgeSec.GetValueOnGameThread());
+		Args.AgePopStart = kAgePopStart;
+		Args.AgePopEnd = kAliveRampStart;
 		Args.Spawns = Spawns;
 		Args.bVerifyOccupancy = bVerify;
 		if (bVerify)
@@ -1866,9 +1917,24 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			                            L.FaucetTicksDeferredNoOccupancy,
 			                            L.FaucetTicksDeferredOutsideVolume);
 		const uint64 BasinRate = uint64(Snapshot.DespawnedBasin) - L.LastPerfBasinDespawns;
-		const uint64 BoundaryRate = uint64(Snapshot.DespawnedBoundary) - L.LastPerfBoundaryDespawns;
+		const uint64 BoundaryRateRaw = uint64(Snapshot.DespawnedBoundary) - L.LastPerfBoundaryDespawns;
+		const uint64 RecycleRate = uint64(Snapshot.RecycledAge) - L.LastPerfRecycled;
+		// The raw boundary counter INCLUDES age recycles (contract item 9 keeps
+		// them on the boundary counter so conservation and the units path are
+		// untouched); the line splits them back apart -- sink(boundary) is real
+		// spatial exits, recycle is the age sink. Subset by construction (both
+		// counters increment together), and both deltas come from one snapshot,
+		// so the subtraction cannot underflow.
+		const uint64 BoundaryRate = BoundaryRateRaw - RecycleRate;
 		L.LastPerfBasinDespawns = uint64(Snapshot.DespawnedBasin);
 		L.LastPerfBoundaryDespawns = uint64(Snapshot.DespawnedBoundary);
+		L.LastPerfRecycled = uint64(Snapshot.RecycledAge);
+		// recycle= ran-flag rules: "off" when the cvar disables the age sink (a
+		// disabled stage must not print a real-looking 0/s), else the rate.
+		const FString RecycleField =
+			CVarVoxelFluidMaxAgeSec.GetValueOnGameThread() <= 0.0f
+				? FString(TEXT("off"))
+				: FString::Printf(TEXT("%llu/s"), RecycleRate);
 		const FString SinkBasinField =
 			!bFaucets ? TEXT("off")
 			          : (L.bSinkValid ? FString::Printf(TEXT("%llu/s"), BasinRate) : TEXT("none"));
@@ -1899,14 +1965,14 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		UE_LOG(LogVoxelFluid, Display,
 		       TEXT("Fluid perf %s alive=%u spawned=%u requested=%llu despawnBasin=%u ")
 		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s iters=%d slots=%llu violations=%llu ")
-		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s ")
+		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s recycle=%s ")
 		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu deferredNoOccupancy=%s%s"),
 		       StateMarker, Snapshot.Alive, Snapshot.SpawnedTotal, CumulativeSpawnRequested,
 		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs, *RenderField,
 		       FMath::Clamp(CVarVoxelFluidIterations.GetValueOnGameThread(), 1, 8),
 		       FMath::Min<uint64>(CumulativeSpawnRequested, VoxelFluidSim::kMaxParticles),
 		       ConservationViolations, *FaucetField, L.PerfSpillEmitted, *SinkBasinField, BoundaryRate,
-		       L.RegionsBuiltTotal, L.PendingRegions.Num(), VerifyField,
+		       *RecycleField, L.RegionsBuiltTotal, L.PendingRegions.Num(), VerifyField,
 		       SimState->GetTicksSkippedNoOccupancy(), *DeferredField,
 		       bDebugDrawSkippedTooMany ? TEXT(" debugDraw=skipped(alive>5000)") : TEXT(""));
 

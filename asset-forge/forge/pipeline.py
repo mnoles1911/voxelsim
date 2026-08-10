@@ -20,16 +20,17 @@ from typing import Any
 
 import numpy as np
 
-from . import materials, rasterize
+from . import materials, rasterize, rock as rocklib
 from .grid import VoxelGrid, dense_bytes
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
 from .spec import get, realize as spec_realize, spec_hash
 
 
 @dataclass
-class Tree:
+class Asset:
     grid: VoxelGrid
-    skeleton: Skeleton
+    # None for kinds that have no branch structure at all, such as rocks.
+    skeleton: Skeleton | None
     spec: dict          # the species, as authored
     seed: int
     realized: dict = field(default_factory=dict)  # this individual of it
@@ -71,38 +72,50 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
     # differ in height, spread and lean and not only in twig placement.
     live, _ = spec_realize(spec, rng)
 
+    kind = get(live, "kind")
     model = get(live, "growth.model")
-    skel = {"whorl": grow_whorl, "frond": grow_frond}.get(model, grow)(live, rng)
-    if model != "frond":
-        skel = add_strands(skel, live, rng)
-    skel = add_roots(skel, live, rng)
-    t_grow = time.perf_counter()
+    skel = None
+    clumps = 0
 
-    origin, shape = rasterize.bounds(skel, live, voxel_m)
-    need_mb = dense_bytes(shape) / 1e6
-    if need_mb > MAX_GRID_MB:
-        raise GridTooLarge(
-            f"{get(live, 'name')} at {voxel_m * 100:g} cm needs a "
-            f"{shape[0]}x{shape[1]}x{shape[2]} grid ({need_mb / 1000:.1f} GB), over the "
-            f"{MAX_GRID_MB / 1000:.1f} GB limit. Use a coarser voxel size, a smaller "
-            f"tree, or raise ASSET_FORGE_MAX_GRID_MB."
-        )
-    grid = VoxelGrid(shape, tuple(origin), voxel_m)
-    rasterize.wood(grid, skel, live, origin)
-    clumps = (rasterize.frond_blades if model == "frond" else rasterize.foliage)(
-        grid, skel, live, origin, rng)
-    t_raster = time.perf_counter()
+    if kind == "rock":
+        # No skeleton: a rock is accreted and carved, not grown.
+        t_grow = time.perf_counter()
+        grid = rocklib.build(live, rng, voxel_m)
+        need_mb = dense_bytes(grid.shape) / 1e6
+        t_raster = time.perf_counter()
+    else:
+        skel = {"whorl": grow_whorl, "frond": grow_frond}.get(model, grow)(live, rng)
+        if model != "frond":
+            skel = add_strands(skel, live, rng)
+        skel = add_roots(skel, live, rng)
+        t_grow = time.perf_counter()
+
+        origin, shape = rasterize.bounds(skel, live, voxel_m)
+        need_mb = dense_bytes(shape) / 1e6
+        if need_mb > MAX_GRID_MB:
+            raise GridTooLarge(
+                f"{get(live, 'name')} at {voxel_m * 100:g} cm needs a "
+                f"{shape[0]}x{shape[1]}x{shape[2]} grid ({need_mb / 1000:.1f} GB), over the "
+                f"{MAX_GRID_MB / 1000:.1f} GB limit. Use a coarser voxel size, a smaller "
+                f"asset, or raise ASSET_FORGE_MAX_GRID_MB."
+            )
+        grid = VoxelGrid(shape, tuple(origin), voxel_m)
+        rasterize.wood(grid, skel, live, origin)
+        clumps = (rasterize.frond_blades if model == "frond" else rasterize.foliage)(
+            grid, skel, live, origin, rng)
+        t_raster = time.perf_counter()
 
     grid = grid.crop()
 
     stats: dict[str, Any] = {
         "seed": seed,
         "spec_hash": spec_hash(spec),
-        "nodes": skel.n,
-        "segments": int(skel.n - 1),
-        "max_order": int(skel.order.max()) if skel.n else 0,
-        "iterations": skel.iterations,
-        "targets_left": skel.targets_left,
+        "kind": kind,
+        "nodes": skel.n if skel else 0,
+        "segments": int(skel.n - 1) if skel else 0,
+        "max_order": int(skel.order.max()) if skel and skel.n else 0,
+        "iterations": skel.iterations if skel else 0,
+        "targets_left": skel.targets_left if skel else 0,
         "clumps": clumps,
         "voxel_cm": round(voxel_m * 100, 4),
         "height_m": round(grid.shape[2] * voxel_m, 2),
@@ -118,7 +131,7 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         "ms_grow": round((t_grow - t0) * 1e3, 1),
         "ms_raster": round((t_raster - t_grow) * 1e3, 1),
     }
-    if connectivity:
+    if connectivity and kind != "rock":
         wood_ids = {
             materials.resolve(get(live, "materials.bark")),
             materials.resolve(get(live, "materials.core")),
@@ -133,10 +146,15 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         stats["detached"] = int(round(stats["voxels"] * (1.0 - attached)))
     stats["ms_total"] = round((time.perf_counter() - t0) * 1e3, 1)
 
-    return Tree(grid=grid, skeleton=skel, spec=spec, seed=seed, realized=live, stats=stats)
+    return Asset(grid=grid, skeleton=skel, spec=spec, seed=seed, realized=live, stats=stats)
 
 
-def health(tree: Tree) -> list[str]:
+# Kept as an alias: the tool grew up as a tree generator and plenty of call
+# sites still say Tree.
+Tree = Asset
+
+
+def health(tree: Asset) -> list[str]:
     """Things that would make this asset unusable in the world.
 
     Reported per tree rather than asserted, because a spec being explored with
@@ -157,13 +175,14 @@ def health(tree: Tree) -> list[str]:
         problems.append(f"loose: {s['detached']:,} voxels float free of the tree")
     if s["ground_contact"] == 0:
         problems.append("floating: nothing touches the ground plane")
-    if s["max_order"] == 0:
+    if s.get("kind", "tree") not in ("rock",) and s["max_order"] == 0:
         problems.append("bare: the trunk never branched")
     if max(s["extent_vox"]) > 256:
         problems.append(
             f"large: {max(s['extent_vox'])} voxels on the long axis, over the 256 "
             "limit for a single .vox model (export will split it)"
         )
-    if get(tree.spec, "foliage.enabled") and s["clumps"] == 0:
+    if (s.get("kind", "tree") not in ("rock",)
+            and get(tree.spec, "foliage.enabled") and s["clumps"] == 0):
         problems.append("bald: foliage is on but no clump was placed")
     return problems

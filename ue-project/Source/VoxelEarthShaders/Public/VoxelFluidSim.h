@@ -63,11 +63,31 @@ namespace VoxelFluidSim
 	// used only to decode the debug-draw readback.
 	struct FParticleCPU
 	{
-		FVector3f Pos;   // P0.xyz, origin-relative UU
-		uint32 Flags;    // asuint(P0.w)
-		FVector3f Vel;   // P1.xyz, UU/s
-		float BatchId;   // P1.w
+		FVector3f Pos;      // P0.xyz, origin-relative UU
+		uint32 Flags;       // asuint(P0.w)
+		FVector3f Vel;      // P1.xyz, UU/s
+		float SpawnTimeSec; // P1.w -- spawn time, game seconds (contract item 9)
 	};
+
+	// Age-sink scale floor, mirror of VOXEL_FLUID_AGE_SCALE_FLOOR
+	// (VoxelFluidSim.usf): the population-scaled effective max age never drops
+	// below this fraction of MaxAgeSec.
+	inline constexpr float kAgeScaleFloor = 0.1f;
+
+	// CPU mirror of the finalize kernel's effective-max-age math (contract
+	// item 9): full MaxAgeSec up to PopStart, linear down to the floor at
+	// PopEnd, floored beyond. One definition here so the automation test pins
+	// the semantics the shader implements.
+	inline float EffectiveMaxAgeSec(uint32 Pop, uint32 PopStart, uint32 PopEnd, float MaxAgeSec)
+	{
+		float Scale = 1.0f;
+		if (Pop > PopStart)
+		{
+			const float T = float(Pop - PopStart) / float(FMath::Max(PopEnd - PopStart, 1u));
+			Scale = FMath::Max(1.0f - T, kAgeScaleFloor);
+		}
+		return MaxAgeSec * Scale;
+	}
 
 	// The shader's kernel-coefficient literals (VoxelFluidSim.usf), re-derived
 	// here in double precision. An automation test asserts each literal is
@@ -114,6 +134,9 @@ struct FVoxelFluidCountsSnapshot
 	uint32 DespawnedBasin = 0;
 	uint32 DespawnedBoundary = 0;
 	uint32 SpawnedTotal = 0;
+	// Age recycles (contract item 9): a SUBSET of DespawnedBoundary, telemetry
+	// only -- never a term of the conservation predicate.
+	uint32 RecycledAge = 0;
 	uint64 Generation = 0;
 	// Last completed GPU timing of the sim pass span, milliseconds. Negative
 	// means "no timing available" (queries unsupported or none resolved yet)
@@ -134,7 +157,9 @@ struct FVoxelFluidSpawnRequest
 	// horizontal perpendicular of VelocityUU). Zero = legacy point/disc.
 	FVector3f JitterDirUU = FVector3f::ZeroVector;
 	uint32 Seed = 0;
-	float BatchId = 0.0f;
+	// Game-time seconds at the spawn dispatch, stamped into every spawned
+	// particle's P1.w -- the age sink's birth time (contract item 9).
+	float SpawnTimeSec = 0.0f;
 };
 
 // Everything one sim tick needs, marshalled game -> render thread by value.
@@ -180,6 +205,17 @@ struct FVoxelFluidSimTickArgs
 	FVector3f BasinBoxMinLocalUU = FVector3f::ZeroVector;
 	FVector3f BasinBoxMaxLocalUU = FVector3f::ZeroVector;
 	float BasinDatumZLocalUU = 0.0f;
+
+	// Age sink (contract item 9): recycle particles older than the
+	// population-scaled max age as boundary despawns. MaxAgeSec <= 0 disables
+	// (cvar voxel.Fluid.MaxAgeSec 0). NowSeconds is the same game-time clock
+	// the spawn requests stamp, uploaded per tick. AgePopStart/End are the
+	// population band over which the effective age shrinks to the floor; the
+	// subsystem anchors AgePopEnd at its emission backpressure ramp start.
+	float NowSeconds = 0.0f;
+	float MaxAgeSec = 0.0f;
+	uint32 AgePopStart = 0;
+	uint32 AgePopEnd = 0;
 
 	// Spawn dispatches this tick, in order: at most one dam-break block plus
 	// every faucet (camera faucet, headwater faucets, sill faucets) that owes

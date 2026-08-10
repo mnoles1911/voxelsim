@@ -1,4 +1,14 @@
 {
+  "biomes": {
+    "beach": 0.0,
+    "desert": 0.0,
+    "grassland": 0.2,
+    "rainforest": 0.0,
+    "savanna": 0.0,
+    "taiga": 0.3,
+    "temperate_forest": 1.0,
+    "tundra_alpine": 0.0
+  },
   "crown": {
     "center_frac": 0.62,
     "height_frac": 0.72,
@@ -12,13 +22,23 @@
   },
   "foliage": {
     "clump_jitter": 0.35,
-    "clump_radius_m": 0.25,
+    "clump_radius_m": 0.3,
     "coverage": 0.85,
     "density": 0.62,
     "droop_m": 0.08,
     "enabled": true,
     "min_order": 1,
+    "separation": 1.5,
     "squash": 0.9
+  },
+  "frond": {
+    "count": 14,
+    "dead": 0.15,
+    "droop": 1.15,
+    "irregular": 0.25,
+    "length_m": 2.6,
+    "rise": 0.85,
+    "width_m": 0.55
   },
   "growth": {
     "gravity": -0.08,
@@ -27,6 +47,7 @@
     "jitter": 0.07,
     "kill_m": 0.28,
     "max_iter": 240,
+    "model": "colonize",
     "phototropism": 0.18,
     "radius_exp": 2.2,
     "step_m": 0.18,
@@ -40,6 +61,31 @@
   },
   "name": "temperate-sapling",
   "notes": "Small young broadleaf, for filling forest floor and clearings. Deliberately close to temperate-oak so the two can be compared as a size family rather than two unrelated species.",
+  "placement": {
+    "abundance": 0.9,
+    "cluster": 0.7,
+    "elev_max_m": 1400.0,
+    "elev_min_m": 0.0,
+    "slope_max_pct": 55.0,
+    "spacing_m": 2.5,
+    "water_max_m": 0.0
+  },
+  "resolution_cm": "10",
+  "roots": {
+    "count": 0,
+    "irregular": 0.3,
+    "length_m": 1.8,
+    "rise": 0.35,
+    "thickness": 0.55
+  },
+  "strand": {
+    "count": 0,
+    "drift": 0.16,
+    "from_frac": 0.35,
+    "length_m": 2.5,
+    "outer": 0.7,
+    "spread": 0.18
+  },
   "trunk": {
     "buttress": 0.0,
     "clear_frac": 0.22,
@@ -47,5 +93,27 @@
     "lean_dir_deg": 120.0,
     "radius_base_m": 0.13,
     "wander": 0.28
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
   }
 }

@@ -31,6 +31,12 @@
 //   voxel.Fluid.Faucets 1           -- headwater + sill faucets and the sinks (default 0)
 //   voxel.Fluid.Faucets.DefaultQ    -- m^3/yr for heads with no baked Q (default 8e6 ~= 253/s)
 //   voxel.Fluid.MaxSpawnPerTick     -- shared faucet emit budget, particles (default 4096)
+//   voxel.Fluid.MaxAgeSec           -- seconds a particle lives before it is recycled
+//                                      downstream as scalars (default 75; 0 = off).
+//                                      The round-6 fix: pocketed water that never
+//                                      reaches a spatial sink turns over by age, so
+//                                      emission == recycling at steady state and
+//                                      faucets never throttle to zero.
 //   voxel.Fluid.Occupancy.RegionsPerTick / .PackMsPerTick -- fill budget
 //   voxel.Fluid.Occupancy.Verify 1  -- continuous GPU-vs-CPU region compare
 //
@@ -147,7 +153,6 @@ private:
 	// Upper bound on particles ever requested -- the dispatch-width bound
 	// passed to the solver. Never decremented; saturates at the contract cap.
 	uint64 CumulativeSpawnRequested = 0;
-	float SpawnBatchCounter = 0.0f;
 
 	// 1 Hz perf line + conservation bookkeeping.
 	double NextPerfLogTime = 0.0;

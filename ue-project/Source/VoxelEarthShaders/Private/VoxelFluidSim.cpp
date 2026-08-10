@@ -57,7 +57,11 @@ namespace
 	// The shader's kernel-coefficient literals (VoxelFluidSim.usf:70,76),
 	// restated ONCE here so the automation tests can pin them against the
 	// double-precision derivations in VoxelFluidSim::Poly6CoeffUU et al.
-	constexpr double kShaderPoly6CoeffLiteral = 4.10673e-13;
+	// 4.10696e-13, corrected from 4.10673e-13 (recycling pass): the original
+	// literal was derived from a mis-multiplied 64*pi*h^9 (7.67034e14 for the
+	// true 7.66990e14) and sat 5.6e-5 relative off -- found the first time the
+	// KernelCoefficients test ran headless.
+	constexpr double kShaderPoly6CoeffLiteral = 4.10696e-13;
 	constexpr double kShaderSpikyGradCoeffLiteral = 5.86709e-8;
 
 	// ---- shared compile policy ---------------------------------------------
@@ -119,7 +123,7 @@ namespace
 			SHADER_PARAMETER(uint32, SpawnMode)
 			SHADER_PARAMETER(uint32, SpawnSeed)
 			SHADER_PARAMETER(uint32, SpawnEdge)
-			SHADER_PARAMETER(float, SpawnBatchId)
+			SHADER_PARAMETER(float, SpawnTimeSec)
 			SHADER_PARAMETER(FVector3f, SpawnCenterLocalUU)
 			SHADER_PARAMETER(FVector3f, SpawnVelUU)
 			SHADER_PARAMETER(FVector3f, SpawnJitterDirUU)
@@ -287,6 +291,11 @@ namespace
 			SHADER_PARAMETER(FVector3f, BasinBoxMinLocalUU)
 			SHADER_PARAMETER(FVector3f, BasinBoxMaxLocalUU)
 			SHADER_PARAMETER(float, BasinDatumZLocalUU)
+			// Age sink (contract item 9): population-scaled recycling.
+			SHADER_PARAMETER(float, NowSeconds)
+			SHADER_PARAMETER(float, MaxAgeSec)
+			SHADER_PARAMETER(uint32, AgePopStart)
+			SHADER_PARAMETER(uint32, AgePopEnd)
 			// Sorted domain (perf pass): InPositions is the final sorted
 			// iterate, InCellEntries the sorted -> slot map corrections are
 			// written back through, InSortedCount the thread bound.
@@ -438,7 +447,7 @@ namespace
 			{
 				continue;
 			}
-			uint32 Counts[4] = { 0, 0, 0, 0 };
+			uint32 Counts[5] = { 0, 0, 0, 0, 0 };
 			const void* Src = Slot.Readback->Lock(sizeof(Counts));
 			if (Src != nullptr)
 			{
@@ -453,6 +462,7 @@ namespace
 					State.LatestCounts.DespawnedBasin = Counts[1];
 					State.LatestCounts.DespawnedBoundary = Counts[2];
 					State.LatestCounts.SpawnedTotal = Counts[3];
+					State.LatestCounts.RecycledAge = Counts[4];
 					State.LatestCounts.Generation = Slot.Generation;
 					State.LatestCounts.bValid = true;
 				}
@@ -598,7 +608,9 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(FParticleCPU), kMaxParticles),
 			TEXT("VoxelFluid.Particles"));
 		State.Counts = AllocatePooledBuffer(
-			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 4),
+			// 5 slots: alive, despawnedBasin, despawnedBoundary, spawnedTotal,
+			// despawnedAge (contract lines 60-70).
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 5),
 			TEXT("VoxelFluid.ParticleCounts"));
 		State.FreeList = AllocatePooledBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), kMaxParticles),
@@ -728,7 +740,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->SpawnMode = Spawn.Mode;
 		Params->SpawnSeed = Spawn.Seed;
 		Params->SpawnEdge = CubeEdgeForCount(Spawn.Count);
-		Params->SpawnBatchId = Spawn.BatchId;
+		Params->SpawnTimeSec = Spawn.SpawnTimeSec;
 		Params->SpawnCenterLocalUU = Spawn.CenterLocalUU;
 		Params->SpawnVelUU = Spawn.VelocityUU;
 		Params->SpawnJitterDirUU = Spawn.JitterDirUU;
@@ -861,6 +873,10 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->BasinBoxMinLocalUU = Args.BasinBoxMinLocalUU;
 		Params->BasinBoxMaxLocalUU = Args.BasinBoxMaxLocalUU;
 		Params->BasinDatumZLocalUU = Args.BasinDatumZLocalUU;
+		Params->NowSeconds = Args.NowSeconds;
+		Params->MaxAgeSec = Args.MaxAgeSec;
+		Params->AgePopStart = Args.AgePopStart;
+		Params->AgePopEnd = Args.AgePopEnd;
 		Params->InPositions = GraphBuilder.CreateSRV(CurIn);
 		Params->InCellEntries = GraphBuilder.CreateSRV(CellEntriesRDG);
 		Params->InSortedCount = GraphBuilder.CreateSRV(SortedCountRDG);
@@ -875,8 +891,8 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	}
 
 	// ---- readbacks ---------------------------------------------------------
-	// The 16-byte counts copy, every frame -- the 4-byte QuadTotal pattern
-	// (VoxelGpuMeshJobManager.cpp:205-217) at 4x the width. This is the whole
+	// The 20-byte counts copy, every frame -- the 4-byte QuadTotal pattern
+	// (VoxelGpuMeshJobManager.cpp:205-217) at 5x the width. This is the whole
 	// per-frame CPU cost of the conservation assert.
 	{
 		FVoxelFluidSimState::FCountsReadback* Free = nullptr;
@@ -894,7 +910,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 			{
 				Free->Readback = MakeUnique<FRHIGPUBufferReadback>(TEXT("VoxelFluid.CountsReadback"));
 			}
-			AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), CountsRDG, 4 * sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), CountsRDG, 5 * sizeof(uint32));
 			Free->Generation = State.TickGeneration;
 			Free->bInFlight = true;
 		}
@@ -1103,6 +1119,74 @@ bool FVoxelFluidConservationTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("leaked particle detected"), CheckConservation(71, 10, 20, 100));
 	TestFalse(TEXT("lost particle detected"), CheckConservation(69, 10, 20, 100));
 	TestFalse(TEXT("despawn without spawn detected"), CheckConservation(0, 0, 1, 0));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidAgeRecyclingTest,
+	"VoxelEarth.Fluid.AgeRecycling", kFluidTestFlags)
+
+bool FVoxelFluidAgeRecyclingTest::RunTest(const FString& Parameters)
+{
+	// CPU mirror of the finalize kernel's effective-max-age math (contract
+	// item 9). The band the subsystem uploads: PopEnd == the emission
+	// backpressure ramp start (kMaxParticles/3 - kMaxParticles/6 = 51,200),
+	// PopStart == 60% of that. Pinned here with those real numbers so a
+	// drifted constant fails a test instead of shipping as a re-jammed loop.
+	using VoxelFluidSim::EffectiveMaxAgeSec;
+	using VoxelFluidSim::kAgeScaleFloor;
+	constexpr uint32 PopEnd = 51200;                       // emission ramp start
+	constexpr uint32 PopStart = (PopEnd * 3u) / 5u;        // 60% of it = 30,720
+	constexpr float MaxAge = 75.0f;
+
+	// Full age at and below the start of the band: pockets refresh slowly.
+	TestEqual(TEXT("empty sim -> full age"), EffectiveMaxAgeSec(0, PopStart, PopEnd, MaxAge), MaxAge);
+	TestEqual(TEXT("at PopStart -> full age"),
+	          EffectiveMaxAgeSec(PopStart, PopStart, PopEnd, MaxAge), MaxAge);
+
+	// Linear inside the band; strictly monotone non-increasing.
+	const float Mid = EffectiveMaxAgeSec((PopStart + PopEnd) / 2, PopStart, PopEnd, MaxAge);
+	TestTrue(TEXT("mid-band shorter than full"), Mid < MaxAge);
+	TestTrue(TEXT("mid-band above floor"), Mid > MaxAge * kAgeScaleFloor);
+	TestTrue(TEXT("mid-band is the linear midpoint"),
+	         FMath::IsNearlyEqual(Mid, MaxAge * 0.5f, MaxAge * 0.01f));
+
+	// At and past PopEnd: floored, never zero and never negative -- a burst
+	// over the band drains at a bounded pace instead of flushing instantly.
+	TestTrue(TEXT("at PopEnd -> floor"),
+	         FMath::IsNearlyEqual(EffectiveMaxAgeSec(PopEnd, PopStart, PopEnd, MaxAge),
+	                              MaxAge * kAgeScaleFloor, 1.0e-4f));
+	TestTrue(TEXT("far past PopEnd stays at the floor"),
+	         FMath::IsNearlyEqual(EffectiveMaxAgeSec(VoxelFluidSim::kMaxParticles, PopStart, PopEnd, MaxAge),
+	                              MaxAge * kAgeScaleFloor, 1.0e-4f));
+
+	// Degenerate upload (start == end) must not divide by zero.
+	const float Degenerate = EffectiveMaxAgeSec(1000, 500, 500, MaxAge);
+	TestTrue(TEXT("degenerate band -> finite, floored"),
+	         Degenerate >= MaxAge * kAgeScaleFloor && Degenerate <= MaxAge);
+
+	// THE PROPERTY THE FIX RESTS ON (round-6 jam): at the round-6 inflow
+	// (~1,340 particles/s unthrottled demand), sustainable population --
+	// inflow x effective age -- must be BELOW the emission ramp start at the
+	// ramp start itself, so population can never hold at the ramp and the
+	// faucets never throttle. Then walk the actual dynamics
+	// (dP/dt = inflow - P / effAge(P)) and confirm it settles under the ramp.
+	{
+		const float Demand = 1340.0f;
+		TestTrue(TEXT("recycling outpaces round-6 demand at the ramp start"),
+		         Demand * EffectiveMaxAgeSec(PopEnd, PopStart, PopEnd, MaxAge) < float(PopEnd));
+
+		float Pop = 0.0f;
+		const float Dt = 0.1f;
+		for (int32 It = 0; It < 20000; ++It) // 2,000 sim-seconds
+		{
+			const float Age = EffectiveMaxAgeSec(uint32(Pop), PopStart, PopEnd, MaxAge);
+			Pop = FMath::Max(0.0f, Pop + (Demand - Pop / Age) * Dt);
+		}
+		TestTrue(TEXT("round-6 demand settles below the emission ramp start"),
+		         Pop < float(PopEnd));
+		TestTrue(TEXT("...and above the full-age band (the valve is actually working)"),
+		         Pop > float(PopStart));
+	}
 	return true;
 }
 

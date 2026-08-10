@@ -70,7 +70,12 @@ async function boot() {
   wire();
   const want = /#seed=(\d+)/.exec(location.hash);
   if (want) state.pendingOpen = Number(want[1]);
-  generate();
+  const tab = /#tab=(\w+)/.exec(location.hash);
+  // generate() switches to the gallery when its response lands, so a deep-linked
+  // tab has to be applied after it resolves or the gallery wins the race.
+  generate().then(() => {
+    if (tab && tab[1] === "biomes") { showTab("biomes"); refreshCoverage(); }
+  });
 }
 
 async function loadSpec(name) {
@@ -508,10 +513,51 @@ function openLibraryDetail(id, seed, name) {
 
 function showTab(which) {
   state.tab = which;
-  $("gallery").classList.toggle("hidden", which !== "gallery");
-  $("library").classList.toggle("hidden", which !== "library");
-  $("tabGallery").classList.toggle("on", which === "gallery");
-  $("tabLibrary").classList.toggle("on", which === "library");
+  for (const [id, tab] of [["gallery","tabGallery"],["library","tabLibrary"],["biomes","tabBiomes"]]) {
+    $(id).classList.toggle("hidden", which !== id);
+    $(tab).classList.toggle("on", which === id);
+  }
+}
+
+/* --- biome coverage ----------------------------------------------------- */
+
+async function refreshCoverage() {
+  const c = await fetch("/api/coverage").then((r) => r.json());
+  const cards = c.biomes.map((b) => {
+    if (!b.plantable) {
+      return `<div class="biome none"><h3>${escape(b.label)}<span class="count">no trees</span></h3>
+        <div class="climate">${escape(b.climate)}</div></div>`;
+    }
+    // A biome with species but none approved is as much a gap as one with no
+    // species at all — say both out loud rather than only counting rows.
+    const gap = b.species.length === 0
+      ? "no species authored for this biome yet"
+      : b.kept === 0 ? "species exist but none approved to the library yet" : "";
+    const rows = b.species.map((s) => `
+      <div class="sp" data-species="${escape(s.name)}">
+        <span class="spname">${escape(s.name)}</span>
+        <span class="spbar"><i style="width:${Math.round(s.weight * 100)}%"></i></span>
+        <span class="spkept${s.kept ? "" : " zero"}">${s.kept ? s.kept + " kept" : "0 kept"}</span>
+      </div>`).join("");
+    return `<div class="biome${b.species.length ? (b.kept ? "" : " empty") : " empty"}">
+      <h3>${escape(b.label)}<span class="count">${b.species.length} species · ${b.kept} approved</span></h3>
+      <div class="climate">${escape(b.climate)} · surface ${escape(b.surface)}</div>
+      ${gap ? `<div class="warn">${gap}</div>` : ""}
+      ${rows}</div>`;
+  });
+  if (c.unassigned.length) {
+    cards.push(`<div class="biome empty"><h3>Unassigned<span class="count">${c.unassigned.length}</span></h3>
+      <div class="warn">no biome weight set — these will never be placed</div>
+      ${c.unassigned.map((n) => `<div class="sp" data-species="${escape(n)}"><span class="spname">${escape(n)}</span></div>`).join("")}</div>`);
+  }
+  $("biomes").innerHTML = cards.join("");
+  $("biomes").querySelectorAll("[data-species]").forEach((el) => {
+    el.onclick = async () => {
+      $("species").value = el.dataset.species;
+      await loadSpec(el.dataset.species);
+      generate();
+    };
+  });
 }
 
 let toastTimer = null;
@@ -564,6 +610,7 @@ function wire() {
   $("viewReset").onclick = () => state.viewer?.reset();
   $("tabGallery").onclick = () => showTab("gallery");
   $("tabLibrary").onclick = () => { showTab("library"); refreshLibrary(); };
+  $("tabBiomes").onclick = () => { showTab("biomes"); refreshCoverage(); };
   $("closeDetail").onclick = () => $("overlay").classList.add("hidden");
   $("overlay").onclick = (e) => { if (e.target === $("overlay")) $("overlay").classList.add("hidden"); };
   document.addEventListener("keydown", (e) => {

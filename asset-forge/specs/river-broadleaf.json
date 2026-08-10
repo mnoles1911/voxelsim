@@ -1,4 +1,14 @@
 {
+  "biomes": {
+    "beach": 0.0,
+    "desert": 0.0,
+    "grassland": 0.0,
+    "rainforest": 0.2,
+    "savanna": 0.0,
+    "taiga": 0.0,
+    "temperate_forest": 0.8,
+    "tundra_alpine": 0.0
+  },
   "crown": {
     "center_frac": 0.68,
     "height_frac": 0.66,
@@ -12,13 +22,23 @@
   },
   "foliage": {
     "clump_jitter": 0.4,
-    "clump_radius_m": 0.32,
+    "clump_radius_m": 0.6,
     "coverage": 0.9,
     "density": 0.58,
     "droop_m": 0.35,
     "enabled": true,
     "min_order": 2,
+    "separation": 1.8,
     "squash": 1.15
+  },
+  "frond": {
+    "count": 14,
+    "dead": 0.15,
+    "droop": 1.15,
+    "irregular": 0.25,
+    "length_m": 2.6,
+    "rise": 0.85,
+    "width_m": 0.55
   },
   "growth": {
     "gravity": -0.32,
@@ -27,6 +47,7 @@
     "jitter": 0.07,
     "kill_m": 0.34,
     "max_iter": 260,
+    "model": "colonize",
     "phototropism": 0.04,
     "radius_exp": 2.2,
     "step_m": 0.26,
@@ -40,6 +61,31 @@
   },
   "name": "river-broadleaf",
   "notes": "Big dense drooping broadleaf for riverbanks and wet ground. NOT a weeping willow: a true willow needs long trailing strands, which needs a strand pass in the generator (see docs/tree-asset-generator-plan.md). Named for what it actually is.",
+  "placement": {
+    "abundance": 0.5,
+    "cluster": 0.5,
+    "elev_max_m": 700.0,
+    "elev_min_m": 0.0,
+    "slope_max_pct": 25.0,
+    "spacing_m": 8.0,
+    "water_max_m": 60.0
+  },
+  "resolution_cm": "10",
+  "roots": {
+    "count": 0,
+    "irregular": 0.3,
+    "length_m": 1.8,
+    "rise": 0.35,
+    "thickness": 0.55
+  },
+  "strand": {
+    "count": 0,
+    "drift": 0.16,
+    "from_frac": 0.35,
+    "length_m": 2.5,
+    "outer": 0.7,
+    "spread": 0.18
+  },
   "trunk": {
     "buttress": 0.35,
     "clear_frac": 0.3,
@@ -58,5 +104,16 @@
     "rotate": true,
     "shape": 0.12,
     "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
   }
 }

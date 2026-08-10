@@ -58,8 +58,25 @@ FIRST_PROPOSED = 16
 
 # Names used in species specs. Specs never carry raw integers, so if the engine
 # picks different numbers only this file changes.
+# Terrain materials the ENGINE ALREADY HAS. Worth stating plainly: a rock asset
+# needs no new material at all -- it is made of the same rock, gravel and sand
+# the terrain is made of, so rocks can be stamped into the world the moment the
+# streaming bound accepts solids above the surface, without waiting on the
+# material append that trees need.
 BY_NAME = {
     "air": MAT_AIR,
+    "bedrock": MAT_BEDROCK,
+    "rock": MAT_ROCK,
+    "gravel": MAT_GRAVEL,
+    "sand": MAT_SAND,
+    "subsoil": MAT_SUBSOIL,
+    "topsoil": MAT_TOPSOIL,
+    "snow": MAT_SNOW,
+    "grass": MAT_GRASS,
+    "podzol": MAT_PODZOL,
+    "permafrost": MAT_PERMAFROST,
+    "mud": MAT_MUD,
+    "clay": MAT_CLAY,
     "bark": MAT_BARK,
     "heartwood": MAT_HEARTWOOD,
     "deadwood": MAT_DEADWOOD,

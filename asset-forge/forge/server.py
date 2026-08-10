@@ -29,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import contact, materials, pipeline, render, spec as specmod, vox, vxa
+from . import biomes as biomelib, contact, materials, pipeline, render, spec as specmod, vox, vxa
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = Path(__file__).resolve().parent / "web"
@@ -344,6 +344,43 @@ class Handler(BaseHTTPRequestHandler):
                 {str(m): list(materials.color(m)) for m in sorted(materials.COLORS)}
             )
 
+        if path == "/api/coverage":
+            # One row per biome: which species claim it and how many approved
+            # trees exist. This is the view that answers "what am I missing?",
+            # which nothing else in the app does.
+            kept: dict[str, int] = {}
+            for entry in library_list():
+                kept[entry.get("species", "")] = kept.get(entry.get("species", ""), 0) + 1
+
+            loaded = []
+            for sp in sorted(SPECS.glob("*.json")):
+                s, _ = specmod.load(sp)
+                loaded.append((specmod.get(s, "name"), s))
+
+            rows = []
+            for b in biomelib.BIOMES:
+                members = []
+                if b.plantable:
+                    for name, s in loaded:
+                        w = float(specmod.get(s, f"biomes.{b.key}") or 0.0)
+                        if w > 0:
+                            members.append({
+                                "name": name, "weight": w,
+                                "kept": kept.get(name, 0),
+                                "height_m": specmod.get(s, "height_m"),
+                                "model": specmod.get(s, "growth.model"),
+                            })
+                    members.sort(key=lambda m: -m["weight"])
+                rows.append({
+                    "id": b.id, "key": b.key, "label": b.label,
+                    "surface": b.surface, "climate": b.climate,
+                    "plantable": b.plantable,
+                    "species": members,
+                    "kept": sum(m["kept"] for m in members),
+                })
+            unassigned = [n for n, s in loaded if not biomelib.weights(s)]
+            return self._json({"biomes": rows, "unassigned": unassigned})
+
         if path == "/api/specs":
             out = []
             for p in sorted(SPECS.glob("*.json")):
@@ -356,6 +393,7 @@ class Handler(BaseHTTPRequestHandler):
                         "height_m": specmod.get(s, "height_m"),
                         "shape": specmod.get(s, "crown.shape"),
                         "notes": specmod.get(s, "notes"),
+                        "biomes": biomelib.summary(s),
                     }
                 )
             return self._json(out)

@@ -224,3 +224,30 @@ main { flex: 1; display: flex; min-height: 0; }
 }
 
 .askedit.miss { color: var(--warn); }
+
+
+/* --- biome coverage --- */
+
+.coverage {
+  flex: 1; overflow-y: auto; padding: 14px;
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  align-content: start;
+}
+.biome {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 12px 14px;
+}
+.biome.empty { border-color: #4a3a24; }
+.biome.none { opacity: .55; }
+.biome h3 { margin: 0 0 2px; font-size: 14px; display: flex; gap: 8px; align-items: baseline; }
+.biome h3 .count { color: var(--dim); font-weight: 400; font-size: 12px; margin-left: auto; }
+.biome .climate { color: var(--dim); font-size: 11px; margin-bottom: 9px; }
+.biome .warn { color: var(--warn); font-size: 11px; margin-bottom: 8px; }
+.sp { display: flex; align-items: center; gap: 8px; margin: 4px 0; cursor: pointer; font-size: 12px; }
+.sp:hover .spname { color: var(--accent2); }
+.spname { flex: 0 0 auto; }
+.spbar { flex: 1; height: 5px; background: var(--panel2); border-radius: 3px; overflow: hidden; }
+.spbar i { display: block; height: 100%; background: var(--accent); }
+.spkept { color: var(--dim); font-size: 11px; min-width: 52px; text-align: right; }
+.spkept.zero { color: var(--warn); }

@@ -40,7 +40,14 @@
 // AoS, 32 bytes, two float4s -- coalesced pairs, no packing cleverness until
 // the spike measures a reason for it.
 //   P0: xyz = position UU (origin-relative), w = asuint(flags)
-//   P1: xyz = velocity UU/s,                 w = spawn batch id (float)
+//   P1: xyz = velocity UU/s,                 w = spawn time, game seconds (float)
+// P1.w REPURPOSED (recycling pass, item 9 below): it used to carry a float
+// spawn batch id that nothing downstream ever read -- verified before the
+// change: the only GPU reads of P1.w were the finalize write-backs carrying it
+// unchanged, the renderer reads P0 only (VoxelFluidRender.usf:186-195), and
+// the CPU debug decode used Pos+Flags only. It now carries the particle's
+// spawn time (the host's game-time seconds at the spawn dispatch), which is
+// what the age-based recycling sink in FluidFinalizeMain ages against.
 // Flags (bits of asuint(P0.w)):
 #define VOXEL_FLUID_FLAG_ALIVE       (1u << 0)
 #define VOXEL_FLUID_FLAG_DESPAWN_BASIN    (1u << 1)  // crossed into a basin extent
@@ -56,10 +63,16 @@ struct FVoxelFluidParticle
 //   RWStructuredBuffer<FVoxelFluidParticle> ParticlesRW     (sim passes)
 // plus the live-count buffer:
 //   RWStructuredBuffer<uint> ParticleCounts   [0]=alive, [1]=despawnedBasin,
-//                                             [2]=despawnedBoundary, [3]=spawnedTotal
+//                                             [2]=despawnedBoundary, [3]=spawnedTotal,
+//                                             [4]=despawnedAge (SUBSET of [2] --
+//                                                 telemetry only, see item 9)
 // CONSERVATION IS THE TEST: spawnedTotal - despawnedBasin - despawnedBoundary
 // == alive, asserted every frame on readback. A counter that cannot prove
-// itself is how three false conclusions happened in one session.
+// itself is how three false conclusions happened in one session. [4] is NOT a
+// term of that predicate: every age despawn also increments [2], so the
+// balance -- and the CPU's despawnBoundary -> river-graph units path -- is
+// unchanged; [4] exists so the perf line can say how much of the boundary
+// count was recycling rather than a real spatial exit.
 
 // ---- occupancy volume (collision) -----------------------------------------
 // 1 bit per 10 cm voxel over the active region, 512^3 bits = 16 MB, packed
@@ -193,5 +206,37 @@ struct FVoxelFluidParticle
 //     half a ULP at 5120 UU -- 2.4 um, one fortieth of the collision skin --
 //     when it moves away. Derivation in voxelcore/fluidoccupancy.h, bound
 //     pinned by test_fluidoccupancy.cpp.
+//
+// RATIFIED, RECYCLING PASS (2026-08-10, owner playtest round 6):
+//  9. THE AGE SINK. The round-6 log (Saved/owner-playtest-round6.log) ended
+//     with alive == spawned == 102,297 pinned just under the host's 102,400
+//     emission soft cap, despawnBasin=0, despawnBoundary=0, faucet=0/s: in a
+//     window whose terrain pockets the water before it can walk 25 m to any
+//     face, the only sinks were SPATIAL, nothing ever left, and the closed
+//     loop jammed -- population one-way-ratcheted to the cap and backpressure
+//     throttled every faucet to zero. So the population must turn over by AGE:
+//     FluidFinalizeMain flags an alive particle DESPAWN_BOUNDARY when
+//     NowSeconds - P1.w exceeds the effective max age, counting it in BOTH
+//     ParticleCounts[2] (so conservation and the CPU's boundary-units ->
+//     river-graph credit path apply verbatim -- the oldest water quietly
+//     continues downstream as scalars) and ParticleCounts[4] (so the perf line
+//     can tell recycling from a real boundary exit). Age despawn is tested
+//     AFTER the basin and boundary tests: a particle that reached a real sink
+//     credits that sink.
+//
+//     THE EFFECTIVE AGE IS POPULATION-SCALED so the age valve is fully open
+//     BEFORE the emission throttle would engage: full MaxAgeSec (host cvar
+//     voxel.Fluid.MaxAgeSec, default 75 s, 0 = off) at populations up to
+//     AgePopStart, falling linearly to a 0.1 floor at AgePopEnd, where the
+//     host sets AgePopEnd == the population its emission backpressure ramp
+//     STARTS at and AgePopStart == 60 % of that. Anchoring to the ramp start
+//     (not the soft cap) is the whole point: equilibrium population
+//     (inflow x effective age) lands BELOW the ramp, so in normal play the
+//     faucets never throttle and visible steady state is emission rate ==
+//     recycling rate. Population is read from SortedCount[0] (this frame's
+//     hashed-alive count -- already bound in finalize, exact, no readback
+//     round-trip). Scale math mirrored and pinned CPU-side:
+//     VoxelFluidSim::EffectiveMaxAgeSec + the VoxelEarth.Fluid.AgeRecycling
+//     automation test.
 
 #endif // VOXEL_FLUID_CONTRACT_USH

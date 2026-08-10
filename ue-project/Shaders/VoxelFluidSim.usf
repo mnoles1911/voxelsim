@@ -64,11 +64,14 @@
 #define VOXEL_FLUID_GRAVITY_UU        980.0f
 
 // Poly6 normalisation, 315 / (64 * pi * h^9) with h = 25 UU (contract line 33).
-// h^9 = 3.8146973e12; 64*pi*h^9 = 7.67034e14. The C++ mirror
+// h^9 = 3.8146973e12; 64*pi*h^9 = 7.66990e14. The C++ mirror
 // (VoxelFluidSim.cpp, VoxelFluidSim::kPoly6CoeffUU) re-derives this in double
 // precision and an automation test pins the two against each other, so a
 // drifted literal fails a test instead of shipping a subtly wrong density.
-#define VOXEL_FLUID_POLY6_COEFF       4.10673e-13f
+// (And it DID: the first value here, 4.10673e-13 off a mis-multiplied
+// 7.67034e14, sat 5.6e-5 relative from the derivation -- caught the first
+// time the KernelCoefficients test actually ran headless, recycling pass.)
+#define VOXEL_FLUID_POLY6_COEFF       4.10696e-13f
 
 // Spiky gradient magnitude, 45 / (pi * h^6). h^6 = 2.44140625e8;
 // pi*h^6 = 7.6699039e8. Mirrored and tested the same way as the poly6 coeff.
@@ -99,6 +102,13 @@
 // step keeps the fallback plane reliable while letting a dam break look like
 // one. The real collision pass owns its own tunneling story (plan spike c).
 #define VOXEL_FLUID_MAX_SPEED_UU      2000.0f
+
+// Age-sink scale floor (contract item 9): the population-scaled effective max
+// age never drops below this fraction of MaxAgeSec, so a burst that overshoots
+// AgePopEnd drains at a bounded pace instead of flushing everything older
+// than an instant. Mirrored CPU-side as VoxelFluidSim::kAgeScaleFloor and
+// pinned by the AgeRecycling automation test.
+#define VOXEL_FLUID_AGE_SCALE_FLOOR   0.1f
 
 // ---- hash grid -------------------------------------------------------------
 // 2^16 buckets. Chosen to be exactly VOXEL_FLUID_SCAN_BLOCK^2 so the house
@@ -153,12 +163,26 @@ uint   BasinSinkEnabled;
 float3 BasinBoxMinLocalUU;
 float3 BasinBoxMaxLocalUU;
 float  BasinDatumZLocalUU;
+// ---- age sink (contract item 9): population-scaled recycling ---------------
+// MaxAgeSec <= 0 disables the age test entirely (cvar voxel.Fluid.MaxAgeSec 0).
+// NowSeconds is the host's game time this tick -- the same clock the spawn
+// pass stamps into P1.w, so age = NowSeconds - P1.w needs no epoch bookkeeping.
+// AgePopStart/AgePopEnd are the population band over which the effective age
+// shrinks from full MaxAgeSec to the VOXEL_FLUID_AGE_SCALE_FLOOR fraction; the
+// host anchors AgePopEnd at its emission backpressure ramp START so recycling
+// is fully open before any faucet would throttle.
+float  NowSeconds;
+float  MaxAgeSec;
+uint   AgePopStart;
+uint   AgePopEnd;
 float  RestDensity;         // computed CPU-side from the rest lattice (see .cpp)
 uint   SpawnCount;
 uint   SpawnMode;
 uint   SpawnSeed;
 uint   SpawnEdge;           // lattice edge (block mode): SpawnEdge^3 >= SpawnCount
-float  SpawnBatchId;
+// Game-time seconds at this spawn dispatch, written to every spawned
+// particle's P1.w (its spawn time -- the age sink's birth stamp).
+float  SpawnTimeSec;
 float3 SpawnCenterLocalUU;
 float3 SpawnVelUU;
 // Faucet mode only: unit direction of the emission LINE, host-computed as the
@@ -450,7 +474,7 @@ void FluidSpawnMain(uint3 DTid : SV_DispatchThreadID)
 
 	FVoxelFluidParticle P;
 	P.P0 = float4(pos, asfloat(VOXEL_FLUID_FLAG_ALIVE));
-	P.P1 = float4(vel, SpawnBatchId);
+	P.P1 = float4(vel, SpawnTimeSec); // w = spawn time (contract: P1.w)
 	ParticlesRW[slot] = P;
 	InterlockedAdd(ParticleCounts[3], 1u); // spawnedTotal
 }
@@ -812,7 +836,11 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 //      Tested BEFORE the boundary so a basin clipped against the region edge
 //      credits the lake rather than leaking into the graph;
 //   4. boundary despawn (left the active box) -> flag, counter, free list;
-//   5. survivors count into ParticleCounts[0] and write back position+velocity.
+//   5. AGE despawn (contract item 9): older than the population-scaled max
+//      age -> DESPAWN_BOUNDARY flag, ParticleCounts[2] AND [4], free list.
+//      Last among the sinks on purpose: water that reached a real sink this
+//      frame credits that sink, age only recycles what is still pooling;
+//   6. survivors count into ParticleCounts[0] and write back position+velocity.
 //
 // SORTED DOMAIN: one thread per sorted entry, mapped back to its slot through
 // CellEntries (the sorted -> slot map the scatter built). Alive slots and
@@ -910,6 +938,44 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		// lint-shader-ub: allow UNGUARDED_WRITE - same CellEntries slot-id bound as the basin write above
 		ParticlesRW[i] = P;
 		return;
+	}
+
+	// Age recycling (contract item 9; owner playtest round 6 -- the closed-loop
+	// jam). Water the terrain pockets never reaches a spatial sink, so the
+	// population must turn over by age or emission ratchets into the soft cap
+	// and throttles to zero. The flag and ParticleCounts[2] are EXACTLY the
+	// boundary despawn's -- the CPU routes the volume into the river graph
+	// through the unchanged despawnBoundary units path -- plus [4] so the perf
+	// line can name the share that was recycling. The effective age shrinks as
+	// the population approaches AgePopEnd (the host's emission ramp start), so
+	// the valve is fully open before any faucet would throttle; below
+	// AgePopStart the full MaxAgeSec applies and pockets refresh slowly.
+	if (MaxAgeSec > 0.0f)
+	{
+		const uint pop = InSortedCount[0];
+		float ageScale = 1.0f;
+		if (pop > AgePopStart)
+		{
+			// max(...,1u) guards a degenerate upload (start == end); overshoot
+			// past AgePopEnd clamps at the floor rather than going negative.
+			const float t = float(pop - AgePopStart) / float(max(AgePopEnd - AgePopStart, 1u));
+			ageScale = max(1.0f - t, VOXEL_FLUID_AGE_SCALE_FLOOR);
+		}
+		if (NowSeconds - P.P1.w > MaxAgeSec * ageScale)
+		{
+			flags = VOXEL_FLUID_FLAG_DESPAWN_BOUNDARY; // ALIVE cleared by assignment
+			InterlockedAdd(ParticleCounts[2], 1u); // boundary: conservation + units path unchanged
+			InterlockedAdd(ParticleCounts[4], 1u); // recycle telemetry (subset of [2])
+			uint top;
+			InterlockedAdd(SlotCounters[0], 1u, top);
+			// lint-shader-ub: allow UNGUARDED_WRITE - same freelist cursor argument as the basin branch above
+			FreeList[top] = i;
+			P.P0 = float4(pNew, asfloat(flags));
+			P.P1 = float4(v, P.P1.w);
+			// lint-shader-ub: allow UNGUARDED_WRITE - same CellEntries slot-id bound as the basin write above
+			ParticlesRW[i] = P;
+			return;
+		}
 	}
 
 	InterlockedAdd(ParticleCounts[0], 1u); // alive

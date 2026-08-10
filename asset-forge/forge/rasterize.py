@@ -89,6 +89,16 @@ def foliage(
     if cand.size == 0:
         return 0
 
+    # Thin the candidates so clump centres keep their distance BEFORE the
+    # coverage roll. Picking twigs at random and hoping for gaps does not work:
+    # twigs are dense, so any coverage high enough to fill the crown also packs
+    # the clumps until they fuse. Enforcing a minimum separation is what gives a
+    # canopy distinct masses with daylight between them.
+    separation = float(get(spec, "foliage.separation"))
+    min_dist = float(get(spec, "foliage.clump_radius_m")) * separation
+    if min_dist > 0.0 and cand.size > 1:
+        cand = cand[_thin_by_distance(skel.pos[cand], min_dist, rng)]
+
     if coverage < 1.0:
         cand = cand[rng.random(cand.size) < coverage]
     if cand.size == 0:
@@ -109,6 +119,43 @@ def foliage(
         )
         placed += 1
     return placed
+
+
+def _thin_by_distance(points: np.ndarray, min_dist: float, rng) -> np.ndarray:
+    """Greedy dart-throwing: keep points no closer than `min_dist` to each other.
+
+    Visits candidates in random order and accepts one only if nothing already
+    accepted is within the radius, using a spatial hash so the check stays local
+    rather than comparing against every accepted point.
+    """
+    cell = max(min_dist, 1e-6)
+    buckets: dict[tuple[int, int, int], list[int]] = {}
+    keep: list[int] = []
+    r2 = min_dist * min_dist
+
+    for i in rng.permutation(points.shape[0]):
+        p = points[i]
+        cx, cy, cz = (int(np.floor(p[0] / cell)), int(np.floor(p[1] / cell)),
+                      int(np.floor(p[2] / cell)))
+        clash = False
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    for j in buckets.get((cx + dx, cy + dy, cz + dz), ()):
+                        d = points[j] - p
+                        if float(d @ d) < r2:
+                            clash = True
+                            break
+                    if clash:
+                        break
+                if clash:
+                    break
+            if clash:
+                break
+        if not clash:
+            buckets.setdefault((cx, cy, cz), []).append(int(i))
+            keep.append(int(i))
+    return np.asarray(sorted(keep), dtype=np.int64)
 
 
 def frond_blades(
