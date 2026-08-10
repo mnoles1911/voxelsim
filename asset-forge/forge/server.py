@@ -29,7 +29,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from . import biomes as biomelib, contact, materials, pipeline, render, spec as specmod, vox, vxa
+from . import (biomes as biomelib, contact, kinds as kindlib, materials, pipeline,
+               render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = Path(__file__).resolve().parent / "web"
@@ -40,12 +41,22 @@ TILE_PX = 260
 DETAIL_PX = 820
 MAX_JOBS = 6
 
-# Gallery tiles always generate at a COARSE resolution regardless of what the
-# species is authored at. The skeleton is resolution-independent, so a 10 cm
-# preview and a 2 cm export are the same tree sampled differently -- and a
-# twelve-tile gallery at 2 cm would be a minute of compute for detail no
-# 260-pixel thumbnail can show.
-PREVIEW_CM = float(os.environ.get("ASSET_FORGE_PREVIEW_CM", "10"))
+# Gallery tiles generate at whatever resolution is AFFORDABLE, not at a fixed
+# one. The skeleton is resolution-independent, so a preview and an export are
+# the same asset sampled differently, and a twelve-tile gallery of 2 cm trees
+# would be a minute of compute for detail no 260-pixel thumbnail can show.
+#
+# But a fixed 10 cm floor was wrong in the other direction and worse: a 1 m
+# bush at 10 cm is ten voxels tall, so every shrub in the gallery previewed as
+# an unreadable smudge no matter how it was authored. Cost is what actually
+# matters, and cost is cells, so budget cells. A big tree lands on 10 cm and a
+# small shrub lands on 2 cm from the same rule.
+PREVIEW_CELLS = int(os.environ.get("ASSET_FORGE_PREVIEW_CELLS", "6000000"))
+PREVIEW_CM = float(os.environ.get("ASSET_FORGE_PREVIEW_CM", "10"))   # coarsest tier
+
+# The tiers a preview may land on, finest first. Authored resolutions coarser
+# than a tier are never refined up to it.
+PREVIEW_TIERS = (1.0, 2.0, 2.5, 5.0, 10.0)
 
 # Ceiling on instances sent to the browser's 3D viewer. Above this the voxels
 # are thinned by a fixed stride -- a 2 cm emergent has tens of millions of
@@ -129,10 +140,7 @@ class Forge:
     def start(self, spec: dict, seeds: list[int]) -> Job:
         # One scale for the whole batch so tiles are comparable by size, the
         # same reason contact sheets do it.
-        # The COARSER of the two: previews never go finer than PREVIEW_CM, but a
-        # species authored coarser than that is previewed as authored rather
-        # than being needlessly refined.
-        preview_cm = max(PREVIEW_CM, float(specmod.get(spec, "resolution_cm")))
+        preview_cm = preview_resolution(spec)
         scale = render.scale_for(
             [render.predicted_extent(spec, preview_cm / 100.0)], TILE_PX
         )
@@ -206,7 +214,29 @@ def encode_voxels(grid) -> bytes:
     return header + pos.tobytes() + mats.tobytes()
 
 
-def viewer_resolution(spec: dict) -> float:
+def _finest_within(spec: dict, budget: float, weight: float) -> float:
+    """Finest tier at or coarser than the authored size that fits `budget`.
+
+    `weight` converts a bounding box into the thing being budgeted -- 1.0 to
+    budget grid cells, or the measured surface fraction to budget the instances
+    the browser has to draw.
+    """
+    authored = float(specmod.get(spec, "resolution_cm"))
+    for cm in PREVIEW_TIERS:
+        if cm < authored:
+            continue
+        nx, ny, nz = render.predicted_extent(spec, cm / 100.0)
+        if nx * ny * nz * weight <= budget:
+            return cm
+    return max(PREVIEW_CM, authored)
+
+
+def preview_resolution(spec: dict) -> float:
+    """Voxel size for gallery tiles."""
+    return _finest_within(spec, PREVIEW_CELLS, 1.0)
+
+
+def viewer_resolution(spec: dict, budget: int | None = None) -> float:
     """Finest voxel size the browser can be asked to draw for this species.
 
     Never finer than the species is authored at, and never so fine that the
@@ -214,18 +244,17 @@ def viewer_resolution(spec: dict) -> float:
     tens of millions of surface voxels; showing it at 5 cm is a far better
     answer than shipping 200 MB and stalling the tab. The export is unaffected
     -- this only governs what gets drawn.
+
+    `budget` lets the client ask for less. A phone on wifi with a mobile GPU is
+    not a desktop, and the honest answer is to send it a coarser lattice rather
+    than the same one more slowly.
     """
-    authored = float(specmod.get(spec, "resolution_cm"))
-    for cm in sorted({authored, 2.5, 5.0, 10.0}):
-        if cm < authored:
-            continue
-        nx, ny, nz = render.predicted_extent(spec, cm / 100.0)
-        # Measured: a tree's surface voxels come to about 2.3% of its bounding
-        # box (an oak at 5 cm is 436k surface out of 18.7M cells). Good enough
-        # to pick a tier; the tier only has to be roughly right.
-        if nx * ny * nz * 0.023 <= MAX_VIEWER_VOXELS:
-            return cm
-    return 10.0
+    budget = MAX_VIEWER_VOXELS if budget is None else max(
+        50_000, min(MAX_VIEWER_VOXELS, int(budget)))
+    # Measured: an asset's surface voxels come to about 2.3% of its bounding box
+    # (an oak at 5 cm is 436k surface out of 18.7M cells). Good enough to pick a
+    # tier; the tier only has to be roughly right.
+    return _finest_within(spec, budget, 0.023)
 
 
 def keep(spec: dict, seed: int) -> dict:
@@ -248,6 +277,7 @@ def keep(spec: dict, seed: int) -> dict:
     meta = {
         "id": entry_id,
         "species": name,
+        "kind": specmod.get(spec, "kind"),
         "seed": seed,
         "spec_hash": specmod.spec_hash(spec),
         "stats": tree.stats,
@@ -264,9 +294,19 @@ def library_list() -> list[dict]:
     entries = []
     for meta_path in sorted(LIBRARY.glob("*/*/meta.json")):
         try:
-            entries.append(json.loads(meta_path.read_text(encoding="utf-8")))
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
+        # Entries kept before kinds existed have no `kind`; read it back off the
+        # saved spec rather than assuming, so an old library scopes correctly
+        # instead of piling everything into the tree tab.
+        if "kind" not in meta:
+            try:
+                s, _ = specmod.load(meta_path.parent / "spec.json")
+                meta["kind"] = specmod.get(s, "kind")
+            except (OSError, json.JSONDecodeError, KeyError):
+                meta["kind"] = "tree"
+        entries.append(meta)
     entries.sort(key=lambda m: (m.get("species", ""), m.get("seed", 0)))
     return entries
 
@@ -332,7 +372,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._static(path[len("/static/") :])
 
         if path == "/api/schema":
-            return self._json({"params": specmod.ui_schema(), "groups": list(specmod.GROUPS)})
+            # Scoped to a kind when asked. The sliders a rock has nothing to do
+            # with are not disabled or greyed, they are absent -- a designer
+            # authoring boulders should never scroll past a foliage section.
+            kind = q.get("kind") or None
+            return self._json({
+                "kind": kind,
+                "params": specmod.ui_schema(kind),
+                "groups": [g for g in specmod.GROUPS
+                           if not kind or g in kindlib.groups_for(kind)],
+            })
+
+        if path == "/api/kinds":
+            return self._json([
+                {"key": k.key, "label": k.label, "blurb": k.blurb, "ready": k.ready,
+                 "species": sum(1 for _, s in self._all_specs()
+                                if specmod.get(s, "kind") == k.key)}
+                for k in kindlib.KINDS
+            ])
 
         if path == "/api/vocabulary":
             from . import language
@@ -346,52 +403,65 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/coverage":
             # One row per biome: which species claim it and how many approved
-            # trees exist. This is the view that answers "what am I missing?",
-            # which nothing else in the app does.
+            # assets exist. This is the view that answers "what am I missing?",
+            # which nothing else in the app does. Scoped by kind, because
+            # "tundra has nothing" is a different job from "tundra has no
+            # boulders" and mixing them hides both.
+            want = q.get("kind") or None
             kept: dict[str, int] = {}
             for entry in library_list():
                 kept[entry.get("species", "")] = kept.get(entry.get("species", ""), 0) + 1
 
-            loaded = []
-            for sp in sorted(SPECS.glob("*.json")):
-                s, _ = specmod.load(sp)
-                loaded.append((specmod.get(s, "name"), s))
+            loaded = [(specmod.get(s, "name"), specmod.get(s, "kind"), s)
+                      for _, s in self._all_specs()
+                      if not want or specmod.get(s, "kind") == want]
 
             rows = []
             for b in biomelib.BIOMES:
                 members = []
-                if b.plantable:
-                    for name, s in loaded:
+                hosts = bool(b.hosts) and (not want or want in b.hosts)
+                if hosts:
+                    for name, kind, s in loaded:
                         w = float(specmod.get(s, f"biomes.{b.key}") or 0.0)
                         if w > 0:
                             members.append({
-                                "name": name, "weight": w,
+                                "name": name, "weight": w, "kind": kind,
                                 "kept": kept.get(name, 0),
-                                "height_m": specmod.get(s, "height_m"),
-                                "model": specmod.get(s, "growth.model"),
+                                "size_m": (specmod.get(s, "rock.size_m") if kind == "rock"
+                                           else specmod.get(s, "height_m")),
+                                "model": (kind if kind == "rock"
+                                          else specmod.get(s, "growth.model")),
                             })
                     members.sort(key=lambda m: -m["weight"])
                 rows.append({
                     "id": b.id, "key": b.key, "label": b.label,
                     "surface": b.surface, "climate": b.climate,
-                    "plantable": b.plantable,
+                    "plantable": b.plantable, "hosts": hosts,
                     "species": members,
                     "kept": sum(m["kept"] for m in members),
                 })
-            unassigned = [n for n, s in loaded if not biomelib.weights(s)]
-            return self._json({"biomes": rows, "unassigned": unassigned})
+            unassigned = [n for n, _, s in loaded if not biomelib.weights(s)]
+            return self._json({"kind": want, "biomes": rows, "unassigned": unassigned})
 
         if path == "/api/specs":
+            want = q.get("kind") or None
             out = []
-            for p in sorted(SPECS.glob("*.json")):
-                s, _ = specmod.load(p)
+            for p, s in self._all_specs():
+                kind = specmod.get(s, "kind")
+                if want and kind != want:
+                    continue
                 out.append(
                     {
                         "name": specmod.get(s, "name"),
                         "file": p.name,
+                        "kind": kind,
                         "hash": specmod.spec_hash(s),
+                        "size_m": (specmod.get(s, "rock.size_m") if kind == "rock"
+                                   else specmod.get(s, "height_m")),
                         "height_m": specmod.get(s, "height_m"),
-                        "shape": specmod.get(s, "crown.shape"),
+                        "resolution_cm": specmod.get(s, "resolution_cm"),
+                        "shape": (specmod.get(s, "materials.rock") if kind == "rock"
+                                  else specmod.get(s, "crown.shape")),
                         "notes": specmod.get(s, "notes"),
                         "biomes": biomelib.summary(s),
                     }
@@ -449,7 +519,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "unknown tree"}, 404)
                 spec, _ = specmod.load(d / "spec.json")
                 seed = json.loads((d / "meta.json").read_text(encoding="utf-8"))["seed"]
-            cm = viewer_resolution(spec)
+            try:
+                cap = int(q["max"]) if q.get("max") else None
+            except ValueError:
+                cap = None
+            cm = viewer_resolution(spec, cap)
             tree = pipeline.build(spec, seed, connectivity=False, resolution_cm=cm)
             body = encode_voxels(tree.grid)
             self.send_response(200)
@@ -593,6 +667,16 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._json({"error": "no such route"}, 404)
 
+    def _all_specs(self) -> list[tuple[Path, dict]]:
+        out = []
+        for p in sorted(SPECS.glob("*.json")):
+            try:
+                s, _ = specmod.load(p)
+            except (OSError, json.JSONDecodeError):
+                continue
+            out.append((p, s))
+        return out
+
     def _spec_from_query(self, q: dict) -> dict:
         p = SPECS / f"{Path(q.get('name', '')).name}.json"
         s, _ = specmod.load(p)
@@ -606,11 +690,61 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), ctype)
 
 
+class Server(ThreadingHTTPServer):
+    """Quiet about clients that hang up.
+
+    A browser that navigates away mid-request, and a phone that sleeps its wifi,
+    both drop the connection, and stdlib's default is a full traceback per drop.
+    On a phone those come in bursts, and a console full of ConnectionResetError
+    buries whatever real error you were watching for.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys
+
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, ConnectionAbortedError,
+                                          BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def lan_address() -> str | None:
+    """This machine's address on the local network, for reaching it by phone.
+
+    Uses a UDP socket to a routable address to find which interface the OS would
+    route out of. Nothing is sent -- connect() on UDP only sets the peer -- but
+    it picks the right interface on a box with several, which reading the
+    hostname does not.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 1))     # TEST-NET-1: reserved, never routed
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
 def serve(host: str = "127.0.0.1", port: int = 8731, open_browser: bool = True) -> None:
     LIBRARY.mkdir(parents=True, exist_ok=True)
-    httpd = ThreadingHTTPServer((host, port), Handler)
-    url = f"http://{host}:{port}/"
+    httpd = Server((host, port), Handler)
+    url = f"http://{'127.0.0.1' if host in ('', '0.0.0.0') else host}:{port}/"
     print(f"asset-forge  {url}")
+    if host in ("", "0.0.0.0"):
+        lan = lan_address()
+        print(f"  phone   http://{lan}:{port}/" if lan else
+              "  phone   (no LAN address found)")
+    else:
+        # Loopback-only is the default on purpose -- the app writes files and
+        # runs unauthenticated -- so say how to reach it from a phone rather
+        # than leaving it looking broken.
+        print("  phone   not reachable; restart with --host 0.0.0.0 to allow "
+              "devices on your network")
     print(f"  specs   {SPECS}")
     print(f"  library {LIBRARY}")
     print("  ctrl-c to stop")

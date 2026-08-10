@@ -165,7 +165,10 @@ PARAMS: tuple[Param, ...] = (
 
     P("foliage.enabled", "Foliage", True, kind="bool", group="foliage"),
     P("foliage.min_order", "Leaves from branch order", 2, 0, 8, 1, kind="int", group="foliage"),
-    P("foliage.clump_radius_m", "Clump radius (m)", 0.65, 0.15, 3.0, 0.05, group="foliage"),
+    P("foliage.clump_radius_m", "Clump radius (m)", 0.65, 0.04, 3.0, 0.01, group="foliage",
+      help="Radius of one leaf mass. The floor is set for 2 cm ground cover, "
+           "not for trees -- a 15 cm floor was fine for an oak and far too "
+           "coarse for a knee-high shrub."),
     P("foliage.density", "Clump density", 0.60, 0.05, 1.0, 0.01, group="foliage"),
     P("foliage.coverage", "Clump coverage", 0.80, 0.0, 1.0, 0.01, group="foliage",
       help="Share of surviving twigs that carry a clump, after separation has "
@@ -237,7 +240,9 @@ PARAMS: tuple[Param, ...] = (
            "distance of a watercourse — riverbank willows and jungle understorey."),
 
     P("rock.size_m", "Size (m)", 1.6, 0.2, 12.0, 0.1, group="rock",
-      help="Longest dimension of the boulder."),
+      help="Longest dimension of the finished stone, after faceting, erosion and "
+           "the burial cut have taken their share. Measured, not estimated, so "
+           "this is what you get."),
     P("rock.lumps", "Lumps", 5, 1, 16, 1, kind="int", group="rock",
       help="How many overlapping masses the rock is built from. One gives a clean "
            "ovoid; more gives a knobbly, weathered boulder."),
@@ -246,14 +251,21 @@ PARAMS: tuple[Param, ...] = (
            "pile rather than a single stone."),
     P("rock.flatten", "Flatten", 0.72, 0.15, 2.0, 0.01, group="rock",
       help="Vertical squash. Below 1 gives a slab; above 1 a standing stone."),
-    P("rock.elongate", "Elongate", 1.25, 0.4, 3.0, 0.01, group="rock"),
+    P("rock.elongate", "Elongate", 1.25, 0.4, 3.0, 0.01, group="rock",
+      help="Stretch along one horizontal axis."),
     P("rock.angular", "Angularity", 0.45, 0.0, 1.0, 0.01, group="rock",
       help="Slices flat faces off the mass. 0 is a rounded river cobble, 1 a "
            "freshly fractured block."),
     P("rock.facets", "Facet count", 4, 0, 10, 1, kind="int", group="rock"),
-    P("rock.erode", "Erosion", 0.35, 0.0, 1.0, 0.01, group="rock",
-      help="Removes weakly-attached voxels, rounding sharp protrusions and "
-           "pitting the surface."),
+    P("rock.rough", "Surface roughness", 0.4, 0.0, 1.0, 0.01, group="rock",
+      help="Pushes the surface in and out before it becomes voxels. This is the "
+           "one that decides whether it reads as stone: at 0 the mass is a "
+           "smooth ellipsoid, and a smooth curve at this voxel size shows clean "
+           "concentric stair-steps that look like a Minecraft sphere. Measured "
+           "as a fraction of the stone's radius."),
+    P("rock.erode", "Erosion", 0.2, 0.0, 1.0, 0.01, group="rock",
+      help="A finishing pass that takes coherent patches off the most exposed "
+           "places. Roughness does the shaping; keep this low."),
     P("rock.bury", "Buried fraction", 0.22, 0.0, 0.7, 0.01, group="rock",
       help="How much of the stone sits below ground. Everything under z=0 is cut "
            "away, so this controls how settled it looks rather than adding volume."),
@@ -354,6 +366,14 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
     # Cross-parameter checks. These are the combinations that produce a tree
     # that generates fine and looks wrong, so they warn rather than clamp.
+    #
+    # Scoped to the kind, because every one of them is about branch growth and a
+    # rock has no branches. Unscoped, saving any rock spec printed a warning
+    # about twig radius -- noise that trains a designer to stop reading warnings,
+    # which is the only thing that makes the real ones useless.
+    if "growth" not in kindlib.groups_for(get(out, "kind")):
+        return out, rep
+
     if get(out, "growth.kill_m") >= get(out, "growth.influence_m"):
         rep.warnings.append(
             "growth.kill_m >= growth.influence_m: targets die before they can pull a "

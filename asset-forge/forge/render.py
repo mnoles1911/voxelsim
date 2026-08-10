@@ -90,14 +90,27 @@ def _occlusion(data: np.ndarray, coords: tuple[np.ndarray, ...]) -> np.ndarray:
 
 
 def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
-    """Roughly how many voxels a tree from this spec will occupy.
+    """Roughly how many voxels an asset from this spec will occupy.
 
-    Used to choose one rendering scale for a whole batch without having to
-    build every tree first and hold them all in memory. It only has to be
-    close: the contact sheet applies a single shrink factor afterwards, so a
-    slightly wrong guess changes the page size, not the relative sizes on it.
+    Used to choose one rendering scale for a whole batch without having to build
+    everything first and hold it all in memory, and to pick a preview
+    resolution. It only has to be close: the contact sheet applies a single
+    shrink factor afterwards, so a slightly wrong guess changes the page size,
+    not the relative sizes on it.
+
+    It does have to be close FOR THE RIGHT KIND, though. Reading a tree's height
+    and crown radius off a rock spec returns the untouched defaults -- a 12 m
+    crown for a half-metre pebble -- and the resolution picker took that at face
+    value and previewed every small stone at the coarsest tier it had.
     """
     from .spec import get  # local import keeps this module free of spec at load
+
+    if get(spec, "kind") == "rock":
+        size = float(get(spec, "rock.size_m"))
+        span = size * max(1.0, float(get(spec, "rock.elongate"))) * (
+            1.0 + float(get(spec, "rock.rubble")) * 1.6) + 0.4
+        tall = size * max(1.0, float(get(spec, "rock.flatten"))) + 0.4
+        return (int(span / voxel_m), int(span / voxel_m), int(tall / voxel_m))
 
     height = float(get(spec, "height_m")) * 1.2
     crown = float(get(spec, "crown.radius_m"))

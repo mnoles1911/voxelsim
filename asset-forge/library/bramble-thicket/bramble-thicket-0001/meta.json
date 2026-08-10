@@ -1,0 +1,46 @@
+{
+  "id": "bramble-thicket-0001",
+  "species": "bramble-thicket",
+  "kind": "bush",
+  "seed": 1,
+  "spec_hash": "07d83ea26af4d3a4",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "07d83ea26af4d3a4",
+    "kind": "bush",
+    "nodes": 189,
+    "segments": 188,
+    "max_order": 3,
+    "iterations": 16,
+    "targets_left": 0,
+    "clumps": 24,
+    "voxel_cm": 2.0,
+    "height_m": 1.5,
+    "footprint_m": [
+      1.76,
+      1.7
+    ],
+    "grid_mb": 1.2,
+    "extent_vox": [
+      88,
+      85,
+      75
+    ],
+    "voxels": 65949,
+    "by_material": {
+      "16": 3057,
+      "17": 52,
+      "19": 62840
+    },
+    "ground_contact": 26,
+    "ms_grow": 13.1,
+    "ms_raster": 62.4,
+    "wood_connected": 1.0,
+    "wood_detached": 0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 94.8
+  },
+  "problems": [],
+  "vox_models": 1
+}

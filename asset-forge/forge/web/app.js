@@ -8,6 +8,8 @@
 const $ = (id) => document.getElementById(id);
 
 const state = {
+  kind: "tree",      // the section being authored; scopes everything below it
+  kinds: [],
   schema: null,
   spec: null,        // live, edited
   saved: null,       // last loaded from disk, for Revert
@@ -37,9 +39,8 @@ function setPath(obj, path, value) {
 /* --- boot --------------------------------------------------------------- */
 
 async function boot() {
-  state.schema = await fetch("/api/schema").then((r) => r.json());
   state.palette = await fetch("/api/palette").then((r) => r.json());
-  const specs = await fetch("/api/specs").then((r) => r.json());
+  state.kinds = await fetch("/api/kinds").then((r) => r.json());
 
   state.viewer = Viewer.create($("detailCanvas"));
   if (!state.viewer) {
@@ -49,10 +50,6 @@ async function boot() {
     state.view = "2d";
   }
 
-  $("species").innerHTML = specs
-    .map((s) => `<option value="${s.name}">${s.name}</option>`)
-    .join("");
-
   fetch("/api/vocabulary")
     .then((r) => r.json())
     .then((v) => {
@@ -60,23 +57,88 @@ async function boot() {
       $("askMsg").textContent = `${v.concepts.length} things I understand`;
     });
 
-  await refreshLibrary();
-  // Open on a representative species rather than whatever sorts first.
-  const first = specs.find((s) => s.name === "temperate-oak") ?? specs[0];
-  if (first) {
-    $("species").value = first.name;
-    await loadSpec(first.name);
-  }
+  buildKindBar();
   wire();
+
+  const wantKind = /#kind=(\w+)/.exec(location.hash);
   const want = /#seed=(\d+)/.exec(location.hash);
   if (want) state.pendingOpen = Number(want[1]);
   const tab = /#tab=(\w+)/.exec(location.hash);
+
+  const kind = state.kinds.find((k) => k.key === wantKind?.[1] && k.ready)?.key ?? "tree";
   // generate() switches to the gallery when its response lands, so a deep-linked
   // tab has to be applied after it resolves or the gallery wins the race.
+  await loadKind(kind, { generate: false });
   generate().then(() => {
     if (tab && tab[1] === "biomes") { showTab("biomes"); refreshCoverage(); }
+    if (tab && tab[1] === "library") { showTab("library"); }
   });
 }
+
+/* --- asset kinds -------------------------------------------------------- */
+
+function buildKindBar() {
+  $("kinds").innerHTML = state.kinds
+    .map(
+      (k) => `<button class="kind${k.ready ? "" : " soon"}" data-kind="${k.key}"
+        ${k.ready ? "" : "disabled"}
+        title="${escape(k.blurb)}${k.ready ? "" : " — no generator yet"}">
+        ${escape(k.label)}<span class="kcount">${k.ready ? k.species : "soon"}</span></button>`
+    )
+    .join("");
+  $("kinds").querySelectorAll("[data-kind]").forEach((b) => {
+    b.onclick = () => loadKind(b.dataset.kind);
+  });
+}
+
+/* Switch section. Everything the designer sees is scoped by this: which
+ * parameters exist, which species are listed, which library entries show, and
+ * which biomes the coverage tab reports on. A rock section that still offered
+ * foliage sliders and listed oaks would not be a section at all. */
+async function loadKind(kind, { generate: gen = true } = {}) {
+  const meta = state.kinds.find((k) => k.key === kind);
+  if (!meta || !meta.ready) return;
+  state.kind = kind;
+
+  $("kinds").querySelectorAll("[data-kind]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.kind === kind);
+  });
+  $("kindLabel").textContent = meta.label;
+  $("kindBlurb").textContent = meta.blurb;
+
+  state.schema = await fetch(`/api/schema?kind=${kind}`).then((r) => r.json());
+  const specs = await fetch(`/api/specs?kind=${kind}`).then((r) => r.json());
+
+  $("species").innerHTML = specs
+    .map((s) => `<option value="${s.name}">${s.name}</option>`)
+    .join("");
+
+  await refreshLibrary();
+
+  // Open on a representative species rather than whatever sorts first.
+  const first =
+    specs.find((s) => s.name === DEFAULT_SPECIES[kind]) ?? specs[0];
+  if (first) {
+    $("species").value = first.name;
+    await loadSpec(first.name);
+    if (gen) generate();
+  } else {
+    // A kind with a generator but no species yet: say so instead of showing an
+    // empty dropdown and a stale gallery from the previous section.
+    state.spec = null;
+    $("params").innerHTML = "";
+    $("gallery").innerHTML =
+      `<div class="status">No ${escape(meta.label.toLowerCase())} authored yet.</div>`;
+  }
+  if (state.tab === "biomes") refreshCoverage();
+  history.replaceState(null, "", `#kind=${kind}`);
+}
+
+const DEFAULT_SPECIES = {
+  tree: "temperate-oak",
+  bush: "bramble-thicket",
+  rock: "granite-boulder",
+};
 
 async function loadSpec(name) {
   const r = await fetch(`/api/spec?name=${encodeURIComponent(name)}`).then((x) => x.json());
@@ -164,9 +226,17 @@ function onParamInput(e) {
 }
 
 function onParamCommit() {
-  // Regenerate on release, not on every pixel of a drag — a tree costs
+  // Regenerate on release, not on every pixel of a drag — an asset costs
   // hundreds of milliseconds and mid-drag renders would only ever be stale.
   if ($("auto").checked) generate();
+}
+
+/* On a phone the drawer covers the gallery, so a change made in it has nowhere
+ * to show. Closing on commit is what makes the drawer usable: move a slider,
+ * see the result. Desktop keeps the sidebar open — there it sits beside the
+ * gallery and closing it would be pure loss. */
+function maybeCloseDrawer() {
+  if (isNarrow()) setPanel(false);
 }
 
 function markChanged() {
@@ -187,6 +257,7 @@ const escape = (s) =>
 /* --- generation --------------------------------------------------------- */
 
 async function generate(append = false) {
+  if (!state.spec) return;   // section with a generator but nothing authored yet
   const count = Math.max(1, Math.min(200, Number($("count").value) || 12));
   const start = append
     ? (state.seeds.at(-1) ?? 0) + 1
@@ -203,6 +274,7 @@ async function generate(append = false) {
   if (r.warnings?.length) toast(r.warnings[0]);
 
   showTab("gallery");
+  maybeCloseDrawer();
   state.job = r.job;
   state.seeds = append ? state.seeds.concat(r.seeds) : r.seeds;
 
@@ -227,8 +299,9 @@ function startPolling() {
 
     $("bar").style.width = `${(j.done / j.total) * 100}%`;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    const noun = (state.kinds.find((k) => k.key === state.kind)?.label ?? "assets").toLowerCase();
     $("status").textContent =
-      j.done < j.total ? `${j.done}/${j.total}  ${secs}s` : `${j.total} trees in ${secs}s`;
+      j.done < j.total ? `${j.done}/${j.total}  ${secs}s` : `${j.total} ${noun} in ${secs}s`;
 
     for (const [seed, t] of Object.entries(j.tiles)) {
       if (!t.ready) continue;
@@ -257,6 +330,18 @@ function fillTile(el, seed, t) {
     el.insertAdjacentHTML("beforeend", `<div class="flag" title="${escape(t.problems.join("\n"))}"></div>`);
   }
   if (state.kept.has(id)) el.classList.add("kept");
+  // Keeping straight from the tile. Approving a batch is the common case --
+  // generate forty, take the six that read well -- and routing every one of
+  // those six through the detail overlay is six round trips of opening and
+  // closing for a decision already made from the thumbnail.
+  el.insertAdjacentHTML(
+    "beforeend",
+    `<button class="tilekeep" data-keep="${seed}" title="Keep to library">+</button>`
+  );
+  el.querySelector("[data-keep]").onclick = (ev) => {
+    ev.stopPropagation();
+    keepTree(seed, id);
+  };
   el.onclick = () => openDetail(seed, t);
 
   // Deep link: #seed=N opens that variant straight away, so a particular tree
@@ -277,21 +362,28 @@ function openDetail(seed, t) {
 
   $("detailTitle").textContent = `${name} · seed ${seed}`;
   $("detailImg").src = `/api/detail?job=${state.job}&seed=${seed}`;
-  loadVoxels(`/api/voxels?job=${state.job}&seed=${seed}`);
+  loadVoxels(`/api/voxels?job=${state.job}&seed=${seed}${VIEW_BUDGET}`);
   $("detailProblems").innerHTML = (t.problems || [])
     .map((p) => `<div class="problem${p.startsWith("broken") ? " bad" : ""}">! ${escape(p)}</div>`)
     .join("");
 
+  // Branch statistics on a rock would be a column of zeroes pretending to mean
+  // something, so the kind decides which rows exist.
+  const branchy = (s.kind ?? state.kind) !== "rock";
   const rows = [
     ["voxel size", `${s.voxel_cm ?? 10} cm (preview)`],
     ["height", `${(s.height_m ?? 0).toFixed(1)} m`],
     ["footprint", `${(s.footprint_m || [0, 0]).map((v) => v.toFixed(1)).join(" × ")} m`],
     ["extent", `${(s.extent_vox || []).join(" × ")} voxels`],
     ["solid voxels", (s.voxels ?? 0).toLocaleString()],
-    ["skeleton nodes", (s.nodes ?? 0).toLocaleString()],
-    ["max branch order", s.max_order],
-    ["foliage clumps", (s.clumps ?? 0).toLocaleString()],
-    ["wood connected", `${((s.wood_connected ?? 1) * 100).toFixed(2)}%`],
+    ...(branchy
+      ? [
+          ["skeleton nodes", (s.nodes ?? 0).toLocaleString()],
+          ["max branch order", s.max_order],
+          ["foliage clumps", (s.clumps ?? 0).toLocaleString()],
+          ["wood connected", `${((s.wood_connected ?? 1) * 100).toFixed(2)}%`],
+        ]
+      : []),
     ["ground contact", `${s.ground_contact} voxels`],
     ["build time", `${s.ms_total} ms`],
     ["spec hash", s.spec_hash],
@@ -369,6 +461,18 @@ const fmtVal = (v) =>
 
 /* --- 3D --------------------------------------------------------------- */
 
+// Touch and mouse do the same three things by different gestures; say which.
+const TOUCH = window.matchMedia("(hover: none)").matches;
+
+// Ask the server for a lattice a phone can actually hold. This trades voxel
+// size for load time and frame rate, and the viewer says out loud when it had
+// to step coarser than the asset is authored at, so nothing is hidden.
+const VIEW_BUDGET = TOUCH ? "&max=400000" : "";
+
+const GESTURES = TOUCH
+  ? "drag to spin · pinch to zoom · double-tap to reset"
+  : "drag to spin · scroll to zoom";
+
 async function loadVoxels(url) {
   if (!state.viewer) return;
   const token = ++state.viewToken;
@@ -390,7 +494,7 @@ async function loadVoxels(url) {
         ? ` · ${shown} cm voxels`
         : "";
     $("viewHint").textContent =
-      `${count.toLocaleString()} surface voxels${note} · drag to spin · scroll to zoom`;
+      `${count.toLocaleString()} surface voxels${note} · ${GESTURES}`;
   } catch {
     if (token === state.viewToken) $("viewHint").textContent = "3D load failed";
   }
@@ -411,30 +515,73 @@ const downloadLinks = (id) => `
   <a href="/api/download?id=${id}&fmt=vxa">.vxa</a>
   <a href="/api/download?id=${id}&fmt=spec">spec.json</a>`;
 
-async function keepTree(seed, id) {
-  $("keepMsg").textContent = "saving…";
+async function keepTree(seed, id, { quiet = false } = {}) {
+  if (state.kept.has(id)) {
+    if (!quiet) $("keepMsg").textContent = "already in the library";
+    return true;
+  }
+  if (!quiet) $("keepMsg").textContent = "saving…";
+  $(`tile-${seed}`)?.classList.add("saving");
   const m = await fetch("/api/keep", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ spec: state.spec, seed }),
-  }).then((r) => r.json());
+  })
+    .then((r) => r.json())
+    .catch(() => ({ error: "network" }));
 
-  if (m.error) return ($("keepMsg").textContent = "failed");
+  $(`tile-${seed}`)?.classList.remove("saving");
+  if (m.error) {
+    if (!quiet) $("keepMsg").textContent = "failed";
+    return false;
+  }
   state.kept.add(m.id);
-  $("keepMsg").textContent = `saved · ${m.vox_models} vox model${m.vox_models === 1 ? "" : "s"}`;
-  $("detailDownloads").innerHTML = downloadLinks(m.id);
+  if (!quiet) {
+    $("keepMsg").textContent = `saved · ${m.vox_models} vox model${m.vox_models === 1 ? "" : "s"}`;
+    $("detailDownloads").innerHTML = downloadLinks(m.id);
+  }
   $(`tile-${seed}`)?.classList.add("kept");
+  if (!quiet) refreshLibrary();
+  return true;
+}
+
+/* Keep every tile in the gallery that generated cleanly. The flagged ones are
+ * skipped on purpose: a health problem is exactly the case that deserves a look
+ * before it goes in the library, and this is the one control that could put a
+ * broken asset in there forty at a time. */
+async function keepAllClean() {
+  const tiles = [...$("gallery").querySelectorAll(".tile[data-done]")].filter(
+    (el) => !el.querySelector(".flag") && !el.classList.contains("kept")
+  );
+  if (!tiles.length) return toast("nothing new to keep");
+  const name = getPath(state.spec, "name");
+  $("keepAll").disabled = true;
+  let saved = 0;
+  for (const el of tiles) {
+    const seed = Number(el.dataset.seed);
+    const id = `${name}-${String(seed).padStart(4, "0")}`;
+    if (await keepTree(seed, id, { quiet: true })) saved++;
+    $("status").textContent = `keeping ${saved}/${tiles.length}…`;
+  }
+  $("keepAll").disabled = false;
+  const flagged = $("gallery").querySelectorAll(".tile .flag").length;
+  toast(`kept ${saved}` + (flagged ? ` · skipped ${flagged} flagged` : ""));
+  $("status").textContent = `kept ${saved}`;
   refreshLibrary();
 }
 
 /* --- library ------------------------------------------------------------ */
 
 async function refreshLibrary() {
-  const items = await fetch("/api/library").then((r) => r.json());
-  state.kept = new Set(items.map((i) => i.id));
+  const all = await fetch("/api/library").then((r) => r.json());
+  // `kept` stays over the WHOLE library, not the current section: it drives the
+  // "already saved" badge on gallery tiles, and an id is unique across kinds.
+  state.kept = new Set(all.map((i) => i.id));
+  const items = all.filter((i) => (i.kind ?? "tree") === state.kind);
+  const label = state.kinds.find((k) => k.key === state.kind)?.label ?? "assets";
   $("library").innerHTML =
     items.length === 0
-      ? `<div class="status">Nothing kept yet. Open a tree and press “Keep to library”.</div>`
+      ? `<div class="status">No ${escape(label.toLowerCase())} kept yet. Open one and press “Keep to library”.</div>`
       : items
           .map(
             (i) => `<div class="tile" data-lib="${i.id}">
@@ -504,14 +651,23 @@ function openLibraryDetail(id, seed, name) {
   $("keepMsg").textContent = "already in the library";
   $("keep").onclick = () => toast("already kept");
   $("detailDownloads").innerHTML = downloadLinks(id);
-  loadVoxels(`/api/voxels?id=${encodeURIComponent(id)}`);
+  loadVoxels(`/api/voxels?id=${encodeURIComponent(id)}${VIEW_BUDGET}`);
   setView(state.viewer ? "3d" : "2d");
   $("overlay").classList.remove("hidden");
 }
 
 /* --- misc --------------------------------------------------------------- */
 
+const isNarrow = () => window.matchMedia("(max-width: 820px)").matches;
+
+function setPanel(open) {
+  document.body.classList.toggle("panelopen", open);
+  $("panelToggle").setAttribute("aria-expanded", String(open));
+  $("scrim").classList.toggle("hidden", !open);
+}
+
 function showTab(which) {
+  setPanel(false);
   state.tab = which;
   for (const [id, tab] of [["gallery","tabGallery"],["library","tabLibrary"],["biomes","tabBiomes"]]) {
     $(id).classList.toggle("hidden", which !== id);
@@ -522,16 +678,17 @@ function showTab(which) {
 /* --- biome coverage ----------------------------------------------------- */
 
 async function refreshCoverage() {
-  const c = await fetch("/api/coverage").then((r) => r.json());
+  const c = await fetch(`/api/coverage?kind=${state.kind}`).then((r) => r.json());
+  const label = state.kinds.find((k) => k.key === state.kind)?.label ?? "assets";
   const cards = c.biomes.map((b) => {
-    if (!b.plantable) {
-      return `<div class="biome none"><h3>${escape(b.label)}<span class="count">no trees</span></h3>
+    if (!b.hosts) {
+      return `<div class="biome none"><h3>${escape(b.label)}<span class="count">no ${escape(label.toLowerCase())}</span></h3>
         <div class="climate">${escape(b.climate)}</div></div>`;
     }
     // A biome with species but none approved is as much a gap as one with no
     // species at all — say both out loud rather than only counting rows.
     const gap = b.species.length === 0
-      ? "no species authored for this biome yet"
+      ? `no ${label.toLowerCase()} authored for this biome yet`
       : b.kept === 0 ? "species exist but none approved to the library yet" : "";
     const rows = b.species.map((s) => `
       <div class="sp" data-species="${escape(s.name)}">
@@ -572,6 +729,7 @@ function wire() {
   $("species").onchange = async (e) => { await loadSpec(e.target.value); generate(); };
   $("generate").onclick = () => generate();
   $("more").onclick = () => generate(true);
+  $("keepAll").onclick = keepAllClean;
   $("reroll").onclick = () => {
     $("seedStart").value = Math.floor(Math.random() * 90000) + 1;
     generate();
@@ -592,10 +750,14 @@ function wire() {
     toast(`saved specs/${r.saved}`);
     state.saved = JSON.parse(JSON.stringify(state.spec));
     markChanged();
-    const specs = await fetch("/api/specs").then((x) => x.json());
+    const specs = await fetch(`/api/specs?kind=${state.kind}`).then((x) => x.json());
     const cur = getPath(state.spec, "name");
     $("species").innerHTML = specs.map((s) => `<option value="${s.name}">${s.name}</option>`).join("");
     $("species").value = cur;
+    // A fork adds to this section's count, which is on the kind bar.
+    state.kinds = await fetch("/api/kinds").then((x) => x.json());
+    buildKindBar();
+    $("kinds").querySelector(`[data-kind="${state.kind}"]`)?.classList.add("on");
   };
   $("askGo").onclick = askEdit;
   $("ask").addEventListener("keydown", (e) => {
@@ -605,6 +767,12 @@ function wire() {
       askEdit();
     }
   });
+  // The slider panel is a drawer on a narrow screen and a fixed sidebar on a
+  // wide one; these controls only exist in the narrow layout.
+  $("panelToggle").onclick = () => setPanel(!document.body.classList.contains("panelopen"));
+  $("panelClose").onclick = () => setPanel(false);
+  $("scrim").onclick = () => setPanel(false);
+
   $("view3d").onclick = () => setView("3d");
   $("view2d").onclick = () => setView("2d");
   $("viewReset").onclick = () => state.viewer?.reset();

@@ -66,7 +66,9 @@ namespace VoxelFluidSim
 		FVector3f Pos;      // P0.xyz, origin-relative UU
 		uint32 Flags;       // asuint(P0.w)
 		FVector3f Vel;      // P1.xyz, UU/s
-		float SpawnTimeSec; // P1.w -- spawn time, game seconds (contract item 9)
+		// P1.w -- age stamp, game seconds: the last time this particle was
+		// moving or born (contract item 9, stagnant-only aging).
+		float AgeStampSec;
 	};
 
 	// Age-sink scale floor, mirror of VOXEL_FLUID_AGE_SCALE_FLOOR
@@ -87,6 +89,17 @@ namespace VoxelFluidSim
 			Scale = FMath::Max(1.0f - T, kAgeScaleFloor);
 		}
 		return MaxAgeSec * Scale;
+	}
+
+	// CPU mirror of the finalize kernel's stagnant-refresh rule (contract
+	// item 9, stagnant-only aging): the age stamp P1.w is rewritten to Now on
+	// every frame the derived speed EXCEEDS the stagnant threshold (strict >,
+	// matching the shader), so only resting water keeps an old stamp and can
+	// age out. One definition here so the automation test pins the semantics
+	// the shader implements.
+	inline float RefreshAgeStamp(float StampSec, float NowSec, float SpeedUU, float StagnantSpeedUU)
+	{
+		return SpeedUU > StagnantSpeedUU ? NowSec : StampSec;
 	}
 
 	// The shader's kernel-coefficient literals (VoxelFluidSim.usf), re-derived
@@ -158,7 +171,8 @@ struct FVoxelFluidSpawnRequest
 	FVector3f JitterDirUU = FVector3f::ZeroVector;
 	uint32 Seed = 0;
 	// Game-time seconds at the spawn dispatch, stamped into every spawned
-	// particle's P1.w -- the age sink's birth time (contract item 9).
+	// particle's P1.w -- the age stamp's initial value; finalize refreshes it
+	// while the particle keeps moving (contract item 9).
 	float SpawnTimeSec = 0.0f;
 };
 
@@ -206,14 +220,19 @@ struct FVoxelFluidSimTickArgs
 	FVector3f BasinBoxMaxLocalUU = FVector3f::ZeroVector;
 	float BasinDatumZLocalUU = 0.0f;
 
-	// Age sink (contract item 9): recycle particles older than the
-	// population-scaled max age as boundary despawns. MaxAgeSec <= 0 disables
-	// (cvar voxel.Fluid.MaxAgeSec 0). NowSeconds is the same game-time clock
-	// the spawn requests stamp, uploaded per tick. AgePopStart/End are the
-	// population band over which the effective age shrinks to the floor; the
-	// subsystem anchors AgePopEnd at its emission backpressure ramp start.
+	// Age sink (contract item 9): recycle particles STAGNANT for longer than
+	// the population-scaled max age as boundary despawns. MaxAgeSec <= 0
+	// disables (cvar voxel.Fluid.MaxAgeSec 0). NowSeconds is the same
+	// game-time clock the spawn requests stamp, uploaded per tick.
+	// AgePopStart/End are the population band over which the effective age
+	// shrinks to the floor; the subsystem anchors AgePopEnd at its emission
+	// backpressure ramp start. StagnantSpeedUU is the moving/resting divide:
+	// finalize refreshes a particle's age stamp while its speed exceeds this
+	// (cvar voxel.Fluid.StagnantSpeedUU; threshold rationale at the uniform's
+	// declaration in VoxelFluidSim.usf).
 	float NowSeconds = 0.0f;
 	float MaxAgeSec = 0.0f;
+	float StagnantSpeedUU = 15.0f;
 	uint32 AgePopStart = 0;
 	uint32 AgePopEnd = 0;
 

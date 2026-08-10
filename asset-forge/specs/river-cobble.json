@@ -73,15 +73,16 @@
     "spacing_m": 2.0,
     "water_max_m": 40.0
   },
-  "resolution_cm": "10",
+  "resolution_cm": "2.5",
   "rock": {
     "angular": 0.12,
     "bury": 0.3,
     "elongate": 1.25,
-    "erode": 0.55,
+    "erode": 0.2,
     "facets": 2,
     "flatten": 0.6,
     "lumps": 4,
+    "rough": 0.35,
     "rubble": 0.35,
     "size_m": 0.9,
     "spread": 0.5

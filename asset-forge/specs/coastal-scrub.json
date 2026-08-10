@@ -11,15 +11,15 @@
     "tundra_alpine": 0.0
   },
   "crown": {
-    "center_frac": 0.45,
+    "center_frac": 0.5,
     "height_frac": 0.8,
     "lean_deg": 22.0,
     "lean_dir_deg": 0.0,
     "points": 520,
-    "radius_m": 1.4,
+    "radius_m": 0.8,
     "shape": "wedge",
     "shell": 0.5,
-    "squash": 1.0
+    "squash": 0.8
   },
   "foliage": {
     "clump_jitter": 0.35,
@@ -73,7 +73,7 @@
     "spacing_m": 2.0,
     "water_max_m": 0.0
   },
-  "resolution_cm": "10",
+  "resolution_cm": "2",
   "rock": {
     "angular": 0.45,
     "bury": 0.22,
@@ -82,6 +82,7 @@
     "facets": 4,
     "flatten": 0.72,
     "lumps": 5,
+    "rough": 0.4,
     "rubble": 0.15,
     "size_m": 1.6,
     "spread": 0.42

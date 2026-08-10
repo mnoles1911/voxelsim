@@ -163,8 +163,19 @@ class VoxelGrid:
     ) -> None:
         """A ragged ellipsoid, for foliage clumps.
 
-        `density` below 1 drops voxels at random, which is what stops a canopy
-        reading as a solid green lump at 10 cm.
+        `density` below 1 opens the clump up, which is what stops a canopy
+        reading as a solid green lump. It is the exact fraction of the ball
+        kept, and what it takes away are COHERENT PATCHES, not scattered
+        voxels.
+
+        The distinction did not matter at 10 cm, where a clump is five or six
+        voxels across and there is no room for a patch. At 2 cm the same clump
+        is fifty voxels across, and dropping a third of them independently
+        turned every leaf mass into a cloud of loose specks -- thousands of
+        voxels per bush touching nothing, which is both wrong to look at and a
+        real failure for an asset that has to be stamped into a world and dug
+        out of it. Three sine waves in random directions cost almost nothing and
+        make the holes big enough to be holes.
         """
         dx, dy, dz = _ball_offsets(_quantize(r_vox))
         if squash != 1.0:
@@ -174,10 +185,30 @@ class VoxelGrid:
             return
         if density < 1.0:
             # Bias retention toward the clump centre so it thins at the edges
-            # rather than turning into uniform static.
+            # rather than uniformly.
             d = np.sqrt(dx * dx + dy * dy + dz * dz) / max(r_vox, 1e-6)
-            p = np.clip(density * (1.35 - 0.55 * d), 0.0, 1.0)
-            keep = rng.random(dx.size) < p
+            score = 1.0 - 0.55 * d
+            if r_vox >= 2.0:
+                base = 2.0 * math.pi / max(r_vox * 0.6, 1.5)
+                noise = np.zeros(dx.size)
+                # Four waves, each at its own frequency. Three at one frequency
+                # beat against each other into visible parallel ripples, which
+                # showed up as corduroy across a sparse canopy -- a texture no
+                # plant has. Detuning them breaks the pattern.
+                for _ in range(4):
+                    v = rng.normal(size=3)
+                    v /= max(float(np.linalg.norm(v)), 1e-9)
+                    freq = base * (0.7 + 0.9 * rng.random())
+                    noise += np.sin(
+                        (dx * v[0] + dy * v[1] + dz * v[2]) * freq
+                        + rng.random() * 2.0 * math.pi
+                    )
+                score = score + noise * 0.14
+            else:
+                score = score + rng.random(dx.size) * 0.5
+            # Quantile, so `density` means what it says whatever the noise did.
+            cut = np.quantile(score, 1.0 - density)
+            keep = score >= cut
             dx, dy, dz = dx[keep], dy[keep], dz[keep]
             if dx.size == 0:
                 return

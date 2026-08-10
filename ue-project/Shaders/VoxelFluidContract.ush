@@ -40,14 +40,16 @@
 // AoS, 32 bytes, two float4s -- coalesced pairs, no packing cleverness until
 // the spike measures a reason for it.
 //   P0: xyz = position UU (origin-relative), w = asuint(flags)
-//   P1: xyz = velocity UU/s,                 w = spawn time, game seconds (float)
+//   P1: xyz = velocity UU/s,                 w = age stamp, game seconds (float):
+//       the last time this particle was moving or born. Spawn writes the birth
+//       time; FluidFinalizeMain refreshes it to NowSeconds every frame the
+//       derived speed exceeds StagnantSpeedUU (item 9, stagnant-only aging),
+//       so age = NowSeconds - P1.w is time-since-last-moving, not time alive.
 // P1.w REPURPOSED (recycling pass, item 9 below): it used to carry a float
 // spawn batch id that nothing downstream ever read -- verified before the
 // change: the only GPU reads of P1.w were the finalize write-backs carrying it
 // unchanged, the renderer reads P0 only (VoxelFluidRender.usf:186-195), and
-// the CPU debug decode used Pos+Flags only. It now carries the particle's
-// spawn time (the host's game-time seconds at the spawn dispatch), which is
-// what the age-based recycling sink in FluidFinalizeMain ages against.
+// the CPU debug decode used Pos+Flags only.
 // Flags (bits of asuint(P0.w)):
 #define VOXEL_FLUID_FLAG_ALIVE       (1u << 0)
 #define VOXEL_FLUID_FLAG_DESPAWN_BASIN    (1u << 1)  // crossed into a basin extent
@@ -226,7 +228,7 @@ struct FVoxelFluidParticle
 //
 //     THE EFFECTIVE AGE IS POPULATION-SCALED so the age valve is fully open
 //     BEFORE the emission throttle would engage: full MaxAgeSec (host cvar
-//     voxel.Fluid.MaxAgeSec, default 75 s, 0 = off) at populations up to
+//     voxel.Fluid.MaxAgeSec, default 500 s, 0 = off) at populations up to
 //     AgePopStart, falling linearly to a 0.1 floor at AgePopEnd, where the
 //     host sets AgePopEnd == the population its emission backpressure ramp
 //     STARTS at and AgePopStart == 60 % of that. Anchoring to the ramp start
@@ -238,5 +240,23 @@ struct FVoxelFluidParticle
 //     round-trip). Scale math mirrored and pinned CPU-side:
 //     VoxelFluidSim::EffectiveMaxAgeSec + the VoxelEarth.Fluid.AgeRecycling
 //     automation test.
+//
+//     AMENDED, PERSISTENCE PASS (2026-08-09, owner directive): AGING IS
+//     STAGNANT-ONLY. Water "should persist as long as it is moving -- the
+//     death countdown only starts when it STOPS moving". The original sink
+//     aged from the birth stamp and killed moving streams a few metres from
+//     the source, mid-journey. FluidFinalizeMain now REFRESHES P1.w to
+//     NowSeconds on every frame the derived speed exceeds StagnantSpeedUU
+//     (host cvar voxel.Fluid.StagnantSpeedUU, default 15 UU/s -- the
+//     placement argument lives at the uniform's declaration in
+//     VoxelFluidSim.usf), so the age above is time-since-last-moving and the
+//     valve retires only settled pools. Everything else in this item --
+//     flags, counters, the units path, the population band -- is unchanged;
+//     the ParticleCounts[4] telemetry now reads as "stagnant retirements".
+//     The band itself is anchored to the host's emission soft cap, which is
+//     now a cvar (voxel.Fluid.SoftCap, default 200,000, clamped to 90 % of
+//     MAX_PARTICLES) so persistent pools plus living streams have headroom;
+//     the ramp/band arithmetic is derived from it in one place
+//     (VoxelFluidSubsystem.cpp, FluidEmissionBand).
 
 #endif // VOXEL_FLUID_CONTRACT_USH

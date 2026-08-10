@@ -1,0 +1,62 @@
+<!doctype html>
+<!-- Layout probe.
+
+     Loads the app same-origin in a fixed-width frame, reports every element
+     wider than the frame's viewport, and lets a screenshot be taken at a real
+     phone width.
+
+     It exists because Chrome on Windows refuses to open a window narrower than
+     about 500 px, so `--window-size=390` silently renders a wider viewport and
+     a screenshot taken that way says nothing about how the app behaves on a
+     phone. An iframe has no such floor.
+
+     Query: w, h, route (applied as the app's hash), open=panel -->
+<html><head><meta charset="utf-8">
+<style>
+  body { font: 12px ui-monospace, Consolas, monospace; background: #fff; color: #111; margin: 0; }
+  iframe { border: 2px solid #c00; display: block; }
+  #out { padding: 6px 8px; white-space: pre-wrap; }
+</style></head><body>
+<div id="out">measuring…</div>
+<iframe id="f"></iframe>
+<script>
+const q = new URLSearchParams(location.search);
+const W = Number(q.get("w") || 390);
+const H = Number(q.get("h") || 780);
+const f = document.getElementById("f");
+f.style.width = W + "px";
+f.style.height = H + "px";
+f.src = "/" + (q.get("route") || "");
+
+setTimeout(() => {
+  const d = f.contentDocument;
+  if (q.get("open") === "panel") {
+    // Chrome's virtual-time clock does not advance CSS transitions, so a
+    // screenshot lands mid-slide and the drawer looks broken when it is only
+    // in flight. Kill the transition and read its resting position.
+    const p = d.getElementById("panel");
+    if (p) p.style.transition = "none";
+    d.getElementById("panelToggle")?.click();
+  }
+
+  setTimeout(() => {
+    const vw = d.documentElement.clientWidth;
+    const lines = [`viewport ${vw}px  doc scrollWidth ${d.documentElement.scrollWidth}px`];
+    for (const el of d.querySelectorAll("*")) {
+      // Anything inside a deliberately scrolling strip is allowed past the edge.
+      if (el.closest(".kinds")) continue;
+      const r = el.getBoundingClientRect();
+      const over = Math.round(r.right - vw);
+      if (r.width > vw + 1 || over > 1) {
+        const id = el.id ? "#" + el.id : "";
+        const cls = typeof el.className === "string" && el.className.trim()
+          ? "." + el.className.trim().split(/\s+/).join(".") : "";
+        lines.push(`OVERFLOW ${el.tagName.toLowerCase()}${id}${cls} w=${Math.round(r.width)} over=${over}`);
+      }
+    }
+    if (lines.length === 1) lines.push("no overflow");
+    document.getElementById("out").textContent = lines.slice(0, 25).join("\n");
+  }, 700);
+}, 4500);
+</script>
+</body></html>

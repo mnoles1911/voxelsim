@@ -175,13 +175,36 @@ float  NowSeconds;
 float  MaxAgeSec;
 uint   AgePopStart;
 uint   AgePopEnd;
+// STAGNANT-ONLY AGING (owner directive, persistence pass): water persists as
+// long as it is MOVING -- the death countdown only starts when it stops.
+// FluidFinalizeMain refreshes P1.w to NowSeconds whenever the derived speed
+// exceeds this threshold, so only resting water accumulates age. The default
+// (cvar voxel.Fluid.StagnantSpeedUU, 15 UU/s) is placed by the sim's own
+// numbers:
+//   ABOVE the settled noise band: at rest the only displacement sources are
+//   gravity's one-step fall (g*Dt^2 = 0.27 UU at 60 Hz, 1.09 UU at the 1/30 s
+//   clamp), cancelled EXACTLY along contact normals by the finalize walk's
+//   per-axis x_prev lift (contract item 7), plus residual tangential
+//   constraint corrections -- proportional to the residual compression error
+//   of a settled pool, an order below their 0.1h = 2.5 UU/iter clamp. Settled
+//   derived speeds therefore sit in single-digit UU/s.
+//   BELOW any real flow: designed stream speeds are 150 UU/s (springs, edge
+//   inflows, kFaucetVelocityUU is 300); one frame of free fall regains
+//   g*Dt = 16.3 UU/s at 60 Hz, so any particle with a downhill exit clears
+//   the threshold on its very next step even from a standing start; and
+//   crossing the 5120 UU active box within one 500 s default lifetime needs
+//   an average of only 10.2 UU/s -- water slower than that cannot reach the
+//   far side within a lifetime anyway, so 15 marks exactly where "moving"
+//   stops being distinguishable from "pooling".
+float  StagnantSpeedUU;
 float  RestDensity;         // computed CPU-side from the rest lattice (see .cpp)
 uint   SpawnCount;
 uint   SpawnMode;
 uint   SpawnSeed;
 uint   SpawnEdge;           // lattice edge (block mode): SpawnEdge^3 >= SpawnCount
 // Game-time seconds at this spawn dispatch, written to every spawned
-// particle's P1.w (its spawn time -- the age sink's birth stamp).
+// particle's P1.w (the age stamp's initial value; finalize refreshes it while
+// the particle keeps moving -- see StagnantSpeedUU above).
 float  SpawnTimeSec;
 float3 SpawnCenterLocalUU;
 float3 SpawnVelUU;
@@ -474,7 +497,7 @@ void FluidSpawnMain(uint3 DTid : SV_DispatchThreadID)
 
 	FVoxelFluidParticle P;
 	P.P0 = float4(pos, asfloat(VOXEL_FLUID_FLAG_ALIVE));
-	P.P1 = float4(vel, SpawnTimeSec); // w = spawn time (contract: P1.w)
+	P.P1 = float4(vel, SpawnTimeSec); // w = age stamp, starts at birth (contract: P1.w)
 	ParticlesRW[slot] = P;
 	InterlockedAdd(ParticleCounts[3], 1u); // spawnedTotal
 }
@@ -831,16 +854,20 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 //      blocks, x_prev's normal component is lifted onto the contact plane so
 //      the derived velocity has EXACTLY zero approach speed.
 //   2. derive + clamp velocity from the (possibly corrected) positions;
-//   3. basin despawn (contract item 6): inside the uploaded basin box at or
+//   3. STAGNANT CHECK (contract item 9, stagnant-only aging): speed above
+//      StagnantSpeedUU refreshes the age stamp (P1.w = NowSeconds), so moving
+//      water can never age out mid-journey -- only resting water counts down;
+//   4. basin despawn (contract item 6): inside the uploaded basin box at or
 //      below the live datum -> DESPAWN_BASIN, ParticleCounts[1], free list.
 //      Tested BEFORE the boundary so a basin clipped against the region edge
 //      credits the lake rather than leaking into the graph;
-//   4. boundary despawn (left the active box) -> flag, counter, free list;
-//   5. AGE despawn (contract item 9): older than the population-scaled max
-//      age -> DESPAWN_BOUNDARY flag, ParticleCounts[2] AND [4], free list.
-//      Last among the sinks on purpose: water that reached a real sink this
-//      frame credits that sink, age only recycles what is still pooling;
-//   6. survivors count into ParticleCounts[0] and write back position+velocity.
+//   5. boundary despawn (left the active box) -> flag, counter, free list;
+//   6. AGE despawn (contract item 9): STAGNANT for longer than the
+//      population-scaled max age -> DESPAWN_BOUNDARY flag, ParticleCounts[2]
+//      AND [4], free list. Last among the sinks on purpose: water that
+//      reached a real sink this frame credits that sink, age only recycles
+//      what is genuinely pooling;
+//   7. survivors count into ParticleCounts[0] and write back position+velocity.
 //
 // SORTED DOMAIN: one thread per sorted entry, mapped back to its slot through
 // CellEntries (the sorted -> slot map the scatter built). Alive slots and
@@ -903,6 +930,17 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		v *= VOXEL_FLUID_MAX_SPEED_UU / speed;
 	}
 
+	// Stagnant-only aging (contract item 9, owner directive): moving water
+	// refreshes its age stamp and can never be recycled mid-journey; only
+	// water at rest counts down. Applied before the sinks so every write-back
+	// below (basin, boundary, age, survivor) carries the refreshed stamp --
+	// harmless on the despawn paths, load-bearing on the survivor path.
+	// Threshold rationale at the StagnantSpeedUU uniform declaration.
+	if (speed > StagnantSpeedUU)
+	{
+		P.P1.w = NowSeconds;
+	}
+
 	// Basin sink v1 (contract item 6). Enabled flag first: an unset box is
 	// all zeros and must not act as a sink at the volume corner.
 	if (BasinSinkEnabled != 0u &&
@@ -943,13 +981,17 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 	// Age recycling (contract item 9; owner playtest round 6 -- the closed-loop
 	// jam). Water the terrain pockets never reaches a spatial sink, so the
 	// population must turn over by age or emission ratchets into the soft cap
-	// and throttles to zero. The flag and ParticleCounts[2] are EXACTLY the
-	// boundary despawn's -- the CPU routes the volume into the river graph
-	// through the unchanged despawnBoundary units path -- plus [4] so the perf
-	// line can name the share that was recycling. The effective age shrinks as
-	// the population approaches AgePopEnd (the host's emission ramp start), so
-	// the valve is fully open before any faucet would throttle; below
-	// AgePopStart the full MaxAgeSec applies and pockets refresh slowly.
+	// and throttles to zero. STAGNANT-ONLY since the persistence pass: the
+	// refresh above means age here is time-since-last-moving, so this valve
+	// retires only settled pool water -- a stream in flight refreshes every
+	// frame and runs its whole journey. The flag and ParticleCounts[2] are
+	// EXACTLY the boundary despawn's -- the CPU routes the volume into the
+	// river graph through the unchanged despawnBoundary units path -- plus [4]
+	// so the perf line can name the share that was recycling. The effective
+	// age shrinks as the population approaches AgePopEnd (the host's emission
+	// ramp start), so the valve is fully open before any faucet would
+	// throttle; below AgePopStart the full MaxAgeSec applies and pockets
+	// refresh slowly.
 	if (MaxAgeSec > 0.0f)
 	{
 		const uint pop = InSortedCount[0];

@@ -187,37 +187,77 @@ const Viewer = (() => {
       gl.drawArraysInstanced(gl.TRIANGLES, 0, 36, state.count);
     }
 
-    /* --- input: drag to orbit, wheel to zoom --- */
+    /* --- input: drag to orbit, wheel or pinch to zoom ---
+     *
+     * Every pointer is tracked rather than just "is a drag happening", because
+     * a phone has no wheel: pinch IS the zoom, and pinch means reading two
+     * pointers at once. With one pointer this behaves exactly as a mouse drag
+     * did, so the same code serves both without a touch/mouse branch. */
 
-    let dragging = false;
-    let lastX = 0;
-    let lastY = 0;
+    const pointers = new Map();
+    let pinch = 0;
+
+    const spread = () => {
+      const [a, b] = [...pointers.values()];
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    };
+    const zoomTo = (r) =>
+      Math.max(state.home * 0.15, Math.min(state.home * 6, r));
 
     canvas.addEventListener("pointerdown", (e) => {
-      dragging = true;
-      lastX = e.clientX;
-      lastY = e.clientY;
-      canvas.setPointerCapture(e.pointerId);
+      pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      try { canvas.setPointerCapture(e.pointerId); } catch { /* fine */ }
+      if (pointers.size === 2) pinch = spread();
     });
-    canvas.addEventListener("pointerup", (e) => {
-      dragging = false;
+
+    const release = (e) => {
+      pointers.delete(e.pointerId);
       try { canvas.releasePointerCapture(e.pointerId); } catch { /* already gone */ }
-    });
+      // A finger lifting off a pinch must not be read as a huge drag by the one
+      // still down, so re-baseline whatever is left.
+      if (pointers.size === 2) pinch = spread();
+    };
+    canvas.addEventListener("pointerup", release);
+    canvas.addEventListener("pointercancel", release);
+
     canvas.addEventListener("pointermove", (e) => {
-      if (!dragging) return;
-      state.azimuth -= (e.clientX - lastX) * 0.008;
-      // Clamp just shy of the poles: at exactly vertical the up vector and the
-      // view direction are parallel and lookAt degenerates.
-      state.elevation = Math.max(-1.5, Math.min(1.5, state.elevation + (e.clientY - lastY) * 0.006));
-      lastX = e.clientX;
-      lastY = e.clientY;
-      state.dirty = true;
+      const prev = pointers.get(e.pointerId);
+      if (!prev) return;
+      const dx = e.clientX - prev.x;
+      const dy = e.clientY - prev.y;
+      prev.x = e.clientX;
+      prev.y = e.clientY;
+
+      if (pointers.size === 1) {
+        state.azimuth -= dx * 0.008;
+        // Clamp just shy of the poles: at exactly vertical the up vector and the
+        // view direction are parallel and lookAt degenerates.
+        state.elevation = Math.max(-1.5, Math.min(1.5, state.elevation + dy * 0.006));
+        state.dirty = true;
+      } else if (pointers.size === 2) {
+        const d = spread();
+        if (pinch > 0 && d > 0) {
+          state.radius = zoomTo(state.radius * (pinch / d));
+          state.dirty = true;
+        }
+        pinch = d;
+      }
     });
+
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
-      state.radius = Math.max(4, Math.min(state.home * 6, state.radius * Math.exp(e.deltaY * 0.0012)));
+      state.radius = zoomTo(state.radius * Math.exp(e.deltaY * 0.0012));
       state.dirty = true;
     }, { passive: false });
+
+    // Double-tap or double-click back to the default view. On a phone there is
+    // no "Reset view" button within reach of the thumb doing the spinning.
+    canvas.addEventListener("dblclick", () => {
+      state.azimuth = -0.9;
+      state.elevation = 0.45;
+      state.radius = state.home ?? state.radius;
+      state.dirty = true;
+    });
 
     let raf = requestAnimationFrame(function loop() {
       draw();

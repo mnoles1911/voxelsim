@@ -291,9 +291,12 @@ namespace
 			SHADER_PARAMETER(FVector3f, BasinBoxMinLocalUU)
 			SHADER_PARAMETER(FVector3f, BasinBoxMaxLocalUU)
 			SHADER_PARAMETER(float, BasinDatumZLocalUU)
-			// Age sink (contract item 9): population-scaled recycling.
+			// Age sink (contract item 9): population-scaled, stagnant-only
+			// recycling. StagnantSpeedUU is the moving/resting divide the
+			// finalize kernel refreshes age stamps against.
 			SHADER_PARAMETER(float, NowSeconds)
 			SHADER_PARAMETER(float, MaxAgeSec)
+			SHADER_PARAMETER(float, StagnantSpeedUU)
 			SHADER_PARAMETER(uint32, AgePopStart)
 			SHADER_PARAMETER(uint32, AgePopEnd)
 			// Sorted domain (perf pass): InPositions is the final sorted
@@ -875,6 +878,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->BasinDatumZLocalUU = Args.BasinDatumZLocalUU;
 		Params->NowSeconds = Args.NowSeconds;
 		Params->MaxAgeSec = Args.MaxAgeSec;
+		Params->StagnantSpeedUU = Args.StagnantSpeedUU;
 		Params->AgePopStart = Args.AgePopStart;
 		Params->AgePopEnd = Args.AgePopEnd;
 		Params->InPositions = GraphBuilder.CreateSRV(CurIn);
@@ -1128,15 +1132,18 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidAgeRecyclingTest,
 bool FVoxelFluidAgeRecyclingTest::RunTest(const FString& Parameters)
 {
 	// CPU mirror of the finalize kernel's effective-max-age math (contract
-	// item 9). The band the subsystem uploads: PopEnd == the emission
-	// backpressure ramp start (kMaxParticles/3 - kMaxParticles/6 = 51,200),
-	// PopStart == 60% of that. Pinned here with those real numbers so a
-	// drifted constant fails a test instead of shipping as a re-jammed loop.
+	// item 9). The band the subsystem uploads at the DEFAULTS (persistence
+	// pass): soft cap voxel.Fluid.SoftCap = 200,000, so PopEnd == the emission
+	// backpressure ramp start == SoftCap/2 = 100,000, PopStart == 60% of that
+	// = 60,000, and MaxAgeSec defaults to 500 s (stagnant water only -- moving
+	// water refreshes its stamp, pinned further down). Pinned here with those
+	// real numbers so a drifted constant fails a test instead of shipping as
+	// a re-jammed loop.
 	using VoxelFluidSim::EffectiveMaxAgeSec;
 	using VoxelFluidSim::kAgeScaleFloor;
-	constexpr uint32 PopEnd = 51200;                       // emission ramp start
-	constexpr uint32 PopStart = (PopEnd * 3u) / 5u;        // 60% of it = 30,720
-	constexpr float MaxAge = 75.0f;
+	constexpr uint32 PopEnd = 100000;                      // emission ramp start
+	constexpr uint32 PopStart = (PopEnd * 3u) / 5u;        // 60% of it = 60,000
+	constexpr float MaxAge = 500.0f;
 
 	// Full age at and below the start of the band: pockets refresh slowly.
 	TestEqual(TEXT("empty sim -> full age"), EffectiveMaxAgeSec(0, PopStart, PopEnd, MaxAge), MaxAge);
@@ -1186,6 +1193,43 @@ bool FVoxelFluidAgeRecyclingTest::RunTest(const FString& Parameters)
 		         Pop < float(PopEnd));
 		TestTrue(TEXT("...and above the full-age band (the valve is actually working)"),
 		         Pop > float(PopStart));
+	}
+
+	// STAGNANT-ONLY AGING (persistence pass, owner directive): the refresh
+	// rule the finalize kernel applies before its sinks -- moving water
+	// rewrites its stamp to Now, resting water keeps it. Mirrored as
+	// VoxelFluidSim::RefreshAgeStamp; the threshold's placement argument
+	// lives at the StagnantSpeedUU uniform in VoxelFluidSim.usf.
+	{
+		using VoxelFluidSim::RefreshAgeStamp;
+		const float Threshold = 15.0f; // voxel.Fluid.StagnantSpeedUU default
+		const float Born = 100.0f;
+		const float Now = 700.0f; // 600 s later -- past even the 500 s default
+
+		// A stream in flight refreshes every frame: its age never exceeds one
+		// frame no matter how long ago it was born, so it can never recycle
+		// mid-journey (the bug this pass removes).
+		const float MovingStamp = RefreshAgeStamp(Born, Now, 150.0f, Threshold);
+		TestEqual(TEXT("moving water refreshes its stamp"), MovingStamp, Now);
+		TestTrue(TEXT("moving water never exceeds the max age"),
+		         Now - MovingStamp < MaxAge);
+
+		// Resting water keeps its stamp and ages out normally.
+		const float RestingStamp = RefreshAgeStamp(Born, Now, 3.0f, Threshold);
+		TestEqual(TEXT("resting water keeps its stamp"), RestingStamp, Born);
+		TestTrue(TEXT("resting water past the max age recycles"),
+		         Now - RestingStamp > MaxAge);
+
+		// Strict >: exactly-at-threshold counts as stagnant (matches the
+		// shader's comparison, so the mirror cannot drift by an ulp of intent).
+		TestEqual(TEXT("at-threshold speed does not refresh"),
+		          RefreshAgeStamp(Born, Now, Threshold, Threshold), Born);
+
+		// One frame of free fall at 60 Hz (g*dt = 980/60 = 16.3 UU/s) clears
+		// the default threshold: anything with a downhill exit re-arms its
+		// stamp on its very next step even from a standing start.
+		TestEqual(TEXT("one frame of free fall clears the default threshold"),
+		          RefreshAgeStamp(Born, Now, 980.0f / 60.0f, Threshold), Now);
 	}
 	return true;
 }

@@ -123,17 +123,9 @@ namespace
 	constexpr double kSinkRefreshSeconds = 1.0;
 
 	// ---- emission backpressure geometry + the age-recycling band ------------
-	// The soft cap is the MEASURED knee (see the backpressure comment in Tick):
-	// faucet emission ramps from full at kAliveRampStart down to zero at
-	// kAliveSoftCap. The age sink (contract item 9) is anchored to the SAME
-	// geometry: its valve opens at 60% of the ramp start and is fully open AT
-	// the ramp start, so recycling always outpaces inflow before the throttle
-	// can engage -- the round-6 jam (population ratcheted into the soft cap,
-	// faucets throttled to zero, nothing ever despawned) cannot re-form.
-	constexpr uint32 kAliveSoftCap = VoxelFluidSim::kMaxParticles / 3;   // 102,400
-	constexpr uint32 kAliveRampWidth = kAliveSoftCap / 2;                // 51,200
-	constexpr uint32 kAliveRampStart = kAliveSoftCap - kAliveRampWidth;  // 51,200
-	constexpr uint32 kAgePopStart = (kAliveRampStart * 3u) / 5u;         // 30,720
+	// Derived from the voxel.Fluid.SoftCap cvar in ONE place, FluidEmissionBand
+	// below (after the console surface) -- the ramp and the age valve must
+	// always share one geometry or the round-6 jam can re-form between them.
 
 	// voxel.Fluid.Spawn with no argument.
 	constexpr int32 kDefaultSpawnCount = 5000;
@@ -202,15 +194,43 @@ namespace
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarVoxelFluidMaxAgeSec(
-		TEXT("voxel.Fluid.MaxAgeSec"), 75.0f,
-		TEXT("How long a water particle may live, in seconds, before it is quietly ")
-		TEXT("recycled: despawned as a boundary exit and its volume carried on ")
-		TEXT("downstream through the river graph (owner playtest round 6 fix -- ")
+		TEXT("voxel.Fluid.MaxAgeSec"), 500.0f,
+		TEXT("How long a water particle may sit STILL, in seconds, before it is ")
+		TEXT("quietly recycled: despawned as a boundary exit and its volume carried ")
+		TEXT("on downstream through the river graph (owner playtest round 6 fix -- ")
 		TEXT("water that pools in terrain pockets never reaches a spatial sink, so ")
 		TEXT("without this the population fills the buffer and every faucet ")
-		TEXT("throttles to zero). The sim shortens the age automatically as the ")
-		TEXT("particle count climbs toward the emission throttle, so faucets keep ")
-		TEXT("a constant stream. 0 disables recycling (the pre-fix behaviour)."),
+		TEXT("throttles to zero). MOVING water never ages: the sim refreshes the ")
+		TEXT("countdown every frame a particle travels faster than ")
+		TEXT("voxel.Fluid.StagnantSpeedUU, so streams run their whole journey and ")
+		TEXT("only settled pools cycle (owner directive, persistence pass; default ")
+		TEXT("raised 75 -> 500 with that change). The sim still shortens the age ")
+		TEXT("automatically as the particle count climbs toward the emission ")
+		TEXT("throttle. 0 disables recycling (the pre-fix behaviour)."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarVoxelFluidStagnantSpeedUU(
+		TEXT("voxel.Fluid.StagnantSpeedUU"), 15.0f,
+		TEXT("Speed, UU/s, below which water counts as STOPPED for age recycling ")
+		TEXT("(contract item 9, stagnant-only aging): faster than this refreshes ")
+		TEXT("the particle's death countdown every frame. Default 15 sits above ")
+		TEXT("the settled-pool jitter band (single-digit UU/s once the collision ")
+		TEXT("lift has zeroed contact normals) and below every real flow (streams ")
+		TEXT("are designed at 150 UU/s; one frame of free fall at 60 Hz is already ")
+		TEXT("16.3 UU/s; crossing the 51 m window inside one 500 s lifetime needs ")
+		TEXT("10.2 UU/s average). Full placement argument at the StagnantSpeedUU ")
+		TEXT("uniform in VoxelFluidSim.usf."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarVoxelFluidSoftCap(
+		TEXT("voxel.Fluid.SoftCap"), 200000,
+		TEXT("Emission soft cap: faucets ramp from full flow at half this count ")
+		TEXT("down to zero at it (surplus discharge routes through the scalar ")
+		TEXT("river graph, never dropped). Raised from the old fixed 102,400 with ")
+		TEXT("stagnant-only aging: persistent pools plus living streams need the ")
+		TEXT("room. Clamped to 90% of the 307,200 buffer cap (276,480) so the ")
+		TEXT("hard cap keeps a shock margin over the soft one. The age valve's ")
+		TEXT("band re-anchors proportionally (FluidEmissionBand)."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<int32> CVarVoxelFluidMaxSpawnPerTick(
@@ -272,6 +292,53 @@ namespace
 		TEXT("Bilateral depth-smooth radius in half-res pixels (two separable ")
 		TEXT("passes). Bigger = sheetier fluid, more GPU. Clamped 1..32."),
 		ECVF_Default);
+
+	// ---- the emission band (backpressure ramp + age-valve anchors) ----------
+	// One derivation for both consumers: the faucet throttle (EmitScale in
+	// Tick) and the age sink's population band (Args.AgePopStart/End). The
+	// proportions are the shipped ones -- ramp starts at half the soft cap,
+	// valve starts closing at 60% of the ramp start -- re-anchored to the
+	// voxel.Fluid.SoftCap cvar (default 200,000).
+	//
+	// THE STRUCTURAL ARGUMENT, RECOMPUTED AT THE DEFAULTS. The valve's
+	// retirement capacity at the ramp start must exceed plausible inflow, or
+	// population parks at the ramp and the faucets throttle (the round-6 jam).
+	// At the ramp start (AgePopEnd = 200,000/2 = 100,000) the effective age is
+	// floored at 0.1 x MaxAgeSec = 50 s (default 500), so the valve can retire
+	// 100,000 / 50 = 2,000 particles/s -- above the largest measured
+	// unthrottled demand (round 6: ~1,340/s), and the AgeRecycling automation
+	// test walks the actual dynamics to an equilibrium (~94k) below the ramp.
+	// STAGNANT-ONLY aging changes who the valve can see, not the argument:
+	// moving water never ages, but it also never pools -- the in-flight share
+	// is bounded by inflow x transit time (~1,340/s x ~34 s to cross the
+	// 5,120 UU box at the slowest designed 150 UU/s stream = ~46k), and
+	// 46k moving + ~94k settled = ~140k, inside the 200,000 cap with ~60k of
+	// margin for bursts and deep pools. The old fixed 102,400 was the measured
+	// settled-pile knee under always-on aging (102k settled = 2.4 ms, one
+	// 156k DEEP PILE = 21 ms); with stagnant-only aging the population spreads
+	// along stream paths instead of ratcheting into one pile, and simGpuMs in
+	// the perf line stays the regression watch for the raised default.
+	struct FFluidEmissionBand
+	{
+		uint32 SoftCap = 0;     // faucet emission reaches zero here
+		uint32 RampWidth = 0;   // full flow -> zero over [RampStart, SoftCap]
+		uint32 RampStart = 0;   // throttle engages here == age valve fully open (AgePopEnd)
+		uint32 AgePopStart = 0; // age valve starts shortening the max age here
+	};
+	FFluidEmissionBand FluidEmissionBand()
+	{
+		// Lower clamp is only degeneracy-proofing (RampWidth >= 1); the upper
+		// clamp is the contract: the hard buffer cap must keep headroom over
+		// the soft one. 307,200 * 9 / 10 = 276,480.
+		const uint32 SoftCapMax = VoxelFluidSim::kMaxParticles / 10u * 9u;
+		FFluidEmissionBand Band;
+		Band.SoftCap = FMath::Clamp(uint32(FMath::Max(0, CVarVoxelFluidSoftCap.GetValueOnGameThread())),
+		                            2u, SoftCapMax);
+		Band.RampWidth = Band.SoftCap / 2u;                 // 100,000 at the default
+		Band.RampStart = Band.SoftCap - Band.RampWidth;     // 100,000 at the default
+		Band.AgePopStart = (Band.RampStart * 3u) / 5u;      // 60,000 at the default
+		return Band;
+	}
 
 	UVoxelFluidSubsystem* FindFluidSubsystem(UWorld* World)
 	{
@@ -1330,6 +1397,10 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	// exactly zero. Game time (starts near zero), not FPlatformTime (OS
 	// uptime), so float keeps millisecond precision for sessions of days.
 	const float NowGameSec = float(World->GetTimeSeconds());
+	// One band per tick, shared by the faucet throttle and the age valve --
+	// the two must never disagree about where the ramp starts (see
+	// FluidEmissionBand's derivation and arithmetic).
+	const FFluidEmissionBand Band = FluidEmissionBand();
 	if (bOriginLatched)
 	{
 		const auto PushSpawn = [&](uint32 Count, uint32 Mode, const FVector& CenterWorld,
@@ -1411,15 +1482,13 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			// snapshot is anyway.)
 			const FVoxelFluidCountsSnapshot Snapshot = SimState->GetLatestCounts();
 			const uint32 AliveNow = Snapshot.bValid ? Snapshot.Alive : 0u;
-			// kAliveSoftCap = 102k: the MEASURED knee. 100k settled costs
-			// simGpuMs 2.4 (sorted gathers); the first backpressure run let the
-			// pool reach 156k and paid 21 ms -- deep piles compress and the
-			// constraint cost is superlinear in local density, so the cap sits
-			// at the scale the measurements actually cleared. (Constants hoisted
-			// to the namespace so the age-recycling band is derived from the
-			// same geometry -- see their comment block.)
-			const uint32 SoftCap = kAliveSoftCap;
-			const uint32 RampWidth = kAliveRampWidth; // emission full -> zero over 51,200..102,400
+			// The soft cap is voxel.Fluid.SoftCap (default 200,000; raised from
+			// the fixed 102,400 with stagnant-only aging -- persistent pools
+			// plus living streams need the headroom). The knee measurements,
+			// the transit/settled arithmetic, and why the age valve shares
+			// this exact geometry all live at FluidEmissionBand's definition.
+			const uint32 SoftCap = Band.SoftCap;
+			const uint32 RampWidth = Band.RampWidth; // emission full -> zero over [RampStart, SoftCap]
 			float EmitScale = 1.0f;
 			if (AliveNow >= SoftCap)
 			{
@@ -1691,10 +1760,14 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		Args.Occupancy = Occupancy.Get();
 		// Age recycling (contract item 9): same clock as the spawn stamps; band
 		// anchored to the emission ramp so recycling opens before throttling.
+		// Stagnant-only: the countdown applies to water moving slower than the
+		// threshold; anything faster refreshes its stamp every frame.
 		Args.NowSeconds = NowGameSec;
 		Args.MaxAgeSec = FMath::Max(0.0f, CVarVoxelFluidMaxAgeSec.GetValueOnGameThread());
-		Args.AgePopStart = kAgePopStart;
-		Args.AgePopEnd = kAliveRampStart;
+		Args.StagnantSpeedUU =
+			FMath::Max(0.0f, CVarVoxelFluidStagnantSpeedUU.GetValueOnGameThread());
+		Args.AgePopStart = Band.AgePopStart;
+		Args.AgePopEnd = Band.RampStart;
 		Args.Spawns = Spawns;
 		Args.bVerifyOccupancy = bVerify;
 		if (bVerify)
@@ -1931,6 +2004,9 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		L.LastPerfRecycled = uint64(Snapshot.RecycledAge);
 		// recycle= ran-flag rules: "off" when the cvar disables the age sink (a
 		// disabled stage must not print a real-looking 0/s), else the rate.
+		// Since the persistence pass this rate counts STAGNANT retirements only
+		// -- settled pool water cycling out -- never streams in flight (they
+		// refresh their stamps every frame and exit via the spatial sinks).
 		const FString RecycleField =
 			CVarVoxelFluidMaxAgeSec.GetValueOnGameThread() <= 0.0f
 				? FString(TEXT("off"))

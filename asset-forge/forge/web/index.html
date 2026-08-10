@@ -2,29 +2,39 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#101216">
   <title>asset-forge</title>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 
+<nav id="kinds" class="kinds" aria-label="Asset kind"></nav>
+
 <header class="bar">
-  <div class="brand">asset&#8209;forge</div>
+  <button id="panelToggle" class="ghost narrowonly" aria-expanded="false"
+          aria-controls="panel" title="Show the parameter panel">&#9776; Sliders</button>
+  <div class="brand" id="kindLabel">Trees</div>
   <select id="species" title="Load a species spec"></select>
   <span id="hash" class="hash" title="Spec hash — identifies this exact parameter set"></span>
   <span class="grow"></span>
   <label class="check"><input type="checkbox" id="auto" checked> auto&#8209;regenerate</label>
   <button id="saveSpec" class="ghost" title="Write the current sliders back to specs/&lt;name&gt;.json — rename first to fork a new species">Save spec</button>
-  <button id="tabGallery" class="tab on">Gallery</button>
-  <button id="tabLibrary" class="tab">Library</button>
-  <button id="tabBiomes" class="tab">Biomes</button>
+  <nav class="tabs">
+    <button id="tabGallery" class="tab on">Gallery</button>
+    <button id="tabLibrary" class="tab">Library</button>
+    <button id="tabBiomes" class="tab">Biomes</button>
+  </nav>
 </header>
 
 <main>
+  <div id="scrim" class="scrim hidden"></div>
   <aside id="panel">
     <div class="panelhead">
       <input id="specName" placeholder="species name" spellcheck="false">
       <button id="reset" class="ghost small" title="Back to the saved spec">Revert</button>
+      <button id="panelClose" class="ghost small narrowonly" title="Close">&times;</button>
     </div>
     <div class="askbox">
       <textarea id="ask" rows="2" spellcheck="false"
@@ -45,9 +55,11 @@
       <label>count <input id="count" type="number" value="12" min="1" max="200" step="1"></label>
       <button id="reroll" class="ghost">Reroll</button>
       <button id="more" class="ghost">More</button>
+      <button id="keepAll" class="ghost" title="Keep every tile that generated without a health flag">Keep all clean</button>
       <div id="progress" class="progress"><div id="bar"></div></div>
       <span id="status" class="status"></span>
     </div>
+    <div id="kindBlurb" class="kindblurb"></div>
     <div id="gallery" class="gallery"></div>
     <div id="library" class="gallery hidden"></div>
     <div id="biomes" class="coverage hidden"></div>
@@ -61,7 +73,7 @@
       <div class="detailimg">
         <canvas id="detailCanvas"></canvas>
         <img id="detailImg" alt="" class="hidden">
-        <div id="viewHint" class="viewhint">drag to spin &middot; scroll to zoom</div>
+        <div id="viewHint" class="viewhint">loading&hellip;</div>
         <div class="viewtoggle">
           <button id="view3d" class="tab on">3D</button>
           <button id="view2d" class="tab">Flat</button>

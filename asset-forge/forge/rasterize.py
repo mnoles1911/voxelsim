@@ -111,11 +111,25 @@ def foliage(
     offsets = rng.normal(scale=jitter * r_vox * 0.5, size=(cand.size, 3))
 
     placed = 0
+    droop_vox = m_to_vox(droop, grid.voxel_m)
     for k, i in enumerate(cand):
-        c = m_to_vox(skel.pos[i], grid.voxel_m) - origin + offsets[k]
-        c[2] -= m_to_vox(droop, grid.voxel_m)
+        anchor = m_to_vox(skel.pos[i], grid.voxel_m) - origin
+        shift = offsets[k].copy()
+        shift[2] -= droop_vox
+        r = max(radii[k], 1.0)
+        # Keep the clump ON the twig it hangs from. Droop and jitter together
+        # can carry a clump clear of its anchor, and the ball then sits in mid
+        # air joined to nothing. That was invisible at 10 cm, where a clump is
+        # two voxels across and any near miss still touches, and at 2 cm it left
+        # whole thousand-voxel leaf masses floating -- the single largest source
+        # of loose voxels in the library. Capping the displacement at three
+        # quarters of the radius keeps every clump overlapping its twig while
+        # leaving droop and jitter their visible range.
+        reach = float(np.linalg.norm(shift))
+        if reach > r * 0.75:
+            shift *= (r * 0.75) / reach
         grid.blob(
-            c, max(radii[k], 1.0), leaf, rng, density=density, squash=squash, only_air=True
+            anchor + shift, r, leaf, rng, density=density, squash=squash, only_air=True
         )
         placed += 1
     return placed

@@ -78,10 +78,11 @@
     "angular": 0.85,
     "bury": 0.32,
     "elongate": 0.8,
-    "erode": 0.3,
+    "erode": 0.2,
     "facets": 6,
     "flatten": 1.8,
     "lumps": 4,
+    "rough": 0.45,
     "rubble": 0.15,
     "size_m": 3.2,
     "spread": 0.3

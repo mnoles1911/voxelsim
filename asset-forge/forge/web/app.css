@@ -20,19 +20,59 @@
 
 html, body {
   margin: 0; height: 100%;
+  /* dvh follows the mobile browser's collapsing address bar; the % is the
+     fallback for anything that does not know the unit. */
+  height: 100dvh;
   background: var(--bg); color: var(--ink);
   font: 13px/1.45 ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  overscroll-behavior: none;
 }
 
-body { display: flex; flex-direction: column; overflow: hidden; }
+body {
+  display: flex; flex-direction: column; overflow: hidden;
+  padding-left: env(safe-area-inset-left); padding-right: env(safe-area-inset-right);
+}
+
+/* Shown only in the narrow layout; see the media query at the foot of the file. */
+.narrowonly { display: none; }
 
 /* --- top bar --- */
 
+/* --- asset kind sections --- */
+
+.kinds {
+  display: flex; align-items: stretch; gap: 2px;
+  padding: 0 10px; background: #10131a;
+  border-bottom: 1px solid var(--line); flex: 0 0 auto;
+  overflow-x: auto; scrollbar-width: none;
+}
+.kinds::-webkit-scrollbar { display: none; }
+.kinds .kind { white-space: nowrap; flex: 0 0 auto; }
+.kinds .kind {
+  background: none; border: none; border-bottom: 2px solid transparent;
+  border-radius: 0; padding: 9px 14px; color: var(--dim);
+  display: flex; align-items: baseline; gap: 7px;
+}
+.kinds .kind:hover { color: var(--ink); background: #161a22; }
+.kinds .kind.on { color: var(--ink); border-bottom-color: var(--accent); font-weight: 600; }
+.kinds .kind .kcount {
+  font-size: 10px; color: #5b6376;
+  background: var(--panel2); border-radius: 9px; padding: 1px 6px;
+}
+.kinds .kind.soon { opacity: .42; cursor: not-allowed; }
+.kinds .kind.soon:hover { background: none; color: var(--dim); }
+
+.kindblurb {
+  padding: 7px 14px 0; color: var(--dim); font-size: 12px; flex: 0 0 auto;
+}
+
 .bar {
-  display: flex; align-items: center; gap: 10px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 8px 12px; background: var(--panel);
   border-bottom: 1px solid var(--line); flex: 0 0 auto;
 }
+.tabs { display: flex; gap: 4px; }
 .brand { font-weight: 650; letter-spacing: .3px; }
 .grow { flex: 1; }
 .hash { color: var(--dim); font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
@@ -55,11 +95,18 @@ input[type=number] { width: 68px; }
 
 /* --- layout --- */
 
-main { flex: 1; display: flex; min-height: 0; }
+main { flex: 1; display: flex; min-height: 0; position: relative; }
 
 #panel {
   width: 320px; flex: 0 0 auto; overflow-y: auto;
   background: var(--panel); border-right: 1px solid var(--line);
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Backdrop behind the panel when it is a drawer. Inert on desktop. */
+.scrim {
+  position: absolute; inset: 0; background: rgba(6, 8, 11, .6);
+  z-index: 8; display: none;
 }
 .panelhead {
   display: flex; gap: 6px; padding: 10px;
@@ -145,6 +192,15 @@ main { flex: 1; display: flex; min-height: 0; }
   border-radius: 50%; background: var(--warn);
 }
 .tile.kept { border-color: var(--accent); }
+.tile .tilekeep {
+  position: absolute; top: 5px; right: 5px; width: 22px; height: 22px;
+  padding: 0; line-height: 1; font-size: 15px; opacity: 0;
+  background: rgba(16, 19, 26, .86); color: var(--ink);
+  transition: opacity .12s;
+}
+.tile:hover .tilekeep { opacity: 1; }
+.tile.kept .tilekeep { display: none; }
+.tile.saving { opacity: .55; }
 .tile .keptmark {
   position: absolute; top: 5px; right: 7px; color: var(--accent2); font-size: 14px;
 }
@@ -251,3 +307,74 @@ main { flex: 1; display: flex; min-height: 0; }
 .spbar i { display: block; height: 100%; background: var(--accent); }
 .spkept { color: var(--dim); font-size: 11px; min-width: 52px; text-align: right; }
 .spkept.zero { color: var(--warn); }
+
+
+/* --- touch and narrow screens ------------------------------------------- *
+
+   Two separate things, deliberately keyed on two separate queries.
+
+   `hover: none` is about INPUT, not size: a touch screen has no hover, so
+   anything that only appears on hover is invisible on it. The tile's keep
+   button is the one that matters -- on a phone it would simply never exist.
+
+   The width query is about LAYOUT: a 320 px sidebar next to a gallery does not
+   fit on a phone, so the sidebar becomes a drawer over the gallery instead of
+   shrinking both into uselessness. The gallery is the thing you came to look
+   at, so the gallery keeps the screen.                                       */
+
+@media (hover: none) {
+  .tile .tilekeep { opacity: 1; }         /* no hover to reveal it */
+  .tile .tilekeep { width: 34px; height: 34px; font-size: 19px; }
+  button, select { min-height: 34px; }
+  .sp { padding: 5px 0; }                 /* fingers, not a cursor */
+}
+
+@media (max-width: 820px) {
+  .narrowonly { display: inline-flex; align-items: center; }
+
+  .bar { gap: 7px; padding: 7px 10px; }
+  .brand { font-size: 13px; }
+  .bar .check { display: none; }          /* auto-regenerate stays on, just hidden */
+  #species { flex: 1 1 140px; min-width: 0; }
+  .hash { display: none; }
+  .tabs { flex: 1 1 100%; justify-content: stretch; }
+  .tabs .tab { flex: 1; padding: 7px 4px; }
+
+  /* The panel becomes a drawer sliding in from the left, over the gallery. */
+  #panel {
+    position: absolute; inset: 0 auto 0 0; z-index: 9;
+    width: min(88vw, 340px);
+    transform: translateX(-101%); transition: transform .18s ease;
+    border-right: 1px solid var(--line); box-shadow: 0 0 30px rgba(0, 0, 0, .5);
+  }
+  body.panelopen #panel { transform: none; }
+  body.panelopen .scrim { display: block; }
+
+  .controls { padding: 8px 10px; gap: 7px; }
+  .controls label { font-size: 12px; }
+  input[type=number] { width: 58px; }
+  .progress { flex: 1 1 60px; width: auto; }
+
+  .gallery { padding: 10px; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+  .tile .imgwrap { height: 150px; }
+  .coverage { padding: 10px; gap: 10px; grid-template-columns: 1fr; }
+
+  /* Full-bleed detail sheet: on a phone a centred modal with a margin wastes
+     the only screen there is, and the 3D viewer is the point of opening it. */
+  .overlay { padding: 0; }
+  .sheetbox { max-height: 100dvh; height: 100dvh; border-radius: 0; border: none; }
+  .detailgrid { padding: 12px; gap: 12px; }
+  .detailimg { flex: 1 1 100%; min-width: 0; min-height: 0; padding: 6px; }
+  #detailCanvas { height: 46dvh; min-height: 0; }
+  .detailimg img { max-height: 46dvh; }
+  .detailinfo { flex: 1 1 100%; min-width: 0; }
+  .viewtoggle { top: 8px; left: 8px; }
+  .viewhint { font-size: 10px; bottom: 6px; }
+  .close { width: 40px; height: 40px; font-size: 26px; }
+}
+
+@media (max-width: 460px) {
+  .gallery { grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); }
+  .tile .imgwrap { height: 124px; }
+  .kinds .kind { padding: 9px 10px; }
+}
