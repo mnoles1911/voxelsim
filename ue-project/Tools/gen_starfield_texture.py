@@ -62,11 +62,27 @@ Tools/sky_star_graph.py's "EQUIRECT UV" section defines the lookup:
     v = 0.5 - dec/pi     ->  row 0 is dec +90 (north celestial pole) at the TOP
     u = StarRotation + StarUDirection * (-H / 2pi)
 
-RA's origin is absorbed wholesale into the StarRotation parameter, so this map's
-RA zero is arbitrary and no calibration is needed -- u = ra/360 left to right.
 Address mode is WRAP in U and CLAMP in V, so the map must be seamless across the
 u=0/1 meridian: every noise field here is generated periodic in galactic
 longitude, and the galactic->equatorial warp inherits that seamlessness.
+
+The U CONVENTION IS COPIED FROM THE MAP BEING REPLACED, and it had to be
+measured because nothing in this repo records it. Measured 2026-08-09 by
+correlating the NASA map's own pixels against the 25 brightest stars' J2000
+positions over every (handedness, offset) at 0.25 degree resolution: the peak
+scores 24.97 out of a possible 25.0 against a median of 1.80 across the search,
+which is not a fit that can be argued with. The convention is
+
+    u = (180 - RA) / 360        MIRRORED, with a 180 degree offset
+    v = (90 - dec) / 180
+
+and this generator writes the same one (see ra_from_column / column_from_ra).
+It matters for exactly one reason: with the same convention this map is a DROP-IN
+swap and MPC_VoxelSky's StarUDirection and StarRotation keep their current
+values. With the opposite handedness the sky would render mirrored -- which for
+randomly-placed stars is undetectable, but it would put the Milky Way's band at
+the wrong parity against the horizon, and it would silently invalidate whatever
+StarUDirection was set to when it was tuned against the NASA map.
 
 
 BRIGHTNESS SCALE -- matched to the map being replaced, on purpose
@@ -92,11 +108,13 @@ integrated light, no grain.
 
 16-BIT IS LOAD-BEARING, NOT A FLOURISH
 --------------------------------------
-The dark-sky floor is ~0.0025 linear and the brightest star is 1.0: a 400:1
-range living entirely in the bottom 1% of the encoding. In 8-bit that floor is
-0.6 of a code value -- the whole faint half of the sky would quantise to 0 or 1
-and the Milky Way's gradients would band into contours. In 16-bit it is 164
-levels, and a magnitude 7 star (4e-4) is still 26 levels. Pillow cannot write
+The dark-sky floor is ~0.003 linear and the brightest star is 1.0: a 300:1
+range whose interesting half lives entirely in the bottom 1% of the encoding.
+In 8-bit the floor is 0.8 of a code value and the entire Milky Way -- 0.003 at
+its edge to 0.09 in the bulge -- gets 22 code values to render its gradients in,
+which is banding, not a sky. In 16-bit the floor is 197 levels and the band has
+5700. Everything this generator does to avoid grain would be undone at the last
+step by an 8-bit write. Pillow cannot write
 16-bit RGB PNG, so this file contains a small PNG writer (write_png16); UE's
 libpng path reads 16-bit truecolour fine and fills alpha with 0xffff
 (PngImageWrapper.cpp:436-446).
@@ -166,6 +184,19 @@ def galactic_matrix():
 
 
 GAL_M = galactic_matrix()
+
+
+# The measured NASA convention, u = (180 - RA)/360, as the ONE pair of functions
+# everything here goes through. See "COORDINATES" in the module docstring.
+
+def ra_from_column(x_plus_half, w):
+    """Column centre -> right ascension, radians."""
+    return math.pi - x_plus_half * (2.0 * math.pi / w)
+
+
+def column_from_ra(ra_rad, w):
+    """Right ascension, radians -> fractional column."""
+    return ((math.pi - ra_rad) % (2.0 * math.pi)) * (w / (2.0 * math.pi))
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +311,7 @@ def tint(rgb):
 # into ambient starlight through StarAmbientGain. Match the mean and night's
 # ambient is unchanged; the redistribution -- out of a noisy floor and into a
 # smooth Milky Way -- is the entire visible difference.
-NEB_SCALE = 1.34
+NEB_SCALE = 1.39
 
 
 def build_nebula_galactic(gh, gw, rng):
@@ -318,9 +349,13 @@ def build_nebula_galactic(gh, gw, rng):
     pole = 1.0 - smoothstep(58.0, 89.5, np.abs(b_deg))
 
     # Clumping. Base octave 24x24 cells over (180 deg, 360 deg) = features about
-    # 7.5 deg tall and 15 deg wide, four octaves down to ~1 deg -- which at
-    # 8192x4096 is 20 texels. Nothing here is ever a few texels across.
-    clump = 0.40 + 1.25 * fbm(gh, gw, 24, 24, 4, rng)
+    # 7.5 deg tall and 15 deg wide, six octaves down to 0.23 deg -- which is 10
+    # texels at 8192x4096, and 5 texels in the half-resolution galactic map this
+    # is painted in. That is the floor: the finest octave must stay several
+    # texels wide in the map it is BUILT in, or the bilinear upsample turns it
+    # into diamond-shaped mush, and anything finer than that is grain by
+    # definition. Six is where that runs out; do not add a seventh.
+    clump = 0.40 + 1.25 * fbm(gh, gw, 24, 24, 6, rng)
     halo_clump = 0.55 + 0.75 * fbm(gh, gw, 8, 10, 3, rng)
 
     core = amp * core_shape * clump
@@ -328,7 +363,7 @@ def build_nebula_galactic(gh, gw, rng):
 
     # Dust lanes: absorption, so MULTIPLICATIVE, and confined to the plane --
     # dust sits in the disc, and lanes floating at b=40 would read as smudges.
-    lane_field = fbm(gh, gw, 14, 12, 4, rng)
+    lane_field = fbm(gh, gw, 14, 12, 5, rng)
     confine = np.exp(-((b_deg / (1.5 * width)) ** 2))
     lanes = 1.0 - 0.78 * confine * smoothstep(0.42, 0.72, lane_field)
 
@@ -390,7 +425,7 @@ def warp_to_equatorial(neb, h, w, chunk_rows=256):
     gh, gw = neb.shape[:2]
     out = np.empty((h, w, 3), dtype=np.float32)
 
-    ra = (np.arange(w, dtype=np.float64) + 0.5) * (2.0 * math.pi / w)
+    ra = ra_from_column(np.arange(w, dtype=np.float64) + 0.5, w)
     cos_ra, sin_ra = np.cos(ra), np.sin(ra)
 
     for y0 in range(0, h, chunk_rows):
@@ -469,9 +504,12 @@ def warp_to_equatorial(neb, h, w, chunk_rows=256):
 # squashed stars over most of the sky and a smear of dots at the poles.
 
 MAG_MIN = -1.5
-MAG_MAX = 7.0
+MAG_MAX = 8.0
 MAG_ALPHA = 0.50
-FAINT_PEAK = 0.040
+# Brightness anchor, held at magnitude 7 so that extending MAG_MAX to pick up
+# the sub-visual sprinkle does not silently re-scale every star in the sky.
+ANCHOR_MAG = 7.0
+ANCHOR_PEAK = 0.040
 
 
 def draw_stars(img, n_stars, rng, h, w):
@@ -506,9 +544,9 @@ def draw_stars(img, n_stars, rng, h, w):
     span = 10.0 ** (MAG_ALPHA * (MAG_MAX - MAG_MIN)) - 1.0
     mag = MAG_MIN + np.log10(1.0 + rng.random(n_stars) * span) / MAG_ALPHA
 
-    flux = FAINT_PEAK * 10.0 ** (-0.4 * (mag - MAG_MAX))
+    flux = ANCHOR_PEAK * 10.0 ** (-0.4 * (mag - ANCHOR_MAG))
     peak = 1.0 - np.exp(-flux)
-    bright = np.clip((MAG_MAX - mag) / (MAG_MAX - MAG_MIN), 0.0, 1.0)
+    bright = np.clip((6.5 - mag) / 8.0, 0.0, 1.0)
     sigma = 0.62 + 1.15 * bright ** 2
 
     # --- colour ------------------------------------------------------------
@@ -533,7 +571,7 @@ def draw_stars(img, n_stars, rng, h, w):
     rgb /= np.maximum(rgb @ LUMA, 1e-6)[:, None]
 
     # --- splat -------------------------------------------------------------
-    cx = (ra / (2.0 * math.pi)) * w
+    cx = column_from_ra(ra, w)
     cy = (0.5 - dec / math.pi) * h
     cos_dec = np.maximum(np.cos(dec), 0.012)          # pole guard
     halo_amp = 0.055 * bright ** 3
@@ -666,7 +704,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--width", type=int, default=8192)
     ap.add_argument("--height", type=int, default=0, help="default width/2")
-    ap.add_argument("--stars", type=int, default=18000)
+    # 50,000 down to magnitude 8.0, of which ~18,000 are brighter than
+    # magnitude 7 -- the naked-eye set the eye actually counts. The 32,000
+    # fainter ones are the SPRINKLE: at 0.016 and below they are 2-5x the sky
+    # floor, which is what fills the Milky Way in between the resolved stars.
+    # They are not grain -- every one of them is a PSF-splatted dot several
+    # texels wide, and the count is set by the same power law as the rest.
+    ap.add_argument("--stars", type=int, default=50000)
     ap.add_argument("--preview", action="store_true",
                     help="2048x1024 draft; same maths, minutes faster")
     ap.add_argument("--out", default=None)
@@ -735,7 +779,7 @@ def main():
         ev = GAL_M.T @ v
         dec = math.asin(max(-1.0, min(1.0, ev[2])))
         ra = math.atan2(ev[1], ev[0]) % (2.0 * math.pi)
-        cx, cy = int(ra / (2.0 * math.pi) * w), int((0.5 - dec / math.pi) * h)
+        cx, cy = int(column_from_ra(ra, w)), int((0.5 - dec / math.pi) * h)
         half = min(512, h // 4)
         y0 = max(0, min(h - 2 * half, cy - half))
         xs = (np.arange(cx - half, cx + half)) % w
@@ -750,7 +794,7 @@ def main():
             "    display = clamp((linear * %.1f) ^ (1/%.1f))\n"
             "standing in for the fixed deep-night exposure the game renders "
             "this at (DeepNightEV 13.6). Without it these files are black "
-            "rectangles: the dark-sky floor is 0.0025 linear.\n\n"
+            "rectangles: the dark-sky floor is 0.003 linear.\n\n"
             "  starfield-full-2048.png          whole sky, box-downsampled from "
             "%dx%d\n"
             "  starfield-crop-milkyway-1to1.png 1:1 texels, galactic centre "

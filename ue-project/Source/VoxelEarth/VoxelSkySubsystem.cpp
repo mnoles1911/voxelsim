@@ -67,18 +67,24 @@ namespace
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyDayLengthSeconds(
-		TEXT("voxel.Sky.DayLengthSeconds"), 1200.0f,
-		TEXT("Wall-clock seconds per game day. Default 1200 = a 20-minute day, which is the ")
-		TEXT("shortest cycle that still leaves a recognisable dawn and dusk (~50 s each at 52 N) ")
-		TEXT("rather than a strobe, and short enough that a play session sees several. This is the ")
-		TEXT("DIURNAL clock only; the seasonal one is DaysPerYear below and the two are ")
-		TEXT("deliberately decoupled -- see VoxelEphemeris.h's JulianDayFromGameClock comment."),
+		TEXT("voxel.Sky.DayLengthSeconds"), 2400.0f,
+		TEXT("Wall-clock seconds per game day. Default 2400 = a 40-minute day. DOUBLED from 1200 ")
+		TEXT("on 2026-08-09: at 1200 the sky visibly moved while you stood still. This is the one ")
+		TEXT("knob that sets the whole sky's angular rate -- the sun, the moon and the star field ")
+		TEXT("all derive from frac(epoch / DayLengthSeconds), so doubling it halves every one of ")
+		TEXT("them together and nothing can drift out of step with anything else. Dawn and dusk ")
+		TEXT("now run ~100 s each at 52 N. This is the DIURNAL clock only; the seasonal one is ")
+		TEXT("DaysPerYear below and the two are deliberately decoupled -- see VoxelEphemeris.h's ")
+		TEXT("JulianDayFromGameClock comment. NOTE the knock-on there: a game YEAR is ")
+		TEXT("DayLength * DaysPerYear, so a doubled day also doubles the year to 32 h of play, ")
+		TEXT("and the calendar's reachable dates stay 365.2425/DaysPerYear = 7.6 real days apart ")
+		TEXT("-- the DATE spacing does not change, only how long you wait between dates."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyDaysPerYear(
 		TEXT("voxel.Sky.DaysPerYear"), 48.0f,
-		TEXT("Game days per game year. Default 48, i.e. a season per ~4 hours of play at the ")
-		TEXT("default day length (48 * 1200 s = 16 h per year, /4 = 4 h per season). NOTE the ")
+		TEXT("Game days per game year. Default 48, i.e. a season per ~8 hours of play at the ")
+		TEXT("default day length (48 * 2400 s = 32 h per year, /4 = 8 h per season). NOTE the ")
 		TEXT("consequence VoxelEphemeris.h:130-138 spells out: the solar declination moves ")
 		TEXT("VISIBLY WITHIN one game day at this compression (365.2425/48 = 7.6 real days per ")
 		TEXT("game day), so the sun rises at a different point on the horizon than it set at. ")
@@ -190,7 +196,7 @@ namespace
 		TEXT("continuously rotating directional light invalidates UE's cached whole-scene shadow ")
 		TEXT("setup every single frame; stepping it instead quantises shadow motion, which is ")
 		TEXT("visible as a pop if the step is coarse. 10 Hz is a starting guess, NOT a measurement ")
-		TEXT("-- at the default 1200 s day the sun moves 0.03 deg per step, which should be below ")
+		TEXT("-- at the default 2400 s day the sun moves 0.015 deg per step, which should be below ")
 		TEXT("the visible-pop threshold, and whether the cap buys anything at all is exactly what ")
 		TEXT("the W7 perf leg exists to settle. 0 = uncapped (re-orient every frame), which is the ")
 		TEXT("control arm of that measurement."),
@@ -1186,11 +1192,11 @@ namespace
 	// dimming lights and an exposure stop, never from crushing albedo. Nothing in
 	// this file touches voxel.GI.AmbientFloor or any other GI cvar and it must not.
 	//
-	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 1200 s day the sun sweeps
-	// 3 degrees in ~10 seconds of wall clock, so this is a 2-stop fade over ten
-	// seconds -- 0.20 stops/s, still no faster than what ships at sunrise, where
+	// THE 3-DEGREE BAND IS NOT ABRUPT. At the default 2400 s day the sun sweeps
+	// 3 degrees in ~20 seconds of wall clock, so this is a 2-stop fade over twenty
+	// seconds -- 0.10 stops/s, still no faster than what ships at sunrise, where
 	// the table below now moves 5.89 stops across the 8 degrees from -6 to +2
-	// (~27 s, 0.22 stops/s). That comparison was rechecked when the cap's onset
+	// (~54 s, 0.11 stops/s). That comparison was rechecked when the cap's onset
 	// moved from -2 to -6: the sunrise ramp got LONGER in degrees and gentler per
 	// degree, so the claim survives with margin it did not have before.
 	//
@@ -2185,8 +2191,8 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// primitive and bust no cached shadow setup, so the cap has nothing to save
 	// here. And one reason of their own, which is stronger than exposure's: this
 	// drives the position of a moon disc 0.52 degrees wide. A 10 Hz step through a
-	// 1200 s day moves the sun and moon 0.03 degrees per step -- invisible on a
-	// shadow, but 6% of the moon's own diameter, i.e. a disc that visibly jerks
+	// 2400 s day moves the sun and moon 0.015 degrees per step -- invisible on a
+	// shadow, but 3% of the moon's own diameter, i.e. a disc that visibly jerks
 	// ten times a second while everything around it moves smoothly.
 	ApplySkyMaterialParams();
 
@@ -2196,7 +2202,7 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// invalidates UE's cached whole-scene shadow setup every frame. Stepping the
 	// rotation instead lets that cache survive between steps -- at the cost of
 	// quantising shadow motion, which shows up as a pop if the step is coarse
-	// enough. At the default 1200 s day and 10 Hz that step is 0.03 degrees of
+	// enough. At the default 2400 s day and 10 Hz that step is 0.015 degrees of
 	// solar motion, which should be far below the visible-pop threshold.
 	//
 	// THE TRADEOFF IS UNMEASURED. "Should be" is doing real work in that

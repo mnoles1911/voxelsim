@@ -2,7 +2,7 @@ Previews of starfield_procedural_8k.png (8192x4096, linear, 16-bit).
 
 DISPLAY TRANSFORM, applied to the previews ONLY -- the texture itself is linear and untouched:
     display = clamp((linear * 6.0) ^ (1/2.2))
-standing in for the fixed deep-night exposure the game renders this at (DeepNightEV 13.6). Without it these files are black rectangles: the dark-sky floor is 0.0025 linear.
+standing in for the fixed deep-night exposure the game renders this at (DeepNightEV 13.6). Without it these files are black rectangles: the dark-sky floor is 0.003 linear.
 
   starfield-full-2048.png          whole sky, box-downsampled from 8192x4096
   starfield-crop-milkyway-1to1.png 1:1 texels, galactic centre (l=0, b=0)

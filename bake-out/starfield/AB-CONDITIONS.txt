@@ -1,0 +1,45 @@
+A/B: the 4k NASA star map vs the procedural 8k one. 2026-08-09.
+
+    ab-<site>-nasa.png          tools/sky-assets/starmap_2020_4k.exr   (4096x2048)
+    ab-<site>-procedural.png    tools/sky-assets/starfield_procedural_8k.png (8192x4096)
+
+WHAT IS HELD EQUAL. Each pair is the SAME 45 x 22.5 degree window of sky,
+sampled bilinearly from each map and written at the same 1024x512, with the same
+display transform. Equal ANGULAR windows at equal pixel size is the comparison
+that matters, because both maps are stretched over the same 200 km dome -- so
+the NASA window (512x256 of its texels) is upscaled 2x, which is exactly what
+the GPU does with it in game. Both maps carry the same UV convention
+(u = (180 - RA)/360, v = (90 - dec)/180), so the two crops are the same stars.
+
+DISPLAY TRANSFORM, previews only -- both textures are linear and untouched:
+
+    display = clamp((linear * 6.0) ^ (1/2.2))
+
+standing in for the fixed deep-night exposure the game renders these at
+(DeepNightEV 13.6). Without it both files are near-black: the dark-sky floor is
+0.003-0.005 linear.
+
+SITES
+    milkyway   RA 266.4  Dec -28.9   galactic centre, the bulge
+    cygnus     RA 305.0  Dec +40.0   the band away from the bulge
+    darksky    RA 192.9  Dec +27.1   north galactic pole -- THE GRAIN CHECK,
+                                     the one that shows the difference plainly
+
+MEASURED, over each crop (Rec.709 luminance; hf-std is the deviation about a
+4x4 box mean, i.e. the texel-scale noise):
+
+    site       map          mean      hf-std
+    milkyway   nasa         0.0806    0.0188
+    milkyway   procedural   0.0430    0.0073
+    cygnus     nasa         0.0377    0.0172
+    cygnus     procedural   0.0246    0.0066
+    darksky    nasa         0.0035    0.0116     <- noise 3.3x the local mean
+    darksky    procedural   0.0049    0.0034     <- and most of THAT is stars
+
+Whole-map means are matched on purpose (NASA 0.01290, procedural 0.01288): the
+map's absolute values feed the SkyLight capture, so keeping the integrated light
+the same keeps night's ambient the same. What changed is where it sits -- out of
+a noisy floor, into a smooth Milky Way.
+
+Regenerate the procedural map (and the starfield-*.png previews here) with
+    python ue-project/Tools/gen_starfield_texture.py

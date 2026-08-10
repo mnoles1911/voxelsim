@@ -332,9 +332,10 @@ function of it.
   > to the client, or a dedicated-server client renders an unlit or stale sky.
   > This is a silent failure in the one configuration nobody routinely runs —
   > see §8 risk 8 for the full argument.
-- **Calendar.** `voxel.Sky.DayLengthSeconds` (default 1200 = a 20-minute day),
-  `voxel.Sky.DaysPerYear` (default 48 — a season passes in roughly four hours of
-  play), `voxel.Sky.AxialTiltDeg` (23.44).
+- **Calendar.** `voxel.Sky.DayLengthSeconds` (default 2400 = a 40-minute day;
+  doubled from 1200 on 2026-08-09 because the sky read as moving too fast),
+  `voxel.Sky.DaysPerYear` (default 48 — a season passes in roughly eight hours of
+  play at that day length), `voxel.Sky.AxialTiltDeg` (23.44).
 - **Geographic mapping — new concept, does not exist today.** A grep for
   latitude/longitude across the whole repo returns nothing: the diffusion world
   is an unlabelled infinite plane. This plan defines the mapping:

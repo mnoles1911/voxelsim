@@ -12,18 +12,20 @@ Content/Voxel/TextureSource/):
 
 Settings matter as much as the pixels here:
 
-  T_SkyStarmap        NASA SVS equirectangular star map (celestial/ICRF
-                       coords), half-float EXR. sRGB OFF -- this is linear
-                       HDR data, not display-referred colour; sRGB-decoding
-                       it would darken and hue-shift every star. TC_HDR keeps
-                       the half-float dynamic range (an ordinary BC1/BC7
-                       colour format would clip it to LDR). Address: wrap in
-                       U (right ascension wraps around the sky), clamp in V
-                       (declination does not wrap over the poles -- wrapping
-                       V would smear the north/south pole texels across the
-                       seam). Mips ON: it's a distant background plate,
-                       minification is expected, and mips suppress star-field
-                       aliasing/shimmer at grazing angles.
+  T_SkyStarmap        The equirectangular star map. TWO POSSIBLE SOURCES --
+                       see "WHICH STAR MAP" below; the settings that follow
+                       apply to both. sRGB OFF -- this is linear data, not
+                       display-referred colour; sRGB-decoding it would darken
+                       and hue-shift every star, and it would also break the
+                       material, which samples with SAMPLERTYPE_LINEAR_COLOR
+                       (sky_star_graph.py:427-432) and only gets that from a
+                       non-sRGB texture. Address: wrap in U (right ascension
+                       wraps around the sky), clamp in V (declination does not
+                       wrap over the poles -- wrapping V would smear the
+                       north/south pole texels across the seam). Mips ON: it's
+                       a distant background plate, minification is expected,
+                       and mips suppress star-field aliasing/shimmer at
+                       grazing angles.
 
   T_MoonColor          LROC colour-poles albedo mosaic. sRGB ON (ordinary
                        display-referred colour), TC_DEFAULT (regular BCn
@@ -39,6 +41,43 @@ Settings matter as much as the pixels here:
                        per-4x4-pixel-block, which would introduce terracing
                        into whatever displaces/parallax-samples this map.
                        Wrap U / clamp V, matching the other two.
+
+WHICH STAR MAP, and how to choose. Added 2026-08-09 for "the night skybox is
+too grainy".
+
+  PROCEDURAL (default when present)   tools/sky-assets/starfield_procedural_8k.png
+      8192x4096, 16-bit, built by ue-project/Tools/gen_starfield_texture.py.
+      Chosen by default because the NASA map's grain is measured and severe:
+      in a starless patch its high-frequency deviation is 3.5x its own local
+      mean, its stars carry no point-spread function at all, and at 4k each
+      texel covers ~2.5 screen pixels at 2K/90deg -- so the noise is magnified
+      rather than minified. The generator's docstring has the full measurement.
+      Compression is TC_HDR_COMPRESSED (BC6H), NOT TC_HDR: at 8192x4096,
+      RGBA16F would be 268 MB resident (358 MB with mips), while BC6H is 33.5
+      MB (44 MB with mips) -- so this is a 4x resolution increase that HALVES
+      the memory the 4k TC_HDR map used. BC6H is safe for a star field
+      specifically because it interpolates endpoints in half-float BIT-PATTERN
+      space, which is piecewise logarithmic: a block spanning 0.003 to 1.0
+      quantises geometrically (first step above the floor is 0.006, not 0.069
+      as a linear encoder would give), so bright stars do not blow bright
+      square halos into the dark sky around them.
+
+  NASA (fallback)                     tools/sky-assets/starmap_2020_4k.exr
+      4096x2048 half-float, SVS 4851 / Gaia DR2, fetched by
+      tools/fetch-sky-assets.ps1. TC_HDR (uncompressed RGBA16F). Used
+      automatically if the procedural PNG is absent, so a checkout that has
+      only run fetch-sky-assets.ps1 still gets a sky.
+
+  Set VOXEL_STARMAP=nasa in the environment to force the NASA map even when
+  the procedural one is present -- that is the A/B control, and it is the only
+  way to get the old sky back without deleting files. VOXEL_STARMAP=procedural
+  makes its absence a hard error instead of a silent fallback.
+
+  Both files carry the SAME UV convention -- u = (180 - RA)/360, mirrored, and
+  v = (90 - dec)/180 -- so this is a drop-in swap: MPC_VoxelSky's StarRotation
+  and StarUDirection keep their current values either way. That convention was
+  not documented anywhere; it was measured off the NASA map's own pixels
+  against the 25 brightest stars (gen_starfield_texture.py, "COORDINATES").
 
 KNOWN RISK, unproven in this repo: EXR -> Texture2D import through
 unreal.TextureFactory has never been exercised here before (PNG import via
@@ -95,14 +134,61 @@ SOURCE_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools", "sky-assets")
 )
 
-# (asset name, source file, srgb, compression, mips, filter, address_u, address_v)
+PROCEDURAL_STARMAP = "starfield_procedural_8k.png"
+NASA_STARMAP = "starmap_2020_4k.exr"
+
+
+def choose_starmap():
+    """(source file, compression, never_stream) for T_SkyStarmap.
+
+    Loud about which one it picked, because "the sky still looks grainy" and
+    "the import silently fell back to the NASA map" are the same screenshot.
+    """
+    want = os.environ.get("VOXEL_STARMAP", "").strip().lower()
+    have_procedural = os.path.isfile(os.path.join(SOURCE_DIR, PROCEDURAL_STARMAP))
+
+    if want == "nasa":
+        unreal.log("T_SkyStarmap: VOXEL_STARMAP=nasa -- using %s (the A/B control)."
+                   % NASA_STARMAP)
+        return NASA_STARMAP, unreal.TextureCompressionSettings.TC_HDR, False
+
+    if want == "procedural" and not have_procedural:
+        raise RuntimeError(
+            "VOXEL_STARMAP=procedural but %s is missing. Generate it with "
+            "`python ue-project/Tools/gen_starfield_texture.py` (system Python, "
+            "needs numpy + Pillow) or unset VOXEL_STARMAP to fall back to the "
+            "NASA map." % os.path.join(SOURCE_DIR, PROCEDURAL_STARMAP))
+
+    if have_procedural:
+        unreal.log("T_SkyStarmap: using the procedural 8192x4096 map (%s), BC6H. "
+                   "Set VOXEL_STARMAP=nasa to import the 4k NASA map instead."
+                   % PROCEDURAL_STARMAP)
+        # never_stream: the point of this asset is its resolution, and a
+        # streamed 8k background plate is exactly the case the streamer is
+        # worst at -- the dome is 200 km across, so its screen-size heuristic
+        # has no useful signal. 44 MB resident, always mip 0.
+        return (PROCEDURAL_STARMAP,
+                unreal.TextureCompressionSettings.TC_HDR_COMPRESSED, True)
+
+    unreal.log_warning(
+        "T_SkyStarmap: %s not found, falling back to the 4k NASA map. This is "
+        "the GRAINY one -- run `python ue-project/Tools/gen_starfield_texture.py` "
+        "and re-run this script if that was not intended."
+        % PROCEDURAL_STARMAP)
+    return NASA_STARMAP, unreal.TextureCompressionSettings.TC_HDR, False
+
+
+_STAR_SRC, _STAR_COMP, _STAR_NOSTREAM = choose_starmap()
+
+# (asset name, source file, srgb, compression, mips, filter, address_u,
+#  address_v, never_stream)
 SPECS = [
-    ("T_SkyStarmap", "starmap_2020_4k.exr", False, unreal.TextureCompressionSettings.TC_HDR,
+    ("T_SkyStarmap", _STAR_SRC, False, _STAR_COMP,
      unreal.TextureMipGenSettings.TMGS_FROM_TEXTURE_GROUP, unreal.TextureFilter.TF_DEFAULT,
-     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP),
+     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP, _STAR_NOSTREAM),
     ("T_MoonColor", "lroc_color_poles_4k.tif", True, unreal.TextureCompressionSettings.TC_DEFAULT,
      unreal.TextureMipGenSettings.TMGS_FROM_TEXTURE_GROUP, unreal.TextureFilter.TF_DEFAULT,
-     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP),
+     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP, False),
     # TC_DISPLACEMENTMAP: pythonized from the C++ enumerator TC_Displacementmap.
     # This repo has no prior use of this particular enum value to copy (only
     # TC_EDITOR_ICON / TC_DEFAULT / TC_HDR appear elsewhere), and this script
@@ -112,19 +198,19 @@ SPECS = [
     # for the exact spelling and fix this one line.
     ("T_MoonDisplacement", "ldem_4_uint.tif", False, unreal.TextureCompressionSettings.TC_DISPLACEMENTMAP,
      unreal.TextureMipGenSettings.TMGS_FROM_TEXTURE_GROUP, unreal.TextureFilter.TF_DEFAULT,
-     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP),
+     unreal.TextureAddress.TA_WRAP, unreal.TextureAddress.TA_CLAMP, False),
 ]
 
 
 def main():
     tasks = []
-    for (name, src, _srgb, _comp, _mips, _filt, _addr_u, _addr_v) in SPECS:
+    for (name, src, _srgb, _comp, _mips, _filt, _addr_u, _addr_v, _nostream) in SPECS:
         path = os.path.join(SOURCE_DIR, src)
         if not os.path.isfile(path):
             raise RuntimeError(
-                "missing %s -- run `tools/fetch-sky-assets.ps1` first "
-                "(pass -EightK if this spec is repointed at the 8k star map)"
-                % path)
+                "missing %s -- run `tools/fetch-sky-assets.ps1` for the NASA "
+                "sources, or `python ue-project/Tools/gen_starfield_texture.py` "
+                "for the procedural star map" % path)
 
         full = PACKAGE_PATH + "/" + name
         if unreal.EditorAssetLibrary.does_asset_exist(full):
@@ -143,7 +229,7 @@ def main():
     unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
 
     failures = []
-    for (name, src, srgb, comp, mips, filt, addr_u, addr_v) in SPECS:
+    for (name, src, srgb, comp, mips, filt, addr_u, addr_v, nostream) in SPECS:
         full = PACKAGE_PATH + "/" + name
         # load_object, not EditorAssetLibrary.load_asset: a -run=pythonscript
         # commandlet does not wait for the asset-registry scan, and load_asset
@@ -174,12 +260,23 @@ def main():
         tex.set_editor_property("filter", filt)
         tex.set_editor_property("address_x", addr_u)
         tex.set_editor_property("address_y", addr_v)
+        tex.set_editor_property("never_stream", nostream)
         # No post_edit_change() -- Texture2D does not expose it to Python
         # (5.8); set_editor_property already routes through
         # PostEditChangeProperty (see import_terrain_textures.py).
         unreal.EditorAssetLibrary.save_loaded_asset(tex)
-        unreal.log("imported %s  srgb=%s comp=%s mips=%s filter=%s addr=%s/%s"
-                   % (full, srgb, comp, mips, filt, addr_u, addr_v))
+        # Dimensions are logged because a texture GROUP can silently cap
+        # resolution (BaseDeviceProfiles.ini MaxLODSize), and "the 8k map
+        # imported as 4k" and "the 8k map imported" look identical otherwise.
+        # Guarded: the accessor is a convenience, not worth failing an
+        # otherwise-good import over if 5.8 spells it differently.
+        try:
+            dims = "%dx%d" % (tex.blueprint_get_size_x(), tex.blueprint_get_size_y())
+        except Exception:
+            dims = "size?"
+        unreal.log("imported %s from %s  %s srgb=%s comp=%s mips=%s "
+                   "filter=%s addr=%s/%s neverStream=%s"
+                   % (full, src, dims, srgb, comp, mips, filt, addr_u, addr_v, nostream))
 
     if failures:
         raise RuntimeError(

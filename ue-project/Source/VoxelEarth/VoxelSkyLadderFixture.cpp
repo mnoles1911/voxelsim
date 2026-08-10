@@ -183,7 +183,10 @@ struct FSkyLadderRun
 	// the epoch, and the epoch is what each rung overwrites, so re-deriving it
 	// would let the ladder walk. See ComputeRungEpochSeconds.
 	bool bLatched = false;
-	double DayLengthSeconds = 1200.0;
+	// Overwritten from VoxelSky::GetDayLengthSeconds() when the ladder latches
+	// (see the assignment in the arming path); this initialiser only has to
+	// match the shipped cvar default so a read before latching is not a lie.
+	double DayLengthSeconds = 2400.0;
 	double BaseDayIndex = 0.0;
 	double BaseEpochSeconds = 0.0;
 
@@ -1057,7 +1060,7 @@ bool VoxelSkyLadderFixture::StartFromCommandLine(UWorld* World)
 		// The pin was refused. ECVF_SetByCode loses to ECVF_SetByConsole and
 		// ECVF_SetByCommandLine, so the usual cause is the same value being set from
 		// -ExecCmds. A running clock drifts between the settle and the shutter --
-		// at the shipped 1200 s day and a 4 s settle that is ~4.8 simulated minutes
+		// at the shipped 2400 s day and a 4 s settle that is ~2.4 simulated minutes
 		// per rung, so every filename would be a small lie and the ladder would
 		// still look completely plausible.
 		UE_LOG(LogVoxelEarth, Error,

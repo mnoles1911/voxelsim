@@ -94,7 +94,8 @@ param(
 
     # --- THE ONLY THING THAT DIFFERS ----------------------------------------
     # 1.0 = the shipped default: one game day per voxel.Sky.DayLengthSeconds
-    # (1200 s), so a 270 s leg covers ~81 degrees of day. Raise it to force a
+    # (2400 s since 2026-08-09, was 1200), so a 270 s leg covers ~40 degrees of
+    # day -- half what it covered before the day length doubled. Raise it to force a
     # bigger sweep, but say what you raised it to -- at high scales the arms
     # stop differing only in "does the sun move" and start differing in "how
     # much sky did each one traverse".
