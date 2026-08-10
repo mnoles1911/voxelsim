@@ -1,0 +1,51 @@
+{
+  "crown": {
+    "center_frac": 0.86,
+    "height_frac": 0.26,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1300,
+    "radius_m": 5.0,
+    "shape": "umbrella",
+    "shell": 0.65,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.4,
+    "clump_radius_m": 0.35,
+    "coverage": 0.9,
+    "density": 0.55,
+    "droop_m": -0.1,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 0.45
+  },
+  "growth": {
+    "gravity": 0.05,
+    "inertia": 0.4,
+    "influence_m": 2.8,
+    "jitter": 0.07,
+    "kill_m": 0.45,
+    "max_iter": 300,
+    "phototropism": 0.02,
+    "radius_exp": 2.2,
+    "step_m": 0.28,
+    "tip_radius_m": 0.045
+  },
+  "height_m": 8.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_dry"
+  },
+  "name": "savanna-acacia",
+  "notes": "Flat-topped umbrella crown on a bare trunk. The silhouette is the whole species, so crown.shape and the low crown.height_frac matter more here than anything else.",
+  "trunk": {
+    "buttress": 0.15,
+    "clear_frac": 0.52,
+    "lean_deg": 6.0,
+    "lean_dir_deg": 200.0,
+    "radius_base_m": 0.34,
+    "wander": 0.22
+  }
+}

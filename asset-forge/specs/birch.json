@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.7,
+    "height_frac": 0.58,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1400,
+    "radius_m": 2.3,
+    "shape": "column",
+    "shell": 0.35,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.35,
+    "coverage": 0.94,
+    "density": 0.66,
+    "droop_m": 0.2,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 0.85
+  },
+  "growth": {
+    "gravity": -0.16,
+    "inertia": 0.5,
+    "influence_m": 2.0,
+    "jitter": 0.06,
+    "kill_m": 0.4,
+    "max_iter": 260,
+    "phototropism": 0.16,
+    "radius_exp": 2.4,
+    "step_m": 0.25,
+    "tip_radius_m": 0.035
+  },
+  "height_m": 16.0,
+  "materials": {
+    "bark": "bark_pale",
+    "core": "heartwood",
+    "leaf": "leaf_broadleaf"
+  },
+  "name": "birch",
+  "notes": "Slender pale-barked northern broadleaf. After vengi's tree_birch proportions: tall for its girth, narrow crown, high branch-free trunk.",
+  "trunk": {
+    "buttress": 0.05,
+    "clear_frac": 0.38,
+    "lean_deg": 4.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.21,
+    "wander": 0.1
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

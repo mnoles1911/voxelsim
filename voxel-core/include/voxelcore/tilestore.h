@@ -605,6 +605,7 @@ constexpr bool fineErrorIsTransient(FineError e) {
     case FineError::kBadPayload:
     case FineError::kValueOutOfRange:
     case FineError::kBadBasinTable:
+    case FineError::kBadHeadwaterTable:
         return false;
     }
     return false;

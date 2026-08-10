@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.68,
+    "height_frac": 0.66,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1200,
+    "radius_m": 3.0,
+    "shape": "sphere",
+    "shell": 0.2,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.35,
+    "coverage": 0.95,
+    "density": 0.72,
+    "droop_m": 0.1,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 0.9
+  },
+  "growth": {
+    "gravity": -0.05,
+    "inertia": 0.4,
+    "influence_m": 1.8,
+    "jitter": 0.08,
+    "kill_m": 0.35,
+    "max_iter": 260,
+    "phototropism": 0.1,
+    "radius_exp": 2.2,
+    "step_m": 0.22,
+    "tip_radius_m": 0.035
+  },
+  "height_m": 6.5,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_blossom"
+  },
+  "name": "cherry-blossom",
+  "notes": "Small flowering broadleaf. Dense rounded crown of blossom rather than leaf. After vengi's tree_cherry.",
+  "trunk": {
+    "buttress": 0.1,
+    "clear_frac": 0.28,
+    "lean_deg": 6.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.22,
+    "wander": 0.3
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

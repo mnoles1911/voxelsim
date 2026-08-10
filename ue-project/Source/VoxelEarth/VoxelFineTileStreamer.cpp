@@ -288,14 +288,22 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 	}
 
 	// The preamble: header, section table, elevation index, water index, basin
-	// table. Four DISJOINT regions, not a prefix -- encode_v2 puts each plane's
-	// multi-megabyte data section immediately after its own index -- which is
-	// why this is a call into voxel-core rather than a "read the first 64 KB"
-	// here. ~62-67 KB of content in 2-4 requests.
+	// table, headwater table. DISJOINT regions, not a prefix -- encode_v2 puts
+	// each plane's multi-megabyte data section immediately after its own index
+	// -- which is why this is a call into voxel-core rather than a "read the
+	// first 64 KB" here. ~62-67 KB of content in 2-5 requests.
 	vxc::FinePreambleRequest Want;
 	Want.wantFlow = false;   // see above: nothing in this module reads flow
 	Want.wantWater = true;   // lakes.h / riverribbon.h decode water lazily
 	Want.wantBasins = true;  // the lake registry; absent != empty, so fetch it
+	// HEADS LOAD WHEREVER BASINS DO. Same argument, same cost class (a table of
+	// a few dozen 8-byte rows, not a plane), and the same absent-vs-empty trap:
+	// a tile whose heads were never fetched reports headsResident()==false, the
+	// fluid's faucet gather reads that as "no baked heads in this box" and falls
+	// to the rivernet graph fallback, whose rim false-heads were the "square of
+	// hovering water" the first playtest saw. It is the default in
+	// FinePreambleRequest; stated here so a future edit has to mean it.
+	Want.wantHeads = true;
 	vxc::FineTileBytes Held;
 	vxc::FineError PreambleErr = vxc::FineError::kNone;
 	vxc::FineHeaderFacts PreambleFacts;

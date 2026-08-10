@@ -216,6 +216,15 @@ struct FinePreambleRequest {
     bool wantFlow = true;
     bool wantWater = true;
     bool wantBasins = true;
+    // SECTION_HEADWATERS (bake_ver 24): the faucet list the PBF solver spawns
+    // from. Defaults ON for the same reason wantBasins does -- it is a preamble
+    // TABLE, not a plane, tens of bytes per tile rather than megabytes, and
+    // "absent" is indistinguishable from "empty" to every consumer. Leaving it
+    // off is what made FineTile::headsResident() permanently false on every
+    // ranged client, which sent GatherHeadwaterFaucets down the rivernet
+    // fallback and put its documented rim false-heads on screen as a square of
+    // hovering water.
+    bool wantHeads = true;
     uint64_t headProbeBytes = kFineHeadProbeBytes;
 };
 
@@ -223,10 +232,11 @@ struct FinePreambleRequest {
 // a FineTileBytes, ready for FineTile::parsePartial. Two rounds at most: one
 // head probe, then one request per section the probe did not already cover.
 //
-// The four regions are DISJOINT and that is the trap this function exists to
-// absorb (docs/tile-slicing-2026-08-04.md §2): encode_v2 emits ELEV_INDEX,
-// ELEV_DATA, FLOW_INDEX, FLOW_DATA, WATER_INDEX, WATER_DATA, BASIN_TABLE, so
-// each index sits immediately before its own multi-megabyte data section. "The
+// The requested regions are DISJOINT and that is the trap this function exists
+// to absorb (docs/tile-slicing-2026-08-04.md §2): encode_v2 emits ELEV_INDEX,
+// ELEV_DATA, FLOW_INDEX, FLOW_DATA, WATER_INDEX, WATER_DATA, BASIN_TABLE,
+// HEADWATERS, so each index sits immediately before its own multi-megabyte
+// data section. "The
 // first 65 KB" is 20 KB of index and 44 KB of compressed elevation, not the
 // preamble. A ground-only client (wantFlow=wantWater=false) gets its whole
 // preamble in ONE request of 20,663 B of content.

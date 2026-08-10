@@ -179,20 +179,159 @@ constexpr bool brickSolidBit(const uint32_t* brickWords, int32_t bx, int32_t by,
 }
 
 // ---------------------------------------------------------------------------
-// Volume bit indexing
+// Volume bit indexing — TOROIDAL
 // ---------------------------------------------------------------------------
 //
-// (lx, ly, lz) are VOLUME-LOCAL voxel coordinates, 0..511. World coordinates
-// are converted once, at the boundary, by subtracting the volume origin —
-// never mid-maths, for the same float-precision reason the contract gives for
-// FluidOriginUU (VoxelFluidContract.ush:20-25).
+// THREE coordinate spaces, and confusing any two of them is the whole class of
+// bug this section exists to prevent:
+//
+//   WORLD    (wx, wy, wz)  planet voxel coordinates, int64, unbounded.
+//   LOCAL    (lx, ly, lz)  window coordinates, 0..511: world minus the volume
+//                          origin. THIS IS THE GEOMETRIC SPACE. Particle
+//                          positions are local UU (contract item 1), the walk's
+//                          boundary planes are at local voxel edges, and the
+//                          collision projection puts a particle back at a local
+//                          plane. Nothing below changes any of that.
+//   STORAGE  (sx, sy, sz)  where the bit physically lives in the 16 MiB buffer,
+//                          0..511. Local plus a rolling offset, modulo 512.
+//
+// WHY STORAGE IS NOT LOCAL (contract item 4, ratified 2026-08-09). The volume
+// used to be flat: storage == local, so moving the origin by one voxel renamed
+// every bit in the buffer and the only correct response was to throw all 16 MiB
+// away and refill — 262,144 bricks to pack, against a mesher with ~893
+// bricks/s of spare capacity, i.e. a multi-second refill during which unbuilt
+// space is solid and the water in it is frozen. That cost is why v0 latched the
+// origin once and never moved it.
+//
+// Toroidal addressing makes the buffer a ROLLING WINDOW. Storage addresses are
+// anchored to the world, not to the window, so when the window slides the bits
+// that stay in view stay exactly where they are; only the newly exposed slab is
+// invalidated. The slab the window left behind is not cleared or copied — it is
+// simply reinterpreted, because the entering slab lands on precisely those
+// addresses (that is what "modulo" means here).
+//
+// THE OFFSET, AND WHY IT IS NOT JUST `world % 512`. The obvious anchor is
+// storage = world & 511, and it works — but only if the origin's x is a
+// multiple of 32, or a 32-voxel output word straddles the wrap seam and the
+// builder's whole-word write (which is what lets it run with no atomics and no
+// pass ordering; see fluidFillRegion below) becomes a read-modify-write race.
+// The origin is the camera's voxel minus 256 and is arbitrary. So the anchor is
+// instead the window's ACCUMULATED MOTION:
+//
+//     storage = (local + wrapOffset) mod 512
+//     wrapOffset = (origin - originAtCreation) mod 512
+//
+// which is the same rolling window, with the alignment property moved onto a
+// quantity the host controls: every recentre step is a multiple of
+// kFluidRecentreStepVoxels, so wrapOffset is always a multiple of 64 and no
+// word ever straddles the seam, whatever the initial origin was. It costs one
+// extra int3 uniform — exactly the cost the volume's own note predicted
+// (VoxelFluidOccupancy.h, SetOriginVoxel).
+//
+// The MIRROR is ue-project/Shaders/VoxelFluidCollision.ush (the reader) and
+// VoxelFluidOccupancy.usf (the writer), and the in-editor verify gate
+// (voxel.Fluid.Occupancy.Verify) byte-compares the GPU volume against
+// fluidFillRegion below — so the wrap has to be identical in three places or
+// the gate says so.
 
-constexpr int64_t fluidVolumeWordIndex(int32_t lx, int32_t ly, int32_t lz) {
-    return (static_cast<int64_t>(lz) * kFluidVolumeDimVoxels + ly) * kFluidVolumeWordsPerRow +
-           (lx / kFluidBitsPerWord);
+// 511. The wrap is an AND, not a %, which is why the dimension must be a power
+// of two — asserted rather than commented, because a future 384-voxel volume
+// would otherwise wrap wrong and silently, in a way that reads as terrain.
+inline constexpr int32_t kFluidVolumeWrapMask = kFluidVolumeDimVoxels - 1;
+static_assert((kFluidVolumeDimVoxels & kFluidVolumeWrapMask) == 0,
+              "toroidal addressing masks instead of dividing: the volume "
+              "dimension must be a power of two");
+
+// THE RECENTRE QUANTUM. The origin may only move in whole multiples of this on
+// every axis, and three separate requirements land on the number:
+//
+//   * 32 in x, minimum, or an output word straddles the wrap seam (above).
+//   * 8 in y and z, minimum, or an entering slab is not brick-aligned and
+//     cannot be packed by the region uploader at all.
+//   * 64 makes an entering slab a whole number of the 64^3 cells the host
+//     already fills the volume with (UVoxelFluidSubsystem's kFillCellVoxels),
+//     so a recentre refill is the SAME unit of work as the initial fill and
+//     rides the same per-tick budget. That is what makes the refill cost
+//     legible: one 64-voxel step exposes 8x8 = 64 cells out of the 512 the
+//     initial fill queues, i.e. 1/8 of the volume, 2 MiB of bits.
+//
+// (The volume's old cost note guessed "~1/50 of the volume for a one-chunk
+// step". That was optimistic about the step size, not about the mechanism: at
+// this 64-voxel quantum it is 1/8, and it would be 1/16 at the 32-voxel floor.
+// Either way it is a bounded slab instead of all 16 MiB, which is the point.)
+inline constexpr int32_t kFluidRecentreStepVoxels = 64;
+static_assert(kFluidRecentreStepVoxels % kFluidBitsPerWord == 0,
+              "a recentre step must keep the wrap seam on an output-word "
+              "boundary, or the builder's whole-word write races");
+static_assert(kFluidRecentreStepVoxels % kFluidBrickEdge == 0,
+              "a recentre step must keep entering slabs brick-aligned");
+static_assert(kFluidVolumeDimVoxels % kFluidRecentreStepVoxels == 0,
+              "the window must be a whole number of recentre cells");
+// 8 cells per axis, 512 in the volume — the same grid the host's initial fill
+// walks centre-out.
+inline constexpr int32_t kFluidRecentreCellsPerAxis =
+    kFluidVolumeDimVoxels / kFluidRecentreStepVoxels;
+
+// LOCAL -> STORAGE, one axis. `local` is 0..511 and `wrapOffset` is 0..511, so
+// the sum is below 1024 and the mask is one conditional subtract; no negative
+// operand ever reaches it, which is why this needs no floorMod.
+constexpr int32_t fluidVolumeStorageAxis(int32_t local, int32_t wrapOffset) {
+    return (local + wrapOffset) & kFluidVolumeWrapMask;
 }
-constexpr uint32_t fluidVolumeBitMask(int32_t lx) {
-    return 1u << (lx % kFluidBitsPerWord);
+
+// The rolling offset after moving the origin by `delta` voxels on one axis.
+// floorMod, not %, because the window slides in both directions and C's % would
+// hand back a negative storage coordinate for a westward move.
+constexpr int32_t fluidWrapOffsetAfterMove(int32_t wrapOffset, int64_t delta) {
+    return static_cast<int32_t>(floorMod(wrapOffset + delta, kFluidVolumeDimVoxels));
+}
+
+// A recentre delta the addressing can actually honour: whole recentre steps on
+// every axis. Refused rather than rounded — a rounded delta would put the
+// window somewhere other than where the caller thinks it is, and every world
+// coordinate the caller then packs would be off by the remainder.
+inline bool fluidRecentreDeltaIsAligned(const int64_t delta[3]) {
+    for (int a = 0; a < 3; ++a) {
+        if (delta[a] % kFluidRecentreStepVoxels != 0) return false;
+    }
+    return true;
+}
+
+// The invariant the builder's whole-word write depends on: the seam sits on an
+// output-word boundary. True by construction if every move was aligned, and
+// therefore worth checking at the point of use — it is the one thing that turns
+// a silent torn word into a refused dispatch.
+inline bool fluidWrapOffsetIsAligned(const int32_t wrapOffset[3]) {
+    for (int a = 0; a < 3; ++a) {
+        if (wrapOffset[a] < 0 || wrapOffset[a] >= kFluidVolumeDimVoxels) return false;
+        if (wrapOffset[a] % kFluidRecentreStepVoxels != 0) return false;
+    }
+    return true;
+}
+
+// (sx, sy, sz) are STORAGE voxel coordinates, 0..511 — where the bit lives, not
+// where it is. Callers that hold LOCAL coordinates want
+// fluidVolumeWordIndexLocal below; this is the raw addressing underneath both.
+constexpr int64_t fluidVolumeWordIndex(int32_t sx, int32_t sy, int32_t sz) {
+    return (static_cast<int64_t>(sz) * kFluidVolumeDimVoxels + sy) * kFluidVolumeWordsPerRow +
+           (sx / kFluidBitsPerWord);
+}
+constexpr uint32_t fluidVolumeBitMask(int32_t sx) {
+    return 1u << (sx % kFluidBitsPerWord);
+}
+
+// LOCAL (window) coordinates -> the word that holds them. This is the function
+// the verify gate must use to compare a GPU word against a CPU word: both sides
+// name a voxel by where it is in the WINDOW, and only this maps that to where
+// the bit was stored.
+constexpr int64_t fluidVolumeWordIndexLocal(const int32_t wrapOffset[3], int32_t lx, int32_t ly,
+                                            int32_t lz) {
+    return fluidVolumeWordIndex(fluidVolumeStorageAxis(lx, wrapOffset[0]),
+                                fluidVolumeStorageAxis(ly, wrapOffset[1]),
+                                fluidVolumeStorageAxis(lz, wrapOffset[2]));
+}
+constexpr uint32_t fluidVolumeBitMaskLocal(const int32_t wrapOffset[3], int32_t lx) {
+    return fluidVolumeBitMask(fluidVolumeStorageAxis(lx, wrapOffset[0]));
 }
 
 constexpr bool fluidVolumeInBounds(int32_t lx, int32_t ly, int32_t lz) {
@@ -200,14 +339,34 @@ constexpr bool fluidVolumeInBounds(int32_t lx, int32_t ly, int32_t lz) {
            ly < kFluidVolumeDimVoxels && lz < kFluidVolumeDimVoxels;
 }
 
-inline bool fluidVolumeGetBit(const uint32_t* words, int32_t lx, int32_t ly, int32_t lz) {
-    return (words[fluidVolumeWordIndex(lx, ly, lz)] & fluidVolumeBitMask(lx)) != 0u;
+// STORAGE-space accessors: (sx, sy, sz) name a slot in the buffer, not a place
+// in the world. Correct for whole-buffer work (the clear, a raw dump) and for
+// callers that already wrapped; anything holding window coordinates wants the
+// Local forms below.
+inline bool fluidVolumeGetBit(const uint32_t* words, int32_t sx, int32_t sy, int32_t sz) {
+    return (words[fluidVolumeWordIndex(sx, sy, sz)] & fluidVolumeBitMask(sx)) != 0u;
 }
 
-inline void fluidVolumeSetBit(uint32_t* words, int32_t lx, int32_t ly, int32_t lz, bool solid) {
-    const int64_t i = fluidVolumeWordIndex(lx, ly, lz);
-    const uint32_t m = fluidVolumeBitMask(lx);
+inline void fluidVolumeSetBit(uint32_t* words, int32_t sx, int32_t sy, int32_t sz, bool solid) {
+    const int64_t i = fluidVolumeWordIndex(sx, sy, sz);
+    const uint32_t m = fluidVolumeBitMask(sx);
     words[i] = solid ? (words[i] | m) : (words[i] & ~m);
+}
+
+// LOCAL-space accessors: (lx, ly, lz) name a place in the window, 0..511. The
+// wrap happens here and nowhere else in the caller.
+inline bool fluidVolumeGetBitLocal(const uint32_t* words, const int32_t wrapOffset[3], int32_t lx,
+                                   int32_t ly, int32_t lz) {
+    return fluidVolumeGetBit(words, fluidVolumeStorageAxis(lx, wrapOffset[0]),
+                             fluidVolumeStorageAxis(ly, wrapOffset[1]),
+                             fluidVolumeStorageAxis(lz, wrapOffset[2]));
+}
+
+inline void fluidVolumeSetBitLocal(uint32_t* words, const int32_t wrapOffset[3], int32_t lx,
+                                   int32_t ly, int32_t lz, bool solid) {
+    fluidVolumeSetBit(words, fluidVolumeStorageAxis(lx, wrapOffset[0]),
+                      fluidVolumeStorageAxis(ly, wrapOffset[1]),
+                      fluidVolumeStorageAxis(lz, wrapOffset[2]), solid);
 }
 
 // THE RULE THE WHOLE COLLISION MODEL RESTS ON: anything outside the built
@@ -217,9 +376,18 @@ inline void fluidVolumeSetBit(uint32_t* words, int32_t lx, int32_t ly, int32_t l
 // is a river that drains into the void the first time the volume lags the
 // camera by one frame, and it would look exactly like a solver bug.
 //
-// originVoxel is the world voxel coordinate of bit (0,0,0).
+// originVoxel is the world voxel coordinate of LOCAL (0,0,0) — the window's
+// minimum corner. wrapOffset is the STORAGE coordinate of that same corner (all
+// zeros for a window that has never moved).
+//
+// THE WINDOW TEST IS UNCHANGED BY THE WRAP, and that is the safety property:
+// the bounds check runs on the LOCAL coordinate, so a voxel outside the window
+// is still solid even though its storage address is perfectly valid and holds
+// somebody else's terrain. Dropping the check and trusting the modulo would
+// make a particle one voxel past the west face collide against the terrain
+// 51.2 m to its east — an aliasing bug that reads as terrain, not as a bug.
 inline bool fluidSolidAtVoxel(const uint32_t* words, const int32_t originVoxel[3],
-                              int64_t wx, int64_t wy, int64_t wz) {
+                              const int32_t wrapOffset[3], int64_t wx, int64_t wy, int64_t wz) {
     const int64_t lx = wx - originVoxel[0];
     const int64_t ly = wy - originVoxel[1];
     const int64_t lz = wz - originVoxel[2];
@@ -227,15 +395,22 @@ inline bool fluidSolidAtVoxel(const uint32_t* words, const int32_t originVoxel[3
         ly >= kFluidVolumeDimVoxels || lz >= kFluidVolumeDimVoxels) {
         return true;
     }
-    return fluidVolumeGetBit(words, static_cast<int32_t>(lx), static_cast<int32_t>(ly),
-                             static_cast<int32_t>(lz));
+    return fluidVolumeGetBitLocal(words, wrapOffset, static_cast<int32_t>(lx),
+                                  static_cast<int32_t>(ly), static_cast<int32_t>(lz));
 }
 
-// An unbuilt volume is ALL SOLID for the same reason, and this is what the
-// builder's clear pass writes. A volume that has just been created or
-// recentred freezes the particles inside it until the regions land, which is a
+// The window that has never moved. Named rather than a brace-initialised
+// literal at every call site, so "this code assumes a flat volume" is greppable.
+inline constexpr int32_t kFluidWrapOffsetNone[3] = {0, 0, 0};
+
+// An unbuilt volume is ALL SOLID for the same reason as outside-is-solid above,
+// and this is what the builder's clear pass writes. A volume that has just been
+// created freezes the particles inside it until the regions land, which is a
 // visible stall; the alternative is particles falling through terrain that
-// simply has not arrived yet, which is a leak that looks like physics.
+// simply has not arrived yet, which is a leak that looks like physics. It is
+// also the value fluidMarkRegionUnbuilt writes over an entering slab, which is
+// how a recentre pays the same stall over 1/8 of the volume instead of all of
+// it.
 inline constexpr uint32_t kFluidVolumeUnbuiltWord = 0xFFFFFFFFu;
 
 // ---------------------------------------------------------------------------
@@ -363,8 +538,21 @@ inline uint32_t fluidRegionWordFromBricks(const uint32_t* regionBrickWords, int3
     return out;
 }
 
-// The whole region, word by word. `words` is the full kFluidVolumeWords volume.
-inline void fluidFillRegion(uint32_t* words, const FluidRegion& r,
+// The whole region, word by word. `words` is the full kFluidVolumeWords volume;
+// the region is in LOCAL (window) coordinates and `wrapOffset` maps it to
+// storage. Mirror of FluidOccupancyFillMain.
+//
+// WHY A WHOLE-WORD WRITE SURVIVES THE WRAP. One output word is 32 voxels of x
+// owned by one thread. The wrap could in principle split that word across the
+// seam — and would, for an arbitrary offset. It cannot here: wrapOffset is
+// always a multiple of kFluidRecentreStepVoxels (64), the region's x is
+// 32-aligned by fluidRegionIsAligned, so a local word column maps to exactly
+// one storage word column. Both halves of that are checkable —
+// fluidWrapOffsetIsAligned and fluidRegionIsAligned — and the host checks them
+// before every dispatch, because the failure they prevent is a torn word at the
+// seam: a 32-voxel stripe of wrong terrain, once per recentre, somewhere in the
+// volume — findable only by the verify gate and only by luck.
+inline void fluidFillRegion(uint32_t* words, const int32_t wrapOffset[3], const FluidRegion& r,
                             const uint32_t* regionBrickWords) {
     const int32_t bricksX = fluidRegionBricks(r.sizeVoxels[0]);
     const int32_t bricksY = fluidRegionBricks(r.sizeVoxels[1]);
@@ -375,11 +563,140 @@ inline void fluidFillRegion(uint32_t* words, const FluidRegion& r,
                 const int32_t lx = r.minVoxel[0] + wx * kFluidBitsPerWord;
                 const int32_t ly = r.minVoxel[1] + ry;
                 const int32_t lz = r.minVoxel[2] + rz;
-                words[fluidVolumeWordIndex(lx, ly, lz)] =
+                words[fluidVolumeWordIndexLocal(wrapOffset, lx, ly, lz)] =
                     fluidRegionWordFromBricks(regionBrickWords, bricksX, bricksY, wx, ry, rz);
             }
         }
     }
+}
+
+// Marks a region UNBUILT (all solid) without an upload. Mirror of
+// FluidOccupancyMarkUnbuiltMain.
+//
+// WHY THIS EXISTS AND THE WHOLE-VOLUME CLEAR STILL DOES NOT. The builder
+// deliberately has no "store a constant" kernel for the whole volume, because
+// RDG already has a clear and a second mechanism is a second place for the
+// value to be wrong (VoxelFluidOccupancy.usf, "THE CLEAR IS NOT HERE"). That
+// argument does not reach a SUB-BOX: there is no ranged buffer clear, and the
+// alternative is uploading 64 bytes per brick of nothing but ones — 2 MiB on
+// the bus per recentre to say "I don't know yet".
+//
+// It is not optional. When the window slides, the entering slab's storage words
+// still hold the terrain from the slab that just left, 51.2 m away and
+// perfectly plausible. Leaving them would not freeze water (the safe failure);
+// it would collide water against terrain from somewhere else, which is the
+// failure that reads as worldgen.
+inline void fluidMarkRegionUnbuilt(uint32_t* words, const int32_t wrapOffset[3],
+                                   const FluidRegion& r) {
+    const int32_t wordsX = r.sizeVoxels[0] / kFluidBitsPerWord;
+    for (int32_t rz = 0; rz < r.sizeVoxels[2]; ++rz) {
+        for (int32_t ry = 0; ry < r.sizeVoxels[1]; ++ry) {
+            for (int32_t wx = 0; wx < wordsX; ++wx) {
+                const int32_t lx = r.minVoxel[0] + wx * kFluidBitsPerWord;
+                const int32_t ly = r.minVoxel[1] + ry;
+                const int32_t lz = r.minVoxel[2] + rz;
+                words[fluidVolumeWordIndexLocal(wrapOffset, lx, ly, lz)] = kFluidVolumeUnbuiltWord;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recentring: which cells enter the window
+// ---------------------------------------------------------------------------
+//
+// The window is a grid of kFluidRecentreCellsPerAxis^3 cells of
+// kFluidRecentreStepVoxels^3 voxels (8^3 cells of 64^3 voxels — the same cells
+// the host's initial fill queues centre-out). After a move, a cell of the NEW
+// window either (a) was wholly inside the OLD window, in which case its bits
+// are already correct and already at the right storage address and there is
+// nothing to do, or (b) was not, in which case it must be marked unbuilt and
+// refilled.
+//
+// ENUMERATED BY CONTAINMENT, NOT BY SLAB ARITHMETIC. The obvious
+// implementation is "the entering slab is delta voxels thick on the moved
+// axis"; it is also wrong for a diagonal move, where up to three slabs overlap
+// and the overlap gets marked (and refilled) two or three times. Testing each
+// cell costs 512 comparisons once per recentre and cannot double-count, and it
+// degenerates correctly with no special case when the move is larger than the
+// window (every cell enters — the full rebuild, reached rather than branched
+// to).
+inline bool fluidRecentreCellIsResident(const int64_t delta[3], const int32_t cell[3]) {
+    for (int a = 0; a < 3; ++a) {
+        // The cell's local box under the NEW origin, expressed under the OLD
+        // one: local_old = local_new + delta.
+        const int64_t lo = static_cast<int64_t>(cell[a]) * kFluidRecentreStepVoxels + delta[a];
+        if (lo < 0 || lo + kFluidRecentreStepVoxels > kFluidVolumeDimVoxels) return false;
+    }
+    return true;
+}
+
+// Calls fn(const FluidRegion&) for every cell of the new window that must be
+// invalidated and refilled, in NEW-origin LOCAL coordinates. Returns the count,
+// so a caller can tell "nothing entered" from "the enumeration did not run" —
+// the standing ran-flag rule.
+template <typename CellFn>
+int32_t fluidForEachEnteringCell(const int64_t delta[3], const CellFn& fn) {
+    int32_t count = 0;
+    for (int32_t cz = 0; cz < kFluidRecentreCellsPerAxis; ++cz) {
+        for (int32_t cy = 0; cy < kFluidRecentreCellsPerAxis; ++cy) {
+            for (int32_t cx = 0; cx < kFluidRecentreCellsPerAxis; ++cx) {
+                const int32_t cell[3] = {cx, cy, cz};
+                if (fluidRecentreCellIsResident(delta, cell)) continue;
+                FluidRegion r;
+                for (int a = 0; a < 3; ++a) {
+                    r.minVoxel[a] = cell[a] * kFluidRecentreStepVoxels;
+                    r.sizeVoxels[a] = kFluidRecentreStepVoxels;
+                }
+                fn(r);
+                ++count;
+            }
+        }
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Recentring: rebasing the particles
+// ---------------------------------------------------------------------------
+//
+// THE DECISION, RATIFIED AS CONTRACT ITEM 8. Particle positions stay
+// ORIGIN-RELATIVE and are rebased by one kernel when the origin moves; they do
+// not become world-anchored.
+//
+// The alternative was tempting because it makes recentring free for the solver:
+// leave positions in world UU and let every pass subtract the origin. It is not
+// available. The world spans tens of km and a float32 ULP at 30 km is 2 mm —
+// two orders of magnitude coarser than the 0.01 UU collision skin, and the PBF
+// density estimate differences positions at 10 UU spacing, where 2 mm of
+// quantisation is 0.02 % noise injected into every neighbour term. That is the
+// exact reason the contract put positions in [0, 5120] in the first place
+// (VoxelFluidContract.ush:20-25), and a recentre must not undo it.
+//
+// So: subtract the delta from every stored position, once, at the move.
+//
+// HOW MUCH ERROR THAT COSTS, EXACTLY. The delta is a whole number of voxels, so
+// deltaUU is an integer multiple of 10 and is itself exact well past any
+// plausible window motion (below). The subtraction p - deltaUU is then EXACT
+// whenever |p - deltaUU| <= |p|, i.e. whenever the particle moves toward the
+// new origin: deltaUU is a multiple of 640 (the recentre quantum in UU), every
+// float in [0, 5120] is a multiple of a power of two no coarser than 2^-11,
+// and the difference is therefore a multiple of the smaller operand's ULP and
+// representable. Moving away from the origin can round, by at most half a ULP
+// at 5120 UU = 2^-12 UU = 2.4 um — one fortieth of the collision skin and one
+// forty-thousandth of a voxel. Pinned by test rather than asserted here.
+inline constexpr float fluidRebaseDeltaUU(int32_t deltaVoxels) {
+    return static_cast<float>(deltaVoxels) * kFluidVoxelUU;
+}
+
+// Whole voxels times 10 UU stops being exactly representable in float32 above
+// 2^24 UU, i.e. 1,677,721 voxels = 167.7 km of window motion IN ONE STEP. A
+// jump that far is a teleport, not a recentre, and the host takes the
+// full-rebuild path for anything past the window anyway — but the bound is
+// named and tested so "float is fine here" is a checked claim and not a habit.
+inline constexpr int64_t kFluidRebaseExactMaxVoxels = (1LL << 24) / 10;
+inline constexpr bool fluidRebaseIsExactlyRepresentable(int64_t deltaVoxels) {
+    return deltaVoxels >= -kFluidRebaseExactMaxVoxels && deltaVoxels <= kFluidRebaseExactMaxVoxels;
 }
 
 // ---------------------------------------------------------------------------

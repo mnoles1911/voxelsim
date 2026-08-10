@@ -381,6 +381,53 @@ VXC_TEST(rivernet_baked_builder_requireWet_and_threshold_are_real_gates) {
     }
 }
 
+// THE SQUARE OF HOVERING WATER (first PBF playtest, 2026-08-09). A window onto
+// a larger world clips reaches at its rim, every clipped reach reads as a head,
+// and the faucets landed on the box boundary as a square. dropRimHeadwaters is
+// the mitigation; this pins both halves of it -- that the false heads go, and
+// that a GENUINE head one pixel inside the rim stays.
+VXC_TEST(rivernet_baked_builder_rim_heads_are_clip_artifacts_and_can_be_dropped) {
+    SyntheticBakedWater water;
+
+    // A window strictly INSIDE the reach: px 2..7 of the channel, so its only
+    // no-incoming node (px 2) is purely an artifact of where the box was cut.
+    {
+        RiverNetwork net;
+        BakedWaterBuildParams p;
+        p.bounds = RegionBounds{2, 2, 7, 7};
+        net.buildFromBakedWater(water, kSeed, p);
+        // The documented default: the clip artifact IS reported as a head.
+        CHECK_EQ(net.headwaterNodes().size(), size_t(1));
+        CHECK_EQ(net.bakedRimHeadsDropped(), uint64_t(0));
+    }
+    {
+        RiverNetwork net;
+        BakedWaterBuildParams p;
+        p.bounds = RegionBounds{2, 2, 7, 7};
+        p.dropRimHeadwaters = true;
+        CHECK(net.buildFromBakedWater(water, kSeed, p) > 0); // the reach still routes
+        // NO heads, and the ran-flag says why -- "a river passes through here"
+        // is a different report from "this valley is dry".
+        CHECK_EQ(net.headwaterNodes().size(), size_t(0));
+        CHECK_EQ(net.headwaterSegments().size(), size_t(0));
+        CHECK_EQ(net.bakedRimHeadsDropped(), uint64_t(1));
+    }
+
+    // A window whose rim clears the reach on every side: the spring at px 0 is
+    // interior now, and the cull must not touch it.
+    {
+        RiverNetwork net;
+        BakedWaterBuildParams p;
+        p.bounds = RegionBounds{-1, -1, 10, 10};
+        p.dropRimHeadwaters = true;
+        net.buildFromBakedWater(water, kSeed, p);
+        CHECK_EQ(net.headwaterNodes().size(), size_t(1));
+        CHECK_EQ(net.bakedRimHeadsDropped(), uint64_t(0));
+        const RiverNode& head = net.nodes()[net.headwaterNodes()[0]];
+        CHECK_EQ(head.elevationMm, int32_t(1000)); // px 0, the top of the chain
+    }
+}
+
 VXC_TEST(rivernet_baked_builder_graph_is_acyclic_and_routes_conservatively) {
     // The strict-total-order rule's purpose: no cycle can close, so water
     // injected anywhere reaches an outlet and the ledger stays exact.

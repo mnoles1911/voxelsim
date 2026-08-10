@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.84,
+    "height_frac": 0.3,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 600,
+    "radius_m": 4.5,
+    "shape": "umbrella",
+    "shell": 0.55,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.45,
+    "clump_radius_m": 0.45,
+    "coverage": 0.62,
+    "density": 0.38,
+    "droop_m": 0.05,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 0.7
+  },
+  "growth": {
+    "gravity": 0.02,
+    "inertia": 0.4,
+    "influence_m": 3.0,
+    "jitter": 0.1,
+    "kill_m": 0.6,
+    "max_iter": 260,
+    "phototropism": 0.06,
+    "radius_exp": 2.6,
+    "step_m": 0.34,
+    "tip_radius_m": 0.06
+  },
+  "height_m": 13.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_dry"
+  },
+  "name": "baobab",
+  "notes": "Enormous water-storing trunk under a small sparse crown. After vengi's tree_baobab: the trunk is most of the tree.",
+  "trunk": {
+    "buttress": 1.0,
+    "clear_frac": 0.55,
+    "lean_deg": 2.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 1.5,
+    "wander": 0.1
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

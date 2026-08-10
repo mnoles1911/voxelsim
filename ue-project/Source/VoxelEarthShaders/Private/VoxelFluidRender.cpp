@@ -20,6 +20,16 @@
 #include "SceneView.h"
 #include "SceneTexturesConfig.h" // FSceneTextureUniformParameters (ENGINE_API, public)
 #include "ShaderParameterStruct.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
+
+// `stat GPU` line for the whole screen-space fluid pass chain (splat ->
+// smoothX -> smoothY -> shadeComposite). Same note as VoxelFluidSim.cpp's:
+// RDG_GPU_STAT_SCOPE is a deprecated no-op in UE 5.8, so the scope is the
+// _STAT variant of the RDG event scope, and its name matches the event name.
+// This is complementary to the file's own RQT_AbsoluteTime bracket, not a
+// duplicate: that one feeds the 1 Hz perf line's renderMs, this one feeds the
+// profiler.
+DECLARE_GPU_STAT_NAMED(VoxelFluidRender, TEXT("VoxelFluidRender"));
 
 // DELIBERATELY NOT INCLUDED: Runtime/Renderer/Internal/PostProcess/
 // PostProcessInputs.h. FPostProcessingInputs is Renderer-Internal (UBT exposes
@@ -340,7 +350,7 @@ void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
 	const float DepthSigmaUU = 1.5f * RadiusUU;
 	const int32 SmoothRadiusPx = FMath::Clamp(Settings.SmoothRadiusPx, 1, 32);
 
-	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidRender");
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelFluidRender, "VoxelFluidRender");
 
 	// ---- GPU timing bracket (begin) -- same RQT_AbsoluteTime shape as the
 	// solver's (VoxelFluidSim.cpp), so renderMs and simGpuMs are comparable --

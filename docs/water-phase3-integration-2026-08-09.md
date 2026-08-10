@@ -102,8 +102,11 @@ test.
 ## Deviations / stated limits
 
 - **No recentring (v0)**: the origin latches once; toggle
-  `voxel.Fluid.Enable` to re-anchor (the volume's own cost note; toroidal
-  addressing remains the planned contract change).
+  `voxel.Fluid.Enable` to re-anchor. **Superseded in part 2026-08-09**: the
+  toroidal machinery now exists and the full-invalidation cost is gone, but
+  nothing calls it yet — the subsystem still latches once. See the addendum
+  "Toroidal occupancy" at the bottom of this file for the call the subsystem
+  should make.
 - **One basin sink per frame** — a region straddling two lakes credits only
   the picked one; v2 is a table upload (contract item 6 says so in place).
 - **Boundary attribution** is by region centre, not exit position (positions
@@ -368,3 +371,144 @@ voxel.Fluid.Render                0|1   (default 0)
 voxel.Fluid.Render.RadiusUU       15    (sprite radius, UU)
 voxel.Fluid.Render.SmoothRadiusPx 6     (bilateral radius, half-res px, 1..32)
 ```
+
+---
+
+## Addendum: toroidal occupancy addressing (contract item 4, 2026-08-09)
+
+Appended by the toroidal build; everything above is the integrator's and the
+renderer's and is unchanged apart from one superseded bullet in Deviations.
+
+### The problem it removes
+
+A recentre used to invalidate all 16 MiB. The volume was flat -- a bit's address
+was its window coordinate -- so moving the origin renamed every bit and the only
+correct response was to throw the lot away. Refilling is 262,144 bricks against
+a mesher with ~893 bricks/s of spare capacity: multi-second, with the unfilled
+part solid and the water in it frozen. That cost is why v0 latched the origin
+once and never moved it, which in turn is why the fluid could not follow a
+camera that walked.
+
+### What changed
+
+The buffer is now a **rolling window**. A bit's storage slot is
+
+```
+storage = (window coordinate + FluidVolumeWrapOffsetVoxel) mod 512
+```
+
+where the wrap offset is how far the window has slid since it was created. The
+bits still in view therefore keep their slots across a move: only the newly
+exposed cells are invalidated, and the cells that left are neither cleared nor
+copied -- the entering ones land on exactly their slots.
+
+Three coordinate spaces, and they are worth keeping apart in your head:
+
+| space | what it is | who uses it |
+|---|---|---|
+| WORLD | planet voxel coordinates | `VoxelFluidSolidAtVoxel`'s argument; brick packing |
+| LOCAL | world minus the origin, 0..511 | **everything geometric**: particle positions (UU), the collision walk's boundary planes, the projection, the boundary/basin boxes, the region/refill boxes |
+| STORAGE | local plus wrap offset, mod 512 | one expression in `VoxelFluidCollision.ush`, one in `VoxelFluidOccupancy.usf`, and `vxc::fluidVolumeWordIndexLocal` |
+
+**The window bounds test did not move and must not.** It runs on LOCAL, and it
+is what keeps "outside the volume is solid" true. Dropping it because "the
+modulo wraps harmlessly" makes a voxel one past the west face read the terrain
+51.2 m east -- the failure that reads as worldgen.
+
+**Why the offset is accumulated motion, not `world mod 512`.** Both are rolling
+windows. The simpler one additionally requires the origin's x to be a multiple
+of 32, or a 32-voxel output word straddles the seam and the builder's whole-word
+write becomes a read-modify-write that two regions can race on. The origin is
+the camera's voxel minus 256. Accumulated motion moves the alignment
+requirement onto a quantity the host controls: every step is a multiple of
+`vxc::kFluidRecentreStepVoxels` (64), so the seam is always word-aligned
+whatever the initial origin was. Cost: one `uint3` uniform.
+
+### The cost, in the units the budget is in
+
+A 64-voxel (6.4 m) step exposes 8x8 = **64 cells of the 512** the initial fill
+queues -- 1/8 of the volume, ~2 MiB of bits. At the default
+`voxel.Fluid.Occupancy.RegionsPerTick 8` that is 8 ticks, ~0.13 s at 60 Hz.
+(The volume's old cost note guessed "~1/50 for a one-chunk step". That was
+optimistic about the step size, not about the mechanism: 1/8 at this quantum,
+1/16 at the 32-voxel floor. Either way it is a bounded slab instead of 16 MiB.)
+
+A camera outrunning the refill -- faster than 6.4 m per 8 ticks, i.e. ~48 m/s --
+grows the queue rather than breaking anything: unbuilt is solid, so water at the
+leading edge freezes and nothing leaks, and the backlog shows in the perf line's
+`occupancy=<built>/<deferred>`. **Flying is the case to measure.**
+
+### The call the subsystem should make (NOT WIRED YET)
+
+Nothing calls `RecentreTo`. `UVoxelFluidSubsystem::LatchOrigin` still calls
+`SetOriginVoxel` once and the origin never moves, exactly as before. The
+machinery, the tests and the contract are in place; the policy is one function
+in the subsystem, and it belongs to whoever owns that file:
+
+```
+// Once per game tick, after the view origin is known, BEFORE ProcessOccupancyQueue.
+CamVoxel   = WorldToVoxel(ViewOriginUU)
+WantOrigin = CamVoxel - DimVoxels/2                      // re-centre exactly
+Drift      = WantOrigin - OriginVoxel                    // per axis
+if (max|Drift| < 96) return;                             // hysteresis: 1.5 steps
+Step       = round(Drift / 64) * 64                      // whole recentre steps
+Occupancy->RecentreTo(OriginVoxel + Step, RefillCells, Delta, Error)
+```
+
+then, in the same tick:
+
+1. **Update the subsystem's own origin state** from the new origin --
+   `OriginVoxel`, `FluidOriginWorld` (= origin x 10, contract item 1), the
+   boundary-box centre, the basin box, and `SetFluidSpillIntercept`'s XY box.
+   These are all derived per tick already; they must be derived from the NEW
+   origin or the water is offset from the terrain by the step.
+2. **Queue the returned cells** exactly the way the initial fill queues its 512:
+   `PackRegionBricks` against the new origin, `UpdateRegion`, ordered centre-out
+   so terrain near the camera lands first. They are already snapped; no
+   arithmetic needed. Ignoring them leaves the entering slab solid *forever*.
+3. **Rebase the particles.** `TakePendingRebaseDeltaVoxels()` on the game thread,
+   then `FVoxelFluidOccupancyVolume::AddRebaseParticlesPass(GraphBuilder,
+   ParticlesUAV, SimSlotBound, Delta)` in the solver's graph, **between solver
+   ticks** -- first thing after the occupancy `AddPasses` the ordering guard
+   already pins. Skipping it slides the water 6.4 m sideways relative to the
+   terrain, once per recentre, cumulatively. (Contract item 8.)
+
+**The two numbers.** Step 64 voxels because that is both the addressing quantum
+and the fill-cell size. Trigger 1.5 steps (96 voxels, 9.6 m) so that
+round-to-nearest leaves the drift inside +/-32 and the camera must travel a
+further 64 voxels to trigger again. Without the 1.5 a camera loitering on a
+boundary pays 64 cells of refill every few frames.
+
+`SetOriginVoxel` is unchanged and still correct for the two cases where
+preserving nothing is right: the first latch, and a teleport.
+
+### Verify gate
+
+`voxel.Fluid.Occupancy.Verify` now applies the same wrap on both sides
+(`fluidVolumeWordIndexLocal`). It had to: the cursor names a cell in the WINDOW,
+and comparing at a flat index would compare two different voxels the moment the
+offset is non-zero and report every one of them as a FAIL. This is the only
+change made to `VoxelFluidSubsystem.cpp` by this work -- two lines.
+
+### Verification done here (no editor launched, per constraints)
+
+- **UBT `Result: Succeeded`** (VoxelEarthEditor Win64 Development, MSVC 14.51),
+  no new warnings.
+- **`vxc_tests` 572 PASS / 0 FAIL**, including 11 new cases: wrap indexing as a
+  bijection across the seam; whole-word preservation (and the unaligned offset
+  that would break it); verify-gate equivalence for a region straddling the
+  seam; outside-the-window-is-solid against the exact slot that would alias;
+  the collision walk crossing the seam in both directions plus free motion
+  across it; entering-cell enumeration for straight/diagonal/backwards/beyond
+  moves with a no-double-count assertion; delta and offset alignment; a full
+  end-to-end recentre proving the far side is byte-identical, that the entering
+  slab really would serve the old terrain, and that marking closes it; two full
+  laps of the ring rebuilt only incrementally; and the particle-rebase precision
+  bound.
+- **Offline dxc**: all 14 fluid entry points to both DXIL and SPIR-V, 28/28
+  green (occupancy x3 including the two new kernels, sim x11 with
+  `VOXEL_FLUID_HAS_COLLISION=1`). `tools/lint-shader-ub.py` clean on the three
+  files this work owns.
+- **Not verified here** (needs the editor): that a recentre looks right, and the
+  refill latency at speed. Nothing calls `RecentreTo` yet, so there is nothing
+  in-editor to look at until the subsystem policy above is wired.

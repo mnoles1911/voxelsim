@@ -1,0 +1,156 @@
+# asset-forge
+
+Cubic-voxel environment assets for voxelsim. Trees first; rocks, bushes, reeds
+and grass use the same pipeline later with a different skeleton step.
+
+Why it is built the way it is: `docs/tree-asset-generator-research.md`.
+What it is for and where it goes: `docs/tree-asset-generator-plan.md`.
+
+## The idea in one paragraph
+
+A species is a JSON file. Sliders write it, plain-language requests patch it,
+batch generation reads it, a seed picks one individual out of it, the library
+stores it. A tree is therefore never a blob of voxels we have to keep — it is
+`(spec, seed)`, a few hundred bytes that regenerate byte-for-byte the same
+voxels every time. That is what makes "hundreds of variants" cheap.
+
+## Status
+
+Phases 1 and 2 work: the generator core and the app. Twelve species.
+Phase 0 (making the engine able to hold a tree at all) is deferred until the
+editor box is free and is tracked in the plan — **nothing here can be stamped
+into the world yet**, because the tree materials do not exist in
+`vxc::Material` and the streaming layer still skips the chunks a crown would
+occupy.
+
+## Run the app
+
+    python -m forge.cli serve
+
+Opens <http://127.0.0.1:8731/> in your browser. Left panel is every parameter
+as a slider, grouped; the middle is a gallery of variants; click one for a
+large render, its measurements and **Keep to library**.
+
+- **Generate / More / Reroll** — a fresh batch, the next block of seeds, or a
+  random seed range.
+- **auto-regenerate** — regenerates when you release a slider, not during the
+  drag; a tree costs a few hundred milliseconds and mid-drag frames would only
+  ever be stale.
+- **Keep to library** writes `library/<species>/<species>-<seed>/` containing
+  the spec, the realized individual, `tree.vox`, `tree.vxa`, a thumbnail and
+  measurements. The Library tab lists everything kept, with download links.
+- **Save spec** writes the current sliders back to `specs/<name>.json`. Change
+  the species name first to fork a new species instead of overwriting.
+- **Contact sheet** dumps the current gallery to `out/` as one page.
+- `#seed=N` in the URL opens that variant directly, so a particular tree can be
+  bookmarked or handed to someone.
+
+Finished tiles are memoised by `(spec hash, seed, scale)`. Because generation
+is deterministic a tile computed once is valid forever, so returning to a
+species or nudging a slider back is instant rather than a regrow.
+
+## Command line
+
+    python -m forge.cli gen     specs/temperate-oak.json --seed 7
+    python -m forge.cli batch   specs/temperate-oak.json --count 100
+    python -m forge.cli survey                    # every species on one page
+    python -m forge.cli check   specs/tundra-pine.json
+    python -m forge.cli schema                    # the slider table, as JSON
+    python -m forge.cli materials                 # material IDs and engine status
+    python -m forge.cli selftest
+
+Needs `numpy`, `scipy`, `pillow`. The app itself adds no dependencies — it is
+stdlib `http.server` and a hand-written page. Output lands in `out/`.
+
+`batch` writes a contact sheet: every seed on one page, each labelled with its
+seed and measured height, anything the health check flagged marked in the
+corner. That sheet is the actual product — choosing is the designer's job and
+it happens by eye.
+
+## Species
+
+    temperate-oak       large broadleaf, the baseline
+    temperate-sapling   small young broadleaf
+    river-broadleaf     dense drooping riverbank tree
+    birch               slender, pale bark, narrow crown
+    cherry-blossom      small flowering, blossom instead of leaf
+    hawthorn-scrub      low gnarled hedgerow scrub
+    tundra-pine         boreal conifer
+    jungle-emergent     30 m rainforest giant with buttress roots
+    coast-palm          bare leaning trunk, a few big fronds
+    savanna-acacia      flat umbrella crown
+    baobab              enormous trunk, small sparse crown
+    desert-dead         standing deadwood, no foliage
+
+Proportions for birch, cherry, hawthorn, palm and baobab were taken from the
+tree scripts in [vengi](https://github.com/vengi-voxel/vengi) (MIT), expressed
+in our own parameter vocabulary. The `hanging` crown shape is after their
+`tree_domehanging`. No code was copied.
+
+## How a tree is made
+
+1. **Envelope** (`envelope.py`) — the crown as a volume: sphere, cone,
+   umbrella, column, vase, wedge. Scatter growth targets inside it. This is
+   where biome variety comes from; a tundra pine and a savanna acacia are two
+   different volumes, not two pieces of code.
+2. **Skeleton** (`skeleton.py`) — space colonization (Runions et al. 2007).
+   Branches grow toward the targets nearest them and consume them on arrival,
+   so competition for space produces the branch pattern and branches never grow
+   through each other.
+3. **Rasterize** (`rasterize.py`, `grid.py`) — draw the skeleton straight into
+   a 10 cm grid. Every segment's centreline goes down first as a face-connected
+   voxel run, then thickens. Connectivity is guaranteed, not hoped for.
+4. **Foliage** (`rasterize.py`) — small ragged clumps on the twigs, jittered in
+   size and position.
+
+Before any of that, `spec.realize()` picks *one individual* out of the species:
+a bit taller, crown a bit wider, leaning a bit further, facing a random way.
+Without it every seed is the same tree with its twigs shuffled — the first
+100-seed sheet came out as a hundred oaks all 14.2 m tall, which would make a
+seed bank pointless. The `variation` group controls how far individuals stray.
+
+Steps 1–3 work in metres. The only place that knows a voxel is 10 cm is
+`grid.VOXEL_M`, which mirrors `vxc::kVoxelSizeMm`.
+
+## Why not generate a mesh and voxelize it
+
+Because at 10 cm a real branch is thinner than one voxel. Meshing first and
+voxelizing after (trimesh, cuda_voxelizer) hands the thin-branch decision to
+the sampler: twigs vanish or fatten arbitrarily, and the crown can end up not
+connected to the trunk. Drawing the skeleton into the grid makes that decision
+ours, once, explicitly. Research doc section 4 has the long version.
+
+Voxelization still has a job — the Blender round trip, when a designer edits an
+exported tree as a mesh and we bring it back. It is just not the main path.
+
+## Files
+
+    specs/*.json      species specs; the real IP lives here
+    forge/spec.py     the parameter table -- single source of truth for
+                      validation, the UI's sliders, and what a language model
+                      is allowed to touch
+    forge/pipeline.py spec + seed -> Tree, plus the per-asset health check
+    forge/render.py   isometric preview renderer (numpy + Pillow, no engine)
+    forge/contact.py  contact sheets
+    forge/vox.py      MagicaVoxel .vox export, splitting models over 256 voxels
+    forge/vxa.py      VXA1, the compact native format the engine will read
+    forge/materials.py material IDs -- slots 0-15 mirror core.h, 16+ are proposed
+
+## Health checks
+
+Every generated tree is measured, and `batch` reports how many were flagged:
+
+- **wood connected** — the trunk and branches must be one face-connected piece.
+  A branch joined only at a corner is a branch that falls off. This must be
+  100%; the selftest fails if it is not.
+- **attached** — how much of the tree touches anything, corners included.
+  Foliage is deliberately speckled, so it is checked more loosely than wood.
+- **ground contact** — a tree with nothing on the bottom slab would float.
+- **size** — anything over 256 voxels on an axis is flagged, because that is
+  the per-model limit in `.vox` and the export has to split it.
+
+## Adding a species
+
+Copy a spec, change it, run `check`, then `batch` it and look at the sheet.
+`python -m forge.cli schema` prints every parameter with its range and a
+one-line explanation.

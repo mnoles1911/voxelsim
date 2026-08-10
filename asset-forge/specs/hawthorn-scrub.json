@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.58,
+    "height_frac": 0.78,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 800,
+    "radius_m": 2.1,
+    "shape": "sphere",
+    "shell": 0.25,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.4,
+    "clump_radius_m": 0.3,
+    "coverage": 0.9,
+    "density": 0.62,
+    "droop_m": 0.06,
+    "enabled": true,
+    "min_order": 1,
+    "squash": 0.9
+  },
+  "growth": {
+    "gravity": -0.06,
+    "inertia": 0.32,
+    "influence_m": 1.4,
+    "jitter": 0.16,
+    "kill_m": 0.3,
+    "max_iter": 260,
+    "phototropism": 0.12,
+    "radius_exp": 2.1,
+    "step_m": 0.18,
+    "tip_radius_m": 0.03
+  },
+  "height_m": 3.8,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_broadleaf"
+  },
+  "name": "hawthorn-scrub",
+  "notes": "Low scrubby hedgerow tree, gnarled and wide for its height. After vengi's tree_hawthorn. Fills the gap between bush and tree.",
+  "trunk": {
+    "buttress": 0.1,
+    "clear_frac": 0.16,
+    "lean_deg": 11.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.14,
+    "wander": 0.55
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

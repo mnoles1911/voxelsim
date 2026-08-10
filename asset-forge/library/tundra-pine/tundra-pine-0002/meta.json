@@ -1,0 +1,42 @@
+{
+  "id": "tundra-pine-0002",
+  "species": "tundra-pine",
+  "seed": 2,
+  "spec_hash": "24e8479d12205452",
+  "stats": {
+    "seed": 2,
+    "spec_hash": "24e8479d12205452",
+    "nodes": 709,
+    "segments": 708,
+    "max_order": 4,
+    "iterations": 37,
+    "targets_left": 4,
+    "clumps": 600,
+    "height_m": 8.6,
+    "footprint_m": [
+      4.7,
+      4.5
+    ],
+    "extent_vox": [
+      47,
+      45,
+      86
+    ],
+    "voxels": 21391,
+    "by_material": {
+      "16": 2427,
+      "17": 3,
+      "20": 18961
+    },
+    "ground_contact": 26,
+    "ms_grow": 32.1,
+    "ms_raster": 82.5,
+    "wood_connected": 1.0,
+    "wood_detached": 0,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 122.0
+  },
+  "problems": [],
+  "vox_models": 1
+}

@@ -1,0 +1,51 @@
+{
+  "crown": {
+    "center_frac": 0.85,
+    "height_frac": 0.32,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 2200,
+    "radius_m": 8.5,
+    "shape": "umbrella",
+    "shell": 0.45,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.6,
+    "coverage": 0.85,
+    "density": 0.6,
+    "droop_m": 0.25,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 0.75
+  },
+  "growth": {
+    "gravity": -0.06,
+    "inertia": 0.45,
+    "influence_m": 3.5,
+    "jitter": 0.06,
+    "kill_m": 0.7,
+    "max_iter": 320,
+    "phototropism": 0.1,
+    "radius_exp": 2.3,
+    "step_m": 0.38,
+    "tip_radius_m": 0.07
+  },
+  "height_m": 28.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_jungle"
+  },
+  "name": "jungle-emergent",
+  "notes": "Rainforest giant that breaks through the canopy. Tall bare trunk, buttress roots, wide flat crown. Exceeds 256 voxels tall, so its .vox export splits into several models.",
+  "trunk": {
+    "buttress": 0.8,
+    "clear_frac": 0.62,
+    "lean_deg": 2.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.85,
+    "wander": 0.08
+  }
+}

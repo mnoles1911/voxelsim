@@ -15,8 +15,20 @@
 #include "DataDrivenShaderPlatformInfo.h"
 #include "RenderingThread.h"
 #include "Misc/AutomationTest.h"
+#include "ProfilingDebugging/RealtimeGPUProfiler.h" // DECLARE_GPU_STAT_NAMED
 
 DEFINE_LOG_CATEGORY_STATIC(LogVoxelFluid, Log, All);
+
+// `stat GPU` line for the whole solver graph.
+//
+// NOT RDG_GPU_STAT_SCOPE: UE 5.8 removed the legacy GPU profiler and that macro
+// is deprecated to a no-op (RenderGraphEvent.h:520 says so in its own message).
+// The live spelling is the _STAT variant of the event scope, which puts the
+// same span on the breadcrumb timeline AND attributes it to this stat -- so one
+// scope now feeds ProfileGPU and `stat GPU` both, where before it fed only the
+// former. The name is kept identical to the RDG event name so a ProfileGPU tree
+// and a stat line cannot be read as two different measurements.
+DECLARE_GPU_STAT_NAMED(VoxelFluidSim, TEXT("VoxelFluidSim"));
 
 // Macro, not a const TCHAR*, for the same reason VoxelGpuWorldGen.cpp:24
 // gives: IMPLEMENT_GLOBAL_SHADER stringizes its path argument.
@@ -538,7 +550,7 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 	// frame's render pass sees this tick's bound.
 	State.RenderSlotBound = Args.SimSlotBound;
 
-	RDG_EVENT_SCOPE(GraphBuilder, "VoxelFluidSim");
+	RDG_EVENT_SCOPE_STAT(GraphBuilder, VoxelFluidSim, "VoxelFluidSim");
 
 	// ---- occupancy volume: clear + queued region fills, FIRST ---------------
 	// Same graph, before any solver pass, or a substep collides against last

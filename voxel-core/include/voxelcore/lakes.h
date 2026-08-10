@@ -123,7 +123,7 @@ size_t lakeExtentFill(const BasinEntry& b, ElevFn&& elev, std::vector<uint8_t>& 
 
     std::vector<int32_t> stack;
     stack.reserve(256);
-    out[size_t(sy) * w + sx] = 1;
+    out[size_t(sy * w + sx)] = 1;
     stack.push_back(sy * w + sx);
     size_t n = 1;
     static constexpr int32_t kDy[8] = {-1, 1, 0, 0, -1, -1, 1, 1};

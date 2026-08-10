@@ -21,6 +21,11 @@
 #include "voxelcore/basinledger.h"
 #include "voxelcore/bytes.h"
 #include "voxelcore/caverns.h"
+// Water re-architecture Phase 3, faucet SELECTION: which baked heads are
+// springs, and where the river crosses the fluid window's boundary. Pure logic,
+// unit-tested in voxel-core (tests/test_fluidsprings.cpp) -- this file only
+// feeds it tile data and turns its answers into world-space emitters.
+#include "voxelcore/fluidsprings.h"
 #include "voxelcore/lakes.h"
 #include "voxelcore/mesher.h"
 // W4 shallow water (docs/adr/0004-swe-fixed-point-coupling.md). This include is
@@ -168,6 +173,36 @@ static TAutoConsoleVariable<int32> CVarVoxelWaterDemoteBudget(
 	TEXT("it `mobilized_` is insert-only and a persistent world leaks bricks, savegame and replication ")
 	TEXT("forever. The budget counts examinations, not demotions, because the 512-cell scan is the ")
 	TEXT("cost. Authority only. 0 = disabled (the pre-9c behaviour)."),
+	ECVF_Default);
+
+// --- SPRING SELECTION KNOBS (see voxelcore/fluidsprings.h) ------------------
+//
+// Integer-valued on purpose. The selection is exact integer arithmetic so a
+// re-gather cannot make a spring move, and a float cvar would put an FPU
+// rounding step in front of that.
+static TAutoConsoleVariable<int32> CVarVoxelWaterSpringQFactorPct(
+	TEXT("voxel.Water.Springs.QFactorPct"), 200,
+	TEXT("A baked headwater is a SPRING only if its discharge is at most this percent of the ")
+	TEXT("smallest discharge in its tile. 200 (the default) means 'first-order origins only': ")
+	TEXT("on tile (-4,-4) the tile minimum is 552,537 m^3/yr and the median head is 1.9M, so ")
+	TEXT("200%% keeps the gully tops and rejects the mid-network fragment breaks that make up ")
+	TEXT("70%% of the 57,157-row table. Raise it for more faucets, lower it for fewer."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterSpringSpacingPx(
+	TEXT("voxel.Water.Springs.SpacingPx"), 80,
+	TEXT("Minimum spacing between spring faucets, in FINE PIXELS (1.875 m each), keeping the ")
+	TEXT("lowest-discharge head of each cluster. 80 px = 150 m, wider than the 51.2 m fluid ")
+	TEXT("window, so a window holds at most one spring. 0 or 1 disables the spacing pass."),
+	ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarVoxelWaterEdgeRunoffMmPerYr(
+	TEXT("voxel.Water.Springs.EdgeRunoffMmPerYr"), 0,
+	TEXT("Discharge coefficient for WINDOW-EDGE river inflow: the mm/yr of catchment-mean ")
+	TEXT("runoff the flow plane's catchment area is multiplied by. 0 (the default) FITS it ")
+	TEXT("from the baked heads near the box, which is the only estimator that scored -- see ")
+	TEXT("voxelcore/fluidsprings.h's calibrateRunoff for the measured table. A non-zero value ")
+	TEXT("forces the coefficient and skips the fit."),
 	ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarVoxelWaterCeilingReliefBudget(
@@ -7096,11 +7131,93 @@ void UVoxelWaterSubsystem::GetBasinLedgerStats(bool& bOutLedgerActive, int32& Ou
 
 // --- PHASE 3 LIFECYCLE ACCESSORS (see the header block) ---------------------
 
+namespace
+{
+// The fine-pixel rectangle and tile range one lifecycle gather covers.
+//
+// SHARED BY THE SPRING GATHER AND THE CROSSING GATHER, and it has to be: the
+// crossing walk's whole job is to find the river on the boundary of the SAME
+// box the springs were selected in, and two copies of this arithmetic that
+// disagreed by one pixel would put an edge faucet just outside the box the
+// solver can emit into.
+struct FFaucetGatherBox
+{
+	int64 PixelMm = 0;
+	int64 MinPx = 0, MaxPx = 0, MinPy = 0, MaxPy = 0;
+	int64 Tx0 = 0, Tx1 = 0, Ty0 = 0, Ty1 = 0;
+};
+
+// pixelSizeMm() is a CONSTANT on the fine tier (1875 mm), readable before any
+// tile is resident. tileSize() is NOT -- it is read back off a loaded tile and
+// is 0 until one is, which is why the tile addressing here uses
+// vxc::kFineTileSize and why the old `TileSize == 0` early-out was itself part
+// of a bug: a cold sampler returned "no heads" without ever trying.
+bool ComputeFaucetGatherBox(int64 PixelMm, double CenterXUU, double CenterYUU, double RadiusUU,
+                            int64 HaloPx, FFaucetGatherBox& Out)
+{
+	if (PixelMm <= 0 || RadiusUU <= 0.0)
+	{
+		return false;
+	}
+	const int64 TileSize = int64(vxc::kFineTileSize);
+	Out.PixelMm = PixelMm;
+	Out.MinPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU - RadiusUU), PixelMm) - HaloPx;
+	Out.MaxPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU + RadiusUU), PixelMm) + HaloPx;
+	Out.MinPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU - RadiusUU), PixelMm) - HaloPx;
+	Out.MaxPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU + RadiusUU), PixelMm) + HaloPx;
+	Out.Tx0 = vxc::floorDiv(Out.MinPx, TileSize);
+	Out.Tx1 = vxc::floorDiv(Out.MaxPx, TileSize);
+	Out.Ty0 = vxc::floorDiv(Out.MinPy, TileSize);
+	Out.Ty1 = vxc::floorDiv(Out.MaxPy, TileSize);
+	return true;
+}
+
+// WARM THE TILES FIRST, exactly as FillRiverRibbonWindowBand does and for
+// exactly the same reason. findTile() is a pure map lookup that never loads;
+// the spring gather was the ONE consumer of ribbonTiles() that did not warm
+// residency first, so a box whose tiles no lake or ribbon query had yet touched
+// read as "no heads table anywhere" and dropped straight through to the
+// fallback. Warmed through waterSurfaceMmAtVoxel -- the ordinary column query,
+// which does load-then-ask -- so there is no second loader that could bring in
+// a different tile set. Cheap: 1-4 tiles for a 51 m box, and a tile already
+// resident costs one hash lookup.
+void WarmFaucetGatherTiles(FVoxelWaterImpl& I, const FFaucetGatherBox& Box)
+{
+	const int64 TileSize = int64(vxc::kFineTileSize);
+	for (int64 Ty = Box.Ty0; Ty <= Box.Ty1; ++Ty)
+	{
+		for (int64 Tx = Box.Tx0; Tx <= Box.Tx1; ++Tx)
+		{
+			const int64 Px = FMath::Clamp(Tx * TileSize, Box.MinPx, Box.MaxPx);
+			const int64 Py = FMath::Clamp(Ty * TileSize, Box.MinPy, Box.MaxPy);
+			I.Water->waterSurfaceMmAtVoxel(vxc::floorDiv(Px * Box.PixelMm, int64(vxc::kVoxelSizeMm)),
+			                               vxc::floorDiv(Py * Box.PixelMm, int64(vxc::kVoxelSizeMm)));
+		}
+	}
+}
+
+// A fine pixel's CENTRE in world UU -- the same convention every other consumer
+// of a fine pixel uses (a corner-anchored faucet is half a pixel, 0.94 m, off
+// its channel).
+FVector2D FinePixelCentreUU(int64 Px, int64 Py, int64 PixelMm)
+{
+	return FVector2D(VoxelCoords::MmToWorld(Px * PixelMm + PixelMm / 2),
+	                 VoxelCoords::MmToWorld(Py * PixelMm + PixelMm / 2));
+}
+
+// How far outside the box the runoff fit looks for rated heads. 128 fine px is
+// 240 m, which at the world's head density (tile (-4,-4): one head per 1,174
+// px^2) holds ~68 heads -- comfortably over calibrateRunoff's 8-sample floor --
+// while spanning at most 2x2 flow-plane blocks, so the fit costs a handful of
+// block decodes rather than the whole 67 MB plane.
+constexpr int64 kRunoffFitHaloPx = 128;
+
+} // namespace
+
 int32 UVoxelWaterSubsystem::GatherHeadwaterFaucets(double CenterXUU, double CenterYUU, double RadiusUU,
                                                    TArray<FVoxelHeadwaterFaucet>& Out,
-                                                   bool& bOutFromBakedHeads)
+                                                   FVoxelHeadwaterGatherStats& OutStats)
 {
-	bOutFromBakedHeads = false;
 	if (!Impl || !Impl->Water || RadiusUU <= 0.0)
 	{
 		return 0;
@@ -7112,85 +7229,260 @@ int32 UVoxelWaterSubsystem::GatherHeadwaterFaucets(double CenterXUU, double Cent
 	{
 		return 0;
 	}
-	const int64 PixelMm = int64(Tiles->pixelSizeMm());
-	const uint32 TileSize = Tiles->tileSize();
-	if (PixelMm <= 0 || TileSize == 0)
+	FFaucetGatherBox Box;
+	if (!ComputeFaucetGatherBox(int64(Tiles->pixelSizeMm()), CenterXUU, CenterYUU, RadiusUU,
+	                            /*HaloPx*/ 0, Box))
 	{
 		return 0;
 	}
-
-	const int64 MinPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU - RadiusUU), PixelMm);
-	const int64 MaxPx = vxc::floorDiv(VoxelCoords::WorldToMm(CenterXUU + RadiusUU), PixelMm);
-	const int64 MinPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU - RadiusUU), PixelMm);
-	const int64 MaxPy = vxc::floorDiv(VoxelCoords::WorldToMm(CenterYUU + RadiusUU), PixelMm);
+	const int64 TileSize = int64(vxc::kFineTileSize);
 	const int32 Before = Out.Num();
+	WarmFaucetGatherTiles(*Impl, Box);
 
 	// Source 1: the baked SECTION_HEADWATERS table (bake_ver 24). Exact points
 	// with per-head Q. "Any overlapped tile has a RESIDENT table" is the
 	// eligibility test -- a tile that merely predates bv24 must not veto the
 	// tiles that carry the data.
-	const int32 Tx0 = int32(vxc::floorDiv(MinPx, int64(TileSize)));
-	const int32 Tx1 = int32(vxc::floorDiv(MaxPx, int64(TileSize)));
-	const int32 Ty0 = int32(vxc::floorDiv(MinPy, int64(TileSize)));
-	const int32 Ty1 = int32(vxc::floorDiv(MaxPy, int64(TileSize)));
+	//
+	// TWO THINGS COME OFF EACH TILE'S TABLE, and the second is the point of this
+	// whole function. The heads INSIDE the box are the candidates; the minimum Q
+	// over the tile's WHOLE table is the datum the spring band is measured
+	// against. It has to be the tile's, not the box's: a 51 m box holds about
+	// half a head, so a box-derived minimum is "the smallest of the one head I
+	// can see" and selects that head every time -- which is the 229k-dots
+	// behaviour wearing a filter. The full-table scan is 57k uint32 reads on the
+	// biggest tile shipped, once per 10 s refresh.
 	bool bAnyHeadsTable = false;
-	for (int32 Ty = Ty0; Ty <= Ty1; ++Ty)
+	std::vector<vxc::SpringHead> InBox;
+	int64 TileMinQ = 0;
+	for (int64 Ty = Box.Ty0; Ty <= Box.Ty1; ++Ty)
 	{
-		for (int32 Tx = Tx0; Tx <= Tx1; ++Tx)
+		for (int64 Tx = Box.Tx0; Tx <= Box.Tx1; ++Tx)
 		{
-			const vxc::FineTile* T = Tiles->findTile(Tx, Ty);
+			const vxc::FineTile* T = Tiles->findTile(int32(Tx), int32(Ty));
 			if (T == nullptr || !T->hasHeads() || !T->headsResident())
 			{
 				continue;
 			}
 			bAnyHeadsTable = true;
-			const int64 Ox = int64(Tx) * int64(TileSize);
-			const int64 Oy = int64(Ty) * int64(TileSize);
+			const int64 Ox = Tx * TileSize;
+			const int64 Oy = Ty * TileSize;
 			for (const vxc::HeadEntry& H : T->heads())
 			{
+				if (H.qM3PerYear != 0 && (TileMinQ == 0 || int64(H.qM3PerYear) < TileMinQ))
+				{
+					// A BOX STRADDLING A TILE SEAM takes the SMALLER of the two
+					// tiles' minima. That is the conservative direction (a
+					// smaller datum is a tighter band, so fewer springs), and
+					// the alternative -- selecting per tile -- would stop the
+					// spacing rule from seeing across the seam and put two
+					// springs 4 m apart on either side of it.
+					TileMinQ = int64(H.qM3PerYear);
+				}
 				const int64 Px = Ox + int64(H.px);
 				const int64 Py = Oy + int64(H.py);
-				if (Px < MinPx || Px > MaxPx || Py < MinPy || Py > MaxPy)
+				if (Px < Box.MinPx || Px > Box.MaxPx || Py < Box.MinPy || Py > Box.MaxPy)
 				{
 					continue;
 				}
-				FVoxelHeadwaterFaucet F;
-				// Pixel CENTRE, the same convention every other consumer of a
-				// fine pixel uses (a corner-anchored faucet is half a pixel --
-				// 0.94 m -- off its channel).
-				F.XUU = VoxelCoords::MmToWorld(Px * PixelMm + PixelMm / 2);
-				F.YUU = VoxelCoords::MmToWorld(Py * PixelMm + PixelMm / 2);
-				F.QM3PerYear = double(H.qM3PerYear);
-				Out.Add(F);
+				vxc::SpringHead S;
+				S.px = Px;
+				S.py = Py;
+				S.qM3PerYear = H.qM3PerYear;
+				InBox.push_back(S);
 			}
 		}
 	}
-	if (bAnyHeadsTable)
+	if (!bAnyHeadsTable)
 	{
-		bOutFromBakedHeads = true;
-		return Out.Num() - Before;
+		// Source 2 (bv23 fallback): a throwaway baked-water graph over the same
+		// box; its no-incoming-segment nodes are the heads. Q is unknowable here
+		// (build-time discharge is catchment AREA, not a rate), so qM3PerYear
+		// stays 0 and selectSprings' UNRATED path runs -- the spacing rule alone,
+		// with no band, which is the honest thing to do with a set that carries
+		// no rate to band on.
+		//
+		// RIM HEADS ARE CULLED (playtest fix 2026-08-09). rivernet.h's caveat --
+		// reaches ENTERING the box have no in-edge inside it and read as heads on
+		// the rim -- was inherited knowingly and then showed up on screen as a
+		// SQUARE of faucets around the active box. A head on the boundary ring is
+		// a clip artifact, not a spring, so the graph builder drops it. The honest
+		// consequence: a box with a river merely passing through reports NO heads
+		// -- which is exactly the case GatherRiverCrossings now answers properly.
+		vxc::FineTileBakedWaterSource Source(*Tiles);
+		vxc::RiverNetwork Net;
+		vxc::BakedWaterBuildParams Params;
+		Params.bounds = vxc::RegionBounds{Box.MinPx, Box.MinPy, Box.MaxPx, Box.MaxPy};
+		Params.dropRimHeadwaters = true;
+		Net.buildFromBakedWater(Source, Impl->Terrain.GetSeed(), Params);
+		if (Net.bakedRimHeadsDropped() > 0 || Net.bakedCellsUnresolved() > 0)
+		{
+			UE_LOG(LogVoxelEarth, Verbose,
+			       TEXT("Headwater fallback over px [%lld,%lld]x[%lld,%lld]: %llu heads kept, ")
+			       TEXT("%llu rim clip artifacts dropped, %llu cells unresolved (tiles not resident)."),
+			       (long long)Box.MinPx, (long long)Box.MaxPx, (long long)Box.MinPy,
+			       (long long)Box.MaxPy, (unsigned long long)Net.headwaterNodes().size(),
+			       (unsigned long long)Net.bakedRimHeadsDropped(),
+			       (unsigned long long)Net.bakedCellsUnresolved());
+		}
+		for (const uint32 NodeId : Net.headwaterNodes())
+		{
+			const vxc::RiverNode& N = Net.nodes()[size_t(NodeId)];
+			vxc::SpringHead S;
+			S.px = vxc::floorDiv(N.vx * int64(vxc::kVoxelSizeMm), Box.PixelMm);
+			S.py = vxc::floorDiv(N.vy * int64(vxc::kVoxelSizeMm), Box.PixelMm);
+			S.qM3PerYear = 0;
+			InBox.push_back(S);
+		}
 	}
 
-	// Source 2 (bv23 fallback): a throwaway baked-water graph over the same
-	// box; its no-incoming-segment nodes are the heads. rivernet.h's caveat is
-	// inherited knowingly: reaches ENTERING the box read as heads at the rim,
-	// and Q is unknowable here (build-time discharge is catchment AREA, not a
-	// rate), so QM3PerYear stays 0 and the caller substitutes its default.
-	vxc::FineTileBakedWaterSource Source(*Tiles);
-	vxc::RiverNetwork Net;
-	vxc::BakedWaterBuildParams Params;
-	Params.bounds = vxc::RegionBounds{MinPx, MinPy, MaxPx, MaxPy};
-	Net.buildFromBakedWater(Source, Impl->Terrain.GetSeed(), Params);
-	for (const uint32 NodeId : Net.headwaterNodes())
+	OutStats.bFromBakedHeads = bAnyHeadsTable;
+	OutStats.HeadsInBox = int32(InBox.size());
+	OutStats.TileMinQ = TileMinQ;
+
+	vxc::SpringParams SP;
+	SP.qFactorNum = FMath::Max(1, CVarVoxelWaterSpringQFactorPct.GetValueOnGameThread());
+	SP.qFactorDen = 100;
+	SP.referenceMinQ = TileMinQ;
+	SP.spacingPx = FMath::Max(0, CVarVoxelWaterSpringSpacingPx.GetValueOnGameThread());
+	const vxc::SpringSelection Springs = vxc::selectSprings(InBox, SP);
+	OutStats.Candidates = int32(Springs.candidates);
+	OutStats.Springs = int32(Springs.springs.size());
+
+	for (const uint32 Idx : Springs.springs)
 	{
-		const vxc::RiverNode& N = Net.nodes()[size_t(NodeId)];
-		const FVector C = VoxelCoords::VoxelToWorldCenter(VoxelCoords::FVoxelCoord{N.vx, N.vy, 0});
+		const vxc::SpringHead& S = InBox[size_t(Idx)];
+		const FVector2D C = FinePixelCentreUU(S.px, S.py, Box.PixelMm);
 		FVoxelHeadwaterFaucet F;
 		F.XUU = C.X;
 		F.YUU = C.Y;
-		F.QM3PerYear = 0.0;
+		F.QM3PerYear = double(S.qM3PerYear);
+		F.bEdgeInflow = false;
 		Out.Add(F);
 	}
+	return Out.Num() - Before;
+}
+
+int32 UVoxelWaterSubsystem::GatherRiverCrossings(double CenterXUU, double CenterYUU, double RadiusUU,
+                                                 TArray<FVoxelHeadwaterFaucet>& Out,
+                                                 FVoxelHeadwaterGatherStats& OutStats)
+{
+	if (!Impl || !Impl->Water || RadiusUU <= 0.0)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // decodes flow/water blocks
+
+	vxc::FineTileSampler* Tiles = Impl->Water->ribbonTiles();
+	if (Tiles == nullptr)
+	{
+		return 0;
+	}
+	FFaucetGatherBox Box;
+	FFaucetGatherBox FitBox;
+	const int64 PixelMm = int64(Tiles->pixelSizeMm());
+	if (!ComputeFaucetGatherBox(PixelMm, CenterXUU, CenterYUU, RadiusUU, /*HaloPx*/ 0, Box) ||
+	    !ComputeFaucetGatherBox(PixelMm, CenterXUU, CenterYUU, RadiusUU, kRunoffFitHaloPx, FitBox))
+	{
+		return 0;
+	}
+	const int32 Before = Out.Num();
+	WarmFaucetGatherTiles(*Impl, FitBox);
+
+	vxc::FineTileBakedWaterSource Source(*Tiles);
+
+	// THE DISCHARGE COEFFICIENT. Fitted from the rated heads within the halo
+	// unless the cvar forces one; voxelcore/fluidsprings.h has the measured
+	// reason a local fit beats the physical constant by an order of magnitude.
+	const int64 Forced = int64(FMath::Max(0, CVarVoxelWaterEdgeRunoffMmPerYr.GetValueOnGameThread()));
+	vxc::RunoffCalibration Runoff;
+	if (Forced > 0)
+	{
+		Runoff.runoffMmPerYr = Forced;
+		Runoff.calibrated = true; // forced by hand IS a decision, not a fallback
+	}
+	else
+	{
+		const int64 TileSize = int64(vxc::kFineTileSize);
+		std::vector<vxc::SpringHead> FitHeads;
+		for (int64 Ty = FitBox.Ty0; Ty <= FitBox.Ty1; ++Ty)
+		{
+			for (int64 Tx = FitBox.Tx0; Tx <= FitBox.Tx1; ++Tx)
+			{
+				const vxc::FineTile* T = Tiles->findTile(int32(Tx), int32(Ty));
+				if (T == nullptr || !T->hasHeads() || !T->headsResident())
+				{
+					continue;
+				}
+				const int64 Ox = Tx * TileSize;
+				const int64 Oy = Ty * TileSize;
+				for (const vxc::HeadEntry& H : T->heads())
+				{
+					const int64 Px = Ox + int64(H.px);
+					const int64 Py = Oy + int64(H.py);
+					if (Px < FitBox.MinPx || Px > FitBox.MaxPx || Py < FitBox.MinPy ||
+					    Py > FitBox.MaxPy)
+					{
+						continue;
+					}
+					vxc::SpringHead S;
+					S.px = Px;
+					S.py = Py;
+					S.qM3PerYear = H.qM3PerYear;
+					FitHeads.push_back(S);
+				}
+			}
+		}
+		Runoff = vxc::calibrateRunoff(Source, FitHeads);
+	}
+	OutStats.RunoffMmPerYr = Runoff.runoffMmPerYr;
+	OutStats.bRunoffCalibrated = Runoff.calibrated;
+
+	vxc::RiverCrossingParams CP;
+	CP.bounds = vxc::RegionBounds{Box.MinPx, Box.MinPy, Box.MaxPx, Box.MaxPy};
+	CP.runoffMmPerYr = Runoff.runoffMmPerYr;
+	const vxc::RiverCrossingResult Crossings = vxc::selectRiverCrossings(Source, CP);
+	if (Crossings.unresolved > 0)
+	{
+		UE_LOG(LogVoxelEarth, Verbose,
+		       TEXT("River-crossing walk over px [%lld,%lld]x[%lld,%lld]: %llu inbound crossings, ")
+		       TEXT("%llu channel edge pixels, %llu unresolved (tiles not resident)."),
+		       (long long)Box.MinPx, (long long)Box.MaxPx, (long long)Box.MinPy, (long long)Box.MaxPy,
+		       (unsigned long long)Crossings.crossings.size(),
+		       (unsigned long long)Crossings.channelEdgePixels,
+		       (unsigned long long)Crossings.unresolved);
+	}
+
+	for (const vxc::RiverCrossing& C : Crossings.crossings)
+	{
+		// ONE PIXEL IN FROM THE FACE, not on it. The crossing is found ON the
+		// boundary ring, and the ring pixel's CENTRE can land a fraction of a
+		// pixel OUTSIDE the solver's despawn box (the pixel rect comes from a
+		// floorDiv of the box, so it overhangs by up to one pixel) -- a faucet
+		// there emits particles the boundary sink deletes on the same step, i.e.
+		// an inflow that silently moves no water. The inward D8 neighbour is
+		// where the water is going anyway and selectRiverCrossings has already
+		// verified it is a qualifying wet channel cell, so it is both safely
+		// inside and still on the river. The 1.875 m shift is a tenth of the
+		// window; the water surface is taken from the ring pixel, which is at
+		// most a few mm higher (the crossing is the upstream end of the step).
+		const FVector2D P = FinePixelCentreUU(C.px + int64(C.dirX), C.py + int64(C.dirY),
+		                                      Box.PixelMm);
+		FVoxelHeadwaterFaucet F;
+		F.XUU = P.X;
+		F.YUU = P.Y;
+		F.SurfaceZUU = VoxelCoords::MmToWorld(int64(C.surfaceMm));
+		F.QM3PerYear = double(C.qM3PerYear);
+		// Unit direction, so a diagonal crossing emits at the same speed as an
+		// axis-aligned one.
+		const double Len =
+			FMath::Sqrt(double(C.dirX) * double(C.dirX) + double(C.dirY) * double(C.dirY));
+		F.DirX = Len > 0.0 ? double(C.dirX) / Len : 0.0;
+		F.DirY = Len > 0.0 ? double(C.dirY) / Len : 0.0;
+		F.bEdgeInflow = true;
+		Out.Add(F);
+	}
+	OutStats.EdgeInflows = Out.Num() - Before;
 	return Out.Num() - Before;
 }
 

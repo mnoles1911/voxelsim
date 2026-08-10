@@ -1,0 +1,51 @@
+{
+  "crown": {
+    "center_frac": 0.62,
+    "height_frac": 0.7,
+    "lean_deg": 8.0,
+    "lean_dir_deg": 40.0,
+    "points": 550,
+    "radius_m": 2.6,
+    "shape": "vase",
+    "shell": 0.5,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.5,
+    "coverage": 0.6,
+    "density": 0.5,
+    "droop_m": 0.1,
+    "enabled": false,
+    "min_order": 2,
+    "squash": 0.8
+  },
+  "growth": {
+    "gravity": 0.04,
+    "inertia": 0.3,
+    "influence_m": 2.2,
+    "jitter": 0.22,
+    "kill_m": 0.55,
+    "max_iter": 260,
+    "phototropism": 0.05,
+    "radius_exp": 2.0,
+    "step_m": 0.24,
+    "tip_radius_m": 0.05
+  },
+  "height_m": 6.0,
+  "materials": {
+    "bark": "deadwood",
+    "core": "deadwood",
+    "leaf": "leaf_dry"
+  },
+  "name": "desert-dead",
+  "notes": "Dead standing wood. No foliage at all, gnarled and leaning, deadwood through to the core so a chopped one shows no fresh timber.",
+  "trunk": {
+    "buttress": 0.3,
+    "clear_frac": 0.24,
+    "lean_deg": 12.0,
+    "lean_dir_deg": 40.0,
+    "radius_base_m": 0.3,
+    "wander": 0.75
+  }
+}

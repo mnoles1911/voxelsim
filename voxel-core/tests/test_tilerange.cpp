@@ -41,6 +41,10 @@ std::filesystem::path goldenWaterPath() {
 std::filesystem::path goldenBasinPath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_512.vxtl";
 }
+// bake_ver 24: basin table v2 AND the headwater table (SECTION_HEADWATERS).
+std::filesystem::path goldenBasinV2Path() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_v2_512.vxtl";
+}
 
 std::optional<std::vector<uint8_t>> loadFixture(const std::filesystem::path& p) {
     if (!std::filesystem::exists(p)) return std::nullopt;
@@ -473,6 +477,61 @@ VXC_TEST(unfetched_basin_table_is_not_an_empty_one) {
     CHECK(tile->hasBasins());
     CHECK(!tile->basinsResident());
     CHECK(tile->basins().empty());
+}
+
+// THE RESIDENCY HOLE BEHIND THE "SQUARE OF HOVERING WATER" (first PBF
+// playtest, 2026-08-09). SECTION_HEADWATERS was not in readFineTilePreamble's
+// want list at all, so a ranged client's tile reported hasHeads()==true and
+// headsResident()==false forever -- with no repair path, because
+// fetchFineTileBlocks only knows the three planes. GatherHeadwaterFaucets read
+// that as "no baked heads here" and fell to the rivernet fallback, whose
+// documented rim false-heads then drew a square in the air.
+VXC_TEST(ranged_preamble_fetches_the_headwater_table_by_default) {
+    const auto bytes = loadFixture(goldenBasinV2Path());
+    if (!bytes) return;
+    const std::optional<FineTile> whole = FineTile::parse(*bytes);
+    if (!whole) return;
+    CHECK(whole->hasHeads());
+    CHECK(whole->headsResident());
+
+    BytesRangeSource src(*bytes);
+    FinePreambleRequest want; // DEFAULTS -- the shipping streamer's request
+    want.wantFlow = false;
+    FineTileBytes held;
+    CHECK(readFineTilePreamble(src, src.fileSize(), want, held, nullptr));
+    std::optional<FineTile> tile = FineTile::parsePartial(std::move(held));
+    if (!tile) return;
+
+    CHECK(tile->hasHeads());
+    CHECK(tile->headsResident());
+    CHECK_EQ(tile->heads().size(), whole->heads().size());
+    for (size_t i = 0; i < tile->heads().size() && i < whole->heads().size(); ++i) {
+        CHECK_EQ(int(tile->heads()[i].px), int(whole->heads()[i].px));
+        CHECK_EQ(int(tile->heads()[i].py), int(whole->heads()[i].py));
+        CHECK_EQ(tile->heads()[i].qM3PerYear, whole->heads()[i].qM3PerYear);
+    }
+}
+
+VXC_TEST(unfetched_headwater_table_is_not_an_empty_one) {
+    const auto bytes = loadFixture(goldenBasinV2Path());
+    if (!bytes) return;
+    BytesRangeSource src(*bytes);
+    FinePreambleRequest want;
+    want.wantFlow = false;
+    want.wantWater = false;
+    want.wantBasins = false;
+    want.wantHeads = false; // deliberately NOT fetched
+    FineTileBytes held;
+    CHECK(readFineTilePreamble(src, src.fileSize(), want, held, nullptr));
+    std::optional<FineTile> tile = FineTile::parsePartial(std::move(held));
+    if (!tile) return;
+
+    // Same shape as the basin-table case: the tile WAS baked with heads, this
+    // client simply does not hold them, and heads() being empty must not be
+    // read as "this tile has no springs".
+    CHECK(tile->hasHeads());
+    CHECK(!tile->headsResident());
+    CHECK(tile->heads().empty());
 }
 
 // ---------------------------------------------------------------------------

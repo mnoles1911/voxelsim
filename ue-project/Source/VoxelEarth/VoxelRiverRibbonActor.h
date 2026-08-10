@@ -7,6 +7,31 @@
 class UProceduralMeshComponent;
 class UMaterialInterface;
 
+// ==========================================================================
+// DEPRECATED 2026-08-09 -- DEFAULT OFF. Do not extend; do not delete.
+// ==========================================================================
+//
+// The first PBF playtest found the far-field ribbons unreadable: the owner
+// could not tell a river ribbon from a lake sheet, and asked for ribbons off.
+// They now build ONLY under -VoxelRiverRibbons=1, and BeginPlay logs the
+// deprecation once per run.
+//
+// WHY THE CODE STAYS. docs/water-deprecation-audit-2026-08-09.md's standing
+// rule: anything with a live call site outside its own tests, or with tests
+// that pin its behaviour, is deprecate-now / delete-after-the-replacement-is-
+// proven. Ribbons have both (this actor, and voxel-core's
+// test_riverribbon.cpp + vxc_riverribbonprobe). The replacement is the PBF
+// fluid's near field plus whatever far-field handoff it grows --
+// docs/water-rearchitecture-plan-2026-08-09.md.
+//
+// NOT AFFECTED: lake sheets (AVoxelWaterSheetActor, -VoxelLakeSheets), which
+// are the standing-water far field and stay on. The two share nothing but a
+// water material.
+//
+// Everything below this banner describes the feature as built and is left
+// intact, because a deprecated thing that still runs still has to be
+// understood by whoever reads its output.
+//
 // FLOWING WATER AT RANGE -- docs/water-handover-2026-08-04.md Phase 4.
 //
 // THE DEFECT THIS EXISTS FOR. UVoxelWaterSubsystem::RefreshImplicitWater meshes
@@ -218,10 +243,14 @@ private:
 	bool bGathered = false;
 	double RegatherDistanceUU = 100000.0; // 1 km
 
-	// -VoxelRiverRibbons=0 removes the whole feature on the same binary. THE
-	// CONTROL for every ribbon capture, and a switch rather than a cvar for the
-	// reason -VoxelNoClipmap is one: -ExecCmds lands after BeginPlay.
-	bool bEnabled = true;
+	// -VoxelRiverRibbons=1 builds the (DEPRECATED) ribbons; anything else, and
+	// the absence of the switch, leaves them off. THE CONTROL for every ribbon
+	// capture, and a switch rather than a cvar for the reason -VoxelNoClipmap is
+	// one: -ExecCmds lands after BeginPlay.
+	//
+	// DEFAULT FLIPPED TO OFF 2026-08-09 -- see the DEPRECATED banner at the top
+	// of this header. BeginPlay parses with a default of 0 to match.
+	bool bEnabled = false;
 
 	// Minimum projected width, in pixels, for a reach to be drawn at all.
 	// 0 = draw everything. See the width policy in this header.

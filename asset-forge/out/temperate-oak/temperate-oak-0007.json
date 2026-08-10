@@ -1,0 +1,87 @@
+{
+  "spec": {
+    "name": "temperate-oak",
+    "notes": "Large temperate broadleaf. The baseline species; if a change breaks anything it usually shows here first.",
+    "height_m": 14.0,
+    "trunk": {
+      "radius_base_m": 0.45,
+      "clear_frac": 0.3,
+      "lean_deg": 3.0,
+      "lean_dir_deg": 0.0,
+      "wander": 0.18,
+      "buttress": 0.25
+    },
+    "crown": {
+      "shape": "vase",
+      "radius_m": 5.0,
+      "height_frac": 0.62,
+      "center_frac": 0.68,
+      "shell": 0.25,
+      "squash": 1.0,
+      "lean_deg": 0.0,
+      "lean_dir_deg": 0.0,
+      "points": 1100
+    },
+    "growth": {
+      "step_m": 0.35,
+      "influence_m": 3.2,
+      "kill_m": 0.75,
+      "gravity": -0.1,
+      "phototropism": 0.12,
+      "inertia": 0.45,
+      "jitter": 0.06,
+      "max_iter": 300,
+      "tip_radius_m": 0.05,
+      "radius_exp": 2.3
+    },
+    "foliage": {
+      "enabled": true,
+      "min_order": 2,
+      "clump_radius_m": 0.75,
+      "density": 0.55,
+      "coverage": 0.85,
+      "droop_m": 0.15,
+      "squash": 0.85
+    },
+    "materials": {
+      "bark": "bark",
+      "core": "heartwood",
+      "leaf": "leaf_broadleaf"
+    }
+  },
+  "stats": {
+    "seed": 7,
+    "spec_hash": "b7282a9a6cc87eb8",
+    "nodes": 680,
+    "segments": 679,
+    "max_order": 3,
+    "iterations": 36,
+    "targets_left": 0,
+    "clumps": 86,
+    "height_m": 14.3,
+    "footprint_m": [
+      9.8,
+      10.4
+    ],
+    "extent_vox": [
+      98,
+      104,
+      143
+    ],
+    "voxels": 77219,
+    "by_material": {
+      "16": 12880,
+      "17": 103,
+      "19": 64236
+    },
+    "ground_contact": 97,
+    "ms_grow": 28.4,
+    "ms_raster": 134.1,
+    "wood_connected": 0.9999,
+    "attached_frac": 1.0,
+    "ms_total": 240.9
+  },
+  "problems": [
+    "broken: 0.0% of the wood is a separate piece"
+  ]
+}

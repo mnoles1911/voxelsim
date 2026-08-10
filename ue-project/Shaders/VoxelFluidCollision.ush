@@ -44,10 +44,40 @@
 // with terrain that is offset by a few metres, which reads as a worldgen bug.
 //
 // It costs nothing. Both origins only move when the active region recentres,
-// and a recentre already forces a full volume rebuild; the extra work is one
-// constant subtraction over <=300k particles. FVoxelFluidOccupancyVolume::
-// GetOriginUU() (VoxelFluidOccupancy.h) is the host-side accessor that keeps
-// the two in step, and it is the value the solver must rebase to.
+// and the extra work is one constant subtraction over <=300k particles --
+// FluidRebaseParticlesMain in VoxelFluidOccupancy.usf, contract item 8.
+// FVoxelFluidOccupancyVolume::GetOriginUU() (VoxelFluidOccupancy.h) is the
+// host-side accessor that keeps the two in step, and it is the value the solver
+// must rebase to.
+//
+// ---------------------------------------------------------------------------
+// THE VOLUME IS TOROIDAL (contract item 4)
+// ---------------------------------------------------------------------------
+//
+// The 16 MiB buffer is a ROLLING WINDOW, not a flat array indexed by window
+// position. Three coordinate spaces, and the reason to hold them apart:
+//
+//   WORLD    planet voxel coordinates -- what the solid predicate is asked
+//            about.
+//   LOCAL    world minus FluidVolumeOriginVoxel, 0..511. THE GEOMETRIC SPACE:
+//            particle positions are local UU, the walk's boundary planes are at
+//            local voxel edges, and the collision projection returns a local
+//            position. Nothing in this file's geometry changed.
+//   STORAGE  local plus FluidVolumeWrapOffsetVoxel, modulo 512 -- where the bit
+//            physically lives. Used by exactly one expression in this file, in
+//            VoxelFluidSolidAtVoxel, and nowhere else.
+//
+// WHY. Flat addressing renames every bit in the buffer when the origin moves,
+// so a recentre had to discard all 16 MiB and refill 262,144 bricks -- a
+// multi-second stall with the water frozen inside it, which is why v0 latched
+// the origin once and never moved. With storage anchored to the window's
+// accumulated motion instead, the bits still in view keep their addresses; only
+// the entering slab is invalidated (1/8 of the volume for one 64-voxel step),
+// and the exiting slab is not cleared or copied -- the entering slab lands on
+// exactly its addresses. voxelcore/fluidoccupancy.h carries the full argument,
+// including why the offset is accumulated motion rather than the simpler
+// `world % 512` (the latter needs a 32-aligned origin, and the origin is the
+// camera's voxel minus 256).
 
 #ifndef VOXEL_FLUID_COLLISION_USH
 #define VOXEL_FLUID_COLLISION_USH
@@ -129,16 +159,35 @@
 // declarations can never meet: nothing includes both this file and the
 // occupancy kernel.
 Buffer<uint> FluidOccupancyBits;
-// World voxel coordinate of bit (0,0,0).
+// World voxel coordinate of volume-LOCAL (0,0,0) -- the window's min corner.
 int3 FluidVolumeOriginVoxel;
 // 512. A uniform rather than a literal so a future half-resolution or
 // quarter-extent volume is a host change, not a shader edit; every use below
-// derives from it.
+// derives from it. MUST BE A POWER OF TWO: the toroidal wrap below masks
+// instead of dividing (mirror of the static_assert on
+// vxc::kFluidVolumeWrapMask).
 uint FluidVolumeDimVoxels;
+// TOROIDAL ADDRESSING (contract item 4). The STORAGE coordinate of local
+// (0,0,0): how far the rolling window has slid, modulo the volume. Zero for a
+// window that has never moved, always in [0, Dim) and always a multiple of the
+// recentre step (vxc::kFluidRecentreStepVoxels, 64) so no 32-voxel output word
+// straddles the seam.
+uint3 FluidVolumeWrapOffsetVoxel;
 
 // ---------------------------------------------------------------------------
 // The bit read
 // ---------------------------------------------------------------------------
+
+// LOCAL (window) voxel -> STORAGE voxel, the whole of what toroidal addressing
+// is. `local` is already known to be in [0, Dim) at every call site, and the
+// offset likewise, so the sum is below 2*Dim and the mask is one conditional
+// subtract -- no negative operand ever reaches it and no integer modulo is
+// needed. Mirror of vxc::fluidVolumeStorageAxis.
+uint3 VoxelFluidStorageVoxel(uint3 localVoxel)
+{
+	// lint-shader-ub: allow UNSIGNED_UNDERFLOW - FluidVolumeDimVoxels is the volume edge, uploaded by the host as vxc::kFluidVolumeDimVoxels (512) and static_asserted to be a positive power of two in both VoxelFluidOccupancy.cpp and fluidoccupancy.h; it is never 0, so Dim-1 is the wrap mask 511 and cannot underflow
+	return (localVoxel + FluidVolumeWrapOffsetVoxel) & (FluidVolumeDimVoxels - 1u);
+}
 
 // OUTSIDE THE VOLUME IS SOLID. This is the rule the whole collision model
 // rests on (VoxelFluidContract.ush:70-73): a particle can never escape through
@@ -146,6 +195,14 @@ uint FluidVolumeDimVoxels;
 // terrain tier uses. The opposite convention drains a river into the void the
 // first time the volume lags the camera by a frame, and it looks like a solver
 // bug rather than a residency bug.
+//
+// AND THE WINDOW TEST IS NOT THE WRAP. The bounds check below runs on the
+// LOCAL coordinate and is exactly what it was before toroidal addressing; the
+// wrap happens after it, only to find where the bit is stored. Deleting the
+// check and trusting the modulo to "wrap harmlessly" is the one way to get this
+// wrong that still compiles: a particle one voxel past the west face would
+// collide against the terrain 51.2 m to its east, which reads as worldgen and
+// not as a bug.
 //
 // Mirror of vxc::fluidSolidAtVoxel.
 bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
@@ -157,12 +214,13 @@ bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
 		return true;
 	}
 
-	// x-major packing: 32 voxels per word along x, rows along x then y then z.
+	// x-major packing: 32 voxels per word along x, rows along x then y then z --
+	// over STORAGE coordinates, which is the only place local and storage differ.
+	const uint3 s = VoxelFluidStorageVoxel((uint3)l);
 	const uint wordsPerRow = FluidVolumeDimVoxels >> 5u;
-	const uint index = ((uint)l.z * FluidVolumeDimVoxels + (uint)l.y) * wordsPerRow
-	                 + ((uint)l.x >> 5u);
+	const uint index = (s.z * FluidVolumeDimVoxels + s.y) * wordsPerRow + (s.x >> 5u);
 	// lint-shader-ub: allow VARIABLE_SHIFT - the distance is masked to 0..31 by the & 31u in the expression itself, so it is provably below the 32-bit left operand's width
-	return (FluidOccupancyBits[index] & (1u << ((uint)l.x & 31u))) != 0u;
+	return (FluidOccupancyBits[index] & (1u << (s.x & 31u))) != 0u;
 }
 
 // Volume-local UU -> world voxel. One floor and one integer add, which is what

@@ -1,0 +1,51 @@
+{
+  "crown": {
+    "center_frac": 0.55,
+    "height_frac": 0.88,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1200,
+    "radius_m": 2.2,
+    "shape": "cone",
+    "shell": 0.55,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.3,
+    "clump_radius_m": 0.3,
+    "coverage": 0.92,
+    "density": 0.72,
+    "droop_m": 0.1,
+    "enabled": true,
+    "min_order": 1,
+    "squash": 0.6
+  },
+  "growth": {
+    "gravity": -0.26,
+    "inertia": 0.55,
+    "influence_m": 1.7,
+    "jitter": 0.05,
+    "kill_m": 0.32,
+    "max_iter": 320,
+    "phototropism": 0.06,
+    "radius_exp": 2.5,
+    "step_m": 0.22,
+    "tip_radius_m": 0.04
+  },
+  "height_m": 9.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_needle"
+  },
+  "name": "tundra-pine",
+  "notes": "Boreal conifer. Cone crown, drooping branches, needles. Sits on podzol and permafrost surfaces.",
+  "trunk": {
+    "buttress": 0.1,
+    "clear_frac": 0.16,
+    "lean_deg": 2.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.22,
+    "wander": 0.06
+  }
+}

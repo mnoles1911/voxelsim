@@ -58,6 +58,7 @@ void RiverNetwork::buildFromFlowAccumulation(ITileSampler& tiles, uint64_t seed,
     bakedScanned_ = 0;
     bakedUnresolved_ = 0;
     bakedChannelCells_ = 0;
+    bakedRimHeadsDropped_ = 0;
     seed_ = seed;
 
     const int64_t w = b.px1 - b.px0 + 1;
@@ -222,6 +223,7 @@ uint32_t RiverNetwork::buildFromBakedWater(IBakedWaterSource& source, uint64_t s
     bakedScanned_ = 0;
     bakedUnresolved_ = 0;
     bakedChannelCells_ = 0;
+    bakedRimHeadsDropped_ = 0;
     seed_ = seed;
 
     const RegionBounds& b = params.bounds;
@@ -349,8 +351,24 @@ uint32_t RiverNetwork::buildFromBakedWater(IBakedWaterSource& source, uint64_t s
         segments_.push_back(seg);
     }
 
-    for (uint32_t n = 0; n < static_cast<uint32_t>(nodes_.size()); ++n) {
-        if (!hasIncoming[n]) headwaterNodes_.push_back(n);
+    // Heads, in ascending node id. Walking PIXELS rather than node ids (the two
+    // orders are identical -- node ids were assigned in ascending i above) so
+    // the rim test has the pixel coordinate it needs without a second array.
+    for (size_t i = 0; i < count; ++i) {
+        const int32_t nid = nodeIdOfPixel[i];
+        if (nid < 0) continue;
+        if (hasIncoming[static_cast<size_t>(nid)]) continue;
+        if (params.dropRimHeadwaters) {
+            const int64_t px = b.px0 + static_cast<int64_t>(i % static_cast<size_t>(w));
+            const int64_t py = b.py0 + static_cast<int64_t>(i / static_cast<size_t>(w));
+            // ON the boundary ring: a reach entering the box was clipped here,
+            // so "no in-edge" says nothing about whether this is a spring.
+            if (px == b.px0 || px == b.px1 || py == b.py0 || py == b.py1) {
+                ++bakedRimHeadsDropped_;
+                continue;
+            }
+        }
+        headwaterNodes_.push_back(static_cast<uint32_t>(nid));
     }
     return static_cast<uint32_t>(segments_.size());
 }

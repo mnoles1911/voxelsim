@@ -208,6 +208,12 @@ bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambl
     if (want.wantFlow && (flags & kFineFlagFlowPresent)) wantIds.push_back(kSectionFlowIndex);
     if (want.wantWater && (flags & kFineFlagWaterPresent)) wantIds.push_back(kSectionWaterIndex);
     if (want.wantBasins && (flags & kFineFlagBasinsPresent)) wantIds.push_back(kSectionBasinTable);
+    // SECTION_HEADWATERS: a preamble table like the basin table, not a plane.
+    // Without this a ranged client's FineTile reports hasHeads()==true and
+    // headsResident()==false forever, and there is no repair path
+    // (fetchFineTileBlocks only knows the three planes) -- the residency hole
+    // behind the "square of hovering water" playtest defect.
+    if (want.wantHeads && (flags & kFineFlagHeadsPresent)) wantIds.push_back(kSectionHeadwaters);
 
     // The header and section table themselves, straight out of the probe.
     const uint64_t fixedBytes =

@@ -63,10 +63,12 @@ struct FVoxelFluidParticle
 
 // ---- occupancy volume (collision) -----------------------------------------
 // 1 bit per 10 cm voxel over the active region, 512^3 bits = 16 MB, packed
-// x-major into uints (32 voxels per uint along x).
+// x-major into uints (32 voxels per uint along x). TOROIDAL: the buffer is a
+// rolling window, addressed by (local + wrap offset) mod dim -- see item 4.
 //   Buffer<uint> / RWBuffer<uint>  FluidOccupancyBits
-//   int3  FluidVolumeOriginVoxel   // world voxel coord of bit (0,0,0)
-//   uint  FluidVolumeDimVoxels     // 512
+//   int3  FluidVolumeOriginVoxel     // world voxel coord of LOCAL (0,0,0)
+//   uint  FluidVolumeDimVoxels       // 512, and a power of two (the wrap masks)
+//   uint3 FluidVolumeWrapOffsetVoxel // STORAGE coord of LOCAL (0,0,0)
 // Provided by VoxelFluidCollision.ush (the ONLY file that reads the bits):
 //   bool VoxelFluidSolidAtVoxel(int3 worldVoxel);  // outside volume => solid,
 //        // so particles can never escape through an unbuilt edge -- the same
@@ -90,11 +92,44 @@ struct FVoxelFluidParticle
 //     at dt=1/60 (a 157 m waterfall; the plan's named 40 m case needs 2,800).
 //     Over budget CLAMPS to the last verified boundary -- water above the
 //     supported speed is slowed, never passed through a wall.
-//  4. PLANNED, NOT YET CONTRACT: toroidal (wrap-around) volume addressing, so
-//     recentring invalidates ~1/50 of the volume instead of all 16 MiB. It
-//     changes VoxelFluidSolidAtVoxel's indexing (per-axis modulo) and lands as
-//     a versioned edit HERE when taken -- consumers must not assume flatness
-//     beyond this file's word.
+//  4. TOROIDAL VOLUME ADDRESSING. **TAKEN 2026-08-09** -- this replaces the
+//     "PLANNED, NOT YET CONTRACT" note that stood here, which promised a
+//     versioned edit at this spot when the change landed. THE VOLUME IS NO
+//     LONGER FLAT. Three spaces, and only the third one changed:
+//
+//       WORLD    planet voxel coordinates.
+//       LOCAL    world - FluidVolumeOriginVoxel, 0..Dim-1. THE GEOMETRIC SPACE
+//                and the one everything else in this contract means: particle
+//                positions are LOCAL UU (item 1), the boundary box and basin
+//                box uniforms are LOCAL UU (items 5, 6), collision projects a
+//                particle back onto a LOCAL plane.
+//       STORAGE  (LOCAL + FluidVolumeWrapOffsetVoxel) mod Dim -- where the bit
+//                lives in the buffer. Used by exactly one expression in
+//                VoxelFluidCollision.ush and one in VoxelFluidOccupancy.usf.
+//
+//     WHAT IT BUYS. Recentring used to rename every bit in the buffer, so it
+//     discarded all 16 MiB and refilled 262,144 bricks -- multi-second, water
+//     frozen throughout, which is why v0 latched the origin once. Now the bits
+//     still in view keep their addresses and only the entering slab is
+//     invalidated: 1/8 of the volume per 64-voxel step, marked unbuilt by
+//     FluidOccupancyMarkUnbuiltMain and refilled through the existing budgeted
+//     UpdateRegion path. The exiting slab is neither cleared nor copied -- the
+//     entering slab lands on exactly its addresses.
+//
+//     WHAT CONSUMERS MUST NOT DO. (a) Do not index the buffer by LOCAL
+//     coordinates: every address goes through the wrap. (b) Do not drop the
+//     window bounds test on the grounds that the modulo "wraps harmlessly" --
+//     the test is on LOCAL and is what keeps outside-is-solid true; without it
+//     a voxel one past the west face reads the terrain 51.2 m east. (c) Do not
+//     assume FluidVolumeWrapOffsetVoxel is zero, even at startup: it is only
+//     zero until the first recentre.
+//
+//     The offset is the window's ACCUMULATED MOTION mod Dim, not
+//     `world mod Dim`. Both are rolling windows; the latter additionally
+//     requires a 32-aligned origin or a 32-voxel output word straddles the
+//     seam, and the origin is the camera's voxel minus 256. Full argument in
+//     voxelcore/fluidoccupancy.h, which is the CPU reference all three
+//     implementations mirror and which vxc_tests pins.
 //
 // RATIFIED, INTEGRATION PASS (2026-08-09, collision + lifecycle wired):
 //  5. VOXEL_FLUID_HAS_COLLISION is now 1 in every shipping compile (set by
@@ -120,5 +155,36 @@ struct FVoxelFluidParticle
 //     plane before deriving v = (x - x_prev)/dt -- item 2's ratified recipe,
 //     now the implementation. Per-iteration DeltaPos correction keeps using
 //     the position-only projection; it derives no velocity.
+//
+// RATIFIED, TOROIDAL PASS (2026-08-09, with item 4):
+//  8. PARTICLES ARE REBASED ON RECENTRE; THEY DO NOT BECOME WORLD-ANCHORED.
+//     Item 1 ties FluidOriginUU to the window's min corner, so when the window
+//     moves, every stored LOCAL position is stale by the delta. The two
+//     available answers were "leave positions in world UU and subtract the
+//     origin in every pass" and "subtract the delta from every position, once,
+//     at the move". The first is not available: the world spans tens of km,
+//     a float32 ULP at 30 km is 2 mm, and PBF differences positions at 10 UU
+//     spacing -- that is 0.02 % quantisation noise in every neighbour term, and
+//     it is the reason item 1 exists.
+//
+//     So the SECOND. One kernel, FluidRebaseParticlesMain (in
+//     VoxelFluidOccupancy.usf, not the solver's file -- recentring is the
+//     window's event, and that kernel's header says why), subtracts
+//     (newOrigin - oldOrigin) * 10 UU from ParticlesRW[i].P0.xyz over the sim's
+//     allocated slots. Velocity is untouched: a frame translation is not a
+//     boost. Flags and batch id are untouched.
+//
+//     WHEN. Between solver ticks, never inside one -- the solver's other
+//     position buffers are per-tick transients rebuilt from ParticlesRW, which
+//     is exactly why they need no rebase and exactly why this pass must not
+//     land mid-tick.
+//
+//     PRECISION, STATED SO IT IS NOT ASSUMED. The delta is a whole number of
+//     voxels, so the shift is an exact multiple of 10 UU (exactly representable
+//     out to 2^24 UU = 167 km of motion in one step). p - delta is EXACT
+//     whenever the particle moves toward the new origin, and rounds by at most
+//     half a ULP at 5120 UU -- 2.4 um, one fortieth of the collision skin --
+//     when it moves away. Derivation in voxelcore/fluidoccupancy.h, bound
+//     pinned by test_fluidoccupancy.cpp.
 
 #endif // VOXEL_FLUID_CONTRACT_USH

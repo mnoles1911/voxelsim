@@ -59,8 +59,17 @@ namespace
 	constexpr float kSpawnClampMarginUU = 200.0f;
 
 	// Headwater/sill faucets emit this far above the local ground/sill, inside
-	// the faucet jitter disc's reach of the channel.
+	// the faucet jitter disc's reach of the channel. An EDGE INFLOW uses the
+	// same clearance but above the DRAWN WATER SURFACE, not the ground: the bed
+	// under a big reach is up to 25 m down, and a river entering the box has to
+	// enter at the height the water is already drawn at or it falls in.
 	constexpr float kLifecycleFaucetHeightUU = 30.0f;
+
+	// Edge-inflow stream speed, UU/s, horizontal along the channel. Small on
+	// purpose: it exists so the water ENTERS moving in the direction the river
+	// runs rather than dropping in as a column, and the slope takes over from
+	// there. 150 UU/s = 1.5 m/s, a brisk river.
+	constexpr float kEdgeInflowSpeedUU = 150.0f;
 
 	// How far from the volume centre the boundary sink searches for a river
 	// segment to inject into (world mm). The region's own half-diagonal is
@@ -259,13 +268,29 @@ struct FVoxelFluidLifecycle
 	{
 		FVector WorldPos = FVector::ZeroVector; // z resolved at refresh (surface + offset)
 		double QM3PerYear = 0.0;                // 0 == source had no rate; DefaultQ applies
+		FVector3f Velocity = FVector3f::ZeroVector; // edge inflow only; a spring seeps
+		bool bEdgeInflow = false;
 		vxc::FluidFaucetAccumulator Acc;
 	};
 	TArray<FHeadFaucet> HeadFaucets;
 	bool bHeadsFromBakedTable = false;
 	bool bFaucetGatherEverRan = false;
+	// The last gather's selection, for the perf line: how many of the box's
+	// baked heads survived the spring rule, and how many faucets came from the
+	// river crossing the boundary instead. (The full breakdown -- heads in box,
+	// Q band, the fitted runoff -- goes to the Verbose log at gather time; only
+	// the two numbers that answer "is the selection working" are kept here.)
+	int32 FaucetSprings = 0;
+	int32 FaucetEdgeInflows = 0;
+	bool bFaucetCapTruncated = false;
 	double NextFaucetRefreshSeconds = 0.0;
 	uint64 HeadFaucetParticlesEmitted = 0;
+	// Faucet-ticks skipped because the emit point sat in occupancy the initial
+	// fill has not reached yet (or outside the volume entirely). Not a drop and
+	// not a debt: the accumulator is left untouched, so the faucet resumes at
+	// its exact carry the moment its cell lands. Printed as deferredNoOcc.
+	uint64 FaucetTicksDeferredNoOccupancy = 0;
+	int32 FaucetsDeferredNoOccupancyNow = 0; // faucets deferred on the last tick
 	// Discharge the window could not afford as particles, routed through the
 	// scalar graph instead (backpressure). Units are ledger units (1/255 vox).
 	int64 FaucetVirtualUnitsRouted = 0;
@@ -597,11 +622,45 @@ void UVoxelFluidSubsystem::RefreshHeadwaterFaucets(double NowSeconds)
 
 	const double CenterX = FluidOriginWorld.X + kBoundaryHalfExtentUU;
 	const double CenterY = FluidOriginWorld.Y + kBoundaryHalfExtentUU;
+
+	// TWO SOURCES OF WATER FOR THE WINDOW, and every window needs exactly the
+	// one it has. A window over a hillside gets its SPRINGS (rare, first-order
+	// heads -- see the water subsystem's header); a window sitting mid-river has
+	// no spring in it and gets the river where it CROSSES THE BOUNDARY. Before
+	// this, the second case either produced nothing (the bv23 arm culls its rim
+	// heads) or produced every fragment head in the box at once, which is what
+	// drew solid lines of water down the valleys.
 	TArray<UVoxelWaterSubsystem::FVoxelHeadwaterFaucet> Heads;
-	bool bFromBaked = false;
-	Water->GatherHeadwaterFaucets(CenterX, CenterY, kBoundaryHalfExtentUU, Heads, bFromBaked);
+	UVoxelWaterSubsystem::FVoxelHeadwaterGatherStats Stats;
+	Water->GatherHeadwaterFaucets(CenterX, CenterY, kBoundaryHalfExtentUU, Heads, Stats);
+	Water->GatherRiverCrossings(CenterX, CenterY, kBoundaryHalfExtentUU, Heads, Stats);
 	L.bFaucetGatherEverRan = true;
-	L.bHeadsFromBakedTable = bFromBaked;
+	L.bHeadsFromBakedTable = Stats.bFromBakedHeads;
+	L.FaucetSprings = Stats.Springs;
+	L.FaucetEdgeInflows = Stats.EdgeInflows;
+	UE_LOG(LogVoxelFluid, Verbose,
+	       TEXT("Faucet gather: %d heads in box -> %d in the Q band (tile min Q %lld) -> %d ")
+	       TEXT("springs; %d edge inflows at %lld mm/yr (%s); source=%s"),
+	       Stats.HeadsInBox, Stats.Candidates, Stats.TileMinQ, Stats.Springs, Stats.EdgeInflows,
+	       Stats.RunoffMmPerYr, Stats.bRunoffCalibrated ? TEXT("fitted") : TEXT("FALLBACK"),
+	       Stats.bFromBakedHeads ? TEXT("baked heads") : TEXT("bv23 graph"));
+
+	// THE CAP IS NOW A GUARD, NOT THE SELECTION. Springs are spaced 150 m apart
+	// and a box has four faces, so springs+edges is single digits by
+	// construction; if it is not, the selection has failed somewhere upstream
+	// and that is worth saying out loud rather than silently keeping the first
+	// 32 of something.
+	L.bFaucetCapTruncated = Heads.Num() > kMaxHeadFaucets;
+	if (L.bFaucetCapTruncated)
+	{
+		UE_LOG(LogVoxelFluid, Warning,
+		       TEXT("Faucet cap TRUNCATED the gather: %d emitters selected (%d springs from %d ")
+		       TEXT("candidates of %d heads in box, %d edge inflows) against a cap of %d. The ")
+		       TEXT("spring rule is supposed to make this impossible -- check ")
+		       TEXT("voxel.Water.Springs.QFactorPct / SpacingPx."),
+		       Heads.Num(), Stats.Springs, Stats.Candidates, Stats.HeadsInBox, Stats.EdgeInflows,
+		       kMaxHeadFaucets);
+	}
 
 	// Rebuild the faucet list, PRESERVING accumulators for faucets that are
 	// still present (matched by XY) so a refresh cannot double-emit or drop a
@@ -615,9 +674,23 @@ void UVoxelFluidSubsystem::RefreshHeadwaterFaucets(double NowSeconds)
 			break; // bounded gather; the cap is a stated limit, not a silent one
 		}
 		FVoxelFluidLifecycle::FHeadFaucet F;
-		// Emit just above the drawn ground at the head, inside the active box.
-		const double GroundZ = WorldSub->GetSurfaceHeightUU(H.XUU, H.YUU);
-		F.WorldPos = FVector(H.XUU, H.YUU, GroundZ + kLifecycleFaucetHeightUU);
+		if (H.bEdgeInflow)
+		{
+			// AT the drawn water surface, moving the way the channel runs. A
+			// river entering the box at ground level would enter under its own
+			// water; entering with no velocity would enter as a dropped column.
+			F.WorldPos = FVector(H.XUU, H.YUU, H.SurfaceZUU + kLifecycleFaucetHeightUU);
+			F.Velocity = FVector3f(float(H.DirX) * kEdgeInflowSpeedUU,
+			                       float(H.DirY) * kEdgeInflowSpeedUU, 0.0f);
+			F.bEdgeInflow = true;
+		}
+		else
+		{
+			// A spring seeps out of the ground and runs downhill from there, so
+			// it emits just above the drawn ground with no velocity of its own.
+			const double GroundZ = WorldSub->GetSurfaceHeightUU(H.XUU, H.YUU);
+			F.WorldPos = FVector(H.XUU, H.YUU, GroundZ + kLifecycleFaucetHeightUU);
+		}
 		F.QM3PerYear = H.QM3PerYear;
 		for (const FVoxelFluidLifecycle::FHeadFaucet& O : Old)
 		{
@@ -823,7 +896,14 @@ void UVoxelFluidSubsystem::RunOccupancyVerify()
 	Region.sizeVoxels[0] = Size.X;
 	Region.sizeVoxels[1] = Size.Y;
 	Region.sizeVoxels[2] = Size.Z;
-	vxc::fluidFillRegion(L.VerifyScratch.GetData(), Region, L.VerifyBrickBits.GetData());
+	// THE VERIFY MUST APPLY THE SAME WRAP THE GPU APPLIED (contract item 4). The
+	// volume is toroidal: the cursor names a cell in the WINDOW, and where those
+	// words live depends on how far the window has slid. Compare at a flat index
+	// and, the moment the wrap offset is non-zero, this gate compares two
+	// different voxels and reports every one of them as a FAIL.
+	const FIntVector WrapV = Occupancy->GetWrapOffsetVoxel();
+	const int32 Wrap[3] = {WrapV.X, WrapV.Y, WrapV.Z};
+	vxc::fluidFillRegion(L.VerifyScratch.GetData(), Wrap, Region, L.VerifyBrickBits.GetData());
 
 	// Byte-compare the region's words.
 	bool bPass = true;
@@ -837,7 +917,7 @@ void UVoxelFluidSubsystem::RunOccupancyVerify()
 				const int32 Lx = MinLocal.X + Wx * vxc::kFluidBitsPerWord;
 				const int32 Ly = MinLocal.Y + Ry;
 				const int32 Lz = MinLocal.Z + Rz;
-				const int64 Idx = vxc::fluidVolumeWordIndex(Lx, Ly, Lz);
+				const int64 Idx = vxc::fluidVolumeWordIndexLocal(Wrap, Lx, Ly, Lz);
 				const uint32 Gpu = Words[int32(Idx)];
 				const uint32 Cpu = L.VerifyScratch[int32(Idx)];
 				if (Gpu != Cpu)
@@ -1181,8 +1261,32 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 
 			const int64 DtMicros = int64(double(DeltaTime) * 1.0e6);
 			const int64 DefaultQ = int64(FMath::Max(0.0f, CVarVoxelFluidFaucetDefaultQ.GetValueOnGameThread()));
+			L.FaucetsDeferredNoOccupancyNow = 0;
 			for (FVoxelFluidLifecycle::FHeadFaucet& F : L.HeadFaucets)
 			{
+				// DEFER INTO UNBUILT OCCUPANCY (playtest fix 2026-08-09). The
+				// initial fill is centre-out and multi-second, and unfilled
+				// space is SOLID by design -- so a faucet at the far corner of
+				// the box emitted into notional rock and its particles froze in
+				// mid-air at the edge of the built region. That frozen shell was
+				// the other half of the "square plane of hovering water".
+				//
+				// Skipped BEFORE addMicros, deliberately: the accumulator keeps
+				// its carry, so nothing is dropped and no debt accrues while the
+				// fill catches up. (Contrast the backpressure path below, which
+				// ROUTES its surplus because the alive cap is a steady state a
+				// faucet would otherwise owe against forever. This one clears in
+				// seconds.) Emitting nowhere is the right answer -- a headwater
+				// with no terrain under it has nothing to run down.
+				const VoxelCoords::FVoxelCoord EmitVoxel = VoxelCoords::WorldToVoxel(F.WorldPos);
+				if (!Occupancy.IsValid() ||
+				    !Occupancy->IsRegionBuilt(FIntVector(int32(EmitVoxel.X), int32(EmitVoxel.Y),
+				                                         int32(EmitVoxel.Z))))
+				{
+					L.FaucetTicksDeferredNoOccupancy++;
+					L.FaucetsDeferredNoOccupancyNow++;
+					continue;
+				}
 				const int64 Q = F.QM3PerYear > 0.0 ? int64(F.QM3PerYear) : DefaultQ;
 				int64 Owed = F.Acc.addMicros(Q, DtMicros);
 				if (Owed <= 0)
@@ -1216,7 +1320,7 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 				{
 					continue;
 				}
-				PushSpawn(uint32(Emit), 1, F.WorldPos, FVector3f::ZeroVector);
+				PushSpawn(uint32(Emit), 1, F.WorldPos, F.Velocity);
 				Budget -= int32(Emit);
 				L.HeadFaucetParticlesEmitted += uint64(Emit);
 				FaucetEmittedThisTick += uint32(Emit);
@@ -1227,6 +1331,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			for (int32 I = L.SillFaucets.Num() - 1; I >= 0; --I)
 			{
 				FVoxelFluidLifecycle::FSillFaucet& S = L.SillFaucets[I];
+				// Same unbuilt-occupancy deferral as the headwaters above. The
+				// owed units simply stay owed (and are refunded at teardown by
+				// the existing path), so a sill over an unfilled corner of the
+				// volume waits instead of spraying into rock.
+				const VoxelCoords::FVoxelCoord SillVoxel = VoxelCoords::WorldToVoxel(S.WorldPos);
+				if (!Occupancy.IsValid() ||
+				    !Occupancy->IsRegionBuilt(FIntVector(int32(SillVoxel.X), int32(SillVoxel.Y),
+				                                         int32(SillVoxel.Z))))
+				{
+					L.FaucetTicksDeferredNoOccupancy++;
+					L.FaucetsDeferredNoOccupancyNow++;
+					continue;
+				}
 				const int64 MaxParticles = vxc::fluidWholeParticlesFromUnits(S.UnitsRemaining);
 				const int64 Emit = FMath::Min(MaxParticles, int64(Budget));
 				if (Emit > 0)
@@ -1497,10 +1614,28 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		}
 		else
 		{
-			FaucetField = FString::Printf(TEXT("%llu/s(n=%d,%s)"), L.PerfFaucetEmitted,
-			                              L.HeadFaucets.Num(),
-			                              L.bHeadsFromBakedTable ? TEXT("heads") : TEXT("fallback"));
+			// springs=<selected> and edges=<crossings> are the two things the
+			// selection is FOR, so they are the two numbers on the line: a box
+			// with springs=0,edges=1 is a window mid-river being fed from its
+			// boundary (correct), and springs=12 would mean the band has come
+			// loose. "heads" vs "fallback" still says which source answered.
+			FaucetField = FString::Printf(TEXT("%llu/s(springs=%d,edges=%d,%s%s)"),
+			                              L.PerfFaucetEmitted, L.FaucetSprings,
+			                              L.FaucetEdgeInflows,
+			                              L.bHeadsFromBakedTable ? TEXT("heads") : TEXT("fallback"),
+			                              L.bFaucetCapTruncated ? TEXT(",CAPPED") : TEXT(""));
 		}
+
+		// deferredNoOccupancy: emitters that skipped this tick because their
+		// point sits in occupancy the initial fill has not reached (or outside
+		// the volume). "off" when the lifecycle is not armed, "<now>/<total>"
+		// otherwise -- a live count beside a cumulative one, so a steady
+		// non-zero left number means a faucet is permanently out of the box
+		// rather than merely waiting for the fill.
+		const FString DeferredField =
+			!bFaucets ? FString(TEXT("off"))
+			          : FString::Printf(TEXT("%d/%llu"), L.FaucetsDeferredNoOccupancyNow,
+			                            L.FaucetTicksDeferredNoOccupancy);
 		const uint64 BasinRate = uint64(Snapshot.DespawnedBasin) - L.LastPerfBasinDespawns;
 		const uint64 BoundaryRate = uint64(Snapshot.DespawnedBoundary) - L.LastPerfBoundaryDespawns;
 		L.LastPerfBasinDespawns = uint64(Snapshot.DespawnedBasin);
@@ -1536,14 +1671,14 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		       TEXT("Fluid perf %s alive=%u spawned=%u requested=%llu despawnBasin=%u ")
 		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s iters=%d slots=%llu violations=%llu ")
 		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s ")
-		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu%s"),
+		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu deferredNoOccupancy=%s%s"),
 		       StateMarker, Snapshot.Alive, Snapshot.SpawnedTotal, CumulativeSpawnRequested,
 		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs, *RenderField,
 		       FMath::Clamp(CVarVoxelFluidIterations.GetValueOnGameThread(), 1, 8),
 		       FMath::Min<uint64>(CumulativeSpawnRequested, VoxelFluidSim::kMaxParticles),
 		       ConservationViolations, *FaucetField, L.PerfSpillEmitted, *SinkBasinField, BoundaryRate,
 		       L.RegionsBuiltTotal, L.PendingRegions.Num(), VerifyField,
-		       SimState->GetTicksSkippedNoOccupancy(),
+		       SimState->GetTicksSkippedNoOccupancy(), *DeferredField,
 		       bDebugDrawSkippedTooMany ? TEXT(" debugDraw=skipped(alive>5000)") : TEXT(""));
 
 		// The scalar side of the extended conservation line, only while the

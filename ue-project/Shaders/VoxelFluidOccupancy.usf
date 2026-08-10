@@ -78,11 +78,36 @@
 // and no ordering between regions. The cost is at most three extra brick
 // columns per region, and the host can always produce them.
 //
-// THE CLEAR IS NOT HERE. A whole-volume clear to "all solid" is
-// AddClearUAVPass on the host side (VoxelFluidOccupancy.cpp) -- RDG already
-// has a clear and a kernel that only stores a constant would be a second
-// mechanism for it. All-solid rather than all-air is the "blocked, never
+// THE WHOLE-VOLUME CLEAR IS NOT HERE. A clear of the entire 16 MiB to "all
+// solid" is AddClearUAVPass on the host side (VoxelFluidOccupancy.cpp) -- RDG
+// already has a clear and a kernel that only stores a constant would be a
+// second mechanism for it. All-solid rather than all-air is the "blocked, never
 // guessed" rule: an unbuilt volume freezes particles, it does not leak them.
+//
+// A SUB-BOX clear is a different question and FluidOccupancyMarkUnbuiltMain
+// below is the answer to it: RDG has no ranged buffer clear, and the only other
+// way to say "this slab is unknown" through the existing fill path is to upload
+// 2 MiB of brick bits that are all ones. See that kernel's own note.
+//
+// ---------------------------------------------------------------------------
+// TOROIDAL ADDRESSING (contract item 4)
+// ---------------------------------------------------------------------------
+//
+// Regions arrive in LOCAL (window) coordinates and are stored at
+// (local + FluidVolumeWrapOffsetVoxel) mod Dim, so the volume is a rolling
+// window and a recentre invalidates only the entering slab instead of all
+// 16 MiB. The reader mirrors this in VoxelFluidCollision.ush and the CPU
+// reference in voxelcore/fluidoccupancy.h defines it; all three have to agree
+// or the in-editor verify gate (voxel.Fluid.Occupancy.Verify) says so.
+//
+// The one thing the wrap could have broken here is the whole-word write this
+// kernel is built on. It does not, and the reason is an alignment invariant the
+// host checks before every dispatch: the wrap offset is always a multiple of 64
+// voxels (the recentre quantum) and a region's x is always 32-aligned, so a
+// local 32-voxel word column maps to exactly one storage word column and never
+// straddles the seam. Without that, one word per region would need a
+// read-modify-write and two regions could race on it -- the same hazard the
+// snapping rule above exists to remove, arriving by a different door.
 
 #include "/Engine/Public/Platform.ush"
 #include "/VoxelEarth/VoxelFluidContract.ush"
@@ -103,14 +128,35 @@ RWBuffer<uint> FluidOccupancyBits;
 StructuredBuffer<uint> FluidRegionBrickBits;
 
 // 512. From the contract; a uniform rather than a literal so a smaller volume
-// is a host change.
+// is a host change. Must be a power of two -- the wrap masks.
 uint FluidVolumeDimVoxels;
+
+// TOROIDAL: the STORAGE coordinate of local (0,0,0). Same name, same meaning
+// and same host binding as VoxelFluidCollision.ush's declaration -- one name,
+// one meaning, two access modes, and the two declarations can never meet.
+uint3 FluidVolumeWrapOffsetVoxel;
 
 // The region, in VOLUME-LOCAL voxels. Min is 32-aligned in x and 8-aligned in
 // y/z; Size likewise. Both guaranteed by vxc::fluidSnapRegion on the host and
 // re-checked by FVoxelFluidOccupancyVolume::UpdateRegion before dispatch.
 uint3 FluidRegionMinVoxel;
 uint3 FluidRegionSizeVoxels;
+
+// ---------------------------------------------------------------------------
+// Addressing, shared by both writer kernels
+// ---------------------------------------------------------------------------
+
+// LOCAL voxel -> the index of the word that holds it. x-major: 32 voxels per
+// word along x, rows along x, then y, then z, over STORAGE coordinates.
+// Identical to vxc::fluidVolumeWordIndexLocal, and the ONLY place either kernel
+// below computes an address.
+uint FluidVolumeWordIndexLocal(uint3 localVoxel)
+{
+	// lint-shader-ub: allow UNSIGNED_UNDERFLOW - FluidVolumeDimVoxels is the volume edge, uploaded by the host as vxc::kFluidVolumeDimVoxels (512) and static_asserted to be a positive power of two in both VoxelFluidOccupancy.cpp and fluidoccupancy.h; it is never 0, so Dim-1 is the wrap mask 511 and cannot underflow
+	const uint3 s = (localVoxel + FluidVolumeWrapOffsetVoxel) & (FluidVolumeDimVoxels - 1u);
+	const uint wordsPerRow = FluidVolumeDimVoxels >> 5u;
+	return (s.z * FluidVolumeDimVoxels + s.y) * wordsPerRow + (s.x >> 5u);
+}
 
 // ---------------------------------------------------------------------------
 // FluidOccupancyFillMain
@@ -164,12 +210,115 @@ void FluidOccupancyFillMain(uint3 tid : SV_DispatchThreadID)
 		packed |= row << (k * 8u);
 	}
 
-	// x-major volume addressing: 32 voxels per word along x, rows along x, then
-	// y, then z. Identical to vxc::fluidVolumeWordIndex.
-	const uint wordsPerRow = FluidVolumeDimVoxels >> 5u;
-	const uint lx = FluidRegionMinVoxel.x + tid.x * 32u;
-	const uint ly = FluidRegionMinVoxel.y + tid.y;
-	const uint lz = FluidRegionMinVoxel.z + tid.z;
-	// lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid inside the region, and the host refuses any region not wholly inside the volume (FVoxelFluidOccupancyVolume::UpdateRegion, via vxc::fluidRegionInBounds), so lx/ly/lz are all below FluidVolumeDimVoxels and the index is below wordsPerRow*Dim*Dim, which is the buffer's exact size
-	FluidOccupancyBits[(lz * FluidVolumeDimVoxels + ly) * wordsPerRow + (lx >> 5u)] = packed;
+	const uint3 lv = FluidRegionMinVoxel + uint3(tid.x * 32u, tid.y, tid.z);
+	// lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid inside the region, and the host refuses any region not wholly inside the volume (FVoxelFluidOccupancyVolume::UpdateRegion, via vxc::fluidRegionInBounds), so lv is below FluidVolumeDimVoxels on every axis; the wrap in FluidVolumeWordIndexLocal is a mask by Dim-1 and cannot leave that range, so the index is below wordsPerRow*Dim*Dim, which is the buffer's exact size
+	FluidOccupancyBits[FluidVolumeWordIndexLocal(lv)] = packed;
+}
+
+// ---------------------------------------------------------------------------
+// FluidOccupancyMarkUnbuiltMain
+// ---------------------------------------------------------------------------
+//
+// Marks one region UNBUILT -- all bits solid -- with no upload. The recentre
+// path's other half: when the window slides, the entering slab's storage words
+// still hold the terrain of the slab that just left, 51.2 m away and entirely
+// plausible. Marking is what makes the gap "we do not know yet" (water freezes,
+// the safe failure) instead of "here is some terrain from over there" (water
+// collides against geometry that is not in front of it, which reads as
+// worldgen).
+//
+// WHY A KERNEL, given this file's own rule that a constant-store kernel is a
+// second mechanism for a clear. That rule is about the WHOLE-volume clear,
+// where RDG already has AddClearUAVPass. There is no ranged buffer clear, and
+// the alternative inside the existing path is uploading 2 MiB of brick bits per
+// recentre that are all ones. This shares FluidVolumeWordIndexLocal with the
+// fill above, so it is a second ENTRY POINT over one addressing definition, not
+// a second definition.
+//
+// Same thread mapping and same guard as the fill, deliberately: one region
+// shape, one dispatch calculation, one off-by-one to get wrong instead of two.
+// Mirror of vxc::fluidMarkRegionUnbuilt.
+[numthreads(8, 8, 1)]
+void FluidOccupancyMarkUnbuiltMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint regionWordsX = FluidRegionSizeVoxels.x >> 5u;
+	if (tid.x >= regionWordsX || tid.y >= FluidRegionSizeVoxels.y ||
+	    tid.z >= FluidRegionSizeVoxels.z)
+	{
+		return;
+	}
+
+	const uint3 lv = FluidRegionMinVoxel + uint3(tid.x * 32u, tid.y, tid.z);
+	// lint-shader-ub: allow UNGUARDED_WRITE - identical bound to FluidOccupancyFillMain's store: the entry guard caps tid inside the region and the host refuses any region not wholly inside the volume, so the wrapped index is below the buffer's exact size
+	FluidOccupancyBits[FluidVolumeWordIndexLocal(lv)] = 0xFFFFFFFFu;   // vxc::kFluidVolumeUnbuiltWord
+}
+
+// ---------------------------------------------------------------------------
+// FluidRebaseParticlesMain -- contract item 8
+// ---------------------------------------------------------------------------
+//
+// WHY A PARTICLE KERNEL IS IN THE OCCUPANCY FILE, WHICH IS NOT THE SOLVER'S.
+// Stated plainly because it is a boundary crossing and boundary crossings rot
+// quietly: VoxelFluidSim.usf is the solver's file and this pass is not the
+// solver's business, it is the volume's. Recentring is a property of the
+// occupancy window -- the window decides when it moves and by how much -- and
+// particle positions are expressed relative to that window's corner by contract
+// item 1. So the fix-up belongs with the thing that caused it. The alternative,
+// a kernel in VoxelFluidSim.usf, would put a pass the solver never calls from
+// its own tick into the solver's file and give two owners one edit.
+//
+// It writes ParticlesRW through the CONTRACT binding (VoxelFluidContract.ush
+// :54-59), by that exact name, so there is no second particle layout here and
+// nothing to drift. It is the only write to particle state outside the solver,
+// and it happens between solver ticks -- never inside one.
+//
+// WHAT IT DOES, AND WHY THAT IS THE WHOLE JOB. Positions are origin-relative
+// (contract item 1), so moving the origin by D voxels means every stored
+// position must lose D*10 UU or the water teleports 51.2 m sideways relative to
+// the terrain. Velocity is unchanged: this is a translation of the frame, not a
+// boost. Only P0.xyz is touched; P0.w (flags) and P1 (velocity, batch id) are
+// written back untouched.
+//
+// AND NOTHING ELSE PERSISTS. The solver's other position buffers
+// (OutPositions/InPositions/GridPositions and the whole sorted domain) are RDG
+// transients rebuilt from ParticlesRW every tick, so they need no rebase --
+// which is also why this pass must not run in the middle of a tick.
+//
+// PRECISION. D is a whole number of voxels, so the shift is an exact multiple
+// of 10 UU; the subtraction is exact whenever the particle moves toward the new
+// origin and rounds by at most half a ULP at 5120 UU (2.4 um, one fortieth of
+// the collision skin) when it moves away. The derivation and the bound are in
+// voxelcore/fluidoccupancy.h (fluidRebaseDeltaUU) and pinned by
+// test_fluidoccupancy.cpp.
+
+RWStructuredBuffer<FVoxelFluidParticle> ParticlesRW;
+
+// The origin's motion in UU: (newOriginVoxel - oldOriginVoxel) * 10, SUBTRACTED
+// from every position. Accumulated by the host across any recentres that landed
+// since the last rebase, so two moves in one frame cost one pass.
+float3 FluidRebaseDeltaUU;
+// Slots to touch: the sim's allocation high water, not MAX_PARTICLES. A dead
+// slot's position is meaningless, so rebasing it is harmless -- but rebasing
+// 300k slots when 5k are allocated is not, and the sim already publishes the
+// bound (FVoxelFluidSimState::SimSlotBound).
+uint FluidRebaseSlotCount;
+
+// 64 rather than the solver's VOXEL_FLUID_GROUP, which is that file's constant
+// and not the contract's. A pure streaming pass over 32-byte records; the group
+// size is not load-bearing.
+[numthreads(64, 1, 1)]
+void FluidRebaseParticlesMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= FluidRebaseSlotCount)
+	{
+		return;
+	}
+	// i is below FluidRebaseSlotCount by the guard above, and the host clamps
+	// that to the particle buffer's element count before dispatch
+	// (FVoxelFluidOccupancyVolume::AddRebaseParticlesPass), so the store is in
+	// range. Only P0.xyz moves: P0.w is the flags word and P1 is velocity plus
+	// the spawn batch id, and a frame translation changes neither.
+	const float4 p0 = ParticlesRW[i].P0;
+	ParticlesRW[i].P0 = float4(p0.xyz - FluidRebaseDeltaUU, p0.w);
 }

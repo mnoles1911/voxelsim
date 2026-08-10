@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.93,
+    "height_frac": 0.16,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 110,
+    "radius_m": 3.6,
+    "shape": "umbrella",
+    "shell": 0.95,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.2,
+    "clump_radius_m": 0.95,
+    "coverage": 1.0,
+    "density": 0.55,
+    "droop_m": 0.26,
+    "enabled": true,
+    "min_order": 1,
+    "squash": 0.4
+  },
+  "growth": {
+    "gravity": -0.46,
+    "inertia": 0.7,
+    "influence_m": 6.5,
+    "jitter": 0.03,
+    "kill_m": 1.7,
+    "max_iter": 260,
+    "phototropism": 0.05,
+    "radius_exp": 2.6,
+    "step_m": 0.55,
+    "tip_radius_m": 0.05
+  },
+  "height_m": 10.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_jungle"
+  },
+  "name": "coast-palm",
+  "notes": "Bare leaning trunk under a few big fronds. After vengi's tree_palm. Few growth targets on purpose -- a palm has a handful of huge leaves, not a canopy.",
+  "trunk": {
+    "buttress": 0.3,
+    "clear_frac": 0.8,
+    "lean_deg": 14.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.24,
+    "wander": 0.22
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

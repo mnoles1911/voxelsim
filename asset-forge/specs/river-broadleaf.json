@@ -1,0 +1,62 @@
+{
+  "crown": {
+    "center_frac": 0.68,
+    "height_frac": 0.66,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 1800,
+    "radius_m": 3.8,
+    "shape": "sphere",
+    "shell": 0.35,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.4,
+    "clump_radius_m": 0.32,
+    "coverage": 0.9,
+    "density": 0.58,
+    "droop_m": 0.35,
+    "enabled": true,
+    "min_order": 2,
+    "squash": 1.15
+  },
+  "growth": {
+    "gravity": -0.32,
+    "inertia": 0.55,
+    "influence_m": 2.4,
+    "jitter": 0.07,
+    "kill_m": 0.34,
+    "max_iter": 260,
+    "phototropism": 0.04,
+    "radius_exp": 2.2,
+    "step_m": 0.26,
+    "tip_radius_m": 0.03
+  },
+  "height_m": 12.0,
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "leaf": "leaf_broadleaf"
+  },
+  "name": "river-broadleaf",
+  "notes": "Big dense drooping broadleaf for riverbanks and wet ground. NOT a weeping willow: a true willow needs long trailing strands, which needs a strand pass in the generator (see docs/tree-asset-generator-plan.md). Named for what it actually is.",
+  "trunk": {
+    "buttress": 0.35,
+    "clear_frac": 0.3,
+    "lean_deg": 8.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.42,
+    "wander": 0.35
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  }
+}

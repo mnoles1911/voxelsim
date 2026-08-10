@@ -1,4 +1,27 @@
 #pragma once
+// ==========================================================================
+// DEPRECATED 2026-08-09 -- the only host of this header builds nothing by
+// default. Do not extend; do not delete.
+// ==========================================================================
+//
+// The first PBF playtest found far-field river ribbons unreadable against lake
+// sheets, and the owner asked for them off. `AVoxelRiverRibbonActor` now
+// requires -VoxelRiverRibbons=1, so on a default run every function below is
+// dead code that still compiles and is still pinned by test_riverribbon.cpp
+// (17 tests) and vxc_riverribbonprobe.
+//
+// THE CODE STAYS, by the standing rule in
+// docs/water-deprecation-audit-2026-08-09.md: anything with a live call site
+// outside its own tests, or with tests that pin its behaviour, is deprecated
+// now and deleted only after the replacement is proven. The replacement is
+// docs/water-rearchitecture-plan-2026-08-09.md's PBF near field plus whatever
+// far-field handoff it grows. Nothing about LAKE SHEETS (lakes.h
+// `lakeSheetRects`) is deprecated -- those are the standing-water far field and
+// they stay on.
+//
+// The design note below is left intact: a deprecated producer that can still be
+// switched on still has to be understandable by whoever switches it on.
+//
 // voxelcore/riverribbon.h -- the FAR-FIELD producer for flowing water.
 //
 // WHY THIS EXISTS. Water reaches the screen by two paths and, before this

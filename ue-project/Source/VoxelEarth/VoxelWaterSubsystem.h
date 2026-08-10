@@ -515,31 +515,85 @@ public:
 	// argument the lake-sheet and ribbon accessor groups make above). Plain
 	// types only: this header stays voxel-core-free by doctrine.
 
-	// One headwater faucet: where a baked reach starts and the discharge it
-	// carries. QM3PerYear is 0 when the source could not supply a rate (the
-	// pre-bv24 fallback below) -- the caller substitutes its own default, and
-	// 0 must never be read as "dry".
+	// One emitter the fluid hangs a faucet on. TWO KINDS, and the difference is
+	// the whole point of the pair of gathers below:
+	//   * a SPRING (bEdgeInflow false) is a first-order head -- water appearing
+	//     at the top of a gully. Its Z is not set here; the caller puts it just
+	//     above the drawn GROUND, because that is where a spring emerges.
+	//   * an EDGE INFLOW (bEdgeInflow true) is the river crossing into the box.
+	//     Its Z IS set (SurfaceZUU, the drawn water surface -- up to 25 m above
+	//     the bed on a big reach) and it carries a direction, because water
+	//     entering a river is already moving.
+	// QM3PerYear is 0 when the source could not supply a rate (the pre-bv24
+	// fallback) -- the caller substitutes its own default, and 0 must never be
+	// read as "dry".
 	struct FVoxelHeadwaterFaucet
 	{
 		double XUU = 0.0, YUU = 0.0; // fine-pixel centre, world UU
-		double QM3PerYear = 0.0;     // discharge at the head (tilestore.h HeadEntry)
+		double QM3PerYear = 0.0;     // spring: measured (tilestore.h HeadEntry).
+		                             // edge inflow: ESTIMATED (fluidsprings.h's chain)
+		double SurfaceZUU = 0.0;     // edge inflow only: the drawn water surface
+		double DirX = 0.0, DirY = 0.0; // edge inflow only: inward channel direction, unit
+		bool bEdgeInflow = false;
 	};
 
-	// Every headwater inside the square of half-extent RadiusUU around the
-	// centre. TWO SOURCES, tried in order:
-	//   1. The baked SECTION_HEADWATERS table (bake_ver 24, FineTile::heads())
-	//      -- the exact answer, with per-head Q. Used whenever any overlapped
-	//      tile has a resident heads table; bOutFromBakedHeads true.
+	// What the gather did, for the perf line and for telling "no springs here"
+	// from "the gather never got to look".
+	struct FVoxelHeadwaterGatherStats
+	{
+		int32 HeadsInBox = 0;    // rows of the baked table inside the box
+		int32 Candidates = 0;    // of those, inside the Q band
+		int32 Springs = 0;       // of those, surviving the spacing rule
+		int32 EdgeInflows = 0;   // inbound channel crossings on the box faces
+		int64 TileMinQ = 0;      // the Q datum the band was measured against
+		int64 RunoffMmPerYr = 0; // the edge-inflow discharge coefficient used
+		bool bRunoffCalibrated = false; // false == the fallback constant
+		bool bFromBakedHeads = false;   // false == the bv23 fallback graph
+	};
+
+	// THE SPRINGS inside the square of half-extent RadiusUU around the centre --
+	// NOT every head. The baked SECTION_HEADWATERS table is the top of every
+	// drawn reach FRAGMENT (tile (-4,-4) ships 57,157 of them), and hanging a
+	// faucet on each drew solid lines of water down every valley. The rule that
+	// turns that table into springs lives in voxel-core and is unit-tested there
+	// (voxelcore/fluidsprings.h, selectSprings): a first-order Q band measured
+	// against the TILE's minimum, then a minimum spacing keeping the lowest-Q
+	// head of each cluster. Expect 0 or 1 per 51 m box.
+	//
+	// TWO SOURCES, tried in order:
+	//   1. The baked table (bake_ver 24, FineTile::heads()) -- the exact answer,
+	//      with per-head Q. Used whenever any overlapped tile has a resident
+	//      heads table; Stats.bFromBakedHeads true.
 	//   2. FALLBACK for bv23-and-older tiles (the running bake has not landed):
 	//      RiverNetwork::buildFromBakedWater over the same box, taking its
 	//      headwaterNodes(). Q is unknown there (build-time discharge is a
-	//      catchment AREA, a different unit -- rivernet.h) so QM3PerYear is 0,
-	//      and rivernet.h's own caveat applies: reaches ENTERING the box from
-	//      outside read as heads, so the box rim can carry false faucets.
-	//      bOutFromBakedHeads false.
+	//      catchment AREA, a different unit -- rivernet.h) so QM3PerYear is 0
+	//      and selectSprings' unrated path applies the spacing rule alone.
+	//      Rim heads are CULLED (dropRimHeadwaters): rivernet.h's caveat is that
+	//      reaches ENTERING the box read as heads on its boundary ring, and that
+	//      drew a square of faucets in the first playtest.
+	// Warms the overlapped tiles before reading them, so a cold sampler cannot
+	// answer "no heads here" without having tried.
 	// Game-thread only (decodes tile blocks). Returns the number appended.
 	int32 GatherHeadwaterFaucets(double CenterXUU, double CenterYUU, double RadiusUU,
-	                             TArray<FVoxelHeadwaterFaucet>& Out, bool& bOutFromBakedHeads);
+	                             TArray<FVoxelHeadwaterFaucet>& Out,
+	                             FVoxelHeadwaterGatherStats& OutStats);
+
+	// WHERE THE RIVER ENTERS THE BOX. A window sitting mid-river has no spring
+	// in it and must not invent one -- its water arrives across the boundary. So
+	// this walks the four faces of the same box in fine pixels and returns the
+	// points where the baked channel crosses INBOUND, as edge-inflow faucets at
+	// the drawn water surface with the channel's direction on them. The
+	// detection rule and its stated approximations are voxel-core's
+	// (fluidsprings.h, selectRiverCrossings); the discharge is an ESTIMATE off
+	// the flow plane's catchment bucket, with the coefficient fitted from the
+	// heads near the box -- read that header's unit chain before trusting the
+	// number.
+	// Appends to the same array as the springs gather and fills the same stats.
+	// Game-thread only. Returns the number appended.
+	int32 GatherRiverCrossings(double CenterXUU, double CenterYUU, double RadiusUU,
+	                           TArray<FVoxelHeadwaterFaucet>& Out,
+	                           FVoxelHeadwaterGatherStats& OutStats);
 
 	// Adds `Units` (WaterCA fill units, the graph's own storage currency) to
 	// the river segment nearest to world voxel (Vx, Vy) within MaxReachMm.

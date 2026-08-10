@@ -185,8 +185,13 @@ void AVoxelEarthGameMode::BeginPlay()
 		// basin registry, and a reach is not a basin. Spawned unconditionally
 		// for the same reason and with the same control discipline as the
 		// sheet -- with no fine tier the actor opens no window and creates no
-		// mesh sections, and -VoxelRiverRibbons=0 is read INSIDE the actor so
+		// mesh sections, and the switch is read INSIDE the actor so
 		// suppressed-by-absence and suppressed-by-switch log differently.
+		//
+		// DEPRECATED 2026-08-09 and now DEFAULT OFF: the actor is still spawned
+		// (so it can log its own deprecation and so -VoxelRiverRibbons=1 works
+		// on the shipping binary) but builds nothing unless asked. See the
+		// banner in VoxelRiverRibbonActor.h. The lake sheet above is unaffected.
 		World->SpawnActor<AVoxelRiverRibbonActor>();
 
 		// M3 wave 1 (docs/m3-plan.md): the edit-log replication transport

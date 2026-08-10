@@ -238,6 +238,13 @@
 //      wider than the one it emits in, or wait for the bake's own
 //      `water_head_mask` (computed at water.py:480-525 and currently DISCARDED
 //      at pipeline.py:5300), which Phase 1 ships and which is the exact answer.
+//      THE PARTIAL MITIGATION, added after the first playtest put those false
+//      heads on screen as a square of hovering water:
+//      BakedWaterBuildParams::dropRimHeadwaters removes every head on the
+//      boundary ring, counting them in bakedRimHeadsDropped(). It cannot invent
+//      the real head outside the box, so it makes the region report NO heads
+//      rather than four wrong ones -- which is the honest answer for a window,
+//      and why it is opt-in rather than the default (see the field).
 //   4. `discharge` at build time means UPSTREAM CATCHMENT AREA IN m^2 here,
 //      decoded from the flow byte's log2 bucket -- a THIRD meaning for that
 //      field, and the reason the two builders are separate entry points rather
@@ -425,6 +432,23 @@ struct BakedWaterBuildParams {
     // about. Left as a knob only because a caller doing a coarse survey over a
     // partially streamed region may genuinely prefer a rough graph to none.
     bool admitUnresolvedWater = false;
+
+    // DROP THE RIM FALSE-HEADS (water re-architecture, playtest fix
+    // 2026-08-09). The approximation this header states at "3. HEADWATERS" is
+    // that a reach ENTERING the region from outside has no in-edge inside it
+    // and is therefore reported as a head, so the region's upstream rim is full
+    // of false heads. With this on, a head lying ON the boundary ring of
+    // `bounds` is dropped: it is a clip artifact, not a spring. Counted in
+    // bakedRimHeadsDropped() so "there were no heads" stays distinguishable
+    // from "every head was a rim artifact".
+    //
+    // OFF BY DEFAULT because the cull is only correct for a caller whose region
+    // is a WINDOW onto a larger world. A caller that built over the whole
+    // catchment -- every fixture in test_rivernet.cpp, and any survey whose
+    // bounds are the data's own extent -- has a genuine spring on its rim, and
+    // dropping it would lose a real head. The faucet gather sets it; the
+    // fixtures do not.
+    bool dropRimHeadwaters = false;
 };
 
 // Sea level for the graph. A node at or below this elevation is AT THE SEA,
@@ -520,6 +544,11 @@ public:
     uint64_t bakedCellsUnresolved() const { return bakedUnresolved_; }
     uint64_t bakedCellsScanned() const { return bakedScanned_; }
     uint64_t bakedChannelCells() const { return bakedChannelCells_; }
+    // Heads suppressed by BakedWaterBuildParams::dropRimHeadwaters. The
+    // ran-flag for the cull: 0 heads with a non-zero count here means the
+    // region only ever saw rivers passing through, which is a different fact
+    // from "this valley is dry".
+    uint64_t bakedRimHeadsDropped() const { return bakedRimHeadsDropped_; }
 
     const std::vector<RiverNode>& nodes() const { return nodes_; }
     const std::vector<RiverSegment>& segments() const { return segments_; }
@@ -713,6 +742,7 @@ private:
     uint64_t bakedScanned_ = 0;
     uint64_t bakedUnresolved_ = 0;
     uint64_t bakedChannelCells_ = 0;
+    uint64_t bakedRimHeadsDropped_ = 0;
 
     bool recordDiffs_ = false;
     std::vector<RiverDiffRecord> diffLog_;

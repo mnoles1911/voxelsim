@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>asset-forge</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="bar">
+  <div class="brand">asset&#8209;forge</div>
+  <select id="species" title="Load a species spec"></select>
+  <span id="hash" class="hash" title="Spec hash — identifies this exact parameter set"></span>
+  <span class="grow"></span>
+  <label class="check"><input type="checkbox" id="auto" checked> auto&#8209;regenerate</label>
+  <button id="saveSpec" class="ghost" title="Write the current sliders back to specs/&lt;name&gt;.json — rename first to fork a new species">Save spec</button>
+  <button id="tabGallery" class="tab on">Gallery</button>
+  <button id="tabLibrary" class="tab">Library</button>
+</header>
+
+<main>
+  <aside id="panel">
+    <div class="panelhead">
+      <input id="specName" placeholder="species name" spellcheck="false">
+      <button id="reset" class="ghost small" title="Back to the saved spec">Revert</button>
+    </div>
+    <div class="askbox">
+      <textarea id="ask" rows="2" spellcheck="false"
+        placeholder="Describe a change — &ldquo;shorter and more gnarled, sparser canopy&rdquo;"></textarea>
+      <div class="askrow">
+        <button id="askGo" class="primary small">Apply</button>
+        <span id="askMsg" class="status"></span>
+      </div>
+      <div id="askEdits" class="askedits"></div>
+    </div>
+    <div id="params"></div>
+  </aside>
+
+  <section id="stage">
+    <div class="controls">
+      <button id="generate" class="primary">Generate</button>
+      <label>from seed <input id="seedStart" type="number" value="1" min="0" step="1"></label>
+      <label>count <input id="count" type="number" value="12" min="1" max="200" step="1"></label>
+      <button id="reroll" class="ghost">Reroll</button>
+      <button id="more" class="ghost">More</button>
+      <div id="progress" class="progress"><div id="bar"></div></div>
+      <span id="status" class="status"></span>
+    </div>
+    <div id="gallery" class="gallery"></div>
+    <div id="library" class="gallery hidden"></div>
+  </section>
+</main>
+
+<div id="overlay" class="overlay hidden">
+  <div class="sheetbox">
+    <button id="closeDetail" class="close">&times;</button>
+    <div class="detailgrid">
+      <div class="detailimg">
+        <canvas id="detailCanvas"></canvas>
+        <img id="detailImg" alt="" class="hidden">
+        <div id="viewHint" class="viewhint">drag to spin &middot; scroll to zoom</div>
+        <div class="viewtoggle">
+          <button id="view3d" class="tab on">3D</button>
+          <button id="view2d" class="tab">Flat</button>
+          <button id="viewReset" class="ghost small">Reset view</button>
+        </div>
+      </div>
+      <div class="detailinfo">
+        <h2 id="detailTitle"></h2>
+        <div id="detailProblems"></div>
+        <table id="detailStats"></table>
+        <div class="detailactions">
+          <button id="keep" class="primary">Keep to library</button>
+          <span id="keepMsg" class="status"></span>
+        </div>
+        <div id="detailDownloads" class="downloads"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/viewer.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>

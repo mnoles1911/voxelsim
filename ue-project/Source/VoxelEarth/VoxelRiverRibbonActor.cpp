@@ -1,3 +1,10 @@
+// ==========================================================================
+// DEPRECATED 2026-08-09 -- DEFAULT OFF (-VoxelRiverRibbons=1 to build).
+// Do not extend; do not delete. Rationale and the keep-not-delete rule:
+// docs/water-deprecation-audit-2026-08-09.md. Banner and full note at the top
+// of VoxelRiverRibbonActor.h. Lake sheets are unaffected.
+// ==========================================================================
+
 #include "VoxelRiverRibbonActor.h"
 
 #include "Camera/PlayerCameraManager.h"
@@ -98,7 +105,13 @@ void AVoxelRiverRibbonActor::BeginPlay()
 		            "material. The frame is NOT comparable to a near-field water capture."));
 	}
 
-	int32 Flag = 1;
+	// DEFAULT OFF, DEPRECATED (2026-08-09, first PBF playtest). The owner could
+	// not tell a ribbon from a lake in the far field and asked for ribbons off.
+	// The switch is unchanged and still the only control: -VoxelRiverRibbons=1
+	// opts a capture back in. Lake SHEETS are a different actor with a different
+	// switch and are UNAFFECTED -- they are the standing-water far field and
+	// they stay on. See docs/water-deprecation-audit-2026-08-09.md.
+	int32 Flag = 0;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelRiverRibbons="), Flag))
 	{
 		bEnabled = (Flag != 0);
@@ -131,6 +144,13 @@ void AVoxelRiverRibbonActor::BeginPlay()
 	            "burial measurement that decided that)."),
 	       bEnabled ? TEXT("enabled") : TEXT("DISABLED (-VoxelRiverRibbons=0)"), ScanRadiusUU / 100.0, EdgePx, EdgePx,
 	       (EdgePx * EdgePx) / (1024.0 * 1024.0), MinScreenPx);
+	// ONE line, always, whichever way the switch went -- the deprecation is a
+	// fact about the feature, not about this run's arm.
+	UE_LOG(LogVoxelEarth, Warning,
+	       TEXT("River ribbons are DEPRECATED and now default OFF. Far-field flowing water is being replaced by "
+	            "the PBF fluid (docs/water-rearchitecture-plan-2026-08-09.md); the code and its tests are kept "
+	            "until the replacement is proven (docs/water-deprecation-audit-2026-08-09.md: deprecate now, "
+	            "delete after). Pass -VoxelRiverRibbons=1 to build them anyway. Lake sheets are unaffected."));
 }
 
 bool AVoxelRiverRibbonActor::GetCameraLocationUU(FVector& Out) const
