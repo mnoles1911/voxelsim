@@ -2712,9 +2712,25 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	// additive and composited after the atmosphere, so nothing in the renderer
 	// extinguishes them (see StarBrightnessForSunAltitude for the whole argument,
 	// and create_sky_material.py's "THE COST OF THAT CHOICE" for the author's
-	// statement of the same fact). Note this scales the MOON's own brightness too
-	// in the material's gain path -- which is wanted, for the same reason
-	// ApplyLightsFromState suppresses the moon LIGHT through civil twilight.
+	// statement of the same fact).
+	//
+	// IT DOES NOT TOUCH THE MOON, and this comment used to claim that it did.
+	// Corrected against the graph rather than against intent: build_moon's gain is
+	// MoonBrightness * horizonFade * disc (create_sky_material.py:730) and
+	// StarBrightness appears nowhere in it -- only build_stars multiplies by it
+	// (:628). So the moon disc renders at its full MPC gain whenever it is above
+	// the horizon, including at midday, when the compressed calendar puts it above
+	// the horizon for roughly half of every game day.
+	//
+	// LEFT AS IT IS, DELIBERATELY, because a daylight moon is REAL -- the actual
+	// moon is plainly visible in a blue sky for much of every month -- and the
+	// question of how bright it should read against one is a judgement to settle on
+	// a screenshot, not to decide here by making the comment true. What is NOT
+	// acceptable is the file asserting a fade that does not exist, because the next
+	// person to debug a too-bright daytime moon would look for it in the C++ and it
+	// is not there. If a fade is wanted, it belongs in build_moon's gain next to
+	// horizon_fade, on its own MPC scalar, so that the moon and the stars can be
+	// faded on different curves -- they are not the same problem.
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("StarBrightness"),
 		(float)StarBrightnessForSunAltitude(S.SunAltitudeDeg));

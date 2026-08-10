@@ -243,11 +243,58 @@ class SkyGraphBuilder(GraphBuilder):
         self.link(a, a_out, n, "")
         return n
 
+    # RADIANS IN, AND THE Period PROPERTY IS WHAT MAKES THAT TRUE.
+    #
+    # UMaterialExpressionSine/Cosine DO NOT COMPUTE sin(x). They default to
+    # Period = 1.0 (MaterialExpressionSine.h:22, 5.8) and compile to
+    #
+    #     Sine:   Period > 0 ? sin(Input * 2pi/Period) : sin(Input)
+    #     Cosine: cos(Input * (Period > 0 ? 2pi/Period : 0))
+    #                            -- MaterialExpressions.cpp:5729, :5747
+    #
+    # so a node left at its default turns a RADIAN input into sin(2pi*x): every
+    # angle in this file silently multiplied by 6.283. That is not a rounding
+    # error, it is a different angle, and NOTHING REPORTS IT -- the graph
+    # compiles, the sky renders, and the numbers are wrong. It is the same class
+    # of silent-wrong-value defect as the unresolved CollectionParameter above
+    # (which compiles to a constant), and it gets the same treatment: set the
+    # property explicitly, then read it back and raise.
+    #
+    # WHAT IT COST BEFORE IT WAS FOUND, so nobody "simplifies" this away:
+    #   * build_star_uv's sin/cos of ObserverLatitude. At the shipped 52 N,
+    #     sin(2pi*0.9076) = -0.548 and cos(2pi*0.9076) = +0.837, which is the
+    #     honest horizon frame for latitude -33.2 -- the star field was built for
+    #     the WRONG HEMISPHERE, and so was the starlight the SkyLight captured
+    #     from M_SkyAtmosphereDome.
+    #   * create_sky_material.build_moon's sin(MoonAngularRadius). sin_radius
+    #     came out 6.283x too large, so the disc mask reached 1.63 deg instead of
+    #     0.26 -- a moon 6.3x too wide and ~40x too large in area.
+    #
+    # 2*pi, NOT 0. Period = 0 is the documented "no period" path for SINE only.
+    # Cosine's compile multiplies by a literal 0 in that branch, i.e. cos(0) = 1,
+    # a CONSTANT -- so the one value that is safe for both nodes is 2*pi, which
+    # makes the scale factor 2pi/2pi = 1 and leaves the input in radians.
+    _PERIOD_RADIANS = TWO_PI
+
+    def _trig(self, cls, a, a_out):
+        n = self.node(cls)
+        n.set_editor_property("period", self._PERIOD_RADIANS)
+        got = float(n.get_editor_property("period"))
+        if abs(got - self._PERIOD_RADIANS) > 1.0e-4:
+            raise RuntimeError(
+                "%s.Period did not round-trip: wrote %.9f, read back %.9f. Left at the "
+                "engine default of 1.0 this node computes sin/cos(2pi*x) instead of "
+                "sin/cos(x) (MaterialExpressions.cpp:5729/:5747) and every angle in this "
+                "graph is silently multiplied by 6.283 with no error anywhere."
+                % (cls.__name__, self._PERIOD_RADIANS, got))
+        self.link(a, a_out, n, "")
+        return n
+
     def sine(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionSine, a, a_out)
+        return self._trig(unreal.MaterialExpressionSine, a, a_out)
 
     def cosine(self, a, a_out=""):
-        return self.unary(unreal.MaterialExpressionCosine, a, a_out)
+        return self._trig(unreal.MaterialExpressionCosine, a, a_out)
 
     def arcsine(self, a, a_out=""):
         return self.unary(unreal.MaterialExpressionArcsine, a, a_out)
