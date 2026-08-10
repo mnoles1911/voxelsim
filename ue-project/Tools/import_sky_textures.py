@@ -145,6 +145,18 @@ def choose_starmap():
     "the import silently fell back to the NASA map" are the same screenshot.
     """
     want = os.environ.get("VOXEL_STARMAP", "").strip().lower()
+    # VOXEL_STARMAP=<absolute path> imports an arbitrary equirect sky file as
+    # the starmap slot -- the evaluation hook for tools/sky-assets/options/.
+    # Everything else about the import (linear, BC6H, wrap) applies unchanged;
+    # a non-power-of-two source simply ships without mips, fine for evaluation.
+    if want and os.path.sep in os.environ.get("VOXEL_STARMAP", ""):
+        cand = os.environ["VOXEL_STARMAP"].strip()
+        if not os.path.isfile(cand):
+            raise RuntimeError(f"VOXEL_STARMAP file not found: {cand}")
+        unreal.log(f"T_SkyStarmap: VOXEL_STARMAP file override -- importing {cand}")
+        return (cand,
+                unreal.TextureCompressionSettings.TC_HDR_COMPRESSED,
+                True)
     have_procedural = os.path.isfile(os.path.join(SOURCE_DIR, PROCEDURAL_STARMAP))
 
     if want == "nasa":

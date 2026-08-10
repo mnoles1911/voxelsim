@@ -59,8 +59,10 @@
   "materials": {
     "bark": "bark",
     "core": "heartwood",
+    "head": "leaf_blossom",
     "leaf": "leaf_broadleaf",
-    "rock": "rock"
+    "rock": "rock",
+    "stem": "grass"
   },
   "name": "field-elm",
   "notes": "Lone spreading hedgerow tree for open country. Authored FOR grassland rather than borrowed from the forest set.",
@@ -73,7 +75,7 @@
     "spacing_m": 18.0,
     "water_max_m": 0.0
   },
-  "resolution_cm": "10",
+  "resolution_cm": "5",
   "rock": {
     "angular": 0.45,
     "bury": 0.22,
@@ -82,6 +84,7 @@
     "facets": 4,
     "flatten": 0.72,
     "lumps": 5,
+    "rough": 0.4,
     "rubble": 0.15,
     "size_m": 1.6,
     "spread": 0.42
@@ -108,6 +111,21 @@
     "lean_dir_deg": 0.0,
     "radius_base_m": 0.42,
     "wander": 0.16
+  },
+  "tuft": {
+    "arc": 0.55,
+    "base_m": 0.05,
+    "head": "none",
+    "head_frac": 0.22,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 18.0,
+    "spread_m": 0.06,
+    "stems": 24,
+    "taper": 0.5,
+    "wander": 0.35,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,

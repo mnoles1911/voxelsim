@@ -20,6 +20,8 @@
 #include "RenderingThread.h"
 #include "RHI.h" // GUsingNullRHI
 
+#include "Misc/AutomationTest.h" // the recentre trigger's hysteresis test, at the bottom
+
 #include "voxelcore/fluidlifecycle.h"
 #include "voxelcore/fluidoccupancy.h"
 
@@ -404,6 +406,90 @@ namespace
 }
 
 // ---------------------------------------------------------------------------
+// The rolling window's trigger arithmetic (declared in the header so the
+// automation test pins the shipping policy, not a copy of it)
+// ---------------------------------------------------------------------------
+
+// The header cannot include voxel-core (UHT), so the agreement is asserted
+// here, in the one translation unit that sees both. Every one of these is a
+// number that exists in two places, and a disagreement is a window that sits
+// somewhere other than where the subsystem believes it does -- which reads as
+// terrain, not as a bug.
+static_assert(VoxelFluidRecentre::StepVoxels == vxc::kFluidRecentreStepVoxels,
+              "the recentre step must BE the volume's addressing quantum, or RecentreTo refuses "
+              "every move the policy proposes");
+static_assert(VoxelFluidRecentre::TriggerVoxels == VoxelFluidRecentre::StepVoxels * 3 / 2,
+              "the trigger is 1.5 steps: that is the hysteresis, and it is what keeps a camera "
+              "loitering on the boundary from paying 64 cells of refill every few frames");
+static_assert(VoxelFluidRecentre::TeleportVoxels == vxc::kFluidVolumeDimVoxels,
+              "a move of a whole window shares no terrain with the old one, which is the "
+              "definition of the teleport SetOriginVoxel exists for");
+static_assert(VoxelFluidRecentre::FloorBelowGroundVoxels < vxc::kFluidVolumeDimVoxels,
+              "the window floor must sit inside the window");
+
+int32 VoxelFluidRecentre::SnapDriftToStep(int32 DriftVoxels)
+{
+	// Halves away from zero, computed on the magnitude so the two directions
+	// are mirror images. int64 because a drift can be a teleport's worth of
+	// voxels and Abs(INT32_MIN) is not representable.
+	const int64 Drift = int64(DriftVoxels);
+	const int64 Mag = Drift < 0 ? -Drift : Drift;
+	const int64 Steps = (Mag + StepVoxels / 2) / StepVoxels;
+	const int64 Snapped = Steps * StepVoxels;
+	return int32(Drift < 0 ? -Snapped : Snapped);
+}
+
+bool VoxelFluidRecentre::ComputeRecentreOrigin(const FIntVector& WantOriginVoxel,
+                                               const FIntVector& CurrentOriginVoxel,
+                                               FIntVector& OutNewOriginVoxel)
+{
+	OutNewOriginVoxel = CurrentOriginVoxel;
+
+	// int64 per axis: origins are planet-scale voxel coordinates and their
+	// difference is only small because the camera moved a little. A teleport
+	// makes it large, and an int32 subtraction there would wrap into a small
+	// drift -- the one arithmetic failure in this function that would look like
+	// "the window just did not move".
+	const int64 Drift[3] = {int64(WantOriginVoxel.X) - int64(CurrentOriginVoxel.X),
+	                        int64(WantOriginVoxel.Y) - int64(CurrentOriginVoxel.Y),
+	                        int64(WantOriginVoxel.Z) - int64(CurrentOriginVoxel.Z)};
+	int64 MaxDrift = 0;
+	for (int32 A = 0; A < 3; ++A)
+	{
+		MaxDrift = FMath::Max(MaxDrift, Drift[A] < 0 ? -Drift[A] : Drift[A]);
+	}
+	if (MaxDrift < int64(TriggerVoxels))
+	{
+		return false;
+	}
+
+	// Round to whole steps per axis. An axis whose drift is under half a step
+	// contributes zero and stays exactly where it is: the move is only ever as
+	// big as it needs to be, which is what bounds the entering slab.
+	int64 Step[3];
+	for (int32 A = 0; A < 3; ++A)
+	{
+		// Clamped before the narrowing so a teleport-sized drift snaps to a
+		// teleport-sized step rather than wrapping; the caller compares the
+		// result against TeleportVoxels and re-latches instead of sliding.
+		const int64 Clamped = FMath::Clamp<int64>(Drift[A], -int64(MAX_int32) / 2, int64(MAX_int32) / 2);
+		Step[A] = int64(SnapDriftToStep(int32(Clamped)));
+	}
+	if (Step[0] == 0 && Step[1] == 0 && Step[2] == 0)
+	{
+		// Unreachable at TriggerVoxels == 1.5 steps (the triggering axis rounds
+		// to at least 2 steps), and kept as a hard floor anyway: a zero move
+		// that reported true would spin the caller through a recentre, a refill
+		// queue and a rebase for nothing, every tick.
+		return false;
+	}
+	OutNewOriginVoxel = FIntVector(int32(int64(CurrentOriginVoxel.X) + Step[0]),
+	                               int32(int64(CurrentOriginVoxel.Y) + Step[1]),
+	                               int32(int64(CurrentOriginVoxel.Z) + Step[2]));
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // The lifecycle state (voxel-core types live here, never in the header)
 // ---------------------------------------------------------------------------
 
@@ -423,6 +509,29 @@ struct FVoxelFluidLifecycle
 	uint64 RegionsQueuedTotal = 0;
 	uint64 RegionsDropped = 0;   // queue overflow / refused by the volume
 	double PackMsTotal = 0.0;
+
+	// --- toroidal recentring (contract item 4) ------------------------------
+	// RAN-FLAG RULE, and this stage needs it more than most: "the camera has
+	// not moved 9.6 m" and "the policy is not running at all" are the same
+	// picture from outside (frozen water, no log line), and the second was the
+	// shipped v0 behaviour for months. RecentreChecks is what separates them --
+	// it advances every tick the origin is latched, whether or not anything
+	// moves, so checks>0 with recentres==0 is a working policy and checks==0 is
+	// a policy nobody is calling.
+	uint64 RecentreChecks = 0;
+	uint64 Recentres = 0;            // successful slides
+	uint64 RecentreTeleports = 0;    // re-latches (a move past the whole window)
+	uint64 RecentreRefused = 0;      // RecentreTo said no (misaligned/too far)
+	uint64 RecentreCellsRequeued = 0;// 64^3 entering cells handed back and queued
+	// Queued-but-unpacked regions this subsystem had to move into the new local
+	// frame, and the ones that fell out of the window entirely. A drop is not a
+	// hole: an entering cell covers the same space and is in the refill list.
+	uint64 RecentreRegionsTranslated = 0;
+	uint64 RecentreRegionsDropped = 0;
+	// Sill faucets whose outlet left the window: refunded to the basin ledger
+	// rather than left deferring forever against occupancy they are no longer
+	// inside (the scalar path routes them, exactly as an un-intercepted spill).
+	uint64 RecentreSillsRefunded = 0;
 
 	// --- headwater faucets --------------------------------------------------
 	struct FHeadFaucet
@@ -664,19 +773,26 @@ int32 UVoxelFluidSubsystem::GroundVoxelZAtCamera() const
 	return int32(FMath::FloorToDouble(GroundUU / 10.0));
 }
 
-void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
+FIntVector UVoxelFluidSubsystem::DesiredOriginVoxel(const FVector& ViewOriginUU)
 {
-	LastViewOriginUU = ViewOriginUU;
+	LastViewOriginUU = ViewOriginUU; // GroundVoxelZAtCamera reads this
 	const VoxelCoords::FVoxelCoord CamVoxel = VoxelCoords::WorldToVoxel(ViewOriginUU);
 	const int32 Half = vxc::kFluidVolumeDimVoxels / 2;
-	OriginVoxel = FIntVector(int32(CamVoxel.X) - Half, int32(CamVoxel.Y) - Half,
-	                         // Z ANCHORS TO THE GROUND, NOT THE CAMERA. The
-	                         // round-3 playtest flew at 80 m and every faucet
-	                         // landed 55 m BELOW the box floor -- water lives
-	                         // on terrain, so the window does too: floor sits
-	                         // ~13 m under the surface at the camera's column
-	                         // (caves/pools), leaving ~38 m of air above it.
-	                         GroundVoxelZAtCamera() - 128);
+	return FIntVector(int32(CamVoxel.X) - Half, int32(CamVoxel.Y) - Half,
+	                  // Z ANCHORS TO THE GROUND, NOT THE CAMERA. The round-3
+	                  // playtest flew at 80 m and every faucet landed 55 m BELOW
+	                  // the box floor -- water lives on terrain, so the window
+	                  // does too: floor sits ~13 m under the surface at the
+	                  // camera's column (caves/pools), leaving ~38 m of air above
+	                  // it. The recentre uses the SAME rule, so the window keeps
+	                  // tracking the ground as the camera crosses a valley
+	                  // instead of only tracking it at the latch.
+	                  GroundVoxelZAtCamera() - VoxelFluidRecentre::FloorBelowGroundVoxels);
+}
+
+void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
+{
+	OriginVoxel = DesiredOriginVoxel(ViewOriginUU);
 	// THE one-origin rule (contract item 1): FluidOriginUU == volume min
 	// corner * 10, computed from the same voxel triple SetOriginVoxel gets.
 	FluidOriginWorld = FVector(double(OriginVoxel.X), double(OriginVoxel.Y), double(OriginVoxel.Z)) *
@@ -690,6 +806,15 @@ void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
 	// materialAt generates on demand -- which is why this is budgeted across
 	// ticks rather than done here.
 	FVoxelFluidLifecycle& L = *Lifecycle;
+	// EVERY QUEUED REGION DIES WITH THE OLD ORIGIN. These are volume-LOCAL
+	// boxes; SetOriginVoxel just renamed every local coordinate, so packing one
+	// of them now would write real terrain bits at the wrong place -- worse than
+	// a hole, because it looks like terrain. The volume drops its own queue for
+	// exactly this reason (SetOriginVoxel); this is the same drop on this side
+	// of the seam, and it matters because a teleport re-latch can reach here
+	// with 512 initial cells still pending.
+	L.PendingRegions.Reset();
+	L.InitialCellsRemaining = 0;
 	L.InitialCellOrder.Reset(kFillCellCount);
 	for (int32 Z = 0; Z < kFillCellsPerAxis; ++Z)
 		for (int32 Y = 0; Y < kFillCellsPerAxis; ++Y)
@@ -713,13 +838,11 @@ void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
 	}
 	L.InitialCellsRemaining = kFillCellCount;
 
-	// Arm the sill-faucet intercept over the active region's XY footprint.
-	if (UVoxelWaterSubsystem* Water = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWaterSubsystem>() : nullptr)
-	{
-		Water->SetFluidSpillIntercept(true, FluidOriginWorld.X, FluidOriginWorld.Y,
-		                              FluidOriginWorld.X + kActiveEdgeUU,
-		                              FluidOriginWorld.Y + kActiveEdgeUU);
-	}
+	// Everything origin-relative that lives outside this subsystem or on a
+	// refresh cadence -- the intercept box, the gathers, the sink. Shared with
+	// the recentre path so a latch and a slide can never disagree about what
+	// "the origin moved" implies.
+	OnOriginMoved();
 
 	UE_LOG(LogVoxelFluid, Display,
 	       TEXT("Fluid origin latched: volume min corner voxel (%d, %d, %d), world UU (%.0f, %.0f, %.0f), ")
@@ -727,6 +850,244 @@ void UVoxelFluidSubsystem::LatchOrigin(const FVector& ViewOriginUU)
 	       TEXT("unfilled space is SOLID until built -- water freezes rather than leaks)."),
 	       OriginVoxel.X, OriginVoxel.Y, OriginVoxel.Z, FluidOriginWorld.X, FluidOriginWorld.Y,
 	       FluidOriginWorld.Z, kActiveEdgeUU, kActiveEdgeUU, kActiveEdgeUU, kFillCellCount);
+}
+
+void UVoxelFluidSubsystem::OnOriginMoved()
+{
+	// EVERY ORIGIN-RELATIVE THING THAT IS NOT RE-DERIVED PER TICK. Called by
+	// both movers -- the hard latch and the toroidal slide -- because a latch
+	// and a slide must not disagree about what "the origin moved" implies, and
+	// the teleport path is literally one calling the other.
+	FVoxelFluidLifecycle& L = *Lifecycle;
+
+	if (UVoxelWaterSubsystem* Water = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWaterSubsystem>()
+	                                             : nullptr)
+	{
+		// The sill-faucet intercept is an XY box in WORLD units: re-arm it over
+		// the new footprint, or spill events keep being handed to a fluid whose
+		// window has moved off them, while events over the new footprint keep
+		// routing through the graph as if there were no fluid here at all.
+		Water->SetFluidSpillIntercept(true, FluidOriginWorld.X, FluidOriginWorld.Y,
+		                              FluidOriginWorld.X + kActiveEdgeUU,
+		                              FluidOriginWorld.Y + kActiveEdgeUU);
+
+		// Sills already claimed whose outlet the window has just left: their
+		// occupancy gate can never pass again (the emit point is outside the
+		// box, the deferral that "never clears"), so they would sit owed until
+		// teardown. Refunded -- the same answer the moved intercept would now
+		// give the event, and the ledger closes on it, since SpillUnitsRefunded
+		// is a term of ReconcileScalars.
+		for (int32 I = L.SillFaucets.Num() - 1; I >= 0; --I)
+		{
+			const FVoxelFluidLifecycle::FSillFaucet& S = L.SillFaucets[I];
+			const bool bInside = S.WorldPos.X >= FluidOriginWorld.X &&
+			                     S.WorldPos.Y >= FluidOriginWorld.Y &&
+			                     S.WorldPos.X < FluidOriginWorld.X + kActiveEdgeUU &&
+			                     S.WorldPos.Y < FluidOriginWorld.Y + kActiveEdgeUU;
+			if (bInside)
+			{
+				continue;
+			}
+			if (S.UnitsRemaining > 0)
+			{
+				L.SpillUnitsRefunded += Water->RefundSpillUnits(S.BasinKey, S.UnitsRemaining);
+			}
+			L.SillFaucets.RemoveAt(I);
+			L.RecentreSillsRefunded++;
+		}
+	}
+
+	// The two gathers are keyed to the window's CENTRE and re-run on their own
+	// cadence (10 s springs/crossings, 1 s basin). Without this the faucets
+	// would keep feeding the old window for up to ten seconds after the water
+	// stopped being there. Zeroing the stamps makes both re-run later in THIS
+	// tick, against the new centre.
+	L.NextFaucetRefreshSeconds = 0.0;
+	L.NextSinkRefreshSeconds = 0.0;
+	// ...and the sink's clipped box is stale until that refresh actually runs,
+	// which it does not at all while the lifecycle is disarmed. Invalid NOW.
+	L.bSinkValid = false;
+}
+
+void UVoxelFluidSubsystem::MaybeRecentre(const FVector& ViewOriginUU)
+{
+	// ---- THE ORIGIN-RELATIVE AUDIT, which is what makes this function long ---
+	//
+	// Everything the fluid holds that is measured FROM the origin has to move
+	// with it, in this tick, or the water is offset from the terrain by the
+	// step. Enumerated once here so the list can be checked rather than
+	// remembered (the boxes are the tick-args' own field comments):
+	//
+	//  MOVED HERE, in this function:
+	//    FluidOriginWorld ......... contract item 1 (origin voxel x 10)
+	//    the queued fill regions ... volume-LOCAL boxes; translated by -delta
+	//    the entering cells ........ queued as fresh work, centre-out
+	//    the spill intercept box ... UVoxelWaterSubsystem::SetFluidSpillIntercept
+	//    the basin sink box ........ invalidated; RefreshBasinSink re-clips it
+	//    the faucet gather ......... forced to re-run around the new centre
+	//    sill faucets outside it ... refunded to the ledger (the scalar path)
+	//    the particle positions .... left OWED on the volume; the tick's mailbox
+	//                                post hands the delta to the rebase pass
+	//  ALREADY CORRECT, and worth knowing why (each is re-derived from
+	//  FluidOriginWorld every tick, AFTER this function runs):
+	//    spawn CenterLocalUU ....... CenterWorld - FluidOriginWorld, per tick
+	//    basin box/datum local ..... SinkXxxUU - FluidOriginWorld, per tick
+	//    renderer FluidOriginWorld . marshalled per tick (and the splat uses the
+	//                                buffer's own origin -- see the render state)
+	//    boundary inject voxel ..... OriginVoxel + 256, per use
+	//    NotifyTerrainDirty ........ snaps against OriginVoxel at call time
+	//  ORIGIN-RELATIVE CONSTANTS, invariant under a move by construction:
+	//    BoundaryCenterLocalUU (2560^3), BoundaryHalfExtentUU, GroundZLocalUU,
+	//    the ClampLocal margins. They describe the CUBE, not the world.
+	//  STATED, NOT FIXED:
+	//    the camera faucet (voxel.Fluid.Emit) keeps its latched world point, as
+	//    its own docstring promises; if the window leaves it behind, ClampLocal
+	//    puts the emission on the box face. Re-issue the command to move it.
+	//    One debug-draw frame after a recentre plots the last readback's
+	//    positions (old origin) against the new one -- readback latency, cleared
+	//    by the next snapshot, debug view only.
+	if (!bOriginLatched || !Occupancy.IsValid() || !Lifecycle.IsValid())
+	{
+		return;
+	}
+	FVoxelFluidLifecycle& L = *Lifecycle;
+	L.RecentreChecks++; // ran-flag: this advances even when nothing moves
+
+	const FIntVector WantOrigin = DesiredOriginVoxel(ViewOriginUU);
+	FIntVector NewOrigin = OriginVoxel;
+	if (!VoxelFluidRecentre::ComputeRecentreOrigin(WantOrigin, OriginVoxel, NewOrigin))
+	{
+		return; // inside the hysteresis boundary -- the overwhelmingly common case
+	}
+
+	// A MOVE OF A WHOLE WINDOW IS A TELEPORT, not a slide. Nothing in view
+	// survives it, so the toroidal path would hand back all 512 cells, pay a
+	// particle rebase to move water that shares no terrain with where it is
+	// going, and arrive at exactly the state a re-latch reaches directly.
+	const FIntVector Step = NewOrigin - OriginVoxel;
+	const int32 MaxStep =
+		FMath::Max3(FMath::Abs(Step.X), FMath::Abs(Step.Y), FMath::Abs(Step.Z));
+	if (MaxStep >= VoxelFluidRecentre::TeleportVoxels)
+	{
+		L.RecentreTeleports++;
+		UE_LOG(LogVoxelFluid, Display,
+		       TEXT("Fluid origin TELEPORT (step %d,%d,%d voxels >= the %d-voxel window): re-latching ")
+		       TEXT("rather than sliding -- the new window shares no terrain with the old, so every ")
+		       TEXT("bit is invalid either way. Water already in flight keeps its local positions and ")
+		       TEXT("retires through the boundary/age sinks."),
+		       Step.X, Step.Y, Step.Z, VoxelFluidRecentre::TeleportVoxels);
+		LatchOrigin(ViewOriginUU);
+		return;
+	}
+
+	TArray<FVoxelFluidOccupancyRefillCell> RefillCells;
+	FIntVector Delta = FIntVector::ZeroValue;
+	FString Error;
+	if (!Occupancy->RecentreTo(NewOrigin, RefillCells, Delta, Error))
+	{
+		// Refused, not rounded (the volume's own doctrine). Loud: the policy
+		// above only ever proposes whole-step moves, so a refusal means the two
+		// have come apart and the window has stopped following the camera.
+		L.RecentreRefused++;
+		UE_LOG(LogVoxelFluid, Error, TEXT("Fluid occupancy recentre REFUSED: %s"), *Error);
+		return;
+	}
+	if (Delta == FIntVector::ZeroValue)
+	{
+		return; // no-op move; ComputeRecentreOrigin already rules this out
+	}
+
+	OriginVoxel = NewOrigin;
+	FluidOriginWorld = FVector(double(OriginVoxel.X), double(OriginVoxel.Y), double(OriginVoxel.Z)) *
+	                   double(vxc::kFluidVoxelUU);
+	L.Recentres++;
+	// Any verify snapshot already in flight was taken against the OLD window;
+	// comparing it now would compare two different volumes and call every word
+	// a FAIL. Bumping the epoch makes the gate say "stale" instead, which is
+	// the state it has for exactly this situation.
+	L.EditEpoch++;
+
+	// ---- 1. the queue this subsystem has not packed yet --------------------
+	// These are volume-LOCAL boxes under the OLD origin, so each one now names a
+	// different world box by exactly the delta. Translate; drop what no longer
+	// fits. A drop is safe by construction: a box that fell out of the window
+	// has left the volume, and one that was inside it is covered either by its
+	// own translated self or by an entering cell.
+	{
+		TArray<FVoxelFluidLifecycle::FRegion> Kept;
+		Kept.Reserve(L.PendingRegions.Num());
+		for (const FVoxelFluidLifecycle::FRegion& R : L.PendingRegions)
+		{
+			const FIntVector NewMin = R.Min - Delta;
+			const bool bFits = NewMin.X >= 0 && NewMin.Y >= 0 && NewMin.Z >= 0 &&
+			                   NewMin.X + R.Size.X <= vxc::kFluidVolumeDimVoxels &&
+			                   NewMin.Y + R.Size.Y <= vxc::kFluidVolumeDimVoxels &&
+			                   NewMin.Z + R.Size.Z <= vxc::kFluidVolumeDimVoxels;
+			if (bFits)
+			{
+				Kept.Add({NewMin, R.Size, R.bInitialFill});
+				L.RecentreRegionsTranslated++;
+				continue;
+			}
+			L.RecentreRegionsDropped++;
+			if (R.bInitialFill && L.InitialCellsRemaining > 0)
+			{
+				// Or the initial fill never reaches zero and the completion log
+				// (and the verify gate's not-still-filling test) waits forever
+				// on a cell nobody is going to build.
+				L.InitialCellsRemaining--;
+			}
+		}
+		L.PendingRegions = MoveTemp(Kept);
+	}
+
+	// ---- 2. the entering cells, queued exactly like the initial fill --------
+	// Centre-out among themselves so the terrain nearest the camera lands
+	// first: the leading edge of the window is where the water the player is
+	// looking at is about to be. They arrive already snapped (64 divides both
+	// alignment requirements), so there is no arithmetic to do here.
+	{
+		const double Mid = (kFillCellsPerAxis - 1) * 0.5;
+		RefillCells.Sort([Mid](const FVoxelFluidOccupancyRefillCell& A,
+		                       const FVoxelFluidOccupancyRefillCell& B)
+		{
+			const FVector Ca(A.MinVoxel.X / double(kFillCellVoxels) - Mid,
+			                 A.MinVoxel.Y / double(kFillCellVoxels) - Mid,
+			                 A.MinVoxel.Z / double(kFillCellVoxels) - Mid);
+			const FVector Cb(B.MinVoxel.X / double(kFillCellVoxels) - Mid,
+			                 B.MinVoxel.Y / double(kFillCellVoxels) - Mid,
+			                 B.MinVoxel.Z / double(kFillCellVoxels) - Mid);
+			return Ca.SizeSquared() < Cb.SizeSquared();
+		});
+		for (const FVoxelFluidOccupancyRefillCell& C : RefillCells)
+		{
+			if (L.PendingRegions.Num() >= kMaxPendingRegions)
+			{
+				// The entering slab is 64 cells against a 4096 cap, so this can
+				// only fire behind a queue that is already pathological. Counted
+				// either way: an entering cell nobody refills stays SOLID, which
+				// freezes water at the leading edge permanently.
+				L.RegionsDropped++;
+				continue;
+			}
+			L.PendingRegions.Add({C.MinVoxel, C.SizeVoxels, /*bInitialFill*/ false});
+			L.RegionsQueuedTotal++;
+			L.RecentreCellsRequeued++;
+		}
+	}
+
+	// ---- 3. the intercept box, the sills, and the gathers -------------------
+	OnOriginMoved();
+
+	UE_LOG(LogVoxelFluid, Display,
+	       TEXT("Fluid origin RECENTRED: (%d,%d,%d) -> (%d,%d,%d) [delta %d,%d,%d voxels = %.1f m], ")
+	       TEXT("%d cells entering (%.0f%% of the volume). Particles owe a rebase of the same delta. ")
+	       TEXT("Lifetime: %llu regions translated, %llu dropped, %llu sills refunded."),
+	       OriginVoxel.X - Delta.X, OriginVoxel.Y - Delta.Y, OriginVoxel.Z - Delta.Z, OriginVoxel.X,
+	       OriginVoxel.Y, OriginVoxel.Z, Delta.X, Delta.Y, Delta.Z,
+	       double(FMath::Max3(FMath::Abs(Delta.X), FMath::Abs(Delta.Y), FMath::Abs(Delta.Z))) * 0.1,
+	       RefillCells.Num(), 100.0 * double(RefillCells.Num()) / double(kFillCellCount),
+	       L.RecentreRegionsTranslated, L.RecentreRegionsDropped, L.RecentreSillsRefunded);
 }
 
 void UVoxelFluidSubsystem::ProcessOccupancyQueue()
@@ -1357,9 +1718,25 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 	}
 
 	// ---- origin latch (first spawn / emit / faucet arm) --------------------
-	if (!bOriginLatched && (PendingSpawnCount > 0 || EmitPerSecond > 0.0f || bFaucets))
+	const bool bLatchedThisTick =
+		!bOriginLatched && (PendingSpawnCount > 0 || EmitPerSecond > 0.0f || bFaucets);
+	if (bLatchedThisTick)
 	{
 		LatchOrigin(ViewOrigin);
+	}
+
+	// ---- the rolling window follows the camera (contract item 4) -----------
+	// BEFORE ProcessOccupancyQueue, because the queue packs against OriginVoxel
+	// and every entry in it has just been re-based into the new local frame;
+	// and before the lifecycle refreshes and the spawn assembly below, which
+	// derive their boxes and their local spawn positions from FluidOriginWorld.
+	// That ordering is the whole policy's one constraint.
+	//
+	// Not on the tick that latched: the drift is zero by construction there, and
+	// the check costs a ground-surface query.
+	if (bOriginLatched && !bLatchedThisTick)
+	{
+		MaybeRecentre(ViewOrigin);
 	}
 
 	// ---- occupancy feed ----------------------------------------------------
@@ -1787,6 +2164,19 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			bDebugDraw && (!Snapshot.bValid || Snapshot.Alive <= kDebugDrawMaxParticles);
 		Args.DebugSlotCount = Args.SimSlotBound;
 
+		// THE PARTICLE HALF OF EVERY RECENTRE SINCE THE LAST POST (contract
+		// item 8). Take-and-clear, and taken HERE rather than inside
+		// MaybeRecentre for one reason: the obligation must not be created
+		// unless it is also handed to somebody. A tick that does not post (no
+		// origin, dt <= 0) leaves the delta accumulating on the volume, which
+		// is exactly what its accumulator is for.
+		//
+		// Taken BEFORE the render-state lock, never inside it: the render
+		// thread nests these two the other way round (render state, then the
+		// volume's own lock, to read the origin for the stale gate), so the
+		// game thread must not hold the first while taking the second.
+		const FIntVector RebaseDeltaVoxels = Occupancy->TakePendingRebaseDeltaVoxels();
+
 		// Post to the mailbox; the view extension consumes it exactly once at
 		// PreRenderViewFamily and adds the passes to the renderer's graph.
 		// (The ENQUEUE_RENDER_COMMAND + own-FRDGBuilder shape that stood here
@@ -1795,6 +2185,15 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		{
 			FScopeLock Guard(&L.RenderState->Lock);
 			L.RenderState->PendingSimArgs = Args;
+			// The origin these args are meaningful against. The render thread
+			// compares it with the volume's live origin and drops the tick if a
+			// recentre has landed in between (see the field's comment).
+			L.RenderState->PendingSimArgsOriginVoxel = OriginVoxel;
+			// ACCUMULATED, not assigned: an unconsumed post is overwritten every
+			// tick, and assigning would drop the delta of any recentre whose
+			// args never made it to the render thread -- water left behind by
+			// exactly the amount nobody rebased.
+			L.RenderState->PendingRebaseDeltaVoxels += RebaseDeltaVoxels;
 			L.RenderState->OccupancyKeepAlive = Occupancy;
 			L.RenderState->SimState = SimState;
 		}
@@ -2020,6 +2419,13 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		                           : L.LastVerifyResult == 2 ? TEXT("stale")
 		                                                     : TEXT("pending");
 
+		// One fetch, two fields: the renderer's GPU time and the particle-rebase
+		// counters (which the RENDER thread owns because it is the side that
+		// actually dispatches the pass). Fetched unconditionally -- the rebase
+		// runs whether or not voxel.Fluid.Render is on.
+		const FVoxelFluidRenderStats RenderStats =
+			L.RenderState.IsValid() ? L.RenderState->GetStats() : FVoxelFluidRenderStats();
+
 		// renderMs: off (cvar 0), pending (armed but no pass has completed a
 		// GPU timing yet -- includes "no particles spawned"), or the newest
 		// completed GPU time of the VoxelFluidRender pass span. The ran-flag
@@ -2031,25 +2437,43 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		}
 		else
 		{
-			const FVoxelFluidRenderStats RenderStats =
-				L.RenderState.IsValid() ? L.RenderState->GetStats() : FVoxelFluidRenderStats();
 			RenderField = (RenderStats.FramesRendered == 0 || RenderStats.RenderGpuMs < 0.0f)
 			                  ? TEXT("pending")
 			                  : FString::Printf(TEXT("%.2f"), RenderStats.RenderGpuMs);
 		}
 
+		// recentre=: the rolling window, and the rule for reading it. "off" is
+		// only ever "no origin latched" -- once latched the policy runs every
+		// tick, so checks= is the ran-flag that separates "the camera has not
+		// moved 9.6 m" from "nobody is calling the policy" (which is what v0
+		// looked like for months, and it looks identical from the water).
+		// rebase= is the PARTICLE half and must track recentres: a recentre
+		// with no rebase behind it is water sliding away from the terrain by
+		// 6.4 m, so miss= and stale= are on the same field rather than hidden.
+		const FString RecentreField =
+			!bOriginLatched
+				? FString(TEXT("off"))
+				: FString::Printf(
+					  TEXT("%llu(cells=%llu,rebase=%llu/%llu slots,miss=%llu,stale=%llu,tele=%llu,")
+					  TEXT("refused=%llu,checks=%llu)"),
+					  L.Recentres, L.RecentreCellsRequeued, RenderStats.RebasePasses,
+					  RenderStats.RebaseSlots, RenderStats.RebaseMissed,
+					  RenderStats.SimFramesStaleOrigin, L.RecentreTeleports, L.RecentreRefused,
+					  L.RecentreChecks);
+
 		UE_LOG(LogVoxelFluid, Display,
 		       TEXT("Fluid perf %s alive=%u spawned=%u requested=%llu despawnBasin=%u ")
 		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s iters=%d slots=%llu violations=%llu ")
 		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s recycle=%s ")
-		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu deferredNoOccupancy=%s%s"),
+		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu deferredNoOccupancy=%s ")
+		       TEXT("recentre=%s%s"),
 		       StateMarker, Snapshot.Alive, Snapshot.SpawnedTotal, CumulativeSpawnRequested,
 		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs, *RenderField,
 		       FMath::Clamp(CVarVoxelFluidIterations.GetValueOnGameThread(), 1, 8),
 		       FMath::Min<uint64>(CumulativeSpawnRequested, VoxelFluidSim::kMaxParticles),
 		       ConservationViolations, *FaucetField, L.PerfSpillEmitted, *SinkBasinField, BoundaryRate,
 		       *RecycleField, L.RegionsBuiltTotal, L.PendingRegions.Num(), VerifyField,
-		       SimState->GetTicksSkippedNoOccupancy(), *DeferredField,
+		       SimState->GetTicksSkippedNoOccupancy(), *DeferredField, *RecentreField,
 		       bDebugDrawSkippedTooMany ? TEXT(" debugDraw=skipped(alive>5000)") : TEXT(""));
 
 		// The scalar side of the extended conservation line, only while the
@@ -2071,3 +2495,202 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		L.PerfSpillEmitted = 0;
 	}
 }
+
+// ---------------------------------------------------------------------------
+// The recentre trigger's arithmetic, tested where it is cheap to test
+// ---------------------------------------------------------------------------
+//
+// The policy is two numbers (a 64-voxel step and a 96-voxel trigger) and one
+// rounding rule, and every failure mode of it is silent: too small a trigger
+// and the window chatters, paying 64 cells of refill every few frames while the
+// water at the leading edge stays frozen; an asymmetric rounding and a camera
+// flying west behaves differently from one flying east; a step that is not a
+// whole multiple of the quantum and RecentreTo REFUSES every move, which looks
+// exactly like the v0 bug this policy exists to fix (the window stops following
+// the camera). None of that is visible in a screenshot until it has cost a
+// playtest, and none of it needs a GPU, a world, or a subsystem to check.
+//
+// Run headlessly:
+//   UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 \
+//     -ExecCmds="Automation RunTests VoxelEarth.Fluid; Quit"
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FVoxelFluidRecentreTriggerTest,
+	"VoxelEarth.Fluid.RecentreTrigger",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::ClientContext
+		| EAutomationTestFlags::EngineFilter)
+
+bool FVoxelFluidRecentreTriggerTest::RunTest(const FString& Parameters)
+{
+	using namespace VoxelFluidRecentre;
+
+	// --- the two numbers ----------------------------------------------------
+	TestEqual(TEXT("the step IS the volume's addressing quantum"), StepVoxels,
+	          int32(vxc::kFluidRecentreStepVoxels));
+	TestEqual(TEXT("the trigger is 1.5 steps -- that ratio IS the hysteresis"), TriggerVoxels,
+	          StepVoxels * 3 / 2);
+	// The no-chatter claim, stated as arithmetic rather than as prose: a move
+	// leaves the drift at most half a step off, so a further FULL step of travel
+	// is needed before the trigger can fire again.
+	TestEqual(TEXT("after a move, a further whole step of travel is needed to re-trigger"),
+	          TriggerVoxels - StepVoxels / 2, StepVoxels);
+
+	// --- the rounding is symmetric and always lands on the grid -------------
+	for (int32 Drift = -4096; Drift <= 4096; ++Drift)
+	{
+		const int32 Step = SnapDriftToStep(Drift);
+		if (Step % StepVoxels != 0)
+		{
+			AddError(FString::Printf(TEXT("drift %d snapped to %d, which is not a whole step -- ")
+			                         TEXT("RecentreTo would refuse it"), Drift, Step));
+			break;
+		}
+		if (SnapDriftToStep(-Drift) != -Step)
+		{
+			AddError(FString::Printf(TEXT("drift %d snaps to %d but %d snaps to %d: the policy is ")
+			                         TEXT("not mirror-symmetric, so west and east behave differently"),
+			                         Drift, Step, -Drift, SnapDriftToStep(-Drift)));
+			break;
+		}
+		if (FMath::Abs(Drift - Step) > StepVoxels / 2)
+		{
+			AddError(FString::Printf(TEXT("drift %d snapped to %d leaves residual %d, past the half ")
+			                         TEXT("step the hysteresis argument rests on"), Drift, Step,
+			                         Drift - Step));
+			break;
+		}
+	}
+	TestEqual(TEXT("half a step rounds AWAY from zero (positive)"), SnapDriftToStep(32), 64);
+	TestEqual(TEXT("half a step rounds AWAY from zero (negative)"), SnapDriftToStep(-32), -64);
+	TestEqual(TEXT("just under half a step does not move"), SnapDriftToStep(31), 0);
+
+	// --- the trigger, at a planet-scale origin ------------------------------
+	// The real numbers from Saved/owner-playtest-round3.log's origin latch line:
+	// the drift is an int64 subtraction of two large coordinates, and doing it
+	// in int32 is the one arithmetic slip here that reads as "the window just
+	// did not move".
+	const FIntVector Origin(-612406, -507706, 19209);
+	FIntVector NewOrigin;
+
+	// Inside the boundary on every axis: nothing moves, and the out parameter is
+	// left as the current origin (a caller that ignores the bool must not be
+	// handed a different window).
+	for (int32 Drift = -(TriggerVoxels - 1); Drift <= TriggerVoxels - 1; ++Drift)
+	{
+		const FIntVector Want(Origin.X + Drift, Origin.Y - Drift, Origin.Z + Drift / 2);
+		NewOrigin = FIntVector(1, 2, 3);
+		if (ComputeRecentreOrigin(Want, Origin, NewOrigin))
+		{
+			AddError(FString::Printf(TEXT("drift %d (< the %d-voxel trigger) fired a recentre"),
+			                         Drift, TriggerVoxels));
+			break;
+		}
+		if (NewOrigin != Origin)
+		{
+			AddError(TEXT("a declined recentre must leave the origin exactly where it was"));
+			break;
+		}
+	}
+
+	// Exactly at the boundary, one axis at a time: fires, moves TWO steps on the
+	// triggering axis (96 rounds to 128) and NOTHING on the others.
+	{
+		TestTrue(TEXT("+96 voxels on x triggers"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X + TriggerVoxels, Origin.Y, Origin.Z),
+		                               Origin, NewOrigin));
+		TestEqual(TEXT("...and moves x by two whole steps"), NewOrigin.X, Origin.X + 2 * StepVoxels);
+		TestEqual(TEXT("...leaving y alone"), NewOrigin.Y, Origin.Y);
+		TestEqual(TEXT("...leaving z alone"), NewOrigin.Z, Origin.Z);
+
+		TestTrue(TEXT("-96 voxels on y triggers"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X, Origin.Y - TriggerVoxels, Origin.Z),
+		                               Origin, NewOrigin));
+		TestEqual(TEXT("...and moves y by two whole steps, the other way"), NewOrigin.Y,
+		          Origin.Y - 2 * StepVoxels);
+		TestEqual(TEXT("...leaving x alone"), NewOrigin.X, Origin.X);
+
+		// Z is the axis the ground anchor drives, and it triggers on its own:
+		// flying along a valley floor moves the window down without any XY drift.
+		TestTrue(TEXT("z alone can trigger (the ground re-anchor)"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X, Origin.Y, Origin.Z - 100), Origin,
+		                               NewOrigin));
+		TestEqual(TEXT("...and only z moves"), NewOrigin.Z, Origin.Z - 2 * StepVoxels);
+		TestEqual(TEXT("...x untouched"), NewOrigin.X, Origin.X);
+		TestEqual(TEXT("...y untouched"), NewOrigin.Y, Origin.Y);
+	}
+
+	// A drift that triggers on ONE axis carries a sub-trigger drift on another
+	// along with it, if that drift is worth at least half a step -- the move is
+	// per-axis rounding, not a single-axis nudge.
+	{
+		TestTrue(TEXT("a triggering axis pulls a half-step neighbour with it"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X + TriggerVoxels, Origin.Y + 40, Origin.Z),
+		                               Origin, NewOrigin));
+		TestEqual(TEXT("...x by two steps"), NewOrigin.X, Origin.X + 2 * StepVoxels);
+		TestEqual(TEXT("...y by one"), NewOrigin.Y, Origin.Y + StepVoxels);
+		// ...and a drift under half a step does not move that axis at all.
+		TestTrue(TEXT("a triggering axis leaves a quarter-step neighbour alone"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X + TriggerVoxels, Origin.Y + 15, Origin.Z),
+		                               Origin, NewOrigin));
+		TestEqual(TEXT("...y unmoved"), NewOrigin.Y, Origin.Y);
+	}
+
+	// --- convergence: one move is always enough, and never chatters ---------
+	// For every drift that fires, the SAME want origin must not fire again from
+	// the origin the move landed on. That is the whole hysteresis contract: a
+	// camera standing still after a recentre pays for exactly one.
+	for (int32 Drift = TriggerVoxels; Drift <= 8192; ++Drift)
+	{
+		for (int32 Sign = -1; Sign <= 1; Sign += 2)
+		{
+			const FIntVector Want(Origin.X + Sign * Drift, Origin.Y, Origin.Z);
+			FIntVector Moved;
+			if (!ComputeRecentreOrigin(Want, Origin, Moved))
+			{
+				AddError(FString::Printf(TEXT("drift %d did not trigger"), Sign * Drift));
+				return false;
+			}
+			if ((Moved.X - Origin.X) % StepVoxels != 0)
+			{
+				AddError(FString::Printf(TEXT("drift %d moved by %d, not a whole step"), Sign * Drift,
+				                         Moved.X - Origin.X));
+				return false;
+			}
+			FIntVector Again;
+			if (ComputeRecentreOrigin(Want, Moved, Again))
+			{
+				AddError(FString::Printf(
+					TEXT("drift %d recentred to %d and IMMEDIATELY wanted to move again (residual ")
+					TEXT("%d): that is the chatter the 1.5-step trigger exists to prevent"),
+					Sign * Drift, Moved.X, Want.X - Moved.X));
+				return false;
+			}
+		}
+	}
+
+	// --- the teleport hand-off ----------------------------------------------
+	// A drift past the window is still snapped to whole steps (so the arithmetic
+	// stays honest), and it is big enough that MaybeRecentre routes it to a
+	// re-latch instead of a slide.
+	{
+		const int32 FarDrift = 1000000; // 100 km in one tick
+		TestTrue(TEXT("a teleport-sized drift still triggers"),
+		         ComputeRecentreOrigin(FIntVector(Origin.X + FarDrift, Origin.Y, Origin.Z), Origin,
+		                               NewOrigin));
+		TestEqual(TEXT("...snapped to a whole step"), (NewOrigin.X - Origin.X) % StepVoxels, 0);
+		TestTrue(TEXT("...and past the whole window, so the caller re-latches"),
+		         FMath::Abs(NewOrigin.X - Origin.X) >= TeleportVoxels);
+	}
+
+	// --- the window floor, which is the other half of the Z policy ----------
+	TestTrue(TEXT("the floor sits inside the window"),
+	         FloorBelowGroundVoxels > 0 && FloorBelowGroundVoxels < int32(vxc::kFluidVolumeDimVoxels));
+	TestEqual(TEXT("the floor is a whole number of recentre steps under the ground, so the ")
+	          TEXT("ground re-anchor lands on the same grid the slide does"),
+	          FloorBelowGroundVoxels % StepVoxels, 0);
+
+	return true;
+}
+
+#endif // WITH_DEV_AUTOMATION_TESTS

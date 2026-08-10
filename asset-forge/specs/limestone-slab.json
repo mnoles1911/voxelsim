@@ -59,8 +59,10 @@
   "materials": {
     "bark": "bark",
     "core": "heartwood",
+    "head": "leaf_blossom",
     "leaf": "leaf_broadleaf",
-    "rock": "bedrock"
+    "rock": "bedrock",
+    "stem": "grass"
   },
   "name": "limestone-slab",
   "notes": "Flat bedded slab, part sunk. Reads as exposed bedrock in open country.",
@@ -73,7 +75,7 @@
     "spacing_m": 14.0,
     "water_max_m": 0.0
   },
-  "resolution_cm": "10",
+  "resolution_cm": "5",
   "rock": {
     "angular": 0.8,
     "bury": 0.35,
@@ -109,6 +111,21 @@
     "lean_dir_deg": 0.0,
     "radius_base_m": 0.3,
     "wander": 0.15
+  },
+  "tuft": {
+    "arc": 0.55,
+    "base_m": 0.05,
+    "head": "none",
+    "head_frac": 0.22,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 18.0,
+    "spread_m": 0.06,
+    "stems": 24,
+    "taper": 0.5,
+    "wander": 0.35,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,

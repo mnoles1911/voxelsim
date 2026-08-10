@@ -131,6 +131,15 @@ def foliage(
         grid.blob(
             anchor + shift, r, leaf, rng, density=density, squash=squash, only_air=True
         )
+        # A solid core ON the twig, whatever the thinning did.
+        #
+        # Capping the displacement keeps the clump's VOLUME over its anchor, but
+        # the voxels that actually bridge to the wood are the innermost ones,
+        # and `density` is free to remove those like any others. When it did,
+        # the clump ended up a shell starting two voxels out and floating -- two
+        # of them on one acacia, twelve hundred voxels each. This is a handful
+        # of voxels that guarantees the join rather than leaving it to chance.
+        grid.ball(anchor, min(r * 0.4, 1.7), leaf, only_air=True)
         placed += 1
     return placed
 

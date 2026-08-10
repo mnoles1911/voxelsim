@@ -1,0 +1,43 @@
+{
+  "id": "water-reed-0001",
+  "species": "water-reed",
+  "kind": "reed",
+  "seed": 1,
+  "spec_hash": "7296673a51f90a5f",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "7296673a51f90a5f",
+    "kind": "reed",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "voxel_cm": 2.0,
+    "height_m": 2.56,
+    "footprint_m": [
+      1.06,
+      0.94
+    ],
+    "grid_mb": 0.4,
+    "extent_vox": [
+      53,
+      47,
+      128
+    ],
+    "voxels": 5953,
+    "by_material": {
+      "8": 2038,
+      "22": 3915
+    },
+    "ground_contact": 361,
+    "ms_grow": 0.5,
+    "ms_raster": 170.4,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 176.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

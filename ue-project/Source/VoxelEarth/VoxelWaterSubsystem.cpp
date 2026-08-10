@@ -1089,18 +1089,31 @@ struct FVoxelWaterImpl
 	//
 	// DECLARATION ORDER IS LOAD-BEARING a fourth time in this struct, and the
 	// chain is one-directional: BasinDatum borrows Basins, Basins borrows
-	// BasinCapacity, BasinCapacity borrows BasinTerrain, BasinTerrain borrows
-	// the FineTileSampler that `Water` above owns. Declared in that order, so
-	// they are DESTROYED in the reverse of it and nothing is ever holding a
-	// reference to something already gone. All four are declared AFTER `Water`
-	// for the same reason.
+	// BasinRouter, BasinRouter borrows BasinCapacity and BasinCapacityV2,
+	// BasinCapacity borrows BasinTerrain and BasinCapacityV2 borrows
+	// BasinTable, and BasinTerrain and BasinTableSrc both borrow the
+	// FineTileSampler that `Water` above owns. Declared in that order, so they
+	// are DESTROYED in the reverse of it and nothing is ever holding a
+	// reference to something already gone. All of them are declared AFTER
+	// `Water` for the same reason.
 	//
-	// ALL FOUR ARE NULL unless the fine tier resolved (EnsureBasinLedger below),
+	// ALL ARE NULL unless the fine tier resolved (EnsureBasinLedger below),
 	// because with no basin table there is nothing to keep a ledger of, and a
 	// null here is the same supported "no fine tier" configuration `Water` is
 	// already a NullWaterSampler for.
+	//
+	// TWO CAPACITY PROVIDERS, NOT A MODE. v1 tiles (client-reconstructed
+	// hypsometry) and basin table v2 tiles (baked capacity, global ids) coexist
+	// in one session -- a partly re-baked cache is the normal state -- and
+	// `vxc::BasinId` already tells the two key spaces apart by its own tag bit,
+	// so `BasinRouter` dispatches per basin and there is no version flag to get
+	// wrong. Removing the v1 pair would break every world baked before bv24.
 	std::unique_ptr<vxc::FineTileBasinTerrain> BasinTerrain;
+	std::unique_ptr<vxc::FineTileBasinTableV2> BasinTableSrc;
+	std::unique_ptr<vxc::BakedBasinTable> BasinTable;
 	std::unique_ptr<vxc::ClientHypsometryProvider> BasinCapacity;
+	std::unique_ptr<vxc::BakedCapacityProvider> BasinCapacityV2;
+	std::unique_ptr<vxc::BasinCapacityRouter> BasinRouter;
 	std::unique_ptr<vxc::BasinLedger> Basins;
 	std::unique_ptr<vxc::BasinLedgerDatumSource> BasinDatum;
 
@@ -3347,16 +3360,96 @@ void EnsureBasinLedger(FVoxelWaterImpl& Impl)
 	// Built in dependency order; see the declaration comment in FVoxelWaterImpl
 	// for why the order is load-bearing on the way out as well as in.
 	Impl.BasinTerrain = std::make_unique<vxc::FineTileBasinTerrain>(*Tiles);
+	Impl.BasinTableSrc = std::make_unique<vxc::FineTileBasinTableV2>(*Tiles);
+	Impl.BasinTable = std::make_unique<vxc::BakedBasinTable>(*Impl.BasinTableSrc);
 	Impl.BasinCapacity = std::make_unique<vxc::ClientHypsometryProvider>(*Impl.BasinTerrain);
-	Impl.Basins = std::make_unique<vxc::BasinLedger>(*Impl.BasinCapacity);
-	Impl.BasinDatum = std::make_unique<vxc::BasinLedgerDatumSource>(*Impl.Basins);
+	Impl.BasinCapacityV2 = std::make_unique<vxc::BakedCapacityProvider>(*Impl.BasinTable);
+	Impl.BasinRouter =
+		std::make_unique<vxc::BasinCapacityRouter>(*Impl.BasinCapacity, *Impl.BasinCapacityV2);
+	Impl.Basins = std::make_unique<vxc::BasinLedger>(*Impl.BasinRouter);
+	// The datum source takes the table so a v2 row is keyed GLOBALLY: without
+	// it, a lake crossing a tile edge would get one account per tile, each
+	// holding half its water and each drawn at its own height.
+	Impl.BasinDatum = std::make_unique<vxc::BasinLedgerDatumSource>(*Impl.Basins, Impl.BasinTable.get());
 	Impl.Water->setBasinDatumSource(Impl.BasinDatum.get());
 
 	UE_LOG(LogVoxelWater, Log,
 	       TEXT("Basin ledger ENABLED (kBasinLedgerVersion %u): lake datums now read surfaceMm + h(volume delta). ")
-	       TEXT("Capacity comes from a CLIENT-RECONSTRUCTED hypsometry (v1 tiles ship none); it is replaced by the ")
-	       TEXT("baked curve when basin table v2 lands, with no change above the provider interface."),
+	       TEXT("Capacity is routed PER BASIN on the key's own tag bit -- a basin table v2 row (bake_ver 24+) uses ")
+	       TEXT("its baked capacity_l and global id, a v1 row uses the client-reconstructed hypsometry. Both are ")
+	       TEXT("live at once, because a partly re-baked tile cache is the normal state."),
 	       vxc::kBasinLedgerVersion);
+}
+
+// Moves the ledger's accounts onto the keys the union rule has since decided
+// are canonical, and reports what moved.
+//
+// WHY THIS IS NOT OPTIONAL. A lake that crosses a tile edge can be credited
+// while only one of its tiles is resident, under that tile's own global id.
+// When the neighbour arrives and the two rows turn out to be one lake, the
+// account has to follow -- otherwise the water is still in `sumOfDeltas()`,
+// still passes `conserves()`, and is attached to a key nothing will ever ask
+// about again. That is the one kind of loss the conservation invariant cannot
+// see, which is why it gets a counter and a log line rather than silence.
+void SyncBasinTableMerges(FVoxelWaterImpl& Impl)
+{
+	if (!Impl.BasinTable || !Impl.Basins)
+	{
+		return;
+	}
+	const std::vector<vxc::BakedBasinTable::Merge> Merges = Impl.BasinTable->drainMerges();
+	if (Merges.empty())
+	{
+		return;
+	}
+	int32 Moved = 0;
+	for (const vxc::BakedBasinTable::Merge& M : Merges)
+	{
+		if (Impl.Basins->mergeAccount(M.from, M.into))
+		{
+			++Moved;
+			Impl.BasinDirtySinceLastBroadcast.Add(M.into.v);
+		}
+		Impl.BasinDirtySinceLastBroadcast.Remove(M.from.v);
+	}
+	if (Moved > 0)
+	{
+		Impl.Water->invalidateBasinDatumMemo();
+		UE_LOG(LogVoxelWater, Log,
+		       TEXT("Basin table v2: %d of %d re-keyings carried water -- a neighbour tile arrived and turned ")
+		       TEXT("separately credited rows into one lake."),
+		       Moved, int32(Merges.size()));
+	}
+}
+
+// Folds one tile's v2 rows into the merged table. Called wherever the subsystem
+// is already holding a tile's basin rows, which is the only moment it knows a
+// tile is resident -- `FineTileSampler` has no load callback and giving it one
+// for this would put a hydrology dependency in the streaming path.
+void IngestBasinTile(FVoxelWaterImpl& Impl, int32 TileX, int32 TileY)
+{
+	if (!Impl.BasinTable)
+	{
+		return;
+	}
+	Impl.BasinTable->ingestTile(TileX, TileY);
+	SyncBasinTableMerges(Impl);
+}
+
+// The ledger key for one baked row: global for a v2 row (through the union
+// rule, so both halves of a spanning lake share an account), tile-local for a
+// v1 one. THE BUILDING form -- an account has to be opened under the canonical
+// key or the drawn path, which uses the non-building lookup, will not find it.
+vxc::BasinId BasinKeyForRow(FVoxelWaterImpl& Impl, int32 TileX, int32 TileY,
+                            const vxc::BasinEntry& Row)
+{
+	if (Impl.BasinTable)
+	{
+		const vxc::BasinId Id = Impl.BasinTable->resolveKeyFor(TileX, TileY, Row);
+		SyncBasinTableMerges(Impl);
+		return Id;
+	}
+	return vxc::basinKeyFor(TileX, TileY, Row, nullptr);
 }
 
 // The fine grid stride the ledger needs before it can turn a tile-local outlet
@@ -3757,6 +3850,8 @@ bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
 	       TEXT("SaveHydroState: wrote %d bytes to %s -- %llu basin(s) off equilibrium (sum %lld units, %lld spilled, ")
 	       TEXT("%lld routed, %lld refunded, %lld replicated rows), %u graph segment(s), %llu graph diff(s). ")
 	       TEXT("Capacity provider: %llu curve(s) built over %llu cell(s), %llu unresolved, %llu apron miss(es). ")
+	       TEXT("Basin table v2: %llu component(s) built, %llu spanning, %llu bbox-fallback union(s), ")
+	       TEXT("%llu capacity disagreement(s), %llu refused row(s), %llu unresolved, %llu account merge(s). ")
 	       TEXT("basinDigest=0x%016llX"),
 	       OutBytes.Num(), *Path, (unsigned long long)Impl.Basins->basinCount(),
 	       (long long)Impl.Basins->sumOfDeltas(), (long long)Impl.Basins->totalSpilled(),
@@ -3773,6 +3868,18 @@ bool SaveHydroStateToDisk(const FVoxelWaterImpl& Impl, uint64 Seed)
 	       (unsigned long long)(Impl.BasinCapacity ? Impl.BasinCapacity->hypsometryCells() : 0ull),
 	       (unsigned long long)(Impl.BasinCapacity ? Impl.BasinCapacity->unresolvedBasins() : 0ull),
 	       (unsigned long long)(Impl.BasinTerrain ? Impl.BasinTerrain->apronMisses() : 0ull),
+	       // THE SAME RAN-FLAG ARGUMENT for the v2 half: zero components built
+	       // says the baked table was never asked (a v1-only cache, or nothing
+	       // ever credited), which is a different fact from "the baked capacity
+	       // agrees with everything". `capacityDisagreements` should be zero and
+	       // is the number that says two tiles saw different lakes.
+	       (unsigned long long)(Impl.BasinTable ? Impl.BasinTable->componentsBuilt() : 0ull),
+	       (unsigned long long)(Impl.BasinTable ? Impl.BasinTable->spanningComponents() : 0ull),
+	       (unsigned long long)(Impl.BasinTable ? Impl.BasinTable->fallbackUnions() : 0ull),
+	       (unsigned long long)(Impl.BasinTable ? Impl.BasinTable->capacityDisagreements() : 0ull),
+	       (unsigned long long)(Impl.BasinTable ? Impl.BasinTable->refusedRows() : 0ull),
+	       (unsigned long long)(Impl.BasinCapacityV2 ? Impl.BasinCapacityV2->unresolvedBasins() : 0ull),
+	       (unsigned long long)Impl.Basins->accountMerges(),
 	       (unsigned long long)D.h);
 	return true;
 }
@@ -7102,7 +7209,10 @@ int64 UVoxelWaterSubsystem::CreditBasinVolume(int32 TileX, int32 TileY, int32 Lo
 	const vxc::BasinEntry& Row = (*Rows)[size_t(LocalBasinId)];
 	OutBakedMm = Row.surfaceMm;
 
-	const vxc::BasinId Id = vxc::BasinId::fromTile(TileX, TileY, uint16(LocalBasinId));
+	// This is a moment the subsystem KNOWS a tile's rows are resident, so it is
+	// where the v2 table gets folded -- see IngestBasinTile.
+	IngestBasinTile(*Impl, TileX, TileY);
+	const vxc::BasinId Id = BasinKeyForRow(*Impl, TileX, TileY, Row);
 	const int64 Accepted = CreditBasinAndSync(*Impl, Id, Units);
 	OutLevelMm = Impl->Water->basinDatumMm(TileX, TileY, Row);
 	return Accepted;

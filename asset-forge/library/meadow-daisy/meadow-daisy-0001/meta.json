@@ -1,0 +1,43 @@
+{
+  "id": "meadow-daisy-0001",
+  "species": "meadow-daisy",
+  "kind": "flower",
+  "seed": 1,
+  "spec_hash": "caaa9eb60aecab98",
+  "stats": {
+    "seed": 1,
+    "spec_hash": "caaa9eb60aecab98",
+    "kind": "flower",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "voxel_cm": 1.0,
+    "height_m": 0.37,
+    "footprint_m": [
+      0.4,
+      0.42
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      40,
+      42,
+      37
+    ],
+    "voxels": 2674,
+    "by_material": {
+      "8": 623,
+      "24": 2051
+    },
+    "ground_contact": 105,
+    "ms_grow": 0.7,
+    "ms_raster": 42.5,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 44.5
+  },
+  "problems": [],
+  "vox_models": 1
+}

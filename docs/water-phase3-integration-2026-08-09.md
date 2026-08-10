@@ -101,12 +101,11 @@ test.
 
 ## Deviations / stated limits
 
-- **No recentring (v0)**: the origin latches once; toggle
-  `voxel.Fluid.Enable` to re-anchor. **Superseded in part 2026-08-09**: the
-  toroidal machinery now exists and the full-invalidation cost is gone, but
-  nothing calls it yet — the subsystem still latches once. See the addendum
-  "Toroidal occupancy" at the bottom of this file for the call the subsystem
-  should make.
+- ~~**No recentring (v0)**: the origin latches once; toggle
+  `voxel.Fluid.Enable` to re-anchor.~~ **SUPERSEDED 2026-08-10** — the window
+  now follows the camera (`UVoxelFluidSubsystem::MaybeRecentre`); the toggle
+  workaround is gone. See the addendum "The recentring policy is wired" at the
+  bottom of this file.
 - **One basin sink per frame** — a region straddling two lakes credits only
   the picked one; v2 is a table upload (contract item 6 says so in place).
 - **Boundary attribution** is by region centre, not exit position (positions
@@ -135,6 +134,7 @@ Fluid perf [run] alive=… spawned=… requested=… despawnBasin=… despawnBou
   sink(basin)=<n>/s|none|off  sink(boundary)=<n>/s
   occupancy=<regionsBuilt>/<deferred>  verify=pass|FAIL|stale|pending|off
   skippedNoOcc=<n>
+  recentre=<n>(cells=…,rebase=…/… slots,miss=…,stale=…,tele=…,refused=…,checks=…)|off
 Fluid ledger: emittedFaucet=… emittedSpill=… creditedToBasin=…(+… pending)
   injectedToGraph=…(+… pending) spillClaimed=… spillRefunded=… scalarViolations=…
 ```
@@ -510,8 +510,9 @@ change made to `VoxelFluidSubsystem.cpp` by this work -- two lines.
   `VOXEL_FLUID_HAS_COLLISION=1`). `tools/lint-shader-ub.py` clean on the three
   files this work owns.
 - **Not verified here** (needs the editor): that a recentre looks right, and the
-  refill latency at speed. Nothing calls `RecentreTo` yet, so there is nothing
-  in-editor to look at until the subsystem policy above is wired.
+  refill latency at speed. ~~Nothing calls `RecentreTo` yet, so there is nothing
+  in-editor to look at until the subsystem policy above is wired.~~ **The policy
+  was wired 2026-08-10** — see the last addendum in this file.
 
 ---
 
@@ -622,3 +623,124 @@ flow rate, never as bulk dumps; plus a request for visible faucet markers.
   mid-slope stream fronts advancing over voxel steps where lone droplets
   still legitimately stick. Captures at the pinned poses, conditions
   stated, owner judges.
+
+---
+
+## Addendum: the recentring policy is wired (2026-08-10)
+
+Appended by the recentring pass. Everything above is unchanged apart from the
+superseded "No recentring (v0)" bullet. This closes the last gap between the
+toroidal machinery (previous addendum, "NOT WIRED YET") and the water: **flying
+past the 51.2 m window no longer freezes the fluid, and toggling
+`voxel.Fluid.Enable` is no longer the workaround.**
+
+### The policy, and where it runs
+
+`UVoxelFluidSubsystem::MaybeRecentre`, once per game tick, after the view origin
+is known and **before** `ProcessOccupancyQueue` â€” that ordering is the whole
+policy's one constraint, because the queue packs against `OriginVoxel` and the
+faucet/sink refreshes and the spawn assembly all derive from `FluidOriginWorld`
+later in the same tick.
+
+```
+WantOrigin = camera voxel - 256 in XY, GroundVoxelZAtCamera() - 128 in Z
+Drift      = WantOrigin - OriginVoxel                 (int64, per axis)
+if (max|Drift| < 96) return                           (1.5 steps of hysteresis)
+Step       = round(Drift / 64) * 64                   (halves AWAY from zero)
+RecentreTo(OriginVoxel + Step, ...)
+```
+
+The two numbers are the header's (`VoxelFluidRecentre::StepVoxels` 64,
+`TriggerVoxels` 96, both `static_assert`ed against
+`vxc::kFluidRecentreStepVoxels`). Z re-anchors to the **ground column**, not the
+camera, by the same rule the first latch uses â€” one definition,
+`DesiredOriginVoxel`, shared by both, so the window keeps tracking terrain as
+the camera crosses a valley instead of only at the latch.
+
+A move of a whole window (>= 512 voxels in one tick, ~3 km/s) is a **teleport**:
+it routes to `LatchOrigin`/`SetOriginVoxel` instead of a slide, because nothing
+in view survives it and a slide would pay a particle rebase to move water that
+shares no terrain with where it is going.
+
+### The particle half (contract item 8)
+
+`TakePendingRebaseDeltaVoxels()` is taken on the game thread **at mailbox-post
+time**, not inside the recentre: a tick that does not post must leave the
+obligation accumulating on the volume rather than dropping it. It rides
+`FVoxelFluidRenderState::PendingRebaseDeltaVoxels` (accumulated, since an
+unconsumed post is overwritten every tick) and
+`FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread` dispatches
+`AddRebaseParticlesPass` **before** `AddSimPasses` â€” i.e. between solver ticks,
+in the renderer's own graph, the same seam the sim rides.
+
+**The stale-origin gate, which is new and load-bearing.** The render thread is a
+frame behind, so it can consume args built against an origin the game thread has
+already moved: un-rebased particles solved against a volume bound one step away
+is up to 12.8 m of displacement, and the density constraint resolves that by
+ejecting the water out of the rock it now sits in (the blast artifact, once per
+recentre). The args now carry the origin they were built against
+(`PendingSimArgsOriginVoxel`); a mismatch drops that tick, counted, and leaves
+the delta owed. The splat likewise draws against the **particle buffer's own**
+origin (`ParticleOriginWorld`), not the settings', so a dropped frame keeps
+drawing the water where the water is.
+
+### The origin-relative audit (the table this pass was really about)
+
+| quantity | where | how it stays correct |
+|---|---|---|
+| `FluidOriginWorld` | subsystem | recomputed from the new origin, same tick |
+| queued fill regions | `FVoxelFluidLifecycle::PendingRegions` | **volume-LOCAL**; translated by âˆ’delta, non-fitting dropped (their space is an entering cell) |
+| entering cells | `RecentreTo` out | requeued centre-out; ignoring them freezes the leading edge *forever* |
+| spill intercept box | `SetFluidSpillIntercept` | re-armed over the new XY footprint (`OnOriginMoved`) |
+| sill faucets | lifecycle | outlets the window left are **refunded** to the ledger, not left deferring |
+| headwater/crossing gather | 10 s cadence | forced to refresh on the move |
+| basin sink box + datum | 1 s cadence | invalidated + forced to refresh |
+| particle positions | GPU buffer | the rebase pass, above |
+| spawn `CenterLocalUU` | tick args | already `world âˆ’ FluidOriginWorld` per tick, after the recentre |
+| basin box/datum local | tick args | same, and the world-space source is refreshed |
+| boundary inject voxel | reconcile | `OriginVoxel + 256` per use |
+| `NotifyTerrainDirty` | listener | snaps against `OriginVoxel` at call time |
+| renderer origin | render settings | marshalled per tick; the splat uses the buffer's origin |
+| `BoundaryCenterLocalUU`, half extent, `GroundZLocalUU`, clamp margins | tick args | origin-relative **constants** â€” they describe the cube, not the world, so a move cannot invalidate them |
+| verify gate | subsystem | `EditEpoch` bumped on recentre â†’ `stale`, never a false FAIL |
+| camera faucet (`voxel.Fluid.Emit`) | subsystem | **stated, unchanged**: keeps its latched world point; re-issue the command to move it |
+| debug draw | subsystem | **stated**: one readback's worth of points can plot against the new origin for a frame after a move |
+
+### Counters (perf line, ran-flag rules)
+
+```
+recentre=<n>(cells=<n>,rebase=<passes>/<slots> slots,miss=<n>,stale=<n>,
+             tele=<n>,refused=<n>,checks=<n>)   |   off
+```
+
+`off` means no origin is latched. `checks=` is the ran-flag that separates "the
+camera has not moved 9.6 m" from "nobody is calling the policy" â€” which is
+exactly what v0 looked like, and the two are identical from the water's side.
+`rebase=` must track `recentre=`: a recentre with no rebase behind it is water
+sliding 6.4 m away from the terrain, so `miss=` is on the same field rather than
+hidden. `miss=` is only counted when particles actually existed.
+
+### Verification done here (no editor launched â€” the owner is playing)
+
+- **UBT compile-verify, `Result: Succeeded`** for both touched translation units
+  (`-singlefile`, which is also what Live Coding limits a build to while a
+  session is active): `VoxelFluidSubsystem.cpp` and `VoxelFluidRender.cpp`,
+  VoxelEarthEditor Win64 Development, MSVC 14.51. No new warnings. One latent
+  include fix on the way: `VoxelFluidRender.cpp` was reaching
+  `TStaticBlendState` et al. through the unity blob and does not compile on its
+  own without `RHIStaticStates.h` (any modified file takes the adaptive
+  non-unity path, so this bites whoever edits it next, not this change).
+- **`VoxelEarth.Fluid.RecentreTrigger`** added (bottom of `VoxelFluidSubsystem.cpp`):
+  trigger/no-trigger either side of 96 on every axis at a planet-scale origin,
+  mirror symmetry of the rounding, whole-step alignment, residual <= half a step,
+  one-move convergence (no chatter) swept over 96..8192 in both directions, the
+  Z-only trigger the ground anchor needs, and the teleport hand-off. **NOT RUN**
+  â€” it needs an editor process and the owner is in one; run it with
+  `-ExecCmds="Automation RunTests VoxelEarth.Fluid; Quit"` at the next
+  opportunity. What *was* run: the shipped bodies of `SnapDriftToStep` /
+  `ComputeRecentreOrigin`, extracted textually and compiled standalone against a
+  shim (clang++ 20, `-std=c++20`), pass every assertion the test makes.
+- **Not verified here** (needs the editor): that flying keeps the water alive,
+  the refill latency at speed, and that no blast appears at a recentre. Read
+  `recentre=` against `occupancy=<built>/<deferred>` while flying; captures at
+  pinned poses, conditions stated, owner judges.

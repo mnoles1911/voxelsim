@@ -99,6 +99,22 @@ struct FVoxelFluidRenderStats
 {
 	float RenderGpuMs = -1.0f;
 	uint64 FramesRendered = 0;
+
+	// --- the particle half of a toroidal recentre (contract item 8) ---------
+	// Read against the subsystem's own recentre counter: a recentre with no
+	// rebase is water teleported sideways relative to the terrain, so these are
+	// meant to be read together and are printed together in the perf line.
+	uint64 RebasePasses = 0;        // AddRebaseParticlesPass calls that ADDED a pass
+	uint64 RebaseSlots = 0;         // particle slots those passes covered, summed
+	// A delta was owed and particles existed, but no pass could be added (the
+	// RHI refused it, or the buffers went away mid-flight). NOT the benign
+	// "nothing has spawned yet" case, which is not counted at all: this one
+	// means the water really is offset from the terrain by that delta.
+	uint64 RebaseMissed = 0;
+	// Sim ticks dropped because the origin moved AFTER the args were posted --
+	// see PreRenderViewFamily_RenderThread. One frozen frame, deliberately,
+	// instead of one frame of solving against terrain 6.4 m away.
+	uint64 SimFramesStaleOrigin = 0;
 };
 
 // Cross-thread state shared between the subsystem (game thread) and the view
@@ -134,10 +150,30 @@ public:
 	// pattern the old enqueue documented).
 	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> OccupancyKeepAlive;
 
+	// THE ORIGIN PendingSimArgs WAS BUILT AGAINST, and the reason it is here:
+	// the volume's origin is game-thread state that a recentre moves MID-FRAME,
+	// while the render thread is one frame behind consuming the PREVIOUS tick's
+	// args. Without this stamp, the frame that straddles a recentre would solve
+	// last tick's origin-relative boxes and un-rebased particles against a
+	// volume bound at the NEW origin -- particles displaced up to a step
+	// relative to the terrain, which the density constraint resolves by
+	// ejecting them. Compared against the volume's live origin at consume time;
+	// a mismatch drops the tick (counted, one frozen frame) and LEAVES the
+	// rebase delta owed for the next one.
+	FIntVector PendingSimArgsOriginVoxel = FIntVector::ZeroValue;
+
+	// THE PARTICLE REBASE MAILBOX (contract item 8). Origin motion the particle
+	// buffer still owes, in voxels, ACCUMULATED by the game thread
+	// (TakePendingRebaseDeltaVoxels is itself take-and-clear, so a tick whose
+	// args are never consumed must not lose its delta) and consumed exactly
+	// once, with the args it belongs to, by PreRenderViewFamily_RenderThread.
+	FIntVector PendingRebaseDeltaVoxels = FIntVector::ZeroValue;
+
 	// -- written by the render thread under Lock --
 	FVoxelFluidRenderStats Stats;
 
-	// -- render-thread-only (no lock: only PrePostProcessPass touches these) --
+	// -- render-thread-only (no lock: only the two render-thread hooks touch
+	//    these, and they run in order in the same frame) --
 	struct FTimingPair
 	{
 		FRenderQueryRHIRef Begin;
@@ -145,6 +181,17 @@ public:
 		bool bInFlight = false;
 	};
 	FTimingPair TimingRing[kNumTimingPairs];
+
+	// THE ORIGIN THE PARTICLE BUFFER IS CURRENTLY EXPRESSED IN, world UU.
+	// The splat needs the origin its positions actually use, which is NOT
+	// necessarily Settings.FluidOriginWorld: the game thread publishes the new
+	// origin the moment it recentres, but the buffer only moves when the rebase
+	// pass runs. Written by PreRenderViewFamily_RenderThread on every sim-args
+	// consume (which is exactly when the accompanying rebase lands), read by
+	// PrePostProcessPass_RenderThread later in the same frame -- so a frame that
+	// skipped the tick keeps drawing the water where the water still is.
+	FVector ParticleOriginWorld = FVector::ZeroVector;
+	bool bParticleOriginValid = false;
 
 	FVoxelFluidRenderStats GetStats() const
 	{

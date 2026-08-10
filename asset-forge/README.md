@@ -1,7 +1,7 @@
 # asset-forge
 
-Cubic-voxel environment assets for voxelsim: trees, bushes and rocks today,
-grass, reeds and flowers on the same pipeline next.
+Cubic-voxel environment assets for voxelsim: trees, bushes, rocks, grass, reeds
+and flowers.
 
 Why it is built the way it is: `docs/tree-asset-generator-research.md`.
 What it is for and where it goes: `docs/tree-asset-generator-plan.md`.
@@ -16,22 +16,35 @@ voxels every time. That is what makes "hundreds of variants" cheap.
 
 ## Status
 
-Phases 1 and 2 work: the generator core and the app. 25 species across three
-asset kinds. Phase 0 (making the engine able to hold a tree at all) is deferred
-until the editor box is free and is tracked in the plan — **no tree or bush here
-can be stamped into the world yet**, because the leaf and bark materials do not
-exist in `vxc::Material` and the streaming layer still skips the chunks a crown
-would occupy.
+Phases 1 and 2 work: the generator core and the app. 42 species across six asset
+kinds, **every one of them on the 5 cm asset lattice**. Phase 0 (making the
+engine able to hold an asset at all) is deferred until the editor box is free
+and is tracked in the plan.
 
-Rocks are the exception and worth stating plainly: a boulder is made of
-`MAT_ROCK`, `MAT_GRAVEL` and `MAT_SAND`, which the terrain is already made of.
-Rocks need no material append at all. They still need the streaming bound to
-accept solids above the surface, but that is one blocker instead of two.
+There are **two** engine blockers, and it matters which assets need which:
+
+- **The streaming bound** skips any chunk `surfaceUpperBoundMm` proves empty,
+  which is every chunk a crown or a stem would occupy. Everything here needs
+  this fixed.
+- **The material append** — bark, the leaf variants and a bloom colour do not
+  exist in `vxc::Material`. Trees, bushes and flowers need this.
+
+**Rocks, grass and reeds need only the first.** A boulder is `MAT_ROCK`,
+`MAT_GRAVEL`, `MAT_BEDROCK` and `MAT_SAND`; a grass tuft and a reed are
+`MAT_GRASS` and `MAT_SAVANNA_GRASS`. Those are the materials the terrain is
+already made of, so seventeen of the forty-two species are one blocker away from
+the world instead of two. If something has to ship first, it is those.
+
+Nothing consumes the **placement** group yet — `abundance`, `spacing_m`,
+`cluster`, the slope and elevation gates and the biome weights are authored and
+read by no code. Scattering has to happen in `voxel-core` during worldgen,
+per-chunk and deterministic; these sliders are the specification for it, not an
+implementation of it.
 
 ## Asset kinds
 
-The app opens on a **section** per kind — Trees, Bushes, Rocks, and three more
-declared but not yet generating. The section scopes everything below it: which
+The app opens on a **section** per kind — Trees, Bushes, Rocks, Grass, Reeds and
+Flowers. The section scopes everything below it: which
 parameters exist, which species the dropdown lists, which library entries show,
 and which biomes the coverage tab reports on. A rock has no trunk, crown, growth
 model or foliage, and the rock section does not show those sliders greyed out —
@@ -40,12 +53,14 @@ it does not show them at all.
 `forge/kinds.py` is the whole registry. Adding a kind is a generator, a
 parameter group and one entry there; it is not a second application.
 
-| Kind | Generator | Notes |
-|---|---|---|
-| Trees | skeleton (`colonize` / `whorl` / `frond`) | 16 species |
-| Bushes | same skeleton, authored short with branches to the ground | 4 species |
-| Rocks | no skeleton at all — see **Rocks** below | 5 species |
-| Grass, Reeds, Flowers | — | declared, greyed out, no generator yet |
+| Kind | Generator | Species | Needs the material append? |
+|---|---|---|---|
+| Trees | skeleton (`colonize` / `whorl` / `frond`) | 16 | yes |
+| Bushes | same skeleton, authored short with branches to the ground | 4 | yes |
+| Rocks | accretion and carving — see **Rocks** | 10 | no |
+| Grass | tuft — see **Ground cover** | 4 | no |
+| Reeds | tuft, tall and near-vertical, seed heads | 3 | no |
+| Flowers | tuft, few stems, some carrying a bloom | 5 | yes (bloom colour) |
 
 Biome weights are scoped per kind too, because **Bare rock** is a real place for
 a boulder and an impossible one for an oak: the engine's cliff gate fires before
@@ -159,13 +174,15 @@ it happens by eye.
 
 ## Voxel size
 
-Each species carries its own **Voxel size** (the `resolution_cm` slider):
-10, 5, 2.5, 2 or 1 cm. The engine's terrain is 10 cm, which is the default; at
-2 cm a real twig is several voxels across instead of being rounded up to the
-one-voxel minimum, which is a visible gain on foliage and thin branches.
+Each species carries its own **Voxel size** (the `resolution_cm` slider), and
+**every species is set to 5 cm** — the asset lattice. 10 cm is the terrain's own
+size; 2.5, 2 and 1 cm remain selectable for hero renders and comparisons but
+nothing authored there can be put in the world. See *Two lattices* below for why
+5 cm and not 2 cm.
 
-**The cost is cubic** — 2 cm is 125× the voxels of 10 cm for the same tree.
-Measured on the species set:
+**The cost is cubic**, which is the whole reason the choice matters — halving
+the voxel is 8× the voxels, and 2 cm is 125× the voxels of 10 cm for the same
+tree. Measured on the species set:
 
     temperate-sapling   10 cm      8,026 vox   0.1 s        2 cm    981,091 vox   0.5 s
     tundra-pine         10 cm     25,406 vox   0.2 s        2 cm  3,107,527 vox   1.4 s
@@ -176,8 +193,8 @@ So the app keeps three resolutions separate, and says which one you are looking
 at rather than leaving it ambiguous:
 
 - **Gallery tiles** build at the finest size whose grid fits a cell budget
-  (`ASSET_FORGE_PREVIEW_CELLS`, default 6M). A 14 m oak lands on 10 cm; a 1.5 m
-  bramble lands on 2 cm. The skeleton is resolution-independent, so a coarse
+  (`ASSET_FORGE_PREVIEW_CELLS`, default 6M). A 14 m oak lands on 10 cm; a 45 cm
+  grass tuft lands on 5 cm. The skeleton is resolution-independent, so a coarse
   preview and a fine export are the same asset sampled differently.
 
   This used to be a flat 10 cm floor, which was right for trees and badly wrong
@@ -187,19 +204,64 @@ at rather than leaving it ambiguous:
   rule.
 - **The 3D viewer** shows the finest size that fits its instance budget
   (`ASSET_FORGE_MAX_VIEWER_VOXELS`, default 2.5M; a touch client asks for 400k).
-  Small species show at their authored size; a 2 cm oak shows at 5 cm and the
-  caption says *"shown at 5 cm (exports at 2 cm)"*.
+  Small species show at their authored size; a species that has to be stepped
+  coarser says so in the caption — *"shown at 10 cm (exports at 5 cm)"*.
 - **Exports** (`.vox`, `.vxa`, Keep to library) always use the authored size.
 
-Small assets are authored fine, because that is what 2 cm is for: the bushes and
-alpine scree are 2 cm, river cobble 2.5 cm, saplings and hawthorn 5 cm, the
-large trees 10 cm.
+### Two lattices: 10 cm and 5 cm
 
-### What 2 cm exposed
+The engine has exactly one voxel size today — `kVoxelSizeMm = 100` in `core.h`,
+and nothing in voxel-core references a finer one. The plan is a second, finer
+tier near the surface, and **that tier is 5 cm**.
+
+5 cm rather than 2 cm because of how it nests. 5 cm is 2:1 inside the terrain
+lattice: eight fine voxels per coarse one, a single subdivision level, trivial
+mip. 2 cm is 5:1 at 125×, which makes bricks, LOD and the digging boundary all
+messier, and costs about fifteen times as much.
+
+What it costs in detail was measured, not guessed
+(`tools/lattice_ab.py` renders each plant authored twice, once for each size):
+
+- **Reeds lose almost nothing.** A 2 m stem has voxels to spare either way.
+- **Grass changes character** — it stops being individual blades and becomes a
+  chunky vegetation clump. Legible, but a different look.
+- **Flowers were the real constraint.** A bloom two voxels wide had nowhere to
+  put a petal, so the rosette collapsed back into the blob it replaced. Fixed by
+  drawing small blooms *on* the lattice instead of sampling onto it: one centre
+  voxel and four cardinal petals. That is what lets 5 cm carry a daisy rather
+  than only a sunflower.
+
+So: **terrain at 10 cm, every asset at 5 cm.** One size for all assets, so
+nothing downstream ever has to ask which lattice a given object lives in. The
+1 cm and 2 cm options stay in the app for hero renders and A/B comparisons;
+nothing authored below 5 cm can be put in the world.
+
+Moving everything down was not a resolution swap. Two things had been tuned
+against a 2 cm voxel and mean something else at 5 cm: a `growth.tip_radius_m` of
+0.02 m is under half a voxel, so twigs get drawn at the one-voxel minimum; and a
+trunk radius of 0.05 m is one voxel, which is not enough for a shrub's main
+stems to read as stems. `tools/retune_5cm.py` and `tools/all_to_5cm.py` record
+what changed and why.
+
+**What the 8× costs.** The sixteen large species went from 866k voxels to 6.7M
+between them. Build times stay workable — most trees are one to two seconds, the
+30 m emergent about five, and the 9 m `summit-tor` is the worst in the library
+at eight to seventeen. Previews are unaffected, because gallery tiles and the 3D
+viewer already pick their own resolution against a budget: a 30 m tree still
+previews at 10 cm and only an export pays full price.
+
+The visible consequence is `.vox` **splitting**, which is now the normal case
+rather than the exception. The format caps a model at 256 voxels per axis, so
+most trees are written as a scene of several — the emergent is nine. The writer
+has always done this and the selftest checks the round trip; what changed is
+that it stopped being worth flagging. See *Health checks*.
+
+### What going fine exposed
 
 Two bugs sat harmlessly in the foliage code for as long as everything was 10 cm,
-and both showed up as thousands of loose voxels the moment a clump was fifty
-voxels across instead of two:
+and both showed up as thousands of loose voxels the moment a clump was tens of
+voxels across instead of two. They were found at 2 cm, before the tier settled
+on 5 cm; both fixes are resolution-independent and both still matter at 5 cm:
 
 - **A clump could come off its twig entirely.** Droop and jitter are world
   distances, so their ratio to the clump radius is the same at any resolution —
@@ -218,12 +280,11 @@ The health check that caught both is `attached`, and it is the reason to run
 
 `pipeline.build` refuses a grid over `ASSET_FORGE_MAX_GRID_MB` (default 3 GB)
 before allocating, with the dimensions and the way out, rather than thrashing
-the machine. The 28 m emergent at 2 cm needs 1.8 GB and 42 s — it works, but it
-is the ceiling of what dense storage handles. Brick-backed storage would cut
-that roughly fivefold and is the next step if 2 cm becomes the default for the
-largest species.
+the machine. Nothing that ships comes near it now that the fine tier is 5 cm —
+the 28 m emergent is 350k voxels at 10 cm — but a 2 cm hero render of that tree
+needs 1.8 GB and 42 s, which is the ceiling of what dense storage handles.
 
-From the command line: `python -m forge.cli gen specs/tundra-pine.json --res 2`.
+From the command line: `python -m forge.cli gen specs/tundra-pine.json --res 5`.
 
 ## Canopy structure
 
@@ -327,8 +388,90 @@ changing the noise.
 raw lumps must start larger. A formula tuned so a boulder came out right left a
 3.2 m standing stone at 4.9 m, because the burial cut removes a different share
 of a tall stone than of a flat one. The builder now measures the result and
-corrects, at most three times, on the same seed — so the slider is honest to
-within a voxel or two.
+corrects on the same seed — searching on a coarse copy first, because the
+correction is a ratio of lengths and barely depends on the lattice, so a 9 m
+boulder is not built three times at full size to find it.
+
+### What the large boulders exposed
+
+The 4.5-9 m boulders are a size class above anything else and they broke two
+things that were invisible at 2-3 m:
+
+**Relief has to be measured in voxels, not only in rock-fractions.** The surface
+noise had two octaves sized to the rock, so a 9 m boulder got the same six
+undulations a 2 m one did — and between those six, the surface was still a
+smooth curve showing exactly the concentric stair-steps the whole pass exists to
+prevent. A third octave a couple of *voxels* wide fixes it at every size,
+because terracing is a property of the lattice and not of the stone.
+
+**A fracture face is not a plane.** Faceting cut true half-spaces, which on a
+6 m block leaves flat faces metres across; the first large boulders read as cut
+gemstones rather than stone. The cut plane now wobbles by a few voxels of noise,
+so the depth still means what the quantile says while the surface it leaves is
+broken. It reuses the same noise field the body does — generating a second one
+doubled the slowest part of the build for a difference nobody could see, and a
+fracture following the same grain as the weathering is if anything more
+physical.
+
+## Ground cover
+
+Grass, reeds and flowers are one generator with three settings, not three
+generators (`forge/ground.py`). A grass tuft, a stand of reeds and a clump of
+daisies are all *a spray of thin stems rising from a common root*; what
+separates them is how tall the stems are, how far they arc over, and what sits
+on top — nothing, a seed spike or plume, or a bloom. That is not a shortcut, it
+is the actual shape, and it is why `tuft.head` is the parameter that tells the
+three kinds apart.
+
+None of it touches the tree machinery. A blade of grass does not branch, does
+not compete for space and carries no foliage clumps, so space colonization has
+nothing to contribute.
+
+**All twelve are authored at 5 cm**, the fine lattice tier (see *Two lattices*
+above). At the terrain's 10 cm a 45 cm tuft is four voxels and there is nothing
+to draw; at 5 cm it is nine, which is enough for a shape.
+
+Authoring *for* 5 cm is a different job from shrinking a 2 cm asset into it, and
+three rules came out of doing both and comparing:
+
+- **Fewer, wider stems.** At 5 cm a blade is one voxel wide whatever you ask
+  for, so thirty-four of them rooted in a 5 cm disc land on top of each other
+  and the tuft fuses into a plate. Ten to fifteen, spread wider, is what the
+  lattice can express.
+- **Taller.** Pushing ground cover up a little buys the shape somewhere to
+  exist; the alpine sedge went from 16 cm to 30 cm for exactly that reason.
+- **Heads have to clear a couple of voxels** to read as anything.
+
+Per-area cost at 5 cm, at each species' own authored spacing: grass is
+26k-64k voxels per 100 m², flowers 0.4k-17k, and reeds the expensive ones at
+26k-316k. A whole temperate oak is about 75k, so a 10 × 10 m reed bed is four
+oaks and a 10 × 10 m meadow is under one.
+
+Four things had to be got right, and each was wrong first:
+
+**A flower head is a rosette, not a ball.** A bloom is two or three voxels
+across; a sphere at that size has no roundness left to lose, and squashing one
+gave a flat rectangular slab — a pink plate on a stick. Petals placed on a ring
+keep a lobed silhouette the eye reads as a flower.
+
+**Below two voxels of radius, even the rosette collapses.** The ring itself
+comes out under one voxel wide, so every petal rounds onto the centre and you
+are back to the blob. At that size a flower has to be drawn *on* the lattice
+rather than sampled onto it: one centre voxel and four cardinal petals. That is
+the smallest thing that still reads as a flower, and it is the reason 5 cm can
+carry a daisy instead of only a sunflower.
+
+**Azimuths are stratified, not random.** Independent draws clump — that is what
+random looks like — and on a plant with eleven stems the clumping *is* the
+silhouette: every bloom bunched on one side with a bald gap opposite. One stem
+per even slice, jittered, fixes it without making a fan.
+
+**The root crown is never smaller than the root spread.** Without a crown each
+stem is its own connected component: botanically true, and wrong for an asset
+that gets stamped into a world and dug out of it. Left as an independent slider
+it silently failed on any wide stand — a reed clump rooting over 18 cm with a
+5 cm crown came out 39% detached, which reads as a generator bug and is a unit
+mismatch between two sliders that were never tied together.
 
 ## Species
 
@@ -360,11 +503,48 @@ within a voxel or two.
 
 ### Rocks
 
-    granite-boulder     weathered, part-buried, moderately faceted
-    river-cobble        rounded waterworn stone, clusters near water
-    limestone-slab      flat bedded slab, part sunk
-    standing-stone      tall fractured monolith
-    alpine-scree        small angular fragments for talus slopes
+    alpine-scree        0.65 m  small angular fragments for talus slopes
+    river-cobble         0.9 m  rounded waterworn stone, clusters near water
+    granite-boulder      2.4 m  weathered, part-buried, moderately faceted
+    standing-stone       3.2 m  tall fractured monolith
+    limestone-slab       3.4 m  flat bedded slab, part sunk
+    mossy-forest-boulder 4.5 m  rounded, heavily eroded, sits deep in forest soil
+    glacial-erratic      5.0 m  rounded granite left on open ground by ice
+    desert-mesa-block    5.5 m  wind-carved sandstone, wide and flat-topped
+    cliff-fall-block     6.5 m  sharply fractured, barely eroded, below cliffs
+    summit-tor           9.0 m  stack of weathered blocks on high open ground
+
+The five above 4 m are a different job from the five below. A 3 m slab is
+scenery you walk past; a 5-9 m boulder is scenery you walk *around* — it blocks
+a line, it casts a shadow you stand in, it is a landmark. That is why they are
+their own species rather than the granite boulder's size slider dragged right,
+and why they are authored rare: `summit-tor` sits at 5% abundance and 120 m
+spacing.
+
+### Grass  (5 cm)
+
+    meadow-grass        the baseline tuft, MAT_GRASS
+    dry-tussock         coarse pale bunchgrass, stands rather than lies over
+    alpine-sedge        short hardy cushion for above the treeline
+    jungle-groundcover  broad-bladed rainforest floor cover
+
+### Reeds  (5 cm)
+
+    water-reed          tall stems with seed spikes, clusters near water
+    bulrush             shorter and thicker, fat dark heads, reads at distance
+    pampas-plume        feathery plume heads on dry open ground
+
+### Flowers  (5 cm)
+
+    meadow-daisy             the baseline; leaf stems and bloom stems together
+    alpine-cushion-flower    tiny high-altitude cushion, almost all bloom
+    desert-bloom             sparse dry-country flower, wide gaps between plants
+    coastal-thrift           low salt-tolerant cushion for the beach band
+    jungle-understory-flower taller stems under a few big bright heads
+
+Grass covers all eight plantable biomes. Reeds are absent from desert, taiga and
+tundra on purpose. `coastal-thrift` and `jungle-understory-flower` exist because
+the coverage tab showed beach and rainforest with no flower at all.
 
 `field-elm` and `alpine-krummholz` exist because the biome coverage tab said so:
 grassland and tundra/alpine had species *borrowed* into them and none authored
@@ -432,6 +612,7 @@ exported tree as a mesh and we bring it back. It is just not the main path.
     forge/biomes.py    mirror of vxc::BiomeId, plus which kinds each biome hosts
     forge/pipeline.py  spec + seed -> Asset, plus the per-asset health check
     forge/rock.py      the rock generator; no skeleton involved
+    forge/ground.py    grass, reeds and flowers; one tuft generator for all three
     forge/render.py    isometric preview renderer (numpy + Pillow, no engine)
     forge/contact.py   contact sheets
     forge/vox.py       MagicaVoxel .vox export, splitting models over 256 voxels
@@ -442,7 +623,13 @@ exported tree as a mesh and we bring it back. It is just not the main path.
     tools/sheet.py       contact sheet of named specs, for eyeballing shape
     tools/shapecheck.py  same, every voxel forced to one bright material
     tools/shots.py       responsive-layout screenshots via headless Chrome
+    tools/lattice_ab.py  a plant authored for 2 cm beside the same one authored
+                         for 5 cm, drawn at matched physical scale
+    tools/retune_5cm.py  one-off that moved the last seven off-lattice assets
+    tools/all_to_5cm.py  one-off that put every remaining species on 5 cm
+    tools/seed_boulders.py one-off that authored the 4.5-9 m boulders
     tools/seed_kinds.py  one-off that authored the rock/bush/gap species
+    tools/seed_ground.py one-off that authored the ground-cover species
 
 ## Health checks
 
@@ -456,8 +643,13 @@ column of zeroes pretending to mean something is worse than no column:
 - **attached** — how much of the tree touches anything, corners included.
   Foliage is deliberately speckled, so it is checked more loosely than wood.
 - **ground contact** — a tree with nothing on the bottom slab would float.
-- **size** — anything over 256 voxels on an axis is flagged, because that is
-  the per-model limit in `.vox` and the export has to split it.
+Size is deliberately **not** among them. Exceeding 256 voxels on an axis used to
+be flagged, because that is the per-model limit in `.vox` and the export has to
+split. At the 5 cm lattice most trees exceed it, so the flag fired on ten of
+forty-two species — which made **Keep all clean** skip every large tree, and a
+check that fires on the normal case only teaches you to ignore checks. The
+writer splits, the selftest verifies the round trip, and the model count is
+reported in the detail stats instead.
 
 ## Adding a species
 

@@ -1,0 +1,7 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-b09041b08
+tiles: [(-5, -4), (-4, -4), (-3, -4), (-5, -5), (-4, -5), (-3, -5)]
+[coarse] 20/20 ring tiles available (generate=False) cpu=0.0s
+[flow L1] 1 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed  cpu=0.6s
+[flow L0] 4 superblock(s) @ 30 m/px, span 61 km  fp=3d3c80deb245,4c8482ae6f68,a79fab8d28ee,c35c5715fa63  cpu=0.9s
+[3/6] baked (-3,-4) cpu=873.5s water=0.420%wet max_catchment=266.1km2 incision_p99=25.00m channels=61068940 injected=84.9km2/Q7.8e+07m3yr@918mm qmax=1.93e+08 drawnpad=281783 basin=0.9%/46m bridge=40904@0.35m settle=2685290/3r-2649319dr-23512bud mono=1174>0 lvl=162951 span=56/26ha@40m basins_v2=241/3span heads=36450@4.3%u32 hydro=c35c5715fa63

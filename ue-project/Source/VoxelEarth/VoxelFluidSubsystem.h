@@ -41,17 +41,85 @@
 //   voxel.Fluid.Occupancy.Verify 1  -- continuous GPU-vs-CPU region compare
 //
 // ORIGIN DOCTRINE (contract items 1/5): the fluid origin IS the occupancy
-// volume's minimum corner, latched from the camera (centred: camera voxel
-// minus 256 per axis) at the first spawn/emit/faucet arm and never moved --
-// v0 does not recentre (FVoxelFluidOccupancyVolume::SetOriginVoxel's cost
-// note); toggle voxel.Fluid.Enable to re-anchor. Particle positions live in
-// [0, 5120] UU.
+// volume's minimum corner, latched from the camera (centred in XY: camera voxel
+// minus 256; floored in Z under the camera's ground column, see
+// DesiredOriginVoxel). Particle positions live in [0, 5120] UU relative to it.
+//
+// AND IT NOW FOLLOWS THE CAMERA (contract item 4, wired 2026-08-10). v0 latched
+// the origin once and never moved it, so flying past the 51.2 m window left the
+// water frozen behind the player and the only cure was toggling
+// voxel.Fluid.Enable. The volume is a toroidal rolling window
+// (FVoxelFluidOccupancyVolume::RecentreTo), so a move now preserves every bit
+// still in view and invalidates only the entering slab; MaybeRecentre drives it
+// with the hysteresis policy in VoxelFluidRecentre below. The two halves that
+// must happen together, in the same tick:
+//
+//   * EVERY ORIGIN-RELATIVE QUANTITY is re-derived from the new origin --
+//     FluidOriginWorld, the spill intercept box, the basin sink box, the faucet
+//     gather (both forced to refresh), and the spawn positions assembled later
+//     in the same Tick. The tick-args boxes (boundary centre/half extent) are
+//     origin-relative CONSTANTS and therefore need no update, which is a
+//     property worth keeping: see the audit table at MaybeRecentre.
+//   * THE PARTICLES ARE REBASED. Positions are origin-relative, so the delta
+//     handed back by TakePendingRebaseDeltaVoxels rides the render mailbox to
+//     FVoxelFluidOccupancyVolume::AddRebaseParticlesPass, which runs in the
+//     renderer's graph BEFORE that frame's solver passes. Skipping it slides
+//     the water sideways relative to the terrain, once per recentre,
+//     cumulatively.
+//
+// SetOriginVoxel (the hard reset) remains for the two cases where preserving
+// nothing is correct: the first latch, and a teleport past the window.
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "VoxelFluidSubsystem.generated.h"
+
+// The rolling window's trigger arithmetic, free functions so the automation
+// test (VoxelEarth.Fluid.RecentreTrigger) pins the SHIPPING policy rather than
+// a copy of it. Values mirror voxelcore/fluidoccupancy.h and are
+// static_assert'ed against it in the .cpp -- this header is UHT-parsed and so
+// must not include voxel-core (the doctrine every subsystem here follows).
+namespace VoxelFluidRecentre
+{
+	// The addressing quantum AND the fill-cell edge: vxc::kFluidRecentreStepVoxels.
+	// Every move is a whole multiple of it on every axis, which is what keeps the
+	// toroidal wrap seam on an output-word boundary and the entering slab
+	// brick-aligned. RecentreTo REFUSES anything else rather than rounding it.
+	inline constexpr int32 StepVoxels = 64; // 6.4 m
+
+	// THE HYSTERESIS: 1.5 steps. With round-to-nearest a move leaves the drift
+	// inside +/-32 voxels, so the camera must travel another 64 to trigger again
+	// -- no chatter at a boundary, which matters because each recentre costs 64
+	// cells of refill (1/8 of the volume). Without the 1.5 a camera loitering on
+	// a threshold would pay that every few frames.
+	inline constexpr int32 TriggerVoxels = 96; // 9.6 m
+
+	// How far under the camera's ground column the window floor sits. Water
+	// lives on terrain, so the window does too: ~12.8 m of rock/caves below the
+	// surface, ~38.4 m of air above it. (Round-3 playtest: anchoring Z to the
+	// CAMERA put every faucet 55 m below the box floor while flying.)
+	inline constexpr int32 FloorBelowGroundVoxels = 128;
+
+	// A move this big shares no terrain with the old window, so sliding it buys
+	// nothing and costs a particle rebase on the way: that is a teleport and the
+	// honest call for it is SetOriginVoxel (a full re-latch).
+	inline constexpr int32 TeleportVoxels = 512; // == the window edge
+
+	// Round a per-axis drift to a whole number of steps, halves AWAY FROM ZERO
+	// so the policy is symmetric under a sign flip (FMath::RoundToInt is
+	// half-to-positive-infinity and would make a westward camera behave
+	// differently from an eastward one).
+	VOXELEARTH_API int32 SnapDriftToStep(int32 DriftVoxels);
+
+	// The whole trigger: false (and OutNewOriginVoxel == CurrentOriginVoxel)
+	// when the camera has not crossed the inner boundary on any axis. True with
+	// a new origin that is Current plus a whole-step move on every axis.
+	VOXELEARTH_API bool ComputeRecentreOrigin(const FIntVector& WantOriginVoxel,
+	                                          const FIntVector& CurrentOriginVoxel,
+	                                          FIntVector& OutNewOriginVoxel);
+}
 
 // Render-thread state, defined in VoxelEarthShaders (VoxelFluidSim.h /
 // VoxelFluidOccupancy.h). Held through forward declarations so this
@@ -113,8 +181,31 @@ private:
 	void ReleaseSimState();
 
 	// Latches the fluid origin (== occupancy volume min corner) centred on
-	// the camera, queues the initial fill, and arms the spill intercept.
+	// the camera, queues the initial fill, and arms the spill intercept. HARD:
+	// throws every built bit away (SetOriginVoxel). Correct for the first latch
+	// and for a teleport; a camera that WALKED goes through MaybeRecentre.
 	void LatchOrigin(const FVector& ViewOriginUU);
+
+	// The origin the camera wants RIGHT NOW -- centred in XY, floored under the
+	// ground column in Z. One definition, shared by the latch and the recentre
+	// trigger, because a disagreement between them would make the window chase
+	// an origin it never reaches. Updates LastViewOriginUU (which
+	// GroundVoxelZAtCamera reads), hence non-const.
+	FIntVector DesiredOriginVoxel(const FVector& ViewOriginUU);
+
+	// The rolling-window policy (contract item 4): once per tick, after the view
+	// origin is known and BEFORE ProcessOccupancyQueue. Slides the volume when
+	// the camera has crossed the inner hysteresis boundary, re-derives every
+	// origin-relative quantity, requeues the entering cells and leaves the
+	// particle rebase owed on the volume for the tick's mailbox post.
+	void MaybeRecentre(const FVector& ViewOriginUU);
+
+	// Everything origin-relative that is NOT re-derived per tick: the spill
+	// intercept box, sill faucets the window has left, and the two gathers
+	// keyed to the window centre. Called by both movers (LatchOrigin and
+	// MaybeRecentre) so a latch and a slide cannot disagree.
+	void OnOriginMoved();
+
 	int32 GroundVoxelZAtCamera() const;
 	FVector LastViewOriginUU = FVector::ZeroVector;
 

@@ -173,6 +173,33 @@ constexpr int64_t basinUnitsFromMm3(int64_t mm3) {
     return mulDivFloorNonNeg(mm3, kBasinLedgerUnitsPerVoxel, kVoxelVolumeMm3);
 }
 
+// SATURATING non-negative multiply/add. They exist for one reason, and it is
+// BasinHypsometry::unitsAtLevel's reason restated: a basin whose numbers are
+// impossible must read as "enormous but finite", never as a wrapped negative.
+// A negative capacity would let the spillway route backwards, and a wrapped
+// volume would put a lake at an arbitrary level with no counter to say so.
+constexpr int64_t satMulNonNeg(int64_t a, int64_t b) {
+    if (a <= 0 || b <= 0) return 0;
+    return a > INT64_MAX / b ? INT64_MAX : a * b;
+}
+constexpr int64_t satAddNonNeg(int64_t a, int64_t b) {
+    if (a < 0 || b < 0) return 0;
+    return a > INT64_MAX - b ? INT64_MAX : a + b;
+}
+
+// One litre is 1e6 mm^3, which is exactly one 10 cm voxel, which is exactly
+// `kBasinLedgerUnitsPerVoxel` ledger units. So the wire's `capacity_l` converts
+// to the ledger's own currency with a single multiply and NO rounding at all --
+// the one conversion in this header that is exact in both directions by
+// construction rather than by a chosen rounding rule.
+inline constexpr int64_t kBasinUnitsPerLitre = kBasinLedgerUnitsPerVoxel;
+static_assert(kVoxelVolumeMm3 == 1000000, "a litre is a voxel only at 10 cm");
+
+constexpr int64_t basinUnitsFromLitres(uint64_t litres) {
+    const uint64_t cap = uint64_t(INT64_MAX) / uint64_t(kBasinUnitsPerLitre);
+    return int64_t(litres > cap ? cap : litres) * kBasinUnitsPerLitre;
+}
+
 // ---------------------------------------------------------------------------
 // BASIN IDENTITY
 // ---------------------------------------------------------------------------
@@ -628,6 +655,653 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// BASIN TABLE v2 -- THE BAKED CAPACITY PATH
+// ---------------------------------------------------------------------------
+//
+// Everything above this line was written against v1 tiles, which ship a basin's
+// spill and surface and nothing else. Basin table v2 (bake_ver 24,
+// `tilestore.h BasinEntry::hasV2()`) adds the four things the client was
+// reconstructing or guessing: a u64 GLOBAL id, the headroom CAPACITY in litres,
+// the FLOOR, and the component's unclipped world bbox and true world outlet.
+//
+// -----------------------------------------------------------------------
+// THE CURVE, AND WHY THIS PROVIDER DOES NOT KEEP THE CLIENT ONE
+// -----------------------------------------------------------------------
+// v2 ships the capacity INTEGRAL but not the hypsometry it was integrated from
+// (`basins.py keep_hypsometry=False` is still off in the bake; the 66 floats
+// per basin were judged not worth the tile). So a v2 provider has four numbers
+// -- floor, surface, spill, capacity -- and needs a volume-vs-stage curve.
+//
+// Two designs were possible and this is the one NOT taken: keep
+// `ClientHypsometryProvider` for the SHAPE and rescale it so its total matches
+// the baked `capacity_l`. It sounds strictly better -- a measured shape with an
+// authoritative total -- and it is wrong for one decisive reason and two
+// supporting ones:
+//
+//   * SPANNING LAKES. The client fill is bounded by `BasinEntry`'s u16 bbox,
+//     which v2 documents as CLIPPED TO THIS TILE. For a lake that crosses a
+//     tile edge the client curve is not a scaled version of the truth, it is
+//     the shape of whichever half happens to be resident, and it CHANGES as
+//     tiles stream in and out. Rescaling that to the right total produces a
+//     confident wrong level rather than an obviously wrong one. Cross-tile
+//     lakes are the entire reason basin table v2 exists (~9% of lake area on
+//     the wet block was being dropped); a hybrid would carry the defect
+//     forward into the fix for it.
+//
+//   * COST. The stated motivation for baking the integral is that the 865 ha
+//     survey outlier is a 2.5M-cell client walk. A hybrid pays that walk in
+//     full and saves nothing.
+//
+//   * RESIDENCY AND DETERMINISM. The client curve needs the basin's elevation
+//     blocks decoded and its one-pixel stencil apron prewarmed, and refuses --
+//     losing the credit -- when they are not. This one answers from an 80-byte
+//     row, so a lake credited while its terrain is still streaming resolves.
+//     And the row is on the wire: two clients cannot disagree about it, which
+//     matters because this is replicated authoritative state.
+//
+// So the curve is a MODEL, stated plainly: **A(h) rises linearly from zero at
+// the floor**, i.e. V(h) is quadratic in stage. That is the paraboloid bowl,
+// the standard hydrological idealisation, and it is the shape a depression
+// carved by a diffusive process actually has -- A(h) is the CDF of the bed's
+// own elevations (`basins.py hypsometry`), and a bed whose depth goes as r^2
+// gives exactly A proportional to (h - floor). It is calibrated on the one
+// measurement available:
+//
+//     V(h) = capacity * (h - floor)^2 / ((spill - floor)^2 - (surface - floor)^2)
+//
+// WHAT THAT PINS EXACTLY, and it is more than it looks:
+//
+//   * V(spill) - V(surface) == capacity, to the unit and not approximately.
+//     Both sides are floors of values differing by the integer `capacity`, so
+//     the floors differ by exactly `capacity`. This is the number that decides
+//     WHEN a lake spills -- `BasinLedger::capacityToSpillUnits` -- so the
+//     spill threshold is baked truth, never modelled.
+//   * The three levels floor / surface / spill are the wire's own.
+//   * V(floor) == 0 and the pair volume<->level are exact inverses of each
+//     other, the same contract `BasinHypsometry` holds.
+//
+// WHAT IT DOES NOT PIN: where the surface sits PART WAY between the equilibrium
+// and the sill. That is interpolated, and the size of the error is a fact worth
+// measuring rather than hand-waving. `test_basinledger.cpp` walks the whole
+// headroom on two synthetic basins and compares stage against the client
+// hypsometry cell by cell:
+//
+//   * paraboloid bowl (A(h) linear, the modelled case): worst 13 mm over a
+//     3.99 m stage range -- 0.33%.
+//   * stepped flat-bottomed bowl (A(h) a step, the worst case for this model):
+//     worst 31 mm over a 450 mm range -- 6.9%.
+//
+// Both agree EXACTLY at the two ends, because both ends are pinned. Note also
+// that the two curves disagree about the ABSOLUTE volume held at equilibrium
+// (7% on the paraboloid) while agreeing about the LEVEL: what sets a stage is
+// the curve's slope near the surface -- the lake's area -- not its integral
+// from the floor, and the ledger's authority is a DELTA against equilibrium
+// precisely so the absolute never has to be right.
+//
+// -----------------------------------------------------------------------
+// IDENTITY, AND THE UNION RULE
+// -----------------------------------------------------------------------
+// A v2 row's `globalId` is a PACKING of the basin's floor cell in absolute
+// world pixels, not a hash -- so it is both a name and an address, and this
+// table uses it as both: given a key, `globalIdWorldX/Y` says which tile to go
+// and read the row from, with no registry to have been populated first.
+//
+// Two tiles that both register one physical basin write the same id, WHERE
+// THEIR PADDED SURFACES AGREE OVER THE OVERLAP -- which the apron makes almost
+// always true and does not guarantee (~1.05% blind spot, measured at bake).
+// So, exactly as `tile_codec.py` instructs, matching ids are the FAST PATH and
+// the fallback is "world bboxes overlap AND spills agree to within one
+// millimetre" -- one millimetre being the wire's own LSB for the field, since
+// `spill_mm` is `int(round(spill_m * 1000))` and two independent measurements
+// of one saddle can differ by a rounding step and by nothing else.
+//
+// CAPACITY IS NOT SUMMED ACROSS MEMBER ROWS. Each tile's row describes the
+// WHOLE component (its padded window saw the whole basin), so two rows of one
+// spanning lake each report the lake's full capacity. Adding them would double
+// a lake's headroom, and it would do it only for lakes that cross a tile edge
+// -- the exact set of lakes that were broken before v2 and that nobody has a
+// baseline for. The fold takes the MAXIMUM and counts disagreements instead.
+
+// How far two rows' `spillMm` may differ and still be one lake. See above.
+inline constexpr int32_t kBasinSpillAgreeMm = 1;
+
+// The largest stage span a baked basin may claim, in mm: 1,048.576 m. No basin
+// in this world is 1 km deep (the deepest surveyed lake is 46 m and the whole
+// int16 elevation plane spans 6.5 km), and the number is an ARITHMETIC bound
+// rather than a taste -- it is what holds span^2 under 1.1e12 so the curve
+// evaluation cannot reach its saturating guards on any real row. A row past it
+// is REFUSED and counted, not clamped: a clamped geometry is a lake at a
+// plausible wrong level, which is the failure the whole conservation note at
+// the top of this file exists to prevent.
+inline constexpr int32_t kBasinMaxSpanMm = 1 << 20;
+
+// Tiles scanned per axis when gathering a spanning component. 16 tiles is 245
+// km of lake at the shipped 15.36 km stride; a row claiming more than that is
+// corrupt, and the scan is truncated and counted rather than allowed to walk
+// the world one rowsForTile() at a time.
+inline constexpr int32_t kBasinUnionMaxTilesPerAxis = 16;
+
+// One physical lake, folded from every v2 row that describes it.
+struct BakedBasin {
+    BasinId id = kNoBasin; //: the CANONICAL key: the smallest member globalId
+    int32_t floorMm = 0;
+    int32_t equilibriumMm = 0;
+    int32_t spillMm = 0;
+    //: `capacity_l` in ledger units. EXACT: a litre is 1e6 mm^3 is one 10 cm
+    //: voxel is `kBasinUnitsPerLitre` units, so this conversion rounds nothing.
+    int64_t capacityUnits = 0;
+    //: `worldOutletX/Y` in world VOXEL coords -- the TRUE saddle. `outletX/Y`
+    //: is clamped into its own tile and is a lie for a basin that spills out of
+    //: one, which is why the spillway reads this and never that.
+    int64_t outletVx = 0, outletVy = 0;
+    uint32_t memberRows = 0; //: rows folded in; > 1 means the union rule fired
+    bool spanning = false;   //: any member set kBasinSpanCrossesTile
+
+    bool valid() const {
+        return id.valid() && floorMm <= equilibriumMm && equilibriumMm <= spillMm &&
+               int64_t(spillMm) - int64_t(floorMm) <= int64_t(kBasinMaxSpanMm);
+    }
+
+    // V(h) per "THE CURVE" above. Saturates at the sill, exactly as
+    // IBasinCapacityProvider::volumeAtLevelUnits requires.
+    int64_t unitsAtLevel(int32_t levelMm) const {
+        const int64_t ts = int64_t(spillMm) - int64_t(floorMm);
+        const int64_t te = int64_t(equilibriumMm) - int64_t(floorMm);
+        if (ts <= 0 || capacityUnits <= 0) return 0;
+        const int64_t d = ts * ts - te * te; // bounded by kBasinMaxSpanMm^2
+        // d == 0 is a lake ALREADY at its sill (surface == spill, the
+        // overflowing kind). Its headroom is zero, every credit spills, and a
+        // flat zero curve is the honest description of a container with no
+        // room -- not a degenerate case needing its own branch downstream.
+        if (d <= 0) return 0;
+        const int64_t t = clampi64(levelMm, floorMm, spillMm) - int64_t(floorMm);
+        return curveUnits(capacityUnits, t, d);
+    }
+
+    // The exact inverse of THIS function -- the highest millimetre whose volume
+    // is <= `units` -- by binary search on the millimetre axis, for the same
+    // reason BasinHypsometry does it that way: inverting the closed form would
+    // need a square root, and a rounded square root is not the inverse of a
+    // floored forward map. ~20 iterations, each a handful of integer ops.
+    int32_t levelAtUnits(int64_t units) const {
+        if (units <= 0) return floorMm;
+        if (units >= unitsAtLevel(spillMm)) return spillMm;
+        int64_t lo = floorMm, hi = spillMm;
+        while (lo < hi) {
+            const int64_t mid = lo + (hi - lo + 1) / 2;
+            if (unitsAtLevel(int32_t(mid)) <= units) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return int32_t(lo);
+    }
+
+private:
+    // floor(c * t * t / d), non-negative, SATURATING.
+    //
+    // Split rather than written out, because c*t*t genuinely does not fit: the
+    // largest capacity the encoder will accept is 1.96e15 litres = 5e17 units,
+    // and t^2 reaches 1.1e12, so the naive product is 1e29 -- gone from int64
+    // eleven orders of magnitude over. The identity used is exact:
+    // c == q*d + r, so c*t*t/d == q*t*t + (r*t*t)/d, and the second term is
+    // split the same way once more so no intermediate ever holds c*t*t.
+    static int64_t curveUnits(int64_t c, int64_t t, int64_t d) {
+        if (c <= 0 || t <= 0 || d <= 0) return 0;
+        const int64_t q = c / d, r = c % d;
+        const int64_t whole = satMulNonNeg(satMulNonNeg(q, t), t);
+        const int64_t rt = satMulNonNeg(r, t); // r < d <= span^2, t <= span
+        const int64_t frac =
+            satAddNonNeg(satMulNonNeg(rt / d, t), satMulNonNeg(rt % d, t) / d);
+        return satAddNonNeg(whole, frac);
+    }
+};
+
+// What the v2 table needs from the world: the rows of a named tile, or nullptr
+// when that tile is not resident. An interface for the same reason
+// `IBasinTerrain` is one -- a streamed sampler and a synthetic fixture -- and
+// deliberately NOT a "give me every loaded tile" enumeration: a component is
+// gathered from the tiles its own world bbox names, so the cost is a function
+// of the lake and not of how much world is in memory.
+class IBasinTableV2 {
+public:
+    virtual ~IBasinTableV2() = default;
+
+    // Fine-tile pixel pitch in mm (1875 on the shipped tier).
+    virtual int32_t pixelSizeMm() const = 0;
+    // Grid stride in fine pixels; 0 when no tile is resident yet, which makes
+    // every resolution REFUSE rather than address the wrong tile.
+    virtual uint32_t tilePixels() const = 0;
+    // Borrowed for the duration of the call. nullptr means NOT RESIDENT, which
+    // is a different fact from an empty vector ("surveyed, holds nothing").
+    virtual const std::vector<BasinEntry>* rowsForTile(int32_t tx, int32_t ty) = 0;
+};
+
+// The merged v2 basin table: global-id keying, the union rule, and the
+// component cache the baked provider reads.
+class BakedBasinTable {
+public:
+    // Two rows now known to be one lake. Emitted when a NEIGHBOUR TILE ARRIVES
+    // and the union rule merges a component that was already keyed under its
+    // own id -- so a host that has credited water under `from` must move it to
+    // `into` (`BasinLedger::mergeAccount`) or that water goes to a basin
+    // nothing asks about again.
+    struct Merge {
+        BasinId from, into;
+    };
+
+    explicit BakedBasinTable(IBasinTableV2& src) : src_(&src) {}
+
+    // The key a row belongs under, WITHOUT building anything: the alias map if
+    // this id has already been folded into a component, otherwise the row's own
+    // global id. Const and allocation-free on purpose -- this is what the DRAWN
+    // path calls (`BasinLedgerDatumSource`), and a render sweep must not be
+    // able to pull neighbour tiles in behind the caller's back.
+    BasinId keyFor(int32_t tx, int32_t ty, const BasinEntry& row) const {
+        if (!row.hasV2()) return BasinId::fromTile(tx, ty, row.basinId);
+        const BasinId self = BasinId::fromGlobal(row.globalId);
+        // A v2 row whose id the ledger's key space refuses (0, or bit 63 set)
+        // is a malformed row, not a reason to lose the lake: it falls back to
+        // its v1 tile-local key and works on the client curve.
+        if (!self.valid()) return BasinId::fromTile(tx, ty, row.basinId);
+        const auto it = aliases_.find(self.v);
+        return it == aliases_.end() ? self : it->second;
+    }
+
+    // The same question on the CREDIT path, where building is allowed and
+    // wanted: an account must be opened under the canonical key or the drawn
+    // path will not find it.
+    BasinId resolveKeyFor(int32_t tx, int32_t ty, const BasinEntry& row) {
+        const BasinId k = keyFor(tx, ty, row);
+        if (!k.valid() || k.isTileLocal()) return k;
+        resolve(k);
+        return keyFor(tx, ty, row);
+    }
+
+    // The folded component for a v2 key, building it on first ask. nullptr when
+    // it cannot be resolved -- and a failure is NOT cached, for exactly the
+    // reason `ClientHypsometryProvider::curveFor` does not cache one: almost
+    // every failure is "that tile is not streamed in yet", a fact about this
+    // instant and not about the basin.
+    const BakedBasin* resolve(BasinId id) {
+        if (!id.valid() || id.isTileLocal()) return nullptr;
+        const auto known = comps_.find(canonical(id));
+        if (known != comps_.end()) return &known->second;
+        if (!build(id)) {
+            ++unresolved_;
+            return nullptr;
+        }
+        const auto it = comps_.find(canonical(id));
+        return it == comps_.end() ? nullptr : &it->second;
+    }
+
+    // Folds every v2 row of one tile, which is what turns a newly streamed
+    // neighbour into the merges below instead of leaving half a lake keyed on
+    // its own. Returns the rows it looked at.
+    size_t ingestTile(int32_t tx, int32_t ty) {
+        const std::vector<BasinEntry>* rows = src_->rowsForTile(tx, ty);
+        if (rows == nullptr) return 0;
+        for (const BasinEntry& r : *rows) {
+            if (!r.hasV2()) continue;
+            const BasinId self = BasinId::fromGlobal(r.globalId);
+            if (self.valid()) resolve(self);
+        }
+        return rows->size();
+    }
+
+    // Hands the caller the re-keyings it owes and clears them. Draining and
+    // ignoring is a silent water leak, which is why this empties the queue
+    // rather than exposing it: a caller that took the list has taken the debt.
+    std::vector<Merge> drainMerges() {
+        std::vector<Merge> out;
+        out.swap(merges_);
+        return out;
+    }
+
+    void forgetAll() {
+        comps_.clear();
+        aliases_.clear();
+        merges_.clear();
+    }
+
+    // --- diagnostics: every one a ran-flag as much as a count ---------------
+    size_t componentCount() const { return comps_.size(); }
+    uint64_t componentsBuilt() const { return built_; }
+    uint64_t spanningComponents() const { return spanning_; }
+    // Unions made by the BBOX+SPILL fallback rather than by matching ids, i.e.
+    // the apron blind spot actually firing. Expected small and non-zero; a
+    // sudden climb means the two tiles' padded surfaces stopped agreeing.
+    uint64_t fallbackUnions() const { return fallbackUnions_; }
+    // Member rows of one component whose capacities differ. Should be zero:
+    // every row of a component reports the WHOLE component's capacity, so a
+    // disagreement means one tile saw a different lake than its neighbour did.
+    uint64_t capacityDisagreements() const { return capacityDisagreements_; }
+    // Rows refused for impossible geometry (see kBasinMaxSpanMm).
+    uint64_t refusedRows() const { return refusedRows_; }
+    // Component gathers cut short by kBasinUnionMaxTilesPerAxis.
+    uint64_t truncatedScans() const { return truncatedScans_; }
+    uint64_t unresolvedBasins() const { return unresolved_; }
+
+private:
+    // One row, named by where it lives rather than by what it says -- the only
+    // key under which two rows of one spanning lake are distinct.
+    struct RowRef {
+        int32_t tx, ty;
+        uint32_t idx;
+        friend bool operator==(RowRef, RowRef) = default;
+    };
+
+    static int32_t idWorldX(uint64_t gid) {
+        return int32_t(int64_t((gid >> 31) & 0x7FFFFFFFull) - kBasinIdAxisBias);
+    }
+    static int32_t idWorldY(uint64_t gid) {
+        return int32_t(int64_t(gid & 0x7FFFFFFFull) - kBasinIdAxisBias);
+    }
+
+    BasinId canonical(BasinId id) const {
+        const auto it = aliases_.find(id.v);
+        return it == aliases_.end() ? id : it->second;
+    }
+
+    static bool bboxesOverlap(const BasinEntry& r, int32_t x0, int32_t y0, int32_t x1,
+                              int32_t y1) {
+        return r.worldX0 <= x1 && r.worldX1 >= x0 && r.worldY0 <= y1 && r.worldY1 >= y0;
+    }
+
+    bool build(BasinId seedId) {
+        const uint32_t tilePx = src_->tilePixels();
+        const int64_t pxMm = src_->pixelSizeMm();
+        if (tilePx == 0 || pxMm <= 0) return false;
+        // THE ID IS AN ADDRESS: it packs the basin's floor cell, so the tile to
+        // read the seed row from is arithmetic rather than a lookup, and no
+        // registry has to have been populated first.
+        if ((seedId.v & kBasinIdTag) == 0) return false;
+        const int64_t fx = idWorldX(seedId.v), fy = idWorldY(seedId.v);
+        uint32_t seedIdx = 0;
+        const BasinEntry* seed =
+            rowWithId(int32_t(floorDiv(fx, int64_t(tilePx))),
+                      int32_t(floorDiv(fy, int64_t(tilePx))), seedId.v, seedIdx);
+        if (seed == nullptr) return false;
+
+        BakedBasin comp;
+        comp.floorMm = seed->floorMm;
+        comp.equilibriumMm = seed->surfaceMm;
+        comp.spillMm = seed->spillMm;
+        comp.capacityUnits = basinUnitsFromLitres(seed->capacityLitres);
+        comp.memberRows = 1;
+        comp.spanning = seed->crossesTile();
+        int32_t bx0 = seed->worldX0, by0 = seed->worldY0;
+        int32_t bx1 = seed->worldX1, by1 = seed->worldY1;
+        uint64_t minGid = seedId.v;
+        int32_t outPx = seed->worldOutletX, outPy = seed->worldOutletY;
+
+        // Gather. Only tiles the component's own bbox names are read, and only
+        // ones already resident -- a lake is never a reason to fetch.
+        //
+        // TWO DIFFERENT DEDUP KEYS, and conflating them was a real bug caught by
+        // `basin_v2_spanning_lake_is_one_ledger_entry`: `members` holds the
+        // distinct GLOBAL IDS (that is what the alias map is built from), but
+        // the fast path is exactly the case where two SEPARATE ROWS carry the
+        // SAME id. Deduplicating rows by id therefore drops the partner row of
+        // every spanning lake -- the one thing this whole path exists for.
+        std::vector<uint64_t> members{seedId.v};
+        std::vector<RowRef> seen{RowRef{int32_t(floorDiv(fx, int64_t(tilePx))),
+                                       int32_t(floorDiv(fy, int64_t(tilePx))), seedIdx}};
+        for (int pass = 0; pass < 4; ++pass) {
+            const bool grew =
+                gather(tilePx, members, seen, comp, bx0, by0, bx1, by1, minGid, outPx, outPy);
+            if (!grew) break;
+        }
+
+        comp.id = BasinId::fromGlobal(minGid);
+        // The fold's ordering guarantee, stated as an assertion rather than an
+        // assumption: floor <= surface <= spill has to survive taking the three
+        // from possibly different member rows.
+        comp.equilibriumMm = int32_t(clampi64(comp.equilibriumMm, comp.floorMm, comp.spillMm));
+        if (!comp.valid()) {
+            ++refusedRows_;
+            return false;
+        }
+        comp.outletVx = floorDiv(int64_t(outPx) * pxMm + pxMm / 2, int64_t(kVoxelSizeMm));
+        comp.outletVy = floorDiv(int64_t(outPy) * pxMm + pxMm / 2, int64_t(kVoxelSizeMm));
+
+        // RE-KEYING. Any member that already had a component of its own is now
+        // known to be this one; the old entry goes and the host is told, so the
+        // water credited under it can follow.
+        for (uint64_t gid : members) {
+            const auto old = comps_.find(BasinId{gid});
+            if (old != comps_.end() && !(BasinId{gid} == comp.id)) {
+                comps_.erase(old);
+                merges_.push_back(Merge{BasinId{gid}, comp.id});
+            }
+            const auto alias = aliases_.find(gid);
+            if (alias != aliases_.end() && !(alias->second == comp.id)) {
+                merges_.push_back(Merge{alias->second, comp.id});
+            }
+            aliases_[gid] = comp.id;
+        }
+        if (comp.memberRows > 1) ++spanning_;
+        ++built_;
+        comps_[comp.id] = comp;
+        return true;
+    }
+
+    // One sweep over the tiles the current bbox covers, folding in any row that
+    // the union rule claims. Returns whether the component grew, so `build`
+    // can sweep again over the wider bbox a new member may have opened up.
+    bool gather(uint32_t tilePx, std::vector<uint64_t>& members, std::vector<RowRef>& seen,
+                BakedBasin& comp, int32_t& bx0, int32_t& by0, int32_t& bx1, int32_t& by1,
+                uint64_t& minGid, int32_t& outPx, int32_t& outPy) {
+        const int64_t stride = int64_t(tilePx);
+        int64_t tx0 = floorDiv(int64_t(bx0), stride), tx1 = floorDiv(int64_t(bx1), stride);
+        int64_t ty0 = floorDiv(int64_t(by0), stride), ty1 = floorDiv(int64_t(by1), stride);
+        if (tx1 - tx0 >= kBasinUnionMaxTilesPerAxis || ty1 - ty0 >= kBasinUnionMaxTilesPerAxis) {
+            ++truncatedScans_;
+            tx1 = tx0 + kBasinUnionMaxTilesPerAxis - 1;
+            ty1 = ty0 + kBasinUnionMaxTilesPerAxis - 1;
+        }
+        bool grew = false;
+        for (int64_t ty = ty0; ty <= ty1; ++ty) {
+            for (int64_t tx = tx0; tx <= tx1; ++tx) {
+                const std::vector<BasinEntry>* rows =
+                    src_->rowsForTile(int32_t(tx), int32_t(ty));
+                if (rows == nullptr) continue;
+                for (size_t i = 0; i < rows->size(); ++i) {
+                    const BasinEntry& r = (*rows)[i];
+                    if (!r.hasV2() || r.globalId == 0) continue;
+                    const RowRef ref{int32_t(tx), int32_t(ty), uint32_t(i)};
+                    bool have = false;
+                    for (const RowRef& s : seen) {
+                        if (s == ref) {
+                            have = true;
+                            break;
+                        }
+                    }
+                    if (have) continue;
+                    bool sameId = false;
+                    for (uint64_t m : members) {
+                        if (m == r.globalId) {
+                            sameId = true;
+                            break;
+                        }
+                    }
+                    const int64_t spillGap = int64_t(r.spillMm) - int64_t(comp.spillMm);
+                    const bool fallback = !sameId && bboxesOverlap(r, bx0, by0, bx1, by1) &&
+                                          (spillGap <= int64_t(kBasinSpillAgreeMm) &&
+                                           -spillGap <= int64_t(kBasinSpillAgreeMm));
+                    if (!sameId && !fallback) continue;
+                    if (fallback) ++fallbackUnions_;
+                    seen.push_back(ref);
+
+                    // THE FOLD. Capacity is the MAX and never the sum: each row
+                    // already describes the whole component (see the header
+                    // note), so summing would double a spanning lake's
+                    // headroom. A disagreement is a fact worth a counter.
+                    const int64_t cap = basinUnitsFromLitres(r.capacityLitres);
+                    if (cap != comp.capacityUnits) ++capacityDisagreements_;
+                    if (cap > comp.capacityUnits) comp.capacityUnits = cap;
+                    // Floor and sill are the DEEPEST and the LOWEST seen: a
+                    // tile that can only see part of the pool reports a floor
+                    // no deeper than the truth, never deeper.
+                    if (r.floorMm < comp.floorMm) comp.floorMm = r.floorMm;
+                    if (r.spillMm < comp.spillMm) comp.spillMm = r.spillMm;
+                    if (r.surfaceMm < comp.equilibriumMm) comp.equilibriumMm = r.surfaceMm;
+                    if (r.worldX0 < bx0) bx0 = r.worldX0;
+                    if (r.worldY0 < by0) by0 = r.worldY0;
+                    if (r.worldX1 > bx1) bx1 = r.worldX1;
+                    if (r.worldY1 > by1) by1 = r.worldY1;
+                    if (r.globalId < minGid) {
+                        // The canonical member also supplies the outlet, so the
+                        // saddle a component spills over does not depend on
+                        // which tile happened to stream in first.
+                        minGid = r.globalId;
+                        outPx = r.worldOutletX;
+                        outPy = r.worldOutletY;
+                    }
+                    comp.spanning = comp.spanning || r.crossesTile();
+                    ++comp.memberRows;
+                    if (!sameId) members.push_back(r.globalId);
+                    grew = true;
+                }
+            }
+        }
+        return grew;
+    }
+
+    const BasinEntry* rowWithId(int32_t tx, int32_t ty, uint64_t gid, uint32_t& outIdx) {
+        const std::vector<BasinEntry>* rows = src_->rowsForTile(tx, ty);
+        if (rows == nullptr) return nullptr;
+        for (size_t i = 0; i < rows->size(); ++i) {
+            if ((*rows)[i].hasV2() && (*rows)[i].globalId == gid) {
+                outIdx = uint32_t(i);
+                return &(*rows)[i];
+            }
+        }
+        return nullptr;
+    }
+
+    IBasinTableV2* src_;
+    std::unordered_map<BasinId, BakedBasin, BasinIdHash> comps_;
+    std::unordered_map<uint64_t, BasinId> aliases_;
+    std::vector<Merge> merges_;
+    uint64_t built_ = 0;
+    uint64_t spanning_ = 0;
+    uint64_t fallbackUnions_ = 0;
+    uint64_t capacityDisagreements_ = 0;
+    uint64_t refusedRows_ = 0;
+    uint64_t truncatedScans_ = 0;
+    uint64_t unresolved_ = 0;
+};
+
+// The v2 capacity provider: the same interface the ledger already talks to,
+// answered from an 80-byte row instead of a 2.5M-cell walk.
+class BakedCapacityProvider final : public IBasinCapacityProvider {
+public:
+    explicit BakedCapacityProvider(BakedBasinTable& table) : table_(&table) {}
+
+    bool volumeAtLevelUnits(BasinId id, int32_t levelMm, int64_t& outUnits) override {
+        const BakedBasin* b = resolve(id);
+        if (b == nullptr) return false;
+        outUnits = b->unitsAtLevel(levelMm);
+        return true;
+    }
+
+    bool levelAtVolumeUnits(BasinId id, int64_t units, int32_t& outLevelMm) override {
+        const BakedBasin* b = resolve(id);
+        if (b == nullptr) return false;
+        outLevelMm = b->levelAtUnits(units);
+        return true;
+    }
+
+    bool levelsMm(BasinId id, int32_t& outFloorMm, int32_t& outEquilibriumMm,
+                  int32_t& outSpillMm) override {
+        const BakedBasin* b = resolve(id);
+        if (b == nullptr) return false;
+        outFloorMm = b->floorMm;
+        outEquilibriumMm = b->equilibriumMm;
+        outSpillMm = b->spillMm;
+        return true;
+    }
+
+    // `worldOutletX/Y`, NEVER `outletX/Y`: the u16 pair is clamped into its own
+    // tile, so for a lake that spills across a tile edge it names a cell on the
+    // seam rather than the saddle. A spillway faucet placed there feeds the
+    // wrong valley, which is the one spill failure that looks like data.
+    bool outletVoxel(BasinId id, int64_t& outVx, int64_t& outVy) override {
+        const BakedBasin* b = resolve(id);
+        if (b == nullptr) return false;
+        outVx = b->outletVx;
+        outVy = b->outletVy;
+        return true;
+    }
+
+    uint64_t unresolvedBasins() const override { return unresolved_; }
+    const BakedBasinTable& table() const { return *table_; }
+
+private:
+    const BakedBasin* resolve(BasinId id) {
+        const BakedBasin* b = table_->resolve(id);
+        if (b == nullptr) ++unresolved_;
+        return b;
+    }
+
+    BakedBasinTable* table_;
+    uint64_t unresolved_ = 0;
+};
+
+// v1 and v2 side by side, dispatched on the key's OWN TAG BIT.
+//
+// Not a mode switch, and that is the point: a session streams v1 and v2 tiles
+// at the same time (a partially re-baked cache is the normal state), and
+// `BasinId` already distinguishes the two key spaces by construction. So the
+// question "which provider" never needs a flag, a version probe, or a guess --
+// it is `id.isTileLocal()`, and a wrong answer is not expressible.
+class BasinCapacityRouter final : public IBasinCapacityProvider {
+public:
+    BasinCapacityRouter(IBasinCapacityProvider& tileLocal, IBasinCapacityProvider& global)
+        : v1_(&tileLocal), v2_(&global) {}
+
+    bool volumeAtLevelUnits(BasinId id, int32_t levelMm, int64_t& outUnits) override {
+        return pick(id).volumeAtLevelUnits(id, levelMm, outUnits);
+    }
+    bool levelAtVolumeUnits(BasinId id, int64_t units, int32_t& outLevelMm) override {
+        return pick(id).levelAtVolumeUnits(id, units, outLevelMm);
+    }
+    bool levelsMm(BasinId id, int32_t& outFloorMm, int32_t& outEquilibriumMm,
+                  int32_t& outSpillMm) override {
+        return pick(id).levelsMm(id, outFloorMm, outEquilibriumMm, outSpillMm);
+    }
+    bool outletVoxel(BasinId id, int64_t& outVx, int64_t& outVy) override {
+        return pick(id).outletVoxel(id, outVx, outVy);
+    }
+    uint64_t unresolvedBasins() const override {
+        return v1_->unresolvedBasins() + v2_->unresolvedBasins();
+    }
+
+private:
+    IBasinCapacityProvider& pick(BasinId id) const { return id.isTileLocal() ? *v1_ : *v2_; }
+    IBasinCapacityProvider* v1_;
+    IBasinCapacityProvider* v2_;
+};
+
+// The ledger key for one baked row, and the ONE place that decision is made.
+//
+// v2 rows key GLOBALLY -- that is the whole point of the global id, and keying
+// them per tile would give a spanning lake two accounts that each hold half its
+// water and each draw at their own level. `table` may be null (no v2 path
+// wired), in which case a v2 row keys under its own id with no union applied.
+inline BasinId basinKeyFor(int32_t tx, int32_t ty, const BasinEntry& row,
+                           const BakedBasinTable* table) {
+    if (row.hasV2()) {
+        if (table != nullptr) return table->keyFor(tx, ty, row);
+        const BasinId g = BasinId::fromGlobal(row.globalId);
+        if (g.valid()) return g;
+    }
+    return BasinId::fromTile(tx, ty, row.basinId);
+}
+
+// ---------------------------------------------------------------------------
 // THE SPILLWAY
 // ---------------------------------------------------------------------------
 //
@@ -901,6 +1575,32 @@ public:
         capacity_ = keep;
     }
 
+    // Moves one basin's whole delta onto another key and forgets the first.
+    //
+    // WHAT CALLS THIS: the v2 union rule, when a neighbour tile streams in and
+    // two rows that had been keyed separately turn out to be one lake
+    // (`BakedBasinTable::drainMerges`). Without it, the water credited under
+    // the losing key stays in an account nothing asks about again -- present in
+    // sumOfDeltas(), invisible in the world, and undetectable by conserves().
+    //
+    // NO UNITS ARE CREATED OR DESTROYED, they change name: the running totals
+    // are deliberately untouched and conserves() still holds. Returns false
+    // when there was nothing to move.
+    bool mergeAccount(BasinId from, BasinId into) {
+        if (!from.valid() || !into.valid() || from == into) return false;
+        const auto it = accounts_.find(from);
+        if (it == accounts_.end()) return false;
+        const int64_t moved = it->second.delta;
+        accounts_.erase(it);
+        ++merges_;
+        if (moved == 0) return false;
+        Account& a = accounts_[into];
+        a.delta += moved;
+        a.levelValid = false;
+        return true;
+    }
+    uint64_t accountMerges() const { return merges_; }
+
     // Invalidates the cached level of every basin -- what a host calls when the
     // capacity provider's curves have been rebuilt underneath it (a tile
     // reloaded, a v2 table arriving).
@@ -971,6 +1671,7 @@ private:
     uint64_t unresolvedDebits_ = 0;
     uint64_t unresolvedLevels_ = 0;
     uint64_t spillEvents_ = 0;
+    uint64_t merges_ = 0;
 };
 
 // Drains the spill queue through `inject`, which must return how many of the
@@ -1102,16 +1803,25 @@ struct BasinLedgerState {
 // start reading the ledger's level instead of the wire's.
 class BasinLedgerDatumSource final : public IBasinDatumSource {
 public:
-    explicit BasinLedgerDatumSource(BasinLedger& ledger) : ledger_(&ledger) {}
+    // `table` is optional and borrowed. With one, a v2 row keys GLOBALLY and
+    // through the union rule, so both halves of a lake that crosses a tile edge
+    // read the ONE account and rise together; without one, every row keys per
+    // tile exactly as it did before v2.
+    explicit BasinLedgerDatumSource(BasinLedger& ledger, const BakedBasinTable* table = nullptr)
+        : ledger_(&ledger), table_(table) {}
 
     int32_t basinDatumMm(int32_t tx, int32_t ty, const BasinEntry& baked) override {
-        const BasinId id = BasinId::fromTile(tx, ty, baked.basinId);
+        // NON-BUILDING on purpose (see BakedBasinTable::keyFor): this is the
+        // drawn path, and a render sweep must not be able to fold neighbour
+        // tiles into components behind the caller's back.
+        const BasinId id = basinKeyFor(tx, ty, baked, table_);
         if (!id.valid()) return baked.surfaceMm;
         return ledger_->levelMmFor(id, baked.surfaceMm);
     }
 
 private:
     BasinLedger* ledger_;
+    const BakedBasinTable* table_ = nullptr;
 };
 
 // `IBasinTerrain` over a streamed `FineTileSampler`.
@@ -1196,6 +1906,36 @@ private:
 
     FineTileSampler* tiles_;
     uint64_t apronMisses_ = 0;
+};
+
+// `IBasinTableV2` over a streamed `FineTileSampler`: the v2 rows of a named
+// tile, and nothing else.
+//
+// IT NEVER FETCHES. `findTile` is a pure lookup, so a component is gathered
+// from whichever of its tiles are already resident and grows -- through
+// `BakedBasinTable::drainMerges` -- when the rest arrive. The alternative,
+// pulling a neighbour tile in to complete a lake, would make asking a basin's
+// level a streaming operation, which is exactly the coupling `basinsResident()`
+// exists to let a caller avoid.
+class FineTileBasinTableV2 final : public IBasinTableV2 {
+public:
+    explicit FineTileBasinTableV2(FineTileSampler& tiles) : tiles_(&tiles) {}
+
+    int32_t pixelSizeMm() const override { return tiles_->pixelSizeMm(); }
+    uint32_t tilePixels() const override { return tiles_->tileSize(); }
+
+    const std::vector<BasinEntry>* rowsForTile(int32_t tx, int32_t ty) override {
+        const FineTile* t = tiles_->findTile(tx, ty);
+        // `basinsResident()` and not just `hasBasins()`: on a sliced tile the
+        // table may not have been fetched, and an unfetched table reads
+        // identically to a tile with no lakes. Answering nullptr keeps that
+        // "not downloaded" and stops it becoming "no basin here".
+        if (t == nullptr || !t->hasBasins() || !t->basinsResident()) return nullptr;
+        return &t->basins();
+    }
+
+private:
+    FineTileSampler* tiles_;
 };
 
 // `IBakedWaterSource` (rivernet.h) over a streamed `FineTileSampler`: the water

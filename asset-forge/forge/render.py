@@ -105,7 +105,17 @@ def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
     """
     from .spec import get  # local import keeps this module free of spec at load
 
-    if get(spec, "kind") == "rock":
+    kind = get(spec, "kind")
+    if kind in ("grass", "reed", "flower"):
+        h = float(get(spec, "height_m"))
+        head = float(get(spec, "tuft.head_m")) if get(spec, "tuft.head") != "none" else 0.0
+        # An arcing stem reaches out roughly as far as it would have gone up.
+        reach = float(get(spec, "tuft.spread_m")) + h * float(get(spec, "tuft.arc")) * 0.8
+        span = 2.0 * (reach + head) + 0.1
+        return (int(span / voxel_m), int(span / voxel_m),
+                int((h * 1.1 + head) / voxel_m))
+
+    if kind == "rock":
         size = float(get(spec, "rock.size_m"))
         span = size * max(1.0, float(get(spec, "rock.elongate"))) * (
             1.0 + float(get(spec, "rock.rubble")) * 1.6) + 0.4

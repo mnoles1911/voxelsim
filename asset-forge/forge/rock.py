@@ -48,10 +48,28 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
     """
     target = float(get(spec, "rock.size_m"))
     seed = int(rng.integers(1 << 62))
-    scale, grid = 1.0, None
-    for _ in range(3):
+
+    # Find the scale on a COARSE copy first. The correction is a ratio of
+    # lengths and barely depends on the lattice, so searching for it at the
+    # authored size means paying for a 9 m boulder three times over. Coarse
+    # search plus one real build is the same answer for a third of the work.
+    probe_m = max(voxel_m, 0.10)
+    scale = 1.0
+    if probe_m > voxel_m * 1.01:
+        for _ in range(3):
+            probe = _build_once(spec, np.random.default_rng(seed), probe_m, scale)
+            got = max(_extent_m(probe))
+            if got <= 0.0:
+                break
+            err = target / got
+            if 0.95 <= err <= 1.05:
+                break
+            scale = min(4.0, max(0.3, scale * err))
+
+    grid = None
+    for _ in range(3 if probe_m <= voxel_m * 1.01 else 2):
         grid = _build_once(spec, np.random.default_rng(seed), voxel_m, scale)
-        got = max(d for d in _extent_m(grid))
+        got = max(_extent_m(grid))
         if got <= 0.0:
             break
         err = target / got
@@ -123,14 +141,26 @@ def _build_once(spec: dict, rng: np.random.Generator, voxel_m: float,
              + ((gz - c[2]) / rz) ** 2)
         np.maximum(field, 1.0 - np.sqrt(q), out=field)
 
+    relief = _surface_noise((nx, ny, nz), 1.0, int(rng.integers(1 << 30)))
     if rough > 0.0:
-        field += _surface_noise((nx, ny, nz), rough, int(rng.integers(1 << 30)))
+        field += relief * rough
 
     grid.data[field > 0.0] = mat
 
     # 2. faceting ------------------------------------------------------------
     if angular > 0.0 and facets > 0:
-        _facet(grid, rng, facets, angular)
+        # A fracture face is not a plane. Cutting with a true half-space gave
+        # perfectly flat faces, and on a large rock those faces are metres
+        # across -- the first 5-9 m boulders came out reading as cut gemstones
+        # rather than stone. Wobbling the cut turns each face into a broken
+        # surface.
+        #
+        # The SAME field does both jobs. Generating a second one doubled the
+        # slowest part of the build for a difference nobody could see, and a
+        # fracture following the same grain as the weathering is if anything the
+        # more physical of the two.
+        _facet(grid, rng, facets, angular,
+               relief * (max(1.5, min(nx, ny, nz) * 0.10) / 0.55))
 
     # 3. erosion -------------------------------------------------------------
     if erode > 0.0:
@@ -173,12 +203,11 @@ def _snap_axis(n: np.ndarray) -> np.ndarray:
 
 
 def _surface_noise(shape, rough: float, salt: int) -> np.ndarray:
-    """Low-frequency displacement, in units of the local radius.
+    """Surface displacement, in units of the local radius.
 
-    Two octaves: one at roughly a sixth of the rock for the big knuckles that
-    change the silhouette, one at half that wavelength for the smaller relief
-    that keeps a face from looking planed. Anything finer than that is noise per
-    voxel, which does not survive a 10 cm preview and looks like damage at 2 cm.
+    Three octaves: two sized to the rock, which set the silhouette, and one
+    sized to the voxel, which breaks up the stair-stepping. See the comment on
+    the octave table below for why the third is not optional.
     """
     try:
         from scipy import ndimage
@@ -187,15 +216,60 @@ def _surface_noise(shape, rough: float, salt: int) -> np.ndarray:
 
     span = max(shape)
     out = np.zeros(shape, np.float32)
-    for octave, weight in ((0.16, 0.68), (0.075, 0.32)):
-        sigma = max(0.9, span * octave)
+
+    # Two octaves scaled to the ROCK for silhouette, and one scaled to the
+    # VOXEL for surface break-up.
+    #
+    # The rock-relative pair alone is size-dependent in a way that only shows up
+    # on large stones: their wavelength is a fixed fraction of the body, so a
+    # 9 m boulder gets the same six undulations a 2 m one does, and between
+    # those six the surface is still a smooth curve showing clean concentric
+    # stair-steps. The whole point of this pass is to stop that happening, and
+    # on the first large boulders it did not, because the relief had grown with
+    # the rock while the terracing had not. A third octave a couple of voxels
+    # wide fixes it at every size, since terracing is a property of the lattice.
+    octaves = [(max(0.9, span * 0.16), 0.62), (max(0.9, span * 0.075), 0.28),
+               (1.7, 0.22)]
+    for k, (sigma, weight) in enumerate(octaves):
+        # Build the coarse octaves SMALL and stretch them, rather than blurring
+        # at full size. Their features are a sixth of the rock wide by
+        # construction, so nothing in the full-resolution field survives the
+        # blur anyway -- and blurring ten million cells with a sigma of thirty
+        # is most of a minute. A 9 m tor went from 41 seconds to nine on this.
+        # The voxel-scale octave has a small sigma already and stays full size.
+        step = max(1, int(sigma / 3.0))
+        small = tuple(max(4, s // step) for s in shape)
         n = ndimage.gaussian_filter(
-            rng_field(shape, salt ^ int(octave * 1000)).astype(np.float32), sigma=sigma)
+            rng_field(small, salt ^ (k * 7919)).astype(np.float32),
+            sigma=sigma / step)
         # Blurring collapses the range, so rescale each octave to [-1, 1] rather
         # than assuming it kept one.
         lo, hi = float(n.min()), float(n.max())
-        out += ((n - lo) / max(hi - lo, 1e-9) * 2.0 - 1.0) * weight
+        n = (n - lo) / max(hi - lo, 1e-9) * 2.0 - 1.0
+        if small != shape:
+            n = ndimage.zoom(n, [shape[i] / small[i] for i in range(3)], order=1)
+            # zoom lands within a voxel of the target; trim or edge-extend so the
+            # field is exactly grid-shaped.
+            n = _fit(n, shape)
+        out += n * weight
     return out * (rough * 0.55)
+
+
+def _occupied_box(occ: np.ndarray) -> tuple[slice, slice, slice]:
+    """Bounding box of the solid voxels, as slices."""
+    idx = [np.flatnonzero(occ.any(axis=tuple(a for a in range(3) if a != ax)))
+           for ax in range(3)]
+    return tuple(slice(int(i[0]), int(i[-1]) + 1) if i.size else slice(0, 0)
+                 for i in idx)
+
+
+def _fit(a: np.ndarray, shape) -> np.ndarray:
+    """Crop or edge-replicate `a` to exactly `shape`."""
+    if a.shape == tuple(shape):
+        return a
+    a = a[:shape[0], :shape[1], :shape[2]]
+    pad = [(0, max(0, shape[i] - a.shape[i])) for i in range(3)]
+    return np.pad(a, pad, mode="edge") if any(p[1] for p in pad) else a
 
 
 def _ellipsoid(grid: VoxelGrid, c, rx: float, ry: float, rz: float, mat: int) -> None:
@@ -216,7 +290,8 @@ def _ellipsoid(grid: VoxelGrid, c, rx: float, ry: float, rz: float, mat: int) ->
     block[d <= 1.0] = mat
 
 
-def _facet(grid: VoxelGrid, rng, facets: int, angular: float) -> None:
+def _facet(grid: VoxelGrid, rng, facets: int, angular: float,
+           wobble: np.ndarray | None = None) -> None:
     """Slice flat faces off the mass with half-space cuts.
 
     The cut depth is measured ALONG EACH NORMAL, against the mass that is
@@ -225,15 +300,25 @@ def _facet(grid: VoxelGrid, rng, facets: int, angular: float) -> None:
     short axis landed outside the stone and removed nothing. Every rock came out
     a smooth ellipsoid and the angularity slider did nothing at all.
     """
-    gx, gy, gz = np.meshgrid(np.arange(grid.shape[0]), np.arange(grid.shape[1]),
-                             np.arange(grid.shape[2]), indexing="ij")
+    # Work inside the solid's bounding box. Everything outside it is air that
+    # cannot be cut, and on a large rock the grid carries a margin for rubble
+    # and erosion that would otherwise be re-evaluated once per facet.
+    box = _occupied_box(grid.data != 0)
+    sub = grid.data[box]
+    wob = wobble[box] if wobble is not None else None
+    gx, gy, gz = np.meshgrid(
+        np.arange(box[0].start, box[0].stop, dtype=np.float32),
+        np.arange(box[1].start, box[1].stop, dtype=np.float32),
+        np.arange(box[2].start, box[2].stop, dtype=np.float32), indexing="ij")
+
     for i in range(facets):
-        occ = grid.data != 0
+        occ = sub != 0
         total = int(occ.sum())
         if total < 8:
             return
         xs, ys, zs = np.nonzero(occ)
-        centre = np.array([xs.mean(), ys.mean(), zs.mean()])
+        centre = np.array([xs.mean() + box[0].start, ys.mean() + box[1].start,
+                           zs.mean() + box[2].start])
 
         if i == 0 and angular > 0.35:
             # A flat top, deliberately, before anything random. It is the single
@@ -261,8 +346,17 @@ def _facet(grid: VoxelGrid, rng, facets: int, angular: float) -> None:
             # burial cut at z=0, turned every rock into a slanted wedge -- two
             # near-parallel faces and nothing left between them.
             frac *= 0.5
-        cut = float(np.quantile(d[occ], 1.0 - frac))
-        grid.data[occ & (d > cut)] = 0
+        # Quantile on a SAMPLE. Sorting a million projections eight times over
+        # is most of a second for a threshold that only has to be right to a
+        # fraction of a percent.
+        proj = d[occ]
+        if proj.size > 120_000:
+            proj = proj[::proj.size // 120_000]
+        cut = float(np.quantile(proj, 1.0 - frac))
+        # Wobble the plane so the face comes out broken rather than machined.
+        # The quantile is taken on the true plane, so the depth still means what
+        # it says; only the surface it leaves behind is roughened.
+        sub[occ & (d > cut + (wob if wob is not None else 0.0))] = 0
 
 
 def rng_field(shape, salt: int = 0) -> np.ndarray:

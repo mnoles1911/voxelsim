@@ -20,10 +20,17 @@ from typing import Any
 
 import numpy as np
 
-from . import materials, rasterize, rock as rocklib
+from . import ground as groundlib, materials, rasterize, rock as rocklib
 from .grid import VoxelGrid, dense_bytes
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
 from .spec import get, realize as spec_realize, spec_hash
+
+# Which generator a kind goes to. Everything not listed here grows a skeleton.
+BOULDER_KINDS = frozenset({"rock"})
+TUFT_KINDS = frozenset({"grass", "reed", "flower"})
+# Kinds with no branch structure, so the branch-shaped stats and the checks
+# that read them do not apply.
+BRANCHLESS = BOULDER_KINDS | TUFT_KINDS
 
 
 @dataclass
@@ -77,10 +84,13 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
     skel = None
     clumps = 0
 
-    if kind == "rock":
-        # No skeleton: a rock is accreted and carved, not grown.
+    if kind in BOULDER_KINDS or kind in TUFT_KINDS:
+        # No skeleton. A rock is accreted and carved rather than grown; a blade
+        # of grass does not branch, so there is nothing for space colonization
+        # to do. Both size their own grid from what they actually traced.
         t_grow = time.perf_counter()
-        grid = rocklib.build(live, rng, voxel_m)
+        gen = rocklib if kind in BOULDER_KINDS else groundlib
+        grid = gen.build(live, rng, voxel_m)
         need_mb = dense_bytes(grid.shape) / 1e6
         t_raster = time.perf_counter()
     else:
@@ -125,13 +135,24 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         ),
         "grid_mb": round(need_mb, 1),
         "extent_vox": tuple(int(v) for v in grid.shape),
+        # How many .vox models this needs: the format caps a model at 256
+        # voxels per axis, so anything larger is written as a scene of several.
+        "vox_models_needed": int(np.prod([
+            max(1, -(-int(v) // 256)) for v in grid.shape])),
         "voxels": grid.count(),
         "by_material": grid.histogram(),
         "ground_contact": rasterize.ground_contact(grid),
         "ms_grow": round((t_grow - t0) * 1e3, 1),
         "ms_raster": round((t_raster - t_grow) * 1e3, 1),
     }
-    if connectivity and kind != "rock":
+    if connectivity and kind in TUFT_KINDS:
+        # Ground cover has no wood, but "is this one piece?" is exactly the
+        # question that matters for it -- a tuft whose blades do not reach the
+        # root crown is a handful of floating threads.
+        attached = grid.component_fraction(None, connectivity=3)
+        stats["attached_frac"] = round(attached, 4)
+        stats["detached"] = int(round(stats["voxels"] * (1.0 - attached)))
+    elif connectivity and kind not in BRANCHLESS:
         wood_ids = {
             materials.resolve(get(live, "materials.bark")),
             materials.resolve(get(live, "materials.core")),
@@ -171,18 +192,21 @@ def health(tree: Asset) -> list[str]:
         problems.append(
             f"broken: {s['wood_detached']} wood voxels are not joined to the trunk"
         )
+    kind = s.get("kind", "tree")
     if s.get("detached", 0) > max(8, 0.01 * s["voxels"]):
-        problems.append(f"loose: {s['detached']:,} voxels float free of the tree")
+        problems.append(f"loose: {s['detached']:,} voxels float free of the asset")
     if s["ground_contact"] == 0:
         problems.append("floating: nothing touches the ground plane")
-    if s.get("kind", "tree") not in ("rock",) and s["max_order"] == 0:
+    if kind not in BRANCHLESS and s["max_order"] == 0:
         problems.append("bare: the trunk never branched")
-    if max(s["extent_vox"]) > 256:
-        problems.append(
-            f"large: {max(s['extent_vox'])} voxels on the long axis, over the 256 "
-            "limit for a single .vox model (export will split it)"
-        )
-    if (s.get("kind", "tree") not in ("rock",)
+    # Exceeding 256 voxels on an axis is NOT a problem and is no longer flagged.
+    # It used to be rare enough to be worth pointing at; at the 5 cm asset
+    # lattice most trees exceed it, the writer splits them and the selftest
+    # checks the round trip. Leaving it in `health` meant ten of forty-two
+    # species carried a permanent warning flag, which made "Keep all clean" skip
+    # every large tree -- a check that fires on the normal case trains you to
+    # ignore checks. The model count is in the stats instead.
+    if (kind not in BRANCHLESS
             and get(tree.spec, "foliage.enabled") and s["clumps"] == 0):
         problems.append("bald: foliage is on but no clump was placed")
     return problems

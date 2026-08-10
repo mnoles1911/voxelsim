@@ -1,0 +1,152 @@
+{
+  "biomes": {
+    "bare_rock": 0.0,
+    "beach": 0.0,
+    "desert": 0.0,
+    "grassland": 0.0,
+    "rainforest": 0.0,
+    "savanna": 0.0,
+    "taiga": 0.5,
+    "temperate_forest": 0.0,
+    "tundra_alpine": 1.0
+  },
+  "crown": {
+    "center_frac": 0.66,
+    "height_frac": 0.65,
+    "lean_deg": 0.0,
+    "lean_dir_deg": 0.0,
+    "points": 900,
+    "radius_m": 3.5,
+    "shape": "sphere",
+    "shell": 0.3,
+    "squash": 1.0
+  },
+  "foliage": {
+    "clump_jitter": 0.35,
+    "clump_radius_m": 0.65,
+    "coverage": 0.8,
+    "density": 0.6,
+    "droop_m": 0.15,
+    "enabled": true,
+    "min_order": 2,
+    "separation": 1.7,
+    "squash": 0.8
+  },
+  "frond": {
+    "count": 14,
+    "dead": 0.15,
+    "droop": 1.15,
+    "irregular": 0.25,
+    "length_m": 2.6,
+    "rise": 0.85,
+    "width_m": 0.55
+  },
+  "growth": {
+    "gravity": -0.12,
+    "inertia": 0.45,
+    "influence_m": 3.0,
+    "jitter": 0.05,
+    "kill_m": 0.7,
+    "max_iter": 260,
+    "model": "colonize",
+    "phototropism": 0.1,
+    "radius_exp": 2.3,
+    "step_m": 0.35,
+    "tip_radius_m": 0.045
+  },
+  "height_m": 0.3,
+  "kind": "grass",
+  "materials": {
+    "bark": "bark",
+    "core": "heartwood",
+    "head": "leaf_blossom",
+    "leaf": "leaf_broadleaf",
+    "rock": "rock",
+    "stem": "leaf_needle"
+  },
+  "name": "alpine-sedge",
+  "notes": "Short hardy cushion for above the treeline. Raised from 16 cm so it is six voxels rather than three; below that there is no shape left to author.",
+  "placement": {
+    "abundance": 1.0,
+    "cluster": 0.8,
+    "elev_max_m": 2000.0,
+    "elev_min_m": 500.0,
+    "slope_max_pct": 65.0,
+    "spacing_m": 0.5,
+    "water_max_m": 0.0
+  },
+  "resolution_cm": "5",
+  "rock": {
+    "angular": 0.45,
+    "bury": 0.22,
+    "elongate": 1.25,
+    "erode": 0.2,
+    "facets": 4,
+    "flatten": 0.72,
+    "lumps": 5,
+    "rough": 0.4,
+    "rubble": 0.15,
+    "size_m": 1.6,
+    "spread": 0.42
+  },
+  "roots": {
+    "count": 0,
+    "irregular": 0.3,
+    "length_m": 1.8,
+    "rise": 0.35,
+    "thickness": 0.55
+  },
+  "strand": {
+    "count": 0,
+    "drift": 0.16,
+    "from_frac": 0.35,
+    "length_m": 2.5,
+    "outer": 0.7,
+    "spread": 0.18
+  },
+  "trunk": {
+    "buttress": 0.0,
+    "clear_frac": 0.35,
+    "lean_deg": 3.0,
+    "lean_dir_deg": 0.0,
+    "radius_base_m": 0.3,
+    "wander": 0.15
+  },
+  "tuft": {
+    "arc": 0.7,
+    "base_m": 0.09,
+    "head": "none",
+    "head_frac": 0.22,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 32.0,
+    "spread_m": 0.09,
+    "stems": 14,
+    "taper": 0.5,
+    "wander": 0.5,
+    "width_m": 0.05
+  },
+  "variation": {
+    "amount": 1.0,
+    "crown_radius": 0.18,
+    "density": 0.12,
+    "droop": 0.25,
+    "height": 0.18,
+    "lean_deg": 7.0,
+    "rotate": true,
+    "shape": 0.12,
+    "trunk_radius": 0.18
+  },
+  "whorl": {
+    "branches": 5,
+    "count": 11,
+    "droop": 0.55,
+    "irregular": 0.22,
+    "leader": 0.03,
+    "rise": 0.28,
+    "stagger": 0.42,
+    "sub": 2,
+    "sub_angle": 38.0
+  }
+}

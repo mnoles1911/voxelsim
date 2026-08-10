@@ -138,6 +138,9 @@ const DEFAULT_SPECIES = {
   tree: "temperate-oak",
   bush: "bramble-thicket",
   rock: "granite-boulder",
+  grass: "meadow-grass",
+  reed: "water-reed",
+  flower: "meadow-daisy",
 };
 
 async function loadSpec(name) {

@@ -1,0 +1,6 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-ba88c9075
+tiles: [(-5, -4), (-4, -4), (-3, -4), (-5, -5), (-4, -5), (-3, -5)]
+[coarse] 20/20 ring tiles available (generate=False) cpu=0.0s
+[flow L1] 1 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed  cpu=6.3s
+[flow L0] 4 superblock(s) @ 30 m/px, span 61 km  fp=3d3c80deb245,4c8482ae6f68,a79fab8d28ee,c35c5715fa63  cpu=23.9s

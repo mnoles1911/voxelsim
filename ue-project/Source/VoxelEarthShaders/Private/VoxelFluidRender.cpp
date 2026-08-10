@@ -8,12 +8,19 @@
 #include "VoxelFluidRender.h"
 
 #include "VoxelFluidSim.h" // FVoxelFluidSimState (particle buffer + slot bound), contract mirrors
+#include "VoxelFluidOccupancy.h" // AddRebaseParticlesPass + the volume's live origin
 
 #include "CommonRenderResources.h" // GEmptyVertexDeclaration
 #include "DataDrivenShaderPlatformInfo.h"
 #include "FXRenderingUtils.h" // UE::FXRenderingUtils::GetRawViewRectUnsafe
 #include "GlobalShader.h"
 #include "PipelineStateCache.h"
+// TStatic{Blend,Rasterizer,DepthStencil,Sampler}State. Reached transitively
+// through the unity blob until this file was first compiled on its own (the
+// adaptive non-unity path every modified file takes), which is a compile error
+// that has nothing to do with the change that triggers it -- so it is included
+// explicitly here rather than left to whoever edits this file next.
+#include "RHIStaticStates.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
 #include "SceneRenderTargetParameters.h" // ESceneTextureSetupMode
@@ -201,20 +208,116 @@ void FVoxelFluidRenderExtension::PreRenderViewFamily_RenderThread(
 	TOptional<FVoxelFluidSimTickArgs> Args;
 	TSharedPtr<FVoxelFluidSimState, ESPMode::ThreadSafe> Sim;
 	TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe> OccAnchor;
+	FIntVector RebaseDeltaVoxels = FIntVector::ZeroValue;
+	FIntVector ArgsOriginVoxel = FIntVector::ZeroValue;
+	bool bStaleOrigin = false;
 	{
 		FScopeLock Guard(&State->Lock);
 		Sim = State->SimState;
 		if (State->PendingSimArgs.IsSet())
 		{
-			Args = State->PendingSimArgs;
+			// THE STALE-ORIGIN GATE (contract items 1/4). These args carry
+			// origin-relative boxes and name particles that are origin-relative
+			// too; both are only meaningful against the origin they were built
+			// for. The game thread is a frame ahead and may already have
+			// recentred, so ask the volume where it is NOW -- it takes its own
+			// lock, and the game thread never nests these two in the other
+			// order (it takes the rebase delta BEFORE it takes this lock), so
+			// the nesting here cannot close a cycle.
+			ArgsOriginVoxel = State->PendingSimArgsOriginVoxel;
+			const FVoxelFluidOccupancyVolume* Volume = State->PendingSimArgs->Occupancy;
+			bStaleOrigin = Volume != nullptr && Volume->GetOriginVoxel() != ArgsOriginVoxel;
+
+			if (bStaleOrigin)
+			{
+				// Drop the tick, KEEP the delta owed: it belongs to the move
+				// that invalidated these args, and the next tick's args will be
+				// built against the origin it lands on.
+				//
+				// WHY DROPPING IS THE ONLY HONEST ANSWER HERE, since it costs a
+				// frame of occupancy fills too: the delta for the move that made
+				// these args stale is still on the VOLUME (the game thread takes
+				// it when it posts), so running anyway would solve un-rebased
+				// particles against a volume bound one step away -- up to 12.8 m
+				// of displacement, which the density constraint resolves by
+				// ejecting the water out of the rock it now sits in. That is the
+				// blast artifact, once per recentre. A frozen frame is the same
+				// "blocked, never guessed" trade the whole occupancy design makes.
+				//
+				// STATED LIMIT: a camera fast enough to recentre EVERY tick
+				// (>6.4 m per tick, ~384 m/s at 60 Hz) can lose a run of ticks
+				// this way. It is already far past the ~48 m/s at which the
+				// refill cannot keep up, so the water there is frozen for the
+				// documented reason regardless, and the counter says so.
+				State->Stats.SimFramesStaleOrigin++;
+			}
+			else
+			{
+				Args = State->PendingSimArgs;
+				OccAnchor = State->OccupancyKeepAlive;
+				RebaseDeltaVoxels = State->PendingRebaseDeltaVoxels;
+				State->PendingRebaseDeltaVoxels = FIntVector::ZeroValue;
+			}
 			State->PendingSimArgs.Reset();
-			OccAnchor = State->OccupancyKeepAlive;
 		}
 	}
-	if (!Args.IsSet() || !Sim.IsValid())
+	if (bStaleOrigin || !Args.IsSet() || !Sim.IsValid())
 	{
 		return;
 	}
+
+	// ---- the particle rebase, BEFORE the solver's passes --------------------
+	//
+	// WHERE IT GOES IN THE FRAME (VoxelFluidOccupancy.h, contract item 8):
+	// BETWEEN solver ticks -- after the previous tick's finalize (last frame's
+	// graph) and before this tick's integrate (added just below, in this one).
+	// The solver's other position buffers are per-tick transients rebuilt from
+	// ParticlesRW, so they need no rebase and must not get one; a pass landing
+	// mid-tick would shift the stored positions out from under a sorted domain
+	// built from the old ones.
+	//
+	// Re-registering the same pooled buffer AddSimPasses registers is not a
+	// second registration: FRDGBuilder::RegisterExternalBuffer returns the
+	// handle it already made for that pooled buffer (RenderGraphBuilder.cpp
+	// FindExternalBuffer), so both sites see one resource and RDG orders this
+	// pass ahead of the solver's on its own dependency tracking.
+	if (RebaseDeltaVoxels != FIntVector::ZeroValue)
+	{
+		const uint32 Slots = FMath::Max(Args->SimSlotBound, Sim->RenderSlotBound);
+		bool bRebased = false;
+		if (Slots > 0 && Sim->bBuffersInitialized && Sim->Particles.IsValid())
+		{
+			FRDGBufferRef ParticlesRDG =
+				GraphBuilder.RegisterExternalBuffer(Sim->Particles, TEXT("VoxelFluid.Particles"));
+			bRebased = FVoxelFluidOccupancyVolume::AddRebaseParticlesPass(
+				GraphBuilder, GraphBuilder.CreateUAV(ParticlesRDG), Slots, RebaseDeltaVoxels);
+		}
+		FScopeLock Guard(&State->Lock);
+		if (bRebased)
+		{
+			State->Stats.RebasePasses++;
+			State->Stats.RebaseSlots += uint64(Slots);
+		}
+		else if (Slots > 0)
+		{
+			// Particles exist and did not move with the window. Counted loudly
+			// rather than absorbed -- this is the failure the contract calls
+			// "water teleported sideways relative to the terrain".
+			State->Stats.RebaseMissed++;
+		}
+		// Slots == 0: nothing has ever spawned, so there is nothing to move and
+		// nothing to report. Deliberately not counted as a miss.
+	}
+
+	// The particle buffer now speaks the origin these args were built against,
+	// whether it already did or the pass above moved it. The splat reads this,
+	// not Settings.FluidOriginWorld, so a frame that skipped the tick keeps
+	// drawing the water where the water actually is.
+	State->ParticleOriginWorld = FVector(double(ArgsOriginVoxel.X), double(ArgsOriginVoxel.Y),
+	                                     double(ArgsOriginVoxel.Z)) *
+	                             double(vxc::kFluidVoxelUU);
+	State->bParticleOriginValid = true;
+
 	// OccAnchor keeps Args->Occupancy alive across this scope; the raw
 	// pointer inside Args is the one the passes bind (contract: one origin,
 	// one volume).
@@ -323,8 +426,17 @@ void FVoxelFluidRenderExtension::PrePostProcessPass_RenderThread(
 	// double; folding it with PreViewTranslation FIRST keeps the float3 the
 	// shader adds camera-relative, exactly like the solver keeps positions
 	// origin-relative.
+	//
+	// AND IT IS THE PARTICLE BUFFER'S OWN ORIGIN, not the settings' -- the two
+	// differ for exactly as long as a recentre is owed a rebase (see
+	// FVoxelFluidRenderState::ParticleOriginWorld). Using the settings there
+	// would draw the water one step away from where it is being simulated, once
+	// per recentre. Settings.FluidOriginWorld is the fallback for the frames
+	// before any sim tick has been consumed, where the two are equal anyway.
+	const FVector ParticleOriginWorld =
+		State->bParticleOriginValid ? State->ParticleOriginWorld : Settings.FluidOriginWorld;
 	const FVector3f FluidOriginTranslatedWorld =
-		FVector3f(Settings.FluidOriginWorld + VM.GetPreViewTranslation());
+		FVector3f(ParticleOriginWorld + VM.GetPreViewTranslation());
 	const float ProjXX = ViewToClip.M[0][0];
 	const float ProjYY = ViewToClip.M[1][1];
 	if (ProjXX == 0.0f || ProjYY == 0.0f)

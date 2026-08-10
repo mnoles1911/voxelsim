@@ -1,5 +1,6 @@
 {
   "biomes": {
+    "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
     "grassland": 0.2,
@@ -54,10 +55,14 @@
     "tip_radius_m": 0.035
   },
   "height_m": 12.0,
+  "kind": "tree",
   "materials": {
     "bark": "bark",
     "core": "heartwood",
-    "leaf": "leaf_broadleaf"
+    "head": "leaf_blossom",
+    "leaf": "leaf_broadleaf",
+    "rock": "rock",
+    "stem": "grass"
   },
   "name": "weeping-willow",
   "notes": "Classic weeping willow. Needs the strand pass: space colonization consumes its targets on arrival, so a branch reaching the crown edge stops there and can never trail. Strands ignore targets and simply fall.",
@@ -70,7 +75,20 @@
     "spacing_m": 8.0,
     "water_max_m": 30.0
   },
-  "resolution_cm": "10",
+  "resolution_cm": "5",
+  "rock": {
+    "angular": 0.45,
+    "bury": 0.22,
+    "elongate": 1.25,
+    "erode": 0.2,
+    "facets": 4,
+    "flatten": 0.72,
+    "lumps": 5,
+    "rough": 0.4,
+    "rubble": 0.15,
+    "size_m": 1.6,
+    "spread": 0.42
+  },
   "roots": {
     "count": 0,
     "irregular": 0.3,
@@ -93,6 +111,21 @@
     "lean_dir_deg": 0.0,
     "radius_base_m": 0.46,
     "wander": 0.3
+  },
+  "tuft": {
+    "arc": 0.55,
+    "base_m": 0.05,
+    "head": "none",
+    "head_frac": 0.22,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 18.0,
+    "spread_m": 0.06,
+    "stems": 24,
+    "taper": 0.5,
+    "wander": 0.35,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,

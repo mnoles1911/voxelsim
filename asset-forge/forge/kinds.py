@@ -42,9 +42,23 @@ KINDS: tuple[Kind, ...] = (
          "Boulders and stones. No skeleton at all — an accretion of lumps, "
          "faceted and eroded, then part-buried.", True,
          ("rock",)),
-    Kind("grass", "Grass", "Tufts of ground cover.", False, ()),
-    Kind("reed", "Reeds", "Waterside stems.", False, ()),
-    Kind("flower", "Flowers", "Small flowering ground plants.", False, ()),
+    # The next three are ONE generator with three settings. A grass tuft, a
+    # stand of reeds and a clump of daisies are all a spray of thin stems from a
+    # common root; what differs is height, how far they arc, and what tops them.
+    # They stay separate kinds because the designer authors them separately and
+    # they go in different places, not because the code differs.
+    Kind("grass", "Grass",
+         "Tufts of blades arcing out from a root crown. Authored at 2 cm — "
+         "at the terrain's 10 cm a tuft is three voxels and there is nothing "
+         "to draw.", True,
+         ("tuft",)),
+    Kind("reed", "Reeds",
+         "Tall near-vertical waterside stems, most carrying a seed head.", True,
+         ("tuft",)),
+    Kind("flower", "Flowers",
+         "Small flowering plants: a few leaf stems and a few carrying a bloom.",
+         True,
+         ("tuft",)),
 )
 
 BY_KEY = {k.key: k for k in KINDS}

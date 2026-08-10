@@ -25,6 +25,8 @@ SHOTS = [
     ("phone-small", "/static/_probe.html?w=360&h=780", 430, 900),
     ("phone-panel", "/static/_probe.html?w=390&h=820&open=panel", 460, 940),
     ("phone-rocks", "/static/_probe.html?w=390&h=820&route=%23kind%3Drock", 460, 940),
+    ("phone-grass", "/static/_probe.html?w=390&h=820&route=%23kind%3Dgrass", 460, 940),
+    ("desktop-flower", "/#kind=flower", 1500, 950),
     ("phone-biomes", "/static/_probe.html?w=390&h=820&route=%23tab%3Dbiomes", 460, 940),
     ("tablet", "/", 820, 1180),
     ("desktop", "/", 1500, 950),

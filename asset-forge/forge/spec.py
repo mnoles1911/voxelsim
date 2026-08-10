@@ -47,15 +47,21 @@ PARAMS: tuple[Param, ...] = (
       choices=kindlib.KEYS,
       help="What sort of asset this is. It decides which parameters apply and "
            "which generator runs — a rock has no trunk, crown or foliage."),
-    P("height_m", "Height (m)", 12.0, 0.3, 40.0, 0.1, group="general",
-      help="Ground to the top of the crown. The floor is low enough for ground "
-           "cover; rocks ignore this and use their own size."),
-    P("resolution_cm", "Voxel size", "10", kind="choice", group="general",
+    P("height_m", "Height (m)", 12.0, 0.05, 40.0, 0.01, group="general",
+      help="Ground to the top of the crown, or the length of a stem. The range "
+           "spans a 5 cm cushion plant to a 40 m emergent, because one slider "
+           "serves every kind that grows; rocks ignore it and use their own "
+           "size."),
+    P("resolution_cm", "Voxel size", "5", kind="choice", group="general",
       choices=("10", "5", "2.5", "2", "1"),
-      help="Edge length of one voxel. The engine's terrain is 10 cm; finer makes "
-           "real twigs instead of one-voxel minimums, but cost is cubic — 2 cm is "
-           "125x the voxels of 10 cm. Previews always render coarse; this is the "
-           "size the asset exports at."),
+      help="Edge length of one voxel, and the size the asset EXPORTS at. "
+           "5 cm IS THE DEFAULT AND EVERY ASSET USES IT. The terrain is 10 cm "
+           "and the asset lattice is 5 cm, which nests 2:1 inside it — eight "
+           "fine voxels per coarse one. Keeping every asset on one size means "
+           "nothing ever has to ask which lattice a given object lives in. "
+           "The other sizes are for hero renders and comparisons; nothing "
+           "authored at 2.5 cm or below can be put in the world. Previews pick "
+           "their own size to stay cheap and say so when it differs from this."),
 
     P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.05, 1.60, 0.01, group="trunk"),
     P("trunk.clear_frac", "Branch-free height", 0.35, 0.0, 0.90, 0.01, group="trunk",
@@ -216,7 +222,7 @@ PARAMS: tuple[Param, ...] = (
     P("placement.abundance", "Abundance", 0.5, 0.0, 1.0, 0.01, group="placement",
       help="Overall frequency of this species where it does occur, before the "
            "per-biome weights are applied."),
-    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 60.0, 0.5, group="placement",
+    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 400.0, 0.5, group="placement",
       help="Closest two individuals may stand. Roughly the canopy diameter for a "
            "closed forest, much larger for savanna or desert."),
     P("placement.cluster", "Grows in stands", 0.3, 0.0, 1.0, 0.01, group="placement",
@@ -273,6 +279,55 @@ PARAMS: tuple[Param, ...] = (
       help="Loose stones scattered around the base."),
     P("materials.rock", "Rock", "rock", kind="choice", group="rock",
       choices=("rock", "bedrock", "gravel", "sand", "clay", "permafrost", "snow")),
+
+    P("tuft.stems", "Stems", 24, 1, 120, 1, kind="int", group="tuft",
+      help="How many blades or stems rise from the root crown. Grass wants "
+           "dozens; a flowering plant wants a handful."),
+    P("tuft.spread_m", "Root spread (m)", 0.06, 0.0, 0.60, 0.01, group="tuft",
+      help="Radius of the patch the stems root in. Small keeps it a tuft; large "
+           "makes a loose stand."),
+    P("tuft.splay_deg", "Splay", 18.0, 0.0, 80.0, 1.0, group="tuft",
+      help="How far from vertical a stem leaves the ground."),
+    P("tuft.arc", "Arc", 0.55, 0.0, 1.0, 0.01, group="tuft",
+      help="How far a stem bends toward horizontal along its length. 0 is a "
+           "rigid spike, 1 lays the tip right over. Weighted toward the tip, so "
+           "the base stays upright whatever this is."),
+    P("tuft.width_m", "Stem width (m)", 0.02, 0.005, 0.12, 0.005, group="tuft",
+      help="Thickness at the root. At 2 cm a value of 0.02 is a one-voxel "
+           "thread, which is the real width of a blade of grass and the reason "
+           "these are authored at 2 cm at all."),
+    P("tuft.taper", "Taper", 0.5, 0.0, 1.0, 0.01, group="tuft",
+      help="Tip thickness as a fraction of the root."),
+    P("tuft.wander", "Wander", 0.35, 0.0, 1.5, 0.01, group="tuft",
+      help="Sideways drift along a stem, so blades curve in plan rather than "
+           "running dead straight out from the centre."),
+    P("tuft.length_var", "Length spread", 0.3, 0.0, 0.8, 0.01, group="tuft",
+      help="How much stems differ in length within one tuft. Zero makes a fan "
+           "of identical copies, which reads as manufactured."),
+    P("tuft.base_m", "Root crown (m)", 0.05, 0.0, 0.40, 0.01, group="tuft",
+      help="A flat disc joining every stem at the ground. Without it each stem "
+           "is a separate piece, which is botanically true and wrong for an "
+           "asset that gets stamped into a world and dug out of it. Never "
+           "smaller than the root spread, whatever this says — a crown that "
+           "does not reach the stems is not doing its job. Set 0 to omit it."),
+    P("tuft.head", "Head", "none", kind="choice", group="tuft",
+      choices=("none", "spike", "bloom", "plume"),
+      help="What tops a stem. None is grass; spike is a reed's seed head; bloom "
+           "is a flower; plume is a feathery seed head."),
+    P("tuft.head_m", "Head width (m)", 0.12, 0.01, 0.80, 0.01, group="tuft",
+      help="Width of the bloom, spike or plume — across, not out from the "
+           "centre. A daisy is about 0.12; a big jungle bloom 0.4."),
+    P("tuft.head_frac", "Head length", 0.22, 0.02, 0.6, 0.01, group="tuft",
+      help="How much of the stem's top the spike or plume occupies."),
+    P("tuft.head_share", "Stems with a head", 1.0, 0.0, 1.0, 0.05, group="tuft",
+      help="Fraction of stems that carry one. Below 1 the rest are plain stems, "
+           "which is how a flowering plant gets its leaves for free."),
+    P("materials.stem", "Stem", "grass", kind="choice", group="tuft",
+      choices=("grass", "savanna_grass", "leaf_dry", "leaf_needle",
+               "leaf_broadleaf", "leaf_jungle", "podzol")),
+    P("materials.head", "Head", "leaf_blossom", kind="choice", group="tuft",
+      choices=("leaf_blossom", "leaf_dry", "leaf_autumn", "savanna_grass",
+               "grass", "snow", "leaf_broadleaf")),
 
     P("materials.bark", "Bark", "bark", kind="choice", group="materials",
       choices=materials.WOOD_NAMES),

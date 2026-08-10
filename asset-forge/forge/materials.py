@@ -58,11 +58,16 @@ FIRST_PROPOSED = 16
 
 # Names used in species specs. Specs never carry raw integers, so if the engine
 # picks different numbers only this file changes.
-# Terrain materials the ENGINE ALREADY HAS. Worth stating plainly: a rock asset
-# needs no new material at all -- it is made of the same rock, gravel and sand
-# the terrain is made of, so rocks can be stamped into the world the moment the
-# streaming bound accepts solids above the surface, without waiting on the
-# material append that trees need.
+#
+# Terrain materials the ENGINE ALREADY HAS. Worth stating plainly, because it
+# changes what can ship first: a rock is made of the same rock, gravel and sand
+# the terrain is made of, and a grass tuft or a reed is made of MAT_GRASS and
+# MAT_SAVANNA_GRASS. Neither needs a single new material. They still need the
+# streaming bound to accept solids above the surface, but that is one blocker
+# instead of two, and it is the only blocker between them and the world.
+#
+# Trees, bushes and flowers are the ones that need the append: bark, the leaf
+# variants, and a bloom colour have no equivalent in the terrain palette.
 BY_NAME = {
     "air": MAT_AIR,
     "bedrock": MAT_BEDROCK,
@@ -73,6 +78,8 @@ BY_NAME = {
     "topsoil": MAT_TOPSOIL,
     "snow": MAT_SNOW,
     "grass": MAT_GRASS,
+    "jungle_soil": MAT_JUNGLE_SOIL,
+    "savanna_grass": MAT_SAVANNA_GRASS,
     "podzol": MAT_PODZOL,
     "permafrost": MAT_PERMAFROST,
     "mud": MAT_MUD,

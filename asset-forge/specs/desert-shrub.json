@@ -23,13 +23,13 @@
   },
   "foliage": {
     "clump_jitter": 0.35,
-    "clump_radius_m": 0.15,
+    "clump_radius_m": 0.19,
     "coverage": 0.85,
-    "density": 0.5,
+    "density": 0.58,
     "droop_m": 0.15,
     "enabled": true,
     "min_order": 1,
-    "separation": 1.3,
+    "separation": 1.25,
     "squash": 0.8
   },
   "frond": {
@@ -52,15 +52,17 @@
     "phototropism": 0.1,
     "radius_exp": 2.3,
     "step_m": 0.11,
-    "tip_radius_m": 0.02
+    "tip_radius_m": 0.03
   },
   "height_m": 1.0,
   "kind": "bush",
   "materials": {
     "bark": "bark",
     "core": "heartwood",
+    "head": "leaf_blossom",
     "leaf": "leaf_dry",
-    "rock": "rock"
+    "rock": "rock",
+    "stem": "grass"
   },
   "name": "desert-shrub",
   "notes": "Sparse woody desert scrub: mostly bare stems under a thin dry canopy.",
@@ -73,7 +75,7 @@
     "spacing_m": 3.5,
     "water_max_m": 0.0
   },
-  "resolution_cm": "2",
+  "resolution_cm": "5",
   "rock": {
     "angular": 0.45,
     "bury": 0.22,
@@ -107,8 +109,23 @@
     "clear_frac": 0.08,
     "lean_deg": 12.0,
     "lean_dir_deg": 0.0,
-    "radius_base_m": 0.05,
+    "radius_base_m": 0.07,
     "wander": 0.7
+  },
+  "tuft": {
+    "arc": 0.55,
+    "base_m": 0.05,
+    "head": "none",
+    "head_frac": 0.22,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 18.0,
+    "spread_m": 0.06,
+    "stems": 24,
+    "taper": 0.5,
+    "wander": 0.35,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,
