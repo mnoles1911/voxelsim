@@ -48,6 +48,38 @@ namespace
 	constexpr float kMoonTintStrength = 1.0f;
 	constexpr float kDeepNightDropEV = 2.0f;
 
+	// The moon disc's DRAWN angular radius in degrees, and the number that makes
+	// the moon a thing you can see rather than a thing the maths agrees is there.
+	//
+	// The real moon's angular radius is 0.26 deg (0.52 deg across). At this
+	// project's 2200x1300 / 90 deg horizontal FOV that is TEN PIXELS wide, and ten
+	// pixels of moon at 51 deg altitude -- above the top edge of a 61 deg vertical
+	// FOV whenever the player is looking level -- is a moon nobody finds. It is
+	// what the owner reported as "there is no moon" in round 15.
+	//
+	// HOW WE GOT HERE, because both halves of this were correct in isolation and
+	// the pair was not. M_NightSky drew the moon at 1.63 deg radius for its whole
+	// life, not by choice but because UMaterialExpressionSine defaults Period to
+	// 1.0 and so computed sin(2pi*x) -- every angle in the sky graphs multiplied by
+	// 6.283 (sky_star_graph.py, _PERIOD_RADIANS). Fixing that trap was right, and
+	// it silently took the moon from 63 pixels to 10 in the same commit that fixed
+	// the star field's hemisphere. NOBODY CHOSE 0.52 DEG. It arrived as the
+	// side-effect of a bug fix, and this constant is the first time the drawn size
+	// has been a decision.
+	//
+	// 0.78 IS THREE TIMES PHYSICAL, and cheating it is the same call this file
+	// already makes one screen up for the moon's LIGHT: kMoonPeakIntensity is ten
+	// stops brighter than physics for exactly the same reason, and says so at
+	// length. A moon that lights the ground ten stops harder than the real one
+	// while drawing at strict physical size is not "more accurate", it is
+	// inconsistent. Every shipped game enlarges the moon; 2-4x is the usual band.
+	//
+	// Runtime knob: voxel.Sky.MoonAngularRadiusDeg. 0.26 is physical truth, 1.63 is
+	// what the owner saw before the Period fix, and both are one console command
+	// away -- this is a judgement to settle on a screenshot, so it is a live knob
+	// and not a rebuild.
+	constexpr float kMoonDrawnAngularRadiusDeg = 0.78f;
+
 	TAutoConsoleVariable<int32> CVarSkyEnabled(
 		TEXT("voxel.Sky.Enabled"), 1,
 		TEXT("Day/night world clock drives the light rig. 1 = on (default). 0 = off, and genuinely ")
@@ -146,6 +178,20 @@ namespace
 		TEXT("navigable night, lower for a harsher one; a NEW moon stays genuinely dark either way ")
 		TEXT("because MoonIlluminatedFraction multiplies this (0 at new, 1 at full). This knob and the ")
 		TEXT("night end of ExposureBiasForSunAltitude move the same pixel, so change one at a time."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyMoonAngularRadiusDeg(
+		TEXT("voxel.Sky.MoonAngularRadiusDeg"), kMoonDrawnAngularRadiusDeg,
+		TEXT("How big the moon DISC is drawn, as an angular RADIUS in degrees (so the disc is twice ")
+		TEXT("this across). Default 0.78 = three times the real moon's 0.26, deliberately -- see ")
+		TEXT("kMoonDrawnAngularRadiusDeg for the argument, which is the same one kMoonPeakIntensity ")
+		TEXT("makes for cheating the moon's LIGHT ten stops. Useful values: 0.26 physical truth (ten ")
+		TEXT("pixels wide at 2200x1300/90deg, which is what 'there is no moon' looked like); 1.63 the ")
+		TEXT("accidental pre-fix size the owner last saw a moon at; 0.78 default. THIS ONLY MOVES THE ")
+		TEXT("DISC. Moonlight is voxel.Sky.MoonIntensity and the two are independent, so a bigger moon ")
+		TEXT("does not brighten the ground by one photon -- if the pair are meant to move together ")
+		TEXT("that has to be done on purpose. Written into MPC_VoxelSky.MoonAngularRadius every frame, ")
+		TEXT("so editing the asset default does nothing; this cvar is the knob."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyMoonTemperatureK(
@@ -480,6 +526,15 @@ namespace VoxelSky
 	// the SUN is what the sky is scattering, at every hour. It is only index 0
 	// that must never leave the scene.
 	float GetMoonIntensity() { return FMath::Max(0.f, CVarSkyMoonIntensity.GetValueOnAnyThread()); }
+
+	// Clamped to a band whose ENDS are both failure modes rather than tastes. Below
+	// 0.05 deg the disc is under two pixels at 2200x1300 and the smoothstep limb
+	// (MoonEdgeSoftness, 12% of the radius) has no pixels left to feather across,
+	// so it aliases into a flickering dot; above 5 deg the flat orthographic
+	// projection build_moon uses -- which treats the disc as a plane, exact only
+	// for small angles -- starts visibly distorting the texture toward the limb.
+	// Neither end is a hard error, which is why they are clamps and not raises.
+	float GetMoonAngularRadiusDeg() { return FMath::Clamp(CVarSkyMoonAngularRadiusDeg.GetValueOnAnyThread(), 0.05f, 5.f); }
 
 	// Clamped to the SAME 1000..15000 window UE clamps to inside
 	// FColorSpace::MakeFromColorTemperature (ColorSpace.cpp:271-273). Restated
@@ -1384,6 +1439,17 @@ struct FVoxelSkyImpl
 	// to an explicit value would otherwise never say so. -1 = nothing logged yet,
 	// which is distinct from both states rather than aliasing one of them.
 	int32 AppliedStarAmbientGainDerived = -1;
+
+	// Last drawn moon radius written into the MPC. Starts negative -- a value
+	// GetMoonAngularRadiusDeg cannot return, since it clamps at 0.05 -- so the
+	// FIRST frame always logs the size the run is actually rendering. A run that
+	// reports "no moon" has to be able to state its own disc size from its own log.
+	float AppliedMoonAngularRadiusDeg = -1.f;
+
+	// Whether the moon was above the horizon on the previous update. -1 = nothing
+	// logged yet, which is deliberately distinct from both 0 and 1 so that a run
+	// whose moon is down for its whole length still emits one line saying so.
+	int32 AppliedMoonUp = -1;
 
 	FVoxelSkyState State;
 };
@@ -2624,6 +2690,74 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	// this at all; it is pure geometry from SunDirection.
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("MoonPhaseFraction"), (float)S.MoonPhaseFraction);
+
+	// --- how big the moon is drawn -------------------------------------------
+	//
+	// DEGREES, and a RADIUS -- build_moon multiplies by DEG2RAD and takes the sine
+	// of it (create_sky_material.py, "disc mask"), so the units are the material's
+	// and no conversion belongs here. Same rule as ObserverLatitude below.
+	//
+	// THIS PARAMETER USED TO BE ASSET-ONLY, and that is precisely how the moon went
+	// missing without a single log line saying so. MPC_VoxelSky shipped
+	// MoonAngularRadius = 0.26; nothing in C++ ever wrote it; and the drawn size
+	// was therefore whatever the material's own trigonometry happened to make of
+	// that number -- which for the graph's whole life was 6.283x too big because of
+	// the Sine Period trap, and which became exactly 0.52 deg across the moment
+	// that trap was fixed. An asset default nobody drives is a decision nobody
+	// makes. Driving it puts the size where every other sky judgement in this file
+	// already lives: on a cvar, with the physical value written down beside the
+	// chosen one (kMoonDrawnAngularRadiusDeg).
+	const float MoonRadiusDeg = VoxelSky::GetMoonAngularRadiusDeg();
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("MoonAngularRadius"), MoonRadiusDeg);
+
+	// Logged on CHANGE, and the log states the pixel width rather than only the
+	// angle, because "0.26 degrees" reads as a perfectly reasonable moon and "10
+	// pixels" reads as the bug it was. The width is quoted at this project's
+	// 2200-wide / 90 deg pose so the number is comparable between runs; it is a
+	// stated reference pose, not a read of the actual viewport.
+	if (!FMath::IsNearlyEqual(MoonRadiusDeg, Impl->AppliedMoonAngularRadiusDeg, 1.e-4f))
+	{
+		Impl->AppliedMoonAngularRadiusDeg = MoonRadiusDeg;
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("VoxelSky moon DISC SIZE RESOLVED: %.3f deg radius (%.2f deg across, %.1fx the real ")
+		       TEXT("moon's 0.26). At 2200x1300 / 90 deg FOV that is about %.0f pixels wide. Written into ")
+		       TEXT("%s.MoonAngularRadius, so the asset default is dead -- voxel.Sky.MoonAngularRadiusDeg ")
+		       TEXT("is the knob. This moves the DISC ONLY; the ground is lit by voxel.Sky.MoonIntensity."),
+		       MoonRadiusDeg, 2.f * MoonRadiusDeg, MoonRadiusDeg / 0.26f,
+		       // 1100 px per radian on the view axis: half of 2200 divided by
+		       // tan(45 deg), which is 1. Spelled as the constant it evaluates to
+		       // rather than as a tan() of a literal that is always the same angle.
+		       2.f * FMath::DegreesToRadians(MoonRadiusDeg) * 1100.f,
+		       kSkyCollectionPath);
+	}
+
+	// --- where the moon actually IS -------------------------------------------
+	//
+	// THE LINE THAT WAS MISSING WHEN IT MATTERED. Round 15 was reported as "stars
+	// but no moon" and the log could not answer the first question anyone asks --
+	// is the moon above the horizon at all, and how lit is it -- because nothing
+	// printed the moon's own position. Settling it took a Python re-derivation of
+	// ComputeMoon against the log's epoch. That is a diagnostic this file can
+	// afford once per horizon crossing.
+	//
+	// TRANSITION-LATCHED on bMoonUp rather than printed per frame: a moon that
+	// never rises then logs exactly one line saying so, which is the case that
+	// needs the line most. A new moon (IlluminatedFraction ~ 0) is genuinely
+	// invisible and is NOT a defect, so the illuminated fraction is on the same
+	// line as the altitude -- the two together are the whole answer.
+	const int32 MoonUpNow = S.bMoonUp ? 1 : 0;
+	if (Impl->AppliedMoonUp != MoonUpNow)
+	{
+		Impl->AppliedMoonUp = MoonUpNow;
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("VoxelSky moon %s: altitude %+.2f deg, azimuth %.1f deg, %.0f%% illuminated (phase ")
+		       TEXT("%.3f, 0=new 0.5=full). MoonEnabled=%d, disc radius %.3f deg. A moon BELOW the ")
+		       TEXT("horizon or at ~0%% illuminated is not a bug -- both draw nothing on purpose."),
+		       S.bMoonUp ? TEXT("IS UP") : TEXT("has SET"),
+		       S.MoonAltitudeDeg, S.MoonAzimuthDeg, 100.0 * S.MoonIlluminatedFraction,
+		       S.MoonPhaseFraction, VoxelSky::IsMoonEnabled() ? 1 : 0, MoonRadiusDeg);
+	}
 
 	// --- the observer ---------------------------------------------------------
 	//

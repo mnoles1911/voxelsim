@@ -1198,12 +1198,30 @@ void UVoxelFluidSubsystem::RefreshHeadwaterFaucets(double NowSeconds)
 	L.bHeadsFromBakedTable = Stats.bFromBakedHeads;
 	L.FaucetSprings = Stats.Springs;
 	L.FaucetEdgeInflows = Stats.EdgeInflows;
-	UE_LOG(LogVoxelFluid, Verbose,
-	       TEXT("Faucet gather: %d heads in box -> %d in the Q band (tile min Q %lld) -> %d ")
-	       TEXT("springs; %d edge inflows at %lld mm/yr (%s); source=%s"),
-	       Stats.HeadsInBox, Stats.Candidates, Stats.TileMinQ, Stats.Springs, Stats.EdgeInflows,
-	       Stats.RunoffMmPerYr, Stats.bRunoffCalibrated ? TEXT("fitted") : TEXT("FALLBACK"),
-	       Stats.bFromBakedHeads ? TEXT("baked heads") : TEXT("bv23 graph"));
+	// Display, not Verbose. A window that selects NO faucet is the one case
+	// worth a line in every owner log: it is indistinguishable in-game from a
+	// broken solver, and it cost a round trip to diagnose once already. A
+	// window that did select stays quiet at Verbose.
+	const bool bDry = (Stats.Springs + Stats.EdgeInflows) == 0;
+	const FString GatherLine = FString::Printf(
+		TEXT("Faucet gather: %d heads in box -> %d in the Q band (tile min Q %lld) -> %d ")
+		TEXT("springs; %d edge inflows%s at %lld mm/yr (%s); edge walk %lld px, %lld on channel, ")
+		TEXT("%lld unresolved; source=%s"),
+		Stats.HeadsInBox, Stats.Candidates, Stats.TileMinQ, Stats.Springs, Stats.EdgeInflows,
+		Stats.bEdgeDryChannelPass ? TEXT(" (DRY-CHANNEL pass, ground datum)") : TEXT(""),
+		Stats.RunoffMmPerYr, Stats.bRunoffCalibrated ? TEXT("fitted") : TEXT("FALLBACK"),
+		Stats.EdgePixelsScanned, Stats.EdgeChannelPixels, Stats.EdgeUnresolved,
+		Stats.bFromBakedHeads ? TEXT("baked heads") : TEXT("bv23 graph"));
+	// UE_LOG takes a compile-time verbosity token, so the two cases are two
+	// calls over one formatted string rather than one call over a ternary.
+	if (bDry)
+	{
+		UE_LOG(LogVoxelFluid, Display, TEXT("[DRY WINDOW: no faucet selected] %s"), *GatherLine);
+	}
+	else
+	{
+		UE_LOG(LogVoxelFluid, Verbose, TEXT("%s"), *GatherLine);
+	}
 
 	// THE CAP IS NOW A GUARD, NOT THE SELECTION. Springs are spaced 150 m apart
 	// and a box has four faces, so springs+edges is single digits by

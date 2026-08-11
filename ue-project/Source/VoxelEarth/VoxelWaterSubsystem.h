@@ -549,6 +549,22 @@ public:
 		int64 RunoffMmPerYr = 0; // the edge-inflow discharge coefficient used
 		bool bRunoffCalibrated = false; // false == the fallback constant
 		bool bFromBakedHeads = false;   // false == the bv23 fallback graph
+
+		// WHY the edge walk found nothing, which is a different question from
+		// whether it ran. A window with heads inside it but zero crossings is
+		// either dry ground the heads fragmented across (channel pixels 0) or a
+		// real river the wet/accumulation gates rejected (channel pixels > 0) --
+		// and those two want opposite fixes, so the perf line must tell them
+		// apart. Costs nothing: selectRiverCrossings already counts all three.
+		int64 EdgePixelsScanned = 0;  // face pixels the walk visited
+		int64 EdgeChannelPixels = 0;  // of those, carrying the channel bit
+		int64 EdgeUnresolved = 0;     // source could not answer (tile not resident)
+
+		// True when the crossings came from the second, dry-channel walk: the
+		// baked plane had no water on this window's channels. Worth reporting
+		// because it says the window is being fed on the strength of the
+		// channel mask alone, at ground datum rather than a water surface.
+		bool bEdgeDryChannelPass = false;
 	};
 
 	// THE SPRINGS inside the square of half-extent RadiusUU around the centre --

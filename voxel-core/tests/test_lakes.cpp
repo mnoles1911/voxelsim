@@ -195,6 +195,112 @@ VXC_TEST(lake_extent_stops_at_the_bbox_and_at_a_dry_datum) {
     CHECK_EQ(lakeExtentFill(b, [&](int32_t, int32_t) { return 0; }, m), size_t(0));
 }
 
+// ---------------------------------------------------------------------------
+// THE SEED RESCUE (lakes.h lakeExtentFillRescued)
+// ---------------------------------------------------------------------------
+//
+// The bv26 measurement these pin (vxc_lakeextentprobe over all six wet-block
+// tiles): 2 of 2,049 water-holding basins produced an EMPTY extent because the
+// wire seed's own CONTROL POINT rings above the datum -- tile (-3,-5) basin
+// 391 at +37 mm and tile (-4,-5) basin 538 at +921 mm -- while the
+// RECONSTRUCTED SPLINE at the same cell sits over a metre UNDER it and the wet
+// component is right there in the bbox. The prefilter can strand one cell that
+// way; a fill that dies at its first test turns that one cell into a whole
+// lake that renders nothing, anywhere.
+
+VXC_TEST(seed_rescue_saves_a_basin_whose_seed_cp_rings_above_the_datum) {
+    // A 5x5 pond component whose lattice sits at 500 mm under a 1000 mm datum,
+    // except the SEED cell, whose control point rings to +1200. The true
+    // surface (what the spline reconstructs, here a table standing in for
+    // reconstructedGroundMm -- the datum-vs-lattice property of the real
+    // spline is pinned by river_datum_is_the_spline_not_the_lattice) is 500 mm
+    // across the whole pond, seed included.
+    constexpr int32_t W = 16;
+    std::vector<int32_t> cp(size_t(W) * W, 2000), truth(size_t(W) * W, 2000);
+    for (int32_t y = 5; y <= 9; ++y) {
+        for (int32_t x = 5; x <= 9; ++x) {
+            cp[size_t(y) * W + size_t(x)] = 500;
+            truth[size_t(y) * W + size_t(x)] = 500;
+        }
+    }
+    cp[size_t(7) * W + 7] = 1200; // the stranded seed, > surfaceMm
+
+    BasinEntry b;
+    b.seedX = 7;
+    b.seedY = 7;
+    b.bboxX0 = 2;
+    b.bboxY0 = 2;
+    b.bboxX1 = 13;
+    b.bboxY1 = 13;
+    b.surfaceMm = 1000;
+    b.kind = kBasinLakeTerminal;
+
+    auto lattice = [&](int32_t x, int32_t y) { return cp[size_t(y) * W + size_t(x)]; };
+    auto spline = [&](int32_t x, int32_t y) { return truth[size_t(y) * W + size_t(x)]; };
+
+    // The shipped rule alone: EMPTY, from a live component. The defect.
+    std::vector<uint8_t> m;
+    CHECK_EQ(lakeExtentFill(b, lattice, m), size_t(0));
+
+    // Rescued: the full 25-cell component, seed included.
+    CHECK_EQ(lakeExtentFillRescued(b, lattice, spline, -1, -1, m), size_t(25));
+    const int32_t w = int32_t(b.bboxX1) - b.bboxX0 + 1;
+    CHECK(m[size_t(7 - b.bboxY0) * size_t(w) + size_t(7 - b.bboxX0)] != 0); // the seed cell
+    // ...and nothing outside the component: the rescue is a refill under a
+    // union rule, not a threshold, so the dry shelf stays dry.
+    size_t wet = 0;
+    for (uint8_t v : m) wet += (v != 0);
+    CHECK_EQ(wet, size_t(25));
+
+    // A basin whose lattice mask is NON-empty must come out byte-identical
+    // with and without the rescue -- the rescue must never re-litigate a
+    // basin that was already drawing.
+    BasinEntry ok = b;
+    ok.seedX = 5; // a seed whose cp is honest
+    ok.seedY = 5;
+    std::vector<uint8_t> plain, rescued;
+    const size_t nPlain = lakeExtentFill(ok, lattice, plain);
+    CHECK(nPlain > 0);
+    CHECK_EQ(lakeExtentFillRescued(ok, lattice, spline, -1, -1, rescued), nPlain);
+    CHECK(plain == rescued);
+
+    // Where the spline cannot be evaluated (INT32_MAX, the unloaded-neighbour
+    // collar), the rescue degrades to exactly the old answer instead of
+    // manufacturing ground.
+    auto noSpline = [](int32_t, int32_t) { return INT32_MAX; };
+    CHECK_EQ(lakeExtentFillRescued(b, lattice, noSpline, -1, -1, m), size_t(0));
+}
+
+VXC_TEST(seed_rescue_falls_back_to_the_v2_floor_cell) {
+    // The wire seed is dry under BOTH grounds (a mis-recorded or clip-stranded
+    // seed); the v2 floor cell is in the component. The refill re-seeds there
+    // and finds the lake; a v1 row (floor = -1) honestly stays empty.
+    constexpr int32_t W = 16;
+    std::vector<int32_t> cp(size_t(W) * W, 2000);
+    for (int32_t y = 4; y <= 6; ++y)
+        for (int32_t x = 4; x <= 6; ++x) cp[size_t(y) * W + size_t(x)] = 300;
+
+    BasinEntry b;
+    b.seedX = 10; // inside the bbox, dry under every ground
+    b.seedY = 10;
+    b.bboxX0 = 2;
+    b.bboxY0 = 2;
+    b.bboxX1 = 12;
+    b.bboxY1 = 12;
+    b.surfaceMm = 1000;
+    b.kind = kBasinLakeTerminal;
+
+    auto lattice = [&](int32_t x, int32_t y) { return cp[size_t(y) * W + size_t(x)]; };
+    auto spline = [&](int32_t x, int32_t y) { return cp[size_t(y) * W + size_t(x)]; };
+
+    std::vector<uint8_t> m;
+    CHECK_EQ(lakeExtentFill(b, lattice, m), size_t(0));
+    CHECK_EQ(lakeExtentFillRescued(b, lattice, spline, -1, -1, m), size_t(0));   // v1: no floor
+    CHECK_EQ(lakeExtentFillRescued(b, lattice, spline, 5, 5, m), size_t(9));     // v2: rescued
+    // The mask stays sized either way, so the caller can index it.
+    CHECK_EQ(m.size(), size_t(11) * size_t(11));
+}
+
 VXC_TEST(partial_top_fill_puts_the_surface_at_the_datum_not_on_the_lattice) {
     // A voxel is 100 mm. A datum 37 mm into a voxel must render 37% of it,
     // not 0% or 100% -- otherwise every lake is up to 5 cm out and two lakes

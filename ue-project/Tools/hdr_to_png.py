@@ -62,18 +62,24 @@ a = np.stack(chans, axis=2)
 # nebula's dynamic range without clipping the few hot stars.
 hi = np.percentile(a, 99.99)
 a = np.clip(a / max(hi,1e-6), 0.0, 1.0)
+# LINEAR 16-bit, because import_sky_textures.py imports the starmap slot with
+# srgb=False and TC_HDR_COMPRESSED (BC6H) and the sky materials sample it with
+# SAMPLERTYPE_LINEAR_COLOR. sRGB-encoding the bytes here would be decoded by
+# nothing and the nebula would render washed out. 16-bit because the image is
+# very dark (mean ~0.002) and 8-bit linear would band the nebula to death.
+# PIL cannot write 16-bit RGB at all, so the PNG chunks are assembled directly.
 import zlib, struct
-u16 = (a*65535.0+0.5).astype(np.uint16)
+u16 = (np.clip(a, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
 h_, w_ = u16.shape[:2]
 be = u16.astype(">u2")
 raw = bytearray()
 for y in range(h_):
-    raw.append(0)
+    raw.append(0)          # filter type 0 (None) per scanline
     raw += be[y].tobytes()
 def chunk(t, d):
     return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
-sig = bytes([137, 80, 78, 71, 13, 10, 26, 10])
-png = sig + chunk(b"IHDR", struct.pack(">IIBBBBB", w_, h_, 16, 2, 0, 0, 0))
+png = bytes([137, 80, 78, 71, 13, 10, 26, 10])
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", w_, h_, 16, 2, 0, 0, 0))
 png += chunk(b"IDAT", zlib.compress(bytes(raw), 6)) + chunk(b"IEND", b"")
 open(dst, "wb").write(png)
 print(f"wrote {dst} {out_w}x{out_h} 16-bit (norm {hi:.4f})")

@@ -256,6 +256,16 @@ if(NOT MSVC)
   target_compile_options(vxc_farwaterprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_lakeextentprobe: the basin extent census, OLD (control lattice)
+#     rule against the RECONSTRUCTED-SPLINE rule, over real tiles. The numeric
+#     readout behind "2,052 registered water-holding basins, 207 drawn" -- see
+#     lakes.h's extent-rule comment for the fix this measured and verified.
+add_executable(vxc_lakeextentprobe lakeextentprobe.cpp)
+target_link_libraries(vxc_lakeextentprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_lakeextentprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_farwaterschemes: the ring cascade against the two proposed
 #     alternatives -- (A) a displaced heightfield strip, (B) that surface plus an
 #     instanced rim -- all four schemes counted off ONE shared water field so a

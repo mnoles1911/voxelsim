@@ -35,18 +35,39 @@
 // close. Physics loses to the single definition, on purpose, in both
 // languages, and `tests/test_lakes.cpp` asserts the two agree on a fixture.
 //
-// WHAT BOUNDS THE WATER FROM BELOW IS NOT THIS FILE. The extent is computed on
-// the BAKED CONTROL LATTICE (1.875 m/px, which is exactly what a fine tile
-// carries -- B5 subtracts `basin_depth` before encoding, so a shipped tile's
-// elevation plane IS the re-opened surface these basins were measured on).
-// What the player sees is the AMPLIFIED surface: carrier spline plus detail
-// bands, at 10 cm. Those disagree by the detail band's amplitude near the
-// shore. The composed predicate in §5.1 resolves it the only way that cannot
-// produce floating water -- `zMm >= amplifiedGroundMm` -- so a column inside
-// the extent whose amplified ground rises above the datum simply yields no
-// water voxels, and the shoreline follows the ground's own contour instead of
-// the lattice's staircase. The DATUM is authoritative; the extent says where
-// to look; the ground says where to stop.
+// WHICH ELEVATION THE CLIENT TESTS, corrected 2026-08-10. An earlier version
+// of this comment claimed that "a shipped tile's elevation plane IS the
+// re-opened surface these basins were measured on". It is not, quite: the bake
+// measured the depression on its re-opened PER-PIXEL surface (`z_open`), and
+// what the tile carries is the PREFILTERED B-SPLINE CONTROL LATTICE for that
+// surface -- a control point is not a sample of it, and the prefilter stands
+// one up to 5.6 m off the surface it interpolates (tile_codec.py; p99 4.4 m on
+// this world). Measured over the bv26 wet block's 2,049 water-holding basins
+// (vxc_lakeextentprobe), the per-CELL consequence is nil: the carrier is a
+// uniform cubic B-spline, a CONVEX average of nearby control points, so the
+// reconstructed surface cannot dip below a datum that no nearby control point
+// dips below, and the lattice extent and the spline extent agree to 0.1% of
+// area (970.1 vs 970.8 ha). The per-SEED consequence is not nil: the seed is
+// ONE cell, prefilter ringing can strand exactly that cell's control point
+// above the datum, and a fill whose seed reads dry returns an EMPTY mask for a
+// basin whose component is sitting right there in the bbox -- 2 of the 2,049
+// rendered nothing anywhere, that way. `lakeExtentFillRescued` below is the
+// repair, and it is deliberately narrow: the lattice rule runs first and is
+// byte-identical for every basin whose mask was already non-empty; only an
+// EMPTY result triggers a refill that also accepts cells the RECONSTRUCTED
+// SPLINE (`reconstructedGroundMm`, the same ground the river datum is defined
+// against) puts at or under the datum, re-seeded at the v2 floor cell if even
+// the wire seed stays dry.
+//
+// WHAT BOUNDS THE WATER FROM BELOW IS NOT THIS FILE. What the player sees is
+// the AMPLIFIED surface: carrier spline plus detail bands, at 10 cm. The
+// extent and the datum disagree with it by the detail band's amplitude near
+// the shore. The composed predicate in §5.1 resolves that the only way that
+// cannot produce floating water -- `zMm >= amplifiedGroundMm` -- so a column
+// inside the extent whose amplified ground rises above the datum simply yields
+// no water voxels, and the shoreline follows the ground's own contour instead
+// of the lattice's staircase. The DATUM is authoritative; the extent says
+// where to look; the ground says where to stop.
 
 #include <algorithm>
 #include <cstdint>
@@ -109,17 +130,22 @@ constexpr uint8_t waterFillUnits(int64_t zBottomMm, int32_t surfaceMm) {
 // Explicit stack, no recursion: a basin can be 2.5 million cells (the survey's
 // largest is 865 ha at 1.875 m/px) and a recursive fill on that is a stack
 // overflow, not a slow function.
+//
+// `lakeExtentFillFrom` is the same fill with an EXPLICIT seed, for the rescue
+// path below: the wire seed is `b.seedX/seedY` and `lakeExtentFill` keeps that
+// as the one spelling every existing caller and the Python fixture pin.
 template <class ElevFn>
-size_t lakeExtentFill(const BasinEntry& b, ElevFn&& elev, std::vector<uint8_t>& out) {
+size_t lakeExtentFillFrom(const BasinEntry& b, int32_t seedX, int32_t seedY, ElevFn&& elev,
+                          std::vector<uint8_t>& out) {
     const int32_t x0 = b.bboxX0, y0 = b.bboxY0, x1 = b.bboxX1, y1 = b.bboxY1;
     const int32_t w = x1 - x0 + 1, h = y1 - y0 + 1;
     out.assign(static_cast<size_t>(w) * static_cast<size_t>(h), 0);
     if (w <= 0 || h <= 0) return 0;
-    if (b.seedX < x0 || b.seedX > x1 || b.seedY < y0 || b.seedY > y1) return 0;
+    if (seedX < x0 || seedX > x1 || seedY < y0 || seedY > y1) return 0;
     if (b.surfaceMm == kNoWaterMm) return 0;
 
-    const int32_t sx = int32_t(b.seedX) - x0, sy = int32_t(b.seedY) - y0;
-    if (elev(b.seedX, b.seedY) > b.surfaceMm) return 0;
+    const int32_t sx = seedX - x0, sy = seedY - y0;
+    if (elev(seedX, seedY) > b.surfaceMm) return 0;
 
     std::vector<int32_t> stack;
     stack.reserve(256);
@@ -144,6 +170,67 @@ size_t lakeExtentFill(const BasinEntry& b, ElevFn&& elev, std::vector<uint8_t>& 
         }
     }
     return n;
+}
+
+template <class ElevFn>
+size_t lakeExtentFill(const BasinEntry& b, ElevFn&& elev, std::vector<uint8_t>& out) {
+    return lakeExtentFillFrom(b, int32_t(b.seedX), int32_t(b.seedY), std::forward<ElevFn>(elev),
+                              out);
+}
+
+// THE SEED RESCUE (2026-08-10), for the 2-in-2,049 case measured on the bv26
+// wet block (see the extent-rule comment at the top of this file): a
+// water-holding basin whose wire seed's CONTROL POINT rings above the datum,
+// so the lattice fill dies at its very first test and the whole lake renders
+// nothing, anywhere, forever -- while the wet component sits in the bbox one
+// cell away. The two measured casualties: tile (-3,-5) basin 391 (seed cp
+// +37 mm over the datum, spline -1,228 mm under it) and tile (-4,-5) basin 538
+// (cp +921 mm over, spline -1,094 mm under).
+//
+// THE PRIMARY RULE IS UNTOUCHED. `latticeElev` runs first, and a basin whose
+// mask comes out non-empty gets EXACTLY the mask it always got -- byte for
+// byte, 2,047 of 2,049 on the measured block -- because a fill rule that moved
+// for everyone to serve two basins would re-litigate every shoreline in the
+// world. Only an EMPTY mask triggers the refill, whose accessor accepts a cell
+// when EITHER ground puts it at or under the datum: the lattice (the shipped
+// rule), or `groundElev` -- the RECONSTRUCTED SPLINE, which is the surface the
+// bake actually measured the depression on, to ~42 mm. That union can only
+// ever be a superset of the lattice component, so the rescue cannot lose a
+// cell the old rule would have kept.
+//
+// `groundElev` must return INT32_MAX where it cannot be evaluated (a stencil
+// that would cross into an unloaded tile); the lattice test alone then decides,
+// which is the pre-rescue behaviour. `floorLx/floorLy` is the basin's v2 floor
+// cell in the same tile-local pixels as the bbox, or -1 when the row is v1 or
+// the floor lies in a neighbouring tile: if even the wire seed stays dry under
+// both grounds, the fill re-seeds there -- the deepest cell of the WHOLE
+// basin, which for a spanning row can rescue the tile whose clipped seed was
+// the casualty.
+//
+// COST, with the arithmetic: the happy path pays nothing (one lattice fill,
+// as before). A rescued basin pays one extra fill over its bbox in which only
+// the lattice-REJECTED cells it visits gather the 4x4 spline stencil --
+// measured across all 2,049 bv26 basins forced through the hybrid accessor,
+// 0.95 M spline gathers over 8.06 M bbox cells and 0.30 s total, i.e. ~0.15 ms
+// for a median basin and 8 ms for the block's largest (1.49 M-cell bbox). Two
+// basins pay it today.
+template <class ElevFn, class GroundFn>
+size_t lakeExtentFillRescued(const BasinEntry& b, ElevFn&& latticeElev, GroundFn&& groundElev,
+                             int32_t floorLx, int32_t floorLy, std::vector<uint8_t>& out) {
+    const size_t n = lakeExtentFill(b, latticeElev, out);
+    if (n != 0 || b.surfaceMm == kNoWaterMm) return n;
+    auto either = [&](int32_t x, int32_t y) -> int32_t {
+        const int32_t cp = latticeElev(x, y);
+        if (cp <= b.surfaceMm) return cp;
+        const int32_t g = groundElev(x, y);
+        return g == INT32_MAX ? cp : g;
+    };
+    const size_t r = lakeExtentFillFrom(b, int32_t(b.seedX), int32_t(b.seedY), either, out);
+    if (r != 0) return r;
+    if (floorLx < 0 || floorLy < 0 ||
+        (floorLx == int32_t(b.seedX) && floorLy == int32_t(b.seedY)))
+        return r;
+    return lakeExtentFillFrom(b, floorLx, floorLy, either, out);
 }
 
 // What the composed ImplicitFn asks, and the only thing this layer answers.
@@ -560,12 +647,46 @@ private:
             auto ins = idx.masks.emplace(id, std::vector<uint8_t>{});
             return ins.first->second;
         }
+        auto lattice = [&](int32_t lx, int32_t ly) {
+            return tiles_.elevationMm(ox + lx, oy + ly);
+        };
+        // The rescue path's spline ground (see lakeExtentFillRescued). The 4x4
+        // carrier stencil of cell (lx, ly) spans pixels [lx-1, lx+2] x
+        // [ly-1, ly+2], so a cell within two pixels of the tile edge gathers
+        // from a neighbouring tile; where that neighbour is NOT loaded the
+        // stencil would mix the missing-tile default into the carrier and
+        // manufacture a cliff, so those cells answer INT32_MAX -- "no spline
+        // here" -- and the lattice test alone decides, exactly as before the
+        // rescue existed. Neighbour pixels of a LOADED tile decode lazily on
+        // first touch, which is fine on this path: maskFor is the mutating
+        // half of this class's threading contract already.
+        bool nb[3][3];
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                nb[dy + 1][dx + 1] =
+                    (dx == 0 && dy == 0) || tiles_.findTile(tx + dx, ty + dy) != nullptr;
+        const int64_t edge = int64_t(size);
+        auto ground = [&](int32_t lx, int32_t ly) -> int32_t {
+            const int xLo = (lx - 1 < 0) ? -1 : 0, xHi = (lx + 2 >= edge) ? 1 : 0;
+            const int yLo = (ly - 1 < 0) ? -1 : 0, yHi = (ly + 2 >= edge) ? 1 : 0;
+            if (!nb[yLo + 1][xLo + 1] || !nb[yLo + 1][xHi + 1] || !nb[yHi + 1][xLo + 1] ||
+                !nb[yHi + 1][xHi + 1])
+                return INT32_MAX;
+            return reconstructedGroundMm(tiles_, ox + lx, oy + ly);
+        };
+        // The v2 floor cell, tile-local; -1 when v1 or when a spanning basin's
+        // floor lies in the neighbour (the neighbour's own row covers it).
+        int32_t fLx = -1, fLy = -1;
+        if (b.hasV2()) {
+            const int64_t wx = int64_t(b.globalIdWorldX()) - ox;
+            const int64_t wy = int64_t(b.globalIdWorldY()) - oy;
+            if (wx >= b.bboxX0 && wx <= b.bboxX1 && wy >= b.bboxY0 && wy <= b.bboxY1) {
+                fLx = int32_t(wx);
+                fLy = int32_t(wy);
+            }
+        }
         std::vector<uint8_t> mask;
-        lakeExtentFill(b,
-                       [&](int32_t lx, int32_t ly) {
-                           return tiles_.elevationMm(ox + lx, oy + ly);
-                       },
-                       mask);
+        lakeExtentFillRescued(b, lattice, ground, fLx, fLy, mask);
         ++maskCount_;
         auto ins = idx.masks.emplace(id, std::move(mask));
         return ins.first->second;

@@ -7551,7 +7551,38 @@ int32 UVoxelWaterSubsystem::GatherRiverCrossings(double CenterXUU, double Center
 	vxc::RiverCrossingParams CP;
 	CP.bounds = vxc::RegionBounds{Box.MinPx, Box.MinPy, Box.MaxPx, Box.MaxPy};
 	CP.runoffMmPerYr = Runoff.runoffMmPerYr;
-	const vxc::RiverCrossingResult Crossings = vxc::selectRiverCrossings(Source, CP);
+	vxc::RiverCrossingResult Crossings = vxc::selectRiverCrossings(Source, CP);
+
+	// THE DRY-CHANNEL FALLBACK, and the measurement that forced it. At the
+	// pinned spawn the walk scanned 114 face pixels, found 41 of them ON a
+	// drawn channel, and admitted ZERO crossings: the baked water plane reads
+	// the no-water sentinel across the whole 51 m window, so `requireWet`
+	// rejected every one. That window is a river valley the bake settled no
+	// water into -- 435 of its 812 pixels carry the channel bit -- and under
+	// the old rule the solver was handed a dry box and the owner saw no water
+	// at all.
+	//
+	// Requiring wetness made sense when the baked plane WAS the water being
+	// drawn. It is not any more: Phase 5 retired that plane from the near
+	// field, and the particles are now the water. So a channel with no baked
+	// water is not a contradiction to refuse -- it is exactly the case the
+	// faucet exists to fill. The wet pass still runs FIRST and still wins when
+	// it finds anything, so every window that worked before is untouched; only
+	// a window that would otherwise be bone dry pays for the second walk.
+	bool bDryChannelPass = false;
+	if (Crossings.crossings.empty() && Crossings.channelEdgePixels > 0)
+	{
+		vxc::RiverCrossingParams DryCP = CP;
+		DryCP.requireWet = false;
+		vxc::RiverCrossingResult DryCrossings = vxc::selectRiverCrossings(Source, DryCP);
+		if (!DryCrossings.crossings.empty())
+		{
+			Crossings = MoveTemp(DryCrossings);
+			bDryChannelPass = true;
+		}
+	}
+	OutStats.bEdgeDryChannelPass = bDryChannelPass;
+
 	if (Crossings.unresolved > 0)
 	{
 		UE_LOG(LogVoxelEarth, Verbose,
@@ -7581,7 +7612,18 @@ int32 UVoxelWaterSubsystem::GatherRiverCrossings(double CenterXUU, double Center
 		FVoxelHeadwaterFaucet F;
 		F.XUU = P.X;
 		F.YUU = P.Y;
-		F.SurfaceZUU = VoxelCoords::MmToWorld(int64(C.surfaceMm));
+		// A dry channel has NO water surface -- waterAt hands back the
+		// kNoWaterMm sentinel (INT32_MIN), and feeding that to MmToWorld would
+		// put the faucet two thousand kilometres underground. The datum for a
+		// dry channel is the ground itself, and specifically the RECONSTRUCTED
+		// SPLINE: that is the surface the river datum is defined against
+		// everywhere else in this system (basinledger.h's three-grounds note),
+		// so a faucet emitting on it sits on the same ground the water will
+		// run down.
+		const int32 SurfaceMm = (C.surfaceMm == vxc::kNoWaterMm)
+		                            ? vxc::reconstructedGroundMm(*Tiles, C.px, C.py)
+		                            : C.surfaceMm;
+		F.SurfaceZUU = VoxelCoords::MmToWorld(int64(SurfaceMm));
 		F.QM3PerYear = double(C.qM3PerYear);
 		// Unit direction, so a diagonal crossing emits at the same speed as an
 		// axis-aligned one.
@@ -7593,6 +7635,13 @@ int32 UVoxelWaterSubsystem::GatherRiverCrossings(double CenterXUU, double Center
 		Out.Add(F);
 	}
 	OutStats.EdgeInflows = Out.Num() - Before;
+	// The walk's own census, so a zero is readable: scanned==0 means the walk
+	// never ran, channel==0 means the faces are genuinely off-channel, and
+	// channel>0 with EdgeInflows==0 means the wet/accumulation/inbound gates
+	// rejected a real river -- three different bugs behind one "edges=0".
+	OutStats.EdgePixelsScanned = int64(Crossings.edgePixelsScanned);
+	OutStats.EdgeChannelPixels = int64(Crossings.channelEdgePixels);
+	OutStats.EdgeUnresolved = int64(Crossings.unresolved);
 	return Out.Num() - Before;
 }
 
