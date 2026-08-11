@@ -45,8 +45,76 @@ namespace
 	constexpr float kSunOuterSpaceIntensity = 15.0f;
 	constexpr float kMoonPeakIntensity = 0.04f;
 	constexpr float kMoonTemperatureK = 12000.f;
-	constexpr float kMoonTintStrength = 1.0f;
+	// 0 = the moon is lit the colour the SPECTRUM says: the sun's own temperature,
+	// warmed by lunar regolith (kMoonAlbedoTint). Was 1.0 -- the full artistic blue
+	// shift -- until the owner asked for the moon's natural colour to be what the
+	// directional light carries. The blue is still one cvar away; see
+	// voxel.Sky.MoonTintStrength, which is the A/B and which nothing else depends on.
+	constexpr float kMoonTintStrength = 0.0f;
 	constexpr float kDeepNightDropEV = 2.0f;
+
+	// THE COLOUR OF THE MOON ITSELF, measured off the pixels rather than asserted.
+	//
+	// Mean linear RGB of tools/sky-assets/lroc_color_poles_4k.tif -- the LROC
+	// mosaic that IS T_MoonColor, the texture the disc samples -- sRGB-decoded and
+	// averaged over all 4096x2048 texels: (0.33259, 0.32433, 0.29813), which
+	// normalised to green is (1.0255, 1.0, 0.9192) at R:B = 1.116.
+	//
+	// So the moon is a very slightly WARM neutral grey, which is exactly what
+	// kMoonTemperatureK's comment says the physics says and is the opposite of the
+	// 12000 K blue that shipped. Multiplying this onto the sun's 5778 K blackbody
+	// gives "sunlight reflected off lunar basalt" -- one colour, derived from the
+	// same texture the disc is drawn with, so the light and the disc cannot drift
+	// apart. That single-source property is the whole point; it is the same
+	// argument sky_star_graph.py makes for one copy of the star derivation.
+	//
+	// NORMALISED TO MAX = 1, not to unit luminance, because ULightComponent stores
+	// LightColor as an FColor -- eight bits per channel -- and anything above 1.0
+	// clamps to 255 and silently loses the ratio. The luminance that costs is put
+	// back in kMoonAlbedoTintLuminanceRecip below, so the tint changes the moon's
+	// HUE and not one photon of its brightness.
+	constexpr float kMoonAlbedoTintR = 1.0f;
+	constexpr float kMoonAlbedoTintG = 0.9751f;
+	constexpr float kMoonAlbedoTintB = 0.8963f;
+	// Rec.709 luminance of the tint above (0.2126 R + 0.7152 G + 0.0722 B),
+	// reciprocated. Dividing it back out is what makes voxel.Sky.MoonIntensity mean
+	// the same number of lux it meant before the tint existed -- otherwise adding a
+	// colour would have quietly darkened every night by 0.037 stops and the
+	// exposure ladder would have been re-tuned against a bug.
+	constexpr float kMoonAlbedoTintLuminanceRecip = 1.0f / 0.97484f;
+
+	// THE MOON DISC'S GAIN, and the number that decides whether it reads as the
+	// moon or as a light bulb.
+	//
+	// The emissive M_NightSky writes is MoonBrightness * T_MoonColor * shading
+	// (create_sky_material.py, build_moon). MPC_VoxelSky shipped MoonBrightness =
+	// 20.0 and NOTHING IN C++ EVER DROVE IT, so 20.0 is not a tuned value -- it is
+	// an asset default nobody ever measured.
+	//
+	// MEASURED, and it is not close. T_MoonColor's mean linear luminance is 0.324
+	// (the LROC mosaic is stretched for display; the real moon's albedo is ~0.12),
+	// so at gain 20 the disc emits ~5.4 and clips to a featureless white blob at
+	// every night exposure this project uses. That is what the owner reported as
+	// "a partial textured phase and the rest is just a glowing blob": the ONLY
+	// place the texture survived was the terminator, where the shading term pulled
+	// it back under 1.0.
+	//
+	// WHAT PHYSICALLY CORRECT WOULD BE, so the size of this cheat is on record.
+	// A Lambertian disc lit by voxel.Sky.SunIntensity has radiance
+	// SunIntensity/pi * albedo = 15/pi * 0.12 = 0.573, and since T_MoonColor
+	// already carries 0.324 rather than 0.12, the gain that reproduces it is
+	// (15/pi) * (0.12/0.324) = 1.77. So the shipped 20.0 was ELEVEN TIMES brighter
+	// than a physically correct moon, and physically correct would ITSELF still
+	// clip -- as it does in every photograph ever taken of the moon against stars.
+	// There is no exposure that shows a star field and an unclipped physical moon;
+	// the eye only manages it by adapting locally, which a single global tonemapper
+	// cannot do.
+	//
+	// 0.15 IS CALIBRATED, NOT PICKED. It is the gain at which the maria read and
+	// the brightest highlands sit just under clipping at the deep-night exposure --
+	// established by re-shooting the owner's own 23:00 pose against a measured
+	// bracket, not by eye. Runtime knob: voxel.Sky.MoonDiscBrightness.
+	constexpr float kMoonDiscBrightness = 0.15f;
 
 	// The moon disc's DRAWN angular radius in degrees, and the number that makes
 	// the moon a thing you can see rather than a thing the maths agrees is there.
@@ -67,18 +135,29 @@ namespace
 	// side-effect of a bug fix, and this constant is the first time the drawn size
 	// has been a decision.
 	//
-	// 0.78 IS THREE TIMES PHYSICAL, and cheating it is the same call this file
-	// already makes one screen up for the moon's LIGHT: kMoonPeakIntensity is ten
-	// stops brighter than physics for exactly the same reason, and says so at
-	// length. A moon that lights the ground ten stops harder than the real one
-	// while drawing at strict physical size is not "more accurate", it is
-	// inconsistent. Every shipped game enlarges the moon; 2-4x is the usual band.
+	// 2.34 IS NINE TIMES PHYSICAL, and it is the owner's call on a screenshot, not
+	// a derivation. It went 0.26 (physical, ~10 px, "there is no moon") -> 0.78
+	// (3x, ~30 px) -> 2.34 (9x, ~90 px at 2200x1300 / 90 deg FOV) after he reviewed
+	// the first two and asked for three times more, explicitly waiving real
+	// earth-to-moon sizing. Recorded as HIS decision so nobody "corrects" it back
+	// toward physical and quietly reintroduces a moon nobody can find.
+	//
+	// Cheating it is also the same call this file already makes one screen up for
+	// the moon's LIGHT: kMoonPeakIntensity is ten stops brighter than physics for
+	// exactly the same reason, and says so at length. A moon that lights the ground
+	// ten stops harder than the real one while drawing at strict physical size is
+	// not "more accurate", it is inconsistent. Every shipped game enlarges the moon.
+	//
+	// AT THIS SIZE THE TEXTURE IS THE POINT. Ninety pixels is enough for the maria
+	// to read, which is exactly why kMoonDiscBrightness had to stop clipping: a
+	// 10-pixel white dot reads as a moon, a 90-pixel white dot reads as a bug.
+	// The two constants were settled together and should move together.
 	//
 	// Runtime knob: voxel.Sky.MoonAngularRadiusDeg. 0.26 is physical truth, 1.63 is
 	// what the owner saw before the Period fix, and both are one console command
 	// away -- this is a judgement to settle on a screenshot, so it is a live knob
 	// and not a rebuild.
-	constexpr float kMoonDrawnAngularRadiusDeg = 0.78f;
+	constexpr float kMoonDrawnAngularRadiusDeg = 2.34f;
 
 	TAutoConsoleVariable<int32> CVarSkyEnabled(
 		TEXT("voxel.Sky.Enabled"), 1,
@@ -183,15 +262,29 @@ namespace
 	TAutoConsoleVariable<float> CVarSkyMoonAngularRadiusDeg(
 		TEXT("voxel.Sky.MoonAngularRadiusDeg"), kMoonDrawnAngularRadiusDeg,
 		TEXT("How big the moon DISC is drawn, as an angular RADIUS in degrees (so the disc is twice ")
-		TEXT("this across). Default 0.78 = three times the real moon's 0.26, deliberately -- see ")
+		TEXT("this across). Default 2.34 = NINE times the real moon's 0.26, deliberately -- see ")
 		TEXT("kMoonDrawnAngularRadiusDeg for the argument, which is the same one kMoonPeakIntensity ")
 		TEXT("makes for cheating the moon's LIGHT ten stops. Useful values: 0.26 physical truth (ten ")
 		TEXT("pixels wide at 2200x1300/90deg, which is what 'there is no moon' looked like); 1.63 the ")
-		TEXT("accidental pre-fix size the owner last saw a moon at; 0.78 default. THIS ONLY MOVES THE ")
+		TEXT("accidental pre-fix size the owner last saw a moon at; 2.34 default (~90 px). THIS ONLY MOVES THE ")
 		TEXT("DISC. Moonlight is voxel.Sky.MoonIntensity and the two are independent, so a bigger moon ")
 		TEXT("does not brighten the ground by one photon -- if the pair are meant to move together ")
 		TEXT("that has to be done on purpose. Written into MPC_VoxelSky.MoonAngularRadius every frame, ")
 		TEXT("so editing the asset default does nothing; this cvar is the knob."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyMoonDiscBrightness(
+		TEXT("voxel.Sky.MoonDiscBrightness"), kMoonDiscBrightness,
+		TEXT("Gain on the moon DISC's emissive, multiplying T_MoonColor. Default 0.15, CALIBRATED so ")
+		TEXT("the maria read and the highlands sit just under clipping at the deep-night exposure. ")
+		TEXT("This replaces an MPC asset default of 20.0 that nothing ever drove and nobody ever ")
+		TEXT("measured -- eleven times brighter than a physically correct moon, which is why the disc ")
+		TEXT("rendered as a white blob with texture visible only along the terminator. See ")
+		TEXT("kMoonDiscBrightness for the full arithmetic, including why the PHYSICALLY correct 1.77 ")
+		TEXT("would also clip. Raise it and you get the blob back; that is the honest trade and it is ")
+		TEXT("the same one every photograph of the moon makes. THIS IS THE DISC ONLY -- the ground is ")
+		TEXT("lit by voxel.Sky.MoonIntensity, and the two are deliberately separate because one is ")
+		TEXT("bounded by the tonemapper and the other by the exposure ladder."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyMoonTemperatureK(
@@ -535,6 +628,13 @@ namespace VoxelSky
 	// for small angles -- starts visibly distorting the texture toward the limb.
 	// Neither end is a hard error, which is why they are clamps and not raises.
 	float GetMoonAngularRadiusDeg() { return FMath::Clamp(CVarSkyMoonAngularRadiusDeg.GetValueOnAnyThread(), 0.05f, 5.f); }
+
+	// Floored at 0 and not clamped above: 0 is a legitimate A/B arm (the disc off
+	// while the moonlight stays on, which is how you tell how much of a night frame
+	// is the disc), and there is no upper value that is WRONG rather than merely
+	// blown out -- the tonemapper is what bounds it, so a ceiling here would be
+	// this file inventing a limit the renderer does not have.
+	float GetMoonDiscBrightness() { return FMath::Max(0.f, CVarSkyMoonDiscBrightness.GetValueOnAnyThread()); }
 
 	// Clamped to the SAME 1000..15000 window UE clamps to inside
 	// FColorSpace::MakeFromColorTemperature (ColorSpace.cpp:271-273). Restated
@@ -1445,6 +1545,11 @@ struct FVoxelSkyImpl
 	// FIRST frame always logs the size the run is actually rendering. A run that
 	// reports "no moon" has to be able to state its own disc size from its own log.
 	float AppliedMoonAngularRadiusDeg = -1.f;
+
+	// Last disc gain written into the MPC. Same -1 sentinel and same reason: a run
+	// that reports "the moon is a white blob" has to be able to state the gain it
+	// was rendering at without anyone guessing at an asset default.
+	float AppliedMoonDiscBrightness = -1.f;
 
 	// Whether the moon was above the horizon on the previous update. -1 = nothing
 	// logged yet, which is deliberately distinct from both 0 and 1 so that a run
@@ -2450,8 +2555,48 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 			// scattering at every hour -- and a moon below the horizon should not
 			// be contributing to it. SetIntensity early-outs on an unchanged
 			// value, so this does not churn the render state while it sits at 0.
-			MoonComp->SetIntensity(S.MoonIntensity);
+			// The luminance recip is folded in HERE rather than into the tint,
+			// because the tint has to be normalised to max = 1 to survive
+			// ULightComponent's 8-bit FColor storage (kMoonAlbedoTint). Together the
+			// two are exactly luminance-neutral: adding the moon's colour must not
+			// change how many lux it delivers, or every rung of the exposure ladder
+			// would have been silently re-based by 0.037 stops.
+			MoonComp->SetIntensity(S.MoonIntensity * kMoonAlbedoTintLuminanceRecip);
 			MoonComp->SetVisibility(bMoonOn && S.MoonIntensity > 0.f);
+
+			// --- THE MOON'S OWN COLOUR, TAKEN FROM THE MOON ---------------------
+			//
+			// LightColor carries the lunar regolith's measured chromaticity and
+			// Temperature carries the illuminant, and UE multiplies them
+			// (ULightComponent::GetColoredLightBrightness), so the light the ground
+			// receives is literally "sunlight, reflected off the surface
+			// T_MoonColor is a photograph of". The disc and the light are now the
+			// same colour by construction rather than by two people agreeing.
+			//
+			// WHY THIS REPLACED A PURE COLOUR TEMPERATURE. A temperature alone can
+			// only travel along the blackbody locus, and lunar basalt is not on it
+			// -- it is a slightly warm grey (kMoonAlbedoTint, R:B 1.116). The old
+			// rig expressed the moon's colour as 12000 K, which is not the moon's
+			// colour by any measurement; it was a deliberate perceptual convention,
+			// documented at length beside kMoonTemperatureK, and the owner has since
+			// asked for the natural colour instead. kMoonTintStrength now defaults
+			// to 0, which hands the illuminant the SUN's temperature -- the answer
+			// the spectrum gives, since moonlight is reflected sunlight.
+			//
+			// THE BLUE IS NOT DELETED, and must not be: voxel.Sky.MoonTintStrength 1
+			// restores it exactly, which is the A/B for "is the night blue because
+			// we chose it or because the sky is". Every word of the argument for the
+			// blue is still at kMoonTemperatureK; what changed is which side of that
+			// argument ships as the default.
+			//
+			// SET UNCONDITIONALLY rather than latched: SetLightColor early-outs on
+			// an unchanged FColor, so this is one comparison per update, and a
+			// constant that is only written once is a constant a Blueprint can clear
+			// without anything noticing -- the same reason SetUseTemperature is
+			// re-asserted below.
+			MoonComp->SetLightColor(
+				FLinearColor(kMoonAlbedoTintR, kMoonAlbedoTintG, kMoonAlbedoTintB),
+				/*bSRGB=*/false); // LINEAR. sRGB-encoding a linear tint would apply the transfer curve twice.
 
 			// COLOUR, EVERY UPDATE, so voxel.Sky.MoonTemperatureK and
 			// voxel.Sky.MoonTintStrength are live knobs rather than build-time
@@ -2471,11 +2616,16 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 			{
 				MoonComp->SetTemperature(S.MoonTemperatureK);
 				UE_LOG(LogVoxelSky, Log,
-				       TEXT("VoxelSky moon colour RESOLVED: %.0f K (requested %.0f K, tint strength %.2f ")
-				       TEXT("against the sun's %.0f K). Read back from the component: %.0f K. Cool BY ")
-				       TEXT("CONVENTION, not by spectrum -- see kMoonTemperatureK."),
+				       TEXT("VoxelSky moon colour RESOLVED: %.0f K illuminant (requested %.0f K, tint ")
+				       TEXT("strength %.2f against the sun's %.0f K), times the MEASURED lunar albedo ")
+				       TEXT("(%.3f, %.3f, %.3f) from T_MoonColor -- so the ground is lit by sunlight ")
+				       TEXT("reflected off the same surface the disc is drawn with. Read back from the ")
+				       TEXT("component: %.0f K. At tint strength 0 this is the SPECTRUM's answer, not a ")
+				       TEXT("convention; voxel.Sky.MoonTintStrength 1 restores the old 12000 K blue and ")
+				       TEXT("is the A/B -- see kMoonTemperatureK for why that argument is a real one."),
 				       S.MoonTemperatureK, VoxelSky::GetMoonTemperatureK(), VoxelSky::GetMoonTintStrength(),
-				       kSunTemperatureK, MoonComp->Temperature);
+				       kSunTemperatureK, kMoonAlbedoTintR, kMoonAlbedoTintG, kMoonAlbedoTintB,
+				       MoonComp->Temperature);
 			}
 		}
 	}
@@ -2711,20 +2861,35 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("MoonAngularRadius"), MoonRadiusDeg);
 
+	// --- how BRIGHT the moon is drawn ----------------------------------------
+	//
+	// Driven for the same reason the radius is, and it is the same failure: the
+	// MPC's 20.0 was an asset default no code path ever touched, so it was never a
+	// decision and never showed up in a log. At 20.0 the disc clips to white and
+	// the LROC texture only survives along the terminator. kMoonDiscBrightness has
+	// the measured arithmetic; the short version is that 20.0 is 11x brighter than
+	// physically correct and physically correct would clip too.
+	const float MoonDiscBrightness = VoxelSky::GetMoonDiscBrightness();
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("MoonBrightness"), MoonDiscBrightness);
+
 	// Logged on CHANGE, and the log states the pixel width rather than only the
 	// angle, because "0.26 degrees" reads as a perfectly reasonable moon and "10
 	// pixels" reads as the bug it was. The width is quoted at this project's
 	// 2200-wide / 90 deg pose so the number is comparable between runs; it is a
 	// stated reference pose, not a read of the actual viewport.
-	if (!FMath::IsNearlyEqual(MoonRadiusDeg, Impl->AppliedMoonAngularRadiusDeg, 1.e-4f))
+	if (!FMath::IsNearlyEqual(MoonRadiusDeg, Impl->AppliedMoonAngularRadiusDeg, 1.e-4f) ||
+		!FMath::IsNearlyEqual(MoonDiscBrightness, Impl->AppliedMoonDiscBrightness, 1.e-4f))
 	{
 		Impl->AppliedMoonAngularRadiusDeg = MoonRadiusDeg;
+		Impl->AppliedMoonDiscBrightness = MoonDiscBrightness;
 		UE_LOG(LogVoxelSky, Log,
-		       TEXT("VoxelSky moon DISC SIZE RESOLVED: %.3f deg radius (%.2f deg across, %.1fx the real ")
-		       TEXT("moon's 0.26). At 2200x1300 / 90 deg FOV that is about %.0f pixels wide. Written into ")
-		       TEXT("%s.MoonAngularRadius, so the asset default is dead -- voxel.Sky.MoonAngularRadiusDeg ")
-		       TEXT("is the knob. This moves the DISC ONLY; the ground is lit by voxel.Sky.MoonIntensity."),
-		       MoonRadiusDeg, 2.f * MoonRadiusDeg, MoonRadiusDeg / 0.26f,
+		       TEXT("VoxelSky moon DISC RESOLVED: %.3f deg radius (%.2f deg across, %.1fx the real ")
+		       TEXT("moon's 0.26), gain %.3f. At 2200x1300 / 90 deg FOV that is about %.0f pixels wide. ")
+		       TEXT("Written into %s (MoonAngularRadius + MoonBrightness), so the asset defaults are ")
+		       TEXT("dead -- voxel.Sky.MoonAngularRadiusDeg and voxel.Sky.MoonDiscBrightness are the ")
+		       TEXT("knobs. These move the DISC ONLY; the ground is lit by voxel.Sky.MoonIntensity."),
+		       MoonRadiusDeg, 2.f * MoonRadiusDeg, MoonRadiusDeg / 0.26f, MoonDiscBrightness,
 		       // 1100 px per radian on the view axis: half of 2200 divided by
 		       // tan(45 deg), which is 1. Spelled as the constant it evaluates to
 		       // rather than as a tan() of a literal that is always the same angle.

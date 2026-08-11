@@ -76,6 +76,14 @@ struct FVoxelFluidParticle
 // unchanged; [4] exists so the perf line can say how much of the boundary
 // count was recycling rather than a real spatial exit.
 
+// ---- basin sink extent grid (item 6, amended 2026-08-10) ------------------
+// The sink tests a bit grid of the lake's TRUE extent, N x N cells over the
+// active window. 32 covers 51.2 m at 1.6 m a cell -- finer than the 1.875 m
+// fine pixel the extent is quantised to -- in 32 uints, 128 bytes of uniform,
+// no texture and no buffer. Mirrored CPU-side as
+// VoxelFluidSim::kBasinExtentMaskN.
+#define VOXEL_FLUID_BASIN_MASK_N     32
+
 // ---- occupancy volume (collision) -----------------------------------------
 // 1 bit per 10 cm voxel over the active region, 512^3 bits = 16 MB, packed
 // x-major into uints (32 voxels per uint along x). TOROIDAL: the buffer is a
@@ -164,6 +172,37 @@ struct FVoxelFluidParticle
 //     derivation and the factor-of-255 test live in
 //     voxelcore/fluidlifecycle.h). One basin per frame is a stated v1 limit,
 //     not a layout: a table upload replaces the four uniforms when needed.
+//
+//     AMENDED, EXTENT PASS (2026-08-10, owner playtest round 17): THE SINK
+//     TESTS THE LAKE'S EXTENT, NOT ITS BOUNDING BOX. The box-and-datum test
+//     above deleted water that had never been near the lake. At the owner's
+//     pinned spawn the picked basin was a 0.29 ha pond whose bbox is 88 x 56 m
+//     -- larger than the 51.2 m active window, which it therefore strictly
+//     CONTAINED -- so every particle in the window below the pond's surface
+//     despawned as "standing water", including the river channel metres away.
+//     Round 17 measured 104,503 spawned, 104,277 basin despawns, 226 alive:
+//     61 ms of mean residence, about 9 cm of travel. There was no flowing
+//     water in the game at all.
+//
+//     THREE CONDITIONS NOW, all required: inside [BasinBoxMinLocalUU,
+//     BasinBoxMaxLocalUU], at or below BasinDatumZLocalUU, AND the extent bit
+//     for the particle's cell is set. The extent is
+//     VOXEL_FLUID_BASIN_MASK_N^2 bits in the uniform array BasinExtentRows
+//     (row cy, bit cx, LSB = smallest x) over a square grid whose cell (0,0)
+//     starts at BasinMaskOriginLocalUU with 1/BasinMaskInvCellUU UU a cell.
+//     Host side builds it from the SHIPPED extent rule -- voxelcore/lakes.h
+//     `basinExtentBits` over `LakeSampler::extentMaskFor`, i.e. the same
+//     8-connected wet component the lake sheet draws -- so the sink and the
+//     water you can see are the same shape by construction, not by agreement.
+//     The box is kept as the cheap early-out and as the z test's carrier.
+//
+//     NO MASK MEANS NO SINK. If the basin's tile or extent will not decode,
+//     the host leaves BasinSinkEnabled at 0 and NOTHING despawns to the
+//     basin this tick; a particle whose cell lies outside the uploaded grid
+//     likewise survives. Chosen over falling back to the bbox because the two
+//     failures are not symmetric: a missed despawn leaks a few particles into
+//     the boundary and age sinks, which already conserve their units, while a
+//     wrong despawn deletes the river -- which is the defect being fixed here.
 //  7. VELOCITY AT A WALL. The solver's finalize walks the FULL step (stored
 //     position -> constrained position) through VoxelFluidResolveCollisionEx
 //     and, when blocked, lifts the stored previous position onto the contact

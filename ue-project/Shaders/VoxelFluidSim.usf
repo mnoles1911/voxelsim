@@ -153,16 +153,53 @@ float  BoundaryHalfExtentUU;// despawn box half extent around BoundaryCenterLoca
 // (2560, 2560, 2560). Uploaded rather than derived so the no-collision debug
 // arm (centre 0) and the shipping arm share one kernel.
 float3 BoundaryCenterLocalUU;
-// ---- basin sink v1 (contract item 6): one basin's clipped box + live datum -
-// A particle inside the box at or below the datum has entered standing water:
-// it despawns to the scalar ledger (DESPAWN_BASIN, ParticleCounts[1]) and the
-// CPU credits 255 ledger units for it. BasinSinkEnabled 0 disables the test
-// entirely (no basin resolved, or the feature is off) -- an all-zero box must
-// never act as a sink at the origin.
+// ---- basin sink (contract item 6, amended): box + datum + TRUE EXTENT ------
+// A particle inside the box, at or below the datum, AND over a cell the lake
+// actually covers has entered standing water: it despawns to the scalar ledger
+// (DESPAWN_BASIN, ParticleCounts[1]) and the CPU credits 255 ledger units for
+// it. BasinSinkEnabled 0 disables the test entirely (no basin resolved, the
+// extent would not decode, or the feature is off) -- an all-zero box must never
+// act as a sink at the origin.
+//
+// THE EXTENT IS NOT OPTIONAL POLISH. Testing the bbox alone deleted the river:
+// the owner's pond had an 88 x 56 m bbox around 0.29 ha of water, the active
+// window is 51.2 m, so the bbox swallowed the whole window and killed every
+// particle in it (round 17: 226 alive out of 104,503 spawned, 61 ms of
+// residence). Full account in VoxelFluidContract.ush item 6.
 uint   BasinSinkEnabled;
 float3 BasinBoxMinLocalUU;
 float3 BasinBoxMaxLocalUU;
 float  BasinDatumZLocalUU;
+// The extent grid: row cy, bit cx (LSB = smallest x), over cells of
+// 1/BasinMaskInvCellUU UU starting at BasinMaskOriginLocalUU. Built host-side
+// from the shipped lake extent rule (voxelcore/lakes.h basinExtentBits).
+// DECLARE_SCALAR_ARRAY, not a bare uint[]: the engine packs scalar arrays four
+// to a float4 register (SHADER_PARAMETER_SCALAR_ARRAY host-side, and a plain
+// uint32[] fails its 16-byte element alignment assert outright), so the rows
+// must be read back through GET_SCALAR_ARRAY_ELEMENT or the indexing is wrong
+// by a factor of four.
+float2 BasinMaskOriginLocalUU;
+float  BasinMaskInvCellUU;
+DECLARE_SCALAR_ARRAY(uint, BasinExtentRows, VOXEL_FLUID_BASIN_MASK_N);
+
+// Is this particle over water the lake actually covers?
+//
+// OUTSIDE THE GRID IS NOT IN THE EXTENT. The grid only describes the window
+// the host built it for, so "no information" has to mean "do not delete this
+// water" -- the alternative is the bbox fallback, which is the bug. The host
+// also disables the sink outright when the extent will not decode, so this
+// branch only catches the geometric edge (a particle beyond the grid after the
+// window has moved under it).
+bool VoxelFluidInBasinExtent(float2 pXY)
+{
+	const int2 c = int2(floor((pXY - BasinMaskOriginLocalUU) * BasinMaskInvCellUU));
+	if (any(c < 0) || any(c >= VOXEL_FLUID_BASIN_MASK_N))
+	{
+		return false;
+	}
+	// lint-shader-ub: allow VARIABLE_SHIFT - c.x is bounds-checked to [0, VOXEL_FLUID_BASIN_MASK_N) two lines above, and that constant is 32, so the shift distance can never reach the width of the uint being shifted
+	return (GET_SCALAR_ARRAY_ELEMENT(BasinExtentRows, c.y) & (1u << uint(c.x))) != 0u;
+}
 // ---- age sink (contract item 9): population-scaled recycling ---------------
 // MaxAgeSec <= 0 disables the age test entirely (cvar voxel.Fluid.MaxAgeSec 0).
 // NowSeconds is the host's game time this tick -- the same clock the spawn
@@ -857,8 +894,9 @@ void FluidDeltaPosMain(uint3 DTid : SV_DispatchThreadID)
 //   3. STAGNANT CHECK (contract item 9, stagnant-only aging): speed above
 //      StagnantSpeedUU refreshes the age stamp (P1.w = NowSeconds), so moving
 //      water can never age out mid-journey -- only resting water counts down;
-//   4. basin despawn (contract item 6): inside the uploaded basin box at or
-//      below the live datum -> DESPAWN_BASIN, ParticleCounts[1], free list.
+//   4. basin despawn (contract item 6): inside the uploaded basin box, at or
+//      below the live datum, AND over a set extent bit -> DESPAWN_BASIN,
+//      ParticleCounts[1], free list.
 //      Tested BEFORE the boundary so a basin clipped against the region edge
 //      credits the lake rather than leaking into the graph;
 //   5. boundary despawn (left the active box) -> flag, counter, free list;
@@ -941,11 +979,14 @@ void FluidFinalizeMain(uint3 DTid : SV_DispatchThreadID)
 		P.P1.w = NowSeconds;
 	}
 
-	// Basin sink v1 (contract item 6). Enabled flag first: an unset box is
-	// all zeros and must not act as a sink at the volume corner.
+	// Basin sink (contract item 6, amended). Enabled flag first: an unset box
+	// is all zeros and must not act as a sink at the volume corner. Extent
+	// LAST: it is the only term that costs a uniform-array load, and the box
+	// and datum reject the overwhelming majority of particles before it.
 	if (BasinSinkEnabled != 0u &&
 	    all(pNew >= BasinBoxMinLocalUU) && all(pNew <= BasinBoxMaxLocalUU) &&
-	    pNew.z <= BasinDatumZLocalUU)
+	    pNew.z <= BasinDatumZLocalUU &&
+	    VoxelFluidInBasinExtent(pNew.xy))
 	{
 		flags = VOXEL_FLUID_FLAG_DESPAWN_BASIN; // ALIVE cleared by assignment
 		InterlockedAdd(ParticleCounts[1], 1u);

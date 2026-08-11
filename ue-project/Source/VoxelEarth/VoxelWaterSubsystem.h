@@ -466,6 +466,19 @@ public:
 	int32 BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx, TArray<FBox2D>& OutRectsUU,
 	                          bool& bOutResolved) const;
 
+	// One basin's wet extent as an N x N BIT GRID over a square world-UU window
+	// -- the form the GPU fluid sink despawns against (vxc::basinExtentBits, and
+	// the failure that made it necessary is documented there). OutRows must hold
+	// N uint32s; row cy, bit cx (LSB = smallest x) is cell
+	// (WinMinXUU + cx*WinEdgeUU/N, WinMinYUU + cy*WinEdgeUU/N). N <= 32.
+	//
+	// Returns false when the basin's tile or its mask would not resolve. That is
+	// NOT "no water": a caller must switch the sink OFF rather than fall back to
+	// the bounding box, which is the defect this replaces. A true return with
+	// zero bits set is the honest "no wet cell in this window".
+	bool BuildBasinExtentBits(const FLakeSheetBasin& Basin, double WinMinXUU, double WinMinYUU,
+	                          double WinEdgeUU, int32 N, uint32* OutRows, int32& OutSetCells) const;
+
 	// The XY footprint the implicit-water refresh is CURRENTLY meshing, plus the
 	// z span of its brick disc, so the sheet can cut an exact hole where the near
 	// field already draws water. False before the first refresh has run.

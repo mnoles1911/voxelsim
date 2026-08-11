@@ -100,6 +100,25 @@ enum HashChannel : uint32_t {
     CH_CARRIER_WARP_X = 48,
     CH_CARRIER_WARP_Y = 49,
     CH_SYNTH_TILE_BASE = 32, // synthetic dev tiles, reserve 32..47
+    // Environmental-asset scatter (voxelcore/assetplacement.h). Three
+    // channels, not one, because the three draws are asked at DIFFERENT
+    // rates and must not correlate: occupancy is asked of every cell of
+    // every layer, the anchor jitter only of cells that carry a site, and
+    // the bank pick only of sites that survive the caller's biome veto. One
+    // shared channel would make "which seed this tree is" a function of
+    // "how far from its cell centre it stands", which reads as a stand of
+    // identical trees along a diagonal -- the exact class of correlation the
+    // registry below exists to prevent, and the reason CH_CAVE_NODE cost a
+    // worldgen version.
+    //
+    // Each layer additionally offsets by its own index (see
+    // AssetLayer::channelBase), so the four size-class layers are
+    // domain-separated from each other too: without that, a groundcover cell
+    // and a canopy cell at the same lattice coordinate would agree on
+    // occupancy, and every big tree would stand in a patch of flowers.
+    CH_ASSET_SITE = 50,   // reserves 50..53, one per layer
+    CH_ASSET_JITTER = 54, // reserves 54..57
+    CH_ASSET_PICK = 58,   // reserves 58..61
 };
 
 constexpr uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint32_t channel) {

@@ -467,7 +467,42 @@ VXC_TEST(sheet_rects_at_step_one_reproduce_the_mask_exactly) {
     }
 }
 
-VXC_TEST(sheet_decimation_can_only_shrink_a_lake_never_grow_it) {
+VXC_TEST(sheet_decimation_covers_every_wet_cell_and_never_leaves_the_bbox) {
+    // THE PROPERTY THE OWNER'S SCREENSHOT BOUGHT. The decimated sheet must
+    // COVER the lake: under the old centre-sample rule a boundary block more
+    // than half wet was dropped whole, and the lake was ringed by a staircase
+    // of empty air between the water and its own bank. Coverage is now the
+    // pinned invariant, in both directions: every wet cell is inside some
+    // emitted rectangle, and no rectangle escapes the bbox.
+    const int32_t w = 64, h = 64;
+    BasinEntry b = sheetBasin(w, h);
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const double dx = x - 31.5, dy = y - 31.5;
+            if (dx * dx + dy * dy <= 25.0 * 25.0) mask[size_t(y) * size_t(w) + size_t(x)] = 1;
+        }
+    }
+    for (int32_t step : {1, 2, 4, 8, 16}) {
+        std::vector<LakeSheetRect> rs;
+        lakeSheetRects(b, mask, step, rs);
+        std::vector<uint8_t> covered(size_t(w) * size_t(h), 0);
+        for (const LakeSheetRect& r : rs) {
+            CHECK(r.x0 >= b.bboxX0 && r.x1 <= b.bboxX1);
+            CHECK(r.y0 >= b.bboxY0 && r.y1 <= b.bboxY1);
+            for (int32_t y = r.y0 - b.bboxY0; y <= r.y1 - b.bboxY0; ++y) {
+                for (int32_t x = r.x0 - b.bboxX0; x <= r.x1 - b.bboxX0; ++x) {
+                    covered[size_t(y) * size_t(w) + size_t(x)] = 1;
+                }
+            }
+        }
+        for (size_t i = 0; i < mask.size(); ++i) {
+            if (mask[i] != 0) CHECK(covered[i] != 0); // no gap at the shore
+        }
+    }
+}
+
+VXC_TEST(sheet_decimation_stays_within_one_block_ring_of_the_lake) {
     // A disc, which is the shape a decimation is most likely to overshoot on:
     // its boundary is diagonal everywhere.
     const int32_t w = 64, h = 64;
@@ -563,6 +598,122 @@ VXC_TEST(subtracting_the_near_field_hole_loses_exactly_the_overlap) {
     const LakeSheetRect edge{-4, 4, 2, 6};
     n = subtractRect(r, edge, out);
     CHECK_EQ(int(areaOf(out, n)), 100 - 3 * 3);
+}
+
+// ---------------------------------------------------------------------------
+// THE FLUID SINK'S EXTENT BITMASK (basinExtentBits)
+// ---------------------------------------------------------------------------
+
+VXC_TEST(extent_bits_sample_the_pixel_under_each_cell_centre) {
+    // A 4 x 3 pixel basin whose tile does NOT start at the world origin, so a
+    // dropped `tileOxPx` term shows up rather than cancelling.
+    BasinEntry b = sheetBasin(4, 3);
+    std::vector<uint8_t> mask(12, 0);
+    mask[size_t(1) * 4 + 2] = 1; // one wet pixel, local (2, 1)
+
+    // One cell per pixel, exactly aligned: cell (cx, cy) centres on pixel
+    // (cx, cy), so the bitmask must be the mask.
+    const int64_t oxPx = 1000, oyPx = -2000;
+    const int32_t pixelMm = 1875;
+    const int64_t winX = oxPx * pixelMm, winY = oyPx * pixelMm;
+    uint32_t rows[32];
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, pixelMm, winX, winY, pixelMm, 4, rows)), 1);
+    CHECK_EQ(int(rows[0]), 0);
+    CHECK_EQ(int(rows[1]), 1 << 2); // bit cx = 2 of row cy = 1, LSB = smallest x
+    CHECK_EQ(int(rows[2]), 0);
+    CHECK_EQ(int(rows[3]), 0); // beyond the bbox in y: cleared, never garbage
+
+    // Slide the window one pixel WEST: every cell centre now lands one pixel
+    // further left in the basin, so the wet cell reports at cx = 3.
+    uint32_t shifted[32];
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, pixelMm, winX - pixelMm, winY, pixelMm, 4,
+                                 shifted)),
+             1);
+    CHECK_EQ(int(shifted[1]), 1 << 3);
+
+    // Rows are cleared even when nothing resolves: a caller that uploads this
+    // buffer after a rejected call must not despawn on last frame's bits.
+    uint32_t dirty[32];
+    for (int i = 0; i < 32; ++i) dirty[i] = 0xFFFFFFFFu;
+    std::vector<uint8_t> wrongSize(11, 1);
+    CHECK_EQ(int(basinExtentBits(b, wrongSize, oxPx, oyPx, pixelMm, winX, winY, pixelMm, 4, dirty)),
+             0);
+    for (int i = 0; i < 4; ++i) CHECK_EQ(int(dirty[i]), 0);
+
+    // Refused arguments, all of which would otherwise index out of bounds.
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, pixelMm, winX, winY, pixelMm, 33, rows)), 0);
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, pixelMm, winX, winY, 0, 4, rows)), 0);
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, 0, winX, winY, pixelMm, 4, rows)), 0);
+    CHECK_EQ(int(basinExtentBits(b, mask, oxPx, oyPx, pixelMm, winX, winY, pixelMm, 4, nullptr)), 0);
+}
+
+VXC_TEST(extent_bits_spare_the_window_the_bbox_would_have_swallowed_whole) {
+    // THE ROUND-17 DEFECT, at its measured scale. The owner's pinned spawn
+    // picked a 0.29 ha pond whose BBOX is 88 x 56 m -- and the fluid's active
+    // window is 51.2 m, so the bbox strictly CONTAINED the window. The shipped
+    // sink tested that bbox, so every particle in the window below the pond's
+    // surface was deleted as standing water: 104,277 of 104,503 spawned, 226
+    // alive, 61 ms of residence, no flowing water anywhere in the game.
+    const int32_t pixelMm = 1875;
+    const int32_t w = 47, h = 30; // 88.1 m x 56.25 m of bbox, 0.49 ha
+    BasinEntry b = sheetBasin(w, h);
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    // The pond itself: an ellipse of 824 pixels == 2,896 m^2 == 0.29 ha, the
+    // measured wet area, i.e. 58% of its own bounding box.
+    size_t wet = 0;
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const double dx = (x - 23.0) / 21.0, dy = (y - 15.0) / 12.5;
+            if (dx * dx + dy * dy <= 1.0) {
+                mask[size_t(y) * size_t(w) + size_t(x)] = 1;
+                ++wet;
+            }
+        }
+    }
+    CHECK(wet > 800 && wet < 850);
+    CHECK(wet < size_t(w) * size_t(h)); // 0.29 ha of wet in 0.49 ha of bbox
+
+    // The window: 51.2 m at 32 cells, laid inside the bbox exactly as the sim
+    // lays it inside the picked basin.
+    const int32_t n = 32;
+    const int64_t cellMm = 1600; // 51,200 mm / 32
+    uint32_t rows[32];
+    const size_t bits = basinExtentBits(b, mask, 0, 0, pixelMm, 0, 0, cellMm, n, rows);
+
+    // What the bbox test did: the whole window, all 1,024 cells, is inside the
+    // bbox. What the extent test does: strictly fewer.
+    CHECK(bits < size_t(n) * size_t(n));
+
+    // Every bit is a genuinely wet pixel, and every wet pixel under a cell
+    // centre is a bit -- recomputed here through a different indexing path
+    // than the function's, so a transposed row/column cannot pass both.
+    size_t expect = 0;
+    for (int32_t cy = 0; cy < n; ++cy) {
+        for (int32_t cx = 0; cx < n; ++cx) {
+            const int32_t px = int32_t((800 + int64_t(cx) * cellMm) / pixelMm);
+            const int32_t py = int32_t((800 + int64_t(cy) * cellMm) / pixelMm);
+            const bool inBbox = px < w && py < h;
+            const bool isWet = inBbox && mask[size_t(py) * size_t(w) + size_t(px)] != 0;
+            CHECK_EQ(int((rows[cy] >> uint32_t(cx)) & 1u), isWet ? 1 : 0);
+            expect += isWet ? 1u : 0u;
+        }
+    }
+    CHECK_EQ(int(bits), int(expect));
+
+    // The corners the shipped sink deleted and this one does not: dry ground
+    // inside the bbox, which is where the river channel ran.
+    CHECK_EQ(int(rows[0] & 1u), 0);                          // (0, 0)
+    CHECK_EQ(int((rows[0] >> uint32_t(n - 1)) & 1u), 0);     // (31, 0)
+    CHECK_EQ(int(rows[n - 1] & 1u), 0);                      // (0, 31)
+
+    // And the pathological case the defect actually is: the same bbox, but the
+    // pond sits entirely OUTSIDE the window. Not one cell may despawn.
+    std::vector<uint8_t> elsewhere(size_t(w) * size_t(h), 0);
+    for (int32_t y = 20; y < h; ++y)
+        for (int32_t x = 34; x < w; ++x) elsewhere[size_t(y) * size_t(w) + size_t(x)] = 1;
+    uint32_t away[32];
+    CHECK_EQ(int(basinExtentBits(b, elsewhere, 0, 0, pixelMm, 0, 0, cellMm, n, away)), 0);
+    for (int32_t cy = 0; cy < n; ++cy) CHECK_EQ(int(away[cy]), 0);
 }
 
 // ---------------------------------------------------------------------------

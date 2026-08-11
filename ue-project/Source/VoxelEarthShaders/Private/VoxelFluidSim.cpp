@@ -41,6 +41,13 @@ DECLARE_GPU_STAT_NAMED(VoxelFluidSim, TEXT("VoxelFluidSim"));
 static_assert(sizeof(VoxelFluidSim::FParticleCPU) == 32,
               "FParticleCPU must match FVoxelFluidParticle byte for byte");
 
+// The basin sink's extent grid packs one ROW per uint32 (contract item 6,
+// amended), so widening the grid past 32 cells silently drops every column
+// past the 32nd -- and dropped columns read as "not the lake", i.e. water that
+// should despawn keeps flowing. Caught here, not in a playtest.
+static_assert(VoxelFluidSim::kBasinExtentMaskN > 0 && VoxelFluidSim::kBasinExtentMaskN <= 32,
+              "kBasinExtentMaskN must fit one row in a uint32");
+
 namespace
 {
 	// ---- solver-internal constants mirrored from VoxelFluidSim.usf ---------
@@ -291,6 +298,15 @@ namespace
 			SHADER_PARAMETER(FVector3f, BasinBoxMinLocalUU)
 			SHADER_PARAMETER(FVector3f, BasinBoxMaxLocalUU)
 			SHADER_PARAMETER(float, BasinDatumZLocalUU)
+			// The sink's TRUE extent (contract item 6, amended): 32 rows of 32
+			// bits over the active window. A uniform array, not a buffer -- the
+			// whole mask is 128 bytes and every particle reads exactly one row.
+			// SCALAR_ARRAY, not ARRAY: a plain uint32[] fails the engine's
+			// 16-byte element alignment assert, and the packed form is the same
+			// 8 uint4 registers the shader's DECLARE_SCALAR_ARRAY declares.
+			SHADER_PARAMETER(FVector2f, BasinMaskOriginLocalUU)
+			SHADER_PARAMETER(float, BasinMaskInvCellUU)
+			SHADER_PARAMETER_SCALAR_ARRAY(uint32, BasinExtentRows, [VoxelFluidSim::kBasinExtentMaskN])
 			// Age sink (contract item 9): population-scaled, stagnant-only
 			// recycling. StagnantSpeedUU is the moving/resting divide the
 			// finalize kernel refreshes age stamps against.
@@ -876,6 +892,15 @@ void VoxelFluidSim::AddSimPasses(FRDGBuilder& GraphBuilder,
 		Params->BasinBoxMinLocalUU = Args.BasinBoxMinLocalUU;
 		Params->BasinBoxMaxLocalUU = Args.BasinBoxMaxLocalUU;
 		Params->BasinDatumZLocalUU = Args.BasinDatumZLocalUU;
+		Params->BasinMaskOriginLocalUU = Args.BasinMaskOriginLocalUU;
+		Params->BasinMaskInvCellUU = Args.BasinMaskInvCellUU;
+		// Copied even when the sink is off: a shader parameter array left
+		// uninitialised is last frame's bits, and BasinSinkEnabled is the only
+		// thing standing between those and a despawn.
+		for (int32 Row = 0; Row < VoxelFluidSim::kBasinExtentMaskN; ++Row)
+		{
+			GET_SCALAR_ARRAY_ELEMENT(Params->BasinExtentRows, Row) = Args.BasinExtentRows[Row];
+		}
 		Params->NowSeconds = Args.NowSeconds;
 		Params->MaxAgeSec = Args.MaxAgeSec;
 		Params->StagnantSpeedUU = Args.StagnantSpeedUU;

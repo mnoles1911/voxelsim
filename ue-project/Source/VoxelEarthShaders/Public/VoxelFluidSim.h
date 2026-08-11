@@ -54,6 +54,10 @@ namespace VoxelFluidSim
 	inline constexpr float kKernelHUU = 25.0f;
 	// VoxelFluidContract.ush:37 -- buffer sizing cap.
 	inline constexpr uint32 kMaxParticles = 300u * 1024u;
+	// VOXEL_FLUID_BASIN_MASK_N -- cells per axis of the basin sink's extent
+	// grid (contract item 6, amended). 32 is also the bit width of a row, so
+	// the mask is exactly N uint32s and N may not exceed 32.
+	inline constexpr int32 kBasinExtentMaskN = 32;
 	// VoxelFluidContract.ush:45-47 -- flag bits of asuint(P0.w).
 	inline constexpr uint32 kFlagAlive = 1u << 0;
 	inline constexpr uint32 kFlagDespawnBasin = 1u << 1;
@@ -213,12 +217,21 @@ struct FVoxelFluidSimTickArgs
 	// alive for the duration of the render-thread call.
 	FVoxelFluidOccupancyVolume* Occupancy = nullptr;
 
-	// Basin sink v1 (contract item 6): one basin's clipped box + live datum,
-	// origin-local UU. bBasinSinkEnabled false leaves the kernel's test off.
+	// Basin sink (contract item 6): one basin's clipped box + live datum +
+	// TRUE EXTENT, all origin-local UU. bBasinSinkEnabled false leaves the
+	// kernel's test off, which is also what the host must do when the extent
+	// will not decode -- the bbox is not a safe fallback, it is the round-17
+	// defect (it deleted the river; see the contract's item 6 amendment).
 	bool bBasinSinkEnabled = false;
 	FVector3f BasinBoxMinLocalUU = FVector3f::ZeroVector;
 	FVector3f BasinBoxMaxLocalUU = FVector3f::ZeroVector;
 	float BasinDatumZLocalUU = 0.0f;
+	// The extent grid: kBasinExtentMaskN^2 bits, row cy in BasinExtentRows[cy],
+	// bit cx (LSB = smallest x). Cell (0,0)'s min corner is
+	// BasinMaskOriginLocalUU; a cell is 1/BasinMaskInvCellUU UU across.
+	FVector2f BasinMaskOriginLocalUU = FVector2f::ZeroVector;
+	float BasinMaskInvCellUU = 0.0f;
+	uint32 BasinExtentRows[VoxelFluidSim::kBasinExtentMaskN] = {};
 
 	// Age sink (contract item 9): recycle particles STAGNANT for longer than
 	// the population-scaled max age as boundary despawns. MaxAgeSec <= 0

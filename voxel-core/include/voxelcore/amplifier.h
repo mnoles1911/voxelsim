@@ -122,20 +122,19 @@ void resetMemoStats();
 
 // --- surface upper bound (the sky-band trim's proof obligation) -------------
 //
-// Amplifier::surfaceUpperBoundMm returns this when it declines to bound. It is
-// deliberately INT64_MAX rather than a bool-out-param so a caller that forgets
-// to check still gets the SAFE answer ("the terrain might reach arbitrarily
-// high here"), never a false all-air verdict.
-inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
-
-// The mirror sentinel, for the LOWER bound and the all-solid bound below.
-// INT64_MIN for exactly the same reason kSurfaceBoundDeclined is INT64_MAX: it
-// is the safe answer. A caller that forgets to check gets "the terrain might
-// reach arbitrarily low here" / "nothing is provably solid here", never a false
-// all-solid verdict. The two sentinels are deliberately different values so a
-// caller cannot pass one where the other is meant and still compile into
-// something that looks like it works.
-inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
+// kSurfaceBoundDeclined and kSurfaceLowerBoundDeclined MOVED TO core.h, values
+// and meanings unchanged. They are still the sentinels
+// Amplifier::surfaceUpperBoundMm / surfaceLowerBoundMm / solidBelowBoundMm
+// return, and every existing `vxc::kSurfaceBoundDeclined` reads the same
+// constant it always did -- core.h is already included here, so nothing about
+// using them from this header changed.
+//
+// They moved because they stopped being the amplifier's private vocabulary. A
+// bound that COMPOSES with the surface bound has to speak the same decline
+// convention (voxelcore/assetplacement.h is the first: an asset height added to
+// INT64_MAX wraps negative, which reads as "provably air" for the whole sky),
+// and making that module include this one -- caves, caverns, biome, climate and
+// all -- to learn one integer would be the wrong dependency edge entirely.
 
 // Tile CONTROL POINTS the bound will read per axis before declining.
 //

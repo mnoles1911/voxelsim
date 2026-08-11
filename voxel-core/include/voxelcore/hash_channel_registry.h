@@ -81,6 +81,14 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     // detail_bedding.h's two channels above -- deliberately, so the volumetric
     // recesses stayed in phase with the banding on the face -- so removing the
     // band frees no channel and leaves this table unchanged.
+    // hash.h -- environmental-asset scatter (voxelcore/assetplacement.h). Each
+    // of the three draws reserves one id PER LAYER (kAssetLayerCount = 4), so
+    // the blocks are 50..53, 54..57 and 58..61; the reserve is declared here at
+    // its true width rather than as three single ids, or a fifth layer would
+    // silently collide with the next draw's base instead of failing the build.
+    {CH_ASSET_SITE, 4, "CH_ASSET_SITE (reserves +0..+3, one per asset layer)"},
+    {CH_ASSET_JITTER, 4, "CH_ASSET_JITTER (reserves +0..+3, one per asset layer)"},
+    {CH_ASSET_PICK, 4, "CH_ASSET_PICK (reserves +0..+3, one per asset layer)"},
 };
 
 inline constexpr int kChannelAllocCount =

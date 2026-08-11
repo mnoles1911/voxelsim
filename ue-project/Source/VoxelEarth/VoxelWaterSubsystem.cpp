@@ -6975,6 +6975,55 @@ int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, in
 	return OutRectsUU.Num() - Before;
 }
 
+bool UVoxelWaterSubsystem::BuildBasinExtentBits(const FLakeSheetBasin& Basin, double WinMinXUU,
+                                                double WinMinYUU, double WinEdgeUU, int32 N,
+                                                uint32* OutRows, int32& OutSetCells) const
+{
+	OutSetCells = 0;
+	if (OutRows == nullptr || N <= 0 || N > 32)
+	{
+		return false;
+	}
+	FMemory::Memzero(OutRows, sizeof(uint32) * size_t(N));
+	if (!Impl || !Impl->Water)
+	{
+		return false;
+	}
+	check(IsInGameThread()); // extentMaskFor decodes blocks; same rule as the rects
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(Basin.TileX, Basin.TileY);
+	if (Basins == nullptr || Basin.BasinId < 0 || size_t(Basin.BasinId) >= Basins->size())
+	{
+		return false;
+	}
+	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
+	const std::vector<uint8_t>* Mask =
+		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+	if (Mask == nullptr)
+	{
+		return false; // would not decode -- the caller must disable the sink
+	}
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return false;
+	}
+	// The window is 51.2 m over 32 cells today: 1,600 mm a cell, which divides
+	// exactly. Integer division is still the right rounding if it ever does not
+	// -- a slightly SHORT cell walks the grid inward, and eroding the sink can
+	// only spare water, never delete more of it.
+	const int64 CellMm = VoxelCoords::WorldToMm(WinEdgeUU) / int64(N);
+	if (CellMm <= 0)
+	{
+		return false;
+	}
+	OutSetCells = int32(vxc::basinExtentBits(
+		B, *Mask, int64(Basin.TileX) * TileSize, int64(Basin.TileY) * TileSize, int32(PixelMm),
+		VoxelCoords::WorldToMm(WinMinXUU), VoxelCoords::WorldToMm(WinMinYUU), CellMm, N, OutRows));
+	return true;
+}
+
 bool UVoxelWaterSubsystem::GetImplicitWaterDiscUU(FBox2D& OutXY, double& OutMinZUU, double& OutMaxZUU) const
 {
 	if (!Impl || !Impl->bImplicitCenterValid)

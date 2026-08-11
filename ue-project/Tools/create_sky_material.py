@@ -27,6 +27,18 @@ between the two sky-material generators mandatory, not stylistic:
 
     1. Tools/create_sky_material.py                (MPC_VoxelSky + M_NightSky)
     2. Tools/create_sky_atmosphere_dome_material.py (M_SkyAtmosphereDome)
+    3. Tools/create_water_voxel_material.py         (M_WaterVoxel)
+
+(3) IS NOT OPTIONAL AND WAS LEARNED THE EXPENSIVE WAY. M_WaterVoxel reads
+SunDirection out of this collection for its sun glint
+(create_water_voxel_material.py:512-523), so it is a dependent exactly like the
+dome -- but it fails LOUDER and worse: re-running (1) alone left it with
+"(Node CollectionParameter) CollectionParameter has invalid parameter None",
+which is a hard compile failure, so UE substituted the DEFAULT MATERIAL for
+every water surface in the game. The owner's report was "I don't see any lake
+basins or ponds in editor" while the log cheerfully said 232 basins and 11,663
+rectangles had been built -- the water was being drawn, in grey, by a material
+that was not ours. Regenerate all three, in this order, every time.
 
 Run them the other way round -- or re-run only (1) after (2) -- and every
 CollectionParameter in M_SkyAtmosphereDome unbinds. An unresolved collection

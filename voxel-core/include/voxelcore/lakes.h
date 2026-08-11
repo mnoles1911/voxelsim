@@ -728,12 +728,22 @@ private:
 // caller's, not a constant here, because the right value is a function of range
 // and the caller is the only one who knows it.
 //
-// THE DECIMATED CELL IS WET IFF ITS CENTRE CELL IS WET, which is the choice
-// that keeps the sheet INSIDE the lake. "Wet if any cell in the block is wet"
-// grows the lake by up to a step in every direction and floats water over dry
-// ground at the shore -- the exact artefact §5.1 spends its ground bound
-// avoiding in the near field. Eroding by a centre sample can only ever lose a
-// sliver of real water at the rim, which the near-field voxels draw anyway.
+// THE DECIMATED CELL IS WET IF ANY CELL IN THE BLOCK IS WET. This REVERSES the
+// original centre-sample rule, and the reversal was forced by a screenshot:
+// eroding left a jagged staircase of empty air between each lake and its own
+// bank, which is what a player actually sees from the air.
+//
+// The old rule's argument was that "any wet" floats water over dry ground at
+// the shore, and that erosion only loses a sliver "the near-field voxels draw
+// anyway". Both halves turned out to be wrong in practice:
+//   - Near-field water meshes only within ~25.6 m of the camera, so from any
+//     altitude nothing draws the eroded rim. The sliver is the artefact.
+//   - Dilated water does not float over dry ground where it matters, because
+//     the ground it runs into is the BANK -- opaque terrain standing above lake
+//     level, which occludes the overhang. The visible waterline becomes the
+//     terrain's own intersection with the lake plane, which is smooth and
+//     correctly shaped, rather than the decimation grid's staircase.
+// The failure modes are not symmetric: over-cover hides, under-cover glares.
 
 // One wet rectangle, in tile-local FINE PIXELS, inclusive on all four sides.
 struct LakeSheetRect {
@@ -757,15 +767,39 @@ size_t lakeSheetRects(const BasinEntry& b, const MaskT& mask, int32_t step,
     if (w <= 0 || h <= 0) return 0;
     if (mask.size() != size_t(w) * size_t(h)) return 0;
     const size_t before = out.size();
-    // Half a step, floored: the centre of a step-sized block. For step 1 this
-    // is the cell itself, so a step of 1 reproduces the mask exactly.
-    const int32_t half = step / 2;
+    // ANY WET PIXEL IN THE BLOCK, not the block's centre sample, and the owner's
+    // screenshot is why. The centre sample ERODES: a block more than half wet
+    // whose middle pixel happens to be dry is dropped whole, so the sheet stops
+    // up to a full step short of the shore and the lake is ringed by a jagged
+    // staircase of EMPTY AIR between the water and its own bank -- at a 500 m
+    // basin that step is ~4 fine pixels, 7.5 m of visible gap from the air.
+    //
+    // The erosion was justified above by "the near-field voxels draw the rim
+    // anyway". That is no longer true: near-field water meshes only within
+    // ~25.6 m of the camera, so anyone looking at a lake from more than a few
+    // dozen metres up sees the eroded rim and nothing filling it.
+    //
+    // Dilating instead is free to look at: the extra half-block of water runs
+    // INTO the bank, and the bank is opaque ground standing above lake level,
+    // so the terrain occludes it. An over-covered rim is invisible; an
+    // under-covered one is the artefact. Cost stays O(mask) overall -- each
+    // pixel is visited at most once across all blocks -- and the scan stops at
+    // the first wet pixel, so open water (the common case) exits immediately.
+    const auto blockWet = [&](int32_t cx, int32_t cy) -> bool {
+        const int32_t yEnd = (cy + step < h) ? (cy + step) : h;
+        const int32_t xEnd = (cx + step < w) ? (cx + step) : w;
+        for (int32_t y = cy; y < yEnd; ++y) {
+            const size_t row = size_t(y) * size_t(w);
+            for (int32_t x = cx; x < xEnd; ++x) {
+                if (mask[row + size_t(x)] != 0) return true;
+            }
+        }
+        return false;
+    };
     for (int32_t cy = 0; cy < h; cy += step) {
-        const int32_t sy = (cy + half < h) ? (cy + half) : (h - 1);
         int32_t runStart = -1;
         for (int32_t cx = 0; cx < w; cx += step) {
-            const int32_t sx = (cx + half < w) ? (cx + half) : (w - 1);
-            const bool wet = mask[size_t(sy) * size_t(w) + size_t(sx)] != 0;
+            const bool wet = blockWet(cx, cy);
             if (wet && runStart < 0) {
                 runStart = cx;
             } else if (!wet && runStart >= 0) {
@@ -805,6 +839,85 @@ inline size_t subtractRect(const LakeSheetRect& r, const LakeSheetRect& hole, La
     if (hole.x0 > r.x0) out[n++] = LakeSheetRect{r.x0, my0, hole.x0 - 1, my1};          // left
     if (hole.x1 < r.x1) out[n++] = LakeSheetRect{hole.x1 + 1, my0, r.x1, my1};          // right
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// THE FLUID SINK'S EXTENT BITMASK (PBF basin sink, VoxelFluidContract item 6)
+// ---------------------------------------------------------------------------
+//
+// WHAT WENT WRONG WITHOUT THIS. The GPU basin sink shipped testing a basin's
+// BOUNDING BOX against the lake datum: a particle inside the box at or below
+// the surface counted as having reached standing water, so it despawned and
+// credited the scalar ledger. At the owner's pinned spawn the picked basin was
+// a 0.29 ha pond inside an 88 x 56 m bbox, and the fluid's active window is
+// only 51.2 m across -- so the bbox STRICTLY CONTAINED the entire window, and
+// every particle anywhere in it below the pond's surface was deleted as
+// "standing water", including river water tens of metres from the pond.
+// Measured in the round-17 playtest: 104,503 spawned, 104,277 despawned to the
+// basin, 226 alive. That is a mean residence of 61 ms -- about 9 cm of travel
+// at the 150 UU/s emit speed. The owner saw no flowing water at all, because
+// the sink ate the river at the faucet mouth.
+//
+// So the sink must test the TRUE EXTENT: the same 8-connected wet component
+// `lakeExtentFill` builds, which the lake sheet already draws from. This
+// resamples that extent onto an N x N bit grid over the window the sim
+// actually simulates, which is what makes it affordable on the GPU: at N = 32
+// over 51.2 m the whole mask is 32 uints -- 128 bytes, a uniform array and one
+// bit test per particle, no texture and no buffer.
+//
+// GEOMETRY. Cell (cx, cy) covers [winMinXMm + cx*cellMm, + cellMm) and is wet
+// iff the fine pixel under its CENTRE is wet. Centre sampling rather than "any
+// wet pixel in the cell", because growing the wet set here would resume
+// DELETING RIVER WATER along the shoreline -- the exact defect this grid exists
+// to end. The error is at most half a cell either way -- 80 cm at N = 32 over
+// 51.2 m, well inside the 1.875 m pixel the extent itself is quantised to.
+//
+// NOTE THAT `lakeSheetRects` DELIBERATELY DOES THE OPPOSITE (any wet pixel),
+// and the disagreement is the point rather than an oversight: these two
+// decimate the same extent for opposite consequences. Drawing wants to
+// OVER-cover, because a sheet that falls short leaves visible air between a
+// lake and its bank while an overhang is hidden by the bank itself. Despawning
+// wants to UNDER-cover, because a sink that reaches too far eats the river. So
+// each rounds toward its own harmless side; do not "make them consistent".
+//
+// BITS. `rowsOut[cy]` bit `cx`, LSB = smallest x. All N rows are cleared
+// first, so a cell whose pixel falls outside the basin's bbox stays 0.
+//
+// RETURNS the number of wet cells. Zero is a REAL answer -- "this basin has no
+// wet cell in this window" -- and is not the same as "the extent could not be
+// resolved", which this function cannot report because it never loads
+// anything. The caller gets that distinction from `extentMaskFor` returning
+// nullptr, and must keep the two apart for the same reason that accessor does:
+// a lake that failed to decode must not read as a lake with no water in it.
+template <class MaskT>
+size_t basinExtentBits(const BasinEntry& b, const MaskT& mask, int64_t tileOxPx, int64_t tileOyPx,
+                       int32_t pixelMm, int64_t winMinXMm, int64_t winMinYMm, int64_t cellMm,
+                       int32_t n, uint32_t* rowsOut) {
+    if (rowsOut == nullptr || n <= 0 || n > 32 || cellMm <= 0 || pixelMm <= 0) return 0;
+    for (int32_t i = 0; i < n; ++i) rowsOut[i] = 0;
+    const int64_t w = int64_t(b.bboxX1) - int64_t(b.bboxX0) + 1;
+    const int64_t h = int64_t(b.bboxY1) - int64_t(b.bboxY0) + 1;
+    if (w <= 0 || h <= 0) return 0;
+    if (mask.size() != size_t(w) * size_t(h)) return 0;
+    const int64_t halfMm = cellMm / 2;
+    size_t setCells = 0;
+    for (int32_t cy = 0; cy < n; ++cy) {
+        const int64_t py =
+            floorDiv(winMinYMm + int64_t(cy) * cellMm + halfMm, int64_t(pixelMm)) - tileOyPx;
+        if (py < b.bboxY0 || py > b.bboxY1) continue;
+        const size_t row = size_t(py - b.bboxY0) * size_t(w);
+        uint32_t bits = 0;
+        for (int32_t cx = 0; cx < n; ++cx) {
+            const int64_t px =
+                floorDiv(winMinXMm + int64_t(cx) * cellMm + halfMm, int64_t(pixelMm)) - tileOxPx;
+            if (px < b.bboxX0 || px > b.bboxX1) continue;
+            if (mask[row + size_t(px - b.bboxX0)] == 0) continue;
+            bits |= (1u << uint32_t(cx));
+            ++setCells;
+        }
+        rowsOut[cy] = bits;
+    }
+    return setCells;
 }
 
 // Baked RIVERS over a `FineTileSampler`, from the P2 water plane.

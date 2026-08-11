@@ -605,6 +605,20 @@ struct FVoxelFluidLifecycle
 	double SinkMinXUU = 0.0, SinkMinYUU = 0.0, SinkMaxXUU = 0.0, SinkMaxYUU = 0.0;
 	double SinkDatumZUU = 0.0;
 	double NextSinkRefreshSeconds = 0.0;
+	// The lake's TRUE extent over the active window, as a bit grid (contract
+	// item 6, amended -- vxc::basinExtentBits). The box above is only the
+	// bounding box, and testing it alone deleted every particle in the window
+	// at the owner's spawn, river water included: round 17 logged 226 alive out
+	// of 104,503 spawned, 61 ms of residence, and no visible flowing water.
+	// bSinkExtentMaskValid false means the tile or mask would not decode -- the
+	// sink is then switched OFF, never fallen back to the box.
+	bool bSinkExtentMaskValid = false;
+	int32 SinkExtentWetCells = 0;
+	uint32 SinkExtentRows[VoxelFluidSim::kBasinExtentMaskN] = {};
+	// World UU of the mask's cell (0,0) min corner. Stored in WORLD space for
+	// the same reason the box is: the origin moves under it, and the upload
+	// subtracts the CURRENT origin every tick.
+	double SinkMaskOriginXUU = 0.0, SinkMaskOriginYUU = 0.0;
 
 	// --- particle<->scalar reconciliation (the extended conservation line) --
 	uint64 BasinDespawnsSeen = 0;   // cumulative counter value already converted to units
@@ -906,7 +920,10 @@ void UVoxelFluidSubsystem::OnOriginMoved()
 	L.NextSinkRefreshSeconds = 0.0;
 	// ...and the sink's clipped box is stale until that refresh actually runs,
 	// which it does not at all while the lifecycle is disarmed. Invalid NOW.
+	// The extent grid goes with it: it is built over the OLD window, so past
+	// the move it describes ground the sim is no longer simulating.
 	L.bSinkValid = false;
+	L.bSinkExtentMaskValid = false;
 }
 
 void UVoxelFluidSubsystem::MaybeRecentre(const FVector& ViewOriginUU)
@@ -1366,6 +1383,32 @@ void UVoxelFluidSubsystem::RefreshBasinSink(double NowSeconds)
 	// second here -- so as credits raise the lake, the sink's mouth rises with
 	// it and the loop is self-consistent.
 	L.SinkDatumZUU = B.SurfaceZUU;
+
+	// THE EXTENT, WHICH IS THE ACTUAL SINK. The clipped box above is a bbox and
+	// nothing more: at the owner's spawn the picked pond's bbox (88 x 56 m
+	// around 0.29 ha of water) was LARGER than this whole 51.2 m window, so a
+	// box test deleted every particle in the window below the pond's surface --
+	// including the river, which was nowhere near the pond. Round 17: 104,277
+	// basin despawns out of 104,503 spawns, 226 alive, 61 ms of residence.
+	//
+	// So resample the SHIPPED extent rule -- the 8-connected wet component
+	// LakeSampler::extentMaskFor builds and the lake sheet draws -- onto a
+	// 32 x 32 bit grid over this window. Rebuilt on this same 1 Hz cadence as
+	// the datum, which it must be: the datum rises as the lake fills and the
+	// wet component grows with it, and a mask from an older, lower datum would
+	// stop despawning at the new shoreline.
+	//
+	// A REFUSAL DISABLES THE SINK. extentMaskFor returns nullptr when the tile
+	// or one of its elevation blocks will not decode, which is not "no water"
+	// -- but it is also not licence to go back to the bbox. Leaving the sink
+	// off costs a few particles that walk out through the boundary and age
+	// sinks (both of which conserve their units to the ledger anyway); going
+	// back to the bbox costs the river.
+	L.bSinkExtentMaskValid = Water->BuildBasinExtentBits(
+		B, MinX, MinY, double(kActiveEdgeUU), VoxelFluidSim::kBasinExtentMaskN, L.SinkExtentRows,
+		L.SinkExtentWetCells);
+	L.SinkMaskOriginXUU = MinX;
+	L.SinkMaskOriginYUU = MinY;
 }
 
 void UVoxelFluidSubsystem::DrainSillSpills()
@@ -2169,7 +2212,12 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 		{
 			L.VerifyArmedEpoch = L.EditEpoch;
 		}
-		if (bFaucets && L.bSinkValid)
+		// The extent grid gates the sink as hard as the pick does (contract
+		// item 6, amended): no mask, no despawns. Falling back to the box is
+		// what round 17 measured -- the pond's bbox contained the entire
+		// window, so the sink deleted the river at the faucet mouth and 226 of
+		// 104,503 particles were alive.
+		if (bFaucets && L.bSinkValid && L.bSinkExtentMaskValid)
 		{
 			Args.bBasinSinkEnabled = true;
 			Args.BasinBoxMinLocalUU = FVector3f(float(L.SinkMinXUU - FluidOriginWorld.X),
@@ -2177,6 +2225,14 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			Args.BasinBoxMaxLocalUU = FVector3f(float(L.SinkMaxXUU - FluidOriginWorld.X),
 			                                    float(L.SinkMaxYUU - FluidOriginWorld.Y), kActiveEdgeUU);
 			Args.BasinDatumZLocalUU = float(L.SinkDatumZUU - FluidOriginWorld.Z);
+			// Origin-local, re-derived from the CURRENT origin every tick like
+			// the box beside it, so a recentre between sink refreshes moves the
+			// grid with the world rather than sliding it under the water.
+			Args.BasinMaskOriginLocalUU =
+				FVector2f(float(L.SinkMaskOriginXUU - FluidOriginWorld.X),
+				          float(L.SinkMaskOriginYUU - FluidOriginWorld.Y));
+			Args.BasinMaskInvCellUU = float(VoxelFluidSim::kBasinExtentMaskN) / kActiveEdgeUU;
+			FMemory::Memcpy(Args.BasinExtentRows, L.SinkExtentRows, sizeof(Args.BasinExtentRows));
 		}
 		Args.bReadbackDebugSlots =
 			bDebugDraw && (!Snapshot.bValid || Snapshot.Alive <= kDebugDrawMaxParticles);
@@ -2428,9 +2484,25 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			CVarVoxelFluidMaxAgeSec.GetValueOnGameThread() <= 0.0f
 				? FString(TEXT("off"))
 				: FString::Printf(TEXT("%llu/s"), RecycleRate);
+		// sink(basin)= also carries the EXTENT the sink is actually testing, in
+		// wet cells of the 32x32 grid over the window (contract item 6,
+		// amended). Printed because the whole round-17 defect was invisible
+		// from this line: a bbox sink that swallows the window and a correct
+		// sink that a river genuinely runs into produce the same "N/s". "extent
+		// 1024/1024" now says the grid is saturated (suspect); "extent 0/1024"
+		// says the lake is not in this window at all and no despawn can be
+		// legitimate; "extent unresolved" says the mask would not decode and
+		// the sink is therefore OFF, not falling back to the box.
+		const FString SinkExtentField =
+			L.bSinkExtentMaskValid
+				? FString::Printf(TEXT("%d/%d"), L.SinkExtentWetCells,
+				                  VoxelFluidSim::kBasinExtentMaskN * VoxelFluidSim::kBasinExtentMaskN)
+				: FString(TEXT("unresolved"));
 		const FString SinkBasinField =
-			!bFaucets ? TEXT("off")
-			          : (L.bSinkValid ? FString::Printf(TEXT("%llu/s"), BasinRate) : TEXT("none"));
+			!bFaucets ? FString(TEXT("off"))
+			: !L.bSinkValid
+				? FString(TEXT("none"))
+				: FString::Printf(TEXT("%llu/s(extent %s)"), BasinRate, *SinkExtentField);
 		const TCHAR* VerifyField = !bVerify            ? TEXT("off")
 		                           : L.LastVerifyResult == 1 ? TEXT("pass")
 		                           : L.LastVerifyResult == 0 ? TEXT("FAIL")

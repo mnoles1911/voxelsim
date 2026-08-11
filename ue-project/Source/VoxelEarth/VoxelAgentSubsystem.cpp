@@ -77,6 +77,28 @@ constexpr int32 kMineCostByMaterial[vxc::kMaterialCount] = {
     /* MAT_PERMAFROST    */ 22,
     /* MAT_MUD           */ 14,
     /* MAT_CLAY          */ 20,
+    // Debug instrument, never real content. Was implicitly 0 before this line
+    // existed: the static_assert below checks the array's declared SIZE, which
+    // C++ satisfies by zero-filling anything the initializer omits, so a
+    // missing entry is not a compile error. Written out to keep that from
+    // being invisible; the value is unchanged.
+    /* MAT_WATERMARK     */ 0,
+
+    // Asset materials. Wood is roughly as hard as packed subsoil to cut and
+    // heartwood harder than the bark around it; dead wood is dry and brittle
+    // and gives way sooner. Foliage is barely an obstacle -- a few frames of
+    // pushing through, not a dig -- which is what keeps an agent from routing
+    // a mile around a tree it could walk through the canopy of.
+    /* MAT_BARK          */ 22,
+    /* MAT_HEARTWOOD     */ 26,
+    /* MAT_DEADWOOD      */ 16,
+    /* MAT_LEAF_BROADLEAF*/ 5,
+    /* MAT_LEAF_NEEDLE   */ 5,
+    /* MAT_LEAF_JUNGLE   */ 6,
+    /* MAT_LEAF_DRY      */ 4,
+    /* MAT_BARK_PALE     */ 20,
+    /* MAT_LEAF_BLOSSOM  */ 5,
+    /* MAT_LEAF_AUTUMN   */ 5,
 };
 static_assert(sizeof(kMineCostByMaterial) / sizeof(kMineCostByMaterial[0]) == vxc::kMaterialCount,
               "kMineCostByMaterial must cover every vxc::Material entry");

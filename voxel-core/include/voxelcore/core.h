@@ -294,6 +294,27 @@ inline constexpr int64_t kSeaLevelVoxelZ = kSeaLevelMm / kVoxelSizeMm;
 static_assert(kSeaLevelVoxelZ * kVoxelSizeMm == kSeaLevelMm,
               "kSeaLevelMm must be a whole number of voxels");
 
+// --- bound decline sentinels ------------------------------------------------
+//
+// Returned by the surface/solidity bounds (Amplifier::surfaceUpperBoundMm,
+// surfaceLowerBoundMm, solidBelowBoundMm -- see voxelcore/amplifier.h for the
+// derivations) when they will not bound a footprint.
+//
+// INT64_MAX rather than a bool-out-param so a caller that forgets to check
+// still gets the SAFE answer ("the terrain might reach arbitrarily high here"),
+// never a false all-air verdict. Getting that backwards is not a lost
+// optimisation: the streaming layer skips generating any chunk these prove
+// empty, so a bound that is too tight is terrain that never generates.
+inline constexpr int64_t kSurfaceBoundDeclined = INT64_MAX;
+
+// The mirror sentinel, for the LOWER bound and the all-solid bound. INT64_MIN
+// for exactly the same reason: it is the safe answer. A caller that forgets to
+// check gets "the terrain might reach arbitrarily low here" / "nothing is
+// provably solid here", never a false all-solid verdict. The two sentinels are
+// deliberately different values so a caller cannot pass one where the other is
+// meant and still compile into something that looks like it works.
+inline constexpr int64_t kSurfaceLowerBoundDeclined = INT64_MIN;
+
 using MaterialId = uint8_t;
 
 // Material set v1 (amplifier stratigraphy + M4 per-biome surface materials,
@@ -331,6 +352,32 @@ enum Material : MaterialId {
     // SURFACE -- see Amplifier::surfaceUpperBoundMm, whose soundness argument
     // that argument depends on.
     MAT_WATERMARK = 15,
+
+    // --- ASSET MATERIALS ---------------------------------------------------
+    // Wood and foliage, for the baked environment assets (asset-forge). The
+    // terrain generator never produces any of these; they arrive only from an
+    // asset, which is why they sit after everything the amplifier can emit.
+    //
+    // They are here because without them a baked tree renders as SOMETHING
+    // rather than failing. MaterialId is a uint8_t, so an asset built from id
+    // 20 does not fault -- it indexes past the end of every material-keyed
+    // array in the engine and the mesher cheerfully emits quads for it. The
+    // whole library except rock, grass and reeds was in that state: nine of
+    // the thirteen materials in use were past the end of this enum.
+    //
+    // The numbers are not free choices. asset-forge has been baking these ids
+    // since before the engine had them (forge/materials.py), so every .vxa
+    // already on disk carries them and the two lists have to agree exactly.
+    MAT_BARK = 16,           // generic tree bark
+    MAT_HEARTWOOD = 17,      // inner wood, exposed on cut or broken trunks
+    MAT_DEADWOOD = 18,       // standing dead wood, snags, desert skeletons
+    MAT_LEAF_BROADLEAF = 19, // temperate broadleaf foliage
+    MAT_LEAF_NEEDLE = 20,    // conifer needles
+    MAT_LEAF_JUNGLE = 21,    // rainforest foliage, palm fronds
+    MAT_LEAF_DRY = 22,       // savanna and arid foliage
+    MAT_BARK_PALE = 23,      // birch and aspen: white/silver bark
+    MAT_LEAF_BLOSSOM = 24,   // cherry and other flowering species
+    MAT_LEAF_AUTUMN = 25,    // seasonal turn
     kMaterialCount
 };
 
