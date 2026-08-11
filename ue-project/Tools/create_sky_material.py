@@ -30,9 +30,10 @@ between the two sky-material generators mandatory, not stylistic:
     3. Tools/create_water_voxel_material.py         (M_WaterVoxel)
 
 (3) IS NOT OPTIONAL AND WAS LEARNED THE EXPENSIVE WAY. M_WaterVoxel reads
-SunDirection out of this collection for its sun glint
-(create_water_voxel_material.py:512-523), so it is a dependent exactly like the
-dome -- but it fails LOUDER and worse: re-running (1) alone left it with
+SunDirection, MoonDirection and MoonLightFraction out of this collection for its
+sun and moon glints and its night sky reflection (create_water_voxel_material.py,
+the collection_param helper and the two glint blocks), so it is a dependent
+exactly like the dome -- but it fails LOUDER and worse: re-running (1) alone left it with
 "(Node CollectionParameter) CollectionParameter has invalid parameter None",
 which is a hard compile failure, so UE substituted the DEFAULT MATERIAL for
 every water surface in the game. The owner's report was "I don't see any lake
@@ -461,6 +462,24 @@ SCALAR_PARAMS = [
     # the module docstring, and the ordering note at the top of this file for why
     # it is declared here rather than by the dome generator.
     ("StarAmbientGain", 0.0),
+    # Read by M_WaterVoxel's moon glint, not by M_NightSky. The moon's directional
+    # light expressed as a FRACTION of the sun's, written every frame by
+    # UVoxelSkySubsystem::ApplySkyMaterialParams -- see the long note there for why
+    # the division happens in C++ and not in the material (it is the only place
+    # both intensities are in scope, so it is the only place that cannot hold a
+    # stale copy of one of them).
+    #
+    # Default 0.0 = NO MOON PATH ON THE WATER, deliberately. Every other moon
+    # parameter in this table defaults to a visible value so the material shows
+    # what it is for the moment it is applied to a sphere with no C++ running. This
+    # one goes the other way: a glint is a SPECULAR term, and an undriven specular
+    # highlight parked at a fixed direction is the single most convincing way to
+    # make a lake look correct while proving nothing. 0.0 makes an unbound or
+    # undriven collection fail visibly (no moon path at all) rather than
+    # plausibly -- the same argument the module docstring makes about a
+    # CollectionParameter compiling to a constant instead of erroring, applied to
+    # the default rather than to the binding.
+    ("MoonLightFraction", 0.0),
 ]
 
 # (name, r, g, b, a)

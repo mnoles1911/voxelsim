@@ -85,15 +85,129 @@ variation are safe, and everything below is one of those two things:
   * Roughness/specular tightened slightly now that the normal actually
     reaches the lit result, so the moving normal reads as a moving glint.
 
+NIGHT WATER (2026-08-11): the lake had no moon path and no reflection at all
+after dark, and it was two separate causes that had to be fixed in two places.
+
+  * IN C++, and this was the larger one: both directional lights sat at
+    ForwardShadingPriority 0, so the renderer chose the single forward /
+    translucent directional light by raw brightness and gave it to the SUN at
+    midnight (LightGridInjection.cpp:1500-1520; the tiebreak runs BEFORE
+    atmosphere transmittance is applied, so a sun below the horizon still
+    competes at full strength). This material is BLEND_TRANSLUCENT with
+    TLM_SURFACE_PER_PIXEL_LIGHTING, so all of its direct lighting comes from that
+    one light -- which at night was 37 degrees underground, N.L clamped to zero,
+    no direct light on the lake from either body. Fixed in
+    UVoxelSkySubsystem::ApplyLightsFromState; nothing in this file could have.
+    That same defect is what raised the editor's "multiple directional lights are
+    competing to be the single one used for forward shading, translucent, water
+    or volumetric fog" warning.
+  * IN THIS FILE, two additions, both driven by the new MPC scalar
+    MoonLightFraction (= moon light / sun light, written every frame by
+    ApplySkyMaterialParams): an analytic MOON GLINT mirroring the sun glint node
+    for node, and a NIGHT branch on the sky reflection. The second matters more
+    than it sounds -- the reflection was gated by saturate(SunDirection.z), which
+    is exactly zero from dusk to dawn, so the Fresnel sheen this file calls "what
+    the eye reads as a liquid surface" switched off every night.
+
+Both are scaled by the one scalar, so they vanish together at moonset and at new
+moon and both track voxel.Sky.MoonIntensity. Neither reads scene colour, adds a
+planar reflection, or adds an SSR probe; the standing ban above is untouched.
+
+NEW DEPENDENCY, AND IT SHARPENS THE ORDERING RULE: this material now binds THREE
+MPC_VoxelSky parameters (SunDirection, MoonDirection, MoonLightFraction) instead
+of one. MoonLightFraction did not exist before 2026-08-11, so running this script
+against an MPC authored by an older create_sky_material.py now RAISES, by name,
+in collection_param() -- see that helper for why the check was added here at all
+(it is the one binding read-back the sky generators had and this one did not).
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
+
+MUST BE RUN THIRD, after create_sky_material.py and
+create_sky_atmosphere_dome_material.py, EVERY TIME either of those runs. The
+reason and the cost of getting it wrong are at the top of create_sky_material.py.
 """
 
+import os
+import sys
+import time
+
 import unreal
+
+# The star subgraph is SHARED, not re-derived. Tools/sky_star_graph.py owns the
+# one horizon->equatorial rotation, the one equirect UV and the one seam fix, and
+# its module docstring says at length why a second copy is the failure mode to
+# fear: two samplers of the same map that disagree produce a sky that is still
+# sharp, still rotating at the right rate, and still wrong, with nothing in a
+# frame to say so. A reflection of the stars that drifted from the stars would be
+# exactly that defect, and the water is the surface most likely to show it (the
+# real sky and its mirror image are in the same frame, a few hundred pixels
+# apart).
+#
+# A -run=pythonscript commandlet does not put the script's own directory on
+# sys.path, hence the explicit insert -- same as create_sky_material.py:417-420.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sky_star_graph import (  # noqa: E402
+    SkyGraphBuilder,
+    build_horizon_fade,
+    build_star_uv,
+    sample_starmap,
+)
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_WaterVoxel"
 FULL_PATH = PACKAGE_PATH + "/" + MATERIAL_NAME
+
+
+# STAR REFLECTION: BUILT OR NOT BUILT, AND NOTHING IN BETWEEN.
+#
+# This exists so the feature's GPU cost can be measured honestly from ONE binary.
+# The two arms are two runs of this script with the environment variable flipped,
+# which produces two genuinely different shaders from the same C++ build -- the
+# only comparison that isolates the material.
+#
+# WHY NOT A MATERIAL SWITCH OR A ZERO MULTIPLY. Multiplying the star term by a
+# parameter set to 0 measures nothing: the texture fetch, the atan2, the arcsine
+# and the two derivative corrections all still execute, and the compiler cannot
+# fold them away because the parameter is a uniform it must assume can change.
+# A StaticSwitchParameter would work, but it makes the OFF arm a different
+# permutation of the SAME material asset, and this project has already been
+# burned once by a water material that was silently not the material anyone
+# thought it was (see the 2026-08-10 default-material failure in the module
+# docstring). Two full regenerations, each logging which arm it built, leaves no
+# room for that.
+#
+# Default is ON: once the measurement is in, the shipped asset is the one the
+# owner decides to keep, and an unset variable should build the full material.
+STAR_REFLECTION_ENV = "VOXEL_WATER_STAR_REFLECT"
+STAR_REFLECTION = os.environ.get(STAR_REFLECTION_ENV, "1").strip().lower() not in (
+    "0", "off", "false", "no", "")
+
+# --- THE FROZEN-RIPPLE MEASUREMENT ARM ---------------------------------------
+#
+# VOXEL_WATER_FREEZE_TIME=1 replaces the single MaterialExpressionTime that
+# drives BOTH ripple systems (the pixel-shader normal waves and the vertex WPO
+# waves -- they share one `ripple_time` node) with a CONSTANT. Everything else
+# about the graph is untouched: the same four sine channels, the same
+# frequencies, strengths and speeds, the same wiring, the same instruction
+# count to within the folding the compiler does on a constant phase.
+#
+# WHY IT EXISTS. Water flicker is measured by taking N frames from one frozen
+# pose and diffing consecutive pairs. That measurement cannot tell ANIMATION
+# from INSTABILITY: a panning ripple is supposed to change between frames, and
+# it lands in the metric identically to a shading term that cannot make up its
+# mind. Worse, the burst's true shutter spacing is ~0.43 s (each 2560x1440 PNG
+# write stalls the game), so the ripple advances about twenty-six times further
+# between two measured frames than it does between two frames the player sees --
+# the confound is not merely present, it is AMPLIFIED by the instrument.
+#
+# With this arm built, any residual inter-frame difference on water is temporal
+# instability by construction. This is a MEASUREMENT arm and not a shipping
+# one: the default is unset = LIVE, so a normal regeneration is byte-for-byte
+# the material that shipped.
+FREEZE_TIME_ENV = "VOXEL_WATER_FREEZE_TIME"
+FREEZE_RIPPLE_TIME = os.environ.get(FREEZE_TIME_ENV, "0").strip().lower() not in (
+    "0", "off", "false", "no", "")
 
 
 def main():
@@ -513,14 +627,48 @@ def main():
     if sky_collection is None:
         raise RuntimeError("MPC_VoxelSky not found -- the sun glint needs SunDirection")
 
+    # EVERY COLLECTION BINDING IN THIS FILE GOES THROUGH HERE, AND IT CHECKS THE
+    # NAME AGAINST THE ASSET AS READ BACK.
+    #
+    # This closes the one gap create_sky_material.py's ordering note left open. That
+    # file says an unresolved CollectionParameter does not fail to compile, it
+    # compiles to a CONSTANT (MaterialExpressions.cpp:17179-17193), and that both
+    # sky generators re-check every binding by name for exactly that reason. THIS
+    # generator never did -- it set parameter_name and hoped -- which is why the
+    # 2026-08-10 failure had to be diagnosed from the owner's "I don't see any lake
+    # basins" rather than from a raised exception at authoring time.
+    #
+    # A typo or a stale MPC now raises HERE, naming the parameter and listing what
+    # the collection actually has, which is a thirty-second fix instead of a
+    # debugging session. Note the two failure shapes it catches are different: a
+    # DELETED parameter raises, and so does a parameter this script expects that a
+    # not-yet-regenerated MPC does not have -- which is precisely the ordering
+    # mistake documented at the top of create_sky_material.py.
+    def collection_param(name, x, y):
+        have = [str(p.get_editor_property("parameter_name"))
+                for p in sky_collection.get_editor_property("scalar_parameters")]
+        have += [str(p.get_editor_property("parameter_name"))
+                 for p in sky_collection.get_editor_property("vector_parameters")]
+        if name not in have:
+            raise RuntimeError(
+                "MPC_VoxelSky has no parameter %r -- it has %s. If you just added it to "
+                "create_sky_material.py's SCALAR_PARAMS/VECTOR_PARAMS, you have to RE-RUN that "
+                "script (and then the dome, then this one, in that order -- see the ordering note "
+                "at the top of create_sky_material.py). An unresolved CollectionParameter does not "
+                "fail to compile, it compiles to a constant, so this check is the only thing "
+                "between a typo and a silently dead term."
+                % (name, sorted(have)))
+        node = mel.create_material_expression(
+            material, unreal.MaterialExpressionCollectionParameter, x, y)
+        node.set_editor_property("collection", sky_collection)
+        node.set_editor_property("parameter_name", name)
+        return node
+
     # SunDirection is written every frame by VoxelSkySubsystem (ApplySkyMaterial
     # parameters). Reusing it rather than a constant is what keeps the glint on
     # the actual sun: the water tracks sunrise and sunset for free, and a frozen
     # -TimeScale 0 capture gets the sun the rest of the frame was lit by.
-    sun_dir_param = mel.create_material_expression(
-        material, unreal.MaterialExpressionCollectionParameter, -1300, 1300)
-    sun_dir_param.set_editor_property("collection", sky_collection)
-    sun_dir_param.set_editor_property("parameter_name", "SunDirection")
+    sun_dir_param = collection_param("SunDirection", -1300, 1300)
 
     sun_dir3 = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1300)
     sun_dir3.set_editor_property("r", True)
@@ -578,6 +726,104 @@ def main():
     if not mel.connect_material_expressions(glint_tint, "", glint, "B"):
         raise RuntimeError("connect glint_tint -> glint.B failed")
 
+    # ======================================================================
+    # MOON GLINT -- the moon path on the water. Added 2026-08-11 because the
+    # owner asked why the moon does not reflect off the lake.
+    #
+    # THERE WERE TWO REASONS IT DID NOT, and this material was only one of them.
+    # The other was in C++ and is the bigger one: both directional lights sat at
+    # ForwardShadingPriority 0, so the renderer picked the single forward /
+    # translucent light by raw brightness and handed it to the SUN at midnight
+    # (LightGridInjection.cpp:1500-1520). This material is BLEND_TRANSLUCENT with
+    # TLM_SURFACE_PER_PIXEL_LIGHTING, so its direct lighting comes from exactly
+    # that one light -- a sun below the horizon, N.L clamped to zero, no direct
+    # light on the lake all night from either body. That half is fixed in
+    # UVoxelSkySubsystem::ApplyLightsFromState; see kForwardMoonPrimarySunBelowDeg.
+    # This half is the SPECULAR half, and neither alone is enough.
+    #
+    # STRUCTURALLY IDENTICAL TO THE SUN GLINT ABOVE, deliberately, down to the
+    # exponent and the tint. Every difference between them is one multiply. The
+    # things it therefore inherits for free: the same reflect(V) mirror direction
+    # against this material's own rippled normal, so the moon path breaks up over
+    # waves exactly as the sun's does; and the same reason for computing it
+    # analytically rather than trusting translucent specular.
+    #
+    # THE EXPONENT STAYS 900, i.e. the SUN's lobe, and that is a decision. The real
+    # moon subtends the same ~0.5 deg the sun does, so 900 is as physical for one as
+    # the other. It is tempting to widen it to match kMoonDrawnAngularRadiusDeg's
+    # nine-times-enlarged DISC, but the glint's width is the term the sun-glint note
+    # above identifies as the one most able to turn a highlight into a plate of wet
+    # plastic across the whole basin, and the enlarged disc is a separate cheat with
+    # a separate justification. The long streak the eye expects from a moon path
+    # comes from the WAVE SLOPE DISTRIBUTION -- the panning ripple normal below --
+    # not from the lobe, so widening the lobe would buy the wrong thing anyway.
+    #
+    # THE TINT IS THE SUN'S TINT SCALED BY MoonLightFraction, and that one multiply
+    # is the whole physical content of this block. MoonLightFraction is written every
+    # frame by UVoxelSkySubsystem::ApplySkyMaterialParams as
+    # S.MoonIntensity / GetSunIntensity() -- "how much dimmer than the sun the moon
+    # is, right now". So the moon's highlight is the sun's calibrated highlight,
+    # dimmed by exactly the ratio the two LIGHTS are dimmed by. Nothing here needs
+    # tuning and nothing here can drift from the lighting rig.
+    #
+    # WHAT THAT ONE SCALAR CARRIES, all of it from the C++ side with no logic here:
+    #   * moonset      -- MoonHorizonGate is already inside S.MoonIntensity, so the
+    #                     path fades out as the moon sets and is gone once it is down
+    #   * new moon     -- MoonIlluminatedFraction is in there too, so a new moon
+    #                     lays no path at all
+    #   * daylight     -- the sun-suppression term zeroes it before sunrise
+    #   * the owner's knob -- voxel.Sky.MoonIntensity scales it, so dialling the
+    #                     moonlight moves the water and the ground by the same stops
+    # Reconstructing any of those from MoonDirection and MoonPhaseFraction in this
+    # graph was the alternative, and it would have been a second copy of
+    # ApplyLightsFromState living in a Python asset generator, unable to see the
+    # cvar, and wrong in a way no log line would report.
+    moon_dir_param = collection_param("MoonDirection", -1300, 1900)
+
+    moon_dir3 = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 1900)
+    moon_dir3.set_editor_property("r", True)
+    moon_dir3.set_editor_property("g", True)
+    moon_dir3.set_editor_property("b", True)
+    moon_dir3.set_editor_property("a", False)
+    if not mel.connect_material_expressions(moon_dir_param, "", moon_dir3, ""):
+        raise RuntimeError("connect moon_dir_param -> moon_dir3 failed")
+
+    # Scalar. NOT masked -- a CollectionParameter bound to a SCALAR compiles as a
+    # float and a ComponentMask on it is both unnecessary and a pin-type mismatch
+    # waiting to happen. The vector ones above are masked only to drop the unused
+    # .a that FLinearColor forces on them.
+    moon_light_fraction = collection_param("MoonLightFraction", -1300, 2060)
+
+    moon_glint_dot = mel.create_material_expression(material, unreal.MaterialExpressionDotProduct, -950, 1900)
+    if not mel.connect_material_expressions(refl_vec, "", moon_glint_dot, "A"):
+        raise RuntimeError("connect refl_vec -> moon_glint_dot.A failed")
+    if not mel.connect_material_expressions(moon_dir3, "", moon_glint_dot, "B"):
+        raise RuntimeError("connect moon_dir3 -> moon_glint_dot.B failed")
+
+    moon_glint_sat = mel.create_material_expression(material, unreal.MaterialExpressionSaturate, -800, 1900)
+    if not mel.connect_material_expressions(moon_glint_dot, "", moon_glint_sat, ""):
+        raise RuntimeError("connect moon_glint_dot -> moon_glint_sat failed")
+
+    moon_glint_pow = mel.create_material_expression(material, unreal.MaterialExpressionPower, -650, 1900)
+    moon_glint_pow.set_editor_property("const_exponent", 900.0)
+    if not mel.connect_material_expressions(moon_glint_sat, "", moon_glint_pow, "Base"):
+        raise RuntimeError("connect moon_glint_sat -> moon_glint_pow.Base failed")
+
+    moon_glint_scaled = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1960)
+    if not mel.connect_material_expressions(moon_glint_pow, "", moon_glint_scaled, "A"):
+        raise RuntimeError("connect moon_glint_pow -> moon_glint_scaled.A failed")
+    if not mel.connect_material_expressions(moon_light_fraction, "", moon_glint_scaled, "B"):
+        raise RuntimeError("connect moon_light_fraction -> moon_glint_scaled.B failed")
+
+    # glint_tint REUSED, not copied. One node, one calibration, and the moon glint
+    # cannot acquire a different colour balance from the sun glint by an edit that
+    # only remembers to change one of them.
+    moon_glint = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -380, 1900)
+    if not mel.connect_material_expressions(moon_glint_scaled, "", moon_glint, "A"):
+        raise RuntimeError("connect moon_glint_scaled -> moon_glint.A failed")
+    if not mel.connect_material_expressions(glint_tint, "", moon_glint, "B"):
+        raise RuntimeError("connect glint_tint -> moon_glint.B failed")
+
     # SKY REFLECTION. A constant sky colour gated by sun altitude, NOT a scene
     # capture and NOT a reflection probe: the ban in the module docstring is on
     # reading scene COLOUR, and a probe read is the same hazard wearing a
@@ -621,6 +867,186 @@ def main():
     if not mel.connect_material_expressions(day_gate, "", sky_lit, "B"):
         raise RuntimeError("connect day_gate -> sky_lit.B failed")
 
+    # THE NIGHT HALF OF THE SAME REFLECTION, and the second reason the lake looked
+    # dead after dark.
+    #
+    # saturate(SunDirection.z) above is EXACTLY ZERO from dusk to dawn. That was
+    # correct as far as it went -- the lake should not mirror a blue daytime sky it
+    # cannot see -- but the consequence was that the Fresnel reflection, the term
+    # the comment above calls "what the eye reads as a liquid surface before any
+    # wave or glint registers", switched off completely every night. A surface with
+    # no reflection at a grazing angle does not read as water at any hour. Note this
+    # is INDEPENDENT of the moon glint added above: the glint is a specular
+    # highlight a few degrees wide, and this is the broad sheen across the whole
+    # basin. Fixing only one of them leaves the lake looking wrong in the other way.
+    #
+    # THE NIGHT SKY IS THE DAY SKY TIMES MoonLightFraction, with no new constant.
+    # sky_tint is the daylit sky's reflected colour; the night sky is lit by the
+    # moon exactly as the day sky is lit by the sun, so scaling by
+    # (moon light / sun light) is not an approximation of convenience, it is the
+    # same ratio the two skies actually stand in -- inside this project's chosen
+    # moon cheat, which is the only frame of reference that matters here. At the
+    # current defaults that puts the reflected sky ~1.8 stops below its daytime
+    # self once the exposure curve's night lift is counted, which sits alongside the
+    # ground's -2.0 stops rather than fighting it. Re-using the SAME scalar the moon
+    # glint uses means the broad sheen and the highlight can never be tuned into
+    # disagreement, and both vanish together at moonset and at new moon.
+    #
+    # THE COLOUR IS DELIBERATELY NOT SHIFTED BLUE. It is tempting to hand the night
+    # branch its own cooler tint, and this file will not: the moon's colour is
+    # settled in C++ from a measurement of T_MoonColor (kMoonAlbedoTint) and is
+    # deliberately NOT the old 12000 K blue, with voxel.Sky.MoonTintStrength as the
+    # A/B. A blue invented here would be a second, unreachable opinion about the
+    # same question, and it would win in the one place the owner is most likely to
+    # be looking at when he forms a view about the night's colour.
+    #
+    # WHAT THIS DOES NOT DO: a moonless but starlit night still gets no sheen from
+    # this term, because MoonLightFraction is 0. That is a real gap and it is left
+    # open rather than papered over with an invented starlight floor -- the honest
+    # value for one is a measurement nobody has taken. Starlight is NOT absent from
+    # the water in that case: the SkyLight's real-time capture carries the star term
+    # (voxel.Sky.StarAmbientGain, routed into the capture through
+    # M_SkyAtmosphereDome's ReflectionCapturePassSwitch) and reaches this surface as
+    # DIFFUSE ambient on BaseColor. What it cannot do is produce a mirrored sky at a
+    # grazing angle. Giving the lake literal reflected STARS -- individual points,
+    # moving with the sidereal rotation -- means sampling T_SkyStarmap along the
+    # reflection vector via Tools/sky_star_graph.py's sample_starmap, which is
+    # allowed (it is a texture read, not a scene-colour read, so no ban is engaged)
+    # but adds the whole star subgraph to a TRANSLUCENT material drawn over very
+    # large screen areas by the far-field sheets. That is a perf decision on a frame
+    # already measured as render-thread bound, so it is a deliberate non-goal here
+    # rather than an oversight.
+    night_sky = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -800, 1780)
+    if not mel.connect_material_expressions(sky_tint, "", night_sky, "A"):
+        raise RuntimeError("connect sky_tint -> night_sky.A failed")
+    if not mel.connect_material_expressions(moon_light_fraction, "", night_sky, "B"):
+        raise RuntimeError("connect moon_light_fraction -> night_sky.B failed")
+
+    # ADD, not LERP. The two branches are already mutually exclusive in practice --
+    # the day gate is 0 whenever the sun is down and MoonLightFraction is 0 whenever
+    # the sun is up (ApplyLightsFromState's sun-suppression term is what guarantees
+    # the second one) -- so a lerp would need a third gate to express something the
+    # inputs already express, and would be a place for the two to disagree.
+    sky_total = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -680, 1700)
+    if not mel.connect_material_expressions(sky_lit, "", sky_total, "A"):
+        raise RuntimeError("connect sky_lit -> sky_total.A failed")
+    if not mel.connect_material_expressions(night_sky, "", sky_total, "B"):
+        raise RuntimeError("connect night_sky -> sky_total.B failed")
+
+    # ======================================================================
+    # REFLECTED STARS (2026-08-11) -- the gap the block above names, closed.
+    #
+    # The night branch immediately above stops at a flat scaled sky colour, and
+    # its own comment says why that is not the whole answer: a moonless night
+    # gets no sheen at all, because MoonLightFraction is 0, and even a moonlit
+    # one gets a featureless wash where the eye expects points of light. The
+    # comment then names the fix and calls it a deliberate non-goal on perf
+    # grounds. This block does it, and the perf question is now answered with a
+    # measurement instead of an estimate rather than left as an assumption --
+    # which is the whole reason STAR_REFLECTION above is a build-time arm.
+    #
+    # WHAT IS ALLOWED HERE AND WHAT IS NOT. The standing ban in the module
+    # docstring is on reading scene COLOUR: refraction, planar reflections, an
+    # SSR probe. All three are banned because the value they read IS the
+    # partially composed translucent stack, so the answer depends on draw order
+    # and two water fragments at one pixel disagree. A TEXTURE fetch along the
+    # reflection vector has none of that: T_SkyStarmap is the same texture
+    # whatever else has been drawn, so every fragment computes the same answer in
+    # any order. The sort-key argument the Fresnel block makes a few lines up
+    # applies here word for word.
+    #
+    # THE DIRECTION IS refl_vec, THE SAME NODE THE TWO GLINTS USE. That is not a
+    # saving of one node, it is the guarantee that the mirrored sky and the two
+    # mirrored light sources are all mirrored about the SAME rippled normal. If
+    # the stars used their own reflection the moon path could sit in one place
+    # and the reflected star field in another, on the same wave.
+    #
+    # THE HORIZON FADE IS DOING REAL WORK HERE, not carried along from the dome.
+    # build_horizon_fade smoothsteps on the Z of the direction it is handed, and
+    # the direction handed to it here is the MIRROR ray, not the gaze. So it
+    # asks "does the mirror ray point at the sky or into the ground", and kills
+    # the term when the answer is the ground: on the underside of a surface seen
+    # from below (this material is two_sided), and on the far face of a ripple
+    # steep enough to turn the mirror ray downward. Without it those pixels would
+    # sample the star map's southern rows and show stars coming out of the lake
+    # bed.
+    #
+    # THE NIGHT GATE IS StarBrightness, AND IT IS NOT MoonLightFraction.
+    # StarBrightness is the MPC scalar C++ already writes every frame as the
+    # sunrise fade (1 below about -12 deg solar altitude, 0 above 0 deg,
+    # smoothstepped between -- VoxelSkySubsystem StarBrightnessForSunAltitude,
+    # times voxel.Sky.StarGain). Using it means:
+    #   * the reflected stars appear and fade at EXACTLY the moment the real ones
+    #     do, because it is the same scalar M_NightSky's own gain uses, and
+    #   * they survive a new moon and a moonset, which is the precise gap the
+    #     block above documents and could not close with MoonLightFraction --
+    #     that scalar is 0 on a moonless night, and a moonless night is when
+    #     stars are most visible, not least.
+    # Scaling this by MoonLightFraction as well would have been "consistent with
+    # the night sky term" in wording and backwards in physics.
+    #
+    # BRIGHTNESS IS FRESNEL AND NOTHING ELSE. This term is added into sky_total,
+    # so the multiply by `fresnel` a few lines below is the only scaling it gets:
+    # about 0.02 looking straight down, rising toward 1 at a grazing angle. That
+    # IS the reflectance of water, so no invented constant is needed and the
+    # still-water grazing view the owner asked about -- where Fresnel is near 1 --
+    # is exactly the case that shows the most stars. StarReflectGain is a plain
+    # material scalar (default 1.0, i.e. physically neutral) left in as the one
+    # knob, so the term can be dimmed or brightened from a material instance
+    # without another regeneration.
+    #
+    # WHAT THIS WILL AND WILL NOT LOOK LIKE, stated now so a capture is not read
+    # as a bug. The star map is sampled with EXPLICIT derivatives, so the mip is
+    # chosen from how fast the reflection vector varies across the screen. On
+    # STILL water the normal barely changes, the derivatives are tiny and the
+    # stars are near-point sharp. On chop the mirror ray swings by degrees per
+    # pixel, a low mip is selected, and the star field correctly degrades to a
+    # broad glow rather than to a field of aliasing sparkle. Both are right; only
+    # the first is the picture anyone imagines when they ask for this.
+    #
+    # THE ONE KNOWN ARTEFACT. sky_star_graph's seam fix subtracts round(du/dx),
+    # which assumes a real derivative is far below 0.5 turns per pixel. On a
+    # steep ripple near the celestial poles that assumption can fail and the mip
+    # comes out one or two levels too sharp for a few pixels. On the DOME that
+    # case cannot arise (the gaze direction is smooth); here it can. The visible
+    # consequence is a little shimmer in the reflection of the polar sky on
+    # rough water, and it is bounded by the same star field being dim there.
+    sky_reflected = sky_total
+    if STAR_REFLECTION:
+        # SkyGraphBuilder rather than raw mel calls, because build_star_uv and
+        # sample_starmap are written against it. It brings its own checked
+        # connects and its own checked CollectionParameter binding, which is the
+        # same guarantee collection_param() above gives this file's own nodes.
+        b = SkyGraphBuilder(material, sky_collection)
+
+        # Normalized explicitly. ReflectionVectorWS is unit length in practice,
+        # but build_star_uv's arcsine reads this vector's Z as sin(dec) directly
+        # and a length that is 1.001 is a declination error, not a brightness
+        # error -- it would move stars, silently.
+        refl_dir = b.normalize(refl_vec)
+        refl_z = b.mask(refl_dir, "", b=True)
+
+        star_uv, star_ddx, star_ddy = build_star_uv(b, refl_dir, refl_z)
+        starmap = sample_starmap(b, star_uv, star_ddx, star_ddy)
+
+        star_gain = b.mul(b.collection_param("StarBrightness"),
+                          build_horizon_fade(b, refl_z))
+        star_gain = b.mul(star_gain, b.scalar("StarReflectGain", 1.0))
+
+        # "RGB" explicitly: a TextureSample's DEFAULT output is RGBA, and
+        # multiplying a float4 into this chain would carry an alpha nobody wants
+        # into the emissive sum. sky_star_graph's own docstring for
+        # sample_starmap says to read RGB and not the default, for this reason.
+        star_reflection = b.mul(starmap, star_gain, "RGB", "")
+
+        # ADDED to sky_total, and therefore UPSTREAM of Fresnel, of the foam
+        # suppression and of the top-face mask below. All three are wanted:
+        # stars are a reflection so they must obey Fresnel; whitewater scatters
+        # and must not mirror a star field; and a submerged side wall is not a
+        # sky-facing surface. Attaching this after the Fresnel multiply would
+        # have quietly opted out of all three.
+        sky_reflected = b.add(sky_total, star_reflection)
+
     # Fresnel with water's real normal-incidence reflectance, 0.02. The Normal
     # input is deliberately LEFT UNCONNECTED so the node uses this material's own
     # shading normal -- which is the panning ripple authored in the W3 section
@@ -631,16 +1057,29 @@ def main():
     fresnel.set_editor_property("base_reflect_fraction", 0.02)
 
     reflection = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -500, 1650)
-    if not mel.connect_material_expressions(sky_lit, "", reflection, "A"):
-        raise RuntimeError("connect sky_lit -> reflection.A failed")
+    if not mel.connect_material_expressions(sky_reflected, "", reflection, "A"):
+        raise RuntimeError("connect sky_reflected -> reflection.A failed")
     if not mel.connect_material_expressions(fresnel, "", reflection, "B"):
         raise RuntimeError("connect fresnel -> reflection.B failed")
 
-    surface_light = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -340, 1540)
+    # BOTH GLINTS ARE FRESNEL-FREE, day and night alike. The reflection above is
+    # Fresnel-weighted and these are not, and that asymmetry is correct rather than
+    # an oversight: Fresnel governs how much of the SKY a surface mirrors, while a
+    # specular return off a rippled surface is dominated by the slope distribution
+    # -- which the normal already supplies. Weighting the glint by Fresnel too would
+    # delete the sun's own reflection when looking straight down at a calm lake at
+    # noon, which is the one place everyone has seen it.
+    glints = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -340, 1440)
+    if not mel.connect_material_expressions(glint, "", glints, "A"):
+        raise RuntimeError("connect glint -> glints.A failed")
+    if not mel.connect_material_expressions(moon_glint, "", glints, "B"):
+        raise RuntimeError("connect moon_glint -> glints.B failed")
+
+    surface_light = mel.create_material_expression(material, unreal.MaterialExpressionAdd, -220, 1540)
     if not mel.connect_material_expressions(reflection, "", surface_light, "A"):
         raise RuntimeError("connect reflection -> surface_light.A failed")
-    if not mel.connect_material_expressions(glint, "", surface_light, "B"):
-        raise RuntimeError("connect glint -> surface_light.B failed")
+    if not mel.connect_material_expressions(glints, "", surface_light, "B"):
+        raise RuntimeError("connect glints -> surface_light.B failed")
 
     # FOAM IS ADDITIVE ON TOP OF THIS, and this is the pin that makes that true
     # in the direction that matters. Froth is a scattering medium: it is the one
@@ -823,7 +1262,16 @@ def main():
     uv = mel.create_material_expression(material, unreal.MaterialExpressionTextureCoordinate, -900, 700)
     uv.set_editor_property("coordinate_index", 0)
 
-    ripple_time = mel.create_material_expression(material, unreal.MaterialExpressionTime, -900, 950)
+    # ONE Time node drives every ripple channel below AND the WPO ripple further
+    # down, so freezing the animation for a measurement arm is a single-node
+    # substitution rather than a graph edit. See FREEZE_RIPPLE_TIME's note at the
+    # top of the file for what the arm is for.
+    if FREEZE_RIPPLE_TIME:
+        ripple_time = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant, -900, 950)
+        ripple_time.set_editor_property("r", 0.0)
+    else:
+        ripple_time = mel.create_material_expression(material, unreal.MaterialExpressionTime, -900, 950)
 
     def make_wave_channel(mask_r, mask_g, freq, speed, strength, y):
         """One panning sine channel: mask an axis of `uv` -> scale by freq ->
@@ -1130,6 +1578,133 @@ def main():
     mel.recompile_material(material)
 
     unreal.EditorAssetLibrary.save_loaded_asset(material)
+
+    # THE RAN-FLAG, and it is deliberately not "success".
+    #
+    # This project's standing rule is that a stage must log something that
+    # distinguishes "ran and found nothing" from "did not run". For an A/B built
+    # by re-running this script, the thing that must be distinguishable is WHICH
+    # ARM was built -- and a perf log that merely says the script succeeded
+    # cannot tell an OFF arm from a run where the environment variable never
+    # reached the process. So the arm is named, the variable's raw value is
+    # echoed next to it, and the star node count is printed: an ON arm with zero
+    # star nodes is a contradiction the line makes visible.
+    #
+    # The count is read back from the SAVED ASSET by asking the material for its
+    # StarmapTex scalar/texture parameter, not from a variable this function set
+    # -- a counter incremented next to the code that builds the node would agree
+    # with the arm by construction and prove nothing.
+    try:
+        star_nodes = len([p for p in mel.get_texture_parameter_names(material)
+                          if str(p) == "StarmapTex"])
+    except AttributeError:
+        # Older/newer engine Python bindings spell this differently. Falling back
+        # to a direct texture lookup keeps the check real -- get_material_default_
+        # texture_parameter_value raises or returns None for a parameter the
+        # material does not have -- rather than turning the ran-flag into a
+        # tautology.
+        try:
+            star_nodes = 1 if mel.get_material_default_texture_parameter_value(
+                material, "StarmapTex") is not None else 0
+        except Exception:  # noqa: BLE001
+            # -1 is UNKNOWN, and it is deliberately not 0. Reporting "no star
+            # sampler found" when the truth is "this engine build would not tell
+            # me" is the precise confusion this project's ran-flag rule exists to
+            # prevent, and here it would abort a correct regeneration.
+            star_nodes = -1
+    # --- READ THE RIPPLE-TIME ARM BACK OFF THE SAVED ASSET --------------------
+    #
+    # Same rule as the star arm below, for the same reason: an environment
+    # variable that fails to reach this process does not error, it silently
+    # builds the OTHER arm. A frozen arm that was actually built live would show
+    # the full animated difference and be reported as "the flicker is not
+    # animation", which is the exact conclusion this arm exists to test.
+    #
+    # There is exactly ONE MaterialExpressionTime in this graph (it feeds the
+    # normal waves and the WPO waves both), so the count is 1 when live and 0
+    # when frozen. -1 is UNKNOWN and is deliberately not 0 -- see the star arm's
+    # note on why reporting a bindings failure as an absence is the worse lie.
+    time_nodes = -1
+    for getter in ("expression_collection", "expressions"):
+        try:
+            holder = material.get_editor_property(getter)
+            exprs = getattr(holder, "expressions", holder)
+            time_nodes = sum(1 for e in exprs
+                             if isinstance(e, unreal.MaterialExpressionTime))
+            break
+        except Exception:  # noqa: BLE001
+            continue
+    unreal.log("M_WaterVoxel RIPPLE TIME ARM: %s (%s=%r, Time nodes=%s)"
+               % ("FROZEN" if FREEZE_RIPPLE_TIME else "LIVE",
+                  FREEZE_TIME_ENV,
+                  os.environ.get(FREEZE_TIME_ENV, "<unset>"),
+                  "UNKNOWN" if time_nodes < 0 else time_nodes))
+    if time_nodes < 0:
+        unreal.log_warning(
+            "M_WaterVoxel: could not enumerate expressions on the saved asset, so the ripple-time "
+            "arm above is this script's INTENT and not a read-back. Do not read a frozen-arm "
+            "measurement taken on this build as evidence about animation.")
+    elif FREEZE_RIPPLE_TIME != (time_nodes == 0):
+        raise RuntimeError(
+            "ripple-time arm disagrees with the graph: FREEZE_RIPPLE_TIME=%s but the saved "
+            "material has %d MaterialExpressionTime node(s). One of the two is a lie and the "
+            "animation-vs-flicker split would inherit it." % (FREEZE_RIPPLE_TIME, time_nodes))
+
+    unreal.log("M_WaterVoxel STAR REFLECTION ARM: %s (%s=%r, StarmapTex params=%s)"
+               % ("ON" if STAR_REFLECTION else "OFF",
+                  STAR_REFLECTION_ENV,
+                  os.environ.get(STAR_REFLECTION_ENV, "<unset>"),
+                  "UNKNOWN" if star_nodes < 0 else star_nodes))
+    if star_nodes < 0:
+        unreal.log_warning(
+            "M_WaterVoxel: could not read the StarmapTex parameter back from the saved asset, so "
+            "the arm above is this script's INTENT and not a read-back. Confirm the arm from the "
+            "material statistics line below instead -- the ON arm has strictly more texture samples.")
+    elif STAR_REFLECTION != (star_nodes > 0):
+        raise RuntimeError(
+            "star-reflection arm disagrees with the graph: arm=%s but %d StarmapTex "
+            "texture parameters are on the saved material. One of the two is a lie "
+            "and the perf A/B would inherit it." % (STAR_REFLECTION, star_nodes))
+
+    # THE DURABLE NUMBER. Frame times belong to this box's GPU; an instruction
+    # count and a texture-sample count belong to the material and transfer to any
+    # machine that ever runs it. Printed for BOTH arms so the delta is a
+    # subtraction rather than a recollection. str() on the struct rather than
+    # named fields on purpose -- the field set of FMaterialStatistics is not
+    # stable across engine versions, and a KeyError here would abort an asset
+    # regeneration over a diagnostic.
+    #
+    # POLLED, NOT READ ONCE. Shader compilation is asynchronous, and the first
+    # attempt at this line returned every field as 0 (measured 2026-08-11). Zero
+    # instructions is not a cheap material, it is an absent shader map -- exactly
+    # the "found nothing" / "did not run" confusion this project's ran-flag rule
+    # is about, arriving in the one number that was supposed to be durable.
+    #
+    # There are two reasons the map can be absent and only one of them is fixable
+    # here: the shaders have not finished compiling yet (this loop), or the
+    # commandlet came up with a NULL RHI and never asked for them at all (pass
+    # -AllowCommandletRendering; tools/voxel-water-star-regen.ps1 does). The log
+    # line below says which by reporting the wait it actually did.
+    try:
+        stats = None
+        waited = 0.0
+        while waited <= 240.0:
+            stats = mel.get_statistics(material)
+            if int(stats.get_editor_property("num_pixel_shader_instructions")) > 0:
+                break
+            time.sleep(5.0)
+            waited += 5.0
+        unreal.log("M_WaterVoxel MATERIAL STATS (%s, waited %.0fs): %s"
+                   % ("ON" if STAR_REFLECTION else "OFF", waited, str(stats)))
+        if stats is None or int(stats.get_editor_property("num_pixel_shader_instructions")) == 0:
+            unreal.log_warning(
+                "M_WaterVoxel: pixel shader instruction count is 0 after %.0fs. That is NOT a free "
+                "material -- it means no compiled shader map was available to read. Re-run with "
+                "-AllowCommandletRendering, and do not report this as an instruction count."
+                % waited)
+    except Exception as exc:  # noqa: BLE001 -- diagnostics only, never fatal
+        unreal.log_warning("M_WaterVoxel material statistics unavailable: %r" % (exc,))
+
     unreal.log("M_WaterVoxel created and saved at " + FULL_PATH)
 
 
