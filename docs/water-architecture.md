@@ -126,7 +126,16 @@ Sourced, not re-derived — read the cited section for the evidence.
   conservation counters (emitted/despawned/in-flight) going forward.
 - **Never rebuild ground in Python.** Reconstructing ground as
   `base_offset_mm + elevation_cp * quant` by hand has produced a ~480 m error
-  and a retracted headline finding, twice. Use the bake's own instrument
+  and a retracted headline finding, twice — and a third time on 2026-08-10,
+  where the landmine was `quant` itself: **it is a CODE, not a multiplier**
+  (`tile_codec.QUANT_MM = {1: 100, 2: 250}`; C++ `tilestore.h fineQuantMm`).
+  Using it as a multiplier compressed relief 100×, floated every basin's
+  surface hundreds of metres above its own bbox, saturated the extent fill,
+  and drew a **solid rectangle for every lake** on the overlay the owner was
+  asked to judge. Two findings were published from it and retracted
+  ("1,429 of 2,052 basins produce no footprint"); the C++ census
+  (`vxc_lakeextentprobe`) says **2 of 2,049**. Cheap tell: a 500 m basin whose
+  entire bbox spans 0.7 m of relief is not terrain. Use the bake's own instrument
   (`vxc_riverribbonprobe`, which already reconstructs ground the client's way
   and carries a long-profile section) instead of re-deriving flow direction,
   perpendicular transects, or which surface discharge was accumulated on.
@@ -149,6 +158,30 @@ Sourced, not re-derived — read the cited section for the evidence.
   work.)
 - **One UE editor per box.** Two capture agents once destroyed each other's
   frames for hours. (`water-system-architecture.md` §14.)
+- **Decimating the extent rounds in OPPOSITE directions for drawing and for
+  despawning, on purpose.** Drawing (`lakeSheetRects`) takes a block if ANY
+  pixel in it is wet; the basin sink's grid (`basinExtentBits`) takes a cell
+  only if its CENTRE is wet. The failure modes are not symmetric: an
+  over-covered sheet runs into the bank, which is opaque ground above lake
+  level and hides it, so the visible waterline becomes the terrain's own
+  intersection with the lake plane — while an under-covered sheet leaves
+  visible air between a lake and its shore (the owner's 2026-08-10
+  screenshot). For despawning it inverts: reaching too far **deletes the
+  river**, falling short leaks a few particles into sinks that already
+  conserve to the ledger. `lakes.h` says this out loud so nobody "makes them
+  consistent."
+- **Grep every playtest log for `Failed to compile Material` before
+  diagnosing anything visual.** `create_sky_material.py` deletes and recreates
+  `MPC_VoxelSky` every run, which unbinds every dependent's
+  `CollectionParameter`; on 2026-08-10 that left `M_WaterVoxel` failing to
+  compile, so **UE drew all water with the DEFAULT MATERIAL** while the log
+  reported `232 basin(s), 16678 rectangle(s), 0 unresolved`. "I can't see it"
+  plus "the log says it was built" can mean the fallback material is drawing
+  it. Regeneration order is mandatory: sky → dome → water.
+- **Residence time is the first thing to compute when water misbehaves.**
+  `alive ÷ emission rate`. 226 alive at 3,682/s is 61 ms — against a 150 UU/s
+  emit speed that is 9 cm of travel, which says "dying at the mouth", not
+  "flowing away", before any shader is opened.
 - **The bake is the authority on where water is; the client only draws it.**
   Still true under the re-architecture — the bake now additionally decides
   faucet placement/rate and basin capacity, not just the drawn shape.

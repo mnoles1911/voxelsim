@@ -124,6 +124,11 @@ param(
     # Keep the persisted edit log instead of clearing it. Only for deliberately
     # photographing an EDITED world; see the note above the clear below.
     [switch]$KeepEditLog,
+    # Frames to take from the settled pose, and their spacing. 1 = the historical
+    # two-shot behaviour. >1 switches the game mode to burst mode; see the note
+    # at the -VoxelScreenshotBurst append below for why flicker needs this.
+    [int]$BurstCount = 1,
+    [double]$BurstIntervalSec = 0.25,
     [string[]]$ExtraArgs = @(),
     [string]$Editor = 'D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor-Cmd.exe',
     # THE PROJECT TO LAUNCH, WHICH IS NOT ALWAYS THIS SCRIPT'S OWN CHECKOUT.
@@ -288,6 +293,14 @@ $argList = @(
     "-VoxelTimeScale=$($TimeScale.ToString([cultureinfo]::InvariantCulture))",
     "-VoxelScreenshotAfter=$SettleSec"
 )
+# BURST: N frames from ONE frozen pose, for TEMPORAL artefacts. A still frame
+# cannot show flicker -- "this looks noisy" and "this CHANGES while nothing
+# moves" are the same photograph. With the camera pinned and TimeScale 0,
+# whatever differs between consecutive frames IS temporal instability.
+if ($BurstCount -gt 1) {
+    $argList += "-VoxelScreenshotBurst=$BurstCount"
+    $argList += "-VoxelScreenshotBurstIntervalSec=$($BurstIntervalSec.ToString([cultureinfo]::InvariantCulture))"
+}
 # SAME InvariantCulture ARGUMENT AS -VoxelTimeScale ABOVE, and it bites harder
 # here: on a comma-decimal machine "-VoxelSpawnPitch=-22,5" reaches FParse::Value,
 # which stops at the comma, and the capture is taken at -22 deg while the script

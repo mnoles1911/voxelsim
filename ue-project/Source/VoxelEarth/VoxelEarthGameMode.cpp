@@ -1684,14 +1684,69 @@ void AVoxelEarthGameMode::BeginPlay()
 						}
 						FScreenshotRequest::RequestScreenshot(TEXT("VoxelVerify"), false, true);
 					};
-					GetWorldTimerManager().SetTimer(
-						ScreenshotTimerHandle, FTimerDelegate::CreateWeakLambda(this, Capture), 1.f, false);
-					GetWorldTimerManager().SetTimer(
-						SecondShotTimerHandle, FTimerDelegate::CreateWeakLambda(this, Capture), 3.f, false);
-					GetWorldTimerManager().SetTimer(
-						QuitTimerHandle,
-						FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
-						6.f, false);
+					// BURST MODE, for TEMPORAL artefacts. -VoxelScreenshotBurst=<N>
+					// takes N shots at -VoxelScreenshotBurstIntervalSec apart
+					// (default 0.25 s) from ONE settled pose, instead of the
+					// default two at +1 s and +3 s.
+					//
+					// It exists because flicker cannot be photographed. The owner
+					// reported "a ton of anti aliasing flickering in the water ...
+					// as the character stands still", and a single frame -- or two
+					// frames two seconds apart -- cannot distinguish "this looks
+					// noisy" from "this CHANGES while nothing moves". Consecutive
+					// frames at a frozen pose can: whatever differs between them is
+					// temporal instability by definition, because the camera, the
+					// sun (TimeScale 0) and the world are all still.
+					//
+					// The pose is not re-applied between shots -- Capture only
+					// re-logs it -- so any difference is the renderer's, not a
+					// drifting camera's.
+					int32 BurstCount = 0;
+					float BurstIntervalSec = 0.25f;
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotBurst="), BurstCount);
+					FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotBurstIntervalSec="), BurstIntervalSec);
+					if (BurstCount > 1)
+					{
+						BurstIntervalSec = FMath::Clamp(BurstIntervalSec, 0.05f, 5.f);
+						BurstCount = FMath::Min(BurstCount, 64);
+						UE_LOG(LogVoxelEarth, Log,
+						       TEXT("Capture BURST: %d shots %.2f s apart from one frozen pose (temporal-artefact ")
+						       TEXT("mode). Consecutive frames differ ONLY where the renderer is unstable."),
+						       BurstCount, BurstIntervalSec);
+						// Shared so the repeating timer can stop itself and quit
+						// only after the LAST write has been requested.
+						TSharedRef<int32> Remaining = MakeShared<int32>(BurstCount);
+						GetWorldTimerManager().SetTimer(
+							ScreenshotTimerHandle,
+							FTimerDelegate::CreateWeakLambda(this,
+								[this, Capture, Remaining]()
+								{
+									Capture();
+									if (--(*Remaining) <= 0)
+									{
+										GetWorldTimerManager().ClearTimer(ScreenshotTimerHandle);
+										// Screenshot writes are async; the same ~3 s
+										// grace the single-shot path uses.
+										GetWorldTimerManager().SetTimer(
+											QuitTimerHandle,
+											FTimerDelegate::CreateLambda(
+												[]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+											3.f, false);
+									}
+								}),
+							BurstIntervalSec, /*bLoop*/ true, /*firstDelay*/ 1.f);
+					}
+					else
+					{
+						GetWorldTimerManager().SetTimer(
+							ScreenshotTimerHandle, FTimerDelegate::CreateWeakLambda(this, Capture), 1.f, false);
+						GetWorldTimerManager().SetTimer(
+							SecondShotTimerHandle, FTimerDelegate::CreateWeakLambda(this, Capture), 3.f, false);
+						GetWorldTimerManager().SetTimer(
+							QuitTimerHandle,
+							FTimerDelegate::CreateLambda([]() { FPlatformMisc::RequestExit(/*bForce*/ false); }),
+							6.f, false);
+					}
 				}),
 			DelaySeconds, false);
 	}
