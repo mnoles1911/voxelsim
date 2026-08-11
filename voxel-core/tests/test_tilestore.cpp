@@ -91,6 +91,18 @@ std::filesystem::path fineWaterZstdFixturePath() {
            "vxtl_v2_golden_water_zstd_512.vxtl";
 }
 
+// The golden tiles carrying the SECTION_BATHY_* PAIR (bake_ver 27), one per
+// codec. Regenerate with `python tools/make_bathy_fixture.py`, whose docstring
+// lists what each property of the pair is there to break -- and which builds
+// both planes by calling bake/basins.py's own `bathymetry_planes`, so the
+// fixture pins the PRODUCER rather than a second copy of it.
+std::filesystem::path fineBathyFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_bathy_512.vxtl";
+}
+std::filesystem::path fineBathyZstdFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_bathy_zstd_512.vxtl";
+}
+
 // The CODEC_ZSTD twin of vxtl_v2_golden_512.vxtl: the SAME control lattice,
 // block mode for block mode, with each block's payload wrapped in its own zstd
 // frame. Regenerate both from the CODEC_RAW golden with
@@ -3449,13 +3461,29 @@ VXC_TEST(vxtl_v2_headwater_table_is_refused_when_it_is_wrong) {
 VXC_TEST(the_reader_declares_the_features_it_learned_with_this_bake) {
     // The rule tilestore.h states for kFineMaxKnownBakeVer: bump it in the
     // same commit that teaches the parser a new flag bit or section id, never
-    // on its own. bake_ver 24 taught it both, so this is that bump asserted
-    // rather than remembered -- and the refusal message quotes this number, so
-    // a stale one sends whoever reads the log to check the wrong thing.
-    CHECK_EQ(int(kFineMaxKnownBakeVer), 24);
+    // on its own. bake_ver 24 taught it both and bake_ver 27 taught it both
+    // again, so this is those bumps asserted rather than remembered -- and the
+    // refusal message quotes this number, so a stale one sends whoever reads
+    // the log to check the wrong thing.
+    CHECK_EQ(int(kFineMaxKnownBakeVer), 27);
     CHECK_EQ(int(kFineFlagsKnown & kFineFlagHeadsPresent), int(kFineFlagHeadsPresent));
     CHECK_EQ(int(kFineFlagHeadsPresent), 0x8);
     CHECK_EQ(int(kSectionHeadwaters), 8);
+    // bake_ver 27: the bathymetry pair. THE MASK IS THE LOAD-BEARING HALF -- a
+    // bit missing from kFineFlagsKnown is not a missing feature, it is every
+    // v27 tile refused whole as kUnknownFeature.
+    CHECK_EQ(int(kFineFlagBathyPresent), 0x10);
+    CHECK_EQ(int(kFineFlagsKnown & kFineFlagBathyPresent), int(kFineFlagBathyPresent));
+    CHECK_EQ(int(kSectionBathyDepthIndex), 9);
+    CHECK_EQ(int(kSectionBathyDepthData), 10);
+    CHECK_EQ(int(kSectionBathyShoreIndex), 11);
+    CHECK_EQ(int(kSectionBathyShoreData), 12);
+    // The wire units, against terrain_service/bake/basins.py's own constants.
+    CHECK_EQ(int(kBathyDepthLsbMm), 10);
+    CHECK_EQ(int(kBathyShoreLsbMm), 100);
+    CHECK_EQ(int(kBathyDryDepth), -1);
+    CHECK_EQ(int(kBathyShoreClampUnits), 1000);
+    CHECK_EQ(int(kBathyShoreClampMm), 100000);
     CHECK_EQ(int(kBasinEntryBytesV2), 80);
     // The v2 row is the v1 row plus a suffix -- the property that let the
     // layout grow without a second section id.
@@ -3616,5 +3644,298 @@ VXC_TEST(vxtl_v2_water_flag_and_sections_must_agree_in_both_directions) {
         flags &= static_cast<uint16_t>(~kFineFlagWaterPresent);
         std::memcpy(bad.data() + 31, &flags, 2);
         refused(bad, FineError::kBadSectionTable);
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// SECTION_BATHY_* (water appearance plan, bake_ver 27). Cross-language again,
+// and the pair is written by bake/basins.py's `bathymetry_planes` -- the
+// producer itself -- so what is pinned below is the real field, not a fixture
+// author's idea of one.
+//
+// THE FAILURE MODE IS SILENT, twice over and in opposite directions:
+//
+//   * the DEPTH plane's -1 means "not inside any basin extent". Read as an
+//     ordinary depth it is -10 mm of water, i.e. every dry cell in the world
+//     becomes a lake one centimetre deep -- and the material would shade it.
+//   * the SHORE plane has NO sentinel: every value is meaningful, and 0 means
+//     "exactly on the waterline", the value at which every shore effect is at
+//     full strength. A decoder that zero-fills anything here draws foam over
+//     whatever it filled.
+//
+// Neither throws, which is why these tests read values rather than statuses.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Everything pinned here was printed by tools/make_bathy_fixture.py's own run
+// (its "C++ test pins" block) rather than copied from an expectation.
+constexpr uint32_t kBathyWetPixels = 8004;
+constexpr int16_t kBathyDeepestUnits = 850;      // 8.50 m
+constexpr int16_t kBathyCentreDepthUnits = 849;  // at local pixel (128, 200)
+constexpr int16_t kBathyCentreShoreUnits = 919;  // 91.9 m inside the water
+// The closest any cell gets to the waterline. One pixel, 1.875 m, 19 units --
+// which is the measurement behind tilestore.h's "zero reads as land" note: the
+// bake cannot emit a 0 here, so the boundary convention is never exercised in
+// production and must not be relied on either way.
+constexpr int16_t kBathyNearestShoreUnits = 19;
+
+void checkBathyFixture(const std::filesystem::path& path, const char* what,
+                       FineDecompressor dec = {}) {
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, dec, &err);
+    if (!tile.has_value() && err == FineError::kNoDecompressor) {
+        std::printf("  (skipped %s: no zstd decompressor in this build)\n", what);
+        return;
+    }
+    CHECK(tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNone));
+    CHECK(tile->hasBathy());
+    CHECK_EQ(int(tile->header().bakeVer), 27);
+    CHECK_EQ(int(tile->size()), 512);
+    // A v27 tile reaching this point AT ALL is the flags-mask half of the
+    // change: without kFineFlagBathyPresent in kFineFlagsKnown the parse above
+    // returns kUnknownFeature and every assertion below is unreachable.
+    CHECK(tile->bathyDepthIndexResident());
+    CHECK(tile->bathyShoreIndexResident());
+
+    const uint32_t dim = tile->blockDim();
+    std::vector<int16_t> depth, shore;
+
+    // 1. THE DRY BLOCKS. (1,0) and (1,1) lie outside every extent and encode
+    //    MODE_CONSTANT -- the encoding a production tile is almost entirely
+    //    made of. The two planes hold DIFFERENT constants there, which is the
+    //    point: a decoder that crossed the two indices would read one of them.
+    for (uint32_t by = 0; by < 2; ++by) {
+        CHECK(tile->bathyDepthBlockResident(1, by));
+        CHECK(tile->decodeBathyDepthBlock(1, by, depth));
+        CHECK_EQ(int(depth.size()), int(dim * dim));
+        CHECK(tile->decodeBathyShoreBlock(1, by, shore));
+        size_t wet = 0;
+        for (size_t i = 0; i < depth.size(); ++i) {
+            if (!bathyDepthIsDry(depth[i])) ++wet;
+            CHECK_EQ(int(depth[i]), int(kBathyDryDepth));
+            // The sentinel must NOT become a depth. -10 mm of water over the
+            // whole dry world is what a missing sentinel test looks like.
+            CHECK_EQ(int(bathyDepthMm(depth[i])), int(kNoBathyDepthMm));
+            // Saturated on the LAND side, and land is what it must read as.
+            CHECK_EQ(int(shore[i]), -int(kBathyShoreClampUnits));
+            CHECK_EQ(int(bathyShoreMm(shore[i])), -int(kBathyShoreClampMm));
+            CHECK(!bathyShoreIsWater(shore[i]));
+        }
+        CHECK_EQ(int(wet), 0);
+    }
+    // Both were CONSTANT, i.e. the branch above really was the constant path.
+    CHECK_EQ(int(tile->bathyDepthIndex()[1].mode), int(kBlockConstant));
+    CHECK_EQ(int(tile->bathyShoreIndex()[1].mode), int(kBlockConstant));
+    // ...and block (0,0) was not: both planes carry a CODED block too, so this
+    // fixture exercises both encodings of both planes. (MODE_RAW is not
+    // reachable for these two -- the encoder never forces it on an int16 plane
+    // where a MED residual always ties or beats a literal -- and it is covered
+    // for the shared block decoder by the elevation and flow fixtures.)
+    CHECK_EQ(int(tile->bathyDepthIndex()[0].mode), int(kBlockCoded));
+    CHECK_EQ(int(tile->bathyShoreIndex()[0].mode), int(kBlockCoded));
+
+    // 2. THE LAKE, in block (0,0).
+    CHECK(tile->decodeBathyDepthBlock(0, 0, depth));
+    CHECK(tile->decodeBathyShoreBlock(0, 0, shore));
+    const size_t centre = size_t(200) * dim + 128;
+    CHECK_EQ(int(depth[centre]), int(kBathyCentreDepthUnits));
+    CHECK_EQ(int(bathyDepthMm(depth[centre])), int(kBathyCentreDepthUnits) * 10);
+    CHECK_EQ(int(shore[centre]), int(kBathyCentreShoreUnits));
+    CHECK_EQ(int(bathyShoreMm(shore[centre])), int(kBathyCentreShoreUnits) * 100);
+    CHECK(bathyShoreIsWater(shore[centre]));
+    CHECK(!bathyDepthIsDry(depth[centre]));
+
+    // 3. A STORED DEPTH OF EXACTLY 0 -- one LSB off the sentinel, and WET at
+    //    exactly the bed. The extent's outermost ring quantises there, so this
+    //    is reachable rather than contrived, and `if (d <= 0) dry` gets it
+    //    wrong.
+    size_t wetPixels = 0, zeroDepth = 0;
+    int16_t deepest = 0, nearestShore = INT16_MAX;
+    for (size_t i = 0; i < depth.size(); ++i) {
+        if (!bathyDepthIsDry(depth[i])) {
+            ++wetPixels;
+            if (depth[i] == 0) {
+                ++zeroDepth;
+                CHECK_EQ(int(bathyDepthMm(depth[i])), 0);   // water, at the bed
+                CHECK(bathyDepthMm(depth[i]) != kNoBathyDepthMm);
+            }
+            if (depth[i] > deepest) deepest = depth[i];
+        }
+        const int16_t mag = static_cast<int16_t>(shore[i] < 0 ? -shore[i] : shore[i]);
+        if (mag < nearestShore) nearestShore = mag;
+        // 4. THE TWO PLANES AGREE, CELL FOR CELL, on which side of the
+        //    shoreline they are describing. Neither plane can make this check
+        //    on its own, and getting it wrong is how a lake ends up shaded as
+        //    wet ground (or a bank as shallow water).
+        CHECK_EQ(int(!bathyDepthIsDry(depth[i])), int(bathyShoreIsWater(shore[i])));
+    }
+    CHECK_EQ(int(wetPixels), int(kBathyWetPixels));
+    CHECK(zeroDepth > 0);
+    CHECK_EQ(int(deepest), int(kBathyDeepestUnits));
+    // 5. NO CELL SITS ON THE WATERLINE, so the sign is always decisive.
+    CHECK_EQ(int(nearestShore), int(kBathyNearestShoreUnits));
+
+    // 6. The convenience accessor, which is the one path a cold caller should
+    //    ever use -- and it hands back MILLIMETRES, so nothing downstream ever
+    //    multiplies by 10 or 100 itself.
+    int32_t depthMm = 0, shoreMm = 0;
+    CHECK(tile->bathyAt(128, 200, depthMm, shoreMm));
+    CHECK_EQ(int(depthMm), int(kBathyCentreDepthUnits) * 10);
+    CHECK_EQ(int(shoreMm), int(kBathyCentreShoreUnits) * 100);
+    // A dry pixel in the far corner: no depth, saturated distance, on land.
+    CHECK(tile->bathyAt(511, 0, depthMm, shoreMm));
+    CHECK_EQ(int(depthMm), int(kNoBathyDepthMm));
+    CHECK_EQ(int(shoreMm), -int(kBathyShoreClampMm));
+    // Off the plane is refused, not clamped.
+    FineError perr = FineError::kNone;
+    CHECK(!tile->bathyAt(512, 0, depthMm, shoreMm, &perr));
+    CHECK_EQ(int(perr), int(FineError::kBadBlockCoords));
+}
+
+} // namespace
+
+VXC_TEST(vxtl_v2_bathy_planes_match_the_python_encoder) {
+    checkBathyFixture(fineBathyFixturePath(), "RAW bathy fixture");
+}
+
+// The ZSTD twin, same argument as the water plane's: production ships
+// CODEC_ZSTD and its block payloads take a different path entirely. The
+// default build still gets a sharp check out of it -- the tile must be REFUSED
+// with kNoDecompressor rather than silently decoded as literal bytes.
+VXC_TEST(vxtl_v2_bathy_planes_zstd_match_the_python_encoder) {
+#ifdef VXC_WITH_ZSTD
+    RealZstdState st;
+    checkBathyFixture(fineBathyZstdFixturePath(), "ZSTD bathy fixture", realDecompressor(st));
+#else
+    const std::filesystem::path path = fineBathyZstdFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(!tile.has_value());
+    CHECK_EQ(int(err), int(FineError::kNoDecompressor));
+#endif
+}
+
+VXC_TEST(vxtl_v2_bathy_flag_and_sections_must_agree_in_both_directions) {
+    const std::filesystem::path path = fineBathyFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> good = readFileBytes(path);
+    CHECK(good.has_value());
+
+    auto refused = [](const std::vector<uint8_t>& bytes, FineError want) {
+        FineError err = FineError::kNone;
+        std::optional<FineTile> t = FineTile::parse(bytes, {}, &err);
+        CHECK(!t.has_value());
+        CHECK_EQ(int(err), int(want));
+    };
+    // Rewrites one section-table entry's ID, which is how a section is made to
+    // "go missing" without moving a byte of payload: an id this parser does not
+    // know is ignored (bounded, but not routed anywhere).
+    auto renameSection = [&good](uint32_t from, uint32_t to) {
+        std::vector<uint8_t> bad = *good;
+        uint16_t nSections = 0;
+        std::memcpy(&nSections, bad.data() + kFineHeaderBytes - 2, 2);
+        for (uint16_t i = 0; i < nSections; ++i) {
+            const size_t e = kFineHeaderBytes + size_t(i) * kFineSectionEntryBytes;
+            uint32_t id = 0;
+            std::memcpy(&id, bad.data() + e, 4);
+            if (id == from) std::memcpy(bad.data() + e, &to, 4);
+        }
+        return bad;
+    };
+
+    // FLAG CLEAR, SECTIONS PRESENT. The direction that matters most: four
+    // sections' worth of bytes would be silently ignored and every lake in the
+    // tile would render flat and unshaded, with no error raised anywhere.
+    {
+        std::vector<uint8_t> bad = *good;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags &= static_cast<uint16_t>(~kFineFlagBathyPresent);
+        std::memcpy(bad.data() + 31, &flags, 2);
+        refused(bad, FineError::kBadSectionTable);
+    }
+
+    // FLAG SET, A SECTION MISSING -- and it is refused for EACH of the four
+    // independently, because one flag bit covers both planes. A tile carrying
+    // depth without shore distance is not a partial feature to be tolerated:
+    // it is a file that disagrees with the producer that wrote it.
+    const uint32_t kUnknownSectionId = 4242;
+    for (uint32_t id : {uint32_t(kSectionBathyDepthIndex), uint32_t(kSectionBathyDepthData),
+                        uint32_t(kSectionBathyShoreIndex), uint32_t(kSectionBathyShoreData)}) {
+        refused(renameSection(id, kUnknownSectionId), FineError::kBadSectionTable);
+    }
+}
+
+VXC_TEST(a_reader_without_the_bathy_flag_bit_refuses_a_v27_tile) {
+    // THE BIT IS GENUINELY NEW, and this is the assertion that says so: the
+    // mask a reader had at bake_ver 24 does not contain it. Spelled out from
+    // the four bits that existed then rather than derived from kFineFlagsKnown,
+    // so that adding a bit to the mask cannot quietly make this test agree.
+    constexpr uint16_t kFlagsKnownAtBakeVer24 = kFineFlagFlowPresent | kFineFlagBasinsPresent |
+                                                kFineFlagWaterPresent | kFineFlagHeadsPresent;
+    CHECK_EQ(int(kFlagsKnownAtBakeVer24 & kFineFlagBathyPresent), 0);
+    CHECK_EQ(int(kFineFlagsKnown & kFineFlagBathyPresent), int(kFineFlagBathyPresent));
+
+    const std::filesystem::path path = fineBathyFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+
+    // What the OLD reader would have computed on this very file. This is the
+    // whole of the refusal test in tilestore.cpp -- `(flags & ~known) != 0` --
+    // evaluated against the mask of the day, so it is the old build's verdict
+    // and not a paraphrase of it.
+    FineHeaderFacts facts;
+    CHECK(fineReadHeaderFacts(bytes->data(), bytes->size(), facts));
+    CHECK(facts.v2Fields);
+    CHECK_EQ(int(facts.bakeVer), 27);
+    CHECK((facts.flags & kFineFlagBathyPresent) != 0);
+    CHECK((facts.flags & static_cast<uint16_t>(~kFlagsKnownAtBakeVer24)) != 0);
+    // And THIS build reads the same file, which is the other half of the claim:
+    // the refusal above is a property of the old mask, not of the bytes.
+    CHECK_EQ(int(facts.unknownFlagBits()), 0);
+    FineError err = FineError::kNone;
+    CHECK(FineTile::parse(*bytes, {}, &err).has_value());
+    CHECK_EQ(int(err), int(FineError::kNone));
+
+    // The mechanism still fires for a bit NOBODY implements (bit5), which is
+    // what a reader older than its tiles will meet next time, and it must say
+    // "the reader is old" rather than "the file is broken".
+    {
+        std::vector<uint8_t> bad = *bytes;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags |= 0x20;
+        std::memcpy(bad.data() + 31, &flags, 2);
+        FineError e = FineError::kNone;
+        CHECK(!FineTile::parse(bad, {}, &e).has_value());
+        CHECK_EQ(int(e), int(FineError::kUnknownFeature));
+        FineHeaderFacts badFacts;
+        CHECK(fineReadHeaderFacts(bad.data(), bad.size(), badFacts));
+        CHECK_EQ(int(badFacts.unknownFlagBits()), 0x20);
+        const std::string why = fineDescribeRejection(FineError::kUnknownFeature, badFacts);
+        CHECK(why.find("bake_ver up to " + std::to_string(kFineMaxKnownBakeVer)) !=
+              std::string::npos);
     }
 }

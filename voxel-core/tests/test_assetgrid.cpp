@@ -133,24 +133,29 @@ VXC_TEST(assetgrid_reads_a_second_real_file_with_a_different_material_set) {
     CHECK_EQ(int(g.at(20, 21, 0)), 8); // MAT_GRASS
 }
 
-// THE FINDING THIS TEST EXISTS TO PIN, and it is not a reader bug: every asset
-// baked so far is unloadable as world content, because it is built from
-// materials vxc::Material does not define. See AssetGrid::maxMaterialId.
+// Every baked asset must be built from materials this engine actually defines.
 //
-// Asserted rather than merely noted so that the day the enum append lands, this
-// test fails and points at itself -- at which point the correct edit is to
-// flip these to materialsWithinEngine() == true and delete this comment. A
-// silent pass either way would let the gap be forgotten.
-VXC_TEST(assetgrid_real_assets_use_materials_the_engine_does_not_have_yet) {
+// This test was originally written the other way up, asserting that they were
+// NOT -- because at the time none of them were, and a test that merely noted
+// the gap would have let it be forgotten. It was built to fail on the day the
+// enum append landed and point at itself. It did, and this is that edit.
+//
+// Keeping it, inverted, is the point: the ids in a .vxa are baked by
+// asset-forge and the ids in vxc::Material are declared here, and nothing but
+// this test makes the two agree. If they drift, a tree loads and renders as
+// SOMETHING -- MaterialId is a uint8_t, so an unknown id indexes past the end
+// of every material-keyed array instead of faulting -- which is the failure
+// mode that hid the original gap for as long as it did.
+VXC_TEST(assetgrid_real_assets_use_materials_the_engine_defines) {
     AssetGrid pine, daisy;
     CHECK_EQ(int(pine.parse(readFixture("asset_tundra_pine_0002.vxa"))), int(AssetParseError::kOk));
     CHECK_EQ(int(daisy.parse(readFixture("asset_meadow_daisy_0001.vxa"))), int(AssetParseError::kOk));
 
-    CHECK_EQ(int(pine.maxMaterialId()), 20);  // MAT_LEAF_NEEDLE, proposed
-    CHECK_EQ(int(daisy.maxMaterialId()), 24); // MAT_LEAF_BLOSSOM, proposed
-    CHECK_EQ(int(kMaterialCount), 16);
-    CHECK(!pine.materialsWithinEngine());
-    CHECK(!daisy.materialsWithinEngine());
+    CHECK_EQ(int(pine.maxMaterialId()), 20);  // MAT_LEAF_NEEDLE
+    CHECK_EQ(int(daisy.maxMaterialId()), 24); // MAT_LEAF_BLOSSOM
+    CHECK_EQ(int(kMaterialCount), 26);        // through MAT_LEAF_AUTUMN = 25
+    CHECK(pine.materialsWithinEngine());
+    CHECK(daisy.materialsWithinEngine());
 }
 
 VXC_TEST(assetgrid_random_access_agrees_with_a_full_sequential_decode) {

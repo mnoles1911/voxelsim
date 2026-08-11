@@ -45,6 +45,10 @@ std::filesystem::path goldenBasinPath() {
 std::filesystem::path goldenBasinV2Path() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_basins_v2_512.vxtl";
 }
+// bake_ver 27: the bathymetry pair (SECTION_BATHY_*).
+std::filesystem::path goldenBathyPath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_bathy_512.vxtl";
+}
 
 std::optional<std::vector<uint8_t>> loadFixture(const std::filesystem::path& p) {
     if (!std::filesystem::exists(p)) return std::nullopt;
@@ -419,6 +423,73 @@ VXC_TEST(unfetched_water_block_is_not_resident_not_dry) {
         CHECK(tile->decodeWaterBlock(id % perAxis, id / perAxis, a));
         CHECK(whole->decodeWaterBlock(id % perAxis, id / perAxis, b));
         CHECK(a == b);
+    }
+}
+
+VXC_TEST(a_ranged_client_gets_both_bathymetry_planes) {
+    // THE HOLE THIS CLOSES is the one SECTION_HEADWATERS fell into: a preamble
+    // planner that does not know a section exists never fetches it, the tile
+    // then reports hasBathy() with a permanently non-resident index, and
+    // fetchFineTileBlocks has no way back because it cannot plan against an
+    // index it does not hold. Nothing errors -- every lake is simply unshaded,
+    // on exactly the clients that stream.
+    const auto bytes = loadFixture(goldenBathyPath());
+    if (!bytes) return;
+    BytesRangeSource src(*bytes);
+    FinePreambleRequest want;
+    want.wantFlow = false;
+    want.wantWater = false;
+    want.wantBasins = false;
+    FineTileBytes held;
+    CHECK(readFineTilePreamble(src, src.fileSize(), want, held, nullptr));
+    std::optional<FineTile> tile = FineTile::parsePartial(std::move(held));
+    if (!tile) return;
+    CHECK(tile->hasBathy());
+    // BOTH indices, from the one `wantBathy`: they are separate sections with a
+    // multi-megabyte data section between them, so fetching one is a distinct
+    // (and useless) outcome from fetching the pair.
+    CHECK(tile->bathyDepthIndexResident());
+    CHECK(tile->bathyShoreIndexResident());
+
+    const uint32_t perAxis = tile->blocksPerAxis();
+    const std::optional<FineTile> whole = FineTile::parse(*bytes);
+    if (!whole) return;
+
+    for (FinePlane plane : {FinePlane::kBathyDepth, FinePlane::kBathyShore}) {
+        // Before the fetch: a coded block is NOT RESIDENT, and the out
+        // parameter is left alone rather than filled with a sentinel that would
+        // read as ordinary land.
+        const std::vector<FineBlockEntry>& index = finePlaneIndex(*tile, plane);
+        bool found = false;
+        for (uint32_t id = 0; id < index.size() && !found; ++id) {
+            if (index[id].mode == kBlockConstant) continue;
+            found = true;
+            std::vector<int16_t> out(tile->blockPixelCount(), int16_t(-777));
+            FineError err = FineError::kNone;
+            const bool ok = plane == FinePlane::kBathyDepth
+                                ? tile->decodeBathyDepthBlock(id % perAxis, id / perAxis, out, &err)
+                                : tile->decodeBathyShoreBlock(id % perAxis, id / perAxis, out, &err);
+            CHECK(!ok);
+            CHECK_EQ(int(err), int(FineError::kBlockNotResident));
+            CHECK_EQ(int(out[0]), -777);
+        }
+        CHECK(found);
+
+        const std::vector<uint32_t> ids = fineNonConstantBlocks(*tile, plane);
+        CHECK(!ids.empty());
+        CHECK(fetchFineTileBlocks(src, *tile, plane, ids));
+        // And the fetched bytes decode to exactly what a whole-file parse gives.
+        for (uint32_t id : ids) {
+            std::vector<int16_t> a, b;
+            if (plane == FinePlane::kBathyDepth) {
+                CHECK(tile->decodeBathyDepthBlock(id % perAxis, id / perAxis, a));
+                CHECK(whole->decodeBathyDepthBlock(id % perAxis, id / perAxis, b));
+            } else {
+                CHECK(tile->decodeBathyShoreBlock(id % perAxis, id / perAxis, a));
+                CHECK(whole->decodeBathyShoreBlock(id % perAxis, id / perAxis, b));
+            }
+            CHECK(a == b);
+        }
     }
 }
 

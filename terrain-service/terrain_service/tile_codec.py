@@ -162,6 +162,26 @@ SECTION_WATER_DATA = 7
 #: computed this mask since bake_ver 9 (`water.water_head_mask`) and deleted it
 #: unused at the end of B6 ever since.
 SECTION_HEADWATERS = 8
+#: The bathymetry pair (water appearance plan, bake_ver 27): per-cell lake
+#: DEPTH and SIGNED DISTANCE TO SHORE. Two planes through the same block
+#: machinery as elevation and water, because both are consumed per-pixel by
+#: the water material and neither can be derived from a table row.
+#:
+#: WHY THE CLIENT CANNOT JUST COMPUTE THESE. It already re-derives a lake's
+#: footprint from four wire numbers, and that is right for a footprint -- it is
+#: a flood fill over data the client already holds. Depth and shore distance
+#: are not: depth needs the datum minus ground at every cell, and distance
+#: needs a Euclidean transform over the whole basin, which is a global
+#: operation over a region that can be 2.5 million cells and does not
+#: decompose per column. The bake does it once; the client fetches a block.
+#:
+#: WHY NOT ONE PLANE WITH TWO CHANNELS. `_encode_plane` predicts along a
+#: scanline, and the two fields have unrelated gradients -- interleaving them
+#: would hand the MED predictor a sawtooth and cost more than the second index.
+SECTION_BATHY_DEPTH_INDEX = 9
+SECTION_BATHY_DEPTH_DATA = 10
+SECTION_BATHY_SHORE_INDEX = 11
+SECTION_BATHY_SHORE_DATA = 12
 
 FLAG_FLOW_PRESENT = 1 << 0
 FLAG_BASINS_PRESENT = 1 << 1
@@ -182,6 +202,13 @@ FLAG_WATER_PRESENT = 1 << 2
 #: (23 -> 24): the product namespace changes with it, so an old client never
 #: meets a new tile under an id it thinks it understands.
 FLAG_HEADS_PRESENT = 1 << 3
+#: bake_ver 27: SECTION_BATHY_* are present. Set even on a tile with no lakes,
+#: for the fourth time and the same reason as the three above -- "surveyed, no
+#: basins here" and "baked before bathymetry existed" are different facts, and
+#: only the flag can tell them apart. One bit covers BOTH planes: they are
+#: computed together from one extent pass and there is no case where a tile
+#: would carry depth without shore distance or the reverse.
+FLAG_BATHY_PRESENT = 1 << 4
 
 # --- SECTION_WATER_* payload: DEPTH ABOVE THE QUANTISED BED ----------------
 #
@@ -576,6 +603,11 @@ class TileV2:
     #: is not None, for the third time and the same reason as `basins` and
     #: `water_cp`: "surveyed, no reaches start here" is a fact.
     heads: "list[HeadEntry] | None" = None
+    #: Bathymetry (bake_ver 27), sets flags bit4. Both or neither -- see
+    #: FLAG_BATHY_PRESENT. int16 like the other two planes; units are
+    #: basins.BATHY_DEPTH_LSB_MM and BATHY_SHORE_LSB_MM respectively.
+    bathy_depth: "np.ndarray | None" = None   # (size,size) int16, 10 mm, -1 dry
+    bathy_shore: "np.ndarray | None" = None   # (size,size) int16, 100 mm, signed
     #: Which SECTION_BASIN_TABLE layout to WRITE. Explicit rather than inferred
     #: from whether the rows carry v2 fields: "these rows have no identity" and
     #: "this tile is a v1 tile" are different statements, and a v2 bake that
@@ -603,6 +635,19 @@ class TileV2:
         if self.water_cp is not None:
             assert self.water_cp.shape == (self.size, self.size)
             assert self.water_cp.dtype == np.int16
+        # BOTH OR NEITHER, checked rather than documented: one flag bit covers
+        # the pair, so a tile carrying only one of them would set the flag and
+        # then fail the section-agreement check inside the decoder, which is a
+        # far worse place to find out.
+        assert (self.bathy_depth is None) == (self.bathy_shore is None), (
+            "bathy_depth and bathy_shore must be given together (one flag bit "
+            "covers both planes)"
+        )
+        for _name, _p in (("bathy_depth", self.bathy_depth),
+                          ("bathy_shore", self.bathy_shore)):
+            if _p is not None:
+                assert _p.shape == (self.size, self.size), f"{_name} shape"
+                assert _p.dtype == np.int16, f"{_name} dtype"
         if self.basins is not None:
             for i, b in enumerate(self.basins):
                 assert b.basin_id == i, "basin ids must be 0..n-1 in order"
@@ -1609,6 +1654,8 @@ def encode_v2(
         flags |= FLAG_WATER_PRESENT
     if tile.heads is not None:
         flags |= FLAG_HEADS_PRESENT
+    if tile.bathy_depth is not None:
+        flags |= FLAG_BATHY_PRESENT
 
     elev_index, elev_data = _encode_plane(
         tile.elevation_cp.astype(np.int64),
@@ -1646,6 +1693,23 @@ def encode_v2(
         )
         sections += [(SECTION_WATER_INDEX, water_index),
                      (SECTION_WATER_DATA, water_data)]
+
+    if tile.bathy_depth is not None:
+        # Same machinery again, twice. Neither plane is force-RAW: both are
+        # int16, where a MED residual always ties or beats a literal, and both
+        # are dominated by their saturated constant regions anyway.
+        for _plane, _ix, _dx in (
+            (tile.bathy_depth, SECTION_BATHY_DEPTH_INDEX, SECTION_BATHY_DEPTH_DATA),
+            (tile.bathy_shore, SECTION_BATHY_SHORE_INDEX, SECTION_BATHY_SHORE_DATA),
+        ):
+            _index, _data = _encode_plane(
+                _plane.astype(np.int64),
+                block_log2=tile.block_log2,
+                codec=tile.codec,
+                elem_dtype="<i2",
+                compressor=compressor,
+            )
+            sections += [(_ix, _index), (_dx, _data)]
 
     if tile.basins is not None:
         # LAST, and uncompressed whatever `codec` says. It is a kilobyte of
@@ -1766,7 +1830,7 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
     )
 
     if flags & ~(FLAG_FLOW_PRESENT | FLAG_BASINS_PRESENT | FLAG_WATER_PRESENT
-                 | FLAG_HEADS_PRESENT):
+                 | FLAG_HEADS_PRESENT | FLAG_BATHY_PRESENT):
         # Same posture as the C++ parser: an undefined flag bit can only mean
         # the bytes came from something this decoder does not understand, and
         # reading them anyway is how a client silently mis-renders a world.
@@ -1806,6 +1870,25 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
     elif SECTION_WATER_INDEX in sections or SECTION_WATER_DATA in sections:
         raise ValueError("water sections present but the water flag is clear")
 
+    bathy_depth = bathy_shore = None
+    _bathy_ids = (SECTION_BATHY_DEPTH_INDEX, SECTION_BATHY_DEPTH_DATA,
+                  SECTION_BATHY_SHORE_INDEX, SECTION_BATHY_SHORE_DATA)
+    if flags & FLAG_BATHY_PRESENT:
+        missing = [i for i in _bathy_ids if i not in sections]
+        if missing:
+            raise ValueError(f"bathymetry flag set but sections {missing} are missing")
+        bathy_depth, bathy_shore = (
+            _decode_plane(
+                sections[_ix], sections[_dx],
+                size=size, block_log2=block_log2, codec=codec,
+                elem_dtype="<i2", out_dtype=np.int16, decompressor=decompressor,
+            )
+            for _ix, _dx in ((SECTION_BATHY_DEPTH_INDEX, SECTION_BATHY_DEPTH_DATA),
+                             (SECTION_BATHY_SHORE_INDEX, SECTION_BATHY_SHORE_DATA))
+        )
+    elif any(i in sections for i in _bathy_ids):
+        raise ValueError("bathymetry sections present but the bathymetry flag is clear")
+
     heads = None
     if flags & FLAG_HEADS_PRESENT:
         if SECTION_HEADWATERS not in sections:
@@ -1823,7 +1906,7 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
         base_offset_mm=base_offset_mm,
         quant=quant, codec=codec, bake_ver=bake_ver,
         block_log2=block_log2, flow=flow, basins=basins, water_cp=water_cp,
-        heads=heads,
+        heads=heads, bathy_depth=bathy_depth, bathy_shore=bathy_shore,
         scale=scale, predictor=predictor, parent_scale=parent_scale,
     )
 
@@ -1926,6 +2009,14 @@ def encode_fine(
     heads: "list | tuple | np.ndarray | None" = None,
     water_surface_m: "np.ndarray | None" = None,
     water_level_m: "np.ndarray | None" = None,
+    #: The bathymetry pair from `basins.bathymetry_planes`, already in wire
+    #: units (int16, 10 mm depth / 100 mm signed shore distance). Passed as
+    #: finished rasters rather than computed here for the same reason
+    #: `basins`/`heads` are passed as rows: this module owns the FORMAT, the
+    #: bake owns the HYDROLOGY, and a Euclidean transform is emphatically the
+    #: latter. Both or neither -- TileV2 asserts it.
+    bathy_depth: "np.ndarray | None" = None,
+    bathy_shore: "np.ndarray | None" = None,
     bake_ver: int | None = None,
     codec: int = CODEC_RAW,
     block_log2: int = DEFAULT_BLOCK_LOG2,
@@ -2012,6 +2103,10 @@ def encode_fine(
             basins=basin_rows,
             heads=head_rows,
             water_cp=water_cp,
+            bathy_depth=(None if bathy_depth is None
+                         else np.ascontiguousarray(bathy_depth, np.int16)),
+            bathy_shore=(None if bathy_shore is None
+                         else np.ascontiguousarray(bathy_shore, np.int16)),
             basin_table_version=int(basin_table_version),
         )
     )

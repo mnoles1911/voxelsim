@@ -923,6 +923,7 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
 
     SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec, headSec;
     SectionRef waterIndexSec, waterDataSec;
+    SectionRef bathyDepthIndexSec, bathyDepthDataSec, bathyShoreIndexSec, bathyShoreDataSec;
     struct Extent {
         uint64_t begin, end;
     };
@@ -967,6 +968,10 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
         case kSectionWaterIndex: waterIndexSec = ref; break;
         case kSectionWaterData: waterDataSec = ref; break;
         case kSectionHeadwaters: headSec = ref; break;
+        case kSectionBathyDepthIndex: bathyDepthIndexSec = ref; break;
+        case kSectionBathyDepthData: bathyDepthDataSec = ref; break;
+        case kSectionBathyShoreIndex: bathyShoreIndexSec = ref; break;
+        case kSectionBathyShoreData: bathyShoreDataSec = ref; break;
         default: break; // see (b): unknown ids are ignored but still bounded
         }
     }
@@ -1006,6 +1011,24 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     // tile would go missing without a word.
     const bool wantHeads = (h.flags & kFineFlagHeadsPresent) != 0;
     if (wantHeads != headSec.present) return reject(FineError::kBadSectionTable);
+    // Fifth, and it is ALL FOUR SECTIONS OR NONE rather than two independent
+    // pairs -- one flag bit covers both planes because the bake computes them
+    // from one extent pass. A tile carrying depth without shore distance is
+    // therefore not a partial feature to be tolerated, it is a file that
+    // disagrees with the producer that wrote it, and the shading it feeds would
+    // be half-right in a way nothing downstream could detect.
+    const bool wantBathy = (h.flags & kFineFlagBathyPresent) != 0;
+    const bool bathyAllPresent = bathyDepthIndexSec.present && bathyDepthDataSec.present &&
+                                 bathyShoreIndexSec.present && bathyShoreDataSec.present;
+    const bool bathyAnyPresent = bathyDepthIndexSec.present || bathyDepthDataSec.present ||
+                                 bathyShoreIndexSec.present || bathyShoreDataSec.present;
+    // Flag set, sections missing: a client that read hasBathy() and then found
+    // no index would have no way back.
+    if (wantBathy != bathyAllPresent) return reject(FineError::kBadSectionTable);
+    // Sections present, flag clear: the half that matters most, exactly as for
+    // the water plane. Those bytes would be silently ignored and every lake in
+    // the tile would render flat and unshaded with no error raised anywhere.
+    if (!wantBathy && bathyAnyPresent) return reject(FineError::kBadSectionTable);
 
     // Resolves one PREAMBLE section's bytes. The distinction it carries is the
     // one this whole partial path exists for: nullptr with the section declared
@@ -1058,6 +1081,10 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     tile.flowDataLen_ = flowDataSec.length;
     tile.waterDataOff_ = waterDataSec.offset;
     tile.waterDataLen_ = waterDataSec.length;
+    tile.bathyDepthDataOff_ = bathyDepthDataSec.offset;
+    tile.bathyDepthDataLen_ = bathyDepthDataSec.length;
+    tile.bathyShoreDataOff_ = bathyShoreDataSec.offset;
+    tile.bathyShoreDataLen_ = bathyShoreDataSec.length;
 
     const uint32_t perAxis = static_cast<uint32_t>(h.size) >> h.blockLog2;
     const uint32_t blocks = perAxis * perAxis;
@@ -1088,6 +1115,29 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
         if (waterIndexData != nullptr) {
             if (!parseBlockIndex(waterIndexData, waterIndexSec.length, blocks, blockPixels,
                                  waterDataSec.length, 2, compressed, tile.waterIndex_)) {
+                return reject(FineError::kBadBlockIndex);
+            }
+        }
+    }
+
+    // Element width 2 again, twice, and through the SAME parseBlockIndex: both
+    // bathymetry planes are int16 planes on the elevation plane's own block
+    // grid, which is the whole reason they cost four section ids and not a line
+    // of new codec. Each index is optional on a PARTIAL tile in its own right
+    // (they are separate ranges), so each is guarded separately -- the both-or-
+    // neither rule above is about the file, not about what was fetched.
+    if (wantBathy) {
+        const uint8_t* depthIndexData = preamble(bathyDepthIndexSec);
+        if (depthIndexData != nullptr) {
+            if (!parseBlockIndex(depthIndexData, bathyDepthIndexSec.length, blocks, blockPixels,
+                                 bathyDepthDataSec.length, 2, compressed, tile.bathyDepthIndex_)) {
+                return reject(FineError::kBadBlockIndex);
+            }
+        }
+        const uint8_t* shoreIndexData = preamble(bathyShoreIndexSec);
+        if (shoreIndexData != nullptr) {
+            if (!parseBlockIndex(shoreIndexData, bathyShoreIndexSec.length, blocks, blockPixels,
+                                 bathyShoreDataSec.length, 2, compressed, tile.bathyShoreIndex_)) {
                 return reject(FineError::kBadBlockIndex);
             }
         }
@@ -1148,6 +1198,20 @@ bool FineTile::waterBlockResident(uint32_t bx, uint32_t by) const {
     if (!hasWater()) return false;
     uint64_t off = 0, len = 0;
     if (!blockFileSpan(waterIndex_, waterDataOff_, bx, by, off, len)) return false;
+    return len == 0 || bytes_.covers(off, len);
+}
+
+bool FineTile::bathyDepthBlockResident(uint32_t bx, uint32_t by) const {
+    if (!hasBathy()) return false;
+    uint64_t off = 0, len = 0;
+    if (!blockFileSpan(bathyDepthIndex_, bathyDepthDataOff_, bx, by, off, len)) return false;
+    return len == 0 || bytes_.covers(off, len);
+}
+
+bool FineTile::bathyShoreBlockResident(uint32_t bx, uint32_t by) const {
+    if (!hasBathy()) return false;
+    uint64_t off = 0, len = 0;
+    if (!blockFileSpan(bathyShoreIndex_, bathyShoreDataOff_, bx, by, off, len)) return false;
     return len == 0 || bytes_.covers(off, len);
 }
 
@@ -1271,6 +1335,75 @@ bool FineTile::decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& 
     return decodeBlockPayload<int16_t>(e, base, static_cast<size_t>(waterDataLen_), dim, -32768,
                                        32767, dec_, fineCodecNeedsDecompressor(h_.codec),
                                        out.data(), err);
+}
+
+// The bathymetry pair. Structurally identical to decodeWaterBlock above --
+// same index, same widths, same shared decodeBlockPayload -- and the ONLY
+// interesting decision in either is what a fresh buffer is filled with, because
+// that is what a caller sees if the payload turns out to be corrupt.
+bool FineTile::decodeBathyDepthBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                                     FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (!hasBathy()) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t perAxis = blocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    // Index not fetched: not-resident, NOT dry -- the same argument the water
+    // plane makes one level earlier than its payload branch.
+    if (!bathyDepthIndexResident()) return fail(err, FineError::kBlockNotResident);
+    const uint32_t dim = blockDim();
+    const FineBlockEntry& e = bathyDepthIndex_[by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, bathyDepthDataOff_, bathyDepthDataLen_);
+    if (base == nullptr) return fail(err, FineError::kBlockNotResident);
+    // The DRY sentinel, not 0. 0 is a legitimate stored depth -- the outermost
+    // ring of a lake's extent, where the datum meets the ground, quantises there
+    // -- so a zero-filled block would read as a sheet of zero-depth water over
+    // the whole block rather than as land.
+    out.assign(blockPixelCount(), kBathyDryDepth);
+    return decodeBlockPayload<int16_t>(e, base, static_cast<size_t>(bathyDepthDataLen_), dim,
+                                       -32768, 32767, dec_,
+                                       fineCodecNeedsDecompressor(h_.codec), out.data(), err);
+}
+
+bool FineTile::decodeBathyShoreBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                                     FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (!hasBathy()) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t perAxis = blocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    if (!bathyShoreIndexResident()) return fail(err, FineError::kBlockNotResident);
+    const uint32_t dim = blockDim();
+    const FineBlockEntry& e = bathyShoreIndex_[by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, bathyShoreDataOff_, bathyShoreDataLen_);
+    if (base == nullptr) return fail(err, FineError::kBlockNotResident);
+    // SATURATED ON THE LAND SIDE, not 0. This plane has no sentinel, so the
+    // fill has to be an ordinary value -- and 0 is the worst one available: it
+    // means "exactly on the shoreline", which is where every shore effect is at
+    // full strength. A failed block would be a square of foam. -1000 units is
+    // "at least 100 m of dry land from any water", which draws nothing.
+    out.assign(blockPixelCount(), static_cast<int16_t>(-kBathyShoreClampUnits));
+    return decodeBlockPayload<int16_t>(e, base, static_cast<size_t>(bathyShoreDataLen_), dim,
+                                       -32768, 32767, dec_,
+                                       fineCodecNeedsDecompressor(h_.codec), out.data(), err);
+}
+
+bool FineTile::bathyAt(uint32_t lx, uint32_t ly, int32_t& depthMm, int32_t& shoreMm,
+                       FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (lx >= h_.size || ly >= h_.size) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t dim = blockDim();
+    const uint32_t bx = lx >> h_.blockLog2, by = ly >> h_.blockLog2;
+    const size_t i = static_cast<size_t>(ly & (dim - 1)) * dim + (lx & (dim - 1));
+    std::vector<int16_t> block;
+    if (!decodeBathyDepthBlock(bx, by, block, err)) return false;
+    const int16_t depthUnits = block[i];
+    // NOTHING WRITTEN TO THE OUT-PARAMETERS UNTIL BOTH DECODES HAVE SUCCEEDED.
+    // Half-filling them on a failure would leave a caller that checked the
+    // return value correct and a caller that did not holding one real field
+    // beside one stale one, which is worse than two stale ones.
+    if (!decodeBathyShoreBlock(bx, by, block, err)) return false;
+    shoreMm = bathyShoreMm(block[i]);
+    depthMm = bathyDepthMm(depthUnits);
+    return true;
 }
 
 bool FineTile::controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp, FineError* err) const {

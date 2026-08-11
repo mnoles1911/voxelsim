@@ -214,6 +214,16 @@ bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambl
     // (fetchFineTileBlocks only knows the three planes) -- the residency hole
     // behind the "square of hovering water" playtest defect.
     if (want.wantHeads && (flags & kFineFlagHeadsPresent)) wantIds.push_back(kSectionHeadwaters);
+    // SECTION_BATHY_* : two more plane INDICES, requested together because one
+    // flag covers both planes. Skipping them here is what left headsResident()
+    // permanently false on ranged clients (see above); the same hole for
+    // bathymetry would leave every lake unshaded on exactly the clients that
+    // stream, with no error anywhere -- decodeBathyDepthBlock would answer
+    // kBlockNotResident forever and nothing would ever fetch the index.
+    if (want.wantBathy && (flags & kFineFlagBathyPresent)) {
+        wantIds.push_back(kSectionBathyDepthIndex);
+        wantIds.push_back(kSectionBathyShoreIndex);
+    }
 
     // The header and section table themselves, straight out of the probe.
     const uint64_t fixedBytes =
@@ -256,6 +266,8 @@ const std::vector<FineBlockEntry>& finePlaneIndex(const FineTile& tile, FinePlan
     switch (plane) {
     case FinePlane::kFlow: return tile.flowIndex();
     case FinePlane::kWater: return tile.waterIndex();
+    case FinePlane::kBathyDepth: return tile.bathyDepthIndex();
+    case FinePlane::kBathyShore: return tile.bathyShoreIndex();
     case FinePlane::kElevation: break;
     }
     return tile.elevIndex();
@@ -267,6 +279,8 @@ uint64_t planeDataOffset(const FineTile& tile, FinePlane plane) {
     switch (plane) {
     case FinePlane::kFlow: return tile.flowDataOffset();
     case FinePlane::kWater: return tile.waterDataOffset();
+    case FinePlane::kBathyDepth: return tile.bathyDepthDataOffset();
+    case FinePlane::kBathyShore: return tile.bathyShoreDataOffset();
     case FinePlane::kElevation: break;
     }
     return tile.elevDataOffset();
@@ -279,6 +293,8 @@ bool planeBlockResident(const FineTile& tile, FinePlane plane, uint32_t id) {
     switch (plane) {
     case FinePlane::kFlow: return tile.flowBlockResident(bx, by);
     case FinePlane::kWater: return tile.waterBlockResident(bx, by);
+    case FinePlane::kBathyDepth: return tile.bathyDepthBlockResident(bx, by);
+    case FinePlane::kBathyShore: return tile.bathyShoreBlockResident(bx, by);
     case FinePlane::kElevation: break;
     }
     return tile.elevBlockResident(bx, by);

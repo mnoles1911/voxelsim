@@ -317,6 +317,11 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         # and the same failure if it is left out -- the bake computes the heads
         # and the tile ships without them, silently and at full size.
         "heads": getattr(result, "water_heads", None),
+        # bake_ver 27: SECTION_BATHY_*. Third time this comment is warranted --
+        # a product this dict does not name is dropped in SILENCE, and the tile
+        # that comes out is a valid tile of the previous configuration.
+        "bathy_depth": getattr(result, "bathy_depth", None),
+        "bathy_shore": getattr(result, "bathy_shore", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #

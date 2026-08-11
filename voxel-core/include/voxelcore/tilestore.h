@@ -178,6 +178,27 @@ enum FineSectionId : uint32_t {
     // list the fluid solver spawns from. The bake has computed this mask since
     // bake_ver 9 and discarded it unused on every tile until now.
     kSectionHeadwaters = 8,
+    // The bathymetry pair (water appearance plan, bake_ver 27): per-cell lake
+    // DEPTH and SIGNED DISTANCE TO SHORE. Two more planes through the same
+    // block machinery, element width and index layout as elevation and water --
+    // int16 per fine pixel, block_log2 8 -- because both are consumed per-pixel
+    // by the water material and neither can be derived from a basin row.
+    //
+    // WHY THE CLIENT CANNOT JUST COMPUTE THEM (tile_codec.py states this at
+    // length and it is the reason these exist at all): a lake's FOOTPRINT is a
+    // flood fill over data the client already holds, which is why
+    // lakes.h re-derives it. Depth needs the datum minus ground at every cell,
+    // and shore distance needs a Euclidean transform over a whole basin -- a
+    // global operation over up to 2.5 million cells that does not decompose per
+    // column. The bake does it once; the client fetches a block.
+    //
+    // WHY TWO PLANES AND NOT ONE INTERLEAVED ONE: the MED predictor runs along
+    // a scanline, and the two fields have unrelated gradients -- interleaving
+    // them hands the predictor a sawtooth and costs more than a second index.
+    kSectionBathyDepthIndex = 9,
+    kSectionBathyDepthData = 10,
+    kSectionBathyShoreIndex = 11,
+    kSectionBathyShoreData = 12,
 };
 
 // SECTION_BASIN_TABLE payload layout, mirroring terrain_service/tile_codec.py.
@@ -373,8 +394,22 @@ inline constexpr uint16_t kFineFlagWaterPresent = 0x4;
 // the tile has no heads, for the third time and the same reason: "surveyed, no
 // reach starts here" and "baked before headwaters existed" are different facts.
 inline constexpr uint16_t kFineFlagHeadsPresent = 0x8;
+// §3 `flags` bit4 (bake_ver 27): SECTION_BATHY_* are present. Set even on a
+// tile with no lakes, for the fourth time and the same reason: "surveyed, no
+// basins here" and "baked before bathymetry existed" are different facts, and
+// only the flag tells them apart. ONE BIT COVERS BOTH PLANES -- they are
+// computed together from one extent pass, and there is no case where a tile
+// carries depth without shore distance or the reverse, so the parser below
+// requires all four sections or none. Mirrors tile_codec.FLAG_BATHY_PRESENT.
+inline constexpr uint16_t kFineFlagBathyPresent = 0x10;
+// EVERY BIT THIS BUILD IMPLEMENTS. `flags & ~kFineFlagsKnown` is the parser's
+// hard refusal (kUnknownFeature), so a bit missing from this mask means every
+// tile carrying it is thrown away whole -- which is the correct behaviour for a
+// reader that is genuinely too old, and a self-inflicted outage for one that
+// merely forgot to list a bit it does implement.
 inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasinsPresent |
-                                            kFineFlagWaterPresent | kFineFlagHeadsPresent;
+                                            kFineFlagWaterPresent | kFineFlagHeadsPresent |
+                                            kFineFlagBathyPresent;
 
 // The newest `bake_ver` whose ON-TILE FEATURES this build implements -- i.e.
 // the last bake_ver that added a section id or a flag bit that the parser
@@ -400,7 +435,12 @@ inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasi
 // which is exactly the rule above. 13-23 were product bumps over an unchanged
 // layout, which is why the counter lagged twelve versions behind the bake and
 // was right to.
-inline constexpr uint16_t kFineMaxKnownBakeVer = 24;
+//
+// 24 -> 27 at the bathymetry pair: this commit teaches the parser four new
+// section ids (kSectionBathy*) and a new flag bit (kFineFlagBathyPresent), so
+// the same rule applies again. 25 and 26 were product bumps over an unchanged
+// layout.
+inline constexpr uint16_t kFineMaxKnownBakeVer = 27;
 
 // The dry sentinel in the water plane, in CONTROL-POINT units. INT16_MIN, the
 // one value the elevation codec's own range can never legitimately carry as a
@@ -437,6 +477,86 @@ inline constexpr int32_t kWaterDepthLsbMm = 10;
 // round. Two constants with one meaning is how the three discharge currencies
 // happened; see bake/water.py.
 inline constexpr int32_t kNoWaterMm = INT32_MIN;
+
+// --- SECTION_BATHY_* wire units (bake_ver 27) -------------------------------
+//
+// EVERY ONE OF THESE MIRRORS A NAMED CONSTANT IN
+// terrain_service/bake/basins.py -- BATHY_DEPTH_LSB_MM, BATHY_SHORE_LSB_MM,
+// BATHY_SHORE_CLAMP_M and BATHY_DRY_DEPTH -- and the names are kept parallel on
+// purpose so a grep for either side finds the other. The producer is the
+// authority; if these two lists ever disagree the tiles are right and this
+// header is wrong.
+//
+// The conversions below exist so that NO CONSUMER RE-DERIVES AN LSB. A shader
+// or a gameplay query that multiplies by its own 10 or 100 is a second copy of
+// the format, and the failure mode is not a crash: it is a lake that is ten
+// times too deep, or a foam band ten times too wide, in a build nobody thinks
+// touched the codec.
+
+//: Millimetres per stored DEPTH unit. Mirrors basins.BATHY_DEPTH_LSB_MM.
+inline constexpr int32_t kBathyDepthLsbMm = 10;
+//: Millimetres per stored SHORE-DISTANCE unit. Mirrors
+//: basins.BATHY_SHORE_LSB_MM -- the elevation plane's own 100 mm.
+inline constexpr int32_t kBathyShoreLsbMm = 100;
+
+//: "Not inside any basin extent", i.e. this cell is not lake bed. -1, the same
+//: marker SECTION_WATER_* uses for dry (kWaterDryDepth), so a consumer that
+//: knows one plane knows both -- basins.BATHY_DRY_DEPTH says exactly that.
+//:
+//: TEST IT AS `< 0`, NOT `== -1`, which is what bathyDepthIsDry does: a depth
+//: is non-negative by construction (water stands above its own bed), so the
+//: whole negative half of the range is available to mean "no water" and no
+//: future sentinel can turn a dry cell into a 300 m lake.
+inline constexpr int16_t kBathyDryDepth = -1;
+
+//: Where the signed shore distance saturates, in stored units: +/-1000, i.e.
+//: +/-100 m. Mirrors basins.BATHY_SHORE_CLAMP_M (100.0 m) divided by the LSB.
+//: The clamp is what makes the plane nearly free -- every block further than
+//: this from any water is one repeated value and encodes MODE_CONSTANT at zero
+//: data bytes.
+inline constexpr int16_t kBathyShoreClampUnits = 1000;
+inline constexpr int32_t kBathyShoreClampMm = kBathyShoreClampUnits * kBathyShoreLsbMm;
+
+//: "This cell has no lake depth." Returned by bathyDepthMm for the dry
+//: sentinel, and INT32_MIN for the same reason kNoWaterMm is: it is the one
+//: value a millimetre depth can never legitimately be, so it cannot be summed
+//: or interpolated into a plausible number by accident.
+inline constexpr int32_t kNoBathyDepthMm = INT32_MIN;
+
+//: Is this cell outside every basin extent?
+constexpr bool bathyDepthIsDry(int16_t depthUnits) { return depthUnits < 0; }
+
+//: Lake depth in millimetres, or kNoBathyDepthMm for a dry cell. The sentinel
+//: test lives HERE rather than at each call site precisely so it cannot be
+//: forgotten at one of them -- the same argument waterMmFromDepth makes.
+//:
+//: A stored 0 is WET, at exactly the bed: the extent's outermost ring, where
+//: the datum meets the ground, quantises there. `<= 0 means dry` is the bug
+//: this function exists to make impossible, and the fixture carries that cell.
+constexpr int32_t bathyDepthMm(int16_t depthUnits) {
+    return bathyDepthIsDry(depthUnits) ? kNoBathyDepthMm
+                                       : static_cast<int32_t>(depthUnits) * kBathyDepthLsbMm;
+}
+
+//: SIGNED distance to the nearest shoreline in millimetres: POSITIVE inside
+//: water, NEGATIVE on land, saturating at +/-kBathyShoreClampMm. No sentinel --
+//: every value is meaningful, including the saturated ones, which mean "at
+//: least 100 m from any shore on this side of it".
+constexpr int32_t bathyShoreMm(int16_t shoreUnits) {
+    return static_cast<int32_t>(shoreUnits) * kBathyShoreLsbMm;
+}
+
+//: Which side of the shoreline this cell is on. The SIGN is the whole point of
+//: the plane (basins.py: "the sign is load-bearing, not a convenience") -- land
+//: within a few decimetres of a lake is exactly the set that should be darkened
+//: as wet, and nothing else in the format can express it.
+//:
+//: Zero reads as LAND. It is not reachable from the bake -- the distance
+//: transform measures to the nearest cell of the opposite class, so the nearest
+//: any cell gets to the shoreline is one pixel, 1.875 m == 19 stored units --
+//: but a rule that leaves the boundary undefined is a rule two consumers will
+//: split on.
+constexpr bool bathyShoreIsWater(int16_t shoreUnits) { return shoreUnits > 0; }
 
 // True for codec values the FORMAT defines. Says nothing about whether this
 // process can decode them -- see fineCodecNeedsDecompressor below.
@@ -870,6 +990,11 @@ public:
     // again: an empty table with this true means "no reach starts here", this
     // false means "baked before headwaters existed" (bake_ver < 24).
     bool hasHeads() const { return (h_.flags & kFineFlagHeadsPresent) != 0; }
+    // True when the tile carries the bathymetry PAIR at all. Same distinction
+    // once more: an all-dry depth plane with this true means "surveyed, no lakes
+    // here", this false means "baked before bathymetry existed" (bake_ver < 27).
+    // One flag, both planes -- there is no tile with one of them.
+    bool hasBathy() const { return (h_.flags & kFineFlagBathyPresent) != 0; }
     // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
     // `basins()[i].basinId == i` and a row means the same basin in every
     // process. Empty when hasBasins() is false.
@@ -901,12 +1026,20 @@ public:
     // what is in them.
     bool flowIndexResident() const { return flowIndex_.size() == blockCount(); }
     bool waterIndexResident() const { return waterIndex_.size() == blockCount(); }
+    // Per PLANE, not per pair: the two bathymetry indices are separate sections
+    // and a ranged client can hold one and not the other (they are 20 KB apart
+    // with a data section in between). The tile-level "both or neither" rule is
+    // about what the FILE carries; this is about what was fetched.
+    bool bathyDepthIndexResident() const { return bathyDepthIndex_.size() == blockCount(); }
+    bool bathyShoreIndexResident() const { return bathyShoreIndex_.size() == blockCount(); }
     bool basinsResident() const { return basinsResident_; }
     bool headsResident() const { return headsResident_; }
 
     const std::vector<FineBlockEntry>& elevIndex() const { return elevIndex_; }
     const std::vector<FineBlockEntry>& flowIndex() const { return flowIndex_; }
     const std::vector<FineBlockEntry>& waterIndex() const { return waterIndex_; }
+    const std::vector<FineBlockEntry>& bathyDepthIndex() const { return bathyDepthIndex_; }
+    const std::vector<FineBlockEntry>& bathyShoreIndex() const { return bathyShoreIndex_; }
 
     // FILE offset of each plane's data section -- what an index entry's
     // `offset` is relative to, and therefore what a range fetcher must add to
@@ -914,6 +1047,8 @@ public:
     uint64_t elevDataOffset() const { return elevDataOff_; }
     uint64_t flowDataOffset() const { return flowDataOff_; }
     uint64_t waterDataOffset() const { return waterDataOff_; }
+    uint64_t bathyDepthDataOffset() const { return bathyDepthDataOff_; }
+    uint64_t bathyShoreDataOffset() const { return bathyShoreDataOff_; }
 
     uint8_t codec() const { return h_.codec; }
     // The decompressor this tile was parsed with. Empty for a CODEC_RAW tile.
@@ -947,6 +1082,19 @@ public:
     // `waterMmFromDepth`.
     bool decodeWaterBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
                           FineError* err = nullptr) const;
+    // The bathymetry pair (bake_ver 27), int16 per fine pixel, decoded through
+    // exactly the same block machinery as the two above -- same index layout,
+    // same MODE_CONSTANT / MODE_CODED / MODE_RAW handling, the same shared
+    // decodeBlockPayload. False when the tile carries no bathymetry, when the
+    // coords are out of range, or when this client never fetched the bytes.
+    //
+    // Values are RAW WIRE UNITS. Convert with bathyDepthMm / bathyShoreMm, and
+    // test dryness with bathyDepthIsDry, rather than multiplying by 10 or 100 at
+    // the call site -- see the comment on those constants.
+    bool decodeBathyDepthBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                               FineError* err = nullptr) const;
+    bool decodeBathyShoreBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
+                               FineError* err = nullptr) const;
 
     // Water-surface elevation from a water control point, or `kNoWaterMm` for
     // the dry sentinel. The sentinel test lives HERE rather than at each call
@@ -1006,6 +1154,20 @@ public:
     // that ignores it must still not substitute a value for `cp`.
     bool controlPointAt(uint32_t lx, uint32_t ly, int16_t& cp, FineError* err = nullptr) const;
 
+    // Both bathymetry fields at one tile-LOCAL pixel, ALREADY IN MILLIMETRES:
+    // `depthMm` is kNoBathyDepthMm outside every basin extent, `shoreMm` is
+    // signed (positive in water). Decodes the two containing blocks on every
+    // call, so -- exactly like controlPointAt -- it is for tests and cold paths;
+    // anything per-pixel should decode the blocks once and convert with
+    // bathyDepthMm / bathyShoreMm.
+    //
+    // BOTH FIELDS FROM ONE CALL because they are always read together (depth
+    // grades colour, distance sets the width of anything drawn along the shore)
+    // and because a caller that took them from two calls could get them from two
+    // different residency states without noticing.
+    bool bathyAt(uint32_t lx, uint32_t ly, int32_t& depthMm, int32_t& shoreMm,
+                 FineError* err = nullptr) const;
+
     // --- per-block residency ------------------------------------------------
     //
     // "Do I hold the bytes for this block?" -- answerable without decoding
@@ -1024,6 +1186,8 @@ public:
     bool elevBlockResident(uint32_t bx, uint32_t by) const;
     bool flowBlockResident(uint32_t bx, uint32_t by) const;
     bool waterBlockResident(uint32_t bx, uint32_t by) const;
+    bool bathyDepthBlockResident(uint32_t bx, uint32_t by) const;
+    bool bathyShoreBlockResident(uint32_t bx, uint32_t by) const;
 
     // Blocks of each plane whose bytes are held (CONSTANT ones counted, per
     // above). residentBlockCount(elev) == blockCount() for a whole-file tile.
@@ -1049,6 +1213,7 @@ private:
     FineTileHeader h_;
     FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_, waterIndex_;
+    std::vector<FineBlockEntry> bathyDepthIndex_, bathyShoreIndex_;
     std::vector<BasinEntry> basins_;
     std::vector<HeadEntry> heads_;
     // Distinguishes a fetched-and-empty basin table from an unfetched one. A
@@ -1059,6 +1224,8 @@ private:
     uint64_t elevDataOff_ = 0, elevDataLen_ = 0;
     uint64_t flowDataOff_ = 0, flowDataLen_ = 0;
     uint64_t waterDataOff_ = 0, waterDataLen_ = 0;
+    uint64_t bathyDepthDataOff_ = 0, bathyDepthDataLen_ = 0;
+    uint64_t bathyShoreDataOff_ = 0, bathyShoreDataLen_ = 0;
 };
 
 // Grid of v2 fine tiles for one seed, addressed in FINE tile-pixel coordinates

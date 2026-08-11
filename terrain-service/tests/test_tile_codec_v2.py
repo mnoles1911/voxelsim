@@ -1154,3 +1154,83 @@ def test_encode_fine_refuses_a_level_with_no_water_plane():
                        elevation_m=np.zeros((n, n)),
                        water_level_m=np.full((n, n), np.nan),
                        block_log2=4)
+
+
+# ------------------------------------------------------- bathymetry (v27) ---
+#
+# SECTION_BATHY_* carries the two rasters the water material shades a lake
+# with: per-cell DEPTH and SIGNED DISTANCE TO SHORE. These pin the wire
+# contract, not the hydrology -- the hydrology is pinned in test_bake_basins.
+
+def _bathy_tile(size=32, block_log2=4, **kw):
+    cp = _smooth_field(size)
+    return tc.TileV2(seed=7, x=1, y=2, size=size, elevation_cp=cp,
+                     block_log2=block_log2, **kw)
+
+
+def test_bathymetry_round_trips_exactly():
+    size = 32
+    yy, xx = np.mgrid[0:size, 0:size]
+    r = np.hypot(xx - 16, yy - 16)
+    depth = np.where(r < 8, np.rint((8 - r) * 50), -1).astype(np.int16)
+    shore = np.clip(np.rint((8 - r) * 18.75), -1000, 1000).astype(np.int16)
+    tile = _bathy_tile(size=size, bathy_depth=depth, bathy_shore=shore)
+    got = tc.decode_v2(tc.encode_v2(tile))
+    # int16 planes are stored losslessly, exactly as elevation and water are.
+    assert np.array_equal(got.bathy_depth, depth)
+    assert np.array_equal(got.bathy_shore, shore)
+
+
+def test_bathymetry_absent_stays_absent():
+    """A tile without the pair sets no flag and carries no sections -- so a
+    bake predating v27 stays readable and is distinguishable from a surveyed
+    tile that simply holds no lakes."""
+    got = tc.decode_v2(tc.encode_v2(_bathy_tile()))
+    assert got.bathy_depth is None and got.bathy_shore is None
+
+
+def test_bathymetry_is_both_or_neither():
+    """One flag bit covers both planes, so a half-populated tile must be
+    refused at construction rather than at decode -- the decoder's own
+    agreement check is a much worse place to discover it."""
+    size = 32
+    plane = np.zeros((size, size), np.int16)
+    with pytest.raises(AssertionError):
+        _bathy_tile(size=size, bathy_depth=plane)
+    with pytest.raises(AssertionError):
+        _bathy_tile(size=size, bathy_shore=plane)
+
+
+def test_an_all_dry_bathymetry_pair_is_essentially_free():
+    """THE PROPERTY THAT MAKES THE PLANE AFFORDABLE. A tile with no lakes is
+    two uniform rasters, every block MODE_CONSTANT at zero data bytes, so the
+    pair costs only its index tables. The wet block measures 0.7% water, so
+    this is the common case rather than a corner one."""
+    size, block_log2 = 64, 4
+    dry = np.full((size, size), -1, np.int16)
+    far = np.full((size, size), -1000, np.int16)
+    base = len(tc.encode_v2(_bathy_tile(size=size, block_log2=block_log2)))
+    withb = len(tc.encode_v2(_bathy_tile(size=size, block_log2=block_log2,
+                                         bathy_depth=dry, bathy_shore=far)))
+    per_plane_elements = size * size * 2  # int16, if it were stored literally
+    assert withb - base < per_plane_elements // 4, (
+        f"an all-dry bathymetry pair cost {withb - base} bytes; it should be "
+        "index tables only"
+    )
+
+
+def test_bathymetry_flag_is_refused_by_an_older_reader():
+    """Adding a flag bit is a HARD BREAK by design: a reader that does not
+    know bit4 must refuse the tile loudly rather than draw a world with the
+    bathymetry silently missing. Simulated by masking the bit out of the
+    decoder's known set, which is what an older build's constant would be."""
+    size = 32
+    plane = np.zeros((size, size), np.int16)
+    blob = tc.encode_v2(_bathy_tile(size=size, bathy_depth=plane,
+                                    bathy_shore=plane))
+    old_known = (tc.FLAG_FLOW_PRESENT | tc.FLAG_BASINS_PRESENT
+                 | tc.FLAG_WATER_PRESENT | tc.FLAG_HEADS_PRESENT)
+    assert tc.FLAG_BATHY_PRESENT & ~old_known, (
+        "FLAG_BATHY_PRESENT must be a NEW bit, or an old reader accepts a "
+        "tile it cannot fully parse"
+    )

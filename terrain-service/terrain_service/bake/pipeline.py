@@ -454,7 +454,11 @@ __all__ = [
 #: but it invalidates sites, screenshots and measurements, so it is the
 #: integrator's call to make deliberately, not a side effect to discover.
 TERRAIN_VERSION = 8
-BAKE_VERSION = 26
+#: 27: SECTION_BATHY_* -- per-cell lake depth and signed shore distance
+#: (B5b). A products-only change: TERRAIN_VERSION is untouched, so the ground
+#: is bit-identical and `test_bake_terrain_identity` must still reproduce the
+#: elevation plane byte for byte.
+BAKE_VERSION = 27
 
 
 @dataclass(frozen=True)
@@ -4160,6 +4164,17 @@ class BakeResult:
     #: reach starts in this tile" is a surveyed fact and ships as a zero-row
     #: table. Same three-state rule as ``basins`` and the water plane.
     water_heads: "np.ndarray | None" = None
+    #: Bathymetry (bake_ver 27): per-cell lake DEPTH (int16, 10 mm, -1 dry) and
+    #: SIGNED DISTANCE TO SHORE (int16, 100 mm, + inside water, saturating at
+    #: `_basins.BATHY_SHORE_CLAMP_M`). SECTION_BATHY_*. Both or neither, and
+    #: the same three-state rule as every product above: None means the stage
+    #: did not run, an all-dry pair means "surveyed, this tile holds no lakes".
+    #:
+    #: These exist because the water material needs depth and shore distance
+    #: PER PIXEL, and neither is derivable at a single column the way a basin's
+    #: footprint is -- see `_basins.bathymetry_planes` for the argument.
+    bathy_depth: "np.ndarray | None" = None
+    bathy_shore: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -4936,6 +4951,20 @@ def bake_tile(
     survey.labels = None
     out["cpu_seconds"]["B5.reopen_basins"] = time.process_time() - c0
 
+    # -- B5b: BATHYMETRY (bake_ver 27). Depth and signed shore distance, the
+    # two rasters the water material needs to shade a lake rather than merely
+    # draw one. See `_basins.bathymetry_planes` for why both, and why baked.
+    #
+    # IT MUST RUN HERE, after the re-open and before `out["z"]` is sliced and
+    # quantised. Depth is measured against the SAME re-opened surface the
+    # extent rule tests and the client reconstructs; measuring it against the
+    # filled surface would put water over ground that no longer exists.
+    c0 = time.process_time()
+    bathy_depth, bathy_shore = _basins.bathymetry_planes(
+        out["z"], survey.basins, interior=sl, cell_m=geom.fine_pixel_m,
+    )
+    out["cpu_seconds"]["B5b.bathymetry"] = time.process_time() - c0
+
     z = np.ascontiguousarray(out["z"][sl, sl])
     acc = np.ascontiguousarray(out["acc"][sl, sl])
     incision = out["incision"][sl, sl]
@@ -5587,6 +5616,8 @@ def bake_tile(
         water_surface_m=water_surface,
         water_level_m=water_level,
         water_heads=water_heads,
+        bathy_depth=bathy_depth,
+        bathy_shore=bathy_shore,
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

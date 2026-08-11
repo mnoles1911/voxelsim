@@ -354,6 +354,140 @@ def lake_extent_mask(
     return out
 
 
+#: Depth plane LSB. Same 10 mm as SECTION_WATER_*, and for the same reason:
+#: int16 at 10 mm spans +/-327 m against a deepest measured basin of ~46 m, so
+#: there is 7x headroom, and 10 mm is below anything the eye resolves in a
+#: colour gradient.
+BATHY_DEPTH_LSB_MM = 10
+#: Shore-distance plane LSB, 100 mm -- the elevation plane's own LSB. A
+#: shoreline gradient authored in decimetres is finer than the 1.875 m pixel
+#: the mask itself lives on, so the LSB is never the limit.
+BATHY_SHORE_LSB_MM = 100
+#: How far from a shoreline the signed distance keeps counting, in metres,
+#: before it saturates.
+#:
+#: THIS CLAMP IS WHAT MAKES THE PLANE FREE. A true distance field over a whole
+#: tile varies everywhere and would compress to nothing useful. Saturated, every
+#: block further than this from any water is a single repeated value, which
+#: `_encode_plane` stores as MODE_CONSTANT at ZERO data bytes -- the same
+#: property that keeps a dry tile's water plane at 1024 constant entries. The
+#: wet block measures 0.7% water, so nearly every block saturates.
+#:
+#: 100 m is chosen against what consumes it: shoreline foam and wet-shore
+#: darkening live in the first few metres, wave damping in the first tens.
+#: Nothing shipped reads a shore distance at 100 m, so the band is generous
+#: rather than tight, and widening it later costs only compressed size.
+BATHY_SHORE_CLAMP_M = 100.0
+#: Dry sentinel for the depth plane. Matches SECTION_WATER_*'s own dry marker
+#: so a consumer that already knows one plane knows both.
+BATHY_DRY_DEPTH = -1
+
+
+def bathymetry_planes(
+    z_open: np.ndarray,
+    records: "list[BasinRecord]",
+    *,
+    interior: "slice | None" = None,
+    cell_m: float,
+    shore_clamp_m: float = BATHY_SHORE_CLAMP_M,
+) -> "tuple[np.ndarray, np.ndarray]":
+    """The two rasters a lake needs to be SHADED rather than merely drawn.
+
+    Returns ``(depth, shore)`` over the interior, both int16:
+
+      * ``depth`` -- water depth in 10 mm units, i.e. the basin's datum minus
+        the re-opened ground, for every cell inside a water-holding basin's
+        extent. ``BATHY_DRY_DEPTH`` (-1) everywhere else.
+      * ``shore`` -- SIGNED distance to the nearest shoreline in 100 mm units,
+        POSITIVE inside water and NEGATIVE on land, saturating at
+        ``shore_clamp_m``.
+
+    WHY BOTH, when they look like the same fact. They are not, and using one
+    for the other is the classic shoreline bug. Crest states it plainly: foam
+    driven by a depth threshold "is not a distance to shoreline, but a
+    threshold on water depth, so the width of the foam band can vary based on
+    terrain slope" -- a steep bank gets a hairline of foam and a flat shallow
+    gets a smear. Depth is what grades COLOUR (Beer-Lambert wants a path
+    length); distance is what sets the WIDTH of anything drawn along the shore.
+    Baking both costs one extra plane that is almost entirely constant.
+
+    WHY BAKED AT ALL, rather than read from the depth buffer as the client does
+    today. The runtime thickness is a view-space Z difference, so it changes as
+    the camera moves, degrades at grazing angles, and -- on a bed quantised to
+    10 cm -- inherits the staircase as contour rings on the lake floor. A baked
+    field is view-independent, correct at any angle, and still right when the
+    shore is off-screen. Scene depth stays as the fallback for things the bake
+    cannot know about (players, boats): the hybrid every shipped game uses.
+
+    THE SIGN IS LOAD-BEARING, not a convenience. Land within a few decimetres
+    of a lake is exactly the set of cells that should be darkened and glossed
+    as wet, and it is the only thing here that a wet mask alone cannot express.
+    One signed field answers "how deep", "how far from shore" and "is this
+    ground beside water" without a second raster or a threshold test.
+
+    ``z_open`` is the PADDED re-opened surface in metres, matching what
+    ``survey_basins`` was handed; ``interior`` slices the shipped window out of
+    it. Records are used only through ``lake_extent_mask``, so this function
+    and the client's footprint agree by construction rather than by review.
+    """
+    from scipy import ndimage  # bake-only dependency; the client never runs this
+
+    z = np.asarray(z_open, dtype=np.float32)
+    if z.ndim != 2:
+        raise ValueError(f"z_open must be 2-D, got {z.shape}")
+
+    # Accumulate on the PADDED grid so a basin that continues past the tile
+    # edge still pushes a correct distance across the seam; slice at the end.
+    # Doing the transform on the interior alone would put a false shoreline on
+    # all four borders, which is the same class of error `survey_basins` runs
+    # padded to avoid.
+    wet = np.zeros(z.shape, bool)
+    depth_mm = np.zeros(z.shape, np.float32)
+    for r in records:
+        # `is_lake` is the same `kind >= KIND_LAKE_TERMINAL` test the wire's
+        # `holdsWater()` uses on the C++ side; a dry playa or salt flat has a
+        # surface at or below its floor and would contribute an empty mask
+        # anyway, but skipping it here keeps the extent fills off the hot path.
+        if not r.is_lake:
+            continue
+        mask = lake_extent_mask(z, r.seed_px, r.surface_m, r.bbox_px)
+        if not mask.any():
+            continue
+        # A basin's own datum, only where that basin actually reaches. Two
+        # basins never overlap (they are distinct components of one threshold
+        # test), so the last writer wins is never exercised -- but the maximum
+        # is taken anyway, because a silent overlap should read as the deeper
+        # water rather than as whichever record happened to be sorted last.
+        d = (np.float32(r.surface_m) - z) * np.float32(1000.0)
+        np.maximum(depth_mm, np.where(mask, d, 0.0), out=depth_mm)
+        wet |= mask
+
+    # Exact Euclidean distance, both directions. `distance_transform_edt`
+    # measures to the nearest ZERO, so running it on the mask gives the
+    # inside distance and on its complement the outside one.
+    if wet.any():
+        inside = ndimage.distance_transform_edt(wet)
+        outside = ndimage.distance_transform_edt(~wet)
+        signed_px = inside - outside
+    else:
+        # No water in this tile: everything is maximally far from a shore, on
+        # the land side. Uniform, so it costs zero data bytes.
+        signed_px = np.full(z.shape, -np.inf, np.float32)
+
+    signed_m = np.asarray(signed_px, np.float32) * np.float32(cell_m)
+    clamp = np.float32(shore_clamp_m)
+    np.clip(signed_m, -clamp, clamp, out=signed_m)
+
+    sl = interior if interior is not None else slice(None)
+    depth_i = np.where(
+        wet[sl, sl],
+        np.rint(np.maximum(depth_mm[sl, sl], 0.0) / BATHY_DEPTH_LSB_MM),
+        BATHY_DRY_DEPTH,
+    ).astype(np.int16)
+    shore_i = np.rint(signed_m[sl, sl] * 1000.0 / BATHY_SHORE_LSB_MM).astype(np.int16)
+    return depth_i, shore_i
+
+
 @flow._jit(cache=True)
 def _label8(mask, labels):
     """8-connected flood fill labelling, explicit stack (no recursion depth).

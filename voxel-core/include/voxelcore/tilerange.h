@@ -225,6 +225,12 @@ struct FinePreambleRequest {
     // fallback and put its documented rim false-heads on screen as a square of
     // hovering water.
     bool wantHeads = true;
+    // SECTION_BATHY_* (bake_ver 27): the lake depth and shore-distance planes.
+    // ONE FLAG FOR THE PAIR, matching the wire -- they are produced together and
+    // a consumer that shades a lake needs both. Defaults ON like the others, and
+    // the cost of that default is two 20 KB indices on tiles that carry them;
+    // the DATA sections are still only fetched block by block on demand.
+    bool wantBathy = true;
     uint64_t headProbeBytes = kFineHeadProbeBytes;
 };
 
@@ -254,10 +260,10 @@ bool readFineTilePreamble(RangeSource& src, uint64_t fileSize, const FinePreambl
                           FineTileBytes& out, FineError* err = nullptr,
                           FineHeaderFacts* facts = nullptr);
 
-// Which plane a fetch is for. The three share all their machinery -- one block
+// Which plane a fetch is for. All five share all their machinery -- one block
 // index, one data section, the same entry layout -- so this selects rather than
 // branches.
-enum class FinePlane : uint8_t { kElevation, kFlow, kWater };
+enum class FinePlane : uint8_t { kElevation, kFlow, kWater, kBathyDepth, kBathyShore };
 
 // Fetches (and splices into `tile`) exactly the named blocks of one plane that
 // are not already resident. CONSTANT blocks cost no request. Returns false on a
