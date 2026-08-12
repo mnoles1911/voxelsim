@@ -466,6 +466,50 @@ public:
 	int32 BuildLakeSheetRects(const FLakeSheetBasin& Basin, int32 StepPx, TArray<FBox2D>& OutRectsUU,
 	                          bool& bOutResolved) const;
 
+	// A LADDER of decimations for one basin, fine near the camera and coarsening
+	// with range -- vxc::LakeSheetLod, restated in plain types because this header
+	// is UHT-parsed and must never see a voxel-core type.
+	//
+	// WHY THE SHEET NEEDS THIS NOW. A single step chosen from the basin's SPAN was
+	// right while the near-field voxel disc covered the first 25.6 m; with lake
+	// basins on one rendering path the sheet is underfoot, and a 2.4 km lake's
+	// 5-7 m rectangles are 5-7 m of staircase on the waterline beside you. Only
+	// the SHORELINE shows decimation -- interior sheet is flat and coplanar, so a
+	// rectangle's size is invisible there -- which is why bands buy so much for so
+	// few extra rectangles.
+	//
+	// The band edges must be multiples of the coarsest step or two bands overlap
+	// (z-fight) or gap (a hole in the lake); vxc::lakeSheetRectsBanded enforces
+	// that itself rather than trusting the caller, and falls back to a single
+	// step for any ladder it cannot make exact.
+	struct FLakeSheetLod
+	{
+		static constexpr int32 kMaxBands = 4;
+		int32 NumBands = 1;
+		int32 StepPx[kMaxBands] = {1, 1, 1, 1};
+		int32 RadiusPx[kMaxBands] = {0, 0, 0, 0}; // outer half-extent; the last is unbounded
+		double CamXUU = 0.0, CamYUU = 0.0;        // band centre, world UU
+	};
+
+	// BuildLakeSheetRects with a per-band step. Same resolve semantics.
+	int32 BuildLakeSheetRectsBanded(const FLakeSheetBasin& Basin, const FLakeSheetLod& Lod,
+	                                TArray<FBox2D>& OutRectsUU, bool& bOutResolved) const;
+
+	// voxel.Water.MeshImplicitLakes. The sheet reads it to decide whether it still
+	// owes the near field a hole -- both halves of the one-path change have to
+	// move together or the frame has either two water surfaces or none.
+	static bool ShouldMeshImplicitLakes();
+
+	// Is there CA-OWNED (mobilized) water inside the implicit disc whose brick z
+	// span brackets `SurfaceZUU`? This is what the sheet's hole is really keyed on
+	// once implicit lakes stop meshing: an untouched lake has no near-field water
+	// to hand over to and must NOT have a hole cut in it, but a lake the player
+	// has dug into does, and that water must not be drawn over.
+	//
+	// Early-outs on the first hit, so the common answer (nothing mobilized) costs
+	// one empty-set test.
+	bool HasMobilizedWaterInImplicitDisc(double SurfaceZUU) const;
+
 	// One basin's wet extent as an N x N BIT GRID over a square world-UU window
 	// -- the form the GPU fluid sink despawns against (vxc::basinExtentBits, and
 	// the failure that made it necessary is documented there). OutRows must hold

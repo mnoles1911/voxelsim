@@ -1459,6 +1459,72 @@ inline int32_t reconstructedGroundMm(ITileSampler& tiles, int64_t px, int64_t py
     return static_cast<int32_t>(evalCarrier(cp, 0, 0, pxMm).heightMm);
 }
 
+// --- BULK BATHYMETRY READ -------------------------------------------------
+//
+// Written for one consumer and shaped by it: the client has to hand a 2D
+// bathymetry field to a MATERIAL, which means filling a raster of tens of
+// thousands of cells per update. FineTile::bathyAt is the wrong tool for that
+// -- it decodes the two containing 256x256 blocks on EVERY call, so a 256-cell
+// row would decode the same pair 256 times. sampleBathyRect decodes each
+// covered block exactly once and copies the intersecting sub-rectangle out,
+// which is the same "one block, one frame" economy decodeElevBlock exists for,
+// applied to a rect instead of a pixel.
+//
+// It is also the only rect->buffer sampler in voxel-core, and deliberately
+// stays a FREE FUNCTION over FineTileSampler's public surface (findTile +
+// FineTile's const decoders) rather than a member: it caches nothing, mutates
+// nothing, and therefore -- unlike every FineTileSampler query method -- is
+// safe to call concurrently on a sampler other threads are reading.
+
+// Written into BOTH planes for a cell that could not be read at all: no tile
+// loaded, the tile predates bake_ver 27, or the block's bytes were never
+// fetched. It must not collide with either plane's real range, and it does not:
+// depth is kBathyDryDepth(-1) or >= 0, shore saturates at +/-kBathyShoreClampUnits
+// (1000). INT16_MIN is unreachable in both.
+//
+// WHY A SENTINEL RATHER THAN "LEAVE IT ALONE". "No data here" and "dry land
+// here" drive opposite decisions downstream -- the first must fall back to the
+// screen-space path, the second must draw dry ground -- and a caller handed a
+// buffer with holes it cannot see will conflate them. Same argument as
+// hasBathy() vs an all-dry plane, one level further down.
+inline constexpr int16_t kBathyMissing = INT16_MIN;
+
+// Why each cell that could not be filled could not be filled. Kept apart for
+// the reason FineTileSampler keeps missingTileQueries apart from
+// notResidentBlockQueries: `missingTiles` means streaming has not caught up,
+// `noPlane` means this world was baked before bathymetry existed, and
+// `notResident` means some fetch gate did not cover this read. Only the first
+// is expected to be nonzero in steady state.
+struct BathyRectStats {
+    uint64_t cells = 0;         // cells in the requested rect
+    uint64_t filled = 0;        // cells answered from a decoded block
+    uint64_t missingTiles = 0;  // owning tile not loaded in this sampler
+    uint64_t noPlane = 0;       // tile loaded but carries no bathymetry (bake_ver < 27)
+    uint64_t notResident = 0;   // block bytes never fetched, or index absent
+    uint64_t decodeFailed = 0;  // bytes held but the payload would not reconstruct
+
+    bool complete() const { return filled == cells; }
+};
+
+// Fills an INCLUSIVE rect of fine tile-pixel coordinates into two row-major
+// int16 buffers, in RAW WIRE UNITS (convert with bathyDepthMm / bathyShoreMm;
+// test dryness with bathyDepthIsDry). Cell (px, py) lands at
+//   out[(py - py0) * rowStrideElems + (px - px0)]
+// so a caller filling a sub-window of a larger texture passes that texture's
+// row stride and a pointer to the window's first cell.
+//
+// Either output pointer may be null to skip that plane; the stats still count
+// the cell against the plane that WAS requested. Unfilled cells are set to
+// kBathyMissing in whichever buffers were supplied.
+//
+// Returns per-reason counts rather than a bool because the caller has to act on
+// the difference (see BathyRectStats). An empty or inverted rect is not an
+// error -- it fills nothing and reports cells == 0.
+BathyRectStats sampleBathyRect(const FineTileSampler& tiles,
+                               int64_t px0, int64_t py0, int64_t px1, int64_t py1,
+                               int16_t* depthOut, int16_t* shoreOut,
+                               int64_t rowStrideElems);
+
 // Reads a whole file into memory. Returns nullopt on any I/O failure.
 std::optional<std::vector<uint8_t>> readFileBytes(const std::filesystem::path& path);
 

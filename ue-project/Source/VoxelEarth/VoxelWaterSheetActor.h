@@ -2,6 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+// For FLakeSheetLod, which is a nested struct and so cannot be forward
+// declared. The .cpp already included this; the ladder moved it up here.
+#include "VoxelWaterSubsystem.h"
+
 #include "VoxelWaterSheetActor.generated.h"
 
 class UProceduralMeshComponent;
@@ -87,6 +91,14 @@ private:
 		int32 Section = INDEX_NONE;
 		int32 StepPx = 1;
 		int32 RectCount = 0;
+		// The camera cell this basin's LOD bands were last centred on, and
+		// whether they depend on the camera at all. A basin further out than the
+		// outermost BOUNDED band decimates uniformly, so its geometry does not
+		// change when the camera moves and it must leave the rebuild rotation --
+		// with ~289 basins resident, rebuilding all of them because the camera
+		// crossed a cell is the cost this flag exists to refuse.
+		FIntPoint LodKey = FIntPoint(MIN_int32, MIN_int32);
+		bool bUniformCoarse = true;
 		// Built, as opposed to "has rectangles". A basin whose extent decimates
 		// to zero cells at this range is BUILT and must leave the rebuild
 		// rotation; keying the rotation on RectCount instead would re-mesh every
@@ -106,10 +118,33 @@ private:
 	// Rebuilds one basin's mesh section. Returns false if the basin would not
 	// resolve (its tile or a block failed to decode) -- which is counted, not
 	// swallowed, because it is indistinguishable from a dry basin on screen.
-	bool RebuildSheet(FSheet& Sheet);
+	bool RebuildSheet(FSheet& Sheet, const FVector& CamUU);
 
 	// Decimation for a basin, in fine pixels per emitted cell. See the .cpp.
 	int32 StepForBasin(double SpanUU) const;
+
+	// The steps and radii for one basin -- fine underfoot, coarsening with range,
+	// coarsest step still the basin-span one StepForBasin picks. No camera: this
+	// is the ladder's SHAPE, which depends only on the basin.
+	void BuildLadder(const FSheet& Sheet, UVoxelWaterSubsystem::FLakeSheetLod& OutLod) const;
+
+	// BuildLadder plus the band centre, and whether this basin is far enough out
+	// that every block lands in the last unbounded band (so it can leave the
+	// rebuild rotation).
+	void BuildLodForBasin(const FSheet& Sheet, const FVector& CamUU,
+	                      UVoxelWaterSubsystem::FLakeSheetLod& OutLod, bool& bOutUniform) const;
+
+	// Does this basin reach the outermost BOUNDED band at this camera? Evaluated
+	// against the snapped cell, so it cannot flap.
+	bool IsBandedAtCamera(const FSheet& Sheet, const FVector& CamUU) const;
+
+	// Which hysteresis cell the camera is in. The bands only re-centre when this
+	// changes, so a metre of walking rebuilds nothing.
+	FIntPoint LodKeyForCamera(const FVector& CamUU) const;
+
+	// The centre of that cell. The bands are centred here rather than on the
+	// camera, which is what makes a basin's mesh a pure function of its LodKey.
+	FVector2D SnappedCamXY(const FVector& CamUU) const;
 
 	// The near-field cut-out, or false when the implicit disc is not meshing
 	// water at this datum (too far above or below it) and no hole is owed.
@@ -158,6 +193,32 @@ private:
 	// otherwise get wildly different triangle budgets for the same screen area.
 	// -VoxelLakeSheetCells overrides it.
 	int32 TargetCellsPerSide = 128;
+
+	// THE FINEST BAND'S HALF-EXTENT, in metres. Inside it the sheet meshes at ONE
+	// FINE PIXEL (1.875 m), the finest the baked extent mask can express; each
+	// band out doubles the radius and coarsens the step until the basin-span step
+	// takes over.
+	//
+	// 96 m rather than something tidier because the number it has to beat is the
+	// retired near disc's 25.6 m half-extent, and the hysteresis grid below can
+	// take up to half a cell off the effective radius. 96 m with a 30 m grid
+	// never drops the fine band below ~81 m, i.e. always more than three times
+	// the coverage the voxel path had. -VoxelLakeSheetFineM moves it.
+	double FineBandRadiusM = 96.0;
+
+	// Camera hysteresis for the band centre, in fine pixels. The bands re-centre
+	// when the camera crosses a cell of this size, not when it moves -- the same
+	// recentring policy the fluid window and the clipmap use, and the reason a
+	// basin is not remeshed because the player took a step. 16 fine pixels = 30 m.
+	int32 LodSnapPx = 16;
+
+	// THE LADDER'S OFF SWITCH, and the reason it is a rung COUNT rather than a
+	// radius: -VoxelLakeSheetFineM 0 does NOT turn the ladder off. Radii round UP
+	// to the band alignment (lcm of the rungs, 28 fine px on the exemplar basin),
+	// so asking for a zero-metre fine band still yields a 52.5 m one. 1 here is
+	// the honest control -- one band at the basin-span step, i.e. exactly the
+	// decomposition the sheet shipped with before distance-aware LOD.
+	int32 MaxBands = 4;
 
 	// One basin rebuilt per tick at most, so a first frame in range never lands
 	// as a hitch -- the same budget discipline RefreshImplicitWater's

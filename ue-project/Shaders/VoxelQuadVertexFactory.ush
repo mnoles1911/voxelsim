@@ -17,6 +17,13 @@
 
 #include "/Engine/Private/VertexFactoryCommon.ush"
 #include "/VoxelEarth/VoxelQuadDecode.ush"
+// ADR-0008's palette, generated from vxc::kMaterialPalette by
+// ue-project/Tools/gen_material_palette_ush.py. It brings the table, the
+// evaluation, and the two route functions this factory calls (VoxelPalettePack
+// per vertex, VoxelPaletteUnpack per pixel). Everything the route DECIDES lives
+// there because that file is compiled by DXC from tools/compile-shaders.ps1 and
+// this one cannot be -- see the block above GetMaterialPixelParameters.
+#include "/VoxelEarth/VoxelMaterialPalette.ush"
 
 // The quad pool and its framing arrive in the VoxelVF uniform buffer, declared
 // by FVoxelQuadVertexFactoryParameters and injected into this shader by the
@@ -53,6 +60,29 @@ struct FVertexFactoryInterpolantsVSToPS
 	// TEXCOORD1 is free -- TANGENTTOWORLD_INTERPOLATOR_BLOCK lands on
 	// TEXCOORD10/11 (+15), not here.
 	float3 GIUVW     : TEXCOORD1;
+
+	// ADR-0008 MATERIAL PALETTE (xyz = voxel-space position, w = mat|faceClass<<8).
+	//
+	// COSTS NOTHING UNTIL A MATERIAL ASKS FOR IT. The guard is the same condition
+	// that decides whether GetMaterialPixelParameters can write TexCoords[3]/[4]
+	// at all, so a material that does not read UV3/UV4 -- M_WaterVoxel, and
+	// M_VoxelTerrain before its graph is regenerated -- compiles this member away
+	// along with everything that fills it. That is what keeps this change inert:
+	// not "cheap", absent.
+	//
+	// WHY AN INTERPOLANT AT ALL, when the local-lights route adds none. Local
+	// lights compute a colour from data already at pixel rate; the palette needs
+	// the pixel's own VOXEL, and nothing already carried identifies it.
+	// VertexColor is full (R surface flag, G AO, B/A climate), TexCoords[0] is
+	// the detail UV and is wrapped to a 32 m period -- hashing on it would tile
+	// the tint every 320 voxels and still be missing the third axis. GIUVW does
+	// encode a position, but it is the GI probe point (pushed 0.6 cells along the
+	// normal, recovered through VoxelGIVol's own origin and inverse size), so
+	// reading the palette out of it would make a colour depend on a lighting
+	// volume's uniforms -- including whatever they hold when GI is off.
+#if NUM_TEX_COORD_INTERPOLATORS > 4
+	float4 VoxelPalette : TEXCOORD2;
+#endif
 };
 
 struct FVertexFactoryIntermediates
@@ -64,6 +94,9 @@ struct FVertexFactoryIntermediates
 	float3  Position;      // primitive space, unreal units
 	float2  TexCoords;
 	float3  GIUVW;
+#if NUM_TEX_COORD_INTERPOLATORS > 4
+	float4  VoxelPalette;
+#endif
 
 	FSceneDataIntermediates SceneData;
 };
@@ -396,16 +429,86 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		(half)ColorB,
 		(half)ColorA);
 
+	// --- ADR-0008 MATERIAL PALETTE ------------------------------------------
+	//
+	// This is the hook the marker branch above was described as the smallest
+	// instance of, generalised: a real per-material appearance in the pooled
+	// renderer. The id is trustworthy HERE for the reason recorded there --
+	// Decoded.MaterialId is unpacked from the quad's own bits inside this shader
+	// and never goes through the FColor vertex-attribute transform that made
+	// VertexColor.R * 255 arrive as ~6-8 where the CPU wrote 4
+	// (VoxelClimateProbe.h). The whole feature rests on that measurement.
+	//
+	// ALL IT DOES IS PACK. The colour is evaluated per PIXEL (see
+	// GetMaterialPixelParameters), because greedy meshing merges up to eight
+	// voxels into one quad and ADR-0008 invariant 2 keys the tint to the voxel:
+	// evaluated here, one quad would be one colour and a bark trunk would read
+	// as flat panels.
+	//
+	// WATER PASSES 0. In a water pool the quad's `mat` byte is the CA fill
+	// fraction, not a material id (UVoxelWaterSubsystem's EmitWaterQuads writes
+	// it there deliberately so it rides the existing encoding), so feeding it to
+	// the palette would index the table with a fill level. 0 is MAT_AIR, whose
+	// row is black with no variation, and water's own material does not read
+	// these UVs anyway.
+#if NUM_TEX_COORD_INTERPOLATORS > 4
+	Intermediates.VoxelPalette = VoxelPalettePack(
+		Decoded.PositionUU,
+		ChunkOrigin,
+		Decoded.Normal,                       // GEOMETRIC, not shading -- this
+		                                      // asks which way the face points
+		VOXEL_SIZE_UU * ChunkScale,           // the quad's own voxel size
+		bWater ? 0u : Decoded.MaterialId,
+		Axis,
+		QPositive != 0u);
+#endif
+
 	// World-planar UVs on the face's two in-plane axes, matching the CPU
 	// path's "position / 100, wrapped to a 32 m period". The wrap keeps the
 	// value small so float precision stays sub-millimetre no matter how far
 	// the chunk sits from the world origin.
+	//
+	// THE WRAP IS NOW A POSITIVE MODULO, NOT fmod, AND THAT IS A BUG FIX
+	// (2026-08-11). HLSL's fmod carries the SIGN OF ITS ARGUMENT: fmod(-5, 32)
+	// is -5, not 27. So this coordinate was an ODD function through world x = 0
+	// and y = 0, and every consumer that feeds it into anything with odd
+	// symmetry -- a sine, a signed noise, a detail texture read as a
+	// perturbation -- got a field that is MIRRORED about both world axes. That
+	// is a real repeating-pattern artefact and it is invisible unless you happen
+	// to stand at the origin, which is why it survived this long.
+	//
+	// frac(x / P) * P is the same period, always in [0, P), continuous
+	// everywhere except at the period boundary where it was discontinuous
+	// anyway. It costs the same.
+	//
+	// AND IT CHANGES NOTHING THAT EXISTS TODAY, which was checked rather than
+	// hoped for. For positive coordinates the two expressions are identical; for
+	// negative ones they differ by EXACTLY ONE PERIOD (fmod(-65102, 32) = -14,
+	// frac(-65102/32)*32 = 18, and 18 - (-14) = 32). The only consumer of this
+	// UV is the terrain/clipmap detail texture at 8 m tiling, and 8 divides 32,
+	// so a whole-period offset lands on the same texel. Measured on the pinned
+	// lake pose at world (-65102, -51084) m: 0.00% of sky pixels and 0.10% of
+	// far-terrain pixels differ by more than 8/255 across this change. What it
+	// removes is the LATENT trap -- the next consumer with odd symmetry that is
+	// not periodic in 32 m would have inherited a mirrored world, and the water
+	// ripple was exactly that consumer.
+	//
+	// WATER NO LONGER READS THIS AT ALL, and that is the other half of the same
+	// fix. M_WaterVoxel used to build its ripple normal on TEXCOORD0, which
+	// meant the lake surface carried a literal 32 m repeating tile with a mirror
+	// down the middle of the world -- the owner's "looks like a repeating tile".
+	// Its wave field is now keyed on absolute world XY instead, which has no
+	// period, and which the far-field lake sheets can also agree with (they
+	// CANNOT adopt a wrapped UV: AVoxelWaterSheetActor rectangles run to a
+	// kilometre and a wrap boundary inside one quad would smear the whole period
+	// across it). What still reads TEXCOORD0 is the terrain and clipmap detail
+	// texture, which is why the wrap and its precision argument stay.
 	const uint U = (Axis + 1u) % 3u;
 	const uint V = (Axis + 2u) % 3u;
 	const float UVPeriodM = 32.0f;
 	Intermediates.TexCoords = float2(
-		fmod(Intermediates.Position[U] / 100.0f, UVPeriodM),
-		fmod(Intermediates.Position[V] / 100.0f, UVPeriodM));
+		frac((Intermediates.Position[U] / 100.0f) / UVPeriodM) * UVPeriodM,
+		frac((Intermediates.Position[V] / 100.0f) / UVPeriodM) * UVPeriodM);
 
 	// Voxel GI probe coordinate. Pushed out along the face normal into the air
 	// cell in front of the surface, matching the CPU sampler's first probe
@@ -450,6 +553,9 @@ FVertexFactoryInterpolantsVSToPS VertexFactoryGetInterpolantsVSToPS(
 	Interpolants.Color = VertexParameters.VertexColor;
 	Interpolants.TexCoords = Intermediates.TexCoords;
 	Interpolants.GIUVW = Intermediates.GIUVW;
+#if NUM_TEX_COORD_INTERPOLATORS > 4
+	Interpolants.VoxelPalette = Intermediates.VoxelPalette;
+#endif
 	return Interpolants;
 }
 
@@ -761,6 +867,43 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 
 #if NUM_TEX_COORD_INTERPOLATORS
 	Result.TexCoords[0] = Interpolants.TexCoords;
+#endif
+
+	// --- ADR-0008 MATERIAL PALETTE, AT PIXEL RATE ---------------------------
+	//
+	// TexCoords[3] = palette RGB.rg, TexCoords[4] = (palette RGB.b, isAsset).
+	// M_VoxelTerrain reads them as TextureCoordinate(3)/(4) and does
+	//
+	//     BaseColor = lerp(biomeAlbedo, paletteRGB, isAsset)
+	//
+	// before its AO multiply, so the palette colour is lit and occluded like
+	// everything else -- invariant 4 keeps lighting out of the table itself.
+	//
+	// WHY 3 AND 4, when 1 and 2 look free. They are not: the local-lights plan
+	// (docs/sky-and-local-light-plan.md L2) routes LocalRGB through
+	// TexCoords[1]/[2] into EmissiveColor. Taking them would collide with a
+	// feature that is already designed, and the collision would present as a
+	// torch that tints bark.
+	//
+	// SETTING THEM HERE ADDS NO VS->PS INTERPOLANT -- the same idiom L2 uses.
+	// What it costs is the one interpolant carrying the voxel coordinate (see
+	// the struct), which no existing channel can supply.
+	//
+	// isAsset IS 0 WHEN NOTHING WRITES IT, and that polarity is the safety
+	// argument. Terrain's ten thousand voxels a frame go down the biome path
+	// they already used; only a material terrain cannot produce takes the
+	// palette. It is also what makes this inert on the COMPONENT path, where
+	// FLocalVertexFactory supplies no fourth or fifth UV: Tools/probe_texcoord1.py
+	// measured a second texture coordinate arriving as zero there, and zero here
+	// means "biome", not "black".
+#if NUM_TEX_COORD_INTERPOLATORS > 4
+	{
+		float3 PaletteRGB;
+		float IsAsset;
+		VoxelPaletteUnpack(Interpolants.VoxelPalette, PaletteRGB, IsAsset);
+		Result.TexCoords[3] = float2(PaletteRGB.r, PaletteRGB.g);
+		Result.TexCoords[4] = float2(PaletteRGB.b, IsAsset);
+	}
 #endif
 
 	return Result;

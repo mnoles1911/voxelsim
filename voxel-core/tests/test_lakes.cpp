@@ -553,6 +553,248 @@ VXC_TEST(sheet_rects_reject_a_mask_that_is_not_its_basins_bbox) {
     CHECK_EQ(int(rs.size()), 0);
 }
 
+// ---------------------------------------------------------------------------
+// THE BAND LADDER (lakeSheetRectsBanded)
+// ---------------------------------------------------------------------------
+//
+// These pin the one property the feature cannot ship without. The rectangles
+// are coplanar and the water material is opaque Single Layer Water, so an
+// OVERLAP between two bands z-fights and a GAP between them is a hole in the
+// lake. "Every cell is covered at most once" is therefore not a tidiness check,
+// it is the whole correctness argument, and it is exactly what a distance-from-
+// a-point band test silently violates (see the header comment).
+
+namespace {
+
+// Cells of the bbox covered by each emitted rectangle. The maximum tells you
+// about overlap, the wet cells about gaps.
+std::vector<int> coverCount(const BasinEntry& b, int32_t w, int32_t h,
+                            const std::vector<LakeSheetRect>& rs) {
+    std::vector<int> cover(size_t(w) * size_t(h), 0);
+    for (const LakeSheetRect& r : rs) {
+        for (int32_t y = r.y0 - b.bboxY0; y <= r.y1 - b.bboxY0; ++y) {
+            for (int32_t x = r.x0 - b.bboxX0; x <= r.x1 - b.bboxX0; ++x) {
+                if (x >= 0 && x < w && y >= 0 && y < h) cover[size_t(y) * size_t(w) + size_t(x)]++;
+            }
+        }
+    }
+    return cover;
+}
+
+std::vector<uint8_t> discMask(int32_t w, int32_t h, double r) {
+    std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const double dx = x - (w / 2.0 - 0.5), dy = y - (h / 2.0 - 0.5);
+            if (dx * dx + dy * dy <= r * r) mask[size_t(y) * size_t(w) + size_t(x)] = 1;
+        }
+    }
+    return mask;
+}
+
+} // namespace
+
+VXC_TEST(sheet_bands_never_overlap_and_never_gap_wherever_the_camera_stands) {
+    const int32_t w = 96, h = 96;
+    BasinEntry b = sheetBasin(w, h);
+    const std::vector<uint8_t> mask = discMask(w, h, 44.0);
+
+    LakeSheetLod lod;
+    lod.numBands = 4;
+    lod.stepPx[0] = 1;
+    lod.stepPx[1] = 2;
+    lod.stepPx[2] = 4;
+    lod.stepPx[3] = 8;
+    lod.radiusPx[0] = 6;
+    lod.radiusPx[1] = 13; // deliberately NOT a multiple of the coarsest step --
+    lod.radiusPx[2] = 27; // the function must snap these itself
+    lod.radiusPx[3] = 0;  // unbounded
+
+    // Camera walked across and beyond the basin, one pixel at a time, including
+    // positions off the bbox entirely and negative ones. A band edge that can
+    // straddle a block will find a camera here that makes it.
+    for (int32_t cx = -20; cx <= w + 20; ++cx) {
+        for (int32_t cy = -20; cy <= h + 20; cy += 7) {
+            lod.camPxX = cx;
+            lod.camPxY = cy;
+            std::vector<LakeSheetRect> rs;
+            lakeSheetRectsBanded(b, mask, lod, rs);
+            const std::vector<int> cover = coverCount(b, w, h, rs);
+            for (size_t i = 0; i < cover.size(); ++i) {
+                CHECK(cover[i] <= 1);                        // no z-fighting overlap
+                if (mask[i] != 0) CHECK(cover[i] == 1);      // no hole in the lake
+            }
+            for (const LakeSheetRect& r : rs) {
+                CHECK(r.x0 >= b.bboxX0 && r.x1 <= b.bboxX1);
+                CHECK(r.y0 >= b.bboxY0 && r.y1 <= b.bboxY1);
+                CHECK(r.x0 <= r.x1 && r.y0 <= r.y1);
+            }
+        }
+    }
+}
+
+VXC_TEST(sheet_bands_are_exact_near_the_camera_and_dilated_far_from_it) {
+    // THE POINT OF THE LADDER, as a number. Inside the finest band the sheet
+    // meshes at one fine pixel, so it covers the wet cells and NOTHING else --
+    // the waterline is the mask's own. Outside, the dilating block rule still
+    // applies, which is what tucks the far shore under the bank.
+    const int32_t w = 96, h = 96;
+    BasinEntry b = sheetBasin(w, h);
+    const std::vector<uint8_t> mask = discMask(w, h, 44.0);
+
+    LakeSheetLod lod;
+    lod.numBands = 3;
+    lod.stepPx[0] = 1;
+    lod.stepPx[1] = 2;
+    lod.stepPx[2] = 8;
+    lod.radiusPx[0] = 16;
+    lod.radiusPx[1] = 32;
+    lod.camPxX = 48;
+    lod.camPxY = 48;
+
+    std::vector<LakeSheetRect> rs;
+    lakeSheetRectsBanded(b, mask, lod, rs);
+    const std::vector<int> cover = coverCount(b, w, h, rs);
+
+    // Every covered cell within the finest band's square is wet: no dry cell is
+    // painted with water anywhere near the camera.
+    for (int32_t y = 48 - 16; y < 48 + 16; ++y) {
+        for (int32_t x = 48 - 16; x < 48 + 16; ++x) {
+            const size_t i = size_t(y) * size_t(w) + size_t(x);
+            if (cover[i] != 0) CHECK(mask[i] != 0);
+        }
+    }
+
+    // And the ladder is strictly finer than the flat coarse decomposition it
+    // replaces: same coverage of the lake, less dry ground painted.
+    std::vector<LakeSheetRect> flat;
+    lakeSheetRects(b, mask, 8, flat);
+    CHECK(rectArea(rs) <= rectArea(flat));
+    CHECK(rs.size() > flat.size()); // more, smaller rectangles -- the cost
+}
+
+VXC_TEST(sheet_bands_with_a_camera_far_away_are_the_flat_decomposition) {
+    // A basin nowhere near the camera has every block in the last, unbounded
+    // band. This is what lets the actor keep such a basin out of the rebuild
+    // rotation entirely: its geometry cannot depend on a camera it never sees.
+    const int32_t w = 48, h = 48;
+    BasinEntry b = sheetBasin(w, h);
+    const std::vector<uint8_t> mask = discMask(w, h, 20.0);
+
+    LakeSheetLod lod;
+    lod.numBands = 3;
+    lod.stepPx[0] = 1;
+    lod.stepPx[1] = 2;
+    lod.stepPx[2] = 4;
+    lod.radiusPx[0] = 8;
+    lod.radiusPx[1] = 16;
+    lod.camPxX = 100000;
+    lod.camPxY = 100000;
+
+    std::vector<LakeSheetRect> banded;
+    lakeSheetRectsBanded(b, mask, lod, banded);
+    std::vector<LakeSheetRect> flat;
+    lakeSheetRects(b, mask, 4, flat);
+    CHECK_EQ(int(banded.size()), int(flat.size()));
+    CHECK_EQ(int(rectArea(banded)), int(rectArea(flat)));
+}
+
+VXC_TEST(sheet_bands_stay_a_partition_when_no_step_divides_another) {
+    // THE CASE THE SHIPPING LADDER IS. A basin's coarsest step comes from its
+    // span, so it is an arbitrary integer -- the exemplar 1564 m lake picks 7,
+    // and {1, 2, 4, 7} has no divisibility between its rungs at all. The band
+    // edges align to lcm = 28 instead, and the partition has to survive that
+    // exactly as it does for a tidy ladder.
+    const int32_t w = 96, h = 96;
+    BasinEntry b = sheetBasin(w, h);
+    const std::vector<uint8_t> mask = discMask(w, h, 44.0);
+
+    LakeSheetLod lod;
+    lod.numBands = 4;
+    lod.stepPx[0] = 1;
+    lod.stepPx[1] = 2;
+    lod.stepPx[2] = 4;
+    lod.stepPx[3] = 7;
+    lod.radiusPx[0] = 10;
+    lod.radiusPx[1] = 20;
+    lod.radiusPx[2] = 40;
+
+    for (int32_t cx = -10; cx <= w + 10; cx += 3) {
+        for (int32_t cy = -10; cy <= h + 10; cy += 11) {
+            lod.camPxX = cx;
+            lod.camPxY = cy;
+            std::vector<LakeSheetRect> rs;
+            lakeSheetRectsBanded(b, mask, lod, rs);
+            const std::vector<int> cover = coverCount(b, w, h, rs);
+            for (size_t i = 0; i < cover.size(); ++i) {
+                CHECK(cover[i] <= 1);
+                if (mask[i] != 0) CHECK(cover[i] == 1);
+            }
+        }
+    }
+
+    // The far field is still the step the caller asked for: a rung of 7 means
+    // 7, not 7 rounded up to 8. That is the whole reason the LCM is used.
+    lod.camPxX = 100000;
+    lod.camPxY = 100000;
+    std::vector<LakeSheetRect> far;
+    lakeSheetRectsBanded(b, mask, lod, far);
+    std::vector<LakeSheetRect> flat7;
+    lakeSheetRects(b, mask, 7, flat7);
+    CHECK_EQ(int(rectArea(far)), int(rectArea(flat7)));
+}
+
+VXC_TEST(sheet_bands_refuse_a_ladder_whose_alignment_would_swallow_them) {
+    // Coprime rungs whose LCM runs past kLakeSheetMaxBandAlign. Snapping the
+    // band edges to something larger than the innermost band is not a ladder,
+    // so the safe uniform decomposition is taken instead.
+    const int32_t w = 48, h = 48;
+    BasinEntry b = sheetBasin(w, h);
+    const std::vector<uint8_t> mask = discMask(w, h, 20.0);
+
+    LakeSheetLod lod;
+    lod.numBands = 4;
+    lod.stepPx[0] = 11;
+    lod.stepPx[1] = 13;
+    lod.stepPx[2] = 17;
+    lod.stepPx[3] = 19; // lcm 46,189 > 4096
+    lod.radiusPx[0] = 12;
+    lod.radiusPx[1] = 24;
+    lod.radiusPx[2] = 36;
+    lod.camPxX = 24;
+    lod.camPxY = 24;
+
+    std::vector<LakeSheetRect> banded;
+    lakeSheetRectsBanded(b, mask, lod, banded);
+    std::vector<LakeSheetRect> flat;
+    lakeSheetRects(b, mask, 19, flat);
+    CHECK_EQ(int(banded.size()), int(flat.size()));
+    CHECK_EQ(int(rectArea(banded)), int(rectArea(flat)));
+
+    // One band is the flat decomposition at that band's own step, not a fallback.
+    LakeSheetLod one;
+    one.numBands = 1;
+    one.stepPx[0] = 2;
+    std::vector<LakeSheetRect> single;
+    lakeSheetRectsBanded(b, mask, one, single);
+    std::vector<LakeSheetRect> flat2;
+    lakeSheetRects(b, mask, 2, flat2);
+    CHECK_EQ(int(rectArea(single)), int(rectArea(flat2)));
+}
+
+VXC_TEST(sheet_bands_reject_a_mask_that_is_not_its_basins_bbox) {
+    BasinEntry b = sheetBasin(8, 8);
+    std::vector<uint8_t> wrong(63, 1); // one short
+    LakeSheetLod lod;
+    lod.numBands = 2;
+    lod.stepPx[0] = 1;
+    lod.stepPx[1] = 2;
+    lod.radiusPx[0] = 4;
+    std::vector<LakeSheetRect> rs;
+    CHECK_EQ(int(lakeSheetRectsBanded(b, wrong, lod, rs)), 0);
+    CHECK_EQ(int(rs.size()), 0);
+}
+
 VXC_TEST(subtracting_the_near_field_hole_loses_exactly_the_overlap) {
     const LakeSheetRect r{0, 0, 9, 9}; // 100 cells
     LakeSheetRect out[4];

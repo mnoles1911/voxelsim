@@ -265,6 +265,30 @@ public:
 	// PlayerCoarseTile TickResidencyAndEviction wants.
 	static vxc::TileCoord CoarseTileForWorldMm(int64 WorldMmX, int64 WorldMmY);
 
+	// --- BATHYMETRY, IN BULK --------------------------------------------------
+	//
+	// Fills an inclusive rect of fine tile-pixel coordinates with the baked lake
+	// depth and signed distance-to-shore planes, in RAW WIRE UNITS (see
+	// tilestore.h's bathyDepthMm / bathyShoreMm). Cells that could not be read
+	// come back as vxc::kBathyMissing with a reason in the returned stats -- a
+	// hole is a fact the caller must be able to see, because "no data" and "dry
+	// land" drive opposite decisions in the material downstream.
+	//
+	// SAFE FROM A WORKER THREAD, and it is the only query on this class that is
+	// safe from one WITHOUT the tile being prewarmed first. vxc::sampleBathyRect
+	// decodes into the caller's own buffers and caches nothing, so unlike
+	// WorldSampler()'s elevation path it never mutates the sampler -- a SHARED
+	// lock is genuinely enough. (The elevation path can only claim that because
+	// EnsureTileResident_Locked prewarms every block at load.)
+	//
+	// Does NOT load anything: a tile outside the resident set is reported as a
+	// hole rather than blocked on. That is deliberate -- this feeds a cosmetic
+	// field with a screen-space fallback, and it must never be able to stall the
+	// game thread or trip the gate-leak detector.
+	vxc::BathyRectStats ReadBathyRect(int64 Px0, int64 Py0, int64 Px1, int64 Py1,
+	                                  int16_t* DepthOut, int16_t* ShoreOut,
+	                                  int64 RowStrideElems) const;
+
 	void SetRingRadiusTiles(int32_t Radius) { RingRadiusTiles_ = Radius; }
 	int32_t RingRadiusTiles() const { return RingRadiusTiles_; }
 

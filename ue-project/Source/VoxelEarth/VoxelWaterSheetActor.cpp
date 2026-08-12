@@ -131,12 +131,22 @@ void AVoxelWaterSheetActor::BeginPlay()
 	}
 	FParse::Value(FCommandLine::Get(), TEXT("VoxelLakeSheetCells="), TargetCellsPerSide);
 	TargetCellsPerSide = FMath::Clamp(TargetCellsPerSide, 8, 2048);
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelLakeSheetFineM="), FineBandRadiusM);
+	FineBandRadiusM = FMath::Clamp(FineBandRadiusM, 0.0, 4000.0);
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelLakeSheetSnapPx="), LodSnapPx);
+	LodSnapPx = FMath::Clamp(LodSnapPx, 1, 4096);
+	FParse::Value(FCommandLine::Get(), TEXT("VoxelLakeSheetBands="), MaxBands);
+	MaxBands = FMath::Clamp(MaxBands, 1, int32(UVoxelWaterSubsystem::FLakeSheetLod::kMaxBands));
 
+	const bool bOnePath = !UVoxelWaterSubsystem::ShouldMeshImplicitLakes();
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("Lake sheets: %s, scan radius %.0f m, %d cells/basin side. Water beyond the implicit disc "
-	            "(52 m) is drawn as flat sheets at the baked datum."),
+	       TEXT("Lake sheets: %s, scan radius %.0f m, %d cells/basin side, up to %d LOD band(s), finest %.0f m at "
+	            "1.875 m/cell (re-centred every %d fine px = %.0f m). Lake basins: %s."),
 	       bEnabled ? TEXT("enabled") : TEXT("DISABLED (-VoxelLakeSheets=0)"), ScanRadiusUU / 100.0,
-	       TargetCellsPerSide);
+	       TargetCellsPerSide, MaxBands, FineBandRadiusM, LodSnapPx, double(LodSnapPx) * 1.875,
+	       bOnePath ? TEXT("ONE rendering path -- the sheet owns them at every range, no near-field hole")
+	                : TEXT("TWO rendering paths (voxel.Water.MeshImplicitLakes=1) -- a hole is cut for the "
+	                       "near-field disc"));
 }
 
 bool AVoxelWaterSheetActor::GetCameraLocationUU(FVector& Out) const
@@ -164,15 +174,125 @@ bool AVoxelWaterSheetActor::GetCameraLocationUU(FVector& Out) const
 	return false;
 }
 
+namespace
+{
+// A fine pixel, in UU. 1.875 m; the fine tier's pixel, see tiles.h.
+constexpr double kFinePixelUU = 187.5;
+} // namespace
+
 int32 AVoxelWaterSheetActor::StepForBasin(double SpanUU) const
 {
 	// SpanUU is the basin's longer bbox side. A fine pixel is 1.875 m; the step
 	// is whatever makes the longer side about TargetCellsPerSide cells, floored
 	// at 1 so a small pond meshes at full lattice resolution and never coarser
 	// than the ground it sits in.
-	const double PixelUU = 187.5; // 1.875 m; the fine tier's pixel, see tiles.h
-	const double Cells = SpanUU / PixelUU;
+	//
+	// THIS IS NOW THE COARSEST BAND'S STEP, not the whole basin's. It is
+	// unchanged on purpose: the far field keeps exactly the decimation it had, so
+	// the band ladder is a strict addition near the camera rather than a retune
+	// of everything. See BuildLodForBasin.
+	const double Cells = SpanUU / kFinePixelUU;
 	return FMath::Max(1, FMath::CeilToInt(Cells / double(TargetCellsPerSide)));
+}
+
+FIntPoint AVoxelWaterSheetActor::LodKeyForCamera(const FVector& CamUU) const
+{
+	const double CellUU = double(FMath::Max(LodSnapPx, 1)) * kFinePixelUU;
+	return FIntPoint(int32(FMath::FloorToDouble(CamUU.X / CellUU)),
+	                 int32(FMath::FloorToDouble(CamUU.Y / CellUU)));
+}
+
+FVector2D AVoxelWaterSheetActor::SnappedCamXY(const FVector& CamUU) const
+{
+	// THE BANDS ARE CENTRED ON THE CELL, NOT ON THE CAMERA, and that is what
+	// makes a basin's geometry a pure function of its LodKey. Centre them on the
+	// raw camera instead and two things go wrong at once: the mesh a basin was
+	// last built with depends on where inside the cell the camera happened to be,
+	// and the uniform/banded verdict becomes a bare distance threshold that
+	// flaps -- rebuilding a basin every frame while the camera jitters across it.
+	const double CellUU = double(FMath::Max(LodSnapPx, 1)) * kFinePixelUU;
+	const FIntPoint Key = LodKeyForCamera(CamUU);
+	return FVector2D((double(Key.X) + 0.5) * CellUU, (double(Key.Y) + 0.5) * CellUU);
+}
+
+bool AVoxelWaterSheetActor::IsBandedAtCamera(const FSheet& Sheet, const FVector& CamUU) const
+{
+	if (Sheet.StepPx <= 1)
+	{
+		return false; // a pond already meshes at full lattice resolution everywhere
+	}
+	// The outermost BOUNDED band. How many rungs a ladder has depends on Base, so
+	// which radius is the last bounded one does too -- ask BuildLadder, which is
+	// the one place the ladder is constructed, rather than restating it here.
+	UVoxelWaterSubsystem::FLakeSheetLod Lod;
+	BuildLadder(Sheet, Lod);
+	if (Lod.NumBands <= 1)
+	{
+		return false;
+	}
+	const double OuterBandedUU = double(Lod.RadiusPx[Lod.NumBands - 2]) * kFinePixelUU;
+	const FVector2D Snap = SnappedCamXY(CamUU);
+	const double DX = FMath::Max(FMath::Max(Sheet.MinXUU - Snap.X, Snap.X - Sheet.MaxXUU), 0.0);
+	const double DY = FMath::Max(FMath::Max(Sheet.MinYUU - Snap.Y, Snap.Y - Sheet.MaxYUU), 0.0);
+	return FMath::Max(DX, DY) < OuterBandedUU;
+}
+
+void AVoxelWaterSheetActor::BuildLadder(const FSheet& Sheet,
+                                        UVoxelWaterSubsystem::FLakeSheetLod& OutLod) const
+{
+	const int32 Base = Sheet.StepPx;
+
+	// THE LADDER IS {1, 2, 4, Base}, keeping only the rungs finer than Base.
+	//
+	// Base is NOT rounded to a power of two, and the far field therefore keeps
+	// exactly the decimation it already had: the exemplar 1564 m basin picks 7,
+	// and 7 is what its outer sheet still meshes at. voxel-core aligns the band
+	// edges to the LCM of the rungs (28 px here) rather than demanding they
+	// divide each other, which is what makes an arbitrary Base affordable -- see
+	// lakeSheetRectsBanded. Rounding Base up instead would have coarsened the
+	// far field by up to 2x to buy nothing.
+	const int32 BandCap = FMath::Clamp(MaxBands, 1, int32(UVoxelWaterSubsystem::FLakeSheetLod::kMaxBands));
+	int32 Steps[UVoxelWaterSubsystem::FLakeSheetLod::kMaxBands];
+	int32 N = 0;
+	for (const int32 Candidate : {1, 2, 4})
+	{
+		if (Candidate < Base && N < BandCap - 1)
+		{
+			Steps[N++] = Candidate;
+		}
+	}
+	Steps[N++] = Base; // always the outermost, always unbounded
+
+	OutLod = UVoxelWaterSubsystem::FLakeSheetLod();
+	OutLod.NumBands = N;
+
+	const int32 FineRadiusPx = FMath::Max(1, FMath::CeilToInt((FineBandRadiusM * 100.0) / kFinePixelUU));
+	for (int32 k = 0; k < N; ++k)
+	{
+		OutLod.StepPx[k] = Steps[k];
+		// Doubling radii against doubling-ish steps: a rectangle's SCREEN size is
+		// then roughly constant across the bands, which is the only sense in which
+		// a decimation ladder can be even.
+		OutLod.RadiusPx[k] = FineRadiusPx << k;
+	}
+}
+
+void AVoxelWaterSheetActor::BuildLodForBasin(const FSheet& Sheet, const FVector& CamUU,
+                                             UVoxelWaterSubsystem::FLakeSheetLod& OutLod,
+                                             bool& bOutUniform) const
+{
+	BuildLadder(Sheet, OutLod);
+	// The CELL centre, not the camera -- see SnappedCamXY. The mesh a basin
+	// carries is then determined entirely by its LodKey, which is what makes
+	// "rebuild when the key changes" both necessary and sufficient.
+	const FVector2D Snap = SnappedCamXY(CamUU);
+	OutLod.CamXUU = Snap.X;
+	OutLod.CamYUU = Snap.Y;
+
+	// UNIFORM means "every block of this basin lands in the last, unbounded
+	// band", so its geometry does not depend on the camera at all and it can
+	// leave the rebuild rotation for good.
+	bOutUniform = !IsBandedAtCamera(Sheet, CamUU);
 }
 
 bool AVoxelWaterSheetActor::HoleForDatum(double SurfaceZUU, FBox2D& OutHoleUU) const
@@ -183,6 +303,27 @@ bool AVoxelWaterSheetActor::HoleForDatum(double SurfaceZUU, FBox2D& OutHoleUU) c
 	{
 		return false;
 	}
+	// ONE RENDERING PATH FOR LAKE BASINS (voxel.Water.MeshImplicitLakes = 0).
+	//
+	// The hole exists only because two renderers drew the same lake water and an
+	// overlap of two coplanar surfaces z-fights. With the near-field voxel disc
+	// retired for lakes there is no second renderer to hand over to -- and the
+	// hole EDGE is itself the seam the owner is looking at: measured at +36.4/255
+	// across adjacent pixels at matched depth and view angle. So no near disc, no
+	// hole, no edge.
+	//
+	// THE ONE THING THAT STILL EARNS A HOLE is water the CA has taken over.
+	// Digging into a lake mobilizes its bricks, and mobilized water IS still
+	// meshed near-field (it always was -- the implicit sweep never drew it). That
+	// water is real, moving, and must not have a flat sheet drawn on top of it.
+	// So the hole is now keyed on the CA actually owning water at this datum
+	// inside the disc, which is false for every untouched lake in the world and
+	// costs one empty-set test to say so.
+	if (!UVoxelWaterSubsystem::ShouldMeshImplicitLakes() && !Water->HasMobilizedWaterInImplicitDisc(SurfaceZUU))
+	{
+		return false;
+	}
+
 	FBox2D DiscXY(ForceInit);
 	double MinZ = 0.0, MaxZ = 0.0;
 	if (!Water->GetImplicitWaterDiscUU(DiscXY, MinZ, MaxZ))
@@ -202,7 +343,7 @@ bool AVoxelWaterSheetActor::HoleForDatum(double SurfaceZUU, FBox2D& OutHoleUU) c
 	return true;
 }
 
-bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet)
+bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet, const FVector& CamUU)
 {
 	UWorld* World = GetWorld();
 	UVoxelWaterSubsystem* Water = World ? World->GetSubsystem<UVoxelWaterSubsystem>() : nullptr;
@@ -217,9 +358,15 @@ bool AVoxelWaterSheetActor::RebuildSheet(FSheet& Sheet)
 	Basin.BasinId = Sheet.BasinId;
 	Basin.SurfaceZUU = Sheet.SurfaceZUU;
 
+	UVoxelWaterSubsystem::FLakeSheetLod Lod;
+	bool bUniform = true;
+	BuildLodForBasin(Sheet, CamUU, Lod, bUniform);
+	Sheet.bUniformCoarse = bUniform;
+	Sheet.LodKey = LodKeyForCamera(CamUU);
+
 	TArray<FBox2D> Rects;
 	bool bResolved = false;
-	Water->BuildLakeSheetRects(Basin, Sheet.StepPx, Rects, bResolved);
+	Water->BuildLakeSheetRectsBanded(Basin, Lod, Rects, bResolved);
 	if (!bResolved)
 	{
 		return false;
@@ -393,15 +540,32 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 
 	// ---- Build/refresh: at most one basin per tick --------------------------
 	//
-	// A basin is rebuilt when it has no mesh yet, or when the near-field hole it
-	// was cut with no longer matches the disc the water subsystem is meshing
-	// now. The second case is normally ZERO basins: the hole only exists for the
-	// basin the camera is standing in the water of.
+	// A basin is rebuilt when it has no mesh yet, when its LOD bands need
+	// re-centring, or when the near-field hole it was cut with no longer matches
+	// the disc the water subsystem is meshing now. The last case is normally ZERO
+	// basins: with lake basins on one rendering path a hole is only owed where
+	// the CA has actually taken water over.
+	const FIntPoint LodKey = LodKeyForCamera(CamUU);
 	const int32 Num = Sheets.Num();
 	for (int32 Step = 0; Step < Num; ++Step)
 	{
 		const int32 Index = (RoundRobinCursor + Step) % Num;
 		FSheet& S = Sheets[Index];
+
+		// THE LOD TRIGGER, and it has to have BOTH terms.
+		//
+		// The second alone is the obvious version and it is wrong in a way that
+		// only shows up when you walk towards a lake: a basin built while it was
+		// far away is flagged uniform, and a trigger that reads only the flag
+		// never rebuilds it, so approaching a lake leaves it meshed at its coarse
+		// far-field step forever. The first term is the state FLIP -- uniform
+		// becoming banded as you approach, and banded becoming uniform as you
+		// leave -- evaluated against the live camera every tick.
+		//
+		// Both are functions of the SNAPPED camera cell, so neither can flap: the
+		// verdict changes only when LodKey does.
+		const bool bBandedNow = IsBandedAtCamera(S, CamUU);
+		const bool bLodStale = (bBandedNow == S.bUniformCoarse) || (bBandedNow && S.LodKey != LodKey);
 
 		FBox2D WantHole(ForceInit);
 		const bool bWantHole = HoleForDatum(S.SurfaceZUU, WantHole);
@@ -417,12 +581,12 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 			return !(H.Max.X <= S.MinXUU || H.Min.X >= S.MaxXUU || H.Max.Y <= S.MinYUU || H.Min.Y >= S.MaxYUU);
 		};
 		const bool bHoleTouches = (bWantHole && Touches(WantHole)) || (S.bHadHole && Touches(S.HoleUU));
-		if (S.bUnresolved || (S.bBuilt && !(bHoleChanged && bHoleTouches)))
+		if (S.bUnresolved || (S.bBuilt && !bLodStale && !(bHoleChanged && bHoleTouches)))
 		{
 			continue;
 		}
 
-		if (!RebuildSheet(S))
+		if (!RebuildSheet(S, CamUU))
 		{
 			++UnresolvedBasins;
 			// Take it out of the rotation: an unresolvable basin retried every

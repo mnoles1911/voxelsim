@@ -480,6 +480,34 @@ SCALAR_PARAMS = [
     # CollectionParameter compiling to a constant instead of erroring, applied to
     # the default rather than to the binding.
     ("MoonLightFraction", 0.0),
+    # --- THE BAKED BATHYMETRY FIELD (water plan Phase 3) --------------------
+    #
+    # Read by M_WaterVoxel and M_VoxelTerrain, written by
+    # UVoxelBathyFieldSubsystem (VoxelBathyField.cpp) every time its
+    # camera-centred window recentres -- NOT every frame. They live here for the
+    # same reason MoonLightFraction does: an MPC is the only CPU->material
+    # channel this project has that does not require a dynamic material
+    # instance, and the far-field lake sheet deliberately has no MID
+    # (VoxelWaterSheetActor.h:47-52).
+    #
+    # WHAT THEY MEAN. The field is a 512x512 texture asset,
+    # /Game/Voxel/T_VoxelBathyInfo, covering a 960 m square of world that
+    # follows the camera. The material turns a world XY into a UV with one
+    # multiply-add:  uv = (WorldXY - BathyFieldOrigin.xy) * BathyFieldInvSize.
+    #
+    #   BathyFieldInvSize -- 1 / (window width in UE units) = 1 / 96000.
+    #   BathyFieldValid   -- 1 when a window has been published this run, 0
+    #                        otherwise.
+    #
+    # DEFAULT 0.0 ON BOTH, for exactly the reason MoonLightFraction defaults to
+    # zero. An undriven InvSize of anything nonzero would map every world
+    # position into the texture and shade lakes from whatever pixels happened to
+    # be there; 0 collapses the whole world onto one texel, and Valid=0 makes
+    # every consumer take its screen-space fallback regardless. An unbound or
+    # undriven collection therefore fails to the OLD behaviour, visibly and
+    # safely, rather than to a plausible-looking wrong one.
+    ("BathyFieldInvSize", 0.0),
+    ("BathyFieldValid", 0.0),
 ]
 
 # (name, r, g, b, a)
@@ -489,6 +517,10 @@ VECTOR_PARAMS = [
     # no C++ driving it.
     ("SunDirection", 0.0, 0.0, -1.0, 0.0),
     ("MoonDirection", 0.0, 0.70710678, 0.70710678, 0.0),
+    # World UU of the bathymetry window's MINIMUM corner, in xy; z and w unused.
+    # See the two scalars above. Zero is as good a default as any -- with
+    # BathyFieldValid at 0 nothing reads it.
+    ("BathyFieldOrigin", 0.0, 0.0, 0.0, 0.0),
 ]
 
 

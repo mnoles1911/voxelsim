@@ -817,6 +817,182 @@ size_t lakeSheetRects(const BasinEntry& b, const MaskT& mask, int32_t step,
     return out.size() - before;
 }
 
+// ---------------------------------------------------------------------------
+// DISTANCE-AWARE DECIMATION -- the sheet under the player's feet
+// ---------------------------------------------------------------------------
+//
+// WHY THE SINGLE-STEP VERSION ABOVE IS NOT ENOUGH ANY MORE. `lakeSheetRects`
+// takes ONE step for a whole basin, chosen from the basin's span, so a 2.4 km
+// lake decimates to ~5-7 m rectangles everywhere. That was invisible while the
+// near-field voxel water drew the first 25.6 m at 10 cm and the sheet only ever
+// appeared beyond it. Once the sheet OWNS the near field (one rendering path
+// for lake basins), those rectangles are underfoot, and a 7 m block is a 7 m
+// staircase on the waterline you are standing next to.
+//
+// WHAT CHANGES AND WHAT DOES NOT. Interior water is flat and coplanar, so a
+// rectangle's SIZE is invisible there however large it is -- decimation is only
+// ever visible where the block grid meets the SHORELINE. So the ladder does not
+// need to be fine everywhere, only near the camera. Bands are square annuli
+// around the camera, each with its own step.
+//
+// THE PARTITION IS EXACT, and that is the whole reason this is written as
+// coordinate squares rather than as a distance test. The rectangles are
+// coplanar and the material is opaque Single Layer Water: an overlap between
+// two bands z-fights, a gap between them is a hole in the lake. Neither is
+// tolerable, and neither is possible here because
+//   - band boundaries are HALF-OPEN squares whose edges are multiples of the
+//     LCM of every step in the ladder, taken in the same bbox-local frame the
+//     block grid starts in, and
+//   - each band's blocks are aligned to that same frame at their own step,
+//     which divides the LCM.
+// So no block of any band's step can straddle a band edge, and testing the
+// block's minimum corner decides the whole block.
+//
+// THE LCM, RATHER THAN "EVERY STEP MUST DIVIDE THE COARSEST", and the
+// difference is not academic. The coarsest step comes from the basin's SPAN, so
+// it is whatever it is -- the exemplar 1564 m lake picks 7. Demanding
+// divisibility there collapses a {1,2,4,7} ladder to {1,7}: 1.875 m underfoot
+// and then a jump straight to 13 m, with nothing in between. Snapping to
+// lcm(1,2,4,7) = 28 px instead keeps the whole ladder AND leaves the far field
+// at exactly the step it had. The LCM is capped, and a ladder that exceeds the
+// cap falls back to a single step rather than quantising the bands to something
+// larger than the bands themselves.
+//
+// A DISTANCE-FROM-A-POINT TEST DOES NOT HAVE THAT PROPERTY and was the first
+// thing tried. The Chebyshev distance from a point to a block's nearest cell is
+// not a multiple of the step on the low side (step 2, camera at 8, block [4,5]:
+// the block's two cells are at distances 4 and 3, so a radius of 4 cuts the
+// block in half) -- which is precisely a straddle, i.e. a z-fighting overlap
+// with the finer band or a one-block gap. tests/test_lakes.cpp pins the
+// partition on a fixture rather than trusting this paragraph.
+struct LakeSheetLod {
+    static constexpr int kMaxBands = 4;
+    // Bands are consumed in order, innermost first. `stepPx[k]` applies inside
+    // the half-open square of half-extent `radiusPx[k]` and outside band k-1's.
+    // The LAST band is unbounded -- its radius is ignored -- so the ladder
+    // always covers the whole bbox.
+    int numBands = 1;
+    int32_t stepPx[kMaxBands] = {1, 1, 1, 1};
+    int32_t radiusPx[kMaxBands] = {0, 0, 0, 0};
+    // The band centre, in the SAME tile-local fine pixels as BasinEntry::bboxX0.
+    // Snapped again internally to the coarsest step, so a caller's own
+    // hysteresis grid does not have to know this basin's bbox origin.
+    int32_t camPxX = 0, camPxY = 0;
+};
+
+// The largest band alignment this will quantise to. Beyond it the bands would
+// be snapped more coarsely than the innermost band is wide, which is not a
+// ladder any more -- so such a ladder is refused rather than silently distorted.
+inline constexpr int32_t kLakeSheetMaxBandAlign = 4096;
+
+// `lakeSheetRects` with a per-band step. Appends; returns the number appended.
+// Degenerate ladders (one band, or one whose step LCM exceeds
+// kLakeSheetMaxBandAlign) fall back to the single-step decomposition, which is
+// always safe because it is a partition by construction.
+template <class MaskT>
+size_t lakeSheetRectsBanded(const BasinEntry& b, const MaskT& mask, const LakeSheetLod& lod,
+                            std::vector<LakeSheetRect>& out) {
+    const int32_t w = int32_t(b.bboxX1) - int32_t(b.bboxX0) + 1;
+    const int32_t h = int32_t(b.bboxY1) - int32_t(b.bboxY0) + 1;
+    if (w <= 0 || h <= 0) return 0;
+    if (mask.size() != size_t(w) * size_t(h)) return 0;
+
+    int n = lod.numBands;
+    if (n < 1) n = 1;
+    if (n > LakeSheetLod::kMaxBands) n = LakeSheetLod::kMaxBands;
+
+    int32_t steps[LakeSheetLod::kMaxBands];
+    int32_t stepMax = 1;
+    for (int k = 0; k < n; ++k) {
+        steps[k] = lod.stepPx[k] < 1 ? 1 : lod.stepPx[k];
+        if (steps[k] > stepMax) stepMax = steps[k];
+    }
+    if (n == 1) return lakeSheetRects(b, mask, steps[0], out);
+
+    // The alignment every band shares. Computed with a running gcd so it cannot
+    // overflow before the cap catches it.
+    int64_t align = 1;
+    for (int k = 0; k < n; ++k) {
+        int64_t a = align, c = steps[k];
+        while (c != 0) {
+            const int64_t t = a % c;
+            a = c;
+            c = t;
+        }
+        align = (align / a) * int64_t(steps[k]);
+        if (align > kLakeSheetMaxBandAlign) break;
+    }
+    if (align > kLakeSheetMaxBandAlign) return lakeSheetRects(b, mask, stepMax, out);
+
+    // Camera into the bbox-local frame the block grid is indexed in, then down
+    // onto the shared alignment -- see the partition argument above.
+    const int64_t camX = int64_t(lod.camPxX) - int64_t(b.bboxX0);
+    const int64_t camY = int64_t(lod.camPxY) - int64_t(b.bboxY0);
+    const int64_t snapX = floorDiv(camX, align) * align;
+    const int64_t snapY = floorDiv(camY, align) * align;
+
+    int64_t radii[LakeSheetLod::kMaxBands];
+    for (int k = 0; k < n; ++k) {
+        int64_t r = lod.radiusPx[k] < 0 ? 0 : int64_t(lod.radiusPx[k]);
+        // UP to a multiple of the alignment, never down: rounding down could
+        // take a radius to zero and silently drop a band.
+        r = ((r + align - 1) / align) * align;
+        if (k > 0 && r < radii[k - 1]) r = radii[k - 1];
+        radii[k] = r;
+    }
+    radii[n - 1] = INT64_MAX; // the outermost band has no outer edge
+
+    // Half-open square membership, decided from the block's minimum corner --
+    // valid only because of the alignment above.
+    const auto inSquare = [&](int32_t cx, int32_t cy, int64_t r) -> bool {
+        if (r == INT64_MAX) return true;
+        const int64_t x = int64_t(cx), y = int64_t(cy);
+        return x >= snapX - r && x < snapX + r && y >= snapY - r && y < snapY + r;
+    };
+    // Same dilating "any wet pixel in the block" rule as the single-step
+    // version, and for the same reason -- see its comment. Over-cover tucks
+    // under the bank; under-cover glares.
+    const auto blockWet = [&](int32_t cx, int32_t cy, int32_t s) -> bool {
+        const int32_t yEnd = (cy + s < h) ? (cy + s) : h;
+        const int32_t xEnd = (cx + s < w) ? (cx + s) : w;
+        for (int32_t y = cy; y < yEnd; ++y) {
+            const size_t row = size_t(y) * size_t(w);
+            for (int32_t x = cx; x < xEnd; ++x) {
+                if (mask[row + size_t(x)] != 0) return true;
+            }
+        }
+        return false;
+    };
+
+    const size_t before = out.size();
+    for (int k = 0; k < n; ++k) {
+        const int32_t s = steps[k];
+        const int64_t rOut = radii[k];
+        const int64_t rIn = (k == 0) ? -1 : radii[k - 1];
+        for (int32_t cy = 0; cy < h; cy += s) {
+            int32_t runStart = -1;
+            for (int32_t cx = 0; cx < w; cx += s) {
+                const bool inBand =
+                    inSquare(cx, cy, rOut) && !(rIn >= 0 && inSquare(cx, cy, rIn));
+                const bool emit = inBand && blockWet(cx, cy, s);
+                if (emit && runStart < 0) {
+                    runStart = cx;
+                } else if (!emit && runStart >= 0) {
+                    out.push_back(LakeSheetRect{b.bboxX0 + runStart, b.bboxY0 + cy,
+                                                b.bboxX0 + cx - 1,
+                                                b.bboxY0 + std::min(cy + s, h) - 1});
+                    runStart = -1;
+                }
+            }
+            if (runStart >= 0) {
+                out.push_back(LakeSheetRect{b.bboxX0 + runStart, b.bboxY0 + cy, b.bboxX0 + w - 1,
+                                            b.bboxY0 + std::min(cy + s, h) - 1});
+            }
+        }
+    }
+    return out.size() - before;
+}
+
 // `r` minus `hole`, as up to four rectangles written to `out`; returns how many.
 // 0 means `r` is entirely inside `hole` and vanishes.
 //

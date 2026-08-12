@@ -395,6 +395,43 @@ bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 			/*bTransient=*/true);
 	}
 
+	// THE BATHYMETRY PAIR (bake_ver 27), fetched here for exactly the reason the
+	// water plane above is: the consumer decodes it long after this function
+	// returns, and an unfetched block answers kBlockNotResident with no way to go
+	// and get the bytes. The consumer is the camera-centred bathymetry field
+	// (VoxelBathyField.cpp), which reads a rect of it every time the window
+	// recentres, off the game thread.
+	//
+	// The preamble already brought both INDICES down -- FinePreambleRequest's
+	// wantBathy defaults to true and readFineTilePreamble honours it -- so
+	// without these two calls a tile would look like it had bathymetry
+	// (bathyDepthIndexResident() true) and answer every actual read
+	// kBlockNotResident. That is the failure mode the flag/section agreement test
+	// exists to make loud at the format level, arriving instead one layer up.
+	//
+	// UNCONDITIONAL, matching the water plane. The two planes are the same cost
+	// class -- int16, block_log2 8, and mostly MODE_CONSTANT away from lakes, so
+	// a dry tile pays nothing at all -- and gating them would mean a second
+	// residency state for something the material reads on every water pixel.
+	if (Validated.tile->hasBathy())
+	{
+		const vxc::FinePlane BathyPlanes[2] = { vxc::FinePlane::kBathyDepth,
+		                                        vxc::FinePlane::kBathyShore };
+		for (vxc::FinePlane Plane : BathyPlanes)
+		{
+			if (!vxc::fetchFineTileBlocks(Source, *Validated.tile, Plane,
+			                              vxc::fineNonConstantBlocks(*Validated.tile, Plane)))
+			{
+				++CorruptLoads_;
+				return RecordLoadFailure_Locked(
+					Tile, Path, FileSizeNow, WriteTimeNow, TEXT("bathy-fetch"),
+					TEXT("a bathymetry payload could not be read: the file shrank or changed between the ")
+					TEXT("preamble read and the payload read. Transient -- see elev-fetch."),
+					/*bTransient=*/true);
+			}
+		}
+	}
+
 	// Capture the geometry before the move below hands ownership to the sampler.
 	const int64 TileSizePx = int64(Validated.tile->size());
 	// What this tile HOLDS, which is now less than its size on disk: the flow
@@ -559,6 +596,17 @@ std::vector<vxc::TileCoord> FVoxelFineTileStreamer::CoveredTiles(int64 WorldMmX0
 	// "gate_blocks_when_nothing_is_resident" and the read-margin pair).
 	return vxc::tilesCoveringFootprint(WorldMmX0, WorldMmY0, WorldMmX1, WorldMmY1, kFineReadMarginMm,
 	                                   int64(vxc::kFineTileSize));
+}
+
+vxc::BathyRectStats FVoxelFineTileStreamer::ReadBathyRect(int64 Px0, int64 Py0, int64 Px1, int64 Py1,
+                                                          int16_t* DepthOut, int16_t* ShoreOut,
+                                                          int64 RowStrideElems) const
+{
+	// SHARED, not exclusive -- see the header. sampleBathyRect decodes into the
+	// caller's buffers and touches no state inside Sampler_, so this is a read in
+	// the same sense IsFootprintResident is, just a much longer one.
+	FRWScopeLock Lock(Lock_, SLT_ReadOnly);
+	return vxc::sampleBathyRect(Sampler_, Px0, Py0, Px1, Py1, DepthOut, ShoreOut, RowStrideElems);
 }
 
 bool FVoxelFineTileStreamer::IsFootprintResident(int64 WorldMmX0, int64 WorldMmY0, int64 WorldMmX1,

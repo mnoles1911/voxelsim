@@ -43,7 +43,54 @@ namespace
 	// constants further down; search for kSunOuterSpaceIntensity before moving
 	// either.
 	constexpr float kSunOuterSpaceIntensity = 15.0f;
-	constexpr float kMoonPeakIntensity = 0.04f;
+
+	// THE MOON'S LIGHT ON THE GROUND. 0.04 -> 0.16 on 2026-08-11, +2.00 stops
+	// exactly, because the owner asked for "the moon acting as a strong
+	// directional light for the entire scene" and 0.04 was not one.
+	//
+	// WHAT 0.04 ACTUALLY PRODUCED, since a multiplier picked without stating that
+	// is the thing this file's conventions forbid. Three numbers, all from the
+	// round-21 settings line (Saved/owner-playtest-round21.log:1607):
+	//   * against the sun:   15.0 / 0.04 = 375x = 8.55 stops below it.
+	//   * against the frame: the exposure curve lifts deep night by
+	//     DeepNightEV - DayEV = 13.60 - 8.83 = 4.77 stops (ExposureBiasForSunAltitude;
+	//     higher EV is BRIGHTER here, it is a compensation and not a metering point).
+	//     At round 21's 86%-illuminated moon the delivered light is 0.04 * 0.86, so
+	//     the moonlit ground rendered log2(0.0344 / 15) + 4.77 = -4.00 stops below a
+	//     noon ground. A sixteenth of daylight is a legible night, and it is NOT a
+	//     "strong directional light" -- it is at the bottom of the tonemapper's toe
+	//     where the shoulder has already crushed most of the contrast that would
+	//     have made the direction readable.
+	//   * against physics:   a real full moon is ~0.25 lux against the sun's
+	//     ~120,000, i.e. 18.9 stops down, so this rig's physical moon would be
+	//     15 / 480000 = 3.1e-5. 0.04 was 10.3 stops above that.
+	//
+	// 0.16 PUTS THE MOONLIT GROUND AT -2.00 STOPS BELOW A NOON GROUND
+	// (log2(0.16 * 0.86 / 15) + 4.77 = -2.00), which is the classic day-for-night
+	// key and is the point at which a directional light stops being "a tint on the
+	// ambient" and starts modelling form. It is 6.55 stops below the sun and 12.3
+	// stops above a physical moon -- so this constant's existing confession got two
+	// stops worse, and that is the honest way to describe it.
+	//
+	// WHY +2 STOPS AND NOT +1 OR +3. +1 (0.08) is inside the range where "did that
+	// change?" is a real question against a tonemapped frame, and the point of this
+	// edit is to be unambiguous. +3 (0.32) puts night one stop below noon, at which
+	// point the DeepNightDrop of 2.0 EV that keeps a full moon from outshining noon
+	// is doing the only work holding it back -- i.e. two knobs fighting. +2 is also
+	// exact and reversible: `voxel.Sky.MoonIntensity 0.04` restores every night
+	// frame in the archive bit-for-bit, which is what makes this safe to ship
+	// ahead of the owner's verdict.
+	//
+	// THIS IS AN AESTHETIC CALL AND IT IS THE OWNER'S, not a correctness claim.
+	// The rungs are 0.04 (-4.0 stops, what shipped), 0.08 (-3.0), 0.16 (-2.0, this
+	// default), 0.32 (-1.0). Live at voxel.Sky.MoonIntensity, unchanged.
+	//
+	// NOTE THE KNOCK-ON, because it is deliberate and not a side effect: the water
+	// material's moon glint is scaled by MoonLightFraction, which is this value
+	// divided by the sun's (ApplySkyMaterialParams). Dialling this knob moves the
+	// moon path on the lake by the same number of stops as it moves the ground, so
+	// the two can never be tuned against each other into disagreement.
+	constexpr float kMoonPeakIntensity = 0.16f;
 	constexpr float kMoonTemperatureK = 12000.f;
 	// 0 = the moon is lit the colour the SPECTRUM says: the sun's own temperature,
 	// warmed by lunar regolith (kMoonAlbedoTint). Was 1.0 -- the full artistic blue
@@ -247,16 +294,64 @@ namespace
 	TAutoConsoleVariable<float> CVarSkyMoonIntensity(
 		TEXT("voxel.Sky.MoonIntensity"), kMoonPeakIntensity,
 		TEXT("Peak moonlight, i.e. the intensity a FULL moon well clear of the horizon is given. ")
-		TEXT("Default 0.04. AN ARTISTIC NUMBER, NOT A PHYSICAL ONE, AND THE SIZE OF THE LIE IS ")
-		TEXT("RECORDED SO NOBODY 'CORRECTS' IT: a real full moon delivers ~0.25 lux against the sun's ")
-		TEXT("~100000, a ratio of 1:400000 (18.6 stops). 0.04 against voxel.Sky.SunIntensity 15 is ")
-		TEXT("1:375 (8.6 stops), so this moon is cheated ten stops brighter than the sky it claims to ")
-		TEXT("model. That is intentional and universal -- every shipped game does it -- because a ")
-		TEXT("physically scaled moon renders as literally nothing, and because scene colour down at ")
-		TEXT("1e-5 is where fp16 stops carrying signal and starts carrying banding. Raise for a more ")
-		TEXT("navigable night, lower for a harsher one; a NEW moon stays genuinely dark either way ")
-		TEXT("because MoonIlluminatedFraction multiplies this (0 at new, 1 at full). This knob and the ")
-		TEXT("night end of ExposureBiasForSunAltitude move the same pixel, so change one at a time."),
+		TEXT("Default 0.16, RAISED FROM 0.04 on 2026-08-11 (+2.00 stops exactly) after the owner asked ")
+		TEXT("for a moon that lights the scene. AN ARTISTIC NUMBER, NOT A PHYSICAL ONE, AND THE SIZE OF ")
+		TEXT("THE LIE IS RECORDED SO NOBODY 'CORRECTS' IT: a real full moon delivers ~0.25 lux against ")
+		TEXT("the sun's ~120000, a ratio of 1:480000 (18.9 stops). 0.16 against voxel.Sky.SunIntensity 15 ")
+		TEXT("is 1:94 (6.6 stops), so this moon is cheated TWELVE stops brighter than the sky it claims ")
+		TEXT("to model -- two worse than the ten 0.04 confessed to. That is intentional and universal -- ")
+		TEXT("every shipped game does it -- because a physically scaled moon renders as literally ")
+		TEXT("nothing, and because scene colour down at 1e-5 is where fp16 stops carrying signal and ")
+		TEXT("starts carrying banding. THE RUNGS, in stops below a NOON ground once the exposure curve's ")
+		TEXT("4.77-stop night lift is counted: 0.04 = -4.0 (what shipped through round 21), 0.08 = -3.0, ")
+		TEXT("0.16 = -2.0 (this default, the day-for-night key), 0.32 = -1.0. Raise for a more navigable ")
+		TEXT("night, lower for a harsher one; a NEW moon stays genuinely dark either way because ")
+		TEXT("MoonIlluminatedFraction multiplies this (0 at new, 1 at full). ALSO MOVES THE WATER: the ")
+		TEXT("moon glint in M_WaterVoxel is scaled by MoonLightFraction = this / SunIntensity, so the ")
+		TEXT("moon path on the lake tracks this knob stop for stop and cannot drift from the ground. ")
+		TEXT("This knob and the night end of ExposureBiasForSunAltitude move the same pixel, so change ")
+		TEXT("one at a time."),
+		ECVF_Default);
+
+	// MOON SHADOWS, OFF BY DEFAULT, AND THE DEFAULT IS THE MEASURED CALL.
+	//
+	// This exists because raising kMoonPeakIntensity two stops changes the terms of
+	// the argument recorded at SpawnRig's SetCastShadows(false) -- that argument was
+	// "shadows from a light 8.6 stops below the sun, under an exposure curve that
+	// lifts the frame nearly seven, are not worth a second whole-scene cascade set",
+	// and the light is now 6.6 stops down rather than 8.6. It is a closer call than
+	// it was. It is NOT a call this file should make silently in the same change
+	// that made it close, so the mechanism ships reachable and off.
+	//
+	// WHAT IT COSTS, stated rather than guessed at: a second shadow-casting
+	// directional light is a second FProjectedShadowInfo set -- DynamicShadowCascades
+	// whole-scene cascades, each with its own depth pass over every shadow-casting
+	// primitive in range. The 2026-07-27 draw-path diagnosis measured the sun's
+	// gathers at ~4-5 per frame, each submitting against the whole pool, on a frame
+	// that is RENDER-THREAD BOUND (voxelsim-draw-path-2k). Turning this on is
+	// therefore expected to roughly DOUBLE the shadow half of a night frame, and
+	// night is not a cheap frame here. NOT MEASURED at 0.16 -- no leg has been run
+	// with this on, and this comment must be updated with a number by whoever does.
+	//
+	// WHY IT MIGHT STILL BE WORTH IT. Without shadows the moonlight is a flat wash:
+	// every up-facing surface in the world gets the same 0.16 regardless of what is
+	// above it, so a cliff overhang, a tree canopy and open ground are equally lit.
+	// That is a large part of what "the moon does not read as a light source" means
+	// perceptually -- a key light with no shadow does not model space. The two stops
+	// added above make the wash BRIGHTER, which makes its flatness MORE visible, not
+	// less. So if the owner turns the moon up and it still reads wrong, this is the
+	// next thing to try, and it is one console command away.
+	TAutoConsoleVariable<int32> CVarSkyMoonShadows(
+		TEXT("voxel.Sky.MoonShadows"), 0,
+		TEXT("Whether the MOON casts shadows. Default 0 = OFF, which is what has always shipped. 1 = ON, ")
+		TEXT("and it is a real cost: a second shadow-casting directional light is a second whole-scene ")
+		TEXT("cascade set and a second depth pass over every caster, on a frame this project has ")
+		TEXT("measured as render-thread bound. NOT YET MEASURED at the current moon intensity -- if you ")
+		TEXT("run it, put the number in the comment above this cvar. Turn it on if moonlight reads FLAT ")
+		TEXT("rather than DIM: raising voxel.Sky.MoonIntensity fixes dim, and only shadows fix flat, ")
+		TEXT("because without them every up-facing surface gets identical moonlight whatever is above it. ")
+		TEXT("Gated by the same horizon logic as the moonlight itself, so a moon that is down or new ")
+		TEXT("never pays for a cascade even with this at 1."),
 		ECVF_Default);
 
 	TAutoConsoleVariable<float> CVarSkyMoonAngularRadiusDeg(
@@ -602,6 +697,8 @@ namespace VoxelSky
 
 	bool IsMoonEnabled() { return CVarSkyMoonEnabled.GetValueOnAnyThread() != 0; }
 
+	bool AreMoonShadowsEnabled() { return CVarSkyMoonShadows.GetValueOnAnyThread() != 0; }
+
 	// FLOORED AWAY FROM ZERO, and this floor is not defensive padding -- it is the
 	// whole of defect 1. ULightComponent::UpdateColorAndBrightness
 	// (LightComponent.cpp:1455-1477) computes
@@ -908,6 +1005,99 @@ namespace
 	// second if the sun is hovering exactly on the threshold.
 	constexpr double kSunShadowOffBelowDeg = -2.0;
 	constexpr double kSunShadowOnAboveDeg = -1.0;
+
+	// ======================================================================
+	// WHICH BODY OWNS THE FORWARD / TRANSLUCENT SINGLE-DIRECTIONAL-LIGHT SLOT
+	//
+	// THE WARNING THE OWNER SEES IN EDITOR -- "Multiple directional lights are
+	// competing to be the single one used for forward shading, translucent, water
+	// or volumetric fog. Please adjust their ForwardShadingPriority." -- is emitted
+	// verbatim from LightGridInjection.cpp:1904, and it is not cosmetic. It is the
+	// renderer reporting that it had to guess, and the guess it makes is wrong here
+	// for the whole of every night.
+	//
+	// THE MECHANISM, from the 5.8 source rather than from inference:
+	//
+	//   1. FSceneRenderer::ComputeLightGrid walks the sorted lights and, for each
+	//      DIRECTIONAL one, keeps a single winner in
+	//      View.ForwardLightingResources.SelectedForwardDirectionalLightProxy
+	//      (LightGridInjection.cpp:1121, 1513-1520). There is exactly one slot.
+	//   2. The comparison is priority FIRST, brightness as the tiebreak
+	//      (LightGridInjection.cpp:1500-1514):
+	//          LightIntensitySq = |LightParameters.Color|^2
+	//          win if  Priority > best  ||  (Priority == best && IntensitySq > best)
+	//      UDirectionalLightComponent::ForwardShadingPriority defaults to 0
+	//      (DirectionalLightComponent.cpp:1040) and NOTHING in this file has ever
+	//      set it, so BOTH of our lights sit at 0 and the tiebreak decides.
+	//   3. The tiebreak is on the light's OWN colour * brightness, taken BEFORE any
+	//      atmosphere transmittance is applied -- transmittance is multiplied in at
+	//      LightGridInjection.cpp:1524-1530, four lines AFTER the winner has been
+	//      chosen, and only when the light opts into per-pixel transmittance, which
+	//      defaults to 0 anyway (DirectionalLightComponent.cpp:1082). So the sun
+	//      competes at its full 15.0 at MIDNIGHT. It outweighs the moon 94:1 and
+	//      wins every frame of every night.
+	//   4. The warning itself: ConflictingLightCountForForwardShading counts how
+	//      many lights share the top priority (1502-1511) and >= 2 raises the flag
+	//      (1662). Two lights, both at priority 0, both registered -> the count is
+	//      permanently 2 and the message is permanently on screen.
+	//
+	// WHY THIS IS THE LAKE BUG AND NOT JUST A NAG. M_WaterVoxel is
+	// BLEND_TRANSLUCENT with TLM_SURFACE_PER_PIXEL_LIGHTING
+	// (create_water_voxel_material.py:114, 140), so its direct lighting comes from
+	// the forward path -- from that one selected proxy and nothing else. At night
+	// the selected proxy is a sun 37 degrees BELOW the horizon, so N.L is negative
+	// for every up-facing water surface and clamps to zero: the lake receives no
+	// direct light at all, from either body, all night. The moon is not dim on the
+	// water; it is not addressed to the water. That is the owner's "the moon does
+	// not light up or reflect against the lake".
+	//
+	// PRIORITY, NOT VISIBILITY, IS THE FIX. Hiding the below-horizon light would
+	// also silence the warning -- and it is the trap this whole file is built
+	// around. ApplyLightsFromState's opening comment documents at length that a
+	// hidden or zero-intensity directional light is REMOVED FROM FScene, which
+	// clears AtmosphereLights[] and makes USkyAtmosphere integrate zero radiance;
+	// that is exactly how twilight rendered black once already. The SkyAtmosphere
+	// needs BOTH lights present at ALL hours -- the sun for twilight scattering
+	// from below the horizon, the moon for the night sky's own tint -- so the two
+	// requirements are in direct conflict and only ForwardShadingPriority satisfies
+	// both. It changes which light the forward path addresses and touches nothing
+	// the atmosphere reads.
+	//
+	// WHERE THE HANDOVER SITS, and why it is not the horizon. The obvious rule is
+	// "whichever body is above the horizon", i.e. hand over at sun altitude 0. That
+	// is right for WATER (a sun at -0.5 deg already delivers nothing to an up-facing
+	// surface) and wrong for the other consumer of this same slot: VOLUMETRIC FOG,
+	// which is lit by the selected proxy too, and whose whole reason for existing at
+	// dusk is the sun scattering through it from below the horizon. Handing the slot
+	// to the moon the instant the sun clips the horizon would drain the colour out
+	// of every twilight.
+	//
+	// So the handover is kMoonSunSuppressStartDeg -- REUSED, not a new number, and
+	// that is the point. That constant already means "the sun is far enough down
+	// that the moon is at full strength": above it the moon's own SunSuppress term
+	// is scaling the moonlight toward zero, so a moon holding the forward slot
+	// during civil twilight would be holding it while contributing almost nothing.
+	// Deriving the handover from the same constant makes the two rules incapable of
+	// disagreeing. Below -6 deg the sun's transmittance is long since ray-marching
+	// through the planet body (see kSunShadowOffBelowDeg) and there is no twilight
+	// left to drain.
+	//
+	// 1 degree of hysteresis, for the reason kSunShadowOffBelowDeg gives:
+	// SetForwardShadingPriority MarkRenderStateDirty's
+	// (DirectionalLightComponent.cpp:1448-1455), which rebuilds the light's scene
+	// proxy. Twice a day is free; twice a second on a sun parked at -6.0 is not.
+	constexpr double kForwardMoonPrimarySunBelowDeg = kMoonSunSuppressStartDeg;       // -6: moon takes the slot
+	constexpr double kForwardSunPrimarySunAboveDeg = kMoonSunSuppressStartDeg + 1.0;  // -5: sun takes it back
+
+	// The two priority values. Any pair of DIFFERENT non-negative ints silences the
+	// warning (the conflict count only rises when the TOP priority is shared), and
+	// SetForwardShadingPriority clamps negatives to 0 anyway
+	// (DirectionalLightComponent.cpp:1453), so 1/0 is the smallest pair that cannot
+	// be defeated by that clamp. They are named rather than literal because the
+	// invariant that matters is "these are never equal", and a reader has to be able
+	// to see that at the point of use.
+	constexpr int32 kForwardPriorityPrimary = 1;
+	constexpr int32 kForwardPrioritySecondary = 0;
 
 	// DEFAULT CLOCK POSE, and this default is doing real work.
 	//
@@ -1472,6 +1662,22 @@ struct FVoxelSkyImpl
 	// light at ADirectionalLight's shadow-casting default; if the first tick
 	// happens to be at night, the first flip is OFF and it is logged.
 	bool bSunShadowsOn = true;
+
+	// Latched state of the MOON's CastShadows flag, mirroring bSunShadowsOn.
+	// Starts FALSE because SpawnRig explicitly calls SetCastShadows(false) on the
+	// moon, so unlike the sun the latch and the component genuinely agree at spawn.
+	bool bMoonShadowsOn = false;
+
+	// Which body currently owns the forward/translucent single-directional-light
+	// slot, latched so the hysteresis band has something to compare against and so
+	// the handover is logged once per crossing rather than every update.
+	//
+	// -1 = nothing decided yet, which is DISTINCT from both states rather than
+	// aliasing "sun". The first update therefore always applies a priority pair and
+	// always logs it: a night capture has to be able to state from its own log which
+	// light its water was addressed by, and "no line" must not be readable as "the
+	// sun, probably".
+	int32 AppliedForwardPrimaryIsMoon = -1;
 
 	// Last-known observer XY, in world UU. Held across frames so that a frame
 	// with no player controller (loading, travel) reuses the previous position
@@ -2627,6 +2833,110 @@ void UVoxelSkySubsystem::ApplyLightsFromState()
 				       kSunTemperatureK, kMoonAlbedoTintR, kMoonAlbedoTintG, kMoonAlbedoTintB,
 				       MoonComp->Temperature);
 			}
+
+			// --- moon shadows, off unless asked for ---------------------------
+			//
+			// Same hysteresis-and-read-back shape as the sun's cadence above, and
+			// gated on the SAME condition the moonlight itself is gated on
+			// (S.MoonIntensity > 0, which already folds in the horizon gate, the
+			// illuminated fraction and the daylight suppression). A moon that is
+			// down, new, or drowned by the sun therefore never sets up a cascade
+			// even with voxel.Sky.MoonShadows at 1 -- the cost is paid only on the
+			// nights it could possibly buy anything.
+			//
+			// See CVarSkyMoonShadows for what it costs and why the default is 0.
+			// The value is READ BACK from the component rather than echoed, for the
+			// reason the sun's line gives: SetCastShadows early-outs when
+			// AreDynamicDataChangesAllowed() is false, which is exactly what a
+			// Stationary-mobility regression would produce, and an echoed log would
+			// report a change that did not happen.
+			const bool bWantMoonShadows =
+				VoxelSky::AreMoonShadowsEnabled() && bMoonOn && S.MoonIntensity > 0.f;
+			if (bWantMoonShadows != Impl->bMoonShadowsOn)
+			{
+				Impl->bMoonShadowsOn = bWantMoonShadows;
+				MoonComp->SetCastShadows(bWantMoonShadows);
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelSky moon shadows %s at moon altitude %+.2f deg, moon intensity %.4f ")
+				       TEXT("(CastShadows read back %d, voxel.Sky.MoonShadows=%d). ON means a SECOND ")
+				       TEXT("whole-scene cascade set every frame -- see CVarSkyMoonShadows for the cost ")
+				       TEXT("argument. The moon's LIGHT is voxel.Sky.MoonIntensity and is unaffected ")
+				       TEXT("either way; this only decides whether that light is occluded."),
+				       bWantMoonShadows ? TEXT("ON") : TEXT("OFF"), S.MoonAltitudeDeg, S.MoonIntensity,
+				       MoonComp->CastShadows ? 1 : 0, VoxelSky::AreMoonShadowsEnabled() ? 1 : 0);
+			}
+		}
+	}
+
+	// --- who owns the forward / translucent single-directional-light slot -----
+	//
+	// THE WHOLE ARGUMENT IS AT kForwardMoonPrimarySunBelowDeg. Read it before
+	// touching this: it has the engine file:line evidence for why two directional
+	// lights at the default priority 0 make the renderer pick by raw brightness,
+	// why that means a sun 37 degrees below the horizon owns the lake all night,
+	// and why hiding a light instead would re-open the black-twilight defect this
+	// function opens with.
+	//
+	// THIS IS ALSO WHAT SILENCES THE EDITOR WARNING. The conflict count at
+	// LightGridInjection.cpp:1502-1511 only rises when two lights SHARE the top
+	// priority, so the sole invariant that matters here is that these two values
+	// are never equal. Both are written on every update, unconditionally, for the
+	// same belt-and-braces reason the sun's SetAtmosphereSunLightIndex is: a
+	// Blueprint or level tool that reset one of them would otherwise put both back
+	// on 0 with nothing in the log to say so. SetForwardShadingPriority early-outs
+	// on an unchanged value (DirectionalLightComponent.cpp:1448-1455), so the
+	// steady-state cost is two integer compares.
+	//
+	// The moon only takes the slot if it is actually DELIVERING light --
+	// S.MoonIntensity is already the product of the horizon gate, the illuminated
+	// fraction and the daylight suppression, so this one test covers moonset, new
+	// moon and voxel.Sky.MoonEnabled 0 together. On a moonless night the sun keeps
+	// the slot, which changes nothing versus what shipped: a below-horizon sun and
+	// an absent moon both deliver exactly zero to an up-facing surface.
+	{
+		const bool bMoonPrimary =
+			S.MoonIntensity > 0.f &&
+			(Impl->AppliedForwardPrimaryIsMoon == 1
+				? S.SunAltitudeDeg < kForwardSunPrimarySunAboveDeg   // stay on the moon until -5
+				: S.SunAltitudeDeg < kForwardMoonPrimarySunBelowDeg); // take the moon below -6
+
+		UDirectionalLightComponent* SunComp = SunLight
+			? Cast<UDirectionalLightComponent>(SunLight->GetLightComponent()) : nullptr;
+		UDirectionalLightComponent* MoonComp = MoonLight
+			? Cast<UDirectionalLightComponent>(MoonLight->GetLightComponent()) : nullptr;
+
+		if (SunComp)
+		{
+			SunComp->SetForwardShadingPriority(
+				bMoonPrimary ? kForwardPrioritySecondary : kForwardPriorityPrimary);
+		}
+		if (MoonComp)
+		{
+			MoonComp->SetForwardShadingPriority(
+				bMoonPrimary ? kForwardPriorityPrimary : kForwardPrioritySecondary);
+		}
+
+		const int32 NowMoon = bMoonPrimary ? 1 : 0;
+		if (NowMoon != Impl->AppliedForwardPrimaryIsMoon)
+		{
+			Impl->AppliedForwardPrimaryIsMoon = NowMoon;
+			// READ BACK off the components, never echoed from the request:
+			// SetForwardShadingPriority is guarded by AreDynamicDataChangesAllowed()
+			// and does nothing at all when that is false, so echoing the intent
+			// would report a handover that never occurred -- and the symptom of the
+			// silent failure (water lit by the wrong body) is invisible in a log.
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("VoxelSky forward-shading PRIMARY is now the %s (sun altitude %+.2f deg, moon ")
+			       TEXT("altitude %+.2f deg, moon intensity %.4f). Read back: sun priority %d, moon ")
+			       TEXT("priority %d -- these MUST differ or the editor's 'multiple directional lights ")
+			       TEXT("are competing' warning returns (LightGridInjection.cpp:1662). This is the ONE ")
+			       TEXT("light that lights translucency, water and volumetric fog; handover at sun ")
+			       TEXT("%+.1f deg with 1 deg of hysteresis, derived from kMoonSunSuppressStartDeg."),
+			       bMoonPrimary ? TEXT("MOON") : TEXT("SUN"), S.SunAltitudeDeg, S.MoonAltitudeDeg,
+			       S.MoonIntensity,
+			       SunComp ? SunComp->ForwardShadingPriority : -1,
+			       MoonComp ? MoonComp->ForwardShadingPriority : -1,
+			       kForwardMoonPrimarySunBelowDeg);
 		}
 	}
 }
@@ -2840,6 +3150,41 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	// this at all; it is pure geometry from SunDirection.
 	UKismetMaterialLibrary::SetScalarParameterValue(
 		World, Collection, TEXT("MoonPhaseFraction"), (float)S.MoonPhaseFraction);
+
+	// --- the moon's LIGHT, as a fraction of the sun's ------------------------
+	//
+	// WHAT THIS IS FOR: M_WaterVoxel's moon glint, the specular "moon path on the
+	// water" (create_water_voxel_material.py, build_moon_glint). Nothing else reads
+	// it yet.
+	//
+	// WHY A RATIO AND NOT THE INTENSITY ITSELF, which is the question a reader will
+	// have. The water material already carries a glint tint (2.6, 2.45, 2.15) that
+	// was calibrated against the SUN at voxel.Sky.SunIntensity 15. Handing the
+	// material the moon's absolute intensity would force it to divide by a
+	// reference sun intensity to use that calibration -- i.e. a copy of 15.0 living
+	// in a Python asset generator, silently wrong the first time anyone moves
+	// voxel.Sky.SunIntensity, with the failure being a moon glint at the wrong
+	// brightness and no diagnostic anywhere. Dividing HERE, where both numbers are
+	// already in scope, means the material multiplies the sun's own calibrated tint
+	// by "how much dimmer the moon is than the sun right now" and there is exactly
+	// one copy of every constant involved.
+	//
+	// WHAT IT CARRIES, all of it for free, because S.MoonIntensity is already the
+	// product the light itself is set from (ApplyLightsFromState): the horizon gate,
+	// so the glint fades out as the moon sets and is zero once it is down; the
+	// illuminated fraction, so a new moon lays no path on the water; the daylight
+	// suppression, so the glint is gone before sunrise; and voxel.Sky.MoonIntensity,
+	// so the owner dialling the moonlight moves the moon path by the same number of
+	// stops as it moves the ground. Those four behaviours are the ones asked for and
+	// none of them needed a line of material logic.
+	//
+	// THE DENOMINATOR IS GetSunIntensity() AND NOT kSunOuterSpaceIntensity, so the
+	// ratio stays true if the sun is dialled at runtime. It cannot divide by zero:
+	// GetSunIntensity is floored at UE_KINDA_SMALL_NUMBER, and that floor is
+	// load-bearing for a different reason entirely (see its comment).
+	const float MoonLightFraction = S.MoonIntensity / VoxelSky::GetSunIntensity();
+	UKismetMaterialLibrary::SetScalarParameterValue(
+		World, Collection, TEXT("MoonLightFraction"), MoonLightFraction);
 
 	// --- how big the moon is drawn -------------------------------------------
 	//

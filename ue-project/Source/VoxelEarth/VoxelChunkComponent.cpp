@@ -133,11 +133,36 @@ namespace
 		// scale is identical, the pattern now simply repeats every
 		// UVTilePeriodM instead of never (it already effectively repeated
 		// every ~168m where the old float precision wrapped around anyway).
+		//
+		// POSITIVE MODULO, NOT Fmod (2026-08-11). FMath::Fmod, like HLSL's fmod
+		// and like C's fmod, carries the SIGN OF ITS ARGUMENT: Fmod(-5, 32) is
+		// -5, not 27. That made this UV an ODD function through world x = 0 and
+		// y = 0, so any consumer with odd symmetry -- a sine, a signed detail
+		// perturbation -- saw a field MIRRORED about both world axes. It is a
+		// real repeating-pattern artefact and it is invisible unless you stand
+		// near the origin, which is how it lasted this long.
+		//
+		// Changed in lockstep with VoxelQuadVertexFactory.ush, which computes
+		// the same quantity for the pooled path. THE TWO MUST AGREE: this
+		// comment block and that one are the only thing keeping them in step,
+		// because nothing draws both paths at once (voxel.Stream.GPU is on by
+		// default, so the pooled factory is what actually renders) and a
+		// divergence would therefore be silent until someone flips
+		// -VoxelNoGpuMesh and wonders why the detail texture moved.
+		//
+		// AND IT CHANGES NOTHING THAT EXISTS TODAY. For positive coordinates the
+		// two expressions are identical; for negative ones they differ by
+		// EXACTLY ONE PERIOD, and the only consumer is the detail texture at 8 m
+		// tiling, which divides 32 -- so a whole-period offset lands on the same
+		// texel. Measured on the pinned lake pose: 0.00% of sky and 0.10% of
+		// far-terrain pixels move by more than 8/255. What it removes is the
+		// LATENT trap, not a visible artefact.
 		constexpr double UVTilePeriodM = 32.0;
 		const auto WrapWorldToUV = [](double ComponentOriginUU, double LocalOffsetUU) -> float
 		{
 			const double WorldM = (ComponentOriginUU + LocalOffsetUU) / 100.0;
-			return float(FMath::Fmod(WorldM, UVTilePeriodM));
+			const double Wrapped = WorldM / UVTilePeriodM;
+			return float((Wrapped - FMath::Floor(Wrapped)) * UVTilePeriodM);
 		};
 
 		// --- M4 voxel GI hookup ------------------------------------------

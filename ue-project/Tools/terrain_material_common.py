@@ -195,8 +195,18 @@ def build_terrain_base_color(
     rock_slope_strength,
     detail_fine_strength,
     detail_coarse_strength,
+    bathy=None,
 ):
-    """Build the biome/palette/detail graph. Returns (base_color_expr, snow_expr).
+    """Build the biome/palette/detail graph.
+
+    Returns (base_color_expr, snow_expr, base_color_out, wet_expr).
+
+    `bathy` is the dict from bathy_field_graph.sample_bathy_field, or None to
+    build the material without the wet-shore term at all. When it is None the
+    fourth return value is None and the caller must not try to use it -- that is
+    the "no field" path in the STRUCTURAL sense, distinct from the per-pixel
+    validity gate inside the term, and it exists so a material can be authored
+    before /Game/Voxel/T_VoxelBathyInfo does.
 
     `b` is a GraphBuilder. `vertex_color` is the shared VertexColor node.
     `detail_uv`/`detail_uv_out` supply the UV for T_VoxelDetail -- the two
@@ -362,6 +372,44 @@ def build_terrain_base_color(
     )
     base = b.lerp(base, "", marker_color, "", b.saturate(is_marker))
 
+    # --- PHASE 3: WET SHORES, FROM THE BAKED SIGNED DISTANCE FIELD ----------
+    #
+    # THE LAND SIDE of the same field the water material reads. bathy_shore is
+    # NEGATIVE on land and saturates at -100 m, so "within a metre or two of the
+    # waterline" is a one-node ramp and needs no height comparison, no water
+    # volume query and nothing per-basin.
+    #
+    # WHY THIS IS THE SINGLE MOST EFFECTIVE ITEM ON THE LIST. A water plane meeting
+    # perfectly dry ground is what makes water read as pasted onto terrain rather
+    # than sitting in it; every real shoreline has a band of ground that is wet,
+    # and the eye reads that band as the join. Nothing else in this plan changes
+    # the JOIN.
+    #
+    # DARKER AND GLOSSIER TOGETHER, which is Lagarde's rule and is not optional.
+    # Wet ground is dark because a water film fills the surface microstructure and
+    # traps light in it, and that same film is what makes it specular. Darkening
+    # alone reads as a dirt texture -- a stain, not water -- and is the standard
+    # way this effect goes wrong. The roughness half is applied by the CALLER,
+    # which is why `wet` is returned rather than consumed here: the two terrain
+    # materials assemble roughness differently and neither can be edited from
+    # inside this function.
+    #
+    # `wet` is 0 wherever the field says nothing, so a run with no fine tier, a
+    # world baked before bake_ver 27, and everything beyond the 480 m window all
+    # produce exactly today's terrain.
+    wet = None
+    if bathy is not None:
+        wet_width = b.scalar("WetShoreWidthM", 2.5)
+        # -shore, so distance INLAND is positive and the ramp reads forwards.
+        inland = b.mul(bathy["shore_m"], b.const(-1.0))
+        wet = b.mul(b.one_minus(b.ramp(inland, "", b.const(0.0), wet_width)), bathy["validity"])
+        # ...and never on the water side of the line: there the terrain is the
+        # lake BED, which is wet in a different sense and is already being graded
+        # by the water volume above it. Double-darkening it would make shallows
+        # read as a black rim.
+        wet = b.mul(wet, b.saturate(inland))
+        base = b.mul(base, b.lerp(b.const(1.0), "", b.scalar("WetShoreDarken", 0.55), "", wet))
+
     # --- generation-time debug bisect ---------------------------------------
     #
     # VOXEL_MATERIAL_DEBUG=<n> in the environment when the material is authored
@@ -408,6 +456,6 @@ def build_terrain_base_color(
                           tint_weight, ""), ""),
         }[debug]
         b.prop(probe[0], probe[1], unreal.MaterialProperty.MP_EMISSIVE_COLOR)
-        return probe[0], snow_w, probe[1]
+        return probe[0], snow_w, probe[1], wet
 
-    return base, snow_w, ""
+    return base, snow_w, "", wet

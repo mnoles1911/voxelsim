@@ -1630,4 +1630,112 @@ bool FineTileSampler::prewarm(int64_t px0, int64_t py0, int64_t px1, int64_t py1
     return ok;
 }
 
+BathyRectStats sampleBathyRect(const FineTileSampler& tiles,
+                               int64_t px0, int64_t py0, int64_t px1, int64_t py1,
+                               int16_t* depthOut, int16_t* shoreOut,
+                               int64_t rowStrideElems) {
+    BathyRectStats st;
+    if (px1 < px0 || py1 < py0) return st; // empty/inverted: not an error, see header
+    st.cells = static_cast<uint64_t>(px1 - px0 + 1) * static_cast<uint64_t>(py1 - py0 + 1);
+
+    // Stamps kBathyMissing over an inclusive sub-rect of the request. Every
+    // early-out below goes through this, so there is exactly one place that can
+    // forget to mark a hole.
+    const auto markMissing = [&](int64_t x0, int64_t y0, int64_t x1, int64_t y1) {
+        for (int64_t y = y0; y <= y1; ++y) {
+            int16_t* dRow = depthOut ? depthOut + (y - py0) * rowStrideElems : nullptr;
+            int16_t* sRow = shoreOut ? shoreOut + (y - py0) * rowStrideElems : nullptr;
+            for (int64_t x = x0; x <= x1; ++x) {
+                const size_t c = static_cast<size_t>(x - px0);
+                if (dRow) dRow[c] = kBathyMissing;
+                if (sRow) sRow[c] = kBathyMissing;
+            }
+        }
+    };
+
+    // No tile has ever been loaded, so there is no grid stride to route with --
+    // the same pre-any-load state blockFor() charges to missingTileQueries.
+    const int64_t sz = static_cast<int64_t>(tiles.tileSize());
+    if (sz == 0) {
+        markMissing(px0, py0, px1, py1);
+        st.missingTiles = st.cells;
+        return st;
+    }
+
+    std::vector<int16_t> dBlk, sBlk;
+    const int64_t ty0 = floorDiv(py0, sz), ty1 = floorDiv(py1, sz);
+    const int64_t tx0 = floorDiv(px0, sz), tx1 = floorDiv(px1, sz);
+    for (int64_t ty = ty0; ty <= ty1; ++ty) {
+        for (int64_t tx = tx0; tx <= tx1; ++tx) {
+            const int64_t tpx0 = tx * sz, tpy0 = ty * sz;
+            const int64_t rx0 = std::max(px0, tpx0), rx1 = std::min(px1, tpx0 + sz - 1);
+            const int64_t ry0 = std::max(py0, tpy0), ry1 = std::min(py1, tpy0 + sz - 1);
+            const uint64_t tileCells = static_cast<uint64_t>(rx1 - rx0 + 1) *
+                                       static_cast<uint64_t>(ry1 - ry0 + 1);
+
+            const FineTile* t = tiles.findTile(static_cast<int32_t>(tx), static_cast<int32_t>(ty));
+            if (!t) {
+                markMissing(rx0, ry0, rx1, ry1);
+                st.missingTiles += tileCells;
+                continue;
+            }
+            // "Baked before bathymetry existed" is NOT "no lakes here" -- see
+            // hasBathy()'s comment. A caller must be able to tell the two apart,
+            // so this is a hole with its own counter, not a dry answer.
+            if (!t->hasBathy()) {
+                markMissing(rx0, ry0, rx1, ry1);
+                st.noPlane += tileCells;
+                continue;
+            }
+
+            const uint32_t log2 = t->blockLog2();
+            const int64_t dim = static_cast<int64_t>(t->blockDim());
+            const int64_t bx0 = (rx0 - tpx0) >> log2, bx1 = (rx1 - tpx0) >> log2;
+            const int64_t by0 = (ry0 - tpy0) >> log2, by1 = (ry1 - tpy0) >> log2;
+            for (int64_t by = by0; by <= by1; ++by) {
+                for (int64_t bx = bx0; bx <= bx1; ++bx) {
+                    const int64_t bpx0 = tpx0 + (bx << log2), bpy0 = tpy0 + (by << log2);
+                    const int64_t cx0 = std::max(rx0, bpx0), cx1 = std::min(rx1, bpx0 + dim - 1);
+                    const int64_t cy0 = std::max(ry0, bpy0), cy1 = std::min(ry1, bpy0 + dim - 1);
+                    const uint64_t cellCount = static_cast<uint64_t>(cx1 - cx0 + 1) *
+                                               static_cast<uint64_t>(cy1 - cy0 + 1);
+
+                    // ONE DECODE PER BLOCK -- the whole reason this function
+                    // exists instead of a loop over FineTile::bathyAt.
+                    FineError err = FineError::kNone;
+                    bool ok = true;
+                    if (depthOut) {
+                        ok = t->decodeBathyDepthBlock(static_cast<uint32_t>(bx),
+                                                      static_cast<uint32_t>(by), dBlk, &err);
+                    }
+                    if (ok && shoreOut) {
+                        ok = t->decodeBathyShoreBlock(static_cast<uint32_t>(bx),
+                                                      static_cast<uint32_t>(by), sBlk, &err);
+                    }
+                    if (!ok) {
+                        markMissing(cx0, cy0, cx1, cy1);
+                        if (err == FineError::kBlockNotResident) st.notResident += cellCount;
+                        else st.decodeFailed += cellCount;
+                        continue;
+                    }
+
+                    for (int64_t y = cy0; y <= cy1; ++y) {
+                        const size_t rowBase = static_cast<size_t>(y - bpy0) * static_cast<size_t>(dim);
+                        int16_t* dRow = depthOut ? depthOut + (y - py0) * rowStrideElems : nullptr;
+                        int16_t* sRow = shoreOut ? shoreOut + (y - py0) * rowStrideElems : nullptr;
+                        for (int64_t x = cx0; x <= cx1; ++x) {
+                            const size_t i = rowBase + static_cast<size_t>(x - bpx0);
+                            const size_t c = static_cast<size_t>(x - px0);
+                            if (dRow) dRow[c] = dBlk[i];
+                            if (sRow) sRow[c] = sBlk[i];
+                        }
+                    }
+                    st.filled += cellCount;
+                }
+            }
+        }
+    }
+    return st;
+}
+
 } // namespace vxc

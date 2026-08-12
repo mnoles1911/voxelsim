@@ -14772,6 +14772,15 @@ bool UVoxelWorldSubsystem::GetWorldgenSurfaceAndCavernFloodMm(int64 Vx, int64 Vy
 	return true;
 }
 
+FVoxelFineTileStreamer* UVoxelWorldSubsystem::GetFineTileStreamer() const
+{
+	// Null in two distinct cases the caller must treat identically but a reader
+	// should not conflate: no Impl (the transient loading world), and an Impl
+	// running without -VoxelFineTileDir= (the synthetic/coarse tile source, which
+	// carries no bathymetry at all). Either way there is nothing baked to read.
+	return Impl ? Impl->FineStreamer.Get() : nullptr;
+}
+
 double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const
 {
 	if (!Impl)

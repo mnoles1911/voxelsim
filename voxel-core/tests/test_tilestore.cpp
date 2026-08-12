@@ -3830,6 +3830,203 @@ VXC_TEST(vxtl_v2_bathy_planes_zstd_match_the_python_encoder) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// sampleBathyRect -- the BULK read the material transport is built on.
+//
+// The thing these tests are actually protecting is the difference between "no
+// water here" and "no data here". Everything downstream of this function is a
+// shader that has to choose between the baked field and a screen-space
+// fallback, and it can only choose if the hole is visible in the buffer. So
+// every case below checks the SENTINEL and the per-reason counter, not just the
+// values that came back.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The fixture, loaded into a sampler at its own seed and tile coordinate. Every
+// rect below is in GLOBAL fine-pixel space, so the tile's own origin has to come
+// from the file rather than be assumed to be (0,0).
+struct BathySamplerFixture {
+    // A unique_ptr and not a value: FineTileSampler holds std::atomic counters,
+    // so it is neither copyable nor movable and cannot be returned by value.
+    std::unique_ptr<FineTileSampler> tiles;
+    int32_t tx = 0, ty = 0;
+    int64_t ox = 0, oy = 0; // global fine pixel of the tile's local (0,0)
+    uint32_t dim = 0;
+    uint64_t seed = 0;
+    bool ok = false;
+};
+
+BathySamplerFixture loadBathySampler() {
+    BathySamplerFixture f;
+    const std::filesystem::path path = fineBathyFixturePath();
+    if (!std::filesystem::exists(path)) return f;
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    if (!bytes) return f;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, nullptr);
+    if (!tile) return f;
+    f.tx = tile->tileX();
+    f.ty = tile->tileY();
+    f.ox = int64_t(f.tx) * int64_t(tile->size());
+    f.oy = int64_t(f.ty) * int64_t(tile->size());
+    f.dim = tile->blockDim();
+    f.seed = tile->seed();
+    f.tiles = std::make_unique<FineTileSampler>(f.seed);
+    f.ok = f.tiles->loadTile(std::move(*tile));
+    return f;
+}
+
+} // namespace
+
+VXC_TEST(sample_bathy_rect_matches_the_per_pixel_accessor) {
+    BathySamplerFixture f = loadBathySampler();
+    if (!f.ok) {
+        std::printf("  (skipped: bathy fixture absent)\n");
+        return;
+    }
+    // A 7x5 window straddling the pinned centre pixel (local 128, 200), read
+    // into a buffer whose stride is WIDER than the window -- the sub-window case
+    // the texture filler uses, and the one an off-by-one in the row indexing
+    // shows up in immediately.
+    constexpr int64_t kW = 7, kH = 5, kStride = 11;
+    const int64_t px0 = f.ox + 125, py0 = f.oy + 198;
+    std::vector<int16_t> depth(size_t(kStride * kH), 12345);
+    std::vector<int16_t> shore(size_t(kStride * kH), 12345);
+
+    BathyRectStats st = sampleBathyRect(*f.tiles, px0, py0, px0 + kW - 1, py0 + kH - 1,
+                                        depth.data(), shore.data(), kStride);
+    CHECK_EQ(int(st.cells), int(kW * kH));
+    CHECK_EQ(int(st.filled), int(kW * kH));
+    CHECK(st.complete());
+    CHECK_EQ(int(st.missingTiles + st.noPlane + st.notResident + st.decodeFailed), 0);
+
+    // Cell for cell against FineTile::bathyAt, which is a completely different
+    // code path (decode-per-pixel) reaching the same bytes. The two disagreeing
+    // is the only way the block/sub-rect arithmetic can be wrong and still look
+    // plausible.
+    const FineTile* tile = f.tiles->findTile(f.tx, f.ty);
+    CHECK(tile != nullptr);
+    for (int64_t y = 0; y < kH; ++y) {
+        for (int64_t x = 0; x < kW; ++x) {
+            int32_t wantDepthMm = 0, wantShoreMm = 0;
+            CHECK(tile->bathyAt(uint32_t(px0 + x - f.ox), uint32_t(py0 + y - f.oy),
+                                wantDepthMm, wantShoreMm));
+            const size_t i = size_t(y * kStride + x);
+            CHECK_EQ(int(bathyDepthMm(depth[i])), int(wantDepthMm));
+            CHECK_EQ(int(bathyShoreMm(shore[i])), int(wantShoreMm));
+        }
+    }
+    // The centre pin itself, so this test fails on a shifted window and not only
+    // on a mismatched one.
+    CHECK_EQ(int(depth[size_t(2 * kStride + 3)]), int(kBathyCentreDepthUnits));
+    CHECK_EQ(int(shore[size_t(2 * kStride + 3)]), int(kBathyCentreShoreUnits));
+    // PADDING UNTOUCHED. Columns kW..kStride-1 of every row must still hold the
+    // poison value: a filler that wrote its own width instead of the caller's
+    // stride would have marched across them.
+    for (int64_t y = 0; y < kH; ++y) {
+        for (int64_t x = kW; x < kStride; ++x) {
+            CHECK_EQ(int(depth[size_t(y * kStride + x)]), 12345);
+            CHECK_EQ(int(shore[size_t(y * kStride + x)]), 12345);
+        }
+    }
+}
+
+VXC_TEST(sample_bathy_rect_crosses_block_and_tile_edges) {
+    BathySamplerFixture f = loadBathySampler();
+    if (!f.ok) {
+        std::printf("  (skipped: bathy fixture absent)\n");
+        return;
+    }
+    CHECK_EQ(int(f.dim), 256);
+
+    // 1. ACROSS A BLOCK EDGE, from the CODED lake block (0,0) into the CONSTANT
+    //    dry block (1,0). One rect, two block modes, two decodes -- and the two
+    //    planes hold different constants on the dry side, so a filler that
+    //    decoded one index and read the other lands here.
+    constexpr int64_t kW = 6, kH = 2;
+    const int64_t px0 = f.ox + 253, py0 = f.oy + 100;
+    std::vector<int16_t> depth(size_t(kW * kH), 0), shore(size_t(kW * kH), 0);
+    BathyRectStats st = sampleBathyRect(*f.tiles, px0, py0, px0 + kW - 1, py0 + kH - 1,
+                                        depth.data(), shore.data(), kW);
+    CHECK(st.complete());
+    CHECK_EQ(int(st.cells), int(kW * kH));
+    for (size_t i = 0; i < depth.size(); ++i) {
+        // Row 100 of this fixture is dry on both sides of the edge; what the
+        // test is pinning is that BOTH blocks answered, with their own plane's
+        // constant, and neither cell came back as the missing sentinel.
+        CHECK(depth[i] != kBathyMissing);
+        CHECK(shore[i] != kBathyMissing);
+        CHECK_EQ(int(depth[i]), int(kBathyDryDepth));
+        CHECK_EQ(int(shore[i]), -int(kBathyShoreClampUnits));
+    }
+
+    // 2. OFF THE LOADED TILE. The right half of this rect belongs to the
+    //    neighbour tile, which was never loaded: those cells must come back as
+    //    kBathyMissing and be charged to missingTiles, while the left half is
+    //    still filled normally. A partial answer is the normal steady state at
+    //    the edge of the streamed set, so it must not poison the whole call.
+    const int64_t ex0 = f.ox + 508;
+    std::vector<int16_t> ed(size_t(kW * kH), 0), es(size_t(kW * kH), 0);
+    BathyRectStats est = sampleBathyRect(*f.tiles, ex0, py0, ex0 + kW - 1, py0 + kH - 1,
+                                         ed.data(), es.data(), kW);
+    CHECK_EQ(int(est.cells), int(kW * kH));
+    CHECK_EQ(int(est.filled), int(4 * kH));         // local x 508..511
+    CHECK_EQ(int(est.missingTiles), int(2 * kH));   // local x 512..513 -> next tile
+    CHECK(!est.complete());
+    for (int64_t y = 0; y < kH; ++y) {
+        for (int64_t x = 0; x < kW; ++x) {
+            const size_t i = size_t(y * kW + x);
+            if (x < 4) {
+                CHECK(ed[i] != kBathyMissing);
+                CHECK(es[i] != kBathyMissing);
+            } else {
+                CHECK_EQ(int(ed[i]), int(kBathyMissing));
+                CHECK_EQ(int(es[i]), int(kBathyMissing));
+            }
+        }
+    }
+    // AND THE SENTINEL IS NOT A DEPTH. This is the assertion the whole sentinel
+    // choice exists for: run the hole through the ordinary converters and it
+    // must not read as shallow water sitting on the waterline.
+    CHECK(bathyDepthIsDry(kBathyMissing));
+    CHECK(!bathyShoreIsWater(kBathyMissing));
+}
+
+VXC_TEST(sample_bathy_rect_degenerate_inputs) {
+    BathySamplerFixture f = loadBathySampler();
+    if (!f.ok) {
+        std::printf("  (skipped: bathy fixture absent)\n");
+        return;
+    }
+    // An inverted rect fills nothing and is not an error.
+    std::vector<int16_t> buf(4, 7);
+    BathyRectStats inv = sampleBathyRect(*f.tiles, 10, 10, 9, 10, buf.data(), nullptr, 2);
+    CHECK_EQ(int(inv.cells), 0);
+    CHECK_EQ(int(buf[0]), 7);
+
+    // One plane only: the other pointer is null and must not be dereferenced,
+    // and the requested plane is still filled and still counted.
+    std::vector<int16_t> shoreOnly(4, 7);
+    BathyRectStats one = sampleBathyRect(*f.tiles, f.ox + 128, f.oy + 200,
+                                         f.ox + 129, f.oy + 201, nullptr, shoreOnly.data(), 2);
+    CHECK_EQ(int(one.cells), 4);
+    CHECK_EQ(int(one.filled), 4);
+    CHECK_EQ(int(shoreOnly[0]), int(kBathyCentreShoreUnits));
+
+    // A sampler with nothing loaded has no grid stride at all -- every cell is a
+    // missing tile, and nothing is left holding the caller's poison value.
+    FineTileSampler empty(f.seed);
+    std::vector<int16_t> d(4, 7), s(4, 7);
+    BathyRectStats none = sampleBathyRect(empty, 0, 0, 1, 1, d.data(), s.data(), 2);
+    CHECK_EQ(int(none.cells), 4);
+    CHECK_EQ(int(none.filled), 0);
+    CHECK_EQ(int(none.missingTiles), 4);
+    for (size_t i = 0; i < 4; ++i) {
+        CHECK_EQ(int(d[i]), int(kBathyMissing));
+        CHECK_EQ(int(s[i]), int(kBathyMissing));
+    }
+}
+
 VXC_TEST(vxtl_v2_bathy_flag_and_sections_must_agree_in_both_directions) {
     const std::filesystem::path path = fineBathyFixturePath();
     if (!std::filesystem::exists(path)) {

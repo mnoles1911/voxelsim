@@ -51,7 +51,9 @@ import unreal
 # Shared biome graph, same directory. A -run=pythonscript commandlet does not
 # put the script's own directory on sys.path, so add it explicitly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from terrain_material_common import GraphBuilder, build_terrain_base_color  # noqa: E402
+from terrain_material_common import build_terrain_base_color  # noqa: E402
+from sky_star_graph import SkyGraphBuilder  # noqa: E402
+from bathy_field_graph import sample_bathy_field  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelClipmap"
@@ -73,7 +75,19 @@ def main():
 
     vertex_color = mel.create_material_expression(material, unreal.MaterialExpressionVertexColor, -700, -50)
 
-    b = GraphBuilder(material)
+    # SkyGraphBuilder + the bathymetry sample, for the same reason M_VoxelTerrain
+    # takes them: the wet-shore band must not stop at the seam between the near
+    # voxel terrain and the clipmap. The 960 m field window is far smaller than a
+    # clipmap level, so in practice this term only ever fires on the innermost
+    # ring -- which is precisely where the seam is, and precisely where a
+    # discontinuity would be visible.
+    sky_collection = unreal.load_object(None, "/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky")
+    if sky_collection is None:
+        raise RuntimeError(
+            "MPC_VoxelSky not found -- M_VoxelClipmap now reads the bathymetry window's "
+            "placement from it for wet shores. Run Tools/create_sky_material.py first.")
+    b = SkyGraphBuilder(material, sky_collection)
+    bathy = sample_bathy_field(b)
 
     # T_VoxelDetail UV. The voxel material uses TexCoord0 (world-planar metres
     # wrapped to 32 m); the clipmap CANNOT -- its SharedUV0 is a plain [0,1]^2
@@ -86,8 +100,8 @@ def main():
     tex_coord.set_editor_property("coordinate_index", 0)
     detail_uv = b.mul(tex_coord, b.scalar("DetailTileRepeats", 28.0))
 
-    base_color, snow_w, base_color_out = build_terrain_base_color(
-        b, vertex_color, detail_uv, "",
+    base_color, snow_w, base_color_out, wet = build_terrain_base_color(
+        b, vertex_color, detail_uv, "", bathy=bathy,
         # Full strength, unlike the voxel material's 0.35: a clipmap vertex
         # normal is a REAL terrain normal (central-difference heightmap
         # gradient, RebuildLevel pass 2), so a steep face here genuinely is
@@ -124,6 +138,11 @@ def main():
     # Same snow-smooths-roughness term as M_VoxelTerrain, same defaults, so the
     # snow cap on a distant peak and the snow underfoot shade alike.
     roughness = b.lerp(b.scalar("RoughnessBase", 0.90), "", b.scalar("RoughnessSnow", 0.55), "", snow_w)
+    # Wet shores go glossier as well as darker -- the same Lagarde pairing
+    # M_VoxelTerrain applies, with the same parameter name and default, because
+    # the two materials meet along the seam this term is most visible on.
+    if wet is not None:
+        roughness = b.lerp(roughness, "", b.scalar("WetShoreRoughness", 0.22), "", wet)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 

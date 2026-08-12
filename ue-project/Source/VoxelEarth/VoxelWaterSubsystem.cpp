@@ -132,6 +132,47 @@ static TAutoConsoleVariable<int32> CVarVoxelWaterRetireBakedRivers(
 	TEXT("Lakes/ocean/caverns unaffected; far-field ribbons unaffected. 0 = old draw."),
 	ECVF_Default);
 
+// ONE RENDERING PATH FOR LAKE BASINS. The near-field voxel disc and the
+// far-field sheet both drew lake water, and where they met there was a measured
+// seam: +36.4/255 luminance across adjacent pixels at matched depth and view
+// angle, achromatic (R +34.2, G +37.3, B +37.7 -- a near-constant DIFFERENCE,
+// which rules out a thickness/absorption mismatch, whose extinction is 11:1
+// across the channels).
+//
+// THE VOXEL VOLUME ADDS NOTHING VISUALLY FOR A STILL LAKE, which is what makes
+// retiring it a simplification rather than a loss. `waterFillUnits` (lakes.h)
+// depends only on the global lattice Z and the basin datum, so every column's
+// top voxel gets an IDENTICAL fill -- a lake surface is flat by construction,
+// and a stack of opaque water voxels under a flat top is a volume nobody can
+// see into. The material is now Single Layer Water (MSM_SingleLayerWater,
+// BLEND_Opaque), which is designed for exactly one water surface with the scene
+// behind it; the sheet is that, and the near disc is structurally not.
+//
+// THIS IS A DRAW GATE AND NOTHING ELSE. It changes what the near-field sweep
+// MESHES; it does not touch `waterSurfaceMmAtVoxel`, so the implicit field keeps
+// answering for everything that is not drawing -- IsUnderwaterAtWorld (swimming
+// and camera submersion), mobilization when a dig breaches a lake, and every
+// collision and gameplay query. Retiring it at the SAMPLER, the way
+// RetireBakedRivers is done, would be catastrophic here: rivers could be retired
+// as data because the PBF sim owns them, but a lake retired as data is a lake
+// the player walks through.
+//
+// WHAT STILL MESHES NEAR-FIELD: CA water, mobilized water, and cavern flood. The
+// gate rides the sweep's OWN existing distinction -- `bLakeOnlyColumn`, a column
+// with a baked lake datum and no cavern -- rather than inventing a parallel one,
+// and in a column with both it suppresses only the lake TERM of the ceiling.
+// Mobilized water is untouched by construction: `implicitFillAt` already returns
+// 0 for a mobilized brick, so this sweep never drew it in the first place; the
+// CA's own component map does.
+static TAutoConsoleVariable<int32> CVarVoxelWaterMeshImplicitLakes(
+	TEXT("voxel.Water.MeshImplicitLakes"), 0,
+	TEXT("Mesh UNMOBILIZED implicit LAKE water as near-field voxels. 0 (default) = the single lake basin ")
+	TEXT("surface: the far-field sheet owns lake basins at every range, which removes the near/far seam ")
+	TEXT("and the sheet's hole with it. 1 = the old two-path draw, for A/B and rollback. DRAW ONLY -- ")
+	TEXT("swimming, submersion, digging-into-a-lake flooding and collision read the implicit field either ")
+	TEXT("way. Cavern flood, CA water, mobilized water and the ocean are unaffected at both settings."),
+	ECVF_Default);
+
 static TAutoConsoleVariable<bool> CVarVoxelWaterImplicitOcean(
 	TEXT("voxel.Water.ImplicitOcean"), true,
 	TEXT("Watershed §6.4: the sea as the third term of the water ImplicitFn -- open air below ")
@@ -1195,6 +1236,14 @@ struct FVoxelWaterImpl
 	// stationary camera costs nothing. Set once the first refresh has run.
 	VoxelCoords::FVoxelCoord LastImplicitCenterBrick = {0, 0, 0};
 	bool bImplicitCenterValid = false;
+
+	// voxel.Water.MeshImplicitLakes, latched on the game thread each tick. Held
+	// here rather than read inside the sweep because a CHANGE has to tear the
+	// existing draw down (see DropImplicitWaterDraw): the sweep is incremental, so
+	// simply declining to offer lake bricks from now on would leave every lake
+	// brick already meshed on screen forever, under the sheet.
+	bool bMeshImplicitLakes = false;
+	bool bMeshImplicitLakesLatched = false;
 
 	// The brick box the implicit sweep last covered. Held alongside the centre
 	// (which GetImplicitWaterDiscUU and the drain's distance sort still want)
@@ -3989,6 +4038,46 @@ constexpr int32 kImplicitRadiusBricksZ = 16;
 // and a first refresh must never land as one frame's worth of work.
 constexpr int32 kMaxImplicitMeshesPerTick = 192;
 
+// Tears the whole implicit-water DRAW down: every component, every pooled slot,
+// the column cache and the pending queue, and the window that says what has
+// already been swept.
+//
+// This exists for one caller -- a voxel.Water.MeshImplicitLakes flip -- and the
+// reason it has to be this total is that the sweep is INCREMENTAL. It only ever
+// looks at what entered the window, so a brick meshed under the old setting is
+// never revisited and would keep drawing under the sheet for the rest of the
+// session. Clearing the columns matters as much as clearing the components:
+// FImplicitColumn caches the admission verdict, so a cached column would keep
+// answering with the old gate long after the flip.
+//
+// Nothing here touches the CA, the mobilizer or the implicit FIELD -- this is
+// the draw and only the draw. The next tick re-sweeps the same window from
+// scratch and rebuilds whatever the current gate admits.
+void DropImplicitWaterDraw(FVoxelWaterImpl& Impl)
+{
+	for (TPair<VoxelCoords::FVoxelCoord, TObjectPtr<UWaterChunkComponent>>& Pair : Impl.ImplicitChunkComponents)
+	{
+		if (Pair.Value)
+		{
+			Pair.Value->DestroyComponent();
+		}
+	}
+	Impl.ImplicitChunkComponents.Empty();
+
+	TArray<VoxelCoords::FVoxelCoord> PooledKeys;
+	Impl.ImplicitPoolSlots.GetKeys(PooledKeys);
+	for (const VoxelCoords::FVoxelCoord& K : PooledKeys)
+	{
+		ReleaseWaterBrickPooled(Impl, Impl.ImplicitPoolSlots, K);
+	}
+
+	Impl.ImplicitColumns.Empty();
+	Impl.PendingImplicitBricks.Reset();
+	Impl.bImplicitCenterValid = false;
+	Impl.LastImplicitWindow = vxc::WaterWindow{};
+	Impl.bImplicitDrainReported = false;
+}
+
 // Rebuilds the implicit-water candidate list when the camera crosses into a new
 // brick, then meshes a budgeted slice of it every tick.
 //
@@ -4109,7 +4198,8 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 		// disc, so a column that is dry has no flooded brick anywhere in its
 		// stack and the entire vertical run is skipped.
 		// ------------------------------------------------------------------
-		auto EvaluateColumn = [&Impl](int32 Bx, int32 By) -> FVoxelWaterImpl::FImplicitColumn
+		const bool bMeshLakes = Impl.bMeshImplicitLakes;
+		auto EvaluateColumn = [&Impl, bMeshLakes](int32 Bx, int32 By) -> FVoxelWaterImpl::FImplicitColumn
 		{
 			FVoxelWaterImpl::FImplicitColumn Col;
 			const int64 Vx = int64(Bx) * vxc::WaterBrick8::kEdge;
@@ -4134,9 +4224,22 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			// water 528 m in the air, carried along with the camera.
 			Col.CavernZMm = Impl.CavernFloodMmAt(Vx, Vy);
 			Col.LakeZMm = Impl.Water->waterSurfaceMmAtVoxel(Vx, Vy);
-			if (Col.CavernZMm == INT32_MIN && Col.LakeZMm == vxc::kNoWaterMm)
+			// THE ONE-PATH GATE (voxel.Water.MeshImplicitLakes). The lake term is
+			// dropped from the DRAW ceiling only -- Col.LakeZMm above stays as the
+			// sampler answered it, because the field itself must keep answering for
+			// swimming, submersion, mobilization and collision. Everything below
+			// this line is about which bricks get MESHED.
+			//
+			// A cavern under a lake keeps its cavern term: `implicitWaterCeilingMm`
+			// takes the max of the two, so zeroing the lake half leaves the cavern
+			// half exactly as it was and a flooded chamber under a basin still
+			// draws. That is why this is a term drop rather than a column skip.
+			const int32 DrawLakeZMm = bMeshLakes ? Col.LakeZMm : vxc::kNoWaterMm;
+			if (Col.CavernZMm == INT32_MIN && DrawLakeZMm == vxc::kNoWaterMm)
 			{
-				return Col; // dry column: no cavern below it and no lake on it
+				// Dry column, or a lake this sweep no longer draws. Not admitted,
+				// so no brick of it is ever offered -- which is the whole change.
+				return Col;
 			}
 
 			// THE PADDED FOOTPRINT'S GROUND BOUND. It bounds the cavern term
@@ -4152,7 +4255,7 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			// a brick that meshes to nothing, a wrong bound deletes a lake.
 			const int64 GroundCeilMm = Col.GroundUpperMm == MIN_int64 ? MAX_int64 : Col.GroundUpperMm;
 
-			const int64 FloodZMm = vxc::implicitWaterCeilingMm(Col.CavernZMm, Col.LakeZMm, GroundCeilMm);
+			const int64 FloodZMm = vxc::implicitWaterCeilingMm(Col.CavernZMm, DrawLakeZMm, GroundCeilMm);
 			if (FloodZMm == vxc::kNoImplicitWaterMm)
 			{
 				return Col; // a cavern in reach, but none of its water is in this column
@@ -4187,7 +4290,12 @@ void RefreshImplicitWater(FVoxelWaterImpl& Impl, const FVector& CameraUU, AActor
 			//
 			// Declining to bound fails OPEN (MIN_int64 rejects nothing), the
 			// same direction the ceiling term fails.
-			const bool bLakeOnlyColumn = (Col.CavernZMm == INT32_MIN) && (Col.LakeZMm != vxc::kNoWaterMm);
+			// DrawLakeZMm, not Col.LakeZMm: with the one-path gate on, a lake-only
+			// column never gets this far, and the two proofs below (the buried
+			// floor and the uniform-datum interior skip) are both statements about
+			// water this sweep is DRAWING. Keying them on the field's answer
+			// instead would be reasoning about bricks that are no longer offered.
+			const bool bLakeOnlyColumn = (Col.CavernZMm == INT32_MIN) && (DrawLakeZMm != vxc::kNoWaterMm);
 			if (bLakeOnlyColumn)
 			{
 				Col.GroundFloorMm = Impl.Terrain.GetSurfaceLowerBoundMm(Px0, Py0, Px1, Py1);
@@ -6039,6 +6147,27 @@ void UVoxelWaterSubsystem::Tick(float DeltaTime)
 	// is one flag rather than three that can disagree.
 	if (World && !VoxelWaterMarkerOnly())
 	{
+		// Latched before the sweep, on the game thread, the same discipline
+		// MaybeArmSwe uses. A flip tears the existing draw down first -- see
+		// DropImplicitWaterDraw for why declining new bricks is not enough.
+		const bool bWantMeshLakes = CVarVoxelWaterMeshImplicitLakes.GetValueOnGameThread() != 0;
+		if (!Impl->bMeshImplicitLakesLatched || bWantMeshLakes != Impl->bMeshImplicitLakes)
+		{
+			const bool bFirst = !Impl->bMeshImplicitLakesLatched;
+			Impl->bMeshImplicitLakes = bWantMeshLakes;
+			Impl->bMeshImplicitLakesLatched = true;
+			if (!bFirst)
+			{
+				DropImplicitWaterDraw(*Impl);
+				UE_LOG(LogVoxelWater, Log,
+				       TEXT("voxel.Water.MeshImplicitLakes -> %d: implicit water draw dropped and will re-sweep. ")
+				       TEXT("%s. Swimming, flooding and collision are unaffected either way."),
+				       bWantMeshLakes ? 1 : 0,
+				       bWantMeshLakes ? TEXT("Lakes draw as near-field voxels again (the old two-path draw)")
+				                      : TEXT("Lake basins are the sheet's alone"));
+			}
+		}
+
 		if (APlayerController* PC = World->GetFirstPlayerController())
 		{
 			FVector CameraUU = FVector::ZeroVector;
@@ -6973,6 +7102,109 @@ int32 UVoxelWaterSubsystem::BuildLakeSheetRects(const FLakeSheetBasin& Basin, in
 			          VoxelCoords::MmToWorld((OyPx + R.y1 + 1) * PixelMm))));
 	}
 	return OutRectsUU.Num() - Before;
+}
+
+int32 UVoxelWaterSubsystem::BuildLakeSheetRectsBanded(const FLakeSheetBasin& Basin,
+                                                      const FLakeSheetLod& Lod,
+                                                      TArray<FBox2D>& OutRectsUU,
+                                                      bool& bOutResolved) const
+{
+	bOutResolved = false;
+	if (!Impl || !Impl->Water)
+	{
+		return 0;
+	}
+	check(IsInGameThread()); // extentMaskFor decodes blocks; same rule as the single-step build
+
+	const std::vector<vxc::BasinEntry>* Basins = Impl->Water->basinsForTile(Basin.TileX, Basin.TileY);
+	if (Basins == nullptr || Basin.BasinId < 0 || size_t(Basin.BasinId) >= Basins->size())
+	{
+		return 0;
+	}
+	const vxc::BasinEntry& B = (*Basins)[size_t(Basin.BasinId)];
+	const std::vector<uint8_t>* Mask =
+		Impl->Water->extentMaskFor(Basin.TileX, Basin.TileY, uint16(Basin.BasinId));
+	if (Mask == nullptr)
+	{
+		return 0; // decode failure, reported apart from "no water" -- see the single-step build
+	}
+	bOutResolved = true;
+
+	const int64 TileSize = int64(Impl->Water->tilePixels());
+	const int64 PixelMm = int64(Impl->Water->pixelSizeMm());
+	if (TileSize <= 0 || PixelMm <= 0)
+	{
+		return 0;
+	}
+	const int64 OxPx = int64(Basin.TileX) * TileSize, OyPx = int64(Basin.TileY) * TileSize;
+
+	// The band centre into TILE-LOCAL fine pixels, the frame BasinEntry::bboxX0 is
+	// in. voxel-core re-snaps it to the coarsest step against this basin's own
+	// bbox origin, so the caller's hysteresis grid does not have to know it.
+	vxc::LakeSheetLod CoreLod;
+	CoreLod.numBands = FMath::Clamp(Lod.NumBands, 1, int32(vxc::LakeSheetLod::kMaxBands));
+	for (int32 k = 0; k < CoreLod.numBands; ++k)
+	{
+		CoreLod.stepPx[k] = FMath::Max(Lod.StepPx[k], 1);
+		CoreLod.radiusPx[k] = FMath::Max(Lod.RadiusPx[k], 0);
+	}
+	const int64 CamMmX = VoxelCoords::WorldToMm(Lod.CamXUU);
+	const int64 CamMmY = VoxelCoords::WorldToMm(Lod.CamYUU);
+	CoreLod.camPxX = int32(FMath::Clamp<int64>(vxc::floorDiv(CamMmX, PixelMm) - OxPx, INT32_MIN, INT32_MAX));
+	CoreLod.camPxY = int32(FMath::Clamp<int64>(vxc::floorDiv(CamMmY, PixelMm) - OyPx, INT32_MIN, INT32_MAX));
+
+	std::vector<vxc::LakeSheetRect> Rects;
+	vxc::lakeSheetRectsBanded(B, *Mask, CoreLod, Rects);
+
+	const int32 Before = OutRectsUU.Num();
+	OutRectsUU.Reserve(OutRectsUU.Num() + int32(Rects.size()));
+	for (const vxc::LakeSheetRect& R : Rects)
+	{
+		OutRectsUU.Add(FBox2D(
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x0) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y0) * PixelMm)),
+			FVector2D(VoxelCoords::MmToWorld((OxPx + R.x1 + 1) * PixelMm),
+			          VoxelCoords::MmToWorld((OyPx + R.y1 + 1) * PixelMm))));
+	}
+	return OutRectsUU.Num() - Before;
+}
+
+bool UVoxelWaterSubsystem::ShouldMeshImplicitLakes()
+{
+	return CVarVoxelWaterMeshImplicitLakes.GetValueOnGameThread() != 0;
+}
+
+bool UVoxelWaterSubsystem::HasMobilizedWaterInImplicitDisc(double SurfaceZUU) const
+{
+	if (!Impl || !Impl->bImplicitCenterValid)
+	{
+		return false;
+	}
+	const std::set<vxc::BrickKey, vxc::BrickKeyLess>& Mobilized = Impl->Mob.mobilizedBricks();
+	if (Mobilized.empty())
+	{
+		return false; // the overwhelmingly common case: an untouched world, one set test
+	}
+
+	const double BrickUU = VoxelCoords::VoxelSizeUU * double(vxc::WaterBrick8::kEdge);
+	const vxc::WaterWindow& W = Impl->LastImplicitWindow;
+	for (const vxc::BrickKey& K : Mobilized)
+	{
+		if (!W.contains(K.x, K.y, K.z))
+		{
+			continue;
+		}
+		// The datum has to be INSIDE this brick's z span, not merely in the disc's.
+		// A mobilized brick 20 m below the surface is CA water in the depths of the
+		// lake, drawn nowhere near the sheet; cutting a hole in the surface for it
+		// would open a 52 m square of missing water over water that is still there.
+		const double Z0 = double(K.z) * BrickUU;
+		if (SurfaceZUU >= Z0 && SurfaceZUU < Z0 + BrickUU)
+		{
+			return true;
+		}
+	}
+	return false;
 }
 
 bool UVoxelWaterSubsystem::BuildBasinExtentBits(const FLakeSheetBasin& Basin, double WinMinXUU,

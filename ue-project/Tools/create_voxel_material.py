@@ -44,6 +44,13 @@ untouched -- Masked mode only adds the OpacityMask input, so with the inert
 defaults every existing chunk renders bit-for-bit as before (Masked with
 OpacityMask==1 draws every pixel, same as Opaque).
 
+ADR-0008 material palette (asset-forge plan Phase 3.1): BaseColor becomes
+lerp(biomeAlbedo, paletteRGB, isAsset), where the palette arrives at pixel rate
+from VoxelQuadVertexFactory.ush through TexCoords[3]/[4]. isAsset is 1 only for
+the ten materials the terrain generator cannot emit, so terrain is unchanged and
+the change is inert until baked assets are in the world. **This graph has never
+been run** -- see the block at the call site.
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 """
@@ -56,7 +63,9 @@ import unreal
 # The shared biome graph lives next to this file. A -run=pythonscript commandlet
 # does not put the script's own directory on sys.path, so add it explicitly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from terrain_material_common import GraphBuilder, build_terrain_base_color  # noqa: E402
+from terrain_material_common import build_terrain_base_color  # noqa: E402
+from sky_star_graph import SkyGraphBuilder  # noqa: E402
+from bathy_field_graph import sample_bathy_field  # noqa: E402
 
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_VoxelTerrain"
@@ -96,7 +105,19 @@ def main():
     #
     # The graph itself is shared with M_VoxelClipmap (terrain_material_common)
     # so the near field and the 50 km vista cannot diverge at their seam.
-    b = GraphBuilder(material)
+    # SkyGraphBuilder, not GraphBuilder. It IS a GraphBuilder (same algebra, same
+    # checked connects) plus the one thing the Phase 3 wet-shore term needs: a
+    # CollectionParameter binding that is checked by name against MPC_VoxelSky as
+    # read back. An unresolved collection parameter compiles to a constant rather
+    # than failing, so the check is the only thing between a stale MPC and a
+    # terrain material that silently darkens nothing (or everything).
+    sky_collection = unreal.load_object(None, "/Game/Voxel/MPC_VoxelSky.MPC_VoxelSky")
+    if sky_collection is None:
+        raise RuntimeError(
+            "MPC_VoxelSky not found -- M_VoxelTerrain now reads the bathymetry window's "
+            "placement from it for wet shores. Run Tools/create_sky_material.py first.")
+    b = SkyGraphBuilder(material, sky_collection)
+    bathy = sample_bathy_field(b)
 
     # T_VoxelDetail UV: TextureCoordinate 0 is world-planar metres wrapped to a
     # 32 m period (VoxelChunkComponent's WrapWorldToUV -- the wrap is what keeps
@@ -107,8 +128,8 @@ def main():
     tex_coord.set_editor_property("coordinate_index", 0)
     detail_uv = b.div(tex_coord, b.scalar("DetailTileMeters", 8.0))
 
-    base_color, snow_w, base_color_out = build_terrain_base_color(
-        b, vertex_color, detail_uv, "",
+    base_color, snow_w, base_color_out, wet = build_terrain_base_color(
+        b, vertex_color, detail_uv, "", bathy=bathy,
         # Voxel face normals are AXIS-ALIGNED, so every 10 cm step riser on a
         # gentle grassy hill is a "vertical" face. At full strength the slope
         # term would stripe the entire world grass/rock; at 0.35 it reads as
@@ -118,6 +139,72 @@ def main():
         detail_fine_strength=0.30,
         detail_coarse_strength=0.22,
     )
+
+    # --- ADR-0008 MATERIAL PALETTE ------------------------------------------
+    #
+    # UNRUN. This function is a `-run=pythonscript` commandlet and one editor per
+    # box is a hard rule here, so the graph below is written but has never been
+    # executed and M_VoxelTerrain.uasset on disk does not contain it yet. The
+    # shader half (VoxelQuadVertexFactory.ush + VoxelMaterialPalette.ush) is
+    # compile-checked by tools/compile-shaders.ps1; this half is not checked by
+    # anything until somebody runs this file.
+    #
+    # WHAT IT DOES. VoxelQuadVertexFactory.ush evaluates vxc::kMaterialPalette
+    # per PIXEL and hands the result over as
+    #
+    #   TexCoords[3] = (R, G)      TexCoords[4] = (B, isAsset)
+    #
+    # and this reads them back as BaseColor = lerp(biome, palette, isAsset).
+    #
+    # THE LERP IS ONE-SIDED ON PURPOSE, and this is the part not to "simplify"
+    # later. isAsset is 1 only for the ten materials terrain cannot produce
+    # (bark, heartwood, deadwood, six leaf types, pale bark -- everything at or
+    # above vxc::MAT_BARK). For every terrain voxel it is 0 and this node is the
+    # identity, so the climate-driven biome path above is untouched: terrain's
+    # colour is supposed to come from its climate, not from a material id, and
+    # the biome path is the only appearance path that currently works. Replacing
+    # it wholesale would be a change that cannot be verified in the same motion
+    # as this one.
+    #
+    # WHY THE LERP GOES *BEFORE* THE AO MULTIPLY. ADR-0008 invariant 4: the
+    # table carries no lighting and no ambient occlusion, because baking a
+    # top-is-brighter bias into it would double-count the renderer's own terms
+    # and go wrong the moment the sun moves. So an asset voxel has to arrive at
+    # the same `* VertexColor.G` every terrain voxel goes through.
+    #
+    # AND IT IS WHAT MAKES THE SHADER SIDE LIVE AT ALL. The factory's palette
+    # block is compiled out unless NUM_TEX_COORD_INTERPOLATORS > 4, which is
+    # decided by whether a material reads UV4. Until this graph lands, the
+    # renderer change costs literally nothing -- not an interpolant, not an
+    # instruction. That is deliberate, and it is also why "the shader is in but
+    # nothing changed" is the EXPECTED state right now rather than a bug.
+    palette_uv_rg = mel.create_material_expression(
+        material, unreal.MaterialExpressionTextureCoordinate, -900, 700)
+    palette_uv_rg.set_editor_property("coordinate_index", 3)
+    palette_uv_b_flag = mel.create_material_expression(
+        material, unreal.MaterialExpressionTextureCoordinate, -900, 780)
+    palette_uv_b_flag.set_editor_property("coordinate_index", 4)
+
+    def mask(src, keep_x):
+        """One component of a float2 TextureCoordinate."""
+        n = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -750, 780)
+        n.set_editor_property("r", bool(keep_x))
+        n.set_editor_property("g", not keep_x)
+        n.set_editor_property("b", False)
+        n.set_editor_property("a", False)
+        if not mel.connect_material_expressions(src, "", n, ""):
+            raise RuntimeError("connect texcoord -> component mask failed")
+        return n
+
+    palette_rgb = b.append(palette_uv_rg, "", mask(palette_uv_b_flag, True), "")
+    # saturate() is belt and braces. The factory writes exactly 0.0 or 1.0 and
+    # the value is constant across a quad, so interpolation cannot move it; a
+    # lerp alpha is the one place where being wrong outside [0,1] extrapolates
+    # instead of clamping, and this material has been bitten by a channel that
+    # did not carry what its name said before.
+    is_asset = b.saturate(mask(palette_uv_b_flag, False))
+    base_color = b.lerp(base_color, base_color_out, palette_rgb, "", is_asset)
+    base_color_out = ""
 
     ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, 50)
     # Every connection is checked: a silently-failed pin connect produced an
@@ -147,6 +234,15 @@ def main():
     # cheapest way to make a snow cap read as snow rather than as white paint.
     # Everything else keeps the original 0.9.
     roughness = b.lerp(b.scalar("RoughnessBase", 0.90), "", b.scalar("RoughnessSnow", 0.55), "", snow_w)
+    # PHASE 3: the OTHER HALF of the wet-shore term, and it is not decoration.
+    # Lagarde's rule is that wet ground goes darker AND glossier together,
+    # because both come from the same water film -- it fills the microstructure,
+    # which traps light (darker) and flattens the surface (glossier). Darkening
+    # without this reads as a stain rather than as water, which is the standard
+    # way this effect goes wrong. `wet` is already 0 wherever the baked field
+    # says nothing, so this is a no-op on a run with no fine tier.
+    if wet is not None:
+        roughness = b.lerp(roughness, "", b.scalar("WetShoreRoughness", 0.22), "", wet)
     if not mel.connect_material_property(roughness, "", unreal.MaterialProperty.MP_ROUGHNESS):
         raise RuntimeError("connect roughness failed")
 

@@ -234,6 +234,21 @@ public:
 	// see bWorldBegunPlay's doc comment -- never gets a real Impl to sample).
 	double SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const;
 
+	// The fine-tier streamer this run is using, or null when there is none
+	// (no -VoxelFineTileDir=, or the transient loading world's subsystem
+	// instance, which never gets an Impl). BORROWED and owned by FVoxelWorldImpl
+	// -- valid only while this subsystem is alive.
+	//
+	// EXISTS FOR ONE CALLER, UVoxelBathyFieldSubsystem, which needs the resident
+	// tile set's baked bathymetry planes and nothing else about the world. A raw
+	// forward-declared pointer rather than a wrapper method per query because the
+	// thing it needs is FVoxelFineTileStreamer::ReadBathyRect, whose signature
+	// carries a vxc type -- and this header is UHT-parsed, so by the doctrine at
+	// VoxelFineTileStreamer.h:8-14 it must stay voxel-core-free. A forward
+	// declaration of a non-UObject class is invisible to UHT; the vxc types stay
+	// behind it in the .cpp that dereferences this.
+	class FVoxelFineTileStreamer* GetFineTileStreamer() const;
+
 	// True if the voxel at the given integer voxel-lattice coordinate is
 	// solid (overlay-aware World::materialAt != MAT_AIR -- edits are
 	// reflected immediately). Game thread only (same constraint as
