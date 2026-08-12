@@ -236,7 +236,8 @@ ONE THING TO WATCH, STATED BECAUSE IT IS NOT MEASURED: an SLW surface receives
 the engine's own reflection-capture/skylight specular, and this material also
 adds a hand-authored Fresnel sky reflection on Emissive. Those may double up.
 The hand-authored one is owner-tuned and is therefore kept as the default, but
-it is now multiplied by LegacySkyReflectGain (scalar, default 1.0) so it can be
+it is now multiplied by LegacySkyReflectGain (scalar, default 0.0 since the
+owner retired it on 2026-08-12 -- see the measurements at the node) so it can be
 dialled to 0 from a MATERIAL INSTANCE, with no regeneration, if the engine's
 reflection turns out to be enough on its own.
 
@@ -1815,17 +1816,40 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
     # outward is (0.84,0.92,0.89) in the first few centimetres, (0.20,0.51,0.54)
     # a metre or two out, and red-dead-blue-alive beyond that.
     #
-    # THE DEFAULT IS STILL 1.0 BECAUSE THIS IS THE OWNER'S CALL. The
-    # hand-authored term stays at full strength as the default because it is the owner-judged
-    # one and because a port should not silently change the look it is porting;
-    # the possibility that it is now redundant is handled by making it a MATERIAL
-    # INSTANCE knob instead of a regeneration. Set LegacySkyReflectGain to 0 and
-    # the water keeps only the engine's reflection; leave it at 1 and it keeps
-    # what it has always had. Note the star reflection rides this too, which is
-    # correct -- the engine's skylight capture already contains the stars via
-    # M_SkyAtmosphereDome's ReflectionCapturePassSwitch, so if one is redundant
-    # both are.
-    legacy_sky_gain = scalar_param("LegacySkyReflectGain", 1.0, -650, 1760)
+    # THE DEFAULT IS 0.0: THE OWNER RETIRED THIS TERM ON 2026-08-12, on the
+    # measurements above. It is kept as a parameter rather than deleted so the
+    # old look is one instance value away and the arms stay reproducible.
+    #
+    # WHY THIS ONE AND NOT THE ENGINE'S, since either would remove the double.
+    # They are not equivalent, and the difference is exactly the defect:
+    #
+    #   * The ENGINE'S reflection participates in the energy split. The shader
+    #     does ScatteredLuminance *= (1 - EnvBrdf) and Reflection *= EnvBrdf, so
+    #     reflection and volume TRADE OFF and sum to <= 1. Turn the water's
+    #     depth grading up and the reflection makes room for it.
+    #   * THIS term is added to Emissive, which is outside that split -- pure
+    #     addition on top of everything else. That is why it did not merely
+    #     brighten the water, it BURIED the volume: measured mid-lake the volume
+    #     alone reads 0.000/0.008/0.005 against this term's 0.106/0.203/0.287.
+    #
+    # And the engine's tracks the real sky -- this project's skylight is a
+    # real-time capture, so it follows time of day, the moon and cloud, where a
+    # constant-sky Fresnel cannot. Removing this term moved the relative
+    # structure in the water (SD/mean of luma) from 0.127 to 0.304.
+    #
+    # THE HISTORY, so nobody re-adds it: this term was written when the water
+    # was BLEND_TRANSLUCENT + MSM_DefaultLit, under this project's own ban
+    # ("reflections stay constant-sky Fresnel, no dynamic reflection capture").
+    # With captures off the table the material had to fake a sky reflection
+    # itself. The Single Layer Water port put the water on the deferred path
+    # where the engine composites captures and the skylight unconditionally --
+    # so the port added the real thing without removing the stand-in. This is
+    # the removal.
+    #
+    # The star reflection rides this gain too, which is correct: the engine's
+    # skylight capture already contains the stars via M_SkyAtmosphereDome's
+    # ReflectionCapturePassSwitch, so if one is redundant both are.
+    legacy_sky_gain = scalar_param("LegacySkyReflectGain", 0.0, -650, 1760)
     reflection = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -420, 1650)
     if not mel.connect_material_expressions(reflection_fresnel, "", reflection, "A"):
         raise RuntimeError("connect reflection_fresnel -> reflection.A failed")
