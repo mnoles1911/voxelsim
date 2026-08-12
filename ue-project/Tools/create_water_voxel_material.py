@@ -811,8 +811,35 @@ def main():
     #     d = 25 m    RGB (0.00, 0.00, 0.01)   -- bed gone, colour is in-scatter
     # Deep water is therefore NOT black: it converges on the scattering albedo
     # below, which is the whole reason scattering is authored at all.
-    absorb_distance = scalar_param("AbsorptionDistanceM", 8.7, -1300, -560)
-    absorb_color = vector_param("WaterAbsorptionColor", 0.0, 0.7776, 0.9111, -1300, -480)
+    # 8.7 -> 3.5 m, 2026-08-12, on the owner's call that the water is "too see
+    # through ... even in the middle of the lake I can see the voxel terrain
+    # lake bed". This is Unity's parameterisation: the depth at which 2% of
+    # light survives, so extinction = -ln(0.02)/d * (1 - AbsorptionColor).
+    #
+    # MEASURED WHY. At 8.7 m the water still passed 30% green and 36% blue at
+    # 3 m of path. The dominant term was BLUE, absorbed at only 0.04 per metre
+    # -- 89% survives every metre, so no practical lake depth could hide the
+    # bed. Shortening the distance alone would not have fixed it; the colour
+    # below is rebalanced in the same change.
+    #
+    # FOR SCALE, every shipped preset is far more absorbing than real water
+    # (0.265/0.055/0.010 per m), deliberately, so falloff is visible over
+    # gameplay depths rather than over 50 m: Crest ships 0.90/0.30/0.35,
+    # Unity HDRP's Pool 5 m and its Ocean/River preset 1.5 m. 3.5 m sits
+    # between the two Unity presets.
+    absorb_distance = scalar_param("AbsorptionDistanceM", 3.5, -1300, -560)
+    # (0, 0.778, 0.911) -> (0, 0.30, 0.38). The channel that survives is
+    # 1 - this, so the old value made blue nearly transparent (1 - 0.911 =
+    # 0.089) and that is the single reason the bed stayed visible at every
+    # depth this world contains. Now: extinction = 1.118 * (1, 0.70, 0.62) =
+    # 1.12 / 0.78 / 0.69 per metre, i.e. transmittance 0.33/0.46/0.50 at 1 m,
+    # 0.11/0.21/0.25 at 2 m, 0.035/0.096/0.126 at 3 m -- the bed is faint by
+    # two metres and gone by three, which is what was asked for.
+    #
+    # Red still dies first and blue still carries furthest, so the colour
+    # SHIFTS with depth rather than merely darkening; the ratio is just far
+    # tighter than the clear-water 11:1 it was.
+    absorb_color = vector_param("WaterAbsorptionColor", 0.0, 0.30, 0.38, -1300, -480)
     absorb_color_rgb = rgb(absorb_color, -1120, -480)
 
     # -ln(0.02) = 3.9120230054281460586. The 2% survival convention is Unity's;
@@ -864,7 +891,22 @@ def main():
     # above still transmit 76-94%, so "see the bottom in the shallows" survives.
     # This is the knob to move if the lake ever needs to look silty; raising it
     # is how you get milk, and it will destroy the shallows first.
-    scatter_color = vector_param("ScatteringPerMetre", 0.005, 0.045, 0.055, -1300, -400)
+    # RAISED WITH THE ABSORPTION, and this is the half that keeps it looking
+    # like water. Absorption alone only removes light: crank it and the lake
+    # goes dark rather than deep. The in-scatter term is what puts colour BACK
+    # and it SATURATES with distance, so past a few metres everything converges
+    # on the water's own colour and loses contrast -- which is the actual
+    # perceptual cue for depth.
+    #
+    # It is also the physically right lever for "murkier": turbid water is a
+    # BRIGHT medium, not a dark one. Petzold measured clear ocean to turbid
+    # harbour as a ~50x change in SCATTERING against only ~3x in absorption,
+    # which is why silty water reads milky rather than black.
+    #
+    # 0.005/0.045/0.055 -> 0.02/0.10/0.26: a deep blue body, single-scattering
+    # albedo (sigma_s / sigma_t) about 0.018/0.114/0.274, so deep water settles
+    # on a saturated blue instead of on black.
+    scatter_color = vector_param("ScatteringPerMetre", 0.02, 0.10, 0.26, -1300, -400)
     scatter_rgb = rgb(scatter_color, -1120, -400)
     scatter_per_cm = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -640, -420)
     if not mel.connect_material_expressions(scatter_rgb, "", scatter_per_cm, "A"):

@@ -443,7 +443,7 @@ size_t rectArea(const std::vector<LakeSheetRect>& rs) {
 
 } // namespace
 
-VXC_TEST(sheet_rects_at_step_one_reproduce_the_mask_exactly) {
+VXC_TEST(sheet_rects_at_step_one_cover_the_mask_with_a_bounded_overhang) {
     const int32_t w = 9, h = 7;
     BasinEntry b = sheetBasin(w, h);
     std::vector<uint8_t> mask(size_t(w) * size_t(h), 0);
@@ -455,15 +455,47 @@ VXC_TEST(sheet_rects_at_step_one_reproduce_the_mask_exactly) {
 
     std::vector<LakeSheetRect> rs;
     lakeSheetRects(b, mask, 1, rs);
-    size_t wet = 0;
-    for (uint8_t m : mask) wet += (m != 0);
-    CHECK_EQ(int(rectArea(rs)), int(wet));
-    // The hole splits its row into two runs; every other wet row is one.
-    CHECK_EQ(int(rs.size()), 6);
-    // Every emitted cell is wet -- the property that keeps water off dry land.
+
+    // THIS TEST USED TO ASSERT THAT STEP 1 REPRODUCES THE MASK EXACTLY. It no
+    // longer does, deliberately: "any wet pixel in the block" dilates only when
+    // a block is bigger than a pixel, so at step 1 it degenerated to an exact
+    // copy of the mask -- and step 1 is the band nearest the camera. The mask
+    // is a test on the 1.875 m lattice while the drawn ground is the amplified
+    // 10 cm surface, so an exact copy stops short of the bank wherever the
+    // surface dips below the datum inside a cell. That was visible in game as
+    // an air gap between the water and the bank. kLakeShoreMarginPx closes it.
+    //
+    // The contract is now COVERAGE PLUS A BOUNDED OVERHANG, which is what the
+    // consumer needs: lakeSheetRects feeds only the drawn sheet (the despawn
+    // path uses basinExtentBits, which is centre-sampled and deliberately
+    // erodes instead).
+
+    // 1. Every wet cell is covered. A gap is the artefact; this is the fix.
+    std::vector<uint8_t> covered(mask.size(), 0);
     for (const LakeSheetRect& r : rs) {
         for (int32_t y = r.y0; y <= r.y1; ++y)
-            for (int32_t x = r.x0; x <= r.x1; ++x) CHECK(mask[size_t(y) * size_t(w) + size_t(x)] != 0);
+            for (int32_t x = r.x0; x <= r.x1; ++x) covered[size_t(y) * size_t(w) + size_t(x)] = 1;
+    }
+    for (size_t i = 0; i < mask.size(); ++i) {
+        if (mask[i] != 0) CHECK(covered[i] != 0);
+    }
+
+    // 2. The overhang is BOUNDED: every emitted cell is within the margin of a
+    //    genuinely wet one, so the sheet cannot wander onto open land.
+    for (const LakeSheetRect& r : rs) {
+        for (int32_t y = r.y0; y <= r.y1; ++y) {
+            for (int32_t x = r.x0; x <= r.x1; ++x) {
+                bool nearWet = false;
+                for (int32_t dy = -kLakeShoreMarginPx; dy <= kLakeShoreMarginPx && !nearWet; ++dy) {
+                    for (int32_t dx = -kLakeShoreMarginPx; dx <= kLakeShoreMarginPx && !nearWet; ++dx) {
+                        const int32_t ny = y + dy, nx = x + dx;
+                        if (ny < 0 || nx < 0 || ny >= h || nx >= w) continue;
+                        if (mask[size_t(ny) * size_t(w) + size_t(nx)] != 0) nearWet = true;
+                    }
+                }
+                CHECK(nearWet);
+            }
+        }
     }
 }
 
@@ -540,9 +572,14 @@ VXC_TEST(sheet_decimation_stays_within_one_block_ring_of_the_lake) {
         CHECK(area <= wet + ring);
     }
     // Step 0 and negative steps are clamped to 1 rather than dividing by zero.
+    // At step 1 the area is the mask PLUS the kLakeShoreMarginPx overhang, not
+    // the mask exactly -- see sheet_rects_at_step_one_... for why that changed.
+    // Bounded above by the mask grown by the margin on every side.
     std::vector<LakeSheetRect> zero;
     lakeSheetRects(b, mask, 0, zero);
-    CHECK_EQ(int(rectArea(zero)), int(wet));
+    CHECK(int(rectArea(zero)) >= int(wet));
+    const size_t grown = wet + size_t(8 * kLakeShoreMarginPx) * wet;
+    CHECK(rectArea(zero) <= grown);
 }
 
 VXC_TEST(sheet_rects_reject_a_mask_that_is_not_its_basins_bbox) {

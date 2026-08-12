@@ -745,6 +745,24 @@ private:
 //     correctly shaped, rather than the decimation grid's staircase.
 // The failure modes are not symmetric: over-cover hides, under-cover glares.
 
+//: How far past the mask's own boundary the drawn sheet reaches, in FINE
+//: PIXELS. One cell, i.e. 1.875 m.
+//:
+//: WHY IT IS NOT ZERO. The extent mask is a test on the 1.875 m control-point
+//: lattice; the ground the player sees is the amplified 10 cm surface. Where
+//: that surface dips below the water datum inside a cell whose control point
+//: sits above it, the cell reads DRY and the water stops short -- an air gap
+//: between the bank and the lake, reported from a screenshot. The margin
+//: covers exactly that cell.
+//:
+//: WHY ONE AND NOT MORE. The failure modes are not symmetric: over-cover runs
+//: into a bank that stands above the water and is occluded by it, while
+//: under-cover is a visible hole. But the overhang is only free while the bank
+//: is steeper than the margin is wide -- on a very shallow shore a larger
+//: margin would put water on visibly dry ground. One cell is the smallest
+//: value that closes the lattice quantisation, which is the actual defect.
+inline constexpr int32_t kLakeShoreMarginPx = 1;
+
 // One wet rectangle, in tile-local FINE PIXELS, inclusive on all four sides.
 struct LakeSheetRect {
     int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
@@ -786,11 +804,25 @@ size_t lakeSheetRects(const BasinEntry& b, const MaskT& mask, int32_t step,
     // pixel is visited at most once across all blocks -- and the scan stops at
     // the first wet pixel, so open water (the common case) exits immediately.
     const auto blockWet = [&](int32_t cx, int32_t cy) -> bool {
-        const int32_t yEnd = (cy + step < h) ? (cy + step) : h;
-        const int32_t xEnd = (cx + step < w) ? (cx + step) : w;
-        for (int32_t y = cy; y < yEnd; ++y) {
+        // EXPANDED BY kLakeShoreMarginPx, and that margin is the whole point at
+        // the finest step. "Any wet pixel in the block" dilates only when the
+        // block is bigger than a pixel: at step 1 it degenerates to reading the
+        // one cell, i.e. an EXACT reproduction of the mask -- and step 1 is the
+        // band nearest the camera, exactly where the owner was looking when he
+        // reported "an air gap between the ground bank and the water".
+        //
+        // The mask is built on the 1.875 m control-point lattice; the ground
+        // the player sees is the amplified 10 cm surface. Wherever that surface
+        // dips below the datum INSIDE a lattice cell whose control point sits
+        // above it, the cell reads dry and the water stops short by up to a
+        // full 1.875 m. The margin covers that cell.
+        const int32_t y0 = (cy - kLakeShoreMarginPx > 0) ? (cy - kLakeShoreMarginPx) : 0;
+        const int32_t x0 = (cx - kLakeShoreMarginPx > 0) ? (cx - kLakeShoreMarginPx) : 0;
+        const int32_t yEnd = (cy + step + kLakeShoreMarginPx < h) ? (cy + step + kLakeShoreMarginPx) : h;
+        const int32_t xEnd = (cx + step + kLakeShoreMarginPx < w) ? (cx + step + kLakeShoreMarginPx) : w;
+        for (int32_t y = y0; y < yEnd; ++y) {
             const size_t row = size_t(y) * size_t(w);
-            for (int32_t x = cx; x < xEnd; ++x) {
+            for (int32_t x = x0; x < xEnd; ++x) {
                 if (mask[row + size_t(x)] != 0) return true;
             }
         }
@@ -953,11 +985,17 @@ size_t lakeSheetRectsBanded(const BasinEntry& b, const MaskT& mask, const LakeSh
     // version, and for the same reason -- see its comment. Over-cover tucks
     // under the bank; under-cover glares.
     const auto blockWet = [&](int32_t cx, int32_t cy, int32_t s) -> bool {
-        const int32_t yEnd = (cy + s < h) ? (cy + s) : h;
-        const int32_t xEnd = (cx + s < w) ? (cx + s) : w;
-        for (int32_t y = cy; y < yEnd; ++y) {
+        // Same kLakeShoreMarginPx expansion as the single-step version, and it
+        // matters MORE here: the finest band is step 1 by design, so without
+        // the margin the band nearest the camera is the one place the sheet
+        // reproduces the lattice mask exactly and stops short of the bank.
+        const int32_t y0 = (cy - kLakeShoreMarginPx > 0) ? (cy - kLakeShoreMarginPx) : 0;
+        const int32_t x0 = (cx - kLakeShoreMarginPx > 0) ? (cx - kLakeShoreMarginPx) : 0;
+        const int32_t yEnd = (cy + s + kLakeShoreMarginPx < h) ? (cy + s + kLakeShoreMarginPx) : h;
+        const int32_t xEnd = (cx + s + kLakeShoreMarginPx < w) ? (cx + s + kLakeShoreMarginPx) : w;
+        for (int32_t y = y0; y < yEnd; ++y) {
             const size_t row = size_t(y) * size_t(w);
-            for (int32_t x = cx; x < xEnd; ++x) {
+            for (int32_t x = x0; x < xEnd; ++x) {
                 if (mask[row + size_t(x)] != 0) return true;
             }
         }
