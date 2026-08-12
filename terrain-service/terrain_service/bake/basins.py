@@ -429,6 +429,23 @@ def bathymetry_planes(
     ``survey_basins`` was handed; ``interior`` slices the shipped window out of
     it. Records are used only through ``lake_extent_mask``, so this function
     and the client's footprint agree by construction rather than by review.
+
+    THE TWO COORDINATE SPACES, and getting this wrong is silent. A record's
+    ``seed_px`` and ``bbox_px`` are INTERIOR pixels -- ``survey_basins``
+    converts them itself, so they mean the same thing as the tile's own
+    elevation index (see ``BasinRecord``). ``z_open`` is PADDED. Indexing the
+    padded array with interior coordinates offsets every mask by the pad width
+    and floods the wrong terrain: measured on tile (-4,-4) that produced
+    depths up to 318 m against a true tile maximum of 40 m, and wet cells at
+    the tile's top edge belonging to no basin's bbox at all. So the records
+    are shifted into padded space here, once, explicitly.
+
+    KNOWN LIMITATION, bounded and deliberate: a basin that continues past the
+    tile edge gets a false shoreline at the seam, because ``bbox_px`` is
+    clipped to the interior and the apron carries no rows to flood from. The
+    distance field is therefore wrong within ``shore_clamp_m`` of a seam that a
+    lake crosses. Fixing it needs the neighbour's rows, which is a superblock
+    pass, not a per-tile one.
     """
     from scipy import ndimage  # bake-only dependency; the client never runs this
 
@@ -441,6 +458,11 @@ def bathymetry_planes(
     # Doing the transform on the interior alone would put a false shoreline on
     # all four borders, which is the same class of error `survey_basins` runs
     # padded to avoid.
+    # Interior -> padded, from the slice the caller sliced with. `interior`
+    # None means the caller already handed us an interior-space grid, so the
+    # shift is zero and the records are used as they stand.
+    pad = 0 if interior is None else int(interior.start or 0)
+
     wet = np.zeros(z.shape, bool)
     depth_mm = np.zeros(z.shape, np.float32)
     for r in records:
@@ -450,7 +472,12 @@ def bathymetry_planes(
         # anyway, but skipping it here keeps the extent fills off the hot path.
         if not r.is_lake:
             continue
-        mask = lake_extent_mask(z, r.seed_px, r.surface_m, r.bbox_px)
+        sx, sy = r.seed_px
+        bx0, by0, bx1, by1 = r.bbox_px
+        mask = lake_extent_mask(
+            z, (sx + pad, sy + pad), r.surface_m,
+            (bx0 + pad, by0 + pad, bx1 + pad, by1 + pad),
+        )
         if not mask.any():
             continue
         # A basin's own datum, only where that basin actually reaches. Two
@@ -458,7 +485,13 @@ def bathymetry_planes(
         # test), so the last writer wins is never exercised -- but the maximum
         # is taken anyway, because a silent overlap should read as the deeper
         # water rather than as whichever record happened to be sorted last.
-        d = (np.float32(r.surface_m) - z) * np.float32(1000.0)
+        # CLAMPED TO THE BASIN'S OWN BOWL. Water in a basin cannot be deeper
+        # than its surface is above its floor, and the clamp is not academic:
+        # two basins can share a bbox, so a fill seeded in a shallow one can
+        # reach into a deeper one's re-opened hole and report its depth. The
+        # record already carries the only correct bound.
+        max_mm = max(0.0, (r.surface_m - r.floor_m) * 1000.0)
+        d = np.clip((np.float32(r.surface_m) - z) * np.float32(1000.0), 0.0, max_mm)
         np.maximum(depth_mm, np.where(mask, d, 0.0), out=depth_mm)
         wet |= mask
 

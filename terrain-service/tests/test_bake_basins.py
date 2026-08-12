@@ -384,3 +384,78 @@ def test_the_bake_hands_the_registry_to_the_encoder():
         assert row.surface_mm == round(rec.surface_m * 1000)
         assert row.seed_px == tuple(rec.seed_px)
     assert back.bake_ver == pipeline.BAKE_VERSION
+
+
+# ------------------------------------------------- bathymetry (bake_ver 27) ---
+
+def _bowl(n=96, pad=16, cx=None, cy=None, r=10.0, depth_m=4.0, rim_m=100.0):
+    """A padded grid with one conical bowl, and the interior-space record for
+    it. `cx`/`cy` are INTERIOR coordinates, as a real BasinRecord carries."""
+    import numpy as np
+    cx = (n // 2) if cx is None else cx
+    cy = (n // 2) if cy is None else cy
+    z = np.full((n + 2 * pad, n + 2 * pad), rim_m, np.float32)
+    yy, xx = np.mgrid[0:z.shape[0], 0:z.shape[1]]
+    d = np.hypot(xx - (cx + pad), yy - (cy + pad))
+    inside = d < r
+    z[inside] = rim_m - depth_m * (1.0 - d[inside] / r)
+
+    class Rec:
+        is_lake = True
+        seed_px = (cx, cy)
+        bbox_px = (cx - int(r) - 1, cy - int(r) - 1, cx + int(r) + 1, cy + int(r) + 1)
+        surface_m = rim_m
+        floor_m = rim_m - depth_m
+    return z, Rec(), slice(pad, pad + n)
+
+
+def test_bathymetry_uses_interior_coordinates_against_a_padded_grid():
+    """THE BUG THIS PINS, and it was silent. A record's seed_px/bbox_px are
+    INTERIOR pixels while z_open is PADDED. Indexing the padded array with
+    interior coordinates offsets every mask by the pad and floods the wrong
+    terrain -- on real tile (-4,-4) that produced depths to 318 m against a
+    true maximum of 40 m, and wet cells at the tile edge inside no basin's
+    bbox. Here the bowl is deliberately placed OFF-CENTRE so an unshifted
+    lookup lands on flat rim and produces nothing.
+    """
+    import numpy as np
+    z, rec, sl = _bowl(cx=30, cy=70, depth_m=4.0)
+    depth, shore = basins.bathymetry_planes(z, [rec], interior=sl, cell_m=1.0)
+    wet = depth != basins.BATHY_DRY_DEPTH
+    assert wet.any(), "no wet cells: the mask missed the bowl entirely"
+    # The wet blob must sit where the record says it does, in interior space.
+    ys, xs = np.nonzero(wet)
+    assert abs(xs.mean() - 30) < 3 and abs(ys.mean() - 70) < 3, (
+        f"wet centroid ({xs.mean():.1f},{ys.mean():.1f}) is not at the "
+        "record's seed (30,70) -- coordinate spaces are mixed again"
+    )
+    # And the depth must be the bowl's, not some other terrain's.
+    assert depth[wet].max() * basins.BATHY_DEPTH_LSB_MM / 1000.0 <= 4.0 + 1e-3
+
+
+def test_bathymetry_never_exceeds_the_basins_own_bowl():
+    """Two basins can share a bbox, so a fill seeded in a shallow one can reach
+    a deeper one's re-opened hole. The record's own surface-minus-floor is the
+    only correct bound and is applied as a clamp."""
+    z, rec, sl = _bowl(depth_m=3.0)
+    # Punch a much deeper pit inside the same bbox, as an adjacent basin would.
+    z[sl, sl][40:44, 40:44] = rec.surface_m - 50.0
+    depth, _ = basins.bathymetry_planes(z, [rec], interior=sl, cell_m=1.0)
+    deepest_m = depth[depth != basins.BATHY_DRY_DEPTH].max() * basins.BATHY_DEPTH_LSB_MM / 1000.0
+    assert deepest_m <= 3.0 + 1e-3, f"clamp failed: {deepest_m:.2f} m over a 3 m bowl"
+
+
+def test_bathymetry_shore_distance_is_signed_and_saturates():
+    z, rec, sl = _bowl(depth_m=4.0, r=10.0)
+    # A 20 m clamp, because this fixture is 96 m across at 1 m cells and the
+    # shipped 100 m band is simply not reachable inside it -- the clamp is the
+    # parameter precisely so the property can be tested at fixture scale.
+    clamp = 20.0
+    _, shore = basins.bathymetry_planes(z, [rec], interior=sl, cell_m=1.0,
+                                        shore_clamp_m=clamp)
+    mm = basins.BATHY_SHORE_LSB_MM
+    assert shore.max() > 0, "no positive (in-water) distances"
+    assert shore.min() < 0, "no negative (on-land) distances"
+    # Far from the bowl it saturates, which is what keeps the plane compressible
+    # (an all-dry tile costs index bytes only -- see the codec test).
+    assert shore[0, 0] * mm / 1000.0 <= -clamp + 1e-6
