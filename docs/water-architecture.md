@@ -62,8 +62,18 @@ plan §1–§7; not repeated here.
 - **River ribbons** (mid/far) — `voxel-core/include/voxelcore/riverribbon.h`,
   `VoxelRiverRibbonActor`. Ordered centreline polylines traced from the water
   plane, shape decisions unit-tested in voxel-core without an engine. Unchanged.
-- **Lake sheets** (mid/far) — `VoxelWaterSheetActor`, rectangle decomposition
-  of a basin's wet mask. Unchanged; still lakes-only by design.
+- **Lake sheets** — `VoxelWaterSheetActor`, rectangle decomposition of a
+  basin's wet mask. **As of 2026-08-11 these own lake basins at EVERY range,
+  not just mid/far**, and the near-field voxel water is retired for lakes
+  (owner's decision: "one type of rendered water, not two systems for
+  basins"). Three things made that right: a lake surface is planar by
+  construction, so the voxel volume added nothing visually; Single Layer Water
+  is designed for a single surface and the near disc is a stacked volume; and
+  the measured step across the boundary was +36.4/255 at matched depth and
+  view angle. The near-field path stays for water that genuinely varies per
+  cell — CA/mobilized water, cavern flood, ocean — and the implicit field
+  keeps ANSWERING for swimming, collision and flood-on-dig; it merely stops
+  being meshed.
 - **The CA (`waterca.h`, `kWaterCAVersion` 5)** — frozen. Still handles bucket
   pours and cave floods. Its persistence design (ADR-0005, `WaterState`) stays
   load-bearing for that frozen scope.
@@ -71,12 +81,23 @@ plan §1–§7; not repeated here.
   — the translucent draw path, spatial sort buckets, chunk-table free list.
   Keeps drawing lake sheets, the voxel-binned PBF fallback/debug arm (§6 of
   the re-architecture plan), and whatever the frozen CA still meshes.
-- **The water material's two documented bans**, both carried forward
-  unchanged into the new screen-space fluid pass:
+- **The water material's two documented bans** — but read the SCOPE note below
+  before applying either, because both were narrower than they had been treated:
   1. **No scene-colour read.** Refraction ships as a normal-perturbed *depth*
      trick or not at all at v0 — a scene-colour read makes translucent
      compositing order-dependent outright (`gpu-water-pool-design.md`).
   2. **Reflections stay constant-sky Fresnel.** No dynamic reflection capture.
+
+  **SCOPE, ESTABLISHED 2026-08-11.** Ban 1 exists because a *translucent
+  material* grabbing scene colour breaks the pool's single sort key. It does
+  NOT cover (a) a **post-process** material, where the colour buffer is the
+  declared input — Epic's own underwater effect is one, which is what makes a
+  proper submerged look available to us; nor (b) **Single Layer Water**, which
+  is not sorted translucency at all: it renders in its own pass after deferred
+  lighting, has no translucent sort key, and receives depth and velocity.
+  Ban 2 likewise costs nothing under SLW — it never consumed planar
+  reflections, and `r.Water.SingleLayer.Reflection 2` (captures + skylight
+  only) is a first-class engine mode rather than a degraded fallback.
 - **The bake's water-shape stages, demoted from "drawn shape" to "data".**
   Basin machinery, the water plane, the flow plane, discharge and heads all
   remain load-bearing — as faucet placement/rates, graph geometry, basin
