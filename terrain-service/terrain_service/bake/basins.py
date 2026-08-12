@@ -474,11 +474,20 @@ def bathymetry_planes(
             continue
         sx, sy = r.seed_px
         bx0, by0, bx1, by1 = r.bbox_px
+        y0, y1 = by0 + pad, by1 + pad
+        x0, x1 = bx0 + pad, bx1 + pad
         mask = lake_extent_mask(
-            z, (sx + pad, sy + pad), r.surface_m,
-            (bx0 + pad, by0 + pad, bx1 + pad, by1 + pad),
+            z, (sx + pad, sy + pad), r.surface_m, (x0, y0, x1, y1),
         )
-        if not mask.any():
+        # EVERY OP BELOW IS BBOX-LOCAL, and on a real tile that is the whole
+        # cost of this stage. A basin's extent is at most its bbox, but the
+        # mask comes back shaped like the tile, so composing it full-grid means
+        # ~4 passes over 72 million cells PER BASIN -- measured at 0.54 CPU-s
+        # each, or 140 CPU-s across a 260-basin tile, against a bbox that is
+        # typically a few hundred cells on a side. Slices are views, so
+        # `out=` writes straight through.
+        sub = mask[y0 : y1 + 1, x0 : x1 + 1]
+        if not sub.any():
             continue
         # A basin's own datum, only where that basin actually reaches. Two
         # basins never overlap (they are distinct components of one threshold
@@ -491,9 +500,13 @@ def bathymetry_planes(
         # reach into a deeper one's re-opened hole and report its depth. The
         # record already carries the only correct bound.
         max_mm = max(0.0, (r.surface_m - r.floor_m) * 1000.0)
-        d = np.clip((np.float32(r.surface_m) - z) * np.float32(1000.0), 0.0, max_mm)
-        np.maximum(depth_mm, np.where(mask, d, 0.0), out=depth_mm)
-        wet |= mask
+        d = np.clip(
+            (np.float32(r.surface_m) - z[y0 : y1 + 1, x0 : x1 + 1]) * np.float32(1000.0),
+            0.0, max_mm,
+        )
+        dst = depth_mm[y0 : y1 + 1, x0 : x1 + 1]
+        np.maximum(dst, np.where(sub, d, 0.0), out=dst)
+        wet[y0 : y1 + 1, x0 : x1 + 1] |= sub
 
     # Exact Euclidean distance, both directions. `distance_transform_edt`
     # measures to the nearest ZERO, so running it on the mask gives the
