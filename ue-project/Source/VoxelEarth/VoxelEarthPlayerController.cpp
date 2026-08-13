@@ -14,6 +14,9 @@
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthHUD.h"
 #include "VoxelExplosive.h"
+#include "VoxelInventoryComponent.h"
+#include "VoxelItem.h"
+#include "VoxelThrownItem.h"
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -49,6 +52,28 @@ void AVoxelEarthPlayerController::SetupInputComponent()
 	InputComponent->BindKey(EKeys::Two, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize1);
 	InputComponent->BindKey(EKeys::Three, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize2);
 	InputComponent->BindKey(EKeys::Four, IE_Pressed, this, &AVoxelEarthPlayerController::SelectDigSize4);
+
+	// --- THE HOTBAR, ON 5-9 AND NOT 1-9 ------------------------------------
+	//
+	// The obvious binding for a hotbar is 1-9 and it is not available. 1 is the
+	// water bucket -- see the note above, which records that as a specific
+	// request ("a key you can hit without thinking") -- and 2/3/4 are the dig
+	// sizes, which were themselves shifted up to keep 1x1x1 rather than lose it.
+	// Taking those back for an inventory nobody has used yet would trade a
+	// control the owner asked for against a feature he has not seen.
+	//
+	// So the hotbar starts at 5. It is FIVE SLOTS, not four, so 5-9 is a
+	// contiguous run under the fingers rather than an awkward 5-8.
+	//
+	// WHEN THIS SHOULD CHANGE: once items can be dug, placed and carried, the
+	// bucket and the dig sizes are themselves items and belong IN the hotbar,
+	// at which point 1-9 becomes one uniform row and this comment is the record
+	// of why it was not that on day one.
+	InputComponent->BindKey(EKeys::Five, IE_Pressed, this, &AVoxelEarthPlayerController::OnUseHotbar1);
+	InputComponent->BindKey(EKeys::Six, IE_Pressed, this, &AVoxelEarthPlayerController::OnUseHotbar2);
+	InputComponent->BindKey(EKeys::Seven, IE_Pressed, this, &AVoxelEarthPlayerController::OnUseHotbar3);
+	InputComponent->BindKey(EKeys::Eight, IE_Pressed, this, &AVoxelEarthPlayerController::OnUseHotbar4);
+	InputComponent->BindKey(EKeys::Nine, IE_Pressed, this, &AVoxelEarthPlayerController::OnUseHotbar5);
 
 	// Creative placement palette cycle (m1-plan.md "Place" row).
 	InputComponent->BindKey(EKeys::T, IE_Pressed, this, &AVoxelEarthPlayerController::CyclePaletteMaterial);
@@ -694,6 +719,120 @@ void AVoxelEarthPlayerController::OnChargeRelease()
 void AVoxelEarthPlayerController::OnCycleDebugMode()
 {
 	VoxelDebug::CycleDebugMode();
+}
+
+// --- items ------------------------------------------------------------------
+
+AVoxelEarthPlayerController::AVoxelEarthPlayerController()
+{
+	// CreateDefaultSubobject, so the component exists before BeginPlay and
+	// before any input can arrive. The alternative -- NewObject +
+	// RegisterComponent at BeginPlay -- has a window in which a keypress finds
+	// no inventory, and "the first throw after respawn does nothing" is exactly
+	// the kind of intermittent that never gets diagnosed.
+	Inventory = CreateDefaultSubobject<UVoxelInventoryComponent>(TEXT("Inventory"));
+}
+
+void AVoxelEarthPlayerController::OnUseHotbar1() { UseHotbarSlot(0); }
+void AVoxelEarthPlayerController::OnUseHotbar2() { UseHotbarSlot(1); }
+void AVoxelEarthPlayerController::OnUseHotbar3() { UseHotbarSlot(2); }
+void AVoxelEarthPlayerController::OnUseHotbar4() { UseHotbarSlot(3); }
+void AVoxelEarthPlayerController::OnUseHotbar5() { UseHotbarSlot(4); }
+
+void AVoxelEarthPlayerController::UseHotbarSlot(int32 SlotIndex)
+{
+	UWorld* World = GetWorld();
+	if (!World || !Inventory)
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Hotbar %d: no world or no inventory component -- nothing can be used. This is a "
+		            "wiring fault, not an empty slot."),
+		       SlotIndex + 1);
+		return;
+	}
+
+	// EVERY REFUSAL BELOW LOGS, AND THEY LOG DIFFERENTLY.
+	//
+	// There are five distinct reasons pressing a hotbar key can correctly do
+	// nothing -- empty slot, unknown item, item is not usable yet, the debit
+	// failed, the spawn failed -- and from the player's chair all five look
+	// identical. This project has lost evenings to exactly that shape of
+	// silence (a subsystem flag that made a whole feature permanently false; a
+	// weathering pass that removed 20 voxels of 90,000 for months). So each one
+	// says which it was.
+	const FVoxelInventorySlot Slot = Inventory->GetSlot(SlotIndex);
+	if (Slot.Count <= 0)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("Hotbar %d: slot is empty."), SlotIndex + 1);
+		return;
+	}
+
+	const FVoxelItemDef* Def = FVoxelItemRegistry::Find(Slot.ItemId);
+	if (Def == nullptr)
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Hotbar %d: slot holds '%s' x%d but the item registry has no such id. The "
+		            "inventory and VoxelItem.cpp's table disagree."),
+		       SlotIndex + 1, *Slot.ItemId.ToString(), Slot.Count);
+		return;
+	}
+
+	Inventory->SetSelectedSlot(SlotIndex);
+
+	// THE DISPATCH. Today exactly one branch is real. The others exist so that
+	// adding them later is a case arm rather than a rethink of the input layer,
+	// and so that pressing a key on a block right now says "not implemented"
+	// instead of nothing at all.
+	if (!Def->CanThrow())
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("Hotbar %d: '%s' is a %s and using it is not implemented yet -- only throwables "
+		            "act on a hotbar key in v0."),
+		       SlotIndex + 1, *Def->DisplayName,
+		       Def->IsBlock() ? TEXT("block") : TEXT("non-throwable item"));
+		return;
+	}
+
+	// DEBIT BEFORE THROWING, not after. If the spawn fails the item is gone,
+	// which is the wrong way to be wrong exactly once; the alternative -- throw
+	// then debit -- duplicates the item every time the spawn fails, which is
+	// wrong forever and is how an infinite-item exploit is born.
+	if (!Inventory->TryRemoveFromSlot(SlotIndex, 1))
+	{
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Hotbar %d: '%s' x%d present but the debit was refused; not throwing."),
+		       SlotIndex + 1, *Slot.ItemId.ToString(), Slot.Count);
+		return;
+	}
+
+	// The same throw geometry as the explosive (OnChargeRelease above): view
+	// point, pitch nudged up by ThrowUpwardArcDegrees, spawned 80 UU ahead so it
+	// does not start inside the camera. Deliberately identical -- a cube and a
+	// charge that flew differently would be two throw models to tune.
+	FVector CameraLocation;
+	FRotator CameraRotation;
+	GetPlayerViewPoint(CameraLocation, CameraRotation);
+	FRotator ThrowRotation = CameraRotation;
+	ThrowRotation.Pitch = FMath::Clamp(CameraRotation.Pitch + ThrowUpwardArcDegrees, -89.f, 89.f);
+	const FVector ThrowDirection = ThrowRotation.Vector();
+
+	const float SpeedUU = Def->ThrowSpeedUUPerSec > 0.f ? Def->ThrowSpeedUUPerSec : MaxThrowSpeedUU;
+	AVoxelThrownItem* Thrown = AVoxelThrownItem::SpawnAndThrow(
+		World, CameraLocation + ThrowDirection * 80.0, ThrowDirection * SpeedUU,
+		GetPawn(), Slot.ItemId, 1);
+
+	if (Thrown == nullptr)
+	{
+		// Refund. The debit-first order above is only defensible if this exists.
+		const int32 Refunded = Inventory->TryAddItem(Slot.ItemId, 1);
+		UE_LOG(LogVoxelEarth, Warning,
+		       TEXT("Hotbar %d: spawn of '%s' FAILED; refunded %d."),
+		       SlotIndex + 1, *Slot.ItemId.ToString(), Refunded);
+		return;
+	}
+
+	UE_LOG(LogVoxelEarth, Log, TEXT("Hotbar %d: threw '%s' at %.0f UU/s (%d left in slot)."),
+	       SlotIndex + 1, *Def->DisplayName, SpeedUU, Slot.Count - 1);
 }
 
 float AVoxelEarthPlayerController::GetExplosiveChargeAlpha() const

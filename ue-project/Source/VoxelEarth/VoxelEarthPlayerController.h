@@ -18,6 +18,9 @@ class VOXELEARTH_API AVoxelEarthPlayerController : public APlayerController
 {
 	GENERATED_BODY()
 
+public:
+	AVoxelEarthPlayerController();
+
 protected:
 	virtual void SetupInputComponent() override;
 	virtual void BeginPlay() override;
@@ -26,6 +29,29 @@ public:
 	// --- HUD queries (AVoxelEarthHUD) --------------------------------------
 
 	int32 GetDigSizeVoxels() const { return DigSizeVoxels; }
+
+	// --- items and the hotbar ----------------------------------------------
+	//
+	// THE INVENTORY LIVES ON THE CONTROLLER, NOT THE PAWN, and that is the
+	// choice everything else here follows from. A pawn can be destroyed and
+	// respawned; what you are carrying should survive that. It also means a
+	// thrown item looking for "the inventory to return to" hops pawn ->
+	// controller, which AVoxelThrownItem already does.
+	class UVoxelInventoryComponent* GetInventory() const { return Inventory; }
+
+	// A NUMBER KEY MEANS "USE THE ITEM IN THIS SLOT", NOT "THROW".
+	//
+	// The owner asked for a number key that throws a cube. Binding a key
+	// literally to "throw" would have been three lines and would have had to be
+	// unpicked the moment the second kind of item existed -- and the brief was
+	// explicit that this framework is meant to carry "tools, voxel blocks, etc".
+	// So the key dispatches on the item's CATEGORY: a throwable is thrown, a
+	// block will be placed, a tool will do its thing. Today only the throwable
+	// branch exists, and it does exactly what was asked; the others log that
+	// they are not implemented rather than silently doing nothing, because
+	// "I pressed the key and nothing happened" is the one report that costs an
+	// evening to diagnose.
+	void UseHotbarSlot(int32 SlotIndex);
 
 	// Raw vxc::MaterialId value (this header stays voxel-core-free by
 	// doctrine, so the type is uint8, not vxc::MaterialId).
@@ -130,6 +156,24 @@ private:
 	// AVoxelEarthGameMode::HUDClass, but a -game run with a HUD override
 	// should not crash).
 	class AVoxelEarthHUD* GetVoxelHUD() const;
+
+	// The five hotbar keys, one thunk each. UE's BindKey takes a no-argument
+	// member function, so the slot index cannot be a parameter -- five thunks is
+	// the whole cost of that, and it keeps the binding table readable.
+	void OnUseHotbar1();
+	void OnUseHotbar2();
+	void OnUseHotbar3();
+	void OnUseHotbar4();
+	void OnUseHotbar5();
+
+	// Created in the constructor rather than attached at BeginPlay by a
+	// bootstrap subsystem. A scaffold subsystem exists
+	// (UVoxelInventoryBootstrapSubsystem) only because the agent that wrote the
+	// inventory could not edit this file; with the controller owning the
+	// component properly, that scaffold is dead weight and its cvar
+	// (voxel.Inventory.AutoAttach) now defaults off.
+	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Items")
+	TObjectPtr<class UVoxelInventoryComponent> Inventory;
 
 	int32 DigSizeVoxels = 1;
 
