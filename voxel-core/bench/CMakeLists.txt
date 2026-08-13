@@ -277,3 +277,16 @@ target_link_libraries(vxc_farwaterschemes PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_farwaterschemes PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# --- vxc_windprobe: the v0 weather field (voxelcore/weather.h), printed.
+#     Answers the two questions the field was built to answer, without an
+#     editor: does the wind actually DIFFER from place to place at one instant,
+#     and does it move smoothly and plausibly at one place as the clock runs.
+#     Also the pin check -- a capture leg that freezes the wind needs proof the
+#     freeze took. Refuses to report a field that is constant, because a
+#     constant wind and a wind field that never ran print the same numbers.
+add_executable(vxc_windprobe windprobe.cpp)
+target_link_libraries(vxc_windprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_windprobe PRIVATE -Wall -Wextra -Werror)
+endif()

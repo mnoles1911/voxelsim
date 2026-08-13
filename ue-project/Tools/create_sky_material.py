@@ -508,6 +508,21 @@ SCALAR_PARAMS = [
     # safely, rather than to a plausible-looking wrong one.
     ("BathyFieldInvSize", 0.0),
     ("BathyFieldValid", 0.0),
+    # 1 while UVoxelWeatherSubsystem is publishing wind, 0 otherwise. The partner
+    # of WindVectorMS below, and the same discipline as BathyFieldValid above:
+    # every wind consumer gates on this and falls back to its own constants when
+    # it is 0.
+    #
+    # WHAT THAT BUYS, concretely: with the weather subsystem off, disabled via
+    # voxel.Weather.Enabled 0, or simply not yet compiled into the running build,
+    # the water reproduces the PRE-WIND lake -- the one the owner signed off on
+    # 2026-08-12 -- rather than going glassy or picking up a default breeze. So
+    # "wind is off" and "wind is broken" both fail to a known-good picture
+    # instead of to two different unknown ones.
+    #
+    # The subsystem writes it LAST, after the values it vouches for, so a
+    # consumer can never see the flag raised over stale wind.
+    ("WindFieldValid", 0.0),
 ]
 
 # (name, r, g, b, a)
@@ -521,6 +536,32 @@ VECTOR_PARAMS = [
     # See the two scalars above. Zero is as good a default as any -- with
     # BathyFieldValid at 0 nothing reads it.
     ("BathyFieldOrigin", 0.0, 0.0, 0.0, 0.0),
+    # THE WIND, written every frame by UVoxelWeatherSubsystem::PublishWind.
+    #
+    #   R = velocity along world +X (NORTH), metres per second
+    #   G = velocity along world +Y (EAST),  metres per second
+    #   B = gust magnitude, metres per second
+    #   A = unused
+    #
+    # A VELOCITY, not a direction plus a speed: the length IS the sustained
+    # speed, so the two cannot go stale with respect to each other. It replaced
+    # a five-parameter draft (WindFlowDirection + WindSpeedMps +
+    # WindSustainedMps + WindGustMps) in which three of the five were the same
+    # quantity stored three ways.
+    #
+    # R IS NORTH. This engine's world axes are X = north, Y = east, Z = up
+    # (VoxelEphemeris.h:43-45), and a material reads R/G/B as x/y/z. The (east,
+    # north) order of a map is the natural one to reach for and IS WRONG HERE --
+    # it reflects every bearing about the 45-degree diagonal and produces
+    # perfectly plausible waves travelling in a direction unrelated to the wind.
+    # That bug was written and caught once already; see
+    # VoxelWeatherSubsystem.cpp's PublishWind.
+    #
+    # DEFAULT ZERO = DEAD CALM, deliberately, and paired with WindFieldValid
+    # below defaulting to 0. A consumer that forgets to gate on the flag gets
+    # calm water rather than a plausible-looking wrong wind, which is the
+    # failure that reports itself.
+    ("WindVectorMS", 0.0, 0.0, 0.0, 0.0),
 ]
 
 

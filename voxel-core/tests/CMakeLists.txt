@@ -42,6 +42,7 @@ add_executable(vxc_tests
   test_fluidoccupancy.cpp
   test_fluidlifecycle.cpp
   test_fluidsprings.cpp
+  test_weather.cpp
 )
 find_package(Threads REQUIRED)
 target_link_libraries(vxc_tests PRIVATE voxelcore Threads::Threads)
