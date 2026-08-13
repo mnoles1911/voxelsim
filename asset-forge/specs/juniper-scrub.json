@@ -18,7 +18,8 @@
     "points": 600,
     "radius_m": 1.0,
     "shape": "wedge",
-    "shell": 0.45,
+    "shell_lower": 0.45,
+    "shell_upper": 0.45,
     "squash": 0.8
   },
   "foliage": {
@@ -28,6 +29,7 @@
     "density": 0.7,
     "droop_m": 0.15,
     "enabled": true,
+    "habit": "radial",
     "min_order": 1,
     "separation": 1.4,
     "squash": 0.8

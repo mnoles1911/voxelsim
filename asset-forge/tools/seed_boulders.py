@@ -16,19 +16,21 @@ All at 5 cm, like everything else. Costs and one limit worth knowing:
   the terrain is already made of, so the whole class is one blocker (the
   streaming bound) from the world rather than two.
 """
+import sys
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
+import seedspec
 from forge import spec as sm
 
 SPECS = Path(__file__).resolve().parents[1] / "specs"
+FORCE = seedspec.parse_force(sys.argv[1:])
 
 
 def make(name, **changes):
     s, rep = sm.patch(sm.default_spec(),
                       dict(name=name, kind="rock", resolution_cm="5", **changes))
-    sm.save(s, SPECS / f"{name}.json")
-    print(f"  {name:<24} " + ("! " + rep.warnings[0] if rep.warnings else "ok"))
+    seedspec.write(s, SPECS / f"{name}.json", rep.warnings, force=FORCE)
 
 
 def main():

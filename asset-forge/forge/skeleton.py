@@ -116,6 +116,19 @@ def grow(spec: dict, rng: np.random.Generator) -> Skeleton:
         tip = add(p + step * nd, tip, nd)
 
     # -- colonization --------------------------------------------------------
+    #
+    # Shadow propagation. In plain space colonization every growth target pulls
+    # equally hard forever, so a branch will happily push into the middle of a
+    # mass of existing wood and leaves -- there is nothing in the model that
+    # knows the space is already taken. Real branches are competing for light,
+    # and a bud that ends up under other foliage does not get to grow. Casting
+    # a shadow downward from everything already grown, and weakening the pull
+    # of targets that fall inside it, is the cheapest faithful version of that:
+    # the crown fills from the outside and the top inward, self-thins where it
+    # is crowded, and stops being a uniform cloud of twigs.
+    shade_amt = float(get(spec, "growth.shade"))
+    shade = _ShadowGrid(spec, step) if shade_amt > 0.0 else None
+
     iterations = 0
     max_iter = int(get(spec, "growth.max_iter"))
     for iterations in range(1, max_iter + 1):
@@ -123,6 +136,8 @@ def grow(spec: dict, rng: np.random.Generator) -> Skeleton:
             break
 
         node_pos = np.asarray(pos)
+        if shade is not None:
+            shade.rebuild(node_pos)
         tree = cKDTree(node_pos)
         dist, idx = tree.query(targets, distance_upper_bound=influence)
         seen = np.isfinite(dist)
@@ -143,7 +158,14 @@ def grow(spec: dict, rng: np.random.Generator) -> Skeleton:
         pull = _normalize(seen_targets - node_pos[owner])
 
         acc = np.zeros_like(node_pos)
-        np.add.at(acc, owner, pull)
+        if shade is not None:
+            # A shaded target still pulls, just less. Dropping it outright made
+            # crowns come apart: a target briefly shadowed by a branch passing
+            # over it would be abandoned for good, and the gap never filled.
+            w = np.exp(-shade_amt * 2.5 * shade.at(seen_targets))
+            np.add.at(acc, owner, pull * w[:, None])
+        else:
+            np.add.at(acc, owner, pull)
         active = np.flatnonzero(np.bincount(owner, minlength=node_pos.shape[0]) > 0)
 
         v = _normalize(acc[active])
@@ -154,9 +176,29 @@ def grow(spec: dict, rng: np.random.Generator) -> Skeleton:
         v = _normalize(v)
 
         new_pos = node_pos[active] + step * v
+
+        # Shade has to decide WHETHER a bud grows, not merely which way it
+        # leans. Weighting the pull vectors alone does almost nothing here,
+        # because the weighted sum is normalised immediately afterwards -- the
+        # magnitude carrying the shade information is thrown away and every
+        # active node advances one step regardless. Measured across five seeds
+        # it moved the node count by 0.1%. Suppressing growth outright is what
+        # a bud in shade actually does.
+        survive = None
+        if shade is not None:
+            lit = np.exp(-shade_amt * 1.1 * shade.at(node_pos[active]))
+            survive = rng.random(active.size) < lit
+            if not survive.any():
+                # Never let shade stall the whole tree: the loop below breaks
+                # out when nothing grew, and a crowded iteration would end
+                # growth for good and leave a stunted tree.
+                survive[int(np.argmax(lit))] = True
+
         grew = False
         for k, par in enumerate(active):
             if new_pos[k, 2] <= 0.0:  # never grow into the ground
+                continue
+            if survive is not None and not survive[k]:
                 continue
             add(new_pos[k], int(par), v[k])
             grew = True
@@ -183,6 +225,59 @@ def grow(spec: dict, rng: np.random.Generator) -> Skeleton:
         targets_left=int(targets.shape[0]),
         iterations=iterations,
     )
+
+
+class _ShadowGrid:
+    """How much of the sky each point in the crown has lost to wood above it.
+
+    A coarse box over the crown, rebuilt each iteration. Shadow is accumulated
+    from the top down: whatever a layer casts falls on the layer below it,
+    spread sideways a little and weakened by a fixed factor, plus whatever new
+    wood that layer contains. Sweeping downward like this costs one blur per
+    layer and gets the same widening cone of shade under each branch that
+    depositing a pyramid per bud would, without the per-bud loop.
+
+    Deliberately coarse -- a cell about a growth step across. This decides
+    which of a thousand targets is worth reaching for, and that judgement does
+    not need to be finer than the distance a branch travels in one step.
+    """
+
+    DECAY = 0.72
+
+    def __init__(self, spec: dict, step: float):
+        radius = float(get(spec, "crown.radius_m")) * 1.7
+        _, top = envelope.crown_bounds(spec)
+        self.cell = max(step, 0.2)
+        self.lo = np.array([-radius, -radius, 0.0])
+        span = np.array([2.0 * radius, 2.0 * radius, max(top * 1.05, self.cell)])
+        self.dims = np.maximum(np.ceil(span / self.cell).astype(int), 2)
+        self.field = np.zeros(tuple(self.dims), np.float32)
+
+    def _index(self, pts: np.ndarray) -> np.ndarray:
+        ijk = np.floor((pts - self.lo) / self.cell).astype(np.int64)
+        return np.clip(ijk, 0, self.dims - 1)
+
+    def rebuild(self, node_pos: np.ndarray) -> None:
+        try:
+            from scipy import ndimage
+        except ImportError:
+            return
+        ijk = self._index(node_pos)
+        wood = np.zeros(tuple(self.dims), np.float32)
+        np.add.at(wood, (ijk[:, 0], ijk[:, 1], ijk[:, 2]), 1.0)
+
+        self.field[:] = 0.0
+        carry = np.zeros(tuple(self.dims[:2]), np.float32)
+        for z in range(self.dims[2] - 1, -1, -1):
+            # Spread sideways as it falls, so the shade under a branch widens
+            # with depth instead of staying a pencil line.
+            carry = ndimage.gaussian_filter(carry, sigma=0.7) * self.DECAY
+            carry = carry + wood[:, :, z]
+            self.field[:, :, z] = carry
+
+    def at(self, pts: np.ndarray) -> np.ndarray:
+        ijk = self._index(pts)
+        return self.field[ijk[:, 0], ijk[:, 1], ijk[:, 2]]
 
 
 def grow_whorl(spec: dict, rng: np.random.Generator) -> Skeleton:
@@ -604,10 +699,19 @@ def _radii(spec: dict, pos: np.ndarray, parent: np.ndarray) -> np.ndarray:
     if root > 1e-9:
         radius *= float(get(spec, "trunk.radius_base_m")) / root
 
-    # Root flare. Thickens the lowest metre and a half of wood, which is what
-    # reads as a tree standing in the ground rather than pushed into it.
+    # Root flare. Thickens the wood just above the ground, which is what reads
+    # as a tree standing IN the ground rather than pushed into it.
+    #
+    # The curve is Weber and Penn's, not a hand-picked one. Theirs falls off
+    # far faster than the squared taper this used to use: it is effectively
+    # spent within the bottom eighth of the trunk, where a fixed one-and-a-half
+    # metres was a large fraction of a small tree and a rounding error on a
+    # large one. Scaling the reach to the tree rather than to a constant is
+    # what makes the same setting look right on a sapling and on an emergent.
     buttress = float(get(spec, "trunk.buttress"))
     if buttress > 0.0:
-        t = np.clip(1.0 - pos[:, 2] / 1.5, 0.0, 1.0)
-        radius = radius * (1.0 + buttress * t**2)
+        height = max(float(get(spec, "height_m")), 1e-3)
+        y = np.clip(pos[:, 2] / height, 0.0, 1.0)
+        flare = (np.power(100.0, np.clip(1.0 - 8.0 * y, -3.0, 1.0)) - 1.0) / 100.0
+        radius = radius * (1.0 + buttress * np.clip(flare, 0.0, None))
     return radius

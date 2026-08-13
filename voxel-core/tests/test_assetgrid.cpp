@@ -153,7 +153,7 @@ VXC_TEST(assetgrid_real_assets_use_materials_the_engine_defines) {
 
     CHECK_EQ(int(pine.maxMaterialId()), 20);  // MAT_LEAF_NEEDLE
     CHECK_EQ(int(daisy.maxMaterialId()), 24); // MAT_LEAF_BLOSSOM
-    CHECK_EQ(int(kMaterialCount), 26);        // through MAT_LEAF_AUTUMN = 25
+    CHECK_EQ(int(kMaterialCount), 47);        // through MAT_BEAK_HORN = 46
     CHECK(pine.materialsWithinEngine());
     CHECK(daisy.materialsWithinEngine());
 }

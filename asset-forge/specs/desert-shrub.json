@@ -18,7 +18,8 @@
     "points": 600,
     "radius_m": 0.7,
     "shape": "vase",
-    "shell": 0.55,
+    "shell_lower": 0.55,
+    "shell_upper": 0.55,
     "squash": 1.0
   },
   "foliage": {
@@ -28,6 +29,7 @@
     "density": 0.58,
     "droop_m": 0.15,
     "enabled": true,
+    "habit": "opposite",
     "min_order": 1,
     "separation": 1.25,
     "squash": 0.8

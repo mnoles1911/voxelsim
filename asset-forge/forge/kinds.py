@@ -48,8 +48,8 @@ KINDS: tuple[Kind, ...] = (
     # They stay separate kinds because the designer authors them separately and
     # they go in different places, not because the code differs.
     Kind("grass", "Grass",
-         "Tufts of blades arcing out from a root crown. Authored at 2 cm — "
-         "at the terrain's 10 cm a tuft is three voxels and there is nothing "
+         "Tufts of blades arcing out from a root crown. Authored at 5 cm — "
+         "at the terrain's 10 cm a tuft is four voxels and there is nothing "
          "to draw.", True,
          ("tuft",)),
     Kind("reed", "Reeds",
@@ -59,6 +59,44 @@ KINDS: tuple[Kind, ...] = (
          "Small flowering plants: a few leaf stems and a few carrying a bloom.",
          True,
          ("tuft",)),
+    # The first animal. It is a kind and not a variation on anything above,
+    # because it is the first asset here that does not stand on the ground: it
+    # is placed IN water, it faces a direction, and it is not meant to persist.
+    # The `detail` group is where that last part is written down.
+    Kind("fish", "Fish",
+         "Swimming detail entities, from a 20 cm minnow to a 9 m whale shark. "
+         "A lofted body with thin fins, coloured by countershading plus one "
+         "mark. Voxel size is per species: 1 cm for small fish, 5 cm for "
+         "sharks.", True,
+         ("fish", "detail")),
+    # THE SAME GENERATOR AS `fish`, and a separate kind for the same reason
+    # grass, reeds and flowers are three kinds behind one tuft generator: the
+    # designer authors them separately, they go in different places, and each
+    # section should show only the sliders it can use. A whale has no pelvic
+    # fin, no anal fin and no barbels; a fish has no blowhole.
+    #
+    # What differs in the GEOMETRY is small, and it is four parameters: the
+    # tail lies horizontally, the cross-section runs from a barrel at the
+    # middle to a blade at the wrist, the flippers are long and narrow, and
+    # there is a blowhole. That is not a second generator's worth of
+    # difference, which is why it is not one. Contrast `bird` below, which IS
+    # a second generator because a bird is jointed and a fish is not.
+    Kind("cetacean", "Whales & dolphins",
+         "Air-breathing marine mammals: a horizontal fluke, flippers, a "
+         "blowhole, and no pelvic or anal fin. Voxel size is per species — a "
+         "25 m whale is authored at 10 cm.", True,
+         ("fish", "detail")),
+    # The second animal, and the first JOINTED one. A fish is a single solid
+    # whose cross-section changes along one axis; a bird is a body, a neck, a
+    # head, a bill, a tail and two wings at angles to each other, and the
+    # angles are most of what tells one from another. That is why it is a
+    # separate generator rather than a fish with different sliders.
+    Kind("bird", "Birds",
+         "Small flying detail entities, drawn to read at 20-90 voxels long. "
+         "A tilted body with a neck, a bill and a tail fan, wings either "
+         "folded or spread, and three markings on three regions. Authored at "
+         "1 cm.", True,
+         ("bird", "flock")),
 )
 
 BY_KEY = {k.key: k for k in KINDS}

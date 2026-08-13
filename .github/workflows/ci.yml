@@ -179,6 +179,73 @@ jobs:
       - name: Test (incl. golden tiles)
         run: cd terrain-service && python -m pytest -q
 
+  # asset-forge had no CI job of any kind until this one, while its README named
+  # `python -m forge.cli selftest` as one of the two things to run before calling
+  # a change done. Nothing enforced it, and the generator's own measurements were
+  # the same story one level down: `pipeline.build` has been writing
+  # `airborne_kept` and `orphans_removed` into every asset's stats and no code
+  # anywhere read either key. Every floating-rock defect in that library was
+  # found by a person looking at a render.
+  #
+  # Two steps, because they answer different questions and one is much cheaper
+  # than the other. `selftest` is determinism, the .vox/.vxa round trips and
+  # whether forge/palette.py is still what the engine header says (that is the
+  # asset-forge half of the palette-drift guard; the UE .ush half is checked by
+  # tools/compile-shaders.ps1 in the Shader compilation job below, and there is
+  # deliberately no third copy). `buildcheck` builds every spec in specs/ and
+  # fails on a spec-validation warning, on a health problem, and on any build
+  # that comes out as more than ONE connected piece.
+  #
+  # No path filter on purpose. A rock defect here is usually caused by a change
+  # to forge/rock.py, but the specs are data and the last two defects were spec
+  # tuning, so scoping this job to a subtree would have missed them.
+  #
+  # WHAT THIS JOB DOES NOT COVER, and why. Four specs dominate the wall clock
+  # and one of them cannot run here at all: `hero-arch-colossal` is 26M voxels
+  # at its authored 5 cm, needs a 23.6 GB working set, takes 27 minutes on a
+  # dev box and raises MemoryError on some seeds. So the library is built in
+  # two passes -- 63 specs at their authored size, then the four heavy ones at
+  # 20 cm. The coarse pass is a WEAKER check (pieces touching at a single voxel
+  # can merge on a coarser lattice, and a thin neck can part), and it is run
+  # rather than skipped because a hero that comes apart into six pieces still
+  # comes apart at 20 cm -- that is how large the defects being caught here are.
+  # A hero regression that only shows at 5 cm is caught by a person running
+  # `python tools/buildcheck.py --only-heavy` locally, not by this job.
+  #
+  # Seed 1 only. Three seeds is the local sign-off command (`--seeds 1 2 3`),
+  # not the per-PR gate.
+  asset-forge:
+    name: asset-forge (selftest + every spec)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # asset-forge has no requirements file: its dependencies are declared in
+      # prose in asset-forge/README.md ("Needs numpy, scipy, pillow"). This list
+      # was verified against the imports rather than copied from that line --
+      # numpy and Pillow throughout, scipy for ndimage (the connectivity and
+      # support passes) and spatial.cKDTree (clump separation). The app adds
+      # nothing: it is stdlib http.server and a hand-written page.
+      - name: Install deps
+        run: python -m pip install numpy scipy pillow
+      # --quick skips selftest's own whole-library one-piece pass, and says so
+      # in its output. Nothing is lost: the next step runs that same rule over
+      # every spec and adds the health and spec-warning checks on top. Without
+      # it this job would build the entire library twice for one verdict.
+      - name: Selftest
+        run: cd asset-forge && python -m forge.cli selftest --quick
+      # Measured on a dev box at seed 1: 7 minutes for the 63, 3 minutes for the
+      # heavy four at 20 cm. 10 cm was tried for the coarse pass and abandoned
+      # -- hero-arch-colossal alone runs over 20 minutes there, against 110 s at
+      # 20 cm, because the size fit re-searches on a grid 8x larger.
+      - name: Build every spec (one asset per generation, no warnings)
+        run: cd asset-forge && python tools/buildcheck.py --skip-heavy
+      - name: The four heavy heroes, on a coarse lattice
+        run: cd asset-forge && python tools/buildcheck.py --only-heavy --res 20
+
   shader-compile:
     name: Shader compilation (DXIL + SPIR-V)
     runs-on: windows-latest

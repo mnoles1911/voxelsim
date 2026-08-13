@@ -3,43 +3,47 @@
   "species": "bramble-thicket",
   "kind": "bush",
   "seed": 1,
-  "spec_hash": "07d83ea26af4d3a4",
+  "spec_hash": "e094dc5bedffe35f",
   "stats": {
     "seed": 1,
-    "spec_hash": "07d83ea26af4d3a4",
+    "spec_hash": "e094dc5bedffe35f",
     "kind": "bush",
-    "nodes": 189,
-    "segments": 188,
+    "nodes": 141,
+    "segments": 140,
     "max_order": 3,
-    "iterations": 16,
+    "iterations": 31,
     "targets_left": 0,
-    "clumps": 24,
-    "voxel_cm": 2.0,
-    "height_m": 1.5,
+    "clumps": 20,
+    "orphans_removed": 3,
+    "airborne_kept": [],
+    "pieces_built": 3,
+    "voxel_cm": 5.0,
+    "height_m": 1.55,
+    "length_m": 1.85,
     "footprint_m": [
-      1.76,
-      1.7
+      1.85,
+      2.05
     ],
-    "grid_mb": 1.2,
+    "grid_mb": 0.1,
     "extent_vox": [
-      88,
-      85,
-      75
+      37,
+      41,
+      31
     ],
-    "voxels": 65949,
+    "vox_models_needed": 1,
+    "voxels": 5321,
     "by_material": {
-      "16": 3057,
-      "17": 52,
-      "19": 62840
+      "16": 608,
+      "19": 4713
     },
-    "ground_contact": 26,
-    "ms_grow": 13.1,
-    "ms_raster": 62.4,
+    "ground_contact": 12,
+    "ms_grow": 145.9,
+    "ms_raster": 59.1,
     "wood_connected": 1.0,
     "wood_detached": 0,
     "attached_frac": 1.0,
     "detached": 0,
-    "ms_total": 94.8
+    "ms_total": 208.8
   },
   "problems": [],
   "vox_models": 1

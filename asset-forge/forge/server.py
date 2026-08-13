@@ -83,6 +83,9 @@ class Job:
     seeds: list[int]
     scale: int
     preview_cm: float = 10.0
+    # Which of the three review cameras this kind wants; see
+    # `forge.render.camera_for`, which is the ONE place that decides.
+    camera: str = "iso"
     tiles: dict[int, Tile] = field(default_factory=dict)
     done: int = 0
     cancelled: bool = False
@@ -141,11 +144,28 @@ class Forge:
         # One scale for the whole batch so tiles are comparable by size, the
         # same reason contact sheets do it.
         preview_cm = preview_resolution(spec)
-        scale = render.scale_for(
-            [render.predicted_extent(spec, preview_cm / 100.0)], TILE_PX
-        )
+        # Each kind is previewed through its own camera, and WHICH ONE is
+        # decided in exactly one place -- `forge.render.camera_for`.
+        #
+        # The isometric looks down onto the asset, which is exactly where a
+        # rock keeps the thing that defines it. It has now hidden three
+        # separate features and produced three wrong verdicts: a tor stack read
+        # as "overlapping plates" when it is four tiers of boulders, a balanced
+        # rock read as a domed lump when its neck is measurably half the width
+        # of its cap, and BOTH arch heroes read as solid stone when they have a
+        # 40%-plus opening. The last one was reported by the owner as "no hole
+        # in the rock", and the hole was there the whole time.
+        #
+        # A low camera sees over a lip if what is behind stands 0.18 m higher
+        # per metre of gap; the isometric needs 0.71 m. That ratio is the whole
+        # difference, and it is why this is a camera fix and not an asset fix.
+        # A fish needed a third camera again, for a different reason: it is
+        # flat and it has a front.
+        camera = render.camera_for(spec)
+        scale = render.scale_for_camera(
+            [render.predicted_extent(spec, preview_cm / 100.0)], camera, TILE_PX)
         job = Job(id=uuid.uuid4().hex[:12], spec=spec, seeds=seeds, scale=scale,
-                  preview_cm=preview_cm)
+                  preview_cm=preview_cm, camera=camera)
         with self.lock:
             self.jobs[job.id] = job
             self.order.append(job.id)
@@ -160,13 +180,24 @@ class Forge:
         for seed in job.seeds:
             if job.cancelled:
                 return
-            key = (digest, seed, job.scale, job.preview_cm)
+            key = (digest, seed, job.scale, job.preview_cm, job.camera)
             tile = self._cache_get(key)
             if tile is None:
                 tile = Tile(seed=seed)
                 try:
                     tree = pipeline.build(job.spec, seed, resolution_cm=job.preview_cm)
-                    img = render.render(tree.grid, scale=job.scale)
+                    g = tree.grid
+                    if job.camera == "side":
+                        # Which quarter turn to show is MEASURED, not fixed:
+                        # `best_turn` scores daylight through the silhouette
+                        # first, then overhang. A fin with a hole bored across
+                        # its short axis is open from one direction and solid
+                        # from ninety degrees round, so a fixed angle shows the
+                        # wrong side of it half the time. Rocks only -- a fish
+                        # is BUILT facing its camera and a measured turn would
+                        # sometimes show the animal end-on.
+                        g = render.turned(g, render.best_turn(g.data))
+                    img = render.view(g, job.camera, scale=job.scale)
                     buf = io.BytesIO()
                     img.save(buf, "PNG")
                     tile.png = buf.getvalue()
@@ -257,6 +288,27 @@ def viewer_resolution(spec: dict, budget: int | None = None) -> float:
     return _finest_within(spec, budget, 0.023)
 
 
+def thumb_grid(grid, spec: dict):
+    """The grid oriented the way its picture should be taken.
+
+    The CAMERA is `render.camera_for`, in one place, read by everybody. The
+    TURN is a second decision and it was being made in two places and skipped
+    in a third -- the gallery tile turned a rock by measurement, the library
+    thumbnail did not, so `hero-arch-colossal` was baked with a portrait of its
+    own wall. An arch is a hole from one direction and a solid from ninety
+    degrees round; on that asset the difference is 65% open sky against 0.1%.
+
+    Rocks only, and for the reason `elevation.turn_for` gives: the measure
+    scores daylight and then overhang, which are questions about stone. A tree
+    has neither, so it would pick between four equivalent views on noise, and
+    an animal is BUILT facing its camera -- a measured turn would sometimes
+    show it end-on.
+    """
+    if render.camera_for(spec) == "side":
+        return render.turned(grid, render.best_turn(grid.data))
+    return grid
+
+
 def keep(spec: dict, seed: int) -> dict:
     """Save a tree the designer approved.
 
@@ -273,7 +325,8 @@ def keep(spec: dict, seed: int) -> dict:
     specmod.save(tree.realized, out / "realized.json")
     models = vox.write(tree.grid, out / "tree.vox", name=entry_id)
     vxa.write(tree.grid, out / "tree.vxa")
-    render.render(tree.grid, target_px=DETAIL_PX).save(out / "thumb.png")
+    render.view(thumb_grid(tree.grid, spec), render.camera_for(spec),
+                target_px=DETAIL_PX).save(out / "thumb.png")
     meta = {
         "id": entry_id,
         "species": name,
@@ -286,6 +339,37 @@ def keep(spec: dict, seed: int) -> dict:
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return meta
+
+
+def _size_m(spec: dict, kind: str) -> float:
+    """The number that means "how big is it" for this kind.
+
+    Reading `height_m` off a rock or a fish gives the untouched default -- a
+    12 m fish -- and both the species list and the biome coverage tab print it
+    as though it meant something.
+    """
+    if kind == "rock":
+        return specmod.get(spec, "rock.size_m")
+    if kind in ("fish", "cetacean"):
+        return specmod.get(spec, "fish.length_m")
+    if kind == "bird":
+        return specmod.get(spec, "bird.length_m")
+    return specmod.get(spec, "height_m")
+
+
+def _shape_word(spec: dict, kind: str) -> str:
+    """One word for what shape this species is, per kind."""
+    if kind == "rock":
+        return specmod.get(spec, "materials.rock")
+    if kind in ("fish", "cetacean"):
+        return specmod.get(spec, "fish.caudal_shape")
+    if kind == "bird":
+        # The POSE, not the tail shape. A bird's tail has seven outlines and a
+        # one-word summary of a species is better spent saying whether it is
+        # perched or in the air, which is the thing that decides its camera,
+        # its grid size and half its parameter set.
+        return specmod.get(spec, "bird.pose")
+    return specmod.get(spec, "crown.shape")
 
 
 def library_list() -> list[dict]:
@@ -427,9 +511,8 @@ class Handler(BaseHTTPRequestHandler):
                             members.append({
                                 "name": name, "weight": w, "kind": kind,
                                 "kept": kept.get(name, 0),
-                                "size_m": (specmod.get(s, "rock.size_m") if kind == "rock"
-                                           else specmod.get(s, "height_m")),
-                                "model": (kind if kind == "rock"
+                                "size_m": _size_m(s, kind),
+                                "model": (kind if kind in ("rock", "fish", "cetacean", "bird")
                                           else specmod.get(s, "growth.model")),
                             })
                     members.sort(key=lambda m: -m["weight"])
@@ -456,12 +539,10 @@ class Handler(BaseHTTPRequestHandler):
                         "file": p.name,
                         "kind": kind,
                         "hash": specmod.spec_hash(s),
-                        "size_m": (specmod.get(s, "rock.size_m") if kind == "rock"
-                                   else specmod.get(s, "height_m")),
+                        "size_m": _size_m(s, kind),
                         "height_m": specmod.get(s, "height_m"),
                         "resolution_cm": specmod.get(s, "resolution_cm"),
-                        "shape": (specmod.get(s, "materials.rock") if kind == "rock"
-                                  else specmod.get(s, "crown.shape")),
+                        "shape": _shape_word(s, kind),
                         "notes": specmod.get(s, "notes"),
                         "biomes": biomelib.summary(s),
                     }
@@ -503,7 +584,12 @@ class Handler(BaseHTTPRequestHandler):
             tree = pipeline.build(spec, int(q["seed"]),
                                   resolution_cm=viewer_resolution(spec))
             buf = io.BytesIO()
-            render.render(tree.grid, target_px=DETAIL_PX).save(buf, "PNG")
+            # The SAME camera the gallery tile used. These were different
+            # -- tiles went through `camera_for` and the detail overlay was
+            # hardcoded to the isometric -- so clicking a rock changed the
+            # angle it was being judged from without saying so.
+            render.view(tree.grid, render.camera_for(spec),
+                        target_px=DETAIL_PX).save(buf, "PNG")
             return self._send(200, buf.getvalue(), "image/png", cache=True)
 
         if path == "/api/voxels":

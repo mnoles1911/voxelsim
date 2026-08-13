@@ -1,0 +1,45 @@
+{
+  "id": "hero-arch-colossal-0006",
+  "species": "hero-arch-colossal",
+  "kind": "rock",
+  "seed": 6,
+  "spec_hash": "736c69138f4db4f3",
+  "stats": {
+    "seed": 6,
+    "spec_hash": "736c69138f4db4f3",
+    "kind": "rock",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 126,
+    "airborne_kept": [],
+    "pieces_built": 9,
+    "voxel_cm": 10.0,
+    "height_m": 58.4,
+    "length_m": 92.6,
+    "footprint_m": [
+      92.6,
+      32.1
+    ],
+    "grid_mb": 420.3,
+    "extent_vox": [
+      926,
+      321,
+      584
+    ],
+    "vox_models_needed": 24,
+    "voxels": 49336892,
+    "by_material": {
+      "4": 49336892
+    },
+    "ground_contact": 67381,
+    "ms_grow": 2.8,
+    "ms_raster": 899173.0,
+    "ms_total": 902547.0
+  },
+  "problems": [],
+  "vox_models": 18
+}

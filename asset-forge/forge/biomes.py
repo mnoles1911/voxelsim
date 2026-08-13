@@ -34,31 +34,51 @@ class Biome:
 # unplantable entries below read as the deliberate exceptions they are.
 _GROWS = ("tree", "bush", "rock", "grass", "reed", "flower")
 
+# Fish are hosted by the biome of the LAND AROUND THE WATER, not by a water
+# biome, because that is what the engine classifies: a river running through
+# temperate forest is classified temperate forest, and only open sea below -3 m
+# comes out as OCEAN. So a brown trout is a temperate-forest fish and a reef
+# fish is an ocean one, and the biome weights on a fish spec mean "which
+# landscape's rivers and lakes hold this species".
+_SWIMS = _GROWS + ("fish", "cetacean")
+
+# Birds go wherever anything else does AND in the two places nothing else can.
+# A gull is an ocean species and a raven and a ptarmigan live on bare rock, so
+# the two biomes that were carved out as exceptions -- one for having no ground
+# and one for being too steep to stand on -- are both perfectly good bird
+# habitat. They are the first kind for which that is true.
+_FLIES = _SWIMS + ("bird",)
+
 BIOMES: tuple[Biome, ...] = (
+    # OCEAN HOSTS SOMETHING NOW. It was empty because nothing that grows can
+    # stand under the sea, and `plantable` said so; a fish is the first asset
+    # that belongs there and the first reason `hosts` had to be separate from
+    # `plantable` on this row rather than only on bare rock.
     Biome(0, "ocean", "Ocean", "mud",
-          "below -3 m; decided before climate", False, ()),
+          "below -3 m; decided before climate", False, ("fish", "cetacean", "bird")),
     Biome(1, "beach", "Beach", "sand",
-          "-3 m to +4 m around sea level; decided before climate", True, _GROWS),
+          "-3 m to +4 m around sea level; decided before climate", True, _FLIES),
     Biome(2, "grassland", "Grassland", "grass",
-          "dry and not hot, or semi-dry without a strong wet season", True, _GROWS),
+          "dry and not hot, or semi-dry without a strong wet season", True, _FLIES),
     Biome(3, "temperate_forest", "Temperate forest", "topsoil",
-          "moderate to wet, mild; the default forested band", True, _GROWS),
+          "moderate to wet, mild; the default forested band", True, _FLIES),
     Biome(4, "rainforest", "Rainforest", "jungle soil",
-          "wet (>1600 mm/yr) and warm (>=18 C)", True, _GROWS),
+          "wet (>1600 mm/yr) and warm (>=18 C)", True, _FLIES),
     Biome(5, "desert", "Desert", "sand",
-          "arid (<400 mm/yr) and hot (>=24 C)", True, _GROWS),
+          "arid (<400 mm/yr) and hot (>=24 C)", True, _FLIES),
     Biome(6, "savanna", "Savanna", "savanna grass",
-          "warm with a strongly seasonal wet season", True, _GROWS),
+          "warm with a strongly seasonal wet season", True, _FLIES),
     Biome(7, "taiga", "Taiga", "podzol",
-          "cold: mean annual temperature below 5 C", True, _GROWS),
+          "cold: mean annual temperature below 5 C", True, _FLIES),
     Biome(8, "tundra_alpine", "Tundra / alpine", "permafrost or rock",
-          "above the treeline (900 m at 0 C, +150 m per degree)", True, _GROWS),
+          "above the treeline (900 m at 0 C, +150 m per degree)", True, _FLIES),
     # Not plantable, but very much not empty. The cliff gate fires before the
     # climate table, so this is every steep face in the world -- exactly where
     # boulders and scree belong, and the reason `hosts` exists separately from
     # `plantable` rather than reusing it.
     Biome(9, "bare_rock", "Bare rock", "rock",
-          "ground steeper than a 70% grade (~35 degrees)", False, ("rock",)),
+          "ground steeper than a 70% grade (~35 degrees)", False,
+          ("rock", "bird")),
 )
 
 BY_KEY = {b.key: b for b in BIOMES}

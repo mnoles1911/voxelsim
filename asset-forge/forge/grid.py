@@ -26,12 +26,43 @@ import math
 
 import numpy as np
 
-VOXEL_M = 0.10  # default metres per voxel, matches vxc::kVoxelSizeMm = 100
+# Fallback metres per voxel for callers that construct a grid without a spec.
+# This is the TERRAIN lattice (vxc::kVoxelSizeMm = 100), not the asset one:
+# every species authors at 5 cm and nests 2:1 inside it. The comment here used
+# to read as though 10 cm were what assets are built at, which stopped being
+# true when the library moved to 5 cm. Real builds take their size from
+# `resolution_cm` on the spec and never reach this.
+VOXEL_M = 0.10
 
 
 def m_to_vox(metres, voxel_m: float = VOXEL_M):
     """Metres -> voxels at a given resolution. Works on scalars and arrays."""
     return metres / voxel_m
+
+
+def ground_band(occ: np.ndarray, voxel_m: float) -> tuple[int, int]:
+    """The z range that counts as touching the ground: (z0, tol).
+
+    A voxel at height `z0 + tol` or below is standing on the ground. Two callers
+    need this and they must agree, because between them they decide what gets
+    fractured and what gets deleted: `rock._block_relief` refuses to open joints
+    over ground the stone never reaches, and `pipeline._drop_airborne` removes
+    debris with nothing underneath it. Two copies of one rule drifting apart is
+    the failure this project repeats, and here it would mean carving on one
+    definition and cleaning up on another.
+
+    The band is generous on purpose, in BOTH an absolute and a relative sense,
+    because being too strict has already cost twice. Relative alone proposed
+    deleting five whole pinnacles from a hero, one of them a 23 m blade whose
+    foot had been trimmed 40 cm by weathering. Absolute alone -- or rather, its
+    absence -- then reported a 0.7 m limestone pavement as more than half
+    airborne, because 2% of a slab that flat is nothing at all.
+    """
+    zs = np.flatnonzero(occ.any(axis=(0, 1)))
+    if zs.size == 0:
+        return 0, 0
+    z0, z1 = int(zs[0]), int(zs[-1])
+    return z0, max(2, int(0.02 * (z1 - z0)), int(round(0.25 / max(voxel_m, 1e-6))))
 
 
 def dense_bytes(shape) -> int:
@@ -160,8 +191,23 @@ class VoxelGrid:
         density: float = 1.0,
         squash: float = 1.0,
         only_air: bool = True,
+        rough: float = 0.0,
+        along: np.ndarray | None = None,
+        stretch: float = 1.0,
     ) -> None:
         """A ragged ellipsoid, for foliage clumps.
+
+        `along` and `stretch` elongate the clump down the twig it hangs from.
+        Leaves are borne on a SHOOT -- a run of twenty to sixty centimetres of
+        new growth -- not at a point, so a clump drawn as a ball is the wrong
+        primitive however well its outline is broken up. It also removes the
+        last source of orientation symmetry in a canopy: balls have no
+        direction, so a crown of them has none either, and it reads as placed
+        rather than grown. Twig directions are irregular, and once the clumps
+        inherit them the arrangement stops looking laid out.
+
+        The elongation preserves volume -- semi-axes stretch along the twig and
+        shrink across it -- so `clump_radius_m` keeps meaning what it did.
 
         `density` below 1 opens the clump up, which is what stops a canopy
         reading as a solid green lump. It is the exact fraction of the ball
@@ -177,17 +223,99 @@ class VoxelGrid:
         out of it. Three sine waves in random directions cost almost nothing and
         make the holes big enough to be holes.
         """
-        dx, dy, dz = _ball_offsets(_quantize(r_vox))
-        if squash != 1.0:
-            keep = (dx * dx + dy * dy + (dz / max(squash, 1e-3)) ** 2) <= r_vox * r_vox + 1e-6
+        # SQUASH IS PART OF THE ELLIPSOID, not a second test after it.
+        #
+        # It used to be applied afterwards, as `dx^2 + dy^2 + (dz/squash)^2 <=
+        # r_vox^2` -- a SPHERE of the unstretched radius. That rejects anything
+        # further than `r_vox` from the centre in x or y, which is precisely the
+        # elongation the line above had just built. Measured on one clump with
+        # `r_vox` 8 and `stretch` 2.2: length along the twig 35 voxels with
+        # `squash` 1.0, and 17 with `squash` 0.85 -- less than half, while the
+        # vertical extent it was supposed to be flattening did not move at all.
+        # Every one of the 21 trees and bushes in the library authors a squash
+        # other than 1, so the shoot shape was being clipped back to a ball on
+        # ALL of them, and the "clumps are shoots, not balls" work was doing
+        # roughly nothing outside its own unit test.
+        #
+        # Folding it in instead: test each offset's UNSQUASHED preimage against
+        # the prolate ellipsoid, which is the same thing as flattening the
+        # finished shoot vertically. Volume still scales with `squash` exactly
+        # as it did when this was a sphere, so the authored values keep meaning
+        # what they did.
+        sq = max(squash, 1e-3)
+        if along is not None and stretch > 1.01:
+            a = r_vox * stretch                    # semi-axis down the twig
+            b = r_vox / math.sqrt(stretch)         # semi-axis across it
+            # The sampling ball has to reach `a` in x/y and `a * sq` in z, so a
+            # squash above 1 (a clump taller than it is wide -- river-broadleaf
+            # authors 1.15) is not silently cropped at the top.
+            dx, dy, dz = _ball_offsets(_quantize(a * max(sq, 1.0)))
+            zs = dz / sq
+            u = dx * along[0] + dy * along[1] + zs * along[2]
+            perp2 = np.maximum(dx * dx + dy * dy + zs * zs - u * u, 0.0)
+            keep = (u / a) ** 2 + perp2 / (b * b) <= 1.0 + 1e-6
             dx, dy, dz = dx[keep], dy[keep], dz[keep]
+        else:
+            dx, dy, dz = _ball_offsets(_quantize(r_vox * max(sq, 1.0)))
+            if squash != 1.0:
+                keep = (dx * dx + dy * dy
+                        + (dz / sq) ** 2) <= r_vox * r_vox + 1e-6
+                dx, dy, dz = dx[keep], dy[keep], dz[keep]
         if dx.size == 0:
             return
+
+        # Break the OUTLINE, before anything thins the inside.
+        #
+        # A clump was a perfect ball, on a quantized radius, so clumps of
+        # similar size came out byte-identical -- a canopy of repeated discs
+        # with concentric stair-step rings around each one. That is the same
+        # defect the rocks had, and it has the same single fix: displace the
+        # surface with coherent noise BEFORE it becomes voxels. Thinning the
+        # interior cannot touch it. You can hollow a sphere as much as you
+        # like and its silhouette is still a sphere, which is exactly why
+        # turning `density` down opened the clumps up without ever making them
+        # stop looking like balls.
+        #
+        # The phases come from `rng`, so two clumps of identical radius are no
+        # longer identical objects -- which is the other half of why a canopy
+        # read as repeated stamps.
+        # Normalised radius: 1 at the surface whatever the clump's shape is.
+        # Roughness and thinning both used raw distance, which is the same thing
+        # only for a sphere -- on an elongated clump it clipped the ends straight
+        # back off and handed back the ball the elongation was there to avoid.
+        # Measured in the SAME unsquashed space the shape was cut in, for the
+        # same reason the cut is: a q built from raw distance is a sphere's
+        # measure, and using it on a flattened shoot makes `rough` and `density`
+        # eat the ends and the ball comes back by the other door.
+        if along is not None and stretch > 1.01:
+            zs = dz / sq
+            u = dx * along[0] + dy * along[1] + zs * along[2]
+            perp2 = np.maximum(dx * dx + dy * dy + zs * zs - u * u, 0.0)
+            q = np.sqrt((u / (r_vox * stretch)) ** 2
+                        + perp2 / (r_vox * r_vox / stretch))
+        else:
+            q = np.sqrt(dx * dx + dy * dy + (dz / sq) ** 2) / max(r_vox, 1e-6)
+
+        if rough > 0.0 and r_vox >= 2.0:
+            d = np.sqrt(dx * dx + dy * dy + dz * dz)
+            safe = np.maximum(d, 1e-6)
+            warp = np.zeros(dx.size)
+            for _ in range(3):
+                v = rng.normal(size=3)
+                v /= max(float(np.linalg.norm(v)), 1e-9)
+                # Low frequency ON PURPOSE: a couple of lobes across the clump
+                # is a leaf mass, a dozen is a sea urchin.
+                freq = 0.9 + 1.6 * rng.random()
+                warp += np.sin((dx * v[0] + dy * v[1] + dz * v[2]) / safe * freq
+                               + rng.random() * 2.0 * math.pi)
+            keep = q <= 1.0 + rough * 0.42 * warp / 3.0
+            dx, dy, dz, q = dx[keep], dy[keep], dz[keep], q[keep]
+            if dx.size == 0:
+                return
         if density < 1.0:
             # Bias retention toward the clump centre so it thins at the edges
             # rather than uniformly.
-            d = np.sqrt(dx * dx + dy * dy + dz * dz) / max(r_vox, 1e-6)
-            score = 1.0 - 0.55 * d
+            score = 1.0 - 0.55 * q
             if r_vox >= 2.0:
                 base = 2.0 * math.pi / max(r_vox * 0.6, 1.5)
                 noise = np.zeros(dx.size)

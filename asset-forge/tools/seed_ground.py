@@ -21,18 +21,20 @@ the specs below reflect that. Three rules came out of the A/B:
 Grass and reeds are MAT_GRASS and MAT_SAVANNA_GRASS, which the engine already
 has, so they need no material append. Flowers need a bloom colour and do.
 """
+import sys
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
+import seedspec
 from forge import spec as sm
 
 SPECS = Path(__file__).resolve().parents[1] / "specs"
+FORCE = seedspec.parse_force(sys.argv[1:])
 
 
 def make(name, **changes):
     s, rep = sm.patch(sm.default_spec(), dict(name=name, resolution_cm="5", **changes))
-    sm.save(s, SPECS / f"{name}.json")
-    print(f"  {name:<26} " + ("! " + rep.warnings[0] if rep.warnings else "ok"))
+    seedspec.write(s, SPECS / f"{name}.json", rep.warnings, force=FORCE, width=26)
 
 
 def main():

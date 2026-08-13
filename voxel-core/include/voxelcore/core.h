@@ -378,6 +378,81 @@ enum Material : MaterialId {
     MAT_BARK_PALE = 23,      // birch and aspen: white/silver bark
     MAT_LEAF_BLOSSOM = 24,   // cherry and other flowering species
     MAT_LEAF_AUTUMN = 25,    // seasonal turn
+
+    // --- CREATURE MATERIALS ------------------------------------------------
+    // Skin colours for the environment animals (asset-forge `fish` kind, and
+    // whatever animals follow it). Asset materials in every sense that matters
+    // to the renderer -- the terrain amplifier never emits one -- so they sit
+    // after the ASSET MATERIALS banner rather than getting a second one that
+    // `gen_material_palette_ush.py` would have to learn about.
+    //
+    // NAMED FOR WHAT THEY LOOK LIKE, NOT FOR WHAT WEARS THEM. Fish are the
+    // first animal here and will not be the last: a frog is MAT_SKIN_GREEN, a
+    // trout's back is MAT_SKIN_OLIVE, and a clownfish and a goldfish are both
+    // MAT_SKIN_ORANGE. Ten entries because authoring the first ten species
+    // with fewer did not work -- six terrain materials come close enough to be
+    // tempting and each is wrong in a way that shows on a twelve-voxel flank.
+    // See asset-forge/docs/fish-colour-proposal.md.
+    //
+    // The appearance numbers for these sit at the QUIET end of every range in
+    // materialpalette.h, which is the opposite end from foliage and gravel. An
+    // animal is one smooth creature, not a granular surface; at foliage's
+    // jitter of 58/255 a flank reads as television static.
+    MAT_SKIN_DARK = 26,      // near-black: eyes, stripes, bars, the top of a back
+    MAT_SKIN_PALE = 27,      // off-white belly, the pale half of countershading
+    MAT_SKIN_SILVER = 28,    // bright silver flank; the commonest fish colour there is
+    MAT_SKIN_OLIVE = 29,     // olive-green back: trout, perch, pike
+    MAT_SKIN_BROWN = 30,     // warm brown: bottom fish, speckled backs
+    MAT_SKIN_ORANGE = 31,    // clownfish, goldfish, koi
+    MAT_SKIN_YELLOW = 32,    // reef yellow
+    MAT_SKIN_RED = 33,       // red fins, rudd, snapper
+    MAT_SKIN_BLUE = 34,      // reef blue and the blue-green of open water
+    MAT_SKIN_GREEN = 35,     // bright green: wrasse, weed-bed fish
+
+    // --- PLUMAGE MATERIALS -------------------------------------------------
+    // Feather and bill colours for the asset-forge `bird` kind. Asset
+    // materials in every sense the renderer cares about, exactly as the
+    // creature skins above are, so they stay under the ASSET MATERIALS banner
+    // rather than getting one of their own that
+    // `gen_material_palette_ush.py` would have to learn about. The terrain
+    // amplifier never emits one.
+    //
+    // ELEVEN, AND THE REASON IS A MEASUREMENT RATHER THAN A TASTE. Delhey 2015
+    // took 46,559 reflectance spectra over 555 species and found melanin is
+    // 74% of a bird's plumage AREA and 7% of the colour GAMUT, while
+    // structural colour is 7% of the area and 45% of the gamut. So a palette
+    // weighted the way a field guide is weighted comes out browns and greys,
+    // and a raven, a pigeon and a sparrow read as three grey-brown lozenges.
+    // A stylised library has to over-weight the rare colours deliberately.
+    //
+    // The twenty species in the library fill 160 material slots between them:
+    // 92 of those are one of these eleven and 68 are one of the ten skins
+    // above, which is why the ask was eleven and not twenty-five. Four of
+    // these are NEUTRALS the fish set has no equivalent for (a fish belly is
+    // cream, not white; the one grey in the skin set is the mirror-flanked
+    // silver; there is no dark cool grey and no sandy tan anywhere in the
+    // palette), six are SATURATED HUES, and one is keratin.
+    //
+    // THE BILL IS ITS OWN MATERIAL BECAUSE IT IS THE CHEAPEST IDENTIFYING
+    // FEATURE A BIRD HAS. Pixel Logic records that Super Mario World's
+    // Swoopers are bats that read as birds purely because their nose was
+    // coloured orange -- an orange protrusion in the head position converts a
+    // bat into a bird. Yellow and orange bills use MAT_SKIN_YELLOW and
+    // MAT_SKIN_ORANGE, so only the grey one is new.
+    //
+    // See asset-forge/docs/bird-colour-proposal.md for the per-entry argument
+    // and the contrast numbers each one was chosen against.
+    MAT_PLUME_WHITE = 36,    // true white: gull, egret, ptarmigan, wing bars
+    MAT_PLUME_GREY = 37,     // neutral mid grey: pigeon, gull mantle, tit
+    MAT_PLUME_SLATE = 38,    // dark cool grey: heron, jay wing, falcon back
+    MAT_PLUME_BUFF = 39,     // sandy tan: lark, gamebird, hoopoe, female duck
+    MAT_PLUME_RUFOUS = 40,   // chestnut: robin breast, kestrel back, jay body
+    MAT_PLUME_CRIMSON = 41,  // bright scarlet: macaw, woodpecker nape
+    MAT_PLUME_LIME = 42,     // yellow-green: parrot, greenfinch, bee-eater
+    MAT_PLUME_CYAN = 43,     // electric turquoise: kingfisher, roller, macaw
+    MAT_PLUME_LILAC = 44,    // violet: jay covert, pigeon and starling gloss
+    MAT_PLUME_IRIDESCENT = 45, // saturated dark teal: starling, mallard head
+    MAT_BEAK_HORN = 46,      // grey keratin: bills, legs and feet
     kMaterialCount
 };
 

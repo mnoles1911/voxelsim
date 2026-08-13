@@ -141,7 +141,16 @@ const DEFAULT_SPECIES = {
   grass: "meadow-grass",
   reed: "water-reed",
   flower: "meadow-daisy",
+  fish: "brown-trout",
+  cetacean: "bottlenose-dolphin",
+  bird: "european-robin",
 };
+
+/* Kinds with no branch structure. Branch statistics on any of these would be a
+ * column of zeroes pretending to mean something, so the kind decides which rows
+ * the detail sheet has. Mirrors `pipeline.BRANCHLESS`. */
+const BRANCHLESS = new Set(["rock", "grass", "reed", "flower", "fish", "cetacean",
+                            "bird"]);
 
 async function loadSpec(name) {
   const r = await fetch(`/api/spec?name=${encodeURIComponent(name)}`).then((x) => x.json());
@@ -370,9 +379,9 @@ function openDetail(seed, t) {
     .map((p) => `<div class="problem${p.startsWith("broken") ? " bad" : ""}">! ${escape(p)}</div>`)
     .join("");
 
-  // Branch statistics on a rock would be a column of zeroes pretending to mean
-  // something, so the kind decides which rows exist.
-  const branchy = (s.kind ?? state.kind) !== "rock";
+  // Branch statistics on a rock or a fish would be a column of zeroes
+  // pretending to mean something, so the kind decides which rows exist.
+  const branchy = !BRANCHLESS.has(s.kind ?? state.kind);
   const rows = [
     ["voxel size", `${s.voxel_cm ?? 10} cm (preview)`],
     ["height", `${(s.height_m ?? 0).toFixed(1)} m`],

@@ -99,6 +99,52 @@ constexpr int32 kMineCostByMaterial[vxc::kMaterialCount] = {
     /* MAT_BARK_PALE     */ 20,
     /* MAT_LEAF_BLOSSOM  */ 5,
     /* MAT_LEAF_AUTUMN   */ 5,
+
+    // Creature materials. An animal is a DETAIL ENTITY: it is spawned near the
+    // player, nothing about it is saved, and it is deleted shortly after the
+    // player leaves. It is not terrain and it is not scenery to be dug through
+    // -- an agent that meets a fish should pass it, not mine it.
+    //
+    // 1 rather than 0 because 0 is MAT_AIR's value and means "not there at
+    // all", and rather than the negative impassable sentinel because a fish
+    // does not block anything either. It is the smallest value that still says
+    // a voxel is present, and it sits below foliage's 4-6, which is already
+    // documented above as "a few frames of pushing through, not a dig".
+    //
+    // If these ever want a real cost it will be because something here stopped
+    // being a detail entity, and that is a design change rather than a tuning
+    // one.
+    /* MAT_SKIN_DARK     */ 1,
+    /* MAT_SKIN_PALE     */ 1,
+    /* MAT_SKIN_SILVER   */ 1,
+    /* MAT_SKIN_OLIVE    */ 1,
+    /* MAT_SKIN_BROWN    */ 1,
+    /* MAT_SKIN_ORANGE   */ 1,
+    /* MAT_SKIN_YELLOW   */ 1,
+    /* MAT_SKIN_RED      */ 1,
+    /* MAT_SKIN_BLUE     */ 1,
+    /* MAT_SKIN_GREEN    */ 1,
+
+    // Plumage. Same argument as the skins above and the same value: a bird is
+    // a detail entity, spawned near the player from (species, seed) and gone
+    // when it despawns, with nothing about the individual saved. An agent that
+    // meets one should pass through it, not dig it.
+    //
+    // The bill and legs (MAT_BEAK_HORN) get 1 as well, even though keratin is
+    // harder than feather. Relative hardness between two parts of the same
+    // two-voxel bill is not a distinction anything can act on, and giving it a
+    // higher number would be inventing a difference to look thorough.
+    /* MAT_PLUME_WHITE   */ 1,
+    /* MAT_PLUME_GREY    */ 1,
+    /* MAT_PLUME_SLATE   */ 1,
+    /* MAT_PLUME_BUFF    */ 1,
+    /* MAT_PLUME_RUFOUS  */ 1,
+    /* MAT_PLUME_CRIMSON */ 1,
+    /* MAT_PLUME_LIME    */ 1,
+    /* MAT_PLUME_CYAN    */ 1,
+    /* MAT_PLUME_LILAC   */ 1,
+    /* MAT_PLUME_IRIDESCENT */ 1,
+    /* MAT_BEAK_HORN     */ 1,
 };
 static_assert(sizeof(kMineCostByMaterial) / sizeof(kMineCostByMaterial[0]) == vxc::kMaterialCount,
               "kMineCostByMaterial must cover every vxc::Material entry");

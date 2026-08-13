@@ -39,6 +39,73 @@ class Param:
 
 
 P = Param
+
+# The crown envelopes that exist. Declared here because `envelope` imports this
+# module and not the other way round; `envelope` checks at import that its own
+# profile table matches this list exactly, so the two cannot drift apart again.
+_CROWN_SHAPES = ("sphere", "cone", "spire", "ovoid", "umbrella", "column",
+                 "vase", "wedge", "hanging")
+
+# Leaf arrangements, declared here for the same reason: `rasterize` owns the
+# table that turns each one into clump geometry and checks at import that it
+# covers exactly this list. A habit that silently falls back to the default is
+# indistinguishable from one that works, which is how `spire` and `ovoid`
+# crowns rendered as spheres for as long as they did.
+_FOLIAGE_HABITS = ("spiral", "distichous", "opposite", "tuft", "radial",
+                   "rosette", "pendulous")
+
+# Fish outlines and markings, declared here for the same reason and checked the
+# same way: `forge/fish.py` asserts at import that its own tables cover exactly
+# these lists. A choice that falls through to a default is indistinguishable
+# from one that works, which is how `spire` and `ovoid` crowns rendered as
+# spheres for as long as they did.
+_CAUDAL_SHAPES = ("forked", "truncate", "rounded", "pointed", "none")
+_DORSAL_SHAPES = ("triangular", "sail", "spiny", "ridge", "none")
+_FISH_PATTERNS = ("none", "stripe", "bars", "spots", "mottle", "saddle")
+# The shapes a countershading boundary may take. `flat` is a level line along
+# the animal, which is what every marking here was until now; the other three
+# bend it. See `fish._field_lines` and `docs/marine-marking-research.md`.
+_FIELD_CURVES = ("flat", "cape", "flame", "hourglass")
+# Which sex of a species to draw. `unsexed` is the species average and is what
+# every spec that has not measured a difference carries. See `fish._sex_scale`.
+_SEXES = ("unsexed", "female", "male")
+
+# Bird outlines, poses and markings, declared here for the same reason and
+# checked the same way: `forge/bird.py` asserts at import that its own tables
+# cover exactly these lists.
+_TAIL_SHAPES = ("square", "rounded", "graduated", "wedge", "notched",
+                "forked", "pointed")
+_WING_SHAPES = ("elliptical", "pointed", "soaring", "slotted")
+_BIRD_POSES = ("perched", "flying")
+_HEAD_MARKS = ("none", "cap", "mask", "supercilium", "throat", "collar")
+_WING_MARKS = ("none", "bar", "doublebar", "panel", "tip")
+_BODY_MARKS = ("none", "barred", "streaked", "speckled", "breastband")
+
+# Every kind EXCEPT fish. Two placement rows are meaningless for something that
+# swims -- ground steepness, and distance to water for a thing that is in it --
+# and the house rule is that a section does not show a slider it cannot use, it
+# leaves it out. `Param.kinds` is a whitelist, so excluding one kind means
+# naming the rest.
+#
+# A BIRD IS IN THE LIST. It is not standing on the ground the way a tree is,
+# but both rows still say something true about one: a bird perches on what
+# grows on the ground, so ground steepness gates where it can be, and a heron
+# and a kingfisher are defined by being near water. Excluding them would have
+# thrown away the only two placement rows that separate a riverbank species
+# from a hillside one.
+_LAND_KINDS = ("tree", "bush", "rock", "grass", "reed", "flower", "bird")
+
+# The two animal kinds that SWIM. They share one generator and one parameter
+# group, the way grass, reeds and flowers share theirs; what separates them is
+# which rows apply, which species the designer authors, and where they go.
+_SWIM_KINDS = ("fish", "cetacean")
+
+# How a tail is held. A fish's caudal fin is VERTICAL and beats side to side; a
+# whale's fluke is HORIZONTAL and beats up and down, which is the single most
+# reliable way to tell a dolphin from a shark at any distance and from any
+# angle except dead broadside.
+_CAUDAL_PLANES = ("vertical", "horizontal")
+
 PARAMS: tuple[Param, ...] = (
     P("name", "Species name", "unnamed", kind="text", group="general"),
     P("notes", "Notes", "", kind="text", group="general",
@@ -47,11 +114,12 @@ PARAMS: tuple[Param, ...] = (
       choices=kindlib.KEYS,
       help="What sort of asset this is. It decides which parameters apply and "
            "which generator runs — a rock has no trunk, crown or foliage."),
-    P("height_m", "Height (m)", 12.0, 0.05, 40.0, 0.01, group="general",
+    P("height_m", "Height (m)", 12.0, 0.05, 150.0, 0.01, group="general",
       help="Ground to the top of the crown, or the length of a stem. The range "
-           "spans a 5 cm cushion plant to a 40 m emergent, because one slider "
+           "spans a 5 cm cushion plant to a 150 m hero tree, because one slider "
            "serves every kind that grows; rocks ignore it and use their own "
-           "size."),
+           "size. Anything much over about 30 m is a set piece rather than "
+           "scenery — check the grid size it asks for before generating."),
     P("resolution_cm", "Voxel size", "5", kind="choice", group="general",
       choices=("10", "5", "2.5", "2", "1"),
       help="Edge length of one voxel, and the size the asset EXPORTS at. "
@@ -63,7 +131,7 @@ PARAMS: tuple[Param, ...] = (
            "authored at 2.5 cm or below can be put in the world. Previews pick "
            "their own size to stay cheap and say so when it differs from this."),
 
-    P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.05, 1.60, 0.01, group="trunk"),
+    P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.05, 12.0, 0.01, group="trunk"),
     P("trunk.clear_frac", "Branch-free height", 0.35, 0.0, 0.90, 0.01, group="trunk",
       help="Fraction of total height with bare trunk. High for jungle emergents, low for bushes."),
     P("trunk.lean_deg", "Lean", 3.0, 0.0, 40.0, 0.5, group="trunk"),
@@ -71,22 +139,86 @@ PARAMS: tuple[Param, ...] = (
     P("trunk.wander", "Wander", 0.15, 0.0, 1.0, 0.01, group="trunk",
       help="How much the trunk wobbles on its way up. Gnarled desert wood is high."),
     P("trunk.buttress", "Root flare", 0.0, 0.0, 1.0, 0.01, group="trunk",
-      help="Thickening at the very base. Kapok and jungle trees want this."),
+      help="Thickening at the very base. Kapok and jungle trees want this. The "
+           "falloff is scaled to the tree, so the same setting reads the same "
+           "on a sapling and on an emergent."),
+    P("trunk.lobes", "Trunk lobes", 0, 0, 12, 1, kind="int", group="trunk",
+      help="Runs vertical grooves up the trunk instead of leaving it a "
+           "circular post. Every branch here is drawn as a capsule, so every "
+           "cross-section is a perfect circle; real boles run in ridges and "
+           "hollows, and on a large tree those are the most legible thing "
+           "about it because they catch light along their whole length. "
+           "NOT SAFE YET — leave at 0. It cuts wood loose: the trunk's surface "
+           "is where limbs and roots attach, so grooving it severs joins and "
+           "leaves pieces floating. Restricting it to the bare bole, to the "
+           "trunk's own outline in each slice, to away from junctions, and "
+           "cutting before the branches are drawn each reduced the damage and "
+           "none removed it — the roots radiate out through the grooved zone "
+           "and are cut regardless. Doing this properly means fluting the "
+           "capsule as it is drawn rather than carving afterwards."),
+    P("trunk.lobe_depth", "Lobe depth", 0.18, 0.0, 0.6, 0.01, group="trunk",
+      help="How deep the grooves cut, as a fraction of the trunk radius. Cut "
+           "inward rather than added outward, so the trunk keeps the thickness "
+           "the taper model gave it."),
 
+    # Choices come from the envelope module rather than being spelled out
+    # again here. A second copy of this list went stale the moment two profiles
+    # were added: the new names failed validation, fell back to "sphere", and
+    # the only reason it was not shipped that way is that the patch report
+    # happened to be printed.
     P("crown.shape", "Crown shape", "sphere", kind="choice", group="crown",
-      choices=("sphere", "cone", "umbrella", "column", "vase", "wedge", "hanging")),
-    P("crown.radius_m", "Crown radius (m)", 3.5, 0.3, 16.0, 0.1, group="crown"),
+      choices=_CROWN_SHAPES,
+      help="Which envelope the crown grows into. 'cone' and 'spire' are fitted "
+           "to laser-scanned conifers — widest a third and a sixth of the way "
+           "up respectively, not at the base."),
+    P("crown.allometry", "Size from trunk", "off", kind="choice", group="crown",
+      choices=("off", "broadleaf", "conifer"),
+      help="Works out the crown radius, length and base height from how thick "
+           "the trunk is, using the fitted relations foresters use, instead of "
+           "you setting three sliders and keeping them consistent by hand. "
+           "Turn it on and the crown follows the trunk; change the height and "
+           "the crown still fits. It OVERRIDES the three controls below, which "
+           "is why it is off unless asked for. The relations are for "
+           "forest-grown trees — an open-grown crown on the same stem runs "
+           "10-30% wider."),
+    P("crown.radius_m", "Crown radius (m)", 3.5, 0.3, 60.0, 0.1, group="crown"),
     P("crown.height_frac", "Crown height", 0.65, 0.10, 1.0, 0.01, group="crown",
       help="Crown's vertical extent as a fraction of tree height."),
     P("crown.center_frac", "Crown centre", 0.66, 0.20, 0.98, 0.01, group="crown"),
-    P("crown.shell", "Hollowness", 0.30, 0.0, 1.0, 0.01, group="crown",
-      help="Pushes growth targets toward the crown's outer surface. Conifers and "
-           "umbrella crowns read better high; dense broadleaves lower."),
+    P("crown.shell_upper", "Leafy depth, upper", 0.55, 0.0, 1.0, 0.01,
+      group="crown",
+      help="How deep the leafy layer goes in from the crown surface, above the "
+           "widest point, as a fraction of the local radius. 1 fills the crown "
+           "solidly; 0.25 leaves a skin. This replaced a single hollowness "
+           "number because the forestry models state it as a thickness above "
+           "and below the widest point separately, and one symmetric number "
+           "cannot describe a crown whose two halves are filled differently."),
+    P("crown.shell_lower", "Leafy depth, lower", 0.40, 0.0, 1.0, 0.01,
+      group="crown",
+      help="The same, below the widest point. Typically thinner than the "
+           "upper: a mature broadleaf carries a solid crown on top and little "
+           "but bare branches underneath, because nothing down there gets the "
+           "light to keep leaves. 0 empties the lower crown completely."),
     P("crown.squash", "Vertical squash", 1.0, 0.30, 2.5, 0.01, group="crown"),
     P("crown.lean_deg", "Crown lean", 0.0, 0.0, 45.0, 0.5, group="crown",
       help="Wind-shear. Leans the whole crown off the trunk axis."),
     P("crown.lean_dir_deg", "Crown lean direction", 0.0, 0.0, 360.0, 1.0, group="crown"),
-    P("crown.points", "Growth targets", 900, 80, 5000, 10, kind="int", group="crown",
+    P("crown.asymmetry", "Lopsidedness", 0.25, 0.0, 1.0, 0.01, group="crown",
+      help="How far from circular the crown is when seen from above. Foresters "
+           "measure four to eight radii around a trunk rather than one, because "
+           "one does not describe a real crown, and the spread between them "
+           "widens as a tree ages. At 0 every crown is a surface of revolution, "
+           "which is a shape that occurs in nature about as often as a perfect "
+           "sphere."),
+    P("crown.offset", "Crown displacement", 0.20, 0.0, 0.8, 0.01, group="crown",
+      help="Slides the crown sideways off its trunk, fully at the top and not "
+           "at all at the base. Trees lean their crowns away from their "
+           "neighbours and into any gap they can reach: measured on old-growth "
+           "beech, a forest-grown crown's centre sits about 0.37 of its own "
+           "radius away from its stem, while an isolated open-grown tree "
+           "manages roughly half that. Use the low end for a specimen tree "
+           "standing alone and the high end for anything grown in a stand."),
+    P("crown.points", "Growth targets", 900, 80, 60000, 10, kind="int", group="crown",
       help="More targets means denser, finer branching and a slower generate."),
 
     P("growth.model", "Growth model", "colonize", kind="choice", group="growth",
@@ -95,10 +227,10 @@ PARAMS: tuple[Param, ...] = (
            "suits irregular broadleaf crowns. 'whorl' builds rings of branches up a "
            "straight leader, which is what a conifer actually is — a spruce's tiers "
            "are a real structure, not an irregular crown that happens to look tiered."),
-    P("growth.step_m", "Segment length (m)", 0.35, 0.08, 1.50, 0.01, group="growth"),
-    P("growth.influence_m", "Reach (m)", 3.0, 0.4, 14.0, 0.1, group="growth",
+    P("growth.step_m", "Segment length (m)", 0.35, 0.08, 6.0, 0.01, group="growth"),
+    P("growth.influence_m", "Reach (m)", 3.0, 0.4, 60.0, 0.1, group="growth",
       help="How far a branch tip can see a growth target."),
-    P("growth.kill_m", "Target consumption (m)", 0.70, 0.10, 4.0, 0.05, group="growth",
+    P("growth.kill_m", "Target consumption (m)", 0.70, 0.10, 16.0, 0.05, group="growth",
       help="Low values give long thin twigs, high values give stubby branching."),
     P("growth.gravity", "Droop", -0.12, -1.0, 1.0, 0.01, group="growth",
       help="Negative droops branches down (willow), positive lifts them up."),
@@ -106,7 +238,16 @@ PARAMS: tuple[Param, ...] = (
     P("growth.inertia", "Straightness", 0.45, 0.0, 1.0, 0.01, group="growth"),
     P("growth.jitter", "Wobble", 0.05, 0.0, 0.6, 0.01, group="growth"),
     P("growth.max_iter", "Growth iterations", 260, 20, 900, 10, kind="int", group="growth"),
-    P("growth.tip_radius_m", "Twig radius (m)", 0.045, 0.01, 0.40, 0.005, group="growth"),
+    P("growth.shade", "Competition for light", 0.40, 0.0, 1.0, 0.01,
+      group="growth",
+      help="Makes branches avoid growing into space that is already shaded by "
+           "wood above it. Without this, growth targets pull just as hard from "
+           "inside a solid mass of existing crown as they do from open air — "
+           "nothing in the model knows the space is taken — so the crown fills "
+           "in evenly everywhere and reads as a cloud of twigs. Real branches "
+           "are competing for light and lose that competition in shade. At 0 "
+           "you get the old behaviour."),
+    P("growth.tip_radius_m", "Twig radius (m)", 0.045, 0.01, 2.0, 0.005, group="growth"),
     P("growth.radius_exp", "Branch thickness falloff", 2.30, 1.50, 3.50, 0.05, group="growth",
       help="Murray's law exponent. 2 splits thickness evenly, 3 keeps parents thick."),
 
@@ -171,11 +312,72 @@ PARAMS: tuple[Param, ...] = (
 
     P("foliage.enabled", "Foliage", True, kind="bool", group="foliage"),
     P("foliage.min_order", "Leaves from branch order", 2, 0, 8, 1, kind="int", group="foliage"),
-    P("foliage.clump_radius_m", "Clump radius (m)", 0.65, 0.04, 3.0, 0.01, group="foliage",
+    P("foliage.clump_radius_m", "Clump radius (m)", 0.65, 0.04, 12.0, 0.01, group="foliage",
       help="Radius of one leaf mass. The floor is set for 2 cm ground cover, "
            "not for trees -- a 15 cm floor was fine for an oak and far too "
            "coarse for a knee-high shrub."),
     P("foliage.density", "Clump density", 0.60, 0.05, 1.0, 0.01, group="foliage"),
+    P("foliage.rough", "Clump raggedness", 0.55, 0.0, 1.0, 0.01, group="foliage",
+      help="Breaks the OUTLINE of each leaf clump before it becomes voxels. "
+           "At 0 a clump is a perfect ball on a rounded radius, so clumps of "
+           "similar size come out identical and a canopy reads as repeated "
+           "discs with stair-step rings around each one. Thinning the inside "
+           "cannot fix that — hollow a sphere as much as you like and its "
+           "silhouette is still a sphere. This is the same fix the rocks "
+           "needed and for the same reason."),
+    P("foliage.habit", "Leaf arrangement", "spiral", kind="choice",
+      group="foliage", choices=_FOLIAGE_HABITS,
+      help="How the species carries its leaves on the shoot, which is most of "
+           "what makes one tree look unlike another. spiral: all round the "
+           "shoot, the neutral broadleaf case. distichous: two-ranked into one "
+           "flat plane held level to the light — beech, elm, fir, hemlock, and "
+           "what makes a fir spray a spray. opposite: decussate pairs, maple "
+           "and ash. tuft: needles held on only the last two or three years of "
+           "growth, so foliage sits at the shoot ENDS with clean twig behind "
+           "— pine, whose crowns really are see-through. radial: needles all "
+           "round and retained five to seven years, so the whole shoot is "
+           "clothed — spruce, the densest. rosette: compressed clusters on "
+           "short shoots spaced along older wood — birch, larch, apple, and "
+           "the one habit that puts foliage back on the inner branches. "
+           "pendulous: sprays hanging from the shoot — willow."),
+    P("foliage.stretch", "Shoot elongation", 2.2, 1.0, 6.0, 0.05, group="foliage",
+      help="Stretches each leaf clump along the twig it hangs from, so it is a "
+           "shoot rather than a ball. Leaves are borne on twenty to sixty "
+           "centimetres of new growth, not at a point, so a clump drawn round "
+           "is the wrong primitive however well its outline is broken up. It "
+           "also gives the canopy an orientation: a ball has no direction, so a "
+           "crown of them has none either, and that is what reads as placed "
+           "rather than grown. Volume is preserved, so the clump radius keeps "
+           "meaning what it did. 1 is the old ball; 2–3 suits most broadleaves; "
+           "4 and up gives the long sprays of spruce and hemlock."),
+    P("foliage.clustering", "Clumping", 0.45, 0.0, 1.0, 0.01, group="foliage",
+      help="Gathers leaf clumps into masses with daylight between them, "
+           "instead of spreading them as evenly as they will go. Even spacing "
+           "is what you get by default from keeping every clump a fixed "
+           "distance from its neighbours, and it is the least natural "
+           "arrangement available — real foliage is strongly aggregated, and "
+           "how strongly is a first-order property of a canopy rather than a "
+           "finishing touch. This moves clumps about rather than removing "
+           "them, so the crown keeps its weight."),
+    P("foliage.compensate", "Spacing compensation", 0.60, 0.0, 1.0, 0.01,
+      group="foliage",
+      help="Grows the surviving clumps to make up for the ones that spacing "
+           "deleted. Raising separation reads as a control over gaps, but it "
+           "removes whole clumps — going from 1.2 to 3.0 drops 85% of them and "
+           "takes a quarter of the crown's outline with it. This holds the "
+           "total leaf area roughly steady so the tree does not shrink every "
+           "time you open it up. Kept partial on purpose: compensating fully "
+           "would close the gaps you widened."),
+    P("foliage.top_bias", "Top-heavy foliage", 0.35, 0.0, 1.0, 0.01,
+      group="foliage",
+      help="Moves leaf density from the bottom of the crown to the top. Every "
+           "canopy model in the literature assumes leaves are spread evenly "
+           "through the crown envelope, and every set of field measurements "
+           "disagrees: density climbs steadily from the crown base to the top "
+           "in every species measured, because the upper layer of small, "
+           "steeply held leaves shades an interior that cannot use any more "
+           "light. This redistributes rather than adds — the total is "
+           "unchanged, so the density slider still means what it says."),
     P("foliage.coverage", "Clump coverage", 0.80, 0.0, 1.0, 0.01, group="foliage",
       help="Share of surviving twigs that carry a clump, after separation has "
            "thinned them."),
@@ -189,7 +391,7 @@ PARAMS: tuple[Param, ...] = (
     P("foliage.clump_jitter", "Clump variation", 0.35, 0.0, 1.0, 0.01, group="foliage",
       help="Random spread in clump size and position. Zero makes the canopy a lattice "
            "of identical spheres."),
-    P("foliage.droop_m", "Clump droop (m)", 0.15, -1.0, 2.0, 0.05, group="foliage"),
+    P("foliage.droop_m", "Clump droop (m)", 0.15, -6.0, 10.0, 0.05, group="foliage"),
     P("foliage.squash", "Clump squash", 0.80, 0.30, 2.5, 0.01, group="foliage"),
 
     # How much individuals of this species differ from each other. Without
@@ -199,14 +401,41 @@ PARAMS: tuple[Param, ...] = (
     P("variation.amount", "Variation", 1.0, 0.0, 3.0, 0.05, group="variation",
       help="Master scale on everything below. Zero makes every seed the same size and "
            "shape, varying only in how the branches happen to grow."),
-    P("variation.height", "Height spread", 0.18, 0.0, 0.6, 0.01, group="variation"),
-    P("variation.crown_radius", "Crown spread", 0.18, 0.0, 0.6, 0.01, group="variation"),
-    P("variation.trunk_radius", "Trunk spread", 0.18, 0.0, 0.6, 0.01, group="variation"),
-    P("variation.shape", "Shape spread", 0.12, 0.0, 0.5, 0.01, group="variation",
+    P("variation.height", "Height spread", 0.28, 0.0, 0.6, 0.01, group="variation"),
+    P("variation.crown_radius", "Crown spread", 0.30, 0.0, 0.6, 0.01, group="variation"),
+    P("variation.trunk_radius", "Trunk spread", 0.30, 0.0, 0.6, 0.01, group="variation"),
+    P("variation.shape", "Shape spread", 0.22, 0.0, 0.5, 0.01, group="variation",
       help="Varies crown squash and how high the crown sits."),
-    P("variation.lean_deg", "Lean spread", 7.0, 0.0, 30.0, 0.5, group="variation"),
-    P("variation.droop", "Droop spread", 0.25, 0.0, 1.0, 0.01, group="variation"),
-    P("variation.density", "Density spread", 0.12, 0.0, 0.6, 0.01, group="variation"),
+    P("variation.proportion", "Proportion spread", 0.30, 0.0, 0.6, 0.01,
+      group="variation",
+      help="How much of an individual is crown and how much is bare bole. This "
+           "is where the visible difference between two trees of one species "
+           "actually lives: a batch that varies only height and radius is the "
+           "same tree twelve times at twelve sizes, because every silhouette "
+           "still has its crown starting at the same fraction of its height. "
+           "The crown grows DOWNWARD from a fixed top rather than about a fixed "
+           "centre, so a long-crowned individual eats into its bole instead of "
+           "poking out above its own height. Measured over eight seeds, taking "
+           "crown height from 0.42 to 0.85 of tree height moves the crown's "
+           "share of the silhouette by 41-72% and is the single strongest "
+           "proportion lever under every growth model."),
+    P("variation.lopsided", "Lopsidedness spread", 0.45, 0.0, 1.0, 0.01,
+      group="variation",
+      help="Varies how far from circular each crown is and how far it sits off "
+           "its own trunk. Only bites under the 'colonize' growth model: whorl "
+           "and frond trees build their branches directly and never sample the "
+           "crown envelope, so this measured as doing nothing at all on a "
+           "conifer."),
+    P("variation.foliage", "Leaf spread", 0.35, 0.0, 0.8, 0.01, group="variation",
+      help="Varies how the leaf mass is distributed within the crown: the depth "
+           "of the leafy shell above and below the widest point, how top-heavy "
+           "it is, how strongly it gathers into masses, and how ragged each "
+           "clump's outline is. The shell depths are much the largest of these "
+           "-- on an oak the lower shell alone doubles the voxel count across "
+           "its range -- and they, too, only apply under 'colonize'."),
+    P("variation.lean_deg", "Lean spread", 10.0, 0.0, 30.0, 0.5, group="variation"),
+    P("variation.droop", "Droop spread", 0.40, 0.0, 1.0, 0.01, group="variation"),
+    P("variation.density", "Density spread", 0.25, 0.0, 0.6, 0.01, group="variation"),
     P("variation.rotate", "Random facing", True, kind="bool", group="variation",
       help="Point each individual's lean in a random direction. Cheap and it does more "
            "for a forest than any other single knob."),
@@ -222,7 +451,7 @@ PARAMS: tuple[Param, ...] = (
     P("placement.abundance", "Abundance", 0.5, 0.0, 1.0, 0.01, group="placement",
       help="Overall frequency of this species where it does occur, before the "
            "per-biome weights are applied."),
-    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 400.0, 0.5, group="placement",
+    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 3000.0, 0.5, group="placement",
       help="Closest two individuals may stand. Roughly the canopy diameter for a "
            "closed forest, much larger for savanna or desert."),
     P("placement.cluster", "Grows in stands", 0.3, 0.0, 1.0, 0.01, group="placement",
@@ -236,16 +465,16 @@ PARAMS: tuple[Param, ...] = (
            "(900 m at 0 C, rising ~150 m per degree), so this mainly separates "
            "lowland species from montane ones inside a biome."),
     P("placement.slope_max_pct", "Steepest ground (% grade)", 45.0, 0.0, 70.0, 1.0,
-      group="placement",
+      group="placement", kinds=_LAND_KINDS,
       help="Ground steeper than this will not carry the species. Stated as a grade "
            "in percent, the same currency the engine's cliff gate uses — above 70% "
            "(~35 degrees) the ground classifies as bare rock and carries nothing."),
     P("placement.water_max_m", "Distance to water (m)", 0.0, 0.0, 500.0, 5.0,
-      group="placement",
+      group="placement", kinds=_LAND_KINDS,
       help="0 means it does not care. Above 0, the species only appears within this "
            "distance of a watercourse — riverbank willows and jungle understorey."),
 
-    P("rock.size_m", "Size (m)", 1.6, 0.2, 12.0, 0.1, group="rock",
+    P("rock.size_m", "Size (m)", 1.6, 0.2, 150.0, 0.1, group="rock",
       help="Longest dimension of the finished stone, after faceting, erosion and "
            "the burial cut have taken their share. Measured, not estimated, so "
            "this is what you get."),
@@ -255,9 +484,9 @@ PARAMS: tuple[Param, ...] = (
     P("rock.spread", "Lump spread", 0.42, 0.0, 1.0, 0.01, group="rock",
       help="How far the lumps scatter from the centre. High values make a broken "
            "pile rather than a single stone."),
-    P("rock.flatten", "Flatten", 0.72, 0.15, 2.0, 0.01, group="rock",
+    P("rock.flatten", "Flatten", 0.72, 0.15, 6.0, 0.01, group="rock",
       help="Vertical squash. Below 1 gives a slab; above 1 a standing stone."),
-    P("rock.elongate", "Elongate", 1.25, 0.4, 3.0, 0.01, group="rock",
+    P("rock.elongate", "Elongate", 1.25, 0.4, 6.0, 0.01, group="rock",
       help="Stretch along one horizontal axis."),
     P("rock.angular", "Angularity", 0.45, 0.0, 1.0, 0.01, group="rock",
       help="Slices flat faces off the mass. 0 is a rounded river cobble, 1 a "
@@ -269,21 +498,231 @@ PARAMS: tuple[Param, ...] = (
            "smooth ellipsoid, and a smooth curve at this voxel size shows clean "
            "concentric stair-steps that look like a Minecraft sphere. Measured "
            "as a fraction of the stone's radius."),
-    P("rock.erode", "Erosion", 0.2, 0.0, 1.0, 0.01, group="rock",
-      help="A finishing pass that takes coherent patches off the most exposed "
-           "places. Roughness does the shaping; keep this low."),
+    P("rock.erode", "Weathering", 0.25, 0.0, 1.0, 0.01, group="rock",
+      help="How much stone the weathering pass takes away. What SHAPE it takes "
+           "away is set by the two below."),
+    P("rock.cavernous", "Cavernous vs spheroidal", 0.0, 0.0, 1.0, 0.01,
+      group="rock",
+      help="Which way the weathering leans. At 0 it attacks convex surfaces "
+           "fastest — corners and edges are exposed on more sides, so a blocky "
+           "stone rounds off and granite sheds shells. At 1 it attacks concave "
+           "surfaces fastest — a pit holds moisture and salt, so it deepens "
+           "faster than the rock around it, and the runaway pitting carves "
+           "tafoni, honeycomb sandstone and hollow-sided goblins. Same "
+           "mechanism, opposite sign, two families of rock."),
+    P("rock.bedding", "Bedding strength", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Alternating hard and soft layers. Sedimentary rock is laid down in "
+           "beds of differing hardness, and that one fact is behind most rock "
+           "shapes people recognise: weather a uniform block and you get a "
+           "rounded lump, weather a layered one and the soft beds retreat while "
+           "the hard ones stand proud. Banded cliffs, undercut pedestals, "
+           "mushroom rocks and the cap on a hoodoo are all this."),
+    P("rock.bed_thickness_m", "Bed thickness (m)", 0.5, 0.05, 25.0, 0.05,
+      group="rock",
+      help="How thick one hard-soft cycle is. Thin gives finely banded "
+           "sandstone; thick gives a few massive ledges."),
+    P("rock.bed_dip_deg", "Bed dip", 0.0, 0.0, 45.0, 1.0, group="rock",
+      help="Tilt of the layers. Beds are laid down flat and tilted afterwards, "
+           "so a non-zero dip reads as rock that has been moved."),
+    P("rock.cross_beds", "Cross-bed sets", 0, 0, 6, 1, kind="int", group="rock",
+      help="Stacked wedges of steeply dipping layers, each one cut off flat by "
+           "the next: aeolian cross-bedding, the Navajo Sandstone. Migrating "
+           "dunes dump sand down their lee face at the angle of repose, then the "
+           "following dune planes the top off, and the wind shifts between them "
+           "so each wedge dips a different way. The TRUNCATION is the whole "
+           "signature — ordinary bedding keeps every layer parallel forever, and "
+           "no dip setting can make one layer cut another off. 0 uses flat "
+           "bedding; 2-4 gives the crossed grain."),
+    P("rock.caprock", "Caprock", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Makes the top of the stone much harder than the rest, so weathering "
+           "eats the neck and leaves the head: hoodoos, pedestals and mushroom "
+           "rocks. Bedding can only do this by accident, because its hard layers "
+           "repeat all the way down."),
+    P("rock.cap_frac", "Cap height", 0.62, 0.2, 0.95, 0.01, group="rock",
+      help="How far up the stone the hard cap starts, as a fraction of its "
+           "height."),
+    P("rock.notch", "Basal attack", 0.0, 0.0, 4.0, 0.05, group="rock",
+      help="Extra weathering concentrated in one horizontal band, on top of "
+           "whatever the curvature pass is doing. This is the missing half of "
+           "every undercut shape: blown sand only bounces to about knee height, "
+           "so it saws a waist into a desert rock; waves only attack the tidal "
+           "band, so they cut the notch that eventually fells a sea stack; damp "
+           "soil rots the very base of a boulder. 0 is off."),
+    P("rock.notch_z_m", "Attack height (m)", 0.25, 0.0, 30.0, 0.05, group="rock",
+      help="Height above the ground where the attack is strongest. 0.1-0.4 for "
+           "wind-blown sand, 0.5-1.5 for a wave notch."),
+    P("rock.notch_spread_m", "Attack spread (m)", 0.18, 0.03, 12.0, 0.01,
+      group="rock",
+      help="How tall the attacked band is. Narrow gives a sharp waist, wide "
+           "gives a general thinning."),
+    P("rock.aspect", "One-sidedness", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Weathers one side harder than the other. Real stone is not attacked "
+           "evenly — tafoni open on the damp shaded face, salt works the seaward "
+           "side, frost the north — and a rock weathered the same on all sides "
+           "is the most reliable tell that it came out of a generator. The side "
+           "is chosen per stone, so a scatter of them does not all lean the same "
+           "way."),
+
+    P("rock.joint_sets", "Joint sets", 0, 0, 3, 1, kind="int", group="rock",
+      help="Rock does not fracture in random directions — it fractures along a "
+           "few JOINT SETS, typically a bedding plane plus two near-vertical "
+           "sets at right angles, and every face in an outcrop shares them. "
+           "That shared orientation is what makes granite look quarried rather "
+           "than merely lumpy. 0 keeps the old independent random faces; 2-3 "
+           "gives jointed rock."),
+    P("rock.joint_scatter", "Joint scatter", 0.12, 0.0, 0.6, 0.01, group="rock",
+      help="How far a face may stray from its joint set. A little keeps it "
+           "natural; a lot is the same as having no sets at all."),
+    P("rock.joint_dip_deg", "Joint dip", 0.0, 0.0, 90.0, 1.0, group="rock",
+      help="Tilt of the whole joint frame, measured from flat-lying. At 0 the "
+           "frame is a horizontal bedding plane plus two vertical sets, which "
+           "is the ordinary case. At 90 it is two VERTICAL sets plus a "
+           "horizontal one, and that matters because `joint sets` takes them "
+           "in order: ask for two sets at dip 0 and you get the bedding plane "
+           "and one vertical set, so the joints cut horizontal shelves. A "
+           "pinnacle forest needs the opposite pair, and 90 is the only way to "
+           "put both vertical sets first."),
+    P("rock.block_size_m", "Block size (m)", 1.2, 0.2, 40.0, 0.1, group="rock",
+      help="Spacing of the joint planes, so the size of one fractured block."),
+    P("rock.block_relief_m", "Joint opening (m)", 0.0, 0.0, 5.0, 0.01,
+      group="rock",
+      help="How wide the joints open. This is the parameter that turns one "
+           "stone into an outcrop of separate blocks — a continuous mass with "
+           "faces drawn on it still reads as one rock, and it is the visible "
+           "GAP between blocks that reads as fractured bedrock. Needs joint "
+           "sets."),
+    P("rock.joint_taper", "Joint taper", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Narrows the joint openings with depth, so the blocks between them "
+           "become blades that are wide apart at the top and nearly touching at "
+           "the base. Dissolving water is used up as it works downward, which is "
+           "how limestone pavements turn into the pinnacle forests of Shilin and "
+           "Tsingy. Needs joint openings."),
+    P("rock.corestone", "Corestones", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Rots the rock inward FROM the joints, so each block loses its "
+           "corners first and a rounded core survives at the middle of it. This "
+           "is how a granite tor becomes a stack of boulders with the old "
+           "fracture grid still legible in how they sit — and it is not "
+           "something ordinary weathering can reach, because that only ever sees "
+           "the outside of the whole mass and leaves the blocks inside it "
+           "prismatic. Turn it up far enough and the cores dissolve too, which "
+           "is a gravel pile, also correct. Needs joint sets."),
+    P("rock.settle_m", "Block settle (m)", 0.0, 0.0, 0.6, 0.01, group="rock",
+      help="Lets separated blocks drop and shift into the space weathering took "
+           "out, instead of staying in perfect alignment. Blocks that never move "
+           "read as one stone with grooves cut into it, because the gaps between "
+           "them stay dead parallel and exactly the same width. Needs joint "
+           "openings or corestones."),
+
+    P("rock.columns", "Columns", 0, 0, 600, 1, kind="int", group="rock",
+      help="Split the stone into vertical columns: basalt. Cooling lava "
+           "contracts into a polygonal crack network that propagates downward, "
+           "which is the Giant's Causeway. 0 is off; 9-36 gives a colonnade."),
+    P("rock.column_gap_m", "Column gap (m)", 0.08, 0.02, 3.0, 0.01, group="rock",
+      help="Width of the crack between columns."),
+    P("rock.column_stagger", "Column stagger", 0.18, 0.0, 0.8, 0.01, group="rock",
+      help="How unevenly the columns end. At 0 they are sawn flat, which reads "
+           "as an extruded shape rather than as stone."),
+
+    P("rock.exfoliate", "Exfoliation", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Peels curved shells off the surface: onion-skin weathering. Granite "
+           "domes release pressure as the rock above erodes away and split into "
+           "sheets PARALLEL to the surface, which spall off. The signature is "
+           "concentric steps, and no amount of tuning the ordinary weathering "
+           "produces it because that pass has no notion of depth."),
+    P("rock.shell_m", "Shell thickness (m)", 0.25, 0.05, 10.0, 0.05, group="rock",
+      help="Thickness of one exfoliation sheet."),
+
+    P("rock.veins", "Veins", 0, 0, 4, 1, kind="int", group="rock",
+      help="Thin sheets of harder rock cutting through the mass — a quartz vein "
+           "or a dyke. They survive the weathering that takes the rock around "
+           "them and end up standing proud as fins, which is the most "
+           "recognisable single detail on a weathered boulder. The eye follows a "
+           "continuous line at far lower resolution than it reads a blob, so "
+           "these carry further than their width suggests."),
+    P("rock.vein_width_m", "Vein width (m)", 0.10, 0.03, 4.0, 0.01, group="rock",
+      help="How thick one vein is. Below about 10 cm it is under two voxels and "
+           "will come and go along its length."),
+    P("rock.vein_hardness", "Vein hardness", 3.0, 1.0, 6.0, 0.1, group="rock",
+      help="How much better than the surrounding rock the vein resists. 1 is no "
+           "different, so nothing shows."),
+    P("rock.rind", "Case-hardened rind", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="A hard skin a few centimetres below the original surface, with "
+           "softer rock behind it. Minerals wick outward and set near the face; "
+           "when the skin is punctured the soft interior scoops out and leaves a "
+           "hollow with a thin overhanging lip. That LIP is why tafoni read as "
+           "tafoni — cavernous weathering on its own retreats the rim along with "
+           "everything else and leaves a smooth bowl. Punctures are placed for "
+           "you, or nothing would ever break through."),
+    P("rock.rind_m", "Rind depth (m)", 0.08, 0.02, 3.0, 0.01, group="rock",
+      help="How deep the hard skin goes."),
+    P("rock.clasts", "Clasts", 0, 0, 6000, 5, kind="int", group="rock",
+      help="Embeds separate lumps in a softer matrix: breccia. As the matrix "
+           "weathers back, some clasts stand proud and others drop out and leave "
+           "sockets, and that mix of bumps and holes is the texture. Note the "
+           "size limit below — pebble conglomerate does not work here and is a "
+           "job for the texture pass, not for geometry."),
+    P("rock.clast_size_m", "Clast size (m)", 0.25, 0.08, 8.0, 0.01, group="rock",
+      help="Typical lump across. Below about 15 cm they are one to three voxels "
+           "and read as noise rather than as clasts."),
+    P("rock.clast_hardness", "Clast hardness", 2.5, 1.0, 5.0, 0.1, group="rock",
+      help="How much better than the matrix the clasts resist. About a third are "
+           "flipped to weaker than the matrix whatever this says, because real "
+           "breccia is a mix of lithologies and the ones that rot out are what "
+           "make the sockets."),
+
+    P("rock.flutes", "Solution flutes", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Runs rainwater down the outside of the stone and dissolves it in "
+           "proportion to how much water passes, so grooves collect more water, "
+           "deepen, and collect more. Near-vertical runnels that merge downhill "
+           "— limestone karren. This is the only weathering here that knows "
+           "which way is down; the curvature pass attacks a shape the same from "
+           "every direction and can never make a directional mark. The flutes "
+           "fade out lower down on their own, because once the water film gets "
+           "deep enough it protects the rock instead of cutting it."),
+    P("rock.flute_width_m", "Flute width (m)", 0.25, 0.10, 6.0, 0.01, group="rock",
+      help="Spacing of the runnels. The centimetre-scale flutes on real "
+           "limestone are far under one voxel and cannot be built here; this is "
+           "the next size up, the decimetre runnels, which do read."),
+    P("rock.pans", "Solution pans", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Hollows water cannot drain out of, dissolved flat-bottomed into the "
+           "upper surfaces. They are found rather than placed: wherever the "
+           "water running down the stone reaches a spot with nowhere lower to "
+           "go, that is a pan."),
+    P("rock.pan_depth_m", "Pan depth (m)", 0.2, 0.05, 6.0, 0.01, group="rock",
+      help="How deep the pans cut. Flat floors and slightly overhung rims, which "
+           "is what separates a solution pan from an ordinary dent."),
+    P("rock.arch", "Arch", 0.0, 0.0, 1.0, 0.01, group="rock",
+      help="Punches a hole clean through the stone and lets the weathering "
+           "smooth the underside of the span: an arch, a window, a sea bridge. "
+           "Nothing else here can make a through-going hole — hollows eaten from "
+           "both sides only meet by luck, and a slab thin enough for them to "
+           "meet usually breaks first. Wants a thin, tall stone to work on, and "
+           "is refused below about 4 m because a small one is not credible."),
+
     P("rock.bury", "Buried fraction", 0.22, 0.0, 0.7, 0.01, group="rock",
       help="How much of the stone sits below ground. Everything under z=0 is cut "
            "away, so this controls how settled it looks rather than adding volume."),
     P("rock.rubble", "Rubble", 0.15, 0.0, 1.0, 0.01, group="rock",
       help="Loose stones scattered around the base."),
     P("materials.rock", "Rock", "rock", kind="choice", group="rock",
-      choices=("rock", "bedrock", "gravel", "sand", "clay", "permafrost", "snow")),
+      choices=("rock", "bedrock", "gravel", "sand", "clay"),
+      help="What the stone is made of, which decides its colour and how much "
+           "it varies. 'rock' is the neutral grey; 'bedrock' is darker and "
+           "reads as a fresh unweathered face; 'sand' is sandstone, and is what "
+           "every desert and arch spec uses; 'gravel' suits scree and cobbles, "
+           "because its high per-voxel jitter is what makes a heap read as "
+           "loose stones; 'clay' is for badland and mudstone bluffs.\n\n"
+           "PERMAFROST AND SNOW WERE OFFERED HERE AND HAVE BEEN REMOVED. They "
+           "are engine materials, so they were valid, but neither is a rock: "
+           "permafrost is frozen ground and snow is snow, and a boulder carved "
+           "out of either is a landform nobody wants. Nothing in the library "
+           "ever selected them. Snow ON a stone is a job for the renderer or a "
+           "surface pass, not for what the stone is made of."),
 
-    P("tuft.stems", "Stems", 24, 1, 120, 1, kind="int", group="tuft",
+    P("tuft.stems", "Stems", 24, 1, 600, 1, kind="int", group="tuft",
       help="How many blades or stems rise from the root crown. Grass wants "
            "dozens; a flowering plant wants a handful."),
-    P("tuft.spread_m", "Root spread (m)", 0.06, 0.0, 0.60, 0.01, group="tuft",
+    P("tuft.spread_m", "Root spread (m)", 0.06, 0.0, 6.0, 0.01, group="tuft",
       help="Radius of the patch the stems root in. Small keeps it a tuft; large "
            "makes a loose stand."),
     P("tuft.splay_deg", "Splay", 18.0, 0.0, 80.0, 1.0, group="tuft",
@@ -292,7 +731,7 @@ PARAMS: tuple[Param, ...] = (
       help="How far a stem bends toward horizontal along its length. 0 is a "
            "rigid spike, 1 lays the tip right over. Weighted toward the tip, so "
            "the base stays upright whatever this is."),
-    P("tuft.width_m", "Stem width (m)", 0.02, 0.005, 0.12, 0.005, group="tuft",
+    P("tuft.width_m", "Stem width (m)", 0.02, 0.005, 1.5, 0.005, group="tuft",
       help="Thickness at the root. At 2 cm a value of 0.02 is a one-voxel "
            "thread, which is the real width of a blade of grass and the reason "
            "these are authored at 2 cm at all."),
@@ -304,7 +743,7 @@ PARAMS: tuple[Param, ...] = (
     P("tuft.length_var", "Length spread", 0.3, 0.0, 0.8, 0.01, group="tuft",
       help="How much stems differ in length within one tuft. Zero makes a fan "
            "of identical copies, which reads as manufactured."),
-    P("tuft.base_m", "Root crown (m)", 0.05, 0.0, 0.40, 0.01, group="tuft",
+    P("tuft.base_m", "Root crown (m)", 0.05, 0.0, 4.0, 0.01, group="tuft",
       help="A flat disc joining every stem at the ground. Without it each stem "
            "is a separate piece, which is botanically true and wrong for an "
            "asset that gets stamped into a world and dug out of it. Never "
@@ -314,7 +753,7 @@ PARAMS: tuple[Param, ...] = (
       choices=("none", "spike", "bloom", "plume"),
       help="What tops a stem. None is grass; spike is a reed's seed head; bloom "
            "is a flower; plume is a feathery seed head."),
-    P("tuft.head_m", "Head width (m)", 0.12, 0.01, 0.80, 0.01, group="tuft",
+    P("tuft.head_m", "Head width (m)", 0.12, 0.01, 8.0, 0.01, group="tuft",
       help="Width of the bloom, spike or plume — across, not out from the "
            "centre. A daisy is about 0.12; a big jungle bloom 0.4."),
     P("tuft.head_frac", "Head length", 0.22, 0.02, 0.6, 0.01, group="tuft",
@@ -329,12 +768,926 @@ PARAMS: tuple[Param, ...] = (
       choices=("leaf_blossom", "leaf_dry", "leaf_autumn", "savanna_grass",
                "grass", "snow", "leaf_broadleaf")),
 
+    # --- fish ---------------------------------------------------------------
+    #
+    # The whole group is written against the fact that a fish here is twenty to
+    # forty voxels long. Nothing that moves the outline by less than one voxel
+    # over its whole range is a slider; that is why there is no superformula and
+    # no per-fin curvature. `docs/fish-shape-research.md` lists what was left
+    # out and what it would have bought.
+    P("fish.length_m", "Length (m)", 0.28, 0.03, 30.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Snout to the wrist of the tail — standard length, the measurement "
+           "every fish reference is quoted in, not including the tail fin. At "
+           "the 1 cm lattice this is also the voxel count: a 0.28 m trout is 28 "
+           "voxels long.\n\n"
+           "NO SPECIES IS AUTHORED UNDER 0.20 m (owner, 2026-08-13): below "
+           "that a fish cannot hold a marking two voxels wide, and enlarging "
+           "the animal was chosen over adding a lattice tier finer than 1 cm. "
+           "The ceiling is 30 m because a blue whale is 25. IT USED TO BE 3, "
+           "and every large species was silently clamped to it at authoring "
+           "time — a 25 m whale came out 2.9 m long, the spec on disk said "
+           "3.0, and nothing downstream had anything to complain about. Voxel "
+           "size is per species and scales with the animal; see "
+           "`tools/fishprobe.py --lattice`."),
+    P("fish.depth_ratio", "Body depth", 0.24, 0.05, 0.80, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Deepest part of the body divided by its length, and the single "
+           "biggest lever on what kind of fish it is. Real values: an eel is "
+           "0.06-0.10, a trout or a herring 0.18-0.25, a perch 0.30, a bream or "
+           "a sunfish 0.40-0.50, an angelfish over 0.6. Morphometrics calls "
+           "these anguilliform, fusiform, compressiform — this slider is that "
+           "axis."),
+    P("fish.width_ratio", "Body width", 0.58, 0.08, 1.80, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Width across the fish divided by its depth. Below about 0.35 it is "
+           "flattened side to side (a bream, a reef fish); around 0.9-1.1 it is "
+           "round in section (an eel, a catfish); above 1.2 it is flattened top "
+           "to bottom (a ray, a flatfish, a bullhead)."),
+    P("fish.depth_at", "Deepest point", 0.36, 0.12, 0.80, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How far back the body is deepest, as a fraction of its length. "
+           "Around 0.35 for most fish; pushed back past 0.5 for an ambush "
+           "predator that carries its mass toward the tail, which is what makes "
+           "a pike read as a pike."),
+    P("fish.fullness", "Swell", 3.0, 0.5, 12.0, 0.1, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How quickly the body swells to its full depth and how quickly it "
+           "falls away again. Low is a long even body that tapers gently; high "
+           "is a short deep one that reaches full depth just behind the head. "
+           "Deliberately independent of the deepest point above — the obvious "
+           "curve moves both at once and tuning a species then means chasing "
+           "one slider with another."),
+    P("fish.snout", "Snout depth", 0.30, 0.05, 0.95, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Depth at the very front, as a fraction of the maximum. Low is a "
+           "pointed head, high is a blunt one. An eel sits near 0.85 because it "
+           "is the same thickness all the way along."),
+    P("fish.peduncle", "Tail wrist", 0.30, 0.05, 0.95, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Depth where the tail fin joins, as a fraction of the maximum. A "
+           "fast open-water fish has a very slim wrist (0.12-0.18); a slow "
+           "bottom fish barely narrows at all."),
+    P("fish.belly", "Belly share", 0.52, 0.20, 0.80, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How much of the depth is below the body's axis rather than above "
+           "it. Above 0.5 gives a deep round belly with a flatter back; below "
+           "0.5 gives an arched back over a flat underside, which is what a "
+           "bottom-living fish has."),
+    P("fish.width_follow", "Width falloff", 1.15, 0.20, 2.50, 0.05, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How hard the fish flattens toward its tail. High values give the "
+           "knife-thin wrist a fast swimmer has; 1.0 keeps the section the same "
+           "shape all the way back, which is an eel."),
+    P("fish.section", "Section shape", 2.0, 1.0, 4.0, 0.05, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Cross-section roundness, as a superellipse exponent. 2 is an "
+           "ellipse. Near 1.2 the section is a diamond and the fish has a "
+           "knife-edged back and belly (a bream, a surgeonfish); near 3 it is a "
+           "rounded box and the fish is a tube (a catfish). This is the one "
+           "thing from the superformula literature that still moves a whole "
+           "voxel at this size."),
+    P("fish.head_frac", "Head length", 0.26, 0.08, 0.50, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Snout to gill cover, as a fraction of body length. Nothing is drawn "
+           "for the gills — this positions the eye and the pectoral fins, which "
+           "is all a head is at this size."),
+    P("fish.head_width", "Head span", 0.0, 0.0, 0.60, 0.01, group="fish",
+      kinds=("fish",),
+      help="How far the HEAD sticks out sideways, measured tip to tip as a "
+           "fraction of body length. 0 leaves the head the width the body's "
+           "own width profile gives it, which is right for every fish except "
+           "one group.\n\n"
+           "THIS IS THE HAMMERHEAD, and it is the only feature in the group "
+           "the body loft could not say. Everything else about a fish's width "
+           "follows its depth — one number, `Width falloff`, decides how the "
+           "whole animal flattens from nose to tail — so a head that is wider "
+           "than the body behind it was not expressible at all, and the "
+           "`hammerhead` keyword produced a shark with hammerhead proportions "
+           "and an ordinary head.\n\n"
+           "Published spans are quoted against TOTAL length (tail included) "
+           "and this slider is against BODY length (snout to tail wrist), "
+           "which on a shark with a 31% tail is about 1.31 times larger: a "
+           "scalloped hammerhead's 30% of total length is 0.39 here. "
+           "`tools/fishprobe.py --head` measures the built animal both ways so "
+           "the published figure can be checked directly. The fore-and-aft "
+           "depth of the hammer is DERIVED at a third of its span rather than "
+           "authored, because a cephalofoil is a wing and its chord goes with "
+           "its span; a slider for it could only ever be set wrong."),
+
+    P("fish.caudal_plane", "Tail plane", "vertical", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_CAUDAL_PLANES,
+      help="Which way the tail lies. A fish's is VERTICAL and beats side to "
+           "side; a whale's or a dolphin's fluke is HORIZONTAL and beats up "
+           "and down. It is one parameter rather than a second generator "
+           "because everything else about a fluke — how it flares out of the "
+           "wrist, its outline, the minimum a lobe may be — is what a tail fin "
+           "already does.\n\n"
+           "A real fluke also has a median NOTCH and this does not draw one: "
+           "the notch is about 5% of the fluke's span and the span about 25% "
+           "of body length, so the notch is 1.2% of the animal — under a voxel "
+           "on anything short of about 120 voxels long. Use the tail notch "
+           "slider if a species is big enough to hold one."),
+    P("fish.caudal_upper", "Upper tail lobe", 0.0, 0.0, 1.0, 0.01, group="fish",
+      kinds=("fish",),
+      help="How much further aft the UPPER lobe of the tail reaches than the "
+           "lower. 0 is a bony fish, where the two are equal. Sharks are "
+           "heterocercal and this is a strong silhouette cue: measured as the "
+           "ratio of the two lobes, a requiem shark is about 3:1, a nurse "
+           "shark 5:1 or more, and a great white about 1.1:1 — nearly "
+           "symmetric, which is why a slider says it better than a tail-shape "
+           "entry could."),
+    P("fish.caudal_shape", "Tail shape", "forked", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_CAUDAL_SHAPES,
+      help="The tail fin's outline. In real fish this tracks how the animal "
+           "swims: a deeply forked or crescent tail is a cruiser that never "
+           "stops, a truncate or rounded one is a fish that accelerates and "
+           "turns in cover. LUNATE AND EMARGINATE ARE NOT SEPARATE ENTRIES — "
+           "they are a deep and a shallow fork, so they come from 'forked' plus "
+           "the notch slider below, and an entry that duplicated a slider "
+           "position would be a choice that silently ignored it."),
+    P("fish.caudal_len", "Tail length", 0.20, 0.0, 0.60, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Tail fin length as a fraction of the body's. 0 removes it."),
+    P("fish.caudal_span", "Tail span", 1.15, 0.30, 3.00, 0.05, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Tail fin height as a multiple of the body's maximum depth. Above "
+           "about 1.6 with a deep notch it reads as the crescent tail of a tuna "
+           "or a shark."),
+    P("fish.caudal_fork", "Tail notch", 0.45, 0.0, 0.92, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How deep the V is cut into the trailing edge, as a fraction of the "
+           "fin's length. ONLY APPLIES TO THE 'forked' SHAPE. Under 0.25 is an "
+           "emarginate tail (a shallow notch, a perch); over 0.6 with a large "
+           "span is lunate (a crescent, a tuna)."),
+
+    P("fish.dorsal_shape", "Dorsal fin", "triangular", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_DORSAL_SHAPES,
+      help="Outline of the fin on the back. These differ in WHERE along the fin "
+           "the height is, which no single slider can say: 'sail' is broad and "
+           "high through the middle, 'spiny' is tallest at its leading edge and "
+           "rakes back, 'ridge' is the low even fold an eel or a catfish has."),
+    P("fish.dorsal_start", "Dorsal position", 0.38, 0.05, 0.85, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Where the dorsal fin begins, as a fraction of the body length back "
+           "from the snout."),
+    P("fish.dorsal_len", "Dorsal length", 0.26, 0.03, 0.85, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How much of the back it runs along. Long and low is an eel; short "
+           "and tall is a perch."),
+    P("fish.dorsal_height", "Dorsal height", 0.38, 0.0, 2.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Fin height as a fraction of the body's maximum depth. 0 removes it. "
+           "Under about 0.15 on a small fish it is one voxel and has no shape "
+           "left, so it reads as a rough edge rather than as a fin."),
+    P("fish.dorsal2_height", "Second dorsal height", 0.0, 0.0, 1.0, 0.01,
+      group="fish", kinds=("fish",),
+      help="A second fin further back on the spine. 0 is off, and off is right "
+           "for every bony fish here. Most SHARKS have one and it is usually a "
+           "nub — 2% of total length on a hammerhead against the first "
+           "dorsal's 13%, and 'minute' on a great white — but two bumps on a "
+           "back reads as a shark where one bump reads as a fish. The fin "
+           "height floor below is the only reason a fin that small survives."),
+    P("fish.dorsal2_start", "Second dorsal position", 0.62, 0.10, 0.95, 0.01,
+      group="fish", kinds=("fish",)),
+    P("fish.dorsal2_len", "Second dorsal length", 0.10, 0.03, 0.40, 0.01,
+      group="fish", kinds=("fish",)),
+    P("fish.adipose", "Adipose fin", False, kind="bool", group="fish",
+      kinds=("fish",),
+      help="The small fleshy bump between the dorsal and the tail that trout, "
+           "salmon and charr have and almost nothing else does. Three voxels, "
+           "and the only mark that separates a trout from every other slim "
+           "brown fish in a shoal."),
+    P("fish.anal_height", "Anal fin height", 0.32, 0.0, 1.2, 0.01, group="fish",
+      kinds=("fish",),
+      help="The fin under the tail end, as a fraction of body depth. Its "
+           "POSITION is not a slider: it ends just in front of the tail wrist "
+           "on every fish that has one."),
+    P("fish.anal_len", "Anal fin length", 0.16, 0.03, 0.50, 0.01, group="fish",
+      kinds=("fish",)),
+    P("fish.pectoral", "Pectoral fins", 0.26, 0.0, 1.2, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="The pair behind the head, as a fraction of body depth. These are "
+           "the only fins that stick out SIDEWAYS, so from anywhere but dead "
+           "broadside they are most of what says 'animal' rather than "
+           "'lozenge'. 0 removes them."),
+    P("fish.pectoral_aspect", "Pectoral chord", 1.20, 0.15, 3.0, 0.05,
+      group="fish", kinds=_SWIM_KINDS,
+      help="How long the paired fins are fore-and-aft, as a fraction of how "
+           "far they stick out. Around 1 is a fish's pectoral — about as long "
+           "as it is wide. Low values give the long narrow blade a whale has "
+           "for a flipper: a humpback's is 31% of its body length and 7% wide, "
+           "a ratio of about 0.24, and it is the most recognisable limb in the "
+           "sea."),
+    P("fish.pelvic", "Pelvic fins", 0.18, 0.0, 1.0, 0.01, group="fish",
+      kinds=("fish",),
+      help="A small pair under the belly. At this size they read as a notch in "
+           "the underside rather than as fins, and that notch is what stops the "
+           "belly being a smooth arc."),
+    P("fish.barbels", "Barbels", 0, 0, 4, 1, kind="int", group="fish",
+      kinds=("fish",),
+      help="Whiskers off the snout: a catfish, a carp, a sturgeon. Drawn as "
+           "face-connected threads starting on a snout voxel, so they are part "
+           "of the fish rather than a second asset floating in front of it."),
+    P("fish.barbel_len", "Barbel length", 0.10, 0.0, 0.60, 0.01, group="fish",
+      kinds=("fish",),
+      help="As a fraction of body length. Under about 0.05 there is nothing to "
+           "draw."),
+    P("fish.fin_thick", "Fin thickness", 1, 1, 3, 1, kind="int", group="fish",
+      kinds=_SWIM_KINDS,
+      help="Fin thickness in voxels. 1 is right for anything under about half a "
+           "metre; a bigger fish wants 2 or its fins disappear edge-on."),
+    P("fish.section_tail", "Section at the tail", 2.0, 1.0, 4.0, 0.05,
+      group="fish", kinds=_SWIM_KINDS,
+      help="Cross-section roundness at the tail wrist, where the slider above "
+           "sets it at the deepest point. Equal values give one section shape "
+           "all the way along, which is a fish. A CETACEAN NEEDS THEM "
+           "DIFFERENT: the literature gets a whale's diameter by dividing its "
+           "girth by pi — the trunk really is a barrel — while the tailstock "
+           "is explicitly elliptical, to the point that modelling it as a cone "
+           "gives the wrong volume. So a dolphin is 2.4 at the middle and 1.3 "
+           "at the wrist: a barrel that becomes a vertical blade."),
+    P("fish.fin_min_vox", "Smallest fin", 2.0, 0.0, 8.0, 0.5, group="fish",
+      kinds=_SWIM_KINDS,
+      help="No fin is drawn shorter than this many voxels, whatever its "
+           "authored fraction works out to. ON A LARGE ANIMAL THIS FLOOR IS "
+           "THE ONLY REASON THE FIN EXISTS. Fin size is authored as a share of "
+           "body depth, but the share that identifies a species does not scale "
+           "with the animal: a blue whale's dorsal fin is 1.0-1.4% of its "
+           "length and is exactly what separates a blue from a fin from a sei, "
+           "and faithfully proportioned it is under half a voxel. A minke's is "
+           "4% and a dolphin's 8-12%, so this floor is invisible on those. "
+           "Applied to the fin's peak, so the outline still tapers."),
+    P("fish.blowhole", "Blowhole", 0.0, 0.0, 3.0, 1.0, group="fish",
+      kinds=("cetacean",),
+      help="Radius in voxels of a dark mark on top of the head; 0 is off. A "
+           "cetacean breathes air and a fish does not, and this is the mark "
+           "that says so. Placed at 7.5% of the body length back from the "
+           "snout — the blowhole-to-dorsal-fin distance is the standard field "
+           "proxy for a dolphin's total length, so it is one of the "
+           "best-pinned landmarks on the animal."),
+    P("fish.eye_patch", "Eye patch", 0.0, 0.0, 4.0, 1.0, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Radius in voxels of a pale patch around the eye, with the pupil "
+           "drawn on top of it; 0 is off. This is the orca, and it is the "
+           "strongest single mark on any animal here. Drawn as a lozenge "
+           "roughly twice as long as it is tall.\n\n"
+           "THE '21.8 BY 5.9 cm ON A 6 m ANIMAL' THIS ROW USED TO QUOTE HAS "
+           "NO SOURCE — nobody has published orca eye patches in absolute "
+           "units, and those two figures match a pair of dimensionless "
+           "diversity indices in a saddle-patch paper. What is published is a "
+           "ratio: patch length is 0.37–0.41 of the blowhole-to-dorsal-fin "
+           "distance on the large-patched Antarctic types (Durban et al. "
+           "2016, n=19). No aspect ratio exists, so the one drawn is what the "
+           "lattice can hold. Real orca patches differ left from right on "
+           "about half of animals; at three voxels there is no asymmetry to "
+           "express that would not read as a mistake."),
+    P("fish.eye", "Eye", 1.0, 0.0, 3.0, 1.0, group="fish", kinds=_SWIM_KINDS,
+      help="Eye radius in voxels; 0 turns it off. Two voxels a side, and they "
+           "do more than any other two in the asset — a voxel animal without an "
+           "eye reads as an object, and with one it reads as facing somewhere. "
+           "A pale voxel is placed in front of the dark one, because a dark eye "
+           "on an olive or brown head vanishes without a contrast partner."),
+
+    P("fish.back_frac", "Dark back", 0.34, 0.0, 1.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Share of the body's depth, measured from the top down, that carries "
+           "the back colour. Countershading — dark above, pale below — is on "
+           "nearly every fish in open water for the same reason it is on "
+           "military aircraft: it cancels the light gradient and flattens the "
+           "animal against whatever is behind it. It is also the only thing "
+           "that gives a voxel fish a top and a bottom, because the silhouette "
+           "does not at this size."),
+    P("fish.belly_frac", "Pale belly", 0.26, 0.0, 1.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="The same, measured from the underside up."),
+
+    # --- shaped colour boundaries -------------------------------------------
+    #
+    # The two rows above draw the dark back and the pale belly as LEVEL LINES
+    # running the length of the animal. That is right for a fish and wrong for
+    # every dolphin: the three most recognisable colour schemes in the sea are
+    # not bands, blotches or patches, they are boundaries with a SHAPE. These
+    # three rows bend the two lines and nothing else, which is why they are
+    # three rows rather than a fourth colour field.
+    P("fish.field_curve", "Boundary shape", "flat", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_FIELD_CURVES,
+      help="Whether the dark back and the pale belly meet the flank along a "
+           "level line or a curved one.\n\n"
+           "FLAT is a level line at the height the two rows above set, which "
+           "is what a fish wears and what everything here wore until now. "
+           "CAPE dips the BACK's lower edge down onto the flank at one place "
+           "and lets it rise again — the dark saddle every dolphin carries, "
+           "which points down at the dorsal fin. FLAME lifts the BELLY's upper "
+           "edge up the flank at one place — the white blaze that flares up an "
+           "orca's side behind its middle, and the reason an orca reads as two "
+           "white shapes from the side rather than one. HOURGLASS does both at "
+           "the same station, so the dark and the white meet and pinch the "
+           "flank out between them; that crossing is the common dolphin's "
+           "criss-cross and it is the same curve twice, not a third mechanism."),
+    P("fish.curve_at", "Boundary waist", 0.55, 0.10, 0.95, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Where the curve reaches its extreme, as a fraction of body length "
+           "back from the snout. A delphinid cape dips under the dorsal fin "
+           "(0.40-0.50); an orca's ventral flame flares at 0.70-0.75."),
+    P("fish.curve_amount", "Boundary reach", 0.0, 0.0, 0.70, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="How far the boundary moves at that station, as a share of the "
+           "body's depth there. 0 leaves it flat whatever shape is chosen "
+           "above, which makes this the off switch for the whole mechanism.\n\n"
+           "IT HAS TO BE WORTH TWO VOXELS. The flank of a bottlenose dolphin "
+           "at its authored size is about twelve voxels deep, so 0.20 moves "
+           "the boundary two and a half voxels and 0.08 moves it one — which "
+           "is not a curve, it is a ragged line. `tools/fishprobe.py --marks` "
+           "prints the movement in voxels per species and flags anything under "
+           "two."),
+
+    # --- sex ----------------------------------------------------------------
+    #
+    # SEX RESEEDS, ON PURPOSE, AND THAT IS THE OPPOSITE OF WHAT `bird.pose`
+    # DOES. A perched raven and a flying raven are one animal in two postures,
+    # so the pose is excluded from the seeding hash (`SEED_INVARIANT`) and both
+    # come out the same raven. A male orca and a female orca are two animals.
+    # There is no individual that is "the same whale, but female", so seed 7
+    # male and seed 7 female are two different whales and this field is
+    # deliberately NOT in `SEED_INVARIANT`.
+    P("fish.sex", "Sex", "unsexed", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_SEXES,
+      help="Which sex of the species to draw. UNSEXED is the species average "
+           "and is what a spec carries until someone measures a difference; "
+           "MALE and FEMALE move the three measurements below apart.\n\n"
+           "The authored numbers describe the AVERAGE of the two sexes, and "
+           "the three ratios below are each a male-to-female ratio, applied as "
+           "the square root either way — so male divided by female is exactly "
+           "the ratio and neither sex is the default. That rule is why three "
+           "species were re-authored when this arrived: `orca`, `whale-shark` "
+           "and `sperm-whale` were each drawn from a male reference and said "
+           "so in their own notes, so their authored numbers were one sex "
+           "wearing the species' name."),
+    P("fish.sex_length", "Male:female length", 1.0, 0.40, 2.20, 0.01,
+      group="fish", kinds=_SWIM_KINDS,
+      help="Adult body length of the male divided by the female's. 1.0 is no "
+           "difference and is right for most of this library. Under 1 means "
+           "the FEMALE is the larger animal, which is the usual way round for "
+           "sharks: a whale shark is 8-9 m male against 14.5 m female, a ratio "
+           "of 0.60 and the largest sexual difference of any species here. "
+           "A sperm whale is the other way, 16 m against 11."),
+    P("fish.sex_dorsal", "Male:female dorsal", 1.0, 0.40, 3.00, 0.01,
+      group="fish", kinds=_SWIM_KINDS,
+      help="Height of the back fin, male divided by female. The orca is the "
+           "reason this exists and is the only species here that needs it: the "
+           "male's fin is 22-30% of his body length and the female's 13-18% of "
+           "hers, a ratio near 1.7, and it is the single most obvious "
+           "difference between two animals of one species anywhere in this "
+           "library."),
+    P("fish.sex_pectoral", "Male:female flipper", 1.0, 0.40, 2.50, 0.01,
+      group="fish", kinds=_SWIM_KINDS,
+      help="How far the paired fins reach, male divided by female. Orca "
+           "flippers are about 20% of body length in males against 11-13% in "
+           "females."),
+    P("fish.pattern", "Marking", "none", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=_FISH_PATTERNS,
+      help="ONE mark, not several: a flank twelve voxels deep cannot hold two "
+           "without them reading as noise. A horizontal STRIPE is the open-water "
+           "schooling mark; vertical BARS break the outline against weed and "
+           "reef; SPOTS and MOTTLE are the freshwater camouflage; a SADDLE is "
+           "blotches over the back only, which is what breaks the outline seen "
+           "from above by a bird."),
+    P("fish.pattern_count", "Marking count", 6, 1, 24, 1, kind="int", group="fish",
+      kinds=_SWIM_KINDS,
+      help="Number of bars, or roughly a third of the number of spots."),
+    P("fish.pattern_width", "Marking width", 0.22, 0.02, 0.90, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="For a stripe, its thickness as a share of body depth. For bars, the "
+           "share of each bar's spacing that is bar rather than gap."),
+    P("fish.pattern_pos", "Stripe height", 0.50, 0.0, 1.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Where the stripe sits: 0 is the belly line, 1 the top of the back. "
+           "Stripe only."),
+    P("fish.pattern_scale", "Blotch size", 0.20, 0.02, 1.0, 0.01, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Spot and blotch size as a fraction of body length. Spots, mottle "
+           "and saddle only."),
+    P("fish.pattern_strength", "Blotch coverage", 0.5, 0.0, 1.0, 0.01,
+      group="fish", kinds=_SWIM_KINDS,
+      help="The EXACT share of the fish the blotches cover, taken as a quantile "
+           "of the noise rather than as a threshold on it. Mottle and saddle "
+           "only. A plain threshold means whatever the noise happened to do, "
+           "which is the defect that left the rock weathering pass removing 20 "
+           "voxels out of 90,000 while reporting success."),
+
+    P("materials.fish_back", "Back", "skin_olive", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_flank", "Flank", "skin_silver", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_belly", "Belly", "skin_pale", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_fin", "Fins", "skin_olive", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_pattern", "Marking", "skin_dark", kind="choice",
+      group="fish", kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_eye", "Eye", "skin_dark", kind="choice", group="fish",
+      kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+    P("materials.fish_patch", "Eye patch", "skin_pale", kind="choice",
+      group="fish", kinds=_SWIM_KINDS, choices=materials.FISH_NAMES),
+
+    # --- detail entity ------------------------------------------------------
+    #
+    # NONE OF THIS IS READ BY ANY CODE, AND THAT IS DELIBERATE. Spawning fish
+    # into water bodies is a job for worldgen, the same way scattering trees is,
+    # and the `placement` group above has been authored-and-unread since the
+    # library began for exactly the same reason. What these rows are is the
+    # SPECIFICATION a spawner will be written against, stated in the same file
+    # the shape is stated in, so the two cannot drift apart.
+    #
+    # The one thing here that is not like `placement`: a fish is a DETAIL
+    # ENTITY. It has no saved state, nothing that happens to it is recorded, and
+    # it is deleted shortly after the player leaves. That is a promise about
+    # cost, and it is why a shoal of forty is affordable when forty trees would
+    # not be.
+    P("detail.entity_class", "Entity class", "detail", kind="choice",
+      group="detail", kinds=_SWIM_KINDS, choices=("detail", "persistent"),
+      help="'detail' means nothing about this individual is saved: it is "
+           "spawned from (species, seed) when the player is near, and when it "
+           "despawns it is gone. Anything that has to survive being left and "
+           "come back the same is 'persistent' and costs a save slot."),
+    P("detail.despawn_m", "Despawn distance (m)", 45.0, 5.0, 1000.0, 5.0,
+      group="detail", kinds=_SWIM_KINDS,
+      help="How far the player has to get before this individual is removed. "
+           "Water is murky and a 25 cm fish is under a voxel of screen space "
+           "well before this, so the number is about cost, not visibility."),
+    P("detail.despawn_delay_s", "Despawn delay (s)", 4.0, 0.0, 120.0, 0.5,
+      group="detail", kinds=_SWIM_KINDS,
+      help="Grace period after the player passes the distance above. Without "
+           "one, walking along a bank at the despawn radius makes the shoal "
+           "flicker in and out."),
+    P("detail.school_min", "Shoal size, least", 1, 1, 200, 1, kind="int",
+      group="detail", kinds=_SWIM_KINDS),
+    P("detail.school_max", "Shoal size, most", 8, 1, 400, 1, kind="int",
+      group="detail", kinds=_SWIM_KINDS,
+      help="A shoal is spawned as one decision: N individuals of this species "
+           "from consecutive seeds, so they vary the way the `variation` group "
+           "says. Solitary species set both ends to 1."),
+    P("detail.school_radius_m", "Shoal spread (m)", 2.5, 0.2, 500.0, 0.5,
+      group="detail", kinds=_SWIM_KINDS,
+      help="Radius the shoal occupies. Tight for a bait ball, wide for a few "
+           "trout holding station in a pool."),
+    P("detail.water", "Water type", "any", kind="choice", group="detail",
+      kinds=_SWIM_KINDS,
+      choices=("any", "ocean", "river", "lake", "shallow", "reef"),
+      help="Which water bodies this species may spawn in. 'shallow' is the "
+           "margin of anything; 'reef' is shallow salt water, which the world "
+           "does not classify yet and which this row is a request for."),
+    P("detail.depth_min_m", "Depth below surface, least (m)", 0.3, 0.0, 200.0,
+      0.1, group="detail", kinds=_SWIM_KINDS,
+      help="How far under the surface the fish holds. A surface-feeding minnow "
+           "is near 0; a bottom fish sets both of these deep."),
+    P("detail.depth_max_m", "Depth below surface, most (m)", 6.0, 0.1, 2000.0,
+      0.5, group="detail", kinds=_SWIM_KINDS),
+    P("detail.min_water_depth_m", "Needs water at least (m) deep", 0.5, 0.05,
+      100.0, 0.05, group="detail", kinds=_SWIM_KINDS,
+      help="Water shallower than this holds none of this species. This is the "
+           "gate that keeps a pike out of a puddle."),
+    P("detail.per_100m2", "Individuals per 100 m² of water", 3.0, 0.0, 300.0,
+      0.5, group="detail", kinds=_SWIM_KINDS,
+      help="Expected number over 100 square metres of water SURFACE, before the "
+           "biome weights are applied. Surface area rather than volume because "
+           "that is what a worldgen pass can cheaply measure per chunk."),
+
+    # --- bird ---------------------------------------------------------------
+    #
+    # A bird here is twenty to ninety voxels long. Same rule as the fish group:
+    # nothing that moves the outline by less than one voxel over its whole
+    # range is a slider, and `tools/birdprobe.py` prints DEAD for anything that
+    # turns out not to. `docs/bird-shape-research.md` lists what was left out
+    # and what it would have bought.
+    #
+    # WHAT MAKES THIS GROUP DIFFERENT FROM THE FISH GROUP. A fish is one solid
+    # and every parameter shapes it. A bird is six parts at angles to each
+    # other, and the five `*_frac` rows below -- which say how the length is
+    # divided between bill, head, neck, body and tail -- are, between them, the
+    # strongest thing in the file. Birders identify birds by proportion and
+    # stance before colour and have a word for it; those five rows plus
+    # `posture_deg` are that.
+    P("bird.length_m", "Length (m)", 0.24, 0.15, 2.50, 0.01, group="bird",
+      kinds=("bird",),
+      help="Bill tip to tail tip, which is the measurement every field guide "
+           "quotes. At the 1 cm lattice this is also the voxel count: a 0.24 m "
+           "robin is 24 voxels long.\n\n"
+           "THE FLOOR IS 15 cm AND EVERY SPECIES IN THE LIBRARY IS AT LEAST "
+           "20 cm, INCLUDING THE ONES THAT ARE NOT. A goldcrest is 9 cm and a "
+           "wren is 10, and at 9 voxels there is no bird there — no bill, no "
+           "eye, no tail shape. The species that are enlarged say so in their "
+           "own notes, so nobody later 'corrects' them back to life size."),
+    P("bird.bill_frac", "Bill share", 0.07, 0.01, 0.30, 0.005, group="bird",
+      kinds=("bird",),
+      help="Share of the total length that is bill. The five share rows are "
+           "NORMALISED, so they are proportions and the length slider still "
+           "means what it says. Real values: a songbird 0.05, a woodpecker "
+           "0.10, a heron 0.17, a kingfisher 0.20, a curlew 0.25."),
+    P("bird.head_frac", "Head share", 0.13, 0.04, 0.35, 0.005, group="bird",
+      kinds=("bird",),
+      help="Share of the total length that is head. An owl and a kingfisher "
+           "are big-headed; a heron and a swan are not."),
+    P("bird.neck_frac", "Neck share", 0.05, 0.0, 0.45, 0.005, group="bird",
+      kinds=("bird",),
+      help="Share of the total length that is visible neck. A songbird sits "
+           "near 0.03 — it has a neck and keeps it pulled in — a duck 0.10, a "
+           "heron 0.28, a swan 0.40. This is the single clearest separator "
+           "between a wading bird and everything else at twenty voxels."),
+    P("bird.body_frac", "Body share", 0.40, 0.15, 0.70, 0.005, group="bird",
+      kinds=("bird",)),
+    P("bird.tail_frac", "Tail share", 0.35, 0.05, 0.65, 0.005, group="bird",
+      kinds=("bird",),
+      help="Share of the total length that is tail. A wren 0.20, a robin 0.33, "
+           "a magpie 0.55, a macaw 0.58. Long tails are the other half of the "
+           "proportion story and they cost almost nothing to draw."),
+    P("bird.posture_deg", "Posture", 30.0, -15.0, 82.0, 1.0, group="bird",
+      kinds=("bird",),
+      help="How far the body is tilted nose-up from level. A duck and a heron "
+           "lie flat at 0-10; a thrush sits at 25-35; a robin, a wren and an "
+           "owl sit up at 45-60; a woodpecker clinging to a trunk is "
+           "near-vertical at 75-80. One number, and it changes the silhouette "
+           "more than any colour does. A flying bird uses a third of this, "
+           "because a bird in the air lies along its own line of travel "
+           "whatever it perches at."),
+
+    P("bird.body_depth", "Body depth", 0.62, 0.25, 1.40, 0.01, group="bird",
+      kinds=("bird",),
+      help="Deepest part of the body divided by the body's own length (not the "
+           "total length). Around 0.55-0.70 for most birds; a plump gamebird or "
+           "a robin in cold weather goes past 0.9; a swift or a swallow drops "
+           "to 0.4."),
+    P("bird.body_width", "Body width", 0.82, 0.35, 1.60, 0.01, group="bird",
+      kinds=("bird",),
+      help="Width across the body divided by its depth. Birds are much rounder "
+           "in section than fish: nearly everything sits between 0.75 and 0.95. "
+           "A duck or a gull is broader (1.0-1.2)."),
+    P("bird.chest_at", "Deepest point", 0.32, 0.10, 0.75, 0.01, group="bird",
+      kinds=("bird",),
+      help="How far back the body is deepest, measured from the BREAST. A "
+           "bird's mass sits forward, over the flight muscle, which is the "
+           "opposite of a fish — so this is usually 0.25-0.40 where a fish's is "
+           "0.36-0.58."),
+    P("bird.breast", "Breast fullness", 0.66, 0.20, 0.98, 0.01, group="bird",
+      kinds=("bird",),
+      help="Depth at the very front of the body, as a fraction of the maximum. "
+           "A BIRD'S FRONT END IS BLUNT: the flight muscle is the deepest thing "
+           "on the animal and it starts immediately behind the neck. Authoring "
+           "this at a fish's snout values (0.25-0.40) gives a bird that reads "
+           "as a fish standing on end."),
+    P("bird.rump", "Rump depth", 0.42, 0.08, 0.95, 0.01, group="bird",
+      kinds=("bird",),
+      help="Depth where the tail joins, as a fraction of the maximum. Low on a "
+           "swallow or a swift, high on a duck."),
+    P("bird.fullness", "Swell", 3.2, 0.5, 12.0, 0.1, group="bird",
+      kinds=("bird",),
+      help="How quickly the body swells to full depth and falls away again. "
+           "Deliberately independent of the deepest point above, so tuning a "
+           "species does not mean chasing one slider with another."),
+    P("bird.belly", "Belly share", 0.52, 0.20, 0.80, 0.01, group="bird",
+      kinds=("bird",),
+      help="How much of the depth sits below the body axis rather than above "
+           "it. Above 0.5 gives the deep round belly of a pigeon or a "
+           "gamebird; below 0.5 an arched back over a flat underside."),
+    P("bird.section", "Section shape", 2.1, 1.0, 4.0, 0.05, group="bird",
+      kinds=("bird",),
+      help="Cross-section roundness, as a superellipse exponent. 2 is an "
+           "ellipse and nearly every bird is close to it. Above 2.6 the body is "
+           "a rounded box, which is what a duck floating is."),
+    P("bird.neck_thick", "Neck thickness", 0.45, 0.08, 1.20, 0.01, group="bird",
+      kinds=("bird",),
+      help="Neck diameter as a fraction of body depth. A heron's is a pipe "
+           "(0.18); an owl has no visible neck at all and wants this near 1.0 "
+           "so head and body run together."),
+    P("bird.neck_up_deg", "Neck angle", 30.0, -40.0, 85.0, 1.0, group="bird",
+      kinds=("bird",),
+      help="How far above the body axis the neck leaves the shoulders. High "
+           "for an upright wader, near zero for a duck, negative for a bird "
+           "reaching down to feed."),
+    P("bird.head_size", "Head size", 1.0, 0.4, 2.2, 0.01, group="bird",
+      kinds=("bird",),
+      help="Multiplier on the head, over and above its share of the length. An "
+           "owl and a kingfisher are 1.5-1.8; a heron and a swan are 0.6-0.8. "
+           "Head size against body size is one of the cues a birder names first "
+           "and one of the very few that survives at ten voxels."),
+    P("bird.crest", "Crest", 0.0, 0.0, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="A back-swept spike of feathers off the crown. Four to eight voxels, "
+           "and on a jay, a hoopoe, a lapwing or a lark it is the single most "
+           "identifiable thing about the animal. 0 removes it."),
+
+    P("bird.bill_depth", "Bill depth", 0.35, 0.06, 1.20, 0.01, group="bird",
+      kinds=("bird",),
+      help="Bill depth at its base, as a fraction of head diameter. THIS IS "
+           "WHAT SAYS WHAT THE BIRD EATS. A seed-cracking finch is a deep cone "
+           "(0.55-0.8); an insect-picking warbler is a needle (0.10-0.18); a "
+           "raptor and a crow are in between and heavy."),
+    P("bird.bill_curve", "Bill curve", 0.0, -0.6, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="Bends the bill's CENTRELINE. Positive is decurved — a curlew, a "
+           "hoopoe, a treecreeper; negative is recurved — an avocet. 0 is "
+           "straight, which is most birds. This bends the bill rather than "
+           "aiming it: a straight bill pointing downhill is a different animal "
+           "and looks close enough in a render to survive several passes."),
+    P("bird.bill_hook", "Bill hook", 0.0, 0.0, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="Drops the last fifth of the bill sharply. A raptor's bill is "
+           "straight for four fifths of its length and then hooks, which is "
+           "the entire visual difference between an eagle and a stork with the "
+           "same bill length. Separate from the curve above because it is a "
+           "different shape, not more of the same one."),
+    P("bird.bill_gape", "Bill width", 0.15, 0.0, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="How wide the bill is across. Near 0 is a needle or a dagger — a "
+           "heron, a kingfisher, a warbler. Near 1 is a spoon — a duck, a "
+           "spoonbill. A duck's bill and a heron's are the same length and "
+           "nobody confuses them, and this is why."),
+
+    P("bird.tail_shape", "Tail shape", "square", kind="choice", group="bird",
+      kinds=("bird",), choices=_TAIL_SHAPES,
+      help="The tail's outline, named the way a field guide names it. These "
+           "are statements about the LENGTHS of the feathers across the fan: "
+           "GRADUATED and WEDGE mean the central pair is longest (a magpie, a "
+           "raven, a macaw), FORKED and NOTCHED mean the outer pair is (a "
+           "swallow, a swift, a house martin), SQUARE means they are all the "
+           "same, ROUNDED is square with the corners taken off, POINTED is "
+           "graduated taken to its limit."),
+    P("bird.tail_width", "Tail width", 0.42, 0.10, 1.40, 0.01, group="bird",
+      kinds=("bird",),
+      help="How wide the tail fan is, as a fraction of its own length. Wide on "
+           "a buzzard or a jay, narrow on a swift."),
+    P("bird.tail_fork", "Fork depth", 0.30, 0.0, 0.90, 0.01, group="bird",
+      kinds=("bird",),
+      help="How deeply the centre of the tail is cut away. ONLY APPLIES TO THE "
+           "'forked' AND 'notched' SHAPES. A house martin is about 0.25; a barn "
+           "swallow with full streamers is 0.7 and up."),
+    P("bird.tail_droop", "Tail carriage", 0.55, -0.5, 1.5, 0.01, group="bird",
+      kinds=("bird",),
+      help="How closely the tail follows the body's angle. 1 continues the body "
+           "line straight out; 0 hangs the tail level whatever the posture; "
+           "negative cocks it up, which is a wren."),
+    P("bird.tail_thick", "Tail thickness", 1, 1, 3, 1, kind="int", group="bird",
+      kinds=("bird",),
+      help="Tail thickness in voxels. 1 is right for anything under about half "
+           "a metre; a big raptor wants 2 or the tail disappears edge-on."),
+
+    P("bird.pose", "Pose", "perched", kind="choice", group="bird",
+      kinds=("bird",), choices=_BIRD_POSES,
+      help="Folded wings or spread ones. THIS IS TWO DIFFERENT ANIMALS AND NOT "
+           "ONE ANIMAL AT TWO ROTATIONS: a folded wing is a three-voxel bulge "
+           "lying along the flank and a spread one is a one-voxel plate "
+           "reaching thirty voxels out, and no rotation turns one into the "
+           "other. One generation produces one asset, so an asset carries one "
+           "pose; producing the other costs one changed field in this spec.\n\n"
+           "ONE THING A SPAWNER MUST KNOW: changing this changes the spec hash, "
+           "so species X seed 7 perched and species X seed 7 flying are two "
+           "different individuals, not one individual in two poses. If a bird "
+           "has to land and stay the same bird, that is a change to "
+           "`pipeline.rng_for`, not to this row."),
+    P("bird.wing_shape", "Wing planform", "elliptical", kind="choice",
+      group="bird", kinds=("bird",), choices=_WING_SHAPES,
+      help="Savile's four wing types, which map almost one-to-one onto the "
+           "groups a player would name. ELLIPTICAL: broad, rounded, built to "
+           "turn in cover — corvids, gamebirds, woodland songbirds. POINTED: "
+           "swept and tapering to a point, built for speed — falcons, swifts, "
+           "swallows, terns. SOARING: a long narrow plank of near-constant "
+           "chord — gulls, albatrosses. SLOTTED: broad, barely tapered, and "
+           "finished with separated finger feathers — eagles, buzzards, storks, "
+           "vultures. ONLY VISIBLE IN THE FLYING POSE; a folded wing is a "
+           "folded wing whatever planform it opens into."),
+    P("bird.wing_span", "Wingspan", 1.7, 0.8, 4.5, 0.05, group="bird",
+      kinds=("bird",),
+      help="Wingspan divided by total length. A wren 1.3, a songbird 1.5-1.8, "
+           "a swallow 1.8, a pigeon 1.9, a buzzard 2.4, a gull 2.7, an "
+           "albatross 4.0. Only drawn in the flying pose."),
+    P("bird.wing_aspect", "Aspect ratio", 6.0, 2.5, 18.0, 0.1, group="bird",
+      kinds=("bird",),
+      help="Wingspan squared over wing area, the number every wing-morphology "
+           "table is published in — and here it is what sets the CHORD, since "
+           "the span is already set above. A gamebird is 4-5, a songbird 5-6, "
+           "an eagle 6-7, a gull 10-12, an albatross 15+. Only drawn in the "
+           "flying pose."),
+    P("bird.wing_sweep", "Wing sweep", 0.25, -0.2, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="How far back the wingtips are carried. Near 0 the wings are held "
+           "straight out from the shoulders; at 1 they rake right back, which "
+           "is a falcon in a stoop or a swift. Only drawn in the flying pose."),
+    P("bird.wing_dihedral", "Wing angle", 0.10, -0.6, 0.8, 0.01, group="bird",
+      kinds=("bird",),
+      help="Whether the wings are carried up in a shallow V, level, or drooped. "
+           "A harrier and a vulture hold a strong V; a buzzard is nearly flat; "
+           "a bird on a downstroke is negative. Cheap, and it is most of what "
+           "stops a flock of eight from reading as eight copies."),
+    P("bird.wing_slots", "Wingtip fingers", 0, 0, 6, 1, kind="int", group="bird",
+      kinds=("bird",),
+      help="Separated primary feathers at the wingtip. ONLY APPLIES TO THE "
+           "'slotted' PLANFORM. 5-6 on an eagle or a vulture, 4 on a buzzard, "
+           "0 everywhere else. This is real geometry — daylight between the "
+           "fingers — and it is the most legible thing about a big soaring bird "
+           "seen from below."),
+    P("bird.wing_thick", "Wing thickness", 1, 1, 3, 1, kind="int", group="bird",
+      kinds=("bird",),
+      help="Wing thickness in voxels. 1 under about half a metre; a large "
+           "raptor wants 2-3 or the wing vanishes when the camera is level "
+           "with it."),
+    P("bird.wing_fold", "Folded wing reach", 0.45, 0.0, 1.30, 0.01, group="bird",
+      kinds=("bird",),
+      help="How far the closed wingtips reach down the tail, as a fraction of "
+           "the tail's length. ONLY APPLIES TO THE PERCHED POSE, and it is the "
+           "one wing cue that survives folding: a swift's primaries reach past "
+           "its tail tip (1.1+) and a wren's stop at its rump (0.1). More "
+           "reliable than colour for separating a long-winged bird from a "
+           "short-winged one."),
+
+    P("bird.leg_len", "Leg length", 0.10, 0.0, 0.45, 0.005, group="bird",
+      kinds=("bird",),
+      help="Leg length as a fraction of total length. A songbird 0.08-0.12, a "
+           "pigeon 0.09, a gull 0.15, a heron 0.33. Only drawn in the perched "
+           "pose — a flying bird tucks its legs into its belly feathers on "
+           "nearly every species, and a pair of one-voxel threads trailing "
+           "under the silhouette is four voxels of noise."),
+    P("bird.leg_thick", "Leg thickness", 1.0, 1.0, 4.0, 0.5, group="bird",
+      kinds=("bird",),
+      help="In voxels. Almost always 1: a tarsus is under a centimetre thick on "
+           "everything smaller than a heron, so at the 1 cm lattice a leg is a "
+           "one-voxel thread whatever the species. Length is the parameter that "
+           "matters."),
+
+    P("bird.eye", "Eye", 1.0, 0.0, 3.0, 1.0, group="bird", kinds=("bird",),
+      help="Eye radius in voxels; 0 turns it off. Two voxels a side and they do "
+           "more than any other two in the asset — a voxel animal without an "
+           "eye reads as an object, and with one it reads as facing somewhere. "
+           "A pale voxel goes in front of the dark one, because a dark eye on a "
+           "dark head vanishes without a contrast partner."),
+    P("bird.upperparts", "Upperparts share", 0.50, 0.0, 1.0, 0.01, group="bird",
+      kinds=("bird",),
+      help="Share of the body's depth, measured from the top down, that carries "
+           "the upperparts colour; the rest is underparts. Upperparts against "
+           "underparts is THE division every field guide uses, and it is a "
+           "single boundary rather than the fish's three bands because a bird "
+           "has no flank worth a third colour. 1.0 makes the bird one colour "
+           "all over, which is a raven; 0.0 makes it underparts all over, which "
+           "is nothing."),
+    P("bird.head_mark", "Head marking", "none", kind="choice", group="bird",
+      kinds=("bird",), choices=_HEAD_MARKS,
+      help="One mark on the head. CAP is a coloured crown — a tit, a blackcap, "
+           "a black-headed gull. MASK is a band through the eye — a shrike, a "
+           "kingfisher; it works by putting the eye ON its edge rather than in "
+           "its middle. SUPERCILIUM is the pale eyebrow stripe over it. THROAT "
+           "is a coloured bib — a robin, a great tit, a swallow. COLLAR is a "
+           "ring round the neck."),
+    P("bird.wing_mark", "Wing marking", "none", kind="choice", group="bird",
+      kinds=("bird",), choices=_WING_MARKS,
+      help="One mark on the wing. BAR and DOUBLEBAR are wing bars — the pale "
+           "tips of one or two rows of coverts, running ACROSS the wing. PANEL "
+           "colours the outer wing, which is a speculum or a flash. TIP colours "
+           "only the outermost part, which is a gull's black wingtips and the "
+           "most reliable gull mark there is."),
+    P("bird.body_mark", "Body marking", "none", kind="choice", group="bird",
+      kinds=("bird",), choices=_BODY_MARKS,
+      help="One mark on the body. BARRED runs across (a sparrowhawk's "
+           "underparts, a gamebird); STREAKED runs along (a lark, a pipit, a "
+           "song thrush); SPECKLED is spots (a starling); BREASTBAND is one "
+           "band across the chest (a ringed plover, a great spotted "
+           "woodpecker).\n\n"
+           "THREE MARKS, WHERE A FISH GETS ONE, and that is not a relaxation of "
+           "the rule — it is the same rule. A fish's stripe and its bars are "
+           "drawn on the same twelve-voxel flank, so two of them is noise. A "
+           "bird's cap is on its head, its wing bar is on its wing and its "
+           "streaking is on its breast, and those three sets of voxels do not "
+           "overlap at all."),
+    P("bird.mark_count", "Marking count", 5, 1, 10, 1, kind="int", group="bird",
+      kinds=("bird",),
+      help="Number of bars along the bird, or of streaks across it. THE "
+           "CEILING IS 10 AND IT USED TO BE 24, because 24 does not exist at "
+           "this size: a 20 cm bird has a body eight voxels long, so 24 bars "
+           "is a period of a third of a voxel and one bar and twenty-four "
+           "come out identical — every column ends up carrying some mark. "
+           "`tools/birdprobe.py` measured exactly that and reported the "
+           "slider DEAD. Even 10 only reads on the largest species; on a "
+           "songbird, five is the practical limit and it is the same "
+           "two-on-two-off floor the fish work measured for bars."),
+    P("bird.mark_width", "Marking width", 0.28, 0.02, 0.90, 0.01, group="bird",
+      kinds=("bird",),
+      help="How wide each mark is, as a share of its own spacing — or for the "
+           "head and wing marks, how far the mark reaches. Below about 2 voxels "
+           "a mark stops reading at all, whatever colour it is."),
+    P("bird.mark_strength", "Speckle coverage", 0.35, 0.0, 1.0, 0.01,
+      group="bird", kinds=("bird",),
+      help="The EXACT share of the body the speckles cover, taken as a quantile "
+           "of the noise rather than as a threshold on it. SPECKLED only. A "
+           "plain threshold means whatever the noise happened to do, which is "
+           "the defect that left the rock weathering pass removing 20 voxels "
+           "out of 90,000 while reporting success."),
+
+    P("materials.bird_back", "Upperparts", "skin_brown", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_belly", "Underparts", "plume_white", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_head", "Head and neck", "skin_brown", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_wing", "Wing and tail", "skin_brown", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_mark", "Wing and body marking", "skin_dark", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    # THE HEAD GETS ITS OWN MARKING COLOUR and no other region does. That is
+    # not symmetry-breaking for its own sake: CUB-200-2011, the standard
+    # expert-annotated bird dataset, gives the head ELEVEN pattern values
+    # (spotted, malar, crested, masked, unique, eyebrow, eyering, plain,
+    # eyeline, striped, capped) and gives the breast, back, belly, wing and
+    # tail FOUR each (solid, spotted, striped, multi-coloured). Ornithologists
+    # spend nearly three times the vocabulary on the head, and the species that
+    # needed this here agree: a great spotted woodpecker is white-panelled on
+    # the wing and CRIMSON on the nape, and one shared marking colour makes it
+    # choose.
+    P("materials.bird_head_mark", "Head marking", "skin_dark", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_bill", "Bill and legs", "beak_horn", kind="choice",
+      group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
+    P("materials.bird_eye", "Eye", "skin_dark", kind="choice", group="bird",
+      kinds=("bird",), choices=materials.BIRD_NAMES),
+
+    # --- flock: a bird as a detail entity -----------------------------------
+    #
+    # NONE OF THIS IS READ BY ANY CODE, AND THAT IS DELIBERATE, exactly as with
+    # the fish `detail` group above. Spawning birds is a job for worldgen; what
+    # these rows are is the SPECIFICATION a spawner will be written against,
+    # stated in the same file the shape is stated in so the two cannot drift.
+    #
+    # A SEPARATE GROUP RATHER THAN REUSING `detail`. Five of that group's
+    # eleven rows are about water depth, and a bird does not have a water
+    # depth. The four that would have transferred are cheaper to restate than
+    # the four that would have had to be hidden per kind.
+    P("flock.entity_class", "Entity class", "detail", kind="choice",
+      group="flock", kinds=("bird",), choices=("detail", "persistent"),
+      help="'detail' means nothing about this individual is saved: it is "
+           "spawned from (species, seed) when the player is near, and when it "
+           "despawns it is gone. Anything that has to survive being left and "
+           "come back the same is 'persistent' and costs a save slot."),
+    P("flock.despawn_m", "Despawn distance (m)", 90.0, 5.0, 800.0, 5.0,
+      group="flock", kinds=("bird",),
+      help="How far the player has to get before this individual is removed. "
+           "Much larger than a fish's, and for a real reason: a soaring bird is "
+           "the one detail entity in this library that is meant to be seen a "
+           "long way off, and an eagle that pops out at 45 m is worse than no "
+           "eagle."),
+    P("flock.despawn_delay_s", "Despawn delay (s)", 6.0, 0.0, 120.0, 0.5,
+      group="flock", kinds=("bird",),
+      help="Grace period after the player passes the distance above. Without "
+           "one, walking at the despawn radius makes the flock flicker."),
+    P("flock.size_min", "Flock size, least", 1, 1, 200, 1, kind="int",
+      group="flock", kinds=("bird",)),
+    P("flock.size_max", "Flock size, most", 4, 1, 2000, 1, kind="int",
+      group="flock", kinds=("bird",),
+      help="A flock is spawned as one decision: N individuals of this species "
+           "from consecutive seeds, so they vary the way the `variation` group "
+           "says. Solitary species set both ends to 1; a starling roost is in "
+           "the hundreds."),
+    P("flock.spread_m", "Flock spread (m)", 12.0, 0.2, 400.0, 0.5,
+      group="flock", kinds=("bird",),
+      help="Radius the flock occupies."),
+    P("flock.perch", "Where it perches", "canopy", kind="choice",
+      group="flock", kinds=("bird",),
+      choices=("ground", "shrub", "canopy", "cliff", "waterside", "water",
+               "air"),
+      help="What this species sits on when it is not flying, which is the gate "
+           "a spawner needs before it can place one. 'air' means the species is "
+           "essentially never seen perched — a swift — and should spawn flying "
+           "whatever its own pose says."),
+    P("flock.height_min_m", "Flying height, least (m)", 2.0, 0.0, 500.0, 1.0,
+      group="flock", kinds=("bird",),
+      help="Height above the ground this species flies at. A swallow hunts at "
+           "1-15 m; a soaring eagle holds 100-400."),
+    P("flock.height_max_m", "Flying height, most (m)", 25.0, 0.5, 3000.0, 5.0,
+      group="flock", kinds=("bird",)),
+    P("flock.flight_share", "Share of time flying", 0.35, 0.0, 1.0, 0.01,
+      group="flock", kinds=("bird",),
+      help="How often an individual of this species is in the air rather than "
+           "perched. This is what tells a spawner which POSE to ask for, and it "
+           "is why the pose above is a species property and not a global "
+           "setting: a vulture is 0.9 and a wren is 0.05."),
+    P("flock.per_hectare", "Individuals per hectare", 4.0, 0.0, 500.0, 0.5,
+      group="flock", kinds=("bird",),
+      help="Expected number over a hectare of suitable ground, before the biome "
+           "weights are applied. A hectare rather than the fish group's 100 m² "
+           "because birds are spread over two orders of magnitude more ground "
+           "than fish are."),
+
+    # Wood and leaf, and ONLY for the two kinds made of wood and leaf.
+    #
+    # The `materials` group is shared by every kind, so these three showed up in
+    # the Rocks, Grass, Reeds, Flowers and Fish sections as well -- five
+    # sections offering a choice of bark for something with no bark in it. The
+    # house rule is that a section does not show a slider it cannot use, it
+    # leaves it out, and `pipeline.build` only reads these two for the kinds
+    # that grow a skeleton.
     P("materials.bark", "Bark", "bark", kind="choice", group="materials",
-      choices=materials.WOOD_NAMES),
+      kinds=("tree", "bush"), choices=materials.WOOD_NAMES),
     P("materials.core", "Heartwood", "heartwood", kind="choice", group="materials",
-      choices=materials.WOOD_NAMES),
+      kinds=("tree", "bush"), choices=materials.WOOD_NAMES),
     P("materials.leaf", "Leaf", "leaf_broadleaf", kind="choice", group="materials",
-      choices=materials.LEAF_NAMES),
+      kinds=("tree", "bush"), choices=materials.LEAF_NAMES),
 )
 del P
 
@@ -502,7 +1855,76 @@ def canonical_json(spec: dict) -> str:
 
 
 def spec_hash(spec: dict) -> str:
+    """What this SPEC is. Library identity: two specs with this hash are the
+    same authored species, and `notes` is left out because it is free text for
+    a person and changing it must not make the library think it has a new
+    species.
+
+    NOT what decides which individual you get -- that is `seed_hash` below, and
+    the two are deliberately different functions.
+    """
     body = {k: v for k, v in spec.items() if k != "notes"}
+    return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
+
+
+# Fields a spec may carry that must NOT change which individual comes out.
+#
+# WHY THIS IS A SECOND HASH AND NOT AN EDIT TO spec_hash. `spec_hash` answers
+# "which species is this", and the library, the .vxa metadata and the cache key
+# all want a pose change to be a different entry -- a perched raven and a flying
+# raven are two assets, saved separately and placed separately. `pipeline.rng_for`
+# is asking a different question: "which individual of this species is seed 7".
+# The answer to that must not move when the pose does.
+#
+# WHAT WAS WRONG. `common-raven` seed 7 perched and `common-raven` seed 7 flying
+# were two DIFFERENT ravens -- different length, different marking phase,
+# different speckle field -- because the pose is part of the spec, the spec hash
+# is mixed into the seed, and a different seed is a different animal. So a bird
+# could not land: it changed size and markings on the way down. `forge/bird.py`
+# wrote that up as something to fix here rather than there, and this is it.
+#
+# HOW IT IS APPLIED, AND WHY IT IS NOT A DELETE. Every validated spec carries
+# every parameter, birds included, because `validate` starts from
+# `default_spec()` -- so DELETING `bird.pose` from the body would change the
+# canonical JSON of a tree, a rock and a fish as well, and reseed the entire
+# library for the second time in a day. Instead the field is NORMALISED to the
+# value a default spec has. Anything that never authored a pose already holds
+# that value, so its canonical JSON comes back byte for byte identical and its
+# seeding is untouched; and the fifteen perched species are untouched too,
+# because "perched" IS the default. Only the five species authored `flying`
+# reseed, once, onto the individual their perched twin already was -- which is
+# the point of the change.
+#
+# WHAT ELSE WAS CONSIDERED AND LEFT OUT. `placement.*`, `biomes.*` and `flock.*`
+# are read by no generator, so on the merits they belong here too: retuning
+# where a species lives should not redraw the animal. They are out because every
+# one of them is authored away from its default on nearly every spec, so
+# normalising them would reseed the whole library -- the exact cost this change
+# is written to avoid. If a library-wide reseed is ever acceptable for another
+# reason, that is the moment to add them, and not before. `resolution_cm` is out
+# for a different reason: `pipeline.build(..., resolution_cm=...)` already
+# overrides the lattice without touching the spec, which is how
+# `tools/birdprobe.py --lattice` compares 1 cm with 5 cm on one individual.
+SEED_INVARIANT: tuple[str, ...] = ("bird.pose",)
+
+
+def seed_hash(spec: dict) -> str:
+    """Which INDIVIDUAL of a species you get. See `SEED_INVARIANT` above.
+
+    Equal to `spec_hash` for everything that does not author a field in that
+    list, which today is every spec in the library except the five birds that
+    fly. `tools/birdprobe.py --pose` measures both halves of that: that the two
+    poses of one species agree, and that two seeds still do not.
+    """
+    body = {k: v for k, v in spec.items() if k != "notes"}
+    for path in SEED_INVARIANT:
+        if get(body, path, _MISSING) is _MISSING:
+            continue          # not carried: nothing to normalise, bytes unchanged
+        row = BY_PATH[path]
+        if get(body, path) == row.default:
+            continue          # already the default: bytes unchanged
+        body = copy.deepcopy(body)
+        set_(body, path, row.default)
     return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
 
 
@@ -544,7 +1966,18 @@ def realize(spec: dict, rng) -> tuple[dict, Report]:
         return spec, Report()
 
     def u() -> float:
-        return float(rng.random()) * 2.0 - 1.0
+        """A draw in [-1, 1], pushed away from the middle.
+
+        A flat uniform draw has a mean absolute value of 0.5, so half the
+        authored spread is never used and a batch of twelve piles up around the
+        species average -- which is most of why a batch reads as one tree
+        repeated even when the nominal spread is wide. Bending the draw toward
+        its ends raises the mean absolute value to 1/1.6 = 0.625, a quarter more
+        typical deviation, WITHOUT widening the range: no individual can leave
+        the spread the designer set.
+        """
+        t = float(rng.random()) * 2.0 - 1.0
+        return abs(t) ** 0.6 if t >= 0.0 else -(abs(t) ** 0.6)
 
     def spread(path: str) -> float:
         return amount * float(get(spec, path))
@@ -556,14 +1989,97 @@ def realize(spec: dict, rng) -> tuple[dict, Report]:
         "trunk.radius_base_m": get(spec, "trunk.radius_base_m")
         * (1.0 + spread("variation.trunk_radius") * u()),
         "crown.squash": get(spec, "crown.squash") * (1.0 + spread("variation.shape") * u()),
-        "crown.center_frac": get(spec, "crown.center_frac")
-        * (1.0 + spread("variation.shape") * 0.5 * u()),
         "trunk.lean_deg": max(0.0, get(spec, "trunk.lean_deg") + spread("variation.lean_deg") * u()),
         "growth.gravity": get(spec, "growth.gravity")
         + spread("variation.droop") * 0.30 * u(),
         "foliage.density": get(spec, "foliage.density")
         * (1.0 + spread("variation.density") * u()),
     }
+
+    # --- proportion ---------------------------------------------------------
+    # Size variation alone gives twelve copies of one tree at twelve sizes:
+    # every individual still carries its crown over the same fraction of its
+    # height, so every silhouette is the same silhouette. This varies the
+    # SHARE of the tree that is crown.
+    #
+    # The crown is re-anchored by its TOP rather than its centre, so a longer
+    # crown reaches further down the bole instead of pushing up past the
+    # tree's own height and quietly re-introducing the height variation that
+    # is already handled above.
+    #
+    # `trunk.clear_frac` moves the opposite way, because a long crown and a
+    # long bare bole are not both available on the same stem. It is carried
+    # along for consistency rather than for effect: measured over eight seeds,
+    # taking it from 0.12 to 0.50 changes nothing at all under `colonize`
+    # (growth targets sit in the crown envelope regardless, so branches simply
+    # colonise back down into it) and moves the lowest foliage by 300% under
+    # `whorl`, where it clamps the bottom ring directly.
+    prop = spread("variation.proportion")
+    if prop > 0.0:
+        squash = float(changes["crown.squash"])
+        hf0 = float(get(spec, "crown.height_frac"))
+        top = float(get(spec, "crown.center_frac")) + hf0 * float(
+            get(spec, "crown.squash")) * 0.5
+        q = u()
+        # Clamped HERE rather than left to `validate`, because the crown centre
+        # below is derived from this number. Eight of the twenty-one tree specs
+        # author a crown height fraction high enough to hit the ceiling, and
+        # anchoring the centre against a value that then got clamped somewhere
+        # else puts the crown's base underground -- where the targets are
+        # silently discarded and the crown comes out short, with nothing
+        # anywhere saying so.
+        row = BY_PATH["crown.height_frac"]
+        hf = min(max(hf0 * (1.0 + prop * q), row.lo), row.hi)
+        # And the crown cannot hang below the ground. Its LENGTH is
+        # height_frac times squash and squash varies too, so bounding
+        # height_frac on its own is not enough: on the eight specs that
+        # already author a crown near the ceiling, a long crown drawn on a
+        # tall-squashed individual put the crown base up to 0.12 of the tree's
+        # height underground, where `envelope.points` drops the targets on the
+        # floor and the crown quietly comes out short instead.
+        hf = min(hf, max(top, 0.15) / max(squash, 1e-6))
+        hf = min(max(hf, row.lo), row.hi)
+        changes["crown.height_frac"] = hf
+        changes["crown.center_frac"] = top - hf * squash * 0.5
+        changes["trunk.clear_frac"] = float(get(spec, "trunk.clear_frac")) * (
+            1.0 - prop * 0.8 * q)
+    # `variation.shape` still nudges where the crown sits, on top of the
+    # re-anchor above rather than instead of it.
+    changes["crown.center_frac"] = float(changes.get(
+        "crown.center_frac", get(spec, "crown.center_frac"))) * (
+        1.0 + spread("variation.shape") * 0.5 * u())
+    # Last word on the crown: whatever the two nudges above worked out to, its
+    # base sits on the ground rather than under it. Targets below 0.15 m are
+    # discarded without a word, so a crown pushed underground does not fail --
+    # it comes back shorter than the numbers say it is.
+    half = 0.5 * float(changes.get(
+        "crown.height_frac", get(spec, "crown.height_frac"))) * float(
+        changes["crown.squash"])
+    changes["crown.center_frac"] = max(float(changes["crown.center_frac"]), half)
+
+    # --- lopsidedness -------------------------------------------------------
+    # Multiplicative on purpose: a species authored as a perfect surface of
+    # revolution (asymmetry 0) stays one, and a species authored lopsided gets
+    # individuals that are more and less so.
+    lop = spread("variation.lopsided")
+    if lop > 0.0:
+        changes["crown.asymmetry"] = get(spec, "crown.asymmetry") * (1.0 + lop * u())
+        changes["crown.offset"] = get(spec, "crown.offset") * (1.0 + lop * u())
+
+    # --- leaf distribution --------------------------------------------------
+    # The two shell depths are much the strongest of these; the last three are
+    # texture and measured as weak on every spec tried, but they cost nothing
+    # and they stop two individuals of equal size and proportion from carrying
+    # identically arranged foliage.
+    fol = spread("variation.foliage")
+    if fol > 0.0:
+        changes["crown.shell_upper"] = get(spec, "crown.shell_upper") * (1.0 + fol * u())
+        changes["crown.shell_lower"] = get(spec, "crown.shell_lower") * (1.0 + fol * u())
+        changes["foliage.top_bias"] = get(spec, "foliage.top_bias") * (1.0 + fol * u())
+        changes["foliage.clustering"] = get(spec, "foliage.clustering") * (
+            1.0 + fol * 0.7 * u())
+        changes["foliage.rough"] = get(spec, "foliage.rough") * (1.0 + fol * 0.7 * u())
+
     if get(spec, "variation.rotate"):
         facing = float(rng.random()) * 360.0
         changes["trunk.lean_dir_deg"] = facing

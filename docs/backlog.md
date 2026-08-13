@@ -18,7 +18,8 @@ there.
 ## 0. ENGINE PERFORMANCE — the current front
 
 **Read this section first.** Everything below it predates the streaming
-programme; §6b in particular is stale and now says so.
+programme — except §8, which was added 2026-08-11 — and §6b in particular is
+stale and now says so.
 
 ### Where the engine is (2026-07-28)
 
@@ -978,6 +979,177 @@ Revisit only if the world reads too bare in normal play.
 
 ---
 
+## 8. ENVIRONMENT ASSETS (asset-forge) — added 2026-08-11
+
+Forty-two species across six kinds are authored and building, every one on the
+5 cm lattice. **None of them is in the world.** Everything below is either the
+last mile of getting them there or a decision about who owns a number. Context:
+`asset-forge/README.md`, `docs/tree-asset-generator-plan.md`.
+
+**The sequenced plan lives in `docs/asset-forge-plan.md`** — five phases, each
+item with the check that says it is finished. This section stays as the standing
+context and the record of what was measured; that one says what to do next and
+in which order.
+
+**The shader palette — TABLE DONE 2026-08-11, WIRING STILL OPEN.** ADR-0008 made
+`vxc::kMaterialPalette` the one definition of what a material looks like.
+asset-forge already read a generated copy; the renderer read nothing, so what a
+designer approved in the forge and what the game drew were two different
+answers.
+
+Done, and verifiable without an editor:
+`ue-project/Shaders/VoxelMaterialPalette.ush` is **generated** from the header by
+`ue-project/Tools/gen_material_palette_ush.py` — all 26 materials, three face
+classes each, sRGB converted to linear once at generation, plus the ADR's
+evaluation (`VoxelMaterialColor(mat, faceClass, voxel)`: voxel-keyed hash tint
+and the trilinear patch term, no lighting). `tools/compile-shaders.ps1` now runs
+two checks on it: `--check` fails if the .ush has drifted from the header, and
+DXC compiles `VoxelMaterialPaletteTest.usf` to **both** ADR-0001 targets. Both
+guards were proved to fire — a perturbed colour is named with its line, and
+moving `MAT_BARK_PALE` back up among the woods reproduces the historical
+"out of step with the enum at index 19". Neither needs the editor, which is the
+point: one editor per box is a hard rule, so a check that needs it is a check
+nobody runs.
+
+**What is left is the wiring, and it needs a decision as well as the box.** The
+hook is named in `VoxelQuadVertexFactory.ush` (the `bMarker` branch: "the
+smallest possible instance of the thing biomes need next: per-material
+appearance in the pooled renderer... the id survives here"). Two constraints
+meet there. `VertexColor` is full — R surface flag, G ambient occlusion, B and A
+climate — and `TexCoords[1]/[2]` are already spoken for by the local-lights plan
+(`docs/sky-and-local-light-plan.md`), so the palette needs `TexCoords[3]/[4]` at
+pixel rate and a `M_VoxelTerrain` graph change to read them. The graph is a
+generated artifact (`Tools/create_voxel_material.py`), so that edit is code, but
+running it is a `-run=pythonscript` commandlet and therefore editor-bound.
+**Recommended shape:** feed the palette only where the biome graph has no
+answer — `BaseColor = lerp(biomeAlbedo, paletteRGB, isAsset)` — which leaves
+terrain's climate-driven colour untouched and is inert until assets are actually
+in the world. Do NOT replace the biome path wholesale as a first step; it cannot
+be verified in the same motion and it is the only appearance path that currently
+works.
+
+**Also found:** `ue-project/Tools/terrain_palette.py` is a **second palette**,
+16 entries, stopping at `MAT_WATERMARK` — its own header calls it "single source
+of truth". The ten asset materials (bark, heartwood, deadwood, six leaf types,
+pale bark) have no appearance on the UE side at all. It is not urgent only
+because no asset is in the world yet. When the wiring above lands, its RGB
+column should be generated from the header too, leaving it to own just the
+UE-side `BIOME_TINT` policy, which genuinely is not the engine's business.
+
+**UE wiring for asset streaming. BLOCKED on the editor box, not on a decision.**
+The voxel-core half is designed and largely written — `assetplacement.h` gives a
+provable upper bound on how high an asset reaches, which is the thing that lets
+the streaming admission path keep skipping chunks it can prove empty. What is
+left is the UE module: getting a baked asset into the volume the marcher reads,
+and confirming a crown lands in the chunks the bound said it would. Neither half
+of that can be *verified* without the editor, and one editor per box is a hard
+rule here — two capture sessions on one machine killed each other's frames for
+hours and read exactly like a slow configuration. Another session holds it.
+**Unblocks:** the box, nothing else.
+
+**Placement: an asset-forge panel, or `assetplacement.h`? — DEFERRED by owner
+decision, 2026-08-11.** No placement logic is to be coded until this is decided;
+the entry below is kept as written because the decision has not been made, only
+postponed. The one thing that still matters while it waits: **neither side may
+grow its own version of the other's numbers in the meantime.** A spacing
+authored in a panel and a spacing typed into an `AssetLayer` is the Appendix's
+failure with a new subject, and the deferral makes that more likely, not less,
+because both halves stay half-built.
+
+Right now it is neither, twice. asset-forge writes a `placement` group per
+species — `abundance`, `spacing_m`, `cluster`, slope and elevation gates, biome
+weights — that **no code reads**. voxel-core has `assetplacement.h`, which does
+the per-chunk deterministic scatter and the bound, and gets its numbers from an
+`AssetLayer` struct that nothing fills in from a spec. The two are not
+alternatives so much as two halves that have never been introduced: the spec is
+a designer's *intent* for a species, the header is the engine's *mechanism*, and
+the open question is only which one owns each number and how the intent reaches
+the mechanism. **Decide before either grows its own version of the other's
+numbers** — a spacing authored in a panel and a spacing typed into an
+`AssetLayer` is the Appendix's failure with a new subject. The cheap answer is
+to compile the spec's placement group into `AssetLayer` at bake time so there is
+one number with two readers; it is written here as a decision because choosing
+the panel instead is a legitimate call and it changes what gets built.
+
+**Review the 16 legacy rock species against the newer mechanisms.** The rock
+generator gained real geology on 2026-08-10 — bedding, joint sets, columns,
+corestones, veins, clasts, tafoni, flutes, pans, exfoliation, arches and
+caprock — and the eighteen species authored during and after that wave use it.
+The sixteen that predate it do not: ten of them (`granite-boulder`,
+`standing-stone`, `summit-tor`, `glacial-erratic`, `river-cobble`,
+`alpine-scree`, `limestone-slab`, `cliff-fall-block`, `desert-mesa-block`,
+`mossy-forest-boulder`) run **no** mechanism at all, and six more
+(`basalt-colonnade`, `exfoliating-dome`, `fractured-outcrop`,
+`jointed-granite-tor`, `banded-sandstone-ledge`, `tafoni-sandstone`) run one or
+two of them. That is not automatically wrong — a river cobble genuinely has no
+joints to show — but every one of those sixteen was tuned around a weathering
+pass that was removing **20 voxels from a stone of 90,000**, so their shapes
+were won with `rough` and cut planes standing in for erosion that never ran.
+Worth a pass to see which are now saying the wrong thing about their own rock
+type. **Judge it with `tools/waistprobe.py`, NOT with `rockmech.py`** — and not
+with voxel counts. `rock.build` measures the finished stone and rescales it to
+the authored size, so a mechanism that plainly works lands within 0.1% of where
+it started and reports "changes nothing"; five did exactly that.
+
+That refit also breaks `rockmech.py` in the opposite direction, which was found
+on 2026-08-11 and is the more dangerous half. Because the stone is rescaled, any
+change in MASS reappears as a shift of the whole surface, so the divergence
+metric reads large whether or not the mechanism did anything shaped. Measured
+with the erosion scaling deliberately disabled, `caprock` still scored 43.5% and
+`notch` 22.2% at 9 m. **`rockmech.py` showing "no dead sliders" was never
+evidence that the mechanisms worked**, and it is what let a size-blind `erode` —
+removing a constant ~4.75 voxel layers whether the stone was 3 m or 13 m, so
+14.3% of a boulder and 3.5% of a hero — survive a full pass of the harness.
+What discriminates is a measurement the refit cannot launder: retreat depth in
+voxels against known size, and `waistprobe.py`'s cross-section-against-height
+with its overhang number and its SEVERED check.
+
+~~**Rocks have no allocation guard.**~~ **DONE 2026-08-11.** An over-ambitious
+`rock.size_m` used to surface as a bare numpy `MemoryError` from whichever
+temporary happened to be unlucky, which points at a line of arithmetic instead
+of at the spec that caused it. `forge/rock.py` now sizes the working set before
+allocating anything — six whole-grid float32 arrays are live at the peak — and
+raises a `MemoryError` naming the spec, the resolution, the grid it would need
+and the ceiling it broke (`MAX_WORKING_GB`, 20 GB; a 90 m hero at 10 cm sits at
+about 12).
+
+### The measurement traps in this repo, so the next person does not rediscover them
+
+Every one of these was hit, twice in some cases, and each cost a round of
+editing correct code.
+
+1. **Strip colour before judging shape.** `MAT_ROCK` and `MAT_BEDROCK` render
+   near-black on the dark contact sheet, so only the lit top faces show and a
+   round boulder reads as a flat wedge. `tools/shapecheck.py` forces every solid
+   voxel to one bright material; use it before believing a shape is wrong.
+2. **A pass that runs is not a pass that does anything.** The rock weathering
+   pass removed 0.44% of a surface while its slider said 30%, for the entire
+   life of the module, because blurred uniform noise is a narrow bell and
+   min/max rescaling does not flatten it. Nothing errored. Always measure what
+   a pass removed, not that it ran.
+3. **Voxel count is not a valid A/B for rocks.** `rock.build` fits the finished
+   stone to the authored size, so anything that changes erosion gets scaled back
+   out. Use shape divergence — crop both to their occupied box, `|A xor B| /
+   |A or B|` — which is what `tools/rockmech.py` reports.
+4. **Count the thing you are changing.** Tuning foliage by leaf-voxel count
+   hides the whole question: the acacia's canopy went from 96 clumps to 271 and
+   *down* in leaf voxels, which is precisely the change that was wanted. Clump
+   count and clump radius are the measurement; voxels are a side effect.
+5. **One seed is not a comparison.** `variation.amount` is doing its job, so the
+   same spec at three seeds is 7.0–9.8 m tall. Any A/B on a single seed is
+   reading that spread. Render the same seeds on both sides, and keep an
+   untouched species in the frame as a control — that is what proves the change
+   is yours and not a baseline someone else moved under you.
+6. **A check that fires on the normal case teaches people to ignore checks.**
+   The 256-voxel size flag fired on ten of forty-two species and made "keep all
+   clean" skip every large tree. It was removed and the export was made to split
+   instead.
+7. **Gate on authored values, never on an internal correction factor.** A rock
+   stage gated on the *scaled* size worked once and then switched itself off for
+   every attempt after the fitting loop corrected downward.
+
+---
+
 ## Appendix: the recurring failure mode
 
 Three separate bugs this week were the same shape — **two copies of one
@@ -1041,3 +1213,57 @@ five files — and is **permanently unmergeable**. The other session touched
 spill into a lower CA-owned neighbour) and ADR-0007's depth term. Both need
 `kSweVersion` 1→2 and a re-pin of `0x61523E585CF7B782`; ADR-0007 argues for
 deciding them together.
+
+---
+
+## 9. WATER BUGS FROM THE 2026-08-13 PLAYTEST
+
+Reported by the owner while testing wind waves, ripples and throwables. Neither
+is diagnosed; both are written down while the observation is fresh, with what is
+already known that bears on them.
+
+### 9.1 P1 — Digging a voxel UNDER water crashes the frame rate and unloads nearby water
+
+**What was seen.** A single left click destroying one voxel beneath the water
+surface "crashed game performance and slowed things down to a crawl", and at the
+same time caused "a shader rendering issue with water such that near water around
+the edit just unloaded or became transparent".
+
+**Why it is probably one bug and not two.** An edit under water invalidates two
+things at once: the terrain mesh for the affected chunk, and the water that was
+resting on it. The near-field water and the lake sheet are separate draw paths
+(docs/water-architecture.md), and the sheet's extent is derived from the baked
+basin rather than from live geometry, so an edit can put them briefly out of
+agreement. "Became transparent" is what water with no volume behind it looks
+like -- consistent with the water surface surviving while whatever it was
+occluding went away, or with an implicit-water brick being dropped and not
+rebuilt.
+
+**What is already known that bears on it.**
+- The water CA owns mobilized bricks and `implicitFillAt` reads 0 there
+  (VoxelWaterSubsystem.cpp, the ownership partition). A dig that mobilizes a
+  region hands it from the implicit path to the CA, and that hand-off is the
+  obvious suspect for both the stall and the disappearance.
+- Edits are replayed from the edit log on load, so this is reproducible from a
+  saved world rather than only live -- which makes it capturable at a pinned
+  pose.
+- The stall being immediate and severe points at synchronous work on the game
+  thread, not at streaming: streaming shows up as a hitch that recovers.
+
+**First moves, cheapest first.** Reproduce at a pinned pose with
+`stat unit` and `voxel.Debug 1` up; watch whether DRAW or GAME time moves.
+Then `voxel.Water.MeshImplicitLakes 1` (default 0) to see whether the near-field
+voxel path is involved at all. Then the CA's own counters -- this project's rule
+is that every stage emits a ran-flag, and the water CA has them.
+
+### 9.2 P2 — The wave field's own crest speed has never been judged separately
+
+The wind field's timescales were slowed 8-15x on 2026-08-13 (weather.h) after
+the owner rejected the default three times. That addressed how fast the wind
+CHANGES. It did not address how fast a crest TRAVELS at a fixed wind, which is
+`omega0` in water_wave_graph.py and is currently 1.59 m/s for the 5 m base octave
+against a real deep-water value of 2.79 m/s -- i.e. already slower than physical.
+If the surface still reads as too fast with a frozen wind, the fault is not there
+and the next suspect is `WindPatchDriftFrac` (0.5, so the calm/choppy patch field
+sweeps at half the wind speed -- 2.5 m/s at the 5 m/s default, which crosses a
+50 m view in twenty seconds).

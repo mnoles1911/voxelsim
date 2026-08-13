@@ -22,6 +22,135 @@ ROOT = Path(__file__).resolve().parent.parent
 SPECS = ROOT / "specs"
 OUT = ROOT / "out"
 
+# THE SINGLE-ASSET RULE (owner, 2026-08-11)
+#
+# One generation produces one thing: 1 tree, 1 rock, 1 grass clump, 1 clump of
+# reeds, 1 clump of flowers. Small, medium and large are separate assets, saved
+# separately and placed together later by placement logic -- so a secondary
+# boulder, a scree ring or a shed block that arrives in the same grid is not a
+# feature of the species, it is a second asset the library cannot address,
+# cannot cost and cannot place.
+#
+# This supersedes the weaker rule that came before it, which only asked whether
+# a loose piece was SUPPORTED (`pipeline._drop_airborne` ->
+# `stats["airborne_kept"]`). A rubble ring sitting flat on the ground passed
+# that and still ships two assets in one file. Support is still worth measuring
+# and is still reported below, but it is no longer the bar.
+#
+# Specs KNOWN to break the rule today. Each entry names the plan item that
+# removes it; the entry goes when the item lands, never the check. `--no-allow`
+# on tools/buildcheck.py ignores this list entirely, which is how a fix gets
+# verified and how the true count is read off at any time.
+#
+# An entry whose spec now builds as one piece is itself a FAILURE -- see
+# `stale_allowances`. Same rule the shader and unity lints use for their
+# silencing annotations, and for the same reason: a permission that outlives
+# the defect it was written for is how a check gets switched off by accident.
+KNOWN_MULTIPIECE: dict[str, str] = {}
+
+
+def stale_allowances(built: dict[str, bool]) -> list[str]:
+    """Allow-list entries for specs that came out as one piece after all.
+
+    `built` maps spec name -> did it break the rule. Only names actually built
+    in this run are judged, so `--kind rock` cannot report the tree entries as
+    stale.
+    """
+    return sorted(name for name, broke in built.items()
+                  if name in KNOWN_MULTIPIECE and not broke)
+
+
+# The specs that dominate a whole-library pass. Measured, not guessed -- times
+# are `tools/buildcheck.py` at seed 1 and the AUTHORED lattice on a dev box
+# (which is 10 cm for the two arches and the sea stack, 5 cm for the rest), and
+# the cut is at one minute:
+#
+#     hero-arch-colossal     24.1M voxels   20   min      <- 65% of the library
+#     hero-sea-stack          1.5M voxels    1.8 min
+#     hero-balanced-rock      5.2M voxels    1.6 min
+#     hero-sequoia           19.3M voxels    1.2 min
+#     everything else (61)                  ~10   min
+#
+# `hero-arch-colossal` is a LANDMARK, not a species -- one arch, at one place,
+# in one world. It is here because it is authored as a spec like everything
+# else, and it should be baked to the library once and placed from there rather
+# than rebuilt. Its cost is per-seed and it varies a lot with the seed: 24.1M
+# voxels on seed 1 against 39.6M on seed 2, which is what a 2.4 elongation and
+# a size-fitting loop do to each other.
+#
+# CI splits on this set rather than skipping it: the cheap 62 run on every pull
+# request, the heavy four on pushes to main. Nothing is excluded from CI, and
+# the local commands take `--skip-heavy` / `--only-heavy` for the same split.
+HEAVY_SPECS = {
+    "hero-arch-colossal",
+    "hero-sea-stack",
+    "hero-balanced-rock",
+    "hero-sequoia",
+}
+
+
+def spec_paths(kind: str | None = None) -> list[Path]:
+    """Every spec on disk, optionally of one kind. Read from the files rather
+    than a list kept here, so a new species is covered the day it is authored."""
+    out = []
+    for p in sorted(SPECS.glob("*.json")):
+        if kind is None:
+            out.append(p)
+            continue
+        try:
+            if json.loads(p.read_text(encoding="utf-8")).get("kind") == kind:
+                out.append(p)
+        except (OSError, ValueError):
+            out.append(p)  # unreadable is a failure for the caller to report
+    return out
+
+
+def pieces(asset) -> tuple[int, list[int]]:
+    """How many separate pieces a build produced, largest first.
+
+    26-connectivity -- `np.ones((3,3,3))`, the neighbourhood `_drop_airborne`
+    and `attached_frac` already use. That is the LENIENT reading: a piece
+    touching the body at a single corner counts as attached. Deliberate. The
+    strict face-connected rule is already applied where a corner join really
+    does fall off, by the wood check; using it here as well would fail specs
+    for foliage speckle rather than for shipping two rocks.
+    """
+    import numpy as np
+
+    try:
+        from scipy import ndimage
+    except ImportError as e:      # loud, not silent
+        raise SystemExit(
+            "the one-piece check needs scipy (pip install scipy)."
+        ) from e
+    # The warning that used to sit here -- that `pipeline` would silently do
+    # nothing without scipy and so a clean run proved nothing -- was true and is
+    # no longer: `pipeline._ndimage()` raises instead of returning the healthy
+    # answer. Left as a note rather than deleted, because a stale caveat that
+    # tells you not to trust a check is worse than none at all.
+
+    occ = asset.grid.data != 0
+    if not occ.any():
+        return 0, []
+    lab, n = ndimage.label(occ, structure=np.ones((3, 3, 3), bool))
+    sizes = sorted((int(v) for v in np.bincount(lab.ravel())[1:]), reverse=True)
+    return int(n), sizes
+
+
+def loose_summary(asset) -> tuple[int, float, str]:
+    """(pieces beyond the first, their share of the asset, one line saying so)."""
+    n, sizes = pieces(asset)
+    if n <= 1:
+        return 0, 0.0, ""
+    loose = sum(sizes[1:])
+    total = max(sum(sizes), 1)
+    airborne = asset.stats.get("airborne_kept") or []
+    return n - 1, loose / total, (
+        f"{n - 1} loose piece{'s' if n != 2 else ''}, {loose:,} voxels "
+        f"({loose / total:.2%} of the asset), largest {sizes[1]:,}"
+        + (f"; {len(airborne)} of them unsupported" if airborne else "")
+    )
+
 
 def _load(path: str) -> tuple[dict, Path]:
     p = Path(path)
@@ -52,7 +181,10 @@ def cmd_gen(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     stem = f"{specmod.get(s, 'name')}-{args.seed:04d}"
 
-    img = render.render(tree.grid, target_px=args.px)
+    # Through the kind's own camera. `gen` used to be hardcoded to the
+    # isometric, so `gen specs/brown-trout.json` wrote a picture of a fish seen
+    # from above -- which is the one angle that shows nothing about a fish.
+    img = render.view(tree.grid, render.camera_for(s), target_px=args.px)
     img.save(out / f"{stem}.png")
     models = vox.write(tree.grid, out / f"{stem}.vox", name=stem)
     size = vxa.write(tree.grid, out / f"{stem}.vxa")
@@ -62,17 +194,31 @@ def cmd_gen(args) -> int:
     )
 
     st = tree.stats
+    # Branch statistics on something with no branches, and a wood-connectivity
+    # figure of "nan%", are a column of zeroes pretending to mean something.
+    # The kind decides which lines print, the same rule the app's detail sheet
+    # and `pipeline.health` already follow.
+    branchy = st.get("kind") not in pipeline.BRANCHLESS
+    swims = st.get("kind") in pipeline.SWIMS
     print(f"{stem}")
-    print(f"  {st['height_m']:.1f} m tall, footprint {st['footprint_m'][0]:.1f} x "
-          f"{st['footprint_m'][1]:.1f} m, {st['extent_vox']} voxels "
-          f"at {st['voxel_cm']:g} cm ({st['grid_mb']:,.0f} MB grid)")
-    print(f"  {st['voxels']:,} solid voxels, {st['nodes']:,} skeleton nodes, "
-          f"max branch order {st['max_order']}")
+    if swims:
+        print(f"  {st.get('length_m', 0):.2f} m long, {st['height_m']:.2f} m deep, "
+              f"{st['footprint_m'][1]:.2f} m across, {st['extent_vox']} voxels "
+              f"at {st['voxel_cm']:g} cm")
+    else:
+        print(f"  {st['height_m']:.1f} m tall, footprint {st['footprint_m'][0]:.1f} x "
+              f"{st['footprint_m'][1]:.1f} m, {st['extent_vox']} voxels "
+              f"at {st['voxel_cm']:g} cm ({st['grid_mb']:,.0f} MB grid)")
+    print(f"  {st['voxels']:,} solid voxels"
+          + (f", {st['nodes']:,} skeleton nodes, max branch order {st['max_order']}"
+             if branchy else f", {st['pieces_built']} piece"
+             f"{'s' if st['pieces_built'] != 1 else ''}"))
     print(f"  materials: " + ", ".join(
         f"{materials.NAME_BY_ID.get(m, m)}={c:,}" for m, c in sorted(st["by_material"].items())))
-    print(f"  wood one piece {st.get('wood_connected', float('nan')):.2%}, "
-          f"attached {st.get('attached_frac', float('nan')):.2%}, "
-          f"ground contact {st['ground_contact']} voxels")
+    print(("  wood one piece {:.2%}, ".format(st.get("wood_connected", float("nan")))
+           if branchy else "  ")
+          + f"attached {st.get('attached_frac', float('nan')):.2%}"
+          + ("" if swims else f", ground contact {st['ground_contact']} voxels"))
     print(f"  {st['ms_grow']:.0f} ms grow + {st['ms_raster']:.0f} ms raster = "
           f"{st['ms_total']:.0f} ms")
     print(f"  wrote {stem}.png, .vox ({models} model{'s' if models != 1 else ''}), "
@@ -88,7 +234,8 @@ def cmd_batch(args) -> int:
     out = Path(args.out) if args.out else OUT / name
     out.mkdir(parents=True, exist_ok=True)
 
-    scale = render.scale_for([render.predicted_extent(s)], args.px)
+    camera = render.camera_for(s)
+    scale = render.scale_for_camera([render.predicted_extent(s)], camera, args.px)
     cells = []
     records = []
     t0 = time.perf_counter()
@@ -96,7 +243,7 @@ def cmd_batch(args) -> int:
         seed = args.seed + i
         tree = pipeline.build(s, seed)
         problems = pipeline.health(tree)
-        img = render.render(tree.grid, scale=scale)
+        img = render.view(tree.grid, camera, scale=scale)
         if args.keep_png:
             img.save(out / f"{name}-{seed:04d}.png")
         if args.keep_vox:
@@ -138,13 +285,24 @@ def cmd_survey(args) -> int:
         print("no specs found", file=sys.stderr)
         return 1
     loaded = [specmod.load(p)[0] for p in paths]
+    # ONE SCALE for the whole survey, so a sapling and an emergent are not the
+    # same size on the page -- but the CAMERA is per species, because the survey
+    # now spans kinds that need different ones. The scale is picked from the
+    # isometric because most of the page is isometric and the three projections
+    # size an asset within a few percent of each other.
     scale = render.scale_for([render.predicted_extent(s) for s in loaded], args.px)
     cells = []
     for s in loaded:
         for i in range(args.each):
             tree = pipeline.build(s, args.seed + i)
-            img = render.render(tree.grid, scale=scale)
-            label = f"{specmod.get(s, 'name')}  {tree.stats['height_m']:.1f} m"
+            img = render.view(tree.grid, render.camera_for(s), scale=scale)
+            # An animal is quoted by its LENGTH and everything else by its
+            # height. A 24 cm robin labelled "0.15 m" is reporting how deep it
+            # is, which is the same mistake the sheet made for fish.
+            size = (f"{tree.stats.get('length_m', 0):.2f} m long"
+                    if specmod.get(s, "kind") in ("fish", "cetacean", "bird")
+                    else f"{tree.stats['height_m']:.1f} m")
+            label = f"{specmod.get(s, 'name')}  {size}"
             cells.append((img, label, pipeline.health(tree)))
             print(f"\r  {len(cells)} rendered", end="", flush=True)
     print()
@@ -189,15 +347,83 @@ def cmd_materials(args) -> int:
         status = "engine (core.h)" if mid < materials.FIRST_PROPOSED else "PROPOSED, not in engine"
         print(f"{mid:>4}  {name:<18} {str(materials.color(mid)):<16} {status}")
     print()
-    print("Proposed IDs must be reconciled with vxc::Material when they are appended.")
-    print("See docs/tree-asset-generator-research.md section 8A for what that append touches.")
+    proposed = [m for m in materials.COLORS if m >= materials.FIRST_PROPOSED]
+    if proposed:
+        print(f"{len(proposed)} proposed ID(s) must be reconciled with vxc::Material "
+              f"when they are appended.")
+        print("See docs/tree-asset-generator-research.md section 8A for what that "
+              "append touches.")
+    else:
+        # Said out loud rather than left as silence. "No warning" and "nothing
+        # to warn about" look identical, and this line has been printed
+        # unconditionally through two appends that resolved it.
+        print(f"Every material in this table exists in vxc::Material "
+              f"(kMaterialCount = {materials.ENGINE_MATERIAL_COUNT}).")
     return 0
+
+
+def _palette_should_be() -> str:
+    """Re-run tools/gen_palette.py in memory: what palette.py ought to contain.
+
+    Loaded by path because `tools/` is a directory of scripts, not a package.
+    Its scripts start with `import _path`, so their own directory has to be on
+    sys.path before this will import.
+    """
+    import importlib.util
+
+    gen = ROOT / "tools" / "gen_palette.py"
+    if str(gen.parent) not in sys.path:
+        sys.path.insert(0, str(gen.parent))
+    ms = importlib.util.spec_from_file_location("gen_palette", gen)
+    mod = importlib.util.module_from_spec(ms)
+    ms.loader.exec_module(mod)
+    return mod.source()
+
+
+def _palette_drift() -> str:
+    """Empty if palette.py is what the header says; otherwise why not."""
+    try:
+        want = _palette_should_be()
+    except SystemExit as e:  # bad header, or no header
+        return str(e)
+    # read_text translates the file's CRLF back to \n, so this compares content
+    # and not line endings -- the generator writes through the same translation.
+    have = (ROOT / "forge" / "palette.py").read_text(encoding="utf-8")
+    if want == have:
+        return ""
+    w, h = want.splitlines(), have.splitlines()
+    for i in range(max(len(w), len(h))):
+        a = w[i] if i < len(w) else "<end of file>"
+        b = h[i] if i < len(h) else "<end of file>"
+        if a != b:
+            return (f"line {i + 1} differs\n"
+                    f"      header says: {a.strip()}\n"
+                    f"      palette.py:  {b.strip()}")
+    return "lengths differ"
 
 
 def cmd_selftest(args) -> int:
     """Checks the three properties the rest of the tool assumes."""
     ok = True
     s = specmod.default_spec()
+
+    # forge/palette.py is GENERATED from the engine's materialpalette.h, and
+    # nothing makes anyone regenerate it. Edit the header, forget the command,
+    # and the forge keeps showing the old colours while the game shows the new
+    # ones -- with no error anywhere, because a wrong colour still looks like a
+    # colour. That is the same failure mode as the material-ID drift this
+    # generation step was introduced to end.
+    #
+    # The generator also checks the header's own order against the enum, and
+    # that check comes along for free here: the table is POSITIONAL, entry N is
+    # material N, and the C++ static_assert counts entries without looking at
+    # their order. When it was first written grouped by type, MAT_BARK_PALE
+    # (id 23) sat with the other woods at index 19 and shifted every id above
+    # it, which dressed every broadleaf in the library in birch bark.
+    drift = _palette_drift()
+    print(f"  palette matches the engine header: {'pass' if not drift else 'FAIL'}"
+          + (f"\n    {drift}\n    run python tools/gen_palette.py" if drift else ""))
+    ok &= not drift
 
     a = pipeline.build(s, 3)
     b = pipeline.build(s, 3)
@@ -255,7 +481,92 @@ def cmd_selftest(args) -> int:
           f"{'pass' if attached >= 0.98 else 'FAIL'} ({attached:.3%} attached)")
     ok &= attached >= 0.98
 
-    print("selftest:", "PASS" if ok else "FAIL")
+    # THE SINGLE-ASSET RULE, over the whole library. See KNOWN_MULTIPIECE.
+    #
+    # Nothing enforced this before. `stats["airborne_kept"]` and
+    # `stats["orphans_removed"]` were both measured per build and read by
+    # nobody, which is why all three floating-rock defects in this library were
+    # found by a person squinting at a render.
+    #
+    # One seed per species, not three. This is one of the two commands the
+    # README says to run before calling a change done, so it has to stay
+    # something people will actually run; three seeds and per-kind filtering
+    # are `python tools/buildcheck.py --seeds 1 2 3`, which is what CI runs and
+    # what a Phase 1 fix gets signed off with.
+    if getattr(args, "quick", False):
+        print("  every build is ONE piece: SKIPPED (--quick)")
+        print("  every asset's materials exist in the engine: SKIPPED (--quick)")
+    else:
+        bad, known, worst = [], [], 0.0
+        # HEAVY_SPECS are left out and named in the output, not silently
+        # dropped: hero-arch-colossal alone is a multi-gigabyte working set at
+        # its authored 10 cm and half an hour of wall clock, so a selftest that
+        # built it would be a selftest nobody could run.
+        paths = [p for p in spec_paths() if p.stem not in HEAVY_SPECS]
+        broke = {}
+        # THE OTHER THING WORTH READING OFF THESE BUILDS, and it costs nothing
+        # because they are being built anyway.
+        #
+        # `assetgrid.h:178` gates every asset the engine loads on
+        # `maxMaterialId() < kMaterialCount`, and until a material append lands
+        # that gate REFUSES every asset authored against the new ids -- which is
+        # correct, and which is the position the trees, the fish and then the
+        # birds were each in for a while. Nothing on this side could see it: the
+        # forge draws a proposed material in its preview colour and the asset
+        # looks finished.
+        #
+        # So the same question is asked here, in Python, against the material
+        # count the GENERATED palette carries. That number comes from the engine
+        # header, so this cannot pass by agreeing with itself: if an append is
+        # forgotten, half-done, or done without regenerating, the species that
+        # need it name themselves.
+        over = []
+        limit = materials.ENGINE_MATERIAL_COUNT
+        for p in paths:
+            ls, _ = specmod.load(p)
+            asset = pipeline.build(ls, 1)
+            hist = asset.stats.get("by_material") or {}
+            top = max((int(m) for m in hist if m), default=0)
+            if top >= limit:
+                over.append(f"{p.stem}: uses material {top} "
+                            f"({materials.NAME_BY_ID.get(top, '?')}), "
+                            f"engine has {limit}")
+            extra, frac, why = loose_summary(asset)
+            broke[p.stem] = bool(extra)
+            if not extra:
+                continue
+            if p.stem in KNOWN_MULTIPIECE:
+                known.append(f"{p.stem}: {why}  [known: {KNOWN_MULTIPIECE[p.stem]}]")
+            else:
+                bad.append(f"{p.stem}: {why}")
+                worst = max(worst, frac)
+        for name in stale_allowances(broke):
+            bad.append(f"{name}: allow-listed in KNOWN_MULTIPIECE but it now builds as "
+                       f"one piece -- delete the entry ({KNOWN_MULTIPIECE[name]})")
+        print(f"  every build is ONE piece ({len(paths)} specs, seed 1): "
+              f"{'pass' if not bad else 'FAIL'} "
+              f"({len(bad)} shipped more than one piece, worst {worst:.2%} of an asset loose"
+              + (f"; {len(known)} known-failing allowed" if known else "") + ")")
+        print(f"    not covered here: {', '.join(sorted(HEAVY_SPECS))} -- too big to "
+              f"build in a pre-commit check; run tools/buildcheck.py --only-heavy")
+        for line in bad:
+            print(f"    ! {line}")
+        for line in known:
+            print(f"    - {line}")
+        ok &= not bad
+
+        print(f"  every asset's materials exist in the engine "
+              f"(kMaterialCount = {limit}): {'pass' if not over else 'FAIL'} "
+              f"({len(over)} of {len(paths)} would be refused by "
+              f"AssetGrid::materialsWithinEngine)")
+        for line in over:
+            print(f"    ! {line}")
+        ok &= not over
+
+    verdict = "PASS" if ok else "FAIL"
+    if getattr(args, "quick", False):
+        verdict += "  (quick: the single-asset check over the library was NOT run)"
+    print("selftest:", verdict)
     return 0 if ok else 1
 
 
@@ -307,8 +618,15 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("schema", help="slider table as JSON").set_defaults(fn=cmd_schema)
     sub.add_parser("materials", help="material table and engine status").set_defaults(
         fn=cmd_materials)
-    sub.add_parser("selftest", help="determinism and round-trip checks").set_defaults(
-        fn=cmd_selftest)
+    t = sub.add_parser("selftest", help="determinism, round trips, one-piece assets")
+    # The library pass is most of the wall clock (hero-arch-colossal alone is
+    # 38M voxels and minutes). --quick exists so the slow half is skippable
+    # without anyone deleting it for being slow -- and it prints SKIPPED on the
+    # check's own line AND on the verdict line, so a quick run can never be
+    # mistaken for a clean one in a log.
+    t.add_argument("--quick", action="store_true",
+                   help="skip the whole-library single-asset pass and say so")
+    t.set_defaults(fn=cmd_selftest)
 
     args = ap.parse_args(argv)
     return args.fn(args)

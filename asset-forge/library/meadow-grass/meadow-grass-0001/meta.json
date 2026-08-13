@@ -3,10 +3,10 @@
   "species": "meadow-grass",
   "kind": "grass",
   "seed": 1,
-  "spec_hash": "721d6a314b8954c8",
+  "spec_hash": "e72e5aff95b15e72",
   "stats": {
     "seed": 1,
-    "spec_hash": "721d6a314b8954c8",
+    "spec_hash": "e72e5aff95b15e72",
     "kind": "grass",
     "nodes": 0,
     "segments": 0,
@@ -14,28 +14,33 @@
     "iterations": 0,
     "targets_left": 0,
     "clumps": 0,
-    "voxel_cm": 2.0,
-    "height_m": 0.42,
+    "orphans_removed": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 5.0,
+    "height_m": 0.55,
+    "length_m": 0.7,
     "footprint_m": [
-      0.56,
-      0.48
+      0.7,
+      0.7
     ],
     "grid_mb": 0.0,
     "extent_vox": [
-      28,
-      24,
-      21
+      14,
+      14,
+      11
     ],
-    "voxels": 748,
+    "vox_models_needed": 1,
+    "voxels": 169,
     "by_material": {
-      "8": 748
+      "8": 169
     },
-    "ground_contact": 29,
-    "ms_grow": 0.5,
-    "ms_raster": 22.5,
+    "ground_contact": 15,
+    "ms_grow": 2.0,
+    "ms_raster": 10.9,
     "attached_frac": 1.0,
     "detached": 0,
-    "ms_total": 23.6
+    "ms_total": 13.5
   },
   "problems": [],
   "vox_models": 1

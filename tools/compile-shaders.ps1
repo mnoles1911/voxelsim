@@ -50,6 +50,48 @@ foreach ($Src in $Kernels.Keys) {
 }
 Write-Host "All kernels compiled to $OutDir"
 
+# ---------------------------------------------------------------------------
+# The material palette (ADR-0008). Two checks, both deliberately here rather
+# than in the editor: one editor per box is a hard rule and another session
+# usually holds it, so a check that needs the editor is a check nobody runs.
+#
+# 1. Have the generated copies drifted from vxc::kMaterialPalette? The header is
+#    the one definition of what a material looks like; a hand-edited copy of it
+#    is the failure this repo has already paid for once with material IDs, and
+#    colour is the version nobody catches because a wrong colour still looks
+#    like a colour. TWO files are covered, not one:
+#      * ue-project/Shaders/VoxelMaterialPalette.ush -- the table the renderer
+#        reads, all 26 materials x 3 face classes, sRGB converted to linear.
+#      * ue-project/Tools/terrain_palette.py -- the UE-side table that feeds
+#        T_VoxelPalette. Its RGB column is generated from the same header; its
+#        BIOME_TINT column stays authored, because that is a UE-side policy call
+#        with no counterpart in the engine.
+# 2. Does the shader COMPILE? The table is generated, so a malformed row reaches
+#    DXC and nothing else.
+$Gen = Join-Path $Root "ue-project\Tools\gen_material_palette_ush.py"
+Write-Host "[palette] drift check (.ush + terrain_palette.py)"
+& python $Gen --check
+if ($LASTEXITCODE -ne 0) { throw "a generated material palette is out of step with the engine header" }
+
+$PalTest = Join-Path $Root "ue-project\Shaders\VoxelMaterialPaletteTest.usf"
+$PalInc = Join-Path $Root "ue-project\Shaders"
+# Its own directory, NOT $OutDir. This is a compile check, not a kernel: the
+# staleness sweep below globs *.spv out of $OutDir and compares it against
+# voxel-core/shaders/prebuilt, which is what vxc_gpu loads. Left in $OutDir the
+# palette reported itself permanently stale and invited someone to copy a
+# never-dispatched test shader in among the worldgen bytecode.
+$PalOut = Join-Path $Root "build\shaders\palette"
+New-Item -ItemType Directory -Force $PalOut | Out-Null
+Write-Host "[palette] DXIL"
+& $Dxc -T cs_6_0 -E PaletteCheckMain -O3 -I $PalInc $PalTest -Fo (Join-Path $PalOut "VoxelMaterialPalette.dxil")
+if ($LASTEXITCODE -ne 0) { throw "material palette failed to compile (DXIL)" }
+Write-Host "[palette] SPIR-V"
+& $Dxc -T cs_6_0 -E PaletteCheckMain -O3 -spirv "-fspv-target-env=vulkan1.1" `
+    -fvk-b-shift 0 0 -fvk-t-shift 1 0 -fvk-u-shift 3 0 -I $PalInc $PalTest `
+    -Fo (Join-Path $PalOut "VoxelMaterialPalette.spv")
+if ($LASTEXITCODE -ne 0) { throw "material palette failed to compile (SPIR-V)" }
+Write-Host "Material palette: both generated files in step with the header, and the shader compiles to both targets." -ForegroundColor Green
+
 # The directory vxc_gpu actually loads. Keep this name in step with
 # VXC_SPV_DIR in voxel-core/bench/CMakeLists.txt.
 $Prebuilt = Join-Path $Root "voxel-core\shaders\prebuilt"

@@ -1,0 +1,82 @@
+// Compile check for VoxelMaterialPalette.ush.
+//
+// This shader is never dispatched. It exists so that the generated palette
+// table and the ADR-0008 evaluation are proved to COMPILE, by DXC, without an
+// Unreal editor -- run from tools/compile-shaders.ps1 alongside the worldgen
+// kernels. One editor per box is a hard rule here and another session usually
+// holds it, so a shader change that can only be checked by opening the editor
+// is a shader change nobody checks.
+//
+// It touches every entry and every face class, so a generator that emits a
+// malformed row, an array sized wrong, or an out-of-range index fails here
+// rather than in a material compile weeks later.
+//
+// IT ALSO COMPILES THE RENDERER ROUTE (VoxelPalettePack / VoxelPaletteUnpack),
+// and that is the only reason those two functions live in the generated palette
+// header rather than in the vertex factory that calls them.
+// VoxelQuadVertexFactory.ush cannot be handed to DXC -- it opens with
+// /Engine/Private/VertexFactoryCommon.ush and is compiled inside a material
+// permutation -- so anything written there is unchecked until somebody opens the
+// editor. Everything the route decides is therefore here, where it is checked,
+// and the factory is left holding one call per side.
+
+#include "VoxelMaterialPalette.ush"
+
+RWStructuredBuffer<float3> PaletteCheckOut;
+
+[numthreads(1, 1, 1)]
+void PaletteCheckMain(uint3 id : SV_DispatchThreadID)
+{
+	float3 acc = 0.0f;
+	for (uint m = 0u; m < VOXEL_MATERIAL_COUNT; ++m)
+	{
+		acc += VoxelMaterialColor(m, VOXEL_FACE_TOP,    int3(1, 2, 3));
+		acc += VoxelMaterialColor(m, VOXEL_FACE_SIDE,   int3(-4, 5, -6));
+		acc += VoxelMaterialColor(m, VOXEL_FACE_BOTTOM, int3(7, -8, 9));
+
+		// The route, over all six face directions and both LOD extremes. The
+		// negative chunk origin is deliberate: the pool is re-based so that the
+		// camera sits near its own origin, so half of every ring is at negative
+		// pool coordinates and the floor() inside the unpack has to be a floor
+		// and not a truncation there.
+		[unroll] for (uint axis = 0u; axis < 3u; ++axis)
+		{
+			[unroll] for (uint pos = 0u; pos < 2u; ++pos)
+			{
+				// L0 (10 UU) on odd materials, L5 (320 UU) on even ones, so the
+				// level scale is exercised. WRITTEN AS ARITHMETIC, NOT AS
+				// `(m & 1u) ? 10.0f : 320.0f`, and the difference is not style:
+				// a scalar select whose result reaches a float3 operation makes
+				// DXC's SPIR-V backend emit `OpSelect %v3float` with a SCALAR
+				// condition, which is invalid SPIR-V ("Expected vector sizes of
+				// Result Type and the condition to be equal"). DXIL accepts the
+				// same source. Reduced to eight lines and confirmed both ways.
+				// The shipping caller cannot hit it -- its voxel size comes from
+				// a buffer, so there is no pair of constants to sink a select
+				// between -- but this file is the SPIR-V arm's only sample of
+				// this code, and the arm has teeth: this is what it caught.
+				const float voxelSizeUU = 10.0f + 310.0f * float(m & 1u);
+
+				// The axis is likewise selected by BUILDING a mask rather than
+				// by writing faceNormal[axis]: dynamic vector-component indexing
+				// is the other well-known source of the same invalid OpSelect.
+				const float3 axisMask = float3(axis == 0u ? 1.0f : 0.0f,
+				                               axis == 1u ? 1.0f : 0.0f,
+				                               axis == 2u ? 1.0f : 0.0f);
+				const float3 faceNormal = axisMask * ((pos != 0u) ? 1.0f : -1.0f);
+				const float3 localUU = float3(3.0f, 5.0f, 2.0f) * voxelSizeUU
+				                     + axisMask * ((pos != 0u) ? voxelSizeUU : 0.0f);
+
+				const float4 packed = VoxelPalettePack(
+					localUU, float3(-640.0f, 320.0f, -1280.0f), faceNormal,
+					voxelSizeUU, m, axis, pos != 0u);
+
+				float3 rgb;
+				float isAsset;
+				VoxelPaletteUnpack(packed, rgb, isAsset);
+				acc += rgb * isAsset + rgb;
+			}
+		}
+	}
+	PaletteCheckOut[id.x] = acc;
+}

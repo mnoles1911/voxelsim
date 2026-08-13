@@ -3,10 +3,10 @@
   "species": "granite-boulder",
   "kind": "rock",
   "seed": 1,
-  "spec_hash": "9b3f567137e8858d",
+  "spec_hash": "c950a9fa464bc251",
   "stats": {
     "seed": 1,
-    "spec_hash": "9b3f567137e8858d",
+    "spec_hash": "c950a9fa464bc251",
     "kind": "rock",
     "nodes": 0,
     "segments": 0,
@@ -14,26 +14,31 @@
     "iterations": 0,
     "targets_left": 0,
     "clumps": 0,
-    "voxel_cm": 10.0,
-    "height_m": 1.3,
+    "orphans_removed": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 5.0,
+    "height_m": 1.1,
+    "length_m": 2.55,
     "footprint_m": [
-      2.4,
-      2.1
+      2.55,
+      2.25
     ],
-    "grid_mb": 0.0,
+    "grid_mb": 0.1,
     "extent_vox": [
-      24,
-      21,
-      13
+      51,
+      45,
+      22
     ],
-    "voxels": 3549,
+    "vox_models_needed": 1,
+    "voxels": 26728,
     "by_material": {
-      "2": 3549
+      "2": 26728
     },
-    "ground_contact": 243,
-    "ms_grow": 0.9,
-    "ms_raster": 31.5,
-    "ms_total": 32.7
+    "ground_contact": 1358,
+    "ms_grow": 1.2,
+    "ms_raster": 128.2,
+    "ms_total": 130.1
   },
   "problems": [],
   "vox_models": 1

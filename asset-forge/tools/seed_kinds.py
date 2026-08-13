@@ -1,25 +1,44 @@
 """One-off: tag existing specs as trees and author the rock/bush/gap species."""
+import sys
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
+import seedspec
 from forge import spec as sm
 
 SPECS = Path(__file__).resolve().parents[1] / "specs"
+FORCE = seedspec.parse_force(sys.argv[1:])
 
 
 def make(name, **changes):
     s, rep = sm.patch(sm.default_spec(), dict(name=name, **changes))
-    sm.save(s, SPECS / f"{name}.json")
-    bad = [w for w in rep.warnings if "tip_radius" not in w]
-    print(f"  {name:<20} " + ("! " + bad[0] if bad else "ok"))
+    seedspec.write(s, SPECS / f"{name}.json", rep.warnings,
+                   force=FORCE, width=20)
 
 
 def main():
+    seedspec.announce(FORCE)
+    # THE MIGRATION BELOW HAS ALREADY RUN AND MUST NOT RUN AGAIN.
+    #
+    # When this was written every spec in the library was a tree and `kind` was
+    # being introduced, so stamping `kind="tree"` onto anything that lacked one
+    # was correct. It is now catastrophic: the condition is "kind is not tree",
+    # which today matches all 34 rocks and every grass, reed and flower, and it
+    # would convert the entire non-tree library into trees in one pass. That is
+    # not a revert to draft values, it is a different asset kind on 46 specs.
+    #
+    # Left in place rather than deleted so the history of the file still reads,
+    # but it only runs under --force, and only on specs that have no kind at
+    # all -- which is the case it was actually written for.
+    migrated = 0
     for fp in sorted(SPECS.glob("*.json")):
         s, _ = sm.load(fp)
-        if sm.get(s, "kind") != "tree":
+        if FORCE and "kind" not in sm.load(fp)[0]:
             s2, _ = sm.patch(s, {"kind": "tree"})
             sm.save(s2, fp)
+            migrated += 1
+    print(f"kind migration: {migrated} spec(s) needed a kind"
+          f"{'' if FORCE else ' (skipped; --force to run)'}")
 
     print("rocks:")
     make("granite-boulder", kind="rock",

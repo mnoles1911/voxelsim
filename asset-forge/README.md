@@ -1,10 +1,15 @@
 # asset-forge
 
-Cubic-voxel environment assets for voxelsim: trees, bushes, rocks, grass, reeds
-and flowers.
+Cubic-voxel environment assets for voxelsim: trees, bushes, rocks, grass, reeds,
+flowers and fish.
 
 Why it is built the way it is: `docs/tree-asset-generator-research.md`.
 What it is for and where it goes: `docs/tree-asset-generator-plan.md`.
+Why the fish are shaped the way they are: `docs/fish-shape-research.md`.
+What changes at 25 metres: `docs/marine-megafauna-research.md`.
+Why a marking can have a shape, and which sex you get: `docs/marine-marking-research.md`.
+What fish colour needs from the engine: `docs/fish-colour-proposal.md`.
+How the heroes hid a defect behind a single seed: `docs/hero-sequoia-wood-detachment.md`.
 
 ## The idea in one paragraph
 
@@ -43,8 +48,8 @@ implementation of it.
 
 ## Asset kinds
 
-The app opens on a **section** per kind — Trees, Bushes, Rocks, Grass, Reeds and
-Flowers. The section scopes everything below it: which
+The app opens on a **section** per kind — Trees, Bushes, Rocks, Grass, Reeds,
+Flowers and Fish. The section scopes everything below it: which
 parameters exist, which species the dropdown lists, which library entries show,
 and which biomes the coverage tab reports on. A rock has no trunk, crown, growth
 model or foliage, and the rock section does not show those sliders greyed out —
@@ -61,6 +66,20 @@ parameter group and one entry there; it is not a second application.
 | Grass | tuft — see **Ground cover** | 4 | no |
 | Reeds | tuft, tall and near-vertical, seed heads | 3 | no |
 | Flowers | tuft, few stems, some carrying a bloom | 5 | yes (bloom colour) |
+| Fish | lofted body + thin fin plates — see **Fish** | 17 | landed |
+| Whales & dolphins | the same generator; horizontal fluke, flippers, blowhole | 7 | landed |
+| Birds | jointed layout: body, neck, head, bill, tail, wings — see **Birds** | 20 | yes (eleven plumage colours) |
+
+**Fish are the first animal here, and the first asset that does not stand on
+the ground.** They are placed IN water, they face a direction, and they are not
+meant to persist — see **Fish** below.
+
+**Birds are the first JOINTED asset.** Everything before them is one shape: a
+tree is a skeleton, a rock is a carved lump, a fish is a solid whose
+cross-section changes along a straight axis. A bird is six parts at angles to
+each other, and the angles are most of what tells one apart from another — see
+**Birds** below. They are also the first kind that can go in **Ocean** and on
+**Bare rock**, the two biomes that hosted only fish and only boulders.
 
 Biome weights are scoped per kind too, because **Bare rock** is a real place for
 a boulder and an impossible one for an oak: the engine's cliff gate fires before
@@ -392,6 +411,84 @@ corrects on the same seed — searching on a coarse copy first, because the
 correction is a ratio of lengths and barely depends on the lattice, so a 9 m
 boulder is not built three times at full size to find it.
 
+### Weathering: one mechanism, two families of rock
+
+The weathering pass is driven by the **sign of the local curvature**, which is
+the mechanism the geology and graphics literature uses rather than a hand-rolled
+proxy (Beardall et al., *Goblins by Spheroidal Weathering*, EG Natural Phenomena
+2007; Jones et al., *Directable Weathering of Concave Rock Using Curvature
+Estimation*). It is what lets one generator produce two entirely different
+kinds of stone:
+
+- **Spheroidal weathering** attacks CONVEX surfaces fastest. A corner is exposed
+  on more sides than a flat face, so it goes first: blocky stone rounds off and
+  granite sheds curved shells. It is why a boulder is a boulder.
+- **Cavernous weathering** attacks CONCAVE surfaces fastest. Once a pit exists
+  it traps moisture and salt, so it deepens faster than the rock around it, and
+  the runaway pitting carves tafoni, honeycomb sandstone and hollow-sided
+  goblins.
+
+Both fall out of one number: the solid fraction inside a small ball centred on
+each voxel — half on a flat face, less on a protruding corner, more inside a
+hollow. `0.5 - fraction` is a signed curvature, and `rock.cavernous` picks which
+end of it drives the erosion. That ball is the "bubble" of the 2007 paper, and
+it is cheap on a voxel grid, which is why this is the one weathering model worth
+having here.
+
+Two details it will not work without. It has to be **iterative** — a pit only
+runs away if the next pass sees the pit the last one made — and the noise must
+be **the same across passes**, so the same weak patches are attacked repeatedly.
+Fresh noise per pass averages the feedback away and gives even pitting instead
+of cavities.
+
+### Bedding: differential erosion
+
+`rock.bedding` lays alternating hard and soft layers through the stone as a
+per-voxel durability field, dipped and noise-roughened. Sedimentary rock is
+deposited in beds of differing hardness, and that one fact is behind most rock
+shapes people recognise: weather a uniform block and you get a rounded lump
+whatever else you do; weather a layered one and the soft beds retreat while the
+hard ones stand proud. Banded cliffs, undercut pedestals, mushroom rocks and the
+capstone on a hoodoo are all this.
+
+It is the single biggest variety lever in the rock generator, because it changes
+the *class* of rock rather than its proportions.
+
+### Fracture: joint sets, blocks and columns
+
+**Rock does not fracture in random directions.** It fractures along a small
+number of **joint sets** — typically a bedding plane plus two near-vertical sets
+roughly at right angles — and every face in an outcrop shares them. That
+correlation between faces is the entire signal: it is what makes granite read as
+quarried rather than merely lumpy, and drawing each facet normal independently
+could never produce it. `rock.joint_sets` builds one orthogonal frame per rock
+and draws every cut from it.
+
+**`rock.block_relief_m` opens the joints.** Once the joint frame exists it also
+defines a lattice of blocks, and letting the planes stand open turns one stone
+into an outcrop of separate ones. This is the voxel form of what the
+implicit-blocks literature (Paris et al., *Modeling Rocky Scenery using Implicit
+Blocks*, CGI 2020) does with signed distance fields. The visible **gap** is the
+whole effect — a continuous mass with faces drawn on it still reads as one rock.
+
+**`rock.columns` gives basalt.** Cooling lava contracts into a polygonal crack
+network that propagates downward. The network is a 2D Voronoi tessellation
+extruded along the column axis, found with the standard F2−F1 test: a voxel is
+on a cell boundary when its two nearest seeds are nearly equidistant. Seeds sit
+on a jittered lattice rather than uniformly at random, because the literature
+puts real column networks between a random and a centroidal tessellation —
+purely random seeds clump and give a few huge columns beside slivers. Columns
+get their own top heights, because a colonnade sawn flat reads as an extruded
+shape rather than as stone.
+
+**`rock.exfoliate` peels shells.** Granite domes release pressure as the load
+above them erodes away and split into sheets *parallel to the surface*, which
+spall off. Depth below the surface is a distance transform and a coherent noise
+field decides how many whole shells each patch has lost; peeling in whole shells
+rather than continuously is what leaves the stepped edge. The ordinary
+weathering pass cannot produce this at any setting, because it has no notion of
+depth.
+
 ### What the large boulders exposed
 
 The 4.5-9 m boulders are a size class above anything else and they broke two
@@ -412,6 +509,610 @@ broken. It reuses the same noise field the body does — generating a second one
 doubled the slowest part of the build for a difference nobody could see, and a
 fracture following the same grain as the weathering is if anything more
 physical.
+
+## Fish
+
+The first environmental animal, and the first asset here that is not rooted to
+the ground (`forge/fish.py`). A fish is three things stuck together, and they
+fail in completely different ways, so the code keeps them apart:
+
+1. **A lofted body** — a spine with a depth and a width at every station along
+   it, filled as a superellipse cross-section.
+2. **Thin plates** — the caudal, dorsal, anal, pectoral and pelvic fins, plus an
+   adipose fin and barbels where the species has them.
+3. **A colour scheme** — countershading, one marking, and an eye.
+
+### The budget decides the design
+
+A fish here is twenty to forty voxels long: about 600 solid voxels, of which
+about 120 are on the silhouette. That cannot carry anatomy, so it is spent on
+the three things the eye actually uses at a glance — the OUTLINE, the COLOUR
+SCHEME and the EYE. Everything else was measured against that budget and most of
+it lost. `docs/fish-shape-research.md` has the full list; the short version of
+the rejections is that the superformula is pixel-identical to a plain ellipse at
+a 4x8 cross-section, elliptic Fourier descriptors put the fin-encoding harmonics
+below the quantisation noise floor, and a Turing pattern with a real fish's
+wavelength resolves as salt and pepper on a body twelve voxels deep.
+
+### Authored at 1 cm, not the 5 cm everything else uses
+
+Cost is not the constraint. A whole fish is 150-4,600 voxels against 75,000 for
+a temperate oak, so a shoal of forty is under a tenth of one tree. What decides
+it is whether the FEATURES still exist, measured with
+`tools/fishprobe.py --lattice`:
+
+    brown-trout        1 cm   41 voxels long   fork depth 5   eye present
+                       2 cm   21               fork depth 2   eye present
+                       5 cm    8               fork depth 0   eye gone
+    clown-anemonefish  1 cm   18               --             eye 2 voxels
+                       2 cm    9               --             eye gone
+
+**At 5 cm the tail fork and the eye are gone on every species**, and between
+them those two are most of what makes a small object read as an animal rather
+than as a lozenge. 1 cm nests 10:1 in the terrain lattice and 5:1 in the asset
+lattice, both whole numbers, so a fish placed on a fine-lattice coordinate lands
+exactly on it.
+
+What 1 cm does not buy is a life-sized small fish. A 10 cm anemonefish is ten
+voxels, and three bars need at least twelve. `clown-anemonefish` and
+`pale-minnow` are therefore authored at the large end of their real size range
+and their spec notes say so. A 5 mm tier would fix it and would be a THIRD asset
+lattice; that is an owner decision, not a generator decision.
+
+### Three things that were got wrong first
+
+**A fin drawn at its true position falls off.** Every fin is a plate one voxel
+thick standing on a curved body, so placing it AT the surface leaves it touching
+at a corner, or not at all, depending on which side of a rounding decision the
+surface landed. Every fin is now drawn starting ONE VOXEL INSIDE the body. The
+pectoral goes further and starts at the body's own axis, because the widest
+point of a fish is exactly where it is thinnest vertically, and a fin voxel
+placed at the surface there often had no body voxel beside it.
+
+**A body drawn only by its cross-section can vanish.** The snout and the caudal
+peduncle are the thinnest parts of a fish — an eel's peduncle is 0.2 voxels at
+this size — and a cross-section that thin contains no cell centre at all, so the
+nose and the tail wrist dropped out and the asset shipped in three pieces. The
+body axis is stamped as a solid one-voxel run FIRST and the cross-sections are
+added to it, which is the same rule `grid.capsule` uses for a twig.
+
+**A fork reaches the full span at the trailing edge**, which is geometrically
+what a fork IS and which left each lobe exactly one voxel wide: two whiskers
+rather than a tail. Lobes are now held to a quarter of the span, or 1.2 voxels,
+whichever is more.
+
+### Colour carries the species, not shape
+
+Two fish of the same outline in different schemes read as two species; two fish
+of different outlines in the same scheme read as one species at two sizes. That
+is a claim about twenty-voxel fish specifically, and it falls straight out of
+the budget: the outline has about 120 voxels to work with and the flank has
+about 400. `golden-carp` and `river-perch` have similar outlines and nobody
+confuses them.
+
+Three layers, in order. **Countershading** — dark back over a pale belly, which
+nearly every fish in open water wears and which is the only thing that gives a
+voxel fish a top and a bottom at all. Then **one marking**. Then **the eye**.
+
+One marking and never two: a flank twelve voxels deep cannot hold a stripe and
+bars without them reading as noise, and in nature they are mutually exclusive
+anyway. The five are `stripe` (horizontal, the open-water schooling mark),
+`bars` (vertical, the weed-bed and reef mark), `spots`, `mottle` and `saddle`.
+
+**The eye is two voxels a side and worth more than any other two in the asset.**
+A voxel animal without one reads as an object; with one it reads as facing
+somewhere. The pale voxel in front of it is not a highlight, it is a contrast
+partner — a dark eye on an olive or brown head disappears entirely without one.
+
+### A marking can be an EDGE, not just ink
+
+The five markings above are all ink laid ON a colour field, and they are drawn
+over a countershading whose two boundaries are **level lines** running the
+length of the animal. The three most recognisable colour schemes in the sea are
+none of those things: they are the *boundary itself* having a shape.
+`fish.field_curve` bends it.
+
+- **`cape`** — the dark back reaches down onto the flank around the dorsal fin
+  and lifts again behind it. Every dolphin wears one.
+- **`flame`** — the pale belly throws a blaze up the flank behind the middle of
+  the animal. It is why an orca reads as two white shapes from the side and not
+  one.
+- **`hourglass`** — both, at the same place, so the dark and the white meet and
+  pinch the flank out between them. That is the common dolphin's criss-cross.
+
+**The third one is the argument for doing it this way.** An hourglass is not a
+third mechanism — it is the first two meeting, and it falls out for free.
+Perrin's 1972 account of *Delphinus* says exactly that: the four colours of a
+common dolphin are the overlap of **two** shapes, not four regions, so the
+forward half of the pinched flank is a warm chestnut and the half behind it
+grey. Drawn
+instead as an hourglass-shaped MARKING it would have been a hand-drawn X that
+knew nothing about where the countershading was, and moving the dark-back
+slider would have left the X floating clear of the cape it is cut out of.
+
+**Two voxels or it is not a curve, and that excludes the small fish by
+measurement.** `python tools/fishprobe.py --marks` prints the minimum setting
+each species needs: an orca needs 0.07 of its body depth, a bottlenose dolphin
+0.22, and a herring **0.67** — two thirds of its own flank, at which point the
+"curve" is the countershading. The bottlenose is the shallowest animal in the
+library that can carry one at all, and it gets exactly two voxels.
+
+`common-dolphin` is authored at **2 cm** rather than the 5 cm the other
+dolphins use, and it is the first time a COLOUR feature has chosen a lattice
+here. At 5 cm its cape dips one voxel; at 2 cm it dips four and the blaze rises
+seven.
+
+### The hammerhead's head
+
+`fish.head_width` is how far the head sticks out sideways, tip to tip, as a
+fraction of body length — 0 on everything except one group.
+
+**It is the only thing in the group the body loft could not say.** Every other
+width here follows the depth: one slider decides how the whole animal flattens
+from nose to tail, so a station that is shallow is narrow. A hammerhead is the
+exact counter-example — its head is the shallowest part of the animal and by a
+long way the widest — and until this parameter existed, typing `hammerhead`
+gave a shark with hammerhead proportions and an ordinary head.
+
+It widens the loft itself rather than adding a plate, so the head is the same
+solid as the body and connectivity is a fact rather than a hope. Two things
+come out of that for free and are measured because they were free: the **eye
+lands on the wingtip**, which is where a hammerhead's eyes are, and the head
+carries no join to come apart. Measured on `scalloped-hammerhead`
+(`--head`): span **27.5% of total length** against a published 25–32%, chord
+0.32 of span against Compagno's "less than half", thickness 0.08 of span
+against the one measured animal's 0.094.
+
+A cephalofoil is a horizontal plate, exactly like a fluke — so the 8-degree
+fish camera sees it edge-on and `render.camera_for` sends a wide-headed fish to
+the 30-degree camera the whales use. Same exception a flying bird needs, same
+geometric reason.
+
+### Male and female
+
+`fish.sex` is `unsexed`, `female` or `male`, and three ratios say how far apart
+the sexes are: body length, dorsal fin height and flipper reach. **The authored
+numbers are the species average and each ratio is split as a square root either
+way**, so male ÷ female is exactly the ratio and neither sex is the default.
+The obvious alternative — the spec is the female and the male is scaled up —
+would have made every unsexed spec in the library silently female.
+
+Forcing that question to be answered out loud found that three specs could not
+answer it. `orca`'s dorsal fin was 27% of its body length when the published
+bull is 22–26% — taller than any measured male — while its **flippers were a
+female's at the same time**; `whale-shark`'s 9 m and `sperm-whale`'s 16 m are
+both male figures against females of 14.5 m and 11 m. Those three were
+re-authored onto the average. Everything else keeps its authored size: the rule
+was *re-author only where leaving the number alone would put both sexes outside
+their published ranges*.
+
+**Eleven of the twenty-three species carry a sex worth drawing and twelve do
+not, and the twelve say so.** A river perch's females are 6% longer, which is
+1.6 voxels; a herring's difference is 0.4%; a blue tang has none published at
+all. `python tools/fishprobe.py --sex` prints the movement in voxels per
+species and flags any species that claims a ratio and does not get it.
+
+**Sex reseeds, and that is the opposite of what a pose does.** A raven perched
+and the same raven flying are one animal, so `bird.pose` is excluded from the
+seeding hash. A male orca and a female orca are two animals — there is no
+individual that is "the same whale, but female" — so seed 7 male and seed 7
+female are two different whales. `--sex` checks the hashes differ rather than
+letting it be an accident of where the field was put.
+
+### The materials
+
+ADR-0008 gives every voxel face one flat colour from `vxc::kMaterialPalette`,
+and that palette was terrain-oriented: no orange, no silver, no reef blue. Ten
+`MAT_SKIN_*` entries were proposed and **were approved and appended to the
+engine on 2026-08-13** — ids 26-35, `kMaterialCount` 26 to 36. They are in
+`forge/materials.py` — dark, pale, silver, olive, brown, orange, yellow, red,
+blue, green — named for what they look like rather than for what wears them,
+because fish will not be the last animal. `docs/fish-colour-proposal.md` has the
+exact table, the files the append touches and what each one costs. The birds
+proved that list one file short: it does not name
+`ue-project/Tools/terrain_palette.py`, which refuses to generate until every new
+material has a `BIOME_TINT` decision and which stopped the fish append's
+generator dead. See `docs/bird-colour-proposal.md`.
+
+### Detail entities
+
+The `detail` group is authored and **read by no code**, deliberately, in exactly
+the way the `placement` group has been since this library began. Spawning fish
+into water bodies is worldgen's job, not the generator's. What these rows are is
+the specification a spawner will be written against, kept in the same file as
+the shape so the two cannot drift apart: which water bodies a species uses, how
+deep it holds, how big a shoal is, how many per hundred square metres of water
+surface — and the thing that makes a shoal of forty affordable at all,
+`detail.entity_class`, which says that nothing about an individual is saved and
+that it is deleted shortly after the player leaves.
+
+### Species
+
+    brown-trout          0.30 m  fusiform, olive-brown, spotted, adipose fin
+    river-perch          0.22 m  deep olive body, five dark bars, spiny dorsal
+    pale-minnow          0.20 m  plain silver; the test of how little will do
+    river-eel            0.70 m  anguilliform, ridge fin, no fork, no pelvic
+    northern-pike        0.75 m  sagittiform, mass carried aft, pale saddles
+    mud-catfish          0.38 m  wider than deep, barbels, brown mottle
+    golden-carp          0.40 m  deep orange body, two barbels
+    clown-anemonefish    0.18 m  three pale bars on orange, rounded tail
+    reef-tang            0.18 m  a disc on edge: blue body, yellow fins
+    shoal-herring        0.20 m  countershading and nothing else, deep fork
+
+### Keyword input
+
+The plain-language box takes species names — *trout*, *pike*, *eel*, *carp*,
+*clownfish*, *tang*, *tuna*, *pufferfish*, *catfish*, *flounder*, *barracuda*
+and about a dozen more — and each one replaces the body proportions, the fin
+arrangement and the markings TOGETHER, because those three are what a species is
+at this size and setting one without the others gives a trout wearing pike
+colours. It also takes descriptions: *deeper bodied*, *streamlined*, *lunate
+tail*, *barred*, *bolder markings*, *bigger eye*.
+
+It is local, like the rest of `forge/language.py` — no network, no model, no
+key. The numbers are the published medians per shape class, typed out by hand.
+FishBase carries a body-shape class for 36,125 species and would have given a
+far larger vocabulary for free; it is also explicitly licensed for
+non-commercial use, and the one public dataset that carries body WIDTH
+contradicts itself about its own licence. Neither belongs inside a game.
+
+### Proving the sliders do something
+
+`tools/fishprobe.py` sweeps every fish parameter across its authored range,
+measures a number a person could check off a render, and prints **DEAD** when it
+does not move. It exists because the silent no-op is this project's signature
+failure, and it earned its place on its first run by finding one — and then by
+finding that three of its own measurements were wrong: `dorsal_len` makes a fin
+longer rather than heavier, `pattern_count` makes more bars rather than more
+ink, and `pattern_pos` moves a stripe without changing how much of the fish it
+covers. All three had been measured by voxel count and all three reported a
+working slider as dead.
+
+    python tools/fishprobe.py              # every parameter, 4 seeds averaged
+    python tools/fishprobe.py --read       # silhouette, value contrast, blur
+    python tools/fishprobe.py --lattice    # 1 cm against 2 cm and 5 cm
+    python tools/fishprobe.py --marks      # shaped colour boundaries, in voxels
+    python tools/fishprobe.py --head       # head span: the cephalofoil
+    python tools/fishprobe.py --sex        # male against female, in voxels
+    python tools/fishprobe.py --ab         # the three A/B render sheets
+
+It averages over seeds because changing any parameter changes the spec hash, and
+the hash is mixed into the seed — so a one-seed A/B is not the same fish twice,
+it is two different fish.
+
+The `--read` pass is the one to run before approving a species. It flags a fish
+under 18 voxels long, a marking covering under 8% of the body, and — the one
+that matters most — a marking whose **value contrast** against the flank is
+under 1.5. The eye carries brightness at roughly four times the spatial detail
+it carries colour, so a marking that differs from the flank only in HUE blurs
+away about four times sooner: it can be perfectly present in the voxels and
+invisible in the water.
+
+## Birds
+
+`forge/bird.py`. Twenty species, authored at **1 cm**, **334 to 28,355
+voxels each** — all twenty together are 87,460, against 1,065,343 for one
+`temperate-oak`, so a flock of forty song-thrushes costs 1.25% of one tree.
+Research and sources in `docs/bird-shape-research.md`; the colour ask in
+`docs/bird-colour-proposal.md`.
+
+**A bird is not a fish with wings, and that is the whole reason it is a second
+generator.** A fish is one solid whose cross-section changes along a straight
+axis, so a loft draws it. A bird is a body, a neck, a head, a bill, a tail and
+two wings, each at its own angle to the others. A heron and a mallard have
+nearly the same body; what separates them at twenty voxels is that the heron's
+neck is a quarter of its length, its bill is a spike and its legs are a third of
+it again.
+
+So the file is a **layout** followed by six drawing passes. The layout is solved
+first, in floating-point voxel coordinates, as a handful of points and radii;
+the grid is sized from that layout's own bounding box rather than from a
+formula; and each part is drawn starting one voxel INSIDE the part it hangs off.
+
+### What the voxel budget is spent on
+
+Birders identify birds by shape and stance before colour. They have a word for
+it — *jizz*, first recorded in a *Manchester Guardian* column in **1921**, which
+settles the folk etymology that it is an RAF acronym — and Cornell's own
+teaching material enumerates the cues: "the head, the bill, the length of the
+wings and the length of the tail", compared **against each other** rather than
+against a ruler.
+
+That is exactly what survives here, so it is exactly what the parameters are:
+
+1. **Proportion.** Five shares — bill, head, neck, body, tail — normalised to
+   sum to one. This is the strongest thing in the file. A heron's neck is 0.26
+   of its length and a starling's is 0.03; a macaw is 0.55 tail and a kingfisher
+   is 0.11.
+2. **Posture.** One angle. A duck lies flat at 4 degrees, a thrush sits at 34, a
+   woodpecker clings to a trunk at 68.
+3. **The bill.** Four to sixteen voxels, and it says what the bird eats.
+4. **The tail outline.** Seven field-guide shapes out of one function.
+5. **The wing** — but only when it is spread.
+6. **One mark per region**, on three disjoint regions.
+
+### The pose problem, and what was decided
+
+A perched raven is a dark lozenge and a flying raven is a cross. Those are not
+one shape at two rotations: the folded wing is a three-voxel bulge lying along
+the flank and the spread wing is a one-voxel plate reaching thirty voxels out,
+and **no rotation turns one into the other at this resolution**. One generation
+produces one asset, so an asset carries one pose.
+
+Every prior art agrees on the shape of the answer and none of it transfers
+directly. Minecraft ships **one** parrot geometry and six animations, with the
+wings moved purely by bone rotation from a folded rest pose. Infinigen exposes
+one continuous `Extension` scalar from folded to spread. Avian-mesh ships two
+JSON files whose faces, kinematic tree and skin weights are byte-identical and
+whose **rest vertex positions are not**. All three store one topology and **two
+rest configurations**.
+
+**A cubic voxel asset cannot store a rotation delta. The grid IS the rest
+configuration.** So the voxel-space equivalent of "one mesh, two rest poses" is
+**one spec, two poses**, which is what `bird.pose` is — and it costs one changed
+field in a four-kilobyte JSON file, not a second asset library.
+
+The measurement that came out of avian-mesh is the one to remember: spreading
+the wings multiplies the **span** by 4.51 and the **body length** by 1.04. Key
+the voxel budget to body length, which is pose-invariant. `render.predicted_extent`
+does, and `render.camera_for` sends a perched bird to the broadside camera and a
+flying one to the isometric, because a flying bird holds its wings along the
+broadside camera's own axis and hides the entire planform from it.
+
+`python tools/birdprobe.py --pose` reproduces that here, over all twenty
+species: **span multiplies by 2.9 to 10.0 and length by 0.89 to 1.21.** The two
+that move most in length are the ones that should — a woodpecker is authored at
+68 degrees nose-up and lies down to fly, so its x extent grows by 1.69, and a
+swallow is authored nearly level already. Voxel counts roughly double to triple:
+a raven is 3,896 perched and 11,728 flying.
+
+**All twenty species are authorable in both poses.** The pose in the spec is
+where the species is usually seen, not a restriction, and `birdprobe --pose`
+builds all forty and checks each is one piece at 26-connectivity.
+
+### A pose is a posture, not a different bird
+
+This used to be untrue and it was the one thing a spawner had to work around.
+`pipeline.rng_for` seeded from `spec.spec_hash`, the pose is part of that hash,
+and a different hash is a different random stream — so `common-raven` seed 7
+perched and `common-raven` seed 7 flying were **two different ravens**,
+different size and different markings. A bird could not land without changing on
+the way down.
+
+`rng_for` now seeds from **`spec.seed_hash`**, which is `spec_hash` with
+`bird.pose` normalised to its default before hashing. `spec_hash` itself is
+unchanged and still identifies the spec everywhere else — the library entry, the
+`.vxa` metadata, the preview cache key — because a perched raven and a flying
+raven are genuinely two assets.
+
+**Normalised rather than deleted, and that is the whole design.** Every
+validated spec carries every parameter, birds included, so *deleting*
+`bird.pose` before hashing would change the canonical JSON of a tree, a rock and
+a fish too and reseed the whole library for the second time in one day.
+Normalising to the default leaves the bytes untouched for anything that never
+authored a pose. Measured over all 109 specs: **104 keep the exact seed they had
+— every tree, rock, fish and cetacean, and the fifteen perched birds — and the
+five species authored `flying` reseed once**, onto the individual their perched
+twin already was.
+
+    python tools/birdprobe.py --pose        # 20/20 species, one bird in both poses
+    python tools/birdprobe.py --pose-ab     # the render: out/birds/birds-pose-ab.png
+
+The A/B sheet draws each species folded and spread at one seed **with individual
+variation ON** — the previous version pinned it to 0, which is a workaround for
+this very defect and hid it — and a third cell per row at the next seed as the
+control. Columns 1 and 2 must be the same animal; column 3 must not be.
+
+`--pose` checks it three ways and each one fails loudly on its own: the seed
+hash, the ten varied numbers `bird._params` hands the drawing code, and the bill
+in voxels. The bill is the only part the pose touches neither directly nor
+through the grid's own mid-plane, which is why the voxel half of the check is
+that narrow — the two poses genuinely do not rasterise on the same lattice, and
+saying so is better than a tolerance.
+
+### Wing planforms
+
+Savile's 1957 classification maps almost one-to-one onto groups a player would
+name, and it is `bird.wing_shape`:
+
+| Planform | Groups | Tip |
+|---|---|---|
+| `elliptical` | corvids, gamebirds, woodland songbirds | broad, rounded |
+| `pointed` | falcons, swifts, swallows, terns, ducks | swept, tapering |
+| `soaring` | gulls, albatrosses | a long narrow plank |
+| `slotted` | eagles, buzzards, storks, vultures | separated finger feathers |
+
+**Aspect ratio is a separate slider and that is not redundancy.** The planform
+says how the chord is DISTRIBUTED; aspect ratio says how much there is. Measured
+over 129 species from 33,610 individual measurements (Alerstam et al. 2007), the
+three raptor shapes are falcon **7.9**, accipiter **6.2**, buteo **5.6** — all
+three are raptors, all three read differently in the air, and the difference is
+one number. A jay is 4.5, the lowest measured, which is why its wing is so short
+and round.
+
+**"Soaring" is not one wing.** Hand-wing index separates ocean dynamic soarers
+(albatross 60–67) from land thermal soarers (eagle and vulture 27–39) by a
+factor of two. A vulture gets its low wing loading from AREA, not from
+pointedness, and drawing a golden eagle with an albatross silhouette is a
+visible error. That is why `soaring` and `slotted` are two entries.
+
+### Three markings, where a fish gets one
+
+That is not a relaxation of the fish rule; it is the same rule. A fish's stripe
+and its bars are drawn on the same twelve-voxel flank, so two of them is noise.
+A bird's cap is on its head, its wing bar is on its wing and its streaking is on
+its breast, and **those three sets of voxels do not overlap at all**.
+
+The head also gets its own marking colour, and there is evidence for the
+asymmetry: CUB-200-2011, the standard expert-annotated bird dataset, gives the
+head **eleven** pattern values and gives the breast, back, belly, wing and tail
+**four** each. Ornithologists spend nearly three times the vocabulary on the
+head. The species that forced it was the great spotted woodpecker, which is
+white-panelled on the wing and crimson on the nape; with one shared marking
+colour it had to choose.
+
+`bird.upperparts` is ONE hard boundary rather than a gradient. Cuthill et al.
+2016 found a sharp countershading transition is optimal under **direct** solar
+illumination and provides no advantage at all under diffuse light — and a hard
+boundary is also what every field guide draws.
+
+### Colour is pushed past life, and there is a number behind it
+
+Delhey 2015 measured 46,559 reflectance spectra over 555 species: **melanin
+accounts for 74% of the plumage area and 7% of the colour gamut, while
+structural colour is 7% of the area and 45% of the gamut.** A palette weighted
+by area — which is what copying a field guide gives you — is browns and greys.
+
+So the rare colours are deliberately over-weighted. A raven carries its gloss as
+a real teal, a pigeon's neck is really lilac, a kingfisher is turquoise rather
+than the deep blue it photographs as. **Where a species is pushed, its spec
+notes say so**, so nobody later "corrects" it back.
+
+Two independent measurements say colour is worth the material slots. Torralba
+found humans need 64×64 in greyscale for what colour does at 32×32 — colour is
+roughly a **2× resolution multiplier**. And *Pixel Logic* records that Super
+Mario World's Swoopers are bats that read as birds purely because their nose was
+coloured orange: **an orange protrusion in the head position converts a bat into
+a bird.** That is why `beak_horn` exists and why nine of the twenty species
+carry a bright bill.
+
+**Eleven `MAT_PLUME_*` entries were proposed and were approved and appended to
+the engine on 2026-08-13** — ids 36–46, `kMaterialCount` 36 to 47. Four are the
+neutrals the fish skins have no equivalent for (a fish belly is cream, not
+white; the one grey in the skin set is the mirror-flanked silver; the palette
+had no dark cool grey and no sandy tan at all), six are saturated hues, and one
+is keratin. `docs/bird-colour-proposal.md` has the table, the WCAG contrast
+number behind every entry and the five files plus two regenerated artifacts the
+append touched.
+
+The twenty species fill 160 material slots between them: **92 are one of the
+eleven and 68 are one of the ten fish skins**, which is why the ask was eleven
+and not twenty-five. Two entries break the darkens-downward convention on
+purpose — `plume_iridescent` has brighter sides than its top, because
+structural colour is an angle effect and a flat dark green draws a starling as a
+blob, and `plume_white` carries the lowest jitter in the whole engine palette,
+because noise on a white bird reads as dirt.
+
+Nothing about a bird is a stand-in any more. `python -m forge.cli selftest`
+checks it: **every asset in the library uses only material ids the engine has**,
+against the count read from the generated palette. Before the append that check
+refused all twenty birds and no other species, which is what
+`AssetGrid::materialsWithinEngine` does in C++ and is the reason the check is
+worth having on this side too.
+
+### Authored at 1 cm, and four species above life size
+
+`tools/birdprobe.py --lattice` measures the features rather than the cost,
+because cost is not the constraint:
+
+| Species | Lattice | Length | Bill | Eye | Tail | Neck | Crest | Voxels |
+|---|---|---|---|---|---|---|---|---|
+| european-robin | 1 cm | 19 | 2 | **2** | 7 | 1 | 1.0 | 445 |
+| | 2 cm | 10 | 3 | 1 | 5 | 1 | 1.0 | 85 |
+| | 5 cm | **7** | 3 | 1 | 5 | 0 | 1.0 | 41 |
+| eurasian-hoopoe | 1 cm | 26 | 5 | **2** | 9 | 5 | **9.0** | 435 |
+| | 5 cm | **9** | 2 | 1 | — | **0** | 2.0 | 35 |
+| golden-eagle | 1 cm | 83 | 8 | **2** | 15 | 3 | 5.5 | 28,355 |
+| | 5 cm | 17 | **0** | 1 | 4 | 3 | 0.0 | 1,189 |
+
+**At 1 cm every species has a two-voxel eye — a pupil and its contrast partner.
+At 5 cm every species has one and no partner**, which is a dark speck on a dark
+head, and **the bill is gone entirely on nine of the twenty species**, the
+eagle's included. At 2 cm a robin is ten voxels long, below Minecraft's own
+shipped parrot at 11. Only 1 cm carries a bill, a two-voxel eye, a neck and a
+crest across the whole set, and it nests 10:1 in the terrain lattice and 5:1 in
+the asset lattice.
+
+A goldcrest is 9 cm and a wren is 10. **Four species are authored above life
+size** — european-robin (24 cm against 14), great-tit (24 against 14),
+barn-swallow (26 against 17–19) and common-kingfisher (20 against 17) — and each
+says so in its own notes. **Three of them sit above the 20 cm floor rather than
+at it**, because a perched songbird is authored at 36–42 degrees nose-up and
+20 cm of bird at that angle projects onto sixteen voxels of length.
+`tools/birdprobe.py --read` measures the animal's longest axis rather than its x
+extent for exactly that reason, and it flagged all three as SHORT at 20 cm.
+
+### Detail entities
+
+Same promise the fish make: **nothing about an individual is saved.** It is
+spawned from `(species, seed)` when the player is near and it is gone when it
+despawns. The `flock` group is the specification a spawner will be written
+against, stated in the same file the shape is stated in so the two cannot drift.
+Nothing reads it yet.
+
+It is a separate group from the fish `detail` group because five of that group's
+eleven rows are about water depth, and a bird does not have one. What a bird has
+instead is `flock.perch` (ground, shrub, canopy, cliff, waterside, water, air),
+a flying height band, and `flock.flight_share` — how often the species is in the
+air rather than perched, which is what tells a spawner which POSE to ask for. A
+vulture is 0.90 and a wren is 0.05.
+
+### Keyword input
+
+`forge/language.py`, still fully local — no network, no model. **46 bird species
+keywords**, and each is a WHOLE BIRD: typing `heron` replaces the five length
+shares, the posture, the bill, the tail and the legs together, because a heron
+with a songbird's neck is a grey songbird.
+
+    heron        eagle        raven        pigeon       kingfisher
+    robin        swallow      owl          duck         macaw
+    wren         swift        falcon       vulture      hummingbird
+    ... 46 in all, plus 74 shape and colour phrases
+
+Species keywords set SHAPE only. Colour is a separate vocabulary
+(`iridescent`, `turquoise bird`, `sandy bird`, `glossy black`) so that `raven`
+and `glossy black` compose instead of one overwriting the other.
+
+Three phrases mean the same thing to a fish and to a bird — `square tail`,
+`rounded tail`, `barred` — and they set **both** parameters. A fish spec never
+reads `bird.*` and a bird spec never reads `fish.*`, so the half that does not
+apply is a no-op. The bird switches live in their own table and are merged by
+`_merge_switches`, which records a collision instead of overwriting: a Python
+dict literal with a duplicate key keeps the last one and says nothing, and
+written into one literal the bird entries silently replaced the fish ones.
+
+### Proving the sliders do something
+
+    python tools/birdprobe.py             # every parameter, 4 seeds averaged
+    python tools/birdprobe.py --read      # silhouette, contrast, erosion
+    python tools/birdprobe.py --lattice   # 1 cm against 2 cm and 5 cm
+    python tools/birdprobe.py --pose      # folded against spread, one piece, one bird
+    python tools/birdprobe.py --pose-ab   # the pose A/B render
+
+Same idea as `fishprobe.py` and a harder problem, because a bird is six parts
+and a measurement taken off the whole animal is usually dominated by the wrong
+one — the tail is longer than the body, the wings are wider than everything, and
+the bill is four voxels out of six hundred. **Most of the measurements read the
+material histogram or a region of the silhouette, and each one says what it was
+measuring before that turned out to be the wrong part.**
+
+It found four real defects in the generator and six in itself. The
+generator's: `bill_gape` multiplied by `bill_depth`, so a shallow bill could not
+be made wide and the slider did nothing on any bird smaller than a heron; the
+folded wing covered five sixths of every animal (119 wing voxels against 88 of
+body on a robin); every head came out twice the length its own share asked for,
+because a `0.5 × … × 2.0` cancelled; and the eye was silently not drawn at all
+on about a third of the small-headed species, because the computed station
+rounded to a cell just outside the head.
+
+Its own included counting a herring gull at **74% ink** on a species that
+carries no marking at all — the head-mark slot happened to hold the same grey
+its back is painted in. The fix is that ink is now measured as the difference
+between the bird and the same bird with its markings turned off, which measures
+the marking whatever colour it shares.
+
+The `--read` pass is the one to run before approving a species. Its contrast
+floor is **2.0** where the fish probe's is 1.5, and the difference is the brief:
+at 1.5 a marking is present and faint; at 2.0 it is a block of colour.
+
+It checks **four** contrasts, not one: the wing mark against the wing, the body
+mark against the underparts, the head mark against the head, and **the bill
+against the head**. The fourth was added last and it was the most productive:
+**ten of the twenty species were drawing a bill in a colour that did not
+separate from the head it sticks out of** — a robin's horn bill on its olive
+head measured 1.04, a great tit's black bill on its black cap measured 1.00.
+The bill was there in every case and could not be seen. Twelve of the twenty
+now carry a bright bill and three a grey one.
 
 ## Ground cover
 
@@ -513,6 +1214,22 @@ mismatch between two sliders that were never tied together.
     desert-mesa-block    5.5 m  wind-carved sandstone, wide and flat-topped
     cliff-fall-block     6.5 m  sharply fractured, barely eroded, below cliffs
     summit-tor           9.0 m  stack of weathered blocks on high open ground
+    tafoni-sandstone     3.6 m  hollowed by cavernous weathering
+    banded-sandstone-ledge 4.2 m stepped ledge, differential erosion
+    jointed-granite-tor  4.0 m  faces sharing three joint orientations
+    fractured-outcrop    5.5 m  separate blocks with the joints standing open
+    basalt-colonnade     4.5 m  vertical columns from a Voronoi crack network
+    exfoliating-dome     5.0 m  concentric shells spalling off a dome
+
+The last six are not re-tunings of the granite boulder — they are rock classes
+the generator could not previously make, one per mechanism:
+
+    tafoni-sandstone        rock.cavernous     runaway pitting
+    banded-sandstone-ledge  rock.bedding       differential erosion
+    jointed-granite-tor     rock.joint_sets    shared fracture orientations
+    fractured-outcrop       rock.block_relief  open joints between blocks
+    basalt-colonnade        rock.columns       cooling-contraction network
+    exfoliating-dome        rock.exfoliate     shells parallel to the surface
 
 The five above 4 m are a different job from the five below. A 3 m slab is
 scenery you walk past; a 5-9 m boulder is scenery you walk *around* — it blocks
@@ -541,6 +1258,57 @@ spacing.
     desert-bloom             sparse dry-country flower, wide gaps between plants
     coastal-thrift           low salt-tolerant cushion for the beach band
     jungle-understory-flower taller stems under a few big bright heads
+
+### Fish  (voxel size per species)
+
+    1 cm   brown-trout  river-perch  pale-minnow  river-eel
+           northern-pike  mud-catfish  golden-carp
+           clown-anemonefish  reef-tang  shoal-herring
+    2 cm   reef-shark  bluefin-tuna  mirror-carp
+    5 cm   great-white-shark  tiger-shark  whale-shark
+           scalloped-hammerhead
+
+### Whales & dolphins  (voxel size per species)
+
+    2 cm   common-dolphin
+    5 cm   bottlenose-dolphin  orca  beluga
+    10 cm  humpback-whale  sperm-whale  blue-whale
+
+**The voxel size scales with the animal**, and the reason is the opposite of
+the obvious one: a big animal needs MORE voxels of length than a small one,
+because the features that identify it are a smaller fraction of its length. A
+reef fish's dorsal fin is 25% of its body; a dolphin's is 10%; **a blue
+whale's is 1.2%**. The rule is *choose the coarsest authorable voxel size at
+which the species' smallest identifying feature is still about three voxels
+across*, and what it produced is a band of 28 to 294 voxels of length across
+the whole set. `docs/marine-megafauna-research.md` §5 has the argument and
+`python tools/fishprobe.py --lattice` has the table.
+
+No species is authored under **20 cm** (owner, 2026-08-13). Below that a
+marking cannot be two voxels wide; enlarging the animal was chosen over adding
+a lattice tier finer than 1 cm, so `clown-anemonefish` is bigger than a real
+one and its spec notes say so.
+
+### Birds  (1 cm)
+
+    common-raven         eurasian-jay         european-robin
+    great-tit            song-thrush          common-starling
+    eurasian-hoopoe      great-spotted-woodpecker
+    tawny-owl            golden-eagle         common-buzzard
+    common-kestrel       barn-swallow         herring-gull
+    grey-heron           common-kingfisher    mallard-duck
+    rock-pigeon          rock-ptarmigan       scarlet-macaw
+
+Fifteen are authored perched and five flying: the eagle, the buzzard, the
+kestrel, the swallow and the gull, which are the five whose wing planform is the
+point. **Every one of the ten biomes carries at least one**, including the two
+that hosted nothing but fish and boulders — open ocean gets the gull and bare
+rock gets the raven, the eagle, the kestrel, the pigeon and the ptarmigan.
+
+The set is chosen to span the readable range of SHAPES, not ornithology: heron
+against starling on neck, macaw against kingfisher on tail, woodpecker against
+mallard on posture, owl against heron on head size, and all four wing planforms.
+See **Birds** above for why four of them are authored above life size.
 
 Grass covers all eight plantable biomes. Reeds are absent from desert, taiga and
 tundra on purpose. `coastal-thrift` and `jungle-understory-flower` exist because
@@ -613,12 +1381,17 @@ exported tree as a mesh and we bring it back. It is just not the main path.
     forge/pipeline.py  spec + seed -> Asset, plus the per-asset health check
     forge/rock.py      the rock generator; no skeleton involved
     forge/ground.py    grass, reeds and flowers; one tuft generator for all three
+    forge/fish.py      the fish generator; a lofted body plus thin fin plates
     forge/render.py    isometric preview renderer (numpy + Pillow, no engine)
     forge/contact.py   contact sheets
     forge/vox.py       MagicaVoxel .vox export, splitting models over 256 voxels
     forge/vxa.py       VXA1, the compact native format the engine will read
     forge/materials.py material IDs -- slots 0-15 mirror core.h, 16+ are proposed
+    forge/palette.py   GENERATED -- what each material looks like, straight from
+                       the engine's materialpalette.h. Never edit it by hand
     forge/web/         the app; hand-written, no framework, no vendored library
+    tools/gen_palette.py rewrite forge/palette.py from the engine header; the
+                         selftest re-runs it in memory and fails if you forgot
     tools/healthpass.py  build every spec at N seeds and print the health checks
     tools/sheet.py       contact sheet of named specs, for eyeballing shape
     tools/shapecheck.py  same, every voxel forced to one bright material
@@ -628,8 +1401,13 @@ exported tree as a mesh and we bring it back. It is just not the main path.
     tools/retune_5cm.py  one-off that moved the last seven off-lattice assets
     tools/all_to_5cm.py  one-off that put every remaining species on 5 cm
     tools/seed_boulders.py one-off that authored the 4.5-9 m boulders
+    tools/seed_rocktypes.py one-off for the six geology-driven rock classes
     tools/seed_kinds.py  one-off that authored the rock/bush/gap species
     tools/seed_ground.py one-off that authored the ground-cover species
+    tools/seed_fish.py   one-off that authored the ten small fish species
+    tools/seed_marine.py one-off that authored the sharks, whales and dolphins
+    tools/fishprobe.py   sweeps every fish slider and says DEAD when one does
+                         nothing; also the readability and lattice checks
 
 ## Health checks
 
@@ -657,7 +1435,54 @@ Copy a spec, set its `kind`, change it, run `check`, then `batch` it and look at
 the sheet. `python -m forge.cli schema` prints every parameter with its range
 and a one-line explanation.
 
-Before calling a change done, run both:
+Before calling a change done, run all three:
 
     python tools/healthpass.py 1 2 3     # every species, three seeds, flagged
-    python -m forge.cli selftest         # determinism, connectivity, round trips
+    python -m forge.cli selftest         # determinism, connectivity, round trips,
+                                         # that palette.py is still generated from
+                                         # the engine header, and that every build
+                                         # is ONE connected piece
+    python tools/buildcheck.py           # builds every spec in specs/ and fails on
+                                         # a second piece, a spec warning, a health
+                                         # problem, or a build that raises
+
+### Open: `hero-sequoia` sheds wood on most of its individuals
+
+`python tools/buildcheck.py` currently FAILS on one spec, and it is worth being
+precise about what it is and what it is not.
+
+    hero-sequoia seed 1: broken: 3235 wood voxels are not joined to the trunk
+
+**Measured, not guessed.** At 20 cm, on seed 6: the tree's 348,274 wood voxels
+form ONE 26-connected component and 73 of them touch the trunk only at a CORNER
+rather than face to face. Nothing floats; the asset is one piece. What fails is
+the `wood connected` check, which is face-only on purpose — "a branch joined to
+the trunk only at a corner is a branch that falls off".
+
+**It is not new and it is not a fish problem.** Under the spec hash this species
+had before the fish parameters existed, it sheds wood on **five of eight**
+individuals; seed 1 happened to be one of the three clean ones, and seed 1 is
+the only individual `buildcheck` ever builds. Adding any row to `spec.PARAMS`
+changes every spec's hash, and the hash is mixed into the seed, so every species
+in the library moved to a different individual — this one landed on a bad one.
+
+That is the finding, and it is a bigger one than the tree: **the library has been
+green on one seed per species, which is a sample of one.** `--seeds 1 2` over
+everything but the four heroes is 146 builds and passes; the heroes need
+their own multi-seed pass and nobody has run one.
+
+Reproduce:
+
+    python -c "from forge import pipeline, spec as sm; s,_=sm.load('specs/hero-sequoia.json');       [print(i, pipeline.build(s,i,resolution_cm=20).stats['wood_detached']) for i in range(1,7)]"
+
+`buildcheck.py` is what CI runs, and it is the one that catches the defect class
+this generator keeps producing: an asset that builds, reports success, and ships
+in several pieces. `selftest` covers the same rule on the specs that are cheap to
+build; four heroes are too large for a pre-commit check and need
+`python tools/buildcheck.py --only-heavy`.
+
+ONE GENERATION MAKES ONE ENTITY — one rock, one tree, one clump of grass. Small,
+medium and large stones are separate species, generated separately and placed
+together by placement logic later. A build that hands back a stone plus a ring of
+loose rubble has produced several things, and nothing downstream can tell which
+of them was the asset.
