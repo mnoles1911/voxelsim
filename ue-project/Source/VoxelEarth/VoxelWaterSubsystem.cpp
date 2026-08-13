@@ -6975,6 +6975,150 @@ bool UVoxelWaterSubsystem::IsUnderwaterAtWorld(const FVector& WorldUU) const
 	return IsOpenSeaAtWorld(WorldUU.Z, Impl->Terrain.GetSurfaceHeightUU(WorldUU.X, WorldUU.Y));
 }
 
+double UVoxelWaterSubsystem::SubmergedDepthUUAtWorld(const FVector& WorldUU) const
+{
+	if (!Impl)
+	{
+		return 0.0;
+	}
+	// The fine-tile sampler decodes lazily on query and is documented
+	// game-thread-only (see FVoxelWaterImpl::Water, :1110, and the same check in
+	// GatherLakeSheetBasinsInTile :7003). AVoxelOceanActor calls this from Tick.
+	check(IsInGameThread());
+
+	// "AM I IN WATER" IS ANSWERED BY THE PREDICATE THAT ALREADY ANSWERS IT, not
+	// by a second rule written here. That matters more than the one extra query
+	// it costs: the client's blend weight and this depth are read off the SAME
+	// camera position in the same tick, and if they came from two different
+	// tests there would be frames with a nonzero depth at weight 0 (extinction
+	// applied in air) or weight 1 at depth 0 (a hard edge at the waterline
+	// exactly where the blend was added to remove one). One test, two consumers.
+	//
+	// Cost: IsUnderwaterAtWorld is a CA cell read plus, on a miss, one implicit
+	// column -- the same work the caller is already doing once per tick. It is
+	// not on any per-voxel path; do not call this one per cell.
+	if (!IsUnderwaterAtWorld(WorldUU))
+	{
+		return 0.0;
+	}
+
+	const int64 Vx = int64(FMath::FloorToDouble(WorldUU.X / VoxelCoords::VoxelSizeUU));
+	const int64 Vy = int64(FMath::FloorToDouble(WorldUU.Y / VoxelCoords::VoxelSizeUU));
+
+	// BOTH WORLDGEN FACTS FROM THE TERRAIN'S OWN AMPLIFIER, in one call, for the
+	// reason spelled out at length at :849-891: `Impl->Amp` is built over a
+	// SyntheticTileSampler and under -VoxelTileDir it is amplifying a DIFFERENT
+	// PLANET from the one on screen. That was measured at 638.451 m of ground
+	// here against 77.6 m on screen. A depth taken against the wrong ground is
+	// the same defect restated in a new place, so this reads the accessor the
+	// implicit field itself reads and never `Amp`.
+	//
+	// The bool return is ignored for the same reason EnsureWorldgenColumn (:907)
+	// ignores it: false means "no world yet" (the transient Entry map), and the
+	// outputs are ALREADY the safe pair -- ground 0, no cavern -- so there is
+	// nothing to branch on. A ground of 0 mm sends a point below the datum down
+	// the underground branch, which then finds no cavern site and falls through
+	// to the conservative 0.0 below. That is the correct behaviour for a world
+	// that does not exist yet; inventing water either way is not.
+	int32 GroundMm = 0;
+	int32 CavernFloodMm = INT32_MIN;
+	Impl->Terrain.GetWorldgenSurfaceAndCavernFloodMm(Vx, Vy, GroundMm, CavernFloodMm);
+
+	// THE LAKE HALF IS LEDGER-ADJUSTED AND THERE IS NO CODE HERE THAT SAYS SO,
+	// which is the point -- exactly as in ImplicitFillAtVoxel (:960).
+	// waterSurfaceMmAtVoxel reaches LakeSampler::surfaceAtPixel, which asks
+	// basinDatumMm, which is the seam the basin ledger binds to. So a credited
+	// basin deepens here by the same number the sheet raises its surface by,
+	// because both went through that seam instead of each applying its own delta.
+	//
+	// This is ALSO why there is no basin lookup in this function even though the
+	// brief mentioned basinsForTile: GatherLakeSheetBasinsInTile is the RECTANGLE
+	// query -- it wants a bbox and a tile id to build geometry from. A point
+	// query wants the column, and the column query already resolves the basin
+	// internally (extent mask -> basin id -> datum) with a per-tile memo the CA
+	// keeps hot. Going through the basin registry here would mean re-implementing
+	// point-in-extent against the bbox list, which is both slower and a second
+	// spelling of a rule voxel-core already owns.
+	const int32 BakedMm = Impl->Water ? Impl->Water->waterSurfaceMmAtVoxel(Vx, Vy) : vxc::kNoWaterMm;
+
+	// mm, and rounded the same way every other mm<->UU conversion in the client
+	// is (VoxelCoords::WorldToMm) so a depth of exactly zero means exactly the
+	// datum rather than half a millimetre either side of it.
+	const int64 ZMm = VoxelCoords::WorldToMm(WorldUU.Z);
+
+	int64 SurfaceMm = INT64_MIN; // "no datum resolved" -- deliberately not 0
+	if (ZMm < int64(GroundMm))
+	{
+		// UNDERGROUND: the only implicit water that can be here is the cavern
+		// aquifer, and its top is vxc::cavernWaterCeilingMm -- min(floodZ,
+		// ground), INT64_MIN for a column with no site in reach. That is
+		// caverns.h's own ceiling function rather than a min() written here, for
+		// the same reason the composition below is lakes.h's.
+		//
+		// THE BRANCH IS NOT AN OPTIMISATION, IT IS THE ANSWER TO A WRONG NUMBER
+		// I wrote first: taking max(lake datum, cavern ceiling) unconditionally
+		// puts a cave 200 m under a lake at 200 m of extinction, because the lake
+		// datum is above the ground and the max picks it. There is ROCK between
+		// the two; they are not one water column. The split at the worldgen
+		// ground is the same line cavernWaterAt draws (`vz * kVoxelSizeMm >=
+		// groundMm` -> not cavern water, caverns.h:684) and the same line
+		// implicitWaterFill draws for surface water, so the two halves meet
+		// exactly and neither claims the other's cells.
+		SurfaceMm = vxc::cavernWaterCeilingMm(CavernFloodMm, int64(GroundMm));
+	}
+	else
+	{
+		// ABOVE THE WORLDGEN GROUND: lake-or-sea, composed by lakes.h's own
+		// implicitWaterDatumMm (max of the baked surface and oceanSurfaceMmAt,
+		// with the kNoWaterMm cases handled) rather than by a max written here.
+		// That is the identical call the near-field sweep makes at :1057, so the
+		// depth this returns is measured to the very surface the near field
+		// meshes and the far-field sheet draws -- not to a third opinion.
+		const int32 DatumMm = vxc::implicitWaterDatumMm(BakedMm, GroundMm);
+		if (DatumMm != vxc::kNoWaterMm)
+		{
+			SurfaceMm = int64(DatumMm);
+		}
+	}
+
+	if (SurfaceMm == INT64_MIN)
+	{
+		// NO DATUM, AND THIS IS THE HONEST ANSWER RATHER THAN A GUESS.
+		//
+		// We are here only because IsUnderwaterAtWorld said yes, so there IS
+		// water at this point -- but it came from the CA's per-cell fill, and the
+		// CA stores fill units per cell and NEVER a surface height. Reachable
+		// cases: a player-poured pool, a PBF body (Phase 5), water that spread
+		// after a breach, and a pit dug below worldgen ground and flooded (the
+		// underground branch above finds no cavern site there, and it must not:
+		// using the EDITED ground instead would reopen defect 1 in lakes.h:1363,
+		// where digging in two passes makes the first pass's own air read as sea).
+		//
+		// Returning 0.0 means "treat me as if I were just under the surface": the
+		// post-process still applies (the blend weight is driven by the predicate,
+		// not by this number), it simply applies no depth-driven darkening. That
+		// is the weakest treatment available, which is the right way to be wrong
+		// -- the alternatives are a fabricated constant (the exact failure this
+		// whole change exists to remove) or walking voxels upward, which is 400
+		// samples for a 40 m column and would still disagree with the drawn
+		// surface by up to one voxel.
+		//
+		// WHAT WOULD CHANGE THIS: if the PBF presentation layer ever publishes a
+		// per-body surface height (Phase 5 owns the only object that could), this
+		// branch should consult it before giving up.
+		return 0.0;
+	}
+
+	const double Depth = VoxelCoords::MmToWorld(SurfaceMm) - WorldUU.Z;
+	// Clamped at 0 rather than returned negative: the contract in the header is
+	// "0 when not submerged", and a negative depth reaching a material parameter
+	// would brighten rather than darken under a pow()/exp() in the shader.
+	// Negative is reachable legitimately -- CA water standing ABOVE the baked
+	// datum, which is what a credited-but-not-yet-synced basin looks like for a
+	// frame -- so this is a real case, not a paranoia clamp.
+	return Depth > 0.0 ? Depth : 0.0;
+}
+
 // --- LAKE SHEETS AT RANGE (watershed plan item 5, §5.2) ---------------------
 //
 // All three of these are thin: the registry, the extent rule and the

@@ -6,7 +6,7 @@
 
 class UStaticMeshComponent;
 class UPostProcessComponent;
-class AExponentialHeightFog;
+class UMaterialInstanceDynamic;
 
 // W1 first slice (docs/voxel-earth-implementation-plan.md SS3.7 "Implicit
 // static" water state; plan SS4 water track W1): the world *looks* hydrated
@@ -40,16 +40,32 @@ private:
 	TObjectPtr<UStaticMeshComponent> OceanPlane;
 
 	// Global (bUnbound) post-process volume-equivalent for the underwater
-	// tint; blend weight toggled 0/1 by camera depth -- see
+	// treatment; blend weight ramped between 0 and 1 by camera depth -- see
 	// UpdateUnderwaterState. Attached to the actor so it streams with it
 	// (there is exactly one ocean actor, so this never needs pooling).
 	UPROPERTY(VisibleAnywhere, Category = "Voxel Earth|Ocean")
 	TObjectPtr<UPostProcessComponent> UnderwaterPostProcess;
 
-	// Spawned once in BeginPlay, hidden until the camera first goes
-	// underwater; visibility toggled by UpdateUnderwaterState thereafter.
+	// THE UNDERWATER LOOK ITSELF, as a post-process material instead of a
+	// constant. Created in BeginPlay from /Game/Voxel/M_Underwater and pushed
+	// into UnderwaterPostProcess->Settings.WeightedBlendables; null when that
+	// asset is missing, which is a supported configuration (see BeginPlay's
+	// fallback -- the old constant tint comes back and a Warning is logged).
+	//
+	// WHY A MATERIAL AT ALL, since the thing it replaces was three floats. The
+	// three floats were measured at the OCEAN, at sea level, before the water
+	// surface had any volumetric model, and they are now applied unchanged to
+	// 2,049 baked lake basins standing at ~1650 m. The surface those lakes are
+	// drawn with (/Game/Voxel/M_WaterVoxel, the same material the sheets, the
+	// ribbons and the near-field voxels use) says one thing about what the water
+	// is made of and the constant tint says another, so looking INTO a pond and
+	// swimming IN it disagree. A constant cannot be made to agree: the
+	// disagreement is depth-dependent and per-pixel, and a single tint has
+	// neither. The material gets the camera's submerged depth every tick
+	// (UVoxelWaterSubsystem::SubmergedDepthUUAtWorld) and computes extinction
+	// from it.
 	UPROPERTY(Transient)
-	TObjectPtr<AExponentialHeightFog> UnderwaterFog;
+	TObjectPtr<UMaterialInstanceDynamic> UnderwaterMID;
 
 	// Recenters OceanPlane's XY under the first player controller's camera
 	// (falls back to its pawn if the camera manager isn't ready yet), Z
@@ -64,15 +80,43 @@ private:
 	// appear as the plane's origin drifts a fraction of a texel per frame).
 	void UpdateFollowPlane();
 
-	// Toggles the underwater fog + post-process tint by camera depth
-	// (camera Z < 0 == underwater), logging LogVoxelEarth once per
-	// above/below transition (only signal available without a screenshot
-	// for this branch -- see task verification notes).
-	void UpdateUnderwaterState();
+	// Ramps the underwater post-process weight toward the water subsystem's
+	// verdict for the camera position (UVoxelWaterSubsystem::IsUnderwaterAtWorld
+	// -- NOT `camera Z < 0`, see the .cpp for the dry-cavern bug that rule
+	// caused), and feeds the material its submerged depth. Logs LogVoxelEarth
+	// once per above/below transition -- still the only signal available
+	// without a screenshot for this branch, see the task verification notes.
+	void UpdateUnderwaterState(float DeltaTime);
 
-	// Last-known underwater state, so UpdateUnderwaterState only acts (and
-	// logs) on a transition, not every tick.
+	// Last-known underwater state. Used for TWO different things now, and
+	// keeping them separate is the point: this bool is the LOGGING edge and the
+	// blend TARGET, while UnderwaterBlendWeight below is the continuous value
+	// actually handed to the component. Before the blend existed they were the
+	// same variable and the function early-returned when nothing had changed;
+	// with a ramp the function must run every tick, so the transition log has to
+	// hang off this bool's edge rather than off "we did some work this frame",
+	// or it would fire once per frame for the whole time you are in the water.
 	bool bUnderwater = false;
+
+	// The value actually written to UnderwaterPostProcess->BlendWeight, ramped
+	// toward 0/1 at 1/UnderwaterBlendSeconds per second.
+	//
+	// WHAT THIS FIXES: the weight used to snap 0 -> 1 in a single frame at the
+	// waterline. Every underwater cue -- extinction, vignette, and previously a
+	// whole fog actor becoming visible -- arrived at once, on one frame, which
+	// reads as a shutter rather than as entering water, and is worst in exactly
+	// the case that happens most (bobbing across the surface while swimming,
+	// where the predicate can flip on consecutive frames).
+	float UnderwaterBlendWeight = 0.f;
+
+	// The last submerged depth pushed into the material, in METRES. Held rather
+	// than recomputed during the fade-OUT: once the camera is above the surface
+	// the depth query correctly answers 0, and pushing that while the weight is
+	// still ramping down would collapse the extinction to nothing in one frame
+	// -- reintroducing, at the exit, precisely the pop the ramp was added to
+	// remove. So the depth freezes at its last submerged value and only the
+	// weight moves.
+	float LastSubmergedDepthM = 0.f;
 
 	// /Engine/BasicShapes/Plane is a 100x100 UU (1m x 1m) quad; scale factor
 	// below reaches PlaneSizeUU on each side.
@@ -80,4 +124,29 @@ private:
 	static constexpr double PlaneSizeUU = 4000000.0; // 40 km
 
 	static constexpr double FollowSnapUU = 100.0; // 1 m
+
+	// How long the underwater post-process takes to reach full strength.
+	//
+	// 0.15 s is chosen to be SHORT ENOUGH NOT TO BE A TRANSITION EFFECT and long
+	// enough to cover the pop: at 60 fps it is 9 frames, at 30 fps it is 5, so
+	// the cue arrives gradually at both and there is no frame rate at which it
+	// degenerates back to a snap. It is deliberately not longer -- a slow fade
+	// makes the water feel like a screen effect being applied to you rather than
+	// a medium you moved into, and it would also lag the surface crossing badly
+	// enough to be visible while swimming at the waterline.
+	//
+	// If this ever needs to differ between entering and exiting (entering fast,
+	// exiting slower, is the usual asymmetry), split it into two constants
+	// rather than averaging them.
+	static constexpr float UnderwaterBlendSeconds = 0.15f;
+
+	// The material parameter names, spelled once. These are a CONTRACT with
+	// /Game/Voxel/M_Underwater (generated by ue-project/Tools/) -- a typo here
+	// does not fail to compile and does not warn at runtime, it silently sets
+	// nothing, so the names live in one place where they can be compared against
+	// the generator. SubmergedDepthM is the only one this actor drives; see
+	// BeginPlay for why the material's other three parameters
+	// (UnderwaterExtinctionScale, UnderwaterAmbientGain, UnderwaterAmbientColor)
+	// are deliberately left at the values the material itself authors.
+	static const FName ParamSubmergedDepthM;
 };

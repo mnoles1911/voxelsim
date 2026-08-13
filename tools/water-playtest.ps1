@@ -41,7 +41,33 @@ param(
     # above never mentioned it either, so the only surviving way to arm rivers
     # was to type the cvar in the console, which the note further down calls
     # "the reliable path". It was reliable because it was the only one working.
-    [switch]$Rivers
+    [switch]$Rivers,
+
+    # WHERE TO STAND. Empty means the historical default (the tile centre, see
+    # the note at the -Origin branch below) and reproduces every previous run of
+    # this script exactly.
+    #
+    # THE REASON THIS EXISTS: the two defaults are both DRY. The tile centre is
+    # high ground chosen so that "any water you see is water YOU poured", and
+    # -Origin is the flat missing-tile fallback at sea level. Neither shows a
+    # baked lake basin, so confirming a change to the LAKE water meant flying
+    # for a long time or editing this file. Both of those have been done.
+    #
+    # The pond every water judgement this session was made against:
+    #   -SpawnAt '-65102,-51084' -AltM 40
+    # datum 1650.235 m, bed 1644.237 m at the deep end, so about 6 m of water.
+    # 40 m up looks down on the whole basin; drop to 8 m to sit on it, and below
+    # about 5.4 m the camera goes UNDER (the altitude is measured from the BED,
+    # not from the water surface -- that has caught us out once already).
+    [string]$SpawnAt = '',
+    # Metres above the terrain surface at the spawn column. The engine REJECTS
+    # a value <= 0 (VoxelEarthGameMode.cpp:4196 tests `> 0.f`), so 0 here means
+    # "do not pass it" rather than "ground level".
+    [double]$AltM = 0,
+    # Degrees, negative looks down. 0 means "do not pass it", and the game mode
+    # then applies its own framing.
+    [double]$Pitch = 0,
+    [double]$Yaw = 0
 )
 
 # A misspelt or undeclared variable is now an ERROR rather than a silent
@@ -116,7 +142,14 @@ $args = @(
 # missing-tile sea-level default rather than real diffusion terrain. The tile
 # centre is high ground (surface ~545 m), which also keeps the implicit ocean
 # out of frame -- so any water you see is water YOU poured.
-if (-not $Origin) { $args += '-VoxelSpawnAt=-84480,53760' }
+if ($SpawnAt -ne '')  { $args += "-VoxelSpawnAt=$SpawnAt" }
+elseif (-not $Origin) { $args += '-VoxelSpawnAt=-84480,53760' }
+
+# Passed only when non-zero, so an un-passed switch reproduces the historical
+# command line byte for byte rather than pinning the framing to a new default.
+if ($AltM  -ne 0) { $args += "-VoxelSpawnAltM=$AltM" }
+if ($Pitch -ne 0) { $args += "-VoxelSpawnPitch=$Pitch" }
+if ($Yaw   -ne 0) { $args += "-VoxelSpawnYaw=$Yaw" }
 
 # W3 rivers (plan S3.7 Layer R). Unlike -Swe, arming late is harmless: the
 # graph is built on whatever Tick the cvar first reads as 1, so if -ExecCmds

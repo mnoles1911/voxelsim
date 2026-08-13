@@ -397,8 +397,32 @@ def build_terrain_base_color(
     # `wet` is 0 wherever the field says nothing, so a run with no fine tier, a
     # world baked before bake_ver 27, and everything beyond the 480 m window all
     # produce exactly today's terrain.
+    # VOXEL_SHORE_FX=0 is the LAND HALF of the shoreline-effects A/B arm; the
+    # water half lives in create_water_voxel_material.py (SHORE_FX_ENV) and reads
+    # the same variable, so one setting moves the whole shoreline treatment and
+    # the two halves cannot end up armed differently. See that file for why this
+    # is a generation-time arm rather than a runtime parameter -- the reasoning is
+    # the one already written down at VOXEL_MATERIAL_DEBUG below.
+    #
+    # Off leaves `wet` as None, which is the SAME state a world with no fine tier
+    # or a pre-bake_ver-27 bake produces, and both callers already guard on it
+    # (create_voxel_material.py, create_clipmap_material.py). So the OFF arm is
+    # not a new code path being exercised for the first time by a measurement --
+    # it is the path that shipped before this feature existed.
+    shore_fx = os.environ.get("VOXEL_SHORE_FX", "1").strip().lower() not in (
+        "0", "off", "false", "no", "")
+    # Logged from HERE rather than from either caller because this is the one
+    # place that knows both halves of the answer: whether the arm is on, and
+    # whether there was a baked field for it to act on at all. "Arm ON, bathy
+    # absent" and "arm OFF" produce an identical material, and a capture pair
+    # taken across that pair would show no difference and be read as "the effect
+    # does nothing" -- which is why the second clause is in the line.
+    unreal.log("TERRAIN SHORE FX ARM: %s (VOXEL_SHORE_FX=%r, baked bathy field %s)"
+               % ("ON" if shore_fx else "OFF",
+                  os.environ.get("VOXEL_SHORE_FX", "<unset>"),
+                  "present" if bathy is not None else "ABSENT -- arm has nothing to act on"))
     wet = None
-    if bathy is not None:
+    if bathy is not None and shore_fx:
         wet_width = b.scalar("WetShoreWidthM", 2.5)
         # -shore, so distance INLAND is positive and the ramp reads forwards.
         inland = b.mul(bathy["shore_m"], b.const(-1.0))

@@ -179,6 +179,40 @@ Sourced, not re-derived — read the cited section for the evidence.
   work.)
 - **One UE editor per box.** Two capture agents once destroyed each other's
   frames for hours. (`water-system-architecture.md` §14.)
+- **Water is rendered by two different renderers, and their physical constants
+  live in exactly one file.** Above the surface it is a Single Layer Water
+  material (`M_WaterVoxel`); from inside it is a post-process doing
+  Beer–Lambert over the depth buffer (`M_Underwater`). Neither can reach the
+  other's shading, so the only thing keeping them the same liquid is that both
+  import `ue-project/Tools/water_optics.py` — absorption distance, absorption
+  colour, scattering, phase g — and neither is allowed to type a coefficient as
+  a literal. **This is not hypothetical: it shipped broken for one commit.**
+  The surface was taken to a 3.5 m absorption distance with 5× the scattering
+  (9d3bd0c) while submerging still applied a hard-coded
+  `SceneColorTint(0.05, 0.30, 0.35)` and a fixed-density height fog, both tuned
+  for the *ocean*, both applied to lakes at ~1650 m because the post-process
+  component is `bUnbound`. Looking into a pond and swimming in it gave two
+  different liquids. Same class of split as the near/far water seam the owner
+  made us delete; the difference is that there is no path to retire here, so
+  the fix is shared constants. Both generators print
+  `water_optics.summary_lines()` into their log so "were these built from the
+  same numbers?" is answerable without opening either asset, and
+  `tools/voxel-underwater-regen.ps1` diffs the two blocks.
+  - Deliberately **not** shared: how each renderer presents that water (foam,
+    glints and ripple normals above; ambient level and the submerged
+    readability scale below), and the underwater view's
+    `UnderwaterExtinctionScale` (0.5) — a **deliberate readability cheat, not
+    physics**. At the true 1.14/m red coefficient a swimmer could not see one
+    metre. Photon and other shipped shaders do the same thing.
+  - Deliberately **not** a Material Parameter Collection, which is the engine's
+    own answer to "two materials, one set of numbers": `create_sky_material.py`
+    deletes and recreates `MPC_VoxelSky` every run, and any material holding a
+    binding to the old one compiles to UE's **default material** while the log
+    reports success. A second collection would be a second instance of that
+    hazard, for constants that never change at runtime. The cost of the Python
+    import instead: the two materials expose these as separate parameters, so a
+    material-instance override on one does not move the other. Instance
+    overrides are for experiments; what ships comes from the file.
 - **Decimating the extent rounds in OPPOSITE directions for drawing and for
   despawning, on purpose.** Drawing (`lakeSheetRects`) takes a block if ANY
   pixel in it is wet; the basin sink's grid (`basinExtentBits`) takes a cell

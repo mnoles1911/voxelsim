@@ -216,6 +216,25 @@ it is not absorbed at all. The shipped pair (8.7 m, RGB 0/0.778/0.911) evaluates
 to exactly the four numbers above; that is a check anyone can redo with a
 calculator, which is the point of deriving them rather than typing them.
 
+THOSE TWO SECTIONS ARE THE 2026-08-11 STATE AND THE PAIR THEY QUOTE IS
+SUPERSEDED: the owner could still see the lake bed from the middle of the lake,
+so on 2026-08-12 it went to 3.5 m and RGB (0, 0.30, 0.38) with the scattering
+raised to match. The reasoning above is kept because it is still the reasoning
+for the mechanism; the numbers are at the parameter sites, which is also no
+longer where they are typed.
+
+WHERE THE FOUR OPTICAL CONSTANTS LIVE NOW: Tools/water_optics.py, because
+Tools/create_underwater_material.py is a second renderer of the same water --
+a post-process Beer-Lambert pass with no access to the SLW node -- and for one
+commit the two disagreed, so the pond was dark blue-green from the bank and the
+old teal once you were in it. Absorption distance, absorption colour, scattering
+and phase g are imported from there; every other number in this file, and every
+word of the reasoning at those four sites, stays here. See the import block
+below for why that is a module and not a second Material Parameter Collection.
+Both generators print water_optics.summary_lines() into their log, so "were
+these two built from the same numbers" is answered by the logs rather than by
+opening two assets.
+
 REFLECTION MODE 2 IS A FIRST-CLASS MODE, NOT A DEGRADED FALLBACK.
 Config/DefaultEngine.ini now sets r.Water.SingleLayer.Reflection=2 (reflection
 captures + skylight only). SLW has never used planar reflections, so nothing is
@@ -421,6 +440,37 @@ from sky_star_graph import (  # noqa: E402
 )
 from bathy_field_graph import build_slant_depth, sample_bathy_field  # noqa: E402
 
+# THE FOUR OPTICAL CONSTANTS ARE NOT TYPED IN THIS FILE ANY MORE, and the reason
+# is that this is no longer the only renderer that has to know them.
+# Tools/create_underwater_material.py (2026-08-12) is a post-process material
+# doing its own Beer-Lambert over the depth buffer; it cannot see the Single
+# Layer Water node this file wires, so the ONLY thing that can keep the surface
+# and the swim looking like the same liquid is both scripts reading one set of
+# numbers. water_optics.py's module docstring records the commit where they
+# disagreed and what it looked like (a dark blue-green pond that turned teal the
+# moment you submerged).
+#
+# WHAT MOVED AND WHAT DID NOT. Four values: AbsorptionDistanceM,
+# WaterAbsorptionColor, ScatteringPerMetre, WaterPhaseG. Those describe THE
+# WATER. Everything else at those four sites -- the parameter names, the node
+# positions, the derivation chain, and every word of the reasoning -- stayed
+# here, because it is this material's business and not the shared module's. Foam,
+# glints, the sky reflection and the wave field are likewise untouched.
+#
+# NOT AN MPC, DELIBERATELY, and this file is the reason: a Material Parameter
+# Collection is the engine's own answer to "two materials, one set of numbers",
+# and create_sky_material.py DELETES and recreates MPC_VoxelSky every run, which
+# on 2026-08-10 left every dependent binding compiling to the ENGINE DEFAULT
+# MATERIAL while the log said success. A Python import cannot fail that way: a
+# missing module means this script does not run at all.
+#
+# THE COST, STATED SO NOBODY REDISCOVERS IT FROM A CONFUSING SCREENSHOT: the two
+# materials still expose these as SEPARATE material parameters, so overriding
+# AbsorptionDistanceM on an instance of M_WaterVoxel does NOT move M_Underwater
+# with it. Instance overrides are for experiments; the shipped values come from
+# water_optics.py plus a regeneration of both materials.
+import water_optics  # noqa: E402
+
 PACKAGE_PATH = "/Game/Voxel"
 MATERIAL_NAME = "M_WaterVoxel"
 FULL_PATH = PACKAGE_PATH + "/" + MATERIAL_NAME
@@ -482,8 +532,61 @@ FREEZE_TIME_ENV = "VOXEL_WATER_FREEZE_TIME"
 FREEZE_RIPPLE_TIME = os.environ.get(FREEZE_TIME_ENV, "0").strip().lower() not in (
     "0", "off", "false", "no", "")
 
+# --- THE SHORELINE-EFFECTS A/B ARM -------------------------------------------
+#
+# VOXEL_SHORE_FX=0 builds the water WITHOUT shoreline foam. Its partner in
+# terrain_material_common.py reads the SAME variable and builds the terrain
+# without wet-shore darkening, so one variable moves the whole shoreline
+# treatment and the two halves cannot be armed inconsistently.
+#
+# WHY AN ARM AT ALL. Both effects were built, wired and shipped, and NEITHER has
+# ever been confirmed in a screenshot -- they landed during the bathymetry work
+# and the captures taken since were all aimed at other questions (the near/far
+# seam, the shoreline gap, the murkiness). "It is in the graph" is not the same
+# claim as "the owner can see it", and on this project the second claim is the
+# only one that counts: the standing rule is that the owner judges appearance
+# from captures and the implementer does not deliver a verdict.
+#
+# WHY GENERATION-TIME AND NOT A RUNTIME PARAMETER, which would be cheaper to
+# flip. Because that is this project's answer to exactly this question already,
+# and the reasoning is written down at VOXEL_MATERIAL_DEBUG
+# (terrain_material_common.py): a runtime switch means a permanent branch in the
+# shipping shader, and there is no per-chunk MID plumbing to drive one from a
+# command line anyway. Chunk MIDs exist but carry only the ring-fade scalars
+# (VoxelChunkComponent.cpp:1408-1411), and the water path has no MID at all --
+# AVoxelWaterSheetActor and the pooled quads both bind /Game/Voxel/M_WaterVoxel
+# directly. Building the plumbing to make this flippable would be a bigger and
+# riskier change than the two regenerations it saves.
+#
+# DEFAULT IS ON, so an unset variable rebuilds the shipped material.
+SHORE_FX_ENV = "VOXEL_SHORE_FX"
+SHORE_FX = os.environ.get(SHORE_FX_ENV, "1").strip().lower() not in (
+    "0", "off", "false", "no", "")
+
 
 def main():
+    # --- SAY WHICH NUMBERS THIS BUILD WAS MADE FROM, BEFORE MAKING ANYTHING ---
+    #
+    # create_underwater_material.py prints the same block from the same module.
+    # That is the point: when the surface and the swim disagree ON SCREEN, the
+    # first question is whether they were built from the same constants, and two
+    # logs answering it identically settles that in seconds without opening
+    # either .uasset -- which is the only way to check an asset's baked defaults
+    # otherwise, and needs an editor this project usually has occupied.
+    #
+    # PRINTED FIRST, BEFORE THE ASSET IS EVEN CREATED, so that a run which dies
+    # later still records what it was trying to build. The same discipline as the
+    # arm read-backs at the bottom of this function, one step earlier: a log that
+    # only reports on success cannot describe a failure.
+    #
+    # It is a DERIVATION, not an echo -- absorption per metre, extinction, the
+    # deep-water albedo and a transmittance table all computed by water_optics
+    # from the four constants. So the log also catches the 100x unit error this
+    # file warns about at `per_cm`: everything in these lines is per METRE, and a
+    # transmittance of 0.33 at 1 m is a number a human can sanity-check.
+    for _line in water_optics.summary_lines():
+        unreal.log("M_WaterVoxel " + _line)
+
     asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
 
     if unreal.EditorAssetLibrary.does_asset_exist(FULL_PATH):
@@ -827,7 +930,16 @@ def main():
     # gameplay depths rather than over 50 m: Crest ships 0.90/0.30/0.35,
     # Unity HDRP's Pool 5 m and its Ocean/River preset 1.5 m. 3.5 m sits
     # between the two Unity presets.
-    absorb_distance = scalar_param("AbsorptionDistanceM", 3.5, -1300, -560)
+    #
+    # THE NUMBER IS NO LONGER TYPED ON THE NEXT LINE. It is
+    # water_optics.ABSORPTION_DISTANCE_M, shared with the underwater
+    # post-process material -- see the import at the top of this file for why,
+    # and water_optics.py's docstring for the commit where the two disagreed. It
+    # currently reads 3.5 m, which is what every figure above was computed
+    # against; if it moves, those figures are a derivation to redo here, not a
+    # second copy of the value to edit.
+    absorb_distance = scalar_param(
+        "AbsorptionDistanceM", water_optics.ABSORPTION_DISTANCE_M, -1300, -560)
     # (0, 0.778, 0.911) -> (0, 0.30, 0.38). The channel that survives is
     # 1 - this, so the old value made blue nearly transparent (1 - 0.911 =
     # 0.089) and that is the single reason the bed stayed visible at every
@@ -836,10 +948,32 @@ def main():
     # 0.11/0.21/0.25 at 2 m, 0.035/0.096/0.126 at 3 m -- the bed is faint by
     # two metres and gone by three, which is what was asked for.
     #
+    # CORRECTION, 2026-08-12, AND THE RUN LOG WILL NOW CONTRADICT THE PARAGRAPH
+    # ABOVE IF THIS IS NOT READ. Those three numbers are ABSORPTION ONLY. What
+    # attenuates a path is absorption PLUS scattering, and scattering was raised
+    # in the same change, so the real extinction is 1.138 / 0.882 / 0.953 per
+    # metre and the real transmittance at 1 m is 0.32 / 0.41 / 0.39, not
+    # 0.33 / 0.46 / 0.50. The direction of the conclusion is unchanged -- the bed
+    # goes faint sooner, not later -- but the hue does move: including scattering,
+    # GREEN carries furthest at short range rather than blue, because blue is
+    # scattered hardest (0.26 per metre against green's 0.10). Blue still wins in
+    # the deep-water limit, which is set by the ALBEDO (0.018/0.113/0.273) and not
+    # by the transmittance. water_optics.summary_lines(), printed at the top of
+    # this run, is the authority for all of these and prints both rows precisely
+    # so this mistake is caught by reading rather than by re-deriving; the trap is
+    # named in water_optics.extinction_per_m's docstring for the same reason.
+    #
     # Red still dies first and blue still carries furthest, so the colour
     # SHIFTS with depth rather than merely darkening; the ratio is just far
     # tighter than the clear-water 11:1 it was.
-    absorb_color = vector_param("WaterAbsorptionColor", 0.0, 0.30, 0.38, -1300, -480)
+    #
+    # Also shared now: water_optics.ABSORPTION_COLOR, currently (0, 0.30, 0.38).
+    # Unpacked with a star rather than indexed [0]/[1]/[2] on purpose -- a tuple
+    # of the wrong length raises here, where indexing would silently drop a
+    # fourth channel or read past the end at a site whose whole job is to be the
+    # same three numbers the other material uses.
+    absorb_color = vector_param(
+        "WaterAbsorptionColor", *water_optics.ABSORPTION_COLOR, -1300, -480)
     absorb_color_rgb = rgb(absorb_color, -1120, -480)
 
     # -ln(0.02) = 3.9120230054281460586. The 2% survival convention is Unity's;
@@ -906,7 +1040,14 @@ def main():
     # 0.005/0.045/0.055 -> 0.02/0.10/0.26: a deep blue body, single-scattering
     # albedo (sigma_s / sigma_t) about 0.018/0.114/0.274, so deep water settles
     # on a saturated blue instead of on black.
-    scatter_color = vector_param("ScatteringPerMetre", 0.02, 0.10, 0.26, -1300, -400)
+    #
+    # THE PAIR OF FIGURES ABOVE IS THE HISTORY OF THE CHANGE, NOT THE SOURCE OF
+    # THE VALUE. What ships is water_optics.SCATTERING_PER_M, currently
+    # (0.02, 0.10, 0.26) per metre, shared with the underwater material so a
+    # swimmer is inside the same medium he was looking at. Same star-unpack
+    # arity check as the absorption colour above.
+    scatter_color = vector_param(
+        "ScatteringPerMetre", *water_optics.SCATTERING_PER_M, -1300, -400)
     scatter_rgb = rgb(scatter_color, -1120, -400)
     scatter_per_cm = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -640, -420)
     if not mel.connect_material_expressions(scatter_rgb, "", scatter_per_cm, "A"):
@@ -928,7 +1069,15 @@ def main():
     # term would be invisible in exactly the shot the owner keeps taking. 0.35
     # keeps a visible sun-side brightening without turning the lake into a
     # spotlight.
-    phase_g = scalar_param("WaterPhaseG", 0.35, -1300, -340)
+    #
+    # Shared as water_optics.PHASE_G, currently 0.35. It is in the shared module
+    # rather than here even though the SLW node is the only consumer TODAY,
+    # because it describes the medium's particulates and not this view of them:
+    # the moment the underwater material grows a sun shaft or an in-scatter term
+    # it needs the same anisotropy, and the failure mode of it having its own
+    # copy is a lit-from-behind sun band that changes strength when you duck
+    # under the surface.
+    phase_g = scalar_param("WaterPhaseG", water_optics.PHASE_G, -1300, -340)
 
     # --- COLOR SCALE BEHIND WATER -------------------------------------------
     #
@@ -1214,7 +1363,24 @@ def main():
                             bathy_b.maximum(bathy["shore_m"], bathy_b.const(0.5)))
     shelf_gate = bathy_b.one_minus(bathy_b.ramp(bed_slope, "", shelf_lo, shelf_hi))
 
-    shore_gain = scalar_param("BathyFoamGain", 0.55, -1300, 360)
+    # THE A/B ARM LANDS HERE, ON THE GAIN, and nowhere else in the graph. Every
+    # node above and below is created identically in both arms, so the OFF
+    # material differs from the ON material by ONE FLOAT. That is the property
+    # that makes the pair readable: any difference in the two captures is this
+    # gain, not a re-authored graph that also happened to change something else.
+    #
+    # IT IS shore_gain SPECIFICALLY, not the whole foam chain. slope_foam and
+    # activity_foam describe MOVING water (a spilling front, a CA-active cell)
+    # and are ~0 on a settled pond anyway, so including them would widen the arm
+    # without changing the picture.
+    #
+    # WHAT ELSE MOVES WITH IT, STATED BECAUSE IT IS NOT OBVIOUS FROM THE NAME:
+    # Opacity is saturate(foam), so the shore foam is also the only thing making
+    # the water OPAQUE in the shore strip -- up to a 55% dim of the volume there.
+    # Turning the gain to 0 therefore removes the foam AND that dimming together.
+    # They are one mechanism rather than two, so the A/B is honest as long as
+    # nobody reads the pair as "foam only".
+    shore_gain = scalar_param("BathyFoamGain", 0.55 if SHORE_FX else 0.0, -1300, 360)
     shore_foam = bathy_b.mul(bathy_b.mul(bathy_b.mul(shore_band, shelf_gate), shore_gain),
                              bathy["validity"])
 
@@ -2717,6 +2883,25 @@ return float3(G * amp, H * amp);
             "ripple-time arm disagrees with the graph: FREEZE_RIPPLE_TIME=%s but the saved "
             "material has %d MaterialExpressionTime node(s). One of the two is a lie and the "
             "animation-vs-flicker split would inherit it." % (FREEZE_RIPPLE_TIME, time_nodes))
+
+    # --- AND THE SHORELINE-EFFECTS ARM ---------------------------------------
+    #
+    # Reported as INTENT, deliberately, and NOT dressed up as a read-back. The
+    # two arms above can be checked against the saved graph because they change
+    # its SHAPE -- a Time node exists or it does not, a texture parameter exists
+    # or it does not. This arm changes one scalar's DEFAULT VALUE and nothing
+    # else, which is what makes it a clean A/B and also what makes it invisible
+    # to a node census.
+    #
+    # So the runner does not get to trust this line alone: tools/voxel-shore-fx-ab.ps1
+    # reads BathyFoamGain back off the saved .uasset instead, which is the
+    # artefact rather than the claim. Same discipline as the package read-back
+    # that script's sibling does for MaterialExpressionTime.
+    unreal.log("M_WaterVoxel SHORE FX ARM: %s (%s=%r, BathyFoamGain default=%.3f)"
+               % ("ON" if SHORE_FX else "OFF",
+                  SHORE_FX_ENV,
+                  os.environ.get(SHORE_FX_ENV, "<unset>"),
+                  0.55 if SHORE_FX else 0.0))
 
     unreal.log("M_WaterVoxel STAR REFLECTION ARM: %s (%s=%r, StarmapTex params=%s)"
                % ("ON" if STAR_REFLECTION else "OFF",

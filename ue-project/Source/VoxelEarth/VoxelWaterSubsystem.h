@@ -346,6 +346,47 @@ public:
 	// mean before the ocean is a real datum (plan item 8).
 	bool IsUnderwaterAtWorld(const FVector& WorldUU) const;
 
+	// HOW DEEP, not merely whether. Distance in world UU from `WorldUU` straight
+	// up to the surface of the water it is in; 0.0 when the point is not
+	// submerged, and never negative.
+	//
+	// WHY THIS EXISTS AT ALL. Until now the client only ever asked the yes/no
+	// question above, so every underwater treatment had to be a CONSTANT: the
+	// ocean post-process was a fixed SceneColorTint of (0.05, 0.30, 0.35) plus a
+	// fixed-density height fog, both hand-tuned at sea level, and both were then
+	// applied unchanged to 2,049 baked lakes sitting at ~1650 m whose SURFACE
+	// shading says something else entirely. Looking into a pond and swimming in
+	// it were two different liquids. A depth is the one number that lets the
+	// post-process compute extinction instead of asserting a colour, so the
+	// treatment can agree with the surface material at every water body rather
+	// than at the one it was tuned on. See AVoxelOceanActor::UpdateUnderwaterState.
+	//
+	// GAME THREAD ONLY, and it can touch disk. Same rule and same reason as
+	// GatherLakeSheetBasinsInTile below: this reaches the fine-tile sampler,
+	// which decodes lazily on query and is documented game-thread-only. In
+	// practice the tile under the camera is already resident (the near-field CA
+	// queries the same column every step), so this is a memo hit, not a load --
+	// but the check() is there because "in practice" is not a guarantee.
+	//
+	// A DATUM, NOT A RAYCAST. It reads the ONE number per column that the near
+	// field and the far-field sheet both already read -- the ledger-adjusted lake
+	// datum through waterSurfaceMmAtVoxel, composed with the sea by
+	// vxc::implicitWaterDatumMm, or the cavern flood ceiling underground -- and
+	// subtracts Z. It deliberately does NOT walk voxels upward looking for air:
+	// at 10 cm voxels a 40 m lake is 400 samples per tick, it would disagree with
+	// the surface the sheet draws by up to one voxel, and it would answer a
+	// different number inside the 52 m implicit disc than outside it. Every seam
+	// this file has already closed once (see GatherLakeSheetBasinsInTile's datum
+	// comment) would reopen.
+	//
+	// WHAT IT CANNOT ANSWER, stated rather than papered over: water that exists
+	// only in the CA -- a player-poured pool, a PBF body, a flooded pit dug below
+	// worldgen ground -- has no datum anywhere, because the CA stores fill per
+	// cell and never a surface height. Those cases return 0.0 (i.e. "treat me as
+	// if I were just under the surface"), which is the weakest, least-wrong
+	// treatment rather than a fabricated depth. The .cpp marks the exact branch.
+	double SubmergedDepthUUAtWorld(const FVector& WorldUU) const;
+
 	// Sea level in UE units, from voxelcore/core.h's kSeaLevelMm -- the one
 	// symbol, converted once, so nothing in the client spells the datum as a
 	// literal again.
