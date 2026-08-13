@@ -405,6 +405,45 @@ THE REPLACEMENT, and each element is here because a shipped source uses it:
     wave slope distribution, which is what the new wave field is for; the
     representative point only fixes the CORE of the highlight.
 
+=============================================================================
+WHERE THE WAVE FIELD LIVES NOW (2026-08-12) -- AND IT IS NO LONGER INERT
+=============================================================================
+
+THE PHASE 5 REASONING ABOVE IS STILL THE REASONING. The octave count, the 1.42
+frequency ratio, the golden-angle direction increment, the 58.7-degree sweep
+optimum, the voxel quantisation knob and the drag warp are all unchanged and all
+still argued where they are. What moved is the CODE, and what changed is the
+DEFAULTS.
+
+  * THE WAVE FIELD IS NOW Tools/water_wave_graph.py, design note at
+    docs/water-wind-waves.md. The 110 lines of inline HLSL and the six scalar
+    parameters that used to sit down at the normal/WPO assembly are gone from
+    this file; the module authors the same six parameters under the same names
+    with the same defaults, so an existing material instance that overrides
+    WaveAmplitudeM keeps working. It adds three things: the wind STEERS the
+    octaves, the wind SIZES them, and the wave BREAKS where the bed comes up
+    (a fourth output, wired into the foam composite).
+  * THE INTERACTIVE RIPPLE IS Tools/ripple_field_graph.py, design note at
+    docs/water-interactive-ripples.md. A camera-following render target of rings
+    spreading from things that enter the water, summed into the SAME gradient
+    and the SAME height as the wave field, at one site, upstream of everything.
+
+ONE PARAMETER NAME DISAPPEARED: BathyWaveDampDepthM. Its replacement is
+BreakSurfFloorM -- same meaning (the depth over which a wave dies as the bed
+comes up), same units, and it now also sets where the wave BREAKS, because a
+real surf zone runs from the break point to the waterline and those are one
+band. An instance override of the old name silently stops doing anything.
+
+AND THE HEADLINE, STATED IN THE DOCSTRING BECAUSE IT IS A CHANGE TO A SIGNED-OFF
+PICTURE: the wind feature ships ACTIVE, on water_wave_graph.DEFAULTS. The lake
+this builds is NOT the lake the owner signed off on 2026-08-12. The octaves are
+steered into a cone about the wind instead of spread over the whole circle,
+about four times as much wave reaches the beach, and there is a white surf band
+at every shoreline where the bed shelves. That is deliberate and it is the point
+of the change -- the owner asked to play-test wind-driven waves at different
+wind speeds. VOXEL_WATER_LEGACY_WAVES=1 rebuilds the previous field exactly; see
+that arm's note below for the A/B.
+
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
 
@@ -439,6 +478,21 @@ from sky_star_graph import (  # noqa: E402
     sample_starmap,
 )
 from bathy_field_graph import build_slant_depth, sample_bathy_field  # noqa: E402
+
+# THE OTHER TWO SHARED SUBGRAPHS, same directory, same sys.path.insert above.
+#
+# water_wave_graph is imported AS A MODULE rather than by name because four of
+# its attributes are read here -- build_wave_field, summary_lines, DEFAULTS and
+# LEGACY_RECIPE -- and two of those are the parameter tables the wind arm
+# switches between. Importing the tables by name would let this file hold a
+# stale copy of a default the module has since moved, which is the exact
+# two-copies-of-one-derivation failure both module docstrings are about.
+#
+# ripple_field_graph is imported by name because there is one entry point and it
+# returns everything.
+from ripple_field_graph import sample_ripple_field  # noqa: E402
+import ripple_field_graph  # noqa: E402
+import water_wave_graph  # noqa: E402
 
 # THE FOUR OPTICAL CONSTANTS ARE NOT TYPED IN THIS FILE ANY MORE, and the reason
 # is that this is no longer the only renderer that has to know them.
@@ -561,6 +615,54 @@ FREEZE_RIPPLE_TIME = os.environ.get(FREEZE_TIME_ENV, "0").strip().lower() not in
 # DEFAULT IS ON, so an unset variable rebuilds the shipped material.
 SHORE_FX_ENV = "VOXEL_SHORE_FX"
 SHORE_FX = os.environ.get(SHORE_FX_ENV, "1").strip().lower() not in (
+    "0", "off", "false", "no", "")
+
+# --- THE PRE-WIND WAVE FIELD, ONE REGENERATION AWAY --------------------------
+#
+# THIS FILE NOW SHIPS A DIFFERENT LAKE ON PURPOSE, AND THIS IS THE WAY BACK.
+#
+# The default arm (unset, or 0) builds water_wave_graph.DEFAULTS: the wind steers
+# the octaves, the wind sizes them, and waves break at the shore. That is NOT the
+# water the owner signed off on 2026-08-12 and nobody should be able to mistake
+# it for an accident -- three things are visibly different and each of them is
+# the feature working:
+#
+#   * WindDirectionAuthority 1.0 (was 0). The eight octaves stop being spread
+#     over the whole circle by the golden angle and collapse into a 35-degree
+#     cone about the wind, narrow at the long octaves and 46 degrees off it in
+#     the tail. The lake acquires a direction. The calm/choppy patch field also
+#     starts drifting downwind instead of breathing in place.
+#   * BreakSurfFloorM 0.15 m (was 0.6, under the name BathyWaveDampDepthM).
+#     Measured in the design note on a 2-D shore at four phases: peak crest
+#     inside the surf zone at 5 m/s goes 1.22 cm -> 4.88 cm. Waves reach the
+#     beach instead of fading out 60 cm deep.
+#   * BreakFoamGain 1.0 and BreakPeakGain 0.6 (both were 0). A white surf band
+#     appears where the bed shelves, riding the crests, and the crests inside it
+#     pitch forward. That band also raises Opacity, which is saturate(foam) --
+#     the same pairing already documented at BathyFoamGain.
+#
+# WHY IT IS AN ARM AND NOT A ONE-LINE EDIT. water_wave_graph.LEGACY_RECIPE is the
+# module's own machine-readable statement of "reproduce the field that shipped",
+# verified offline against a transcription of the shipped HLSL to 5.1e-11 m in
+# height. Keeping it reachable from the environment means the A/B is two runs of
+# one script from one C++ build -- the same argument, and the same shape, as
+# VOXEL_WATER_STAR_REFLECT above and VOXEL_SHORE_FX beside it. Setting it takes
+# the regeneration; it is not a runtime flip.
+#
+# WHY A REGENERATION IS EVEN NEEDED FOR THIS ONE, given the whole point below is
+# that the WIND itself needs none: the recipe is a set of SCALAR DEFAULTS baked
+# into the asset. All five are still material parameters, so an instance
+# override reproduces the legacy field without any regeneration at all -- this
+# arm exists so the SHIPPED asset can be flipped back without hand-editing five
+# numbers, and so the flip is recorded in a log line rather than in someone's
+# memory of what they typed into an instance.
+#
+# DEFAULT IS THE WIND ARM. An unset variable builds the feature the owner asked
+# for. That is a deliberate inversion of how VOXEL_SHORE_FX and
+# VOXEL_WATER_STAR_REFLECT default (both "build what shipped"), because here
+# what shipped is the thing being replaced.
+LEGACY_WAVES_ENV = "VOXEL_WATER_LEGACY_WAVES"
+LEGACY_WAVES = os.environ.get(LEGACY_WAVES_ENV, "0").strip().lower() not in (
     "0", "off", "false", "no", "")
 
 
@@ -806,6 +908,167 @@ def main():
     # replacement, and hence the default is not 1.0.
     bathy_authority = bathy_b.scalar("BathyDepthAuthority", 0.85)
     bathy_weight = bathy_b.mul(bathy_authority, bathy["validity"])
+
+    # ======================================================================
+    # THE WAVE FIELD, BUILT HERE BECAUSE FOAM READS IT
+    # ======================================================================
+    #
+    # It used to live ~1,500 lines down, beside the normal and the WPO it feeds,
+    # and the whole of that section's reasoning is still down there -- the
+    # absolute-world-XY argument, the eight octaves, the quantisation knob, the
+    # 58.7-degree sweep. Read it there; none of it moved and none of it changed.
+    #
+    # WHAT MOVED AND WHY. water_wave_graph's node returns a FOURTH output, a
+    # breaking-wave signal, and its consumer is the foam composite about 500
+    # lines below this point -- which is 1,200 lines ABOVE where the wave node
+    # used to be built. Python evaluates top to bottom, so the field has to be
+    # built before the first thing that reads it, and foam is now that thing.
+    #
+    # NOTHING ABOUT THE FIELD CHANGED BY MOVING IT. It is a pure function of
+    # absolute world position and time; both of its original consumers (the
+    # pixel normal and the vertex displacement) still read it at exactly the
+    # sites they always did, from the same single evaluation.
+    #
+    # THIS IS ALSO THE EARLIEST POINT IT CAN GO: it reads `bathy` for depth and
+    # validity, and `bathy` is sampled immediately above.
+    #
+    # ONE Time node still drives the whole field, so VOXEL_WATER_FREEZE_TIME is
+    # still a single-node substitution rather than a graph edit -- and it now
+    # freezes the breaking foam too, by construction, because the foam rides the
+    # same crests off the same evaluation.
+    if FREEZE_RIPPLE_TIME:
+        ripple_time = mel.create_material_expression(
+            material, unreal.MaterialExpressionConstant, -900, 950)
+        ripple_time.set_editor_property("r", 0.0)
+    else:
+        ripple_time = mel.create_material_expression(
+            material, unreal.MaterialExpressionTime, -900, 950)
+
+    # ABSOLUTE WORLD XY IN METRES, and the argument for it is the longest one in
+    # the wave section below ("THE COORDINATE IS ABSOLUTE WORLD XY IN METRES,
+    # NOT TextureCoordinate(0)"). Short form: the pooled vertex factory's UV
+    # repeats every 32 m and mirrors about the world axes, the far-field sheets
+    # do not use that UV at all, and world XY is the only key both draw paths can
+    # agree on. WPT_EXCLUDE_ALL_SHADER_OFFSETS because this value feeds World
+    # Position Offset and a position carrying this material's own WPO would put
+    # the wave into its own input.
+    world_pos_abs = mel.create_material_expression(
+        material, unreal.MaterialExpressionWorldPosition, -1300, 700)
+    world_pos_abs.set_editor_property(
+        "world_position_shader_offset",
+        unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
+
+    world_xy = mel.create_material_expression(
+        material, unreal.MaterialExpressionComponentMask, -1120, 700)
+    world_xy.set_editor_property("r", True)
+    world_xy.set_editor_property("g", True)
+    world_xy.set_editor_property("b", False)
+    world_xy.set_editor_property("a", False)
+    if not mel.connect_material_expressions(world_pos_abs, "", world_xy, ""):
+        raise RuntimeError("connect world_pos_abs -> world_xy failed")
+
+    # UU -> metres. Every frequency in the wave loop is quoted in radians per
+    # METRE so the wavelengths in the comments are readable as wavelengths.
+    uu_to_m = mel.create_material_expression(
+        material, unreal.MaterialExpressionConstant, -1120, 780)
+    uu_to_m.set_editor_property("r", 0.01)
+    wave_pos_m = mel.create_material_expression(
+        material, unreal.MaterialExpressionMultiply, -960, 720)
+    if not mel.connect_material_expressions(world_xy, "", wave_pos_m, "A"):
+        raise RuntimeError("connect world_xy -> wave_pos_m.A failed")
+    if not mel.connect_material_expressions(uu_to_m, "", wave_pos_m, "B"):
+        raise RuntimeError("connect uu_to_m -> wave_pos_m.B failed")
+
+    # --- THE ARM, AND THE ONE LINE THAT DECIDES WHAT THIS LAKE LOOKS LIKE ----
+    #
+    # THE DEFAULT ARM SHIPS THE WIND FEATURE ON. That is a deliberate, visible
+    # change to a signed-off picture, requested so the owner can play-test waves
+    # at different wind speeds; the full list of what looks different is at
+    # LEGACY_WAVES near the top of this file and it is not repeated here.
+    #
+    # STARTING FROM water_wave_graph.DEFAULTS AND NOT FROM A HAND-WRITTEN DICT is
+    # the point of passing the table at all. Every number in it is argued in that
+    # module against a measurement -- WindDirectionAuthority against the corduroy
+    # histogram, BreakSurfFloorM against the 1.22 cm -> 4.88 cm shore crest,
+    # BreakDepthRatio against McCowan's 0.78 breaker index, BreakShoalGain
+    # against Green's law -- and a copy of any of them typed here would be a
+    # second, silent authority on the same quantity. The dict() is so a later
+    # edit to this file cannot mutate the module's table in place.
+    #
+    # LEGACY_RECIPE is the module's own machine-readable "reproduce the shipped
+    # field", not five numbers reconstructed by reading a diff. Verified offline
+    # to 5.1e-11 m in height and 8.6e-10 in the gradient components against a
+    # transcription of the shipped HLSL.
+    if LEGACY_WAVES:
+        WAVE_DEFAULTS = dict(water_wave_graph.LEGACY_RECIPE)
+    else:
+        WAVE_DEFAULTS = dict(water_wave_graph.DEFAULTS)
+
+    # --- THE CALM-LAKE FLOOR: A DECISION, AND IT IS "NO FLOOR" --------------
+    #
+    # THE PATH, STATED FIRST SO IT IS NOT DISCOVERED FROM A SCREENSHOT. The wave
+    # amplitude scale is u^WindAmpExponent with u = |WindVectorMS| /
+    # WindRefSpeedMS and the shipped exponent 1.0, and it is NOT gated by
+    # WindDirectionAuthority -- only the STEERING is. So the moment
+    # UVoxelWeatherSubsystem publishes WindFieldValid = 1 over a near-zero wind,
+    # the lake goes to glass: a mirror, no normal variation, no displacement, no
+    # surf. Every crest in the field is multiplied by that one number.
+    #
+    # THREE THINGS MAKE THAT SAFE ENOUGH TO SHIP AS-IS.
+    #
+    #   1. IT IS THE CORRECT PHYSICS AND IT IS THE FEATURE. A wind-driven field
+    #      with no wind has no waves. If the owner pins 0 m/s and gets a mirror,
+    #      the instrument is reading true -- that is the low end of the sweep he
+    #      asked to play-test, not a failure of it.
+    #   2. IT NEEDS THE SUBSYSTEM TO BE PUBLISHING A CALM. With no weather
+    #      subsystem, or with voxel.Weather.Enabled 0, WindFieldValid is 0 and
+    #      build_wind_input's lerp returns the MATERIAL fallback exactly --
+    #      WindFallbackSpeedMS 5.0 at WindFallbackDirDeg 238.7, which is u = 1
+    #      and therefore the shipped wave SIZE with the new steering. A run with
+    #      no weather is never glass.
+    #   3. IT IS RECOVERABLE IN A FRAME, FROM THE CONSOLE, WITH NO REGENERATION:
+    #      `voxel.Weather.PinMps 5` puts it straight back.
+    #
+    # AND THE FLOOR IS NOT IMPLEMENTABLE HERE ANYWAY, WHICH IS THE OTHER HALF OF
+    # THE DECISION. The wind expression is built inside build_wave_field, from
+    # build_wind_input, and reaches the HLSL on a pin this file never touches;
+    # nothing in WAVE_DEFAULTS can add a term to it. The two levers this file
+    # does have are both wrong:
+    #
+    #   * Raising WindRefSpeedMS scales u, it does not floor it. Zero stays zero.
+    #   * Dropping WindAmpExponent toward 0 flattens the whole response curve --
+    #     at 0.1, a 0.05 m/s breath (u = 0.01) would produce 0.01^0.1 = 63% of
+    #     the reference wave, and a 20 m/s storm only 115% of it.
+    #     That destroys exactly the thing being play-tested (wave size against
+    #     wind speed) in order to fix its endpoint, and pow(0, 0.1) is still 0,
+    #     so it does not even fix the endpoint.
+    #
+    # SO IF A FLOOR IS WANTED, IT BELONGS ON THE PUBLISHED WIND, NOT ON THE
+    # AMPLITUDE: one clamp on the sustained speed in UVoxelWeatherSubsystem's
+    # PublishWind, before it writes WindVectorMS. A floor of 0.5 m/s gives
+    # u = 0.1, H_s = 0.6 cm and a break depth of 0.8 cm -- a lake with a faint
+    # texture on it rather than a mirror -- and it keeps ONE definition of "how
+    # windy is it" instead of a second one hidden in a shader. That is a change
+    # to weather.h/VoxelWeatherSubsystem.cpp and is deliberately not made here.
+    wave_field = water_wave_graph.build_wave_field(
+        bathy_b, wave_pos_m, ripple_time, bathy,
+        defaults=WAVE_DEFAULTS, log=unreal.log_warning)
+    wave_grad_raw = wave_field["gradient"]     # float2, dH/dx and dH/dy
+    wave_height_m = wave_field["height_m"]     # float, metres
+    wave_breaking = wave_field["breaking"]     # float 0..1, for foam
+
+    # Logged HERE rather than beside water_optics.summary_lines() at the top of
+    # main(), because wind_source is not known until build_wind_input has read
+    # the collection back -- and wind_source is the line that matters. It says
+    # MPC_VoxelSky when the two wind parameters are on the collection (they are,
+    # create_sky_material.py:525 and :564) and material-fallback when they are
+    # not, which is the tell that create_sky_material.py has not been re-run
+    # since they landed.
+    for _line in water_wave_graph.summary_lines(wave_field["wind_source"]):
+        unreal.log("M_WaterVoxel " + _line)
+    unreal.log("M_WaterVoxel WIND WAVE DEFAULTS (%s): %s"
+               % ("LEGACY_RECIPE" if LEGACY_WAVES else "water_wave_graph.DEFAULTS",
+                  ", ".join("%s=%g" % kv for kv in sorted(WAVE_DEFAULTS.items()))))
 
     # --- SINGLE LAYER WATER VOLUME: ABSORPTION AND SCATTERING --------------
     #
@@ -1394,6 +1657,34 @@ def main():
     if not mel.connect_material_expressions(activity_foam, "", foam_raw, "B"):
         raise RuntimeError("connect activity_foam -> foam_raw.B failed")
     foam_raw = bathy_b.maximum(foam_raw, shore_foam)
+
+    # SIGNAL 4: BREAKING WAVES, from the wave field built ~500 lines above.
+    #
+    # MAX AND NOT ADD, for the reason stated at foam_raw just above -- these
+    # describe one physical thing from four directions, and a wave breaking over
+    # an already-foamy shore should be fully white rather than 2x white and
+    # clipped, which would flatten the distinction between "quite foamy" and
+    # "extremely foamy" over most of the interesting range.
+    #
+    # THE PERMANENT-WHITE-RING DISCIPLINE APPLIES TO THIS TERM TOO and it is
+    # gated four ways inside the wave node rather than here: the band is
+    # proportional to the wave (no wave, no band, at any damping depth), the foam
+    # rides the CRESTS so it travels with them instead of being a painted stripe,
+    # an absolute 5 cm size gate sits under the proportional one, and the whole
+    # thing is multiplied by the bathymetry validity so water with no baked depth
+    # looks exactly as it does today. See water_wave_graph.py, "THREE GATES ON
+    # THE FOAM".
+    #
+    # ON THE SHIPPED ARM THIS IS LIVE: BreakFoamGain is 1.0. Under
+    # VOXEL_WATER_LEGACY_WAVES=1 it is 0.0 and this contributes exactly zero.
+    #
+    # AND IT MOVES OPACITY WITH IT, which is not obvious from the name: Opacity
+    # is saturate(foam), so anything raising foam also makes the water more
+    # opaque there. That pairing is already documented at BathyFoamGain and it
+    # applies here identically -- a surf band is also a band where you stop
+    # seeing the bed. Correct, for whitewater, and stated so it is not read as a
+    # second bug when the shoreline goes light.
+    foam_raw = bathy_b.maximum(foam_raw, wave_breaking)
 
     foam = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -190, -60)
     if not mel.connect_material_expressions(foam_raw, "", foam, "A"):
@@ -2316,80 +2607,57 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
     # it is still moot for the same reason and is still set, because the day
     # someone makes the fill-drop term touch X/Y is not the day anyone will
     # remember to come back here.
-
-    # ONE Time node drives the whole field, so the FREEZE_RIPPLE_TIME
-    # measurement arm is still a single-node substitution rather than a graph
-    # edit -- and now it freezes the vertex wave and the pixel wave together by
-    # construction, where before it happened to feed two separate systems that
-    # each had to be checked. See FREEZE_RIPPLE_TIME's note at the top of the
-    # file for what the arm is for.
-    if FREEZE_RIPPLE_TIME:
-        ripple_time = mel.create_material_expression(
-            material, unreal.MaterialExpressionConstant, -900, 950)
-        ripple_time.set_editor_property("r", 0.0)
-    else:
-        ripple_time = mel.create_material_expression(material, unreal.MaterialExpressionTime, -900, 950)
-
-    world_pos_abs = mel.create_material_expression(material, unreal.MaterialExpressionWorldPosition, -1300, 700)
-    world_pos_abs.set_editor_property(
-        "world_position_shader_offset", unreal.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS
-    )
-
-    world_xy = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -1120, 700)
-    world_xy.set_editor_property("r", True)
-    world_xy.set_editor_property("g", True)
-    world_xy.set_editor_property("b", False)
-    world_xy.set_editor_property("a", False)
-    if not mel.connect_material_expressions(world_pos_abs, "", world_xy, ""):
-        raise RuntimeError("connect world_pos_abs -> world_xy failed")
-
-    # UU -> metres. Every frequency in the wave loop is quoted in radians per
-    # METRE so the wavelengths in the comments are readable as wavelengths.
-    uu_to_m = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -1120, 780)
-    uu_to_m.set_editor_property("r", 0.01)
-    wave_pos_m = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -960, 720)
-    if not mel.connect_material_expressions(world_xy, "", wave_pos_m, "A"):
-        raise RuntimeError("connect world_xy -> wave_pos_m.A failed")
-    if not mel.connect_material_expressions(uu_to_m, "", wave_pos_m, "B"):
-        raise RuntimeError("connect uu_to_m -> wave_pos_m.B failed")
-
-    # --- The knobs, all of them instance-tunable ---------------------------
     #
-    # WaveAmplitudeM is the amplitude of the wave the whole field is scaled to.
-    # 0.25 here is a GAIN on a normalised field whose peak is about 0.34, so the
-    # physical wave it produces is about 8.6 cm crest-to-mean, with the 99th
-    # percentile of |height| at 5.0 cm.
+    # WHERE THE CODE THAT DOES ALL OF THAT NOW IS: ~1,500 lines up, immediately
+    # after the bathymetry sample, under "THE WAVE FIELD, BUILT HERE BECAUSE FOAM
+    # READS IT". The Time node, world_pos_abs, world_xy, uu_to_m and wave_pos_m
+    # moved there verbatim, and the six scalar knobs that used to be typed out
+    # below are now authored by water_wave_graph under the same names with the
+    # same defaults. NOTHING ABOUT THE FIELD CHANGED BY MOVING IT -- it is a pure
+    # function of absolute world position and time, and the two consumers below
+    # read it exactly where they always did. The reasoning above is left here,
+    # attached to the section it explains, rather than dragged 1,500 lines up
+    # into a block whose subject is Python ordering.
     #
-    # AND THIS NUMBER WAS SET FROM A MEASUREMENT, NOT FROM TASTE, because the
-    # first guess at it was wrong in an instructive way. The point of the new
-    # field is a wider surface-slope distribution -- a glint needs slope, not
-    # height, and the old ripple's ~4 degrees of maximum tilt against a specular
-    # exponent of 900 is why the sun's return was a dot rather than a path. The
-    # first attempt shipped a 9 m base wavelength at this amplitude and MEASURED
-    # WORSE THAN THE THING IT REPLACED: p99 tilt 3.7 degrees against the old
-    # ripple's 5.2, because slope is amplitude OVER wavelength and 9 m
-    # wavelengths at 8 cm of height are nearly flat however many octaves you sum.
-    #
-    # Shipped configuration, evaluated over a 30 m patch on a 400x400 grid,
-    # against the four sines it replaces:
-    #
-    #                        tilt p50   p95    p99     max
-    #     old four sines       2.8    4.6    5.2     5.7  deg
-    #     this field           3.8    7.8    9.5    ~20   deg
-    #
-    # so the slope distribution is roughly doubled at the median and the tail is
-    # much longer, which is the part a glint actually rides on -- and the water
-    # is still only 8 cm of relief, i.e. a calm lake rather than a sea.
-    wave_amp = scalar_param("WaveAmplitudeM", 0.25, -1300, 860)
+    # WHAT DID CHANGE, and it is not a move: the field is now WIND-DRIVEN and
+    # ships that way. See VOXEL_WATER_LEGACY_WAVES at the top of this file.
 
-    # WaveWpoFraction is how much of that the GEOMETRY actually moves: 0.25 of
+    # --- The one knob that stays HERE, because it is applied HERE ------------
+    #
+    # THE OTHER SIX MOVED, AND THEY MOVED WITHOUT CHANGING. WaveAmplitudeM,
+    # WaveBaseWavelengthM, WaveDirBaseDeg, WaveDirIncrementDeg,
+    # WaveQuantPerVoxel and WavePatchContrast are authored by
+    # water_wave_graph.build_wave_field -- same names, same defaults, same
+    # meanings -- so a material instance that already overrides WaveAmplitudeM
+    # keeps working across this change. Their arguments (the 8.6 cm relief and
+    # the slope measurement that set 0.25, the 0.43 m short end against the
+    # quantisation grid, the golden angle, the 58.7-degree sweep optimum) moved
+    # with them and are in water_wave_graph.py and docs/water-wind-waves.md.
+    #
+    # WaveWpoFraction did NOT move, because it is not the wave field's: it is
+    # applied to the field's OUTPUT, below, after the ripple is summed in.
+    #
+    # WaveWpoFraction is how much of the wave the GEOMETRY actually moves: 0.25 of
     # an 8.6 cm field, so about +/-2.1 cm at the extreme and +/-1.2 cm at the
     # 99th percentile. That is deliberately the budget the old WPO bob worked to
-    # ("no more than 1-2 UU"), because the reasons for that budget have not
-    # changed: the surface has to sit on a 10 cm voxel grid, and there is still
-    # no shore-damping term to stop a rising crest clipping through its own bank
-    # (that is Phase 3 of the plan and it wants the baked distance-to-shore
-    # field, which does not exist yet).
+    # ("no more than 1-2 UU"), and ONE of the two reasons for that budget still
+    # holds: the surface has to sit on a 10 cm voxel grid.
+    #
+    # THE OTHER REASON IS RETIRED AND THE SENTENCE THAT STATED IT IS DELETED. It
+    # used to read "there is still no shore-damping term to stop a rising crest
+    # clipping through its own bank". There is now, and it is better than a
+    # damping term: water_wave_graph's surf band is proportional to the wave, so
+    # inside it H(d) = d / BreakDepthRatio = 0.78 d and the crest is DEPTH-LIMITED
+    # at any wind speed. Measured over a 0.8 m -> 0 m shore at four phases, the
+    # vertex displacement is at most 0.30 of the local depth and stops growing
+    # above 10 m/s. The bank-clipping bound is now derived rather than bought
+    # with a small number, so 0.25 could be RAISED on evidence -- it is not
+    # raised here, because that is a look change and the owner judges those from
+    # captures.
+    #
+    # ONE EXCEPTION TO THE BOUND, and it is the interactive ripple, not the wave:
+    # the ripple is summed into the height BELOW, downstream of the node, so the
+    # depth limit cannot reach it. See the ripple block for what that costs.
     #
     # The shading and the displacement therefore differ by a scalar, and that is
     # the design rather than an inconsistency: same field, same phase, same
@@ -2398,233 +2666,141 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
     # and water sloshing over the bank.
     wave_wpo_fraction = scalar_param("WaveWpoFraction", 0.25, -1300, 920)
 
-    # Wavelength of the FIRST octave, in metres. Eight octaves at the 1.42
-    # frequency ratio in the loop then run 5.00, 3.52, 2.48, 1.75, 1.23, 0.87,
-    # 0.61, 0.43 m.
+    # --- THE INTERACTIVE RIPPLE FIELD, SUMMED INTO BOTH OUTPUTS -------------
     #
-    # THE SHORT END IS CHOSEN AGAINST THE QUANTISATION GRID, not by feel. At the
-    # default WaveQuantPerVoxel = 1 the field is sampled on a 10 cm lattice, so
-    # the shortest octave at 0.43 m still gets four samples per wavelength --
-    # comfortably above the point where quantisation stops being a style and
-    # starts being aliasing. Shortening the base wavelength further raises the
-    # slope distribution (3.0 m gives a p99 tilt of 17 degrees) at the cost of
-    # pushing the last octave to 0.22 m, which is two samples per wavelength and
-    # will read as noise rather than as ripple. That is the trade if the owner
-    # wants it choppier: shorten this first, raise WaveAmplitudeM second.
-    wave_base_len = scalar_param("WaveBaseWavelengthM", 5.0, -1300, 980)
-
-    # DIRECTION INCREMENT PER OCTAVE, IN DEGREES. This is the fix, and it is the
-    # one most often skipped. Mojang ships this as `direction_increment` in
-    # Vibrant Visuals at 80 degrees over 28 octaves; Photon uses the golden
-    # angle. Default here is the golden angle, 137.507764 deg, which over eight
-    # octaves (from the WaveDirBaseDeg starting angle below) puts the wave
-    # directions at 58.7, 196.2, 333.7, 111.2, 248.7, 26.2, 163.7 and 301.3 deg.
-    # Set it to 0 to see the old failure reproduced exactly: every octave
-    # parallel, and a corduroy lake.
+    # A SECOND HEIGHT FIELD ON THE SAME SURFACE, from a camera-following render
+    # target: rings spreading from things that entered the water. Exactly the
+    # same shape as the wave field -- (dH/dx, dH/dy, H) with H in metres -- and
+    # it composes with it by plain addition and nothing else. See
+    # Tools/ripple_field_graph.py and docs/water-interactive-ripples.md.
     #
-    # NOTE the increment alone is not the whole fix -- see WaveDirBaseDeg. The
-    # increment fixes the SPACING of the directions; the base fixes where that
-    # whole set sits relative to the world axes, and a base of zero puts the
-    # heaviest octave straight down a world axis no matter how good the spacing.
-    wave_dir_inc = scalar_param("WaveDirIncrementDeg", 137.507764, -1300, 1040)
-
-    # THE STARTING ANGLE, AND IT IS NOT ZERO, WHICH IS A BUG THIS FILE ALMOST
-    # SHIPPED. The direction of octave i is (sin(base + i*inc), cos(...)), so at
-    # base = 0 the FIRST octave -- the longest wavelength and the heaviest
-    # weight, i.e. the most visible one in the sum -- travels along exactly
-    # world +Y, and its wavefronts are exactly parallel to world X. That is the
-    # precise defect this whole section exists to remove, reintroduced by a
-    # default of zero, and it was caught by printing the eight directions rather
-    # than by looking at the water.
+    # SUMMING GRADIENTS IS THE WHOLE ARGUMENT, and the note at the normal
+    # assembly immediately below already makes it: averaging or lerping unit
+    # normals systematically flattens slopes, which is how multi-octave water
+    # ends up looking like a bin liner. Two independent height fields on one
+    # surface superpose, so their GRADIENTS add, and the normal assembled from
+    # the sum is the normal of the combined surface. The ripple is a ninth
+    # octave from a different source. Any other order is a different and wrong
+    # surface.
     #
-    # 58.7 degrees is the OPTIMUM, not a taste. The eight wavefront ORIENTATIONS
-    # are (base + i*137.507764) mod 180 -- mod 180 because a wave train and its
-    # reverse share a wavefront -- and the golden-angle increment fixes their
-    # spacing, so the only free variable is where the whole set sits relative to
-    # the world axes. Sweeping base in 0.1 degree steps and maximising the
-    # smallest distance from 0 or 90 lands on 58.7, which puts the orientations
-    # at 16.2, 26.2, 58.7, 68.7, 111.2, 121.3, 153.7 and 163.7 -- the nearest
-    # any octave comes to a world axis is 16.2 degrees.
+    # BOTH SUMS HAPPEN HERE, AT ONE SITE, and every one of the four things
+    # downstream of this point matters:
     #
-    # The first guess here was 31.7, which looked arbitrary enough and was not:
-    # it puts one octave at 179.2, i.e. 0.8 degrees off the world X axis. Two
-    # different awkward-looking numbers, one of them quietly reintroducing the
-    # defect. This is why the sweep is recorded rather than the number.
-    wave_dir_base = scalar_param("WaveDirBaseDeg", 58.7, -1300, 1080)
-
-    # THE VOXEL-STYLE KNOB the owner asked for. Samples per 10 cm voxel: 1 is
-    # one sample per voxel (a 10 cm grid), 2 and 4 are finer, 0 turns it off.
-    # `p = floor(p * k) / k` before the field is evaluated -- Glimmer does this
-    # behind PIXEL_LOCKED_LIGHTING, Rethinking Voxels does the same.
+    #   * UPSTREAM OF THE -1 AND THE APPEND. A height field's tangent-space
+    #     normal is (-dH/dx, -dH/dy, 1); converting the sum once gives the
+    #     combined surface's normal, converting each field separately and then
+    #     blending does not.
+    #   * UPSTREAM OF THE VertexColor.B TOP-FACE MASK, and on the WPO half that
+    #     is not cosmetic. An unmasked vertex offset would lift a side wall's
+    #     BOTTOM vertices off the floor they are sealed against and open the
+    #     mesh. A ripple summed outside that mask would tear water bricks apart.
+    #     On the normal half it is cosmetic and still right: a splash should no
+    #     more light up a submerged wall than a wind wave should.
+    #   * UPSTREAM OF THE metres->UU CONVERSION, so both terms are in metres at
+    #     the point they meet and the 100.0 is applied once.
+    #   * UPSTREAM OF WaveWpoFraction, which is a consequence rather than a
+    #     choice: the ripple's GEOMETRY contribution is a quarter of its height,
+    #     so a 9 cm ring lifts the surface 2.25 cm and the normal carries the
+    #     rest. If the owner wants the ring to visibly lift the water, the fix is
+    #     a separate fraction on the ripple half of this sum -- NOT raising
+    #     WaveWpoFraction, which would also make the wind wave slosh over its
+    #     banks.
     #
-    # IT IS ALSO THE ANTI-ALIASING, and that is not a bonus argument, it is half
-    # the reason to want it: a field with no spatial frequency above the voxel
-    # grid has nothing left to alias, so distant water cannot shimmer from
-    # under-sampled ripples. It replaces the per-octave distance fade the plan
-    # lists as Phase 5 item 2 for the near field, and does not replace it at
-    # range (a 10 cm grid is still far finer than a pixel at 200 m); the fade is
-    # deliberately not implemented here and is called out in the report.
+    # IT IS DELIBERATELY NOT DEPTH-DAMPED, AND IT CANNOT BE REACHED BY THE
+    # DAMPING EVEN BY ACCIDENT. The wave's shore damping lives INSIDE the
+    # WaveField custom node (BreakSurfFloorM), applied to the wave's own
+    # amplitude before the node returns; the ripple is added to the node's
+    # OUTPUT. There is no wiring by which one could reach the other. That is
+    # what we want: damping a splash by depth would delete it exactly at the
+    # shoreline, which is where a player enters the water. The ripple has its own
+    # shore treatment and it is a HORIZONTAL one -- the simulation is masked by
+    # the baked signed distance to shore, so a ring dies against the bank rather
+    # than fading out with depth.
     #
-    # NOTE THE ACCIDENT THAT MAKES k=1 FREE ON THE GEOMETRY: water quad vertices
-    # already sit on the 10 cm voxel grid, so at k=1 the quantisation changes
-    # nothing about where the vertex wave samples and only stylises the pixel
-    # normal. The displacement does not acquire a staircase until k > 1.
-    wave_quant = scalar_param("WaveQuantPerVoxel", 1.0, -1300, 1100)
-
-    # How much the very-low-frequency patch field varies the amplitude: 0 is a
-    # uniform lake (the old behaviour), 1 would swing from dead calm to double.
-    # 0.55 gives visibly calm and visibly choppy areas without either extreme.
-    wave_patch = scalar_param("WavePatchContrast", 0.55, -1300, 1160)
-
-    # ------------------------------------------------------------------------
-    # THE WAVE FIELD ITSELF.
+    # WHAT THAT COSTS, STATED SO IT IS NOT DISCOVERED FROM A SCREENSHOT: the
+    # wave's depth limit also carries a guarantee that a crest cannot stand
+    # taller than the water it is in (see WaveWpoFraction above). The ripple
+    # bypasses the guarantee along with the damping -- its shore mask is zero on
+    # land and zero at the waterline, but 30 cm inside the water it is 1.0
+    # however shallow that water is. Bounded in practice by RippleFieldGain, by
+    # the mask dying 25 cm inside the waterline, and by WaveWpoFraction taking
+    # the geometry to a quarter of the ring: three small numbers, not a proof.
+    # Accepted -- a splash poking a centimetre through a shallow bank for a
+    # second is a better failure than no splash. If it ever shows in a capture
+    # the fix is a depth CLAMP on the ripple's WPO half only,
+    # min(ripple_h, 0.5 * depth), which leaves the shading ring intact.
     #
-    # ATTRIBUTION AND LICENCE, and read the module docstring's longer note
-    # before changing this. The technique is afl_ext's "Very fast procedural
-    # ocean" (shadertoy.com/view/MdXyzX): an exp-sine crest and a per-octave
-    # drag warp. The instruction for this work was to verify the licence at
-    # shadertoy.com first-hand. THAT VERIFICATION FAILED -- shadertoy.com
-    # returns HTTP 403 to this box. A third-party carrier
-    # (jbritain/glimmer-shaders, shaders/lib/water/waveNormals.glsl) attributes
-    # it to afl_ext and links opensource.org/license/mit, but that is a
-    # second-hand assertion. SO NO CODE WAS COPIED. What follows is written here
-    # from the described mathematics and shares no lines with either GLSL
-    # source. The licence position is UNVERIFIED and is recorded as such.
+    # --- AND WHY THIS IS GUARDED RATHER THAN CALLED STRAIGHT -----------------
     #
-    # WHY THIS SHAPE OF FUNCTION, in three parts:
+    # sample_ripple_field RAISES if the three RippleField* names are not on
+    # MPC_VoxelSky, or if /Game/Voxel/RT_VoxelRippleField does not exist, and it
+    # is right to: an unresolved CollectionParameter compiles to a CONSTANT
+    # rather than failing (MaterialExpressions.cpp:17179-17193), so a constant
+    # origin would sample one fixed texel for the entire world, and an unbound
+    # texture parameter would add whatever image the engine picks to the water's
+    # normal on every pixel. Both are silent. Raising is the correct default for
+    # a module that cannot know who is calling it.
     #
-    #   exp(sin(x) - 1) * 0.5 instead of sin(x). Asymmetric: broad troughs,
-    #   sharp crests, which is what a real wind wave looks like and is also what
-    #   gives the field high-frequency content the octave list does not have to
-    #   pay for. A sine has exactly one frequency; this has a whole harmonic
-    #   series, so eight octaves look like many more.
+    # IT IS THE WRONG BEHAVIOUR *HERE*, TODAY, AND THAT IS A SCHEDULING FACT
+    # RATHER THAN A DISAGREEMENT. Those two prerequisites are landing with the
+    # ripple subsystem, in files this change does not own
+    # (create_sky_material.py's parameter tables, create_ripple_field_materials.
+    # py's render target). Until they do, calling straight through would make
+    # M_WaterVoxel UNGENERATABLE -- and the wind waves above, which have no such
+    # dependency and which the owner is waiting to play-test, would go down with
+    # them. Whole feature blocked on an unrelated one.
     #
-    #   THE DERIVATIVE IS FREE. d/dx of that is wave * cos(x), which the loop
-    #   already has both factors of. So the surface GRADIENT is accumulated
-    #   directly -- no finite differencing, no three evaluations of the height
-    #   field to get one normal. That is what makes it affordable to run the
-    #   same field in the vertex shader and the pixel shader.
+    # So this probes and degrades, LOUDLY, which is exactly the shape
+    # water_wave_graph.build_wind_input already uses for the same situation
+    # (water_wave_graph.py:961-968: "IF THE COLLECTION HAS NO WIND PARAMETERS
+    # THIS DOES NOT RAISE ... It logs, loudly, and takes the fallback"). The
+    # degraded arm is not an approximation of the ripple, it is its exact
+    # absence: the sums become the wave field alone, which is what
+    # RippleFieldGain = 0 would produce anyway, minus the texture fetch.
     #
-    #   THE DRAG WARP is the part that stops it looking like a sum of sines.
-    #   Each octave displaces the sample position for the NEXT octave along its
-    #   own direction by its own derivative (`pos += d * -dwave * weight *
-    #   0.2`). The octaves therefore pull on each other instead of cleanly
-    #   superimposing, and clean superposition is exactly what reads as a grid.
-    #
-    # WHAT WAS DROPPED FROM THE ORIGINAL, DELIBERATELY: afl_ext seeds a phase
-    # offset from `length(position) * 0.1`, to keep octaves from sharing a phase
-    # near the origin. That is correct for shadertoy coordinates centred on
-    # zero. Here the world is ~65 km from the origin, so the radial direction is
-    # effectively constant across a whole lake and the term degenerates into a
-    # coherent 63 m plane-wave phase ramp shared by every octave -- i.e. it
-    # would ADD a long-wavelength banding to the thing this section exists to
-    # remove. The per-octave direction rotation already does the decorrelating
-    # it was there for.
-    #
-    # THE PATCH FIELD is the "calm and choppy patches instead of uniform
-    # corduroy" item. Two sines at ~180 m and ~232 m, both diagonal, both
-    # non-commensurate with each other and with every octave. It multiplies the
-    # height and the gradient together. Strictly the gradient should also carry
-    # the derivative OF the patch field; that term is smaller by the ratio of
-    # the wavelengths (~180 m against ~9 m, so ~2%) and is left out.
-    WAVE_CODE = """
-// One evaluation, two outputs: float3(dH/dx, dH/dy, H). H is in metres, the
-// gradient is dimensionless (metres of rise per metre of run).
-float2 p = PosM;
+    # THE PROBE IS THE SAME TWO CHECKS THE MODULE ITSELF WOULD MAKE, so it
+    # cannot pass here and fail there: name membership read back off the
+    # collection (SkyGraphBuilder.mpc_names), and a load of the render target.
+    # WHEN THE PREREQUISITES LAND THIS ARM DISAPPEARS ON ITS OWN -- there is no
+    # environment variable and no default to remember to flip.
+    ripple_missing = sorted(
+        n for n in (ripple_field_graph.MPC_ORIGIN,
+                    ripple_field_graph.MPC_INV_SIZE,
+                    ripple_field_graph.MPC_GAIN)
+        if n not in bathy_b.mpc_names())
+    try:
+        # try/except and not a bare None check: unreal.load_object's failure
+        # mode for a package that does not exist on disk is not guaranteed to be
+        # a None return on every engine build, and the entire point of this
+        # block is that a missing ripple field must not take the water material
+        # down with it.
+        ripple_rt = unreal.load_object(None, ripple_field_graph.FIELD_TEXTURE)
+    except Exception:  # noqa: BLE001 -- absence is the thing being tested for
+        ripple_rt = None
 
-// Voxel-grid quantisation: the stylisation knob, and the anti-aliasing.
-if (QuantPerVoxel > 0.0)
-{
-    float k = QuantPerVoxel * 10.0;   // samples per metre; 10 = one per 10 cm voxel
-    p = floor(p * k) / k;
-}
-
-const float DRAG_MULT = 0.2;
-// Mean of exp(sin(x)-1)*0.5 over a full period = 0.5 * I0(1) * e^-1. Subtracted
-// so the field is centred on zero and the displacement does not lift the whole
-// lake by a constant.
-const float MEAN_WAVE = 0.2329;
-
-float2 pos    = p;
-float  freq   = 6.2831853 / max(BaseWavelengthM, 0.05);
-float  tmul   = 2.0;
-float  weight = 1.0;
-float  sumH   = 0.0;
-float  sumW   = 0.0;
-float2 sumD   = float2(0.0, 0.0);
-float  ang    = radians(DirBaseDeg);
-float  dAng   = radians(DirIncrementDeg);
-
-[unroll]
-for (int i = 0; i < 8; ++i)
-{
-    float2 d = float2(sin(ang), cos(ang));
-    float  x = dot(d, pos) * freq + T * tmul;
-    float  wv  = exp(sin(x) - 1.0) * 0.5;
-    float  dwv = wv * cos(x);
-
-    // Drag: this octave warps the sample position seen by the next one.
-    pos += d * (-dwv) * weight * DRAG_MULT;
-
-    sumH += wv * weight;
-    sumD += d * (dwv * freq * weight);
-    sumW += weight;
-
-    weight *= 0.8;      // lerp(weight, 0, 0.2)
-    freq   *= 1.42;     // non-commensurate on purpose
-    tmul   *= 1.07;
-    ang    += dAng;     // rotate the wave direction per octave
-}
-
-float  invW = 1.0 / max(sumW, 1e-6);
-float  H = (sumH * invW) - MEAN_WAVE;
-float2 G = sumD * invW;
-
-// Very-low-frequency calm/choppy field: ~180 m and ~232 m, both diagonal.
-float lfa = sin(dot(p, float2( 0.0349,  0.0217)) + T * 0.031);
-float lfb = sin(dot(p, float2(-0.0161,  0.0271)) + T * 0.0193);
-float patch = saturate(0.5 + 0.35 * lfa + 0.35 * lfb);
-float amp = AmplitudeM * lerp(1.0 - PatchContrast, 1.0 + PatchContrast, patch);
-
-return float3(G * amp, H * amp);
-"""
-
-    wave = custom_node(
-        "WaveField", WAVE_CODE,
-        ["PosM", "T", "AmplitudeM", "BaseWavelengthM", "DirBaseDeg", "DirIncrementDeg",
-         "QuantPerVoxel", "PatchContrast"],
-        -700, 900, unreal.CustomMaterialOutputType.CMOT_FLOAT3)
-    # --- PHASE 3: DAMP THE WAVE TO NOTHING AS THE BED COMES UP --------------
-    #
-    # Valheim's `lerp(0, wind, depth)`, and the note at WaveWpoFraction above
-    # says exactly why it was owed: there was "no shore-damping term to stop a
-    # rising crest clipping through its own bank", so the WPO fraction was held
-    # at 0.25 to keep the crests small enough not to matter. This is that term.
-    #
-    # ON THE AMPLITUDE, WHICH IS ONE MULTIPLY AND DAMPS BOTH HALVES. The normal
-    # and the displacement are the same field scaled differently, and both read
-    # AmplitudeM, so damping here keeps them in step by construction -- a crest
-    # that stops moving in the geometry stops moving in the shading, at the same
-    # place. Damping only the WPO would leave a shimmer with no surface under it.
-    #
-    # BY DEPTH, NOT BY DISTANCE. This one really is a depth question: a wave dies
-    # because the bed is close, not because the shore is. A steep-sided lake has
-    # full waves within a metre of the bank and should.
-    #
-    # WHERE THERE IS NO FIELD, THERE IS NO DAMPING. The lerp back to 1 on
-    # validity is what keeps a run with no fine tier looking exactly as it does
-    # today rather than with its waves silently switched off.
-    wave_damp_depth = scalar_param("BathyWaveDampDepthM", 0.6, -1300, 1040)
-    wave_damp_raw = bathy_b.ramp(bathy["depth_m"], "", bathy_b.const(0.0), wave_damp_depth)
-    wave_damp = bathy_b.lerp(bathy_b.const(1.0), "", wave_damp_raw, "", bathy["validity"])
-    wave_amp = bathy_b.mul(wave_amp, wave_damp)
-
-    for src, pin in ((wave_pos_m, "PosM"), (ripple_time, "T"), (wave_amp, "AmplitudeM"),
-                     (wave_base_len, "BaseWavelengthM"), (wave_dir_base, "DirBaseDeg"),
-                     (wave_dir_inc, "DirIncrementDeg"),
-                     (wave_quant, "QuantPerVoxel"), (wave_patch, "PatchContrast")):
-        if not mel.connect_material_expressions(src, "", wave, pin):
-            raise RuntimeError("connect -> WaveField.%s failed" % pin)
+    if ripple_missing or ripple_rt is None:
+        unreal.log_warning(
+            "M_WaterVoxel RIPPLE FIELD ARM: ABSENT -- building the water WITHOUT interactive "
+            "ripples. Missing MPC_VoxelSky parameters: %s. Render target %s: %s. This is the "
+            "expected state until the ripple subsystem's two authoring steps land; the wind "
+            "wave field above is unaffected and the water is exactly the water it would be "
+            "with RippleFieldGain at 0. TO FIX: apply docs/water-interactive-ripples.md 8.1 to "
+            "create_sky_material.py, then re-run create_sky_material.py, "
+            "create_sky_atmosphere_dome_material.py, create_ripple_field_materials.py and this "
+            "script, in that order."
+            % (ripple_missing or "none",
+               ripple_field_graph.FIELD_TEXTURE,
+               "missing" if ripple_rt is None else "present"))
+        wave_grad_total = wave_grad_raw
+        wave_height_total = wave_height_m
+    else:
+        ripple = sample_ripple_field(bathy_b)
+        unreal.log(
+            "M_WaterVoxel RIPPLE FIELD ARM: PRESENT (%s bound, RippleFieldGain gates it at "
+            "runtime and the subsystem holds it at 0 until the first simulated frame exists)"
+            % ripple_field_graph.FIELD_TEXTURE)
+        wave_grad_total = bathy_b.add(wave_grad_raw, ripple["grad_xy"])
+        wave_height_total = bathy_b.add(wave_height_m, ripple["height_m"])
 
     # --- NORMAL -------------------------------------------------------------
     #
@@ -2634,27 +2810,23 @@ return float3(G * amp, H * amp);
     # SURFACE GRADIENTS rather than as blended normals. Summing gradients is the
     # only correct way to combine height fields -- averaging or lerping unit
     # normals systematically flattens slopes, which is how multi-octave water
-    # ends up looking like a bin liner. The gradient sum happens inside the loop
-    # above; this is just the assembly.
+    # ends up looking like a bin liner. The eight-octave gradient sum happens
+    # inside the WaveField node and the ripple is added to it immediately above;
+    # this is just the assembly.
     #
     # A top face's tangent basis is world-aligned (tangent=X, bitangent=Y,
     # normal=Z -- VoxelQuadVertexFactory.ush's per-axis RotateLocalToWorld for
     # an Axis==2 face), and the far-field sheets author the same basis
     # explicitly (FProcMeshTangent(1,0,0) with an up normal), so the X/Y
     # gradient lands in the directions it was computed in on BOTH draw paths.
-    wave_grad = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -540, 860)
-    wave_grad.set_editor_property("r", True)
-    wave_grad.set_editor_property("g", True)
-    wave_grad.set_editor_property("b", False)
-    wave_grad.set_editor_property("a", False)
-    if not mel.connect_material_expressions(wave, "", wave_grad, ""):
-        raise RuntimeError("connect wave -> wave_grad failed")
-
+    # THE LOCAL .xy MASK THAT USED TO BE HERE IS GONE. build_wave_field returns
+    # the gradient already masked off the float4 node, and the input here is now
+    # the SUM of that and the ripple, not the wave alone.
     neg_one = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -540, 940)
     neg_one.set_editor_property("r", -1.0)
     normal_xy_raw = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -380, 880)
-    if not mel.connect_material_expressions(wave_grad, "", normal_xy_raw, "A"):
-        raise RuntimeError("connect wave_grad -> normal_xy_raw.A failed")
+    if not mel.connect_material_expressions(wave_grad_total, "", normal_xy_raw, "A"):
+        raise RuntimeError("connect wave_grad_total -> normal_xy_raw.A failed")
     if not mel.connect_material_expressions(neg_one, "", normal_xy_raw, "B"):
         raise RuntimeError("connect neg_one -> normal_xy_raw.B failed")
 
@@ -2698,21 +2870,17 @@ return float3(G * amp, H * amp);
     # physical vertex compute identically. That was the reason the old WPO
     # ripple used absolute world position and refused the wrapped UV, and it is
     # unchanged -- it is now the reason the NORMAL uses it too.
-    wave_height_m = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -540, 1020)
-    wave_height_m.set_editor_property("r", False)
-    wave_height_m.set_editor_property("g", False)
-    wave_height_m.set_editor_property("b", True)
-    wave_height_m.set_editor_property("a", False)
-    if not mel.connect_material_expressions(wave, "", wave_height_m, ""):
-        raise RuntimeError("connect wave -> wave_height_m failed")
-
+    # The .z mask that used to be built here is gone for the same reason as the
+    # gradient's: build_wave_field returns height_m already masked, and what is
+    # displaced is the SUM of the wave and the ripple.
+    #
     # metres -> UU, and take the displacement fraction. 100.0 is the engine's
     # cm-per-metre, the same constant the UU->m conversion above inverts.
     m_to_uu = mel.create_material_expression(material, unreal.MaterialExpressionConstant, -540, 1100)
     m_to_uu.set_editor_property("r", 100.0)
     wave_height_uu = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -380, 1040)
-    if not mel.connect_material_expressions(wave_height_m, "", wave_height_uu, "A"):
-        raise RuntimeError("connect wave_height_m -> wave_height_uu.A failed")
+    if not mel.connect_material_expressions(wave_height_total, "", wave_height_uu, "A"):
+        raise RuntimeError("connect wave_height_total -> wave_height_uu.A failed")
     if not mel.connect_material_expressions(m_to_uu, "", wave_height_uu, "B"):
         raise RuntimeError("connect m_to_uu -> wave_height_uu.B failed")
 
@@ -2855,9 +3023,15 @@ return float3(G * amp, H * amp);
     # animation", which is the exact conclusion this arm exists to test.
     #
     # There is exactly ONE MaterialExpressionTime in this graph (it feeds the
-    # normal waves and the WPO waves both), so the count is 1 when live and 0
+    # normal, the WPO and the breaking foam), so the count is 1 when live and 0
     # when frozen. -1 is UNKNOWN and is deliberately not 0 -- see the star arm's
     # note on why reporting a bindings failure as an absence is the worse lie.
+    #
+    # THE ASSERTION STILL HOLDS AFTER THE WAVE AND RIPPLE MODULES LANDED, and it
+    # was checked rather than assumed: neither creates a Time node.
+    # build_wave_field takes time as an ARGUMENT (that is why the signature has
+    # one -- water_wave_graph.py:1026-1031), and the ripple's animation lives in
+    # the render target's simulation, not in this material.
     time_nodes = -1
     for getter in ("expression_collection", "expressions"):
         try:
@@ -2902,6 +3076,32 @@ return float3(G * amp, H * amp);
                   SHORE_FX_ENV,
                   os.environ.get(SHORE_FX_ENV, "<unset>"),
                   0.55 if SHORE_FX else 0.0))
+
+    # --- AND THE WIND-WAVE ARM ------------------------------------------------
+    #
+    # INTENT, NOT A READ-BACK, and flagged as such for exactly the reason the
+    # shore-fx arm above is: this arm changes five scalar DEFAULT VALUES and
+    # nothing else about the graph's shape, which is what makes it a clean A/B
+    # and also what makes it invisible to a node census. The way to check the
+    # ARTEFACT is to read the five defaults back off the saved .uasset, the same
+    # thing tools/voxel-shore-fx-ab.ps1 does for BathyFoamGain.
+    #
+    # THE DEFAULT ARM IS THE WIND ONE AND IT IS A VISIBLE CHANGE TO THE WATER.
+    # Read it in the log as a statement that the lake is deliberately not the
+    # lake of 2026-08-12: waves steered into a cone about the wind, reaching the
+    # beach roughly four times taller, and breaking white where the bed shelves.
+    unreal.log("M_WaterVoxel WIND WAVE ARM: %s (%s=%r, "
+               "WindDirectionAuthority=%g, BreakSurfFloorM=%g, BreakFoamGain=%g, "
+               "BreakPeakGain=%g, BreakShoalGain=%g)"
+               % ("LEGACY (pre-wind field, reproduces 2026-08-12)" if LEGACY_WAVES
+                  else "WIND-DRIVEN (ACTIVE -- deliberately not the 2026-08-12 water)",
+                  LEGACY_WAVES_ENV,
+                  os.environ.get(LEGACY_WAVES_ENV, "<unset>"),
+                  WAVE_DEFAULTS["WindDirectionAuthority"],
+                  WAVE_DEFAULTS["BreakSurfFloorM"],
+                  WAVE_DEFAULTS["BreakFoamGain"],
+                  WAVE_DEFAULTS["BreakPeakGain"],
+                  WAVE_DEFAULTS["BreakShoalGain"]))
 
     unreal.log("M_WaterVoxel STAR REFLECTION ARM: %s (%s=%r, StarmapTex params=%s)"
                % ("ON" if STAR_REFLECTION else "OFF",

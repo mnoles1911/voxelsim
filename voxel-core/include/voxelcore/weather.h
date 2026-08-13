@@ -157,8 +157,24 @@
 //              that clock freezes this field exactly; see the subsystem.
 //   speed      millimetres per second. 6000 == 6 m/s.
 //   bearing    milli-degrees, [0, 360000), COMPASS convention: 0 is north,
-//              90000 is east. That matches the world's axes as
-//              VoxelEphemeris.cpp:289 fixes them -- +Y is north, +X is east.
+//              90000 is east.
+//
+// THE WORLD'S AXES ARE X = NORTH, Y = EAST, Z = UP, and this comment said the
+// opposite until 2026-08-13. It read "+Y is north, +X is east", citing
+// VoxelEphemeris.cpp:289 -- and the advection in sampleWind faithfully
+// implemented that, which put the synoptic pattern about 90 degrees off the
+// bearing it is documented to travel along.
+//
+// :289 is the OUTLIER, not the authority. VoxelEphemeris.h:43-45 states the
+// convention outright, and DirectionFromAltAz backs it in code: with azimuth
+// measured clockwise from north, Direction.x = cos(azimuth), which is the north
+// component. GeoFromWorldUU at :289 takes latitude from Y, which disagrees with
+// both and is a pre-existing inconsistency this file should not have adopted.
+//
+// GETTING THIS WRONG HAS NO SYMPTOM, which is why it needs saying here rather
+// than being left to the reader. The noise is statistically isotropic, so a
+// field advected along the wrong axis still looks exactly like weather. Only a
+// stated property is false, and no screenshot can show you that.
 //
 // THE SIGN CONVENTION. `east/north` in WindSample is the direction the air
 // TRAVELS. `fromBearingMilliDeg` is the direction it COMES FROM, which is what
@@ -565,8 +581,26 @@ constexpr WindSample sampleWind(uint64_t worldSeed, int64_t xMm, int64_t yMm, in
     // pattern appear to arrive from upwind. Get this backwards and the weather
     // recedes from the direction the wind is blowing, which looks wrong in a
     // way that is very hard to name.
-    const int64_t ax = xMm - windMulQ(advectMm, advectDir.eastQ);
-    const int64_t ay = yMm - windMulQ(advectMm, advectDir.northQ);
+    //
+    // x TAKES THE NORTH COMPONENT AND y TAKES THE EAST ONE, AND THESE WERE THE
+    // OTHER WAY ROUND UNTIL 2026-08-13. Applying the east component to x and the
+    // north component to y reflects the advection direction about the
+    // 45-degree diagonal (bearing theta becomes 90 - theta), so the synoptic
+    // pattern travelled roughly across the prevailing wind instead of along it.
+    //
+    // It produced a perfectly good-looking field -- the noise is statistically
+    // isotropic, so a wrongly-rotated advection is still a valid random field,
+    // just not the one every comment here describes. Nothing about the output
+    // looks wrong; only the stated property "weather is advected along the base
+    // bearing" was false. That is why it survived: there is no symptom.
+    //
+    // The root cause was a comment. The header said "+Y is north, +X is east",
+    // citing VoxelEphemeris.cpp:289, and this code faithfully implemented it.
+    // The engine is X = NORTH, Y = east (VoxelEphemeris.h:43-45, and
+    // DirectionFromAltAz where X = cos(azimuth)); :289 is itself the outlier,
+    // taking latitude from Y. See the axis note at the top of this file.
+    const int64_t ax = xMm - windMulQ(advectMm, advectDir.northQ);
+    const int64_t ay = yMm - windMulQ(advectMm, advectDir.eastQ);
 
     // --- the two place-dependent bands --------------------------------------
     const int64_t synTurn = windNoiseXYT(s, ax, ay, tMs, p.synopticLatticeMm, p.synopticLatticeMs,
@@ -608,9 +642,29 @@ constexpr WindSample sampleWind(uint64_t worldSeed, int64_t xMm, int64_t yMm, in
     }
     if (speed > p.maxSpeedMmPerS) {
         speed = p.maxSpeedMmPerS;
-        // Keep the stated invariant speed == sustained + gust true even when
-        // the rail fires. A report whose parts do not add up is how a rail
-        // gets mistaken for a modelling bug.
+        // SUSTAINED IS RAILED TOO, AND IT WAS NOT UNTIL 2026-08-13. The old code
+        // clamped `speed`, then back-solved `gust = speed - sustained` and left
+        // `sustained` alone -- so a pinned 60 m/s reported speed 40, sustained
+        // 60, gust -20 (reproduce with:
+        // vxc_windprobe 20260719 --pin-speed 60). Two things were wrong with
+        // that, and the second one is the expensive one:
+        //
+        //   * The documented invariant "gust is within +/-25% of sustained"
+        //     (asserted in test_weather.cpp) is false whenever the rail fires.
+        //
+        //   * UVoxelWeatherSubsystem::PublishWind sends direction * SUSTAINED,
+        //     not * speed. So the water would have been driven at 60 m/s while
+        //     every log line, and the probe, said 40 -- a 1.5x wave amplitude
+        //     with no way to see where it came from. Reachable from legal
+        //     cvars: voxel.Weather.BaseWindMps 6 with WindScale 8.
+        //
+        // Railing sustained as well means every scalar this function returns is
+        // bounded by maxSpeedMmPerS, so it does not matter which one a consumer
+        // reaches for -- which is the property that makes the rail a rail
+        // rather than a suggestion.
+        if (sustained > speed) {
+            sustained = speed;
+        }
         gust = speed - sustained;
     }
 

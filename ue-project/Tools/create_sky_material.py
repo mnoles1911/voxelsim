@@ -508,6 +508,29 @@ SCALAR_PARAMS = [
     # safely, rather than to a plausible-looking wrong one.
     ("BathyFieldInvSize", 0.0),
     ("BathyFieldValid", 0.0),
+    # THE INTERACTIVE RIPPLE WINDOW, read by M_WaterVoxel and written EVERY
+    # FRAME by UVoxelRippleFieldSubsystem (VoxelRippleField.cpp) -- unlike the
+    # bathymetry window, which only moves when the camera leaves its texel.
+    #
+    #   RippleFieldInvSize -- 1 / (window width in UE units) = 1 / 5120, for a
+    #                         51.2 m square at one texel per 10 cm voxel.
+    #   RippleFieldGain    -- global strength, and the feature's off switch.
+    #
+    # DEFAULT 0 ON BOTH, same discipline as BathyFieldValid: an undriven InvSize
+    # of anything nonzero maps the whole world onto one texel, and Gain 0 makes
+    # every consumer ignore the field regardless. So a collection nobody is
+    # driving fails to water-without-ripples, which is a known-good picture,
+    # rather than to a plausible wrong one.
+    #
+    # THESE ARE NOT OPTIONAL ONCE THE WATER MATERIAL SAMPLES THE FIELD.
+    # sample_ripple_field goes through a CHECKED collection_param that RAISES on
+    # a missing name -- deliberately, because an unresolved CollectionParameter
+    # otherwise compiles to a silent CONSTANT. So the water generator will refuse
+    # to build rather than quietly produce rippleless water, which is the right
+    # failure but does mean these three and the water-side call site must land in
+    # the same regeneration.
+    ("RippleFieldInvSize", 0.0),
+    ("RippleFieldGain", 0.0),
     # 1 while UVoxelWeatherSubsystem is publishing wind, 0 otherwise. The partner
     # of WindVectorMS below, and the same discipline as BathyFieldValid above:
     # every wind consumer gates on this and falls back to its own constants when
@@ -562,6 +585,10 @@ VECTOR_PARAMS = [
     # calm water rather than a plausible-looking wrong wind, which is the
     # failure that reports itself.
     ("WindVectorMS", 0.0, 0.0, 0.0, 0.0),
+    # World UU of the ripple window's MINIMUM corner, in xy; z and w unused.
+    # Partner of the two RippleField scalars above. Zero is as good a default as
+    # any -- with RippleFieldGain at 0 nothing reads it.
+    ("RippleFieldOrigin", 0.0, 0.0, 0.0, 0.0),
 ]
 
 

@@ -134,6 +134,13 @@ if ($live.Count -gt 0) {
 $ORDER = @(
     'create_sky_material.py',                 # authors the collection
     'create_sky_atmosphere_dome_material.py',
+    # BEFORE the water material, and the arrow is load-bearing in both
+    # directions. After the sky, because the ripple step material binds the
+    # collection like everything else. Before the water, because
+    # sample_ripple_field loads /Game/Voxel/RT_VoxelRippleField BY NAME and
+    # raises if it is absent -- so the water generator cannot build until the
+    # ripple assets exist.
+    'create_ripple_field_materials.py',
     'create_water_voxel_material.py',
     'create_underwater_material.py',
     # THE TWO TERRAIN MATERIALS ARE SKY DEPENDENTS, WHICH IS NOT OBVIOUS AND WAS
@@ -168,7 +175,10 @@ $NOT_A_GENERATOR = @(
 # Generators that bind the collection but are NOT yet wired into the game. They
 # are skipped rather than silently ignored, and the skip is printed -- an
 # unlisted-but-skipped file is how the next M_Underwater happens.
-$NOT_YET_WIRED = @('create_ripple_field_materials.py')
+#
+# EMPTY as of 2026-08-13: create_ripple_field_materials.py graduated into $ORDER
+# when the water material started sampling the ripple field.
+$NOT_YET_WIRED = @()
 
 # WHAT COUNTS AS BINDING THE COLLECTION, AND WHY THE FIRST VERSION OF THIS SCAN
 # WAS WRONG.
@@ -235,10 +245,35 @@ foreach ($s in ($(if ($CaptureOnly) { @() } else { $toRun }))) {
     $log = Join-Path $LogDir ("regen-" + ($s -replace '\.py$','') + '.log')
     $logs += $log
     Write-Host "=== $s -> $log" -ForegroundColor Cyan
-    $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList @(
+    # -AllowCommandletRendering, and only where it is needed.
+    #
+    # Without it the commandlet comes up with rhiname="Null" (confirmed in the
+    # log: NullDrv is loaded). Materials are perfectly happy with that -- they
+    # are assets, not GPU resources -- which is why every generator in this
+    # chain ran headless for months without anyone needing the flag.
+    #
+    # A RENDER TARGET IS NOT. create_ripple_field_materials.py builds three of
+    # them, and on a null RHI AssetTools::create_asset returns None, so the
+    # script raised "Failed to create render target asset at
+    # /Game/Voxel/RT_VoxelRippleStateA" -- a clean, loud failure, but one whose
+    # message says nothing about the RHI and would send the next person into the
+    # factory bindings instead.
+    #
+    # The water script gets it for a different reason, documented in
+    # voxel-water-star-regen.ps1: without a real RHI no shader map is built and
+    # MaterialEditingLibrary.get_statistics returns every field as 0 -- a zero
+    # indistinguishable from a genuinely free material.
+    #
+    # The rest are left on the cheaper path deliberately: the flag costs real
+    # startup time, and a generator that does not need it should not pay it.
+    $extra = @()
+    if ($s -eq 'create_ripple_field_materials.py' -or $s -eq 'create_water_voxel_material.py') {
+        $extra += '-AllowCommandletRendering'
+    }
+    $p = Start-Process -FilePath $Editor -PassThru -WindowStyle Hidden -ArgumentList (@(
         "`"$Project`"", '-run=pythonscript', "-script=`"$Tools\$s`"",
         '-unattended', '-nop4', '-nosplash', "-abslog=`"$log`""
-    )
+    ) + $extra)
     $p.WaitForExit($TimeoutSec * 1000) | Out-Null
     if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force; throw "$s TIMED OUT after ${TimeoutSec}s -- see $log" }
 
@@ -265,19 +300,87 @@ if ($CaptureOnly) {
     }
     Write-Host "=== -CaptureOnly: verifying against $($logs.Count) existing regeneration logs" -ForegroundColor Cyan
 }
+# A COMPILE FAILURE IN AN INTERMEDIATE LOG IS EXPECTED, AND TREATING IT AS FATAL
+# WAS WRONG.
+#
+# The first version threw on any "Failed to compile Material" in any
+# generator's log. That is a false positive by construction, and it stopped a
+# chain that had actually worked.
+#
+# The reason: each generator runs its own editor, and that editor LOADS every
+# material in the project. Between recreating MPC_VoxelSky and rebuilding
+# dependent N, every dependent after N is still bound to the collection that no
+# longer exists -- so it fails to compile, loudly, in the log of whichever
+# generator happens to be running at the time. Observed exactly that: the
+# ripple generator's log carries 16 "CollectionParameter has invalid parameter
+# None" errors against M_WaterVoxel, which the very next step rebuilt correctly.
+# The same session also logged "Param2D> Found NULL" for the ripple texture the
+# water material had not been rebuilt to point at yet.
+#
+# In other words the intermediate logs record the chain MID-FLIGHT, and the
+# whole reason the chain exists is that mid-flight is broken. Only the FINAL
+# state is a claim about anything.
+#
+# So these are reported and not thrown on, and the authoritative check moved to
+# the capture below -- a fresh editor that loads everything after all
+# regeneration is done. That is also where the real 2026-08-13 breakage was
+# caught (M_VoxelTerrain, drawing as the default material), because a load-time
+# failure never appears in a generation log at all.
 $failed = @()
 foreach ($log in $logs) { $failed += @(Select-String -Path $log -SimpleMatch 'Failed to compile Material' -ErrorAction SilentlyContinue) }
 if ($failed.Count -gt 0) {
-    $failed | Select-Object -First 10 | ForEach-Object { Write-Host "    $($_.Line)" -ForegroundColor Red }
-    throw ("$($failed.Count) material compile failure(s). A material that fails to compile is replaced " +
-           "by the engine DEFAULT, which renders, and renders fast -- so nothing downstream will " +
-           "report this for you.")
+    Write-Host ("=== $($failed.Count) compile failure(s) in intermediate logs -- EXPECTED mid-chain, " +
+                "see the note here. The capture below is the check that counts.") -ForegroundColor Yellow
+    $failed | Select-Object -First 4 | ForEach-Object { Write-Host "    $($_.Line -replace '^.*?(Failed to compile)','$1')" -ForegroundColor DarkYellow }
 }
-Write-Host '=== no compile failures in any log' -ForegroundColor Green
+else { Write-Host '=== no compile failures in any generation log' -ForegroundColor Green }
 
 if ($SkipCapture) { Write-Host 'CAPTURE SKIPPED -- the chain is UNVERIFIED where it matters most.' -ForegroundColor Yellow; return }
 
 # --- THE CHECK THAT IS ACTUALLY WORTH SOMETHING ------------------------------
+# --- MAKE voxelcore.lib GENUINELY NEWEST BEFORE THE CAPTURE GUARD LOOKS -------
+#
+# voxel-capture.ps1 refuses to shoot when any file under voxel-core/src or
+# /include is newer than the compiled voxelcore.lib, because UBT does not track
+# those sources: Build.bat prints "Result: Succeeded" while linking a lib from
+# hours ago, and the failure is not a link error, it is WRONG TERRAIN. That
+# guard is correct and must not be weakened.
+#
+# But it compares against EVERY file in those directories, including headers no
+# translation unit in the lib includes. voxelcore/weather.h is one: nothing in
+# voxel-core/src consumes it (its callers are the tests, a bench and two UE
+# translation units), so editing it leaves the lib legitimately unchanged and
+# legitimately older. The guard then refuses a capture that would have been
+# perfectly valid. That happened three times on 2026-08-13 alone, and each time
+# the "fix" was a human touching an unrelated .cpp -- which is a ritual, not a
+# repair, and the sort of thing that eventually gets replaced by weakening the
+# guard.
+#
+# So the chain does it properly and in the ONLY order that works:
+#   voxelcore first, so the lib postdates every source;
+#   then the UE module, so the DLL postdates the lib -- the guard checks that
+#   too, and rebuilding the lib alone does NOT trigger a relink because UBT
+#   still sees no changed input.
+# Reversing these two leaves the DLL older than the lib and the guard fires on
+# the second of its two checks instead of the first.
+if (-not $SkipCapture) {
+    Write-Host '=== refreshing voxelcore.lib and the module so the capture guard is satisfied' -ForegroundColor Cyan
+    (Get-Item (Join-Path $Root 'voxel-core\src\tilestore.cpp')).LastWriteTime = Get-Date
+    & cmake --build (Join-Path $Root 'build\voxel-core-msvc') --config Release --target voxelcore 2>&1 | Select-Object -Last 2
+    if ($LASTEXITCODE -ne 0) { throw "voxel-core relink FAILED (exit $LASTEXITCODE)" }
+    # TOUCH A UE SOURCE FIRST, OR Build.bat DOES NOTHING. UBT does not track
+    # voxel-core, so after the lib is rebuilt it still sees no changed input and
+    # declines to relink -- leaving the DLL older than the lib, which is the
+    # capture guard's SECOND check. Rebuilding the lib alone therefore trades one
+    # refusal for another, and that is exactly what happened on the first run of
+    # this block. The guard's own message says to do this; follow it.
+    (Get-Item (Join-Path $Root 'ue-project\Source\VoxelEarth\VoxelOceanActor.cpp')).LastWriteTime = Get-Date
+    $blog = Join-Path $Root 'Saved\build-chain-relink.log'
+    & 'D:\UE_5.8\Engine\Build\BatchFiles\Build.bat' VoxelEarthEditor Win64 Development `
+        -Project="$Project" -WaitMutex *>&1 | Tee-Object -FilePath $blog | Select-Object -Last 3
+    if ($LASTEXITCODE -ne 0) { throw "module relink FAILED (exit $LASTEXITCODE) -- see $blog" }
+}
+
 if (-not (Test-Path $ReferencePng)) { throw "reference frame not found: $ReferencePng" }
 Write-Host "=== CAPTURE at the pinned pose, to compare against $(Split-Path $ReferencePng -Leaf)" -ForegroundColor Cyan
 $shot = & (Join-Path $PSScriptRoot 'voxel-capture.ps1') `
@@ -285,6 +388,26 @@ $shot = & (Join-Path $PSScriptRoot 'voxel-capture.ps1') `
     -Width 2560 -Height 1440 -TimeOfDay $TimeOfDay -Date $Date -SettleSec $SettleSec |
     Select-Object -Last 1
 if (-not $shot -or -not (Test-Path $shot)) { throw 'verification capture produced no image' }
+
+# THE AUTHORITATIVE COMPILE CHECK, on a fresh editor that loaded everything
+# after all regeneration finished. A material that fails HERE is broken in the
+# shipped state, not mid-chain -- and note that this is a LOAD-time failure,
+# which never appears in a generation log at all. This is precisely how
+# M_VoxelTerrain was caught drawing as the engine default on 2026-08-13, after
+# four generation logs reported success and meant it.
+$capLog = Join-Path $Root ("Saved\capture-skychain-verify.log")
+if (Test-Path $capLog) {
+    $loadFail = @(Select-String -Path $capLog -SimpleMatch 'Failed to compile Material' -ErrorAction SilentlyContinue)
+    if ($loadFail.Count -gt 0) {
+        $loadFail | Select-Object -First 6 | ForEach-Object { Write-Host "    $($_.Line -replace '^.*?(Failed to compile)','$1')" -ForegroundColor Red }
+        throw ("$($loadFail.Count) material(s) FAILED TO COMPILE AT LOAD TIME in the verification run. " +
+               "These are drawing as the engine DEFAULT MATERIAL in the shipped state. Rebuild the " +
+               "named material(s) with -Only; if one is not in `$ORDER, it is an undiscovered dependent " +
+               "and belongs there.")
+    }
+    Write-Host '=== no load-time compile failures in the verification run' -ForegroundColor Green
+}
+else { Write-Warning "no capture log at $capLog -- load-time compile failures UNCHECKED." }
 
 $diff = & python (Join-Path $PSScriptRoot 'imgdiff.py') $ReferencePng $shot --where 2>&1
 $diff | ForEach-Object { Write-Host "  $_" }

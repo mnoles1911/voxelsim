@@ -30,6 +30,7 @@
 #include "voxelcore/weather.h"
 
 #include <cstdint>
+#include <cstdio>  // std::printf, for the margin this test reports either way
 #include <cstdlib> // std::abs for the integer overloads
 
 using namespace vxc;
@@ -57,13 +58,41 @@ struct Reference {
     int32_t east, north, speed, sustained, gust, fromMilliDeg;
 };
 
-// Produced by the Python integer mirror; see this file's header.
+// TWO OF THESE FIVE ROWS ARE STILL INDEPENDENT EVIDENCE. THREE ARE NOW ONLY
+// REGRESSION PINS, and the difference matters when one of them next fails.
+//
+// On 2026-08-13 sampleWind's advection was found to apply the EAST component of
+// the advection direction to the x (NORTH) coordinate and vice versa -- it was
+// implementing this header's own axis comment, which was itself wrong. Fixing it
+// moved the field wherever advection is non-zero.
+//
+// The two t=0 rows did NOT move, and could not have: advectMm is zero there, so
+// ax==xMm and ay==yMm whichever component is applied. They still hold their
+// original meaning -- produced by a Python integer mirror written from the
+// specification by a different route, so agreement is evidence.
+//
+// The three advected rows below were REGENERATED FROM THIS C++ after the fix,
+// because the mirror lives in a scratch file that was not kept and still
+// implements the old swap. That makes them tautological: they will detect an
+// unintended change to the field, which is worth having, but they can no longer
+// tell you the field is CORRECT. Do not cite them as though they could.
+//
+// That every one of the three still satisfies sustained + gust == speed
+// (5435+1103=6538, 8016-780=7236, 8237+613=8850) is a real check that survived
+// the regeneration, and it is the invariant the speed rail had been breaking.
+//
+// THE FOLLOW-UP, and it is now two things: re-derive the mirror with the
+// corrected advection and restore these three rows to evidence, and add the
+// swept golden digest the header asks for. Until the first is done this test is
+// weaker than its header claims.
 constexpr Reference kReference[] = {
+    // t = 0: independent (mirror-derived, unaffected by the advection fix).
     {0, 0, 0, -7033, 1834, 7298, 9270, -1972, 104623},
     {0, 0, 1000, -7135, 1834, 7397, 9259, -1862, 104426},
-    {1'000'000, -2'000'000, 3'600'000, -8415, 3363, 9073, 7541, 1532, 111782},
-    {-123'456'789, 987'654'321, 86'400'000, 741, -3358, 3446, 3817, -371, 347548},
-    {2'048'000, 2'048'000, 600'000, -3475, 1162, 3681, 3427, 254, 108493},
+    // advected: regression pins, regenerated 2026-08-13. See above.
+    {1'000'000, -2'000'000, 3'600'000, -5885, 2791, 6538, 5435, 1103, 115382},
+    {-123'456'789, 987'654'321, 86'400'000, 2966, -6579, 7236, 8016, -780, 335727},
+    {2'048'000, 2'048'000, 600'000, -8508, -2289, 8850, 8237, 613, 74933},
 };
 
 } // namespace
@@ -265,6 +294,53 @@ VXC_TEST(wind_pins_exactly) {
         if (w.gustMmPerS != 0) sawGust = true;
     }
     CHECK(sawGust); // ran-flag: a pinned bearing must not silently pin the speed too
+}
+
+VXC_TEST(wind_is_never_calm) {
+    // THE OWNER'S REQUIREMENT, 2026-08-13, stated as a test: "our weather system
+    // should be such that there is almost always at least some breeze."
+    //
+    // It was already true when he asked, and that is exactly why this test
+    // exists. The floor is a CONSEQUENCE of three parameters rather than
+    // anything that enforces it:
+    //
+    //     sustained  = baseSpeedMmPerS * [1 - synopticSpeedSpanQ .. 1 + ...]
+    //                = 6000 * [0.35 .. 1.65]
+    //     speed      = sustained * [1 - gustFractionQ .. 1 + gustFractionQ]
+    //     worst case = 6000 * 0.35 * 0.75 = 1575 mm/s
+    //
+    // So nudging synopticSpeedSpanQ toward 1.0 during tuning -- an obviously
+    // reasonable thing to want, it widens the weather -- silently takes the
+    // floor to zero and hands the lake a dead calm. Nothing would fail, and the
+    // symptom would appear hours later as a mirror-flat pond that nobody could
+    // explain.
+    //
+    // WHY A CALM MATTERS MORE THAN IT SOUNDS: the water material's amplitude
+    // scale is u^1 and is deliberately NOT floored -- glass at zero wind is the
+    // owner's decision and the feature reading true. This field is therefore
+    // the ONLY thing standing between the shipped defaults and a glass lake.
+    //
+    // The bar is 1.0 m/s, comfortably under the 1.575 the parameters imply, so
+    // this fails on a real regression rather than on tuning within the intended
+    // envelope. Deliberately NOT pinned at 1.575: that would make the test a
+    // restatement of the arithmetic instead of a statement of the requirement.
+    const WindParams p{};
+    Stream rng(90210);
+    int32_t lowest = INT32_MAX;
+    constexpr int32_t kBreezeFloorMmPerS = 1000;
+    constexpr int kSamples = 20000;
+    for (int i = 0; i < kSamples; ++i) {
+        const WindSample w = sampleWind(kSeed, rng.sym(1'000'000'000LL), rng.sym(1'000'000'000LL),
+                                        rng.pos(1'000'000'000LL), p);
+        if (w.speedMmPerS < lowest) {
+            lowest = w.speedMmPerS;
+        }
+    }
+    CHECK(lowest >= kBreezeFloorMmPerS);
+    // Reported whether or not it passes: the margin is the interesting number,
+    // and a run that passes at 1005 mm/s is a warning that a later one will not.
+    std::printf("    lowest speed over %d samples: %d mm/s (floor %d)\n",
+                kSamples, lowest, kBreezeFloorMmPerS);
 }
 
 VXC_TEST(wind_differs_from_place_to_place) {
