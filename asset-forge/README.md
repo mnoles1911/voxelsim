@@ -8,6 +8,7 @@ What it is for and where it goes: `docs/tree-asset-generator-plan.md`.
 Why the fish are shaped the way they are: `docs/fish-shape-research.md`.
 What changes at 25 metres: `docs/marine-megafauna-research.md`.
 Why a marking can have a shape, and which sex you get: `docs/marine-marking-research.md`.
+Which birds have a sex worth drawing, and which twelve do not: `docs/bird-dimorphism-research.md`.
 What fish colour needs from the engine: `docs/fish-colour-proposal.md`.
 How the heroes hid a defect behind a single seed: `docs/hero-sequoia-wood-detachment.md`.
 
@@ -910,6 +911,77 @@ through the grid's own mid-plane, which is why the voxel half of the check is
 that narrow — the two poses genuinely do not rasterise on the same lattice, and
 saying so is better than a tolerance.
 
+### Male and female
+
+Sourced species by species in `docs/bird-dimorphism-research.md`, with the
+rejections carrying the numbers that decided them.
+
+**In fish, sexual difference is size. In birds it is colour**, and that one
+sentence is the whole design. `fish.sex` got twenty-three species out of three
+ratios and a square root, because what separates a bull orca from a cow is the
+height of a fin. The largest difference between two animals of one species
+anywhere in this library is a mallard drake against a hen — bottle-green head,
+white collar, grey body and yellow bill against uniform mottled brown — and
+**not one voxel of it is a proportion**. So `bird.sex` drives two mechanisms.
+
+**The size half is the fish rule verbatim.** `bird.sex_length` and
+`bird.sex_tail` are male-to-female ratios, applied as `sqrt(r)` and
+`1/sqrt(r)`, so male ÷ female is exactly the ratio, the authored number is the
+species average and neither sex is the default. Three species carry a length
+ratio and one a tail ratio. Unlike the fish, **three of the four are the female
+being larger** — reversed sexual size dimorphism is the rule for raptors, and
+the golden eagle at 0.93 (wingspans 2.02 m against 2.16 m) is the largest
+size difference in the set.
+
+**The colour half cannot be, and says so.** There is no average of a green head
+and a brown one, so a dimorphic species is authored as ONE sex,
+`bird.sex_plumage` names which, seven `materials.bird_alt_*` rows and three
+`bird.sex_alt_*_mark` rows say what the other sex swaps, and `unsexed` draws
+the authored one. `same` on any row means "whatever the species carries", so a
+great spotted woodpecker — whose entire published difference is that the male
+has a crimson nape and the female does not — authors one row and not ten.
+**That limitation is printed by the probe on every run**, listing the four
+species where `unsexed` is really one of the sexes.
+
+**Eight of the twenty carry a difference and twelve are an honest null** —
+1.00, 1.00, `same`, and measured moving no geometry at all. The rejections are
+where the work is: a tawny owl's females are 5% longer, which is **1.6 voxels**;
+a kestrel's size difference is 1.9; every passerine here needs 8–17% linear
+dimorphism before the difference is a voxel and a half, and passerines have
+2–4%. A kingfisher's female has an orange lower mandible and **the bill is one
+voxel deep**. A starling's sexes differ in bill-base colour, throat hackles and
+iris — three voxels, no feather texture, and a two-voxel eye.
+
+**No bird's authored numbers were re-authored.** The aquatic work moved three
+specs off male references; the same check run here — apply both square roots and
+test each result against that sex's published range — lands every species
+inside. But four specs *were* authored at one sex, in their COLOURS, which is
+the same trap through a different door and could not be fixed the same way. It
+is declared instead.
+
+**Sex reseeds, which is the opposite of what the pose does**, and the section
+above is why that needs saying twice. There is no individual that is "the same
+mallard, but female", so `bird.sex` is deliberately not in `SEED_INVARIANT` —
+and `--sex` checks the hashes differ on all twenty species, including the twelve
+that look identical, because on those it is the only thing separating "no
+dimorphism" from "the parameter never reached the build".
+
+    python tools/birdprobe.py --sex        # male against female, in voxels
+    python tools/birdprobe.py --sex-ab     # out/birds/birds-sex-ab.png
+
+`--sex` reports the movement in voxels, the repainted area **against each
+species' own marking-phase noise** (a 314-voxel song thrush moves 6% of its
+histogram between two individuals without a single decision differing, because
+its speckle quantile keeps the count and not the positions), and two tables that
+exist because of holes found while building it. Six of the seven colour slots
+are used by one species and two of the ten rows by none, so **every `alt` row is
+exercised on a rig** that authors none of them, with a control that it does not
+leak to the sex the spec is authored as. And **the other sex's colours are put
+through the same contrast floor `--read` uses** — which caught a real defect on
+its first run: the hen mallard, left at the drake's yellow bill, measured 1.20
+against her buff head. An invisible bill, which is the exact defect ten of these
+twenty species shipped once before.
+
 ### Wing planforms
 
 Savile's 1957 classification maps almost one-to-one onto groups a player would
@@ -1078,6 +1150,8 @@ written into one literal the bird entries silently replaced the fish ones.
     python tools/birdprobe.py --lattice   # 1 cm against 2 cm and 5 cm
     python tools/birdprobe.py --pose      # folded against spread, one piece, one bird
     python tools/birdprobe.py --pose-ab   # the pose A/B render
+    python tools/birdprobe.py --sex       # male against female, in voxels
+    python tools/birdprobe.py --sex-ab    # the sex A/B render
 
 Same idea as `fishprobe.py` and a harder problem, because a bird is six parts
 and a measurement taken off the whole animal is usually dominated by the wrong

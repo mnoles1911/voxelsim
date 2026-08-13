@@ -882,12 +882,237 @@ SPECIES = {
 }
 
 
+# --- the sexes ---------------------------------------------------------------
+#
+# HELD IN THEIR OWN TABLE rather than folded into the twenty entries above, and
+# not for tidiness. The species entries are what a bird IS; this is a claim
+# about how far apart its two sexes are, every row of it is traced to a quoted
+# source in `docs/bird-dimorphism-research.md`, and it is the part most likely
+# to be revised when a biometrics table that is currently behind a 403 can be
+# read. Keeping it separable means the next person can diff eight rows instead
+# of reading twenty species.
+#
+# IT IS HERE AT ALL BECAUSE THE ALTERNATIVE IS A SILENT REVERT. This script
+# refuses to overwrite an authored spec (see `tools/seedspec.py`, and the hero
+# arch that was reverted to draft values), so leaving the sexes out would not
+# damage anything today -- and would quietly drop every one of them the first
+# time somebody ran this with `--force` on a fresh checkout. `tools/seed_marine`
+# carries the fish ratios for the same reason.
+#
+# TWELVE SPECIES ARE ABSENT FROM THIS TABLE AND THAT IS THE FINDING. They have
+# no difference worth drawing at 1 cm -- a tawny owl's females are 5% longer,
+# which is 1.6 voxels; every passerine here would need 8-17% and has 2-4% --
+# and `tools/birdprobe.py --sex` measures them moving exactly zero.
+SEX = {
+    # Reversed size dimorphism: the female is the larger bird. Bortolotti 1984,
+    # 50 adult golden eagles, wing chord 595.0 mm male against 640.4 female.
+    "golden-eagle": b(sex_length=0.93),
+    # "Females average about 2-7% larger than males linearly"; wing-chord
+    # midpoints give 0.953 and a second compilation 0.972. The least certain
+    # number in the set -- see the research doc.
+    "common-buzzard": b(sex_length=0.95),
+    # The one species here where the MALE is bigger by enough to draw.
+    # Ingolfsson 1969 gives 1.054/1.076/1.067 for three populations and
+    # Threlfall & Jewer 1978 gives wing 1.047/1.057 over 464 birds.
+    "herring-gull": b(sex_length=1.06),
+    # The only tail ornament in the library. Male outer rectrices are 5% longer
+    # in Spain and 20% in Finland; the northern figure is the only one that
+    # survives the lattice, and even it is the marginal case at two columns.
+    "barn-swallow": b(sex_tail=1.20),
+    # --- and the four whose difference is COLOUR ----------------------------
+    #
+    # These four author their plumage as ONE SEX and say so. There is no average
+    # of a green head and a brown one, so `unsexed` draws the authored sex on
+    # these and nothing can be done about it except state it, which
+    # `bird.sex_plumage` is for.
+    "mallard-duck": b(
+        sex_plumage="male", sex_alt_head_mark="none",
+        mat_alt_head="plume_buff", mat_alt_back="skin_brown",
+        mat_alt_belly="plume_buff", mat_alt_wing="skin_brown",
+        # NOT left at the drake's yellow. On her buff head that measured a
+        # contrast ratio of 1.20 -- an invisible bill, which is the defect ten
+        # of these twenty species shipped once already.
+        mat_alt_bill="beak_horn"),
+    # Barred where he is spotted, IN THE SAME BROWN, which is why the marking
+    # has its own swap and a material swap could not have said it.
+    "common-kestrel": b(sex_plumage="male", sex_alt_body_mark="barred",
+                        mat_alt_head="plume_rufous"),
+    # One row, four voxels: he has a crimson nape and she has nothing there.
+    "great-spotted-woodpecker": b(sex_plumage="male", sex_alt_head_mark="none"),
+    # One row, twenty voxels: the crimson eye comb.
+    "rock-ptarmigan": b(sex_plumage="male", sex_alt_head_mark="none"),
+}
+
+# The prose that goes with it, appended to each species' own `notes`.
+#
+# HERE RATHER THAN ONLY ON DISK, because `tools/seedspec.py` exists to stop a
+# seed script HALF-reverting a species -- "harder to notice than a full revert
+# and impossible to undo by hand" is its own wording. Carrying the ratios above
+# without the paragraphs that justify them is exactly that: a `--force` run
+# would leave a golden eagle drawn at 0.93 with no surviving record of where
+# 0.93 came from.
+SEX_NOTES = {
+    "golden-eagle":
+        "SEX. Reversed size dimorphism, the largest of the three in "
+        "this set that carry it, and the best-measured number in the "
+        "library: Bortolotti 1984 gives 50 adults, wing chord 595.0 "
+        "mm for 23 males against 640.4 for 27 females -- 0.929 -- and "
+        "his eighth primary, first secondary and tail all land "
+        "between 0.933 and 0.938 as well. 0.93 is authored.\n\n"
+        "IT IS NOT A MASS RATIO AND THAT MATTERS. The same species is "
+        "3.69 kg against 5.17 kg, whose cube root is 0.89; authoring "
+        "that would have drawn an eagle half again as dimorphic as "
+        "she is. Where a source publishes both, the linear one wins.\n\n"
+        "NO TAIL RATIO, and Bortolotti is the reason there is not "
+        "one: her tail is 0.933 of his, which is the same ratio as "
+        "the rest of her, so `sex_length` already draws it. Plumage "
+        "is monomorphic -- \"adults of both sexes have similar "
+        "plumage and are primarily dark brown\".",
+    "common-buzzard":
+        "SEX. Reversed size dimorphism, stated linearly at the "
+        "source: \"females average about 2-7% larger than males "
+        "linearly and weigh about 15% more\". The wing chords agree -- "
+        "350-418 mm male against 374-432 mm female, midpoints 384 and "
+        "403, a ratio of 0.953 -- so 0.95 is authored. Plumage is "
+        "monomorphic, and this species is the most variable bird in "
+        "the set for reasons that have nothing to do with sex.",
+    "herring-gull":
+        "SEX. The only species here where the MALE is the larger bird "
+        "by enough to draw, and the number moved once during "
+        "authoring, which is worth recording. It was first set at "
+        "1.09 from a field-guide length range -- 60-67 cm male "
+        "against 55-62 cm female. Two primary biometric papers put it "
+        "lower and agree with each other, so 1.06 is what is "
+        "authored: Ingolfsson 1969 gives the linear ratio for three "
+        "L. argentatus populations as 1.054, 1.076 and 1.067, and "
+        "Threlfall & Jewer 1978 gives wing length 1.047 and 1.057 "
+        "across 464 birds in two populations, with tarsus at 1.077 "
+        "and 1.099.\n\n"
+        "AND THAT PAPER IS ALSO THE CAUTIONARY TALE. Ingolfsson's "
+        "Table 1 prints columns headed culmen, bill depth, tarsus, "
+        "wing and tail with values like 102.1 and 98.1, which read "
+        "exactly like measurements and are not: the footnote says "
+        "they are \"the ratio of male to female measurements expressed "
+        "as a percentage of the cube root of male over female "
+        "weights\". They are normalised indices, and 98.1 means a "
+        "male's wing is SHORTER than his overall size would predict, "
+        "not that females have longer wings. Reading them as "
+        "millimetres is how this project once shipped a fabricated "
+        "orca measurement. See docs/bird-dimorphism-research.md.\n\n"
+        "PLUMAGE IS MONOMORPHIC AND THE SOURCE SAYS SO OUTRIGHT: "
+        "\"male and female plumage are identical at all stages of "
+        "development, but adult males are often larger\".",
+    "barn-swallow":
+        "SEX. The only TAIL ornament in the set, and the only species "
+        "whose difference is a proportion rather than a colour. The "
+        "male's outer tail feathers are longer than the female's by "
+        "5% in Spain and 20% in Finland; 1.20 is authored, which is "
+        "the northern figure and the only one that survives the "
+        "lattice -- 1.05 moves the tail by a fifth of a voxel. Even "
+        "1.20 is the marginal case in this library, at two columns of "
+        "tail measured perched.\n\n"
+        "PLUMAGE IS LEFT MONOMORPHIC AND THAT IS A REJECTION, not an "
+        "oversight. The female's upperparts are \"less glossy\" and her "
+        "underparts \"paler\" -- a difference of INTENSITY, and the "
+        "palette has no duller blue-black between `plume_iridescent` "
+        "and `skin_dark`. Substituting `skin_dark` would say she is a "
+        "different colour rather than the same colour less bright.",
+    "mallard-duck":
+        "SEX, AND THIS IS THE FLAGSHIP CASE FOR THE WHOLE MECHANISM. "
+        "A drake against a hen is the largest single difference "
+        "between two animals of one species anywhere in this library "
+        "and not one voxel of it is a proportion: bottle-green head, "
+        "white collar, grey body and yellow bill against uniform "
+        "mottled brown. The colours above are the DRAKE'S, "
+        "`bird.sex_plumage` says so, and asking for the female swaps "
+        "the head, the back, the belly and the wing and drops the "
+        "collar.\n\n"
+        "THE SPECULUM IS DELIBERATELY NOT SWAPPED. \"Both male and "
+        "female mallards have distinct iridescent purple-blue "
+        "speculum feathers edged with white\" -- it is the one mark on "
+        "the bird that is identical in both sexes, which is exactly "
+        "why it is the field mark you identify a hen by.\n\n"
+        "AND THE HEN'S MOTTLING IS A REJECTION WITH A REASON. She is "
+        "\"predominantly mottled, with each individual feather showing "
+        "sharp contrast from buff to very dark brown\", which wants "
+        "`body_mark` set to speckled -- but `materials.bird_mark` is "
+        "ONE slot shared by the wing mark and the body mark, so "
+        "speckling her would repaint the speculum in the speckle's "
+        "colour and cost her the field mark. Two brown fields and the "
+        "blue speculum is the hen that fits the mechanism.\n\n"
+        "HER BILL HAD TO CHANGE TOO, AND THE PROBE FOUND IT RATHER "
+        "THAN AN EYE. Left at the drake's yellow, a hen's bill "
+        "measures a contrast ratio of 1.20 against her buff head -- "
+        "an invisible bill, which is the defect ten of these twenty "
+        "species already shipped once and which `tools/birdprobe.py "
+        "--read` was never going to catch, because that gate reads "
+        "the colours a spec is AUTHORED in and the hen's are not "
+        "those. The source says hers is \"generally darker and ranging "
+        "from black to mottled orange and brown\", so it is "
+        "`beak_horn`, at 3.39.\n\n"
+        "That slot paints the LEGS as well, and a hen's legs are "
+        "orange like a drake's, so this is a trade rather than a fix: "
+        "the bill is the cheapest identifying feature a bird has and "
+        "the legs are three voxels of a bird that is usually sitting "
+        "on water.",
+    "common-kestrel":
+        "SEX. The second-largest plumage difference in the set, and "
+        "the one that needed a MARKING swapped rather than a colour: "
+        "\"the male having fewer black spots and streaks, as well as a "
+        "blue-grey cap and tail. The tail is brown with black bars in "
+        "females\". So the female takes a rufous head in place of the "
+        "male's slate one and BARRED in place of SPOTTED, in the same "
+        "dark brown.\n\n"
+        "THE MALE'S BLUE-GREY TAIL CANNOT BE DRAWN AND THAT IS A "
+        "LIMIT OF THE SHAPE CODE, not of this parameter: "
+        "`materials.bird_wing` paints the wing and the tail together, "
+        "so the male's tail is already rufous like his back. "
+        "Splitting them is a change to `bird._paint` and is not worth "
+        "it for one species.\n\n"
+        "SIZE IS NOT AUTHORED. The published masses are 155 g male "
+        "against 184 g female, whose cube root is 0.945 -- and at "
+        "this species' 33 voxels that moves the bird by 1.9 voxels, "
+        "under the two-voxel floor. The kestrel is carried by its "
+        "colour.",
+    "great-spotted-woodpecker":
+        "SEX. \"Males have a crimson patch on the nape, which is "
+        "absent from the otherwise similar females\" -- one field, and "
+        "the smallest adopted difference in the library. The crimson "
+        "patch measures FOUR VOXELS at 1 cm on a 352-voxel bird, "
+        "which is 1.1% of the animal and the reason "
+        "`tools/birdprobe.py --sex` gates on voxels as well as on per "
+        "cent: a five-per-cent gate would call the most-quoted field "
+        "mark for this species a no-op.",
+    "rock-ptarmigan":
+        "SEX. The male carries the crimson eye comb and the female "
+        "does not -- \"apart from the red eye combs, male rock "
+        "ptarmigans have no distinct plumage\" -- so the female's head "
+        "marking is dropped and nothing else changes. Twenty voxels "
+        "of crimson on 3,424 of white, which is 0.6% of the bird and "
+        "reads only because it is the only saturated thing on it.\n\n"
+        "THE BLACK LORAL STRIPE IS A SEPARATE MALE-ONLY MARK and "
+        "cannot be drawn beside the comb: a bird carries at most ONE "
+        "head marking here, the comb has it, and a second would have "
+        "to displace it.",
+}
+
+
+assert set(SEX) <= set(SPECIES), (
+    f"SEX names species this script does not author: {set(SEX) - set(SPECIES)}")
+assert set(SEX_NOTES) == set(SEX), (
+    f"a sexual difference without its justification, or the other way round: "
+    f"{set(SEX_NOTES) ^ set(SEX)}")
+
+
 def main() -> int:
     force = seedspec.parse_force(sys.argv[1:])
     seedspec.announce(force, "bird specs")
     written = 0
     for name, (blurb, changes) in SPECIES.items():
+        changes = {**changes, **SEX.get(name, {})}
         s, rep = sm.patch(sm.default_spec(), changes)
+        if name in SEX_NOTES:
+            s["notes"] = s["notes"].rstrip() + "\n\n" + SEX_NOTES[name]
         if seedspec.write(s, SPECS / f"{name}.json", rep.warnings, force=force,
                           label=name, width=26):
             written += 1

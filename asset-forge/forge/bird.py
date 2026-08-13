@@ -57,6 +57,25 @@ on the seed it already had. Nothing in this file changed for it, and nothing in
 this file should: the pose still decides the geometry, it just no longer decides
 the animal.
 
+MALE AND FEMALE, AND WHY THAT IS TWO MECHANISMS AND NOT ONE. A fish's sexual
+difference is nearly all SIZE, so `fish.sex` covered twenty-three species with
+three ratios and a square root. A bird's is nearly all COLOUR. The largest
+single difference between two animals of one species anywhere in this library
+is a mallard drake against a hen -- bottle-green head, white collar, grey body
+and yellow bill against uniform mottled brown -- and not one voxel of it is a
+proportion. So this file carries `_sex_scale`, which is the fish rule verbatim
+and moves two measurements, and `_alt`, which swaps colours and markings
+outright. Eight of the twenty species carry a difference and twelve are an
+honest null; `docs/bird-dimorphism-research.md` has the sources and the numbers
+that decided each rejection, and `tools/birdprobe.py --sex` measures all of it.
+
+The one thing worth reading here rather than there: SEX RESEEDS AND A POSE DOES
+NOT, which is the opposite of the paragraph above and is deliberate. A perched
+raven and a flying raven are one animal in two postures. A drake and a hen are
+two animals -- there is no individual that is "the same mallard, but female" --
+so `bird.sex` is NOT in `spec.SEED_INVARIANT` and seed 7 male and seed 7 female
+are two different ducks.
+
 THE FOUR THINGS THAT WERE GOT WRONG FIRST, with what they measured as, because
 each one is a trap and none of them looked like a bug in a render:
 
@@ -111,7 +130,9 @@ import numpy as np
 
 from . import materials
 from .grid import VoxelGrid
-from .spec import (_BIRD_POSES, _BODY_MARKS, _HEAD_MARKS, _TAIL_SHAPES,
+from .spec import BY_PATH as _BY_PATH
+from .spec import (_ALT_BODY_MARKS, _ALT_HEAD_MARKS, _ALT_WING_MARKS,
+                   _BIRD_POSES, _BODY_MARKS, _HEAD_MARKS, _SEXES, _TAIL_SHAPES,
                    _WING_MARKS, _WING_SHAPES, get)
 
 # Tail outlines. Named the way a field guide names them, because that is the
@@ -141,6 +162,21 @@ HEAD_MARKS = ("none", "cap", "mask", "supercilium", "throat", "collar")
 WING_MARKS = ("none", "bar", "doublebar", "panel", "tip")
 BODY_MARKS = ("none", "barred", "streaked", "speckled", "breastband")
 
+# Which sex is being drawn. Same three words the fish use, and the same import
+# check, because the two files answer to one parameter table.
+SEXES = ("unsexed", "female", "male")
+
+# Which sex the authored colours belong to. See `_alt` and `bird.sex_plumage`.
+PLUMAGE_AUTHORED = ("same", "male", "female")
+
+# The seven colour slots an author may override for the other sex, and the
+# three markings. Listed once, here, and read by `_alt_mat` and `_alt_mark`
+# rather than typed out at each site -- fourteen literal strings spread over a
+# function is how `materials.bird_head` gets overridden and
+# `materials.bird_head_mark` quietly does not.
+ALT_SLOTS = ("back", "belly", "head", "wing", "mark", "head_mark", "bill")
+ALT_MARKS = ("head_mark", "wing_mark", "body_mark")
+
 # The parameter table offers these as choices and this file implements them.
 # Checked at import rather than trusted: a shape name that falls through to a
 # default LOOKS like a shape that works, which is how `spire` and `ovoid`
@@ -152,10 +188,39 @@ for _mine, _theirs, _what in (
     (HEAD_MARKS, _HEAD_MARKS, "HEAD_MARKS"),
     (WING_MARKS, _WING_MARKS, "WING_MARKS"),
     (BODY_MARKS, _BODY_MARKS, "BODY_MARKS"),
+    (SEXES, _SEXES, "SEXES"),
+    # And the three `alt` lists really are the three above with one extra
+    # entry. Checked because they are written as a derived tuple in spec.py and
+    # as a literal here, and a sentinel that exists on one side only would show
+    # up as `bird.sex_alt_body_mark` silently refusing `breastband`.
+    (("same",) + HEAD_MARKS, _ALT_HEAD_MARKS, "ALT_HEAD_MARKS"),
+    (("same",) + WING_MARKS, _ALT_WING_MARKS, "ALT_WING_MARKS"),
+    (("same",) + BODY_MARKS, _ALT_BODY_MARKS, "ALT_BODY_MARKS"),
 ):
     assert set(_mine) == set(_theirs), (
         f"bird.py {_what} and spec.py disagree: {set(_mine) ^ set(_theirs)}")
 del _mine, _theirs, _what
+
+# AND THE SLOT LISTS ARE CHECKED AGAINST THE PARAMETER TABLE ITSELF, not against
+# another list of the same strings. `ALT_SLOTS` decides which colours `_alt_mat`
+# will swap and which the probe will exercise, so a slot added to spec.py and
+# forgotten here would be a row that exists in the browser, sits at its default
+# forever, and appears in no table anywhere -- a feature nobody can tell is not
+# working. Reading the parameter table back is the only check that cannot itself
+# go stale.
+for _slot in ALT_SLOTS:
+    assert f"materials.bird_alt_{_slot}" in _BY_PATH, (
+        f"bird.py ALT_SLOTS names {_slot!r} and spec.py has no "
+        f"materials.bird_alt_{_slot}")
+for _m in ALT_MARKS:
+    assert f"bird.sex_alt_{_m}" in _BY_PATH, (
+        f"bird.py ALT_MARKS names {_m!r} and spec.py has no bird.sex_alt_{_m}")
+_declared = {p.split("materials.bird_alt_")[1] for p in _BY_PATH
+             if p.startswith("materials.bird_alt_")}
+assert _declared == set(ALT_SLOTS), (
+    f"spec.py declares alt colour slots bird.py will never swap: "
+    f"{_declared ^ set(ALT_SLOTS)}")
+del _slot, _m, _declared
 
 # Part tags. Drawn into a scratch grid so that the paint pass can tell a wing
 # from a body without a second geometry pass, exactly as `fish._fins` returns
@@ -206,6 +271,111 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
 # --- parameters and layout --------------------------------------------------
 
 
+def _sex_scale(spec: dict, ratio_path: str) -> float:
+    """Multiplier on one measurement for the sex this bird is being drawn as.
+
+    IDENTICAL IN BEHAVIOUR TO `fish._sex_scale`, and deliberately not shared
+    with it: the two files read different parameter paths and the only thing a
+    common helper would save is four lines, against the cost that a change made
+    for a whale silently reshapes every bird in the library. What is shared is
+    the RULE, and it is stated in both places because it is the part that is
+    easy to get wrong.
+
+    THE AUTHORED NUMBER IS THE SPECIES AVERAGE AND THE RATIO IS SPLIT BOTH
+    WAYS. Each `bird.sex_*` row is a male-to-female ratio, so the male gets
+    `sqrt(r)` and the female `1/sqrt(r)`: male divided by female is exactly `r`
+    whatever the authored value is, and `unsexed` is the geometric mean of the
+    two. Neither sex is the default, which is the whole reason for the square
+    root -- the obvious version, "the authored bird is the female and the male
+    is scaled up", makes every unsexed spec in the library silently female.
+
+    UNDER 1 IS NOT AN EDGE CASE HERE. Four of the twenty species author a ratio
+    below one because the female is the larger bird: reversed sexual size
+    dimorphism is the rule in raptors and owls, and the golden eagle, common
+    buzzard, common kestrel and tawny owl all carry it. The fish library had
+    exactly one species that way round.
+
+    A species with no measured difference leaves the ratio at 1.0, and then
+    this returns 1.0 for all three sexes and the choice genuinely changes no
+    geometry. That is a real answer and not a broken one -- `tools/birdprobe.py
+    --sex` prints the per-species movement in voxels so that "changes nothing"
+    is a measurement rather than an assumption.
+    """
+    sex = str(get(spec, "bird.sex"))
+    if sex == "unsexed":
+        return 1.0
+    r = max(float(get(spec, ratio_path)), 1e-3)
+    return math.sqrt(r) if sex == "male" else 1.0 / math.sqrt(r)
+
+
+def _alt(spec: dict) -> bool:
+    """Is this bird wearing the OTHER sex's plumage?
+
+    THE MECHANISM THE FISH DID NOT NEED, AND THE ONE THING IN THIS FILE THAT
+    CANNOT BE A RATIO. A mallard drake against a hen is the largest single
+    difference in this library and none of it is a proportion: bottle-green
+    head, white collar, grey body against uniform mottled brown. Halfway
+    between green and brown is not an unsexed mallard, it is a colour no duck
+    has ever worn.
+
+    So the swap is CATEGORICAL. `bird.sex_plumage` names which sex the authored
+    colours are -- `same` for a monomorphic species, which is twelve of the
+    twenty here -- and asking for the other sex substitutes whichever of the
+    ten `alt` rows the author filled in. Three consequences, all of them
+    intended and all of them checked by `tools/birdprobe.py --sex`:
+
+      * UNSEXED DRAWS THE AUTHORED PLUMAGE, so on a dimorphic species unsexed
+        and one named sex are the same bird. That is stated rather than hidden;
+        the probe prints which species it is true of and how many voxels apart
+        the two sexes are.
+      * ASKING FOR THE SEX THE SPEC IS ALREADY AUTHORED AS CHANGES NOTHING, by
+        construction, so `sex_plumage=male` plus `sex=male` is a no-op and only
+        `sex=female` swaps.
+      * A MONOMORPHIC SPECIES IGNORES THE `alt` ROWS ENTIRELY. Not "applies
+        them and finds them empty" -- ignores them, so an `alt` row left behind
+        by a species that was later measured as monomorphic cannot come back to
+        life the day somebody sets the sex.
+    """
+    authored = str(get(spec, "bird.sex_plumage"))
+    if authored == "same":
+        return False
+    sex = str(get(spec, "bird.sex"))
+    return sex in ("male", "female") and sex != authored
+
+
+def _alt_mat(spec: dict, slot: str, alt: bool) -> int:
+    """The material id for one colour slot, after the plumage swap.
+
+    `same` is consumed here and never reaches `materials.resolve`, which raises
+    on a name it does not know. That ordering is the point: a typo in an `alt`
+    row fails loudly at build time instead of coming out as a silently
+    substituted colour hundreds of assets later, which is the failure mode
+    `materials.resolve`'s own docstring was written against.
+    """
+    if alt:
+        name = str(get(spec, f"materials.bird_alt_{slot}"))
+        if name != "same":
+            return materials.resolve(name)
+    return materials.resolve(get(spec, f"materials.bird_{slot}"))
+
+
+def _alt_mark(spec: dict, which: str, alt: bool) -> str:
+    """The marking for one region, after the plumage swap.
+
+    A SEPARATE MECHANISM FROM THE COLOURS BECAUSE SOME DIFFERENCES ARE NOT
+    COLOURS. A female kestrel is BARRED across the back where the male is
+    SPOTTED, in the same dark brown; swapping her marking material would give
+    her the male's spots in a new colour, which is a bird that does not exist.
+    A female great spotted woodpecker is the opposite case and needs no colour
+    at all -- she simply has no red on her head, so her row is `none`.
+    """
+    if alt:
+        pick = str(get(spec, f"bird.sex_alt_{which}"))
+        if pick != "same":
+            return pick
+    return str(get(spec, f"bird.{which}"))
+
+
 def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
     """Everything the drawing code needs, in VOXELS, with this individual's
     variation already applied and the layout already solved.
@@ -229,7 +399,13 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
         return value * (1.0 + amount * float(get(spec, slider)) * scale * u())
 
     v = float(voxel_m)
-    length_m = max(vary(float(get(spec, "bird.length_m")), "variation.height"),
+    # Sex is applied BEFORE the individual variation draw, so a male and a
+    # female of one species are two draws around two different means rather
+    # than one draw scaled -- which is what "two birds" has to mean if the word
+    # is doing any work. See `_sex_scale` and `bird.sex`'s help text.
+    length_m = max(vary(float(get(spec, "bird.length_m"))
+                        * _sex_scale(spec, "bird.sex_length"),
+                        "variation.height"),
                    v * 8.0)
     length_v = max(8.0, length_m / v)
 
@@ -251,6 +427,33 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
                                          "variation.proportion", 0.5))),
     }
     total = max(sum(shares.values()), 1e-6)
+
+    # --- and what the sex does to the tail, which the normalisation fights ---
+    #
+    # A BARN SWALLOW'S STREAMERS MAKE HIM LONGER; THEY DO NOT MAKE HIS HEAD
+    # SMALLER. That is what the line below is careful about, and it is careful
+    # by NOT recomputing `total`. Scaled into the normalisation the ordinary
+    # way, a tail ratio of 1.20 on a swallow authored at tail 0.42 divides
+    # every other share by a total 8% larger, so the head, the neck, the bill
+    # and the body all shrink to pay for the streamers -- sub-voxel on each of
+    # them, which is exactly the kind of wrong that never shows up in a render
+    # and does show up as a male whose bill lost a voxel.
+    #
+    # Dividing by the total taken BEFORE the ratio leaves every unchanged share
+    # exactly where it was and moves the tail by the ratio and nothing else.
+    # The bird then genuinely comes out longer than `bird.length_m`, which is
+    # correct and is what a streamer is: published lengths for this species are
+    # 17-19 cm without the outer feathers and up to 21 cm with them.
+    #
+    # `length_v` is deliberately left alone, because the wingspan and the leg
+    # length are fractions OF it. Scaling it would have given the male swallow
+    # 8% more wing as well, and his wing chord differs from hers by about one
+    # percent. `tools/birdprobe.py --sex` measures the tail in columns AND the
+    # bill in columns AND the wing reach, because a compensation that overshoots
+    # looks identical to one that works if you only measure the part that was
+    # meant to move.
+    shares["tail"] *= _sex_scale(spec, "bird.sex_tail")
+
     seg = {k: length_v * x / total for k, x in shares.items()}
 
     pose = str(get(spec, "bird.pose"))
@@ -341,6 +544,11 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
 
     off = np.array([margin - lo[0], half_y, margin - lo[2]])
 
+    # Read once and passed to the ten slots below. Read per slot instead, this
+    # is ten calls that must all agree; read once, a species either wears the
+    # other sex's plumage or it does not.
+    alt = _alt(spec)
+
     return {
         "voxel_m": v,
         "shape": (max(nx, 6), max(ny, 6), max(nz, 6)),
@@ -395,21 +603,36 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
         "leg_thick": float(get(spec, "bird.leg_thick")),
         "eye": float(get(spec, "bird.eye")),
         "upperparts": float(get(spec, "bird.upperparts")),
-        "head_mark": str(get(spec, "bird.head_mark")),
-        "wing_mark": str(get(spec, "bird.wing_mark")),
-        "body_mark": str(get(spec, "bird.body_mark")),
+        # THE PLUMAGE SWAP HAPPENS HERE AND NOWHERE ELSE. Every colour and
+        # every marking the drawing passes read comes out of this dict, so one
+        # gate covers all ten of them and there is no second site to forget --
+        # which matters, because `_paint` reads the marks and the marking
+        # colours in four different functions and `_eye` picks its contrast
+        # partner out of the palette by scanning it.
+        #
+        # `alt` is False for the twelve monomorphic species and for `unsexed`
+        # on all twenty, and then every line below reads exactly what it read
+        # before this parameter existed.
+        "sex": str(get(spec, "bird.sex")),
+        "alt_plumage": alt,
+        "head_mark": _alt_mark(spec, "head_mark", alt),
+        "wing_mark": _alt_mark(spec, "wing_mark", alt),
+        "body_mark": _alt_mark(spec, "body_mark", alt),
         "mark_count": int(get(spec, "bird.mark_count")),
         "mark_width": float(get(spec, "bird.mark_width")),
         "mark_strength": float(get(spec, "bird.mark_strength")),
         "phase": float(rng.random()),
         "salt": int(rng.integers(1 << 30)),
-        "mat_back": materials.resolve(get(spec, "materials.bird_back")),
-        "mat_belly": materials.resolve(get(spec, "materials.bird_belly")),
-        "mat_head": materials.resolve(get(spec, "materials.bird_head")),
-        "mat_wing": materials.resolve(get(spec, "materials.bird_wing")),
-        "mat_mark": materials.resolve(get(spec, "materials.bird_mark")),
-        "mat_head_mark": materials.resolve(get(spec, "materials.bird_head_mark")),
-        "mat_bill": materials.resolve(get(spec, "materials.bird_bill")),
+        "mat_back": _alt_mat(spec, "back", alt),
+        "mat_belly": _alt_mat(spec, "belly", alt),
+        "mat_head": _alt_mat(spec, "head", alt),
+        "mat_wing": _alt_mat(spec, "wing", alt),
+        "mat_mark": _alt_mat(spec, "mark", alt),
+        "mat_head_mark": _alt_mat(spec, "head_mark", alt),
+        "mat_bill": _alt_mat(spec, "bill", alt),
+        # NO `alt` ON THE EYE, and that is a measured decision rather than an
+        # omission -- see the note on the `materials.bird_alt_*` block in
+        # spec.py. Two voxels cannot carry an iris.
         "mat_eye": materials.resolve(get(spec, "materials.bird_eye")),
     }
 

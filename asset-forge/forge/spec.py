@@ -81,6 +81,22 @@ _HEAD_MARKS = ("none", "cap", "mask", "supercilium", "throat", "collar")
 _WING_MARKS = ("none", "bar", "doublebar", "panel", "tip")
 _BODY_MARKS = ("none", "barred", "streaked", "speckled", "breastband")
 
+# The same three lists with a "leave it alone" entry in front, for the OTHER
+# SEX'S plumage. See `bird.sex_plumage` and `bird._alt`.
+#
+# THE SENTINEL IS NOT LAZINESS, IT IS DRIFT PROTECTION. The obvious design is
+# that a dimorphic species authors the other sex's plumage in full -- all seven
+# colours and all three markings -- and the code just swaps one complete set for
+# the other. A great spotted woodpecker differs from its female in ONE field:
+# he carries a crimson nape and she carries nothing there. Under the complete
+# set she would restate six colours and two markings identically, and the day
+# somebody retunes the male's wing panel the female keeps the old one and
+# nothing anywhere says so. `same` means "whatever the species carries", so the
+# only rows an author writes are the rows that actually differ.
+_ALT_HEAD_MARKS = ("same",) + _HEAD_MARKS
+_ALT_WING_MARKS = ("same",) + _WING_MARKS
+_ALT_BODY_MARKS = ("same",) + _BODY_MARKS
+
 # Every kind EXCEPT fish. Two placement rows are meaningless for something that
 # swims -- ground steepness, and distance to water for a thing that is in it --
 # and the house rule is that a section does not show a slider it cannot use, it
@@ -1581,6 +1597,113 @@ PARAMS: tuple[Param, ...] = (
            "the defect that left the rock weathering pass removing 20 voxels "
            "out of 90,000 while reporting success."),
 
+    # --- sex -----------------------------------------------------------------
+    #
+    # SEX RESEEDS, ON PURPOSE, AND THAT IS THE OPPOSITE OF WHAT `bird.pose`
+    # DOES. The two decisions sit four hundred lines apart in this file and
+    # they are easy to read as an inconsistency, so: a perched raven and a
+    # flying raven are one animal in two postures, which is why the pose is
+    # excluded from the seeding hash (`SEED_INVARIANT`) and both come out the
+    # same raven. A drake and a hen are two animals. There is no individual
+    # that is "the same mallard, but female", so seed 7 male and seed 7 female
+    # are two different ducks and this field is deliberately NOT in
+    # `SEED_INVARIANT`. `tools/birdprobe.py --sex` checks the hashes DIFFER
+    # rather than trusting this comment.
+    #
+    # WHERE THIS DEPARTS FROM `fish.sex`, AND WHY IT HAD TO. A fish's sexual
+    # difference is nearly all SIZE -- an orca's dorsal fin, a whale shark's
+    # length -- so three ratios and a square root covered twenty-three species.
+    # A bird's is nearly all COLOUR. The largest single difference anywhere in
+    # this library is a mallard drake against a hen: a bottle-green head, a
+    # white collar and a grey body against uniform mottled brown, and not one
+    # voxel of it is a proportion. No ratio can express that, so there are two
+    # mechanisms below rather than one: two ratios that work exactly like the
+    # fish's, and a PLUMAGE SWAP that replaces colours and markings outright.
+    P("bird.sex", "Sex", "unsexed", kind="choice", group="bird",
+      kinds=("bird",), choices=_SEXES,
+      help="Which sex of the species to draw. UNSEXED is what a spec carries "
+           "until someone measures a difference, and on the twelve species "
+           "here that have none it is the species and the choice changes "
+           "nothing at all.\n\n"
+           "The two RATIOS below are handled the way the fish are: the "
+           "authored number is the average of the two sexes and the ratio is "
+           "split as a square root either way, so male divided by female is "
+           "exactly the ratio and neither sex is the default.\n\n"
+           "PLUMAGE CANNOT WORK THAT WAY AND DOES NOT PRETEND TO. There is no "
+           "average of a green head and a brown one. So a dimorphic species "
+           "authors its colours as ONE sex, says which in `bird.sex_plumage`, "
+           "and gives the other sex's colours in the `alt` rows; UNSEXED then "
+           "draws the authored plumage, which on those species is one of the "
+           "two sexes and not a compromise. That is a real limitation of "
+           "drawing colour rather than a number, it is stated here, in "
+           "`docs/bird-dimorphism-research.md` and in the probe's own table, "
+           "and it is the reason `bird.sex_plumage` exists at all instead of "
+           "the swap being inferred."),
+    P("bird.sex_length", "Male:female length", 1.0, 0.70, 1.45, 0.01,
+      group="bird", kinds=("bird",),
+      help="Adult LINEAR size of the male divided by the female's, from wing "
+           "chord where a ringing scheme publishes one. 1.0 is no difference "
+           "and is right for most of this library.\n\n"
+           "UNDER 1 MEANS THE FEMALE IS THE LARGER BIRD, and unlike the fish "
+           "that is not an oddity here -- it is the rule for every raptor and "
+           "owl in the set. Reversed sexual size dimorphism is one of the "
+           "best-documented patterns in ornithology and the four species that "
+           "carry it here (golden eagle, buzzard, kestrel, tawny owl) all "
+           "author a ratio below 1.\n\n"
+           "MASS RATIOS DO NOT GO IN THIS BOX. A golden eagle female is about "
+           "a third heavier than a male, which is a LINEAR ratio near the cube "
+           "root of that. Putting the mass ratio here would draw an eagle "
+           "three times too dimorphic; the research doc shows the arithmetic "
+           "for every species that only had mass published."),
+    P("bird.sex_tail", "Male:female tail", 1.0, 0.60, 1.80, 0.01,
+      group="bird", kinds=("bird",),
+      help="Tail LENGTH, male divided by female. Separate from the size ratio "
+           "because on the species that needs it the tail moves and the bird "
+           "does not: a barn swallow's outer tail feathers are the classic "
+           "measured ornament and its wing chord barely differs between the "
+           "sexes at all.\n\n"
+           "IT DOES NOT SHRINK THE REST OF THE BIRD. `bird.tail_frac` is one "
+           "of five shares that are normalised to sum to one, so scaling the "
+           "share alone lengthens the tail by taking length off the head, the "
+           "neck and the body -- a longer-tailed swallow with a smaller head, "
+           "which is not what a streamer is. `bird._params` compensates the "
+           "overall length by the same factor, so this ratio moves the tail "
+           "and leaves every other part where it was."),
+    P("bird.sex_plumage", "Authored plumage", "same", kind="choice",
+      group="bird", kinds=("bird",), choices=("same", "male", "female"),
+      help="WHICH SEX THE COLOURS ABOVE DESCRIBE. SAME means the species is "
+           "plumage-monomorphic and the twelve `alt` rows are ignored "
+           "entirely, which is the honest answer for most of this library.\n\n"
+           "MALE or FEMALE says the authored colours are that sex's, and then "
+           "asking for the OTHER sex applies whichever `alt` rows are not left "
+           "at `same`. Drawing the sex the spec is already authored as changes "
+           "nothing, by construction.\n\n"
+           "THIS IS A DECLARATION AND NOT A DEFAULT. It is the same trap the "
+           "fish work found three times over -- an orca authored at a bull's "
+           "fin height while claiming to be the species -- except that colour "
+           "cannot be split down the middle to escape it. A mallard in this "
+           "library IS a drake unless you ask otherwise; saying so in a field "
+           "the probe can read is the difference between a known limitation "
+           "and a silent one."),
+    P("bird.sex_alt_head_mark", "Other sex: head marking", "same",
+      kind="choice", group="bird", kinds=("bird",), choices=_ALT_HEAD_MARKS,
+      help="The other sex's head marking, or SAME to keep the species'. This "
+           "is the single field a great spotted woodpecker needs: the male "
+           "carries a crimson nape and the female carries nothing there, so "
+           "her row reads `none` and every other row stays `same`."),
+    P("bird.sex_alt_wing_mark", "Other sex: wing marking", "same",
+      kind="choice", group="bird", kinds=("bird",), choices=_ALT_WING_MARKS,
+      help="The other sex's wing marking, or SAME to keep the species'. Rarely "
+           "needed: a mallard's blue speculum is the one mark on the bird that "
+           "is IDENTICAL in both sexes, which is exactly why it is the field "
+           "mark you identify a hen by."),
+    P("bird.sex_alt_body_mark", "Other sex: body marking", "same",
+      kind="choice", group="bird", kinds=("bird",), choices=_ALT_BODY_MARKS,
+      help="The other sex's body marking, or SAME to keep the species'. A "
+           "female kestrel is BARRED where the male is SPOTTED, which is a "
+           "different marking rather than a different colour and could not be "
+           "said by swapping a material."),
+
     P("materials.bird_back", "Upperparts", "skin_brown", kind="choice",
       group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
     P("materials.bird_belly", "Underparts", "plume_white", kind="choice",
@@ -1607,6 +1730,40 @@ PARAMS: tuple[Param, ...] = (
       group="bird", kinds=("bird",), choices=materials.BIRD_NAMES),
     P("materials.bird_eye", "Eye", "skin_dark", kind="choice", group="bird",
       kinds=("bird",), choices=materials.BIRD_NAMES),
+
+    # --- the other sex's colours --------------------------------------------
+    #
+    # SEVEN SLOTS, WHICH IS THE SAME SEVEN AS ABOVE MINUS THE EYE, and the eye
+    # is missing on purpose rather than by oversight. It is two voxels. No
+    # published account of any species here separates the sexes on iris colour
+    # at a size a two-voxel eye could carry, and a slot that no species can
+    # ever author is a slot that will sit at its default forever while looking
+    # like a feature. `docs/bird-dimorphism-research.md` records that as a
+    # rejection with the voxel count behind it.
+    #
+    # `same` MEANS THE SPECIES' OWN COLOUR, not a material. `materials.resolve`
+    # would raise on it, which is the behaviour wanted: the sentinel is
+    # consumed in `bird._alt_mat` and never reaches the palette, so a typo in
+    # one of these rows cannot come out as a silently substituted colour.
+    P("materials.bird_alt_back", "Other sex: upperparts", "same", kind="choice",
+      group="bird", kinds=("bird",), choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_belly", "Other sex: underparts", "same", kind="choice",
+      group="bird", kinds=("bird",), choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_head", "Other sex: head and neck", "same",
+      kind="choice", group="bird", kinds=("bird",),
+      choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_wing", "Other sex: wing and tail", "same",
+      kind="choice", group="bird", kinds=("bird",),
+      choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_mark", "Other sex: wing and body marking", "same",
+      kind="choice", group="bird", kinds=("bird",),
+      choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_head_mark", "Other sex: head marking", "same",
+      kind="choice", group="bird", kinds=("bird",),
+      choices=("same",) + materials.BIRD_NAMES),
+    P("materials.bird_alt_bill", "Other sex: bill and legs", "same",
+      kind="choice", group="bird", kinds=("bird",),
+      choices=("same",) + materials.BIRD_NAMES),
 
     # --- flock: a bird as a detail entity -----------------------------------
     #

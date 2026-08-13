@@ -15,6 +15,8 @@ slider moves, and this tool prints the number and says DEAD when it does not.
     python tools/birdprobe.py --lattice       # 1 cm against 2 cm and 5 cm
     python tools/birdprobe.py --pose          # perched against flying
     python tools/birdprobe.py --pose-ab       # ... and the render of it
+    python tools/birdprobe.py --sex           # male against female
+    python tools/birdprobe.py --sex-ab        # ... and the render of it
 
 WHY IT AVERAGES OVER SEEDS. Changing any parameter changes the seed hash, and
 `pipeline.rng_for` mixes the hash into the seed -- so a one-seed A/B is not the
@@ -26,6 +28,14 @@ entry in `spec.SEED_INVARIANT`, so it is normalised out of the hash
 `pipeline.rng_for` seeds from and the two poses of a species are one individual.
 That is what `--pose` tests and it is the only A/B in this file that is the same
 bird by construction rather than by averaging.
+
+`bird.sex` IS DELIBERATELY NOT LIKE THAT, and `--sex` checks it. A pose is a
+posture and a sex is not: there is no individual that is "the same mallard, but
+female". So a male and a female of one seed are two different birds, every
+species is checked for it including the twelve with no dimorphism at all -- on
+those it is the only thing separating "they look alike" from "the parameter
+never reached the build" -- and the sex table pins `variation.amount` to zero so
+that what is left is the mechanism and not the draw.
 
 WHAT "MOVES" MEANS HERE. A parameter passes if its measurement changes by more
 than one voxel AND by more than 4% across its authored range. Both, because
@@ -60,7 +70,7 @@ from pathlib import Path
 import numpy as np
 
 import _path  # noqa: F401  (sys.path bootstrap)
-from forge import cli, materials, pipeline, spec as sm
+from forge import bird as _birdlib, cli, materials, pipeline, spec as sm
 
 ROOT = Path(__file__).resolve().parents[1]
 SPECS = ROOT / "specs"
@@ -71,6 +81,37 @@ SPECS = ROOT / "specs"
 # Each of these is a number a HUMAN could check off a render, which is the
 # point: a probe that measures an internal variable proves the variable exists,
 # not that it reached the voxels.
+
+
+def _bird_mat(spec: dict, slot: str) -> int:
+    """The material one bird slot is ACTUALLY painted in, after the sex swap.
+
+    EVERY MEASUREMENT IN THIS FILE THAT READS A COLOUR HAS TO GO THROUGH HERE,
+    and the reason is a measurement that read 0 within an hour of the swap
+    existing. `m_bill_run` finds the bill by looking for the bill COLOUR, and
+    it took that colour straight off `materials.bird_bill` -- which on a hen
+    mallard is the drake's yellow, a colour she does not wear anywhere. It duly
+    reported her bill as nought columns long on a bird that has one. Nothing
+    was wrong with the bird.
+
+    That is the same class of failure as `m_head_mark` counting 74% of a
+    herring gull as head marking: a probe reading the spec where it should be
+    reading the animal. `bird._alt_mat` is the drawing code's own resolution,
+    so this cannot drift from what was painted.
+
+    THE EYE IS NOT AN `alt` SLOT and falls through to a plain resolve. See the
+    note on the `materials.bird_alt_*` block in spec.py for why it does not
+    have one.
+    """
+    if slot in _birdlib.ALT_SLOTS:
+        return _birdlib._alt_mat(spec, slot, _birdlib._alt(spec))
+    return materials.resolve(sm.get(spec, f"materials.bird_{slot}"))
+
+
+def _bird_mark(spec: dict, which: str) -> str:
+    """The marking one region ACTUALLY carries, after the sex swap. Same reason
+    as `_bird_mat`: a female kestrel is barred where the spec says spotted."""
+    return _birdlib._alt_mark(spec, which, _birdlib._alt(spec))
 
 
 def _occ(a):
@@ -275,7 +316,7 @@ def m_neck_run(a) -> float:
     shoulders at an angle, so it does not occupy its own columns -- it shares
     them with the breast underneath it. Distance has neither problem.
     """
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_head"))
+    mat = _bird_mat(a.spec, "head")
     m = a.grid.data == mat
     if not m.any():
         return 0.0
@@ -296,7 +337,7 @@ def m_head_diam(a) -> float:
     them apart. This is only meaningful where the head colour differs from the
     body's, which is why `SETUP_FOR` forces one that does.
     """
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_head"))
+    mat = _bird_mat(a.spec, "head")
     m = (a.grid.data == mat).any(axis=1)
     if not m.any():
         return 0.0
@@ -305,7 +346,7 @@ def m_head_diam(a) -> float:
 
 def m_bill_run(a) -> float:
     """How many columns forward of the head carry bill and nothing else."""
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     cols = (a.grid.data == mat).any(axis=(1, 2))
     if not cols.any():
         return 0.0
@@ -330,7 +371,7 @@ def m_bill_drop(a) -> float:
     so this measurement alone cannot tell them apart -- `m_bill_bend` is the
     partner that can, and the two of them disagreeing is the signature.
     """
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     m = a.grid.data == mat
     xs = np.flatnonzero(m.any(axis=(1, 2)))
     if xs.size < 2:
@@ -353,7 +394,7 @@ def m_bill_bend(a) -> float:
     number that separates them, and it is the reason `bill_curve` bends a
     centreline rather than rotating a direction.
     """
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     m = a.grid.data == mat
     xs = np.flatnonzero(m.any(axis=(1, 2)))
     if xs.size < 4:
@@ -390,7 +431,7 @@ def m_bill_depth(a) -> float:
     measuring it by total voxel count reported it as weak at 3% while it is the
     whole difference between a finch and a warbler. This measures the bill.
     """
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     m = a.grid.data == mat
     xs = np.flatnonzero(m.any(axis=(1, 2)))
     if xs.size < 2:
@@ -402,7 +443,7 @@ def m_bill_depth(a) -> float:
 
 
 def m_bill_width(a) -> float:
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     m = (a.grid.data == mat).any(axis=2)
     return float(m.sum(axis=1).max()) if m.any() else 0.0
 
@@ -432,7 +473,7 @@ def m_posture(a) -> float:
 
 def m_leg_drop(a) -> float:
     """How far the legs hang below the body, in voxels."""
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_bill"))
+    mat = _bird_mat(a.spec, "bill")
     m = a.grid.data == mat
     if not m.any():
         return 0.0
@@ -607,18 +648,20 @@ def m_wing_fold(a) -> float:
     return float(xs[0])
 
 
-def _share(a, path: str) -> float:
-    mat = materials.resolve(sm.get(a.spec, path))
+def _share(a, slot: str) -> float:
+    """Share of the bird wearing one slot's colour. Slot NAME, not parameter
+    path, so that it resolves through the sex swap -- see `_bird_mat`."""
+    mat = _bird_mat(a.spec, slot)
     hist = a.stats["by_material"]
     return 100.0 * hist.get(mat, 0) / max(sum(hist.values()), 1)
 
 
 def m_upper(a) -> float:
-    return _share(a, "materials.bird_back")
+    return _share(a, "back")
 
 
 def m_under(a) -> float:
-    return _share(a, "materials.bird_belly")
+    return _share(a, "belly")
 
 
 def m_mark(a) -> float:
@@ -629,21 +672,21 @@ def m_mark(a) -> float:
     material is the same as the thing it sits on, because a mark painted in
     the base colour covers voxels and shows nothing.
     """
-    if (sm.get(a.spec, "bird.wing_mark") == "none"
-            and sm.get(a.spec, "bird.body_mark") == "none"):
+    if (_bird_mark(a.spec, "wing_mark") == "none"
+            and _bird_mark(a.spec, "body_mark") == "none"):
         return 0.0
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_mark"))
+    mat = _bird_mat(a.spec, "mark")
     # AGAINST EVERY OTHER SLOT, not just the wing and the back. A robin's
     # marking colour and its underparts colour are both `plume_white`, so with
     # only two of the six checked this counted the whole belly as marking and
     # reported 45% of the bird as barred on a species that carries no bar at
     # all -- and then reported the same 45% at one bar and at ten, which reads
     # as a dead slider and is a dead measurement.
-    others = {materials.resolve(sm.get(a.spec, f"materials.bird_{k}"))
+    others = {_bird_mat(a.spec, k)
               for k in ("wing", "back", "belly", "head")}
     if mat in others:
         return 0.0
-    return _share(a, "materials.bird_mark")
+    return _share(a, "mark")
 
 
 def m_head_mark(a) -> float:
@@ -657,13 +700,13 @@ def m_head_mark(a) -> float:
     at 74% ink and nothing looked wrong. A probe that lies in the reassuring
     direction is worse than no probe.
     """
-    if sm.get(a.spec, "bird.head_mark") == "none":
+    if _bird_mark(a.spec, "head_mark") == "none":
         return 0.0
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_head_mark"))
-    head = materials.resolve(sm.get(a.spec, "materials.bird_head"))
+    mat = _bird_mat(a.spec, "head_mark")
+    head = _bird_mat(a.spec, "head")
     if mat == head:
         return 0.0
-    return _share(a, "materials.bird_head_mark")
+    return _share(a, "head_mark")
 
 
 def m_mark_runs(a) -> float:
@@ -683,7 +726,7 @@ def m_mark_runs(a) -> float:
     """
     from scipy import ndimage
 
-    mat = materials.resolve(sm.get(a.spec, "materials.bird_mark"))
+    mat = _bird_mat(a.spec, "mark")
     m = a.grid.data == mat
     if not m.any():
         return 0.0
@@ -701,8 +744,8 @@ def m_eye(a) -> float:
     measure this here" and "there is no eye" are different facts and the second
     one is what decides the lattice.
     """
-    eye = materials.resolve(sm.get(a.spec, "materials.bird_eye"))
-    others = {materials.resolve(sm.get(a.spec, f"materials.bird_{k}"))
+    eye = _bird_mat(a.spec, "eye")
+    others = {_bird_mat(a.spec, k)
               for k in ("back", "belly", "head", "wing", "mark", "head_mark",
                         "bill")}
     if eye in others:
@@ -1057,20 +1100,24 @@ def readability(names: list[str], seeds: list[int]) -> int:
         ink = _ink_delta(pipeline.build(pinned, seeds[0]),
                          pipeline.build(plain, seeds[0]))
 
+        # THROUGH `_bird_mat`, NOT OFF THE SPEC. This table runs on the spec as
+        # authored, where the two are the same thing -- but the day somebody
+        # points it at a sexed bird, reading the spec would grade the drake's
+        # colours and print the hen's name. `sexes` checks the other sex
+        # separately; see `_alt_contrast` for why that check had to exist.
         col = materials.color
-        res = materials.resolve
-        wing = col(res(sm.get(spec, "materials.bird_wing")))
-        under = col(res(sm.get(spec, "materials.bird_belly")))
-        head = col(res(sm.get(spec, "materials.bird_head")))
-        mark = col(res(sm.get(spec, "materials.bird_mark")))
-        hmark = col(res(sm.get(spec, "materials.bird_head_mark")))
+        wing = col(_bird_mat(spec, "wing"))
+        under = col(_bird_mat(spec, "belly"))
+        head = col(_bird_mat(spec, "head"))
+        mark = col(_bird_mat(spec, "mark"))
+        hmark = col(_bird_mat(spec, "head_mark"))
 
         cw = (_contrast(wing, mark)
-              if sm.get(spec, "bird.wing_mark") != "none" else float("nan"))
+              if _bird_mark(spec, "wing_mark") != "none" else float("nan"))
         cb = (_contrast(under, mark)
-              if sm.get(spec, "bird.body_mark") != "none" else float("nan"))
+              if _bird_mark(spec, "body_mark") != "none" else float("nan"))
         ch = (_contrast(head, hmark)
-              if sm.get(spec, "bird.head_mark") != "none" else float("nan"))
+              if _bird_mark(spec, "head_mark") != "none" else float("nan"))
         # THE BILL AGAINST THE HEAD, which is a fourth check and was not here
         # at first. It should have been: *Pixel Logic* records that Super Mario
         # World's Swoopers are bats that read as birds purely because their
@@ -1081,7 +1128,7 @@ def readability(names: list[str], seeds: list[int]) -> int:
         # were drawing it in a colour that did not separate from the head it
         # sticks out of. A robin's horn bill on its olive head measured 1.04,
         # which is no bill at all.
-        cbill = _contrast(col(res(sm.get(spec, "materials.bird_bill"))), head)
+        cbill = _contrast(col(_bird_mat(spec, "bill")), head)
 
         # Erosion survival: does the SILHOUETTE still have a bird's shape after
         # the equivalent of moving a voxel away? The pixel-art "features under
@@ -1098,7 +1145,7 @@ def readability(names: list[str], seeds: list[int]) -> int:
         flags = []
         if reach < 18:
             flags.append(f"SHORT ({reach:.0f} vox; the reference is 20-40)")
-        marked = sum(sm.get(spec, f"bird.{r}_mark") != "none"
+        marked = sum(_bird_mark(spec, f"{r}_mark") != "none"
                      for r in ("wing", "body", "head"))
         if marked and ink < 2.5:
             flags.append(f"FAINT MARKING ({ink:.1f}% of the bird)")
@@ -1234,7 +1281,14 @@ def _spare_colours(spec: dict, want: int) -> list[str]:
     already wears it, so a measurement keyed to it would count the macaw's whole
     body and report a head the size of a bird.
     """
+    # THE `alt` COLOURS COUNT AS USED TOO. A colour the species wears only as
+    # the other sex is still a colour a histogram cannot tell apart from the
+    # part being measured, and the whole point of this function is that a
+    # hardcoded `plume_crimson` is right on nineteen species and silently wrong
+    # on the twentieth.
     used = {sm.get(spec, f"materials.bird_{k}") for k in _BIRD_SLOTS}
+    used |= {sm.get(spec, f"materials.bird_alt_{k}")
+             for k in _BIRD_SLOTS if k != "eye"}
     free = [c for c in _SPARE_COLOURS if c not in used]
     if len(free) < want:
         raise SystemExit(
@@ -1371,6 +1425,463 @@ def _same_individual(names: list[str], seeds: list[int]) -> int:
     return bad
 
 
+# --- sex --------------------------------------------------------------------
+
+
+def _shares(a) -> dict[int, float]:
+    """The bird's material histogram as fractions of the bird."""
+    hist = a.stats["by_material"]
+    total = max(sum(hist.values()), 1)
+    return {k: v / total for k, v in hist.items()}
+
+
+def m_recolour(a, b) -> float:
+    """How much of the bird changed colour between two builds, in % of it.
+
+    MEASURED AS THE DISTANCE BETWEEN TWO MATERIAL HISTOGRAMS, IN SHARES, and
+    both halves of that are forced on us rather than chosen.
+
+    NOT VOXEL BY VOXEL, because the two builds are not the same individual and
+    cannot be made to be. Sex reseeds on purpose -- that is the design decision
+    `bird.sex` states -- so a male and a female of one seed draw different
+    marking phases even with `variation.amount` pinned to zero, and a
+    voxel-wise diff would report a speckled starling as heavily recoloured on
+    the strength of its speckles having moved. The histogram is blind to WHERE
+    the paint went, which is exactly the property wanted here.
+
+    IN SHARES RATHER THAN COUNTS, because a species that also carries a size
+    ratio draws two birds of different volumes, and a raw count difference on a
+    golden eagle would report a third of the animal recoloured when nothing was
+    repainted at all -- there is simply more of her.
+
+    THE NOISE FLOOR IS NOT ASSUMED, IT IS MEASURED, AND IT IS NOT SMALL. `sexes`
+    prints a control column beside this one: the same figure between two SEEDS
+    of one sex, which is the marking phase moving and nothing else. On a
+    song thrush it runs to eight per cent, and the reason is worth writing
+    down because it looks like a bug and is not. The thrush is 314 voxels. Its
+    speckling is placed as a QUANTILE of a noise field, so the number of
+    speckled voxels is identical between any two individuals -- but WHICH
+    voxels, and therefore whether a speckle lands on the rufous back or the
+    white belly, is not. Thirty-nine voxels of speckle change which region they
+    sit on, the two region colours swap thirty-odd voxels between them, and the
+    histogram moves by nine per cent without a single decision differing.
+
+    So a plumage swap has to clear its own control by a wide margin, and the
+    flag in `sexes` is written against the control rather than against a
+    constant.
+    """
+    sa, sb = _shares(a), _shares(b)
+    keys = set(sa) | set(sb)
+    return 50.0 * sum(abs(sa.get(k, 0.0) - sb.get(k, 0.0)) for k in keys)
+
+
+# Which of the ten `alt` rows a species has actually filled in. Read off the
+# spec rather than off the build, so it is exact and says nothing about voxels
+# -- the voxels are what `m_recolour` is for.
+#
+# IMPORTED FROM `forge/bird.py` RATHER THAN RETYPED. Ten strings that have to
+# stay equal to ten strings in another file is the drift `forge/materials.py`
+# warns about in its own header, and a probe holding a stale copy of the list
+# would report "10/10 alt rows reach the voxels" while never testing the
+# eleventh.
+_ALT_MAT_SLOTS = _birdlib.ALT_SLOTS
+_ALT_MARK_SLOTS = _birdlib.ALT_MARKS
+
+
+def _alt_rows(spec: dict) -> list[str]:
+    rows = [f"{s}={sm.get(spec, f'materials.bird_alt_{s}')}"
+            for s in _ALT_MAT_SLOTS
+            if sm.get(spec, f"materials.bird_alt_{s}") != "same"]
+    rows += [f"{s}={sm.get(spec, f'bird.sex_alt_{s}')}"
+             for s in _ALT_MARK_SLOTS
+             if sm.get(spec, f"bird.sex_alt_{s}") != "same"]
+    return rows
+
+
+def sexes(names: list[str], seeds: list[int]) -> int:
+    """Male against female, per species, in voxels and in repainted area.
+
+    THE POINT OF THIS TABLE IS THE SPECIES THAT DO NOT MOVE. Most of this
+    library has no difference worth drawing at these sizes and the honest
+    output is a row of zeros with the ratios at 1.00 and the plumage at
+    `same` -- not an invented difference. What it has to catch is the other
+    case: a species that AUTHORS a difference and does not get it, which is the
+    silent no-op wearing a field guide's jacket.
+
+    TWO MECHANISMS, SO TWO SETS OF NUMBERS, and the reason there are two is the
+    whole difference between this file and the fish one. A fish's sexual
+    difference is size and three ratios covered it. A bird's is nearly all
+    plumage: a mallard drake against a hen is a bottle-green head, a white
+    collar and a grey body against uniform mottled brown, and no ratio
+    anywhere can say that. So:
+
+      * THE RATIOS are checked the way the fish's are -- the measured
+        male-to-female difference in voxels has to clear two on any species
+        that claims a ratio at all, and `unsexed` has to sit between the two
+        sexes because the authored number is the mean and the ratio is split
+        as a square root either way.
+
+      * THE PLUMAGE SWAP is checked as REPAINTED AREA, in per cent of the bird,
+        with a measured control beside it. See `m_recolour`.
+
+      * AND THE TAIL RATIO IS CHECKED TWICE, once on the tail and once on the
+        bill. `bird.tail_frac` is one of five shares normalised to sum to one,
+        so the naive implementation lengthens the tail by shortening the head
+        and the bill; the bill column is there to prove it did not.
+
+      * A MALE AND A FEMALE OF ONE SEED ARE DIFFERENT INDIVIDUALS. That is the
+        design decision and it is the opposite of `bird.pose`, so it is
+        measured rather than assumed -- and it is measured on every species,
+        including the twelve that are otherwise identical, because that is the
+        only thing that separates "no dimorphism" from "the parameter is not
+        wired up".
+
+      * AND AN `alt` ROW ON A SPECIES DECLARED `same` IS A FAULT, not a spare.
+        It is authored plumage that no setting of any parameter can ever draw,
+        which is how a species gets "fixed" in a way that does nothing.
+    """
+    print("\nSEX  (male against female, individual variation off)\n")
+    print("  ratios are male:female and are split as a square root either way,")
+    print("  so `unsexed` is the geometric mean. PLUMAGE cannot be averaged: a")
+    print("  dimorphic species is authored as ONE sex and `unsexed` draws that")
+    print("  one. The `authored` column says which.\n")
+    print(f"{'species':<26} {'L':>5} {'T':>5} {'authored':<9} {'alt':>4} "
+          f"{'len f/m':>11} {'tail f/m':>11} {'bill f/m':>9} "
+          f"{'repaint':>8} {'vox':>6} {'phase':>6}  flags")
+    bad = 0
+    n_dimorphic = n_flat = 0
+    unsexed_is_a_sex = []
+    # Two seeds are enough for the geometry, which is deterministic once
+    # variation is off, and not nearly enough for the repaint figure, which is
+    # a difference of two noisy quantities. Both columns are averaged over
+    # every seed asked for.
+    pairs = list(zip(seeds, seeds[1:])) or [(seeds[0], seeds[0] + 1)]
+    for n in names:
+        spec, _ = sm.load(SPECS / f"{n}.json")
+        # PERCHED, ON EVERY SPECIES, INCLUDING THE FIVE AUTHORED FLYING, and
+        # this is not tidiness -- it is the fix the barn swallow forced. A
+        # flying bird's length along the grid's x axis is set by its SWEPT
+        # WINGTIPS, not by its tail: a swallow's tips are carried ten voxels
+        # aft and its whole tail is six, so a 20% tail ratio measured as one
+        # voxel of length and `m_tail_run` came back 3, 6, 5 for female,
+        # unsexed and male -- non-monotonic, which is a measurement reporting
+        # noise as a result. Perched, the same ratio measures 11 against 13
+        # columns of tail and the length 26 against 28, monotonic on both. The
+        # pose is a posture and all twenty species are authorable in either, so
+        # pinning it costs nothing and is what `SETUP_FOR` does for half the
+        # sweep table already.
+        pinned, _ = sm.patch(spec, {"variation.amount": 0.0,
+                                    "bird.pose": "perched"})
+        rl = float(sm.get(spec, "bird.sex_length"))
+        rt = float(sm.get(spec, "bird.sex_tail"))
+        authored = str(sm.get(spec, "bird.sex_plumage"))
+        by_sex = {s: sm.patch(pinned, {"bird.sex": s})[0]
+                  for s in ("unsexed", "female", "male")}
+        built = {s: pipeline.build(v, seeds[0]) for s, v in by_sex.items()}
+        L = {k: m_length(v) for k, v in built.items()}
+        T = {k: m_tail_run(v) for k, v in built.items()}
+        B = {k: m_bill_run(v) for k, v in built.items()}
+        moved = max(abs(L["male"] - L["female"]), abs(T["male"] - T["female"]))
+        repaint = float(np.mean([
+            m_recolour(pipeline.build(by_sex["male"], s),
+                       pipeline.build(by_sex["female"], s)) for s in seeds]))
+        # THE CONTROL, and the table is unreadable without it. Two seeds of ONE
+        # sex, same spec, variation off: everything that differs between them
+        # is the marking phase, which is the noise `repaint` sits on top of.
+        control = float(np.mean([
+            m_recolour(pipeline.build(by_sex["unsexed"], i),
+                       pipeline.build(by_sex["unsexed"], j)) for i, j in pairs]))
+
+        claims_size = max(abs(rl - 1.0), abs(rt - 1.0)) > 0.005
+        rows = _alt_rows(spec)
+        claims_plumage = authored != "same"
+        # The same figure in voxels. A PER CENT ALONE CANNOT GATE THIS and the
+        # great spotted woodpecker is why: the entire published difference
+        # between the sexes of that species is that the male carries a crimson
+        # patch on the nape and the female does not, and at 1 cm that patch is
+        # FOUR VOXELS on a 352-voxel bird -- 1.1%. A five-per-cent gate calls
+        # the most-quoted field mark in the set a no-op. A two-voxel gate alone
+        # is no better in the other direction: two voxels on a 28,355-voxel
+        # golden eagle is a rounding error. Both, therefore.
+        repaint_vox = repaint * 0.01 * np.mean(
+            [built["male"].stats["voxels"], built["female"].stats["voxels"]])
+        flags = []
+        if claims_size and moved < 2.0:
+            flags.append(f"CLAIMS A RATIO AND MOVES {moved:.0f} VOXELS")
+        if not claims_size and moved >= 2.0:
+            flags.append(f"NO RATIO AUTHORED BUT MOVED {moved:.0f} VOXELS")
+        # The tail ratio must not be paid for out of the bill. Half a voxel is
+        # the rounding of one column; anything above that is the normalisation
+        # eating the rest of the bird.
+        if abs(rt - 1.0) > 0.005 and abs(B["male"] - B["female"]) > 0.5:
+            flags.append(f"the tail ratio moved the BILL by "
+                         f"{abs(B['male'] - B['female']):.0f} columns")
+        for label, m in (("length", L), ("tail", T)):
+            lo, hi = sorted((m["female"], m["male"]))
+            if hi - lo >= 2.0 and not (lo - 1.0 <= m["unsexed"] <= hi + 1.0):
+                flags.append(f"unsexed {label} {m['unsexed']:.0f} is outside "
+                             f"[{lo:.0f}, {hi:.0f}]")
+        if claims_plumage and not rows:
+            flags.append("declares a sexed plumage and fills in no alt row")
+        # AGAINST THE SPECIES' OWN NOISE, not against a constant. A swap on a
+        # thrush has to beat the six per cent its speckles move on their own;
+        # a swap on a raven has to beat nothing, because a raven has no
+        # speckles to move. And it has to be two voxels, whatever the per cent
+        # says.
+        floor = max(1.5 * control, 0.5)
+        if claims_plumage and (repaint < floor or repaint_vox < 2.0):
+            flags.append(f"CLAIMS A PLUMAGE SWAP AND REPAINTS {repaint:.1f}% "
+                         f"= {repaint_vox:.0f} voxels, against a phase floor of "
+                         f"{floor:.1f}% and a two-voxel floor")
+        if not claims_plumage and rows:
+            flags.append(f"sex_plumage=same but {len(rows)} alt row(s) are "
+                         f"authored and can never be drawn: {', '.join(rows)}")
+        # SEX RESEEDS. Checked on every species, not only the dimorphic ones:
+        # on a monomorphic bird it is the ONLY thing that separates "male and
+        # female look alike" from "the parameter never reached the build".
+        hm = sm.seed_hash(sm.patch(spec, {"bird.sex": "male"})[0])
+        hf = sm.seed_hash(sm.patch(spec, {"bird.sex": "female"})[0])
+        if hm == hf:
+            flags.append("male and female seed to the SAME individual; sex is "
+                         "meant to reseed -- see bird.sex")
+        if claims_size or claims_plumage:
+            n_dimorphic += 1
+        else:
+            n_flat += 1
+        if claims_plumage:
+            unsexed_is_a_sex.append(f"{n} ({authored})")
+        bad += bool(flags)
+        print(f"{n:<26} {rl:>5.2f} {rt:>5.2f} {authored:<9} {len(rows):>4} "
+              f"{L['female']:>5.0f}/{L['male']:<5.0f} "
+              f"{T['female']:>5.0f}/{T['male']:<5.0f} "
+              f"{B['female']:>4.0f}/{B['male']:<4.0f} "
+              f"{repaint:>7.1f}% {repaint_vox:>6.0f} {control:>5.1f}%  "
+              f"{'; '.join(flags)}")
+
+    # SAY "NO GEOMETRY", NOT "NOTHING", because the repaint column beside it is
+    # not zero on three of these and a summary line claiming it was would be
+    # contradicted by the table directly above it. A song thrush repaints 6% of
+    # its histogram between a male and a female that differ in no authored value
+    # at all; that is its speckle phase, the control column measures it, and
+    # rounding it away in the summary is how a true statement becomes a lie.
+    print(f"\n  {n_dimorphic} of {len(names)} species carry a difference; "
+          f"{n_flat} are authored at 1.00/1.00 and `same` and move NO GEOMETRY "
+          f"at all -- the honest null. Any repaint on those is the marking "
+          f"phase, and the `phase` column beside it is what that costs.")
+    if unsexed_is_a_sex:
+        print("\n  UNSEXED IS ONE OF THE SEXES on these, because colour has no "
+              "average:")
+        for line in unsexed_is_a_sex:
+            print(f"    {line}")
+    bad += _alt_contrast(names)
+    bad += _alt_slots_live(seeds)
+    return bad
+
+
+def _alt_contrast(names: list[str]) -> int:
+    """Does the OTHER sex's plumage clear the same contrast floor?
+
+    A HOLE THE MOMENT THE SWAP EXISTED, and worth naming because it is the
+    exact shape of this project's favourite bug. `readability` reads
+    `materials.bird_*` directly, so it has always checked the plumage a spec is
+    authored in and nothing else. The day a mallard grew a female, half the
+    library's colour decisions stopped being covered by the gate that exists to
+    cover them -- the hen is brown upperparts over buff underparts with a
+    brown wing behind a blue speculum, and nothing anywhere asked whether those
+    separate. The gate reported PASS on twenty species and was checking sixteen.
+
+    THE EFFECTIVE COLOURS ARE READ THROUGH `bird._alt_mat` AND `bird._alt_mark`,
+    which is the drawing code's own resolution rather than a copy of it. This
+    file otherwise refuses to read internals; the reason it is allowed here is
+    that the repaint column above has already proved the swap reaches the
+    voxels, so what is left to check is which COLOURS it reached them with, and
+    a second implementation of the sentinel logic is exactly the drift that
+    would make the answer wrong.
+    """
+    rows = [(n, sm.load(SPECS / f"{n}.json")[0]) for n in names]
+    rows = [(n, s) for n, s in rows if sm.get(s, "bird.sex_plumage") != "same"]
+    print("\nTHE OTHER SEX'S COLOURS, AGAINST THE SAME CONTRAST FLOOR  "
+          f"(floor {CONTRAST_FLOOR})\n")
+    if not rows:
+        print("  no species declares a sexed plumage.")
+        return 0
+    print(f"{'species':<26} {'sex':<8} {'wing/mark':>10} {'body/mark':>10} "
+          f"{'head/mark':>10} {'bill/head':>10} {'back/belly':>11}  flags")
+    bad = 0
+    col, res = materials.color, materials.resolve
+    for n, spec in rows:
+        authored = str(sm.get(spec, "bird.sex_plumage"))
+        other = "female" if authored == "male" else "male"
+        for sex in (authored, other):
+            s, _ = sm.patch(spec, {"bird.sex": sex})
+            alt = _birdlib._alt(s)
+            c = {k: col(_birdlib._alt_mat(s, k, alt)) for k in _ALT_MAT_SLOTS}
+            mk = {k: _birdlib._alt_mark(s, k, alt) for k in _ALT_MARK_SLOTS}
+            pairs = (
+                ("wing", _contrast(c["wing"], c["mark"]),
+                 mk["wing_mark"] != "none"),
+                ("body", _contrast(c["belly"], c["mark"]),
+                 mk["body_mark"] != "none"),
+                ("head", _contrast(c["head"], c["head_mark"]),
+                 mk["head_mark"] != "none"),
+                ("bill", _contrast(c["bill"], c["head"]), True),
+                # THE FIFTH PAIR, WHICH `readability` DOES NOT CHECK AT ALL and
+                # which the hen mallard forced. Upperparts against underparts is
+                # the division every field guide leads with, and on a bird whose
+                # markings have all been swapped away it is the ONLY division
+                # left -- a hen drawn brown over brown is a duck-shaped blob and
+                # every marking check would pass her, because she has no
+                # markings to check.
+                #
+                # CHECKED ONLY WHEN THERE IS NOTHING ELSE, and that condition is
+                # the whole point rather than a let-off. Two species here are
+                # deliberately one colour top to bottom -- a drake is grey above
+                # and below, a winter ptarmigan is white -- and both measure
+                # 1.00 here and are correct. What is not survivable is one
+                # colour top to bottom AND no marking anywhere, which is a
+                # silhouette with no information in it at all.
+                ("back/belly", _contrast(c["back"], c["belly"]),
+                 not any(mk[k] != "none" for k in _ALT_MARK_SLOTS)),
+            )
+            flags = [f"LOW CONTRAST on the {w} ({v:.2f})"
+                     for w, v, on in pairs if on and v < CONTRAST_FLOOR]
+            bad += bool(flags)
+
+            def f(v, on):
+                return "     -" if not on else f"{v:>6.2f}"
+
+            print(f"{n if sex == authored else '':<26} {sex:<8} "
+                  f"{f(pairs[0][1], pairs[0][2]):>10} "
+                  f"{f(pairs[1][1], pairs[1][2]):>10} "
+                  f"{f(pairs[2][1], pairs[2][2]):>10} "
+                  f"{f(pairs[3][1], True):>10} {f(pairs[4][1], True):>11}  "
+                  f"{'; '.join(flags)}")
+    return bad
+
+
+# The species every `alt` slot is exercised on. A songbird rather than a
+# mallard, on purpose: this is a WIRING test and it has to run on a spec that
+# authors none of the rows it is setting, so that what it measures is the
+# mechanism and not the mallard.
+_SLOT_RIG = "european-robin"
+
+
+def _leak_floor(moved: float) -> float:
+    """How far the CONTROL may drift before it counts as a leak.
+
+    NOT A CONSTANT, AND THE FIRST VERSION WAS ONE. Setting an `alt` row changes
+    the spec, `pipeline.rng_for` mixes the spec hash into the seed, and the
+    marking phase therefore moves between the control build and the one it is
+    compared against -- so a barred rig's marking share drifts by 1.3% with
+    nothing wired wrong at all, and a flat 0.5% threshold reported the
+    body-marking row as leaking on its first run. A real leak is the whole
+    swap arriving on the wrong sex, so the bar is a QUARTER of the movement
+    being tested, floored at 2% so that a tiny effect cannot be excused.
+    """
+    return max(2.0, 0.25 * abs(moved))
+
+
+def _alt_slots_live(seeds: list[int]) -> int:
+    """Does every one of the ten `alt` rows actually reach the voxels?
+
+    THE TABLE ABOVE CANNOT ANSWER THIS AND IT IS THE OBVIOUS PLACE TO BE
+    WRONG. Six of the seven colour slots and one of the three marking slots are
+    used by exactly one species in the library, and two of the ten are used by
+    none at all. A slot no species authors is a slot whose wiring has never
+    been executed -- and this project's history is `bill_gape`, which was
+    multiplied by `bill_depth` and therefore did nothing on any bird smaller
+    than a heron, and shipped, and was found by a probe and not by an eye.
+
+    So each row is set here on a species that authors none of them, to a colour
+    or a marking the species wears nowhere, and the share of the bird wearing
+    it is measured before and after. The reason this is a fair test rather than
+    a rigged one is that it is the SAME rig for all ten: if the swap gate were
+    wired to the wrong parameter, every row would read zero together.
+    """
+    print("\nEVERY ALT ROW, ON ONE RIG  (a slot no species authors is a slot "
+          "that has never run)\n")
+    spec, _ = sm.load(SPECS / f"{_SLOT_RIG}.json")
+    # `sex_plumage=male` plus `sex=female` is the swap in force. The rig also
+    # turns on all three markings, because a marking colour cannot be measured
+    # on a bird that carries no marking -- which is the false alarm that makes
+    # a no-op detector worse than none.
+    spec, _ = sm.patch(spec, {
+        "variation.amount": 0.0, "bird.sex_plumage": "male",
+        "bird.head_mark": "cap", "bird.wing_mark": "bar",
+        "bird.body_mark": "barred", "bird.mark_width": 0.5,
+        # A LONG BILL ON PURPOSE. At the robin's authored 0.07 the bill and the
+        # legs together are two voxels of a 600-voxel bird, and the alt bill row
+        # measured 0.5% -- a real effect sitting exactly on the threshold, which
+        # is indistinguishable from a dead one. The row being tested is the
+        # wiring, not the robin.
+        "bird.bill_frac": 0.22,
+        "bird.length_m": 0.9, "bird.leg_len": 0.06})
+    colour, = _spare_colours(spec, 1)
+    base_m, _ = sm.patch(spec, {"bird.sex": "male"})
+    base_f, _ = sm.patch(spec, {"bird.sex": "female"})
+    print(f"  rig: {_SLOT_RIG} at 0.90 m, sex_plumage=male, all three markings "
+          f"on, alt colour {colour}")
+    print(f"\n{'alt row':<34} {'share before':>13} {'share after':>12} "
+          f"{'moved':>7}  verdict")
+    dead = 0
+
+    def _mean_share(s, name) -> float:
+        mat = materials.resolve(name)
+        vals = []
+        for sd in seeds:
+            a = pipeline.build(s, sd)
+            hist = a.stats["by_material"]
+            vals.append(100.0 * hist.get(mat, 0) / max(sum(hist.values()), 1))
+        return float(np.mean(vals))
+
+    for slot in _ALT_MAT_SLOTS:
+        path = f"materials.bird_alt_{slot}"
+        before = _mean_share(base_f, colour)
+        after = _mean_share(sm.patch(base_f, {path: colour})[0], colour)
+        # AND THE CONTROL: the same row set, asked for as the sex the spec is
+        # authored as. It must NOT move, or the gate is not a gate and every
+        # bird in the library is wearing half of the other sex.
+        leak = _mean_share(sm.patch(base_m, {path: colour})[0], colour)
+        state = "moves" if after - before >= 0.5 else "DEAD"
+        if abs(leak - before) >= _leak_floor(after - before):
+            state = f"LEAKS TO THE AUTHORED SEX ({leak - before:.1f}%)"
+        dead += state != "moves"
+        print(f"{path:<34} {before:>12.1f}% {after:>11.1f}% "
+              f"{after - before:>6.1f}%  {state}")
+
+    # The markings are choices, so they are measured by how much of the bird
+    # the marking colour covers when the region's mark is turned OFF for the
+    # other sex. Off rather than on, because all three are already on in the
+    # rig and a mark that cannot be turned off is a mark that is not being read.
+    mark_colour = materials.resolve(sm.get(spec, "materials.bird_mark"))
+    head_colour = materials.resolve(sm.get(spec, "materials.bird_head_mark"))
+    for which, mat in (("head_mark", head_colour), ("wing_mark", mark_colour),
+                       ("body_mark", mark_colour)):
+        path = f"bird.sex_alt_{which}"
+
+        def _share_of(s, m=mat) -> float:
+            vals = []
+            for sd in seeds:
+                a = pipeline.build(s, sd)
+                hist = a.stats["by_material"]
+                vals.append(100.0 * hist.get(m, 0) / max(sum(hist.values()), 1))
+            return float(np.mean(vals))
+
+        before = _share_of(base_f)
+        after = _share_of(sm.patch(base_f, {path: "none"})[0])
+        leak = _share_of(sm.patch(base_m, {path: "none"})[0])
+        state = "moves" if abs(after - before) >= 0.5 else "DEAD"
+        if abs(leak - before) >= _leak_floor(after - before):
+            state = f"LEAKS TO THE AUTHORED SEX ({leak - before:.1f}%)"
+        dead += state != "moves"
+        print(f"{path + ' -> none':<34} {before:>12.1f}% {after:>11.1f}% "
+              f"{after - before:>6.1f}%  {state}")
+
+    print(f"\n  {10 - dead}/10 alt rows reach the voxels and none of them leak "
+          f"to the sex the spec is authored as.")
+    return dead
+
+
 # The species the pose A/B renders. Six rather than twenty, chosen to be
 # unmistakable from each other at a glance and to span the shapes: the raven is
 # the animal the pose bug was reported on, the eagle is the biggest thing in the
@@ -1443,6 +1954,87 @@ def pose_ab(names: list[str], seed: int, out: Path) -> Path:
     return p
 
 
+# The species the sex A/B renders, and this list is chosen by the TABLE rather
+# than by taste: it is every species that authors a plumage swap, plus the two
+# that move most on a ratio alone. Anything authored at 1.00/1.00 and `same` is
+# left off, because three identical cells in a row is a picture that says
+# nothing and trains the eye to skim the sheet.
+SEX_AB = ("mallard-duck", "common-kestrel", "great-spotted-woodpecker",
+          "rock-ptarmigan", "barn-swallow", "golden-eagle")
+
+
+def sex_ab(names: list[str], seed: int, out: Path) -> Path:
+    """Female, unsexed and male of one species, side by side.
+
+    INDIVIDUAL VARIATION IS OFF, AND THAT IS THE OPPOSITE OF THE POSE SHEET.
+    The pose sheet leaves it ON because what it has to prove is that two
+    postures came off the same random stream, and pinning it would have made
+    the two halves match for the wrong reason. Here the two halves are meant to
+    be DIFFERENT BIRDS -- sex reseeds -- so leaving variation on would add a
+    random size difference to every row and there would be no way to tell a
+    real ratio from a seed that drew a big one. Each row is therefore one
+    animal at its species average, drawn three times.
+
+    THE MIDDLE CELL IS THE ONE TO READ ON A DIMORPHIC SPECIES. `unsexed` is the
+    geometric mean on the ratios, so it should sit between its neighbours in
+    size -- but on plumage it is whichever sex the spec is authored as, which
+    means the middle mallard is a drake and matches the cell on one side of it
+    exactly. That is the limitation of drawing colour rather than a number, and
+    a sheet that hid it would be a sheet that lied.
+
+    ONE SCALE PER ROW, not one per page, for the reason the pose sheet gives:
+    a page-wide ruler that fits a golden eagle draws a swallow at eight pixels.
+
+    PERCHED AND BROADSIDE ON EVERY ROW, INCLUDING THE THREE AUTHORED FLYING,
+    and the first version of this sheet did neither. It drew each species in
+    its authored pose through `render.camera_for`'s choice of camera, which
+    sent the kestrel and the swallow to the isometric with their wings spread
+    -- and a spread wing is the largest flat area on the animal, so the
+    kestrel's rufous head against a slate one was four pixels beside a wing
+    that fills the cell, and the swallow's two extra columns of tail were
+    hidden behind its own swept primaries. Both differences ARE there; the
+    sheet was drawing the part of the bird they are not on.
+
+    Every difference on this sheet is a colour field on the flank or a tail,
+    which is exactly what a perched broadside shows and what a spread-winged
+    isometric hides. It is also the pose the measurement table uses, for the
+    same reason and stated there. The pose is a posture and all twenty species
+    are authorable in either, so this costs nothing.
+    """
+    from forge import contact, render
+
+    cells = []
+    for n in names:
+        spec, _ = sm.load(SPECS / f"{n}.json")
+        spec, _ = sm.patch(spec, {"variation.amount": 0.0,
+                                  "bird.pose": "perched"})
+        row = [(s, pipeline.build(sm.patch(spec, {"bird.sex": s})[0], seed))
+               for s in ("female", "unsexed", "male")]
+        scale = render.scale_for_camera([a.grid.data.shape for _, a in row],
+                                        "side", 440)
+        authored = str(sm.get(spec, "bird.sex_plumage"))
+        ratios = (f"L{sm.get(spec, 'bird.sex_length'):g} "
+                  f"T{sm.get(spec, 'bird.sex_tail'):g} {authored}")
+        for s, a in row:
+            note = f"  = the {authored}" if (authored != "same"
+                                             and s == "unsexed") else ""
+            cells.append((render.view(a.grid, "side", scale=scale),
+                          f"{n}  {s}  [{ratios}]  "
+                          f"{a.stats['voxels']:,} vox{note}", []))
+
+    img = contact.sheet(
+        cells,
+        title=f"sex A/B: female, unsexed and male, seed {seed}",
+        subtitle=("variation OFF, every row perched and broadside: one animal "
+                  "drawn three times. [L T sex] = the two male:female ratios "
+                  "and the sex the colours are authored as."),
+        columns=3,
+    )
+    p = contact.save(img, out)
+    print(f"  wrote {p}")
+    return p
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1454,10 +2046,15 @@ def main() -> int:
     ap.add_argument("--read", action="store_true", help="readability tests only")
     ap.add_argument("--lattice", action="store_true", help="lattice comparison only")
     ap.add_argument("--pose", action="store_true", help="pose comparison only")
+    ap.add_argument("--sex", action="store_true",
+                    help="male against female, in voxels and repainted area")
+    ap.add_argument("--sex-ab", action="store_true",
+                    help="render the female/unsexed/male sheet to out/birds/")
     ap.add_argument("--pose-ab", action="store_true",
                     help="render the folded/spread A/B sheet to out/birds/")
     ap.add_argument("--seed", type=int, default=7,
-                    help="which individual the --pose-ab sheet draws (default 7)")
+                    help="which individual the --pose-ab and --sex-ab sheets "
+                         "draw (default 7)")
     args = ap.parse_args()
 
     seeds = list(range(1, args.seeds + 1))
@@ -1477,11 +2074,21 @@ def main() -> int:
             return 2
         pose_ab(list(POSE_AB), args.seed, ROOT / "out" / "birds" / "birds-pose-ab.png")
         return 0
+    if args.sex_ab:
+        missing = [n for n in SEX_AB if n not in names]
+        if missing:
+            print(f"SEX_AB names specs that do not exist: {', '.join(missing)}",
+                  file=sys.stderr)
+            return 2
+        sex_ab(list(SEX_AB), args.seed, ROOT / "out" / "birds" / "birds-sex-ab.png")
+        return 0
     if args.lattice:
         lattice(names, seeds)
         return 0
     if args.pose:
         return 1 if pose(names, seeds) else 0
+    if args.sex:
+        return 1 if sexes(names, seeds) else 0
     if args.read:
         return 1 if readability(names, seeds) else 0
 
@@ -1489,8 +2096,9 @@ def main() -> int:
     dead = sweep(base, seeds)
     variation(base, seeds)
     bad = readability(names, seeds)
+    bad += sexes(names, seeds)
     print(f"\n{dead} parameter(s) measured as DEAD; "
-          f"{bad} species carry a readability flag.")
+          f"{bad} species carry a readability or sex flag.")
     print("A DEAD parameter is not a tuning problem. It is a wiring problem.")
     return 1 if dead else 0
 
