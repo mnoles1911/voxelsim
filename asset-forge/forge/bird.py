@@ -228,9 +228,32 @@ del _slot, _m, _declared
 T_NONE, T_BODY, T_NECK, T_HEAD, T_BILL = 0, 1, 2, 3, 4
 T_TAIL, T_WING, T_LEG, T_CREST = 5, 6, 7, 8
 
+# The same tags, named, for anything downstream that has to move a part rather
+# than paint one. THIS IS WHY THE TAG GRID LEAVES THIS FILE.
+#
+# Animals are rigid-part animated and ship in ONE pose (owner, 2026-08-14 --
+# see docs/animal-rigging-decision.md), which means the runtime rotates a wing
+# about a shoulder rather than swapping to a differently-baked bird. It can
+# only do that if the asset says which voxels are the wing, and until now this
+# grid was scratch: built because the paint pass needs to tell a wing from a
+# body, thrown away three lines later.
+PART_NAMES = {
+    T_NONE: "none", T_BODY: "body", T_NECK: "neck", T_HEAD: "head",
+    T_BILL: "bill", T_TAIL: "tail", T_WING: "wing", T_LEG: "leg",
+    T_CREST: "crest",
+}
 
-def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
+
+def build(spec: dict, rng: np.random.Generator, voxel_m: float,
+          out: dict | None = None) -> VoxelGrid:
     """One bird, bill at +x, back at +z, seen broadside from -y.
+
+    `out`, when given, collects the part tags on the way past -- `out["tags"]`
+    is a uint8 array parallel to the returned grid, valued by the `T_*`
+    constants, and `out["part_names"]` names them. An out-dict rather than a
+    second return value so no existing caller changes, and rather than a
+    separate entry point so the tags cannot drift from the geometry they
+    describe: they are the same pass.
 
     Same convention as a fish, and for the same reason: this is the first thing
     in the library after a fish that has a FRONT, and a preview camera that has
@@ -265,6 +288,9 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
 
     grid = VoxelGrid(p["shape"], (0, 0, 0), voxel_m)
     _paint(grid, tag.data, p, body)
+    if out is not None:
+        out["tags"] = tag.data
+        out["part_names"] = PART_NAMES
     return grid
 
 

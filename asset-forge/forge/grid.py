@@ -345,11 +345,20 @@ class VoxelGrid:
 
     # -- finishing ----------------------------------------------------------
 
-    def crop(self) -> "VoxelGrid":
-        """Shrink to the occupied bounding box, keeping world origin correct."""
+    def crop(self, also=None) -> "VoxelGrid":
+        """Shrink to the occupied bounding box, keeping world origin correct.
+
+        `also`, when given, is a second array of the same shape cropped by the
+        SAME box and returned as `(grid, cropped)`. It exists for the part tags
+        that ride alongside an animal's voxels: cropping the two separately
+        would compute the box from whichever array was asked, and a tag array
+        is not empty in the same places as a material array -- so they would
+        silently come back different shapes, or worse, the same shape offset by
+        a voxel.
+        """
         occ = self.data != 0
         if not occ.any():
-            return self
+            return (self, also) if also is not None else self
         xs = np.flatnonzero(occ.any(axis=(1, 2)))
         ys = np.flatnonzero(occ.any(axis=(0, 2)))
         zs = np.flatnonzero(occ.any(axis=(0, 1)))
@@ -358,7 +367,10 @@ class VoxelGrid:
             tuple(self.origin + np.array([xs[0], ys[0], zs[0]])),
             self.voxel_m,
         )
-        out.data[:] = self.data[xs[0] : xs[-1] + 1, ys[0] : ys[-1] + 1, zs[0] : zs[-1] + 1]
+        box = (slice(xs[0], xs[-1] + 1), slice(ys[0], ys[-1] + 1), slice(zs[0], zs[-1] + 1))
+        out.data[:] = self.data[box]
+        if also is not None:
+            return out, also[box]
         return out
 
     def surface_mask(self) -> np.ndarray:

@@ -122,8 +122,13 @@ assert set(SEXES) == set(_SEXES), (
     f"fish.py SEXES and spec.py _SEXES disagree: {set(SEXES) ^ set(_SEXES)}")
 
 
-def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
+def build(spec: dict, rng: np.random.Generator, voxel_m: float,
+          out: dict | None = None) -> VoxelGrid:
     """One fish, nose at +x, back at +z, seen broadside from -y.
+
+    `out`, when given, collects the part tags on the way past -- `out["tags"]`
+    is a uint8 array parallel to the returned grid, valued by the `P_*`
+    constants. Same pass as the geometry, so the two cannot drift.
 
     The orientation is fixed rather than random because a fish is the first
     asset here with a FRONT. A rock has no correct way round and a tree is a
@@ -139,6 +144,16 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:
     fins, fin_kind = _fins(p, body)
     _paint(grid, p, body, fins, fin_kind)
     _barbels(grid, p)
+    if out is not None:
+        # Body first, fins over it. A fin starts ONE VOXEL INSIDE the body (see
+        # `_fins`), so the overlap is deliberate and those voxels belong to the
+        # fin -- they are what holds it on, and a fin whose root is tagged body
+        # would tear off the moment it rotated.
+        tags = np.where(grid.data != 0, np.uint8(P_BODY), np.uint8(P_NONE))
+        tags[fins] = fin_kind[fins]
+        tags[grid.data == 0] = P_NONE
+        out["tags"] = tags
+        out["part_names"] = PART_NAMES
     return grid
 
 
@@ -570,6 +585,21 @@ def _body(p: dict) -> np.ndarray:
 # Which fin a voxel belongs to, so the paint pass can colour the caudal
 # differently from the body without a second geometry pass.
 FIN_NONE, FIN_MEDIAN, FIN_CAUDAL, FIN_PAIRED = 0, 1, 2, 3
+
+# Part tags as the RIGGING sees them, which is not the same question `_fins`
+# answers. `_fins` separates fins by how they are drawn and painted -- median,
+# caudal, paired -- and that is the right split for colour. A rig wants the
+# body as a part too, because the body is what everything else rotates against.
+#
+# Animals are rigid-part animated and ship in one pose (owner, 2026-08-14; see
+# docs/animal-rigging-decision.md), so the asset has to say which voxels move
+# together. Same numbering as the fin kinds with the body added at the end, so
+# the translation is one addition rather than a table.
+P_NONE, P_MEDIAN, P_CAUDAL, P_PAIRED, P_BODY = 0, 1, 2, 3, 4
+PART_NAMES = {
+    P_NONE: "none", P_MEDIAN: "median-fin", P_CAUDAL: "caudal-fin",
+    P_PAIRED: "paired-fin", P_BODY: "body",
+}
 
 
 def _fins(p: dict, body: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

@@ -64,10 +64,42 @@ rather than an individual, and it costs nothing when the exclusion set is empty.
 `bird.sex` is unaffected and stays outside the exclusion set. Sex is not a
 posture: there is no individual that is "the same mallard, but female".
 
-## What this does NOT decide
+## The seam: a ball at every joint, owned by the parent
 
-The seam problem. Rotating a rigid voxel limb about a joint opens a gap at the
-shoulder, and how that looks is an art call nobody here has made yet — Minecraft
-accepts it outright, others hide it with an overlapping collar of voxels that
-belongs to both parts. The generator can produce either; it needs to be told
-which. Worth settling with one animal on screen rather than in advance.
+**Decision (owner, 2026-08-14): whichever looks more natural.** That is a ball
+joint, and it is worth saying why rather than just recording the choice, because
+the two obvious alternatives are both worse and one of them is what most voxel
+games ship.
+
+Rotating a rigid limb about a joint opens a wedge of empty space on the outside
+of the bend. Three ways to deal with it:
+
+* **Leave it.** Minecraft does. It reads as a style rather than a defect at that
+  blockiness, and it costs nothing. It is also the thing the owner asked us not
+  to do.
+* **An overlapping collar** — duplicate the voxels near the joint into both
+  parts so there is always material spanning the gap. It works at small angles
+  and fails at large ones: the collar is a shape, and a shape only covers the
+  wedge from the directions it was built to cover. Push the leg forward far
+  enough and the seam opens on the other side.
+* **A ball at the joint, belonging to the PARENT part.** A sphere of the
+  parent's material centred on the joint, with a radius a little over the
+  child's cross-section. This is the one that actually works, and the reason is
+  that **a sphere is rotationally symmetric**: it presents the same silhouette
+  from every direction, so it covers the wedge at *any* angle rather than at the
+  angles someone anticipated. A shoulder stays a shoulder through the whole
+  swing. It is also what the real shape is — a shoulder IS a ball — so it reads
+  as anatomy rather than as a patch.
+
+So: each joint gets a cap sphere, owned by the parent, radius scaled from the
+child limb's own thickness. Cheap, and it is drawn by machinery that already
+exists (`grid.ball` / the same ellipsoid stamps the generators use everywhere).
+
+**Two limits worth knowing before this is built.** On a small animal the cap can
+eat the limb: a 22 cm squirrel at 2 cm has legs two or three voxels thick, and a
+ball big enough to cover their swing is most of the leg. Below about three
+voxels of limb thickness the cap should be skipped — at that size the wedge is
+one voxel and invisible, so it is buying nothing. And the cap must be drawn as
+part of the PARENT, not shared: a voxel that belongs to two parts has no defined
+answer when both rotate, which is the overlapping-collar problem wearing a
+different hat.

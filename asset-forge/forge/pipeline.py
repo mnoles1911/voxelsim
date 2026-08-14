@@ -58,6 +58,15 @@ class Asset:
     seed: int
     realized: dict = field(default_factory=dict)  # this individual of it
     stats: dict[str, Any] = field(default_factory=dict)
+    # WHICH PART EACH VOXEL BELONGS TO, parallel to `grid.data`, or None for a
+    # kind that has no parts to move -- a rock, a tuft, a tree. Animals are
+    # rigid-part animated and ship in one pose (owner, 2026-08-14; see
+    # docs/animal-rigging-decision.md), so the runtime rotates a wing about a
+    # shoulder and needs to be told which voxels are the wing. Both animal
+    # generators already computed this to paint their markings and threw it
+    # away; carrying it is the whole change.
+    parts: Any = None
+    part_names: dict[int, str] | None = None
 
     @property
     def name(self) -> str:
@@ -241,6 +250,9 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
     live = envelope.apply_allometry(live)
 
     kind = get(live, "kind")
+    # Only the animal generators produce these; a rock has no parts to move.
+    parts = None
+    part_names = None
     model = get(live, "growth.model")
     skel = None
     clumps = 0
@@ -257,7 +269,12 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         gen = (rocklib if kind in BOULDER_KINDS
                else fishlib if kind in FISH_KINDS
                else birdlib if kind in BIRD_KINDS else groundlib)
-        grid = gen.build(live, rng, voxel_m)
+        gen_out: dict = {}
+        grid = (gen.build(live, rng, voxel_m, out=gen_out)
+                if kind in FISH_KINDS or kind in BIRD_KINDS
+                else gen.build(live, rng, voxel_m))
+        parts = gen_out.get("tags")
+        part_names = gen_out.get("part_names")
         pieces_built = _piece_count(grid)
         if kind in BOULDER_KINDS:
             orphans, airborne_kept = _single_piece(grid)
@@ -287,7 +304,11 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         orphans = _drop_orphans(grid)
         t_raster = time.perf_counter()
 
-    grid = grid.crop()
+    # The tags ride along, cropped by the same box -- see VoxelGrid.crop.
+    if parts is not None:
+        grid, parts = grid.crop(also=parts)
+    else:
+        grid = grid.crop()
 
     stats: dict[str, Any] = {
         "seed": seed,
@@ -360,7 +381,8 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         stats["detached"] = int(round(stats["voxels"] * (1.0 - attached)))
     stats["ms_total"] = round((time.perf_counter() - t0) * 1e3, 1)
 
-    return Asset(grid=grid, skeleton=skel, spec=spec, seed=seed, realized=live, stats=stats)
+    return Asset(grid=grid, skeleton=skel, spec=spec, seed=seed, realized=live,
+                 stats=stats, parts=parts, part_names=part_names)
 
 
 # Kept as an alias: the tool grew up as a tree generator and plenty of call
