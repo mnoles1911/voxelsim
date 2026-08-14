@@ -50,8 +50,36 @@ TAutoConsoleVariable<bool> CVarVoxelWaterRippleEnable(
 	TEXT("before the feature existed -- it is the A arm of any A/B on it."),
 	ECVF_Default);
 
+// ---------------------------------------------------------------------------
+// THE DEFAULTS BELOW WERE RAISED ON 2026-08-14 BECAUSE THE FEATURE WAS INVISIBLE
+// IN PLAY WHILE BEING COMPLETELY CORRECT.
+//
+// The owner tested every ripple command, threw voxel cubes into a lake and flew
+// into it himself, and saw nothing on any path. Six separate measurements said
+// the system was healthy, and they were all right: a CPU readback of the render
+// targets (voxel.Water.Ripple.Probe, written for this) showed the splat landing
+// -- state 0.5 -> 1.165 -- the derive pass producing gradients up to 2.13, and
+// the field texture holding a ring over 1% of its area. A debug build routing
+// that field straight to emissive rendered it plainly: 34,854 red-dominant
+// pixels against ZERO in an otherwise identical frame where the drop had been
+// placed outside the view.
+//
+// So nothing was broken. Three things made it unnoticeable, and all three are
+// numbers:
+//   * A 1.8 s HALF-LIFE. Fly in, then look down, and it is already 70% gone.
+//   * STRENGTHS SIZED AGAINST FLAT WATER. 9 cm of player entry competes with a
+//     6 cm wind-wave field on the same normal -- and the wind waves are moving,
+//     which wins the eye every time.
+//   * A/B ON THE SHIPPING MATERIAL measured the ring at a mean 3.59/255 delta:
+//     really there, and about as visible as a compression artefact.
+//
+// These are a starting point for judgement, not a measurement. The whole
+// apparatus for re-judging them is in place now: voxel.Water.Ripple.Probe reads
+// the data, VOXEL_WATER_RIPPLE_DEBUG=1 renders the field directly, and
+// -VoxelExecAfter runs a drop once the world is actually up.
+// ---------------------------------------------------------------------------
 TAutoConsoleVariable<float> CVarVoxelWaterRippleGain(
-	TEXT("voxel.Water.Ripple.Gain"), 1.0f,
+	TEXT("voxel.Water.Ripple.Gain"), 2.5f,
 	TEXT("Global multiplier on the ripple field as the water material reads it. 1 is shipped ")
 	TEXT("strength. This scales what is DRAWN, not what is simulated, so turning it down and ")
 	TEXT("back up does not disturb a settling ring -- which is what makes it the right knob for ")
@@ -68,7 +96,7 @@ TAutoConsoleVariable<float> CVarVoxelWaterRippleSpeed(
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRippleHalfLife(
-	TEXT("voxel.Water.Ripple.HalfLifeSec"), 1.8f,
+	TEXT("voxel.Water.Ripple.HalfLifeSec"), 5.0f,
 	TEXT("Seconds for a ripple's amplitude to halve. 1.8 puts a splash at ~10% after 6 s, and ")
 	TEXT("since 2026-08-12 that is the REALISED figure rather than the intended one -- the step ")
 	TEXT("material damped only one of the two time levels, which made every configured half-life ")
@@ -116,20 +144,20 @@ TAutoConsoleVariable<bool> CVarVoxelWaterRippleAutoWatch(
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRipplePlayerStrength(
-	TEXT("voxel.Water.Ripple.PlayerStrengthM"), 0.09f,
+	TEXT("voxel.Water.Ripple.PlayerStrengthM"), 0.22f,
 	TEXT("Ripple height in metres for a player entering water at full speed, scaled down for a ")
 	TEXT("slow entry. 9 cm is already a big splash: the ambient wind wave on this water is ")
 	TEXT("8.6 cm crest-to-mean (create_water_voxel_material.py:2356-2382)."),
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRipplePlayerRadius(
-	TEXT("voxel.Water.Ripple.PlayerRadiusM"), 0.5f,
+	TEXT("voxel.Water.Ripple.PlayerRadiusM"), 0.9f,
 	TEXT("Initial radius in metres of the ring a player makes entering water. Roughly a body's ")
 	TEXT("width; the ring expands from there at voxel.Water.Ripple.SpeedMPS."),
 	ECVF_Default);
 
 TAutoConsoleVariable<float> CVarVoxelWaterRippleObjectStrength(
-	TEXT("voxel.Water.Ripple.ObjectStrengthM"), 0.07f,
+	TEXT("voxel.Water.Ripple.ObjectStrengthM"), 0.18f,
 	TEXT("Ripple height in metres for a thrown voxel volume or a lump of debris hitting water at ")
 	TEXT("full speed. Its RADIUS comes from the object's own bounds, not from here."),
 	ECVF_Default);
@@ -234,6 +262,95 @@ FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleDropHereCmd(
 			}
 			UE_LOG(LogVoxelWater, Log, TEXT("Ripple.DropHere: (%.0f, %.0f) UU, %d step(s)."),
 			       P.X, P.Y, Steps);
+		}));
+
+// READ THE TEXTURES BACK AND SAY WHAT IS IN THEM.
+//
+// WHY THIS EXISTS. On 2026-08-13 the ripple system reported perfect health and
+// rendered nothing, through every path -- the console drop, the player entering
+// water, and a thrown cube. Everything checkable was checked and all of it
+// passed: `armed=1 published=1 steps=26585 injected=4 dropped(outside=0 full=0
+// unarmed=0 inert=0)`, the derive shader correctly removing the storage bias,
+// M_WaterVoxel's package naming RT_VoxelRippleField and all three RippleField*
+// collection parameters, the field render target being RGBA16F so signed
+// gradients survive, the sheet's vertex colour B being 255 so the top-face mask
+// cannot be zeroing it, and not one warning in the log.
+//
+// Every one of those is a check on the PROCESS. None of them looks at the DATA.
+// `injected` in particular counts calls that passed validation and were written
+// into a splat slot -- it is not evidence that the shader ever used them.
+//
+// So this reads the pixels. It is the same move as the pinned-pose screenshot
+// that settles material regressions on this project, one layer down and without
+// needing anybody's eyes.
+//
+// HOW TO READ THE RESULT, which is the point of printing all three:
+//   state non-zero, field non-zero -> the data is there and the fault is in the
+//       water material: the UV mapping, or a contribution too small to see.
+//   state non-zero, field ZERO     -> the derive pass is not writing.
+//   state ZERO                     -> the step pass is not applying the splats,
+//       and `injected` was measuring the wrong thing.
+void ProbeRenderTarget(UTextureRenderTarget2D* RT, const TCHAR* Name)
+{
+	if (RT == nullptr)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Probe: %s is NULL."), Name);
+		return;
+	}
+	FTextureRenderTargetResource* Res = RT->GameThread_GetRenderTargetResource();
+	if (Res == nullptr)
+	{
+		UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Probe: %s has no render resource."), Name);
+		return;
+	}
+
+	TArray<FLinearColor> Pixels;
+	if (!Res->ReadLinearColorPixels(Pixels) || Pixels.Num() == 0)
+	{
+		UE_LOG(LogVoxelWater, Warning,
+		       TEXT("Ripple.Probe: %s read back %d pixel(s) -- the readback itself failed, so this "
+		            "says nothing about the contents."),
+		       Name, Pixels.Num());
+		return;
+	}
+
+	double MinR = 1e30, MaxR = -1e30, MinG = 1e30, MaxG = -1e30, MinB = 1e30, MaxB = -1e30;
+	double SumAbs = 0.0;
+	int32 NonZero = 0;
+	for (const FLinearColor& C : Pixels)
+	{
+		MinR = FMath::Min(MinR, (double)C.R); MaxR = FMath::Max(MaxR, (double)C.R);
+		MinG = FMath::Min(MinG, (double)C.G); MaxG = FMath::Max(MaxG, (double)C.G);
+		MinB = FMath::Min(MinB, (double)C.B); MaxB = FMath::Max(MaxB, (double)C.B);
+		const double A = FMath::Abs((double)C.R) + FMath::Abs((double)C.G) + FMath::Abs((double)C.B);
+		SumAbs += A;
+		if (A > 1e-6) { ++NonZero; }
+	}
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("Ripple.Probe: %s %dx%d  R[%.5f..%.5f] G[%.5f..%.5f] B[%.5f..%.5f]  "
+	            "mean|rgb|=%.6f  nonzero=%d/%d (%.1f%%)"),
+	       Name, RT->SizeX, RT->SizeY, MinR, MaxR, MinG, MaxG, MinB, MaxB,
+	       SumAbs / (double)Pixels.Num(), NonZero, Pixels.Num(),
+	       100.0 * (double)NonZero / (double)Pixels.Num());
+}
+
+FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleProbeCmd(
+	TEXT("voxel.Water.Ripple.Probe"),
+	TEXT("Read the ripple render targets back to the CPU and print their min/max/mean per channel. "
+	     "THE INSTRUMENT FOR 'everything reports healthy and nothing renders': the counters and the "
+	     "asset checks all measure the process, this measures the DATA. state non-zero + field "
+	     "non-zero means the fault is in the water material; state non-zero + field zero means the "
+	     "derive pass is not writing; state zero means the step pass never applied the splats."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+		{
+			UVoxelRippleFieldSubsystem* Ripple = FindRippleSubsystem(World);
+			if (Ripple == nullptr)
+			{
+				UE_LOG(LogVoxelWater, Warning, TEXT("Ripple.Probe: no ripple subsystem in this world."));
+				return;
+			}
+			Ripple->ProbeTextures();
 		}));
 
 FAutoConsoleCommandWithWorldAndArgs GVoxelWaterRippleStatCmd(
@@ -1085,4 +1202,19 @@ void UVoxelRippleFieldSubsystem::AutoWatch(float DeltaTime)
 			Consider(Actor);
 		}
 	}
+}
+
+void UVoxelRippleFieldSubsystem::ProbeTextures()
+{
+	// All three, in the order the data flows, so the log reads as a pipeline and
+	// the first zero is the culprit. Front() is the state the derive pass reads,
+	// which is the one that matters -- probing the back buffer would report the
+	// previous step and could look like a one-frame lag that is not there.
+	UE_LOG(LogVoxelWater, Log,
+	       TEXT("Ripple.Probe: armed=%d published=%d steps=%lld injected=%lld -- the counters say "
+	            "healthy; below is what is actually in the textures."),
+	       bArmed_ ? 1 : 0, bPublished_ ? 1 : 0, (long long)TotalSteps_, (long long)Injected_);
+	ProbeRenderTarget(Front(), TEXT("state(front)"));
+	ProbeRenderTarget(Front() == StateA_ ? StateB_ : StateA_, TEXT("state(back)"));
+	ProbeRenderTarget(Field_, TEXT("field(derived)"));
 }

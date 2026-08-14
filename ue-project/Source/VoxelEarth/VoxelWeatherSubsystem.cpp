@@ -75,6 +75,33 @@ namespace
 		TEXT("number carries an argument and that one does not."),
 		ECVF_Default);
 
+	// HOW LONG THE SEA TAKES TO NOTICE THE WIND, in seconds. This is the knob for
+	// the owner's 2026-08-13 report: "the wave effect is way way too fast, it
+	// looks like someone is playing a video at multiple times speed, and the wind
+	// effect on water is jittery and moving too fast."
+	//
+	// The cause was not the wave animation -- with voxel.Weather.Enabled 0 the
+	// material uses a STATIC fallback wind and the same waves were judged "quite
+	// good". It is that wind speed sets WAVELENGTH as well as height
+	// (water_wave_graph.py, U^0.68), so a wind that moves every frame slides
+	// every crest every frame, and the eye reads that as the scene running fast.
+	//
+	// 45 s is a starting point, not a measurement. Real wind seas are duration-
+	// limited over minutes, so if anything this is still fast; it was chosen so
+	// that pinning a new wind with voxel.Weather.PinMps visibly TAKES EFFECT
+	// within a few seconds while play-testing, rather than appearing not to work.
+	// Turn it up if the water still hurries, down if a pinned change feels
+	// unresponsive. 0 disables smoothing entirely and restores the raw
+	// instantaneous wind, which is the arm that produced the complaint.
+	TAutoConsoleVariable<float> CVarWeatherWaveResponseSeconds(
+		TEXT("voxel.Weather.WaveResponseSeconds"), 45.0f,
+		TEXT("Time constant, in seconds, of the low-pass between the wind field and the wind that ")
+		TEXT("reaches water materials. Waves have inertia: a real sea takes minutes to build to a new ")
+		TEXT("wind, and driving wave height AND wavelength from a 6-second gust band makes the whole ")
+		TEXT("surface appear to run at several times speed. 0 = no smoothing (raw instantaneous wind). ")
+		TEXT("Does not affect the logged or HUD wind, which stays the true instantaneous value."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<float> CVarWeatherWindScale(
 		TEXT("voxel.Weather.WindScale"), 1.0f,
 		TEXT("Multiplier on the whole wind speed. Default 1.0. The knob for 'make the world ")
@@ -223,6 +250,11 @@ namespace VoxelWeather
 		return FMath::Max(0.0, (double)CVarWeatherBaseWindMps.GetValueOnAnyThread());
 	}
 
+	float GetWaveResponseSeconds()
+	{
+		return FMath::Max(0.0f, CVarWeatherWaveResponseSeconds.GetValueOnAnyThread());
+	}
+
 	double GetWindScale() { return FMath::Max(0.0, (double)CVarWeatherWindScale.GetValueOnAnyThread()); }
 	double GetGustScale() { return FMath::Max(0.0, (double)CVarWeatherGustScale.GetValueOnAnyThread()); }
 
@@ -278,6 +310,14 @@ struct FVoxelWeatherImpl
 	// same call for the same reason), and released in Deinitialize.
 	TStrongObjectPtr<UMaterialParameterCollection> Collection;
 	bool bCollectionLoadAttempted = false;
+
+	// The sea's response to the wind, in m/s along world +X (north) and +Y
+	// (east). NOT the wind -- see the wave-inertia note in Tick for why the
+	// instantaneous wind must not reach a material. Seeded from the first real
+	// sample rather than from zero, which is what bSmoothedWindValid tracks.
+	double SmoothedNorthMS = 0.0;
+	double SmoothedEastMS = 0.0;
+	bool bSmoothedWindValid = false;
 
 	// Real seconds since the last periodic log line.
 	double SecondsSinceLog = 0.0;
@@ -668,10 +708,14 @@ void UVoxelWeatherSubsystem::PublishWind(const FVoxelWindSample& Wind)
 	// A VELOCITY, so the length is the sustained speed and direction cannot go
 	// stale independently of it. Gust rides in B; it is a magnitude in m/s on
 	// top of the sustained wind, not a multiplier.
+	// THE SMOOTHED VECTOR, not the raw sample -- see the wave-inertia note in
+	// Tick. The raw sample is still in FVoxelWeatherState for the log line, the
+	// HUD and any consumer that genuinely wants the instantaneous wind; what
+	// crosses into a material is the sea's response to it.
 	UKismetMaterialLibrary::SetVectorParameterValue(
 		World, C, kParamWindVector,
-		FLinearColor((float)(Wind.DirNorth * Wind.SustainedMps),
-		             (float)(Wind.DirEast * Wind.SustainedMps),
+		FLinearColor((float)Impl->SmoothedNorthMS,
+		             (float)Impl->SmoothedEastMS,
 		             (float)Wind.GustMps, 0.0f));
 
 	// LAST, AND IT MATTERS THAT IT IS LAST. WindFieldValid is the flag every
@@ -806,6 +850,60 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 	S.bBearingPinned = VoxelWeather::IsBearingPinned();
 	S.bSpeedPinned = VoxelWeather::IsSpeedPinned();
 	S.Wind = SampleWindAtWorldUUAtEpoch(CamX, CamY, Epoch);
+
+	// --- WAVE INERTIA ---------------------------------------------------------
+	//
+	// THE WIND THAT DRIVES WAVES IS NOT THE WIND. It is a heavily smoothed
+	// version of it, and shipping without this was the first thing the owner
+	// noticed: "the wave effect is way way too fast, it looks like someone is
+	// playing a video at multiple times speed, and the wind effect on water is
+	// jittery and moving too fast."
+	//
+	// WHY IT LOOKS LIKE SPEED RATHER THAN LIKE FLICKER, which is the part worth
+	// understanding before touching the number. Wind speed does not merely scale
+	// wave HEIGHT -- water_wave_graph.py derives the wavelength from it too
+	// (lenScale, U^0.68). Retune the wavelength and every crest in the field
+	// moves to a new position in that same frame. So a wind that wanders a few
+	// per cent per frame slides the entire pattern a few per cent per frame, on
+	// top of the waves' own correct motion, and the eye reads the sum as the
+	// whole scene running fast.
+	//
+	// The owner's own A/B is the proof: with voxel.Weather.Enabled 0 the material
+	// falls back to a STATIC 5 m/s wind and he judged it "quite good ... looks
+	// like there is still slight breeze blowing across surface". Same wave field,
+	// same animation, no per-frame wind -- so the wave maths was never the
+	// problem.
+	//
+	// AND IT IS ALSO THE PHYSICS. Wind seas are duration- and fetch-limited: a
+	// sea takes minutes to build to a new wind and longer to lie down, which is
+	// why the JONSWAP fetch relation the amplitude comes from is quoted against a
+	// SUSTAINED wind and not an instantaneous one. Driving wave height and
+	// wavelength from a 6-second gust band is asking the ocean to have no mass.
+	//
+	// One-pole low-pass, frame-rate independent (alpha from exp(-dt/tau), not a
+	// fixed per-frame fraction -- the latter makes the response depend on how
+	// fast the machine is, and a capture would then not match a play session).
+	// The GUST channel is deliberately NOT smoothed: it is published for spray
+	// and foam, which SHOULD twitch, and nothing reads it yet anyway.
+	const float TauSeconds = VoxelWeather::GetWaveResponseSeconds();
+	const double SmoothN = S.Wind.DirNorth * S.Wind.SustainedMps;
+	const double SmoothE = S.Wind.DirEast * S.Wind.SustainedMps;
+	if (!Impl->bSmoothedWindValid || TauSeconds <= 0.0f || DeltaTime <= 0.0f)
+	{
+		// Seeded to the first real sample rather than to zero, so there is no
+		// warm-up ramp from a dead calm at world start -- an artefact that would
+		// be invisible in play and would quietly corrupt the first seconds of
+		// any capture.
+		Impl->SmoothedNorthMS = SmoothN;
+		Impl->SmoothedEastMS = SmoothE;
+		Impl->bSmoothedWindValid = true;
+	}
+	else
+	{
+		const double Alpha = 1.0 - FMath::Exp(-(double)DeltaTime / (double)TauSeconds);
+		Impl->SmoothedNorthMS += (SmoothN - Impl->SmoothedNorthMS) * Alpha;
+		Impl->SmoothedEastMS += (SmoothE - Impl->SmoothedEastMS) * Alpha;
+	}
 
 	PublishWind(S.Wind);
 	++S.Publishes;

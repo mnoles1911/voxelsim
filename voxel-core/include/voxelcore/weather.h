@@ -61,17 +61,17 @@
 // one or the other ("make it windier", "the wind should come off the sea").
 // Four bands contribute, at four timescales, and each is separately nameable:
 //
-//   REGIME   ~3 h of clock, +/-180 deg of bearing, no dependence on place.
+//   REGIME   ~24 h of clock, +/-180 deg of bearing, no dependence on place.
 //            "This week the wind is out of the north." The band that lets the
 //            wind visit the whole compass rather than fidgeting about a fixed
 //            quarter. Time only: a regime that differed between two ends of
 //            the map would not be a regime.
 //
-//   PREVAIL  ~20 min of clock, +/-55 deg of bearing, no dependence on place.
+//   PREVAIL  ~4 h of clock, +/-55 deg of bearing, no dependence on place.
 //            "It has backed round to the west this afternoon." Time only, same
 //            reason.
 //
-//   SYNOPTIC ~2 km of ground and ~10 min of clock. Carries BOTH a bearing
+//   SYNOPTIC ~2 km of ground and ~2 h of clock. Carries BOTH a bearing
 //            perturbation (+/-25 deg) and the speed's whole variation
 //            (x0.35 .. x1.65). This is the band that answers the actual
 //            requirement -- different parts of the map having different wind
@@ -81,12 +81,38 @@
 //            THIS BAND ADVECTS (see below), which is what makes weather arrive
 //            from upwind instead of fading in on the spot.
 //
-//   GUST     ~180 m of ground and ~6 s of clock. +/-9 deg of bearing and a
+//   GUST     ~180 m of ground and ~90 s of clock. +/-9 deg of bearing and a
 //            speed swing of +/-25% OF THE SUSTAINED SPEED -- a fraction, not
 //            an absolute, so a calm day has small gusts and a rough one has
 //            large ones, which is both the real behaviour and the only way a
 //            pinned dead-calm wind can be genuinely dead calm. Does NOT
 //            advect: a gust is a local eddy, not a system passing through.
+//
+// THE TIMESCALES WERE 8-15x FASTER UNTIL 2026-08-13, AND THAT WAS THE WHOLE
+// PROBLEM. They were originally regime 3 h, prevail 20 min, synoptic 10 min,
+// gust 6 s, chosen so that weather would visibly change within a play session.
+// That reasoning is right for a cloud layer and WRONG FOR WATER, and the owner
+// rejected it three times in a row -- "the wave effect is way way too fast, it
+// looks like someone is playing a video at multiple times speed", and then twice
+// more he simply turned the whole system off with voxel.Weather.Enabled 0
+// because a static fallback wind looked better than a live one.
+//
+// The mechanism, which is not obvious and is why a filter was tried first: wind
+// speed sets wave WAVELENGTH as well as wave height (water_wave_graph.py,
+// U^0.68). Retune the wavelength and every crest in the field moves to a new
+// place in that same frame. So wind that wanders visibly over ten minutes drags
+// the entire surface pattern with it, continuously, and the eye reads that as
+// the scene running at several times speed. A low-pass between the field and the
+// material (voxel.Weather.WaveResponseSeconds) treated the symptom and needed to
+// be set to 5000 s -- an effectively frozen wind -- before the water looked
+// right, which is the measurement that condemned these numbers rather than the
+// filter.
+//
+// THE STANDARD IS THE OWNER'S: "in real weather, wave direction may only change
+// several times per day with general wind direction changes." So regime is now
+// a day, prevail four hours, synoptic two hours, and the gust a minute and a
+// half. A player still sees the wind change; they see it change over a session
+// rather than over a shot.
 //
 // FOUR NAMED BANDS RATHER THAN N ANONYMOUS OCTAVES. A sum of fBm octaves is
 // the standard cheap answer and would produce a similar-looking field, but
@@ -432,13 +458,13 @@ struct WindParams {
     // REGIME: the slow bearing wander that lets the wind reach the whole
     // compass. 3 h of clock; at the default voxel.Sky.DayLengthSeconds that is
     // about three game days per lattice cell.
-    int64_t regimeLatticeMs = 10'800'000;
+    int64_t regimeLatticeMs = 86'400'000;
     int32_t regimeTurnMilliDeg = 180'000;
 
     // PREVAIL: the within-session bearing wander. 20 min of clock, a third of
     // a game day at the default day length -- long enough that a capture leg
     // does not see it move, short enough that a session does.
-    int64_t prevailLatticeMs = 1'200'000;
+    int64_t prevailLatticeMs = 14'400'000;
     int32_t prevailTurnMilliDeg = 55'000;
 
     // SYNOPTIC. 2048 m is the one number here with a source:
@@ -447,7 +473,7 @@ struct WindParams {
     // power of two so the lattice lines land on round world coordinates, which
     // makes a probe's census readable.
     int64_t synopticLatticeMm = 2'048'000;
-    int64_t synopticLatticeMs = 600'000;
+    int64_t synopticLatticeMs = 7'200'000;
     int32_t synopticTurnMilliDeg = 25'000;
     // Q15. 21299/32768 = 0.65, so the speed multiplier spans 0.35 .. 1.65.
     int32_t synopticSpeedSpanQ = 21'299;
@@ -462,7 +488,7 @@ struct WindParams {
     // spatial part alone re-rolls the gust every 36 s, so the two axes
     // contribute at comparable rates and neither dominates.
     int64_t gustLatticeMm = 180'000;
-    int64_t gustLatticeMs = 6'000;
+    int64_t gustLatticeMs = 90'000;
     int32_t gustTurnMilliDeg = 9'000;
     // Q15, and a FRACTION OF THE SUSTAINED SPEED rather than an absolute.
     // 8192/32768 = 0.25, giving a gust factor (peak / sustained) of 1.25,

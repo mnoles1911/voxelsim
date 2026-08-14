@@ -1319,6 +1319,74 @@ void AVoxelEarthGameMode::BeginPlay()
 	// for streaming to populate, captures a screenshot, then quits ~3s later
 	// (screenshot write is async). Drives phase-verification captures from
 	// scripts/CI without editor tooling.
+	// -VoxelExecAfter=<seconds> plus -VoxelExecCmds="a,b,c": run console commands
+	// once the world is actually up.
+	//
+	// WHY UE'S OWN -ExecCmds IS NOT ENOUGH, and it cost three runs to work out.
+	// It fires at ENGINE INIT. Measured on 2026-08-14: a chain that dropped a
+	// ripple and probed the render targets ran with `steps=0 injected=0` and the
+	// ripple window origin still at (0,0) -- no world, no camera, no simulation
+	// step had happened, so a drop at the player's position was 6.5 million UU
+	// outside the window. Nothing errored; the output was simply a measurement of
+	// an empty world, which is indistinguishable from a measurement of a broken
+	// feature.
+	//
+	// Two more things about -ExecCmds that are worth writing down because each
+	// one silently produced a wrong answer here:
+	//   * IT SPLITS ON COMMAS, NOT PIPES. A '|'-joined chain is handed to the
+	//     first command as one long argument and the rest is discarded --
+	//     silently. tools/water-playtest.ps1 joins with '|' and has therefore
+	//     only ever run its first command.
+	//   * THE VALUE MUST BE QUOTED IF IT CONTAINS SPACES, or the engine's parser
+	//     splits it and can take the tail as a MAP NAME. One run tried to resolve
+	//     a network host called "3|voxel.Throwable.DropAt".
+	//
+	// So: same comma convention as -ExecCmds (one habit, not two), fired from a
+	// timer like every other delayed action in this file.
+	float ExecDelaySeconds = 0.f;
+	FString ExecCmdLine;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelExecAfter="), ExecDelaySeconds) &&
+	    ExecDelaySeconds > 0.f &&
+	    FParse::Value(FCommandLine::Get(), TEXT("VoxelExecCmds="), ExecCmdLine) &&
+	    !ExecCmdLine.IsEmpty())
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelExecAfter: will run %.1fs from now: %s"), ExecDelaySeconds, *ExecCmdLine);
+		FTimerHandle ExecHandle;
+		GetWorldTimerManager().SetTimer(
+			ExecHandle,
+			FTimerDelegate::CreateWeakLambda(this,
+				[this, ExecCmdLine]()
+				{
+					UWorld* W = GetWorld();
+					APlayerController* PC = W ? W->GetFirstPlayerController() : nullptr;
+					TArray<FString> Cmds;
+					ExecCmdLine.ParseIntoArray(Cmds, TEXT(","), true);
+					for (const FString& C : Cmds)
+					{
+						const FString Trimmed = C.TrimStartAndEnd();
+						if (Trimmed.IsEmpty())
+						{
+							continue;
+						}
+						// Echoed BEFORE running, so a command that hangs or
+						// crashes still names itself in the log. The alternative
+						// -- log the result -- tells you nothing about the one
+						// that did not return.
+						UE_LOG(LogVoxelEarth, Log, TEXT("VoxelExecAfter: %s"), *Trimmed);
+						if (PC)
+						{
+							PC->ConsoleCommand(Trimmed, /*bWriteToLog=*/true);
+						}
+						else if (GEngine && W)
+						{
+							GEngine->Exec(W, *Trimmed);
+						}
+					}
+				}),
+			ExecDelaySeconds, /*bLoop=*/false);
+	}
+
 	float DelaySeconds = 0.f;
 	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelScreenshotAfter="), DelaySeconds) && DelaySeconds > 0.f)
 	{

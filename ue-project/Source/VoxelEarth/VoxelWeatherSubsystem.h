@@ -346,6 +346,10 @@ namespace VoxelWeather
 	VOXELEARTH_API double GetBaseSpeedMps();
 	// Multiplier on the base speed. The knob for "make the whole world windier"
 	// without moving the number the base is justified against.
+	// Seconds. The low-pass between the wind field and the wind a material sees
+	// -- waves have inertia; see the cvar's own note in the .cpp.
+	VOXELEARTH_API float GetWaveResponseSeconds();
+
 	VOXELEARTH_API double GetWindScale();
 	// Multiplier on the gust band only. 0 gives a perfectly steady wind that is
 	// still varying in space and over the slower bands -- which is what a

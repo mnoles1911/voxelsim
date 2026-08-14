@@ -274,6 +274,12 @@ public:
 	// reproducible. Inject, run a fixed number of steps, freeze, capture.
 	void RunSteps(int32 NumSteps);
 
+	// Read the three render targets back to the CPU and log their contents. See
+	// voxel.Water.Ripple.Probe in the .cpp for why this exists: every other
+	// check in this class measures the PROCESS, and there was a state in which
+	// all of them passed and nothing rendered.
+	void ProbeTextures();
+
 	// Both state targets back to flat water. Also called on arm and disarm -- a
 	// field left over from a previous world would otherwise be the first thing
 	// the next one shows.

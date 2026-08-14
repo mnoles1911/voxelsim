@@ -88,11 +88,11 @@ struct Reference {
 constexpr Reference kReference[] = {
     // t = 0: independent (mirror-derived, unaffected by the advection fix).
     {0, 0, 0, -7033, 1834, 7298, 9270, -1972, 104623},
-    {0, 0, 1000, -7135, 1834, 7397, 9259, -1862, 104426},
+    {0, 0, 1000, -7024, 1832, 7289, 9259, -1970, 104623},
     // advected: regression pins, regenerated 2026-08-13. See above.
-    {1'000'000, -2'000'000, 3'600'000, -5885, 2791, 6538, 5435, 1103, 115382},
-    {-123'456'789, 987'654'321, 86'400'000, 2966, -6579, 7236, 8016, -780, 335727},
-    {2'048'000, 2'048'000, 600'000, -8508, -2289, 8850, 8237, 613, 74933},
+    {1'000'000, -2'000'000, 3'600'000, -6071, 2306, 6511, 6104, 407, 110796},
+    {-123'456'789, 987'654'321, 86'400'000, -6567, -750, 6641, 6954, -313, 83485},
+    {2'048'000, 2'048'000, 600'000, -3496, 1425, 3778, 3470, 308, 112179},
 };
 
 } // namespace
@@ -200,7 +200,16 @@ VXC_TEST(wind_visits_the_whole_compass) {
     int hits[16] = {};
     constexpr int kSamples = 20000;
     for (int i = 0; i < kSamples; ++i) {
-        const int64_t t = rng.pos(200'000'000LL);
+        // 2e9 ms, not 2e8, since 2026-08-13. The regime band -- the only one
+        // that can reach the whole compass -- was slowed from 3 h to 24 h, and
+        // this test sampled 55 h of clock, i.e. barely two regime periods. A
+        // noise field over two cells does not visit all sixteen sectors, so the
+        // test failed on a field that is behaving exactly as intended. The
+        // REQUIREMENT is unchanged ("the wind must not fidget about a fixed
+        // quarter"); what changed is how long you have to watch to see it, and
+        // the horizon has to follow the band it is measuring. 2e9 ms is ~23
+        // regime periods, the same ratio the old 2e8 had against the old 3 h.
+        const int64_t t = rng.pos(2'000'000'000LL);
         const WindSample w = sampleWind(kSeed, rng.sym(1'000'000'000LL), rng.sym(1'000'000'000LL), t, p);
         const int64_t b = floorMod(static_cast<int64_t>(w.fromBearingMilliDeg) + 11'250, 360'000);
         ++hits[b / 22'500];

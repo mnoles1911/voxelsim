@@ -2802,6 +2802,55 @@ return pow(d, max(SpecExponent, 1.0)) * n * n;
         wave_grad_total = bathy_b.add(wave_grad_raw, ripple["grad_xy"])
         wave_height_total = bathy_b.add(wave_height_m, ripple["height_m"])
 
+        # --- THE INSTRUMENT: VOXEL_WATER_RIPPLE_DEBUG=1 ---------------------
+        #
+        # Routes the ripple field straight to EMISSIVE and nothing else, so the
+        # water surface becomes a picture of the field instead of a surface lit
+        # by it. Built because static reading had run out of road.
+        #
+        # THE STATE THAT FORCED THIS, recorded because every single check passed
+        # and the feature still did not work. The simulation reported
+        # `armed=1 published=1 steps=26585 injected=4 dropped(outside=0 full=0
+        # unarmed=0 inert=0)` -- four disturbances accepted, none rejected. The
+        # derive pass correctly removes the storage bias (h = HC - StateBias).
+        # M_WaterVoxel's package names RT_VoxelRippleField, RippleFieldGain,
+        # RippleFieldOrigin and RippleFieldInvSize, so the sampler and all three
+        # collection parameters are really in the graph. The subsystem publishes
+        # all three every frame and `published=1` proves the gain it published
+        # was above zero. There is not one warning in the log. And no ripple is
+        # visible on the water.
+        #
+        # When every report is healthy and the picture disagrees, the reports are
+        # measuring the wrong thing, and the only way forward is to look at the
+        # data itself. That is the same conclusion this project reached about
+        # material regeneration -- the pinned-pose screenshot is the check that
+        # works -- arrived at again one layer down.
+        #
+        # WHAT THE TWO OUTCOMES MEAN, so the next run is decisive:
+        #   COLOUR appears around the player  -> the texture holds data and the
+        #       UV lands, so the fault is downstream: the ripple's contribution
+        #       to the NORMAL is real but too small to see against the wind
+        #       waves, and the fix is a gain or a strength.
+        #   FLAT BLACK -> the sample itself is zero, so it is the derive draw or
+        #       the UV mapping, and the gain is irrelevant.
+        # Green/red tint reads the two gradient channels; blue reads height.
+        if os.environ.get("VOXEL_WATER_RIPPLE_DEBUG", "0").strip().lower() not in (
+                "0", "off", "false", "no", ""):
+            # The GRADIENT only, not the height: a float2 wired to emissive
+            # reads as (R, G, 0), which is all that is needed to answer "is
+            # there anything in this texture". Assembling a float3 would need an
+            # AppendVector this builder does not expose, and the extra channel
+            # would tell us nothing the first two do not.
+            dbg_gain = scalar_param("RippleDebugGain", 20.0, -1300, 3000)
+            dbg = bathy_b.mul(ripple["grad_xy"], dbg_gain)
+            if not mel.connect_material_property(
+                    dbg, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR):
+                raise RuntimeError("connect ripple debug -> emissive failed")
+            unreal.log(
+                "M_WaterVoxel RIPPLE DEBUG ARM: ON -- emissive is the ripple field "
+                "(R,G = gradient, B = height) x RippleDebugGain. THIS IS NOT A SHIPPING "
+                "MATERIAL; rebuild without VOXEL_WATER_RIPPLE_DEBUG to restore it.")
+
     # --- NORMAL -------------------------------------------------------------
     #
     # A height field's tangent-space normal is (-dH/dx, -dH/dy, 1). Z IS PINNED
