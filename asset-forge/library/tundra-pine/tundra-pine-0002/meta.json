@@ -3,48 +3,48 @@
   "species": "tundra-pine",
   "kind": "tree",
   "seed": 2,
-  "spec_hash": "85612b0563aa7cbe",
+  "spec_hash": "7641fd7c694868d1",
   "stats": {
     "seed": 2,
-    "spec_hash": "85612b0563aa7cbe",
+    "spec_hash": "7641fd7c694868d1",
     "kind": "tree",
-    "nodes": 1080,
-    "segments": 1079,
-    "max_order": 6,
+    "nodes": 891,
+    "segments": 890,
+    "max_order": 5,
     "iterations": 14,
     "targets_left": 0,
-    "clumps": 244,
-    "orphans_removed": 90,
+    "clumps": 164,
+    "orphans_removed": 10,
     "airborne_kept": [],
-    "pieces_built": 31,
-    "voxel_cm": 5.0,
-    "height_m": 7.7,
-    "length_m": 5.9,
+    "pieces_built": 9,
+    "voxel_cm": 10.0,
+    "height_m": 8.0,
+    "length_m": 4.9,
     "footprint_m": [
-      5.9,
-      5.6
+      4.9,
+      4.9
     ],
-    "grid_mb": 2.2,
+    "grid_mb": 0.2,
     "extent_vox": [
-      118,
-      112,
-      154
+      49,
+      49,
+      80
     ],
     "vox_models_needed": 1,
-    "voxels": 141141,
+    "voxels": 14314,
     "by_material": {
-      "16": 11010,
-      "17": 369,
-      "20": 129762
+      "16": 3619,
+      "17": 17,
+      "20": 10678
     },
-    "ground_contact": 54,
-    "ms_grow": 40.3,
-    "ms_raster": 1048.5,
+    "ground_contact": 26,
+    "ms_grow": 17.8,
+    "ms_raster": 136.4,
     "wood_connected": 1.0,
     "wood_detached": 0,
     "attached_frac": 1.0,
     "detached": 0,
-    "ms_total": 1166.9
+    "ms_total": 159.3
   },
   "problems": [],
   "vox_models": 1
