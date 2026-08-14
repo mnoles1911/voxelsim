@@ -3,10 +3,10 @@
   "species": "water-reed",
   "kind": "reed",
   "seed": 1,
-  "spec_hash": "c32cd897439aa666",
+  "spec_hash": "34c4147f421f0984",
   "stats": {
     "seed": 1,
-    "spec_hash": "c32cd897439aa666",
+    "spec_hash": "34c4147f421f0984",
     "kind": "reed",
     "nodes": 0,
     "segments": 0,
@@ -18,30 +18,30 @@
     "airborne_kept": [],
     "pieces_built": 1,
     "voxel_cm": 5.0,
-    "height_m": 2.9,
-    "length_m": 0.95,
+    "height_m": 2.35,
+    "length_m": 1.05,
     "footprint_m": [
-      0.95,
-      1.1
+      1.05,
+      1.15
     ],
     "grid_mb": 0.1,
     "extent_vox": [
-      19,
-      22,
-      58
+      21,
+      23,
+      47
     ],
     "vox_models_needed": 1,
-    "voxels": 1486,
+    "voxels": 1261,
     "by_material": {
-      "8": 621,
-      "22": 865
+      "8": 553,
+      "22": 708
     },
-    "ground_contact": 73,
-    "ms_grow": 1.5,
-    "ms_raster": 75.5,
+    "ground_contact": 75,
+    "ms_grow": 1.1,
+    "ms_raster": 45.6,
     "attached_frac": 1.0,
     "detached": 0,
-    "ms_total": 78.3
+    "ms_total": 47.6
   },
   "problems": [],
   "vox_models": 1

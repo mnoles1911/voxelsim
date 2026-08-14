@@ -43,14 +43,31 @@ namespace vxc {
 // Header layout, fixed by forge/vxa.py's docstring and its struct format
 // strings. Kept as named constants rather than literals sprinkled through the
 // parser because the two sides are a wire contract: the Python writer packs
-// "<I" + "<iii" + "<III" + "<I" after a 4-byte magic, and the record body is a
-// PACKED numpy structured dtype (u1 then u4, itemsize 5 -- numpy does not pad
-// structured dtypes unless align=True is passed, and vxa.py does not pass it).
-// A reader that assumed natural alignment would read 8-byte records and
-// silently produce garbage from the second run onward.
+// "<I" + "<iii" + "<III" + "<I" + "<I" after a 4-byte magic, and the record
+// body is a PACKED numpy structured dtype (u1 then u4, itemsize 5 -- numpy
+// does not pad structured dtypes unless align=True is passed, and vxa.py does
+// not pass it). A reader that assumed natural alignment would read 8-byte
+// records and silently produce garbage from the second run onward.
+//
+// VERSION 2 ADDED THE VOXEL SIZE, and it is the only difference. Version 1
+// recorded a box of voxels and never said how big a voxel was, which was
+// survivable while every asset was on one lattice and stopped being survivable
+// the moment they were not. The library now spans four: 1 cm birds and small
+// fish, 2 cm tuna, 5 cm ground cover, 10 cm trees, rocks and large whales.
+//
+// This reader could not tell them apart and did not know it had a problem:
+// `at()` takes plain integer local coordinates, so an asset is placed one
+// asset voxel per terrain voxel whatever it was baked at. A 5 cm boulder read
+// that way is not an error, it is a boulder at twice its size -- and there are
+// no boulder-shaped diagnostics.
+//
+// v1 IS REFUSED rather than assumed to be terrain lattice. The two v1 files
+// that existed when this changed (`granite-boulder`, `tundra-pine`) were both
+// baked at 5 cm, so the tempting assumption is wrong for the entire actual
+// corpus. Re-baking is seconds; a silently wrong scale is forever.
 inline constexpr uint32_t kVxaMagic = 0x31415856u; // "VXA1", little-endian
-inline constexpr uint32_t kVxaVersion = 1u;
-inline constexpr size_t kVxaHeaderBytes = 36u;
+inline constexpr uint32_t kVxaVersion = 2u;
+inline constexpr size_t kVxaHeaderBytes = 40u;
 inline constexpr size_t kVxaRunBytes = 5u; // uint8 material + uint32 count, packed
 
 // Why an asset was rejected. A named reason rather than a bool because the
@@ -65,6 +82,7 @@ enum class AssetParseError : uint8_t {
     kBadDimensions,   // zero, negative, or overflowing extent
     kTruncatedBody,   // header promises more runs than the blob carries
     kRunLengthSum,    // runs do not tile the box exactly
+    kBadVoxelSize,    // voxel edge of zero, or one the lattice cannot hold
 };
 
 const char* assetParseErrorText(AssetParseError e);
@@ -99,6 +117,23 @@ public:
     int32_t originX() const { return originX_; }
     int32_t originY() const { return originY_; }
     int32_t originZ() const { return originZ_; }
+
+    // The edge of ONE VOXEL OF THIS ASSET, in millimetres, as baked.
+    //
+    // Read it before placing anything. It is `kVoxelSizeMm` for a terrain
+    // asset -- rocks and trees, which join the world grid and are destructible
+    // as terrain is -- and it is anything the species chose for a detail
+    // entity, which carries its own grid and its own transform and never
+    // enters the world lattice at all. `at()` deliberately does NOT scale by
+    // it: local coordinates are indices into the baked box, and what a caller
+    // does with a box of 10 mm voxels is a placement decision, not a decode
+    // one.
+    uint32_t voxelSizeMm() const { return voxelSizeMm_; }
+
+    // True when this asset is on the world's own lattice and so can be stamped
+    // into terrain. A detail entity answers false and must be placed as its
+    // own object.
+    bool onTerrainLattice() const { return voxelSizeMm_ == uint32_t(kVoxelSizeMm); }
 
     // Number of run records, exposed for tests and for the library's byte
     // accounting (an LRU that charges decoded size needs a decoded size).
@@ -187,6 +222,7 @@ private:
     // one cache line per column instead of straddling.
     int32_t sizeX_ = 0, sizeY_ = 0, sizeZ_ = 0;
     int32_t originX_ = 0, originY_ = 0, originZ_ = 0;
+    uint32_t voxelSizeMm_ = 0;   // 0 until a successful parse; see voxelSizeMm()
     std::vector<MaterialId> runMat_;
     std::vector<uint32_t> runLen_;
     std::vector<uint32_t> colRun_;

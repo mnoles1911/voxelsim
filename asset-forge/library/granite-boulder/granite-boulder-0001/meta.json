@@ -37,8 +37,8 @@
     },
     "ground_contact": 428,
     "ms_grow": 1.1,
-    "ms_raster": 267.4,
-    "ms_total": 268.8
+    "ms_raster": 10.9,
+    "ms_total": 12.4
   },
   "problems": [],
   "vox_models": 1

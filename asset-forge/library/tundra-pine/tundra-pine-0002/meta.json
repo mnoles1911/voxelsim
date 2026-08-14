@@ -38,13 +38,13 @@
       "20": 10678
     },
     "ground_contact": 26,
-    "ms_grow": 17.8,
-    "ms_raster": 136.4,
+    "ms_grow": 29.8,
+    "ms_raster": 193.7,
     "wood_connected": 1.0,
     "wood_detached": 0,
     "attached_frac": 1.0,
     "detached": 0,
-    "ms_total": 159.3
+    "ms_total": 229.3
   },
   "problems": [],
   "vox_models": 1

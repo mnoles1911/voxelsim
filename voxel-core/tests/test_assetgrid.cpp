@@ -42,10 +42,15 @@ std::vector<uint8_t> readFixture(const char* name) {
     return bytes;
 }
 
-// Minimal VXA1 encoder, for the synthetic cases only. Never used to validate
+// Minimal VXA encoder, for the synthetic cases only. Never used to validate
 // the reader against itself -- the fixture tests do that job.
+//
+// `voxelMm` defaults to the terrain lattice because most synthetic cases do not
+// care, but it is a PARAMETER rather than a constant so the malformed-blob test
+// can hand it a zero and prove kBadVoxelSize fires.
 std::vector<uint8_t> encode(int32_t ox, int32_t oy, int32_t oz, int32_t nx, int32_t ny, int32_t nz,
-                            const std::vector<MaterialId>& dense) {
+                            const std::vector<MaterialId>& dense,
+                            uint32_t voxelMm = uint32_t(kVoxelSizeMm)) {
     std::vector<uint8_t> out;
     auto u32 = [&out](uint32_t v) {
         out.push_back(uint8_t(v & 0xffu));
@@ -54,9 +59,10 @@ std::vector<uint8_t> encode(int32_t ox, int32_t oy, int32_t oz, int32_t nx, int3
         out.push_back(uint8_t((v >> 24) & 0xffu));
     };
     out.push_back('V'); out.push_back('X'); out.push_back('A'); out.push_back('1');
-    u32(1u);
+    u32(2u); // version
     u32(static_cast<uint32_t>(ox)); u32(static_cast<uint32_t>(oy)); u32(static_cast<uint32_t>(oz));
     u32(static_cast<uint32_t>(nx)); u32(static_cast<uint32_t>(ny)); u32(static_cast<uint32_t>(nz));
+    u32(voxelMm);
 
     std::vector<MaterialId> mats;
     std::vector<uint32_t> lens;
@@ -97,23 +103,36 @@ VXC_TEST(assetgrid_reads_a_real_asset_forge_file) {
     CHECK(g.valid());
 
     // Every number below read off the Python decode of this same file.
-    CHECK_EQ(g.sizeX(), 47);
-    CHECK_EQ(g.sizeY(), 45);
-    CHECK_EQ(g.sizeZ(), 86);
+    //
+    // The fixture was re-baked when VXA went to version 2, and the numbers
+    // moved for TWO independent reasons that are worth keeping apart: the
+    // format gained a voxel-size field (4 more header bytes), and the species
+    // itself moved from the 5 cm asset lattice to the 10 cm terrain lattice,
+    // because a tree joins the world grid and is destructible as terrain is.
+    // So this is a coarser pine, not a different one.
+    CHECK_EQ(g.sizeX(), 49);
+    CHECK_EQ(g.sizeY(), 49);
+    CHECK_EQ(g.sizeZ(), 80);
     CHECK_EQ(g.originX(), -24);
-    CHECK_EQ(g.originY(), -23);
+    CHECK_EQ(g.originY(), -24);
     CHECK_EQ(g.originZ(), 0);
-    CHECK_EQ(int(g.runCount()), 16430);
-    CHECK_EQ(int(g.solidCount()), 21391);
+    CHECK_EQ(int(g.runCount()), 13856);
+    CHECK_EQ(int(g.solidCount()), 14314);
+
+    // A TREE IS ON THE TERRAIN LATTICE. This is the assertion that would have
+    // caught the whole class of bug version 2 exists for: before it, a file
+    // could not say what scale it was and this reader had to assume.
+    CHECK_EQ(int(g.voxelSizeMm()), int(kVoxelSizeMm));
+    CHECK(g.onTerrainLattice());
 
     // Probe cells, chosen on the Python side before this test existed. The
     // trunk cell in particular is the one that catches a record-stride error:
     // a reader assuming 8-byte aligned records walks off into the wrong run
     // almost immediately and every probe past the first disagrees.
-    CHECK_EQ(int(g.at(23, 22, 0)), 16); // bark, at the base of the trunk
+    CHECK_EQ(int(g.at(24, 24, 0)), 16);  // bark, at the base of the trunk
     CHECK_EQ(int(g.at(0, 0, 0)), 0);
-    CHECK_EQ(int(g.at(23, 22, 43)), 0);
-    CHECK_EQ(int(g.at(46, 44, 85)), 0);
+    CHECK_EQ(int(g.at(24, 24, 40)), 16); // bark, halfway up the same trunk
+    CHECK_EQ(int(g.at(48, 48, 79)), 0);
     CHECK_EQ(int(g.at(15, 15, 28)), 0);
 }
 
@@ -122,15 +141,22 @@ VXC_TEST(assetgrid_reads_a_second_real_file_with_a_different_material_set) {
     CHECK(!blob.empty());
     AssetGrid g;
     CHECK_EQ(int(g.parse(blob)), int(AssetParseError::kOk));
-    CHECK_EQ(g.sizeX(), 40);
-    CHECK_EQ(g.sizeY(), 42);
-    CHECK_EQ(g.sizeZ(), 37);
-    CHECK_EQ(g.originX(), 0);
-    CHECK_EQ(g.originY(), 5); // a non-zero origin on ONE axis only
+    CHECK_EQ(g.sizeX(), 9);
+    CHECK_EQ(g.sizeY(), 8);
+    CHECK_EQ(g.sizeZ(), 9);
+    CHECK_EQ(g.originX(), 4);
+    CHECK_EQ(g.originY(), 4);
     CHECK_EQ(g.originZ(), 0);
-    CHECK_EQ(int(g.runCount()), 1593);
-    CHECK_EQ(int(g.solidCount()), 2674);
-    CHECK_EQ(int(g.at(20, 21, 0)), 8); // MAT_GRASS
+    CHECK_EQ(int(g.runCount()), 91);
+    CHECK_EQ(int(g.solidCount()), 106);
+    CHECK_EQ(int(g.at(4, 4, 0)), 8); // MAT_GRASS
+
+    // A FLOWER IS A DETAIL ASSET AND IS NOT ON THE TERRAIN LATTICE. Deliberately
+    // paired with the pine above: one fixture of each class, so a reader that
+    // ignored the new field and assumed terrain lattice fails here and only
+    // here. 50 mm against the world's 100.
+    CHECK_EQ(int(g.voxelSizeMm()), 50);
+    CHECK(!g.onTerrainLattice());
 }
 
 // Every baked asset must be built from materials this engine actually defines.
@@ -222,6 +248,31 @@ VXC_TEST(assetgrid_rejects_malformed_blobs_by_reason) {
     std::vector<uint8_t> badVersion = good;
     badVersion[4] = 9;
     CHECK_EQ(int(g.parse(badVersion)), int(AssetParseError::kBadVersion));
+
+    // VERSION 1 IS REFUSED, NOT ASSUMED. It is the one bad version that will
+    // actually turn up, because every asset baked before the voxel-size field
+    // existed is one. Reading it as terrain lattice was the tempting
+    // compromise and it is wrong for the whole corpus that existed when this
+    // changed -- granite-boulder and tundra-pine were both v1 at 5 cm. The
+    // offsets alone make it unsafe: at v2 positions, a v1 file's run count is
+    // read as its voxel size.
+    std::vector<uint8_t> v1 = good;
+    v1[4] = 1;
+    CHECK_EQ(int(g.parse(v1)), int(AssetParseError::kBadVersion));
+
+    // A voxel has to have a size. Zero is what an uninitialised or truncated
+    // writer produces, and it is the value that would divide by zero in any
+    // caller converting local voxels to metres.
+    CHECK_EQ(int(g.parse(encode(0, 0, 0, 2, 2, 2, dense, 0u))),
+             int(AssetParseError::kBadVoxelSize));
+    CHECK_EQ(int(g.parse(encode(0, 0, 0, 2, 2, 2, dense, 100000u))),
+             int(AssetParseError::kBadVoxelSize));
+
+    // ... and a legal non-terrain one is accepted and reported as itself. A
+    // 10 mm bird is not malformed, it is a detail entity.
+    CHECK_EQ(int(g.parse(encode(0, 0, 0, 2, 2, 2, dense, 10u))), int(AssetParseError::kOk));
+    CHECK_EQ(int(g.voxelSizeMm()), 10);
+    CHECK(!g.onTerrainLattice());
 
     std::vector<uint8_t> zeroDim = good;
     zeroDim[20] = zeroDim[21] = zeroDim[22] = zeroDim[23] = 0; // nx = 0

@@ -13,6 +13,8 @@ const char* assetParseErrorText(AssetParseError e) {
         case AssetParseError::kBadDimensions: return "zero or overflowing box dimensions";
         case AssetParseError::kTruncatedBody: return "run table truncated";
         case AssetParseError::kRunLengthSum: return "run lengths do not tile the box";
+        case AssetParseError::kBadVoxelSize:
+            return "voxel size of zero, or one no lattice can hold";
     }
     return "unknown";
 }
@@ -35,6 +37,10 @@ int32_t readI32(const uint8_t* p) { return static_cast<int32_t>(readU32(p)); }
 void AssetGrid::clear() {
     sizeX_ = sizeY_ = sizeZ_ = 0;
     originX_ = originY_ = originZ_ = 0;
+    // Zero, not kVoxelSizeMm. A cleared grid must not answer `true` to
+    // onTerrainLattice() -- that is the one question whose wrong answer stamps
+    // a detail entity into the world.
+    voxelSizeMm_ = 0;
     runMat_.clear();
     runLen_.clear();
     colRun_.clear();
@@ -53,7 +59,12 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     const uint32_t nx = readU32(blob + 20);
     const uint32_t ny = readU32(blob + 24);
     const uint32_t nz = readU32(blob + 28);
-    const uint32_t nruns = readU32(blob + 32);
+    // Version 2 field. Everything after it shifted by four bytes, which is why
+    // kVxaHeaderBytes moved 36 -> 40 and why a v1 blob is refused rather than
+    // read: at these offsets a v1 file's run count would be read as its voxel
+    // size and its first run record as its run count.
+    const uint32_t voxelMm = readU32(blob + 32);
+    const uint32_t nruns = readU32(blob + 36);
 
     // Bound every extent so the cell count cannot overflow, and so a corrupt
     // header cannot ask for an allocation the size of the address space before
@@ -63,6 +74,13 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     constexpr uint32_t kMaxEdge = 4096u;
     if (nx == 0 || ny == 0 || nz == 0) return AssetParseError::kBadDimensions;
     if (nx > kMaxEdge || ny > kMaxEdge || nz > kMaxEdge) return AssetParseError::kBadDimensions;
+
+    // A voxel has to have a size, and it has to be one an integer lattice can
+    // express. The ceiling is generous on purpose: it rejects a corrupt or
+    // uninitialised field without ever rejecting content, since the coarsest
+    // thing anyone has baked is 100 mm.
+    constexpr uint32_t kMaxVoxelMm = 4096u;
+    if (voxelMm == 0 || voxelMm > kMaxVoxelMm) return AssetParseError::kBadVoxelSize;
 
     const uint64_t cells = uint64_t(nx) * uint64_t(ny) * uint64_t(nz);
     const size_t bodyBytes = size_t(nruns) * kVxaRunBytes;
@@ -87,6 +105,7 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     sizeX_ = static_cast<int32_t>(nx);
     sizeY_ = static_cast<int32_t>(ny);
     sizeZ_ = static_cast<int32_t>(nz);
+    voxelSizeMm_ = voxelMm;
     originX_ = ox;
     originY_ = oy;
     originZ_ = oz;
