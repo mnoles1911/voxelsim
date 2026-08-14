@@ -59,7 +59,7 @@ std::vector<uint8_t> encode(int32_t ox, int32_t oy, int32_t oz, int32_t nx, int3
         out.push_back(uint8_t((v >> 24) & 0xffu));
     };
     out.push_back('V'); out.push_back('X'); out.push_back('A'); out.push_back('1');
-    u32(2u); // version
+    u32(3u); // version
     u32(static_cast<uint32_t>(ox)); u32(static_cast<uint32_t>(oy)); u32(static_cast<uint32_t>(oz));
     u32(static_cast<uint32_t>(nx)); u32(static_cast<uint32_t>(ny)); u32(static_cast<uint32_t>(nz));
     u32(voxelMm);
@@ -75,6 +75,8 @@ std::vector<uint8_t> encode(int32_t ox, int32_t oy, int32_t oz, int32_t nx, int3
         }
     }
     u32(static_cast<uint32_t>(mats.size()));
+    u32(0u); // part runs: the synthetic cases carry no rig
+    u32(0u); // joints
     for (size_t i = 0; i < mats.size(); ++i) {
         out.push_back(mats[i]);
         u32(lens[i]);
@@ -216,6 +218,46 @@ VXC_TEST(assetgrid_random_access_agrees_with_a_full_sequential_decode) {
     CHECK_EQ(mismatches, 0);
 }
 
+VXC_TEST(assetgrid_reads_the_rig_of_a_baked_animal) {
+    // The one fixture with parts. A tree and a flower have nothing that moves
+    // relative to anything else, so they answer hasParts() false -- which is
+    // not a degraded case and is asserted alongside, so a reader that lost the
+    // parts entirely cannot pass by looking like a rock.
+    AssetGrid g;
+    CHECK_EQ(int(g.parse(readFixture("asset_common_raven_0007.vxa"))),
+             int(AssetParseError::kOk));
+    CHECK(g.hasParts());
+    CHECK_EQ(int(g.voxelSizeMm()), 10);
+    CHECK(!g.onTerrainLattice());
+    CHECK_EQ(int(g.joints().size()), 8);
+
+    // Every solid voxel belongs to a part, and no empty voxel does. This is the
+    // assertion that catches a part table one run out of step with the material
+    // table -- they tile the same box, and nothing else checks that they agree.
+    int solid = 0, taggedSolid = 0, taggedAir = 0;
+    for (int x = 0; x < g.sizeX(); ++x) {
+        for (int y = 0; y < g.sizeY(); ++y) {
+            for (int z = 0; z < g.sizeZ(); ++z) {
+                const bool s = g.at(x, y, z) != MAT_AIR;
+                const bool p = g.partAt(x, y, z) != 0;
+                if (s) { ++solid; if (p) ++taggedSolid; }
+                else if (p) ++taggedAir;
+            }
+        }
+    }
+    CHECK_EQ(solid, 5989);
+    CHECK_EQ(taggedSolid, 5989);
+    CHECK_EQ(taggedAir, 0);
+
+    // A tree carries none of this, and says so.
+    AssetGrid pine;
+    CHECK_EQ(int(pine.parse(readFixture("asset_tundra_pine_0002.vxa"))),
+             int(AssetParseError::kOk));
+    CHECK(!pine.hasParts());
+    CHECK_EQ(int(pine.joints().size()), 0);
+    CHECK_EQ(int(pine.partAt(24, 24, 0)), 0);
+}
+
 VXC_TEST(assetgrid_out_of_range_reads_answer_air_on_every_face) {
     // The mesher's 1-voxel apron reads one cell outside every brick, so a brick
     // flush with the asset's bounding box reads outside it on every load. This
@@ -259,6 +301,13 @@ VXC_TEST(assetgrid_rejects_malformed_blobs_by_reason) {
     std::vector<uint8_t> v1 = good;
     v1[4] = 1;
     CHECK_EQ(int(g.parse(v1)), int(AssetParseError::kBadVersion));
+
+    // v2 likewise: it records a scale but no rig, and a rig cannot be inferred
+    // from voxels -- which voxels were a wing is knowledge only the generator
+    // had. tools/vxa_upgrade.py converts one for assets that need no rig.
+    std::vector<uint8_t> v2 = good;
+    v2[4] = 2;
+    CHECK_EQ(int(g.parse(v2)), int(AssetParseError::kBadVersion));
 
     // A voxel has to have a size. Zero is what an uninitialised or truncated
     // writer produces, and it is the value that would divide by zero in any

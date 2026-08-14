@@ -1,9 +1,10 @@
-"""Upgrade a version-1 VXA file to version 2 without rebuilding the asset.
+"""Bring an old VXA file to the current version without rebuilding the asset.
 
 WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE.
 
-Version 2 added the voxel size, and the reader refuses version 1 rather than
-assuming one -- see `forge/vxa.py`. That is right, but "re-bake it" is only a
+Version 2 added the voxel size and version 3 added the rig -- part tags and
+joints -- and the reader refuses both older versions rather than assuming
+anything; see `forge/vxa.py`. That is right, but "re-bake it" is only a
 valid answer while the asset is still reproducible, and a baked asset stops
 being reproducible the moment anything is added to the parameter table.
 Adding a parameter changes every spec's hash, which reseeds every species, so
@@ -42,22 +43,31 @@ import _path  # noqa: F401  (sys.path bootstrap)
 from forge import vxa
 
 V1_HEADER_BYTES = 36
+V2_HEADER_BYTES = 40
 
 
 def upgrade(blob: bytes, voxel_mm: int) -> bytes:
-    """v1 bytes in, v2 bytes out. The run table is copied, never decoded."""
+    """v1 or v2 bytes in, v3 bytes out. The run table is copied, never decoded."""
     if blob[:4] != vxa.MAGIC:
         raise ValueError("not a VXA file")
     version = struct.unpack("<I", blob[4:8])[0]
     if version == vxa.VERSION:
-        raise ValueError("already version 2")
-    if version != 1:
+        raise ValueError(f"already version {vxa.VERSION}")
+    if version not in (1, 2):
         raise ValueError(f"cannot upgrade version {version}")
     if voxel_mm <= 0:
         raise ValueError("voxel size must be positive")
 
-    ox, oy, oz, nx, ny, nz, nruns = struct.unpack("<iiiIIII", blob[8:V1_HEADER_BYTES])
-    body = blob[V1_HEADER_BYTES:]
+    if version == 1:
+        ox, oy, oz, nx, ny, nz, nruns = struct.unpack(
+            "<iiiIIII", blob[8:V1_HEADER_BYTES])
+        body = blob[V1_HEADER_BYTES:]
+    else:
+        ox, oy, oz, nx, ny, nz, had_mm, nruns = struct.unpack(
+            "<iiiIIIII", blob[8:V2_HEADER_BYTES])
+        body = blob[V2_HEADER_BYTES:]
+        # A v2 file already knows its scale; believe it over the caller.
+        voxel_mm = had_mm
     if len(body) != nruns * 5:
         raise ValueError(
             f"body is {len(body)} bytes, header promises {nruns * 5}; refusing "
@@ -69,6 +79,13 @@ def upgrade(blob: bytes, voxel_mm: int) -> bytes:
             + struct.pack("<III", nx, ny, nz)
             + struct.pack("<I", int(voxel_mm))
             + struct.pack("<I", nruns)
+            # NO PARTS AND NO JOINTS. That is the honest answer rather than a
+            # limitation: an old file records voxels, and which voxels were a
+            # wing is knowledge only the generator had. Anything that needs a
+            # rig has to be re-baked; anything that does not -- every rock and
+            # tree in the library -- is complete as it stands.
+            + struct.pack("<I", 0)
+            + struct.pack("<I", 0)
             + body)
 
 
@@ -93,12 +110,14 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    out = upgrade(path.read_bytes(), mm)
+    blob = path.read_bytes()
+    was = struct.unpack("<I", blob[4:8])[0]
+    out = upgrade(blob, mm)
     path.write_bytes(out)
 
     # Read it back through the real decoder rather than trusting the write.
     g = vxa.read(path)
-    print(f"{path}: v1 -> v2, {int(g.voxel_m * 1000)} mm, "
+    print(f"{path}: v{was} -> v{vxa.VERSION}, {int(g.voxel_m * 1000)} mm, "
           f"{g.shape[0]}x{g.shape[1]}x{g.shape[2]}, "
           f"{int((g.data != 0).sum()):,} solid voxels")
     return 0

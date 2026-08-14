@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contact, kinds, materials, pipeline, render, spec as specmod, vox, vxa
+from . import contact, kinds, parts as partslib, materials, pipeline, render, spec as specmod, vox, vxa
 
 ROOT = Path(__file__).resolve().parent.parent
 SPECS = ROOT / "specs"
@@ -187,7 +187,8 @@ def cmd_gen(args) -> int:
     img = render.view(tree.grid, render.camera_for(s), target_px=args.px)
     img.save(out / f"{stem}.png")
     models = vox.write(tree.grid, out / f"{stem}.vox", name=stem)
-    size = vxa.write(tree.grid, out / f"{stem}.vxa")
+    size = vxa.write(tree.grid, out / f"{stem}.vxa", tree.parts,
+                     partslib.joints(tree.parts))
     (out / f"{stem}.json").write_text(
         json.dumps({"spec": s, "stats": tree.stats, "problems": problems}, indent=2),
         encoding="utf-8",
@@ -439,7 +440,7 @@ def cmd_selftest(args) -> int:
     ok &= bool(differs)
 
     blob = vxa.encode(a.grid)
-    back = vxa.decode(blob)
+    back, _, _ = vxa.decode(blob)
     round_ok = (back.data == a.grid.data).all() and (back.origin == a.grid.origin).all()
     ratio = len(blob) / max(a.grid.data.size, 1)
     print(f"  vxa round trip: {'pass' if round_ok else 'FAIL'} "

@@ -1,0 +1,51 @@
+{
+  "id": "common-raven-0007",
+  "species": "common-raven",
+  "kind": "bird",
+  "seed": 7,
+  "spec_hash": "411916807ceb5fbb",
+  "stats": {
+    "seed": 7,
+    "spec_hash": "411916807ceb5fbb",
+    "kind": "bird",
+    "nodes": 0,
+    "segments": 0,
+    "max_order": 0,
+    "iterations": 0,
+    "targets_left": 0,
+    "clumps": 0,
+    "orphans_removed": 0,
+    "airborne_kept": [],
+    "pieces_built": 1,
+    "voxel_cm": 1.0,
+    "height_m": 0.28,
+    "length_m": 0.64,
+    "footprint_m": [
+      0.64,
+      0.17
+    ],
+    "grid_mb": 0.1,
+    "extent_vox": [
+      64,
+      17,
+      28
+    ],
+    "vox_models_needed": 1,
+    "voxels": 5989,
+    "by_material": {
+      "26": 2393,
+      "36": 2,
+      "37": 109,
+      "44": 298,
+      "45": 3187
+    },
+    "ground_contact": 32,
+    "ms_grow": 1.0,
+    "ms_raster": 55.8,
+    "attached_frac": 1.0,
+    "detached": 0,
+    "ms_total": 57.7
+  },
+  "problems": [],
+  "vox_models": 1
+}

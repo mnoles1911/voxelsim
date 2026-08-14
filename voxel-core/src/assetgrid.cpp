@@ -45,6 +45,11 @@ void AssetGrid::clear() {
     runLen_.clear();
     colRun_.clear();
     colOff_.clear();
+    partMat_.clear();
+    partLen_.clear();
+    partColRun_.clear();
+    partColOff_.clear();
+    joints_.clear();
 }
 
 AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
@@ -65,6 +70,8 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     // size and its first run record as its run count.
     const uint32_t voxelMm = readU32(blob + 32);
     const uint32_t nruns = readU32(blob + 36);
+    const uint32_t npartRuns = readU32(blob + 40);
+    const uint32_t njoints = readU32(blob + 44);
 
     // Bound every extent so the cell count cannot overflow, and so a corrupt
     // header cannot ask for an allocation the size of the address space before
@@ -83,7 +90,9 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
     if (voxelMm == 0 || voxelMm > kMaxVoxelMm) return AssetParseError::kBadVoxelSize;
 
     const uint64_t cells = uint64_t(nx) * uint64_t(ny) * uint64_t(nz);
-    const size_t bodyBytes = size_t(nruns) * kVxaRunBytes;
+    const size_t bodyBytes = size_t(nruns) * kVxaRunBytes
+                           + size_t(npartRuns) * kVxaRunBytes
+                           + size_t(njoints) * kVxaJointBytes;
     if (bytes < kVxaHeaderBytes + bodyBytes) return AssetParseError::kTruncatedBody;
 
     runMat_.resize(nruns);
@@ -146,7 +155,71 @@ AssetParseError AssetGrid::parse(const uint8_t* blob, size_t bytes) {
             }
         }
     }
+    // Part runs, if any. Same tiling rule as the materials and the same column
+    // sweep, deliberately duplicated rather than shared: the two tables differ
+    // in element type and this is thirty lines, where a template over both
+    // would put the hot `at` walk behind an indirection for no gain.
+    const uint8_t* prec = blob + kVxaHeaderBytes + size_t(nruns) * kVxaRunBytes;
+    if (npartRuns) {
+        partMat_.resize(npartRuns);
+        partLen_.resize(npartRuns);
+        uint64_t ptotal = 0;
+        const uint8_t* q = prec;
+        for (uint32_t i = 0; i < npartRuns; ++i, q += kVxaRunBytes) {
+            partMat_[i] = q[0];
+            const uint32_t len = readU32(q + 1);
+            partLen_[i] = len;
+            ptotal += len;
+            if (ptotal > cells) { clear(); return AssetParseError::kRunLengthSum; }
+        }
+        if (ptotal != cells) { clear(); return AssetParseError::kRunLengthSum; }
+
+        partColRun_.resize(columns);
+        partColOff_.resize(columns);
+        uint32_t run = 0, off = 0;
+        for (size_t c = 0; c < columns; ++c) {
+            while (run < npartRuns && off >= partLen_[run]) { off = 0; ++run; }
+            partColRun_[c] = run;
+            partColOff_[c] = off;
+            uint32_t remaining = nz;
+            while (remaining > 0 && run < npartRuns) {
+                const uint32_t avail = partLen_[run] - off;
+                if (avail > remaining) { off += remaining; remaining = 0; }
+                else { remaining -= avail; off = 0; ++run; }
+            }
+        }
+    }
+
+    const uint8_t* jrec = prec + size_t(npartRuns) * kVxaRunBytes;
+    joints_.resize(njoints);
+    for (uint32_t i = 0; i < njoints; ++i, jrec += kVxaJointBytes) {
+        joints_[i].part = jrec[0];
+        joints_[i].parent = jrec[1];
+        joints_[i].xMm = readI32(jrec + 2);
+        joints_[i].yMm = readI32(jrec + 6);
+        joints_[i].zMm = readI32(jrec + 10);
+    }
     return AssetParseError::kOk;
+}
+
+uint8_t AssetGrid::partAt(int32_t lx, int32_t ly, int32_t lz) const {
+    if (partMat_.empty()) return 0;
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= sizeX_ || ly >= sizeY_ || lz >= sizeZ_) {
+        return 0;
+    }
+    const size_t c = size_t(lx) * size_t(sizeY_) + size_t(ly);
+    uint32_t run = partColRun_[c];
+    uint32_t off = partColOff_[c];
+    uint32_t want = static_cast<uint32_t>(lz);
+    const uint32_t n = static_cast<uint32_t>(partLen_.size());
+    while (run < n) {
+        const uint32_t avail = partLen_[run] - off;
+        if (want < avail) return partMat_[run];
+        want -= avail;
+        off = 0;
+        ++run;
+    }
+    return 0;
 }
 
 MaterialId AssetGrid::at(int32_t lx, int32_t ly, int32_t lz) const {

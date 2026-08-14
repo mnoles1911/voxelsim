@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import parts as partslib
 from . import (biomes as biomelib, contact, kinds as kindlib, materials, pipeline,
                render, spec as specmod, vox, vxa)
 
@@ -324,7 +325,8 @@ def keep(spec: dict, seed: int) -> dict:
     specmod.save(spec, out / "spec.json")
     specmod.save(tree.realized, out / "realized.json")
     models = vox.write(tree.grid, out / "tree.vox", name=entry_id)
-    vxa.write(tree.grid, out / "tree.vxa")
+    vxa.write(tree.grid, out / "tree.vxa", tree.parts,
+              partslib.joints(tree.parts))
     render.view(thumb_grid(tree.grid, spec), render.camera_for(spec),
                 target_px=DETAIL_PX).save(out / "thumb.png")
     meta = {

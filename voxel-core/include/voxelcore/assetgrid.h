@@ -61,13 +61,30 @@ namespace vxc {
 // that way is not an error, it is a boulder at twice its size -- and there are
 // no boulder-shaped diagnostics.
 //
+// VERSION 3 ADDED THE RIG: a part id per voxel, run-length encoded over the
+// same box as the materials, and a table of joints. Animals are rigid-part
+// animated and ship in ONE pose (owner, 2026-08-14), so the runtime rotates a
+// wing about a shoulder rather than swapping to a differently-baked bird. It
+// can do neither without knowing which voxels are the wing and where the
+// shoulder is, and a v2 file states neither.
+//
+// The part runs are their OWN encoding, not a re-use of the material
+// boundaries: a wing and the body beside it are often the same material, so a
+// material run happily spans the join and could not express two parts.
+//
+// Joints are in MILLIMETRES from the local origin rather than voxels, because
+// a joint is the middle of a contact patch and is generally not on a voxel
+// centre. Rounding it to the lattice would move a shoulder by up to half a
+// voxel, which on a 22 cm squirrel is most of a leg.
+//
 // v1 IS REFUSED rather than assumed to be terrain lattice. The two v1 files
 // that existed when this changed (`granite-boulder`, `tundra-pine`) were both
 // baked at 5 cm, so the tempting assumption is wrong for the entire actual
 // corpus. Re-baking is seconds; a silently wrong scale is forever.
 inline constexpr uint32_t kVxaMagic = 0x31415856u; // "VXA1", little-endian
-inline constexpr uint32_t kVxaVersion = 2u;
-inline constexpr size_t kVxaHeaderBytes = 40u;
+inline constexpr uint32_t kVxaVersion = 3u;
+inline constexpr size_t kVxaHeaderBytes = 48u;
+inline constexpr size_t kVxaJointBytes = 14u; // u8 part + u8 parent + 3 x i32 mm
 inline constexpr size_t kVxaRunBytes = 5u; // uint8 material + uint32 count, packed
 
 // Why an asset was rejected. A named reason rather than a bool because the
@@ -86,6 +103,15 @@ enum class AssetParseError : uint8_t {
 };
 
 const char* assetParseErrorText(AssetParseError e);
+
+// Where one part turns about its parent. Positions are in MILLIMETRES from the
+// asset's local origin, because a joint is the centroid of a contact patch and
+// is generally not on a voxel centre -- see forge/vxa.py.
+struct AssetJoint {
+    uint8_t part = 0;
+    uint8_t parent = 0;
+    int32_t xMm = 0, yMm = 0, zMm = 0;
+};
 
 // One baked (species, seed): a box of voxels plus where its base sits.
 //
@@ -134,6 +160,20 @@ public:
     // into terrain. A detail entity answers false and must be placed as its
     // own object.
     bool onTerrainLattice() const { return voxelSizeMm_ == uint32_t(kVoxelSizeMm); }
+
+    // WHICH PART OWNS A VOXEL, and where the parts turn.
+    //
+    // Only animals carry these. A rock and a tree answer `false` to hasParts()
+    // and an empty joint list, which is not a failure: they have nothing that
+    // moves relative to anything else.
+    bool hasParts() const { return !partMat_.empty(); }
+    const std::vector<AssetJoint>& joints() const { return joints_; }
+
+    // Part id at LOCAL coordinates, 0 outside the box and 0 for a voxel no part
+    // claims. Same column-index walk as `at`, over a SEPARATE run table: a wing
+    // and the body beside it are often the same material, so the material runs
+    // span joins the part runs must not.
+    uint8_t partAt(int32_t lx, int32_t ly, int32_t lz) const;
 
     // Number of run records, exposed for tests and for the library's byte
     // accounting (an LRU that charges decoded size needs a decoded size).
@@ -223,6 +263,10 @@ private:
     int32_t sizeX_ = 0, sizeY_ = 0, sizeZ_ = 0;
     int32_t originX_ = 0, originY_ = 0, originZ_ = 0;
     uint32_t voxelSizeMm_ = 0;   // 0 until a successful parse; see voxelSizeMm()
+    std::vector<uint8_t> partMat_;
+    std::vector<uint32_t> partLen_;
+    std::vector<uint32_t> partColRun_, partColOff_;
+    std::vector<AssetJoint> joints_;
     std::vector<MaterialId> runMat_;
     std::vector<uint32_t> runLen_;
     std::vector<uint32_t> colRun_;

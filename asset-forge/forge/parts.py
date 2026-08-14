@@ -116,3 +116,92 @@ def to_shared(tags: np.ndarray, table: dict[int, int]) -> np.ndarray:
     for private, shared in table.items():
         out[tags == private] = shared
     return split_sides(out)
+
+
+# Who each part hangs off. A rig needs a tree, and the tree is anatomy rather
+# than something a generator should be free to choose per species.
+#
+# A part whose parent is absent falls through to the next one up: plenty of
+# birds have no crest, and a fish has no neck, so a head must still find the
+# body. `joints` walks this until it lands on something the animal actually has.
+PARENT = {
+    P_NECK: P_BODY,
+    P_HEAD: P_NECK,
+    P_JAW: P_HEAD,
+    P_CREST: P_HEAD,
+    P_TAIL: P_BODY,
+    P_FIN_MEDIAN: P_BODY,
+    P_FIN_CAUDAL: P_BODY,
+    P_FIN_PAIRED: P_BODY,
+    P_WING: P_BODY,
+    P_LEG: P_BODY,
+    P_EAR: P_HEAD,
+    P_HORN: P_HEAD,
+}
+
+
+def base_id(pid: int) -> int:
+    """The part without its side."""
+    return pid - SIDE_STRIDE if pid >= SIDE_STRIDE else pid
+
+
+def joints(tags: np.ndarray) -> list[dict]:
+    """Where each part turns about its parent, in local voxel coordinates.
+
+    DERIVED FROM THE CONTACT SURFACE, not from the generator. A joint is the
+    centroid of the voxels where a part touches its parent face-to-face, which
+    is not an approximation of the anatomy -- it IS the anatomy. A shoulder is
+    where the wing meets the body. A hip is where the leg does.
+
+    Doing it this way rather than having each generator report its own joint
+    positions is worth the paragraph. The generators place parts from
+    parameters, so a reported joint would be a SECOND expression of the same
+    fact, free to drift from the geometry when either changes -- and this
+    project has already paid for that once, with a foliage parameter consumed
+    twenty-five lines before it was modified. The contact surface cannot drift,
+    because it is measured off the voxels that shipped. It also costs a future
+    quadruped generator nothing: four legs meet a body somewhere, and the same
+    measurement finds all four without knowing what a leg is.
+
+    Returns one record per part present, `body` excluded -- the body is the
+    root and turns about nothing. `parent` is the id it hangs off. `origin` is
+    in voxels, fractional, relative to the array.
+    """
+    if tags is None:
+        return []
+    present = {int(v) for v in np.unique(tags) if v != P_NONE}
+    out: list[dict] = []
+    for pid in sorted(present):
+        base = base_id(pid)
+        if base == P_BODY:
+            continue
+        # Walk up until we reach a part this animal actually has.
+        parent = PARENT.get(base, P_BODY)
+        while parent not in present and parent != P_BODY:
+            parent = PARENT.get(parent, P_BODY)
+        if parent not in present:
+            continue
+
+        mine = tags == pid
+        theirs = tags == parent
+        # Face-adjacent contact, six directions. A corner touch is not a joint
+        # for the same reason it is not a join: nothing can hang off it.
+        touch = np.zeros_like(mine)
+        for ax in (0, 1, 2):
+            for sh in (1, -1):
+                nb = np.roll(theirs, sh, axis=ax)
+                sl = [slice(None)] * 3
+                sl[ax] = 0 if sh > 0 else -1
+                nb[tuple(sl)] = False
+                touch |= mine & nb
+        if not touch.any():
+            # A part that touches its parent only at a corner, or not at all.
+            # Reported rather than dropped: a limb with no joint is a rigging
+            # defect and silence is how it would ship.
+            out.append({"part": pid, "parent": parent, "origin": None})
+            continue
+        xs, ys, zs = np.nonzero(touch)
+        out.append({"part": pid, "parent": parent,
+                    "origin": (float(xs.mean()), float(ys.mean()), float(zs.mean())),
+                    "contact": int(touch.sum())})
+    return out
