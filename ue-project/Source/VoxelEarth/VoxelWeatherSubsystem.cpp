@@ -86,15 +86,23 @@ namespace
 	// (water_wave_graph.py, U^0.68), so a wind that moves every frame slides
 	// every crest every frame, and the eye reads that as the scene running fast.
 	//
-	// 45 s is a starting point, not a measurement. Real wind seas are duration-
-	// limited over minutes, so if anything this is still fast; it was chosen so
-	// that pinning a new wind with voxel.Weather.PinMps visibly TAKES EFFECT
-	// within a few seconds while play-testing, rather than appearing not to work.
-	// Turn it up if the water still hurries, down if a pinned change feels
-	// unresponsive. 0 disables smoothing entirely and restores the raw
-	// instantaneous wind, which is the arm that produced the complaint.
+	// 45 -> 8 s on 2026-08-14, and the direction of that change is the opposite
+	// of what three rounds of guessing suggested. A LONGER constant is WORSE, not
+	// better: it converts every wind change into a longer smooth drift, and a
+	// coherent drift slides every crest (wind speed sets wavelength) far more
+	// visibly than the gust twitch it was suppressing. The owner reported the
+	// water as "way way too fast" at 0 AND at 45, and had to reach 5000 -- an
+	// effectively frozen wind -- before it looked right, which in hindsight is
+	// the measurement saying "any drift at all is the problem".
+	//
+	// 8 s still removes the gust band (now 90 s, so it was never the issue) and
+	// settles fast enough that a change is over rather than ongoing. The wind
+	// field itself was slowed 8-15x in the same session, so there is very little
+	// left for this to smooth.
+	//
+	// 0 disables smoothing entirely. Pins bypass it regardless -- see Tick.
 	TAutoConsoleVariable<float> CVarWeatherWaveResponseSeconds(
-		TEXT("voxel.Weather.WaveResponseSeconds"), 45.0f,
+		TEXT("voxel.Weather.WaveResponseSeconds"), 8.0f,
 		TEXT("Time constant, in seconds, of the low-pass between the wind field and the wind that ")
 		TEXT("reaches water materials. Waves have inertia: a real sea takes minutes to build to a new ")
 		TEXT("wind, and driving wave height AND wavelength from a 6-second gust band makes the whole ")
@@ -888,7 +896,32 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 	const float TauSeconds = VoxelWeather::GetWaveResponseSeconds();
 	const double SmoothN = S.Wind.DirNorth * S.Wind.SustainedMps;
 	const double SmoothE = S.Wind.DirEast * S.Wind.SustainedMps;
-	if (!Impl->bSmoothedWindValid || TauSeconds <= 0.0f || DeltaTime <= 0.0f)
+	// A PIN BYPASSES THE FILTER ENTIRELY, and leaving it out was the bug that
+	// kept the water moving after three attempts to stop it.
+	//
+	// MEASURED, 2026-08-14. With voxel.Weather.PinMps 5 and PinFromDeg 238.7 the
+	// SAMPLE was rock steady -- "5.00 m/s from 238.7 deg (sustained 5.00, gust
+	// +0.00)" on every line -- while the PUBLISHED vector was still sweeping:
+	// (N 2.360, E -1.281) -> (N 2.421, E +0.204) over eight seconds, crawling
+	// toward its target of (2.60, 4.27) at exactly the rate a 45 s time constant
+	// predicts. About 135 s to converge, and every frame of it a changing wind.
+	//
+	// Wind speed sets wave WAVELENGTH as well as height, so a wind that is
+	// slowly converging retunes the spectrum continuously and slides every crest
+	// with it. The filter added to stop the surface moving was what kept it
+	// moving -- and a smooth coherent drift reads far worse than a slightly
+	// noisy but stationary wind, which is why raising the constant made it worse
+	// rather than better.
+	//
+	// A pin is a deliberate step, not weather. It has no inertia to model.
+	const bool bPinned = VoxelWeather::IsBearingPinned() && VoxelWeather::IsSpeedPinned();
+	if (bPinned)
+	{
+		Impl->SmoothedNorthMS = SmoothN;
+		Impl->SmoothedEastMS = SmoothE;
+		Impl->bSmoothedWindValid = true;
+	}
+	else if (!Impl->bSmoothedWindValid || TauSeconds <= 0.0f || DeltaTime <= 0.0f)
 	{
 		// Seeded to the first real sample rather than to zero, so there is no
 		// warm-up ramp from a dead calm at world start -- an artefact that would
@@ -922,13 +955,26 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 			// binding held. A leg that greps this line learns what its frames
 			// were taken in; a leg that greps nothing learns that this subsystem
 			// did not run, which is a different fact from a calm day.
+			// THE PUBLISHED VECTOR IS ON THIS LINE, not just the sample it came
+			// from, and the two are different things. The sample is the wind;
+			// what a material sees is the SMOOTHED velocity (wave inertia, see
+			// Tick), and on 2026-08-14 the owner reported that pinning the live
+			// path to the fallback's exact numbers still did not reproduce the
+			// fallback's look. That question cannot be answered from the sample
+			// alone -- it needs the number that actually crossed into the
+			// collection. Printing one and debugging the other is how an
+			// afternoon disappears.
+			const double PubLen = FMath::Sqrt(Impl->SmoothedNorthMS * Impl->SmoothedNorthMS +
+			                                  Impl->SmoothedEastMS * Impl->SmoothedEastMS);
 			UE_LOG(LogVoxelWeather, Log,
 			       TEXT("wind: %.2f m/s from %.1f deg (sustained %.2f, gust %+.2f) at (%.0f, %.0f) UU, ")
-			       TEXT("epoch %.1f s, publishes=%lld, bound=%d, pins[dir=%d spd=%d], camera=%d"),
+			       TEXT("epoch %.1f s, publishes=%lld, bound=%d, pins[dir=%d spd=%d], camera=%d | ")
+			       TEXT("PUBLISHED WindVectorMS=(N %.3f, E %.3f) |v|=%.3f m/s"),
 			       S.Wind.SpeedMps, S.Wind.FromBearingDeg, S.Wind.SustainedMps, S.Wind.GustMps,
 			       S.SampleXUU, S.SampleYUU, S.EpochSeconds, (long long)S.Publishes,
 			       S.bMaterialBound ? 1 : 0, S.bBearingPinned ? 1 : 0, S.bSpeedPinned ? 1 : 0,
-			       S.bHasCamera ? 1 : 0);
+			       S.bHasCamera ? 1 : 0,
+			       Impl->SmoothedNorthMS, Impl->SmoothedEastMS, PubLen);
 		}
 	}
 }
