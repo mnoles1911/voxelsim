@@ -23,6 +23,40 @@ class Kind:
     blurb: str
     ready: bool          # is there a generator behind it yet?
     param_groups: tuple[str, ...]   # groups shown for this kind, beyond the shared ones
+    lattice: str = "detail"         # "terrain" or "detail"; see below
+
+
+# --- WHICH LATTICE A KIND LIVES ON (owner, 2026-08-13) -----------------------
+#
+# This is the one property that is not a matter of taste, so it is recorded on
+# the kind rather than left to each spec.
+#
+# "terrain" -- rocks and trees. They JOIN THE WORLD'S OWN VOXEL GRID and are
+# destructible exactly as terrain is. A destructible voxel has to be
+# addressable in the world grid, a world grid has exactly one cell size, and
+# that size is `vxc::kVoxelSizeMm` = 100 mm. So a terrain-lattice asset is
+# authored at 10 cm and nothing else is legal. Authoring one finer bought a
+# better preview and nothing more: `AssetGrid::at(lx, ly, lz)` takes plain
+# integer voxel coordinates with no scale factor, and there is no resampling
+# anywhere in voxel-core, so a 5 cm asset read through it would come out at
+# twice its intended size.
+#
+# "detail" -- bushes, ground cover and every animal. They never enter the
+# terrain grid: they carry their own voxel grid and their own transform, they
+# are not destructible in the terrain sense, and their lattice is therefore
+# free. They keep whatever size their own measurements chose -- 5 cm for ground
+# cover, 1 to 10 cm for animals by the rule in
+# `docs/marine-megafauna-research.md`, which is that a species is drawn at the
+# coarsest voxel at which its smallest identifying feature is still about three
+# voxels across.
+#
+# The library was briefly ALL 5 cm (`tools/all_to_5cm.py`) on the reasoning
+# that one lattice for everything means nothing downstream has to ask which
+# lattice an object is on. Right about the goal, wrong about the number: the
+# lattice that matters is the one the world uses, and half the library cannot
+# join it at any size. `tools/all_to_10cm.py` is the move back, and
+# `forge.cli.selftest` refuses a terrain-lattice spec that is not at 10 cm.
+TERRAIN_LATTICE_CM = 10.0
 
 
 # Groups every kind carries: identity, where it goes in the world, and what it
@@ -33,7 +67,8 @@ KINDS: tuple[Kind, ...] = (
     Kind("tree", "Trees",
          "Woody plants with a trunk and a crown. Three growth models: "
          "colonize, whorl and frond.", True,
-         ("trunk", "crown", "growth", "whorl", "frond", "roots", "strand", "foliage")),
+         ("trunk", "crown", "growth", "whorl", "frond", "roots", "strand", "foliage"),
+         lattice="terrain"),
     Kind("bush", "Bushes",
          "Low multi-stemmed woody scrub. Same growth machinery as a tree, "
          "authored short with branches to the ground.", True,
@@ -41,7 +76,7 @@ KINDS: tuple[Kind, ...] = (
     Kind("rock", "Rocks",
          "Boulders and stones. No skeleton at all — an accretion of lumps, "
          "faceted and eroded, then part-buried.", True,
-         ("rock",)),
+         ("rock",), lattice="terrain"),
     # The next three are ONE generator with three settings. A grass tuft, a
     # stand of reeds and a clump of daisies are all a spray of thin stems from a
     # common root; what differs is height, how far they arc, and what tops them.

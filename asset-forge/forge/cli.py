@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contact, materials, pipeline, render, spec as specmod, vox, vxa
+from . import contact, kinds, materials, pipeline, render, spec as specmod, vox, vxa
 
 ROOT = Path(__file__).resolve().parent.parent
 SPECS = ROOT / "specs"
@@ -562,6 +562,40 @@ def cmd_selftest(args) -> int:
         for line in over:
             print(f"    ! {line}")
         ok &= not over
+
+    # A TERRAIN-LATTICE ASSET IS AUTHORED AT 10 CM, AND NOTHING ELSE IS LEGAL.
+    #
+    # Rocks and trees join the world's own voxel grid and are destructible as
+    # terrain is, so they have to be on the grid's cell size --
+    # `vxc::kVoxelSizeMm` = 100 mm. `AssetGrid::at` takes plain integer voxel
+    # coordinates with no scale factor and nothing in voxel-core resamples, so
+    # a 5 cm rock read through it comes out at twice its intended size. There
+    # is no diagnostic for that: it is a boulder that is simply wrong, in a
+    # world full of boulders.
+    #
+    # Cheap and unconditional, so it runs under `--quick` too. The whole
+    # library was on the wrong lattice as recently as this morning
+    # (`tools/all_to_5cm.py`), which is exactly how a rule with no check ends.
+    off = []
+    for p in spec_paths():
+        try:
+            s, _ = specmod.load(p)
+        except (OSError, ValueError) as e:
+            off.append(f"{p.stem}: unreadable ({e})")
+            continue
+        k = kinds.BY_KEY.get(specmod.get(s, "kind"))
+        if k is None or k.lattice != "terrain":
+            continue
+        cm = float(specmod.get(s, "resolution_cm"))
+        if cm != kinds.TERRAIN_LATTICE_CM:
+            off.append(f"{p.stem} ({k.key}) is authored at {cm:g} cm; a "
+                       f"terrain-lattice kind must be at "
+                       f"{kinds.TERRAIN_LATTICE_CM:g} cm")
+    print(f"  terrain-lattice assets are on the terrain lattice: "
+          f"{'pass' if not off else 'FAIL'}")
+    for line in off:
+        print(f"    ! {line}")
+    ok &= not off
 
     verdict = "PASS" if ok else "FAIL"
     if getattr(args, "quick", False):
