@@ -129,6 +129,7 @@ import math
 import numpy as np
 
 from . import materials
+from . import parts
 from .grid import VoxelGrid
 from .spec import BY_PATH as _BY_PATH
 from .spec import (_ALT_BODY_MARKS, _ALT_HEAD_MARKS, _ALT_WING_MARKS,
@@ -237,10 +238,15 @@ T_TAIL, T_WING, T_LEG, T_CREST = 5, 6, 7, 8
 # only do that if the asset says which voxels are the wing, and until now this
 # grid was scratch: built because the paint pass needs to tell a wing from a
 # body, thrown away three lines later.
-PART_NAMES = {
-    T_NONE: "none", T_BODY: "body", T_NECK: "neck", T_HEAD: "head",
-    T_BILL: "bill", T_TAIL: "tail", T_WING: "wing", T_LEG: "leg",
-    T_CREST: "crest",
+# The private painting tags above map into the shared rigging vocabulary in
+# `forge/parts.py` on the way out. They stay private because they answer a
+# different question -- "what colour is this voxel" -- and because a baked
+# asset that says "part 6" has to mean the same thing to every reader, which a
+# number chosen inside this file cannot.
+_TO_SHARED = {
+    T_NONE: parts.P_NONE, T_BODY: parts.P_BODY, T_NECK: parts.P_NECK,
+    T_HEAD: parts.P_HEAD, T_BILL: parts.P_JAW, T_TAIL: parts.P_TAIL,
+    T_WING: parts.P_WING, T_LEG: parts.P_LEG, T_CREST: parts.P_CREST,
 }
 
 
@@ -289,8 +295,7 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float,
     grid = VoxelGrid(p["shape"], (0, 0, 0), voxel_m)
     _paint(grid, tag.data, p, body)
     if out is not None:
-        out["tags"] = tag.data
-        out["part_names"] = PART_NAMES
+        out["tags"] = parts.to_shared(tag.data, _TO_SHARED)
     return grid
 
 

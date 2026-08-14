@@ -22,6 +22,7 @@ import numpy as np
 
 from . import (bird as birdlib, envelope, fish as fishlib, ground as groundlib,
                materials, rasterize, rock as rocklib)
+from . import parts as partslib
 from .grid import VoxelGrid, dense_bytes, ground_band
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
 from .spec import get, realize as spec_realize, seed_hash, spec_hash
@@ -274,7 +275,7 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
                 if kind in FISH_KINDS or kind in BIRD_KINDS
                 else gen.build(live, rng, voxel_m))
         parts = gen_out.get("tags")
-        part_names = gen_out.get("part_names")
+        part_names = partslib.names() if parts is not None else None
         pieces_built = _piece_count(grid)
         if kind in BOULDER_KINDS:
             orphans, airborne_kept = _single_piece(grid)

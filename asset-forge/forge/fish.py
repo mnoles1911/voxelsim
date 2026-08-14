@@ -73,6 +73,7 @@ import math
 import numpy as np
 
 from . import materials
+from . import parts
 from .grid import VoxelGrid
 from .spec import (_CAUDAL_SHAPES, _DORSAL_SHAPES, _FIELD_CURVES,
                    _FISH_PATTERNS, _SEXES, get)
@@ -152,8 +153,7 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float,
         tags = np.where(grid.data != 0, np.uint8(P_BODY), np.uint8(P_NONE))
         tags[fins] = fin_kind[fins]
         tags[grid.data == 0] = P_NONE
-        out["tags"] = tags
-        out["part_names"] = PART_NAMES
+        out["tags"] = parts.to_shared(tags, _TO_SHARED)
     return grid
 
 
@@ -596,9 +596,12 @@ FIN_NONE, FIN_MEDIAN, FIN_CAUDAL, FIN_PAIRED = 0, 1, 2, 3
 # together. Same numbering as the fin kinds with the body added at the end, so
 # the translation is one addition rather than a table.
 P_NONE, P_MEDIAN, P_CAUDAL, P_PAIRED, P_BODY = 0, 1, 2, 3, 4
-PART_NAMES = {
-    P_NONE: "none", P_MEDIAN: "median-fin", P_CAUDAL: "caudal-fin",
-    P_PAIRED: "paired-fin", P_BODY: "body",
+# ... mapped into the shared rigging vocabulary on the way out; see bird.py for
+# why the private numbering stays private.
+_TO_SHARED = {
+    P_NONE: parts.P_NONE, P_MEDIAN: parts.P_FIN_MEDIAN,
+    P_CAUDAL: parts.P_FIN_CAUDAL, P_PAIRED: parts.P_FIN_PAIRED,
+    P_BODY: parts.P_BODY,
 }
 
 
