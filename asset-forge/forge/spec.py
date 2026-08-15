@@ -143,6 +143,19 @@ _LAND_KINDS = ("tree", "bush", "rock", "grass", "reed", "flower", "bird",
 # which rows apply, which species the designer authors, and where they go.
 _SWIM_KINDS = ("fish", "cetacean")
 
+# Anything that lives IN water, not only what swims. The Ocean biome hosts rock,
+# grass, reed and bush as of 2026-08-15, so kelp, seagrass and coral are aquatic
+# too -- and the depth rows below are the only place an asset can say how deep
+# it lives. Until this existed they were scoped to the two swimming kinds, which
+# gates the APP'S SLIDERS and not `validate`: patching a kelp spec with a depth
+# succeeded silently, so every aquatic plant recorded its depth band in PROSE in
+# its notes, where placement cannot read it.
+#
+# Widening a `kinds=` tuple changes no spec bytes and reseeds nothing -- every
+# validated body already carries every group. Doing it now is free; doing it
+# after placement ships is a kWorldGenVersion bump with goldens to re-bless.
+_WET_KINDS = _SWIM_KINDS + ("grass", "reed", "bush", "flower", "rock")
+
 # How a tail is held. A fish's caudal fin is VERTICAL and beats side to side; a
 # whale's fluke is HORIZONTAL and beats up and down, which is the single most
 # reliable way to tell a dolphin from a shark at any distance and from any
@@ -508,8 +521,13 @@ PARAMS: tuple[Param, ...] = (
     P("placement.cluster", "Grows in stands", 0.3, 0.0, 1.0, 0.01, group="placement",
       help="0 scatters individuals evenly; 1 gathers them into groves with open "
            "ground between."),
-    P("placement.elev_min_m", "Lowest elevation (m)", 0.0, -10.0, 4000.0, 10.0,
-      group="placement", help="Metres above sea level. The engine's sea level is z=0."),
+    # FLOOR -10 -> -200 m. Sea level is z=0, so a negative value is depth, and
+    # -10 m could not describe most of what lives under water: a giant kelp
+    # forest reaches -30 m and a whale shark ranges past -100. The old floor was
+    # set when nothing in the library lived below the tideline.
+    P("placement.elev_min_m", "Lowest elevation (m)", 0.0, -200.0, 4000.0, 10.0,
+      group="placement", help="Metres above sea level. The engine's sea level "
+                              "is z=0, so a negative value is depth."),
     P("placement.elev_max_m", "Highest elevation (m)", 2000.0, 0.0, 5000.0, 10.0,
       group="placement",
       help="Above the treeline nothing but tundra/alpine is classified anyway "
@@ -1341,13 +1359,13 @@ PARAMS: tuple[Param, ...] = (
            "margin of anything; 'reef' is shallow salt water, which the world "
            "does not classify yet and which this row is a request for."),
     P("detail.depth_min_m", "Depth below surface, least (m)", 0.3, 0.0, 200.0,
-      0.1, group="detail", kinds=_SWIM_KINDS,
+      0.1, group="detail", kinds=_WET_KINDS,
       help="How far under the surface the fish holds. A surface-feeding minnow "
            "is near 0; a bottom fish sets both of these deep."),
     P("detail.depth_max_m", "Depth below surface, most (m)", 6.0, 0.1, 2000.0,
-      0.5, group="detail", kinds=_SWIM_KINDS),
+      0.5, group="detail", kinds=_WET_KINDS),
     P("detail.min_water_depth_m", "Needs water at least (m) deep", 0.5, 0.05,
-      100.0, 0.05, group="detail", kinds=_SWIM_KINDS,
+      100.0, 0.05, group="detail", kinds=_WET_KINDS,
       help="Water shallower than this holds none of this species. This is the "
            "gate that keeps a pike out of a puddle."),
     P("detail.per_100m2", "Individuals per 100 m² of water", 3.0, 0.0, 300.0,
