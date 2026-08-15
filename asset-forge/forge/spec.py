@@ -61,7 +61,8 @@ _FOLIAGE_HABITS = ("spiral", "distichous", "opposite", "tuft", "radial",
 # spheres for as long as they did.
 _CAUDAL_SHAPES = ("forked", "truncate", "rounded", "pointed", "none")
 _DORSAL_SHAPES = ("triangular", "sail", "spiny", "ridge", "none")
-_FISH_PATTERNS = ("none", "stripe", "bars", "spots", "mottle", "saddle")
+_FISH_PATTERNS = ("none", "stripe", "stripes", "bars", "spots", "mottle",
+                  "saddle")
 # The shapes a countershading boundary may take. `flat` is a level line along
 # the animal, which is what every marking here was until now; the other three
 # bend it. See `fish._field_lines` and `docs/marine-marking-research.md`.
@@ -493,7 +494,15 @@ PARAMS: tuple[Param, ...] = (
     P("placement.abundance", "Abundance", 0.5, 0.0, 1.0, 0.01, group="placement",
       help="Overall frequency of this species where it does occur, before the "
            "per-biome weights are applied."),
-    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.5, 3000.0, 0.5, group="placement",
+    # FLOOR LOWERED 0.5 -> 0.1 (owner, 2026-08-15). The old floor was set when
+    # nothing in the library needed to be denser than a shrub, and ground cover
+    # is: fifteen carpet species -- bluebell, wood anemone, ramsons, feather
+    # moss, hair-cap moss, buffalo grass -- asked for 0.25 to 0.45 m and were
+    # SILENTLY CLAMPED to 0.5, so a moss carpet could not be authored as dense
+    # as moss actually grows and nothing said so. Nothing reads `placement`
+    # yet, so this costs nothing today and stops a wrong number being baked
+    # into fifteen specs before anything does.
+    P("placement.spacing_m", "Minimum spacing (m)", 6.0, 0.1, 3000.0, 0.1, group="placement",
       help="Closest two individuals may stand. Roughly the canopy diameter for a "
            "closed forest, much larger for savanna or desert."),
     P("placement.cluster", "Grows in stands", 0.3, 0.0, 1.0, 0.01, group="placement",
@@ -1217,10 +1226,21 @@ PARAMS: tuple[Param, ...] = (
            "schooling mark; vertical BARS break the outline against weed and "
            "reef; SPOTS and MOTTLE are the freshwater camouflage; a SADDLE is "
            "blotches over the back only, which is what breaks the outline seen "
-           "from above by a bird."),
+           "from above by a bird. STRIPE is ONE lateral band; STRIPES is "
+           "several, which is a different fish -- a bluestripe snapper wears "
+           "four and a single band would be a different species."),
     P("fish.pattern_count", "Marking count", 6, 1, 24, 1, kind="int", group="fish",
       kinds=_SWIM_KINDS,
-      help="Number of bars, or roughly a third of the number of spots."),
+      # NAMED, because it was not read by every pattern and nothing said so.
+      # `stripe` draws ONE band by definition and ignores this, which is
+      # correct -- but `bluestripe-snapper` shipped carrying 6 here and drawing
+      # one stripe, and the parameter looked wired up. The fix was not to make
+      # `stripe` obey it: all ten stripe species carry 6 because 6 is the
+      # DEFAULT, so obeying it would have given six bands to nine fish that
+      # never asked. `stripes` is the pattern for a fish that wears several.
+      help="Number of bars, of stripes under the STRIPES pattern, or roughly a "
+           "third of the number of spots. The single STRIPE pattern draws one "
+           "band and does not read this."),
     P("fish.pattern_width", "Marking width", 0.22, 0.02, 0.90, 0.01, group="fish",
       kinds=_SWIM_KINDS,
       help="For a stripe, its thickness as a share of body depth. For bars, the "

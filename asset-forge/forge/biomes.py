@@ -67,8 +67,16 @@ BIOMES: tuple[Biome, ...] = (
     # stand under the sea, and `plantable` said so; a fish is the first asset
     # that belongs there and the first reason `hosts` had to be separate from
     # `plantable` on this row rather than only on bare rock.
+    # ROCK AND PLANTS ADDED (owner, 2026-08-15). `plantable` stays False and
+    # that is the distinction this row exists to make: `plantable` means "a
+    # land plant can root here", which is still no. `hosts` means "an asset of
+    # this kind belongs here", and kelp, seagrass and a reef plainly do. The
+    # ocean had 67 fish and nothing whatever for them to swim around, which is
+    # 15 blocked rows across the biome lists and the emptiest water in the
+    # world.
     Biome(0, "ocean", "Ocean", "mud",
-          "below -3 m; decided before climate", False, ("fish", "cetacean", "bird")),
+          "below -3 m; decided before climate", False,
+          ("fish", "cetacean", "bird", "rock", "grass", "reed", "bush")),
     Biome(1, "beach", "Beach", "sand",
           "-3 m to +4 m around sea level; decided before climate", True, _WALKS),
     Biome(2, "grassland", "Grassland", "grass",
@@ -91,7 +99,13 @@ BIOMES: tuple[Biome, ...] = (
     # `plantable` rather than reusing it.
     Biome(9, "bare_rock", "Bare rock", "rock",
           "ground steeper than a 70% grade (~35 degrees)", False,
-          ("rock", "bird")),
+          # QUADRUPEDS ADDED (owner, 2026-08-15). The comment above this row
+          # said the question was "where animals may stand in the world, not a
+          # consequence of a generator landing" -- and it is still not a
+          # consequence, it is a decision that has now been made. An ibex and a
+          # chamois stand on ground far steeper than 35 degrees; that is the
+          # whole point of them.
+          ("rock", "bird", "quadruped")),
 )
 
 BY_KEY = {b.key: b for b in BIOMES}

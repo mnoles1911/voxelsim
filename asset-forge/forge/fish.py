@@ -91,7 +91,7 @@ CAUDAL_SHAPES = ("forked", "truncate", "rounded", "pointed", "none")
 DORSAL_SHAPES = ("triangular", "sail", "spiny", "ridge", "none")
 
 # Colour patterns. See `_paint`.
-PATTERNS = ("none", "stripe", "bars", "spots", "mottle", "saddle")
+PATTERNS = ("none", "stripe", "stripes", "bars", "spots", "mottle", "saddle")
 
 # Shapes the boundary between two colour fields may take. See `_field_lines`.
 # These are NOT another entry in `PATTERNS`, and the difference is the whole
@@ -1206,7 +1206,32 @@ def _pattern(p: dict, t, uz, occ) -> np.ndarray | None:
         # A horizontal band down the flank. Signals a schooling fish in open
         # water: it lines the shoal up and it points at the head, which is what
         # a predator has to find.
+        #
+        # ONE band, and it deliberately does not read `pattern_count`. See that
+        # parameter's help: every species using this pattern carries the
+        # default 6, so honouring it would have put six bands on nine fish that
+        # never asked for them. A fish that wears several stripes uses the
+        # `stripes` pattern below.
         band = np.abs(uz - p["pattern_pos"]) <= max(p["pattern_width"], 0.02) * 0.5
+        return np.broadcast_to(band[:, None, :], occ.shape)
+
+    if kind == "stripes":
+        # Several horizontal bands: a snapper, a sweetlips, a convict cichlid.
+        # The same construction as `bars` turned ninety degrees -- periodic in
+        # DEPTH rather than along the body -- because that is exactly what the
+        # difference between the two markings is on a real fish.
+        #
+        # Spaced over the flank rather than the whole depth. A band centred on
+        # the belly is not a stripe, it is the countershading boundary with a
+        # gap in it, and running the series edge to edge put one there on every
+        # species that tried it.
+        n = max(1, int(p["pattern_count"]))
+        lo, hi = 0.18, 0.92
+        w = min(max(p["pattern_width"], 0.02), 0.9)
+        band = np.zeros_like(uz, dtype=bool)
+        for i in range(n):
+            centre = lo + (hi - lo) * (i + 0.5) / n
+            band |= np.abs(uz - centre) <= (hi - lo) / n * w * 0.5
         return np.broadcast_to(band[:, None, :], occ.shape)
 
     if kind == "bars":

@@ -462,3 +462,141 @@ retracted as sample bias. Every share in these files is the 289-tile figure, and
 the biome files say so where the older number is likely to be met elsewhere. If
 you are quoting a biome share from anywhere in this repo, **check which census it
 came from.**
+
+---
+
+## 9. What the 2026-08-15 authoring pass hit, and could not work around
+
+Written after the pass that took the library from 481 specs to 705 — 224 new
+species across ten kinds, including the first 107 land animals beyond the
+quadruped generator's own shakedown tranche. **The build queue above is now
+almost empty of things that only needed authoring.** What is left is this list,
+and it is deliberately specific: each entry names the parameter, the file and
+the number that stopped the species, so the next person can decide whether the
+mechanism is worth building rather than rediscovering the wall.
+
+Two blockers recorded by earlier passes were **removed by the owner on
+2026-08-15** and are no longer true: the ocean's `hosts` tuple now admits
+`rock`, `grass`, `reed` and `bush`, and bare rock's now admits `quadruped`.
+Both were authored against immediately — the sea floor has kelp, seagrass and
+reef on it, and bare rock has an ibex, a chamois, a mountain goat, a
+klipspringer and a rock hyrax standing on it.
+
+### 9.1 The markings a mammal cannot carry
+
+`quad.mark` puts **one** marking, on the **flank**, in one of six shapes. Two
+whole classes of real coat sit outside that, and between them they cost ten
+species their field mark.
+
+**A marking that runs FORE-AND-AFT.** `bars` wrap the body transversely, which
+is right for a zebra and a tiger and wrong for everything that is striped down
+its length. Three species ship without their stripes: `striped-skunk` (drawn as
+a white saddle, so the split between its two stripes is lost),
+`eastern-chipmunk` (five dorsal stripes, drawn as one dark saddle) and
+`european-badger`, whose head stripes run down the skull. **One longitudinal
+marking axis serves all three.**
+
+**A marking on the HEAD.** Six species record this and it is the single most
+requested mechanism in the new specs: `european-badger` (the black-and-white
+face is the species), `chamois` (the black eye-to-muzzle stripe), `cheetah`
+(the tear line), `pronghorn` (two white throat bands), `addax` (the facial X)
+and `mandrill`, where a red nasal stripe between blue flanges is the entire
+animal and the spec can only paint the whole head red. **A per-region head
+marking serves all six.**
+
+**Rosettes and reticulation** remain what they were: an annulus with a tawny
+centre and a partition into plates, neither of which is any setting of the six
+shapes. Four species are left unauthored rather than shipped with the wrong
+coat — `leopard`, `jaguar`, `snow-leopard` and `reticulated-giraffe`. Note
+that a **cheetah IS authorable and is authored**: its spots are solid and
+round, which is `spots` exactly.
+
+### 9.2 Parts a land animal does not have
+
+* **No trunk.** An elephant's trunk is a long flexible tapering rod off the
+  front of the skull — a tail attached to the wrong end. `african-bush-elephant`,
+  `african-forest-elephant` and `lowland-tapir` use a heavily drooped muzzle
+  (`muzzle_drop` at its ceiling), which reads in silhouette and cannot curl or
+  reach.
+* **One pair of horns, side by side.** A rhinoceros carries two horns in line
+  front-to-back. `white-rhinoceros` authors the pair at `horn_spread` 0.0 so
+  they meet on the midline and read as one nasal horn; **the second horn is not
+  drawn**, because a second pair would put a horn on each cheek.
+* **No suspended stance.** `quad.stance` offers standing, sprawling and
+  bipedal. `brown-throated-sloth` is a hanging animal and is authored on the
+  ground instead, which is a real thing it does and a famously bad one. A
+  suspended stance needs an attachment point as well as a pose.
+* **No membrane sheet.** `siberian-flying-squirrel` is authored perched, where
+  the patagium is a baggy flank fold and expressible as body width. The spread
+  pose is a flat rectangle and there is no sheet primitive.
+
+### 9.3 Two blockers in the tree generator
+
+* **A trunk cannot lie down.** `trunk.lean_deg` is capped at 40° and
+  `crown.lean_deg` at 45°; horizontal is 90 and no other field lays an asset
+  over. **Fallen mossy log** and **driftwood snag** are therefore not
+  authorable, and both biome files already say the answer is `desert-dead`
+  rotated — which is a placement decision, not a spec.
+* **No two generators in one grid.** `forge/pipeline.py` dispatches one
+  generator per build, so **root-split block** — a rock and a root in the same
+  asset — has no route. A split block with no root is not the asset.
+
+### 9.4 Two blockers in the fish generator
+
+* **No posture or orientation.** A **longsnout seahorse** is a vertical S and a
+  **garden eel** is a vertical stalk out of sand; both identities are a pose.
+  The two candidate fields are not what they look like: `curve_amount` /
+  `curve_at` move the colour boundary, not the body, and `caudal_plane` rotates
+  the tail *fin*. A horizontal garden eel is a fifth eel with nothing of its
+  own.
+* **Silent no-ops found while authoring, reported not fixed.** `bars`
+  distributes by modulo with no origin; `spots` ignores `pattern_pos`; and
+  `stripe` draws exactly one band while ignoring `pattern_count` — which means
+  the already-shipped **`bluestripe-snapper` carries `pattern_count: 6` and
+  draws one stripe today**. `fish.barbels` is hard-capped at 4, so a stone
+  loach's six are not authorable at any size.
+
+### 9.5 Still true from §3, and now measured against real specs
+
+`pinniped` (4 species), `chelonian` (7), `serpentine` (6), `arthropod` (9),
+`cephalopod` (3), `succulent` (3), `lichen` (1) and `fungus` (1) still have no
+generator. The **rock scatter** gap is unchanged and now blocks six rows
+outright — blockfield, talus cone (twice), patterned ground, erratic train,
+rock glacier — plus **shingle bank**; these are *distributions* of blocks, not
+one block, and one placement feature serves all of them. **Giant bamboo** and
+**hazel coppice at full size** remain blocked by one-asset-per-generation: a
+clump of twenty to forty poles from one base is many pieces.
+
+### 9.6 One kind-list line
+
+`understory-fan-palm` is a `bush` built with `growth.model: frond`. It builds
+correctly, but `forge/kinds.py` does not list `frond` among the bush parameter
+groups, so the app shows no frond sliders for it and tuning the fans means
+editing JSON. One line, and it belongs to whoever owns the kind list.
+
+### 9.7 What the newly-unblocked sea floor hit
+
+The `hosts` change opened fifteen rows and fourteen were authored. What it did
+not open:
+
+* **Sea fan / gorgonian.** A gorgonian is a flat rigid NET held across the
+  current — a plane, not a volume. The only kind in the library that makes a
+  plane is `fish`, whose fin plates measure a genuine 0.98 x 0.06 x 2.63 m
+  sail; but a `fish` spec is placed as a swimming detail entity, so a
+  gorgonian authored that way swims in mid-water. The `bush` route measures
+  1.04 x 1.20 x 1.04 — `crown.squash` acts vertically and nothing flattens a
+  crown horizontally — and the tuft kinds draw round capsules over a full
+  circle of azimuths. **This is a placement fault, not a shape fault**, and it
+  is the one row the `hosts` change did not fix.
+* **`growth.kill_m` has a 0.10 m floor**, so no two branches in the library can
+  come closer than 10 cm at any lattice. Real coral fingers are 3-5 cm apart,
+  so `branching-stony-coral` ships at about half life density and no lattice
+  change reaches it.
+* **`materials.bark` offers four choices and all four are wood**
+  (`forge/materials.py`). The tree generator makes the right coral skeleton
+  and there is no stone to paint it with; `deadwood` is the nearest thing.
+  Same shape as the saguaro's missing green.
+* **`placement.elev_min_m` bottoms out at -10 m.** A kelp forest lives at
+  20-40 m down and no ocean spec can currently say so. `placement.water_max_m`
+  is also meaningless for something already in the water: `fish` is excluded
+  from its whitelist and the four kinds the ocean just gained are not.
