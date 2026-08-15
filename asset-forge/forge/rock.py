@@ -42,6 +42,14 @@ from .spec import get
 # itself in `_build_once` -- so this is not 20 GB of RAM.
 MAX_WORKING_GB = 20.0
 
+# How much harder the rock beside an arch's opening is than the rest of the
+# stone. Not a fudge factor: load-bearing sandstone genuinely weathers slower
+# (Bruthans 2014), which is why a real arch stands on legs far thinner than
+# anything else on the rock. Sized by measurement -- below about 3 the legs
+# still go on some seeds, and above about 6 the whole span stops weathering and
+# the arch keeps the machined edge the carve gave it.
+ARCH_LEG_HARDNESS = 4.5
+
 
 def build(spec: dict, rng: np.random.Generator, voxel_m: float,
           *, with_rubble: bool = False) -> VoxelGrid:
@@ -365,8 +373,9 @@ def _build_once(spec: dict, rng: np.random.Generator, voxel_m: float,
     # hit its target, and every attempt after that fell under the threshold and
     # silently skipped the carve -- so the slider did nothing at all while
     # looking like it was wired up.
+    arch_out: dict = {}
     if arch > 0.0 and float(get(spec, "rock.size_m")) >= 4.0:
-        _arch(grid, rng, arch)
+        _arch(grid, rng, arch, out=arch_out)
 
     # 3. weathering ----------------------------------------------------------
     if erode > 0.0:
@@ -381,6 +390,17 @@ def _build_once(spec: dict, rng: np.random.Generator, voxel_m: float,
             clasts=clasts, clast_r_vox=m_to_vox(clast_size * 0.5, voxel_m),
             clast_hardness=clast_hardness, sets=sets,
             salt=int(rng.integers(1 << 30)))
+        # An arch's legs are the load path and load-bearing rock weathers
+        # slower; without this the carve opens a hole and erosion closes it.
+        # See `_arch`.
+        lp = arch_out.get("load_path")
+        if lp is not None and durability is not None:
+            durability = durability.copy()
+            durability[lp] *= ARCH_LEG_HARDNESS
+            np.clip(durability, 0.05, 12.0, out=durability)
+        elif lp is not None:
+            durability = np.where(lp, np.float32(ARCH_LEG_HARDNESS),
+                                  np.float32(1.0))
         _erode(grid, erode, cavernous, durability, voxel_m=voxel_m,
                notch=(notch, notch_z, notch_spread) if notch > 0.0 else None,
                aspect=(aspect, _unit(rng.normal(size=3) * [1.0, 1.0, 0.35]))
@@ -1216,7 +1236,7 @@ def daylight(sil: np.ndarray) -> np.ndarray:
     return (ndimage.binary_fill_holes(framed) & ~framed)[1:-1, 1:-1]
 
 
-def _arch(grid: VoxelGrid, rng, amount: float) -> str:
+def _arch(grid: VoxelGrid, rng, amount: float, out: dict | None = None) -> str:
     """Punch a hole through the stone: an arch, a window, a natural bridge.
 
     A fin of rock develops alcoves on both flanks along a weak layer; they
@@ -1335,6 +1355,34 @@ def _arch(grid: VoxelGrid, rng, amount: float) -> str:
                else np.broadcast_to(tube2d[:, None, :], grid.data.shape))
         grid.data[...] = before
         grid.data[cut] = 0
+
+        # THE LEGS AND THE SPAN, so weathering cannot eat them.
+        #
+        # This carve worked and the asset still had no hole, which took a
+        # stage-by-stage measurement to see: `desert-arch` seed 1 came out of
+        # `_arch` with 660 px of daylight and out of `_erode` with ONE. The
+        # opening is cut correctly and then erosion removes the legs that made
+        # it an arch -- they are the thinnest rock on the stone, so they go
+        # first -- and once a leg's foot is gone the opening drains sideways
+        # and stops being an enclosed hole at all. Five of six seeds here, and
+        # one of six on `hero-natural-arch`.
+        #
+        # The fix is not to weather less. It is that LOAD-BEARING ROCK WEATHERS
+        # SLOWER, which is the finding this project already researched for the
+        # arch work: Bruthans et al., "Sandstone landforms shaped by negative
+        # feedback between stress and erosion", Nature Geoscience 7, 597-601
+        # (2014). Under load the grains lock and erosion nearly stops, which is
+        # exactly why real arches survive as thin legs under a heavy span. See
+        # docs/arch-research-and-verdict.md.
+        #
+        # So the band around the opening is marked, and `_durability` makes it
+        # hard. A wider band than the cut, because the leg is what stands
+        # BESIDE the hole, not the hole itself.
+        band = (zz <= r_z * 1.35) & (np.abs(ga - c_a) <= r_a * 2.2)
+        load = (np.broadcast_to(band[None, :, :], grid.data.shape) if across == 1
+                else np.broadcast_to(band[:, None, :], grid.data.shape))
+        if out is not None:
+            out["load_path"] = load & (grid.data != 0)
 
         occ2 = grid.data != 0
         solid = int(occ2.sum())

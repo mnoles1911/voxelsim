@@ -23,13 +23,13 @@ TRACE = []
 _real = rock._arch
 
 
-def traced(grid, rng, amount):
+def traced(grid, rng, amount, out=None):
     occ = grid.data != 0
     before = int(occ.sum())
     box = rock._occupied_box(occ)
     span = [box[i].stop - box[i].start for i in range(3)]
     TRACE.append(f"  called: amount={amount:.2f} span_vox={span} solid={before}")
-    why = _real(grid, rng, amount)
+    why = _real(grid, rng, amount, out=out)
     after = int((grid.data != 0).sum())
     TRACE.append(f"  result: {why}")
     TRACE.append(f"          removed {before - after} voxels "
