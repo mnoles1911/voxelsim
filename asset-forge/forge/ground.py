@@ -225,14 +225,27 @@ def _head(grid: VoxelGrid, pts: np.ndarray, kind: str, r_vox: float,
 
     elif kind == "plume":
         # A feathery seed head: short filaments fanning off the top of the stem.
+        #
+        # ANCHORED ON THE STEM'S OWN POLYLINE, not on the chord between its
+        # base and its tip. Those are the same line only on a straight stem,
+        # and `_stem` arcs and wanders by design -- so on anything tall and
+        # curved the chord leaves the stem and the filament starts in open
+        # water. `giant-kelp` is 28 m with an arc of 0.14, which is far enough
+        # for exactly that: seed 3 shipped 16 voxels in two loose pieces, 83%
+        # of the way up the asset, and seeds 1, 2 and 4 through 8 were clean.
+        # A one-in-eight failure is what a single-seed check cannot see, and
+        # this was found by the first three-seed sweep after the library grew
+        # past a hundred specs.
         start = max(1, int(len(pts) * (1.0 - frac)))
-        base = pts[start]
-        axis = pts[-1] - base
-        span = float(np.linalg.norm(axis)) or 1.0
+        span = float(np.linalg.norm(pts[-1] - pts[start])) or 1.0
         for _ in range(14):
             a = rng.random() * 2.0 * math.pi
             t = 0.25 + 0.75 * rng.random()
-            anchor = base + axis * t
+            # Walk the polyline itself: the fractional index between `start`
+            # and the tip, interpolated between the two points either side.
+            f = start + t * (len(pts) - 1 - start)
+            i = min(int(f), len(pts) - 2)
+            anchor = pts[i] + (pts[i + 1] - pts[i]) * (f - i)
             reach = r_vox * (0.4 + 0.9 * rng.random())
             end = anchor + np.array([math.cos(a) * reach, math.sin(a) * reach,
                                      span * 0.18 * (rng.random() - 0.35)])
