@@ -536,7 +536,6 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
     # it reaches down. A standing or bipedal limb leaves the belly, under the
     # trunk. No angle on a limb attached under the body produces a sprawl,
     # which is why the attachment moves and not the angle.
-    leg_r = max(0.5, float(get(spec, "quad.leg_thick")) * depth_v * 0.5)
     if stance == "sprawling":
         # OUT AT THE FLANK, at about the height of the trunk's own axis. The
         # attachment point itself moves, which is the thing no angle on a limb
@@ -576,6 +575,63 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
     # `_legs` works in grid coordinates and the two heights are in layout ones,
     # and dividing one by the other at the call site is a second expression of
     # the same fact -- which is what this project has paid for repeatedly.
+
+    # --- HOW THICK A LIMB IS, AND WHAT IT IS THICK RELATIVE TO ---------------
+    #
+    # A LIMB'S THICKNESS IS A FRACTION OF ITS OWN LENGTH, and getting that
+    # reference wrong is the whole of why the land animals shipped looking
+    # wrong (owner, 2026-08-15: "tall lanky with narrow legs and bodies").
+    #
+    # It used to be a fraction of the TRUNK'S DEPTH, which is three
+    # multiplications away from anything the eye judges:
+    #
+    #     leg_r = leg_thick * depth_v * 0.5
+    #     depth_v = quad.depth * trunk_v
+    #     trunk_v = (trunk_frac / the four shares) * length_v
+    #
+    # Every one of those factors is below 1, and the species that need the
+    # thickest legs are the ones that shrink all three. A gemsbok is a quarter
+    # neck, so its trunk share is 0.52 where a boar's is 0.58; a running build
+    # is shallow, so its `quad.depth` is 0.42 where a boar's is 0.46. Nothing in
+    # that chain knows how LONG the leg is, and the leg is long precisely
+    # because the animal is tall -- so the taller the animal, the thinner its
+    # legs looked, which is the definition of lanky and is exactly the set of
+    # species the owner picked out.
+    #
+    # MEASURED, on the eight species he named: thickness over length came out
+    # at 0.111 to 0.282 on the three he called solid and 0.055 to 0.102 on the
+    # five he called wireframes -- two groups with no overlap. The two
+    # obvious alternative ratios do NOT separate them, and both were tried
+    # first: thickness in VOXELS put the wireframes on top (3.0 to 4.0 against
+    # 3.0 to 3.5), and thickness over WITHERS HEIGHT put a wild boar at 0.055
+    # against a gemsbok at 0.050. See `tools/quadprobe.py --bulk`.
+    #
+    # SO THE REFERENCE IS THE LIMB'S OWN LENGTH, joint to ground, averaged over
+    # the fore and hind pair because one radius draws all four legs. That also
+    # makes `quad.leg_thick` the SAME NUMBER the published corpora are quoted
+    # in -- Infinigen's photoreal quadruped genome 0.111 behind and 0.140 in
+    # front, Veloren 0.230, Minecraft 0.393
+    # (`docs/quadruped-proportion-research.md`) -- so a designer can read a
+    # figure off that table and type it in, instead of dividing it by a trunk
+    # depth they have to derive first.
+    #
+    # A FLOOR OF TWO VOXELS AND NOT ONE. The old floor was half a voxel of
+    # radius, which draws a limb one voxel across, and a one-voxel limb is a
+    # wire at any lattice. Neither shipped voxel corpus contains one: the
+    # thinnest load-bearing limb in ten Minecraft mobs is 2 units (wolf, fox)
+    # and the thinnest of 48 Veloren quadruped parts is 2 voxels. One-voxel
+    # features do ship in both, but only as detail that carries no weight --
+    # Minecraft's cow horn is [1, 3, 1]. Forty-eight species in this library
+    # had a foreleg one or two voxels across before this change.
+    #
+    # DELIBERATELY NOT A max() AGAINST THE OLD EXPRESSION. A floor would have
+    # left `quad.leg_thick` authored on eighty species and doing nothing on
+    # them, which is this project's signature failure and would have been
+    # invisible in every render -- the sweep in `tools/quadprobe.py` would
+    # have started reporting the row DEAD and been right. One reference, one
+    # meaning, and the 131 authored values were converted to it.
+    limb_v = max(1.0, 0.5 * (fore_len + hind_len))
+    leg_r = max(1.0, 0.5 * float(get(spec, "quad.leg_thick")) * limb_v)
 
     # --- ears, headgear -----------------------------------------------------
     ear = str(get(spec, "quad.ear_shape"))

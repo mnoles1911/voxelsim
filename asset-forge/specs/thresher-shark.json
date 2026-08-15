@@ -111,6 +111,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.3,
     "caudal_upper": 1.0,
+    "claspers": 0.088,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.32,

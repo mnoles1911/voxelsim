@@ -1229,6 +1229,23 @@ PARAMS: tuple[Param, ...] = (
            "from above by a bird. STRIPE is ONE lateral band; STRIPES is "
            "several, which is a different fish -- a bluestripe snapper wears "
            "four and a single band would be a different species."),
+    # CLASPERS (owner, 2026-08-15). Male sharks and rays carry a pair of rods
+    # behind the pelvic fins, and they are the most visible external difference
+    # between the sexes on the largest animals in the library. Measured at 8.8%
+    # of total length on a mature whale shark, which is ~10 voxels on a great
+    # white -- well clear of the three-voxel floor, so the lattice was never
+    # the reason they were absent.
+    #
+    # Drawn only when `fish.sex` is `male`. A female or unsexed spec carrying a
+    # non-zero value here draws nothing, which is correct rather than a silent
+    # no-op: the parameter says how long the claspers ARE on this species, not
+    # whether this individual has them.
+    P("fish.claspers", "Clasper length", 0.0, 0.0, 0.25, 0.005, group="fish",
+      kinds=_SWIM_KINDS,
+      help="Paired rods behind the pelvic fins, as a share of body length. "
+           "MALES ONLY -- a female or unsexed individual of the same species "
+           "draws none. Sharks and rays have them; bony fish do not, so this "
+           "is 0 for most of the library."),
     P("fish.pattern_count", "Marking count", 6, 1, 24, 1, kind="int", group="fish",
       kinds=_SWIM_KINDS,
       # NAMED, because it was not read by every pattern and nothing said so.
@@ -2249,10 +2266,25 @@ PARAMS: tuple[Param, ...] = (
       help="A terminal tuft. A lion's, a zebra's tassel, an ox's switch, a "
            "jerboa's flag."),
 
-    P("quad.leg_thick", "Limb thickness", 0.22, 0.05, 0.70, 0.01, group="quad",
+    P("quad.leg_thick", "Limb thickness", 0.16, 0.05, 0.90, 0.01, group="quad",
       kinds=("quadruped",),
-      help="Limb diameter as a fraction of the trunk's depth. A gazelle 0.11, "
-           "a wolf 0.18, a horse 0.20, a rhino 0.36, an elephant 0.45.\n\n"
+      help="Limb diameter as a fraction of THE LIMB'S OWN LENGTH, joint to "
+           "ground. This is the ratio the eye judges as 'lanky' and it is the "
+           "ratio published creature sets are quoted in, so a figure can be "
+           "read off one and typed straight in: Infinigen's photoreal "
+           "quadruped 0.11 behind and 0.14 in front, Veloren 0.23, Minecraft "
+           "0.39 (`docs/quadruped-proportion-research.md`).\n\n"
+           "IT USED TO BE A FRACTION OF THE TRUNK'S DEPTH, and that is what "
+           "made every tall animal in the library look like a wireframe. Trunk "
+           "depth is three multiplications away from the leg — it shrinks when "
+           "the neck lengthens and when the build is a running one — and "
+           "nothing in the chain knew how long the leg was. The taller the "
+           "animal, the thinner its legs came out. All 131 species were "
+           "converted; the old values do not mean anything here.\n\n"
+           "A house-standard hoofed animal sits near 0.16, a bison or a bear "
+           "near 0.20, a rhino or an elephant past 0.30, and a low-slung "
+           "lizard or mustelid — whose legs are barely longer than they are "
+           "thick — well above that.\n\n"
            "THIS ROW DECIDES WHETHER THE JOINT CAPS ARE DRAWN AT ALL. Below "
            "three voxels of limb thickness the cap is skipped (owner, "
            "2026-08-14): at that size the wedge a rotating limb opens is one "

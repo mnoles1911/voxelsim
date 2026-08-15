@@ -145,6 +145,7 @@ def build(spec: dict, rng: np.random.Generator, voxel_m: float,
     fins, fin_kind = _fins(p, body)
     _paint(grid, p, body, fins, fin_kind)
     _barbels(grid, p)
+    _claspers(grid, p)
     if out is not None:
         # Body first, fins over it. A fin starts ONE VOXEL INSIDE the body (see
         # `_fins`), so the overlap is deliberate and those voxels belong to the
@@ -328,6 +329,8 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
         "pectoral": pect,
         "pectoral_aspect": float(get(spec, "fish.pectoral_aspect")),
         "pelvic": float(get(spec, "fish.pelvic")),
+        "claspers": float(get(spec, "fish.claspers")),
+        "sex": str(get(spec, "fish.sex")),
         "barbels": int(get(spec, "fish.barbels")),
         "barbel_len": float(get(spec, "fish.barbel_len")),
         "fin_thick": int(get(spec, "fish.fin_thick")),
@@ -1007,6 +1010,20 @@ def _barbels(grid: VoxelGrid, p: dict) -> None:
     in this repo is drawn with, so each barbel is a face-connected run starting
     ON a snout voxel. That is the only reason a two-voxel-thick thread hanging
     off the front of the fish is not a second asset.
+
+    AND THE START HAS TO BE CHECKED, not computed and assumed. The paragraph
+    above was true of the intent and false of the code: the start was placed a
+    quarter of the body's width out from the axis and a fraction of its depth
+    down, which lands inside a wide flat head and OUTSIDE a narrow one. The
+    barbel then began in open water and the fish shipped in two pieces.
+
+    Measured over eight seeds on `barbel` (width ratio 0.68, against
+    `mud-catfish`'s 1.25): four barbels fail on one to two seeds at any length,
+    two barbels pass on all eight. Every four-barbel species in the library
+    happens to be a wide flat-headed one, which is the only reason this had
+    never been seen. So the start now marches back toward the snout axis --
+    which is inside the fish by construction -- and takes the first solid voxel
+    it finds. A barbel that finds none is skipped rather than drawn detached.
     """
     n = max(0, min(int(p["barbels"]), 4))
     if n == 0 or p["barbel_len"] <= 0.0:
@@ -1015,14 +1032,71 @@ def _barbels(grid: VoxelGrid, p: dict) -> None:
     if reach < 1.0:
         return
     nose = np.array([p["xnose"] - 0.5, p["ycen"], p["zaxis"]])
+    nx, ny, nz = grid.data.shape
     for i in range(n):
         s = 1.0 if i % 2 == 0 else -1.0
         tier = i // 2
-        start = nose + np.array([0.0, s * max(1.0, 0.25 * p["width_v"]),
-                                 -0.15 * p["depth_v"] * (1 + tier)])
-        end = start + np.array([reach * (0.55 - 0.20 * tier),
-                                s * reach * 0.35,
-                                -reach * (0.40 + 0.25 * tier)])
+        want = nose + np.array([0.0, s * max(1.0, 0.25 * p["width_v"]),
+                                -0.15 * p["depth_v"] * (1 + tier)])
+        end = want + np.array([reach * (0.55 - 0.20 * tier),
+                               s * reach * 0.35,
+                               -reach * (0.40 + 0.25 * tier)])
+        # March from the wanted start back to the axis and take the first solid
+        # voxel. Sixteen samples over a distance that is a fraction of the head
+        # cannot step over a voxel.
+        start = None
+        for t in np.linspace(0.0, 1.0, 16):
+            q = want + (nose - want) * t
+            ix, iy, iz = (int(round(q[0])), int(round(q[1])), int(round(q[2])))
+            if 0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz                     and grid.data[ix, iy, iz] != 0:
+                start = q
+                break
+        if start is None:
+            continue
+        grid.line(start, end, p["mat_fin"])
+
+
+def _claspers(grid: VoxelGrid, p: dict) -> None:
+    """Paired rods behind the pelvic fins. Male sharks and rays only.
+
+    The most visible external sex difference on the biggest animals here, and
+    the lattice was never the reason they were missing: 8.8% of total length on
+    a mature whale shark is about ten voxels on a great white, well clear of
+    the three-voxel floor.
+
+    Anchored the same way the barbels are, and for the same reason -- the start
+    marches up to the body and takes the first solid voxel rather than trusting
+    a computed point. A clasper hangs off the narrowest, most tapered part of
+    the animal, which is exactly where an assumed start lands in open water.
+
+    Drawn behind the pelvic origin, which `_pelvic` puts at 0.36 of standard
+    length measured from the TAIL end of the body (`t` runs nose-ward), so the
+    rods trail aft along the underside. A female or unsexed fish gets none,
+    whatever the species carries -- the parameter says how long a clasper is on
+    this species, not whether this individual has one.
+    """
+    if p["sex"] != "male" or p["claspers"] <= 0.0:
+        return
+    reach = p["claspers"] * p["length_v"]
+    if reach < 2.0:
+        return
+    nx, ny, nz = grid.data.shape
+    # A little aft of the pelvic origin and just off the midline.
+    xp = p["xnose"] - 0.62 * p["length_v"]
+    off = max(1.0, 0.10 * p["width_v"])
+    for s in (1.0, -1.0):
+        want = np.array([xp, p["ycen"] + s * off, p["zaxis"] - 0.30 * p["depth_v"]])
+        axis = np.array([xp, p["ycen"], p["zaxis"]])
+        start = None
+        for tt in np.linspace(0.0, 1.0, 16):
+            q = want + (axis - want) * tt
+            ix, iy, iz = (int(round(q[0])), int(round(q[1])), int(round(q[2])))
+            if 0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz                     and grid.data[ix, iy, iz] != 0:
+                start = q
+                break
+        if start is None:
+            continue
+        end = start + np.array([-reach, s * reach * 0.10, -reach * 0.18])
         grid.line(start, end, p["mat_fin"])
 
 
