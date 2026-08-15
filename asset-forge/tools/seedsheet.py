@@ -47,7 +47,7 @@ def main() -> int:
     # daylight -- silently reverted to the stone reading for whales, dolphins
     # and birds. A bird sheet quoted a 24 cm robin as "0.2 m" of HEIGHT with a
     # daylight column of zeroes beside it.
-    fish = sm.get(s, "kind") in ("fish", "cetacean", "bird")
+    fish = sm.get(s, "kind") in ("fish", "cetacean", "bird", "quadruped")
 
     built = []
     for seed in range(1, count + 1):
