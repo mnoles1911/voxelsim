@@ -134,7 +134,7 @@ not guessed — FIA records a crown class per tree, and code 1 is "open grown":
 |---|---|---|
 | **stem diameter at 15 m** | **1.50×** (range 1.27–2.19, n=19 spp) | FIA `CCLCD=1` vs all, same power law fitted to each, species with ≥80 open-grown stems |
 | **crown width at DBH 50 cm** | **1.20×** (range 0.63–1.82, n=19 spp) | FVS open-grown equations vs Tallo's crown-radius law |
-| **crown ratio** | **1.06×** (n=13 spp) | FIA `UNCRCD`, `CCLCD=1` vs all |
+| **crown ratio** | **1.08×** (n=17 spp) | FIA `UNCRCD`, `CCLCD=1` vs all |
 
 `OPEN_GROWN = 1.50` in `tools/plantfit.py` is that first row and nothing else.
 
@@ -279,28 +279,31 @@ refuses to save if `validate` clamped it to something other than what was asked.
 
 FIA carries both. `CR` is *compacted* — the crew mentally pushes branches in to
 fill holes, giving a fuller, shorter crown. `UNCRCD` is the honest base-of-live-
-crown to top. Across 87 species, **median `UNCRCD`/`CR` = 1.35**.
+crown to top. Across 125 species with n ≥ 100, **median `UNCRCD`/`CR` = 1.33**
+(species-median compacted 40%, uncompacted 55%).
 
 Only `UNCRCD` is comparable to "where do the leaves start" on a voxel asset.
-Taking the more prominent `CR` column would have been a **35% error in the
+Taking the more prominent `CR` column would have been a **33% error in the
 direction of concluding our crowns are far too deep**.
 
-Measured, 87 species with n ≥ 100: **uncompacted crown ratio median 55%, range
-33% to 99%.** Aspen 35%, red maple-country hardwoods 40–55%, woodland junipers
+Measured, 125 species with n ≥ 100: **uncompacted crown ratio median 55%, range
+25% to 98%.** Aspen 35%, red maple-country hardwoods 40–55%, woodland junipers
 and pinyons 90–99% because their crowns run to the ground. **Crown ratio is
 another quantity where nature has a range and one number cannot serve.**
 
 ### 3.6 A genus fallback for crown ratio is a lion-to-macaque waiting to happen
 
-Only **11 of 78** tree specs have a species-level FIA crown ratio. Falling back
-to the genus median fills in another 28 — and for *Pinus* the FIA genus is
+Only **12 of 78** tree specs have a species-level FIA crown ratio. Falling back
+to the genus median fills in another 27 — and for *Pinus* the FIA genus is
 dominated by pinyon and one-leaf pines from the Arizona woodland plots, whose
 crowns reach the ground at 86–99%. Used as a reference for `stone-pine` and
 `maritime-pine` — Mediterranean pines whose own notes author a deliberately bare
 four-fifths of bole — it declares them 70% wrong.
 
-They are not wrong; the reference is. The genus-level crown ratios are reported
-in §4 for completeness and **nothing was fitted from them**.
+They are not wrong; the reference is. §4 therefore reports crown ratio **twice**
+— once over the 12 species-level matches, which is the number to believe, and
+once over all 39 including the genus fallback, which is the number a less
+careful pass would have published. **Nothing was fitted from either.**
 
 ---
 
@@ -323,7 +326,8 @@ genus level**, and §3.6's warning applies to those 18 as well (see below).
 | crown width / height, vs open-grown (÷1.20) | 42 | **1.25×** | | | |
 | **stem diameter / height, vs stand-grown** | 55 | **3.05×** | 1.35–15.80× | **300%** | **0/55** |
 | **stem diameter / height, vs open-grown target** | 52 | **2.00×** | | **134%** | **4/52** |
-| crown ratio, vs FIA uncompacted | 39 | 1.15× | 0.27–2.07× | 34.0% | 11/39 |
+| **crown ratio, vs FIA uncompacted, species-level only** | **12** | **1.15×** | 0.90–1.83× | **22.3%** | 5/12 |
+| crown ratio, same but including genus fallback (§3.6 — do not believe this row) | 39 | 1.15× | 0.27–2.07× | 34.0% | 11/39 |
 | built height ÷ authored `height_m` | 64 | 1.00× | 0.82–1.22× | 7.6% | 48/64 |
 | trunk taper d(1.3 m)/d(0.1 m), ours | 64 | 0.83 | 0.53–1.71 | | |
 
@@ -353,8 +357,11 @@ measured in §2.5. A quarter too wide is inside the range of "which individual",
 and the crown envelope is also the parameter the owner has tuned by eye across
 several passes. **Measured, reported, not changed.**
 
-**Crown ratio — median 1.15×, and the reference is too thin to act on.** Only 11
-species-level matches, and §3.6 shows the genus fallback actively lying about
+**Crown ratio — median 1.15×, and the reference is too thin to act on.** On the
+12 species with a species-level FIA match, our crowns are 15% deeper than
+measured with a 22% mean absolute error — close, and the same "level right,
+spread wrong" shape again. But 12 species is not a basis for moving 78, and
+§3.6 shows the genus fallback that would fill the gap actively lying about
 Mediterranean pines. **Measured, reported, not changed.**
 
 **Stem diameter — the finding.** Median **3.05×** the stem a real tree of that
@@ -398,7 +405,7 @@ Against the raw stand-grown Tallo law, the library moved from **3.05× to
 1.57×** — i.e. onto the 1.50× open-grown figure, which is where it was aimed.
 
 The other ratios, re-measured after the change, moved as expected — barely:
-height 0.98× → 0.96×, crown width 1.50× → 1.56×, crown ratio 1.15× → 1.15×.
+height 0.98× → 0.96×, crown width 1.50× → 1.56×, crown ratio 1.15× → 1.11×.
 Trunk thickness and crown shape are close to independent in this generator,
 which is the result that says the fit did not buy its win somewhere else.
 
@@ -590,7 +597,7 @@ driven by these numbers.
 
 ## 8. What could not be sourced, stated plainly
 
-- **Crown depth for anything outside North America.** Only 11 of 78 tree specs
+- **Crown depth for anything outside North America.** Only 12 of 78 tree specs
   have a species-level crown ratio, all FIA, all US. The European and tropical
   species have none, and §3.6 shows the genus fallback is actively wrong for
   Mediterranean pines. This is the biggest remaining hole and NEON (rejection 2)
