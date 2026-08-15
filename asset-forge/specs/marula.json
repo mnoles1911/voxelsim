@@ -111,6 +111,7 @@
     "caudal_shape": "forked",
     "caudal_span": 1.15,
     "caudal_upper": 0.0,
+    "claspers": 0.0,
     "curve_amount": 0.0,
     "curve_at": 0.55,
     "depth_at": 0.36,
@@ -404,7 +405,7 @@
     "lean_dir_deg": 0.0,
     "lobe_depth": 0.18,
     "lobes": 0,
-    "radius_base_m": 0.42,
+    "radius_base_m": 0.315,
     "wander": 0.22
   },
   "tuft": {

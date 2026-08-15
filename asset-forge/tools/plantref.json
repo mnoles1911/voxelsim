@@ -1,0 +1,1176 @@
+{
+ "alpine-krummholz": {
+  "binomial": "Pinus mugo",
+  "note": "generic krummholz form; mugo pine is the archetype",
+  "tallo_level": "species",
+  "tallo_n_h": 27,
+  "h_p90": 14.860000000000007,
+  "h_p95": 16.93
+ },
+ "american-beech": {
+  "binomial": "Fagus grandifolia",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1749,
+  "h_p90": 20.7,
+  "h_p95": 23.2,
+  "crown_radius_vs_h": {
+   "a": 0.47787,
+   "b": 0.66468,
+   "n": 723,
+   "r2": 0.374
+  },
+  "dbh_vs_h": {
+   "a": 0.64496,
+   "b": 1.25886,
+   "n": 1749,
+   "r2": 0.914
+  },
+  "fia_uncr": 0.7,
+  "fia_uncr_n": 3260
+ },
+ "baobab": {
+  "binomial": "Adansonia digitata",
+  "note": ""
+ },
+ "beach-hibiscus": {
+  "binomial": "Hibiscus tiliaceus",
+  "note": ""
+ },
+ "bigleaf-maple": {
+  "binomial": "Acer macrophyllum",
+  "note": "",
+  "tallo_level": "genus:Acer",
+  "tallo_n_h": 11879,
+  "h_p90": 23.6,
+  "h_p95": 25.9,
+  "crown_radius_vs_h": {
+   "a": 0.40789,
+   "b": 0.69494,
+   "n": 7349,
+   "r2": 0.413
+  },
+  "dbh_vs_h": {
+   "a": 0.62684,
+   "b": 1.25841,
+   "n": 11879,
+   "r2": 0.82
+  },
+  "fia_uncr": 0.45,
+  "fia_uncr_n": 121
+ },
+ "birch": {
+  "binomial": "Betula pendula",
+  "note": "generic 'birch'",
+  "tallo_level": "species",
+  "tallo_n_h": 1608,
+  "h_p90": 29.1,
+  "h_p95": 32.96499999999999,
+  "crown_radius_vs_h": {
+   "a": 0.14944,
+   "b": 0.94266,
+   "n": 728,
+   "r2": 0.663
+  },
+  "dbh_vs_h": {
+   "a": 0.41201,
+   "b": 1.30131,
+   "n": 1608,
+   "r2": 0.878
+  }
+ },
+ "black-cherry": {
+  "binomial": "Prunus serotina",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 201,
+  "h_p90": 28.2,
+  "h_p95": 29.9,
+  "crown_radius_vs_h": {
+   "a": 0.63637,
+   "b": 0.57293,
+   "n": 81,
+   "r2": 0.469
+  },
+  "dbh_vs_h": {
+   "a": 0.57589,
+   "b": 1.30357,
+   "n": 201,
+   "r2": 0.915
+  },
+  "fia_uncr": 0.4,
+  "fia_uncr_n": 1186
+ },
+ "black-mangrove": {
+  "binomial": "Avicennia germinans",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 475,
+  "h_p90": 20.2,
+  "h_p95": 23.05999999999999,
+  "crown_radius_vs_h": {
+   "a": 0.30492,
+   "b": 0.75694,
+   "n": 472,
+   "r2": 0.554
+  },
+  "dbh_vs_h": {
+   "a": 0.93726,
+   "b": 1.28276,
+   "n": 475,
+   "r2": 0.782
+  }
+ },
+ "bur-oak": {
+  "binomial": "Quercus macrocarpa",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 50,
+  "h_p90": 23.26,
+  "h_p95": 23.965,
+  "crown_radius_vs_h": {
+   "a": 0.65729,
+   "b": 0.68564,
+   "n": 48,
+   "r2": 0.414
+  },
+  "dbh_vs_h": {
+   "a": 2.29896,
+   "b": 0.98015,
+   "n": 50,
+   "r2": 0.659
+  }
+ },
+ "casuarina": {
+  "binomial": "Casuarina equisetifolia",
+  "note": "",
+  "tallo_level": "genus:Casuarina",
+  "tallo_n_h": 126,
+  "h_p90": 13.350000000000001,
+  "h_p95": 15.225000000000001,
+  "dbh_vs_h": {
+   "a": 4.64496,
+   "b": 0.48621,
+   "n": 126,
+   "r2": 0.297
+  }
+ },
+ "cecropia": {
+  "binomial": "Cecropia",
+  "note": "genus-level",
+  "tallo_level": "genus:Cecropia",
+  "tallo_n_h": 374,
+  "h_p90": 27.27,
+  "h_p95": 30.434999999999995,
+  "crown_radius_vs_h": {
+   "a": 0.13821,
+   "b": 1.03798,
+   "n": 246,
+   "r2": 0.625
+  },
+  "dbh_vs_h": {
+   "a": 0.68382,
+   "b": 1.17439,
+   "n": 374,
+   "r2": 0.892
+  }
+ },
+ "cherry-blossom": {
+  "binomial": "Prunus serrulata",
+  "note": "ornamental cultivar group",
+  "tallo_level": "genus:Prunus",
+  "tallo_n_h": 1172,
+  "h_p90": 26.0,
+  "h_p95": 28.0,
+  "crown_radius_vs_h": {
+   "a": 0.25467,
+   "b": 0.90007,
+   "n": 503,
+   "r2": 0.595
+  },
+  "dbh_vs_h": {
+   "a": 0.82984,
+   "b": 1.13967,
+   "n": 1172,
+   "r2": 0.803
+  }
+ },
+ "coast-palm": {
+  "binomial": "Cocos nucifera",
+  "note": "palm - no secondary thickening",
+  "tallo_level": "species",
+  "tallo_n_h": 1,
+  "h_p90": 10.0,
+  "h_p95": 10.0
+ },
+ "columnar-cypress": {
+  "binomial": "Cupressus sempervirens",
+  "note": "'Stricta' cultivar habit",
+  "tallo_level": "genus:Cupressus",
+  "tallo_n_h": 104,
+  "h_p90": 15.64,
+  "h_p95": 19.404999999999994,
+  "crown_radius_vs_h": {
+   "a": 0.33458,
+   "b": 0.70312,
+   "n": 104,
+   "r2": 0.424
+  },
+  "dbh_vs_h": {
+   "a": 1.24593,
+   "b": 0.96399,
+   "n": 104,
+   "r2": 0.511
+  }
+ },
+ "common-alder": {
+  "binomial": "Alnus glutinosa",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 71,
+  "h_p90": 30.0,
+  "h_p95": 32.0,
+  "dbh_vs_h": {
+   "a": 2.56593,
+   "b": 0.79854,
+   "n": 71,
+   "r2": 0.609
+  }
+ },
+ "common-ash": {
+  "binomial": "Fraxinus excelsior",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1077,
+  "h_p90": 33.339999999999996,
+  "h_p95": 35.5,
+  "crown_radius_vs_h": {
+   "a": 0.25866,
+   "b": 0.70736,
+   "n": 1006,
+   "r2": 0.439
+  },
+  "dbh_vs_h": {
+   "a": 1.0389,
+   "b": 1.01789,
+   "n": 1077,
+   "r2": 0.697
+  }
+ },
+ "cork-oak": {
+  "binomial": "Quercus suber",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 3256,
+  "h_p90": 11.0,
+  "h_p95": 12.5,
+  "crown_radius_vs_h": {
+   "a": 0.34864,
+   "b": 1.09432,
+   "n": 3256,
+   "r2": 0.418
+  },
+  "dbh_vs_h": {
+   "a": 4.21953,
+   "b": 1.04369,
+   "n": 3256,
+   "r2": 0.468
+  }
+ },
+ "crab-apple": {
+  "binomial": "Malus sylvestris",
+  "note": "",
+  "tallo_level": "genus:Malus",
+  "tallo_n_h": 33,
+  "h_p90": 8.08,
+  "h_p95": 8.52
+ },
+ "date-palm": {
+  "binomial": "Phoenix dactylifera",
+  "note": "palm"
+ },
+ "desert-dead": {
+  "binomial": null,
+  "note": "generic dead snag - no species"
+ },
+ "desert-ironwood": {
+  "binomial": "Olneya tesota",
+  "note": ""
+ },
+ "douglas-fir": {
+  "binomial": "Pseudotsuga menziesii",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 5144,
+  "h_p90": 26.3,
+  "h_p95": 34.3,
+  "crown_radius_vs_h": {
+   "a": 0.26903,
+   "b": 0.68773,
+   "n": 4238,
+   "r2": 0.484
+  },
+  "dbh_vs_h": {
+   "a": 0.78117,
+   "b": 1.17865,
+   "n": 5144,
+   "r2": 0.882
+  },
+  "fia_uncr": 0.67,
+  "fia_uncr_n": 12009
+ },
+ "doum-palm": {
+  "binomial": "Hyphaene thebaica",
+  "note": "palm"
+ },
+ "eastern-cottonwood": {
+  "binomial": "Populus deltoides",
+  "note": "",
+  "tallo_level": "genus:Populus",
+  "tallo_n_h": 3274,
+  "h_p90": 22.9,
+  "h_p95": 25.5,
+  "crown_radius_vs_h": {
+   "a": 0.44672,
+   "b": 0.6026,
+   "n": 1383,
+   "r2": 0.321
+  },
+  "dbh_vs_h": {
+   "a": 0.50988,
+   "b": 1.33723,
+   "n": 3274,
+   "r2": 0.812
+  }
+ },
+ "eastern-hemlock": {
+  "binomial": "Tsuga canadensis",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1515,
+  "h_p90": 19.9,
+  "h_p95": 21.9,
+  "crown_radius_vs_h": {
+   "a": 0.68529,
+   "b": 0.55303,
+   "n": 456,
+   "r2": 0.333
+  },
+  "dbh_vs_h": {
+   "a": 0.97842,
+   "b": 1.23926,
+   "n": 1515,
+   "r2": 0.889
+  },
+  "fia_uncr": 0.65,
+  "fia_uncr_n": 2361
+ },
+ "european-beech": {
+  "binomial": "Fagus sylvatica",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 8931,
+  "h_p90": 29.8,
+  "h_p95": 33.2,
+  "dbh_vs_h": {
+   "a": 1.83572,
+   "b": 0.92272,
+   "n": 8931,
+   "r2": 0.41
+  }
+ },
+ "european-yew": {
+  "binomial": "Taxus baccata",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 66,
+  "h_p90": 11.55,
+  "h_p95": 12.375,
+  "crown_radius_vs_h": {
+   "a": 0.67685,
+   "b": 0.59653,
+   "n": 49,
+   "r2": 0.216
+  },
+  "dbh_vs_h": {
+   "a": 1.4621,
+   "b": 1.08535,
+   "n": 66,
+   "r2": 0.425
+  }
+ },
+ "fever-tree": {
+  "binomial": "Vachellia xanthophloea",
+  "note": "syn. Acacia xanthophloea",
+  "tallo_level": "genus:Vachellia",
+  "tallo_n_h": 1169,
+  "h_p90": 8.0,
+  "h_p95": 9.5,
+  "crown_radius_vs_h": {
+   "a": 0.59395,
+   "b": 0.92045,
+   "n": 879,
+   "r2": 0.614
+  },
+  "dbh_vs_h": {
+   "a": 4.50231,
+   "b": 0.6926,
+   "n": 1169,
+   "r2": 0.364
+  }
+ },
+ "field-elm": {
+  "binomial": "Ulmus minor",
+  "note": "",
+  "tallo_level": "genus:Ulmus",
+  "tallo_n_h": 785,
+  "h_p90": 15.920000000000005,
+  "h_p95": 18.75999999999999,
+  "crown_radius_vs_h": {
+   "a": 0.64517,
+   "b": 0.60987,
+   "n": 321,
+   "r2": 0.481
+  },
+  "dbh_vs_h": {
+   "a": 0.98951,
+   "b": 1.19557,
+   "n": 785,
+   "r2": 0.739
+  }
+ },
+ "field-maple": {
+  "binomial": "Acer campestre",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 214,
+  "h_p90": 21.87,
+  "h_p95": 23.235,
+  "crown_radius_vs_h": {
+   "a": 0.45495,
+   "b": 0.68124,
+   "n": 202,
+   "r2": 0.448
+  },
+  "dbh_vs_h": {
+   "a": 1.97412,
+   "b": 0.93381,
+   "n": 214,
+   "r2": 0.566
+  }
+ },
+ "flowering-dogwood": {
+  "binomial": "Cornus florida",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 228,
+  "h_p90": 9.530000000000001,
+  "h_p95": 11.0,
+  "dbh_vs_h": {
+   "a": 0.71029,
+   "b": 1.26422,
+   "n": 228,
+   "r2": 0.732
+  },
+  "fia_uncr": 0.55,
+  "fia_uncr_n": 166
+ },
+ "hawthorn-scrub": {
+  "binomial": "Crataegus monogyna",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 242,
+  "h_p90": 6.0,
+  "h_p95": 8.0
+ },
+ "hero-sequoia": {
+  "binomial": "Sequoiadendron giganteum",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 13,
+  "h_p90": 26.12000000000001,
+  "h_p95": 51.159999999999926
+ },
+ "holm-oak": {
+  "binomial": "Quercus ilex",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 22746,
+  "h_p90": 9.0,
+  "h_p95": 10.5,
+  "crown_radius_vs_h": {
+   "a": 0.38278,
+   "b": 1.11088,
+   "n": 20955,
+   "r2": 0.41
+  },
+  "dbh_vs_h": {
+   "a": 3.75081,
+   "b": 1.10607,
+   "n": 22746,
+   "r2": 0.369
+  }
+ },
+ "honey-locust": {
+  "binomial": "Gleditsia triacanthos",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 83,
+  "h_p90": 20.439999999999998,
+  "h_p95": 21.449999999999996,
+  "crown_radius_vs_h": {
+   "a": 0.56633,
+   "b": 0.6023,
+   "n": 54,
+   "r2": 0.218
+  },
+  "dbh_vs_h": {
+   "a": 0.89925,
+   "b": 1.24386,
+   "n": 83,
+   "r2": 0.834
+  }
+ },
+ "hornbeam": {
+  "binomial": "Carpinus betulus",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 2292,
+  "h_p90": 25.0,
+  "h_p95": 27.2,
+  "crown_radius_vs_h": {
+   "a": 0.45534,
+   "b": 0.70229,
+   "n": 2287,
+   "r2": 0.334
+  },
+  "dbh_vs_h": {
+   "a": 2.5405,
+   "b": 0.75486,
+   "n": 2292,
+   "r2": 0.379
+  }
+ },
+ "jackalberry": {
+  "binomial": "Diospyros mespiliformis",
+  "note": "",
+  "tallo_level": "genus:Diospyros",
+  "tallo_n_h": 2748,
+  "h_p90": 14.43000000000002,
+  "h_p95": 17.2,
+  "crown_radius_vs_h": {
+   "a": 0.24801,
+   "b": 0.80967,
+   "n": 2359,
+   "r2": 0.394
+  },
+  "dbh_vs_h": {
+   "a": 0.82406,
+   "b": 1.15724,
+   "n": 2748,
+   "r2": 0.611
+  }
+ },
+ "japanese-maple": {
+  "binomial": "Acer palmatum",
+  "note": "",
+  "tallo_level": "genus:Acer",
+  "tallo_n_h": 11879,
+  "h_p90": 23.6,
+  "h_p95": 25.9,
+  "crown_radius_vs_h": {
+   "a": 0.40789,
+   "b": 0.69494,
+   "n": 7349,
+   "r2": 0.413
+  },
+  "dbh_vs_h": {
+   "a": 0.62684,
+   "b": 1.25841,
+   "n": 11879,
+   "r2": 0.82
+  }
+ },
+ "joshua-tree": {
+  "binomial": "Yucca brevifolia",
+  "note": "arborescent monocot"
+ },
+ "jungle-emergent": {
+  "binomial": null,
+  "note": "generic emergent - no species"
+ },
+ "kapok": {
+  "binomial": "Ceiba pentandra",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 88,
+  "h_p90": 42.0,
+  "h_p95": 44.31499999999999,
+  "dbh_vs_h": {
+   "a": 0.19571,
+   "b": 1.83402,
+   "n": 88,
+   "r2": 0.904
+  }
+ },
+ "maritime-pine": {
+  "binomial": "Pinus pinaster",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 11761,
+  "h_p90": 17.5,
+  "h_p95": 20.0,
+  "crown_radius_vs_h": {
+   "a": 0.68585,
+   "b": 0.48928,
+   "n": 11747,
+   "r2": 0.242
+  },
+  "dbh_vs_h": {
+   "a": 5.15952,
+   "b": 0.7003,
+   "n": 11761,
+   "r2": 0.504
+  }
+ },
+ "marula": {
+  "binomial": "Sclerocarya birrea",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 81,
+  "h_p90": 14.8,
+  "h_p95": 17.8,
+  "crown_radius_vs_h": {
+   "a": 0.36815,
+   "b": 1.10229,
+   "n": 79,
+   "r2": 0.798
+  },
+  "dbh_vs_h": {
+   "a": 1.06632,
+   "b": 1.51982,
+   "n": 81,
+   "r2": 0.878
+  }
+ },
+ "monterey-cypress": {
+  "binomial": "Hesperocyparis macrocarpa",
+  "note": "syn. Cupressus macrocarpa"
+ },
+ "mopane": {
+  "binomial": "Colophospermum mopane",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 213,
+  "h_p90": 6.860000000000003,
+  "h_p95": 7.6,
+  "crown_radius_vs_h": {
+   "a": 0.42825,
+   "b": 0.88695,
+   "n": 213,
+   "r2": 0.664
+  },
+  "dbh_vs_h": {
+   "a": 1.91614,
+   "b": 1.16984,
+   "n": 213,
+   "r2": 0.661
+  }
+ },
+ "norway-spruce": {
+  "binomial": "Picea abies",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 6687,
+  "h_p90": 32.6,
+  "h_p95": 35.6,
+  "crown_radius_vs_h": {
+   "a": 0.40507,
+   "b": 0.55636,
+   "n": 6124,
+   "r2": 0.452
+  },
+  "dbh_vs_h": {
+   "a": 1.15792,
+   "b": 1.03251,
+   "n": 6687,
+   "r2": 0.845
+  }
+ },
+ "olive": {
+  "binomial": "Olea europaea",
+  "note": "",
+  "tallo_level": "genus:Olea",
+  "tallo_n_h": 202,
+  "h_p90": 15.0,
+  "h_p95": 17.0,
+  "crown_radius_vs_h": {
+   "a": 0.26441,
+   "b": 0.67384,
+   "n": 190,
+   "r2": 0.264
+  },
+  "dbh_vs_h": {
+   "a": 1.02115,
+   "b": 1.09772,
+   "n": 202,
+   "r2": 0.596
+  }
+ },
+ "quaking-aspen": {
+  "binomial": "Populus tremuloides",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1834,
+  "h_p90": 21.3,
+  "h_p95": 23.2,
+  "crown_radius_vs_h": {
+   "a": 0.29992,
+   "b": 0.74782,
+   "n": 565,
+   "r2": 0.608
+  },
+  "dbh_vs_h": {
+   "a": 0.47532,
+   "b": 1.36816,
+   "n": 1834,
+   "r2": 0.824
+  },
+  "fia_uncr": 0.31,
+  "fia_uncr_n": 5037
+ },
+ "red-mangrove": {
+  "binomial": "Rhizophora mangle",
+  "note": "",
+  "tallo_level": "genus:Rhizophora",
+  "tallo_n_h": 211,
+  "h_p90": 15.1,
+  "h_p95": 17.95,
+  "crown_radius_vs_h": {
+   "a": 0.2486,
+   "b": 0.87107,
+   "n": 209,
+   "r2": 0.733
+  },
+  "dbh_vs_h": {
+   "a": 0.67611,
+   "b": 1.13523,
+   "n": 211,
+   "r2": 0.827
+  }
+ },
+ "river-broadleaf": {
+  "binomial": null,
+  "note": "generic riparian broadleaf - no species"
+ },
+ "rowan": {
+  "binomial": "Sorbus aucuparia",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 54,
+  "h_p90": 19.0,
+  "h_p95": 21.194999999999993,
+  "dbh_vs_h": {
+   "a": 1.28688,
+   "b": 0.86954,
+   "n": 54,
+   "r2": 0.683
+  }
+ },
+ "saguaro": {
+  "binomial": "Carnegiea gigantea",
+  "note": "columnar cactus - not a tree"
+ },
+ "sausage-tree": {
+  "binomial": "Kigelia africana",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 4,
+  "h_p90": 13.010000000000002,
+  "h_p95": 13.804999999999998
+ },
+ "savanna-acacia": {
+  "binomial": "Vachellia tortilis",
+  "note": "syn. Acacia tortilis, umbrella thorn",
+  "tallo_level": "species",
+  "tallo_n_h": 261,
+  "h_p90": 6.0,
+  "h_p95": 6.0,
+  "crown_radius_vs_h": {
+   "a": 0.57045,
+   "b": 0.96656,
+   "n": 260,
+   "r2": 0.631
+  },
+  "dbh_vs_h": {
+   "a": 3.22436,
+   "b": 1.2179,
+   "n": 261,
+   "r2": 0.676
+  }
+ },
+ "scots-pine": {
+  "binomial": "Pinus sylvestris",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 17957,
+  "h_p90": 23.0,
+  "h_p95": 26.4,
+  "dbh_vs_h": {
+   "a": 2.93014,
+   "b": 0.80118,
+   "n": 17957,
+   "r2": 0.467
+  }
+ },
+ "screwpine": {
+  "binomial": "Pandanus tectorius",
+  "note": "monocot",
+  "tallo_level": "species",
+  "tallo_n_h": 7,
+  "h_p90": 5.7,
+  "h_p95": 5.85
+ },
+ "sea-grape": {
+  "binomial": "Coccoloba uvifera",
+  "note": "",
+  "tallo_level": "genus:Coccoloba",
+  "tallo_n_h": 829,
+  "h_p90": 13.0,
+  "h_p95": 15.05999999999999,
+  "dbh_vs_h": {
+   "a": 0.80107,
+   "b": 1.18275,
+   "n": 829,
+   "r2": 0.714
+  }
+ },
+ "shagbark-hickory": {
+  "binomial": "Carya ovata",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 204,
+  "h_p90": 23.740000000000006,
+  "h_p95": 26.685,
+  "crown_radius_vs_h": {
+   "a": 0.82651,
+   "b": 0.52009,
+   "n": 50,
+   "r2": 0.402
+  },
+  "dbh_vs_h": {
+   "a": 1.43256,
+   "b": 1.03654,
+   "n": 204,
+   "r2": 0.693
+  },
+  "fia_uncr": 0.5,
+  "fia_uncr_n": 495
+ },
+ "siberian-larch": {
+  "binomial": "Larix sibirica",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 161,
+  "h_p90": 18.2,
+  "h_p95": 20.3,
+  "dbh_vs_h": {
+   "a": 0.46165,
+   "b": 1.31793,
+   "n": 161,
+   "r2": 0.868
+  }
+ },
+ "sitka-spruce": {
+  "binomial": "Picea sitchensis",
+  "note": "",
+  "tallo_level": "genus:Picea",
+  "tallo_n_h": 13789,
+  "h_p90": 31.0,
+  "h_p95": 34.8,
+  "crown_radius_vs_h": {
+   "a": 0.3438,
+   "b": 0.60145,
+   "n": 8755,
+   "r2": 0.475
+  },
+  "dbh_vs_h": {
+   "a": 1.3743,
+   "b": 1.00718,
+   "n": 13789,
+   "r2": 0.842
+  }
+ },
+ "small-leaved-lime": {
+  "binomial": "Tilia cordata",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 473,
+  "h_p90": 21.18,
+  "h_p95": 22.179999999999996,
+  "dbh_vs_h": {
+   "a": 0.39963,
+   "b": 1.34758,
+   "n": 473,
+   "r2": 0.775
+  }
+ },
+ "stone-pine": {
+  "binomial": "Pinus pinea",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 3163,
+  "h_p90": 13.0,
+  "h_p95": 14.5,
+  "crown_radius_vs_h": {
+   "a": 0.58535,
+   "b": 0.72874,
+   "n": 3159,
+   "r2": 0.5
+  },
+  "dbh_vs_h": {
+   "a": 4.18734,
+   "b": 0.90742,
+   "n": 3163,
+   "r2": 0.683
+  }
+ },
+ "strangler-fig": {
+  "binomial": "Ficus",
+  "note": "genus-level; many strangler species",
+  "tallo_level": "genus:Ficus",
+  "tallo_n_h": 1138,
+  "h_p90": 15.0,
+  "h_p95": 28.414999999999985,
+  "crown_radius_vs_h": {
+   "a": 0.18243,
+   "b": 1.00641,
+   "n": 1022,
+   "r2": 0.508
+  },
+  "dbh_vs_h": {
+   "a": 1.23193,
+   "b": 1.14408,
+   "n": 1138,
+   "r2": 0.634
+  }
+ },
+ "sugar-maple": {
+  "binomial": "Acer saccharum",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 5743,
+  "h_p90": 23.7,
+  "h_p95": 25.3,
+  "crown_radius_vs_h": {
+   "a": 0.30937,
+   "b": 0.79242,
+   "n": 4840,
+   "r2": 0.39
+  },
+  "dbh_vs_h": {
+   "a": 0.40671,
+   "b": 1.39935,
+   "n": 5743,
+   "r2": 0.794
+  },
+  "fia_uncr": 0.55,
+  "fia_uncr_n": 5093
+ },
+ "sweet-chestnut": {
+  "binomial": "Castanea sativa",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1710,
+  "h_p90": 18.4,
+  "h_p95": 19.554999999999996
+ },
+ "sycamore-maple": {
+  "binomial": "Acer pseudoplatanus",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 686,
+  "h_p90": 31.35,
+  "h_p95": 32.8,
+  "dbh_vs_h": {
+   "a": 0.89182,
+   "b": 1.09374,
+   "n": 686,
+   "r2": 0.604
+  }
+ },
+ "temperate-oak": {
+  "binomial": "Quercus robur",
+  "note": "generic 'temperate oak'",
+  "tallo_level": "species",
+  "tallo_n_h": 2440,
+  "h_p90": 25.0,
+  "h_p95": 29.704999999999973,
+  "crown_radius_vs_h": {
+   "a": 0.76986,
+   "b": 0.56642,
+   "n": 2333,
+   "r2": 0.29
+  },
+  "dbh_vs_h": {
+   "a": 5.63006,
+   "b": 0.66672,
+   "n": 2440,
+   "r2": 0.335
+  }
+ },
+ "temperate-sapling": {
+  "binomial": null,
+  "note": "generic sapling - no species"
+ },
+ "tree-fern": {
+  "binomial": "Dicksonia antarctica",
+  "note": "tree fern - no secondary thickening"
+ },
+ "tulip-tree": {
+  "binomial": "Liriodendron tulipifera",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 1076,
+  "h_p90": 35.8,
+  "h_p95": 38.0,
+  "crown_radius_vs_h": {
+   "a": 0.48056,
+   "b": 0.66483,
+   "n": 384,
+   "r2": 0.339
+  },
+  "dbh_vs_h": {
+   "a": 0.35652,
+   "b": 1.42081,
+   "n": 1076,
+   "r2": 0.909
+  },
+  "fia_uncr": 0.45,
+  "fia_uncr_n": 1788
+ },
+ "tundra-pine": {
+  "binomial": "Pinus sylvestris",
+  "note": "generic treeline pine",
+  "tallo_level": "species",
+  "tallo_n_h": 17957,
+  "h_p90": 23.0,
+  "h_p95": 26.4,
+  "dbh_vs_h": {
+   "a": 2.93014,
+   "b": 0.80118,
+   "n": 17957,
+   "r2": 0.467
+  }
+ },
+ "weeping-willow": {
+  "binomial": "Salix babylonica",
+  "note": "",
+  "tallo_level": "genus:Salix",
+  "tallo_n_h": 77,
+  "h_p90": 16.860000000000007,
+  "h_p95": 19.94000000000001,
+  "crown_radius_vs_h": {
+   "a": 0.3676,
+   "b": 0.64924,
+   "n": 58,
+   "r2": 0.735
+  },
+  "dbh_vs_h": {
+   "a": 0.91166,
+   "b": 1.07887,
+   "n": 77,
+   "r2": 0.826
+  }
+ },
+ "western-hemlock": {
+  "binomial": "Tsuga heterophylla",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 563,
+  "h_p90": 34.1,
+  "h_p95": 38.78999999999999,
+  "crown_radius_vs_h": {
+   "a": 0.35402,
+   "b": 0.70148,
+   "n": 97,
+   "r2": 0.847
+  },
+  "dbh_vs_h": {
+   "a": 0.96865,
+   "b": 1.14382,
+   "n": 563,
+   "r2": 0.935
+  },
+  "fia_uncr": 0.7,
+  "fia_uncr_n": 925
+ },
+ "western-red-cedar": {
+  "binomial": "Thuja plicata",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 81,
+  "h_p90": 31.7,
+  "h_p95": 33.2,
+  "crown_radius_vs_h": {
+   "a": 0.40153,
+   "b": 0.66571,
+   "n": 47,
+   "r2": 0.904
+  },
+  "dbh_vs_h": {
+   "a": 0.86585,
+   "b": 1.23277,
+   "n": 81,
+   "r2": 0.95
+  },
+  "fia_uncr": 0.7,
+  "fia_uncr_n": 361
+ },
+ "white-poplar": {
+  "binomial": "Populus alba",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 43,
+  "h_p90": 18.38,
+  "h_p95": 19.849999999999998
+ },
+ "wild-banana": {
+  "binomial": "Musa acuminata",
+  "note": "giant herb, not a tree"
+ },
+ "wild-pear": {
+  "binomial": "Pyrus pyraster",
+  "note": "",
+  "tallo_level": "genus:Pyrus",
+  "tallo_n_h": 118,
+  "h_p90": 7.0,
+  "h_p95": 8.0,
+  "dbh_vs_h": {
+   "a": 6.38115,
+   "b": 0.69607,
+   "n": 118,
+   "r2": 0.232
+  }
+ },
+ "wych-elm": {
+  "binomial": "Ulmus glabra",
+  "note": "",
+  "tallo_level": "species",
+  "tallo_n_h": 99,
+  "h_p90": 20.6,
+  "h_p95": 27.31,
+  "crown_radius_vs_h": {
+   "a": 0.46208,
+   "b": 0.68925,
+   "n": 93,
+   "r2": 0.541
+  },
+  "dbh_vs_h": {
+   "a": 0.9988,
+   "b": 1.09539,
+   "n": 99,
+   "r2": 0.705
+  }
+ }
+}

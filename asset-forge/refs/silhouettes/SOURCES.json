@@ -998,33 +998,45 @@
   "common-frog": {
     "images": [
       {
-        "attribution": "Margot Michaud",
-        "contributor": "Margot Michaud",
-        "file": "common-frog/3a403599.png",
-        "licence": "CC0 1.0",
-        "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "phylopic_title": "Mustela lutreolina",
-        "raster_size": "1536x742",
-        "raster_url": "https://images.phylopic.org/images/3a403599-00a2-4b1e-b16f-869bdd3e6feb/raster/1536x742.png",
-        "source_url": "https://www.phylopic.org/images/3a403599-00a2-4b1e-b16f-869bdd3e6feb",
-        "uuid": "3a403599-00a2-4b1e-b16f-869bdd3e6feb"
+        "attribution": "Luca Leicht",
+        "contributor": "Luca Leicht",
+        "file": "common-frog/b14f5941.png",
+        "licence": "CC BY 4.0",
+        "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+        "phylopic_title": "Rana temporaria",
+        "raster_size": "1531x1536",
+        "raster_url": "https://images.phylopic.org/images/b14f5941-85a7-4d9a-bd6b-81e4f40402bf/raster/1531x1536.png",
+        "source_url": "https://www.phylopic.org/images/b14f5941-85a7-4d9a-bd6b-81e4f40402bf",
+        "uuid": "b14f5941-85a7-4d9a-bd6b-81e4f40402bf"
       },
       {
-        "attribution": "Margot Michaud",
-        "contributor": "Margot Michaud",
-        "file": "common-frog/f5e7b7ea.png",
+        "attribution": "Luca Leicht",
+        "contributor": "Luca Leicht",
+        "file": "common-frog/97b84671.png",
+        "licence": "CC BY 4.0",
+        "licence_url": "https://creativecommons.org/licenses/by/4.0/",
+        "phylopic_title": "Rana temporaria",
+        "raster_size": "1536x454",
+        "raster_url": "https://images.phylopic.org/images/97b84671-8359-465b-8f15-a8877528dcf7/raster/1536x454.png",
+        "source_url": "https://www.phylopic.org/images/97b84671-8359-465b-8f15-a8877528dcf7",
+        "uuid": "97b84671-8359-465b-8f15-a8877528dcf7"
+      },
+      {
+        "attribution": "Beth Reinke",
+        "contributor": "Beth Reinke",
+        "file": "common-frog/e73c5c1c.png",
         "licence": "CC0 1.0",
         "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "phylopic_title": "Mustela lutreola",
-        "raster_size": "1536x550",
-        "raster_url": "https://images.phylopic.org/images/f5e7b7ea-cf7c-4492-93d4-1847e1d66b15/raster/1536x550.png",
-        "source_url": "https://www.phylopic.org/images/f5e7b7ea-cf7c-4492-93d4-1847e1d66b15",
-        "uuid": "f5e7b7ea-cf7c-4492-93d4-1847e1d66b15"
+        "phylopic_title": "Rana temporaria",
+        "raster_size": "1141x1188",
+        "raster_url": "https://images.phylopic.org/images/e73c5c1c-7727-4687-bf0b-3957343edfc3/raster/1141x1188.png",
+        "source_url": "https://www.phylopic.org/images/e73c5c1c-7727-4687-bf0b-3957343edfc3",
+        "uuid": "e73c5c1c-7727-4687-bf0b-3957343edfc3"
       }
     ],
     "phylopic_build": 549,
     "refused": [],
-    "scientific_name": "Mustela lutreola"
+    "scientific_name": "Rana temporaria"
   },
   "corsac-fox": {
     "images": [
@@ -1391,33 +1403,57 @@
   "elk-wapiti": {
     "images": [
       {
-        "attribution": "Ferran Sayol",
-        "contributor": "Ferran Sayol",
-        "file": "elk-wapiti/cc03f5c2.png",
+        "attribution": null,
+        "contributor": "Abby Weber",
+        "file": "elk-wapiti/b156cc5b.png",
         "licence": "CC0 1.0",
         "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "phylopic_title": "Cervus elaphus",
-        "raster_size": "1509x1536",
-        "raster_url": "https://images.phylopic.org/images/cc03f5c2-933f-4c40-9c64-7f8727556fdb/raster/1509x1536.png",
-        "source_url": "https://www.phylopic.org/images/cc03f5c2-933f-4c40-9c64-7f8727556fdb",
-        "uuid": "cc03f5c2-933f-4c40-9c64-7f8727556fdb"
+        "phylopic_title": "Cervus canadensis",
+        "raster_size": "1536x1251",
+        "raster_url": "https://images.phylopic.org/images/b156cc5b-3c1b-4c10-9de8-dfa9b6840f1a/raster/1536x1251.png",
+        "source_url": "https://www.phylopic.org/images/b156cc5b-3c1b-4c10-9de8-dfa9b6840f1a",
+        "uuid": "b156cc5b-3c1b-4c10-9de8-dfa9b6840f1a"
       },
       {
-        "attribution": "Steven Traver",
-        "contributor": "Steven Traver",
-        "file": "elk-wapiti/72f2f997.png",
+        "attribution": "Richard Rich",
+        "contributor": "Richard Rich",
+        "file": "elk-wapiti/b960d496.png",
         "licence": "CC0 1.0",
         "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
-        "phylopic_title": "Cervus elaphus",
-        "raster_size": "1299x1536",
-        "raster_url": "https://images.phylopic.org/images/72f2f997-e474-4caf-bbd5-72fc8dbcc40d/raster/1299x1536.png",
-        "source_url": "https://www.phylopic.org/images/72f2f997-e474-4caf-bbd5-72fc8dbcc40d",
-        "uuid": "72f2f997-e474-4caf-bbd5-72fc8dbcc40d"
+        "phylopic_title": "Cervus canadensis",
+        "raster_size": "1439x1536",
+        "raster_url": "https://images.phylopic.org/images/b960d496-81f5-43a1-9acd-159bfa3d7b79/raster/1439x1536.png",
+        "source_url": "https://www.phylopic.org/images/b960d496-81f5-43a1-9acd-159bfa3d7b79",
+        "uuid": "b960d496-81f5-43a1-9acd-159bfa3d7b79"
+      },
+      {
+        "attribution": null,
+        "contributor": "Patricia Holroyd",
+        "file": "elk-wapiti/b9a9382d.png",
+        "licence": "CC0 1.0",
+        "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "phylopic_title": "Cervus canadensis",
+        "raster_size": "1493x1536",
+        "raster_url": "https://images.phylopic.org/images/b9a9382d-cb9f-4499-b14e-60faad285bb4/raster/1493x1536.png",
+        "source_url": "https://www.phylopic.org/images/b9a9382d-cb9f-4499-b14e-60faad285bb4",
+        "uuid": "b9a9382d-cb9f-4499-b14e-60faad285bb4"
+      },
+      {
+        "attribution": "Tracy A. Heath",
+        "contributor": "Tracy Heath",
+        "file": "elk-wapiti/97f83f5e.png",
+        "licence": "CC0 1.0",
+        "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+        "phylopic_title": "Cervus canadensis",
+        "raster_size": "1536x1507",
+        "raster_url": "https://images.phylopic.org/images/97f83f5e-9afe-4ce8-812e-337f506ca841/raster/1536x1507.png",
+        "source_url": "https://www.phylopic.org/images/97f83f5e-9afe-4ce8-812e-337f506ca841",
+        "uuid": "97f83f5e-9afe-4ce8-812e-337f506ca841"
       }
     ],
     "phylopic_build": 549,
     "refused": [],
-    "scientific_name": "Cervus elaphus"
+    "scientific_name": "Cervus canadensis"
   },
   "eurasian-beaver": {
     "images": [

@@ -1,0 +1,1083 @@
+{
+  "addax": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 1.6,
+      "ratio": 0.625,
+      "shoulder_m": 1.0
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "african-bush-elephant": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 6.0,
+      "ratio": 0.5333,
+      "shoulder_m": 3.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.54
+  },
+  "african-forest-elephant": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 3.0,
+      "ratio": 0.8,
+      "shoulder_m": 2.4
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.66
+  },
+  "african-wild-dog": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 1.1,
+      "ratio": 0.6818,
+      "shoulder_m": 0.75
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.66
+  },
+  "alpaca": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "alpine-ibex": {
+    "biome_doc": {
+      "file": "08-tundra-alpine.md",
+      "head_body_m": 1.5,
+      "ratio": 0.6,
+      "shoulder_m": 0.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "alpine-marmot": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.5,
+      "ratio": 0.4,
+      "shoulder_m": 0.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.62
+  },
+  "american-bison": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 2.8,
+      "ratio": 0.6429,
+      "shoulder_m": 1.8
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "american-black-bear": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 1.6,
+      "ratio": 0.5625,
+      "shoulder_m": 0.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.55
+  },
+  "american-mink": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.3
+  },
+  "antelope-ground-squirrel": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "arabian-oryx": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 1.6,
+      "ratio": 0.625,
+      "shoulder_m": 1.0
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "arctic-fox": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.52
+  },
+  "arctic-ground-squirrel": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.72
+  },
+  "barbary-sheep": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 1.4,
+      "ratio": 0.6786,
+      "shoulder_m": 0.95
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.64
+  },
+  "bengal-tiger": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 2.0,
+      "ratio": 0.475,
+      "shoulder_m": 0.95
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.48
+  },
+  "bighorn-sheep": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "black-howler-monkey": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.56
+  },
+  "black-tailed-jackrabbit": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.55,
+      "ratio": 0.4545,
+      "shoulder_m": 0.25
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "black-tailed-prairie-dog": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.46
+  },
+  "blue-wildebeest": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.2,
+      "ratio": 0.6364,
+      "shoulder_m": 1.4
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.64
+  },
+  "bobcat": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 0.8,
+      "ratio": 0.625,
+      "shoulder_m": 0.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "bongo": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 2.2,
+      "ratio": 0.5455,
+      "shoulder_m": 1.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.55
+  },
+  "brown-bear": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 2.0,
+      "ratio": 0.55,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.52
+  },
+  "brown-throated-sloth": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.26
+  },
+  "cape-buffalo": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.8,
+      "ratio": 0.5357,
+      "shoulder_m": 1.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.55
+  },
+  "cape-hare": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.5,
+      "ratio": 0.5,
+      "shoulder_m": 0.25
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "capybara": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 1.1,
+      "ratio": 0.5,
+      "shoulder_m": 0.55
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.46
+  },
+  "caracal": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.75,
+      "ratio": 0.6,
+      "shoulder_m": 0.45
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "chacma-baboon": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 0.9,
+      "ratio": 0.7778,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.72
+  },
+  "chamois": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "cheetah": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 1.3,
+      "ratio": 0.6538,
+      "shoulder_m": 0.85
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.65
+  },
+  "chimpanzee": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "coati": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "common-frog": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.26
+  },
+  "corsac-fox": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.55,
+      "ratio": 0.5455,
+      "shoulder_m": 0.3
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.54
+  },
+  "coyote": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.9,
+      "ratio": 0.6111,
+      "shoulder_m": 0.55
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "desert-monitor": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.18
+  },
+  "dingo": {
+    "biome_doc": {
+      "file": "01-beach.md",
+      "head_body_m": 0.9,
+      "ratio": 0.6111,
+      "shoulder_m": 0.55
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.61
+  },
+  "dorcas-gazelle": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.95,
+      "ratio": 0.6316,
+      "shoulder_m": 0.6
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.63
+  },
+  "dromedary-camel": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 3.0,
+      "ratio": 0.6333,
+      "shoulder_m": 1.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "eastern-chipmunk": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "eastern-grey-kangaroo": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.8
+  },
+  "eastern-grey-squirrel": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "elk-wapiti": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 2.4,
+      "ratio": 0.625,
+      "shoulder_m": 1.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "eurasian-beaver": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.34
+  },
+  "eurasian-lynx": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 1.0,
+      "ratio": 0.65,
+      "shoulder_m": 0.65
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.66
+  },
+  "european-badger": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.8,
+      "ratio": 0.375,
+      "shoulder_m": 0.3
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.34
+  },
+  "european-bison": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.66
+  },
+  "european-hare": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.65,
+      "ratio": 0.3846,
+      "shoulder_m": 0.25
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.38
+  },
+  "european-hedgehog": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.36
+  },
+  "european-mole": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.22
+  },
+  "european-otter": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.28
+  },
+  "european-polecat": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.3
+  },
+  "european-rabbit": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.4,
+      "ratio": 0.5,
+      "shoulder_m": 0.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "european-souslik": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.62
+  },
+  "european-wildcat": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 0.6,
+      "ratio": 0.5833,
+      "shoulder_m": 0.35
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "fallow-deer": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.5,
+      "ratio": 0.6333,
+      "shoulder_m": 0.95
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.63
+  },
+  "fennec-fox": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.4,
+      "ratio": 0.5,
+      "shoulder_m": 0.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.5
+  },
+  "fire-salamander": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.16
+  },
+  "fisher": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.38
+  },
+  "forest-buffalo": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 2.2,
+      "ratio": 0.5,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.52
+  },
+  "gemsbok": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.0,
+      "ratio": 0.6,
+      "shoulder_m": 1.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "giant-anteater": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.44
+  },
+  "golden-jackal": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.85,
+      "ratio": 0.5294,
+      "shoulder_m": 0.45
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.55
+  },
+  "greater-kudu": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.3,
+      "ratio": 0.6087,
+      "shoulder_m": 1.4
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.61
+  },
+  "grey-wolf": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.3,
+      "ratio": 0.6154,
+      "shoulder_m": 0.8
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "guanaco": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.9,
+      "ratio": 0.5789,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "hippopotamus": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 3.5,
+      "ratio": 0.4286,
+      "shoulder_m": 1.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "impala": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 1.4,
+      "ratio": 0.6429,
+      "shoulder_m": 0.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.64
+  },
+  "klipspringer": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.63
+  },
+  "lesser-egyptian-jerboa": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.76
+  },
+  "lion": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.0,
+      "ratio": 0.55,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.55
+  },
+  "lowland-tapir": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 2.0,
+      "ratio": 0.5,
+      "shoulder_m": 1.0
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.5
+  },
+  "mandrill": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 0.8,
+      "ratio": 0.625,
+      "shoulder_m": 0.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "maned-wolf": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.0,
+      "ratio": 0.9,
+      "shoulder_m": 0.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.95
+  },
+  "marine-iguana": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.18
+  },
+  "meerkat": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 1.05
+  },
+  "moose": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 2.8,
+      "ratio": 0.6786,
+      "shoulder_m": 1.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.7
+  },
+  "mountain-goat": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.62
+  },
+  "mountain-hare": {
+    "biome_doc": {
+      "file": "07-taiga.md",
+      "head_body_m": 0.55,
+      "ratio": 0.5455,
+      "shoulder_m": 0.3
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "muskox": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.48
+  },
+  "nile-crocodile": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.16
+  },
+  "nile-monitor": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.2
+  },
+  "nine-banded-armadillo": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.34
+  },
+  "north-american-porcupine": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "norway-lemming": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.38
+  },
+  "ocellated-lizard": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.18
+  },
+  "okapi": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 2.1,
+      "ratio": 0.7143,
+      "shoulder_m": 1.5
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.72
+  },
+  "pika": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.44
+  },
+  "pine-marten": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.36
+  },
+  "plains-zebra": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 2.3,
+      "ratio": 0.5652,
+      "shoulder_m": 1.3
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.56
+  },
+  "poison-dart-frog": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.28
+  },
+  "pronghorn": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.4,
+      "ratio": 0.6429,
+      "shoulder_m": 0.9
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.64
+  },
+  "przewalskis-horse": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "raccoon": {
+    "biome_doc": {
+      "file": "01-beach.md",
+      "head_body_m": 0.5,
+      "ratio": 0.6,
+      "shoulder_m": 0.3
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "red-deer-hind": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.9,
+      "ratio": 0.5789,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "red-deer-stag": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 2.0,
+      "ratio": 0.6,
+      "shoulder_m": 1.2
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.63
+  },
+  "red-fox": {
+    "biome_doc": {
+      "file": "01-beach.md",
+      "head_body_m": 0.7,
+      "ratio": 0.5714,
+      "shoulder_m": 0.4
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.57
+  },
+  "red-kangaroo": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "bipedal",
+    "withers_over_hb": 0.86
+  },
+  "red-river-hog": {
+    "biome_doc": {
+      "file": "04-rainforest.md",
+      "head_body_m": 1.3,
+      "ratio": 0.5385,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.54
+  },
+  "red-squirrel": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.42
+  },
+  "reindeer": {
+    "biome_doc": {
+      "file": "07-taiga.md",
+      "head_body_m": 1.8,
+      "ratio": 0.6111,
+      "shoulder_m": 1.1
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "rock-hyrax": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.4
+  },
+  "roe-deer": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.2,
+      "ratio": 0.5833,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "saiga-antelope": {
+    "biome_doc": {
+      "file": "02-grassland.md",
+      "head_body_m": 1.3,
+      "ratio": 0.5385,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.56
+  },
+  "sand-cat": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 0.5,
+      "ratio": 0.56,
+      "shoulder_m": 0.28
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.56
+  },
+  "sand-lizard": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.18
+  },
+  "siberian-flying-squirrel": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.34
+  },
+  "siberian-musk-deer": {
+    "biome_doc": {
+      "file": "07-taiga.md",
+      "head_body_m": 0.85,
+      "ratio": 0.6471,
+      "shoulder_m": 0.55
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "sika-deer": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 1.4,
+      "ratio": 0.6071,
+      "shoulder_m": 0.85
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.61
+  },
+  "small-indian-mongoose": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.26
+  },
+  "spectacled-caiman": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.16
+  },
+  "spiny-tailed-lizard": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.2
+  },
+  "spotted-hyena": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 1.4,
+      "ratio": 0.6071,
+      "shoulder_m": 0.85
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.63
+  },
+  "steppe-polecat": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.3
+  },
+  "stoat": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.32
+  },
+  "striped-hyena": {
+    "biome_doc": {
+      "file": "05-desert.md",
+      "head_body_m": 1.1,
+      "ratio": 0.6364,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.64
+  },
+  "striped-skunk": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.34
+  },
+  "vicuna": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "virginia-opossum": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.38
+  },
+  "viviparous-lizard": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.18
+  },
+  "warthog": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 1.3,
+      "ratio": 0.5385,
+      "shoulder_m": 0.7
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.54
+  },
+  "water-monitor": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "sprawling",
+    "withers_over_hb": 0.2
+  },
+  "western-lowland-gorilla": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.66
+  },
+  "white-rhinoceros": {
+    "biome_doc": {
+      "file": "06-savanna.md",
+      "head_body_m": 3.8,
+      "ratio": 0.4737,
+      "shoulder_m": 1.8
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.47
+  },
+  "white-tailed-deer": {
+    "biome_doc": {
+      "file": "03-temperate-forest.md",
+      "head_body_m": 1.8,
+      "ratio": 0.5556,
+      "shoulder_m": 1.0
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  },
+  "wild-boar": {
+    "biome_doc": {
+      "file": "01-beach.md",
+      "head_body_m": 1.4,
+      "ratio": 0.5714,
+      "shoulder_m": 0.8
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "wild-yak": {
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.6
+  },
+  "wolverine": {
+    "biome_doc": {
+      "file": "07-taiga.md",
+      "head_body_m": 0.85,
+      "ratio": 0.4941,
+      "shoulder_m": 0.42
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.48
+  },
+  "wood-bison": {
+    "biome_doc": {
+      "file": "07-taiga.md",
+      "head_body_m": 2.9,
+      "ratio": 0.6207,
+      "shoulder_m": 1.8
+    },
+    "source": "spec quad.shoulder_h as authored at 17cc742",
+    "stance": "standing",
+    "withers_over_hb": 0.58
+  }
+}

@@ -16,6 +16,13 @@ ratio whose denominator moves, which cost this project a day on trunk girth.
     python tools/refsheet.py --before out/reffit/before   # run BEFORE fitting
     python tools/refsheet.py --after  out/reffit/after    # run AFTER fitting
     python tools/refsheet.py --sheet  out/reffit/sheets   # compose the three
+
+AND `--specs DIR` FOR WHEN THE BEFORE WAS NOT SHOT IN TIME. The instructions
+above assume somebody remembered to run `--before` first, and on the stance pass
+of 2026-08-15 nobody did -- 106 specs had already moved. A before recovered from
+`git show <commit>:specs/<name>.json` into a scratch directory is the same
+pictures, and it is a great deal better than the alternative, which is to
+publish an after with nothing beside it and call the difference obvious.
 """
 from __future__ import annotations
 
@@ -158,7 +165,12 @@ def main() -> int:
     ap.add_argument("--after", action="store_true")
     ap.add_argument("--sheet", action="store_true")
     ap.add_argument("--only", nargs="*")
+    ap.add_argument("--specs", help="read specs from here instead of specs/ "
+                                    "-- for shooting a before after the fact")
     a = ap.parse_args()
+    if a.specs:
+        global SPECS
+        SPECS = Path(a.specs)
     names = _names(a.only)
     if a.before:
         return shoot(names, OUT / "before", lock=True)

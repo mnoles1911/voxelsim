@@ -2012,9 +2012,24 @@ PARAMS: tuple[Param, ...] = (
       help="Height of the SHOULDER JOINT above the ground, as a fraction of "
            "head-body length. This sets the foreleg length; there is no "
            "separate leg row to disagree with it.\n\n"
-           "Real values, from the biome files: a badger 0.38, a wild boar 0.60, "
-           "a red fox 0.57, a horse 0.62, a bison 0.64, a moose 0.70, a giraffe "
-           "1.30. Under about 0.35 the animal is a low-slung mustelid."),
+           "IT IS THE JOINT, NOT THE WITHERS, and that distinction cost the "
+           "whole library. A published 'shoulder height' is measured to the TOP "
+           "OF THE BACK; the joint sits half a trunk-depth below it. All 131 "
+           "specs were authored by typing published shoulder figures straight "
+           "into this row, so the generator put the joint where the withers "
+           "belong and drew the trunk on top -- the library stood a half-trunk "
+           "too tall, measured at 1.35x life over 108 standing species with NOT "
+           "ONE inside 10%.\n\n"
+           "The examples this help used to give were the same mistake: 'a "
+           "giraffe 1.30' is a withers ratio. A number read out of "
+           "docs/biomes/*.md or off a species page is almost certainly a "
+           "withers height, and half the trunk depth has to come off before it "
+           "belongs here. `tools/refstance.py report` is the regression check; "
+           "docs/quadruped-stance-height.md has the account.\n\n"
+           "Joint values, solved against reference silhouettes rather than "
+           "typed: a badger 0.26, a wild boar 0.44, a red fox 0.42, a bison "
+           "0.48, a moose 0.52. Under about 0.25 the animal is a low-slung "
+           "mustelid."),
     # THE FLOOR IS 0.25 AND NOT 0.45, and the difference is the bipeds. A
     # quadruped never goes below about 0.7 -- a bison is 0.86 and a spotted
     # hyena, which is the most extreme sloped back of any land mammal, is 0.75.

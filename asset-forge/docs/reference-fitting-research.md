@@ -530,6 +530,24 @@ Six species hit the 1.5× cap and are flagged for a render rather than trusted:
 `american-black-bear`, `bobcat`, `caracal`, `cheetah`, `eurasian-lynx`,
 `wolverine`.
 
+**Resolved 2026-08-15, one at a time and by looking.** Re-run after the stance
+fix, five of the six no longer need the cap at all: `american-black-bear` (0.470
+against a reference 0.385) and `eurasian-lynx` (0.320 against 0.309) are now
+above life without being touched, and `bobcat` (0.262 vs 0.264), `caracal` (0.310
+vs 0.291) and `cheetah` (0.235 vs 0.240) reached their references inside one
+pass. **So the cap was not the constraint on those five; the too-long limb it was
+being divided by was.**
+
+`wolverine` is the sixth and it is **the reference that is wrong, not the spec**.
+Both of its silhouettes are of a walking plantigrade mustelid, and the overlays
+show why the number is inflated: the 0.30–0.75 band cuts the legs where the near
+and far limbs and the large flat feet are merged into one run, so what is
+measured as a limb diameter is a limb plus a paw plus its opposite number. The
+cap was protecting the spec here, not holding it back. The files are left in
+place — `fit` never reduces, so no harm follows from a reference that reads high,
+and the same silhouettes give a perfectly good belly line — but nothing should
+chase 0.340 on a wolverine.
+
 **One regression was caused and fixed, and it is the coupling the previous
 work documented.** A thicker limb stands the animal higher, and withers height
 is the denominator of the girth ratio — so `eurasian-lynx` fell to 0.90 of the
@@ -625,13 +643,19 @@ reason this change is 14 spec numbers rather than a new asset type.
 
 ### OPEN — and the biggest of these is not limb thickness
 
-- **Belly clearance is 26% too high across the library and was not fitted.**
-  This is the larger finding of the two and it is left alone on purpose: it is
-  driven by `quad.shoulder_h` and `quad.depth` together, both of which move
-  girth/withers — a gate the previous work deliberately stopped short of life on
-  (0.95 against a real 1.14–1.38). Fitting it means reopening that decision,
-  which is the owner's to make and wants renders in front of it. The measurement
-  now exists and `reffit report` prints it.
+- **~~Belly clearance is 26% too high across the library and was not fitted.~~**
+  **CLOSED 2026-08-15 — see `docs/quadruped-stance-height.md`.** It was not a
+  tuning gap: `quad.shoulder_h` is the shoulder JOINT and every value authored
+  into 131 specs was a published shoulder (WITHERS) height, so the generator
+  drew each animal a half-trunk-depth above the number it was authored from.
+  Measured withers ran 1.35× the authored figure with **0 of 108** standing
+  species inside 10%. Fitted, it is 1.003× with 106 of 108 inside 10%. The
+  girth gate this was feared to fight turned out to move the other way —
+  withers is its denominator, so lowering the library carried girth/withers from
+  1.00 to 1.25, into the live range, and took the count below the 0.95 retune
+  target from 38 of 131 to zero. `belly ÷ length` is **not** what was fitted;
+  §4's own denominator turned out to carry most of that 1.26×, and the
+  length-free `leg_share` went 1.067× → 0.957×.
 - **Trunk width / length**, still 0.25 against Veloren's 0.505. A silhouette is
   the wrong instrument; this needs the **top** view, and PhyloPic has none.
   Commons `Category:Top views of…` was not investigated.
@@ -660,6 +684,23 @@ reason this change is 14 spec numbers rather than a new asset type.
 - **MorphoSource's current terms of use** — bot protection, no post-2022 archive.
 - **Animal3D's 26 keypoint names** — never enumerated in the paper text.
 
+**A fifth GBIF mis-resolution, found on 2026-08-15 by a check that did not exist
+before.** `common-frog` had resolved to ***Mustela lutreola*** — a European mink
+— because the Mammalia constraint that fixes "brown bear → *Protea speciosa*"
+cannot return an amphibian, and two mink silhouettes were sitting on disk under
+`refs/silhouettes/common-frog/`. **A verified name is not the same thing as
+verified pictures**: `refs/species-latin.json` records what the name was checked
+to be and `SOURCES.json` records what the files were downloaded AS, and fixing a
+name by hand without re-fetching leaves them disagreeing. `reffit fit` now
+refuses any species where the two differ and prints the fetch command. The frog
+and `elk-wapiti` (*Cervus elaphus* → *Cervus canadensis*) were re-fetched; the
+stale files were dropped by the same name-change path §2.1 already had.
+
+**Coverage, 2026-08-15.** The name gate — not the corpus — was what stopped most
+species being fitted. 41 more binomials were hand-entered and put through the
+same GBIF check, all 101 verified, taking the species eligible for a limb fit
+from **27 to 42** and for a stance fit to **53**.
+
 **Could not be fitted.**
 
 - **104 of 131 species.** 37 reach fit quality but 10 of those have an
@@ -674,12 +715,25 @@ reason this change is 14 spec numbers rather than a new asset type.
 
 **Where this is estimating.**
 
-- **`MAX_SPREAD = 0.55` and `MIN_SILHOUETTES = 2` are judgement**, tuned against
+- **`MAX_SPREAD` and `MIN_SILHOUETTES = 2` are judgement**, tuned against
   what the corpus does, not derived. At n≥4 and spread ≤0.45 only **two** species
   in the whole library qualify, which would have made the exercise empty;
   loosening them was a decision to accept weaker references and defend them with
   a cap instead. It is the same *kind* of call as the 0.16 this file set out to
   replace, and it is recorded as such.
+
+  **REVISED 2026-08-15: the statistic was wrong, not the number.**
+  `(max−min)/median` punishes a species for being well sampled — a range can
+  only grow with n. Measured over this corpus: median range/median is 0.38 at
+  n=2–3, 0.60 at n=4–6 and **0.81 at n=7–11**, correlating +0.67 with sample
+  size. That threw out `plains-zebra` (7 silhouettes, and §4 calls it the
+  best-sampled species here), `grey-wolf` (11), `reindeer` (9) and `wild-boar`
+  (5) — one striding outlier among eleven good drawings is what a median is for,
+  and the range gate handed the outlier the verdict. The gate is now the
+  **interquartile** spread at **0.275**, which is not a fresh judgement: at n=2
+  and n=3 the IQR is exactly half the range, so 0.275 reproduces the old 0.55
+  verdict on the sample sizes it was tuned against and only differs from n≥4.
+  It admitted 5 species and dropped none.
 - **`MAX_LIFT = 1.5`** is a bound, not a measurement.
 - **`refsil`'s band 0.30–0.75 of belly height** and the 1.2%-of-length minimum
   run were set by looking at the corpus.

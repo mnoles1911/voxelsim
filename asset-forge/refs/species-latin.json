@@ -28,17 +28,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "african-forest-elephant": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2435349,
     "gbif_vernacular": [
+      "Aafrika metsaelevant",
       "African Forest Elephant",
-      "Elefante de Bosque",
-      "\u00c9l\u00e9phant de for\u00eat",
-      "Forest Elephant",
-      "Elefante"
+      "African Forest Elephant",
+      "African Forest Elephant",
+      "African Forest Elephant"
     ],
     "latin": "Loxodonta cyclotis",
-    "resolved_from": "african-forest-elephant"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "african-wild-dog": {
     "checked_by_hand": true,
@@ -55,30 +56,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "alpaca": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 7515593,
     "gbif_vernacular": [
-      "alpakka",
+      "Alpaca",
+      "Alpaca",
       "Alpaca",
       "Alpaka",
-      "Alpaca",
-      "alpakka"
+      "Alpaka"
     ],
     "latin": "Vicugna pacos",
-    "resolved_from": "alpaca"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "alpine-ibex": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441055,
     "gbif_vernacular": [
-      "\u041a\u043e\u0437\u0435\u043b \u0430\u043b\u044c\u043f\u0456\u0439\u0441\u044c\u043a\u0438\u0439",
-      "Alpine ibex",
-      "Bouquetin des Alpes, Bouquetin",
-      "Ibex",
-      "Alpensteinbock"
+      "Alp Ke\u00e7isi",
+      "Alp da\u011f ke\u00e7isi",
+      "Alpen-Steinbock",
+      "Alpen-Steinbock",
+      "Alpen-Steinbock"
     ],
     "latin": "Capra ibex",
-    "resolved_from": "alpine-ibex"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "alpine-marmot": {
     "checked_by_hand": false,
@@ -161,17 +164,18 @@
     "resolved_from": "arabian-oryx"
   },
   "arctic-fox": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219303,
     "gbif_vernacular": [
-      "Renard polaire",
-      "Blue Fox",
       "Arctic Fox",
-      "Zorro \u00c1rtico",
-      "\u041f\u0435\u0441\u0435\u0446"
+      "Arctic Fox",
+      "Arctic Fox",
+      "Arctic Fox",
+      "Arctic fox"
     ],
     "latin": "Vulpes lagopus",
-    "resolved_from": "arctic-fox"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "arctic-ground-squirrel": {
     "checked_by_hand": false,
@@ -214,17 +218,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "bighorn-sheep": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441119,
     "gbif_vernacular": [
-      "bighorn sheep",
-      "Mountain Sheep",
-      "Mouflon D'Am\u00e9rique",
-      "Mouflon Du Canada",
-      "Mouflon Pachyc\u00e8re"
+      "American Bighorn",
+      "American Sheep",
+      "Ameri\u010dki muflon",
+      "Argalia",
+      "Big-horn"
     ],
     "latin": "Ovis canadensis",
-    "resolved_from": "bighorn-sheep"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "black-howler-monkey": {
     "checked_by_hand": false,
@@ -426,56 +431,60 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "chimpanzee": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219534,
     "gbif_vernacular": [
-      "Chimpanzee",
+      "Akatia",
+      "Baya\u011f\u0131 \u015eempanze",
+      "Chimp",
       "Chimpanc\u00e9",
-      "Chimpanz\u00e9",
-      "Robust Chimpanzee",
-      "Common Chimpanzee"
+      "Chimpanc\u00e9"
     ],
     "latin": "Pan troglodytes",
-    "resolved_from": "chimpanzee"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "coati": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2433531,
     "gbif_vernacular": [
-      "white-nosed coati",
-      "Coat\u00ed norte\u00f1o",
-      "White-nosed Coati",
-      "Cusumbo | Guache",
-      "Cusumbo norte\u00f1o | cusumbo solo | cusumbo solino"
+      "Coati",
+      "Coati a nez blanc",
+      "Coati a nez blanc",
+      "Coati pizote",
+      "Coatimundi"
     ],
     "latin": "Nasua narica",
-    "resolved_from": "coati"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "common-frog": {
-    "checked_by_hand": false,
-    "gbif_key": 5219007,
+    "checked_by_hand": true,
+    "gbif_class": "Amphibia",
+    "gbif_key": 2426805,
     "gbif_vernacular": [
-      "Vison d'Europe, Vison, Petite loutre, Putois d'eau",
-      "European Mink",
-      "European Mink",
-      "Vis\u00f3n Europeo",
-      "\u0415\u0432\u0440\u043e\u043f\u0435\u0439\u0441\u043a\u0430\u044f \u043d\u043e\u0440\u043a\u0430"
+      "Baso-igel gorri",
+      "Broasca ro\u0219ie de munte",
+      "Broga",
+      "Brogaod",
+      "Bruine kikker"
     ],
-    "latin": "Mustela lutreola",
-    "resolved_from": "common-frog"
+    "latin": "Rana temporaria",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "corsac-fox": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219293,
     "gbif_vernacular": [
+      "Corsac",
+      "Corsac",
       "Corsac Fox",
-      "Korsak",
-      "Khyrs",
-      "Karsac",
-      "Renard Corsac"
+      "Corsac Fox",
+      "Corsac Fox"
     ],
     "latin": "Vulpes corsac",
-    "resolved_from": "corsac-fox"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "coyote": {
     "checked_by_hand": true,
@@ -506,13 +515,14 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "dingo": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219214,
     "gbif_vernacular": [
       "dingo"
     ],
     "latin": "Canis dingo",
-    "resolved_from": "dingo"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "dorcas-gazelle": {
     "checked_by_hand": false,
@@ -542,30 +552,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "eastern-chipmunk": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2437438,
     "gbif_vernacular": [
-      "Tamia Ray\u00e9",
-      "Streifen-backenhornchen",
-      "Eastern Chipmunk",
       "Ardilla Listada Oriental",
-      "Eastern Chipmunk"
+      "Ardilla Listada Oriental",
+      "Ardilla Listada del Este Americano",
+      "Ardilla listada oriental",
+      "Ardilla listada oriental"
     ],
     "latin": "Tamias striatus",
-    "resolved_from": "eastern-chipmunk"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "eastern-grey-kangaroo": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219981,
     "gbif_vernacular": [
-      "Eastern Grey Kangaroo",
-      "Scrubber",
-      "Scrub Kangaroo",
-      "Great Grey Kangaroo",
-      "Forester"
+      "Austrumu pel\u0113kais \u0137engurs",
+      "Canguro Gris Oriental",
+      "Canguro gigante",
+      "Canguro grigio orientale",
+      "Canguro gris oriental"
     ],
     "latin": "Macropus giganteus",
-    "resolved_from": "eastern-grey-kangaroo"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "eastern-grey-squirrel": {
     "checked_by_hand": false,
@@ -581,17 +593,18 @@
     "resolved_from": "eastern-grey-squirrel"
   },
   "elk-wapiti": {
-    "checked_by_hand": false,
-    "gbif_key": 2440958,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 8600904,
     "gbif_vernacular": [
-      "hjort",
-      "hjort",
-      "jurot",
-      "ruksesgoddi",
-      "\u041e\u043b\u0435\u043d\u044c \u0431\u043b\u0430\u0433\u043e\u0440\u043e\u0434\u043d\u0438\u0439"
+      "Alashan Wapiti",
+      "American Elk",
+      "Aten\u00e1:ti",
+      "Cerf Wapiti",
+      "Cerf wapiti"
     ],
-    "latin": "Cervus elaphus",
-    "resolved_from": "elk-wapiti"
+    "latin": "Cervus canadensis",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "eurasian-beaver": {
     "checked_by_hand": false,
@@ -635,17 +648,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-bison": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441184,
     "gbif_vernacular": [
-      "europeisk bison",
-      "europeisk bison",
-      "visent",
-      "visent",
-      "\u0417\u0443\u0431\u0440"
+      "Bison",
+      "Bison d'Europe",
+      "Bisonte europeo",
+      "Bisonte europeo",
+      "Bis\u00e3o"
     ],
     "latin": "Bison bonasus",
-    "resolved_from": "european-bison"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-hare": {
     "checked_by_hand": false,
@@ -674,17 +688,18 @@
     "resolved_from": "european-hedgehog"
   },
   "european-mole": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 7872906,
     "gbif_vernacular": [
-      "Taupe d'Europe",
-      "European Mole",
-      "European Mole",
-      "Topo Europeo",
-      "Toupeira-europeia"
+      "(Europ\u00e6isk) muldvarp",
+      "Avrupa k\u00f6stebe\u011fi",
+      "Common Mole",
+      "Common Mole",
+      "Common mole"
     ],
     "latin": "Talpa europaea",
-    "resolved_from": "european-mole"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-otter": {
     "checked_by_hand": false,
@@ -700,30 +715,32 @@
     "resolved_from": "european-otter"
   },
   "european-polecat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5218911,
     "gbif_vernacular": [
-      "\u0422\u0445\u0456\u0440 \u043b\u0456\u0441\u043e\u0432\u0438\u0439",
-      "Putois d'Europe, Putois, Furet",
-      "Polecat",
-      "Western Polecat",
-      "Tur\u00f3n"
+      "Baya\u011f\u0131 kokarca",
+      "Black Polecat",
+      "Bunzing",
+      "Bunzing",
+      "Common Ferret"
     ],
     "latin": "Mustela putorius",
-    "resolved_from": "european-polecat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-rabbit": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436940,
     "gbif_vernacular": [
-      "Conejo dom\u00e9stico",
-      "Wild Rabbit",
-      "Domestic Rabbit",
-      "Conejo europeo",
-      "Wildkaninchen"
+      "Adanko",
+      "Arnab Eropah",
+      "Avropa adadov\u015fan\u0131",
+      "Avrupa Ada Tav\u015fan\u0131",
+      "Awtil"
     ],
     "latin": "Oryctolagus cuniculus",
-    "resolved_from": "european-rabbit"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-souslik": {
     "checked_by_hand": true,
@@ -740,17 +757,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-wildcat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 7964291,
     "gbif_vernacular": [
-      "\u041a\u0456\u0442 \u043b\u0456\u0441\u043e\u0432\u0438\u0439",
-      "\u6591\u8c93",
-      "M\u00e8o hoang d\u00e3",
-      "\u041a\u0456\u0442 \u043b\u0456\u0441\u043e\u0432\u0438\u0439",
-      "Yaban kedisi"
+      "Al qit",
+      "Asian races",
+      "Asian races",
+      "Asiatic Steppe Wildcat",
+      "Asiatic Steppe Wildcat"
     ],
     "latin": "Felis silvestris",
-    "resolved_from": "european-wildcat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "fallow-deer": {
     "checked_by_hand": true,
@@ -767,17 +785,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "fennec-fox": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219310,
     "gbif_vernacular": [
-      "Fennec Fox",
-      "fennec",
-      "Fennec fox",
-      "\ud859\uddd2\u72d0",
-      "\u0424\u0435\u043d\u0435\u043a"
+      "Aqorchi",
+      "Arhorchi",
+      "Fenec",
+      "Feneco",
+      "Fenek"
     ],
     "latin": "Vulpes zerda",
-    "resolved_from": "fennec-fox"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "fire-salamander": {
     "checked_by_hand": true,
@@ -836,30 +855,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "giant-anteater": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436346,
     "gbif_vernacular": [
-      "Walisim\u00eb",
-      "Tam\u00e3dua",
-      "Tamanwa",
-      "Tamanwa",
-      "Tamanwa"
+      "Ant Bear",
+      "Ant Bear",
+      "Ant Bear",
+      "Aroka",
+      "Bandeira"
     ],
     "latin": "Myrmecophaga tridactyla",
-    "resolved_from": "giant-anteater"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "golden-jackal": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219219,
     "gbif_vernacular": [
-      "guldschakal",
-      "golden jackal",
-      "Shial",
-      "golden jackal",
-      "guldschakal"
+      "Alt\u0131n \u00c7akal",
+      "Aranysak\u00e1l",
+      "Aranysak\u00e1l",
+      "Asian Jackal",
+      "Asiatic Jackal"
     ],
     "latin": "Canis aureus",
-    "resolved_from": "golden-jackal"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "greater-kudu": {
     "checked_by_hand": true,
@@ -918,17 +939,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "impala": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441144,
     "gbif_vernacular": [
-      "impala",
-      "Rooibok",
-      "Impala",
-      "Schwarzfersenantilope",
-      "Black-faced Impala"
+      "Aepyceros melampus",
+      "Black-faced Impala",
+      "Common Impala",
+      "Common Impala",
+      "Impala"
     ],
     "latin": "Aepyceros melampus",
-    "resolved_from": "impala"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "klipspringer": {
     "checked_by_hand": true,
@@ -986,17 +1008,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "mandrill": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219556,
     "gbif_vernacular": [
-      "Mandrill",
+      "Mandril",
+      "Mandril",
       "Mandril",
       "Mandrill",
-      "Mandril",
       "Mandrill"
     ],
     "latin": "Mandrillus sphinx",
-    "resolved_from": "mandrill"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "maned-wolf": {
     "checked_by_hand": true,
@@ -1027,17 +1050,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "meerkat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2434126,
     "gbif_vernacular": [
-      "Meerkat",
-      "Suricate",
-      "Suricate",
-      "Slender-tailed Meerkat",
-      "Scharrtier"
+      "Erdm\u00e4nnchen",
+      "Graatjie-meerkat",
+      "Graatjiemeerkat",
+      "Gray Meerkat",
+      "Grey Meerkat"
     ],
     "latin": "Suricata suricatta",
-    "resolved_from": "meerkat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "moose": {
     "checked_by_hand": true,
@@ -1054,17 +1078,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "mountain-goat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441151,
     "gbif_vernacular": [
-      "Rocky Mountain Goat",
-      "Mountain Goat",
-      "Mountain Goat",
-      "Rocky Mountain goat",
-      "Mountain Goat"
+      "Aplocero",
+      "Cabra",
+      "Cabra blanca de las Rocosas",
+      "Cabra-americana",
+      "Cabra-das-montanhas"
     ],
     "latin": "Oreamnos americanus",
-    "resolved_from": "mountain-goat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "mountain-hare": {
     "checked_by_hand": false,
@@ -1122,17 +1147,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "nine-banded-armadillo": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2440779,
     "gbif_vernacular": [
+      "Acqu\u00e1 | Aku\u00e1",
+      "Armadelo",
       "Armadillo / gurre",
-      "nine-banded armadillo",
-      "nine-banded armadillo",
-      "Nine-banded armadillo",
-      "Tatu-de-folha"
+      "Armadillo Com\u00fan | Armadillo (generalizado)",
+      "Armadillo a nove fasce"
     ],
     "latin": "Dasypus novemcinctus",
-    "resolved_from": "nine-banded-armadillo"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "north-american-porcupine": {
     "checked_by_hand": true,
@@ -1246,17 +1272,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "pronghorn": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2440902,
     "gbif_vernacular": [
-      "pronghorn",
+      "American Antelope",
+      "American Pronghorn",
       "Amerikanischer Gabelbock",
-      "Gabelbock",
-      "Gabelhornantilope",
-      "American Pronghorn"
+      "Antelope",
+      "Antelope"
     ],
     "latin": "Antilocapra americana",
-    "resolved_from": "pronghorn"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "przewalskis-horse": {
     "checked_by_hand": true,
@@ -1342,17 +1369,18 @@
     "resolved_from": "red-kangaroo"
   },
   "red-river-hog": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441225,
     "gbif_vernacular": [
-      "red river hog",
+      "African Bush Pig",
+      "Afrikanisches Buschschwein",
       "Bosvark",
-      "Pinselohrschwein",
-      "Potamoch\u00e8re roux",
-      "Potamocer rosso"
+      "Cerdo del r\u00edo Rojo",
+      "Congo Bushpig"
     ],
     "latin": "Potamochoerus porcus",
-    "resolved_from": "red-river-hog"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "red-squirrel": {
     "checked_by_hand": true,
@@ -1423,17 +1451,18 @@
     "resolved_from": "saiga-antelope"
   },
   "sand-cat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2435028,
     "gbif_vernacular": [
-      "Sand Cat",
-      "Gato del Sahara",
-      "Gato de las Arenas",
-      "pshaya koshka",
-      "Chat des sables"
+      "Chat des sables",
+      "Chat des sables",
+      "Chat des sables",
+      "Gato",
+      "Gato de las arenas"
     ],
     "latin": "Felis margarita",
-    "resolved_from": "sand-cat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "sand-lizard": {
     "checked_by_hand": true,
@@ -1450,17 +1479,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "siberian-flying-squirrel": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2437258,
     "gbif_vernacular": [
-      "Siberian Flying Squirrel",
       "Ardilla Voladora Europea",
-      "Polatouche",
-      "Russian Flying Squirrel",
-      "Flygekorre"
+      "Ardilla voladora",
+      "Ardilla voladora de Siberia",
+      "Ardilla voladora de Siberia",
+      "Ardilla voladora europea"
     ],
     "latin": "Pteromys volans",
-    "resolved_from": "siberian-flying-squirrel"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "siberian-musk-deer": {
     "checked_by_hand": false,
@@ -1545,30 +1575,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "steppe-polecat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219057,
     "gbif_vernacular": [
-      "Steppe Polecat",
-      "Tur\u00f3n de la Estepa",
+      "Ai-you, Ai-hu",
+      "Arohilleri",
+      "Moln\u00e1rg\u00f6r\u00e9ny",
       "Putois des Steppes",
-      "Steppe Weasel",
-      "St\u00e4ppiller"
+      "Putois des steppes"
     ],
     "latin": "Mustela eversmanii",
-    "resolved_from": "steppe-polecat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "stoat": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219019,
     "gbif_vernacular": [
-      "Stoat, Ermine",
-      "Stoat",
-      "Short-tailed Weasel",
-      "Hermelin",
-      "Ermine, Short-tailed Weasel, Stoat"
+      "Arminho",
+      "Arminho",
+      "Arminio",
+      "Armino",
+      "Armino"
     ],
     "latin": "Mustela erminea",
-    "resolved_from": "stoat"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "striped-hyena": {
     "checked_by_hand": true,
@@ -1585,17 +1617,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "striped-skunk": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219380,
     "gbif_vernacular": [
-      "Striped Skunk",
-      "Striped Skunk",
-      "Striped Skunk",
-      "Striped Skunk",
-      "Gestreept stinkdier"
+      "Alaska Sable",
+      "Ameri\u010dki smrdljivac",
+      "Baya\u011f\u0131 \u015feritli kokarca",
+      "Cangamb\u00e1",
+      "Cangamb\u00e1-listrado"
     ],
     "latin": "Mephitis mephitis",
-    "resolved_from": "striped-skunk"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "vicuna": {
     "checked_by_hand": false,
@@ -1611,17 +1644,18 @@
     "resolved_from": "vicuna"
   },
   "virginia-opossum": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2439923,
     "gbif_vernacular": [
-      "Virginia opossum",
-      "Sarigue de Virginie",
-      "Virginia Opossum",
-      "Virginia Opossum",
-      "opossum d'Am\u00e9rique"
+      "Anihei\u00e0:tha",
+      "Ayaanii",
+      "Dydelf p\u00f3\u0142nocny",
+      "Dydelf wirginijski",
+      "Gamb\u00e1-da-Virg\u00ednia"
     ],
     "latin": "Didelphis virginiana",
-    "resolved_from": "virginia-opossum"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "viviparous-lizard": {
     "checked_by_hand": true,
@@ -1666,17 +1700,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "western-lowland-gorilla": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436441,
     "gbif_vernacular": [
-      "Western Gorilla",
+      "Bat\u0131 Gorili",
       "Gorila Occidental",
-      "Gorille de l'Ouest",
-      "Lowland Gorilla",
-      "Westlicher Gorilla"
+      "Gorila n\u00ed\u017einn\u00e1",
+      "Gorila occidental",
+      "Gorila-ocidental"
     ],
     "latin": "Gorilla gorilla",
-    "resolved_from": "western-lowland-gorilla"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "white-rhinoceros": {
     "checked_by_hand": true,

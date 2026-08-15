@@ -23,6 +23,13 @@ ADOPT/REJECT with numbers, and what could not be sourced.
 | `species-latin.json` | spec name → scientific name, with `checked_by_hand` | `reffit.py fetch`, `refnames.py --write` |
 | `excluded.json` | silhouettes refused BY HAND after looking, each with its reason | hand-edited |
 | `quadruped-reference.json` | the extracted numbers — this is what `fit` and `report` read | `reffit.py extract` |
+| `withers-target.json` | every species' authored shoulder height, frozen **once**, with the biome file's figure in metres beside it | `refstance.py freeze` |
+
+`withers-target.json` is frozen rather than recomputed for one reason:
+`quad.shoulder_h` is both the row being solved and the row that carried the
+target, so a second run reading its own output would lower every animal again
+and print a tidy table doing it. See `docs/quadruped-stance-height.md`, and
+`tools/retune_quad_bulk.py`, which hit the same trap and fixed it the same way.
 
 ## The three rules that matter
 
@@ -43,6 +50,17 @@ measurement of the right one. So `tools/refnames.py` verifies each binomial
 against GBIF's own vernacular list, and `reffit.py fit` skips any species whose
 `checked_by_hand` is not `true` — printing which ones, rather than dropping them
 quietly.
+
+**2b. A verified NAME is not the same thing as verified PICTURES**, and the gap
+between them was live in this directory until 2026-08-15. `species-latin.json`
+records what a name was checked to be; `SOURCES.json` records what the files were
+downloaded **as**. Fix a name by hand without re-fetching and they disagree, and
+everything downstream reports a verified species measured off the wrong animal —
+which is the mongoose again, one step further along. `common-frog` carried a
+verified *Rana temporaria* over two silhouettes downloaded as *Mustela lutreola*,
+a European mink, because the Mammalia constraint that fixes the shrubs cannot
+return an amphibian. `reffit.py fit` now refuses any species where the two names
+differ and prints the `fetch` command that repairs it.
 
 **3. What the automatic gate cannot catch is written down, not papered over.**
 `excluded.json` holds silhouettes that pass every geometric test and are still

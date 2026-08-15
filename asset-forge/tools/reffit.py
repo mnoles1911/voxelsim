@@ -75,8 +75,30 @@ OK_LICENCES = {
 MIN_SILHOUETTES = 2
 
 # How far the usable silhouettes for one species may disagree before the species
-# is treated as unmeasured. Expressed as (max-min)/median on limb slenderness.
-MAX_SPREAD = 0.55
+# is treated as unmeasured.
+#
+# IT WAS (max-min)/median AND THAT PUNISHED A SPECIES FOR BEING WELL SAMPLED.
+# The range of a sample can only grow as the sample grows, so a gate on the
+# range is a gate on n as much as on disagreement. Measured over this corpus:
+#
+#     n = 2-3   (39 species)   median range/median 0.38
+#     n = 4-6   (12 species)   median range/median 0.60
+#     n = 7-11  ( 7 species)   median range/median 0.81
+#     correlation of range/median with n: +0.67
+#
+# `plains-zebra` -- 7 silhouettes, and `docs/reference-fitting-research.md` §4
+# calls it the best-sampled species in the corpus -- was thrown out by that, and
+# so were `grey-wolf` (11), `reindeer` (9) and `wild-boar` (5). One striding or
+# sitting outlier among eleven good drawings is exactly what a median is for,
+# and the range gate handed the outlier the verdict instead.
+#
+# The interquartile spread does not do that (correlation +0.49, and flat from
+# n=4 up: 0.25, 0.25). The number below is 0.275 rather than a fresh judgement
+# because AT n = 2 AND n = 3 THE IQR IS EXACTLY HALF THE RANGE -- both quartiles
+# fall between the same pair of order statistics -- so 0.275 reproduces the old
+# 0.55 gate exactly on the sample sizes it was tuned against, and only changes
+# the verdict for n >= 4. It admitted 5 species and dropped none.
+MAX_SPREAD = 0.275
 
 # THE MOST ANY ONE PASS MAY THICKEN A SPECIES, as a multiple of what it already
 # measures. This is the general defence against a bad reference that no gate
@@ -285,6 +307,17 @@ def _write_attribution(src: dict) -> None:
 
 # ------------------------------------------------------------ extract (local)
 
+def _spread(v: np.ndarray) -> float:
+    """Interquartile spread over the median. See `MAX_SPREAD` for why not the
+    range. At n = 2 and n = 3 this is exactly half the range, by construction of
+    the quartiles, which is what makes the new gate continuous with the old."""
+    med = float(np.median(v))
+    if not np.isfinite(med) or med <= 0:
+        return float("inf")
+    q1, q3 = np.percentile(v, [25, 75])
+    return float((q3 - q1) / med)
+
+
 def _species_sils(sp: str) -> list[Path]:
     d = SILS / sp
     return sorted(d.glob("*.png")) if d.is_dir() else []
@@ -335,13 +368,27 @@ def extract(verbose: bool) -> int:
         b = np.array([r["belly_over_length"] for r in rows])
         h = np.array([r["height_over_length"] for r in rows])
         t = np.array([r["trunk_over_length"] for r in rows])
+        g = np.array([r["leg_share"] for r in rows])
         med = float(np.median(s))
-        spread = float((s.max() - s.min()) / med) if med > 0 else float("inf")
+        spread = _spread(s)
         fit_ok = len(rows) >= MIN_SILHOUETTES and spread <= MAX_SPREAD
         status = "ok" if fit_ok else (
             f"n={len(rows)} < {MIN_SILHOUETTES}" if len(rows) < MIN_SILHOUETTES
             else f"spread {spread:.2f} > {MAX_SPREAD}")
+        # LEG SHARE IS GATED SEPARATELY, AND IT EARNS IT. Where the legs join
+        # the body is a topology fact that two artists agree about; how thick a
+        # limb is drawn is an opinion. Measured over the same corpus, the
+        # interquartile spread of `leg_share` has a median of 0.089 against
+        # 0.25 for `slender`, so 53 species reach fit quality on stance where 42
+        # do on thickness. Sharing one gate would have thrown away eleven
+        # perfectly good stance references to defend a thickness nobody was
+        # going to use.
+        gspread = _spread(g)
+        gfit = len(rows) >= MIN_SILHOUETTES and gspread <= MAX_SPREAD
         out[sp] = {
+            "leg_share": round(float(np.median(g)), 4),
+            "leg_share_spread": round(gspread, 4),
+            "leg_share_quality": "fit" if gfit else "report-only",
             "scientific_name": src[sp]["scientific_name"],
             "n_usable": len(rows),
             "n_refused": len(bad),
@@ -503,7 +550,7 @@ def fit(only: list[str] | None, dry: bool) -> int:
     # right one. Only `tools/refnames.py` can, and only a name it has verified
     # against GBIF's own vernacular list is allowed to move a spec.
     latin = json.loads(LATIN.read_text(encoding="utf-8")) if LATIN.exists() else {}
-    names, unchecked = [], []
+    names, unchecked, stale = [], [], []
     for n in sorted(refs):
         if only and n not in only:
             continue
@@ -512,6 +559,20 @@ def fit(only: list[str] | None, dry: bool) -> int:
         if not (latin.get(n) or {}).get("checked_by_hand"):
             unchecked.append(n)
             continue
+        # A VERIFIED NAME IS NOT THE SAME THING AS VERIFIED PICTURES, and that
+        # gap is how the mongoose would have got in the second time.
+        # `refs/species-latin.json` records what the name was checked to be;
+        # `SOURCES.json` records what the files on disk were downloaded AS. Fix
+        # a name by hand without re-fetching and they disagree, and everything
+        # downstream reports a verified species measured off the wrong animal.
+        # Found live, in this repository, on the run that added this check:
+        # `common-frog` carried a verified *Rana temporaria* over silhouettes
+        # downloaded as *Mustela lutreola*, a European mink.
+        want = (latin.get(n) or {}).get("latin")
+        got = (refs[n] or {}).get("scientific_name")
+        if want and got and want != got:
+            stale.append((n, want, got))
+            continue
         names.append(n)
     print("\nFIT quad.leg_thick TO THE MEASURED REFERENCE (never reduced)\n")
     if unchecked:
@@ -519,6 +580,13 @@ def fit(only: list[str] | None, dry: bool) -> int:
               f"UNVERIFIED scientific name and are skipped:")
         print(f"    {', '.join(unchecked)}")
         print("    run: python tools/refnames.py --write\n")
+    if stale:
+        print(f"  {len(stale)} species have a verified name that does NOT match "
+              f"the silhouettes on disk and are REFUSED:")
+        for n, want, got in stale:
+            print(f"    {n:<24} verified {want}, files downloaded as {got}")
+        print("    run: python tools/reffit.py fetch --only "
+              f"{' '.join(n for n, _, _ in stale)}\n")
     if not names:
         print("  no species qualifies: needs a spec, a 'fit'-quality reference, "
               "and a hand-checked name")

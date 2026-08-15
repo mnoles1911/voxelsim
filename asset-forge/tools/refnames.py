@@ -122,6 +122,48 @@ HAND: dict[str, tuple[str, str]] = {
     "african-wild-dog": ("Lycaon pictus", "Mammalia"),
     "dromedary-camel": ("Camelus dromedarius", "Mammalia"),
     "maned-wolf": ("Chrysocyon brachyurus", "Mammalia"),
+    # --- ADDED 2026-08-15, second pass. The name gate is what stops a species
+    # being fitted, not the reference, so every species in `refs/` that reaches
+    # fit quality on EITHER limb thickness or stance is entered here and put
+    # through the same GBIF check as the rest. One of them was already wrong in
+    # the automatic map and is exactly the failure this file was written for:
+    # `common-frog` had resolved to *Mustela lutreola*, a EUROPEAN MINK, because
+    # the Mammalia constraint that fixes the shrubs cannot return an amphibian.
+    "common-frog": ("Rana temporaria", "Amphibia"),
+    "alpaca": ("Vicugna pacos", "Mammalia"),
+    "arctic-fox": ("Vulpes lagopus", "Mammalia"),
+    "bighorn-sheep": ("Ovis canadensis", "Mammalia"),
+    "corsac-fox": ("Vulpes corsac", "Mammalia"),
+    "elk-wapiti": ("Cervus canadensis", "Mammalia"),
+    "european-polecat": ("Mustela putorius", "Mammalia"),
+    "european-wildcat": ("Felis silvestris", "Mammalia"),
+    "fennec-fox": ("Vulpes zerda", "Mammalia"),
+    "golden-jackal": ("Canis aureus", "Mammalia"),
+    "nine-banded-armadillo": ("Dasypus novemcinctus", "Mammalia"),
+    "pronghorn": ("Antilocapra americana", "Mammalia"),
+    "striped-skunk": ("Mephitis mephitis", "Mammalia"),
+    "western-lowland-gorilla": ("Gorilla gorilla", "Mammalia"),
+    "african-forest-elephant": ("Loxodonta cyclotis", "Mammalia"),
+    "alpine-ibex": ("Capra ibex", "Mammalia"),
+    "chimpanzee": ("Pan troglodytes", "Mammalia"),
+    "coati": ("Nasua narica", "Mammalia"),
+    "eastern-chipmunk": ("Tamias striatus", "Mammalia"),
+    "eastern-grey-kangaroo": ("Macropus giganteus", "Mammalia"),
+    "european-bison": ("Bison bonasus", "Mammalia"),
+    "european-mole": ("Talpa europaea", "Mammalia"),
+    "european-rabbit": ("Oryctolagus cuniculus", "Mammalia"),
+    "giant-anteater": ("Myrmecophaga tridactyla", "Mammalia"),
+    "impala": ("Aepyceros melampus", "Mammalia"),
+    "mandrill": ("Mandrillus sphinx", "Mammalia"),
+    "meerkat": ("Suricata suricatta", "Mammalia"),
+    "mountain-goat": ("Oreamnos americanus", "Mammalia"),
+    "red-river-hog": ("Potamochoerus porcus", "Mammalia"),
+    "sand-cat": ("Felis margarita", "Mammalia"),
+    "siberian-flying-squirrel": ("Pteromys volans", "Mammalia"),
+    "steppe-polecat": ("Mustela eversmanii", "Mammalia"),
+    "stoat": ("Mustela erminea", "Mammalia"),
+    "virginia-opossum": ("Didelphis virginiana", "Mammalia"),
+    "dingo": ("Canis dingo", "Mammalia"),
 }
 
 # Species whose SPEC NAME cannot overlap its own vernacular list, with the

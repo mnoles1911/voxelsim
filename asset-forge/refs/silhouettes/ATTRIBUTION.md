@@ -151,10 +151,11 @@ NoDerivatives licence are refused at download and are not present.
 
 - `coati/2419a5cb.png` -- CC0 1.0 -- Margot Michaud -- <https://www.phylopic.org/images/2419a5cb-71ca-47a5-87ac-c21dc33f842f>
 
-## common-frog -- *Mustela lutreola*
+## common-frog -- *Rana temporaria*
 
-- `common-frog/3a403599.png` -- CC0 1.0 -- Margot Michaud -- <https://www.phylopic.org/images/3a403599-00a2-4b1e-b16f-869bdd3e6feb>
-- `common-frog/f5e7b7ea.png` -- CC0 1.0 -- Margot Michaud -- <https://www.phylopic.org/images/f5e7b7ea-cf7c-4492-93d4-1847e1d66b15>
+- `common-frog/b14f5941.png` -- CC BY 4.0 -- Luca Leicht -- <https://www.phylopic.org/images/b14f5941-85a7-4d9a-bd6b-81e4f40402bf>
+- `common-frog/97b84671.png` -- CC BY 4.0 -- Luca Leicht -- <https://www.phylopic.org/images/97b84671-8359-465b-8f15-a8877528dcf7>
+- `common-frog/e73c5c1c.png` -- CC0 1.0 -- Beth Reinke -- <https://www.phylopic.org/images/e73c5c1c-7727-4687-bf0b-3957343edfc3>
 
 ## corsac-fox -- *Vulpes corsac*
 
@@ -204,10 +205,12 @@ NoDerivatives licence are refused at download and are not present.
 - `eastern-grey-squirrel/2916f8fe.png` -- CC0 1.0 -- Andy Wilson -- <https://www.phylopic.org/images/2916f8fe-290a-423b-b6f7-fb975c30d518>
 - `eastern-grey-squirrel/d02f50ba.png` -- CC0 1.0 -- Anthony Caravaggi -- <https://www.phylopic.org/images/d02f50ba-af71-4997-860a-ff11e8d1cbcc>
 
-## elk-wapiti -- *Cervus elaphus*
+## elk-wapiti -- *Cervus canadensis*
 
-- `elk-wapiti/cc03f5c2.png` -- CC0 1.0 -- Ferran Sayol -- <https://www.phylopic.org/images/cc03f5c2-933f-4c40-9c64-7f8727556fdb>
-- `elk-wapiti/72f2f997.png` -- CC0 1.0 -- Steven Traver -- <https://www.phylopic.org/images/72f2f997-e474-4caf-bbd5-72fc8dbcc40d>
+- `elk-wapiti/b156cc5b.png` -- CC0 1.0 -- Abby Weber -- <https://www.phylopic.org/images/b156cc5b-3c1b-4c10-9de8-dfa9b6840f1a>
+- `elk-wapiti/b960d496.png` -- CC0 1.0 -- Richard Rich -- <https://www.phylopic.org/images/b960d496-81f5-43a1-9acd-159bfa3d7b79>
+- `elk-wapiti/b9a9382d.png` -- CC0 1.0 -- Patricia Holroyd -- <https://www.phylopic.org/images/b9a9382d-cb9f-4499-b14e-60faad285bb4>
+- `elk-wapiti/97f83f5e.png` -- CC0 1.0 -- Tracy A. Heath -- <https://www.phylopic.org/images/97f83f5e-9afe-4ce8-812e-337f506ca841>
 
 ## eurasian-beaver -- *Castor fiber*
 

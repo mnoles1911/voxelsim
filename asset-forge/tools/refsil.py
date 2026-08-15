@@ -238,6 +238,30 @@ def measure(m: np.ndarray) -> dict | None:
     out["trunk_depth"] = float(tr.max() - tr.min() + 1) if tr.size else float("nan")
     out["trunk_over_length"] = out["trunk_depth"] / length
     out["back_over_length"] = (belly + out["trunk_depth"]) / length
+    # HOW MUCH OF THE STANDING ANIMAL IS LEG -- the belly divided by the height
+    # of the back, both measured up from the same ground line. THE ONLY STANCE
+    # RATIO HERE WITH NO LENGTH IN IT, and that matters more than it sounds.
+    #
+    # Every ratio measured against `length` reads high by about the same amount
+    # -- belly 1.26x the reference, trunk depth 1.17x, back height 1.22x -- and
+    # one offset shared by three independent numerators is one defect in the
+    # denominator they share, not three defects. `length` is the whole x-extent
+    # of the silhouette, which is exactly what a pose moves: our generator
+    # carries a tail at -35 degrees and a neck at +30, so one of our assets
+    # measures 0.98 of its OWN authored head-body length across and 0.83 of
+    # head-body-plus-tail, while a PhyloPic artist may draw the tail streaming
+    # out behind. `leg_share` cannot be moved by either end of the animal.
+    #
+    # A REJECTED SECOND ATTEMPT, RECORDED SO IT IS NOT RETRIED. The obvious
+    # length-free ruler is fore-foot to hind-foot centre distance, and it is
+    # useless here: our assets stand square, so the left and right of a pair
+    # project onto each other and 2 legs are tracked, while the reference
+    # corpus is drawn mid-stride and tracks 3 to 5. Measured, our span came out
+    # at 0.375 of body length against the reference's 0.742 on `wood-bison` --
+    # 2.2x library-wide -- which is the stride, not the animal. Same class of
+    # error as the horizontal cut across a slanted leg above.
+    back = belly + out["trunk_depth"]
+    out["leg_share"] = belly / back if back > 0 else float("nan")
     return out
 
 
