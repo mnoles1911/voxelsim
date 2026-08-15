@@ -59,7 +59,14 @@ constexpr uint64_t splitmix64(uint64_t z) {
 //   32..47   hash.h             CH_SYNTH_TILE_BASE + synthetic dev-tile index
 //   48       hash.h             CH_CARRIER_WARP_X  (v16 carrier warp)
 //   49       hash.h             CH_CARRIER_WARP_Y  (v16 carrier warp)
-//   50..     FREE
+//   50..53  assetplacement.h   CH_ASSET_SITE   + layer index
+//   54..57  assetplacement.h   CH_ASSET_JITTER + layer index
+//   58..61  assetplacement.h   CH_ASSET_PICK   + layer index
+//   62..65  assetpolicy.h      CH_ASSET_CLUSTER + layer index
+//   66..69  assetpolicy.h      CH_ASSET_SPECIES + layer index
+//   70      assetdetail.h      CH_DETAIL_GROUP
+//   71      assetdetail.h      CH_DETAIL_MEMBER
+//   72..    FREE
 //
 // HISTORY. CH_CAVE_NODE and CH_CAVE_EDGE originally reused ids 18 and 19 â€”
 // the exact ids CH_ECOTONE_TEMP and CH_ECOTONE_PRECIP already occupied â€” a
@@ -119,6 +126,35 @@ enum HashChannel : uint32_t {
     CH_ASSET_SITE = 50,   // reserves 50..53, one per layer
     CH_ASSET_JITTER = 54, // reserves 54..57
     CH_ASSET_PICK = 58,   // reserves 58..61
+
+    // Placement POLICY draws (voxelcore/assetpolicy.h). Separate from the
+    // three above for the reason that block already gives, and it applies with
+    // more force here: the cluster field is a SPATIALLY SMOOTH function
+    // sampled at a coarse lattice, and the site occupancy is a per-cell white
+    // draw. Sharing a channel would make "does this cell carry a tree" and
+    // "is this cell inside a grove" the same field read at two scales, which
+    // is not a subtle correlation -- it is the grove boundary and the tree
+    // positions being the same curve.
+    //
+    // CH_ASSET_SPECIES is separate from CH_ASSET_PICK for a different reason.
+    // CH_ASSET_PICK chooses which BAKED SEED of a species bank an instance
+    // draws (its individual shape); CH_ASSET_SPECIES chooses WHICH SPECIES,
+    // against the biome weights. Sharing them would tie "which oak this is"
+    // to "whether this is an oak or a beech", so every beech in the world
+    // would be seed 0 of its bank and every oak seed 3 -- one shape per
+    // species, which is the exact failure the 64-seed bank exists to prevent.
+    CH_ASSET_CLUSTER = 62, // reserves 62..65, one per layer
+    CH_ASSET_SPECIES = 66, // reserves 66..69, one per layer
+
+    // Detail-entity groups (voxelcore/assetdetail.h): herds, flocks, shoals.
+    // Not per-layer -- a detail group lattice is per SPECIES CLASS chosen by
+    // the caller, not one of the four size classes the terrain scatter uses,
+    // so there is nothing to index by. The two draws are split because group
+    // occupancy is asked of every cell of the disc and the member layout only
+    // of groups that survived the habitat gate, which is the same
+    // rate-separation argument as CH_ASSET_SITE vs CH_ASSET_JITTER.
+    CH_DETAIL_GROUP = 70,
+    CH_DETAIL_MEMBER = 71,
 };
 
 constexpr uint64_t hash2(uint64_t seed, int64_t x, int64_t y, uint32_t channel) {

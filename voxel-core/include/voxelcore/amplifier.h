@@ -10,6 +10,7 @@
 
 #include <atomic> // the debug water marker's column counters
 
+#include "voxelcore/biome.h" // BiomeId, carried on ColumnSample since the asset policy
 #include "voxelcore/caverns.h"
 #include "voxelcore/caves.h"
 
@@ -63,6 +64,34 @@ struct ColumnSample {
     int32_t subsoilMm = 0;      // layer thickness below topsoil
     int32_t bedrockDepthMm = 0; // depth below surface where bedrock begins
     MaterialId surfaceMat = MAT_TOPSOIL; // biome surface material, voxelcore/biome.h
+
+    // WHAT classifyBiome ACTUALLY SAID, and the slope it said it about.
+    //
+    // Both of these were computed inside column() and thrown away. surfaceMat
+    // is a lossy reduction of the first and is the only thing that used to
+    // survive: MAT_SAND is BOTH beach and desert, MAT_ROCK is BOTH bare rock
+    // and alpine above the rock line (biomeSurfaceMaterial, biome.h:239), so
+    // a consumer that needs the biome cannot recover it from the material.
+    // slopeMmPerM was not exposed at all -- evalSurface is private.
+    //
+    // Asset placement is the consumer that needs both: a species carries a
+    // weight per biome (all 828 asset-forge specs do) and a slope band, and
+    // "steep, but not a cliff" is what puts scree below a cliff rather than
+    // on top of it.
+    //
+    // NEITHER FIELD CAN CHANGE A VOXEL. materialAt and stratigraphyAt are
+    // static functions of (ColumnSample, vz) and read neither, so the solid
+    // set is untouched; this is carried on the sample for exactly the reason
+    // `cave` and `cavern` below are, and it costs two stores in a function
+    // that already computed both values. Verified rather than argued: the
+    // worldgen digest (vxc_bench --radius 8 --digest) is unchanged.
+    //
+    // The GPU mirror (shaders/worldgen.ush ColumnMain) does NOT need these:
+    // it mirrors materialAt's inputs, and these are not among them. Adding a
+    // field materialAt reads WOULD carry that obligation.
+    BiomeId biome = TEMPERATE_FOREST;
+    int64_t slopeMmPerM = 0; // mm of rise per metre of run, same currency as
+                             // kBiomeCliffSlopeMmPerM (biome.h:71)
 
     // DEBUG WATER MARKER (off by default). Absolute mm of the baked water
     // surface over this column, or kNoWaterMm. Populated only when the

@@ -2499,6 +2499,14 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     const BiomeId biome = classifyBiome(clTempDithered, clPrecipDithered, cl.precipVariability,
                                          col.surfaceMm, slopeMmPerM);
     col.surfaceMat = biomeSurfaceMaterial(biome, col.surfaceMm);
+    // CARRIED, NOT RE-DERIVED. Both of these were computed here and dropped;
+    // surfaceMat above is a lossy reduction of the first (MAT_SAND is beach
+    // AND desert) and slopeMmPerM had no public route out of the amplifier at
+    // all. Asset placement needs both -- see ColumnSample's own comment. These
+    // two stores cannot change a voxel: materialAt/stratigraphyAt read neither
+    // field, which is why the worldgen digest is unchanged across this commit.
+    col.biome = biome;
+    col.slopeMmPerM = slopeMmPerM;
 
     // THE 3D DENSITY BAND WAS REDUCED HERE, once per column, until v20 removed
     // it (core.h's v20 entry has the measurement and the argument for why the

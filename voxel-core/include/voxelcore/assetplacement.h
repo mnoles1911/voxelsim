@@ -141,7 +141,58 @@ struct AssetLayer {
     // How many baked seeds this layer's species banks carry. The pick draw is
     // reduced modulo this, so 0 is treated as 1.
     uint16_t seedCount = 64;
+
+    // DOES THIS LAYER PUT VOXELS IN THE WORLD GRID?
+    //
+    // True for trees and rocks: forge/kinds.py:34-42 records that they "JOIN
+    // THE WORLD'S OWN VOXEL GRID and are destructible exactly as terrain is",
+    // which forces them to 10 cm = kVoxelSizeMm and nothing else. Those are
+    // the assets that are solid above the surface, and they are the entire
+    // reason the bounds in this file exist.
+    //
+    // False for everything else -- ground cover, bushes and every animal.
+    // forge/kinds.py:44-51: "they never enter the terrain grid: they carry
+    // their own voxel grid and their own transform". AssetGrid::onTerrainLattice
+    // (assetgrid.h:162) is the per-asset twin of this flag.
+    //
+    // THE BOUNDS SKIP LAYERS WHERE THIS IS FALSE, AND THAT IS THE DANGEROUS
+    // DIRECTION. Every other switch in this file makes the bound larger or
+    // leaves it alone; this one makes it smaller, which is the polarity that
+    // puts holes in worlds. Three things make it sound rather than merely
+    // plausible:
+    //
+    //   1. THE DEFAULT IS TRUE. A layer that never mentions the field pays the
+    //      full bound. Forgetting is the safe direction.
+    //   2. assetLayerAdmitsVoxelSize refuses a mismatch at bake and load time,
+    //      so a detail layer provably holds nothing on the world lattice. That
+    //      is the premise the skip rests on, and it is checked rather than
+    //      assumed.
+    //   3. tests/test_assetplacement.cpp drives it in BOTH directions -- a
+    //      detail layer contributing exactly zero, and the same layer flipped
+    //      back to terrain contributing again. A gate exercised only in the
+    //      easy direction is what tilestreaming.h:173-188 is a postmortem of.
+    //
+    // What it buys is not tidiness. The bound's early-out means the DENSEST
+    // layer answers first, so with ground cover on a terrain layer every
+    // footprint on the planet takes the grass layer's maxHeightMm -- and a few
+    // hundred mm straddles a level-0 chunk boundary often enough to admit an
+    // extra 32-voxel chunk layer over a large fraction of the world, to carry
+    // geometry that is not in the voxel grid at all.
+    bool terrainLattice = true;
 };
+
+// The lattice a layer expects an asset to be baked at, in mm. Terrain layers
+// admit exactly kVoxelSizeMm because the world grid has exactly one cell size;
+// detail layers admit anything BUT that, so that a 10 cm asset cannot be filed
+// somewhere the bound will not account for it.
+//
+// `voxelSizeMm` is AssetGrid::voxelSizeMm() -- the size the asset was actually
+// baked at, read out of the VXA header, not the size anybody believes it was.
+inline bool assetLayerAdmitsVoxelSize(const AssetLayer& layer, uint32_t voxelSizeMm) {
+    if (voxelSizeMm == 0) return false;
+    return layer.terrainLattice ? (voxelSizeMm == uint32_t(kVoxelSizeMm))
+                                : (voxelSizeMm != uint32_t(kVoxelSizeMm));
+}
 
 // A candidate placement, before any policy has looked at it.
 //
@@ -276,6 +327,10 @@ inline int32_t assetTopAboveSurfaceMm(uint64_t seed, const AssetLayer* layers, i
     int32_t top = 0;
     for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
         const AssetLayer& L = layers[li];
+        // A detail layer is not in the world grid, so it cannot break the
+        // all-air proof and must not widen it. See AssetLayer::terrainLattice
+        // for why this skip is the dangerous direction and what guards it.
+        if (!L.terrainLattice) continue;
         if (L.cellMm <= 0 || L.maxHeightMm <= top) continue; // cannot raise the answer
         const int64_t r = int64_t(L.maxRadiusMm);
         const int64_t cx0 = floorDiv(x0 - r, int64_t(L.cellMm));
@@ -309,6 +364,7 @@ inline int32_t assetBottomBelowSurfaceMm(uint64_t seed, const AssetLayer* layers
     int32_t depth = 0;
     for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
         const AssetLayer& L = layers[li];
+        if (!L.terrainLattice) continue; // not in the world grid; see above
         if (L.cellMm <= 0 || L.maxDepthMm <= depth) continue;
         const int64_t r = int64_t(L.maxRadiusMm);
         const int64_t cx0 = floorDiv(x0 - r, int64_t(L.cellMm));
@@ -341,6 +397,16 @@ inline int32_t assetMaxReachMm(const AssetLayer* layers, int layerCount) {
     int32_t r = 0;
     if (layers == nullptr) return 0;
     for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
+        // TERRAIN LAYERS ONLY, and this one is load-bearing rather than an
+        // optimisation. This reach is the dilation assetAwareSurfaceUpperBoundMm
+        // applies to the TERRAIN bound query, and the reason for that dilation
+        // (assetplacement.h's note 1 on that function) is that an instance
+        // anchored outside the rect stands on ground at its own anchor and
+        // reaches in. A detail-lattice instance puts no voxel in the rect at
+        // all, so it has nothing to reach in WITH, and dilating for it would
+        // widen every bound query on the planet for geometry that is not in
+        // the grid.
+        if (!layers[li].terrainLattice) continue;
         if (layers[li].cellMm <= 0) continue;
         if (layers[li].maxRadiusMm > r) r = layers[li].maxRadiusMm;
     }

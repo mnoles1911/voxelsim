@@ -241,14 +241,37 @@ MaterialId AssetGrid::at(int32_t lx, int32_t ly, int32_t lz) const {
     return MAT_AIR;
 }
 
+// Quarter turns about +z, right-handed: (x,y) -> (-y,x). The box's origin
+// corner moves with it, so the rotated origin is derived from the ORIGINAL
+// origin and the extent that ends up spanning the axis.
+//
+// THE +1 ON EVERY NEGATED AXIS, AND WHY IT WAS MISSING. These are VOXEL INDICES,
+// not a continuous interval, and negation flips which end of a half-open span is
+// the closed one. An axis spanning indices [o, o+n) negates to the index set
+// {-o, -o-1, ..., -(o+n-1)}, whose lowest member is -(o + n - 1) -- one MORE
+// than the -(o + n) that comes from negating the exclusive upper bound. Four of
+// the eight cases below negated an axis and all four were short by exactly that
+// one.
+//
+// It was wrong from the day it was written and nothing said so, because
+// NOTHING CALLED IT. assetgrid_yaw_is_a_bijection_that_preserves_content
+// exercises atYaw thoroughly and never touches these two, and atYaw is
+// self-consistent -- its coordinates are zero-based inside the rotated box, so
+// it cannot notice an error in where that box sits in the world. The two halves
+// only meet in a caller placing a yawed instance, and there was no such caller
+// until assetfield.h. The symptom, when it finally appeared, was three of every
+// four trees invisible: yaw 0 drew, and yaws 1-3 sampled one voxel outside the
+// box on the negated axis and read the out-of-range MAT_AIR that at() answers
+// by design. Not a crash, not a warning -- a thinner forest.
+//
+// assetgrid_rotated_origin_puts_a_yawed_box_where_atYaw_reads_it now pins the
+// two against each other, which is the only test that could have caught this:
+// either one alone is self-consistent.
 int32_t AssetGrid::rotatedOriginX(uint8_t yawQuarter) const {
-    // Quarter turns about +z, right-handed: (x,y) -> (-y,x). The box's origin
-    // corner moves with it, so the rotated origin is derived from the ORIGINAL
-    // origin and the extent that ends up spanning the axis.
     switch (yawQuarter & 3u) {
         case 0: return originX_;
-        case 1: return -(originY_ + sizeY_);
-        case 2: return -(originX_ + sizeX_);
+        case 1: return -(originY_ + sizeY_ - 1);
+        case 2: return -(originX_ + sizeX_ - 1);
         default: return originY_;
     }
 }
@@ -257,8 +280,8 @@ int32_t AssetGrid::rotatedOriginY(uint8_t yawQuarter) const {
     switch (yawQuarter & 3u) {
         case 0: return originY_;
         case 1: return originX_;
-        case 2: return -(originY_ + sizeY_);
-        default: return -(originX_ + sizeX_);
+        case 2: return -(originY_ + sizeY_ - 1);
+        default: return -(originX_ + sizeX_ - 1);
     }
 }
 

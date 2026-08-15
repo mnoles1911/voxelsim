@@ -338,6 +338,107 @@ VXC_TEST(assetbound_layer_height_contract_is_checkable_at_bake_time) {
     CHECK(!assetLayerAdmitsHeight(canopy, 121)); // 12.1 m -- one voxel over
 }
 
+// ---------------------------------------------------------------------------
+// THE TERRAIN / DETAIL LATTICE SPLIT
+//
+// This is the only switch in the file that makes a bound SMALLER, which is the
+// polarity that puts holes in worlds. So it is driven in both directions: the
+// same layer contributing nothing as a detail layer, and contributing again the
+// moment it is flipped back. A gate exercised only in the direction where it
+// does nothing is exactly what tilestreaming.h:173-188 is a postmortem of.
+// ---------------------------------------------------------------------------
+
+VXC_TEST(assetbound_ignores_detail_lattice_layers_and_notices_when_they_flip_back) {
+    AssetLayer detail{};
+    detail.cellMm = 800;
+    detail.maxHeightMm = 500;
+    detail.maxDepthMm = 100;
+    detail.maxRadiusMm = 300;
+    detail.densityPerMille = 1000; // every cell, so "found nothing" cannot be luck
+    detail.seedCount = 8;
+    detail.terrainLattice = false;
+
+    const AssetVoxelRect rect = chunkRect(3, -2);
+
+    // A detail layer is not in the world grid, so it must contribute exactly
+    // zero to both bounds and to the reach -- not "a small amount", zero.
+    CHECK_EQ(assetTopAboveSurfaceMm(kSeed, &detail, 1, rect), 0);
+    CHECK_EQ(assetBottomBelowSurfaceMm(kSeed, &detail, 1, rect), 0);
+    CHECK_EQ(assetMaxReachMm(&detail, 1), 0);
+
+    // But the GENERATION query must still return its sites, or ground cover
+    // never gets placed at all. This is the half that would make "skip detail
+    // layers" a plausible-looking one-line change with the vegetation deleted.
+    CHECK(!assetSitesForRect(kSeed, &detail, 1, rect).empty());
+
+    // Flip the one field and every number must come back. Same seed, same
+    // cells, same rect -- the ONLY difference is the flag.
+    AssetLayer terrain = detail;
+    terrain.terrainLattice = true;
+    CHECK_EQ(assetTopAboveSurfaceMm(kSeed, &terrain, 1, rect), terrain.maxHeightMm);
+    CHECK_EQ(assetBottomBelowSurfaceMm(kSeed, &terrain, 1, rect), terrain.maxDepthMm);
+    CHECK_EQ(assetMaxReachMm(&terrain, 1), terrain.maxRadiusMm);
+}
+
+VXC_TEST(assetbound_default_is_a_terrain_layer_so_forgetting_is_the_safe_direction) {
+    // A default-constructed layer must pay the full bound. If the default were
+    // `false`, every layer anybody forgot to annotate would silently vanish
+    // from the bound -- which is the hole-in-the-world direction, arrived at by
+    // omission rather than by decision.
+    AssetLayer fresh{};
+    CHECK(fresh.terrainLattice);
+    fresh.cellMm = 4000;
+    fresh.maxHeightMm = 9000;
+    fresh.maxRadiusMm = 2000;
+    fresh.densityPerMille = 1000;
+    CHECK_EQ(assetTopAboveSurfaceMm(kSeed, &fresh, 1, chunkRect(0, 0)), 9000);
+}
+
+VXC_TEST(assetlayer_admits_only_its_own_lattice) {
+    // The check that makes the skip above SOUND rather than merely plausible: a
+    // detail layer provably holds nothing on the world lattice, because this
+    // refuses it at bake and load time.
+    AssetLayer terrain{};
+    AssetLayer detail{};
+    detail.terrainLattice = false;
+
+    CHECK(assetLayerAdmitsVoxelSize(terrain, uint32_t(kVoxelSizeMm)));
+    CHECK(!assetLayerAdmitsVoxelSize(terrain, 50u));  // a 5 cm asset on the world grid
+    CHECK(!assetLayerAdmitsVoxelSize(terrain, 10u));
+
+    CHECK(assetLayerAdmitsVoxelSize(detail, 50u));
+    CHECK(assetLayerAdmitsVoxelSize(detail, 10u));
+    CHECK(!assetLayerAdmitsVoxelSize(detail, uint32_t(kVoxelSizeMm))); // and the reverse
+
+    // A zero voxel size is a header that never parsed. Refuse it on both.
+    CHECK(!assetLayerAdmitsVoxelSize(terrain, 0u));
+    CHECK(!assetLayerAdmitsVoxelSize(detail, 0u));
+}
+
+VXC_TEST(assetbound_composed_query_is_not_dilated_for_detail_layers) {
+    // The reach is the dilation assetAwareSurfaceUpperBoundMm applies to the
+    // TERRAIN bound. A detail instance puts no voxel in the rect, so it has
+    // nothing to reach in with, and dilating for it would widen every bound
+    // query on the planet for geometry that is not in the grid.
+    AssetLayer layers[2];
+    layers[0] = kLayers[0];                 // terrain, 9 m reach
+    layers[1] = kLayers[3];                 // dense ground cover...
+    layers[1].maxRadiusMm = 100'000;        // ...with an absurd reach
+    layers[1].terrainLattice = false;
+
+    int64_t sawX0 = 0;
+    const auto record = [&](int64_t x0, int64_t, int64_t, int64_t) -> int64_t {
+        sawX0 = x0;
+        return 0;
+    };
+    const AssetVoxelRect rect = chunkRect(0, 0);
+    assetAwareSurfaceUpperBoundMm(kSeed, layers, 2, rect, record);
+
+    CHECK_EQ(assetMaxReachMm(layers, 2), kLayers[0].maxRadiusMm);
+    const int64_t reachVox = int64_t(kLayers[0].maxRadiusMm) / int64_t(kVoxelSizeMm) + 1;
+    CHECK_EQ(sawX0, rect.vx0 - reachVox);
+}
+
 VXC_TEST(assetsites_are_ordered_and_free_of_duplicates) {
     // The generation query feeds a mesher; a duplicated site would draw the
     // same tree twice into the same voxels, which is invisible in the render

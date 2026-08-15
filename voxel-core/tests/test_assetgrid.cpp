@@ -342,6 +342,81 @@ VXC_TEST(assetgrid_rejects_malformed_blobs_by_reason) {
     CHECK_EQ(int(g.at(0, 0, 0)), int(MAT_AIR));
 }
 
+VXC_TEST(assetgrid_rotated_origin_puts_a_yawed_box_where_atYaw_reads_it) {
+    // THE TEST THAT WAS MISSING, AND THE ONLY SHAPE THAT COULD HAVE CAUGHT IT.
+    //
+    // atYaw and rotatedOrigin* are each self-consistent on their own: atYaw's
+    // coordinates are zero-based inside the rotated box, so it cannot notice an
+    // error in where that box sits in the world, and rotatedOrigin* has no
+    // content to disagree with. They only meet in a caller placing a yawed
+    // instance -- and there was no such caller until assetfield.h, so four of
+    // rotatedOrigin*'s eight cases were off by one from the day they were
+    // written with nothing to say so.
+    //
+    // The property: for every yaw, mapping each baked voxel to world through
+    // (anchor + rotatedOrigin + rotated-local) and reading it back through
+    // atYaw must return the material that was baked there. Asserted over a box
+    // with DIFFERENT extents on x and y and a NON-ZERO, NEGATIVE origin -- a
+    // cube at the origin would pass with every one of the four bugs present.
+    const int32_t nx = 3, ny = 5, nz = 2;
+    const int32_t ox = -1, oy = -4;
+    std::vector<MaterialId> dense(size_t(nx * ny * nz));
+    for (size_t i = 0; i < dense.size(); ++i)
+        dense[i] = static_cast<MaterialId>(1 + (i % 7)); // every cell distinct-ish, none air
+    AssetGrid g;
+    CHECK_EQ(int(g.parse(encode(ox, oy, 0, nx, ny, nz, dense))), int(AssetParseError::kOk));
+
+    for (uint8_t yaw = 0; yaw < 4; ++yaw) {
+        const int32_t rw = g.rotatedSizeX(yaw), rh = g.rotatedSizeY(yaw);
+        // 1. Every cell of the rotated box reads as something that was baked --
+        //    i.e. the box's own extent and origin agree with atYaw's indexing.
+        int solid = 0;
+        for (int32_t ry = 0; ry < rh; ++ry)
+            for (int32_t rx = 0; rx < rw; ++rx)
+                for (int32_t rz = 0; rz < nz; ++rz)
+                    if (g.atYaw(rx, ry, rz, yaw) != MAT_AIR) ++solid;
+        CHECK_EQ(solid, nx * ny * nz); // nothing baked was lost to a rotation
+
+        // 2. And one cell OUTSIDE the rotated box on each axis reads air, which
+        //    is what makes the origin's placement observable at all: an origin
+        //    off by one puts a real voxel where this expects nothing.
+        for (int32_t rz = 0; rz < nz; ++rz) {
+            CHECK_EQ(int(g.atYaw(-1, 0, rz, yaw)), int(MAT_AIR));
+            CHECK_EQ(int(g.atYaw(rw, 0, rz, yaw)), int(MAT_AIR));
+            CHECK_EQ(int(g.atYaw(0, -1, rz, yaw)), int(MAT_AIR));
+            CHECK_EQ(int(g.atYaw(0, rh, rz, yaw)), int(MAT_AIR));
+        }
+
+        // 3. THE ROUND TRIP THROUGH WORLD SPACE, which is the property a
+        //    placer actually depends on. Take the world position the UNROTATED
+        //    convention gives a baked voxel (world = anchor + origin + local,
+        //    assetgrid.h's own words), rotate that world offset about the
+        //    anchor, and read it back through the rotated origin. It must be
+        //    the same material.
+        for (int32_t lx = 0; lx < nx; ++lx)
+            for (int32_t ly = 0; ly < ny; ++ly) {
+                const int32_t ax = ox + lx, ay = oy + ly; // asset-space
+                int32_t wx = 0, wy = 0;                   // rotated asset-space
+                switch (yaw) {
+                    case 0: wx = ax;  wy = ay;  break;
+                    case 1: wx = -ay; wy = ax;  break;
+                    case 2: wx = -ax; wy = -ay; break;
+                    default: wx = ay; wy = -ax; break;
+                }
+                const int32_t rx = wx - g.rotatedOriginX(yaw);
+                const int32_t ry = wy - g.rotatedOriginY(yaw);
+                // Inside the rotated box, by construction...
+                CHECK(rx >= 0);
+                CHECK(rx < rw);
+                CHECK(ry >= 0);
+                CHECK(ry < rh);
+                // ...and holding exactly the voxel that was baked there.
+                for (int32_t lz = 0; lz < nz; ++lz)
+                    CHECK_EQ(int(g.atYaw(rx, ry, lz, yaw)), int(g.at(lx, ly, lz)));
+            }
+    }
+}
+
 VXC_TEST(assetgrid_yaw_is_a_bijection_that_preserves_content) {
     // Four quarter turns must return the asset to itself, and each turn must
     // move solid mass rather than lose it -- a rotation that silently drops

@@ -89,6 +89,16 @@ inline constexpr ChannelAlloc kChannelAllocs[] = {
     {CH_ASSET_SITE, 4, "CH_ASSET_SITE (reserves +0..+3, one per asset layer)"},
     {CH_ASSET_JITTER, 4, "CH_ASSET_JITTER (reserves +0..+3, one per asset layer)"},
     {CH_ASSET_PICK, 4, "CH_ASSET_PICK (reserves +0..+3, one per asset layer)"},
+    // hash.h -- placement policy (voxelcore/assetpolicy.h). Same per-layer
+    // reserve as the three above and declared at its true width for the same
+    // reason.
+    {CH_ASSET_CLUSTER, 4, "CH_ASSET_CLUSTER (reserves +0..+3, one per asset layer)"},
+    {CH_ASSET_SPECIES, 4, "CH_ASSET_SPECIES (reserves +0..+3, one per asset layer)"},
+    // hash.h -- detail entities (voxelcore/assetdetail.h). NOT per-layer; a
+    // detail group lattice is chosen by the caller rather than being one of
+    // the four size classes, so there is no index to reserve against.
+    {CH_DETAIL_GROUP, 1, "CH_DETAIL_GROUP"},
+    {CH_DETAIL_MEMBER, 1, "CH_DETAIL_MEMBER"},
 };
 
 inline constexpr int kChannelAllocCount =

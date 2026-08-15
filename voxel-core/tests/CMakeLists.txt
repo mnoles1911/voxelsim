@@ -5,6 +5,9 @@ add_executable(vxc_tests
   test_amplifier.cpp
   test_assetgrid.cpp
   test_assetplacement.cpp
+  test_assetpolicy.cpp
+  test_assetdetail.cpp
+  test_assetfield.cpp
   test_carrier.cpp
   test_biome.cpp
   test_climate.cpp

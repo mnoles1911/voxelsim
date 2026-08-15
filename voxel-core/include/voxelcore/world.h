@@ -33,6 +33,21 @@ public:
         amp_.setWaterMarker(sampler, includeOcean);
     }
     void setWaterMarkerFillPx(int64_t px) { amp_.setWaterMarkerFillPx(px); }
+
+    // THE ASSET TERM, and the same narrow door for the same reason.
+    //
+    // `generated()` is const because nothing in normal operation may
+    // reconfigure worldgen after construction, and the asset field is worldgen:
+    // it feeds makeBrick, which is what applyToOverlay rebuilds an edited brick
+    // from, and materialAt, which is what raycasts and digging read. Installing
+    // one mid-session would make the same brick generate differently before and
+    // after, so this must be called during bring-up, before any worker touches
+    // the world -- exactly as setWaterMarker must.
+    //
+    // The field is NOT owned. It holds decoded species banks that outlive any
+    // one world, which is the whole point of residency being per bank.
+    void setAssetField(const AssetField* field) { gen_.setAssetField(field); }
+    const AssetField* assetField() const { return gen_.assetField(); }
     // See Amplifier::waterMarkerColumnsMarked -- the two numbers that separate
     // "the marker is not wired up" from "the camera never looked at water" from
     // "the water is there and something downstream will not draw it".

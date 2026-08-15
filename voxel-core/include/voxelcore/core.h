@@ -464,6 +464,28 @@ constexpr int64_t floorDiv(int64_t a, int64_t b) {
 }
 constexpr int64_t floorMod(int64_t a, int64_t b) { return a - floorDiv(a, b) * b; }
 
+// THE TOPMOST SOLID VOXEL OF A COLUMN, from its surface elevation. A voxel is
+// solid when its CENTRE is at or below the surface, so this is the index whose
+// centre is the highest one that still qualifies.
+//
+// ONE RULE, TWO CALLERS, AND THAT IS THE POINT OF IT BEING HERE. This formula
+// was written out inline in GeneratedWorld::surfaceBrickRange, which decides
+// which bricks a chunk materialises, and asset placement needs the identical
+// answer to decide which voxel a tree stands on. A tree anchored by a second,
+// separately-derived version of this arithmetic would sit one voxel off
+// wherever the two disagreed -- which is a floating tree, or a buried one, and
+// neither is logged. Two derivations of one rule is how the cavern reach and
+// the carrier stencil came to disagree once already (tilestreaming.h:190-197).
+//
+// IT IS NOT A SOLIDITY TEST. It answers "where the surface puts the top voxel",
+// and the carve passes (caves, caverns) can make that voxel AIR -- a cave mouth
+// or a sinkhole shaft is exactly that. Anything anchoring to it must then ask
+// Amplifier::materialAt whether the voxel is really there. See
+// AssetColumnFacts::anchorSolid.
+constexpr int64_t topSolidVoxelZ(int64_t surfaceMm) {
+    return floorDiv(surfaceMm - int64_t(kVoxelSizeMm) / 2, int64_t(kVoxelSizeMm));
+}
+
 constexpr int64_t clampi64(int64_t v, int64_t lo, int64_t hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }

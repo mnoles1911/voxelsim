@@ -4,6 +4,7 @@
 // should be materialized by callers; underground stays implicit-solid.
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/assetfield.h"
 #include "voxelcore/brick.h"
 #include "voxelcore/chunkmap.h"
 
@@ -26,6 +27,23 @@ public:
 
     const Amplifier& amplifier() const { return *amp_; }
 
+    // THE THIRD TERM IN THE WORLD FUNCTION, and it is optional.
+    //
+    // With no field installed this class is bit-for-bit what it was: every
+    // existing golden, every test and the worldgen digest are untouched until
+    // somebody deliberately switches assets on. That is not politeness, it is
+    // the only way to tell a wiring bug from a placement bug -- when the field
+    // IS installed the digest MUST change, and an unchanged digest means the
+    // field is not wired rather than that placement found nothing.
+    //
+    // It is composed HERE rather than in the UE mesher's sampler because
+    // makeBrick is what World::applyToOverlay rebuilds an edited brick from,
+    // and materialAt below is what raycasts, digging and the region graph read.
+    // See assetfield.h's header for the two silent defects that composing it
+    // only in the mesher produces.
+    void setAssetField(const AssetField* field) { assets_ = field; }
+    const AssetField* assetField() const { return assets_; }
+
     ColumnGrid columns(int32_t bx, int32_t by) const {
         ColumnGrid g;
         g.bx = bx;
@@ -37,14 +55,47 @@ public:
         return g;
     }
 
+    // Every asset instance that can put a voxel in this brick, with each
+    // instance's anchor column evaluated at ITS OWN xy -- not at the brick's.
+    // A 9 m crown over a 0.8 m brick is usually anchored in a different brick
+    // entirely, and resolving it against the brick's columns would put the tree
+    // at the height of the ground under its own canopy edge.
+    std::vector<AssetInstance> assetInstancesForBrick(const BrickKey& key) const {
+        if (assets_ == nullptr || assets_->empty()) return {};
+        const int64_t vx0 = int64_t(key.x) * B, vy0 = int64_t(key.y) * B;
+        const AssetVoxelRect rect{vx0, vy0, vx0 + B - 1, vy0 + B - 1};
+        return assets_->instancesForRect(rect, [this](int64_t vx, int64_t vy) {
+            return assetColumnFactsFromSample(amp_->columnCached(vx, vy));
+        });
+    }
+
     Brick<B> makeBrick(const BrickKey& key, const ColumnGrid& grid) const {
         Brick<B> brick;
+        // Resolved once per brick, not once per voxel. Empty whenever no field
+        // is installed, and the inner loop then costs one branch on an empty
+        // vector -- which is what keeps the no-asset world exactly as fast and
+        // exactly as bit-identical as it was.
+        const std::vector<AssetInstance> insts = assetInstancesForBrick(key);
         for (int y = 0; y < B; ++y)
             for (int x = 0; x < B; ++x) {
                 const ColumnSample& col = grid.at(x, y);
-                for (int z = 0; z < B; ++z)
-                    brick.set(x, y, z,
-                              Amplifier::materialAt(col, int64_t(key.z) * B + z));
+                for (int z = 0; z < B; ++z) {
+                    const int64_t vz = int64_t(key.z) * B + z;
+                    MaterialId m = Amplifier::materialAt(col, vz);
+                    // AIR ONLY. An asset never replaces terrain, so a
+                    // part-buried rock stays buried, MAT_BEDROCK is safe with
+                    // no special case, and the composition is MONOTONE -- it
+                    // can only add solid. That last one is load-bearing:
+                    // assetplacement.h's bound assumes assets are solid ABOVE
+                    // the surface, and a composition that could also remove
+                    // solid would break the all-solid floor bound while the sky
+                    // bound went on looking correct.
+                    if (m == MAT_AIR && !insts.empty()) {
+                        m = assets_->materialAt(insts, int64_t(key.x) * B + x,
+                                                int64_t(key.y) * B + y, vz);
+                    }
+                    brick.set(x, y, z, m);
+                }
             }
         brick.tryCollapse();
         return brick;
@@ -80,8 +131,11 @@ public:
     void surfaceBrickRange(const ColumnGrid& grid, int32_t& bzMin, int32_t& bzMax) const {
         int64_t vzMin = INT64_MAX, vzMax = INT64_MIN;
         for (int i = 0; i < B * B; ++i) {
-            // Topmost solid voxel: centre <= surfaceMm.
-            const int64_t top = floorDiv(grid.cols[i].surfaceMm - kVoxelSizeMm / 2, kVoxelSizeMm);
+            // Topmost solid voxel: centre <= surfaceMm. The formula moved to
+            // core.h's topSolidVoxelZ so that asset placement anchors trees to
+            // the SAME voxel this materialises bricks for, rather than to a
+            // second derivation of the same arithmetic.
+            const int64_t top = topSolidVoxelZ(grid.cols[i].surfaceMm);
             vzMin = top < vzMin ? top : vzMin;
             vzMax = top > vzMax ? top : vzMax;
         }
@@ -89,8 +143,26 @@ public:
         bzMax = static_cast<int32_t>(floorDiv(vzMax, B));
     }
 
+    // THE PER-VOXEL QUERY, and it must see assets or a tree is not a thing you
+    // can dig, raycast, stand on or collapse. World::materialAt is this
+    // function; it feeds IsSolidAtVoxel, the region graph and collapse.h.
+    //
+    // It costs a site enumeration over a one-voxel rect when a field is
+    // installed and the terrain answered air. That is genuinely more expensive
+    // than the batch path, and it is the same trade this function already makes
+    // -- it re-derives a whole column per voxel, which is why the header above
+    // tells batch callers to use makeBrick instead. Correctness here is not
+    // optional: the alternative is geometry that renders and is not there.
     MaterialId materialAt(int64_t vx, int64_t vy, int64_t vz) const {
-        return amp_->materialAt(vx, vy, vz);
+        const MaterialId m = amp_->materialAt(vx, vy, vz);
+        if (m != MAT_AIR || assets_ == nullptr || assets_->empty()) return m;
+        const AssetVoxelRect rect{vx, vy, vx, vy};
+        const std::vector<AssetInstance> insts =
+            assets_->instancesForRect(rect, [this](int64_t ax, int64_t ay) {
+                return assetColumnFactsFromSample(amp_->columnCached(ax, ay));
+            });
+        if (insts.empty()) return MAT_AIR;
+        return assets_->materialAt(insts, vx, vy, vz);
     }
 
     // ------------------------------------------------------------------
@@ -237,6 +309,9 @@ public:
 
 private:
     const Amplifier* amp_;
+    // Null means "no assets", which is the world exactly as it was before this
+    // existed. See setAssetField.
+    const AssetField* assets_ = nullptr;
 };
 
 } // namespace vxc
