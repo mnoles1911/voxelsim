@@ -105,7 +105,20 @@ BIOMES: tuple[Biome, ...] = (
           # consequence, it is a decision that has now been made. An ibex and a
           # chamois stand on ground far steeper than 35 degrees; that is the
           # whole point of them.
-          ("rock", "bird", "quadruped")),
+          # AND PLANTS (owner, 2026-08-15): "bare rock should host moss, lichen
+          # and vines at times". `plantable` stays False and that is still the
+          # distinction -- plantable means the climate-and-soil table will
+          # AUTO-PLANT here, which a cliff face should not; `hosts` means an
+          # asset of this kind may be placed here, and a moss cushion on a rock
+          # face plainly may.
+          #
+          # grass carries the mosses, flower the crevice herbs, bush the vines
+          # and the woody things that get a roothold in a crack. There is no
+          # `lichen` kind yet -- it is on the blocked list in
+          # docs/biomes/README.md section 9, wanting a crust primitive that
+          # nothing here has -- so the owner's third example is named and not
+          # yet servable.
+          ("rock", "bird", "quadruped", "grass", "flower", "bush")),
 )
 
 BY_KEY = {b.key: b for b in BIOMES}
