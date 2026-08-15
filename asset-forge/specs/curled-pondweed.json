@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.9,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "taiga": 0.5,
+    "temperate_forest": 0.9,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.6,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "grass",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "curled-pondweed",
+  "notes": "THE COMMONEST POND PLANT IN THE TEMPERATE WORLD and the first fully submerged freshwater species in the library. Its wavy crisped leaf edge is the field mark and is a 2-3 mm undulation (estimate), a twentieth of a voxel at 5 cm -- so what is authored is the leaf's OUTLINE: wide, limp, heavily arced straps that lie over each other.\n\n`arc` 0.80 is the highest in this file and it is the whole difference between a submerged plant and an emergent one. Water holds a pondweed up; air does not, and nothing here knows that -- an underwater plant drawn with a reed's stiffness reads as a reed. Every submerged species below is arced past 0.60 for this reason and it is the single most important shared decision in the file.\n\n0.5-3 m of water, rooted in silt. Placed hard against water (`water_max_m` 1) on nearly flat ground.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.9,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 15.0,
+    "spacing_m": 0.4,
+    "water_max_m": 1.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,18 +408,18 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.8,
+    "base_m": 0.1,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.36,
+    "splay_deg": 28.0,
+    "spread_m": 0.09,
+    "stems": 18,
+    "taper": 0.6,
+    "wander": 0.4,
     "width_m": 0.05
   },
   "variation": {
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

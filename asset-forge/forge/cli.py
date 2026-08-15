@@ -16,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import contact, kinds, parts as partslib, materials, pipeline, render, spec as specmod, vox, vxa
+from . import biomes as biomelib, contact, kinds, parts as partslib, materials, pipeline, render, spec as specmod, vox, vxa
 
 ROOT = Path(__file__).resolve().parent.parent
 SPECS = ROOT / "specs"
@@ -598,6 +598,39 @@ def cmd_selftest(args) -> int:
     for line in off:
         print(f"    ! {line}")
     ok &= not off
+
+    # A SPECIES MAY ONLY BE WEIGHTED INTO A BIOME THAT HOSTS ITS KIND.
+    #
+    # `spec.py` gates the app's sliders with `kinds=b.hosts`, which is a UI
+    # rule and not a validation one: `specmod.patch` will happily set
+    # `biomes.bare_rock` on a flower and `validate` returns no warning, so a
+    # spec can claim to live somewhere nothing of its kind can be placed. Two
+    # were doing exactly that when this was written -- `herb-robert` and
+    # `moss-cushion` on bare rock, which hosts no plant kind -- and neither had
+    # ever produced a diagnostic.
+    #
+    # This is cheap, so it runs under `--quick` too. It is also the check that
+    # will fire the next time somebody opens a `hosts` tuple and forgets that
+    # weights were authored against the old one.
+    astray = []
+    for p in spec_paths():
+        try:
+            s, _ = specmod.load(p)
+        except (OSError, ValueError):
+            continue        # the lattice check above already reports these
+        kind = specmod.get(s, "kind")
+        for bk, w in (s.get("biomes") or {}).items():
+            b = biomelib.BY_KEY.get(bk)
+            if b is None:
+                astray.append(f"{p.stem}: no such biome {bk!r}")
+            elif float(w) > 0.0 and kind not in b.hosts:
+                astray.append(f"{p.stem} ({kind}) is weighted {float(w):g} into "
+                              f"{bk}, which hosts {', '.join(b.hosts) or 'nothing'}")
+    print(f"  every species lives somewhere that hosts it: "
+          f"{'pass' if not astray else 'FAIL'}")
+    for line in astray:
+        print(f"    ! {line}")
+    ok &= not astray
 
     verdict = "PASS" if ok else "FAIL"
     if getattr(args, "quick", False):

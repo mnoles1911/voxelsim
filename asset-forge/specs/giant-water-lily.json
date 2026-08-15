@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.0,
     "ocean": 0.0,
-    "rainforest": 0.0,
+    "rainforest": 1.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.0,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.6,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "grass",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_jungle"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "giant-water-lily",
+  "notes": "THE BIGGEST LEAF IN THE LIBRARY AND THE RIM IS MISSING. A Victoria pad is two to three metres across (estimate) with a vertical UPTURNED LIP five to ten centimetres high all the way round, and that lip is the entire species -- it is what makes the pad a tray rather than a disc. `tuft.head` draws a flat bloom and there is no rim primitive at any lattice. Authored as a large plain pad.\n\n`tuft.head_m` CEILS AT 8.0 m, so the diameter itself is expressible with room to spare; it is set to 1.6 rather than the full 2-3 because a single-stem plant whose head is four times its own height reads as an umbrella, and because at 0.05 m voxels a 1.6 m disc is already 32 voxels across.\n\nFIVE STEMS, WHICH IS BOTANICALLY WRONG AND STRUCTURALLY NECESSARY. One pad per rootstock is the truth; one stem from one crown is the most fragile thing this generator makes and `tools/buildcheck.py` requires one connected piece. Five short thick stalks under five pads is a clump of the same plant and is what a stand looks like anyway.\n\n0.5-2 m, warm still backwater. Rainforest only.",
   "placement": {
-    "abundance": 0.6,
+    "abundance": 0.3,
     "cluster": 0.8,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 8.0,
+    "spacing_m": 2.6,
+    "water_max_m": 1.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
+    "arc": 0.62,
+    "base_m": 0.15,
     "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_frac": 0.1,
+    "head_m": 1.6,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 40.0,
+    "spread_m": 0.14,
+    "stems": 5,
+    "taper": 0.8,
+    "wander": 0.24,
+    "width_m": 0.06
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

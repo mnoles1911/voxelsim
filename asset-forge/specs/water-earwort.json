@@ -3,13 +3,13 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
-    "temperate_forest": 1.0,
-    "tundra_alpine": 0.0
+    "taiga": 0.9,
+    "temperate_forest": 0.4,
+    "tundra_alpine": 1.0
   },
   "bird": {
     "belly": 0.52,
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.2,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "grass",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -255,16 +255,16 @@
     "rock": "rock",
     "stem": "podzol"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "water-earwort",
+  "notes": "A LIVERWORT, WHICH IS NOT A MOSS, and the difference is visible: Scapania's leaves are folded in two and overlap flat in one plane like roof tiles, where a moss's spiral round the stem. Neither the fold nor the plane exists in the tuft generator, so what separates it from the two mosses here is what CAN be said -- it is flatter (`arc` 0.60, `splay_deg` 56, so it lies over rather than mounding), coarser (0.03 m stems against their 0.02) and a different colour.\n\nTHE COLOUR IS THE FIELD MARK AND IT IS THE USUAL PROBLEM. This liverwort is a dark reddish purple-brown -- the sign of an acid, metal-rich, nutrient-poor stream -- and there is no red in `materials.stem`'s seven land-vegetation choices. `podzol` (86,72,60) is the darkest brown and is the same compromise all four red algae in the saltwater file make.\n\nAUTHORED AT EXACTLY THE 0.20 m FLOOR against a real 0.02-0.05 m (estimate), which is 4x to 10x -- the largest enlargement anywhere in this pass. It is here because acid upland streams otherwise have nothing on their stones at all, and it is the last thing that should be authored rather than the first.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.7,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 50.0,
+    "spacing_m": 0.3,
+    "water_max_m": 1.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.6,
+    "base_m": 0.1,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.26,
+    "splay_deg": 56.0,
+    "spread_m": 0.09,
+    "stems": 38,
+    "taper": 0.7,
+    "wander": 0.36,
+    "width_m": 0.03
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

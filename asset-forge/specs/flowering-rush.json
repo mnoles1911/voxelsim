@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 1.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.8,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 1.2,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "flowering-rush",
+  "notes": "ONE TALL BARE STALK CARRYING A ROUND UMBEL OF PINK FLOWERS well above the leaves, which is a silhouette nothing else in the waterside set has -- every other flowering emergent here holds its flowers among its foliage. So the head is on a SMALL share of the stems (0.25) at a large diameter (0.16 m, three voxels) and the rest are plain leaves, which puts the pink where it belongs: a few discs floating above a green fan.\n\n`leaf_blossom` (226,168,190) is the palette's only pink and is very close to this species' actual colour. Third time in these two files that the palette has been right.\n\nThe leaves are triangular in section -- three-cornered, which is where the name comes from -- and the tuft generator has one cross-section. Not drawn.\n\n0-0.5 m at the margin of slow rivers and canals.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.5,
+    "cluster": 0.85,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 18.0,
+    "spacing_m": 0.8,
+    "water_max_m": 3.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
+    "arc": 0.34,
     "base_m": 0.11,
     "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_frac": 0.12,
+    "head_m": 0.16,
+    "head_share": 0.25,
+    "length_var": 0.34,
+    "splay_deg": 14.0,
+    "spread_m": 0.1,
+    "stems": 12,
+    "taper": 0.5,
+    "wander": 0.22,
+    "width_m": 0.035
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

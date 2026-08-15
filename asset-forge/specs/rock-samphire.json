@@ -1,14 +1,14 @@
 {
   "biomes": {
     "bare_rock": 0.0,
-    "beach": 0.0,
+    "beach": 1.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.0,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "skin_yellow",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,17 +253,17 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_needle"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "rock-samphire",
+  "notes": "THE PLANT OF THE SPLASH ZONE ITSELF -- above the highest seaweed and below the first grass, on bare cliff rock that is wetted by spray and never by tide. Nothing else in the library occupies that band.\n\nSUCCULENT, WHICH IS `width_m` AND `taper` TOGETHER. Its leaves are fat blue-green fingers, so the stems are wide (0.055) and barely taper (0.75), which is the same argument `glasswort` makes for its beads and the opposite of every grass in the library.\n\n`leaf_needle` (46,84,62) is the darkest, bluest green in the menu and is the nearest to a samphire's glaucous foliage. The flat umbel heads are `bloom` at 0.10 m on half the stems, which is what gives a flowering plant its leaves for free.\n\nSTEEP ROCK, AND THE BIOME IT ACTUALLY WANTS IS NOT OPEN TO IT. Rock samphire grows on sea-cliff faces, which the engine classifies as BARE ROCK once they pass a 70% grade -- and bare rock's `hosts` tuple is ('rock', 'bird', 'quadruped'), with `plantable` False. No plant kind is admitted there at all. So `biomes.bare_rock` is 0 and `placement.slope_max_pct` is set to 70, the ceiling, which puts the species on the steepest ground Beach itself reaches. That is the honest expressible half.\n\nNothing in `spec.validate` enforces this -- a weight on a biome that does not host the kind is accepted silently -- so it is a rule kept by hand and `tools/aquaticprobe.py --hosts` is what keeps it. The same rule costs `plumose-anemone` its ocean weight.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
-    "elev_max_m": 2000.0,
-    "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
+    "abundance": 0.5,
+    "cluster": 0.7,
+    "elev_max_m": 25.0,
+    "elev_min_m": 1.0,
+    "slope_max_pct": 70.0,
+    "spacing_m": 1.0,
     "water_max_m": 0.0
   },
   "quad": {
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
+    "arc": 0.36,
+    "base_m": 0.1,
     "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_frac": 0.2,
+    "head_m": 0.1,
+    "head_share": 0.5,
+    "length_var": 0.32,
+    "splay_deg": 34.0,
+    "spread_m": 0.09,
+    "stems": 14,
+    "taper": 0.75,
+    "wander": 0.3,
+    "width_m": 0.055
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

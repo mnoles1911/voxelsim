@@ -11,6 +11,8 @@ Why a marking can have a shape, and which sex you get: `docs/marine-marking-rese
 Which birds have a sex worth drawing, and which twelve do not: `docs/bird-dimorphism-research.md`.
 What fish colour needs from the engine: `docs/fish-colour-proposal.md`.
 How the heroes hid a defect behind a single seed: `docs/hero-sequoia-wood-detachment.md`.
+What grows and what lies on the bottom in salt and fresh water, and the three
+decisions behind it: `docs/aquatic-species.md`.
 
 ## The idea in one paragraph
 

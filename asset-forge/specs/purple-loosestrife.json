@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 1.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.9,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 1.2,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "plume_lilac",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "purple-loosestrife",
+  "notes": "THE ONE WATERSIDE FLOWER THAT COLOURS A WHOLE BANK, and the reason it is worth authoring over a dozen prettier ones is that it grows in dense single-species stands hundreds of metres long. One spec changes the colour of a river.\n\nA LONG DENSE SPIKE, WHICH IS THE EASIEST SHAPE IN THIS FILE. `head_frac` 0.38 makes the flower head over a third of the stem's length -- the longest in either aquatic file -- and `head_share` 0.75, because in a real stand nearly every shoot flowers. That is the opposite of every other species here and it is what makes a stand read as a block of colour.\n\n`plume_lilac` (166,132,208) against a real magenta: too blue, too pale, and the closest of the fourteen head materials. `plume_crimson` (208,40,56) is the alternative and is too red.\n\n0-0.2 m, and it also grows on wet ground well back from the water, hence `water_max_m` 6.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.8,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 25.0,
+    "spacing_m": 0.5,
+    "water_max_m": 6.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "arc": 0.14,
+    "base_m": 0.1,
+    "head": "spike",
+    "head_frac": 0.38,
+    "head_m": 0.1,
+    "head_share": 0.75,
+    "length_var": 0.32,
+    "splay_deg": 10.0,
+    "spread_m": 0.09,
+    "stems": 10,
+    "taper": 0.45,
+    "wander": 0.18,
+    "width_m": 0.035
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

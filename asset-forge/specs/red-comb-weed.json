@@ -1,14 +1,14 @@
 {
   "biomes": {
     "bare_rock": 0.0,
-    "beach": 0.0,
+    "beach": 0.4,
     "desert": 0.0,
-    "grassland": 0.4,
-    "ocean": 0.0,
+    "grassland": 0.0,
+    "ocean": 1.0,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.0,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.25,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "grass",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -255,15 +255,15 @@
     "rock": "rock",
     "stem": "podzol"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "red-comb-weed",
+  "notes": "THE SPECIES THAT MEASURED THE BUSH FLOOR. Authored first as a `bush`, it built 45, 133, 53, 162 and 123 voxels over seeds 1-5 -- a scribble, and the number that sent four species in this file to the tuft generator. `irish-moss` carries the full arithmetic; the short version is that `crown.radius_m` floors at 0.30 m and `growth.influence_m` at 0.40 m, both larger than this whole plant.\n\nCOMBED TO ONE SIDE, and that asymmetry is the species -- every branchlet comes off the same side of its parent, so the plant looks brushed. There is no handedness in the tuft generator either. `wander` 0.60 is the highest in this file and is what stands in: heavy sideways drift along every stem, which reads as combed-and-tangled rather than as combed-one-way. An honest half.\n\nVery fine (0.022 m, a one-voxel thread at 5 cm) and very numerous, which is the other half of what a Plocamium looks like. The fourth and last of the red algae that cannot be red -- `podzol` again.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
-    "elev_max_m": 2000.0,
-    "elev_min_m": 0.0,
+    "abundance": 0.5,
+    "cluster": 0.9,
+    "elev_max_m": 0.0,
+    "elev_min_m": -10.0,
     "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
+    "spacing_m": 0.35,
     "water_max_m": 0.0
   },
   "quad": {
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.45,
+    "base_m": 0.08,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.34,
+    "splay_deg": 30.0,
+    "spread_m": 0.07,
+    "stems": 34,
+    "taper": 0.8,
+    "wander": 0.6,
+    "width_m": 0.022
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

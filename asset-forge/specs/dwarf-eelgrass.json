@@ -1,14 +1,14 @@
 {
   "biomes": {
     "bare_rock": 0.0,
-    "beach": 0.0,
+    "beach": 1.0,
     "desert": 0.0,
-    "grassland": 0.4,
-    "ocean": 0.0,
+    "grassland": 0.0,
+    "ocean": 0.5,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.0,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.22,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "grass",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -253,17 +253,17 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_needle"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "dwarf-eelgrass",
+  "notes": "AUTHORED UP, WITH THE ARITHMETIC. Real dwarf eelgrass is roughly 0.10-0.20 m (an estimate); the owner's floor is 0.20, so this is 0.22 -- between 1.1x and 2.2x, and at the top of its real range it is not an authored-up at all. The cheapest of the three enlargements in this file.\n\nIT IS THE ONE SEAGRASS A PLAYER WALKS ON. The other four are under water permanently; dwarf eelgrass carpets estuarine mudflats and is exposed at every low tide, which makes it the seagrass most likely to be seen close up and the reason it is worth authoring at all at this size.\n\nVery fine and very dense: 36 stems at 0.02 m, the highest count in the file.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
-    "elev_max_m": 2000.0,
-    "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
+    "abundance": 1.0,
+    "cluster": 1.0,
+    "elev_max_m": 3.0,
+    "elev_min_m": -3.0,
+    "slope_max_pct": 20.0,
+    "spacing_m": 0.2,
     "water_max_m": 0.0
   },
   "quad": {
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.52,
+    "base_m": 0.1,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 22.0,
+    "spread_m": 0.09,
+    "stems": 36,
+    "taper": 0.75,
+    "wander": 0.3,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

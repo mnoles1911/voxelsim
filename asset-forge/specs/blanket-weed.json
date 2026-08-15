@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 1.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
     "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "temperate_forest": 0.8,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.4,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "grass",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "grass"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "blanket-weed",
+  "notes": "THE SIGN THAT SOMETHING IS WRONG. Cladophora blooms when a watercourse is over-enriched, and a river choked with blanket weed is a river with fertiliser in it -- which makes this the one plant in either aquatic file whose presence is information rather than scenery.\n\nFILAMENTS, WHICH IS THE ONE THING A TUFT DRAWS PERFECTLY. It is unbranched threads from an attachment point, and a tuft is a spray of stems from a crown; no forking, no whorls, no blades, nothing missing. It and the anemones in the saltwater file are the only species in this pass that lose nothing to the generator.\n\nThe finest and most numerous thing here: 52 stems at 0.02 m -- a one-voxel thread at 5 cm -- arced 0.82 so they stream, with `wander` 0.55 so they tangle. Real filaments are 0.1 mm and there are millions; this is fifty threads at two hundred times life thickness, and it is the mass that reads.\n\nAttached to stone in 0.1-1 m of slow enriched water.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.7,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 30.0,
+    "spacing_m": 0.3,
+    "water_max_m": 1.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.82,
+    "base_m": 0.08,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.4,
+    "splay_deg": 40.0,
+    "spread_m": 0.07,
+    "stems": 52,
+    "taper": 0.85,
+    "wander": 0.55,
+    "width_m": 0.02
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

@@ -3,11 +3,11 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.8,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
+    "taiga": 0.6,
     "temperate_forest": 1.0,
     "tundra_alpine": 0.0
   },
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.4,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "skin_yellow",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "yellow-water-lily",
+  "notes": "THE ONE FLOATING-LEAVED PLANT WHOSE FLOWER THIS GENERATOR CAN ACTUALLY DRAW, and that is why it is authored the opposite way round from the white lily beside it. A Nuphar's flower is a hard yellow globe held ten centimetres CLEAR of the water on a thick stalk -- it is not lying on the surface -- which is exactly what a `bloom` head on a stiff stem is. So this one gets a real flower at `skin_yellow`, on 40% of the stems, and the pads are the other 60% drawn as plain wide stems.\n\nThe pair is deliberate: a white lily authored as pads and a yellow lily authored as flowers, which between them cover the two things a `flower` spec can be and neither of which is both.\n\nLarger and more leathery than the white lily, and it tolerates moving water and shade, so it takes the taiga weight the white one does not. 0.5-3 m.",
   "placement": {
     "abundance": 0.6,
-    "cluster": 0.8,
+    "cluster": 0.9,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 12.0,
+    "spacing_m": 1.1,
+    "water_max_m": 1.0
   },
   "quad": {
     "belly": 0.52,
@@ -411,16 +411,16 @@
     "arc": 0.72,
     "base_m": 0.11,
     "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_frac": 0.14,
+    "head_m": 0.11,
+    "head_share": 0.4,
+    "length_var": 0.34,
+    "splay_deg": 48.0,
+    "spread_m": 0.1,
+    "stems": 11,
+    "taper": 0.8,
+    "wander": 0.32,
+    "width_m": 0.045
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

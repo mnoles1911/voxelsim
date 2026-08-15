@@ -1,6 +1,6 @@
 {
   "biomes": {
-    "bare_rock": 0.25,
+    "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
     "grassland": 0.9,
@@ -256,7 +256,7 @@
     "stem": "leaf_jungle"
   },
   "name": "moss-cushion",
-  "notes": "AUTHORED AT 0.22 m AGAINST THE BIOME LIST'S APPROXIMATE 0.06 m, which is the same departure `feather-moss` records and carries the same open question: at 5 cm a real moss cushion is ONE VOXEL, and a one-voxel mat is not an object -- it is the top of the ground, and the honest implementation may be a terrain surface material. This spec does not close that question. It is authored because a grassland with no moss in its hollows is bare in exactly the places that should not be.\n\nA CUSHION AND NOT A CARPET, which is what separates it from `feather-moss` and `woolly-fringe-moss`: those two tile to cover ground, and a moss cushion is a discrete dome sitting in a hollow or in a stone's lee with bare ground around it. The shape is the highest stem count in the flower file on a narrow crown with a steep splay and a hard arc; the distinction from the carpets lives in placement, not in geometry.\n\nSPACING 0.35 m, BELOW THE OLD 0.5 FLOOR AND MEANT: one cushion is 10-20 cm across, so 0.35 m is two cushion widths and lets a group of them gather in one hollow without fusing into a sheet. Clustering is high and abundance is middling, which is how a scatterer produces patches rather than a lawn.",
+  "notes": "AUTHORED AT 0.22 m AGAINST THE BIOME LIST'S APPROXIMATE 0.06 m, which is the same departure `feather-moss` records and carries the same open question: at 5 cm a real moss cushion is ONE VOXEL, and a one-voxel mat is not an object -- it is the top of the ground, and the honest implementation may be a terrain surface material. This spec does not close that question. It is authored because a grassland with no moss in its hollows is bare in exactly the places that should not be.\n\nA CUSHION AND NOT A CARPET, which is what separates it from `feather-moss` and `woolly-fringe-moss`: those two tile to cover ground, and a moss cushion is a discrete dome sitting in a hollow or in a stone's lee with bare ground around it. The shape is the highest stem count in the flower file on a narrow crown with a steep splay and a hard arc; the distinction from the carpets lives in placement, not in geometry.\n\nSPACING 0.35 m, BELOW THE OLD 0.5 FLOOR AND MEANT: one cushion is 10-20 cm across, so 0.35 m is two cushion widths and lets a group of them gather in one hollow without fusing into a sheet. Clustering is high and abundance is middling, which is how a scatterer produces patches rather than a lawn. Bare-rock weight zeroed (was 0.25): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
   "placement": {
     "abundance": 0.6,
     "cluster": 0.9,

@@ -3,13 +3,13 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.5,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
-    "temperate_forest": 1.0,
-    "tundra_alpine": 0.0
+    "taiga": 1.0,
+    "temperate_forest": 0.9,
+    "tundra_alpine": 0.5
   },
   "bird": {
     "belly": 0.52,
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 0.9,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "reed",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_needle"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "water-horsetail",
+  "notes": "THE SIMPLEST SHAPE IN THIS FILE AND THE ONE THE GENERATOR GETS EXACTLY RIGHT. Equisetum fluviatile is a bare unbranched hollow tube standing vertically out of the water with essentially no leaves -- which is a tuft stem, unmodified. `arc` 0.06 and `splay_deg` 4 are the stiffest and most vertical settings in either aquatic file.\n\n`wood-horsetail` ALREADY SHIPS AND IS A DIFFERENT PLANT: that one is the branched forest-floor species with whorls of side shoots. This one is the unbranched aquatic species that stands in half a metre of water, and the two look nothing alike -- one is a bottle brush and one is a bundle of straws.\n\nThe dark joints every few centimetres are the field mark and there is no banding on a tuft stem at any lattice. `taper` 0.92 is the highest in the file, because a horsetail is the same diameter for its whole length and then simply ends.\n\nTHIRTEEN STEMS IN A 0.17 m CROWN AND THE FIRST DRAFT HAD TWENTY-TWO IN 0.11, WHICH RENDERED AS A SOLID BLOCK. At 5 cm a 0.03 m stem is one voxel; twenty-two of them rooted in a 0.11 m disc are 2.2 voxels apart on average and the gaps close. `tools/lattice_ab.py` measured that effect for grass generally -- at 5 cm a tuft stops being blades and becomes a clump -- and for most species here that is the intended look. It is NOT the intended look for a horsetail, whose whole identity is separate bare tubes with water visible between them. Fewer stems in a wider crown is the fix, and it is the general answer whenever a species is about its gaps.\n\n0.2-1 m of water, and it is the emergent that goes DEEPEST of the ones here.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.8,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 15.0,
+    "spacing_m": 0.4,
+    "water_max_m": 2.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
+    "arc": 0.06,
+    "base_m": 0.18,
+    "head": "none",
     "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_m": 0.12,
+    "head_share": 1.0,
+    "length_var": 0.3,
+    "splay_deg": 5.0,
+    "spread_m": 0.17,
+    "stems": 13,
+    "taper": 0.92,
+    "wander": 0.1,
+    "width_m": 0.03
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

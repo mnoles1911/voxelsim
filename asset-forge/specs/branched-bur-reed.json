@@ -3,11 +3,11 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 0.9,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
+    "taiga": 0.5,
     "temperate_forest": 1.0,
     "tundra_alpine": 0.0
   },
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 1.0,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "reed",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "leaf_dry",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "branched-bur-reed",
+  "notes": "THE BURRS ARE SPHERES AND `tuft.head` DRAWS ONE PER STEM. A Sparganium carries several spiky green balls SCATTERED ALONG a zig-zag stem, and a tuft head sits on the top of a stem and nowhere else -- the same along-the-stem gap that costs the giant kelp its blades and five submerged species their whorls. So each stem gets one terminal burr instead of four spaced ones, and the stem count (17) stands in for the scatter.\n\nThe zig-zag itself is `wander` 0.42, which is sideways drift along a stem rather than a real kink, and is the closest thing available.\n\n`head` is 'bloom' rather than 'spike' because a burr is round and a spike is a cylinder, and roundness is the readable half of the field mark.\n\n0-0.5 m at the margin, often in slightly moving water where the cattail will not go.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.7,
+    "cluster": 0.95,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 18.0,
+    "spacing_m": 0.5,
+    "water_max_m": 3.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
+    "arc": 0.3,
     "base_m": 0.11,
     "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "head_frac": 0.1,
+    "head_m": 0.07,
+    "head_share": 0.5,
+    "length_var": 0.34,
+    "splay_deg": 16.0,
+    "spread_m": 0.1,
+    "stems": 17,
+    "taper": 0.55,
+    "wander": 0.42,
+    "width_m": 0.03
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,

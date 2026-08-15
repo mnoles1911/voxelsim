@@ -3,12 +3,12 @@
     "bare_rock": 0.0,
     "beach": 0.0,
     "desert": 0.0,
-    "grassland": 0.4,
+    "grassland": 1.0,
     "ocean": 0.0,
     "rainforest": 0.0,
     "savanna": 0.0,
-    "taiga": 0.0,
-    "temperate_forest": 1.0,
+    "taiga": 0.6,
+    "temperate_forest": 0.9,
     "tundra_alpine": 0.0
   },
   "bird": {
@@ -204,7 +204,7 @@
     "step_m": 0.35,
     "tip_radius_m": 0.045
   },
-  "height_m": 0.35,
+  "height_m": 2.2,
   "herd": {
     "cover": "any",
     "despawn_delay_s": 20.0,
@@ -216,7 +216,7 @@
     "size_min": 1,
     "spread_m": 30.0
   },
-  "kind": "flower",
+  "kind": "reed",
   "materials": {
     "bark": "bark",
     "bird_alt_back": "same",
@@ -242,7 +242,7 @@
     "fish_flank": "skin_silver",
     "fish_patch": "skin_pale",
     "fish_pattern": "skin_dark",
-    "head": "leaf_blossom",
+    "head": "leaf_autumn",
     "leaf": "leaf_broadleaf",
     "quad_back": "skin_brown",
     "quad_belly": "skin_pale",
@@ -253,18 +253,18 @@
     "quad_mark": "skin_dark",
     "quad_tail": "skin_brown",
     "rock": "rock",
-    "stem": "podzol"
+    "stem": "leaf_broadleaf"
   },
-  "name": "herb-robert",
-  "notes": "THE RED STEM IS THE SPECIES AND THE STEM PALETTE HAS NO RED. `materials.stem` offers seven choices and six are greens, a straw and a savanna tan; `podzol` is the seventh and it is a red-brown soil colour, which is the nearest thing available and is duller and browner than the plant. A red or purple STEM material is a one-row choice-list ask and this species is the argument for it -- the same shape of ask `snowberry` records for a white leaf.\n\nSprawling rather than upright: high splay, high arc, many fine stems out of a wide crown, so it lies over rock and wall bases instead of standing. The finely cut leaves are sub-voxel and are not attempted; the small hard pink flowers are, and they sit on the sprawl. Bare-rock weight zeroed (was 0.2): that biome hosts rock, bird and quadruped only, so nothing of this kind can be placed there. Moss and crevice herbs do grow on rock faces -- if bare rock is opened to plant kinds, put this weight back.",
+  "name": "broadleaf-cattail",
+  "notes": "THE MOST RECOGNISABLE WATERSIDE PLANT THERE IS AND THE LIBRARY DID NOT HAVE IT. `bulrush` ships with 'shorter, thicker stems with a fat dark head' and `water-reed` with 'tall near-vertical waterside stems with seed heads'; neither is a Typha, whose head is a dense velvet-brown CYLINDER 15-20 cm long and 2-3 cm thick on an otherwise bare stalk. That silhouette is unmistakable and unmatched by anything shipped.\n\n`head_m` IS 0.09 AND THE HONEST FIGURE IS 0.02, AND THE RENDER IS WHY. A real cigar is 2-3 cm thick (estimate). At 0.05 m -- already twice life size, because one voxel is the floor -- the head is ONE voxel across, and on a contact sheet it came out as a scatter of loose dots up the stem rather than as a cylinder. At 0.09 it is two voxels and reads as a cigar. That is roughly four times life thickness.\n\nTWO VOXELS IS THE FLOOR FOR ANYTHING THAT HAS TO READ AS A SHAPE RATHER THAN AS INK, which is the same conclusion `docs/fish-shape-research.md` reached for a shaped colour boundary and `docs/bird-shape-research.md` for a bill. Written down because it is exactly the kind of number someone later halves back to life size and quietly destroys.\n\n`head_frac` 0.11 puts it in the top 24 cm of a 2.2 m stem.\n\n`head_share` 0.35: two thirds of the shoots in a real stand are sterile leaf fans with no cigar at all, and that mix is what a cattail bed looks like.\n\n0-0.5 m of water at the margin; it will not grow in deep water and it dominates everything shallower.",
   "placement": {
-    "abundance": 0.6,
-    "cluster": 0.8,
+    "abundance": 0.9,
+    "cluster": 1.0,
     "elev_max_m": 2000.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 60.0,
-    "spacing_m": 0.7,
-    "water_max_m": 0.0
+    "slope_max_pct": 15.0,
+    "spacing_m": 0.5,
+    "water_max_m": 2.0
   },
   "quad": {
     "belly": 0.52,
@@ -408,19 +408,19 @@
     "wander": 0.15
   },
   "tuft": {
-    "arc": 0.72,
-    "base_m": 0.11,
-    "head": "bloom",
-    "head_frac": 0.22,
-    "head_m": 0.08,
-    "head_share": 0.45,
-    "length_var": 0.35,
-    "splay_deg": 50.0,
-    "spread_m": 0.11,
-    "stems": 16,
-    "taper": 0.65,
-    "wander": 0.5,
-    "width_m": 0.05
+    "arc": 0.16,
+    "base_m": 0.13,
+    "head": "spike",
+    "head_frac": 0.11,
+    "head_m": 0.09,
+    "head_share": 0.35,
+    "length_var": 0.32,
+    "splay_deg": 8.0,
+    "spread_m": 0.12,
+    "stems": 14,
+    "taper": 0.6,
+    "wander": 0.18,
+    "width_m": 0.045
   },
   "variation": {
     "amount": 1.0,
@@ -428,7 +428,7 @@
     "density": 0.25,
     "droop": 0.4,
     "foliage": 0.35,
-    "height": 0.26,
+    "height": 0.28,
     "lean_deg": 10.0,
     "lopsided": 0.45,
     "proportion": 0.2,
