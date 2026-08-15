@@ -1,0 +1,2041 @@
+{
+  "addax": {
+    "belly_over_length": 0.4554,
+    "fit_quality": "report-only",
+    "height_over_length": 0.9548,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "3bcb8f2b.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Addax nasomaculatus",
+    "slender": 0.1289,
+    "slender_max": 0.1673,
+    "slender_min": 0.0906,
+    "slender_spread": 0.5942,
+    "trunk_over_length": 0.2067,
+    "used": [
+      "addax/b92ddc05.png",
+      "addax/c17ae54d.png"
+    ]
+  },
+  "african-bush-elephant": {
+    "belly_over_length": 0.4017,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7204,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 6,
+    "refused": [
+      {
+        "file": "51c89c19.png",
+        "why": "height/length 1.89 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Loxodonta africana",
+    "slender": 0.2011,
+    "slender_max": 0.2634,
+    "slender_min": 0.134,
+    "slender_spread": 0.6436,
+    "trunk_over_length": 0.2508,
+    "used": [
+      "african-bush-elephant/2a070808.png",
+      "african-bush-elephant/62398ac0.png",
+      "african-bush-elephant/80db1004.png",
+      "african-bush-elephant/910d853a.png",
+      "african-bush-elephant/c3452989.png",
+      "african-bush-elephant/fb84ef24.png"
+    ]
+  },
+  "african-forest-elephant": {
+    "belly_over_length": 0.3607,
+    "fit_quality": "report-only",
+    "height_over_length": 0.625,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Loxodonta cyclotis",
+    "slender": 0.2613,
+    "slender_max": 0.2613,
+    "slender_min": 0.2613,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2246,
+    "used": [
+      "african-forest-elephant/0489d246.png"
+    ]
+  },
+  "african-wild-dog": {
+    "belly_over_length": 0.4825,
+    "fit_quality": "fit",
+    "height_over_length": 1.0745,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "41e86fdc.png",
+        "why": "height/length 1.76 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Lycaon pictus",
+    "slender": 0.1698,
+    "slender_max": 0.198,
+    "slender_min": 0.1416,
+    "slender_spread": 0.3325,
+    "trunk_over_length": 0.4131,
+    "used": [
+      "african-wild-dog/832e5f72.png",
+      "african-wild-dog/c974b08c.png"
+    ]
+  },
+  "alpaca": {
+    "belly_over_length": 0.5129,
+    "fit_quality": "fit",
+    "height_over_length": 1.3224,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Vicugna pacos",
+    "slender": 0.262,
+    "slender_max": 0.3173,
+    "slender_min": 0.2067,
+    "slender_spread": 0.4225,
+    "trunk_over_length": 0.4725,
+    "used": [
+      "alpaca/5629fe18.png",
+      "alpaca/ec7b0ed8.png"
+    ]
+  },
+  "alpine-ibex": {
+    "belly_over_length": 0.3966,
+    "fit_quality": "report-only",
+    "height_over_length": 1.0085,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Capra ibex",
+    "slender": 0.1229,
+    "slender_max": 0.1229,
+    "slender_min": 0.1229,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.3106,
+    "used": [
+      "alpine-ibex/2b07a361.png"
+    ]
+  },
+  "american-bison": {
+    "belly_over_length": 0.293,
+    "fit_quality": "fit",
+    "height_over_length": 0.6758,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Bison bison",
+    "slender": 0.2216,
+    "slender_max": 0.2747,
+    "slender_min": 0.1753,
+    "slender_spread": 0.4488,
+    "trunk_over_length": 0.3281,
+    "used": [
+      "american-bison/d44d834e.png",
+      "american-bison/d65f6782.png",
+      "american-bison/dbf2f035.png"
+    ]
+  },
+  "american-black-bear": {
+    "belly_over_length": 0.2486,
+    "fit_quality": "fit",
+    "height_over_length": 0.6866,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "363a5d99.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "aa777f28.png",
+        "why": "height/length 2.14 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Ursus americanus",
+    "slender": 0.3852,
+    "slender_max": 0.4627,
+    "slender_min": 0.3077,
+    "slender_spread": 0.4024,
+    "trunk_over_length": 0.3604,
+    "used": [
+      "american-black-bear/369a7880.png",
+      "american-black-bear/5a5dafa2.png"
+    ]
+  },
+  "arctic-fox": {
+    "belly_over_length": 0.2744,
+    "fit_quality": "fit",
+    "height_over_length": 0.7331,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Vulpes lagopus",
+    "slender": 0.2342,
+    "slender_max": 0.2922,
+    "slender_min": 0.1763,
+    "slender_spread": 0.4945,
+    "trunk_over_length": 0.2881,
+    "used": [
+      "arctic-fox/8db421ba.png",
+      "arctic-fox/8e5dfa51.png"
+    ]
+  },
+  "bengal-tiger": {
+    "belly_over_length": 0.3099,
+    "fit_quality": "report-only",
+    "height_over_length": 0.474,
+    "n_refused": 3,
+    "n_refused_by_hand": 0,
+    "n_usable": 7,
+    "refused": [
+      {
+        "file": "135296df.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "13f2f985.png",
+        "why": "belly at 0.05 of length -- leg gap implausible"
+      },
+      {
+        "file": "54700084.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Panthera tigris",
+    "slender": 0.2628,
+    "slender_max": 0.3823,
+    "slender_min": 0.1217,
+    "slender_spread": 0.9916,
+    "trunk_over_length": 0.1888,
+    "used": [
+      "bengal-tiger/2d866913.png",
+      "bengal-tiger/9b08d795.png",
+      "bengal-tiger/9e72c215.png",
+      "bengal-tiger/a02b9a9a.png",
+      "bengal-tiger/cb44ff49.png",
+      "bengal-tiger/e148eabb.png",
+      "bengal-tiger/e19dbcad.png"
+    ]
+  },
+  "bighorn-sheep": {
+    "belly_over_length": 0.3109,
+    "fit_quality": "report-only",
+    "height_over_length": 0.863,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Ovis canadensis",
+    "slender": 0.1937,
+    "slender_max": 0.3054,
+    "slender_min": 0.0819,
+    "slender_spread": 1.1539,
+    "trunk_over_length": 0.3161,
+    "used": [
+      "bighorn-sheep/b7344c53.png",
+      "bighorn-sheep/d4a64b49.png"
+    ]
+  },
+  "blue-wildebeest": {
+    "belly_over_length": 0.4399,
+    "fit_quality": "fit",
+    "height_over_length": 0.7688,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Connochaetes taurinus",
+    "slender": 0.1126,
+    "slender_max": 0.1261,
+    "slender_min": 0.0992,
+    "slender_spread": 0.2389,
+    "trunk_over_length": 0.2256,
+    "used": [
+      "blue-wildebeest/10e283ad.png",
+      "blue-wildebeest/a1076575.png"
+    ]
+  },
+  "bobcat": {
+    "belly_over_length": 0.2913,
+    "fit_quality": "fit",
+    "height_over_length": 0.5742,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Lynx rufus",
+    "slender": 0.2641,
+    "slender_max": 0.2745,
+    "slender_min": 0.1523,
+    "slender_spread": 0.4626,
+    "trunk_over_length": 0.237,
+    "used": [
+      "bobcat/66a4f6c2.png",
+      "bobcat/ab6cfd4f.png",
+      "bobcat/b48db64c.png"
+    ]
+  },
+  "brown-bear": {
+    "belly_over_length": 0.2857,
+    "fit_quality": "fit",
+    "height_over_length": 0.6868,
+    "n_refused": 1,
+    "n_refused_by_hand": 1,
+    "n_usable": 4,
+    "refused": [
+      {
+        "file": "43e82541.png",
+        "why": "height/length 2.01 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [
+      {
+        "file": "c7fbe213.png",
+        "why": "rearing; the forelimbs are off the ground entirely."
+      }
+    ],
+    "scientific_name": "Ursus arctos",
+    "slender": 0.4277,
+    "slender_max": 0.4839,
+    "slender_min": 0.3157,
+    "slender_spread": 0.3933,
+    "trunk_over_length": 0.351,
+    "used": [
+      "brown-bear/0cd82109.png",
+      "brown-bear/5629fae2.png",
+      "brown-bear/7f543d16.png",
+      "brown-bear/8cab53e9.png"
+    ]
+  },
+  "cape-buffalo": {
+    "belly_over_length": 0.3192,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7667,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Syncerus caffer",
+    "slender": 0.1276,
+    "slender_max": 0.167,
+    "slender_min": 0.0882,
+    "slender_spread": 0.6176,
+    "trunk_over_length": 0.3595,
+    "used": [
+      "cape-buffalo/414644c7.png",
+      "cape-buffalo/65c4a9b3.png"
+    ]
+  },
+  "caracal": {
+    "belly_over_length": 0.456,
+    "fit_quality": "fit",
+    "height_over_length": 0.9182,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Caracal caracal",
+    "slender": 0.2911,
+    "slender_max": 0.3584,
+    "slender_min": 0.2238,
+    "slender_spread": 0.4625,
+    "trunk_over_length": 0.2453,
+    "used": [
+      "caracal/0495f1b4.png",
+      "caracal/22f9f707.png"
+    ]
+  },
+  "cheetah": {
+    "belly_over_length": 0.2559,
+    "fit_quality": "fit",
+    "height_over_length": 0.429,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [
+      {
+        "file": "36338b79.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      },
+      {
+        "file": "981961da.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Acinonyx jubatus",
+    "slender": 0.2402,
+    "slender_max": 0.2666,
+    "slender_min": 0.183,
+    "slender_spread": 0.3478,
+    "trunk_over_length": 0.1209,
+    "used": [
+      "cheetah/0f43b377.png",
+      "cheetah/6290407d.png",
+      "cheetah/b660d937.png"
+    ]
+  },
+  "chimpanzee": {
+    "belly_over_length": 0.6,
+    "fit_quality": "report-only",
+    "height_over_length": 0.9251,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "2f7da8c8.png",
+        "why": "belly at 0.63 of length -- leg gap implausible"
+      },
+      {
+        "file": "7133ab33.png",
+        "why": "belly at 0.91 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Pan troglodytes",
+    "slender": 0.3034,
+    "slender_max": 0.3034,
+    "slender_min": 0.3034,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2801,
+    "used": [
+      "chimpanzee/34f93016.png"
+    ]
+  },
+  "coati": {
+    "belly_over_length": 0.252,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7917,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Nasua narica",
+    "slender": 0.2401,
+    "slender_max": 0.2401,
+    "slender_min": 0.2401,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1139,
+    "used": [
+      "coati/2419a5cb.png"
+    ]
+  },
+  "common-frog": {
+    "belly_over_length": 0.2057,
+    "fit_quality": "fit",
+    "height_over_length": 0.4206,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Mustela lutreola",
+    "slender": 0.4285,
+    "slender_max": 0.4788,
+    "slender_min": 0.3782,
+    "slender_spread": 0.2346,
+    "trunk_over_length": 0.1699,
+    "used": [
+      "common-frog/3a403599.png",
+      "common-frog/f5e7b7ea.png"
+    ]
+  },
+  "corsac-fox": {
+    "belly_over_length": 0.2552,
+    "fit_quality": "fit",
+    "height_over_length": 0.7552,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Vulpes corsac",
+    "slender": 0.2141,
+    "slender_max": 0.2824,
+    "slender_min": 0.2015,
+    "slender_spread": 0.3779,
+    "trunk_over_length": 0.2871,
+    "used": [
+      "corsac-fox/40a5954e.png",
+      "corsac-fox/b8ceb3e3.png",
+      "corsac-fox/c669db3a.png"
+    ]
+  },
+  "coyote": {
+    "belly_over_length": 0.3612,
+    "fit_quality": "fit",
+    "height_over_length": 0.7195,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 6,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Canis latrans",
+    "slender": 0.167,
+    "slender_max": 0.2203,
+    "slender_min": 0.1366,
+    "slender_spread": 0.5012,
+    "trunk_over_length": 0.2319,
+    "used": [
+      "coyote/171a1fd1.png",
+      "coyote/3492f4ca.png",
+      "coyote/5a0398e3.png",
+      "coyote/d451e353.png",
+      "coyote/da5faa63.png",
+      "coyote/f787cef9.png"
+    ]
+  },
+  "dingo": {
+    "belly_over_length": 0.4318,
+    "fit_quality": "report-only",
+    "height_over_length": 0.8775,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 7,
+    "refused": [
+      {
+        "file": "3c534a59.png",
+        "why": "belly at 0.72 of length -- leg gap implausible"
+      },
+      {
+        "file": "7e0de747.png",
+        "why": "belly at 0.67 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Canis dingo",
+    "slender": 0.1617,
+    "slender_max": 0.2199,
+    "slender_min": 0.1041,
+    "slender_spread": 0.7161,
+    "trunk_over_length": 0.3099,
+    "used": [
+      "dingo/09b969ae.png",
+      "dingo/22689036.png",
+      "dingo/4b31c74e.png",
+      "dingo/6f3ebbc6.png",
+      "dingo/77acd947.png",
+      "dingo/a5fa0f4e.png",
+      "dingo/b29da1d8.png"
+    ]
+  },
+  "dromedary-camel": {
+    "belly_over_length": 0.4345,
+    "fit_quality": "fit",
+    "height_over_length": 0.7871,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Camelus dromedarius",
+    "slender": 0.121,
+    "slender_max": 0.1533,
+    "slender_min": 0.105,
+    "slender_spread": 0.3989,
+    "trunk_over_length": 0.2658,
+    "used": [
+      "dromedary-camel/93c5e5b0.png",
+      "dromedary-camel/d3aa9186.png",
+      "dromedary-camel/e52676dd.png"
+    ]
+  },
+  "eastern-chipmunk": {
+    "belly_over_length": 0.4049,
+    "fit_quality": "report-only",
+    "height_over_length": 0.9316,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Tamias striatus",
+    "slender": 0.3392,
+    "slender_max": 0.3392,
+    "slender_min": 0.3392,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.4368,
+    "used": [
+      "eastern-chipmunk/6239499e.png"
+    ]
+  },
+  "eastern-grey-kangaroo": {
+    "belly_over_length": 0.3184,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5953,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Macropus giganteus",
+    "slender": 0.2213,
+    "slender_max": 0.2213,
+    "slender_min": 0.2213,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2355,
+    "used": [
+      "eastern-grey-kangaroo/624e3d80.png"
+    ]
+  },
+  "elk-wapiti": {
+    "belly_over_length": 0.3409,
+    "fit_quality": "fit",
+    "height_over_length": 1.0998,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Cervus elaphus",
+    "slender": 0.1197,
+    "slender_max": 0.125,
+    "slender_min": 0.1144,
+    "slender_spread": 0.0886,
+    "trunk_over_length": 0.2842,
+    "used": [
+      "elk-wapiti/72f2f997.png",
+      "elk-wapiti/cc03f5c2.png"
+    ]
+  },
+  "eurasian-lynx": {
+    "belly_over_length": 0.3001,
+    "fit_quality": "fit",
+    "height_over_length": 0.7975,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 4,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Lynx lynx",
+    "slender": 0.3095,
+    "slender_max": 0.3407,
+    "slender_min": 0.2277,
+    "slender_spread": 0.3649,
+    "trunk_over_length": 0.2943,
+    "used": [
+      "eurasian-lynx/20442a12.png",
+      "eurasian-lynx/27a2173a.png",
+      "eurasian-lynx/72166d2d.png",
+      "eurasian-lynx/b2656d2a.png"
+    ]
+  },
+  "european-badger": {
+    "belly_over_length": 0.1608,
+    "fit_quality": "report-only",
+    "height_over_length": 0.4922,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Meles meles",
+    "slender": 0.4884,
+    "slender_max": 0.6934,
+    "slender_min": 0.2738,
+    "slender_spread": 0.8591,
+    "trunk_over_length": 0.2845,
+    "used": [
+      "european-badger/0c32ffbe.png",
+      "european-badger/39f78b1e.png",
+      "european-badger/a1c1c74f.png"
+    ]
+  },
+  "european-bison": {
+    "belly_over_length": 0.4993,
+    "fit_quality": "report-only",
+    "height_over_length": 0.6341,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Bison bonasus",
+    "slender": 0.5398,
+    "slender_max": 0.5398,
+    "slender_min": 0.5398,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.0833,
+    "used": [
+      "european-bison/3d1dc9ef.png"
+    ]
+  },
+  "european-mole": {
+    "belly_over_length": 0.127,
+    "fit_quality": "report-only",
+    "height_over_length": 0.3763,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "0465d81c.png",
+        "why": "height/length 0.34 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Talpa europaea",
+    "slender": 0.5029,
+    "slender_max": 0.5029,
+    "slender_min": 0.5029,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2181,
+    "used": [
+      "european-mole/823fa387.png"
+    ]
+  },
+  "european-polecat": {
+    "belly_over_length": 0.1772,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7792,
+    "n_refused": 3,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [
+      {
+        "file": "0070ddbf.png",
+        "why": "limb thickness/length 1.39 -- implausible"
+      },
+      {
+        "file": "a67f24a9.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      },
+      {
+        "file": "f9fafdbd.png",
+        "why": "belly at 0.01 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Mustela putorius",
+    "slender": 0.4909,
+    "slender_max": 0.5764,
+    "slender_min": 0.2478,
+    "slender_spread": 0.6695,
+    "trunk_over_length": 0.2285,
+    "used": [
+      "european-polecat/20d4e0a3.png",
+      "european-polecat/592c3569.png",
+      "european-polecat/914634bc.png"
+    ]
+  },
+  "european-rabbit": {
+    "belly_over_length": 0.2904,
+    "fit_quality": "report-only",
+    "height_over_length": 0.985,
+    "n_refused": 1,
+    "n_refused_by_hand": 1,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "ad7d2a9d.png",
+        "why": "limb thickness/length 0.94 -- implausible"
+      }
+    ],
+    "refused_by_hand": [
+      {
+        "file": "d71fcd12.png",
+        "why": "crouched, hocks on the ground; belly height is not leg length."
+      }
+    ],
+    "scientific_name": "Oryctolagus cuniculus",
+    "slender": 0.2251,
+    "slender_max": 0.2251,
+    "slender_min": 0.2251,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.3815,
+    "used": [
+      "european-rabbit/1e15411c.png"
+    ]
+  },
+  "european-wildcat": {
+    "belly_over_length": 0.3991,
+    "fit_quality": "fit",
+    "height_over_length": 0.765,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "17b7a839.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      },
+      {
+        "file": "e850db21.png",
+        "why": "height/length 2.13 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Felis silvestris",
+    "slender": 0.254,
+    "slender_max": 0.314,
+    "slender_min": 0.1939,
+    "slender_spread": 0.473,
+    "trunk_over_length": 0.2611,
+    "used": [
+      "european-wildcat/1edbe9ff.png",
+      "european-wildcat/cc22d71c.png"
+    ]
+  },
+  "fallow-deer": {
+    "belly_over_length": 0.33,
+    "fit_quality": "fit",
+    "height_over_length": 1.0497,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Dama dama",
+    "slender": 0.1118,
+    "slender_max": 0.1216,
+    "slender_min": 0.1021,
+    "slender_spread": 0.1737,
+    "trunk_over_length": 0.2805,
+    "used": [
+      "fallow-deer/054cc266.png",
+      "fallow-deer/fa652f87.png"
+    ]
+  },
+  "fennec-fox": {
+    "belly_over_length": 0.3034,
+    "fit_quality": "fit",
+    "height_over_length": 0.8184,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "a426770a.png",
+        "why": "limb thickness/length 1.90 -- implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Vulpes zerda",
+    "slender": 0.1672,
+    "slender_max": 0.1741,
+    "slender_min": 0.1603,
+    "slender_spread": 0.0829,
+    "trunk_over_length": 0.3044,
+    "used": [
+      "fennec-fox/6dcdf5ae.png",
+      "fennec-fox/7c580599.png"
+    ]
+  },
+  "fire-salamander": {
+    "belly_over_length": 0.5031,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7877,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "0a948f02.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "c7438e63.png",
+        "why": "height/length 0.32 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Salamandra salamandra",
+    "slender": 0.156,
+    "slender_max": 0.156,
+    "slender_min": 0.156,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2296,
+    "used": [
+      "fire-salamander/9dbd1574.png"
+    ]
+  },
+  "forest-buffalo": {
+    "belly_over_length": 0.3192,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7667,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Syncerus caffer",
+    "slender": 0.1276,
+    "slender_max": 0.167,
+    "slender_min": 0.0882,
+    "slender_spread": 0.6176,
+    "trunk_over_length": 0.3595,
+    "used": [
+      "forest-buffalo/414644c7.png",
+      "forest-buffalo/65c4a9b3.png"
+    ]
+  },
+  "gemsbok": {
+    "belly_over_length": 0.362,
+    "fit_quality": "report-only",
+    "height_over_length": 0.998,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Oryx gazella",
+    "slender": 0.1237,
+    "slender_max": 0.1237,
+    "slender_min": 0.1237,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.332,
+    "used": [
+      "gemsbok/8a6e967b.png"
+    ]
+  },
+  "giant-anteater": {
+    "belly_over_length": 0.2296,
+    "fit_quality": "report-only",
+    "height_over_length": 0.3953,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Myrmecophaga tridactyla",
+    "slender": 0.5633,
+    "slender_max": 0.5633,
+    "slender_min": 0.5633,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1168,
+    "used": [
+      "giant-anteater/d52b48fc.png"
+    ]
+  },
+  "golden-jackal": {
+    "belly_over_length": 0.4414,
+    "fit_quality": "fit",
+    "height_over_length": 0.8932,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Canis aureus",
+    "slender": 0.1443,
+    "slender_max": 0.2045,
+    "slender_min": 0.1285,
+    "slender_spread": 0.5271,
+    "trunk_over_length": 0.2861,
+    "used": [
+      "golden-jackal/26a76622.png",
+      "golden-jackal/87689696.png",
+      "golden-jackal/89794356.png"
+    ]
+  },
+  "greater-kudu": {
+    "belly_over_length": 0.3122,
+    "fit_quality": "report-only",
+    "height_over_length": 0.687,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Tragelaphus strepsiceros",
+    "slender": 0.1356,
+    "slender_max": 0.1356,
+    "slender_min": 0.1356,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2537,
+    "used": [
+      "greater-kudu/e590147d.png"
+    ]
+  },
+  "grey-wolf": {
+    "belly_over_length": 0.3743,
+    "fit_quality": "report-only",
+    "height_over_length": 0.6602,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 11,
+    "refused": [
+      {
+        "file": "634db116.png",
+        "why": "limb thickness/length 1.95 -- implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Canis lupus",
+    "slender": 0.1904,
+    "slender_max": 0.3265,
+    "slender_min": 0.1354,
+    "slender_spread": 1.0037,
+    "trunk_over_length": 0.2428,
+    "used": [
+      "grey-wolf/171a1fd1.png",
+      "grey-wolf/23ddcc50.png",
+      "grey-wolf/5e56c4e5.png",
+      "grey-wolf/8621c5e8.png",
+      "grey-wolf/9f3d85eb.png",
+      "grey-wolf/b416b85f.png",
+      "grey-wolf/b625de9c.png",
+      "grey-wolf/d84f0a0f.png",
+      "grey-wolf/e629188b.png",
+      "grey-wolf/f0c6c94e.png",
+      "grey-wolf/f787cef9.png"
+    ]
+  },
+  "guanaco": {
+    "belly_over_length": 0.4813,
+    "fit_quality": "report-only",
+    "height_over_length": 1.0622,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Lama guanicoe",
+    "slender": 0.1788,
+    "slender_max": 0.1788,
+    "slender_min": 0.1788,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2379,
+    "used": [
+      "guanaco/a0afbb0a.png"
+    ]
+  },
+  "hippopotamus": {
+    "belly_over_length": 0.2142,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5272,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 5,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Hippopotamus amphibius",
+    "slender": 0.3829,
+    "slender_max": 0.7403,
+    "slender_min": 0.2977,
+    "slender_spread": 1.1559,
+    "trunk_over_length": 0.3098,
+    "used": [
+      "hippopotamus/3769e205.png",
+      "hippopotamus/6336f90c.png",
+      "hippopotamus/bab03f09.png",
+      "hippopotamus/d74455cd.png",
+      "hippopotamus/e130f877.png"
+    ]
+  },
+  "impala": {
+    "belly_over_length": 0.3366,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7018,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Aepyceros melampus",
+    "slender": 0.1105,
+    "slender_max": 0.1105,
+    "slender_min": 0.1105,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1771,
+    "used": [
+      "impala/e07d1491.png"
+    ]
+  },
+  "lion": {
+    "belly_over_length": 0.3154,
+    "fit_quality": "fit",
+    "height_over_length": 0.5501,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 12,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Panthera leo",
+    "slender": 0.2084,
+    "slender_max": 0.2385,
+    "slender_min": 0.1821,
+    "slender_spread": 0.2711,
+    "trunk_over_length": 0.139,
+    "used": [
+      "lion/5fcdfa34.png",
+      "lion/60a4dd78.png",
+      "lion/76a5e7ce.png",
+      "lion/79d5f732.png",
+      "lion/9e2e1fe6.png",
+      "lion/9f33e613.png",
+      "lion/a8be3867.png",
+      "lion/b2ea5bb0.png",
+      "lion/b79d7633.png",
+      "lion/cb70ae6c.png",
+      "lion/dd7c7bc6.png",
+      "lion/de81a69c.png"
+    ]
+  },
+  "lowland-tapir": {
+    "belly_over_length": 0.2559,
+    "fit_quality": "fit",
+    "height_over_length": 0.5711,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Tapirus terrestris",
+    "slender": 0.2204,
+    "slender_max": 0.2762,
+    "slender_min": 0.2157,
+    "slender_spread": 0.2749,
+    "trunk_over_length": 0.2773,
+    "used": [
+      "lowland-tapir/4fcdd729.png",
+      "lowland-tapir/8f6b8802.png",
+      "lowland-tapir/c2175a40.png"
+    ]
+  },
+  "mandrill": {
+    "belly_over_length": 0.4275,
+    "fit_quality": "report-only",
+    "height_over_length": 1.1472,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Mandrillus sphinx",
+    "slender": 0.4594,
+    "slender_max": 0.4594,
+    "slender_min": 0.4594,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.6308,
+    "used": [
+      "mandrill/88f44b35.png"
+    ]
+  },
+  "maned-wolf": {
+    "belly_over_length": 0.4498,
+    "fit_quality": "fit",
+    "height_over_length": 0.9565,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 4,
+    "refused": [
+      {
+        "file": "f965b640.png",
+        "why": "height/length 2.35 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Chrysocyon brachyurus",
+    "slender": 0.1516,
+    "slender_max": 0.1837,
+    "slender_min": 0.1181,
+    "slender_spread": 0.4333,
+    "trunk_over_length": 0.2814,
+    "used": [
+      "maned-wolf/1e606dbc.png",
+      "maned-wolf/5ad223f0.png",
+      "maned-wolf/72e1b4c0.png",
+      "maned-wolf/ebd8b68c.png"
+    ]
+  },
+  "meerkat": {
+    "belly_over_length": 0.1354,
+    "fit_quality": "report-only",
+    "height_over_length": 1.0449,
+    "n_refused": 3,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "3f51cce3.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "44ead7ca.png",
+        "why": "belly at 0.04 of length -- leg gap implausible"
+      },
+      {
+        "file": "71cc5f62.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Suricata suricatta",
+    "slender": 0.3325,
+    "slender_max": 0.3325,
+    "slender_min": 0.3325,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.8571,
+    "used": [
+      "meerkat/a7243ae1.png"
+    ]
+  },
+  "moose": {
+    "belly_over_length": 0.3167,
+    "fit_quality": "fit",
+    "height_over_length": 0.8369,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "df2d0ad0.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Alces alces",
+    "slender": 0.1552,
+    "slender_max": 0.1792,
+    "slender_min": 0.1312,
+    "slender_spread": 0.3095,
+    "trunk_over_length": 0.2806,
+    "used": [
+      "moose/1a20a65d.png",
+      "moose/74eab34a.png"
+    ]
+  },
+  "mountain-goat": {
+    "belly_over_length": 0.375,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7617,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Oreamnos americanus",
+    "slender": 0.5678,
+    "slender_max": 0.5678,
+    "slender_min": 0.5678,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.3275,
+    "used": [
+      "mountain-goat/5474bc8a.png"
+    ]
+  },
+  "muskox": {
+    "belly_over_length": 0.2419,
+    "fit_quality": "fit",
+    "height_over_length": 0.8223,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Ovibos moschatus",
+    "slender": 0.2627,
+    "slender_max": 0.2761,
+    "slender_min": 0.2627,
+    "slender_spread": 0.0511,
+    "trunk_over_length": 0.5147,
+    "used": [
+      "muskox/10423604.png",
+      "muskox/2238533e.png",
+      "muskox/b697158f.png"
+    ]
+  },
+  "nile-crocodile": {
+    "belly_over_length": 0.2181,
+    "fit_quality": "report-only",
+    "height_over_length": 0.4167,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "1746c09a.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "2fa0c118.png",
+        "why": "height/length 2.42 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Crocodylus niloticus",
+    "slender": 0.2482,
+    "slender_max": 0.2482,
+    "slender_min": 0.2482,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1536,
+    "used": [
+      "nile-crocodile/b43ea475.png"
+    ]
+  },
+  "nine-banded-armadillo": {
+    "belly_over_length": 0.1886,
+    "fit_quality": "report-only",
+    "height_over_length": 0.422,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Dasypus novemcinctus",
+    "slender": 0.4143,
+    "slender_max": 0.5303,
+    "slender_min": 0.2983,
+    "slender_spread": 0.5599,
+    "trunk_over_length": 0.1994,
+    "used": [
+      "nine-banded-armadillo/5d59b5ce.png",
+      "nine-banded-armadillo/780109d6.png"
+    ]
+  },
+  "okapi": {
+    "belly_over_length": 0.4284,
+    "fit_quality": "fit",
+    "height_over_length": 0.8242,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Okapia johnstoni",
+    "slender": 0.114,
+    "slender_max": 0.1162,
+    "slender_min": 0.1117,
+    "slender_spread": 0.0399,
+    "trunk_over_length": 0.2962,
+    "used": [
+      "okapi/44eea793.png",
+      "okapi/da601133.png"
+    ]
+  },
+  "pine-marten": {
+    "belly_over_length": 0.2402,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5319,
+    "n_refused": 5,
+    "n_refused_by_hand": 0,
+    "n_usable": 5,
+    "refused": [
+      {
+        "file": "27772b23.png",
+        "why": "belly at 0.06 of length -- leg gap implausible"
+      },
+      {
+        "file": "88f0b603.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "8f846edb.png",
+        "why": "height/length 0.34 -- not standing side-on"
+      },
+      {
+        "file": "9bdc6c80.png",
+        "why": "belly at 0.71 of length -- leg gap implausible"
+      },
+      {
+        "file": "b4513dd1.png",
+        "why": "height/length 0.27 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Martes martes",
+    "slender": 0.3901,
+    "slender_max": 0.6246,
+    "slender_min": 0.2712,
+    "slender_spread": 0.9058,
+    "trunk_over_length": 0.2089,
+    "used": [
+      "pine-marten/229fa896.png",
+      "pine-marten/7f7431c6.png",
+      "pine-marten/8685ed13.png",
+      "pine-marten/a4ace614.png",
+      "pine-marten/f8fc9e61.png"
+    ]
+  },
+  "plains-zebra": {
+    "belly_over_length": 0.4642,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7728,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 7,
+    "refused": [
+      {
+        "file": "22f808e2.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Equus quagga",
+    "slender": 0.1376,
+    "slender_max": 0.2471,
+    "slender_min": 0.1028,
+    "slender_spread": 1.0479,
+    "trunk_over_length": 0.1751,
+    "used": [
+      "plains-zebra/2adcd232.png",
+      "plains-zebra/6f55522e.png",
+      "plains-zebra/81caf94e.png",
+      "plains-zebra/a31e7527.png",
+      "plains-zebra/e1beb953.png",
+      "plains-zebra/f7d817d0.png",
+      "plains-zebra/fc76cee5.png"
+    ]
+  },
+  "poison-dart-frog": {
+    "belly_over_length": 0.4725,
+    "fit_quality": "report-only",
+    "height_over_length": 0.9941,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "4679516b.png",
+        "why": "belly at 0.63 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Dendrobates tinctorius",
+    "slender": 0.391,
+    "slender_max": 0.391,
+    "slender_min": 0.391,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.4657,
+    "used": [
+      "poison-dart-frog/bd80bc51.png"
+    ]
+  },
+  "pronghorn": {
+    "belly_over_length": 0.3958,
+    "fit_quality": "report-only",
+    "height_over_length": 0.9375,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Antilocapra americana",
+    "slender": 0.0912,
+    "slender_max": 0.115,
+    "slender_min": 0.0626,
+    "slender_spread": 0.5747,
+    "trunk_over_length": 0.2689,
+    "used": [
+      "pronghorn/26f9f4f5.png",
+      "pronghorn/7983e259.png",
+      "pronghorn/a1ead819.png"
+    ]
+  },
+  "przewalskis-horse": {
+    "belly_over_length": 0.4577,
+    "fit_quality": "fit",
+    "height_over_length": 0.6289,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Equus ferus",
+    "slender": 0.1282,
+    "slender_max": 0.1516,
+    "slender_min": 0.1047,
+    "slender_spread": 0.3668,
+    "trunk_over_length": 0.1279,
+    "used": [
+      "przewalskis-horse/85d95128.png",
+      "przewalskis-horse/9f550f9e.png"
+    ]
+  },
+  "raccoon": {
+    "belly_over_length": 0.3249,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5267,
+    "n_refused": 1,
+    "n_refused_by_hand": 1,
+    "n_usable": 6,
+    "refused": [
+      {
+        "file": "2f08862f.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [
+      {
+        "file": "047f311e.png",
+        "why": "crouched with all four feet gathered; 0.94 of the body length is in ground contact."
+      }
+    ],
+    "scientific_name": "Procyon lotor",
+    "slender": 0.3154,
+    "slender_max": 0.5323,
+    "slender_min": 0.211,
+    "slender_spread": 1.0187,
+    "trunk_over_length": 0.2301,
+    "used": [
+      "raccoon/1bf06f1a.png",
+      "raccoon/1ccc967d.png",
+      "raccoon/52193065.png",
+      "raccoon/5dca4757.png",
+      "raccoon/e805d164.png",
+      "raccoon/fb1daf6a.png"
+    ]
+  },
+  "red-deer-hind": {
+    "belly_over_length": 0.3409,
+    "fit_quality": "fit",
+    "height_over_length": 1.0998,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Cervus elaphus",
+    "slender": 0.1197,
+    "slender_max": 0.125,
+    "slender_min": 0.1144,
+    "slender_spread": 0.0886,
+    "trunk_over_length": 0.2842,
+    "used": [
+      "red-deer-hind/72f2f997.png",
+      "red-deer-hind/cc03f5c2.png"
+    ]
+  },
+  "red-deer-stag": {
+    "belly_over_length": 0.3409,
+    "fit_quality": "fit",
+    "height_over_length": 1.0998,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Cervus elaphus",
+    "slender": 0.1197,
+    "slender_max": 0.125,
+    "slender_min": 0.1144,
+    "slender_spread": 0.0886,
+    "trunk_over_length": 0.2842,
+    "used": [
+      "red-deer-stag/72f2f997.png",
+      "red-deer-stag/cc03f5c2.png"
+    ]
+  },
+  "red-fox": {
+    "belly_over_length": 0.3117,
+    "fit_quality": "report-only",
+    "height_over_length": 0.6699,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 12,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Vulpes vulpes",
+    "slender": 0.2216,
+    "slender_max": 0.3124,
+    "slender_min": 0.1566,
+    "slender_spread": 0.7028,
+    "trunk_over_length": 0.2393,
+    "used": [
+      "red-fox/40541f06.png",
+      "red-fox/40a5954e.png",
+      "red-fox/4a2143fc.png",
+      "red-fox/51b1b6e4.png",
+      "red-fox/64cdabf4.png",
+      "red-fox/76352962.png",
+      "red-fox/9b3e3567.png",
+      "red-fox/a1116e25.png",
+      "red-fox/a5e2a085.png",
+      "red-fox/b8ceb3e3.png",
+      "red-fox/c669db3a.png",
+      "red-fox/d67d3bf6.png"
+    ]
+  },
+  "red-river-hog": {
+    "belly_over_length": 0.2142,
+    "fit_quality": "report-only",
+    "height_over_length": 0.6113,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Potamochoerus porcus",
+    "slender": 0.2679,
+    "slender_max": 0.2679,
+    "slender_min": 0.2679,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.3678,
+    "used": [
+      "red-river-hog/565c4a96.png"
+    ]
+  },
+  "reindeer": {
+    "belly_over_length": 0.3546,
+    "fit_quality": "report-only",
+    "height_over_length": 1.0,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 9,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Rangifer tarandus",
+    "slender": 0.107,
+    "slender_max": 0.1578,
+    "slender_min": 0.0716,
+    "slender_spread": 0.806,
+    "trunk_over_length": 0.2604,
+    "used": [
+      "reindeer/09c5d6bf.png",
+      "reindeer/19864ae2.png",
+      "reindeer/570d32a2.png",
+      "reindeer/76bb1db0.png",
+      "reindeer/95fb3246.png",
+      "reindeer/a7e8f29e.png",
+      "reindeer/d2e268c1.png",
+      "reindeer/e60cd072.png",
+      "reindeer/e6e864fd.png"
+    ]
+  },
+  "roe-deer": {
+    "belly_over_length": 0.388,
+    "fit_quality": "fit",
+    "height_over_length": 1.0007,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Capreolus capreolus",
+    "slender": 0.0833,
+    "slender_max": 0.0852,
+    "slender_min": 0.0813,
+    "slender_spread": 0.0467,
+    "trunk_over_length": 0.2551,
+    "used": [
+      "roe-deer/1a8006a1.png",
+      "roe-deer/b36a215a.png"
+    ]
+  },
+  "sand-cat": {
+    "belly_over_length": 0.2874,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5992,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Felis margarita",
+    "slender": 0.2698,
+    "slender_max": 0.2698,
+    "slender_min": 0.2698,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1696,
+    "used": [
+      "sand-cat/9a496bf8.png"
+    ]
+  },
+  "siberian-flying-squirrel": {
+    "belly_over_length": 0.2891,
+    "fit_quality": "report-only",
+    "height_over_length": 0.821,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Pteromys volans",
+    "slender": 0.2814,
+    "slender_max": 0.2814,
+    "slender_min": 0.2814,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.349,
+    "used": [
+      "siberian-flying-squirrel/6997107a.png"
+    ]
+  },
+  "sika-deer": {
+    "belly_over_length": 0.4281,
+    "fit_quality": "report-only",
+    "height_over_length": 1.2268,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Cervus nippon",
+    "slender": 0.0839,
+    "slender_max": 0.0839,
+    "slender_min": 0.0839,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.3027,
+    "used": [
+      "sika-deer/dbf886d8.png"
+    ]
+  },
+  "small-indian-mongoose": {
+    "belly_over_length": 0.151,
+    "fit_quality": "report-only",
+    "height_over_length": 0.3672,
+    "n_refused": 2,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "29c72f54.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      },
+      {
+        "file": "59db28b6.png",
+        "why": "1 leg run -- legs merged, or not a lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Herpestes javanicus",
+    "slender": 0.3827,
+    "slender_max": 0.3827,
+    "slender_min": 0.3827,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1908,
+    "used": [
+      "small-indian-mongoose/3781740f.png"
+    ]
+  },
+  "spotted-hyena": {
+    "belly_over_length": 0.3249,
+    "fit_quality": "fit",
+    "height_over_length": 0.6674,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 6,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Crocuta crocuta",
+    "slender": 0.2093,
+    "slender_max": 0.252,
+    "slender_min": 0.1478,
+    "slender_spread": 0.4981,
+    "trunk_over_length": 0.2533,
+    "used": [
+      "spotted-hyena/145ab8b1.png",
+      "spotted-hyena/485d294a.png",
+      "spotted-hyena/49b72776.png",
+      "spotted-hyena/a160fd31.png",
+      "spotted-hyena/f032c54a.png",
+      "spotted-hyena/f1b665ae.png"
+    ]
+  },
+  "steppe-polecat": {
+    "belly_over_length": 0.1772,
+    "fit_quality": "report-only",
+    "height_over_length": 0.7792,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Mustela eversmanii",
+    "slender": 0.4909,
+    "slender_max": 0.4909,
+    "slender_min": 0.4909,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2984,
+    "used": [
+      "steppe-polecat/20d4e0a3.png"
+    ]
+  },
+  "stoat": {
+    "belly_over_length": 0.1074,
+    "fit_quality": "report-only",
+    "height_over_length": 0.4447,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "a81024b4.png",
+        "why": "height/length 0.25 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Mustela erminea",
+    "slender": 0.4515,
+    "slender_max": 0.4515,
+    "slender_min": 0.4515,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.1504,
+    "used": [
+      "stoat/001f56ab.png"
+    ]
+  },
+  "striped-hyena": {
+    "belly_over_length": 0.3405,
+    "fit_quality": "fit",
+    "height_over_length": 0.7764,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Hyaena hyaena",
+    "slender": 0.1782,
+    "slender_max": 0.1842,
+    "slender_min": 0.1723,
+    "slender_spread": 0.0665,
+    "trunk_over_length": 0.3372,
+    "used": [
+      "striped-hyena/8023a0f8.png",
+      "striped-hyena/efd94e33.png"
+    ]
+  },
+  "striped-skunk": {
+    "belly_over_length": 0.1611,
+    "fit_quality": "fit",
+    "height_over_length": 1.1817,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [
+      {
+        "file": "9b98049a.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Mephitis mephitis",
+    "slender": 0.6476,
+    "slender_max": 0.6814,
+    "slender_min": 0.6138,
+    "slender_spread": 0.1043,
+    "trunk_over_length": 0.6651,
+    "used": [
+      "striped-skunk/11fa3ad4.png",
+      "striped-skunk/4a78cd1b.png"
+    ]
+  },
+  "virginia-opossum": {
+    "belly_over_length": 0.1927,
+    "fit_quality": "report-only",
+    "height_over_length": 0.4342,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 1,
+    "refused": [
+      {
+        "file": "91324e57.png",
+        "why": "height/length 0.32 -- not standing side-on"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Didelphis virginiana",
+    "slender": 0.4799,
+    "slender_max": 0.4799,
+    "slender_min": 0.4799,
+    "slender_spread": 0.0,
+    "trunk_over_length": 0.2018,
+    "used": [
+      "virginia-opossum/0e1fe113.png"
+    ]
+  },
+  "warthog": {
+    "belly_over_length": 0.2344,
+    "fit_quality": "fit",
+    "height_over_length": 0.6637,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Phacochoerus africanus",
+    "slender": 0.1983,
+    "slender_max": 0.2,
+    "slender_min": 0.1966,
+    "slender_spread": 0.0174,
+    "trunk_over_length": 0.2926,
+    "used": [
+      "warthog/b1a641cd.png",
+      "warthog/d594a0c4.png"
+    ]
+  },
+  "western-lowland-gorilla": {
+    "belly_over_length": 0.5304,
+    "fit_quality": "fit",
+    "height_over_length": 1.0661,
+    "n_refused": 1,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [
+      {
+        "file": "f9bb81be.png",
+        "why": "belly at 0.06 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Gorilla gorilla",
+    "slender": 0.353,
+    "slender_max": 0.4127,
+    "slender_min": 0.2227,
+    "slender_spread": 0.5382,
+    "trunk_over_length": 0.3279,
+    "used": [
+      "western-lowland-gorilla/142e0571.png",
+      "western-lowland-gorilla/d9af529d.png",
+      "western-lowland-gorilla/dd10acd5.png"
+    ]
+  },
+  "white-rhinoceros": {
+    "belly_over_length": 0.2321,
+    "fit_quality": "report-only",
+    "height_over_length": 0.4873,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 6,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Ceratotherium simum",
+    "slender": 0.37,
+    "slender_max": 0.4789,
+    "slender_min": 0.2093,
+    "slender_spread": 0.7288,
+    "trunk_over_length": 0.2531,
+    "used": [
+      "white-rhinoceros/55b24c01.png",
+      "white-rhinoceros/623da06a.png",
+      "white-rhinoceros/74542562.png",
+      "white-rhinoceros/7f867be1.png",
+      "white-rhinoceros/8896498f.png",
+      "white-rhinoceros/fdfaac80.png"
+    ]
+  },
+  "white-tailed-deer": {
+    "belly_over_length": 0.429,
+    "fit_quality": "report-only",
+    "height_over_length": 1.1663,
+    "n_refused": 3,
+    "n_refused_by_hand": 0,
+    "n_usable": 5,
+    "refused": [
+      {
+        "file": "09e12cc6.png",
+        "why": "height/length 1.99 -- not standing side-on"
+      },
+      {
+        "file": "9df2ed00.png",
+        "why": "no belly line -- legs never separate, so not a standing lateral view"
+      },
+      {
+        "file": "ccdfd1a8.png",
+        "why": "belly at 0.65 of length -- leg gap implausible"
+      }
+    ],
+    "refused_by_hand": [],
+    "scientific_name": "Odocoileus virginianus",
+    "slender": 0.1017,
+    "slender_max": 0.1702,
+    "slender_min": 0.0967,
+    "slender_spread": 0.7227,
+    "trunk_over_length": 0.3008,
+    "used": [
+      "white-tailed-deer/4584be20.png",
+      "white-tailed-deer/49a5a5db.png",
+      "white-tailed-deer/4b474bdd.png",
+      "white-tailed-deer/5294755c.png",
+      "white-tailed-deer/56f6fdb2.png"
+    ]
+  },
+  "wild-boar": {
+    "belly_over_length": 0.3025,
+    "fit_quality": "report-only",
+    "height_over_length": 0.5548,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 5,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Sus scrofa",
+    "slender": 0.1998,
+    "slender_max": 0.2789,
+    "slender_min": 0.1674,
+    "slender_spread": 0.5579,
+    "trunk_over_length": 0.293,
+    "used": [
+      "wild-boar/14a64a2f.png",
+      "wild-boar/3d8acaf6.png",
+      "wild-boar/48d65919.png",
+      "wild-boar/87047da1.png",
+      "wild-boar/9108ee62.png"
+    ]
+  },
+  "wolverine": {
+    "belly_over_length": 0.2148,
+    "fit_quality": "fit",
+    "height_over_length": 0.5017,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 2,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Gulo gulo",
+    "slender": 0.3401,
+    "slender_max": 0.3652,
+    "slender_min": 0.3151,
+    "slender_spread": 0.1474,
+    "trunk_over_length": 0.2624,
+    "used": [
+      "wolverine/1f9bbb79.png",
+      "wolverine/bee678d0.png"
+    ]
+  },
+  "wood-bison": {
+    "belly_over_length": 0.293,
+    "fit_quality": "fit",
+    "height_over_length": 0.6758,
+    "n_refused": 0,
+    "n_refused_by_hand": 0,
+    "n_usable": 3,
+    "refused": [],
+    "refused_by_hand": [],
+    "scientific_name": "Bison bison",
+    "slender": 0.2216,
+    "slender_max": 0.2747,
+    "slender_min": 0.1753,
+    "slender_spread": 0.4488,
+    "trunk_over_length": 0.3281,
+    "used": [
+      "wood-bison/d44d834e.png",
+      "wood-bison/d65f6782.png",
+      "wood-bison/dbf2f035.png"
+    ]
+  }
+}

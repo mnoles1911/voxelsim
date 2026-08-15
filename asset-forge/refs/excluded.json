@@ -1,0 +1,41 @@
+{
+  "_why": [
+    "Silhouettes that PASS every automatic gate in tools/refsil.py and are",
+    "still wrong, refused by hand after looking at the overlay.",
+    "",
+    "THIS FILE EXISTS BECAUSE THE AUTOMATIC GATE CANNOT DETECT A SITTING",
+    "ANIMAL, and that limit was established by trying. A sitting mustelid has",
+    "a belly line, two or more runs across the leg band, a plausible",
+    "height/length and a plausible thickness/length -- because the haunch it",
+    "is sitting on measures exactly like a very thick leg. Four separate",
+    "discriminators were built and tested against the corpus and all four",
+    "failed:",
+    "",
+    "  limb thickness over BODY length   fisher 0.159 sits inside the range of",
+    "                                    real stocky animals; our own pika",
+    "                                    measures 0.182 standing.",
+    "  ground contact width              fisher does not even reach the top 14;",
+    "                                    elephants and rhinos rank above it",
+    "                                    because they genuinely have big feet.",
+    "  cross-silhouette agreement        fisher's two references agree with each",
+    "                                    other to 21% -- both artists drew the",
+    "                                    same sitting pose, so more samples and",
+    "                                    a tighter spread gate never help.",
+    "  within-silhouette leg disagreement  2.48 and 1.00, against a corpus",
+    "                                    median of 1.66 and a 75th percentile of",
+    "                                    2.41. No threshold separates it.",
+    "",
+    "So the defence is not a cleverer gate. It is (a) this list, written only",
+    "after looking at the overlay, and (b) MAX_LIFT in tools/reffit.py, which",
+    "bounds what any single undetected bad reference can do to a spec."
+  ],
+  "excluded": {
+    "fisher/5e13bb38.png": "sitting: hind quarters on the ground, tail along the floor. The haunch tracks as a limb and reads 0.537 thick for its length.",
+    "fisher/622e05d2.png": "sitting, same pose. Only one limb tracks; the measurement is of a foreleg against a seated belly height.",
+    "european-hare/4afd156c.png": "sitting up on the haunches; the hind limb is folded, not standing.",
+    "european-rabbit/d71fcd12.png": "crouched, hocks on the ground; belly height is not leg length.",
+    "raccoon/047f311e.png": "crouched with all four feet gathered; 0.94 of the body length is in ground contact.",
+    "brown-bear/c7fbe213.png": "rearing; the forelimbs are off the ground entirely.",
+    "black-tailed-prairie-dog/bdf9f7a6.png": "sitting upright on the hind quarters."
+  }
+}
