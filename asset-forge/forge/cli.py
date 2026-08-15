@@ -301,7 +301,8 @@ def cmd_survey(args) -> int:
             # height. A 24 cm robin labelled "0.15 m" is reporting how deep it
             # is, which is the same mistake the sheet made for fish.
             size = (f"{tree.stats.get('length_m', 0):.2f} m long"
-                    if specmod.get(s, "kind") in ("fish", "cetacean", "bird")
+                    if specmod.get(s, "kind") in ("fish", "cetacean", "bird",
+                                                  "quadruped")
                     else f"{tree.stats['height_m']:.1f} m")
             label = f"{specmod.get(s, 'name')}  {size}"
             cells.append((img, label, pipeline.health(tree)))

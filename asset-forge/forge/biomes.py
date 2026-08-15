@@ -49,6 +49,19 @@ _SWIMS = _GROWS + ("fish", "cetacean")
 # habitat. They are the first kind for which that is true.
 _FLIES = _SWIMS + ("bird",)
 
+# Land animals go wherever anything that grows does, and nowhere else yet.
+#
+# THE TWO BIOMES LEFT OUT ARE LEFT OUT ON PURPOSE. Ocean is obvious. Bare rock
+# is not, and `docs/biomes/README.md` §5 makes the case for widening it: the 35
+# degree gate is the angle of repose FOR LOOSE MATERIAL, which is not the angle
+# at which an ibex, a chamois or a mountain goat loses its footing, and those
+# rows are currently blocked twice over. That case is now half-answered -- the
+# generator exists -- but widening the tuple is a PLACEMENT decision about where
+# animals may stand in the world, not a consequence of a generator landing, and
+# it belongs to whoever owns placement. Left alone, and said so here rather than
+# done quietly.
+_WALKS = _FLIES + ("quadruped",)
+
 BIOMES: tuple[Biome, ...] = (
     # OCEAN HOSTS SOMETHING NOW. It was empty because nothing that grows can
     # stand under the sea, and `plantable` said so; a fish is the first asset
@@ -57,21 +70,21 @@ BIOMES: tuple[Biome, ...] = (
     Biome(0, "ocean", "Ocean", "mud",
           "below -3 m; decided before climate", False, ("fish", "cetacean", "bird")),
     Biome(1, "beach", "Beach", "sand",
-          "-3 m to +4 m around sea level; decided before climate", True, _FLIES),
+          "-3 m to +4 m around sea level; decided before climate", True, _WALKS),
     Biome(2, "grassland", "Grassland", "grass",
-          "dry and not hot, or semi-dry without a strong wet season", True, _FLIES),
+          "dry and not hot, or semi-dry without a strong wet season", True, _WALKS),
     Biome(3, "temperate_forest", "Temperate forest", "topsoil",
-          "moderate to wet, mild; the default forested band", True, _FLIES),
+          "moderate to wet, mild; the default forested band", True, _WALKS),
     Biome(4, "rainforest", "Rainforest", "jungle soil",
-          "wet (>1600 mm/yr) and warm (>=18 C)", True, _FLIES),
+          "wet (>1600 mm/yr) and warm (>=18 C)", True, _WALKS),
     Biome(5, "desert", "Desert", "sand",
-          "arid (<400 mm/yr) and hot (>=24 C)", True, _FLIES),
+          "arid (<400 mm/yr) and hot (>=24 C)", True, _WALKS),
     Biome(6, "savanna", "Savanna", "savanna grass",
-          "warm with a strongly seasonal wet season", True, _FLIES),
+          "warm with a strongly seasonal wet season", True, _WALKS),
     Biome(7, "taiga", "Taiga", "podzol",
-          "cold: mean annual temperature below 5 C", True, _FLIES),
+          "cold: mean annual temperature below 5 C", True, _WALKS),
     Biome(8, "tundra_alpine", "Tundra / alpine", "permafrost or rock",
-          "above the treeline (900 m at 0 C, +150 m per degree)", True, _FLIES),
+          "above the treeline (900 m at 0 C, +150 m per degree)", True, _WALKS),
     # Not plantable, but very much not empty. The cliff gate fires before the
     # climate table, so this is every steep face in the world -- exactly where
     # boulders and scree belong, and the reason `hosts` exists separately from

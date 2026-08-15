@@ -158,6 +158,65 @@ CONCEPTS: dict[str, Concept] = {
                 (("bird.eye", ADD, 1.0),)),
         Concept("flock", "how many of them turn up together",
                 (("flock.size_max", MUL, 0.7), ("flock.per_hectare", MUL, 0.7))),
+
+        # --- land animals -----------------------------------------------------
+        # Same rule a third time: each is a recipe over parameters that exist,
+        # not a wish. "Leggy" is not a slider -- it is the shoulder height and
+        # the hip height together, because raising one alone tips the animal
+        # over rather than standing it up, and the height rows are what the limb
+        # lengths are derived FROM.
+        #
+        # AND ONE CONCEPT HERE IS TWO EDITS FOR A REASON THE OTHERS ARE NOT.
+        # `quad.hip_h` is a RATIO to the shoulder height, so "taller" has to
+        # move the shoulder and leave the ratio alone or a taller animal also
+        # becomes a differently-proportioned one. `humped` is the opposite case
+        # and moves the ratio without touching the height, which is exactly what
+        # separates a bison from a bigger cow.
+        Concept("quadsize", "how big the animal is",
+                (("quad.length_m", MUL, 0.25),)),
+        Concept("leggy", "how tall it stands",
+                (("quad.shoulder_h", MUL, 0.22),)),
+        Concept("humped", "shoulders higher than hips",
+                (("quad.hip_h", ADD, -0.12), ("quad.hump", ADD, 0.20))),
+        Concept("quadneck", "how much of it is neck",
+                (("quad.neck_frac", MUL, 0.45),)),
+        Concept("necklift", "how high it carries its head",
+                (("quad.neck_deg", ADD, 22.0),)),
+        Concept("quadmuzzle", "how long the muzzle is",
+                (("quad.muzzle_frac", MUL, 0.40),)),
+        Concept("muzzledepth", "how heavy the muzzle is",
+                (("quad.muzzle_depth", MUL, 0.30), ("quad.jaw", ADD, 0.15))),
+        Concept("quadhead", "how big the head is",
+                (("quad.head_size", MUL, 0.25),)),
+        Concept("barrel", "how deep-bodied it is",
+                (("quad.depth", MUL, 0.25), ("quad.waist", ADD, 0.10))),
+        Concept("quadwidth", "how broad it is across the back",
+                (("quad.width", MUL, 0.28),)),
+        Concept("quadears", "how big the ears are",
+                (("quad.ear_len", MUL, 0.45),)),
+        Concept("quadhorn", "how big the horns or antlers are",
+                (("quad.horn_len", MUL, 0.40), ("quad.horn_thick", MUL, 0.15))),
+        Concept("hornspread", "how wide the horns reach",
+                (("quad.horn_spread", ADD, 0.35),)),
+        Concept("quadtail", "how long the tail is",
+                (("quad.tail_len", MUL, 0.40),)),
+        Concept("bushytail", "how thick the tail is",
+                (("quad.tail_thick", MUL, 0.40), ("quad.tail_taper", ADD, 0.18))),
+        Concept("tailup", "how high the tail is carried",
+                (("quad.tail_deg", ADD, 35.0),)),
+        Concept("quadmane", "the mane or crest along the neck",
+                (("quad.mane", ADD, 0.30),)),
+        Concept("quadlegs", "how thick the limbs are",
+                (("quad.leg_thick", MUL, 0.30),)),
+        Concept("crouch", "how folded the hind legs are",
+                (("quad.hock", ADD, 0.25),)),
+        Concept("quadmark", "how bold the markings are",
+                (("quad.mark_width", MUL, 0.35),
+                 ("quad.mark_strength", ADD, 0.15))),
+        Concept("quadcount", "how many bands or spots",
+                (("quad.mark_count", MUL, 0.6),)),
+        Concept("herd", "how many of them turn up together",
+                (("herd.size_max", MUL, 0.7), ("herd.per_hectare", MUL, 0.7))),
     )
 }
 
@@ -296,6 +355,84 @@ _say("birdeye", "bigger eyes|larger eyes|big-eyed bird",
      "smaller eyes|beady eyes")
 _say("flock", "bigger flock|larger flock|flocking|in a flock",
      "smaller flock|alone|single bird")
+
+# --- land animals ------------------------------------------------------------
+#
+# EVERY PHRASE HERE IS QUALIFIED -- "longer tail" already belongs to the bird
+# concept and "bigger head" to another, so these say "bushier tail" and
+# "heavier head" instead. That is not politeness: `_say` records a duplicate in
+# `CONFLICTS` and REFUSES it rather than overwriting, so an unqualified
+# collision would leave the land-animal concept silently unreachable while the
+# vocabulary listing went on advertising it. `forge.cli vocab` prints
+# `CONFLICTS`, and it is empty.
+_say("quadsize", "bigger animal|larger animal|longer animal|heavier animal",
+     "smaller animal|littler animal|dwarf animal")
+# NONE OF THESE PHRASES MAY COLLIDE WITH A BIRD OR FISH ONE. `_say` records a
+# duplicate in `CONFLICTS` and REFUSES it rather than overwriting, so a bare
+# "longer legs" -- which `birdlegs` already owns -- would leave the land-animal
+# concept unreachable while `forge.cli vocab` went on advertising it. That is a
+# silent no-op in the vocabulary itself, and the first draft of this block shipped
+# fourteen of them. `CONFLICTS` is empty and is the check.
+_say("leggy", "longer in the leg|taller legs|tall at the shoulder|stilted|"
+              "stands taller|higher off the ground|long legs on it",
+     "shorter in the leg|low-slung|squat animal|belly to the ground|"
+     "close to the ground|short legs on it")
+_say("humped", "humped|shoulder hump|humped shoulders|withers hump|"
+               "high at the shoulder|sloping back|bison-backed|hyena-backed",
+     "level back|even back|flat backed|high at the rump|rump-high")
+_say("quadneck", "longer neck on it|more neck|giraffe-necked|craning neck",
+     "shorter neck on it|less neck|neck pulled in")
+_say("necklift", "head up|head held high|alert head|browsing|neck raised|"
+                 "looking up",
+     "head down|grazing|head lowered|nose to the ground|neck lowered")
+_say("quadmuzzle", "longer muzzle|long-muzzled|longer snout|long snout|"
+                   "drawn-out face",
+     "shorter muzzle|short-muzzled|blunt face|snub-nosed|flat face")
+_say("muzzledepth", "heavy muzzle|heavy jaw|blunt muzzle|deep muzzle|"
+                    "powerful jaw|heavy head",
+     "fine muzzle|slender muzzle|delicate jaw|narrow muzzle")
+_say("quadhead", "bigger skull|larger skull|heavier skull",
+     "smaller skull|finer skull")
+_say("barrel", "barrel-bodied|deep through the chest|deep chest|barrel chest|"
+               "heavy-bodied|thickset|portly",
+     "slab-sided|shallow-bodied|tucked up|lean animal|greyhound build|"
+     "racy|whippet-thin")
+_say("quadwidth", "broad-backed|wide-bodied|broad across the back|"
+                  "wide across the back",
+     "narrow-bodied|slab-thin|narrow across the back")
+_say("quadears", "bigger ears|longer ears|big-eared|long-eared|"
+                 "ears like a hare|huge ears",
+     "smaller ears|shorter ears|small-eared|tiny ears")
+_say("quadhorn", "bigger horns|longer horns|bigger antlers|longer antlers|"
+                 "heavier rack|bigger rack|antlered|horned",
+     "smaller horns|shorter horns|smaller antlers|shorter antlers|"
+     "lighter rack|hornless|antlerless")
+_say("hornspread", "wider horns|wider antlers|wide rack|spreading antlers|"
+                   "spreading horns",
+     "narrower horns|narrower antlers|tight rack|close-set horns")
+_say("quadtail", "longer tail on it|more tail",
+     "shorter tail on it|stub tail|bobtailed|docked")
+_say("bushytail", "bushier tail|thicker tail|brush tail|plume tail|"
+                  "plumed tail|fuller tail",
+     "thinner tail|whip tail|ratty tail|wiry tail|rat-tailed")
+_say("tailup", "tail up|tail carried high|tail raised|flagged tail",
+     "tail down|tail carried low|tail tucked|drooping tail")
+_say("quadmane", "maned|with a mane|dorsal crest|bristle crest|"
+                 "crest along the spine|ridged back|shaggy neck",
+     "no mane|maneless|smooth neck|clean spine")
+_say("quadlegs", "thicker limbs|heavier limbs|stout legs|pillar legs|"
+                 "sturdy legs",
+     "finer limbs|thinner limbs|spindly legs|slender legs|delicate legs")
+_say("crouch", "folded hind legs|deep hocks|springy|"
+               "coiled hindquarters|hare-legged|folded haunches",
+     "straight legs|column legs|stiff-legged|upright hind legs")
+_say("quadmark", "louder coat|bolder coat|bolder stripes|bolder spots",
+     "plainer coat|quieter coat|washed-out coat|fainter stripes|fainter spots")
+_say("quadcount", "more stripes|more spots|finer stripes|finer spots|"
+                  "more bands",
+     "fewer stripes|fewer spots|broader stripes|broader spots|fewer bands")
+_say("herd", "bigger herd|larger herd|in a herd|herding|in numbers",
+     "smaller herd|on its own|lone animal|a single animal")
 
 # Silhouettes set a shape outright rather than nudging a number.
 SHAPES: dict[str, str] = {

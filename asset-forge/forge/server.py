@@ -356,6 +356,14 @@ def _size_m(spec: dict, kind: str) -> float:
         return specmod.get(spec, "fish.length_m")
     if kind == "bird":
         return specmod.get(spec, "bird.length_m")
+    if kind == "quadruped":
+        # HEAD-BODY LENGTH, which is what the parameter means and what every
+        # size in `docs/biomes/*.md` is quoted as. Not the shoulder height, even
+        # though that is the number a field guide leads with for a large mammal:
+        # this column sits beside a tree's height and a fish's length, and a
+        # bison reading "1.8" next to a trout reading "0.3" would be comparing
+        # two different measurements in one column.
+        return specmod.get(spec, "quad.length_m")
     return specmod.get(spec, "height_m")
 
 
@@ -371,6 +379,12 @@ def _shape_word(spec: dict, kind: str) -> str:
         # perched or in the air, which is the thing that decides its camera,
         # its grid size and half its parameter set.
         return specmod.get(spec, "bird.pose")
+    if kind == "quadruped":
+        # THE STANCE, not the headgear. Only a handful of species carry horns at
+        # all, so a headgear column would read "none" for most of the list;
+        # standing / sprawling / bipedal splits it into three groups that mean
+        # something, and it is the row that decides the limb geometry.
+        return specmod.get(spec, "quad.stance")
     return specmod.get(spec, "crown.shape")
 
 
@@ -514,7 +528,8 @@ class Handler(BaseHTTPRequestHandler):
                                 "name": name, "weight": w, "kind": kind,
                                 "kept": kept.get(name, 0),
                                 "size_m": _size_m(s, kind),
-                                "model": (kind if kind in ("rock", "fish", "cetacean", "bird")
+                                "model": (kind if kind in ("rock", "fish", "cetacean", "bird",
+                                                   "quadruped")
                                           else specmod.get(s, "growth.model")),
                             })
                     members.sort(key=lambda m: -m["weight"])

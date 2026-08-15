@@ -144,13 +144,14 @@ const DEFAULT_SPECIES = {
   fish: "brown-trout",
   cetacean: "bottlenose-dolphin",
   bird: "european-robin",
+  quadruped: "red-fox",
 };
 
 /* Kinds with no branch structure. Branch statistics on any of these would be a
  * column of zeroes pretending to mean something, so the kind decides which rows
  * the detail sheet has. Mirrors `pipeline.BRANCHLESS`. */
 const BRANCHLESS = new Set(["rock", "grass", "reed", "flower", "fish", "cetacean",
-                            "bird"]);
+                            "bird", "quadruped"]);
 
 async function loadSpec(name) {
   const r = await fetch(`/api/spec?name=${encodeURIComponent(name)}`).then((x) => x.json());

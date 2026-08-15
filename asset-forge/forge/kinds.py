@@ -132,6 +132,25 @@ KINDS: tuple[Kind, ...] = (
          "folded or spread, and three markings on three regions. Authored at "
          "1 cm.", True,
          ("bird", "flock")),
+    # The third animal, and the first one that STANDS ON SOMETHING. A fish is in
+    # mid-water and a bird is in the air or on a branch, so for both of them the
+    # height of the body above anything is nobody's business: `bird.leg_len` is
+    # a fraction of the bird's length and wherever the legs stop is where they
+    # stop. A land animal's four feet are on a plane, which turns the body's
+    # height and slope into a CONSTRAINT to be solved rather than an output --
+    # and that, rather than the extra pair of legs, is why this is a separate
+    # generator rather than a bird with different sliders.
+    #
+    # It is also the largest single unlock in the library: 167 rows across all
+    # ten biomes are blocked on it (`docs/biomes/README.md` §3), in the one
+    # category the world currently has none of.
+    Kind("quadruped", "Land animals",
+         "Terrestrial vertebrates: a trunk between a shoulder and a hip at "
+         "authored heights, four limbs solved down to the ground, a neck at "
+         "its own angle, a muzzle, ears, optional horns or antlers and a rod "
+         "tail. Three stances — standing, sprawling and bipedal. Voxel size is "
+         "per species: 1 cm for a squirrel, 5 cm for a bison.", True,
+         ("quad", "herd")),
 )
 
 BY_KEY = {k.key: k for k in KINDS}

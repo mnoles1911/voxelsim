@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 
 from . import (bird as birdlib, envelope, fish as fishlib, ground as groundlib,
-               materials, rasterize, rock as rocklib)
+               materials, quadruped as quadlib, rasterize, rock as rocklib)
 from . import parts as partslib
 from .grid import VoxelGrid, dense_bytes, ground_band
 from .skeleton import Skeleton, add_roots, add_strands, grow, grow_frond, grow_whorl
@@ -32,9 +32,10 @@ BOULDER_KINDS = frozenset({"rock"})
 TUFT_KINDS = frozenset({"grass", "reed", "flower"})
 FISH_KINDS = frozenset({"fish", "cetacean"})
 BIRD_KINDS = frozenset({"bird"})
+QUAD_KINDS = frozenset({"quadruped"})
 # Kinds with no branch structure, so the branch-shaped stats and the checks
 # that read them do not apply.
-BRANCHLESS = BOULDER_KINDS | TUFT_KINDS | FISH_KINDS | BIRD_KINDS
+BRANCHLESS = BOULDER_KINDS | TUFT_KINDS | FISH_KINDS | BIRD_KINDS | QUAD_KINDS
 # Kinds that do not stand on the ground. A tree with nothing on its bottom slab
 # is floating and broken; a fish is SUPPOSED to be in mid-water and the check
 # would be a permanent false alarm on every one of them -- which is the fastest
@@ -48,6 +49,17 @@ SWIMS = FISH_KINDS
 # species and mean nothing on any of them.
 FLIES = BIRD_KINDS
 UNGROUNDED = SWIMS | FLIES
+# A LAND ANIMAL IS DELIBERATELY NOT IN `UNGROUNDED`. It is the first asset here
+# after a tree that genuinely stands on the ground plane, so the floating check
+# applies to it and should.
+#
+# Be clear about what that check is worth, though, because it is worth less than
+# it looks: `build` CROPS the grid before the stat is taken, so the bottom slab
+# of the finished asset is occupied whatever the feet did, and a quadruped whose
+# legs stop short would still pass. What it catches is a grid with nothing in it
+# at all. The real measurement -- how far each of the four feet is above the
+# lowest voxel -- is `tools/quadprobe.py --stance`, and it exists because this
+# one cannot answer the question.
 
 
 @dataclass
@@ -269,10 +281,11 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         t_grow = time.perf_counter()
         gen = (rocklib if kind in BOULDER_KINDS
                else fishlib if kind in FISH_KINDS
-               else birdlib if kind in BIRD_KINDS else groundlib)
+               else birdlib if kind in BIRD_KINDS
+               else quadlib if kind in QUAD_KINDS else groundlib)
         gen_out: dict = {}
         grid = (gen.build(live, rng, voxel_m, out=gen_out)
-                if kind in FISH_KINDS or kind in BIRD_KINDS
+                if kind in FISH_KINDS or kind in BIRD_KINDS or kind in QUAD_KINDS
                 else gen.build(live, rng, voxel_m))
         parts = gen_out.get("tags")
         part_names = partslib.names() if parts is not None else None
@@ -356,14 +369,17 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         "ms_raster": round((t_raster - t_grow) * 1e3, 1),
     }
     if connectivity and (kind in TUFT_KINDS or kind in FISH_KINDS
-                         or kind in BIRD_KINDS):
+                         or kind in BIRD_KINDS or kind in QUAD_KINDS):
         # Ground cover has no wood, but "is this one piece?" is exactly the
         # question that matters for it -- a tuft whose blades do not reach the
         # root crown is a handful of floating threads. A fish is the same
         # question with a different failure: a fin that comes off the body, and
         # a bird has five more ways to fail it than a fish does -- a head off
         # the end of a thin neck, a bill off the head, a wingtip finger, a tail
-        # feather, a leg.
+        # feather, a leg. A land animal has more ways still: four limbs each
+        # joined only at a hip or a shoulder, a tail, a neck, a pair of ears and
+        # a pair of antlers, and a leg coming off at the hip is the failure this
+        # generator was expected to ship with.
         attached = grid.component_fraction(None, connectivity=3)
         stats["attached_frac"] = round(attached, 4)
         stats["detached"] = int(round(stats["voxels"] * (1.0 - attached)))

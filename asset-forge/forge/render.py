@@ -557,6 +557,34 @@ def camera_for(spec: dict) -> str:
         return "broadhigh" if float(get(spec, "fish.head_width")) > 0.0 else "broad"
     if kind == "bird":
         return "broad" if get(spec, "bird.pose") == "perched" else "iso"
+    if kind == "quadruped":
+        # BROADSIDE, LIFTED. Every cue a land animal is identified by is a side
+        # view: the slope of the back from shoulder to hip, how high it stands,
+        # the neck angle, the muzzle, the tail's carriage, the outline of a rack
+        # of antlers. The isometric foreshortens length and looks down a
+        # diagonal, which is exactly wrong for an animal whose whole subject is
+        # the profile.
+        #
+        # But the FISH camera's 8 degrees is too low, and the reason is the one
+        # thing a fish does not have. Measured on `plains-zebra` at 2 cm, by
+        # painting the four legs four separate materials and counting the pixels
+        # each one reaches in the finished render:
+        #
+        #     tilt      fore-L   fore-R   hind-L   hind-R   far pair visible
+        #      8 deg      646        0      819        0       0.0%
+        #     20 deg      639       76      807      114        11.7%
+        #     30 deg      615      170      769      241        26.4%
+        #     40 deg      578      248      723      329        39.6%
+        #
+        # At 8 degrees the far pair is completely hidden behind the near pair --
+        # not mostly, entirely -- so the review camera for the first four-legged
+        # asset in the library would have shown two legs. That is precisely the
+        # class of thing this generator was most likely to get wrong and the
+        # camera would have hidden it. 30 degrees is the same lift the cetaceans
+        # already take for a horizontal fluke, it keeps screen-x exactly equal to
+        # body length so a squirrel and a bison are comparable on one sheet, and
+        # it costs about 5% of the back's slope against the 8-degree view.
+        return "broadhigh"
     if kind == "rock":
         return "side"
     return "iso"
@@ -779,6 +807,52 @@ def predicted_extent(spec: dict, voxel_m: float = 0.10) -> tuple[int, int, int]:
         wide = (length * float(get(spec, "bird.wing_span"))
                 if get(spec, "bird.pose") == "flying"
                 else depth * float(get(spec, "bird.body_width")) * 1.6) + 0.04
+        return (max(1, int(span / voxel_m)), max(1, int(wide / voxel_m)),
+                max(1, int(tall / voxel_m)))
+
+    if kind == "quadruped":
+        # Nose to tail tip, and tall enough to hold a raised neck under a rack
+        # of antlers. Same warning as the fish and the bird above, and it bites
+        # harder here than on either: this is what `server.preview_resolution`
+        # reads, and a 26 cm squirrel that looks like a 12 m tree crown to the
+        # estimator is previewed at the coarsest tier there is, which for a
+        # 26-voxel animal means a smudge.
+        #
+        # THE HEIGHT IS THE ONE THAT MATTERS, and it is the one neither of the
+        # other two animals had. A land animal's height is not a fraction of its
+        # length -- it is the shoulder height plus the neck plus the head plus
+        # whatever is on the head -- and on a red deer stag those last two are
+        # nearly as tall again as the animal is at the shoulder. Estimated from
+        # length alone the grid under-reads by about half on every horned or
+        # long-necked species.
+        length = float(get(spec, "quad.length_m"))
+        trunk = length * float(get(spec, "quad.trunk_frac"))
+        depth = trunk * float(get(spec, "quad.depth"))
+        span = length * (1.0 + float(get(spec, "quad.tail_len"))) + 0.10
+        tall = (length * float(get(spec, "quad.shoulder_h"))
+                + length * (float(get(spec, "quad.neck_frac"))
+                            + float(get(spec, "quad.head_frac")))
+                + length * float(get(spec, "quad.horn_len"))
+                + length * float(get(spec, "quad.ear_len"))
+                + depth + 0.10)
+        # The three coefficients below are each set ABOVE what the geometry
+        # needs, checked against the built assets. An over-estimate costs a
+        # preview one tier finer than it had to be; an under-estimate crops the
+        # asset out of its own gallery tile, and it did on both the sprawling
+        # lizard and the antlered stag before these were raised.
+        wide = max(depth * float(get(spec, "quad.width")) * 1.8,
+                   length * float(get(spec, "quad.horn_spread"))
+                   * float(get(spec, "quad.horn_len")) * 2.2,
+                   # A fan ear is wider than it is long and stands off the
+                   # skull, which on an elephant is the widest thing about the
+                   # animal.
+                   length * float(get(spec, "quad.ear_len"))
+                   * max(1.0, float(get(spec, "quad.ear_width"))) * 2.4,
+                   # A sprawled limb reaches further out sideways than the
+                   # animal is deep, which is the one case where the width is
+                   # not set by the body at all.
+                   (length * float(get(spec, "quad.shoulder_h")) * 3.4
+                    if get(spec, "quad.stance") == "sprawling" else 0.0)) + 0.08
         return (max(1, int(span / voxel_m)), max(1, int(wide / voxel_m)),
                 max(1, int(tall / voxel_m)))
 

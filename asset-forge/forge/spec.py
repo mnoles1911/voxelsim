@@ -97,6 +97,23 @@ _ALT_HEAD_MARKS = ("same",) + _HEAD_MARKS
 _ALT_WING_MARKS = ("same",) + _WING_MARKS
 _ALT_BODY_MARKS = ("same",) + _BODY_MARKS
 
+# Land-animal stances, ear outlines, headgear and markings, declared here for
+# the same reason and checked the same way: `forge/quadruped.py` asserts at
+# import that its own tables cover exactly these lists.
+#
+# THE STANCE IS A SPECIES PROPERTY AND NOT A POSE, which is worth stating beside
+# the list rather than only in the generator. A kangaroo cannot stand
+# quadrupedally and a monitor lizard cannot stand like a horse, so this belongs
+# in `spec_hash` and in `seed_hash` alike and is deliberately NOT added to
+# `SEED_INVARIANT`. `docs/biomes/README.md` §4.2 predicted a repeat of the
+# bird-pose seed trap here; it does not arise, because animals ship in one pose
+# (owner, 2026-08-14) and there is no second authored posture to reseed against.
+_QUAD_STANCES = ("standing", "sprawling", "bipedal")
+_QUAD_EARS = ("none", "round", "pointed", "blade", "fan", "tufted")
+_QUAD_HORNS = ("none", "spike", "curve", "sweep", "spiral", "palmate", "branched")
+_QUAD_MARKS = ("none", "bars", "spots", "saddle", "flankstripe", "dapple",
+               "blotch")
+
 # Every kind EXCEPT fish. Two placement rows are meaningless for something that
 # swims -- ground steepness, and distance to water for a thing that is in it --
 # and the house rule is that a section does not show a slider it cannot use, it
@@ -109,7 +126,16 @@ _ALT_BODY_MARKS = ("same",) + _BODY_MARKS
 # and a kingfisher are defined by being near water. Excluding them would have
 # thrown away the only two placement rows that separate a riverbank species
 # from a hillside one.
-_LAND_KINDS = ("tree", "bush", "rock", "grass", "reed", "flower", "bird")
+#
+# A QUADRUPED IS IN THE LIST TOO, and unlike the bird it is in it literally: it
+# is the first asset in this library that genuinely stands on the ground the
+# slope row describes. Ground steepness is a real gate on a hoofed animal --
+# `09-bare-rock.md` argues the 35-degree threshold is the angle of repose for
+# LOOSE MATERIAL and not the angle at which an ibex loses its footing, which is
+# a placement question this row is the right place to answer -- and distance to
+# water separates a hippo from an addax.
+_LAND_KINDS = ("tree", "bush", "rock", "grass", "reed", "flower", "bird",
+               "quadruped")
 
 # The two animal kinds that SWIM. They share one generator and one parameter
 # group, the way grass, reeds and flowers share theirs; what separates them is
@@ -780,9 +806,32 @@ PARAMS: tuple[Param, ...] = (
     P("materials.stem", "Stem", "grass", kind="choice", group="tuft",
       choices=("grass", "savanna_grass", "leaf_dry", "leaf_needle",
                "leaf_broadleaf", "leaf_jungle", "podzol")),
+    # THE BLOOM PALETTE WAS SEVEN ENTRIES AND SIX OF THEM WERE FOLIAGE.
+    # `leaf_blossom` is a pale cherry pink, `leaf_autumn` a brown-orange,
+    # `leaf_dry` a straw yellow, and the other four are green, tan and snow. A
+    # wildflower list written against that has no blue, no violet, no scarlet
+    # and no saturated yellow -- which is most of a meadow. A poppy came out
+    # pink, a cornflower came out pink, a knapweed came out pink, and three
+    # species that are unmistakable in life were one colour on a hillside.
+    #
+    # THE SEVEN ADDED HERE ARE ALREADY IN THE ENGINE. They are creature
+    # materials -- ids 27-44, appended for the fish and the birds and carried
+    # in `forge/palette.py` -- so this is a WIDER MENU AND NOT A MATERIAL
+    # APPEND: `forge.cli selftest` gates on every authored material existing in
+    # `kMaterialCount`, and every one of these does. Nothing that already
+    # authored a head changes, because no default moved and no existing choice
+    # was removed, so the canonical JSON of every spec in the library is
+    # untouched and nothing reseeds.
+    #
+    # They are named for what they look like rather than for what wears them,
+    # which is the rule `materials.py` already states: a kingfisher's back and
+    # a gentian are the same turquoise, and inventing a second one so the name
+    # could read "petal" would be tidiness of naming beating the picture.
     P("materials.head", "Head", "leaf_blossom", kind="choice", group="tuft",
       choices=("leaf_blossom", "leaf_dry", "leaf_autumn", "savanna_grass",
-               "grass", "snow", "leaf_broadleaf")),
+               "grass", "snow", "leaf_broadleaf",
+               "plume_white", "plume_crimson", "plume_lilac", "plume_buff",
+               "skin_blue", "skin_yellow", "skin_orange")),
 
     # --- fish ---------------------------------------------------------------
     #
@@ -1765,6 +1814,55 @@ PARAMS: tuple[Param, ...] = (
       kind="choice", group="bird", kinds=("bird",),
       choices=("same",) + materials.BIRD_NAMES),
 
+    # --- land-animal colours -------------------------------------------------
+    #
+    # EIGHT SLOTS AND NO NEW MATERIALS. Every species in the first tranche is
+    # authored out of the twenty-one creature materials already in the engine
+    # (`forge/materials.py`), because a material append has five separate tails
+    # -- a static_assert in VoxelAgentSubsystem.cpp, a count assertion in
+    # test_assetgrid.cpp, the positional table in materialpalette.h, a
+    # BIOME_TINT decision in ue-project/Tools/terrain_palette.py that refuses to
+    # generate without one, and two generated mirrors -- and it is not something
+    # to spend before the shapes are approved.
+    #
+    # `docs/quadruped-notes.md` records the two colours the mammal set genuinely
+    # wants and what they would cost, with the WCAG contrast numbers that decide
+    # whether each one is a real gap or tidiness of naming. Neither is proposed
+    # here.
+    #
+    # NO `alt` SLOTS, unlike the bird block above, and that is a measured
+    # difference rather than an omission. A bird's sexual difference is nearly
+    # all COLOUR -- a mallard drake against a hen is bottle green, white, grey
+    # and yellow against uniform brown, and not one voxel of it is a proportion.
+    # A mammal's is nearly all STRUCTURE: a stag's antlers, a lion's mane, a
+    # bull's size. `quad.sex_horn` and `quad.sex_mane` carry that, and there is
+    # no species in this library's queue whose two sexes differ mainly in hue.
+    P("materials.quad_back", "Upperparts", "skin_brown", kind="choice",
+      group="quad", kinds=("quadruped",), choices=materials.CREATURE_NAMES),
+    P("materials.quad_belly", "Underparts", "skin_pale", kind="choice",
+      group="quad", kinds=("quadruped",), choices=materials.CREATURE_NAMES),
+    P("materials.quad_head", "Head, ears and muzzle", "skin_brown",
+      kind="choice", group="quad", kinds=("quadruped",),
+      choices=materials.CREATURE_NAMES),
+    P("materials.quad_leg", "Legs", "skin_brown", kind="choice", group="quad",
+      kinds=("quadruped",), choices=materials.CREATURE_NAMES),
+    P("materials.quad_tail", "Tail", "skin_brown", kind="choice", group="quad",
+      kinds=("quadruped",), choices=materials.CREATURE_NAMES),
+    P("materials.quad_mark", "Marking, cape, stockings and mane", "skin_dark",
+      kind="choice", group="quad", kinds=("quadruped",),
+      choices=materials.CREATURE_NAMES,
+      help="ONE COLOUR FOR ALL FIVE, which is a deliberate limit rather than a "
+           "shortcut. A fox's black stockings, black ear backs and white brush "
+           "tip are three colours on one animal and it would want two slots — "
+           "but every species that wants a second is a species whose first is "
+           "doing nothing, and five slots that are the same value on forty "
+           "specs is five places for a retune to be applied to four of them."),
+    P("materials.quad_horn", "Horns, antlers and hooves", "beak_horn",
+      kind="choice", group="quad", kinds=("quadruped",),
+      choices=materials.CREATURE_NAMES),
+    P("materials.quad_eye", "Eye", "skin_dark", kind="choice", group="quad",
+      kinds=("quadruped",), choices=materials.CREATURE_NAMES),
+
     # --- flock: a bird as a detail entity -----------------------------------
     #
     # NONE OF THIS IS READ BY ANY CODE, AND THAT IS DELIBERATE, exactly as with
@@ -1830,6 +1928,522 @@ PARAMS: tuple[Param, ...] = (
            "weights are applied. A hectare rather than the fish group's 100 m² "
            "because birds are spread over two orders of magnitude more ground "
            "than fish are."),
+
+    # --- quadruped: the first asset that stands on the ground ---------------
+    #
+    # WHAT MAKES THIS GROUP DIFFERENT FROM THE BIRD GROUP. A bird's body height
+    # above anything is nobody's business: `bird.leg_len` is a fraction of its
+    # length and wherever the legs stop is where they stop. A land animal's feet
+    # are on a plane, so `shoulder_h` and `hip_h` below are HEIGHTS ABOVE THE
+    # GROUND and the limb lengths are derived from them. That is one number
+    # fewer than the obvious design and it is the reason a spec cannot say
+    # "shoulder at 1.8 m" and "foreleg 1.1 m" and be wrong twice.
+    #
+    # THE THREE ROWS THAT CARRY MOST OF THE BETWEEN-SPECIES SIGNAL are
+    # `shoulder_h`, `hip_h` and `neck_deg`. A bison's shoulder is well above its
+    # hips and its neck is low; a giraffe's neck is vertical off a back that
+    # slopes the same way; a hyena slopes and holds its head level; a musk deer
+    # is higher at the hip than the shoulder. Those are three numbers and they
+    # separate more species than every colour row below them put together.
+    P("quad.length_m", "Head-body length (m)", 1.20, 0.10, 7.00, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Nose to rump, NOT including the tail. Every size in "
+           "`docs/biomes/*.md` is quoted head-body for a reason: the tail is "
+           "the one measurement sources disagree about, and a squirrel "
+           "authored on total length comes out with half the body it should "
+           "have.\n\n"
+           "The tail is `tail_len` below, as a fraction of this."),
+    P("quad.stance", "Stance", "standing", kind="choice", group="quad",
+      kinds=("quadruped",), choices=_QUAD_STANCES,
+      help="How the animal meets the ground, and the one row here that changes "
+           "geometry rather than a number.\n\n"
+           "STANDING — four limbs under the trunk, all four on the floor. "
+           "Everything with hooves, paws or pads.\n\n"
+           "SPRAWLING — the limbs leave the FLANK and reach out sideways "
+           "before they reach down, with the belly close to the ground. "
+           "Lizards and crocodilians. No angle on a limb attached under the "
+           "body reaches this, because it is the attachment point that moves.\n\n"
+           "BIPEDAL — the hind limbs and the TAIL carry the animal, as a "
+           "tripod. The tail's carriage angle stops being authored and is "
+           "solved so its tip lands on the ground, and the forelimbs attach "
+           "forward on the chest. A kangaroo, a jerboa, a meerkat on watch.\n\n"
+           "This is a species property and not a posture — a kangaroo cannot "
+           "stand quadrupedally — so it is part of the seeding hash, unlike "
+           "`bird.pose`."),
+    P("quad.shoulder_h", "Shoulder height", 0.62, 0.12, 1.60, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Height of the SHOULDER JOINT above the ground, as a fraction of "
+           "head-body length. This sets the foreleg length; there is no "
+           "separate leg row to disagree with it.\n\n"
+           "Real values, from the biome files: a badger 0.38, a wild boar 0.60, "
+           "a red fox 0.57, a horse 0.62, a bison 0.64, a moose 0.70, a giraffe "
+           "1.30. Under about 0.35 the animal is a low-slung mustelid."),
+    # THE FLOOR IS 0.25 AND NOT 0.45, and the difference is the bipeds. A
+    # quadruped never goes below about 0.7 -- a bison is 0.86 and a spotted
+    # hyena, which is the most extreme sloped back of any land mammal, is 0.75.
+    # A kangaroo's hip sits at a little over 0.4 of its shoulder height and a
+    # meerkat standing vertical is lower still, and at a floor of 0.45 both were
+    # silently clamped at authoring time. That is exactly the `fish.length_m`
+    # ceiling of 3 m that clamped every whale in this library, one parameter
+    # over: the spec said one thing, the asset was another, and the only sign
+    # was a warning nobody was reading.
+    P("quad.hip_h", "Hip height : shoulder height", 1.00, 0.25, 1.45, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Hip joint height divided by shoulder joint height, which is the "
+           "SLOPE OF THE BACK and one of the strongest species cues there is.\n\n"
+           "1.0 is level (a horse, a deer, a cat). Below 1 the animal is higher "
+           "at the shoulder: a bison 0.86, a spotted hyena 0.75, a wildebeest "
+           "0.80, a brown bear 0.90. Above 1 it is higher at the rump: a rabbit "
+           "1.15, a Siberian musk deer 1.20. A kangaroo sits far below 1 "
+           "because its hip is near the ground and its shoulders are not."),
+    P("quad.trunk_frac", "Trunk share", 0.62, 0.25, 0.90, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Share of the head-body length that is trunk, rump to shoulder. The "
+           "four share rows are NORMALISED, so they are proportions and the "
+           "length row still means what it says."),
+    P("quad.neck_frac", "Neck share", 0.12, 0.0, 0.55, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Share that is visible neck. A cat or a boar 0.06, a wolf 0.12, a "
+           "horse 0.20, a camel 0.26, a giraffe 0.45. This is the clearest "
+           "separator between a grazer and a hunter at twenty voxels."),
+    P("quad.head_frac", "Head share", 0.16, 0.05, 0.40, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Share that is skull, excluding the muzzle. A hippo and a capybara "
+           "are famously big-headed; a giraffe is not."),
+    P("quad.muzzle_frac", "Muzzle share", 0.10, 0.0, 0.35, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Share that is muzzle, projecting forward of the skull. A cat 0.03, "
+           "a bear 0.09, a wolf 0.13, a horse 0.17, a tapir 0.20."),
+    P("quad.neck_deg", "Neck angle", 30.0, -45.0, 88.0, 1.0, group="quad",
+      kinds=("quadruped",),
+      help="How far above the horizontal the neck rises, measured ABSOLUTELY "
+           "and not relative to the back — because that is how you read it off "
+           "a photograph. A giraffe holds a vertical neck off a sloping back "
+           "and a stoat holds a horizontal one off a horizontal back, and "
+           "authoring the second as an offset from the first means entering "
+           "every species by arithmetic.\n\n"
+           "A grazing or browsing animal with its head down is NEGATIVE: a "
+           "wildebeest carries its head at about -10, a moose reaching for "
+           "water lower still. A meerkat on watch is near 85."),
+    P("quad.head_deg", "Head angle", 0.0, -70.0, 45.0, 1.0, group="quad",
+      kinds=("quadruped",),
+      help="Which way the muzzle points, from the horizontal. Separate from "
+           "the neck angle because an alert deer holds a raised neck with a "
+           "level face, and a grazing one holds a lowered neck with the face "
+           "pointing at the ground."),
+
+    P("quad.depth", "Trunk depth", 0.42, 0.15, 0.90, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Depth of the trunk, belly to back, divided by the trunk's own "
+           "length. A greyhound or a cheetah 0.30, a wolf 0.36, a horse 0.42, "
+           "a bear 0.50, a hippo 0.62."),
+    P("quad.width", "Trunk width", 0.62, 0.25, 1.30, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Width across the trunk divided by its depth. Mammals are much "
+           "narrower than they are deep — a deep narrow chest is the running "
+           "build — so most of this library sits between 0.5 and 0.75. A hippo "
+           "or a badger goes past 0.9."),
+    P("quad.chest", "Chest fullness", 1.00, 0.30, 1.60, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Depth at the shoulder end as a fraction of the deepest point."),
+    P("quad.waist", "Waist fullness", 0.94, 0.30, 1.60, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Depth halfway along. This is a REAL VALUE AT THE MIDPOINT, not a "
+           "curve control point — the algebra in `quadruped._trunk_profiles` is "
+           "what makes it so, because a designer who types 0.8 and gets 0.65 "
+           "never finds out why. A tucked-up hunting dog or a cheetah drops to "
+           "0.72; a barrel-bodied pony or a capybara sits at 1.0."),
+    P("quad.rump", "Rump fullness", 0.92, 0.30, 1.60, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Depth at the tail end. A kangaroo's hindquarters go past 1.2."),
+    P("quad.belly", "Belly share", 0.52, 0.20, 0.80, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How much of the trunk's depth hangs BELOW its axis. Above 0.5 the "
+           "animal is pot-bellied, which most grazers are."),
+    P("quad.section", "Section squareness", 2.20, 1.20, 4.00, 0.05,
+      group="quad", kinds=("quadruped",),
+      help="Superellipse exponent of the trunk's cross-section. 2 is an "
+           "ellipse; above 3 it squares off, which is what a bison, a hippo or "
+           "a rhino actually looks like."),
+    P("quad.hump", "Withers hump", 0.0, 0.0, 0.90, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Extra depth added to the TOP of the trunk over the withers, on top "
+           "of the shoulder height. A bison 0.55, a wildebeest 0.35, a brown "
+           "bear 0.30, a camel 0.70 (the fatty hump), everything else 0.\n\n"
+           "Added to the top only, never to the depth: added to the depth it "
+           "would push the belly down as well and a bison would carry a bulge "
+           "underneath it that no animal has."),
+    P("quad.hump_at", "Hump position", 0.16, 0.0, 0.70, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Where along the trunk the hump sits, 0 at the shoulder and 1 at "
+           "the rump. A bison's is right at the withers; a camel's is further "
+           "back."),
+
+    P("quad.neck_thick", "Neck thickness", 0.52, 0.15, 1.10, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Neck diameter as a fraction of the trunk's depth. A stag in rut "
+           "and a lion carry necks nearly as deep as their chests; a giraffe "
+           "and a gazelle are under 0.3."),
+    P("quad.neck_taper", "Neck taper", 0.72, 0.30, 1.20, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Neck thickness at the head divided by at the shoulder."),
+    P("quad.mane", "Mane / dorsal crest", 0.0, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="A ridge along the top of the neck, drawn in the marking colour. A "
+           "zebra's stiff brush, a boar's bristle crest, a striped hyena's "
+           "erectile mane, a lion's mane, a Przewalski's horse's upright "
+           "black mane.\n\n"
+           "A ridge ON TOP of a normal neck, not a thicker neck: a thicker "
+           "neck is a different animal."),
+    P("quad.dewlap", "Throat hang", 0.0, 0.0, 1.20, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="A lobe hanging under the throat. A moose's bell, a greater kudu's "
+           "fringe, a Barbary sheep's chest hair, a zebu's dewlap."),
+
+    P("quad.head_size", "Head size", 1.00, 0.50, 1.90, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Multiplier on the skull's diameter, on top of its share."),
+    P("quad.muzzle_depth", "Muzzle depth", 0.62, 0.20, 1.40, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Depth of the muzzle as a fraction of the skull's radius. A bear is "
+           "deep and blunt; a wolf and an anteater are shallow."),
+    P("quad.muzzle_width", "Muzzle width", 0.58, 0.15, 1.40, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Width of the muzzle as a fraction of the skull's radius. A white "
+           "rhino's square wide lip and a hippo's blunt head are past 1.0."),
+    P("quad.muzzle_drop", "Muzzle droop", 0.0, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far the muzzle BENDS downward along its own length. A moose's "
+           "overhanging muzzle and a tapir's short trunk are the reason this "
+           "exists.\n\n"
+           "A bend, not a rotation. Rotated, the tip moves and the muzzle stays "
+           "straight — which looks close enough in a render to survive review, "
+           "and is the mistake `bird.bill_curve` shipped with for several "
+           "passes before the probe measured the bend itself."),
+    P("quad.jaw", "Jaw heaviness", 0.35, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How much deeper the lower half of the muzzle is than the upper. "
+           "This is what makes a muzzle read as a mouth rather than a snout; a "
+           "hyena, a howler monkey and a mandrill are near 1."),
+    P("quad.eye", "Eye size", 1.0, 0.0, 3.0, 1.0, kind="int", group="quad",
+      kinds=("quadruped",),
+      help="Radius in voxels of the eye patch on each side of the skull. Two "
+           "voxels do more than any other two in the asset. 0 turns it off, "
+           "which a mole or a giant anteater wants."),
+
+    P("quad.ear_shape", "Ear shape", "pointed", kind="choice", group="quad",
+      kinds=("quadruped",), choices=_QUAD_EARS,
+      help="ROUND is a low disc against the skull (a bear, a boar). POINTED is "
+           "an erect cone (a fox, a deer, a cat). BLADE is a long flat paddle "
+           "standing off the skull (a hare, a kangaroo, a donkey) and is the "
+           "one whose LENGTH is the species. FAN is a broad sheet lying back "
+           "along the neck (an elephant) — wider than it is long, which no "
+           "setting of BLADE reaches. TUFTED is a pointed ear with a spike off "
+           "the tip (a lynx, a caracal, a winter red squirrel)."),
+    P("quad.ear_len", "Ear length", 0.09, 0.0, 0.45, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Ear length as a fraction of head-body length. A bear 0.05, a fox "
+           "0.10, a hare 0.20, a fennec fox 0.30, an African elephant 0.35.\n\n"
+           "THIS IS THE ROW THAT SETS THE LATTICE on several species. A hare's "
+           "ears are 3-4 cm wide, so at 2 cm they are two voxels and read as a "
+           "mistake rather than as ears; the whole animal goes to 1 cm for "
+           "them. See `docs/biomes/README.md` §6."),
+    P("quad.ear_width", "Ear width", 0.45, 0.10, 1.60, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Ear width divided by its length. Above 1 is a fan."),
+    P("quad.ear_deg", "Ear angle", 62.0, 0.0, 90.0, 1.0, group="quad",
+      kinds=("quadruped",),
+      help="90 is straight up, 0 is straight out sideways. A sand cat's ears "
+           "are famously low and wide-set; a fox's are near vertical."),
+    P("quad.ear_back", "Ear sweep", 0.25, -0.60, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far back the ears are carried. A running hare lays them flat "
+           "back; an alert deer swings them forward, which is negative here."),
+
+    P("quad.horn_shape", "Headgear", "none", kind="choice", group="quad",
+      kinds=("quadruped",), choices=_QUAD_HORNS,
+      help="SPIKE is a straight tapering cone. CURVE is a ram's or a Barbary "
+           "sheep's semicircle. SWEEP is an oryx's or a gemsbok's near-straight "
+           "spear. SPIRAL is a kudu's or an addax's open turns. PALMATE is a "
+           "flat blade with points on its edge — a moose, a fallow deer. "
+           "BRANCHED is a beam with round tines — a red deer stag, an elk.\n\n"
+           "PALMATE AND BRANCHED ARE NOT ONE SHAPE WITH A WIDTH SLIDER, and the "
+           "reason is measured. `docs/biomes/README.md` §6 works out that a red "
+           "deer's round beam is 3-4 cm and its tine tips 1-2 cm, so at the "
+           "5 cm lattice the rack disappears and the stag becomes a hind — "
+           "while a moose's palm is a 10-15 cm blade, three voxels at 5 cm, and "
+           "reads unaltered. A species using BRANCHED at life size is expected "
+           "to author the rack thicker than life and say so in its own notes."),
+    P("quad.horn_len", "Headgear length", 0.20, 0.0, 0.90, 0.005, group="quad",
+      kinds=("quadruped",),
+      help="Length as a fraction of head-body length. A gazelle 0.15, a red "
+           "deer 0.45, a gemsbok 0.55, a kudu 0.60."),
+    P("quad.horn_thick", "Headgear thickness", 0.16, 0.03, 0.50, 0.005,
+      group="quad", kinds=("quadruped",),
+      help="Base diameter as a fraction of the headgear's own length. Life "
+           "size for a red deer is about 0.08 and that is under two voxels at "
+           "any lattice the animal can use, so a stag spec authors this higher "
+           "and says so in its notes."),
+    P("quad.horn_spread", "Headgear spread", 0.55, 0.0, 2.00, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="How far out to the sides the pair reaches, relative to its length."),
+    P("quad.horn_curl", "Headgear curl", 0.35, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far round the arc comes. Read by CURVE, SWEEP and SPIRAL."),
+    P("quad.horn_tines", "Points a side", 3, 1, 9, 1, kind="int", group="quad",
+      kinds=("quadruped",),
+      help="Tines on each antler, for PALMATE and BRANCHED. A roe deer 3, a "
+           "red deer 5-7, an elk 6-7."),
+
+    P("quad.tail_len", "Tail length", 0.35, 0.0, 1.60, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Tail length as a fraction of head-body length. A bear 0.06, a deer "
+           "0.12, a wolf 0.40, a fox 0.60, a squirrel 0.95, a howler monkey "
+           "1.05, a monitor lizard 1.4."),
+    P("quad.tail_thick", "Tail thickness", 0.20, 0.03, 1.10, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Base diameter as a fraction of the trunk's depth. A deer's scut "
+           "0.10, a wolf 0.22, a fox's brush 0.40, a kangaroo's counterweight "
+           "0.70 — which really is thicker than the animal's own neck."),
+    P("quad.tail_taper", "Tail taper", 0.35, 0.05, 1.20, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Tip thickness divided by base thickness. A PLUME — a squirrel, a "
+           "fox — is this near 1 with a thick base, which is why there is no "
+           "separate plume switch: it would be a second way to spell a number "
+           "that already exists."),
+    P("quad.tail_deg", "Tail carriage", -35.0, -90.0, 90.0, 1.0, group="quad",
+      kinds=("quadruped",),
+      help="Angle above the horizontal the tail leaves the rump at. Negative "
+           "hangs down. A wolf carries its brush low at -30, a warthog runs "
+           "with its tail straight up at +85, a coati holds it vertical.\n\n"
+           "IGNORED IN THE BIPEDAL STANCE, where the tail is a leg and its "
+           "angle is solved so the tip reaches the ground. "
+           "`tools/quadprobe.py --stance` prints the solved angle and the gap."),
+    P("quad.tail_arc", "Tail arc", 0.0, -0.80, 1.20, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far the tail BENDS along its length, on top of its carriage "
+           "angle. A grey squirrel's S over the back is the extreme; a wolf's "
+           "straight brush is 0."),
+    P("quad.tail_tuft", "Tail tuft", 0.0, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="A terminal tuft. A lion's, a zebra's tassel, an ox's switch, a "
+           "jerboa's flag."),
+
+    P("quad.leg_thick", "Limb thickness", 0.22, 0.05, 0.70, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="Limb diameter as a fraction of the trunk's depth. A gazelle 0.11, "
+           "a wolf 0.18, a horse 0.20, a rhino 0.36, an elephant 0.45.\n\n"
+           "THIS ROW DECIDES WHETHER THE JOINT CAPS ARE DRAWN AT ALL. Below "
+           "three voxels of limb thickness the cap is skipped (owner, "
+           "2026-08-14): at that size the wedge a rotating limb opens is one "
+           "voxel and invisible, and a ball big enough to cover it is most of "
+           "the leg. On a 22 cm squirrel at 1 cm this bites immediately."),
+    P("quad.fore_bend", "Foreleg bend", 0.25, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far the elbow is carried back and the foot forward. A horse's "
+           "foreleg is nearly a straight column at 0.12; a bear's or a "
+           "gorilla's is well bent."),
+    P("quad.hock", "Hind leg fold", 0.35, 0.0, 1.00, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How pronounced the hind leg's zigzag is — hip forward to the "
+           "stifle, back to the hock, forward again along the foot. An "
+           "elephant's hind leg is nearly a column at 0.10; a deer sits near "
+           "0.45; a kangaroo and a hare fold deeply at 0.85.\n\n"
+           "A FORE LEG IS TWO SEGMENTS AND A HIND LEG IS THREE, which is "
+           "anatomy and not detail: drawn as two both ways, every animal in "
+           "the library stands like a table."),
+    P("quad.foot", "Foot size", 1.00, 0.30, 3.00, 0.05, group="quad",
+      kinds=("quadruped",),
+      help="Multiplier on the foot, against the limb's own thickness. A "
+           "reindeer's splayed hooves, a hare's and a kangaroo's long hind "
+           "feet, a wolverine's huge paws."),
+    P("quad.fore_reach", "Forelimb reach", 1.00, 0.20, 1.25, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="How far down the forelimb reaches, as a fraction of the distance "
+           "from its joint to the ground. 1.0 puts the foot on the floor and "
+           "is right for everything that walks on four legs; a kangaroo is "
+           "near 0.35 and holds its forelimbs clear.\n\n"
+           "NOT GATED ON THE STANCE, on purpose. A parameter that only works "
+           "when another is set a particular way is this project's documented "
+           "trap — `bird.bill_gape` was multiplied by `bill_depth` and did "
+           "nothing below heron size for as long as it did — so this is "
+           "honoured in every stance and `tools/quadprobe.py --stance` measures "
+           "the fore foot's height above the ground on every species, which is "
+           "what catches an animal accidentally authored on tiptoe."),
+
+    P("quad.under", "Underside boundary", 0.30, 0.0, 0.85, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far up the flank the pale underside reaches, 0 at the belly "
+           "line and 1 at the spine. Countershading is on nearly every mammal "
+           "here; on a pronghorn or a gemsbok the boundary itself is the "
+           "marking, which is what `flankstripe` draws on."),
+    P("quad.cape", "Shoulder cape", 0.0, 0.0, 0.80, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="A dark field over the FRONT of the animal, in the marking colour, "
+           "running back from the shoulder by this fraction of the trunk. A "
+           "bison's shaggy cape over a bare rear, a wolf's saddle, a "
+           "wildebeest's dark forequarter. It is one of the two things that "
+           "separate an American bison from a wisent."),
+    P("quad.stocking", "Dark stockings", 0.0, 0.0, 0.90, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How far up the legs the marking colour reaches, measured FROM THE "
+           "GROUND UP as a fraction of standing height. A red fox's black "
+           "stockings, an Arabian oryx's black legs, an okapi's white ones.\n\n"
+           "From the ground rather than from each joint down, because the fore "
+           "and hind legs are different lengths on nearly every species: a "
+           "fraction of each limb's own length puts the boundary at two "
+           "heights and the animal looks as though it is standing in a hole."),
+    P("quad.tail_tip", "Tail tip", 0.0, 0.0, 0.70, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="The last fraction of the tail in the marking colour. A red fox's "
+           "white brush tip; a stoat's black one, which stays black when the "
+           "rest of the animal turns white in winter and is the only reliable "
+           "way to tell it from a weasel."),
+    P("quad.mark", "Marking", "none", kind="choice", group="quad",
+      kinds=("quadruped",), choices=_QUAD_MARKS,
+      help="One marking, on the flank. ONE, WHERE A BIRD GETS THREE: a bird's "
+           "cap, wing bar and breast streaking sit on three disjoint sets of "
+           "voxels, while every mammal marking competes for the same flank.\n\n"
+           "BARS are transverse bands wrapping the body — a zebra, a kudu, a "
+           "bongo, a tiger. This is the fish generator's 'vertical bars', "
+           "reused deliberately, floor rules included. SPOTS, DAPPLE and BLOTCH "
+           "are one field of blobs at three scales — a leopard's rough stand-in, "
+           "a fallow deer's fine white spotting, a hyena's coarse irregular "
+           "patching. SADDLE is a dark field over the back. FLANKSTRIPE is a "
+           "horizontal band at the countershading boundary — a gemsbok, an "
+           "impala, a dorcas gazelle.\n\n"
+           "ROSETTES AND RETICULATION ARE NOT HERE and that is the honest gap: "
+           "a leopard's rosette is an annulus with a tawny centre and a "
+           "giraffe's reticulation is a partition into plates, and neither is "
+           "any setting of the six above."),
+    P("quad.mark_count", "Marking count", 12, 1, 40, 1, kind="int",
+      group="quad", kinds=("quadruped",),
+      help="Bands along the body, or the scale of the blob field. A zebra "
+           "carries about 25 body stripes; a bongo 12; a tiger's are fewer and "
+           "wider.\n\n"
+           "SATURATES ON A SMALL ANIMAL, which is a finding rather than a bug: "
+           "a band narrower than two voxels with two voxels of gap merges into "
+           "a wash, so above about five bands on a twenty-voxel body they stop "
+           "being bands. `tools/quadprobe.py` sweeps this on a large species "
+           "for exactly that reason."),
+    P("quad.mark_width", "Marking width", 0.32, 0.02, 0.90, 0.01, group="quad",
+      kinds=("quadruped",),
+      help="How much of each period the mark occupies, or how much of the "
+           "flank the blob field covers."),
+    P("quad.mark_strength", "Marking strength", 1.0, 0.0, 1.0, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="How solidly the mark is laid down. A voxel has one flat material "
+           "(ADR-0008), so there is no half-tone to blend to and the only "
+           "honest reading of 'weaker' is 'less of it' — this thins the mark "
+           "rather than fading its colour."),
+
+    # --- structural sexual dimorphism ---------------------------------------
+    #
+    # `docs/biomes/README.md` §4.9 called this out as the one place a quadruped
+    # needs MORE than a bird: `bird._sex_scale` moves a measurement, and a red
+    # deer hind against a stag is a part that is PRESENT OR ABSENT. So there are
+    # two mechanisms here rather than one, and the second is `_sex_present`,
+    # which reads a ratio of 0 as "the female does not have it" — a case the
+    # square-root rule cannot express, because sqrt(0) removes it from the male
+    # as well.
+    P("quad.sex", "Sex", "unsexed", kind="choice", group="quad",
+      kinds=("quadruped",), choices=_SEXES,
+      help="Which sex to draw. UNSEXED is the species average and is what a "
+           "spec carries until someone measures a difference. A sex is NOT a "
+           "posture — there is no individual that is 'the same red deer, but "
+           "female' — so this is part of the seeding hash and seed 7 male and "
+           "seed 7 female are two different animals."),
+    P("quad.sex_length", "Male:female length", 1.0, 0.50, 2.00, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Adult head-body length of the male divided by the female's. 1.0 is "
+           "no difference. A red deer is about 1.15, a lion 1.20, a gorilla "
+           "1.25, an elephant seal far higher."),
+    P("quad.sex_horn", "Male:female headgear", 1.0, 0.0, 3.00, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Headgear length, male divided by female. 1.0 is 'both sexes carry "
+           "the same' (an oryx, a gemsbok, a reindeer).\n\n"
+           "ZERO MEANS THE FEMALE HAS NONE AT ALL, and that is a different "
+           "mechanism from a small one: a red deer hind has no antlers, which "
+           "is not a short rack. An UNSEXED draw of a species set to 0 is drawn "
+           "WITH the headgear, because the unsexed draw is what the library "
+           "thumbnails and a stag with no antlers is not the species average, "
+           "it is a different animal."),
+    P("quad.sex_mane", "Male:female mane", 1.0, 0.0, 3.00, 0.01,
+      group="quad", kinds=("quadruped",),
+      help="Mane size, male divided by female, on the same rule as the "
+           "headgear above. A lion is the extreme and is the reason both this "
+           "and the headgear row read the same helper: a mane is present on "
+           "both sexes and hugely bigger on one, antlers are present on one, "
+           "and one parameter covers both."),
+
+    # --- herd: a land animal as a detail entity -----------------------------
+    #
+    # NONE OF THIS IS READ BY ANY CODE, and that is deliberate, exactly as with
+    # the fish `detail` group and the bird `flock` group. Spawning animals is a
+    # job for worldgen; what these rows are is the SPECIFICATION a spawner will
+    # be written against, stated in the same file the shape is stated in so the
+    # two cannot drift.
+    #
+    # A SEPARATE GROUP RATHER THAN REUSING `flock`. Six of that group's ten rows
+    # are about flying — height above ground, share of time in the air, where it
+    # perches — and a bison does none of those. What replaces them is the one
+    # thing a land animal has that neither a bird nor a fish does: it walks on
+    # ground of a particular kind, and a spawner has to know whether this
+    # species belongs on open ground or under cover.
+    P("herd.entity_class", "Entity class", "detail", kind="choice",
+      group="herd", kinds=("quadruped",), choices=("detail", "persistent"),
+      help="'detail' means nothing about this individual is saved: it is "
+           "spawned from (species, seed) when the player is near, and when it "
+           "despawns it is gone. Anything that has to survive being left and "
+           "come back the same is 'persistent' and costs a save slot.\n\n"
+           "A LARGE ANIMAL IS THE FIRST SERIOUS CANDIDATE FOR 'persistent' in "
+           "this library. A shoal of sardines can pop in and out; a bison herd "
+           "that vanishes when you turn round is the difference between a world "
+           "with animals in it and a world with animal-shaped decorations."),
+    P("herd.despawn_m", "Despawn distance (m)", 220.0, 10.0, 2000.0, 10.0,
+      group="herd", kinds=("quadruped",),
+      help="How far the player has to get before this individual is removed. "
+           "Much larger than a bird's, because on open ground — and savanna is "
+           "20.76% of all land — a herd is visible to the horizon and an "
+           "elephant that pops out at 90 m is worse than no elephant."),
+    P("herd.despawn_delay_s", "Despawn delay (s)", 20.0, 0.0, 300.0, 1.0,
+      group="herd", kinds=("quadruped",),
+      help="Grace period after the player passes the distance above."),
+    P("herd.size_min", "Herd size, least", 1, 1, 200, 1, kind="int",
+      group="herd", kinds=("quadruped",)),
+    P("herd.size_max", "Herd size, most", 1, 1, 2000, 1, kind="int",
+      group="herd", kinds=("quadruped",),
+      help="A herd is spawned as one decision: N individuals of this species "
+           "from consecutive seeds, so they vary the way the `variation` group "
+           "says. Solitary species set both ends to 1; a wildebeest aggregation "
+           "is in the hundreds and is the single largest thing a spawner in "
+           "this library will ever be asked for."),
+    P("herd.spread_m", "Herd spread (m)", 30.0, 0.5, 800.0, 0.5,
+      group="herd", kinds=("quadruped",),
+      help="Radius the group occupies."),
+    P("herd.cover", "Cover it needs", "any", kind="choice", group="herd",
+      kinds=("quadruped",),
+      choices=("any", "open", "edge", "forest", "rock", "waterside"),
+      help="What kind of ground this species is found on, which is the gate a "
+           "spawner needs before it can place one. 'open' is a plains grazer "
+           "that avoids trees, 'edge' is a deer that wants the boundary between "
+           "the two, 'forest' is a species that stays under canopy, 'rock' is an "
+           "ibex or a chamois, 'waterside' is a hippo or an otter.\n\n"
+           "This is not the same question as the biome weights: grassland holds "
+           "both a pronghorn and a badger, and only one of them is standing "
+           "where you can see it."),
+    P("herd.per_hectare", "Individuals per hectare", 0.8, 0.0, 200.0, 0.1,
+      group="herd", kinds=("quadruped",),
+      help="Expected number over a hectare of suitable ground, before the biome "
+           "weights are applied. A hectare rather than the fish group's 100 m², "
+           "for the same reason the bird group uses one."),
+    P("herd.flee_m", "Flight distance (m)", 60.0, 0.0, 500.0, 5.0,
+      group="herd", kinds=("quadruped",),
+      help="How close a player gets before the animal moves away. This is the "
+           "row that decides whether a species is ever seen at close range, and "
+           "it is worth authoring honestly: a red deer's is a couple of hundred "
+           "metres and a squirrel's is five, so a world tuned only for the "
+           "large species would let a player walk up to nothing."),
 
     # Wood and leaf, and ONLY for the two kinds made of wood and leaf.
     #
