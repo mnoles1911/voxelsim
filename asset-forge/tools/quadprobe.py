@@ -19,6 +19,7 @@ not.
     python tools/quadprobe.py --lattice       # each species one tier finer
     python tools/quadprobe.py --read          # can the markings be seen?
     python tools/quadprobe.py --sex           # male against female
+    python tools/quadprobe.py --bulk          # is it shaped like an animal?
     python tools/quadprobe.py --all           # everything
 
 WHY IT AVERAGES OVER SEEDS. Changing any parameter changes the seed hash, and
@@ -66,6 +67,7 @@ see the thing it is looking for:
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -749,6 +751,211 @@ def m_hind_foot(a) -> float:
     return float(xs.max() - xs.min() + 1)
 
 
+# --- DOES IT LOOK LIKE AN ANIMAL? -------------------------------------------
+#
+# EVERYTHING ABOVE THIS LINE MEASURES WHETHER A MECHANISM FIRED. That is what
+# the sweep is for and it does it well: every row in the `quad` group moves a
+# number, `--stance` puts every foot on the floor, `--parts` gives every animal
+# four legs and `--caps` accounts for every joint ball. All four report clean.
+#
+# AND THE ANIMALS STILL LOOKED WRONG (owner, 2026-08-15): "tall lanky with
+# narrow legs and bodies". Nothing in this file could see that, because a limb
+# two voxels through is a working limb by every test here -- it is present, it
+# is its own part, it reaches the floor, it responds to its slider. The gap is
+# that no measurement compared one part of the animal to ANOTHER part of the
+# same animal, which is the only thing "lanky" can mean.
+#
+# So these five are ratios and absolutes together, and both halves are load
+# bearing. A leg at 6% of the withers height is a wire on a 2 m animal and a
+# reasonable leg on a 20 cm one; a leg two voxels across is a wire on both. The
+# report prints both and gates on both.
+
+
+def _free_limb(a, pid) -> np.ndarray | None:
+    """One limb, below the belly line -- the part of it that reads as a limb.
+
+    Cut at the bottom of the TRUNK rather than at the joint, because the top of
+    a femur is inside the body and its lateral span there is the span of the
+    hip, not of the leg. Measured over the whole limb, a deep-chested animal
+    scores its own chest as leg thickness.
+
+    AND THE BOTTOM SLAB IS DROPPED, which is not tidying. A foot is a sphere,
+    so the single lowest layer of it is the sphere's rounded underside and
+    contains one voxel. Left in, the narrowest slab of EVERY standing animal in
+    the library measured 1 -- a bison, a bear and a red deer stag alike -- and
+    the "narrowest slab" column, whose entire job is to find the wire in the
+    middle of a limb, reported the same artefact for all of them and found
+    nothing. It is the probe flattering a defect into universality, which is
+    the failure mode this file exists to avoid.
+
+    A LOW-SLUNG ANIMAL HAS NO LIMB BELOW ITS OWN BELLY, and a marmot, a meerkat
+    and a kangaroo's forelimb are all genuinely like that. Returning nothing
+    there put NaN in five rows of the report, which reads as a broken probe
+    rather than as an animal whose legs are shorter than its body is deep. So
+    the fallback measures the limb's own lower half instead, and it is a
+    fallback rather than the rule because on a horse that would include the
+    shoulder.
+    """
+    m = _part(a, pid)
+    if not m.any():
+        return None
+    zs = np.nonzero(m)[2]
+    bb = _bbox(_body(a))
+    lo, hi = int(zs.min()), int(zs.max())
+    if bb is not None and bb[4] > lo + 2:
+        cut = bb[4]
+    else:
+        cut = lo + (hi - lo) // 2 + 1
+    out = m.copy()
+    out[:, :, cut:] = False
+    out[:, :, :lo + 1] = False
+    return out if out.any() else None
+
+
+def _limb_spans(a, pid) -> list[float]:
+    """Lateral span of one free limb, slab by slab, in voxels.
+
+    ACROSS THE ANIMAL (y) and not along it (x). A limb slants fore-and-aft --
+    that is what `fore_bend` and `hock` are -- so its x extent in any one slab
+    is the slant plus the thickness and grows as the leg gets longer. Its y
+    extent is the thickness and nothing else, and y is also the direction
+    nothing else in the asset contributes to at that height.
+    """
+    m = _free_limb(a, pid)
+    if m is None:
+        return []
+    out = []
+    for z in np.unique(np.nonzero(m)[2]):
+        ys = np.nonzero(m[:, :, int(z)])[1]
+        if ys.size:
+            out.append(float(ys.max() - ys.min() + 1))
+    return out
+
+
+def m_limb_dia(a) -> float:
+    """Typical thickness of one foreleg, across, in voxels."""
+    s = _limb_spans(a, LEG_FL)
+    return float(np.median(s)) if s else float("nan")
+
+
+def m_limb_dia_min(a) -> float:
+    """THE NARROWEST SLAB OF ONE FORELEG, which is where a leg stops being a
+    leg. A median of 3 with a minimum of 1 is a limb with a wire in the middle
+    of it, and the median alone cannot tell you that."""
+    s = _limb_spans(a, LEG_FL)
+    return float(np.min(s)) if s else float("nan")
+
+
+def m_hind_dia(a) -> float:
+    """The same for a hind leg, which is drawn 1.35x at the hip and 0.85x at
+    the ankle and is therefore not the same number."""
+    s = _limb_spans(a, LEG_HL)
+    return float(np.median(s)) if s else float("nan")
+
+
+def m_limb_len(a) -> float:
+    """How far the free foreleg runs, top to bottom, in voxels."""
+    m = _free_limb(a, LEG_FL)
+    if m is None:
+        return float("nan")
+    zs = np.nonzero(m)[2]
+    return float(zs.max() - zs.min() + 1)
+
+
+def m_limb_slender(a) -> float:
+    """LIMB THICKNESS DIVIDED BY LIMB LENGTH. The number that separates the
+    animals the owner accepted from the ones he did not.
+
+    THE FIRST TWO RATIOS THIS FILE TRIED DID NOT SEPARATE THEM, and that is
+    worth recording because both are plausible and both are wrong:
+
+      * limb across, in VOXELS. The three species the owner called solid
+        measured 3.0, 3.5 and 3.0; four of the five he called wireframes
+        measured 3.0, 4.0, 3.0 and 4.0. The wireframes were the THICKER group.
+      * limb across over WITHERS HEIGHT. Wild boar 0.055 against gemsbok 0.050
+        -- the same number, on one animal the owner accepted and one he
+        rejected.
+
+    Thickness over LENGTH does separate them, cleanly and with no overlap:
+    boar 0.111, bison 0.143, warthog 0.143, brown bear 0.233 against gemsbok
+    0.087, moose 0.097, zebra 0.063, kudu 0.061, red deer stag 0.056. It is
+    also the ratio the published voxel-art corpora are quoted in, so the
+    library can be held against them rather than against an opinion --
+    `docs/quadruped-proportion-research.md` §2 has Minecraft at 0.393 mean over
+    ten mobs, Veloren at 0.230 over six, and Infinigen's photoreal quadruped
+    genome at 0.111.
+
+    That is the whole diagnosis. A leg is not lanky because it is thin; it is
+    lanky because it is thin FOR ITS LENGTH, and no measurement in this file
+    divided one by the other until now.
+    """
+    d = m_limb_dia(a)
+    ln = m_limb_len(a)
+    if np.isnan(d) or np.isnan(ln) or ln <= 0:
+        return float("nan")
+    return float(d / ln)
+
+
+def m_withers_h(a) -> float:
+    """TOP OF THE BACK OVER THE SHOULDER, above the ground, in voxels.
+
+    The livestock withers height -- the measurement every published body
+    dimension of a hoofed animal is quoted against, so it is the one that can
+    be compared to a real animal. Deliberately not the total height of the
+    asset, which includes the head, the ears and a rack of antlers, and
+    deliberately not `quad.shoulder_h`, which is the JOINT and an internal
+    variable.
+    """
+    top = _back_top(a, 0.72, 0.95)
+    bb = _bbox(_occ(a))
+    if bb is None or np.isnan(top):
+        return float("nan")
+    return float(top - bb[4] + 1)
+
+
+def m_trunk_girth(a) -> float:
+    """Girth of the trunk around the middle of its barrel, in voxels, as the
+    perimeter of the ellipse the width and depth there describe.
+
+    Ramanujan's first approximation, which is within 0.05% over the whole range
+    of aspect ratios anything in this library reaches. The point of the number
+    is that GIRTH AGAINST WITHERS HEIGHT is a standard livestock ratio with
+    published values, so it is a place where this generator can be held against
+    a real animal instead of against an opinion.
+
+    MEASURED AT THE MIDDLE OF THE BARREL AND NOT BEHIND THE ELBOW, which is
+    where a livestock heart girth is taken, and the difference is not a
+    quibble -- it is a measurement defect this probe shipped for one afternoon
+    and it would have corrupted the whole exercise. `_limb_caps` draws the
+    shoulder and hip balls with the TRUNK'S tag, deliberately (a joint belongs
+    to its parent, `forge/quadruped.py`), and the shoulder ball sits at
+    exactly the station a heart girth is taken at. Sampled there, "chest
+    girth" moved from 64 to 110 voxels on a gemsbok when nothing changed but
+    the LEG THICKNESS -- so a tool solving limb thickness and trunk bulk
+    against each other would have chased its own tail. At 0.55 of the trunk
+    the same sweep reads 52.8, 52.8, 52.8.
+
+    So the number below is honestly a barrel girth, and it is NOT
+    interchangeable with a published heart girth: on a real grazer the barrel
+    is the fuller of the two. Compare it as an approximation and say so.
+    """
+    m = _body(a)
+    b = _bbox(m)
+    if b is None:
+        return float("nan")
+    x = int(round(b[0] + 0.55 * (b[1] - b[0])))
+    x = int(np.clip(x, b[0], b[1]))
+    sl = m[x]
+    if not sl.any():
+        return float("nan")
+    d = 0.5 * float(sl.any(axis=0).sum())
+    w = 0.5 * float(sl.any(axis=1).sum())
+    if d <= 0.0 or w <= 0.0:
+        return float("nan")
+    h = ((d - w) ** 2) / max((d + w) ** 2, 1e-9)
+    return float(math.pi * (d + w) * (1.0 + 3.0 * h / (10.0 + math.sqrt(4.0 - 3.0 * h))))
+
+
 # --- the four that read COLOUR, and why ------------------------------------
 #
 # See the module docstring: a tag-based measurement of a marking proves the
@@ -966,7 +1173,16 @@ SETUP_FOR = {
     "quad.tail_taper": {"quad.tail_len": 0.6, "quad.tail_thick": 0.5,
                         "quad.tail_tuft": 0.0},
     "quad.tail_deg": {"quad.tail_len": 0.6},
-    "quad.tail_arc": {"quad.tail_len": 0.7, "quad.tail_thick": 0.4},
+    # AND CARRIED LEVEL, which is a statement about the measurement and not a
+    # convenience. The zebra this sweep runs on hangs its tail at -62 degrees;
+    # a downward arc on top of that puts the far half of the tail underground,
+    # where `VoxelGrid._write` drops it, so the low end of the slider and the
+    # middle of it measure the same clipped stump. The row read DEAD on a
+    # slider that plainly works -- SATURATED rather than dead, the same
+    # distinction `quad.mark_count` records above. An arc needs somewhere to
+    # arc into.
+    "quad.tail_arc": {"quad.tail_len": 0.7, "quad.tail_thick": 0.4,
+                      "quad.tail_deg": 0.0},
     "quad.tail_tuft": {"quad.tail_len": 0.6, "quad.tail_thick": 0.18},
     "quad.tail_thick": {"quad.tail_len": 0.6},
     "quad.tail_tip": {"quad.tail_len": 0.6, "quad.tail_thick": 0.35, **_MARK},
@@ -1461,6 +1677,152 @@ def sex(names: list[str], seeds: list[int]) -> int:
     return bad
 
 
+# THE THRESHOLDS THE `--bulk` REPORT GATES ON, and where each one comes from.
+# `docs/quadruped-proportion-research.md` is the working; these are the numbers
+# it ends on. They are named constants rather than inline literals because the
+# next person to disagree with one should have to change it in the one place
+# that decides the verdict.
+#
+# SLENDER_MIN -- foreleg thickness over foreleg length. 0.11 is TWO
+#   independent lines arriving at the same number: it is the thinnest-legged
+#   species the owner looked at and accepted (wild boar, 0.111), and it is
+#   Infinigen's photoreal quadruped back leg, 2*0.1/1.8 = 0.111. Every species
+#   the owner rejected is below it. Voxel-art convention is far above it --
+#   Veloren 0.230, Minecraft 0.393 -- so this is a FLOOR and not a target.
+# LIMB_MIN_VOX -- the house "three voxels to read" rule applied to a limb.
+#   Neither shipped corpus puts a load-bearing limb below 2 voxels and both
+#   sit mostly at 3-4, so 3 is the floor and 2 is the hard floor.
+# GIRTH_MIN -- trunk girth over withers height. Live animals measure 1.14
+#   (horses) to 1.38 (goats) at the heart girth and a grazer's barrel is the
+#   fuller of the two, so 0.90 is NOT the anatomical figure and is not
+#   pretending to be. `tools/retune_quad_bulk.py` lifts the library to 0.95
+#   -- deliberately short of life, because the owner accepted animals sitting
+#   at 0.88 to 1.12 and a bigger move rebuilds species he did not complain
+#   about. The gate is set one solver tolerance band BELOW that target (the
+#   retune stops inside 3%, so a converged species lands at 0.92 or better),
+#   which is what makes this a regression guard rather than a restatement of
+#   the retune's own arithmetic. `docs/quadruped-proportion-research.md` §4
+#   records the whole of that decision including what was NOT done.
+SLENDER_MIN = 0.11
+LIMB_MIN_VOX = 3.0
+GIRTH_MIN = 0.90
+GIRTH_WANT = 0.95
+
+
+def bulk(names: list[str], seeds: list[int]) -> int:
+    """IS IT SHAPED LIKE AN ANIMAL, OR IS IT A WIREFRAME?
+
+    THE CHECK THIS FILE DID NOT HAVE, and its absence is why the land animals
+    shipped looking wrong while every other mode here reported clean. The sweep
+    proves each slider moves something. `--stance` proves the feet reach the
+    floor. `--parts` proves four legs are four parts. `--caps` accounts for
+    every joint ball. NONE OF THEM COMPARES ONE PART OF AN ANIMAL TO ANOTHER
+    PART OF THE SAME ANIMAL, and "lanky" is a statement about exactly that
+    comparison and about nothing else. Every mode in this file reported clean
+    on the day the owner said the animals looked wrong.
+
+    THREE NUMBERS, AND THE FIRST ONE IS THE DIAGNOSIS:
+
+      L/D     foreleg thickness over foreleg length. See `m_limb_slender` for
+              the two ratios that were tried first and did NOT separate the
+              animals the owner accepted from the ones he rejected. This one
+              separates them with no overlap.
+      GIRTH   chest girth over withers height. The livestock heart-girth
+              measurement, chosen because real published values exist for it.
+      TRUNK   width over length. A trunk seen edge-on as a thin slab is a
+              width-over-length failure, and side-on is the review camera.
+
+    ABSOLUTE VOXELS ARE PRINTED NEXT TO EVERY RATIO, because either alone
+    lies. A leg at 6% of anything is a wire on a 2 m gemsbok and sound on a
+    20 cm lemming; a leg 2 voxels across is a wire on both. The narrowest slab
+    is printed next to the median for the same reason: a limb whose median is 4
+    and whose narrowest slab is 1 has a wire in the middle of it.
+    """
+    print("\nBULK: is it shaped like an animal?\n")
+    print(f"  gates: foreleg thickness/length >= {SLENDER_MIN:.2f} "
+          f"AND >= {LIMB_MIN_VOX:g} vox across; "
+          f"chest girth >= {GIRTH_MIN:.2f} of withers")
+    print("  reference (docs/quadruped-proportion-research.md): thickness/length "
+          "-- Infinigen 0.111, Veloren 0.230, Minecraft 0.393")
+    print("  variation pinned OFF: these are the species, not one individual\n")
+    print(f"{'species':<26} {'cm':>4} {'len':>5} {'with':>5} "
+          f"{'limb':>5} {'min':>4} {'legL':>5} {'t/L':>6} "
+          f"{'girth':>6} {'g/w':>6} {'trunkWxL':>9} {'W/L':>5} {'D/w':>5}  verdict")
+    bad = 0
+    rows = []
+    for n in names:
+        s, _ = sm.load(SPECS / f"{n}.json")
+        cm = float(sm.get(s, "resolution_cm"))
+        # PINNED, FOR THE SAME REASON THE SWEEP PINS IT, and here it is not a
+        # refinement -- an unpinned run of this report is not reproducible
+        # enough to compare a before against an after.
+        #
+        # A limb is drawn as a capsule and then rasterised, so its measured
+        # span is the diameter rounded to whole voxels at whatever sub-voxel
+        # offset the centreline happened to land on. On `american-bison` a 9%
+        # length draw moves the limb radius between about 1.7 and 1.9 voxels
+        # and the measured span jumps between 3 and 5 -- a 67% swing in the
+        # headline number from an individual that is 9% different. Averaged
+        # over two seeds that came out as 3.0 one day and 5.0 the next, which
+        # would have made every before-and-after in this exercise unreadable.
+        #
+        # With the draw off, every quantity below is a property of the SPEC and
+        # one seed is the whole answer: `_params` multiplies each variation by
+        # `amount`, so at zero the layout no longer reads the stream at all.
+        s, _ = sm.patch(s, {"variation.amount": 0.0})
+        seeds = seeds[:1]
+        length = _mean(s, m_length, seeds)
+        with_h = _mean(s, m_withers_h, seeds)
+        limb = _mean(s, m_limb_dia, seeds)
+        limb_lo = _mean(s, m_limb_dia_min, seeds)
+        limb_l = _mean(s, m_limb_len, seeds)
+        slender = _mean(s, m_limb_slender, seeds)
+        girth = _mean(s, m_trunk_girth, seeds)
+        trunk_l = _mean(s, m_trunk_run, seeds)
+        trunk_w = _mean(s, m_body_width, seeds)
+        trunk_d = _mean(s, m_body_depth, seeds)
+        gw = girth / with_h if with_h > 0 else float("nan")
+        wl = trunk_w / trunk_l if trunk_l > 0 else float("nan")
+        dw = trunk_d / with_h if with_h > 0 else float("nan")
+        why = []
+        if slender < SLENDER_MIN:
+            why.append(f"foreleg {slender:.3f} thick for its length")
+        if limb < LIMB_MIN_VOX:
+            why.append(f"foreleg {limb:.1f} vox across")
+        if gw < GIRTH_MIN:
+            why.append(f"chest girth {gw:.2f} of withers")
+        bad += bool(why)
+        rows.append((n, cm, length, with_h, limb, limb_lo, limb_l, slender,
+                     girth, gw, trunk_w, trunk_l, wl, dw, why))
+        print(f"{n:<26} {cm:>4g} {length:>5.0f} {with_h:>5.0f} "
+              f"{limb:>5.1f} {limb_lo:>4.0f} {limb_l:>5.0f} {slender:>6.3f} "
+              f"{girth:>6.1f} {gw:>6.2f} {trunk_w:>4.0f}x{trunk_l:<4.0f} "
+              f"{wl:>5.2f} {dw:>5.2f}  "
+              f"{'FAIL: ' + '; '.join(why) if why else 'ok'}")
+    thin = [r for r in rows if r[14]]
+    print(f"\n  {len(thin)} of {len(rows)} species fail a bulk gate")
+    if rows:
+        print("  medians over the set:  "
+              f"foreleg {np.nanmedian([r[4] for r in rows]):.1f} vox across, "
+              f"thickness/length {np.nanmedian([r[7] for r in rows]):.3f}, "
+              f"girth/withers {np.nanmedian([r[9] for r in rows]):.2f}, "
+              f"trunk W/L {np.nanmedian([r[12] for r in rows]):.2f}")
+        worst = sorted((r for r in rows if not np.isnan(r[7])),
+                       key=lambda r: r[7])[:8]
+        print("  thinnest for their length: "
+              + ", ".join(f"{r[0]} {r[7]:.3f}" for r in worst))
+        # NOT A FAILURE, AND PRINTED ANYWAY. The gate above is the regression
+        # guard; this is the honest distance still to run. A count that only
+        # ever appears as "0 failures" hides a known gap, and the gap here is
+        # a real one -- every live ungulate measured in the research file is
+        # above 1.14 and nothing in this library is.
+        short = [r for r in rows if np.isfinite(r[9]) and r[9] < GIRTH_WANT]
+        print(f"  girth below the {GIRTH_WANT:.2f} retune target (not a "
+              f"failure): {len(short)} of {len(rows)}; live ungulates measure "
+              f"1.14 to 1.38 and nothing here reaches it")
+    return bad
+
+
 def _quad_specs() -> list[str]:
     out = []
     for p in sorted(SPECS.glob("*.json")):
@@ -1485,6 +1847,7 @@ def main() -> int:
     ap.add_argument("--lattice", action="store_true")
     ap.add_argument("--read", action="store_true")
     ap.add_argument("--sex", action="store_true")
+    ap.add_argument("--bulk", action="store_true")
     ap.add_argument("--all", action="store_true")
     args = ap.parse_args()
 
@@ -1495,7 +1858,7 @@ def main() -> int:
         return 2
 
     picked = any((args.stance, args.parts, args.caps, args.lattice,
-                  args.read, args.sex))
+                  args.read, args.sex, args.bulk))
     failures = 0
     if args.all or not picked:
         base, _ = sm.load(SPECS / f"{args.spec}.json")
@@ -1513,6 +1876,8 @@ def main() -> int:
         failures += readability(names, seeds)
     if args.all or args.sex:
         failures += sex(names, seeds)
+    if args.all or args.bulk:
+        failures += bulk(names, seeds)
 
     print(f"\nquadprobe: {failures} thing{'s' if failures != 1 else ''} to look at")
     return 0

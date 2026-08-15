@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "white-tailed-deer",
-  "notes": "THE TAIL IS THE SPECIES AND IT IS THE ONE POSE THIS GENERATOR CANNOT AUTHOR HALFWAY. A white-tail is identified by a broad tail held straight up showing pure white underneath as it flees -- so the tail is drawn raised, at `tail_deg` 80, wide and white-tipped. That is a fleeing animal standing still, which is a small dishonesty and worth naming: a grazing white-tail carries the tail down and is then a plain tan deer. Both are reachable from this spec by one field, and the raised one is authored because it is the one anybody recognises.\n\nLATTICE: 5 cm. The raised tail is 25-30 cm on a 1.8 m animal, five voxels at 5 cm, comfortably past the rule -- which is unusual here: on most deer the lattice is set by something small and on this one it is set by the largest feature the animal has.",
+  "notes": "THE TAIL IS THE SPECIES AND IT IS THE ONE POSE THIS GENERATOR CANNOT AUTHOR HALFWAY. A white-tail is identified by a broad tail held straight up showing pure white underneath as it flees -- so the tail is drawn raised, at `tail_deg` 80, wide and white-tipped. That is a fleeing animal standing still, which is a small dishonesty and worth naming: a grazing white-tail carries the tail down and is then a plain tan deer. Both are reachable from this spec by one field, and the raised one is authored because it is the one anybody recognises.\n\nLATTICE: 2 cm, moved down from 5 cm on 2026-08-15. The old note reasoned from the raised tail alone -- 25-30 cm, five voxels at 5 cm, comfortably past the rule -- and called that unusual because on most deer the lattice is set by something small. It was wrong for exactly that reason: it picked the LARGEST feature and never checked the smallest. At 5 cm this animal's skull is about seven voxels across and has to carry an ear, an antler pedicle and an eye, and the antler beam is drawn straight through where the ear sits. The right ear came out as two voxels touching nothing but the antler, so it had no joint and could not be rigged -- found by `tools/quadprobe.py --parts`, invisible in every render, and the LEFT ear was fine, which is what a sub-voxel rounding difference looks like. At 2 cm the same ear is twelve voxels and reaches the skull. Its congeners -- sika, roe and fallow deer -- were already at 2 cm; this was the outlier.",
   "placement": {
     "abundance": 0.5,
     "cluster": 0.3,
@@ -270,7 +270,7 @@
     "belly": 0.48,
     "cape": 0.0,
     "chest": 0.96,
-    "depth": 0.551,
+    "depth": 0.591,
     "dewlap": 0.0,
     "ear_back": 0.25,
     "ear_deg": 58.0,
@@ -331,7 +331,7 @@
     "waist": 0.92,
     "width": 0.5
   },
-  "resolution_cm": "5",
+  "resolution_cm": "2",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

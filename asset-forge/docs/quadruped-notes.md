@@ -242,3 +242,122 @@ and leaves it alone. It is a one-line change when someone decides.
   ridge and neither is right.
 * **The muzzle bend is three straight segments.** At three it is visibly
   faceted on a moose at 5 cm. More segments cost a full grid pass each.
+
+---
+
+## 9. The proportion pass (2026-08-15): what "lanky" turned out to be
+
+The owner's verdict on the first full library: *"All of the quadruped land
+animals do not look particularly realistic or good. They look tall lanky with
+narrow legs and bodies."* `docs/quadruped-proportion-research.md` is the
+working, the sources and the ADOPT/REJECT list. This section is what changed
+here and what it cost.
+
+### 9.1 The generator had no term for how long a leg is
+
+`quad.leg_thick` was limb diameter over the TRUNK'S DEPTH. Trunk depth is
+`quad.depth × trunk share × head-body length` — three factors, all below one,
+and all three smaller on exactly the animals that stand tallest, because a
+long neck takes share away from the trunk and a running build is shallow.
+Nothing anywhere in that chain knew the leg's own length, and the leg is long
+*because* the animal is tall. The result was that the taller the species, the
+thinner its legs came out.
+
+It is now a fraction of the limb's own length, joint to ground. All 131
+authored values were converted by solving each species against a measurement
+(`tools/retune_quad_bulk.py`), not by arithmetic, because the old reference and
+the new one are in a different ratio on every animal.
+
+**Why not a floor on top of the old expression**, which was the smaller change:
+it would have left `quad.leg_thick` authored on eighty species and doing
+nothing on them. That is this project's signature failure with a new coat on,
+and the sweep in `tools/quadprobe.py` would have started reporting the row DEAD
+and been right to.
+
+### 9.2 The probe could not see it, and that is the real lesson
+
+Every mode in `tools/quadprobe.py` reported clean on the day the owner said the
+animals looked wrong. The sweep proved all eighty rows move a number,
+`--stance` proved 524 feet reach the floor, `--parts` proved 524 legs are 524
+rigged parts, `--caps` accounted for every joint ball.
+
+**Not one of them compared one part of an animal to another part of the same
+animal**, and that comparison is the entire content of the word "lanky". A limb
+two voxels through passes every test in that file: it is present, it is its own
+part, it reaches the ground, it responds to its slider. `--bulk` is the mode
+that was missing.
+
+### 9.3 Lattice was not the answer, and it was the obvious one
+
+58 species had a foreleg under three voxels across and 24 species sit at 5 cm,
+so "move them finer" looks like the fix. It is not, because **a lattice
+multiplies both sides of a ratio**. `red-deer-stag` before the change, at its
+authored 2 cm and one tier finer:
+
+| | foreleg | free limb | t/L | asset |
+|---|---|---|---|---|
+| 2 cm | 3 vox | 50 vox | 0.060 | 16,283 vox |
+| 1 cm | 7 vox | 101 vox | 0.069 | 124,085 vox |
+
+7.6× the voxels for 15% of the ratio, all of it rounding. The proportion change
+took the same animal to 0.163 at its own 2 cm. **Proportion did the work.**
+
+### 9.4 One species did move lattice, for an unrelated reason
+
+`white-tailed-deer`, 5 cm → 2 cm. Its right ear had **no rigging joint** and
+had shipped that way: at 5 cm its skull is seven voxels across and has to carry
+an ear, an antler pedicle and an eye, the antler beam is drawn through where
+the ear sits, and the ear survived as two voxels touching nothing but antler.
+The LEFT ear was fine, which is what a sub-voxel rounding difference looks
+like.
+
+Its own lattice note is the interesting part and it is worth keeping as a
+warning: it reasoned entirely from the raised tail — 25–30 cm, five voxels at
+5 cm, "comfortably past the rule" — and explicitly called that unusual because
+on most deer the lattice is set by something small. **It picked the largest
+feature and never checked the smallest**, which is the rule inverted. The note
+now says so.
+
+### 9.5 What the numbers did
+
+| | before | after |
+|---|---|---|
+| foreleg thickness / length, median over 131 | 0.167 | 0.231 |
+| species under the 0.11 readability gate | 48 | 0 |
+| species with a foreleg under 3 voxels across | 58 | 0 |
+| trunk girth / withers, median | 0.92 | 1.01 |
+| species failing a `--bulk` gate | 96 | 1 |
+
+Twenty species did not move at all, including three of the four the owner
+called solid. Both passes only ever lift a species to a floor, never lower it,
+so "do not make the good ones worse" holds by construction.
+
+### 9.6 Still open
+
+* **`maned-wolf`** finishes at 0.83 of the girth floor with `quad.depth` at the
+  row's ceiling of 0.90. Reported, not forced. It may simply be right: the
+  animal stands at 0.95 of its own head-body length at the shoulder.
+* **The trunk is still slighter than a live animal.** Girth over withers sits
+  at 1.01 against 1.14–1.38 measured on cattle, horses, sika deer and goats.
+  The stop was deliberate — see the research file's rejection 4 — and it is the
+  obvious next thing to revisit if the owner still reads the bodies as narrow.
+* **Limb taper.** A real foreleg is 2.1–2.5× thicker at the forearm than at the
+  cannon and Infinigen authors a radius at each end; this generator draws one
+  radius with fixed multipliers. There is no `quad.leg_taper` row.
+* **Nothing varies limb proportion between individuals any more.** It used to,
+  by accident, through `variation.shape` moving `quad.depth` and `quad.depth`
+  moving the limb. Infinigen deliberately varies limb LENGTH at 20% sigma and
+  holds thickness fixed, which is probably the right model, but nothing here
+  does either yet.
+* **`tools/seed_quadrupeds.py` and `seed_quadrupeds2.py` still carry the old
+  `quad.leg_thick` and `quad.depth` drafts**, which now mean something else.
+  They are drafts and `--force` already says it discards tuning, but a rerun
+  would author 131 wire-legged animals.
+* **`out/quadrupeds-by-family/` is stale** and shows the old proportions.
+  `out/quadrupeds-by-biome/` was regenerated because its membership is derived
+  from the specs; family is not a field on a spec, so the eight family lists
+  exist only as the shell commands somebody typed, which were not recorded.
+  Remaking those sheets means retyping the lists. The before-and-after
+  comparison is in `out/quad-bulk-ab/` instead — three side-by-side sheets at
+  one scale in metres, plus the two `quadprobe --bulk` tables and a per-species
+  table.

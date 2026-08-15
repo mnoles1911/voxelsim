@@ -295,7 +295,7 @@
     "hump": 0.0,
     "hump_at": 0.16,
     "jaw": 0.3,
-    "leg_thick": 0.24,
+    "leg_thick": 0.05,
     "length_m": 0.25,
     "mane": 0.0,
     "mark": "bars",

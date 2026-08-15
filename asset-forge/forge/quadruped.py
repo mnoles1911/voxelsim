@@ -48,6 +48,18 @@ WHAT THE VOXEL BUDGET IS SPENT ON, in the order the biome survey put them:
      the same mark the fish generator calls "vertical bars", floor rules and
      all.
 
+A LIMB'S THICKNESS IS A FRACTION OF ITS OWN LENGTH
+--------------------------------------------------
+`quad.leg_thick` was a fraction of the TRUNK'S DEPTH until 2026-08-15, and that
+one wrong reference is the whole of why the owner called the first library
+"tall lanky with narrow legs and bodies". Trunk depth is three multiplications
+away from the leg and every one of them is smaller on the animals that stand
+tallest, so the taller the species the thinner its legs came out -- which is
+what lanky means. The working is in `_params` under "HOW THICK A LIMB IS" and
+the sources are in `docs/quadruped-proportion-research.md`. The number is now
+the same one Minecraft, Veloren and Infinigen are quoted in, so a figure can be
+read off that table and typed straight into a spec.
+
 THE STANCE, AND WHY A KANGAROO IS NOT A BUG
 -------------------------------------------
 A kangaroo stands on two hind legs and a heavy tail, with small forelimbs held
@@ -654,9 +666,28 @@ def _params(spec: dict, rng: np.random.Generator, voxel_m: float) -> dict:
         p_head + head_r * 1.4, p_head - head_r * 1.4,
         p_muz_base + muz_dir * muz_v + np.array([0.0, 0.0, -muz_v * 0.6]),
         p_muz_base + muz_dir * muz_v + np.array([0.0, 0.0, muz_v * 0.6]),
-        p_tail_base + tail_dir * tail_v,
-        p_tail_base + tail_dir * tail_v + np.array([0.0, 0.0, tail_r * 3.0]),
-        p_tail_base + tail_dir * tail_v - np.array([0.0, 0.0, tail_r * 3.0]),
+        # THE TAIL'S FAR END, ITS ARC AND ITS OWN THICKNESS, all three.
+        #
+        # This used to pad the tip in z only, by three tail radii, and not in x
+        # at all -- and it did not know about `tail_arc`, which bends the
+        # centreline by up to 0.55 of the tail's whole length. Neither gap
+        # showed while tails were thin. Both showed the moment the trunk got
+        # deeper, because `tail_r` is a fraction of the trunk's DEPTH: a zebra
+        # with a thick tail had it drawn straight off the back of its own grid,
+        # `VoxelGrid._write` dropped a third of it without a word (4,860 voxels
+        # of tail where 15,348 were asked for), and the arc slider measured the
+        # same number at both ends of its range because what was left was the
+        # clipped stump either way. `tools/quadprobe.py` reported
+        # `quad.tail_arc` DEAD, which is the honest description of a parameter
+        # whose effect is being thrown away.
+        #
+        # 3.6 rather than 3.0 because `_tail`'s terminal tuft is drawn at up to
+        # 3.5 times the base radius, which the old padding did not cover
+        # either.
+        *[p_tail_base + tail_dir * tail_v
+          + np.array([0.0, 0.0, tail_arc * tail_v * 0.55])
+          + np.array([sx * tail_r * 3.6, 0.0, sz * tail_r * 3.6])
+          for sx in (-1.0, 1.0) for sz in (-1.0, 1.0)],
         p_head + np.array([0.0, 0.0, head_r + ear_v * 1.05]),
         p_head + np.array([0.0, 0.0, head_r + horn_v * 1.15]),
         p_head + np.array([horn_v * 0.9, 0.0, head_r]),
@@ -1138,6 +1169,35 @@ def _ears(tag: VoxelGrid, p: dict) -> None:
         root = back + np.array([0.0, sgn * r * 0.45, 0.0]) - d * (r * 0.35)
         tip = root + d * ear_v
 
+        # A STALK DOWN INTO THE SKULL, drawn before the ear itself and for
+        # every ear shape.
+        #
+        # The inset above is 0.35 of a head radius from a point already 0.64 of
+        # a radius out from the skull's centre, so on a small head the ear's
+        # root sits within a voxel of the surface -- and whether it lands
+        # inside or outside is then decided by where the mirror plane falls
+        # between two voxel centres. That is a coin toss taken separately for
+        # each side.
+        #
+        # `white-tailed-deer` lost it. Deepening its trunk moved the head half a
+        # voxel, its RIGHT ear came away from the skull, and
+        # `tools/quadprobe.py --parts` reported "no joint (corner contact
+        # only): ear-R" -- an ear that renders perfectly and cannot be rigged,
+        # on one side of one species, from a change to the animal's chest. The
+        # left ear was fine, which is what a rounding coin toss looks like.
+        #
+        # Sunk to 0.9 of the head radius the root is unambiguously interior at
+        # any rounding, and the ear's own outline is untouched because only the
+        # BASE moves: `tip` is computed above and every branch below still
+        # draws to it.
+        # A CENTRELINE AND NOT A PLUG: `grid.capsule` at half a voxel lays a
+        # face-connected run and nothing more. Drawn at the ear's own width it
+        # displaced enough skull that `okapi`'s horn -- which roots within
+        # 0.2 of a head radius of the ear's root, see `_headgear` -- ended up
+        # surrounded by ear on all six faces and lost ITS joint instead. One
+        # rig defect traded for another is not a fix.
+        tag.capsule(root - d * (r * 0.9), root, 0.5, 0.5, T_EAR)
+
         if p["ear"] in ("round",):
             tag.capsule(root, root + d * (ear_v * 0.65),
                         max(0.6, width), max(0.6, width * 0.85), T_EAR)
@@ -1216,6 +1276,22 @@ def _headgear(tag: VoxelGrid, p: dict) -> None:
         root = (p["p_head"]
                 + np.array([-r * 0.15, sgn * r * 0.45, r * 0.55])
                 - np.array([0.0, 0.0, r * 0.30]))
+        # THE PEDICLE, and it is the same remedy the ear root needs, for the
+        # same reason. A horn roots 0.53 of a head radius from the skull's
+        # centre and an ear roots 0.64 out and 0.2 of a radius away -- so on a
+        # species with a big ear the ear plate is drawn over the pedicle, and
+        # although `_headgear` runs afterwards and reclaims the voxels the horn
+        # ITSELF occupies, every voxel around them is now ear. `okapi` shipped
+        # exactly that: its two 23-voxel spikes touched ear on 70 faces and the
+        # skull on none, so `forge.parts.joints` reported no joint and the horns
+        # could not be rigged. Nothing renders wrong; the horn is right where it
+        # should be, sitting in the ear.
+        #
+        # A run straight DOWN into the skull, drawn before the horn's own
+        # shape, reaches the head's core whatever is on the surface. Half a
+        # voxel of radius, so it is a centreline and does not become the horn.
+        tag.capsule(root - np.array([0.0, 0.0, r * 0.85]), root, 0.5, 0.5,
+                    T_HORN)
         if p["horn"] == "spike":
             tip = root + np.array([L * 0.15, sgn * spread * L * 0.5, L])
             tag.capsule(root, tip, base_r, max(0.5, base_r * 0.25), T_HORN)
@@ -1425,6 +1501,36 @@ def _legs(tag: VoxelGrid, p: dict) -> None:
     gz = p["ground_z"]
     sprawl = p["stance"] == "sprawling"
 
+    def _clear(joint: np.ndarray, radius: float) -> np.ndarray:
+        """Lift a mid-limb joint so its own thickness does not go through the
+        floor.
+
+        A JOINT IS A SPHERE AND A SPHERE HAS A BOTTOM. Every position in this
+        function is a centreline point, and `grid.capsule` sweeps a ball of the
+        limb's radius along it -- so a knee or a hock placed one radius above
+        the ground is drawn ON the ground and one placed closer is drawn
+        THROUGH it.
+
+        That never bit while limbs were thin. It bit the moment they were not:
+        a hippopotamus has a limb 4.6 voxels in radius and 15.7 long, and its
+        hock sat 2.6 voxels above the ground plane, so the capsule reached 1.5
+        voxels UNDER it. `pipeline.build` then cropped the grid to include
+        them, which moved the whole asset's floor down, and
+        `tools/quadprobe.py --stance` reported the FORE feet as 2 voxels off
+        the ground -- correctly, and at the opposite end of the animal from the
+        cause. It is the same shape of failure the gorilla's `fore_reach` had,
+        and the same check caught it.
+
+        Clamped rather than scaled, because the limb's length is solved against
+        the stance and is not this function's to change: what gives is the
+        zigzag, which is what a heavy animal's leg does anyway.
+        """
+        if joint[2] >= gz + radius:
+            return joint
+        out = joint.copy()
+        out[2] = gz + radius
+        return out
+
     for sgn in (-1.0, 1.0):
         # --- fore -----------------------------------------------------------
         a = p["p_fore"] + np.array([0.0, sgn * p["y_off"], 0.0])
@@ -1463,6 +1569,9 @@ def _legs(tag: VoxelGrid, p: dict) -> None:
                                   sgn * r * 0.4, -drop * 0.52])
             foot = np.array([a[0] + drop * p["fore_bend"] * 0.22 + over, a[1],
                              foot_z + foot_r])
+        # Each joint against the radius of the THICKEST capsule that ends on
+        # it, which for the elbow is the upper segment's `r`.
+        elbow = _clear(elbow, r)
         tag.capsule(a, elbow, r * 1.25, r, T_LEG_FORE)
         tag.capsule(elbow, foot, r, r * 0.9, T_LEG_FORE)
         tag.ball(foot, foot_r, T_LEG_FORE)
@@ -1492,6 +1601,8 @@ def _legs(tag: VoxelGrid, p: dict) -> None:
                                     -hdrop * (0.40 - 0.06 * hock)])
             foot = np.array([heel[0] + hdrop * (0.02 + 0.42 * hock), heel[1],
                              gz + foot_r])
+        knee = _clear(knee, r * 1.05)
+        heel = _clear(heel, r * 0.9)
         tag.capsule(b, knee, r * 1.35, r * 1.05, T_LEG_HIND)
         tag.capsule(knee, heel, r * 1.05, r * 0.85, T_LEG_HIND)
         tag.capsule(heel, foot, r * 0.9, r * 0.85, T_LEG_HIND)
