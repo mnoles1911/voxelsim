@@ -28,6 +28,12 @@ from .spec import get
 MAX_NODES = 30_000  # runaway guard; a dense 30 m tree lands near 6k
 MAX_CHILDREN = 4    # a node that has forked four times stops competing
 
+# How far up the trunk the root flare is allowed to reach, in metres, however
+# tall the tree is. Breast height is 1.3 m and the flare has to end below it --
+# see `_radii`, and `docs/plant-proportion-research.md` §5.4 item 2 for the
+# four-pass fit this caused.
+FLARE_REACH_MAX_M = 1.2
+
 
 @dataclass
 class Skeleton:
@@ -699,6 +705,45 @@ def _radii(spec: dict, pos: np.ndarray, parent: np.ndarray) -> np.ndarray:
     if root > 1e-9:
         radius *= float(get(spec, "trunk.radius_base_m")) / root
 
+    # Taper: how thick the stem is allowed to be at a given HEIGHT.
+    #
+    # Everything above is a function of the branching topology and nothing else.
+    # Murray's law says a parent is as thick as its children require, so a stem
+    # that has not forked yet keeps the radius it started with -- all the way up.
+    # That is a cylinder, and the library measured it as one: `birch` came out
+    # at a taper ratio of 1.00 on all three seeds, `hero-sequoia` at 0.977, a
+    # 90 m untapered column. Real stems taper, forestry has measured taper
+    # equations for a century, and `docs/plant-proportion-research.md` §5.4
+    # named this as the one shape finding a spec value could not reach: there
+    # was no d(z) anywhere in this file to author.
+    #
+    # A CEILING, NOT A MULTIPLIER, and that is the whole design. Multiplying
+    # every radius by a height profile would thin the crown as well as the bole
+    # -- but the crown is already thinned, correctly, by the branching model,
+    # and multiplying would double-count it and pinch every twig. Taking the
+    # smaller of the two instead means this term does something only where
+    # Murray's law says "cylinder": on the unforked bole. Above the first fork
+    # the branches are already thinner than this envelope and the minimum
+    # leaves them exactly as they were.
+    #
+    # THE FLOOR AT THE TWIG RADIUS IS NOT A SAFETY NET, it is the other half of
+    # the model. The envelope goes to zero at z = H, so without it the leader of
+    # a whorled conifer tapers to nothing over the top of the tree, and the
+    # foliage that hangs off those nodes goes with it. A twig is the thickness
+    # the species says a twig is; taper describes the stem below it.
+    #
+    # WHAT IT COSTS AT BREAST HEIGHT, because 78 tree specs were just fitted for
+    # diameter there against 3.4 million measured stems and this must not
+    # quietly move that fit: on a 20 m tree the envelope at 1.3 m is
+    # ((20 - 1.3) / 20) ** 0.5 = 0.967 of the base, so the fitted number moves by
+    # about 3%. It moves further on a small tree -- 0.86 at 5 m -- which is
+    # correct and is why the fit is re-measured rather than assumed after this.
+    if float(get(spec, "trunk.taper")) > 0.0 and n:
+        base_r = float(get(spec, "trunk.radius_base_m"))
+        envelope_r = np.maximum(
+            base_r * envelope.taper_factor(spec, pos[:, 2]), tip_r)
+        radius = np.minimum(radius, envelope_r)
+
     # Root flare. Thickens the wood just above the ground, which is what reads
     # as a tree standing IN the ground rather than pushed into it.
     #
@@ -708,10 +753,39 @@ def _radii(spec: dict, pos: np.ndarray, parent: np.ndarray) -> np.ndarray:
     # metres was a large fraction of a small tree and a rounding error on a
     # large one. Scaling the reach to the tree rather than to a constant is
     # what makes the same setting look right on a sapling and on an emergent.
+    #
+    # AND SCALING IT TO THE TREE ALONE IS WHY THE STEM-DIAMETER FIT TOOK FOUR
+    # PASSES. An eighth of a 24 m beech is 3 m. Breast height -- 1.3 m, where
+    # every published trunk diameter in the world is measured, and where
+    # `tools/plantprobe.py` measures ours -- was then INSIDE the flare on 50 of
+    # the 73 trees that author one, so `trunk.buttress` was inflating the
+    # measured DBH instead of sitting below it, and each pass of
+    # `tools/plantfit.py` moved the base radius by a factor the flare made
+    # non-linear. A control for how a tree meets the ground was quietly acting
+    # as a control on the number the library is fitted against.
+    #
+    # So the reach is bounded in METRES as well. 1.2 m is not a measurement, it
+    # is the largest round number that still leaves breast height outside the
+    # flare -- that is the entire argument for it, and it is the property worth
+    # holding, because it is what makes `trunk.radius_base_m` and the fitted DBH
+    # two independent numbers instead of one control fighting another.
+    #
+    # THE EXCEPTION IS THE STEM THAT IS ITSELF WIDER THAN THAT. Butt swell
+    # scales with the girth it has to support, not with the height above it, so
+    # a 4.2 m-radius sequoia does not spend its swell in a metre [estimate --
+    # no butt-swell reach was sourced in this session]. The floor is therefore
+    # one stem DIAMETER, and only the trees big enough to need it get more than
+    # 1.2 m: `hero-sequoia` keeps 8.4 m of the 10 it had, `kapok` and
+    # `jungle-emergent` keep 1.7, and every other tree in the library lands on
+    # 1.2. Those three are also exactly the species a forester would measure
+    # above the buttress rather than at 1.3 m in the first place.
     buttress = float(get(spec, "trunk.buttress"))
     if buttress > 0.0:
         height = max(float(get(spec, "height_m")), 1e-3)
-        y = np.clip(pos[:, 2] / height, 0.0, 1.0)
-        flare = (np.power(100.0, np.clip(1.0 - 8.0 * y, -3.0, 1.0)) - 1.0) / 100.0
+        reach = min(height / 8.0,
+                    max(FLARE_REACH_MAX_M,
+                        2.0 * float(get(spec, "trunk.radius_base_m"))))
+        y = np.clip(pos[:, 2] / max(reach, 1e-3), 0.0, None)
+        flare = (np.power(100.0, np.clip(1.0 - y, -3.0, 1.0)) - 1.0) / 100.0
         radius = radius * (1.0 + buttress * np.clip(flare, 0.0, None))
     return radius

@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "doum-palm",
-  "notes": "THE FORK IS THE WHOLE IDENTITY AND THE `frond` MODEL CANNOT FORK. `frond` is an unbranched trunk carrying a crown of arcing leaves, by definition. So this is built on `whorl` instead with a very small number of very long branches leaving high up -- three rings of two -- which gives a stem that splits and splits again, each arm ending in a tuft. That is the doum's structure got from the wrong model, and it is the nearest the generator reaches.\n\nA true forking palm would be a `frond` variant that allows a branching trunk. Recorded as the feature request it is.",
+  "notes": "THE FORK IS THE WHOLE IDENTITY AND THE `frond` MODEL CANNOT FORK. `frond` is an unbranched trunk carrying a crown of arcing leaves, by definition. So this is built on `whorl` instead with a very small number of very long branches leaving high up -- three rings of two -- which gives a stem that splits and splits again, each arm ending in a tuft. That is the doum's structure got from the wrong model, and it is the nearest the generator reaches.\n\nA true forking palm would be a `frond` variant that allows a branching trunk. Recorded as the feature request it is.\n\nTAPER 0: A PALM IS A CYLINDER, forked or not -- no cambium, so neither stem above the fork thins with height.",
   "placement": {
     "abundance": 0.3,
     "cluster": 0.7,
@@ -405,6 +405,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.3,
+    "taper": 0.0,
     "wander": 0.18
   },
   "tuft": {

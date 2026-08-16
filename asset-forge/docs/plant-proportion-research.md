@@ -435,6 +435,13 @@ species Tallo simply does not carry at n ≥ 40 (`crab-apple`, `hawthorn-scrub`,
 
 ### 5.4 Where the generator cannot express the real proportion
 
+**Items 1, 2 and the fifth (the 0.85) were closed on 2026-08-15 —
+see `docs/trunk-taper-and-the-deferred-five.md`.** `trunk.taper` exists,
+the root flare is bounded below breast height, and `envelope.py` calls the
+taper curve rather than a constant. Items 3 and 4 stand as written. The section
+below is left exactly as it was, because it is the measurement that motivated
+the work.
+
 Four of these were found by fitting, not by reading code.
 
 1. **Trunk taper is not a function of height, so a tree that forks little is a

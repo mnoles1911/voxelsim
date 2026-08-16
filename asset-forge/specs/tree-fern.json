@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "tree-fern",
-  "notes": "NO TAPER IS THE SPECIES. A tree fern's trunk is the same width top to bottom -- it is a mass of old frond bases, not wood -- so `radius_exp` is 3.5, the top of the range, which keeps the parent thick all the way up, and the root flare is zero. Everything else here tapers.\n\nA `frond` crown that is FLAT rather than a fountain: rise 0.35 with a low droop, so the fronds go out rather than up. Head-height understorey, which is the layer the rainforest file says the biome is missing.",
+  "notes": "NO TAPER IS THE SPECIES. A tree fern's trunk is the same width top to bottom -- it is a mass of old frond bases, not wood -- so `radius_exp` is 3.5, the top of the range, which keeps the parent thick all the way up, and the root flare is zero. Everything else here tapers.\n\nA `frond` crown that is FLAT rather than a fountain: rise 0.35 with a low droop, so the fronds go out rather than up. Head-height understorey, which is the layer the rainforest file says the biome is missing.\n\nTAPER 0 IS NOW SAID DIRECTLY. `radius_exp` 3.5 was the only way to say 'does not taper' before `trunk.taper` existed, and it says it by keeping every PARENT thick rather than by describing the stem; the note above ('everything else here tapers') was true of the intent and not of the generator, which measured `birch` at a taper ratio of 1.00 and had no d(z) at all.",
   "placement": {
     "abundance": 0.6,
     "cluster": 0.85,
@@ -405,6 +405,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.13,
+    "taper": 0.0,
     "wander": 0.1
   },
   "tuft": {

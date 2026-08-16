@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "date-palm",
-  "notes": "THE TALLEST PALM IN THE LIBRARY and deliberately STIFFER than the shipped `coast-palm`: `frond.rise` 1.25 against 0.85 and a much lower droop, so the crown is an upright fountain rather than a spreading spray. A coconut palm leans and hangs; a date palm stands.\n\nOne of the two silhouettes the desert file says say 'desert' from a kilometre away, and it places against the biome's three water exceptions rather than across sand.",
+  "notes": "THE TALLEST PALM IN THE LIBRARY and deliberately STIFFER than the shipped `coast-palm`: `frond.rise` 1.25 against 0.85 and a much lower droop, so the crown is an upright fountain rather than a spreading spray. A coconut palm leans and hangs; a date palm stands.\n\nOne of the two silhouettes the desert file says say 'desert' from a kilometre away, and it places against the biome's three water exceptions rather than across sand.\n\nTAPER 0: A PALM IS A CYLINDER -- no cambium, no secondary thickening, the trunk is the width the crown laid down and stays it.",
   "placement": {
     "abundance": 0.4,
     "cluster": 0.9,
@@ -405,6 +405,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.34,
+    "taper": 0.0,
     "wander": 0.1
   },
   "tuft": {

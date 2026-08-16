@@ -109,6 +109,54 @@ _ALT_BODY_MARKS = ("same",) + _BODY_MARKS
 # `SEED_INVARIANT`. `docs/biomes/README.md` §4.2 predicted a repeat of the
 # bird-pose seed trap here; it does not arise, because animals ship in one pose
 # (owner, 2026-08-14) and there is no second authored posture to reseed against.
+# WHAT A GROUND PLANT MAY BE MADE OF -- ONE MENU FOR THE STEM AND THE HEAD.
+#
+# THE FAILURE THIS ENDS, from `docs/aquatic-species.md` §8.6a. These were two
+# different menus: `materials.stem` offered seven land-vegetation greens and
+# browns, `materials.head` offered fourteen, and they overlapped in only four --
+# there was no `leaf_jungle` and no `podzol` anywhere in `head`. A head material
+# outside its own menu is not refused, it is REPLACED WITH THE DEFAULT, and the
+# default here is `leaf_blossom`, a pink at (226,168,190). So the first draft of
+# `tools/seed_freshwater_plants.py` shipped a brown-cigar cattail, a
+# black-spiked pond sedge and two sets of lotus pads ALL WEARING BLOSSOM PINK,
+# and every one of them validated clean, built clean and reported success.
+#
+# That is this project's signature failure exactly: it ran, it said it worked,
+# and it drew the wrong thing. And note where the silence actually lives --
+# `validate` does emit a warning, but the SAVED spec then holds `leaf_blossom`,
+# so from that moment on the file on disk is self-consistent and no gate
+# downstream can ever tell. `tools/buildcheck.py` fails on any spec warning at
+# load and could not have caught this, because by the time the file existed
+# there was nothing left to warn about. The window between authoring and saving
+# is the whole window, and a printed warning is the only thing in it.
+#
+# So the fix is not a louder warning, it is to remove the mismatch: one tuple,
+# read by both rows, and `forge/ground.py` -- the file that resolves both --
+# asserts at import that the two rows still share it. That is the same guard
+# `envelope.py` puts on crown shapes and `rasterize.py` puts on foliage habits,
+# for the same reason and after the same class of accident.
+#
+# ADDITIVE, SO NOTHING RESEEDS. Neither default moves and no choice is removed,
+# so every spec's canonical JSON is byte-identical and no individual changes.
+# Every name here is already in `forge/palette.py` and inside the engine's
+# `kMaterialCount`, which `forge.cli selftest` gates on.
+#
+# WHAT THE UNION BUYS BEYOND THE BUG. §8.6a's two other complaints were that
+# there is no dark brown in `head` at all -- `broadleaf-cattail` and
+# `lesser-pond-sedge` both carry `leaf_autumn`, an orange, and both say so in
+# their notes -- and no dark red, which cost `marsh-cinquefoil` its blackish
+# purple-red. `podzol` answers the first. `skin_red` is added for the second: it
+# is the darkest red in the palette, against `plume_crimson` (208,40,56) which
+# is the bright orange-red those specs are wearing now.
+_PLANT_MATERIALS = (
+    # vegetation: greens, browns, straw, snow
+    "grass", "savanna_grass", "leaf_broadleaf", "leaf_needle", "leaf_jungle",
+    "leaf_dry", "leaf_autumn", "podzol", "snow",
+    # flower and seed-head colours
+    "leaf_blossom", "plume_white", "plume_crimson", "plume_lilac", "plume_buff",
+    "skin_blue", "skin_yellow", "skin_orange", "skin_red",
+)
+
 _QUAD_STANCES = ("standing", "sprawling", "bipedal")
 _QUAD_EARS = ("none", "round", "pointed", "blade", "fan", "tufted")
 _QUAD_HORNS = ("none", "spike", "curve", "sweep", "spiral", "palmate", "branched")
@@ -176,18 +224,103 @@ PARAMS: tuple[Param, ...] = (
            "serves every kind that grows; rocks ignore it and use their own "
            "size. Anything much over about 30 m is a set piece rather than "
            "scenery — check the grid size it asks for before generating."),
+    # THE HELP TEXT BELOW WAS REWRITTEN 2026-08-15 BECAUSE IT DESCRIBED A WORLD
+    # THAT NO LONGER EXISTS. It read "5 cm IS THE DEFAULT AND EVERY ASSET USES
+    # IT" and "nothing authored at 2.5 cm or below can be put in the world",
+    # both of which the owner's 2026-08-14 ruling on lattices (see
+    # `forge/kinds.py`) overturned and which the library on disk contradicts:
+    # measured over all 828 specs, 312 are at 5 cm, 226 at 1 cm, 187 at 10 cm
+    # and 103 at 2 cm. Of 131 quadrupeds, 63 are at 2 cm, 42 at 1 cm and 26 at
+    # 5 cm. A help string that a reader can falsify by opening any bird spec is
+    # worse than none, because it is the sentence they will trust.
+    #
+    # AND IT IS A CHOICE, WHICH MEANS AN OUT-OF-MENU VALUE IS REPLACED WITH "5"
+    # AND THE ASSET STILL BUILDS. `resolution_cm` is the most expensive place in
+    # this table for that to happen -- it scales an asset's voxel count by the
+    # cube of the ratio, so a spec authored "3" builds at 5 cm and comes back
+    # about 4.6x lighter than the author thinks it is. It happened: six
+    # quadrupeds authored at "3" were measured against the same six at "5" and
+    # came back BYTE-IDENTICAL -- elephant 62,635 both, hippo 20,682 both, rhino
+    # 18,308, yak 12,651, camel 4,112, bison 6,748 -- and a whole measurement
+    # pass was spent believing a 3 cm option had been priced. Same failure as
+    # the blossom-pink cattail in `_PLANT_MATERIALS`, with a bigger bill.
+    # `forge.cli selftest` now trips a bogus value through EVERY choice
+    # parameter in this table, this one included, every run.
     P("resolution_cm", "Voxel size", "5", kind="choice", group="general",
       choices=("10", "5", "2.5", "2", "1"),
-      help="Edge length of one voxel, and the size the asset EXPORTS at. "
-           "5 cm IS THE DEFAULT AND EVERY ASSET USES IT. The terrain is 10 cm "
-           "and the asset lattice is 5 cm, which nests 2:1 inside it — eight "
-           "fine voxels per coarse one. Keeping every asset on one size means "
-           "nothing ever has to ask which lattice a given object lives in. "
-           "The other sizes are for hero renders and comparisons; nothing "
-           "authored at 2.5 cm or below can be put in the world. Previews pick "
-           "their own size to stay cheap and say so when it differs from this."),
+      help="Edge length of one voxel, and the size the asset EXPORTS at.\n\n"
+           "THIS IS A MENU, NOT A NUMBER. A value that is not on it is not "
+           "refused — it is silently replaced with 5 and the asset builds "
+           "anyway, roughly 4.6x lighter than a 3 cm author expects. There is "
+           "no 3 cm and no 4 cm.\n\n"
+           "WHICH SIZE IS NOT A MATTER OF TASTE, it follows from the kind "
+           "(owner, 2026-08-14; see forge/kinds.py). A tree or a rock JOINS THE "
+           "WORLD'S OWN VOXEL GRID and is destructible as terrain is, so it is "
+           "authored at the terrain's 10 cm and nothing else is legal — the "
+           "selftest refuses one that is not. Everything else — bushes, ground "
+           "cover, fish, birds and land animals — is a DETAIL asset carrying "
+           "its own grid and its own transform, so its lattice is free.\n\n"
+           "For those, the rule is measured rather than chosen: the COARSEST "
+           "voxel at which the species' smallest identifying feature is still "
+           "about three voxels across. That is why the library sits where it "
+           "does — 5 cm for ground cover, 1 cm for a bird whose eye stripe is a "
+           "centimetre, 2 cm for most land animals. Previews pick their own "
+           "size to stay cheap and say so when it differs from this."),
 
-    P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.05, 12.0, 0.01, group="trunk"),
+    P("trunk.radius_base_m", "Trunk radius at base (m)", 0.30, 0.01, 12.0, 0.01, group="trunk"),
+    # THE STEM HAD NO d(z) AT ALL, AND THE LIBRARY MEASURED IT.
+    #
+    # `skeleton._radii` derives every node's radius from Murray's law over the
+    # branching topology and rescales the whole tree so the root equals
+    # `trunk.radius_base_m`. Thickness was therefore entirely a consequence of
+    # WHERE BRANCHES FORK, and a stem that forks little came out a post:
+    # `birch` measured a taper ratio of 1.00 on all three seeds -- a perfect
+    # cylinder from the ground to the first fork -- and `hero-sequoia` measured
+    # 0.977 / 0.977 / 0.988, i.e. a 90 m untapered column.
+    # `docs/plant-proportion-research.md` §5.4 calls this the one finding there
+    # that a spec value cannot reach, because there was no term to author.
+    #
+    # This is that term. `r(z) = r_base * ((H - z) / H) ** taper`, applied as a
+    # CEILING on the radius Murray's law already worked out rather than as a
+    # multiplier on it, so it can only remove wood and never add any: where the
+    # tree has already forked, Murray is thinner than this envelope and nothing
+    # changes; on the unforked bole, where Murray says "cylinder", this is what
+    # is left. Floored at `growth.tip_radius_m`, so the envelope going to zero
+    # at the top of the tree cannot thin a twig below the twig radius the
+    # species authored -- without that floor the leader of a whorled conifer
+    # tapers away to nothing and takes its foliage anchors with it.
+    #
+    # THE EXPONENT IS THE CLASSICAL SOLID OF REVOLUTION and the default is not
+    # a fitted number. 0 is a cylinder, 1/3 is Metzger's cubic paraboloid (the
+    # stem as a beam of uniform resistance to bending, 1893), 0.5 is the plain
+    # paraboloid that most of the taper literature treats as the shape of the
+    # merchantable bole, 1.0 is a cone and above that runs neiloid, which is
+    # what the butt swell under breast height really is -- and that part is
+    # `trunk.buttress`, not this. The default sits at the paraboloid.
+    #
+    # WHAT THE DEFAULT IS WORTH AT 10 CM, so nobody tunes the second decimal:
+    # on a 20 m tree, halfway up, 0.4 and 0.6 differ by 0.758 vs 0.660 of the
+    # base radius. On a 40 cm stem that is under half a voxel. One significant
+    # figure is all this lattice can carry, which is the same argument
+    # `envelope.lame` makes for not separating Scots pine from Norway spruce by
+    # 0.07 of a crown exponent.
+    #
+    # NOT MEASURED AGAINST A PUBLISHED TAPER EQUATION. The plant fit looked for
+    # one and found none it could licence-clear (research §8, "Trunk taper, for
+    # any species -- no taper equation was obtained"), so the library's 0.53-1.71
+    # spread was measured against nothing. It still is. What has changed is that
+    # there is now a term to put a measurement INTO when one arrives, and a
+    # per-species knob to put it in per species.
+    P("trunk.taper", "Trunk taper", 0.50, 0.0, 1.5, 0.05, group="trunk",
+      help="How fast the stem thins with height. 0 is a true cylinder — which "
+           "is the right answer for a palm, a bamboo and a tree fern, because "
+           "a monocot stem does not lay down new wood and really is the same "
+           "thickness all the way up. 0.33 is a stem built like a beam of "
+           "uniform bending strength, 0.5 a paraboloid (the default, and the "
+           "usual description of a woody bole), 1.0 a cone. Only ever thins "
+           "the tree: it is a ceiling on the thickness the branching model "
+           "already worked out, so it bites on the unforked bole and leaves "
+           "the crown alone, and it never thins a twig below the twig radius."),
     P("trunk.clear_frac", "Branch-free height", 0.35, 0.0, 0.90, 0.01, group="trunk",
       help="Fraction of total height with bare trunk. High for jungle emergents, low for bushes."),
     P("trunk.lean_deg", "Lean", 3.0, 0.0, 40.0, 0.5, group="trunk"),
@@ -237,7 +370,46 @@ PARAMS: tuple[Param, ...] = (
            "is why it is off unless asked for. The relations are for "
            "forest-grown trees — an open-grown crown on the same stem runs "
            "10-30% wider."),
-    P("crown.radius_m", "Crown radius (m)", 3.5, 0.3, 60.0, 0.1, group="crown"),
+    # THE FOUR FLOORS BELOW USED TO PUT A HALF-METRE MINIMUM UNDER A KIND WHOSE
+    # LATTICE IS FREE. `crown.radius_m` 0.30, `growth.influence_m` 0.40,
+    # `growth.step_m` 0.08 and `trunk.radius_base_m` 0.05 are metre-scale bounds,
+    # and a `bush` is a detail-lattice kind that may be authored at 1 cm. On a
+    # 25 cm plant the crown-radius floor alone was 1.2x the whole plant's height
+    # and the reach floor was 1.6x it, so every growth target sat outside the
+    # plant. Five aquatic species were moved to tuft kinds to get round it and
+    # `dead-mans-fingers` did not merely come out thin -- it failed
+    # `pipeline.health` outright at seed 2 with "bare: the trunk never
+    # branched", after building 1,079 voxels at seed 1
+    # (docs/aquatic-species.md §8.8).
+    #
+    # MEASURED BEFORE LOWERING THEM, a 0.25 m plant on the same spec, five seeds
+    # each, against the 94-185 voxel band a shipped small tuft occupies:
+    #
+    #     0.60 m at 5 cm, as `sea-oak-weed` ships    212-246 vox, fork order 3-4
+    #     0.25 m at 5 cm, floors as they were         66- 89 vox, order 2-3
+    #     0.25 m at 5 cm, floors lowered              45- 55 vox, order 2-4
+    #     0.25 m at 2 cm, floors lowered             171-196 vox, order 3-5
+    #     0.25 m at 1 cm, floors lowered             626-660 vox, order 5-8
+    #
+    # So the floor was never really a floor on the PLANT, it was a floor on the
+    # LATTICE: at 5 cm nothing rescues a 25 cm bush, because eight growth steps
+    # of 8 cm is 0.64 m and that is what it takes to reach a fork -- which is
+    # why 0.60 m is the smallest bush in the library that works, to within a
+    # voxel of the arithmetic. Bring the lattice down with the plant and the
+    # same species builds in the shipped band WITH the dichotomous forking that
+    # moving it to a tuft threw away.
+    #
+    # WHAT STOPS SOMEBODY SETTING NONSENSE, now that the blanket floors are
+    # gone: `validate`'s cross-checks below already refuse the combinations that
+    # matter -- kill >= influence ("the tree will be a bare trunk", which is
+    # exactly what `dead-mans-fingers` printed) and step > influence. Those are
+    # relationships between the three, which is what actually governs whether
+    # colonization can branch; a fixed metre bound never was. And the runaway
+    # these might be imagined to guard against does not exist: a 30 m beech at
+    # `step_m` 0.02 was measured at 10.0 s and 7,227 voxels, i.e. it degenerates
+    # into a scribble at the same cost as any other bad number, rather than
+    # exploding. MAX_NODES already holds that end.
+    P("crown.radius_m", "Crown radius (m)", 3.5, 0.05, 60.0, 0.1, group="crown"),
     P("crown.height_frac", "Crown height", 0.65, 0.10, 1.0, 0.01, group="crown",
       help="Crown's vertical extent as a fraction of tree height."),
     P("crown.center_frac", "Crown centre", 0.66, 0.20, 0.98, 0.01, group="crown"),
@@ -283,10 +455,11 @@ PARAMS: tuple[Param, ...] = (
            "suits irregular broadleaf crowns. 'whorl' builds rings of branches up a "
            "straight leader, which is what a conifer actually is — a spruce's tiers "
            "are a real structure, not an irregular crown that happens to look tiered."),
-    P("growth.step_m", "Segment length (m)", 0.35, 0.08, 6.0, 0.01, group="growth"),
-    P("growth.influence_m", "Reach (m)", 3.0, 0.4, 60.0, 0.1, group="growth",
+    P("growth.step_m", "Segment length (m)", 0.35, 0.02, 6.0, 0.01, group="growth",
+      help="How far a branch grows in one iteration. See the floors note on crown.radius_m: this one is the binding constraint on how small a plant the branching model can draw, because it takes about eight steps of trunk to reach a fork."),
+    P("growth.influence_m", "Reach (m)", 3.0, 0.03, 60.0, 0.1, group="growth",
       help="How far a branch tip can see a growth target."),
-    P("growth.kill_m", "Target consumption (m)", 0.70, 0.10, 16.0, 0.05, group="growth",
+    P("growth.kill_m", "Target consumption (m)", 0.70, 0.02, 16.0, 0.05, group="growth",
       help="Low values give long thin twigs, high values give stubby branching."),
     P("growth.gravity", "Droop", -0.12, -1.0, 1.0, 0.01, group="growth",
       help="Negative droops branches down (willow), positive lifts them up."),
@@ -830,9 +1003,10 @@ PARAMS: tuple[Param, ...] = (
     P("tuft.head_share", "Stems with a head", 1.0, 0.0, 1.0, 0.05, group="tuft",
       help="Fraction of stems that carry one. Below 1 the rest are plain stems, "
            "which is how a flowering plant gets its leaves for free."),
+    # ONE MENU. `materials.stem` and `materials.head` used to be two, and the
+    # mismatch between them was silent -- see `_PLANT_MATERIALS`.
     P("materials.stem", "Stem", "grass", kind="choice", group="tuft",
-      choices=("grass", "savanna_grass", "leaf_dry", "leaf_needle",
-               "leaf_broadleaf", "leaf_jungle", "podzol")),
+      choices=_PLANT_MATERIALS),
     # THE BLOOM PALETTE WAS SEVEN ENTRIES AND SIX OF THEM WERE FOLIAGE.
     # `leaf_blossom` is a pale cherry pink, `leaf_autumn` a brown-orange,
     # `leaf_dry` a straw yellow, and the other four are green, tan and snow. A
@@ -855,10 +1029,7 @@ PARAMS: tuple[Param, ...] = (
     # a gentian are the same turquoise, and inventing a second one so the name
     # could read "petal" would be tidiness of naming beating the picture.
     P("materials.head", "Head", "leaf_blossom", kind="choice", group="tuft",
-      choices=("leaf_blossom", "leaf_dry", "leaf_autumn", "savanna_grass",
-               "grass", "snow", "leaf_broadleaf",
-               "plume_white", "plume_crimson", "plume_lilac", "plume_buff",
-               "skin_blue", "skin_yellow", "skin_orange")),
+      choices=_PLANT_MATERIALS),
 
     # --- fish ---------------------------------------------------------------
     #
@@ -2622,8 +2793,20 @@ def validate(spec: dict) -> tuple[dict, Report]:
             if p.kind == "int":
                 val = int(round(val))
         elif p.kind == "choice" and val not in p.choices:
+            # NAME THE CONSEQUENCE, NOT THE RULE. This used to read "not one of
+            # (...), using 'leaf_blossom'", which is true and reads as
+            # housekeeping; what actually happened is that four species were
+            # DRAWN IN PINK and shipped. A warning that says what the asset will
+            # look like is a different thing to scroll past.
+            #
+            # And this is the last moment anyone can see it. The substituted
+            # value is what gets saved, so from here on the file on disk is
+            # self-consistent and no later gate -- `buildcheck`, `selftest`,
+            # `health` -- has anything to find. See `_PLANT_MATERIALS`.
             rep.warnings.append(
-                f"{p.path}: {val!r} not one of {p.choices}, using {p.default!r}"
+                f"{p.path}: {val!r} is not on the menu, so this asset will be "
+                f"BUILT AND DRAWN AS {p.default!r} instead -- nothing "
+                f"downstream will report it again. Menu: {p.choices}"
             )
             continue
         set_(out, p.path, val)
@@ -2763,6 +2946,42 @@ def spec_hash(spec: dict) -> str:
 # `tools/birdprobe.py --lattice` compares 1 cm with 5 cm on one individual.
 SEED_INVARIANT: tuple[str, ...] = ("bird.pose",)
 
+# Fields DELETED from the seed hash rather than normalised in it, for the one
+# reason normalising cannot cover: a parameter that did not exist yesterday.
+#
+# THE ARITHMETIC THAT FORCES THIS, because it is not obvious and it cost the
+# library a full reseed twice already. `validate` starts from `default_spec()`,
+# so every saved spec carries every parameter -- which means ADDING A ROW TO
+# `PARAMS` PUTS A NEW KEY IN ALL 828 SPECS' CANONICAL JSON. Normalising that key
+# to its default (the `SEED_INVARIANT` route above) does not help: the key is
+# still in the body, the bytes are still new, every hash moves and every species
+# in the library becomes a different individual. The README already records what
+# that costs -- "adding any row to `spec.PARAMS` changes every spec's hash ...
+# every species in the library moved to a different individual", which is how
+# `hero-sequoia` landed on a shedding seed. Deleting the key restores the exact
+# bytes the library hashed before the row existed, so the reseed is zero.
+#
+# `tools/trunkform.py --hashes` measures that claim against a snapshot rather
+# than asserting it: 828 of 828 seed hashes unchanged, and it is a one-line
+# check that would have caught the two earlier reseeds while they were still
+# reversible.
+#
+# WHY TAPER BELONGS HERE ON ITS MERITS AS WELL, and not only as an accounting
+# trick. A before/after render of a taper change has to be the SAME individual
+# on both sides or it is not a comparison -- `tools/plantsheet.py` exists
+# because scaling each tile separately "silently undoes the comparison", and
+# drawing two different trees undoes it far more thoroughly. Seeded from a hash
+# that taper is part of, the before tree and the after tree differ in height,
+# lean, crown and every twig, and no amount of locked scale recovers that. So:
+# taper changes the SHAPE OF THE STEM of a given individual, exactly as
+# `bird.pose` changes the posture of a given bird.
+#
+# WHAT DOES NOT GO HERE: anything that makes it a different plant. Height,
+# crown radius and trunk radius are all seeded, and should be -- they are what
+# `variation` draws per individual. This list is for a field that redraws the
+# same individual differently, and it should stay as short as `SEED_INVARIANT`.
+SEED_EXCLUDED: tuple[str, ...] = ("trunk.taper",)
+
 
 def seed_hash(spec: dict) -> str:
     """Which INDIVIDUAL of a species you get. See `SEED_INVARIANT` above.
@@ -2781,6 +3000,18 @@ def seed_hash(spec: dict) -> str:
             continue          # already the default: bytes unchanged
         body = copy.deepcopy(body)
         set_(body, path, row.default)
+    for path in SEED_EXCLUDED:
+        if get(body, path, _MISSING) is _MISSING:
+            continue
+        body = copy.deepcopy(body)
+        parts = path.split(".")
+        cur = body
+        for key in parts[:-1]:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict):
+                break
+        if isinstance(cur, dict):
+            cur.pop(parts[-1], None)
     return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
 
 

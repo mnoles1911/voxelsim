@@ -31,9 +31,32 @@ import numpy as np
 
 from . import materials
 from .grid import VoxelGrid, m_to_vox
-from .spec import get
+from .spec import BY_PATH, get
 
 _UP = np.array([0.0, 0.0, 1.0])
+
+# THE STEM MENU AND THE HEAD MENU ARE THE SAME MENU, AND THIS IS WHERE THAT IS
+# CHECKED, because this is the file that resolves both of them.
+#
+# They used to differ -- seven entries against fourteen, overlapping in four --
+# and a head material that was only in the stem list came back as
+# `leaf_blossom`, a pink, with no error anywhere. `docs/aquatic-species.md`
+# §8.6a has the four species that shipped that way. The menus are one tuple in
+# `spec.py` now, and this asserts they still are: widening one and forgetting
+# the other is a two-line change that would reopen the same hole, and it would
+# reopen it SILENTLY, which is the only reason this is an assert at import
+# rather than a note in a docstring.
+#
+# Same guard, same reasoning, as `envelope.py` on crown shapes and
+# `rasterize.py` on foliage habits. Both of those were written after a choice
+# fell through to a default and nobody could see it for months.
+assert BY_PATH["materials.stem"].choices == BY_PATH["materials.head"].choices, (
+    "forge/spec.py: materials.stem and materials.head no longer offer the same "
+    "menu; an out-of-menu choice is replaced with the default, silently, and "
+    "the default head material is a pink -- see docs/aquatic-species.md 8.6a")
+assert all(n in materials.BY_NAME for n in BY_PATH["materials.stem"].choices), (
+    "forge/spec.py: the plant material menu names something "
+    "forge/materials.py cannot resolve")
 
 
 def build(spec: dict, rng: np.random.Generator, voxel_m: float) -> VoxelGrid:

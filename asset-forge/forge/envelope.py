@@ -127,6 +127,32 @@ def profile_for(shape: str):
     return _PROFILES.get(shape, _PROFILES["sphere"])
 
 
+BREAST_HEIGHT_M = 1.3
+
+
+def taper_factor(spec: dict, z_m):
+    """Stem thickness at height `z_m`, as a fraction of the thickness at the base.
+
+    The shape of the bole, in one line: `((H - z) / H) ** trunk.taper`. 0 is a
+    cylinder, 1/3 a beam of uniform bending strength, 1/2 a paraboloid, 1 a cone.
+    `spec.py`'s `trunk.taper` row carries the argument for the default.
+
+    Lives here rather than in `skeleton.py` because two callers need the same
+    curve and only one of them grows a skeleton: `skeleton._radii` applies it as
+    a ceiling on every node's radius, and `apply_allometry` below needs the
+    single number it produces at breast height. THEY MUST BE THE SAME FUNCTION.
+    The version of that conversion this replaced was a hardcoded 0.85 whose own
+    comment called it "a taper allowance, not a measurement", standing where a
+    0.53-1.71 range lives; the library's measured median turned out to be 0.83,
+    so the guess was a good one and it was still a constant pretending to be a
+    model. Now the crown allometry is told what this tree's stem actually does.
+    """
+    height = max(float(get(spec, "height_m")), 1e-3)
+    taper = float(get(spec, "trunk.taper"))
+    frac = np.clip(1.0 - np.asarray(z_m, np.float64) / height, 0.0, 1.0)
+    return frac ** taper if taper > 0.0 else np.ones_like(frac)
+
+
 def apply_allometry(spec: dict) -> dict:
     """Derive crown size from trunk thickness, instead of setting it by hand.
 
@@ -159,9 +185,13 @@ def apply_allometry(spec: dict) -> dict:
         return spec
 
     height = float(get(spec, "height_m"))
-    # Breast height is above the flare, so the stem is thinner there than at
-    # the base. The 0.85 is a taper allowance, not a measurement.
-    dbh_cm = 2.0 * float(get(spec, "trunk.radius_base_m")) * 0.85 * 100.0
+    # Breast height is above the flare, so the stem is thinner there than at the
+    # base. HOW MUCH thinner is now the generator's own taper curve rather than
+    # a constant -- see `taper_factor`. A species that authors `trunk.taper` 0,
+    # which is a palm or anything else that does not lay down new wood, is
+    # correctly told its stem is the same width at 1.3 m as at the ground.
+    dbh_cm = (2.0 * float(get(spec, "trunk.radius_base_m"))
+              * float(taper_factor(spec, BREAST_HEIGHT_M)) * 100.0)
     if mode == "conifer":
         radius, length = 0.045 * dbh_cm + 1.2, 0.040 * dbh_cm + 2.7
     else:

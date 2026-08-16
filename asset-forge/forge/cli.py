@@ -599,6 +599,63 @@ def cmd_selftest(args) -> int:
         print(f"    ! {line}")
     ok &= not off
 
+    # WHAT A SPEC SAYS IS WHAT GETS BUILT.
+    #
+    # `spec.validate` never raises: an out-of-menu choice is replaced with the
+    # parameter's default and reported as a warning, and the REPLACEMENT is what
+    # gets saved. That is how four freshwater plants shipped in blossom pink --
+    # a brown-cigar cattail, a black-spiked sedge and two sets of lotus pads,
+    # all validating clean and building clean (docs/aquatic-species.md §8.6a).
+    # Once such a spec is on disk it is self-consistent and undetectable, so
+    # there are exactly two places to stand: the moment of authoring, and here.
+    #
+    # Two checks, and the second is the one with teeth.
+    #
+    # 1. Every spec on disk survives a raw load unchanged. This catches a
+    #    HAND-EDITED spec -- which is a real authoring route, `docs/biomes`
+    #    §9.6 says tuning a frond means editing JSON by hand -- and a spec left
+    #    behind by a parameter that moved. `buildcheck` already does this per
+    #    build; it is here because it is cheap, it runs under --quick, and this
+    #    is the command people run before committing.
+    #
+    # 2. The substitution machinery is EXERCISED, not trusted. A bogus value is
+    #    pushed through `spec.patch` on EVERY choice parameter in the table --
+    #    not a hand-picked few, because the expensive one is never the one you
+    #    would have picked. `resolution_cm` is the proof: six quadrupeds were
+    #    authored at "3", which is not on its menu, and came back BYTE-IDENTICAL
+    #    to the same six at "5" -- elephant 62,635 voxels either way -- so a
+    #    measurement pass was spent pricing a 3 cm option that was never built.
+    #    A silent substitution is invisible by construction, so the only way to
+    #    know the alarm still works is to trip it on purpose, every time. The
+    #    day someone "simplifies" that warning away, this is what says so.
+    laundered, mute = [], []
+    for p in spec_paths():
+        try:
+            raw = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            laundered.append(f"{p.stem}: unreadable ({e})")
+            continue
+        _, rep = specmod.validate(raw)
+        for w in rep.warnings:
+            laundered.append(f"{p.stem}: {w}")
+    probe = specmod.default_spec()
+    # `text` rows take any string by design; `choice` rows are the ones that
+    # substitute. `kind` is excluded because changing it changes which
+    # parameters apply at all, which is a different question from this one.
+    menus = [p for p in specmod.PARAMS if p.kind == "choice" and p.path != "kind"]
+    for p in menus:
+        _, rep = specmod.patch(probe, {p.path: "definitely-not-a-real-choice"})
+        if not any(p.path in w for w in rep.warnings):
+            mute.append(f"{p.path}: an out-of-menu value was accepted in silence "
+                        f"(menu: {p.choices})")
+    print(f"  every spec says what it builds: "
+          f"{'pass' if not laundered and not mute else 'FAIL'} "
+          f"({len(spec_paths())} specs re-validated from disk, "
+          f"{len(mute)} of {len(menus)} choice menus silent)")
+    for line in laundered + mute:
+        print(f"    ! {line}")
+    ok &= not laundered and not mute
+
     # A SPECIES MAY ONLY BE WEIGHTED INTO A BIOME THAT HOSTS ITS KIND.
     #
     # `spec.py` gates the app's sliders with `kinds=b.hosts`, which is a UI

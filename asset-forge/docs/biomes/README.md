@@ -537,6 +537,13 @@ round, which is `spots` exactly.
   over. **Fallen mossy log** and **driftwood snag** are therefore not
   authorable, and both biome files already say the answer is `desert-dead`
   rotated — which is a placement decision, not a spec.
+  **Measured 2026-08-15 and the cap turns out not to be the blocker at all**:
+  forced to 90° in memory, `desert-dead` builds an asset that is MORE vertical
+  than at 40° (longest ÷ tallest 0.92 against 0.98, and 0.56 with wander off),
+  and `pipeline.health` calls it clean every time. Three mechanisms hold it up
+  and none is the cap — see `docs/trunk-taper-and-the-deferred-five.md` §6.
+  Raising the cap would ship a knob that reports success and does nothing. The
+  rotated-placement answer stands.
 * **No two generators in one grid.** `forge/pipeline.py` dispatches one
   generator per build, so **root-split block** — a rock and a root in the same
   asset — has no route. A split block with no root is not the asset.

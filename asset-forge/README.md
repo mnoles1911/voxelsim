@@ -1516,8 +1516,14 @@ Before calling a change done, run all three:
     python tools/healthpass.py 1 2 3     # every species, three seeds, flagged
     python -m forge.cli selftest         # determinism, connectivity, round trips,
                                          # that palette.py is still generated from
-                                         # the engine header, and that every build
-                                         # is ONE connected piece
+                                         # the engine header, that every build
+                                         # is ONE connected piece, and that every
+                                         # spec still SAYS what it builds — an
+                                         # out-of-menu choice is replaced with the
+                                         # parameter's default and the replacement
+                                         # is what gets saved, so a bogus value is
+                                         # tripped through five menus every run to
+                                         # prove the warning still fires
     python tools/buildcheck.py           # builds every spec in specs/ and fails on
                                          # a second piece, a spec warning, a health
                                          # problem, or a build that raises

@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "screwpine",
-  "notes": "`whorl` FOR A THING THAT LOOKS LIKE A PALM, for the same reason the `doum-palm` uses it: `frond` builds an UNBRANCHED stem with one crown, by definition, and a screwpine forks. Four rings of two long branches leaving at a strong lift, one sub-branch each, and a big tuft on every tip -- so the plant is a few thick arms each ending in a rosette, which is what it actually is.\n\nThe stilts are `roots` at 10 of 16 with a high arch, second only to the red mangrove in this pass. THE SCREW ITSELF IS GONE: the name comes from the spiral in which the strap leaves are set around each tip, and a leaf spiral is a centimetre-scale arrangement of things that are not drawn individually at 10 cm. What is left is the assembly, and the assembly is odd enough to be recognisable.",
+  "notes": "`whorl` FOR A THING THAT LOOKS LIKE A PALM, for the same reason the `doum-palm` uses it: `frond` builds an UNBRANCHED stem with one crown, by definition, and a screwpine forks. Four rings of two long branches leaving at a strong lift, one sub-branch each, and a big tuft on every tip -- so the plant is a few thick arms each ending in a rosette, which is what it actually is.\n\nThe stilts are `roots` at 10 of 16 with a high arch, second only to the red mangrove in this pass. THE SCREW ITSELF IS GONE: the name comes from the spiral in which the strap leaves are set around each tip, and a leaf spiral is a centimetre-scale arrangement of things that are not drawn individually at 10 cm. What is left is the assembly, and the assembly is odd enough to be recognisable.\n\nTAPER 0: A MONOCOT STEM DOES NOT THICKEN WITH AGE, so the trunk is the same width top to bottom.",
   "placement": {
     "abundance": 0.4,
     "cluster": 0.8,
@@ -405,6 +405,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.2,
+    "taper": 0.0,
     "wander": 0.25
   },
   "tuft": {

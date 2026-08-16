@@ -764,6 +764,13 @@ Listed in §6. 0.5–5 mm thick against a 1 cm finest lattice.
 
 ### 8.6a `materials.head` and `materials.stem` are two different menus, and the mismatch is silent
 
+> **CLOSED 2026-08-15.** They are one menu now — `spec._PLANT_MATERIALS`, read
+> by both rows, with `forge/ground.py` asserting at import that they still
+> share it, and `selftest` tripping a bogus choice through five menus every run
+> to prove the alarm still fires. `podzol` is the dark brown this section says
+> `head` has none of, and `skin_red` was added for the dark red. No spec was
+> re-coloured. See `docs/trunk-taper-and-the-deferred-five.md` §5.
+
 Found by writing five specs wrong. `materials.stem` offers seven land-vegetation
 greens and browns; `materials.head` offers fourteen and **they do not overlap** —
 there is no `leaf_jungle` and no `podzol` in `head`. A head material outside its
@@ -812,6 +819,14 @@ A mushroom coral needs a detail-lattice kind, and every detail-lattice kind here
 is a branching skeleton or a spray of stems, and a fungiid is a solid disc.
 
 ### 8.8 The bush generator has a floor at about half a metre
+
+> **CLOSED 2026-08-15, and the floor turned out to be the LATTICE.** Eight
+> growth steps of 8 cm is 0.64 m, which is why `sea-oak-weed` at 0.60 m is the
+> smallest bush that works — to within a voxel of the arithmetic. The four
+> floors are lowered to what the finest legal lattice can carry, and the same
+> 0.25 m plant then builds 171–196 voxels with fork order 3–5 **at 2 cm**,
+> against 66–89 at 5 cm with the old floors. The five species were left as
+> tufts. See `docs/trunk-taper-and-the-deferred-five.md` §4.
 
 **Five species moved from `bush` to a tuft kind because of it**, and the numbers
 are worth recording once because nothing else in the repo states them together.

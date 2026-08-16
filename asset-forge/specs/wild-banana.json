@@ -256,7 +256,7 @@
     "stem": "grass"
   },
   "name": "wild-banana",
-  "notes": "NOT A TREE AND FILED AS ONE, because `frond` is what builds it: an unbranched stem carrying a crown of very long very wide blades. Six fronds at 1.1 m of half-width, which is double the width the palm uses -- the blade rasterizer's own rule is that blades must be narrower than their spacing or the crown closes into a disc, so six is the count that keeps them separate at that width.\n\nThe pseudostem is green and the wood palette is not, so it is drawn in `deadwood` -- the palest, greyest option -- and the crown carries the colour. Same gap the saguaro records.",
+  "notes": "NOT A TREE AND FILED AS ONE, because `frond` is what builds it: an unbranched stem carrying a crown of very long very wide blades. Six fronds at 1.1 m of half-width, which is double the width the palm uses -- the blade rasterizer's own rule is that blades must be narrower than their spacing or the crown closes into a disc, so six is the count that keeps them separate at that width.\n\nThe pseudostem is green and the wood palette is not, so it is drawn in `deadwood` -- the palest, greyest option -- and the crown carries the colour. Same gap the saguaro records.\n\nTAPER 0: THE PSEUDOSTEM IS A CYLINDER. It is a packed roll of leaf sheaths rather than wood, and it does not thin with height.",
   "placement": {
     "abundance": 0.5,
     "cluster": 0.9,
@@ -405,6 +405,7 @@
     "lobe_depth": 0.18,
     "lobes": 0,
     "radius_base_m": 0.22,
+    "taper": 0.0,
     "wander": 0.12
   },
   "tuft": {
