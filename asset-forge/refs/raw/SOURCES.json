@@ -1,0 +1,21 @@
+{
+ "PanTHERIA_WR05.txt": {
+  "dataset": "PanTHERIA 1.0 (Wilson & Reeder 2005 taxonomy)",
+  "citation": "Jones, K.E., Bielby, J., Cardillo, M., et al. (2009) PanTHERIA: a species-level database of life history, ecology, and geography of extant and recently extinct mammals. Ecology 90:2648.",
+  "url": "https://esapubs.org/archive/ecol/E090/184/PanTHERIA_1-0_WR05_Aug2008.txt",
+  "metadata_url": "https://esapubs.org/archive/ecol/E090/184/metadata.htm",
+  "downloaded": "2026-08-16",
+  "bytes": 2359096,
+  "records": 5416,
+  "terms": "ESA Ecological Archives states no copyright or proprietary restrictions ('None') and that the data are free for scientific use, compiled with public funds; the authors request citation of the paper above.",
+  "columns_used": [
+   "MSW05_Binomial",
+   "21-1_PopulationDensity_n/km2",
+   "5-1_AdultBodyMass_g",
+   "6-2_TrophicLevel",
+   "1-1_ActivityCycle"
+  ],
+  "why_checked_in": "tools/densityref.py follows tools/reffit.py's rule: `fetch` is the only command that touches a network, and everything `extract` needs is in the repository. Re-deriving refs/density-reference.json must not require the ESA archive to still be up.",
+  "not_covered": "Mammals only. The library's 127 birds and 106 fish need entirely different sources; the 18 cetaceans are mammals but have no scientific names on file yet (refs/species-latin.json covers the 131 quadrupeds only)."
+ }
+}
