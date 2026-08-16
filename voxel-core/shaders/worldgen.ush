@@ -80,7 +80,33 @@
 // stale-library case is covered on the C++ side by VoxelEarth.Build.cs's
 // timestamp warning and by voxel.GPU.VerifyRegion's pinned CPU-reference
 // digest. Two different faults, two different guards.
-#define VXC_WORLDGEN_VERSION_USH 23
+// 23 -> 25, and NOTHING BELOW WAS RE-MIRRORED, which needs its reasons stated
+// because this contract normally means the opposite.
+//
+// v24 and v25 add the ASSET TERM: a species manifest, VXA banks and a
+// four-layer scatter table, composed in GeneratedWorld::makeBrick and
+// materialAt when a host installs an AssetField. None of it is in this file and
+// none of it can be -- the GPU path mirrors the TERRAIN kernel, and assets are
+// not terrain. There is no constant here for them to have changed.
+//
+// THE SKEW WAS LATENT SINCE v24, not introduced by the bump to 25. The v24 work
+// landed while the editor was held by another session, so nothing ever compiled
+// this file against it; the #error fired the first time anyone built the UE
+// side, which is exactly the moment it is designed to fire and two versions
+// later than anyone would like.
+//
+// WHAT IS OFFERED INSTEAD OF A RE-MIRROR, since "I did not change terrain" is a
+// claim and not evidence:
+//   * the terrain-only bench digest is e02458de2be47309 at v23, v24 and v25
+//     alike -- if any constant below had moved, that fold would have moved;
+//   * vxc_gpu's CPU/GPU parity over its fixtures still passes, which is the
+//     check that this file agrees with amplifier.cpp cell by cell;
+//   * voxel.GPU.VerifyRegion's pinned CPU-reference digest still reads
+//     b2b5d2f1044caa35, which is the check that catches BOTH sides moving
+//     together -- the one failure parity alone cannot see.
+// Two independent folds and a parity sweep. If any had disagreed this bump
+// would have been wrong and is recorded here so a later reader can re-test it.
+#define VXC_WORLDGEN_VERSION_USH 25
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
