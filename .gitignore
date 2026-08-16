@@ -98,3 +98,10 @@ asset-forge/.backup/
 # small ones committed before this rule stay tracked; nothing new that large
 # goes into history.
 asset-forge/library/hero-arch-colossal/**/tree.vox
+
+# Baked terrain tiles. GitHub REFUSES any push containing a file over 100 MB,
+# and two of these (bake-out/-3_-3.vxtl and -2_-4.vxtl, 192 MB each) were
+# committed on 2026-08-15 and blocked every push to main until the history was
+# rewritten to strip them on 2026-08-16. They are build artifacts, regenerable
+# from the terrain service, and they must never be tracked again.
+bake-out/*.vxtl
