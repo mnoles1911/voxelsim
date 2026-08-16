@@ -267,26 +267,55 @@ VXC_TEST(assetbound_propagates_a_declined_terrain_bound) {
     CHECK(got > 0); // i.e. it did not wrap
 }
 
-VXC_TEST(assetbound_dilates_the_terrain_query_by_the_widest_reach) {
-    // The dilation is invisible in the result, so assert it at the call: record
-    // the rect the terrain bound is actually asked about.
-    int64_t sawX0 = 0, sawY0 = 0, sawX1 = 0, sawY1 = 0;
+VXC_TEST(assetbound_dilates_each_layers_terrain_query_by_its_own_reach) {
+    // The dilation is invisible in the result, so assert it at the call:
+    // record every rect the terrain bound is actually asked about.
+    //
+    // PER LAYER SINCE THE WIDENING CENSUS. The old composition made ONE call
+    // dilated by the widest reach, which charged the emergent layer's
+    // dilation to every footprint on the planet while that layer had a site
+    // near a few percent of them (vxc_assetprobe measured the slack at ~2
+    // chunk layers on real ground). The contract now: the UNDILATED rect is
+    // always queried (bare terrain inside it), and each terrain layer WITH A
+    // SITE IN REACH queries the rect dilated by ITS OWN maxRadiusMm, rounded
+    // outward. A layer with no site nearby must buy no bound call at all.
+    struct Call { int64_t x0, y0, x1, y1; };
+    std::vector<Call> calls;
     const auto record = [&](int64_t x0, int64_t y0, int64_t x1, int64_t y1) -> int64_t {
-        sawX0 = x0; sawY0 = y0; sawX1 = x1; sawY1 = y1;
+        calls.push_back({x0, y0, x1, y1});
         return 0;
     };
     const AssetVoxelRect rect = chunkRect(0, 0);
     assetAwareSurfaceUpperBoundMm(kSeed, kLayers, kAssetLayerCount, rect, record);
 
-    const int32_t reach = assetMaxReachMm(kLayers, kAssetLayerCount);
-    CHECK_EQ(reach, 9000); // the emergent layer's radius, the widest present
-    const int64_t reachVox = int64_t(reach) / int64_t(kVoxelSizeMm) + 1;
-    CHECK_EQ(sawX0, rect.vx0 - reachVox);
-    CHECK_EQ(sawY0, rect.vy0 - reachVox);
-    CHECK_EQ(sawX1, rect.vx1 + reachVox);
-    CHECK_EQ(sawY1, rect.vy1 + reachVox);
-    // Rounded OUTWARD: the dilation in voxels must cover the reach in mm.
-    CHECK(reachVox * int64_t(kVoxelSizeMm) >= int64_t(reach));
+    CHECK(!calls.empty());
+    // First call: the rect itself, undilated.
+    CHECK_EQ(calls[0].x0, rect.vx0);
+    CHECK_EQ(calls[0].y0, rect.vy0);
+    CHECK_EQ(calls[0].x1, rect.vx1);
+    CHECK_EQ(calls[0].y1, rect.vy1);
+    // Every further call is the rect dilated by exactly one TERRAIN layer's
+    // own reach, rounded OUTWARD, for a layer that really has a site there --
+    // cross-checked against the same presence test the bound uses.
+    std::vector<int64_t> expected;
+    for (int li = 0; li < kAssetLayerCount; ++li) {
+        const AssetLayer& L = kLayers[li];
+        if (!L.terrainLattice || L.cellMm <= 0 || L.maxHeightMm <= 0) continue;
+        if (!assetLayerHasSiteNear(kSeed, L, li, rect)) continue;
+        const int64_t reachVox = int64_t(L.maxRadiusMm) / int64_t(kVoxelSizeMm) + 1;
+        CHECK(reachVox * int64_t(kVoxelSizeMm) >= int64_t(L.maxRadiusMm));
+        expected.push_back(reachVox);
+    }
+    CHECK_EQ(calls.size(), expected.size() + 1);
+    for (size_t i = 1; i < calls.size(); ++i) {
+        const int64_t reachVox = expected[i - 1];
+        CHECK_EQ(calls[i].x0, rect.vx0 - reachVox);
+        CHECK_EQ(calls[i].y0, rect.vy0 - reachVox);
+        CHECK_EQ(calls[i].x1, rect.vx1 + reachVox);
+        CHECK_EQ(calls[i].y1, rect.vy1 + reachVox);
+    }
+    // The sweep is only meaningful if at least one layer was present.
+    CHECK(expected.size() >= 1);
 }
 
 VXC_TEST(assetbound_cannot_be_raised_by_a_policy) {
@@ -416,27 +445,45 @@ VXC_TEST(assetlayer_admits_only_its_own_lattice) {
 }
 
 VXC_TEST(assetbound_composed_query_is_not_dilated_for_detail_layers) {
-    // The reach is the dilation assetAwareSurfaceUpperBoundMm applies to the
-    // TERRAIN bound. A detail instance puts no voxel in the rect, so it has
-    // nothing to reach in with, and dilating for it would widen every bound
-    // query on the planet for geometry that is not in the grid.
+    // A detail instance puts no voxel in the rect, so it has nothing to reach
+    // in with, and buying it a bound term would widen every query on the
+    // planet for geometry that is not in the grid. Under the per-layer
+    // composition that means: a detail layer buys NO terrain-bound call, so
+    // no recorded query is wider than the widest TERRAIN reach -- even when
+    // the detail layer's own reach is absurd.
     AssetLayer layers[2];
     layers[0] = kLayers[0];                 // terrain, 9 m reach
     layers[1] = kLayers[3];                 // dense ground cover...
     layers[1].maxRadiusMm = 100'000;        // ...with an absurd reach
     layers[1].terrainLattice = false;
 
-    int64_t sawX0 = 0;
+    // A rect the sparse terrain layer actually reaches, found with the same
+    // presence test the bound uses -- the term under test only exists where
+    // the layer is present.
+    AssetVoxelRect rect = chunkRect(0, 0);
+    bool found = false;
+    // The layer's cell is 64 m and a dilated chunk query spans ~21 m, so one
+    // rect sees at most one cell at 120 per-mille; walk a few hundred metres
+    // of chunks to find an occupied one (deterministic: fixed seed).
+    for (int64_t cy = 0; cy <= 200 && !found; ++cy)
+        for (int64_t cx = 0; cx <= 200 && !found; ++cx) {
+            rect = chunkRect(cx, cy);
+            found = assetLayerHasSiteNear(kSeed, layers[0], 0, rect);
+        }
+    CHECK(found);
+
+    int64_t widestSeen = 0;
     const auto record = [&](int64_t x0, int64_t, int64_t, int64_t) -> int64_t {
-        sawX0 = x0;
+        const int64_t dilation = rect.vx0 - x0;
+        if (dilation > widestSeen) widestSeen = dilation;
         return 0;
     };
-    const AssetVoxelRect rect = chunkRect(0, 0);
     assetAwareSurfaceUpperBoundMm(kSeed, layers, 2, rect, record);
 
     CHECK_EQ(assetMaxReachMm(layers, 2), kLayers[0].maxRadiusMm);
     const int64_t reachVox = int64_t(kLayers[0].maxRadiusMm) / int64_t(kVoxelSizeMm) + 1;
-    CHECK_EQ(sawX0, rect.vx0 - reachVox);
+    CHECK(widestSeen <= reachVox);
+    CHECK(widestSeen > 0); // the terrain layer really was present and dilated
 }
 
 VXC_TEST(assetsites_are_ordered_and_free_of_duplicates) {

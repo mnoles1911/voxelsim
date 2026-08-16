@@ -303,6 +303,37 @@ inline std::vector<AssetSite> assetSitesForRect(uint64_t seed, const AssetLayer*
 
 // --- the bounds -------------------------------------------------------------
 
+// Does `layer` carry any site whose reach can touch `rect`? The shared inner
+// scan of assetTopAboveSurfaceMm / assetBottomBelowSurfaceMm and the per-layer
+// presence test of assetAwareSurfaceUpperBoundMm -- ONE spelling, because the
+// bound and the presence test disagreeing about which cells count is an
+// off-by-one that produces a hole one chunk wide.
+//
+// Same early-out argument as assetTopAboveSurfaceMm: dense layers answer on
+// the first cell or two, sparse layers have a handful of cells.
+inline bool assetLayerHasSiteNear(uint64_t seed, const AssetLayer& L, int32_t layerIndex,
+                                  const AssetVoxelRect& rect) {
+    if (!rect.valid() || L.cellMm <= 0) return false;
+    const int64_t vs = int64_t(kVoxelSizeMm);
+    const int64_t x0 = rect.vx0 * vs, x1 = rect.vx1 * vs + vs - 1;
+    const int64_t y0 = rect.vy0 * vs, y1 = rect.vy1 * vs + vs - 1;
+    const int64_t r = int64_t(L.maxRadiusMm);
+    const int64_t cx0 = floorDiv(x0 - r, int64_t(L.cellMm));
+    const int64_t cx1 = floorDiv(x1 + r, int64_t(L.cellMm));
+    const int64_t cy0 = floorDiv(y0 - r, int64_t(L.cellMm));
+    const int64_t cy1 = floorDiv(y1 + r, int64_t(L.cellMm));
+    for (int64_t cy = cy0; cy <= cy1; ++cy) {
+        for (int64_t cx = cx0; cx <= cx1; ++cx) {
+            AssetSite s;
+            if (!assetSiteInCell(seed, L, layerIndex, cx, cy, s)) continue;
+            if (s.anchorXMm + r < x0 || s.anchorXMm - r > x1) continue;
+            if (s.anchorYMm + r < y0 || s.anchorYMm - r > y1) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
 // The largest height above its anchor's ground that any asset intersecting
 // `rect` can reach, over every policy obeying the veto-only rule. 0 means no
 // layer has a site anywhere that could reach this rect, i.e. the terrain
@@ -320,10 +351,6 @@ inline std::vector<AssetSite> assetSitesForRect(uint64_t seed, const AssetLayer*
 inline int32_t assetTopAboveSurfaceMm(uint64_t seed, const AssetLayer* layers, int layerCount,
                                       const AssetVoxelRect& rect) {
     if (!rect.valid() || layers == nullptr) return 0;
-    const int64_t vs = int64_t(kVoxelSizeMm);
-    const int64_t x0 = rect.vx0 * vs, x1 = rect.vx1 * vs + vs - 1;
-    const int64_t y0 = rect.vy0 * vs, y1 = rect.vy1 * vs + vs - 1;
-
     int32_t top = 0;
     for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
         const AssetLayer& L = layers[li];
@@ -332,23 +359,7 @@ inline int32_t assetTopAboveSurfaceMm(uint64_t seed, const AssetLayer* layers, i
         // for why this skip is the dangerous direction and what guards it.
         if (!L.terrainLattice) continue;
         if (L.cellMm <= 0 || L.maxHeightMm <= top) continue; // cannot raise the answer
-        const int64_t r = int64_t(L.maxRadiusMm);
-        const int64_t cx0 = floorDiv(x0 - r, int64_t(L.cellMm));
-        const int64_t cx1 = floorDiv(x1 + r, int64_t(L.cellMm));
-        const int64_t cy0 = floorDiv(y0 - r, int64_t(L.cellMm));
-        const int64_t cy1 = floorDiv(y1 + r, int64_t(L.cellMm));
-        bool found = false;
-        for (int64_t cy = cy0; cy <= cy1 && !found; ++cy) {
-            for (int64_t cx = cx0; cx <= cx1; ++cx) {
-                AssetSite s;
-                if (!assetSiteInCell(seed, L, li, cx, cy, s)) continue;
-                if (s.anchorXMm + r < x0 || s.anchorXMm - r > x1) continue;
-                if (s.anchorYMm + r < y0 || s.anchorYMm - r > y1) continue;
-                found = true;
-                break;
-            }
-        }
-        if (found) top = L.maxHeightMm;
+        if (assetLayerHasSiteNear(seed, L, li, rect)) top = L.maxHeightMm;
     }
     return top;
 }
@@ -357,32 +368,12 @@ inline int32_t assetTopAboveSurfaceMm(uint64_t seed, const AssetLayer* layers, i
 inline int32_t assetBottomBelowSurfaceMm(uint64_t seed, const AssetLayer* layers, int layerCount,
                                          const AssetVoxelRect& rect) {
     if (!rect.valid() || layers == nullptr) return 0;
-    const int64_t vs = int64_t(kVoxelSizeMm);
-    const int64_t x0 = rect.vx0 * vs, x1 = rect.vx1 * vs + vs - 1;
-    const int64_t y0 = rect.vy0 * vs, y1 = rect.vy1 * vs + vs - 1;
-
     int32_t depth = 0;
     for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
         const AssetLayer& L = layers[li];
         if (!L.terrainLattice) continue; // not in the world grid; see above
         if (L.cellMm <= 0 || L.maxDepthMm <= depth) continue;
-        const int64_t r = int64_t(L.maxRadiusMm);
-        const int64_t cx0 = floorDiv(x0 - r, int64_t(L.cellMm));
-        const int64_t cx1 = floorDiv(x1 + r, int64_t(L.cellMm));
-        const int64_t cy0 = floorDiv(y0 - r, int64_t(L.cellMm));
-        const int64_t cy1 = floorDiv(y1 + r, int64_t(L.cellMm));
-        bool found = false;
-        for (int64_t cy = cy0; cy <= cy1 && !found; ++cy) {
-            for (int64_t cx = cx0; cx <= cx1; ++cx) {
-                AssetSite s;
-                if (!assetSiteInCell(seed, L, li, cx, cy, s)) continue;
-                if (s.anchorXMm + r < x0 || s.anchorXMm - r > x1) continue;
-                if (s.anchorYMm + r < y0 || s.anchorYMm - r > y1) continue;
-                found = true;
-                break;
-            }
-        }
-        if (found) depth = L.maxDepthMm;
+        if (assetLayerHasSiteNear(seed, L, li, rect)) depth = L.maxDepthMm;
     }
     return depth;
 }
@@ -432,6 +423,36 @@ inline int32_t assetMaxReachMm(const AssetLayer* layers, int layerCount) {
 //      chunk is provably air" for the entire sky. A decline must propagate as
 //      a decline. Never claim air on no information.
 //
+// PER LAYER, NOT ONE CALL, and the census that forced it. The first cut took
+// ONE terrain bound over the rect dilated by the WIDEST terrain reach and
+// added the tallest present layer's height. vxc_assetprobe measured what that
+// costs: the widest layer is the emergent one (15 m of reach), it has a site
+// near only a few percent of footprints -- and every other footprint on the
+// planet was paying its dilation anyway, ~2 chunk layers of slope slack on
+// real terrain and ~9 on the steep synthetic bench, for a layer that was not
+// there. So each terrain layer now buys exactly its own term:
+//
+//     max( bound(rect),
+//          max over terrain layers with a site in reach of
+//              bound(rect (+) layer.maxRadius) + layer.maxHeightMm )
+//
+// SOUNDNESS, spelled out because this is the function whose failure is a hole
+// in the world: any instance of layer i intersecting `rect` is anchored
+// within maxRadius_i of it (that is what reach means, and
+// assetLayerHasSiteNear tests the same cells with the same dilation the site
+// enumeration uses), its base stands on ground <= bound(rect (+) r_i), and
+// the veto-only rule caps everything above that base at maxHeightMm_i. Bare
+// terrain inside the rect is covered by the undilated first term. Every term
+// of the new composition is <= the old single-call one, so this is strictly
+// tighter and never admits less than the truth requires.
+//
+// COST: one bound evaluation, plus one more per terrain layer that actually
+// has a site in reach (the presence scan is the same pure-hash early-out the
+// widening uses, and it runs FIRST, so an absent layer costs a few hashes and
+// no bound call). Dense layers are near-always present; the expensive-looking
+// case -- every layer present -- is exactly the case where each term is doing
+// real work.
+//
 // `surfaceUpperBoundMm` is any callable with the signature of
 // Amplifier::surfaceUpperBoundMm (int64_t (int64_t, int64_t, int64_t,
 // int64_t)). Templated rather than taking an Amplifier so this stays testable
@@ -443,12 +464,24 @@ template <typename SurfaceUpperBoundFn>
 int64_t assetAwareSurfaceUpperBoundMm(uint64_t seed, const AssetLayer* layers, int layerCount,
                                       const AssetVoxelRect& rect,
                                       const SurfaceUpperBoundFn& surfaceUpperBoundMm) {
-    const int32_t reachMm = assetMaxReachMm(layers, layerCount);
-    const int64_t reachVox = int64_t(reachMm) / int64_t(kVoxelSizeMm) + 1; // round outward
-    const int64_t bound = surfaceUpperBoundMm(rect.vx0 - reachVox, rect.vy0 - reachVox,
+    int64_t best = surfaceUpperBoundMm(rect.vx0, rect.vy0, rect.vx1, rect.vy1);
+    if (best == kSurfaceBoundDeclined) return kSurfaceBoundDeclined;
+    if (layers == nullptr || !rect.valid()) return best;
+    for (int li = 0; li < layerCount && li < kAssetLayerCount; ++li) {
+        const AssetLayer& L = layers[li];
+        // Detail layers put no voxel in the world grid: no term, no dilation.
+        // See AssetLayer::terrainLattice for why this skip is guarded.
+        if (!L.terrainLattice) continue;
+        if (L.cellMm <= 0 || L.maxHeightMm <= 0) continue;
+        if (!assetLayerHasSiteNear(seed, L, li, rect)) continue;
+        const int64_t reachVox =
+            int64_t(L.maxRadiusMm) / int64_t(kVoxelSizeMm) + 1; // round outward
+        const int64_t b = surfaceUpperBoundMm(rect.vx0 - reachVox, rect.vy0 - reachVox,
                                               rect.vx1 + reachVox, rect.vy1 + reachVox);
-    if (bound == kSurfaceBoundDeclined) return kSurfaceBoundDeclined;
-    return bound + int64_t(assetTopAboveSurfaceMm(seed, layers, layerCount, rect));
+        if (b == kSurfaceBoundDeclined) return kSurfaceBoundDeclined;
+        if (b + int64_t(L.maxHeightMm) > best) best = b + int64_t(L.maxHeightMm);
+    }
+    return best;
 }
 
 // A bake/load-time check that an asset actually fits the layer it is filed

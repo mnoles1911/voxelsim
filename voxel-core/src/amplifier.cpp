@@ -1760,6 +1760,11 @@ Amplifier::SurfaceEval Amplifier::evalSurface(int64_t vx, int64_t vy) const {
     s.px = floorDiv(xMm, pxMm);
     s.py = floorDiv(yMm, pxMm);
     s.slopeMmPerM = slopeMmPerM;
+    // The gradient's DIRECTION, which carrierSlopeMmPerM reduces away. Same
+    // CarrierEval, same warped position, two more divisions -- and the only
+    // reader is Amplifier::surfaceInfo, so the voxel path is untouched.
+    s.slopeXMmPerM = carrier.sxMmPerPx * 1000 / pxMm;
+    s.slopeYMmPerM = carrier.syMmPerPx * 1000 / pxMm;
     s.surfaceMm = clampi32(baseMm + detailMm, kSurfaceClampMinMm, kSurfaceClampMaxMm);
     return s;
 }
@@ -2216,10 +2221,8 @@ int64_t Amplifier::solidBelowBoundMm(int64_t vx0, int64_t vy0, int64_t vx1, int6
     return lowerMm - kDeepestCarveBelowSurfaceMm;
 }
 
-ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
-    const SurfaceEval s = evalSurface(vx, vy);
-    const int64_t px = s.px, py = s.py;
-    const int64_t slopeMmPerM = s.slopeMmPerM;
+Amplifier::ClimateAtColumn Amplifier::climateAtColumn(int64_t vx, int64_t vy, int64_t px,
+                                                      int64_t py) const {
     const int64_t pxMmC = tiles_->pixelSizeMm();
     const int64_t xMmC = vx * kVoxelSizeMm, yMmC = vy * kVoxelSizeMm;
 
@@ -2243,7 +2246,9 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     const int64_t cfx = fadeFractionMm(xMmC - px * pxMmC, pxMmC);
     const int64_t cfy = fadeFractionMm(yMmC - py * pxMmC, pxMmC);
     const ClimateSample* cq = cachedClimateQuad(id_, *tiles_, px, py);
-    const ClimateSample cl = blendClimate(cq[0], cq[1], cq[2], cq[3], cfx, cfy, pxMmC);
+
+    ClimateAtColumn out;
+    out.cl = blendClimate(cq[0], cq[1], cq[2], cq[3], cfx, cfy, pxMmC);
 
     // ECOTONE DITHER. Interpolation alone turns 30 m stair-steps into smooth
     // curves, but a smooth curve through a hard threshold is still a clean line
@@ -2258,8 +2263,41 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
         hashToSigned16(hash2(seed_, vx >> 4, vy >> 4, CH_ECOTONE_TEMP)) * 2 / 32768);
     const int32_t ecoP = static_cast<int32_t>(
         hashToSigned16(hash2(seed_, vx >> 4, vy >> 4, CH_ECOTONE_PRECIP)) * 2 / 32768);
-    const int32_t clTempDithered = clampi32(int64_t(cl.temperature) + ecoT, 0, 255);
-    const int32_t clPrecipDithered = clampi32(int64_t(cl.precipitation) + ecoP, 0, 255);
+    out.tempDithered = clampi32(int64_t(out.cl.temperature) + ecoT, 0, 255);
+    out.precipDithered = clampi32(int64_t(out.cl.precipitation) + ecoP, 0, 255);
+    return out;
+}
+
+Amplifier::SurfaceInfo Amplifier::surfaceInfo(int64_t vx, int64_t vy) const {
+    const SurfaceEval s = evalSurface(vx, vy);
+    const ClimateAtColumn cac = climateAtColumn(vx, vy, s.px, s.py);
+    SurfaceInfo out;
+    out.surfaceMm = s.surfaceMm;
+    out.slopeMmPerM = s.slopeMmPerM;
+    out.slopeXMmPerM = s.slopeXMmPerM;
+    out.slopeYMmPerM = s.slopeYMmPerM;
+    out.climate = cac.cl;
+    // The SAME classification column() performs, argument for argument --
+    // dithered temperature and precipitation, undithered precipitation
+    // variability -- via the shared helper above, so a spawner and the world
+    // it spawns into agree about every boundary, dither included.
+    out.biome = classifyBiome(cac.tempDithered, cac.precipDithered, cac.cl.precipVariability,
+                              s.surfaceMm, s.slopeMmPerM);
+    return out;
+}
+
+ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
+    const SurfaceEval s = evalSurface(vx, vy);
+    const int64_t px = s.px, py = s.py;
+    const int64_t slopeMmPerM = s.slopeMmPerM;
+
+    // Climate blend + ecotone dither, factored (verbatim -- the v9 faded-
+    // bilinear argument and the dither's own comment moved with the code) so
+    // surfaceInfo classifies the SAME biome this function does.
+    const ClimateAtColumn cac = climateAtColumn(vx, vy, px, py);
+    const ClimateSample& cl = cac.cl;
+    const int32_t clTempDithered = cac.tempDithered;
+    const int32_t clPrecipDithered = cac.precipDithered;
 
     ColumnSample col;
     col.surfaceMm = s.surfaceMm;

@@ -4,6 +4,8 @@ add_executable(vxc_tests
   test_hash.cpp
   test_amplifier.cpp
   test_assetgrid.cpp
+  test_assetmanifest.cpp
+  test_assetbank.cpp
   test_assetplacement.cpp
   test_assetpolicy.cpp
   test_assetdetail.cpp

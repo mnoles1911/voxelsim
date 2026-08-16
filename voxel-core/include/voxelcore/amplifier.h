@@ -334,6 +334,49 @@ public:
     // Full stratigraphy for the column through voxel (vx, vy).
     ColumnSample column(int64_t vx, int64_t vy) const;
 
+    // WHAT THE GROUND IS LIKE HERE, without what is underneath it.
+    //
+    // Surface, slope magnitude AND signed per-axis gradient, biome and climate
+    // in one call: one evalSurface plus the climate read and the biome gates.
+    // What it does NOT pay for is the cave reduction (34 hashes) and the
+    // cavern reduction that column() also does -- which a caller asking "is
+    // this deer country" has no use for. That caller is the detail-entity
+    // spawner (classes 3-4 of docs/asset-placement-architecture.md §1), which
+    // has a position and nothing else; the chunk-generation path should keep
+    // using the ColumnSample it already holds, where `biome` and `slopeMmPerM`
+    // ride for free.
+    //
+    // THE GRADIENT DIRECTION is the carrier's analytic gradient at the
+    // (warped) sample position -- the same quantity whose L1 magnitude is
+    // slopeMmPerM, which until now was the only part that survived
+    // evalSurface. Sign convention: positive slopeXMmPerM means the ground
+    // RISES toward +x, so uphill is (+slopeX, +slopeY) and downhill is its
+    // negation. This is what directional placement needs: scree lies where a
+    // probe ~15 m UPHILL reads past the BARE_ROCK gate, and "uphill" was not
+    // answerable from a magnitude.
+    //
+    // ROUNDING: slopeXMmPerM and slopeYMmPerM are each scaled to mm-per-metre
+    // separately, so |slopeX| + |slopeY| can differ from slopeMmPerM by the
+    // truncation of one division (carrierSlopeMmPerM divides the SUM once).
+    // slopeMmPerM here is BIT-IDENTICAL to ColumnSample::slopeMmPerM; the
+    // per-axis fields are new information, not a recomposition of it.
+    //
+    // `biome` and `climate` are BIT-IDENTICAL to what column() computes for
+    // the same (vx, vy) -- same blended channels, same ecotone dither -- via
+    // one shared private helper, so a spawner and the world it spawns into
+    // cannot disagree about where the taiga is.
+    struct SurfaceInfo {
+        int32_t surfaceMm = 0;
+        int64_t slopeMmPerM = 0;   // L1 magnitude, ColumnSample::slopeMmPerM
+        int64_t slopeXMmPerM = 0;  // signed: + rises toward +x
+        int64_t slopeYMmPerM = 0;  // signed: + rises toward +y
+        BiomeId biome = TEMPERATE_FOREST;
+        ClimateSample climate;     // blended channels, UNDITHERED (the dither
+                                   // is a per-column boundary treatment and is
+                                   // already inside `biome`)
+    };
+    SurfaceInfo surfaceInfo(int64_t vx, int64_t vy) const;
+
     // The terrain surface elevation at (vx, vy) on its own — bit-identical to
     // column(vx, vy).surfaceMm (it is literally the same evalSurface call), but
     // without the climate read, stratigraphy, biome classification, cave pass
@@ -502,9 +545,28 @@ private:
         // tile PIXEL from a per-cell forward difference, which both stepped on
         // the pixel grid and meant a different grade at every tile scale.
         int64_t slopeMmPerM = 0;
+        // The same gradient's two SIGNED components, mm per metre. Computed
+        // beside the magnitude from the identical CarrierEval (they were being
+        // thrown away); consumed only by surfaceInfo. Nothing on the voxel
+        // path reads them, which is why carrying them cannot move the digest.
+        int64_t slopeXMmPerM = 0;
+        int64_t slopeYMmPerM = 0;
         int64_t px = 0, py = 0; // tile pixel the column falls in
     };
     SurfaceEval evalSurface(int64_t vx, int64_t vy) const;
+
+    // The climate half of column(): faded-bilinear channel blend plus the
+    // ecotone dither, at a column whose evalSurface already produced (px, py).
+    // ONE function used by both column() and surfaceInfo(), so the two cannot
+    // disagree about where a biome boundary falls -- a spawner keyed to a
+    // biome that placement disagrees with puts deer in the wrong valley
+    // deterministically, which is worse than randomly.
+    struct ClimateAtColumn {
+        ClimateSample cl;        // blended, undithered
+        int32_t tempDithered = 0;
+        int32_t precipDithered = 0;
+    };
+    ClimateAtColumn climateAtColumn(int64_t vx, int64_t vy, int64_t px, int64_t py) const;
 
     // Shared body of surfaceUpperBoundMm / surfaceLowerBoundMm: one traversal
     // of the footprint's tile-pixel corners producing BOTH bounds, so the two

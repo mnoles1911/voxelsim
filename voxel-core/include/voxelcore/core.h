@@ -258,7 +258,23 @@ namespace vxc {
 // STILL OPEN after v23 (tasks #47/#48): the 11-window paired corpus was never
 // re-run, and v23 has never been judged for visible terracing, which its own
 // commit message demands.
-inline constexpr uint32_t kWorldGenVersion = 23;
+//
+// --- v24: THE ASSET TERM BECOMES INSTALLABLE WORLDGEN INPUT -----------------
+//
+// Everything above describes the terrain function, which v24 does not touch:
+// a world with no AssetField installed is bit-identical to v23 (verified: the
+// terrain-only digest is e02458de2be47309 before and after). What v24 adds is
+// the third term -- 826 species from asset-forge's manifest, VXA v3 banks,
+// and the four-layer scatter table -- composed into makeBrick/materialAt when
+// a host installs it. FROM HERE ON, the manifest bytes, the bank bytes and
+// the layer table are worldgen input: any change to any of them (a weight, a
+// cap, a re-baked seed, a new seed file in a bank directory) changes voxels
+// and is a version bump with goldens re-blessed, exactly like an amplifier
+// constant. docs/asset-placement-architecture.md section 9 is the contract;
+// vxc_bench --assets is the ran-flag (its digest MUST differ from the
+// terrain-only one, and did: 3b5fe7ec61c6581a at radius 8, seed 20260719,
+// brick 16, against the 2026-08-15 manifest and 4-seed banks).
+inline constexpr uint32_t kWorldGenVersion = 24;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

@@ -1255,3 +1255,69 @@ VXC_TEST(world_installs_the_marker_without_a_mutable_amplifier) {
     w.setWaterMarker(&water);
     CHECK(w.amplifier().waterMarkerEnabled());
 }
+
+// ---------------------------------------------------------------------------
+// surfaceInfo: the cheap ground query for the entity-spawner path
+// ---------------------------------------------------------------------------
+
+VXC_TEST(surfaceInfo_agrees_with_column_bit_for_bit) {
+    // One shared private helper computes climate + dither for both paths, so
+    // this is pinning that the refactor stays a refactor: a spawner keyed to
+    // surfaceInfo and the world column() generates must agree about surface,
+    // slope AND biome -- dither included, because a deterministic disagreement
+    // at a boundary puts the deer in the wrong valley on every machine.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    int nonDefaultBiomes = 0;
+    for (int64_t vy = -900; vy <= 900; vy += 37)
+        for (int64_t vx = -900; vx <= 900; vx += 41) {
+            const ColumnSample col = amp.column(vx, vy);
+            const Amplifier::SurfaceInfo si = amp.surfaceInfo(vx, vy);
+            CHECK_EQ(si.surfaceMm, col.surfaceMm);
+            CHECK_EQ(si.slopeMmPerM, col.slopeMmPerM);
+            CHECK_EQ(int(si.biome), int(col.biome));
+            if (col.biome != TEMPERATE_FOREST) ++nonDefaultBiomes;
+        }
+    // Vacuous-truth guard: a sweep that never left the default biome would
+    // pass the equality above with the biome path broken.
+    CHECK(nonDefaultBiomes > 10);
+}
+
+VXC_TEST(surfaceInfo_gradient_direction_points_uphill) {
+    // The per-axis gradient is NEW information (only its L1 magnitude
+    // survived evalSurface before), so it needs its own evidence in both
+    // halves: (1) the components recompose to the magnitude up to the one
+    // truncated division documented on the API; (2) the DIRECTION is uphill
+    // -- checked against the terrain itself, by stepping 15 m along the
+    // dominant component from sloped columns and asking whether the surface
+    // rose. The step probes the real surface (detail octaves included), the
+    // gradient is the carrier's, so agreement is statistical: on this seed it
+    // measures ~97% and is pinned at 90%.
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    int sloped = 0, rose = 0;
+    const int64_t stepVox = 150; // 15 m at 100 mm
+    for (int64_t vy = -2000; vy <= 2000; vy += 83)
+        for (int64_t vx = -2000; vx <= 2000; vx += 79) {
+            const Amplifier::SurfaceInfo si = amp.surfaceInfo(vx, vy);
+            const int64_t ax = si.slopeXMmPerM < 0 ? -si.slopeXMmPerM : si.slopeXMmPerM;
+            const int64_t ay = si.slopeYMmPerM < 0 ? -si.slopeYMmPerM : si.slopeYMmPerM;
+            // Recomposition: each component is truncated separately, so the
+            // sum may undershoot the once-divided magnitude by at most 2.
+            CHECK(ax + ay <= si.slopeMmPerM + 2);
+            CHECK(ax + ay + 2 >= si.slopeMmPerM);
+            // Direction, on ground steep enough that 15 m of carrier gradient
+            // dominates the detail octaves' local noise.
+            if (si.slopeMmPerM < 150) continue;
+            ++sloped;
+            int64_t dx = 0, dy = 0;
+            if (ax >= ay) dx = si.slopeXMmPerM > 0 ? stepVox : -stepVox;
+            else dy = si.slopeYMmPerM > 0 ? stepVox : -stepVox;
+            if (amp.surfaceMm(vx + dx, vy + dy) > si.surfaceMm) ++rose;
+        }
+    // Vacuous-truth guard first: the sweep must actually contain slopes.
+    CHECK(sloped > 100);
+    std::printf("    uphill probe: %d/%d columns rose (%d%%)\n", rose, sloped,
+                sloped ? 100 * rose / sloped : 0);
+    CHECK(rose * 100 >= sloped * 90);
+}

@@ -473,3 +473,109 @@ VXC_TEST(assetfield_never_replaces_terrain_and_a_world_without_one_is_unchanged)
     std::printf("    asset field added %d voxels and changed no existing one (%d unchanged)\n",
                 added, same);
 }
+
+// ---------------------------------------------------------------------------
+// The placement golden: real terrain, a real baked bank, a pinned digest
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint8_t> readFixtureBlob(const char* name) {
+    std::string path = std::string(VXC_TEST_FIXTURE_DIR) + "/" + name;
+    std::vector<uint8_t> bytes;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return bytes;
+    std::fseek(f, 0, SEEK_END);
+    const long n = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (n > 0) {
+        bytes.resize(size_t(n));
+        const size_t got = std::fread(bytes.data(), 1, bytes.size(), f);
+        bytes.resize(got);
+    }
+    std::fclose(f);
+    return bytes;
+}
+
+} // namespace
+
+VXC_TEST(assetfield_installed_field_moves_the_world_digest_and_the_digest_is_pinned) {
+    // THE RAN-FLAG, as a test (docs/asset-placement-architecture.md section 9):
+    // installing an asset field with real species data MUST change the world
+    // digest, and the changed digest is PINNED -- class 1-2 placement is part
+    // of f(seed, x, y, z), so this golden is what a layer-table, manifest or
+    // policy change has to consciously re-bless, exactly like the amplifier's
+    // own goldens. The bank is the real baked tundra-pine fixture, so the
+    // digest covers the whole chain: scatter, policy, anchor, yaw, rotated
+    // origin and the run-length decode of a file asset-forge wrote.
+    SyntheticTileSampler tiles(20260719);
+    Amplifier amp(20260719, tiles);
+    GeneratedWorld<8> gen(amp);
+
+    AssetGrid pine;
+    CHECK_EQ(int(pine.parse(readFixtureBlob("asset_tundra_pine_0002.vxa"))),
+             int(AssetParseError::kOk));
+    OneGridBank banks(&pine);
+
+    // The production layer table (forge/manifest.py LAYERS, as carried by the
+    // manifest fixture) and one species that tolerates everything, so the
+    // golden does not depend on which biome the synthetic climate lands here.
+    AssetLayer layers[kAssetLayerCount];
+    layers[0] = {24'000, 60'000, 8'000, 15'000, 60, 4, true};
+    layers[1] = {5'000, 34'000, 4'000, 12'000, 1000, 4, true};
+    layers[2] = {2'200, 7'500, 2'000, 6'000, 1000, 4, true};
+    layers[3] = {800, 30'000, 2'000, 2'500, 1000, 4, false};
+    AssetSpecies pineRow;
+    pineRow.bankId = 0;
+    pineRow.layer = 1;
+    for (int b = 0; b < kBiomeCount; ++b) pineRow.weightPerMille[b] = 900;
+    pineRow.elevMinMm = -10'000;
+    pineRow.elevMaxMm = 2'000'000;
+    pineRow.slopeMaxMmPerM = 100'000;
+    pineRow.clusterQ10 = 768;
+    pineRow.heightMm = 8'000;
+    pineRow.voxelSizeMm = uint32_t(kVoxelSizeMm);
+
+    AssetField field;
+    field.setLayers(layers, kAssetLayerCount);
+    field.setSpecies(&pineRow, 1);
+    field.setBankSource(&banks);
+    field.setSeed(20260719);
+
+    const auto digestRegion = [&](const AssetField* f) -> uint64_t {
+        GeneratedWorld<8> g(amp);
+        g.setAssetField(f);
+        Digest d;
+        // +/- 12 bricks = +/- 9.6 m: wide enough that the 5 m canopy lattice
+        // has anchors INSIDE the region (a first cut at +/-3.2 m digested
+        // only crowns reaching in from outside, and there were none -- the
+        // pine's crown radius is 2.4 m).
+        for (int32_t by = -12; by <= 12; ++by)
+            for (int32_t bx = -12; bx <= 12; ++bx) {
+                const auto grid = g.columns(bx, by);
+                int32_t bzMin = 0, bzMax = 0;
+                g.surfaceBrickRange(grid, bzMin, bzMax);
+                // Pine height is 8 m = 80 voxels = 10 bricks of 8; walk the
+                // shell plus that headroom so every crown voxel is digested.
+                for (int32_t bz = bzMin; bz <= bzMax + 11; ++bz) {
+                    const Brick<8> brick = g.makeBrick({bx, by, bz}, grid);
+                    d.u32(uint32_t(bx));
+                    d.u32(uint32_t(by));
+                    d.u32(uint32_t(bz));
+                    brick.digest(d);
+                }
+            }
+        return d.h;
+    };
+
+    const uint64_t bare = digestRegion(nullptr);
+    const uint64_t wooded = digestRegion(&field);
+    std::printf("    bare %016llx, wooded %016llx\n", (unsigned long long)bare,
+                (unsigned long long)wooded);
+    // The ran-flag: an installed field that leaves the digest unchanged means
+    // the field is not wired.
+    CHECK(bare != wooded);
+    // The golden. Moves ONLY on a deliberate worldgen change (kWorldGenVersion
+    // bump): layer table, policy maths, scatter channels, or the fixture bake.
+    CHECK_EQ((unsigned long long)wooded, 0xcfcd3f62789f4d0eull);
+}

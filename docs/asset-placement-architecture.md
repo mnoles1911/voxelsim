@@ -270,6 +270,22 @@ per-chunk instancing for ground cover; the wildlife spawner subsystem.
 * Whether `bathy_shore`'s wet set includes river and sea shorelines or lake
   basins only — check the terrain-service codec before relying on it for
   riverbank species.
+  **ANSWERED 2026-08-15, from the bake code: LAKE BASINS ONLY.**
+  `terrain_service/bake/basins.py::bathymetry_planes` builds the wet mask
+  exclusively from basin records (`for r in records: if not r.is_lake:
+  continue`), and `bake/pipeline.py:4963` feeds it `survey.basins` — the
+  depression survey. Rivers live in the separate graded water plane
+  (SECTION_WATER, built in B6, after the bathymetry pass), and the sea is
+  never baked at all (it IS the datum, `lakes.h:1391`). So `bathy_shore`
+  answers "distance to the nearest LAKE shoreline": right for reeds ringing a
+  lake, wrong for a riverbank willow and for beach species, and §3's claim
+  that it carries `placement.water_max_m`'s semantics is TRUE ONLY FOR LAKES.
+  Per the design doc's §9 the gate stays failing closed (a species with
+  `waterMaxMm > 0` is refused when the distance is unknown) rather than being
+  wired to a lake-only answer that would deterministically starve every
+  riverbank species; serving rivers needs the distance transform run over
+  `wet |= water plane` at bake, which is a bake-format decision, not a
+  client-side one.
 * Whether `validate()` fills missing params into loaded bodies (affects only the
   reseed accounting in §8; the giant-kelp body carrying every group suggests
   yes).

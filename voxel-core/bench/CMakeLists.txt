@@ -290,3 +290,9 @@ target_link_libraries(vxc_windprobe PRIVATE voxelcore)
 if(NOT MSVC)
   target_compile_options(vxc_windprobe PRIVATE -Wall -Wextra -Werror)
 endif()
+
+# The asset layer-table widening census and placement counters. See the file
+# header: the layer table is a price list, and this is the measurement the
+# architecture pass requires before it is tuned.
+add_executable(vxc_assetprobe assetprobe.cpp)
+target_link_libraries(vxc_assetprobe PRIVATE voxelcore)

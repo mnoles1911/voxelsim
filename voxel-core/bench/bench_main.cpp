@@ -18,8 +18,12 @@
 #include <vector>
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/assetbank.h"
+#include "voxelcore/assetfield.h"
+#include "voxelcore/assetmanifest.h"
 #include "voxelcore/mesher.h"
 #include "voxelcore/mips.h"
+#include "voxelcore/tilestore.h" // readFileBytes, for --assets
 #include "voxelcore/world.h"
 
 using namespace vxc;
@@ -34,6 +38,55 @@ struct Options {
     bool goldens = false;
     bool mips = false; // --mips: per-level chunk build, fine mip path vs coarse path
     int reps = 5;      // --reps: min-of-N for the --mips mode
+    // --assets <dir>: install the REAL asset term -- <dir>/species.vxm plus
+    // <dir>/banks/<name>/<name>-NNNN.vxa -- and compose it into every brick
+    // and quad this bench digests. THE DIGEST IS THE RAN-FLAG
+    // (docs/asset-placement-architecture.md section 9): with --assets the
+    // digest MUST differ from the terrain-only run, and a landing where it
+    // does not means the field is not wired. The flag is opt-in because the
+    // digest then depends on the manifest and bank BYTES as worldgen input --
+    // CI's cross-compiler digest comparison stays terrain-only until those
+    // files ship with CI.
+    std::string assetsDir;
+};
+
+// The asset term, assembled from a directory or refused loudly. Everything
+// lives for the whole run because AssetField holds pointers.
+struct AssetsOnDisk {
+    AssetManifest manifest;
+    std::vector<AssetSpecies> table;
+    AssetBankLibrary banks;
+    AssetField field;
+    bool ok = false;
+
+    bool load(const std::string& dir, uint64_t seed, bool quiet) {
+        const auto blob = readFileBytes(std::filesystem::path(dir) / "species.vxm");
+        if (!blob) {
+            std::fprintf(stderr, "--assets: cannot read %s/species.vxm\n", dir.c_str());
+            return false;
+        }
+        const AssetManifestError me = manifest.parse(*blob);
+        if (me != AssetManifestError::kOk) {
+            std::fprintf(stderr, "--assets: manifest refused: %s\n",
+                         assetManifestErrorText(me));
+            return false;
+        }
+        const AssetTableBuildStats st = assetSpeciesTableFromManifest(manifest, table);
+        if (st.kept == 0) {
+            std::fprintf(stderr, "--assets: manifest folded to an EMPTY table\n");
+            return false;
+        }
+        banks.configure(&manifest, (std::filesystem::path(dir) / "banks").string());
+        field.setLayers(manifest.layers().data(), int(manifest.layers().size()));
+        field.setSpecies(table.data(), int(table.size()));
+        field.setBankSource(&banks);
+        field.setSeed(seed);
+        if (!quiet)
+            std::printf("assets: %d species installed (%d without banks), %zu layers\n",
+                        st.kept, st.withoutBanks, manifest.layers().size());
+        ok = true;
+        return true;
+    }
 };
 
 using Clock = std::chrono::steady_clock;
@@ -59,10 +112,11 @@ struct BenchResult {
 };
 
 template <int B>
-BenchResult run(const Options& opt) {
+BenchResult run(const Options& opt, const AssetsOnDisk* assets) {
     SyntheticTileSampler tiles(opt.seed);
     Amplifier amp(opt.seed, tiles);
     GeneratedWorld<B> gen(amp);
+    if (assets != nullptr && assets->ok) gen.setAssetField(&assets->field);
     BenchResult r;
     Digest digest;
 
@@ -101,6 +155,30 @@ BenchResult run(const Options& opt) {
                     vzMin = top < vzMin ? top : vzMin;
                     vzMax = top > vzMax ? top : vzMax;
                 }
+
+            // THE ASSET TERM (--assets). Same composition as GeneratedWorld::
+            // makeBrick: resolved once per footprint, air-only, monotone. The
+            // brick-z range is extended by each instance's OWN baked extents
+            // -- not by the layer bound -- so the digest walks exactly the
+            // bricks that can hold asset voxels and no test of the bound
+            // sneaks into a measurement of the fill.
+            std::vector<AssetInstance> insts;
+            if (assets != nullptr && assets->ok) {
+                const int64_t vx0 = int64_t(bx) * B, vy0 = int64_t(by) * B;
+                const AssetVoxelRect arect{vx0, vy0, vx0 + B - 1, vy0 + B - 1};
+                insts = assets->field.instancesForRect(
+                    arect, [&](int64_t vx, int64_t vy) {
+                        return assetColumnFactsFromSample(amp.columnCached(vx, vy));
+                    });
+                for (const AssetInstance& inst : insts) {
+                    const AssetGrid* g = assets->banks.bankGrid(inst.bankId, inst.seedIndex);
+                    if (g == nullptr) continue;
+                    const int64_t lo = inst.anchorVz + int64_t(g->originZ());
+                    const int64_t hi = lo + int64_t(g->sizeZ()) - 1;
+                    vzMin = lo < vzMin ? lo : vzMin;
+                    vzMax = hi > vzMax ? hi : vzMax;
+                }
+            }
             const int32_t bzMin = static_cast<int32_t>(floorDiv(vzMin, B));
             const int32_t bzMax = static_cast<int32_t>(floorDiv(vzMax, B));
 
@@ -123,9 +201,17 @@ BenchResult run(const Options& opt) {
                 for (int y = 0; y < B; ++y)
                     for (int x = 0; x < B; ++x) {
                         const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
-                        for (int z = 0; z < B; ++z)
-                            brick.set(x, y, z,
-                                      Amplifier::materialAt(c, int64_t(bz) * B + z));
+                        for (int z = 0; z < B; ++z) {
+                            const int64_t vz = int64_t(bz) * B + z;
+                            MaterialId m = Amplifier::materialAt(c, vz);
+                            // AIR ONLY, exactly as GeneratedWorld::makeBrick:
+                            // the composition is monotone or the floor bound
+                            // breaks while the sky bound looks fine.
+                            if (m == MAT_AIR && !insts.empty())
+                                m = assets->field.materialAt(insts, int64_t(bx) * B + x,
+                                                             int64_t(by) * B + y, vz);
+                            brick.set(x, y, z, m);
+                        }
                     }
                 brick.tryCollapse();
                 r.voxelizeMs += msSince(tVox);
@@ -137,7 +223,12 @@ BenchResult run(const Options& opt) {
                 quads.clear();
                 const auto sampler = [&](int x, int y, int z) -> MaterialId {
                     const ColumnSample& c = ext[(x + 1) + (B + 2) * (y + 1)];
-                    return Amplifier::materialAt(c, int64_t(bz) * B + z);
+                    const int64_t vz = int64_t(bz) * B + z;
+                    MaterialId m = Amplifier::materialAt(c, vz);
+                    if (m == MAT_AIR && !insts.empty())
+                        m = assets->field.materialAt(insts, int64_t(bx) * B + x,
+                                                     int64_t(by) * B + y, vz);
+                    return m;
                 };
                 meshBrick<B>(sampler, quads);
                 r.meshMs += msSince(tMesh);
@@ -431,6 +522,7 @@ int main(int argc, char** argv) {
         if (a == "--radius" && i + 1 < argc) opt.radiusM = std::atoll(argv[++i]);
         else if (a == "--seed" && i + 1 < argc) opt.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--brick" && i + 1 < argc) opt.brick = std::atoi(argv[++i]);
+        else if (a == "--assets" && i + 1 < argc) opt.assetsDir = argv[++i];
         else if (a == "--digest") opt.digestOnly = true;
         else if (a == "--goldens") opt.goldens = true;
         else if (a == "--mips") opt.mips = true;
@@ -438,7 +530,7 @@ int main(int argc, char** argv) {
         else {
             std::fprintf(stderr,
                          "usage: vxc_bench [--radius m] [--seed n] [--brick 8|16] "
-                         "[--digest] [--goldens] [--mips] [--reps n]\n");
+                         "[--digest] [--goldens] [--mips] [--reps n] [--assets dir]\n");
             return 2;
         }
     }
@@ -450,18 +542,28 @@ int main(int argc, char** argv) {
         runMipsBench(opt);
         return 0;
     }
+    // The asset term is loaded once and shared by every run: with --assets the
+    // digest covers the manifest, the layer table and the bank bytes, which is
+    // exactly the point -- the digest is the ran-flag for asset placement.
+    AssetsOnDisk assets;
+    if (!opt.assetsDir.empty() &&
+        !assets.load(opt.assetsDir, opt.seed, /*quiet=*/opt.digestOnly))
+        return 1;
+    const AssetsOnDisk* ap = assets.ok ? &assets : nullptr;
+
     if (opt.digestOnly) {
         // Digest mode: fixed deterministic output for cross-build comparison.
         if (opt.brick == 8) {
-            std::printf("%016llx\n", (unsigned long long)run<8>(opt).digest);
+            std::printf("%016llx\n", (unsigned long long)run<8>(opt, ap).digest);
         } else {
-            std::printf("%016llx\n", (unsigned long long)run<16>(opt).digest);
+            std::printf("%016llx\n", (unsigned long long)run<16>(opt, ap).digest);
         }
         return 0;
     }
-    std::printf("voxel-core bench: radius %lldm, seed %llu (worldgen v%u)\n\n",
-                (long long)opt.radiusM, (unsigned long long)opt.seed, kWorldGenVersion);
-    if (opt.brick == 0 || opt.brick == 8) report("8^3", run<8>(opt));
-    if (opt.brick == 0 || opt.brick == 16) report("16^3", run<16>(opt));
+    std::printf("voxel-core bench: radius %lldm, seed %llu (worldgen v%u)%s\n\n",
+                (long long)opt.radiusM, (unsigned long long)opt.seed, kWorldGenVersion,
+                ap != nullptr ? " + assets" : "");
+    if (opt.brick == 0 || opt.brick == 8) report("8^3", run<8>(opt, ap));
+    if (opt.brick == 0 || opt.brick == 16) report("16^3", run<16>(opt, ap));
     return 0;
 }

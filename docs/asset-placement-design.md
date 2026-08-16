@@ -820,7 +820,165 @@ unaffected.
 
 ---
 
+## 12. The data landing (2026-08-15, second session)
+
+The seam §9 said was unbuilt is now built, in the architecture doc's §11
+order. Everything below is code that runs, with the measurement that would
+catch it doing nothing.
+
+### 12.1 The manifest: forge exports, the engine refuses or loads whole
+
+`forge/manifest.py` + `tools/export_manifest.py` emit **one versioned binary
+table per library build** (`out/engine/species.vxm`, format "VXM1" v1, 826
+species): kind, layer, per-biome weight, abundance, spacing, cluster,
+elevation band, slope band (min field present, always 0 until the spec grows
+`slope_min_pct`), depth band, herd/shoal parameters and the bank reference,
+per species — plus **the four-layer scatter table in the header**, so a
+species can never be read against a layer table it was not filed under.
+`voxelcore/assetmanifest.h` is the reader, on the `AssetParseError` model:
+thirteen named refusals, including one no other parser here has — **the biome
+names travel in the file and are verified by spelling against BiomeId order**,
+because a silent reorder would turn every rainforest weight into a desert
+weight and every one of those is a valid weight.
+
+The export REPORTS what it bends, by name: 28 species authored tighter spacing
+than their layer's cell (served at the cell pitch), 6 hero landmarks whose
+900 m+ spacing folds below one per-mille (ABSENT from the world — per-mille
+pick weights cannot express one-arch-per-3-km, and a scatter lattice should
+not try; they need a landmark placement pass), and 2 species taller than every
+layer (hero-sequoia, hero-arch-colossal — refused outright). The C++ fold
+(`assetSpeciesTableFromManifest`) counts the same events on its side: over the
+real manifest, **438 kept / 382 detail entities / 6 too rare / 0 no-biome**,
+pinned loosely by `test_assetmanifest.cpp` against the fixture the exporter
+actually wrote (`tests/fixtures/asset_species_v1.vxm`).
+
+### 12.2 The banks: baked, validated by the tool that files them
+
+`tools/export_banks.py` baked **688 VXA v3 files** — every terrain-kind
+species except the four heavy heroes and the fold-to-zero landmarks, at four
+seeds each — into `out/engine/banks/<name>/<name>-NNNN.vxa`, checking every
+baked grid against its layer's declared box at bake time. That check earned
+its keep immediately: **16 species refused on the first pass**, every one a
+baked individual overshooting its authored nominal (worst +18%, small-leaved
+lime 25 m authored, 29.6 m baked) or a hero wider than any sane dilation
+(natural-arch: 45.2 m of reach). The layer table now files at nominal x1.3 and
+its caps/radii are the MEASURED maxima over the full bake (52.5 m, 14.5 m),
+not the spec's claims.
+
+`voxelcore/assetbank.h` (`AssetBankLibrary`) is the production
+`IAssetBankSource`: per-species-bank residency, sorted-filename seed order,
+seedIndex reduced modulo the valid count, every file re-validated at load
+(nine named refusals), and **misses are counters, not silence** — a species
+whose bank never loads composes as air AND as a number, because "the table
+loaded and nothing renders" must be a one-line diagnosis.
+
+### 12.3 `Amplifier::surfaceInfo` and the gradient direction
+
+Built as the architecture doc specified: surface, slope magnitude AND signed
+per-axis gradient, biome and climate in one call, sharing one private
+climate+dither helper with `column()` so a spawner and the world it spawns
+into cannot disagree about a boundary (pinned bit-for-bit over a 2,500-column
+sweep). The gradient direction — computed inside `evalSurface` since v9 and
+thrown away — now survives; the uphill probe measures 98% agreement between
+"step 15 m along the dominant component" and "the surface rose" on sloped
+ground. Worldgen digest unchanged by all of this: `e02458de2be47309`.
+
+### 12.4 The widening census, and what it did to the layer table
+
+`vxc_assetprobe` (bench/assetprobe.cpp) is the measurement §9 said nobody had
+taken. Over 32-voxel chunk footprints it reports the distribution of
+`assetTopAboveSurfaceMm`, the **extra admitted chunk layers** against the
+terrain-only bound (dilation slack and widening split out), and — with
+`--banks` — the §10 placement counters and the anchor contact audit.
+
+What it found, and what changed because of it:
+
+* The architecture's illustrative table (canopy = 14 m) does not fit the
+  authored library: **half of all trees are taller than 14 m at under 8 m
+  spacing** (Sitka spruce: 45 m at 7 m). A 14 m canopy cap would demote 39 of
+  78 trees to a 24 m lattice and gut every conifer forest.
+* The first composition charged the widest layer's dilation to every
+  footprint on the planet for a layer present on ~13% of them. The composed
+  bound is now **per layer** — each terrain layer with a site in reach buys
+  `bound(rect (+) its own radius) + its own cap` — strictly tighter, soundness
+  argued at the function, pinned by the updated dilation tests and the
+  unchanged adversarial dominance sweep.
+* Tuned numbers (synthetic, 512 m square, seed 20260719): mean extra
+  admitted chunk layers **22.98 → 17.02**; on the real wet-alpine fine tile
+  (bake-out/-3_-3.vxtl): **24.58**, of which 17.2 chunks is dilation slack —
+  steep ground pays reach x slope and no cap tuning touches that term.
+* **The honest residue, for the owner:** even after tuning, a world with this
+  library placeable costs ~17-25 extra admitted chunk layers per footprint
+  against a surface shell of ~1.6-2.0 — an admission multiplier of roughly
+  10x, paid everywhere the canopy lattice exists, vetoed or not. Capping the
+  canopy at 14 m (priced with `--l1cap 14000`) only reaches 11.4 / 18.9,
+  because the slack term survives. The two real levers are design work, not
+  tuning: a SOUND climate-conditioned veto of the bound's terms (skip the
+  canopy term only where no column in reach could classify tree-hosting —
+  computable from the same raster stencil the bound already reads, with
+  margins for dither and interpolation), and accepting that in forests the
+  "extra" chunks are not waste at all (they hold crowns). Neither is built;
+  the census is what makes the decision priceable.
+
+The placement census over a 128 m square of real amplifier ground: 32,669
+sites -> 9,898 instances, 34 species, **0 floating anchors of 9,898
+audited** (independently re-read through `Amplifier::materialAt`, not
+trusting the resolver), 1,635 bank-served terrain instances, 3.9 M stampable
+voxels, 0 bank refusals.
+
+### 12.5 The digest moved, deliberately
+
+`vxc_bench --assets <dir>` installs the real manifest + banks and composes
+the asset term into every brick and quad it digests, through the same
+air-only monotone rule as `GeneratedWorld::makeBrick`:
+
+* terrain-only: `e02458de2be47309` — unchanged, the terrain function is
+  untouched;
+* `--assets asset-forge/out/engine`: **`3b5fe7ec61c6581a`** — the ran-flag
+  fires.
+
+`kWorldGenVersion` is bumped **23 → 24** (core.h records the contract: from
+here on the manifest bytes, bank bytes and layer table are worldgen input).
+A new pinned golden
+(`assetfield_installed_field_moves_the_world_digest_and_the_digest_is_pinned`)
+digests a wooded region through `makeBrick` against the real baked
+tundra-pine fixture and asserts both halves: installed-field digest differs
+from bare, and equals `cfcd3f62789f4d0e` until somebody re-blesses it on
+purpose.
+
+### 12.6 `bathy_shore` answered, and `water_max_m` stays closed
+
+From the bake code (`terrain_service/bake/basins.py::bathymetry_planes`,
+called at `bake/pipeline.py:4963` with `survey.basins`): the wet set is
+**lake basins only** — rivers are the separate graded water plane, the sea is
+the datum and is never baked. So the shore-distance plane serves "reeds ring
+a lake" and nothing else; wiring it into `distanceToWaterMm` would
+deterministically starve every riverbank willow while looking wired. The gate
+therefore still fails closed, unchanged from §9, and serving rivers needs the
+bake's distance transform to include the water plane's wet cells — a
+bake-format change, flagged for whoever owns bake_ver next.
+
+### 12.7 Still unbuilt after this landing
+
+* Ground-cover banks (the 266 kept species without banks — their `.vxa` are
+  UE-side render assets, not world voxels) and everything §9 lists under
+  "needs the editor": the UE admission gate wiring, per-chunk instancing, the
+  wildlife spawner.
+* The aquatic depth bands are still not AUTHORED (only widened in scope);
+  the sequencing warning in §11.5 now has teeth, because a reseed is now a
+  v24+ worldgen change.
+* The landmark heroes need their own placement pass; per-mille pick weights
+  cannot express them and this document refuses to pretend otherwise.
+* The two design levers in §12.4 for the admission price, priced but not
+  built.
+
 ## 10. Verification
+
+> §12 supersedes the digest half of this section: as of the data landing the
+> suite is at **697 pass, exit 0**, the terrain-only digest is still
+> `e02458de2be47309`, and `vxc_bench --assets` produces `3b5fe7ec61c6581a` —
+> the digest now moves exactly when the field is installed, which is what §9
+> of the architecture doc demands.
 
 ```
 cd voxel-core && cmake --build build --config Release --target vxc_tests
