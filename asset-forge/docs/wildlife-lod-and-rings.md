@@ -92,26 +92,63 @@ that could never have been received, and it leaves ~1,300 far-ring movers in the
 worst biome — of which ~1,200 are genuinely on screen. At 60 voxels each (LOD3)
 that is 78,000 voxels total, less than three shipped trees.
 
-## 4. The long shot, and how to keep it without paying for it
+## 4. The weapons settle it: bows and crossbows, nothing past 200 m
 
-There is a real gameplay cliff in this design: if S1 is not killable, an animal
-you can plainly see at 600 m cannot be shot, and the player feels the seam.
+**Owner, 2026-08-16: no guns; the only ranged weapons are bows and crossbows; no
+ranged shot past 200 m.** That removes the hardest problem in this document
+before it was built.
 
-**Promote on demand.** A shot fired toward a far group promotes that one group to
-S0 for the duration — collision, hit resolution, death. The identity is already
-stable (the scatter's site id plus the index within the herd), so the animal that
-was moving is the animal that is hit. You never pay for 1,300 killable deer; you
-pay for the one the player aimed at, at the moment they aimed.
+An earlier draft of this section proposed *promotion on demand* — a shot fired
+at a far group promotes it to a full actor for the duration — to avoid the cliff
+where an animal you can plainly see at 600 m cannot be shot. **With a 200 m
+weapon ceiling there is no cliff.** Killability simply ends at the actor ring,
+and everything beyond it is spectacle by construction rather than by compromise.
 
-The same mechanism runs the other way when the player closes on a herd: S1 → S0
-promotion must preserve identity, or the deer you stalked is not the deer you
-meet. That is the same requirement, and one implementation.
+So the actor ring is not a tuning decision either. It is the weapon range:
+
+    S0 (full actor, killable)   0 – ~220 m,  flat, for anything huntable
+    S1 (mover, not killable)    220 m – the pixel-visibility limit
+    S2 (group record)           beyond
+
+The flat 220 m matters. The authored `despawn_m` scales with body size, so a fox
+sits at 145 m and a pika at 60 m — under the weapon ceiling. A rabbit at 190 m is
+shootable and must therefore exist as something that can be hit.
+
+**And the authored data already survives that test.** Taking "aimable" as at
+least 8 pixels of body — below which there is nothing to put a crosshair on — and
+capping at the 200 m weapon range, **0 of 131 species can be aimed at from beyond
+where they despawn.** The hand-authored ranges are already consistent with a bow
+world. Nothing needs re-authoring for this.
+
+### 4.1 What actually fills the actor ring, and the surprise in it
+
+Quadrupeds inside 220 m with real densities:
+
+| biome | all sizes | body ≥ 0.8 m |
+|---|---|---|
+| grassland | 562 | **16** |
+| temperate forest | 291 | **13** |
+
+The huntable quarry is about **sixteen animals** — a comfortable budget, with
+room for birds on top. The other 546 are colony animals: 278 prairie dogs, 141
+moles, 54 rabbits, 44 marmots. Their densities are real and correct, and full AI
+actors are the wrong shape for them.
+
+So the tier is **relevance, not only distance**: large animals get full actors
+inside the weapon ring, small colony animals stay cheap movers *even up close*,
+and promotion-on-demand survives after all — not for the 600 m shot it was
+invented for, but for the moment a player actually targets a rabbit. That is far
+rarer and far cheaper than promoting a herd across a valley.
+
+Promotion must still preserve identity in both directions, or the deer you
+stalked is not the deer you meet. The scatter's site id plus the index within the
+herd already provides it.
 
 ## 5. What this does not settle
 
-* **Where killability ends entirely.** Promotion-on-demand makes the far ring
-  shootable in principle; whether a 1.8 km shot should connect is a design call,
-  not an engineering one.
+* **Melee and traps.** The 200 m ceiling settles ranged weapons. If an animal
+  can be trapped, snared or driven, that is an interaction beyond the actor ring
+  and it reopens the question this section just closed.
 * **Movement authority at S1.** "Some NPC movement" is cheap if a herd moves as a
   unit and individuals carry a deterministic offset and gait phase. It stops
   being cheap the moment an S1 animal needs to path around terrain. v1 should
