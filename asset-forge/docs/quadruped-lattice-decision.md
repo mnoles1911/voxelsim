@@ -47,7 +47,9 @@ Solid voxel counts, seed 1, `variation.amount` pinned to 0.
 blue-wildebeest 33,022 · plains-zebra 38,001 · greater-kudu 50,339. Call it
 **27k–50k**.
 
-**The 20 species at or under 2.4 m, if moved to 2 cm:**
+**The 15 species at or under 2.4 m, if moved to 2 cm** (a first version of this
+file said 20 here and six below; both were the row counts of the sample tables,
+not the group sizes — the split is 15 and 11):
 
 | | 5 cm now | at 2 cm |
 |---|---|---|
@@ -61,7 +63,7 @@ blue-wildebeest 33,022 · plains-zebra 38,001 · greater-kudu 50,339. Call it
 **They land inside the band 63 species already occupy.** Moving them is not a
 new cost class; it is parity with the animals standing next to them.
 
-**The six over 2.4 m are a different question:**
+**The 11 over 2.4 m are a different question:**
 
 | | 5 cm now | at 2.5 cm | at 2 cm |
 |---|---|---|---|
@@ -77,16 +79,31 @@ hippo sit at 2–3× it. The elephant is an outlier at any setting: half a milli
 voxels at 2.5 cm and nearly a million at 2 cm, against 50,339 for the most
 expensive animal shipping today.
 
-## 3. The recommendation
+## 3. What was done — applied 2026-08-16 on the owner's approval
 
-* **The 20 species at or under 2.4 m → 2 cm.** Free, in the sense that it buys
-  no cost the library is not already paying per animal, and it is the whole
-  lattice-limited population among the mid-size animals.
-* **The six giants → 2.5 cm**, which is the next value on the menu and puts the
-  moose and bison in-band while roughly tripling the detail on the rest.
-* **The elephant is the one genuinely open call.** 5 cm keeps it at 62,635 and
-  120 voxels along the body — which, being 6 m long, is already better resolved
-  than a lion at 5 cm. It may simply not need the move.
+**25 of the 26 moved. The elephant stayed.** Every species was priced at its
+target before anything was written, and the whole 26 went from 197,782 voxels
+to 1,321,072 — 6.7× — for one individual each at seed 1.
+
+| | count | lattice | voxels after |
+|---|---|---|---|
+| at or under 2.4 m | 15 | 5 cm → **2 cm** | 15,176 – 55,527 |
+| over 2.4 m | 10 | 5 cm → **2.5 cm** | 30,353 – 166,133 |
+| `african-bush-elephant` | 1 | **stays 5 cm** | 62,635 |
+
+The 15 land in and below the 27k–50k band that 63 species already pay, so that
+half is parity rather than a new cost. The 10 giants are dearer — hippo 166,133
+and white rhino 141,167 are 3× the dearest animal shipping before today — and
+that is the price of a 3.5 m animal that reads as an animal.
+
+**The elephant stayed at 5 cm, and that is the one judgement call in here.** At
+6 m it is already 120 voxels along the body — better resolved than a lion was at
+5 cm, and better than a muskox is at 2 cm. Moving it costs 498,016 voxels at
+2.5 cm, ten times the dearest shipped animal, to improve the one species that
+was never lattice-limited. If it should move anyway, it is a one-line change and
+a re-bake.
+
+Not touched: the 42 species on 1 cm and the 63 already on 2 cm.
 
 ## 4. Two traps found on the way here
 
@@ -113,9 +130,74 @@ Ten of them are 20 cm animals — jerboa, pika, mole, common frog — which are
 the owner set and 1 cm is the finest lattice on the menu. No lattice decision
 reaches them.
 
-Nothing here re-fits any spec. Changing `resolution_cm` changes that species'
-`spec_hash` and so reseeds it, and the limb ratios in
-`docs/quadruped-limb-regression.md` were measured at the current lattices —
-**they would all need re-measuring after a move**, and `reffit dead` in
-particular rewrites rows to what the one-voxel floor draws, which is a
-lattice-dependent quantity by construction.
+**The limb fit is now owed a re-measurement, and this is the debt in writing.**
+Every ratio in `docs/quadruped-limb-regression.md` was measured with these 25
+species on 5 cm. `reffit dead` in particular rewrote 68 rows to *what the
+one-voxel radius floor was already drawing*, and that is a lattice-dependent
+quantity by construction: at 2 cm the floor stops binding on most of them, so
+those rows now mean something they did not mean when they were written. The
+species that were lattice-limited are exactly the species that just moved, which
+is the point of the move and also the reason the numbers cannot simply be
+carried over. Re-measured immediately after the change in §7.
+
+## 6. `quad.eye`, and why validation had to become idempotent first
+
+**This was fixed before the lattice change, and the order was not incidental.**
+`spec.validate` was not idempotent: `sm.patch(spec, {})` returned a **different
+individual** on 192 of 828 specs, so any pass that patched and saved reseeded
+them silently — `tools/plantfit.py fit --apply` among them. Changing 25 lattices
+through a patch-and-save would have quietly reseeded a fifth of the library
+alongside it, and the lattice renders would have been read as lattice effects.
+
+**The cause was one row.** `quad.eye` was authored `1.0, 0.0, 3.0, 1.0` and is
+the only one of 34 `kind="int"` parameters with float bounds. A spec that never
+authored an eye loaded the default as `1.0`; `patch` coerced it to `1`. Identity
+is a hash of the spec's canonical JSON, and `"1.0"` and `"1"` serialise
+differently **while comparing equal in Python** — the two dicts are `==`, so no
+value comparison anywhere in the codebase could ever have seen it. That is the
+same shape as every other detachment in this project: a fact derived twice, in
+two representations, agreeing until one of them moves.
+
+**There was no cheaper repair, and that was checked rather than assumed.** 636
+specs already carry `"eye": 1` on disk because they have been patch-and-saved at
+some point; 192 do not. Normalising the hash in either direction moves one group
+or the other, so 192 is the floor. Fixing the row's bounds pays exactly that
+floor, once.
+
+**Who actually reseeded is the surprise: not one of the 192 is a quadruped.**
+Every quadruped spec had been saved through the coercion already. The 192 are 52
+flowers, 44 grasses, 34 rocks, 20 birds, 12 fish, 10 reeds, 9 trees, 7 cetaceans
+and 4 bushes — and the 9 trees and 34 rocks are terrain kinds with baked banks,
+so the re-bake covers them.
+
+`forge/cli.py selftest` now checks both ends every run: no `kind="int"` row may
+carry a float bound (the cause), and re-validating any spec must return the same
+individual (the symptom). The second matters more, because the next instance of
+this will not be about integers.
+
+## 7. Re-measured after the move, and the lattice was carrying a third of the error
+
+`tools/reffit.py report`, same 78 species with a reference, same code both
+sides. **No limb parameter was touched — only `resolution_cm`.**
+
+| | before the move | after |
+|---|---|---|
+| limb thickness ÷ limb length, median | 1.29× life | **1.13×** |
+| within 10% of life | 15 of 78 | **21 of 78** |
+| belly clearance ÷ body length, median | 0.78× | **0.81×** |
+| total height ÷ body length, within 10% | 20 of 78 | 21 of 78 |
+
+**A third of the remaining limb error was the lattice**, and it came off for
+free. `wood-bison` went 1.21× → 0.96×. That is the claim
+`docs/quadruped-limb-regression.md` ended on — *"71 of 131 species are
+lattice-limited and no value of any spec row can fix that"* — turning out to be
+literally true and now literally paid.
+
+**It also means the 68 rows `reffit dead` rewrote are due a re-fit, not just a
+re-measurement.** Those rows record what the one-voxel radius floor was drawing
+at 5 cm; at 2 cm the floor stops binding and the row becomes live again, so the
+value that was a faithful description of the old drawing is now an authored
+number nobody chose. The re-fit is `reffit dead` followed by `fit --thin` at the
+new lattices, and it is deliberately NOT bundled into this change: the move is
+worth reading on its own, and stacking a solver on top of it would make the two
+impossible to tell apart in a render.

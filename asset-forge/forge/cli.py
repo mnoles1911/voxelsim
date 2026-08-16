@@ -656,6 +656,46 @@ def cmd_selftest(args) -> int:
         print(f"    ! {line}")
     ok &= not laundered and not mute
 
+    # VALIDATION MUST BE IDEMPOTENT, and this check exists because it wasn't.
+    #
+    # `quad.eye` was authored `1.0, 0.0, 3.0, 1.0` -- the only one of 34
+    # kind="int" rows with float bounds -- so a spec that never authored an eye
+    # loaded the default as 1.0 and `patch` coerced it to 1. That is a DIFFERENT
+    # INDIVIDUAL: identity is a hash of the spec's canonical JSON, and "1.0" and
+    # "1" serialise differently while comparing EQUAL in Python. 192 of 828
+    # specs moved every time anything patched and saved them, `plantfit fit
+    # --apply` included, and no value comparison in the codebase could have seen
+    # it -- the two dicts are `==`.
+    #
+    # So it is checked two ways, cheaply, on every run: no int row may carry a
+    # float bound (the cause), and re-validating a spec may not change which
+    # individual it is (the symptom). The second is the one that matters,
+    # because the next instance of this will not be about ints.
+    typed = [f"{p.path}: kind=\"int\" with float bounds "
+             f"{(p.default, p.lo, p.hi, p.step)}"
+             for p in specmod.PARAMS if p.kind == "int"
+             and any(isinstance(v, float) for v in (p.default, p.lo, p.hi, p.step)
+                     if v is not None)]
+    drifted = []
+    for p in spec_paths():
+        try:
+            body, _ = specmod.load(p)
+        except (OSError, ValueError):
+            continue  # already reported by the check above
+        again, _ = specmod.patch(body, {})
+        if specmod.seed_hash(body) != specmod.seed_hash(again):
+            drifted.append(f"{p.stem}: re-validating returns a different "
+                           f"individual ({specmod.seed_hash(body)[:12]} -> "
+                           f"{specmod.seed_hash(again)[:12]})")
+    print(f"  validating a spec twice returns the same individual: "
+          f"{'pass' if not typed and not drifted else 'FAIL'} "
+          f"({len(spec_paths())} specs, {len(typed)} int rows with float bounds)")
+    for line in typed + drifted[:10]:
+        print(f"    ! {line}")
+    if len(drifted) > 10:
+        print(f"    ! ...and {len(drifted) - 10} more")
+    ok &= not typed and not drifted
+
     # A SPECIES MAY ONLY BE WEIGHTED INTO A BIOME THAT HOSTS ITS KIND.
     #
     # `spec.py` gates the app's sliders with `kinds=b.hosts`, which is a UI

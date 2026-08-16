@@ -2366,7 +2366,18 @@ PARAMS: tuple[Param, ...] = (
       help="How much deeper the lower half of the muzzle is than the upper. "
            "This is what makes a muzzle read as a mouth rather than a snout; a "
            "hyena, a howler monkey and a mandrill are near 1."),
-    P("quad.eye", "Eye size", 1.0, 0.0, 3.0, 1.0, kind="int", group="quad",
+    # THE BOUNDS ARE INTS AND THAT IS LOAD-BEARING. This row was authored
+    # `1.0, 0.0, 3.0, 1.0` -- the only one of 34 kind="int" params with float
+    # bounds -- and it made `validate` NON-IDEMPOTENT: a spec that never
+    # authored an eye loaded the default as 1.0 and `patch` coerced it to 1, so
+    # `sm.patch(spec, {})` returned A DIFFERENT INDIVIDUAL on 192 of 828 specs.
+    # Identity is a hash of the spec's canonical JSON, and "1.0" and "1"
+    # serialise differently while comparing EQUAL in Python, so no value
+    # comparison anywhere could see it. Anything that patched and saved had
+    # been silently reseeding, `tools/plantfit.py fit --apply` included.
+    # Fixed 2026-08-16 at the cost of reseeding those 192 once; see
+    # docs/quadruped-lattice-decision.md §6 for why no cheaper repair exists.
+    P("quad.eye", "Eye size", 1, 0, 3, 1, kind="int", group="quad",
       kinds=("quadruped",),
       help="Radius in voxels of the eye patch on each side of the skull. Two "
            "voxels do more than any other two in the asset. 0 turns it off, "

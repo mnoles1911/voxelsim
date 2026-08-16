@@ -78,13 +78,26 @@ def _build(name: str, cm: str | None):
 
 
 def main():
-    names = sys.argv[1:]
+    args = sys.argv[1:]
+    # `--before CM` forces the LEFT cell to a lattice the species no longer
+    # authors, which is the only way to draw a before once the change is
+    # applied. Without it the left cell is whatever the spec says today, which
+    # after 2026-08-16 is the AFTER -- and a sheet whose two halves are the same
+    # build is the most confident kind of wrong.
+    before_cm = None
+    if "--before" in args:
+        i = args.index("--before")
+        before_cm = args[i + 1]
+        del args[i:i + 2]
+    names = args
     cases = ([(n, None) for n in names] if names else DEFAULT)
 
     rows = []
     for name, control in cases:
         cells = []
-        for label, cm in (("authored", None), ("at 2 cm", "2")):
+        pair = (("was", before_cm), ("authored", None)) if before_cm else \
+               (("authored", None), ("at 2 cm", "2"))
+        for label, cm in pair:
             a, cm_got = _build(name, cm)
             cells.append((f"{name}  {label} ({cm_got:g} cm)", a))
         if control:
