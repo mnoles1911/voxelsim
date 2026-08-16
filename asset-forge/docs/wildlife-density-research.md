@@ -25,17 +25,20 @@ It joins to the 131 hand-checked GBIF binomials already in
 
 | tier | n | what it is |
 |---|---|---|
-| **measured** | 78 | PanTHERIA's own species-level figure |
-| **allometric** | 25 | predicted from body mass *and* trophic level |
+| **measured** | 81 | PanTHERIA's own species-level figure |
+| **allometric** | 26 | predicted from body mass *and* trophic level |
 | **genus** | 10 | median of congeners that have one |
-| **none** | 18 | no mammal source. Not estimated. Listed. |
+| **none** | 14 | no mammal source. Not estimated. Listed. |
 
-The 18 are 13 reptiles and amphibians — PanTHERIA is a mammal database and does
-not cover them — plus 5 mammals whose binomial `species-latin.json` already
-flags as `checked_by_hand: false`.
+Thirteen of the 14 are reptiles and amphibians — PanTHERIA is a mammal database
+and does not cover them at all. The fourteenth is `arctic-ground-squirrel`, which
+PanTHERIA carries but with no density recorded. **Every binomial in the library
+is now hand-checked**, which was not true when this file was first written; §7 is
+what changed.
 
-**113 species now carry a number, spanning 5.9 orders of magnitude**, from
-`wolverine` at 0.0079/km² to `rock-hyrax` at 5,752/km². Median 2.9/km².
+**117 species now carry a number, spanning 5.5 orders of magnitude**, from
+`wolverine` at 0.0079/km² to `rock-hyrax` at 2,735/km². Median 2.9/km².
+(First written as 113 species and 5,752/km²; §7 explains what changed.)
 
 ## 2. The allometry is fitted here, not quoted
 
@@ -75,7 +78,7 @@ recorded per species, because that is fine for choosing between "one per km²" a
 | wolverine | 0.02 | 0.0001 | 253× |
 | … | | | |
 | european-mole | 0.50 | 9.26 | 0.1× — **18× too few** |
-| rock-hyrax | 4.00 | 57.52 | 0.1× |
+| rock-hyrax | 4.00 | 27.35 | 0.1× |
 | black-tailed-prairie-dog | 6.00 | 18.30 | 0.3× |
 
 **Wrong in both directions at once.** Predators overstated by two to three orders
@@ -101,8 +104,8 @@ worse.** Quadrupeds within a 2 km radius (1,257 hectares):
 | taiga | 9,854 | 6,789 |
 
 Because the total is dominated by the animals nobody came to see. A European
-mole at 926/km² is 11,600 moles inside the bubble; a rock hyrax at 5,752/km² is
-72,000. Both figures are *correct*. Neither is a reason to instantiate anything.
+mole at 926/km² is 11,600 moles inside the bubble; a rock hyrax at 2,735/km² is
+34,000. Both figures are *correct*. Neither is a reason to instantiate anything.
 
 Checking whether they are at least asleep does not rescue it either — of the
 density leaders, `rock-hyrax`, `black-tailed-prairie-dog`, `pika` and
@@ -159,12 +162,46 @@ that would resolve if their binomial were hand-checked — including `capybara`
 and `european-hedgehog`, which are on file with misspelt genera (`Hydrochoeris`,
 `Erimaceus`).
 
-## 7. One thing to watch in the numbers as they stand
+## 7. The watch item, chased down and closed
 
-The two highest densities in the library — `rock-hyrax` 5,752/km² and
-`black-tailed-prairie-dog` 1,830/km² — both come from binomials flagged
-`checked_by_hand: false`, and the tool prints that warning rather than hiding it.
-`rock-hyrax` is on file as *Heterohyrax brucei*, which is the **yellow-spotted**
-hyrax, not the rock hyrax (*Procavia capensis*). The density may well be right
-for the genus and it is still a name nobody has confirmed, sitting at the top of
-the table where it moves the totals most.
+This section originally flagged a risk: the two highest densities in the library
+both came from binomials marked `checked_by_hand: false`, and `rock-hyrax` was on
+file as *Heterohyrax brucei* — the **yellow-spotted** hyrax, not *Procavia
+capensis*. It sat at the top of the table where it moved every total most.
+
+**Chased down 2026-08-16, and it was wrong.** Corrected to *Procavia capensis*
+and re-verified through `tools/refnames.py`'s check (ACCEPTED, SPECIES rank,
+Mammalia, GBIF's own vernaculars containing "rock" and "hyrax"), the density is
+**2,734.5/km², not 5,752** — the wrong hyrax was inflating the library's largest
+number by 2.1×.
+
+Three more names were wrong the same way and nobody had ever checked them:
+
+| species | was | is |
+|---|---|---|
+| `capybara` | *Hydrochoeris hydrochaeris* | *Hydrochoerus hydrochaeris* |
+| `european-hedgehog` | *Erimaceus roumanicus* | *Erinaceus europaeus* |
+| `chamois` | *Rupicapra carpatica* | *Rupicapra rupicapra* |
+
+All three had failed to join PanTHERIA at all, so they were sitting in the
+"no source" pile; corrected, they carry **125.3, 123.0 and (still none)**
+respectively. Coverage went from 113 species to **117**, unsourced from 18 to 14.
+
+**Two more needed a different fix, and it is worth distinguishing.** `fisher` and
+`arctic-ground-squirrel` had names that were *right and current* — but PanTHERIA
+is keyed on 2005 taxonomy, and both have been reassigned since (*Pekania* was
+*Martes*, *Urocitellus* was *Spermophilus*). GBIF returns the old names as
+SPECIES/**SYNONYM** with vernaculars still matching, which is exactly what a
+superseded-but-correct name looks like. Those go in a `WR05_SYNONYM` bridge in
+`densityref.py` — the accepted name identifies the animal, the old name finds its
+row — and never into the name file, which holds identity.
+
+**And the remaining fourteen unverified names were all correct.** Each was put
+through the same check and all fourteen passed, so they are now in the hand table
+too. The warning is therefore *earned*: an unverified name now means nobody
+looked, and after this pass nobody's name is unlooked-at.
+
+The lesson is the one this project keeps relearning. The wrong hyrax produced a
+perfectly valid density, for a real animal, from a real study, joined correctly
+to a real row. Nothing was malformed. It was simply a different animal — and it
+was the biggest number in the table.

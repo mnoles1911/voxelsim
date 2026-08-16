@@ -84,17 +84,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "alpine-marmot": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2437377,
     "gbif_vernacular": [
-      "Marmotte des Alpes, Marmotte",
-      "Alpine Marmot",
-      "Alpine Marmot",
-      "Marmota Alpina",
-      "Marmotta"
+      "Alp Marmotu",
+      "Alpa marmoto",
+      "Alpemurmeldyr",
+      "Alpemurmeldyr",
+      "Alpemurmeldyr"
     ],
     "latin": "Marmota marmota",
-    "resolved_from": "alpine-marmot"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "american-bison": {
     "checked_by_hand": true,
@@ -245,30 +246,32 @@
     "resolved_from": "black-howler-monkey"
   },
   "black-tailed-jackrabbit": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436801,
     "gbif_vernacular": [
-      "California Jackrabbit",
-      "Liebre de cola negra",
-      "Eselhase",
-      "Lievre de Californie",
-      "Black-tailed Jackrabbit"
+      "American Desert Hare",
+      "Asnah\u00e9ri",
+      "Black-tail Jackrabbit",
+      "Black-tailed Jack Rabbit",
+      "Black-tailed Jack Rabbit"
     ],
     "latin": "Lepus californicus",
-    "resolved_from": "black-tailed-jackrabbit"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "black-tailed-prairie-dog": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2437232,
     "gbif_vernacular": [
-      "Black-tailed Prairie Dog",
       "Arizona Black-tailed Prairie Dog",
+      "Arizona black-tailed prairie dog",
+      "Arizona black-tailed prairie dog",
       "Black-tailed Prairie Dog",
-      "Zwartstaartprairiehond",
       "Black-tailed Prairie Dog"
     ],
     "latin": "Cynomys ludovicianus",
-    "resolved_from": "black-tailed-prairie-dog"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "blue-wildebeest": {
     "checked_by_hand": true,
@@ -299,7 +302,8 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "bongo": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5220180,
     "gbif_vernacular": [
       "Bongo",
@@ -309,7 +313,7 @@
       "Bongo"
     ],
     "latin": "Tragelaphus eurycerus",
-    "resolved_from": "bongo"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "brown-bear": {
     "checked_by_hand": true,
@@ -326,17 +330,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "brown-throated-sloth": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436353,
     "gbif_vernacular": [
-      "Brown-throated Sloth",
-      "Perico Ligero",
-      "Perezoso Trid\u00e1ctilo",
-      "Perezoso Grisaceo",
-      "Perezoso Bayo"
+      "Ai",
+      "Ai-ai",
+      "Apey",
+      "A\u00ed",
+      "A\u00ef De Bolivie"
     ],
     "latin": "Bradypus variegatus",
-    "resolved_from": "brown-throated-sloth"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "cape-buffalo": {
     "checked_by_hand": true,
@@ -353,28 +358,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "cape-hare": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2436736,
     "gbif_vernacular": [
-      "Liebre dom\u00e9stica",
-      "Li\u00e8vre du Cap",
-      "and grant",
-      "and grant)",
-      "carpi"
+      "Afrikai ny\u00fal",
+      "Arabian Hare",
+      "Arabian Hare",
+      "Arabian Hare (Middle East)",
+      "Arabian Hare (Middle East)"
     ],
     "latin": "Lepus capensis",
-    "resolved_from": "cape-hare"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "capybara": {
-    "checked_by_hand": false,
-    "gbif_key": 4263032,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5786666,
     "gbif_vernacular": [
-      "Capybara",
-      "Capybara",
-      "Capybara"
+      "Akvoporko",
+      "Cabia\u00ef, Capybara, Capiai",
+      "Cac\u00f3",
+      "Cac\u00f3",
+      "Capibara"
     ],
-    "latin": "Hydrochoeris hydrochaeris",
-    "resolved_from": "capybara"
+    "latin": "Hydrochoerus hydrochaeris",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "caracal": {
     "checked_by_hand": true,
@@ -391,30 +400,32 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "chacma-baboon": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 7262029,
     "gbif_vernacular": [
-      "Chacma Baboon",
-      "Papi\u00f3n Chacma",
+      "Adoons",
+      "Babbuino nero",
       "Babouin chacma",
-      "ursinus",
-      "Southern Chacma Baboon"
+      "Babouin chacma",
+      "Babuino Chacma"
     ],
     "latin": "Papio ursinus",
-    "resolved_from": "chacma-baboon"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "chamois": {
-    "checked_by_hand": false,
-    "gbif_key": 11637904,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220170,
     "gbif_vernacular": [
-      "Rebeco",
-      "Rebeco de los Carpatos",
-      "Karpaten-Gamse",
-      "Chamois des Carpathes",
-      "Carpathian Chamois"
+      "(Alpen-)G\u00e4mse",
+      "(Pronounce: Sha-mee or Sham-wa)",
+      "Agriogido",
+      "Alpen-Gamse",
+      "Alpen-Gamse"
     ],
-    "latin": "Rupicapra carpatica",
-    "resolved_from": "chamois"
+    "latin": "Rupicapra rupicapra",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "cheetah": {
     "checked_by_hand": true,
@@ -525,17 +536,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "dorcas-gazelle": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5220149,
     "gbif_vernacular": [
-      "Gazelle dorcas",
       "Dorcas Gazelle",
-      "Gacela Dorcas",
-      "Gazelle Dorcas",
-      "Dorkasgazelle"
+      "Dorcas Gazelle",
+      "Dorcas Gazelle",
+      "Dorcas Gazelle",
+      "Dorcas Gazelle"
     ],
     "latin": "Gazella dorcas",
-    "resolved_from": "dorcas-gazelle"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "dromedary-camel": {
     "checked_by_hand": true,
@@ -580,17 +592,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "eastern-grey-squirrel": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219681,
     "gbif_vernacular": [
-      "Ostliches Grauhdrnchen",
-      "Grey Squirrel",
-      "Gray Squirrel",
-      "Ecureuil Gris",
-      "Eastern Grey Squirrel"
+      "American Squirrel",
+      "Amerikaanse Eekhorinkie",
+      "Amerikaanse Grijze Eekhoorn",
+      "Ardilla Gris Oriental",
+      "Ardilla Gris Oriental"
     ],
     "latin": "Sciurus carolinensis",
-    "resolved_from": "eastern-grey-squirrel"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "elk-wapiti": {
     "checked_by_hand": true,
@@ -675,17 +688,18 @@
     "resolved_from": "european-hare"
   },
   "european-hedgehog": {
-    "checked_by_hand": false,
-    "gbif_key": 11619510,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5219616,
     "gbif_vernacular": [
-      "Eastern European Hedgehog",
-      "Erizo de los Balcanes",
-      "Nordlicher WeilRbrustigel",
-      "H\u00e9risson des Balkans",
-      "Northern White-breasted Hedgehog"
+      "Adi kirpi",
+      "Arici",
+      "Ariciul comun",
+      "Ariciul-european",
+      "Ariz\u00f3n d\u2019Europa"
     ],
-    "latin": "Erimaceus roumanicus",
-    "resolved_from": "european-hedgehog"
+    "latin": "Erinaceus europaeus",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-mole": {
     "checked_by_hand": true,
@@ -702,17 +716,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-otter": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2433753,
     "gbif_vernacular": [
-      "utter",
-      "\u05dc\u05d5\u05d8\u05e8\u05d4",
-      "\u0440\u0435\u0447\u043d\u0430\u044f \u0432\u044b\u0434\u0440\u0430",
-      "\u043f\u043e\u0440\u0435\u0448\u043d\u044f",
-      "\u043e\u0431\u044b\u043a\u043d\u043e\u0432\u0435\u043d\u043d\u0430\u044f"
+      "Adi susamuru",
+      "Baya\u011f\u0131 su samuru",
+      "Berang-berang eurasia",
+      "Common Otter",
+      "Common Otter"
     ],
     "latin": "Lutra lutra",
-    "resolved_from": "european-otter"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "european-polecat": {
     "checked_by_hand": true,
@@ -1356,17 +1371,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "red-kangaroo": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5219963,
     "gbif_vernacular": [
-      "Red Kangaroo",
-      "red kangaroo",
       "Blue Flier (females)",
+      "Plains Kangaroo",
       "Red Kangaroo",
-      "Plains Kangaroo"
+      "Red Kangaroo",
+      "Red Kangaroo"
     ],
     "latin": "Macropus rufus",
-    "resolved_from": "red-kangaroo"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "red-river-hog": {
     "checked_by_hand": true,
@@ -1411,17 +1427,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "rock-hyrax": {
-    "checked_by_hand": false,
-    "gbif_key": 2437073,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5219598,
     "gbif_vernacular": [
-      "Bush Hyrax",
-      "Daman de steppe",
-      "Yellow-spotted Rock Hyrax",
-      "Yellow-spotted Hyrax",
-      "Hoggar Hyrax"
+      "!Aus",
+      "Cape Hyrax (capensis)",
+      "Cape Hyrax (capensis)",
+      "Cape hyrax",
+      "Common Rock Hyrax"
     ],
-    "latin": "Heterohyrax brucei",
-    "resolved_from": "rock-hyrax"
+    "latin": "Procavia capensis",
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "roe-deer": {
     "checked_by_hand": true,
@@ -1438,17 +1455,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "saiga-antelope": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2441067,
     "gbif_vernacular": [
-      "Antilope sa\u00efga",
-      "Saiga",
-      "Mongolian Saiga",
-      "Saiga",
-      "Saiga Antelope"
+      "Ak bokon",
+      "Altnaza antilopo",
+      "Antelop saiga",
+      "Antilopa Saiga",
+      "Antilope Saiga"
     ],
     "latin": "Saiga tatarica",
-    "resolved_from": "saiga-antelope"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "sand-cat": {
     "checked_by_hand": true,
@@ -1520,17 +1538,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "small-indian-mongoose": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 2434271,
     "gbif_vernacular": [
-      "\u179f\u17d2\u1780\u17b6\u178f\u17bc\u1785",
-      "Small Indian mongoose",
-      "Mangous, Manglous",
-      "Small Asian Mongoose",
-      "Meloncillo de Java"
+      "Hong-xia-meng",
+      "Indian Mongoose",
+      "Indian mongoose",
+      "Indische mangoeste",
+      "Javan Mongoose"
     ],
     "latin": "Herpestes javanicus",
-    "resolved_from": "small-indian-mongoose"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "spectacled-caiman": {
     "checked_by_hand": true,
@@ -1631,17 +1650,18 @@
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "vicuna": {
-    "checked_by_hand": false,
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
     "gbif_key": 5220192,
     "gbif_vernacular": [
-      "Vicu\u00f1a",
-      "Vicuna",
-      "Vicu\u00f1a",
-      "Wik'u\u00f1a",
-      "Vigogne"
+      "Argentine Vicuna (vicugna)",
+      "Argentine Vicuna (vicugna)",
+      "Bikuina",
+      "Huari",
+      "Peruvian Vicufa"
     ],
     "latin": "Vicugna vicugna",
-    "resolved_from": "vicuna"
+    "resolved_from": "hand-entered, tools/refnames.py"
   },
   "virginia-opossum": {
     "checked_by_hand": true,

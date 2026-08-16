@@ -12,10 +12,10 @@ land animals in grassland. Real animals are not distributed like that, and the
 fix the owner asked for is the real numbers: **individuals per square
 kilometre, per species, from the field literature.**
 
-The point is NOT realism for its own sake. It is that real densities span SIX
-ORDERS OF MAGNITUDE -- rock hyrax 5,752/km2, wolverine 0.008/km2 -- and that
-spread does almost all of the thinning by itself, in a way no global multiplier
-can. The owner has said these will be tweaked and some inflated to make the
+The point is NOT realism for its own sake. It is that real densities span FIVE
+AND A HALF ORDERS OF MAGNITUDE -- rock hyrax 2,735/km2, wolverine 0.008/km2 --
+and that spread does almost all of the thinning by itself, in a way no global
+multiplier can. The owner has said these will be tweaked and some inflated to make the
 world more interesting; this file is the baseline that tweak departs FROM, so
 that "we doubled the deer" is a sentence with a meaning.
 
@@ -44,7 +44,7 @@ reproduced on this data.
 
 But mass alone is not enough, and the residuals say so plainly: fitted against
 body length the worst outliers are wolverine, wild dog, grey wolf, cheetah and
-lynx, all far BELOW the line, and rock hyrax 592x ABOVE it. That is the energy
+lynx, all far BELOW the line, and rock hyrax far ABOVE it. That is the energy
 pyramid, not noise. Splitting the fit by PanTHERIA's own trophic level gives,
 for a 10 kg animal:
 
@@ -105,6 +105,24 @@ COL_ACTIVITY = "1-1_ActivityCycle"
 
 TROPHIC = {1: "herbivore", 2: "omnivore", 3: "carnivore"}
 ACTIVITY = {1: "nocturnal", 2: "crepuscular/both", 3: "diurnal"}
+
+# TWO NAMES, TWO JOBS. `refs/species-latin.json` holds the CURRENTLY ACCEPTED
+# binomial, GBIF-verified, and that is the species' identity. PanTHERIA is keyed
+# on Wilson & Reeder 2005, and mammal taxonomy has moved since -- so for a
+# handful of species the name that identifies the animal and the name that finds
+# its row are different words for the same thing.
+#
+# This is NOT a place to correct a wrong name. A wrong name gets fixed in
+# `tools/refnames.py`'s hand table and re-verified against GBIF (four were, on
+# 2026-08-16). This table is only for names that are RIGHT and OLD: GBIF returns
+# them as SPECIES/SYNONYM with the vernaculars still matching, which is exactly
+# what a superseded-but-correct name looks like. Both were confirmed that way
+# before being written here.
+WR05_SYNONYM = {
+    # accepted today            -> the name PanTHERIA files it under
+    "Pekania pennanti": "Martes pennanti",
+    "Urocitellus parryii": "Spermophilus parryii",
+}
 
 
 # ---------------------------------------------------------------- fetch (net)
@@ -194,8 +212,17 @@ def extract() -> int:
         rec = latin[name]
         binom = rec.get("latin")
         checked = bool(rec.get("checked_by_hand"))
-        p = pan.get(binom or "")
+        # The accepted name identifies the animal; the WR05 synonym finds its
+        # row. Try the accepted name first so the bridge can never mask a name
+        # that PanTHERIA already knows.
+        key = binom or ""
+        p = pan.get(key)
+        if p is None and key in WR05_SYNONYM:
+            key = WR05_SYNONYM[key]
+            p = pan.get(key)
         entry = {"latin": binom, "name_checked_by_hand": checked}
+        if key and key != binom:
+            entry["pantheria_binomial"] = key
         if p:
             if p["mass_g"]:
                 entry["mass_g"] = p["mass_g"]

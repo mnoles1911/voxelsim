@@ -58,6 +58,38 @@ HAND: dict[str, tuple[str, str]] = {
     "nile-monitor": ("Varanus niloticus", "Reptilia"),
     "spectacled-caiman": ("Caiman crocodilus", "Reptilia"),
     "fisher": ("Pekania pennanti", "Mammalia"),
+    # --- 2026-08-16: four names that were never hand-entered, so they carried
+    # whatever the bulk resolver produced, and three of them were wrong. Found
+    # by tools/densityref.py, which could not join them to PanTHERIA and said so
+    # rather than silently dropping the species. `rock-hyrax` is the one that
+    # mattered: on file as the YELLOW-SPOTTED hyrax, it was contributing the
+    # single largest density in the library (5,752/km2 against Procavia's
+    # 2,734) and moving every population total with it.
+    "rock-hyrax": ("Procavia capensis", "Mammalia"),
+    "capybara": ("Hydrochoerus hydrochaeris", "Mammalia"),   # was Hydrochoeris
+    "european-hedgehog": ("Erinaceus europaeus", "Mammalia"),  # was Erimaceus
+    "chamois": ("Rupicapra rupicapra", "Mammalia"),  # carpatica is not a species
+    # --- 2026-08-16: fourteen names that the bulk resolver got RIGHT but that
+    # nobody had ever confirmed, so every density taken under them carried a
+    # warning. Each was put through the same check as the rest -- ACCEPTED, at
+    # SPECIES rank, in Mammalia, with GBIF's own vernaculars overlapping the
+    # spec name -- and all fourteen passed. Listed so the warning is EARNED
+    # rather than blanket: an unverified name should mean "nobody looked", and
+    # after this it does.
+    "alpine-marmot": ("Marmota marmota", "Mammalia"),
+    "black-tailed-jackrabbit": ("Lepus californicus", "Mammalia"),
+    "black-tailed-prairie-dog": ("Cynomys ludovicianus", "Mammalia"),
+    "bongo": ("Tragelaphus eurycerus", "Mammalia"),
+    "brown-throated-sloth": ("Bradypus variegatus", "Mammalia"),
+    "cape-hare": ("Lepus capensis", "Mammalia"),
+    "chacma-baboon": ("Papio ursinus", "Mammalia"),
+    "dorcas-gazelle": ("Gazella dorcas", "Mammalia"),
+    "eastern-grey-squirrel": ("Sciurus carolinensis", "Mammalia"),
+    "european-otter": ("Lutra lutra", "Mammalia"),
+    "red-kangaroo": ("Macropus rufus", "Mammalia"),
+    "saiga-antelope": ("Saiga tatarica", "Mammalia"),
+    "small-indian-mongoose": ("Herpestes javanicus", "Mammalia"),
+    "vicuna": ("Vicugna vicugna", "Mammalia"),
     # --- resolved to the wrong species of the right genus
     "hippopotamus": ("Hippopotamus amphibius", "Mammalia"),
     "moose": ("Alces alces", "Mammalia"),

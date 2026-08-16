@@ -88,12 +88,11 @@
   "alpine-marmot": {
    "latin": "Marmota marmota",
    "mass_g": 4059.15,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 583.5,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "american-bison": {
    "activity": "crepuscular/both",
@@ -201,23 +200,21 @@
    "activity": "nocturnal",
    "latin": "Lepus californicus",
    "mass_g": 2422.48,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 12.0,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "black-tailed-prairie-dog": {
    "activity": "diurnal",
    "latin": "Cynomys ludovicianus",
    "mass_g": 797.05,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 1830.0,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "blue-wildebeest": {
    "activity": "crepuscular/both",
@@ -243,12 +240,11 @@
    "activity": "crepuscular/both",
    "latin": "Tragelaphus eurycerus",
    "mass_g": 270998.37,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 0.4,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "brown-bear": {
    "activity": "crepuscular/both",
@@ -264,12 +260,11 @@
    "activity": "crepuscular/both",
    "latin": "Bradypus variegatus",
    "mass_g": 4136.36,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 508.44,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "cape-buffalo": {
    "activity": "crepuscular/both",
@@ -285,19 +280,21 @@
    "activity": "crepuscular/both",
    "latin": "Lepus capensis",
    "mass_g": 2047.11,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 14.75,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "capybara": {
-   "latin": "Hydrochoeris hydrochaeris",
-   "name_checked_by_hand": false,
-   "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
-   "tier": "none"
+   "activity": "crepuscular/both",
+   "latin": "Hydrochoerus hydrochaeris",
+   "mass_g": 48144.91,
+   "name_checked_by_hand": true,
+   "per_km2": 125.34,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "herbivore"
   },
   "caracal": {
    "activity": "nocturnal",
@@ -314,19 +311,21 @@
    "activity": "diurnal",
    "latin": "Papio ursinus",
    "mass_g": 17729.44,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 2.77,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "chamois": {
-   "latin": "Rupicapra carpatica",
-   "name_checked_by_hand": false,
-   "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
-   "tier": "none"
+   "factor_uncertainty": 5.5,
+   "latin": "Rupicapra rupicapra",
+   "mass_g": 33266.35,
+   "name_checked_by_hand": true,
+   "per_km2": 6.4545,
+   "source": "Damuth fit, herbivore, from PanTHERIA body mass",
+   "tier": "allometric",
+   "trophic": "herbivore"
   },
   "cheetah": {
    "activity": "diurnal",
@@ -404,12 +403,11 @@
    "activity": "crepuscular/both",
    "latin": "Gazella dorcas",
    "mass_g": 15635.95,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 2.3,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "omnivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "omnivore"
   },
   "dromedary-camel": {
    "activity": "diurnal",
@@ -442,12 +440,11 @@
    "activity": "diurnal",
    "latin": "Sciurus carolinensis",
    "mass_g": 545.4,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 690.0,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "omnivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "omnivore"
   },
   "elk-wapiti": {
    "latin": "Cervus canadensis",
@@ -508,11 +505,14 @@
    "trophic": "omnivore"
   },
   "european-hedgehog": {
-   "latin": "Erimaceus roumanicus",
-   "name_checked_by_hand": false,
-   "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
-   "tier": "none"
+   "activity": "crepuscular/both",
+   "latin": "Erinaceus europaeus",
+   "mass_g": 777.95,
+   "name_checked_by_hand": true,
+   "per_km2": 123.0,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "omnivore"
   },
   "european-mole": {
    "activity": "crepuscular/both",
@@ -528,12 +528,11 @@
    "activity": "nocturnal",
    "latin": "Lutra lutra",
    "mass_g": 8868.69,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 0.85,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "carnivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "carnivore"
   },
   "european-polecat": {
    "activity": "nocturnal",
@@ -605,11 +604,15 @@
    "tier": "none"
   },
   "fisher": {
+   "activity": "crepuscular/both",
    "latin": "Pekania pennanti",
+   "mass_g": 3750.0,
    "name_checked_by_hand": true,
-   "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
-   "tier": "none"
+   "pantheria_binomial": "Martes pennanti",
+   "per_km2": 0.17,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "carnivore"
   },
   "forest-buffalo": {
    "activity": "crepuscular/both",
@@ -972,12 +975,11 @@
    "activity": "nocturnal",
    "latin": "Macropus rufus",
    "mass_g": 38968.39,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 3.14,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "red-river-hog": {
    "activity": "crepuscular/both",
@@ -1010,14 +1012,13 @@
   },
   "rock-hyrax": {
    "activity": "diurnal",
-   "latin": "Heterohyrax brucei",
-   "mass_g": 2453.66,
-   "name_checked_by_hand": false,
-   "per_km2": 5751.97,
+   "latin": "Procavia capensis",
+   "mass_g": 2952.48,
+   "name_checked_by_hand": true,
+   "per_km2": 2734.51,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "roe-deer": {
    "activity": "crepuscular/both",
@@ -1032,12 +1033,11 @@
    "activity": "diurnal",
    "latin": "Saiga tatarica",
    "mass_g": 37734.01,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 0.75,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "sand-cat": {
    "activity": "nocturnal",
@@ -1093,12 +1093,11 @@
    "activity": "diurnal",
    "latin": "Herpestes javanicus",
    "mass_g": 750.0,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 39.59,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "omnivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "omnivore"
   },
   "spectacled-caiman": {
    "latin": "Caiman crocodilus",
@@ -1169,12 +1168,11 @@
   "vicuna": {
    "latin": "Vicugna vicugna",
    "mass_g": 47499.61,
-   "name_checked_by_hand": false,
+   "name_checked_by_hand": true,
    "per_km2": 3.1,
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
-   "trophic": "herbivore",
-   "warning": "binomial is NOT hand-checked; the density may belong to a different animal"
+   "trophic": "herbivore"
   },
   "virginia-opossum": {
    "activity": "nocturnal",
@@ -1280,10 +1278,10 @@
   }
  },
  "tier_counts": {
-  "allometric": 25,
+  "allometric": 26,
   "genus": 10,
-  "measured": 78,
-  "none": 18
+  "measured": 81,
+  "none": 14
  },
  "units": "individuals per square kilometre of suitable habitat",
  "version": 1
