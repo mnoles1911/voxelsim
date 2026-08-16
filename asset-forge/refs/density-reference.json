@@ -94,6 +94,16 @@
    "tier": "measured",
    "trophic": "herbivore"
   },
+  "amazon-river-dolphin": {
+   "activity": "diurnal",
+   "latin": "Inia geoffrensis",
+   "mass_g": 121430.76,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "american-bison": {
    "activity": "crepuscular/both",
    "latin": "Bison bison",
@@ -156,7 +166,7 @@
    "latin": "Urocitellus parryu",
    "name_checked_by_hand": false,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "barbary-sheep": {
@@ -168,6 +178,15 @@
    "source": "Damuth fit, herbivore, from PanTHERIA body mass",
    "tier": "allometric",
    "trophic": "herbivore"
+  },
+  "beluga": {
+   "latin": "Delphinapterus leucas",
+   "mass_g": 1381640.73,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
   },
   "bengal-tiger": {
    "activity": "nocturnal",
@@ -216,6 +235,15 @@
    "tier": "measured",
    "trophic": "herbivore"
   },
+  "blue-whale": {
+   "latin": "Balaenoptera musculus",
+   "mass_g": 154321304.5,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "blue-wildebeest": {
    "activity": "crepuscular/both",
    "latin": "Connochaetes taurinus",
@@ -245,6 +273,15 @@
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
    "trophic": "herbivore"
+  },
+  "bottlenose-dolphin": {
+   "latin": "Tursiops truncatus",
+   "mass_g": 281040.55,
+   "name_checked_by_hand": true,
+   "per_km2": 0.2,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "carnivore"
   },
   "brown-bear": {
    "activity": "crepuscular/both",
@@ -357,11 +394,19 @@
    "tier": "measured",
    "trophic": "omnivore"
   },
+  "common-dolphin": {
+   "latin": "Delphinus delphis",
+   "mass_g": 79271.69,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none"
+  },
   "common-frog": {
    "latin": "Rana temporaria",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "corsac-fox": {
@@ -389,7 +434,7 @@
    "latin": "Varanus griseus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "dingo": {
@@ -596,11 +641,20 @@
    "tier": "allometric",
    "trophic": "omnivore"
   },
+  "fin-whale": {
+   "latin": "Balaenoptera physalus",
+   "mass_g": 47506008.23,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "fire-salamander": {
    "latin": "Salamandra salamandra",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "fisher": {
@@ -664,6 +718,16 @@
    "tier": "measured",
    "trophic": "herbivore"
   },
+  "grey-whale": {
+   "activity": "crepuscular/both",
+   "latin": "Eschrichtius robustus",
+   "mass_g": 27324024.19,
+   "name_checked_by_hand": true,
+   "per_km2": 4.9,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "omnivore"
+  },
   "grey-wolf": {
    "activity": "crepuscular/both",
    "latin": "Canis lupus",
@@ -681,6 +745,15 @@
    "source": "median of 1 congener(s) in PanTHERIA",
    "tier": "genus"
   },
+  "harbour-porpoise": {
+   "latin": "Phocoena phocoena",
+   "mass_g": 52730.93,
+   "name_checked_by_hand": true,
+   "per_km2": 0.03,
+   "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
+   "tier": "measured",
+   "trophic": "carnivore"
+  },
   "hippopotamus": {
    "activity": "crepuscular/both",
    "latin": "Hippopotamus amphibius",
@@ -690,6 +763,15 @@
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
    "trophic": "omnivore"
+  },
+  "humpback-whale": {
+   "latin": "Megaptera novaeangliae",
+   "mass_g": 30000000.01,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
   },
   "impala": {
    "activity": "diurnal",
@@ -731,6 +813,15 @@
    "tier": "measured",
    "trophic": "carnivore"
   },
+  "long-finned-pilot-whale": {
+   "latin": "Globicephala melas",
+   "mass_g": 800000.0,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "lowland-tapir": {
    "activity": "crepuscular/both",
    "latin": "Tapirus terrestris",
@@ -766,7 +857,7 @@
    "latin": "Amblyrhynchus cristatus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "meerkat": {
@@ -778,6 +869,15 @@
    "per_km2": 11.3276,
    "source": "Damuth fit, carnivore, from PanTHERIA body mass",
    "tier": "allometric",
+   "trophic": "carnivore"
+  },
+  "minke-whale": {
+   "latin": "Balaenoptera acutorostrata",
+   "mass_g": 5587093.59,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
    "trophic": "carnivore"
   },
   "moose": {
@@ -820,18 +920,27 @@
    "tier": "measured",
    "trophic": "herbivore"
   },
+  "narwhal": {
+   "latin": "Monodon monoceros",
+   "mass_g": 938126.44,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "nile-crocodile": {
    "latin": "Crocodylus niloticus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "nile-monitor": {
    "latin": "Varanus niloticus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "nine-banded-armadillo": {
@@ -851,6 +960,15 @@
    "source": "median of 1 congener(s) in PanTHERIA",
    "tier": "genus"
   },
+  "north-atlantic-right-whale": {
+   "latin": "Eubalaena glacialis",
+   "mass_g": 22999999.91,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "norway-lemming": {
    "factor_uncertainty": 5.5,
    "latin": "Lemmus lemmus",
@@ -865,7 +983,7 @@
    "latin": "Timon lepidus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "okapi": {
@@ -877,6 +995,15 @@
    "source": "PanTHERIA 21-1_PopulationDensity_n/km2",
    "tier": "measured",
    "trophic": "herbivore"
+  },
+  "orca": {
+   "latin": "Orcinus orca",
+   "mass_g": 5628758.66,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
   },
   "pika": {
    "activity": "diurnal",
@@ -912,7 +1039,7 @@
    "latin": "Dendrobates tinctorius",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "pronghorn": {
@@ -1010,6 +1137,15 @@
    "tier": "measured",
    "trophic": "herbivore"
   },
+  "rissos-dolphin": {
+   "latin": "Grampus griseus",
+   "mass_g": 387500.0,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
+  },
   "rock-hyrax": {
    "activity": "diurnal",
    "latin": "Procavia capensis",
@@ -1054,8 +1190,17 @@
    "latin": "Lacerta agilis",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
+  },
+  "sei-whale": {
+   "latin": "Balaenoptera borealis",
+   "mass_g": 22106251.95,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
   },
   "siberian-flying-squirrel": {
    "activity": "nocturnal",
@@ -1103,14 +1248,31 @@
    "latin": "Caiman crocodilus",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
+  },
+  "sperm-whale": {
+   "latin": "Physeter macrocephalus",
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
+   "tier": "none"
+  },
+  "spinner-dolphin": {
+   "activity": "crepuscular/both",
+   "latin": "Stenella longirostris",
+   "mass_g": 50500.0,
+   "name_checked_by_hand": true,
+   "per_km2": null,
+   "source": "Cetacea: PanTHERIA's marine densities are local survey figures, not range-wide, and the terrestrial allometry does not apply at sea",
+   "tier": "none",
+   "trophic": "carnivore"
   },
   "spiny-tailed-lizard": {
    "latin": "Uromastyx aegyptia",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "spotted-hyena": {
@@ -1188,7 +1350,7 @@
    "latin": "Zootoca vivipara",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "warthog": {
@@ -1206,7 +1368,7 @@
    "latin": "Varanus salvator",
    "name_checked_by_hand": true,
    "per_km2": null,
-   "source": "no mammal source; PanTHERIA does not cover reptiles or amphibians",
+   "source": "no mammal source; PanTHERIA does not cover reptiles, amphibians, birds or fish",
    "tier": "none"
   },
   "western-lowland-gorilla": {
@@ -1280,8 +1442,8 @@
  "tier_counts": {
   "allometric": 26,
   "genus": 10,
-  "measured": 81,
-  "none": 14
+  "measured": 84,
+  "none": 29
  },
  "units": "individuals per square kilometre of suitable habitat",
  "version": 1

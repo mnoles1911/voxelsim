@@ -205,3 +205,42 @@ The lesson is the one this project keeps relearning. The wrong hyrax produced a
 perfectly valid density, for a real animal, from a real study, joined correctly
 to a real row. Nothing was malformed. It was simply a different animal — and it
 was the biggest number in the table.
+
+
+## 8. Cetaceans: names done, densities refused
+
+**All 18 cetacean names are now hand-supplied and GBIF-verified** (ACCEPTED,
+SPECIES rank, Mammalia, vernaculars overlapping the spec name) and are in
+`tools/refnames.py`'s table — `species-latin.json` is no longer quadrupeds-only,
+at 137 verified names.
+
+**Their densities are refused, and that is the finding.** Cetaceans are mammals,
+so PanTHERIA covers them in principle. In practice it carries only **five**
+marine mammals with both a mass and a density, and they span **1,200× with no
+relationship to body mass whatever**:
+
+| | mass | density |
+|---|---|---|
+| *Orcaella brevirostris* (Irrawaddy dolphin) | 0.19 t | **37.36** /km² |
+| *Eschrichtius robustus* (grey whale) | 27.32 t | **4.90** /km² |
+| *Tursiops truncatus* | 0.28 t | 0.20 /km² |
+| *Stenella coeruleoalba* | 0.14 t | 0.21 /km² |
+| *Phocoena phocoena* | 0.05 t | 0.03 /km² |
+
+A 27-tonne grey whale reading denser than a 50 kg porpoise is not a density
+relationship; it is what you get when the figures are **local survey densities in
+feeding aggregations and river mouths** rather than range-wide. Same units,
+different quantity. Five points cannot be fitted, and the terrestrial Damuth fit
+is meaningless at sea.
+
+**The tool did it anyway, which is why there is now a guard.** The moment the 18
+names landed, `extract` handed fourteen whales terrestrial *carnivore*
+predictions — a blue whale at 0.0001/km² — minutes after the marine data had been
+shown unfittable. Nothing was malformed; every number was plausible; the model was
+simply wrong for the animal. `NO_TERRESTRIAL_ALLOMETRY = {Cetacea, Sirenia}` now
+refuses, and carries the reason with the refusal. The three surviving *measured*
+marine values are kept but flagged for the same reason.
+
+Cetacean densities need a marine source — IWC or NOAA abundance estimates, which
+are per-stock over a survey area and will need converting. That is research, and
+it is in the handoff.

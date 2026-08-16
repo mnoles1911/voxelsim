@@ -90,6 +90,32 @@ HAND: dict[str, tuple[str, str]] = {
     "saiga-antelope": ("Saiga tatarica", "Mammalia"),
     "small-indian-mongoose": ("Herpestes javanicus", "Mammalia"),
     "vicuna": ("Vicugna vicugna", "Mammalia"),
+    # --- 2026-08-16: THE EIGHTEEN CETACEANS. This file was quadrupeds-only
+    # because the shape-fitting work was; names are needed more widely now that
+    # tools/densityref.py joins on them. All eighteen verified ACCEPTED, at
+    # SPECIES rank, in Mammalia, with GBIF's vernaculars overlapping the spec
+    # name -- so they are recorded even though PanTHERIA CANNOT serve their
+    # densities (see densityref.py: marine "density" there is a local survey
+    # figure, not a range-wide one, and five points spanning 1,200x with no
+    # relationship to body mass cannot be fitted to anything).
+    "amazon-river-dolphin": ("Inia geoffrensis", "Mammalia"),
+    "beluga": ("Delphinapterus leucas", "Mammalia"),
+    "blue-whale": ("Balaenoptera musculus", "Mammalia"),
+    "bottlenose-dolphin": ("Tursiops truncatus", "Mammalia"),
+    "common-dolphin": ("Delphinus delphis", "Mammalia"),
+    "fin-whale": ("Balaenoptera physalus", "Mammalia"),
+    "grey-whale": ("Eschrichtius robustus", "Mammalia"),
+    "harbour-porpoise": ("Phocoena phocoena", "Mammalia"),
+    "humpback-whale": ("Megaptera novaeangliae", "Mammalia"),
+    "long-finned-pilot-whale": ("Globicephala melas", "Mammalia"),
+    "minke-whale": ("Balaenoptera acutorostrata", "Mammalia"),
+    "narwhal": ("Monodon monoceros", "Mammalia"),
+    "north-atlantic-right-whale": ("Eubalaena glacialis", "Mammalia"),
+    "orca": ("Orcinus orca", "Mammalia"),
+    "rissos-dolphin": ("Grampus griseus", "Mammalia"),
+    "sei-whale": ("Balaenoptera borealis", "Mammalia"),
+    "sperm-whale": ("Physeter macrocephalus", "Mammalia"),
+    "spinner-dolphin": ("Stenella longirostris", "Mammalia"),
     # --- resolved to the wrong species of the right genus
     "hippopotamus": ("Hippopotamus amphibius", "Mammalia"),
     "moose": ("Alces alces", "Mammalia"),

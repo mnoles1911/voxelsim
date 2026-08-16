@@ -97,6 +97,20 @@
     "latin": "Marmota marmota",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "amazon-river-dolphin": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440314,
+    "gbif_vernacular": [
+      "Amazon Nehir Yunusu",
+      "Amazon River Dolphin",
+      "Amazon River Dolphin",
+      "Amazon River Dolphin",
+      "Amazon River Dolphin"
+    ],
+    "latin": "Inia geoffrensis",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "american-bison": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -204,6 +218,20 @@
     "latin": "Ammotragus lervia",
     "resolved_from": "barbary-sheep"
   },
+  "beluga": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220003,
+    "gbif_vernacular": [
+      "Aq del\u02b9f\u00efn",
+      "A\u011f balina",
+      "Bale txuri",
+      "Balea zuri",
+      "Balea zuria"
+    ],
+    "latin": "Delphinapterus leucas",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "bengal-tiger": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -273,6 +301,20 @@
     "latin": "Cynomys ludovicianus",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "blue-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440735,
+    "gbif_vernacular": [
+      "Baleia-azul",
+      "Ballena azul",
+      "Ballena azul",
+      "Ballena azul",
+      "Blauwal"
+    ],
+    "latin": "Balaenoptera musculus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "blue-wildebeest": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -313,6 +355,20 @@
       "Bongo"
     ],
     "latin": "Tragelaphus eurycerus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "bottlenose-dolphin": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440447,
+    "gbif_vernacular": [
+      "Arroaz",
+      "Black Porpoise",
+      "Black Porpoise",
+      "Black Sea Bottlenose Dolphin",
+      "Black Sea Bottlenose Dolphin"
+    ],
+    "latin": "Tursiops truncatus",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "brown-bear": {
@@ -467,6 +523,20 @@
       "Coatimundi"
     ],
     "latin": "Nasua narica",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "common-dolphin": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 8324617,
+    "gbif_vernacular": [
+      "Aihe",
+      "Al-dolpheen",
+      "Al-sha'eh",
+      "Almindelig delfin",
+      "Almindelige delfiner"
+    ],
+    "latin": "Delphinus delphis",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "common-frog": {
@@ -813,6 +883,20 @@
     "latin": "Vulpes zerda",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "fin-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440718,
+    "gbif_vernacular": [
+      "Baleine fin",
+      "Baleine \u00e0 nageoires",
+      "Baleinopt\u00e8re commune",
+      "Balenoptero",
+      "Balhena"
+    ],
+    "latin": "Balaenoptera physalus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "fire-salamander": {
     "checked_by_hand": true,
     "gbif_class": "Amphibia",
@@ -911,6 +995,20 @@
     "latin": "Tragelaphus strepsiceros",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "grey-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440704,
+    "gbif_vernacular": [
+      "Atlantic Gray Whale",
+      "Atlantic Grey Whale",
+      "Baleia-cinza",
+      "Baleia-cinzenta",
+      "Baleine"
+    ],
+    "latin": "Eschrichtius robustus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "grey-wolf": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -939,6 +1037,20 @@
     "latin": "Lama guanicoe",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "harbour-porpoise": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440669,
+    "gbif_vernacular": [
+      "Afro-Iberian Harbor Porpoise",
+      "Afro-Iberian Harbour Porpoise",
+      "Almindeligt marsvin",
+      "A\u0121visuaq",
+      "Botu"
+    ],
+    "latin": "Phocoena phocoena",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "hippopotamus": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -951,6 +1063,20 @@
       "Common Hippopotamus"
     ],
     "latin": "Hippopotamus amphibius",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "humpback-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220086,
+    "gbif_vernacular": [
+      "Baleia-de-bossa",
+      "Baleia-jubarte",
+      "Baleine \u00e0 bosse, M\u00e9gapt\u00e8re",
+      "Balena gunga\u00e7e",
+      "Ballena jorobada"
+    ],
+    "latin": "Megaptera novaeangliae",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "impala": {
@@ -1006,6 +1132,20 @@
       "Afrikanischer L\u00f6we"
     ],
     "latin": "Panthera leo",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "long-finned-pilot-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440596,
+    "gbif_vernacular": [
+      "American black-fish",
+      "Atlantic Pilot Whale",
+      "Atlantic Pilot Whale",
+      "Atlantic Pilot Whale",
+      "Atlantic blackfish"
+    ],
+    "latin": "Globicephala melas",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "lowland-tapir": {
@@ -1078,6 +1218,20 @@
     "latin": "Suricata suricatta",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "minke-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440728,
+    "gbif_vernacular": [
+      "(n\u00f6rdlicher) Zwergwal",
+      "Acutorostrata",
+      "Baleia-an\u00e3",
+      "Baleia-minke-an\u00e3",
+      "Baleine de Minke, Rorqual \u00e0 museau pointu, Petit rorqual"
+    ],
+    "latin": "Balaenoptera acutorostrata",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "moose": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -1131,6 +1285,20 @@
       "Boeuf-musqu\u00e9"
     ],
     "latin": "Ovibos moschatus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "narwhal": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220008,
+    "gbif_vernacular": [
+      "Adlungwak",
+      "Chi\u030dt-kak",
+      "Horned Whale",
+      "Hornhval",
+      "K\u1ef3 l\u00e2n bi\u1ec3n"
+    ],
+    "latin": "Monodon monoceros",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "nile-crocodile": {
@@ -1189,6 +1357,20 @@
     "latin": "Erethizon dorsatus",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "north-atlantic-right-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440339,
+    "gbif_vernacular": [
+      "Atlantik-Nordkaper",
+      "Atlantik-Nordkaper",
+      "Atlantische noordkaper",
+      "Atlantischer Nordkaper",
+      "Baleine franche de l\u2019Atlantique Nord, Baleine franche bor\u00e9ale, Baleine des Basques, Baleine de Biscaye"
+    ],
+    "latin": "Eubalaena glacialis",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "norway-lemming": {
     "checked_by_hand": false,
     "gbif_key": 5219840,
@@ -1228,6 +1410,20 @@
       "Okapi"
     ],
     "latin": "Okapia johnstoni",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "orca": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440483,
+    "gbif_vernacular": [
+      "Aa\u0121lu",
+      "Baleia-assassina",
+      "Balena vras\u00ebse",
+      "Blackfish",
+      "Butskopf"
+    ],
+    "latin": "Orcinus orca",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "pika": {
@@ -1426,6 +1622,20 @@
     "latin": "Rangifer tarandus",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "rissos-dolphin": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220027,
+    "gbif_vernacular": [
+      "Arroaz boto",
+      "Calderon",
+      "Calderon Gris",
+      "Calderon gris",
+      "Calder\u00f3n gris | Tonina"
+    ],
+    "latin": "Grampus griseus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "rock-hyrax": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -1496,6 +1706,20 @@
     "latin": "Lacerta agilis",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
+  "sei-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 2440709,
+    "gbif_vernacular": [
+      "Baleia Sei",
+      "Baleia-sardinheira",
+      "Ballena boba",
+      "Ballena de Sei",
+      "Ballena de Sei"
+    ],
+    "latin": "Balaenoptera borealis",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
   "siberian-flying-squirrel": {
     "checked_by_hand": true,
     "gbif_class": "Mammalia",
@@ -1563,6 +1787,34 @@
       "Brillekaiman"
     ],
     "latin": "Caiman crocodilus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "sperm-whale": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 8123917,
+    "gbif_vernacular": [
+      "Ag-tkha-Gikh",
+      "Augustur",
+      "Ballena de esperma",
+      "B\u00fari",
+      "C'hwezher bras"
+    ],
+    "latin": "Physeter macrocephalus",
+    "resolved_from": "hand-entered, tools/refnames.py"
+  },
+  "spinner-dolphin": {
+    "checked_by_hand": true,
+    "gbif_class": "Mammalia",
+    "gbif_key": 5220060,
+    "gbif_vernacular": [
+      "Central American Spinner Dolphin",
+      "Central American Spinner Dolphin",
+      "Central American spinner",
+      "Dauphin a long bec",
+      "Dauphin a long bec"
+    ],
+    "latin": "Stenella longirostris",
     "resolved_from": "hand-entered, tools/refnames.py"
   },
   "spiny-tailed-lizard": {

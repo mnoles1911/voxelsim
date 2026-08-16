@@ -102,6 +102,24 @@ COL_TROPHIC = "6-2_TrophicLevel"
 # (rock hyrax, prairie dog, pika, grey squirrel) -- but a spawner that wants to
 # know whether a species is out at noon should not have to guess.
 COL_ACTIVITY = "1-1_ActivityCycle"
+COL_ORDER = "MSW05_Order"
+
+# ORDERS THE TERRESTRIAL ALLOMETRY MUST REFUSE TO PREDICT.
+#
+# The Damuth fit below is built from land mammals and it is meaningless at sea.
+# PanTHERIA carries only FIVE marine mammals with both a mass and a density, and
+# they span 1,200x with no relationship to mass at all: an Irrawaddy dolphin at
+# 37.36/km2 and a 27-tonne grey whale at 4.90 against a 50 kg harbour porpoise
+# at 0.03. Those are LOCAL SURVEY densities in feeding aggregations and river
+# mouths, not range-wide densities -- a different quantity wearing the same
+# units.
+#
+# This guard exists because the tool did it anyway. The eighteen cetacean names
+# landed, the extract ran, and fourteen whales were quietly handed terrestrial
+# carnivore predictions -- a blue whale at 0.0001/km2 -- minutes after the marine
+# data had been shown unfittable. Nothing was malformed and every number looked
+# plausible. Refusing is the only honest answer, and the reason travels with it.
+NO_TERRESTRIAL_ALLOMETRY = {"Cetacea", "Sirenia"}
 
 TROPHIC = {1: "herbivore", 2: "omnivore", 3: "carnivore"}
 ACTIVITY = {1: "nocturnal", 2: "crepuscular/both", 3: "diurnal"}
@@ -150,14 +168,15 @@ def read_pantheria() -> dict:
         hdr = f.readline().rstrip("\n").split("\t")
         iN, iD = hdr.index(COL_NAME), hdr.index(COL_DENS)
         iM, iT = hdr.index(COL_MASS), hdr.index(COL_TROPHIC)
-        iA = hdr.index(COL_ACTIVITY)
+        iA, iO = hdr.index(COL_ACTIVITY), hdr.index(COL_ORDER)
         for line in f:
             c = line.rstrip("\n").split("\t")
             def num(i):
                 v = float(c[i])
                 return None if v == -999 else v
             out[c[iN]] = {"density": num(iD), "mass_g": num(iM),
-                          "trophic": num(iT), "activity": num(iA)}
+                          "trophic": num(iT), "activity": num(iA),
+                          "order": c[iO]}
     return out
 
 
@@ -237,6 +256,21 @@ def extract() -> int:
             if not checked:
                 entry["warning"] = ("binomial is NOT hand-checked; the density "
                                     "may belong to a different animal")
+            if p.get("order") in NO_TERRESTRIAL_ALLOMETRY:
+                # Kept, because it IS a measured figure -- but it is almost
+                # certainly a local survey density in an aggregation area, not
+                # a range-wide one. A 27-tonne grey whale reading 4.9/km2 is the
+                # tell. Flagged rather than dropped, and flagged rather than
+                # used silently.
+                entry["warning"] = (f"{p['order']}: marine density, almost "
+                                    f"certainly a LOCAL survey figure rather "
+                                    f"than range-wide -- not comparable to the "
+                                    f"land species in this file")
+        elif p and p.get("order") in NO_TERRESTRIAL_ALLOMETRY:
+            entry.update(per_km2=None, tier="none",
+                         source=f"{p['order']}: PanTHERIA's marine densities are "
+                                f"local survey figures, not range-wide, and the "
+                                f"terrestrial allometry does not apply at sea")
         elif p and p["mass_g"]:
             d, lab, sd = predict(fits, p["mass_g"], p["trophic"])
             entry.update(per_km2=round(d, 4), tier="allometric",
@@ -251,7 +285,7 @@ def extract() -> int:
         else:
             entry.update(per_km2=None, tier="none",
                          source="no mammal source; PanTHERIA does not cover "
-                                "reptiles or amphibians")
+                                "reptiles, amphibians, birds or fish")
         counts[entry["tier"]] += 1
         species[name] = entry
 
