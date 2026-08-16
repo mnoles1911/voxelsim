@@ -18,12 +18,22 @@ file is not written. The C++ loader re-checks at load (the file could be
 edited); this check is the one that names the species while a human is
 watching.
 
-Skips (species, seed) files that already exist, so an interrupted run resumes
-rather than re-baking half an hour of trees. --force rebakes.
+Skips (species, seed) files that already exist AND whose spec has not moved, so
+an interrupted run resumes rather than re-baking half an hour of trees. --force
+rebakes everything regardless.
+
+THE SKIP USED TO BE ON FILE EXISTENCE ALONE, and that is how a bank detaches
+from the species it claims to be. A spec could gain a trunk taper or a re-fitted
+diameter and the bank kept serving the old tree forever, because the old tree
+was still on disk -- no error, no warning, a world composed from a library it no
+longer matches. So every bake now stamps `spec.spec_hash` into banks/BAKED.json
+and a changed hash re-bakes. `tools/enginecheck.py` is the standalone check and
+explains what the hash can and cannot see (it covers the SPEC, not `forge/`).
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -76,7 +86,18 @@ def main() -> int:
     banks = Path(args.out)
     banks.mkdir(parents=True, exist_ok=True)
 
-    baked = refused = skipped = failed = 0
+    # What each species' bank was baked from. Read before the loop, rewritten
+    # after it, so an interrupted run keeps the entries it had already earned.
+    record_path = banks / "BAKED.json"
+    record: dict = {}
+    if record_path.is_file():
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 -- an unreadable record is no record
+            record = {}
+    known: dict = record.get("species", {})
+
+    baked = refused = skipped = failed = stale = 0
     t0 = time.time()
     report = manifest.ExportReport()
 
@@ -106,10 +127,23 @@ def main() -> int:
                   f"(absent from the world), bank skipped")
             continue
 
+        # Identity of the species as authored RIGHT NOW. A bank whose recorded
+        # hash differs is serving a different animal or plant than the library
+        # describes, and the only safe reading of "different" is "re-bake".
+        now_hash = sm.spec_hash(body)
+        was_hash = (known.get(name) or {}).get("spec_hash")
+        moved = was_hash is not None and was_hash != now_hash
+        if moved:
+            print(f"  {name}: spec_hash {was_hash[:12]} -> {now_hash[:12]}, "
+                  f"re-baking (its bank served the old species)")
+            stale += 1
+
+        seeds_done: list[int] = []
         for seed in args.seeds:
             dst = banks / name / f"{name}-{seed:04d}.vxa"
-            if dst.exists() and not args.force:
+            if dst.exists() and not args.force and not moved:
                 skipped += 1
+                seeds_done.append(seed)
                 continue
             try:
                 a = pipeline.build(body, seed)
@@ -125,11 +159,25 @@ def main() -> int:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_bytes(vxa.encode(a.grid, a.parts, partslib.joints(a.parts)))
             baked += 1
+            seeds_done.append(seed)
             print(f"  {name} seed {seed}: {dst.stat().st_size:,} B "
                   f"({time.time() - t0:,.0f} s elapsed)")
 
-    print(f"banks: baked {baked}, skipped {skipped} existing, refused {refused}, "
+        # Stamped only if every requested seed is on disk. A partial bake that
+        # recorded the new hash would be worse than no record at all: the check
+        # would call it clean while some seeds still served the old species.
+        if seeds_done and len(seeds_done) == len(args.seeds):
+            known[name] = {"spec_hash": now_hash, "layer": layer,
+                           "seeds": sorted(seeds_done)}
+
+    record = {"version": 1, "species": known}
+    record_path.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n",
+                           encoding="utf-8")
+
+    print(f"banks: baked {baked}, skipped {skipped} existing, "
+          f"re-baked {stale} stale, refused {refused}, "
           f"failed {failed}, in {time.time() - t0:,.0f} s")
+    print(f"  spec hashes recorded for {len(known)} species in {record_path}")
     # Refusals are DELIBERATE and named above; build failures mean the bake is
     # incomplete and the manifest's seeds_baked will say so per species.
     return 1 if failed else 0
