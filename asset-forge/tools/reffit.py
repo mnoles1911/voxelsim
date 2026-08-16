@@ -40,6 +40,7 @@ from pathlib import Path
 import numpy as np
 
 import _path  # noqa: F401  (sys.path bootstrap)
+import quadprobe as qp
 import refsil
 from forge import pipeline, spec as sm
 
@@ -51,6 +52,7 @@ SOURCES = SILS / "SOURCES.json"
 LATIN = REFS / "species-latin.json"
 EXTRACT = REFS / "quadruped-reference.json"
 EXCLUDED = REFS / "excluded.json"
+LIMBTARGET = REFS / "limb-target.json"
 OUT = ROOT / "out" / "reffit"
 
 SEED = 1
@@ -113,6 +115,26 @@ MAX_SPREAD = 0.275
 # is the point: a 50% limb change is exactly the size of thing the owner should
 # look at a render of rather than read about in a table.
 MAX_LIFT = 1.5
+
+# THE MOST ANY ONE PASS MAY THIN A SPECIES, and it is a SEPARATE number from
+# MAX_LIFT because the two directions carry different risks.
+#
+# Thinning was forbidden outright until 2026-08-15 (see `fit`'s docstring and
+# `docs/reference-fitting-research.md` §7 rejection 1) on the grounds that the
+# references would undo the owner's own fix. That rejection was written when
+# every authored `quad.leg_thick` was an owner-facing judgement. It is no longer
+# true of most of them: measured, 49 of 131 specs carry the row's LOWER BOUND
+# (0.05) and 11 carry values from 0.30 to 0.69 -- a limb two thirds as thick as
+# it is long -- and both extremes were produced by solvers chasing the
+# three-voxel readability gate at three different lattices, not by anybody
+# looking at an animal. `docs/quadruped-limb-regression.md` has the working.
+#
+# So thinning is allowed, in one direction-symmetric bound, and it is defended
+# by the SAME three things the owner's gates already are rather than by a
+# prohibition: the drawn limb may never fall below `quadprobe.LIMB_MIN_VOX`
+# voxels across, `quadprobe.SLENDER_MIN` still holds, and every species whose
+# limb changes by more than a third is printed for a render.
+MAX_THIN = 2.0
 
 
 # ---------------------------------------------------------------- fetch (net)
@@ -516,6 +538,77 @@ def _read_slender(o) -> float:
     return float("nan") if o is None else o["slender"]
 
 
+def _drawn(spec: dict, seed: int = SEED) -> tuple[float, float, float]:
+    """What the OWNER'S OWN GATES see: limb voxels across, limb voxels long, and
+    girth over withers, on the built asset rather than on a silhouette.
+
+    `refsil` and `quadprobe` measure two different limbs on purpose -- the
+    silhouette starts at the belly line, the probe starts at the part tag -- and
+    the fit is solved against the silhouette because that is what the references
+    are measured with. But the GATES are the probe's, so a thinning pass has to
+    be checked against the probe or it would solve one ruler and fail the other.
+    """
+    a = _build(spec, seed)
+    return qp.m_limb_dia(a), qp.m_limb_len(a), qp.m_trunk_girth(a) / max(
+        qp.m_withers_h(a), 1e-6)
+
+
+def _limb_floor(name: str) -> float:
+    """The lowest `quadprobe` thickness/length this species may be taken to.
+
+    NOT A JUDGEMENT. It is what the library actually measured at commit 17cc742
+    -- the state whose `quadprobe --bulk` thickness/length median is **0.250**,
+    which is the number the owner named when he said the ratio must not fall.
+    Frozen in `refs/limb-target.json` rather than recomputed, because the row
+    this file solves is the row that would otherwise carry the baseline: a
+    solver reading its own output as its own floor thins the library a little
+    further on every run and prints a clean table each time.
+    `tools/refstance.py` hit exactly this and its fix was the same.
+
+    THE FLOOR IS THE RATIO AND NOT THE DIAMETER, and that distinction was
+    measured rather than assumed. Against the 17cc742 diameters, 38 of 131
+    species are ALREADY thinner today -- the stance pass took a zebra from 7
+    voxels across to 5 -- so a diameter floor would refuse every move including
+    the ones that fix the regression. Against the 17cc742 RATIO, 0 of 131 are
+    below, because the visible limb shortened faster than the limb thinned. The
+    ratio is the quantity the owner's sentence is about and it is the one with
+    headroom.
+
+    Without this floor the references take twelve species to three voxels across
+    -- `brown-bear` 7 -> 3, `wood-bison` 5 -> 3, `warthog` 5 -> 3 -- which is the
+    wireframe library the owner rejected, rebuilt on the authority of a
+    silhouette. `docs/reference-fitting-research.md` §7 rejection 1 is right
+    about that, and this is how it survives the reference being allowed to thin.
+    """
+    if not LIMBTARGET.exists():
+        return qp.SLENDER_MIN
+    rec = (json.loads(LIMBTARGET.read_text(encoding="utf-8"))
+           .get("species", {}).get(name) or {})
+    # THE HIGHEST OF THE THREE, not the newest. The guarantee on record is that
+    # the ratio "rose on every species and fell on none" against the
+    # PRE-2026-08-15 library as well, and a floor taken from the newest state
+    # alone let `roe-deer` fall 0.208 -> 0.167 against the older one. Two
+    # baselines, one floor.
+    ts = [float(rec[k]) for k in ("t_over_L", "t_over_L_040fb58",
+                                  "t_over_L_90f512c") if rec.get(k)]
+    return max([qp.SLENDER_MIN] + ts)
+
+
+def _thin_ok(spec: dict, name: str = "") -> str | None:
+    """Why this candidate may NOT be written, in the owner's own units."""
+    dia, ln, gw = _drawn(spec)
+    floor = _limb_floor(name) if name else qp.SLENDER_MIN
+    if not np.isfinite(dia) or dia < qp.LIMB_MIN_VOX:
+        return f"foreleg {dia:.0f} voxels across, floor {qp.LIMB_MIN_VOX:g}"
+    if np.isfinite(ln) and ln > 0 and dia / ln < floor:
+        return (f"thickness/length {dia / ln:.3f}, floor {floor:.3f}"
+                + (" (the 0.250-median library)" if floor > qp.SLENDER_MIN
+                   else ""))
+    if np.isfinite(gw) and gw < qp.GIRTH_MIN:
+        return f"girth/withers {gw:.2f}, floor {qp.GIRTH_MIN:.2f}"
+    return None
+
+
 def _write(path: Path, changes: dict) -> None:
     raw = json.loads(path.read_text(encoding="utf-8"))
     for dotted, value in changes.items():
@@ -525,21 +618,32 @@ def _write(path: Path, changes: dict) -> None:
                     encoding="utf-8")
 
 
-def fit(only: list[str] | None, dry: bool) -> int:
-    """Solve `quad.leg_thick` to the measured reference. NEVER REDUCES.
+def fit(only: list[str] | None, dry: bool, thin: bool = False) -> int:
+    """Solve `quad.leg_thick` to the measured reference.
 
-    THE NEVER-REDUCE RULE IS NOT TIMIDITY AND IT IS THE MOST IMPORTANT LINE IN
-    THIS FILE. Taken literally, the references say our red deer's legs are 41%
-    TOO THICK and should come down from 0.174 to 0.123. That is what a real red
-    deer measures and it is exactly the animal the owner looked at, called a
-    wireframe, and had rebuilt this morning. A photoreal target would undo that
-    fix on the authority of a silhouette rather than a render.
+    UPWARD ONLY BY DEFAULT, AND THAT DEFAULT IS DELIBERATE. Taken literally, the
+    references said our red deer's legs were 41% TOO THICK and should come down
+    from 0.174 to 0.123 -- and that was the exact animal the owner looked at,
+    called a wireframe, and had rebuilt. A photoreal target would have undone
+    that fix on the authority of a silhouette rather than a render. So the plain
+    `fit` still only lifts, and `docs/reference-fitting-research.md` §7 records
+    that as a rejection with its numbers.
 
-    So the reference is used in ONE DIRECTION: it lifts species that are thinner
-    than life and it never thins one that is thicker. That keeps every decision
-    the owner has already made and adds only what he has not been asked about.
-    `docs/reference-fitting-research.md` §7 records this as a rejection with the
-    numbers, because it is a real limit on what this tool does.
+    `--thin` IS THE OTHER DIRECTION AND IT NEEDED A REASON, WHICH ARRIVED. The
+    stance fix lowered the whole library onto its true withers, which shortened
+    every VISIBLE limb without thinning it, and the ratio the references judge
+    went from 1.04x life to 1.46x with a mean absolute error of 69%. Chasing
+    that with the row is only legitimate because the row turned out not to be
+    carrying anybody's judgement on most species: 49 specs sit on the row's
+    lower bound and 11 sit between 0.30 and 0.69. Those are solver artefacts of
+    the three-voxel readability gate at three lattices, and thinning them is
+    repairing a measurement, not overruling the owner.
+
+    The prohibition is therefore replaced by the owner's OWN gates rather than
+    lifted: `_thin_ok` refuses any candidate that would draw a limb under
+    `quadprobe.LIMB_MIN_VOX` voxels across, or below `SLENDER_MIN`, or below the
+    girth floor, and `MAX_THIN` bounds one pass. A species that cannot be thinned
+    without breaking a gate is printed as held, with the gate that held it.
     """
     refs = _refs()
     # THE HAND-CHECK GATE, AND IT IS NOT CEREMONY. GBIF's common-name search
@@ -595,6 +699,8 @@ def fit(only: list[str] | None, dry: bool) -> int:
     moved = 0
     short: list[tuple[str, float, float]] = []
     cappedlist: list[tuple[str, float, float]] = []
+    heldlist: list[tuple[str, str]] = []
+    looklist: list[tuple[str, float, float]] = []
     for n in names:
         path = SPECS / f"{n}.json"
         spec, _ = sm.load(path)
@@ -604,6 +710,46 @@ def fit(only: list[str] | None, dry: bool) -> int:
         t0 = float(sm.get(spec, "quad.leg_thick"))
         if not np.isfinite(s0):
             print(f"{n:<24} {t0:>7.3f} {'':>8} {'not measurable':>30}  skipped")
+            continue
+        if thin and s0 > want * 1.03:
+            d0, _, _ = _drawn(spec)
+            aim = max(want, s0 / MAX_THIN)
+            t1, s1 = _solve(spec, "quad.leg_thick", aim, _read_slender, 0.02, 0.90)
+            # WALK IT BACK UNTIL IT PASSES THE OWNER'S GATES rather than
+            # refusing outright. A species whose reference asks for less than
+            # three voxels can still take part of the distance, and taking part
+            # of it is the whole difference between a library at 1.46x life and
+            # one at 1.2x. The candidate is rebuilt at every step because the
+            # gates are measured on the DRAWN asset, not predicted from the row.
+            why = None
+            for frac in (1.0, 0.75, 0.5, 0.25):
+                cand = t0 + (t1 - t0) * frac
+                if cand >= t0 - 1e-4:
+                    t1, why = t0, _thin_ok(sm.patch(spec, {"quad.leg_thick": t0})[0], n)
+                    break
+                why = _thin_ok(sm.patch(spec, {"quad.leg_thick": round(cand, 3)})[0], n)
+                if why is None:
+                    t1 = round(cand, 3)
+                    s1 = _read_slender(_asset_sil(
+                        sm.patch(spec, {"quad.leg_thick": t1})[0]))
+                    break
+            if why is not None or t1 >= t0 - 1e-4:
+                heldlist.append((n, why or "solver found nothing thinner"))
+                print(f"{n:<24} {t0:>7.3f} -> {t0:<6.3f} {s0:>13.3f} vs {want:<6.3f} "
+                      f"{'':>3}  HELD: {why or 'solver found nothing thinner'}")
+                continue
+            moved += 1
+            d1, _, _ = _drawn(sm.patch(spec, {"quad.leg_thick": t1})[0])
+            note = ""
+            if np.isfinite(d0) and d0 > 0 and abs(d1 - d0) / d0 > 0.33:
+                looklist.append((n, d0, d1))
+                note = f"  LIMB {d0:.0f} -> {d1:.0f} VOXELS ACROSS -- LOOK AT IT"
+            elif s1 > want * 1.10:
+                note = f"  still {s1 / want:.2f}x life"
+            print(f"{n:<24} {t0:>7.3f} -> {t1:<6.3f} {s0:>13.3f} -> {s1:<6.3f} "
+                  f"(want {want:.3f}){note}")
+            if not dry:
+                _write(path, {"quad.leg_thick": round(t1, 3)})
             continue
         if s0 >= want * 0.97:
             print(f"{n:<24} {t0:>7.3f} -> {t0:<6.3f} {s0:>13.3f} vs {want:<6.3f} "
@@ -638,8 +784,14 @@ def fit(only: list[str] | None, dry: bool) -> int:
               f"(want {want:.3f}){note}")
         if not dry:
             _write(path, {"quad.leg_thick": round(t1, 3)})
-    print(f"\n  {moved} species thickened, {len(names) - moved} left alone"
+    print(f"\n  {moved} species {'moved' if thin else 'thickened'}, "
+          f"{len(names) - moved} left alone"
           f"{'  (DRY RUN -- nothing written)' if dry else ''}")
+    for n, why in heldlist:
+        print(f"  HELD: {n} is above life and cannot be thinned -- {why}")
+    for n, d0, d1 in looklist:
+        print(f"  LOOK AT IT: {n} went {d0:.0f} -> {d1:.0f} voxels across. "
+              f"That is a render, not a table row.")
     for n, got, want in cappedlist:
         print(f"  CAPPED: {n} reached {got:.3f}; the reference asks {want:.3f}. "
               f"Re-run to go further, and look at a render before you do.")
@@ -647,6 +799,123 @@ def fit(only: list[str] | None, dry: bool) -> int:
         print(f"  STILL SHORT: {n} reached {got:.3f} of a wanted {want:.3f} -- "
               f"a thicker limb also stands the animal higher, so this ratio "
               f"cannot be reached by limb thickness alone")
+    return 0
+
+
+def _stance_gaps(spec: dict, seeds=(1, 2, 3)) -> tuple[float, float]:
+    """Fore and hind foot clearance, averaged, on the VARIED draw."""
+    f, h = [], []
+    for s in seeds:
+        a = pipeline.build(spec, s)
+        f.append(qp.m_fore_gap(a))
+        h.append(qp.m_hind_gap(a))
+    return float(np.nanmean(f)), float(np.nanmean(h))
+
+
+def _settle_dead(name: str, old: float, honest: float) -> tuple[float, bool]:
+    """Back the honest value off until the VARIED draw is unchanged too.
+
+    THE HOLE THIS PLUGS IS ALREADY WRITTEN DOWN IN THIS REPOSITORY, in
+    `docs/quadruped-stance-height.md` §4: *"the solver pins the variation draw
+    off and the probe does not, so the pinned build was clean and the failure
+    only existed on the drawn one."* It cost `fennec-fox` a `--parts` failure
+    then and it cost `lesser-egyptian-jerboa` a `--stance` failure here.
+
+    `2.0 / limb_v` puts the radius exactly on the one-voxel floor AT THE PINNED
+    SIZE. `quad.shoulder_h`, `quad.hip_h` and `quad.length_m` are all varied, so
+    an individual drawn a few per cent larger has a longer limb, and at exactly
+    the floor that individual's radius crosses it -- which is fine on most
+    species and lifted the jerboa's hind feet two voxels off the ground. So the
+    value is walked down in eighths until the varied draw measures what it did
+    before, and a species that cannot be settled keeps the value it had.
+    """
+    path = SPECS / f"{name}.json"
+    spec, _ = sm.load(path)
+    f0, h0 = _stance_gaps(sm.patch(spec, {"quad.leg_thick": old})[0])
+    for k in range(9):
+        cand = honest * (1.0 - k / 8.0)
+        if cand <= old + 1e-9:
+            return old, k > 0
+        f1, h1 = _stance_gaps(sm.patch(spec, {"quad.leg_thick": round(cand, 3)})[0])
+        if abs(f1 - f0) <= 0.01 and abs(h1 - h0) <= 0.01:
+            return round(cand, 3), k > 0
+    return old, True
+
+
+def dead(only: list[str] | None, write: bool) -> int:
+    """Find every spec whose `quad.leg_thick` the generator CANNOT HONOUR.
+
+    THIS IS THE SILENT NO-OP THIS PROJECT KEEPS PAYING FOR, and it shipped for a
+    day inside the fix that was meant to end it. `forge/quadruped.py` computes
+
+        leg_r = max(1.0, 0.5 * quad.leg_thick * limb_v)
+
+    so on any species where `0.5 * leg_thick * limb_v` is under one voxel THE
+    ROW DOES NOTHING: the floor draws the limb, three voxels across, whatever
+    the spec says. Measured on 2026-08-15 that was 68 of 131 species, and 49 of
+    them carry the row's own LOWER BOUND, 0.05 -- which is not an authored
+    number at all. It is what the 90f512c conversion clamped to when its
+    arithmetic went out of range, and the floor then hid the clamp perfectly:
+    every one of those 49 renders exactly as it would with any other value, so
+    no render, no gate and no sweep could ever have shown it. `red-fox` went
+    0.176 -> 0.05 in that commit and nothing changed on screen.
+
+    `--write` replaces a dead value with the ratio THE FLOOR IS ACTUALLY
+    DRAWING, `2.0 / limb_v`, which changes no voxel and makes the row state what
+    is on screen. That is deliberately not a fit: where a reference exists,
+    `fit` should do the work and this should not pre-empt it. It is the
+    difference between a spec that lies and a spec that is merely coarse.
+    """
+    from forge import quadruped as quad
+    rows = []
+    for name in _quad_specs():
+        if only and name not in only:
+            continue
+        path = SPECS / f"{name}.json"
+        spec, _ = sm.load(path)
+        flat, _ = sm.patch(spec, {"variation.amount": 0.0})
+        p = quad._params(flat, np.random.default_rng(SEED),
+                         pipeline.resolution_m(flat))
+        limb_v = max(1.0, 0.5 * (p["fore_len"] + p["hind_len"]))
+        t0 = float(sm.get(flat, "quad.leg_thick"))
+        want = 0.5 * t0 * limb_v
+        if want >= 1.0 - 1e-9:
+            continue
+        # FLOORED TO THREE DECIMALS, NOT ROUNDED. `2.0 / limb_v` puts the radius
+        # exactly on the one-voxel floor, and rounding UP would put it a
+        # thousandth above -- at which point `max(1.0, ...)` stops governing and
+        # the capsule rasteriser is free to add a corner voxel. A repair that
+        # claims to change no geometry has to be arithmetically incapable of it.
+        honest = np.floor(min(0.90, max(0.02, 2.0 / limb_v)) * 1000.0) / 1000.0
+        rows.append((name, t0, limb_v, want, float(honest)))
+    lo = float(sm.BY_PATH["quad.leg_thick"].lo)
+    at_lo = [r for r in rows if abs(r[1] - lo) < 1e-9]
+    print("\nSPEC ROWS THE GENERATOR CANNOT HONOUR (quad.leg_thick)\n")
+    print(f"{'species':<28} {'authored':>9} {'limb_v':>8} {'radius asked':>13} "
+          f"{'drawn radius':>13} {'honest value':>13}")
+    for name, t0, limb_v, want, hon in rows:
+        print(f"{name:<28} {t0:>9.3f} {limb_v:>8.2f} {want:>13.2f} "
+              f"{1.0:>13.2f} {hon:>13.3f}"
+              f"{'   AT THE ROW LOW BOUND' if abs(t0 - lo) < 1e-9 else ''}")
+    print(f"\n  {len(rows)} of {len(_quad_specs())} species draw their limb from "
+          f"the one-voxel radius floor, not from the row")
+    print(f"  {len(at_lo)} of those carry the row's own lower bound {lo:g}, "
+          f"which is a clamp and not an authored value")
+    if write:
+        n_back = 0
+        for name, t0, _, _, hon in rows:
+            hon, backed = _settle_dead(name, t0, hon)
+            n_back += int(backed)
+            _write(SPECS / f"{name}.json", {"quad.leg_thick": hon})
+        print(f"  rewrote {len(rows)} specs to the ratio the floor already draws "
+              f"-- NO VOXEL CHANGES at the pinned size; verify with "
+              f"tools/quadprobe.py --bulk")
+        if n_back:
+            print(f"  {n_back} backed off below it because the VARIED draw does "
+                  f"leave the floor -- see `_settle_dead`")
+    else:
+        print("  --write rewrites them to the ratio already on screen "
+              "(no voxel changes)")
     return 0
 
 
@@ -696,6 +965,14 @@ def main() -> int:
     t = sub.add_parser("fit", help="solve quad.leg_thick to the reference")
     t.add_argument("--only", nargs="*")
     t.add_argument("--dry", action="store_true", help="print, write nothing")
+    t.add_argument("--thin", action="store_true",
+                   help="also bring species DOWN to life, gated on the probe's "
+                        "own limb, slenderness and girth floors")
+    d = sub.add_parser("dead", help="specs whose quad.leg_thick the floor overrides")
+    d.add_argument("--only", nargs="*")
+    d.add_argument("--write", action="store_true",
+                   help="rewrite dead rows to the ratio already drawn "
+                        "(changes no voxels)")
     o = sub.add_parser("overlay", help="draw the measurement on the silhouette")
     o.add_argument("--only", nargs="*")
     a = ap.parse_args()
@@ -707,7 +984,9 @@ def main() -> int:
     if a.cmd == "report":
         return report(a.only)
     if a.cmd == "fit":
-        return fit(a.only, a.dry)
+        return fit(a.only, a.dry, a.thin)
+    if a.cmd == "dead":
+        return dead(a.only, a.write)
     if a.cmd == "overlay":
         return overlay(a.only)
     return 2

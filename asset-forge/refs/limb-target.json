@@ -1,0 +1,1190 @@
+{
+ "_source": {
+  "what": "Foreleg thickness the library drew at commit 17cc742, the state whose quadprobe --bulk thickness/length median is 0.250 -- the number the owner named as the one that must not fall. Frozen in a FILE and not recomputed, for the same reason refs/withers-target.json is: the row being solved is the row that would otherwise carry the baseline, so a second run reading its own output would thin the library again and print a tidy table every time.",
+  "commit": "17cc742 reffit: references as the judge, and the answer is \"neither\"",
+  "measured_with": "tools/quadprobe.py m_limb_dia / m_limb_len, seed 1, variation pinned off",
+  "also_recorded": "dia_90f512c is the thickness pass before the reference fit; dia_040fb58 is the pre-2026-08-15 library the owner called wireframes.",
+  "floor_is": "max(t_over_L, t_over_L_040fb58, t_over_L_90f512c) -- the documented guarantee is that the ratio rose on every species and fell on none against the PRE-2026-08-15 library (040fb58) as well as against the 0.250-median state, so the floor is the highest of the three and not just the newest."
+ },
+ "species": {
+  "addax": {
+   "dia": 7.0,
+   "free_limb": 33.0,
+   "t_over_L": 0.2121,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.2121,
+   "t_over_L_90f512c": 0.2121
+  },
+  "african-bush-elephant": {
+   "dia": 16.0,
+   "free_limb": 37.0,
+   "t_over_L": 0.4324,
+   "dia_90f512c": 16.0,
+   "dia_040fb58": 17.0,
+   "t_over_L_040fb58": 0.4595,
+   "t_over_L_90f512c": 0.4324
+  },
+  "african-forest-elephant": {
+   "dia": 9.0,
+   "free_limb": 23.0,
+   "t_over_L": 0.3913,
+   "dia_90f512c": 9.0,
+   "dia_040fb58": 9.0,
+   "t_over_L_040fb58": 0.3913,
+   "t_over_L_90f512c": 0.3913
+  },
+  "african-wild-dog": {
+   "dia": 5.0,
+   "free_limb": 24.0,
+   "t_over_L": 0.2083,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2083,
+   "t_over_L_90f512c": 0.2083
+  },
+  "alpaca": {
+   "dia": 5.0,
+   "free_limb": 31.0,
+   "t_over_L": 0.1613,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1562,
+   "t_over_L_90f512c": 0.1613
+  },
+  "alpine-ibex": {
+   "dia": 3.0,
+   "free_limb": 12.0,
+   "t_over_L": 0.25,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.25,
+   "t_over_L_90f512c": 0.25
+  },
+  "alpine-marmot": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "american-bison": {
+   "dia": 5.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.2632,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.25,
+   "t_over_L_90f512c": 0.25
+  },
+  "american-black-bear": {
+   "dia": 5.0,
+   "free_limb": 10.0,
+   "t_over_L": 0.5,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.25,
+   "t_over_L_90f512c": 0.25
+  },
+  "american-mink": {
+   "dia": 4.0,
+   "free_limb": 8.0,
+   "t_over_L": 0.5,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 0.5,
+   "t_over_L_90f512c": 0.5
+  },
+  "antelope-ground-squirrel": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "arabian-oryx": {
+   "dia": 7.0,
+   "free_limb": 35.0,
+   "t_over_L": 0.2,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1429,
+   "t_over_L_90f512c": 0.2
+  },
+  "arctic-fox": {
+   "dia": 3.0,
+   "free_limb": 10.0,
+   "t_over_L": 0.3,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.3,
+   "t_over_L_90f512c": 0.3
+  },
+  "arctic-ground-squirrel": {
+   "dia": 3.0,
+   "free_limb": 4.0,
+   "t_over_L": 0.75,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.75,
+   "t_over_L_90f512c": 0.75
+  },
+  "barbary-sheep": {
+   "dia": 5.0,
+   "free_limb": 31.0,
+   "t_over_L": 0.1613,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1613,
+   "t_over_L_90f512c": 0.1613
+  },
+  "bengal-tiger": {
+   "dia": 7.0,
+   "free_limb": 33.0,
+   "t_over_L": 0.2121,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.2188,
+   "t_over_L_90f512c": 0.2121
+  },
+  "bighorn-sheep": {
+   "dia": 3.0,
+   "free_limb": 13.0,
+   "t_over_L": 0.2308,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2308,
+   "t_over_L_90f512c": 0.2308
+  },
+  "black-howler-monkey": {
+   "dia": 3.5,
+   "free_limb": 22.0,
+   "t_over_L": 0.1591,
+   "dia_90f512c": 3.5,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2273,
+   "t_over_L_90f512c": 0.1591
+  },
+  "black-tailed-jackrabbit": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "black-tailed-prairie-dog": {
+   "dia": 3.0,
+   "free_limb": 2.0,
+   "t_over_L": 1.5,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 1.5,
+   "t_over_L_90f512c": 1.5
+  },
+  "blue-wildebeest": {
+   "dia": 7.0,
+   "free_limb": 42.0,
+   "t_over_L": 0.1667,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1667,
+   "t_over_L_90f512c": 0.1667
+  },
+  "bobcat": {
+   "dia": 10.0,
+   "free_limb": 33.0,
+   "t_over_L": 0.303,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1389,
+   "t_over_L_90f512c": 0.2
+  },
+  "bongo": {
+   "dia": 7.0,
+   "free_limb": 43.0,
+   "t_over_L": 0.1628,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1628,
+   "t_over_L_90f512c": 0.1628
+  },
+  "brown-bear": {
+   "dia": 6.5,
+   "free_limb": 10.0,
+   "t_over_L": 0.65,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 0.3636,
+   "t_over_L_90f512c": 0.3636
+  },
+  "brown-throated-sloth": {
+   "dia": 4.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.3333,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 1.3333,
+   "t_over_L_90f512c": 1.3333
+  },
+  "cape-buffalo": {
+   "dia": 5.0,
+   "free_limb": 20.0,
+   "t_over_L": 0.25,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.25,
+   "t_over_L_90f512c": 0.25
+  },
+  "cape-hare": {
+   "dia": 3.0,
+   "free_limb": 15.0,
+   "t_over_L": 0.2,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.2
+  },
+  "capybara": {
+   "dia": 3.0,
+   "free_limb": 15.0,
+   "t_over_L": 0.2,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.2
+  },
+  "caracal": {
+   "dia": 4.0,
+   "free_limb": 15.0,
+   "t_over_L": 0.2667,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1765,
+   "t_over_L_90f512c": 0.1765
+  },
+  "chacma-baboon": {
+   "dia": 5.0,
+   "free_limb": 20.0,
+   "t_over_L": 0.25,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1429,
+   "t_over_L_90f512c": 0.25
+  },
+  "chamois": {
+   "dia": 5.0,
+   "free_limb": 27.0,
+   "t_over_L": 0.1852,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1111,
+   "t_over_L_90f512c": 0.1852
+  },
+  "cheetah": {
+   "dia": 15.0,
+   "free_limb": 55.0,
+   "t_over_L": 0.2727,
+   "dia_90f512c": 10.0,
+   "dia_040fb58": 9.0,
+   "t_over_L_040fb58": 0.15,
+   "t_over_L_90f512c": 0.1695
+  },
+  "chimpanzee": {
+   "dia": 5.0,
+   "free_limb": 23.0,
+   "t_over_L": 0.2174,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2174,
+   "t_over_L_90f512c": 0.2174
+  },
+  "coati": {
+   "dia": 3.0,
+   "free_limb": 9.0,
+   "t_over_L": 0.3333,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.3333,
+   "t_over_L_90f512c": 0.3333
+  },
+  "common-frog": {
+   "dia": 4.0,
+   "free_limb": 2.0,
+   "t_over_L": 2.0,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 2.0,
+   "t_over_L_90f512c": 2.0
+  },
+  "corsac-fox": {
+   "dia": 3.5,
+   "free_limb": 10.0,
+   "t_over_L": 0.35,
+   "dia_90f512c": 3.5,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.3,
+   "t_over_L_90f512c": 0.35
+  },
+  "coyote": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1579,
+   "t_over_L_90f512c": 0.1579
+  },
+  "desert-monitor": {
+   "dia": 5.5,
+   "free_limb": 2.0,
+   "t_over_L": 2.75,
+   "dia_90f512c": 5.5,
+   "dia_040fb58": 5.5,
+   "t_over_L_040fb58": 2.75,
+   "t_over_L_90f512c": 2.75
+  },
+  "dingo": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.15,
+   "t_over_L_90f512c": 0.1579
+  },
+  "dorcas-gazelle": {
+   "dia": 3.5,
+   "free_limb": 22.0,
+   "t_over_L": 0.1591,
+   "dia_90f512c": 3.5,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1364,
+   "t_over_L_90f512c": 0.1591
+  },
+  "dromedary-camel": {
+   "dia": 5.0,
+   "free_limb": 28.0,
+   "t_over_L": 0.1786,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1786,
+   "t_over_L_90f512c": 0.1786
+  },
+  "eastern-chipmunk": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "eastern-grey-kangaroo": {
+   "dia": 6.0,
+   "free_limb": 10.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 6.0,
+   "dia_040fb58": 6.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "eastern-grey-squirrel": {
+   "dia": 3.0,
+   "free_limb": 7.0,
+   "t_over_L": 0.4286,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.4286,
+   "t_over_L_90f512c": 0.4286
+  },
+  "elk-wapiti": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.15,
+   "t_over_L_90f512c": 0.1579
+  },
+  "eurasian-beaver": {
+   "dia": 3.0,
+   "free_limb": 7.0,
+   "t_over_L": 0.4286,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.4286,
+   "t_over_L_90f512c": 0.4286
+  },
+  "eurasian-lynx": {
+   "dia": 7.0,
+   "free_limb": 21.0,
+   "t_over_L": 0.3333,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2083,
+   "t_over_L_90f512c": 0.2083
+  },
+  "european-badger": {
+   "dia": 3.0,
+   "free_limb": 7.0,
+   "t_over_L": 0.4286,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.4286,
+   "t_over_L_90f512c": 0.4286
+  },
+  "european-bison": {
+   "dia": 5.0,
+   "free_limb": 26.0,
+   "t_over_L": 0.1923,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1923,
+   "t_over_L_90f512c": 0.1923
+  },
+  "european-hare": {
+   "dia": 3.0,
+   "free_limb": 18.0,
+   "t_over_L": 0.1667,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1667,
+   "t_over_L_90f512c": 0.1667
+  },
+  "european-hedgehog": {
+   "dia": 3.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.0,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 1.0,
+   "t_over_L_90f512c": 1.0
+  },
+  "european-mole": {
+   "dia": 7.0,
+   "free_limb": 2.0,
+   "t_over_L": 3.5,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 3.5,
+   "t_over_L_90f512c": 3.5
+  },
+  "european-otter": {
+   "dia": 3.5,
+   "free_limb": 6.0,
+   "t_over_L": 0.5833,
+   "dia_90f512c": 3.5,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.5,
+   "t_over_L_90f512c": 0.5833
+  },
+  "european-polecat": {
+   "dia": 3.0,
+   "free_limb": 9.0,
+   "t_over_L": 0.3333,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.3333,
+   "t_over_L_90f512c": 0.3333
+  },
+  "european-rabbit": {
+   "dia": 3.0,
+   "free_limb": 11.0,
+   "t_over_L": 0.2727,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2727,
+   "t_over_L_90f512c": 0.2727
+  },
+  "european-souslik": {
+   "dia": 3.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.0,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 1.0,
+   "t_over_L_90f512c": 1.0
+  },
+  "european-wildcat": {
+   "dia": 5.0,
+   "free_limb": 24.0,
+   "t_over_L": 0.2083,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.12,
+   "t_over_L_90f512c": 0.2083
+  },
+  "fallow-deer": {
+   "dia": 7.0,
+   "free_limb": 33.0,
+   "t_over_L": 0.2121,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.2121,
+   "t_over_L_90f512c": 0.2121
+  },
+  "fennec-fox": {
+   "dia": 3.0,
+   "free_limb": 14.0,
+   "t_over_L": 0.2143,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2143,
+   "t_over_L_90f512c": 0.2143
+  },
+  "fire-salamander": {
+   "dia": 6.0,
+   "free_limb": 1.0,
+   "t_over_L": 6.0,
+   "dia_90f512c": 6.0,
+   "dia_040fb58": 6.0,
+   "t_over_L_040fb58": 6.0,
+   "t_over_L_90f512c": 6.0
+  },
+  "fisher": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "forest-buffalo": {
+   "dia": 3.0,
+   "free_limb": 15.0,
+   "t_over_L": 0.2,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.2
+  },
+  "gemsbok": {
+   "dia": 7.0,
+   "free_limb": 42.0,
+   "t_over_L": 0.1667,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1667,
+   "t_over_L_90f512c": 0.1667
+  },
+  "giant-anteater": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1765,
+   "t_over_L_90f512c": 0.1579
+  },
+  "golden-jackal": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "greater-kudu": {
+   "dia": 9.0,
+   "free_limb": 46.0,
+   "t_over_L": 0.1957,
+   "dia_90f512c": 9.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1522,
+   "t_over_L_90f512c": 0.1957
+  },
+  "grey-wolf": {
+   "dia": 5.0,
+   "free_limb": 26.0,
+   "t_over_L": 0.1923,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.1923
+  },
+  "guanaco": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "hippopotamus": {
+   "dia": 11.5,
+   "free_limb": 8.0,
+   "t_over_L": 1.4375,
+   "dia_90f512c": 11.5,
+   "dia_040fb58": 8.5,
+   "t_over_L_040fb58": 0.85,
+   "t_over_L_90f512c": 1.4375
+  },
+  "impala": {
+   "dia": 5.0,
+   "free_limb": 32.0,
+   "t_over_L": 0.1562,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1562,
+   "t_over_L_90f512c": 0.1562
+  },
+  "klipspringer": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1579,
+   "t_over_L_90f512c": 0.1579
+  },
+  "lesser-egyptian-jerboa": {
+   "dia": 5.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.6667,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 1.6667,
+   "t_over_L_90f512c": 1.6667
+  },
+  "lion": {
+   "dia": 3.0,
+   "free_limb": 14.0,
+   "t_over_L": 0.2143,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.2
+  },
+  "lowland-tapir": {
+   "dia": 3.0,
+   "free_limb": 12.0,
+   "t_over_L": 0.25,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2308,
+   "t_over_L_90f512c": 0.2308
+  },
+  "mandrill": {
+   "dia": 5.0,
+   "free_limb": 32.0,
+   "t_over_L": 0.1562,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1562,
+   "t_over_L_90f512c": 0.1562
+  },
+  "maned-wolf": {
+   "dia": 7.0,
+   "free_limb": 34.0,
+   "t_over_L": 0.2059,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1429,
+   "t_over_L_90f512c": 0.2059
+  },
+  "marine-iguana": {
+   "dia": 4.5,
+   "free_limb": 2.0,
+   "t_over_L": 2.25,
+   "dia_90f512c": 4.5,
+   "dia_040fb58": 4.5,
+   "t_over_L_040fb58": 2.25,
+   "t_over_L_90f512c": 2.25
+  },
+  "meerkat": {
+   "dia": 3.0,
+   "free_limb": 4.0,
+   "t_over_L": 0.75,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.75,
+   "t_over_L_90f512c": 0.75
+  },
+  "moose": {
+   "dia": 5.0,
+   "free_limb": 24.0,
+   "t_over_L": 0.2083,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2174,
+   "t_over_L_90f512c": 0.2083
+  },
+  "mountain-goat": {
+   "dia": 3.0,
+   "free_limb": 11.0,
+   "t_over_L": 0.2727,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2727,
+   "t_over_L_90f512c": 0.2727
+  },
+  "mountain-hare": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "muskox": {
+   "dia": 3.0,
+   "free_limb": 8.0,
+   "t_over_L": 0.375,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.375,
+   "t_over_L_90f512c": 0.375
+  },
+  "nile-crocodile": {
+   "dia": 4.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.3333,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 1.3333,
+   "t_over_L_90f512c": 1.3333
+  },
+  "nile-monitor": {
+   "dia": 5.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.6667,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 1.6667,
+   "t_over_L_90f512c": 1.6667
+  },
+  "nine-banded-armadillo": {
+   "dia": 3.0,
+   "free_limb": 4.0,
+   "t_over_L": 0.75,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.75,
+   "t_over_L_90f512c": 0.75
+  },
+  "north-american-porcupine": {
+   "dia": 3.0,
+   "free_limb": 7.0,
+   "t_over_L": 0.4286,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.4286,
+   "t_over_L_90f512c": 0.4286
+  },
+  "norway-lemming": {
+   "dia": 3.0,
+   "free_limb": 4.0,
+   "t_over_L": 0.75,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.75,
+   "t_over_L_90f512c": 0.75
+  },
+  "ocellated-lizard": {
+   "dia": 5.0,
+   "free_limb": 2.0,
+   "t_over_L": 2.5,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 2.5,
+   "t_over_L_90f512c": 2.5
+  },
+  "okapi": {
+   "dia": 9.0,
+   "free_limb": 47.0,
+   "t_over_L": 0.1915,
+   "dia_90f512c": 9.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1458,
+   "t_over_L_90f512c": 0.1915
+  },
+  "pika": {
+   "dia": 4.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.8,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 0.8,
+   "t_over_L_90f512c": 0.8
+  },
+  "pine-marten": {
+   "dia": 3.0,
+   "free_limb": 13.0,
+   "t_over_L": 0.2308,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2308,
+   "t_over_L_90f512c": 0.2308
+  },
+  "plains-zebra": {
+   "dia": 7.0,
+   "free_limb": 45.0,
+   "t_over_L": 0.1556,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1556,
+   "t_over_L_90f512c": 0.1556
+  },
+  "poison-dart-frog": {
+   "dia": 4.0,
+   "free_limb": 2.0,
+   "t_over_L": 2.0,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 2.0,
+   "t_over_L_90f512c": 2.0
+  },
+  "pronghorn": {
+   "dia": 5.0,
+   "free_limb": 32.0,
+   "t_over_L": 0.1562,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1562,
+   "t_over_L_90f512c": 0.1562
+  },
+  "przewalskis-horse": {
+   "dia": 3.0,
+   "free_limb": 17.0,
+   "t_over_L": 0.1765,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1667,
+   "t_over_L_90f512c": 0.1765
+  },
+  "raccoon": {
+   "dia": 3.0,
+   "free_limb": 7.0,
+   "t_over_L": 0.4286,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.4286,
+   "t_over_L_90f512c": 0.4286
+  },
+  "red-deer-hind": {
+   "dia": 3.0,
+   "free_limb": 16.0,
+   "t_over_L": 0.1875,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1875,
+   "t_over_L_90f512c": 0.1875
+  },
+  "red-deer-stag": {
+   "dia": 7.0,
+   "free_limb": 43.0,
+   "t_over_L": 0.1628,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1628,
+   "t_over_L_90f512c": 0.1628
+  },
+  "red-fox": {
+   "dia": 3.0,
+   "free_limb": 14.0,
+   "t_over_L": 0.2143,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2143,
+   "t_over_L_90f512c": 0.2143
+  },
+  "red-kangaroo": {
+   "dia": 8.0,
+   "free_limb": 10.0,
+   "t_over_L": 0.8,
+   "dia_90f512c": 8.0,
+   "dia_040fb58": 8.0,
+   "t_over_L_040fb58": 0.8,
+   "t_over_L_90f512c": 0.8
+  },
+  "red-river-hog": {
+   "dia": 5.0,
+   "free_limb": 22.0,
+   "t_over_L": 0.2273,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1364,
+   "t_over_L_90f512c": 0.2273
+  },
+  "red-squirrel": {
+   "dia": 3.0,
+   "free_limb": 6.0,
+   "t_over_L": 0.5,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.5,
+   "t_over_L_90f512c": 0.5
+  },
+  "reindeer": {
+   "dia": 3.0,
+   "free_limb": 15.0,
+   "t_over_L": 0.2,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.2
+  },
+  "rock-hyrax": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "roe-deer": {
+   "dia": 4.0,
+   "free_limb": 25.0,
+   "t_over_L": 0.16,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2083,
+   "t_over_L_90f512c": 0.16
+  },
+  "saiga-antelope": {
+   "dia": 5.0,
+   "free_limb": 26.0,
+   "t_over_L": 0.1923,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.1923
+  },
+  "sand-cat": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.15,
+   "t_over_L_90f512c": 0.1579
+  },
+  "sand-lizard": {
+   "dia": 5.5,
+   "free_limb": 2.0,
+   "t_over_L": 2.75,
+   "dia_90f512c": 5.5,
+   "dia_040fb58": 5.5,
+   "t_over_L_040fb58": 2.75,
+   "t_over_L_90f512c": 2.75
+  },
+  "siberian-flying-squirrel": {
+   "dia": 3.0,
+   "free_limb": 4.0,
+   "t_over_L": 0.75,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.75,
+   "t_over_L_90f512c": 0.75
+  },
+  "siberian-musk-deer": {
+   "dia": 6.0,
+   "free_limb": 37.0,
+   "t_over_L": 0.1622,
+   "dia_90f512c": 6.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.1892,
+   "t_over_L_90f512c": 0.1622
+  },
+  "sika-deer": {
+   "dia": 5.0,
+   "free_limb": 31.0,
+   "t_over_L": 0.1613,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1667,
+   "t_over_L_90f512c": 0.1613
+  },
+  "small-indian-mongoose": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "spectacled-caiman": {
+   "dia": 4.5,
+   "free_limb": 4.0,
+   "t_over_L": 1.125,
+   "dia_90f512c": 4.5,
+   "dia_040fb58": 4.5,
+   "t_over_L_040fb58": 1.125,
+   "t_over_L_90f512c": 1.125
+  },
+  "spiny-tailed-lizard": {
+   "dia": 4.5,
+   "free_limb": 2.0,
+   "t_over_L": 2.25,
+   "dia_90f512c": 4.5,
+   "dia_040fb58": 4.5,
+   "t_over_L_040fb58": 2.25,
+   "t_over_L_90f512c": 2.25
+  },
+  "spotted-hyena": {
+   "dia": 5.0,
+   "free_limb": 22.0,
+   "t_over_L": 0.2273,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2174,
+   "t_over_L_90f512c": 0.2174
+  },
+  "steppe-polecat": {
+   "dia": 3.0,
+   "free_limb": 10.0,
+   "t_over_L": 0.3,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.3,
+   "t_over_L_90f512c": 0.3
+  },
+  "stoat": {
+   "dia": 3.0,
+   "free_limb": 6.0,
+   "t_over_L": 0.5,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.5,
+   "t_over_L_90f512c": 0.5
+  },
+  "striped-hyena": {
+   "dia": 3.0,
+   "free_limb": 19.0,
+   "t_over_L": 0.1579,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1579,
+   "t_over_L_90f512c": 0.1579
+  },
+  "striped-skunk": {
+   "dia": 3.0,
+   "free_limb": 3.0,
+   "t_over_L": 1.0,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 1.0,
+   "t_over_L_90f512c": 1.0
+  },
+  "vicuna": {
+   "dia": 7.0,
+   "free_limb": 32.0,
+   "t_over_L": 0.2188,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.2188,
+   "t_over_L_90f512c": 0.2188
+  },
+  "virginia-opossum": {
+   "dia": 3.0,
+   "free_limb": 5.0,
+   "t_over_L": 0.6,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.6,
+   "t_over_L_90f512c": 0.6
+  },
+  "viviparous-lizard": {
+   "dia": 5.0,
+   "free_limb": 2.0,
+   "t_over_L": 2.5,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 2.5,
+   "t_over_L_90f512c": 2.5
+  },
+  "warthog": {
+   "dia": 5.0,
+   "free_limb": 22.0,
+   "t_over_L": 0.2273,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.1364,
+   "t_over_L_90f512c": 0.2174
+  },
+  "water-monitor": {
+   "dia": 4.0,
+   "free_limb": 4.0,
+   "t_over_L": 1.0,
+   "dia_90f512c": 4.0,
+   "dia_040fb58": 4.0,
+   "t_over_L_040fb58": 1.0,
+   "t_over_L_90f512c": 1.0
+  },
+  "western-lowland-gorilla": {
+   "dia": 7.0,
+   "free_limb": 22.0,
+   "t_over_L": 0.3182,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 7.0,
+   "t_over_L_040fb58": 0.3182,
+   "t_over_L_90f512c": 0.3182
+  },
+  "white-rhinoceros": {
+   "dia": 9.0,
+   "free_limb": 18.0,
+   "t_over_L": 0.5,
+   "dia_90f512c": 9.0,
+   "dia_040fb58": 9.0,
+   "t_over_L_040fb58": 0.5,
+   "t_over_L_90f512c": 0.5
+  },
+  "white-tailed-deer": {
+   "dia": 7.0,
+   "free_limb": 37.0,
+   "t_over_L": 0.1892,
+   "dia_90f512c": 7.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2,
+   "t_over_L_90f512c": 0.1892
+  },
+  "wild-boar": {
+   "dia": 4.5,
+   "free_limb": 26.0,
+   "t_over_L": 0.1731,
+   "dia_90f512c": 4.5,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.1923,
+   "t_over_L_90f512c": 0.1731
+  },
+  "wild-yak": {
+   "dia": 5.0,
+   "free_limb": 18.0,
+   "t_over_L": 0.2778,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2778,
+   "t_over_L_90f512c": 0.2778
+  },
+  "wolverine": {
+   "dia": 3.0,
+   "free_limb": 14.0,
+   "t_over_L": 0.2143,
+   "dia_90f512c": 3.0,
+   "dia_040fb58": 3.0,
+   "t_over_L_040fb58": 0.2143,
+   "t_over_L_90f512c": 0.2143
+  },
+  "wood-bison": {
+   "dia": 5.0,
+   "free_limb": 18.0,
+   "t_over_L": 0.2778,
+   "dia_90f512c": 5.0,
+   "dia_040fb58": 5.0,
+   "t_over_L_040fb58": 0.2778,
+   "t_over_L_90f512c": 0.2778
+  }
+ }
+}

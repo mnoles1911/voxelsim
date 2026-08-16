@@ -160,6 +160,17 @@ short at the girth floor.
 
 ## 4. Where this is honest about not landing
 
+> **CLOSED 2026-08-15 — see `docs/quadruped-limb-regression.md`.** The diagnosis
+> below is right about the mechanism and wrong about the cause. The limb radius
+> floor is not what did it: measured across three commits, the drawn diameter
+> barely moved (median 3 → 4 voxels) while the **visible** limb halved (median
+> 15 → 8 voxels), because a lowered trunk covers more of its own leg. Underneath
+> that sat a dead row — `quad.leg_thick` was on its own lower bound in **49 of
+> 131 specs** and overridden by the floor in **68** — which no render could show.
+> Repaired and re-fitted in both directions, against life: 1.46× → **1.29×**,
+> mean absolute error 69% → **56%**, and 1.70× → **1.21×** on the 41 species with
+> a fit-quality reference.
+
 **Limb thickness over limb length went the wrong way, and it is reported rather
 than hidden.** Against the references it moved from 1.04× to **1.40×**, mean
 absolute error 32% → 69%. The mechanism is resolution, not shape: the limb
@@ -181,11 +192,26 @@ neither is hidden.
 **17 species stopped short at the girth floor**, and they are mostly deer:
 `red-deer-stag` reached a leg share of 0.449 where its references ask 0.544, and
 a trunk slim enough to get there falls below `GIRTH_WANT = 0.95`. That floor is
-`tools/quadprobe.py`'s and was set by the previous proportion work; a real red
-deer's chest girth is about 0.92 of its withers, i.e. **below the library's own
-floor**, because the 1.14–1.38 livestock figures behind that floor are cattle,
-horses and goats and not cervids. Moving it is a decision for the owner in front
-of renders, not something a fitting pass should do to its own gate.
+`tools/quadprobe.py`'s and was set by the previous proportion work.
+
+> **WITHDRAWN 2026-08-15.** This paragraph originally continued: *"a real red
+> deer's chest girth is about 0.92 of its withers, i.e. below the library's own
+> floor, because the 1.14–1.38 livestock figures behind that floor are cattle,
+> horses and goats and not cervids."* **That 0.92 carried no source and the
+> literature contradicts it.** Read per file with the units established in each
+> case, adult cervids run **1.03 to 1.23** — roe deer 1.026 (n=90), moose 1.085
+> (n=23), red deer 1.113 (n=290) and 1.131 (n=76), fallow 1.133, sika 1.155–1.227
+> (n=254–322), reindeer 1.215 (n=98) — against 1.10–1.41 for domestic bovids and
+> equids. The leanest deer found anywhere is **1.008**, so a 0.95 floor sits 6%
+> below it and cannot bind on any deer. The library's own cervids already measure
+> 0.95–1.25 against those figures, i.e. at or *below* life in the chest, so
+> lowering the floor would move them further from real deer.
+> **No per-clade floor was made.** Sources, the four literature traps found on
+> the way, and what could not be sourced are in
+> `docs/quadruped-limb-regression.md` §7 and §8.
+
+Whatever holds those 17 short, it is not a floor that is 6% clear of every
+published deer.
 
 **Two species were held entirely.** `european-hedgehog` cannot be lowered without
 its foreleg dropping to 2 voxels across; `striped-skunk`'s belly reaches the
