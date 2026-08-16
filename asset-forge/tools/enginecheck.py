@@ -66,15 +66,21 @@ def bank_record(banks: Path) -> dict:
         return {}
 
 
-def check_banks(banks: Path, deep: bool = False) -> tuple[list[str], int, int]:
-    """(problems, checked, unrecorded). A species with a bank directory but no
-    recorded hash is UNRECORDED, not clean: it was baked before this tool
-    existed and nothing knows which spec it came from."""
+def check_banks(banks: Path, deep: bool = False
+                ) -> tuple[list[str], int, int, list[str]]:
+    """(problems, checked, unrecorded, orphans).
+
+    A species with a bank directory but no recorded hash is UNRECORDED, not
+    clean: nothing knows which spec its files came from. After the first
+    `--force` pass that is not "predates the record" any more -- it means the
+    exporter no longer bakes that species, so the files are left over from a
+    library it has since dropped. Reported, never deleted."""
     rec = bank_record(banks)
     problems: list[str] = []
+    orphans: list[str] = []
     checked = unrecorded = 0
     if not banks.is_dir():
-        return ([f"no bank directory at {banks}"], 0, 0)
+        return ([f"no bank directory at {banks}"], 0, 0, [])
 
     for d in sorted(banks.iterdir()):
         if not d.is_dir():
@@ -92,7 +98,16 @@ def check_banks(banks: Path, deep: bool = False) -> tuple[list[str], int, int]:
         was = (rec.get(name) or {}).get("spec_hash")
         checked += 1
         if was is None:
+            # A bank directory with no record after a --force pass is not
+            # "predates the record" -- the exporter would have stamped it. It is
+            # a bank the exporter no longer bakes: a species that folds to zero
+            # per-mille, is refused by its layer, or was renamed. The files stay
+            # (deleting a baked hero is not this tool's call) but they are dead
+            # bytes of unknown vintage, and saying so is the point.
             unrecorded += 1
+            orphans.append(f"{name}: {len(files)} bank file(s), no recorded "
+                           f"spec_hash -- the exporter does not bake this "
+                           f"species, so these are stale bytes of unknown age")
             continue
         if was != now:
             problems.append(f"{name}: spec_hash {was[:12]} -> {now[:12]} -- "
@@ -108,7 +123,7 @@ def check_banks(banks: Path, deep: bool = False) -> tuple[list[str], int, int]:
                     problems.append(f"{name} seed {seed}: rebuilt bytes differ "
                                     f"from the baked file though the spec_hash "
                                     f"matches -- the GENERATOR moved")
-    return (problems, checked, unrecorded)
+    return (problems, checked, unrecorded, orphans)
 
 
 def check_manifest(out: Path) -> list[str]:
@@ -148,7 +163,7 @@ def main() -> int:
 
     out = Path(args.out)
     problems = check_manifest(out)
-    bank_problems, checked, unrecorded = check_banks(out / "banks", args.deep)
+    bank_problems, checked, unrecorded, orphans = check_banks(out / "banks", args.deep)
     problems += bank_problems
 
     if not args.quiet:
@@ -165,8 +180,11 @@ def main() -> int:
               f"and re-bless goldens)")
         return 1
     if unrecorded:
-        print(f"enginecheck: PASS with {unrecorded} unrecorded -- those banks "
-              f"predate the hash record; a --force re-bake stamps them")
+        for w in orphans:
+            print(f"  ~ {w}")
+        print(f"enginecheck: PASS with {unrecorded} unrecorded -- reported "
+              f"above, not fatal: they are not in the manifest, so nothing "
+              f"loads them")
         return 0
     print(f"enginecheck: PASS -- {checked} species, manifest matches the specs")
     return 0

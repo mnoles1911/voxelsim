@@ -201,3 +201,18 @@ number nobody chose. The re-fit is `reffit dead` followed by `fit --thin` at the
 new lattices, and it is deliberately NOT bundled into this change: the move is
 worth reading on its own, and stacking a solver on top of it would make the two
 impossible to tell apart in a render.
+
+## 8. Where the baked world actually lives
+
+`asset-forge/out/` is in `.gitignore`, so the 688 bank files and `species.vxm`
+that `vxc::kWorldGenVersion` v25 calls **worldgen input** are not in version
+control. That is defensible only on one condition: the export must be a pure
+function of things that are tracked. It is — every build is deterministic in
+`(spec, seed)` — and `tools/enginecheck.py --deep` is the thing that checks it
+rather than assuming it, by rebuilding every species and comparing the bytes it
+would write against the bytes on disk.
+
+So the chain is: **specs are the source of truth and are versioned; the export
+is derived, reproducible and unversioned; `enginecheck` is what proves the two
+still agree.** A clone with no `out/` is not broken, it is unbuilt — one
+`export_banks.py` and one `export_manifest.py` away.

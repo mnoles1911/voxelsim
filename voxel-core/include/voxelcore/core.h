@@ -274,7 +274,33 @@ namespace vxc {
 // vxc_bench --assets is the ran-flag (its digest MUST differ from the
 // terrain-only one, and did: 3b5fe7ec61c6581a at radius 8, seed 20260719,
 // brick 16, against the 2026-08-15 manifest and 4-seed banks).
-inline constexpr uint32_t kWorldGenVersion = 24;
+//
+// --- v25: THE FIRST TIME THAT CONTRACT WAS CALLED IN -----------------------
+//
+// v24 declared manifest bytes, bank bytes and the layer table to be worldgen
+// input. On 2026-08-16 all three moved and this is the bump that says so. What
+// changed is in asset-forge, not here:
+//
+//   * trunk taper (a real missing term -- an unforked bole kept its base radius
+//     to the crown, and a birch measured 1.00), so every tree in the 688-file
+//     bank is a different tree;
+//   * quad.eye's float bounds made spec validation NON-IDEMPOTENT, reseeding
+//     192 specs -- 9 trees and 34 rocks among them, all terrain kinds with
+//     banks;
+//   * 25 quadrupeds moved off the 5 cm lattice. They are detail kinds and have
+//     no banks, but they are in the manifest.
+//
+// TERRAIN IS UNTOUCHED AND THAT IS VERIFIED, NOT ASSUMED: the terrain-only
+// digest is e02458de2be47309 before and after, identical to v23's and v24's.
+// Only the asset term moved: vxc_bench --assets goes 3b5fe7ec61c6581a ->
+// 41ec6bbf103f18dc at radius 8, seed 20260719, brick 16.
+//
+// The staleness that made this bump necessary was found by asset-forge's
+// tools/enginecheck.py, which compares each baked bank against its spec's
+// spec_hash. Before it existed the exporter skipped a bake whenever the FILE
+// EXISTED, so the engine would have gone on composing pre-taper trees forever
+// with nothing to say so.
+inline constexpr uint32_t kWorldGenVersion = 25;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

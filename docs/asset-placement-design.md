@@ -1025,3 +1025,47 @@ No crash, no warning, just a thinner forest. Fixed, and pinned by
 `assetgrid_rotated_origin_puts_a_yawed_box_where_atYaw_reads_it`, which asserts
 the two against each other over a box with unequal extents and a negative origin
 — a cube at the origin passes with all four bugs present.
+
+---
+
+## 13. v25 — the contract §9 declared was called in on 2026-08-16
+
+Every digest above that reads `3b5fe7ec61c6581a` was measured against the
+2026-08-15 export. That export is gone. `kWorldGenVersion` is now **25** and the
+current pair, same conditions throughout (radius 8, seed 20260719, brick 16):
+
+* terrain-only: **`e02458de2be47309`** — still, and this is the third version in
+  a row it has not moved. The terrain function is untouched by all of this.
+* `--assets asset-forge/out/engine`: **`41ec6bbf103f18dc`** (was
+  `3b5fe7ec61c6581a`).
+
+**What moved, none of it in this repo:**
+
+* **Trunk taper.** A real missing term, not a tuning change — `skeleton._radii`
+  derived thickness only from where branches fork, so an unforked bole kept its
+  base radius to the crown and a birch measured a taper ratio of 1.00. Every
+  tree in the 688-file bank is now a different tree.
+* **`quad.eye`.** Float bounds on the only one of 34 `kind="int"` rows made spec
+  validation non-idempotent, silently reseeding 192 specs — 9 trees and 34 rocks
+  among them, all terrain kinds with banks.
+* **25 quadrupeds off the 5 cm lattice.** Detail kinds, so no banks, but they
+  are in the manifest and therefore in its bytes.
+
+**How the staleness was found, since that is the part worth keeping.** Nothing
+checked the export against its source. `export_banks.py` skipped a bake whenever
+the **file existed**, so a spec could move any distance and its bank would go on
+serving the old tree forever — the engine composing pre-taper trees with nothing
+to say so. `asset-forge/tools/enginecheck.py` now stamps each species'
+`spec_hash` at bake and compares; it caught this within hours of being written,
+and `european-beech` differing by 5,920 bytes from its own spec is what a
+"deliberate worldgen change" looks like when it is *not* deliberate.
+
+**Fixtures.** `tests/fixtures/asset_species_v1.vxm` is refreshed, because a test
+named `assetmanifest_reads_the_file_asset_forge_actually_wrote` should not read
+a file asset-forge wrote a day ago. `asset_tundra_pine_0002.vxa` is deliberately
+**not** refreshed: it is an *input* to the reader tests, which pin its exact
+dimensions, origin, run count and voxel values. Refreshing it churns six
+assertions to prove nothing about the reader, and the pinned golden
+`cfcd3f62789f4d0e` is computed from it and so is unchanged.
+
+Suite after: **697 pass, 0 fail.**
