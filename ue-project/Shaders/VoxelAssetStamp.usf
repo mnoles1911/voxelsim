@@ -28,6 +28,21 @@
 // RotOriginX/Y arrive precomputed from AssetGrid::rotatedOriginX/Y for THIS
 // instance's yaw, so the one-voxel negated-axis subtlety documented there
 // stays in exactly one place.
+//
+// TWO ENTRY POINTS, ONE PER SAMPLING DIRECTION. AssetStampMain is the level-0
+// SCATTER above: one thread per BAKED column, walking its spans into level-0
+// cells -- a bijection, so it is race-free and exact. AssetStampCoarseMain is
+// the CoarseLevel > 0 GATHER: at level L many baked voxels map to one level-L
+// cell, so a scatter would race threads against each other for the cell and
+// whichever landed last would win -- a nondeterministic winner where the CPU
+// rule (FCoarseChunkGridSampler in VoxelWorldSubsystem.cpp) is deterministic
+// nearest-neighbour: sample the instance at the cell's REPRESENTATIVE level-0
+// coordinate, coarseRep(c, L) = c * 2^L + 2^L/2, exactly as the terrain around
+// it is sampled. The coarse kernel therefore holds one thread per level-L cell
+// in the instance's covering cell box and gathers through atYaw's inverse map
+// into the span table -- the same direction the CPU sampler reads, which is
+// what makes byte parity an identity rather than an argument. Level 0 never
+// takes the coarse kernel, so its bytes cannot move.
 
 #include "/Engine/Public/Platform.ush"
 
@@ -125,6 +140,150 @@ void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
             {
                 OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
             }
+        }
+    }
+}
+
+// --- AssetStampCoarseMain: the CoarseLevel > 0 gather ----------------------
+//
+// Byte-parity target: FCoarseChunkGridSampler::operator(). For level-L cell
+// (X, Y, Z) the CPU computes rep coordinates coarseRep(., L), subtracts the
+// instance's rotated-box origin (anchor + rotatedOrigin), and if the local
+// coordinate lands inside the rotated box, samples AssetGrid::atYaw -- first
+// non-air instance wins, and only where the terrain cell is AIR. This kernel
+// is that walk verbatim, with atYaw's run table replaced by the identical
+// span table AssetStampMain already reads.
+//
+// COORDINATES ARRIVE REGION-RELATIVE so the arithmetic stays in int32: the
+// host folds the region's level-0 base (OriginVx * 2^L) into AnchorRel, so
+// for region-local cell c the rotated-box-local coordinate is
+//     r = c * CoarseScale + CoarseScale/2 - AnchorRel - RotOrigin
+// (identical to rep-minus-origin in absolute coordinates, minus the shared
+// base). Z stays absolute -- AnchorVz always was.
+//
+// CoarseScale, not the level, for the same reason FillLooseParameters passes
+// it to worldgen.ush: this file must contain no variable shift distance
+// (lint-shader-ub VARIABLE_SHIFT). The only shifts below are by literals.
+//
+// RACE-FREE BY SHAPE, not by bijection: one thread owns one level-L cell
+// column of the instance's covering cell box, so no two threads of a dispatch
+// touch the same cell, and the pass barrier between per-instance dispatches
+// keeps first-non-air-wins in array order exactly as at level 0.
+
+uint CoarseScale;        // 1 << CoarseLevel, host-computed and range-checked
+uint2 CellBoxMin;        // region-local level-L cell box, host-clamped >= 0
+uint2 CellBoxSize;       // threads dispatched over this; box is inclusive of
+                         // every cell whose rep the instance COULD cover --
+                         // the rep-in-box test below is the exact filter
+
+[numthreads(8, 8, 1)]
+void AssetStampCoarseMain(uint3 Tid : SV_DispatchThreadID)
+{
+    if (Tid.x >= CellBoxSize.x || Tid.y >= CellBoxSize.y)
+    {
+        return;
+    }
+    const uint Ci = CellBoxMin.x + Tid.x;   // region-local level-L cell x
+    const uint Cj = CellBoxMin.y + Tid.y;
+    if (Ci >= DispatchColumns.x || Cj >= DispatchColumns.y)
+    {
+        return;   // unreachable when the host clamps; defence stays
+    }
+
+    const int Scale = int(CoarseScale);
+    const int Half = int(CoarseScale >> 1u);   // literal shift: lint-clean
+
+    // Rotated-box-local coordinates of this cell's rep (see header). The CPU
+    // shortlist admits a column only when its rep lies inside the instance's
+    // rotated XY box; this is that test, per thread.
+    const int Rx = int(Ci) * Scale + Half - AnchorRel.x - RotOriginX;
+    const int Ry = int(Cj) * Scale + Half - AnchorRel.y - RotOriginY;
+    const bool bYawSwaps = (YawQuarter & 1u) != 0u;
+    const int RotSizeX = bYawSwaps ? int(SizeY) : int(SizeX);
+    const int RotSizeY = bYawSwaps ? int(SizeX) : int(SizeY);
+    if (Rx < 0 || Rx >= RotSizeX || Ry < 0 || Ry >= RotSizeY)
+    {
+        return;
+    }
+
+    // Inverse quarter-turn -- the EXACT mirror of AssetGrid::atYaw's at()
+    // arguments, not of the forward map the scatter kernel uses:
+    //   yaw 0: at(rx, ry, .)
+    //   yaw 1: at(ry, SizeY-1-rx, .)
+    //   yaw 2: at(SizeX-1-rx, SizeY-1-ry, .)
+    //   yaw 3: at(SizeX-1-ry, rx, .)
+    int Bx, By;
+    switch (YawQuarter & 3u)
+    {
+        case 0u: Bx = Rx;                  By = Ry;                  break;
+        case 1u: Bx = Ry;                  By = int(SizeY) - 1 - Rx; break;
+        case 2u: Bx = int(SizeX) - 1 - Rx; By = int(SizeY) - 1 - Ry; break;
+        default: Bx = int(SizeX) - 1 - Ry; By = Rx;                  break;
+    }
+
+    const uint C = uint(Bx) * SizeY + uint(By);
+    const uint S0 = ColStarts[ColStartsBase + C];
+    const uint S1 = ColStarts[ColStartsBase + C + 1u];
+    if (S0 == S1)
+    {
+        return;   // baked column is all air
+    }
+
+    // Cell indexing -- same six mirrored lines as the level-0 kernel; the
+    // lattice is level-L cells but the brick arithmetic is identical.
+    const uint BxBrick = Ci >> 3;
+    const uint ByBrick = Cj >> 3;
+    const uint Lx = Ci & 7u;
+    const uint Ly = Cj & 7u;
+    const uint BricksX = DispatchColumns.x / 8u;
+    const uint FootprintIndex = BxBrick + BricksX * ByBrick;
+
+    const int RegionZCells = int(BricksZ) * 8;
+    const int ZCellBase = BrickZMin * 8;   // level-L cell units, like OriginVx
+
+    for (int K = 0; K < RegionZCells; ++K)
+    {
+        // Baked-local z of this cell's rep. GridOriginZ folds originZ() in,
+        // exactly as the CPU subtracts anchorVz + originZ() before at().
+        const int Rz = (ZCellBase + K) * Scale + Half - AnchorVz - GridOriginZ;
+        if (Rz < 0 || Rz >= int(SizeZ))
+        {
+            continue;   // at() answers MAT_AIR out of range; so does this
+        }
+
+        // Gather: the span containing Rz, if any. Spans are ascending and
+        // non-overlapping (columnRuns visits ascending z; air runs were
+        // dropped at build), so the first span starting past Rz ends it.
+        uint Mat = 0u;
+        for (uint S = S0; S < S1; ++S)
+        {
+            const uint Packed = Spans[S];
+            const int Z0 = int(Packed >> 20);
+            if (Rz < Z0)
+            {
+                break;
+            }
+            if (Rz < Z0 + int((Packed >> 8) & 0xfffu))
+            {
+                Mat = Packed & 0xffu;
+                break;
+            }
+        }
+        if (Mat == 0u)
+        {
+            continue;   // air in THIS instance falls through to the next
+        }
+
+        const uint BzBrick = uint(K) >> 3;
+        const uint Lz = uint(K) & 7u;
+        const uint BrickIndex = FootprintIndex * BricksZ + BzBrick;
+        const uint CellIndex = BrickIndex * 512u + (Lx + 8u * (Ly + 8u * Lz));
+        const uint Cell = OutCells[CellIndex];
+        // AIR ONLY -- same monotone rule, same upper-bit preservation, as the
+        // level-0 kernel above.
+        if ((Cell & 0xffu) == 0u)
+        {
+            OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
         }
     }
 }

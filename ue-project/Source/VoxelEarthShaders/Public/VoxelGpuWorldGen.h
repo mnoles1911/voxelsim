@@ -127,10 +127,23 @@ struct FVoxelGpuRegionRequest
 	// Terrain-lattice asset instances stamped into Cells between VoxelizeMain
 	// and the mesh chain, one dispatch per instance IN ARRAY ORDER -- that
 	// order is the byte-parity contract with the CPU's first-non-air-wins
-	// compose (AssetField::materialAtResolved), so the caller must fill it
-	// from instancesForRect order and nothing may sort it. Empty arrays skip
-	// the pass entirely, which is what keeps the verify/digest path (which
-	// never fills them) terrain-only by construction.
+	// compose (AssetField::materialAtResolved at level 0,
+	// FCoarseChunkGridSampler's shortlist walk at CoarseLevel > 0), so the
+	// caller must fill it from resolveForCompose order and nothing may sort
+	// it. Empty arrays skip the pass entirely, which is what keeps the
+	// verify/digest path (which never fills them) terrain-only by
+	// construction.
+	//
+	// AT CoarseLevel > 0 the stamp runs the rep-coordinate GATHER kernel
+	// (AssetStampCoarseMain): each level-L cell samples the instance at its
+	// coarseRep level-0 coordinate, nearest-neighbour, exactly as the terrain
+	// around it is sampled. The anchor fields keep their LEVEL-0 VOXEL units
+	// at every level; only the base they are made relative to follows the
+	// region: AnchorRelVx = anchorVx - OriginVx * 2^CoarseLevel (OriginVx is
+	// in level-L cell units, so OriginVx * 2^L is the region's level-0 base
+	// -- at level 0 this is the same subtraction it always was). AnchorVz
+	// stays absolute. Everything else -- origins, yaw, sizes, span tables --
+	// is filled identically at every level.
 	//
 	// AssetSpans packs one RLE run as z0:12 | len:12 | mat:8. AssetColStarts
 	// holds, per instance, SizeX*SizeY+1 prefix offsets into AssetSpans
@@ -138,8 +151,8 @@ struct FVoxelGpuRegionRequest
 	// share one span block -- the caller dedups by (bankId, seedIndex).
 	struct FAssetInstance
 	{
-		int32 AnchorRelVx = 0;   // anchor voxel minus OriginVx
-		int32 AnchorRelVy = 0;   // anchor voxel minus OriginVy
+		int32 AnchorRelVx = 0;   // anchor voxel minus OriginVx * 2^CoarseLevel
+		int32 AnchorRelVy = 0;   // anchor voxel minus OriginVy * 2^CoarseLevel
 		int32 AnchorVz = 0;      // absolute anchor voxel z
 		int32 GridOriginZ = 0;   // AssetGrid::originZ()
 		int32 RotOriginX = 0;    // AssetGrid::rotatedOriginX(YawQuarter)
