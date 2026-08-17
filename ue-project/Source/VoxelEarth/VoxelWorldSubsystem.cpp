@@ -16011,6 +16011,40 @@ FVoxelFineTileStreamer* UVoxelWorldSubsystem::GetFineTileStreamer() const
 	return Impl ? Impl->FineStreamer.Get() : nullptr;
 }
 
+// --- TASK #7 (detail-asset rendering) hook: accessor definitions -------------
+// See the matching declarations in the header for the ownership/threading
+// contract. These three are deliberately the ONLY thing this feature adds to
+// this file: the detail renderer lives entirely in
+// VoxelDetailAssetSubsystem.cpp and consumes the same field/amplifier/bank
+// objects the meshing workers already share.
+
+const vxc::AssetField* UVoxelWorldSubsystem::GetAssetField() const
+{
+	if (!Impl)
+	{
+		return nullptr;
+	}
+	// empty() is the "installed but useless" state (no layers, no species or
+	// no bank source); answering nullptr for it keeps the caller's null test
+	// the single gate.
+	const vxc::AssetField* Field = Impl->Voxels.assetField();
+	return (Field != nullptr && !Field->empty()) ? Field : nullptr;
+}
+
+const vxc::IAssetBankSource* UVoxelWorldSubsystem::GetAssetBankSource() const
+{
+	// The counting tap, not the raw library, so the caller's bank loads show
+	// up in the same voxel.Assets species histogram every other consumer
+	// feeds (FCountingBankSource's charter).
+	return (Impl && Impl->AssetBankTap.Inner != nullptr) ? &Impl->AssetBankTap : nullptr;
+}
+
+const vxc::Amplifier* UVoxelWorldSubsystem::GetWorldgenAmplifier() const
+{
+	return Impl ? &Impl->Voxels.amplifier() : nullptr;
+}
+// --- end TASK #7 hook ---------------------------------------------------------
+
 double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const
 {
 	if (!Impl)
