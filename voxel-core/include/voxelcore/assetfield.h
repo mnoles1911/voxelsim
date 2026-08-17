@@ -191,6 +191,10 @@ public:
         const AssetGrid* grid = nullptr;
         int64_t anchorVx = 0, anchorVy = 0, anchorVz = 0;
         uint8_t yawQuarter = 0;
+        // Which lattice this instance came from. Carried for attribution (the
+        // per-layer mesher counters exist because an aggregate count hid a
+        // whole missing layer); composition itself never reads it.
+        uint8_t layer = 0;
     };
 
     // Resolve every TERRAIN-LATTICE instance's grid once. Detail-lattice
@@ -218,6 +222,7 @@ public:
             r.anchorVy = floorDiv(inst.anchorYMm, int64_t(kVoxelSizeMm));
             r.anchorVz = inst.anchorVz;
             r.yawQuarter = inst.yawQuarter;
+            r.layer = inst.layer;
             out.push_back(r);
         }
         return out;

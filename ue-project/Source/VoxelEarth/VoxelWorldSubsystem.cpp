@@ -1927,6 +1927,23 @@ std::atomic<int64> GL0GridVerifyMismatches{0};
 std::atomic<uint64> GMesherChunksComposed{0};       // level-0 jobs that ran the resolve at all
 std::atomic<uint64> GMesherChunksWithInstances{0};  // ...and got >= 1 terrain instance
 std::atomic<uint64> GMesherInstancesResolved{0};    // total instances across them
+// Per layer, because the aggregate hid a whole missing layer at the alpine
+// lake: shrubs (L2) rendered while canopy (L1) never reached pixels, and the
+// combined count looked healthy throughout. Index = AssetLayer index; [3] is
+// unused (detail never survives resolveForCompose) but sized to the constant
+// so a layer-table change cannot write past it.
+std::atomic<uint64> GMesherInstancesByLayer[vxc::kAssetLayerCount] = {};
+// Tallest resolved grid seen, in voxels -- separates "no tall instances reach
+// the mesher" from "tall instances arrive and vanish later".
+std::atomic<uint64> GMesherTallestGridVox{0};
+// Exact admission's own accounting: of the level-0 footprints that ran the
+// z-range, how many found instances and how many actually RAISED the range
+// above the terrain answer. Near-zero raises beside hundreds of thousands of
+// mesher-side instances = crown chunks are never admitted and the mesher only
+// ever sees the surface slice of every tall tree.
+std::atomic<uint64> GAdmitFootprints{0};
+std::atomic<uint64> GAdmitFootprintsWithInstances{0};
+std::atomic<uint64> GAdmitFootprintsRaised{0};
 
 // Cross-job level-0 column-grid cache: MEASUREMENT ONLY, and deliberately so.
 //
@@ -5497,10 +5514,20 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		// what happened at the alpine lake, 2026-08-17: 16.5M requests, tree
 		// species in the histogram, zero trees on screen.
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("assets MESHER: %llu chunks ran resolve, %llu had instances, %llu instances total"),
+		       TEXT("assets MESHER: %llu chunks ran resolve, %llu had instances, %llu instances total "
+		            "(L0=%llu L1=%llu L2=%llu, tallest grid %llu vox)"),
 		       (unsigned long long)VoxelStreamAdmission::GMesherChunksComposed.load(std::memory_order_relaxed),
 		       (unsigned long long)VoxelStreamAdmission::GMesherChunksWithInstances.load(std::memory_order_relaxed),
-		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesResolved.load(std::memory_order_relaxed));
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesResolved.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[0].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[1].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[2].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets ADMIT: %llu footprints ran exact admission, %llu had instances, %llu raised the z-range"),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprints.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsWithInstances.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsRaised.load(std::memory_order_relaxed));
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
 		// anybody reading a log; the manifest index is the species name, and the
@@ -7370,8 +7397,15 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 				MaxCrownTop = FMath::Max(MaxCrownTop, R.anchorVz + int64(R.grid->originZ()) +
 				                                          int64(R.grid->sizeZ()) - 1);
 			}
+			VoxelStreamAdmission::GAdmitFootprints.fetch_add(1, std::memory_order_relaxed);
+			VoxelStreamAdmission::GAdmitFootprintsWithInstances.fetch_add(
+				Resolved.empty() ? 0 : 1, std::memory_order_relaxed);
 			if (MaxCrownTop != INT64_MIN)
 			{
+				if (MaxCrownTop + 1 > TopVoxelForMax)
+				{
+					VoxelStreamAdmission::GAdmitFootprintsRaised.fetch_add(1, std::memory_order_relaxed);
+				}
 				TopVoxelForMax = FMath::Max(TopVoxelForMax, MaxCrownTop + 1);
 			}
 		}
@@ -7398,6 +7432,51 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		return;
 	}
 	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed);
+	// CACHE ONLY WHAT WAS COMPUTED FROM RESIDENT TILES. The memo's charter --
+	// "a pure function of (Level, X, Y) and the immutable tile raster, so an
+	// entry never needs invalidating" -- was written before the fine tier
+	// existed, and the fine tier broke its premise in one specific way: the
+	// RASTER is immutable, but WHICH raster a column query answers from flips
+	// once, when the tile becomes resident. An entry computed during the
+	// seconds a 300 MB tile is still decoding is derived from the non-resident
+	// fallback (sea-level elevation, default climate, and -- through exact
+	// admission -- zero resolved instances), and with no invalidation and a
+	// distance-only prune it is wrong for the rest of the session for any
+	// camera that does not walk away and back. Computing WITHOUT caching keeps
+	// the answer available to this recompute pass and re-derives it on the
+	// next, and the moment residency flips the first post-residency answer is
+	// cached and genuinely permanent -- the charter holds again, restored
+	// rather than patched with invalidation hooks. No fine tier configured
+	// (FineStreamer null) means every query answers from always-resident
+	// coarse tiles and the old unconditional cache is exactly right.
+	if (FineStreamer)
+	{
+		const int64 LevelScale = int64(1) << Level;
+		const int64 SpanMm = int64(VoxelCoords::ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+		int64 X0Mm = int64(ChunkX) * SpanMm;
+		int64 Y0Mm = int64(ChunkY) * SpanMm;
+		int64 X1Mm = X0Mm + SpanMm - 1;
+		int64 Y1Mm = Y0Mm + SpanMm - 1;
+		// Level 0 resolves asset anchors up to the layer reach outside the
+		// footprint (exact admission); the residency question must cover the
+		// columns the answer was actually derived from.
+		if (Level == 0)
+		{
+			if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+			{
+				int64 ReachMm = 0;
+				for (const vxc::AssetLayer& L : Field->layers())
+				{
+					if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+				}
+				X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
+			}
+		}
+		if (!FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm))
+		{
+			return; // honest answer for THIS pass; not yet a fact worth memoizing
+		}
+	}
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
 }
 
@@ -9457,6 +9536,16 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(Resolved.empty() ? 0 : 1,
 			                                     std::memory_order_relaxed);
 			VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(Resolved.size()), std::memory_order_relaxed);
+			for (const vxc::AssetField::ResolvedAssetInstance& RI : Resolved)
+			{
+				VoxelStreamAdmission::GMesherInstancesByLayer[RI.layer & (vxc::kAssetLayerCount - 1)]
+				    .fetch_add(1, std::memory_order_relaxed);
+				const uint64 H = uint64(RI.grid->sizeZ());
+				uint64 Prev = VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed);
+				while (H > Prev &&
+				       !VoxelStreamAdmission::GMesherTallestGridVox.compare_exchange_weak(
+				           Prev, H, std::memory_order_relaxed)) {}
+			}
 			// Two instances of one species-seed in the same chunk share one
 			// prefix table -- the dedup FVoxelGpuRegionRequest's header
 			// promises.
@@ -10531,6 +10620,16 @@ void FVoxelWorldImpl::DispatchJobs()
 						VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(AResolved.size()),
 						                                   std::memory_order_relaxed);
 						VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
+						for (const vxc::AssetField::ResolvedAssetInstance& RI : AResolved)
+						{
+							VoxelStreamAdmission::GMesherInstancesByLayer[RI.layer & (vxc::kAssetLayerCount - 1)]
+							    .fetch_add(1, std::memory_order_relaxed);
+							const uint64 H = uint64(RI.grid->sizeZ());
+							uint64 Prev = VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed);
+							while (H > Prev &&
+							       !VoxelStreamAdmission::GMesherTallestGridVox.compare_exchange_weak(
+							           Prev, H, std::memory_order_relaxed)) {}
+						}
 					}
 					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
 					if (bComputeBand)
