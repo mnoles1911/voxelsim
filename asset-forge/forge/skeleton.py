@@ -740,8 +740,33 @@ def _radii(spec: dict, pos: np.ndarray, parent: np.ndarray) -> np.ndarray:
     # correct and is why the fit is re-measured rather than assumed after this.
     if float(get(spec, "trunk.taper")) > 0.0 and n:
         base_r = float(get(spec, "trunk.radius_base_m"))
+        # AND A SECOND FLOOR, AT THE READABLE MINIMUM, because the taper broke
+        # four trees in the engine before anybody saw one.
+        #
+        # 2026-08-17: the first placed trees rendered as a stump, an air gap and
+        # a floating crown. Cause: this taper pinched the stem to a SINGLE VOXEL
+        # at discrete heights -- cecropia at 7.7-7.9 m, cherry-blossom at
+        # 1.6-2.0 m, rowan and flowering-dogwood likewise -- and a 10 cm column
+        # is invisible, so the tree read as detached pieces. With trunk.taper 0
+        # the thinnest slice is 3 voxels on all four; with it, 1.
+        #
+        # THE TAPER PASS MEASURED FORM QUOTIENT, DIAMETER AT QUARTER HEIGHT, DBH
+        # AND TOTAL VOXELS, and claimed "no species gained a voxel". Every one of
+        # those is a bulk or an average. None of them can see a one-voxel pinch,
+        # so the defect passed the entire metric set. The measurement that would
+        # have caught it is MINIMUM WIDTH, and tools/trunkform.py now reports it.
+        #
+        # This floors the CEILING, not the radius: `radius` is still whatever
+        # Murray's law made it, so a genuine twig stays a twig. It only stops the
+        # taper from thinning load-bearing wood below what the lattice can draw.
+        # Distinct from the leg_thick floor that produced a dead row on 68
+        # species -- that one OVERRODE an authored value and hid it; this one
+        # bounds a derived one and is reported by the probe.
+        voxel_m = float(get(spec, "resolution_cm")) / 100.0
+        readable_r = 1.5 * voxel_m  # 3 voxels across, the project's own rule
         envelope_r = np.maximum(
-            base_r * envelope.taper_factor(spec, pos[:, 2]), tip_r)
+            base_r * envelope.taper_factor(spec, pos[:, 2]),
+            max(tip_r, min(readable_r, base_r)))
         radius = np.minimum(radius, envelope_r)
 
     # Root flare. Thickens the wood just above the ground, which is what reads

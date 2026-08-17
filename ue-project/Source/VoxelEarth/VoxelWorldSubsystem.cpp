@@ -5349,7 +5349,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			{
 				bProbedOnce = true;
 				const vxc::Amplifier& Amp = Voxels.amplifier();
-				int32 ColsWithAir = 0, ColsWithSolidAbove = 0, MaxRunVox = 0;
+				int32 ColsWithAir = 0, ColsWithSolidAbove = 0, MaxRunVox = 0, MaxInternalGap = 0;
 				// LastAnchorLocation is the streaming anchor in UE world units;
 				// VoxelSizeUU converts to voxels, which is what the amplifier takes.
 				const int64 CamVX = int64(FMath::FloorToDouble(LastAnchorLocation.X / VoxelCoords::VoxelSizeUU));
@@ -5362,12 +5362,28 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 						const vxc::ColumnSample Col = Amp.column(vx, vy);
 						const int64 TopSolid = vxc::topSolidVoxelZ(Col.surfaceMm);
 						int32 Run = 0; bool AnySolid = false;
+						// CONTIGUITY, not just presence. A tree that renders as a
+						// stump, an air gap and a floating crown is either a gap in
+						// the COMPOSITION or a gap in the MESHING, and those need
+						// opposite fixes. This walks the column and records the
+						// largest air gap that sits BETWEEN two solid voxels: zero
+						// means the world function built a continuous trunk and any
+						// break the eye sees is downstream of it.
+						int32 LastSolidZ = -1, FirstSolidZ = -1, WorstGap = 0;
 						// 25 m of headroom: cecropia bakes to 17.1 m.
 						for (int64 vz = TopSolid + 1; vz <= TopSolid + 250; ++vz)
 						{
 							if (Voxels.materialAt(vx, vy, vz) != vxc::MAT_AIR)
-							{ AnySolid = true; ++Run; }
+							{
+								AnySolid = true; ++Run;
+								const int32 Z = int32(vz - TopSolid);
+								if (FirstSolidZ < 0) { FirstSolidZ = Z; }
+								if (LastSolidZ >= 0 && Z - LastSolidZ - 1 > WorstGap)
+								{ WorstGap = Z - LastSolidZ - 1; }
+								LastSolidZ = Z;
+							}
 						}
+						if (AnySolid) { MaxInternalGap = FMath::Max(MaxInternalGap, WorstGap); }
 						++ColsWithAir;
 						if (AnySolid) { ++ColsWithSolidAbove; MaxRunVox = FMath::Max(MaxRunVox, Run); }
 					}
@@ -5377,6 +5393,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				            "above their own surface; tallest stack %d voxels (%.1f m). "
 				            "Zero here means nothing is stamped no matter how many banks were read."),
 				       ColsWithSolidAbove, ColsWithAir, MaxRunVox, MaxRunVox * 0.1f);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("assets PROBE: largest air gap BETWEEN solid voxels in any column: "
+				            "%d voxels (%.1f m). Zero means the world function is continuous and "
+				            "any visible break is in meshing or contrast, not composition."),
+				       MaxInternalGap, MaxInternalGap * 0.1f);
 			}
 		}
 	}
