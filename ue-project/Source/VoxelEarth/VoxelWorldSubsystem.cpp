@@ -2686,6 +2686,32 @@ struct FVoxelWorldImpl
 						}
 						else
 						{
+							// LOAD ONE BANK AT INSTALL, and it is not a warm-up.
+							// The counters below only move if something ASKS the
+							// library for a grid, so a run that composes nothing
+							// and a run that composes everything both report
+							// zeros at startup and are indistinguishable. Forcing
+							// one species proves the banks on disk are readable
+							// HERE, in this process, separating "the bank path is
+							// broken" from "nothing ever called it" -- which is
+							// exactly the distinction a silent no-op hides.
+							// Through the MANIFEST, not the folded table: seedsBaked
+							// is a fact about the files on disk and lives on
+							// AssetManifestSpecies. AssetSpecies is the
+							// policy-side row and carries only what placement
+							// needs -- bankId, layer, weights, bands. The bankId
+							// IS the manifest index, which is what makes the probe
+							// below address the same species the field would.
+							int Probe = -1;
+							const auto& MSpecies = AssetManifestData.species();
+							for (size_t i = 0; i < MSpecies.size(); ++i)
+							{
+								if (MSpecies[i].seedsBaked > 0 && MSpecies[i].terrainLattice)
+								{
+									Probe = AssetBanks.loadSpecies(uint16_t(i));
+									break;
+								}
+							}
 							Voxels.setAssetField(&AssetFieldObj);
 							UE_LOG(LogVoxelEarth, Log,
 							       TEXT("VoxelAssets: INSTALLED from %s -- %d layers, %d species placeable "
@@ -2694,6 +2720,16 @@ struct FVoxelWorldImpl
 							       *AssetDir, int(AssetManifestData.layers().size()), Stats.kept,
 							       Stats.detailEntities, Stats.tooRare, Stats.noBiome, Stats.withoutBanks,
 							       vxc::kWorldGenVersion);
+							const vxc::AssetBankLibrary::Stats B = AssetBanks.stats();
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: bank probe loaded %d seed grid(s); library so far "
+							            "%llu requests, %llu served, %llu files, %llu refused, %llu bytes. "
+							            "IF 'requests' IS STILL ~0 AFTER THE WORLD STREAMS, NOTHING IS "
+							            "COMPOSING ASSETS -- the field is installed but no generation path "
+							            "is asking it."),
+							       Probe, (unsigned long long)B.requests, (unsigned long long)B.servedGrids,
+							       (unsigned long long)B.filesLoaded, (unsigned long long)B.filesRefused,
+							       (unsigned long long)B.bytesResident);
 						}
 					}
 				}
@@ -5201,6 +5237,24 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// branch), so this pair is what tells us whether depth is costing RAM or
 	// merely bookkeeping + worker throughput. An O(tracked) scan at the periodic
 	// 5s log cadence only; never per-frame.
+	// THE ASSET TERM'S ONE HONEST QUESTION: is anything asking for it?
+	//
+	// A field can be installed, its manifest valid and its banks readable, and
+	// still no generation path may ever call bankGrid -- in which case the world
+	// renders exactly as it did before and NOTHING reports a fault. That is what
+	// happened on 2026-08-16: 117,006 instances resolved on this ground by
+	// vxc_assetprobe, the field logged INSTALLED, and the capture was
+	// indistinguishable from its own control at the pixel level. `requests` is
+	// the number that separates "composed and invisible" from "never composed".
+	if (Voxels.assetField() != nullptr)
+	{
+		const vxc::AssetBankLibrary::Stats B = AssetBanks.stats();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets: %llu bankGrid requests, %llu served, %llu files, %llu bytes resident"),
+		       (unsigned long long)B.requests, (unsigned long long)B.servedGrids,
+		       (unsigned long long)B.filesLoaded, (unsigned long long)B.bytesResident);
+	}
+
 	int32 DeepTracked = 0;
 	int32 DeepWithGeometry = 0;
 	for (const auto& Pair : ChunkRecords)
@@ -6630,7 +6684,38 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 	const int64 SpanVox = int64(ChunkEdgeVoxels) * (int64(1) << Level);
 	const int64 Vx0 = int64(ChunkX) * SpanVox;
 	const int64 Vy0 = int64(ChunkY) * SpanVox;
-	return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
+
+	// AND THE SAME ARGUMENT NOW APPLIES TO THE ASSET TERM (worldgen v24/v25).
+	//
+	// Everything above is about a bound that under-states the terrain. A tree
+	// is the same failure with a different cause: its trunk stands on ground
+	// this bound covers, but its CROWN reaches above it, and a crown above the
+	// bound is proven all-air and never generated. Trees with no tops, and
+	// nothing anywhere reports it -- which is why assetplacement.h says
+	// plainly that "a bound that is too tight is not a lost optimisation, it is
+	// terrain that never generates. A hole in the world."
+	//
+	// assetAwareSurfaceUpperBoundMm composes PER LAYER: each terrain layer that
+	// actually has a site in reach buys bound(rect (+) its own radius) + its own
+	// cap, and a layer with no site nearby costs a few hashes and no bound call.
+	// Every term is <= a single widest-layer call, so it is strictly tighter
+	// than the obvious composition and never admits less than the truth needs.
+	//
+	// WITH NO FIELD INSTALLED THIS IS THE OLD LINE, unchanged, which is what
+	// keeps every existing golden and the pinned digest valid.
+	const vxc::AssetField* Field = Voxels.assetField();
+	if (Field == nullptr || Field->empty())
+	{
+		return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
+	}
+
+	const vxc::AssetVoxelRect Rect{Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1};
+	return vxc::assetAwareSurfaceUpperBoundMm(
+		Field->seed(), Field->layers().data(), int(Field->layers().size()), Rect,
+		[this](int64_t Ax0, int64_t Ay0, int64_t Ax1, int64_t Ay1) -> int64_t
+		{
+			return Voxels.amplifier().surfaceUpperBoundMm(Ax0, Ay0, Ax1, Ay1);
+		});
 }
 
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
