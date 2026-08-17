@@ -210,4 +210,32 @@ struct AssetTableBuildStats {
 AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
                                                    std::vector<AssetSpecies>& speciesOut);
 
+// LOWER EACH LAYER'S maxHeightMm TO THE TALLEST THING ACTUALLY FILED ON IT.
+//
+// The authored cap is a bake-time CONTRACT and is deliberately loose; it is not
+// a description of the library. Worse, it cannot become one: assign_layer files
+// a species by SPACING among the layers whose cap admits it, so a 5 m shrub
+// authored at 30 m spacing lands on L0 and inherits its 60 m cap. Nothing in the
+// authoring path ties a layer's cap to its occupants.
+//
+// Every streaming bound is made of that cap -- assetTopAboveSurfaceMm returns
+// `maxHeightMm or nothing`, and the level-0 chunk z-range adds it to every
+// footprint. Measured 2026-08-17 against the shipped table: mean 16.49 extra
+// chunk layers admitted per footprint versus a 1.45-layer terrain shell, i.e.
+// ~12x the chunks the terrain needs, which collapsed streaming badly enough that
+// a 240 s settle reached 4,234 of 41,069 chunks. The early-out in
+// assetTopAboveSurfaceMm cannot help: L1 is a 5 m lattice at full density, so a
+// site is found in the first cell for 89.2% of footprints.
+//
+// SAFE BY CONSTRUCTION: this only ever lowers a cap to the maximum height of the
+// species already filed on that layer, so no asset that fits today stops fitting
+// and assetLayerAdmitsHeight still holds for everything in the manifest. A layer
+// with no baked occupants keeps its authored cap rather than collapsing to zero
+// -- too small is a hole in the world at a crown, which is the unsafe direction.
+//
+// Call this AFTER parsing and BEFORE handing layers to AssetField or to any
+// bound. The engine and vxc_assetprobe both call it, deliberately: a probe that
+// measured the authored caps would be pricing a world the engine does not run.
+void assetTightenLayerCaps(const AssetManifest& m, std::vector<AssetLayer>& layers);
+
 } // namespace vxc

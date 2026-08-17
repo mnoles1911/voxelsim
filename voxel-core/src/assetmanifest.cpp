@@ -194,6 +194,28 @@ AssetManifestError AssetManifest::parse(const uint8_t* blob, size_t bytes) {
     return AssetManifestError::kOk;
 }
 
+void assetTightenLayerCaps(const AssetManifest& m, std::vector<AssetLayer>& layers) {
+    // Tallest BAKED occupant per layer. seedsBaked > 0 because a species with no
+    // grids on disk composes nothing and must not hold a layer's ceiling up;
+    // terrainLattice because only those reach the world grid, and the detail
+    // layer's cap is not a streaming bound (see assetTopAboveSurfaceMm's skip).
+    int32_t tallest[kAssetLayerCount] = {};
+    for (const AssetManifestSpecies& s : m.species()) {
+        if (s.seedsBaked == 0 || !s.terrainLattice) continue;
+        if (s.layer >= kAssetLayerCount) continue;
+        if (s.heightMm > tallest[s.layer]) tallest[s.layer] = s.heightMm;
+    }
+    for (size_t li = 0; li < layers.size() && li < size_t(kAssetLayerCount); ++li) {
+        AssetLayer& L = layers[li];
+        if (!L.terrainLattice) continue;
+        const int32_t t = tallest[li];
+        // Never raise, and never collapse an unoccupied layer to zero: an empty
+        // layer keeps its authored cap so a manifest that under-reports heights
+        // degrades to today's behaviour instead of clipping crowns.
+        if (t > 0 && t < L.maxHeightMm) L.maxHeightMm = t;
+    }
+}
+
 AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
                                                    std::vector<AssetSpecies>& speciesOut) {
     AssetTableBuildStats st;

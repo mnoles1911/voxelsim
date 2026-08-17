@@ -2672,8 +2672,22 @@ struct FVoxelWorldImpl
 						const vxc::AssetTableBuildStats Stats =
 							vxc::assetSpeciesTableFromManifest(AssetManifestData, AssetSpeciesTable);
 						AssetBanks.configure(&AssetManifestData, TCHAR_TO_UTF8(*FPaths::Combine(AssetDir, TEXT("banks"))));
-						AssetFieldObj.setLayers(AssetManifestData.layers().data(),
-						                        int(AssetManifestData.layers().size()));
+						// TIGHTEN BEFORE INSTALL, never after: every bound downstream
+						// is made of these caps, so the field must never see the
+						// authored ones. vxc_assetprobe calls the same function for
+						// the same reason -- see assetTightenLayerCaps.
+						AssetLayersTightened = AssetManifestData.layers();
+						vxc::assetTightenLayerCaps(AssetManifestData, AssetLayersTightened);
+						for (size_t Li = 0; Li < AssetLayersTightened.size(); ++Li)
+						{
+							const vxc::AssetLayer& Authored = AssetManifestData.layers()[Li];
+							if (!Authored.terrainLattice) { continue; }
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: layer L%d cap %d -> %d mm (tallest baked occupant)."),
+							       int(Li), Authored.maxHeightMm, AssetLayersTightened[Li].maxHeightMm);
+						}
+						AssetFieldObj.setLayers(AssetLayersTightened.data(),
+						                        int(AssetLayersTightened.size()));
 						AssetFieldObj.setSpecies(AssetSpeciesTable.data(), int(AssetSpeciesTable.size()));
 						AssetBankTap.Inner = &AssetBanks;
 						AssetBankTap.Resize(AssetManifestData.species().size());
@@ -2714,6 +2728,36 @@ struct FVoxelWorldImpl
 									break;
 								}
 							}
+							// See AssetTallestTerrainVox's declaration: the streaming
+							// bound must come from what the library BAKES, not from
+							// what the layer permits.
+							int64 TallestMm = 0;
+							for (const auto& S : MSpecies)
+							{
+								if (S.seedsBaked > 0 && S.terrainLattice && S.heightMm > TallestMm)
+								{
+									TallestMm = S.heightMm;
+								}
+							}
+							int64 CapMm = 0;
+							for (const vxc::AssetLayer& L : AssetManifestData.layers())
+							{
+								if (L.terrainLattice && L.maxHeightMm > CapMm) { CapMm = L.maxHeightMm; }
+							}
+							// A manifest that reports no heights at all is stale, not
+							// empty: fall back to the cap rather than silently bound
+							// the world at zero and punch holes through every crown.
+							const int64 UseMm = (TallestMm > 0) ? FMath::Min(TallestMm, CapMm) : CapMm;
+							AssetTallestTerrainVox =
+								(UseMm > 0) ? (vxc::floorDiv(UseMm, int64(vxc::kVoxelSizeMm)) + 1) : 0;
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: tallest baked terrain-lattice asset %lld mm "
+							            "(layer cap %lld mm) -> streaming bound widened by %lld voxels "
+							            "(%.1f level-0 chunk layers). The CAP would have cost %lld."),
+							       (long long)TallestMm, (long long)CapMm,
+							       (long long)AssetTallestTerrainVox,
+							       double(AssetTallestTerrainVox) / double(VoxelCoords::ChunkEdgeVoxels),
+							       (long long)(CapMm > 0 ? vxc::floorDiv(CapMm, int64(vxc::kVoxelSizeMm)) + 1 : 0));
 							Voxels.setAssetField(&AssetFieldObj);
 							UE_LOG(LogVoxelEarth, Log,
 							       TEXT("VoxelAssets: INSTALLED from %s -- %d layers, %d species placeable "
@@ -2845,6 +2889,45 @@ struct FVoxelWorldImpl
 	// as TileDir and FineTileDir above, deliberately.
 	vxc::AssetManifest AssetManifestData;
 	vxc::AssetBankLibrary AssetBanks;
+
+	// THE TALLEST ASSET THAT ACTUALLY EXISTS, in level-0 voxels above its anchor,
+	// and it is NOT the layer cap.
+	//
+	// AssetLayer::maxHeightMm is a CONTRACT with the bake step, deliberately
+	// generous: 60 m on L0, 34 m on L1. The tallest thing the library actually
+	// bakes is a ~17 m cecropia. Both the streaming z-range and the brick skip
+	// need "how much solid can stand above this ground", and taking that from the
+	// cap instead of from the bake costs 600 voxels of empty sky per footprint --
+	// ~18 extra level-0 chunk layers, on rings where the sky-band trim's analytic
+	// bound does NOT bind (levels 0-1) and so cannot claw it back.
+	//
+	// THIS IS THE BUG THAT MADE THE FIRST TREE SCREENSHOTS LOOK BROKEN, 2026-08-17.
+	// Measured, same pose and seed, only -VoxelAssetDir differing: assets OFF
+	// settled at 41,069 chunks / 33.4M quads with an empty queue; assets ON was
+	// still at 2,228 chunks / 1.8M quads with 96 jobs in flight and ~1,600
+	// pending when the shutter fired. The picture was a 5%-loaded world, and it
+	// read exactly like broken geometry -- ground missing, trunks cut off,
+	// foliage floating in the few chunks that happened to be resident. Nothing
+	// was wrong with placement, composition or meshing.
+	//
+	// Read from the manifest, which is the same authority assetLayerAdmitsHeight
+	// validates the bake against, and restricted to terrainLattice species with
+	// seedsBaked > 0 for parity with the two call sites. Still clamped to the
+	// layer cap: this may only ever TIGHTEN the old bound, never widen it, so the
+	// safe direction (too many chunks) stays the failure mode if the manifest is
+	// stale. Zero means "no asset field installed" and both call sites add nothing.
+	//
+	// Used by SkipBrick only. The streaming z-range takes the PER-FOOTPRINT
+	// assetTopAboveSurfaceMm instead: measured over 63,001 footprints, that gives
+	// 89.2% of them the L1 cap (25 m) rather than this global 45 m maximum, and
+	// the z-range is memoized per footprint so it can afford the query. SkipBrick
+	// runs 64 times per chunk on a worker and cannot.
+	int64 AssetTallestTerrainVox = 0;
+
+	// The layer table the FIELD sees: manifest caps lowered to each layer's
+	// tallest baked occupant. Must outlive AssetFieldObj (setLayers copies, but
+	// this is the authored-vs-installed seam and it should be inspectable).
+	std::vector<vxc::AssetLayer> AssetLayersTightened;
 
 	// WHICH SPECIES ARE ACTUALLY COMPOSING, and it is a decorator so voxel-core
 	// needs no change to answer it.
@@ -5350,6 +5433,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				bProbedOnce = true;
 				const vxc::Amplifier& Amp = Voxels.amplifier();
 				int32 ColsWithAir = 0, ColsWithSolidAbove = 0, MaxRunVox = 0, MaxInternalGap = 0;
+				int64 TallestVX = 0, TallestVY = 0, TallestBaseZ = 0;
+				int32 TallestFirst = -1;
 				// LastAnchorLocation is the streaming anchor in UE world units;
 				// VoxelSizeUU converts to voxels, which is what the amplifier takes.
 				const int64 CamVX = int64(FMath::FloorToDouble(LastAnchorLocation.X / VoxelCoords::VoxelSizeUU));
@@ -5385,7 +5470,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 						}
 						if (AnySolid) { MaxInternalGap = FMath::Max(MaxInternalGap, WorstGap); }
 						++ColsWithAir;
-						if (AnySolid) { ++ColsWithSolidAbove; MaxRunVox = FMath::Max(MaxRunVox, Run); }
+						if (AnySolid)
+						{
+							++ColsWithSolidAbove;
+							if (Run > MaxRunVox)
+							{
+								// WHERE the tallest thing is, so a camera can be put next
+								// to it. Every capture so far has been aimed by guesswork at
+								// a landscape and then squinted at; a single tree at 10 m
+								// settles 'is the trunk missing or merely dark' outright.
+								MaxRunVox = Run; TallestVX = vx; TallestVY = vy;
+								TallestBaseZ = TopSolid; TallestFirst = FirstSolidZ;
+							}
+						}
 					}
 				}
 				UE_LOG(LogVoxelPerf, Log,
@@ -5398,6 +5495,46 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				            "%d voxels (%.1f m). Zero means the world function is continuous and "
 				            "any visible break is in meshing or contrast, not composition."),
 				       MaxInternalGap, MaxInternalGap * 0.1f);
+				// HOW WIDE IS THE CROWN, ACTUALLY?
+				//
+				// A cecropia bakes 8.1 x 8.7 m of foliage, which spans THREE
+				// 3.2 m chunks. Instances are resolved once per chunk from that
+				// chunk's own rect, and if the dilation does not reach far enough
+				// the chunks either side of the anchor resolve NOTHING -- leaving
+				// a bare pole with a stub of crown at the axis, which is exactly
+				// what the capture shows. This walks outward from the tallest
+				// column at crown height and reports where solid stops.
+				if (MaxRunVox > 0)
+				{
+					const int64 CrownZ = TallestBaseZ + FMath::Max(1, MaxRunVox * 3 / 4);
+					int32 ReachVox = 0;
+					for (int32 R = 1; R <= 60; ++R)
+					{
+						bool AnyAtR = false;
+						for (int32 K = -R; K <= R && !AnyAtR; ++K)
+						{
+							if (Voxels.materialAt(TallestVX + K, TallestVY + R, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX + K, TallestVY - R, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX + R, TallestVY + K, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX - R, TallestVY + K, CrownZ) != vxc::MAT_AIR)
+							{ AnyAtR = true; }
+						}
+						if (AnyAtR) { ReachVox = R; }
+					}
+					UE_LOG(LogVoxelPerf, Log,
+					       TEXT("assets PROBE: crown reach at z=%lld is %d voxels (%.1f m) from the "
+					            "trunk axis. The baked crown is ~40 voxels (4.0 m); anything much "
+					            "under that is instances missing in neighbouring chunks."),
+					       (long long)CrownZ, ReachVox, ReachVox * 0.1f);
+				}
+
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("assets PROBE: tallest stack at voxel (%lld,%lld) = world "
+				            "(%.1f,%.1f) m, ground voxel z=%lld, first solid +%d above it. "
+				            "Spawn there to photograph ONE tree."),
+				       (long long)TallestVX, (long long)TallestVY,
+				       double(TallestVX) * 0.1, double(TallestVY) * 0.1,
+				       (long long)TallestBaseZ, TallestFirst);
 			}
 		}
 	}
@@ -7008,20 +7145,35 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// 1089 columns carried solid material above their own surface with stacks to
 	// 10.7 m, in a frame that showed bare ground.
 	//
-	// Raised by the tallest TERRAIN-LATTICE layer cap rather than by a per-site
-	// query, deliberately: this runs per footprint on the streaming path, the
-	// caps are 34 m (L1) and 60 m (L0), and admitting a few extra chunks is the
-	// SAFE direction. The other direction is a hole in the world.
+	// Raised by the tallest asset the library ACTUALLY BAKES rather than by the
+	// layer cap, and the difference is not cosmetic: the caps are 34 m (L1) and
+	// 60 m (L0) against a ~17 m tallest bake, and this runs per footprint on the
+	// streaming path. Widening every level-0 footprint by the cap added ~18 chunk
+	// layers of guaranteed-empty sky each -- and levels 0-1 are exactly where the
+	// sky-band trim's analytic bound does NOT bind, so nothing downstream removed
+	// them again. Measured cost of getting this wrong: 2,228 chunks resident and
+	// still climbing where the same pose without assets settled at 41,069. See
+	// AssetTallestTerrainVox's declaration for the full A/B.
+	//
+	// Still the safe direction, just tight: the value is clamped to the cap at
+	// install, so this can only ever admit FEWER chunks than the cap rule did and
+	// never fewer than the tallest thing that can stand here.
+	//
+	// PER FOOTPRINT, not the global maximum. assetTopAboveSurfaceMm answers "the
+	// tallest any asset intersecting THIS rect can reach", which is the L1 cap for
+	// 89.2% of footprints and the L0 cap for 10.7% -- measured over 63,001
+	// footprints, mean 13.48 extra chunk layers against 14 for the global rule.
+	// Affordable here specifically because this function is memoized per footprint
+	// (FootprintChunkZRangeCached) and because the query early-outs on the first
+	// site it finds in each layer; see assetTopAboveSurfaceMm's own doc comment.
 	if (const vxc::AssetField* Field = Voxels.assetField())
 	{
-		int64 TallestMm = 0;
-		for (const vxc::AssetLayer& L : Field->layers())
+		const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
+		const int32 TopMm = vxc::assetTopAboveSurfaceMm(
+			Field->seed(), Field->layers().data(), int(Field->layers().size()), FootRect);
+		if (TopMm > 0)
 		{
-			if (L.terrainLattice && L.maxHeightMm > TallestMm) { TallestMm = L.maxHeightMm; }
-		}
-		if (TallestMm > 0)
-		{
-			TopVoxelMax += vxc::floorDiv(TallestMm, int64(vxc::kVoxelSizeMm)) + 1;
+			TopVoxelMax += vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1;
 		}
 	}
 
@@ -9738,6 +9890,9 @@ void FVoxelWorldImpl::DispatchJobs()
 		// Ring-boundary skirt mask -- computed here on the game thread where the
 		// anchor and RingPresets are live, then baked into this job's mesh.
 		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
+		// Same snapshot-on-the-game-thread shape as RingSkirtMask above: constant
+		// after install, but read here so the worker never touches Impl state.
+		const int64 AssetTallestVoxSnapshot = AssetTallestTerrainVox;
 
 		// --- The GPU fork (Wave D / D4) -------------------------------------
 		//
@@ -9828,7 +9983,8 @@ void FVoxelWorldImpl::DispatchJobs()
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask]()
+			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask,
+			 AssetTallestVoxSnapshot]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -10115,19 +10271,16 @@ void FVoxelWorldImpl::DispatchJobs()
 						// terrain-lattice cap for the same reason the chunk z-range
 						// is: too tight here is a tree with no top, and the cost of
 						// too loose is a few extra bricks meshed to nothing.
+						//
+						// The BAKED height, not the layer cap, for the reason spelled
+						// out at AssetTallestTerrainVox: the cap is 60 m against a
+						// ~17 m tallest bake, and this test runs 64 times per chunk.
+						// Unlike the z-range above, being loose here only wastes
+						// meshing work rather than admitting chunks -- but it is the
+						// same number and it should not be wrong in two places.
 						if (AField != nullptr && !AInstsPtr->empty())
 						{
-							int64 TallestVox = 0;
-							for (const vxc::AssetLayer& L : AField->layers())
-							{
-								if (L.terrainLattice && L.maxHeightMm > 0)
-								{
-									TallestVox = FMath::Max<int64>(
-										TallestVox,
-										vxc::floorDiv(int64(L.maxHeightMm), int64(vxc::kVoxelSizeMm)));
-								}
-							}
-							MaxTopInterior += TallestVox;
+							MaxTopInterior += AssetTallestVoxSnapshot;
 						}
 						if (InteriorZMin > MaxTopInterior + 1)
 						{

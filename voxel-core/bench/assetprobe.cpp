@@ -116,6 +116,20 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::vector<AssetLayer> layers = manifest.layers();
+    // Before any override or census: the engine tightens caps to their tallest
+    // baked occupant at install, so a probe reading the authored caps would be
+    // pricing a world nobody runs. Printed rather than applied silently -- the
+    // gap between the two IS the finding.
+    {
+        std::vector<AssetLayer> authored = layers;
+        assetTightenLayerCaps(manifest, layers);
+        std::printf("layer caps (authored -> tightened to tallest baked occupant):");
+        for (size_t li = 0; li < layers.size(); ++li) {
+            if (!layers[li].terrainLattice) continue;
+            std::printf(" L%zu %d->%d mm", li, authored[li].maxHeightMm, layers[li].maxHeightMm);
+        }
+        std::printf("\n");
+    }
     bool overridden = false;
     if (opt.l1capMm > 0) { layers[1].maxHeightMm = opt.l1capMm; overridden = true; }
     if (opt.l0capMm > 0) { layers[0].maxHeightMm = opt.l0capMm; overridden = true; }
