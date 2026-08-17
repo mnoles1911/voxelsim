@@ -1944,6 +1944,15 @@ std::atomic<uint64> GMesherTallestGridVox{0};
 std::atomic<uint64> GAdmitFootprints{0};
 std::atomic<uint64> GAdmitFootprintsWithInstances{0};
 std::atomic<uint64> GAdmitFootprintsRaised{0};
+// The last two gates a crown chunk can die at. A CROWN chunk here means a
+// level-0 CPU job whose interior starts above every terrain column top in its
+// own grid AND whose resolved list is non-empty -- i.e. the only thing it can
+// possibly contain is asset voxels. If band skips dwarf crown meshes, the
+// dispatch skip is eating them; if crown chunks mesh but produce zero quads,
+// the sampler/mesher is; if they produce quads, the loss is apply/draw side.
+std::atomic<uint64> GBandSkipAirL0{0};        // level-0 air-skips by BandProvesChunkEmpty (dispatch site)
+std::atomic<uint64> GCrownChunksMeshed{0};    // CPU crown chunks that ran MeshChunkBricks
+std::atomic<uint64> GCrownChunksWithQuads{0}; // ...and produced >= 1 quad
 
 // Cross-job level-0 column-grid cache: MEASUREMENT ONLY, and deliberately so.
 //
@@ -5528,6 +5537,11 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprints.load(std::memory_order_relaxed),
 		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsWithInstances.load(std::memory_order_relaxed),
 		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsRaised.load(std::memory_order_relaxed));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets CROWN: %llu L0 air-skips by band, %llu crown chunks CPU-meshed, %llu with quads"),
+		       (unsigned long long)VoxelStreamAdmission::GBandSkipAirL0.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GCrownChunksMeshed.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GCrownChunksWithQuads.load(std::memory_order_relaxed));
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
 		// anybody reading a log; the manifest index is the species name, and the
@@ -10146,6 +10160,10 @@ void FVoxelWorldImpl::DispatchJobs()
 					++BuriedSkipsSinceLog;
 					BuriedSkipsByLevelSinceLog[0] += 1;
 					(bAllAir ? BuriedSkipAirSinceLog : BuriedSkipSolidSinceLog) += 1;
+					if (bAllAir)
+					{
+						VoxelStreamAdmission::GBandSkipAirL0.fetch_add(1, std::memory_order_relaxed);
+					}
 				}
 			}
 		}
@@ -10792,6 +10810,28 @@ void FVoxelWorldImpl::DispatchJobs()
 					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask, SkipBrick);
 					Result.BricksSkippedAir = uint16(SkippedAir);
 					Result.BricksSkippedSolid = uint16(SkippedSolid);
+					// Crown-chunk discriminator (see GCrownChunksMeshed): this
+					// job's interior starts above every terrain column top in
+					// its own grid, and instances were resolved -- so any quad
+					// it emits is asset material, and zero quads means the
+					// compose path lost the crown between the list and the
+					// mesher.
+					if (!AResolved.empty() && (bComputeBand || bBrickSkip))
+					{
+						int64 MaxTerrainTop = INT64_MIN;
+						for (int32 I = 0; I < GridCells; ++I)
+						{
+							MaxTerrainTop = FMath::Max(MaxTerrainTop, ScratchTopSolid[I]);
+						}
+						if (ChunkBaseVZ > MaxTerrainTop)
+						{
+							VoxelStreamAdmission::GCrownChunksMeshed.fetch_add(1, std::memory_order_relaxed);
+							if (Result.Quads.Num() > 0)
+							{
+								VoxelStreamAdmission::GCrownChunksWithQuads.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
+					}
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
