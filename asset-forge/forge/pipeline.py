@@ -173,6 +173,106 @@ def _drop_orphans(grid: VoxelGrid) -> int:
     return removed
 
 
+def _bridge_corner_joins(grid: VoxelGrid) -> int:
+    """Turn corner/edge contacts between pieces into face contacts. Returns
+    how many voxels were added.
+
+    THE MESHER DRAWS FACES, AND EVERY CONNECTIVITY RULE HERE COUNTS CORNERS.
+    `_drop_orphans` labels at 26-connectivity, so a crown whose thinning left
+    chains of diagonally-touching voxels is "one piece" to every check in this
+    package -- and renders as dotted speckle hanging beside the tree, because
+    two voxels sharing only a corner share no face for the mesher to close.
+    Measured on the shipped banks (2026-08-17): 124 of 173 were one piece at
+    26-connectivity and HUNDREDS of pieces at face-connectivity -- casuarina
+    17% of its voxels, the conifers 3-5%, read on screen as floating leaf bits
+    with gaps up to 0.9 m. That is a defect the owner saw in the first tree
+    screenshot ever taken, and no check caught it because every check agreed
+    with the lenient reading.
+
+    Deleting the detached material is the wrong repair: it is a fifth of a
+    casuarina's foliage, and per-voxel thinning artifacts are a known way this
+    package quietly ruins silhouettes (the 2 cm thinning defect). Instead every
+    diagonal contact gains the one voxel that makes it a face contact -- for a
+    2-D diagonal (1,1,0) one step voxel; a 3-D corner (1,1,1) resolves over two
+    sweeps, first to an edge contact, then to a face. Material is copied from
+    the fragment side of the contact, so a leaf joins by leaf and bark by bark.
+    The sweep repeats until face-connectivity reports one piece, which it must:
+    26-connectivity already proved a corner path exists to the main body, and
+    each sweep converts every link of every such path one step closer to faces.
+    The guard is against a grid that was NOT one piece at 26-conn (rocks'
+    deliberate rubble never comes through here; `_drop_orphans` runs first for
+    trees), where corner chains to the main body need not exist: the loop stops
+    when a sweep adds nothing rather than trusting the precondition.
+
+    Cost honesty, per the silent-no-op rule: the count of added voxels goes to
+    stats as `bridges_added`. Expected magnitude is 0.5-2% of the asset for a
+    thinned conifer and 0 for a broadleaf whose blades are solid; a spec adding
+    much more than that is shedding structure sideways and should be re-tuned,
+    not silently welded.
+    """
+    ndimage = _ndimage()
+    face = ndimage.generate_binary_structure(3, 1)
+    added = 0
+    # Diagonal neighbourhood: every 26-offset that is not a face offset.
+    diagonals = [(dx, dy, dz)
+                 for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+                 if abs(dx) + abs(dy) + abs(dz) >= 2]
+    while True:
+        occ = grid.data != 0
+        lab, n = ndimage.label(occ, structure=face)
+        if n <= 1:
+            return added
+        added_this_sweep = 0
+        for dx, dy, dz in diagonals:
+            occ = grid.data != 0
+            lab, n = ndimage.label(occ, structure=face)
+            if n <= 1:
+                return added
+            # Voxels whose neighbour at (dx,dy,dz) is occupied AND in a
+            # different face-component: a corner/edge contact across pieces.
+            here = lab[max(dx, 0) or None: grid.data.shape[0] + min(dx, 0) or None,
+                       max(dy, 0) or None: grid.data.shape[1] + min(dy, 0) or None,
+                       max(dz, 0) or None: grid.data.shape[2] + min(dz, 0) or None]
+            there = lab[max(-dx, 0) or None: grid.data.shape[0] + min(-dx, 0) or None,
+                        max(-dy, 0) or None: grid.data.shape[1] + min(-dy, 0) or None,
+                        max(-dz, 0) or None: grid.data.shape[2] + min(-dz, 0) or None]
+            contact = (here > 0) & (there > 0) & (here != there)
+            if not contact.any():
+                continue
+            xs, ys, zs = np.nonzero(contact)
+            # Back to full-grid coordinates of the "here" voxel.
+            xs = xs + max(dx, 0)
+            ys = ys + max(dy, 0)
+            zs = zs + max(dz, 0)
+            # The step voxel: advance the first nonzero axis only, which is
+            # face-adjacent to `here` and strictly closer to `there`.
+            if dx != 0:
+                bx, by, bz = xs - dx, ys, zs
+            elif dy != 0:
+                bx, by, bz = xs, ys - dy, zs
+            else:
+                bx, by, bz = xs, ys, zs - dz
+            empty = grid.data[bx, by, bz] == 0
+            bx, by, bz = bx[empty], by[empty], bz[empty]
+            if bx.size == 0:
+                continue
+            # Material from the fragment side of each contact, deduplicated --
+            # np.unique keeps the first writer per cell deterministic.
+            flat = (bx * grid.data.shape[1] + by) * grid.data.shape[2] + bz
+            _, first = np.unique(flat, return_index=True)
+            bx, by, bz = bx[first], by[first], bz[first]
+            grid.data[bx, by, bz] = grid.data[xs[empty][first],
+                                              ys[empty][first],
+                                              zs[empty][first]]
+            added += int(bx.size)
+            added_this_sweep += int(bx.size)
+        if added_this_sweep == 0:
+            # No corner contacts left but still >1 piece: genuinely separated
+            # material with a real air gap. Not this pass's job -- leave it for
+            # the orphan rule rather than invent geometry across open air.
+            return added
+
+
 def _single_piece(grid: VoxelGrid) -> tuple[int, list[int]]:
     """Reduce a rock to ONE connected lump. Returns (voxels deleted, big ones).
 
@@ -290,8 +390,12 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         parts = gen_out.get("tags")
         part_names = partslib.names() if parts is not None else None
         pieces_built = _piece_count(grid)
+        bridges = 0
         if kind in BOULDER_KINDS:
             orphans, airborne_kept = _single_piece(grid)
+            # Rocks shatter at face-connectivity the same way crowns do --
+            # hero-tor-stack was 35 face-pieces inside one 26-conn lump.
+            bridges = _bridge_corner_joins(grid)
         need_mb = dense_bytes(grid.shape) / 1e6
         t_raster = time.perf_counter()
     else:
@@ -316,6 +420,7 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
             grid, skel, live, origin, rng)
         pieces_built = _piece_count(grid)
         orphans = _drop_orphans(grid)
+        bridges = _bridge_corner_joins(grid)
         t_raster = time.perf_counter()
 
     # The tags ride along, cropped by the same box -- see VoxelGrid.crop.
@@ -338,6 +443,10 @@ def build(spec: dict, seed: int, *, connectivity: bool = True,
         # Kept visible: a spec shedding thousands is badly tuned even
         # though the asset that comes out is watertight.
         "orphans_removed": orphans,
+        # Voxels ADDED to turn corner-only contacts into face contacts, so the
+        # mesher sees the same single piece the 26-conn checks see. See
+        # _bridge_corner_joins for why deleting was the wrong repair.
+        "bridges_added": bridges,
         # Detached pieces too big to delete quietly. Non-empty means the spec is
         # shedding structure, not debris -- see _single_piece and _drop_orphans.
         "airborne_kept": airborne_kept,
