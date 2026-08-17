@@ -161,6 +161,78 @@ public:
         return out;
     }
 
+    // One instance with its bank grid ALREADY RESOLVED, so sampling it costs
+    // arithmetic and an array read -- no lock, no map, no source query.
+    //
+    // Why this exists: materialAt below goes through materialOfInstance, which
+    // asks the bank source for the grid ON EVERY CALL, and the disk-backed
+    // source answers under one global mutex. The level-0 mesher samples ~64k
+    // voxels per chunk across ~96 worker threads; measured 2026-08-17, a
+    // single capture issued 26.4M bankGrid calls and the workers convoyed on
+    // that mutex badly enough to hold streaming at ~17 chunks/s. The grid for
+    // a given (bankId, seedIndex) never changes within a job, so resolving it
+    // once per chunk is the whole fix, and composition is byte-identical: the
+    // list preserves instancesForRect order, so first-non-air-wins picks the
+    // same winner.
+    struct ResolvedAssetInstance {
+        const AssetGrid* grid = nullptr;
+        int64_t anchorVx = 0, anchorVy = 0, anchorVz = 0;
+        uint8_t yawQuarter = 0;
+    };
+
+    // Resolve every TERRAIN-LATTICE instance's grid once. Detail-lattice
+    // instances are dropped here for the same reason materialOfInstance answers
+    // MAT_AIR for them -- they never enter the world lattice -- and dropping
+    // them up front also removes them from the per-voxel loop entirely (84% of
+    // resolved instances are detail ground cover; iterating them per voxel to
+    // skip them was most of the loop). Grids that are missing, invalid or off
+    // the world lattice are dropped exactly where materialOfInstance would have
+    // answered MAT_AIR for them, so the survivors are precisely the instances
+    // that can put a voxel anywhere.
+    std::vector<ResolvedAssetInstance>
+    resolveForCompose(const std::vector<AssetInstance>& instances) const {
+        std::vector<ResolvedAssetInstance> out;
+        if (banks_ == nullptr) return out;
+        out.reserve(instances.size());
+        for (const AssetInstance& inst : instances) {
+            if (size_t(inst.layer) >= layers_.size()) continue;
+            if (!layers_[inst.layer].terrainLattice) continue;
+            const AssetGrid* g = banks_->bankGrid(inst.bankId, inst.seedIndex);
+            if (g == nullptr || !g->valid() || !g->onTerrainLattice()) continue;
+            ResolvedAssetInstance r;
+            r.grid = g;
+            r.anchorVx = floorDiv(inst.anchorXMm, int64_t(kVoxelSizeMm));
+            r.anchorVy = floorDiv(inst.anchorYMm, int64_t(kVoxelSizeMm));
+            r.anchorVz = inst.anchorVz;
+            r.yawQuarter = inst.yawQuarter;
+            out.push_back(r);
+        }
+        return out;
+    }
+
+    // materialAt over a pre-resolved list. Same transform, same first-non-air
+    // rule, same answers as materialAt(instances, ...) -- the ONLY difference
+    // is where the grid pointer comes from. Static because it deliberately
+    // cannot touch the bank source.
+    static MaterialId materialAtResolved(const std::vector<ResolvedAssetInstance>& resolved,
+                                         int64_t vx, int64_t vy, int64_t vz) {
+        for (const ResolvedAssetInstance& r : resolved) {
+            // Identical arithmetic to materialOfInstance, against the cached
+            // grid. atYaw answers MAT_AIR out of range, so the only guard
+            // needed is the int32 narrowing one.
+            const int64_t rx = vx - r.anchorVx - int64_t(r.grid->rotatedOriginX(r.yawQuarter));
+            const int64_t ry = vy - r.anchorVy - int64_t(r.grid->rotatedOriginY(r.yawQuarter));
+            const int64_t rz = vz - r.anchorVz - int64_t(r.grid->originZ());
+            if (rx < INT32_MIN || rx > INT32_MAX || ry < INT32_MIN || ry > INT32_MAX ||
+                rz < INT32_MIN || rz > INT32_MAX)
+                continue;
+            const MaterialId m = r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
+                                               static_cast<int32_t>(rz), r.yawQuarter);
+            if (m != MAT_AIR) return m;
+        }
+        return MAT_AIR;
+    }
+
     // The material one instance puts at a world voxel, or MAT_AIR.
     //
     // Only TERRAIN-LATTICE instances answer anything. A detail-lattice species

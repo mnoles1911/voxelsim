@@ -2929,6 +2929,31 @@ struct FVoxelWorldImpl
 	// this is the authored-vs-installed seam and it should be inspectable).
 	std::vector<vxc::AssetLayer> AssetLayersTightened;
 
+	// How much a TERRAIN-ONLY band extremum must rise before it may claim
+	// emptiness for this footprint, in level-0 voxels. Zero without an asset
+	// field. The GPU band producers reduce ground columns in HLSL and know
+	// nothing about assets, so their MaxSurfaceTopVoxel arrives here as a
+	// terrain number; consuming it unraised re-opens the deleted-treetop bug
+	// the CPU band path closes exactly (see the band raise in the level-0
+	// job). Cap-based rather than exact -- the game thread has no resolved
+	// instance list at the GPU completion sites -- which errs the safe way:
+	// a raise too large only forfeits skips.
+	int64 AssetBandRaiseVox(int32 ChunkX, int32 ChunkY) const
+	{
+		const vxc::AssetField* Field = Voxels.assetField();
+		if (Field == nullptr || Field->empty())
+		{
+			return 0;
+		}
+		constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+		const vxc::AssetVoxelRect Rect{int64(ChunkX) * ChunkVox, int64(ChunkY) * ChunkVox,
+		                               int64(ChunkX) * ChunkVox + ChunkVox - 1,
+		                               int64(ChunkY) * ChunkVox + ChunkVox - 1};
+		const int32 TopMm = vxc::assetTopAboveSurfaceMm(
+			Field->seed(), Field->layers().data(), int(Field->layers().size()), Rect);
+		return (TopMm > 0) ? (vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1) : 0;
+	}
+
 	// WHICH SPECIES ARE ACTUALLY COMPOSING, and it is a decorator so voxel-core
 	// needs no change to answer it.
 	//
@@ -9399,9 +9424,14 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		// what speculation looks at.
 		if (Pending.Key.Level == 0)
 		{
+			// + AssetBandRaiseVox: the GPU reduced ground columns only. See the
+			// helper's comment -- unraised, this cache entry proves crown
+			// chunks empty.
 			FootprintBandCache.Add(FIntPoint(Pending.Key.Key.X, Pending.Key.Key.Y),
-			                       VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
-			                                                         GpuResult.BandMinDeepestAirVoxel));
+			                       VoxelStreaming::MakeFootprintBand(
+			                           GpuResult.BandMaxSurfaceTopVoxel +
+			                               AssetBandRaiseVox(Pending.Key.Key.X, Pending.Key.Key.Y),
+			                           GpuResult.BandMinDeepestAirVoxel));
 		}
 		// TIMED. This runs inside Manager->Tick(), which the tick-budget line
 		// attributes to dispatch= -- so unlike a demand result (which only gets
@@ -9444,8 +9474,11 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	Result.bBandValid = GpuResult.bBandValid;
 	if (GpuResult.bBandValid)
 	{
-		Result.Band = VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
-		                                               GpuResult.BandMinDeepestAirVoxel);
+		// + AssetBandRaiseVox, same reason as the speculative cache above.
+		Result.Band = VoxelStreaming::MakeFootprintBand(
+			GpuResult.BandMaxSurfaceTopVoxel +
+			    AssetBandRaiseVox(Pending.Key.Key.X, Pending.Key.Key.Y),
+			GpuResult.BandMinDeepestAirVoxel);
 	}
 
 	if (GpuResult.IsOk())
@@ -10160,21 +10193,6 @@ void FVoxelWorldImpl::DispatchJobs()
 							ScratchDeepestAir[I] = VoxelStreaming::ColumnDeepestAirVoxel(Col);
 						}
 					}
-					if (bComputeBand)
-					{
-						int64 MaxTop = INT64_MIN;
-						int64 MinAir = INT64_MAX;
-						for (int32 I = 0; I < GridCells; ++I)
-						{
-							MaxTop = FMath::Max(MaxTop, ScratchTopSolid[I]);
-							MinAir = FMath::Min(MinAir, ScratchDeepestAir[I]);
-						}
-						// Shared with voxel.GPU.VerifyRegion's band gate and with
-						// BandReduceMain's readback path, so the widening cannot
-						// drift between the three producers of a band.
-						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
-						Result.bBandValid = true;
-					}
 					// THE ASSET TERM, IN THE SAMPLER THE MESHER ACTUALLY READS.
 					//
 					// This lambda was `Amplifier::materialAt` alone -- pure terrain
@@ -10198,6 +10216,15 @@ void FVoxelWorldImpl::DispatchJobs()
 					// every brick's and costs one query instead of 64.
 					const vxc::AssetField* AField = GenPtr->assetField();
 					std::vector<vxc::AssetInstance> AInsts;
+					// RESOLVED ONCE PER CHUNK, sampled lock-free per voxel.
+					// The old shape -- AField->materialAt per air voxel -- asked
+					// the bank library for the grid on every call, one global
+					// mutex per ask, ~64k asks per chunk, 96 workers convoying:
+					// measured 26.4M bankGrid calls in one capture and ~17
+					// chunks/s streaming. resolveForCompose pays ~one lock per
+					// terrain instance per chunk instead and drops the detail
+					// instances (84% of the list) that could never answer.
+					std::vector<vxc::AssetField::ResolvedAssetInstance> AResolved;
 					if (AField != nullptr && !AField->empty())
 					{
 						const vxc::AssetVoxelRect ARect{
@@ -10206,9 +10233,51 @@ void FVoxelWorldImpl::DispatchJobs()
 						{
 							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY));
 						});
+						AResolved = AField->resolveForCompose(AInsts);
 					}
-					const std::vector<vxc::AssetInstance>* AInstsPtr = &AInsts;
-					const auto GridSampler = [Columns, BaseVX, BaseVY, AField, AInstsPtr](int64 X, int64 Y, int64 Z)
+					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
+					if (bComputeBand)
+					{
+						int64 MaxTop = INT64_MIN;
+						int64 MinAir = INT64_MAX;
+						for (int32 I = 0; I < GridCells; ++I)
+						{
+							MaxTop = FMath::Max(MaxTop, ScratchTopSolid[I]);
+							MinAir = FMath::Min(MinAir, ScratchDeepestAir[I]);
+						}
+						// THE BAND MUST SEE THE CROWNS, or it deletes them. The
+						// band's contract (VoxelFootprintBand.h) is that a false
+						// "definitely empty" is a rendering bug, and its all-air
+						// half is consulted by the default-ON dispatch skip AND
+						// cached per footprint -- so a terrain-only MaxTop with
+						// assets installed silently settles every chunk above the
+						// ground as "proven empty, zero quads" the moment the
+						// footprint's band caches. That is a deleted treetop, and
+						// unlike the streaming starvation it never heals.
+						//
+						// Raised by the EXACT crown tops of this footprint's
+						// resolved instances -- not a cap. The resolved list is
+						// the compose-time truth: anchor + rotated grid height IS
+						// the topmost voxel materialAtResolved can answer non-air
+						// for, so chunks above this line are provably crown-free
+						// and the fast path stays armed at its exact ceiling.
+						// Same shape as the water-marker widening in
+						// ColumnSurfaceTopVoxel, for the same reason: another
+						// subsystem now puts solid above `surfaceMm`, and every
+						// emptiness gate that reads this band must know.
+						for (const vxc::AssetField::ResolvedAssetInstance& R : AResolved)
+						{
+							const int64 CrownTop = R.anchorVz + int64(R.grid->originZ()) +
+							                       int64(R.grid->sizeZ()) - 1;
+							MaxTop = FMath::Max(MaxTop, CrownTop);
+						}
+						// Shared with voxel.GPU.VerifyRegion's band gate and with
+						// BandReduceMain's readback path, so the widening cannot
+						// drift between the three producers of a band.
+						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
+						Result.bBandValid = true;
+					}
+					const auto GridSampler = [Columns, BaseVX, BaseVY, AResolvedPtr](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
 						const int32 LY = int32(Y - BaseVY) + 1;
@@ -10218,10 +10287,12 @@ void FVoxelWorldImpl::DispatchJobs()
 						// AIR ONLY, matching makeBrick exactly: an asset never
 						// replaces terrain, so the composition stays monotone and
 						// the bound's "assets are solid ABOVE the surface"
-						// assumption holds.
-						if (M == vxc::MAT_AIR && AField != nullptr && !AInstsPtr->empty())
+						// assumption holds. materialAtResolved preserves
+						// instancesForRect order, so first-non-air-wins picks the
+						// same winner as the bank-source path did, byte for byte.
+						if (M == vxc::MAT_AIR && !AResolvedPtr->empty())
 						{
-							M = AField->materialAt(*AInstsPtr, X, Y, Z);
+							M = vxc::AssetField::materialAtResolved(*AResolvedPtr, X, Y, Z);
 						}
 						return M;
 					};
@@ -10272,13 +10343,19 @@ void FVoxelWorldImpl::DispatchJobs()
 						// is: too tight here is a tree with no top, and the cost of
 						// too loose is a few extra bricks meshed to nothing.
 						//
+						// The RESOLVED list, not the raw instance list: 84% of raw
+						// instances are detail ground cover that composes nothing
+						// into the world grid, and widening the air skip for a
+						// chunk whose only instances are grass killed the skip on
+						// nearly every chunk on the map. Resolved instances are
+						// exactly the ones materialAtResolved can answer for, so a
+						// chunk with none has a provably terrain-only air band.
+						//
 						// The BAKED height, not the layer cap, for the reason spelled
-						// out at AssetTallestTerrainVox: the cap is 60 m against a
-						// ~17 m tallest bake, and this test runs 64 times per chunk.
-						// Unlike the z-range above, being loose here only wastes
-						// meshing work rather than admitting chunks -- but it is the
-						// same number and it should not be wrong in two places.
-						if (AField != nullptr && !AInstsPtr->empty())
+						// out at AssetTallestTerrainVox: this test runs 64 times per
+						// chunk and only wastes meshing work when loose -- but it is
+						// the same number and it should not be wrong in two places.
+						if (!AResolvedPtr->empty())
 						{
 							MaxTopInterior += AssetTallestVoxSnapshot;
 						}
