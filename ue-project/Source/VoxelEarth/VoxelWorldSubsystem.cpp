@@ -1922,6 +1922,12 @@ bool L0GridVerifyEnabled()
 std::atomic<int64> GL0GridVerifyChecked{0};
 std::atomic<int64> GL0GridVerifyMismatches{0};
 
+// Mesher-side asset resolve accounting -- see the fetch_add site in the level-0
+// job for why the bank tap cannot answer this question any more.
+std::atomic<uint64> GMesherChunksComposed{0};       // level-0 jobs that ran the resolve at all
+std::atomic<uint64> GMesherChunksWithInstances{0};  // ...and got >= 1 terrain instance
+std::atomic<uint64> GMesherInstancesResolved{0};    // total instances across them
+
 // Cross-job level-0 column-grid cache: MEASUREMENT ONLY, and deliberately so.
 //
 // A level-0 job's 34x34 grid depends only on the footprint (X,Y) -- the whole
@@ -5485,6 +5491,16 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       TEXT("assets: %llu bankGrid requests, %llu served, %llu files, %llu bytes resident"),
 		       (unsigned long long)B.requests, (unsigned long long)B.servedGrids,
 		       (unsigned long long)B.filesLoaded, (unsigned long long)B.bytesResident);
+		// THE MESHER'S OWN NUMBERS. Requests above are dominated by the legacy
+		// per-voxel paths (the startup probe walk alone is millions), so they
+		// can look alive while the mesher composes nothing -- which is exactly
+		// what happened at the alpine lake, 2026-08-17: 16.5M requests, tree
+		// species in the histogram, zero trees on screen.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets MESHER: %llu chunks ran resolve, %llu had instances, %llu instances total"),
+		       (unsigned long long)VoxelStreamAdmission::GMesherChunksComposed.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherChunksWithInstances.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesResolved.load(std::memory_order_relaxed));
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
 		// anybody reading a log; the manifest index is the species name, and the
@@ -8350,7 +8366,40 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// grid is the chunk plus a ONE-cell apron, comfortably
 						// inside this.
 						const double CellUU = ChunkEdge / double(VoxelCoords::ChunkEdgeVoxels);
-						const double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
+						double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
+						// THE SAME HOLE A THIRD TIME, and this instance was live:
+						// asset anchors sit up to maxRadiusMm OUTSIDE the chunk
+						// (site enumeration dilates by it), and the resolver reads
+						// Amp.column AT THE ANCHOR -- "one column per site, at the
+						// site's own anchor". At level 0 this gate covered 0.8 m of
+						// halo against a 15 m reach, so anchor columns fell into
+						// non-resident blocks, answered elevation 0 with default
+						// climate, and assetSpeciesTolerates refused every species.
+						// The terrain meshed perfectly and the world simply had no
+						// trees -- measured at the alpine lake, 2026-08-17: census
+						// with fully-decoded tiles places 13,995 instances; the
+						// engine composed zero. Level 0 only, because that is the
+						// only level whose sampler resolves instances at all.
+						if (QueueLevel == 0)
+						{
+							if (const vxc::AssetField* AFieldGate = Voxels.assetField();
+							    AFieldGate != nullptr && !AFieldGate->empty())
+							{
+								int32 ReachMm = 0;
+								for (const vxc::AssetLayer& L : AFieldGate->layers())
+								{
+									if (L.terrainLattice && L.maxRadiusMm > ReachMm)
+									{
+										ReachMm = L.maxRadiusMm;
+									}
+								}
+								// mm -> UU via the documented identity (1 UU = 10 mm,
+								// VoxelCoords.h:71), written as the ratio so a
+								// change to either constant moves this with it.
+								HalfEdge += double(ReachMm) *
+								            (VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm));
+							}
+						}
 						const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
 						const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
 						const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
@@ -9402,6 +9451,12 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				/*terrainOnly*/ true);
 			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
 				AField->resolveForCompose(AInsts);
+			// Same mesher-side accounting as the CPU job: a GPU-meshed chunk
+			// resolves here and never runs the worker's block.
+			VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
+			VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(Resolved.empty() ? 0 : 1,
+			                                     std::memory_order_relaxed);
+			VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(Resolved.size()), std::memory_order_relaxed);
 			// Two instances of one species-seed in the same chunk share one
 			// prefix table -- the dedup FVoxelGpuRegionRequest's header
 			// promises.
@@ -10463,6 +10518,19 @@ void FVoxelWorldImpl::DispatchJobs()
 							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY));
 						}, /*terrainOnly*/ true);
 						AResolved = AField->resolveForCompose(AInsts);
+						// MESHER-SIDE resolve accounting, because the bank tap
+						// can no longer answer "is the mesher composing":
+						// resolveForCompose issues ~one bankGrid call per
+						// instance per chunk, a rounding error beside the
+						// legacy per-voxel paths (the startup probe walk alone
+						// is millions), so a healthy-looking request total can
+						// hide a mesher that resolves nothing. These two are
+						// the mesher's own numbers and nothing else's.
+						VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(AResolved.empty() ? 0 : 1,
+						                                     std::memory_order_relaxed);
+						VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(AResolved.size()),
+						                                   std::memory_order_relaxed);
+						VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
 					}
 					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
 					if (bComputeBand)

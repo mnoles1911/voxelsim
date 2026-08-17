@@ -58,6 +58,7 @@ struct Options {
     std::string manifest;
     std::string banks;
     std::string fineDir;
+    std::string coarseDir;
     uint64_t seed = 20260719;
     int64_t regionM = 512;    // half-edge of the census square, metres
     int64_t originXM = 0, originYM = 0;
@@ -80,6 +81,7 @@ int main(int argc, char** argv) {
         if (a == "--manifest" && i + 1 < argc) opt.manifest = argv[++i];
         else if (a == "--banks" && i + 1 < argc) opt.banks = argv[++i];
         else if (a == "--fine" && i + 1 < argc) opt.fineDir = argv[++i];
+        else if (a == "--coarse" && i + 1 < argc) opt.coarseDir = argv[++i];
         else if (a == "--seed" && i + 1 < argc) opt.seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--region" && i + 1 < argc) opt.regionM = std::atoll(argv[++i]);
         else if (a == "--origin-x" && i + 1 < argc) opt.originXM = std::atoll(argv[++i]);
@@ -155,8 +157,36 @@ int main(int argc, char** argv) {
     std::printf("%s\n", overridden ? "  (OVERRIDDEN for pricing)" : "");
 
     // --- the world under census ---------------------------------------------
+    //
+    // WHY --coarse EXISTS, 2026-08-17: this probe censused 3,741 instances at
+    // the alpine lake while the ENGINE composed exactly zero there -- because
+    // the climate channel (and with it every biome weight, the treeline gate
+    // and the temperature dither) fell back to synthetic. Same rule as
+    // assetTightenLayerCaps: a probe pricing a world the engine does not run
+    // is not evidence. FineTileSampler delegates whatever it does not carry to
+    // its inner sampler, so wiring the real coarse tiles as that inner sampler
+    // is the whole change.
     SyntheticTileSampler synth(opt.seed);
+    TileGridSampler coarse(opt.seed, /*scale*/ 1);
     ITileSampler* tiles = &synth;
+    bool realClimate = false;
+    if (!opt.coarseDir.empty()) {
+        int loaded = 0, rejected = 0;
+        for (auto& e : std::filesystem::directory_iterator(opt.coarseDir)) {
+            if (e.path().extension() != ".vxtl") continue;
+            if (coarse.loadTileFile(e.path())) ++loaded;
+            else ++rejected;
+        }
+        std::printf("coarse tiles: loaded %d, rejected %d from %s\n", loaded, rejected,
+                    opt.coarseDir.c_str());
+        if (loaded == 0) {
+            std::fprintf(stderr, "no coarse tiles loaded; refusing to silently census "
+                                 "synthetic climate under a --coarse flag\n");
+            return 1;
+        }
+        tiles = &coarse;
+        realClimate = true;
+    }
     FineTileSampler fine(opt.seed, tiles);
     bool real = false;
     if (!opt.fineDir.empty()) {
@@ -176,9 +206,10 @@ int main(int argc, char** argv) {
         real = true;
     }
     Amplifier amp(opt.seed, real ? static_cast<ITileSampler&>(fine)
-                                 : static_cast<ITileSampler&>(synth));
+                                 : (realClimate ? static_cast<ITileSampler&>(coarse)
+                                                : static_cast<ITileSampler&>(synth)));
     std::printf("terrain: %s elevation, %s climate\n", real ? "REAL fine-tile" : "synthetic",
-                "synthetic"); // no coarse tiles are wired here yet; say so
+                realClimate ? "REAL coarse-tile" : "synthetic");
 
     // =========================================================================
     // CENSUS 1: WIDENING
