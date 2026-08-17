@@ -775,6 +775,73 @@ struct FCoarseChunkGridSampler
 		{
 			PerfCounters->incColumnEvals(uint64_t(GridEdge) * GridEdge);
 		}
+
+		// --- COARSE ASSET COMPOSITION -----------------------------------
+		//
+		// Distant rings sample the generator at each coarse cell's
+		// REPRESENTATIVE level-0 coordinate; the asset term follows the same
+		// rule, which is what makes a tree at 1 km the same deterministic
+		// function of (seed, tiles) it is at 10 m -- nearest-neighbour
+		// sampled, not majority-eroded, exactly like the terrain around it.
+		// Until this existed, assets composed ONLY at level 0 and every tree
+		// vanished past RingPresets[0]'s 128 m: the "no trees at the alpine
+		// lake" report, 2026-08-17, after every level-0 stage had been
+		// measured healthy.
+		//
+		// The rect covers every rep coordinate this grid can sample (cells
+		// -1..ChunkVox on both axes); instancesForRect dilates by asset
+		// reach itself. PER-COLUMN SHORTLISTS, built instance-outward: a
+		// level-L chunk's dilated rect can hold thousands of instances (a
+		// square kilometre of forest at level 5), so a per-voxel walk of the
+		// full list would be dead on arrival. Each instance instead appends
+		// its index to the few grid columns whose rep coordinate its rotated
+		// XY box covers -- O(instances x cells-covered), and cells-covered
+		// SHRINKS with level (a 6 m crown is one cell at level 5) -- leaving
+		// operator() a 0-to-few walk.
+		if (const vxc::AssetField* AField = Gen.assetField(); AField != nullptr && !AField->empty())
+		{
+			const vxc::AssetVoxelRect ARect{GenT::coarseRep(BaseVX - 1, Level),
+			                                GenT::coarseRep(BaseVY - 1, Level),
+			                                GenT::coarseRep(BaseVX + ChunkVox, Level),
+			                                GenT::coarseRep(BaseVY + ChunkVox, Level)};
+			Resolved = AField->resolveForCompose(AField->instancesForRect(
+				ARect,
+				[&Amp](int64_t AVX, int64_t AVY)
+				{ return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY)); },
+				/*terrainOnly*/ true));
+			if (!Resolved.empty())
+			{
+				ColShortlist.SetNum(GridEdge * GridEdge);
+				const int64 Scale = int64(1) << Level;
+				for (int32 I = 0; I < int32(Resolved.size()); ++I)
+				{
+					const auto& R = Resolved[I];
+					const int64 MinVx = R.anchorVx + R.grid->rotatedOriginX(R.yawQuarter);
+					const int64 MinVy = R.anchorVy + R.grid->rotatedOriginY(R.yawQuarter);
+					const int64 MaxVx = MinVx + R.grid->rotatedSizeX(R.yawQuarter) - 1;
+					const int64 MaxVy = MinVy + R.grid->rotatedSizeY(R.yawQuarter) - 1;
+					// Level-L cells whose rep coordinate falls inside the box:
+					// rep(c) = c*Scale + Scale/2, so invert around the box edges
+					// and clamp to this grid.
+					const int64 C0x = FMath::Max<int64>(vxc::floorDiv(MinVx - Scale / 2, Scale), BaseVX - 1);
+					const int64 C1x = FMath::Min<int64>(vxc::floorDiv(MaxVx - Scale / 2, Scale) + 1, BaseVX + ChunkVox);
+					const int64 C0y = FMath::Max<int64>(vxc::floorDiv(MinVy - Scale / 2, Scale), BaseVY - 1);
+					const int64 C1y = FMath::Min<int64>(vxc::floorDiv(MaxVy - Scale / 2, Scale) + 1, BaseVY + ChunkVox);
+					for (int64 Cy2 = C0y; Cy2 <= C1y; ++Cy2)
+					{
+						const int64 RepY = GenT::coarseRep(Cy2, Level);
+						if (RepY < MinVy || RepY > MaxVy) { continue; }
+						for (int64 Cx2 = C0x; Cx2 <= C1x; ++Cx2)
+						{
+							const int64 RepX = GenT::coarseRep(Cx2, Level);
+							if (RepX < MinVx || RepX > MaxVx) { continue; }
+							ColShortlist[int32(Cx2 - BaseVX) + 1 + GridEdge * (int32(Cy2 - BaseVY) + 1)]
+							    .Add(uint16(I));
+						}
+					}
+				}
+			}
+		}
 	}
 
 	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
@@ -782,13 +849,49 @@ struct FCoarseChunkGridSampler
 		const int32 LX = int32(X - BaseVX) + 1;
 		const int32 LY = int32(Y - BaseVY) + 1;
 		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-		return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+		const vxc::MaterialId M =
+			vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+		// AIR ONLY, the same monotone rule as every other compose site; the
+		// shortlist holds the 0-to-few instances whose box covers this
+		// column's rep coordinate, in resolveForCompose order, so
+		// first-non-air-wins picks the same winner level 0 would.
+		if (M == vxc::MAT_AIR && ColShortlist.Num() > 0)
+		{
+			const TArray<uint16, TInlineAllocator<2>>& Short = ColShortlist[LX + GridEdge * LY];
+			if (Short.Num() > 0)
+			{
+				const int64 RepX = GenT::coarseRep(X, Level);
+				const int64 RepY = GenT::coarseRep(Y, Level);
+				const int64 RepZ = GenT::coarseRep(Z, Level);
+				for (const uint16 I : Short)
+				{
+					const auto& R = Resolved[I];
+					const int64 Rx = RepX - R.anchorVx - int64(R.grid->rotatedOriginX(R.yawQuarter));
+					const int64 Ry = RepY - R.anchorVy - int64(R.grid->rotatedOriginY(R.yawQuarter));
+					const int64 Rz = RepZ - R.anchorVz - int64(R.grid->originZ());
+					if (Rx < INT32_MIN || Rx > INT32_MAX || Ry < INT32_MIN || Ry > INT32_MAX ||
+					    Rz < INT32_MIN || Rz > INT32_MAX)
+					{
+						continue;
+					}
+					const vxc::MaterialId AM = R.grid->atYaw(
+						int32(Rx), int32(Ry), int32(Rz), R.yawQuarter);
+					if (AM != vxc::MAT_AIR)
+					{
+						return AM;
+					}
+				}
+			}
+		}
+		return M;
 	}
 
 	int32 Level;
 	int64 BaseVX;
 	int64 BaseVY;
 	TArray<vxc::ColumnSample> Columns;
+	std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
+	TArray<TArray<uint16, TInlineAllocator<2>>> ColShortlist;
 };
 
 // Field-by-field quad equality for -VoxelCoarseGridVerify. Compares the emitted
@@ -3045,14 +3148,18 @@ struct FVoxelWorldImpl
 	// job). Cap-based rather than exact -- the game thread has no resolved
 	// instance list at the GPU completion sites -- which errs the safe way:
 	// a raise too large only forfeits skips.
-	int64 AssetBandRaiseVox(int32 ChunkX, int32 ChunkY) const
+	int64 AssetBandRaiseVox(int32 ChunkX, int32 ChunkY, int32 Level = 0) const
 	{
 		const vxc::AssetField* Field = Voxels.assetField();
 		if (Field == nullptr || Field->empty())
 		{
 			return 0;
 		}
-		constexpr int64 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+		// At Level > 0 the chunk coordinate is a level-L one and the rect must
+		// span the whole level-0 footprint beneath it -- a corner sub-chunk
+		// check would let the GPU fork take a coarse chunk whose OTHER corner
+		// holds a forest.
+		const int64 ChunkVox = int64(VoxelCoords::ChunkEdgeVoxels) << FMath::Clamp(Level, 0, 5);
 		const vxc::AssetVoxelRect Rect{int64(ChunkX) * ChunkVox, int64(ChunkY) * ChunkVox,
 		                               int64(ChunkX) * ChunkVox + ChunkVox - 1,
 		                               int64(ChunkY) * ChunkVox + ChunkVox - 1};
@@ -7392,6 +7499,29 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// an amplifier column; the resolve is the same work one level-0 mesh job
 	// already does per chunk, paid once per footprint instead of once per
 	// stacked chunk.
+	if (Level >= 1)
+	{
+		// Coarse levels compose assets too now (FCoarseChunkGridSampler), so
+		// their vertical range must admit crowns -- but a level-5 footprint is
+		// a square kilometre and the exact per-instance resolve below would be
+		// tens of thousands of amplifier columns on the streaming path. The
+		// per-footprint CAP query early-outs on the first site per layer and
+		// answers "the tallest anything COULD reach here", which for a chunk
+		// stack 2^L times taller than level 0's is plenty tight: the loose
+		// direction costs at most one extra coarse chunk layer.
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
+			const int32 TopMm = vxc::assetTopAboveSurfaceMm(
+				Field->seed(), Field->layers().data(), int(Field->layers().size()), FootRect);
+			if (TopMm > 0)
+			{
+				TopVoxelForMax = FMath::Max(
+					TopVoxelForMax,
+					TopVoxelMax + vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1);
+			}
+		}
+	}
 	if (Level == 0)
 	{
 		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
@@ -10346,13 +10476,24 @@ void FVoxelWorldImpl::DispatchJobs()
 			// than sound-until-batching.
 			//
 			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
-			// Assets now exist on the GPU: SubmitGpuMeshJob resolves this
-			// chunk's terrain instances and the AssetStamp passes compose them
-			// into Cells in CPU order (see VoxelAssetStamp.usf). The one case
-			// the stamp cannot serve -- a grid too tall for span packing --
-			// makes SubmitGpuMeshJob return false, which falls through to the
-			// CPU worker below exactly like a full GPU queue does.
+			// Assets now exist on the GPU at LEVEL 0: SubmitGpuMeshJob
+			// resolves the chunk's terrain instances and the AssetStamp
+			// passes compose them into Cells in CPU order
+			// (VoxelAssetStamp.usf). The one case the stamp cannot serve -- a
+			// grid too tall for span packing -- makes SubmitGpuMeshJob return
+			// false, which falls through to the CPU worker exactly like a
+			// full GPU queue does.
 			//
+			// COARSE levels compose on the CPU only (FCoarseChunkGridSampler
+			// samples instance grids at rep coordinates; the GPU coarse
+			// kernel has no stamp and ValidateRegionRequest refuses instances
+			// on coarse regions). A coarse footprint that can hold an asset
+			// must therefore mesh on the CPU, or the fork paints the distant
+			// forest treeless in whatever patches it happens to take. The cap
+			// query is one early-out lattice probe; misrouting costs a CPU
+			// mesh, not a wrong world.
+			&& !(LevelKey.Level >= 1 &&
+			     AssetBandRaiseVox(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Level) > 0)
 			// A chunk whose previous GPU job FAILED is not offered again: the
 			// failure flagged the record CPU-only, because a timeout under
 			// readback saturation re-fails identically every retry window.

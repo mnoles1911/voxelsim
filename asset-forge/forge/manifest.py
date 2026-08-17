@@ -238,8 +238,21 @@ LAYERS = (
     # set where the density can stay at 1000: 26 m nominal filing, 34 m baked
     # cap. The widening is effectively constant (density 1000), so this cap IS
     # the global price; vxc_assetprobe's census is what it is priced against.
+    #
+    # DENSITY 1000 -> 350, 2026-08-17, and this is the ONE forest-density
+    # knob that actually works. Per-species spacing dilution folds into PICK
+    # WEIGHTS, and in any biome rich enough to saturate the occupancy cap the
+    # dilution cancels across species (measured: canopy spacing x1.75 moved
+    # the census 381 -> 376). Layer density thins SITES before any of that,
+    # uniformly. At 1000 the resolver stood a tree on 41% of 5 m cells --
+    # ~830 stems/ha, a thicket the camera could not see 5 m into (the owner's
+    # "mess" screenshots); 350 lands ~290/ha, mature-forest spacing with
+    # sight lines, and cuts the composed far-forest quad bill by the same
+    # factor (the naive thicket at coarse levels blew a 200M-quad pool with
+    # 28,205 chunks refused). Species mix and biome patterns are untouched --
+    # this thins WHERE trees stand, not WHICH trees stand there.
     Layer(cell_mm=5_000, max_height_mm=34_000, max_depth_mm=4_000,
-          max_radius_mm=12_000, density_per_mille=1000, seed_count=4,
+          max_radius_mm=12_000, density_per_mille=350, seed_count=4,
           terrain_lattice=True),
     # L2 small terrain: boulders and shrubs-with-trunks to 5 m nominal.
     # Radius from the measured widest resident (boulder-beach, 5.8 m of reach:
@@ -248,8 +261,11 @@ LAYERS = (
     # it is nearly free: the bound takes the MAX over layers, so wherever L1's
     # constant 34 m stands (density 1000, i.e. almost everywhere), L2's cap is
     # shadowed entirely.
+    # Density 1000 -> 550 with L1's retune: understory thinned less than
+    # canopy (shrubs read as texture at distance and fill gaps at eye level),
+    # but a shrub on every second 2.2 m cell was part of the same wall.
     Layer(cell_mm=2_200, max_height_mm=7_500, max_depth_mm=2_000,
-          max_radius_mm=6_000, density_per_mille=1000, seed_count=4,
+          max_radius_mm=6_000, density_per_mille=550, seed_count=4,
           terrain_lattice=True),
     # L3 ground cover and every other detail-lattice plant: excluded from the
     # streaming bound entirely (assetplacement.h's terrainLattice guard,
