@@ -1,0 +1,130 @@
+// Stamps one resolved asset instance's voxels into the region cell buffer,
+// between VoxelizeMain (which fills Cells with terrain) and the mesh chain
+// (which reads them through regionCellMat).
+//
+// WHY THIS IS NOT IN /VoxelCore/worldgen.ush. That file is a MIRROR of
+// vxc terrain worldgen under a version lock (VXC_WORLDGEN_VERSION_USH) and is
+// shared with the standalone determinism bench; asset composition is not
+// terrain, has no bench leg, and bumping the mirror's contract for it would
+// entangle two release cadences. The only convention this file borrows from
+// the mirror is the CELL INDEXING (see regionCellMat there) -- six lines,
+// mirrored below with the same names, and the pair must move together.
+//
+// ORDERING CONTRACT, THE ONE THAT MAKES THIS BYTE-IDENTICAL TO THE CPU. The
+// CPU composes assets with first-non-air-wins in instancesForRect order
+// (AssetField::materialAtResolved). This kernel is dispatched ONCE PER
+// INSTANCE, in that same order, and only ever writes cells whose material is
+// AIR -- so instance i+1 sees instance i's writes through the pass barrier and
+// the same winner is picked for every overlapped cell. One thread owns one
+// baked column, so there are no intra-dispatch races either.
+//
+// The transform mirrors AssetGrid::atYaw's INVERSE map, inverted back to a
+// forward map (this kernel walks baked columns and scatters; the CPU sampler
+// holds world cells and gathers):
+//   yaw 0: (rx,ry) = (bx, by)
+//   yaw 1: (rx,ry) = (SizeY-1-by, bx)
+//   yaw 2: (rx,ry) = (SizeX-1-bx, SizeY-1-by)
+//   yaw 3: (rx,ry) = (by, SizeX-1-bx)
+// RotOriginX/Y arrive precomputed from AssetGrid::rotatedOriginX/Y for THIS
+// instance's yaw, so the one-voxel negated-axis subtlety documented there
+// stays in exactly one place.
+
+#include "/Engine/Public/Platform.ush"
+
+// --- Region shape (same values the worldgen passes get) ---------------------
+uint2 DispatchColumns;   // cells along x / y, multiples of 8
+uint BricksZ;            // vertical extent in bricks
+int BrickZMin;           // world brick z of the stack's bottom
+
+// --- This instance --------------------------------------------------------
+int2 AnchorRel;          // instance anchor voxel minus (OriginVx, OriginVy)
+int AnchorVz;            // anchor world voxel z
+int GridOriginZ;         // AssetGrid::originZ()
+int RotOriginX;          // AssetGrid::rotatedOriginX(yaw)
+int RotOriginY;          // AssetGrid::rotatedOriginY(yaw)
+uint YawQuarter;         // 0..3
+uint SizeX;              // BAKED box extents
+uint SizeY;
+uint SizeZ;
+uint ColStartsBase;      // this instance's base into ColStarts
+
+// Per baked column (c = bx * SizeY + by, matching AssetGrid::at's layout):
+// spans live at Spans[ColStarts[base+c] .. ColStarts[base+c+1]).
+// A span packs z0:12 | len:12 | mat:8 -- SizeZ is validated <= 4095 on the
+// host, refusing the asset rather than truncating.
+StructuredBuffer<uint> ColStarts;
+StructuredBuffer<uint> Spans;
+
+RWStructuredBuffer<uint> OutCells;
+
+[numthreads(8, 8, 1)]
+void AssetStampMain(uint3 Tid : SV_DispatchThreadID)
+{
+    if (Tid.x >= SizeX || Tid.y >= SizeY)
+    {
+        return;
+    }
+    const int Bx = int(Tid.x);
+    const int By = int(Tid.y);
+
+    // Forward quarter-turn about +z (see header).
+    int Rx, Ry;
+    switch (YawQuarter & 3u)
+    {
+        case 0u: Rx = Bx;                  Ry = By;                  break;
+        case 1u: Rx = int(SizeY) - 1 - By; Ry = Bx;                  break;
+        case 2u: Rx = int(SizeX) - 1 - Bx; Ry = int(SizeY) - 1 - By; break;
+        default: Rx = By;                  Ry = int(SizeX) - 1 - Bx; break;
+    }
+
+    const int Rvx = AnchorRel.x + RotOriginX + Rx;
+    const int Rvy = AnchorRel.y + RotOriginY + Ry;
+    if (Rvx < 0 || Rvx >= int(DispatchColumns.x) || Rvy < 0 || Rvy >= int(DispatchColumns.y))
+    {
+        return;
+    }
+
+    // Cell indexing -- mirrors regionCellMat in /VoxelCore/worldgen.ush.
+    const uint BxBrick = uint(Rvx) >> 3;
+    const uint ByBrick = uint(Rvy) >> 3;
+    const uint Lx = uint(Rvx) & 7u;
+    const uint Ly = uint(Rvy) & 7u;
+    const uint BricksX = DispatchColumns.x / 8u;
+    const uint FootprintIndex = BxBrick + BricksX * ByBrick;
+
+    const uint C = Tid.x * SizeY + Tid.y;
+    const uint S0 = ColStarts[ColStartsBase + C];
+    const uint S1 = ColStarts[ColStartsBase + C + 1u];
+    const int RegionZBase = BrickZMin * 8;
+    const int RegionZCount = int(BricksZ) * 8;
+
+    for (uint S = S0; S < S1; ++S)
+    {
+        const uint Packed = Spans[S];
+        const int Z0 = int(Packed >> 20);
+        const int Len = int((Packed >> 8) & 0xfffu);
+        const uint Mat = Packed & 0xffu;
+        for (int Dz = 0; Dz < Len; ++Dz)
+        {
+            const int Rvz = AnchorVz + GridOriginZ + Z0 + Dz - RegionZBase;
+            if (Rvz < 0 || Rvz >= RegionZCount)
+            {
+                continue;
+            }
+            const uint BzBrick = uint(Rvz) >> 3;
+            const uint Lz = uint(Rvz) & 7u;
+            const uint BrickIndex = FootprintIndex * BricksZ + BzBrick;
+            // cellIndexInBrick(lx, ly, lz) = lx + 8*(ly + 8*lz) -- mirrored.
+            const uint CellIndex = BrickIndex * 512u + (Lx + 8u * (Ly + 8u * Lz));
+            const uint Cell = OutCells[CellIndex];
+            // AIR ONLY: an asset never replaces terrain (or an earlier
+            // instance), same monotone rule as every CPU compose site. The
+            // upper bits are preserved -- the low byte is the material and the
+            // rest is the mirror's packing headroom, not this kernel's to own.
+            if ((Cell & 0xffu) == 0u)
+            {
+                OutCells[CellIndex] = (Cell & ~0xffu) | Mat;
+            }
+        }
+    }
+}

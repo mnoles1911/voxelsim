@@ -121,6 +121,38 @@ struct FVoxelGpuRegionRequest
 	// in the dispatch instead of only on the diagonal. See VoxelBandReduce.usf.
 	uint32 BandOriginJ = 0;
 	uint32 BandEdge = 0;
+
+	// --- Asset compose ------------------------------------------------------
+	//
+	// Terrain-lattice asset instances stamped into Cells between VoxelizeMain
+	// and the mesh chain, one dispatch per instance IN ARRAY ORDER -- that
+	// order is the byte-parity contract with the CPU's first-non-air-wins
+	// compose (AssetField::materialAtResolved), so the caller must fill it
+	// from instancesForRect order and nothing may sort it. Empty arrays skip
+	// the pass entirely, which is what keeps the verify/digest path (which
+	// never fills them) terrain-only by construction.
+	//
+	// AssetSpans packs one RLE run as z0:12 | len:12 | mat:8. AssetColStarts
+	// holds, per instance, SizeX*SizeY+1 prefix offsets into AssetSpans
+	// (instance base recorded in ColStartsBase). Grids repeated within a job
+	// share one span block -- the caller dedups by (bankId, seedIndex).
+	struct FAssetInstance
+	{
+		int32 AnchorRelVx = 0;   // anchor voxel minus OriginVx
+		int32 AnchorRelVy = 0;   // anchor voxel minus OriginVy
+		int32 AnchorVz = 0;      // absolute anchor voxel z
+		int32 GridOriginZ = 0;   // AssetGrid::originZ()
+		int32 RotOriginX = 0;    // AssetGrid::rotatedOriginX(YawQuarter)
+		int32 RotOriginY = 0;    // AssetGrid::rotatedOriginY(YawQuarter)
+		uint32 YawQuarter = 0;
+		uint32 SizeX = 0;        // BAKED box extents (pre-rotation)
+		uint32 SizeY = 0;
+		uint32 SizeZ = 0;        // host-validated <= 4095 (span packing)
+		uint32 ColStartsBase = 0;
+	};
+	TArray<FAssetInstance> AssetInstances;
+	TArray<uint32> AssetColStarts;
+	TArray<uint32> AssetSpans;
 };
 
 struct FVoxelGpuRegionResult

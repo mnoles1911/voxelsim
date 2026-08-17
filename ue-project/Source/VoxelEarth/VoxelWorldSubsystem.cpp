@@ -1211,6 +1211,16 @@ struct FChunkRecord
 
 	bool bJobInFlight = false;
 
+	// Set when a GPU mesh job for this chunk failed (timeout, device error):
+	// the retry must go to the CPU worker, not back to the fork that just
+	// failed it. Under readback saturation a GPU retry re-fails the same way
+	// every 10 s window and the chunk stays a hole indefinitely -- measured
+	// 2026-08-17, 248 chunks delivered EMPTY by timeout in one settle. Cleared
+	// never: one failure is enough evidence for this chunk this session, and
+	// the cost of being wrong is one chunk meshed on the slower-but-correct
+	// path.
+	bool bNoGpuRetry = false;
+
 	// --- Chunk-state debug tint bookkeeping (docs/debug-tooling-plan.md P1,
 	// mode 2 + voxel.Debug.ChunkStates) -- all in FVoxelWorldImpl::ElapsedSeconds
 	// terms (a free-running clock since Initialize, not GetWorld()'s time).
@@ -2928,6 +2938,71 @@ struct FVoxelWorldImpl
 	// tallest baked occupant. Must outlive AssetFieldObj (setLayers copies, but
 	// this is the authored-vs-installed seam and it should be inspectable).
 	std::vector<vxc::AssetLayer> AssetLayersTightened;
+
+	// Decoded span tables for the GPU asset stamp, keyed by grid pointer --
+	// stable for the process lifetime (AssetBankLibrary holds each grid in a
+	// unique_ptr it never frees). Built once per grid by columnRuns, reused by
+	// every GPU job that stamps an instance of it; the per-job upload is a
+	// concat of references into these. Game thread only, like every other
+	// streaming structure on Impl.
+	struct FGpuAssetGridSpans
+	{
+		TArray<uint32> ColStarts;   // SizeX*SizeY+1 prefix offsets into Spans
+		TArray<uint32> Spans;       // z0:12 | len:12 | mat:8, non-air runs only
+		int32 SizeX = 0, SizeY = 0, SizeZ = 0;
+		int32 OriginZ = 0;
+		bool bTooTall = false;      // SizeZ > 4095: cannot pack; CPU meshes it
+	};
+	TMap<const vxc::AssetGrid*, FGpuAssetGridSpans> GpuAssetSpanCache;
+
+	const FGpuAssetGridSpans& GpuSpansForGrid(const vxc::AssetGrid* Grid)
+	{
+		if (FGpuAssetGridSpans* Hit = GpuAssetSpanCache.Find(Grid))
+		{
+			return *Hit;
+		}
+		FGpuAssetGridSpans& S = GpuAssetSpanCache.Add(Grid);
+		S.SizeX = Grid->sizeX();
+		S.SizeY = Grid->sizeY();
+		S.SizeZ = Grid->sizeZ();
+		S.OriginZ = Grid->originZ();
+		if (S.SizeZ > 4095)
+		{
+			// 409 m; nothing baked approaches it. Refusing here routes the
+			// chunk to the CPU mesher rather than truncating a hole into the
+			// top of the asset.
+			S.bTooTall = true;
+			return S;
+		}
+		S.ColStarts.Reserve(S.SizeX * S.SizeY + 1);
+		for (int32 X = 0; X < S.SizeX; ++X)
+		{
+			for (int32 Y = 0; Y < S.SizeY; ++Y)
+			{
+				S.ColStarts.Add(uint32(S.Spans.Num()));
+				Grid->columnRuns(X, Y, [&S](int32 Z0, int32 Len, vxc::MaterialId Mat)
+				{
+					if (Mat == vxc::MAT_AIR)
+					{
+						return;
+					}
+					// Long runs split at the 12-bit length limit rather than
+					// refused -- len is bounded by SizeZ <= 4095 anyway, but
+					// the loop keeps the packing honest by construction.
+					int32 Z = Z0, Remaining = Len;
+					while (Remaining > 0)
+					{
+						const int32 Take = FMath::Min(Remaining, 4095);
+						S.Spans.Add((uint32(Z) << 20) | (uint32(Take) << 8) | uint32(Mat));
+						Z += Take;
+						Remaining -= Take;
+					}
+				});
+			}
+		}
+		S.ColStarts.Add(uint32(S.Spans.Num()));
+		return S;
+	}
 
 	// How much a TERRAIN-ONLY band extremum must rise before it may claim
 	// emptiness for this footprint, in level-0 voxels. Zero without an asset
@@ -7180,27 +7255,11 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// still climbing where the same pose without assets settled at 41,069. See
 	// AssetTallestTerrainVox's declaration for the full A/B.
 	//
-	// Still the safe direction, just tight: the value is clamped to the cap at
-	// install, so this can only ever admit FEWER chunks than the cap rule did and
-	// never fewer than the tallest thing that can stand here.
-	//
-	// PER FOOTPRINT, not the global maximum. assetTopAboveSurfaceMm answers "the
-	// tallest any asset intersecting THIS rect can reach", which is the L1 cap for
-	// 89.2% of footprints and the L0 cap for 10.7% -- measured over 63,001
-	// footprints, mean 13.48 extra chunk layers against 14 for the global rule.
-	// Affordable here specifically because this function is memoized per footprint
-	// (FootprintChunkZRangeCached) and because the query early-outs on the first
-	// site it finds in each layer; see assetTopAboveSurfaceMm's own doc comment.
-	if (const vxc::AssetField* Field = Voxels.assetField())
-	{
-		const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
-		const int32 TopMm = vxc::assetTopAboveSurfaceMm(
-			Field->seed(), Field->layers().data(), int(Field->layers().size()), FootRect);
-		if (TopMm > 0)
-		{
-			TopVoxelMax += vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1;
-		}
-	}
+	// The asset term moved BELOW the sky-band trim -- see the EXACT ADMISSION
+	// block there. Raising TopVoxelMax here would feed the raise into
+	// min(sampled + headroom, analytic), which is how the very first version of
+	// this bound deleted every crown: the analytic side knows nothing about
+	// assets, so min() discards the raise wherever the trim binds.
 
 	const int64 TopVoxelMinAtLevel = VoxelCoords::FloorDiv(TopVoxelMin, LevelScale);
 	OutChunkZMin = (int32)VoxelCoords::FloorDiv(TopVoxelMinAtLevel, (int64)ChunkEdgeVoxels) - 1;
@@ -7246,6 +7305,59 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 			// decides what is never requested at all.
 			const int64 AnalyticTopVoxel = vxc::floorDiv(BoundMm, int64(vxc::kVoxelSizeMm));
 			TopVoxelForMax = FMath::Min(TopVoxelForMax, AnalyticTopVoxel);
+		}
+	}
+
+	// EXACT ADMISSION FOR ASSETS (docs/asset-streaming-perf-plan.md P1). Level 0
+	// only, AFTER the trim, raising by max() -- each of those three words closes
+	// a specific hole:
+	//
+	//  * LEVEL 0 ONLY because that is the only level whose sampler composes
+	//    assets at all; raising coarser levels reserves sky for crowns that
+	//    cannot exist there. (When coarse composition lands, this condition is
+	//    the line to revisit.)
+	//  * AFTER THE TRIM because min(sampled, analytic) with an asset-raised
+	//    sampled side is the original deleted-crown bug -- the raise must
+	//    dominate the trim, not compete with it.
+	//  * BY MAX(), not +=, because these are absolute crown tops, not heights:
+	//    the tallest voxel materialAtResolved can answer non-air for, plus the
+	//    one-voxel generosity every bound in this function carries.
+	//
+	// EXACT, not the cap: the footprint's instances are resolved and their true
+	// rotated grid tops taken, so a bare footprint pays NOTHING (the census says
+	// that alone removes both the 8.4-layer height reservation and the 6.1-layer
+	// dilation slack -- an instance 15 m away that can lean voxels over this rect
+	// contributes its real top; one that cannot reach contributes nothing),
+	// and a footprint under a 45 m emergent admits exactly 45 m. Priced at mean
+	// 13.48 -> ~1-2 extra chunk layers over the terrain shell. Affordable
+	// because FootprintChunkZRangeCached memoizes this per footprint and
+	// terrainOnly skips the 85% of sites that are detail cover before they cost
+	// an amplifier column; the resolve is the same work one level-0 mesh job
+	// already does per chunk, paid once per footprint instead of once per
+	// stacked chunk.
+	if (Level == 0)
+	{
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
+			const vxc::Amplifier& AmpRef = Voxels.amplifier();
+			const std::vector<vxc::AssetInstance> Insts = Field->instancesForRect(
+				FootRect,
+				[&AmpRef](int64_t AVX, int64_t AVY)
+				{ return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY)); },
+				/*terrainOnly*/ true);
+			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
+				Field->resolveForCompose(Insts);
+			int64 MaxCrownTop = INT64_MIN;
+			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+			{
+				MaxCrownTop = FMath::Max(MaxCrownTop, R.anchorVz + int64(R.grid->originZ()) +
+				                                          int64(R.grid->sizeZ()) - 1);
+			}
+			if (MaxCrownTop != INT64_MIN)
+			{
+				TopVoxelForMax = FMath::Max(TopVoxelForMax, MaxCrownTop + 1);
+			}
 		}
 	}
 
@@ -9265,6 +9377,83 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// fork. See FVoxelWorldImpl::ActiveTiles' comment.
 	VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
 
+	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
+	//
+	// Level 0 only -- the CPU composes assets nowhere else, and
+	// ValidateRegionRequest refuses instances on a coarse region outright. The
+	// resolve is the same instancesForRect + resolveForCompose the CPU worker
+	// runs for this chunk, in the same order, which is the byte-parity
+	// contract: the stamp passes execute per instance in array order, so the
+	// GPU loses every overlap to the same winner the CPU would.
+	if (LevelKey.Level == 0)
+	{
+		if (const vxc::AssetField* AField = Voxels.assetField(); AField != nullptr && !AField->empty())
+		{
+			constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+			const int64 BaseVX = int64(LevelKey.Key.X) * ChunkVox;
+			const int64 BaseVY = int64(LevelKey.Key.Y) * ChunkVox;
+			const vxc::AssetVoxelRect ARect{BaseVX, BaseVY, BaseVX + ChunkVox - 1,
+			                                BaseVY + ChunkVox - 1};
+			const vxc::Amplifier& AmpRef = Voxels.amplifier();
+			const std::vector<vxc::AssetInstance> AInsts = AField->instancesForRect(
+				ARect,
+				[&AmpRef](int64_t AVX, int64_t AVY)
+				{ return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY)); },
+				/*terrainOnly*/ true);
+			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
+				AField->resolveForCompose(AInsts);
+			// Two instances of one species-seed in the same chunk share one
+			// prefix table -- the dedup FVoxelGpuRegionRequest's header
+			// promises.
+			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
+			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+			{
+				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid);
+				if (S.bTooTall)
+				{
+					// One un-stampable instance and the whole chunk goes to
+					// the CPU mesher: a partial stamp is a hole in an asset,
+					// which is the failure this whole path exists to avoid.
+					return false;
+				}
+				FVoxelGpuRegionRequest::FAssetInstance Inst;
+				Inst.AnchorRelVx = int32(R.anchorVx - int64(Req.OriginVx));
+				Inst.AnchorRelVy = int32(R.anchorVy - int64(Req.OriginVy));
+				Inst.AnchorVz = int32(R.anchorVz);
+				Inst.GridOriginZ = S.OriginZ;
+				Inst.RotOriginX = R.grid->rotatedOriginX(R.yawQuarter);
+				Inst.RotOriginY = R.grid->rotatedOriginY(R.yawQuarter);
+				Inst.YawQuarter = R.yawQuarter;
+				Inst.SizeX = uint32(S.SizeX);
+				Inst.SizeY = uint32(S.SizeY);
+				Inst.SizeZ = uint32(S.SizeZ);
+				if (const uint32* Known = BaseForGrid.Find(R.grid))
+				{
+					Inst.ColStartsBase = *Known;
+				}
+				else
+				{
+					Inst.ColStartsBase = uint32(Req.AssetColStarts.Num());
+					BaseForGrid.Add(R.grid, Inst.ColStartsBase);
+					const uint32 SpanBase = uint32(Req.AssetSpans.Num());
+					Req.AssetColStarts.Append(S.ColStarts);
+					Req.AssetSpans.Append(S.Spans);
+					// The per-instance prefix table indexes the JOB buffer, so
+					// grid-local offsets shift by where this grid's spans
+					// landed.
+					if (SpanBase > 0)
+					{
+						for (int32 I = 0; I < S.ColStarts.Num(); ++I)
+						{
+							Req.AssetColStarts[int32(Inst.ColStartsBase) + I] += SpanBase;
+						}
+					}
+				}
+				Req.AssetInstances.Add(Inst);
+			}
+		}
+	}
+
 	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
 	//
 	// DECIDED HERE, AT DISPATCH, AND LATCHED. The alternative -- deciding at
@@ -9507,15 +9696,40 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	else
 	{
 		++GpuMeshJobsFailedSinceLog;
-		// A failed job still owes exactly one result, and it delivers an EMPTY
-		// one. That is the honest outcome -- but it is also indistinguishable
-		// on screen from terrain that is genuinely empty, which is why it is
-		// counted and logged rather than merely returned.
+		// A failed job is NOT delivered as an empty chunk any more. An empty
+		// delivery settles the chunk with zero quads -- a permanent hole
+		// indistinguishable on screen from real emptiness, and 248 of them
+		// landed in one settle when readback saturation timed jobs out in
+		// bursts. Instead the record is released back to the dispatcher
+		// exactly the way a bounced dispatch is, flagged CPU-only so the
+		// retry cannot bounce off the same failure: RecomputeDesiredSet still
+		// wants this chunk (it never loaded), so it re-enters the pending
+		// queue on the next recompute and the worker path meshes it.
+		//
+		// The one-result-one-decrement contract holds: this failure produces
+		// zero results and zero net counter movement only if the record is
+		// still ours -- if an edit superseded the job (GenerationId moved),
+		// the empty result was going to be discarded in DrainResults anyway,
+		// so the release below is safe in both cases.
 		UE_LOG(LogVoxelStream, Warning,
-		       TEXT("VoxelGpuMesh: job %llu for chunk (%d, %d, %d) L%d ended %s -- delivering an EMPTY chunk. %s"),
+		       TEXT("VoxelGpuMesh: job %llu for chunk (%d, %d, %d) L%d ended %s -- requeueing on the CPU worker path. %s"),
 		       (unsigned long long)GpuResult.JobId,
 		       Pending.Key.Key.X, Pending.Key.Key.Y, Pending.Key.Key.Z, Pending.Key.Level,
 		       LexToString(GpuResult.Status), *GpuResult.Error);
+		if (VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Pending.Key))
+		{
+			if (Rec->GenerationId == Pending.GenerationId && Rec->bJobInFlight)
+			{
+				Rec->bJobInFlight = false;
+				Rec->bNoGpuRetry = true;
+				--LevelJobsInFlight[FMath::Clamp(Pending.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+				JobsInFlightCounter.Decrement();
+				return;
+			}
+		}
+		// Record gone or superseded: fall through and deliver the empty
+		// result so the drain-side bookkeeping (which will discard it as
+		// stale) still sees its one result.
 	}
 
 	// The matching half of the fork's contract: exactly one FJobResult on the
@@ -9970,6 +10184,17 @@ void FVoxelWorldImpl::DispatchJobs()
 			// than sound-until-batching.
 			//
 			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
+			// Assets now exist on the GPU: SubmitGpuMeshJob resolves this
+			// chunk's terrain instances and the AssetStamp passes compose them
+			// into Cells in CPU order (see VoxelAssetStamp.usf). The one case
+			// the stamp cannot serve -- a grid too tall for span packing --
+			// makes SubmitGpuMeshJob return false, which falls through to the
+			// CPU worker below exactly like a full GPU queue does.
+			//
+			// A chunk whose previous GPU job FAILED is not offered again: the
+			// failure flagged the record CPU-only, because a timeout under
+			// readback saturation re-fails identically every retry window.
+			&& !Rec->bNoGpuRetry
 			// The fork's own bound. Applied HERE rather than in the loop
 			// condition so a chunk arriving when the GPU is full falls back to
 			// the CPU instead of stalling the whole dispatch loop.
@@ -10229,10 +10454,14 @@ void FVoxelWorldImpl::DispatchJobs()
 					{
 						const vxc::AssetVoxelRect ARect{
 							BaseVX, BaseVY, BaseVX + ChunkVox - 1, BaseVY + ChunkVox - 1};
+						// terrainOnly: this list exists solely to feed
+						// resolveForCompose, which drops detail instances anyway
+						// -- skipping their sites here saves the ~85% of
+						// per-site amplifier columns that bought nothing.
 						AInsts = AField->instancesForRect(ARect, [&Amp](int64_t AVX, int64_t AVY)
 						{
 							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY));
-						});
+						}, /*terrainOnly*/ true);
 						AResolved = AField->resolveForCompose(AInsts);
 					}
 					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;

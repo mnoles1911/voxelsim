@@ -141,15 +141,28 @@ public:
     // ONE COLUMN PER SITE, NOT PER VOXEL. The column is evaluated at the site's
     // OWN anchor -- not at the query voxel -- because that is where the tree
     // stands. The rect's own columns are irrelevant to it.
+    // `terrainOnly` skips every DETAIL-lattice site before it costs anything.
+    // A detail site pays the same columnFacts amplifier column as a terrain one
+    // -- the expensive part of this whole function -- and then resolves to an
+    // instance that no world-lattice consumer can use (materialOfInstance and
+    // resolveForCompose both refuse detail instances). Measured on the census
+    // ground: 27,684 of 32,673 sites (85%) are detail, so a world-lattice
+    // caller passing false pays ~6x the columns for the same composition.
+    // Default false because the DETAIL consumers (the entity spawner, the
+    // census) want the full list and predate the flag.
     template <typename ColumnFactsFn>
     std::vector<AssetInstance> instancesForRect(const AssetVoxelRect& rect,
-                                                const ColumnFactsFn& columnFacts) const {
+                                                const ColumnFactsFn& columnFacts,
+                                                bool terrainOnly = false) const {
         std::vector<AssetInstance> out;
         if (empty()) return out;
         const std::vector<AssetSite> sites =
             assetSitesForRect(seed_, layers_.data(), int(layers_.size()), rect);
         out.reserve(sites.size());
         for (const AssetSite& s : sites) {
+            if (terrainOnly && (size_t(s.layer) >= layers_.size() ||
+                                !layers_[s.layer].terrainLattice))
+                continue;
             const int64_t avx = floorDiv(s.anchorXMm, int64_t(kVoxelSizeMm));
             const int64_t avy = floorDiv(s.anchorYMm, int64_t(kVoxelSizeMm));
             AssetInstance inst;
