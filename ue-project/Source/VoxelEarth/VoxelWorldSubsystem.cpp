@@ -41,6 +41,9 @@
 #include "Camera/PlayerCameraManager.h"
 #include "UnrealClient.h"
 
+#include "voxelcore/assetbank.h"     // v24/v25 asset term: the baked species banks
+#include "voxelcore/assetfield.h"    // ...the layer table + species + policy, as one object
+#include "voxelcore/assetmanifest.h" // ...and the table asset-forge exports
 #include "voxelcore/bytes.h"
 // -VoxelCavernShot searches for natural cavern rooms via ColumnSample::cavern
 // (CavernSeg::marginSq); amplifier.h already pulls this in, included
@@ -2632,6 +2635,71 @@ struct FVoxelWorldImpl
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
 		}
 
+		// --- the asset term ------------------------------------------------
+		//
+		// Opt-in, and it REFUSES RATHER THAN DEGRADES. Every failure below
+		// leaves the field uninstalled, which composes as the pre-v24 world --
+		// the one outcome that cannot silently produce wrong terrain. A
+		// half-loaded manifest would be worse than none, which is why
+		// AssetManifest::parse "never partially fills".
+		{
+			FString AssetDir;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelAssetDir="), AssetDir) && !AssetDir.IsEmpty())
+			{
+				const FString ManifestPath = FPaths::Combine(AssetDir, TEXT("species.vxm"));
+				TArray<uint8> Blob;
+				if (!FFileHelper::LoadFileToArray(Blob, *ManifestPath))
+				{
+					UE_LOG(LogVoxelEarth, Error,
+					       TEXT("VoxelAssets: could not read %s -- the asset term stays OFF and this run "
+					            "generates the pre-v24 world."), *ManifestPath);
+				}
+				else
+				{
+					const vxc::AssetManifestError Err =
+						AssetManifestData.parse(Blob.GetData(), size_t(Blob.Num()));
+					if (Err != vxc::AssetManifestError::kOk)
+					{
+						UE_LOG(LogVoxelEarth, Error,
+						       TEXT("VoxelAssets: %s REFUSED: %s. The asset term stays OFF."),
+						       *ManifestPath, UTF8_TO_TCHAR(vxc::assetManifestErrorText(Err)));
+					}
+					else
+					{
+						// The fold counts everything it drops, and those counts
+						// are logged rather than summed away: "438 kept" means
+						// nothing without the 382 detail entities beside it.
+						const vxc::AssetTableBuildStats Stats =
+							vxc::assetSpeciesTableFromManifest(AssetManifestData, AssetSpeciesTable);
+						AssetBanks.configure(&AssetManifestData, TCHAR_TO_UTF8(*FPaths::Combine(AssetDir, TEXT("banks"))));
+						AssetFieldObj.setLayers(AssetManifestData.layers().data(),
+						                        int(AssetManifestData.layers().size()));
+						AssetFieldObj.setSpecies(AssetSpeciesTable.data(), int(AssetSpeciesTable.size()));
+						AssetFieldObj.setBankSource(&AssetBanks);
+						AssetFieldObj.setSeed(Seed);
+						if (AssetFieldObj.empty())
+						{
+							UE_LOG(LogVoxelEarth, Error,
+							       TEXT("VoxelAssets: field is empty after load (layers %d, species %d) -- "
+							            "NOT installed."),
+							       int(AssetManifestData.layers().size()), int(AssetSpeciesTable.size()));
+						}
+						else
+						{
+							Voxels.setAssetField(&AssetFieldObj);
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: INSTALLED from %s -- %d layers, %d species placeable "
+							            "(%d detail entities, %d too rare, %d no biome, %d without banks). "
+							            "kWorldGenVersion = %u."),
+							       *AssetDir, int(AssetManifestData.layers().size()), Stats.kept,
+							       Stats.detailEntities, Stats.tooRare, Stats.noBiome, Stats.withoutBanks,
+							       vxc::kWorldGenVersion);
+						}
+					}
+				}
+			}
+		}
+
 		// "Admit everything at this level" sentinel. Set by loop rather than by a
 		// braced initializer on the member, because a braced list that falls
 		// short of kNumLevels zero-fills its tail -- and 0.0 here is not a
@@ -2718,6 +2786,29 @@ struct FVoxelWorldImpl
 	// pointer, and the streamer borrows Tiles as its climate source. Tiles ->
 	// FineStreamer -> Voxels is the only order in which all three are valid.
 	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
+
+	// THE ASSET TERM (worldgen v24/v25), and it is DECLARED HERE FOR THE SAME
+	// REASON THE Tiles/FineStreamer/Voxels ORDER ABOVE IS LOAD-BEARING.
+	//
+	// Members are destroyed in REVERSE declaration order, so everything the
+	// world borrows must be declared BEFORE it. `Voxels` holds a raw
+	// `const AssetField*`; the field holds a raw `const IAssetBankSource*`; and
+	// `AssetBankLibrary::configure` documents that "manifest must outlive this
+	// library". The chain is therefore manifest -> banks -> species -> field ->
+	// Voxels, and reordering any pair of these lines is a use-after-free that
+	// would show up as wrong voxels rather than as a crash.
+	//
+	// ALL FOUR ARE INERT UNLESS -VoxelAssetDir IS PASSED. assetfield.h's own
+	// contract: "a world with no AssetField is exactly the world that exists
+	// today, bit for bit, which is what keeps every existing golden and the
+	// worldgen digest valid until the field is deliberately switched on." The
+	// constructor below installs nothing without the switch, so this commit
+	// cannot move a single voxel on any existing run -- the same opt-in shape
+	// as TileDir and FineTileDir above, deliberately.
+	vxc::AssetManifest AssetManifestData;
+	vxc::AssetBankLibrary AssetBanks;
+	std::vector<vxc::AssetSpecies> AssetSpeciesTable;
+	vxc::AssetField AssetFieldObj;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 
