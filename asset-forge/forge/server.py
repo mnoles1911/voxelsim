@@ -562,6 +562,7 @@ class Handler(BaseHTTPRequestHandler):
                         "shape": _shape_word(s, kind),
                         "notes": specmod.get(s, "notes"),
                         "biomes": biomelib.summary(s),
+                        "curation": specmod.curation(s),
                     }
                 )
             return self._json(out)
@@ -572,7 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no such spec"}, 404)
             s, rep = specmod.load(p)
             return self._json({"spec": s, "warnings": rep.warnings,
-                               "hash": specmod.spec_hash(s)})
+                               "hash": specmod.spec_hash(s),
+                               "curation": specmod.curation(s)})
 
         if path == "/api/job":
             job = FORGE.get(q.get("job", ""))
@@ -715,6 +717,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad species name"}, 400)
             specmod.save(spec, SPECS / f"{name}.json")
             return self._json({"saved": f"{name}.json", "warnings": rep.warnings})
+
+        if path == "/api/curation":
+            # The publish verdict, written into the spec FILE and nowhere
+            # else. The exporters read the gate from specs/, so a verdict
+            # held in server memory or a sidecar would be one more derived
+            # copy waiting to detach from its source.
+            name = Path(str(body.get("name", ""))).name
+            p = SPECS / f"{name}.json"
+            if not name or name in (".", "..") or not p.is_file():
+                return self._json({"error": "no such spec"}, 404)
+            status = str(body.get("status", ""))
+            if status not in specmod.CURATION_STATUSES:
+                return self._json(
+                    {"error": f"status must be one of {specmod.CURATION_STATUSES}"}, 400)
+            try:
+                seeds = sorted({int(s) for s in (body.get("seeds") or [])})
+            except (TypeError, ValueError):
+                return self._json({"error": "seeds must be whole numbers"}, 400)
+            if not seeds or not all(1 <= s <= 9999 for s in seeds):
+                # An approved species with no seeds would be published with an
+                # empty bank; refuse the write instead of letting the resolver
+                # quietly substitute the default later.
+                return self._json({"error": "at least one seed, each 1-9999"}, 400)
+            # The RAW file, not the validated body: validate re-clamps every
+            # parameter it touches, and this route's whole contract is that
+            # nothing but the curation block moves. The dump matches
+            # `spec.save`'s byte format, so the diff IS the block.
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw["curation"] = {"status": status, "seeds": seeds,
+                               "notes": str(body.get("notes", ""))}
+            p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
+            return self._json({"saved": f"{name}.json",
+                               "curation": specmod.curation(raw)})
 
         if path == "/api/keep":
             spec, _ = specmod.validate(body.get("spec") or {})

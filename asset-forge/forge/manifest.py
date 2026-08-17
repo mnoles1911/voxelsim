@@ -111,6 +111,7 @@ than silently absent.
 
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -312,6 +313,84 @@ class ExportReport:
             for name, why in sorted(self.unplaceable):
                 out.append(f"    {name}: {why}")
         return out
+
+
+# A bank seed file is <name>-NNNN.vxa; the NNNN is the seed.
+SEED_FILE_RE = re.compile(r"-(\d{4})\.vxa$")
+
+
+@dataclass
+class CurationSummary:
+    """Who the publish gate held back, BY NAME -- the same rule ExportReport
+    states for itself: a gate that skips species silently is a silent no-op
+    with a human's verdict inside it."""
+    approved: int = 0
+    grandfathered: int = 0
+    draft: list[str] = field(default_factory=list)
+    rejected: list[str] = field(default_factory=list)
+
+    def lines(self) -> list[str]:
+        held = len(self.draft) + len(self.rejected)
+        out = [f"curation: {self.approved} approved "
+               f"({self.grandfathered} grandfathered, never curated by a "
+               f"human), {held} held back"]
+        if self.draft:
+            out.append(f"  draft, not exported: {', '.join(sorted(self.draft))}")
+        if self.rejected:
+            out.append(f"  rejected, not exported: {', '.join(sorted(self.rejected))}")
+        return out
+
+
+def curated_inputs(specs_dir: Path, banks_dir: Path
+                   ) -> "tuple[list[tuple[str, dict]], dict[str, int], CurationSummary]":
+    """Everything `encode` should see, with the publish gate applied: the
+    approved (name, validated body) list, and per species the count of bank
+    seeds ON DISK that are also on its approved list.
+
+    ONE FUNCTION BECAUSE THERE ARE TWO CALLERS. `tools/export_manifest.py`
+    writes the table from this and `tools/enginecheck.py` re-derives it as
+    the staleness check; if each applied the gate itself, the day their two
+    readings differed the check would certify a manifest the exporter would
+    not write -- a derived fact in two places, which is the failure the check
+    exists to catch.
+
+    The seed count keeps the counting discipline the manifest has always had
+    -- COUNTED off the disk, never assumed from the verdict -- and then
+    intersects with the approved list. So a bake that failed still shows up
+    as a lower number, and a stale file for a seed a curator pulled does not
+    inflate it."""
+    specs: list[tuple[str, dict]] = []
+    summary = CurationSummary()
+    approved_seeds: dict[str, set[int]] = {}
+    for p in sorted(specs_dir.glob("*.json")):
+        body, _report = sm.load(p)
+        cur = sm.curation(body)
+        if cur["status"] == "rejected":
+            summary.rejected.append(p.stem)
+            continue
+        if cur["status"] == "draft":
+            summary.draft.append(p.stem)
+            continue
+        summary.approved += 1
+        if not cur["curated"]:
+            summary.grandfathered += 1
+        approved_seeds[p.stem] = set(cur["seeds"])
+        specs.append((p.stem, body))
+
+    seeds_baked: dict[str, int] = {}
+    if banks_dir.is_dir():
+        for d in sorted(banks_dir.iterdir()):
+            if not d.is_dir() or d.name not in approved_seeds:
+                continue
+            ok = approved_seeds[d.name]
+            n = 0
+            for f in d.iterdir():
+                m = SEED_FILE_RE.search(f.name)
+                if m and int(m.group(1)) in ok:
+                    n += 1
+            if n:
+                seeds_baked[d.name] = n
+    return specs, seeds_baked, summary
 
 
 def _kind_group_params(spec: dict, kind: str) -> tuple[int, int, int]:

@@ -2,47 +2,35 @@
 
     python tools/export_manifest.py [--out out/engine/species.vxm]
 
-Reads every spec in specs/, counts the baked bank seeds already exported under
-the manifest's own directory (banks/<name>/<name>-NNNN.vxa), and writes one
-versioned binary table -- see forge/manifest.py for the format and for why the
-layer table travels inside it.
+Reads every spec in specs/, applies the publish gate (`spec.curation`: a
+species is exported only if its verdict is approved, and absent means
+approved -- the grandfather clause is documented on the resolver), counts the
+baked APPROVED bank seeds already exported under the manifest's own directory
+(banks/<name>/<name>-NNNN.vxa), and writes one versioned binary table -- see
+forge/manifest.py for the format and for why the layer table travels inside
+it. The gate and the seed count both come from `manifest.curated_inputs`,
+shared with tools/enginecheck.py so the exporter and its checker cannot read
+the verdicts differently.
 
-Prints the export report to stdout and REFUSES (exit 1) only on structural
-failure (a spec that cannot be represented at all). Underserved spacing and
-too-rare-to-express species are reported, not fatal: they are authored facts
-the format cannot fully serve, and hiding the export behind them would just
-stop the 800 species it does serve.
+Prints the export report to stdout -- including who the gate held back, by
+name -- and REFUSES (exit 1) only on structural failure (a spec that cannot
+be represented at all). Underserved spacing and too-rare-to-express species
+are reported, not fatal: they are authored facts the format cannot fully
+serve, and hiding the export behind them would just stop the 800 species it
+does serve. A draft or rejected species is different again: held back on
+purpose, by a person, and reported so the absence is legible.
 """
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
-from forge import manifest, spec as sm
+from forge import manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 SPECS = ROOT / "specs"
-
-_SEED_FILE = re.compile(r"-(\d{4})\.vxa$")
-
-
-def count_baked_seeds(banks_dir: Path) -> dict[str, int]:
-    """How many bank seeds each species has on disk. COUNTED, not assumed:
-    the manifest's seeds_baked is the number a loader can trust before it
-    opens a single file, so it must be the number of files."""
-    out: dict[str, int] = {}
-    if not banks_dir.is_dir():
-        return out
-    for d in sorted(banks_dir.iterdir()):
-        if not d.is_dir():
-            continue
-        n = sum(1 for f in d.iterdir() if _SEED_FILE.search(f.name))
-        if n:
-            out[d.name] = n
-    return out
 
 
 def main() -> int:
@@ -53,18 +41,16 @@ def main() -> int:
     out_path = Path(args.out)
     banks_dir = out_path.parent / "banks"
 
-    specs = []
-    for p in sorted(SPECS.glob("*.json")):
-        body, _report = sm.load(p)
-        specs.append((p.stem, body))
+    specs, seeds_baked, curation = manifest.curated_inputs(SPECS, banks_dir)
 
     report = manifest.ExportReport()
-    blob = manifest.encode(specs, seeds_baked=count_baked_seeds(banks_dir),
-                           report=report)
+    blob = manifest.encode(specs, seeds_baked=seeds_baked, report=report)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(blob)
 
+    for line in curation.lines():
+        print(line)
     for line in report.lines():
         print(line)
     print(f"wrote {out_path} ({len(blob):,} bytes)")

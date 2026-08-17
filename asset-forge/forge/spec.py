@@ -2784,6 +2784,10 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
     known = set(BY_PATH)
     for path in _leaf_paths(spec):
+        # The curation block rides in the spec file but is not a parameter:
+        # no slider, no clamp row. It is handled whole, below.
+        if path == "curation" or path.startswith("curation."):
+            continue
         if path not in known:
             rep.warnings.append(f"ignored unknown parameter {path!r}")
 
@@ -2821,6 +2825,24 @@ def validate(spec: dict) -> tuple[dict, Report]:
             )
             continue
         set_(out, p.path, val)
+
+    # Carry the curation block THROUGH validation rather than stripping it as
+    # an unknown key. `save` writes what `validate` returns, so a verdict that
+    # vanished on the next slider drag would be this project's signature
+    # failure with a human's decision as the casualty. Specs that carry no
+    # block get none added -- their bytes must not move (see `curation`'s
+    # grandfather clause).
+    if "curation" in spec:
+        raw = spec["curation"]
+        if isinstance(raw, dict):
+            out["curation"] = _clean_curation(raw, rep)
+        else:
+            rep.warnings.append(
+                f"curation: {raw!r} is not a block, so this species is "
+                f"treated as 'draft' and WILL NOT EXPORT until a readable "
+                f"verdict is written")
+            out["curation"] = {"status": "draft",
+                               "seeds": list(CURATION_SEEDS), "notes": ""}
 
     # Cross-parameter checks. These are the combinations that produce a tree
     # that generates fine and looks wrong, so they warn rather than clamp.
@@ -2862,6 +2884,96 @@ def validate(spec: dict) -> tuple[dict, Report]:
 
 
 _MISSING = object()
+
+
+# --- curation ----------------------------------------------------------------
+
+# The publish gate's menu, and the seed list every species was published with
+# before any human curated one. `curation` below is the ONE resolver: the two
+# exporters, the library report and the app all read the block through it, so
+# "what does an absent block mean" has exactly one answer everywhere.
+CURATION_STATUSES = ("draft", "approved", "rejected")
+CURATION_SEEDS = (1, 2, 3, 4)
+
+
+def curation(spec: dict) -> dict:
+    """The publish verdict for this species: {status, seeds, notes, curated}.
+
+    ABSENT MEANS APPROVED AT SEEDS 1-4, and that is a grandfather clause, not
+    a default anyone chose per species. When the gate was added the whole
+    library was already published -- 828 species, four seeds each, in the
+    manifest and the banks -- and a gate whose default was "draft" would have
+    unpublished every one of them in a single export. So a spec that carries
+    no block is exactly as published as it was the day before the gate
+    existed, both exports are byte-identical, and `curated: False` says a
+    human has never actually looked. The report prints that count out loud,
+    because grandfathered and approved-by-a-person are different facts even
+    though both export.
+
+    A block that IS present but cannot be read -- a status off the menu, a
+    seeds field that is not a list -- resolves toward `draft`, the opposite
+    direction. An absent verdict publishes because that is what the library
+    already was; an illegible one must not, because somebody wrote SOMETHING
+    and nobody can tell what.
+    """
+    raw = spec.get("curation")
+    if not isinstance(raw, dict):
+        return {"status": "approved", "seeds": list(CURATION_SEEDS),
+                "notes": "", "curated": False}
+    out = _clean_curation(raw, Report())
+    out["curated"] = True
+    return out
+
+
+def _clean_curation(raw: dict, rep: Report) -> dict:
+    """One curation block, coerced onto its menu. Warnings name the
+    consequence, the same rule `validate` applies to choice rows: "not a
+    valid status" is housekeeping, "will not export" is a sentence somebody
+    actually reads."""
+    for k in raw:
+        if k not in ("status", "seeds", "notes"):
+            rep.warnings.append(f"curation.{k}: ignored unknown field")
+
+    status = raw.get("status", "draft")
+    if status not in CURATION_STATUSES:
+        rep.warnings.append(
+            f"curation.status: {status!r} is not one of {CURATION_STATUSES}, "
+            f"so this species is treated as 'draft' and WILL NOT EXPORT until "
+            f"a readable verdict is written")
+        status = "draft"
+
+    seeds_raw = raw.get("seeds", list(CURATION_SEEDS))
+    seeds: list[int] = []
+    if isinstance(seeds_raw, (list, tuple)):
+        for s in seeds_raw:
+            ok = (not isinstance(s, bool) and isinstance(s, (int, float))
+                  and float(s).is_integer() and 1 <= int(s) <= 9999)
+            if not ok:
+                rep.warnings.append(
+                    f"curation.seeds: {s!r} is not a seed (a whole number "
+                    f"1-9999, the NNNN in a bank file's name) and is dropped")
+                continue
+            seeds.append(int(s))
+        seeds = sorted(set(seeds))
+    else:
+        rep.warnings.append(
+            f"curation.seeds: {seeds_raw!r} is not a list, "
+            f"using {list(CURATION_SEEDS)}")
+    if not seeds:
+        # An approved species with no seeds would sit in the manifest with no
+        # bank behind it -- published and undrawable. Refuse the combination
+        # here rather than letting the exporters each decide what it means.
+        rep.warnings.append(
+            f"curation.seeds: no usable seeds, and a published species with "
+            f"an empty bank is a hole in the world -- "
+            f"using {list(CURATION_SEEDS)}")
+        seeds = list(CURATION_SEEDS)
+
+    notes = raw.get("notes", "")
+    if not isinstance(notes, str):
+        rep.warnings.append(f"curation.notes: {notes!r} is not text, kept as text")
+        notes = str(notes)
+    return {"status": status, "seeds": seeds, "notes": notes}
 
 
 def _coerce(p: Param, raw: Any) -> Any:
@@ -2910,10 +3022,16 @@ def spec_hash(spec: dict) -> str:
     a person and changing it must not make the library think it has a new
     species.
 
+    `curation` is left out for the same reason with higher stakes: it is a
+    verdict ON the species, not part of it. Were it hashed, approving a
+    species would change its identity -- export_banks would re-bake all four
+    seeds of an asset whose every voxel is unchanged, and the very first
+    human pass over the library would invalidate every bank in it.
+
     NOT what decides which individual you get -- that is `seed_hash` below, and
     the two are deliberately different functions.
     """
-    body = {k: v for k, v in spec.items() if k != "notes"}
+    body = {k: v for k, v in spec.items() if k not in ("notes", "curation")}
     return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
 
 
@@ -3001,8 +3119,11 @@ def seed_hash(spec: dict) -> str:
     list, which today is every spec in the library except the five birds that
     fly. `tools/birdprobe.py --pose` measures both halves of that: that the two
     poses of one species agree, and that two seeds still do not.
+
+    `curation` is excluded here exactly as in `spec_hash`: a verdict must not
+    redraw the individual it was passed on.
     """
-    body = {k: v for k, v in spec.items() if k != "notes"}
+    body = {k: v for k, v in spec.items() if k not in ("notes", "curation")}
     for path in SEED_INVARIANT:
         if get(body, path, _MISSING) is _MISSING:
             continue          # not carried: nothing to normalise, bytes unchanged
