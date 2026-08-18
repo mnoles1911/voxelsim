@@ -1,0 +1,209 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 120 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15500, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 300, detail]
+coarse tiles: loaded 289, rejected 0 from D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+fine tiles: loaded 1, rejected 0 from bake-out/biome-survey/.stage/fine-8_-11
+terrain: REAL fine-tile elevation, REAL coarse-tile climate, water datum BAKED lake+river, placement planes from fine tiles (sentinels where absent)
+
+=== widening census: 25921 footprints (0 declined) over [-113401,-112889]x[-163141,-162629] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :    23893 footprints (92.1%)
+   45000 mm :     2028 footprints (7.8%)
+extra admitted chunk layers (sky side, dilation included):
+  +  9 chunks :        7 footprints
+  + 10 chunks :      176 footprints
+  + 11 chunks :      306 footprints
+  + 12 chunks :      514 footprints
+  + 13 chunks :      979 footprints
+  + 14 chunks :     1281 footprints
+  + 15 chunks :     1287 footprints
+  + 16 chunks :     1699 footprints
+  + 17 chunks :     1540 footprints
+  + 18 chunks :     1570 footprints
+  + 19 chunks :     1518 footprints
+  + 20 chunks :     1305 footprints
+  + 21 chunks :      856 footprints
+  + 22 chunks :      808 footprints
+  + 23 chunks :      938 footprints
+  + 24 chunks :      976 footprints
+  + 25 chunks :     1027 footprints
+  + 26 chunks :      915 footprints
+  + 27 chunks :      803 footprints
+  + 28 chunks :      657 footprints
+  + 29 chunks :      487 footprints
+  + 30 chunks :      466 footprints
+  + 31 chunks :      373 footprints
+  + 32 chunks :      344 footprints
+  + 33 chunks :      421 footprints
+  + 34 chunks :      405 footprints
+  + 35 chunks :      435 footprints
+  + 36 chunks :      339 footprints
+  + 37 chunks :      352 footprints
+  + 38 chunks :      307 footprints
+  + 39 chunks :      247 footprints
+  + 40 chunks :      140 footprints
+  + 41 chunks :      145 footprints
+  + 42 chunks :      166 footprints
+  + 43 chunks :      136 footprints
+  + 44 chunks :      162 footprints
+  + 45 chunks :      150 footprints
+  + 46 chunks :      117 footprints
+  + 47 chunks :      201 footprints
+  + 48 chunks :      198 footprints
+  + 49 chunks :      173 footprints
+  + 50 chunks :      169 footprints
+  + 51 chunks :       95 footprints
+  + 52 chunks :       71 footprints
+  + 53 chunks :       40 footprints
+  + 54 chunks :       42 footprints
+  + 55 chunks :       52 footprints
+  + 56 chunks :       57 footprints
+  + 57 chunks :       46 footprints
+  + 58 chunks :       20 footprints
+  + 59 chunks :       51 footprints
+  + 60 chunks :       81 footprints
+  + 61 chunks :       50 footprints
+  + 62 chunks :       48 footprints
+  + 63 chunks :       38 footprints
+  + 64 chunks :       24 footprints
+  + 65 chunks :       14 footprints
+  + 66 chunks :       38 footprints
+  + 67 chunks :        6 footprints
+  + 68 chunks :       19 footprints
+  + 69 chunks :       20 footprints
+  + 70 chunks :       14 footprints
+mean extra: 24.52 chunk layers per footprint
+components: mean widening 26564 mm (8.3 chunks), mean dilation slack 71094 mm (22.2 chunks)
+baseline surface shell (sampled 441 footprints): mean 1.75 chunk layers
+
+=== placement census over [-113273,-113017]x[-163013,-162757] m ===
+sites considered: 41264 (per layer: L0=7 L1=1102 L2=8211 L3=31944)
+instances resolved: 22338 (per layer: L0=4 L1=568 L2=5111 L3=16655)
+species represented: 98
+anchor contact audit: 22338 audited, 0 NOT SOLID
+submerged-anchor audit (vs the RENDERED water datum): 0 of 22338 stand in >300 mm of water
+species histogram (name, instances; * = water-gated riparian):
+    american-beech               24
+    bilberry-mat                183
+    birch                        33
+    birdsfoot-trefoil            65
+    black-cherry                 17
+    blackthorn-scrub            325
+    box                         240
+    bracken                     132
+    bramble-thicket             683
+    butchers-broom             4762
+    charcoal-blackened-block      1
+    cherry-blossom               37
+    cocksfoot                   114
+    columnar-cypress             16
+    common-ash                   13
+    common-bluebell             297
+    common-broom                131
+    common-dog-violet           216
+    common-knapweed              35
+    common-milkweed              18
+    common-poppy                 56
+    cork-oak                      1
+    cowslip                      55
+    crab-apple                   54
+    cyclamen                    161
+    dog-rose                    255
+    dogs-mercury                272
+    douglas-fir                   1
+    elder                       232
+    european-yew                  2
+    feather-moss                632
+    field-maple                  50
+    field-scabious               20
+    fireweed                     43
+    flowering-dogwood            57
+    foxglove                     10
+    gorse                       142
+    granite-boulder               3
+    harebell                     94
+    hawthorn-scrub              111
+    hazel-coppice               322
+    hellebore                    71
+    herb-robert                 777
+    holly-understorey           166
+    holm-oak                      2
+    honey-locust                  4
+    hornbeam                     16
+    ivy-ground-layer            258
+    japanese-maple               24
+    jungle-groundcover          109
+    jungle-understory-flower     22
+    karst-breakdown-block         2
+    large-trillium               66
+    leaf-littered-slab            6
+    lily-of-the-valley          223
+    male-fern                   247
+    maritime-pine                 3
+    meadow-daisy                 83
+    meadow-grass                936
+    moss-cushion                470
+    mountain-laurel             328
+    oxeye-daisy                  97
+    prairie-lupine               18
+    primrose                    148
+    quaking-aspen                39
+    red-campion                 175
+    red-clover                  126
+    red-huckleberry             398
+    rhododendron-thicket        351
+    ribwort-plantain             73
+    rowan                        48
+    salal                      4272
+    scots-pine                   20
+    shagbark-hickory              7
+    sinkhole-rim                  1
+    small-leaved-lime             3
+    snowberry                   266
+    spindle                     199
+    sugar-maple                  16
+    sweet-chestnut               11
+    sword-fern                  253
+    sycamore-maple                6
+    temperate-oak                24
+    temperate-sapling           423
+    timothy                      78
+    trout-lily                  145
+    tulip-tree                    1
+    tundra-pine                  13
+    understory-fern              81
+    western-hemlock               2
+    wild-pear                     7
+    wild-privet                 288
+    witch-hazel                 119
+    wood-anemone                296
+    wood-sedge                  208
+    woolly-fringe-moss          342
+    wych-elm                      8
+    yarrow                       48
+riparian (water-gated) species placed: 0 species, 0 instances
+gate attribution over 7920246 (site, species) pairs:
+  tolerated                        559479 (7.0%)
+  biome weight 0                  4657520 (58.8%)
+  elevation band                     1425 (0.0%)
+  below slope min                      61 (0.0%)
+  past slope-curve zero           2533548 (31.9%)
+  water distance (far/unknown)     168213 (2.1%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:    722 instances, mean height   1.2 m
+  slope  15- 30%:   3199 instances, mean height   1.4 m
+  slope  30- 45%:   4261 instances, mean height   1.4 m
+  slope  45- 60%:   5156 instances, mean height   1.6 m
+  slope  60- 75%:   5801 instances, mean height   1.6 m
+  slope  75- 90%:   2679 instances, mean height   1.5 m
+  slope  90-105%:    520 instances, mean height   1.4 m
+kinds: tree=1093 bush=13479 rock=13 grass=4388 flower=3365
+height: mean 1.5 m, median 0.8 m over 22338 instances
+distance to water at anchors: <=2m 0, <=10m 0, <=30m 0, <=120m 277, >120m 22061, unknown 0; wet anchors 0
+slope bands: 0-15% 722, 15-30% 3199, 30-45% 4261, 45-60% 5156, 60%+ 9000
+treeline: below 22338, above 0, unknown 0
+stampable voxels over resolved terrain instances: 68895190
+banks: 22338 requests, 18973 served, 0 miss(no species), 3365 miss(no seeds), 288 files loaded, 0 refused, 0 seed-count mismatches, 58546254 bytes resident
+overlay: wrote bake-out/biome-survey/temperate_forest-fine.instances.csv and bake-out/biome-survey/temperate_forest-fine.ground.bin (138x138 @ 1875 mm)
+json: wrote bake-out/biome-survey/temperate_forest-fine.json (149 counters)
+VERDICT: placement wired; 22338 instances, all anchors solid, none submerged

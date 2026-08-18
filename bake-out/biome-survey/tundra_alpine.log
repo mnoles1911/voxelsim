@@ -1,0 +1,74 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 120 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15500, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 300, detail]
+coarse tiles: loaded 289, rejected 0 from D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+terrain: synthetic elevation, REAL coarse-tile climate, water datum NONE (dry world), placement planes NONE (sentinels)
+
+=== widening census: 25921 footprints (0 declined) over [-76111,-75599]x[-96841,-96329] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :    23146 footprints (89.2%)
+   45000 mm :     2775 footprints (10.7%)
+extra admitted chunk layers (sky side, dilation included):
+  +  8 chunks :      432 footprints
+  +  9 chunks :    11381 footprints
+  + 10 chunks :     9668 footprints
+  + 11 chunks :     1200 footprints
+  + 12 chunks :      402 footprints
+  + 13 chunks :       62 footprints
+  + 14 chunks :        1 footprints
+  + 15 chunks :      487 footprints
+  + 16 chunks :     1496 footprints
+  + 17 chunks :      680 footprints
+  + 18 chunks :      106 footprints
+  + 20 chunks :        2 footprints
+  + 21 chunks :        4 footprints
+mean extra: 10.27 chunk layers per footprint
+components: mean widening 27141 mm (8.4 chunks), mean dilation slack 7259 mm (2.2 chunks)
+baseline surface shell (sampled 441 footprints): mean 1.21 chunk layers
+
+=== placement census over [-75983,-75727]x[-96713,-96457] m ===
+sites considered: 41271 (per layer: L0=7 L1=1115 L2=8313 L3=31836)
+instances resolved: 23935 (per layer: L0=2 L1=143 L2=0 L3=23790)
+species represented: 19
+anchor contact audit: 23935 audited, 0 NOT SOLID
+species histogram (name, instances; * = water-gated riparian):
+    arctic-willow-thicket      3303
+    bilberry-mat               1341
+    crowberry-mat              3254
+    dwarf-birch                2180
+    feather-moss               1097
+    fireweed                    336
+    granite-boulder             135
+    harebell                    535
+    jointed-granite-tor           1
+    juniper-scrub               363
+    moss-cushion                922
+    prairie-lupine              157
+    reindeer-lichen            2870
+    roche-moutonnee               1
+    sheeps-fescue              1541
+    tussock-cottongrass        2559
+    veined-granite                8
+    wild-thyme                  840
+    woolly-fringe-moss         2492
+riparian (water-gated) species placed: 0 species, 0 instances
+gate attribution over 7902446 (site, species) pairs:
+  tolerated                        484300 (6.1%)
+  biome weight 0                  6612997 (83.6%)
+  elevation band                   295952 (3.7%)
+  below slope min                   10564 (0.1%)
+  past slope-curve zero             35456 (0.4%)
+  water distance (far/unknown)     463177 (5.8%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:  22621 instances, mean height   0.4 m
+  slope  15- 30%:   1314 instances, mean height   0.4 m
+kinds: bush=5846 rock=145 grass=13517 reed=2559 flower=1868
+height: mean 0.4 m, median 0.2 m over 23935 instances
+distance to water at anchors: <=2m 0, <=10m 0, <=30m 0, <=120m 0, >120m 0, unknown 23935; wet anchors 0
+slope bands: 0-15% 22621, 15-30% 1314, 30-45% 0, 45-60% 0, 60%+ 0
+treeline: below 0, above 23935, unknown 0
+stampable voxels over resolved terrain instances: 390985
+banks: 23935 requests, 19508 served, 0 miss(no species), 4427 miss(no seeds), 56 files loaded, 0 refused, 0 seed-count mismatches, 489846 bytes resident
+overlay: wrote bake-out/biome-survey/tundra_alpine.instances.csv and bake-out/biome-survey/tundra_alpine.ground.bin (138x138 @ 1875 mm, AMPLIFIED-COARSE ground: sea-only datum, no shore distance)
+json: wrote bake-out/biome-survey/tundra_alpine.json (70 counters)
+VERDICT: placement wired; 23935 instances, all anchors solid, none submerged

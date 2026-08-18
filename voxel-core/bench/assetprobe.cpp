@@ -698,8 +698,70 @@ int main(int argc, char** argv) {
     // never rebuild ground in Python. -----------------------------------------
     if (!opt.overlayBase.empty()) {
         if (!real) {
-            std::fprintf(stderr, "--overlay: no fine tiles loaded, skipping ground raster "
-                                 "(the CSV was still written)\n");
+            // No fine tiles: write the raster from the SAME amplified-coarse
+            // ground the placement census above resolved against (amp over the
+            // coarse tiles). This is the engine's own surface function, not a
+            // rebuild -- but it is NOT the fine bake: no baked lake/river
+            // datum (sea only) and no shore-distance plane (-1 = unknown).
+            // Labelled below so a map from this branch can never be mistaken
+            // for one over baked fine tiles.
+            const int32_t pxMm = 1875; // match the fine tiles' pitch for a comparable map
+            const int64_t x0Mm = (opt.originXM - pr) * 1000, x1Mm = (opt.originXM + pr) * 1000;
+            const int64_t y0Mm = (opt.originYM - pr) * 1000, y1Mm = (opt.originYM + pr) * 1000;
+            const int64_t px0 = floorDiv(x0Mm, int64_t(pxMm)), px1 = floorDiv(x1Mm, int64_t(pxMm));
+            const int64_t py0 = floorDiv(y0Mm, int64_t(pxMm)), py1 = floorDiv(y1Mm, int64_t(pxMm));
+            const uint32_t W = uint32_t(px1 - px0 + 1), H = uint32_t(py1 - py0 + 1);
+            const std::string p = opt.overlayBase + ".ground.bin";
+            std::FILE* gf = std::fopen(p.c_str(), "wb");
+            if (gf == nullptr) {
+                std::fprintf(stderr, "cannot write %s\n", p.c_str());
+                return 1;
+            }
+            const uint32_t ver = 1, planes = 4;
+            const int64_t gx0Mm = px0 * pxMm, gy0Mm = py0 * pxMm;
+            const int32_t stepMm = pxMm;
+            std::fwrite("VXOV", 1, 4, gf);
+            std::fwrite(&ver, 4, 1, gf);
+            std::fwrite(&gx0Mm, 8, 1, gf);
+            std::fwrite(&gy0Mm, 8, 1, gf);
+            std::fwrite(&stepMm, 4, 1, gf);
+            std::fwrite(&W, 4, 1, gf);
+            std::fwrite(&H, 4, 1, gf);
+            std::fwrite(&planes, 4, 1, gf);
+            std::vector<int32_t> elevP(size_t(W) * H), waterP(size_t(W) * H),
+                distP(size_t(W) * H), treeP(size_t(W) * H);
+            for (int64_t py = py0; py <= py1; ++py) {
+                for (int64_t px = px0; px <= px1; ++px) {
+                    const size_t i = size_t(px - px0) + size_t(W) * size_t(py - py0);
+                    const int64_t vx = floorDiv(px * pxMm + pxMm / 2, int64_t(kVoxelSizeMm));
+                    const int64_t vy = floorDiv(py * pxMm + pxMm / 2, int64_t(kVoxelSizeMm));
+                    const int32_t elev = amp.surfaceMm(vx, vy);
+                    // Sea is the only datum this branch knows.
+                    const int32_t w = elev < kSeaLevelMm ? kSeaLevelMm : kNoWaterMm;
+                    int32_t tl = INT32_MIN;
+                    {
+                        const int64_t cMm = int64_t(tiles->pixelSizeMm());
+                        if (cMm > 0) {
+                            const ClimateSample c =
+                                tiles->climate(floorDiv(vx * kVoxelSizeMm, cMm),
+                                               floorDiv(vy * kVoxelSizeMm, cMm));
+                            tl = biomeTreelineMm(c.temperature);
+                        }
+                    }
+                    elevP[i] = elev;
+                    waterP[i] = w;
+                    distP[i] = -1; // shore distance is a fine-tile plane; unknown here
+                    treeP[i] = tl;
+                }
+            }
+            std::fwrite(elevP.data(), 4, elevP.size(), gf);
+            std::fwrite(waterP.data(), 4, waterP.size(), gf);
+            std::fwrite(distP.data(), 4, distP.size(), gf);
+            std::fwrite(treeP.data(), 4, treeP.size(), gf);
+            std::fclose(gf);
+            std::printf("overlay: wrote %s.instances.csv and %s (%ux%u @ %d mm, "
+                        "AMPLIFIED-COARSE ground: sea-only datum, no shore distance)\n",
+                        opt.overlayBase.c_str(), p.c_str(), W, H, stepMm);
         } else {
             const int32_t pxMm = fine.pixelSizeMm();
             const int64_t x0Mm = (opt.originXM - pr) * 1000, x1Mm = (opt.originXM + pr) * 1000;

@@ -1,0 +1,167 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 120 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15500, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 300, detail]
+coarse tiles: loaded 289, rejected 0 from D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+fine tiles: loaded 1, rejected 0 from bake-out/biome-survey/.stage/fine-7_-5
+terrain: REAL fine-tile elevation, REAL coarse-tile climate, water datum BAKED lake+river, placement planes from fine tiles (sentinels where absent)
+
+=== widening census: 25921 footprints (0 declined) over [-105121,-104609]x[-76111,-75599] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :    22987 footprints (88.6%)
+   45000 mm :     2934 footprints (11.3%)
+extra admitted chunk layers (sky side, dilation included):
+  +  8 chunks :        4 footprints
+  +  9 chunks :      570 footprints
+  + 10 chunks :     1820 footprints
+  + 11 chunks :     2317 footprints
+  + 12 chunks :     2118 footprints
+  + 13 chunks :     1058 footprints
+  + 14 chunks :      620 footprints
+  + 15 chunks :      607 footprints
+  + 16 chunks :      569 footprints
+  + 17 chunks :      624 footprints
+  + 18 chunks :     1028 footprints
+  + 19 chunks :     1097 footprints
+  + 20 chunks :      956 footprints
+  + 21 chunks :      800 footprints
+  + 22 chunks :      743 footprints
+  + 23 chunks :      789 footprints
+  + 24 chunks :      771 footprints
+  + 25 chunks :      710 footprints
+  + 26 chunks :      663 footprints
+  + 27 chunks :      587 footprints
+  + 28 chunks :      551 footprints
+  + 29 chunks :      576 footprints
+  + 30 chunks :      705 footprints
+  + 31 chunks :      784 footprints
+  + 32 chunks :      523 footprints
+  + 33 chunks :      445 footprints
+  + 34 chunks :      326 footprints
+  + 35 chunks :      334 footprints
+  + 36 chunks :      275 footprints
+  + 37 chunks :      310 footprints
+  + 38 chunks :      317 footprints
+  + 39 chunks :      350 footprints
+  + 40 chunks :      269 footprints
+  + 41 chunks :      342 footprints
+  + 42 chunks :      194 footprints
+  + 43 chunks :      178 footprints
+  + 44 chunks :      168 footprints
+  + 45 chunks :       86 footprints
+  + 46 chunks :      122 footprints
+  + 47 chunks :       75 footprints
+  + 48 chunks :       41 footprints
+  + 49 chunks :       61 footprints
+  + 50 chunks :       69 footprints
+  + 51 chunks :       26 footprints
+  + 52 chunks :       24 footprints
+  + 53 chunks :       33 footprints
+  + 54 chunks :       16 footprints
+  + 55 chunks :       10 footprints
+  + 56 chunks :       26 footprints
+  + 57 chunks :       13 footprints
+  + 58 chunks :       19 footprints
+  + 59 chunks :       33 footprints
+  + 60 chunks :        2 footprints
+  + 72 chunks :        1 footprints
+  + 78 chunks :        3 footprints
+  + 79 chunks :        4 footprints
+  + 80 chunks :        4 footprints
+  + 81 chunks :        5 footprints
+  + 82 chunks :        2 footprints
+  + 83 chunks :        3 footprints
+  + 96 chunks :        1 footprints
+  + 99 chunks :        1 footprints
+  +100 chunks :        9 footprints
+  +101 chunks :        6 footprints
+  +103 chunks :        1 footprints
+  +104 chunks :        8 footprints
+  +105 chunks :        6 footprints
+  +106 chunks :        2 footprints
+  +107 chunks :        3 footprints
+  +108 chunks :        8 footprints
+  +109 chunks :       15 footprints
+  +110 chunks :        8 footprints
+  +111 chunks :       14 footprints
+  +112 chunks :       17 footprints
+  +113 chunks :       21 footprints
+  +114 chunks :        7 footprints
+  +115 chunks :       18 footprints
+mean extra: 22.43 chunk layers per footprint
+components: mean widening 27263 mm (8.5 chunks), mean dilation slack 61689 mm (19.2 chunks)
+baseline surface shell (sampled 441 footprints): mean 1.51 chunk layers
+
+=== placement census over [-104993,-104737]x[-75983,-75727] m ===
+sites considered: 41411 (per layer: L0=12 L1=1168 L2=8192 L3=32039)
+instances resolved: 22988 (per layer: L0=2 L1=488 L2=5090 L3=17408)
+species represented: 41
+anchor contact audit: 22988 audited, 0 NOT SOLID
+submerged-anchor audit (vs the RENDERED water datum): 0 of 22988 stand in >300 mm of water
+species histogram (name, instances; * = water-gated riparian):
+    banded-sandstone-ledge        1
+    big-galleta                 518
+    big-sagebrush              1833
+    brittlebush                1388
+    buffalo-grass              1464
+    california-poppy           1214
+    conglomerate-boulder          1
+    creosote-bush              1465
+    cross-bedded-butte            1
+  * date-palm                     7
+    desert-bloom                136
+    desert-dead                  41
+    desert-ironwood              19
+    desert-lily                 104
+    desert-marigold             427
+    desert-saltgrass           1104
+    desert-shrub                649
+    devils-thorn                647
+  * doum-palm                     2
+    dry-tussock                1733
+    esparto-grass              1297
+    feather-grass               951
+    four-wing-saltbush         1064
+  * giant-reed                    3
+    globe-mallow                297
+    joshua-tree                  93
+    limestone-slab                5
+    mopane                       68
+    ocotillo                    840
+    olive                        33
+    prairie-coneflower          189
+    red-oat-grass              1005
+    rubber-rabbitbrush          697
+    saguaro                     207
+    saltbush                   1860
+    sand-verbena                546
+    tafoni-sandstone              7
+  * tamarisk-scrub               67
+    ventifact-boulder             5
+    vipers-bugloss              115
+    wild-sage-bush              885
+riparian (water-gated) species placed: 4 species, 79 instances
+gate attribution over 7948526 (site, species) pairs:
+  tolerated                        459478 (5.7%)
+  biome weight 0                  7188596 (90.4%)
+  below slope min                       4 (0.0%)
+  past slope-curve zero            288140 (3.6%)
+  standing water (submerged)          636 (0.0%)
+  water distance (far/unknown)      11672 (0.1%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:   6250 instances, mean height   1.0 m
+  slope  15- 30%:   7340 instances, mean height   1.1 m
+  slope  30- 45%:   4442 instances, mean height   1.2 m
+  slope  45- 60%:   2386 instances, mean height   1.5 m
+  slope  60- 75%:   1925 instances, mean height   1.4 m
+  slope  75- 90%:    570 instances, mean height   1.3 m
+  slope  90-105%:     75 instances, mean height   1.2 m
+kinds: tree=470 bush=10748 rock=20 grass=8072 reed=3 flower=3675
+height: mean 1.2 m, median 0.8 m over 22988 instances
+distance to water at anchors: <=2m 112, <=10m 289, <=30m 842, <=120m 11645, >120m 10100, unknown 0; wet anchors 17
+slope bands: 0-15% 6250, 15-30% 7340, 30-45% 4442, 45-60% 2386, 60%+ 2570
+treeline: below 22988, above 0, unknown 0
+stampable voxels over resolved terrain instances: 8969345
+banks: 22988 requests, 19310 served, 0 miss(no species), 3678 miss(no seeds), 124 files loaded, 0 refused, 0 seed-count mismatches, 4042482 bytes resident
+overlay: wrote bake-out/biome-survey/desert.instances.csv and bake-out/biome-survey/desert.ground.bin (138x138 @ 1875 mm)
+json: wrote bake-out/biome-survey/desert.json (92 counters)
+VERDICT: placement wired; 22988 instances, all anchors solid, none submerged
