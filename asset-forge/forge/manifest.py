@@ -370,8 +370,16 @@ LAYERS = (
     # them further) while opening the walkable gaps a player needs. Density is
     # the honest knob here for the same reason it was on L1: per-species
     # spacing folds into pick weights and cancels wherever a biome saturates.
+    # max_radius 2_500 -> 10_000, 2026-08-18. The bake REFUSED 12 species whose
+    # baked reach exceeds the declared radius (giant-kelp 9.3 m, feather-boa-kelp
+    # 4.2 m, elephant-grass 4.05 m, giant-reed 2.85 m ...) with the correct
+    # reason: "rect queries would miss its edge". Raising it is free HERE and
+    # only here -- L3 is excluded from the streaming bound by the terrainLattice
+    # guard, so unlike L0/L1 this radius prices no admitted chunks; it only
+    # dilates the detail resolver's own query rect, which is what makes a
+    # 9 m kelp frond findable from the cell its anchor sits in.
     Layer(cell_mm=800, max_height_mm=30_000, max_depth_mm=2_000,
-          max_radius_mm=2_500, density_per_mille=300, seed_count=4,
+          max_radius_mm=10_000, density_per_mille=300, seed_count=4,
           terrain_lattice=False),
 )
 
