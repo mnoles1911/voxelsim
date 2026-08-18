@@ -88,7 +88,7 @@ positionally identical to v1 so a v1 parser fails on `version`, not on garbage.
 | `quant` | `u8` | 1 = 100 mm/LSB, 2 = 250 mm/LSB |
 | `codec` | `u8` | 0 = `CODEC_RAW`, 1 = `CODEC_ZSTD` |
 | `bake_ver` | `u16` | bake algorithm + constants version |
-| `flags` | `u16` | bit0 = flow plane present, bit1 = basin table present (§6.1). Any other bit set is **rejected**. |
+| `flags` | `u16` | bit0 = flow plane present, bit1 = basin table present (§6.1), bit2 = water plane (bake_ver 9), bit3 = headwaters (bake_ver 24), bit4 = bathymetry pair (bake_ver 27), bit5 = placement channel planes (§6.2, bake_ver 28). Any other bit set is **rejected**. |
 | `base_offset_mm` | `i32` | per-tile elevation datum |
 | `parent_scale` | `u8` | 0 = absolute (this spec). Reserved for a future residual ladder. |
 | `reserved` | `u8[3]` | must be 0 |
@@ -96,7 +96,13 @@ positionally identical to v1 so a v1 parser fails on `version`, not on garbage.
 | section table | `n_sections × {u32 id, u64 offset, u64 length}` | offsets are from file start |
 
 Section ids: `ELEV_INDEX` = 1, `ELEV_DATA` = 2, `FLOW_INDEX` = 3, `FLOW_DATA` = 4,
-`BASIN_TABLE` = 5 (§6.1).
+`BASIN_TABLE` = 5 (§6.1), `WATER_INDEX` = 6, `WATER_DATA` = 7 (bake_ver 9),
+`HEADWATERS` = 8 (bake_ver 24), `BATHY_DEPTH_INDEX` = 9, `BATHY_DEPTH_DATA` = 10,
+`BATHY_SHORE_INDEX` = 11, `BATHY_SHORE_DATA` = 12 (bake_ver 27; §6 of
+`tile_codec.py`'s comment blocks are the live spec for 6–12), and the placement
+channel pairs of §6.2 (bake_ver 28): `PLACE_DIST_WATER_INDEX/DATA` = 13/14,
+`PLACE_TWI_INDEX/DATA` = 15/16, `PLACE_TALUS_INDEX/DATA` = 17/18,
+`PLACE_CURV_INDEX/DATA` = 19/20, `PLACE_HEAT_INDEX/DATA` = 21/22.
 
 **`codec` is a field, not a constant, on purpose.** `CODEC_RAW` lets the C++ decoder land and be
 tested before any compression dependency exists; `CODEC_ZSTD` is added without touching the
@@ -270,6 +276,45 @@ seed outside its own bbox, a `kind` outside the enum, and non-zero reserved byte
 The bake's registry filter (which depressions get a row at all) is a set of `BakeConstants`, so
 changing it rolls `bake_ver` → `fine_provider_id` → a new world, exactly like any other bake
 constant. It is **not** a decoder parameter.
+
+### 6.2 Placement channel planes (optional, `flags` bit5) — added at `bake_ver` 28
+
+Five `uint8` planes consumed by ASSET PLACEMENT (`voxelcore/assetpolicy.h` gates and pick
+weights), baked per tile because placement is worldgen: same answer on every machine, no runtime
+search. `docs/asset-placement-audit.md` §3 and `docs/placement-research.md` §3–§4 are the
+rationale; this section is the bytes.
+
+**All five planes are SUBSAMPLED 4×: plane edge = `size / 4`** (2048 at production, 7.5 m/px).
+Placement gates read distances authored in whole metres and weight multipliers smoother than any
+7.5 m feature, so full resolution would be 16× the bytes for nothing. Everything else about the
+encoding is §4/§5 verbatim — same MED predictor, same modes, same 1-byte-element rules as the flow
+plane (§6): `RAW` is one byte per pixel, `CONSTANT` stores an unsigned 0–255 in `const_cp`,
+out-of-range `const_cp` is **rejected**. The block edge is **derived, never stored**: the header's
+`block_log2` clamped down to the largest power of two that divides the plane edge
+(`tile_codec.placement_block_log2`, mirrored in `tilestore.h`) — at production that is the
+header's own 256-px blocks (the plane is 8×8 of them); a 512-px fixture tile's 128-px plane gets
+one 128-px block.
+
+The pairs, and their value encodings (normative):
+
+| ids | plane | encoding |
+|---|---|---|
+| 13/14 | `dist_water` | distance to the nearest water, **2 m per step**, 0 = wet or touching water, **255 = "≥ 508 m / no water knowable"**. The wet set is `lake extents ∪ river water-plane wet cells ∪ ground below sea level` — the union §12.6 of the placement design demanded (the lake-only `bathy_shore` plane of §6-bathy deliberately serves shading, not this gate). Distance is computed at FULL fine resolution and **min-pooled** 4×4, then floor-quantised — both choices OVER-COVER, so a subsampled cell that contains any wet fine pixel reads 0 and a species gate never reads "farther than true". (Vetoes must over-cover; the near-water *bonus* landing in open water is prevented by the standing-water veto, not by this plane.) |
+| 15/16 | `twi` | topographic wetness index `ln(a / tan β)`, `a` = MFD flow accumulation per unit contour width (m²/m), `tan β` = local slope (floor 0.001). Stored as `clamp(round((twi + 3) * 8), 0, 254)`; **255 = not computable**. Mean-pooled 4×4 from full resolution. |
+| 17/18 | `talus` | debris flux deposited by the fixed-pass talus sweep (cliff cells `tan β ≥ 1.0` shed, flux walks D8 steepest descent while `tan β > 0.78` (~38°, angle of repose), deposits where it falls under). Stored `clamp(round(48 * ln(1 + flux)), 0, 254)`; 255 reserved. Computed on the subsampled grid directly (a 480 m runout is 64 passes at 7.5 m). |
+| 19/20 | `curvature` | Laplacian of the subsampled elevation (Zevenbergen–Thorne total curvature), 1/m. Stored `clamp(128 + round(lap * 640), 0, 255)`: **128 = flat, > 128 concave (hollow), < 128 convex (ridge)**. |
+| 21/22 | `heatload` | McCune–Keon-style heat-load index from slope and aspect, folded about SW (+y is north): `0.5 + 0.5 * cos(aspect - 225°) * s/(s+1)`, `s = tan β`, aspect = the direction the slope FACES. Stored `round(h * 254)`: **127 ≈ flat/neutral, 254 = hottest (steep SW face), 0 = coldest (steep NE face)**. |
+
+Presence is **all five or none** — one flag bit, one decoder branch, and a consumer that could
+see `twi` without `dist_water` would have to invent per-plane residency semantics that §6.1's
+"empty is a statement" rule exists to avoid. A tile with bit5 clear (bake_ver ≤ 27) serves
+**sentinels**: placement's water-distance gate keeps failing closed and every weight multiplier
+reads neutral, which is bit-for-bit the pre-28 behaviour.
+
+Like the bathy pair, the planes are computed on the tile interior: `dist_water` and `twi` inherit
+the padded-domain accumulation/extent inputs where those exist, but a water body that only exists
+in a NEIGHBOURING tile beyond the apron is invisible to this tile's distance field. The error is
+bounded by the apron width and saturates toward "too far", the fail-closed direction.
 
 ## 7. Decode is a pure integer function of the bytes
 

@@ -322,6 +322,13 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         # that comes out is a valid tile of the previous configuration.
         "bathy_depth": getattr(result, "bathy_depth", None),
         "bathy_shore": getattr(result, "bathy_shore", None),
+        # bake_ver 28: SECTION_PLACE_*. Fourth time, same rule -- a product
+        # this dict does not name is dropped in silence.
+        "place_dist_water": getattr(result, "place_dist_water", None),
+        "place_twi": getattr(result, "place_twi", None),
+        "place_talus": getattr(result, "place_talus", None),
+        "place_curv": getattr(result, "place_curv", None),
+        "place_heat": getattr(result, "place_heat", None),
         "provider_id": provider_id,
         # THE CODEC HAS TO BE PASSED, and it was not until 2026-08-01.
         #
@@ -377,6 +384,15 @@ def _encode_fine(result, seed: int, provider_id: str, codec: int | None = None):
         (("water_surface_m",), getattr(result, "water_surface_m", None)),
         (("water_level_m",), getattr(result, "water_level_m", None)),
         (("heads",), getattr(result, "water_heads", None)),
+        # bake_ver 27/28 products. Absent from this guard until 2026-08-17,
+        # which is exactly the silence it exists to refuse.
+        (("bathy_depth",), getattr(result, "bathy_depth", None)),
+        (("bathy_shore",), getattr(result, "bathy_shore", None)),
+        (("place_dist_water",), getattr(result, "place_dist_water", None)),
+        (("place_twi",), getattr(result, "place_twi", None)),
+        (("place_talus",), getattr(result, "place_talus", None)),
+        (("place_curv",), getattr(result, "place_curv", None)),
+        (("place_heat",), getattr(result, "place_heat", None)),
     ):
         if value is None:
             continue          # the bake produced nothing; nothing to lose
