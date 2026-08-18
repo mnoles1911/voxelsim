@@ -1741,7 +1741,9 @@ STAGE_ORDER: tuple[str, ...] = (
 #: ``bake_tile`` reports timings for both lists in one ``cpu_seconds`` dict, so
 #: the split is an identity boundary and not a reporting one.
 PRODUCT_STAGE_ORDER: tuple[str, ...] = (
+    "B5b.bathymetry",
     "B6.discharge_water",
+    "B7.placement_channels",
 )
 
 
