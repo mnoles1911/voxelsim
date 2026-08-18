@@ -398,3 +398,46 @@ Same day as the audit, tasks #6+#8. What of the table above changed state:
 * **NOT touched**: item 2 (per-biome density scalar), item 4 (groves in
   saturated forests), item 5 (rendering), the §5.2 data passes, and
   research's FON-lite cross-layer suppression — deferred with the task.
+
+---
+
+## 8. LANDED (follow-up): the ENGINE was never wired to §7 — root cause of the "identical finale" capture
+
+§7's numbers were true and the world did not change, because they were the
+**probe's** numbers: only `vxc_assetprobe` called the canonical
+`assetchannels.h::assetColumnChannelsAt` binding. Every engine composition
+site — the level-0 GridSampler resolve, `FCoarseChunkGridSampler`,
+`SubmitGpuMeshJob`'s resolve, exact admission's z-range resolve,
+`GeneratedWorld::makeBrick`/`materialAt`, and the detail-asset resolver —
+called the channel-less `assetColumnFactsFromSample(col)` overload, i.e.
+composed with sentinel channels: riparians refused everywhere (fails closed),
+the standing-water veto inert, treeline/TWI/talus/heat multipliers neutral.
+The owner's "finale looks identical" capture and the probe's "3,870 riparian,
+0 submerged" report were both correct, about two different worlds.
+
+The fix: a `vxc::IAssetChannelSource` seam on `GeneratedWorld`/`World`
+(assetfield.h/generator.h/world.h), the engine's one binding
+`FVoxelAssetChannelSource` (VoxelWorldSubsystem.cpp — own
+`FineTileSampler` + `LakeSampler`/`RiverSampler`/`CompositeWaterSampler` in
+baked configuration, mirroring `FLakeWaterSampler`'s own-sampler pattern,
+internally serialized), and every one of the six composition paths above
+resolving facts through it. Admission and meshing share the binding, so
+crowns and instances cannot disagree.
+
+Measured at the alpine lake (−39661,−57292, place-region 512 m, bv28 tiles),
+`vxc_assetprobe --no-channels` (the pre-fix engine's exact facts) vs channels
+on: **submerged anchors 235,453 → 0; riparian 0 species / 0 instances → 67 /
+26,586; reeds 0 → 2,678; water distance unknown 471,311 → 0; treeline unknown
+471,311 → 0**. Total instances 471,311 → 235,740 — the "extra" half of the
+before-world was carpet on the lake bed.
+
+The probe also grew the owner's comparability instruments: `--json` (flat
+counters: kind/layer/species, height mean/median, water-distance bands, the
+0-15/15-30/30-45/45-60/60+ % slope bands, above/below treeline, audits,
+gates), `--compare before.json` (numeric delta table — "did the re-bake
+change anything" in one line), `--no-channels` (the before-world, on demand),
+and `--overlay <base>` (instances CSV + VXOV ground raster). 
+`asset-forge/tools/place_overlay.py` renders those into the map overlays:
+hillshaded elevation + contours + the placement wet union + treeline line +
+one dot per anchor by class (riparian ringed), plus per-class density
+heatmaps.
