@@ -116,6 +116,27 @@ struct AssetColumnChannels {
     int32_t treelineMm = kAssetNoTreelineMm;
 };
 
+// THE HOST'S CHANNEL SEAM. One virtual, deliberately shaped like
+// assetchannels.h's assetColumnChannelsAt so the engine can bind that function
+// (plus whatever locking its samplers need) and hand it to GeneratedWorld --
+// which is what makes every composition path (makeBrick, materialAt, the UE
+// mesher's parallel samplers, exact admission, the detail resolver) read the
+// SAME channels the census probe reads. Before this seam existed the probe
+// called the binding and the engine called the channel-less overload below:
+// the probe censused 3,870 riparian instances at the alpine lake while the
+// engine composed the sentinel world -- riparians refused everywhere, the
+// submerged veto inert -- and the owner photographed both (2026-08-17).
+//
+// NOT const: the canonical binding decodes placement blocks and water rows
+// lazily, so an implementation carries its samplers' threading contract --
+// prewarm-then-share, or serialize internally. Every answer must remain a
+// pure function of (seed, tile bytes): worldgen, never runtime state.
+class IAssetChannelSource {
+public:
+    virtual ~IAssetChannelSource() = default;
+    virtual AssetColumnChannels channelsAt(int64_t vx, int64_t vy) = 0;
+};
+
 inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col,
                                                    const AssetColumnChannels& ch) {
     AssetColumnFacts f;

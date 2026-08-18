@@ -221,6 +221,13 @@ struct FResolveJobInput
 	const vxc::AssetField* Field = nullptr;
 	const vxc::Amplifier* Amp = nullptr;
 	const vxc::IAssetBankSource* Banks = nullptr;
+	// The engine's ONE channel binding (UVoxelWorldSubsystem::
+	// GetAssetChannelSource) -- ground cover must gate on the same water
+	// distance / standing water / treeline the tree meshers gate on, or reeds
+	// resolve where no lake is and grass resolves under it. Null (no fine
+	// tier) means sentinel channels: fail-closed, the pre-channel world.
+	// Thread-safe from workers; internally serialized.
+	vxc::IAssetChannelSource* Channels = nullptr;
 	FGroupKey Group;
 	vxc::AssetVoxelRect Rect;
 	// MeshKeys whose geometry the game thread already has (or has in flight
@@ -439,8 +446,14 @@ FGroupResult RunResolveJob(const FResolveJobInput& In)
 
 	const std::vector<vxc::AssetInstance> Insts = In.Field->instancesForRect(
 		In.Rect,
-		[Amp = In.Amp](int64_t Vx, int64_t Vy)
-		{ return vxc::assetColumnFactsFromSample(Amp->column(Vx, Vy)); },
+		[Amp = In.Amp, Ch = In.Channels](int64_t Vx, int64_t Vy)
+		{
+			// Channel-sourced facts, same binding as the terrain meshers; a
+			// null source composes the sentinel (fail-closed) channels.
+			return vxc::assetColumnFactsFromSample(
+				Amp->column(Vx, Vy),
+				Ch != nullptr ? Ch->channelsAt(Vx, Vy) : vxc::AssetColumnChannels{});
+		},
 		/*terrainOnly*/ false);
 	R.SitesTotal = int32(Insts.size());
 
@@ -1128,6 +1141,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				Input.Field = Field;
 				Input.Amp = Amp;
 				Input.Banks = Banks;
+				Input.Channels = VoxelWorld->GetAssetChannelSource();
 				Input.Group = C.Key;
 				Input.Rect = Rect;
 				Input.KnownGeometry = S.GeometryKnown; // snapshot; stale => dup, not miss

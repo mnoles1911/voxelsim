@@ -40,6 +40,7 @@ namespace vxc
 class AssetField;
 class IAssetBankSource;
 class Amplifier;
+class IAssetChannelSource;
 }
 // --- end TASK #7 hook --------------------------------------------------------
 
@@ -280,6 +281,15 @@ public:
 	const vxc::AssetField* GetAssetField() const;
 	const vxc::IAssetBankSource* GetAssetBankSource() const;
 	const vxc::Amplifier* GetWorldgenAmplifier() const;
+	// The engine's ONE placement-channel binding (bake-28 planes + rendered
+	// water datum + treeline; see FVoxelAssetChannelSource in the .cpp). Any
+	// consumer that resolves AssetField facts MUST compose channels from this
+	// source or its instance list drifts from what the meshers stamp -- the
+	// probe-vs-engine split of 2026-08-17. Null until a field AND the fine
+	// tier are installed; callers then pass default (sentinel) channels, which
+	// is the fail-closed world. NOT const: the binding decodes lazily behind
+	// its own lock. Thread-safe from workers (internally serialized).
+	vxc::IAssetChannelSource* GetAssetChannelSource() const;
 	// --- end TASK #7 hook ----------------------------------------------------
 
 	// True if the voxel at the given integer voxel-lattice coordinate is

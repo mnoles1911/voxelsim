@@ -14,6 +14,7 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
+#include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
@@ -42,6 +43,7 @@
 #include "UnrealClient.h"
 
 #include "voxelcore/assetbank.h"     // v24/v25 asset term: the baked species banks
+#include "voxelcore/assetchannels.h" // ...the canonical channel binding (bake-28 planes + water datum)
 #include "voxelcore/assetfield.h"    // ...the layer table + species + policy, as one object
 #include "voxelcore/assetmanifest.h" // ...and the table asset-forge exports
 #include "voxelcore/bytes.h"
@@ -806,8 +808,15 @@ struct FCoarseChunkGridSampler
 			                                GenT::coarseRep(BaseVY + ChunkVox, Level)};
 			Resolved = AField->resolveForCompose(AField->instancesForRect(
 				ARect,
-				[&Amp](int64_t AVX, int64_t AVY)
-				{ return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY)); },
+				// Facts through the world's channel source (bake-28 planes +
+				// water datum + treeline), NOT the channel-less overload --
+				// the sentinel path is how riparians refused everywhere while
+				// the probe counted 3,870 of them (2026-08-17).
+				[&Amp, &Gen](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY),
+					                                       Gen.assetChannelsAt(AVX, AVY));
+				},
 				/*terrainOnly*/ true));
 			if (!Resolved.empty())
 			{
@@ -2730,6 +2739,134 @@ static FString JoinPerLevel(FormatOneLevelFn&& FormatOneLevel)
 	return Out;
 }
 
+// ---------------------------------------------------------------------------
+// FVoxelAssetChannelSource -- the ENGINE'S instance of the canonical channel
+// binding (assetchannels.h::assetColumnChannelsAt), installed into the world
+// via vxc::World::setAssetChannelSource so every composition path -- the
+// level-0 GridSampler, FCoarseChunkGridSampler, SubmitGpuMeshJob's resolve,
+// exact admission's z-range resolve, GeneratedWorld's makeBrick/materialAt and
+// the detail-asset resolver -- reads the SAME bake-28 placement planes and the
+// SAME composed lake/river water datum the census probe (vxc_assetprobe) and
+// the renderer read.
+//
+// WHY IT EXISTS (the owner-visible defect of 2026-08-17): item 1 of the
+// placement audit landed the planes, the binding and the probe -- but every
+// engine composition site kept calling the channel-less
+// assetColumnFactsFromSample overload. The probe censused 3,870 riparian
+// instances and 0 submerged anchors at the alpine lake while the ENGINE
+// composed the sentinel world at the same coordinates: riparians refused
+// everywhere (distance unknown fails closed), the standing-water veto inert
+// (no datum served), the treeline/TWI/talus/heat multipliers neutral. The
+// "identical" finale capture after the bake-28 re-bake was this file, not the
+// bake.
+//
+// WHY IT OWNS A SECOND FineTileSampler rather than borrowing the streamer's:
+// the same reasoning as FLakeWaterSampler in VoxelWaterSubsystem.cpp (which
+// this class deliberately mirrors) -- the streamer's sampler is private
+// behind an FRWLock whose shared side is only sound because elevation blocks
+// are fully prewarmed at load, and the placement planes and water rows are
+// NOT in that prewarm set: a lazy placement decode under the shared lock
+// would be a data race. The duplication is cheap for the same reason it is
+// there: lazy per-block decode means this holds the placement planes and the
+// water rows actually touched, not the 134 MB elevation lattice.
+//
+// THREADING: one critical section serializes every query -- the documented
+// "prewarm-then-share, or serialize" contract of FineTileSampler, chosen as
+// "serialize" because callers are the per-chunk instancesForRect resolves
+// (dozens of channel reads per chunk, each a hash probe + array read once
+// decoded), not per-voxel paths. Called from meshing workers, the game
+// thread's admission pass and the detail-resolve workers alike. Tile file
+// loads happen inside the lock on first touch, exactly as FLakeWaterSampler
+// loads on the game thread; a missing tile stays missing (one stat per tile
+// per session) and its channels stay at the fail-closed sentinels.
+//
+// DETERMINISM: every answer is a pure function of (seed, tile bytes) at the
+// anchor -- the water sampler stays in its baked configuration (no ledger, no
+// retire-baked-rivers presentation toggle; CompositeWaterSampler composed
+// exactly as the probe composes it), which is what assetchannels.h requires
+// of placement reads.
+class FVoxelAssetChannelSource final : public vxc::IAssetChannelSource
+{
+public:
+	FVoxelAssetChannelSource(uint64 InSeed, FString InRoot, std::string InProviderId,
+	                         vxc::ITileSampler* InClimate)
+		: Tiles(InSeed, InClimate)
+		, Lakes(Tiles)
+		, Rivers(Tiles)
+		, Water(Lakes, Rivers)
+		, Climate(InClimate)
+		, Root(MoveTemp(InRoot))
+		, ProviderId(MoveTemp(InProviderId))
+	{
+		Tiles.setDecompressor(VoxelEarth::GetFineTileDecompressor());
+	}
+
+	vxc::AssetColumnChannels channelsAt(int64_t Vx, int64_t Vy) override
+	{
+		FScopeLock Guard(&Lock);
+		EnsureTileFor(Vx, Vy);
+		return vxc::assetColumnChannelsAt(&Tiles, &Water, Climate, Vx, Vy);
+	}
+
+	uint64 TilesLoaded() const { return Loaded; }
+	uint64 TilesRefused() const { return Refused; }
+
+private:
+	// Same shape as FLakeWaterSampler::EnsureTileFor: load-on-first-touch,
+	// remember absence, warn once on refused bytes (a refused tile's channels
+	// read as sentinels, which on screen is "no riparians here" -- worth a log
+	// line, never a silent shrug). Caller holds Lock.
+	void EnsureTileFor(int64_t Vx, int64_t Vy)
+	{
+		const vxc::TileCoord T = FVoxelFineTileStreamer::CoarseTileForWorldMm(
+			Vx * vxc::kVoxelSizeMm, Vy * vxc::kVoxelSizeMm);
+		if (Tiles.findTile(T.x, T.y) != nullptr)
+		{
+			return;
+		}
+		const uint64 Key = (uint64(uint32(T.x)) << 32) | uint64(uint32(T.y));
+		if (Missing.Contains(Key))
+		{
+			return;
+		}
+		const std::string CacheKey = vxc::formatFineTileCacheKey(ProviderId, Tiles.seed(), T.x, T.y);
+		const FString Path = FPaths::Combine(Root, FString(CacheKey.c_str()) + TEXT(".vxtl"));
+		vxc::FineError Err = vxc::FineError::kNone;
+		if (!Tiles.loadTileFile(std::filesystem::path(*Path), &Err))
+		{
+			Missing.Add(Key);
+			if (Err != vxc::FineError::kFileUnreadable)
+			{
+				++Refused;
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Asset channels: fine tile (%d,%d) at %s was REFUSED (%s). Placement "
+				            "channels stay at fail-closed sentinels there (no riparians, no "
+				            "standing-water veto)."),
+				       T.x, T.y, *Path, ANSI_TO_TCHAR(vxc::fineErrorName(Err)));
+			}
+			return;
+		}
+		++Loaded;
+	}
+
+	FCriticalSection Lock;
+	// DECLARATION ORDER IS LOAD-BEARING, exactly as in FLakeWaterSampler:
+	// Lakes and Rivers borrow Tiles, Water borrows both.
+	vxc::FineTileSampler Tiles;
+	vxc::LakeSampler Lakes;
+	vxc::RiverSampler Rivers;
+	vxc::CompositeWaterSampler Water;
+	// The coarse climate tier -- the same sampler the amplifier's climate
+	// delegates to, so the treeline placement positions is the treeline the
+	// biome gate reads. Borrowed; FVoxelWorldImpl::Tiles outlives this member.
+	vxc::ITileSampler* Climate;
+	FString Root;
+	std::string ProviderId;
+	TSet<uint64> Missing;
+	uint64 Loaded = 0;
+	uint64 Refused = 0;
+};
+
 struct FVoxelWorldImpl
 {
 	// Track B2: TileDir/TileScale select the tile source (see MakeTileSampler
@@ -2904,6 +3041,34 @@ struct FVoxelWorldImpl
 							       double(AssetTallestTerrainVox) / double(VoxelCoords::ChunkEdgeVoxels),
 							       (long long)(CapMm > 0 ? vxc::floorDiv(CapMm, int64(vxc::kVoxelSizeMm)) + 1 : 0));
 							Voxels.setAssetField(&AssetFieldObj);
+							// THE CHANNEL BINDING RIDES WITH THE FIELD (see
+							// FVoxelAssetChannelSource). Installed here, in bring-up,
+							// before any worker reads -- the same narrow-door rule as
+							// setAssetField itself. Without the fine tier there are no
+							// planes and no baked water datum to serve, so the source
+							// stays null and the channels stay sentinels: the
+							// fail-closed world, stated out loud rather than silently
+							// reproduced.
+							if (!FineTileDir.IsEmpty())
+							{
+								AssetChannels = MakeUnique<FVoxelAssetChannelSource>(
+									Seed, FineTileDir,
+									std::string(TCHAR_TO_UTF8(*FineProviderId)), Tiles.get());
+								Voxels.setAssetChannelSource(AssetChannels.Get());
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelAssets: channel binding INSTALLED over %s "
+								            "(placement planes + lake/river datum + treeline). "
+								            "Riparian gate and standing-water veto are LIVE where "
+								            "bake_ver >= 28 tiles are resident."),
+								       *FineTileDir);
+							}
+							else
+							{
+								UE_LOG(LogVoxelEarth, Warning,
+								       TEXT("VoxelAssets: NO -VoxelFineTileDir, so no placement "
+								            "channels -- riparian species refuse everywhere and the "
+								            "standing-water veto is inert (fail-closed sentinels)."));
+							}
 							UE_LOG(LogVoxelEarth, Log,
 							       TEXT("VoxelAssets: INSTALLED from %s -- %d layers, %d species placeable "
 							            "(%d detail entities, %d too rare, %d no biome, %d without banks). "
@@ -3216,6 +3381,15 @@ struct FVoxelWorldImpl
 	FCountingBankSource AssetBankTap;
 	std::vector<vxc::AssetSpecies> AssetSpeciesTable;
 	vxc::AssetField AssetFieldObj;
+
+	// The engine's channel binding (see FVoxelAssetChannelSource above).
+	// DECLARED BEFORE Voxels for the same destruction-order reason the field
+	// chain above is: Voxels holds a raw IAssetChannelSource* into it, and the
+	// binding itself borrows Tiles (declared earlier still) as climate. Null
+	// whenever no field is installed or no fine tier is configured -- the
+	// channels then stay sentinels and composition reproduces the pre-channel
+	// world exactly.
+	TUniquePtr<FVoxelAssetChannelSource> AssetChannels;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 
@@ -7530,8 +7704,15 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 			const vxc::Amplifier& AmpRef = Voxels.amplifier();
 			const std::vector<vxc::AssetInstance> Insts = Field->instancesForRect(
 				FootRect,
-				[&AmpRef](int64_t AVX, int64_t AVY)
-				{ return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY)); },
+				// SAME channel source as the mesh resolve (Voxels forwards to
+				// the one installed binding) -- admission and composition must
+				// derive the instance list from identical facts, or crowns and
+				// admitted z-ranges disagree and treetops get clipped.
+				[&AmpRef, this](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
+					                                       Voxels.assetChannelsAt(AVX, AVY));
+				},
 				/*terrainOnly*/ true);
 			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
 				Field->resolveForCompose(Insts);
@@ -9677,8 +9858,14 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			const vxc::Amplifier& AmpRef = Voxels.amplifier();
 			const std::vector<vxc::AssetInstance> AInsts = AField->instancesForRect(
 				ARect,
-				[&AmpRef](int64_t AVX, int64_t AVY)
-				{ return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY)); },
+				// Channel-sourced facts, same binding as every CPU resolve --
+				// the GPU stamp's byte-parity contract starts at the instance
+				// list, so this resolve must never see different gates.
+				[&AmpRef, this](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
+					                                       Voxels.assetChannelsAt(AVX, AVY));
+				},
 				/*terrainOnly*/ true);
 			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
 				AField->resolveForCompose(AInsts);
@@ -10770,9 +10957,16 @@ void FVoxelWorldImpl::DispatchJobs()
 						// resolveForCompose, which drops detail instances anyway
 						// -- skipping their sites here saves the ~85% of
 						// per-site amplifier columns that bought nothing.
-						AInsts = AField->instancesForRect(ARect, [&Amp](int64_t AVX, int64_t AVY)
+						AInsts = AField->instancesForRect(ARect, [&Amp, GenPtr](int64_t AVX, int64_t AVY)
 						{
-							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY));
+							// Channel-sourced facts (bake-28 planes + water
+							// datum), not the sentinel overload -- see
+							// FVoxelAssetChannelSource. GenPtr forwards to the
+							// one installed binding, so the level-0 mesher, the
+							// coarse sampler, admission and the probe cannot
+							// disagree about which species a site carries.
+							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY),
+							                                       GenPtr->assetChannelsAt(AVX, AVY));
 						}, /*terrainOnly*/ true);
 						AResolved = AField->resolveForCompose(AInsts);
 						// MESHER-SIDE resolve accounting, because the bank tap
@@ -16051,6 +16245,14 @@ const vxc::IAssetBankSource* UVoxelWorldSubsystem::GetAssetBankSource() const
 const vxc::Amplifier* UVoxelWorldSubsystem::GetWorldgenAmplifier() const
 {
 	return Impl ? &Impl->Voxels.amplifier() : nullptr;
+}
+
+vxc::IAssetChannelSource* UVoxelWorldSubsystem::GetAssetChannelSource() const
+{
+	// The one binding FVoxelWorldImpl installed into Voxels (or null when the
+	// fine tier / field is off) -- handed out so the detail-asset resolver
+	// gates its instances on the same channels the meshers compose with.
+	return Impl ? Impl->AssetChannels.Get() : nullptr;
 }
 // --- end TASK #7 hook ---------------------------------------------------------
 

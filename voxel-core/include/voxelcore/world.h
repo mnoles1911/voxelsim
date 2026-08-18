@@ -48,6 +48,15 @@ public:
     // one world, which is the whole point of residency being per bank.
     void setAssetField(const AssetField* field) { gen_.setAssetField(field); }
     const AssetField* assetField() const { return gen_.assetField(); }
+    // The channel source is worldgen exactly as the field is (see
+    // GeneratedWorld::setAssetChannelSource): same narrow door, same bring-up
+    // rule. assetChannelsAt is forwarded so host-side parallel samplers (the
+    // UE meshers, exact admission) resolve facts through the SAME source the
+    // brick/materialAt paths compose with -- one binding, no drift.
+    void setAssetChannelSource(IAssetChannelSource* src) { gen_.setAssetChannelSource(src); }
+    AssetColumnChannels assetChannelsAt(int64_t vx, int64_t vy) const {
+        return gen_.assetChannelsAt(vx, vy);
+    }
     // See Amplifier::waterMarkerColumnsMarked -- the two numbers that separate
     // "the marker is not wired up" from "the camera never looked at water" from
     // "the water is there and something downstream will not draw it".
