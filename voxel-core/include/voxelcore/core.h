@@ -333,7 +333,44 @@ namespace vxc {
 // the terrain-only digest must not. Verified at the bump (radius 8, seed
 // 20260719, brick 16, 2026-08-17 manifest): terrain-only e02458de2be47309
 // unchanged; --assets 41ec6bbf103f18dc -> ea75a87ab98e8cba.
-inline constexpr uint32_t kWorldGenVersion = 26;
+//
+// --- v27: BIOME REBALANCE (owner decisions, 2026-08-18) --------------------
+//
+// Two changes, both in biome.h's classifyBiome and BOTH terrain (surfaceMat
+// moves, so unlike v24..v26 the digests MOVE at this bump):
+//
+//   * THE DRY-LAND CLIFF GATE IS GONE. "Bare rock should not really be a
+//     thing at all unless it's underneath a water body or ocean." Slope >
+//     kBiomeCliffSlopeMmPerM now classifies BARE_ROCK only BELOW the coastal
+//     band (steep ocean floor: rock, not mud -- sediment does not rest above
+//     the angle of repose); on dry land the column falls through to the
+//     treeline/Whittaker answer, so steep hillsides carry their climate's
+//     biome and its slope-curve-gated vegetation. Cliff FACES still show
+//     rock: the topsoil retention floor (unchanged, still tied to the same
+//     constant) leaves a one-voxel soil skin whose wall faces expose the
+//     MAT_ROCK stratigraphy beneath.
+//
+//   * THE GRASSLAND/FOREST PRECIPITATION BOUNDARY MOVED 800 -> 450 mm/yr
+//     (kBiomePrecipSemiU8, u8 17 -> 10) to trade grassland for temperate
+//     forest on this world's compressed precipitation tails. Coarse-corpus
+//     census (vxc_climateprobe 64/axis): TEMPERATE_FOREST 5.44% -> 9.67% of
+//     world (11.9% -> 21.1% of land), GRASSLAND 14.38% -> 12.87%
+//     (31.4% -> 28.1%), BARE_ROCK 5.25% -> 1.07% (all submarine, 0.00% of
+//     land), TUNDRA_ALPINE 7.23% -> 9.03% (ex-cliff columns above the
+//     treeline are alpine now), DESERT/SAVANNA/TAIGA/RAINFOREST/BEACH/OCEAN
+//     within 0.25 points. The full reasoning, including why 450 is this
+//     lever's floor and what it deliberately trades, is at the constants in
+//     biome.h.
+//
+// NO TILE RE-BAKE IS NEEDED to see the new biomes: tiles carry raw climate
+// channels (coarse) and elevation/water/placement planes (fine), never a
+// biome byte -- classification is code, applied per column at generation
+// time, so the next session over the SAME tiles renders v27 biomes. (The
+// placement planes' talus threshold cites the cliff constant only as prose;
+// the bake never calls classifyBiome.) What DOES go stale is anything
+// derived from the old classification outside the tiles: census overlays,
+// biome-keyed capture site lists, and cached session state.
+inline constexpr uint32_t kWorldGenVersion = 27;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

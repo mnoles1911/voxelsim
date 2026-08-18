@@ -44,15 +44,25 @@ VXC_TEST(biome_cold_is_taiga_or_tundra) {
     CHECK_EQ(classifyBiome(T(-5), P(600), V(400), 500'000, 0), TUNDRA_ALPINE);
 }
 
-VXC_TEST(biome_steep_slope_overrides_climate) {
-    // Warm + wet would Whittaker-pick RAINFOREST at slope 0 ...
+VXC_TEST(biome_steep_slope_no_longer_overrides_climate_on_land) {
+    // v27 (owner decision): dry land NEVER classifies BARE_ROCK, whatever the
+    // slope -- a cliff-steep warm wet hillside keeps its climate's biome and
+    // can carry the slope-curve-gated vegetation. (v8..v26 the second call
+    // returned BARE_ROCK; before v8, TUNDRA_ALPINE at an 11-degree
+    // "cliff" threshold.)
     CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kInlandMm, 0), RAINFOREST);
-    // ... but a cliff-steep slope gates to BARE_ROCK regardless. (Before v8
-    // this returned TUNDRA_ALPINE, i.e. permafrost, on a 25 C rainforest
-    // hillside -- and at a "cliff" threshold of 11 degrees.)
     CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kInlandMm,
                            kBiomeCliffSlopeMmPerM + 1),
+             RAINFOREST);
+    // Where the slope gate still lives: BELOW the coastal band. A steep
+    // submarine face is rock, not mud seafloor -- sediment does not rest
+    // above the angle of repose -- and this is the ONLY route to BARE_ROCK.
+    CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kBiomeBeachLowerMm - 1,
+                           kBiomeCliffSlopeMmPerM + 1),
              BARE_ROCK);
+    CHECK_EQ(classifyBiome(T(25), P(2500), V(400), kBiomeBeachLowerMm - 1,
+                           kBiomeCliffSlopeMmPerM),
+             OCEAN);
 }
 
 VXC_TEST(biome_wet_warm_is_rainforest) {
@@ -61,8 +71,15 @@ VXC_TEST(biome_wet_warm_is_rainforest) {
 
 VXC_TEST(biome_precip_seasonality_splits_savanna_from_grassland) {
     // Same warm, semi-arid climate; only the DRY SEASON differs (bio_15).
+    // v27 moved the grassland/forest boundary to 450 mm/yr, so the semi-arid
+    // band this test needs is now 400-446 mm (one u8 step); 420 mm sits in it.
+    CHECK_EQ(classifyBiome(T(20), P(420), V(1000), kInlandMm, 0), SAVANNA);
+    CHECK_EQ(classifyBiome(T(20), P(420), V(200), kInlandMm, 0), GRASSLAND);
+    // 600 mm -- semi-arid grassland through v26 -- is exactly the ground the
+    // owner wanted wooded: it reads TEMPERATE_FOREST now (still SAVANNA when
+    // strongly seasonal, unchanged).
     CHECK_EQ(classifyBiome(T(20), P(600), V(1000), kInlandMm, 0), SAVANNA);
-    CHECK_EQ(classifyBiome(T(20), P(600), V(200), kInlandMm, 0), GRASSLAND);
+    CHECK_EQ(classifyBiome(T(20), P(600), V(200), kInlandMm, 0), TEMPERATE_FOREST);
 }
 
 VXC_TEST(biome_precip_seasonality_splits_forest_types) {
@@ -81,12 +98,16 @@ VXC_TEST(biome_coastal_band_beach_and_ocean) {
 
 VXC_TEST(biome_morphology_gate_varying_slope) {
     // Fixed climate that Whittaker-picks TEMPERATE_FOREST at slope 0
-    // (10 C is not "warm", 1200 mm/yr is in the moderate band).
+    // (10 C is not "warm", 1200 mm/yr is in the moderate band). v27: the
+    // answer is now slope-INDEPENDENT on land -- the third case used to flip
+    // to BARE_ROCK past the cliff threshold and no longer does. This is the
+    // exact hillside the owner walked: steep temperate ground must read as
+    // forest, with rock showing only through the stratigraphy on the faces.
     CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, 0), TEMPERATE_FOREST);
     CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, kBiomeCliffSlopeMmPerM),
              TEMPERATE_FOREST);
     CHECK_EQ(classifyBiome(T(10), P(1200), V(200), kInlandMm, kBiomeCliffSlopeMmPerM + 1),
-             BARE_ROCK);
+             TEMPERATE_FOREST);
 }
 
 VXC_TEST(biome_treeline_rises_with_temperature) {
@@ -118,13 +139,14 @@ VXC_TEST(biome_never_alpine_below_sea_level) {
     // Until v8 the slope gate ran ahead of the sea-level gates, so steep
     // seafloor classified as TUNDRA_ALPINE -- 17.8% of the real 25-tile world
     // was submarine permafrost. Nothing below the coastal band may be anything
-    // but OCEAN, whatever the climate or the slope.
+    // but OCEAN or (v27, steep faces only) BARE_ROCK, whatever the climate.
     for (int32_t t = 0; t <= 255; t += 5)
         for (int32_t p = 0; p <= 255; p += 7)
             for (int64_t slope = 0; slope <= 60'000; slope += 3000)
                 for (int32_t depthMm : {kBiomeBeachLowerMm - 1, -100'000, -1'000'000,
                                         -6'000'000})
-                    CHECK_EQ(classifyBiome(t, p, (t * 3 + p * 5) & 0xff, depthMm, slope), OCEAN);
+                    CHECK_EQ(classifyBiome(t, p, (t * 3 + p * 5) & 0xff, depthMm, slope),
+                             slope > kBiomeCliffSlopeMmPerM ? BARE_ROCK : OCEAN);
 }
 
 VXC_TEST(biome_every_id_reachable_from_physical_ranges) {
@@ -209,9 +231,11 @@ VXC_TEST(biome_map_golden_digest) {
                 }
             }
         }
-    // Re-pinned at worldgen v22 (was 0x7D36AFFD6B9DE5C5 at v8..v21). The third
-    // argument of the sweep is a raw u8 either way; what moved is the gate it
-    // is compared against -- bio_4 >= 128 became bio_15 >= 89 -- so the SAVANNA
-    // cells of this map change and nothing else does.
-    CHECK_EQ(d.h, 0xD7E49028948294F5ull); // GOLDEN(biome_map)
+    // Re-pinned at worldgen v22 (was 0x7D36AFFD6B9DE5C5 at v8..v21; bio_4 ->
+    // bio_15 savanna gate). Re-pinned again at v27: the dry-land cliff gate is
+    // gone (slope cells above 700 mm/m flip from BARE_ROCK to their climate's
+    // biome on land and to BARE_ROCK only below the coastal band) and the
+    // grassland/forest boundary moved 800 -> 450 mm/yr, so both the steep
+    // cells and the 450-800 mm precipitation rows of this map change.
+    CHECK_EQ(d.h, 0x9D322E24B6F38C9Dull); // GOLDEN(biome_map)
 }

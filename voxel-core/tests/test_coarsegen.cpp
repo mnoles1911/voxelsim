@@ -226,7 +226,7 @@ VXC_TEST(coarsegen_golden_digest) {
     // wired in per-brick or per-dispatch rather than per world coordinate.
     // (was 0x85B3E79EF8D01AFC at v5, 0xFCE6D8509799236D at v6..v11, and
     //  0xB812048EB08AA281 at the 700 mm cut of v12)
-    CHECK_EQ(d, 0x4954D7436976D9B1ull);
+    CHECK_EQ(d, 0xB0A48A287A5055D0ull);
 }
 
 VXC_TEST(coarsegen_seed_sensitivity) {
@@ -342,7 +342,21 @@ VXC_TEST(coarsegen_fidelity_vs_true_mip) {
     // just above the new measurements so further degradation still trips.
     // Material at these levels is ring shading; the occupancy rows above are
     // the ones that gate collision.
-    const int64_t matCeilPermille[5] = {0, 175, 155, 90, 30};
+    // v27 (dry-land cliff gate removed): measured 170/153/52/45 against v14's
+    // 170/149/83/25. OCCUPANCY DID NOT MOVE (48/48/13/20 -- the surface is
+    // untouched; only classification changed), which is what licenses reading
+    // the material rows as shading. The mechanism cuts both ways and is the
+    // point-sampled-LOD one this file already documents: through v26 every
+    // cell on this fixture's extreme grades was uniformly BARE_ROCK/MAT_ROCK,
+    // the easiest possible material to represent with one column; now those
+    // cells wear their climate's one-voxel surface skin over rock, so at L4
+    // (where one cell spans 1.6 m and climate/treeline boundaries cross it) a
+    // representative column matches the mip average less often, 25 -> 45,
+    // while at L3 the same change IMPROVED agreement 83 -> 52 (the skin is
+    // more spatially coherent than the old rock/alpine flicker at that
+    // scale). L4 ceiling set just above the measurement, L3 tightened to just
+    // above its improvement, per the standing policy.
+    const int64_t matCeilPermille[5] = {0, 175, 155, 55, 50};
 
     for (int32_t level = 1; level <= 4; ++level) {
         const auto grid = gen.coarseColumns(level, 0, 0);

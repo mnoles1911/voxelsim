@@ -1,4 +1,4 @@
-// The asset term composed into the world function.
+﻿// The asset term composed into the world function.
 //
 // WHAT THIS FILE IS ACTUALLY GUARDING. docs/asset-streaming-design.md said to
 // wire the asset sample into the UE mesher's sampler. That is necessary and not
@@ -577,5 +577,5 @@ VXC_TEST(assetfield_installed_field_moves_the_world_digest_and_the_digest_is_pin
     CHECK(bare != wooded);
     // The golden. Moves ONLY on a deliberate worldgen change (kWorldGenVersion
     // bump): layer table, policy maths, scatter channels, or the fixture bake.
-    CHECK_EQ((unsigned long long)wooded, 0xcfcd3f62789f4d0eull);
+    CHECK_EQ((unsigned long long)wooded, 0xF41F8E6A14A3C5A9ull);
 }

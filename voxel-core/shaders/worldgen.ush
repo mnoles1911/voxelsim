@@ -116,7 +116,15 @@
 // CPU-reference digest stays b2b5d2f1044caa35. Mirror version moves so the
 // skew check can keep meaning "the math disagrees" rather than "somebody
 // forgot the dance."
-#define VXC_WORLDGEN_VERSION_USH 26
+//
+// v27 (biome rebalance, owner decisions -- core.h's v27 entry has the full
+// story): UNLIKE v24..v26 THIS ONE MOVES THE TERRAIN MATH. Two mirrored
+// changes in classifyBiome below: the dry-land cliff gate is gone (slope now
+// gates BARE_ROCK only below the coastal band -- steep ocean floor), and
+// kBiomePrecipSemiU8 dropped 17 -> 10 (800 -> 450 mm/yr) to trade grassland
+// for temperate forest. surfaceMat changes on real ground, so every digest
+// moves at this bump and the prebuilt SPIR-V is respun in the same commit.
+#define VXC_WORLDGEN_VERSION_USH 27
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
@@ -213,7 +221,7 @@ static const int kBiomeTempColdU8 = 143;   // climateTempU8FromDegC(5)
 static const int kBiomeTempWarmU8 = 185;   // climateTempU8FromDegC(18)
 static const int kBiomeTempHotU8 = 204;    // climateTempU8FromDegC(24)
 static const int kBiomePrecipAridU8 = 9;   // climatePrecipU8FromMmPerYr(400)
-static const int kBiomePrecipSemiU8 = 17;  // climatePrecipU8FromMmPerYr(800)
+static const int kBiomePrecipSemiU8 = 10;  // climatePrecipU8FromMmPerYr(450), v27 (was 17 = 800 mm)
 static const int kBiomePrecipModU8 = 34;   // climatePrecipU8FromMmPerYr(1600)
 // v22: the savanna gate reads bio_15 (precipitation seasonality), not bio_4
 // (temperature seasonality). The old kBiomeSeasonalHighU8 = 128 is GONE, not
@@ -225,7 +233,10 @@ static const int kBiomePrecipSeasonalHighU8 = 89; // climatePrecipVarU8FromDeciP
 // retained FRACTION -- the old form was swamped by any realistic 30 m-pixel
 // slope and produced zero topsoil on 85-91% of land, which made the biome
 // surface material invisible everywhere. The retention floor is tied to the
-// cliff threshold so soil is thinnest exactly where BARE_ROCK takes over.
+// cliff threshold so soil bottoms out exactly at the angle of repose (v27:
+// that no longer flips the land BIOME to BARE_ROCK -- exposed rock on steep
+// ground is a stratigraphy fact, the thin soil skin's wall faces, not a
+// biome verdict).
 static const int64_t kTopsoilBaseMm = 200;
 static const int64_t kTopsoilMmPerMetreOfRain = 200;
 static const int64_t kTopsoilSlopeRetentionMinQ10 = 128;
@@ -1183,9 +1194,14 @@ uint classifyBiome(int tempU8, int precipU8, int precipVarU8, int surfaceMm,
     // SEA LEVEL FIRST (v8). The slope gate used to run ahead of these, so steep
     // SEAFLOOR classified as TUNDRA_ALPINE -- measured at 17.8% of the real
     // 25-tile world. Nothing below sea level can be alpine.
-    if (surfaceMm < kBiomeBeachLowerMm) return BIOME_OCEAN;
+    //
+    // v27: the cliff gate lives INSIDE the ocean branch now -- BARE_ROCK is
+    // reachable only under water (steep ocean floor), never on dry land,
+    // which falls through to the treeline/Whittaker answer. Mirror of
+    // biome.h's classifyBiome; the owner-decision reasoning is there.
+    if (surfaceMm < kBiomeBeachLowerMm)
+        return slopeMmPerM > kBiomeCliffSlopeMmPerM ? BIOME_BARE_ROCK : BIOME_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return BIOME_BEACH;
-    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return BIOME_BARE_ROCK;
     if (surfaceMm > biomeTreelineMm(tempU8)) return BIOME_TUNDRA_ALPINE;
 
     if (tempU8 < kBiomeTempColdU8) return BIOME_TAIGA;

@@ -1427,10 +1427,15 @@ constexpr int64_t kBedrockDepthJitterMm = 40000;
 // dimensionless, so it cannot be swamped by a units mismatch again, and it
 // scales the way soil loss actually does -- with how much is there.
 //
-// The retention floor is tied to kBiomeCliffSlopeMmPerPx so soil reaches its
-// thinnest exactly where the cliff gate takes over and paints BARE_ROCK. One
-// constant, two consumers: the "bare soil-less ground that is not classified
-// as a cliff" state is unrepresentable by construction.
+// The retention floor is tied to kBiomeCliffSlopeMmPerM so soil reaches its
+// thinnest exactly at the angle of repose. Through v26 that was also where
+// the biome cliff gate painted BARE_ROCK; v27 removed the dry-land cliff
+// gate (biome.h -- owner decision, bare rock only under water now), so on
+// steep land this floor is what carries the "cliffs read as rock" look
+// instead: a one-voxel soil skin whose wall faces expose the MAT_ROCK
+// stratigraphy beneath. The constant still has two consumers -- this floor
+// and the submarine cliff gate -- and stays the single angle-of-repose
+// contract.
 constexpr int64_t kTopsoilBaseMm = 200;
 constexpr int64_t kTopsoilMmPerMetreOfRain = 200; // +200 mm of soil per m/yr of rain
 constexpr int64_t kTopsoilSlopeRetentionMinQ10 = 128; // 12.5% retained at the cliff angle

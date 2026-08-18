@@ -42,7 +42,7 @@ int main() {
                 kBiomeTempHotU8);
     std::printf("static const int kBiomePrecipAridU8 = %d;   // 400 mm/yr\n",
                 kBiomePrecipAridU8);
-    std::printf("static const int kBiomePrecipSemiU8 = %d;   // 800 mm/yr\n",
+    std::printf("static const int kBiomePrecipSemiU8 = %d;   // 450 mm/yr (v27; was 800)\n",
                 kBiomePrecipSemiU8);
     std::printf("static const int kBiomePrecipModU8 = %d;   // 1600 mm/yr\n",
                 kBiomePrecipModU8);
