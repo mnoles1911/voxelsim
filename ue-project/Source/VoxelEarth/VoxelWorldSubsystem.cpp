@@ -9651,21 +9651,29 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 
 	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
 	//
-	// Level 0 only -- the CPU composes assets nowhere else, and
-	// ValidateRegionRequest refuses instances on a coarse region outright. The
-	// resolve is the same instancesForRect + resolveForCompose the CPU worker
-	// runs for this chunk, in the same order, which is the byte-parity
-	// contract: the stamp passes execute per instance in array order, so the
-	// GPU loses every overlap to the same winner the CPU would.
-	if (LevelKey.Level == 0)
+	// ALL LEVELS since the coarse gather kernel landed (04dbdfe): level 0 runs
+	// the scatter stamp, CoarseLevel > 0 the rep-coordinate gather, and the
+	// resolve here is the same instancesForRect + resolveForCompose the CPU
+	// samplers run, in the same order -- the byte-parity contract at every
+	// level. The rect differs by level exactly as the CPU side differs:
+	// level 0 resolves over the chunk's own voxels; a coarse chunk resolves
+	// over the REP COORDINATES of its cells plus the one-cell apron, mirroring
+	// FCoarseChunkGridSampler so the GPU sees the identical instance list.
 	{
 		if (const vxc::AssetField* AField = Voxels.assetField(); AField != nullptr && !AField->empty())
 		{
 			constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
 			const int64 BaseVX = int64(LevelKey.Key.X) * ChunkVox;
 			const int64 BaseVY = int64(LevelKey.Key.Y) * ChunkVox;
-			const vxc::AssetVoxelRect ARect{BaseVX, BaseVY, BaseVX + ChunkVox - 1,
-			                                BaseVY + ChunkVox - 1};
+			using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+			const vxc::AssetVoxelRect ARect =
+				(LevelKey.Level == 0)
+					? vxc::AssetVoxelRect{BaseVX, BaseVY, BaseVX + ChunkVox - 1,
+					                      BaseVY + ChunkVox - 1}
+					: vxc::AssetVoxelRect{GenT::coarseRep(BaseVX - 1, LevelKey.Level),
+					                      GenT::coarseRep(BaseVY - 1, LevelKey.Level),
+					                      GenT::coarseRep(BaseVX + ChunkVox, LevelKey.Level),
+					                      GenT::coarseRep(BaseVY + ChunkVox, LevelKey.Level)};
 			const vxc::Amplifier& AmpRef = Voxels.amplifier();
 			const std::vector<vxc::AssetInstance> AInsts = AField->instancesForRect(
 				ARect,
@@ -9705,8 +9713,14 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 					return false;
 				}
 				FVoxelGpuRegionRequest::FAssetInstance Inst;
-				Inst.AnchorRelVx = int32(R.anchorVx - int64(Req.OriginVx));
-				Inst.AnchorRelVy = int32(R.anchorVy - int64(Req.OriginVy));
+				// Anchor stays in LEVEL-0 voxels at every level; the base
+				// follows the region's level-0 origin (OriginVx is level-L
+				// cell units -- see FAssetInstance's contract). At level 0
+				// the shift is zero and this is the subtraction it always was.
+				Inst.AnchorRelVx = int32(R.anchorVx -
+				                         (int64(Req.OriginVx) << LevelKey.Level));
+				Inst.AnchorRelVy = int32(R.anchorVy -
+				                         (int64(Req.OriginVy) << LevelKey.Level));
 				Inst.AnchorVz = int32(R.anchorVz);
 				Inst.GridOriginZ = S.OriginZ;
 				Inst.RotOriginX = R.grid->rotatedOriginX(R.yawQuarter);
@@ -10484,16 +10498,11 @@ void FVoxelWorldImpl::DispatchJobs()
 			// false, which falls through to the CPU worker exactly like a
 			// full GPU queue does.
 			//
-			// COARSE levels compose on the CPU only (FCoarseChunkGridSampler
-			// samples instance grids at rep coordinates; the GPU coarse
-			// kernel has no stamp and ValidateRegionRequest refuses instances
-			// on coarse regions). A coarse footprint that can hold an asset
-			// must therefore mesh on the CPU, or the fork paints the distant
-			// forest treeless in whatever patches it happens to take. The cap
-			// query is one early-out lattice probe; misrouting costs a CPU
-			// mesh, not a wrong world.
-			&& !(LevelKey.Level >= 1 &&
-			     AssetBandRaiseVox(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Level) > 0)
+			// Coarse levels compose on the GPU too since the gather kernel
+			// (04dbdfe): AssetStampCoarseMain samples each level-L cell at its
+			// rep coordinate, byte-parity with FCoarseChunkGridSampler, and
+			// SubmitGpuMeshJob fills instances at every level -- so the
+			// route-coarse-asset-chunks-to-CPU term that stood here is gone.
 			// A chunk whose previous GPU job FAILED is not offered again: the
 			// failure flagged the record CPU-only, because a timeout under
 			// readback saturation re-fails identically every retry window.

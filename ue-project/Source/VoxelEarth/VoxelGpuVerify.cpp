@@ -91,7 +91,13 @@ namespace
 	// because nothing here installs one. The evidence for v24/v25 is the
 	// placement census (32,669 sites -> 9,898 instances, 0 floating anchors of
 	// 9,898 independently re-read) and the 697-test suite, not this constant.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 25;
+	//
+	// v26 (placement channels: water-distance/TWI/talus planes, bake_ver 28):
+	// same shape as the v25 move -- the new channels are ASSET-PLACEMENT
+	// inputs, not terrain, so the verify region's bytes cannot move; the
+	// channel owner re-verified the terrain digest unchanged (e02458de2be47309
+	// on the fixture leg) before bumping. Version mirror moves, digest stays.
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 26;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
