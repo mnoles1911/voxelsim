@@ -1,0 +1,369 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 266 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15000, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 1000, detail]
+coarse tiles: loaded 289, rejected 0 from tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+fine tiles: loaded 6, rejected 0 from tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-b19d281fd/000000000135276f/s16
+terrain: REAL fine-tile elevation, REAL coarse-tile climate, water datum BAKED lake+river, placement planes from fine tiles (sentinels where absent)
+
+=== widening census: 6561 footprints (0 declined) over [-39789,-39533]x[-57420,-57164] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :     6086 footprints (92.7%)
+   45000 mm :      475 footprints (7.2%)
+extra admitted chunk layers (sky side, dilation included):
+  +  8 chunks :        2 footprints
+  +  9 chunks :      180 footprints
+  + 10 chunks :      307 footprints
+  + 11 chunks :      266 footprints
+  + 12 chunks :      262 footprints
+  + 13 chunks :      302 footprints
+  + 14 chunks :      316 footprints
+  + 15 chunks :      253 footprints
+  + 16 chunks :      315 footprints
+  + 17 chunks :      365 footprints
+  + 18 chunks :      270 footprints
+  + 19 chunks :      180 footprints
+  + 20 chunks :      179 footprints
+  + 21 chunks :      216 footprints
+  + 22 chunks :      221 footprints
+  + 23 chunks :      158 footprints
+  + 24 chunks :      184 footprints
+  + 25 chunks :      146 footprints
+  + 26 chunks :       78 footprints
+  + 27 chunks :       86 footprints
+  + 28 chunks :      102 footprints
+  + 29 chunks :       94 footprints
+  + 30 chunks :       98 footprints
+  + 31 chunks :      103 footprints
+  + 32 chunks :      119 footprints
+  + 33 chunks :      119 footprints
+  + 34 chunks :      130 footprints
+  + 35 chunks :       68 footprints
+  + 36 chunks :       32 footprints
+  + 37 chunks :       26 footprints
+  + 38 chunks :        1 footprints
+  + 39 chunks :       11 footprints
+  + 40 chunks :       31 footprints
+  + 41 chunks :       13 footprints
+  + 42 chunks :        9 footprints
+  + 43 chunks :       37 footprints
+  + 44 chunks :       25 footprints
+  + 45 chunks :        3 footprints
+  + 46 chunks :        4 footprints
+  + 47 chunks :        4 footprints
+  + 48 chunks :        2 footprints
+  + 49 chunks :        2 footprints
+  + 50 chunks :        1 footprints
+  + 51 chunks :        1 footprints
+  + 53 chunks :        1 footprints
+  + 54 chunks :        2 footprints
+  + 55 chunks :        4 footprints
+  + 56 chunks :        9 footprints
+  + 58 chunks :        2 footprints
+  + 59 chunks :        1 footprints
+  + 60 chunks :        4 footprints
+  + 61 chunks :        1 footprints
+  + 62 chunks :        2 footprints
+  + 63 chunks :        1 footprints
+  + 65 chunks :        1 footprints
+  + 66 chunks :        4 footprints
+  + 67 chunks :        5 footprints
+  + 68 chunks :        1 footprints
+  + 70 chunks :        4 footprints
+  + 71 chunks :        7 footprints
+  + 72 chunks :        1 footprints
+  + 74 chunks :        2 footprints
+  + 75 chunks :        1 footprints
+  + 76 chunks :        3 footprints
+  + 80 chunks :        2 footprints
+  + 81 chunks :        1 footprints
+  + 82 chunks :        1 footprints
+  + 86 chunks :        1 footprints
+  + 88 chunks :        2 footprints
+  + 89 chunks :        1 footprints
+  + 91 chunks :        2 footprints
+  + 95 chunks :        1 footprints
+  + 97 chunks :        7 footprints
+  + 98 chunks :        3 footprints
+  +103 chunks :        1 footprints
+  +106 chunks :       12 footprints
+  +107 chunks :        1 footprints
+  +108 chunks :        1 footprints
+  +109 chunks :        1 footprints
+  +125 chunks :        4 footprints
+  +132 chunks :        1 footprints
+  +133 chunks :        7 footprints
+  +137 chunks :        2 footprints
+  +138 chunks :        2 footprints
+  +140 chunks :        1 footprints
+  +143 chunks :        2 footprints
+  +144 chunks :        1 footprints
+  +145 chunks :        1 footprints
+  +146 chunks :        1 footprints
+  +147 chunks :        7 footprints
+  +148 chunks :        2 footprints
+  +149 chunks :        3 footprints
+  +150 chunks :       11 footprints
+  +151 chunks :       12 footprints
+  +152 chunks :       14 footprints
+  +153 chunks :        4 footprints
+  +154 chunks :        3 footprints
+  +155 chunks :        2 footprints
+  +156 chunks :        5 footprints
+  +157 chunks :        8 footprints
+  +158 chunks :        5 footprints
+  +159 chunks :       42 footprints
+  +160 chunks :       23 footprints
+  +161 chunks :        6 footprints
+  +162 chunks :        9 footprints
+  +163 chunks :       13 footprints
+  +164 chunks :       22 footprints
+  +165 chunks :        3 footprints
+  +166 chunks :        3 footprints
+  +167 chunks :        2 footprints
+  +168 chunks :        2 footprints
+  +169 chunks :        5 footprints
+  +172 chunks :        2 footprints
+  +173 chunks :        1 footprints
+  +174 chunks :        1 footprints
+  +175 chunks :        4 footprints
+  +176 chunks :        7 footprints
+  +177 chunks :       10 footprints
+  +178 chunks :        8 footprints
+  +179 chunks :        6 footprints
+  +180 chunks :       13 footprints
+  +181 chunks :       21 footprints
+  +182 chunks :       31 footprints
+  +183 chunks :       36 footprints
+  +184 chunks :       70 footprints
+  +185 chunks :       27 footprints
+  +186 chunks :        4 footprints
+  +187 chunks :       11 footprints
+  +188 chunks :       39 footprints
+  +189 chunks :       21 footprints
+  +190 chunks :        4 footprints
+  +191 chunks :        9 footprints
+  +192 chunks :       10 footprints
+  +193 chunks :        6 footprints
+  +194 chunks :       19 footprints
+  +195 chunks :       12 footprints
+  +197 chunks :       19 footprints
+  +198 chunks :       12 footprints
+  +199 chunks :        5 footprints
+  +200 chunks :       17 footprints
+  +201 chunks :        6 footprints
+  +202 chunks :        1 footprints
+  +203 chunks :        2 footprints
+  +204 chunks :        8 footprints
+  +205 chunks :       11 footprints
+  +206 chunks :        2 footprints
+  +207 chunks :        2 footprints
+  +208 chunks :        8 footprints
+  +209 chunks :       38 footprints
+  +210 chunks :        2 footprints
+  +211 chunks :        9 footprints
+  +212 chunks :        7 footprints
+  +213 chunks :        4 footprints
+  +214 chunks :       13 footprints
+  +215 chunks :        8 footprints
+  +216 chunks :       34 footprints
+  +217 chunks :       35 footprints
+  +218 chunks :       26 footprints
+  +219 chunks :        7 footprints
+  +220 chunks :        1 footprints
+  +221 chunks :       10 footprints
+  +222 chunks :        3 footprints
+  +223 chunks :        5 footprints
+  +224 chunks :       28 footprints
+  +225 chunks :       40 footprints
+  +232 chunks :        2 footprints
+  +234 chunks :        1 footprints
+  +236 chunks :        2 footprints
+  +237 chunks :        5 footprints
+  +238 chunks :       23 footprints
+  +239 chunks :        6 footprints
+  +240 chunks :        5 footprints
+  +241 chunks :        1 footprints
+  +242 chunks :        4 footprints
+  +243 chunks :        3 footprints
+  +244 chunks :        1 footprints
+  +245 chunks :        1 footprints
+  +246 chunks :        1 footprints
+  +247 chunks :        4 footprints
+  +248 chunks :        2 footprints
+  +250 chunks :       11 footprints
+  +251 chunks :        2 footprints
+  +252 chunks :        4 footprints
+  +253 chunks :        9 footprints
+  +254 chunks :        1 footprints
+  +255 chunks :        2 footprints
+  +257 chunks :        2 footprints
+  +258 chunks :        4 footprints
+  +259 chunks :       14 footprints
+  +261 chunks :        3 footprints
+  +262 chunks :        1 footprints
+  +263 chunks :        2 footprints
+  +264 chunks :        3 footprints
+  +265 chunks :        2 footprints
+  +266 chunks :       14 footprints
+  +267 chunks :       23 footprints
+  +268 chunks :        4 footprints
+  +269 chunks :        3 footprints
+  +270 chunks :        1 footprints
+  +272 chunks :        1 footprints
+  +273 chunks :        5 footprints
+  +274 chunks :        2 footprints
+  +275 chunks :        2 footprints
+  +276 chunks :        3 footprints
+  +277 chunks :        3 footprints
+  +278 chunks :        2 footprints
+mean extra: 52.11 chunk layers per footprint
+components: mean widening 26447 mm (8.2 chunks), mean dilation slack 186584 mm (58.3 chunks)
+baseline surface shell (sampled 121 footprints): mean 1.81 chunk layers
+
+=== placement census over [-39725,-39597]x[-57356,-57228] m ===
+sites considered: 30303 (per layer: L0=0 L1=341 L2=2297 L3=27665)
+instances resolved: 11759 (per layer: L0=0 L1=142 L2=765 L3=10852)
+species represented: 122
+anchor contact audit: 11759 audited, 0 NOT SOLID
+submerged-anchor audit (vs the RENDERED water datum): 0 of 11759 stand in >300 mm of water
+species histogram (name, instances; * = water-gated riparian):
+  * arrowhead                    44
+    bilberry-mat                238
+    birch                        23
+    birdsfoot-trefoil            60
+    blackthorn-scrub            402
+  * blanket-weed                 51
+  * bogbean                      13
+    box                         144
+    bracken                     373
+    bramble-thicket             244
+  * branched-bur-reed            65
+  * broadleaf-cattail            63
+  * brook-moss-cushion          175
+  * bulrush                      26
+  * canadian-waterweed           64
+    chalk-outcrop                 2
+    charcoal-blackened-block      2
+    cocksfoot                   107
+    columnar-cypress              8
+  * common-alder                  3
+    common-broom                 39
+  * common-cottongrass           48
+  * common-dogwood              167
+    common-knapweed              28
+  * common-stonewort             28
+    cowslip                      61
+  * curled-pondweed              42
+    dog-rose                     52
+  * eastern-cottonwood            2
+    elder                        94
+    feather-moss                396
+    field-scabious               14
+    fireweed                     44
+  * flowering-rush               30
+    foxglove                      7
+  * fringed-water-lily           31
+    gorse                        42
+    granite-boulder               1
+  * gravel-bar                    2
+  * guelder-rose                 92
+  * hair-cap-moss               384
+    harebell                     66
+  * harts-tongue-fern           126
+    hazel-coppice               100
+    herb-robert                 421
+  * impatiens                    48
+    ivy-ground-layer            293
+    jungle-groundcover          135
+    jungle-understory-flower     18
+  * lady-fern                   383
+  * lake-bed-slab                 2
+    large-trillium               55
+    leaf-littered-slab            5
+  * lesser-pond-sedge            72
+    male-fern                   234
+  * marl-bench                    2
+  * marsh-cinquefoil             43
+  * marsh-marigold               42
+    meadow-daisy                 84
+    meadow-grass                438
+    moss-cushion                230
+  * mossy-sandstone-bench         1
+    mountain-laurel             123
+  * needle-spike-rush            53
+    oxeye-daisy                 116
+  * pickerelweed                 29
+    prairie-lupine               14
+    primrose                    161
+  * purple-loosestrife           97
+    quaking-aspen                21
+  * quartz-vein-cobble-bar        6
+  * quillwort                    14
+  * rapids-whaleback              6
+    red-campion                 176
+    red-clover                   97
+    red-huckleberry              93
+  * reed-sweet-grass             51
+    rhododendron-thicket        277
+    ribwort-plantain             65
+  * riffle-slab                  59
+  * rigid-hornwort               49
+  * river-water-crowfoot         61
+    rowan                        14
+    salal                       662
+    scots-pine                    9
+  * sedge-tussock                85
+    snowberry                    78
+  * soft-rush                   120
+  * sphagnum-hummock            113
+  * spiked-water-milfoil         52
+  * step-pool-boulder            11
+  * streambed-cascade-block     117
+    sugar-maple                   9
+  * sweet-flag                   43
+    sword-fern                  236
+    sycamore-maple                5
+    temperate-sapling           578
+    timothy                      89
+  * travertine-rimstone-dam       1
+  * tree-fern                     7
+    tundra-pine                  10
+  * undercut-bank-block           1
+    understory-fern             127
+  * water-chestnut               31
+  * water-earwort                18
+  * water-forget-me-not          89
+  * water-horsetail              44
+  * water-mint                  102
+  * water-plantain               56
+  * water-soldier                37
+  * water-starwort               38
+  * watercress                   41
+  * white-water-lily             14
+  * wild-rice                    21
+  * willow-moss                  95
+    witch-hazel                  47
+  * wood-horsetail              184
+    wood-sedge                  227
+    woolly-fringe-moss          146
+    yarrow                       49
+  * yellow-flag-iris             51
+  * yellow-water-lily            25
+riparian (water-gated) species placed: 63 species, 3870 instances
+gate attribution over 7441999 (site, species) pairs:
+  tolerated                        805513 (10.8%)
+  biome weight 0                  5459317 (73.3%)
+  elevation band                   320993 (4.3%)
+  below slope min                     581 (0.0%)
+  past slope-curve zero            578912 (7.7%)
+  standing water (submerged)       124288 (1.6%)
+  water distance (far/unknown)     152395 (2.0%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:   5525 instances, mean height   1.0 m
+  slope  15- 30%:   1758 instances, mean height   1.1 m
+  slope  30- 45%:   1905 instances, mean height   1.2 m
+  slope  45- 60%:   1684 instances, mean height   2.0 m
+  slope  60- 75%:    887 instances, mean height   2.3 m
+stampable voxels over resolved terrain instances: 16109273
+banks: 11759 requests, 907 served, 0 miss(no species), 10852 miss(no seeds), 108 files loaded, 0 refused, 0 seed-count mismatches, 18609558 bytes resident
+VERDICT: placement wired; 11759 instances, all anchors solid, none submerged

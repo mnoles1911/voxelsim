@@ -1,0 +1,13 @@
+# root       D:\vox-wet-cache\terrain-diffusion-unlabeled-80b9ca451a23eae4-b09041b08\000000000135276f\s16
+# tiles      3x2 = 6 requested, 8192 px each (15.36 km)
+# mosaic     6144x4096 px, downsample x4, 7.500 m/px, 46.08 x 30.72 km
+# buffers    0.201 GB of float32 mosaic
+( -5, -5)  bake_ver 26  water YES  wet  1.089%  (730,642 cells)  max depth  10.10 m  basins 401  [86.5s]
+( -4, -5)  bake_ver 26  water YES  wet  0.743%  (498,869 cells)  max depth  11.42 m  basins 581  [79.8s]
+( -3, -5)  bake_ver 26  water YES  wet  0.639%  (428,837 cells)  max depth  12.15 m  basins 404  [68.1s]
+( -5, -4)  bake_ver 26  water YES  wet  0.782%  (524,755 cells)  max depth  10.14 m  basins 260  [71.5s]
+( -4, -4)  bake_ver 26  water YES  wet  0.446%  (299,070 cells)  max depth  13.45 m  basins 165  [76.8s]
+( -3, -4)  bake_ver 26  water YES  wet  0.420%  (281,783 cells)  max depth  10.54 m  basins 241  [78.5s]
+# wet        0.686% of 402,653,184 fine cells over 6 surveyed tile(s)
+# wrote      D:/voxelsim/bake-out/wet-block-bv26-base.png  6144x4096 @ 7.500 m/px
+# cost       466.3s wall, peak RSS 1.37 GB
