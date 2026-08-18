@@ -263,7 +263,7 @@
     "cluster": 0.8,
     "elev_max_m": 1600.0,
     "elev_min_m": 0.0,
-    "slope_max_pct": 45.0,
+    "slope_max_pct": 70.0,
     "spacing_m": 4.0,
     "water_max_m": 0.0
   },

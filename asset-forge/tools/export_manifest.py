@@ -43,6 +43,60 @@ def main() -> int:
 
     specs, seeds_baked, curation = manifest.curated_inputs(SPECS, banks_dir)
 
+    # --- ROCK SELF-CLASSIFICATION (owner directive, 2026-08-18) --------------
+    #
+    # Rocks are allocated by what they physically ARE, measured from the baked
+    # grid, so a newly generated rock species falls into the system without
+    # hand-tuning: bake it, export, and its size has already priced its rarity.
+    #
+    #   volume  = solid voxels x pitch^3 of seed 1's bank (the library
+    #             individual; seeds vary a few percent, rarity doesn't care)
+    #   spacing = max(authored, 6.0 x volume^0.35 m) -- the size-frequency law.
+    #             Real rock populations follow N(>V) ~ V^-1.8..-2 (see
+    #             docs/placement-research.md; same power-law family as the
+    #             Damuth scaling the wildlife densities use), so nominal
+    #             spacing must grow with volume or a 100 m^3 tor is as common
+    #             as a cobble. Calibration: 1 m^3 boulder -> 6 m, 100 m^3
+    #             tor -> ~30 m, cobbles keep their authored spacing (the
+    #             derived floor sits below it). AUTHORED ALWAYS WINS UPWARD --
+    #             a designer may make a species rarer than physics, never
+    #             more common than its size allows.
+    #   cluster = floor of 0.7 for slope-banded (talus-class) rocks whose
+    #             authored cluster is lower: fragmentation debris clusters,
+    #             and the authored library median (0.35) reads as scattered
+    #             gravel where a talus fan should be.
+    #
+    # Mass (volume x ~2600 kg/m^3) is derived and REPORTED but not yet a
+    # placement input; the talus/water transport channels (bake_ver 28) are
+    # what will consume it. Extension point documented in
+    # docs/rock-placement-system.md.
+    try:
+        sys.path.insert(0, str(ROOT))
+        from forge import vxa as _vxa
+        import glob as _glob
+        derived_n = 0
+        for name, body in specs:
+            if body.get("kind") != "rock":
+                continue
+            bank = sorted(_glob.glob(str(banks_dir / name / f"{name}-*.vxa")))
+            if not bank:
+                continue
+            g = _vxa.read(bank[0])
+            solid = int((g.data != 0).sum())
+            pitch = float(body.get("resolution_cm", 10.0)) / 100.0
+            vol = solid * pitch ** 3
+            pl = body.setdefault("placement", {})
+            derived_sp = 6.0 * (vol ** 0.35)
+            if derived_sp > float(pl.get("spacing_m") or 0.0):
+                pl["spacing_m"] = round(derived_sp, 2)
+                derived_n += 1
+            if float(pl.get("slope_min_pct") or 0.0) > 0 and float(pl.get("cluster") or 0.0) < 0.7:
+                pl["cluster"] = 0.7
+        print(f"rock classifier: size-frequency spacing raised on {derived_n} species "
+              f"(measured from banks; authored-wins-upward)")
+    except Exception as e:  # loud, never silent -- a classifier that half-runs
+        raise SystemExit(f"rock classifier failed: {e}")
+
     report = manifest.ExportReport()
     blob = manifest.encode(specs, seeds_baked=seeds_baked, report=report)
 

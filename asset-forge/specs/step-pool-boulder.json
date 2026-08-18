@@ -264,7 +264,8 @@
     "elev_min_m": 0.0,
     "slope_max_pct": 70.0,
     "spacing_m": 4.0,
-    "water_max_m": 2.0
+    "water_max_m": 2.0,
+    "slope_min_pct": 20
   },
   "quad": {
     "belly": 0.52,

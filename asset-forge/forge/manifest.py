@@ -570,7 +570,7 @@ def species_record(spec: dict, name: str, seeds_baked: int,
         _mm(spacing_m),
         _mm(sm.get(spec, "placement.elev_min_m")),
         _mm(sm.get(spec, "placement.elev_max_m")),
-        0,  # slope_min: placement.slope_min_pct does not exist in the spec yet
+        int(round(float(sm.get(spec, "placement.slope_min_pct") or 0.0) * 10.0)),
         int(round(float(sm.get(spec, "placement.slope_max_pct") or 70.0) * 10.0)),
         _mm(sm.get(spec, "placement.water_max_m") or 0.0),
         _mm(nominal_height_m(spec, kind)),

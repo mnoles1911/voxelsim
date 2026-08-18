@@ -711,6 +711,13 @@ PARAMS: tuple[Param, ...] = (
       help="Ground steeper than this will not carry the species. Stated as a grade "
            "in percent, the same currency the engine's cliff gate uses — above 70% "
            "(~35 degrees) the ground classifies as bare rock and carries nothing."),
+    P("placement.slope_min_pct", "Gentlest ground (% grade)", 0.0, 0.0, 70.0, 1.0,
+      group="placement", kinds=_LAND_KINDS,
+      help="Ground FLATTER than this will not carry the species. 0 means no floor. "
+           "This is the scree band: talus and cliff-fall debris live on steep ground "
+           "and must vanish from lawns, which a ceiling alone can never say. The "
+           "engine gate (slopeMinMmPerM) has existed since the format was defined; "
+           "this row is what finally lets a spec author it."),
     P("placement.water_max_m", "Distance to water (m)", 0.0, 0.0, 500.0, 5.0,
       group="placement", kinds=_LAND_KINDS,
       help="0 means it does not care. Above 0, the species only appears within this "
