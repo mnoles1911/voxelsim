@@ -351,3 +351,50 @@ differentiates the dry ones, 3 sharpens the steep ones, 4 organises the rich
 ones. Item 5 is the only reason a player would currently conclude "there is
 no placement system" for two-thirds of the library — the logic exists; the
 pixels do not.
+
+---
+
+## 7. LANDED 2026-08-17 (evening): item 1, plus research recs 2–7 — bake_ver 28 / worldgen v26
+
+Same day as the audit, tasks #6+#8. What of the table above changed state:
+
+* **§3 (water distance) — SERVED.** The bake's wet set is now the full
+  `lakes ∪ river plane ∪ sea` union (§12.6's trap closed), shipped as one of
+  five new u8 placement planes per fine tile (`SECTION_PLACE_*`,
+  docs/vxtl-v2-format.md §6.2), read through
+  `FineTileSampler::placementAtVoxel` and the canonical
+  `assetchannels.h::assetColumnChannelsAt` binding. Measured on the bv28
+  tiles (namespace `-b19d281fd`, six alpine + rainforest (−6,−11) + desert
+  (−7,−7)): at the alpine lakeshore (−39661,−57292) **63 riparian species /
+  3,870 instances place** (was 0 / 0, ever), cattail-bulrush-bur-reed ringing
+  the lake; at a riverside rainforest site (−86471,−168131) **72 riparian
+  species / 8,057 instances**, and rainforest canopy beats desert on
+  identical real-fine conditions (L1 204 vs 156) — reversing §2's reading 2
+  wherever water is inside the authored reach. (A rainforest RIDGE 150+ m
+  from any water stays canopy-starved at L1 39: that is the authored 60–120 m
+  water binding of the guild doing its job, not a gate failure — 0.5% of its
+  refusals attribute to the water gate, 93% to biome weight.) The gate keeps
+  failing closed on pre-28 tiles: re-measured on the old corpus, still 0
+  riparian, bit-identical census — the sentinel path reproduces the v25
+  world exactly.
+* **§3.4 (trees on lake beds) — CLOSED, from the rendered datum.** The veto
+  now reads the SAME composed `LakeSampler`/`RiverSampler` water surface the
+  renderer draws (the first cut read the debug water-marker field, which is
+  empty in production — the owner's lake-tree photo). The probe re-audits
+  every anchor against that datum independently: **0 submerged of 11,759 /
+  18,990 / 20,389** at the lakeshore / riverside / desert censuses, and it
+  exits nonzero if one ever is.
+* **§1's "aspect/moisture microhabitat" and "slope band" rows** — TWI
+  moisture, talus flux, curvature and heat-load planes bake beside the
+  distance; pick weights read them through per-species affinities DERIVED at
+  import (water_max, biome weights, kind, height — zero spec edits). The
+  hard `slope_max` became a response curve sized inversely from height
+  (owner: "steeper slopes have small trees"), and the treeline a krummholz
+  BAND (±150 m by aspect heat load).
+* **`vxc_assetprobe` grew the instruments this document asked for**: the
+  `--species` histogram (with riparian call-outs), a per-gate refusal
+  attribution (one spelling with the gate itself), the submerged audit, and
+  mean placed height per slope bucket.
+* **NOT touched**: item 2 (per-biome density scalar), item 4 (groves in
+  saturated forests), item 5 (rendering), the §5.2 data passes, and
+  research's FON-lite cross-layer suppression — deferred with the task.
