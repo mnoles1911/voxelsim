@@ -20,6 +20,17 @@ if(NOT MSVC)
   target_compile_options(vxc_terrainprobe PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_reliefprobe: REGION-SCALE relief statistics (windowed relief, wall
+# scores, slope bimodality, hypsometry, TRI/VRM) over the amplified surface,
+# comparable lag-for-lag against 30 m DEM clips. terrainprobe answers the
+# roughness question; this answers the kilometre-scale drama question
+# (docs/dem-reference-library.md section 5). ---------------------------------
+add_executable(vxc_reliefprobe reliefprobe.cpp)
+target_link_libraries(vxc_reliefprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_reliefprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_stagedump: STAGE-BY-STAGE observability for the amplification
 # pipeline. Dumps the client half (S2 carrier-only / S3 continuous surface /
 # S4 voxelised) as float32 .npy + JSON sidecars over one world rectangle, at
