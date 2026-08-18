@@ -247,6 +247,68 @@ AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
         s.depthMm = r.depthMm;
         s.voxelSizeMm = r.voxelSizeMm;
 
+        // --- CHANNEL RESPONSES (worldgen v26): derived here, not authored ---
+        //
+        // THE SLOPE CURVE, sized inversely from height for trees and bushes
+        // (owner rule 2026-08-17: "steeper slopes have small trees" -- soil
+        // depth and windthrow bite the big crowns first): tall canopy tapers
+        // out by 60% slope, mid by 75%, small by 90%, krummholz-scale holds
+        // to 100%. A species that AUTHORED a deliberately low ceiling
+        // (<= 30%) keeps it as its zero point -- a floodplain willow must not
+        // climb a hillside because it is short. Everything else (rocks,
+        // grass, reeds -- kinds whose authored band IS their habitat
+        // statement) keeps the authored ceiling as the zero point and gains
+        // only the taper below it. Deriving here rather than hand-editing 78
+        // specs is the point: the curve moves with the species' own height,
+        // and an authored override field can land in the spec later without
+        // touching this default.
+        {
+            int32_t zero = r.slopeMaxMmPerM;
+            const bool woody = r.kind == AssetKind::kTree || r.kind == AssetKind::kBush;
+            if (woody && r.slopeMaxMmPerM > 300) {
+                const int32_t derived = r.heightMm >= 15'000   ? 600
+                                        : r.heightMm >= 8'000  ? 750
+                                        : r.heightMm >= 3'000  ? 900
+                                                               : 1000;
+                if (derived > zero) zero = derived;
+            }
+            s.slopeMaxMmPerM = zero; // the curve's zero point -- see the field
+            const int32_t full = zero * 2 / 3;
+            s.slopeFullMmPerM = full < r.slopeMinMmPerM ? r.slopeMinMmPerM : full;
+        }
+
+        // MOISTURE AFFINITY, from what the author already said: a species
+        // that binds itself to water (water_max_m > 0) is a hygrophile; one
+        // whose weight lives mostly in the dry biomes is a xerophile; one
+        // rooted in the rainforest leans wet. Reading the AUTHORED weights
+        // (pre-fold) because abundance says how MANY, not how thirsty.
+        {
+            int64_t total = 0;
+            for (uint32_t b = 0; b < kBiomeCount; ++b) total += r.biomeWeightPerMille[b];
+            const int64_t dry = int64_t(r.biomeWeightPerMille[DESERT]) +
+                                int64_t(r.biomeWeightPerMille[SAVANNA]);
+            const int64_t wet = int64_t(r.biomeWeightPerMille[RAINFOREST]);
+            if (r.waterMaxMm > 0) {
+                s.moistureAffinity = 2;
+            } else if (total > 0 && dry * 2 >= total) {
+                s.moistureAffinity = -2;
+            } else if (total > 0 && dry * 4 >= total) {
+                s.moistureAffinity = -1;
+            } else if (total > 0 && wet * 2 >= total) {
+                s.moistureAffinity = 1;
+            }
+        }
+
+        // TALUS: rocks concentrate below cliffs (boost-only; see the field's
+        // comment). CURVATURE: rocks seek convex ridge noses and cliff bases,
+        // the biggest trees seek concave deep-soil hollows -- the two ends of
+        // the soil-depth gradient, one channel (research 3.3/4.2).
+        s.talusAffinity = r.kind == AssetKind::kRock ? int8_t(1) : int8_t(0);
+        s.curvatureAffinity = r.kind == AssetKind::kRock ? int8_t(-1)
+                              : (r.kind == AssetKind::kTree && r.heightMm >= 15'000)
+                                  ? int8_t(1)
+                                  : int8_t(0);
+
         // THE FOLD. weight x abundance x (cell/spacing)^2, exact integer, one
         // rounding at the end (round-to-nearest: floor would shave every
         // species, and the fold's job is to preserve the authored population).

@@ -300,7 +300,40 @@ namespace vxc {
 // spec_hash. Before it existed the exporter skipped a bake whenever the FILE
 // EXISTED, so the engine would have gone on composing pre-taper trees forever
 // with nothing to say so.
-inline constexpr uint32_t kWorldGenVersion = 25;
+//
+// --- v26: PLACEMENT READS THE GROUND'S OWN CHANNELS ------------------------
+//
+// The terrain function is untouched (terrain-only digest e02458de2be47309
+// before and after -- assets are not terrain); what moved is which species
+// stands where, in five ways:
+//
+//   * STANDING WATER finally reaches the veto: AssetColumnFacts gets its
+//     water surface from the SAME composed lake/river datum the renderer
+//     draws (assetchannels.h over IWaterSampler), plus the sea composed from
+//     the column itself -- not from ColumnSample::waterSurfaceMm, the debug
+//     marker that is empty in every production run and made the first veto
+//     inert while the owner photographed oaks standing in the alpine lake.
+//   * DISTANCE TO WATER is served from the fine tiles' new SECTION_PLACE_*
+//     planes (bake_ver 28), un-refusing the 112 authored riparian species
+//     that failed closed since the gate existed.
+//   * The hard slope ceiling became a RESPONSE CURVE, sized inversely from
+//     species height at import (tall crowns taper out by ~60% slope,
+//     krummholz holds to 100%), and the treeline became a BAND: tall species
+//     thin through the last 150-300 m below the temperature-adjusted line,
+//     shifted by aspect heat load.
+//   * TWI moisture, talus flux and curvature modulate pick weights through
+//     per-species affinities DERIVED at import from what authors already
+//     said (water_max, biome weights, kind, height) -- zero spec edits.
+//   * Every channel is sentinelled: a world with no fine tiles or pre-28
+//     tiles modulates by exactly 1 everywhere except the slope curve and the
+//     treeline band, which need no channel.
+//
+// assetpolicy.h/assetfield.h/assetchannels.h/assetmanifest.cpp are the
+// mechanism; vxc_bench --assets is the ran-flag, and its digest moves while
+// the terrain-only digest must not. Verified at the bump (radius 8, seed
+// 20260719, brick 16, 2026-08-17 manifest): terrain-only e02458de2be47309
+// unchanged; --assets 41ec6bbf103f18dc -> ea75a87ab98e8cba.
+inline constexpr uint32_t kWorldGenVersion = 26;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

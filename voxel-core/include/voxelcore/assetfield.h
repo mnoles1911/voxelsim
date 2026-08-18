@@ -90,19 +90,79 @@ public:
 // A cave mouth is a column with a perfectly good surfaceMm whose top voxel is
 // the open shaft. Nothing about surfaceMm says so, which is why this is a
 // second call and not an inference.
-inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
+// The baked channels a caller can serve BESIDE the column -- everything here
+// is a pure function of (seed, tile bytes) at the anchor, never of runtime
+// state, so the composition stays worldgen. Default-constructed it is all
+// sentinels, and the binding below then reproduces the channel-less world
+// exactly: the water gate fails closed, every multiplier reads neutral.
+//
+// WHO FILLS IT: assetchannels.h's assetColumnChannelsAt is the canonical
+// binding over a FineTileSampler (SECTION_PLACE_* planes), an IWaterSampler
+// (the SAME composed lake/river/sea datum the renderer draws -- NOT the debug
+// water marker, which is exactly the field that was empty over the alpine
+// lake), and the coarse climate (for the treeline). Hosts without those
+// samplers pass the default and get the fail-closed world.
+struct AssetColumnChannels {
+    int32_t distanceToWaterMm = kAssetNoWaterDistanceMm;
+    // Absolute baked water surface over the anchor column, or kNoWaterMarkerMm
+    // (== tilestore's kNoWaterMm; amplifier.cpp static_asserts them equal).
+    int32_t waterSurfaceMm = kNoWaterMarkerMm;
+    int32_t twiMilli = kAssetNoTwiMilli;
+    int16_t talus = -1;
+    int16_t curv = -1;
+    int16_t heat = -1;
+    // The temperature-adjusted treeline at the anchor (biomeTreelineMm of the
+    // column's climate), absolute mm; kAssetNoTreelineMm when unservable.
+    int32_t treelineMm = kAssetNoTreelineMm;
+};
+
+inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col,
+                                                   const AssetColumnChannels& ch) {
     AssetColumnFacts f;
     f.known = true;
     f.biome = col.biome;
     f.surfaceMm = col.surfaceMm;
     f.slopeMmPerM = col.slopeMmPerM;
     f.anchorSolid = Amplifier::materialAt(col, topSolidVoxelZ(col.surfaceMm)) != MAT_AIR;
-    // Distance to water is not servable from a column -- nothing in voxel-core
-    // answers "how far to the nearest watercourse" (design doc section 9). It
-    // is left at the sentinel so a species that needs it is refused rather than
-    // placed on an assumption.
-    f.distanceToWaterMm = kAssetNoWaterDistanceMm;
+    // STANDING WATER, from the channels' baked datum first -- the composed
+    // lake/river/sea surface the renderer draws water at -- and only then from
+    // the column's own waterSurfaceMm, which is the DEBUG MARKER field and is
+    // kNoWaterMarkerMm in every production run (the owner-visible defect of
+    // 2026-08-17: trees standing in the alpine lake, because the veto read a
+    // channel the columns never carry). Either sentinel reads as dry: the veto
+    // errs toward placing on unknown, matching how dry land dominates the
+    // world; the lakes always carry a datum.
+    int32_t ws = ch.waterSurfaceMm != kNoWaterMarkerMm ? ch.waterSurfaceMm
+                                                       : col.waterSurfaceMm;
+    // THE SEA IS THE DATUM, NOT BAKED (lakes.h:implicitWaterDatumMm), so it is
+    // composed HERE, from the column alone, where no caller can forget it: a
+    // column below sea level stands under the sea whatever the samplers say.
+    if (col.surfaceMm < kSeaLevelMm && (ws == kNoWaterMarkerMm || ws < kSeaLevelMm)) {
+        ws = kSeaLevelMm;
+    }
+    if (ws != kNoWaterMarkerMm && ws > col.surfaceMm) {
+        const int64_t d = int64_t(ws) - int64_t(col.surfaceMm);
+        f.standingWaterMm = d > INT32_MAX ? INT32_MAX : int32_t(d);
+    }
+    f.distanceToWaterMm = ch.distanceToWaterMm;
+    f.twiMilli = ch.twiMilli;
+    f.talus = ch.talus;
+    f.curv = ch.curv;
+    f.heat = ch.heat;
+    if (ch.treelineMm != kAssetNoTreelineMm) {
+        const int64_t d = int64_t(ch.treelineMm) - int64_t(col.surfaceMm);
+        f.treelineDeltaMm = d > INT32_MAX ? INT32_MAX : d < INT32_MIN + 1 ? INT32_MIN + 1
+                                                                          : int32_t(d);
+    }
     return f;
+}
+
+// The channel-less binding, kept for callers with no fine tiles and no water
+// sampler (vxc_bench's synthetic ground, tests): sentinels throughout, so a
+// species that needs water distance is refused rather than placed on an
+// assumption, and every channel multiplier reads neutral.
+inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
+    return assetColumnFactsFromSample(col, AssetColumnChannels{});
 }
 
 // The layer table, the species table, the banks and the policy, as one object.

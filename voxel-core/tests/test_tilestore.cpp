@@ -103,6 +103,14 @@ std::filesystem::path fineBathyZstdFixturePath() {
     return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_bathy_zstd_512.vxtl";
 }
 
+// The golden tile carrying the five SECTION_PLACE_* planes (bake_ver 28).
+// Regenerate with `python terrain-service/tools/make_placement_fixture.py`,
+// whose plane contents are FORMULAS the tests below recompute independently --
+// the two halves share the format document and no code.
+std::filesystem::path finePlacementFixturePath() {
+    return std::filesystem::path(VXC_TEST_FIXTURE_DIR) / "vxtl_v2_golden_placement_512.vxtl";
+}
+
 // The CODEC_ZSTD twin of vxtl_v2_golden_512.vxtl: the SAME control lattice,
 // block mode for block mode, with each block's payload wrapped in its own zstd
 // frame. Regenerate both from the CODEC_RAW golden with
@@ -3465,7 +3473,7 @@ VXC_TEST(the_reader_declares_the_features_it_learned_with_this_bake) {
     // again, so this is those bumps asserted rather than remembered -- and the
     // refusal message quotes this number, so a stale one sends whoever reads
     // the log to check the wrong thing.
-    CHECK_EQ(int(kFineMaxKnownBakeVer), 27);
+    CHECK_EQ(int(kFineMaxKnownBakeVer), 28);
     CHECK_EQ(int(kFineFlagsKnown & kFineFlagHeadsPresent), int(kFineFlagHeadsPresent));
     CHECK_EQ(int(kFineFlagHeadsPresent), 0x8);
     CHECK_EQ(int(kSectionHeadwaters), 8);
@@ -3490,6 +3498,28 @@ VXC_TEST(the_reader_declares_the_features_it_learned_with_this_bake) {
     CHECK(kBasinEntryBytesV2 > kBasinEntryBytes);
     CHECK(std::string(fineErrorName(FineError::kBadHeadwaterTable)) ==
           "bad-headwater-table");
+    // bake_ver 28: the placement channel planes. Same load-bearing mask rule.
+    CHECK_EQ(int(kFineFlagPlacementPresent), 0x20);
+    CHECK_EQ(int(kFineFlagsKnown & kFineFlagPlacementPresent),
+             int(kFineFlagPlacementPresent));
+    CHECK_EQ(int(kSectionPlaceDistWaterIndex), 13);
+    CHECK_EQ(int(kSectionPlaceDistWaterData), 14);
+    CHECK_EQ(int(kSectionPlaceTwiIndex), 15);
+    CHECK_EQ(int(kSectionPlaceHeatData), 22);
+    // The wire units, against terrain_service/tile_codec.py's own constants.
+    CHECK_EQ(int(kPlacementSubsample), 4);
+    CHECK_EQ(int(kPlacementDistLsbMm), 2000);
+    CHECK_EQ(int(kPlacementDistUnknown), 255);
+    CHECK_EQ(placementDistanceMm(0), 0);
+    CHECK_EQ(placementDistanceMm(10), 20000);
+    CHECK_EQ(placementDistanceMm(kPlacementDistUnknown), INT32_MAX);
+    CHECK_EQ(placementTwiMilli(24), 0);        // (24/8 - 3) == 0.0
+    CHECK_EQ(placementTwiMilli(104), 10000);   // 10.0
+    CHECK_EQ(placementTwiMilli(kPlacementTwiUnknown), INT32_MIN);
+    // The derived block rule at both interesting sizes: production keeps the
+    // header's blocks, a 512-px fixture collapses to one 128-px block.
+    CHECK_EQ(int(finePlacementBlockLog2(8192, 8)), 8);
+    CHECK_EQ(int(finePlacementBlockLog2(512, 8)), 7);
 }
 
 
@@ -4116,23 +4146,169 @@ VXC_TEST(a_reader_without_the_bathy_flag_bit_refuses_a_v27_tile) {
     CHECK(FineTile::parse(*bytes, {}, &err).has_value());
     CHECK_EQ(int(err), int(FineError::kNone));
 
-    // The mechanism still fires for a bit NOBODY implements (bit5), which is
-    // what a reader older than its tiles will meet next time, and it must say
-    // "the reader is old" rather than "the file is broken".
+    // The mechanism still fires for a bit NOBODY implements (bit6 -- bit5
+    // became the bake_ver 28 placement planes, which is exactly why this test
+    // must always use a bit past the mask's edge), which is what a reader
+    // older than its tiles will meet next time, and it must say "the reader
+    // is old" rather than "the file is broken".
     {
         std::vector<uint8_t> bad = *bytes;
         uint16_t flags = 0;
         std::memcpy(&flags, bad.data() + 31, 2);
-        flags |= 0x20;
+        flags |= 0x40;
         std::memcpy(bad.data() + 31, &flags, 2);
         FineError e = FineError::kNone;
         CHECK(!FineTile::parse(bad, {}, &e).has_value());
         CHECK_EQ(int(e), int(FineError::kUnknownFeature));
         FineHeaderFacts badFacts;
         CHECK(fineReadHeaderFacts(bad.data(), bad.size(), badFacts));
-        CHECK_EQ(int(badFacts.unknownFlagBits()), 0x20);
+        CHECK_EQ(int(badFacts.unknownFlagBits()), 0x40);
         const std::string why = fineDescribeRejection(FineError::kUnknownFeature, badFacts);
         CHECK(why.find("bake_ver up to " + std::to_string(kFineMaxKnownBakeVer)) !=
               std::string::npos);
     }
+    // Bit5 SET but the ten placement sections missing is not "unknown", it is
+    // a file that disagrees with itself -- the same section-agreement refusal
+    // every other flag gets.
+    {
+        std::vector<uint8_t> bad = *bytes;
+        uint16_t flags = 0;
+        std::memcpy(&flags, bad.data() + 31, 2);
+        flags |= kFineFlagPlacementPresent;
+        std::memcpy(bad.data() + 31, &flags, 2);
+        FineError e = FineError::kNone;
+        CHECK(!FineTile::parse(bad, {}, &e).has_value());
+        CHECK_EQ(int(e), int(FineError::kBadSectionTable));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SECTION_PLACE_* (bake_ver 28). Cross-language, same rule as every plane
+// above: the fixture was written by terrain_service/tile_codec.py against the
+// same format document, sharing no code with this decoder, and the expected
+// values below are the generator's FORMULAS recomputed, not its output copied.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// make_placement_fixture.py's plane formulas, one spelling per language.
+uint8_t placementFixtureExpected(FinePlacementPlane plane, uint32_t sx, uint32_t sy) {
+    switch (plane) {
+        case kPlacementDistWater: {
+            const uint32_t d = (sx > 16 ? sx - 16 : 0) * 3;
+            return static_cast<uint8_t>(d > 255 ? 255 : d);
+        }
+        case kPlacementTwi: {
+            if (sx >= 112 && sy >= 112) return 255;
+            const uint32_t t = (sx + sy) / 2;
+            return static_cast<uint8_t>(t > 254 ? 254 : t);
+        }
+        case kPlacementTalus: return 0;
+        case kPlacementCurv: {
+            const int32_t m = ((int32_t(sx) - int32_t(sy)) % 64 + 64) % 64;
+            const int32_t v = 128 + m - 32;
+            return static_cast<uint8_t>(v < 0 ? 0 : v > 255 ? 255 : v);
+        }
+        case kPlacementHeat: return static_cast<uint8_t>((sx * 2 + sy) % 255);
+        default: return 0;
+    }
+}
+
+} // namespace
+
+VXC_TEST(placement_fixture_parses_and_every_plane_reads_back_by_formula) {
+    const std::filesystem::path path = finePlacementFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    FineError err = FineError::kNone;
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {}, &err);
+    CHECK(tile.has_value());
+    CHECK(tile->hasPlacement());
+    CHECK_EQ(int(tile->header().bakeVer), 28);
+    CHECK_EQ(int(tile->placementEdge()), 128);
+    CHECK_EQ(int(tile->placementBlockLog2()), 7); // derived: one 128-px block
+    CHECK_EQ(int(tile->placementBlockCount()), 1);
+
+    // Every subsampled pixel of every plane, through decodePlacementBlock.
+    std::vector<uint8_t> block;
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+        const FinePlacementPlane plane = static_cast<FinePlacementPlane>(p);
+        CHECK(tile->placementBlockResident(plane, 0, 0));
+        CHECK(tile->decodePlacementBlock(plane, 0, 0, block, &err));
+        for (uint32_t sy = 0; sy < 128; ++sy)
+            for (uint32_t sx = 0; sx < 128; ++sx) {
+                if (block[sy * 128 + sx] != placementFixtureExpected(plane, sx, sy)) {
+                    CHECK_EQ(int(block[sy * 128 + sx]),
+                             int(placementFixtureExpected(plane, sx, sy)));
+                    return; // one mismatch prints; 81,920 would not help
+                }
+            }
+    }
+
+    // The cold-path per-pixel read folds the 4x subsample itself: fine pixel
+    // (67, 250) is subsampled pixel (16, 62) -- the shoreline column, where
+    // the distance is exactly 0 (wet).
+    uint8_t v[kPlacementPlaneCount];
+    CHECK(tile->placementAt(67, 250, v, &err));
+    CHECK_EQ(int(v[kPlacementDistWater]), 0);
+    CHECK_EQ(int(v[kPlacementTwi]), int(placementFixtureExpected(kPlacementTwi, 16, 62)));
+    CHECK_EQ(int(v[kPlacementTalus]), 0);
+
+    // And the conversions on real wire values: a stored 30 is 60 m.
+    CHECK_EQ(placementDistanceMm(30), 60'000);
+
+    // The sampler's voxel-addressed read, through its block cache. The tile
+    // is at coarse (-7, 3): fine pixel (-7*512 + 20, 3*512 + 40), and
+    // 18.75 voxels per fine pixel puts a voxel squarely inside it.
+    FineTileSampler sampler(20260719);
+    CHECK(sampler.loadTile(std::move(*tile)));
+    const int64_t px = -7 * 512 + 20, py = 3 * 512 + 40;
+    const int64_t vx = px * 1875 / kVoxelSizeMm, vy = py * 1875 / kVoxelSizeMm;
+    FineTileSampler::FinePlacementSample s = sampler.placementAtVoxel(vx, vy);
+    CHECK(s.valid);
+    CHECK_EQ(int(s.distWater), int(placementFixtureExpected(kPlacementDistWater, 20 / 4, 40 / 4)));
+    CHECK_EQ(int(s.twi), int(placementFixtureExpected(kPlacementTwi, 5, 10)));
+    CHECK_EQ(int(s.curv), int(placementFixtureExpected(kPlacementCurv, 5, 10)));
+    CHECK_EQ(int(s.heat), int(placementFixtureExpected(kPlacementHeat, 5, 10)));
+    // Warm now: the same query is a pure read.
+    CHECK(sampler.placementAtVoxel(vx, vy).valid);
+}
+
+VXC_TEST(placement_planes_absent_serve_sentinels_not_zeros) {
+    // A pre-28 tile (the basin fixture) has no planes: hasPlacement() is
+    // false, the per-pixel read refuses, and the SAMPLER answers an invalid
+    // sample whose fields are the fail-closed sentinels -- never zeros, which
+    // would read as "wet, at the shoreline, maximum talus" and invert every
+    // gate that consumes them.
+    const std::filesystem::path path = fineBasinFixturePath();
+    if (!std::filesystem::exists(path)) {
+        std::printf("  (skipped: %s absent)\n", path.string().c_str());
+        return;
+    }
+    std::optional<std::vector<uint8_t>> bytes = readFileBytes(path);
+    CHECK(bytes.has_value());
+    std::optional<FineTile> tile = FineTile::parse(*bytes, {});
+    CHECK(tile.has_value());
+    CHECK(!tile->hasPlacement());
+    uint8_t v[kPlacementPlaneCount];
+    FineError err = FineError::kNone;
+    CHECK(!tile->placementAt(10, 10, v, &err));
+    CHECK(!tile->placementBlockResident(kPlacementDistWater, 0, 0));
+
+    FineTileSampler sampler(tile->seed());
+    const int32_t tx = tile->tileX(), ty = tile->tileY();
+    const uint32_t size = tile->size();
+    CHECK(sampler.loadTile(std::move(*tile)));
+    const int64_t px = int64_t(tx) * size + 8, py = int64_t(ty) * size + 8;
+    FineTileSampler::FinePlacementSample s =
+        sampler.placementAtVoxel(px * 1875 / kVoxelSizeMm, py * 1875 / kVoxelSizeMm);
+    CHECK(!s.valid);
+    CHECK_EQ(int(s.distWater), int(kPlacementDistUnknown));
+    CHECK_EQ(int(s.twi), int(kPlacementTwiUnknown));
+    // == assetpolicy.h's kAssetNoWaterDistanceMm; assetchannels.h pins them.
+    CHECK_EQ(placementDistanceMm(s.distWater), INT32_MAX);
 }

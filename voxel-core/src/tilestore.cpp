@@ -924,6 +924,7 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     SectionRef elevIndexSec, elevDataSec, flowIndexSec, flowDataSec, basinSec, headSec;
     SectionRef waterIndexSec, waterDataSec;
     SectionRef bathyDepthIndexSec, bathyDepthDataSec, bathyShoreIndexSec, bathyShoreDataSec;
+    SectionRef placeIndexSec[kPlacementPlaneCount], placeDataSec[kPlacementPlaneCount];
     struct Extent {
         uint64_t begin, end;
     };
@@ -972,7 +973,15 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
         case kSectionBathyDepthData: bathyDepthDataSec = ref; break;
         case kSectionBathyShoreIndex: bathyShoreIndexSec = ref; break;
         case kSectionBathyShoreData: bathyShoreDataSec = ref; break;
-        default: break; // see (b): unknown ids are ignored but still bounded
+        default:
+            // The placement pairs (bake_ver 28) are contiguous ids 13..22,
+            // (index, data) per plane in wire order -- a loop, not ten cases.
+            if (id >= kSectionPlaceDistWaterIndex && id <= kSectionPlaceHeatData) {
+                const uint32_t rel = id - kSectionPlaceDistWaterIndex;
+                if ((rel & 1u) == 0) placeIndexSec[rel / 2] = ref;
+                else placeDataSec[rel / 2] = ref;
+            }
+            break; // see (b): unknown ids are ignored but still bounded
         }
     }
 
@@ -1029,6 +1038,21 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     // the water plane. Those bytes would be silently ignored and every lake in
     // the tile would render flat and unshaded with no error raised anywhere.
     if (!wantBathy && bathyAnyPresent) return reject(FineError::kBadSectionTable);
+    // Sixth: the placement planes, ALL TEN SECTIONS OR NONE under one flag bit,
+    // for the bathy pair's reason scaled up -- the five planes are one bake
+    // stage's output, and a tile carrying TWI without the water distance is a
+    // file that disagrees with its own producer. The "sections present, flag
+    // clear" half matters most again: silently ignored bytes here would be
+    // every riparian species refused with no error raised anywhere.
+    const bool wantPlace = (h.flags & kFineFlagPlacementPresent) != 0;
+    if (wantPlace && (h.size % kPlacementSubsample) != 0) return reject(FineError::kBadHeader);
+    bool placeAllPresent = true, placeAnyPresent = false;
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+        placeAllPresent = placeAllPresent && placeIndexSec[p].present && placeDataSec[p].present;
+        placeAnyPresent = placeAnyPresent || placeIndexSec[p].present || placeDataSec[p].present;
+    }
+    if (wantPlace != placeAllPresent) return reject(FineError::kBadSectionTable);
+    if (!wantPlace && placeAnyPresent) return reject(FineError::kBadSectionTable);
 
     // Resolves one PREAMBLE section's bytes. The distinction it carries is the
     // one this whole partial path exists for: nullptr with the section declared
@@ -1085,6 +1109,10 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
     tile.bathyDepthDataLen_ = bathyDepthDataSec.length;
     tile.bathyShoreDataOff_ = bathyShoreDataSec.offset;
     tile.bathyShoreDataLen_ = bathyShoreDataSec.length;
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+        tile.placeDataOff_[p] = placeDataSec[p].offset;
+        tile.placeDataLen_[p] = placeDataSec[p].length;
+    }
 
     const uint32_t perAxis = static_cast<uint32_t>(h.size) >> h.blockLog2;
     const uint32_t blocks = perAxis * perAxis;
@@ -1138,6 +1166,25 @@ std::optional<FineTile> FineTile::parsePartial(FineTileBytes bytes,
         if (shoreIndexData != nullptr) {
             if (!parseBlockIndex(shoreIndexData, bathyShoreIndexSec.length, blocks, blockPixels,
                                  bathyShoreDataSec.length, 2, compressed, tile.bathyShoreIndex_)) {
+                return reject(FineError::kBadBlockIndex);
+            }
+        }
+    }
+
+    // The placement planes ride their OWN geometry -- a 4x-subsampled edge and
+    // the derived block edge (finePlacementBlockLog2) -- through the same
+    // parseBlockIndex, at element width 1 like the flow plane. Each index is
+    // optional on a PARTIAL tile in its own right, exactly as for bathy.
+    if (wantPlace) {
+        const uint32_t pDim = 1u << finePlacementBlockLog2(h.size, h.blockLog2);
+        const uint32_t pPerAxis = (static_cast<uint32_t>(h.size) / kPlacementSubsample) / pDim;
+        const uint32_t pBlocks = pPerAxis * pPerAxis;
+        const uint32_t pBlockPixels = pDim * pDim;
+        for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+            const uint8_t* placeIndexData = preamble(placeIndexSec[p]);
+            if (placeIndexData == nullptr) continue;
+            if (!parseBlockIndex(placeIndexData, placeIndexSec[p].length, pBlocks, pBlockPixels,
+                                 placeDataSec[p].length, 1, compressed, tile.placeIndex_[p])) {
                 return reject(FineError::kBadBlockIndex);
             }
         }
@@ -1213,6 +1260,20 @@ bool FineTile::bathyShoreBlockResident(uint32_t bx, uint32_t by) const {
     uint64_t off = 0, len = 0;
     if (!blockFileSpan(bathyShoreIndex_, bathyShoreDataOff_, bx, by, off, len)) return false;
     return len == 0 || bytes_.covers(off, len);
+}
+
+bool FineTile::placementBlockResident(FinePlacementPlane plane, uint32_t bx, uint32_t by) const {
+    if (plane >= kPlacementPlaneCount || !hasPlacement()) return false;
+    // blockFileSpan's own bounds test is on the ELEVATION grid, so the
+    // placement grid's bounds are checked here first.
+    const uint32_t perAxis = placementBlocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return false;
+    const size_t i = static_cast<size_t>(by) * perAxis + bx;
+    if (i >= placeIndex_[plane].size()) return false;
+    const FineBlockEntry& e = placeIndex_[plane][i];
+    if (e.mode == kBlockConstant) return true;
+    if (e.compLen == 0) return false;
+    return bytes_.covers(placeDataOff_[plane] + e.offset, e.compLen);
 }
 
 uint32_t FineTile::residentElevBlocks() const {
@@ -1386,6 +1447,57 @@ bool FineTile::decodeBathyShoreBlock(uint32_t bx, uint32_t by, std::vector<int16
                                        fineCodecNeedsDecompressor(h_.codec), out.data(), err);
 }
 
+// One placement plane's block: the flow plane's u8 path over the placement
+// grid's own geometry. Fresh buffers fill with each plane's fail-safe value --
+// the one a consumer treats as "nothing here": UNKNOWN for the distance (fail
+// closed, never "water nearby"), UNKNOWN for TWI, zero flux for talus, flat
+// for curvature, neutral for heat.
+bool FineTile::decodePlacementBlock(FinePlacementPlane plane, uint32_t bx, uint32_t by,
+                                    std::vector<uint8_t>& out, FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (plane >= kPlacementPlaneCount) return fail(err, FineError::kBadBlockCoords);
+    if (!hasPlacement()) return fail(err, FineError::kBadBlockCoords);
+    const uint32_t perAxis = placementBlocksPerAxis();
+    if (bx >= perAxis || by >= perAxis) return fail(err, FineError::kBadBlockCoords);
+    if (!placementIndexResident(plane)) return fail(err, FineError::kBlockNotResident);
+    const uint32_t dim = placementBlockDim();
+    const FineBlockEntry& e = placeIndex_[plane][by * perAxis + bx];
+    const uint8_t* base = planeDataFor(bytes_, e, placeDataOff_[plane], placeDataLen_[plane]);
+    if (base == nullptr) return fail(err, FineError::kBlockNotResident);
+    static constexpr uint8_t kFill[kPlacementPlaneCount] = {
+        kPlacementDistUnknown, kPlacementTwiUnknown, 0, kPlacementCurvFlat,
+        kPlacementHeatNeutral};
+    out.assign(placementBlockPixelCount(), kFill[plane]);
+    return decodeBlockPayload<uint8_t>(e, base, static_cast<size_t>(placeDataLen_[plane]), dim,
+                                       0, 255, dec_, fineCodecNeedsDecompressor(h_.codec),
+                                       out.data(), err);
+}
+
+bool FineTile::placementAt(uint32_t lx, uint32_t ly, uint8_t out[kPlacementPlaneCount],
+                           FineError* err) const {
+    if (err) *err = FineError::kNone;
+    if (lx >= h_.size || ly >= h_.size) return fail(err, FineError::kBadBlockCoords);
+    if (!hasPlacement()) return fail(err, FineError::kBadBlockCoords);
+    // Fine pixel -> subsampled pixel -> placement block. The fold lives here
+    // so no caller re-derives the subsample factor.
+    const uint32_t sx = lx / kPlacementSubsample, sy = ly / kPlacementSubsample;
+    const uint32_t pl = placementBlockLog2();
+    const uint32_t dim = 1u << pl;
+    const uint32_t bx = sx >> pl, by = sy >> pl;
+    const size_t i = static_cast<size_t>(sy & (dim - 1)) * dim + (sx & (dim - 1));
+    // NOTHING WRITTEN TO `out` UNTIL ALL FIVE DECODES SUCCEED, for bathyAt's
+    // reason: one real value beside four stale ones is worse than five stale.
+    uint8_t v[kPlacementPlaneCount];
+    std::vector<uint8_t> block;
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+        if (!decodePlacementBlock(static_cast<FinePlacementPlane>(p), bx, by, block, err))
+            return false;
+        v[p] = block[i];
+    }
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) out[p] = v[p];
+    return true;
+}
+
 bool FineTile::bathyAt(uint32_t lx, uint32_t ly, int32_t& depthMm, int32_t& shoreMm,
                        FineError* err) const {
     if (err) *err = FineError::kNone;
@@ -1511,6 +1623,72 @@ const std::vector<int16_t>* FineTileSampler::blockFor(int64_t px, int64_t py,
     return &bit->second;
 }
 
+FineTileSampler::FinePlacementSample FineTileSampler::placementAtVoxel(int64_t vx, int64_t vy) {
+    FinePlacementSample s;
+    if (tileSize_ == 0) {
+        missingTileQueries.fetch_add(1, std::memory_order_relaxed);
+        return s;
+    }
+    // World voxel -> containing fine pixel, the same mapping every other
+    // voxel-addressed water consumer uses: the pixel the voxel's origin lies
+    // in. kVoxelSizeMm and pixelSizeMm are both positive, so floorDiv keeps
+    // negative coordinates on the correct tile.
+    const int64_t pxMm = static_cast<int64_t>(pixelSizeMm());
+    const int64_t px = floorDiv(vx * kVoxelSizeMm, pxMm);
+    const int64_t py = floorDiv(vy * kVoxelSizeMm, pxMm);
+    const int64_t sz = static_cast<int64_t>(tileSize_);
+    auto it = tiles_.find(tileKey(static_cast<int32_t>(floorDiv(px, sz)),
+                                  static_cast<int32_t>(floorDiv(py, sz))));
+    if (it == tiles_.end()) {
+        missingTileQueries.fetch_add(1, std::memory_order_relaxed);
+        return s;
+    }
+    Resident& res = it->second;
+    // A pre-28 tile carries no planes: NOT a miss and NOT an error -- the
+    // sample simply stays at its fail-closed sentinels, which is the contract
+    // "a plane that is absent serves sentinels".
+    if (!res.tile.hasPlacement()) return s;
+    const uint32_t fx = static_cast<uint32_t>(floorMod(px, sz));
+    const uint32_t fy = static_cast<uint32_t>(floorMod(py, sz));
+    const uint32_t sx = fx / kPlacementSubsample, sy = fy / kPlacementSubsample;
+    const uint32_t pl = res.tile.placementBlockLog2();
+    const uint32_t dim = 1u << pl;
+    const uint32_t perAxis = res.tile.placementBlocksPerAxis();
+    const uint32_t bx = sx >> pl, by = sy >> pl;
+    const size_t inBlock = static_cast<size_t>(sy & (dim - 1)) * dim + (sx & (dim - 1));
+
+    uint8_t v[kPlacementPlaneCount];
+    for (uint32_t p = 0; p < kPlacementPlaneCount; ++p) {
+        // Keyed past the elevation cache's keyspace by plane; same decode-on-
+        // first-touch shape as blockFor, same two counters, same threading
+        // contract (a cold query is a write).
+        const uint32_t key = (p + 1u) * res.tile.placementBlockCount() + by * perAxis + bx;
+        auto bit = res.placeBlocks.find(key);
+        if (bit == res.placeBlocks.end()) {
+            std::vector<uint8_t> decoded;
+            FineError err = FineError::kNone;
+            if (!res.tile.decodePlacementBlock(static_cast<FinePlacementPlane>(p), bx, by,
+                                               decoded, &err)) {
+                if (err == FineError::kBlockNotResident) {
+                    notResidentBlockQueries.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    blockDecodeFailures.fetch_add(1, std::memory_order_relaxed);
+                }
+                return s; // sentinels; `valid` stays false
+            }
+            bit = res.placeBlocks.emplace(key, std::move(decoded)).first;
+        }
+        v[p] = bit->second[inBlock];
+    }
+    s.valid = true;
+    s.distWater = v[kPlacementDistWater];
+    s.twi = v[kPlacementTwi];
+    s.talus = v[kPlacementTalus];
+    s.curv = v[kPlacementCurv];
+    s.heat = v[kPlacementHeat];
+    return s;
+}
+
 bool FineTileSampler::blockDecoded(int64_t px, int64_t py) const {
     if (tileSize_ == 0) return false;
     const int64_t sz = static_cast<int64_t>(tileSize_);
@@ -1548,6 +1726,9 @@ uint64_t FineTileSampler::decodedBlockBytes() const {
     for (const auto& kv : tiles_) {
         for (const auto& b : kv.second.blocks) {
             n += static_cast<uint64_t>(b.second.size()) * sizeof(int16_t);
+        }
+        for (const auto& b : kv.second.placeBlocks) {
+            n += static_cast<uint64_t>(b.second.size());
         }
     }
     return n;

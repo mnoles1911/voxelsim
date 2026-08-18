@@ -195,6 +195,41 @@ struct AssetSpecies {
     int32_t slopeMinMmPerM = 0;
     int32_t slopeMaxMmPerM = 450; // placement.slope_max_pct default, 45%
 
+    // THE SLOPE RESPONSE CURVE (worldgen v26). slopeMaxMmPerM above is now
+    // the curve's ZERO point (refused past it, exactly as before); this is
+    // where the taper STARTS -- full pick weight at or below it, linear to
+    // zero at slopeMaxMmPerM. Defaulting to INT32_MAX means "no taper", so a
+    // species built by hand (every test, any host that never imports a
+    // manifest) keeps the old hard cut bit for bit.
+    //
+    // The audit's defect (b) -- "mountainsides and ridgelines nearly bare" --
+    // was the hard 45-50% cut; real closed conifer forest holds 60-80%
+    // slopes, and the literature's answer (placement-research.md section 3.6,
+    // and HZD/UE-PCG's "density is a product of channel response CURVES, not
+    // hard bands") is a taper. assetSpeciesTableFromManifest derives BOTH
+    // numbers at import, INVERSELY FROM HEIGHT for woody kinds (owner rule,
+    // 2026-08-17: "steeper slopes have small trees"): tall canopy tapers out
+    // by ~60% slope, mid trees ~75%, small ~90%, krummholz-scale holds to
+    // 100% -- soil depth and windthrow bite the big crowns first. A species
+    // that AUTHORED a deliberately low ceiling (<= 30%) keeps it -- a
+    // floodplain willow must not climb a hillside because it is short.
+    int32_t slopeFullMmPerM = INT32_MAX;
+
+    // Moisture affinity, -2 (xerophile) .. +2 (hygrophile), 0 = indifferent.
+    // Multiplies the pick weight by the column's TWI moisture (hollows lush,
+    // ridges sparse -- assetSpeciesSiteWeightQ10). Derived at import from
+    // water_max_m and the authored biome weights rather than authored per
+    // spec; placement.moisture can override it later if authors want to.
+    int8_t moistureAffinity = 0;
+    // Talus response: 1 = debris-seeking (pick weight scales up with the
+    // baked talus flux -- the Far Cry 5 cliff-rock pass analogue), 0 =
+    // indifferent. Boost-only, never a penalty: rocks still place off-talus
+    // at authored weight, they CONCENTRATE below cliffs.
+    int8_t talusAffinity = 0;
+    // Curvature affinity: -1 convex-seeking (ridge noses -- rocks), +1
+    // concave-seeking (hollows, deep soil -- the biggest trees), 0 neutral.
+    int8_t curvatureAffinity = 0;
+
     // Only appears within this distance of a watercourse. 0 means "does not
     // care", which is what 800 of the 828 specs carry.
     //
@@ -244,6 +279,17 @@ struct AssetColumnFacts {
     int32_t surfaceMm = 0;            // ColumnSample::surfaceMm
     int64_t slopeMmPerM = 0;          // ColumnSample::slopeMmPerM
 
+    // Standing water ABOVE the ground at this column, in mm; 0 on dry land.
+    // From ColumnSample's baked water surface where the tiles carry one. THE
+    // LAKE-TREE VETO: a terrestrial anchor whose column is submerged deeper
+    // than a species tolerates is refused -- without this, a lake-bed column
+    // is just "ground" to every gate (anchorSolid is TRUE on a lake bed) and
+    // the resolver happily stands an oak in six metres of water, which is the
+    // owner-reported defect of 2026-08-17's first scatter vista. Shoreline
+    // species (mangrove, reeds) later RAISE their tolerance rather than a
+    // special case existing here.
+    int32_t standingWaterMm = 0;
+
     // IS THE VOXEL topSolidVoxelZ(surfaceMm) POINTS AT ACTUALLY SOLID?
     //
     // THIS IS THE FIELD THAT STOPS TREES STANDING OVER HOLES, and it is not
@@ -271,7 +317,40 @@ struct AssetColumnFacts {
     // riverbank willow on the strength of not knowing where the river is is
     // exactly the derived-not-verified failure this file is guarding.
     int32_t distanceToWaterMm = 0;
+
+    // --- baked placement channels (worldgen v26), every one SENTINELLED -----
+    //
+    // Filled from the fine tiles' SECTION_PLACE_* planes where those are
+    // resident (assetfield.h's channel binding); left at the sentinels
+    // everywhere else, and every consumer below treats a sentinel as NEUTRAL
+    // -- a world with no channels places exactly as it did before they
+    // existed, except for the curve/band terms that need no channel at all.
+
+    // TWI moisture in thousandths (tilestore.h placementTwiMilli), or
+    // kAssetNoTwiMilli. Hollows and valley floors score high (wet), convex
+    // ridges low (dry).
+    int32_t twiMilli = INT32_MIN;
+    // Raw talus flux byte (0..254) or -1 unknown.
+    int16_t talus = -1;
+    // Raw curvature byte (128 = flat, above = concave hollow, below = convex
+    // ridge) or -1 unknown.
+    int16_t curv = -1;
+    // Raw heat-load byte (~127 flat/neutral, 254 steep SW, 0 steep NE) or -1.
+    int16_t heat = -1;
+    // Millimetres of headroom below the temperature-adjusted treeline
+    // (biomeTreelineMm(temp) - surfaceMm; positive below the line), or
+    // kAssetNoTreelineMm when the caller had no temperature to compute it
+    // from. Drives the krummholz BAND: tall species taper out through the
+    // last few hundred metres below the line instead of marching full-height
+    // to a hard edge.
+    int32_t treelineDeltaMm = INT32_MIN;
 };
+
+// Channel sentinels. INT32_MIN (not 0) because 0 is a legitimate value for
+// both quantities, and because arithmetic on an unnoticed sentinel produces
+// an absurdity rather than a plausible weight.
+inline constexpr int32_t kAssetNoTwiMilli = INT32_MIN;
+inline constexpr int32_t kAssetNoTreelineMm = INT32_MIN;
 
 // "I do not know how far the water is." INT32_MAX rather than -1 so that the
 // ordinary comparison `distanceToWaterMm <= waterMaxMm` fails closed on its own
@@ -299,23 +378,152 @@ struct AssetInstance {
 
 // --- the gates --------------------------------------------------------------
 
-// Does this species tolerate this column at all? Integer compares, no hashes --
-// this runs once per species per site and is the cheapest thing in the file, so
-// it runs first.
-inline bool assetSpeciesTolerates(const AssetSpecies& s, const AssetColumnFacts& col) {
-    if (!col.known) return false;
-    if (uint32_t(col.biome) >= uint32_t(kBiomeCount)) return false;
-    if (s.weightPerMille[col.biome] == 0) return false;
-    if (col.surfaceMm < s.elevMinMm || col.surfaceMm > s.elevMaxMm) return false;
-    if (col.slopeMmPerM < int64_t(s.slopeMinMmPerM)) return false;
-    if (col.slopeMmPerM > int64_t(s.slopeMaxMmPerM)) return false;
+// Which gate refused a species at a column -- kNone means tolerated. Named so
+// the census probe can attribute refusals ("which gate binds on the ridges")
+// without a second spelling of these compares: assetSpeciesTolerates below IS
+// this function compared against kNone, so the diagnostic and the gate cannot
+// drift.
+enum class AssetGate : uint8_t {
+    kNone = 0,
+    kUnknownColumn,
+    kBiomeWeight,
+    kElevation,
+    kSlopeMin,
+    kSlopeZero,      // past the response curve's zero point (worldgen v26)
+    kStandingWater,  // submerged anchor -- the lake-tree veto
+    kWaterDistance,  // riparian gate: too far, or distance unknown (fails closed)
+    kGateCount,
+};
+
+inline const char* assetGateName(AssetGate g) {
+    switch (g) {
+        case AssetGate::kNone: return "tolerated";
+        case AssetGate::kUnknownColumn: return "unknown column";
+        case AssetGate::kBiomeWeight: return "biome weight 0";
+        case AssetGate::kElevation: return "elevation band";
+        case AssetGate::kSlopeMin: return "below slope min";
+        case AssetGate::kSlopeZero: return "past slope-curve zero";
+        case AssetGate::kStandingWater: return "standing water (submerged)";
+        case AssetGate::kWaterDistance: return "water distance (far/unknown)";
+        default: return "?";
+    }
+}
+
+// The gates, in cost order -- integer compares, no hashes; this runs once per
+// species per site and is the cheapest thing in the file, so it runs first.
+inline AssetGate assetSpeciesFirstRefusal(const AssetSpecies& s, const AssetColumnFacts& col) {
+    if (!col.known) return AssetGate::kUnknownColumn;
+    if (uint32_t(col.biome) >= uint32_t(kBiomeCount)) return AssetGate::kUnknownColumn;
+    if (s.weightPerMille[col.biome] == 0) return AssetGate::kBiomeWeight;
+    if (col.surfaceMm < s.elevMinMm || col.surfaceMm > s.elevMaxMm) return AssetGate::kElevation;
+    if (col.slopeMmPerM < int64_t(s.slopeMinMmPerM)) return AssetGate::kSlopeMin;
+    // slopeMaxMmPerM is the response curve's ZERO point as of worldgen v26 --
+    // the import derivation moved it up for woody species (see the field).
+    // Between slopeFullMmPerM and here the species is TOLERATED but its pick
+    // weight tapers -- assetSpeciesSiteWeightQ10 below.
+    if (col.slopeMmPerM > int64_t(s.slopeMaxMmPerM)) return AssetGate::kSlopeZero;
+    // NEVER UNDERWATER (owner rule, 2026-08-17): tolerate at most shin-deep
+    // standing water unless a species authors more (minWaterDepthMm-style
+    // shoreline species come later; today no terrestrial species tolerates a
+    // submerged anchor). 300 mm keeps beach grass on a wet strand while
+    // refusing every lake-bed column.
+    if (col.standingWaterMm > 300) return AssetGate::kStandingWater;
     if (s.waterMaxMm > 0) {
         // Fails closed on kAssetNoWaterDistanceMm, and deliberately: a species
         // that only grows near water must not be placed by a caller that does
         // not know where the water is.
-        if (col.distanceToWaterMm > s.waterMaxMm) return false;
+        if (col.distanceToWaterMm > s.waterMaxMm) return AssetGate::kWaterDistance;
     }
-    return true;
+    return AssetGate::kNone;
+}
+
+inline bool assetSpeciesTolerates(const AssetSpecies& s, const AssetColumnFacts& col) {
+    return assetSpeciesFirstRefusal(s, col) == AssetGate::kNone;
+}
+
+// THE MODULATED PICK WEIGHT (worldgen v26): the species' authored per-biome
+// weight times its response to the column's baked channels, Q10 chain, exact
+// integers. This is what the habitat scan SUMS and the pick WALKS -- the two
+// must be one function or the walk overruns the sum, which is why it is here
+// and not inlined twice in assetResolveSite.
+//
+// EVERY TERM IS NEUTRAL ON A SENTINEL. A column with no channels (no fine
+// tile, a pre-28 bake, vxc_bench's synthetic ground) modulates by 1024/1024
+// everywhere except the slope taper and the treeline band, which need no
+// channel -- so the channel-less world moves only where those two say so, and
+// a missing plane can never read as "boost" or as "veto".
+//
+// The response SHAPES (each in Q10, clamped into [0, 3072]):
+//
+//   slope    full weight to slopeFull, linear to 0 at slopeZero -- the curve
+//            the literature (research 3.6) and the owner's inverse-height
+//            rule size per species at import.
+//   moisture 1024 + affinity * (twi - 6.0) * 64/1000 per affinity step: a
+//            hygrophile (+2) reads ~x1.75 in a wet hollow (twi 12) and ~x0.25
+//            on a dry ridge (twi 0); a xerophile mirrors it. Neutral at
+//            twi 6.0, the mid-slope baseline.
+//   talus    boost-only, 1024 + talus * 8: full flux reads ~x3. Rocks
+//            CONCENTRATE below cliffs; absence of talus is not a penalty.
+//   curv     1024 + affinity * (curv - 128) * 6: a concave-seeker reads
+//            ~x1.75 in a strong hollow, ~x0.25 on a sharp ridge nose.
+//   treeline tall species taper linearly through the krummholz BAND below
+//            the temperature-adjusted treeline (300 m for >= 15 m crowns,
+//            150 m for >= 8 m), to zero AT the line; smaller species hold to
+//            it untapered, which is what makes the band read as krummholz --
+//            the small keep growing where the tall have thinned out. The
+//            heat-load byte shifts the local line +/-~150 m (warm SW aspects
+//            carry trees higher), which is McCune-Keon's cheapest testable
+//            consequence.
+inline uint32_t assetSpeciesSiteWeightQ10(const AssetSpecies& s, const AssetColumnFacts& col) {
+    int64_t w = int64_t(s.weightPerMille[col.biome]) * kAssetQ10One;
+
+    // Slope taper. tolerates() already refused past slopeMax (the zero point).
+    if (col.slopeMmPerM > int64_t(s.slopeFullMmPerM) &&
+        s.slopeMaxMmPerM > s.slopeFullMmPerM) {
+        const int64_t span = int64_t(s.slopeMaxMmPerM) - int64_t(s.slopeFullMmPerM);
+        const int64_t left = int64_t(s.slopeMaxMmPerM) - col.slopeMmPerM;
+        w = w * (left < 0 ? 0 : left) / span;
+    }
+
+    if (s.moistureAffinity != 0 && col.twiMilli != kAssetNoTwiMilli) {
+        int64_t f = kAssetQ10One +
+                    int64_t(s.moistureAffinity) * (int64_t(col.twiMilli) - 6000) * 64 / 1000;
+        if (f < 0) f = 0;
+        if (f > 3072) f = 3072;
+        w = w * f / kAssetQ10One;
+    }
+
+    if (s.talusAffinity > 0 && col.talus >= 0) {
+        int64_t f = kAssetQ10One + int64_t(col.talus) * 8;
+        if (f > 3072) f = 3072;
+        w = w * f / kAssetQ10One;
+    }
+
+    if (s.curvatureAffinity != 0 && col.curv >= 0) {
+        int64_t f = kAssetQ10One + int64_t(s.curvatureAffinity) * (int64_t(col.curv) - 128) * 6;
+        if (f < 0) f = 0;
+        if (f > 3072) f = 3072;
+        w = w * f / kAssetQ10One;
+    }
+
+    if (col.treelineDeltaMm != kAssetNoTreelineMm && s.heightMm >= 8'000) {
+        // Warm aspects push the local line up, cold ones down, +/-152 m at
+        // the extremes; the sentinel leaves the line where temperature put it.
+        int64_t delta = col.treelineDeltaMm;
+        if (col.heat >= 0) delta += (int64_t(col.heat) - 127) * 1200;
+        const int64_t band = s.heightMm >= 15'000 ? 300'000 : 150'000;
+        if (delta <= 0) {
+            w = 0; // a tall crown above the (aspect-adjusted) line
+        } else if (delta < band) {
+            w = w * delta / band;
+        }
+    }
+
+    if (w < 0) w = 0;
+    // Back to per-mille-x-Q10-free units: the caller sums these against the
+    // same 1000-per-mille occupancy arithmetic as before.
+    const int64_t out = w / kAssetQ10One;
+    return out > 0xFFFFFFll ? 0xFFFFFFu : uint32_t(out);
 }
 
 // The grove field's gain at a position, Q10, mean kAssetQ10One.
@@ -449,12 +657,18 @@ inline bool assetResolveSite(uint64_t seed, const AssetLayer* layers, int layerC
     const AssetLayer& L = layers[site.layer];
     if (L.cellMm <= 0) return false;
 
-    // 1. HABITAT SCAN. No hashes; integer compares only.
-    uint32_t total = 0;
+    // 1. HABITAT SCAN. No hashes; integer compares and the Q10 response chain.
+    // THE MODULATED WEIGHT (assetSpeciesSiteWeightQ10), not the raw authored
+    // one, and in BOTH the sum and the walk below -- one function, or the walk
+    // overruns the sum. A species the channels taper to zero contributes
+    // nothing and cannot be picked, which is the soft version of a veto and
+    // composes with the occupancy rule for free: a ridge whose every species
+    // is tapered thin is a ridge where most sites carry nothing.
+    uint64_t total = 0;
     for (int i = 0; i < speciesCount; ++i) {
         if (int(species[i].layer) != site.layer) continue;
         if (!assetSpeciesTolerates(species[i], col)) continue;
-        total += species[i].weightPerMille[col.biome];
+        total += assetSpeciesSiteWeightQ10(species[i], col);
     }
     if (total == 0) return false;
 
@@ -467,13 +681,13 @@ inline bool assetResolveSite(uint64_t seed, const AssetLayer* layers, int layerC
     // site. Testing occupancy first and clustering afterwards is what lost 17%
     // of the population -- assetClusterKeeps records the measurement.
     const uint64_t h = hash2(seed, site.cellX, site.cellY, CH_ASSET_SPECIES + uint32_t(site.layer));
-    const uint32_t cap = total > 1000u ? 1000u : total;
-    uint32_t r = static_cast<uint32_t>((h >> 8) % uint64_t(total));
+    const uint64_t cap = total > 1000u ? 1000u : total;
+    uint64_t r = (h >> 8) % total;
     int chosen = -1;
     for (int i = 0; i < speciesCount; ++i) {
         if (int(species[i].layer) != site.layer) continue;
         if (!assetSpeciesTolerates(species[i], col)) continue;
-        const uint32_t w = species[i].weightPerMille[col.biome];
+        const uint64_t w = assetSpeciesSiteWeightQ10(species[i], col);
         if (r < w) { chosen = i; break; }
         r -= w;
     }

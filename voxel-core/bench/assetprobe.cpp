@@ -46,8 +46,10 @@
 
 #include "voxelcore/amplifier.h"
 #include "voxelcore/assetbank.h"
+#include "voxelcore/assetchannels.h"
 #include "voxelcore/assetfield.h"
 #include "voxelcore/assetmanifest.h"
+#include "voxelcore/lakes.h"
 #include "voxelcore/tilestore.h"
 
 using namespace vxc;
@@ -208,8 +210,28 @@ int main(int argc, char** argv) {
     Amplifier amp(opt.seed, real ? static_cast<ITileSampler&>(fine)
                                  : (realClimate ? static_cast<ITileSampler&>(coarse)
                                                 : static_cast<ITileSampler&>(synth)));
-    std::printf("terrain: %s elevation, %s climate\n", real ? "REAL fine-tile" : "synthetic",
-                realClimate ? "REAL coarse-tile" : "synthetic");
+
+    // THE PLACEMENT CHANNELS (worldgen v26). The water datum is the SAME
+    // composed lake/river surface the renderer draws -- LakeSampler over the
+    // basin rows, RiverSampler over the water plane -- never the debug water
+    // marker; the distance/TWI/talus/curvature/heat planes come off the fine
+    // tiles' SECTION_PLACE_* sections; the treeline comes from the same
+    // climate the biome gate reads. All three fall away cleanly when their
+    // tiles are absent: the channels then stay at fail-closed sentinels and
+    // this probe censuses the pre-channel world, labelled below.
+    LakeSampler lakeWater(fine);
+    RiverSampler riverWater(fine);
+    CompositeWaterSampler bakedWater(lakeWater, riverWater);
+    IWaterSampler* water = real ? static_cast<IWaterSampler*>(&bakedWater) : nullptr;
+    FineTileSampler* fineChannels = real ? &fine : nullptr;
+    const auto channelsAt = [&](int64_t vx, int64_t vy) {
+        return assetColumnChannelsAt(fineChannels, water, tiles, vx, vy);
+    };
+    std::printf("terrain: %s elevation, %s climate, water datum %s, placement planes %s\n",
+                real ? "REAL fine-tile" : "synthetic",
+                realClimate ? "REAL coarse-tile" : "synthetic",
+                water != nullptr ? "BAKED lake+river" : "NONE (dry world)",
+                real ? "from fine tiles (sentinels where absent)" : "NONE (sentinels)");
 
     // =========================================================================
     // CENSUS 1: WIDENING
@@ -351,7 +373,7 @@ int main(int argc, char** argv) {
         assetSitesForRect(opt.seed, layers.data(), int(layers.size()), prect);
     const std::vector<AssetInstance> instances =
         field.instancesForRect(prect, [&](int64_t vx, int64_t vy) {
-            return assetColumnFactsFromSample(amp.columnCached(vx, vy));
+            return assetColumnFactsFromSample(amp.columnCached(vx, vy), channelsAt(vx, vy));
         });
 
     int64_t perLayerSites[kAssetLayerCount] = {};
@@ -359,6 +381,14 @@ int main(int argc, char** argv) {
     int64_t perLayer[kAssetLayerCount] = {};
     std::map<uint16_t, int64_t> perSpecies;
     int64_t anchorsAudited = 0, anchorsBad = 0;
+    // THE SUBMERGED AUDIT, independently of the resolver, exactly like the
+    // contact audit: re-ask the SAME water samplers the renderer draws from
+    // whether each anchor stands under more than shin-deep water. Nonzero
+    // here is the owner's lake-tree defect, and it must read 0.
+    int64_t anchorsSubmerged = 0;
+    // Inverse-height slope grading (owner rule): mean placed-species height
+    // per anchor-slope bucket. Steeper buckets must trend SHORTER.
+    int64_t slopeBucketCount[8] = {}, slopeBucketHeightMm[8] = {};
     for (const AssetInstance& inst : instances) {
         ++perLayer[inst.layer & (kAssetLayerCount - 1)];
         ++perSpecies[inst.bankId];
@@ -366,11 +396,44 @@ int main(int argc, char** argv) {
         // column and ask whether the voxel this instance stands on is solid.
         // The resolver already refused air anchors; this re-derivation is the
         // check that the refusal is WIRED, not merely written.
-        const ColumnSample col = amp.column(
-            floorDiv(inst.anchorXMm, int64_t(kVoxelSizeMm)),
-            floorDiv(inst.anchorYMm, int64_t(kVoxelSizeMm)));
+        const int64_t avx = floorDiv(inst.anchorXMm, int64_t(kVoxelSizeMm));
+        const int64_t avy = floorDiv(inst.anchorYMm, int64_t(kVoxelSizeMm));
+        const ColumnSample col = amp.column(avx, avy);
         ++anchorsAudited;
         if (Amplifier::materialAt(col, inst.anchorVz) == MAT_AIR) ++anchorsBad;
+        if (water != nullptr) {
+            const int32_t ws = water->waterSurfaceMmAtVoxel(avx, avy);
+            if (ws != kNoWaterMm && int64_t(ws) > int64_t(inst.anchorZMm) + 300) {
+                ++anchorsSubmerged;
+            }
+        }
+        if (inst.speciesIndex < table.size()) {
+            int b = int(col.slopeMmPerM / 150); // 15% grade per bucket
+            if (b > 7) b = 7;
+            if (b >= 0) {
+                ++slopeBucketCount[b];
+                slopeBucketHeightMm[b] += table[inst.speciesIndex].heightMm;
+            }
+        }
+    }
+
+    // GATE ATTRIBUTION over the placement columns: which gate refused each
+    // (site, species) pair on the site's own layer, through the SAME
+    // assetSpeciesFirstRefusal the resolver's tolerates() wraps -- one
+    // spelling, so this census cannot drift from the gate it measures. This is
+    // the instrument "measure which gate binds on the ridges" asks for.
+    int64_t gateCounts[size_t(AssetGate::kGateCount)] = {};
+    int64_t pairsScanned = 0;
+    for (const AssetSite& s : sites) {
+        const int64_t avx = floorDiv(s.anchorXMm, int64_t(kVoxelSizeMm));
+        const int64_t avy = floorDiv(s.anchorYMm, int64_t(kVoxelSizeMm));
+        const AssetColumnFacts facts =
+            assetColumnFactsFromSample(amp.columnCached(avx, avy), channelsAt(avx, avy));
+        for (const AssetSpecies& sp : table) {
+            if (int(sp.layer) != s.layer) continue;
+            ++pairsScanned;
+            ++gateCounts[size_t(assetSpeciesFirstRefusal(sp, facts))];
+        }
     }
 
     std::printf("\n=== placement census over [%lld,%lld]x[%lld,%lld] m ===\n",
@@ -385,6 +448,45 @@ int main(int argc, char** argv) {
     std::printf(")\nspecies represented: %zu\n", perSpecies.size());
     std::printf("anchor contact audit: %lld audited, %lld NOT SOLID\n",
                 (long long)anchorsAudited, (long long)anchorsBad);
+    if (water != nullptr)
+        std::printf("submerged-anchor audit (vs the RENDERED water datum): %lld of %lld "
+                    "stand in >300 mm of water%s\n",
+                    (long long)anchorsSubmerged, (long long)anchorsAudited,
+                    anchorsSubmerged == 0 ? "" : "  <-- LAKE-TREE DEFECT");
+
+    // Per-species histogram, riparian species called out by name: the audit's
+    // headline number is "112 water-gated species place nowhere", and this is
+    // the counter that says whether serving the distance turned them on.
+    {
+        const std::vector<AssetManifestSpecies>& rows = manifest.species();
+        int64_t riparianInstances = 0;
+        int riparianSpecies = 0;
+        std::printf("species histogram (name, instances; * = water-gated riparian):\n");
+        for (const auto& [bankId, n] : perSpecies) {
+            const bool rip = bankId < rows.size() && rows[bankId].waterMaxMm > 0;
+            if (rip) { riparianInstances += n; ++riparianSpecies; }
+            std::printf("  %c %-24s %6lld\n", rip ? '*' : ' ',
+                        bankId < rows.size() ? rows[bankId].name.c_str() : "?", (long long)n);
+        }
+        std::printf("riparian (water-gated) species placed: %d species, %lld instances\n",
+                    riparianSpecies, (long long)riparianInstances);
+    }
+
+    std::printf("gate attribution over %lld (site, species) pairs:\n", (long long)pairsScanned);
+    for (size_t g = 0; g < size_t(AssetGate::kGateCount); ++g)
+        if (gateCounts[g] > 0)
+            std::printf("  %-28s %10lld (%lld.%01lld%%)\n",
+                        assetGateName(AssetGate(g)), (long long)gateCounts[g],
+                        (long long)(gateCounts[g] * 1000 / pairsScanned / 10),
+                        (long long)(gateCounts[g] * 1000 / pairsScanned % 10));
+
+    std::printf("mean placed-species height by anchor slope (inverse-height check):\n");
+    for (int b = 0; b < 8; ++b) {
+        if (slopeBucketCount[b] == 0) continue;
+        std::printf("  slope %3d-%3d%%: %6lld instances, mean height %5.1f m\n", b * 15,
+                    b == 7 ? 999 : (b + 1) * 15, (long long)slopeBucketCount[b],
+                    double(slopeBucketHeightMm[b]) / double(slopeBucketCount[b]) / 1000.0);
+    }
 
     // Stamp census: real voxels through the same composition GeneratedWorld
     // uses, over every brick that intersects the placed instances' boxes --
@@ -416,16 +518,21 @@ int main(int argc, char** argv) {
                         assetBankErrorText(AssetBankError(e)));
 
     // The one-line verdicts the failure table asks for.
-    if (!instances.empty() && anchorsBad == 0)
-        std::printf("VERDICT: placement wired; %zu instances, all anchors solid\n",
+    if (!instances.empty() && anchorsBad == 0 && anchorsSubmerged == 0)
+        std::printf("VERDICT: placement wired; %zu instances, all anchors solid, none "
+                    "submerged\n",
                     instances.size());
     else if (instances.empty())
         std::printf("VERDICT: NOTHING PLACED against %zu sites -- wiring fault until "
                     "proven otherwise\n",
                     sites.size());
-    else
+    else if (anchorsBad > 0)
         std::printf("VERDICT: %lld FLOATING ANCHORS -- the anti-float guard is not "
                     "wired\n",
                     (long long)anchorsBad);
-    return anchorsBad == 0 ? 0 : 1;
+    else
+        std::printf("VERDICT: %lld SUBMERGED ANCHORS -- the standing-water veto is not "
+                    "wired to the rendered water datum\n",
+                    (long long)anchorsSubmerged);
+    return (anchorsBad == 0 && anchorsSubmerged == 0) ? 0 : 1;
 }
