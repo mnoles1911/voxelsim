@@ -134,10 +134,21 @@ constexpr int32 kGroupEdgeChunks = 2;
 constexpr int32 kGroupEdgeVoxels = kGroupEdgeChunks * VoxelCoords::ChunkEdgeVoxels; // 64
 constexpr double kGroupEdgeUU = double(kGroupEdgeVoxels) * VoxelCoords::VoxelSizeUU; // 640
 
-// The task brief's "~96-128 m ring". 112 m sits inside R0's 128 m level-0
-// ring, so every group this resolves stands on ground the streamer has
-// already admitted (and whose fine tiles it has already made resident).
-constexpr double kDefaultRingMeters = 112.0;
+// 112 -> 256 m, 2026-08-18 (owner: "extend the detail ring"). The old value
+// sat inside R0's 128 m level-0 ring so every group stood on already-admitted
+// ground; past it, groups can land on ground the streamer has not admitted
+// yet -- which is SAFE here and always was, because dispatch is gated on
+// IsFootprintResident (dilated by the full layer reach) and a group outside
+// residency simply defers to a later tick instead of dispatching. The gate is
+// the invariant; 128 m was belt-and-braces.
+//
+// Cost: instance count scales with area, 5.2x at this radius -- but the same
+// day cut L3 density 1000 -> 300 per-mille (the owner walked into ground cover
+// that blocked movement), so the net is ~1.6x the old resident count for 2.3x
+// the visible radius. That pairing is the point: THINNER, but visible much
+// further, which is what "the slopes look bare from the vista" actually was --
+// 94% of a hillside's vegetation is detail-lattice and used to vanish at 112 m.
+constexpr double kDefaultRingMeters = 256.0;
 
 // Hysteresis on release, same shape as UVoxelWorldSubsystem's
 // UnloadRingMultiplier: a group loads inside RingMeters and unloads past

@@ -171,6 +171,54 @@ KINDS_ON_SCATTER = ("tree", "bush", "rock", "grass", "reed", "flower")
 KINDS_TERRAIN = ("tree", "rock")
 LAYER_NOT_SCATTERED = 255
 
+# THE COLLISION LINE, and the owner drew it by height, not by kind
+# (2026-08-18): "Small bushes, flowers, and grasses should not be collidable in
+# terrain lattice. But I'm seeing many larger bushes and tall grasses that are
+# as tall vertically as the player. It does not make sense for those to not be
+# collidable."
+#
+# Terrain lattice == voxels in the world grid == solid, collidable, diggable,
+# and drawn at EVERY LOD ring. Detail lattice == instanced meshes, no
+# collision, and drawn only inside the detail ring. So this threshold decides
+# two things at once, and both point the same way: a shrub you cannot see past
+# is a shrub you should not walk through, and it is also a shrub that should
+# still be there when you look at the hillside from across the valley.
+#
+# 1.5 m: below a 1.8 m player's eyeline but unmistakably body-scale. Measured
+# against the library -- bush median is 1.80 m (46 of 57 over 1.0 m), grass
+# tops out at 2.0 m with only 9 over 1.0 m -- so this promotes most true shrubs
+# and the few genuinely tall grasses, and leaves tufts, flowers and low cover
+# where they belong. Reeds are exempt: they stand in water, where a collidable
+# voxel column would wall off a lake margin the player is meant to wade.
+# NOT LIVE YET -- set KINDS_HEIGHT_PROMOTED to ("bush", "grass") to enable.
+# Promotion is NOT a flag flip: a terrain-lattice species must be BAKED at the
+# world's 100 mm pitch (assetLayerAdmitsVoxelSize), and the 38 body-scale
+# candidates are authored at 5 cm (37) and 2 cm (1). Flipping the flag alone
+# produced a manifest the engine REFUSED whole -- correctly. The full change is:
+#   1. re-author those specs to resolution_cm 10 and re-bake their banks
+#      (measured: 33 s for 582 grids, so the bake is not the obstacle),
+#   2. reconcile spacing against the destination lattice pitch, and
+#   3. re-verify the whole table against assetSpeciesFits -- note that ~30
+#      EXISTING trees and rocks already carry spacing tighter than their
+#      layer's cell (birch 4 m on the 5 m lattice, douglas-fir 8 m on the
+#      24 m), so whatever tolerates those today must be understood before
+#      adding 38 more.
+# Owner intent stands (2026-08-18): body-scale plants SHOULD collide.
+TERRAIN_LATTICE_MIN_HEIGHT_M = 1.5
+KINDS_HEIGHT_PROMOTED = ()
+
+
+def is_terrain_lattice(kind: str, height_m: float) -> bool:
+    """Does this species live in the world voxel grid (solid + all-LOD)?
+
+    Trees and rocks always do. Bushes and grasses do IF they are body-scale --
+    see TERRAIN_LATTICE_MIN_HEIGHT_M. One function so the manifest's flag, the
+    layer assignment and any future consumer cannot disagree about it.
+    """
+    if kind in KINDS_TERRAIN:
+        return True
+    return kind in KINDS_HEIGHT_PROMOTED and float(height_m or 0.0) >= TERRAIN_LATTICE_MIN_HEIGHT_M
+
 
 @dataclass(frozen=True)
 class Layer:
@@ -274,8 +322,17 @@ LAYERS = (
     # box the load-time sanity check holds species to, and they hold the
     # library as authored: bushes and reeds run to 4 m and giant kelp to 28 m,
     # all of it geometry that never enters the world voxel grid.
+    # DENSITY 1000 -> 300, 2026-08-18. At 1000 the detail lattice stood a
+    # bush, tuft or flower on EVERY 800 mm cell -- the owner walked into it at
+    # the temperate site and reported ground cover so thick it blocked
+    # movement. 800 mm is the pitch a single tuft needs; it is not the pitch a
+    # SHRUB needs, and the layer carries both. 300 leaves ground cover reading
+    # as continuous at eye level (a tuft every ~1.5 m, and clustering gathers
+    # them further) while opening the walkable gaps a player needs. Density is
+    # the honest knob here for the same reason it was on L1: per-species
+    # spacing folds into pick weights and cancels wherever a biome saturates.
     Layer(cell_mm=800, max_height_mm=30_000, max_depth_mm=2_000,
-          max_radius_mm=2_500, density_per_mille=1000, seed_count=4,
+          max_radius_mm=2_500, density_per_mille=300, seed_count=4,
           terrain_lattice=False),
 )
 
@@ -462,8 +519,8 @@ def assign_layer(kind: str, height_m: float, report: ExportReport, name: str,
     """
     if kind not in KINDS_ON_SCATTER:
         return LAYER_NOT_SCATTERED
-    if kind not in KINDS_TERRAIN:
-        return 3  # ground cover: the detail lattice
+    if not is_terrain_lattice(kind, height_m):
+        return 3  # ground cover: the detail lattice (no collision, detail ring only)
     # Nominal x headroom against the cap: what the BAKES reach, not what the
     # spec says. See FILE_HEADROOM_*.
     h_mm = _mm(height_m) * FILE_HEADROOM_NUM // FILE_HEADROOM_DEN
@@ -559,7 +616,7 @@ def species_record(spec: dict, name: str, seeds_baked: int,
         encoded_name,
         KIND_ORDER.index(kind),
         layer & 0xFF,
-        1 if kind in KINDS_TERRAIN else 0,
+        1 if is_terrain_lattice(kind, nominal_height_m(spec, kind)) else 0,
         WATER_ORDER.index(water_kind),
         WATER_KIND_TO_MASK[water_kind],
         seeds_baked,
