@@ -320,6 +320,26 @@ double JulianDayFromGameClock(double WorldEpochSeconds, double DayLengthSeconds,
 	return kJD2000Jan1_0hUT + FMath::FloorToDouble(RealDayOfYear) + DayFraction;
 }
 
+double ContinuousJulianDayFromGameClock(double WorldEpochSeconds, double DayLengthSeconds,
+                                        double DaysPerYear)
+{
+	// JulianDayFromGameClock without the FloorToDouble on the date. The floor
+	// is what keeps exactly one diurnal cycle per game day (the sun's hour
+	// angle depends on the day fraction alone, so flooring the date is free for
+	// it); the moon's slow elements have no such immunity and need the smooth
+	// count. Everything else -- the safety clamps, the wrap, the epoch -- is
+	// identical, deliberately: two expressions that must agree except in one
+	// term should differ in exactly that term.
+	const double SafeDayLength   = FMath::Max(DayLengthSeconds, 1.0e-6);
+	const double SafeDaysPerYear = FMath::Max(DaysPerYear, 1.0e-3);
+
+	const double DayFraction  = Wrap01(WorldEpochSeconds / SafeDayLength);
+	const double YearFraction = Wrap01(WorldEpochSeconds / (SafeDayLength * SafeDaysPerYear));
+	const double RealDayOfYear = YearFraction * kTropicalYearDays;
+
+	return kJD2000Jan1_0hUT + RealDayOfYear + DayFraction;
+}
+
 FSunState ComputeSun(double JulianDay, const FGeoCoord& Geo)
 {
 	const FSolarElements S = ComputeSolarElements(JulianDay);
@@ -349,9 +369,34 @@ FSunState ComputeSun(double JulianDay, const FGeoCoord& Geo)
 	return Out;
 }
 
-FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& Sun)
+FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& Sun,
+                       double SlowJulianDay)
 {
-	const double D = JulianDay - kJ2000Epoch;
+	// THE MOON TELEPORTED, AND THIS IS WHY (owner report, playtest rounds
+	// 20-22, 2026-08-18: "moonless nights", plus a log showing the moon SET at
+	// 04:47:06, RISE at 04:47:43 and SET again at 04:48:11).
+	//
+	// JulianDayFromGameClock floors the date, so JD advances one whole day
+	// every 7 min 53 s of play. The SUN is invariant under that by design --
+	// its hour angle is built from the day fraction, which the floor does not
+	// touch. The moon is not: its longitude runs at 13.18 deg/day, so each
+	// step hops it -12.19 deg across the sky (2.6 of its own drawn diameters),
+	// up to ~6 deg in declination, and +3.4% of a phase cycle.
+	//
+	// The fix is to feed the SLOW elements -- longitude, argument of latitude,
+	// and through them phase -- a CONTINUOUS day count, while the hour angle
+	// (below, via sidereal time) keeps the stepped JD it shares with the sun
+	// and the star field. The moon then drifts against the stars at its true
+	// rate and hops only the 0.99 deg/step the whole celestial sphere hops,
+	// together with it. The synodic period and the average rise/set schedule
+	// are unchanged -- this removes a discontinuity, it does not retime the
+	// moon.
+	//
+	// SlowJulianDay <= 0 means "no continuous clock supplied": fall back to the
+	// stepped value, which is exactly the pre-fix behaviour, so every existing
+	// caller and test keeps its numbers until it opts in.
+	const double SlowJD = (SlowJulianDay > 0.0) ? SlowJulianDay : JulianDay;
+	const double D = SlowJD - kJ2000Epoch;
 
 	// Circular-orbit model -- see the header for why this is the right amount
 	// of moon. Both rates are the J2000 mean motions expressed per day:
