@@ -138,6 +138,11 @@ def check_manifest(out: Path) -> list[str]:
         return [f"no manifest at {p}"]
 
     specs, seeds, _curation = manifest.curated_inputs(SPECS, out / "banks")
+    # The exporter mutates rock placement from the baked grids before
+    # encoding (manifest.apply_rock_classification); comparing without the
+    # same mutation certifies nothing and fails everything -- see the
+    # function's own docstring for the day that proved it.
+    manifest.apply_rock_classification(specs, out / "banks")
     fresh = manifest.encode(specs, seeds, manifest.ExportReport())
     have = p.read_bytes()
     if fresh == have:

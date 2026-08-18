@@ -272,6 +272,19 @@ LAYERS = (
     #
     # CAP AND RADIUS ARE MEASURED, NOT GUESSED: over the full 4-seed bank bake
     # the tallest L0 grid is 52.5 m and the widest reach is 14.5 m (kapok).
+    # RADIUS 15_000 -> 15_500, 2026-08-18: the taper-term fix (0450a4a) reshaped
+    # every tree; kapok's widest baked seed now reaches 15.3 m and the bake
+    # REFUSED it against the old ceiling, which would have pinned kapok's bank
+    # to the pre-taper species forever. The ceiling follows the measurement,
+    # as this comment already promised it would; the extra 0.5 m of query
+    # dilation is priced by the same widening census as the original number.
+    # The first cut said 96 m / 20 m; the widening census priced that at ~11
+    # wasted chunk layers on every L0-present footprint and ~2 chunk layers of
+    # dilation slack, for headroom no baked asset uses. The wider heroes that
+    # WOULD need more fold to zero everywhere (900 m+ spacing is past
+    # per-mille resolution), are absent from the world, and export_banks skips
+    # their banks -- paying dilation for species that cannot appear is paying
+    # for nothing.
     # The first cut said 96 m / 20 m; the widening census priced that at ~11
     # wasted chunk layers on every L0-present footprint and ~2 chunk layers of
     # dilation slack, for headroom no baked asset uses. The wider heroes that
@@ -280,7 +293,7 @@ LAYERS = (
     # their banks -- paying dilation for species that cannot appear is paying
     # for nothing.
     Layer(cell_mm=24_000, max_height_mm=60_000, max_depth_mm=8_000,
-          max_radius_mm=15_000, density_per_mille=60, seed_count=4,
+          max_radius_mm=15_500, density_per_mille=60, seed_count=4,
           terrain_lattice=True),
     # L1 canopy. Most trees, including the boreal giants -- the library
     # measures HALF of all trees past 14 m at under 8 m spacing, so the cap is
@@ -448,6 +461,54 @@ def curated_inputs(specs_dir: Path, banks_dir: Path
             if n:
                 seeds_baked[d.name] = n
     return specs, seeds_baked, summary
+
+
+def apply_rock_classification(specs: "list[tuple[str, dict]]",
+                              banks_dir: Path) -> int:
+    """ROCK SELF-CLASSIFICATION (owner directive, 2026-08-18): mutate the rock
+    specs' placement in-memory from what the baked grid physically IS, before
+    `encode` sees them. Returns how many species had spacing raised.
+
+    volume  = solid voxels x pitch^3 of seed 1's bank (the library individual;
+              seeds vary a few percent, rarity doesn't care).
+    spacing = max(authored, 6.0 x volume^0.35 m) -- the size-frequency law
+              N(>V) ~ V^-1.8..-2 (docs/placement-research.md). Authored always
+              wins UPWARD: a designer may make a species rarer than physics,
+              never more common than its size allows.
+    cluster = floor of 0.7 for slope-banded (talus-class) rocks: fragmentation
+              debris clusters, and the authored median (0.35) reads as
+              scattered gravel where a talus fan should be.
+
+    LIVES HERE, NOT IN export_manifest.py, FOR THE `curated_inputs` REASON
+    STATED ABOVE IT: there are two callers. The exporter applies it before
+    writing and enginecheck applies it before comparing; for a stretch of
+    2026-08-18 only the exporter did, so enginecheck failed every manifest the
+    exporter had just written -- the checker was rebuilding a table the
+    exporter would never produce. Raised spacing also MOVES LAYERS
+    (assign_layer files by spacing among the height survivors), so the drift
+    was not cosmetic: layer bytes differed too."""
+    from . import vxa  # lazy: vxa is only needed when banks are read
+
+    derived_n = 0
+    for name, body in specs:
+        if body.get("kind") != "rock":
+            continue
+        bank = sorted((banks_dir / name).glob(f"{name}-*.vxa")) \
+            if (banks_dir / name).is_dir() else []
+        if not bank:
+            continue
+        g = vxa.read(str(bank[0]))
+        solid = int((g.data != 0).sum())
+        pitch = float(body.get("resolution_cm", 10.0)) / 100.0
+        vol = solid * pitch ** 3
+        pl = body.setdefault("placement", {})
+        derived_sp = 6.0 * (vol ** 0.35)
+        if derived_sp > float(pl.get("spacing_m") or 0.0):
+            pl["spacing_m"] = round(derived_sp, 2)
+            derived_n += 1
+        if float(pl.get("slope_min_pct") or 0.0) > 0 and float(pl.get("cluster") or 0.0) < 0.7:
+            pl["cluster"] = 0.7
+    return derived_n
 
 
 def _kind_group_params(spec: dict, kind: str) -> tuple[int, int, int]:
