@@ -190,33 +190,66 @@ LAYER_NOT_SCATTERED = 255
 # and the few genuinely tall grasses, and leaves tufts, flowers and low cover
 # where they belong. Reeds are exempt: they stand in water, where a collidable
 # voxel column would wall off a lake margin the player is meant to wade.
-# NOT LIVE YET -- set KINDS_HEIGHT_PROMOTED to ("bush", "grass") to enable.
-# Promotion is NOT a flag flip: a terrain-lattice species must be BAKED at the
-# world's 100 mm pitch (assetLayerAdmitsVoxelSize), and the 38 body-scale
-# candidates are authored at 5 cm (37) and 2 cm (1). Flipping the flag alone
-# produced a manifest the engine REFUSED whole -- correctly. The full change is:
-#   1. re-author those specs to resolution_cm 10 and re-bake their banks
-#      (measured: 33 s for 582 grids, so the bake is not the obstacle),
-#   2. reconcile spacing against the destination lattice pitch, and
-#   3. re-verify the whole table against assetSpeciesFits -- note that ~30
-#      EXISTING trees and rocks already carry spacing tighter than their
-#      layer's cell (birch 4 m on the 5 m lattice, douglas-fir 8 m on the
-#      24 m), so whatever tolerates those today must be understood before
-#      adding 38 more.
-# Owner intent stands (2026-08-18): body-scale plants SHOULD collide.
+# LIVE as of 2026-08-18 (owner decision: "Proceed with plant collision as
+# described"). The two blockers the first flip hit, and what each turned out
+# to be:
+#   1. RESOLUTION. A terrain-lattice species must be baked at the world's
+#      100 mm pitch (assetLayerAdmitsVoxelSize); the 38 body-scale candidates
+#      were authored at 5 cm (37) and 2 cm (1), so the flag alone produced a
+#      manifest the engine refused WHOLE -- correctly. The candidates now
+#      carry resolution_cm 10, except the two named in
+#      TERRAIN_LATTICE_EXEMPT, whose shapes genuinely do not survive 10 cm.
+#      The judgment call, against the project rule (smallest identifying
+#      feature ~3 voxels across): a shrub's identifying feature is its
+#      foliage mass and multi-stem silhouette, comfortably >30 cm on every
+#      promoted bush; the three tall grasses ride grid.capsule's centreline
+#      fallback (a stem thinner than half a voxel is drawn as a face-connected
+#      one-voxel run -- ground.py's own contract), so a 2 m grass at 10 cm is
+#      the same regime as a 40 cm tuft at 2 cm: 15-20 voxels tall, one-voxel
+#      stems, connected. What degrades: big-bluestem's seed spike (0.16 m)
+#      drops to ~2 voxels. Accepted -- at collision scale the read that
+#      matters is "tall grass", not which grass.
+#   2. SPACING. ~30 existing trees and rocks carry spacing tighter than their
+#      layer's cell (birch 4 m on the 5 m lattice) yet the shipped manifest
+#      passes assetSpeciesFits. RESOLVED, not a latent bug: the manifest
+#      stores spacing AS AUTHORED, and the reader checks the SERVED spacing
+#      -- authored floored at the cell pitch (assetmanifest.cpp's semantic
+#      check computes `served = max(spacingMm, L.cellMm)` before calling
+#      assetSpeciesFits). Tighter-than-cell spacing means "one per cell, full
+#      density": the residual (cell/spacing)^2 fold clamps at 1, the exporter
+#      reports every floor by name (underserved_spacing), and kSpacingTooTight
+#      exists for callers that pass raw authored spacing (tests, importers).
+#      The promoted shrubs join that reported population deliberately.
 TERRAIN_LATTICE_MIN_HEIGHT_M = 1.5
-KINDS_HEIGHT_PROMOTED = ()
+KINDS_HEIGHT_PROMOTED = ("bush", "grass")
+
+# Body-scale species that stay on the detail lattice BY NAME, because their
+# authored resolution is the species. Each cites its own spec's notes:
+#   black-coral-tree: 2 cm, ocean floor. tip_radius_m 0.015 is 1.5 voxels at
+#     the authored pitch and "most wants 1 cm" -- at 10 cm the feathering that
+#     IS a black coral vanishes into a stone lollipop. It also stands in open
+#     water, where the reed argument applies as written.
+#   mangrove-sapling: 5 cm, the water margin. Its spec says it outright: the
+#     seedling stage lives "on the 5 cm detail lattice, where thirty voxels of
+#     height is enough to carry stilts that a 10 cm lattice would lose" -- and
+#     a collidable column in the wading margin is what the reed exemption
+#     exists to prevent. The 7 m red-mangrove TREE already ships collidable.
+TERRAIN_LATTICE_EXEMPT = ("black-coral-tree", "mangrove-sapling")
 
 
-def is_terrain_lattice(kind: str, height_m: float) -> bool:
+def is_terrain_lattice(kind: str, height_m: float, name: str) -> bool:
     """Does this species live in the world voxel grid (solid + all-LOD)?
 
     Trees and rocks always do. Bushes and grasses do IF they are body-scale --
-    see TERRAIN_LATTICE_MIN_HEIGHT_M. One function so the manifest's flag, the
-    layer assignment and any future consumer cannot disagree about it.
+    see TERRAIN_LATTICE_MIN_HEIGHT_M -- and not exempted by name (see
+    TERRAIN_LATTICE_EXEMPT). One function so the manifest's flag, the layer
+    assignment and any future consumer cannot disagree about it; `name` is
+    required so no consumer can forget the exemptions.
     """
     if kind in KINDS_TERRAIN:
         return True
+    if name in TERRAIN_LATTICE_EXEMPT:
+        return False
     return kind in KINDS_HEIGHT_PROMOTED and float(height_m or 0.0) >= TERRAIN_LATTICE_MIN_HEIGHT_M
 
 
@@ -278,13 +311,6 @@ LAYERS = (
     # to the pre-taper species forever. The ceiling follows the measurement,
     # as this comment already promised it would; the extra 0.5 m of query
     # dilation is priced by the same widening census as the original number.
-    # The first cut said 96 m / 20 m; the widening census priced that at ~11
-    # wasted chunk layers on every L0-present footprint and ~2 chunk layers of
-    # dilation slack, for headroom no baked asset uses. The wider heroes that
-    # WOULD need more fold to zero everywhere (900 m+ spacing is past
-    # per-mille resolution), are absent from the world, and export_banks skips
-    # their banks -- paying dilation for species that cannot appear is paying
-    # for nothing.
     # The first cut said 96 m / 20 m; the widening census priced that at ~11
     # wasted chunk layers on every L0-present footprint and ~2 chunk layers of
     # dilation slack, for headroom no baked asset uses. The wider heroes that
@@ -580,7 +606,7 @@ def assign_layer(kind: str, height_m: float, report: ExportReport, name: str,
     """
     if kind not in KINDS_ON_SCATTER:
         return LAYER_NOT_SCATTERED
-    if not is_terrain_lattice(kind, height_m):
+    if not is_terrain_lattice(kind, height_m, name):
         return 3  # ground cover: the detail lattice (no collision, detail ring only)
     # Nominal x headroom against the cap: what the BAKES reach, not what the
     # spec says. See FILE_HEADROOM_*.
@@ -677,7 +703,7 @@ def species_record(spec: dict, name: str, seeds_baked: int,
         encoded_name,
         KIND_ORDER.index(kind),
         layer & 0xFF,
-        1 if is_terrain_lattice(kind, nominal_height_m(spec, kind)) else 0,
+        1 if is_terrain_lattice(kind, nominal_height_m(spec, kind), name) else 0,
         WATER_ORDER.index(water_kind),
         WATER_KIND_TO_MASK[water_kind],
         seeds_baked,

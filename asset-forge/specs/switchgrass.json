@@ -247,7 +247,7 @@
     "spacing_m": 0.8,
     "water_max_m": 0.0
   },
-  "resolution_cm": "5",
+  "resolution_cm": "10",
   "rock": {
     "angular": 0.45,
     "arch": 0.0,

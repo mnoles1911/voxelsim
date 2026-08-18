@@ -287,7 +287,9 @@ VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
 
     // tundra-pine, numbers read from specs/tundra-pine.json by eye:
     // biomes.taiga 1.0, temperate_forest 0.2, tundra_alpine 0.35; abundance
-    // 0.9; cluster 0.75; spacing 4.5 m; elev 0..2200 m; slope_max 55%;
+    // 0.9; cluster 0.75; spacing 4.5 m; elev 0..2200 m; slope_max 70%
+    // (55 -> 70 in the scree-slope-band pass, 20248e2, which never refreshed
+    // this fixture; caught at the 2026-08-18 re-bless);
     // height 9 m; kind tree; 4 baked bank seeds on disk.
     const AssetManifestSpecies* pine = nullptr;
     for (const AssetManifestSpecies& s : m.species())
@@ -306,7 +308,7 @@ VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
         CHECK_EQ(pine->spacingMm, 4500);
         CHECK_EQ(pine->elevMinMm, 0);
         CHECK_EQ(pine->elevMaxMm, 2'200'000);
-        CHECK_EQ(pine->slopeMaxMmPerM, 550);
+        CHECK_EQ(pine->slopeMaxMmPerM, 700);
         CHECK_EQ(pine->heightMm, 9000);
         CHECK_EQ(pine->voxelSizeMm, 100u);
         CHECK_EQ(int(pine->seedsBaked), 4);
