@@ -106,7 +106,17 @@
 //     together -- the one failure parity alone cannot see.
 // Two independent folds and a parity sweep. If any had disagreed this bump
 // would have been wrong and is recorded here so a later reader can re-test it.
-#define VXC_WORLDGEN_VERSION_USH 25
+//
+// v26 (placement channels, bake_ver 28): same argument as v25, stated for the
+// record. The version moved because fine tiles gained five PLACEMENT planes
+// (water distance, standing water, TWI, talus, curvature/aspect) that asset
+// placement reads -- worldgen INPUTS by contract, but not terrain math. Not
+// one constant in this file changes; the terrain-only bench digest was
+// re-verified at e02458de2be47309 before the C++ bump, and the pinned
+// CPU-reference digest stays b2b5d2f1044caa35. Mirror version moves so the
+// skew check can keep meaning "the math disagrees" rather than "somebody
+// forgot the dance."
+#define VXC_WORLDGEN_VERSION_USH 26
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."
