@@ -1,14 +1,26 @@
 # Environment assets: what is left, in the order it should be done
 
+> **SUPERSEDED 2026-08-19 — kept for its acceptance tests, not its status.**
+> Every premise in "where things stand" below has been overtaken: **828 species**
+> across ten kinds (not 66 across six), they are **on the 10 cm terrain lattice**
+> where they collide (5 cm survives only for detail-ring cover), they **are in the
+> world** on both the CPU and GPU composition paths, and the game **does** read
+> the colour table (ADR-0008 palette, at pixel rate). The forward list is
+> `docs/backlog.md` §10; what shipped and how it is measured is
+> `docs/asset-placement-design.md` and `docs/biome-placement-survey.md`. What is
+> still worth reading here is the per-item *check* — the rule that an item without
+> a check gets declared finished twice.
+
 Written 2026-08-11. Companion to `docs/backlog.md` §8, which holds the standing
 context; this is the sequenced plan and the acceptance test for each item.
 
-**Where things stand.** Sixty-six species build, every one on the 5 cm lattice.
-None of them is in the world, nothing in the game reads the colour table, and
-the last three sessions have been spent on defects that all failed the same
-way — they ran, reported success, and were wrong. That is the thing to keep in
-mind while reading the order below: the sequencing is not by size, it is by
-*how much later work a mistake here would poison*.
+**Where things stand** *(as of 2026-08-11 — see the banner)*. Sixty-six species
+build, every one on the 5 cm lattice. None of them is in the world, nothing in
+the game reads the colour table, and the last three sessions have been spent on
+defects that all failed the same way — they ran, reported success, and were
+wrong. That is the thing to keep in mind while reading the order below: the
+sequencing is not by size, it is by *how much later work a mistake here would
+poison*.
 
 Every item says how you will know it is done. An item without a check is an
 item that will be declared finished twice.

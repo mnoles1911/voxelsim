@@ -10,14 +10,26 @@ notes listed in §12. Where an older note and this document disagree, this
 document is right and the older note carries a banner saying so. Water is
 deliberately thin here — it has its own documents (§12) and its own owner.
 
-**Pinned state at time of writing:**
+**Pinned state — version row refreshed 2026-08-19; the prose below it is still
+the 2026-08-05 consolidation:**
 
 | number | value | what it covers |
 |---|---|---|
-| `TERRAIN_VERSION` | **8** | the ground itself |
-| `BAKE_VERSION` | **14** | everything the bake emits that is not ground |
-| `kWorldGenVersion` | **23** | the client amplifier's maths |
+| `TERRAIN_VERSION` | **8** | the ground itself — unchanged since consolidation, so every site coordinate here still resolves |
+| `BAKE_VERSION` | **28** (was 14) | everything the bake emits that is not ground |
+| `kWorldGenVersion` | **28** (was 23) | the client amplifier's maths |
 | shipped world | seed `20260719`, 17×17 coarse tiles | the world every measurement below is from unless it says otherwise |
+
+**What moved since:** `BAKE_VERSION` 15–28 is water (lake depth and signed shore
+distance, ponds, headwaters) and then **placement** — bake 28 adds five per-tile
+placement planes. `kWorldGenVersion` 24–28 is the asset era: the asset term
+became worldgen input (v24), manifest and bank bytes were called in as worldgen
+input (v25), placement started reading the ground's own channels (v26), the biome
+rebalance moved the digests (v27), and v28 is per-biome placement. **Only v27
+moves the terrain digest** — v24–v26 and v28 are asset-side and leave terrain-only
+bit-identical (e02458de2be47309 through v26, ad9c4c2a100b5a28 after v27), which is
+why each of those bumps ships a composed-ASSET digest as its ran-flag instead.
+`core.h`'s changelog is authoritative and now runs to v28.
 
 ---
 
@@ -136,9 +148,9 @@ This is the part people get wrong most often, so it is stated as a rule.
 
 | number | value | lives in | what it means when it moves |
 |---|---|---|---|
-| `TERRAIN_VERSION` | **8** | `terrain-service/terrain_service/bake/pipeline.py:430` | **A NEW WORLD.** Every measurement, screenshot and site coordinate anyone holds is invalidated. |
-| `BAKE_VERSION` | **14** | `pipeline.py:431` | Tiles are re-baked **onto identical ground**. Products change; the ground does not. |
-| `kWorldGenVersion` | **23** | `voxel-core/include/voxelcore/core.h:236` | The client draws different voxels from the same tile. Invalidates edit logs and golden digests. |
+| `TERRAIN_VERSION` | **8** | `terrain-service/terrain_service/bake/pipeline.py:457` | **A NEW WORLD.** Every measurement, screenshot and site coordinate anyone holds is invalidated. |
+| `BAKE_VERSION` | **28** | `pipeline.py:469` | Tiles are re-baked **onto identical ground**. Products change; the ground does not. |
+| `kWorldGenVersion` | **28** | `voxel-core/include/voxelcore/core.h:416` | The client draws different voxels from the same tile. Invalidates edit logs and golden digests. |
 
 **`TERRAIN_VERSION` decides the ground.** Bump it when the surface changes — a
 new stage, a new constant in `BakeConstants.as_payload`, a kernel that moves a
@@ -147,10 +159,13 @@ height. It feeds `roughness_seed` and `bake_identity_payload`.
 **`BAKE_VERSION` decides the products.** Bump it when the bake emits something
 new or differently — a new section, a table layout, a threshold that decides
 written bytes. It is stamped in the tile header as `bake_ver` and hashed through
-`product_identity_payload`. The recent 9→14 run is all water work (discharge,
-water heads, the graded water plane, single-receiver routing, lateral fill, and
-at 14 making the drawn river touch the slope); the ground did not move for any
-of it.
+`product_identity_payload`. The 9→14 run was all water work (discharge, water
+heads, the graded water plane, single-receiver routing, lateral fill, and at 14
+making the drawn river touch the slope); 15→28 continued through ponds,
+headwaters, and per-cell lake depth + signed shore distance, and then **28 added
+the five placement planes** (distance-to-water, standing water, TWI, talus,
+curvature/heat) that asset placement reads. The ground did not move for any of
+it.
 
 **`kWorldGenVersion` decides what the amplifier does with a tile.** Its full
 history lives in a per-version changelog in `core.h` above the constant.
@@ -168,13 +183,11 @@ deliberate — it is what lets the codec default change without orphaning a sing
 baked tile — but anything treating the id as an ETag or a byte checksum must key
 on `(id, codec)` instead. **The id addresses the world, not the file.**
 
-### Known gap: `core.h` has no v23 entry
+### ~~Known gap: `core.h` has no v23 entry~~ — CLOSED 2026-08-19
 
-`core.h`'s changelog runs to v22 and then declares `kWorldGenVersion = 23`.
-The v23 rationale exists only in commit `0609be1` and in the comment at
-`amplifier.cpp:1697–1712`, so a reader of the changelog sees v22's savanna prose
-sitting directly above a constant that says 23. **This is a code fix, not a
-documentation one, and it has not been made.** See §11.
+The changelog now carries a full entry for every version through **v28**,
+including the v23 one this section was written about. A reader of `core.h` no
+longer sees v22's savanna prose sitting above a constant that says 23.
 
 ---
 

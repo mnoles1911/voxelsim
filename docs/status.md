@@ -1,5 +1,12 @@
 # Milestone gate status
 
+> **HISTORICAL — this file stops at 2026-07-29 and is no longer being written.**
+> Everything after that date (the water re-architecture and PBF, weather and
+> waves, the item system, and the asset placement / Asset Forge programme) is
+> recorded in merge commit messages and in the per-programme documents indexed
+> from `docs/backlog.md`. Read the backlog first; treat any claim below as true
+> *as of its own date* and check it against the code before acting on it.
+
 ## 2026-07-29 — a working day/night cycle, and the plan's central claim was wrong
 
 Shipped: `VoxelEphemeris` (NOAA/Meeus solar position, circular-orbit moon),

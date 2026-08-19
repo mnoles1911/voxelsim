@@ -1,5 +1,16 @@
 # The assets compose and nothing appears: what is proven, and what is not
 
+> **RESOLVED — reviewed 2026-08-19. Read this as a case study, not as the state
+> of the engine.** Every break named below was fixed in the 2026-08-17/19
+> programme: coarse LOD levels now compose assets (the "no high-altitude camera
+> can ever show an asset" clause in §4 no longer holds — CPU and a GPU gather
+> kernel both do it), the shore-distance channel §3 calls unservable is served
+> from the bake-28 placement planes so the 112 water-gated species place, and the
+> world itself was rebalanced (§4's 4.8% temperate forest is now 21.1%). The
+> species-pick narrowing was the engine calling the old column binding in five
+> places and the new one in zero (`183f068`). Current state:
+> `docs/biome-placement-survey.md`; what is left: `docs/backlog.md` §10.
+
 Written 2026-08-16 at the end of the first session with the editor. **The owner
 looked at every capture and said, correctly, that none of them contains a placed
 object.** This file is the evidence for where the break is, so the next session

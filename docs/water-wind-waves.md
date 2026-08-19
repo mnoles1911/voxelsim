@@ -10,9 +10,17 @@ surface. Nothing here touches the water simulation. The code is
 `ue-project/Tools/water_wave_graph.py`, imported by the water material
 generator; `docs/water-architecture.md` remains the architecture entry point.
 
-Status: **built and compile-checked, not yet rendered.** No screenshot exists.
-Every number below comes from an offline numpy transcription of the shader
-maths, not from a frame.
+Status: **LIVE — reviewed 2026-08-19.** It shipped and was rendered on
+2026-08-13 (`f2ea97c`, "wind-driven waves and interactive ripples, live") and has
+since been tuned against the owner's eye twice: the ripple system turned out
+never to have been broken (`c031b03`), and the crest speed the owner kept
+rejecting was the **wave-inertia filter**, not the wave maths (`a3a53d3`).
+Original status, and the caveat that still applies to the numbers below: built
+and compile-checked, not yet rendered — every number below comes from an offline
+numpy transcription of the shader maths, not from a frame, so treat them as the
+design intent and the frame as the authority. One open question remains in
+`docs/backlog.md` §9.2: crest speed at a *frozen* wind has never been judged on
+its own.
 
 ---
 

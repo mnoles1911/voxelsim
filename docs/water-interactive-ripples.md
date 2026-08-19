@@ -1,12 +1,14 @@
 # Local interactive water ripples
 
-**STATUS 2026-08-12: BUILT, FOUR BUGS FIXED, NOT YET WIRED IN.** The simulation
-and its assets are complete and self-contained. Nothing reads the field yet — the
-integration edits are written out in §8, and **§8.1 is the one that blocks a
-play-test**: until `MPC_VoxelSky` carries the three `RippleField*` parameters,
-`sample_ripple_field` raises and `create_water_voxel_material.py` cannot even
-run. Until §8.1 and §8.2 are applied this feature costs one subsystem tick and
-three GPU passes and changes nothing on screen.
+**STATUS 2026-08-19: WIRED, LIVE AND TUNED.** §8's integration edits were
+applied on 2026-08-13 (`f2ea97c`) and the system has been on screen since. It was
+then reported dead by the owner and was not: `c031b03` established with a
+read-back probe that every stage worked and that **three defaults** were hiding
+it — half-life 1.8 → 5.0 s, gain 1.0 → 2.5, player entry 0.09/0.5 → 0.22/0.9 m,
+object impact 0.07 → 0.18 m. A 9 cm ripple was competing with a moving 6 cm
+wind-wave field on the same normal. **Read that commit before tuning anything
+here**, including its list of five measurements taken where the answer could not
+appear. Original status: built, four bugs fixed, not yet wired in.
 
 Four confirmed bugs were fixed on 2026-08-12, one of which had every ripple
 lasting twice as long as configured. They are recorded with their measurements in

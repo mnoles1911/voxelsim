@@ -1,7 +1,14 @@
 # Procedural placement for the 828 environmental assets
 
 Date: 2026-08-15
-Status: design + voxel-core implementation built and tested; UE wiring specified, not written
+Status: **the UE wiring is now written and verified in-editor (reviewed
+2026-08-19)** — composition at every LOD level on both the CPU and GPU paths,
+exact per-footprint admission, and detail-ring ground cover as HISM. §9's "what
+needs the editor" list is therefore history. Two things landed after this
+document and are not in it: per-kind × per-biome densities with named rule
+overrides (worldgen v28, `docs/placement-spec-schema.md`), and the survey that
+judged the result (`docs/biome-placement-survey.md`). Originally: design +
+voxel-core implementation built and tested; UE wiring specified, not written.
 Prior art: `docs/asset-streaming-design.md` (the streaming half, built 2026-08-10),
 `voxel-core/include/voxelcore/assetplacement.h`, `voxel-core/include/voxelcore/assetgrid.h`,
 `asset-forge/docs/aquatic-species.md`, `asset-forge/docs/biomes/README.md`

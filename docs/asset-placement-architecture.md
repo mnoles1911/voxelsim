@@ -1,15 +1,20 @@
 # Architecture: procedural placement of environmental assets
 
 Date: 2026-08-15
-Status: architecture plan, not yet implemented. Supersedes parts of
+Status: **BUILT — reviewed 2026-08-19.** Written as a plan; the 2026-08-15/19
+programme implemented it, and in two places went past it (per-kind × per-biome
+densities and named per-biome rule overrides, worldgen v28, which this document
+does not describe — see `docs/placement-spec-schema.md`). Supersedes parts of
 `docs/asset-streaming-design.md` — see §2.1, which contradicts that document's
-wiring list on a point that matters.
+wiring list on a point that matters. Read the scope paragraph below as the
+starting condition, not the current one.
 
-**Scope.** 828 authored species (131 quadruped, 127 bird, 106 fish, 102 rock,
-89 grass, 87 flower, 78 tree, 57 bush, 33 reed, 18 cetacean) and nothing spawns
-any of them. This says, for each of the owner's four classes, what the rule
-reads, what it decides, where it runs, and **what measurement catches each
-failure mode it introduces**.
+**Scope** *(the starting condition, 2026-08-15)*. 828 authored species (131
+quadruped, 127 bird, 106 fish, 102 rock, 89 grass, 87 flower, 78 tree, 57 bush,
+33 reed, 18 cetacean) and nothing spawns any of them. All but the 382 animals
+(deferred until animation exists) now do. This says, for each of the owner's
+four classes, what the rule reads, what it decides, where it runs, and **what
+measurement catches each failure mode it introduces**.
 
 ## What has changed since `asset-streaming-design.md` (2026-08-10)
 

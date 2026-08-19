@@ -1,7 +1,13 @@
 # Streaming environmental assets larger than a render chunk
 
 Date: 2026-08-10
-Status: design + voxel-core foundation built and tested; UE wiring specified, not written
+Status: **SUPERSEDED — reviewed 2026-08-19.** The UE wiring is built; its §5.1
+blockers are retired; and `docs/asset-placement-architecture.md` §2.1 corrects
+this document's wiring list on a point that matters. Read that one and
+`docs/asset-placement-design.md` first; keep this for the streaming-bound
+derivation, which is still the reason admission can skip a chunk it proves empty.
+Originally: design + voxel-core foundation built and tested; UE wiring specified,
+not written.
 Prior art: `docs/tree-asset-generator-plan.md`, `docs/tree-asset-generator-research.md` §8
 
 This session had no access to the Unreal editor (another session held it). Everything
