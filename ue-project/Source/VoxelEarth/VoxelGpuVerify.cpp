@@ -122,7 +122,7 @@ namespace
 	// but the parity gate would not catch a wrong u8 there. Same fixture-gap
 	// shape v22 documented; a semi-band region in kBandOnlyRegions is the
 	// close, if anyone needs it proven.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 27;
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 28;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "
