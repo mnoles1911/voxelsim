@@ -222,6 +222,91 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutQuads)
 		END_SHADER_PARAMETER_STRUCT()
 	};
+	// --- AssetStampMain: asset compose into Cells ---------------------------
+	//
+	// NOT a worldgen kernel and deliberately not in worldgen.ush -- assets are
+	// not terrain, the kernel has no bench leg, and the mirror's version lock
+	// must not move for it (VoxelAssetStamp.usf's header carries the full
+	// argument). Derives from FGlobalShader for the same reason QuadTotal
+	// does; the only convention shared with the mirror is cell indexing.
+	class FVoxelAssetStampCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelAssetStampCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelAssetStampCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return true;
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(FUintVector2, DispatchColumns)
+			SHADER_PARAMETER(uint32, BricksZ)
+			SHADER_PARAMETER(int32, BrickZMin)
+			SHADER_PARAMETER(FIntPoint, AnchorRel)
+			SHADER_PARAMETER(int32, AnchorVz)
+			SHADER_PARAMETER(int32, GridOriginZ)
+			SHADER_PARAMETER(int32, RotOriginX)
+			SHADER_PARAMETER(int32, RotOriginY)
+			SHADER_PARAMETER(uint32, YawQuarter)
+			SHADER_PARAMETER(uint32, SizeX)
+			SHADER_PARAMETER(uint32, SizeY)
+			SHADER_PARAMETER(uint32, SizeZ)
+			SHADER_PARAMETER(uint32, ColStartsBase)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ColStarts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- AssetStampCoarseMain: the CoarseLevel > 0 gather -------------------
+	//
+	// A separate class rather than a permutation of FVoxelAssetStampCS because
+	// the two kernels are different SHAPES, not one kernel with a flag: the
+	// scatter is threaded over baked columns, the gather over level-L cells of
+	// a host-computed covering box, and their parameter sets differ by exactly
+	// the fields that describe that box. Keeping level 0 on the untouched
+	// scatter class is also what makes "level 0 byte-identical" a property of
+	// the code layout instead of a test result. Same .usf, same span table,
+	// same FGlobalShader reasoning as the scatter above.
+	class FVoxelAssetStampCoarseCS : public FGlobalShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelAssetStampCoarseCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelAssetStampCoarseCS, FGlobalShader);
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return true;
+		}
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(FUintVector2, DispatchColumns)
+			SHADER_PARAMETER(uint32, BricksZ)
+			SHADER_PARAMETER(int32, BrickZMin)
+			SHADER_PARAMETER(FIntPoint, AnchorRel)
+			SHADER_PARAMETER(int32, AnchorVz)
+			SHADER_PARAMETER(int32, GridOriginZ)
+			SHADER_PARAMETER(int32, RotOriginX)
+			SHADER_PARAMETER(int32, RotOriginY)
+			SHADER_PARAMETER(uint32, YawQuarter)
+			SHADER_PARAMETER(uint32, SizeX)
+			SHADER_PARAMETER(uint32, SizeY)
+			SHADER_PARAMETER(uint32, SizeZ)
+			SHADER_PARAMETER(uint32, ColStartsBase)
+			// The gather's own three: the scale (host-computed 1 << level, same
+			// VARIABLE_SHIFT reasoning as FillLooseParameters' CoarseScale) and
+			// the covering cell box the dispatch is threaded over.
+			SHADER_PARAMETER(uint32, CoarseScale)
+			SHADER_PARAMETER(FUintVector2, CellBoxMin)
+			SHADER_PARAMETER(FUintVector2, CellBoxSize)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ColStarts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, Spans)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- QuadTotalMain: the 4-byte scan total (Wave D / D3) ----------------
 	//
 	// NOT a worldgen kernel and deliberately not in worldgen.ush — see the
@@ -363,6 +448,9 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelQuadCompactCS,   VOXEL_QUAD_POOL_WRITE_USF, "QuadC
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolWriteCS, VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolWriteMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolHideCS,  VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolHideMain",  SF_Compute);
 
+IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampCoarseMain", SF_Compute);
+
 IMPLEMENT_GLOBAL_SHADER(FVoxelColumnCS,     VOXEL_WORLDGEN_USF, "ColumnMain",     SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain",   SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
@@ -483,6 +571,49 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 				TEXT("RingSkirtMask %u has bits outside the four lateral faces (1=-X 2=+X 4=-Y ")
 				TEXT("8=+Y)"), Req.RingSkirtMask);
 			return false;
+		}
+	}
+
+	if (Req.AssetInstances.Num() > 0)
+	{
+		// Coarse regions stamp through AssetStampCoarseMain now (the rep-coord
+		// gather, byte-parity target FCoarseChunkGridSampler), so instances are
+		// accepted at any level the terrain kernels themselves run at. What is
+		// STILL refused is a level outside [0, 5]: FillLooseParameters clamps
+		// the terrain's CoarseScale silently, and a stamp composed at a clamped
+		// scale would sit at the wrong offset inside plausible terrain -- the
+		// exact wrong-but-plausible output this function exists to catch.
+		if (Req.CoarseLevel < 0 || Req.CoarseLevel > 5)
+		{
+			OutError = FString::Printf(
+				TEXT("AssetInstances (%d) on a CoarseLevel %d region — the stamp supports levels ")
+				TEXT("0..5 (the range the terrain kernels' CoarseScale is derived over); a clamped ")
+				TEXT("scale would stamp instances at the wrong offset inside plausible terrain."),
+				Req.AssetInstances.Num(), Req.CoarseLevel);
+			return false;
+		}
+		// Prefix-table shape: each instance owns SizeX*SizeY+1 entries and the
+		// spans it indexes must exist. A packing overflow (SizeZ > 4095) is
+		// refused HERE, where the species can still be named by the caller,
+		// rather than truncated into a hole at the top of a tall asset.
+		for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Req.AssetInstances)
+		{
+			if (Inst.SizeX == 0 || Inst.SizeY == 0 || Inst.SizeZ == 0 || Inst.SizeZ > 4095)
+			{
+				OutError = FString::Printf(
+					TEXT("AssetInstance box %ux%ux%u is empty or too tall for span packing ")
+					TEXT("(SizeZ max 4095)"), Inst.SizeX, Inst.SizeY, Inst.SizeZ);
+				return false;
+			}
+			const uint64 Cols = uint64(Inst.SizeX) * uint64(Inst.SizeY);
+			if (uint64(Inst.ColStartsBase) + Cols + 1 > uint64(Req.AssetColStarts.Num()))
+			{
+				OutError = FString::Printf(
+					TEXT("AssetInstance ColStarts [%u, %llu) overruns AssetColStarts (%d)"),
+					Inst.ColStartsBase, uint64(Inst.ColStartsBase) + Cols + 1,
+					Req.AssetColStarts.Num());
+				return false;
+			}
 		}
 	}
 
@@ -639,6 +770,136 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+	}
+
+	// --- pass 2a: AssetStampMain / AssetStampCoarseMain, one dispatch per ----
+	// --- instance -------------------------------------------------------------
+	//
+	// Between VoxelizeMain (terrain into Cells) and everything that reads
+	// Cells. ONE DISPATCH PER INSTANCE, IN ARRAY ORDER: the RDG UAV barrier
+	// between consecutive passes is what serializes them, and that ordering is
+	// the byte-parity contract with the CPU's first-non-air-wins compose --
+	// instance i+1 must see instance i's writes to lose the same overlaps.
+	// Within one dispatch no two threads own the same cell (level 0: the yaw
+	// map is a bijection over baked columns; coarse: one thread per level-L
+	// cell), so there is no intra-pass race on either kernel.
+	//
+	// An empty request skips all of this, including for the verify/digest
+	// path, which never fills the arrays and therefore stays terrain-only.
+	if (Request.AssetInstances.Num() > 0)
+	{
+		FRDGBufferRef ColStartsBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.AssetColStarts"), sizeof(uint32),
+			Request.AssetColStarts.Num(), Request.AssetColStarts.GetData(),
+			Request.AssetColStarts.Num() * sizeof(uint32));
+		FRDGBufferRef SpansBuffer = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.AssetSpans"), sizeof(uint32),
+			Request.AssetSpans.Num(), Request.AssetSpans.GetData(),
+			Request.AssetSpans.Num() * sizeof(uint32));
+
+		if (Request.CoarseLevel == 0)
+		{
+			// Level 0: the scatter kernel, untouched -- byte-identical to every
+			// dispatch taken before the coarse gather existed.
+			TShaderMapRef<FVoxelAssetStampCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
+			{
+				FVoxelAssetStampCS::FParameters* Params =
+					GraphBuilder.AllocParameters<FVoxelAssetStampCS::FParameters>();
+				Params->DispatchColumns = Request.DispatchColumns;
+				Params->BricksZ = Request.BricksZ;
+				Params->BrickZMin = Request.BrickZMin;
+				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
+				Params->AnchorVz = Inst.AnchorVz;
+				Params->GridOriginZ = Inst.GridOriginZ;
+				Params->RotOriginX = Inst.RotOriginX;
+				Params->RotOriginY = Inst.RotOriginY;
+				Params->YawQuarter = Inst.YawQuarter;
+				Params->SizeX = Inst.SizeX;
+				Params->SizeY = Inst.SizeY;
+				Params->SizeZ = Inst.SizeZ;
+				Params->ColStartsBase = Inst.ColStartsBase;
+				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
+				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
+				Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
+
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStamp"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(Inst.SizeX, 8u),
+					           FMath::DivideAndRoundUp(Inst.SizeY, 8u), 1));
+			}
+		}
+		else
+		{
+			// CoarseLevel > 0: the gather kernel, one thread per level-L cell
+			// of the instance's covering cell box. The box is computed HERE,
+			// mirroring FCoarseChunkGridSampler's shortlist bounds: cells whose
+			// rep coordinate COULD fall inside the rotated XY box, i.e.
+			// [floorDiv(min - s/2, s), floorDiv(max - s/2, s) + 1] inclusive,
+			// clamped to the region -- conservative on purpose, because the
+			// kernel's rep-in-box test is the exact filter (same division of
+			// labour as the CPU: cover loosely, test exactly). A box clamped to
+			// nothing is an instance whose rep coordinates never land in this
+			// region: the CPU composes nothing for it, so skipping the dispatch
+			// IS parity, not an optimisation over it.
+			//
+			// floorDiv is inlined here (this module deliberately does not link
+			// voxel-core); (min - s/2) is routinely negative for an instance
+			// leaning in from the negative side, so operator/ will not do.
+			const int32 Scale = 1 << Request.CoarseLevel;   // validated 1..5
+			const auto FloorDivI32 = [](int32 A, int32 B) -> int32
+			{
+				return (A >= 0) ? (A / B) : -((-A + B - 1) / B);
+			};
+
+			TShaderMapRef<FVoxelAssetStampCoarseCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			for (const FVoxelGpuRegionRequest::FAssetInstance& Inst : Request.AssetInstances)
+			{
+				const int32 RotSizeX = (Inst.YawQuarter & 1u) ? int32(Inst.SizeY) : int32(Inst.SizeX);
+				const int32 RotSizeY = (Inst.YawQuarter & 1u) ? int32(Inst.SizeX) : int32(Inst.SizeY);
+				const int32 MinRelVx = Inst.AnchorRelVx + Inst.RotOriginX;
+				const int32 MinRelVy = Inst.AnchorRelVy + Inst.RotOriginY;
+				const int32 Half = Scale / 2;
+
+				const int32 C0x = FMath::Max(FloorDivI32(MinRelVx - Half, Scale), 0);
+				const int32 C1x = FMath::Min(FloorDivI32(MinRelVx + RotSizeX - 1 - Half, Scale) + 1,
+				                             int32(Cx) - 1);
+				const int32 C0y = FMath::Max(FloorDivI32(MinRelVy - Half, Scale), 0);
+				const int32 C1y = FMath::Min(FloorDivI32(MinRelVy + RotSizeY - 1 - Half, Scale) + 1,
+				                             int32(Cy) - 1);
+				if (C0x > C1x || C0y > C1y)
+				{
+					continue;
+				}
+
+				FVoxelAssetStampCoarseCS::FParameters* Params =
+					GraphBuilder.AllocParameters<FVoxelAssetStampCoarseCS::FParameters>();
+				Params->DispatchColumns = Request.DispatchColumns;
+				Params->BricksZ = Request.BricksZ;
+				Params->BrickZMin = Request.BrickZMin;
+				Params->AnchorRel = FIntPoint(Inst.AnchorRelVx, Inst.AnchorRelVy);
+				Params->AnchorVz = Inst.AnchorVz;
+				Params->GridOriginZ = Inst.GridOriginZ;
+				Params->RotOriginX = Inst.RotOriginX;
+				Params->RotOriginY = Inst.RotOriginY;
+				Params->YawQuarter = Inst.YawQuarter;
+				Params->SizeX = Inst.SizeX;
+				Params->SizeY = Inst.SizeY;
+				Params->SizeZ = Inst.SizeZ;
+				Params->ColStartsBase = Inst.ColStartsBase;
+				Params->CoarseScale = uint32(Scale);
+				Params->CellBoxMin = FUintVector2(uint32(C0x), uint32(C0y));
+				Params->CellBoxSize = FUintVector2(uint32(C1x - C0x + 1), uint32(C1y - C0y + 1));
+				Params->ColStarts = GraphBuilder.CreateSRV(ColStartsBuffer);
+				Params->Spans = GraphBuilder.CreateSRV(SpansBuffer);
+				Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
+
+				FComputeShaderUtils::AddPass(
+					GraphBuilder, RDG_EVENT_NAME("Voxel.AssetStampCoarse"), Shader, Params,
+					FIntVector(FMath::DivideAndRoundUp(uint32(C1x - C0x + 1), 8u),
+					           FMath::DivideAndRoundUp(uint32(C1y - C0y + 1), 8u), 1));
+			}
+		}
 	}
 
 	// --- pass 2b: BandReduceMain (Wave D / D6) -----------------------

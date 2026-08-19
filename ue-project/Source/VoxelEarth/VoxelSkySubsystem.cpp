@@ -2521,7 +2521,12 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 
 	const double JulianDay = VoxelSky::JulianDayFromGameClock(Impl->EpochSeconds, DayLength, DaysPerYear);
 	const VoxelSky::FSunState Sun = VoxelSky::ComputeSun(JulianDay, Geo);
-	const VoxelSky::FMoonState Moon = VoxelSky::ComputeMoon(JulianDay, Geo, Sun);
+	// The moon's slow elements run on the UNFLOORED calendar (see ComputeMoon):
+	// same expression as JulianDayFromGameClock without FloorToDouble, so the
+	// two agree to within the fraction the floor discards.
+	const double SlowJulianDay = VoxelSky::ContinuousJulianDayFromGameClock(
+		Impl->EpochSeconds, DayLength, DaysPerYear);
+	const VoxelSky::FMoonState Moon = VoxelSky::ComputeMoon(JulianDay, Geo, Sun, SlowJulianDay);
 
 	FVoxelSkyState& S = Impl->State;
 	S.EpochSeconds = Impl->EpochSeconds;

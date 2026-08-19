@@ -497,6 +497,20 @@ namespace VoxelGpuPoolCull
 		ECVF_RenderThreadSafe);
 }
 
+// What CreateSceneProxy hands a new proxy instead of whole-capacity array
+// copies (S2-5): only the CPU-written shadow content, as upload runs over a
+// flat staging payload -- the same shape UpdateQuadRange_RenderThread already
+// consumes. At the old 80M default the whole-array handoff was two 960 MB
+// game-thread memcpys per proxy recreation; this is proportional to the
+// CPU-authored content instead, and zero on a settled GPU-resident pool.
+struct FVoxelPoolInitialShadow
+{
+	TArray<FVoxelQuadUploadRun> Runs;
+	TArray<uint64> Quads;
+	TArray<uint32> Ids;
+	TArray<uint32> Corners; // empty on terrain pools
+};
+
 class FVoxelGpuPoolSceneProxy final : public FPrimitiveSceneProxy
 {
 public:
@@ -507,9 +521,8 @@ public:
 	}
 
 	FVoxelGpuPoolSceneProxy(UVoxelGpuPoolComponent* Component,
-	                        const TArray<uint64>& InQuads,
-	                        const TArray<uint32>& InChunkIds,
-	                        const TArray<uint32>& InCornerHeights,
+	                        FVoxelPoolInitialShadow&& InInitialShadow,
+	                        int32 InBufferQuads,
 	                        const TArray<FVector4f>& InOrigins,
 	                        const TArray<FVector4f>& InParams,
 	                        const TArray<UVoxelGpuPoolComponent::FChunkRun>& InRuns,
@@ -520,16 +533,14 @@ public:
 		, VertexFactory(GetScene().GetFeatureLevel())
 		, PoolName(InPoolName)
 		, SharedBuffers(MoveTemp(InSharedBuffers))
-		, Quads(InQuads)
-		, ChunkIds(InChunkIds)
-		, CornerHeights(InCornerHeights)
+		, InitialShadow(MoveTemp(InInitialShadow))
 		, Origins(InOrigins)
 		, Params(InParams)
 		, Runs(InRuns)
 		, ChunkEdgeVoxels(Component->GetChunkEdgeVoxels())
 		, bWaterMode(Component->IsWaterMode())
 		, NumQuads(Component->GetHighWaterMarkQuads())
-		, BufferQuads(InQuads.Num())
+		, BufferQuads(InBufferQuads)
 		, NumChunks(InOrigins.Num())
 		, MaxChunks(FMath::Max(InOrigins.Num() * 4, InChunkTableCapacity))
 	{
@@ -593,7 +604,7 @@ public:
 		// CPU shadow happens to contain. Once the GPU writes quads directly,
 		// re-uploading here would silently revert them.
 		check(SharedBuffers.IsValid());
-		if (!SharedBuffers->IsValid() || SharedBuffers->CapacityQuads < Quads.Num())
+		if (!SharedBuffers->IsValid() || SharedBuffers->CapacityQuads < BufferQuads)
 		{
 			// First proxy, or the pool outgrew the allocation. The latter means
 			// the GPU-resident contents are genuinely gone, so re-uploading from
@@ -612,14 +623,27 @@ public:
 				       TEXT("%s: pool buffers REBUILT (capacity %d -> %d quads). Every GPU-written range is "
 				            "now empty and nothing re-meshes them — see requirement D4-R1. Expect missing "
 				            "terrain until those chunks are re-dispatched."),
-				       *PoolName, SharedBuffers->CapacityQuads, Quads.Num());
+				       *PoolName, SharedBuffers->CapacityQuads, BufferQuads);
 			}
 			SharedBuffers->GpuWritable.Set(0);
-			SharedBuffers->QuadBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-				RHICmdList, TEXT("VoxelGpuPool.Quads"),
-				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
-					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
-				MakeConstArrayView(Quads));
+			// ZERO-INITIALISED AT CAPACITY, NOT UPLOADED FROM A CAPACITY-SIZED
+			// ARRAY (S2-5). The shadow is paged now and no flat array exists;
+			// zeros are exactly what the flat zeroed shadow used to upload for
+			// every never-CPU-written slot (quad 0, chunk id 0 = hidden). The
+			// CPU-authored content -- InitialShadow, proportional to what was
+			// actually written, not to capacity -- is uploaded run-by-run just
+			// below, before GpuWritable is set.
+			{
+				const FRHIBufferCreateDesc QuadDesc =
+					FRHIBufferCreateDesc::CreateStructured(
+						TEXT("VoxelGpuPool.Quads"),
+						uint32(BufferQuads) * sizeof(uint64), sizeof(uint64))
+					.AddUsage(EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					          | EBufferUsageFlags::UnorderedAccess)
+					.DetermineInitialState()
+					.SetInitActionZeroData();
+				SharedBuffers->QuadBuffer = RHICmdList.CreateBuffer(QuadDesc);
+			}
 			SharedBuffers->QuadSRV = RHICmdList.CreateShaderResourceView(
 				SharedBuffers->QuadBuffer,
 				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
@@ -627,11 +651,17 @@ public:
 				SharedBuffers->QuadBuffer,
 				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->QuadBuffer));
 
-			SharedBuffers->ChunkIdBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-				RHICmdList, TEXT("VoxelGpuPool.ChunkIds"),
-				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
-					| EBufferUsageFlags::UnorderedAccess | EBufferUsageFlags::StructuredBuffer,
-				MakeConstArrayView(ChunkIds));
+			{
+				const FRHIBufferCreateDesc IdDesc =
+					FRHIBufferCreateDesc::CreateStructured(
+						TEXT("VoxelGpuPool.ChunkIds"),
+						uint32(BufferQuads) * sizeof(uint32), sizeof(uint32))
+					.AddUsage(EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource
+					          | EBufferUsageFlags::UnorderedAccess)
+					.DetermineInitialState()
+					.SetInitActionZeroData();
+				SharedBuffers->ChunkIdBuffer = RHICmdList.CreateBuffer(IdDesc);
+			}
 			SharedBuffers->ChunkIdSRV = RHICmdList.CreateShaderResourceView(
 				SharedBuffers->ChunkIdBuffer,
 				FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
@@ -639,7 +669,35 @@ public:
 				SharedBuffers->ChunkIdBuffer,
 				FRHIViewDesc::CreateBufferUAV().SetTypeFromBuffer(SharedBuffers->ChunkIdBuffer));
 
-			SharedBuffers->CapacityQuads = Quads.Num();
+			// The CPU-authored ranges. Same lock-per-run mechanics as
+			// UpdateQuadRange_RenderThread, and it must land before GpuWritable
+			// flips: a compute write racing this upload would be the D1
+			// ordering hazard at creation time.
+			for (const FVoxelQuadUploadRun& Run : InitialShadow.Runs)
+			{
+				if (Run.Count == 0)
+				{
+					continue;
+				}
+				const uint32 QuadBytes = Run.Count * sizeof(uint64);
+				if (void* Dst = RHICmdList.LockBuffer(SharedBuffers->QuadBuffer,
+				                                      Run.First * sizeof(uint64),
+				                                      QuadBytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, InitialShadow.Quads.GetData() + Run.SrcOffset, QuadBytes);
+					RHICmdList.UnlockBuffer(SharedBuffers->QuadBuffer);
+				}
+				const uint32 IdBytes = Run.Count * sizeof(uint32);
+				if (void* Dst = RHICmdList.LockBuffer(SharedBuffers->ChunkIdBuffer,
+				                                      Run.First * sizeof(uint32),
+				                                      IdBytes, RLM_WriteOnly))
+				{
+					FMemory::Memcpy(Dst, InitialShadow.Ids.GetData() + Run.SrcOffset, IdBytes);
+					RHICmdList.UnlockBuffer(SharedBuffers->ChunkIdBuffer);
+				}
+			}
+
+			SharedBuffers->CapacityQuads = BufferQuads;
 
 			// The RDG half (Wave D / D1). Same two buffers, wrapped so a compute
 			// pass can write them: RegisterExternalBuffer brings them into a
@@ -710,17 +768,45 @@ public:
 		// chunk-id buffers beside it -- see the CornerBuffer member for why that
 		// difference is correct rather than an oversight (nothing GPU-meshes
 		// water, so the shadow is always the authority here).
-		if (CornerHeights.Num() > 0)
+		if (bWaterMode && BufferQuads > 0)
 		{
-			CornerBuffer = UE::RHIResourceUtils::CreateBufferFromArray(
-				RHICmdList, TEXT("VoxelGpuPool.QuadCornerHeights"),
-				EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource | EBufferUsageFlags::StructuredBuffer,
-				MakeConstArrayView(CornerHeights));
+			// Zero-initialised at capacity, then the shadow's runs on top --
+			// same S2-5 shape as the quad/id buffers above, except this
+			// happens on EVERY proxy creation: the corner buffer is per-proxy
+			// and nothing GPU-writes corners, so the (paged) shadow is always
+			// its authority.
+			const FRHIBufferCreateDesc CornerDesc =
+				FRHIBufferCreateDesc::CreateStructured(
+					TEXT("VoxelGpuPool.QuadCornerHeights"),
+					uint32(BufferQuads) * sizeof(uint32), sizeof(uint32))
+				.AddUsage(EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource)
+				.DetermineInitialState()
+				.SetInitActionZeroData();
+			CornerBuffer = RHICmdList.CreateBuffer(CornerDesc);
 			CornerSRV = RHICmdList.CreateShaderResourceView(
 				CornerBuffer, FRHIViewDesc::CreateBufferSRV().SetTypeFromBuffer(CornerBuffer));
+			if (InitialShadow.Corners.Num() > 0)
+			{
+				for (const FVoxelQuadUploadRun& Run : InitialShadow.Runs)
+				{
+					if (Run.Count == 0)
+					{
+						continue;
+					}
+					const uint32 CornerBytes = Run.Count * sizeof(uint32);
+					if (void* Dst = RHICmdList.LockBuffer(CornerBuffer,
+					                                      Run.First * sizeof(uint32),
+					                                      CornerBytes, RLM_WriteOnly))
+					{
+						FMemory::Memcpy(Dst, InitialShadow.Corners.GetData() + Run.SrcOffset,
+						                CornerBytes);
+						RHICmdList.UnlockBuffer(CornerBuffer);
+					}
+				}
+			}
 			UE_LOG(LogTemp, Log,
 			       TEXT("%s: per-quad corner heights up, %d entries (%.1f MB) — water surfaces are bilinear"),
-			       *PoolName, CornerHeights.Num(), double(CornerHeights.Num()) * 4.0 / (1024.0 * 1024.0));
+			       *PoolName, BufferQuads, double(BufferQuads) * 4.0 / (1024.0 * 1024.0));
 		}
 
 		VertexFactory.SetQuadBufferSRV(QuadBufferSRV);
@@ -1262,10 +1348,12 @@ private:
 	// FVoxelGpuPoolBuffers for why that matters.
 	FVoxelGpuPoolBuffersRef SharedBuffers;
 
-	TArray<uint64> Quads;
-	TArray<uint32> ChunkIds;
-	// Empty on a terrain pool -- see UVoxelGpuPoolComponent::QuadCornerHeights.
-	TArray<uint32> CornerHeights;
+	// CPU-written shadow content only, as upload runs (S2-5) -- see
+	// FVoxelPoolInitialShadow. Consumed by CreateRenderThreadResources: the
+	// quads/ids halves on a first creation or capacity rebuild, the corner
+	// half on EVERY creation (the corner buffer is per-proxy; nothing GPU-
+	// writes corners, so the shadow is always its authority).
+	FVoxelPoolInitialShadow InitialShadow;
 	TArray<FVector4f> Origins;
 	TArray<FVector4f> Params;
 	// Which quads belong to which chunk, sorted by pool offset. The cull's
@@ -2236,21 +2324,16 @@ UVoxelGpuPoolComponent::UVoxelGpuPoolComponent()
 void UVoxelGpuPoolComponent::InitPool(uint32 CapacityQuads)
 {
 	Pool.Init(CapacityQuads);
-	PooledQuads.SetNumZeroed(int32(CapacityQuads));
-	QuadChunkIds.SetNumZeroed(int32(CapacityQuads));
-	// WATER ONLY, and sized here rather than lazily so the buffer exists before
-	// the first proxy is built. 4 bytes per quad: 16 MB at the water pool's 4M,
-	// which is why a terrain pool -- whose capacity is measured in tens of
-	// millions of quads for a field it never reads -- gets nothing at all. See
-	// QuadCornerHeights; this is also why SetWaterMode must precede InitPool.
-	if (bWaterMode)
-	{
-		QuadCornerHeights.SetNumZeroed(int32(CapacityQuads));
-	}
-	else
-	{
-		QuadCornerHeights.Reset();
-	}
+	// S2-5: the CPU shadow is PAGED and allocates on first CPU write -- see
+	// ShadowPages. Only the (small) page table is sized here. On the
+	// GPU-resident arm this is what makes capacity nearly free on the CPU
+	// side: a never-CPU-written page costs 8 bytes of pointer, not 12 B/quad.
+	// SetWaterMode must still precede InitPool: whether a page carries the
+	// corner-height third is decided when the page is first allocated, and
+	// the proxy sizes the corner GPU buffer off bWaterMode.
+	ShadowPages.Reset();
+	ShadowPages.SetNum(int32((CapacityQuads + kShadowPageQuads - 1) / kShadowPageQuads));
+	NumShadowPagesAllocated = 0;
 
 	// Reserve the hidden chunk at index 0. Everything freed points here.
 	ChunkOrigins.Reset();
@@ -2336,18 +2419,123 @@ int32 UVoxelGpuPoolComponent::AcquireAllocationHandle(const FVoxelGpuPoolAllocat
 	return Handle;
 }
 
+int32 UVoxelGpuPoolComponent::GetNumQuads() const
+{
+	return int32(Pool.GetCapacityQuads());
+}
+
+// --- the paged CPU shadow (S2-5) -- see ShadowPages in the header -----------
+
+UVoxelGpuPoolComponent::FShadowPage& UVoxelGpuPoolComponent::EnsureShadowPage(int32 PageIndex)
+{
+	TUniquePtr<FShadowPage>& Slot = ShadowPages[PageIndex];
+	if (!Slot.IsValid())
+	{
+		Slot = MakeUnique<FShadowPage>();
+		Slot->Quads.SetNumZeroed(int32(kShadowPageQuads));
+		Slot->ChunkIds.SetNumZeroed(int32(kShadowPageQuads));
+		if (bWaterMode)
+		{
+			Slot->Corners.SetNumZeroed(int32(kShadowPageQuads));
+		}
+		++NumShadowPagesAllocated;
+		// Every 32 pages (~96 MB terrain / ~128 MB water), say what the shadow
+		// actually costs -- this is the number S2-5 exists to shrink, and a
+		// CPU-only run (GPU meshing off) is EXPECTED to climb here: the paged
+		// shadow degrades to the old flat cost on the arm that reads it.
+		if ((NumShadowPagesAllocated & 31) == 1)
+		{
+			const double PageMB =
+				double(kShadowPageQuads) * (bWaterMode ? 16.0 : 12.0) / (1024.0 * 1024.0);
+			UE_LOG(LogTemp, Log,
+			       TEXT("%s: CPU shadow at %d of %d pages (%.0f MB) -- pages allocate on "
+			            "first CPU-authored write only (S2-5); GPU-meshed ranges never "
+			            "materialise one."),
+			       *PoolName, NumShadowPagesAllocated, ShadowPages.Num(),
+			       double(NumShadowPagesAllocated) * PageMB);
+		}
+	}
+	return *Slot;
+}
+
+void UVoxelGpuPoolComponent::ShadowStampHidden(uint32 Offset, uint32 Count)
+{
+	while (Count > 0)
+	{
+		const int32 Page = int32(Offset / kShadowPageQuads);
+		const uint32 Within = Offset % kShadowPageQuads;
+		const uint32 Span = FMath::Min(Count, kShadowPageQuads - Within);
+		// A page that was never allocated is ALREADY implicit hidden (id 0);
+		// stamping it would materialise 3 MB to write a value it already
+		// reads as. Skip -- this is what keeps GPU-chunk removal from slowly
+		// allocating the whole shadow on the GPU-resident arm.
+		if (TUniquePtr<FShadowPage>& Slot = ShadowPages[Page]; Slot.IsValid())
+		{
+			for (uint32 I = 0; I < Span; ++I)
+			{
+				Slot->ChunkIds[int32(Within + I)] = kHiddenChunkId;
+			}
+		}
+		Offset += Span;
+		Count -= Span;
+	}
+}
+
+void UVoxelGpuPoolComponent::ShadowCopySlice(uint32 First, uint32 Count, TArray<uint64>& OutQuads,
+                                             TArray<uint32>& OutIds, TArray<uint32>* OutCorners) const
+{
+	while (Count > 0)
+	{
+		const int32 Page = int32(First / kShadowPageQuads);
+		const uint32 Within = First % kShadowPageQuads;
+		const uint32 Span = FMath::Min(Count, kShadowPageQuads - Within);
+		const TUniquePtr<FShadowPage>& Slot = ShadowPages[Page];
+		if (Slot.IsValid())
+		{
+			OutQuads.Append(Slot->Quads.GetData() + Within, int32(Span));
+			OutIds.Append(Slot->ChunkIds.GetData() + Within, int32(Span));
+			if (OutCorners != nullptr)
+			{
+				if (Slot->Corners.Num() > 0)
+				{
+					OutCorners->Append(Slot->Corners.GetData() + Within, int32(Span));
+				}
+				else
+				{
+					OutCorners->AddZeroed(int32(Span));
+				}
+			}
+		}
+		else
+		{
+			// Implicit zeros: quad 0, id 0 = hidden, corner 0. Identical to
+			// what the flat zeroed arrays held for a never-written range.
+			OutQuads.AddZeroed(int32(Span));
+			OutIds.AddZeroed(int32(Span));
+			if (OutCorners != nullptr)
+			{
+				OutCorners->AddZeroed(int32(Span));
+			}
+		}
+		First += Span;
+		Count -= Span;
+	}
+}
+
 // See the declaration. Every write of a pool range goes through here so the
 // three parallel shadows can never disagree about what a slot holds.
 void UVoxelGpuPoolComponent::WriteQuadRange(uint32 Offset, uint32 ChunkId, const TArray<uint64>& InQuads,
                                             const TArray<uint32>* InCornerHeights)
 {
-	// A caller that HAS corner heights but a pool with no shadow to put them in
-	// is a wiring mistake, not a state: it means SetWaterMode was not set before
+	// A caller that HAS corner heights but a pool that is not in water mode is
+	// a wiring mistake, not a state: it means SetWaterMode was not set before
 	// InitPool, and the whole surface would silently draw at whatever the vertex
 	// factory's dummy binding happens to hold. Loud, once, rather than a subtly
-	// wrong waterline nobody attributes to this.
-	const bool bWriteCorners = InCornerHeights != nullptr && QuadCornerHeights.Num() > 0;
-	if (InCornerHeights != nullptr && QuadCornerHeights.Num() == 0)
+	// wrong waterline nobody attributes to this. (Checked against bWaterMode
+	// rather than a corner array's existence: the shadow is paged now and the
+	// corner third only exists on pages that were already written.)
+	const bool bWriteCorners = InCornerHeights != nullptr && bWaterMode;
+	if (InCornerHeights != nullptr && !bWaterMode)
 	{
 		static bool bLoggedMissingCornerShadow = false;
 		if (!bLoggedMissingCornerShadow)
@@ -2361,14 +2549,30 @@ void UVoxelGpuPoolComponent::WriteQuadRange(uint32 Offset, uint32 ChunkId, const
 	}
 	checkSlow(!bWriteCorners || InCornerHeights->Num() == InQuads.Num());
 
-	for (int32 I = 0; I < InQuads.Num(); ++I)
+	// Page-spanning write: this is the one place shadow pages MATERIALISE
+	// (S2-5) -- a CPU-authored chunk landed here, so its pages are live from
+	// now on. GPU-authored chunks never reach this function.
+	uint32 Remaining = uint32(InQuads.Num());
+	uint32 Src = 0;
+	uint32 Dst = Offset;
+	while (Remaining > 0)
 	{
-		PooledQuads[int32(Offset) + I] = InQuads[I];
-		QuadChunkIds[int32(Offset) + I] = ChunkId;
-		if (bWriteCorners)
+		const int32 Page = int32(Dst / kShadowPageQuads);
+		const uint32 Within = Dst % kShadowPageQuads;
+		const uint32 Span = FMath::Min(Remaining, kShadowPageQuads - Within);
+		FShadowPage& P = EnsureShadowPage(Page);
+		for (uint32 I = 0; I < Span; ++I)
 		{
-			QuadCornerHeights[int32(Offset) + I] = (*InCornerHeights)[I];
+			P.Quads[int32(Within + I)] = InQuads[int32(Src + I)];
+			P.ChunkIds[int32(Within + I)] = ChunkId;
+			if (bWriteCorners)
+			{
+				P.Corners[int32(Within + I)] = (*InCornerHeights)[int32(Src + I)];
+			}
 		}
+		Src += Span;
+		Dst += Span;
+		Remaining -= Span;
 	}
 }
 
@@ -2521,13 +2725,14 @@ int32 UVoxelGpuPoolComponent::AddChunkFromGpu(const FVoxelGpuQuadPayloadRef& Src
 		ChunkParams.Add(Params);
 	}
 
-	// THE ONE THING THIS DOES NOT DO. AddChunk writes PooledQuads and
-	// QuadChunkIds here and then calls MarkQuadsDirty, which is what schedules
-	// the upload. Neither happens: the quads are already on the GPU, the ids are
-	// written by the same compute pass that copies them, and marking the range
-	// dirty would upload the shadow's ZEROS straight over the geometry that pass
-	// is about to write. See PooledQuads for why leaving the shadow zeroed is the
-	// safe direction rather than merely the cheap one.
+	// THE ONE THING THIS DOES NOT DO. AddChunk writes the CPU shadow
+	// (WriteQuadRange) here and then calls MarkQuadsDirty, which is what
+	// schedules the upload. Neither happens: the quads are already on the GPU,
+	// the ids are written by the same compute pass that copies them, and
+	// marking the range dirty would upload the shadow's ZEROS straight over the
+	// geometry that pass is about to write. See ShadowPages for why leaving the
+	// shadow zeroed (now: never even allocated, S2-5) is the safe direction
+	// rather than merely the cheap one.
 	//
 	// S1-1: AND IT MUST ACTIVELY UN-MARK THE RANGE, not merely decline to mark it.
 	// Not marking is sufficient only while every mutation publishes on its own.
@@ -2600,10 +2805,11 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	// a degenerate point rather than continuing to draw stale geometry.
 	//
 	// S2-1: on the GPU path this is a compute pass rather than a shadow write.
-	// The shadow loop below is the LAST writer of PooledQuads/QuadChunkIds on a
-	// GPU-only run, so which branch runs decides whether the shadow can be
-	// dropped at all (S2-5) -- 12 B/quad of system RAM plus a whole-array copy in
-	// CreateSceneProxy.
+	// S2-5 (2026-08-18) then made the shadow write cheap on the GPU arm too:
+	// ShadowStampHidden skips pages that were never CPU-written (they already
+	// read as hidden), so removing a GPU-authored chunk no longer materialises
+	// 12 B/quad of shadow for its range -- the dirty upload below zero-fills
+	// the unallocated span, which IS the hide.
 	if (VoxelGpuPoolCull::GGpuHide != 0 && IsGpuWritable())
 	{
 		PendingGpuHides.Add(FPendingGpuHide{ Alloc.Offset, Alloc.NumQuads, kHiddenChunkId });
@@ -2613,10 +2819,11 @@ void UVoxelGpuPoolComponent::RemoveChunkInternal(int32 Handle, bool bRecycleChun
 	}
 	else
 	{
-		for (uint32 I = 0; I < Alloc.NumQuads; ++I)
-		{
-			QuadChunkIds[int32(Alloc.Offset + I)] = kHiddenChunkId;
-		}
+		// S2-5: pages the range crosses that were never CPU-written are skipped
+		// -- they already read as hidden, and the dirty upload below zero-fills
+		// them, so the hide still reaches the GPU without materialising 12 B/quad
+		// of shadow for a GPU-authored chunk's range.
+		ShadowStampHidden(Alloc.Offset, Alloc.NumQuads);
 	}
 
 	// Only now is the table entry unreferenced by any quad, which is what makes
@@ -3224,7 +3431,7 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	// it rides the SAME runs as the quads, which is the point: a quad and its
 	// corner heights are published by one command or by neither.
 	TArray<uint32> CornersSlice;
-	const bool bHasCornerShadow = QuadCornerHeights.Num() > 0;
+	const bool bHasCornerShadow = bWaterMode;
 	QuadsSlice.Reserve(int32(TotalQuadsToUpload));
 	IdsSlice.Reserve(int32(TotalQuadsToUpload));
 	if (bHasCornerShadow)
@@ -3233,12 +3440,11 @@ void UVoxelGpuPoolComponent::FlushUpdatesToProxy()
 	}
 	for (const FVoxelQuadUploadRun& Run : UploadRuns)
 	{
-		QuadsSlice.Append(PooledQuads.GetData() + Run.First, int32(Run.Count));
-		IdsSlice.Append(QuadChunkIds.GetData() + Run.First, int32(Run.Count));
-		if (bHasCornerShadow)
-		{
-			CornersSlice.Append(QuadCornerHeights.GetData() + Run.First, int32(Run.Count));
-		}
+		// Page-aware copy (S2-5): spans whose page was never CPU-written come
+		// back as zeros/hidden, which is exactly what a dirty range over a
+		// removed GPU chunk wants uploaded.
+		ShadowCopySlice(Run.First, Run.Count, QuadsSlice, IdsSlice,
+		                bHasCornerShadow ? &CornersSlice : nullptr);
 	}
 
 	if (GVoxelPoolUploadStats != 0 && UploadRuns.Num() > 0)
@@ -3393,10 +3599,8 @@ int32 UVoxelGpuPoolComponent::UpdateChunkInternal(int32 Handle, const TArray<uin
 		// as they are on purpose: the hidden chunk's scale-0 table entry collapses
 		// those quads to a point, so nothing reads them, and writing them would be
 		// pure traffic on water's hottest path.
-		for (uint32 I = uint32(InQuads.Num()); I < Existing.NumQuads; ++I)
-		{
-			QuadChunkIds[int32(Existing.Offset + I)] = kHiddenChunkId;
-		}
+		ShadowStampHidden(Existing.Offset + uint32(InQuads.Num()),
+		                  Existing.NumQuads - uint32(InQuads.Num()));
 		MarkQuadsDirty(Existing.Offset, Existing.NumQuads);
 		PushUpdatesToProxy();
 		return Handle;
@@ -4117,11 +4321,15 @@ void UVoxelGpuPoolComponent::DebugClobberShadowAndRecreate(int32 NumQuadsToClobb
 	// Point them at the hidden chunk (scale 0), which is the pool's own
 	// "collapse to a point" encoding — so if this DOES reach the GPU the result
 	// is unambiguous missing geometry rather than random garbage that might be
-	// mistaken for a shader bug.
-	for (int32 I = 0; I < N; ++I)
+	// mistaken for a shader bug. Materialises pages (EnsureShadowPage) on
+	// purpose: this test corrupts the shadow to prove the rebind path ignores
+	// it, so the corruption has to actually exist somewhere.
+	for (int32 I = 0; I < N; I += int32(kShadowPageQuads))
 	{
-		QuadChunkIds[I] = kHiddenChunkId;
-		PooledQuads[I] = 0;
+		FShadowPage& P = EnsureShadowPage(I / int32(kShadowPageQuads));
+		const int32 Span = FMath::Min(N - I, int32(kShadowPageQuads));
+		FMemory::Memzero(P.Quads.GetData(), Span * sizeof(uint64));
+		FMemory::Memzero(P.ChunkIds.GetData(), Span * sizeof(uint32)); // 0 == kHiddenChunkId
 	}
 
 	UE_LOG(LogTemp, Warning,
@@ -4177,34 +4385,87 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	{
 		return nullptr;
 	}
-	// The whole capacity is uploaded, not just the used prefix: incremental
-	// writes address absolute pool offsets, so the buffer has to be that big
-	// from the start. Only [0, HighWaterMark) is ever drawn.
-	TArray<uint64> UsedQuads = PooledQuads;
-	TArray<uint32> UsedIds = QuadChunkIds;
-	// Empty for a terrain pool, capacity-sized for a water one, for the same
-	// absolute-offset reason as the two above.
-	TArray<uint32> UsedCorners = QuadCornerHeights;
+	// The GPU buffers span the whole capacity, not just the used prefix:
+	// incremental writes address absolute pool offsets, so they have to be
+	// that big from the start. Only [0, HighWaterMark) is ever drawn.
+	//
+	// S2-5: what travels to the proxy is no longer a capacity-sized copy of
+	// the shadow (two 960 MB memcpys at the old 80M default, ~2.3 GB each at
+	// the new default) but only the CPU-WRITTEN pages, clipped to the high
+	// water mark, as upload runs. The proxy zero-fills the rest at buffer
+	// creation, which is what the flat shadow's zeroed slots uploaded anyway.
+	FVoxelPoolInitialShadow Init;
+	{
+		const uint32 HighWater = Pool.GetHighWaterMark();
+		uint32 SpanStart = 0;
+		uint32 SpanCount = 0; // in pages
+		auto FlushSpan = [&]()
+		{
+			if (SpanCount == 0)
+			{
+				return;
+			}
+			const uint32 First = SpanStart * kShadowPageQuads;
+			const uint32 Count =
+				FMath::Min(SpanCount * kShadowPageQuads, HighWater - FMath::Min(First, HighWater));
+			if (Count > 0)
+			{
+				Init.Runs.Add(FVoxelQuadUploadRun{ First, Count, uint32(Init.Quads.Num()) });
+				ShadowCopySlice(First, Count, Init.Quads, Init.Ids,
+				                bWaterMode ? &Init.Corners : nullptr);
+			}
+			SpanCount = 0;
+		};
+		for (int32 Page = 0; Page < ShadowPages.Num(); ++Page)
+		{
+			if (uint32(Page) * kShadowPageQuads >= HighWater)
+			{
+				break; // nothing past the high water mark was ever written
+			}
+			if (ShadowPages[Page].IsValid())
+			{
+				if (SpanCount == 0)
+				{
+					SpanStart = uint32(Page);
+				}
+				else if (SpanStart + SpanCount != uint32(Page))
+				{
+					FlushSpan();
+					SpanStart = uint32(Page);
+				}
+				++SpanCount;
+			}
+			else
+			{
+				FlushSpan();
+			}
+		}
+		FlushSpan();
+	}
 
 	// What is actually about to be drawn, in terms the eye cannot check. A
 	// pooled draw has no per-chunk state, so when it renders wrong the only
 	// way to tell "the CPU tables are bad" from "the shader reads them wrong"
-	// is to print the tables.
+	// is to print the tables. Quads outside the CPU-written runs are implicit
+	// hidden (id 0) by construction, so scanning the runs IS scanning the
+	// drawn range.
 	{
 		const int32 Drawn = int32(Pool.GetHighWaterMark());
-		int32 HiddenQuads = 0, OutOfRangeQuads = 0;
+		int32 HiddenQuads = Drawn - Init.Ids.Num(); // implicit-zero span
+		int32 OutOfRangeQuads = 0;
 		uint32 MaxIdSeen = 0;
-		for (int32 I = 0; I < Drawn; ++I)
+		for (int32 I = 0; I < Init.Ids.Num(); ++I)
 		{
-			const uint32 Id = UsedIds[I];
+			const uint32 Id = Init.Ids[I];
 			HiddenQuads += (Id == kHiddenChunkId) ? 1 : 0;
 			OutOfRangeQuads += (Id >= uint32(ChunkOrigins.Num())) ? 1 : 0;
 			MaxIdSeen = FMath::Max(MaxIdSeen, Id);
 		}
 		UE_LOG(LogTemp, Log,
 		       TEXT("%s upload: drawn=%d hidden=%d outOfRange=%d maxId=%u "
-		            "tableEntries=%d (%d free) hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
+		            "tableEntries=%d (%d free) shadowPages=%d/%d hiddenEntry=(%.1f,%.1f,%.1f,scale=%.3f)"),
 		       *PoolName, Drawn, HiddenQuads, OutOfRangeQuads, MaxIdSeen, ChunkOrigins.Num(), FreeChunkIds.Num(),
+		       NumShadowPagesAllocated, ShadowPages.Num(),
 		       ChunkOrigins[0].X, ChunkOrigins[0].Y, ChunkOrigins[0].Z, ChunkOrigins[0].W);
 
 		// Where the geometry actually is, versus where the renderer will look
@@ -4224,7 +4485,7 @@ FPrimitiveSceneProxy* UVoxelGpuPoolComponent::CreateSceneProxy()
 	}
 
 	FVoxelGpuPoolSceneProxy* Proxy =
-		new FVoxelGpuPoolSceneProxy(this, UsedQuads, UsedIds, UsedCorners, ChunkOrigins, ChunkParams,
+		new FVoxelGpuPoolSceneProxy(this, MoveTemp(Init), GetNumQuads(), ChunkOrigins, ChunkParams,
 		                            BuildChunkRuns(), PoolName, ChunkTableCapacity, GetOrCreatePoolBuffers());
 	LiveProxy = Proxy;
 	return Proxy;

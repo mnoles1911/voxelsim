@@ -1,0 +1,145 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 120 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15500, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 300, detail]
+coarse tiles: loaded 289, rejected 0 from D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+terrain: synthetic elevation, REAL coarse-tile climate, water datum NONE (dry world), placement planes NONE (sentinels)
+
+=== widening census: 25921 footprints (0 declined) over [-221161,-220649]x[-96841,-96329] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :    22346 footprints (86.2%)
+   45000 mm :     3575 footprints (13.7%)
+extra admitted chunk layers (sky side, dilation included):
+  +  8 chunks :     8742 footprints
+  +  9 chunks :    13604 footprints
+  + 14 chunks :       65 footprints
+  + 15 chunks :     3138 footprints
+  + 16 chunks :      372 footprints
+mean extra: 9.50 chunk layers per footprint
+components: mean widening 27758 mm (8.6 chunks), mean dilation slack 3868 mm (1.2 chunks)
+baseline surface shell (sampled 441 footprints): mean 1.36 chunk layers
+
+=== placement census over [-221033,-220777]x[-96713,-96457] m ===
+sites considered: 40981 (per layer: L0=12 L1=1072 L2=8150 L3=31747)
+instances resolved: 30041 (per layer: L0=2 L1=854 L2=5957 L3=23228)
+species represented: 99
+anchor contact audit: 30041 audited, 0 NOT SOLID
+species histogram (name, instances; * = water-gated riparian):
+    bayberry                    656
+    beach-morning-glory         240
+    beach-rose                  693
+    beachrock-slab               62
+    bedrock-ledge                 1
+    birdsfoot-trefoil           244
+    bladderwrack                878
+    blowhole                      2
+    boulder-beach                71
+    boulder-reef                 10
+    casuarina                    65
+    chalk-cliff-foot              6
+    chalk-outcrop                 5
+    channelled-wrack            549
+    coast-palm                  113
+    coastal-scrub               110
+    coastal-thrift              486
+    common-chicory               26
+    conglomerate-boulder          1
+    coquina-shell-rock           39
+    coral-rubble-bank           131
+    coralline-turf              813
+    dabberlocks                 143
+    dead-mans-fingers           201
+    desert-saltgrass            101
+    dog-rose                    163
+    dulse                       657
+    dwarf-eelgrass             1030
+    eelgrass-meadow             110
+    feather-duster-worm         446
+    furbelows                    11
+    giant-green-anemone         724
+    golden-samphire             286
+    gorse                       408
+    green-sea-fingers           495
+    gutweed                     920
+    honeycomb-worm-reef         431
+    irish-moss                  771
+    knotted-wrack               809
+    lava-tube-bench              18
+    laver-weed                  673
+    lyme-grass                  122
+    maritime-pine                74
+    marram-grass                383
+    meadow-grass                221
+    monterey-cypress             28
+    oarweed                     405
+    oyster-reef-bank             84
+    pillow-lava-mound            21
+    plumose-anemone             477
+    red-clover                  154
+    red-comb-weed                57
+    reef-flat-pavement           41
+    reef-spur                     1
+    ribwort-plantain            135
+    rock-samphire                71
+    rockpool-platform            25
+    rubble-apron               1793
+    saltbush                    113
+    saltmarsh-grass             735
+    sand-sedge                  346
+    sand-verbena                 36
+    sargassum-weed              233
+    sea-beet                    292
+    sea-bindweed                147
+    sea-blite                   498
+    sea-buckthorn               874
+    sea-campion                 151
+    sea-couch                   670
+    sea-grape                   268
+    sea-holly                   153
+    sea-kale                     34
+    sea-lettuce                 940
+    sea-oak-weed                 30
+    sea-palm                    507
+    sea-rocket                   60
+    sea-rush                    383
+    sea-sandwort                235
+    serrated-wrack              870
+    sheeps-fescue               174
+    shoal-grass                 565
+    snakelocks-anemone          668
+    spiral-wrack                852
+    stone-pine                   10
+    submerged-granite-boulder     25
+    submerged-limestone-pavement     14
+    sugar-kelp                   54
+    surfgrass                   728
+    switchgrass                 239
+    tafoni-sandstone              3
+    thongweed                   575
+    tidal-notch                   6
+    turtlegrass                  76
+    vipers-bugloss               29
+    wave-polished-boulder       338
+    wild-hibiscus                94
+    wild-thyme                  128
+    yarrow                       92
+    yellow-horned-poppy         106
+riparian (water-gated) species placed: 0 species, 0 instances
+gate attribution over 7868496 (site, species) pairs:
+  tolerated                       1659825 (21.0%)
+  biome weight 0                  5469187 (69.5%)
+  elevation band                   495346 (6.2%)
+  below slope min                       9 (0.0%)
+  standing water (submerged)        20035 (0.2%)
+  water distance (far/unknown)     224094 (2.8%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:  30041 instances, mean height   0.9 m
+kinds: tree=558 bush=3374 rock=3128 grass=14025 reed=6036 flower=2920
+height: mean 0.9 m, median 0.4 m over 30041 instances
+distance to water at anchors: <=2m 0, <=10m 0, <=30m 0, <=120m 0, >120m 0, unknown 30041; wet anchors 5575
+slope bands: 0-15% 30041, 15-30% 0, 30-45% 0, 45-60% 0, 60%+ 0
+treeline: below 30041, above 0, unknown 0
+stampable voxels over resolved terrain instances: 24620658
+banks: 30041 requests, 21085 served, 0 miss(no species), 8956 miss(no seeds), 276 files loaded, 0 refused, 0 seed-count mismatches, 6088435 bytes resident
+overlay: wrote bake-out/biome-survey/beach.instances.csv and bake-out/biome-survey/beach.ground.bin (138x138 @ 1875 mm, AMPLIFIED-COARSE ground: sea-only datum, no shore distance)
+json: wrote bake-out/biome-survey/beach.json (150 counters)
+VERDICT: placement wired; 30041 instances, all anchors solid, none submerged

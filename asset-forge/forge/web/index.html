@@ -59,6 +59,14 @@
       <div id="progress" class="progress"><div id="bar"></div></div>
       <span id="status" class="status"></span>
     </div>
+    <div id="curation" class="curation hidden">
+      <span class="curlabel">publish gate</span>
+      <span id="curStatus" class="curstatus"></span>
+      <button id="curApprove" class="ghost small" title="Export this species to the manifest and banks">Approve</button>
+      <button id="curDraft" class="ghost small" title="Hold this species back from export while it is worked on">Draft</button>
+      <button id="curReject" class="ghost small" title="Unpublish this species — removed from the manifest, bank files deleted on next export">Reject</button>
+      <span id="curSeeds" class="status"></span>
+    </div>
     <div id="kindBlurb" class="kindblurb"></div>
     <div id="gallery" class="gallery"></div>
     <div id="library" class="gallery hidden"></div>

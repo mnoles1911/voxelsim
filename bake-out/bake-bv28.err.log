@@ -1,0 +1,12 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-b858388bd
+tiles: [(-3, -4), (-3, -5), (-4, -4), (-4, -5), (-5, -4), (-5, -5), (-16, -16)]
+[coarse] 24/29 ring tiles available (generate=False) cpu=0.0s
+  warning: flow superblock L1 (-2,-2) is INCOMPLETE (256 of 256 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+  warning: flow superblock L1 (-2,-1) is INCOMPLETE (256 of 256 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+  warning: flow superblock L1 (-1,-2) is INCOMPLETE (256 of 256 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+[flow L1] 4 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed,7f4192da6b42,a4c50fc6f68f,cc6fe055c6d8  cpu=0.8s
+  warning: flow superblock L0 (-5,-5) is INCOMPLETE (16 of 16 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+  warning: flow superblock L0 (-5,-4) is INCOMPLETE (16 of 16 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+  warning: flow superblock L0 (-4,-5) is INCOMPLETE (16 of 16 coarse tiles absent). Rivers entering from those tiles contribute nothing, permanently, to every tile baked against it.
+[flow L0] 8 superblock(s) @ 30 m/px, span 61 km  fp=1faf9661d8cc,27468022930f,3d3c80deb245,4c8482ae6f68,a79fab8d28ee,bc1330bf5a2b,c35c5715fa63,ccc4918fcb82  cpu=1.1s

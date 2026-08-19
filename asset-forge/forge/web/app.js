@@ -17,6 +17,7 @@ const state = {
   poll: null,
   seeds: [],
   kept: new Set(),   // "species-seed" of things already in the library
+  curation: null,    // the loaded species' publish verdict {status, seeds, ...}
   tab: "gallery",
   view: "3d",        // detail overlay: "3d" orbit viewer or "2d" flat render
   viewer: null,
@@ -157,9 +158,71 @@ async function loadSpec(name) {
   const r = await fetch(`/api/spec?name=${encodeURIComponent(name)}`).then((x) => x.json());
   state.spec = r.spec;
   state.saved = JSON.parse(JSON.stringify(r.spec));
+  state.curation = r.curation ?? null;
   $("hash").textContent = r.hash;
   $("specName").value = getPath(r.spec, "name") ?? name;
   buildParams();
+  renderCuration();
+}
+
+/* --- curation ------------------------------------------------------------ */
+
+/* The publish gate for the loaded species. Every species has a verdict --
+ * absence resolves to "approved, seeds 1-4" on the server (the grandfather
+ * clause), and the resolved form is what arrives here, so this bar never has
+ * to know the difference beyond saying "grandfathered" out loud. */
+function renderCuration() {
+  const c = state.curation;
+  $("curation").classList.toggle("hidden", !c);
+  if (!c) return;
+  $("curStatus").textContent = c.curated ? c.status : `${c.status} (grandfathered)`;
+  $("curStatus").className = `curstatus ${c.status}`;
+  for (const [id, st] of [["curApprove", "approved"], ["curDraft", "draft"], ["curReject", "rejected"]])
+    $(id).classList.toggle("on", c.status === st);
+  $("curSeeds").textContent = `bank seeds: ${c.seeds.join(", ")}`;
+  $("gallery").querySelectorAll(".tile[data-done]").forEach(paintSeedBadge);
+}
+
+async function postCuration(patch) {
+  const c = state.curation;
+  if (!c) return;
+  const r = await fetch("/api/curation", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name: getPath(state.spec, "name"),
+      status: patch.status ?? c.status,
+      seeds: patch.seeds ?? c.seeds,
+      notes: patch.notes ?? c.notes ?? "",
+    }),
+  })
+    .then((x) => x.json())
+    .catch(() => ({ error: "network" }));
+  if (r.error) return toast(`curation failed: ${r.error}`);
+  state.curation = r.curation;
+  renderCuration();
+  toast(`${getPath(state.spec, "name")}: ${r.curation.status}, seeds ${r.curation.seeds.join(", ")}`);
+}
+
+function toggleSeed(seed) {
+  const c = state.curation;
+  if (!c) return;
+  const has = c.seeds.includes(seed);
+  if (has && c.seeds.length === 1)
+    return toast("a published species needs at least one bank seed");
+  const seeds = has ? c.seeds.filter((s) => s !== seed) : [...c.seeds, seed].sort((a, b) => a - b);
+  postCuration({ seeds });
+}
+
+function paintSeedBadge(el) {
+  const b = el.querySelector("[data-curseed]");
+  if (!b || !state.curation) return;
+  const on = state.curation.seeds.includes(Number(b.dataset.curseed));
+  b.classList.toggle("on", on);
+  b.textContent = on ? "✓ bank" : "+ bank";
+  b.title = on
+    ? "In the published bank — click to pull this seed from it"
+    : "Not in the published bank — click to publish this seed";
 }
 
 /* --- parameter panel ---------------------------------------------------- */
@@ -355,6 +418,17 @@ function fillTile(el, seed, t) {
     ev.stopPropagation();
     keepTree(seed, id);
   };
+  // The seed's place in the PUBLISHED bank, distinct from "keep to library":
+  // keep saves a portfolio entry, this decides what the engine serves.
+  el.insertAdjacentHTML(
+    "beforeend",
+    `<button class="tileseed" data-curseed="${seed}"></button>`
+  );
+  el.querySelector("[data-curseed]").onclick = (ev) => {
+    ev.stopPropagation();
+    toggleSeed(seed);
+  };
+  paintSeedBadge(el);
   el.onclick = () => openDetail(seed, t);
 
   // Deep link: #seed=N opens that variant straight away, so a particular tree
@@ -771,6 +845,13 @@ function wire() {
     state.kinds = await fetch("/api/kinds").then((x) => x.json());
     buildKindBar();
     $("kinds").querySelector(`[data-kind="${state.kind}"]`)?.classList.add("on");
+  };
+  $("curApprove").onclick = () => postCuration({ status: "approved" });
+  $("curDraft").onclick = () => postCuration({ status: "draft" });
+  $("curReject").onclick = () => {
+    const name = getPath(state.spec, "name");
+    if (confirm(`Reject ${name}?\n\nIt disappears from the species manifest and its bank files are removed on the next export.`))
+      postCuration({ status: "rejected" });
   };
   $("askGo").onclick = askEdit;
   $("ask").addEventListener("keydown", (e) => {

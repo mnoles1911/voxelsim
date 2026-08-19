@@ -106,12 +106,16 @@ int64_t probeSlopeMmPerM(int64_t e00, int64_t e10, int64_t e01, int64_t pxMm) {
 // therefore shows up as a nonzero MISMATCH line rather than as quietly wrong
 // attribution.
 enum Gate { GATE_OCEAN, GATE_BEACH, GATE_CLIFF, GATE_TREELINE, GATE_WHITTAKER, kGateCount };
-const char* kGateName[kGateCount] = {"ocean", "beach", "cliff-slope", "treeline", "whittaker"};
+// v27: the cliff gate moved INSIDE the ocean branch (steep ocean floor ->
+// BARE_ROCK; dry land never gates on slope). The label says so, because a
+// census reader who still thinks "cliff-slope" means land cliffs would read
+// the new column as the old gate at a different rate.
+const char* kGateName[kGateCount] = {"ocean", "beach", "subsea-cliff", "treeline", "whittaker"};
 
 Gate attributeGate(int32_t tempU8, int32_t surfaceMm, int64_t slopeMmPerM) {
-    if (surfaceMm < kBiomeBeachLowerMm) return GATE_OCEAN;
+    if (surfaceMm < kBiomeBeachLowerMm)
+        return slopeMmPerM > kBiomeCliffSlopeMmPerM ? GATE_CLIFF : GATE_OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return GATE_BEACH;
-    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return GATE_CLIFF;
     if (surfaceMm > biomeTreelineMm(tempU8)) return GATE_TREELINE;
     return GATE_WHITTAKER;
 }

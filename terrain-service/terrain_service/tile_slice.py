@@ -319,8 +319,15 @@ def _parse_fixed_head(head: bytes) -> dict:
     # slicer does not know refuses the tile, so bake_ver 24's FLAG_HEADS_PRESENT
     # would have made every new tile unsliceable while the two parsers the
     # change was written against both accepted it.
+    # bake_ver 27's FLAG_BATHY_PRESENT was missed here for a stretch --
+    # exactly the failure the comment above warns about: the two parsers
+    # accepted the tiles while this slicer refused every one of them. Fixed
+    # alongside bake_ver 28's FLAG_PLACEMENT_PRESENT. (Knowing the bit is all
+    # the slicer needs: it fetches only the sections a caller asks for, and
+    # nothing asks it for the bathy or placement planes.)
     if flags & ~(tc.FLAG_FLOW_PRESENT | tc.FLAG_BASINS_PRESENT | tc.FLAG_WATER_PRESENT
-                 | tc.FLAG_HEADS_PRESENT):
+                 | tc.FLAG_HEADS_PRESENT | tc.FLAG_BATHY_PRESENT
+                 | tc.FLAG_PLACEMENT_PRESENT):
         raise ValueError(f"unknown header flag bits set: 0x{flags:04x}")
 
     table_len = n_sections * tc._SECTION_ENTRY.size

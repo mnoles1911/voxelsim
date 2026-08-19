@@ -245,7 +245,8 @@
     "elev_min_m": 300.0,
     "slope_max_pct": 70.0,
     "spacing_m": 1.2,
-    "water_max_m": 0.0
+    "water_max_m": 0.0,
+    "slope_min_pct": 35
   },
   "resolution_cm": "10",
   "rock": {

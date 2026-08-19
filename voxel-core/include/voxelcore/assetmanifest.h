@@ -47,12 +47,41 @@
 namespace vxc {
 
 inline constexpr uint32_t kVxmMagic = 0x314D5856u; // "VXM1", little-endian
-inline constexpr uint32_t kVxmVersion = 1u;
+// VERSION 2 (2026-08-18, the per-biome placement expansion). Same magic --
+// the family tag -- same 152-byte species record, two new sections:
+//
+//   * a KIND x BIOME DENSITY TABLE between the layer table and the species
+//     records: kAssetKindCount x kBiomeCount u16 per-mille, kind-major. It
+//     scales the occupancy test per kind per biome (AssetSpecies::
+//     occupancyPerMille carries the species' row after import), which is the
+//     audit's "per-biome density scalar" widened to one row per asset class.
+//     1000 everywhere is today's world exactly; values above 1000 are REFUSED
+//     because the veto-only rule says a policy may only remove sites.
+//
+//   * a NAMED PLACEMENT-RULE TABLE and a RULE-ATTACHMENT TABLE around the
+//     species records. A rule is authored ONCE, by name ("near-fresh-water-
+//     60m": water_max 60 m, fresh), and carries a masked subset of the
+//     placement gates -- elevation band, slope band, water distance and
+//     kind, spacing, abundance, cluster. An attachment binds (species,
+//     biome) -> rule, one or many per pair. This is the owner's contract of
+//     2026-08-18: "temperate type tree is almost unrestricted in temperate
+//     forest but faces strict placement rules in deserts such as must be
+//     near fresh water body", with the rules "custom authored and defined
+//     prior" and attached per species by reference. parse() COMPOSES each
+//     (species, biome)'s attached rules into one effective gate set --
+//     intersection, strictest wins, see composeOverrides in the .cpp -- and
+//     the import turns each composed pair into a SPLIT ROW of the species
+//     table (assetSpeciesTableFromManifest), so the resolver's gates stay
+//     biome-blind scalar compares.
+inline constexpr uint32_t kVxmVersion = 2u;
 inline constexpr size_t kVxmHeaderBytes = 32u;
 inline constexpr size_t kVxmBiomeNameBytes = 16u;
 inline constexpr size_t kVxmLayerBytes = 24u;
 inline constexpr size_t kVxmSpeciesBytes = 152u;
 inline constexpr size_t kVxmNameBytes = 64u;
+inline constexpr size_t kVxmRuleBytes = 64u;
+inline constexpr size_t kVxmRuleNameBytes = 32u;
+inline constexpr size_t kVxmAttachBytes = 8u;
 
 // The ten kinds, in the manifest's own stable order (forge/manifest.py
 // KIND_ORDER -- append-only, deliberately NOT forge/kinds.py's UI order).
@@ -111,6 +140,24 @@ enum class AssetManifestError : uint8_t {
                          // make this unreachable, so reaching it means the
                          // file and the exporter disagree and NOTHING about
                          // the file should be trusted
+    kBadDensity,         // a kind x biome density entry above 1000 per-mille:
+                         // the table may only THIN (veto-only), so a boost is
+                         // not a tuning value, it is a file this build must
+                         // not honour
+    kBadRule,            // a named placement rule is malformed: bad name, no
+                         // mask bit or an unknown one, a field carried
+                         // without its mask bit, a non-positive spacing, an
+                         // inverted band inside the rule, or a water kind
+                         // outside the enum
+    kBadAttachment,      // a rule attachment is malformed (species, biome or
+                         // rule index out of range; unsorted or duplicate) --
+                         // or the attached rules COMPOSE to a contradiction
+                         // for their (species, biome): an empty band, an
+                         // empty salinity mask, or two rules stating
+                         // different water kinds or cluster strengths. The
+                         // exporter refuses these by name at export, so
+                         // reaching this means the file and the exporter
+                         // disagree
 };
 
 const char* assetManifestErrorText(AssetManifestError e);
@@ -145,6 +192,80 @@ struct AssetManifestSpecies {
     int32_t groupRadiusMm = 0;
 };
 
+// Which gate fields a named rule carries. A rule's unmasked fields MUST be
+// zero on the wire (parse refuses otherwise) so a manifest has exactly one
+// byte encoding -- the exporter and enginecheck compare manifests by bytes.
+enum AssetOverrideField : uint16_t {
+    kOverrideElevMin = 1u << 0,
+    kOverrideElevMax = 1u << 1,
+    kOverrideSlopeMin = 1u << 2,
+    kOverrideSlopeMax = 1u << 3,
+    kOverrideWaterMax = 1u << 4,
+    kOverrideWaterKind = 1u << 5, // waterKind AND waterMask together
+    kOverrideSpacing = 1u << 6,
+    kOverrideAbundance = 1u << 7,
+    kOverrideCluster = 1u << 8,
+};
+inline constexpr uint16_t kOverrideFieldMaskAll = 0x01FFu;
+
+// One NAMED placement rule, authored once in asset-forge's rule library
+// (rules/placement-rules.json) and referenced by any number of species. The
+// name is for humans and reports; the gates are the payload. Only masked
+// fields are meaningful; the rest are zero on the wire.
+struct AssetPlacementRule {
+    std::string name;       // <= 31 ASCII chars, species-name charset
+    uint16_t fieldMask = 0; // AssetOverrideField bits
+    AssetWaterKind waterKind = AssetWaterKind::kAny;
+    uint8_t waterMask = 0;
+    uint16_t abundanceQ10 = 0;
+    uint16_t clusterQ10 = 0;
+    int32_t elevMinMm = 0;
+    int32_t elevMaxMm = 0;
+    int32_t slopeMinMmPerM = 0;
+    int32_t slopeMaxMmPerM = 0;
+    int32_t waterMaxMm = 0;
+    int32_t spacingMm = 0;
+};
+
+// One attachment: "in THIS biome, this species obeys THIS rule." One or many
+// per (species, biome); parse() composes each pair's set by intersection.
+struct AssetRuleAttachment {
+    uint16_t speciesIndex = 0; // row in the species table
+    uint8_t biome = 0;         // BiomeId
+    uint16_t ruleIndex = 0;    // row in the rule table
+};
+
+// The COMPOSED per-(species, biome) override -- not a wire record. parse()
+// builds one of these per (species, biome) that has attachments, by
+// intersecting the attached rules with the species' own defaults (strictest
+// wins; see composeOverrides in assetmanifest.cpp for the per-field law).
+// The import (assetSpeciesTableFromManifest) applies these by SPLITTING the
+// species: the base row loses its weight in every overridden biome and one
+// variant row per composed pair carries that biome's weight with the
+// composed gates -- the resolver never sees a rule, only species rows, so
+// the veto-only argument is unchanged.
+//
+// spacing NEVER MOVES THE LAYER: a species is filed on one lattice at export
+// (assign_layer reads the DEFAULT spacing), and a composed spacing acts only
+// through the fold's (cell/spacing)^2 residual in its own biome. A per-biome
+// lattice would be a per-biome streaming bound, which the bound --
+// deliberately biome-blind -- cannot pay.
+struct AssetManifestOverride {
+    uint16_t speciesIndex = 0; // row in the species table
+    uint8_t biome = 0;         // BiomeId
+    uint16_t fieldMask = 0;    // AssetOverrideField bits (union of the set)
+    AssetWaterKind waterKind = AssetWaterKind::kAny;
+    uint8_t waterMask = 0;
+    uint16_t abundanceQ10 = 0;
+    uint16_t clusterQ10 = 0;
+    int32_t elevMinMm = 0;
+    int32_t elevMaxMm = 0;
+    int32_t slopeMinMmPerM = 0;
+    int32_t slopeMaxMmPerM = 0;
+    int32_t waterMaxMm = 0;
+    int32_t spacingMm = 0;
+};
+
 class AssetManifest {
 public:
     AssetManifest() = default;
@@ -163,6 +284,20 @@ public:
     const std::vector<AssetLayer>& layers() const { return layers_; }
     const std::vector<AssetManifestSpecies>& species() const { return species_; }
 
+    // The kind x biome occupancy density table, per-mille, kind-major:
+    // classDensity()[kind * kBiomeCount + biome]. Every entry <= 1000 after a
+    // successful parse (parse refuses more). All-1000 is the neutral table.
+    const uint16_t* classDensity() const { return classDensity_; }
+
+    // The named rule library and the raw attachments, as authored -- for
+    // reports and for any host that wants to show "which rules bind here".
+    const std::vector<AssetPlacementRule>& rules() const { return rules_; }
+    const std::vector<AssetRuleAttachment>& attachments() const { return attachments_; }
+
+    // The COMPOSED per-(species, biome) overrides -- what the import
+    // consumes. Sorted by (speciesIndex, biome), unique.
+    const std::vector<AssetManifestOverride>& overrides() const { return overrides_; }
+
     // The species a kSpeciesMisfiled refusal was about, for the error path
     // that has a human on it. Empty unless the last parse returned that.
     const std::string& misfiledName() const { return misfiledName_; }
@@ -172,6 +307,10 @@ private:
     void clear();
     std::vector<AssetLayer> layers_;
     std::vector<AssetManifestSpecies> species_;
+    uint16_t classDensity_[kAssetKindCount * kBiomeCount] = {};
+    std::vector<AssetPlacementRule> rules_;
+    std::vector<AssetRuleAttachment> attachments_;
+    std::vector<AssetManifestOverride> overrides_;
     std::string misfiledName_;
     AssetTableError misfiledWhy_ = AssetTableError::kOk;
 };
@@ -181,7 +320,14 @@ private:
 // table of 500 without a number anywhere is one. Zero `kept` against a
 // non-empty manifest is a wiring fault by definition.
 struct AssetTableBuildStats {
-    int kept = 0;           // rows in the output table
+    int kept = 0;           // manifest SPECIES kept (>= 1 output row each)
+    int splitRows = 0;      // EXTRA output rows from per-biome overrides: a
+                            // species with overrides becomes a base row plus
+                            // one variant per overridden biome, all sharing
+                            // one bankId. 0 whenever no overrides are
+                            // authored, so the pre-override accounting
+                            // (kept + detail + tooRare + noBiome == species)
+                            // still holds and table.size() == kept + this
     int detailEntities = 0; // layer 255: not this table's business (classes 3-4)
     int tooRare = 0;        // every folded weight rounded to zero per-mille --
                             // the species is ABSENT from the world (the
@@ -209,5 +355,33 @@ struct AssetTableBuildStats {
 // what AssetBankLibrary resolves back to a name and a directory.
 AssetTableBuildStats assetSpeciesTableFromManifest(const AssetManifest& m,
                                                    std::vector<AssetSpecies>& speciesOut);
+
+// LOWER EACH LAYER'S maxHeightMm TO THE TALLEST THING ACTUALLY FILED ON IT.
+//
+// The authored cap is a bake-time CONTRACT and is deliberately loose; it is not
+// a description of the library. Worse, it cannot become one: assign_layer files
+// a species by SPACING among the layers whose cap admits it, so a 5 m shrub
+// authored at 30 m spacing lands on L0 and inherits its 60 m cap. Nothing in the
+// authoring path ties a layer's cap to its occupants.
+//
+// Every streaming bound is made of that cap -- assetTopAboveSurfaceMm returns
+// `maxHeightMm or nothing`, and the level-0 chunk z-range adds it to every
+// footprint. Measured 2026-08-17 against the shipped table: mean 16.49 extra
+// chunk layers admitted per footprint versus a 1.45-layer terrain shell, i.e.
+// ~12x the chunks the terrain needs, which collapsed streaming badly enough that
+// a 240 s settle reached 4,234 of 41,069 chunks. The early-out in
+// assetTopAboveSurfaceMm cannot help: L1 is a 5 m lattice at full density, so a
+// site is found in the first cell for 89.2% of footprints.
+//
+// SAFE BY CONSTRUCTION: this only ever lowers a cap to the maximum height of the
+// species already filed on that layer, so no asset that fits today stops fitting
+// and assetLayerAdmitsHeight still holds for everything in the manifest. A layer
+// with no baked occupants keeps its authored cap rather than collapsing to zero
+// -- too small is a hole in the world at a crown, which is the unsafe direction.
+//
+// Call this AFTER parsing and BEFORE handing layers to AssetField or to any
+// bound. The engine and vxc_assetprobe both call it, deliberately: a probe that
+// measured the authored caps would be pricing a world the engine does not run.
+void assetTightenLayerCaps(const AssetManifest& m, std::vector<AssetLayer>& layers);
 
 } // namespace vxc

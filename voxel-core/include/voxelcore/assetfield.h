@@ -90,19 +90,100 @@ public:
 // A cave mouth is a column with a perfectly good surfaceMm whose top voxel is
 // the open shaft. Nothing about surfaceMm says so, which is why this is a
 // second call and not an inference.
-inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
+// The baked channels a caller can serve BESIDE the column -- everything here
+// is a pure function of (seed, tile bytes) at the anchor, never of runtime
+// state, so the composition stays worldgen. Default-constructed it is all
+// sentinels, and the binding below then reproduces the channel-less world
+// exactly: the water gate fails closed, every multiplier reads neutral.
+//
+// WHO FILLS IT: assetchannels.h's assetColumnChannelsAt is the canonical
+// binding over a FineTileSampler (SECTION_PLACE_* planes), an IWaterSampler
+// (the SAME composed lake/river/sea datum the renderer draws -- NOT the debug
+// water marker, which is exactly the field that was empty over the alpine
+// lake), and the coarse climate (for the treeline). Hosts without those
+// samplers pass the default and get the fail-closed world.
+struct AssetColumnChannels {
+    int32_t distanceToWaterMm = kAssetNoWaterDistanceMm;
+    // Absolute baked water surface over the anchor column, or kNoWaterMarkerMm
+    // (== tilestore's kNoWaterMm; amplifier.cpp static_asserts them equal).
+    int32_t waterSurfaceMm = kNoWaterMarkerMm;
+    int32_t twiMilli = kAssetNoTwiMilli;
+    int16_t talus = -1;
+    int16_t curv = -1;
+    int16_t heat = -1;
+    // The temperature-adjusted treeline at the anchor (biomeTreelineMm of the
+    // column's climate), absolute mm; kAssetNoTreelineMm when unservable.
+    int32_t treelineMm = kAssetNoTreelineMm;
+};
+
+// THE HOST'S CHANNEL SEAM. One virtual, deliberately shaped like
+// assetchannels.h's assetColumnChannelsAt so the engine can bind that function
+// (plus whatever locking its samplers need) and hand it to GeneratedWorld --
+// which is what makes every composition path (makeBrick, materialAt, the UE
+// mesher's parallel samplers, exact admission, the detail resolver) read the
+// SAME channels the census probe reads. Before this seam existed the probe
+// called the binding and the engine called the channel-less overload below:
+// the probe censused 3,870 riparian instances at the alpine lake while the
+// engine composed the sentinel world -- riparians refused everywhere, the
+// submerged veto inert -- and the owner photographed both (2026-08-17).
+//
+// NOT const: the canonical binding decodes placement blocks and water rows
+// lazily, so an implementation carries its samplers' threading contract --
+// prewarm-then-share, or serialize internally. Every answer must remain a
+// pure function of (seed, tile bytes): worldgen, never runtime state.
+class IAssetChannelSource {
+public:
+    virtual ~IAssetChannelSource() = default;
+    virtual AssetColumnChannels channelsAt(int64_t vx, int64_t vy) = 0;
+};
+
+inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col,
+                                                   const AssetColumnChannels& ch) {
     AssetColumnFacts f;
     f.known = true;
     f.biome = col.biome;
     f.surfaceMm = col.surfaceMm;
     f.slopeMmPerM = col.slopeMmPerM;
     f.anchorSolid = Amplifier::materialAt(col, topSolidVoxelZ(col.surfaceMm)) != MAT_AIR;
-    // Distance to water is not servable from a column -- nothing in voxel-core
-    // answers "how far to the nearest watercourse" (design doc section 9). It
-    // is left at the sentinel so a species that needs it is refused rather than
-    // placed on an assumption.
-    f.distanceToWaterMm = kAssetNoWaterDistanceMm;
+    // STANDING WATER, from the channels' baked datum first -- the composed
+    // lake/river/sea surface the renderer draws water at -- and only then from
+    // the column's own waterSurfaceMm, which is the DEBUG MARKER field and is
+    // kNoWaterMarkerMm in every production run (the owner-visible defect of
+    // 2026-08-17: trees standing in the alpine lake, because the veto read a
+    // channel the columns never carry). Either sentinel reads as dry: the veto
+    // errs toward placing on unknown, matching how dry land dominates the
+    // world; the lakes always carry a datum.
+    int32_t ws = ch.waterSurfaceMm != kNoWaterMarkerMm ? ch.waterSurfaceMm
+                                                       : col.waterSurfaceMm;
+    // THE SEA IS THE DATUM, NOT BAKED (lakes.h:implicitWaterDatumMm), so it is
+    // composed HERE, from the column alone, where no caller can forget it: a
+    // column below sea level stands under the sea whatever the samplers say.
+    if (col.surfaceMm < kSeaLevelMm && (ws == kNoWaterMarkerMm || ws < kSeaLevelMm)) {
+        ws = kSeaLevelMm;
+    }
+    if (ws != kNoWaterMarkerMm && ws > col.surfaceMm) {
+        const int64_t d = int64_t(ws) - int64_t(col.surfaceMm);
+        f.standingWaterMm = d > INT32_MAX ? INT32_MAX : int32_t(d);
+    }
+    f.distanceToWaterMm = ch.distanceToWaterMm;
+    f.twiMilli = ch.twiMilli;
+    f.talus = ch.talus;
+    f.curv = ch.curv;
+    f.heat = ch.heat;
+    if (ch.treelineMm != kAssetNoTreelineMm) {
+        const int64_t d = int64_t(ch.treelineMm) - int64_t(col.surfaceMm);
+        f.treelineDeltaMm = d > INT32_MAX ? INT32_MAX : d < INT32_MIN + 1 ? INT32_MIN + 1
+                                                                          : int32_t(d);
+    }
     return f;
+}
+
+// The channel-less binding, kept for callers with no fine tiles and no water
+// sampler (vxc_bench's synthetic ground, tests): sentinels throughout, so a
+// species that needs water distance is refused rather than placed on an
+// assumption, and every channel multiplier reads neutral.
+inline AssetColumnFacts assetColumnFactsFromSample(const ColumnSample& col) {
+    return assetColumnFactsFromSample(col, AssetColumnChannels{});
 }
 
 // The layer table, the species table, the banks and the policy, as one object.
@@ -141,15 +222,28 @@ public:
     // ONE COLUMN PER SITE, NOT PER VOXEL. The column is evaluated at the site's
     // OWN anchor -- not at the query voxel -- because that is where the tree
     // stands. The rect's own columns are irrelevant to it.
+    // `terrainOnly` skips every DETAIL-lattice site before it costs anything.
+    // A detail site pays the same columnFacts amplifier column as a terrain one
+    // -- the expensive part of this whole function -- and then resolves to an
+    // instance that no world-lattice consumer can use (materialOfInstance and
+    // resolveForCompose both refuse detail instances). Measured on the census
+    // ground: 27,684 of 32,673 sites (85%) are detail, so a world-lattice
+    // caller passing false pays ~6x the columns for the same composition.
+    // Default false because the DETAIL consumers (the entity spawner, the
+    // census) want the full list and predate the flag.
     template <typename ColumnFactsFn>
     std::vector<AssetInstance> instancesForRect(const AssetVoxelRect& rect,
-                                                const ColumnFactsFn& columnFacts) const {
+                                                const ColumnFactsFn& columnFacts,
+                                                bool terrainOnly = false) const {
         std::vector<AssetInstance> out;
         if (empty()) return out;
         const std::vector<AssetSite> sites =
             assetSitesForRect(seed_, layers_.data(), int(layers_.size()), rect);
         out.reserve(sites.size());
         for (const AssetSite& s : sites) {
+            if (terrainOnly && (size_t(s.layer) >= layers_.size() ||
+                                !layers_[s.layer].terrainLattice))
+                continue;
             const int64_t avx = floorDiv(s.anchorXMm, int64_t(kVoxelSizeMm));
             const int64_t avy = floorDiv(s.anchorYMm, int64_t(kVoxelSizeMm));
             AssetInstance inst;
@@ -159,6 +253,83 @@ public:
             out.push_back(inst);
         }
         return out;
+    }
+
+    // One instance with its bank grid ALREADY RESOLVED, so sampling it costs
+    // arithmetic and an array read -- no lock, no map, no source query.
+    //
+    // Why this exists: materialAt below goes through materialOfInstance, which
+    // asks the bank source for the grid ON EVERY CALL, and the disk-backed
+    // source answers under one global mutex. The level-0 mesher samples ~64k
+    // voxels per chunk across ~96 worker threads; measured 2026-08-17, a
+    // single capture issued 26.4M bankGrid calls and the workers convoyed on
+    // that mutex badly enough to hold streaming at ~17 chunks/s. The grid for
+    // a given (bankId, seedIndex) never changes within a job, so resolving it
+    // once per chunk is the whole fix, and composition is byte-identical: the
+    // list preserves instancesForRect order, so first-non-air-wins picks the
+    // same winner.
+    struct ResolvedAssetInstance {
+        const AssetGrid* grid = nullptr;
+        int64_t anchorVx = 0, anchorVy = 0, anchorVz = 0;
+        uint8_t yawQuarter = 0;
+        // Which lattice this instance came from. Carried for attribution (the
+        // per-layer mesher counters exist because an aggregate count hid a
+        // whole missing layer); composition itself never reads it.
+        uint8_t layer = 0;
+    };
+
+    // Resolve every TERRAIN-LATTICE instance's grid once. Detail-lattice
+    // instances are dropped here for the same reason materialOfInstance answers
+    // MAT_AIR for them -- they never enter the world lattice -- and dropping
+    // them up front also removes them from the per-voxel loop entirely (84% of
+    // resolved instances are detail ground cover; iterating them per voxel to
+    // skip them was most of the loop). Grids that are missing, invalid or off
+    // the world lattice are dropped exactly where materialOfInstance would have
+    // answered MAT_AIR for them, so the survivors are precisely the instances
+    // that can put a voxel anywhere.
+    std::vector<ResolvedAssetInstance>
+    resolveForCompose(const std::vector<AssetInstance>& instances) const {
+        std::vector<ResolvedAssetInstance> out;
+        if (banks_ == nullptr) return out;
+        out.reserve(instances.size());
+        for (const AssetInstance& inst : instances) {
+            if (size_t(inst.layer) >= layers_.size()) continue;
+            if (!layers_[inst.layer].terrainLattice) continue;
+            const AssetGrid* g = banks_->bankGrid(inst.bankId, inst.seedIndex);
+            if (g == nullptr || !g->valid() || !g->onTerrainLattice()) continue;
+            ResolvedAssetInstance r;
+            r.grid = g;
+            r.anchorVx = floorDiv(inst.anchorXMm, int64_t(kVoxelSizeMm));
+            r.anchorVy = floorDiv(inst.anchorYMm, int64_t(kVoxelSizeMm));
+            r.anchorVz = inst.anchorVz;
+            r.yawQuarter = inst.yawQuarter;
+            r.layer = inst.layer;
+            out.push_back(r);
+        }
+        return out;
+    }
+
+    // materialAt over a pre-resolved list. Same transform, same first-non-air
+    // rule, same answers as materialAt(instances, ...) -- the ONLY difference
+    // is where the grid pointer comes from. Static because it deliberately
+    // cannot touch the bank source.
+    static MaterialId materialAtResolved(const std::vector<ResolvedAssetInstance>& resolved,
+                                         int64_t vx, int64_t vy, int64_t vz) {
+        for (const ResolvedAssetInstance& r : resolved) {
+            // Identical arithmetic to materialOfInstance, against the cached
+            // grid. atYaw answers MAT_AIR out of range, so the only guard
+            // needed is the int32 narrowing one.
+            const int64_t rx = vx - r.anchorVx - int64_t(r.grid->rotatedOriginX(r.yawQuarter));
+            const int64_t ry = vy - r.anchorVy - int64_t(r.grid->rotatedOriginY(r.yawQuarter));
+            const int64_t rz = vz - r.anchorVz - int64_t(r.grid->originZ());
+            if (rx < INT32_MIN || rx > INT32_MAX || ry < INT32_MIN || ry > INT32_MAX ||
+                rz < INT32_MIN || rz > INT32_MAX)
+                continue;
+            const MaterialId m = r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
+                                               static_cast<int32_t>(rz), r.yawQuarter);
+            if (m != MAT_AIR) return m;
+        }
+        return MAT_AIR;
     }
 
     // The material one instance puts at a world voxel, or MAT_AIR.

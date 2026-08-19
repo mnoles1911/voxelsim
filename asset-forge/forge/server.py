@@ -34,9 +34,17 @@ from . import (biomes as biomelib, contact, kinds as kindlib, materials, pipelin
                render, spec as specmod, vox, vxa)
 
 ROOT = Path(__file__).resolve().parent.parent
-WEB = Path(__file__).resolve().parent / "web"
+# The React frontend (web/dist, built by `npm run build` in web/) took over
+# from the hand-written page in forge/web on 2026-08-18. The old page is kept
+# as a fallback ONLY for a checkout that has never built the app, so the
+# server still opens on something rather than a 404.
+DIST = ROOT / "web" / "dist"
+LEGACY_WEB = Path(__file__).resolve().parent / "web"
 SPECS = ROOT / "specs"
 LIBRARY = ROOT / "library"
+RULES_DIR = ROOT / "rules"
+PLACEMENT_RULES = RULES_DIR / "placement-rules.json"
+BIOME_DENSITY = RULES_DIR / "biome-density.json"
 
 TILE_PX = 260
 DETAIL_PX = 820
@@ -420,6 +428,212 @@ def library_dir(entry_id: str) -> Path | None:
     return None
 
 
+# --- placement: the named-rule library + per-spec blocks --------------------
+#
+# The UI writes placement the same way it writes curation: into the RAW file,
+# touching only the edited block, so the diff IS the edit. The schema itself
+# (field law, composition, allowlist resolution) is owned by forge/spec.py and
+# forge/biomes.py -- everything here just enforces it at the route.
+
+# Clamp ranges for rule fields, mirrored in web/src/lib/schema.ts (the client
+# validates before writing; the server refuses regardless).
+RULE_CLAMPS = {
+    "elev_min_m": (-500.0, 9000.0), "elev_max_m": (-500.0, 9000.0),
+    "slope_min_pct": (0.0, 70.0), "slope_max_pct": (0.0, 70.0),
+    "water_max_m": (0.1, 2000.0), "spacing_m": (0.0, 500.0),
+    "abundance": (0.0, 1.0), "cluster": (0.0, 1.0),
+}
+RULE_WATER_KINDS = ("any", "ocean", "river", "lake", "shallow", "reef")
+
+# Species names are file names; same charset the seeders use.
+import re as _re
+SPECIES_NAME_RE = _re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+
+
+def _read_json(path: Path, fallback: dict) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return dict(fallback)
+
+
+def rules_doc() -> dict:
+    """rules/placement-rules.json, raw (the `_readme` rides along untouched)."""
+    return _read_json(PLACEMENT_RULES, {"rules": {}})
+
+
+def density_table() -> dict:
+    return _read_json(BIOME_DENSITY, {}).get("density", {})
+
+
+def rule_references() -> dict:
+    """Rule name -> the species whose `biome_rules` cite it. Read from the RAW
+    spec files: this is what makes delete refuse instead of silently orphaning
+    a reference the export would then refuse by name."""
+    refs: dict[str, list[str]] = {}
+    for p in sorted(SPECS.glob("*.json")):
+        raw = _read_json(p, {})
+        br = raw.get("biome_rules")
+        if not isinstance(br, dict):
+            continue
+        cited = set()
+        for names in br.values():
+            if isinstance(names, list):
+                cited.update(n for n in names if isinstance(n, str))
+        for n in sorted(cited):
+            refs.setdefault(n, []).append(raw.get("name", p.stem))
+    return refs
+
+
+def clean_rule_body(raw) -> tuple[dict | None, str | None]:
+    """One rule body, checked against the field law. Returns (cleaned, error)."""
+    if not isinstance(raw, dict):
+        return None, "a rule must be a mapping of restriction fields"
+    out: dict = {}
+    for k, v in raw.items():
+        if k == "_note":
+            if str(v).strip():
+                out["_note"] = str(v)
+            continue
+        if k not in specmod.RULE_FIELDS:
+            return None, f"{k!r} is not a rule field (menu: {list(specmod.RULE_FIELDS)})"
+        if k == "water":
+            if v not in RULE_WATER_KINDS:
+                return None, f"water must be one of {RULE_WATER_KINDS}"
+            out[k] = v
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            return None, f"{k} must be a number"
+        lo, hi = RULE_CLAMPS[k]
+        if not (lo <= fv <= hi):
+            return None, f"{k} must be between {lo:g} and {hi:g}"
+        out[k] = int(fv) if fv == int(fv) else fv
+    if not any(k in out for k in specmod.RULE_FIELDS):
+        return None, "a rule must set at least one field, or it restricts nothing"
+    if "elev_min_m" in out and "elev_max_m" in out and out["elev_min_m"] >= out["elev_max_m"]:
+        return None, "the elevation floor must sit below the ceiling"
+    if ("slope_min_pct" in out and "slope_max_pct" in out
+            and out["slope_min_pct"] >= out["slope_max_pct"]):
+        return None, "the minimum slope must sit below the maximum"
+    if "water" in out and "water_max_m" not in out:
+        return None, "a water kind needs a distance (set water_max_m)"
+    return out, None
+
+
+def import_asset(name: str, kind: str, grid, source_format: str) -> dict:
+    """Save an asset from an OUTSIDE source into the library.
+
+    The point of the exercise: an imported asset gets a spec file exactly like
+    a generated species, so curation and placement (biomes, allowlist, rule
+    overrides) work identically and nothing downstream can tell the two paths
+    apart. The one honest difference is recorded in `meta.imported` -- there
+    is no (spec, seed) that regenerates it, so routes that rebuild from the
+    spec serve the stored files instead.
+    """
+    spec, _ = specmod.validate({
+        "name": name, "kind": kind,
+        "notes": f"imported from an outside 3D source ({source_format})",
+    })
+    entry_id = f"{name}-0001"
+    out = LIBRARY / name / entry_id
+    out.mkdir(parents=True, exist_ok=True)
+
+    specmod.save(spec, out / "spec.json")
+    models = vox.write(grid, out / "tree.vox", name=entry_id)
+    vxa.write(grid, out / "tree.vxa")
+    render.view(grid, "iso", target_px=DETAIL_PX).save(out / "thumb.png")
+    meta = {
+        "id": entry_id,
+        "species": name,
+        "kind": kind,
+        "seed": 1,
+        "imported": True,
+        "source_format": source_format,
+        "spec_hash": specmod.spec_hash(spec),
+        "stats": {
+            "height_m": round(grid.shape[2] * grid.voxel_m, 3),
+            "voxels": int((grid.data > 0).sum()),
+        },
+        "problems": [],
+        "vox_models": models,
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    # The species entry in specs/, never clobbering one that exists. Curation
+    # starts at DRAFT: the grandfather clause is for the pre-gate library, and
+    # a brand-new import has by definition never been looked at.
+    sp = SPECS / f"{name}.json"
+    if not sp.exists():
+        specmod.save(spec, sp)
+        raw = json.loads(sp.read_text(encoding="utf-8"))
+        raw["curation"] = {"status": "draft", "seeds": [1],
+                          "notes": "imported asset; approve to publish"}
+        sp.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                      encoding="utf-8")
+    return meta
+
+
+def grid_from_vox(blob: bytes, voxel_mm: int):
+    """A MagicaVoxel .vox (first model) as a VoxelGrid.
+
+    Colours snap to the nearest forge material colour -- imports keep their
+    shape exactly; their palette is quantised onto the engine's materials,
+    which is the only palette anything downstream can draw.
+    """
+    import numpy as np
+
+    from .grid import VoxelGrid, dense_bytes
+
+    if len(blob) < 20 or blob[:4] != b"VOX ":
+        raise ValueError("not a MagicaVoxel .vox file (missing 'VOX ' magic)")
+    size = xyzi = rgba = None
+    i = 8
+    while i + 12 <= len(blob):
+        cid = blob[i:i + 4]
+        n, _children = struct.unpack_from("<II", blob, i + 4)
+        content = blob[i + 12:i + 12 + n]
+        if cid == b"SIZE" and size is None:
+            size = struct.unpack_from("<III", content, 0)
+        elif cid == b"XYZI" and xyzi is None:
+            cnt = struct.unpack_from("<I", content, 0)[0]
+            xyzi = np.frombuffer(content, dtype=np.uint8,
+                                 count=cnt * 4, offset=4).reshape(cnt, 4)
+        elif cid == b"RGBA":
+            rgba = np.frombuffer(content, dtype=np.uint8,
+                                 count=256 * 4).reshape(256, 4)
+        # A chunk's children are themselves chunks, so skipping only the
+        # content walks straight into them (MAIN's content is empty).
+        i += 12 + n
+    if size is None or xyzi is None or len(xyzi) == 0:
+        raise ValueError("no voxels found (missing SIZE/XYZI chunk)")
+    if rgba is None:
+        raise ValueError(
+            "no RGBA palette chunk; save the model from MagicaVoxel 0.99+ "
+            "so the file carries its palette")
+    sx, sy, sz = (int(v) for v in size)
+    if not (0 < sx and 0 < sy and 0 < sz) or dense_bytes((sx, sy, sz)) > 512 << 20:
+        raise ValueError(f"model size {sx}x{sy}x{sz} is out of range")
+
+    grid = VoxelGrid((sx, sy, sz), voxel_m=voxel_mm / 1000.0)
+    mats = sorted((m, c) for m, c in materials.COLORS.items() if m != materials.MAT_AIR)
+    mat_ids = np.array([m for m, _ in mats], dtype=np.uint8)
+    mat_rgb = np.array([c for _, c in mats], dtype=np.int64)
+    lut = np.zeros(256, dtype=np.uint8)
+    for pi in np.unique(xyzi[:, 3]):
+        c = rgba[(int(pi) - 1) % 256, :3].astype(np.int64)
+        lut[pi] = mat_ids[int(np.argmin(((mat_rgb - c) ** 2).sum(axis=1)))]
+    xs = xyzi[:, 0].astype(np.int64)
+    ys = xyzi[:, 1].astype(np.int64)
+    zs = xyzi[:, 2].astype(np.int64)
+    keep = (xs < sx) & (ys < sy) & (zs < sz)
+    grid.data[xs[keep], ys[keep], zs[keep]] = lut[xyzi[keep, 3]]
+    if not grid.data.any():
+        raise ValueError("the model decoded to zero voxels")
+    return grid
+
+
 # --- http -------------------------------------------------------------------
 
 
@@ -470,6 +684,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._static("index.html")
         if path.startswith("/static/"):
             return self._static(path[len("/static/") :])
+        if path.startswith("/assets/"):
+            # Vite's content-hashed bundles from web/dist.
+            return self._static(path[1:])
 
         if path == "/api/schema":
             # Scoped to a kind when asked. The sliders a rock has nothing to do
@@ -481,6 +698,27 @@ class Handler(BaseHTTPRequestHandler):
                 "params": specmod.ui_schema(kind),
                 "groups": [g for g in specmod.GROUPS
                            if not kind or g in kindlib.groups_for(kind)],
+            })
+
+        if path == "/api/biomes":
+            # The biome menu, straight off forge/biomes.py -- the frontend
+            # never hardcodes a biome key or a hosting decision.
+            return self._json([
+                {"id": b.id, "key": b.key, "label": b.label,
+                 "surface": b.surface, "climate": b.climate,
+                 "plantable": b.plantable, "hosts": list(b.hosts)}
+                for b in biomelib.BIOMES
+            ])
+
+        if path == "/api/rules":
+            # The named-rule library + the kind x biome density table (the
+            # latter read-only context in the UI: it scales everything).
+            doc = rules_doc()
+            return self._json({
+                "rules": doc.get("rules", {}),
+                "density": density_table(),
+                "fields": list(specmod.RULE_FIELDS),
+                "referenced": rule_references(),
             })
 
         if path == "/api/kinds":
@@ -562,6 +800,18 @@ class Handler(BaseHTTPRequestHandler):
                         "shape": _shape_word(s, kind),
                         "notes": specmod.get(s, "notes"),
                         "biomes": biomelib.summary(s),
+                        "curation": specmod.curation(s),
+                        # The placement blocks, for the library's placement
+                        # panel. `biome_allow` absent -> null (derived from
+                        # the weights); `validate` has already cleaned both.
+                        "weights": biomelib.weights(s),
+                        "biome_allow": (s.get("biome_allow")
+                                        if isinstance(s.get("biome_allow"), list)
+                                        else None),
+                        "biome_rules": ({k: v for k, v in s["biome_rules"].items()
+                                         if k != "__illegible__"}
+                                        if isinstance(s.get("biome_rules"), dict)
+                                        else {}),
                     }
                 )
             return self._json(out)
@@ -572,7 +822,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "no such spec"}, 404)
             s, rep = specmod.load(p)
             return self._json({"spec": s, "warnings": rep.warnings,
-                               "hash": specmod.spec_hash(s)})
+                               "hash": specmod.spec_hash(s),
+                               "curation": specmod.curation(s)})
 
         if path == "/api/job":
             job = FORGE.get(q.get("job", ""))
@@ -614,6 +865,7 @@ class Handler(BaseHTTPRequestHandler):
             # (spec, seed) like the detail render -- deterministic build means
             # this is exactly the tree the thumbnail showed.
             job = FORGE.get(q.get("job", ""))
+            grid = None
             if job:
                 spec, seed = job.spec, int(q["seed"])
             else:
@@ -621,14 +873,23 @@ class Handler(BaseHTTPRequestHandler):
                 if not d:
                     return self._json({"error": "unknown tree"}, 404)
                 spec, _ = specmod.load(d / "spec.json")
-                seed = json.loads((d / "meta.json").read_text(encoding="utf-8"))["seed"]
+                meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+                seed = meta["seed"]
+                if meta.get("imported"):
+                    # No (spec, seed) regenerates an import -- the stored
+                    # voxels ARE the asset, so serve those.
+                    grid = vxa.read(d / "tree.vxa")
             try:
                 cap = int(q["max"]) if q.get("max") else None
             except ValueError:
                 cap = None
-            cm = viewer_resolution(spec, cap)
-            tree = pipeline.build(spec, seed, connectivity=False, resolution_cm=cm)
-            body = encode_voxels(tree.grid)
+            if grid is None:
+                cm = viewer_resolution(spec, cap)
+                grid = pipeline.build(spec, seed, connectivity=False,
+                                      resolution_cm=cm).grid
+            else:
+                cm = grid.voxel_m * 100.0
+            body = encode_voxels(grid)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -672,6 +933,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return self.wfile.write(body)
 
+        if not path.startswith("/api/"):
+            # SPA fallback: any non-API path is a client-side route of the
+            # React app; serve the shell and let it route.
+            return self._static("index.html")
         return self._json({"error": "no such route"}, 404)
 
     def do_POST(self) -> None:
@@ -715,6 +980,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": "bad species name"}, 400)
             specmod.save(spec, SPECS / f"{name}.json")
             return self._json({"saved": f"{name}.json", "warnings": rep.warnings})
+
+        if path == "/api/curation":
+            # The publish verdict, written into the spec FILE and nowhere
+            # else. The exporters read the gate from specs/, so a verdict
+            # held in server memory or a sidecar would be one more derived
+            # copy waiting to detach from its source.
+            name = Path(str(body.get("name", ""))).name
+            p = SPECS / f"{name}.json"
+            if not name or name in (".", "..") or not p.is_file():
+                return self._json({"error": "no such spec"}, 404)
+            status = str(body.get("status", ""))
+            if status not in specmod.CURATION_STATUSES:
+                return self._json(
+                    {"error": f"status must be one of {specmod.CURATION_STATUSES}"}, 400)
+            try:
+                seeds = sorted({int(s) for s in (body.get("seeds") or [])})
+            except (TypeError, ValueError):
+                return self._json({"error": "seeds must be whole numbers"}, 400)
+            if not seeds or not all(1 <= s <= 9999 for s in seeds):
+                # An approved species with no seeds would be published with an
+                # empty bank; refuse the write instead of letting the resolver
+                # quietly substitute the default later.
+                return self._json({"error": "at least one seed, each 1-9999"}, 400)
+            # The RAW file, not the validated body: validate re-clamps every
+            # parameter it touches, and this route's whole contract is that
+            # nothing but the curation block moves. The dump matches
+            # `spec.save`'s byte format, so the diff IS the block.
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw["curation"] = {"status": status, "seeds": seeds,
+                               "notes": str(body.get("notes", ""))}
+            p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
+            return self._json({"saved": f"{name}.json",
+                               "curation": specmod.curation(raw)})
 
         if path == "/api/keep":
             spec, _ = specmod.validate(body.get("spec") or {})
@@ -768,6 +1067,200 @@ class Handler(BaseHTTPRequestHandler):
             p = contact.save(img, ROOT / "out" / name / f"{name}-sheet.png")
             return self._json({"path": str(p)})
 
+        if path == "/api/placement":
+            # Placement for one species: biome weights, the allowlist, and the
+            # per-biome rule attachments. Same contract as /api/curation: the
+            # RAW spec file, and only the blocks present in the request move.
+            #   weights      {biome: 0..1}  DELTAS -- only the changed keys;
+            #                0 removes the key from the biomes block
+            #   biome_allow  list | null    whole block; null removes it
+            #                (allowlist back to derived-from-weights)
+            #   biome_rules  {biome: [rule names]} | null   whole block
+            name = Path(str(body.get("name", ""))).name
+            p = SPECS / f"{name}.json"
+            if not name or name in (".", "..") or not p.is_file():
+                return self._json({"error": "no such spec"}, 404)
+            s, _ = specmod.load(p)
+            kind = specmod.get(s, "kind")
+            hosts = tuple(b.key for b in biomelib.BIOMES if kind in b.hosts)
+            raw = json.loads(p.read_text(encoding="utf-8"))
+
+            if "weights" in body:
+                deltas = body["weights"]
+                if not isinstance(deltas, dict):
+                    return self._json({"error": "weights must map biome -> 0..1"}, 400)
+                block = raw.get("biomes")
+                if not isinstance(block, dict):
+                    block = {}
+                for k, v in deltas.items():
+                    if k not in hosts:
+                        return self._json(
+                            {"error": f"{k!r} does not host kind {kind!r} "
+                                      f"(menu: {list(hosts)})"}, 400)
+                    try:
+                        w = float(v)
+                    except (TypeError, ValueError):
+                        return self._json({"error": f"weight for {k} must be a number"}, 400)
+                    if not (0.0 <= w <= 1.0):
+                        return self._json({"error": f"weight for {k} must be 0..1"}, 400)
+                    if w <= 0:
+                        block.pop(k, None)
+                    else:
+                        block[k] = round(w, 4)
+                if block:
+                    raw["biomes"] = block
+                else:
+                    raw.pop("biomes", None)
+
+            if "biome_allow" in body:
+                allow = body["biome_allow"]
+                if allow is None:
+                    raw.pop("biome_allow", None)
+                elif isinstance(allow, list):
+                    bad = [k for k in allow if k not in hosts]
+                    if bad:
+                        return self._json(
+                            {"error": f"biome_allow: {bad} do not host kind "
+                                      f"{kind!r} (menu: {list(hosts)})"}, 400)
+                    raw["biome_allow"] = sorted(set(allow))
+                else:
+                    return self._json(
+                        {"error": "biome_allow must be a list of biome keys, "
+                                  "or null to derive from the weights"}, 400)
+
+            if "biome_rules" in body:
+                br = body["biome_rules"]
+                if br is None:
+                    raw.pop("biome_rules", None)
+                elif isinstance(br, dict):
+                    known = rules_doc().get("rules", {})
+                    cleaned: dict = {}
+                    for bkey, names in br.items():
+                        if bkey not in biomelib.BY_KEY:
+                            return self._json({"error": f"{bkey!r} is not a biome key"}, 400)
+                        if not isinstance(names, list):
+                            return self._json(
+                                {"error": f"biome_rules.{bkey} must be a list of rule names"}, 400)
+                        # Referential check AT AUTHORING TIME: the export
+                        # refuses dangling names, so the UI must never be able
+                        # to write one.
+                        missing = [n for n in names if n not in known]
+                        if missing:
+                            return self._json(
+                                {"error": f"unknown rule(s) {missing}; author them "
+                                          f"in the rule library first"}, 400)
+                        if names:
+                            cleaned[bkey] = sorted(set(names))
+                    if cleaned:
+                        raw["biome_rules"] = cleaned
+                    else:
+                        raw.pop("biome_rules", None)
+                else:
+                    return self._json(
+                        {"error": "biome_rules must map biome -> [rule names], "
+                                  "or null to clear"}, 400)
+
+            p.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n",
+                         encoding="utf-8")
+            s2, rep = specmod.load(p)
+            return self._json({
+                "saved": f"{name}.json",
+                "weights": biomelib.weights(s2),
+                "biome_allow": (s2.get("biome_allow")
+                                if isinstance(s2.get("biome_allow"), list) else None),
+                "biome_rules": ({k: v for k, v in s2["biome_rules"].items()
+                                 if k != "__illegible__"}
+                                if isinstance(s2.get("biome_rules"), dict) else {}),
+                "allowed": list(biomelib.allowed(s2)),
+                "warnings": rep.warnings,
+            })
+
+        if path == "/api/rules/save":
+            # Create or update ONE named rule in rules/placement-rules.json.
+            # The raw document is edited in place, so the diff is the rule.
+            name = str(body.get("name", ""))
+            if not specmod.RULE_NAME_RE.match(name):
+                return self._json(
+                    {"error": "rule name must be 1-31 chars of [A-Za-z0-9_-] "
+                              "(it is wire data)"}, 400)
+            cleaned, err = clean_rule_body(body.get("rule"))
+            if err:
+                return self._json({"error": err}, 400)
+            doc = rules_doc()
+            doc.setdefault("rules", {})[name] = cleaned
+            RULES_DIR.mkdir(parents=True, exist_ok=True)
+            PLACEMENT_RULES.write_text(json.dumps(doc, indent=2) + "\n",
+                                       encoding="utf-8")
+            return self._json({"saved": name, "rules": doc["rules"]})
+
+        if path == "/api/rules/delete":
+            # Deleting a rule any spec still cites would leave dangling names
+            # the export then refuses -- so the delete refuses FIRST, by name.
+            name = str(body.get("name", ""))
+            doc = rules_doc()
+            if name not in doc.get("rules", {}):
+                return self._json({"error": "no such rule"}, 404)
+            refs = rule_references().get(name, [])
+            if refs:
+                return self._json(
+                    {"error": f"rule {name!r} is attached to {len(refs)} species; "
+                              f"detach it everywhere first",
+                     "referenced": refs}, 409)
+            del doc["rules"][name]
+            PLACEMENT_RULES.write_text(json.dumps(doc, indent=2) + "\n",
+                                       encoding="utf-8")
+            return self._json({"deleted": name, "rules": doc["rules"]})
+
+        if path == "/api/import":
+            # An asset from an outside 3D source, into the library, with a
+            # spec file so it is curated and placement-specced identically to
+            # a generated species.
+            import base64
+
+            name = str(body.get("name", ""))
+            if not SPECIES_NAME_RE.match(name):
+                return self._json(
+                    {"error": "species name must be lowercase letters, digits "
+                              "and dashes (up to 40)"}, 400)
+            kind = str(body.get("kind", ""))
+            if kind not in {k.key for k in kindlib.KINDS}:
+                return self._json(
+                    {"error": f"kind must be one of "
+                              f"{[k.key for k in kindlib.KINDS]}"}, 400)
+            fmt = str(body.get("format", ""))
+            try:
+                blob = base64.b64decode(str(body.get("data_b64", "")), validate=True)
+            except (ValueError, TypeError):
+                return self._json({"error": "data_b64 is not valid base64"}, 400)
+            if not blob:
+                return self._json({"error": "the file is empty"}, 400)
+            if len(blob) > 64 << 20:
+                return self._json({"error": "file too large (64 MB cap)"}, 400)
+            try:
+                if fmt == "vxa":
+                    import tempfile
+
+                    tmp = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                                suffix=".vxa", delete=False) as f:
+                            f.write(blob)
+                            tmp = f.name
+                        grid = vxa.read(tmp)
+                    finally:
+                        if tmp:
+                            os.unlink(tmp)
+                elif fmt == "vox":
+                    voxel_mm = int(body.get("voxel_mm", 100))
+                    if not (10 <= voxel_mm <= 1000):
+                        return self._json({"error": "voxel_mm must be 10-1000"}, 400)
+                    grid = grid_from_vox(blob, voxel_mm)
+                else:
+                    return self._json({"error": "format must be 'vox' or 'vxa'"}, 400)
+            except ValueError as e:
+                return self._json({"error": str(e)}, 400)
+            return self._json(import_asset(name, kind, grid, fmt))
+
         return self._json({"error": "no such route"}, 404)
 
     def _all_specs(self) -> list[tuple[Path, dict]]:
@@ -786,11 +1279,15 @@ class Handler(BaseHTTPRequestHandler):
         return s
 
     def _static(self, rel: str) -> None:
-        target = (WEB / rel).resolve()
-        if WEB.resolve() not in target.parents or not target.is_file():
+        # web/dist (the built React app) when it exists; the legacy page in
+        # forge/web only as a fallback for a checkout that never ran a build.
+        root = DIST if (DIST / "index.html").is_file() else LEGACY_WEB
+        target = (root / rel).resolve()
+        if root.resolve() not in target.parents or not target.is_file():
             return self._json({"error": "not found"}, 404)
         ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        self._send(200, target.read_bytes(), ctype)
+        # Vite bundles are content-hashed, so they can cache forever.
+        self._send(200, target.read_bytes(), ctype, cache=rel.startswith("assets/"))
 
 
 class Server(ThreadingHTTPServer):

@@ -31,6 +31,7 @@
 // runs of a single z-column, which is what makes the walk short rather than
 // merely finite.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -215,6 +216,34 @@ public:
     // instance without re-deriving the rotation convention.
     int32_t rotatedOriginX(uint8_t yawQuarter) const;
     int32_t rotatedOriginY(uint8_t yawQuarter) const;
+
+    // Visit every RLE run of one baked column in ascending z:
+    // visit(z0, len, mat), len >= 1, runs abut. AIR runs are delivered too --
+    // the caller decides what solid means. Out-of-range columns visit nothing.
+    //
+    // This is at()'s walk without the per-cell restart: at() is O(runs) per
+    // CELL, so a consumer that wants a whole column -- the GPU stamp upload
+    // decodes every column of a grid exactly once -- pays O(z * runs) through
+    // at() and O(runs) here. Header-only because the walk is four lines and a
+    // template visitor keeps it allocation-free.
+    template <typename F>
+    void columnRuns(int32_t lx, int32_t ly, F&& visit) const {
+        if (lx < 0 || ly < 0 || lx >= sizeX_ || ly >= sizeY_) return;
+        const size_t c = size_t(lx) * size_t(sizeY_) + size_t(ly);
+        uint32_t run = colRun_[c];
+        uint32_t off = colOff_[c];
+        const uint32_t nruns = static_cast<uint32_t>(runLen_.size());
+        int32_t z = 0;
+        while (run < nruns && z < sizeZ_) {
+            const uint32_t avail = runLen_[run] - off;
+            const int32_t len =
+                int32_t(std::min<uint64_t>(uint64_t(avail), uint64_t(sizeZ_ - z)));
+            if (len > 0) visit(z, len, runMat_[run]);
+            z += len;
+            off = 0;
+            ++run;
+        }
+    }
 
     // Count of non-air cells. Walks the runs once; used by tests and by the
     // bake-verification tooling, not on any hot path.

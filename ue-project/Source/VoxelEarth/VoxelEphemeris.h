@@ -189,7 +189,19 @@ namespace VoxelSky
 	// both already in the same local horizon frame -- is exactly what sets the
 	// illuminated fraction, and taking it from the caller's FSunState keeps the
 	// returned phase self-consistent with the returned directions.
-	VOXELEARTH_API FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& Sun);
+	// SlowJulianDay: the CONTINUOUS day count (no calendar floor) used for the
+	// moon's slow orbital elements; the stepped JulianDay still drives the hour
+	// angle so the moon stays locked to the star field. Omit (or pass <= 0) for
+	// the pre-2026-08-18 behaviour, in which the moon hops 12.19 deg every
+	// calendar step -- see ComputeMoon's body for the owner's playtest evidence.
+	// The unfloored companion to JulianDayFromGameClock, for the moon's slow
+	// elements. See its body.
+	VOXELEARTH_API double ContinuousJulianDayFromGameClock(double WorldEpochSeconds,
+	                                                       double DayLengthSeconds,
+	                                                       double DaysPerYear);
+
+	VOXELEARTH_API FMoonState ComputeMoon(double JulianDay, const FGeoCoord& Geo, const FSunState& Sun,
+	                                      double SlowJulianDay = 0.0);
 
 	// Local mean sidereal time, in degrees, wrapped into [0, 360).
 	//

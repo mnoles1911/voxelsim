@@ -1,0 +1,14 @@
+coarse namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4
+fine   namespace: terrain-diffusion-unlabeled-80b9ca451a23eae4-bdcab4bed
+tiles: [(-5, -4), (-4, -4), (-3, -4), (-5, -5), (-4, -5), (-3, -5)]
+[coarse] 20/20 ring tiles available (generate=False) cpu=0.0s
+[flow L1] 1 superblock(s) @ 120 m/px, span 246 km  fp=066cf1d469ed  cpu=7.8s
+[flow L0] 4 superblock(s) @ 30 m/px, span 61 km  fp=3d3c80deb245,4c8482ae6f68,a79fab8d28ee,c35c5715fa63  cpu=27.0s
+[1/6] baked (-5,-4) cpu=1421.7s water=0.782%wet max_catchment=173.3km2 incision_p99=25.00m channels=48149077 injected=148.1km2/Q2.65e+07m3yr@179mm qmax=1.84e+08 drawnpad=524755 basin=1.1%/22m bridge=30355@0.20m settle=1835846/3r-1750800dr-60335bud mono=1811>0 lvl=404654 span=100/38ha@21m basins_v2=260/7span heads=48144@2.6%u32 hydro=3d3c80deb245
+[2/6] baked (-4,-4) cpu=1306.1s water=0.446%wet max_catchment=70.0km2 incision_p99=25.00m channels=53503304 injected=73.7km2/Q8.02e+06m3yr@109mm qmax=1.03e+08 drawnpad=299070 basin=0.5%/34m bridge=53333@0.34m settle=2484016/3r-2417729dr-40958bud mono=1550>0 lvl=202618 span=58/23ha@40m basins_v2=165/7span heads=57157@2.3%u32 hydro=c35c5715fa63
+[3/6] baked (-3,-4) cpu=1194.2s water=0.420%wet max_catchment=266.1km2 incision_p99=25.00m channels=61068940 injected=84.9km2/Q7.8e+07m3yr@918mm qmax=1.93e+08 drawnpad=281783 basin=0.9%/46m bridge=40904@0.35m settle=2685290/3r-2649319dr-23512bud mono=1174>0 lvl=162951 span=56/26ha@40m basins_v2=241/3span heads=36450@4.3%u32 hydro=c35c5715fa63
+[4/6] baked (-5,-5) cpu=1167.3s water=1.089%wet max_catchment=75.2km2 incision_p99=16.78m channels=26591131 injected=20.6km2/Q1.65e+05m3yr@8mm qmax=5.31e+07 drawnpad=730642 basin=1.7%/44m bridge=43263@0.10m settle=2429703/3r-2258125dr-107799bud mono=2711>0 lvl=454417 span=57/30ha@41m basins_v2=401/6span heads=86129@1.2%u32 hydro=a79fab8d28ee
+[5/6] baked (-4,-5) cpu=1274.7s water=0.743%wet max_catchment=171.3km2 incision_p99=25.00m channels=41731447 injected=50.0km2/Q1.81e+06m3yr@36mm qmax=1.31e+08 drawnpad=498869 basin=2.4%/36m bridge=27734@0.22m settle=1851640/3r-1776867dr-52852bud mono=1661>0 lvl=340678 span=110/47ha@34m basins_v2=581/10span heads=41079@3.0%u32 hydro=4c8482ae6f68
+  warning: tile (-3,-5) contains a flat/basin 1003 m across, wider than the 960 m apron. Elevations still agree across the seam (the effect is sub-ULP, below the 100 mm wire LSB) but its ROUTING may not -- see pipeline.APRON_BLIND_SPOT.
+[6/6] baked (-3,-5) cpu=1074.2s water=0.639%wet max_catchment=145.2km2 incision_p99=25.00m channels=60091888 injected=285.7km2/Q2.02e+08m3yr@707mm qmax=2.26e+08 drawnpad=428837 basin=1.5%/40m bridge=22474@0.24m settle=1717593/3r-1661923dr-42255bud mono=1904>0 lvl=356701 span=107/35ha@20m basins_v2=404/10span heads=30293@5.3%u32 hydro=4c8482ae6f68
+Bake complete: baked=6 skipped=0 unencoded=0 total=6 incomplete_superblocks=0 stale_superblocks=0 cpu_seconds=7521.7

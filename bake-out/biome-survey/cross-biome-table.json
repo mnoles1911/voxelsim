@@ -1,0 +1,292 @@
+{
+ "beach": {
+  "per_ha": {
+   "canopy": 44.25048828125,
+   "small-tree": 40.8935546875,
+   "shrub": 514.83154296875,
+   "grass+gc": 2140.045166015625,
+   "flower": 445.556640625,
+   "rock": 477.294921875,
+   "reed": 921.0205078125
+  },
+  "top": [
+   [
+    "rubble-apron",
+    1793
+   ],
+   [
+    "dwarf-eelgrass",
+    1030
+   ],
+   [
+    "sea-lettuce",
+    940
+   ],
+   [
+    "gutweed",
+    920
+   ]
+  ]
+ },
+ "grassland": {
+  "per_ha": {
+   "canopy": 111.6943359375,
+   "small-tree": 89.111328125,
+   "shrub": 790.4052734375,
+   "grass+gc": 2043.304443359375,
+   "flower": 1850.5859375,
+   "rock": 9.613037109375,
+   "reed": 14.0380859375
+  },
+  "top": [
+   [
+    "meadow-grass",
+    1638
+   ],
+   [
+    "buffalo-grass",
+    1341
+   ],
+   [
+    "cocksfoot",
+    1232
+   ],
+   [
+    "little-bluestem",
+    1230
+   ]
+  ]
+ },
+ "temperate_forest": {
+  "per_ha": {
+   "canopy": 117.645263671875,
+   "small-tree": 124.20654296875,
+   "shrub": 1431.2744140625,
+   "grass+gc": 1521.759033203125,
+   "flower": 1435.24169921875,
+   "rock": 6.256103515625,
+   "reed": 0.0
+  },
+  "top": [
+   [
+    "butchers-broom",
+    2320
+   ],
+   [
+    "salal",
+    2058
+   ],
+   [
+    "meadow-grass",
+    1460
+   ],
+   [
+    "herb-robert",
+    1249
+   ]
+  ]
+ },
+ "temperate_forest-fine": {
+  "per_ha": {
+   "canopy": 67.7490234375,
+   "small-tree": 99.029541015625,
+   "shrub": 2056.732177734375,
+   "grass+gc": 669.5556640625,
+   "flower": 513.458251953125,
+   "rock": 1.983642578125,
+   "reed": 0.0
+  },
+  "top": [
+   [
+    "butchers-broom",
+    4762
+   ],
+   [
+    "salal",
+    4272
+   ],
+   [
+    "meadow-grass",
+    936
+   ],
+   [
+    "herb-robert",
+    777
+   ]
+  ]
+ },
+ "rainforest": {
+  "per_ha": {
+   "canopy": 56.304931640625,
+   "small-tree": 0.0,
+   "shrub": 986.328125,
+   "grass+gc": 3152.618408203125,
+   "flower": 725.860595703125,
+   "rock": 42.877197265625,
+   "reed": 0.0
+  },
+  "top": [
+   [
+    "jungle-groundcover",
+    9857
+   ],
+   [
+    "understory-fern",
+    8205
+   ],
+   [
+    "coffee-shrub",
+    3085
+   ],
+   [
+    "feather-moss",
+    2599
+   ]
+  ]
+ },
+ "desert": {
+  "per_ha": {
+   "canopy": 65.460205078125,
+   "small-tree": 6.256103515625,
+   "shrub": 1640.0146484375,
+   "grass+gc": 1231.689453125,
+   "flower": 560.760498046875,
+   "rock": 3.0517578125,
+   "reed": 0.457763671875
+  },
+  "top": [
+   [
+    "saltbush",
+    1860
+   ],
+   [
+    "big-sagebrush",
+    1833
+   ],
+   [
+    "dry-tussock",
+    1733
+   ],
+   [
+    "creosote-bush",
+    1465
+   ]
+  ]
+ },
+ "savanna": {
+  "per_ha": {
+   "canopy": 98.724365234375,
+   "small-tree": 44.708251953125,
+   "shrub": 742.034912109375,
+   "grass+gc": 2945.404052734375,
+   "flower": 1070.556640625,
+   "rock": 16.021728515625,
+   "reed": 117.034912109375
+  },
+  "top": [
+   [
+    "red-oat-grass",
+    6373
+   ],
+   [
+    "dry-tussock",
+    5038
+   ],
+   [
+    "buffalo-grass",
+    2449
+   ],
+   [
+    "devils-thorn",
+    2273
+   ]
+  ]
+ },
+ "taiga": {
+  "per_ha": {
+   "canopy": 125.1220703125,
+   "small-tree": 153.80859375,
+   "shrub": 1075.439453125,
+   "grass+gc": 2627.105712890625,
+   "flower": 806.121826171875,
+   "rock": 12.664794921875,
+   "reed": 0.0
+  },
+  "top": [
+   [
+    "reindeer-lichen",
+    3465
+   ],
+   [
+    "feather-moss",
+    3152
+   ],
+   [
+    "bilberry-mat",
+    2915
+   ],
+   [
+    "meadow-grass",
+    1481
+   ]
+  ]
+ },
+ "tundra_alpine": {
+  "per_ha": {
+   "canopy": 0.0,
+   "small-tree": 0.0,
+   "shrub": 892.02880859375,
+   "grass+gc": 2062.530517578125,
+   "flower": 285.0341796875,
+   "rock": 22.125244140625,
+   "reed": 390.472412109375
+  },
+  "top": [
+   [
+    "arctic-willow-thicket",
+    3303
+   ],
+   [
+    "crowberry-mat",
+    3254
+   ],
+   [
+    "reindeer-lichen",
+    2870
+   ],
+   [
+    "tussock-cottongrass",
+    2559
+   ]
+  ]
+ },
+ "alpine-lake": {
+  "per_ha": {
+   "canopy": 34.332275390625,
+   "small-tree": 28.38134765625,
+   "shrub": 769.805908203125,
+   "grass+gc": 679.168701171875,
+   "flower": 296.630859375,
+   "rock": 16.78466796875,
+   "reed": 29.296875
+  },
+  "top": [
+   [
+    "salal",
+    2235
+   ],
+   [
+    "herb-robert",
+    557
+   ],
+   [
+    "bramble-thicket",
+    464
+   ],
+   [
+    "meadow-grass",
+    449
+   ]
+  ]
+ }
+}

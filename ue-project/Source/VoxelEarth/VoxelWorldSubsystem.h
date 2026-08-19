@@ -30,6 +30,20 @@ struct FVoxelWorldImpl;
 // expecting class while parsing class", which does not name the real problem.
 namespace vxc { class IWaterSampler; }
 
+// --- TASK #7 (detail-asset rendering) hook: forward declarations only --------
+// Voxel-core types surfaced OPAQUELY to UVoxelDetailAssetSubsystem through the
+// three accessors below (same voxel-core-free-header doctrine, and the same
+// shape, as IWaterSampler above and GetFineTileStreamer's forward-declared
+// class). Must also stay above UCLASS() -- see the note above.
+namespace vxc
+{
+class AssetField;
+class IAssetBankSource;
+class Amplifier;
+class IAssetChannelSource;
+}
+// --- end TASK #7 hook --------------------------------------------------------
+
 UCLASS()
 class VOXELEARTH_API UVoxelWorldSubsystem : public UTickableWorldSubsystem
 {
@@ -248,6 +262,35 @@ public:
 	// declaration of a non-UObject class is invisible to UHT; the vxc types stay
 	// behind it in the .cpp that dereferences this.
 	class FVoxelFineTileStreamer* GetFineTileStreamer() const;
+
+	// --- TASK #7 (detail-asset rendering) hook: three read-only accessors ----
+	// EXISTS FOR ONE CALLER, UVoxelDetailAssetSubsystem, which renders the
+	// detail-lattice ground cover that voxel-core resolves and nothing draws
+	// (docs/asset-placement-audit.md section 5.3; docs/detail-asset-rendering.md).
+	// All three return nullptr until -VoxelAssetDir installed a field (or
+	// forever without one), which the caller treats as "nothing to render".
+	// Returned pointers are BORROWED, owned by FVoxelWorldImpl, valid while
+	// this subsystem is alive; the caller guarantees (via InitializeDependency
+	// + waiting out its worker jobs in its own Deinitialize) that no use
+	// outlives this subsystem. GetWorldgenAmplifier()->column() is safe from
+	// worker threads under exactly the meshing workers' contract: resident
+	// tiles only (the caller must gate on GetFineTileStreamer()'s
+	// IsFootprintResident, dilated by the layer table's reach, before letting
+	// a worker touch a footprint). Definitions live beside
+	// GetFineTileStreamer's in the .cpp.
+	const vxc::AssetField* GetAssetField() const;
+	const vxc::IAssetBankSource* GetAssetBankSource() const;
+	const vxc::Amplifier* GetWorldgenAmplifier() const;
+	// The engine's ONE placement-channel binding (bake-28 planes + rendered
+	// water datum + treeline; see FVoxelAssetChannelSource in the .cpp). Any
+	// consumer that resolves AssetField facts MUST compose channels from this
+	// source or its instance list drifts from what the meshers stamp -- the
+	// probe-vs-engine split of 2026-08-17. Null until a field AND the fine
+	// tier are installed; callers then pass default (sentinel) channels, which
+	// is the fail-closed world. NOT const: the binding decodes lazily behind
+	// its own lock. Thread-safe from workers (internally serialized).
+	vxc::IAssetChannelSource* GetAssetChannelSource() const;
+	// --- end TASK #7 hook ----------------------------------------------------
 
 	// True if the voxel at the given integer voxel-lattice coordinate is
 	// solid (overlay-aware World::materialAt != MAT_AIR -- edits are

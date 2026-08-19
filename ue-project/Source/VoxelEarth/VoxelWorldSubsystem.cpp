@@ -14,6 +14,7 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
+#include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
 #include "VoxelGI.h" // pooled-path light field ingest (the component path reaches it via SetChunkQuads)
 #include "VoxelMeshTypes.h"
@@ -41,6 +42,10 @@
 #include "Camera/PlayerCameraManager.h"
 #include "UnrealClient.h"
 
+#include "voxelcore/assetbank.h"     // v24/v25 asset term: the baked species banks
+#include "voxelcore/assetchannels.h" // ...the canonical channel binding (bake-28 planes + water datum)
+#include "voxelcore/assetfield.h"    // ...the layer table + species + policy, as one object
+#include "voxelcore/assetmanifest.h" // ...and the table asset-forge exports
 #include "voxelcore/bytes.h"
 // -VoxelCavernShot searches for natural cavern rooms via ColumnSample::cavern
 // (CavernSeg::marginSq); amplifier.h already pulls this in, included
@@ -772,6 +777,80 @@ struct FCoarseChunkGridSampler
 		{
 			PerfCounters->incColumnEvals(uint64_t(GridEdge) * GridEdge);
 		}
+
+		// --- COARSE ASSET COMPOSITION -----------------------------------
+		//
+		// Distant rings sample the generator at each coarse cell's
+		// REPRESENTATIVE level-0 coordinate; the asset term follows the same
+		// rule, which is what makes a tree at 1 km the same deterministic
+		// function of (seed, tiles) it is at 10 m -- nearest-neighbour
+		// sampled, not majority-eroded, exactly like the terrain around it.
+		// Until this existed, assets composed ONLY at level 0 and every tree
+		// vanished past RingPresets[0]'s 128 m: the "no trees at the alpine
+		// lake" report, 2026-08-17, after every level-0 stage had been
+		// measured healthy.
+		//
+		// The rect covers every rep coordinate this grid can sample (cells
+		// -1..ChunkVox on both axes); instancesForRect dilates by asset
+		// reach itself. PER-COLUMN SHORTLISTS, built instance-outward: a
+		// level-L chunk's dilated rect can hold thousands of instances (a
+		// square kilometre of forest at level 5), so a per-voxel walk of the
+		// full list would be dead on arrival. Each instance instead appends
+		// its index to the few grid columns whose rep coordinate its rotated
+		// XY box covers -- O(instances x cells-covered), and cells-covered
+		// SHRINKS with level (a 6 m crown is one cell at level 5) -- leaving
+		// operator() a 0-to-few walk.
+		if (const vxc::AssetField* AField = Gen.assetField(); AField != nullptr && !AField->empty())
+		{
+			const vxc::AssetVoxelRect ARect{GenT::coarseRep(BaseVX - 1, Level),
+			                                GenT::coarseRep(BaseVY - 1, Level),
+			                                GenT::coarseRep(BaseVX + ChunkVox, Level),
+			                                GenT::coarseRep(BaseVY + ChunkVox, Level)};
+			Resolved = AField->resolveForCompose(AField->instancesForRect(
+				ARect,
+				// Facts through the world's channel source (bake-28 planes +
+				// water datum + treeline), NOT the channel-less overload --
+				// the sentinel path is how riparians refused everywhere while
+				// the probe counted 3,870 of them (2026-08-17).
+				[&Amp, &Gen](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY),
+					                                       Gen.assetChannelsAt(AVX, AVY));
+				},
+				/*terrainOnly*/ true));
+			if (!Resolved.empty())
+			{
+				ColShortlist.SetNum(GridEdge * GridEdge);
+				const int64 Scale = int64(1) << Level;
+				for (int32 I = 0; I < int32(Resolved.size()); ++I)
+				{
+					const auto& R = Resolved[I];
+					const int64 MinVx = R.anchorVx + R.grid->rotatedOriginX(R.yawQuarter);
+					const int64 MinVy = R.anchorVy + R.grid->rotatedOriginY(R.yawQuarter);
+					const int64 MaxVx = MinVx + R.grid->rotatedSizeX(R.yawQuarter) - 1;
+					const int64 MaxVy = MinVy + R.grid->rotatedSizeY(R.yawQuarter) - 1;
+					// Level-L cells whose rep coordinate falls inside the box:
+					// rep(c) = c*Scale + Scale/2, so invert around the box edges
+					// and clamp to this grid.
+					const int64 C0x = FMath::Max<int64>(vxc::floorDiv(MinVx - Scale / 2, Scale), BaseVX - 1);
+					const int64 C1x = FMath::Min<int64>(vxc::floorDiv(MaxVx - Scale / 2, Scale) + 1, BaseVX + ChunkVox);
+					const int64 C0y = FMath::Max<int64>(vxc::floorDiv(MinVy - Scale / 2, Scale), BaseVY - 1);
+					const int64 C1y = FMath::Min<int64>(vxc::floorDiv(MaxVy - Scale / 2, Scale) + 1, BaseVY + ChunkVox);
+					for (int64 Cy2 = C0y; Cy2 <= C1y; ++Cy2)
+					{
+						const int64 RepY = GenT::coarseRep(Cy2, Level);
+						if (RepY < MinVy || RepY > MaxVy) { continue; }
+						for (int64 Cx2 = C0x; Cx2 <= C1x; ++Cx2)
+						{
+							const int64 RepX = GenT::coarseRep(Cx2, Level);
+							if (RepX < MinVx || RepX > MaxVx) { continue; }
+							ColShortlist[int32(Cx2 - BaseVX) + 1 + GridEdge * (int32(Cy2 - BaseVY) + 1)]
+							    .Add(uint16(I));
+						}
+					}
+				}
+			}
+		}
 	}
 
 	vxc::MaterialId operator()(int64 X, int64 Y, int64 Z) const
@@ -779,13 +858,49 @@ struct FCoarseChunkGridSampler
 		const int32 LX = int32(X - BaseVX) + 1;
 		const int32 LY = int32(Y - BaseVY) + 1;
 		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-		return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+		const vxc::MaterialId M =
+			vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+		// AIR ONLY, the same monotone rule as every other compose site; the
+		// shortlist holds the 0-to-few instances whose box covers this
+		// column's rep coordinate, in resolveForCompose order, so
+		// first-non-air-wins picks the same winner level 0 would.
+		if (M == vxc::MAT_AIR && ColShortlist.Num() > 0)
+		{
+			const TArray<uint16, TInlineAllocator<2>>& Short = ColShortlist[LX + GridEdge * LY];
+			if (Short.Num() > 0)
+			{
+				const int64 RepX = GenT::coarseRep(X, Level);
+				const int64 RepY = GenT::coarseRep(Y, Level);
+				const int64 RepZ = GenT::coarseRep(Z, Level);
+				for (const uint16 I : Short)
+				{
+					const auto& R = Resolved[I];
+					const int64 Rx = RepX - R.anchorVx - int64(R.grid->rotatedOriginX(R.yawQuarter));
+					const int64 Ry = RepY - R.anchorVy - int64(R.grid->rotatedOriginY(R.yawQuarter));
+					const int64 Rz = RepZ - R.anchorVz - int64(R.grid->originZ());
+					if (Rx < INT32_MIN || Rx > INT32_MAX || Ry < INT32_MIN || Ry > INT32_MAX ||
+					    Rz < INT32_MIN || Rz > INT32_MAX)
+					{
+						continue;
+					}
+					const vxc::MaterialId AM = R.grid->atYaw(
+						int32(Rx), int32(Ry), int32(Rz), R.yawQuarter);
+					if (AM != vxc::MAT_AIR)
+					{
+						return AM;
+					}
+				}
+			}
+		}
+		return M;
 	}
 
 	int32 Level;
 	int64 BaseVX;
 	int64 BaseVY;
 	TArray<vxc::ColumnSample> Columns;
+	std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
+	TArray<TArray<uint16, TInlineAllocator<2>>> ColShortlist;
 };
 
 // Field-by-field quad equality for -VoxelCoarseGridVerify. Compares the emitted
@@ -1207,6 +1322,16 @@ struct FChunkRecord
 	uint64 GenerationId = 1;
 
 	bool bJobInFlight = false;
+
+	// Set when a GPU mesh job for this chunk failed (timeout, device error):
+	// the retry must go to the CPU worker, not back to the fork that just
+	// failed it. Under readback saturation a GPU retry re-fails the same way
+	// every 10 s window and the chunk stays a hole indefinitely -- measured
+	// 2026-08-17, 248 chunks delivered EMPTY by timeout in one settle. Cleared
+	// never: one failure is enough evidence for this chunk this session, and
+	// the cost of being wrong is one chunk meshed on the slower-but-correct
+	// path.
+	bool bNoGpuRetry = false;
 
 	// --- Chunk-state debug tint bookkeeping (docs/debug-tooling-plan.md P1,
 	// mode 2 + voxel.Debug.ChunkStates) -- all in FVoxelWorldImpl::ElapsedSeconds
@@ -1909,6 +2034,38 @@ bool L0GridVerifyEnabled()
 std::atomic<int64> GL0GridVerifyChecked{0};
 std::atomic<int64> GL0GridVerifyMismatches{0};
 
+// Mesher-side asset resolve accounting -- see the fetch_add site in the level-0
+// job for why the bank tap cannot answer this question any more.
+std::atomic<uint64> GMesherChunksComposed{0};       // level-0 jobs that ran the resolve at all
+std::atomic<uint64> GMesherChunksWithInstances{0};  // ...and got >= 1 terrain instance
+std::atomic<uint64> GMesherInstancesResolved{0};    // total instances across them
+// Per layer, because the aggregate hid a whole missing layer at the alpine
+// lake: shrubs (L2) rendered while canopy (L1) never reached pixels, and the
+// combined count looked healthy throughout. Index = AssetLayer index; [3] is
+// unused (detail never survives resolveForCompose) but sized to the constant
+// so a layer-table change cannot write past it.
+std::atomic<uint64> GMesherInstancesByLayer[vxc::kAssetLayerCount] = {};
+// Tallest resolved grid seen, in voxels -- separates "no tall instances reach
+// the mesher" from "tall instances arrive and vanish later".
+std::atomic<uint64> GMesherTallestGridVox{0};
+// Exact admission's own accounting: of the level-0 footprints that ran the
+// z-range, how many found instances and how many actually RAISED the range
+// above the terrain answer. Near-zero raises beside hundreds of thousands of
+// mesher-side instances = crown chunks are never admitted and the mesher only
+// ever sees the surface slice of every tall tree.
+std::atomic<uint64> GAdmitFootprints{0};
+std::atomic<uint64> GAdmitFootprintsWithInstances{0};
+std::atomic<uint64> GAdmitFootprintsRaised{0};
+// The last two gates a crown chunk can die at. A CROWN chunk here means a
+// level-0 CPU job whose interior starts above every terrain column top in its
+// own grid AND whose resolved list is non-empty -- i.e. the only thing it can
+// possibly contain is asset voxels. If band skips dwarf crown meshes, the
+// dispatch skip is eating them; if crown chunks mesh but produce zero quads,
+// the sampler/mesher is; if they produce quads, the loss is apply/draw side.
+std::atomic<uint64> GBandSkipAirL0{0};        // level-0 air-skips by BandProvesChunkEmpty (dispatch site)
+std::atomic<uint64> GCrownChunksMeshed{0};    // CPU crown chunks that ran MeshChunkBricks
+std::atomic<uint64> GCrownChunksWithQuads{0}; // ...and produced >= 1 quad
+
 // Cross-job level-0 column-grid cache: MEASUREMENT ONLY, and deliberately so.
 //
 // A level-0 job's 34x34 grid depends only on the footprint (X,Y) -- the whole
@@ -2582,6 +2739,134 @@ static FString JoinPerLevel(FormatOneLevelFn&& FormatOneLevel)
 	return Out;
 }
 
+// ---------------------------------------------------------------------------
+// FVoxelAssetChannelSource -- the ENGINE'S instance of the canonical channel
+// binding (assetchannels.h::assetColumnChannelsAt), installed into the world
+// via vxc::World::setAssetChannelSource so every composition path -- the
+// level-0 GridSampler, FCoarseChunkGridSampler, SubmitGpuMeshJob's resolve,
+// exact admission's z-range resolve, GeneratedWorld's makeBrick/materialAt and
+// the detail-asset resolver -- reads the SAME bake-28 placement planes and the
+// SAME composed lake/river water datum the census probe (vxc_assetprobe) and
+// the renderer read.
+//
+// WHY IT EXISTS (the owner-visible defect of 2026-08-17): item 1 of the
+// placement audit landed the planes, the binding and the probe -- but every
+// engine composition site kept calling the channel-less
+// assetColumnFactsFromSample overload. The probe censused 3,870 riparian
+// instances and 0 submerged anchors at the alpine lake while the ENGINE
+// composed the sentinel world at the same coordinates: riparians refused
+// everywhere (distance unknown fails closed), the standing-water veto inert
+// (no datum served), the treeline/TWI/talus/heat multipliers neutral. The
+// "identical" finale capture after the bake-28 re-bake was this file, not the
+// bake.
+//
+// WHY IT OWNS A SECOND FineTileSampler rather than borrowing the streamer's:
+// the same reasoning as FLakeWaterSampler in VoxelWaterSubsystem.cpp (which
+// this class deliberately mirrors) -- the streamer's sampler is private
+// behind an FRWLock whose shared side is only sound because elevation blocks
+// are fully prewarmed at load, and the placement planes and water rows are
+// NOT in that prewarm set: a lazy placement decode under the shared lock
+// would be a data race. The duplication is cheap for the same reason it is
+// there: lazy per-block decode means this holds the placement planes and the
+// water rows actually touched, not the 134 MB elevation lattice.
+//
+// THREADING: one critical section serializes every query -- the documented
+// "prewarm-then-share, or serialize" contract of FineTileSampler, chosen as
+// "serialize" because callers are the per-chunk instancesForRect resolves
+// (dozens of channel reads per chunk, each a hash probe + array read once
+// decoded), not per-voxel paths. Called from meshing workers, the game
+// thread's admission pass and the detail-resolve workers alike. Tile file
+// loads happen inside the lock on first touch, exactly as FLakeWaterSampler
+// loads on the game thread; a missing tile stays missing (one stat per tile
+// per session) and its channels stay at the fail-closed sentinels.
+//
+// DETERMINISM: every answer is a pure function of (seed, tile bytes) at the
+// anchor -- the water sampler stays in its baked configuration (no ledger, no
+// retire-baked-rivers presentation toggle; CompositeWaterSampler composed
+// exactly as the probe composes it), which is what assetchannels.h requires
+// of placement reads.
+class FVoxelAssetChannelSource final : public vxc::IAssetChannelSource
+{
+public:
+	FVoxelAssetChannelSource(uint64 InSeed, FString InRoot, std::string InProviderId,
+	                         vxc::ITileSampler* InClimate)
+		: Tiles(InSeed, InClimate)
+		, Lakes(Tiles)
+		, Rivers(Tiles)
+		, Water(Lakes, Rivers)
+		, Climate(InClimate)
+		, Root(MoveTemp(InRoot))
+		, ProviderId(MoveTemp(InProviderId))
+	{
+		Tiles.setDecompressor(VoxelEarth::GetFineTileDecompressor());
+	}
+
+	vxc::AssetColumnChannels channelsAt(int64_t Vx, int64_t Vy) override
+	{
+		FScopeLock Guard(&Lock);
+		EnsureTileFor(Vx, Vy);
+		return vxc::assetColumnChannelsAt(&Tiles, &Water, Climate, Vx, Vy);
+	}
+
+	uint64 TilesLoaded() const { return Loaded; }
+	uint64 TilesRefused() const { return Refused; }
+
+private:
+	// Same shape as FLakeWaterSampler::EnsureTileFor: load-on-first-touch,
+	// remember absence, warn once on refused bytes (a refused tile's channels
+	// read as sentinels, which on screen is "no riparians here" -- worth a log
+	// line, never a silent shrug). Caller holds Lock.
+	void EnsureTileFor(int64_t Vx, int64_t Vy)
+	{
+		const vxc::TileCoord T = FVoxelFineTileStreamer::CoarseTileForWorldMm(
+			Vx * vxc::kVoxelSizeMm, Vy * vxc::kVoxelSizeMm);
+		if (Tiles.findTile(T.x, T.y) != nullptr)
+		{
+			return;
+		}
+		const uint64 Key = (uint64(uint32(T.x)) << 32) | uint64(uint32(T.y));
+		if (Missing.Contains(Key))
+		{
+			return;
+		}
+		const std::string CacheKey = vxc::formatFineTileCacheKey(ProviderId, Tiles.seed(), T.x, T.y);
+		const FString Path = FPaths::Combine(Root, FString(CacheKey.c_str()) + TEXT(".vxtl"));
+		vxc::FineError Err = vxc::FineError::kNone;
+		if (!Tiles.loadTileFile(std::filesystem::path(*Path), &Err))
+		{
+			Missing.Add(Key);
+			if (Err != vxc::FineError::kFileUnreadable)
+			{
+				++Refused;
+				UE_LOG(LogVoxelEarth, Warning,
+				       TEXT("Asset channels: fine tile (%d,%d) at %s was REFUSED (%s). Placement "
+				            "channels stay at fail-closed sentinels there (no riparians, no "
+				            "standing-water veto)."),
+				       T.x, T.y, *Path, ANSI_TO_TCHAR(vxc::fineErrorName(Err)));
+			}
+			return;
+		}
+		++Loaded;
+	}
+
+	FCriticalSection Lock;
+	// DECLARATION ORDER IS LOAD-BEARING, exactly as in FLakeWaterSampler:
+	// Lakes and Rivers borrow Tiles, Water borrows both.
+	vxc::FineTileSampler Tiles;
+	vxc::LakeSampler Lakes;
+	vxc::RiverSampler Rivers;
+	vxc::CompositeWaterSampler Water;
+	// The coarse climate tier -- the same sampler the amplifier's climate
+	// delegates to, so the treeline placement positions is the treeline the
+	// biome gate reads. Borrowed; FVoxelWorldImpl::Tiles outlives this member.
+	vxc::ITileSampler* Climate;
+	FString Root;
+	std::string ProviderId;
+	TSet<uint64> Missing;
+	uint64 Loaded = 0;
+	uint64 Refused = 0;
+};
+
 struct FVoxelWorldImpl
 {
 	// Track B2: TileDir/TileScale select the tile source (see MakeTileSampler
@@ -2630,6 +2915,181 @@ struct FVoxelWorldImpl
 			// bUsingTileGrid being true is exactly MakeTileSampler's own
 			// guarantee that Tiles.get() really does point at a TileGridSampler.
 			GridTiles = static_cast<vxc::TileGridSampler*>(Tiles.get());
+		}
+
+		// --- the asset term ------------------------------------------------
+		//
+		// Opt-in, and it REFUSES RATHER THAN DEGRADES. Every failure below
+		// leaves the field uninstalled, which composes as the pre-v24 world --
+		// the one outcome that cannot silently produce wrong terrain. A
+		// half-loaded manifest would be worse than none, which is why
+		// AssetManifest::parse "never partially fills".
+		{
+			FString AssetDir;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelAssetDir="), AssetDir) && !AssetDir.IsEmpty())
+			{
+				const FString ManifestPath = FPaths::Combine(AssetDir, TEXT("species.vxm"));
+				TArray<uint8> Blob;
+				if (!FFileHelper::LoadFileToArray(Blob, *ManifestPath))
+				{
+					UE_LOG(LogVoxelEarth, Error,
+					       TEXT("VoxelAssets: could not read %s -- the asset term stays OFF and this run "
+					            "generates the pre-v24 world."), *ManifestPath);
+				}
+				else
+				{
+					const vxc::AssetManifestError Err =
+						AssetManifestData.parse(Blob.GetData(), size_t(Blob.Num()));
+					if (Err != vxc::AssetManifestError::kOk)
+					{
+						UE_LOG(LogVoxelEarth, Error,
+						       TEXT("VoxelAssets: %s REFUSED: %s. The asset term stays OFF."),
+						       *ManifestPath, UTF8_TO_TCHAR(vxc::assetManifestErrorText(Err)));
+					}
+					else
+					{
+						// The fold counts everything it drops, and those counts
+						// are logged rather than summed away: "438 kept" means
+						// nothing without the 382 detail entities beside it.
+						const vxc::AssetTableBuildStats Stats =
+							vxc::assetSpeciesTableFromManifest(AssetManifestData, AssetSpeciesTable);
+						AssetBanks.configure(&AssetManifestData, TCHAR_TO_UTF8(*FPaths::Combine(AssetDir, TEXT("banks"))));
+						// TIGHTEN BEFORE INSTALL, never after: every bound downstream
+						// is made of these caps, so the field must never see the
+						// authored ones. vxc_assetprobe calls the same function for
+						// the same reason -- see assetTightenLayerCaps.
+						AssetLayersTightened = AssetManifestData.layers();
+						vxc::assetTightenLayerCaps(AssetManifestData, AssetLayersTightened);
+						for (size_t Li = 0; Li < AssetLayersTightened.size(); ++Li)
+						{
+							const vxc::AssetLayer& Authored = AssetManifestData.layers()[Li];
+							if (!Authored.terrainLattice) { continue; }
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: layer L%d cap %d -> %d mm (tallest baked occupant)."),
+							       int(Li), Authored.maxHeightMm, AssetLayersTightened[Li].maxHeightMm);
+						}
+						AssetFieldObj.setLayers(AssetLayersTightened.data(),
+						                        int(AssetLayersTightened.size()));
+						AssetFieldObj.setSpecies(AssetSpeciesTable.data(), int(AssetSpeciesTable.size()));
+						AssetBankTap.Inner = &AssetBanks;
+						AssetBankTap.Resize(AssetManifestData.species().size());
+						AssetFieldObj.setBankSource(&AssetBankTap);
+						AssetFieldObj.setSeed(Seed);
+						if (AssetFieldObj.empty())
+						{
+							UE_LOG(LogVoxelEarth, Error,
+							       TEXT("VoxelAssets: field is empty after load (layers %d, species %d) -- "
+							            "NOT installed."),
+							       int(AssetManifestData.layers().size()), int(AssetSpeciesTable.size()));
+						}
+						else
+						{
+							// LOAD ONE BANK AT INSTALL, and it is not a warm-up.
+							// The counters below only move if something ASKS the
+							// library for a grid, so a run that composes nothing
+							// and a run that composes everything both report
+							// zeros at startup and are indistinguishable. Forcing
+							// one species proves the banks on disk are readable
+							// HERE, in this process, separating "the bank path is
+							// broken" from "nothing ever called it" -- which is
+							// exactly the distinction a silent no-op hides.
+							// Through the MANIFEST, not the folded table: seedsBaked
+							// is a fact about the files on disk and lives on
+							// AssetManifestSpecies. AssetSpecies is the
+							// policy-side row and carries only what placement
+							// needs -- bankId, layer, weights, bands. The bankId
+							// IS the manifest index, which is what makes the probe
+							// below address the same species the field would.
+							int Probe = -1;
+							const auto& MSpecies = AssetManifestData.species();
+							for (size_t i = 0; i < MSpecies.size(); ++i)
+							{
+								if (MSpecies[i].seedsBaked > 0 && MSpecies[i].terrainLattice)
+								{
+									Probe = AssetBanks.loadSpecies(uint16_t(i));
+									break;
+								}
+							}
+							// See AssetTallestTerrainVox's declaration: the streaming
+							// bound must come from what the library BAKES, not from
+							// what the layer permits.
+							int64 TallestMm = 0;
+							for (const auto& S : MSpecies)
+							{
+								if (S.seedsBaked > 0 && S.terrainLattice && S.heightMm > TallestMm)
+								{
+									TallestMm = S.heightMm;
+								}
+							}
+							int64 CapMm = 0;
+							for (const vxc::AssetLayer& L : AssetManifestData.layers())
+							{
+								if (L.terrainLattice && L.maxHeightMm > CapMm) { CapMm = L.maxHeightMm; }
+							}
+							// A manifest that reports no heights at all is stale, not
+							// empty: fall back to the cap rather than silently bound
+							// the world at zero and punch holes through every crown.
+							const int64 UseMm = (TallestMm > 0) ? FMath::Min(TallestMm, CapMm) : CapMm;
+							AssetTallestTerrainVox =
+								(UseMm > 0) ? (vxc::floorDiv(UseMm, int64(vxc::kVoxelSizeMm)) + 1) : 0;
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: tallest baked terrain-lattice asset %lld mm "
+							            "(layer cap %lld mm) -> streaming bound widened by %lld voxels "
+							            "(%.1f level-0 chunk layers). The CAP would have cost %lld."),
+							       (long long)TallestMm, (long long)CapMm,
+							       (long long)AssetTallestTerrainVox,
+							       double(AssetTallestTerrainVox) / double(VoxelCoords::ChunkEdgeVoxels),
+							       (long long)(CapMm > 0 ? vxc::floorDiv(CapMm, int64(vxc::kVoxelSizeMm)) + 1 : 0));
+							Voxels.setAssetField(&AssetFieldObj);
+							// THE CHANNEL BINDING RIDES WITH THE FIELD (see
+							// FVoxelAssetChannelSource). Installed here, in bring-up,
+							// before any worker reads -- the same narrow-door rule as
+							// setAssetField itself. Without the fine tier there are no
+							// planes and no baked water datum to serve, so the source
+							// stays null and the channels stay sentinels: the
+							// fail-closed world, stated out loud rather than silently
+							// reproduced.
+							if (!FineTileDir.IsEmpty())
+							{
+								AssetChannels = MakeUnique<FVoxelAssetChannelSource>(
+									Seed, FineTileDir,
+									std::string(TCHAR_TO_UTF8(*FineProviderId)), Tiles.get());
+								Voxels.setAssetChannelSource(AssetChannels.Get());
+								UE_LOG(LogVoxelEarth, Log,
+								       TEXT("VoxelAssets: channel binding INSTALLED over %s "
+								            "(placement planes + lake/river datum + treeline). "
+								            "Riparian gate and standing-water veto are LIVE where "
+								            "bake_ver >= 28 tiles are resident."),
+								       *FineTileDir);
+							}
+							else
+							{
+								UE_LOG(LogVoxelEarth, Warning,
+								       TEXT("VoxelAssets: NO -VoxelFineTileDir, so no placement "
+								            "channels -- riparian species refuse everywhere and the "
+								            "standing-water veto is inert (fail-closed sentinels)."));
+							}
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: INSTALLED from %s -- %d layers, %d species placeable "
+							            "(%d detail entities, %d too rare, %d no biome, %d without banks). "
+							            "kWorldGenVersion = %u."),
+							       *AssetDir, int(AssetManifestData.layers().size()), Stats.kept,
+							       Stats.detailEntities, Stats.tooRare, Stats.noBiome, Stats.withoutBanks,
+							       vxc::kWorldGenVersion);
+							const vxc::AssetBankLibrary::Stats B = AssetBanks.stats();
+							UE_LOG(LogVoxelEarth, Log,
+							       TEXT("VoxelAssets: bank probe loaded %d seed grid(s); library so far "
+							            "%llu requests, %llu served, %llu files, %llu refused, %llu bytes. "
+							            "IF 'requests' IS STILL ~0 AFTER THE WORLD STREAMS, NOTHING IS "
+							            "COMPOSING ASSETS -- the field is installed but no generation path "
+							            "is asking it."),
+							       Probe, (unsigned long long)B.requests, (unsigned long long)B.servedGrids,
+							       (unsigned long long)B.filesLoaded, (unsigned long long)B.filesRefused,
+							       (unsigned long long)B.bytesResident);
+						}
+					}
+				}
+			}
 		}
 
 		// "Admit everything at this level" sentinel. Set by loop rather than by a
@@ -2718,6 +3178,218 @@ struct FVoxelWorldImpl
 	// pointer, and the streamer borrows Tiles as its climate source. Tiles ->
 	// FineStreamer -> Voxels is the only order in which all three are valid.
 	TUniquePtr<FVoxelFineTileStreamer> FineStreamer;
+
+	// THE ASSET TERM (worldgen v24/v25), and it is DECLARED HERE FOR THE SAME
+	// REASON THE Tiles/FineStreamer/Voxels ORDER ABOVE IS LOAD-BEARING.
+	//
+	// Members are destroyed in REVERSE declaration order, so everything the
+	// world borrows must be declared BEFORE it. `Voxels` holds a raw
+	// `const AssetField*`; the field holds a raw `const IAssetBankSource*`; and
+	// `AssetBankLibrary::configure` documents that "manifest must outlive this
+	// library". The chain is therefore manifest -> banks -> species -> field ->
+	// Voxels, and reordering any pair of these lines is a use-after-free that
+	// would show up as wrong voxels rather than as a crash.
+	//
+	// ALL FOUR ARE INERT UNLESS -VoxelAssetDir IS PASSED. assetfield.h's own
+	// contract: "a world with no AssetField is exactly the world that exists
+	// today, bit for bit, which is what keeps every existing golden and the
+	// worldgen digest valid until the field is deliberately switched on." The
+	// constructor below installs nothing without the switch, so this commit
+	// cannot move a single voxel on any existing run -- the same opt-in shape
+	// as TileDir and FineTileDir above, deliberately.
+	vxc::AssetManifest AssetManifestData;
+	vxc::AssetBankLibrary AssetBanks;
+
+	// THE TALLEST ASSET THAT ACTUALLY EXISTS, in level-0 voxels above its anchor,
+	// and it is NOT the layer cap.
+	//
+	// AssetLayer::maxHeightMm is a CONTRACT with the bake step, deliberately
+	// generous: 60 m on L0, 34 m on L1. The tallest thing the library actually
+	// bakes is a ~17 m cecropia. Both the streaming z-range and the brick skip
+	// need "how much solid can stand above this ground", and taking that from the
+	// cap instead of from the bake costs 600 voxels of empty sky per footprint --
+	// ~18 extra level-0 chunk layers, on rings where the sky-band trim's analytic
+	// bound does NOT bind (levels 0-1) and so cannot claw it back.
+	//
+	// THIS IS THE BUG THAT MADE THE FIRST TREE SCREENSHOTS LOOK BROKEN, 2026-08-17.
+	// Measured, same pose and seed, only -VoxelAssetDir differing: assets OFF
+	// settled at 41,069 chunks / 33.4M quads with an empty queue; assets ON was
+	// still at 2,228 chunks / 1.8M quads with 96 jobs in flight and ~1,600
+	// pending when the shutter fired. The picture was a 5%-loaded world, and it
+	// read exactly like broken geometry -- ground missing, trunks cut off,
+	// foliage floating in the few chunks that happened to be resident. Nothing
+	// was wrong with placement, composition or meshing.
+	//
+	// Read from the manifest, which is the same authority assetLayerAdmitsHeight
+	// validates the bake against, and restricted to terrainLattice species with
+	// seedsBaked > 0 for parity with the two call sites. Still clamped to the
+	// layer cap: this may only ever TIGHTEN the old bound, never widen it, so the
+	// safe direction (too many chunks) stays the failure mode if the manifest is
+	// stale. Zero means "no asset field installed" and both call sites add nothing.
+	//
+	// Used by SkipBrick only. The streaming z-range takes the PER-FOOTPRINT
+	// assetTopAboveSurfaceMm instead: measured over 63,001 footprints, that gives
+	// 89.2% of them the L1 cap (25 m) rather than this global 45 m maximum, and
+	// the z-range is memoized per footprint so it can afford the query. SkipBrick
+	// runs 64 times per chunk on a worker and cannot.
+	int64 AssetTallestTerrainVox = 0;
+
+	// The layer table the FIELD sees: manifest caps lowered to each layer's
+	// tallest baked occupant. Must outlive AssetFieldObj (setLayers copies, but
+	// this is the authored-vs-installed seam and it should be inspectable).
+	std::vector<vxc::AssetLayer> AssetLayersTightened;
+
+	// Decoded span tables for the GPU asset stamp, keyed by grid pointer --
+	// stable for the process lifetime (AssetBankLibrary holds each grid in a
+	// unique_ptr it never frees). Built once per grid by columnRuns, reused by
+	// every GPU job that stamps an instance of it; the per-job upload is a
+	// concat of references into these. Game thread only, like every other
+	// streaming structure on Impl.
+	struct FGpuAssetGridSpans
+	{
+		TArray<uint32> ColStarts;   // SizeX*SizeY+1 prefix offsets into Spans
+		TArray<uint32> Spans;       // z0:12 | len:12 | mat:8, non-air runs only
+		int32 SizeX = 0, SizeY = 0, SizeZ = 0;
+		int32 OriginZ = 0;
+		bool bTooTall = false;      // SizeZ > 4095: cannot pack; CPU meshes it
+	};
+	TMap<const vxc::AssetGrid*, FGpuAssetGridSpans> GpuAssetSpanCache;
+
+	const FGpuAssetGridSpans& GpuSpansForGrid(const vxc::AssetGrid* Grid)
+	{
+		if (FGpuAssetGridSpans* Hit = GpuAssetSpanCache.Find(Grid))
+		{
+			return *Hit;
+		}
+		FGpuAssetGridSpans& S = GpuAssetSpanCache.Add(Grid);
+		S.SizeX = Grid->sizeX();
+		S.SizeY = Grid->sizeY();
+		S.SizeZ = Grid->sizeZ();
+		S.OriginZ = Grid->originZ();
+		if (S.SizeZ > 4095)
+		{
+			// 409 m; nothing baked approaches it. Refusing here routes the
+			// chunk to the CPU mesher rather than truncating a hole into the
+			// top of the asset.
+			S.bTooTall = true;
+			return S;
+		}
+		S.ColStarts.Reserve(S.SizeX * S.SizeY + 1);
+		for (int32 X = 0; X < S.SizeX; ++X)
+		{
+			for (int32 Y = 0; Y < S.SizeY; ++Y)
+			{
+				S.ColStarts.Add(uint32(S.Spans.Num()));
+				Grid->columnRuns(X, Y, [&S](int32 Z0, int32 Len, vxc::MaterialId Mat)
+				{
+					if (Mat == vxc::MAT_AIR)
+					{
+						return;
+					}
+					// Long runs split at the 12-bit length limit rather than
+					// refused -- len is bounded by SizeZ <= 4095 anyway, but
+					// the loop keeps the packing honest by construction.
+					int32 Z = Z0, Remaining = Len;
+					while (Remaining > 0)
+					{
+						const int32 Take = FMath::Min(Remaining, 4095);
+						S.Spans.Add((uint32(Z) << 20) | (uint32(Take) << 8) | uint32(Mat));
+						Z += Take;
+						Remaining -= Take;
+					}
+				});
+			}
+		}
+		S.ColStarts.Add(uint32(S.Spans.Num()));
+		return S;
+	}
+
+	// How much a TERRAIN-ONLY band extremum must rise before it may claim
+	// emptiness for this footprint, in level-0 voxels. Zero without an asset
+	// field. The GPU band producers reduce ground columns in HLSL and know
+	// nothing about assets, so their MaxSurfaceTopVoxel arrives here as a
+	// terrain number; consuming it unraised re-opens the deleted-treetop bug
+	// the CPU band path closes exactly (see the band raise in the level-0
+	// job). Cap-based rather than exact -- the game thread has no resolved
+	// instance list at the GPU completion sites -- which errs the safe way:
+	// a raise too large only forfeits skips.
+	int64 AssetBandRaiseVox(int32 ChunkX, int32 ChunkY, int32 Level = 0) const
+	{
+		const vxc::AssetField* Field = Voxels.assetField();
+		if (Field == nullptr || Field->empty())
+		{
+			return 0;
+		}
+		// At Level > 0 the chunk coordinate is a level-L one and the rect must
+		// span the whole level-0 footprint beneath it -- a corner sub-chunk
+		// check would let the GPU fork take a coarse chunk whose OTHER corner
+		// holds a forest.
+		const int64 ChunkVox = int64(VoxelCoords::ChunkEdgeVoxels) << FMath::Clamp(Level, 0, 5);
+		const vxc::AssetVoxelRect Rect{int64(ChunkX) * ChunkVox, int64(ChunkY) * ChunkVox,
+		                               int64(ChunkX) * ChunkVox + ChunkVox - 1,
+		                               int64(ChunkY) * ChunkVox + ChunkVox - 1};
+		const int32 TopMm = vxc::assetTopAboveSurfaceMm(
+			Field->seed(), Field->layers().data(), int(Field->layers().size()), Rect);
+		return (TopMm > 0) ? (vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1) : 0;
+	}
+
+	// WHICH SPECIES ARE ACTUALLY COMPOSING, and it is a decorator so voxel-core
+	// needs no change to answer it.
+	//
+	// 2026-08-16 left one number unexplained: UE loaded 20-28 bank files (5-7
+	// species) at bare rock, at 1645 m alpine and in rainforest alike, where the
+	// census reports 144-196 on the same ground. A count cannot say WHICH
+	// species, and "seven of them" and "the same seven everywhere" are different
+	// bugs with different fixes. This records the bankId of every request, so the
+	// histogram can be compared against vxc_assetprobe's species list directly.
+	//
+	// It forwards every call unchanged and adds one array increment, so an
+	// instrumented run composes the same world as an uninstrumented one.
+	// THREAD-SAFE BY CONSTRUCTION, AND IT HAD TO BE LEARNED THE HARD WAY.
+	//
+	// The first version used a TMap and crashed the moment the level-0 sampler
+	// started composing assets: `meshBrick` runs on worker tasks, so bankGrid is
+	// called concurrently from many threads and TMap::FindOrAdd is not safe.
+	// UE asserted inside TSparseArrayBase::AddUninitialized. The instrument
+	// added to find a bug destroyed the fix for it.
+	//
+	// A flat atomic array indexed by bankId cannot reallocate, cannot rehash and
+	// needs no lock. Relaxed ordering: these are diagnostics read once a second
+	// by the game thread, and a counter that is a few increments stale tells the
+	// same story.
+	struct FCountingBankSource final : public vxc::IAssetBankSource
+	{
+		const vxc::IAssetBankSource* Inner = nullptr;
+		mutable std::vector<std::atomic<uint64_t>> Hits;
+		mutable std::atomic<uint64_t> Total{0};
+		mutable std::atomic<uint64_t> NullAnswers{0};
+
+		void Resize(size_t SpeciesCount) { Hits = std::vector<std::atomic<uint64_t>>(SpeciesCount); }
+
+		const vxc::AssetGrid* bankGrid(uint16_t BankId, uint16_t SeedIndex) const override
+		{
+			Total.fetch_add(1, std::memory_order_relaxed);
+			if (BankId < Hits.size())
+			{
+				Hits[BankId].fetch_add(1, std::memory_order_relaxed);
+			}
+			const vxc::AssetGrid* G = Inner ? Inner->bankGrid(BankId, SeedIndex) : nullptr;
+			if (G == nullptr) { NullAnswers.fetch_add(1, std::memory_order_relaxed); }
+			return G;
+		}
+	};
+	FCountingBankSource AssetBankTap;
+	std::vector<vxc::AssetSpecies> AssetSpeciesTable;
+	vxc::AssetField AssetFieldObj;
+
+	// The engine's channel binding (see FVoxelAssetChannelSource above).
+	// DECLARED BEFORE Voxels for the same destruction-order reason the field
+	// chain above is: Voxels holds a raw IAssetChannelSource* into it, and the
+	// binding itself borrows Tiles (declared earlier still) as climate. Null
+	// whenever no field is installed or no fine tier is configured -- the
+	// channels then stay sentinels and composition reproduces the pre-channel
+	// world exactly.
+	TUniquePtr<FVoxelAssetChannelSource> AssetChannels;
 
 	vxc::World<VoxelCoords::BrickEdgeVoxels> Voxels;
 
@@ -5110,6 +5782,201 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// branch), so this pair is what tells us whether depth is costing RAM or
 	// merely bookkeeping + worker throughput. An O(tracked) scan at the periodic
 	// 5s log cadence only; never per-frame.
+	// THE ASSET TERM'S ONE HONEST QUESTION: is anything asking for it?
+	//
+	// A field can be installed, its manifest valid and its banks readable, and
+	// still no generation path may ever call bankGrid -- in which case the world
+	// renders exactly as it did before and NOTHING reports a fault. That is what
+	// happened on 2026-08-16: 117,006 instances resolved on this ground by
+	// vxc_assetprobe, the field logged INSTALLED, and the capture was
+	// indistinguishable from its own control at the pixel level. `requests` is
+	// the number that separates "composed and invisible" from "never composed".
+	if (Voxels.assetField() != nullptr)
+	{
+		const vxc::AssetBankLibrary::Stats B = AssetBanks.stats();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets: %llu bankGrid requests, %llu served, %llu files, %llu bytes resident"),
+		       (unsigned long long)B.requests, (unsigned long long)B.servedGrids,
+		       (unsigned long long)B.filesLoaded, (unsigned long long)B.bytesResident);
+		// THE MESHER'S OWN NUMBERS. Requests above are dominated by the legacy
+		// per-voxel paths (the startup probe walk alone is millions), so they
+		// can look alive while the mesher composes nothing -- which is exactly
+		// what happened at the alpine lake, 2026-08-17: 16.5M requests, tree
+		// species in the histogram, zero trees on screen.
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets MESHER: %llu chunks ran resolve, %llu had instances, %llu instances total "
+		            "(L0=%llu L1=%llu L2=%llu, tallest grid %llu vox)"),
+		       (unsigned long long)VoxelStreamAdmission::GMesherChunksComposed.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherChunksWithInstances.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesResolved.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[0].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[1].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherInstancesByLayer[2].load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets ADMIT: %llu footprints ran exact admission, %llu had instances, %llu raised the z-range"),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprints.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsWithInstances.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GAdmitFootprintsRaised.load(std::memory_order_relaxed));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("assets CROWN: %llu L0 air-skips by band, %llu crown chunks CPU-meshed, %llu with quads"),
+		       (unsigned long long)VoxelStreamAdmission::GBandSkipAirL0.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GCrownChunksMeshed.load(std::memory_order_relaxed),
+		       (unsigned long long)VoxelStreamAdmission::GCrownChunksWithQuads.load(std::memory_order_relaxed));
+
+		// The histogram, by NAME, sorted by share. A bankId is only a number to
+		// anybody reading a log; the manifest index is the species name, and the
+		// question this answers ("is the pick degenerate, and toward what?") is
+		// unanswerable without it.
+		const uint64 TapTotal = AssetBankTap.Total.load(std::memory_order_relaxed);
+		if (TapTotal > 0)
+		{
+			const auto& MSpecies = AssetManifestData.species();
+			TArray<TPair<uint16, uint64>> Ranked;
+			for (size_t I = 0; I < AssetBankTap.Hits.size(); ++I)
+			{
+				const uint64 V = AssetBankTap.Hits[I].load(std::memory_order_relaxed);
+				if (V > 0) { Ranked.Emplace(uint16(I), V); }
+			}
+			Ranked.Sort([](const TPair<uint16, uint64>& A, const TPair<uint16, uint64>& B2)
+			            { return A.Value > B2.Value; });
+			FString Line;
+			for (int32 I = 0; I < Ranked.Num() && I < 12; ++I)
+			{
+				const uint16 Id = Ranked[I].Key;
+				const FString Name = (Id < MSpecies.size())
+					? FString(UTF8_TO_TCHAR(MSpecies[Id].name.c_str()))
+					: FString::Printf(TEXT("<id %u>"), Id);
+				Line += FString::Printf(TEXT("%s=%.1f%% "), *Name,
+				                        100.0 * double(Ranked[I].Value) / double(TapTotal));
+			}
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("assets: %d DISTINCT species requested, %llu null answers. top: %s"),
+			       Ranked.Num(),
+			       (unsigned long long)AssetBankTap.NullAnswers.load(std::memory_order_relaxed), *Line);
+
+			// AND THE ONLY QUESTION THAT MATTERS: is anything SOLID standing
+			// above the ground?
+			//
+			// A bankGrid request is NOT a stamped voxel. Every air voxel near an
+			// instance triggers a lookup and most return AIR because the voxel is
+			// outside the grid, so millions of served requests prove only that
+			// instances are nearby. This walks real columns through
+			// World::materialAt -- the same call a raycast uses -- and counts
+			// columns carrying solid material ABOVE their own surface, which is
+			// what a tree is and what terrain never is.
+			static bool bProbedOnce = false;
+			if (!bProbedOnce)
+			{
+				bProbedOnce = true;
+				const vxc::Amplifier& Amp = Voxels.amplifier();
+				int32 ColsWithAir = 0, ColsWithSolidAbove = 0, MaxRunVox = 0, MaxInternalGap = 0;
+				int64 TallestVX = 0, TallestVY = 0, TallestBaseZ = 0;
+				int32 TallestFirst = -1;
+				// LastAnchorLocation is the streaming anchor in UE world units;
+				// VoxelSizeUU converts to voxels, which is what the amplifier takes.
+				const int64 CamVX = int64(FMath::FloorToDouble(LastAnchorLocation.X / VoxelCoords::VoxelSizeUU));
+				const int64 CamVY = int64(FMath::FloorToDouble(LastAnchorLocation.Y / VoxelCoords::VoxelSizeUU));
+				for (int32 dy = -64; dy <= 64; dy += 4)
+				{
+					for (int32 dx = -64; dx <= 64; dx += 4)
+					{
+						const int64 vx = CamVX + dx, vy = CamVY + dy;
+						const vxc::ColumnSample Col = Amp.column(vx, vy);
+						const int64 TopSolid = vxc::topSolidVoxelZ(Col.surfaceMm);
+						int32 Run = 0; bool AnySolid = false;
+						// CONTIGUITY, not just presence. A tree that renders as a
+						// stump, an air gap and a floating crown is either a gap in
+						// the COMPOSITION or a gap in the MESHING, and those need
+						// opposite fixes. This walks the column and records the
+						// largest air gap that sits BETWEEN two solid voxels: zero
+						// means the world function built a continuous trunk and any
+						// break the eye sees is downstream of it.
+						int32 LastSolidZ = -1, FirstSolidZ = -1, WorstGap = 0;
+						// 25 m of headroom: cecropia bakes to 17.1 m.
+						for (int64 vz = TopSolid + 1; vz <= TopSolid + 250; ++vz)
+						{
+							if (Voxels.materialAt(vx, vy, vz) != vxc::MAT_AIR)
+							{
+								AnySolid = true; ++Run;
+								const int32 Z = int32(vz - TopSolid);
+								if (FirstSolidZ < 0) { FirstSolidZ = Z; }
+								if (LastSolidZ >= 0 && Z - LastSolidZ - 1 > WorstGap)
+								{ WorstGap = Z - LastSolidZ - 1; }
+								LastSolidZ = Z;
+							}
+						}
+						if (AnySolid) { MaxInternalGap = FMath::Max(MaxInternalGap, WorstGap); }
+						++ColsWithAir;
+						if (AnySolid)
+						{
+							++ColsWithSolidAbove;
+							if (Run > MaxRunVox)
+							{
+								// WHERE the tallest thing is, so a camera can be put next
+								// to it. Every capture so far has been aimed by guesswork at
+								// a landscape and then squinted at; a single tree at 10 m
+								// settles 'is the trunk missing or merely dark' outright.
+								MaxRunVox = Run; TallestVX = vx; TallestVY = vy;
+								TallestBaseZ = TopSolid; TallestFirst = FirstSolidZ;
+							}
+						}
+					}
+				}
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("assets PROBE: %d of %d columns near the camera carry SOLID material "
+				            "above their own surface; tallest stack %d voxels (%.1f m). "
+				            "Zero here means nothing is stamped no matter how many banks were read."),
+				       ColsWithSolidAbove, ColsWithAir, MaxRunVox, MaxRunVox * 0.1f);
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("assets PROBE: largest air gap BETWEEN solid voxels in any column: "
+				            "%d voxels (%.1f m). Zero means the world function is continuous and "
+				            "any visible break is in meshing or contrast, not composition."),
+				       MaxInternalGap, MaxInternalGap * 0.1f);
+				// HOW WIDE IS THE CROWN, ACTUALLY?
+				//
+				// A cecropia bakes 8.1 x 8.7 m of foliage, which spans THREE
+				// 3.2 m chunks. Instances are resolved once per chunk from that
+				// chunk's own rect, and if the dilation does not reach far enough
+				// the chunks either side of the anchor resolve NOTHING -- leaving
+				// a bare pole with a stub of crown at the axis, which is exactly
+				// what the capture shows. This walks outward from the tallest
+				// column at crown height and reports where solid stops.
+				if (MaxRunVox > 0)
+				{
+					const int64 CrownZ = TallestBaseZ + FMath::Max(1, MaxRunVox * 3 / 4);
+					int32 ReachVox = 0;
+					for (int32 R = 1; R <= 60; ++R)
+					{
+						bool AnyAtR = false;
+						for (int32 K = -R; K <= R && !AnyAtR; ++K)
+						{
+							if (Voxels.materialAt(TallestVX + K, TallestVY + R, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX + K, TallestVY - R, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX + R, TallestVY + K, CrownZ) != vxc::MAT_AIR ||
+							    Voxels.materialAt(TallestVX - R, TallestVY + K, CrownZ) != vxc::MAT_AIR)
+							{ AnyAtR = true; }
+						}
+						if (AnyAtR) { ReachVox = R; }
+					}
+					UE_LOG(LogVoxelPerf, Log,
+					       TEXT("assets PROBE: crown reach at z=%lld is %d voxels (%.1f m) from the "
+					            "trunk axis. The baked crown is ~40 voxels (4.0 m); anything much "
+					            "under that is instances missing in neighbouring chunks."),
+					       (long long)CrownZ, ReachVox, ReachVox * 0.1f);
+				}
+
+				UE_LOG(LogVoxelPerf, Log,
+				       TEXT("assets PROBE: tallest stack at voxel (%lld,%lld) = world "
+				            "(%.1f,%.1f) m, ground voxel z=%lld, first solid +%d above it. "
+				            "Spawn there to photograph ONE tree."),
+				       (long long)TallestVX, (long long)TallestVY,
+				       double(TallestVX) * 0.1, double(TallestVY) * 0.1,
+				       (long long)TallestBaseZ, TallestFirst);
+			}
+		}
+	}
+
 	int32 DeepTracked = 0;
 	int32 DeepWithGeometry = 0;
 	for (const auto& Pair : ChunkRecords)
@@ -6539,7 +7406,38 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 	const int64 SpanVox = int64(ChunkEdgeVoxels) * (int64(1) << Level);
 	const int64 Vx0 = int64(ChunkX) * SpanVox;
 	const int64 Vy0 = int64(ChunkY) * SpanVox;
-	return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
+
+	// AND THE SAME ARGUMENT NOW APPLIES TO THE ASSET TERM (worldgen v24/v25).
+	//
+	// Everything above is about a bound that under-states the terrain. A tree
+	// is the same failure with a different cause: its trunk stands on ground
+	// this bound covers, but its CROWN reaches above it, and a crown above the
+	// bound is proven all-air and never generated. Trees with no tops, and
+	// nothing anywhere reports it -- which is why assetplacement.h says
+	// plainly that "a bound that is too tight is not a lost optimisation, it is
+	// terrain that never generates. A hole in the world."
+	//
+	// assetAwareSurfaceUpperBoundMm composes PER LAYER: each terrain layer that
+	// actually has a site in reach buys bound(rect (+) its own radius) + its own
+	// cap, and a layer with no site nearby costs a few hashes and no bound call.
+	// Every term is <= a single widest-layer call, so it is strictly tighter
+	// than the obvious composition and never admits less than the truth needs.
+	//
+	// WITH NO FIELD INSTALLED THIS IS THE OLD LINE, unchanged, which is what
+	// keeps every existing golden and the pinned digest valid.
+	const vxc::AssetField* Field = Voxels.assetField();
+	if (Field == nullptr || Field->empty())
+	{
+		return Voxels.amplifier().surfaceUpperBoundMm(Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1);
+	}
+
+	const vxc::AssetVoxelRect Rect{Vx0, Vy0, Vx0 + SpanVox - 1, Vy0 + SpanVox - 1};
+	return vxc::assetAwareSurfaceUpperBoundMm(
+		Field->seed(), Field->layers().data(), int(Field->layers().size()), Rect,
+		[this](int64_t Ax0, int64_t Ay0, int64_t Ax1, int64_t Ay1) -> int64_t
+		{
+			return Voxels.amplifier().surfaceUpperBoundMm(Ax0, Ay0, Ax1, Ay1);
+		});
 }
 
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
@@ -6668,6 +7566,39 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// Qualified: VoxelLightField.cpp declares its own anonymous-namespace
 	// FloorDiv, and in a unity blob that contains both files the unqualified
 	// name is ambiguous against `using namespace VoxelCoords`.
+	// THE SAMPLED CORNER BOUND IS A TERRAIN BOUND, AND ASSETS STAND ON TERRAIN.
+	//
+	// TopVoxelMax above is the highest GROUND of four corner columns. With an
+	// AssetField installed that is no longer an upper bound on solid: a cecropia
+	// bakes to 17.1 m and stands on ground the corners describe perfectly, so the
+	// true ceiling is corner-ground PLUS the tallest asset that can stand there.
+	//
+	// THIS IS THE BUG THAT KEPT EVERY TREE OFF THE SCREEN, 2026-08-17. The trim
+	// below takes min(sampled + headroom, analytic bound). Making the analytic
+	// bound asset-aware made it LARGER, so min() discarded it and kept the
+	// terrain-only sampled value -- and this function decides "what is never
+	// requested at all". The chunks holding the crowns were therefore never
+	// generated, never meshed, and never drawn, while World::materialAt (which
+	// bypasses streaming) reported them present the whole time: measured, 505 of
+	// 1089 columns carried solid material above their own surface with stacks to
+	// 10.7 m, in a frame that showed bare ground.
+	//
+	// Raised by the tallest asset the library ACTUALLY BAKES rather than by the
+	// layer cap, and the difference is not cosmetic: the caps are 34 m (L1) and
+	// 60 m (L0) against a ~17 m tallest bake, and this runs per footprint on the
+	// streaming path. Widening every level-0 footprint by the cap added ~18 chunk
+	// layers of guaranteed-empty sky each -- and levels 0-1 are exactly where the
+	// sky-band trim's analytic bound does NOT bind, so nothing downstream removed
+	// them again. Measured cost of getting this wrong: 2,228 chunks resident and
+	// still climbing where the same pose without assets settled at 41,069. See
+	// AssetTallestTerrainVox's declaration for the full A/B.
+	//
+	// The asset term moved BELOW the sky-band trim -- see the EXACT ADMISSION
+	// block there. Raising TopVoxelMax here would feed the raise into
+	// min(sampled + headroom, analytic), which is how the very first version of
+	// this bound deleted every crown: the analytic side knows nothing about
+	// assets, so min() discards the raise wherever the trim binds.
+
 	const int64 TopVoxelMinAtLevel = VoxelCoords::FloorDiv(TopVoxelMin, LevelScale);
 	OutChunkZMin = (int32)VoxelCoords::FloorDiv(TopVoxelMinAtLevel, (int64)ChunkEdgeVoxels) - 1;
 
@@ -6715,6 +7646,96 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 		}
 	}
 
+	// EXACT ADMISSION FOR ASSETS (docs/asset-streaming-perf-plan.md P1). Level 0
+	// only, AFTER the trim, raising by max() -- each of those three words closes
+	// a specific hole:
+	//
+	//  * LEVEL 0 ONLY because that is the only level whose sampler composes
+	//    assets at all; raising coarser levels reserves sky for crowns that
+	//    cannot exist there. (When coarse composition lands, this condition is
+	//    the line to revisit.)
+	//  * AFTER THE TRIM because min(sampled, analytic) with an asset-raised
+	//    sampled side is the original deleted-crown bug -- the raise must
+	//    dominate the trim, not compete with it.
+	//  * BY MAX(), not +=, because these are absolute crown tops, not heights:
+	//    the tallest voxel materialAtResolved can answer non-air for, plus the
+	//    one-voxel generosity every bound in this function carries.
+	//
+	// EXACT, not the cap: the footprint's instances are resolved and their true
+	// rotated grid tops taken, so a bare footprint pays NOTHING (the census says
+	// that alone removes both the 8.4-layer height reservation and the 6.1-layer
+	// dilation slack -- an instance 15 m away that can lean voxels over this rect
+	// contributes its real top; one that cannot reach contributes nothing),
+	// and a footprint under a 45 m emergent admits exactly 45 m. Priced at mean
+	// 13.48 -> ~1-2 extra chunk layers over the terrain shell. Affordable
+	// because FootprintChunkZRangeCached memoizes this per footprint and
+	// terrainOnly skips the 85% of sites that are detail cover before they cost
+	// an amplifier column; the resolve is the same work one level-0 mesh job
+	// already does per chunk, paid once per footprint instead of once per
+	// stacked chunk.
+	if (Level >= 1)
+	{
+		// Coarse levels compose assets too now (FCoarseChunkGridSampler), so
+		// their vertical range must admit crowns -- but a level-5 footprint is
+		// a square kilometre and the exact per-instance resolve below would be
+		// tens of thousands of amplifier columns on the streaming path. The
+		// per-footprint CAP query early-outs on the first site per layer and
+		// answers "the tallest anything COULD reach here", which for a chunk
+		// stack 2^L times taller than level 0's is plenty tight: the loose
+		// direction costs at most one extra coarse chunk layer.
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
+			const int32 TopMm = vxc::assetTopAboveSurfaceMm(
+				Field->seed(), Field->layers().data(), int(Field->layers().size()), FootRect);
+			if (TopMm > 0)
+			{
+				TopVoxelForMax = FMath::Max(
+					TopVoxelForMax,
+					TopVoxelMax + vxc::floorDiv(int64(TopMm), int64(vxc::kVoxelSizeMm)) + 1);
+			}
+		}
+	}
+	if (Level == 0)
+	{
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
+			const vxc::Amplifier& AmpRef = Voxels.amplifier();
+			const std::vector<vxc::AssetInstance> Insts = Field->instancesForRect(
+				FootRect,
+				// SAME channel source as the mesh resolve (Voxels forwards to
+				// the one installed binding) -- admission and composition must
+				// derive the instance list from identical facts, or crowns and
+				// admitted z-ranges disagree and treetops get clipped.
+				[&AmpRef, this](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
+					                                       Voxels.assetChannelsAt(AVX, AVY));
+				},
+				/*terrainOnly*/ true);
+			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
+				Field->resolveForCompose(Insts);
+			int64 MaxCrownTop = INT64_MIN;
+			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+			{
+				MaxCrownTop = FMath::Max(MaxCrownTop, R.anchorVz + int64(R.grid->originZ()) +
+				                                          int64(R.grid->sizeZ()) - 1);
+			}
+			VoxelStreamAdmission::GAdmitFootprints.fetch_add(1, std::memory_order_relaxed);
+			VoxelStreamAdmission::GAdmitFootprintsWithInstances.fetch_add(
+				Resolved.empty() ? 0 : 1, std::memory_order_relaxed);
+			if (MaxCrownTop != INT64_MIN)
+			{
+				if (MaxCrownTop + 1 > TopVoxelForMax)
+				{
+					VoxelStreamAdmission::GAdmitFootprintsRaised.fetch_add(1, std::memory_order_relaxed);
+				}
+				TopVoxelForMax = FMath::Max(TopVoxelForMax, MaxCrownTop + 1);
+			}
+		}
+	}
+
 	OutChunkZMax = (int32)VoxelCoords::FloorDiv(VoxelCoords::FloorDiv(TopVoxelForMax, LevelScale), (int64)ChunkEdgeVoxels);
 	OutChunkZMaxUntrimmed =
 		(int32)VoxelCoords::FloorDiv(VoxelCoords::FloorDiv(TopVoxelMax + HeadroomVoxels, LevelScale), (int64)ChunkEdgeVoxels);
@@ -6736,6 +7757,51 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		return;
 	}
 	ComputeFootprintChunkZRange(ChunkX, ChunkY, Level, OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed);
+	// CACHE ONLY WHAT WAS COMPUTED FROM RESIDENT TILES. The memo's charter --
+	// "a pure function of (Level, X, Y) and the immutable tile raster, so an
+	// entry never needs invalidating" -- was written before the fine tier
+	// existed, and the fine tier broke its premise in one specific way: the
+	// RASTER is immutable, but WHICH raster a column query answers from flips
+	// once, when the tile becomes resident. An entry computed during the
+	// seconds a 300 MB tile is still decoding is derived from the non-resident
+	// fallback (sea-level elevation, default climate, and -- through exact
+	// admission -- zero resolved instances), and with no invalidation and a
+	// distance-only prune it is wrong for the rest of the session for any
+	// camera that does not walk away and back. Computing WITHOUT caching keeps
+	// the answer available to this recompute pass and re-derives it on the
+	// next, and the moment residency flips the first post-residency answer is
+	// cached and genuinely permanent -- the charter holds again, restored
+	// rather than patched with invalidation hooks. No fine tier configured
+	// (FineStreamer null) means every query answers from always-resident
+	// coarse tiles and the old unconditional cache is exactly right.
+	if (FineStreamer)
+	{
+		const int64 LevelScale = int64(1) << Level;
+		const int64 SpanMm = int64(VoxelCoords::ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+		int64 X0Mm = int64(ChunkX) * SpanMm;
+		int64 Y0Mm = int64(ChunkY) * SpanMm;
+		int64 X1Mm = X0Mm + SpanMm - 1;
+		int64 Y1Mm = Y0Mm + SpanMm - 1;
+		// Level 0 resolves asset anchors up to the layer reach outside the
+		// footprint (exact admission); the residency question must cover the
+		// columns the answer was actually derived from.
+		if (Level == 0)
+		{
+			if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+			{
+				int64 ReachMm = 0;
+				for (const vxc::AssetLayer& L : Field->layers())
+				{
+					if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+				}
+				X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
+			}
+		}
+		if (!FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm))
+		{
+			return; // honest answer for THIS pass; not yet a fact worth memoizing
+		}
+	}
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
 }
 
@@ -7704,7 +8770,40 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// grid is the chunk plus a ONE-cell apron, comfortably
 						// inside this.
 						const double CellUU = ChunkEdge / double(VoxelCoords::ChunkEdgeVoxels);
-						const double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
+						double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
+						// THE SAME HOLE A THIRD TIME, and this instance was live:
+						// asset anchors sit up to maxRadiusMm OUTSIDE the chunk
+						// (site enumeration dilates by it), and the resolver reads
+						// Amp.column AT THE ANCHOR -- "one column per site, at the
+						// site's own anchor". At level 0 this gate covered 0.8 m of
+						// halo against a 15 m reach, so anchor columns fell into
+						// non-resident blocks, answered elevation 0 with default
+						// climate, and assetSpeciesTolerates refused every species.
+						// The terrain meshed perfectly and the world simply had no
+						// trees -- measured at the alpine lake, 2026-08-17: census
+						// with fully-decoded tiles places 13,995 instances; the
+						// engine composed zero. Level 0 only, because that is the
+						// only level whose sampler resolves instances at all.
+						if (QueueLevel == 0)
+						{
+							if (const vxc::AssetField* AFieldGate = Voxels.assetField();
+							    AFieldGate != nullptr && !AFieldGate->empty())
+							{
+								int32 ReachMm = 0;
+								for (const vxc::AssetLayer& L : AFieldGate->layers())
+								{
+									if (L.terrainLattice && L.maxRadiusMm > ReachMm)
+									{
+										ReachMm = L.maxRadiusMm;
+									}
+								}
+								// mm -> UU via the documented identity (1 UU = 10 mm,
+								// VoxelCoords.h:71), written as the ratio so a
+								// change to either constant moves this with it.
+								HalfEdge += double(ReachMm) *
+								            (VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm));
+							}
+						}
 						const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
 						const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
 						const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
@@ -8731,6 +9830,119 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// fork. See FVoxelWorldImpl::ActiveTiles' comment.
 	VoxelGpuRegionBuild::FillRasterWindow(Req, ActiveTiles());
 
+	// --- Asset compose: stamp this chunk's terrain instances on the GPU ------
+	//
+	// ALL LEVELS since the coarse gather kernel landed (04dbdfe): level 0 runs
+	// the scatter stamp, CoarseLevel > 0 the rep-coordinate gather, and the
+	// resolve here is the same instancesForRect + resolveForCompose the CPU
+	// samplers run, in the same order -- the byte-parity contract at every
+	// level. The rect differs by level exactly as the CPU side differs:
+	// level 0 resolves over the chunk's own voxels; a coarse chunk resolves
+	// over the REP COORDINATES of its cells plus the one-cell apron, mirroring
+	// FCoarseChunkGridSampler so the GPU sees the identical instance list.
+	{
+		if (const vxc::AssetField* AField = Voxels.assetField(); AField != nullptr && !AField->empty())
+		{
+			constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+			const int64 BaseVX = int64(LevelKey.Key.X) * ChunkVox;
+			const int64 BaseVY = int64(LevelKey.Key.Y) * ChunkVox;
+			using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+			const vxc::AssetVoxelRect ARect =
+				(LevelKey.Level == 0)
+					? vxc::AssetVoxelRect{BaseVX, BaseVY, BaseVX + ChunkVox - 1,
+					                      BaseVY + ChunkVox - 1}
+					: vxc::AssetVoxelRect{GenT::coarseRep(BaseVX - 1, LevelKey.Level),
+					                      GenT::coarseRep(BaseVY - 1, LevelKey.Level),
+					                      GenT::coarseRep(BaseVX + ChunkVox, LevelKey.Level),
+					                      GenT::coarseRep(BaseVY + ChunkVox, LevelKey.Level)};
+			const vxc::Amplifier& AmpRef = Voxels.amplifier();
+			const std::vector<vxc::AssetInstance> AInsts = AField->instancesForRect(
+				ARect,
+				// Channel-sourced facts, same binding as every CPU resolve --
+				// the GPU stamp's byte-parity contract starts at the instance
+				// list, so this resolve must never see different gates.
+				[&AmpRef, this](int64_t AVX, int64_t AVY)
+				{
+					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
+					                                       Voxels.assetChannelsAt(AVX, AVY));
+				},
+				/*terrainOnly*/ true);
+			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
+				AField->resolveForCompose(AInsts);
+			// Same mesher-side accounting as the CPU job: a GPU-meshed chunk
+			// resolves here and never runs the worker's block.
+			VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
+			VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(Resolved.empty() ? 0 : 1,
+			                                     std::memory_order_relaxed);
+			VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(Resolved.size()), std::memory_order_relaxed);
+			for (const vxc::AssetField::ResolvedAssetInstance& RI : Resolved)
+			{
+				VoxelStreamAdmission::GMesherInstancesByLayer[RI.layer & (vxc::kAssetLayerCount - 1)]
+				    .fetch_add(1, std::memory_order_relaxed);
+				const uint64 H = uint64(RI.grid->sizeZ());
+				uint64 Prev = VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed);
+				while (H > Prev &&
+				       !VoxelStreamAdmission::GMesherTallestGridVox.compare_exchange_weak(
+				           Prev, H, std::memory_order_relaxed)) {}
+			}
+			// Two instances of one species-seed in the same chunk share one
+			// prefix table -- the dedup FVoxelGpuRegionRequest's header
+			// promises.
+			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
+			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
+			{
+				const FGpuAssetGridSpans& S = GpuSpansForGrid(R.grid);
+				if (S.bTooTall)
+				{
+					// One un-stampable instance and the whole chunk goes to
+					// the CPU mesher: a partial stamp is a hole in an asset,
+					// which is the failure this whole path exists to avoid.
+					return false;
+				}
+				FVoxelGpuRegionRequest::FAssetInstance Inst;
+				// Anchor stays in LEVEL-0 voxels at every level; the base
+				// follows the region's level-0 origin (OriginVx is level-L
+				// cell units -- see FAssetInstance's contract). At level 0
+				// the shift is zero and this is the subtraction it always was.
+				Inst.AnchorRelVx = int32(R.anchorVx -
+				                         (int64(Req.OriginVx) << LevelKey.Level));
+				Inst.AnchorRelVy = int32(R.anchorVy -
+				                         (int64(Req.OriginVy) << LevelKey.Level));
+				Inst.AnchorVz = int32(R.anchorVz);
+				Inst.GridOriginZ = S.OriginZ;
+				Inst.RotOriginX = R.grid->rotatedOriginX(R.yawQuarter);
+				Inst.RotOriginY = R.grid->rotatedOriginY(R.yawQuarter);
+				Inst.YawQuarter = R.yawQuarter;
+				Inst.SizeX = uint32(S.SizeX);
+				Inst.SizeY = uint32(S.SizeY);
+				Inst.SizeZ = uint32(S.SizeZ);
+				if (const uint32* Known = BaseForGrid.Find(R.grid))
+				{
+					Inst.ColStartsBase = *Known;
+				}
+				else
+				{
+					Inst.ColStartsBase = uint32(Req.AssetColStarts.Num());
+					BaseForGrid.Add(R.grid, Inst.ColStartsBase);
+					const uint32 SpanBase = uint32(Req.AssetSpans.Num());
+					Req.AssetColStarts.Append(S.ColStarts);
+					Req.AssetSpans.Append(S.Spans);
+					// The per-instance prefix table indexes the JOB buffer, so
+					// grid-local offsets shift by where this grid's spans
+					// landed.
+					if (SpanBase > 0)
+					{
+						for (int32 I = 0; I < S.ColStarts.Num(); ++I)
+						{
+							Req.AssetColStarts[int32(Inst.ColStartsBase) + I] += SpanBase;
+						}
+					}
+				}
+				Req.AssetInstances.Add(Inst);
+			}
+		}
+	}
+
 	// --- Wave D / D1: may this chunk's quads stay on the GPU? ----------------
 	//
 	// DECIDED HERE, AT DISPATCH, AND LATCHED. The alternative -- deciding at
@@ -8890,9 +10102,14 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		// what speculation looks at.
 		if (Pending.Key.Level == 0)
 		{
+			// + AssetBandRaiseVox: the GPU reduced ground columns only. See the
+			// helper's comment -- unraised, this cache entry proves crown
+			// chunks empty.
 			FootprintBandCache.Add(FIntPoint(Pending.Key.Key.X, Pending.Key.Key.Y),
-			                       VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
-			                                                         GpuResult.BandMinDeepestAirVoxel));
+			                       VoxelStreaming::MakeFootprintBand(
+			                           GpuResult.BandMaxSurfaceTopVoxel +
+			                               AssetBandRaiseVox(Pending.Key.Key.X, Pending.Key.Key.Y),
+			                           GpuResult.BandMinDeepestAirVoxel));
 		}
 		// TIMED. This runs inside Manager->Tick(), which the tick-budget line
 		// attributes to dispatch= -- so unlike a demand result (which only gets
@@ -8935,8 +10152,11 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	Result.bBandValid = GpuResult.bBandValid;
 	if (GpuResult.bBandValid)
 	{
-		Result.Band = VoxelStreaming::MakeFootprintBand(GpuResult.BandMaxSurfaceTopVoxel,
-		                                               GpuResult.BandMinDeepestAirVoxel);
+		// + AssetBandRaiseVox, same reason as the speculative cache above.
+		Result.Band = VoxelStreaming::MakeFootprintBand(
+			GpuResult.BandMaxSurfaceTopVoxel +
+			    AssetBandRaiseVox(Pending.Key.Key.X, Pending.Key.Key.Y),
+			GpuResult.BandMinDeepestAirVoxel);
 	}
 
 	if (GpuResult.IsOk())
@@ -8965,15 +10185,40 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	else
 	{
 		++GpuMeshJobsFailedSinceLog;
-		// A failed job still owes exactly one result, and it delivers an EMPTY
-		// one. That is the honest outcome -- but it is also indistinguishable
-		// on screen from terrain that is genuinely empty, which is why it is
-		// counted and logged rather than merely returned.
+		// A failed job is NOT delivered as an empty chunk any more. An empty
+		// delivery settles the chunk with zero quads -- a permanent hole
+		// indistinguishable on screen from real emptiness, and 248 of them
+		// landed in one settle when readback saturation timed jobs out in
+		// bursts. Instead the record is released back to the dispatcher
+		// exactly the way a bounced dispatch is, flagged CPU-only so the
+		// retry cannot bounce off the same failure: RecomputeDesiredSet still
+		// wants this chunk (it never loaded), so it re-enters the pending
+		// queue on the next recompute and the worker path meshes it.
+		//
+		// The one-result-one-decrement contract holds: this failure produces
+		// zero results and zero net counter movement only if the record is
+		// still ours -- if an edit superseded the job (GenerationId moved),
+		// the empty result was going to be discarded in DrainResults anyway,
+		// so the release below is safe in both cases.
 		UE_LOG(LogVoxelStream, Warning,
-		       TEXT("VoxelGpuMesh: job %llu for chunk (%d, %d, %d) L%d ended %s -- delivering an EMPTY chunk. %s"),
+		       TEXT("VoxelGpuMesh: job %llu for chunk (%d, %d, %d) L%d ended %s -- requeueing on the CPU worker path. %s"),
 		       (unsigned long long)GpuResult.JobId,
 		       Pending.Key.Key.X, Pending.Key.Key.Y, Pending.Key.Key.Z, Pending.Key.Level,
 		       LexToString(GpuResult.Status), *GpuResult.Error);
+		if (VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(Pending.Key))
+		{
+			if (Rec->GenerationId == Pending.GenerationId && Rec->bJobInFlight)
+			{
+				Rec->bJobInFlight = false;
+				Rec->bNoGpuRetry = true;
+				--LevelJobsInFlight[FMath::Clamp(Pending.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+				JobsInFlightCounter.Decrement();
+				return;
+			}
+		}
+		// Record gone or superseded: fall through and deliver the empty
+		// result so the drain-side bookkeeping (which will discard it as
+		// stale) still sees its one result.
 	}
 
 	// The matching half of the fork's contract: exactly one FJobResult on the
@@ -9246,6 +10491,10 @@ void FVoxelWorldImpl::DispatchJobs()
 					++BuriedSkipsSinceLog;
 					BuriedSkipsByLevelSinceLog[0] += 1;
 					(bAllAir ? BuriedSkipAirSinceLog : BuriedSkipSolidSinceLog) += 1;
+					if (bAllAir)
+					{
+						VoxelStreamAdmission::GBandSkipAirL0.fetch_add(1, std::memory_order_relaxed);
+					}
 				}
 			}
 		}
@@ -9381,6 +10630,9 @@ void FVoxelWorldImpl::DispatchJobs()
 		// Ring-boundary skirt mask -- computed here on the game thread where the
 		// anchor and RingPresets are live, then baked into this job's mesh.
 		const uint8 RingSkirtMask = ComputeRingSkirtMask(LevelKey, LastAnchorLocation);
+		// Same snapshot-on-the-game-thread shape as RingSkirtMask above: constant
+		// after install, but read here so the worker never touches Impl state.
+		const int64 AssetTallestVoxSnapshot = AssetTallestTerrainVox;
 
 		// --- The GPU fork (Wave D / D4) -------------------------------------
 		//
@@ -9425,6 +10677,23 @@ void FVoxelWorldImpl::DispatchJobs()
 			// than sound-until-batching.
 			//
 			&& !bPredictedEmpty           // the band already says this meshes to nothing; do not pay a dispatch
+			// Assets now exist on the GPU at LEVEL 0: SubmitGpuMeshJob
+			// resolves the chunk's terrain instances and the AssetStamp
+			// passes compose them into Cells in CPU order
+			// (VoxelAssetStamp.usf). The one case the stamp cannot serve -- a
+			// grid too tall for span packing -- makes SubmitGpuMeshJob return
+			// false, which falls through to the CPU worker exactly like a
+			// full GPU queue does.
+			//
+			// Coarse levels compose on the GPU too since the gather kernel
+			// (04dbdfe): AssetStampCoarseMain samples each level-L cell at its
+			// rep coordinate, byte-parity with FCoarseChunkGridSampler, and
+			// SubmitGpuMeshJob fills instances at every level -- so the
+			// route-coarse-asset-chunks-to-CPU term that stood here is gone.
+			// A chunk whose previous GPU job FAILED is not offered again: the
+			// failure flagged the record CPU-only, because a timeout under
+			// readback saturation re-fails identically every retry window.
+			&& !Rec->bNoGpuRetry
 			// The fork's own bound. Applied HERE rather than in the loop
 			// condition so a chunk arriving when the GPU is full falls back to
 			// the CPU instead of stalling the whole dispatch loop.
@@ -9471,7 +10740,8 @@ void FVoxelWorldImpl::DispatchJobs()
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask]()
+			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask,
+			 AssetTallestVoxSnapshot]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -9647,6 +10917,83 @@ void FVoxelWorldImpl::DispatchJobs()
 							ScratchDeepestAir[I] = VoxelStreaming::ColumnDeepestAirVoxel(Col);
 						}
 					}
+					// THE ASSET TERM, IN THE SAMPLER THE MESHER ACTUALLY READS.
+					//
+					// This lambda was `Amplifier::materialAt` alone -- pure terrain
+					// -- and that is why no asset ever reached a frame. It is a
+					// PARALLEL SAMPLER: GeneratedWorld::makeBrick composes the
+					// asset term and World::materialAt composes it, but level-0
+					// meshing does not go through either, so a world provably full
+					// of trees (505 of 1089 columns carrying solid above their own
+					// surface, stacks to 10.7 m, measured through World::materialAt)
+					// rendered as bare ground.
+					//
+					// asset-placement-design.md's own "what needs the editor" list
+					// named this exactly -- "the level-0 worker's GridSampler and
+					// SkipBrick ... consult the same vxc::AssetField
+					// GeneratedWorld composes, rather than a parallel sampler" --
+					// and that item was blocked on the editor and never done.
+					//
+					// Instances are resolved ONCE PER CHUNK rather than per brick:
+					// a chunk is 3.2 m and the site enumeration already dilates by
+					// each layer's radius, so a chunk-wide rect is a superset of
+					// every brick's and costs one query instead of 64.
+					const vxc::AssetField* AField = GenPtr->assetField();
+					std::vector<vxc::AssetInstance> AInsts;
+					// RESOLVED ONCE PER CHUNK, sampled lock-free per voxel.
+					// The old shape -- AField->materialAt per air voxel -- asked
+					// the bank library for the grid on every call, one global
+					// mutex per ask, ~64k asks per chunk, 96 workers convoying:
+					// measured 26.4M bankGrid calls in one capture and ~17
+					// chunks/s streaming. resolveForCompose pays ~one lock per
+					// terrain instance per chunk instead and drops the detail
+					// instances (84% of the list) that could never answer.
+					std::vector<vxc::AssetField::ResolvedAssetInstance> AResolved;
+					if (AField != nullptr && !AField->empty())
+					{
+						const vxc::AssetVoxelRect ARect{
+							BaseVX, BaseVY, BaseVX + ChunkVox - 1, BaseVY + ChunkVox - 1};
+						// terrainOnly: this list exists solely to feed
+						// resolveForCompose, which drops detail instances anyway
+						// -- skipping their sites here saves the ~85% of
+						// per-site amplifier columns that bought nothing.
+						AInsts = AField->instancesForRect(ARect, [&Amp, GenPtr](int64_t AVX, int64_t AVY)
+						{
+							// Channel-sourced facts (bake-28 planes + water
+							// datum), not the sentinel overload -- see
+							// FVoxelAssetChannelSource. GenPtr forwards to the
+							// one installed binding, so the level-0 mesher, the
+							// coarse sampler, admission and the probe cannot
+							// disagree about which species a site carries.
+							return vxc::assetColumnFactsFromSample(Amp.column(AVX, AVY),
+							                                       GenPtr->assetChannelsAt(AVX, AVY));
+						}, /*terrainOnly*/ true);
+						AResolved = AField->resolveForCompose(AInsts);
+						// MESHER-SIDE resolve accounting, because the bank tap
+						// can no longer answer "is the mesher composing":
+						// resolveForCompose issues ~one bankGrid call per
+						// instance per chunk, a rounding error beside the
+						// legacy per-voxel paths (the startup probe walk alone
+						// is millions), so a healthy-looking request total can
+						// hide a mesher that resolves nothing. These two are
+						// the mesher's own numbers and nothing else's.
+						VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(AResolved.empty() ? 0 : 1,
+						                                     std::memory_order_relaxed);
+						VoxelStreamAdmission::GMesherInstancesResolved.fetch_add(uint64(AResolved.size()),
+						                                   std::memory_order_relaxed);
+						VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
+						for (const vxc::AssetField::ResolvedAssetInstance& RI : AResolved)
+						{
+							VoxelStreamAdmission::GMesherInstancesByLayer[RI.layer & (vxc::kAssetLayerCount - 1)]
+							    .fetch_add(1, std::memory_order_relaxed);
+							const uint64 H = uint64(RI.grid->sizeZ());
+							uint64 Prev = VoxelStreamAdmission::GMesherTallestGridVox.load(std::memory_order_relaxed);
+							while (H > Prev &&
+							       !VoxelStreamAdmission::GMesherTallestGridVox.compare_exchange_weak(
+							           Prev, H, std::memory_order_relaxed)) {}
+						}
+					}
+					const std::vector<vxc::AssetField::ResolvedAssetInstance>* AResolvedPtr = &AResolved;
 					if (bComputeBand)
 					{
 						int64 MaxTop = INT64_MIN;
@@ -9656,18 +11003,56 @@ void FVoxelWorldImpl::DispatchJobs()
 							MaxTop = FMath::Max(MaxTop, ScratchTopSolid[I]);
 							MinAir = FMath::Min(MinAir, ScratchDeepestAir[I]);
 						}
+						// THE BAND MUST SEE THE CROWNS, or it deletes them. The
+						// band's contract (VoxelFootprintBand.h) is that a false
+						// "definitely empty" is a rendering bug, and its all-air
+						// half is consulted by the default-ON dispatch skip AND
+						// cached per footprint -- so a terrain-only MaxTop with
+						// assets installed silently settles every chunk above the
+						// ground as "proven empty, zero quads" the moment the
+						// footprint's band caches. That is a deleted treetop, and
+						// unlike the streaming starvation it never heals.
+						//
+						// Raised by the EXACT crown tops of this footprint's
+						// resolved instances -- not a cap. The resolved list is
+						// the compose-time truth: anchor + rotated grid height IS
+						// the topmost voxel materialAtResolved can answer non-air
+						// for, so chunks above this line are provably crown-free
+						// and the fast path stays armed at its exact ceiling.
+						// Same shape as the water-marker widening in
+						// ColumnSurfaceTopVoxel, for the same reason: another
+						// subsystem now puts solid above `surfaceMm`, and every
+						// emptiness gate that reads this band must know.
+						for (const vxc::AssetField::ResolvedAssetInstance& R : AResolved)
+						{
+							const int64 CrownTop = R.anchorVz + int64(R.grid->originZ()) +
+							                       int64(R.grid->sizeZ()) - 1;
+							MaxTop = FMath::Max(MaxTop, CrownTop);
+						}
 						// Shared with voxel.GPU.VerifyRegion's band gate and with
 						// BandReduceMain's readback path, so the widening cannot
 						// drift between the three producers of a band.
 						Result.Band = VoxelStreaming::MakeFootprintBand(MaxTop, MinAir);
 						Result.bBandValid = true;
 					}
-					const auto GridSampler = [Columns, BaseVX, BaseVY](int64 X, int64 Y, int64 Z)
+					const auto GridSampler = [Columns, BaseVX, BaseVY, AResolvedPtr](int64 X, int64 Y, int64 Z)
 					{
 						const int32 LX = int32(X - BaseVX) + 1;
 						const int32 LY = int32(Y - BaseVY) + 1;
 						checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-						return vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
+						vxc::MaterialId M =
+							vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], Z);
+						// AIR ONLY, matching makeBrick exactly: an asset never
+						// replaces terrain, so the composition stays monotone and
+						// the bound's "assets are solid ABOVE the surface"
+						// assumption holds. materialAtResolved preserves
+						// instancesForRect order, so first-non-air-wins picks the
+						// same winner as the bank-source path did, byte for byte.
+						if (M == vxc::MAT_AIR && !AResolvedPtr->empty())
+						{
+							M = vxc::AssetField::materialAtResolved(*AResolvedPtr, X, Y, Z);
+						}
+						return M;
 					};
 					// docs/debug-tooling-plan.md P1 "vxc::Counters": columnEvals
 					// counts the explicit Amp.column() calls this cache-build loop
@@ -9706,6 +11091,32 @@ void FVoxelWorldImpl::DispatchJobs()
 								MaxTopInterior = FMath::Max(MaxTopInterior, ScratchTopSolid[RowBase + I]);
 							}
 						}
+						// AND THE SKIP IS A TERRAIN SKIP, so it must be told about
+						// assets or it throws away every brick a crown lives in.
+						// MaxTopInterior is the top SOLID GROUND of this brick's
+						// column block; a cecropia stands on that ground and rises
+						// 17.1 m through bricks this test would otherwise discard
+						// before meshBrick was ever called. Widened by the tallest
+						// terrain-lattice cap for the same reason the chunk z-range
+						// is: too tight here is a tree with no top, and the cost of
+						// too loose is a few extra bricks meshed to nothing.
+						//
+						// The RESOLVED list, not the raw instance list: 84% of raw
+						// instances are detail ground cover that composes nothing
+						// into the world grid, and widening the air skip for a
+						// chunk whose only instances are grass killed the skip on
+						// nearly every chunk on the map. Resolved instances are
+						// exactly the ones materialAtResolved can answer for, so a
+						// chunk with none has a provably terrain-only air band.
+						//
+						// The BAKED height, not the layer cap, for the reason spelled
+						// out at AssetTallestTerrainVox: this test runs 64 times per
+						// chunk and only wastes meshing work when loose -- but it is
+						// the same number and it should not be wrong in two places.
+						if (!AResolvedPtr->empty())
+						{
+							MaxTopInterior += AssetTallestVoxSnapshot;
+						}
 						if (InteriorZMin > MaxTopInterior + 1)
 						{
 							++SkippedAir;
@@ -9743,6 +11154,28 @@ void FVoxelWorldImpl::DispatchJobs()
 					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask, SkipBrick);
 					Result.BricksSkippedAir = uint16(SkippedAir);
 					Result.BricksSkippedSolid = uint16(SkippedSolid);
+					// Crown-chunk discriminator (see GCrownChunksMeshed): this
+					// job's interior starts above every terrain column top in
+					// its own grid, and instances were resolved -- so any quad
+					// it emits is asset material, and zero quads means the
+					// compose path lost the crown between the list and the
+					// mesher.
+					if (!AResolved.empty() && (bComputeBand || bBrickSkip))
+					{
+						int64 MaxTerrainTop = INT64_MIN;
+						for (int32 I = 0; I < GridCells; ++I)
+						{
+							MaxTerrainTop = FMath::Max(MaxTerrainTop, ScratchTopSolid[I]);
+						}
+						if (ChunkBaseVZ > MaxTerrainTop)
+						{
+							VoxelStreamAdmission::GCrownChunksMeshed.fetch_add(1, std::memory_order_relaxed);
+							if (Result.Quads.Num() > 0)
+							{
+								VoxelStreamAdmission::GCrownChunksWithQuads.fetch_add(1, std::memory_order_relaxed);
+							}
+						}
+					}
 					if (bMeasureEmpty && Result.Quads.Num() == 0)
 					{
 						Result.EmptyClass = ClassifyEmpty(GridSampler, Key);
@@ -10182,14 +11615,39 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// terrain denser than this traverse (mean 967 quads/chunk here) and first-fit
 	// fragmentation without paying for a parked population that does not exist.
 	//
-	// WHY NOT MORE: the CPU shadow below is still allocated at full capacity
-	// (PooledQuads + QuadChunkIds, 12 B/quad), so every quad of capacity costs
-	// 12 B of VRAM AND 12 B of system RAM, and CreateSceneProxy copies both
-	// arrays whole. At 80M that is 960 MB VRAM + 960 MB RAM and a 960 MB
-	// game-thread memcpy on any render-state rebuild. S2-5 -- dropping the shadow
-	// on the GPU-only arm, where nothing reads it -- is what makes any further
-	// raise cheap. Do that before going higher, not after.
-	constexpr uint32 kPoolCapacityQuads = 80u * 1000u * 1000u;   // 640 MB at 8 B/quad
+	// RESIZED 80M -> 192M (2026-08-18), unblocked by S2-5. The 80M sizing note
+	// below ended "WHY NOT MORE": the CPU shadow was allocated flat at capacity
+	// (12 B/quad of system RAM next to 12 B/quad of VRAM, with CreateSceneProxy
+	// copying both arrays whole), so raising capacity taxed RAM and the game
+	// thread as hard as VRAM. S2-5 is now DONE: the shadow is paged and pages
+	// materialise only under CPU-authored writes (session-opening readback
+	// bootstrap, GI-claimed chunks, water pools, or a run with GPU meshing
+	// off), so on the shipping GPU-resident arm capacity costs VRAM and
+	// almost nothing else -- see UVoxelGpuPoolComponent::ShadowPages.
+	//
+	// WHY 192M. The 2026-08-18 scenes measured what the amplified world now
+	// actually submits at settle: 144.6M (alpine, thinned scatter), 156M
+	// (alpine vista), 173M (with the slope fix) -- and the first full-config
+	// attempt against the 80M default refused 28,205 chunks ("no room for N
+	// quads ... Chunk left undrawn"), i.e. the SHIPPING default could not draw
+	// the world we now generate, and every capture since has needed a
+	// -VoxelPoolCapacityQuads override. 192M covers the worst measured scene
+	// (173M) plus ~11% for first-fit fragmentation and load-before-unload
+	// retention. That is thinner headroom than the ~25-35% this constant has
+	// historically carried, and deliberately so: the next step, 200M, is the
+	// clamp ceiling (below).
+	//
+	// COST at 192M: 1465 MB + 732 MB VRAM (8 B/quad quad buffer + 4 B/quad
+	// chunk-id buffer). System RAM: 3 MB per CPU-written 256K-quad shadow page
+	// -- tens of MB on the GPU arm, and only a CPU-only run (GPU meshing off)
+	// climbs back toward 12 B/quad of RESIDENT demand (not capacity: pages
+	// past its high water never allocate).
+	//
+	// THE 200M CLAMP IS A REAL CEILING, not caution: past ~268M quads the quad
+	// buffer's byte size (8 B/quad) crosses 2^31 and every int32/uint32
+	// byte-offset in the lock/upload paths needs auditing first. Raise the
+	// clamp only with that audit in hand.
+	constexpr uint32 kPoolCapacityQuads = 192u * 1000u * 1000u;   // 1465 MB at 8 B/quad
 	uint32 PoolCapacityQuads = kPoolCapacityQuads;
 	{
 		uint32 Override = 0;
@@ -14780,6 +16238,48 @@ FVoxelFineTileStreamer* UVoxelWorldSubsystem::GetFineTileStreamer() const
 	// carries no bathymetry at all). Either way there is nothing baked to read.
 	return Impl ? Impl->FineStreamer.Get() : nullptr;
 }
+
+// --- TASK #7 (detail-asset rendering) hook: accessor definitions -------------
+// See the matching declarations in the header for the ownership/threading
+// contract. These three are deliberately the ONLY thing this feature adds to
+// this file: the detail renderer lives entirely in
+// VoxelDetailAssetSubsystem.cpp and consumes the same field/amplifier/bank
+// objects the meshing workers already share.
+
+const vxc::AssetField* UVoxelWorldSubsystem::GetAssetField() const
+{
+	if (!Impl)
+	{
+		return nullptr;
+	}
+	// empty() is the "installed but useless" state (no layers, no species or
+	// no bank source); answering nullptr for it keeps the caller's null test
+	// the single gate.
+	const vxc::AssetField* Field = Impl->Voxels.assetField();
+	return (Field != nullptr && !Field->empty()) ? Field : nullptr;
+}
+
+const vxc::IAssetBankSource* UVoxelWorldSubsystem::GetAssetBankSource() const
+{
+	// The counting tap, not the raw library, so the caller's bank loads show
+	// up in the same voxel.Assets species histogram every other consumer
+	// feeds (FCountingBankSource's charter).
+	return (Impl && Impl->AssetBankTap.Inner != nullptr) ? &Impl->AssetBankTap : nullptr;
+}
+
+const vxc::Amplifier* UVoxelWorldSubsystem::GetWorldgenAmplifier() const
+{
+	return Impl ? &Impl->Voxels.amplifier() : nullptr;
+}
+
+vxc::IAssetChannelSource* UVoxelWorldSubsystem::GetAssetChannelSource() const
+{
+	// The one binding FVoxelWorldImpl installed into Voxels (or null when the
+	// fine tier / field is off) -- handed out so the detail-asset resolver
+	// gates its instances on the same channels the meshers compose with.
+	return Impl ? Impl->AssetChannels.Get() : nullptr;
+}
+// --- end TASK #7 hook ---------------------------------------------------------
 
 double UVoxelWorldSubsystem::SampleTerrainHeightUU(double WorldXUU, double WorldYUU) const
 {

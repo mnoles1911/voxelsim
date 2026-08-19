@@ -119,6 +119,7 @@ import numpy as np
 # Pure numpy, no kernels, no scipy -- safe to import eagerly here (the lazy
 # imports elsewhere in this file exist for scipy/numba, not for module cycles).
 from . import basins as _basins
+from . import placement as _placement
 from . import province as _province
 from . import water as _water
 
@@ -458,7 +459,14 @@ TERRAIN_VERSION = 8
 #: (B5b). A products-only change: TERRAIN_VERSION is untouched, so the ground
 #: is bit-identical and `test_bake_terrain_identity` must still reproduce the
 #: elevation plane byte for byte.
-BAKE_VERSION = 27
+#:
+#: 28: SECTION_PLACE_* -- the five placement channel planes (B7): distance to
+#: water over the FULL wet union (lakes + rivers + sea, closing the section
+#: 12.6 trap that starved every riverbank species), TWI moisture, talus flux,
+#: curvature, heat load. Products-only again: the ground is bit-identical,
+#: only what asset placement can read about it changed. Consumed by
+#: voxel-core's assetpolicy gates from worldgen v26 on.
+BAKE_VERSION = 28
 
 
 @dataclass(frozen=True)
@@ -1733,7 +1741,9 @@ STAGE_ORDER: tuple[str, ...] = (
 #: ``bake_tile`` reports timings for both lists in one ``cpu_seconds`` dict, so
 #: the split is an identity boundary and not a reporting one.
 PRODUCT_STAGE_ORDER: tuple[str, ...] = (
+    "B5b.bathymetry",
     "B6.discharge_water",
+    "B7.placement_channels",
 )
 
 
@@ -1819,6 +1829,25 @@ def product_identity_payload(consts: BakeConstants = CONSTANTS) -> dict:
             "headwaters": _codec_const("SECTION_HEADWATERS"),
             "headwaters_flag": _codec_const("FLAG_HEADS_PRESENT"),
             "headwater_entry_bytes": _codec_const("HEADWATER_ENTRY_BYTES"),
+            # bake_ver 27. Absent until 2026-08-17 -- the bathy pair rode on
+            # the BAKE_VERSION integer alone, so a layout change with no
+            # constant change would have been invisible to the id.
+            "bathy_depth_index": _codec_const("SECTION_BATHY_DEPTH_INDEX"),
+            "bathy_shore_index": _codec_const("SECTION_BATHY_SHORE_INDEX"),
+            "bathy_flag": _codec_const("FLAG_BATHY_PRESENT"),
+            # bake_ver 28: the placement channel planes. The subsample factor
+            # and every quantisation constant is here because each one decides
+            # baked bytes and how a client reads them.
+            "place_first_index": _codec_const("SECTION_PLACE_DIST_WATER_INDEX"),
+            "place_flag": _codec_const("FLAG_PLACEMENT_PRESENT"),
+            "place_subsample": _codec_const("PLACEMENT_SUBSAMPLE"),
+            "place_dist_lsb_m": _codec_const("PLACEMENT_DIST_LSB_M"),
+            "place_dist_unknown": _codec_const("PLACEMENT_DIST_UNKNOWN"),
+            "place_twi_offset": _codec_const("PLACEMENT_TWI_OFFSET"),
+            "place_twi_scale": _codec_const("PLACEMENT_TWI_SCALE"),
+            "place_talus_scale": _codec_const("PLACEMENT_TALUS_SCALE"),
+            "place_curv_scale": _codec_const("PLACEMENT_CURV_SCALE"),
+            "place_heat_scale": _codec_const("PLACEMENT_HEAT_SCALE"),
         },
     }
 
@@ -4175,6 +4204,16 @@ class BakeResult:
     #: footprint is -- see `_basins.bathymetry_planes` for the argument.
     bathy_depth: "np.ndarray | None" = None
     bathy_shore: "np.ndarray | None" = None
+    #: Placement channel planes (bake_ver 28): five uint8 rasters at
+    #: fine_tile_px // tile_codec.PLACEMENT_SUBSAMPLE per edge, already in
+    #: wire units -- SECTION_PLACE_*. All five or None together (one flag bit,
+    #: one bake stage); see `bake.placement.placement_planes` for the
+    #: geomorphology and docs/vxtl-v2-format.md section 6.2 for the bytes.
+    place_dist_water: "np.ndarray | None" = None
+    place_twi: "np.ndarray | None" = None
+    place_talus: "np.ndarray | None" = None
+    place_curv: "np.ndarray | None" = None
+    place_heat: "np.ndarray | None" = None
 
 
 def basin_filter(consts: BakeConstants = CONSTANTS) -> "_basins.BasinFilter":
@@ -5466,9 +5505,41 @@ def bake_tile(
                     if hq.size else 0.0),
                 "heads_padded_count": float(heads_pad.sum()),
             })
+        # Kept for B7: the PADDED river wet mask, after every stage that can
+        # move the drawn extent (widening, settling, levelling). A bool copy,
+        # so B7 does not pin the float surface in memory.
+        river_wet_pad = np.isfinite(w_pad)
         del wet_pad, heads_pad, w_pad, q_pad, z_route
+    else:
+        river_wet_pad = None
     del z_pre_reopen, basin_keep_pad
     out["cpu_seconds"]["B6.discharge_water"] = time.process_time() - c0
+
+    # -- B7: PLACEMENT CHANNELS (bake_ver 28). Five uint8 rasters consumed by
+    # asset placement -- distance-to-water, TWI moisture, talus, curvature,
+    # heat load. See `bake.placement` for the geomorphology and the rounding
+    # direction (the distance plane must OVER-cover wetness), and
+    # docs/vxtl-v2-format.md section 6.2 for the wire encoding.
+    #
+    # AFTER B6, necessarily: the distance plane's wet set is the union of the
+    # lake extents (B5b's bathymetry already computed exactly that mask -- the
+    # interior cells whose depth is not the dry sentinel), the river plane's
+    # FINAL wet cells (which the stages inside B6 move right up to the last
+    # one), and the sea. Before the interior crop of `out["z"]`/`out["acc"]`
+    # below would be too early for the first two and is impossible for the
+    # third reading anyway (the sweep wants the padded sea for a coast just
+    # over the seam).
+    c0 = time.process_time()
+    place = _placement.placement_planes(
+        z_pad=out["z"],
+        acc_pad=out["acc"],
+        interior=sl,
+        cell_m=geom.fine_pixel_m,
+        lake_wet_interior=(bathy_depth >= 0),
+        river_wet_pad=river_wet_pad,
+    )
+    del river_wet_pad
+    out["cpu_seconds"]["B7.placement_channels"] = time.process_time() - c0
 
 
     basin_depth = out["basin_depth"]
@@ -5587,6 +5658,16 @@ def bake_tile(
         "basin_water_volume_m3": float(sum(
             b.area_m2 * b.water_depth_m for b in survey.basins)),
         "peak_bytes_estimate": float(estimate_peak_bytes(geom)),
+        # -- B7 placement channels (bake_ver 28). A ran-flag plus the three
+        # numbers that say whether each plane has anything in it -- the
+        # silent-counter rule: "no talus on this tile" and "the stage did not
+        # run" must be different facts.
+        "placement_ran": 1.0,
+        "placement_dist_known_frac": float(
+            (place["dist_water"] != _codec_const("PLACEMENT_DIST_UNKNOWN"))
+            .mean()),
+        "placement_talus_frac": float((place["talus"] > 0).mean()),
+        "placement_twi_p50": float(np.percentile(place["twi"], 50)),
     }
     stats.update(water_stats)
     # LANDFORM PROVINCE MIX over the tile INTERIOR, as area fractions summing
@@ -5618,6 +5699,11 @@ def bake_tile(
         water_heads=water_heads,
         bathy_depth=bathy_depth,
         bathy_shore=bathy_shore,
+        place_dist_water=place["dist_water"],
+        place_twi=place["twi"],
+        place_talus=place["talus"],
+        place_curv=place["curv"],
+        place_heat=place["heat"],
         superblock_fingerprint=(
             "" if inflow_source is None else inflow_source.fingerprint_hex
         ),

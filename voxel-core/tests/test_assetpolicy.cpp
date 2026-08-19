@@ -679,3 +679,248 @@ VXC_TEST(assetcluster_gives_each_species_its_own_grove) {
     CHECK(samples > 1000);
     CHECK(differing * 10 > samples * 8); // 80%+ meaningfully different
 }
+
+// ---------------------------------------------------------------------------
+// 4. THE CHANNEL RESPONSES (worldgen v26): the slope curve, the standing-water
+// veto, the krummholz band, and the moisture/talus/curvature multipliers.
+// Every one is sentinel-neutral by contract -- a column with no channels must
+// weigh exactly as it did before the channels existed -- and every one is
+// tested in BOTH directions, because a response that never fires and a
+// response that always fires both read as "ran" to a census.
+// ---------------------------------------------------------------------------
+
+VXC_TEST(assetpolicy_slope_curve_tapers_weight_and_zeroes_at_the_ceiling) {
+    AssetSpecies s = anywhere(1, 1000);
+    s.slopeMaxMmPerM = 600;  // the curve's zero point
+    s.slopeFullMmPerM = 400; // full weight to here
+
+    const uint32_t flat = assetSpeciesSiteWeightQ10(s, goodGround(TEMPERATE_FOREST, 120'000, 100));
+    const uint32_t atFull = assetSpeciesSiteWeightQ10(s, goodGround(TEMPERATE_FOREST, 120'000, 400));
+    const uint32_t mid = assetSpeciesSiteWeightQ10(s, goodGround(TEMPERATE_FOREST, 120'000, 500));
+    const uint32_t nearZero =
+        assetSpeciesSiteWeightQ10(s, goodGround(TEMPERATE_FOREST, 120'000, 598));
+    CHECK_EQ(int(flat), 1000);
+    CHECK_EQ(int(atFull), 1000);
+    CHECK_EQ(int(mid), 500);   // exactly halfway down the taper
+    CHECK(nearZero < 50);
+    // Past the zero point the GATE refuses -- the taper and the veto meet.
+    CHECK(!assetSpeciesTolerates(s, goodGround(TEMPERATE_FOREST, 120'000, 601)));
+    CHECK_EQ(int(assetSpeciesFirstRefusal(s, goodGround(TEMPERATE_FOREST, 120'000, 601))),
+             int(AssetGate::kSlopeZero));
+
+    // A hand-built species (default slopeFull = INT32_MAX) has NO taper: the
+    // old hard cut, bit for bit. This is what keeps every pre-v26 table and
+    // every direct-construction test meaning what it meant.
+    AssetSpecies old = anywhere(1, 1000);
+    old.slopeMaxMmPerM = 600;
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(old, goodGround(TEMPERATE_FOREST, 120'000, 599))),
+             1000);
+}
+
+VXC_TEST(assetpolicy_standing_water_vetoes_submerged_ground_only) {
+    // THE LAKE-TREE VETO. anchorSolid is TRUE on a lake bed -- to every other
+    // gate it is just ground -- so without this gate an oak stands in six
+    // metres of water (the owner-reported defect of 2026-08-17's first
+    // scatter vista).
+    const AssetSpecies oak = anywhere(1, 1000);
+    AssetColumnFacts dry = goodGround();
+    CHECK(assetSpeciesTolerates(oak, dry));
+
+    AssetColumnFacts shin = goodGround();
+    shin.standingWaterMm = 300; // shin-deep: a wet strand still hosts
+    CHECK(assetSpeciesTolerates(oak, shin));
+
+    AssetColumnFacts lakeBed = goodGround();
+    lakeBed.standingWaterMm = 6'000'000;
+    CHECK(!assetSpeciesTolerates(oak, lakeBed));
+    CHECK_EQ(int(assetSpeciesFirstRefusal(oak, lakeBed)), int(AssetGate::kStandingWater));
+}
+
+VXC_TEST(assetpolicy_moisture_affinity_moves_weight_with_twi_and_is_sentinel_neutral) {
+    AssetSpecies willow = anywhere(1, 1000);
+    willow.moistureAffinity = 2; // hygrophile
+    AssetSpecies pine = anywhere(1, 1000);
+    pine.moistureAffinity = -2; // xerophile
+
+    AssetColumnFacts hollow = goodGround();
+    hollow.twiMilli = 12'000; // a wet hollow
+    AssetColumnFacts ridge = goodGround();
+    ridge.twiMilli = 500; // a dry convex ridge
+    AssetColumnFacts unknown = goodGround(); // twiMilli stays at the sentinel
+
+    // The hygrophile gains where it is wet and starves where it is dry...
+    CHECK(assetSpeciesSiteWeightQ10(willow, hollow) > 1500);
+    CHECK(assetSpeciesSiteWeightQ10(willow, ridge) < 500);
+    // ...the xerophile mirrors it...
+    CHECK(assetSpeciesSiteWeightQ10(pine, hollow) < 500);
+    CHECK(assetSpeciesSiteWeightQ10(pine, ridge) > 1500);
+    // ...and NOBODY moves on the sentinel: a world with no moisture plane is
+    // the world before the plane existed.
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(willow, unknown)), 1000);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(pine, unknown)), 1000);
+}
+
+VXC_TEST(assetpolicy_talus_boosts_rocks_and_curvature_sorts_rocks_from_trees) {
+    AssetSpecies rock = anywhere(2, 500);
+    rock.talusAffinity = 1;
+    rock.curvatureAffinity = -1; // convex-seeking
+    AssetSpecies bigTree = anywhere(0, 500);
+    bigTree.curvatureAffinity = 1; // concave-seeking
+    bigTree.heightMm = 20'000;
+
+    AssetColumnFacts debris = goodGround();
+    debris.talus = 200;
+    AssetColumnFacts clean = goodGround();
+    clean.talus = 0;
+    // Talus is BOOST-ONLY: flux multiplies the rock up, zero flux leaves the
+    // authored weight alone (never a penalty -- rocks still place off-talus).
+    CHECK(assetSpeciesSiteWeightQ10(rock, debris) > 1000);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(rock, clean)), 500);
+
+    AssetColumnFacts hollowC = goodGround();
+    hollowC.curv = 190; // strongly concave
+    AssetColumnFacts ridgeC = goodGround();
+    ridgeC.curv = 70; // strongly convex
+    // The anti-correlation research section 4.2 asks for, from ONE channel:
+    // rocks up on the ridge nose and down in the hollow, big trees inverted.
+    CHECK(assetSpeciesSiteWeightQ10(rock, ridgeC) > assetSpeciesSiteWeightQ10(rock, hollowC));
+    CHECK(assetSpeciesSiteWeightQ10(bigTree, hollowC) >
+          assetSpeciesSiteWeightQ10(bigTree, ridgeC));
+}
+
+VXC_TEST(assetpolicy_krummholz_band_thins_tall_species_toward_the_treeline) {
+    // THE BAND, NOT A LINE (research section 3.6): approaching the
+    // temperature-adjusted treeline, the TALL species taper out while the
+    // small hold -- so the last few hundred metres below the line read as
+    // krummholz because of what is MISSING, with no krummholz special case.
+    AssetSpecies tall = anywhere(0, 1000);
+    tall.heightMm = 20'000;
+    AssetSpecies mid = anywhere(1, 1000);
+    mid.heightMm = 10'000;
+    AssetSpecies krummholz = anywhere(2, 1000);
+    krummholz.heightMm = 2'500;
+
+    auto below = [&](int32_t deltaMm) {
+        AssetColumnFacts c = goodGround(TAIGA, 800'000, 100);
+        c.treelineDeltaMm = deltaMm;
+        return c;
+    };
+    // Deep below the line nobody is touched.
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(tall, below(500'000))), 1000);
+    // 100 m below: the 300 m band has the tall crown at a third weight, the
+    // 150 m band has the mid tree at two thirds, the krummholz untouched.
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(tall, below(100'000))), 333);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(mid, below(100'000))), 666);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(krummholz, below(100'000))), 1000);
+    // At and above the line the tall are gone; the small still hold (the
+    // BIOME flip to alpine is what finally stops them, not this band).
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(tall, below(0))), 0);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(krummholz, below(0))), 1000);
+    // The sentinel is neutral: no temperature, no band.
+    AssetColumnFacts noTemp = goodGround(TAIGA, 800'000, 100);
+    CHECK_EQ(int(assetSpeciesSiteWeightQ10(tall, noTemp)), 1000);
+
+    // Warm aspects carry trees higher: the same column, 100 m below the line,
+    // reads better under a hot SW heat load and worse under a cold NE one.
+    AssetColumnFacts warm = below(100'000);
+    warm.heat = 254;
+    AssetColumnFacts cold = below(100'000);
+    cold.heat = 0;
+    CHECK(assetSpeciesSiteWeightQ10(tall, warm) > assetSpeciesSiteWeightQ10(tall, below(100'000)));
+    CHECK(assetSpeciesSiteWeightQ10(tall, cold) < assetSpeciesSiteWeightQ10(tall, below(100'000)));
+}
+
+VXC_TEST(assetpolicy_water_distance_gate_opens_when_the_channel_is_served) {
+    // The audit's headline: 112 authored riparian species, refused EVERYWHERE
+    // because the distance arrived as the sentinel. Serving a real distance is
+    // the whole fix -- no species change, no new gate.
+    AssetSpecies reed = anywhere(2, 800);
+    reed.waterMaxMm = 3'000; // within 3 m of water
+
+    AssetColumnFacts unknown = goodGround();
+    unknown.distanceToWaterMm = kAssetNoWaterDistanceMm;
+    CHECK(!assetSpeciesTolerates(reed, unknown));
+    CHECK_EQ(int(assetSpeciesFirstRefusal(reed, unknown)), int(AssetGate::kWaterDistance));
+
+    AssetColumnFacts shore = goodGround();
+    shore.distanceToWaterMm = 2'000;
+    CHECK(assetSpeciesTolerates(reed, shore));
+
+    AssetColumnFacts inland = goodGround();
+    inland.distanceToWaterMm = 40'000;
+    CHECK(!assetSpeciesTolerates(reed, inland));
+}
+
+// ---------------------------------------------------------------------------
+// 4. THE KIND x BIOME OCCUPANCY SCALAR (VXM2's density table, per species)
+// ---------------------------------------------------------------------------
+
+VXC_TEST(assetpolicy_occupancy_scalar_thins_a_saturated_biome_linearly_and_only_downward) {
+    // The saturation defect this exists to fix: a species whose summed weight
+    // saturates the occupancy cap stands on the layer density's share of
+    // cells in EVERY biome, so savanna == forest. The scalar must (a) thin a
+    // saturated biome by its stated fraction, (b) never add a site anywhere
+    // (veto-only), (c) at 1000 reproduce the unscaled world exactly, and (d)
+    // at 0 place nothing at all.
+    AssetSpecies full = anywhere(1, 1000);   // saturates: occupancy cap == 1000
+    AssetSpecies half = full;
+    for (int b = 0; b < kBiomeCount; ++b) half.occupancyPerMille[b] = 500;
+    AssetSpecies dark = full;
+    for (int b = 0; b < kBiomeCount; ++b) dark.occupancyPerMille[b] = 0;
+
+    int nFull = 0, nHalf = 0, nDark = 0, sites = 0;
+    for (int64_t cy = 0; cy < 60; ++cy)
+        for (int64_t cx = 0; cx < 60; ++cx) {
+            AssetSite s;
+            if (!assetSiteInCell(kSeed, kLayers[1], 1, cx, cy, s)) continue;
+            ++sites;
+            AssetInstance inst;
+            const bool keptFull = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &full, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            const bool keptHalf = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &half, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            const bool keptDark = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &dark, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            nFull += keptFull;
+            nHalf += keptHalf;
+            nDark += keptDark;
+            // (b) veto-only, site by site: the scalar may only remove.
+            CHECK(!(keptHalf && !keptFull));
+        }
+    CHECK(sites > 1000);       // the census is real
+    CHECK_EQ(nFull, sites);    // (c) saturated + neutral scalar: every site
+    CHECK_EQ(nDark, 0);        // (d)
+    // (a) 500 per-mille halves the population; a deterministic draw over
+    // 1400+ sites lands within a few percent of half.
+    CHECK(nHalf * 1000 > nFull * 450);
+    CHECK(nHalf * 1000 < nFull * 550);
+    std::printf("    occupancy scalar: %d sites, full %d, half %d, dark %d\n", sites, nFull,
+                nHalf, nDark);
+}
+
+VXC_TEST(assetpolicy_occupancy_scalar_is_per_biome) {
+    // One species, thinned in savanna and untouched in temperate forest: the
+    // same site keeps its tree in the forest and usually loses it in the
+    // savanna. This is the cross-biome contrast the census measured as absent.
+    AssetSpecies sp = anywhere(1, 1000);
+    sp.occupancyPerMille[SAVANNA] = 150;
+
+    int nForest = 0, nSavanna = 0, sites = 0;
+    for (int64_t cy = 0; cy < 40; ++cy)
+        for (int64_t cx = 0; cx < 40; ++cx) {
+            AssetSite s;
+            if (!assetSiteInCell(kSeed, kLayers[1], 1, cx, cy, s)) continue;
+            ++sites;
+            AssetInstance inst;
+            nForest += assetResolveSite(kSeed, kLayers, kAssetLayerCount, &sp, 1, s,
+                                        goodGround(TEMPERATE_FOREST), inst);
+            nSavanna += assetResolveSite(kSeed, kLayers, kAssetLayerCount, &sp, 1, s,
+                                         goodGround(SAVANNA), inst);
+        }
+    CHECK(sites > 400);
+    CHECK_EQ(nForest, sites);
+    CHECK(nSavanna > 0);
+    CHECK(nSavanna * 1000 < sites * 250); // ~150 per-mille, generous ceiling
+    std::printf("    per-biome occupancy: %d sites, forest %d, savanna %d\n", sites, nForest,
+                nSavanna);
+}

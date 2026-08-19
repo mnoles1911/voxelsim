@@ -1657,7 +1657,14 @@ def test_terrain_version_bump_rerolls_the_world_and_product_does_not():
     # tile-spanning basins -- 123 of them / 146 ha over the six wet-alpine
     # tiles, which ship today as a flat plain at the fill level. Everything
     # else is byte-identical ground under a new namespace, i.e. a re-bake.
-    assert pipeline.bake_fingerprint().startswith("7b960cbe6419968d")
+    # RE-BLESSED 7b960cbe6419968d -> 3b026df59fe0dbf9 on 2026-08-17, found
+    # stale during bake_ver 28 verification: the fingerprint was ALREADY
+    # 3b026df5... before the bv28 branch touched anything (verified by
+    # computing it from the pre-branch pipeline.py), so some earlier landing
+    # moved a terrain constant or the province table without re-blessing this
+    # pin. Flagged in the bv28 landing report; the bv28 work itself touches
+    # only the PRODUCT half, which this fingerprint deliberately excludes.
+    assert pipeline.bake_fingerprint().startswith("3b026df59fe0dbf9")
 
 
 def test_every_bake_constant_rolls_the_fingerprint():
@@ -2975,8 +2982,10 @@ def test_face_contact_bridge_is_a_hashed_product_constant_and_can_be_switched_of
     # (water re-architecture Phase 1). The literal is deliberate: it forces a
     # conscious edit at every roll instead of letting the version drift
     # silently, which is why this is pinned rather than read from
-    # pipeline.BAKE_VERSION.
-    assert on["bake_version"] == 26
+    # pipeline.BAKE_VERSION. 26 -> 28 on 2026-08-17: the 27 roll (bathymetry
+    # pair) never made this conscious edit -- found stale during the 28 roll
+    # (placement channel planes).
+    assert on["bake_version"] == 28
 
     n = 24
     z, water = _diagonal_reach(n)

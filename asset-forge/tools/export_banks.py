@@ -29,6 +29,19 @@ was still on disk -- no error, no warning, a world composed from a library it no
 longer matches. So every bake now stamps `spec.spec_hash` into banks/BAKED.json
 and a changed hash re-bakes. `tools/enginecheck.py` is the standalone check and
 explains what the hash can and cannot see (it covers the SPEC, not `forge/`).
+
+THE PUBLISH GATE (`spec.curation`) IS HONORED HERE, NOT ONLY IN THE MANIFEST,
+because the engine's AssetBankLibrary scans the banks directory by layout: a
+file left on disk for a species a curator rejected, or for a seed a curator
+pulled, is not dead bytes waiting politely -- it is one directory listing away
+from being served. So a species whose verdict is draft or rejected has its
+bank REMOVED (each removal printed), and an approved species with an explicit
+seed list bakes exactly that list and has any other seed's file removed. A
+spec with no block is grandfathered approved at seeds 1-4 (see the resolver's
+docstring for why absence publishes) and bakes `--seeds` as it always has, so
+the gate's arrival changed no byte of the library on disk. `--seeds` applies
+to uncurated species only: an explicit verdict is per-species truth and a
+command-line default does not override it.
 """
 from __future__ import annotations
 
@@ -97,7 +110,7 @@ def main() -> int:
             record = {}
     known: dict = record.get("species", {})
 
-    baked = refused = skipped = failed = stale = 0
+    baked = refused = skipped = failed = stale = held = pruned = 0
     t0 = time.time()
     report = manifest.ExportReport()
 
@@ -112,6 +125,33 @@ def main() -> int:
         kind = sm.get(body, "kind")
         if kind not in args.kind:
             continue
+
+        # The publish gate. A held-back verdict is always explicit (absence
+        # resolves to approved), so removing the bank is carrying out a
+        # decision a person wrote down, not this tool's own judgement.
+        cur = sm.curation(body)
+        if cur["status"] != "approved":
+            d = banks / name
+            if d.is_dir():
+                n = 0
+                for f in sorted(d.iterdir()):
+                    if f.is_file():
+                        f.unlink()
+                        n += 1
+                try:
+                    d.rmdir()
+                except OSError:
+                    pass  # something non-file inside; the .vxa files are gone
+                known.pop(name, None)
+                pruned += n
+                print(f"  {name}: {cur['status']}, bank removed ({n} file(s))")
+            else:
+                print(f"  {name}: {cur['status']}, bank skipped")
+            held += 1
+            continue
+        # Curated seed list overrides --seeds; uncurated bakes what was asked.
+        want_seeds = cur["seeds"] if cur["curated"] else args.seeds
+
         layer = manifest.assign_layer(
             kind, manifest.nominal_height_m(body, kind), report, name,
             float(sm.get(body, "placement.spacing_m")))
@@ -138,8 +178,23 @@ def main() -> int:
                   f"re-baking (its bank served the old species)")
             stale += 1
 
+        # A curated species' bank holds its approved seeds and NOTHING ELSE:
+        # the engine indexes the files it finds, so a pulled seed's file has
+        # to leave the disk, not merely stop being counted.
+        if cur["curated"]:
+            d = banks / name
+            keep = set(cur["seeds"])
+            if d.is_dir():
+                for f in sorted(d.iterdir()):
+                    m = manifest.SEED_FILE_RE.search(f.name)
+                    if m and int(m.group(1)) not in keep:
+                        f.unlink()
+                        pruned += 1
+                        print(f"  {name}: seed {int(m.group(1))} is not on the "
+                              f"approved list, file removed")
+
         seeds_done: list[int] = []
-        for seed in args.seeds:
+        for seed in want_seeds:
             dst = banks / name / f"{name}-{seed:04d}.vxa"
             if dst.exists() and not args.force and not moved:
                 skipped += 1
@@ -166,7 +221,7 @@ def main() -> int:
         # Stamped only if every requested seed is on disk. A partial bake that
         # recorded the new hash would be worse than no record at all: the check
         # would call it clean while some seeds still served the old species.
-        if seeds_done and len(seeds_done) == len(args.seeds):
+        if seeds_done and len(seeds_done) == len(want_seeds):
             known[name] = {"spec_hash": now_hash, "layer": layer,
                            "seeds": sorted(seeds_done)}
 
@@ -176,7 +231,8 @@ def main() -> int:
 
     print(f"banks: baked {baked}, skipped {skipped} existing, "
           f"re-baked {stale} stale, refused {refused}, "
-          f"failed {failed}, in {time.time() - t0:,.0f} s")
+          f"failed {failed}, held back {held} by curation "
+          f"(pruned {pruned} file(s)), in {time.time() - t0:,.0f} s")
     print(f"  spec hashes recorded for {len(known)} species in {record_path}")
     # Refusals are DELIBERATE and named above; build failures mean the bake is
     # incomplete and the manifest's seeds_baked will say so per species.

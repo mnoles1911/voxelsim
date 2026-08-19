@@ -70,7 +70,59 @@ namespace
 	// So the version is pinned ALONGSIDE the digest and asserted, which is what
 	// makes the discipline mechanical instead of remembered: bump
 	// kWorldGenVersion without re-measuring this and the build stops.
-	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 23;
+	// v24 AND v25 ADDED THE ASSET TERM AND MUST NOT MOVE THIS, and the reason is
+	// structural rather than a hope. The fold below is over vxc::Amplifier and
+	// vxc::meshBrick -- the TERRAIN function -- and v24/v25 changed nothing in
+	// it: they made a species manifest, VXA banks and the four-layer scatter
+	// table into worldgen input, composed inside GeneratedWorld::makeBrick and
+	// materialAt when a host INSTALLS an AssetField. This path installs none, so
+	// the asset term is not merely unchanged here, it is absent.
+	//
+	// Independently checked on the CPU bench before touching this file: the
+	// terrain-only digest is e02458de2be47309 at v23, v24 and v25 alike, while
+	// vxc_bench --assets moved 3b5fe7ec61c6581a -> 41ec6bbf103f18dc. Two folds,
+	// one moved, one did not, exactly as the split intends.
+	//
+	// So this is a THIRD version in a row where the pin is expected not to move
+	// -- v22's savanna gate and v23's fine-tier cap were both unreachable from
+	// these fixtures. Read it the way the v22 and v23 notes above ask: it
+	// confirms the terrain function was not disturbed, and says NOTHING about
+	// whether the asset term is right. Nothing in this gate exercises an asset,
+	// because nothing here installs one. The evidence for v24/v25 is the
+	// placement census (32,669 sites -> 9,898 instances, 0 floating anchors of
+	// 9,898 independently re-read) and the 697-test suite, not this constant.
+	//
+	// v26 (placement channels: water-distance/TWI/talus planes, bake_ver 28):
+	// same shape as the v25 move -- the new channels are ASSET-PLACEMENT
+	// inputs, not terrain, so the verify region's bytes cannot move; the
+	// channel owner re-verified the terrain digest unchanged (e02458de2be47309
+	// on the fixture leg) before bumping. Version mirror moves, digest stays.
+	//
+	// v27 (biome rebalance: dry-land cliff gate removed, submarine cliff gate
+	// added, grassland/forest boundary 800 -> 450 mm/yr) IS a terrain change
+	// -- surfaceMat moves on real ground and vxc_gpu's nine-region combined
+	// digest moved b5f00a706e10ec12 -> f85c29b31b0b18fa -- and this pin STILL
+	// did not, which was re-measured, not assumed: a standalone mirror of the
+	// fold below (the v22 protocol; validated by reproducing b2b5d2f1044caa35
+	// byte for byte on the pre-change tree) prints the identical value after.
+	// The reason is fixture reachability, same shape as v22: neither digest
+	// region contains a column steeper than 700 mm/m on either side of sea
+	// level (so neither the removed land gate nor the added submarine gate
+	// ever fired or fires there), and both regions' temperatures (u8 66..114)
+	// sit below kBiomeTempColdU8 = 143, so every land column is TAIGA before
+	// the moved precipitation boundary is consulted. The bench's OTHER
+	// fixtures do reach the morphology change and prove CPU/GPU agreement on
+	// it -- fine-tier's col0 flips MAT_MUD -> MAT_ROCK (new submarine branch)
+	// and density-band-cliff's col0 flips MAT_ROCK -> MAT_PERMAFROST (removed
+	// land branch), bit-exact on both sides. What NO fixture demonstrably
+	// crosses is the semi band itself (precip u8 in [10, 17) with temp >=
+	// 143): the kBiomePrecipSemiU8 literal in worldgen.ush came from
+	// vxc_dump_biome_constants rather than hand arithmetic, and the CPU-side
+	// effect is measured by the coarse-corpus census (core.h's v27 entry),
+	// but the parity gate would not catch a wrong u8 there. Same fixture-gap
+	// shape v22 documented; a semi-band region in kBandOnlyRegions is the
+	// close, if anyone needs it proven.
+	constexpr uint32 kExpectedCpuDigestWorldGenVersion = 28;
 	static_assert(vxc::kWorldGenVersion == kExpectedCpuDigestWorldGenVersion,
 	              "vxc::kWorldGenVersion moved without kExpectedCpuDigest being re-measured. "
 	              "Run voxel.GPU.VerifyRegion over BOTH fixture regions, take the 'got' value "

@@ -182,6 +182,26 @@ SECTION_BATHY_DEPTH_INDEX = 9
 SECTION_BATHY_DEPTH_DATA = 10
 SECTION_BATHY_SHORE_INDEX = 11
 SECTION_BATHY_SHORE_DATA = 12
+#: The placement channel planes (bake_ver 28, docs/vxtl-v2-format.md section 6.2):
+#: five uint8 planes consumed by asset placement -- distance-to-water, TWI
+#: moisture, talus flux, curvature, heat load. SUBSAMPLED 4x (edge = size // 4,
+#: 7.5 m/px at production): the consumers are tolerance gates authored in whole
+#: metres and weight multipliers smoother than any 7.5 m feature, so full
+#: resolution would be 16x the bytes for nothing. Same block machinery as the
+#: flow plane (u8 elements, auto-RAW), same block_log2 -- the plane is simply
+#: 8x8 blocks instead of 32x32. All five ship together under one flag bit; the
+#: value encodings are normative in the format doc, mirrored in
+#: voxelcore/tilestore.h.
+SECTION_PLACE_DIST_WATER_INDEX = 13
+SECTION_PLACE_DIST_WATER_DATA = 14
+SECTION_PLACE_TWI_INDEX = 15
+SECTION_PLACE_TWI_DATA = 16
+SECTION_PLACE_TALUS_INDEX = 17
+SECTION_PLACE_TALUS_DATA = 18
+SECTION_PLACE_CURV_INDEX = 19
+SECTION_PLACE_CURV_DATA = 20
+SECTION_PLACE_HEAT_INDEX = 21
+SECTION_PLACE_HEAT_DATA = 22
 
 FLAG_FLOW_PRESENT = 1 << 0
 FLAG_BASINS_PRESENT = 1 << 1
@@ -209,6 +229,68 @@ FLAG_HEADS_PRESENT = 1 << 3
 #: computed together from one extent pass and there is no case where a tile
 #: would carry depth without shore distance or the reverse.
 FLAG_BATHY_PRESENT = 1 << 4
+#: bake_ver 28: SECTION_PLACE_* are present -- all ten sections (five planes)
+#: or none, one flag bit, for the reason FLAG_BATHY_PRESENT covers both its
+#: planes: they are one bake stage's output and a consumer that could see TWI
+#: without the water distance would need per-plane residency semantics that
+#: "empty is a statement" exists to avoid. Set even on a tile with no water and
+#: no cliffs anywhere: "surveyed, everything is far from water" and "baked
+#: before placement channels existed" are different facts, and asset placement
+#: fails CLOSED on the second (a riparian species is refused when the distance
+#: is unknown) -- conflating them would refuse those species on every new tile
+#: too.
+FLAG_PLACEMENT_PRESENT = 1 << 5
+
+#: Placement planes are subsampled by this factor (docs/vxtl-v2-format.md
+#: section 6.2). A decoder derives the plane edge as `size // 4`; it is not a
+#: header field, deliberately -- one more knob would be one more way for the
+#: two halves to disagree.
+PLACEMENT_SUBSAMPLE = 4
+#: dist_water: metres of ground per stored step, and the saturated/unknown top
+#: code. 254 * 2 m = 508 m of expressible distance against a library whose
+#: largest authored water_max_m is 250.
+PLACEMENT_DIST_LSB_M = 2.0
+PLACEMENT_DIST_UNKNOWN = 255
+#: twi: stored = clamp(round((twi + PLACEMENT_TWI_OFFSET) * PLACEMENT_TWI_SCALE),
+#: 0, 254); 255 = not computable.
+PLACEMENT_TWI_OFFSET = 3.0
+PLACEMENT_TWI_SCALE = 8.0
+PLACEMENT_TWI_UNKNOWN = 255
+#: talus: stored = clamp(round(PLACEMENT_TALUS_SCALE * ln(1 + flux)), 0, 254).
+PLACEMENT_TALUS_SCALE = 48.0
+#: curvature: stored = clamp(128 + round(laplacian_per_m * PLACEMENT_CURV_SCALE),
+#: 0, 255); 128 is flat, above concave (hollow), below convex (ridge).
+PLACEMENT_CURV_SCALE = 640.0
+#: heatload: stored = round(h * 254), h in [0, 1], 0.5 = flat/neutral.
+PLACEMENT_HEAT_SCALE = 254.0
+
+#: The five planes in wire order, with their section id pairs. One place, so
+#: the encoder, the decoder and the identity payload cannot disagree about
+#: which id carries which plane.
+PLACEMENT_PLANE_NAMES = ("dist_water", "twi", "talus", "curv", "heat")
+
+
+def placement_block_log2(size: int, block_log2: int) -> int:
+    """The block edge the SUBSAMPLED planes use, derived, never stored.
+
+    The header's `block_log2` where the plane is big enough (production:
+    2048-px planes, 256-px blocks, 8x8), clamped down to the largest power of
+    two that divides the plane edge where it is not (a 512-px fixture tile has
+    a 128-px plane and gets one 128-px block). Derived identically by both
+    halves -- a second header field would be one more way to disagree.
+    """
+    pedge = size // PLACEMENT_SUBSAMPLE
+    pl = min(block_log2, pedge.bit_length() - 1)
+    while pl > 0 and pedge % (1 << pl):
+        pl -= 1
+    return pl
+PLACEMENT_SECTIONS = (
+    (SECTION_PLACE_DIST_WATER_INDEX, SECTION_PLACE_DIST_WATER_DATA),
+    (SECTION_PLACE_TWI_INDEX, SECTION_PLACE_TWI_DATA),
+    (SECTION_PLACE_TALUS_INDEX, SECTION_PLACE_TALUS_DATA),
+    (SECTION_PLACE_CURV_INDEX, SECTION_PLACE_CURV_DATA),
+    (SECTION_PLACE_HEAT_INDEX, SECTION_PLACE_HEAT_DATA),
+)
 
 # --- SECTION_WATER_* payload: DEPTH ABOVE THE QUANTISED BED ----------------
 #
@@ -608,6 +690,14 @@ class TileV2:
     #: basins.BATHY_DEPTH_LSB_MM and BATHY_SHORE_LSB_MM respectively.
     bathy_depth: "np.ndarray | None" = None   # (size,size) int16, 10 mm, -1 dry
     bathy_shore: "np.ndarray | None" = None   # (size,size) int16, 100 mm, signed
+    #: Placement channel planes (bake_ver 28), set flags bit5. All five or
+    #: none -- see FLAG_PLACEMENT_PRESENT. uint8 at (size // PLACEMENT_SUBSAMPLE)
+    #: per edge; value encodings in docs/vxtl-v2-format.md section 6.2.
+    place_dist_water: "np.ndarray | None" = None
+    place_twi: "np.ndarray | None" = None
+    place_talus: "np.ndarray | None" = None
+    place_curv: "np.ndarray | None" = None
+    place_heat: "np.ndarray | None" = None
     #: Which SECTION_BASIN_TABLE layout to WRITE. Explicit rather than inferred
     #: from whether the rows carry v2 fields: "these rows have no identity" and
     #: "this tile is a v1 tile" are different statements, and a v2 bake that
@@ -615,6 +705,11 @@ class TileV2:
     #: the silent downgrade `_pack_v2_tail` refuses. Only the v1 fixture
     #: generator sets this.
     basin_table_version: int = BASIN_TABLE_VERSION
+
+    def placement_planes(self) -> "tuple[np.ndarray | None, ...]":
+        """The five placement planes in PLACEMENT_PLANE_NAMES / wire order."""
+        return (self.place_dist_water, self.place_twi, self.place_talus,
+                self.place_curv, self.place_heat)
 
     def __post_init__(self) -> None:
         assert self.scale == FINE_SCALE, f"v2 scale must be {FINE_SCALE}"
@@ -648,6 +743,23 @@ class TileV2:
             if _p is not None:
                 assert _p.shape == (self.size, self.size), f"{_name} shape"
                 assert _p.dtype == np.int16, f"{_name} dtype"
+        _place = self.placement_planes()
+        assert len({p is None for p in _place}) == 1, (
+            "the five placement planes must be given together (one flag bit "
+            "covers all of them)"
+        )
+        _pedge = self.size // PLACEMENT_SUBSAMPLE
+        assert self.size % PLACEMENT_SUBSAMPLE == 0
+        # The subsampled planes use `placement_block_log2`, derived from the
+        # header -- see that function for the rule both halves share.
+        _pbs = 1 << placement_block_log2(self.size, self.block_log2)
+        for _name, _p in zip(PLACEMENT_PLANE_NAMES, _place):
+            if _p is not None:
+                assert _pedge % _pbs == 0, (
+                    f"placement plane edge {_pedge} not a multiple of the "
+                    f"derived block edge {_pbs}")
+                assert _p.shape == (_pedge, _pedge), f"{_name} shape {_p.shape}"
+                assert _p.dtype == np.uint8, f"{_name} dtype"
         if self.basins is not None:
             for i, b in enumerate(self.basins):
                 assert b.basin_id == i, "basin ids must be 0..n-1 in order"
@@ -1656,6 +1768,8 @@ def encode_v2(
         flags |= FLAG_HEADS_PRESENT
     if tile.bathy_depth is not None:
         flags |= FLAG_BATHY_PRESENT
+    if tile.place_dist_water is not None:
+        flags |= FLAG_PLACEMENT_PRESENT
 
     elev_index, elev_data = _encode_plane(
         tile.elevation_cp.astype(np.int64),
@@ -1707,6 +1821,21 @@ def encode_v2(
                 block_log2=tile.block_log2,
                 codec=tile.codec,
                 elem_dtype="<i2",
+                compressor=compressor,
+            )
+            sections += [(_ix, _index), (_dx, _data)]
+
+    if tile.place_dist_water is not None:
+        # The same u8 path as the flow plane (auto-RAW applies), on the 4x
+        # subsampled edge, at the DERIVED block size both halves share.
+        _pbl = placement_block_log2(tile.size, tile.block_log2)
+        for _plane, (_ix, _dx) in zip(tile.placement_planes(),
+                                      PLACEMENT_SECTIONS):
+            _index, _data = _encode_plane(
+                _plane.astype(np.int64),
+                block_log2=_pbl,
+                codec=tile.codec,
+                elem_dtype="u1",
                 compressor=compressor,
             )
             sections += [(_ix, _index), (_dx, _data)]
@@ -1830,7 +1959,8 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
     )
 
     if flags & ~(FLAG_FLOW_PRESENT | FLAG_BASINS_PRESENT | FLAG_WATER_PRESENT
-                 | FLAG_HEADS_PRESENT | FLAG_BATHY_PRESENT):
+                 | FLAG_HEADS_PRESENT | FLAG_BATHY_PRESENT
+                 | FLAG_PLACEMENT_PRESENT):
         # Same posture as the C++ parser: an undefined flag bit can only mean
         # the bytes came from something this decoder does not understand, and
         # reading them anyway is how a client silently mis-renders a world.
@@ -1889,6 +2019,27 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
     elif any(i in sections for i in _bathy_ids):
         raise ValueError("bathymetry sections present but the bathymetry flag is clear")
 
+    place = {}
+    _place_ids = [i for pair in PLACEMENT_SECTIONS for i in pair]
+    if flags & FLAG_PLACEMENT_PRESENT:
+        missing = [i for i in _place_ids if i not in sections]
+        if missing:
+            raise ValueError(
+                f"placement flag set but sections {missing} are missing")
+        if size % PLACEMENT_SUBSAMPLE != 0:
+            raise ValueError("size not a multiple of PLACEMENT_SUBSAMPLE")
+        _pedge = size // PLACEMENT_SUBSAMPLE
+        _pbl = placement_block_log2(size, block_log2)
+        for _name, (_ix, _dx) in zip(PLACEMENT_PLANE_NAMES, PLACEMENT_SECTIONS):
+            place[_name] = _decode_plane(
+                sections[_ix], sections[_dx],
+                size=_pedge, block_log2=_pbl, codec=codec,
+                elem_dtype="u1", out_dtype=np.uint8, decompressor=decompressor,
+            )
+    elif any(i in sections for i in _place_ids):
+        raise ValueError(
+            "placement sections present but the placement flag is clear")
+
     heads = None
     if flags & FLAG_HEADS_PRESENT:
         if SECTION_HEADWATERS not in sections:
@@ -1907,6 +2058,11 @@ def decode_v2(data: bytes, *, decompressor: Decompressor | None = None) -> TileV
         quant=quant, codec=codec, bake_ver=bake_ver,
         block_log2=block_log2, flow=flow, basins=basins, water_cp=water_cp,
         heads=heads, bathy_depth=bathy_depth, bathy_shore=bathy_shore,
+        place_dist_water=place.get("dist_water"),
+        place_twi=place.get("twi"),
+        place_talus=place.get("talus"),
+        place_curv=place.get("curv"),
+        place_heat=place.get("heat"),
         scale=scale, predictor=predictor, parent_scale=parent_scale,
     )
 
@@ -2017,6 +2173,16 @@ def encode_fine(
     #: latter. Both or neither -- TileV2 asserts it.
     bathy_depth: "np.ndarray | None" = None,
     bathy_shore: "np.ndarray | None" = None,
+    #: The five placement channel planes from `bake.placement.placement_planes`,
+    #: already in wire units (uint8 at size // PLACEMENT_SUBSAMPLE per edge --
+    #: docs/vxtl-v2-format.md section 6.2). Finished rasters for the same
+    #: reason the bathymetry pair is: the format lives here, the geomorphology
+    #: lives in the bake. All five or none -- TileV2 asserts it.
+    place_dist_water: "np.ndarray | None" = None,
+    place_twi: "np.ndarray | None" = None,
+    place_talus: "np.ndarray | None" = None,
+    place_curv: "np.ndarray | None" = None,
+    place_heat: "np.ndarray | None" = None,
     bake_ver: int | None = None,
     codec: int = CODEC_RAW,
     block_log2: int = DEFAULT_BLOCK_LOG2,
@@ -2107,6 +2273,17 @@ def encode_fine(
                          else np.ascontiguousarray(bathy_depth, np.int16)),
             bathy_shore=(None if bathy_shore is None
                          else np.ascontiguousarray(bathy_shore, np.int16)),
+            place_dist_water=(None if place_dist_water is None
+                              else np.ascontiguousarray(place_dist_water,
+                                                        np.uint8)),
+            place_twi=(None if place_twi is None
+                       else np.ascontiguousarray(place_twi, np.uint8)),
+            place_talus=(None if place_talus is None
+                         else np.ascontiguousarray(place_talus, np.uint8)),
+            place_curv=(None if place_curv is None
+                        else np.ascontiguousarray(place_curv, np.uint8)),
+            place_heat=(None if place_heat is None
+                        else np.ascontiguousarray(place_heat, np.uint8)),
             basin_table_version=int(basin_table_version),
         )
     )

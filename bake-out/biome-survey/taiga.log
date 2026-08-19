@@ -1,0 +1,95 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 120 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15500, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 300, detail]
+coarse tiles: loaded 289, rejected 0 from D:/vox-wet-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+terrain: synthetic elevation, REAL coarse-tile climate, water datum NONE (dry world), placement planes NONE (sentinels)
+
+=== widening census: 25921 footprints (0 declined) over [-159001,-158489]x[-80251,-79739] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :    23071 footprints (89.0%)
+   45000 mm :     2850 footprints (10.9%)
+extra admitted chunk layers (sky side, dilation included):
+  +  8 chunks :     5989 footprints
+  +  9 chunks :    17079 footprints
+  + 10 chunks :        3 footprints
+  + 15 chunks :     1647 footprints
+  + 16 chunks :     1203 footprints
+mean extra: 9.47 chunk layers per footprint
+components: mean widening 27198 mm (8.4 chunks), mean dilation slack 4041 mm (1.2 chunks)
+baseline surface shell (sampled 441 footprints): mean 1.15 chunk layers
+
+=== placement census over [-158873,-158617]x[-80123,-79867] m ===
+sites considered: 41460 (per layer: L0=9 L1=1106 L2=8215 L3=32130)
+instances resolved: 31459 (per layer: L0=7 L1=896 L2=6276 L3=24280)
+species represented: 50
+anchor contact audit: 31459 audited, 0 NOT SOLID
+species histogram (name, instances; * = water-gated riparian):
+    american-beech               23
+    arctic-willow-thicket      1145
+    bilberry-mat               2915
+    birch                       137
+    bracken                    1439
+    bramble-thicket            1173
+    charcoal-blackened-block      8
+    columnar-cypress             15
+    common-bluebell             675
+    common-dog-violet           569
+    corestone-tor                 1
+    douglas-fir                   1
+    dwarf-birch                1295
+    feather-moss               3152
+    fireweed                   1076
+    foxglove                     28
+    granite-boulder              26
+    harebell                    280
+    hazel-coppice               484
+    jointed-granite-tor           1
+    juniper-scrub               391
+    leaf-littered-slab           44
+    lily-of-the-valley          675
+    male-fern                  1085
+    meadow-grass               1481
+    moss-cushion               1019
+    mountain-laurel             660
+    norway-spruce                 2
+    oxeye-daisy                 505
+    quaking-aspen               167
+    red-huckleberry             728
+    reindeer-lichen            3465
+    rhododendron-thicket        784
+    rowan                        64
+    salal                       388
+    scots-pine                   94
+    siberian-larch                1
+    sugar-maple                  18
+    sword-fern                  789
+    sycamore-maple               13
+    temperate-sapling          1008
+    trout-lily                  324
+    tundra-pine                 274
+    veined-granite                3
+    western-hemlock               1
+    wood-anemone                708
+    wood-sedge                  767
+    woolly-fringe-moss         1105
+    wych-elm                     10
+    yarrow                      443
+riparian (water-gated) species placed: 0 species, 0 instances
+gate attribution over 7963772 (site, species) pairs:
+  tolerated                        812078 (10.1%)
+  biome weight 0                  5814305 (73.0%)
+  elevation band                   273488 (3.4%)
+  below slope min                    2212 (0.0%)
+  water distance (far/unknown)    1061689 (13.3%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope   0- 15%:  31459 instances, mean height   1.3 m
+kinds: tree=1828 bush=7048 rock=83 grass=17217 flower=5283
+height: mean 1.3 m, median 0.5 m over 31459 instances
+distance to water at anchors: <=2m 0, <=10m 0, <=30m 0, <=120m 0, >120m 0, unknown 31459; wet anchors 0
+slope bands: 0-15% 31459, 15-30% 0, 30-45% 0, 45-60% 0, 60%+ 0
+treeline: below 31459, above 0, unknown 0
+stampable voxels over resolved terrain instances: 66638442
+banks: 31459 requests, 26176 served, 0 miss(no species), 5283 miss(no seeds), 160 files loaded, 0 refused, 0 seed-count mismatches, 28007905 bytes resident
+overlay: wrote bake-out/biome-survey/taiga.instances.csv and bake-out/biome-survey/taiga.ground.bin (138x138 @ 1875 mm, AMPLIFIED-COARSE ground: sea-only datum, no shore distance)
+json: wrote bake-out/biome-survey/taiga.json (101 counters)
+VERDICT: placement wired; 31459 instances, all anchors solid, none submerged

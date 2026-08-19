@@ -69,7 +69,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .cache import TileCache
+from .cache import WORLD_MANIFEST_NAME, TileCache
 
 #: Bumped when the SHAPE of the record changes. A manifest written by a newer
 #: schema is refused rather than half-understood: partial comprehension of an
@@ -340,3 +340,120 @@ def record_world_identity(
 def read_world_manifest(path: "str | Path") -> dict:
     """Load a manifest from an explicit path, for tools and for humans."""
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# READING the record back: which namespace should a CLIENT be pointed at?
+# ---------------------------------------------------------------------------
+
+
+def find_fine_namespaces(
+    cache_root: "str | Path",
+    seed: int,
+    *,
+    tiles: "list[tuple[int, int]] | None" = None,
+    coarse_provider_id: str | None = None,
+) -> list[dict]:
+    """Every baked fine namespace under ``cache_root`` for ``seed``, READ off
+    disk. The answer to "what do I pass as ``-VoxelFineTileProviderId``?".
+
+    WHY THIS IS A READER AND NEVER A RECOMPUTE
+    ------------------------------------------
+    On 2026-08-18 a capture run died three times on the fine-tier residency
+    gate, and each time it was worked around by hand-pinning
+    ``-VoxelFineTileProviderId``. The cause was not a wrong hash on either
+    side. It was that NOTHING RECONCILES THE TWO SIDES:
+
+    * The bake COMPUTES its namespace -- ``fine_id_for(provider_id())``, whose
+      ``-bXXXXXXXX`` suffix is a sha256 over ``bake_identity_payload()`` and
+      ``product_identity_payload()``. So it moves whenever a bake constant
+      moves; ``bake_ver`` 27 -> 28 moved it ``-bdcab4bed`` -> ``-b19d281fd``.
+    * The engine COMPUTES NOTHING. It reads a literal string from
+      ``-VoxelFineTileProviderId`` or, failing that, ``DefaultFineTileProviderId``
+      in ``ue-project/Config/DefaultGame.ini``.
+
+    Between those two sits a human copying nine hex characters into an ini
+    after every bake change. That is the entire reconciliation mechanism, and
+    it is the thing that failed. Recomputing the fingerprint on the client side
+    would not fix it -- it would need a second implementation of a Python
+    sha256 in C++, i.e. a second answer to a question that content addressing
+    exists to have exactly one answer to.
+
+    So the authority is the record the bake already writes: ``world-identity.json``
+    carries ``namespace_id``, which IS the directory it was written into. This
+    function reads those records. It derives nothing.
+
+    ``tiles`` filters to namespaces that actually hold every listed coarse tile,
+    which is the question a capture harness really has -- "where can I fly THIS
+    camera?" -- and is what distinguishes a stale pin (tile is baked, elsewhere)
+    from a coverage gap (tile is baked nowhere).
+
+    ``coarse_provider_id`` filters to fine namespaces derived from one coarse
+    world. Matched by prefix, which is sound precisely because ``fine_id_for``
+    SUFFIXES rather than re-hashes -- see its docstring for why that shape was
+    chosen.
+
+    Returns one dict per namespace, newest bake first::
+
+        {"namespace_id", "path", "created_utc", "provider_id",
+         "has_manifest", "tiles_present", "tiles_missing"}
+
+    Namespaces with no manifest are still reported (``has_manifest`` False):
+    the 289-tile world predates the manifest entirely, and a reader that hid
+    the directories it cannot vouch for would answer "nowhere" for the world
+    that matters most.
+    """
+    root = Path(cache_root)
+    seed_hex = f"{int(seed):016x}"
+    wanted = [tuple(t) for t in (tiles or [])]
+    found: list[dict] = []
+    if not root.is_dir():
+        return found
+
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        world = entry / seed_hex
+        if not world.is_dir():
+            continue  # this namespace holds nothing for this seed
+        if coarse_provider_id and not entry.name.startswith(coarse_provider_id):
+            continue
+
+        record: dict = {}
+        manifest_path = world / WORLD_MANIFEST_NAME
+        try:
+            record = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            record = {}
+        identity = record.get("identity") or {}
+
+        present, missing = [], []
+        for tx, ty in wanted:
+            if (world / "s16" / f"{tx}_{ty}.vxtl").is_file():
+                present.append((tx, ty))
+            else:
+                missing.append((tx, ty))
+
+        found.append(
+            {
+                # The DIRECTORY NAME is the namespace, always. A manifest whose
+                # recorded namespace_id disagreed with the directory holding it
+                # would be a record that had been moved; reported below rather
+                # than trusted over the path the client will actually open.
+                "namespace_id": entry.name,
+                "path": world,
+                "created_utc": record.get("created_utc"),
+                "provider_id": identity.get("provider_id"),
+                "recorded_namespace_id": identity.get("namespace_id"),
+                "has_manifest": bool(record),
+                "tiles_present": present,
+                "tiles_missing": missing,
+            }
+        )
+
+    # Newest first, undated last: the freshest bake is what a capture almost
+    # always wants, and an undated namespace is one nobody can date, not one
+    # from the beginning of time.
+    found.sort(key=lambda d: (d["created_utc"] is not None, d["created_utc"] or ""),
+               reverse=True)
+    return found

@@ -199,6 +199,36 @@ enum FineSectionId : uint32_t {
     kSectionBathyDepthData = 10,
     kSectionBathyShoreIndex = 11,
     kSectionBathyShoreData = 12,
+    // The placement channel planes (bake_ver 28, docs/vxtl-v2-format.md §6.2):
+    // five uint8 planes consumed by ASSET PLACEMENT -- distance-to-water over
+    // the full wet union (lakes + rivers + sea; the bathy shore plane above is
+    // LAKES ONLY and serving it to the water-distance gate is the trap the
+    // placement design's §12.6 documents), TWI moisture, talus flux,
+    // curvature, and heat load. SUBSAMPLED 4x: the plane edge is size/4 and
+    // the block edge is DERIVED (finePlacementBlockLog2 below), never stored.
+    // Same u8 block machinery as the flow plane otherwise.
+    kSectionPlaceDistWaterIndex = 13,
+    kSectionPlaceDistWaterData = 14,
+    kSectionPlaceTwiIndex = 15,
+    kSectionPlaceTwiData = 16,
+    kSectionPlaceTalusIndex = 17,
+    kSectionPlaceTalusData = 18,
+    kSectionPlaceCurvIndex = 19,
+    kSectionPlaceCurvData = 20,
+    kSectionPlaceHeatIndex = 21,
+    kSectionPlaceHeatData = 22,
+};
+
+// The five placement planes, in wire order -- index i's sections are
+// (kSectionPlaceDistWaterIndex + 2*i, +1). One enum so the decoder, the
+// residency tests and every consumer name a plane the same way.
+enum FinePlacementPlane : uint32_t {
+    kPlacementDistWater = 0,
+    kPlacementTwi = 1,
+    kPlacementTalus = 2,
+    kPlacementCurv = 3,
+    kPlacementHeat = 4,
+    kPlacementPlaneCount = 5,
 };
 
 // SECTION_BASIN_TABLE payload layout, mirroring terrain_service/tile_codec.py.
@@ -402,6 +432,16 @@ inline constexpr uint16_t kFineFlagHeadsPresent = 0x8;
 // carries depth without shore distance or the reverse, so the parser below
 // requires all four sections or none. Mirrors tile_codec.FLAG_BATHY_PRESENT.
 inline constexpr uint16_t kFineFlagBathyPresent = 0x10;
+// §3 `flags` bit5 (bake_ver 28): SECTION_PLACE_* are present -- ALL TEN
+// SECTIONS (five planes) or none, one bit, for the same reason the bathy bit
+// covers its pair: one bake stage's output, and per-plane residency semantics
+// are what "empty is a statement" exists to avoid. Set even on a tile with no
+// water and no cliffs anywhere: asset placement fails CLOSED on a pre-28 tile
+// (a riparian species is refused when the distance is unknown), so "surveyed,
+// everything far from water" and "baked before the channels existed" must not
+// be conflated -- conflating them would refuse those species on new tiles too.
+// Mirrors tile_codec.FLAG_PLACEMENT_PRESENT.
+inline constexpr uint16_t kFineFlagPlacementPresent = 0x20;
 // EVERY BIT THIS BUILD IMPLEMENTS. `flags & ~kFineFlagsKnown` is the parser's
 // hard refusal (kUnknownFeature), so a bit missing from this mask means every
 // tile carrying it is thrown away whole -- which is the correct behaviour for a
@@ -409,7 +449,7 @@ inline constexpr uint16_t kFineFlagBathyPresent = 0x10;
 // merely forgot to list a bit it does implement.
 inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasinsPresent |
                                             kFineFlagWaterPresent | kFineFlagHeadsPresent |
-                                            kFineFlagBathyPresent;
+                                            kFineFlagBathyPresent | kFineFlagPlacementPresent;
 
 // The newest `bake_ver` whose ON-TILE FEATURES this build implements -- i.e.
 // the last bake_ver that added a section id or a flag bit that the parser
@@ -440,7 +480,10 @@ inline constexpr uint16_t kFineFlagsKnown = kFineFlagFlowPresent | kFineFlagBasi
 // section ids (kSectionBathy*) and a new flag bit (kFineFlagBathyPresent), so
 // the same rule applies again. 25 and 26 were product bumps over an unchanged
 // layout.
-inline constexpr uint16_t kFineMaxKnownBakeVer = 27;
+//
+// 27 -> 28 at the placement channel planes: ten new section ids
+// (kSectionPlace*) and a new flag bit (kFineFlagPlacementPresent).
+inline constexpr uint16_t kFineMaxKnownBakeVer = 28;
 
 // The dry sentinel in the water plane, in CONTROL-POINT units. INT16_MIN, the
 // one value the elevation codec's own range can never legitimately carry as a
@@ -557,6 +600,66 @@ constexpr int32_t bathyShoreMm(int16_t shoreUnits) {
 //: but a rule that leaves the boundary undefined is a rule two consumers will
 //: split on.
 constexpr bool bathyShoreIsWater(int16_t shoreUnits) { return shoreUnits > 0; }
+
+// --- SECTION_PLACE_* wire units (bake_ver 28) -------------------------------
+//
+// Every one of these mirrors a named constant in terrain_service/tile_codec.py
+// -- PLACEMENT_SUBSAMPLE, PLACEMENT_DIST_LSB_M, PLACEMENT_DIST_UNKNOWN,
+// PLACEMENT_TWI_OFFSET/SCALE -- same posture as the bathy block above: the
+// producer is the authority, and no consumer re-derives an LSB at a call site.
+
+//: Placement planes are subsampled by this factor: plane edge = size / 4
+//: (2048 at production, 7.5 m/px). Derived by both halves, never stored.
+inline constexpr uint32_t kPlacementSubsample = 4;
+
+//: The block edge the subsampled planes use: the header's block_log2 where the
+//: plane is big enough, clamped down to the largest power of two dividing the
+//: plane edge (a 512-px fixture tile's 128-px plane gets one 128-px block).
+//: Mirrors tile_codec.placement_block_log2 -- derived identically by both
+//: halves; a second header field would be one more way to disagree.
+constexpr uint32_t finePlacementBlockLog2(uint32_t size, uint32_t blockLog2) {
+    const uint32_t pedge = size / kPlacementSubsample;
+    uint32_t hi = 0;
+    while ((1u << (hi + 1)) <= pedge) ++hi;
+    uint32_t pl = blockLog2 < hi ? blockLog2 : hi;
+    while (pl > 0 && (pedge % (1u << pl)) != 0) --pl;
+    return pl;
+}
+
+//: dist_water: millimetres of ground per stored step (2 m), and the saturated
+//: top code. 254 steps = 508 m of expressible distance against a species
+//: library whose largest authored water_max is 250 m.
+inline constexpr int32_t kPlacementDistLsbMm = 2000;
+//: "At least ~510 m from any water, or no water knowable." The consumer must
+//: treat this as UNKNOWN (fail closed), not as a large distance -- the two
+//: coincide for every authored gate, and the sentinel direction is the safe
+//: one for any future gate that does not.
+inline constexpr uint8_t kPlacementDistUnknown = 255;
+//: twi: stored = clamp(round((twi + 3) * 8), 0, 254); 255 = not computable.
+inline constexpr uint8_t kPlacementTwiUnknown = 255;
+//: curvature: 128 = flat, above = concave (hollow), below = convex (ridge).
+inline constexpr uint8_t kPlacementCurvFlat = 128;
+//: heatload: ~127 = flat/neutral, 254 = hottest (steep SW), 0 = coldest.
+inline constexpr uint8_t kPlacementHeatNeutral = 127;
+
+//: Distance to the nearest water in millimetres, or INT32_MAX for the unknown
+//: sentinel -- deliberately the same value as assetpolicy.h's
+//: kAssetNoWaterDistanceMm, so the placement gate's ordinary comparison fails
+//: closed on it with no translation (a static_assert in assetfield.h pins the
+//: two together).
+constexpr int32_t placementDistanceMm(uint8_t stored) {
+    return stored == kPlacementDistUnknown
+               ? INT32_MAX
+               : static_cast<int32_t>(stored) * kPlacementDistLsbMm;
+}
+
+//: TWI in thousandths (milli-TWI): stored/8 - 3, exact in integers because
+//: 1000/8 = 125. INT32_MIN for the unknown sentinel. Real-terrain range is
+//: roughly [-3000, +28000]; hollows and valley floors score high.
+constexpr int32_t placementTwiMilli(uint8_t stored) {
+    return stored == kPlacementTwiUnknown ? INT32_MIN
+                                          : static_cast<int32_t>(stored) * 125 - 3000;
+}
 
 // True for codec values the FORMAT defines. Says nothing about whether this
 // process can decode them -- see fineCodecNeedsDecompressor below.
@@ -995,6 +1098,27 @@ public:
     // here", this false means "baked before bathymetry existed" (bake_ver < 27).
     // One flag, both planes -- there is no tile with one of them.
     bool hasBathy() const { return (h_.flags & kFineFlagBathyPresent) != 0; }
+    // True when the tile carries the FIVE placement channel planes at all.
+    // Same distinction: an all-unknown distance plane with this true means
+    // "surveyed, nothing near water here"; false means "baked before the
+    // channels existed" (bake_ver < 28), and asset placement fails closed on
+    // it. One flag, all five planes.
+    bool hasPlacement() const { return (h_.flags & kFineFlagPlacementPresent) != 0; }
+
+    // --- placement plane geometry (bake_ver 28) -----------------------------
+    // The planes are subsampled 4x and use a DERIVED block edge -- see
+    // finePlacementBlockLog2. Everything else mirrors the full-resolution
+    // planes' geometry accessors above.
+    uint32_t placementEdge() const { return static_cast<uint32_t>(h_.size) / kPlacementSubsample; }
+    uint32_t placementBlockLog2() const {
+        return finePlacementBlockLog2(h_.size, h_.blockLog2);
+    }
+    uint32_t placementBlockDim() const { return 1u << placementBlockLog2(); }
+    uint32_t placementBlocksPerAxis() const { return placementEdge() / placementBlockDim(); }
+    uint32_t placementBlockPixelCount() const { return placementBlockDim() * placementBlockDim(); }
+    uint32_t placementBlockCount() const {
+        return placementBlocksPerAxis() * placementBlocksPerAxis();
+    }
     // The registry, ordered by (min_y, min_x) of extent with ids 0..n-1, so
     // `basins()[i].basinId == i` and a row means the same basin in every
     // process. Empty when hasBasins() is false.
@@ -1032,6 +1156,11 @@ public:
     // about what the FILE carries; this is about what was fetched.
     bool bathyDepthIndexResident() const { return bathyDepthIndex_.size() == blockCount(); }
     bool bathyShoreIndexResident() const { return bathyShoreIndex_.size() == blockCount(); }
+    // Per plane, like the bathy pair: the five indices are separate sections
+    // and a ranged client can hold any subset of them.
+    bool placementIndexResident(FinePlacementPlane p) const {
+        return p < kPlacementPlaneCount && placeIndex_[p].size() == placementBlockCount();
+    }
     bool basinsResident() const { return basinsResident_; }
     bool headsResident() const { return headsResident_; }
 
@@ -1040,6 +1169,9 @@ public:
     const std::vector<FineBlockEntry>& waterIndex() const { return waterIndex_; }
     const std::vector<FineBlockEntry>& bathyDepthIndex() const { return bathyDepthIndex_; }
     const std::vector<FineBlockEntry>& bathyShoreIndex() const { return bathyShoreIndex_; }
+    const std::vector<FineBlockEntry>& placementIndex(FinePlacementPlane p) const {
+        return placeIndex_[p];
+    }
 
     // FILE offset of each plane's data section -- what an index entry's
     // `offset` is relative to, and therefore what a range fetcher must add to
@@ -1049,6 +1181,7 @@ public:
     uint64_t waterDataOffset() const { return waterDataOff_; }
     uint64_t bathyDepthDataOffset() const { return bathyDepthDataOff_; }
     uint64_t bathyShoreDataOffset() const { return bathyShoreDataOff_; }
+    uint64_t placementDataOffset(FinePlacementPlane p) const { return placeDataOff_[p]; }
 
     uint8_t codec() const { return h_.codec; }
     // The decompressor this tile was parsed with. Empty for a CODEC_RAW tile.
@@ -1095,6 +1228,23 @@ public:
                                FineError* err = nullptr) const;
     bool decodeBathyShoreBlock(uint32_t bx, uint32_t by, std::vector<int16_t>& out,
                                FineError* err = nullptr) const;
+    // One placement plane's block (bake_ver 28), uint8 per SUBSAMPLED pixel,
+    // resized to placementBlockPixelCount(). Block coords are on the
+    // placement grid (placementBlocksPerAxis() per side), NOT the elevation
+    // grid. Values are raw wire units -- convert distance with
+    // placementDistanceMm and TWI with placementTwiMilli rather than
+    // multiplying at a call site.
+    bool decodePlacementBlock(FinePlacementPlane plane, uint32_t bx, uint32_t by,
+                              std::vector<uint8_t>& out, FineError* err = nullptr) const;
+
+    // All five placement channels at one tile-LOCAL FINE pixel (the subsample
+    // fold happens inside). Decodes up to five blocks per call, so -- exactly
+    // like controlPointAt and bathyAt -- it is for tests and cold paths;
+    // anything hot goes through FineTileSampler's placement cache. False when
+    // the tile predates the planes, a block is unfetched, or the payload is
+    // corrupt; `out` is untouched then, so the caller's sentinels survive.
+    bool placementAt(uint32_t lx, uint32_t ly, uint8_t out[kPlacementPlaneCount],
+                     FineError* err = nullptr) const;
 
     // Water-surface elevation from a water control point, or `kNoWaterMm` for
     // the dry sentinel. The sentinel test lives HERE rather than at each call
@@ -1188,6 +1338,8 @@ public:
     bool waterBlockResident(uint32_t bx, uint32_t by) const;
     bool bathyDepthBlockResident(uint32_t bx, uint32_t by) const;
     bool bathyShoreBlockResident(uint32_t bx, uint32_t by) const;
+    // Placement-grid block coords, like decodePlacementBlock.
+    bool placementBlockResident(FinePlacementPlane plane, uint32_t bx, uint32_t by) const;
 
     // Blocks of each plane whose bytes are held (CONSTANT ones counted, per
     // above). residentBlockCount(elev) == blockCount() for a whole-file tile.
@@ -1214,6 +1366,7 @@ private:
     FineDecompressor dec_{};
     std::vector<FineBlockEntry> elevIndex_, flowIndex_, waterIndex_;
     std::vector<FineBlockEntry> bathyDepthIndex_, bathyShoreIndex_;
+    std::vector<FineBlockEntry> placeIndex_[kPlacementPlaneCount];
     std::vector<BasinEntry> basins_;
     std::vector<HeadEntry> heads_;
     // Distinguishes a fetched-and-empty basin table from an unfetched one. A
@@ -1226,6 +1379,8 @@ private:
     uint64_t waterDataOff_ = 0, waterDataLen_ = 0;
     uint64_t bathyDepthDataOff_ = 0, bathyDepthDataLen_ = 0;
     uint64_t bathyShoreDataOff_ = 0, bathyShoreDataLen_ = 0;
+    uint64_t placeDataOff_[kPlacementPlaneCount] = {};
+    uint64_t placeDataLen_[kPlacementPlaneCount] = {};
 };
 
 // Grid of v2 fine tiles for one seed, addressed in FINE tile-pixel coordinates
@@ -1309,6 +1464,30 @@ public:
     // when the tile isn't loaded or its block fails to decode.
     bool controlPointAt(int64_t px, int64_t py, int16_t& cp);
 
+    // The five placement channels (bake_ver 28) at one WORLD VOXEL column, in
+    // raw wire units, through a per-tile decoded-block cache (u8 blocks, so a
+    // warmed tile costs 1/16 of one int16 plane). This is the production read
+    // path asset placement's column-facts binding uses -- see
+    // assetfield.h::assetPlacementChannelsFromFineTiles.
+    //
+    // `valid` is false -- and every field stays at its fail-closed sentinel --
+    // when the tile is missing, predates the planes (bake_ver < 28), or the
+    // covering block is unfetched/corrupt. The distinction rides the same
+    // counters the elevation path uses.
+    //
+    // SAME THREADING CONTRACT as every other lazy read on this class: a cold
+    // query decodes into the cache and is a write; prewarm-then-share, or hold
+    // an exclusive lock.
+    struct FinePlacementSample {
+        bool valid = false;
+        uint8_t distWater = kPlacementDistUnknown;
+        uint8_t twi = kPlacementTwiUnknown;
+        uint8_t talus = 0;
+        uint8_t curv = kPlacementCurvFlat;
+        uint8_t heat = kPlacementHeatNeutral;
+    };
+    FinePlacementSample placementAtVoxel(int64_t vx, int64_t vy);
+
     // Control point at (px, py) in mm. Missing tile -> 0, as TileGridSampler
     // does, with missingTileQueries bumped so callers can fail loudly.
     int32_t elevationMm(int64_t px, int64_t py) override;
@@ -1374,6 +1553,10 @@ private:
     struct Resident {
         FineTile tile;
         std::unordered_map<uint32_t, std::vector<int16_t>> blocks; // by*perAxis+bx
+        // Decoded placement blocks, keyed plane * placementBlockCount() +
+        // (by * placementBlocksPerAxis() + bx). Separate map because the
+        // element width differs and the placement grid is its own geometry.
+        std::unordered_map<uint32_t, std::vector<uint8_t>> placeBlocks;
     };
 
     static uint64_t tileKey(int32_t tx, int32_t ty) {

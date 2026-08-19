@@ -6,14 +6,17 @@
 // here must be made identically in both places and re-verified by vxc_gpu.
 //
 // classifyBiome() runs MORPHOLOGY GATES before the Whittaker climate table
-// (m4-plan): slope beyond a cliff threshold reads as rock/alpine regardless
-// of climate; a coastal band around sea level reads as ocean/beach; terrain
-// above a temperature-adjusted treeline reads as alpine/tundra. Only once
-// every gate has passed does climate (temperature x precipitation, with
-// PRECIPITATION seasonality -- bio_15, not bio_4; see kBiomePrecipSeasonalHighU8
-// -- splitting savanna off grassland and the forest types) pick among the
-// remaining biomes. No floats; every threshold below is an integer worldgen
-// contract constant — tune only on a deliberate kWorldGenVersion bump.
+// (m4-plan): a coastal band around sea level reads as ocean/beach (with steep
+// SUBMERGED ground reading as bare rock rather than mud seafloor -- the only
+// gate that produces BARE_ROCK since v27); terrain above a temperature-
+// adjusted treeline reads as alpine/tundra. Only once every gate has passed
+// does climate (temperature x precipitation, with PRECIPITATION seasonality
+// -- bio_15, not bio_4; see kBiomePrecipSeasonalHighU8 -- splitting savanna
+// off grassland and the forest types) pick among the remaining biomes.
+// v8..v26 additionally gated dry-land slope > 35 degrees to BARE_ROCK; v27
+// removed that by owner decision -- see the note at classifyBiome. No floats;
+// every threshold below is an integer worldgen contract constant — tune only
+// on a deliberate kWorldGenVersion bump.
 
 #include "voxelcore/climate.h"
 #include "voxelcore/core.h"
@@ -37,6 +40,9 @@ enum BiomeId : uint8_t {
     // mostly caught high ground; with the gate corrected to ~35 degrees it
     // would have put permafrost on every temperate sea cliff. Append-only, so
     // no existing id is renumbered.
+    //
+    // v27: reachable ONLY below the coastal band (steep ocean floor). On dry
+    // land the id still exists but no gate produces it -- see classifyBiome.
     BARE_ROCK,
     kBiomeCount
 };
@@ -45,7 +51,12 @@ enum BiomeId : uint8_t {
 
 // Sum-of-abs-elevation-deltas-per-tile-pixel — the same "slopeMmPerPx" value
 // Amplifier::column already derives for detail-amplitude scaling — beyond
-// which terrain reads as a cliff face: bare rock regardless of climate.
+// which SUBMERGED terrain reads as a cliff face: bare rock instead of mud
+// seafloor. (v8..v26 it also flipped dry land to BARE_ROCK; v27 removed the
+// dry-land use of this gate -- see classifyBiome -- but the constant itself
+// keeps all of its OTHER consumers: amplifier.cpp's topsoil retention floor
+// bottoms out at exactly this grade, and assetpolicy.h's per-species slope
+// bands are stated against it. It is still the angle-of-repose contract.)
 //
 // Stated as a GRADE so it means something. 70% over a tile pixel is about 35
 // degrees, the angle of repose for soil and scree (33-37): above it loose
@@ -133,7 +144,26 @@ inline constexpr int32_t kBiomeTempWarmU8 = climateTempU8FromDegC(18);  // was 1
 // docs/measurements/biome-gates-2026-08-01.txt.
 inline constexpr int32_t kBiomeTempHotU8 = climateTempU8FromDegC(24);   // was 170 = +13.3 C
 inline constexpr int32_t kBiomePrecipAridU8 = climatePrecipU8FromMmPerYr(400);  // was 60 = 2824 mm
-inline constexpr int32_t kBiomePrecipSemiU8 = climatePrecipU8FromMmPerYr(800);  // was 100 = 4706 mm
+// THE GRASSLAND/FOREST BOUNDARY MOVED 800 -> 450 mm/yr AT v27, owner decision:
+// "adjust Whittaker's threshold to increase temperate forests, reduce
+// grasslands" -- he walked hillsides that read as scrub and expected woodland.
+// 800 mm was Earth-calibrated; this world's coarse model compresses the
+// precipitation tails (land p50 is 282 mm/yr, p75 is 518 -- same blocker the
+// kBiomeTempHotU8 note above documents for DESERT), so the Earth-correct line
+// put 31% of land in GRASSLAND and 12% in TEMPERATE_FOREST. 450 mm is one u8
+// step above the arid line -- the FLOOR of this lever -- and moves every
+// grassland column the boundary can legally claim: measured over the coarse
+// corpus (vxc_climateprobe, 64/axis, with the v27 cliff-gate change already
+// in), forest 247 -> 396 columns (13.2% -> 21.1% of land, 1.78x the v26
+// baseline's 11.9%), grassland 676 -> 527 (36.1% -> 28.1%), every other biome
+// unchanged to the column. The residual grassland is the ARID branch
+// (< 400 mm/yr steppe), which no value of THIS constant can reach; claiming
+// it would mean moving kBiomePrecipAridU8, which also moves DESERT and was
+// not asked for. Physically 450 mm/yr is dry open woodland / forest-steppe --
+// marginal for closed-canopy forest on Earth, and that trade (world reads
+// wooded, as asked, at the cost of Whittaker realism in the 450-800 band) is
+// deliberate and owner-directed.
+inline constexpr int32_t kBiomePrecipSemiU8 = climatePrecipU8FromMmPerYr(450);  // was 100 = 4706 mm
 inline constexpr int32_t kBiomePrecipModU8 = climatePrecipU8FromMmPerYr(1600);  // was 170 = 8000 mm
 
 // THE SAVANNA GATE READS PRECIPITATION SEASONALITY (bio_15), NOT TEMPERATURE
@@ -197,8 +227,35 @@ constexpr int32_t biomeTreelineMm(int32_t tempU8) {
     return clampi32(adjusted, kBiomeBeachUpperMm, 9'000'000);
 }
 
-// Per-column biome classification. Gate order (m4-plan): slope -> beach/
-// ocean -> temperature-adjusted treeline -> Whittaker climate table.
+// Per-column biome classification. Gate order (v27): ocean (steep ocean
+// floor -> BARE_ROCK, else OCEAN) -> beach -> temperature-adjusted treeline
+// -> Whittaker climate table.
+//
+// THE DRY-LAND CLIFF GATE IS GONE AT v27, by owner decision: "bare rock
+// should not really be a thing at all unless it's underneath a water body or
+// ocean." From v8..v26 any land column steeper than kBiomeCliffSlopeMmPerM
+// classified BARE_ROCK regardless of climate; now such a column falls
+// through to the treeline/Whittaker answer, so a steep temperate hillside is
+// TEMPERATE_FOREST and can carry the v26 slope-response-curve-gated
+// vegetation instead of being categorically bare. What this deliberately
+// does NOT change, so "no bare-rock biome on land" and "rock still shows on
+// cliff faces" both stay true:
+//   * amplifier.cpp's topsoil retention still bottoms out (12.5% retained,
+//     floored at one voxel) at exactly this grade, so a cliff column carries
+//     a ~10 cm soil skin over MAT_ROCK -- the exposed FACE of a cliff still
+//     meshes as rock, because the wall's side faces read the stratigraphy
+//     below that skin. Genuinely exposed stone on steep ground is a
+//     stratigraphy fact now, not a biome verdict.
+//   * biomeSurfaceMaterial(BARE_ROCK) is still MAT_ROCK, reached via the
+//     submarine branch below; TUNDRA_ALPINE above kBiomeAlpineRockLineMm is
+//     still MAT_ROCK.
+// The one place BARE_ROCK remains reachable is steep ground BELOW the
+// coastal band -- ocean floor and the only "under a water body" this
+// per-column classifier can see (lakes above sea level live in the baked
+// water datum, which classifyBiome has no argument for; their beds classify
+// by climate, and the standing-water asset veto owns what grows there).
+// Physical rationale unchanged: sediment does not rest above the angle of
+// repose, so a submarine cliff is rock, not mud.
 //
 // THE THIRD ARGUMENT CHANGED CHANNEL AT v22: it was seasonalityU8 (bio_4,
 // temperature seasonality) and is now precipVarU8 (bio_15, precipitation
@@ -213,11 +270,12 @@ constexpr BiomeId classifyBiome(int32_t tempU8, int32_t precipU8, int32_t precip
     // 39.8% of everything below sea level -- 17.8% of the whole world -- was
     // submarine terrain wearing alpine permafrost. Nothing underwater can be
     // alpine, and no threshold value fixes an ordering bug.
-    if (surfaceMm < kBiomeBeachLowerMm) return OCEAN;
+    if (surfaceMm < kBiomeBeachLowerMm)
+        return slopeMmPerM > kBiomeCliffSlopeMmPerM ? BARE_ROCK : OCEAN;
     if (surfaceMm <= kBiomeBeachUpperMm) return BEACH;
-    // Steep ground inside the beach band now reads BEACH rather than rock.
-    // That is correct: the band is 7 m tall, so it is the foot of a sea cliff.
-    if (slopeMmPerM > kBiomeCliffSlopeMmPerM) return BARE_ROCK;
+    // Steep ground inside the beach band reads BEACH rather than rock. That
+    // is correct: the band is 7 m tall, so it is the foot of a sea cliff.
+    // (v27: no slope test on dry land at all -- see the doc comment above.)
     if (surfaceMm > biomeTreelineMm(tempU8)) return TUNDRA_ALPINE;
 
     // Whittaker temperature x precipitation table (gates above already
@@ -246,17 +304,17 @@ constexpr MaterialId biomeSurfaceMaterial(BiomeId biome, int32_t surfaceMm) {
         case DESERT: return MAT_SAND;
         case SAVANNA: return MAT_SAVANNA_GRASS;
         case TAIGA: return MAT_PODZOL;
-        case BARE_ROCK: return MAT_ROCK;
+        case BARE_ROCK: return MAT_ROCK; // v27: submarine cliffs only
         case TUNDRA_ALPINE:
         default:
             // Since v8 only ONE gate reaches TUNDRA_ALPINE -- the
             // temperature-adjusted treeline -- so this is unambiguously cold
             // high ground, and the elevation split is just permafrost below
-            // the rock line and exposed rock above it.
-            //
-            // The v6 note that a steep LOW cliff read as permafrost no longer
-            // applies: the cliff gate returns BARE_ROCK now, which is exactly
-            // the "dedicated rock-face biome" that note asked for.
+            // the rock line and exposed rock above it. (Still true at v27:
+            // removing the dry-land cliff gate ADDED no route here -- steep
+            // high ground above the treeline was already alpine-or-rock, it
+            // just resolves to TUNDRA_ALPINE now instead of BARE_ROCK, and
+            // this split keeps it MAT_ROCK above the rock line.)
             return surfaceMm > kBiomeAlpineRockLineMm ? MAT_ROCK : MAT_PERMAFROST;
     }
 }

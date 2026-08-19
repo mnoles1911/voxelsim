@@ -109,13 +109,48 @@ def run(name: str, seed: int, taper=None) -> dict:
     row = profile(a.grid.data, voxel_m, h)
     row.update(name=name, seed=seed, height_m=round(h, 2),
                voxels=int(solid.sum()))
+    row["minwid"] = min_stem_voxels(solid)
     return row
+
+
+def min_stem_voxels(solid) -> int:
+    """The THINNEST the stem gets, in voxels across, over the lower half.
+
+    THE ONE MEASUREMENT THAT WOULD HAVE CAUGHT THE 2026-08-17 REGRESSION, and
+    the reason it is here rather than in a comment.
+
+    The taper pass reported form quotient, d(0.1), d(1.3), d(25/50/75%), the
+    taper ratio and total voxels, and concluded "no species gained a voxel".
+    Every one of those is a bulk or an average over a stem that was still
+    mostly three voxels wide -- and NONE of them can see the stem pinching to
+    ONE voxel at a single height. Four trees did exactly that (cecropia at
+    7.7-7.9 m, cherry-blossom at 1.6-2.0 m, rowan, flowering-dogwood), which at
+    a 10 cm lattice is a 10 cm thread: invisible in the engine, so the tree
+    rendered as a stump, an air gap and a floating crown. The owner saw it in a
+    screenshot; the metric set could not.
+
+    Read against the project's own rule -- the smallest identifying feature
+    should stay about three voxels across -- anything under 3 here is a stem
+    the lattice cannot draw, whatever its averages say.
+    """
+    nx, ny, nz = solid.shape
+    worst = None
+    for z in range(2, max(3, nz // 2)):
+        sl = solid[:, :, z]
+        if not sl.any():
+            continue
+        w = int(sl.sum(axis=0).max())
+        if worst is None or w < worst:
+            worst = w
+    return int(worst) if worst is not None else 0
 
 
 def _fmt(r: dict) -> str:
     return (f"{r['height_m']:6.1f} {r['d0.1']:7.1f} {r['d1.3']:7.1f} "
             f"{r['d25pc']:7.1f} {r['d50pc']:7.1f} {r['d75pc']:7.1f} "
-            f"{(r['taper'] or 0):6.3f} {(r['fq'] or 0):6.3f} {r['voxels']:9,d}")
+            f"{(r['taper'] or 0):6.3f} {(r['fq'] or 0):6.3f} "
+            f"{r.get('minwid', 0):7d}{'!' if r.get('minwid', 9) < 3 else ' '}"
+            f"{r['voxels']:8,d}")
 
 
 def check_hashes(path: Path) -> int:
@@ -166,7 +201,7 @@ def main():
     rows = []
     print(f"{'spec':22s} {'':8s} {'H_m':>6s} {'d0.1':>7s} {'d1.3':>7s} "
           f"{'d25%':>7s} {'d50%':>7s} {'d75%':>7s} {'taper':>6s} {'fq':>6s} "
-          f"{'voxels':>9s}")
+          f"{'minwid':>7s} {'voxels':>9s}")
     for n in sorted(set(names)):
         for seed in a.seeds:
             try:
@@ -193,6 +228,12 @@ def main():
                       f"median {statistics.median(fq):.3f}  "
                       f"min {min(fq):.3f} max {max(fq):.3f}   |   "
                       f"taper d(1.3)/d(0.1) median {statistics.median(tp):.3f}")
+            mw = [r["minwid"] for r in rows if r["side"] == side and "minwid" in r]
+            if mw:
+                thin = sum(1 for v in mw if v < 3)
+                print(f"{'':9s} {'':4s}  MIN STEM WIDTH median {statistics.median(mw):.0f} "
+                      f"voxels, thinnest {min(mw)}; {thin} of {len(mw)} builds under 3 "
+                      f"({'PASS' if thin == 0 else 'FAIL -- a stem the lattice cannot draw'})")
     if a.json:
         Path(a.json).parent.mkdir(parents=True, exist_ok=True)
         Path(a.json).write_text(json.dumps(rows, indent=1), encoding="utf-8")

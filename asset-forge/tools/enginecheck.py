@@ -127,23 +127,22 @@ def check_banks(banks: Path, deep: bool = False
 
 
 def check_manifest(out: Path) -> list[str]:
-    """The manifest on disk against the one today's specs would produce."""
+    """The manifest on disk against the one today's specs would produce.
+
+    Re-derived through `manifest.curated_inputs`, the SAME function
+    export_manifest writes from -- the publish gate and the approved-seed
+    count are one reading, applied twice, so this check cannot certify a
+    manifest the exporter would not write."""
     p = out / "species.vxm"
     if not p.is_file():
         return [f"no manifest at {p}"]
 
-    banks = out / "banks"
-    seeds: dict[str, int] = {}
-    if banks.is_dir():
-        for d in sorted(banks.iterdir()):
-            if d.is_dir():
-                seeds[d.name] = sum(1 for f in d.iterdir()
-                                    if _SEED_FILE.search(f.name))
-
-    specs = []
-    for sp in sorted(SPECS.glob("*.json")):
-        body, _ = sm.load(sp)
-        specs.append((sp.stem, body))
+    specs, seeds, _curation = manifest.curated_inputs(SPECS, out / "banks")
+    # The exporter mutates rock placement from the baked grids before
+    # encoding (manifest.apply_rock_classification); comparing without the
+    # same mutation certifies nothing and fails everything -- see the
+    # function's own docstring for the day that proved it.
+    manifest.apply_rock_classification(specs, out / "banks")
     fresh = manifest.encode(specs, seeds, manifest.ExportReport())
     have = p.read_bytes()
     if fresh == have:

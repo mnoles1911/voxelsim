@@ -359,6 +359,25 @@ private:
 	friend class FVoxelFineTileSamplerProxy;
 
 	FString LocalPathFor(vxc::TileCoord Tile) const;
+	// WHICH NAMESPACE SHOULD THIS RUN HAVE BEEN POINTED AT? Answered by reading
+	// the cache root, never by recomputing an id.
+	//
+	// The fine provider id is a sha256 over the terrain-service BAKE's Python
+	// constants (providers/diffusion.py::_bake_fingerprint). Nothing in C++ can
+	// derive it and nothing in C++ should try: a second implementation of that
+	// hash is a second answer, and the whole point of content addressing is that
+	// there is one. What this side CAN do is look, because the bake writes its
+	// answer down as the directory name -- <root>/<fine_provider_id>/... -- so
+	// the namespaces that exist under a cache root are a fact readable with a
+	// directory listing.
+	//
+	// Used only on the failure path, where one listing of a directory with a
+	// handful of entries is free and the alternative is a fatal message that
+	// names a path and leaves the operator to guess why it is the wrong one.
+	// That guessing has cost this project three capture runs, each worked around
+	// by hand-pinning -VoxelFineTileProviderId without anyone establishing why
+	// the default was wrong. See docs/fine-tile-provider-identity.md.
+	FString DiagnoseNamespace(vxc::TileCoord Tile) const;
 	// Loads+validates+FULLY DECODES one coarse tile's fine data if not already
 	// resident. Returns true if it is resident after the call (already was, or
 	// the load succeeded this call). Caller must already hold Lock_ exclusively.

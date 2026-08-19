@@ -1,5 +1,5 @@
 #pragma once
-// A synthetic VXM1 encoder for the manifest and bank tests.
+// A synthetic VXM2 encoder for the manifest and bank tests.
 //
 // AN INDEPENDENT SPELLING OF THE FORMAT, deliberately: it mirrors
 // forge/manifest.py's struct layout by hand, so a disagreement between this
@@ -10,11 +10,15 @@
 // driven by corrupting known offsets in a well-formed blob.
 //
 // Layout offsets (kept in comments where the corruption tests poke them):
-//   header 32 B: magic 0, version 4, biomeCount 8, layerCount 12,
-//                speciesCount 16, recordBytes 20
-//   biome names: 32 .. 32 + 10*16          (= 192)
-//   layer table: 192 .. 192 + 4*24         (= 288)
-//   species:     288 + i*152
+//   header 32 B:  magic 0, version 4, biomeCount 8, layerCount 12,
+//                 speciesCount 16, recordBytes 20, ruleCount 24,
+//                 attachCount 28
+//   biome names:  32 .. 32 + 10*16                    (= 192)
+//   layer table:  192 .. 192 + 4*24                   (= 288)
+//   density:      288 .. 288 + 10*10*2                (= 488) kind-major u16
+//   rules:        488 + i*64
+//   species:      488 + rules*64 + i*152
+//   attachments:  ... + species*152 + i*8
 
 #include <cstdint>
 #include <cstring>
@@ -83,18 +87,49 @@ inline const char* kBiomeNames[vxc::kBiomeCount] = {
     "desert", "savanna", "taiga",     "tundra_alpine",    "bare_rock",
 };
 
+// A named placement rule, wire-shaped. Unmasked fields must stay zero.
+struct VxmRule {
+    std::string name = "test-rule";
+    uint16_t fieldMask = 0;
+    uint16_t abundanceQ10 = 0;
+    uint16_t clusterQ10 = 0;
+    uint8_t waterKind = 0;
+    uint8_t waterMask = 0;
+    int32_t elevMinMm = 0;
+    int32_t elevMaxMm = 0;
+    int32_t slopeMinMmPerM = 0;
+    int32_t slopeMaxMmPerM = 0;
+    int32_t waterMaxMm = 0;
+    int32_t spacingMm = 0;
+};
+
+// One attachment: (species row, biome) obeys rule row.
+struct VxmAttach {
+    uint16_t speciesIndex = 0;
+    uint8_t biome = 0;
+    uint16_t ruleIndex = 0;
+};
+
+// The neutral kind x biome density table: 1000 everywhere = today's world.
+inline std::vector<uint16_t> neutralDensity() {
+    return std::vector<uint16_t>(vxc::kAssetKindCount * vxc::kBiomeCount, 1000u);
+}
+
 inline std::vector<uint8_t> buildVxm(const std::vector<VxmSpecies>& species,
                                      const std::vector<vxc::AssetLayer>& layers =
-                                         defaultLayers()) {
+                                         defaultLayers(),
+                                     const std::vector<uint16_t>& density = neutralDensity(),
+                                     const std::vector<VxmRule>& rules = {},
+                                     const std::vector<VxmAttach>& attachments = {}) {
     std::vector<uint8_t> b;
     putU32(b, 0x314D5856u); // "VXM1"
-    putU32(b, 1u);
+    putU32(b, 2u);
     putU32(b, vxc::kBiomeCount);
     putU32(b, uint32_t(layers.size()));
     putU32(b, uint32_t(species.size()));
     putU32(b, 152u);
-    putU32(b, 0u);
-    putU32(b, 0u);
+    putU32(b, uint32_t(rules.size()));
+    putU32(b, uint32_t(attachments.size()));
     for (uint32_t i = 0; i < vxc::kBiomeCount; ++i) {
         const char* n = kBiomeNames[i];
         const size_t len = std::strlen(n);
@@ -111,6 +146,22 @@ inline std::vector<uint8_t> buildVxm(const std::vector<VxmSpecies>& species,
         b.push_back(0u);
         b.push_back(0u);
         b.push_back(0u);
+    }
+    for (uint16_t d : density) putU16(b, d);
+    for (const VxmRule& r : rules) {
+        for (size_t c = 0; c < 32; ++c)
+            b.push_back(c < r.name.size() ? uint8_t(r.name[c]) : 0u);
+        putU16(b, r.fieldMask);
+        putU16(b, r.abundanceQ10);
+        putU16(b, r.clusterQ10);
+        b.push_back(r.waterKind);
+        b.push_back(r.waterMask);
+        putI32(b, r.elevMinMm);
+        putI32(b, r.elevMaxMm);
+        putI32(b, r.slopeMinMmPerM);
+        putI32(b, r.slopeMaxMmPerM);
+        putI32(b, r.waterMaxMm);
+        putI32(b, r.spacingMm);
     }
     for (const VxmSpecies& s : species) {
         for (size_t c = 0; c < 64; ++c)
@@ -140,6 +191,13 @@ inline std::vector<uint8_t> buildVxm(const std::vector<VxmSpecies>& species,
         putU16(b, s.groupMin);
         putU16(b, s.groupMax);
         putI32(b, s.groupRadiusMm);
+    }
+    for (const VxmAttach& a : attachments) {
+        putU16(b, a.speciesIndex);
+        b.push_back(a.biome);
+        b.push_back(0u);
+        putU16(b, a.ruleIndex);
+        putU16(b, 0u);
     }
     return b;
 }

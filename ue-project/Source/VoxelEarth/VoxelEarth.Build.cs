@@ -44,7 +44,14 @@ public class VoxelEarth : ModuleRules
 			// register its shader directory before the global shader map is
 			// built -- this one loads at Default, far too late. Used by
 			// VoxelGpuVerify.cpp's voxel.GPU.VerifyRegion command.
-			"VoxelEarthShaders"
+			"VoxelEarthShaders",
+			// TASK #7 (VoxelDetailAssetSubsystem): runtime static meshes for
+			// detail-lattice ground cover, built through the documented
+			// runtime path UStaticMesh::BuildFromMeshDescriptions
+			// (bFastBuild). FMeshDescription lives in MeshDescription;
+			// FStaticMeshAttributes in StaticMeshDescription.
+			"MeshDescription",
+			"StaticMeshDescription"
 		});
 
 		// -------------------------------------------------------------------

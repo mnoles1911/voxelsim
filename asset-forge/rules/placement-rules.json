@@ -1,0 +1,59 @@
+{
+  "_readme": [
+    "THE NAMED PLACEMENT-RULE LIBRARY (owner directive, 2026-08-18): rules are",
+    "'custom authored and defined prior', then ATTACHED to species by name, one",
+    "or many per (species, biome), via the spec's `biome_rules` block. A rule is",
+    "a masked set of placement restrictions; attaching several composes them by",
+    "INTERSECTION (strictest wins) -- see docs/placement-spec-schema.md for the",
+    "per-field law and the exact clamp ranges.",
+    "",
+    "Fields a rule may carry (all optional, at least one required):",
+    "  elev_min_m, elev_max_m   metres above sea level (band intersects)",
+    "  slope_min_pct, slope_max_pct  percent grade 0-70 (band intersects)",
+    "  water_max_m              only within this distance of water (min wins)",
+    "  water                    one of any/ocean/river/lake/shallow/reef",
+    "                           ('lake' = fresh only -- the owner's 'near fresh",
+    "                           water body'; 'river' = fresh+brackish)",
+    "  spacing_m                minimum spacing (max wins; never moves the layer)",
+    "  abundance                0..1 frequency (min wins)",
+    "  cluster                  0..1 grove strength (setters must agree)",
+    "",
+    "Renaming or deleting a rule that any spec references makes the export",
+    "REFUSE by name -- a typo'd reference must never silently drop a restriction.",
+    "Editing a rule's numbers changes the manifest: worldgen change, version",
+    "bump, goldens re-blessed."
+  ],
+  "rules": {
+    "near-fresh-water-60m": {
+      "water_max_m": 60.0,
+      "water": "lake",
+      "_note": "The owner's worked example: a temperate-type tree in a desert must sit near a fresh water body. Attach to (species, desert)."
+    },
+    "near-fresh-water-25m": {
+      "water_max_m": 25.0,
+      "water": "lake",
+      "_note": "Tighter oasis margin: reeds and water-edge flowers in arid biomes."
+    },
+    "near-water-100m": {
+      "water_max_m": 100.0,
+      "_note": "Riparian corridor at valley scale, any salinity."
+    },
+    "sparse-outlier": {
+      "abundance": 0.1,
+      "spacing_m": 40.0,
+      "_note": "A species present but rare and scattered: relict trees, lone specimens at a biome's edge."
+    },
+    "scree-band": {
+      "slope_min_pct": 30.0,
+      "_note": "Only on steep ground: talus and cliff-fall debris must vanish from lawns."
+    },
+    "valley-floor": {
+      "elev_max_m": 500.0,
+      "_note": "Lowland-only in this biome, whatever the species' default band says."
+    },
+    "no-cluster": {
+      "cluster": 0.0,
+      "_note": "Scatter evenly in this biome even if the species usually grows in stands."
+    }
+  }
+}

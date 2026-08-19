@@ -1,0 +1,61 @@
+layer caps (authored -> tightened to tallest baked occupant): L0 60000->45000 mm L1 34000->25000 mm L2 7500->5000 mm
+manifest: 826 species -> table 438 kept, 382 detail entities, 6 too rare, 0 no-biome, 266 without banks
+layers: L0[cell 24000 mm, maxH 45000, r 15000, density 60, terrain] L1[cell 5000 mm, maxH 25000, r 12000, density 350, terrain] L2[cell 2200 mm, maxH 5000, r 6000, density 550, terrain] L3[cell 800 mm, maxH 30000, r 2500, density 1000, detail]
+coarse tiles: loaded 289, rejected 0 from tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1
+terrain: synthetic elevation, REAL coarse-tile climate, water datum NONE (dry world), placement planes NONE (sentinels)
+
+=== widening census: 6561 footprints (0 declined) over [-234360,-234104]x[-242151,-241895] m, seed 20260719 ===
+widening (assetTopAboveSurfaceMm) distribution:
+   25000 mm :     5690 footprints (86.7%)
+   45000 mm :      871 footprints (13.2%)
+extra admitted chunk layers (sky side, dilation included):
+  +  9 chunks :       70 footprints
+  + 10 chunks :     1514 footprints
+  + 11 chunks :     4013 footprints
+  + 12 chunks :       93 footprints
+  + 16 chunks :       17 footprints
+  + 17 chunks :      201 footprints
+  + 18 chunks :      635 footprints
+  + 19 chunks :       18 footprints
+mean extra: 11.65 chunk layers per footprint
+components: mean widening 27655 mm (8.6 chunks), mean dilation slack 11770 mm (3.6 chunks)
+baseline surface shell (sampled 121 footprints): mean 1.24 chunk layers
+
+=== placement census over [-234296,-234168]x[-242087,-241959] m ===
+sites considered: 30255 (per layer: L0=3 L1=348 L2=2220 L3=27684)
+instances resolved: 21993 (per layer: L0=3 L1=195 L2=0 L3=21795)
+species represented: 19
+anchor contact audit: 21993 audited, 0 NOT SOLID
+species histogram (name, instances; * = water-gated riparian):
+    cecropia                    108
+    coffee-shrub                911
+    dracaena-thicket            509
+    feather-moss               2517
+    heliconia                   752
+    jungle-emergent               1
+    jungle-groundcover         7705
+    jungle-understory-flower   1195
+    karst-breakdown-block        21
+    laterite-crust-block         28
+    leaf-littered-slab           26
+    mossy-forest-boulder          1
+    sinkhole-rim                  4
+    strangler-fig                 8
+    termite-mound                 1
+    terrestrial-bromeliad       860
+    understory-fern            6212
+    wild-ginger                 860
+    wild-hibiscus               274
+riparian (water-gated) species placed: 0 species, 0 instances
+gate attribution over 7453893 (site, species) pairs:
+  tolerated                        278909 (3.7%)
+  biome weight 0                  6606471 (88.6%)
+  elevation band                    59676 (0.8%)
+  past slope-curve zero            295948 (3.9%)
+  water distance (far/unknown)     212889 (2.8%)
+mean placed-species height by anchor slope (inverse-height check):
+  slope  15- 30%:  13933 instances, mean height   1.0 m
+  slope  30- 45%:   8060 instances, mean height   1.0 m
+stampable voxels over resolved terrain instances: 8401354
+banks: 21993 requests, 198 served, 0 miss(no species), 21795 miss(no seeds), 36 files loaded, 0 refused, 0 seed-count mismatches, 10069725 bytes resident
+VERDICT: placement wired; 21993 instances, all anchors solid, none submerged

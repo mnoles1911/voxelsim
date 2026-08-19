@@ -44,6 +44,22 @@ public:
     void setAssetField(const AssetField* field) { assets_ = field; }
     const AssetField* assetField() const { return assets_; }
 
+    // THE CHANNEL SOURCE RIDES BESIDE THE FIELD, and every composition path in
+    // this class (and every host-side parallel sampler that mirrors them) must
+    // resolve facts through assetChannelsAt or the field's gates run on
+    // sentinels: riparian species refused everywhere, the standing-water veto
+    // inert, treeline/TWI/talus multipliers neutral -- the engine/probe split
+    // of 2026-08-17. Null (the default) IS the sentinel world, kept for hosts
+    // with no baked channels (tests, synthetic ground); with a source
+    // installed the answer must be a pure function of (seed, tile bytes), so
+    // installing one is a worldgen change exactly like installing the field.
+    // Same bring-up rule as setAssetField: install before any worker reads.
+    void setAssetChannelSource(IAssetChannelSource* src) { channels_ = src; }
+    IAssetChannelSource* assetChannelSource() const { return channels_; }
+    AssetColumnChannels assetChannelsAt(int64_t vx, int64_t vy) const {
+        return channels_ != nullptr ? channels_->channelsAt(vx, vy) : AssetColumnChannels{};
+    }
+
     ColumnGrid columns(int32_t bx, int32_t by) const {
         ColumnGrid g;
         g.bx = bx;
@@ -65,7 +81,8 @@ public:
         const int64_t vx0 = int64_t(key.x) * B, vy0 = int64_t(key.y) * B;
         const AssetVoxelRect rect{vx0, vy0, vx0 + B - 1, vy0 + B - 1};
         return assets_->instancesForRect(rect, [this](int64_t vx, int64_t vy) {
-            return assetColumnFactsFromSample(amp_->columnCached(vx, vy));
+            return assetColumnFactsFromSample(amp_->columnCached(vx, vy),
+                                              assetChannelsAt(vx, vy));
         });
     }
 
@@ -159,7 +176,8 @@ public:
         const AssetVoxelRect rect{vx, vy, vx, vy};
         const std::vector<AssetInstance> insts =
             assets_->instancesForRect(rect, [this](int64_t ax, int64_t ay) {
-                return assetColumnFactsFromSample(amp_->columnCached(ax, ay));
+                return assetColumnFactsFromSample(amp_->columnCached(ax, ay),
+                                                  assetChannelsAt(ax, ay));
             });
         if (insts.empty()) return MAT_AIR;
         return assets_->materialAt(insts, vx, vy, vz);
@@ -312,6 +330,9 @@ private:
     // Null means "no assets", which is the world exactly as it was before this
     // existed. See setAssetField.
     const AssetField* assets_ = nullptr;
+    // Null means "sentinel channels" -- the fail-closed world. See
+    // setAssetChannelSource.
+    IAssetChannelSource* channels_ = nullptr;
 };
 
 } // namespace vxc

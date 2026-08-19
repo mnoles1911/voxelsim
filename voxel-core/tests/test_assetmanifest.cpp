@@ -1,4 +1,4 @@
-// VXM1 manifest reader tests.
+// VXM2 manifest reader tests.
 //
 // Two sources, on the test_assetgrid.cpp model. The synthetic blobs come from
 // tests/asset_manifest_testutil.h -- an independent hand spelling of the
@@ -148,22 +148,29 @@ VXC_TEST(assetmanifest_refuses_with_named_reasons) {
     b[32 + 4] = 'h';
     CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBiomeOrderMismatch));
 
-    // Species record fields: species block starts at 288.
+    // Species record fields: species block starts at 488 (past the density table).
     b = good;
-    b[288 + 64] = 200; // kind
+    b[488 + 64] = 200; // kind
     CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBadKind));
 
     b = good;
-    b[288 + 65] = uint8_t(kAssetLayerCount); // layer index one past the table
+    b[488 + 65] = uint8_t(kAssetLayerCount); // layer index one past the table
     CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBadLayer));
 
     b = good;
-    b[288] = 0; // empty name
+    b[488] = 0; // empty name
     CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBadName));
 
     b = good;
-    b[288 + 2] = uint8_t(' '); // a path component with a space is refused
+    b[488 + 2] = uint8_t(' '); // a path component with a space is refused
     CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBadName));
+
+    // A density entry above 1000 per-mille: a per-biome density BOOST, which
+    // the veto-only contract forbids. Density block starts at 288.
+    b = good;
+    b[288] = 0xE9; // 1001 little-endian
+    b[289] = 0x03;
+    CHECK_EQ(int(m.parse(b)), int(AssetManifestError::kBadDensity));
 
     // A species taller than its own layer's cap: the exporter checks this at
     // bake, so a file that carries it is a file the exporter did not write.
@@ -182,7 +189,7 @@ VXC_TEST(assetmanifest_refuses_with_named_reasons) {
     CHECK_EQ(int(m.misfiledWhy()), int(AssetTableError::kWrongLattice));
 
     // Every reason says something: "the table did not load" is not a diagnosis.
-    for (int e = 0; e <= int(AssetManifestError::kSpeciesMisfiled); ++e)
+    for (int e = 0; e <= int(AssetManifestError::kBadAttachment); ++e)
         CHECK(assetManifestErrorText(AssetManifestError(e))[0] != '\0');
 
     // And a refused parse leaves the manifest EMPTY, not half-filled.
@@ -268,7 +275,7 @@ VXC_TEST(assetmanifest_fold_counts_what_it_drops) {
 }
 
 VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
-    const std::vector<uint8_t> blob = readFixture("asset_species_v1.vxm");
+    const std::vector<uint8_t> blob = readFixture("asset_species_v2.vxm");
     CHECK(!blob.empty());
     AssetManifest m;
     CHECK_EQ(int(m.parse(blob)), int(AssetManifestError::kOk));
@@ -287,7 +294,9 @@ VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
 
     // tundra-pine, numbers read from specs/tundra-pine.json by eye:
     // biomes.taiga 1.0, temperate_forest 0.2, tundra_alpine 0.35; abundance
-    // 0.9; cluster 0.75; spacing 4.5 m; elev 0..2200 m; slope_max 55%;
+    // 0.9; cluster 0.75; spacing 4.5 m; elev 0..2200 m; slope_max 70%
+    // (55 -> 70 in the scree-slope-band pass, 20248e2, which never refreshed
+    // this fixture; caught at the 2026-08-18 re-bless);
     // height 9 m; kind tree; 4 baked bank seeds on disk.
     const AssetManifestSpecies* pine = nullptr;
     for (const AssetManifestSpecies& s : m.species())
@@ -306,7 +315,7 @@ VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
         CHECK_EQ(pine->spacingMm, 4500);
         CHECK_EQ(pine->elevMinMm, 0);
         CHECK_EQ(pine->elevMaxMm, 2'200'000);
-        CHECK_EQ(pine->slopeMaxMmPerM, 550);
+        CHECK_EQ(pine->slopeMaxMmPerM, 700);
         CHECK_EQ(pine->heightMm, 9000);
         CHECK_EQ(pine->voxelSizeMm, 100u);
         CHECK_EQ(int(pine->seedsBaked), 4);
@@ -328,8 +337,9 @@ VXC_TEST(assetmanifest_reads_the_file_asset_forge_actually_wrote) {
     CHECK(st.kept > 400);          // the plant/rock library is most of the file
     CHECK(st.detailEntities > 300); // 131+127+106+18 animals
     CHECK(st.tooRare >= 4 && st.tooRare <= 12); // the hero landmarks
-    // Terrain-kind banks were baked (4 seeds each); ground cover has none yet.
-    CHECK(st.withoutBanks > 0);
+    // Every kept species has banks since the flower/reed bake of 2026-08-18
+    // (37591e0) -- the manifest carries a real seed count for all of them.
+    CHECK_EQ(st.withoutBanks, 0);
 }
 
 VXC_TEST(assetmanifest_imported_table_realises_a_subset_of_what_the_bound_accounted_for) {
@@ -340,7 +350,7 @@ VXC_TEST(assetmanifest_imported_table_realises_a_subset_of_what_the_bound_accoun
     // that layer's declared maximum. If this fails, assetTopAboveSurfaceMm
     // has stopped being an upper bound over the production data and the
     // failure mode is a hole in the world.
-    const std::vector<uint8_t> blob = readFixture("asset_species_v1.vxm");
+    const std::vector<uint8_t> blob = readFixture("asset_species_v2.vxm");
     AssetManifest m;
     CHECK_EQ(int(m.parse(blob)), int(AssetManifestError::kOk));
     std::vector<AssetSpecies> table;
@@ -385,4 +395,223 @@ VXC_TEST(assetmanifest_imported_table_realises_a_subset_of_what_the_bound_accoun
     // Vacuous-truth guard: a taiga column at 400 m that places nothing from
     // the real library means the import is broken, not that the test passed.
     CHECK(checked > 50);
+}
+
+// --- VXM2: the kind x biome density table -----------------------------------
+
+VXC_TEST(assetmanifest_density_table_lands_on_each_species_occupancy_row) {
+    std::vector<uint16_t> density = vxmtest::neutralDensity();
+    // Tree row (kind 0): taiga thinned to 250, desert to 0. Rock row (kind 2)
+    // left neutral, to prove the row is selected by KIND.
+    density[0 * kBiomeCount + TAIGA] = 250;
+    density[0 * kBiomeCount + DESERT] = 0;
+
+    VxmSpecies tree = taigaTree("test-pine");
+    VxmSpecies rock;
+    rock.name = "test-boulder";
+    rock.kind = 2; // rock
+    rock.layer = 2;
+    rock.spacingMm = 3000;
+    rock.heightMm = 2000;
+    rock.weights[TAIGA] = 400;
+
+    AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({tree, rock}, vxmtest::defaultLayers(), density))),
+             int(AssetManifestError::kOk));
+    std::vector<AssetSpecies> table;
+    const AssetTableBuildStats st = assetSpeciesTableFromManifest(m, table);
+    CHECK_EQ(st.kept, 2);
+    CHECK_EQ(st.splitRows, 0);
+    CHECK_EQ(int(table[0].occupancyPerMille[TAIGA]), 250);
+    CHECK_EQ(int(table[0].occupancyPerMille[DESERT]), 0);
+    CHECK_EQ(int(table[0].occupancyPerMille[TEMPERATE_FOREST]), 1000);
+    CHECK_EQ(int(table[1].occupancyPerMille[TAIGA]), 1000);
+    // And a hand-built species (no manifest at all) defaults to neutral:
+    AssetSpecies bare;
+    for (int bi = 0; bi < int(kBiomeCount); ++bi)
+        CHECK_EQ(int(bare.occupancyPerMille[bi]), 1000);
+}
+
+// --- VXM2: named rules, attachments, and the split-row import ---------------
+
+namespace {
+
+vxmtest::VxmRule nearFreshWater60m() {
+    vxmtest::VxmRule r;
+    r.name = "near-fresh-water-60m";
+    r.fieldMask = uint16_t(kOverrideWaterMax | kOverrideWaterKind);
+    r.waterMaxMm = 60'000;
+    r.waterKind = 3;  // lake
+    r.waterMask = 2;  // fresh
+    return r;
+}
+
+vxmtest::VxmRule sparseOutlier() {
+    vxmtest::VxmRule r;
+    r.name = "sparse-outlier";
+    r.fieldMask = uint16_t(kOverrideAbundance | kOverrideSpacing);
+    r.abundanceQ10 = 256; // 0.25
+    r.spacingMm = 20'000;
+    return r;
+}
+
+} // namespace
+
+VXC_TEST(assetmanifest_rules_compose_by_intersection_and_split_the_species) {
+    // The owner's contract, as a table: a taiga/temperate tree that also
+    // carries desert weight, but in the desert must sit near fresh water and
+    // is rare and sparse. Two rules attached to (species, DESERT).
+    VxmSpecies tree = taigaTree("test-desert-margin-pine");
+    tree.weights[DESERT] = 300;
+
+    const std::vector<vxmtest::VxmRule> rules = {nearFreshWater60m(), sparseOutlier()};
+    const std::vector<vxmtest::VxmAttach> att = {{0, uint8_t(DESERT), 0},
+                                                 {0, uint8_t(DESERT), 1}};
+    AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  rules, att))),
+             int(AssetManifestError::kOk));
+    CHECK_EQ(int(m.rules().size()), 2);
+    CHECK(m.rules()[0].name == "near-fresh-water-60m");
+    CHECK_EQ(int(m.attachments().size()), 2);
+
+    // The composed override: union of masks, intersection of gates.
+    CHECK_EQ(int(m.overrides().size()), 1);
+    const AssetManifestOverride& o = m.overrides()[0];
+    CHECK_EQ(int(o.speciesIndex), 0);
+    CHECK_EQ(int(o.biome), int(DESERT));
+    CHECK_EQ(o.waterMaxMm, 60'000);
+    CHECK_EQ(int(o.waterKind), int(AssetWaterKind::kLake));
+    CHECK_EQ(int(o.waterMask), 2);
+    CHECK_EQ(o.spacingMm, 20'000);
+    CHECK_EQ(int(o.abundanceQ10), 256);
+
+    // The import splits: a base row that lost its desert weight, and a desert
+    // variant carrying the composed gates.
+    std::vector<AssetSpecies> table;
+    const AssetTableBuildStats st = assetSpeciesTableFromManifest(m, table);
+    CHECK_EQ(st.kept, 1);
+    CHECK_EQ(st.splitRows, 1);
+    CHECK_EQ(int(table.size()), 2);
+    const AssetSpecies& base = table[0];
+    const AssetSpecies& desert = table[1];
+    CHECK_EQ(int(base.bankId), 0);
+    CHECK_EQ(int(desert.bankId), 0); // same species, same bank
+    CHECK(base.weightPerMille[TAIGA] > 0);
+    CHECK_EQ(int(base.weightPerMille[DESERT]), 0);
+    CHECK_EQ(base.waterMaxMm, 0);
+    CHECK_EQ(int(desert.weightPerMille[TAIGA]), 0);
+    // Desert fold: 300 x (256/1024) x (5000/20000)^2 = 4.69 -> 5 per-mille.
+    CHECK_EQ(int(desert.weightPerMille[DESERT]), 5);
+    CHECK_EQ(desert.waterMaxMm, 60'000);
+
+    // And the behavioural contract: in the desert, this species FAILS CLOSED
+    // without a water distance and tolerates within its composed reach.
+    AssetColumnFacts col;
+    col.known = true;
+    col.biome = DESERT;
+    col.surfaceMm = 300'000;
+    col.slopeMmPerM = 100;
+    col.anchorSolid = true;
+    col.distanceToWaterMm = kAssetNoWaterDistanceMm;
+    CHECK_EQ(int(assetSpeciesFirstRefusal(desert, col)), int(AssetGate::kWaterDistance));
+    col.distanceToWaterMm = 30'000;
+    CHECK_EQ(int(assetSpeciesFirstRefusal(desert, col)), int(AssetGate::kNone));
+    col.distanceToWaterMm = 90'000;
+    CHECK_EQ(int(assetSpeciesFirstRefusal(desert, col)), int(AssetGate::kWaterDistance));
+    // The base row never reads water at all, and carries nothing in desert.
+    CHECK_EQ(int(assetSpeciesFirstRefusal(base, col)), int(AssetGate::kBiomeWeight));
+    // In taiga the base row is untouched by any of it.
+    col.biome = TAIGA;
+    col.distanceToWaterMm = 0;
+    CHECK_EQ(int(assetSpeciesFirstRefusal(base, col)), int(AssetGate::kNone));
+}
+
+VXC_TEST(assetmanifest_band_rules_intersect) {
+    vxmtest::VxmRule lowland;
+    lowland.name = "lowland";
+    lowland.fieldMask = uint16_t(kOverrideElevMin | kOverrideElevMax);
+    lowland.elevMinMm = 0;
+    lowland.elevMaxMm = 500'000;
+    vxmtest::VxmRule montane;
+    montane.name = "montane-floor";
+    montane.fieldMask = uint16_t(kOverrideElevMin | kOverrideElevMax);
+    montane.elevMinMm = 200'000;
+    montane.elevMaxMm = 2'000'000;
+
+    VxmSpecies tree = taigaTree("test-banded");
+    AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {lowland, montane},
+                                  {{0, uint8_t(TAIGA), 0}, {0, uint8_t(TAIGA), 1}}))),
+             int(AssetManifestError::kOk));
+    CHECK_EQ(int(m.overrides().size()), 1);
+    CHECK_EQ(m.overrides()[0].elevMinMm, 200'000);
+    CHECK_EQ(m.overrides()[0].elevMaxMm, 500'000);
+
+    // Two bands that do NOT intersect are a contradiction, refused whole.
+    montane.elevMinMm = 600'000;
+    AssetManifest m2;
+    CHECK_EQ(int(m2.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                   {lowland, montane},
+                                   {{0, uint8_t(TAIGA), 0}, {0, uint8_t(TAIGA), 1}}))),
+             int(AssetManifestError::kBadAttachment));
+    CHECK(!m2.valid());
+}
+
+VXC_TEST(assetmanifest_refuses_malformed_rules_and_attachments) {
+    VxmSpecies tree = taigaTree("test-pine");
+    VxmSpecies fish;
+    fish.name = "test-trout";
+    fish.kind = 6;
+    fish.layer = kAssetLayerNotScattered;
+    fish.flags = 0;
+    fish.weights[TEMPERATE_FOREST] = 500;
+    AssetManifest m;
+
+    // A rule with no mask bit says nothing and is refused.
+    vxmtest::VxmRule empty;
+    empty.name = "says-nothing";
+    empty.fieldMask = 0;
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {empty}, {}))),
+             int(AssetManifestError::kBadRule));
+
+    // A field carried without its mask bit: two encodings for one meaning.
+    vxmtest::VxmRule sneaky = sparseOutlier();
+    sneaky.waterMaxMm = 5'000; // not masked
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {sneaky}, {}))),
+             int(AssetManifestError::kBadRule));
+
+    // An attachment out of range, on either axis.
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {sparseOutlier()}, {{0, uint8_t(TAIGA), 7}}))),
+             int(AssetManifestError::kBadAttachment));
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {sparseOutlier()}, {{9, uint8_t(TAIGA), 0}}))),
+             int(AssetManifestError::kBadAttachment));
+
+    // Unsorted (duplicate) attachments.
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {sparseOutlier()},
+                                  {{0, uint8_t(TAIGA), 0}, {0, uint8_t(TAIGA), 0}}))),
+             int(AssetManifestError::kBadAttachment));
+
+    // An attachment on a detail entity: no gate of it reaches the scatter.
+    CHECK_EQ(int(m.parse(buildVxm({tree, fish}, vxmtest::defaultLayers(),
+                                  vxmtest::neutralDensity(), {sparseOutlier()},
+                                  {{1, uint8_t(TEMPERATE_FOREST), 0}}))),
+             int(AssetManifestError::kBadAttachment));
+
+    // Two rules that state different water KINDS for one (species, biome):
+    // no order exists between kinds, so the pair is a contradiction.
+    vxmtest::VxmRule river = nearFreshWater60m();
+    river.name = "near-river";
+    river.waterKind = 2; // river
+    river.waterMask = 6; // fresh | brackish
+    CHECK_EQ(int(m.parse(buildVxm({tree}, vxmtest::defaultLayers(), vxmtest::neutralDensity(),
+                                  {nearFreshWater60m(), river},
+                                  {{0, uint8_t(TAIGA), 0}, {0, uint8_t(TAIGA), 1}}))),
+             int(AssetManifestError::kBadAttachment));
 }

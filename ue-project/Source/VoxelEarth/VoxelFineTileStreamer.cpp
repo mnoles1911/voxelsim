@@ -204,6 +204,100 @@ FString FVoxelFineTileStreamer::LocalPathFor(vxc::TileCoord Tile) const
 	return FPaths::Combine(RootDir_, FString(Key.c_str()) + TEXT(".vxtl"));
 }
 
+FString FVoxelFineTileStreamer::DiagnoseNamespace(vxc::TileCoord Tile) const
+{
+	// Everything here is best-effort and failure-path-only: if the root cannot
+	// be listed we say nothing extra rather than turning a diagnosis into a
+	// second fault. std::error_code overloads throughout, for that reason.
+	std::error_code Ec;
+	const std::filesystem::path Root(*RootDir_);
+	if (!std::filesystem::is_directory(Root, Ec))
+	{
+		return FString::Printf(
+			TEXT(" THE FINE CACHE ROOT ITSELF IS NOT A DIRECTORY: %s does not exist or is not readable, so no "
+			     "namespace under it could match. Check -VoxelFineTileDir (or DefaultFineTileDir in "
+			     "Config/DefaultGame.ini)."),
+			*RootDir_);
+	}
+
+	// Does the CONFIGURED namespace even exist here? This is the single most
+	// informative bit and it is one stat. "The directory is not there" and "the
+	// directory is there but this tile has not been baked" call for opposite
+	// actions -- re-pin versus wait for the bake -- and the old message could
+	// not tell them apart because it printed one path for both.
+	const FString ConfiguredId(ProviderId_.c_str());
+	const bool bConfiguredDirExists =
+		std::filesystem::is_directory(Root / ProviderId_, Ec);
+
+	// Which namespaces under this root actually hold the wanted tile, for THIS
+	// seed? Formatted through vxc::formatFineTileCacheKey with each candidate
+	// id rather than by pasting the path grammar together here, so this cannot
+	// drift from the grammar LocalPathFor and the LRU key already share.
+	TArray<FString> Holders;
+	int32 NamespacesSeen = 0;
+	for (std::filesystem::directory_iterator It(Root, std::filesystem::directory_options::skip_permission_denied, Ec),
+	     End;
+	     It != End && !Ec; It.increment(Ec))
+	{
+		if (!It->is_directory(Ec))
+		{
+			continue;
+		}
+		const std::string Candidate = It->path().filename().string();
+		++NamespacesSeen;
+		const std::string Key = vxc::formatFineTileCacheKey(Candidate, Seed_, Tile.x, Tile.y);
+		if (std::filesystem::exists(Root / (Key + ".vxtl"), Ec))
+		{
+			Holders.Add(FString(Candidate.c_str()));
+		}
+	}
+	Holders.Sort();
+
+	if (Holders.Num() > 0)
+	{
+		// THE ANSWER, AND THE EXACT FLAG. An operator reading a fatal log at
+		// 02:00 should not have to know that the id is a bake fingerprint, that
+		// it lives in an ini, or that a command-line -VoxelFineTileDir does NOT
+		// carry the id with it. They should be able to copy one line.
+		FString Copyable;
+		for (const FString& Holder : Holders)
+		{
+			Copyable += FString::Printf(TEXT("\n    -VoxelFineTileProviderId=%s"), *Holder);
+		}
+		return FString::Printf(
+			TEXT(" NAMESPACE MISMATCH -- THIS TILE IS BAKED, UNDER A DIFFERENT PROVIDER ID. This run is configured "
+			     "for fine provider id '%s'%s, but %s holds tile (%d,%d) for seed %016llx under %d OTHER namespace(s). "
+			     "The fine provider id is a fingerprint of the terrain-service BAKE's constants, so it MOVES every "
+			     "time the bake changes -- and -VoxelFineTileDir on the command line does NOT bring the matching id "
+			     "with it (the id resolves independently, from -VoxelFineTileProviderId or DefaultFineTileProviderId "
+			     "in Config/DefaultGame.ini). Re-run with exactly one of:%s\nSee "
+			     "docs/fine-tile-provider-identity.md, and read the namespace the bake wrote off %s/<id>/%016llx/"
+			     "world-identity.json rather than deriving it."),
+			*ConfiguredId,
+			bConfiguredDirExists ? TEXT("") : TEXT(" (which has NO directory under this cache root at all)"),
+			*RootDir_, Tile.x, Tile.y, (unsigned long long)Seed_, Holders.Num(), *Copyable, *RootDir_,
+			(unsigned long long)Seed_);
+	}
+
+	if (!bConfiguredDirExists)
+	{
+		return FString::Printf(
+			TEXT(" THE CONFIGURED NAMESPACE DOES NOT EXIST UNDER THIS ROOT: no directory '%s' in %s (%d namespace "
+			     "directory/ies are present, none holding tile (%d,%d) for seed %016llx). Either the cache root or "
+			     "the provider id is wrong for this run -- they are resolved INDEPENDENTLY, so overriding "
+			     "-VoxelFineTileDir alone leaves the id pointing at whatever Config/DefaultGame.ini pins. See "
+			     "docs/fine-tile-provider-identity.md."),
+			*ConfiguredId, *RootDir_, NamespacesSeen, Tile.x, Tile.y, (unsigned long long)Seed_);
+	}
+
+	return FString::Printf(
+		TEXT(" The namespace is right and the tile is simply NOT BAKED: '%s' exists under %s, and no namespace there "
+		     "holds tile (%d,%d) for seed %016llx. This is a coverage gap, not an identity mismatch -- bake the tile "
+		     "(terrain-service: pregen --mode bake, or tools/bake_tiles_from_cache.py --tiles=\"%d,%d\") or move the "
+		     "camera to a baked tile."),
+		*ConfiguredId, *RootDir_, Tile.x, Tile.y, (unsigned long long)Seed_, Tile.x, Tile.y);
+}
+
 bool FVoxelFineTileStreamer::EnsureTileResident_Locked(vxc::TileCoord Tile)
 {
 	if (Sampler_.findTile(Tile.x, Tile.y) != nullptr)
@@ -767,6 +861,21 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 	// alike. Those need opposite responses: wait for the bake, versus rebuild
 	// the binary. The refusal was diagnosed the first time it happened; this
 	// carries that diagnosis to where it will be seen.
+	// AND IF THE TILE IS SOMEWHERE ELSE, SAY WHERE. The refusal note below
+	// explains a tile that was READ and rejected; this explains the far more
+	// common case that made this gate fire three times on 2026-08-18 -- a tile
+	// that exists, is fine, and is sitting under a different provider id because
+	// the bake fingerprint moved and nothing told this process.
+	//
+	// COMPUTED ONLY WHEN IT WILL ACTUALLY BE PRINTED, which is the whole reason
+	// this is a lambda and not a plain local. DiagnoseNamespace lists a
+	// directory; the non-fatal path reaches here on EVERY leaking query, and the
+	// audit that motivated this gate measured 18.7 MILLION leaks into one tile
+	// in a single run. Computing it eagerly would put a directory scan on that
+	// path -- turning a diagnostic into a hang, which is precisely the mistake
+	// the surrounding code refuses to make about tile loads.
+	const auto NamespaceNote = [this, Tile]() -> FString { return DiagnoseNamespace(Tile); };
+
 	FString RefusalNote;
 	if (auto FailIt = LoadFailures_.find(TileHash(Tile)); FailIt != LoadFailures_.end())
 	{
@@ -785,13 +894,13 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("and on the fine tier sea level is not a fallback -- it is terrain no other client computes, so this ")
 		       TEXT("run's output would not be reproducible. Stopping instead of producing an artifact that looks fine. ")
 		       TEXT("Leaks so far=%llu, blocking loads=%llu, resident=%llu tile(s), absentOnDisk=%llu, corrupt=%llu, ")
-		       TEXT("identityMismatch=%llu, refusedTiles=%llu.%s If the tile SHOULD exist, check ")
-		       TEXT("-VoxelFineTileProviderId: it is part of the cache key and of the on-disk path, and omitting it ")
-		       TEXT("makes every lookup miss. Pass -VoxelFineTileGateFatal=0 to downgrade this to an Error."),
+		       TEXT("identityMismatch=%llu, refusedTiles=%llu.%s%s Pass -VoxelFineTileGateFatal=0 to downgrade ")
+		       TEXT("this to an Error."),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
 		       (unsigned long long)BlockingLoads_.load(std::memory_order_relaxed), (unsigned long long)Sampler_.tileCount(),
 		       (unsigned long long)MissingFileLoads_, (unsigned long long)CorruptLoads_,
-		       (unsigned long long)IdentityMismatches_, (unsigned long long)GivenUpTiles_, *RefusalNote);
+		       (unsigned long long)IdentityMismatches_, (unsigned long long)GivenUpTiles_, *RefusalNote,
+		       *NamespaceNote());
 		// UE_LOG(Fatal) does not return. The sea-level answer below is
 		// unreachable here and exists only for the non-fatal path.
 	}
@@ -802,9 +911,9 @@ int32_t FVoxelFineTileStreamer::ReportGateLeak_Locked(vxc::TileCoord Tile, int64
 		       TEXT("FINE TIER GATE LEAK: elevation query at fine pixel (%lld,%lld) landed in NON-RESIDENT tile (%d,%d) ")
 		       TEXT("(%s) and is being answered with SEA LEVEL. That is a desync, not a fallback: this client's terrain, ")
 		       TEXT("collision and edits here will not match a client that has the tile. Logged once per tile; total ")
-		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal).%s"),
+		       TEXT("leaks=%llu. Thread=%s. Unattended runs stop on this instead (SetLeakIsFatal).%s%s"),
 		       (long long)px, (long long)py, Tile.x, Tile.y, *LocalPathFor(Tile), (unsigned long long)LeakCount,
-		       IsInGameThread() ? TEXT("game") : TEXT("worker"), *RefusalNote);
+		       IsInGameThread() ? TEXT("game") : TEXT("worker"), *RefusalNote, *NamespaceNote());
 	}
 
 	// The sampler's own missingTileQueries bump happens inside this call, which

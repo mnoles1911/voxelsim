@@ -300,7 +300,120 @@ namespace vxc {
 // spec_hash. Before it existed the exporter skipped a bake whenever the FILE
 // EXISTED, so the engine would have gone on composing pre-taper trees forever
 // with nothing to say so.
-inline constexpr uint32_t kWorldGenVersion = 25;
+//
+// --- v26: PLACEMENT READS THE GROUND'S OWN CHANNELS ------------------------
+//
+// The terrain function is untouched (terrain-only digest e02458de2be47309
+// before and after -- assets are not terrain); what moved is which species
+// stands where, in five ways:
+//
+//   * STANDING WATER finally reaches the veto: AssetColumnFacts gets its
+//     water surface from the SAME composed lake/river datum the renderer
+//     draws (assetchannels.h over IWaterSampler), plus the sea composed from
+//     the column itself -- not from ColumnSample::waterSurfaceMm, the debug
+//     marker that is empty in every production run and made the first veto
+//     inert while the owner photographed oaks standing in the alpine lake.
+//   * DISTANCE TO WATER is served from the fine tiles' new SECTION_PLACE_*
+//     planes (bake_ver 28), un-refusing the 112 authored riparian species
+//     that failed closed since the gate existed.
+//   * The hard slope ceiling became a RESPONSE CURVE, sized inversely from
+//     species height at import (tall crowns taper out by ~60% slope,
+//     krummholz holds to 100%), and the treeline became a BAND: tall species
+//     thin through the last 150-300 m below the temperature-adjusted line,
+//     shifted by aspect heat load.
+//   * TWI moisture, talus flux and curvature modulate pick weights through
+//     per-species affinities DERIVED at import from what authors already
+//     said (water_max, biome weights, kind, height) -- zero spec edits.
+//   * Every channel is sentinelled: a world with no fine tiles or pre-28
+//     tiles modulates by exactly 1 everywhere except the slope curve and the
+//     treeline band, which need no channel.
+//
+// assetpolicy.h/assetfield.h/assetchannels.h/assetmanifest.cpp are the
+// mechanism; vxc_bench --assets is the ran-flag, and its digest moves while
+// the terrain-only digest must not. Verified at the bump (radius 8, seed
+// 20260719, brick 16, 2026-08-17 manifest): terrain-only e02458de2be47309
+// unchanged; --assets 41ec6bbf103f18dc -> ea75a87ab98e8cba.
+//
+// --- v27: BIOME REBALANCE (owner decisions, 2026-08-18) --------------------
+//
+// Two changes, both in biome.h's classifyBiome and BOTH terrain (surfaceMat
+// moves, so unlike v24..v26 the digests MOVE at this bump):
+//
+//   * THE DRY-LAND CLIFF GATE IS GONE. "Bare rock should not really be a
+//     thing at all unless it's underneath a water body or ocean." Slope >
+//     kBiomeCliffSlopeMmPerM now classifies BARE_ROCK only BELOW the coastal
+//     band (steep ocean floor: rock, not mud -- sediment does not rest above
+//     the angle of repose); on dry land the column falls through to the
+//     treeline/Whittaker answer, so steep hillsides carry their climate's
+//     biome and its slope-curve-gated vegetation. Cliff FACES still show
+//     rock: the topsoil retention floor (unchanged, still tied to the same
+//     constant) leaves a one-voxel soil skin whose wall faces expose the
+//     MAT_ROCK stratigraphy beneath.
+//
+//   * THE GRASSLAND/FOREST PRECIPITATION BOUNDARY MOVED 800 -> 450 mm/yr
+//     (kBiomePrecipSemiU8, u8 17 -> 10) to trade grassland for temperate
+//     forest on this world's compressed precipitation tails. Coarse-corpus
+//     census (vxc_climateprobe 64/axis): TEMPERATE_FOREST 5.44% -> 9.67% of
+//     world (11.9% -> 21.1% of land), GRASSLAND 14.38% -> 12.87%
+//     (31.4% -> 28.1%), BARE_ROCK 5.25% -> 1.07% (all submarine, 0.00% of
+//     land), TUNDRA_ALPINE 7.23% -> 9.03% (ex-cliff columns above the
+//     treeline are alpine now), DESERT/SAVANNA/TAIGA/RAINFOREST/BEACH/OCEAN
+//     within 0.25 points. The full reasoning, including why 450 is this
+//     lever's floor and what it deliberately trades, is at the constants in
+//     biome.h.
+//
+// NO TILE RE-BAKE IS NEEDED to see the new biomes: tiles carry raw climate
+// channels (coarse) and elevation/water/placement planes (fine), never a
+// biome byte -- classification is code, applied per column at generation
+// time, so the next session over the SAME tiles renders v27 biomes. (The
+// placement planes' talus threshold cites the cliff constant only as prose;
+// the bake never calls classifyBiome.) What DOES go stale is anything
+// derived from the old classification outside the tiles: census overlays,
+// biome-keyed capture site lists, and cached session state.
+//
+// --- v28: PER-BIOME PLACEMENT (owner directive, 2026-08-18) ----------------
+//
+// The manifest moves to VXM2 (forge/manifest.py / assetmanifest.h) and the
+// placement policy learns three per-biome facts. Terrain is untouched
+// (terrain-only digest ad9c4c2a100b5a28 before and after -- assets are not
+// terrain); what moves is which species stands where and HOW MANY:
+//
+//   * A KIND x BIOME DENSITY TABLE (rules/biome-density.json) scales the
+//     occupancy test per asset class per biome, AFTER the species pick, so
+//     it is linear through weight saturation -- the measured defect it
+//     fixes: biome weights saturate the occupancy cap, so savanna carried
+//     the same canopy density as temperate forest (277 vs 283 sites, audit
+//     4.2) and only the global layer density acted anywhere. Values above
+//     1000 per-mille are REFUSED: the table may only thin (veto-only), so
+//     every streaming-bound argument stands unmodified.
+//   * AN EXPLICIT BIOME ALLOWLIST per species (spec `biome_allow`, enforced
+//     at export by zeroing outside weights, reported by name) -- "allowed in
+//     one, many, or NO biomes" is now an auditable statement instead of an
+//     implicit pattern of zeros.
+//   * NAMED PLACEMENT RULES (rules/placement-rules.json), authored once and
+//     ATTACHED per (species, biome), one or many; composition is
+//     intersection (strictest wins), and the import splits each overridden
+//     (species, biome) into its own gate row so the resolver stays scalar
+//     compares. The owner's contract: "temperate type tree is almost
+//     unrestricted in temperate forest but faces strict placement rules in
+//     deserts such as must be near fresh water body."
+//
+// THE FORMAT LANDED AS A PROVEN NO-OP FIRST: with the density table neutral
+// (all 1000) and no rules attached, the VXM2 species block is byte-identical
+// to the VXM1 export, vxc_assetprobe's census is identical at three sites
+// (savanna 35,829 / temperate_forest 33,029 / rainforest 35,568 instances,
+// zero counters moved), and the composed-asset digest is unchanged
+// (d6357c3b035c8c22 with old code + VXM1 and new code + neutral VXM2). The
+// REAL per-biome densities then land as their own commit so the tuning diff
+// is exactly the tuning -- both steps inside this one version bump, because
+// no world shipped against the interim neutral manifest. With the tuned
+// table (rules/biome-density.json) the composed-asset digest moves
+// d6357c3b035c8c22 -> 48b159faa28a5e84 (the ran-flag), terrain-only stays
+// ad9c4c2a100b5a28, and the census delivers the directive's contrast:
+// savanna 143 -> 25 trees/ha with its grass untouched at ~3,200/ha, while
+// taiga keeps 279 trees/ha -- cross-biome tree spread 5x -> 15.5x, grass
+// 2.1x -> 10x (per-site tables in the tuning commit).
+inline constexpr uint32_t kWorldGenVersion = 28;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

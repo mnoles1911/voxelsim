@@ -1,0 +1,125 @@
+coarse tiles loaded=289 rejected=0 pixelSizeMm=30000
+zstd: bound from libzstd.dll
+fine tier: dir=D:/voxelsim/tile-cache/terrain-diffusion-unlabeled-80b9ca451a23eae4-b19d281fd/000000000135276f/s16 loaded=1 rejected=0 skipped_outside_region=14 pixelSizeMm=1875
+fine prewarm: [-40840..-32888]x[-89992..-82040] px complete
+sampling 496 x 496 = 246016 columns at 30 m stride, 12 threads...
+
+region fine_t-5_-11: (-76560, -168720) m, 14880 x 14880 m, stride 30 m, tier FINE (v2, 1.875 m/px)
+elevation (clamped to sea level): min 2.7  mean 229.3  max 730.7 m   (raw seabed min 2.7 m)   land 100.0%   HI 0.311
+
+WINDOWED RELIEF R(w) = max-min inside a sliding square window (clamped)
+         w   span (m)    p50 (m)    p90 (m)    p99 (m)    max (m)  max window centre
+      1.0k        990      178.1      328.5      418.1      543.0  (-75615, -160755) m
+      2.5k       2490      341.2      469.2      542.9      582.8  (-75315, -160095) m
+      5.0k       5010      494.5      573.1      611.1      632.8  (-73695, -158835) m
+     10.0k       9990      641.2      667.4      699.7      707.0  (-71145, -158895) m
+
+WALL SCORE W(L) = |elevation gain| along straight L m transects, 4 lattice directions
+  W2k  lag axis 2010 m / diag 1994.0 m: p50 59.5  p99 351.0  MAX 569.4 m
+        max climbs (-74700, -159930) -> (-76110, -161340) m  [NE-SW]  161.2 -> 730.7 m
+  W500 lag axis 510 m / diag 509.1 m: p50 23.1  p99 207.7  MAX 350.1 m
+        max climbs (-75510, -161580) -> (-76020, -161580) m  [E-W]  324.3 -> 674.3 m
+  W2k with bathymetry (raw ground, no sea-level clamp): p99 351.0  MAX 569.4 m  (-74700, -159930) -> (-76110, -161340) m
+
+SLOPE at 30 m posting: mean 14.59  p50 11.11  p90 33.43  p99 43.61 deg   bimodality BC 0.636 (BIMODAL; >0.555 suggests bimodal)
+RUGGEDNESS: TRI mean 23.74 p90 51.70 p99 69.62 m   VRM mean 0.01813 p90 0.04936 p99 0.09984 (3x3)
+
+=== VXC_RELIEFPROBE BASELINE v1 ===
+# field                                                   value  unit
+config.worldgen_version                                      27  int
+config.seed                                            20260719  int
+config.region                                      fine_t-5_-11  label
+config.x0                                                -76560  m
+config.y0                                               -168720  m
+config.width                                              14880  m
+config.height                                             14880  m
+config.stride                                                30  m
+config.tier                                          fine1875mm  enum
+config.samples_x                                            496  count
+config.samples_y                                            496  count
+config.fine_tiles                                             1  count
+config.coarse_misses                                          0  count_must_be_0
+config.fine_misses                                            0  count
+elev.min_bathy                                            2.683  m
+elev.min                                                  2.683  m
+elev.p10                                                  55.15  m
+elev.p50                                                 202.25  m
+elev.p90                                                 435.65  m
+elev.max                                                730.673  m
+elev.mean                                               229.289  m
+elev.hypsometric_integral                              0.311276  ratio
+elev.land_frac                                                1  ratio
+relief.w1000.span                                           990  m
+relief.w1000.windows                                     214369  count
+relief.w1000.p50                                         178.05  m
+relief.w1000.p90                                         328.45  m
+relief.w1000.p99                                         418.05  m
+relief.w1000.max                                        542.952  m
+relief.w1000.max_cx                                      -75615  m
+relief.w1000.max_cy                                     -160755  m
+relief.w2500.span                                          2490  m
+relief.w2500.windows                                     170569  count
+relief.w2500.p50                                         341.15  m
+relief.w2500.p90                                         469.25  m
+relief.w2500.p99                                         542.85  m
+relief.w2500.max                                        582.812  m
+relief.w2500.max_cx                                      -75315  m
+relief.w2500.max_cy                                     -160095  m
+relief.w5000.span                                          5010  m
+relief.w5000.windows                                     108241  count
+relief.w5000.p50                                         494.45  m
+relief.w5000.p90                                         573.05  m
+relief.w5000.p99                                         611.05  m
+relief.w5000.max                                          632.8  m
+relief.w5000.max_cx                                      -73695  m
+relief.w5000.max_cy                                     -158835  m
+relief.w10000.span                                         9990  m
+relief.w10000.windows                                     26569  count
+relief.w10000.p50                                        641.25  m
+relief.w10000.p90                                        667.35  m
+relief.w10000.p99                                        699.65  m
+relief.w10000.max                                       707.031  m
+relief.w10000.max_cx                                     -71145  m
+relief.w10000.max_cy                                    -158895  m
+wall.w2000.lag_axis                                        2010  m
+wall.w2000.lag_diag                                     1994.04  m
+wall.w2000.p50                                            59.45  m
+wall.w2000.p99                                           350.95  m
+wall.w2000.max                                          569.424  m
+wall.w2000.max_x0                                        -74700  m
+wall.w2000.max_y0                                       -159930  m
+wall.w2000.max_x1                                        -76110  m
+wall.w2000.max_y1                                       -161340  m
+wall.w2000.max_lo                                       161.249  m
+wall.w2000.max_hi                                       730.673  m
+wall.w500.lag_axis                                          510  m
+wall.w500.lag_diag                                      509.117  m
+wall.w500.p50                                             23.05  m
+wall.w500.p99                                            207.65  m
+wall.w500.max                                           350.058  m
+wall.w500.max_x0                                         -75510  m
+wall.w500.max_y0                                        -161580  m
+wall.w500.max_x1                                         -76020  m
+wall.w500.max_y1                                        -161580  m
+wall.w500.max_lo                                        324.265  m
+wall.w500.max_hi                                        674.323  m
+wall.w2000_bathy.p99                                     350.95  m
+wall.w2000_bathy.max                                    569.424  m
+wall.w2000_bathy.max_x0                                  -74700  m
+wall.w2000_bathy.max_y0                                 -159930  m
+wall.w2000_bathy.max_x1                                  -76110  m
+wall.w2000_bathy.max_y1                                 -161340  m
+slope.mean                                              14.5855  deg
+slope.p50                                                 11.11  deg
+slope.p90                                                 33.43  deg
+slope.p99                                                 43.61  deg
+slope.bimodality_bc                                    0.636139  ratio_gt_0.555_bimodal
+tri.mean                                                  23.74  m
+tri.p50                                                  19.815  m
+tri.p90                                                  51.705  m
+tri.p99                                                  69.625  m
+vrm.mean                                               0.018127  ratio
+vrm.p50                                                0.009585  ratio
+vrm.p90                                                0.049355  ratio
+vrm.p99                                                0.099835  ratio
+json written to docs/measurements/relief-2026-08-18/fine-t-5_-11.json

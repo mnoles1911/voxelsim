@@ -1,0 +1,243 @@
+[
+ {
+  "name": "vista-desert-arid",
+  "x_m": -38400.0,
+  "y_m": -161280.0,
+  "tx": -3,
+  "ty": -11,
+  "px": 256,
+  "py": 256,
+  "elev": 129.0,
+  "temp": 25.568627450980387,
+  "seas": 4.11764705882353,
+  "precip": 94.11764705882352,
+  "biome": "DESERT",
+  "share": {
+   "DESERT": 0.9794605276465966,
+   "BEACH": 0.020539472353403407
+  },
+  "prov_pt": {
+   "fluvial": 0.0,
+   "glacial": 0.0,
+   "arid": 1.0,
+   "lowland": 0.0
+  },
+  "prov_tile": {
+   "fluvial": 0.0,
+   "glacial": 0.0,
+   "arid": 1.0,
+   "lowland": 0.0
+  },
+  "prov_top": "arid",
+  "relief": 456.0,
+  "land_frac": 0.80333125,
+  "slug": "desert-arid-t-3_-11"
+ },
+ {
+  "name": "vista-temperate_forest-fluvial",
+  "x_m": -115200.0,
+  "y_m": -176640.0,
+  "tx": -8,
+  "ty": -12,
+  "px": 256,
+  "py": 256,
+  "elev": 1062.0,
+  "temp": 8.0,
+  "seas": 5.1764705882352935,
+  "precip": 1976.4705882352941,
+  "biome": "TEMPERATE_FOREST",
+  "share": {
+   "TEMPERATE_FOREST": 0.99896875
+  },
+  "prov_pt": {
+   "fluvial": 1.0,
+   "glacial": 0.0,
+   "arid": 0.0,
+   "lowland": 0.0
+  },
+  "prov_tile": {
+   "fluvial": 0.9752958416938782,
+   "glacial": 4.843340866500512e-05,
+   "arid": 0.0,
+   "lowland": 0.024655725806951523
+  },
+  "prov_top": "fluvial",
+  "relief": 1607.0,
+  "land_frac": 1.0,
+  "slug": "temperate_forest-fluvial-t-8_-12"
+ },
+ {
+  "name": "vista-rainforest-lowland",
+  "x_m": -100470.0,
+  "y_m": -171510.0,
+  "tx": -7,
+  "ty": -12,
+  "px": 235,
+  "py": 427,
+  "elev": 111.0,
+  "temp": 24.313725490196077,
+  "seas": 3.5294117647058822,
+  "precip": 1741.1764705882354,
+  "biome": "RAINFOREST",
+  "share": {
+   "RAINFOREST": 0.87415,
+   "SAVANNA": 0.1054,
+   "TEMPERATE_FOREST": 0.02045
+  },
+  "prov_pt": {
+   "fluvial": 0.17014575004577637,
+   "glacial": 0.0,
+   "arid": 0.0,
+   "lowland": 0.8298542499542236
+  },
+  "prov_tile": {
+   "fluvial": 0.5604261159896851,
+   "glacial": 0.0,
+   "arid": 0.02821831963956356,
+   "lowland": 0.411355584859848
+  },
+  "prov_top": "lowland",
+  "relief": 898.0,
+  "land_frac": 1.0,
+  "slug": "rainforest-lowland-t-7_-12"
+ },
+ {
+  "name": "vista-beach",
+  "x_m": -61200.0,
+  "y_m": -153360.0,
+  "tx": -4,
+  "ty": -10,
+  "px": 8,
+  "py": 8,
+  "elev": 1.0,
+  "temp": 26.509803921568633,
+  "seas": 4.588235294117648,
+  "precip": 376.4705882352941,
+  "biome": "BEACH",
+  "share": {
+   "SAVANNA": 0.6966301651642568,
+   "BEACH": 0.19604331780506987,
+   "DESERT": 0.10732651703067336
+  },
+  "prov_pt": {
+   "fluvial": 0.07172991335391998,
+   "glacial": 0.0,
+   "arid": 0.8499285578727722,
+   "lowland": 0.07834156602621078
+  },
+  "prov_tile": {
+   "fluvial": 0.12388329952955246,
+   "glacial": 0.0,
+   "arid": 0.7466760277748108,
+   "lowland": 0.12944066524505615
+  },
+  "prov_top": "arid",
+  "relief": 355.0,
+  "land_frac": 0.51653125,
+  "slug": "beach-arid-t-4_-10"
+ },
+ {
+  "name": "vista-taiga",
+  "x_m": -102390.0,
+  "y_m": -23670.0,
+  "tx": -7,
+  "ty": -2,
+  "px": 171,
+  "py": 235,
+  "elev": 126.0,
+  "temp": -0.470588235294116,
+  "seas": 15.176470588235293,
+  "precip": 235.2941176470588,
+  "biome": "TAIGA",
+  "share": {
+   "TAIGA": 0.794038497229366,
+   "GRASSLAND": 0.09672694010658324,
+   "TUNDRA_ALPINE": 0.0917623352864756,
+   "BEACH": 0.0174722273775751
+  },
+  "prov_pt": {
+   "fluvial": 0.08743316680192947,
+   "glacial": 0.8146211504936218,
+   "arid": 0.09794565290212631,
+   "lowland": 0.0
+  },
+  "prov_tile": {
+   "fluvial": 0.17824502289295197,
+   "glacial": 0.3036927580833435,
+   "arid": 0.5180622339248657,
+   "lowland": 0.0
+  },
+  "prov_top": "glacial",
+  "relief": 782.0,
+  "land_frac": 0.942925,
+  "slug": "taiga-glacial-t-7_-2"
+ },
+ {
+  "name": "vista-tundra_alpine-glacial",
+  "x_m": -38400.0,
+  "y_m": -38400.0,
+  "tx": -3,
+  "ty": -3,
+  "px": 256,
+  "py": 256,
+  "elev": 3311.0,
+  "temp": -6.431372549019606,
+  "seas": 22.823529411764703,
+  "precip": 94.11764705882352,
+  "biome": "TUNDRA_ALPINE",
+  "share": {
+   "TUNDRA_ALPINE": 1.0
+  },
+  "prov_pt": {
+   "fluvial": 0.0,
+   "glacial": 1.0,
+   "arid": 0.0,
+   "lowland": 0.0
+  },
+  "prov_tile": {
+   "fluvial": 0.0887991264462471,
+   "glacial": 0.8122527003288269,
+   "arid": 0.09894819557666779,
+   "lowland": 0.0
+  },
+  "prov_top": "glacial",
+  "relief": 3746.0,
+  "land_frac": 1.0,
+  "slug": "tundra_alpine-glacial-t-3_-3"
+ },
+ {
+  "name": "vista-rainforest-fluvial",
+  "x_m": -23040.0,
+  "y_m": -53760.0,
+  "tx": -2,
+  "ty": -4,
+  "px": 256,
+  "py": 256,
+  "elev": 1437.0,
+  "temp": 21.80392156862745,
+  "seas": 8.23529411764706,
+  "precip": 1788.235294117647,
+  "biome": "RAINFOREST",
+  "share": {
+   "RAINFOREST": 0.60685,
+   "TEMPERATE_FOREST": 0.22931875,
+   "TUNDRA_ALPINE": 0.163775
+  },
+  "prov_pt": {
+   "fluvial": 1.0,
+   "glacial": 0.0,
+   "arid": 0.0,
+   "lowland": 0.0
+  },
+  "prov_tile": {
+   "fluvial": 0.9338091611862183,
+   "glacial": 0.06581292301416397,
+   "arid": 0.0,
+   "lowland": 0.00037792843068018556
+  },
+  "prov_top": "fluvial",
+  "relief": 3489.0,
+  "land_frac": 1.0,
+  "slug": "rainforest-fluvial-t-2_-4"
+ }
+]
