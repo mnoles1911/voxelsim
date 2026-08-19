@@ -112,7 +112,7 @@ export default function App() {
             <Hammer className="h-4 w-4" /> Forge
           </TabButton>
           <TabButton active={tab === "library"} onClick={() => setTab("library")}>
-            <BookOpen className="h-4 w-4" /> Library & placement
+            <BookOpen className="h-4 w-4" /> Asset Library
           </TabButton>
           <TabButton active={tab === "rules"} onClick={() => setTab("rules")}>
             <ScrollText className="h-4 w-4" /> Placement rules

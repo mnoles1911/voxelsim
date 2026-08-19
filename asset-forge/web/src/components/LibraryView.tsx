@@ -25,12 +25,19 @@ export function LibraryView({
 }) {
   const [kind, setKind] = React.useState("all");
   const [biome, setBiome] = React.useState("all");
-  const [status, setStatus] = React.useState("all");
+  // "What is actually in my library" defaults to the exporting set: approved
+  // verdicts (the grandfathered majority included). Switch to "Any verdict"
+  // to see drafts and rejections.
+  const [status, setStatus] = React.useState("approved");
   const [query, setQuery] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    if (focus) setSelected(focus.name);
+    if (!focus) return;
+    setSelected(focus.name);
+    // A handoff (just-kept seed, fresh import at draft) must never land on a
+    // ledger that filters its species out of sight.
+    setStatus("all");
   }, [focus]);
 
   const variantCount = React.useMemo(() => {

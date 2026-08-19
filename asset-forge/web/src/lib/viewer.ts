@@ -153,6 +153,8 @@ function instanceAttrib(
 export interface VoxelViewer {
   setInstances(offsets: Float32Array, colors: Uint8Array, dims: Vec3): void;
   reset(): void;
+  /** Multiply the orbit distance: factor < 1 zooms in, > 1 out. */
+  zoom(factor: number): void;
   invalidate(): void;
   dispose(): void;
 }
@@ -192,10 +194,14 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
     gl!.bindVertexArray(vao);
     instanceAttrib(gl!, prog, "aOffset", offsetBuf, offsets, 3, gl!.FLOAT, false);
     instanceAttrib(gl!, prog, "aColor", colorBuf, colors, 3, gl!.UNSIGNED_BYTE, true);
+    // Keep the CAMERA between models: the orbit angles persist untouched, and
+    // the zoom carries over as a ratio of the framing distance -- so stepping
+    // between a species' seeds compares them from the exact same viewpoint.
+    const ratio = state.count > 0 ? state.radius / state.home : 1;
     state.count = offsets.length / 3;
     state.center = [dims[0] / 2, dims[1] / 2, dims[2] / 2];
-    state.radius = Math.max(...dims) * 1.5;
-    state.home = state.radius;
+    state.home = Math.max(...dims) * 1.5;
+    state.radius = state.home * ratio;
     state.dirty = true;
   }
 
@@ -317,6 +323,10 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
       state.radius = state.home;
       state.dirty = true;
     },
+    zoom(factor: number) {
+      state.radius = zoomTo(state.radius * factor);
+      state.dirty = true;
+    },
     invalidate() {
       state.dirty = true;
     },
@@ -326,7 +336,9 @@ export function createViewer(canvas: HTMLCanvasElement): VoxelViewer | null {
   };
 }
 
-/** Decode the server's binary surface-voxel blob (see server.encode_voxels). */
+/** Decode the server's binary surface-voxel blob (see server.encode_voxels).
+ * Also tallies voxels per material id, which is how the inspector reports
+ * "materials used" without any extra server round trip. */
 export function decodeVoxels(buffer: ArrayBuffer, palette: Record<string, [number, number, number]>) {
   const head = new Uint32Array(buffer, 0, 4);
   const dims: Vec3 = [head[0], head[1], head[2]];
@@ -336,14 +348,17 @@ export function decodeVoxels(buffer: ArrayBuffer, palette: Record<string, [numbe
 
   const offsets = new Float32Array(count * 3);
   const colors = new Uint8Array(count * 3);
+  const materialCounts: Record<number, number> = {};
   for (let i = 0; i < count; i++) {
     offsets[i * 3] = pos[i * 3];
     offsets[i * 3 + 1] = pos[i * 3 + 1];
     offsets[i * 3 + 2] = pos[i * 3 + 2];
-    const c = palette[String(mats[i])] || [255, 0, 255];
+    const m = mats[i];
+    materialCounts[m] = (materialCounts[m] ?? 0) + 1;
+    const c = palette[String(m)] || [255, 0, 255];
     colors[i * 3] = c[0];
     colors[i * 3 + 1] = c[1];
     colors[i * 3 + 2] = c[2];
   }
-  return { offsets, colors, dims, count };
+  return { offsets, colors, dims, count, materialCounts };
 }

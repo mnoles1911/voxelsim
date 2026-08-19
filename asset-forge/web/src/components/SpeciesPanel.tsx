@@ -1,7 +1,7 @@
 import * as React from "react";
-import { Check, Download, FileBox, Sparkles, Stamp, Trash2, X } from "lucide-react";
+import { Check, FileBox, Rotate3d, Stamp, X } from "lucide-react";
 import type { World } from "../App";
-import { api, forgeApi } from "../lib/api";
+import { api } from "../lib/api";
 import type { CurationStatus, SpeciesRow } from "../lib/schema";
 import { CURATION_SEEDS } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
@@ -10,13 +10,14 @@ import { Button } from "./ui/button";
 import { Input } from "./ui/input";
 import { useToast } from "./ui/toast";
 import { CurationBadge } from "./LibraryView";
+import { LibraryInspector } from "./LibraryInspector";
 import { PlacementPanel } from "./PlacementPanel";
-import { VariantViewer } from "./VariantViewer";
 import { cn } from "../lib/cn";
 
-/* One species, everything about it: variants (with the 3D viewer), the
- * publish verdict, and the placement panel. Works identically for generated
- * and imported assets -- nothing here assumes generator-only fields. */
+/* One species, everything about it: kept variants (each with a first-class
+ * 3D INSPECT affordance), the publish verdict, and the placement panel.
+ * Works identically for generated and imported assets -- nothing here
+ * assumes generator-only fields. */
 
 export function SpeciesPanel({
   row, world, onVary,
@@ -27,9 +28,8 @@ export function SpeciesPanel({
 }) {
   const Icon = kindIcon(row.kind);
   const variants = world.library.filter((e) => e.species === row.name);
-  const [viewing, setViewing] = React.useState<string | null>(variants[0]?.id ?? null);
+  const [inspecting, setInspecting] = React.useState<string | null>(null);
   const toast = useToast();
-  const viewingEntry = variants.find((e) => e.id === viewing);
 
   const kindLabel = world.kinds.find((k) => k.key === row.kind)?.label ?? row.kind;
 
@@ -50,95 +50,64 @@ export function SpeciesPanel({
 
       <CurationBar row={row} world={world} />
 
-      {/* variants */}
+      {/* kept variants: each card IS the inspector's door */}
       <section className="chamfer bevel-up bg-stone-800 p-3">
         <h3 className="mb-2 flex items-center gap-2 font-display text-sm uppercase tracking-widest text-parch-400">
           <FileBox className="h-4 w-4" /> Kept variants
+          <span className="font-mono text-[11px] normal-case tracking-normal text-parch-500">
+            {variants.length > 0 && variants.length + " saved · click one to inspect it in 3D"}
+          </span>
         </h3>
         {variants.length === 0 ? (
           <p className="text-sm text-parch-500">
-            None kept yet. Variants arrive from the generator's gallery ("keep to library") or through
-            Import asset -- both land here and are placement-specced identically.
+            None kept yet. Variants arrive from the Forge ("keep to library") or through Import asset --
+            both land here and are placement-specced identically.
           </p>
         ) : (
-          <>
-            <div className="mb-3 flex flex-wrap gap-2">
-              {variants.map((e) => (
-                <button
-                  key={e.id}
-                  onClick={() => setViewing(e.id)}
-                  className={cn(
-                    "chamfer-sm relative w-24 shrink-0 bg-stone-850 p-1 transition-colors",
-                    viewing === e.id ? "bevel-up bg-stone-600" : "bevel-down hover:bg-stone-700",
-                  )}
-                  title={e.id}
-                >
-                  <img src={api.thumbUrl(e.id)} alt={e.id} loading="lazy" className="h-20 w-full object-contain" />
-                  <span className="block truncate text-center font-mono text-[10px] text-parch-400">
-                    seed {e.seed}
+          <div className="grid grid-cols-[repeat(auto-fill,minmax(150px,1fr))] gap-2">
+            {variants.map((e) => (
+              <button
+                key={e.id}
+                onClick={() => setInspecting(e.id)}
+                className="chamfer bevel-up group relative flex flex-col bg-stone-850 p-1.5 text-left transition-colors hover:bg-stone-700"
+                title={"Inspect " + e.id + " in 3D"}
+              >
+                <img src={api.thumbUrl(e.id)} alt={e.id} loading="lazy" className="h-28 w-full object-contain" />
+                <div className="mt-1 flex items-center gap-1.5 px-0.5">
+                  <span className="font-mono text-[11px] text-parch-300">
+                    {e.imported ? "imported" : "seed " + e.seed}
                   </span>
-                  {e.imported && (
-                    <Badge variant="gold" className="absolute left-0 top-0">imported</Badge>
+                  {row.curation.seeds.includes(e.seed) && !e.imported && (
+                    <Badge variant="outline" title="In the published bank">bank</Badge>
                   )}
-                </button>
-              ))}
-            </div>
-            {viewing && (
-              <div>
-                <VariantViewer entryId={viewing} palette={world.palette} />
-                <div className="mt-2 flex items-center gap-2">
-                  <a href={api.downloadUrl(viewing, "vox")} className="contents">
-                    <Button variant="ghost" size="sm"><Download className="h-3.5 w-3.5" /> .vox</Button>
-                  </a>
-                  <a href={api.downloadUrl(viewing, "vxa")} className="contents">
-                    <Button variant="ghost" size="sm"><Download className="h-3.5 w-3.5" /> .vxa</Button>
-                  </a>
-                  <a href={api.downloadUrl(viewing, "spec")} className="contents">
-                    <Button variant="ghost" size="sm"><Download className="h-3.5 w-3.5" /> spec</Button>
-                  </a>
-                  {onVary && !viewingEntry?.imported && (
-                    <Button
-                      variant="default"
-                      size="sm"
-                      title="Back to the Forge: generate fresh seeds from this entry's exact spec"
-                      onClick={async () => {
-                        try {
-                          const r = await forgeApi.librarySpec(viewing);
-                          onVary(r.spec, Math.floor(Math.random() * 90000) + 1);
-                        } catch (e) {
-                          toast.error(String(e));
-                        }
-                      }}
-                    >
-                      <Sparkles className="h-3.5 w-3.5" /> More like this
-                    </Button>
-                  )}
-                  <Button
-                    variant="rust"
-                    size="sm"
-                    className="ml-auto"
-                    onClick={async () => {
-                      if (!confirm("Remove " + viewing + " from the library? This deletes its files on disk.")) return;
-                      try {
-                        await api.deleteLibrary(viewing);
-                        setViewing(variants.find((e) => e.id !== viewing)?.id ?? null);
-                        await world.refreshLibrary();
-                        toast.ok("Removed " + viewing);
-                      } catch (e) {
-                        toast.error(String(e));
-                      }
-                    }}
-                  >
-                    <Trash2 className="h-3.5 w-3.5" /> Remove
-                  </Button>
+                  <span className="ml-auto flex items-center gap-1 font-display text-[10px] uppercase tracking-wide text-gold-400 opacity-70 transition-opacity group-hover:opacity-100">
+                    <Rotate3d className="h-3.5 w-3.5" /> Inspect
+                  </span>
                 </div>
-              </div>
-            )}
-          </>
+              </button>
+            ))}
+          </div>
         )}
       </section>
 
       <PlacementPanel row={row} world={world} />
+
+      {inspecting && (
+        <LibraryInspector
+          world={world}
+          row={row}
+          variants={variants}
+          openId={inspecting}
+          onOpenChange={setInspecting}
+          onVary={onVary}
+          onDeleted={async (id) => {
+            const rest = variants.filter((e) => e.id !== id);
+            setInspecting(rest[0]?.id ?? null);
+            await world.refreshLibrary();
+            toast.ok("Library updated");
+          }}
+        />
+      )}
     </div>
   );
 }
