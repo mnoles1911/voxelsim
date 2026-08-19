@@ -11615,14 +11615,39 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	// terrain denser than this traverse (mean 967 quads/chunk here) and first-fit
 	// fragmentation without paying for a parked population that does not exist.
 	//
-	// WHY NOT MORE: the CPU shadow below is still allocated at full capacity
-	// (PooledQuads + QuadChunkIds, 12 B/quad), so every quad of capacity costs
-	// 12 B of VRAM AND 12 B of system RAM, and CreateSceneProxy copies both
-	// arrays whole. At 80M that is 960 MB VRAM + 960 MB RAM and a 960 MB
-	// game-thread memcpy on any render-state rebuild. S2-5 -- dropping the shadow
-	// on the GPU-only arm, where nothing reads it -- is what makes any further
-	// raise cheap. Do that before going higher, not after.
-	constexpr uint32 kPoolCapacityQuads = 80u * 1000u * 1000u;   // 640 MB at 8 B/quad
+	// RESIZED 80M -> 192M (2026-08-18), unblocked by S2-5. The 80M sizing note
+	// below ended "WHY NOT MORE": the CPU shadow was allocated flat at capacity
+	// (12 B/quad of system RAM next to 12 B/quad of VRAM, with CreateSceneProxy
+	// copying both arrays whole), so raising capacity taxed RAM and the game
+	// thread as hard as VRAM. S2-5 is now DONE: the shadow is paged and pages
+	// materialise only under CPU-authored writes (session-opening readback
+	// bootstrap, GI-claimed chunks, water pools, or a run with GPU meshing
+	// off), so on the shipping GPU-resident arm capacity costs VRAM and
+	// almost nothing else -- see UVoxelGpuPoolComponent::ShadowPages.
+	//
+	// WHY 192M. The 2026-08-18 scenes measured what the amplified world now
+	// actually submits at settle: 144.6M (alpine, thinned scatter), 156M
+	// (alpine vista), 173M (with the slope fix) -- and the first full-config
+	// attempt against the 80M default refused 28,205 chunks ("no room for N
+	// quads ... Chunk left undrawn"), i.e. the SHIPPING default could not draw
+	// the world we now generate, and every capture since has needed a
+	// -VoxelPoolCapacityQuads override. 192M covers the worst measured scene
+	// (173M) plus ~11% for first-fit fragmentation and load-before-unload
+	// retention. That is thinner headroom than the ~25-35% this constant has
+	// historically carried, and deliberately so: the next step, 200M, is the
+	// clamp ceiling (below).
+	//
+	// COST at 192M: 1465 MB + 732 MB VRAM (8 B/quad quad buffer + 4 B/quad
+	// chunk-id buffer). System RAM: 3 MB per CPU-written 256K-quad shadow page
+	// -- tens of MB on the GPU arm, and only a CPU-only run (GPU meshing off)
+	// climbs back toward 12 B/quad of RESIDENT demand (not capacity: pages
+	// past its high water never allocate).
+	//
+	// THE 200M CLAMP IS A REAL CEILING, not caution: past ~268M quads the quad
+	// buffer's byte size (8 B/quad) crosses 2^31 and every int32/uint32
+	// byte-offset in the lock/upload paths needs auditing first. Raise the
+	// clamp only with that audit in hand.
+	constexpr uint32 kPoolCapacityQuads = 192u * 1000u * 1000u;   // 1465 MB at 8 B/quad
 	uint32 PoolCapacityQuads = kPoolCapacityQuads;
 	{
 		uint32 Override = 0;

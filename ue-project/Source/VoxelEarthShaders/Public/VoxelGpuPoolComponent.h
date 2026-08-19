@@ -235,8 +235,8 @@ public:
 	// InCornerHeights is the PER-QUAD half of the same problem, for water only:
 	// four 8-bit surface heights per quad, one entry per InQuads entry, in the
 	// corner order VoxelQuadDecode.ush decodes. Null (the terrain case) leaves
-	// the shadow untouched, and a terrain pool has no shadow to touch -- the
-	// array is only allocated under SetWaterMode. See QuadCornerHeights.
+	// the corner shadow untouched -- shadow pages only carry the corner third
+	// under SetWaterMode. See ShadowPages.
 	int32 AddChunk(const TArray<uint64>& InQuads, const FVector3f& OriginUU, int32 Level,
 	               const FVector4f& Params = FVector4f(0.5f, 0.5f, kNoSurfaceGate, 0.0f),
 	               const TArray<uint32>* InCornerHeights = nullptr);
@@ -255,7 +255,7 @@ public:
 	// AllocFailure counters, because a full pool drops geometry identically
 	// whichever mesher produced it.
 	//
-	// THE CPU SHADOW IS DELIBERATELY NOT WRITTEN for this range. See PooledQuads
+	// THE CPU SHADOW IS DELIBERATELY NOT WRITTEN for this range. See ShadowPages
 	// for what that means and why it is the safe direction.
 	//
 	// Returns INDEX_NONE without allocating if IsGpuWritable() is false.
@@ -351,7 +351,7 @@ public:
 	int32 UpdateChunk(int32 Handle, const TArray<uint64>& InQuads);
 
 	// The same, carrying per-quad corner heights -- see AddChunk's
-	// InCornerHeights and QuadCornerHeights.
+	// InCornerHeights and ShadowPages' corner third.
 	//
 	// AN OVERLOAD RATHER THAN A DEFAULTED PARAMETER, unlike AddChunk. This is
 	// water's HOT path: every active brick re-meshes at the CA's 10 Hz cadence
@@ -366,7 +366,10 @@ public:
 	void ClearChunks();
 
 	int32 GetNumChunks() const { return NumLiveChunks; }
-	int32 GetNumQuads() const { return PooledQuads.Num(); }
+	// The pool's CAPACITY in quads (not occupancy) -- was PooledQuads.Num()
+	// when the shadow was a flat capacity-sized array; the allocator is the
+	// authority now that the shadow is paged (S2-5).
+	int32 GetNumQuads() const;
 	uint32 GetHighWaterMarkQuads() const { return Pool.GetHighWaterMark(); }
 	uint32 GetFreeQuads() const { return Pool.GetFreeQuads(); }
 	uint32 GetLargestFreeRun() const { return Pool.GetLargestFreeRun(); }
@@ -658,50 +661,64 @@ private:
 	FVoxelGpuPoolBuffersRef PoolBuffers;
 	FVoxelGpuPoolBuffersRef GetOrCreatePoolBuffers();
 
-	// One flat buffer for every chunk's quads, in insertion order.
+	// THE CPU SHADOW, PAGED (S2-5, 2026-08-18). What used to be three flat
+	// capacity-sized arrays (PooledQuads + QuadChunkIds + water's
+	// QuadCornerHeights: 12 B/quad of system RAM allocated up front, 960 MB at
+	// the old 80M default, and copied WHOLE on every CreateSceneProxy) is now a
+	// page table whose pages allocate on first CPU WRITE. A page that was never
+	// written reads as implicit zeros: quad 0, chunk id 0 = kHiddenChunkId,
+	// scale 0, collapsed to a point -- exactly what the flat arrays' zeroed
+	// tails held.
+	//
+	// WHY THIS IS SAFE, unchanged from the flat version's argument:
 	//
 	// NOT WRITTEN FOR GPU-MESHED RANGES (Wave D / D1), and that is a deliberate
-	// asymmetry rather than an oversight. AddChunkFromGpu leaves this array's
-	// slice for its chunk holding zeros, and QuadChunkIds' slice holding 0 --
-	// which is kHiddenChunkId, scale 0, collapsed to a point.
+	// asymmetry rather than an oversight. AddChunkFromGpu writes no shadow, so
+	// on the GPU-resident arm -- where the only CPU-authored chunks are the
+	// session-opening readback bootstrap and whatever GI's WantsChunkQuads
+	// claims -- only the pages those chunks land on ever materialise. The
+	// shadow is stale for GPU ranges in the ONE safe direction: anything that
+	// ever did re-upload it over GPU-written quads would make them INVISIBLE,
+	// not garbage. A capacity rebuild (D4-R1) still invalidates every GPU range
+	// whatever the shadow holds, and still logs loud.
 	//
-	// So the shadow is not merely stale for those ranges, it is stale in the ONE
-	// safe direction: anything that ever did re-upload it over GPU-written quads
-	// would make them INVISIBLE, not garbage. That matters because the paths
-	// that could re-upload are the rare-and-silent ones this wave keeps being
-	// bitten by -- a capacity rebuild (D4-R1) is the remaining one, and it
-	// invalidates every GPU range whatever the shadow holds.
+	// RemoveChunk still needs no GPU-specific branch: ShadowStampHidden points
+	// the ids at the hidden chunk (skipping pages that were never allocated --
+	// they are ALREADY implicit hidden) and the range rides the dirty upload
+	// exactly as before, with ShadowCopySlice zero-filling unallocated spans.
 	//
-	// It also means RemoveChunk needs no GPU-specific branch: it points the ids
-	// at the hidden chunk and marks the range dirty exactly as it does for a CPU
-	// chunk, and the resulting upload writes hidden ids over the GPU content,
-	// which is precisely the intended effect.
-	TArray<uint64> PooledQuads;
+	// The corner-height page third (water pools only) rides the SAME pages and
+	// the same dirty intervals as the quads, for the same reason the flat
+	// array did: a quad and its corner heights must be published by one
+	// command or by neither. Terrain pages do not allocate the corner third.
+	//
+	// PAGE SIZE: 2^18 quads = 3 MB/page on terrain (2 MB quads + 1 MB ids),
+	// 4 MB on water. Small enough that a GPU-resident run whose only CPU
+	// chunks are bootstrap + GI ring pays tens of MB instead of 12 B/quad of
+	// capacity; large enough that a CPU-only run (GPU meshing off -- every
+	// page allocates) wastes at most one page of slack past its high water.
+	static constexpr uint32 kShadowPageQuads = 1u << 18;
 
-	// Parallel to PooledQuads: which chunk each quad belongs to. This is what
-	// removes per-draw state and lets one draw span the pool.
-	TArray<uint32> QuadChunkIds;
+	struct FShadowPage
+	{
+		TArray<uint64> Quads;     // kShadowPageQuads entries, zeroed
+		TArray<uint32> ChunkIds;  // kShadowPageQuads entries, zeroed
+		TArray<uint32> Corners;   // water pools only, else empty
+	};
+	// Fixed size Capacity/kShadowPageQuads (rounded up) after InitPool; null
+	// entry = never CPU-written = implicit zeros/hidden.
+	TArray<TUniquePtr<FShadowPage>> ShadowPages;
+	int32 NumShadowPagesAllocated = 0;
 
-	// Parallel to PooledQuads: four 8-bit water surface heights per quad, one
-	// per corner, in the order VoxelQuadDecode.ush decodes them.
-	//
-	// EMPTY UNLESS THIS POOL DRAWS WATER, and that is the whole reason it is a
-	// separate buffer rather than a wider quad. The 8-byte quad is a contract
-	// with the GPU mesher and the terrain renderer AND it is full; widening it
-	// would cost 4 bytes on every quad of a 100M-quad terrain pool for a field
-	// terrain never reads. Allocated in InitPool, gated on bWaterMode, which is
-	// why SetWaterMode has to precede InitPool (the water subsystem's pool
-	// creation does exactly that, in that order).
-	//
-	// It rides the SAME dirty-range machinery as the quads: every place that
-	// writes PooledQuads[i] writes this too, and every upload run copies the
-	// matching slice. Keeping them on one set of intervals is what makes it
-	// impossible for a quad and its corners to be published a frame apart.
-	//
-	// NOT written by AddChunkFromGpu, and nothing needs it to be: no GPU mesher
-	// produces water. If one ever does, this array is the thing that has to grow
-	// a GPU write path with it -- see PooledQuads for the shape that takes.
-	TArray<uint32> QuadCornerHeights;
+	FShadowPage& EnsureShadowPage(int32 PageIndex);
+	bool HasShadowPages() const { return NumShadowPagesAllocated > 0; }
+	// Stamp kHiddenChunkId over [Offset, Offset+Count)'s ids, skipping pages
+	// that were never allocated (implicitly hidden already).
+	void ShadowStampHidden(uint32 Offset, uint32 Count);
+	// Append [First, First+Count) to the out arrays, zero-filling spans whose
+	// page was never allocated. OutCorners may be null (terrain pools).
+	void ShadowCopySlice(uint32 First, uint32 Count, TArray<uint64>& OutQuads,
+	                     TArray<uint32>& OutIds, TArray<uint32>* OutCorners) const;
 
 	// xyz = chunk origin in component space (unreal units), w = mip scale.
 	TArray<FVector4f> ChunkOrigins;
