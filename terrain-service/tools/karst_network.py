@@ -222,7 +222,7 @@ def edge_costs(nodes, idx_a, idx_b, elev, head, incept, coher, theta, log2acc):
 
 
 def build_system(nodes, elev, head, incept, coher, theta, log2acc,
-                 sink_ids, spring_id, gamma):
+                 sink_ids, spring_id, gamma, deadends=0, rng=None):
     """kNN graph, Dijkstra from each sink to the spring, gamma-skeleton prune."""
     if len(nodes) < 8:
         return []
@@ -249,6 +249,40 @@ def build_system(nodes, elev, head, incept, coher, theta, log2acc,
         if cur == spring_id:
             p.append(spring_id)
             paths.append(p)
+
+    # AMPLIFICATION -- the paper's `Amplify`, and the step whose absence is why
+    # a first implementation reads as fragments rather than as a cave.
+    #
+    # Sink-to-spring shortest paths give the TRUNK and nothing else. A real
+    # cave is mostly not trunk: it is tributaries, blind alleys and abandoned
+    # loops, which is why the reference scenes carry explicit Waypoint and
+    # Deadend key points (their "superimposed" scene is 1 sink and 2 springs
+    # against 2 waypoints and ELEVEN deadends; the spongework scene is ~50).
+    # So: pick extra nodes in the corridor and route each to the nearest node
+    # ALREADY on the skeleton, which is what makes a branch a branch rather
+    # than a second trunk.
+    if deadends > 0 and paths:
+        on_skeleton = sorted({n for p in paths for n in p})
+        if len(on_skeleton) >= 2:
+            for _ in range(deadends):
+                cand = int(rng.integers(0, len(nodes)))
+                if cand in on_skeleton:
+                    continue
+                d2, pred2 = dijkstra(g, directed=False, indices=cand,
+                                     return_predecessors=True)
+                reach = [(d2[t], t) for t in on_skeleton if np.isfinite(d2[t])]
+                if not reach:
+                    continue
+                _, tgt = min(reach)
+                p2, cur = [], tgt
+                guard = 0
+                while cur != cand and cur >= 0 and guard < 10000:
+                    p2.append(cur)
+                    cur = pred2[cur]
+                    guard += 1
+                if cur == cand:
+                    p2.append(cand)
+                    paths.append(p2)
 
     # Gamma-skeleton prune, on the REDUCED skeleton (the union of the paths),
     # never on the sampling graph -- that is the difference between milliseconds
@@ -287,16 +321,32 @@ def build_system(nodes, elev, head, incept, coher, theta, log2acc,
 
 
 def main() -> int:
+    # NODE SPACING AND GAMMA INTERACT AND MUST BE SWEPT TOGETHER. Spacing sets
+    # how many candidate routes exist; gamma sets how many survive pruning.
+    # Swept alone, the winning value of each can measure WORSE than the loser --
+    # the same trap docs/backlog.md section 0.6 already records for
+    # GPUCullMergeGap and GPUCullMaxRanges. The `global` has to be declared
+    # before argparse reads these names for its defaults.
+    global NODE_SPACING_M, NEIGHBOURS
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("fields", type=pathlib.Path)
     ap.add_argument("--gamma", type=float, default=2.0)
     ap.add_argument("--max-systems", type=int, default=60)
+    ap.add_argument("--node-spacing-m", type=float, default=NODE_SPACING_M,
+                    help="corridor sample spacing; sweep TOGETHER with --gamma")
+    ap.add_argument("--neighbours", type=int, default=NEIGHBOURS)
+    ap.add_argument("--deadends", type=int, default=0,
+                    help="amplification key points per system (paper's Amplify)")
     ap.add_argument("--spring-sep-m", type=float, default=1500.0,
                     help="minimum separation between resurgences (see suppress_springs)")
     ap.add_argument("--out", type=pathlib.Path, default=None)
     args = ap.parse_args()
     out = args.out or args.fields.parent
+
+    NODE_SPACING_M = args.node_spacing_m
+    NEIGHBOURS = args.neighbours
 
     t0 = time.time()
     f = load_fields(args.fields)
@@ -333,7 +383,8 @@ def main() -> int:
             _, i = tree.query(q)
             sink_ids.append(int(i))
         segs = build_system(nodes, elev, head, incept, coher, theta, log2acc,
-                            sink_ids, int(spring_id), args.gamma)
+                            sink_ids, int(spring_id), args.gamma,
+                            deadends=args.deadends, rng=rng)
         if not segs:
             failed += 1
             continue
@@ -349,7 +400,9 @@ def main() -> int:
     total_km = sum(lengths) / 1000.0
     area_km2 = (elev.shape[0] * GRID_M / 1000.0) * (elev.shape[1] * GRID_M / 1000.0)
     stats = {
-        "gamma": args.gamma,
+        "gamma": args.gamma, "deadends": args.deadends,
+        "node_spacing_m": NODE_SPACING_M, "neighbours": NEIGHBOURS,
+        "spring_sep_m": args.spring_sep_m,
         "systems_total": len(systems), "systems_routed": routed,
         "systems_failed": failed,
         "segments": len(all_segments),
