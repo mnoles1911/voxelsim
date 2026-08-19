@@ -14,12 +14,24 @@ import { cn } from "../lib/cn";
  * selected species' variants, curation and placement in a panel alongside.
  * Placement is integrated here, not a separate page (owner directive). */
 
-export function LibraryView({ world }: { world: World }) {
+export function LibraryView({
+  world, focus, onVary,
+}: {
+  world: World;
+  /** stage-4 handoff from the Forge or an import: open on this species */
+  focus?: { name: string; n: number } | null;
+  /** back to stage 1: regenerate variations of a kept entry's exact spec */
+  onVary?: (spec: Record<string, unknown>, seedStart: number) => void;
+}) {
   const [kind, setKind] = React.useState("all");
   const [biome, setBiome] = React.useState("all");
   const [status, setStatus] = React.useState("all");
   const [query, setQuery] = React.useState("");
   const [selected, setSelected] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (focus) setSelected(focus.name);
+  }, [focus]);
 
   const variantCount = React.useMemo(() => {
     const m = new Map<string, number>();
@@ -115,7 +127,7 @@ export function LibraryView({ world }: { world: World }) {
       {/* detail side */}
       <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
         {selectedRow ? (
-          <SpeciesPanel key={selectedRow.name} row={selectedRow} world={world} />
+          <SpeciesPanel key={selectedRow.name} row={selectedRow} world={world} onVary={onVary} />
         ) : (
           <div className="flex h-full items-center justify-center p-8 text-center font-display text-parch-500">
             Choose a species from the ledger to see its variants,

@@ -1,7 +1,7 @@
 import * as React from "react";
-import { Check, Download, FileBox, Stamp, Trash2, X } from "lucide-react";
+import { Check, Download, FileBox, Sparkles, Stamp, Trash2, X } from "lucide-react";
 import type { World } from "../App";
-import { api } from "../lib/api";
+import { api, forgeApi } from "../lib/api";
 import type { CurationStatus, SpeciesRow } from "../lib/schema";
 import { CURATION_SEEDS } from "../lib/schema";
 import { kindIcon } from "../lib/kindIcons";
@@ -18,11 +18,18 @@ import { cn } from "../lib/cn";
  * publish verdict, and the placement panel. Works identically for generated
  * and imported assets -- nothing here assumes generator-only fields. */
 
-export function SpeciesPanel({ row, world }: { row: SpeciesRow; world: World }) {
+export function SpeciesPanel({
+  row, world, onVary,
+}: {
+  row: SpeciesRow;
+  world: World;
+  onVary?: (spec: Record<string, unknown>, seedStart: number) => void;
+}) {
   const Icon = kindIcon(row.kind);
   const variants = world.library.filter((e) => e.species === row.name);
   const [viewing, setViewing] = React.useState<string | null>(variants[0]?.id ?? null);
   const toast = useToast();
+  const viewingEntry = variants.find((e) => e.id === viewing);
 
   const kindLabel = world.kinds.find((k) => k.key === row.kind)?.label ?? row.kind;
 
@@ -89,6 +96,23 @@ export function SpeciesPanel({ row, world }: { row: SpeciesRow; world: World }) 
                   <a href={api.downloadUrl(viewing, "spec")} className="contents">
                     <Button variant="ghost" size="sm"><Download className="h-3.5 w-3.5" /> spec</Button>
                   </a>
+                  {onVary && !viewingEntry?.imported && (
+                    <Button
+                      variant="default"
+                      size="sm"
+                      title="Back to the Forge: generate fresh seeds from this entry's exact spec"
+                      onClick={async () => {
+                        try {
+                          const r = await forgeApi.librarySpec(viewing);
+                          onVary(r.spec, Math.floor(Math.random() * 90000) + 1);
+                        } catch (e) {
+                          toast.error(String(e));
+                        }
+                      }}
+                    >
+                      <Sparkles className="h-3.5 w-3.5" /> More like this
+                    </Button>
+                  )}
                   <Button
                     variant="rust"
                     size="sm"

@@ -1,13 +1,21 @@
 import * as React from "react";
-import { Anvil, BookOpen, Import, ScrollText } from "lucide-react";
+import { Anvil, BookOpen, Hammer, Import, ScrollText } from "lucide-react";
 import { api } from "./lib/api";
 import type { Biome, Kind, LibraryEntry, RulesDoc, SpeciesRow } from "./lib/schema";
 import { Button } from "./components/ui/button";
 import { useToast } from "./components/ui/toast";
+import { ForgeView, type ForgeRequest } from "./components/ForgeView";
 import { LibraryView } from "./components/LibraryView";
 import { RulesView } from "./components/RulesView";
 import { ImportDialog } from "./components/ImportDialog";
 import { cn } from "./lib/cn";
+
+/* The app follows the owner's four-stage workflow, in order:
+ *   1. GENERATE and 2. FINE-TUNE  -> the Forge tab
+ *   3. KEEP TO LIBRARY            -> the hinge (keep buttons in the Forge,
+ *                                    variants + curation in the Library)
+ *   4. PLACEMENT                  -> the Library tab's placement panel
+ * All views stay mounted so a running generation survives a tab switch. */
 
 /** Everything the app knows, fetched from the server (which reads
  * forge/biomes.py, forge/kinds.py and rules/*.json -- never duplicated here). */
@@ -24,12 +32,18 @@ export interface World {
   patchSpec: (name: string, patch: Partial<SpeciesRow>) => void;
 }
 
+type Tab = "forge" | "library" | "rules";
+
 export default function App() {
   const toast = useToast();
-  const [tab, setTab] = React.useState<"library" | "rules">("library");
+  const [tab, setTab] = React.useState<Tab>("forge");
   const [importOpen, setImportOpen] = React.useState(false);
   const [world, setWorld] = React.useState<World | null>(null);
   const [bootError, setBootError] = React.useState<string | null>(null);
+  /* stage-4 handoff: which species the library should open on arrival */
+  const [libraryFocus, setLibraryFocus] = React.useState<{ name: string; n: number } | null>(null);
+  /* library -> forge handoff: "more like this" re-opens a kept spec at stage 1 */
+  const [forgeRequest, setForgeRequest] = React.useState<ForgeRequest | null>(null);
 
   const load = React.useCallback(async () => {
     try {
@@ -63,6 +77,16 @@ export default function App() {
     void load();
   }, [load]);
 
+  const openPlacement = React.useCallback((name: string) => {
+    setLibraryFocus((f) => ({ name, n: (f?.n ?? 0) + 1 }));
+    setTab("library");
+  }, []);
+
+  const openInForge = React.useCallback((spec: Record<string, unknown>, seedStart: number) => {
+    setForgeRequest((r) => ({ spec, seedStart, n: (r?.n ?? 0) + 1 }));
+    setTab("forge");
+  }, []);
+
   if (bootError)
     return (
       <div className="flex h-full items-center justify-center p-8">
@@ -84,8 +108,11 @@ export default function App() {
           <span className="uppercase">Asset Forge</span>
         </div>
         <nav className="ml-6 flex gap-1">
+          <TabButton active={tab === "forge"} onClick={() => setTab("forge")}>
+            <Hammer className="h-4 w-4" /> Forge
+          </TabButton>
           <TabButton active={tab === "library"} onClick={() => setTab("library")}>
-            <BookOpen className="h-4 w-4" /> Library
+            <BookOpen className="h-4 w-4" /> Library & placement
           </TabButton>
           <TabButton active={tab === "rules"} onClick={() => setTab("rules")}>
             <ScrollText className="h-4 w-4" /> Placement rules
@@ -108,10 +135,20 @@ export default function App() {
         <div className="flex flex-1 items-center justify-center font-display text-parch-400">
           Stoking the forge…
         </div>
-      ) : tab === "library" ? (
-        <LibraryView world={world} />
       ) : (
-        <RulesView world={world} />
+        <>
+          {/* Every view stays mounted: a generation keeps polling and the
+           * library keeps its selection across tab switches. */}
+          <div className={cn("min-h-0 flex-1 flex-col", tab === "forge" ? "flex" : "hidden")}>
+            <ForgeView world={world} request={forgeRequest} onOpenPlacement={openPlacement} />
+          </div>
+          <div className={cn("min-h-0 flex-1 flex-col", tab === "library" ? "flex" : "hidden")}>
+            <LibraryView world={world} focus={libraryFocus} onVary={openInForge} />
+          </div>
+          <div className={cn("min-h-0 flex-1 flex-col", tab === "rules" ? "flex" : "hidden")}>
+            <RulesView world={world} />
+          </div>
+        </>
       )}
 
       {world && (
@@ -122,6 +159,7 @@ export default function App() {
           onImported={async (entry) => {
             toast.ok("Imported " + entry.id + " into the library");
             await Promise.all([world.refreshLibrary(), world.refreshSpecs()]);
+            openPlacement(entry.species);
           }}
         />
       )}

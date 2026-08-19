@@ -245,3 +245,70 @@ export interface RulesDoc {
   density: Record<string, Record<string, number>>; // kind -> biome -> 0..1
   referenced: Record<string, string[]>; // rule name -> species using it
 }
+
+/* --- the authoring schema (mirrors forge/spec.py ui_schema()) ------------ */
+
+/** One parameter row from GET /api/schema?kind=... The parameter panel is
+ * GENERATED from these -- never hand-written per kind -- so a new kind's
+ * sliders appear the moment its generator lands server-side. */
+export interface UiParam {
+  path: string; // dotted path into the spec
+  label: string;
+  kind: "float" | "int" | "bool" | "choice" | "text";
+  default: unknown;
+  lo: number;
+  hi: number;
+  step: number;
+  choices: string[];
+  group: string;
+  help: string;
+}
+
+export interface UiSchema {
+  kind: string | null;
+  params: UiParam[];
+  groups: string[]; // schema group order, already scoped to the kind
+}
+
+/** A live spec draft is a plain nested object; these are the two dotted-path
+ * helpers the whole authoring surface shares. */
+export const getPath = (obj: unknown, path: string): unknown =>
+  path.split(".").reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), obj);
+
+export function setPath(obj: Record<string, unknown>, path: string, value: unknown): void {
+  const keys = path.split(".");
+  let node: Record<string, unknown> = obj;
+  for (const k of keys.slice(0, -1)) {
+    if (typeof node[k] !== "object" || node[k] == null) node[k] = {};
+    node = node[k] as Record<string, unknown>;
+  }
+  node[keys[keys.length - 1]] = value;
+}
+
+/* --- generation jobs (mirrors Job.progress() in forge/server.py) --------- */
+
+export interface TileState {
+  ready: boolean;
+  error: string | null;
+  stats: Record<string, unknown> | null;
+  problems: string[];
+}
+
+export interface JobProgress {
+  job: string;
+  done: number;
+  total: number;
+  seeds: number[];
+  tiles: Record<string, TileState>;
+}
+
+/** /api/interpret: the LOCAL plain-language spec editor (forge/language.py).
+ * No model callbacks, by standing constraint -- the vocabulary is authored
+ * in the repo and the route never leaves the machine. */
+export interface InterpretResult {
+  spec: Record<string, unknown>;
+  understood: string[];
+  ignored: string[];
+  edits: { label: string; from: unknown; to: unknown }[];
+  warnings?: string[];
+}
