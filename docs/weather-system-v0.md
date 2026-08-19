@@ -1,9 +1,13 @@
 # Weather system v0 — the world gets wind
 
-Status: **implemented, never compiled, never run in the editor.** Written
-2026-08-12 while a 90-minute automated chain held the editor, so nothing here
-has been built or seen. The verification that *was* possible is described in
-[§9](#9-what-has-actually-been-verified); read that before trusting a number.
+Status: **SHIPPED AND TUNED — reviewed 2026-08-19.** The wind field landed the
+same day this was written (`65dc0bf`, 2026-08-12), drove the live wave system the
+next (`f2ea97c`), and its timescales were then **slowed 8–15x in `weather.h` on
+2026-08-13 after the owner rejected the default three times** — so the numbers
+below are the authored intent, not the shipped values. Check `weather.h` before
+quoting any timescale. Original status: implemented, never compiled, never run in
+the editor; written while a 90-minute automated chain held the editor. The
+verification that was possible at the time is [§9](#9-what-has-actually-been-verified).
 
 ---
 

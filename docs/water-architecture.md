@@ -8,9 +8,10 @@ regardless of which solver is running, and indexes every other water document
 in `docs/` by current status. It does not re-derive anything measured
 elsewhere — it cites.
 
-**Status: current, 2026-08-09.** The authoritative design document underneath
-this one is `docs/water-rearchitecture-plan-2026-08-09.md`, approved by the
-owner. Read that for the full reasoning; this file is the map, not a
+**Status: the direction is current; the roadmap in §3 is now history — phases
+0-5 all shipped (reviewed 2026-08-19).** The authoritative design document
+underneath this one is `docs/water-rearchitecture-plan-2026-08-09.md`, approved
+by the owner. Read that for the full reasoning; this file is the map, not a
 replacement.
 
 ---
@@ -107,10 +108,24 @@ plan §1–§7; not repeated here.
 
 ---
 
-## 3. What is being built, and who owns it
+## 3. The phased build — SHIPPED, and who owns each part
 
-From the re-architecture plan's phased roadmap (§"Phased implementation");
-consult it for full detail, acceptance gates and file lists.
+> **Reviewed 2026-08-19: phases 0 through 5 all landed, most of them on
+> 2026-08-09.** Phase 0 spikes `bcabb76`; Phase 3 lifecycle `f0b4f31`; Phase 4
+> screen-space fluid renderer `b795409`; Phase 5 (baked river plane retired from
+> the near-field draw) `7925cb6`; the solver then took a soft cap at the measured
+> knee — **102k particles at 2.4 ms** (`938da2a`). **What the table does not say:
+> the far-field lake SHEET — a different draw path from the particle surface —
+> was separately rebuilt onto Unreal's Single Layer Water shading model on
+> 2026-08-11** (`MSM_SingleLayerWater`, `VoxelWaterSubsystem.cpp:147`), and wind
+> waves and interactive ripples ride on it (`docs/water-wind-waves.md`,
+> `docs/water-interactive-ripples.md`). Phase 6 is still open by design. The known
+> live water defects are `docs/backlog.md` §9.
+
+Kept below as written, because the phase names are what the code and the commit
+messages refer to. From the re-architecture plan's phased roadmap
+(§"Phased implementation"); consult it for full detail, acceptance gates and file
+lists.
 
 | phase | what | owning subsystem |
 |---|---|---|

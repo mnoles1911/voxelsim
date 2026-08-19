@@ -24,32 +24,46 @@ voxels every time. That is what makes "hundreds of variants" cheap.
 
 ## Status
 
-Phases 1 and 2 work: the generator core and the app. 42 species across six asset
-kinds, **every one of them on the 5 cm asset lattice**. Phase 0 (making the
-engine able to hold an asset at all) is deferred until the editor box is free
-and is tracked in the plan.
+**828 species across ten kinds** — tree 78, bush 57, grass 89, flower 87,
+reed 33, rock 102, and the 382 animals (bird 127, quadruped 131, fish 106,
+cetacean 18) that are authored and deliberately not rendered until animation
+exists. Plants and rocks **are in the world**: the engine composes them into
+terrain chunks on both the CPU and GPU paths.
 
-There are **two** engine blockers, and it matters which assets need which:
+**Lattice is decided by how a species lives in the world** (owner, 2026-08-13).
+*Terrain lattice*: every tree (78) and rock (102) plus the body-scale bushes (33)
+and tall grasses (3) are authored at the world's own `kVoxelSizeMm` = 100 mm,
+join the terrain grid, and are destructible and collidable exactly as terrain is.
+*Detail*: smaller bushes, grass, flowers, reeds and every animal keep their own
+finer lattice (1-5 cm), never enter the terrain grid, and are drawn as instances
+in the detail ring. `tools/all_to_5cm.py` is reversed and must stay that way -
+nothing in voxel-core resamples, so a 5 cm rock read through `AssetGrid::at`
+comes out at twice its size.
 
-- **The streaming bound** skips any chunk `surfaceUpperBoundMm` proves empty,
-  which is every chunk a crown or a stem would occupy. Everything here needs
-  this fixed.
-- **The material append** — bark, the leaf variants and a bloom colour do not
-  exist in `vxc::Material`. Trees, bushes and flowers need this.
+Both former engine blockers are retired. The **streaming bound** now admits the
+chunks an asset reaches (exact per-footprint admission), and the **material
+append** landed — `MAT_BARK` (16) through `MAT_BEAK_HORN` (46), `kMaterialCount`
+47, drawn through the ADR-0008 palette at pixel rate.
 
-**Rocks, grass and reeds need only the first.** A boulder is `MAT_ROCK`,
-`MAT_GRAVEL`, `MAT_BEDROCK` and `MAT_SAND`; a grass tuft and a reed are
-`MAT_GRASS` and `MAT_SAVANNA_GRASS`. Those are the materials the terrain is
-already made of, so seventeen of the forty-two species are one blocker away from
-the world instead of two. If something has to ship first, it is those.
+The **placement** group is consumed. `tools/export_manifest.py` compiles it into
+the VXM2 manifest — per-kind × per-biome densities, explicit biome allowlists and
+named per-biome rule overrides — and `voxel-core` does the deterministic
+per-chunk scatter from that. The sliders are the specification *and* the input.
+See `docs/placement-spec-schema.md`, and `docs/backlog.md` §10 for what is left.
 
-Nothing consumes the **placement** group yet — `abundance`, `spacing_m`,
-`cluster`, the slope and elevation gates and the biome weights are authored and
-read by no code. Scattering has to happen in `voxel-core` during worldgen,
-per-chunk and deterministic; these sliders are the specification for it, not an
-implementation of it.
+**Nobody has curated any of it.** All 828 species are `approved` by a grandfather
+clause and carry zero human verdicts; the Asset Library tab is where that happens.
 
 ## Asset kinds
+
+> **The app described in this section and the next is the legacy page.** Since
+> 2026-08-18 `serve` hosts the React app in `web/dist` (`asset-forge/web/README.md`),
+> which is organised as three tabs — **Forge** (generate and fine-tune),
+> **Asset Library** (variants, 3D inspection, curation, placement) and
+> **Placement rules** — rather than a section per kind. The hand-written page in
+> `forge/web` is kept only as the fallback for a checkout that never ran a build.
+> Everything below about parameters, kinds and measurements is still accurate; the
+> layout description is not.
 
 The app opens on a **section** per kind — Trees, Bushes, Rocks, Grass, Reeds,
 Flowers and Fish. The section scopes everything below it: which

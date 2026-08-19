@@ -8,9 +8,14 @@ integer math.
 
 Read [docs/voxel-earth-implementation-plan.md](docs/voxel-earth-implementation-plan.md)
 first — it is the project's source of truth (vision, architecture doctrine,
-milestones). Current milestone status lives in [docs/status.md](docs/status.md),
-and everything known-and-not-done is in [docs/backlog.md](docs/backlog.md) —
-including a "measured and CLOSED" section for options already ruled out.
+milestones). Everything known-and-not-done is in
+[docs/backlog.md](docs/backlog.md) — start there; it says what is current, what
+is stale, and it carries a "measured and CLOSED" section for options already
+ruled out. [docs/status.md](docs/status.md) is the milestone record **up to
+2026-07-29 only** and has not been written since; for the work after that, read
+the merge commits and the per-programme documents
+([water](docs/water-architecture.md), [land](docs/world-generation-architecture.md),
+[assets](docs/asset-placement-design.md)).
 
 ## Repo layout
 
@@ -19,7 +24,8 @@ including a "measured and CLOSED" section for options already ruled out.
 /voxel-core/        C++20, UE-header-free, CMake: bricks, palettes, amplifier, mesher, editlog
 /voxel-core/bench/  headless benchmark + determinism harness
 /ue-project/        UE 5.8 project (VoxelEarth) consuming voxel-core as a static lib
-/docs/              implementation plan, ADRs, milestone status
+/asset-forge/       Python + React: the environment-asset generator and its placement authoring
+/docs/              implementation plan, ADRs, design documents, backlog
 ```
 
 ## Building voxel-core

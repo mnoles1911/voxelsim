@@ -9,17 +9,34 @@ Items are grouped by **what kind of decision they need**, not by subsystem —
 because the thing that stalls work here is usually "whose call is this", not
 "where does the code live".
 
-`docs/status.md` remains the chronological record of what happened. This file is
-the forward-looking list. When an item lands, delete it here and write the result
-there.
+`docs/status.md` **stopped being written on 2026-07-29** and is now a historical
+record, not the current one. Since then the chronological record is the merge
+commit messages plus the dated document each programme leaves in `docs/` — water:
+`docs/water-architecture.md`; assets: §10 below and the documents it cites. This
+file is the forward-looking list. When an item lands, delete it here and say where
+the result was written.
+
+**Read in this order** (staleness reviewed 2026-08-19). §10 is the newest and
+describes the world as it is now. §0 is the engine-performance front, but its
+numbers are from 2026-07-28 and predate both the 192M pool and assets in the
+world. §§1-7 predate August entirely; where this review falsified an item it now
+says so inline.
 
 ---
 
 ## 0. ENGINE PERFORMANCE — the current front
 
-**Read this section first.** Everything below it predates the streaming
-programme — except §8, which was added 2026-08-11 — and §6b in particular is
-stale and now says so.
+Everything below this section predates the streaming programme — except §§8-10 —
+and §6b in particular is stale and now says so.
+
+> **Re-measure before quoting anything here. Reviewed 2026-08-19.** Two things
+> changed underneath these numbers. The quad pool default went 80M → 192M
+> (`036552f`), so "70% of 80M" no longer describes any run. And the world now
+> composes environment assets into terrain chunks and draws ground cover as HISM
+> instances out to 256 m (§10) — render-thread and GPU work that no leg below
+> includes. The *conclusions* (render-thread bound, tail is GPU, game-thread work
+> buys headroom not fps) are structural and are expected to hold; the
+> milliseconds are not current.
 
 ### Where the engine is (2026-07-28)
 
@@ -276,13 +293,13 @@ known answer:** allocate one chunk, publish, read it back, assert the ids equal
 that chunk's id. Full history:
 `docs/measurements/s21-gpu-hide-probe-2026-07-28.txt`.
 
-**S2-5 drop the CPU shadow — blocked on S2-1.** `InitPool` allocates
-`PooledQuads` + `QuadChunkIds` at full capacity (12 B/quad) and
-`CreateSceneProxy` copies both **whole** — at the current 80M capacity, ~960 MB
-of system RAM plus a 960 MB game-thread memcpy on any render-state rebuild.
-Blocked because the shadow's last writer on the GPU-only path is
-`RemoveChunkInternal`'s per-quad id stamp, which IS the mechanism that hides
-freed geometry. Also gates any pool growth beyond 80M.
+~~**S2-5 drop the CPU shadow — blocked on S2-1.**~~ **DONE 2026-08-18**
+(`036552f`). The shadow was not dropped, it was **paged**: capacity now costs
+VRAM only, the whole-array copy in `CreateSceneProxy` is gone, and the default
+pool went 80M → 192M quads (`kPoolCapacityQuads`,
+`VoxelWorldSubsystem.cpp:11650`) — which is what the asset-composed alpine vista
+needed. S2-1 stayed gated off and did not block it. **Not yet seen in a rendered
+frame at the new default** — that verification is §10b.
 
 ---
 
@@ -385,11 +402,13 @@ claim rests on one vendor. **Cost:** ~$5 and ~20 minutes on a rented box.
 **Expected digests** are in `voxel-core/shaders/prebuilt/README.md`'s v8 respin
 section.
 
-**A second pregen in an arid region.** The 25-tile launch set is uniformly wet
-(660-1650 mm/yr, no arid pixels), so DESERT and SAVANNA have no real-tile
-regression coverage — they are exercised only by synthetic tests and the
-`biome_map` golden sweep. **Cost:** one GPU session. **Note** the seed makes this
-harder than it sounds; see §5.
+~~**A second pregen in an arid region.**~~ **RESOLVED by regeneration, not by a
+second pregen.** The orographic rain-shadow coupling plus the WorldClim
+conditioning rebuild (§4, 2026-08-01) made the shipped world itself arid in
+places: DESERT 9.74% of land, and both biomes now have real-tile coverage —
+desert has **baked fine tiles** and a censused site, savanna a real interior
+sample at s1 stride (`docs/biome-placement-survey.md`). The remaining arid gap is
+authoring, not terrain: see §10a on roster starvation.
 
 **Adopting the existing tile cache under the new identity.** Identity schema
 v3 rolled every `provider_id`, so `pregen`/serving will not find
@@ -415,8 +434,8 @@ output then equals `main` byte-for-byte, so no golden moves and no
 `kWorldGenVersion` bump is needed at all; (b) port flow accumulation to a GPU
 compute pass, which pairs naturally with the harness widening below.
 
-**GPU harness cannot see real tiles.** *(Still open, confirmed 2026-07-28:
-`gpu_harness.cpp:1869` still takes `SyntheticTileSampler&`.)* `gpu_harness.cpp`
+**GPU harness cannot see real tiles.** *(Still open, confirmed 2026-08-19:
+`gpu_harness.cpp:1963` still takes `SyntheticTileSampler&`.)* `gpu_harness.cpp`
 and `VoxelGpuVerify.cpp` take a concrete `SyntheticTileSampler&`, not
 `ITileSampler&`, so `vxc_gpu` can only ever exercise synthetic climate — never
 the real-tile regime where v8's miscalibration actually lived. Mitigated for now
@@ -445,8 +464,9 @@ that is 3750. The comment now says so. Adding a real 3750 environment is a new
 environment plus a re-pin of a golden that is explicitly not worldgen output, so
 it is a deliberate small change rather than a free rider.
 
-*Still open, confirmed 2026-07-28:* `test_amplifier.cpp` mentions 3750 only in
-those two comments — no 3750 environment exists yet.
+**DONE — verified 2026-08-19.** `test_amplifier.cpp` now runs real 3750 *and*
+1875 environments (`{kSeed, 3750}` at :591, and the `pixelMm[]` sweep at :792
+crosses 30000/3750/1875); :869 records the digest re-pin those additions forced.
 
 **Re-run `-VoxelMatHistogram` in engine.** v8's fix is verified by the CPU-side
 top-voxel census (surface materials 12.4% → 100.00%), not by the quad census
@@ -981,17 +1001,28 @@ Revisit only if the world reads too bare in normal play.
 
 ## 8. ENVIRONMENT ASSETS (asset-forge) — added 2026-08-11
 
-Forty-two species across six kinds are authored and building, every one on the
-5 cm lattice. **None of them is in the world.** Everything below is either the
-last mile of getting them there or a decision about who owns a number. Context:
-`asset-forge/README.md`, `docs/tree-asset-generator-plan.md`.
+> **LARGELY SUPERSEDED BY §10 — reviewed 2026-08-19. Read §10 first.** The
+> premise here ("forty-two species, none of them in the world") is two programmes
+> out of date: **828 species** are authored, the engine composes them into terrain
+> chunks on both the CPU and GPU paths, and the 2026-08-17/19 programme placed,
+> censused and mapped them across every land biome. What survives is the
+> asset-forge measurement discipline — the rock findings and the seven
+> measurement traps at the end of this section, which are still the rules for
+> judging a shape. Items found closed by the review are struck below.
 
-**The sequenced plan lives in `docs/asset-forge-plan.md`** — five phases, each
-item with the check that says it is finished. This section stays as the standing
-context and the record of what was measured; that one says what to do next and
-in which order.
+Everything below is either the last mile of getting assets into the world or a
+decision about who owns a number. Context: `asset-forge/README.md`,
+`docs/tree-asset-generator-plan.md`.
 
-**The shader palette — TABLE DONE 2026-08-11, WIRING STILL OPEN.** ADR-0008 made
+~~**The sequenced plan lives in `docs/asset-forge-plan.md`**~~ — that plan's five
+phases are done or overtaken, and it now carries a banner saying so. The current
+forward list is §10.
+
+**The shader palette — DONE.** *(Table 2026-08-11; the wiring landed with the
+asset programme — `VoxelQuadVertexFactory.ush:874` carries palette RGB on
+`TexCoords[3]/[4]` with `isAsset`, and the material graph does the
+`lerp(biomeAlbedo, paletteRGB, isAsset)` recommended below. Kept for the
+reasoning.)* ADR-0008 made
 `vxc::kMaterialPalette` the one definition of what a material looks like.
 asset-forge already read a generated copy; the renderer read nothing, so what a
 designer approved in the forge and what the game drew were two different
@@ -1028,15 +1059,21 @@ in the world. Do NOT replace the biome path wholesale as a first step; it cannot
 be verified in the same motion and it is the only appearance path that currently
 works.
 
-**Also found:** `ue-project/Tools/terrain_palette.py` is a **second palette**,
-16 entries, stopping at `MAT_WATERMARK` — its own header calls it "single source
-of truth". The ten asset materials (bark, heartwood, deadwood, six leaf types,
+**Also found — SINCE FIXED.** `ue-project/Tools/terrain_palette.py` *was* a
+**second palette**, 16 entries, stopping at `MAT_WATERMARK`, and its own header
+called it "single source of truth". Its RGB column is now **generated** from
+`materialpalette.h` by `gen_material_palette_ush.py` and checked by
+`compile-shaders.ps1`; the file owns only the UE-side `BIOME_TINT` policy and its
+header now says so. Original entry kept for the reasoning. The ten asset materials (bark, heartwood, deadwood, six leaf types,
 pale bark) have no appearance on the UE side at all. It is not urgent only
 because no asset is in the world yet. When the wiring above lands, its RGB
 column should be generated from the header too, leaving it to own just the
 UE-side `BIOME_TINT` policy, which genuinely is not the engine's business.
 
-**UE wiring for asset streaming. BLOCKED on the editor box, not on a decision.**
+~~**UE wiring for asset streaming. BLOCKED on the editor box.**~~ **DONE** —
+built and verified in-editor across the 2026-08-15/19 programme: composition at
+every LOD level on both the CPU and GPU paths, plus exact per-footprint
+admission. Original entry:
 The voxel-core half is designed and largely written — `assetplacement.h` gives a
 provable upper bound on how high an asset reaches, which is the thing that lets
 the streaming admission path keep skipping chunks it can prove empty. What is
@@ -1047,10 +1084,13 @@ rule here — two capture sessions on one machine killed each other's frames for
 hours and read exactly like a slow configuration. Another session holds it.
 **Unblocks:** the box, nothing else.
 
-**Placement: an asset-forge panel, or `assetplacement.h`? — DEFERRED by owner
-decision, 2026-08-11.** No placement logic is to be coded until this is decided;
-the entry below is kept as written because the decision has not been made, only
-postponed. The one thing that still matters while it waits: **neither side may
+**Placement: an asset-forge panel, or `assetplacement.h`? — DECIDED, and the
+answer was compile-the-spec.** asset-forge authors the intent (per-kind ×
+per-biome densities, explicit allowlists, named rule overrides, in the web app's
+Placement panel); `tools/export_manifest.py` compiles it into the VXM2 manifest;
+the engine reads that as its `AssetLayer` numbers. One number, two readers — the
+panel-vs-header split never grew. See `docs/placement-spec-schema.md`. Original
+entry: The one thing that still matters while it waits: **neither side may
 grow its own version of the other's numbers in the meantime.** A spacing
 authored in a panel and a spacing typed into an `AssetLayer` is the Appendix's
 failure with a new subject, and the deferral makes that more likely, not less,
@@ -1194,14 +1234,19 @@ The carving pass avoided a `kWorldGenVersion` bump by not wiring itself in.
 That was reported as a clean win; it was also precisely why the feature does
 not work.
 
-**What unblocks it, in order:**
+**What unblocks it, in order** *(reviewed 2026-08-19)*:
 1. The amplifier and bake pipeline settle (the other session owns this).
-2. Wire `ChannelField` into worldgen output. **Costs `kWorldGenVersion` 10→11,
-   golden re-pins, and an HLSL mirror change in lockstep** — there is no free
-   route, because "free" was exactly what not-wiring-it bought.
-3. Basin detection → ponds and lakes (plan §3.7, entirely unimplemented). This
-   is the missing fourth determinism site for water placement, and no amount of
-   river work substitutes for it.
+2. Wire `ChannelField` into worldgen output. **Costs a `kWorldGenVersion` bump
+   (now 28, so 28→29), golden re-pins, and an HLSL mirror change in lockstep** —
+   there is no free route, because "free" was exactly what not-wiring-it bought.
+   *Still true: `ChannelField` is referenced only by `channel.h`/`channel.cpp`.*
+3. ~~Basin detection → ponds and lakes.~~ **DONE, by another route.** The water
+   re-architecture (2026-08-09 onward) ships the baked basin registry,
+   `FBasinLedger`, lake sheets that rise/spill/drain, and a GPU PBF solver for
+   near-field water; the baked river plane was retired from the near-field draw
+   in Phase 5 (`7925cb6`). **Re-read `docs/water-architecture.md` before resuming
+   W3 at all** — it may have removed the reason this is parked, or the need for
+   it.
 
 **Collision warning.** `origin/claude/erosion-v7` took the version-bump route
 for drainage carving — 341 lines into `amplifier.cpp`, goldens re-pinned across
@@ -1220,7 +1265,8 @@ deciding them together.
 
 Reported by the owner while testing wind waves, ripples and throwables. Neither
 is diagnosed; both are written down while the observation is fresh, with what is
-already known that bears on them.
+already known that bears on them. **Both still open — confirmed 2026-08-19; no
+commit since the playtest touches either.**
 
 ### 9.1 P1 — Digging a voxel UNDER water crashes the frame rate and unloads nearby water
 
