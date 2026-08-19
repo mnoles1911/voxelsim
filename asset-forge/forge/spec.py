@@ -2792,8 +2792,11 @@ def validate(spec: dict) -> tuple[dict, Report]:
     known = set(BY_PATH)
     for path in _leaf_paths(spec):
         # The curation block rides in the spec file but is not a parameter:
-        # no slider, no clamp row. It is handled whole, below.
+        # no slider, no clamp row. It is handled whole, below. The two
+        # placement blocks (`biome_allow`, `biome_rules`) ride the same way.
         if path == "curation" or path.startswith("curation."):
+            continue
+        if path == "biome_allow" or path.startswith(("biome_allow.", "biome_rules")):
             continue
         if path not in known:
             rep.warnings.append(f"ignored unknown parameter {path!r}")
@@ -2850,6 +2853,37 @@ def validate(spec: dict) -> tuple[dict, Report]:
                 f"verdict is written")
             out["curation"] = {"status": "draft",
                                "seeds": list(CURATION_SEEDS), "notes": ""}
+
+    # The per-biome placement blocks ride through validation the same way the
+    # curation block does: whole, cleaned, and only when present -- a spec
+    # that never authors them must come back byte for byte identical (its
+    # allowlist stays DERIVED from the weights; see forge.biomes.allowed).
+    if "biome_allow" in spec:
+        cleaned = _clean_biome_allow(spec["biome_allow"], get(out, "kind"), rep)
+        if cleaned is not None:
+            out["biome_allow"] = cleaned
+    if "biome_rules" in spec:
+        cleaned = _clean_biome_rules(spec["biome_rules"], rep)
+        if cleaned is not None:
+            out["biome_rules"] = cleaned
+    # Cross-checks with the consequence named: these are the two ways an
+    # authored block quietly does less than it reads as doing.
+    if "biome_allow" in out:
+        for b in biomelib.HOSTING:
+            w = float(get(out, f"biomes.{b.key}") or 0.0)
+            if w > 0 and b.key not in out["biome_allow"]:
+                rep.warnings.append(
+                    f"biomes.{b.key}: weight {w:g} is OUTSIDE the authored "
+                    f"biome_allow list, so it will be ZEROED at export and "
+                    f"the species will not appear there")
+    if "biome_rules" in out:
+        allowed_now = biomelib.allowed(out)
+        for bkey in out["biome_rules"]:
+            if bkey not in allowed_now:
+                rep.warnings.append(
+                    f"biome_rules.{bkey}: rules attached to a biome this "
+                    f"species is not allowed in -- they gate NOTHING and the "
+                    f"export will report them as dead")
 
     # Cross-parameter checks. These are the combinations that produce a tree
     # that generates fine and looks wrong, so they warn rather than clamp.
@@ -2983,6 +3017,101 @@ def _clean_curation(raw: dict, rep: Report) -> dict:
     return {"status": status, "seeds": seeds, "notes": notes}
 
 
+# The fields a NAMED PLACEMENT RULE may set (rules/placement-rules.json), and
+# therefore the fields a per-biome attachment can tighten. Everything here is
+# a restriction with a defined composition (docs/placement-spec-schema.md);
+# height, kind, lattice and layer are deliberately absent -- those decide the
+# streaming bound and are not per-biome facts.
+RULE_FIELDS = ("elev_min_m", "elev_max_m", "slope_min_pct", "slope_max_pct",
+               "water_max_m", "water", "spacing_m", "abundance", "cluster")
+
+# Rule names are wire data (32-byte ASCII field) and path-safe by the same
+# charset species names obey.
+import re as _re
+RULE_NAME_RE = _re.compile(r"^[A-Za-z0-9_-]{1,31}$")
+
+
+def _clean_biome_allow(raw: Any, kind: str, rep: Report) -> "list[str] | None":
+    """One biome_allow block, coerced onto the biome menu.
+
+    An ILLEGIBLE block resolves toward [] -- allowed NOWHERE -- for the
+    curation reason with the polarity flipped to match the stakes: an absent
+    allowlist means "derived from the weights" (that is what the library
+    already was), but a present-and-unreadable one means somebody tried to
+    RESTRICT and nobody can tell to what. Falling open would un-restrict a
+    species a human tried to fence in, silently; falling closed shows up as
+    a zero-biome species in the very next export report."""
+    if not isinstance(raw, list):
+        rep.warnings.append(
+            f"biome_allow: {raw!r} is not a list of biome keys, so this "
+            f"species is treated as allowed NOWHERE and will place in no "
+            f"biome until the block is fixed or removed")
+        return []
+    hosts = tuple(b.key for b in biomelib.BIOMES if kind in b.hosts)
+    out = []
+    for entry in raw:
+        if not isinstance(entry, str) or entry not in biomelib.BY_KEY:
+            rep.warnings.append(
+                f"biome_allow: {entry!r} is not a biome key and is dropped. "
+                f"Menu: {tuple(b.key for b in biomelib.BIOMES)}")
+            continue
+        if entry not in hosts:
+            rep.warnings.append(
+                f"biome_allow: {entry} does not host kind {kind!r} and is "
+                f"dropped -- hosting is the biome's own property "
+                f"(forge/biomes.py), not the spec's")
+            continue
+        out.append(entry)
+    return sorted(set(out))
+
+
+def _clean_biome_rules(raw: Any, rep: Report) -> "dict | None":
+    """One biome_rules block: {biome key: [rule names]}.
+
+    Rule NAMES are validated for shape only -- the rule library lives in
+    rules/placement-rules.json and the EXPORT is what refuses an unknown
+    name, by name, because a typo'd reference silently dropping a restriction
+    is the exact failure this block must never have. An illegible block gets
+    the same closed resolution: the export refuses the species whole rather
+    than publishing it un-restricted."""
+    if not isinstance(raw, dict):
+        rep.warnings.append(
+            f"biome_rules: {raw!r} is not a mapping of biome -> rule names; "
+            f"this species WILL NOT EXPORT until it is fixed, because "
+            f"exporting without its restrictions is worse than not exporting")
+        return {"__illegible__": []}
+    out: dict = {}
+    illegible = False
+    for bkey, names in raw.items():
+        if bkey == "__illegible__":
+            continue
+        if bkey not in biomelib.BY_KEY:
+            rep.warnings.append(
+                f"biome_rules: {bkey!r} is not a biome key and is dropped")
+            continue
+        if not isinstance(names, list):
+            rep.warnings.append(
+                f"biome_rules.{bkey}: {names!r} is not a list of rule names; "
+                f"this species WILL NOT EXPORT until it is fixed")
+            illegible = True
+            continue
+        kept = []
+        for n in names:
+            if not isinstance(n, str) or not RULE_NAME_RE.match(n):
+                rep.warnings.append(
+                    f"biome_rules.{bkey}: {n!r} is not a rule name (1-31 "
+                    f"chars of [A-Za-z0-9_-]); this species WILL NOT EXPORT "
+                    f"until it is fixed")
+                illegible = True
+                continue
+            kept.append(n)
+        if kept:
+            out[bkey] = sorted(set(kept))
+    if illegible:
+        out["__illegible__"] = []
+    return out
+
+
 def _coerce(p: Param, raw: Any) -> Any:
     if p.kind == "bool":
         if isinstance(raw, bool):
@@ -3037,8 +3166,19 @@ def spec_hash(spec: dict) -> str:
 
     NOT what decides which individual you get -- that is `seed_hash` below, and
     the two are deliberately different functions.
+
+    `biome_allow` and `biome_rules` are left out for the curation reason with
+    the same stakes: they are placement metadata ON the species, not part of
+    its geometry, and export_banks re-bakes on a spec_hash change -- so were
+    they hashed, tuning where a species may stand would re-bake four banks of
+    an asset whose every voxel is unchanged, and the first allowlist pass
+    over the library would invalidate every bank in it. What DOES catch a
+    placement edit is the manifest byte comparison in tools/enginecheck.py:
+    these blocks are manifest input, and a stale species.vxm fails that check
+    by name.
     """
-    body = {k: v for k, v in spec.items() if k not in ("notes", "curation")}
+    body = {k: v for k, v in spec.items()
+            if k not in ("notes", "curation", "biome_allow", "biome_rules")}
     return hashlib.blake2b(canonical_json(body).encode(), digest_size=8).hexdigest()
 
 
@@ -3128,9 +3268,12 @@ def seed_hash(spec: dict) -> str:
     poses of one species agree, and that two seeds still do not.
 
     `curation` is excluded here exactly as in `spec_hash`: a verdict must not
-    redraw the individual it was passed on.
+    redraw the individual it was passed on. `biome_allow` and `biome_rules`
+    likewise: where a species may stand must not change WHICH individual
+    stands there.
     """
-    body = {k: v for k, v in spec.items() if k not in ("notes", "curation")}
+    body = {k: v for k, v in spec.items()
+            if k not in ("notes", "curation", "biome_allow", "biome_rules")}
     for path in SEED_INVARIANT:
         if get(body, path, _MISSING) is _MISSING:
             continue          # not carried: nothing to normalise, bytes unchanged

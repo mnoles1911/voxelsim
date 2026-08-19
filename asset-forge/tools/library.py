@@ -3,6 +3,8 @@
     python tools/library.py                 # the summary a human reads
     python tools/library.py --full          # one row per species
     python tools/library.py --json          # the same facts for a machine
+    python tools/library.py --biome desert  # which species are ALLOWED there
+    python tools/library.py --rule near-fresh-water-60m   # who uses this rule
 
 This is the authoritative reading of the publish gate. The two exporters
 apply the gate (via `spec.curation`, the one resolver); this tool is where a
@@ -37,7 +39,7 @@ from collections import Counter
 from pathlib import Path
 
 import _path  # noqa: F401  (sys.path bootstrap)
-from forge import spec as sm
+from forge import biomes as biomelib, spec as sm
 
 ROOT = Path(__file__).resolve().parents[1]
 SPECS = ROOT / "specs"
@@ -64,6 +66,7 @@ def collect() -> list[dict]:
     for p in sorted(SPECS.glob("*.json")):
         body, report = sm.load(p)
         cur = sm.curation(body)
+        biome_rules = body.get("biome_rules")
         rows.append({
             "name": p.stem,
             "kind": sm.get(body, "kind"),
@@ -72,6 +75,16 @@ def collect() -> list[dict]:
             "seeds": cur["seeds"],
             "spec_hash": sm.spec_hash(body),
             "water": water_flags(body),
+            # THE EFFECTIVE BIOME ALLOWLIST, through the one resolver
+            # (forge.biomes.allowed): explicit when a human authored
+            # `biome_allow`, otherwise derived from the weights -- and the
+            # report says which, because "nobody restricted this" and
+            # "somebody chose these biomes" are different facts.
+            "biomes": list(biomelib.allowed(body)),
+            "biomes_explicit": biomelib.is_explicit_allowlist(body),
+            # Per-biome named-rule attachments, as authored.
+            "rules": {k: v for k, v in biome_rules.items()
+                      if k != "__illegible__"} if isinstance(biome_rules, dict) else {},
             # A malformed curation block resolves to draft and validate names
             # the damage; surface those lines here, where a curator is looking.
             "warnings": [w for w in report.warnings if w.startswith("curation")],
@@ -93,6 +106,12 @@ def main() -> int:
                     help="one row per species instead of the summary")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable output (implies every row)")
+    ap.add_argument("--biome", metavar="KEY",
+                    help="list the species ALLOWED in this biome (the "
+                         "allowlist question, answered from the one resolver)")
+    ap.add_argument("--rule", metavar="NAME",
+                    help="list the species that attach this named placement "
+                         "rule, and in which biomes")
     args = ap.parse_args()
 
     try:
@@ -100,6 +119,33 @@ def main() -> int:
     except (OSError, json.JSONDecodeError) as e:
         print(f"library: FAILED to read a spec: {e}", file=sys.stderr)
         return 1
+
+    if args.biome:
+        if args.biome not in biomelib.BY_KEY:
+            print(f"library: {args.biome!r} is not a biome "
+                  f"({', '.join(b.key for b in biomelib.BIOMES)})", file=sys.stderr)
+            return 1
+        ours = [r for r in rows if args.biome in r["biomes"]]
+        print(f"{len(ours)} species allowed in {args.biome} "
+              f"({sum(1 for r in ours if r['biomes_explicit'])} by explicit "
+              f"allowlist, the rest derived from weights):")
+        for r in sorted(ours, key=lambda r: (r["kind"], r["name"])):
+            mark = "A" if r["biomes_explicit"] else " "
+            ruled = r["rules"].get(args.biome, [])
+            extra = f"  rules: {', '.join(ruled)}" if ruled else ""
+            print(f"  {r['name']:<40} {r['kind']:<10} {mark}{extra}")
+        return 0
+
+    if args.rule:
+        hits = []
+        for r in rows:
+            for bkey, names in r["rules"].items():
+                if args.rule in names:
+                    hits.append((r["name"], r["kind"], bkey))
+        print(f"rule {args.rule!r} is attached by {len(hits)} (species, biome) pairs:")
+        for name, kind, bkey in sorted(hits):
+            print(f"  {name:<40} {kind:<10} in {bkey}")
+        return 0
 
     by_status = Counter(r["status"] for r in rows)
     grandfathered = sum(1 for r in rows if not r["curated"])
@@ -138,6 +184,16 @@ def main() -> int:
 
     gated = [r for r in rows if r["water"]]
     print(f"water:   {len(gated)} species water-gated")
+
+    explicit = sum(1 for r in rows if r["biomes_explicit"])
+    nowhere = [r for r in rows if not r["biomes"]]
+    ruled = [r for r in rows if r["rules"]]
+    print(f"biomes:  {explicit} species carry an explicit allowlist "
+          f"({len(rows) - explicit} derived from weights); "
+          f"{len(nowhere)} allowed nowhere; "
+          f"{len(ruled)} attach per-biome placement rules")
+    for r in nowhere:
+        print(f"    allowed nowhere: {r['name']} ({r['kind']})")
 
     held_rows = [r for r in rows if r["status"] != "approved"]
     for r in held_rows:

@@ -147,6 +147,42 @@ def weights(spec: dict) -> dict[str, float]:
     return out
 
 
+def allowed(spec: dict) -> tuple[str, ...]:
+    """THE ONE ALLOWLIST RESOLVER: which biomes this species may appear in.
+
+    A species may be allowed in one, several, or NO biomes (owner directive,
+    2026-08-18). Explicit form: a top-level `biome_allow` list of biome keys
+    in the spec ([] means "allowed nowhere", deliberately). Absent, the
+    allowlist is DERIVED from the weights -- exactly the biomes with weight
+    above zero -- which is what every existing spec already meant by its
+    zeroes, so a spec that never authors the block keeps today's effective
+    biome set bit for bit. Either way the result is clipped to the biomes
+    that HOST the species' kind, because a weight row a biome does not host
+    was never authorable in the first place.
+
+    The exporter enforces the explicit form: a weight above zero OUTSIDE an
+    authored allowlist is zeroed at export and reported by name, so the
+    allowlist is authoritative and auditable rather than advisory.
+
+    One function, two callers by design -- the exporter and the library
+    report -- so "which species are allowed in the desert" has exactly one
+    answer everywhere.
+    """
+    from .spec import get
+
+    kind = spec.get("kind")
+    hosts = tuple(b.key for b in BIOMES if kind in b.hosts)
+    explicit = spec.get("biome_allow")
+    if isinstance(explicit, list):
+        return tuple(k for k in hosts if k in explicit)
+    return tuple(k for k in hosts if float(get(spec, f"biomes.{k}") or 0.0) > 0)
+
+
+def is_explicit_allowlist(spec: dict) -> bool:
+    """Did a human author the allowlist, or is it derived from the weights?"""
+    return isinstance(spec.get("biome_allow"), list)
+
+
 def summary(spec: dict) -> str:
     w = weights(spec)
     if not w:

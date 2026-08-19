@@ -370,7 +370,44 @@ namespace vxc {
 // the bake never calls classifyBiome.) What DOES go stale is anything
 // derived from the old classification outside the tiles: census overlays,
 // biome-keyed capture site lists, and cached session state.
-inline constexpr uint32_t kWorldGenVersion = 27;
+//
+// --- v28: PER-BIOME PLACEMENT (owner directive, 2026-08-18) ----------------
+//
+// The manifest moves to VXM2 (forge/manifest.py / assetmanifest.h) and the
+// placement policy learns three per-biome facts. Terrain is untouched
+// (terrain-only digest ad9c4c2a100b5a28 before and after -- assets are not
+// terrain); what moves is which species stands where and HOW MANY:
+//
+//   * A KIND x BIOME DENSITY TABLE (rules/biome-density.json) scales the
+//     occupancy test per asset class per biome, AFTER the species pick, so
+//     it is linear through weight saturation -- the measured defect it
+//     fixes: biome weights saturate the occupancy cap, so savanna carried
+//     the same canopy density as temperate forest (277 vs 283 sites, audit
+//     4.2) and only the global layer density acted anywhere. Values above
+//     1000 per-mille are REFUSED: the table may only thin (veto-only), so
+//     every streaming-bound argument stands unmodified.
+//   * AN EXPLICIT BIOME ALLOWLIST per species (spec `biome_allow`, enforced
+//     at export by zeroing outside weights, reported by name) -- "allowed in
+//     one, many, or NO biomes" is now an auditable statement instead of an
+//     implicit pattern of zeros.
+//   * NAMED PLACEMENT RULES (rules/placement-rules.json), authored once and
+//     ATTACHED per (species, biome), one or many; composition is
+//     intersection (strictest wins), and the import splits each overridden
+//     (species, biome) into its own gate row so the resolver stays scalar
+//     compares. The owner's contract: "temperate type tree is almost
+//     unrestricted in temperate forest but faces strict placement rules in
+//     deserts such as must be near fresh water body."
+//
+// THE FORMAT LANDED AS A PROVEN NO-OP FIRST: with the density table neutral
+// (all 1000) and no rules attached, the VXM2 species block is byte-identical
+// to the VXM1 export, vxc_assetprobe's census is identical at three sites
+// (savanna 35,829 / temperate_forest 33,029 / rainforest 35,568 instances,
+// zero counters moved), and the composed-asset digest is unchanged
+// (d6357c3b035c8c22 with old code + VXM1 and new code + neutral VXM2). The
+// REAL per-biome densities then land as their own commit so the tuning diff
+// is exactly the tuning -- both steps inside this one version bump, because
+// no world shipped against the interim neutral manifest.
+inline constexpr uint32_t kWorldGenVersion = 28;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
 

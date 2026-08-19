@@ -245,6 +245,36 @@ struct AssetSpecies {
     // ground between. From placement.cluster.
     uint16_t clusterQ10 = 0;
 
+    // PER-BIOME OCCUPANCY SCALAR, per-mille -- the kind x biome density table
+    // (VXM2), folded per species at import from the manifest's classDensity
+    // row for this species' kind. This is the knob the 2026-08-18 census
+    // showed was missing: the summed-weight occupancy rule caps at certainty,
+    // so every biome rich enough to saturate the cap carries identical
+    // density (savanna == temperate forest, 277 vs 283 canopy sites) and the
+    // one global layer density does all the work everywhere.
+    //
+    // WHERE IT ACTS: assetResolveSite's step 3, AFTER the pick -- the site's
+    // keep probability becomes cap/1000 x this/1000 for the CHOSEN species.
+    // After rather than before the pick so the scalar is LINEAR: folded into
+    // the weights it would be invisible in any biome whose sum stays above
+    // the cap (a x0.5 on a 10x-saturated forest changes nothing), which is
+    // exactly the saturation defect this exists to fix. Post-pick, savanna
+    // trees at 150 per-mille place at 15% of what the occupancy rule alone
+    // would give, whatever the roster sums to -- and the thinning is
+    // per-KIND, so savanna grass at 1000 is untouched on the same lattice.
+    //
+    // VETO-ONLY BY CONSTRUCTION: the parse refuses values above 1000, so
+    // this can only remove sites, never create them, and the streaming bound
+    // stands unmodified. 1000 everywhere (the default, and what a VXM with a
+    // neutral table carries) reproduces the pre-table world bit for bit.
+    //
+    // A DELIBERATE SIDE EFFECT worth knowing when tuning: wherever this drops
+    // the joint keep probability below certainty, the cluster field regains
+    // headroom -- so a thinned kind in a saturated biome starts forming
+    // groves (audit 4.3's dead zone shrinks exactly where this table bites).
+    uint16_t occupancyPerMille[kBiomeCount] = {1000, 1000, 1000, 1000, 1000,
+                                               1000, 1000, 1000, 1000, 1000};
+
     // Extent above and below the anchor, mm. Redundant with the layer's own
     // maximum ON PURPOSE: the layer's number is the bound's contract and this
     // one is the individual's truth, and assetSpeciesTableIsWellFormed exists
@@ -258,6 +288,14 @@ struct AssetSpecies {
     // Checked against its layer by assetLayerAdmitsVoxelSize.
     uint32_t voxelSizeMm = uint32_t(kVoxelSizeMm);
 };
+
+// The occupancy default above spells out ten 1000s because an NSDMI cannot
+// loop; if the biome axis ever moves, the initializer must move with it or a
+// new biome would default to occupancy ZERO -- a silent empty biome, the
+// polarity this file never accepts.
+static_assert(kBiomeCount == 10,
+              "kBiomeCount moved: update AssetSpecies::occupancyPerMille's initializer "
+              "(every biome must default to 1000, never 0)");
 
 // What a column says about itself, at the resolution placement needs.
 //
@@ -720,9 +758,22 @@ inline bool assetResolveSite(uint64_t seed, const AssetLayer* layers, int layerC
     // need the cluster field folded into the PICK weights instead, which costs
     // one field evaluation per eligible species rather than one per site. Not
     // done; see the design doc's section 9.
+    //
+    // THE KIND x BIOME DENSITY TABLE multiplies in here, after the pick, as a
+    // second factor on the keep probability: cap/1000 x occupancy/1000 for
+    // the chosen species' kind in this column's biome. See the field's own
+    // comment for why post-pick (linearity through saturation) -- and note
+    // the ordering consequence: on a layer that mixes kinds, a site whose
+    // pick landed on a thinned kind stays EMPTY rather than being re-offered
+    // to the others, so a kind's realised density is share x cap x occupancy
+    // -- each factor linear, none coupled to the others. Bounds for the
+    // cross-multiplication below: keepNumerator <= 1000 x 1000, gain <= 4096,
+    // so 1000 x 1e6 x 4096 ~ 4e12, comfortably inside int64.
     const AssetSpecies& S = species[chosen];
+    const int64_t occ = int64_t(S.occupancyPerMille[col.biome]);
     if (!assetClusterKeeps(seed, L, site.layer, uint16_t(chosen), S.clusterQ10, site.anchorXMm,
-                           site.anchorYMm, site.cellX, site.cellY, int64_t(cap), 1000))
+                           site.anchorYMm, site.cellX, site.cellY, int64_t(cap) * occ,
+                           1000 * 1000))
         return false;
 
     // 5. GROUND, VERIFIED. `anchorSolid` is the caller's answer to

@@ -850,3 +850,77 @@ VXC_TEST(assetpolicy_water_distance_gate_opens_when_the_channel_is_served) {
     inland.distanceToWaterMm = 40'000;
     CHECK(!assetSpeciesTolerates(reed, inland));
 }
+
+// ---------------------------------------------------------------------------
+// 4. THE KIND x BIOME OCCUPANCY SCALAR (VXM2's density table, per species)
+// ---------------------------------------------------------------------------
+
+VXC_TEST(assetpolicy_occupancy_scalar_thins_a_saturated_biome_linearly_and_only_downward) {
+    // The saturation defect this exists to fix: a species whose summed weight
+    // saturates the occupancy cap stands on the layer density's share of
+    // cells in EVERY biome, so savanna == forest. The scalar must (a) thin a
+    // saturated biome by its stated fraction, (b) never add a site anywhere
+    // (veto-only), (c) at 1000 reproduce the unscaled world exactly, and (d)
+    // at 0 place nothing at all.
+    AssetSpecies full = anywhere(1, 1000);   // saturates: occupancy cap == 1000
+    AssetSpecies half = full;
+    for (int b = 0; b < kBiomeCount; ++b) half.occupancyPerMille[b] = 500;
+    AssetSpecies dark = full;
+    for (int b = 0; b < kBiomeCount; ++b) dark.occupancyPerMille[b] = 0;
+
+    int nFull = 0, nHalf = 0, nDark = 0, sites = 0;
+    for (int64_t cy = 0; cy < 60; ++cy)
+        for (int64_t cx = 0; cx < 60; ++cx) {
+            AssetSite s;
+            if (!assetSiteInCell(kSeed, kLayers[1], 1, cx, cy, s)) continue;
+            ++sites;
+            AssetInstance inst;
+            const bool keptFull = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &full, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            const bool keptHalf = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &half, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            const bool keptDark = assetResolveSite(kSeed, kLayers, kAssetLayerCount, &dark, 1,
+                                                   s, goodGround(SAVANNA), inst);
+            nFull += keptFull;
+            nHalf += keptHalf;
+            nDark += keptDark;
+            // (b) veto-only, site by site: the scalar may only remove.
+            CHECK(!(keptHalf && !keptFull));
+        }
+    CHECK(sites > 1000);       // the census is real
+    CHECK_EQ(nFull, sites);    // (c) saturated + neutral scalar: every site
+    CHECK_EQ(nDark, 0);        // (d)
+    // (a) 500 per-mille halves the population; a deterministic draw over
+    // 1400+ sites lands within a few percent of half.
+    CHECK(nHalf * 1000 > nFull * 450);
+    CHECK(nHalf * 1000 < nFull * 550);
+    std::printf("    occupancy scalar: %d sites, full %d, half %d, dark %d\n", sites, nFull,
+                nHalf, nDark);
+}
+
+VXC_TEST(assetpolicy_occupancy_scalar_is_per_biome) {
+    // One species, thinned in savanna and untouched in temperate forest: the
+    // same site keeps its tree in the forest and usually loses it in the
+    // savanna. This is the cross-biome contrast the census measured as absent.
+    AssetSpecies sp = anywhere(1, 1000);
+    sp.occupancyPerMille[SAVANNA] = 150;
+
+    int nForest = 0, nSavanna = 0, sites = 0;
+    for (int64_t cy = 0; cy < 40; ++cy)
+        for (int64_t cx = 0; cx < 40; ++cx) {
+            AssetSite s;
+            if (!assetSiteInCell(kSeed, kLayers[1], 1, cx, cy, s)) continue;
+            ++sites;
+            AssetInstance inst;
+            nForest += assetResolveSite(kSeed, kLayers, kAssetLayerCount, &sp, 1, s,
+                                        goodGround(TEMPERATE_FOREST), inst);
+            nSavanna += assetResolveSite(kSeed, kLayers, kAssetLayerCount, &sp, 1, s,
+                                         goodGround(SAVANNA), inst);
+        }
+    CHECK(sites > 400);
+    CHECK_EQ(nForest, sites);
+    CHECK(nSavanna > 0);
+    CHECK(nSavanna * 1000 < sites * 250); // ~150 per-mille, generous ceiling
+    std::printf("    per-biome occupancy: %d sites, forest %d, savanna %d\n", sites, nForest,
+                nSavanna);
+}

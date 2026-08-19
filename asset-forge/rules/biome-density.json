@@ -1,0 +1,26 @@
+{
+  "_readme": [
+    "THE KIND x BIOME DENSITY TABLE: how much of the occupancy cap each asset",
+    "class may use, per biome, 0.0..1.0 (exported as per-mille; the engine",
+    "REFUSES values above 1.0 -- the table may only thin, never boost, because",
+    "a placement policy may only veto sites). 1.0 everywhere reproduces the",
+    "pre-table world exactly. Missing kinds or biomes read as 1.0.",
+    "",
+    "This is the knob the 2026-08-18 census showed was missing: biome weights",
+    "saturate the occupancy cap, so every rich biome carried the same density",
+    "(savanna == temperate forest) and the single per-layer density did all",
+    "the work everywhere. This table scales the KEEP test per kind per biome,",
+    "linearly, after the species pick -- see docs/placement-spec-schema.md.",
+    "",
+    "Any edit here changes the manifest: worldgen change, kWorldGenVersion",
+    "bump, goldens re-blessed, per the v24 contract."
+  ],
+  "density": {
+    "tree":   {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0},
+    "bush":   {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0},
+    "rock":   {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0},
+    "grass":  {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0},
+    "reed":   {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0},
+    "flower": {"ocean": 1.0, "beach": 1.0, "grassland": 1.0, "temperate_forest": 1.0, "rainforest": 1.0, "desert": 1.0, "savanna": 1.0, "taiga": 1.0, "tundra_alpine": 1.0, "bare_rock": 1.0}
+  }
+}

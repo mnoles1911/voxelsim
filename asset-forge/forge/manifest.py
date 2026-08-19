@@ -31,17 +31,39 @@ deliberately. That is docs/asset-placement-architecture.md section 9, and it is
 why MANIFEST_VERSION exists separately from the VXA version: the two move for
 different reasons.
 
+VERSION 2 (2026-08-18): the per-biome placement expansion. Three additions,
+none touching the 152-byte species record:
+
+    * a KIND x BIOME DENSITY TABLE (rules/biome-density.json) between the
+      layer table and the species records -- the occupancy scalar per asset
+      class per biome. 1000 everywhere is today's world exactly; the reader
+      REFUSES values above 1000 (veto-only: the table may thin, never boost).
+    * a NAMED RULE TABLE (rules/placement-rules.json): placement restrictions
+      authored once, by name, each a masked subset of the gate fields.
+    * a RULE ATTACHMENT TABLE: (species, biome) -> rule, one or many per
+      pair, from each spec's `biome_rules` block. The READER composes a
+      pair's rules by intersection (strictest wins) and splits the species
+      into per-biome rows at import; this exporter validates the same
+      composition BY NAME first, so a contradiction is refused here with the
+      rule names in the message, never discovered as a parse error.
+
+The species' biome ALLOWLIST (spec `biome_allow`, resolved by
+forge.biomes.allowed) is enforced at encode: a weight outside the allowlist
+is zeroed and reported by name, so the wire's weights ARE the allowlist and
+the reader needs no second mechanism.
+
 Format, all little-endian, packed (no alignment padding beyond what is spelled
 out). Mirrors voxelcore/assetmanifest.h field for field.
 
     header (32 B):
         magic         u32   "VXM1" = 0x314D5856
-        version       u32   = 1
+        version       u32   = 2
         biome_count   u32   = 10   (len(BIOME_ORDER); reader refuses mismatch)
         layer_count   u32   = 4    (vxc::kAssetLayerCount; reader refuses mismatch)
         species_count u32
         record_bytes  u32   = SPECIES_RECORD_BYTES (reader refuses mismatch)
-        reserved      u32 x 2 = 0
+        rule_count    u32
+        attach_count  u32
 
     biome names: biome_count x 16 bytes, ASCII, zero-padded. THE ORDER IS
         voxelcore/biome.h's BiomeId ORDER, and the names are in the file so the
@@ -52,6 +74,17 @@ out). Mirrors voxelcore/assetmanifest.h field for field.
     layers: layer_count x 24 B:
         cell_mm u32 | max_height_mm i32 | max_depth_mm i32 | max_radius_mm i32
         density_per_mille u16 | seed_count u16 | terrain_lattice u8 | pad u8 x 3
+
+    class density: kAssetKindCount(10) x biome_count(10) u16 per-mille,
+        kind-major in KIND_ORDER x BIOME_ORDER. <= 1000 or the reader refuses.
+
+    rules: rule_count x 64 B, sorted by name (the whole authored library
+        ships, referenced or not, so rule ids are stable across exports):
+        name char[32] | field_mask u16 | abundance_q10 u16 | cluster_q10 u16
+        water_kind u8 | water_mask u8 | elev_min_mm i32 | elev_max_mm i32
+        slope_min i32 | slope_max i32 (pct x 10) | water_max_mm i32
+        spacing_mm i32
+        Unmasked fields are ZERO on the wire -- one encoding per meaning.
 
     species: species_count x record_bytes, sorted by name so the table is a
         deterministic function of the spec set:
@@ -98,6 +131,10 @@ out). Mirrors voxelcore/assetmanifest.h field for field.
 
     record_bytes = 152.
 
+    attachments: attach_count x 8 B, sorted strictly ascending by
+        (species_index, biome, rule_index) -- sorted AND unique:
+        species_index u16 | biome u8 | pad u8 | rule_index u16 | pad u16
+
 WHAT THE READER FOLDS, AND WHY NOT HERE. vxc::AssetSpecies::weightPerMille is
 biome_weight x abundance x min(1, (cell/spacing)^2): the joint per-mille chance
 the species takes a site. The manifest keeps the three factors separate because
@@ -111,6 +148,7 @@ than silently absent.
 
 from __future__ import annotations
 
+import json
 import re
 import struct
 from dataclasses import dataclass, field
@@ -120,11 +158,33 @@ from . import biomes as biomelib
 from . import spec as sm
 
 MAGIC = b"VXM1"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 HEADER_BYTES = 32
 BIOME_NAME_BYTES = 16
 LAYER_RECORD_BYTES = 24
 SPECIES_RECORD_BYTES = 152
+RULE_RECORD_BYTES = 64
+RULE_NAME_BYTES = 32
+ATTACH_RECORD_BYTES = 8
+
+# Where the placement-wide data lives: the named rule library and the kind x
+# biome density table. Species JSON stays in specs/; these are not species.
+RULES_PATH = Path(__file__).resolve().parents[1] / "rules" / "placement-rules.json"
+DENSITY_PATH = Path(__file__).resolve().parents[1] / "rules" / "biome-density.json"
+
+# AssetOverrideField bits, mirroring assetmanifest.h bit for bit. Keys are the
+# spec-side field names (spec.RULE_FIELDS).
+RULE_FIELD_BITS = {
+    "elev_min_m": 1 << 0,
+    "elev_max_m": 1 << 1,
+    "slope_min_pct": 1 << 2,
+    "slope_max_pct": 1 << 3,
+    "water_max_m": 1 << 4,
+    "water": 1 << 5,
+    "spacing_m": 1 << 6,
+    "abundance": 1 << 7,
+    "cluster": 1 << 8,
+}
 
 # voxelcore/biome.h's BiomeId order, BY HAND AND ON PURPOSE. forge/biomes.py
 # orders its tuple for the app's UI; the engine's enum is append-only wire
@@ -170,6 +230,156 @@ WATER_KIND_TO_MASK = {
 KINDS_ON_SCATTER = ("tree", "bush", "rock", "grass", "reed", "flower")
 KINDS_TERRAIN = ("tree", "rock")
 LAYER_NOT_SCATTERED = 255
+
+
+def load_rules(path: "Path | None" = None) -> "dict[str, dict]":
+    """The named rule library, validated: {name: {field: value}}.
+
+    RAISES on anything malformed rather than warning: the library is one
+    shared file, a broken rule is referenced by an unknown number of species,
+    and an export that silently dropped a restriction is the failure this
+    whole mechanism exists to prevent. Values are clamped to the same Param
+    ranges the placement sliders use, so a rule cannot say what a spec could
+    not. Keys starting with '_' are notes and ignored."""
+    p = Path(path) if path is not None else RULES_PATH
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    rules_raw = raw.get("rules")
+    if not isinstance(rules_raw, dict):
+        raise ValueError(f"{p}: no 'rules' mapping")
+    out: dict[str, dict] = {}
+    for name in sorted(rules_raw):
+        body = rules_raw[name]
+        if not sm.RULE_NAME_RE.match(name or ""):
+            raise ValueError(f"{p}: rule name {name!r} is not 1-31 chars of [A-Za-z0-9_-]")
+        if not isinstance(body, dict):
+            raise ValueError(f"{p}: rule {name!r} is not a mapping")
+        rule: dict = {}
+        for k, v in body.items():
+            if k.startswith("_"):
+                continue
+            if k not in sm.RULE_FIELDS:
+                raise ValueError(f"{p}: rule {name!r} field {k!r} is not one of "
+                                 f"{sm.RULE_FIELDS}")
+            if k == "water":
+                if v not in WATER_ORDER:
+                    raise ValueError(f"{p}: rule {name!r} water {v!r} not in {WATER_ORDER}")
+                rule[k] = v
+                continue
+            row = sm.BY_PATH[f"placement.{k}"]
+            try:
+                val = float(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"{p}: rule {name!r} field {k}: {v!r} is not a number")
+            if val < row.lo or val > row.hi:
+                raise ValueError(f"{p}: rule {name!r} field {k}: {val} outside "
+                                 f"[{row.lo}, {row.hi}]")
+            rule[k] = val
+        if not rule:
+            raise ValueError(f"{p}: rule {name!r} sets no fields -- it gates nothing")
+        if "water_max_m" in rule and rule["water_max_m"] <= 0:
+            raise ValueError(f"{p}: rule {name!r} water_max_m must be positive "
+                             f"(omit the field for 'does not care')")
+        if "spacing_m" in rule and rule["spacing_m"] <= 0:
+            raise ValueError(f"{p}: rule {name!r} spacing_m must be positive")
+        if ("elev_min_m" in rule and "elev_max_m" in rule
+                and rule["elev_min_m"] > rule["elev_max_m"]):
+            raise ValueError(f"{p}: rule {name!r} elevation band is inverted")
+        if ("slope_min_pct" in rule and "slope_max_pct" in rule
+                and rule["slope_min_pct"] > rule["slope_max_pct"]):
+            raise ValueError(f"{p}: rule {name!r} slope band is inverted")
+        out[name] = rule
+    return out
+
+
+def load_density(path: "Path | None" = None) -> "dict[tuple[str, str], int]":
+    """The kind x biome density table, per-mille: {(kind, biome): 0..1000}.
+
+    Missing kinds or biomes read as 1000 (neutral). Unknown keys RAISE -- a
+    typo'd biome silently reading as neutral is a silent no-op with the
+    owner's tuning inside it. Values above 1.0 raise here for the reason the
+    reader refuses them: the table may only thin."""
+    p = Path(path) if path is not None else DENSITY_PATH
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    table_raw = raw.get("density")
+    if not isinstance(table_raw, dict):
+        raise ValueError(f"{p}: no 'density' mapping")
+    out: dict[tuple[str, str], int] = {}
+    for kind, per_biome in table_raw.items():
+        if kind.startswith("_"):
+            continue
+        if kind not in KIND_ORDER:
+            raise ValueError(f"{p}: {kind!r} is not an asset kind ({KIND_ORDER})")
+        if not isinstance(per_biome, dict):
+            raise ValueError(f"{p}: density.{kind} is not a mapping")
+        for biome, v in per_biome.items():
+            if biome.startswith("_"):
+                continue
+            if biome not in BIOME_ORDER:
+                raise ValueError(f"{p}: density.{kind}.{biome!r} is not a biome "
+                                 f"({BIOME_ORDER})")
+            val = float(v)
+            if val < 0.0 or val > 1.0:
+                raise ValueError(f"{p}: density.{kind}.{biome} = {val} outside [0, 1] "
+                                 f"-- the table may only thin (veto-only), never boost")
+            out[(kind, biome)] = _per_mille(val)
+    return out
+
+
+def compose_problems(name: str, biome_key: str, rule_names: "list[str]",
+                     rules: "dict[str, dict]", body: dict) -> "list[str]":
+    """The contradictions in attaching `rule_names` to (species, biome), as
+    human sentences naming the rules -- empty means the composition is sound.
+
+    MIRRORS assetmanifest.cpp's composeOverrides law (intersection, strictest
+    wins) in the one place a human sees names instead of indices. The reader
+    re-checks the same law on the wire; this exists so the failure is 'rules
+    A and B contradict on species S in desert', not a parse refusal."""
+    problems: list[str] = []
+    elev_min = float(sm.get(body, "placement.elev_min_m"))
+    elev_max = float(sm.get(body, "placement.elev_max_m"))
+    slope_min = float(sm.get(body, "placement.slope_min_pct") or 0.0)
+    slope_max = float(sm.get(body, "placement.slope_max_pct") or 70.0)
+    water_kind = None
+    water_kind_rule = None
+    mask = WATER_KIND_TO_MASK[sm.get(body, "detail.water") or "any"]
+    cluster = None
+    cluster_rule = None
+    for rn in rule_names:
+        r = rules[rn]
+        if "elev_min_m" in r:
+            elev_min = max(elev_min, r["elev_min_m"])
+        if "elev_max_m" in r:
+            elev_max = min(elev_max, r["elev_max_m"])
+        if "slope_min_pct" in r:
+            slope_min = max(slope_min, r["slope_min_pct"])
+        if "slope_max_pct" in r:
+            slope_max = min(slope_max, r["slope_max_pct"])
+        if "water" in r:
+            if water_kind is not None and water_kind != r["water"]:
+                problems.append(
+                    f"{name} in {biome_key}: rules {water_kind_rule!r} and {rn!r} "
+                    f"state different water kinds ({water_kind} vs {r['water']})")
+            water_kind = r["water"]
+            water_kind_rule = rn
+            mask &= WATER_KIND_TO_MASK[r["water"]]
+        if "cluster" in r:
+            if cluster is not None and cluster != r["cluster"]:
+                problems.append(
+                    f"{name} in {biome_key}: rules {cluster_rule!r} and {rn!r} "
+                    f"state different cluster strengths ({cluster} vs {r['cluster']})")
+            cluster = r["cluster"]
+            cluster_rule = rn
+    if elev_min > elev_max:
+        problems.append(f"{name} in {biome_key}: composed elevation band is empty "
+                        f"({elev_min} > {elev_max} m) over rules {rule_names}")
+    if slope_min > slope_max:
+        problems.append(f"{name} in {biome_key}: composed slope band is empty "
+                        f"({slope_min} > {slope_max} %) over rules {rule_names}")
+    if water_kind is not None and mask == 0:
+        problems.append(f"{name} in {biome_key}: composed salinity admission is empty "
+                        f"(species water {sm.get(body, 'detail.water')!r} against rule "
+                        f"water {water_kind!r})")
+    return problems
 
 # THE COLLISION LINE, and the owner drew it by height, not by kind
 # (2026-08-18): "Small bushes, flowers, and grasses should not be collidable in
@@ -390,13 +600,31 @@ class ExportReport:
     this project keeps paying for is the silent no-op; an exporter that files
     828 species and says nothing is one."""
     species: int = 0
+    rules: int = 0
+    attachments: int = 0
     underserved_spacing: list[tuple[str, float, float]] = field(default_factory=list)
     too_rare_to_express: list[tuple[str, int, float]] = field(default_factory=list)
     unplaceable: list[tuple[str, str]] = field(default_factory=list)
     no_biome: list[str] = field(default_factory=list)
+    # (species, biome, authored weight) zeroed because the biome is outside
+    # the species' authored allowlist -- the allowlist is authoritative.
+    outside_allowlist: list[tuple[str, str, float]] = field(default_factory=list)
+    # (species, biome, rule, why): attachments that gate nothing and were not
+    # written -- the biome is dark or disallowed for that species.
+    dead_rules: list[tuple[str, str, str, str]] = field(default_factory=list)
 
     def lines(self) -> list[str]:
-        out = [f"manifest: {self.species} species"]
+        out = [f"manifest: {self.species} species, {self.rules} rules, "
+               f"{self.attachments} attachments"]
+        if self.outside_allowlist:
+            out.append(f"  {len(self.outside_allowlist)} biome weights zeroed as OUTSIDE "
+                       f"their species' authored allowlist:")
+            for name, biome, w in sorted(self.outside_allowlist):
+                out.append(f"    {name}: {biome} weight {w:g} -> 0")
+        if self.dead_rules:
+            out.append(f"  {len(self.dead_rules)} rule attachments DEAD (not written):")
+            for name, biome, rule, why in sorted(self.dead_rules):
+                out.append(f"    {name} in {biome}: {rule!r} -- {why}")
         if self.no_biome:
             out.append(f"  {len(self.no_biome)} species with zero weight in every biome "
                        f"(never appear anywhere): {', '.join(sorted(self.no_biome)[:8])}"
@@ -657,16 +885,31 @@ def species_record(spec: dict, name: str, seeds_baked: int,
     if kind not in KIND_ORDER:
         report.unplaceable.append((name, f"unknown kind {kind!r}"))
         return None
+    if isinstance(spec.get("biome_rules"), dict) and "__illegible__" in spec["biome_rules"]:
+        # validate() named the damage already; exporting the species WITHOUT
+        # its restrictions would be worse than not exporting it.
+        report.unplaceable.append(
+            (name, "biome_rules block is illegible -- refusing to publish the "
+                   "species un-restricted; fix or remove the block"))
+        return None
     spacing_m = float(sm.get(spec, "placement.spacing_m"))
     layer = assign_layer(kind, nominal_height_m(spec, kind), report, name, spacing_m)
     if layer < 0:
         return None
 
+    # THE ALLOWLIST IS ENFORCED HERE, so the wire's weights ARE the effective
+    # biome set and the reader needs no second mechanism. For a spec with no
+    # authored `biome_allow` the allowlist is derived from the weights and
+    # this zeroes nothing -- bit-for-bit today's export.
+    allowed = biomelib.allowed(spec)
     weights = []
     any_weight = False
     for b in BIOME_ORDER:
         w = sm.get(spec, f"biomes.{b}")
         pm = _per_mille(w if w is not None else 0.0)
+        if pm > 0 and b not in allowed:
+            report.outside_allowlist.append((name, b, float(w or 0.0)))
+            pm = 0
         any_weight = any_weight or pm > 0
         weights.append(pm)
     if not any_weight:
@@ -736,24 +979,101 @@ def species_record(spec: dict, name: str, seeds_baked: int,
     return rec
 
 
+def _rule_record(name: str, rule: dict) -> bytes:
+    """One 64-byte named rule, unmasked fields zero."""
+    mask = 0
+    for k in rule:
+        mask |= RULE_FIELD_BITS[k]
+    water_kind = rule.get("water")
+    rec = struct.pack(
+        "<32sHHHBBiiiiii",
+        name.encode("ascii"),
+        mask,
+        _q10(rule["abundance"]) if "abundance" in rule else 0,
+        _q10(rule["cluster"]) if "cluster" in rule else 0,
+        WATER_ORDER.index(water_kind) if water_kind is not None else 0,
+        WATER_KIND_TO_MASK[water_kind] if water_kind is not None else 0,
+        _mm(rule["elev_min_m"]) if "elev_min_m" in rule else 0,
+        _mm(rule["elev_max_m"]) if "elev_max_m" in rule else 0,
+        int(round(rule["slope_min_pct"] * 10.0)) if "slope_min_pct" in rule else 0,
+        int(round(rule["slope_max_pct"] * 10.0)) if "slope_max_pct" in rule else 0,
+        _mm(rule["water_max_m"]) if "water_max_m" in rule else 0,
+        _mm(rule["spacing_m"]) if "spacing_m" in rule else 0,
+    )
+    assert len(rec) == RULE_RECORD_BYTES, len(rec)
+    return rec
+
+
 def encode(specs: "list[tuple[str, dict]]",
            seeds_baked: "dict[str, int] | None" = None,
-           report: ExportReport | None = None) -> bytes:
+           report: ExportReport | None = None,
+           rules: "dict[str, dict] | None" = None,
+           density: "dict[tuple[str, str], int] | None" = None) -> bytes:
     """The manifest for a list of (name, validated spec body), sorted by name
-    so the byte stream is a deterministic function of the spec set."""
+    so the byte stream is a deterministic function of the spec set.
+
+    `rules` and `density` default to the checked-in libraries
+    (rules/placement-rules.json, rules/biome-density.json) so the exporter
+    and enginecheck cannot read them differently. RAISES, with names, on an
+    unknown rule reference or a contradictory composition: a typo that
+    silently dropped a restriction would place species where a human fenced
+    them out, which is worse than a failed export."""
     report = report if report is not None else ExportReport()
     seeds_baked = seeds_baked or {}
+    rules = rules if rules is not None else load_rules()
+    density = density if density is not None else load_density()
+
+    rule_names = sorted(rules)
+    rule_index = {n: i for i, n in enumerate(rule_names)}
 
     records = []
+    attachments: list[tuple[int, int, int]] = []  # (species_idx, biome_id, rule_idx)
+    problems: list[str] = []
     for name, spec in sorted(specs, key=lambda t: t[0]):
         rec = species_record(spec, name, int(seeds_baked.get(name, 0)), report)
-        if rec is not None:
-            records.append(rec)
+        if rec is None:
+            continue
+        idx = len(records)
+        records.append(rec)
+
+        biome_rules = spec.get("biome_rules")
+        if not isinstance(biome_rules, dict):
+            continue
+        allowed = biomelib.allowed(spec)
+        for bkey in sorted(biome_rules, key=lambda k: BIOME_ORDER.index(k)
+                           if k in BIOME_ORDER else 99):
+            if bkey not in BIOME_ORDER:
+                continue  # validate() warned already
+            names = biome_rules[bkey]
+            unknown = [n for n in names if n not in rules]
+            if unknown:
+                problems.append(f"{name} in {bkey}: unknown rule(s) "
+                                f"{', '.join(repr(u) for u in unknown)} -- not in "
+                                f"{RULES_PATH.name}")
+                continue
+            if bkey not in allowed:
+                for n in names:
+                    report.dead_rules.append(
+                        (name, bkey, n, "biome is outside the species' allowlist"))
+                continue
+            if _per_mille(sm.get(spec, f"biomes.{bkey}") or 0.0) == 0:
+                for n in names:
+                    report.dead_rules.append(
+                        (name, bkey, n, "species has zero weight in this biome"))
+                continue
+            problems.extend(compose_problems(name, bkey, names, rules, spec))
+            for n in sorted(names, key=lambda n: rule_index[n]):
+                attachments.append((idx, BIOME_ORDER.index(bkey), rule_index[n]))
+    if problems:
+        raise ValueError("manifest export refused:\n  " + "\n  ".join(problems))
+
     report.species = len(records)
+    report.rules = len(rule_names)
+    report.attachments = len(attachments)
 
     header = MAGIC + struct.pack(
         "<IIIIIII", MANIFEST_VERSION, len(BIOME_ORDER), len(LAYERS),
-        len(records), SPECIES_RECORD_BYTES, 0, 0)
+        len(records), SPECIES_RECORD_BYTES, len(rule_names), len(attachments))
     assert len(header) == HEADER_BYTES
 
     biome_block = b"".join(
@@ -767,7 +1087,24 @@ def encode(specs: "list[tuple[str, dict]]",
             1 if L.terrain_lattice else 0)
     assert len(layer_block) == LAYER_RECORD_BYTES * len(LAYERS)
 
-    return header + biome_block + layer_block + b"".join(records)
+    density_block = b""
+    for kind in KIND_ORDER:
+        for biome in BIOME_ORDER:
+            density_block += struct.pack("<H", density.get((kind, biome), 1000))
+    assert len(density_block) == 2 * len(KIND_ORDER) * len(BIOME_ORDER)
+
+    rule_block = b"".join(_rule_record(n, rules[n]) for n in rule_names)
+
+    # Attachments sorted strictly ascending by (species, biome, rule): the
+    # reader refuses any other order, which is what makes the file's byte
+    # encoding unique.
+    attach_block = b""
+    for sp, bio, ru in sorted(attachments):
+        attach_block += struct.pack("<HBxH2x", sp, bio, ru)
+    assert len(attach_block) == ATTACH_RECORD_BYTES * len(attachments)
+
+    return (header + biome_block + layer_block + density_block + rule_block +
+            b"".join(records) + attach_block)
 
 
 def decode(blob: bytes) -> dict:
@@ -776,7 +1113,8 @@ def decode(blob: bytes) -> dict:
     exporter."""
     if blob[:4] != MAGIC:
         raise ValueError("bad magic")
-    version, biomes, layers, count, rec_bytes, _, _ = struct.unpack_from("<IIIIIII", blob, 4)
+    version, biomes, layers, count, rec_bytes, rule_count, attach_count = \
+        struct.unpack_from("<IIIIIII", blob, 4)
     if version != MANIFEST_VERSION:
         raise ValueError(f"version {version}")
     off = HEADER_BYTES
@@ -788,6 +1126,29 @@ def decode(blob: bytes) -> dict:
     for _ in range(layers):
         layer_rows.append(struct.unpack_from("<IiiiHHB3x", blob, off))
         off += LAYER_RECORD_BYTES
+    density = {}
+    for kind in KIND_ORDER:
+        for biome in BIOME_ORDER:
+            density[(kind, biome)] = struct.unpack_from("<H", blob, off)[0]
+            off += 2
+    rules = []
+    for _ in range(rule_count):
+        r = struct.unpack_from("<32sHHHBBiiiiii", blob, off)
+        rules.append({
+            "name": r[0].rstrip(b"\0").decode("ascii"),
+            "field_mask": r[1],
+            "abundance_q10": r[2],
+            "cluster_q10": r[3],
+            "water_kind": WATER_ORDER[r[4]],
+            "water_mask": r[5],
+            "elev_min_mm": r[6],
+            "elev_max_mm": r[7],
+            "slope_min": r[8],
+            "slope_max": r[9],
+            "water_max_mm": r[10],
+            "spacing_mm": r[11],
+        })
+        off += RULE_RECORD_BYTES
     species = []
     for _ in range(count):
         rec = struct.unpack_from(
@@ -820,4 +1181,10 @@ def decode(blob: bytes) -> dict:
             "group_radius_mm": rec[33],
         })
         off += rec_bytes
-    return {"biomes": tuple(names), "layers": layer_rows, "species": species}
+    attachments = []
+    for _ in range(attach_count):
+        a = struct.unpack_from("<HBxH2x", blob, off)
+        attachments.append({"species": a[0], "biome": BIOME_ORDER[a[1]], "rule": a[2]})
+        off += ATTACH_RECORD_BYTES
+    return {"biomes": tuple(names), "layers": layer_rows, "density": density,
+            "rules": rules, "species": species, "attachments": attachments}
