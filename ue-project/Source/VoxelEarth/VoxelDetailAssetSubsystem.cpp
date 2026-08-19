@@ -93,6 +93,7 @@
 #include "VoxelDetailAssetSubsystem.h"
 
 #include "VoxelCoords.h"
+#include "VoxelDebug.h" // VoxelDebug::kHitchThresholdMs -- the adaptive budgets' bar
 #include "VoxelEarth.h"
 #include "VoxelFineTileStreamer.h"
 #include "VoxelWorldSubsystem.h"
@@ -156,13 +157,44 @@ constexpr double kDefaultRingMeters = 256.0;
 // motion.
 constexpr double kUnloadMultiplier = 1.15;
 
-// Per-tick budgets. Resolve jobs are bounded by in-flight count (worker-side
-// cost); mesh builds and instance-table rebuilds run on the game thread and
-// are the ones that could hitch a frame, so they are budgeted separately.
-constexpr int32 kMaxJobsInFlight = 4;
-constexpr int32 kMaxDispatchPerTick = 8;
-constexpr int32 kMaxMeshBuildsPerTick = 4;
-constexpr int32 kMaxRebuildsPerTick = 4;
+// Per-tick budgets, ADAPTIVE since 2026-08-18 (the ten-minute first-arrival
+// debt: 5,028 groups / 311 first-encounter meshes at the alpine lake pushed
+// capture settle from ~350 s to 591-656 s under the old fixed 4/8/4/4).
+//
+// The original hitch reasoning still stands and is preserved, just made
+// proportional: mesh builds and instance-table rebuilds run on the game
+// thread and are the ones that could hitch a frame, so they are governed by a
+// measured TIME budget per tick rather than a count (grids span 100-5000
+// voxels; four big builds and four small ones are very different frames).
+// Resolve jobs run on background workers and are bounded by an in-flight
+// count (worker-side cost -- they share the task pool with the level-0
+// meshing jobs).
+//
+// Both budgets scale with the headroom the LAST frame had against
+// VoxelDebug::kHitchThresholdMs (the same 33.3 ms bar the "Hitch frame" log
+// fires on): a fast frame gets the max values, a frame at 85% of the
+// threshold gets the min values, linear in between. Convergence therefore
+// runs hard exactly when the frame can afford it and backs off to roughly
+// the old fixed budgets when it cannot -- it never ADDS a hitch to a frame
+// already near the bar.
+constexpr int32 kMinJobsInFlight = 4;        // the old fixed cap; floor under load
+constexpr int32 kMaxJobsInFlight = 24;       // ceiling with full frame headroom
+constexpr int32 kMaxDispatchPerTick = 32;    // refill limit per tick
+// Game-thread time budget shared by mesh builds and HISM rebuilds each tick.
+// 6 ms fits inside a 16.6 ms frame's idle time (the game thread idles ~75% at
+// 2K -- voxelsim-draw-path-2k); 1.5 ms is roughly what the old 4-mesh budget
+// spent on typical grids, so the busy floor is the old behaviour.
+constexpr double kMinBuildBudgetMs = 1.5;
+constexpr double kMaxBuildBudgetMs = 6.0;
+// Hard ceilings under the time budget so a pathological run of tiny grids
+// cannot spin the loops unboundedly inside one tick.
+constexpr int32 kMaxMeshBuildsPerTick = 64;
+constexpr int32 kMaxRebuildsPerTick = 64;
+// Headroom window, as fractions of the hitch threshold: at or below 60%
+// (20 ms) the frame is healthy and budgets are maxed; at or above 85%
+// (28.3 ms) budgets are floored.
+constexpr double kHealthyFrameFrac = 0.60;
+constexpr double kBusyFrameFrac = 0.85;
 
 // Refuse to dense-decode an absurd grid (nothing baked approaches this; the
 // detail library is 100-5000 voxels per grid).
@@ -594,6 +626,25 @@ struct FVoxelDetailAssetImpl
 	double LogTimer = 0.0;
 	bool bFirstApplyLogged = false;
 
+	// Convergence telemetry (2026-08-18). The convergence curve was previously
+	// unmeasurable from the log -- the only signal was the capture harness's
+	// settle time. These make it a first-class measurement:
+	//  * StartTimeSeconds anchors time-to-first-full-ring;
+	//  * bConvergedLogged latches the one CONVERGED line (first full ring:
+	//    every group in the ring resolved, every encountered mesh built, no
+	//    dirty HISM rebuilds outstanding);
+	//  * the Window* pair measure mesh-build throughput per progress window;
+	//  * StatPendingGroups is the dispatch step's last candidate count (groups
+	//    inside the ring not yet resolved or in flight -- includes groups
+	//    deferred by the residency gate).
+	double StartTimeSeconds = 0.0;
+	bool bConvergedLogged = false;
+	double ProgressLogTimer = 0.0;
+	uint64 WindowMeshBuilds = 0;
+	double WindowBuildMs = 0.0;
+	double StatBuildMsTotal = 0.0;
+	int32 StatPendingGroups = 0;
+
 	void WaitForAllJobs()
 	{
 		for (UE::Tasks::TTask<void>& T : Tasks)
@@ -854,6 +905,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 #endif
 
 		S.bStarted = true;
+		S.StartTimeSeconds = FPlatformTime::Seconds();
 		UE_LOG(LogVoxelEarth, Log,
 		       TEXT("VoxelDetailAssets: STARTED -- ring %.0f m, group %.1f m, reach dilation "
 		            "%lld mm, shadows %s. Rendering detail-lattice plants/rocks only; detail "
@@ -874,6 +926,24 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 	const double RingUU = S.RingMeters * 100.0;
 	const double UnloadUU = RingUU * kUnloadMultiplier;
+
+	// --- adaptive budgets (see the constants' comment) -----------------------
+	// DeltaTime is the LAST frame's duration -- the standard one-frame-lagged
+	// headroom proxy, and the same quantity the "Hitch frame" log judges.
+	const double FrameMs = double(DeltaTime) * 1000.0;
+	const double HealthyMs = double(VoxelDebug::kHitchThresholdMs) * kHealthyFrameFrac;
+	const double BusyMs = double(VoxelDebug::kHitchThresholdMs) * kBusyFrameFrac;
+	const double Headroom =
+		FMath::Clamp((BusyMs - FrameMs) / (BusyMs - HealthyMs), 0.0, 1.0);
+	const int32 JobsInFlightCap =
+		kMinJobsInFlight +
+		FMath::RoundToInt32(Headroom * double(kMaxJobsInFlight - kMinJobsInFlight));
+	const double BuildBudgetMs =
+		kMinBuildBudgetMs + Headroom * (kMaxBuildBudgetMs - kMinBuildBudgetMs);
+	// Shared by the mesh-build and rebuild steps below; each step is
+	// guaranteed one unit of progress per tick so a long stretch of busy
+	// frames stalls convergence to the old fixed-budget rate, never to zero.
+	double BudgetSpentMs = 0.0;
 
 	// --- 1. drain worker results -------------------------------------------
 	{
@@ -945,12 +1015,16 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	// --- 2. budgeted mesh builds -------------------------------------------
 	{
 		int32 Built = 0;
-		for (auto It = S.PendingGeometry.CreateIterator(); It && Built < kMaxMeshBuildsPerTick; ++It)
+		for (auto It = S.PendingGeometry.CreateIterator();
+		     It && Built < kMaxMeshBuildsPerTick &&
+		     (Built == 0 || BudgetSpentMs < BuildBudgetMs);
+		     ++It)
 		{
 			const uint32 Key = It->Key;
 			TUniquePtr<FMeshGeometry> Geometry = MoveTemp(It->Value);
 			It.RemoveCurrent();
 			++Built;
+			const double BuildStart = FPlatformTime::Seconds();
 
 			UStaticMesh* Mesh = CreateDetailStaticMesh(*Geometry, DetailMaterial);
 			if (Mesh == nullptr)
@@ -959,6 +1033,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				       TEXT("VoxelDetailAssets: mesh build FAILED for key %08x (%d verts) -- "
 				            "instances of this (species, seed) will not render this session."),
 				       Key, Geometry->Positions.Num());
+				BudgetSpentMs += (FPlatformTime::Seconds() - BuildStart) * 1000.0;
 				continue;
 			}
 			BuiltMeshes.Add(Mesh);
@@ -991,6 +1066,12 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			Entry.SolidVoxels = Geometry->SolidVoxels;
 			Entry.bDirty = true; // full rebuild picks up every already-applied group
 			++S.StatMeshesBuilt;
+
+			const double BuildMs = (FPlatformTime::Seconds() - BuildStart) * 1000.0;
+			BudgetSpentMs += BuildMs;
+			S.WindowBuildMs += BuildMs;
+			S.StatBuildMsTotal += BuildMs;
+			++S.WindowMeshBuilds;
 		}
 	}
 
@@ -1034,7 +1115,10 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		int32 Rebuilt = 0;
 		for (TPair<uint32, FVoxelDetailAssetImpl::FMeshEntry>& Pair : S.Meshes)
 		{
-			if (Rebuilt >= kMaxRebuildsPerTick)
+			// Shares the tick's time budget with the mesh builds above (and the
+			// same guaranteed-progress floor: at least one rebuild per tick).
+			if (Rebuilt >= kMaxRebuildsPerTick ||
+			    (Rebuilt > 0 && BudgetSpentMs >= BuildBudgetMs))
 			{
 				break;
 			}
@@ -1045,6 +1129,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			}
 			++Rebuilt;
 			Entry.bDirty = false;
+			const double RebuildStart = FPlatformTime::Seconds();
 
 			TArray<FTransform> Transforms;
 			if (const TSet<FGroupKey>* Members = S.KeyGroups.Find(Pair.Key))
@@ -1069,6 +1154,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				Entry.Hism->AddInstances(Transforms, /*bShouldReturnIndices*/ false,
 				                         /*bWorldSpace*/ false);
 			}
+			BudgetSpentMs += (FPlatformTime::Seconds() - RebuildStart) * 1000.0;
 		}
 	}
 
@@ -1079,7 +1165,7 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		S.Tasks.RemoveAll([](const UE::Tasks::TTask<void>& T) { return T.IsCompleted(); });
 
 		const int32 Capacity =
-			FMath::Min(kMaxDispatchPerTick, kMaxJobsInFlight - S.InFlight.Num());
+			FMath::Min(kMaxDispatchPerTick, JobsInFlightCap - S.InFlight.Num());
 		if (Capacity > 0)
 		{
 			FVoxelFineTileStreamer* Streamer = VoxelWorld->GetFineTileStreamer();
@@ -1117,6 +1203,37 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			}
 			Candidates.Sort([](const FCandidate& A, const FCandidate& B)
 			                { return A.DistSq < B.DistSq; });
+			S.StatPendingGroups = Candidates.Num();
+
+			// Time-to-first-full-ring, latched once. "Converged" is the full
+			// conjunction: every group in the ring resolved (no candidates
+			// left, none in flight), every first-encounter mesh built, and no
+			// HISM still waiting on a rebuild -- i.e. everything the resolver
+			// placed is actually on screen.
+			if (!S.bConvergedLogged && S.Groups.Num() > 0 && Candidates.Num() == 0 &&
+			    S.InFlight.Num() == 0 && S.PendingGeometry.Num() == 0)
+			{
+				bool bAnyDirty = false;
+				for (const TPair<uint32, FVoxelDetailAssetImpl::FMeshEntry>& Pair : S.Meshes)
+				{
+					if (Pair.Value.bDirty && Pair.Value.Hism != nullptr)
+					{
+						bAnyDirty = true;
+						break;
+					}
+				}
+				if (!bAnyDirty)
+				{
+					S.bConvergedLogged = true;
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("VoxelDetailAssets: CONVERGED -- full ring resolved and built "
+					            "%.1f s after start. %d groups, %llu instances, %d distinct "
+					            "meshes (%.0f ms game-thread mesh-build time total)."),
+					       FPlatformTime::Seconds() - S.StartTimeSeconds, S.Groups.Num(),
+					       (unsigned long long)S.StatInstancesLive, S.Meshes.Num(),
+					       S.StatBuildMsTotal);
+				}
+			}
 
 			int32 Dispatched = 0;
 			for (const FCandidate& C : Candidates)
@@ -1177,6 +1294,31 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	}
 
 	// --- 6. periodic telemetry ---------------------------------------------
+	// Convergence-curve log: every 5 s until the first full ring, so the curve
+	// (groups resolved / pending, meshes built / pending, build throughput) is
+	// readable straight off the capture log rather than inferred from settle
+	// times. Goes quiet once converged; the 30 s census below continues.
+	if (!S.bConvergedLogged)
+	{
+		S.ProgressLogTimer += DeltaTime;
+		if (S.ProgressLogTimer >= 5.0 && S.StatGroupsResolved > 0)
+		{
+			S.ProgressLogTimer = 0.0;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("VoxelDetailAssets: converging -- %.1f s elapsed: %d groups live, "
+			            "%d pending, %d in flight; %d meshes built, %d builds pending; "
+			            "%llu instances; window: %llu builds in %.1f ms; headroom %.2f "
+			            "(frame %.1f ms), jobsCap %d, budget %.1f ms"),
+			       FPlatformTime::Seconds() - S.StartTimeSeconds, S.Groups.Num(),
+			       S.StatPendingGroups, S.InFlight.Num(), S.Meshes.Num(),
+			       S.PendingGeometry.Num(), (unsigned long long)S.StatInstancesLive,
+			       (unsigned long long)S.WindowMeshBuilds, S.WindowBuildMs, Headroom,
+			       FrameMs, JobsInFlightCap, BuildBudgetMs);
+			S.WindowMeshBuilds = 0;
+			S.WindowBuildMs = 0.0;
+		}
+	}
+
 	S.LogTimer += DeltaTime;
 	if (S.LogTimer >= 30.0)
 	{
@@ -1184,14 +1326,17 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 		if (S.StatGroupsResolved > 0)
 		{
 			UE_LOG(LogVoxelEarth, Log,
-			       TEXT("VoxelDetailAssets: %llu groups live, %llu instances, %d distinct "
-			            "(species, seed) meshes, %d HISM components, %llu sites resolved total, "
-			            "%llu bank misses. ZERO INSTANCES WITH GROUPS LIVE MEANS THE RESOLVER IS "
-			            "GATING EVERYTHING OUT HERE (biome/elevation/slope), not a wiring fault."),
-			       (unsigned long long)S.Groups.Num(), (unsigned long long)S.StatInstancesLive,
-			       S.Meshes.Num(), HismComponents.Num(),
+			       TEXT("VoxelDetailAssets: %llu groups live (%d pending, %d in flight), %llu "
+			            "instances, %d distinct (species, seed) meshes (%d builds pending), "
+			            "%d HISM components, %llu sites resolved total, %llu bank misses, "
+			            "%.0f ms mesh-build time total. ZERO INSTANCES WITH GROUPS LIVE MEANS "
+			            "THE RESOLVER IS GATING EVERYTHING OUT HERE (biome/elevation/slope), "
+			            "not a wiring fault."),
+			       (unsigned long long)S.Groups.Num(), S.StatPendingGroups, S.InFlight.Num(),
+			       (unsigned long long)S.StatInstancesLive,
+			       S.Meshes.Num(), S.PendingGeometry.Num(), HismComponents.Num(),
 			       (unsigned long long)S.StatSitesResolved,
-			       (unsigned long long)S.StatBankMisses);
+			       (unsigned long long)S.StatBankMisses, S.StatBuildMsTotal);
 		}
 	}
 }
