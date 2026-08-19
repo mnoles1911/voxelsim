@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/* == The medieval voxel theme =============================================
+ *
+ * Dark stone hall, parchment ink, forge-gold accents. Everything square:
+ * no border-radius anywhere -- corners are CHAMFERED (a 45-degree cut that
+ * reads as a big pixel) and edges get a hard two-tone bevel like a voxel
+ * catching the light. All shading is flat steps, never soft gradients or
+ * blurred shadows, so the chrome reads like the game's own blocks.
+ */
+
+@theme {
+  /* stone: the walls and floors, darkest to lightest */
+  --color-stone-950: #100d09;
+  --color-stone-900: #171310;
+  --color-stone-850: #1d1813;
+  --color-stone-800: #241e17;
+  --color-stone-700: #2e261c;
+  --color-stone-600: #3a3023;
+  --color-stone-500: #4c3f2e;
+
+  /* parchment: text and paper panels */
+  --color-parch-100: #f0e6c8;
+  --color-parch-200: #e2d4ac;
+  --color-parch-300: #c8b78d;
+  --color-parch-400: #a6956e;
+  --color-parch-500: #7d6f51;
+  --color-parch-600: #57503c;
+
+  /* accents */
+  --color-gold-400: #e8c34a;
+  --color-gold-500: #c9a227;
+  --color-gold-600: #94761c;
+  --color-moss-400: #8fb35c;
+  --color-moss-500: #6d8f42;
+  --color-moss-600: #4c6a2c;
+  --color-rust-400: #d06a4a;
+  --color-rust-500: #a03d2e;
+  --color-rust-600: #762b20;
+  --color-water-400: #6fa7cc;
+  --color-water-500: #4e83a8;
+
+  --font-display: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --font-body: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  --font-mono: "Cascadia Mono", Consolas, "Courier New", monospace;
+
+  --radius: 0px;
+}
+
+/* Chamfered corners: the octagon cut that stands in for a rounded corner.
+ * Sized in px so the cut stays chunky at any element size. */
+@utility chamfer {
+  clip-path: polygon(
+    6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px),
+    calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px);
+}
+@utility chamfer-sm {
+  clip-path: polygon(
+    3px 0, calc(100% - 3px) 0, 100% 3px, 100% calc(100% - 3px),
+    calc(100% - 3px) 100%, 3px 100%, 0 calc(100% - 3px), 0 3px);
+}
+
+/* Voxel bevel: hard one-pixel light/dark steps, no blur. `up` is a raised
+ * block (buttons, cards); `down` is a recess (inputs, wells). Inset shadows
+ * survive the chamfer clip, which real borders would not. */
+@utility bevel-up {
+  box-shadow:
+    inset 0 2px 0 0 rgb(255 255 255 / 0.07),
+    inset 2px 0 0 0 rgb(255 255 255 / 0.05),
+    inset 0 -2px 0 0 rgb(0 0 0 / 0.45),
+    inset -2px 0 0 0 rgb(0 0 0 / 0.30);
+}
+@utility bevel-down {
+  box-shadow:
+    inset 0 2px 0 0 rgb(0 0 0 / 0.50),
+    inset 2px 0 0 0 rgb(0 0 0 / 0.35),
+    inset 0 -2px 0 0 rgb(255 255 255 / 0.06),
+    inset -2px 0 0 0 rgb(255 255 255 / 0.04);
+}
+
+/* An engraved rule, like a mortar line between stone courses. */
+@utility mortar-b {
+  border-bottom: 1px solid var(--color-stone-950);
+  box-shadow: 0 1px 0 0 rgb(255 255 255 / 0.05);
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  font-family: var(--font-body);
+  background-color: var(--color-stone-900);
+  color: var(--color-parch-200);
+  /* faint stone coursing on the page ground: flat repeating steps, no blur */
+  background-image:
+    repeating-linear-gradient(0deg, transparent 0 46px, rgb(0 0 0 / 0.14) 46px 48px),
+    repeating-linear-gradient(90deg, transparent 0 94px, rgb(0 0 0 / 0.10) 94px 96px);
+}
+
+::selection { background: var(--color-gold-600); color: var(--color-parch-100); }
+
+* { scrollbar-width: thin; scrollbar-color: var(--color-stone-500) var(--color-stone-900); }
