@@ -1,0 +1,397 @@
+{
+  "tiles": 15,
+  "bake_ver": [
+    28
+  ],
+  "basins_total": 9580,
+  "basins_terminal": 1700,
+  "basins_spanning": 230,
+  "by_kind": {
+    "lake_overflowing": 7880,
+    "dry_playa": 45,
+    "lake_terminal": 543,
+    "seasonal": 1112
+  },
+  "heads": 460848,
+  "network_km_by_log2_acc": {
+    "14": 56782.83375,
+    "16": 27088.813125,
+    "18": 11870.895,
+    "20": 4485.125625
+  },
+  "drainage_density_km_per_km2_by_log2_acc": {
+    "14": 16.045134862263996,
+    "16": 7.6544904708862305,
+    "18": 3.354360792371962,
+    "20": 1.267362700568305
+  },
+  "systems_per_superblock_from_terminal": 1813.3333333333333,
+  "systems_per_superblock_from_heads": 491571.2,
+  "plan_assumption": 400,
+  "per_tile": [
+    {
+      "tile": "-11_-6",
+      "bake_ver": 28,
+      "basins_total": 958,
+      "basins_terminal": 5,
+      "by_kind": {
+        "lake_overflowing": 953,
+        "dry_playa": 2,
+        "lake_terminal": 3
+      },
+      "heads": 24096,
+      "net_px": {
+        "14": 2318316,
+        "16": 1258664,
+        "18": 628816,
+        "20": 249261
+      },
+      "net_km": {
+        "14": 4346.8425,
+        "16": 2359.995,
+        "18": 1179.03,
+        "20": 467.364375
+      },
+      "spanning": 25
+    },
+    {
+      "tile": "-15_-7",
+      "bake_ver": 28,
+      "basins_total": 328,
+      "basins_terminal": 328,
+      "by_kind": {
+        "seasonal": 327,
+        "lake_terminal": 1
+      },
+      "heads": 1,
+      "net_px": {
+        "14": 2345303,
+        "16": 1156846,
+        "18": 478216,
+        "20": 149282
+      },
+      "net_km": {
+        "14": 4397.443125,
+        "16": 2169.08625,
+        "18": 896.655,
+        "20": 279.90375
+      },
+      "spanning": 13
+    },
+    {
+      "tile": "-3_-4",
+      "bake_ver": 28,
+      "basins_total": 241,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 241
+      },
+      "heads": 36450,
+      "net_px": {
+        "14": 1737832,
+        "16": 916830,
+        "18": 469414,
+        "20": 217914
+      },
+      "net_km": {
+        "14": 3258.435,
+        "16": 1719.05625,
+        "18": 880.15125,
+        "20": 408.58875
+      },
+      "spanning": 3
+    },
+    {
+      "tile": "-3_-5",
+      "bake_ver": 28,
+      "basins_total": 404,
+      "basins_terminal": 8,
+      "by_kind": {
+        "lake_overflowing": 396,
+        "lake_terminal": 5,
+        "dry_playa": 3
+      },
+      "heads": 30293,
+      "net_px": {
+        "14": 1573769,
+        "16": 741581,
+        "18": 365879,
+        "20": 185201
+      },
+      "net_km": {
+        "14": 2950.816875,
+        "16": 1390.464375,
+        "18": 686.023125,
+        "20": 347.251875
+      },
+      "spanning": 10
+    },
+    {
+      "tile": "-4_-4",
+      "bake_ver": 28,
+      "basins_total": 165,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 165
+      },
+      "heads": 57157,
+      "net_px": {
+        "14": 1478981,
+        "16": 667150,
+        "18": 292483,
+        "20": 109737
+      },
+      "net_km": {
+        "14": 2773.089375,
+        "16": 1250.90625,
+        "18": 548.405625,
+        "20": 205.756875
+      },
+      "spanning": 7
+    },
+    {
+      "tile": "-4_-5",
+      "bake_ver": 28,
+      "basins_total": 581,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 581
+      },
+      "heads": 41079,
+      "net_px": {
+        "14": 1704760,
+        "16": 834377,
+        "18": 408782,
+        "20": 177293
+      },
+      "net_km": {
+        "14": 3196.425,
+        "16": 1564.456875,
+        "18": 766.46625,
+        "20": 332.424375
+      },
+      "spanning": 10
+    },
+    {
+      "tile": "-5_-11",
+      "bake_ver": 28,
+      "basins_total": 907,
+      "basins_terminal": 309,
+      "by_kind": {
+        "lake_overflowing": 598,
+        "lake_terminal": 120,
+        "dry_playa": 1,
+        "seasonal": 188
+      },
+      "heads": 11491,
+      "net_px": {
+        "14": 1493073,
+        "16": 743772,
+        "18": 331667,
+        "20": 122093
+      },
+      "net_km": {
+        "14": 2799.511875,
+        "16": 1394.5725,
+        "18": 621.875625,
+        "20": 228.924375
+      },
+      "spanning": 41
+    },
+    {
+      "tile": "-5_-4",
+      "bake_ver": 28,
+      "basins_total": 260,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 260
+      },
+      "heads": 48144,
+      "net_px": {
+        "14": 1652536,
+        "16": 789198,
+        "18": 358872,
+        "20": 156959
+      },
+      "net_km": {
+        "14": 3098.505,
+        "16": 1479.74625,
+        "18": 672.885,
+        "20": 294.298125
+      },
+      "spanning": 7
+    },
+    {
+      "tile": "-5_-5",
+      "bake_ver": 28,
+      "basins_total": 401,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 401
+      },
+      "heads": 86129,
+      "net_px": {
+        "14": 3081581,
+        "16": 1515049,
+        "18": 623449,
+        "20": 185203
+      },
+      "net_km": {
+        "14": 5777.964375,
+        "16": 2840.716875,
+        "18": 1168.966875,
+        "20": 347.255625
+      },
+      "spanning": 6
+    },
+    {
+      "tile": "-5_-7",
+      "bake_ver": 28,
+      "basins_total": 1247,
+      "basins_terminal": 0,
+      "by_kind": {
+        "lake_overflowing": 1247
+      },
+      "heads": 50666,
+      "net_px": {
+        "14": 2698313,
+        "16": 1158092,
+        "18": 399065,
+        "20": 100733
+      },
+      "net_km": {
+        "14": 5059.336875,
+        "16": 2171.4225,
+        "18": 748.246875,
+        "20": 188.874375
+      },
+      "spanning": 27
+    },
+    {
+      "tile": "-6_-11",
+      "bake_ver": 28,
+      "basins_total": 530,
+      "basins_terminal": 18,
+      "by_kind": {
+        "lake_overflowing": 512,
+        "dry_playa": 8,
+        "lake_terminal": 10
+      },
+      "heads": 20304,
+      "net_px": {
+        "14": 1361304,
+        "16": 658477,
+        "18": 309575,
+        "20": 118784
+      },
+      "net_km": {
+        "14": 2552.445,
+        "16": 1234.644375,
+        "18": 580.453125,
+        "20": 222.72
+      },
+      "spanning": 18
+    },
+    {
+      "tile": "-7_-12",
+      "bake_ver": 28,
+      "basins_total": 1841,
+      "basins_terminal": 75,
+      "by_kind": {
+        "lake_overflowing": 1766,
+        "lake_terminal": 51,
+        "dry_playa": 24
+      },
+      "heads": 29313,
+      "net_px": {
+        "14": 2101931,
+        "16": 1056988,
+        "18": 481522,
+        "20": 188266
+      },
+      "net_km": {
+        "14": 3941.120625,
+        "16": 1981.8525,
+        "18": 902.85375,
+        "20": 352.99875
+      },
+      "spanning": 25
+    },
+    {
+      "tile": "-7_-5",
+      "bake_ver": 28,
+      "basins_total": 755,
+      "basins_terminal": 629,
+      "by_kind": {
+        "lake_terminal": 156,
+        "seasonal": 473,
+        "lake_overflowing": 126
+      },
+      "heads": 2319,
+      "net_px": {
+        "14": 2480023,
+        "16": 1253218,
+        "18": 576117,
+        "20": 209696
+      },
+      "net_km": {
+        "14": 4650.043125,
+        "16": 2349.78375,
+        "18": 1080.219375,
+        "20": 393.18
+      },
+      "spanning": 23
+    },
+    {
+      "tile": "-7_-7",
+      "bake_ver": 28,
+      "basins_total": 423,
+      "basins_terminal": 296,
+      "by_kind": {
+        "seasonal": 124,
+        "lake_terminal": 172,
+        "lake_overflowing": 127
+      },
+      "heads": 899,
+      "net_px": {
+        "14": 2366561,
+        "16": 931086,
+        "18": 287850,
+        "20": 90518
+      },
+      "net_km": {
+        "14": 4437.301875,
+        "16": 1745.78625,
+        "18": 539.71875,
+        "20": 169.72125
+      },
+      "spanning": 12
+    },
+    {
+      "tile": "-8_-11",
+      "bake_ver": 28,
+      "basins_total": 539,
+      "basins_terminal": 32,
+      "by_kind": {
+        "lake_overflowing": 507,
+        "lake_terminal": 25,
+        "dry_playa": 7
+      },
+      "heads": 22507,
+      "net_px": {
+        "14": 1889895,
+        "16": 766039,
+        "18": 319437,
+        "20": 131127
+      },
+      "net_km": {
+        "14": 3543.553125,
+        "16": 1436.323125,
+        "18": 598.944375,
+        "20": 245.863125
+      },
+      "spanning": 3
+    }
+  ],
+  "failed": []
+}

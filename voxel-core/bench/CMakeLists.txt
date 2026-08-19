@@ -307,3 +307,14 @@ endif()
 # architecture pass requires before it is tuned.
 add_executable(vxc_assetprobe assetprobe.cpp)
 target_link_libraries(vxc_assetprobe PRIVATE voxelcore)
+
+# --- vxc_caveprobe: the interval-band falsification test. Per-footprint air
+# spans over the SHIPPED materialAt, and admitted level-0 chunks per band
+# capacity, so "is an interval band worth building" is a measurement rather
+# than an argument. See the file header for the bar and for what it refuses to
+# measure.
+add_executable(vxc_caveprobe caveprobe.cpp)
+target_link_libraries(vxc_caveprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_caveprobe PRIVATE -Wall -Wextra -Werror)
+endif()
