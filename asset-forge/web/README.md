@@ -65,13 +65,19 @@ the seed dialog offers **Set placement**, which jumps straight to stage 4 with
 the species already open. The workflow strip across the top of the Forge shows
 all four stages; stage 4 is a live link whenever the species has a spec file.
 
-**Stage 4 -- Library & placement tab.** The whole species ledger, filterable
+**Stage 4 -- Asset Library tab.** The whole species ledger, filterable
 by kind, biome (including "unassigned"), curation verdict and text search.
 The selected species shows:
 
-- *Kept variants*: thumbnails, the 3D viewer, downloads (.vox/.vxa/spec),
+- *Kept variants*: every card opens the INSPECTOR -- a full-dialog 3D view
+  with visible zoom/reset controls, seed switching that keeps the camera (so
+  a species' kept seeds are compared from one viewpoint), and the judging
+  numbers: voxel count, bounding box in metres, voxel pitch, height,
+  materials used, seed, spec hash, the curation verdict, and which
+  biomes/weights/rules the species places under. Downloads (.vox/.vxa/spec),
   delete, and "More like this" -- which reopens the entry's exact spec in the
-  Forge at a fresh seed block (the loop back to stage 1).
+  Forge at a fresh seed block (the loop back to stage 1) -- live there too.
+  The ledger's verdict filter defaults to Approved: the exporting set.
 - *Publish verdict*: approve / reject / draft, per-seed toggles, notes.
   Writes `/api/curation`; only the curation block of the raw spec file moves.
   "Unreviewed" species export under the grandfather clause and say so.
