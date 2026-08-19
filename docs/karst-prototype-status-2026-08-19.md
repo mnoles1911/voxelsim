@@ -122,10 +122,55 @@ Two causes identified, one fixed:
   retracted one 100× decode error (`bb83002`); same trap, different field.
 * **`HeadEntry.px` is the (x, y) pair**, not an x.
 
+## Playability: measured against the engine's own player
+
+`karst_playability.py`. The player numbers are read out of
+`VoxelMovementTuning.h`, not guessed: a **box 0.6 m wide x 1.8 m tall** (1.2 m
+crouched), **step-up 0.3 m**, jump ~1.25 m. That is almost exactly Minecraft's
+player (0.6 x 1.8, 0.5 m step), so Minecraft's cave design rules transfer nearly
+unchanged, and the two numbers that decide a passage are the same two in both:
+**headroom and floor step**.
+
+Classes are set by gradient against the step-up: **walk** <= 0.5 (0.3 m rise per
+0.6 m of travel), **scramble** <= 2.0 (needs jumps), **shaft** above that.
+
+| | value |
+|---|---|
+| walk / scramble / shaft, by length | **56.6% / 36.3% / 7.1%** |
+| headroom | min 6.0 m, mean 7.4 m |
+| walkable floor width | min 2.68 m, mean 3.30 m |
+| surface entrances | 735 |
+| **reachable on foot from an entrance** | **22.7% walking, 92.1% with jumps** |
+
+**92.1% reachable with jumps is the headline: the network is explorable, not
+scenery.** The walk/scramble/shaft mix is close to what a Minecraft cave feels
+like, and 7% shafts is enough vertical drama to matter without isolating the
+system.
+
+**One finding that follows from the 5x directive and is worth reconsidering.**
+Minimum headroom is **6 m** and minimum walkable floor is **2.7 m** — every
+passage in the world is a hall. There are no crawls, no squeezes, no tight
+connectors, because a uniform 5x scale removes the small end of the
+distribution entirely. Tight passages are a large part of what makes caves read
+as caves in Minecraft, and "one characteristic scale per feature class" is
+exactly the complaint that got the old system rejected
+(`docs/underground-system-plan.md`, the six tells). The fix is not to abandon 5x
+— it is to make the radius distribution WIDE rather than shifted: keep the halls
+at 5x and let a real fraction of passages stay at 1-2x so a player has to crouch
+and squeeze between them. That is an owner decision, not a tuning one, because
+it partly walks back the "uniformly generous" answer.
+
+*Caveat on the radii:* they are currently sized from node degree as a stand-in
+for discharge (r ~ Q^0.4 is the physical rule). The prototype does not carry Q
+yet, so the radius VARIATION is not yet physical — only its range is.
+
 ## Next, in order
 
 1. **Owner looks at the map and sections** in `docs/images/karst/` and says
    whether the shape reads. Density is in band; shape is his call.
+1b. **Owner decides the radius DISTRIBUTION** — uniform 5x (no crawls, current)
+   vs. wide (halls at 5x, a real fraction of squeezes at 1-2x). See the
+   playability section.
 2. **Hierarchical amplification.** The current step connects each dead-end to
    the nearest skeleton node, which makes spidery hubs. Real caves branch
    hierarchically — a tributary joins a trunk, not a star centre. Weighting the
