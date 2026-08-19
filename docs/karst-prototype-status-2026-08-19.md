@@ -164,8 +164,54 @@ it partly walks back the "uniformly generous" answer.
 for discharge (r ~ Q^0.4 is the physical rule). The prototype does not carry Q
 yet, so the radius VARIATION is not yet physical — only its range is.
 
+## OWNER VERDICT, 2026-08-19: "the tunnel tubes look very perfect, straight, and not natural"
+
+Correct, and now measured. **Tortuosity (path length / straight-line distance)
+is mean 1.142, median 1.073, and 45.6% of chains are essentially straight
+(<1.05). Surveyed karst conduits run about 1.3-2.0; a straight line is 1.0.**
+`docs/images/karst/centreline-wander.png` shows it directly: straight spokes
+radiating from a hub.
+
+**This reproduces tell #3 of the six that got the OLD system rejected** --
+"straight constant-radius capsules, one hash draw per edge". A Dijkstra graph of
+capsules ships the same artefact as a hash lattice of capsules, with better
+provenance. That was named as the killer risk in the plan and it has now
+happened.
+
+**Where the straightness actually comes from, and it is not the renderer.**
+
+1. Voxel-level detail was the first thing I tried and it is NOT the fix.
+   Midpoint subdivision with noise displacement, radius variation along the
+   conduit and wall roughness all landed (`karst_voxel.py`), and they make the
+   walls irregular and the width vary -- but the centreline stays straight. That
+   is cosmetic jitter on an unchanged path.
+2. **Every term in the edge cost is multiplied by segment length.** So the total
+   is essentially `k x length` with `k` varying slowly, and the cheapest path is
+   simply the SHORTEST one: Dijkstra returns a straight line by construction.
+   Tested rather than argued -- dropping `w_dist` 1.0 -> 0.15 and sharpening the
+   horizon term to a narrow band (`w_horizon` 400, exponent 3) moved passage
+   density only 1.168 -> 1.249, i.e. the geological terms barely influence the
+   route at all.
+3. **Node spacing cannot express the meander.** At 120 m spacing a 400 m
+   conduit is three nodes. A 30 m wiggle has nowhere to live.
+
+**The fix, in the order it should be tried** (none of it done yet):
+
+* Make the geological cost vary *per unit length* far more sharply than it does,
+  so following a horizon or a joint is genuinely cheaper than going straight.
+  The horizon term wants to be a narrow band, not a smooth ramp.
+* Node spacing down to ~30-40 m so a route has somewhere to bend, accepting the
+  Dijkstra cost (it is milliseconds today).
+* Only then noise displacement, as a finish rather than as the mechanism.
+
+**Acceptance target, stated before the attempt: mean tortuosity >= 1.3 with
+under 10% of chains below 1.05.** That is a number the next attempt can be
+measured against instead of another round of looking.
+
 ## Next, in order
 
+0. **Fix the straightness** (above). It is the blocking defect and it has an
+   acceptance number.
 1. **Owner looks at the map and sections** in `docs/images/karst/` and says
    whether the shape reads. Density is in band; shape is his call.
 1b. **Owner decides the radius DISTRIBUTION** — uniform 5x (no crawls, current)

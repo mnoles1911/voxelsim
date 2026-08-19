@@ -57,6 +57,7 @@ W_HORIZON = 60.0
 W_PERM = 30.0
 W_FRACTURE = 15.0
 W_VADOSE = 40.0
+HORIZON_SHARP = 1.0
 BIG = 1.0e7
 
 #: Vertical sampling band, relative to the water table. Conduits form in a band
@@ -192,8 +193,14 @@ def edge_costs(nodes, idx_a, idx_b, elev, head, incept, coher, theta, log2acc):
     cost = W_DIST * length
 
     # Horizon proximity: cheap ON a horizon, expensive off it.
-    horiz = np.abs(incept[my, mx])
-    cost += W_HORIZON * np.clip(horiz, 0.0, 1.0) * length / GRID_M
+    # EVERY TERM HERE IS MULTIPLIED BY LENGTH, which is the whole problem: if
+    # the per-unit-length rate barely varies between neighbouring routes, the
+    # cheapest path is simply the SHORTEST one and Dijkstra returns a straight
+    # line. `horizon_sharp` > 1 turns the horizon term into a narrow band, so
+    # being ON a horizon is dramatically cheaper than being near one and the
+    # route has a reason to bend.
+    horiz = np.clip(np.abs(incept[my, mx]), 0.0, 1.0) ** HORIZON_SHARP
+    cost += W_HORIZON * horiz * length / GRID_M
 
     # Permeability: high flow accumulation marks stress-relief fracturing and
     # concentrated recharge, so it is CHEAP.
@@ -327,7 +334,7 @@ def main() -> int:
     # the same trap docs/backlog.md section 0.6 already records for
     # GPUCullMergeGap and GPUCullMaxRanges. The `global` has to be declared
     # before argparse reads these names for its defaults.
-    global NODE_SPACING_M, NEIGHBOURS
+    global NODE_SPACING_M, NEIGHBOURS, W_DIST, W_HORIZON, HORIZON_SHARP
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -337,6 +344,10 @@ def main() -> int:
     ap.add_argument("--node-spacing-m", type=float, default=NODE_SPACING_M,
                     help="corridor sample spacing; sweep TOGETHER with --gamma")
     ap.add_argument("--neighbours", type=int, default=NEIGHBOURS)
+    ap.add_argument("--w-dist", type=float, default=W_DIST)
+    ap.add_argument("--w-horizon", type=float, default=W_HORIZON)
+    ap.add_argument("--horizon-sharp", type=float, default=1.0,
+                    help="exponent on the horizon term; >1 makes it a narrow band")
     ap.add_argument("--deadends", type=int, default=0,
                     help="amplification key points per system (paper's Amplify)")
     ap.add_argument("--spring-sep-m", type=float, default=1500.0,
@@ -345,6 +356,9 @@ def main() -> int:
     args = ap.parse_args()
     out = args.out or args.fields.parent
 
+    W_DIST = args.w_dist
+    W_HORIZON = args.w_horizon
+    HORIZON_SHARP = args.horizon_sharp
     NODE_SPACING_M = args.node_spacing_m
     NEIGHBOURS = args.neighbours
 
