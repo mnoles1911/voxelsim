@@ -47,6 +47,11 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
 from scipy.spatial import cKDTree
 
+import sys as _sys, pathlib as _pl
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent))
+from karst_prototype import inception_at  # noqa: E402  -- ONE horizon field, not two
+from karst_voxel import subdivide          # noqa: E402  -- ONE subdivision, not two
+
 GRID_M = 30.0
 EXAGGERATION = 5.0
 
@@ -58,6 +63,8 @@ W_PERM = 30.0
 W_FRACTURE = 15.0
 W_VADOSE = 40.0
 HORIZON_SHARP = 1.0
+FOLD = None
+SEED = 0
 BIG = 1.0e7
 
 #: Vertical sampling band, relative to the water table. Conduits form in a band
@@ -199,7 +206,12 @@ def edge_costs(nodes, idx_a, idx_b, elev, head, incept, coher, theta, log2acc):
     # line. `horizon_sharp` > 1 turns the horizon term into a narrow band, so
     # being ON a horizon is dramatically cheaper than being near one and the
     # route has a reason to bend.
-    horiz = np.clip(np.abs(incept[my, mx]), 0.0, 1.0) ** HORIZON_SHARP
+    # HORIZONS ARE EVALUATED IN 3D, AT THE EDGE'S OWN z. The previous version
+    # indexed a 2D array of the stratigraphic field sampled at the SURFACE, so
+    # a conduit at 1,900 m and one at 2,100 m in the same column got identical
+    # horizon cost -- the term carried no depth information and could not make
+    # a route follow a bedding plane. That is why conduits came out straight.
+    horiz = np.clip(np.abs(inception_at(mz, FOLD[my, mx], SEED)), 0.0, 1.0) ** HORIZON_SHARP
     cost += W_HORIZON * horiz * length / GRID_M
 
     # Permeability: high flow accumulation marks stress-relief fracturing and
@@ -334,7 +346,7 @@ def main() -> int:
     # the same trap docs/backlog.md section 0.6 already records for
     # GPUCullMergeGap and GPUCullMaxRanges. The `global` has to be declared
     # before argparse reads these names for its defaults.
-    global NODE_SPACING_M, NEIGHBOURS, W_DIST, W_HORIZON, HORIZON_SHARP
+    global NODE_SPACING_M, NEIGHBOURS, W_DIST, W_HORIZON, HORIZON_SHARP, FOLD, SEED
 
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,6 +360,12 @@ def main() -> int:
     ap.add_argument("--w-horizon", type=float, default=W_HORIZON)
     ap.add_argument("--horizon-sharp", type=float, default=1.0,
                     help="exponent on the horizon term; >1 makes it a narrow band")
+    ap.add_argument("--piece-m", type=float, default=8.0,
+                    help="subdivision length for the sinuosity pass")
+    ap.add_argument("--wander-z", type=float, default=0.15,
+                    help="vertical share of the wander; see subdivide()'s note")
+    ap.add_argument("--wander", type=float, default=0.0,
+                    help="centreline displacement in piece lengths; 0 = straight")
     ap.add_argument("--deadends", type=int, default=0,
                     help="amplification key points per system (paper's Amplify)")
     ap.add_argument("--spring-sep-m", type=float, default=1500.0,
@@ -368,6 +386,10 @@ def main() -> int:
     incept, coher, theta = f["incept"], f["coher"], f["theta"]
     log2acc = f["log2acc"]
     sinks, springs = f["sinks"], f["springs"]
+    FOLD = f["fold_m"] if "fold_m" in f else np.zeros_like(elev)
+    SEED = int(f["seed_used"]) if "seed_used" in f else 20260719
+    if "fold_m" not in f:
+        print("  WARNING: fields file predates fold_m; horizons will be FLAT in z")
     rng = np.random.default_rng(12345)
 
     n_raw = len(springs)
@@ -411,10 +433,77 @@ def main() -> int:
             my = int(np.clip((a[1] + b[1]) * 0.5 / GRID_M, 0, elev.shape[0] - 1))
             depths.append(float(elev[my, mx] - (a[2] + b[2]) * 0.5))
 
+    # --- SINUOSITY, applied to the NETWORK rather than only at render time.
+    #
+    # Shortest-path over a smooth cost field is near-straight as a matter of
+    # mathematics, so no weighting of the geological terms will produce a
+    # meander -- swept, and it does not (mean tortuosity moved 1.08 -> 1.16
+    # across a 3x3 of spacing and weights). Real conduit sinuosity at the 10-50 m
+    # scale does not come from optimising a smooth field either; it comes from
+    # following discrete fractures and irregular dissolution. So it is ADDED,
+    # which is what the reference method's midpoint subdivision does and what
+    # Minecraft's noise carving does.
+    #
+    # It belongs HERE and not in the voxeliser: the skeleton is what gets baked,
+    # measured and shipped, and a sinuosity that exists only in a preview is a
+    # sinuosity the game never sees.
+    if args.wander > 0 and all_segments:
+        segs_in = np.asarray([[a, b] for a, b in all_segments], float)
+        all_segments = [(a.tolist(), b.tolist())
+                        for a, b in subdivide(segs_in, args.piece_m, args.wander,
+                                              z_scale=args.wander_z)]
+        lengths = [float(np.linalg.norm(np.asarray(b) - np.asarray(a)))
+                   for a, b in all_segments]
+
     total_km = sum(lengths) / 1000.0
+
+    # --- TORTUOSITY: the metric the owner's eye caught and mine did not have.
+    # Path length divided by straight-line distance, over maximal chains through
+    # degree-2 nodes. Surveyed karst runs about 1.3-2.0; a straight line is 1.0.
+    # Measured here rather than in a side script so every run reports it.
+    def tortuosity(segments):
+        if not segments:
+            return {}
+        key = lambda p: (round(float(p[0]), 1), round(float(p[1]), 1), round(float(p[2]), 1))
+        adj = collections.defaultdict(list)
+        for a, b in segments:
+            adj[key(a)].append(key(b)); adj[key(b)].append(key(a))
+        seen, tort = set(), []
+        for start in adj:
+            if len(adj[start]) == 2:
+                continue
+            for nb in adj[start]:
+                if (start, nb) in seen:
+                    continue
+                path, prev, cur = [start], start, nb
+                while True:
+                    path.append(cur)
+                    seen.add((prev, cur)); seen.add((cur, prev))
+                    if len(adj[cur]) != 2:
+                        break
+                    nxt = [n for n in adj[cur] if n != prev]
+                    if not nxt:
+                        break
+                    prev, cur = cur, nxt[0]
+                P = np.asarray(path, float)
+                if len(P) < 2:
+                    continue
+                L = float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum())
+                C = float(np.linalg.norm(P[-1] - P[0]))
+                if C > 30.0:
+                    tort.append(L / C)
+        if not tort:
+            return {}
+        a = np.asarray(tort)
+        return {"chains": len(a), "mean": round(float(a.mean()), 3),
+                "p50": round(float(np.percentile(a, 50)), 3),
+                "p90": round(float(np.percentile(a, 90)), 3),
+                "straight_frac": round(float((a < 1.05).mean()), 3)}
     area_km2 = (elev.shape[0] * GRID_M / 1000.0) * (elev.shape[1] * GRID_M / 1000.0)
     stats = {
         "gamma": args.gamma, "deadends": args.deadends,
+        "wander": args.wander, "piece_m": args.piece_m,
+        "wander_z": args.wander_z,
         "node_spacing_m": NODE_SPACING_M, "neighbours": NEIGHBOURS,
         "spring_sep_m": args.spring_sep_m,
         "systems_total": len(systems), "systems_routed": routed,
@@ -430,6 +519,7 @@ def main() -> int:
             "p90": round(float(np.percentile(depths, 90)), 1) if depths else None,
             "max": round(float(np.max(depths)), 1) if depths else None,
         },
+        "tortuosity": tortuosity(all_segments),
         "seconds": round(time.time() - t0, 1),
     }
     print(json.dumps(stats, indent=2))

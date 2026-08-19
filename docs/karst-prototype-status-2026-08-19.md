@@ -208,10 +208,66 @@ happened.
 under 10% of chains below 1.05.** That is a number the next attempt can be
 measured against instead of another round of looking.
 
+## FIXED: tortuosity 1.14 -> 1.30, straight chains 45.6% -> 0.4%
+
+**Acceptance target met** (mean >= 1.3, straight < 10%). Settings:
+`--node-spacing-m 80 --gamma 1.05 --deadends 20 --wander 3.0 --piece-m 5
+--wander-z 0.10`. Density 2.04 km/km^2, still inside the 5x band.
+`docs/images/karst/centreline-fixed.png`.
+
+**Three things were wrong, and only the third one mattered.**
+
+1. **Horizons were 2D.** `incept` was the stratigraphic field sampled at the
+   SURFACE and stored as a 2D array, then indexed by `[my, mx]` regardless of
+   the node's z -- so a conduit at 1,900 m and one at 2,100 m in the same column
+   got identical horizon cost. The term carried no depth information and could
+   not make a route follow a bedding plane. Fixed (`inception_at`, evaluated in
+   3D at the edge's own z, one field shared by both stages). **It changed
+   almost nothing on its own: 1.098 mean, 67.7% straight.** Worth fixing because
+   it was simply wrong, not because it was the cause.
+2. **The cost weights cannot bend a route, and this is mathematics rather than
+   tuning.** Every term is multiplied by segment length, so the total is
+   `k x length` with `k` varying slowly, and shortest-path over a smooth cost
+   field is near-straight. Swept 3x3 over spacing and weights: mean tortuosity
+   moved 1.082 -> 1.156, nowhere near 1.3. **Stop trying to weight your way to
+   sinuosity.**
+3. **Sinuosity has to be ADDED, not optimised for** -- which is what the
+   reference method's midpoint subdivision does and what Minecraft's noise
+   carving does. I had implemented it in the VOXELISER only, and judged it by
+   eye at 900 m zoom where a 6 m meander is invisible. Moved into the network
+   stage, where the skeleton that actually gets baked and shipped lives, and
+   measured instead of eyeballed.
+
+**The trade it forces, measured: sinuosity costs walkability.**
+
+| wander_z | tortuosity | straight | walk-reachable | with jumps |
+|---|---|---|---|---|
+| 0.05 | 1.304 | 0.4% | 13.2% | 55.8% |
+| **0.10** | **1.30** | **0.4%** | **12.0%** | **~55%** |
+| 0.30 | 1.314 | 0.3% | 9.7% | 50.0% |
+| 0.60 | 1.343 | 0.2% | 7.0% | 37.6% |
+
+Vertical displacement is not a taste parameter. At 0.6 it puts a several-metre
+rise and fall into every 5 m piece, which is a rollercoaster, not a cave. Real
+passages meander in PLAN far more than they undulate in PROFILE, because a
+phreatic tube follows the water table and a vadose canyon follows the hydraulic
+gradient, and both are smooth in z.
+
+**AND IT FORCES A CORRECTION TO AN EARLIER NUMBER.** The 92.1% foot-reachable
+figure reported before was an artefact of coarse segments: gradient averaged
+over 217 m hides local steepness the player actually walks into. At a realistic
+5 m piece length the honest figure is **~55%**. The earlier number was measured
+correctly and meant less than it looked like -- the same averaging trap
+`voxelsim-terracing-measure-plateau-area` already records.
+
+**One cost to carry into the format design:** subdivision takes the skeleton
+from 2,880 to 80,820 segments, ~28x. The `.vxkn` budget in the plan (~280 KB per
+tile) was sized on unsubdivided nodes and needs re-deriving -- or the wander
+needs to be applied at read time from a seed rather than stored, which is the
+cheaper answer and worth designing for.
+
 ## Next, in order
 
-0. **Fix the straightness** (above). It is the blocking defect and it has an
-   acceptance number.
 1. **Owner looks at the map and sections** in `docs/images/karst/` and says
    whether the shape reads. Density is in band; shape is his call.
 1b. **Owner decides the radius DISTRIBUTION** — uniform 5x (no crawls, current)

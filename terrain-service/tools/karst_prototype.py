@@ -175,10 +175,34 @@ def _value_noise_1d(x: np.ndarray, seed: int, wavelength: float) -> np.ndarray:
     return a * (1.0 - s) + b * s
 
 
+#: Horizon constants, module-level so the network stage evaluates the SAME
+#: field rather than growing a second copy of it.
+HORIZON_WAVELENGTH_M = 36.0 * EXAGGERATION
+HORIZON_FOLD_AMP_M = 12.0 * EXAGGERATION
+HORIZON_FOLD_WAVELENGTH_M = 300.0
+
+
+def inception_fold(x_m, y_m, seed: int):
+    """The fold that displaces the stratigraphic datum. Split out because the
+    network stage needs to evaluate horizons at a NODE'S OWN z, and a 2D array
+    of the field sampled at the surface cannot answer that -- which is exactly
+    the bug that made conduits straight: the horizon term carried no depth
+    information, so it could not make a route follow a bedding plane."""
+    return (HORIZON_FOLD_AMP_M * _value_noise_1d(x_m, seed ^ 0x11, HORIZON_FOLD_WAVELENGTH_M)
+            + HORIZON_FOLD_AMP_M * _value_noise_1d(y_m, seed ^ 0x22,
+                                                   HORIZON_FOLD_WAVELENGTH_M * 0.61))
+
+
+def inception_at(z_m, fold, seed: int):
+    """Signed stratigraphic field at an arbitrary z. Zero crossings are the
+    horizons; descending crossings are strong-over-weak contacts."""
+    return _value_noise_1d(z_m + fold, seed ^ 0x33, HORIZON_WAVELENGTH_M)
+
+
 def inception_field(z_m: np.ndarray, x_m: np.ndarray, y_m: np.ndarray, seed: int,
-                    wavelength_m: float = 36.0 * EXAGGERATION,
-                    fold_amp_m: float = 12.0 * EXAGGERATION,
-                    fold_wavelength_m: float = 300.0) -> np.ndarray:
+                    wavelength_m: float = HORIZON_WAVELENGTH_M,
+                    fold_amp_m: float = HORIZON_FOLD_AMP_M,
+                    fold_wavelength_m: float = HORIZON_FOLD_WAVELENGTH_M) -> np.ndarray:
     """The stratigraphic field. Horizons are its DESCENDING zero crossings.
 
     Same construction as `repose_field`'s strata term: 1-D noise over elevation
@@ -364,7 +388,10 @@ def main() -> int:
         "seconds": round(time.time() - t0, 2),
     }
     (args.out / f"{f['tile']}-fields.json").write_text(json.dumps(stats, indent=2))
+    fold = inception_fold(X, Y, seed)
     np.savez_compressed(args.out / f"{f['tile']}-fields.npz",
+                        fold_m=fold.astype(np.float32),
+                        seed_used=np.int64(seed),
                         elev_m=f["elev_m"].astype(np.float32),
                         head_m=head.astype(np.float32),
                         incept=incept_surface.astype(np.float32),
