@@ -406,7 +406,13 @@ namespace vxc {
 // (d6357c3b035c8c22 with old code + VXM1 and new code + neutral VXM2). The
 // REAL per-biome densities then land as their own commit so the tuning diff
 // is exactly the tuning -- both steps inside this one version bump, because
-// no world shipped against the interim neutral manifest.
+// no world shipped against the interim neutral manifest. With the tuned
+// table (rules/biome-density.json) the composed-asset digest moves
+// d6357c3b035c8c22 -> 48b159faa28a5e84 (the ran-flag), terrain-only stays
+// ad9c4c2a100b5a28, and the census delivers the directive's contrast:
+// savanna 143 -> 25 trees/ha with its grass untouched at ~3,200/ha, while
+// taiga keeps 279 trees/ha -- cross-biome tree spread 5x -> 15.5x, grass
+// 2.1x -> 10x (per-site tables in the tuning commit).
 inline constexpr uint32_t kWorldGenVersion = 28;
 
 inline constexpr int32_t kVoxelSizeMm = 100; // 10 cm voxels
