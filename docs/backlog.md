@@ -1267,3 +1267,135 @@ If the surface still reads as too fast with a frozen wind, the fault is not ther
 and the next suspect is `WindPatchDriftFrac` (0.5, so the calm/choppy patch field
 sweeps at half the wind speed -- 2.5 m/s at the 5 m/s default, which crosses a
 50 m view in twenty seconds).
+
+---
+
+## 10. ASSET PLACEMENT + ASSET FORGE — after the 2026-08-17/19 programme (merged, `aab8f54`)
+
+54 commits. What landed is in the merge message and `docs/status.md`; this is
+only what did **not**. Grouped, as this file is, by whose call each one needs.
+
+### 10a. Needs the owner, not engineering
+
+**CURATION HAS NEVER BEEN EXERCISED.** 828 species, all `approved` by the
+grandfather clause, **zero human verdicts**. The gate ships (`354339b`), the UI
+ships (Asset Library tab: approve/reject/draft plus per-seed toggles), and
+`tools/library.py` reports the split. Nothing else can substitute — only the
+owner can say which of a species' four baked seeds are worth placing. Best done
+now that the 3D inspector shows an asset beside its placement contract.
+*Cost: an evening of looking. Unblocks: a library that means something.*
+
+**RAINFOREST AND INLAND ROCKS ARE ROSTER GAPS, NOT DENSITY BUGS.** Rainforest
+carries 4 weighted tree species and measured 53.7 trees/ha — below grassland.
+Inland rocks sit at 1.5–5/ha against the beach's 132. Per-biome density
+deliberately did NOT touch either (`003b136`): they are starved, not saturated,
+and thinning a starved biome makes it worse. The fix is authoring — weight more
+species into those biomes, or generate them.
+
+**TERRAIN DRAMA — HELD BY OWNER DECISION.** `docs/terrain-relief-measurements.md`
+(`77aef42`) measured this world's 2 km wall score at **1,964 m max** (Milford
+Sound is 1,683) and 10 km relief at 5,610 m — the amplitude ceiling is already
+DEM-class. Two real gaps: **abundance** (world p99 10 km relief is 2,740 m
+against that 5,610 max; 6 of 289 tiles exceed a 1,500 m wall; exactly ONE
+sea-to-summit wall exists in the world) and **grammar** (slope p99 saturates at
+50–58 degrees in every region measured — the checkpoint's own ceiling, so no
+U-floors, no benches, no vertical faces). Levers can plausibly buy abundance;
+only regional DEM conditioning buys grammar. `docs/dem-reference-library.md`
+(`dcae423`) has 12 candidate regions with bboxes, licensing and three routes
+priced. Paused by the owner until placement judgement finishes.
+
+**BARE-ROCK-ONLY SPECIES NOW HAVE NO HOST.** v27 removed BARE_ROCK from dry land
+(owner's call); species weighted only for it can never place. Re-weight toward
+alpine/scree, or accept them as submarine-only.
+
+### 10b. Blocked on something else landing
+
+**VERIFICATION CAPTURES FOR THE LAST THREE LANDINGS.** All merged, none seen
+in-world: the 192M pool default (`036552f` — every capture that night needed
+`-VoxelPoolCapacityQuads`; the default should now carry the alpine vista's 173M
+unaided), adaptive detail budgets (`e30bb46` — grep `VoxelDetailAssets: CONVERGED`
+for time-to-first-full-ring against that night's 591–656 s, and the count of
+`Hitch frame` lines must not rise), and the v28 per-biome densities in a
+rendered frame rather than a census. Blocked only on the editor, which is free.
+
+**GPU COARSE BYTE-PARITY HARNESS — WRITTEN, NEVER RUN.** `04dbdfe` documents the
+exact procedure (CPU `FCoarseChunkGridSampler` plus `MeshChunkBricks` against
+`RunRegionBlocking`; compare cells in dispatch columns 7..40, then quads through
+`VoxelChunkQuadsIdentical`; levels 1–5, all four yaws). Byte parity is the
+acceptance bar for coarse GPU composition and is currently asserted, not measured.
+
+**PER-CLASS OVERLAYS ARE STALE.** `bake-out/biome-survey/` overlays predate the
+flower/reed bank bake (`37591e0`), so they under-draw every biome by the 14–38%
+that was invisible. Regenerate with `vxc_assetprobe --overlay <base>` then
+`asset-forge/tools/place_overlay.py`.
+
+### 10c. Cheap and self-contained
+
+**`voxel-capture.ps1` DEFAULTS `-FineProviderId` TO EMPTY.** That default is the
+fall-through that produced three fatal gate leaks in one night: the dir comes
+from the command line, the id falls through to the ini, and the cross-product
+has never existed on disk. `terrain-service/tools/resolve_fine_namespace.py`
+answers it (rc 2 = nothing baked, rc 3 = ambiguous);
+`docs/fine-tile-provider-identity.md` section 7 has the drop-in snippet. **Make
+the dir/id pair atomic**: refuse a run that supplies one without the other.
+
+**~35 GB OF STALE TILE NAMESPACES.** `D:/vox-wet-cache` and
+`D:/voxelsim/tile-cache` hold ~20 superseded bake namespaces at 0.3–2.2 GB each.
+Keep `...-b19d281fd` (bake_ver 28, current) and `...-bdcab4bed` (the previous
+pair). **Scan for junctions before any recursive delete** — this repo has the
+scar (`windows-junction-recursive-delete-hazard`).
+
+**THE BIOME MAP SHOULD COME FROM `vxc_climateprobe`, NOT A SECOND REPO'S WEB
+SERVICE.** `terrain-service/tools/world_map.py` needs the terrain-diffusion
+explorer running (torch, diffusers, rasterio, infinite-tensor — eight dependency
+clusters), produces a coarse *preview* whose percentages disagree sharply with
+the engine's own census, and duplicates classification by parsing `biome.h`.
+`vxc_climateprobe` already classifies every column through the engine's own
+classifier off baked tiles; a colour-keyed PNG mode there would be
+authoritative, service-free and unable to drift. Note the proper
+`terrain-service/tools/worldmaps/` set (heightmap, biomes+provinces,
+temperature, vista index) IS the standing deliverable and does work — it needs
+`D:/terrain-diffusion/.venv`, which its README documents.
+
+**FLOWER AND REED SPECIES NEED THEIR OWN CURATION PASS.** 477 banks were baked in
+one command after being invisible for their entire existence — nobody has ever
+looked at them.
+
+### 10d. Larger, worth scoping
+
+**COARSE-LEVEL GPU ASSET STAMPING IS PARTIAL.** The gather kernel ships and the
+fork serves coarse chunks, but a grid too tall for span packing (SizeZ > 4095)
+still falls back to the CPU, and `ValidateRegionRequest` refuses instances on any
+level it does not implement.
+
+**DETAIL ASSETS DO NOT REACT TO EDITS.** A dug-out column keeps its ground cover
+until the group leaves the 256 m ring and re-resolves. Terrain-lattice assets get
+this right through the overlay; cover accepting a staleness window is the v1
+trade, recorded in `docs/detail-asset-rendering.md`.
+
+**PER-BIOME WATER KIND IS CARRIED, NOT SERVED.** The schema accepts `water_kind`
+per rule (the owner's "must be near FRESH water" case), but the bake-28 distance
+plane is salinity-blind — it answers "how far to water", not "to what kind".
+Same precedent as `water_max` before bake-28: the gate exists the day the channel
+does.
+
+**ANIMALS.** 382 species (bird 127, fish 106, quadruped 131, cetacean 18) place
+correctly and are structurally excluded from rendering by owner decision — they
+need animation first. `assetdetail.h`'s group scatter (herds, shoals, flocks) is
+built and has no consumer. 251 of them still have no density source (the
+PanTHERIA work covered mammals; birds, fish and cetaceans were blocked on a
+web-search budget).
+
+### 10e. The recurring failure mode, fourth instance
+
+This programme lost the most hours to **an instrument measuring a world the
+engine was not running** — four separate times: a probe on synthetic climate; a
+veto reading an empty debug channel; the engine calling the old column binding in
+five places while the probe called the new one; and a stale `vxc_gpu.exe`
+reporting a *plausible* CPU/GPU divergence that was really 16-hour-old CPU code
+against a current shader. The countermeasures shipped — engine-bound counters
+with `--json`/`--compare`, trunk-anchor overlays, and `assetColumnChannelsAt`
+living on the world object so no composition path can opt out by omission — but
+the discipline is the fix: **`ls -la` the probe binary and `grep -c` the accessor
+on both sides before quoting any number.** See the appendix above and
+`voxelsim-instrument-must-run-the-engine-binding` in the session memory.
