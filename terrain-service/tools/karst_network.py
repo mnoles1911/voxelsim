@@ -63,6 +63,8 @@ W_PERM = 30.0
 W_FRACTURE = 15.0
 W_VADOSE = 40.0
 HORIZON_SHARP = 1.0
+#: How hard to discourage a second branch joining at the same node.
+ATTACH_PENALTY = 0.8
 FOLD = None
 SEED = 0
 BIG = 1.0e7
@@ -280,6 +282,7 @@ def build_system(nodes, elev, head, incept, coher, theta, log2acc,
     # So: pick extra nodes in the corridor and route each to the nearest node
     # ALREADY on the skeleton, which is what makes a branch a branch rather
     # than a second trunk.
+    attach = {}
     if deadends > 0 and paths:
         on_skeleton = sorted({n for p in paths for n in p})
         if len(on_skeleton) >= 2:
@@ -289,10 +292,19 @@ def build_system(nodes, elev, head, incept, coher, theta, log2acc,
                     continue
                 d2, pred2 = dijkstra(g, directed=False, indices=cand,
                                      return_predecessors=True)
-                reach = [(d2[t], t) for t in on_skeleton if np.isfinite(d2[t])]
+                # HIERARCHICAL, NOT NEAREST. Connecting every dead-end to the
+                # closest skeleton node piles them onto whichever node happens
+                # to be central, which is what produced the spidery hubs -- many
+                # short spokes meeting at one point, which is not how caves
+                # branch. Penalising a node that has already been attached to
+                # spreads the junctions ALONG the trunk, which is what a
+                # tributary actually does.
+                reach = [(d2[t] * (1.0 + ATTACH_PENALTY * attach.get(t, 0)), t)
+                         for t in on_skeleton if np.isfinite(d2[t])]
                 if not reach:
                     continue
                 _, tgt = min(reach)
+                attach[tgt] = attach.get(tgt, 0) + 1
                 p2, cur = [], tgt
                 guard = 0
                 while cur != cand and cur >= 0 and guard < 10000:

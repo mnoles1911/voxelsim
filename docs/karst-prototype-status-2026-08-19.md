@@ -266,6 +266,52 @@ tile) was sized on unsubdivided nodes and needs re-deriving -- or the wander
 needs to be applied at read time from a seed rather than stored, which is the
 cheaper answer and worth designing for.
 
+## Owner decisions applied, and the four follow-ups
+
+**Radius distribution: WIDE, accepted.** Radii are now **log-uniform from 0.8 m
+to 9.0 m** rather than a linear ramp between 3.0 and 7.5. Log-uniform is the
+point: discharge across a karst network spans orders of magnitude and r ~ Q^0.4,
+so a linear ramp is middle-heavy and makes everything a hall. Both tiles now
+measure a **1.97 m mean radius against a 9 m maximum** -- most passage small, a
+few large, which is what real caves and Minecraft both have.
+
+**The 0.8 m floor is a playability limit, not taste.** A tube of radius r has a
+walkable floor about 0.894r wide with 1.79r of headroom over it, so the player's
+0.6 m box and 1.2 m crouch both bottom out at r = 0.67 m. 0.8 m is that plus
+margin: a 1.6 m tube you crouch through. Measured minimum headroom is now
+**1.60 m** -- crouch-only passages exist, which is the texture that was missing.
+
+*One bug found and fixed on the way:* the radius model normalised junction order
+by each tile's own min/max, which is unstable when degree is nearly constant --
+it gave a 1.79 m mean on one tile and **8.92 m on another** (every passage a
+hall) because dividing by a near-zero range amplifies the leftover noise. Now an
+absolute mapping: degree 1 is a tip, 4+ is a trunk confluence, and those mean the
+same thing on every tile.
+
+**1. Hierarchical branching -- done.** Dead-ends no longer all attach to whichever
+node happens to be central. A node already branched-to is penalised, which
+spreads junctions along the trunk the way a tributary joins a river.
+
+**2. The unserved region -- NOT DONE.** Still the one open item of the four.
+
+**3. A tile with ponors -- done, and the path had never run.** Tile `-7_-5`
+carries **629 terminal basins**; every previous run was on a tile whose 165
+basins are all overflowing, so the terminal-basin sink path -- the strongest
+evidence the world carries -- had never once executed. It works: 1,710 sinks,
+629 of them ponors, density 4.48 km/km^2, 79/19/2 walk/scramble/shaft.
+*Worth noting:* spring-headwater agreement is **5.7%** on this tile against 29.7%
+on the alpine one. Wetter, flatter, shallower water table. Not yet explained.
+
+**4. The `.vxkn` budget -- re-derived, and the answer is: do not store the
+wander.** Subdivision takes the skeleton from 2,880 to 80,820 segments, ~28x,
+which would take the ~280 KB/tile estimate to roughly 8 MB and make the sidecar
+a third of a tile. But the wander is a pure function of `(seed, position)` --
+it is `subdivide()` over a value-noise field, with no global state. **Store the
+un-subdivided skeleton and apply the wander at READ time from the seed.** The
+format then keeps its ~280 KB, the client reconstructs identical geometry, and
+the sinuosity costs nothing on the wire. This is a format-design decision that
+had to be made before the format is written rather than after.
+
 ## Next, in order
 
 1. **Owner looks at the map and sections** in `docs/images/karst/` and says

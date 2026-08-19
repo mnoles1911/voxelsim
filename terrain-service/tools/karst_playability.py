@@ -68,6 +68,14 @@ STEP_UP_M = 0.30
 JUMP_M = 1.25
 
 WALK_GRADIENT = STEP_UP_M / PLAYER_WIDTH_M      # 0.5
+
+#: Radius range. THE FLOOR IS A PLAYABILITY LIMIT, NOT A TASTE ONE. A tube of
+#: radius r has a walkable floor about 0.894r wide and 1.79r of headroom over
+#: it, so the player's 0.6 m box and 1.2 m crouched height both bottom out at
+#: r = 0.67 m. 0.8 m is that limit plus margin: a 1.6 m tube you crouch through.
+#: The ceiling is the owner's 5x hall.
+RADIUS_MIN_M = 0.8
+RADIUS_MAX_M = 9.0
 SCRAMBLE_GRADIENT = 2.0
 
 #: The walkable band across a circular tube's floor. For floor z = -sqrt(R^2-x^2)
@@ -87,13 +95,26 @@ def assign_radii(seg: np.ndarray, trunk_order: np.ndarray) -> np.ndarray:
     driver (r ~ Q^0.4); node degree stands in for it until the prototype carries
     Q, and that substitution is why this is a prototype.
     """
-    lo, hi = 3.0, 7.5
-    o = trunk_order.astype(float)
-    if o.max() > o.min():
-        o = (o - o.min()) / (o.max() - o.min())
-    else:
-        o = np.zeros_like(o)
-    return lo + (hi - lo) * o
+    lo, hi = RADIUS_MIN_M, RADIUS_MAX_M
+    # ABSOLUTE mapping from junction order, NOT a per-tile min/max normalisation.
+    # Normalising is unstable when degree is nearly constant: on one tile it
+    # spread 0.8-9.0 m with a 1.79 m mean, and on another it collapsed to a 8.92 m
+    # mean -- every passage a hall -- because dividing by a near-zero range
+    # amplifies whatever variation is left. Degree 1 is a tip, 4+ is a trunk
+    # confluence, and those mean the same thing on every tile.
+    o = np.clip((trunk_order.astype(float) - 1.0) / 3.0, 0.0, 1.0)
+    # Per-segment jitter, so passage size is not a pure function of topology.
+    # Deterministic in the segment index: a prototype that reshuffles its own
+    # radii between runs cannot be A/B'd against itself.
+    rng = np.random.default_rng(20260819)
+    o = np.clip(o + rng.normal(0.0, 0.18, size=o.shape), 0.0, 1.0)
+    # LOG-UNIFORM, NOT LINEAR. Discharge across a karst network spans orders of
+    # magnitude and r ~ Q^0.4, so a linear ramp between two radii is the wrong
+    # shape: it produces a middle-heavy distribution where almost everything is
+    # a hall. Interpolating in log space gives what real caves have and what
+    # Minecraft has -- MOST passage small, a few large, which is the "wide not
+    # shifted" distribution the owner chose over uniform 5x.
+    return lo * (hi / lo) ** o
 
 
 def classify(seg: np.ndarray):
