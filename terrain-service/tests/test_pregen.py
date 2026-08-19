@@ -771,3 +771,165 @@ def test_codec_flag_is_advertised_and_has_no_auto():
     assert "--codec" in out.stdout
     # 'auto' would defeat the whole point; assert it is not offered.
     assert "auto" not in out.stdout.split("--codec")[1].split("--")[0]
+
+
+# ---------------------------------------------------------------------------
+# find_fine_namespaces -- READING BACK which namespace a client should be
+# pointed at.
+#
+# On 2026-08-18 the fine-tier residency gate killed three capture runs, each
+# worked around by hand-pinning -VoxelFineTileProviderId. Neither side had a
+# wrong hash: the bake COMPUTES its namespace (fine_id_for, whose -bXXXXXXXX
+# suffix moved -bdcab4bed -> -b19d281fd at bake_ver 27 -> 28) and the engine
+# COMPUTES NOTHING (it reads a literal from the command line or
+# DefaultGame.ini). The only reconciliation was a human copying nine hex
+# characters into an ini. These pin the reader that replaces that human.
+#
+# Filesystem-only: no GPU, no checkpoint, no rasters -- the same reason
+# world_identity_verdict is pure.
+# ---------------------------------------------------------------------------
+
+
+def _bake_namespace(root, namespace, seed_hex, tiles, created=None):
+    """Lay out <root>/<namespace>/<seed_hex>/s16/<x>_<y>.vxtl on disk."""
+    import json as _json
+
+    world = root / namespace / seed_hex
+    (world / "s16").mkdir(parents=True, exist_ok=True)
+    for tx, ty in tiles:
+        (world / "s16" / f"{tx}_{ty}.vxtl").write_bytes(b"not a real tile")
+    if created is not None:
+        (world / MANIFEST_NAME).write_text(
+            _json.dumps({
+                "manifest_schema": 1,
+                "created_utc": created,
+                "identity": {"namespace_id": namespace,
+                             "provider_id": namespace.rsplit("-b", 1)[0]},
+            }),
+            encoding="utf-8",
+        )
+    return world
+
+
+def test_find_fine_namespaces_finds_the_tile_under_the_other_id(tmp_path):
+    """THE 2026-08-18 FAILURE, reproduced and answered.
+
+    Two bakes of the same coarse world, the wanted tile in the NEWER one only.
+    A client pinned to the older id gets a fatal residency gate; the reader has
+    to name the namespace that actually holds the tile.
+    """
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    seed, seed_hex = 20260719, f"{20260719:016x}"
+    coarse = "terrain-diffusion-unlabeled-80b9ca451a23eae4"
+    _bake_namespace(tmp_path, f"{coarse}-bdcab4bed", seed_hex, [(-9, -9)],
+                    created="2026-08-07T12:00:00Z")
+    _bake_namespace(tmp_path, f"{coarse}-b19d281fd", seed_hex, [(-3, -4)],
+                    created="2026-08-18T00:23:14Z")
+
+    got = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)])
+    holders = [g["namespace_id"] for g in got if not g["tiles_missing"]]
+    assert holders == [f"{coarse}-b19d281fd"]
+    # And the stale pin is reported as present-but-short, not as absent: the
+    # operator needs to see that the id they passed IS a real namespace here,
+    # or they will go looking for a broken cache root instead of a stale pin.
+    stale = next(g for g in got if g["namespace_id"] == f"{coarse}-bdcab4bed")
+    assert stale["tiles_missing"] == [(-3, -4)]
+
+
+def test_find_fine_namespaces_orders_newest_first(tmp_path):
+    """--newest has to mean newest. Ordering is the only thing standing between
+    a capture and silently measuring last week's bake.
+    """
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    seed, seed_hex = 20260719, f"{20260719:016x}"
+    coarse = "terrain-diffusion-unlabeled-80b9ca451a23eae4"
+    for suffix, created in (("-b111111a", "2026-08-04T02:10:07Z"),
+                            ("-b222222b", "2026-08-18T00:23:14Z"),
+                            ("-b333333c", "2026-08-05T13:36:52Z")):
+        _bake_namespace(tmp_path, coarse + suffix, seed_hex, [(-3, -4)],
+                        created=created)
+    # No manifest at all: dateless, and must sort LAST rather than first --
+    # "nobody can date it" is not "it is from the beginning of time".
+    _bake_namespace(tmp_path, coarse + "-b444444d", seed_hex, [(-3, -4)])
+
+    got = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)])
+    assert [g["namespace_id"][-9:] for g in got] == [
+        "-b222222b", "-b333333c", "-b111111a", "-b444444d"]
+    assert got[-1]["has_manifest"] is False
+
+
+def test_find_fine_namespaces_ignores_other_seeds_and_other_worlds(tmp_path):
+    """A namespace holding nothing for THIS seed is not a candidate, and
+    --provider-id keeps two coarse worlds' fine bakes apart. Prefix matching is
+    sound only because fine_id_for SUFFIXES rather than re-hashes.
+    """
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    seed, seed_hex = 20260719, f"{20260719:016x}"
+    other_hex = f"{99999999:016x}"
+    mine = "terrain-diffusion-unlabeled-80b9ca451a23eae4"
+    theirs = "terrain-diffusion-unlabeled-71e2b362e3241e71"
+    _bake_namespace(tmp_path, f"{mine}-b19d281fd", seed_hex, [(-3, -4)],
+                    created="2026-08-18T00:23:14Z")
+    _bake_namespace(tmp_path, f"{theirs}-b19d281fd", seed_hex, [(-3, -4)],
+                    created="2026-08-18T00:23:14Z")
+    _bake_namespace(tmp_path, f"{mine}-bfffffff", other_hex, [(-3, -4)],
+                    created="2026-08-18T00:23:14Z")
+
+    both = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)])
+    assert len(both) == 2  # the other SEED is not a candidate at all
+
+    only_mine = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)],
+                                     coarse_provider_id=mine)
+    assert [g["namespace_id"] for g in only_mine] == [f"{mine}-b19d281fd"]
+
+
+def test_find_fine_namespaces_reports_a_moved_record(tmp_path):
+    """A record naming a namespace other than the directory holding it has been
+    copied by hand. The DIRECTORY is what the client opens, so it is what gets
+    reported -- but the disagreement must be visible, since hand cache surgery
+    is how one namespace ends up holding two planets.
+    """
+    import json as _json
+
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    seed, seed_hex = 20260719, f"{20260719:016x}"
+    world = _bake_namespace(tmp_path, "ns-b19d281fd", seed_hex, [(-3, -4)],
+                            created="2026-08-18T00:23:14Z")
+    rec = _json.loads((world / MANIFEST_NAME).read_text(encoding="utf-8"))
+    rec["identity"]["namespace_id"] = "ns-bdcab4bed"  # copied from elsewhere
+    (world / MANIFEST_NAME).write_text(_json.dumps(rec), encoding="utf-8")
+
+    got = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)])
+    assert got[0]["namespace_id"] == "ns-b19d281fd"           # the directory
+    assert got[0]["recorded_namespace_id"] == "ns-bdcab4bed"  # the claim
+
+
+def test_find_fine_namespaces_survives_an_unreadable_record(tmp_path):
+    """A corrupt manifest must not hide the tiles beside it. The 289-tile world
+    has no manifest at all; a reader that answered "nowhere" for the namespaces
+    it cannot vouch for would be useless for the world that matters most.
+    """
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    seed, seed_hex = 20260719, f"{20260719:016x}"
+    world = _bake_namespace(tmp_path, "ns-b19d281fd", seed_hex, [(-3, -4)])
+    (world / MANIFEST_NAME).write_bytes(b"\xff\xfe not json at all")
+
+    got = find_fine_namespaces(tmp_path, seed, tiles=[(-3, -4)])
+    assert [g["namespace_id"] for g in got] == ["ns-b19d281fd"]
+    assert got[0]["has_manifest"] is False
+    assert got[0]["tiles_missing"] == []
+
+
+def test_find_fine_namespaces_on_a_missing_root_is_empty_not_an_error(tmp_path):
+    """A wrong --cache-dir must produce "nothing here", which the tool turns
+    into a refusal. Raising instead would tempt a harness into an except: that
+    falls back to a default id -- and a wrong default id is the fatal gate.
+    """
+    from terrain_service.world_manifest import find_fine_namespaces
+
+    assert find_fine_namespaces(tmp_path / "nope", 20260719) == []
