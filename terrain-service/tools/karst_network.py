@@ -243,7 +243,7 @@ def edge_costs(nodes, idx_a, idx_b, elev, head, incept, coher, theta, log2acc):
 
 
 def build_system(nodes, elev, head, incept, coher, theta, log2acc,
-                 sink_ids, spring_id, gamma, deadends=0, rng=None):
+                 sink_ids, spring_id, gamma, deadends=0, rng=None, mouth_ids=()):
     """kNN graph, Dijkstra from each sink to the spring, gamma-skeleton prune."""
     if len(nodes) < 8:
         return []
@@ -283,11 +283,19 @@ def build_system(nodes, elev, head, incept, coher, theta, log2acc,
     # ALREADY on the skeleton, which is what makes a branch a branch rather
     # than a second trunk.
     attach = {}
-    if deadends > 0 and paths:
+    # HILLSIDE MOUTHS ARE ROUTED IN FIRST, and they are routed to the EXISTING
+    # skeleton rather than being new outlets. That is what a hillside mouth
+    # physically IS: a valley wall retreating until it cuts an existing conduit
+    # open sideways. Making them outlets instead would grow separate stub
+    # systems that happen to touch a hillside -- holes leading nowhere, which is
+    # the opposite of the walk-in access they exist to provide.
+    seeds = list(mouth_ids) + (
+        [int(rng.integers(0, len(nodes))) for _ in range(deadends)]
+        if deadends > 0 and rng is not None else [])
+    if seeds and paths:
         on_skeleton = sorted({n for p in paths for n in p})
         if len(on_skeleton) >= 2:
-            for _ in range(deadends):
-                cand = int(rng.integers(0, len(nodes)))
+            for cand in seeds:
                 if cand in on_skeleton:
                     continue
                 d2, pred2 = dijkstra(g, directed=False, indices=cand,
@@ -378,6 +386,9 @@ def main() -> int:
                     help="vertical share of the wander; see subdivide()'s note")
     ap.add_argument("--wander", type=float, default=0.0,
                     help="centreline displacement in piece lengths; 0 = straight")
+    ap.add_argument("--mouths-per-system", type=int, default=6,
+                    help="hillside mouths wired into each system")
+    ap.add_argument("--mouth-depth-m", type=float, default=4.0)
     ap.add_argument("--deadends", type=int, default=0,
                     help="amplification key points per system (paper's Amplify)")
     ap.add_argument("--spring-sep-m", type=float, default=1500.0,
@@ -414,6 +425,10 @@ def main() -> int:
           f"routing the {len(order)} largest")
 
     all_segments, lengths, depths, routed, failed = [], [], [], 0, 0
+    routed_mouths = 0
+    mouth_pts = []
+    mouths = f["mouths"] if "mouths" in f else np.empty((0, 2), np.int32)
+    print(f"hillside mouths available: {len(mouths)}")
     for si, (spring_idx, sink_list) in enumerate(order):
         sp = springs[spring_idx]
         nodes, _ = sample_corridor(sink_list, tuple(int(v) for v in sp),
@@ -430,9 +445,39 @@ def main() -> int:
             q = np.array([s[0] * GRID_M, s[1] * GRID_M, elev[s[1], s[0]] - 5.0])
             _, i = tree.query(q)
             sink_ids.append(int(i))
+        mouth_ids = []
+        if len(mouths):
+            lo = nodes[:, :2].min(axis=0) / GRID_M
+            hi = nodes[:, :2].max(axis=0) / GRID_M
+            inside = mouths[(mouths[:, 0] >= lo[0]) & (mouths[:, 0] <= hi[0]) &
+                            (mouths[:, 1] >= lo[1]) & (mouths[:, 1] <= hi[1])]
+            for mx_, my_ in inside[:args.mouths_per_system]:
+                # Snap just INSIDE the hill: a mouth is the passage meeting the
+                # slope, so its node sits a passage-radius below the surface.
+                qy = np.array([mx_ * GRID_M, my_ * GRID_M,
+                               elev[my_, mx_] - args.mouth_depth_m], float)
+                # SNAP TO A LEVEL NEIGHBOUR, not simply the nearest node. A
+                # mouth sits on steep ground by definition, so the nearest node
+                # in 3D is usually below it and the connector into the hill
+                # comes out as a scramble or a shaft -- which is precisely what
+                # a walk-in entrance must not be. Measured: nearest-node snapping
+                # put 91 mouths on the network and left only 7.4% of it
+                # reachable on foot from one. A real mouth runs roughly LEVEL
+                # into the hill along the bedding, so penalise height difference
+                # hard and let horizontal distance decide the rest.
+                kq = min(24, len(nodes))
+                dd, ii = tree.query(qy, k=kq)
+                ii = np.atleast_1d(ii)
+                candn = nodes[ii]
+                horiz = np.linalg.norm(candn[:, :2] - qy[:2], axis=1)
+                dz = np.abs(candn[:, 2] - qy[2])
+                i2 = int(ii[np.argmin(horiz + 8.0 * dz)])
+                mouth_ids.append(i2)
         segs = build_system(nodes, elev, head, incept, coher, theta, log2acc,
                             sink_ids, int(spring_id), args.gamma,
-                            deadends=args.deadends, rng=rng)
+                            deadends=args.deadends, rng=rng, mouth_ids=mouth_ids)
+        routed_mouths += len(mouth_ids)
+        mouth_pts.extend(nodes[i2_].tolist() for i2_ in mouth_ids)
         if not segs:
             failed += 1
             continue
@@ -519,6 +564,7 @@ def main() -> int:
         "node_spacing_m": NODE_SPACING_M, "neighbours": NEIGHBOURS,
         "spring_sep_m": args.spring_sep_m,
         "systems_total": len(systems), "systems_routed": routed,
+        "hillside_mouths_wired": routed_mouths,
         "systems_failed": failed,
         "segments": len(all_segments),
         "passage_km": round(total_km, 2),
@@ -546,7 +592,8 @@ def main() -> int:
     np.savez_compressed(out / f"{stem}-network.npz",
                         segments=np.asarray(all_segments, np.float32).reshape(-1, 2, 3),
                         springs_used=np.asarray(springs, np.int32).reshape(-1, 2),
-                        sinks_used=np.asarray(sinks, np.int32).reshape(-1, 2))
+                        sinks_used=np.asarray(sinks, np.int32).reshape(-1, 2),
+                        mouth_nodes=np.asarray(mouth_pts, np.float32).reshape(-1, 3))
     print(f"wrote {out}/{stem}-network.{{json,npz}}")
     return 0
 

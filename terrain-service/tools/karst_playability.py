@@ -56,6 +56,7 @@ import json
 import pathlib
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 GRID_M = 30.0
 
@@ -199,6 +200,18 @@ def main() -> int:
                     parent[ru] = rv
         return [find(i) for i in range(len(pts))]
 
+    # WALK-IN ENTRANCES, kept separate from every other kind of breach.
+    # A doline, a shaft and a swallet all reach daylight, and all three are a
+    # fall. Only a hillside mouth is something a player WALKS IN through, so
+    # "reachable from an entrance" and "reachable from a walk-in entrance" are
+    # different numbers and the second is the one that describes the feature.
+    mouth_nodes = net.get("mouth_nodes", np.empty((0, 3), np.float32))
+    is_mouth = np.zeros(len(pts), bool)
+    if len(mouth_nodes):
+        mt = cKDTree(np.asarray(mouth_nodes, float))
+        d_m, _ = mt.query(pts)
+        is_mouth = d_m <= 1.0          # snapped to the same node
+
     res = {}
     for name, mc in (("walk", 0), ("walk_scramble", 1)):
         comp = components(mc)
@@ -207,9 +220,15 @@ def main() -> int:
         for u, v, i in edges:
             if cls[i] <= mc and comp[u] in reachable_roots:
                 km += length[i] / 1000.0
+        mouth_roots = {comp[i] for i in np.nonzero(is_mouth)[0]}
+        km_mouth = 0.0
+        for u, v, i in edges:
+            if cls[i] <= mc and comp[u] in mouth_roots:
+                km_mouth += length[i] / 1000.0
         res[name] = {
             "reachable_km": round(float(km), 2),
             "reachable_pct": round(100.0 * float(km) / float(total_km), 1),
+            "from_hillside_mouth_pct": round(100.0 * float(km_mouth) / float(total_km), 1),
             "components": len(set(comp)),
         }
 
@@ -236,6 +255,7 @@ def main() -> int:
         "headroom_m": {"min": round(float(headroom.min()), 2),
                        "mean": round(float(headroom.mean()), 2)},
         "entrances": int(is_entrance.sum()),
+        "hillside_mouth_nodes": int(is_mouth.sum()),
         "reachable_on_foot": res,
     }
     print(json.dumps(stats, indent=2))
@@ -249,8 +269,12 @@ def main() -> int:
     print(f"  walkable floor >= {PLAYER_WIDTH_M} m everywhere: "
           f"{'YES' if ok_floor else 'NO'} (min {walk_floor_w.min():.2f} m)")
     r = res["walk_scramble"]["reachable_pct"]
-    print(f"  reachable on foot from a surface entrance: "
+    print(f"  reachable on foot from ANY entrance:      "
           f"{res['walk']['reachable_pct']}% walking, {r}% with jumps")
+    print(f"  reachable from a WALK-IN hillside mouth:  "
+          f"{res['walk']['from_hillside_mouth_pct']}% walking, "
+          f"{res['walk_scramble']['from_hillside_mouth_pct']}% with jumps "
+          f"({stats['hillside_mouth_nodes']} mouths on the network)")
     if stats["entrances"] == 0:
         print("  NO SURFACE ENTRANCE -- the whole network is unreachable on foot.")
     elif r < 50:

@@ -204,7 +204,62 @@ def main() -> int:
     fig.savefig(args.out / "karst-entrances.png")
     plt.close(fig)
 
-    print(f"wrote {args.out}/karst-cross-sections.png and karst-entrances.png")
+    # ---------------- SHEET 3: hillside mouth varieties ---------------------
+    # The owner asked for more hillside mouths "of varying shapes, sizes, and
+    # varieties", so the varieties are enumerated rather than implied. Each is a
+    # different CONTROL on the opening -- what the rock was doing where the
+    # valley cut it -- not a different random seed. Size and shape follow from
+    # the control, which is why they vary together the way real mouths do.
+    MOUTHS = [
+        ("bedding arch", "wide and low -- a bedding-plane\npassage cut open",
+         [((-26, -6.0), (26, -7.5), 3.4)], 0.55, 34.0),
+        ("joint slot", "tall and narrow -- a joint slot\nyou turn sideways for",
+         [((-26, -4.0), (26, -7.0), 1.1)], 3.10, 30.0),
+        ("collapse portal", "breakdown-widened, talus cone\nacross the floor",
+         [((-26, -5.0), (26, -9.0), 4.6)], 0.85, 46.0),
+        ("crawl-in", "a small tube -- crouch through,\nit opens out inside",
+         [((-26, -5.5), (26, -7.0), 0.9)], 1.00, 26.0),
+        ("compound mouth", "twin openings, one cave -- both\ncut by the same wall",
+         [((-26, -3.5), (26, -6.0), 1.7), ((-26, -12.0), (26, -13.5), 2.3)],
+         1.00, 30.0),
+        ("alcove + rift", "wide shallow alcove; the passage\nleaves its back wall",
+         [((-4, -6.0), (26, -8.0), 5.0), ((-26, -7.5), (-2, -7.0), 1.4)],
+         0.70, 38.0),
+    ]
+    Wm, Hm, vm = 56.0, 34.0, 0.12
+    xs2 = np.linspace(-Wm / 2, Wm / 2, int(Wm / vm))
+    zs2 = np.linspace(-Hm * 0.62, Hm * 0.38, int(Hm / vm))
+    X2, Z2 = np.meshgrid(xs2, zs2, indexing="ij")
+    fig, axes = plt.subplots(2, 3, figsize=(17, 10.5), dpi=140)
+    for ax, (name, note, conds, vstretch, slope_deg) in zip(axes.ravel(), MOUTHS):
+        surf = np.clip(-np.tan(np.radians(slope_deg)) * (xs2 + 6.0) + 7.0, -12.0, 12.0)
+        air = Z2 > surf[:, None]
+        for (a, b, r) in conds:
+            a, b = np.asarray(a, float), np.asarray(b, float)
+            ab = b - a
+            t_ = np.clip(((X2 - a[0]) * ab[0] + (Z2 - a[1]) * ab[1]) / max(ab @ ab, 1e-9), 0, 1)
+            dx_ = X2 - a[0] - ab[0] * t_
+            dz_ = (Z2 - a[1] - ab[1] * t_) / vstretch
+            air |= (np.sqrt(dx_ ** 2 + dz_ ** 2) - r + rough(X2, Z2, 0.17 * r, 31)) <= 0
+        if name == "collapse portal":            # talus cone across the floor
+            air &= ~((Z2 < -9.5 + 3.0 * np.exp(-((X2 - 2) / 7.0) ** 2)) & (X2 > -14))
+        ax.imshow(air.T, origin="lower", cmap="bone",
+                  extent=[xs2[0], xs2[-1], zs2[0], zs2[-1]], interpolation="nearest")
+        ax.plot(xs2, surf, color="#2a7f2a", lw=1.5)
+        ax.add_patch(Rectangle((-7.0, -8.6), PLAYER_W, PLAYER_H,
+                               fill=False, ec="#d1004f", lw=1.7))
+        ax.set_title(name, fontsize=11)
+        ax.text(0.02, 0.03, note, transform=ax.transAxes, fontsize=7.5,
+                va="bottom", ha="left", color="#e8e8e8")
+        ax.set_xlabel("m"); ax.set_ylabel("m"); ax.set_aspect("equal")
+    fig.suptitle("hillside mouth varieties -- profile, 12 cm voxels, "
+                 "player 0.6 x 1.8 m in red", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(args.out / "karst-mouth-varieties.png")
+    plt.close(fig)
+
+    print(f"wrote {args.out}/karst-cross-sections.png, "
+          f"karst-entrances.png and karst-mouth-varieties.png")
     return 0
 
 

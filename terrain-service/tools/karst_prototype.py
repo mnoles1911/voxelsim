@@ -322,6 +322,59 @@ def find_springs(f: dict, head: np.ndarray, incept_surface: np.ndarray,
     return [(int(x), int(y)) for x, y in zip(xs, ys)]
 
 
+def find_hillside_mouths(f: dict, head: np.ndarray, incept_surface: np.ndarray,
+                         min_slope_deg: float = 18.0, min_sep_cells: float = 4.0,
+                         max_count: int = 2000):
+    """Walk-in entrances: where a VALLEY WALL cuts a conduit open sideways.
+
+    WHY THIS IS ITS OWN DETECTOR AND NOT A BY-PRODUCT. Everything else that
+    reaches daylight does so from ABOVE -- a doline funnels down, a shaft drops,
+    a swallet swallows. Those are all one-way and most of them are a fall. The
+    hillside mouth is the only entrance a player WALKS IN through, and it is the
+    one the previous system had none of: its single entrance mechanism was a
+    vertical cylinder, rejected twice.
+
+    It is a different geometry, so it needs a different test. A mouth wants:
+
+      * a STEEP surface -- a valley wall retreating into the hill, not a slope
+        the conduit merely grazes;
+      * ground BELOW the local ridge, so the conduit is inside the hill rather
+        than under a summit;
+      * a horizon daylighting, which is where a conduit would be to be cut.
+
+    Returned as route TARGETS, not as decoration: the router has to actually
+    reach them or they are holes in a hillside leading nowhere.
+    """
+    elev = f["elev_m"]
+    gy, gx = np.gradient(elev, GRID_M)
+    slope_deg = np.degrees(np.arctan(np.hypot(gx, gy)))
+
+    # Below the local ridge: compare against a broad maximum so a mouth sits on
+    # a flank rather than on a summit.
+    ridge = ndimage.maximum_filter(elev, size=25)
+    on_flank = (ridge - elev) > 15.0
+
+    outcrop = np.abs(incept_surface) < 0.30
+    cand = (slope_deg >= min_slope_deg) & on_flank & outcrop
+    ys, xs = np.nonzero(cand)
+    if len(xs) == 0:
+        return np.empty((0, 2), np.int32)
+
+    # Steepest first, then spread them out -- a valley wall flags a continuous
+    # ribbon of cells and one mouth per ribbon is the truth.
+    order = np.argsort(-slope_deg[ys, xs])
+    kept, pts = [], []
+    for i in order:
+        p = np.array([xs[i], ys[i]], float)
+        if pts and np.min(np.linalg.norm(np.asarray(pts) - p, axis=1)) < min_sep_cells:
+            continue
+        kept.append((int(xs[i]), int(ys[i])))
+        pts.append(p)
+        if len(kept) >= max_count:
+            break
+    return np.asarray(kept, np.int32)
+
+
 def spring_head_overlap(springs, heads, tol_cells: int = 3) -> float:
     """Fraction of baked headwaters within `tol_cells` of a modelled spring."""
     if not springs or not heads:
@@ -366,6 +419,8 @@ def main() -> int:
     print(f"  fracture coherence mean {coher.mean():.3f}")
 
     sinks, kinds = find_sinks(f, incept_surface)
+    mouths = find_hillside_mouths(f, head, incept_surface)
+    print(f"  hillside mouths {len(mouths)}")
     springs = find_springs(f, head, incept_surface)
     nb = sum(1 for k in kinds if k == "basin")
     print(f"  sinks {len(sinks)}  (terminal basins {nb}, stream/horizon {len(sinks) - nb})")
@@ -383,7 +438,7 @@ def main() -> int:
         "wt_depth_p90_m": float(np.percentile(depth, 90)),
         "fracture_coherence_mean": float(coher.mean()),
         "sinks": len(sinks), "sinks_from_basins": nb,
-        "springs": len(springs),
+        "springs": len(springs), "hillside_mouths": len(mouths),
         "spring_headwater_overlap": None if ov != ov else float(ov),
         "seconds": round(time.time() - t0, 2),
     }
@@ -400,7 +455,8 @@ def main() -> int:
                         log2acc=f["log2acc"].astype(np.float32),
                         drain=drain,
                         sinks=np.asarray(sinks, np.int32).reshape(-1, 2),
-                        springs=np.asarray(springs, np.int32).reshape(-1, 2))
+                        springs=np.asarray(springs, np.int32).reshape(-1, 2),
+                        mouths=np.asarray(mouths, np.int32).reshape(-1, 2))
     print(f"\nwrote {args.out}/{f['tile']}-fields.{{json,npz}}  ({stats['seconds']}s)")
     return 0
 
