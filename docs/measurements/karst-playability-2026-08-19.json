@@ -1,0 +1,46 @@
+{
+  "player": {
+    "width_m": 0.6,
+    "stand_m": 1.8,
+    "step_up_m": 0.3,
+    "jump_m": 1.25,
+    "walk_gradient": 0.5
+  },
+  "passage_km_total": 448.86,
+  "by_class_km": {
+    "walk": 253.92,
+    "scramble": 163.02,
+    "shaft": 31.92
+  },
+  "by_class_pct": {
+    "walk": 56.6,
+    "scramble": 36.3,
+    "shaft": 7.1
+  },
+  "radius_m": {
+    "min": 3.0,
+    "mean": 3.69,
+    "max": 7.5
+  },
+  "walkable_floor_width_m": {
+    "min": 2.68,
+    "mean": 3.3
+  },
+  "headroom_m": {
+    "min": 6.0,
+    "mean": 7.38
+  },
+  "entrances": 735,
+  "reachable_on_foot": {
+    "walk": {
+      "reachable_km": 101.79,
+      "reachable_pct": 22.7,
+      "components": 864
+    },
+    "walk_scramble": {
+      "reachable_km": 413.55,
+      "reachable_pct": 92.1,
+      "components": 213
+    }
+  }
+}

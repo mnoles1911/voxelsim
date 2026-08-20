@@ -1,0 +1,32 @@
+KARST SINK CENSUS -- 15 fine tiles, bake_ver [28]
+  tile = 15.36 km square = 235.9 km^2; superblock = 16 tiles = 3775 km^2
+
+REGISTERED BASINS (a LOWER bound on sinks -- dolines are not in the tile)
+  total                     9580   (   638.7 per tile)
+  terminal (ponors)         1700   (   113.3 per tile)
+  tile-spanning rows         230   (double-counted physical lakes)
+    lake_overflowing        7880   (   525.3 per tile)
+    seasonal                1112   (    74.1 per tile)
+    lake_terminal            543   (    36.2 per tile)
+    dry_playa                 45   (     3.0 per tile)
+
+STREAM NETWORK, by catchment-area threshold (NOT the flow plane's
+channel bit -- see the header for why that bit is not a river mask)
+  acc >= 2^14 (   16,384 m^2)      56783 km   density  16.05 km/km^2
+  acc >= 2^16 (   65,536 m^2)      27089 km   density   7.65 km/km^2
+  acc >= 2^18 (  262,144 m^2)      11871 km   density   3.35 km/km^2  <- plausible
+  acc >= 2^20 (1,048,576 m^2)       4485 km   density   1.27 km/km^2  <- plausible
+  baked headwaters        460848   ( 30723.2 per tile, 130.2/km^2)
+
+VERDICT -- against the plan's assumed 400 systems per superblock
+  from terminal basins         1813 systems/superblock
+  from baked headwaters      491571 systems/superblock
+
+  PASS -- the world supplies at least the assumed system count from
+  registered features alone, before any doline is counted.
+
+  Neither number counts dolines. Both are printed because they
+  measure different things; do not add them.
+
+wrote D:\voxelsim\docs\measurements\karst-sink-census-2026-08-19.json
+
