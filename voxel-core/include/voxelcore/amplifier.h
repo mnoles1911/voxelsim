@@ -12,6 +12,7 @@
 
 #include "voxelcore/biome.h" // BiomeId, carried on ColumnSample since the asset policy
 #include "voxelcore/caverns.h"
+#include "voxelcore/karst.h"
 #include "voxelcore/caves.h"
 
 #include "voxelcore/hash_channel_registry.h" // compile-time HashChannel id uniqueness guard
@@ -121,6 +122,25 @@ struct ColumnSample {
     // mirror recomputes it inside VoxelizeMain rather than widening
     // GpuColumnSample (docs/cavern-design.md §3.5).
     CavernColumn cavern;
+
+    // KARST CONDUITS (voxelcore/karst.h), carried for the same reason `cave`
+    // and `cavern` are: materialAt is a static function of (ColumnSample, vz),
+    // so anything the per-voxel test needs and cannot derive from vz has to
+    // arrive on the sample.
+    //
+    // IT IS EMPTY UNTIL A TABLE IS INSTALLED, AND THAT IS DELIBERATE. This
+    // member and its carve land as a PROVEN NO-OP: with no table the reduction
+    // returns count == 0, karstCarveAt's first compare rejects, and the world
+    // is byte-identical -- verified by vxc_bench --digest before and after. The
+    // repo has done this before, deliberately (core.h's v28 note: "THE FORMAT
+    // LANDED AS A PROVEN NO-OP FIRST"), because it separates "the plumbing is
+    // correct" from "the new geometry is good", and those fail differently.
+    //
+    // The table itself will be baked (docs/karst-phase1-carve.md). Until the
+    // HLSL mirror in voxel-core/shaders/karst.ush is wired into worldgen.ush,
+    // installing a real table would make the CPU and GPU disagree -- which
+    // ADR-0006 makes a desync vector -- so the source stays null on purpose.
+    KarstColumn karst;
 
     // A THIRD MEMBER, Density3Column d3, lived here from v12 to v19 for the
     // same reason `cave` and `cavern` do: stratigraphyAt is a static function of
@@ -295,6 +315,18 @@ public:
     // sampler queries on EVERY column in the world, wet or dry, and dry is
     // 99.4% of them.
     void setWaterMarkerFillPx(int64_t px) { waterMarkerFillPx_ = px < 0 ? 0 : px; }
+
+    // Install the region's baked conduit table. The Amplifier does NOT own it:
+    // the caller (the tile streamer, or a test) owns the arrays and must
+    // outlive this. Passing an empty table restores the no-op default.
+    //
+    // NOT YET CALLED BY ANYTHING SHIPPING. Installing a real table makes the
+    // CPU carve conduits the GPU mirror does not, and ADR-0006 makes that
+    // divergence a desync vector -- so this stays unwired until
+    // voxel-core/shaders/karst.ush is included by worldgen.ush and vxc_gpu has
+    // shown the two agree.
+    void setKarstTable(const KarstTable& t) { karstTable_ = t; }
+    const KarstTable& karstTable() const { return karstTable_; }
     IWaterSampler* waterMarker() const { return waterMarker_; }
     bool waterMarkerEnabled() const { return waterMarker_ != nullptr; }
 
@@ -592,6 +624,10 @@ private:
     uint64_t seed_;
     ITileSampler* tiles_;
     uint64_t id_;
+    // The baked conduit table for the region being amplified. EMPTY BY DEFAULT
+    // and empty in every shipping configuration today, which is what makes the
+    // karst carve a proven no-op: see setKarstTable and the ColumnSample member.
+    KarstTable karstTable_{};
     // Debug only; nullptr in every shipping configuration. See setWaterMarker.
     IWaterSampler* waterMarker_ = nullptr;
     bool waterMarkerOcean_ = true;

@@ -2571,6 +2571,15 @@ ColumnSample Amplifier::column(int64_t vx, int64_t vy) const {
     // caveColumnFor(seed_, vx, vy, col.surfaceMm).
     col.cave = cachedCaveColumn(seed_, vx, vy, col.surfaceMm);
 
+    // KARST CONDUITS. Reduced here for the same reason the two passes above
+    // are, and a NO-OP until a table is installed: `karstTable_` is null by
+    // default, `karstColumnFor` returns count == 0, and the world is
+    // byte-identical. See the ColumnSample member's note for why it lands that
+    // way rather than switched on.
+    if (!karstTable_.empty()) {
+        col.karst = karstColumnFor(karstTable_, vx, vy);
+    }
+
     // M4 cave pass v2 cavern pass (voxelcore/caverns.h), wired in exactly as
     // the cave pass above is: one reduction per column, carried in the
     // ColumnSample, consumed per voxel by materialAt.
@@ -2686,6 +2695,12 @@ MaterialId Amplifier::materialAt(const ColumnSample& col, int64_t vz) {
     // common case never reaches this call: cavernCarveAt's first test is
     // `count == 0`.
     if (cavernCarveAt(col.cavern, col.surfaceMm, col.bedrockDepthMm, vz))
+        return static_cast<MaterialId>(MAT_AIR);
+    // KARST. Ordered last of the three while all three coexist: with no table
+    // installed `col.karst.count` is 0 and this is a single compare, so the
+    // common path is unchanged and the digest cannot move. When karst.h
+    // replaces caves.h and caverns.h the two calls above go and this one stays.
+    if (karstCarveAt(col.karst, col.surfaceMm, col.bedrockDepthMm, vz))
         return static_cast<MaterialId>(MAT_AIR);
     return m;
 }

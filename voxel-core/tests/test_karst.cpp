@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <vector>
 
+#include "voxelcore/amplifier.h"
 #include "voxelcore/karst.h"
 #include "vxctest.h"
 
@@ -319,4 +320,73 @@ VXC_TEST(karst_golden_digest) {
     std::printf("      karst_layer golden: 0x%016llX\n",
                 static_cast<unsigned long long>(h));
     CHECK_EQ(h, 0xA500EED45E8333B5ull);
+}
+
+// --- AMPLIFIER INTEGRATION -------------------------------------------------
+// These two must be read together. The first proves the carve is INERT with no
+// table installed, which is what lets it land without moving the world digest.
+// The second proves it is inert because the table is empty and NOT because the
+// wiring is broken -- a disconnected wire passes the first test perfectly, and
+// "it changed nothing" is exactly what a feature that was never called looks
+// like. This repo has shipped that failure before (the standing-water veto read
+// an empty debug field and was inert for a whole programme).
+
+VXC_TEST(karst_is_inert_in_the_amplifier_with_no_table) {
+    SyntheticTileSampler tiles(20260819ull);
+    Amplifier amp(20260819ull, tiles);
+    CHECK(amp.karstTable().empty());
+    for (int64_t vx = -200; vx <= 200; vx += 50) {
+        const ColumnSample col = amp.column(vx, 37);
+        CHECK(col.karst.count == 0);
+        for (int64_t vz = -50; vz <= 200; vz += 7) {
+            // Whatever the terrain says, the karst pass must not be the reason.
+            CHECK(!karstCarveAt(col.karst, col.surfaceMm, col.bedrockDepthMm, vz));
+        }
+    }
+}
+
+VXC_TEST(karst_table_installed_actually_carves_through_materialAt) {
+    SyntheticTileSampler tiles(20260819ull);
+    Amplifier amp(20260819ull, tiles);
+
+    // Put a fat conduit squarely inside solid rock under a real column: read the
+    // surface first, then place the axis 40 m below it, so the roof and bedrock
+    // guards are both satisfied by construction rather than by luck.
+    const ColumnSample probe = amp.column(0, 0);
+    const int32_t axisMm = probe.surfaceMm - 40000;
+
+    std::vector<KarstNode> nodes(2);
+    for (int i = 0; i < 2; ++i) {
+        nodes[i].xMm = (i == 0) ? -60000 : 60000;
+        nodes[i].yMm = 0;
+        nodes[i].zMm = axisMm;
+        nodes[i].rHorizCm = 500;   // 5 m
+        nodes[i].rVertCm = 500;
+        nodes[i].kind = KARST_PHREATIC;
+    }
+    std::vector<KarstEdge> edges{KarstEdge{0, 1}};
+    KarstTable t;
+    t.nodes = nodes.data();
+    t.edges = edges.data();
+    t.nodeCount = 2;
+    t.edgeCount = 1;
+    amp.setKarstTable(t);
+
+    const ColumnSample col = amp.column(0, 0);
+    CHECK(col.karst.count == 1);
+
+    // The axis voxel must now read as AIR through the SHIPPED path -- not
+    // through karstCarveAt directly, which would test the carve against itself.
+    const int64_t axisVz = axisMm / kVoxelSizeMm;
+    CHECK(Amplifier::materialAt(col, axisVz) == MAT_AIR);
+
+    // And a column well outside the conduit must be untouched.
+    const ColumnSample far = amp.column(0, 4000);
+    CHECK(far.karst.count == 0);
+
+    // Removing the table restores the no-op exactly.
+    amp.setKarstTable(KarstTable{});
+    const ColumnSample after = amp.column(0, 0);
+    CHECK(after.karst.count == 0);
+    CHECK(Amplifier::materialAt(after, axisVz) != MAT_AIR);
 }
