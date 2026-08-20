@@ -443,19 +443,30 @@ public:
     // Static for the same reason materialAtResolved is: it must not be able to
     // touch the bank source, and therefore cannot take the global bankGrid
     // mutex from inside a per-voxel loop.
+    // ONE instance's material at a cover voxel. THE ONLY PLACE THE COVER
+    // TRANSFORM IS SPELLED. Callers that walk a per-column SHORTLIST rather
+    // than the whole list (a census, a mesher) must come through here too --
+    // re-inlining the arithmetic at the call site is how a probe ends up
+    // measuring a world the reference does not describe, which is the exact
+    // failure this file's byte-parity contract exists to prevent.
+    static MaterialId coverMaterialOfResolved(const ResolvedCoverInstance& r, int64_t cx,
+                                              int64_t cy, int64_t cz) {
+        const int64_t rx = cx - r.anchorCx - int64_t(r.grid->rotatedOriginX(r.yawQuarter));
+        const int64_t ry = cy - r.anchorCy - int64_t(r.grid->rotatedOriginY(r.yawQuarter));
+        const int64_t rz = cz - r.anchorCz - int64_t(r.grid->originZ());
+        // atYaw answers MAT_AIR out of range by design, so this guard is only
+        // keeping the int32 narrowing honest -- same as above.
+        if (rx < INT32_MIN || rx > INT32_MAX || ry < INT32_MIN || ry > INT32_MAX ||
+            rz < INT32_MIN || rz > INT32_MAX)
+            return MAT_AIR;
+        return r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
+                             static_cast<int32_t>(rz), r.yawQuarter);
+    }
+
     static MaterialId coverMaterialAtResolved(const std::vector<ResolvedCoverInstance>& resolved,
                                               int64_t cx, int64_t cy, int64_t cz) {
         for (const ResolvedCoverInstance& r : resolved) {
-            const int64_t rx = cx - r.anchorCx - int64_t(r.grid->rotatedOriginX(r.yawQuarter));
-            const int64_t ry = cy - r.anchorCy - int64_t(r.grid->rotatedOriginY(r.yawQuarter));
-            const int64_t rz = cz - r.anchorCz - int64_t(r.grid->originZ());
-            // atYaw answers MAT_AIR out of range by design, so this guard is
-            // only keeping the int32 narrowing honest -- same as above.
-            if (rx < INT32_MIN || rx > INT32_MAX || ry < INT32_MIN || ry > INT32_MAX ||
-                rz < INT32_MIN || rz > INT32_MAX)
-                continue;
-            const MaterialId m = r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
-                                               static_cast<int32_t>(rz), r.yawQuarter);
+            const MaterialId m = coverMaterialOfResolved(r, cx, cy, cz);
             if (m != MAT_AIR) return m;
         }
         return MAT_AIR;

@@ -23,8 +23,9 @@ is. Composition is AssetField::resolveForCoverCompose / coverMaterialOfResolved
    payload = descriptors + occupancy + 16 B palette + adaptive cells.
 
    site                     ground              inst/ha   PAYLOAD   flat index
-   alpine bank -61440,-61440  real fine+climate      156   10.5 MiB   290.1 MiB
+   grassland   -92445,-75855  REAL fine+climate    3,611   25.4 MiB    29.1 MiB
    grassland   -92445,-75855  coarse-only*         3,717   26.5 MiB    25.4 MiB
+   alpine bank -61440,-61440  real fine+climate      156   10.5 MiB   290.1 MiB
 
    CONTROL, same ground as the alpine arm, same reading:
    terrain at 10 cm, --radius 112       payload 31.3 MiB, flat index 37.4 MiB,
@@ -115,17 +116,29 @@ is. Composition is AssetField::resolveForCoverCompose / coverMaterialOfResolved
    compose as air and the run would report a free volume.
 
 
-7. STILL OPEN
+7. STILL OPEN -- AND THE PREDICTION, NOW RESOLVED
    No vegetated FINE-TILE site was censused -- grassland's fine tile (-7_-5) is
    not in the working set, and the survey's staged tiles are gone. The
    grassland number therefore stands on real climate over synthetic elevation.
 
-   PREDICTION, RECORDED BEFORE THE BAKE: re-running --detail-cover at
+   PREDICTION, RECORDED BEFORE THE RUN: re-running --detail-cover at
    -92445,-75855 with a real fine tile will land the payload between 15 and
    45 MiB, and not above 100 MiB. Reasoning: at the one site where gate
    attribution was measurable, biome weight refused 83.5% of (site, species)
    pairs and elevation band 15.8%. The grassland run already has real climate,
    which drives the dominant gate; real elevation refines the minority one.
 
-   If it lands outside 15-45 MiB, section 1's number should be re-derived from
-   the fine-tile row rather than patched.
+   RESOLVED 2026-08-20: 25.4 MiB. Prediction holds; the coarse-only proxy was
+   accurate to 4% (25.4 vs 26.5) and density moved 3,717 -> 3,611/ha, still
+   within 8% of the survey's 3,908.
+
+   NO BAKE WAS NEEDED. -7_-5.vxtl already existed in the v28 fine namespace UE
+   is pinned to (tile-cache/...-b19d281fd/000000000135276f/s16/, 312 MB,
+   2026-08-18), and the grassland site sits inside it: tile edge 15,360 m, so
+   (-7,-5) covers X -107,520..-92,160 and Y -76,800..-61,440. The gap was a
+   staging oversight, not a missing measurement. Worth remembering the next
+   time a result is qualified as "blocked on a bake".
+
+   STILL UNMEASURED: every biome other than grassland and alpine on real fine
+   tiles. By this file's own reading rule (section 2) that is a limit on the
+   claim, not a caveat to wave at it.
