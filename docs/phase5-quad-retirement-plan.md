@@ -3,10 +3,15 @@
 Companion to `docs/ray-marching-plan-2026-08-19.md`. Written for the marcher and GI workstreams to
 work against directly, because it names couplings on both their territory.
 
-**Status: step 1 done, steps 2–4 held.** The quad path cannot be turned off yet — the marcher misses
-86% of the hits it should make, so the quad pool is the only thing drawing terrain. The deliverable is
-a switch that is *ready to flip*, plus measurements taken with it flipped in an arm. Not a change of
-default.
+**Status: steps 1–3 done and gated OFF. Step 4 is follow-ons with owners.**
+
+Step 1 resolved the marcher's miss rate entirely: `drawn` went 1,138 → **8,015** against an occupancy
+control of 8,016, and the index gained 9,317 chunks. **The whole 86% was the pre-dispatch skip sites** —
+traversal, join, decode and the second DDA were all correct. The marcher then passed its depth gate on
+the brick source at 0.0433% interior disagreement against a 0.2671% reference-noise floor.
+
+The switch is built and **off by default**. It stays off until the marcher can skip empty space, cross
+rings and reach past 51.2 m; with it on today the world renders nearly empty beyond the near field.
 
 **The prize, measured not argued:** `fill 0.227 + pack 0.160 = 0.389 ms/chunk` against today's
 `mesh 0.810 + pack 0.158 = 0.969` — **2.49× cheaper per chunk**, with `fill < mesh` by 3.57×.
@@ -215,10 +220,31 @@ and must not be reported.
 
 ## 9. Sequence
 
-1. ~~Fix the all-solid pre-dispatch skip.~~ **Done.**
-2. **HOLD** — re-measure the marcher's miss rate with (1) fixed. If 86% collapses, the traversal may be
-   fine and the DDA hunt should stop; if it barely moves, both defects are real and independent.
-3. Gate the GPU fork so a brick-only job exists.
-4. Promote the switch to `voxel.Terrain.RetireQuads` with the falsifiable self-check and the pool-usage
-   accessor.
-5. Follow-ons with owners: GI ingest + `FindPoolWorldLocation`; the movement/residency coupling; skirts.
+1. ~~Fix the all-solid pre-dispatch skip.~~ **Done** — and it was the entire marcher miss rate.
+2. ~~Gate the GPU fork so a brick-only job exists.~~ **Done.** Smaller than scoped: the region request
+   already carried `bMeshChain`, used until now only by the verification gates, and
+   `AddRegionPasses` places its early-out (`VoxelGpuWorldGen.cpp:1429`) **after** both the band pass
+   and the brick pack. So a brick-only job costs no new kernel and no new shader, and the band — which
+   the buried skip and the cold-band throttle depend on — survives untouched.
+3. ~~`voxel.Terrain.RetireQuads` with the falsifiable self-check and the pool-usage accessor.~~ **Done,
+   default 0.**
+4. Follow-ons with owners: GI ingest; the movement/residency coupling; skirts.
+
+## 10. Corrections to this document
+
+- **`FindPoolWorldLocation` is NOT the crash cause.** The GI workstream investigated and killed it —
+  that path logs and defers rather than querying. It found something worse in the same area: the GI
+  volume **latches** its anchor from a camera position that reads exactly zero until the camera manager
+  has updated once, which under the shipping config would anchor the volume 6,144 km away
+  **permanently**. The "an absence triggers it silently" instinct was right about the shape and wrong
+  about the mechanism. Owned by GI.
+- **Retirement requires BOTH pack gates**, not just the master one. Gating only on
+  `voxel.GPU.BrickPack` looked right and was not: with `voxel.Brick.PackOnCpu 0` the CPU worker — ~92%
+  of streaming traffic — would have stopped meshing while never packing, producing nothing at all from
+  nine chunks in ten, with every switch reading as intended. `VoxelTerrainQuadsRetired()` now requires
+  both and refuses the combination rather than obeying it.
+- **A loud production Error log on a tested path costs an `AddExpectedError` in every test that
+  exercises it.** The first-eviction Error turned three green tests red, because the automation
+  framework promotes logged Errors to failures. That is a standing cost of the "announce the
+  transition" pattern, not an argument against it — but it should be paid deliberately, in the tests,
+  rather than by lowering the log.
