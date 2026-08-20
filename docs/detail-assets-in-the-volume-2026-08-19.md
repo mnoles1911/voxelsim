@@ -340,5 +340,16 @@ against unit tests, and only then point a byte gate at them.** Same shape as
   "~20k per 128×128 m" is 1.22 instances/m², 2.6× the current ceiling.
   `VoxelDetailAssetSubsystem.cpp:147` records the cut from 1000 → 300 per-mille.
   Use `docs/biome-placement-survey.md` for density; it is post-retune.
+* **`asset-forge/tools/lattice_ab.py` was measuring size on screen, not detail
+  — found and fixed while adding the 10 cm column (step 3).** `render.scale_for`
+  quantises pixels-per-voxel to {8,6,4,3,2,1} and each variant was scaled to
+  FILL its own cell, so metres-per-pixel differed across a row: measured, the
+  5 cm reed rendered 63x118 px against the 2 cm reed's 151x345 px for plants of
+  2.65 m and 2.86 m. **The coarse column looked better than it was, which is the
+  exact direction that would have biased this phase's own decision.** The tool
+  now sets pixels-per-voxel proportional to pitch (1 px per cm of voxel edge,
+  integral because every authored pitch is a whole number of cm) and applies one
+  common per-row downscale. Any earlier sheet from this tool — including
+  `out/lattice-ab.png` — carries the old bias and should not be re-read.
 * **The `bankGrid` global mutex is a prerequisite for this phase**, not a side
   effect of it — see §6, item 3.

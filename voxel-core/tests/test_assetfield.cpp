@@ -579,3 +579,205 @@ VXC_TEST(assetfield_installed_field_moves_the_world_digest_and_the_digest_is_pin
     // bump): layer table, policy maths, scatter channels, or the fixture bake.
     CHECK_EQ((unsigned long long)wooded, 0xF41F8E6A14A3C5A9ull);
 }
+
+// --- COVER COMPOSE: the detail lattice, in a volume of its own --------------
+//
+// WHAT THESE GUARD, and it is a failure shape this project already knows. The
+// obvious reference for a cover byte gate is materialAtResolved, and it returns
+// MAT_AIR for every detail grid BY DESIGN (assetfield.h:354, "the last line of
+// defence"). A gate built on it compares cover against air and PASSES IF THE
+// PRODUCER ALSO EMITS NOTHING -- a check that cannot fail. The first test below
+// is that check made able to fail: over ONE instance list it asserts the world
+// path answers air AND the cover path answers the material. If cover compose is
+// ever quietly reduced to a no-op, that test goes red rather than green.
+//
+// The tolerance here is EXACTLY ZERO and that is not an oversight. Both sides
+// are integer voxels with no float anywhere in the path, so unlike a depth or
+// timing gate there is no reference noise floor to calibrate against. Nobody
+// should add an epsilon here out of habit.
+
+namespace {
+
+// A tuft-sized detail asset: 2x2x6 voxels at 50 mm = 10x10x30 cm.
+bool makeTuft(AssetGrid& g) {
+    return g.parse(solidBlock(2, 2, 6, MAT_LEAF_BROADLEAF, 50u)) == AssetParseError::kOk;
+}
+
+// A detail-lattice field over one grid, sited in every 800 mm cell -- the real
+// L3 cell size (asset-forge/forge/manifest.py:591).
+struct CoverFixture {
+    AssetLayer layers[1];
+    AssetSpecies sp[1];
+    OneGridBank bank;
+    AssetField field;
+
+    explicit CoverFixture(const AssetGrid* g, uint32_t pitchMm = 50u) : bank(g) {
+        layers[0] = everyCell(800, 300, 0, /*terrain*/ false);
+        sp[0] = pillarSpecies(0, 300, pitchMm);
+        field.setSeed(kSeed);
+        field.setLayers(layers, 1);
+        field.setSpecies(sp, 1);
+        field.setBankSource(&bank);
+    }
+};
+
+} // namespace
+
+VXC_TEST(covercompose_composes_exactly_what_world_compose_refuses) {
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CHECK(!g.onTerrainLattice());
+    CoverFixture fx(&g);
+    CHECK(!fx.field.empty());
+
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+
+    // The WORLD path drops every one of them -- this is the "cannot fail"
+    // reference, asserted rather than assumed.
+    const std::vector<AssetField::ResolvedAssetInstance> world =
+        fx.field.resolveForCompose(insts);
+    CHECK_EQ(int(world.size()), 0);
+
+    // The COVER path keeps them all.
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK_EQ(int(cover.size()), int(insts.size()));
+
+    // And it puts the material somewhere. Sample the first instance's own base
+    // voxel: local (0,0,0) of a grid whose origin is (0,0,0).
+    const AssetField::ResolvedCoverInstance& r0 = cover[0];
+    const int64_t bx = r0.anchorCx + r0.grid->rotatedOriginX(r0.yawQuarter);
+    const int64_t by = r0.anchorCy + r0.grid->rotatedOriginY(r0.yawQuarter);
+    const int64_t bz = r0.anchorCz + r0.grid->originZ();
+    CHECK_EQ(int(AssetField::coverMaterialAtResolved(cover, bx, by, bz)),
+             int(MAT_LEAF_BROADLEAF));
+
+    // The same cover voxel through the world composer is air, because a detail
+    // grid is not a world-lattice thing. Two composers, two lattices, and the
+    // one that must answer does.
+    CHECK_EQ(int(AssetField::materialAtResolved(world, bx, by, bz)), int(MAT_AIR));
+}
+
+VXC_TEST(covercompose_stands_cover_on_the_anchor_voxel_not_inside_it) {
+    // The terrain convention shares the anchor voxel; cover must sit on its TOP
+    // surface, or a 5 cm tuft is entirely buried in the 10 cm ground cube
+    // (VoxelDetailAssetSubsystem.cpp:538-544).
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK(!cover.empty());
+
+    // 100 mm world voxel / 50 mm cover voxel = 2 cover voxels per world voxel.
+    for (size_t i = 0; i < cover.size(); ++i) {
+        CHECK_EQ(int(cover[i].anchorCz), int((insts[i].anchorVz + 1) * 2));
+        CHECK_EQ(int(cover[i].pitchMm), 50);
+    }
+
+    // The cover voxel directly BELOW the base is air: nothing was buried.
+    const AssetField::ResolvedCoverInstance& r0 = cover[0];
+    const int64_t bx = r0.anchorCx + r0.grid->rotatedOriginX(r0.yawQuarter);
+    const int64_t by = r0.anchorCy + r0.grid->rotatedOriginY(r0.yawQuarter);
+    const int64_t bz = r0.anchorCz + r0.grid->originZ();
+    CHECK_EQ(int(AssetField::coverMaterialAtResolved(cover, bx, by, bz - 1)), int(MAT_AIR));
+}
+
+VXC_TEST(covercompose_floors_negative_anchors_rather_than_truncating) {
+    // THE SIGN BUG, and the census ground is at (-39661, -57292) so this is the
+    // common case, not the edge one. C++ floorDiv floors; HLSL '/' truncates
+    // toward zero; they disagree on every negative non-multiple. A GPU mirror
+    // must therefore receive anchors ALREADY DIVIDED by this function.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{-400, -400, -369, -369},
+        [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK_EQ(int(cover.size()), int(insts.size()));
+
+    // CALIBRATE THE TEST BEFORE TRUSTING IT: it only has teeth if at least one
+    // instance actually lands where floor and truncation disagree.
+    int discriminating = 0;
+    for (size_t i = 0; i < cover.size(); ++i) {
+        const int64_t mm = insts[i].anchorXMm;
+        const int64_t trunc = mm / 50;           // toward zero, what HLSL does
+        const int64_t floored = cover[i].anchorCx;
+        // The floor property itself, on every instance.
+        CHECK(floored * 50 <= mm);
+        CHECK((floored + 1) * 50 > mm);
+        if (mm < 0 && (mm % 50) != 0) {
+            CHECK_EQ(int(floored), int(trunc - 1));
+            ++discriminating;
+        }
+    }
+    CHECK(discriminating > 0);
+}
+
+VXC_TEST(covercompose_refuses_a_grid_baked_at_another_pitch) {
+    // Nothing in voxel-core resamples (asset-forge/README.md:38-41), so a 20 mm
+    // bush in a 50 mm volume would come out 2.5x its size. It is dropped, and
+    // the volume stays empty rather than wrong.
+    AssetGrid g20;
+    CHECK_EQ(int(g20.parse(solidBlock(2, 2, 6, MAT_LEAF_BROADLEAF, 20u))),
+             int(AssetParseError::kOk));
+    CoverFixture fx(&g20, /*species pitch*/ 20u);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+
+    // Its own pitch composes.
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 20u).size()), int(insts.size()));
+    // A 50 mm volume refuses it entirely.
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 50u).size()), 0);
+}
+
+VXC_TEST(covercompose_refuses_a_pitch_that_does_not_tile_the_world_lattice) {
+    // (anchorVz + 1) must land on a cover-voxel boundary. 100/30 does not
+    // divide, so the whole volume is refused rather than composed half a voxel
+    // low everywhere.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 30u).size()), 0);
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 0u).size()), 0);
+}
+
+VXC_TEST(covercompose_never_admits_a_terrain_lattice_instance) {
+    // Trees and rocks are already in the world volume through
+    // VoxelAssetStamp.usf -> BrickPackMain (VoxelGpuWorldGen.cpp:1367/1389).
+    // Composing them here as well would draw every tree twice.
+    AssetGrid g;
+    CHECK_EQ(int(g.parse(solidBlock(1, 1, 30, MAT_BARK, uint32_t(kVoxelSizeMm)))),
+             int(AssetParseError::kOk));
+    CHECK(g.onTerrainLattice());
+    OneGridBank bank(&g);
+
+    const AssetLayer layers[1] = {everyCell(3200, 3000, 0, /*terrain*/ true)};
+    const AssetSpecies sp[1] = {pillarSpecies(0, 3000, uint32_t(kVoxelSizeMm))};
+    AssetField field;
+    field.setSeed(kSeed);
+    field.setLayers(layers, 1);
+    field.setSpecies(sp, 1);
+    field.setBankSource(&bank);
+
+    const std::vector<AssetInstance> insts = field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    // The world composer takes them ...
+    CHECK(!field.resolveForCompose(insts).empty());
+    // ... and the cover composer takes none of them, at any pitch.
+    CHECK_EQ(int(field.resolveForCoverCompose(insts, 50u).size()), 0);
+    CHECK_EQ(int(field.resolveForCoverCompose(insts, uint32_t(kVoxelSizeMm)).size()), 0);
+}
