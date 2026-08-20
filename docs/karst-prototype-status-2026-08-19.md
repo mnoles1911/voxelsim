@@ -312,6 +312,73 @@ format then keeps its ~280 KB, the client reconstructs identical geometry, and
 the sinuosity costs nothing on the wire. This is a format-design decision that
 had to be made before the format is written rather than after.
 
+## The four closed, and the killer risk is dead
+
+**1. THE BLEND QUESTION IS ANSWERED, AND THE FILLET CAN BE DROPPED.** This was
+the risk named as able to kill the project. Re-run on SINUOUS conduits (it was
+meaningless on straight ones -- "a smooth junction between two straight pipes is
+still two straight pipes"), and against a blend radius that rounds junctions
+instead of inflating them:
+
+| blend k | blended vs hard volume | hard-vs-blended IoU |
+|---|---|---|
+| 0.5 | 1.03x | **0.971** |
+| 1.0 | 1.09x | 0.916 |
+| 2.0 | 1.28x | 0.778 |
+| 4.0 | **1.93x** | 0.517 |
+
+The k=4.0 figure quoted earlier was never a smoothness measurement -- at that
+radius smooth-min inflates the conduit by **93% of its own volume**, so it was
+comparing a tube against a fatter tube. At a radius that only rounds junctions,
+**a hard union already matches smooth-min to within 3%.**
+
+The reason is subdivision: at 5 m pieces adjacent capsules overlap so heavily
+that their union is smooth by construction. The crease that motivated the whole
+fillet mitigation was an artefact of 217 m segments meeting at sharp angles.
+**Ship the hard union with its early-out; do not build fillet nodes.** That
+removes a bake-time step, an extra primitive class, and the only part of the
+geometry plan that had no bounded cost.
+
+**2. THE UNSERVED REGION IS LEGITIMATE GEOLOGY, NOT A SUPPRESSION ARTEFACT.**
+Conduit coverage within 300 m is 47.6% (alpine) and 86.2% (ponor), and the
+unserved ground is simply HIGHER:
+
+| | served | unserved | delta |
+|---|---|---|---|
+| alpine, elevation | 2,312 m | 2,649 m | **+337 m** |
+| ponor, elevation | 183 m | 706 m | **+524 m** |
+| ponor, water-table depth | 10.9 m | 33.1 m | +22 m |
+
+High massifs stand above the local base level, have no springs, and therefore
+grow no conduits. That is what real karst does -- caves cluster near base level
+-- so the empty high ground is the model working, not failing. **Nothing to fix.**
+
+**3. THE HEADROOM CHECK IS SPLIT.** "Passable" (1.2 m, crouched) is the bar;
+"standing" (1.8 m) is a texture statistic. Both tiles: **94% stand upright, 6%
+crouch-only**, minimum 1.60 m. The flat NO it used to print was the wide radius
+distribution working, reported as a regression.
+
+*6% is on the low side for the crawl texture the wide distribution was chosen
+for.* It follows arithmetically from log-uniform 0.8-9.0 m, where only ~5% of
+the range sits below a 0.9 m radius. If more squeezes are wanted, the
+distribution has to be shifted down, not widened further.
+
+**4. THE SPRING/HEADWATER GAP IS A CRITERION LIMIT, AND IT IS WORTH KNOWING.**
+Agreement was 29.7% on the alpine tile and 5.7% on the ponor one. Cause:
+
+| | alpine | ponor |
+|---|---|---|
+| water-table depth, mean | 48.4 m | 14.0 m |
+| cells with the table within 1 m of the surface | 9.8% | **47.4%** |
+
+The spring test is "the water table meets the surface in a valley where a
+horizon daylights". On wet flat ground the table is at the surface across nearly
+HALF the tile, so the test stops discriminating and suppression then picks 40
+resurgences out of 2,411 near-arbitrarily. **The criterion only works where the
+water table is deep.** The fix is to require the table to EMERGE -- a convergence
+or gradient condition -- rather than merely to be near the surface. Not done, and
+it is the highest-value correctness item left in the field stage.
+
 ## Next, in order
 
 1. **Owner looks at the map and sections** in `docs/images/karst/` and says
