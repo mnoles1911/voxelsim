@@ -231,3 +231,92 @@ VXC_TEST(karst_far_column_sees_no_segments) {
     CHECK(col.count == 0);
     CHECK(!karstCarveAt(col, kSurfaceMm, kBedrockDepthMm, 3000));
 }
+
+// --- MIRROR PARITY GROUNDWORK ---------------------------------------------
+// The HLSL mirror is voxel-core/shaders/karst.ush, compiled on its own against
+// both ADR-0001 targets by KarstMirrorTest.usf. Proving the two agree BIT-EXACTLY
+// needs both running over the same inputs, which is vxc_gpu's job once the carve
+// is wired into worldgen.ush. These two tests are what that run will be measured
+// against, and they pin the hazards the transliteration can plausibly get wrong.
+
+VXC_TEST(karst_is_translation_symmetric_across_the_origin) {
+    // HAZARD A from karst.ush's header: integer division direction. Every
+    // division here is either by a positive denominator with the numerator's
+    // sign preserved, or wholly non-negative -- so truncation is correct AND
+    // identical on both sides. If someone "fixes" one of them to floorDiv, or
+    // uses plain division where the lattice needs floor, the two sides diverge
+    // for NEGATIVE coordinates only, which is the half of the world nobody
+    // tests. So: the same conduit at +X and at -X must carve the same shape.
+    const int64_t kOffset = 1000000;   // 100 km, comfortably negative on the left
+    Fixture pos = straightTube(kAxisMm, 300, 250);
+    Fixture neg = pos;
+    for (auto& n : pos.nodes) n.xMm += static_cast<int32_t>(kOffset);
+    for (auto& n : neg.nodes) n.xMm -= static_cast<int32_t>(kOffset);
+
+    for (int64_t dy = -40; dy <= 40; dy += 8) {
+        const KarstColumn a = karstColumnFor(pos.table(), kOffset / kVoxelSizeMm, dy);
+        const KarstColumn b = karstColumnFor(neg.table(), -kOffset / kVoxelSizeMm, dy);
+        CHECK_EQ(a.count, b.count);
+        for (int32_t i = 0; i < a.count; ++i) {
+            CHECK_EQ(a.segs[i].marginSq, b.segs[i].marginSq);
+            CHECK_EQ(a.segs[i].rVertMm, b.segs[i].rVertMm);
+            CHECK_EQ(a.segs[i].floorDropMm, b.segs[i].floorDropMm);
+        }
+        CHECK_EQ(a.maxZMm - a.minZMm, b.maxZMm - b.minZMm);
+    }
+}
+
+VXC_TEST(karst_golden_digest) {
+    // THE TARGET THE GPU PARITY RUN IS MEASURED AGAINST. A branching table with
+    // varied kinds and radii, swept over a region, folded into one FNV-1a value.
+    // When karst.ush runs for real, it must reproduce this exact number; until
+    // then it pins the CPU side against accidental change.
+    //
+    // If this moves, kWorldGenVersion moves with it. That is the whole point of
+    // a golden: it is not a regression test, it is a version tripwire.
+    Fixture f;
+    const int32_t kinds[4] = {KARST_PHREATIC, KARST_VADOSE, KARST_KEYHOLE,
+                              KARST_EPIPHREATIC};
+    for (int i = 0; i < 4; ++i) {
+        KarstNode a;
+        a.xMm = -40000 + i * 7000;
+        a.yMm = -12000 + i * 9000;
+        a.zMm = kAxisMm + i * 2500;
+        a.rHorizCm = static_cast<uint16_t>(180 + i * 140);
+        a.rVertCm = static_cast<uint16_t>(120 + i * 90);
+        a.kind = static_cast<uint8_t>(kinds[i]);
+        KarstNode b = a;
+        b.xMm = 40000 - i * 5000;
+        b.yMm = 14000 - i * 6000;
+        b.zMm = kAxisMm - i * 1800;
+        b.rHorizCm = static_cast<uint16_t>(200 + i * 110);
+        b.rVertCm = static_cast<uint16_t>(150 + i * 70);
+        b.kind = a.kind;
+        f.nodes.push_back(a);
+        f.nodes.push_back(b);
+        f.edges.push_back(KarstEdge{static_cast<uint32_t>(2 * i),
+                                    static_cast<uint32_t>(2 * i + 1)});
+    }
+
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (v >> (b * 8)) & 0xFF;
+            h *= 1099511628211ull;
+        }
+    };
+    for (int64_t vx = -60; vx <= 60; vx += 4) {
+        for (int64_t vy = -60; vy <= 60; vy += 4) {
+            const KarstColumn col = karstColumnFor(f.table(), vx, vy);
+            mix(static_cast<uint64_t>(col.count));
+            mix(static_cast<uint64_t>(static_cast<uint32_t>(col.minZMm)));
+            mix(static_cast<uint64_t>(static_cast<uint32_t>(col.maxZMm)));
+            for (int64_t vz = 2900; vz <= 3100; vz += 3) {
+                mix(karstCarveAt(col, kSurfaceMm, kBedrockDepthMm, vz) ? 1u : 0u);
+            }
+        }
+    }
+    std::printf("      karst_layer golden: 0x%016llX\n",
+                static_cast<unsigned long long>(h));
+    CHECK_EQ(h, 0xA500EED45E8333B5ull);
+}

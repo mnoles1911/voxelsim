@@ -1,0 +1,235 @@
+#ifndef VXC_KARST_USH
+#define VXC_KARST_USH
+// KARST CONDUITS -- the HLSL mirror of voxelcore/karst.h.
+//
+// BIT-EXACT MIRROR. Collision resolves against the CPU `karstCarveAt`; display
+// resolves against this. ADR-0006 makes a divergence between them a desync
+// vector in a networked game, and a silent one -- so this file is a
+// TRANSLITERATION of karst.h, not a reimplementation of it. Same names, same
+// order of operations, same integer types. If you change one, change both in the
+// same commit and bump vxc::kWorldGenVersion.
+//
+// WHY IT IS ITS OWN FILE rather than another block inside worldgen.ush:
+//
+//   1. worldgen.ush is 3,180 lines and is the single most contended file in the
+//      repository -- two sessions have already collided in it, one of them badly
+//      enough that the editor would not boot. A self-contained include is a
+//      one-line integration when the file is free.
+//   2. It can be compile-checked ON ITS OWN, against both ADR-0001 targets,
+//      without building anything else. `KarstMirrorTest.usf` does exactly that.
+//
+// -- THE MIRROR HAZARDS IN THIS PARTICULAR CARVE, NAMED -------------------
+//
+// A. INTEGER DIVISION DIRECTION. C++ and HLSL both truncate toward zero for
+//    signed integer division, so `a / b` agrees. That is why this file uses
+//    plain `/` and NOT the floorDiv the rest of worldgen.ush uses: floorDiv
+//    exists for LATTICE indexing, where truncation and floor genuinely differ
+//    and floor is the correct answer. Here every division is either by a
+//    positive denominator with the numerator's sign preserved (karstLerp,
+//    karstFoot) or wholly non-negative (marginSq), so truncation is both
+//    correct and identical on the two sides. Getting this backwards -- using
+//    floorDiv here, or plain division for a lattice -- is the class of bug the
+//    mirror exists to prevent.
+//
+// B. 64-BIT INTERMEDIATES ARE REQUIRED, NOT OPTIONAL. `rV*rV * (rH*rH - dSq)`
+//    peaks near 2.1e16 with the radii this carve permits, which overflows int32
+//    by six orders of magnitude. int64_t is already used throughout
+//    worldgen.ush at cs_6_0, so this costs nothing new -- but a well-meaning
+//    narrowing to int would produce plausible geometry that diverges from the
+//    CPU only for large conduits, which is the worst possible failure shape.
+//
+// C. NO SQUARE ROOT, on either side. The column band uses the vertical
+//    semi-axis as a conservative half-extent. A sqrt would be a float, and a
+//    float in a bit-exact path is a divergence waiting for a driver update.
+
+// ---------------------------------------------------------------------------
+// Constants -- mirror of karst.h. Values, not derivations: a second derivation
+// is a second thing that can drift.
+// ---------------------------------------------------------------------------
+#define KARST_PHREATIC    0
+#define KARST_VADOSE      1
+#define KARST_KEYHOLE     2
+#define KARST_EPIPHREATIC 3
+#define KARST_CHAMBER     4
+#define KARST_SHAFT       5
+#define KARST_ENTRANCE    6
+
+#define kMaxKarstSegs 8
+
+static const int kKarstRoofMinMm = 4000;
+static const int kKarstBedrockMarginMm = 2000;
+static const int64_t kKarstMinVoxelZ = 0;   // == vxc::kSeaLevelVoxelZ
+static const int kKarstMaxReachMm = 12000;
+
+// ---------------------------------------------------------------------------
+// Wire types. Laid out to match the CPU structs field for field; the host
+// uploads the decoded arrays verbatim, with no resampling and no window phase,
+// which is what makes this mirror easier than the raster ones rather than
+// harder.
+// ---------------------------------------------------------------------------
+struct GpuKarstNode {
+    int xMm;
+    int yMm;
+    int zMm;
+    uint rHorizCm;   // packed: low 16 bits rHoriz, high 16 bits rVert
+    uint kindTier;   // packed: low 8 bits kind, next 8 bits tier
+};
+
+struct GpuKarstEdge {
+    uint n0;
+    uint n1;
+};
+
+struct GpuKarstSeg {
+    int marginSq;
+    int axisZMm;
+    int floorDropMm;
+    int rVertMm;
+    uint kind;
+};
+
+struct GpuKarstColumn {
+    int count;
+    int minZMm;
+    int maxZMm;
+    uint overflow;
+    GpuKarstSeg segs[kMaxKarstSegs];
+};
+
+// ---------------------------------------------------------------------------
+// Arithmetic -- transliterated from karst.h line for line.
+// ---------------------------------------------------------------------------
+
+// karstFoot: squared distance from (px,py) to the segment, and the
+// interpolation parameter as an exact numerator/denominator pair.
+void karstFoot(int64_t px, int64_t py, int64_t ax, int64_t ay,
+               int64_t bx, int64_t by,
+               out int64_t distSq, out int64_t tNum, out int64_t tDen) {
+    const int64_t abx = bx - ax;
+    const int64_t aby = by - ay;
+    const int64_t apx = px - ax;
+    const int64_t apy = py - ay;
+    const int64_t den = abx * abx + aby * aby;
+    if (den <= 0) {
+        distSq = apx * apx + apy * apy;
+        tNum = 0;
+        tDen = 1;
+        return;
+    }
+    int64_t num = apx * abx + apy * aby;
+    if (num < 0) num = 0;
+    if (num > den) num = den;
+    const int64_t fx = apx * den - abx * num;
+    const int64_t fy = apy * den - aby * num;
+    distSq = (fx / den) * (fx / den) + (fy / den) * (fy / den);
+    tNum = num;
+    tDen = den;
+}
+
+int64_t karstLerp(int64_t a, int64_t b, int64_t num, int64_t den) {
+    return a + ((b - a) * num) / den;
+}
+
+int karstClamp32(int64_t v, int lo, int hi) {
+    return (int)(v < (int64_t)lo ? (int64_t)lo : (v > (int64_t)hi ? (int64_t)hi : v));
+}
+
+// karstSegForColumn. Returns true when the conduit reaches this column.
+bool karstSegForColumn(GpuKarstNode a, GpuKarstNode b, int64_t vx, int64_t vy,
+                       int voxelSizeMm, out GpuKarstSeg outSeg) {
+    outSeg = (GpuKarstSeg)0;
+
+    const int64_t px = vx * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
+    const int64_t py = vy * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
+
+    int64_t distSq, tNum, tDen;
+    karstFoot(px, py, a.xMm, a.yMm, b.xMm, b.yMm, distSq, tNum, tDen);
+
+    const int64_t aH = (int64_t)(a.rHorizCm & 0xFFFF) * 10;
+    const int64_t bH = (int64_t)(b.rHorizCm & 0xFFFF) * 10;
+    const int64_t rH = karstLerp(aH, bH, tNum, tDen);
+    if (rH <= 0 || distSq >= rH * rH) return false;
+
+    const int64_t aV = (int64_t)((a.rHorizCm >> 16) & 0xFFFF) * 10;
+    const int64_t bV = (int64_t)((b.rHorizCm >> 16) & 0xFFFF) * 10;
+    const int64_t rV = karstLerp(aV, bV, tNum, tDen);
+    if (rV <= 0) return false;
+
+    // Hazard B: this product needs 64 bits. See the header note.
+    const int64_t marginSq = (rV * rV) * (rH * rH - distSq) / (rH * rH);
+    if (marginSq <= 0) return false;
+
+    const uint kind = a.kindTier & 0xFF;
+    outSeg.marginSq = karstClamp32(marginSq, 0, 0x7FFFFFFF);
+    outSeg.rVertMm = karstClamp32(rV, 0, 0x7FFFFFFF);
+    outSeg.axisZMm = karstClamp32(karstLerp((int64_t)a.zMm, (int64_t)b.zMm, tNum, tDen),
+                                  -2147483647 - 1, 0x7FFFFFFF);
+    outSeg.kind = kind;
+    outSeg.floorDropMm = (kind == KARST_KEYHOLE) ? karstClamp32(rV * 3 / 2, 0, 0x7FFFFFFF) : 0;
+    return true;
+}
+
+// karstColumnFor. THE ITERATION ORDER IS PART OF THE WORLDGEN CONTRACT: edges
+// are visited in index order and appended in that order, so two sides that
+// disagree about the order disagree about which segments survive an overflow.
+GpuKarstColumn karstColumnFor(StructuredBuffer<GpuKarstNode> nodes,
+                              StructuredBuffer<GpuKarstEdge> edges,
+                              int edgeCount, int64_t vx, int64_t vy,
+                              int voxelSizeMm) {
+    GpuKarstColumn col = (GpuKarstColumn)0;
+    int lo = 0x7FFFFFFF;
+    int hi = -2147483647 - 1;
+
+    for (int i = 0; i < edgeCount; ++i) {
+        const GpuKarstEdge e = edges[i];
+        GpuKarstSeg s;
+        if (!karstSegForColumn(nodes[e.n0], nodes[e.n1], vx, vy, voxelSizeMm, s)) continue;
+        if (col.count >= kMaxKarstSegs) {
+            col.overflow = 1;
+            continue;
+        }
+        col.segs[col.count] = s;
+        col.count += 1;
+        const int segLo = s.axisZMm - s.rVertMm - s.floorDropMm;
+        const int segHi = s.axisZMm + s.rVertMm;
+        if (segLo < lo) lo = segLo;
+        if (segHi > hi) hi = segHi;
+    }
+    if (col.count > 0) {
+        col.minZMm = lo;
+        col.maxZMm = hi;
+    }
+    return col;
+}
+
+// karstCarveAt. Guard order is the CPU's, and each guard is an independent
+// reason to refuse.
+bool karstCarveAt(GpuKarstColumn col, int surfaceMm, int bedrockDepthMm,
+                  int64_t vz, int voxelSizeMm) {
+    if (col.count == 0) return false;
+
+    const int64_t centreMm = vz * (int64_t)voxelSizeMm + (int64_t)voxelSizeMm / 2;
+
+    if (centreMm < (int64_t)col.minZMm || centreMm > (int64_t)col.maxZMm) return false;
+    if (vz < kKarstMinVoxelZ) return false;
+
+    const int64_t bedrockTopMm = (int64_t)surfaceMm - (int64_t)bedrockDepthMm;
+    if (centreMm <= bedrockTopMm + (int64_t)kKarstBedrockMarginMm) return false;
+
+    const int64_t depthMm = (int64_t)surfaceMm - centreMm;
+
+    for (int i = 0; i < col.count; ++i) {
+        const GpuKarstSeg s = col.segs[i];
+        if (depthMm < (int64_t)kKarstRoofMinMm && s.kind != KARST_ENTRANCE) continue;
+
+        const int64_t dz = centreMm - (int64_t)s.axisZMm;
+        if (dz * dz < (int64_t)s.marginSq) return true;
+
+        if (s.floorDropMm > 0 && dz < 0 && -dz <= (int64_t)s.floorDropMm) {
+            if (s.marginSq > 0 && (dz * dz) / 16 < (int64_t)s.marginSq) return true;
+        }
+    }
+    return false;
+}
+
+#endif  // VXC_KARST_USH
