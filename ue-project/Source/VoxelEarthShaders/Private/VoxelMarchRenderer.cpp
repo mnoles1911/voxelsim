@@ -492,6 +492,29 @@ void VoxelMarchEnsureExtension(UWorld* World)
 	GetGlobalVoxelMarchChunkIndex().AttachToGlobalPool();
 }
 
+void VoxelMarchReleaseExtension()
+{
+	check(IsInGameThread());
+
+	// Reset in the same order UVoxelShadowMarchSubsystem::Deinitialize uses --
+	// extension first, then the state it holds -- so the extension is off the
+	// engine's list before the state it points at goes away.
+	//
+	// Dropping these is what lets EnsureExtension build a NEW extension bound
+	// to the NEXT world. Without it the IsValid() guard above is satisfied
+	// forever by a pointer to a DEAD world, and the marcher silently never
+	// registers again: terrain streams normally and nothing draws it, while
+	// water keeps rendering through its own quad pools. See the header.
+	if (GMarchExtension.IsValid() || GMarchState.IsValid())
+	{
+		UE_LOG(LogVoxelMarch, Display,
+		       TEXT("Voxel march view extension released (world teardown). The next Game/PIE "
+		            "world builds a fresh one; without this it would silently reuse a dead one."));
+	}
+	GMarchExtension.Reset();
+	GMarchState.Reset();
+}
+
 void VoxelMarchPublishSource(UWorld* World,
                              const TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe>& InVolume)
 {

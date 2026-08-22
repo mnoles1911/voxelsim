@@ -966,10 +966,13 @@ void FVoxelGpuMeshJobManager::Tick()
 		// before the validation checks means a rejected job's QueuedMs still
 		// describes real queueing time, not a zero from a job that was never
 		// actually going to run.
-		if (GVoxelGpuMeshLatencyStats != 0)
-		{
-			Job->PromotedSeconds = FPlatformTime::Seconds();
-		}
+		// STAMPED UNCONDITIONALLY, not just for latency stats. It used to be
+		// gated on GVoxelGpuMeshLatencyStats because its only consumer was
+		// QueuedMs, a diagnostic. It now also drives the in-flight TIMEOUT,
+		// which must not change behaviour depending on whether a stats cvar is
+		// on. One FPlatformTime::Seconds() per promoted job is nothing against
+		// the seven compute passes that follow it.
+		Job->PromotedSeconds = FPlatformTime::Seconds();
 
 		FString ValidationError;
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
@@ -1731,15 +1734,44 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			continue;
 		}
 
-		if (Now - Job->SubmitSeconds > TimeoutSeconds)
+		// TIMED FROM PROMOTION, NOT SUBMISSION -- and that distinction was
+		// costing HALF of all GPU mesh work.
+		//
+		// SubmitSeconds is stamped in Submit(), when the job joins the QUEUE.
+		// Using it here charged a job's queue wait against a budget whose own
+		// message calls itself "readback not ready", i.e. GPU time. Under a
+		// cold fill the queue is deep -- MaxInFlight and MeshBatchCap both
+		// throttle promotion by design -- so a job could sit for 9 s and get
+		// 1 s of actual GPU time before being declared timed out.
+		//
+		// Measured 2026-08-22: 8,984 jobs dispatched, 4,480 TIMED OUT (~50%),
+		// each abandoned after a full 10 s and redone on the CPU worker path.
+		//
+		// AND IT WAS SELF-REINFORCING, which is why it presents as a cliff
+		// rather than a constant tax: a timed-out job occupies its in-flight
+		// slot for the whole timeout, so half the pipeline fills with zombies,
+		// which lengthens the queue, which makes the next batch more likely to
+		// time out the same way.
+		//
+		// PromotedSeconds is the moment the job actually went to the GPU, which
+		// is what "readback not ready after N s" has always claimed to measure.
+		// Falling back to SubmitSeconds keeps a job that somehow reached
+		// InFlight without a promotion stamp from becoming immortal.
+		const double ClockStart = Job->PromotedSeconds > 0.0 ? Job->PromotedSeconds : Job->SubmitSeconds;
+		if (Now - ClockStart > TimeoutSeconds)
 		{
 			// Device loss, a wedged queue, or a render thread that never ran the
 			// command. Give up on it, but keep the job object alive for any
 			// render command still holding a reference.
 			Job->Abandoned.store(1, std::memory_order_release);
 			InFlight.RemoveAt(I, EAllowShrinking::No);
+			// The queue wait is REPORTED rather than charged, so a deep queue is
+			// still visible here -- it just no longer counts against the GPU.
+			const double QueuedSec = (Job->PromotedSeconds > 0.0 && Job->SubmitSeconds > 0.0)
+				? (Job->PromotedSeconds - Job->SubmitSeconds) : 0.0;
 			Finished.Add({ Job, EVoxelGpuMeshJobStatus::TimedOut,
-				FString::Printf(TEXT("readback not ready after %.1f s"), TimeoutSeconds) });
+				FString::Printf(TEXT("readback not ready after %.1f s on the GPU (queued %.1f s before that)"),
+				                Now - ClockStart, QueuedSec) });
 		}
 	}
 

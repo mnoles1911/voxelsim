@@ -2985,7 +2985,27 @@ int32 UVoxelWorldSubsystem::GetRingOverlapChunks()
 {
 	static const int32 Overlap = []
 	{
-		int32 Value = 0;
+		// DEFAULT 1 SINCE 2026-08-22, because the marcher is now the primary
+		// terrain renderer and this comment already said what it needs: "a
+		// marcher needs ONE chunk".
+		//
+		// At 0 exactly one level covers any given ground, so a ray leaves level
+		// L's resident set at ground level L+1 does not yet cover, and the seam
+		// reads as a GAP at the ring boundary. That is the defect the owner has
+		// reported repeatedly at 128/256/512 m. At 1 both levels hold the seam.
+		//
+		// Safe at the shipped radii, and the check below is what proves it
+		// rather than assuming: Outer/ChunkEdge is exactly 40 at every level, so
+		// admit-meets-unload needs N >= 10 and this clamps at 4. Moving a ring
+		// with -VoxelRingOuterMeters= can still break that, which is why the
+		// thrash check exists and logs an error naming this cvar.
+		//
+		// COSTS RESIDENT CHUNKS, and that is a real trade against the streaming
+		// complaint being worked in backlog 0.0 -- the seam band is admitted at
+		// BOTH levels instead of one. Set -VoxelRingOverlapChunks=0 to get the
+		// old behaviour back in one argument if the gaps turn out to be cheaper
+		// to live with than the extra streaming load.
+		int32 Value = 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOverlapChunks="), Value);
 		// Clamped at 4: past that the band is wider than the annulus at the
 		// inner levels and the admission span loop grows quadratically. A
@@ -17047,6 +17067,22 @@ void UVoxelWorldSubsystem::Deinitialize()
 
 		Index.Detach();
 		Pool.Reset();
+
+		// AND THE VIEW EXTENSION, which is the same bug a third time and the
+		// one that actually cost the owner three test sessions.
+		//
+		// GMarchExtension is created once, guarded by IsValid(), and bound to
+		// the world it was made for. Nothing released it, so PIE session two
+		// found a valid pointer to a DEAD world and returned without
+		// registering: the log shows the shadow extension re-registering every
+		// session and the march extension only in the first. Terrain streamed
+		// correctly and nothing drew it. Water, which has its own quad pools
+		// and does not go through this extension, kept rendering -- so the
+		// world looked empty except for lakes hanging in the sky.
+		//
+		// Ordered after the pool and index so the extension is gone before the
+		// data it reads; none of the three may outlive the UWorld.
+		VoxelMarchReleaseExtension();
 
 		// LOGGED WITH BOTH SIDES AND THE AFTER-READING, so this is a gate that
 		// can come out the other way. If a later change makes either teardown

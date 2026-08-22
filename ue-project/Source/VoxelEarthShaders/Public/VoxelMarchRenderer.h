@@ -1182,6 +1182,24 @@ public:
 // whoever owns the brick pool.
 VOXELEARTHSHADERS_API void VoxelMarchEnsureExtension(UWorld* World);
 
+// THE OTHER HALF OF EnsureExtension, and it is not optional.
+//
+// GMarchExtension is a process-lifetime global created ONCE, guarded by
+// if (!GMarchExtension.IsValid()), and associated with the UWorld it was made
+// for. Nothing released it, so the guard stayed satisfied forever: PIE session
+// two called EnsureExtension, found a valid pointer bound to session ONE's
+// dead world, and returned without registering anything. Terrain streamed
+// normally and was never drawn, while water -- which has its own quad pools
+// and no dependency on this extension -- kept rendering. The owner saw lakes
+// floating in an empty sky, three sessions running.
+//
+// UVoxelShadowMarchSubsystem never had this bug because it is a WORLD
+// subsystem: its Extension and State are members, rebuilt in OnWorldBeginPlay
+// and dropped in Deinitialize. This is that same teardown for the global pair.
+// Call it from the world's Deinitialize, next to the pool and index teardown --
+// same class of bug, same fix, third instance today.
+VOXELEARTHSHADERS_API void VoxelMarchReleaseExtension();
+
 VOXELEARTHSHADERS_API void VoxelMarchPublishSource(
 	UWorld* World,
 	const TSharedPtr<FVoxelFluidOccupancyVolume, ESPMode::ThreadSafe>& InVolume);
