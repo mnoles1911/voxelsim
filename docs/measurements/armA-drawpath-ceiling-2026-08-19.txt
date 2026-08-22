@@ -10116,6 +10116,31 @@ harness measure the idle lobe (see the p50 artifact entry above).
 
 THE HONEST HEADLINE IS -9.3% ON FLIGHT FRAME TIME, NOT -16%.
 
+================================================================================
+2026-08-22  CORRECTION: the index grid is 56 MiB, not 4 MiB
+================================================================================
+
+The "WHAT IT IS DOING" entry above says the flush-time FNV runs over "the WHOLE
+4 MiB chunk-index grid -- 1,048,576 iterations". BOTH NUMBERS ARE STALE. 4 MiB
+was ONE level grid at kDimZ=64; since the Z-aliasing fix (kDimZ=128) and the
+cover slot the grid is kGridSlots(7) x 128^3 = 14,680,064 dwords = 56 MiB, and
+the hash is ~14.7 MILLION iterations per flush, not ~1M.
+
+The correction STRENGTHENS the attribution rather than undermining it: 14.7M
+steps x ~180 flushes/window is ~2.6 BILLION hash steps per 5 s window, the
+right order for the measured 3,146-3,190 ms. At the claimed 1M iterations the
+same loop would have cost ~220 ms/window and the breakdown would not have
+closed to the tenth the way it does above.
+
+THE SAME STALENESS HID THE UPLOAD COST, which the hash entries leave implicit
+and the hash-OFF leg exposes (uploadMs 155-880 with the hash off is NOT noise):
+`Staged = Cells` was a 56 MiB memcpy per flush, re-copied inside RDG by
+QueueBufferUpload and pushed whole over PCIe, to move a typical ~9,500 changed
+cells of 14.7M -- 0.065%. ~10 GB of game-thread memcpy per 5 s window at ~180
+flushes. Fixed 2026-08-22 by the delta path behind voxel.March.IndexDeltaUpload
+(default 0 = the old full upload; VoxelMarchChunkIndex.cpp owns the design
+record, voxel.March.IndexDeltaVerify is the readback gate).
+
 The -16% came from comparing across TWO BUILDS (applydelta-full vs
 hashgate-verify), which differed by more than the hash -- the earlier build also
 carried a different set of instrumentation brackets. The same-binary A/B is

@@ -135,6 +135,7 @@
 
 class FRDGBuilder;
 class FRDGPooledBuffer;
+class FRHIGPUBufferReadback;
 
 // The shader-side binding, mirroring VOXEL_FLUID_OCCUPANCY_PARAMETERS() term
 // for term so the two traversal sources present the same shape to the marcher
@@ -409,10 +410,53 @@ public:
 	// vertical band. A non-zero drop count is not an error -- the band is finite
 	// -- but it bounds how much of the world the marcher can possibly see.
 	uint64 GetUploads() const { return Uploads; }
-	// Bytes pushed across all uploads. At six levels one dirty frame is 48 MiB,
-	// so this is the number that decides whether the per-level dirty rebuild is
-	// required or merely available.
+	// Bytes STAGED for upload, and it now tells the truth per path: a full
+	// staging adds the whole grid (kCells * 4 B = 56 MiB), a delta staging adds
+	// 8 B per changed cell (a [cell, value] dword pair). A staging that is
+	// replaced before Register() consumes it is subtracted back out, so this
+	// tracks bytes that actually cross to RDG rather than bytes that were
+	// merely prepared. This is the number that decided the delta path was
+	// required: ~10 GB per 5 s window staged to move ~0.065% of the grid.
 	uint64 GetUploadBytes() const { return UploadBytes; }
+
+	// ---- Wave 1.3: delta-upload accounting ---------------------------------
+	//
+	// Every counter here exists because the full-upload cost hid for weeks
+	// behind a stale "4 MiB" comment. The split says WHICH path ran and WHY,
+	// so the next reader can tell "the delta path is off" from "the delta path
+	// is on but always falling back" from the counters alone -- those have
+	// completely different owners.
+	struct FUploadStats
+	{
+		// Stagings that carried the whole grid vs only changed cells. With
+		// voxel.March.IndexDeltaUpload at its default 0, FullUploads counts
+		// every flush and DeltaUploads stays 0 -- the control-leg fingerprint.
+		uint64 FullUploads = 0;
+		uint64 DeltaUploads = 0;
+		// Cells staged across all delta stagings, and the size of the most
+		// recent staging (kCells for a full one) -- "cells uploaded per flush".
+		uint64 DeltaCellsStaged = 0;
+		uint32 LastStagedCells = 0;
+		// Why the FULL path ran while the delta switch was ON. "First" is the
+		// designed cold start (there is nothing on the GPU to patch), "Seed" is
+		// a reseed after attach (the whole grid changed meaning), "Pending"
+		// means a full staging was already waiting and absorbed this flush,
+		// "Large" is the voxel.March.IndexDeltaMaxCells threshold.
+		uint32 FullBecauseFirst = 0;
+		uint32 FullBecauseSeed = 0;
+		uint32 FullBecausePending = 0;
+		uint32 FullBecauseLarge = 0;
+		// voxel.March.IndexDeltaVerify results: the delta-patched GPU buffer,
+		// read back whole and FNV-hashed, against the hash of the CPU grid it
+		// was patched to equal. A single failure is a wrong world.
+		uint64 VerifyPasses = 0;
+		uint64 VerifyFailures = 0;
+	};
+	// Snapshot by value. Verify counters are written on the render thread and
+	// the rest on the game thread; reads are diagnostic and a one-frame-stale
+	// verify count is acceptable, a torn uint64 on x64 is not possible for
+	// aligned words.
+	FUploadStats GetUploadStats() const { return UploadStats; }
 
 	// A CONTENT HASH OF THE WHOLE GRID, and it exists because equal counts are
 	// not equal contents.
@@ -431,8 +475,10 @@ public:
 
 	// THE HASH IS OFF BY DEFAULT, AND THE MEASUREMENT IS WHY.
 	//
-	// MarkDirtyAndUpload ran an FNV-1a over the WHOLE 4 MiB grid on the GAME
-	// THREAD, once per flush, unconditionally. Measured 2026-08-22 on a moving
+	// MarkDirtyAndUpload ran an FNV-1a over the WHOLE grid (56 MiB at today's
+	// 7-slot shape; the "4 MiB" this comment used to claim was the old
+	// one-level kDimZ=64 grid) on the GAME THREAD, once per flush,
+	// unconditionally. Measured 2026-08-22 on a moving
 	// leg: 3,146-3,190 ms PER 5 SECOND WINDOW -- against a streaming tick that
 	// totals ~3,700 ms. It was ~85% of the tick, and therefore the world's
 	// generation ceiling, since throughput is MaxJobsInFlight x frame rate.
@@ -498,17 +544,74 @@ private:
 	void ApplyDelta(const struct FVoxelBrickIndexDelta& Delta);
 	void Seed(const TArray<struct FVoxelBrickIndexEntry>& Snapshot);
 	void MarkDirtyAndUpload();
+	// The two render-thread halves of the delta verify gate; called only from
+	// Register(). Enqueue copies the whole index buffer into VerifyReadback
+	// inside the graph that just scattered a delta; Poll hashes a completed
+	// readback and compares it to the hash the staging recorded.
+	void EnqueueDeltaVerify(FRDGBuilder& GraphBuilder, FRDGBufferRef IndexBuffer);
+	void PollDeltaVerify();
 	void NoteObservedSpan(const FIntVector& Coord, int32 Slot);
 	void NoteCellOwner(uint32 Cell, const FIntVector& Coord, int32 Slot);
 	// false => outside the cover band, refused and counted. Always true for a
 	// ring level: rings are bounded by their own presets and the static_asserts.
 	bool AdmitToSlot(const FIntVector& Coord, int32 Slot);
 
-	// The CPU shadow. 4 MiB, one dword per cell, resident for the process.
+	// The CPU shadow. One dword per cell, resident for the process. 56 MiB at
+	// today's shape (kGridSlots(7) x 128^3) -- NOT 4 MiB; that figure dates
+	// from one level grid at kDimZ=64, before the Z-aliasing fix and the cover
+	// slot, and it survived in comments long enough to make the full-upload
+	// cost look 14x cheaper than it was.
 	TArray<uint32> Cells;
-	// Staged for the next graph. See MarkDirtyAndUpload.
+	// Staged for the next graph (FULL upload path). See MarkDirtyAndUpload.
 	TArray<uint32> Staged;
 	bool bStagedValid = false;
+
+	// ---- Wave 1.3: the delta upload path (voxel.March.IndexDeltaUpload) ----
+	//
+	// Cells written since the LAST staging. Game thread only; populated by
+	// ApplyDelta's remove and add loops, and only while the delta switch is on
+	// -- with the switch off every staging is full and an untended set would
+	// grow for the life of the process.
+	TSet<uint32> DeltaPendingCells;
+	// Cells covered by the CURRENTLY STAGED pair list. Kept separate from
+	// pending so that a staging Register() has already consumed can be dropped,
+	// while one it has not must be merged into the next -- losing a cell here
+	// is a wrong index entry that renders as a hole or as another chunk's
+	// terrain, with no error anywhere.
+	TSet<uint32> DeltaStagedCells;
+	// Flat [cell, value] dword pairs, deduplicated by cell (the sets above are
+	// keyed by cell), values snapshotted from Cells on the GAME thread at
+	// staging time -- Register() must never read Cells itself, the game thread
+	// may be rewriting it. Guarded by DeltaStageLock, and the lock is NOT
+	// optional the way it would be for Staged: Staged never changes size, so a
+	// concurrent overwrite tears data at worst; this array changes size every
+	// staging, so an unguarded overwrite can REALLOCATE while the render
+	// thread reads the old allocation -- a dangling pointer, not a torn value.
+	TArray<uint32> StagedDeltaPairs;
+	bool bStagedDeltaValid = false;
+	FCriticalSection DeltaStageLock;
+	// Whether a FULL upload has been staged since the last Detach, i.e.
+	// whether there is a base on the GPU that a delta can legally patch. The
+	// first upload after creation (or after a teardown) must be full -- there
+	// is nothing to patch into.
+	bool bDeltaBaseEstablished = false;
+	// Seed() sets this: a reseed rewrites the meaning of the whole grid, so
+	// the next staging must be full regardless of how few cells moved.
+	bool bForceFullUpload = false;
+	// Bytes of the staging that has not been consumed yet, so a replaced
+	// staging can be subtracted back out of UploadBytes (see GetUploadBytes).
+	uint64 PendingStagedBytes = 0;
+	FUploadStats UploadStats;
+	// voxel.March.IndexDeltaVerify: hash of Cells at the moment the current
+	// delta pairs were staged (game thread writes, render thread reads under
+	// DeltaStageLock), and the single-buffered readback that checks the GPU
+	// buffer against it. Readback members are render-thread state, like Pooled.
+	uint64 StagedContentHash = 0;
+	bool bStagedHashValid = false;
+	TUniquePtr<FRHIGPUBufferReadback> VerifyReadback;
+	bool bVerifyInFlight = false;
+	uint64 VerifyExpectedHash = 0;
+
 	TRefCountPtr<FRDGPooledBuffer> Pooled;
 	bool bAttached = false;
 	bool bDirty = false;

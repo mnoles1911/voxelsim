@@ -292,7 +292,8 @@ namespace
 		TEXT("makes the lost counters wrong by one on purpose."),
 		ECVF_RenderThreadSafe);
 
-	// THE 4 MiB INDEX HASH, AS AN A/B SWITCH RATHER THAN A REBUILD.
+	// THE WHOLE-GRID INDEX HASH (56 MiB -- the "4 MiB" this comment used to say
+	// was the old one-level kDimZ=64 grid), AS AN A/B SWITCH RATHER THAN A REBUILD.
 	//
 	// FVoxelMarchChunkIndex::MarkDirtyAndUpload used to run an FNV-1a over the
 	// whole chunk-index grid on the GAME THREAD, once per pool flush,
@@ -307,7 +308,7 @@ namespace
 	// paying for. 1 forces the hash on with the comparator off.
 	TAutoConsoleVariable<int32> CVarVoxelMarchIndexContentHash(
 		TEXT("voxel.March.IndexContentHash"), 0,
-		TEXT("Force the chunk index's 4 MiB FNV content hash on (1) with the source comparator "
+		TEXT("Force the chunk index's whole-grid (56 MiB) FNV content hash on (1) with the source comparator "
 		     "off. Default 0. The hash is otherwise enabled only by voxel.March.VerifySource, "
 		     "which is the only consumer of the value. MEASUREMENT SWITCH: it costs ~85% of the "
 		     "streaming tick, so this is how you A/B that cost in a single binary rather than "
@@ -4552,7 +4553,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				{
 					// THE COMPARATOR OWNS THE HASH, because it is the only thing
 					// that reads it and it costs ~85% of the streaming tick to
-					// maintain (a 4 MiB FNV over the grid, on the game thread,
+					// maintain (a whole-grid FNV -- 56 MiB -- on the game thread,
 					// once per flush). Switched on here rather than read from a
 					// cvar inside the index, so the index keeps no opinion about
 					// who wants it. Idempotent; the first frame this branch runs
