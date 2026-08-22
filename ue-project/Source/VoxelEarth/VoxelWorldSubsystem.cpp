@@ -16899,6 +16899,53 @@ void UVoxelWorldSubsystem::Deinitialize()
 		}
 	}
 
+	// THE GPU BRICK POOL AND THE MARCH INDEX ARE PROCESS-LIFETIME GLOBALS AND
+	// THIS UWORLD IS NOT. Nothing released them before, and both teardown
+	// primitives -- FVoxelBrickPool::Reset and FVoxelMarchChunkIndex::Detach --
+	// existed with ZERO CALLERS.
+	//
+	// Why it was never caught: every measurement leg is a fresh -game process,
+	// so the pool was always empty at start. PIE re-entry is the only path that
+	// starts a world against a populated pool, and no leg has ever taken it.
+	// Pressing Stop then Play found it immediately: the second session rendered
+	// pure sky, because the pool still held the first session's chunks, no live
+	// record owned them so released stayed 0, and a full pool evicts
+	// farthest-from-focus -- which reads as "nothing ever streams in".
+	//
+	// ORDER MATTERS. Detach first so the sink is unhooked before the pool drops
+	// its allocations; Reset discards PendingIndexRemovals rather than
+	// delivering them, so a still-attached index would be left holding entries
+	// for chunks the pool had already forgotten.
+	//
+	// GUARDED ON bWorldBegunPlay for the reason SaveWorld above is: -game and
+	// -server also construct a subsystem for the transient "Entry" loading
+	// world, and that instance must not wipe a live pool on its way out.
+	//
+	// SINGLE-WORLD ASSUMPTION, stated because it is load-bearing: one global
+	// pool cannot serve two simultaneous worlds, so this is already the only
+	// coherent lifetime. If PIE ever runs a separate dedicated-server world
+	// alongside the client, the pool needs an owner before this does.
+	if (bWorldBegunPlay)
+	{
+		FVoxelMarchChunkIndex& Index = GetGlobalVoxelMarchChunkIndex();
+		FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+		const int32 EntriesBefore = Index.GetNumEntries();
+		const int32 ChunksBefore  = Pool.GetNumResidentChunks();
+
+		Index.Detach();
+		Pool.Reset();
+
+		// LOGGED WITH BOTH SIDES AND THE AFTER-READING, so this is a gate that
+		// can come out the other way. If a later change makes either teardown
+		// partial, the after-counts stay non-zero here and say so on the spot
+		// instead of surfacing as an empty world one Play press later.
+		UE_LOG(LogVoxelEarth, Display,
+		       TEXT("Voxel GPU teardown: released %d pool chunks and %d index entries "
+		            "(pool now %d, index now %d -- both must be 0)."),
+		       ChunksBefore, EntriesBefore,
+		       Pool.GetNumResidentChunks(), Index.GetNumEntries());
+	}
+
 	ChunkRoot = nullptr;
 	ChunkOwner = nullptr;
 	ChunkMaterial = nullptr;

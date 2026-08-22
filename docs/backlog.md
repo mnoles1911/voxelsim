@@ -38,6 +38,76 @@ and §6b in particular is stale and now says so.
 > buys headroom not fps) are structural and are expected to hold; the
 > milliseconds are not current.
 
+### 0.0 NEW P0 (2026-08-22) — MAJOR REGRESSION: marcher streaming is slower than the quad mesher it replaced
+
+**Owner-reported, in the editor, and it is the headline problem with the marcher
+programme right now.** Three symptoms, believed to be one cause:
+
+1. **Streaming is slower than the pre-marcher quad system.** Not "slower than
+   hoped" — slower than what shipped before any of this work.
+2. **Chunks are missing at LOD boundaries on initial load**, so the ring seams
+   are visible as gaps rather than as a detail change.
+3. **Flying at normal speed outpaces the streamer**, leaving holes that fill in
+   behind the camera.
+
+**Why this matters more than the draw-path win.** The marcher's headline is
+**2.72x p50 / 2.41x p95** on the *draw path*. That number is real and was
+measured on matched legs. But it buys frame time the owner cannot see while the
+world he is flying through has holes in it. **A renderer that draws an
+incomplete world quickly is not faster.** Every marcher-vs-quad comparison in
+`docs/measurements/armA-drawpath-ceiling-2026-08-19.txt` measures frames, not
+world completeness, so none of them would have caught this — and the standing
+warning in that file about asking "what was the quad arm doing that the marcher
+arm was not" applies to the *producer* side too, not just shadows and GI.
+
+**What is measured so far** (`Saved/Logs/VoxelEarth.log`, 2026-08-22 16:30-16:32,
+two PIE sessions back to back in one process):
+
+| | session 1 | session 2 |
+|---|---|---|
+| index entries after 5 s | 9,675 | 1,531 |
+| after 25 s | 65,522 | 26,106 |
+| sustained fill rate | ~2,000-2,500 chunks/s | decelerates 1,979 → 880 → 300/s |
+| streaming `tickMs` | 0.269 then collapses to **0.007** | **0.267-0.281 sustained** |
+
+So there are **two distinct problems layered on top of each other**:
+
+- **(a) A general streaming-throughput regression** vs the quad mesher. Not yet
+  quantified against a pre-marcher build — that comparison does not exist and is
+  the first thing to get.
+- **(b) A second-PIE-session throughput collapse.** Session 2 fills at roughly a
+  seventh of session 1's rate and its streaming tick never drops. Something is
+  not being reset per world besides the pool. **This is separate from the
+  teardown bug fixed on 2026-08-22** (see below) — that fix is verified working
+  and did not address this.
+
+**Already fixed, do not re-diagnose:** the brick pool and march chunk index were
+never torn down with the UWorld, so a second PIE session inherited a saturated
+index (`indexEntries=131047` of 131,072) full of orphans nobody owned, evicted
+~200/5 s, and rendered pure sky. Three links: no teardown call,
+`FVoxelBrickPool::Reset` and `FVoxelMarchChunkIndex::Detach` both existing with
+**zero callers**, and `Cells.SetNumZeroed` being a no-op on re-attach because
+`SetNumZeroed` only zeroes elements it adds. Fixed and gated —
+`Voxel GPU teardown: released 71060 pool chunks and 71060 index entries (pool now
+0, index now 0)`. **Session 2 now streams. It just streams badly**, which is (b).
+
+**An open design question the fix raises.** The teardown now DISCARDS 71,060
+chunks that were still valid geometry for the same world at the same location.
+Re-adopting them into the new world's records instead of dropping them would make
+a second Play near-instant rather than a full cold re-stream. That is an
+optimisation, not a correctness fix, and it should not be attempted until (a) and
+(b) are understood — but it is the reason session 2 starts from zero.
+
+**Suggested first move, and it is a comparison not a hunt:** build the
+pre-marcher quad configuration (`voxel.March 0`, `voxel.Terrain.RetireQuads 0`)
+and run the same flight, reading chunks/s and the LOD-boundary behaviour. That
+says whether (a) is the marcher's producer path or a change underneath both. The
+producer switches are command line / ini only — `-ExecCmds` lands after streaming
+has begun and will silently not apply (`VoxelBrickPool.cpp:286-304`).
+
+**Do not read frame time as progress on this item.** The thing being fixed is
+chunks per second and holes at boundaries.
+
 ### Where the engine is (2026-07-28)
 
 Standard flight leg, shipped defaults, **2560x1440**:
@@ -1385,11 +1455,16 @@ answers it (rc 2 = nothing baked, rc 3 = ambiguous);
 `docs/fine-tile-provider-identity.md` section 7 has the drop-in snippet. **Make
 the dir/id pair atomic**: refuse a run that supplies one without the other.
 
-**~35 GB OF STALE TILE NAMESPACES.** `D:/vox-wet-cache` and
-`D:/voxelsim/tile-cache` hold ~20 superseded bake namespaces at 0.3–2.2 GB each.
-Keep `...-b19d281fd` (bake_ver 28, current) and `...-bdcab4bed` (the previous
-pair). **Scan for junctions before any recursive delete** — this repo has the
-scar (`windows-junction-recursive-delete-hazard`).
+**REDUNDANT COARSE COPIES, ~870 MB.** (Was: *~35 GB of stale tile namespaces* --
+the fine-namespace half of that was done 2026-08-19, 21.29 GB -> 6.47 GB.) As of
+2026-08-21 `D:/voxelsim/tile-cache` is the single authoritative root and holds
+coarse + fine + superblocks together. `D:/vox-trunk-cache` and `D:/vox-wet-cache`
+still each hold a byte-identical 289-tile coarse `s1` tier (435 MB each) plus
+~20 superseded fine bake namespaces. Keep `...-b19d281fd` (bake_ver 28, current).
+**Scan for junctions before any recursive delete** -- this repo has the scar
+(`windows-junction-recursive-delete-hazard`), and `vox-wet-cache` in particular
+holds many namespaces that older measurement docs still cite by path, so read
+`docs/water-wet-country-*.md` before removing anything there.
 
 **THE BIOME MAP SHOULD COME FROM `vxc_climateprobe`, NOT A SECOND REPO'S WEB
 SERVICE.** `terrain-service/tools/world_map.py` needs the terrain-diffusion

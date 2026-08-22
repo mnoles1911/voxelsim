@@ -123,7 +123,21 @@ void FVoxelMarchChunkIndex::AttachToGlobalPool()
 	// 4 MiB, zeroed. Zero is "not resident" by construction -- kResidentBit
 	// clear -- so an unseeded grid reads as an empty world rather than as
 	// garbage slots, which is the safe direction.
-	Cells.SetNumZeroed(int32(kCells));
+	//
+	// ZEROED UNCONDITIONALLY, NOT VIA SetNumZeroed's SIZING PATH. This is a
+	// global that outlives a UWorld, so the SECOND attach -- a new PIE session
+	// after the first was stopped -- finds Cells already kCells long, and
+	// TArray::SetNumZeroed only zeroes elements it ADDS. It was therefore a
+	// no-op on re-attach and the grid kept every resident bit from the previous
+	// world. Seed() does not cover this either: it resets the counters and the
+	// spans, but never the cells.
+	//
+	// The symptom was a second PIE session that rendered pure sky
+	// (shadowmarch sky=1027408 of considered=1027408) with indexEntries frozen
+	// at 131047 against a 131072 pool -- an index full of chunks no live record
+	// owned, so nothing could be released and everything evicted.
+	Cells.SetNumUninitialized(int32(kCells));
+	FMemory::Memzero(Cells.GetData(), SIZE_T(Cells.Num()) * sizeof(uint32));
 
 	// ONE CALL, and the header explains why: registering and snapshotting
 	// separately leaves a window in which a flush delivers a delta against an
@@ -161,6 +175,54 @@ void FVoxelMarchChunkIndex::Detach()
 	TArray<FVoxelBrickIndexEntry> Ignored;
 	GetGlobalVoxelBrickPool().SetIndexSink(nullptr, Ignored);
 	bAttached = false;
+
+	// THE GPU-SIDE COPY MUST GO TOO, and it is a separate lifetime from Cells.
+	// Register() hands the march passes whatever Pooled holds; leaving it alive
+	// across a world teardown lets a stopped world's index keep answering
+	// lookups in the next one, which reads as terrain that is present but
+	// unmarchable. bStagedValid=false forces the next Register to rebuild from
+	// the (re-seeded) cells rather than trusting Staged.
+	Staged.Reset();
+	bStagedValid = false;
+	bDirty = true;
+
+	// POOLED IS RENDER-THREAD STATE AND MUST BE RELEASED THERE. Register()
+	// writes it via QueueBufferExtraction while a graph is building, so
+	// clearing it from the game thread here is a genuine data race on the
+	// pointer, not a theoretical one.
+	//
+	// It cannot simply be left alone either: with bStagedValid false, Register
+	// falls through to RegisterExternalBuffer(Pooled) and would hand the NEXT
+	// world the previous world's index buffer until the first flush replaced
+	// it -- a shorter window of exactly the bug this teardown exists to close.
+	//
+	// Enqueueing is what satisfies both. Render commands run in order, so the
+	// release lands after any in-flight graph that still references the buffer
+	// and before the next world's first Register. `this` is a global, so there
+	// is no lifetime question about the capture.
+	ENQUEUE_RENDER_COMMAND(VoxelMarchChunkIndexDetach)(
+		[this](FRHICommandListImmediate&)
+		{
+			Pooled.SafeRelease();
+		});
+
+	// A DETACHED INDEX MUST REPORT EMPTY, because it IS empty -- it is wired to
+	// no pool and owns no chunk. Leaving NumEntries at its last value made
+	// GetNumEntries() report 131047 for an index holding nothing, which is
+	// exactly the kind of plausible-but-false counter that has cost this
+	// feature three separate wrong conclusions.
+	//
+	// The cells are zeroed HERE as well as on attach so the detached state is
+	// self-consistent rather than "empty by counter, stale by content". Attach
+	// keeps its own memzero: it is the one that must also handle the very first
+	// sizing, and an attach that has not been preceded by a detach.
+	FMemory::Memzero(Cells.GetData(), SIZE_T(Cells.Num()) * sizeof(uint32));
+	CellOwner.Reset();
+	NumEntries = 0;
+	FMemory::Memzero(PerSlotEntries, sizeof(PerSlotEntries));
+
+	// The spans, offer buckets and alias counters are diagnostics about a
+	// session rather than residency, and Seed() resets them on the next attach.
 }
 
 namespace
