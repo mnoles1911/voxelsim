@@ -428,16 +428,15 @@ bool UVoxelCharacterMovementComponent::IsTerrainReadyAt(const FVector& Pos) cons
 		return false;
 	}
 
-	bool bTracked = false;
-	bool bHasComponent = false;
-	int32 Quads = 0;
-	bool bSettled = false;
-	if (Subsystem->DebugChunkStatusAt(Pos, bTracked, bHasComponent, Quads, bSettled) && bTracked && !bHasComponent
-	    && !bSettled)
-	{
-		return false;
-	}
-	return true;
+	// THE RULE ITSELF NOW LIVES IN UVoxelWorldSubsystem::IsChunkPresentableAt,
+	// unchanged. It moved because the front end's loading gate has to ask the
+	// identical question at 112 probe columns, and two hand-copies of a rule
+	// with this many clauses drift -- at which point the walk-mode gravity veto
+	// and the loading screen disagree about whether the world exists, and the
+	// symptom is a character falling through the floor a frame after the
+	// curtain lifts. Everything above this line is why the rule is what it is
+	// and stays here, next to the caller it was written for.
+	return Subsystem->IsChunkPresentableAt(Pos);
 }
 
 // ---------------------------------------------------------------------------

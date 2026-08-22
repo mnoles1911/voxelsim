@@ -35,9 +35,38 @@ public:
 	AVoxelEarthGameMode();
 
 	virtual void RestartPlayer(AController* NewPlayer) override;
+
+	// --- Front-end seam (docs/front-end-plan.md) -----------------------------
+	//
+	// Spawns and possesses the player pawn, once, when the main menu hands off
+	// on NEW GAME/CONTINUE. Only ever called when
+	// VoxelFrontEnd::IsEnabledThisRun() is true -- otherwise AGameModeBase
+	// spawns the pawn at StartPlay exactly as it always did, which is what the
+	// self-driving verification switches depend on.
+	//
+	// SpawnOverride is a saved player transform to restore, or null for the
+	// ordinary spawn column. It is honoured inside the RestartPlayer override
+	// (which is where every -VoxelSpawn* switch already lives), rather than by
+	// a second spawn path that would have to duplicate all of them.
+	//
+	// Idempotent: a second call warns and returns. Returns without spawning
+	// (and warns) if no player controller exists yet, so a caller that runs a
+	// frame early can simply try again next tick.
+	void BeginPlayerSession(const FTransform* SpawnOverride);
 	virtual void BeginPlay() override;
 
 private:
+
+	// --- Front-end seam state (docs/front-end-plan.md) -----------------------
+	// Set once by BeginPlayerSession; guards against a double NEW GAME press
+	// spawning two pawns.
+	bool bPlayerSessionBegun = false;
+	// A saved player transform to restore on the next RestartPlayer, set and
+	// cleared around that call by BeginPlayerSession. Unset in every run where
+	// the front end is suppressed, so the spawn-shaping -Voxel* switches keep
+	// their existing precedence untouched.
+	TOptional<FTransform> PendingSessionSpawnTransform;
+
 	FTimerHandle ScreenshotTimerHandle;
 	FTimerHandle SecondShotTimerHandle;
 	FTimerHandle QuitTimerHandle;

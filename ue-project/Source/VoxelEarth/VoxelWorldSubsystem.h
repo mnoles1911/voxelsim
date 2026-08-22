@@ -461,6 +461,73 @@ public:
 	bool DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent, int32& OutQuads,
 	                        bool& bOutSettled) const;
 
+	// --- Front-end seams (docs/front-end-plan.md) ---------------------------
+	//
+	// The four members below exist so the main menu can hold the world still
+	// while a player reads it, and so the loading screen can say something true
+	// about how much of the world is there yet. They are no-ops in every run
+	// where VoxelFrontEnd::IsEnabledThisRun() is false.
+
+	// Brings the voxel world up: replays an edit log (if one is named) and
+	// spawns ChunkOwner/ChunkRoot, which is what Tick() gates on -- so calling
+	// this IS opening the streaming gate, and not calling it is the gate being
+	// shut. There is no separate flag, deliberately: Tick's first line has
+	// always been `if (!Impl || !ChunkOwner || !ChunkRoot) return;`, and
+	// OnWorldBeginPlay has always left those null on NM_DedicatedServer for
+	// exactly this "run the world, draw nothing" purpose. Reusing that path
+	// means the gate is exercised in production every day rather than being a
+	// second, untested way to be switched off.
+	//
+	// EditLogPathOrEmpty is replayed BEFORE anything spawns, preserving
+	// OnWorldBeginPlay's standing invariant that the log lands before any
+	// streaming work reads Impl->Voxels. Empty means "start from pure
+	// generation" (NEW GAME). Ignored on NM_Client, which gets its state from
+	// the server's join-sync reply instead.
+	//
+	// Idempotent: a second call warns and returns. Called inline from
+	// OnWorldBeginPlay when the front end is suppressed, so that arm is
+	// byte-identical to the behaviour that predates the front end.
+	void StartWorldSession(const FString& EditLogPathOrEmpty);
+	bool HasWorldSessionStarted() const { return ChunkOwner != nullptr; }
+
+	// Always-live streaming counters for the loading screen's progress bar and
+	// readiness gate. See FVoxelStreamingProgress (VoxelDebug.h) for why
+	// GetPerfSnapshot() cannot serve this purpose, and for the 5 Hz poll
+	// ceiling this walk's O(ChunkRecords) cost imposes.
+	FVoxelStreamingProgress GetStreamingProgress() const;
+
+	// Where streaming should centre itself before a pawn exists.
+	//
+	// Tick's own fallback when nothing is possessed is the world origin, which
+	// is right for the moment between StartPlay and RestartPlayer and wrong for
+	// the front end in two ways. First, the readiness probe needs a centre from
+	// its very first poll, and the pawn is spawned in the same tick the gate
+	// opens -- one frame of possession lag would centre 112 probes on (0,0)
+	// instead of the spawn column. Second, -VoxelSpawnAt= can put the spawn
+	// 65 km from the origin, where an origin-anchored first RecomputeDesiredSet
+	// would build a whole desired set and immediately throw it away.
+	//
+	// Tick prefers a possessed pawn whenever there is one, so once the player
+	// exists this override is inert -- it is a pre-pawn seed, not a camera
+	// override. Cleared at hand-off.
+	void SetStreamingAnchorOverride(const FVector& AnchorUU);
+	void ClearStreamingAnchorOverride();
+
+	// "Is the ground at this world position actually there to be stood on or
+	// looked at?" -- the tracked && (HoldsGeometry || settled) rule, in one
+	// place.
+	//
+	// EXTRACTED, NOT NEW. This rule was written once, carefully, inside
+	// UVoxelCharacterMovementComponent::IsTerrainReadyAt (whose comment is the
+	// doctrinal record for every clause of it and stays where it is). The
+	// loading gate needs the identical question answered at 112 probe columns,
+	// and two hand-copies of a rule this subtle WILL drift -- the walk-mode
+	// gravity veto and the loading screen would then disagree about whether the
+	// world exists, which is a bug that only shows up as "the character fell
+	// through the floor right after the curtain lifted". So both callers now
+	// share this one implementation.
+	bool IsChunkPresentableAt(const FVector& WorldPos) const;
+
 	// docs/debug-tooling-plan.md P1 "Perf HUD": a snapshot refreshed at 1Hz
 	// (per-frame collection, see FVoxelWorldImpl::UpdatePerfSnapshot), read by
 	// AVoxelEarthHUD every frame when voxel.Debug >= 1. Cheap struct copy;
@@ -561,6 +628,16 @@ private:
 	// M2 task "Config-driven seed": resolved in Initialize() from -VoxelSeed=
 	// (default DefaultSeed); see GetSeed() above.
 	uint64 Seed = DefaultSeed;
+
+	// Front-end pre-pawn streaming anchor; see SetStreamingAnchorOverride.
+	// Unset is the normal state and means "Tick's own pawn-or-origin rule".
+	TOptional<FVector> StreamingAnchorOverride;
+
+	// Guards StartWorldSession against a second call. Not the same question as
+	// HasWorldSessionStarted() (which reads ChunkOwner): a spawn failure leaves
+	// ChunkOwner null but must NOT invite a retry that replays the edit log a
+	// second time on top of itself.
+	bool bWorldSessionStartAttempted = false;
 
 	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): set true once
 	// OnWorldBeginPlay actually runs its game-world/Impl-present body (i.e.
