@@ -192,6 +192,16 @@ VOXELEARTHSHADERS_API const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status);
 VOXELEARTHSHADERS_API bool VoxelGpuBrickPackEnabled();
 VOXELEARTHSHADERS_API bool VoxelGpuBrickPackResidentEnabled();
 
+// Tier B.1: whether the manager may AMORTISE the GPU worldgen/pack passes by
+// fusing Z-sibling brick-only jobs into one tall region per column stack --
+// one set of passes for K chunks instead of K sets. voxel.GPU.WorldGenBatch
+// (default 0: today's per-chunk graphs, byte-identical control) with a
+// -VoxelGpuWorldGenBatch=<n> command-line override for the -ExecCmds
+// startup-window reason set out on VoxelGpuBrickPackEnabled. Same accessor
+// idiom as the two brick gates above, for the same "the gate is no longer a
+// cvar" lesson recorded there.
+VOXELEARTHSHADERS_API bool VoxelGpuWorldGenBatchEnabled();
+
 struct FVoxelGpuMeshJobResult
 {
 	uint64 JobId = 0;
@@ -433,6 +443,39 @@ public:
 		return Out;
 	}
 
+	// --- Tier B.1 (voxel.GPU.WorldGenBatch) window counters -----------------
+	//
+	// THE COUNTERS EXIST SO A SILENT NO-OP IS IMPOSSIBLE. This project has a
+	// recorded history of switches that were on and did nothing (the fork that
+	// carried zero traffic under retirement; the GPU gate that tested nothing
+	// for a long stretch), so the batch path counts every unit it dispatches
+	// AND every chunk that declined to batch, with the reason. If the switch
+	// is armed and the log shows zero stacks, the fallback columns say exactly
+	// why -- there is no state in which the feature can quietly not run.
+	//
+	// Consumed by the manager's own periodic log line ("[gpu-batch] ...",
+	// ~5 s cadence while armed). Deliberately NOT also exposed through a
+	// public read-and-reset accessor: two readers of a reset-on-read window
+	// halve each other's totals, which is the exact trap FTickStageMs's
+	// comment above documents.
+	//
+	// StackPasses / ClassicPasses are DERIVED from per-shape constants next to
+	// the dispatch code (kPassesPerStackDispatch etc. in the .cpp), not
+	// counted at the AddPass sites -- keep the constants in step with the
+	// pass-adding code they describe; each is commented at its definition.
+
+	// Fell back to the per-chunk path because:
+	enum class EBatchFallback : uint8
+	{
+		QuadMesh,   // the job still produces quads (voxel.Terrain.RetireQuads 0)
+		Band,       // the job carries its footprint's band request
+		Assets,     // the job stamps asset instances (span-table merge not built)
+		Mismatch,   // a Z-sibling's raster window / seed differed from the head's
+		Single,     // no contiguous Z-sibling was queued alongside it
+		Invalid,    // the assembled stack region failed validation (loud-logged)
+		COUNT
+	};
+
 	int32 GetMaxInFlight() const { return MaxInFlight; }
 	void SetMaxInFlight(int32 InMaxInFlight) { MaxInFlight = FMath::Max(1, InMaxInFlight); }
 
@@ -469,4 +512,19 @@ private:
 	// submit-last ordering alone cannot do against a FIFO queue.
 	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> QueuedLowPriority;
 	TArray<TSharedPtr<FJob, ESPMode::ThreadSafe>> InFlight;
+
+	// Tier B.1 window counters (game thread; the two crosscheck counters live
+	// as file-scope atomics in the .cpp because they are incremented on the
+	// render thread by poll commands that must not capture `this`).
+	int32 BatchStacks = 0;
+	int32 BatchStackChunks = 0;
+	int32 BatchStackPasses = 0;
+	int32 BatchClassicJobs = 0;
+	int32 BatchClassicPasses = 0;
+	int32 BatchFallbacks[uint8(EBatchFallback::COUNT)] = { 0 };
+	double LastBatchLogSeconds = 0.0;
+	bool bBatchArmingLogged = false;
+
+	void NoteBatchFallback(EBatchFallback Reason) { ++BatchFallbacks[uint8(Reason)]; }
+	void MaybeLogBatchWindow();
 };

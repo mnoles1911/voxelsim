@@ -102,6 +102,35 @@ struct FVoxelGpuRegionRequest
 	// dispatch is 3.375x less voxelize work per chunk than the mesher's.
 	bool bBrickPack = false;
 
+	// --- Tier B.1 (voxel.GPU.WorldGenBatch): per-chunk totals for a stack -----
+	//
+	// Only meaningful on a bBrickPack region that holds MORE THAN ONE chunk in
+	// z -- the batched "stack" region the job manager builds out of Z-sibling
+	// chunk jobs. Adds ONE 64-thread pass (BrickStackTotalsMain) that writes,
+	// into a (2 + 2*NumBrickChunks)-dword buffer, the region totals pair
+	// followed by each chunk's own occ/mat dword pair -- the numbers the pool
+	// needs to allocate PER CHUNK out of one batched dispatch, plus the region
+	// pair the CPU cross-checks the per-chunk sums against.
+	//
+	// FALSE BY DEFAULT AND FALSE EVERYWHERE THE BATCH SWITCH IS OFF, so the
+	// control graph is byte-for-byte the one that shipped. ValidateRegionRequest
+	// refuses it without bBrickPack rather than let it silently do nothing --
+	// this project's most expensive recurring bug is the parameter that runs and
+	// does nothing.
+	bool bPerChunkBrickTotals = false;
+
+	// --- gate-only: read the brick chain's outputs back --------------------
+	//
+	// Set ONLY by verification (voxel.GPU.VerifyBrickStack). RunRegionBlocking
+	// then also reads back the scratch descriptors, both arenas, the region
+	// totals, and (with bPerChunkBrickTotals) the per-chunk totals, so a gate
+	// can byte-compare a batched stack against per-chunk dispatches. THE
+	// STREAMING PATH NEVER SETS THIS: the no-readback direct-to-pool design
+	// (docs/gpu-pool-rendering-notes.md, Wave D / D1) is exactly the property
+	// batching must not undo, and keeping the readback behind a gate-only flag
+	// is how that stays a structural fact instead of a promise.
+	bool bReadbackBricks = false;
+
 	// --- Wave D / D2: the chunk-local emit permutation ----------------------
 	//
 	// Selects FVoxelMeshEmitCS's VXC_MESH_CHUNK_LOCAL permutation, which bakes
@@ -241,6 +270,26 @@ struct FVoxelGpuRegionResult
 	// Quads is sized to the upper bound (32 per mask); this is how many the
 	// scan says are actually live. Only the first NumQuads entries are output.
 	uint32 NumQuads = 0;
+
+	// --- Tier B.1 gate-only brick readbacks ---------------------------------
+	//
+	// Filled ONLY when the request set bReadbackBricks (and bBrickPack). All in
+	// the scratch, CHUNK-RELATIVE-or-batch-relative form the producer wrote --
+	// no pool base has been added, which is what makes them comparable across a
+	// batched and a per-chunk dispatch with plain offset arithmetic.
+	//
+	// BrickDescRaw holds NumBricks descriptor PAIRS as 2*NumBricks dwords
+	// (x then y per brick). BrickOccRaw/BrickMatRaw are the WORST-CASE-sized
+	// scratch arenas; only the prefix the totals name is live, the tail is
+	// whatever the transient allocator held -- compare live ranges only.
+	// BrickTotalsRaw is BrickTotalMain's region pair. BrickStackTotalsRaw is
+	// BrickStackTotalsMain's (2 + 2*NumBrickChunks) layout, empty unless the
+	// request also set bPerChunkBrickTotals.
+	TArray<uint32> BrickDescRaw;
+	TArray<uint32> BrickOccRaw;
+	TArray<uint32> BrickMatRaw;
+	TArray<uint32> BrickTotalsRaw;
+	TArray<uint32> BrickStackTotalsRaw;
 
 	// --- Wave D / D6: the footprint band ------------------------------------
 	//

@@ -554,6 +554,29 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
+	// Tier B.1 (voxel.GPU.WorldGenBatch). Splits a batched stack region's two
+	// scans into per-chunk totals -- see BrickStackTotalsMain's header comment
+	// in VoxelBrickPoolWrite.usf for why the split is a subtraction over the
+	// exclusive scans and why every batch cross-checks it. Same compile policy
+	// as FVoxelBrickTotalCS, and for the same reason: it is arithmetic over the
+	// scan arrays, not worldgen, so it has no business inside the version lock.
+	class FVoxelBrickStackTotalsCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickStackTotalsCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickStackTotalsCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, ScanCount)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InOccCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InMatCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickTotals)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	class FVoxelBrickWordCopyCS : public FVoxelBrickPoolShader
 	{
 	public:
@@ -672,6 +695,7 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPackCS,     VOXEL_BRICK_PACK_USF, "BrickPackM
 #define VOXEL_BRICK_POOL_WRITE_USF "/VoxelEarth/VoxelBrickPoolWrite.usf"
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickTotalCS,         VOXEL_BRICK_POOL_WRITE_USF, "BrickTotalMain",         SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickStackTotalsCS,   VOXEL_BRICK_POOL_WRITE_USF, "BrickStackTotalsMain",   SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickWordCopyCS,      VOXEL_BRICK_POOL_WRITE_USF, "BrickWordCopyMain",      SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickDescPoolWriteCS, VOXEL_BRICK_POOL_WRITE_USF, "BrickDescPoolWriteMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickChunkRecordCS,   VOXEL_BRICK_POOL_WRITE_USF, "BrickChunkRecordMain",   SF_Compute);
@@ -989,6 +1013,26 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 				NumBricks, kMaxMasksPerDispatch);
 			return false;
 		}
+	}
+
+	// Tier B.1: both batch-support flags are only meaningful on a brick-pack
+	// region, and both are REFUSED elsewhere rather than ignored. A flag that
+	// is set and silently does nothing is the exact failure shape that let the
+	// GPU gate test nothing for a long stretch (docs: "vxc_gpu tested nothing")
+	// -- the caller believes it asked for per-chunk totals or a readback, gets
+	// neither, and every downstream read of the missing data looks like its own
+	// unrelated bug.
+	if (Req.bPerChunkBrickTotals && !Req.bBrickPack)
+	{
+		OutError = TEXT("bPerChunkBrickTotals without bBrickPack — there is no brick scan to ")
+		           TEXT("split, so the flag would be silently inert");
+		return false;
+	}
+	if (Req.bReadbackBricks && !Req.bBrickPack)
+	{
+		OutError = TEXT("bReadbackBricks without bBrickPack — there are no brick buffers to ")
+		           TEXT("read back, so the flag would be silently inert");
+		return false;
 	}
 
 	if (Req.bMeshChain)
@@ -1431,6 +1475,41 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickTotalMain"), Shader, Params,
 				FIntVector(1, 1, 1));
 		}
+
+		// --- brick pass 10, Tier B.1 only: BrickStackTotalsMain ------------
+		//
+		// Splits the two scans into PER-CHUNK totals so one batched region can
+		// feed K per-chunk pool allocations from a single (2 + 2K)-dword
+		// readback. Absent (and the graph byte-identical) unless the request
+		// asked -- which only the voxel.GPU.WorldGenBatch stack path and its
+		// gate do. The region pair is restated in [0, 1] by the same kernel so
+		// the harvest can cross-check sum(per-chunk) == region without a second
+		// copy; see the kernel's header for why that check exists.
+		if (Request.bPerChunkBrickTotals)
+		{
+			Out.BrickStackTotals = GraphBuilder.CreateBuffer(
+				FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2 + 2 * S.NumBrickChunks),
+				TEXT("Voxel.BrickStackTotals"));
+
+			FVoxelBrickStackTotalsCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelBrickStackTotalsCS::FParameters>();
+			Params->ScanCount = S.NumBricks;
+			// 64 by contract; from the constant rather than a literal so this
+			// host code and decodeBrick's chunk decomposition cannot disagree.
+			Params->BrickCount = kBricksPerChunk;
+			Params->InOccCounts = GraphBuilder.CreateSRV(OccCounts);
+			Params->InOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
+			Params->InMatCounts = GraphBuilder.CreateSRV(MatCounts);
+			Params->InMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
+			Params->OutBrickTotals = GraphBuilder.CreateUAV(Out.BrickStackTotals);
+
+			TShaderMapRef<FVoxelBrickStackTotalsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder,
+				RDG_EVENT_NAME("Voxel.BrickStackTotals(%u chunks)", S.NumBrickChunks),
+				Shader, Params,
+				FIntVector(FMath::DivideAndRoundUp(S.NumBrickChunks, 64u), 1, 1));
+		}
 	}
 
 	if (!S.bMesh)
@@ -1799,10 +1878,27 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 	const bool bWantBand = Request.BandEdge > 0;
 	FString RenderError;
 
+	// Tier B.1 gate-only brick readbacks (bReadbackBricks). Sized from the
+	// SAME FRegionGraphSizes the graph is built from, so the copies and the
+	// buffers cannot disagree about a length. The occ/mat arrays are the
+	// worst-case scratch sizes; only the totals-named prefix is live.
+	const bool bWantBricks = Request.bBrickPack && Request.bReadbackBricks;
+	const bool bWantStackTotals = bWantBricks && Request.bPerChunkBrickTotals;
+	const uint32 BrickDescDwords = bWantBricks ? Sizes.NumBricks * 2u : 0u;
+	const uint32 BrickOccDwords = bWantBricks ? Sizes.BrickOccWordsMax : 0u;
+	const uint32 BrickMatDwords = bWantBricks ? Sizes.BrickMatWordsMax : 0u;
+	const uint32 StackTotalDwords = bWantStackTotals ? (2u + 2u * Sizes.NumBrickChunks) : 0u;
+	TArray<uint32> BrickDescOut;
+	TArray<uint32> BrickOccOut;
+	TArray<uint32> BrickMatOut;
+	TArray<uint32> BrickTotalsOut;
+	TArray<uint32> StackTotalsOut;
+
 	ENQUEUE_RENDER_COMMAND(VoxelGpuRunRegion)(
 		[&Request, &ColumnsOut, &CellsOut, &CountsOut, &OffsetsOut, &QuadsOut, &GpuTotalOut,
 		 &BandOut, &bBandOut, &RenderError, NumColumns, NumCells, bMesh, MaskCount, QuadElements,
-		 bWantBand]
+		 bWantBand, bWantBricks, bWantStackTotals, BrickDescDwords, BrickOccDwords, BrickMatDwords,
+		 StackTotalDwords, &BrickDescOut, &BrickOccOut, &BrickMatOut, &BrickTotalsOut, &StackTotalsOut]
 		(FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
@@ -1825,6 +1921,13 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		FRHIGPUBufferReadback QuadsReadback(TEXT("Voxel.QuadsReadback"));
 		FRHIGPUBufferReadback TotalReadback(TEXT("Voxel.QuadTotalReadback"));
 		FRHIGPUBufferReadback BandReadback(TEXT("Voxel.BandReadback"));
+		// Tier B.1 gate-only. Declared unconditionally (cheap, they hold nothing
+		// until enqueued) so the copy-out below can reference them either way.
+		FRHIGPUBufferReadback BrickDescReadback(TEXT("Voxel.BrickDescReadback"));
+		FRHIGPUBufferReadback BrickOccReadback(TEXT("Voxel.BrickOccReadback"));
+		FRHIGPUBufferReadback BrickMatReadback(TEXT("Voxel.BrickMatReadback"));
+		FRHIGPUBufferReadback BrickTotalsReadback(TEXT("Voxel.BrickTotalsReadback"));
+		FRHIGPUBufferReadback StackTotalsReadback(TEXT("Voxel.BrickStackTotalsReadback"));
 
 		const uint32 ColumnsBytes = NumColumns * sizeof(FVoxelGpuColumnSample);
 		const uint32 CellsBytes = NumCells * sizeof(uint32);
@@ -1840,6 +1943,29 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		{
 			AddEnqueueCopyPass(GraphBuilder, &BandReadback, Graph.Band, 2 * sizeof(int32));
 		}
+		// Tier B.1 gate-only: the brick chain's outputs. THE STREAMING PATH
+		// NEVER TAKES THESE COPIES -- bReadbackBricks is a verification flag,
+		// and the whole point of the batched path is that nothing but sizes
+		// crosses PCIe. Guarded on the buffers existing so a refused chain
+		// cannot enqueue a copy from null.
+		if (bWantBricks && Graph.BrickDesc != nullptr && Graph.BrickOcc != nullptr &&
+		    Graph.BrickMat != nullptr && Graph.BrickTotals != nullptr)
+		{
+			AddEnqueueCopyPass(GraphBuilder, &BrickDescReadback, Graph.BrickDesc,
+			                   BrickDescDwords * sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, &BrickOccReadback, Graph.BrickOcc,
+			                   BrickOccDwords * sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, &BrickMatReadback, Graph.BrickMat,
+			                   BrickMatDwords * sizeof(uint32));
+			AddEnqueueCopyPass(GraphBuilder, &BrickTotalsReadback, Graph.BrickTotals,
+			                   2 * sizeof(uint32));
+			if (bWantStackTotals && Graph.BrickStackTotals != nullptr)
+			{
+				AddEnqueueCopyPass(GraphBuilder, &StackTotalsReadback, Graph.BrickStackTotals,
+				                   StackTotalDwords * sizeof(uint32));
+			}
+		}
+
 		if (bMesh)
 		{
 			AddEnqueueCopyPass(GraphBuilder, &CountsReadback, CountsBuffer, CountsBytes);
@@ -1884,6 +2010,28 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 		CellsOut.SetNumUninitialized(NumCells);
 		CopyOut(CellsReadback, CellsOut.GetData(), CellsBytes, TEXT("Cells"));
 
+		if (bWantBricks)
+		{
+			BrickDescOut.SetNumUninitialized(int32(BrickDescDwords));
+			CopyOut(BrickDescReadback, BrickDescOut.GetData(),
+			        BrickDescDwords * sizeof(uint32), TEXT("BrickDesc"));
+			BrickOccOut.SetNumUninitialized(int32(BrickOccDwords));
+			CopyOut(BrickOccReadback, BrickOccOut.GetData(),
+			        BrickOccDwords * sizeof(uint32), TEXT("BrickOcc"));
+			BrickMatOut.SetNumUninitialized(int32(BrickMatDwords));
+			CopyOut(BrickMatReadback, BrickMatOut.GetData(),
+			        BrickMatDwords * sizeof(uint32), TEXT("BrickMat"));
+			BrickTotalsOut.SetNumUninitialized(2);
+			CopyOut(BrickTotalsReadback, BrickTotalsOut.GetData(),
+			        2 * sizeof(uint32), TEXT("BrickTotals"));
+			if (bWantStackTotals)
+			{
+				StackTotalsOut.SetNumUninitialized(int32(StackTotalDwords));
+				CopyOut(StackTotalsReadback, StackTotalsOut.GetData(),
+				        StackTotalDwords * sizeof(uint32), TEXT("BrickStackTotals"));
+			}
+		}
+
 		if (bWantBand && Graph.Band != nullptr)
 		{
 			CopyOut(BandReadback, BandOut, 2 * sizeof(int32), TEXT("Band"));
@@ -1918,6 +2066,13 @@ FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionR
 	Result.bBandValid = bBandOut;
 	Result.BandMaxSurfaceTopVoxel = BandOut[0];
 	Result.BandMinDeepestAirVoxel = BandOut[1];
+
+	// Tier B.1 gate-only brick readbacks; empty on every other path.
+	Result.BrickDescRaw = MoveTemp(BrickDescOut);
+	Result.BrickOccRaw = MoveTemp(BrickOccOut);
+	Result.BrickMatRaw = MoveTemp(BrickMatOut);
+	Result.BrickTotalsRaw = MoveTemp(BrickTotalsOut);
+	Result.BrickStackTotalsRaw = MoveTemp(StackTotalsOut);
 
 	if (bMesh)
 	{

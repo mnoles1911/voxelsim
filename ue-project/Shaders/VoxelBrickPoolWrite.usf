@@ -151,6 +151,70 @@ void BrickTotalMain(uint3 tid : SV_DispatchThreadID)
 }
 
 // ---------------------------------------------------------------------------
+// BrickStackTotalsMain -- per-chunk arena totals for a MULTI-CHUNK region
+// (voxel.GPU.WorldGenBatch, Tier B.1).
+//
+// WHY IT EXISTS. BrickTotalMain above answers "how many dwords does this
+// REGION need", which is the right question when a region is one chunk -- the
+// shape every streaming dispatch had until the batched path. A batched region
+// is a vertical stack of K chunks generated and packed in ONE set of passes,
+// and the pool still allocates PER CHUNK, so the CPU needs K pairs, not one.
+//
+// WHY THE SPLIT IS THIS SUBTRACTION AND NOTHING CLEVERER. decodeBrick's pack
+// order is CHUNK-MAJOR (brickpack.ush: packIndex = chunkIndex * 64 + local),
+// and the two scans run over the counts in pack order, so chunk c's bricks are
+// scan entries [c*BrickCount, (c+1)*BrickCount) and its arena words are the
+// CONTIGUOUS run from InOccOffsets[first] to InOccOffsets[last] +
+// InOccCounts[last]. That contiguity is what lets the pool copy a chunk out of
+// the batch scratch as one run, and this kernel is where the assumption is
+// turned into numbers the CPU can CHECK: the harvest cross-checks
+// sum(per-chunk) == region pair, so a wrong split fails loudly instead of
+// publishing somebody else's bricks. (This project has shipped code that ran
+// and did nothing for months; every batch therefore carries its own check.)
+//
+// Thread 0 also writes the region pair into [0, 1] -- the same derivation as
+// BrickTotalMain, restated so ONE readback carries both halves of the
+// cross-check. Layout: [0]=region occ, [1]=region mat, then per chunk c:
+// [2+2c]=occ dwords, [3+2c]=mat dwords.
+//
+// ScanCount is the region's brick count, BrickCount the bricks per chunk (64
+// by contract, bound from the host like every other count in this file).
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickStackTotalsMain(uint3 tid : SV_DispatchThreadID)
+{
+	// Same unreachable-defence guard as BrickTotalMain: a zero count would
+	// underflow the Last index below into a wild read.
+	if (ScanCount == 0u || BrickCount == 0u)
+	{
+		return;
+	}
+	const uint NumChunks = ScanCount / BrickCount;
+	if (tid.x >= NumChunks)
+	{
+		return;
+	}
+
+	const uint First = tid.x * BrickCount;
+	const uint Last  = First + BrickCount - 1u;
+	// The scans are EXCLUSIVE, so a chunk's words end at its last brick's start
+	// offset plus that brick's own count, and begin at its first brick's start
+	// offset. The difference is the chunk's total; it is also, because the pack
+	// order is chunk-major, the length of the chunk's contiguous arena run.
+	OutBrickTotals[2u + 2u * tid.x + 0u] =
+		(InOccOffsets[Last] + InOccCounts[Last]) - InOccOffsets[First];
+	OutBrickTotals[2u + 2u * tid.x + 1u] =
+		(InMatOffsets[Last] + InMatCounts[Last]) - InMatOffsets[First];
+
+	if (tid.x == 0u)
+	{
+		const uint L = ScanCount - 1u;
+		OutBrickTotals[0] = InOccOffsets[L] + InOccCounts[L];
+		OutBrickTotals[1] = InMatOffsets[L] + InMatCounts[L];
+	}
+}
+
+// ---------------------------------------------------------------------------
 // BrickWordCopyMain -- one arena, one chunk's run of dwords.
 //
 // A compute pass rather than AddCopyBufferPass for VoxelQuadPoolWrite.usf's

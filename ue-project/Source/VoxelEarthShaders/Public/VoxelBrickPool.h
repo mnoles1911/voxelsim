@@ -170,6 +170,25 @@ struct VOXELEARTHSHADERS_API FVoxelGpuBrickPayload
 	uint32 OccWords = 0;
 	uint32 MatWords = 0;
 
+	// Where this chunk's arena words START inside the scratch buffers above.
+	//
+	// ZERO for the one-chunk-per-job shape, where the producer's write bases
+	// are zero and the chunk's words begin at the front of its own buffers.
+	// NON-ZERO only for a chunk handed out of a BATCHED stack region
+	// (voxel.GPU.WorldGenBatch, Tier B.1): there the scratch buffers hold the
+	// whole stack and the scans ran across it, so chunk c's words are the
+	// contiguous run starting at the sum of its predecessors' totals -- the
+	// pack order is chunk-major (decodeBrick), which is what makes the run
+	// contiguous at all. Its DESCRIPTOR offset fields are then BATCH-relative,
+	// and Flush's desc-write pass folds `PoolBase - SrcOccFirst` in as one
+	// wrapped add; see AddFlushPasses_RenderThread for why the wrap is sound.
+	//
+	// Filled by the job manager at harvest, from the per-chunk totals readback
+	// -- the same numbers OccWords/MatWords come from, so the four cannot
+	// drift apart without the batch's own sum-vs-region cross-check failing.
+	uint32 SrcOccFirst = 0;
+	uint32 SrcMatFirst = 0;
+
 	// The chunk's min corner in LEVEL-L voxel coordinates, for the record.
 	FIntVector OriginVoxel = FIntVector::ZeroValue;
 };

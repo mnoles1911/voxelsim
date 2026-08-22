@@ -1311,28 +1311,48 @@ void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 		FRDGBufferRef SrcMat = P->Mat.IsValid()
 			? GraphBuilder.RegisterExternalBuffer(P->Mat, TEXT("BrickSrc.Mat")) : nullptr;
 
-		// The payload's occupancy offsets are chunk-relative and start at 0,
-		// so the whole run moves as one copy.
+		// The chunk's arena words are ONE CONTIGUOUS RUN in the scratch,
+		// starting at SrcOccFirst/SrcMatFirst -- zero for a single-chunk
+		// payload (offsets chunk-relative from 0, the original shape), the
+		// predecessors' summed totals for a chunk handed out of a batched
+		// stack region (Tier B.1). Either way the whole run moves as one copy.
 		if (P->OccWords > 0 && SrcOcc != nullptr)
 		{
 			VoxelGpuWorldGen::AddBrickWordCopyPass(GraphBuilder, DstOcc, SrcOcc,
-			                                       /*SrcFirst*/ 0, Write.OccBase, P->OccWords);
+			                                       P->SrcOccFirst, Write.OccBase, P->OccWords);
 		}
 		if (P->MatWords > 0 && SrcMat != nullptr)
 		{
 			VoxelGpuWorldGen::AddBrickWordCopyPass(GraphBuilder, DstMat, SrcMat,
-			                                       /*SrcFirst*/ 0, Write.MatBase, P->MatWords);
+			                                       P->SrcMatFirst, Write.MatBase, P->MatWords);
 		}
 
+		// THE DESC BASES ARE A SUBTRACTION DRESSED AS AN ADD, and the wrap is
+		// deliberate. A batched chunk's descriptor offsets are BATCH-relative
+		// (they include SrcOccFirst), so the value that turns them into pool
+		// addresses is `Write.OccBase - P->SrcOccFirst` -- which can be
+		// "negative" as a uint. That is fine BY THE KERNEL'S OWN ARITHMETIC:
+		// BrickDescPoolWriteMain computes ((offset + base) & 0x0fffffff), and
+		// two's-complement wrap followed by the 28-bit mask yields exactly
+		// (offset - SrcOccFirst + OccBase) whenever the true result fits in 28
+		// bits -- which FVoxelBrickPool::Init already guarantees by refusing
+		// arenas past 2^28 dwords. For the single-chunk shape SrcOccFirst is 0
+		// and this is byte-for-byte the old pass.
 		VoxelGpuWorldGen::AddBrickDescPoolWritePass(GraphBuilder, DstDesc, SrcDesc,
 		                                            P->SrcBrickFirst, Write.BrickBase,
-		                                            P->BrickCount, Write.OccBase, Write.MatBase);
+		                                            P->BrickCount,
+		                                            Write.OccBase - P->SrcOccFirst,
+		                                            Write.MatBase - P->SrcMatFirst);
 
 		// The record LAST, and reading the SCRATCH buffers. Last because a
 		// record is what makes a chunk visible to a marcher, and it must not
 		// name arena ranges that have not been written yet. Scratch because
-		// those offsets are chunk-relative, so the allSolid walk needs no
-		// base and cannot be wrong about one.
+		// the descriptor offsets there and the scratch occupancy words they
+		// point at are relative to the SAME buffer -- chunk-relative for a
+		// single-chunk payload, batch-relative for a Tier B.1 stack member --
+		// so the allSolid walk needs no base either way and cannot be wrong
+		// about one. That self-consistency is why the batched path did not
+		// have to touch this pass at all.
 		VoxelGpuWorldGen::AddBrickChunkRecordPass(
 			GraphBuilder, DstTable, SrcDesc, SrcOcc, SrcMask,
 			P->SrcBrickFirst, P->SrcChunkIndex, P->BrickCount,

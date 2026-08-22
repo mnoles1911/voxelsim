@@ -131,6 +131,14 @@ namespace VoxelGpuWorldGen
 		// allocation is made from.
 		FRDGBufferRef BrickTotals = nullptr;
 
+		// Tier B.1 (voxel.GPU.WorldGenBatch): (2 + 2*NumBrickChunks) uints --
+		// the region totals pair, then each chunk's own occ/mat dword pair.
+		// Null unless the request set bPerChunkBrickTotals. This is what the
+		// batched stack path reads back INSTEAD of K per-chunk BrickTotals
+		// copies: one copy pass, (2 + 2K) * 4 bytes, still nothing but sizes
+		// crossing PCIe.
+		FRDGBufferRef BrickStackTotals = nullptr;
+
 		FRegionGraphSizes Sizes;
 	};
 
