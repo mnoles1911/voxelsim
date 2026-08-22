@@ -43,6 +43,16 @@ if(NOT MSVC)
   target_compile_options(vxc_stagedump PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_matcensus: WHICH MATERIAL IDS REACH THE QUADS. The gate on ADR-0009's
+# material-led colour, and the re-run VoxelClimateProbe.h asks for: the column
+# census and the quad census, from one walk of one world, so the two can be
+# compared inside the tool instead of across two instruments and two years.
+add_executable(vxc_matcensus matcensus.cpp)
+target_link_libraries(vxc_matcensus PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_matcensus PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_climateprobe: climate/biome/stratigraphy diagnostic. Channel
 # percentiles in u8 AND physical units, biome census WITH gate attribution,
 # topsoil depth, and the top-voxel material histogram -- the numeric readout
