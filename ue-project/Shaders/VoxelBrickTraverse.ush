@@ -2658,11 +2658,57 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	uint EnteredMask = 0u;
 
 	const uint RingCount = min(MarchRingCount, VOXEL_MARCH_MAX_RINGS);
+
+	// ===================================================================
+	// RING BOUNDARIES ARE CYLINDERS, NOT SPHERES
+	// ===================================================================
+	//
+	// This was a real defect, owner-visible, and it produced two symptoms
+	// that did not obviously share a cause:
+	//
+	//   * circular gaps at 128 / 256 / 512 m, whose FAR side was jagged in
+	//     the shape of whole missing chunks;
+	//   * flying straight up eventually stopped rendering the ground
+	//     DIRECTLY BELOW the camera, in a ring, and descending brought it
+	//     back -- with no chunk-shaped popping either way.
+	//
+	// The cause: these segment bounds are ray parameter t, i.e. 3D distance
+	// FROM THE CAMERA, while the streaming admission that decides which
+	// chunks are RESIDENT uses horizontal distance only --
+	//   DistSq = (CenterX - Anchor.X)^2 + (CenterY - Anchor.Y)^2
+	// with no Z term (VoxelWorldSubsystem.cpp, "a finer ring owns this
+	// footprint"). Streaming rings are CYLINDERS. This walk treated them as
+	// SPHERES, and the two diverge by exactly the camera's height.
+	//
+	// So from 300 m up, ground directly below sits at horizontal distance ~0
+	// -- level 0 territory, and streaming therefore never admits a level-2
+	// chunk there -- while the ray reaches it at t ~ 300 m, so this walk
+	// entered ring 2 and looked up level 2. Nothing resident, nothing drawn,
+	// a hole under the camera. At a seam the same error switches the ring at
+	// sqrt(Outer^2 - h^2) horizontally, i.e. EARLY, into an annulus streaming
+	// has only covered at the finer level.
+	//
+	// THE CORRECTION IS ONE SCALE FACTOR because the ray starts at the camera
+	// and the streaming anchor IS the camera's XY: horizontal distance at
+	// parameter t is exactly t * |Dir.xy|, so a boundary at radius R is
+	// crossed at t = R / |Dir.xy|. Linear and monotonic -- no quadratic, no
+	// second root, because the ray's XY origin is the axis of the cylinder.
+	//
+	// A PERFECTLY VERTICAL RAY THEN NEVER LEAVES RING 0, which is not a
+	// degenerate case to guard against -- it is the correct answer. Ground
+	// straight down is at horizontal distance 0 and is level-0 ground however
+	// high the camera is. The clamp only keeps the scale finite; TMaxUU is
+	// what actually bounds the walk.
+	//
+	// Horizontal rays are unaffected: |Dir.xy| = 1 makes this identity.
+	const float RingHorizLen = length(DirWorld.xy);
+	const float RingTScale = 1.0f / max(RingHorizLen, 1e-4f);
+
 	[loop]
 	for (uint L = 0; L < RingCount; ++L)
 	{
-		const float SegIn  = max(VoxelMarchRingInnerUU(L), TMinUU);
-		const float SegOut = min(VoxelMarchRingOuterUU(L), TMaxUU);
+		const float SegIn  = max(VoxelMarchRingInnerUU(L) * RingTScale, TMinUU);
+		const float SegOut = min(VoxelMarchRingOuterUU(L) * RingTScale, TMaxUU);
 		if (SegOut <= SegIn)
 		{
 			continue;

@@ -2985,27 +2985,23 @@ int32 UVoxelWorldSubsystem::GetRingOverlapChunks()
 {
 	static const int32 Overlap = []
 	{
-		// DEFAULT 1 SINCE 2026-08-22, because the marcher is now the primary
-		// terrain renderer and this comment already said what it needs: "a
-		// marcher needs ONE chunk".
+		// STAYS 0. Tried at 1 on 2026-08-22 to close the ring-boundary gaps and
+		// REVERTED the same day, on evidence rather than preference:
 		//
-		// At 0 exactly one level covers any given ground, so a ray leaves level
-		// L's resident set at ground level L+1 does not yet cover, and the seam
-		// reads as a GAP at the ring boundary. That is the defect the owner has
-		// reported repeatedly at 128/256/512 m. At 1 both levels hold the seam.
+		//   * the owner tested it and the gaps were still there, so overlap was
+		//     not the mechanism;
+		//   * VoxelBrickTraverse.ush already records what it costs -- +9.2%
+		//     resident chunks, p50 14.9 -> 17.3 ms, chunks/s 968 -> 672,
+		//     hitches 1 -> 47 -- against a streaming throughput complaint that
+		//     is the owner's other open issue.
 		//
-		// Safe at the shipped radii, and the check below is what proves it
-		// rather than assuming: Outer/ChunkEdge is exactly 40 at every level, so
-		// admit-meets-unload needs N >= 10 and this clamps at 4. Moving a ring
-		// with -VoxelRingOuterMeters= can still break that, which is why the
-		// thrash check exists and logs an error naming this cvar.
-		//
-		// COSTS RESIDENT CHUNKS, and that is a real trade against the streaming
-		// complaint being worked in backlog 0.0 -- the seam band is admitted at
-		// BOTH levels instead of one. Set -VoxelRingOverlapChunks=0 to get the
-		// old behaviour back in one argument if the gaps turn out to be cheaper
-		// to live with than the extra streaming load.
-		int32 Value = 1;
+		// The gaps had two real causes and neither needed a wider band. The
+		// marcher was segmenting its rings by 3D distance from the camera while
+		// admission uses horizontal distance (fixed in VoxelBrickTraverse.ush),
+		// and the inner ring edge was unpadded while the outer one was padded
+		// (fixed in the admission loop below). Both are targeted; this is the
+		// blunt instrument and it stays available as a bisection tool.
+		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOverlapChunks="), Value);
 		// Clamped at 4: past that the band is wider than the annulus at the
 		// inner levels and the admission span loop grows quadratically. A
@@ -9607,9 +9603,40 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-				if (Level > 0 && DistSq < FMath::Square(InnerUU))
+				// INNER EDGE PADDED BY THE SAME HALF-DIAGONAL AS THE OUTER
+				// EDGE, and its absence was a real owner-visible defect:
+				// perfectly square chunk-shaped holes in a ring at every LOD
+				// boundary, seen with the camera standing ON the surface (so
+				// not the cylinder-vs-sphere error the marcher had as well).
+				//
+				// The unpadded test skips a COARSE chunk whenever its CENTRE
+				// falls inside Inner -- but the chunk extends half an edge
+				// further out, and the finer ring stops dead at
+				// Outer[L] == Inner[L+1]. Ground in [Inner, Inner + halfEdge)
+				// was therefore claimed by the finer ring's admission and
+				// covered by neither: the coarse chunk that contains it was
+				// dropped for having its centre on the wrong side.
+				//
+				// The finer ring's own outer pad cannot reach it. That pad is
+				// a half-diagonal of a level-L chunk (0.707 edges) while the
+				// hole is up to half a level-L+1 chunk, which is a FULL
+				// level-L edge. Short by design, and the shortfall is exactly
+				// one chunk -- which is why the holes are chunk-shaped squares
+				// rather than a ragged band.
+				//
+				// Padding INWARD admits a coarse chunk whose footprint
+				// straddles the boundary. Both levels then hold the seam, at a
+				// cost of one ring of coarse chunks per level -- far cheaper
+				// than -VoxelRingOverlapChunks, which widens the band
+				// everywhere and measured chunks/s 968 -> 672.
+				//
+				// Never negative: at level 1 the half-diagonal is a
+				// meaningful fraction of Inner, and a negative threshold would
+				// admit the whole interior at the coarse level.
+				const double InnerAdmitUU = FMath::Max(0.0, InnerUU - ChunkHalfDiagUU);
+				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
 				{
-					continue; // a finer ring owns this footprint
+					continue; // a finer ring owns this footprint, entirely
 				}
 				if (DistSq >= FMath::Square(OuterUU))
 				{
@@ -10762,6 +10789,10 @@ void FVoxelWorldImpl::LogCoverageVerify()
 		// out there having no records is the padding rule working, not a hole.
 		// Verifying the core annulus alone keeps every reported hole unambiguous.
 		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
+		// Mirrors the admission pass's inner pad below. This is the VERIFIER, so
+		// it has to use the same rule the admitter does or it reports the pad as
+		// a hole at every ring boundary.
+		const double ChunkHalfDiagUU = ChunkEdge * 0.70710678118654752440;
 
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
@@ -10773,9 +10804,40 @@ void FVoxelWorldImpl::LogCoverageVerify()
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 				const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-				if (Level > 0 && DistSq < FMath::Square(InnerUU))
+				// INNER EDGE PADDED BY THE SAME HALF-DIAGONAL AS THE OUTER
+				// EDGE, and its absence was a real owner-visible defect:
+				// perfectly square chunk-shaped holes in a ring at every LOD
+				// boundary, seen with the camera standing ON the surface (so
+				// not the cylinder-vs-sphere error the marcher had as well).
+				//
+				// The unpadded test skips a COARSE chunk whenever its CENTRE
+				// falls inside Inner -- but the chunk extends half an edge
+				// further out, and the finer ring stops dead at
+				// Outer[L] == Inner[L+1]. Ground in [Inner, Inner + halfEdge)
+				// was therefore claimed by the finer ring's admission and
+				// covered by neither: the coarse chunk that contains it was
+				// dropped for having its centre on the wrong side.
+				//
+				// The finer ring's own outer pad cannot reach it. That pad is
+				// a half-diagonal of a level-L chunk (0.707 edges) while the
+				// hole is up to half a level-L+1 chunk, which is a FULL
+				// level-L edge. Short by design, and the shortfall is exactly
+				// one chunk -- which is why the holes are chunk-shaped squares
+				// rather than a ragged band.
+				//
+				// Padding INWARD admits a coarse chunk whose footprint
+				// straddles the boundary. Both levels then hold the seam, at a
+				// cost of one ring of coarse chunks per level -- far cheaper
+				// than -VoxelRingOverlapChunks, which widens the band
+				// everywhere and measured chunks/s 968 -> 672.
+				//
+				// Never negative: at level 1 the half-diagonal is a
+				// meaningful fraction of Inner, and a negative threshold would
+				// admit the whole interior at the coarse level.
+				const double InnerAdmitUU = FMath::Max(0.0, InnerUU - ChunkHalfDiagUU);
+				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
 				{
-					continue; // a finer ring owns this footprint
+					continue; // a finer ring owns this footprint, entirely
 				}
 				if (DistSq >= FMath::Square(OuterUU))
 				{

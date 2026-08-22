@@ -116,4 +116,35 @@ private:
 
 	FString CachedPerfHUDText;
 	float PerfHUDLastRefreshWorldSeconds = -1000.f;
+
+	// --- FPS counter -------------------------------------------------------
+	//
+	// SEPARATE FROM THE 1 Hz PERF PANEL ON PURPOSE. The panel republishes once
+	// a second because its contents are 1 Hz aggregates; an FPS readout that
+	// only moved once a second would be unusable for the thing an FPS counter
+	// is actually for -- turning around, flying, and watching the number
+	// respond. This refreshes four times a second.
+	//
+	// TIMED WITH FPlatformTime::Seconds(), NOT world delta time. World time is
+	// dilated by slomo, stops when PIE is paused, and is clamped by the
+	// smoothing settings -- so it would report a frame rate the editor is not
+	// actually running at, which is the one thing this must never do.
+	static constexpr float FpsRefreshIntervalSeconds = 0.25f;
+	static constexpr int32 FpsHistorySize = 240; // ~4 s at 60 fps
+
+	double FpsLastFrameSeconds = 0.0;     // 0 = not yet sampled
+	double FpsWindowStartSeconds = 0.0;
+	int32 FpsWindowFrames = 0;
+	double FpsWindowWorstMs = 0.0;
+
+	// Rolling frame times for the 1% low. A plain average hides exactly the
+	// hitches this project spends its time chasing, so the panel carries both.
+	TArray<double> FpsHistoryMs;
+	int32 FpsHistoryNext = 0;
+
+	FString CachedFpsText;
+	// Kept as a number as well as in the string: the draw colour keys off it,
+	// and re-parsing a formatted string to recover a value it was built from is
+	// the kind of thing that survives until someone changes the format.
+	double CachedFpsValue = 0.0;
 };
