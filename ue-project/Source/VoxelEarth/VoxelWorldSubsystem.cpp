@@ -2835,6 +2835,94 @@ constexpr double SumRingCapShare()
 	return Sum;
 }
 static_assert(SumRingCapShare() > 0.999 && SumRingCapShare() < 1.001, "kRingCapShare must sum to 1.0");
+
+// --- the inner edge of a ring, as ONE pair of radii -------------------------
+//
+// Level L's inner hole is the ground the next FINER ring has taken over. Two
+// different questions get asked about that hole, and the whole point of this
+// pair is that they must not be answered by two separately-written expressions:
+//
+//   * ADMIT -- is this footprint outside the hole, so level L should cover it?
+//   * EVICT -- has a resident chunk drifted far enough inside the hole that
+//     level L should let it go?
+//
+// On 2026-08-22 the admit test was padded INWARD by the chunk half-diagonal (a
+// hole fix; see the INNER EDGE comment in RecomputeDesiredSet for why) and the
+// exit scan was left on the raw radius. The band between the two answers was
+// then admitted on every recompute and evicted on the next -- 11,779 unloads/s
+// WITH THE PLAYER STANDING STILL, and no counter anywhere named the cause. The
+// two radii now come from here or they do not exist.
+//
+// The evict radius sits a fraction of a chunk edge further in --
+// InnerHysteresisChunks below, which carries the measurement that set it and
+// the reason a full edge was too much. A FRACTION OF AN EDGE, never the outer
+// edge's 1.25x multiplier: a proportional margin on level 5's 2 km inner radius
+// would hold a 400 m band of coarse chunks resident to buy a few metres of
+// slack.
+//
+// Level 0 has no inner hole (InnerMeters == 0), so both return 0 and every
+// `DistSq < Square(...)` test against them is false -- the right answer, since
+// nothing is finer than level 0.
+double InnerAdmitUU(int32 Level)
+{
+	const double InnerUU = UVoxelWorldSubsystem::GetRingPresets()[Level].InnerMeters * 100.0;
+	const double ChunkHalfDiagUU = VoxelCoords::ChunkEdgeUUForLevel(Level) * 0.70710678118654752440;
+	// Never negative: at level 1 the half-diagonal is a meaningful fraction of
+	// Inner, and a negative threshold would admit the entire interior coarse.
+	return FMath::Max(0.0, InnerUU - ChunkHalfDiagUU);
+}
+
+// How far inside the admit radius the evict radius sits, in chunk edges.
+// -VoxelInnerHysteresisChunks=<float>, default 0.25.
+//
+// ZERO IS ALREADY THRASH-FREE, which is worth stating because it is not
+// obvious: admission takes a chunk when Dist >= Admit and the exit scan drops
+// it when Dist < Evict, so at Evict == Admit the two sets are exact
+// complements and no chunk can be in both. Everything above zero buys slack
+// against a chunk sitting exactly on the boundary -- and PAYS FOR IT IN
+// RESIDENT CHUNKS, one band of coarse chunks per level per chunk edge of
+// margin, sitting underneath ground the finer ring already covers.
+//
+// 0.25 is the quarter chunk edge the desired-set rescan itself is gated on
+// (see RescanThresholdUU): below that the set is not recomputed at all, so a
+// margin smaller than it cannot be crossed twice between two recomputes.
+//
+// A FULL EDGE WAS THE FIRST TRY AND IT MEASURED WORSE. Matched 30 m/s line
+// legs, same spawn, same frozen sun: unloads/s 1,907 -> 1,444 and brickPacks
+// 571,256 -> 474,647 (both wanted), but p95 frame 55.97 -> 68.60 ms and
+// hitches 2,127 -> 3,248, with the shadow march's rays-starting-inside-solid
+// count doubling (1,008 -> 2,027 per frame). That is what a band of coarse
+// rock buried under the fine ring costs, and it is why this is a knob.
+double InnerHysteresisChunks()
+{
+	static const double Chunks = []
+	{
+		double Value = 0.25;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelInnerHysteresisChunks="), Value);
+		// NEGATIVE IS ALLOWED, AND IT IS A BISECTION TOOL, NOT A SETTING.
+		// -0.7071 puts the evict radius back exactly on the raw InnerMeters --
+		// the pre-2026-08-22 behaviour, thrash band and all -- because the
+		// admit radius is Inner minus one chunk half-diagonal (0.7071 edges).
+		// That makes the before arm of this fix's A/B a command-line switch
+		// rather than a rebuild, so both arms run the SAME BINARY and a frame
+		// number cannot be blamed on a different compile.
+		return Value;
+	}();
+	return Chunks;
+}
+
+double InnerEvictUU(int32 Level)
+{
+	const double AdmitUU = InnerAdmitUU(Level);
+	// When the pad already reaches the anchor there is no hole left to evict
+	// into, and 0 makes the eviction test simply never fire -- which matches an
+	// admission pass that is admitting everything inside.
+	if (AdmitUU <= 0.0)
+	{
+		return 0.0;
+	}
+	return FMath::Max(0.0, AdmitUU - InnerHysteresisChunks() * VoxelCoords::ChunkEdgeUUForLevel(Level));
+}
 } // namespace VoxelStreamAdmission
 
 // --- sky band: never mesh chunks that are provably above the terrain ---------
@@ -9290,10 +9378,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 	// 1. Hysteresis exit: currently-tracked chunks (any level) that drifted
 	// beyond their level's unload ring, OR drifted inside their level's inner
-	// edge (the next finer level has taken over -- no hysteresis on this
-	// side in wave 1, see the doc comment on RingPresets in
-	// VoxelWorldSubsystem.h: "hard boundary" per m2-plan.md's v0 decision),
-	// get queued for unload. Chunks that merely left the load ring but are
+	// edge (the next finer level has taken over), get queued for unload.
+	//
+	// BOTH edges now have hysteresis. The inner one used to be a hard boundary
+	// at the raw InnerMeters ("hard boundary" per m2-plan.md's v0 decision, in
+	// the doc comment on RingPresets), and that stopped being safe the moment
+	// admission padded its own inner test inward: the band between the two
+	// radii was admitted every recompute and evicted the next, which is where
+	// the 11,779 unloads/s with the player STANDING STILL came from. Both
+	// radii come from VoxelStreamAdmission::Inner{Admit,Evict}UU now, and the
+	// gap between them is checked in RecomputeDesiredSet's entry pass. Chunks that merely left the load ring but are
 	// still inside the unload ring stay tracked untouched -- this is the
 	// same hysteresis gap the original single-ring code had, now evaluated
 	// per level.
@@ -9310,9 +9404,9 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
 		const double UnloadOuterUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier;
-		const double InnerUU = Preset.InnerMeters * 100.0;
+		const double InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(LevelKey.Level);
 		const bool bBeyondOuter = DistSq > FMath::Square(UnloadOuterUU);
-		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerUU);
+		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerEvictUU);
 		// Underground streaming (see namespace VoxelUnderground): the two tests
 		// above are XY-only, which is correct for every chunk whose desired-ness
 		// is a pure function of its footprint (the surface band and the depth
@@ -9511,7 +9605,6 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
 
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
-		const double InnerUU = Preset.InnerMeters * 100.0;
 		const double OuterUU = Preset.OuterMeters * 100.0;
 		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
 
@@ -9540,11 +9633,14 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// and minimal: a gap child's centre is at most its parent's centre plus
 		// e/sqrt(2), and the parent's centre is < Outer[L-1] by construction.
 		//
-		// Only the OUTER side needs padding -- padding there admits the finer
-		// level slightly past the seam, so the finer (more accurate) mesh wins
-		// in the overlap band, and the coarser ring's inner hole stays hard. The
-		// exit pass does not fight this: bBeyondOuter uses Outer*1.25, which is
-		// wider than Outer + half-diagonal at every level.
+		// The exit pass does not fight this: bBeyondOuter uses Outer*1.25, which
+		// is wider than Outer + half-diagonal at every level.
+		//
+		// (This block once ended "only the OUTER side needs padding ... the
+		// coarser ring's inner hole stays hard". That stopped being true when
+		// the inner edge got its own pad below, and because the exit pass was
+		// not moved with it, the inner edge is where the admit/evict churn
+		// actually happened. Both edges are padded now and both are checked.)
 		//
 		// Cost: ~7-10% more resident chunks per level. That is the price of the
 		// annuli genuinely overlapping, which VoxelChunkComponent.cpp:828-844
@@ -9596,6 +9692,34 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			}
 		}
 
+		// THE SAME CHECK ON THE INNER EDGE, and this one is not hypothetical --
+		// it fired for real. Admission skips a coarse chunk inside InnerAdmitUU;
+		// the exit scan evicts one inside InnerEvictUU. If evict ever reaches
+		// admit, the band between them is admitted every recompute and evicted
+		// the next: 11,779 unloads/s with the player standing still, and the
+		// only visible symptom is a streaming pipeline that looks slow.
+		//
+		// It cannot happen with the radii as written (evict is a full chunk edge
+		// further in), so this is a tripwire for a future edit or a
+		// -VoxelRingInnerMeters= that moves one and not the other. Once per
+		// level, and level 0 is exempt: it has no inner hole to evict into.
+		if (Level > 0)
+		{
+			static bool bWarnedInnerThrash[VoxelCoords::kNumLevels] = {};
+			const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
+			const double InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(Level);
+			if (InnerEvictUU >= InnerAdmitUU && InnerAdmitUU > 0.0 && !bWarnedInnerThrash[Level])
+			{
+				bWarnedInnerThrash[Level] = true;
+				UE_LOG(LogVoxelStream, Error,
+				       TEXT("Ring L%d admits inward to %.1f m but the exit pass evicts inside %.1f m. ")
+				       TEXT("Every chunk in that band will be admitted and evicted on alternate ")
+				       TEXT("recomputes -- unbounded churn that reads as a slow streaming pipeline. ")
+				       TEXT("Fix VoxelStreamAdmission::Inner{Admit,Evict}UU or widen this ring."),
+				       Level, InnerAdmitUU / 100.0, InnerEvictUU / 100.0);
+			}
+		}
+
 		const int32 ChunkSpan = FMath::CeilToInt32(AdmitOuterUU / ChunkEdge) + 1;
 
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
@@ -9632,10 +9756,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// than -VoxelRingOverlapChunks, which widens the band
 				// everywhere and measured chunks/s 968 -> 672.
 				//
-				// Never negative: at level 1 the half-diagonal is a
-				// meaningful fraction of Inner, and a negative threshold would
-				// admit the whole interior at the coarse level.
-				const double InnerAdmitUU = FMath::Max(0.0, InnerUU - ChunkHalfDiagUU);
+				// The radius itself lives in VoxelStreamAdmission, next to the
+				// InnerEvictUU the exit scan uses. They were written out
+				// separately in the two passes and detached the day this pad
+				// landed -- see that comment for the churn that caused.
+				const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
 				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
 				{
 					continue; // a finer ring owns this footprint, entirely
@@ -10462,8 +10587,12 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 	{
 		return 0; // finest ring: nothing finer sits inside it, so no seam to retain
 	}
-	const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
-	const double InnerSq = FMath::Square(Preset.InnerMeters * 100.0);
+	// The raw InnerMeters is NOT the membership test any more -- admission pads
+	// this edge inward, so a neighbour out in [InnerAdmitUU, InnerMeters) is
+	// admitted at THIS level too and there is no seam across that face to wall
+	// off. Reading the raw radius here marked those faces as boundaries and
+	// dropped a retaining wall against a neighbour that was actually present.
+	const double InnerSq = FMath::Square(VoxelStreamAdmission::InnerAdmitUU(Level));
 	const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
 	// A face is retained only when the neighbour across it belongs to a FINER
 	// ring (its chunk centre falls inside this ring's inner hole). That is the
@@ -10635,7 +10764,10 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 		const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-		if (L > 0 && DistSq < FMath::Square(Preset.InnerMeters * 100.0))
+		// InnerAdmitUU, not the raw InnerMeters: this lambda's contract is "would
+		// the entry pass admit this footprint at level L", and the entry pass
+		// pads its inner edge.
+		if (L > 0 && DistSq < FMath::Square(VoxelStreamAdmission::InnerAdmitUU(L)))
 		{
 			return false;
 		}
@@ -10782,7 +10914,6 @@ void FVoxelWorldImpl::LogCoverageVerify()
 	for (int32 Level = 0; Level <= MaxRingLevel; ++Level)
 	{
 		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Level];
-		const double InnerUU = Preset.InnerMeters * 100.0;
 		const double OuterUU = Preset.OuterMeters * 100.0;
 		const double ChunkEdge = ChunkEdgeUUForLevel(Level);
 		const FVoxelChunkKey AnchorChunk = ChunkKeyForVoxel(WorldToVoxelForLevel(Anchor, Level));
@@ -10791,10 +10922,6 @@ void FVoxelWorldImpl::LogCoverageVerify()
 		// out there having no records is the padding rule working, not a hole.
 		// Verifying the core annulus alone keeps every reported hole unambiguous.
 		const int32 ChunkSpan = FMath::CeilToInt32(OuterUU / ChunkEdge) + 1;
-		// Mirrors the admission pass's inner pad below. This is the VERIFIER, so
-		// it has to use the same rule the admitter does or it reports the pad as
-		// a hole at every ring boundary.
-		const double ChunkHalfDiagUU = ChunkEdge * 0.70710678118654752440;
 
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
@@ -10833,10 +10960,11 @@ void FVoxelWorldImpl::LogCoverageVerify()
 				// than -VoxelRingOverlapChunks, which widens the band
 				// everywhere and measured chunks/s 968 -> 672.
 				//
-				// Never negative: at level 1 the half-diagonal is a
-				// meaningful fraction of Inner, and a negative threshold would
-				// admit the whole interior at the coarse level.
-				const double InnerAdmitUU = FMath::Max(0.0, InnerUU - ChunkHalfDiagUU);
+				// The radius itself lives in VoxelStreamAdmission, next to the
+				// InnerEvictUU the exit scan uses. They were written out
+				// separately in the two passes and detached the day this pad
+				// landed -- see that comment for the churn that caused.
+				const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
 				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
 				{
 					continue; // a finer ring owns this footprint, entirely
