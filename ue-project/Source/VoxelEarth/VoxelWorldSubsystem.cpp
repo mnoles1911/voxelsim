@@ -170,6 +170,17 @@ static TAutoConsoleVariable<bool> CVarVoxelCollapseEnabled(
 	TEXT("M5: run brick-resolution differential-support structural collapse for edits too large for voxel-resolution island detection."),
 	ECVF_Default);
 
+// Forward declaration at GLOBAL scope, deliberately outside the anonymous
+// namespace below: FSharedColumnGridCache (inside it) reads its capacity from
+// this accessor, whose definition lives with its siblings in the real
+// VoxelStreamAdmission block further down. Declaring it inside the anonymous
+// namespace would silently create a DIFFERENT namespace
+// (<anon>::VoxelStreamAdmission) and fail at link.
+namespace VoxelStreamAdmission
+{
+int32 SharedGridCacheEntries();
+}
+
 namespace
 {
 // MeshChunkBricks and ERingSkirtFace now live in VoxelChunkMesher.h (included
@@ -729,6 +740,216 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const
 	};
 }
 
+// Phase 2 of the streaming plan (docs/marcher-handoff-2026-08-22.md §5):
+// share the (32+2)^2 column grid across the Z-siblings of one footprint.
+//
+// THE WASTE THIS REMOVES, measured: the level-0 grid build is ~72% of a
+// level-0 job's retired cycles (gridKcyc=3592 of jobKcyc=4980,
+// Saved/final-shipped-state.log), Key.Z never enters its computation, and the
+// footprint's 8-16 vertically stacked chunks each rebuild the identical 1156
+// columns. The thread_local scratch buffer the level-0 job uses is an
+// ALLOCATION optimisation only -- it removes the 208 KB malloc, not the
+// 1156 Amplifier::column calls. FCoarseChunkGridSampler pays the same shape
+// of cost per coarse chunk. This cache is the memo both were missing: a
+// shared, refcounted (Level, ChunkX, ChunkY) -> column grid map, consulted by
+// every CPU mesh job that would otherwise build the grid from scratch.
+//
+// OFF BY DEFAULT (-VoxelSharedGridCache=<entries>, 0 = off) -- see the
+// accessor's doc comment. The -VoxelL0GridCacheProbe measurement that decides
+// whether this cache earns its memory is being taken by the main session;
+// until that number is in, the default must not change behaviour.
+//
+// --- The residency gate, which matters more than the cache -----------------
+//
+// This is FootprintChunkZRangeCached's rule, copied deliberately: a column
+// grid computed while a fine terrain tile is still decoding answers from the
+// sea-level fallback, and a memoized fallback grid is PERMANENTLY WRONG
+// TERRAIN for that footprint -- worse than not building the cache at all,
+// because the per-job rebuild at least re-derives the truth once the tile
+// lands. So an entry is only ever inserted for a footprint whose columns were
+// provably resident when the job was DISPATCHED (game thread, the same
+// IsFootprintResident query the z-range memo gates on; see
+// FVoxelWorldImpl::IsColumnGridFootprintResident for the exact rect). A job
+// whose footprint was not resident builds its grid per-job exactly as before
+// and bumps ResidencyRefused -- honest answer for THIS job, not yet a fact
+// worth memoizing. Once residency flips, the first post-residency build is
+// cached and genuinely permanent: the raster is immutable, so a post-residency
+// grid can never go stale. (Edits change the OVERLAY, never Amplifier::column
+// -- edited chunks take the game-thread overlay path and never reach the
+// worker jobs that read this cache -- so there is no edit-invalidation hook
+// here, for the same reason FootprintZRangeCache has none.)
+//
+// The one window the gate does not close: a fine tile evicted between the
+// dispatch-time check and the worker's sampling. That window exists for the
+// per-job build too, and it is not silent -- a worker sampling a non-resident
+// tile is a GATE LEAK through FVoxelFineTileSamplerProxy (logged as an Error,
+// fatal under SetLeakIsFatal), not a quiet fallback. A stale entry here
+// therefore cannot appear without the leak counter moving.
+//
+// --- Concurrency, copied from FSharedMipCache one screen up ----------------
+//
+// Sharded (FRWLock per shard). Every entry is a deterministic function of
+// (seed, level, footprint) computed via GeneratedWorld only, so two jobs
+// racing the same miss insert byte-identical grids and first-wins is correct.
+// Find returns a TSharedPtr copy under the read lock -- the refcount is the
+// point: eviction removes the MAP ENTRY, and a job still meshing off that grid
+// keeps the 208 KB alive through its own reference until it returns. Eviction
+// is the same generation-stamped sampled-LRU as the mip cache, capped in
+// ENTRIES (one entry = sizeof(FGrid) = ~208 KB; the recommended 1024 is
+// ~208 MB, priced in the plan).
+//
+// --- Counters (all cumulative; the 5s perf log prints window deltas) -------
+//
+// Hits / Misses    : Find outcomes for RESIDENT footprints only.
+// ResidencyRefused : grids built per-job because the gate refused to memoize.
+// Evictions        : entries dropped by the cap.
+// This project has a recorded history of code that ran and did nothing for
+// months, so the perf log prints these whenever the switch is on -- a line of
+// zeros is a cache that is not working, visibly.
+class FSharedColumnGridCache
+{
+public:
+	static constexpr int32 kGridEdge = VoxelCoords::ChunkEdgeVoxels + 2; // mesher's [-1,B] apron contract
+	static constexpr int32 kGridCells = kGridEdge * kGridEdge;
+
+	struct FGrid
+	{
+		vxc::ColumnSample Columns[kGridCells];
+	};
+	using FConstGridRef = TSharedPtr<const FGrid, ESPMode::ThreadSafe>;
+
+	FConstGridRef Find(int32 Level, int32 ChunkX, int32 ChunkY) const
+	{
+		const FKey Key{Level, ChunkX, ChunkY};
+		const FShard& Shard = ShardFor(Key);
+		{
+			FRWScopeLock Lock(Shard.Lock, SLT_ReadOnly);
+			const auto Found = Shard.Map.find(Key);
+			if (Found != Shard.Map.end())
+			{
+				Found->second.LastTouch.store(NextGeneration(), std::memory_order_relaxed);
+				Hits.fetch_add(1, std::memory_order_relaxed);
+				return Found->second.Grid; // TSharedPtr copy taken under the read lock
+			}
+		}
+		Misses.fetch_add(1, std::memory_order_relaxed);
+		return FConstGridRef();
+	}
+
+	void Insert(int32 Level, int32 ChunkX, int32 ChunkY, const FConstGridRef& Grid)
+	{
+		const FKey Key{Level, ChunkX, ChunkY};
+		FShard& Shard = ShardFor(Key);
+		const uint64 Gen = NextGeneration();
+		FRWScopeLock Lock(Shard.Lock, SLT_Write);
+		auto [It, bInserted] = Shard.Map.try_emplace(Key, Grid, Gen);
+		(void)It;
+		if (bInserted)
+		{
+			EntryCount.fetch_add(1, std::memory_order_relaxed);
+		}
+		// else: two jobs raced the same miss. Both grids are byte-identical
+		// (same deterministic inputs, both dispatched under the residency
+		// gate), so keeping the first is correct -- see FSharedMipCache's
+		// identical argument.
+		EvictIfOverCapLocked(Shard);
+	}
+
+	// A job whose footprint failed the dispatch-time residency check builds
+	// its grid per-job (pre-cache behaviour) and records that here, so "the
+	// gate refused everything" and "the cache hit nothing" read as two
+	// different numbers instead of one silent zero.
+	void NoteResidencyRefusal() const { ResidencyRefused.fetch_add(1, std::memory_order_relaxed); }
+
+	int64 GetHits() const { return Hits.load(std::memory_order_relaxed); }
+	int64 GetMisses() const { return Misses.load(std::memory_order_relaxed); }
+	int64 GetResidencyRefused() const { return ResidencyRefused.load(std::memory_order_relaxed); }
+	int64 GetEvictions() const { return Evictions.load(std::memory_order_relaxed); }
+	int64 GetEntryCount() const { return EntryCount.load(std::memory_order_relaxed); }
+	int64 GetBytesUsed() const { return GetEntryCount() * int64(sizeof(FGrid)); }
+
+private:
+	static constexpr int32 kNumShards = 16;
+	static constexpr int32 kEvictSampleSize = 8; // same bounded-sample argument as FSharedMipCache
+
+	struct FKey
+	{
+		int32 Level;
+		int32 X;
+		int32 Y;
+		bool operator==(const FKey& O) const { return Level == O.Level && X == O.X && Y == O.Y; }
+	};
+	struct FKeyHash
+	{
+		size_t operator()(const FKey& K) const
+		{
+			uint64 H = (uint64(uint32(K.X)) << 32) | uint64(uint32(K.Y));
+			H ^= uint64(uint32(K.Level)) * 0x9E3779B97F4A7C15ull;
+			H ^= H >> 33;
+			H *= 0xFF51AFD7ED558CCDull;
+			H ^= H >> 33;
+			return size_t(H);
+		}
+	};
+
+	struct FEntry
+	{
+		FConstGridRef Grid;
+		mutable std::atomic<uint64> LastTouch; // same "logically const, bookkeeping mutates" doctrine as FSharedMipCache
+		FEntry(const FConstGridRef& InGrid, uint64 InTouch) : Grid(InGrid), LastTouch(InTouch) {}
+	};
+
+	struct FShard
+	{
+		mutable FRWLock Lock;
+		std::unordered_map<FKey, FEntry, FKeyHash> Map;
+	};
+
+	FShard& ShardFor(const FKey& Key) { return Shards[FKeyHash{}(Key) % size_t(kNumShards)]; }
+	const FShard& ShardFor(const FKey& Key) const { return Shards[FKeyHash{}(Key) % size_t(kNumShards)]; }
+
+	uint64 NextGeneration() const { return Generation.fetch_add(1, std::memory_order_relaxed); }
+
+	// Called from Insert with Shard's write lock held. The cap is global but
+	// eviction only samples the inserting shard -- approximate on purpose,
+	// exactly as the mip cache's per-shard eviction is approximate against its
+	// global byte budget; the worst skew is a few entries per shard.
+	void EvictIfOverCapLocked(FShard& Shard)
+	{
+		const int64 Cap = VoxelStreamAdmission::SharedGridCacheEntries();
+		while (EntryCount.load(std::memory_order_relaxed) > Cap && !Shard.Map.empty())
+		{
+			auto OldestIt = Shard.Map.end();
+			uint64 OldestTouch = 0;
+			int32 Sampled = 0;
+			for (auto It = Shard.Map.begin(); It != Shard.Map.end() && Sampled < kEvictSampleSize; ++It, ++Sampled)
+			{
+				const uint64 Touch = It->second.LastTouch.load(std::memory_order_relaxed);
+				if (OldestIt == Shard.Map.end() || Touch < OldestTouch)
+				{
+					OldestIt = It;
+					OldestTouch = Touch;
+				}
+			}
+			if (OldestIt == Shard.Map.end())
+			{
+				break; // defensive; unreachable given !empty()
+			}
+			Shard.Map.erase(OldestIt); // refcount keeps the grid alive for any job still reading it
+			EntryCount.fetch_sub(1, std::memory_order_relaxed);
+			Evictions.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+
+	FShard Shards[kNumShards];
+	mutable std::atomic<uint64> Generation{1};
+	std::atomic<int64> EntryCount{0};
+	mutable std::atomic<int64> Hits{0};
+	mutable std::atomic<int64> Misses{0};
+	mutable std::atomic<int64> ResidencyRefused{0};
+	std::atomic<int64> Evictions{0};
+};
+
 // COARSE flat-grid sampler -- MakeCoarseLevelSampler's output with the
 // indirection removed. Same rule, same numbers, ~3x cheaper per chunk.
 //
@@ -762,27 +983,78 @@ struct FCoarseChunkGridSampler
 	static constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
 	static constexpr int32 GridEdge = ChunkVox + 2; // +1 apron each side (mesher's [-1,B] contract)
 
+	// Phase 2 (-VoxelSharedGridCache=): SharedCache non-null consults/populates
+	// the cross-job column-grid cache under the SAME dispatch-latched residency
+	// verdict the level-0 arm uses -- a coarse footprint's 1156 columns are as
+	// Z-invariant as level 0's (the build below never reads Key.Z), and its
+	// stacked chunks were rebuilding them identically too. Null (the default)
+	// is the pre-cache behaviour, verbatim. Only the COLUMNS are shared; the
+	// asset shortlist below stays per-job (it is cheap relative to the columns
+	// and folding the resolve into the cache would widen the residency rect the
+	// gate must prove -- see IsColumnGridFootprintResident).
 	FCoarseChunkGridSampler(const GenT& Gen, int32 InLevel, const VoxelCoords::FVoxelChunkKey& Key,
-	                        vxc::Counters* PerfCounters)
+	                        vxc::Counters* PerfCounters,
+	                        FSharedColumnGridCache* SharedCache = nullptr, bool bFootprintResident = false)
 		: Level(InLevel)
 		, BaseVX(int64(Key.X) * ChunkVox)
 		, BaseVY(int64(Key.Y) * ChunkVox)
 	{
-		Columns.SetNumUninitialized(GridEdge * GridEdge);
+		static_assert(GridEdge * GridEdge == FSharedColumnGridCache::kGridCells,
+		              "the shared cache's grid layout must match the coarse sampler's");
 		const vxc::Amplifier& Amp = Gen.amplifier();
-		for (int32 LY = 0; LY < GridEdge; ++LY)
+		if (SharedCache != nullptr)
 		{
-			const int64 CY = GenT::coarseRep(BaseVY + LY - 1, Level);
-			for (int32 LX = 0; LX < GridEdge; ++LX)
+			if (bFootprintResident)
 			{
-				Columns[LX + GridEdge * LY] = Amp.column(GenT::coarseRep(BaseVX + LX - 1, Level), CY);
+				SharedGrid = SharedCache->Find(Level, Key.X, Key.Y);
+				if (SharedGrid.IsValid())
+				{
+					Cols = SharedGrid->Columns; // hit: zero Amplifier::column calls for the grid
+				}
+			}
+			else
+			{
+				// Computed and used, never memoized -- a grid built while a
+				// fine tile is decoding derives from the sea-level fallback
+				// and caching it would be permanently wrong terrain.
+				SharedCache->NoteResidencyRefusal();
 			}
 		}
-		// Same unit the level-0 job and FJobColumnGridCache report: explicit
-		// Amplifier::column() calls made by this job.
-		if (PerfCounters)
+		if (Cols == nullptr)
 		{
-			PerfCounters->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+			vxc::ColumnSample* Build;
+			TSharedPtr<FSharedColumnGridCache::FGrid, ESPMode::ThreadSafe> BuildShared;
+			if (SharedCache != nullptr && bFootprintResident)
+			{
+				BuildShared = MakeShared<FSharedColumnGridCache::FGrid>();
+				Build = BuildShared->Columns;
+			}
+			else
+			{
+				OwnColumns.SetNumUninitialized(GridEdge * GridEdge);
+				Build = OwnColumns.GetData();
+			}
+			for (int32 LY = 0; LY < GridEdge; ++LY)
+			{
+				const int64 CY = GenT::coarseRep(BaseVY + LY - 1, Level);
+				for (int32 LX = 0; LX < GridEdge; ++LX)
+				{
+					Build[LX + GridEdge * LY] = Amp.column(GenT::coarseRep(BaseVX + LX - 1, Level), CY);
+				}
+			}
+			Cols = Build;
+			if (BuildShared.IsValid())
+			{
+				SharedGrid = BuildShared;
+				SharedCache->Insert(Level, Key.X, Key.Y, SharedGrid);
+			}
+			// Same unit the level-0 job and FJobColumnGridCache report: explicit
+			// Amplifier::column() calls made by this job. A cache hit made none,
+			// so this stays inside the build branch.
+			if (PerfCounters)
+			{
+				PerfCounters->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+			}
 		}
 
 		// --- COARSE ASSET COMPOSITION -----------------------------------
@@ -866,7 +1138,7 @@ struct FCoarseChunkGridSampler
 		const int32 LY = int32(Y - BaseVY) + 1;
 		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
 		const vxc::MaterialId M =
-			vxc::Amplifier::materialAt(Columns[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+			vxc::Amplifier::materialAt(Cols[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
 		// AIR ONLY, the same monotone rule as every other compose site; the
 		// shortlist holds the 0-to-few instances whose box covers this
 		// column's rep coordinate, in resolveForCompose order, so
@@ -905,7 +1177,12 @@ struct FCoarseChunkGridSampler
 	int32 Level;
 	int64 BaseVX;
 	int64 BaseVY;
-	TArray<vxc::ColumnSample> Columns;
+	// Exactly one of these two owns the columns; Cols points at whichever it
+	// is. SharedGrid's refcount is what keeps a cache-served (or concurrently
+	// evicted) grid alive for this sampler's whole lifetime.
+	FSharedColumnGridCache::FConstGridRef SharedGrid;
+	TArray<vxc::ColumnSample> OwnColumns;
+	const vxc::ColumnSample* Cols = nullptr;
 	std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
 	TArray<TArray<uint16, TInlineAllocator<2>>> ColShortlist;
 };
@@ -1522,6 +1799,12 @@ struct FJobResult
 	// fewer, whatever the chunk contains. Cycles per column is therefore a
 	// like-for-like number across runs in a way that ms/job is not (chunk mix
 	// moves the mesh half).
+	//
+	// ...UNLESS -VoxelSharedGridCache= is on (Phase 2): a cache hit evaluates
+	// ZERO columns and its GridCycles is the near-zero acquire cost, which is
+	// the win the cache exists to make. The fixed-work property above holds
+	// only on cache-off runs -- take cycles-per-column readings with the cache
+	// off, or restrict them to the miss population.
 	//
 	// QueryThreadCycleTime is a cheap user-mode read of the thread's own cycle
 	// counter (two calls per job) and cannot perturb the number it reports the
@@ -2518,6 +2801,48 @@ int32 L0GridCacheProbeEntries()
 		int32 Value = 0;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelL0GridCacheProbe="), Value);
 		return FMath::Max(0, Value);
+	}();
+	return Entries;
+}
+
+// Phase 2 (docs/marcher-handoff-2026-08-22.md §5): the REAL cross-job column
+// grid cache the probe above only simulates -- see FSharedColumnGridCache's
+// doc comment for the design and, above all, the residency gate.
+//
+// `-VoxelSharedGridCache=<entries>` sets the capacity in ENTRIES and enables
+// the cache. One entry is one (32+2)^2 column grid, sizeof ~208 KB, so the
+// plan's budgeted 1024 entries is ~208 MB. 0 = OFF, AND OFF IS THE DEFAULT:
+// the probe leg that decides whether this cache earns its memory
+// (-VoxelL0GridCacheProbe, run by the main session) had not reported at the
+// time this shipped, and a cache that changes every job's storage path must
+// not be the thing a measurement leg silently includes. Flip the default only
+// with the probe's distinct/dispatches number in hand, and flip it the way
+// GpuMeshEnabled did -- to a NEGATIVE switch -- so PIE sessions (which have no
+// command line of their own) get whatever the measured default is.
+//
+// Command line rather than a cvar, for the reason every switch in this
+// namespace is: -ExecCmds cvars land after streaming has already begun, so a
+// cvar here would fork a run half way through and make its cold-fill number a
+// blend of cached and uncached jobs. The value must be decided before the
+// first dispatch or the A/B this switch exists to serve cannot be taken.
+int32 SharedGridCacheEntries()
+{
+	static const int32 Entries = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSharedGridCache="), Value);
+		// Clamped at 4096 (~832 MB): past that the cache is bigger than the
+		// footprint population of the whole cascade could ever use.
+		Value = FMath::Clamp(Value, 0, 4096);
+		if (Value > 0)
+		{
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel shared column-grid cache ENABLED: cap=%d entries (~%d MB). ")
+			       TEXT("Expect a 'Voxel shared grid cache' line in every 5s perf window; ")
+			       TEXT("a line of zeros means the cache is not being consulted."),
+			       Value, int32((int64(Value) * 208 * 1024) >> 20));
+		}
+		return Value;
 	}();
 	return Entries;
 }
@@ -4244,6 +4569,16 @@ struct FVoxelWorldImpl
 	// makes for GenPtr/QueuePtr/CounterPtr).
 	FSharedMipCache SharedMipCache;
 
+	// Phase 2 (marcher handoff §5): shared cross-job (Level, ChunkX, ChunkY)
+	// -> column-grid cache, consulted by the level-0 worker arm and
+	// FCoarseChunkGridSampler when -VoxelSharedGridCache= is set. Owned here
+	// for the same lifetime argument as SharedMipCache directly above -- and
+	// with one strengthening: entries are TSharedPtr-refcounted, so even an
+	// entry evicted mid-job keeps its storage alive through the job's own
+	// reference. See the class doc comment for the residency gate, which is
+	// the load-bearing part.
+	FSharedColumnGridCache SharedColumnGridCache;
+
 	// M2 wave 2 item 1: bumped once per edit batch, BEFORE SharedMipCache
 	// invalidation, in PropagateEditToMips -- lets an in-flight worker job
 	// (dispatched before the edit landed) detect that an edit raced its
@@ -5132,6 +5467,14 @@ struct FVoxelWorldImpl
 	int64 L0ProbeHitsSinceLog = 0;
 	int64 L0ProbeMissesSinceLog = 0;
 	int64 L0ProbeColdMissesSinceLog = 0; // misses on a footprint never seen this window
+	// Phase 2 shared column-grid cache (-VoxelSharedGridCache=): totals at the
+	// last perf log, so the 5s line can print window DELTAS from the cache's
+	// cumulative worker-side atomics. Game thread only, like the probe fields
+	// above.
+	int64 GridCacheHitsAtLastLog = 0;
+	int64 GridCacheMissesAtLastLog = 0;
+	int64 GridCacheRefusedAtLastLog = 0;
+	int64 GridCacheEvictionsAtLastLog = 0;
 	// THE decisive number for this wave, and the one the job-count census
 	// cannot give: worker WALL TIME split by outcome. 77% of jobs meshing to
 	// zero quads only justifies a skip if those jobs are also a large share of
@@ -5368,6 +5711,11 @@ private:
 	// FootprintZRangeCache's doc comment for why memoizing is exact.
 	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
 	                                 int32& OutChunkZMaxUntrimmed) const;
+	// Phase 2 shared column-grid cache: is every column the level-L grid
+	// build will sample provably resident RIGHT NOW? Game thread, called at
+	// dispatch; the answer is latched into the job. See the definition for
+	// the exact rect and FSharedColumnGridCache for what the answer gates.
+	bool IsColumnGridFootprintResident(int32 Level, int32 ChunkX, int32 ChunkY) const;
 	void PruneFootprintZRangeCache(const FVector& Anchor);
 	// Load-before-unload, ring-gap fix: the Z half of "is the replacement chunk
 	// this stand-in is waiting on actually DESIRED" -- see
@@ -7057,6 +7405,44 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       Probes > 0 ? 100.0 * double(Probes - L0ProbeDistinct.Num()) / double(Probes) : 0.0);
 		L0ProbeHitsSinceLog = L0ProbeMissesSinceLog = L0ProbeColdMissesSinceLog = 0;
 		L0ProbeDistinct.Reset();
+	}
+
+	// -VoxelSharedGridCache: the REAL cross-job column-grid cache, per 5s
+	// window. Printed WHENEVER the switch is on, zeros included -- this project
+	// has a recorded history of code that ran and did nothing for months, and
+	// this line is how that failure stays impossible to miss here. How to read
+	// it: hit% is hits/(hits+misses) over RESIDENT lookups only;
+	// residencyRefused counts grids built per-job because the dispatch-time
+	// gate declined to memoize (high forever = the gate is refusing footprints
+	// it should not, or fine tiles are perpetually behind the camera);
+	// evictions racing hits = the cap is too small for the flight pattern.
+	// The throughput question is answered elsewhere: gridKcyc's share of
+	// jobKcyc on the census line, and chunksPerSec on the job-flow line.
+	if (const int32 GridCacheCap = VoxelStreamAdmission::SharedGridCacheEntries(); GridCacheCap > 0)
+	{
+		const int64 CacheHits = SharedColumnGridCache.GetHits();
+		const int64 CacheMisses = SharedColumnGridCache.GetMisses();
+		const int64 CacheRefused = SharedColumnGridCache.GetResidencyRefused();
+		const int64 CacheEvictions = SharedColumnGridCache.GetEvictions();
+		const int64 WinHits = CacheHits - GridCacheHitsAtLastLog;
+		const int64 WinMisses = CacheMisses - GridCacheMissesAtLastLog;
+		const int64 WinRefused = CacheRefused - GridCacheRefusedAtLastLog;
+		const int64 WinEvictions = CacheEvictions - GridCacheEvictionsAtLastLog;
+		GridCacheHitsAtLastLog = CacheHits;
+		GridCacheMissesAtLastLog = CacheMisses;
+		GridCacheRefusedAtLastLog = CacheRefused;
+		GridCacheEvictionsAtLastLog = CacheEvictions;
+		const int64 WinLookups = WinHits + WinMisses;
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel shared grid cache (5s window): cap=%d hits=%lld misses=%lld (hit%%=%.1f) ")
+		       TEXT("residencyRefused=%lld evictions=%lld | totals hits=%lld misses=%lld refused=%lld ")
+		       TEXT("evictions=%lld entries=%lld (%.0f MB)"),
+		       GridCacheCap, (long long)WinHits, (long long)WinMisses,
+		       WinLookups > 0 ? 100.0 * double(WinHits) / double(WinLookups) : 0.0,
+		       (long long)WinRefused, (long long)WinEvictions,
+		       (long long)CacheHits, (long long)CacheMisses, (long long)CacheRefused,
+		       (long long)CacheEvictions, (long long)SharedColumnGridCache.GetEntryCount(),
+		       double(SharedColumnGridCache.GetBytesUsed()) / double(1 << 20));
 	}
 
 	// -VoxelCoarseGridVerify running total: coarse chunks meshed BOTH ways and
@@ -8990,6 +9376,43 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 		}
 	}
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
+}
+
+// Phase 2 shared column-grid cache: the residency question for one footprint's
+// column grid, answered on the game thread at dispatch time and latched into
+// the job. Same rule as the memo directly above -- only a fact derived from
+// resident tiles is worth memoizing -- with the rect adjusted to what the grid
+// build actually samples.
+//
+// WHAT THE GRID SAMPLES, exactly: level 0 evaluates Amp.column over cells
+// [ChunkX*32 - 1, ChunkX*32 + 32] on each axis (the mesher's [-1,B] apron);
+// a coarse level evaluates the same cell range at REP coordinates,
+// rep(c) = c*Scale + Scale/2, which land strictly inside those cells' level-0
+// span. So the honest rect is the chunk footprint dilated by ONE level-L cell
+// on every side -- narrower than the z-range memo's asset-reach dilation
+// because this cache stores COLUMNS ONLY: the per-job asset resolve (whose
+// instance sites reach further out) is deliberately not cached, so its columns
+// are not this gate's problem. IsFootprintResident additionally dilates
+// internally by the carrier stencil and kFineReadMarginMm (the sampling margin
+// every generation query carries -- see VoxelFineTileStreamer.h).
+//
+// No fine tier configured means every column answers from always-resident
+// coarse tiles and the answer is unconditionally yes -- the same branch the
+// two memos above take.
+bool FVoxelWorldImpl::IsColumnGridFootprintResident(int32 Level, int32 ChunkX, int32 ChunkY) const
+{
+	if (!FineStreamer)
+	{
+		return true;
+	}
+	const int64 LevelScale = int64(1) << Level;
+	const int64 CellMm = LevelScale * vxc::kVoxelSizeMm;
+	const int64 SpanMm = int64(VoxelCoords::ChunkEdgeVoxels) * CellMm;
+	const int64 X0Mm = int64(ChunkX) * SpanMm - CellMm;
+	const int64 Y0Mm = int64(ChunkY) * SpanMm - CellMm;
+	const int64 X1Mm = int64(ChunkX) * SpanMm + SpanMm + CellMm - 1;
+	const int64 Y1Mm = int64(ChunkY) * SpanMm + SpanMm + CellMm - 1;
+	return FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm);
 }
 
 void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
@@ -12270,6 +12693,24 @@ void FVoxelWorldImpl::DispatchJobs()
 		// getting a gate's value into the task body (bPredictedEmpty,
 		// bComputeBand are the same shape).
 		const bool bLatencyStatsEnabled = VoxelDebug::GetStreamLatencyStats();
+		// Phase 2 shared column-grid cache (-VoxelSharedGridCache=): both
+		// halves of the decision are taken HERE, on the game thread, and
+		// latched into the task -- the pointer because null IS the off switch
+		// (the worker body never reads the command line), and the residency
+		// verdict because FineStreamer's gate is a game-thread query, the same
+		// placement rule as every gate read in this loop. A job dispatched
+		// before its footprint's fine tiles finished decoding gets
+		// bColumnGridResident=false and builds its grid per-job exactly as
+		// before -- computed-but-not-cached, the FootprintChunkZRangeCached
+		// discipline. Only the CPU worker arm reaches this point; the GPU fork
+		// above never builds a CPU column grid.
+		FSharedColumnGridCache* SharedGridCachePtr = nullptr;
+		bool bColumnGridResident = false;
+		if (VoxelStreamAdmission::SharedGridCacheEntries() > 0)
+		{
+			SharedGridCachePtr = &SharedColumnGridCache;
+			bColumnGridResident = IsColumnGridFootprintResident(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y);
+		}
 		// P2 coverage: the CPU arm's gate, read on the GAME THREAD for exactly the
 		// reason above -- VoxelBrickPackOnCpuEnabled and VoxelGpuBrickPackEnabled are
 		// cvar reads and are not safe from a background task. Latched per dispatch,
@@ -12296,7 +12737,7 @@ void FVoxelWorldImpl::DispatchJobs()
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
 			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
 			 bReuseMesherVoxels, RingSkirtMask,
-			 AssetTallestVoxSnapshot]()
+			 AssetTallestVoxSnapshot, SharedGridCachePtr, bColumnGridResident]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
 				const double JobStartSeconds = FPlatformTime::Seconds();
@@ -12396,30 +12837,91 @@ void FVoxelWorldImpl::DispatchJobs()
 					// -VoxelL0GridScratch=0 restores the per-job TArray as the A/B
 					// control (command line, not a cvar, for the -VoxelCoarseMinLevel
 					// reason: -ExecCmds lands after streaming has begun).
+					//
+					// Phase 2 (-VoxelSharedGridCache=N, default off): everything
+					// above optimises the ALLOCATION; none of it saves the 1156
+					// Amplifier::column calls, which are ~72% of this job's
+					// retired cycles and which the footprint's 8-16 Z-siblings
+					// each repeat identically (Key.Z never enters the loop
+					// below). With the cache on, a resident footprint's grid is
+					// built once into a shared refcounted allocation and every
+					// sibling reads it; the scratch/heap paths remain the
+					// verbatim fallback for cache-off, cache-miss-ineligible and
+					// residency-refused jobs. See FSharedColumnGridCache.
 					constexpr int32 GridCells = GridEdge * GridEdge;
+					static_assert(GridCells == FSharedColumnGridCache::kGridCells,
+					              "the shared cache's grid layout must match the level-0 job's");
 					static thread_local vxc::ColumnSample ScratchColumns[GridCells];
-					TArray<vxc::ColumnSample> HeapColumns; // only populated when the switch is off
-					vxc::ColumnSample* Columns = ScratchColumns;
-					if (!VoxelStreamAdmission::L0GridScratchEnabled())
-					{
-						HeapColumns.SetNumUninitialized(GridCells);
-						Columns = HeapColumns.GetData();
-					}
+					TArray<vxc::ColumnSample> HeapColumns; // only populated when the scratch switch is off
+					// Phase 2: a hit's grid, or the grid this job built for the
+					// cache. Held for the WHOLE job -- the TSharedPtr is the
+					// refcount that lets a concurrent eviction drop the map
+					// entry without freeing storage the mesh below still reads.
+					FSharedColumnGridCache::FConstGridRef SharedGrid;
+					const vxc::ColumnSample* Columns = nullptr;
 					const vxc::Amplifier& Amp = GenPtr->amplifier();
 					// Buried-chunk skip step 1: time the column-grid build apart
 					// from the mesh. These (32+2)^2 Amplifier::column calls are
 					// the only part of a level-0 job that a pre-dispatch skip
 					// could reclaim -- the mesher's own early-outs already make
 					// the mesh of a uniform chunk cheap -- so this split is what
-					// decides whether the skip is worth building at all.
+					// decides whether the skip is worth building at all. The
+					// bracket covers the shared-cache acquire too, so a cache
+					// hit reports its true (near-zero) grid cost and the
+					// gridKcyc share on the census line is what the cache
+					// actually changed.
 					const double GridStartSeconds = FPlatformTime::Seconds();
 					const uint64 GridStartCycles = VoxelThreadCycles();
-					for (int32 LY = 0; LY < GridEdge; ++LY)
+					if (SharedGridCachePtr != nullptr)
 					{
-						for (int32 LX = 0; LX < GridEdge; ++LX)
+						if (bColumnGridResident)
 						{
-							Columns[LX + GridEdge * LY] =
-								Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+							SharedGrid = SharedGridCachePtr->Find(0, Key.X, Key.Y);
+							if (SharedGrid.IsValid())
+							{
+								Columns = SharedGrid->Columns; // hit: zero Amplifier::column calls this job
+							}
+						}
+						else
+						{
+							// Footprint not resident at dispatch -- the grid
+							// this job builds may derive from the sea-level
+							// fallback, so it is computed and USED but never
+							// memoized (FootprintChunkZRangeCached's rule).
+							SharedGridCachePtr->NoteResidencyRefusal();
+						}
+					}
+					bool bBuiltGridThisJob = false;
+					if (Columns == nullptr)
+					{
+						vxc::ColumnSample* Build = ScratchColumns;
+						TSharedPtr<FSharedColumnGridCache::FGrid, ESPMode::ThreadSafe> BuildShared;
+						if (SharedGridCachePtr != nullptr && bColumnGridResident)
+						{
+							// Build straight into the shared allocation -- no
+							// post-build 208 KB copy -- and only then publish.
+							BuildShared = MakeShared<FSharedColumnGridCache::FGrid>();
+							Build = BuildShared->Columns;
+						}
+						else if (!VoxelStreamAdmission::L0GridScratchEnabled())
+						{
+							HeapColumns.SetNumUninitialized(GridCells);
+							Build = HeapColumns.GetData();
+						}
+						for (int32 LY = 0; LY < GridEdge; ++LY)
+						{
+							for (int32 LX = 0; LX < GridEdge; ++LX)
+							{
+								Build[LX + GridEdge * LY] =
+									Amp.column(BaseVX + LX - 1, BaseVY + LY - 1);
+							}
+						}
+						bBuiltGridThisJob = true;
+						Columns = Build;
+						if (BuildShared.IsValid())
+						{
+							SharedGrid = BuildShared;
+							SharedGridCachePtr->Insert(0, Key.X, Key.Y, SharedGrid);
 						}
 					}
 					Result.GridCycles = VoxelThreadCycles() - GridStartCycles;
@@ -12614,7 +13116,13 @@ void FVoxelWorldImpl::DispatchJobs()
 					// makes -- the ~100x-cheaper number the doc comment above
 					// references, NOT a count of voxel-core-internal column work
 					// (that stays uninstrumented this pass, per P1 scope).
-					PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+					// Gated on the grid actually being BUILT: a shared-cache hit
+					// made zero column calls, and counting phantom evals here
+					// would hide exactly the reduction the cache exists to make.
+					if (bBuiltGridThisJob)
+					{
+						PerfCountersPtr->incColumnEvals(uint64_t(GridEdge) * GridEdge);
+					}
 
 					// The brick-level counterpart of BandProvesChunkEmpty, over
 					// this brick's own column block rather than the whole chunk's.
@@ -12854,7 +13362,8 @@ void FVoxelWorldImpl::DispatchJobs()
 						// does, so it bounds what any pre-dispatch skip could
 						// ever reclaim from one.
 						const double GridStartSeconds = FPlatformTime::Seconds();
-						const FCoarseChunkGridSampler CoarseSampler(*GenPtr, LevelKey.Level, Key, PerfCountersPtr);
+						const FCoarseChunkGridSampler CoarseSampler(*GenPtr, LevelKey.Level, Key, PerfCountersPtr,
+						                                            SharedGridCachePtr, bColumnGridResident);
 						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
 						// P2 coverage, coarse levels. FCoarseChunkGridSampler satisfies the
 						// same (int64,int64,int64) -> MaterialId contract the packer wants,
