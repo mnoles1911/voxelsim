@@ -2386,6 +2386,107 @@ bool L0GridScratchEnabled()
 	return bEnabled;
 }
 
+// TIER B / B.3: get the GPU arm's ASSET RESOLVE off the game thread (default OFF).
+//
+// WHAT IS ON THE GAME THREAD TODAY, and it is worldgen, not bookkeeping. For a
+// GPU mesh job SubmitGpuMeshJob runs the whole asset resolve inline -- an
+// AssetField::instancesForRect over the chunk's rect, which calls
+// vxc::Amplifier::column ONCE PER CANDIDATE SITE through the columnFacts lambda,
+// then resolveForCompose over the survivors. Amplifier::column is the single
+// most expensive primitive in this project (cycPerColumn ~3,107 measured
+// 2026-08-22, roughly DOUBLE the 1,517 of 2026-07-28). The identical work runs
+// on a WORKER for a CPU-meshed chunk, in the level-0 job body -- so the fork
+// moved the mesh to the GPU and left the worldgen term on the frame thread.
+//
+// AND IT IS PAID PER CHUNK, NOT PER FOOTPRINT. The rect SubmitGpuMeshJob builds
+// is a pure function of (Level, ChunkX, ChunkY): Key.Z never enters it, at level
+// 0 or coarse. With resident0 = 41,625 level-0 chunks over 5,026 columns
+// (docs/marcher-handoff-2026-08-22.md section 1) that is 8.3 stacked chunks each
+// resolving the SAME instance list from scratch. Exact admission
+// (ComputeFootprintChunkZRange, level 0) runs a NINTH copy of the same resolve
+// over the same rect, also on the game thread. So the game thread pays ~9.3
+// resolves per level-0 footprint where 1 would do.
+//
+// WHAT THIS SWITCH DOES, in the order the wins arrive:
+//
+//   1. ONE SHARED PER-FOOTPRINT CACHE of the resolved instance list, keyed
+//      (Level, X, Y) with Z forced to 0 -- the same key convention and the same
+//      residency gate as FootprintZRangeCache. Consumed by BOTH admission and
+//      SubmitGpuMeshJob. This is the ~8.3-of-9.3 win and it moves nothing
+//      between threads; it deletes duplicate work.
+//   2. A WORKER WARM PASS. Footprints already queued for dispatch but not yet
+//      cached are resolved on the task pool, ahead of the tick that needs them.
+//      This is the half that actually leaves the game thread.
+//   3. AN INLINE FALLBACK THAT NEVER GOES AWAY. A miss resolves on the game
+//      thread exactly as it does today. No chunk is ever delayed waiting for a
+//      warm task, so a task that lands late costs a counter and nothing else.
+//
+// WHY NOT FOLD IT INTO THE GPU STAMP PASSES INSTEAD (the other option B.3
+// offers). AssetStampMain consumes an ALREADY RESOLVED instance plus a decoded
+// span table; read its header -- it stamps one instance's baked columns and
+// knows nothing about site enumeration, species selection or bank lookup. Moving
+// the resolve there would mean porting assetSitesForRect + assetResolveSite +
+// AssetField::resolveForCompose into HLSL, and resolveForCompose returns
+// `const AssetGrid*` pointers into AssetBankLibrary -- CPU-side decoded voxel
+// banks with no GPU-resident form at all. The byte-parity contract the stamp
+// path rests on ("the resolve here is the same instancesForRect +
+// resolveForCompose the CPU samplers run, in the same order") would become a
+// second HLSL mirror to keep in step with vxc, which is precisely the drift
+// worldgen.ush's version lock exists to prevent. Worker pool chosen; GPU
+// rejected on the bank-residency problem, not on cost.
+//
+// DEFAULT OFF so a control leg is byte-identical: with the switch off nothing
+// below is read, no cache is consulted and no task is launched -- one bool test
+// per resolve site.
+//
+// Command line, not a cvar, for the reason -VoxelPendingJobCap and
+// -VoxelNoGpuMesh give verbatim: -ExecCmds cvars land after streaming has begun,
+// so a cvar A/B measures the same warmed-up state twice and misses the cold fill
+// entirely -- which for a CACHE is the only phase where the miss rate is
+// interesting.
+bool AsyncAssetResolveEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolve"));
+	return bEnabled;
+}
+
+// How many warm tasks the dispatch pass may launch per call (0 disables the
+// worker half and leaves the shared cache, which is the A/B that separates
+// "deleting duplicate work" from "moving work off the thread" -- two different
+// findings that one number cannot separate, the same trap `dispatch` and
+// `brickFlush` each fell into).
+//
+// 24 is one per logical core on the measurement box and it is a LAUNCH budget,
+// not an in-flight cap: the in-flight set is what stops a footprint being
+// resolved twice, and the pending queue is ~2,048 deep against ~96 dispatches
+// per tick, so a warm task has tens of ticks of head start. NOT TUNED BY
+// MEASUREMENT -- nothing has been run.
+int32 AsyncAssetResolveWarmPerTick()
+{
+	static const int32 N = []
+	{
+		int32 Value = 24;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelAsyncAssetResolveWarm="), Value);
+		return FMath::Clamp(Value, 0, 4096);
+	}();
+	return N;
+}
+
+// B.3 accounting. The question these have to answer is not "is it faster" -- it
+// is "did any work actually move", because this project has shipped a fork that
+// carried zero traffic for weeks and a weathering pass that changed 20 voxels of
+// 90,000. GameThreadUs and WorkerUs are the pair to read together: if WorkerUs
+// stays at zero the warm pass is a no-op and the only win is the cache.
+std::atomic<uint64> GAssetResolveCacheHits{0};       // served from the cache; no columns run anywhere
+std::atomic<uint64> GAssetResolveInline{0};          // run on the GAME THREAD (cold miss or fallback)
+std::atomic<uint64> GAssetResolveWarmLaunched{0};    // warm tasks started
+std::atomic<uint64> GAssetResolveWarmLanded{0};      // ...that came back and were cached
+std::atomic<uint64> GAssetResolveWarmRaced{0};       // ...that came back after the game thread had resolved it
+std::atomic<uint64> GAssetResolveWarmNotResident{0}; // ...discarded: footprint not fine-tile resident
+std::atomic<uint64> GAssetResolveUncached{0};        // inline resolves NOT cached, same residency reason
+std::atomic<int64> GAssetResolveGameThreadUs{0};     // microseconds of resolve STILL on the game thread
+std::atomic<int64> GAssetResolveWorkerUs{0};         // microseconds of resolve MOVED to the task pool
+
 // Per-BRICK emptiness skip inside a level-0 job (default ON).
 //
 // The existing buried-chunk skip works on a whole 32-voxel-tall chunk, so it can
@@ -4357,6 +4458,49 @@ struct FVoxelWorldImpl
 	};
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, FFootprintZRange> FootprintZRangeCache;
 
+	// --- B.3: the shared asset resolve ------------------------------------
+	//
+	// THE RESOLVED TERRAIN INSTANCE LIST for a footprint, keyed (Level, X, Y)
+	// with Z forced to 0 -- the fourth memo of exactly this shape and it keys the
+	// same way as the other three, for the same reason: the value is a pure
+	// function of (Level, X, Y) and the immutable raster. Key.Z never enters the
+	// rect at any level (see VoxelAssetRectForFootprint), which is precisely why
+	// the 8.3 stacked chunks of a level-0 column were each rebuilding it.
+	//
+	// GAME THREAD ONLY. Read and written on the game thread and nowhere else;
+	// the warm task never touches it, it posts to AssetResolveQueue instead.
+	//
+	// SIZE. A ResolvedAssetInstance is a pointer plus five integers, ~40 bytes.
+	// The measured mesher-side census runs a few instances per level-0 footprint
+	// on wooded ground; even at 32 instances a footprint that is ~1.3 KB, and the
+	// entry count is bounded by the same distance prune the z-range memo uses.
+	//
+	// RESIDENCY-GATED, exactly as FootprintChunkZRangeCached is and for the
+	// stronger version of its reason. A resolve run while a fine tile is still
+	// decoding reads the sea-level fallback, which resolves to ZERO instances --
+	// and the z-range memo's comment already names that case ("through exact
+	// admission -- zero resolved instances"). Memoizing an empty list would delete
+	// every tree in that footprint for the rest of the session. So an entry is
+	// only stored once the footprint's dilated rect is resident, and until then
+	// the resolve is simply re-run, which is what today's code does anyway.
+	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, std::vector<vxc::AssetField::ResolvedAssetInstance>>
+		AssetResolveCache;
+
+	// Footprints with a warm task outstanding. Game thread only. Its job is to
+	// stop N chunks of one column each launching their own task for the same
+	// footprint -- without it the warm pass would be a work MULTIPLIER, not a
+	// mover.
+	mutable TSet<VoxelCoords::FVoxelLevelChunkKey> AssetResolveInFlight;
+
+	// Worker -> game thread. Same MPSC shape as ResultsQueue and for the same
+	// reason: many task threads produce, exactly one consumer drains.
+	struct FAssetResolveResult
+	{
+		VoxelCoords::FVoxelLevelChunkKey Key;
+		std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
+	};
+	mutable TQueue<FAssetResolveResult, EQueueMode::Mpsc> AssetResolveQueue;
+
 	// All-solid admission skip: the analytic floor (absolute mm, sea-level
 	// datum) below which every voxel of this level-L footprint is provably
 	// solid, from vxc::Amplifier::solidBelowBoundMm. INT64_MIN means it
@@ -5230,6 +5374,26 @@ private:
 	void FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
 	                                 int32& OutChunkZMaxUntrimmed) const;
 	void PruneFootprintZRangeCache(const FVector& Anchor);
+
+	// --- B.3 ---------------------------------------------------------------
+	// The one entry point every game-thread asset resolve now goes through.
+	// Returns a pointer to the resolved list: into AssetResolveCache on a hit,
+	// into OutScratch on a miss (which is resolved inline, on this thread,
+	// exactly as the code it replaces did). NEVER null and never blocking --
+	// nothing waits on a warm task. Valid until the next call or the next prune.
+	const std::vector<vxc::AssetField::ResolvedAssetInstance>* ResolvedAssetsForFootprint(
+		int32 Level, int32 ChunkX, int32 ChunkY,
+		std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const;
+	// Is this footprint's resolve derived from RESIDENT fine tiles? The dilation
+	// by the tallest terrain layer's radius is the same one FootprintChunkZRangeCached
+	// applies, and for the same reason: level-0 resolves read asset anchors up to
+	// that reach OUTSIDE the footprint.
+	bool AssetResolveFootprintResident(int32 Level, int32 ChunkX, int32 ChunkY) const;
+	// Game thread: take everything the warm tasks finished and put it in the cache.
+	void DrainAssetResolveResults();
+	// Game thread: launch warm tasks for queued-but-uncached footprints.
+	void WarmAssetResolves();
+
 	// Load-before-unload, ring-gap fix: the Z half of "is the replacement chunk
 	// this stand-in is waiting on actually DESIRED" -- see
 	// FChunkRecord::RetainChildZMask for the bit layout and why Z is stamped once
@@ -6500,6 +6664,41 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)VoxelStreamAdmission::GBandSkipAirL0.load(std::memory_order_relaxed),
 		       (unsigned long long)VoxelStreamAdmission::GCrownChunksMeshed.load(std::memory_order_relaxed),
 		       (unsigned long long)VoxelStreamAdmission::GCrownChunksWithQuads.load(std::memory_order_relaxed));
+
+		// B.3 (-VoxelAsyncAssetResolve): did the asset resolve actually leave the
+		// game thread, and did the shared cache actually remove duplicate work?
+		// Two separate questions, and this line answers both, because one number
+		// could not -- the same trap `dispatch` and `brickFlush` each fell into.
+		//
+		// HOW TO READ IT. `hits` against `inline` is the CACHE: at level 0 there
+		// are ~8.3 stacked chunks plus one exact-admission call per footprint, so
+		// a warm cache should read roughly 8 hits per inline resolve, and anything
+		// near 1:1 means the residency gate is refusing to store entries.
+		// `worker` against `gameThread` is the THREAD MOVE: if worker stays at 0.0
+		// the warm pass is a silent no-op and the only win is the cache. `raced`
+		// counts warm answers the game thread beat to the footprint -- expected
+		// while stationary, and if it is nearly all of `landed` the warm pass is
+		// paying for work that was never on the critical path.
+		//
+		// Printed only when the switch is on, so an unswitched run's log stays
+		// byte-comparable with every log taken before this wave.
+		if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
+		{
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("assets RESOLVE (B.3): hits=%llu inline=%llu uncached=%llu | warm launched=%llu "
+			            "landed=%llu raced=%llu notResident=%llu | gameThread=%.1f ms worker=%.1f ms "
+			            "(cache %d entries, %d in flight)"),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveCacheHits.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveInline.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveUncached.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveWarmLaunched.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveWarmLanded.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveWarmRaced.load(std::memory_order_relaxed),
+			       (unsigned long long)VoxelStreamAdmission::GAssetResolveWarmNotResident.load(std::memory_order_relaxed),
+			       double(VoxelStreamAdmission::GAssetResolveGameThreadUs.load(std::memory_order_relaxed)) / 1000.0,
+			       double(VoxelStreamAdmission::GAssetResolveWorkerUs.load(std::memory_order_relaxed)) / 1000.0,
+			       AssetResolveCache.Num(), AssetResolveInFlight.Num());
+		}
 
 		// The histogram, by NAME, sorted by share. A bankId is only a number to
 		// anybody reading a log; the manifest index is the species name, and the
@@ -8536,6 +8735,95 @@ bool FVoxelWorldImpl::IsChunkProvablyAllSolid(const VoxelCoords::FVoxelLevelChun
 	return TopCentreMm < FloorMm;
 }
 
+// B.3: THE ONE BODY EVERY ASSET RESOLVE RUNS, so the game thread and a worker
+// cannot drift apart.
+//
+// There were three transcriptions of this before: exact admission
+// (ComputeFootprintChunkZRange), SubmitGpuMeshJob, and the level-0 worker job.
+// They agreed only because someone kept them agreeing by hand, and the comment
+// at the GPU site says so explicitly -- "the same instancesForRect +
+// resolveForCompose the CPU samplers run, in the same order -- the byte-parity
+// contract at every level". Adding a FOURTH copy on a worker would have been the
+// fourth chance to get it wrong, so the worker and the two game-thread sites now
+// call this and nothing else. (The level-0 job body is left alone deliberately:
+// it already runs on a worker, so moving it buys nothing and touching it would
+// put a meshing-path change in a streaming-path commit.)
+//
+// THREAD SAFETY, and this is the whole argument for the warm task.
+//
+//  * It takes `const GeneratedWorld&` and NOTHING else. GeneratedWorld is what
+//    DispatchJobs already hands every mesh worker as GenPtr, with the reason
+//    written there: "the job touches ONLY GeneratedWorld (pure function of seed,
+//    lock-free) -- never World (the overlay is not thread-safe and workers must
+//    never touch it)". World::assetField/amplifier/assetChannelsAt are pure
+//    forwards to gen_ and amp_ (voxelcore/world.h:50-58), so a game-thread
+//    caller passing Voxels.generated() gets the identical objects.
+//  * Amplifier::column is const and is already called from ~96 concurrent mesh
+//    workers today.
+//  * assetChannelsAt lands in FVoxelAssetChannelSource, whose own header states
+//    the contract: "one critical section serializes every query ... Called from
+//    meshing workers, the game thread's admission pass and the detail-resolve
+//    workers alike."
+//  * AssetField::instancesForRect and resolveForCompose are const and hold no
+//    mutable state; resolveForCompose's whole purpose is to take the bank
+//    library's global mutex ONCE PER INSTANCE instead of once per voxel (its own
+//    comment: 26.4M bankGrid calls convoying 96 workers at ~17 chunks/s).
+//  * It returns by value. Nothing is written through a pointer the game thread
+//    also holds.
+//
+// WHAT IT DELIBERATELY DOES NOT TOUCH: GpuAssetSpanCache. That TMap is declared
+// "Game thread only, like every other streaming structure on Impl" and is
+// mutated lazily by GpuSpansForGrid, so the span-table build and the packing
+// into FVoxelGpuRegionRequest STAY on the game thread. See the note at that call
+// site for why that half is cheap and why it must not move.
+static std::vector<vxc::AssetField::ResolvedAssetInstance> VoxelResolveTerrainInstances(
+	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>& Gen, const vxc::AssetVoxelRect& Rect)
+{
+	const vxc::AssetField* Field = Gen.assetField();
+	if (Field == nullptr || Field->empty())
+	{
+		return {};
+	}
+	const vxc::Amplifier& AmpRef = Gen.amplifier();
+	// terrainOnly: identical to all three existing sites. 85% of sites are
+	// detail-lattice and each one costs a full Amplifier::column before
+	// resolveForCompose drops it anyway (assetfield.h's own census: 27,684 of
+	// 32,673). Passing false here would silently make this ~6x more expensive
+	// than the code it replaces while producing the same composition.
+	const std::vector<vxc::AssetInstance> Insts = Field->instancesForRect(
+		Rect,
+		[&AmpRef, &Gen](int64_t AVX, int64_t AVY)
+		{
+			return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
+			                                       Gen.assetChannelsAt(AVX, AVY));
+		},
+		/*terrainOnly*/ true);
+	return Field->resolveForCompose(Insts);
+}
+
+// The rect a (Level, ChunkX, ChunkY) footprint resolves over. ONE derivation,
+// because the two existing ones differ in form and must not differ in value:
+// admission builds {Vx0, Vy0, Vx1, Vy1} from ChunkEdgeVoxels * LevelScale and
+// SubmitGpuMeshJob builds a coarseRep box with a one-cell apron. At level 0 both
+// are exactly the chunk's own 32x32 voxels, which is what makes ONE cache
+// serve both; above level 0 only SubmitGpuMeshJob resolves at all (admission
+// takes the cap-based assetTopAboveSurfaceMm there instead), so the coarse form
+// has a single caller and no agreement to maintain.
+static vxc::AssetVoxelRect VoxelAssetRectForFootprint(int32 Level, int32 ChunkX, int32 ChunkY)
+{
+	constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
+	const int64 BaseVX = int64(ChunkX) * ChunkVox;
+	const int64 BaseVY = int64(ChunkY) * ChunkVox;
+	if (Level == 0)
+	{
+		return vxc::AssetVoxelRect{BaseVX, BaseVY, BaseVX + ChunkVox - 1, BaseVY + ChunkVox - 1};
+	}
+	using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
+	return vxc::AssetVoxelRect{GenT::coarseRep(BaseVX - 1, Level), GenT::coarseRep(BaseVY - 1, Level),
+	                           GenT::coarseRep(BaseVX + ChunkVox, Level),
+	                           GenT::coarseRep(BaseVY + ChunkVox, Level)};
+}
+
 void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, int32 Level, int32& OutChunkZMin, int32& OutChunkZMax,
                                                    int32& OutChunkZMaxUntrimmed) const
 {
@@ -8717,22 +9005,24 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	{
 		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
 		{
-			const vxc::AssetVoxelRect FootRect{Vx0, Vy0, Vx1, Vy1};
-			const vxc::Amplifier& AmpRef = Voxels.amplifier();
-			const std::vector<vxc::AssetInstance> Insts = Field->instancesForRect(
-				FootRect,
-				// SAME channel source as the mesh resolve (Voxels forwards to
-				// the one installed binding) -- admission and composition must
-				// derive the instance list from identical facts, or crowns and
-				// admitted z-ranges disagree and treetops get clipped.
-				[&AmpRef, this](int64_t AVX, int64_t AVY)
-				{
-					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
-					                                       Voxels.assetChannelsAt(AVX, AVY));
-				},
-				/*terrainOnly*/ true);
-			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
-				Field->resolveForCompose(Insts);
+			// B.3: SAME instance list the mesh resolve gets, from the one shared
+			// body and the one shared cache.
+			//
+			// The rect this used to build inline -- {Vx0, Vy0, Vx1, Vy1} at
+			// LevelScale 1 -- is the chunk's own 32x32 voxels, which is
+			// character-for-character what VoxelAssetRectForFootprint returns at
+			// level 0 and what SubmitGpuMeshJob builds. That identity is the
+			// reason ONE cache can serve admission and composition, and it is
+			// also the property the old comment here was protecting by hand:
+			// "admission and composition must derive the instance list from
+			// identical facts, or crowns and admitted z-ranges disagree and
+			// treetops get clipped." They now derive it from the same call.
+			//
+			// With -VoxelAsyncAssetResolve off this is one bool test and then
+			// exactly the work that was written here before.
+			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
+			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
+				*ResolvedAssetsForFootprint(0, ChunkX, ChunkY, ResolveScratch);
 			int64 MaxCrownTop = INT64_MIN;
 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
 			{
@@ -8822,8 +9112,296 @@ void FVoxelWorldImpl::FootprintChunkZRangeCached(int32 ChunkX, int32 ChunkY, int
 	FootprintZRangeCache.Add(CacheKey, FFootprintZRange{OutChunkZMin, OutChunkZMax, OutChunkZMaxUntrimmed});
 }
 
+// --- B.3 implementation ----------------------------------------------------
+
+bool FVoxelWorldImpl::AssetResolveFootprintResident(int32 Level, int32 ChunkX, int32 ChunkY) const
+{
+	if (!FineStreamer)
+	{
+		// No fine tier configured means every column query answers from
+		// always-resident coarse tiles, so there is no fallback raster to be
+		// fooled by. Same conclusion FootprintChunkZRangeCached reaches.
+		return true;
+	}
+	const int64 LevelScale = int64(1) << Level;
+	const int64 SpanMm = int64(VoxelCoords::ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+	int64 X0Mm = int64(ChunkX) * SpanMm;
+	int64 Y0Mm = int64(ChunkY) * SpanMm;
+	int64 X1Mm = X0Mm + SpanMm - 1;
+	int64 Y1Mm = Y0Mm + SpanMm - 1;
+	// THE COARSE RECT IS WIDER THAN THE FOOTPRINT and the residency test has to
+	// cover what was actually read, not what the chunk owns. Above level 0
+	// VoxelAssetRectForFootprint runs from coarseRep(Base - 1, L) to
+	// coarseRep(Base + 32, L), i.e. one cell of apron plus the half-cell rep
+	// offset -- up to 1.5 level-L cells past each edge. Two cells each side
+	// covers it with room to spare, and being generous here only ever REFUSES to
+	// cache; being mean would cache a fallback. Zero at level 0, where the rect
+	// is exactly the footprint.
+	if (Level > 0)
+	{
+		const int64 PadMm = 2 * LevelScale * vxc::kVoxelSizeMm;
+		X0Mm -= PadMm; Y0Mm -= PadMm; X1Mm += PadMm; Y1Mm += PadMm;
+	}
+	// The resolve reads asset ANCHORS up to the tallest terrain layer's radius
+	// outside the rect (assetSitesForRect dilates by exactly that), so the
+	// residency question has to cover the columns the answer came from -- not
+	// the rect. Copied in shape and in reason from FootprintChunkZRangeCached;
+	// the two must dilate the same way or one memo caches a fallback the other
+	// refuses. Applied at EVERY level here, where the z-range memo applies it
+	// only at level 0 -- the z-range memo has no exact coarse resolve to protect
+	// and this cache does.
+	if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+	{
+		int64 ReachMm = 0;
+		for (const vxc::AssetLayer& L : Field->layers())
+		{
+			if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+		}
+		X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
+	}
+	return FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm);
+}
+
+const std::vector<vxc::AssetField::ResolvedAssetInstance>* FVoxelWorldImpl::ResolvedAssetsForFootprint(
+	int32 Level, int32 ChunkX, int32 ChunkY,
+	std::vector<vxc::AssetField::ResolvedAssetInstance>& OutScratch) const
+{
+	check(IsInGameThread());
+	const VoxelCoords::FVoxelLevelChunkKey CacheKey{Level, VoxelCoords::FVoxelChunkKey{ChunkX, ChunkY, 0}};
+	if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
+	{
+		if (const std::vector<vxc::AssetField::ResolvedAssetInstance>* Hit = AssetResolveCache.Find(CacheKey))
+		{
+			VoxelStreamAdmission::GAssetResolveCacheHits.fetch_add(1, std::memory_order_relaxed);
+			return Hit;
+		}
+	}
+
+	// THE FALLBACK, AND IT IS THE WHOLE SAFETY ARGUMENT. A miss resolves right
+	// here, on this thread, with the same body a warm task would have run. So
+	// there is no state in which a chunk waits for a task, no state in which a
+	// late task produces a hole, and with the switch OFF this is the only path
+	// and it is what the three call sites did before this change.
+	const double T0 = FPlatformTime::Seconds();
+	OutScratch = VoxelResolveTerrainInstances(Voxels.generated(),
+	                                          VoxelAssetRectForFootprint(Level, ChunkX, ChunkY));
+	VoxelStreamAdmission::GAssetResolveInline.fetch_add(1, std::memory_order_relaxed);
+	VoxelStreamAdmission::GAssetResolveGameThreadUs.fetch_add(
+		int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
+
+	if (VoxelStreamAdmission::AsyncAssetResolveEnabled())
+	{
+		if (AssetResolveFootprintResident(Level, ChunkX, ChunkY))
+		{
+			// Cache it, and the Z-siblings behind this chunk in the SAME tick
+			// hit. That is where most of the 8.3-of-9.3 saving actually lands --
+			// a column's chunks are dispatched together, so waiting for a warm
+			// task to cover them would have left the largest term unpaid.
+			//
+			// COPIED, NOT MOVED, into the map. The caller owns OutScratch and the
+			// contract of this function is "the returned pointer is valid" --
+			// moving out of the caller's buffer would be a silent second contract
+			// nobody reading a call site could see, to save one vector copy of a
+			// handful of instances on a path that just paid an Amplifier::column
+			// per candidate site. Not a cost worth a footgun.
+			//
+			// AssetResolveInFlight is deliberately NOT cleared here even though a
+			// warm task for this footprint may now be redundant. The set means
+			// "a task is outstanding", and it is: letting the task land and be
+			// counted as `raced` is the truthful state, and clearing it early
+			// would only let WarmAssetResolves launch a SECOND task for the same
+			// footprint before the first one returned.
+			AssetResolveCache.Add(CacheKey, OutScratch);
+			return AssetResolveCache.Find(CacheKey);
+		}
+		// Not resident: honest answer for THIS caller, not yet a fact worth
+		// memoizing. Identical policy to FootprintChunkZRangeCached, and the
+		// stakes are higher here -- a non-resident resolve returns an EMPTY
+		// list, and an empty list cached forever is every tree in this footprint
+		// gone for the session.
+		VoxelStreamAdmission::GAssetResolveUncached.fetch_add(1, std::memory_order_relaxed);
+	}
+	return &OutScratch;
+}
+
+void FVoxelWorldImpl::DrainAssetResolveResults()
+{
+	check(IsInGameThread());
+	if (!VoxelStreamAdmission::AsyncAssetResolveEnabled())
+	{
+		return;
+	}
+	FAssetResolveResult Landed;
+	while (AssetResolveQueue.Dequeue(Landed))
+	{
+		VoxelStreamAdmission::GAssetResolveWarmLanded.fetch_add(1, std::memory_order_relaxed);
+		AssetResolveInFlight.Remove(Landed.Key);
+		if (AssetResolveCache.Contains(Landed.Key))
+		{
+			// The game thread resolved it inline before the task came back. Keep
+			// the entry that is already there rather than overwriting: they are
+			// the same function of the same inputs, but the resident one has
+			// already been checked and this one has not.
+			VoxelStreamAdmission::GAssetResolveWarmRaced.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		// RESIDENCY CHECKED HERE TOO, not only at launch. Residency can only be
+		// read on the game thread, so the task cannot check its own inputs; the
+		// launch-side check says the raster was resident when the work started
+		// and this one says it still is. Neither proves it stayed resident
+		// throughout -- that is the same exposure FootprintZRangeCache already
+		// accepts and it is stated rather than papered over.
+		if (!AssetResolveFootprintResident(Landed.Key.Level, Landed.Key.Key.X, Landed.Key.Key.Y))
+		{
+			VoxelStreamAdmission::GAssetResolveWarmNotResident.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		AssetResolveCache.Add(Landed.Key, MoveTemp(Landed.Resolved));
+	}
+}
+
+void FVoxelWorldImpl::WarmAssetResolves()
+{
+	check(IsInGameThread());
+	if (!VoxelStreamAdmission::AsyncAssetResolveEnabled())
+	{
+		return;
+	}
+	const int32 Budget = VoxelStreamAdmission::AsyncAssetResolveWarmPerTick();
+	if (Budget <= 0)
+	{
+		return;
+	}
+	const vxc::AssetField* Field = Voxels.assetField();
+	if (Field == nullptr || Field->empty())
+	{
+		return; // no field, nothing to resolve, and no task worth launching
+	}
+
+	// WHERE THE HEAD START COMES FROM. PendingJobKeysByLevel holds up to
+	// kDefaultPendingJobCap (2,048) chunks against ~96 dispatched per tick, so a
+	// footprint sitting in the queue is typically many ticks away from needing
+	// its resolve. Each queue is sorted lowest-priority-first and popped from the
+	// back, so walking BACKWARDS from Last() visits them in the order dispatch
+	// will.
+	//
+	// WHERE ITS TRAFFIC ACTUALLY COMES FROM, AND IT IS NOT LEVEL 0. Saying this
+	// here because the obvious reading of this function is wrong and this project
+	// has shipped two things that ran and did nothing.
+	//
+	//   * AT LEVEL 0 THIS WILL MOSTLY FIND THE CACHE ALREADY WARM. Exact
+	//     admission resolves the same footprint, on the game thread, inside
+	//     RecomputeDesiredSet -- which is what PUT the chunk in this queue. So by
+	//     the time a level-0 key is visible here the answer is normally already
+	//     cached and the Contains() test skips it. That is not a failure: the
+	//     level-0 win is the CACHE (~8.3 duplicate resolves per column deleted),
+	//     not the thread move, and the counters separate the two.
+	//   * THE COARSE LEVELS ARE WHERE THE WORK IS, and they are far bigger than
+	//     level 0 rather than smaller. VoxelAssetRectForFootprint at level L spans
+	//     (32 + 2) * 2^L level-0 voxels per axis: 3.4 m at level 0, 108.8 m at
+	//     level 5. That is (1088/32)^2 = 1,156x the AREA, and assetSitesForRect
+	//     enumerates candidate sites by area with an Amplifier::column per
+	//     surviving terrain site. Exact admission refuses to run this at all
+	//     above level 0 -- read its comment, "a level-5 footprint ... would be
+	//     tens of thousands of amplifier columns on the streaming path", so it
+	//     takes the cap-based assetTopAboveSurfaceMm instead. SubmitGpuMeshJob
+	//     runs it anyway, per coarse chunk, on the game thread. Nothing warms it
+	//     and nothing else caches it.
+	//
+	// So the honest expectation is: level-0 launches near zero, coarse launches
+	// carrying the traffic. If `warm launched` reads ~0 with coarse chunks
+	// dispatching, this function is not reaching the queue and that is a bug, not
+	// a tuning problem.
+	//
+	// Levels walked in ascending order anyway, because the Contains() test makes
+	// an already-warm level 0 cost a hash probe and the budget then flows to the
+	// levels that need it.
+	const vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>* GenPtr = &Voxels.generated();
+	TQueue<FAssetResolveResult, EQueueMode::Mpsc>* QueuePtr = &AssetResolveQueue;
+	int32 Launched = 0;
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels && Launched < Budget; ++Level)
+	{
+		const TArray<FSortEntry>& Queue = PendingJobKeysByLevel[Level];
+		for (int32 I = Queue.Num() - 1; I >= 0 && Launched < Budget; --I)
+		{
+			const VoxelCoords::FVoxelLevelChunkKey CacheKey{
+				Level, VoxelCoords::FVoxelChunkKey{Queue[I].Key.Key.X, Queue[I].Key.Key.Y, 0}};
+			if (AssetResolveCache.Contains(CacheKey) || AssetResolveInFlight.Contains(CacheKey))
+			{
+				continue; // already answered, or already being answered
+			}
+			// Don't spend a worker on a footprint whose answer we would throw
+			// away at drain time anyway.
+			if (!AssetResolveFootprintResident(Level, CacheKey.Key.X, CacheKey.Key.Y))
+			{
+				continue;
+			}
+			AssetResolveInFlight.Add(CacheKey);
+			++Launched;
+			VoxelStreamAdmission::GAssetResolveWarmLaunched.fetch_add(1, std::memory_order_relaxed);
+			const vxc::AssetVoxelRect Rect = VoxelAssetRectForFootprint(Level, CacheKey.Key.X, CacheKey.Key.Y);
+			// GenPtr and QueuePtr are raw pointers into Impl-owned data, exactly
+			// as the mesh job's GenPtr/QueuePtr are, and safe for exactly the
+			// same reason: the task goes into InFlightTasks and Deinitialize
+			// waits on it in WaitForInFlightTasks before Impl is destroyed. A
+			// warm task that is NOT registered there would outlive Impl on
+			// teardown and read freed worldgen -- which is why this is added to
+			// the array on the very next line rather than fired and forgotten.
+			UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
+				TEXT("VoxelAssetResolveWarm"),
+				[GenPtr, QueuePtr, CacheKey, Rect]()
+				{
+					const double T0 = FPlatformTime::Seconds();
+					FAssetResolveResult Out;
+					Out.Key = CacheKey;
+					Out.Resolved = VoxelResolveTerrainInstances(*GenPtr, Rect);
+					VoxelStreamAdmission::GAssetResolveWorkerUs.fetch_add(
+						int64((FPlatformTime::Seconds() - T0) * 1e6), std::memory_order_relaxed);
+					QueuePtr->Enqueue(MoveTemp(Out));
+				},
+				// Background, below the mesh jobs' own priority band by intent:
+				// this is speculative work whose miss costs a counter, and it
+				// must never take a slot from a chunk somebody is waiting for.
+				UE::Tasks::ETaskPriority::BackgroundLow);
+			InFlightTasks.Add(MoveTemp(Task));
+		}
+	}
+}
+
 void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 {
+	// B.3: the asset resolve cache prunes on ITS OWN trigger, ahead of the early
+	// return below, and that is deliberate rather than tidy.
+	//
+	// The other three memos hold 8-12 bytes per entry, so 65,536 of them is under
+	// a megabyte and one shared trigger is fine. An AssetResolveCache entry is a
+	// std::vector -- a heap allocation plus ~40 bytes per resolved instance --
+	// and 65,536 live vectors is a different kind of object entirely. Sharing the
+	// trigger would let it sit at that size for as long as the z-range cache
+	// stayed under its own limit, which on a stationary session is forever.
+	//
+	// 8,192 entries is ~1.6x the 5,026 level-0 columns a 128 m R0 disc holds, so
+	// the working set of a stationary or slowly-moving camera fits with headroom
+	// and only travel evicts. Not tuned by measurement.
+	constexpr int32 AssetResolveCacheMaxEntries = 8192;
+	if (AssetResolveCache.Num() > AssetResolveCacheMaxEntries)
+	{
+		for (auto It = AssetResolveCache.CreateIterator(); It; ++It)
+		{
+			const int32 Level = It.Key().Level;
+			const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+			const double KeepRadiusUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 *
+			                            UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+			const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
+			const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
+			if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) >
+			    FMath::Square(KeepRadiusUU))
+			{
+				It.RemoveCurrent();
+			}
+		}
+	}
+
 	if (FootprintZRangeCache.Num() <= FootprintZRangeCacheMaxEntries)
 	{
 		return;
@@ -11101,34 +11679,39 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	{
 		if (const vxc::AssetField* AField = Voxels.assetField(); AField != nullptr && !AField->empty())
 		{
-			constexpr int32 ChunkVox = VoxelCoords::ChunkEdgeVoxels;
-			const int64 BaseVX = int64(LevelKey.Key.X) * ChunkVox;
-			const int64 BaseVY = int64(LevelKey.Key.Y) * ChunkVox;
-			using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
-			const vxc::AssetVoxelRect ARect =
-				(LevelKey.Level == 0)
-					? vxc::AssetVoxelRect{BaseVX, BaseVY, BaseVX + ChunkVox - 1,
-					                      BaseVY + ChunkVox - 1}
-					: vxc::AssetVoxelRect{GenT::coarseRep(BaseVX - 1, LevelKey.Level),
-					                      GenT::coarseRep(BaseVY - 1, LevelKey.Level),
-					                      GenT::coarseRep(BaseVX + ChunkVox, LevelKey.Level),
-					                      GenT::coarseRep(BaseVY + ChunkVox, LevelKey.Level)};
-			const vxc::Amplifier& AmpRef = Voxels.amplifier();
-			const std::vector<vxc::AssetInstance> AInsts = AField->instancesForRect(
-				ARect,
-				// Channel-sourced facts, same binding as every CPU resolve --
-				// the GPU stamp's byte-parity contract starts at the instance
-				// list, so this resolve must never see different gates.
-				[&AmpRef, this](int64_t AVX, int64_t AVY)
-				{
-					return vxc::assetColumnFactsFromSample(AmpRef.column(AVX, AVY),
-					                                       Voxels.assetChannelsAt(AVX, AVY));
-				},
-				/*terrainOnly*/ true);
-			const std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved =
-				AField->resolveForCompose(AInsts);
+			// B.3: THE RESOLVE THAT USED TO BE WRITTEN OUT HERE.
+			//
+			// It was ~30 lines of instancesForRect + resolveForCompose with an
+			// Amplifier::column per candidate site, run on the GAME THREAD, once
+			// per CHUNK. The rect it built is a pure function of (Level, X, Y) --
+			// LevelKey.Key.Z appears nowhere in it -- so the 8.3 stacked chunks of
+			// a level-0 column each ran it identically, and exact admission ran a
+			// ninth copy over the same rect earlier in the same tick.
+			//
+			// VoxelAssetRectForFootprint reproduces both forms exactly: the level-0
+			// 32x32 box and the coarse coarseRep box with its one-cell apron, which
+			// mirrors FCoarseChunkGridSampler. Nothing about WHICH instances this
+			// chunk stamps changes; only how many times the answer is computed and
+			// on which thread.
+			//
+			// The order is preserved and that is load-bearing, not incidental: the
+			// stamp kernel is dispatched once per instance IN THIS ORDER and writes
+			// only AIR cells, so first-non-air-wins picks the same winner as
+			// AssetField::materialAtResolved on the CPU. VoxelResolveTerrainInstances
+			// returns resolveForCompose's own vector unmodified, so the order is
+			// resolveForCompose's, which is instancesForRect's -- unchanged.
+			std::vector<vxc::AssetField::ResolvedAssetInstance> ResolveScratch;
+			const std::vector<vxc::AssetField::ResolvedAssetInstance>& Resolved =
+				*ResolvedAssetsForFootprint(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y, ResolveScratch);
 			// Same mesher-side accounting as the CPU job: a GPU-meshed chunk
 			// resolves here and never runs the worker's block.
+			//
+			// STILL COUNTED ON A CACHE HIT, deliberately. These count CHUNKS
+			// COMPOSED, and a chunk that took a cached list composed exactly as
+			// much asset geometry as one that resolved inline. Gating them on the
+			// miss path would make the "assets MESHER" line read as though
+			// composition had collapsed the moment the cache warmed -- the same
+			// shape as the counter that reported chunksPerSec=0 forever.
 			VoxelStreamAdmission::GMesherChunksComposed.fetch_add(1, std::memory_order_relaxed);
 			VoxelStreamAdmission::GMesherChunksWithInstances.fetch_add(Resolved.empty() ? 0 : 1,
 			                                     std::memory_order_relaxed);
@@ -11146,6 +11729,18 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			// Two instances of one species-seed in the same chunk share one
 			// prefix table -- the dedup FVoxelGpuRegionRequest's header
 			// promises.
+			//
+			// B.3: THIS HALF STAYS ON THE GAME THREAD AND MUST. GpuSpansForGrid
+			// reads and lazily WRITES GpuAssetSpanCache, a TMap on Impl whose own
+			// declaration says "Game thread only, like every other streaming
+			// structure on Impl". A worker touching it would be a concurrent TMap
+			// insert -- a rehash racing a lookup, which corrupts silently rather
+			// than crashing. It is also not worth moving: the span table is built
+			// ONCE PER GRID for the whole process (the cache is keyed on a grid
+			// pointer the bank library never frees), so on a warm run this loop is
+			// a hash lookup and a few Appends per instance, with no worldgen in it
+			// at all. The expensive half -- the amplifier columns -- is the half
+			// that moved.
 			TMap<const vxc::AssetGrid*, uint32> BaseForGrid;
 			for (const vxc::AssetField::ResolvedAssetInstance& R : Resolved)
 			{
@@ -11490,6 +12085,22 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 
 void FVoxelWorldImpl::DispatchJobs()
 {
+	// B.3: collect the warm resolves that finished, then queue more.
+	//
+	// DRAIN FIRST, WARM SECOND, AND BOTH BEFORE THE DISPATCH LOOP. Draining
+	// first means a resolve that landed since the last call is in the cache
+	// before this call's chunks ask for it -- put after the loop, every warm
+	// task would arrive exactly one dispatch too late and the counters would
+	// show launches and landings with a hit rate that never moved. Warming
+	// second means it sees the queue as admission left it.
+	//
+	// Both are a single early return with the switch off. DispatchJobs runs
+	// twice per tick (voxel.Stream.DispatchAfterDrain); the second pass drains
+	// whatever the first pass's tasks finished, and the in-flight set stops it
+	// re-launching anything.
+	DrainAssetResolveResults();
+	WarmAssetResolves();
+
 	// docs/m1-plan.md Stage 2 decisions table: "<=2xLogicalCores jobs in
 	// flight." The multiplier is now voxel.Stream.JobsInFlightPerCore (default
 	// 2, i.e. byte-identical to the old hardcoded form) -- see that cvar's

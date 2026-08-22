@@ -1,0 +1,248 @@
+================================================================================
+THE GAME THREAD'S TWO BIG BUCKETS, READ OUT OF THE CODE'S OWN INSTRUMENTS
+2026-08-22  --  companion to TIER B item B.3
+================================================================================
+
+Written alongside the B.3 change (-VoxelAsyncAssetResolve). Nothing here was
+measured by me: every number is quoted from an instrument already in the tree
+and from docs/measurements/armA-drawpath-ceiling-2026-08-19.txt, with the line
+that produced it named. No editor was launched and no build was run for this
+file.
+
+--------------------------------------------------------------------------------
+0. FIRST, A CORRECTION TO THE PREMISE
+--------------------------------------------------------------------------------
+
+The brief that commissioned this work quotes "game thread at 84.5% of wall,
+dispatch=2111 ms, brickFlush=1590 ms per 5-second window". Those are
+PRE-HASH-GATE numbers. The gate landed before this branch was cut --
+FVoxelMarchChunkIndex::SetContentHashEnabled exists at VoxelMarchChunkIndex.h:448
+with `bool bContentHashEnabled = false;` at :543, and voxel.March.IndexContentHash
+(default 0) at VoxelMarchRenderer.cpp:308.
+
+The same instruments after the gate (armA file, leg hashgate-verify):
+
+    uploadMs      3,146-3,190  ->  155-880 ms per 5 s window
+    brickFlush    1,627-1,806  ->  108-407 ms
+    dispatch      1,985-2,311  ->  670-680 ms
+    tickMs        3,564-4,223  ->  930-1,602 ms
+    % of wall     71-84%       ->  18-32%
+
+And `airProof` (FootprintSurfaceUpperBoundMm) went 245-261 ms -> 0.03 ms with
+FootprintSurfaceUpperBoundCache, which is also already in the tree.
+
+So the buckets below are 3-4x smaller than the brief assumes. The shape of what
+is IN them has not changed, and that is what this note is about.
+
+--------------------------------------------------------------------------------
+1. `dispatch` -- WHAT IT ACTUALLY IS
+--------------------------------------------------------------------------------
+
+DEFINITION, from the accumulator itself (VoxelWorldSubsystem.cpp, the tick):
+
+    AccumDispatchMs += (T1 - T0) * 1000.0 + (T3b - T3) * 1000.0;
+
+T0->T1 is the first DispatchJobs() plus GpuMeshJobs->Tick(). T3->T3b is the
+second DispatchJobs() (voxel.Stream.DispatchAfterDrain, default 1). The comment
+at the second site says so explicitly: "TIMING: folded into
+ThisFrameDispatchMs/AccumDispatchMs (not RemeshMs or UnloadMs) so the tick-budget
+line still attributes all dispatch cost to the dispatch bucket."
+
+SO IT IS NOT ONE THING, AND MOST OF IT WAS NEVER DISPATCH. The GPU manager's own
+FTickStageMs breakdown (logged as "Voxel GPU mesh tick (5s window)"):
+
+    promoteMs=0.6  (of which enqueueMs=0.2)  pollMs=1.4  brickFlushMs=1,170-1,860
+
+Job promotion is 0.6 ms per 5 SECOND WINDOW. Polling the readbacks is 1.4. The
+render-command enqueue is 0.2, which retires render-thread backpressure outright.
+Everything else in Manager->Tick() is GetGlobalVoxelBrickPool().Flush() -- i.e.
+the same function the `brickFlush` bucket measures, just at the other of its two
+call sites. The armA file's own summary: the `dispatch` bucket is "90% NOT
+dispatch".
+
+WHAT IS LEFT IN IT once the flush and the hash are accounted for (670-680 ms per
+5 s window):
+
+  (a) DispatchJobs' per-candidate work. Measured at ~0.21 ms of game thread per
+      DISPATCHED chunk, "reproducible across two legs with tracked counts an
+      order of magnitude apart, so it is not O(tracked)". The ring-quota scan is
+      already bracketed (the PickStart bracket walks every level's queue head on
+      every iteration).
+  (b) SubmitGpuMeshJob's ASSET RESOLVE. This is the B.3 item and it is addressed
+      by the change this note ships with. Sizing is in section 3.
+  (c) ParkSpeculativeResult, which runs INLINE inside OnGpuMeshJobComplete.
+      Measured at 334.7 ms of a 343.9 ms dispatch bucket on the T4-1 leg -- 97%
+      of speculation's entire game-thread cost. Its own comment records this.
+
+MUST IT BE ON THE GAME THREAD?
+
+  (a) YES, the bookkeeping half. DispatchJobs reads and writes ChunkRecords,
+      LevelJobsInFlight, PendingJobKeysByLevel, GpuJobsPending, FootprintBandCache
+      and FootprintBlindJobInFlight. Every one of those is a game-thread-only
+      streaming structure on Impl and several are TMaps mutated in the loop. A
+      worker touching any of them is a concurrent TMap insert. This is a
+      "must stay" and it should be BUDGETED, not moved.
+  (b) NO. The asset resolve is pure worldgen over GeneratedWorld and is already
+      run from ~96 concurrent workers on the CPU meshing arm. Moved by this
+      change; see section 3.
+  (c) YES. ParkSpeculativeResult does AddChunkFromGpu + ParkChunk, both pool
+      mutations, and AddChunkFromGpu does the UnmarkQuadsDirty interval subtract
+      that guards the free-then-reallocate-within-one-frame race. It also has to
+      sit inside the tick's FScopedBatch, which is what removed its per-mutation
+      publication (334.7 ms -> the batch). BUDGET IT: the lever is
+      voxel.Stream.SpeculativeMaxInFlight and the parked cap, not a thread move.
+
+--------------------------------------------------------------------------------
+2. `brickFlush` -- WHAT IT ACTUALLY IS
+--------------------------------------------------------------------------------
+
+DEFINITION, from the tick:
+
+    const double BrickFlushT0 = FPlatformTime::Seconds();
+    GetGlobalVoxelBrickPool().Flush();
+    AccumBrickFlushMs += (FPlatformTime::Seconds() - BrickFlushT0) * 1000.0;
+
+This is the SUBSYSTEM's Flush -- the second of two call sites. The first is
+inside FVoxelGpuMeshJobManager::Tick and lands in `dispatch` (section 1). Both do
+real work and the tick comment says why the second is not redundant: the manager
+flushes before DrainResults and DrainGameThreadMesh, "so without this call every
+CPU-packed chunk would wait a frame, and on a run with no GPU fork at all it
+would wait forever."
+
+THE POOL SPLITS ITSELF THREE WAYS (FVoxelBrickPool::FFlushStageMs, logged as
+"Voxel brick flush (5s window, both call sites)"):
+
+    prepMs=0.1   enqueueMs=0.3-0.4   sinkMs=2,647.6 / 3,437.7 / 3,465.2
+
+prep (moving the pending queues, building the index delta) is 0.1 ms per 5 s
+window. The ENQUEUE_RENDER_COMMAND is 0.3-0.4, so the game thread is not waiting
+on the render thread here at all. THE WHOLE COST IS IndexSink(IndexDelta), i.e.
+FVoxelMarchChunkIndex::ApplyDelta.
+
+APPLYDELTA SPLITS ITSELF THREE WAYS AGAIN (FApplyDeltaMs):
+
+    removedMs=0.0 (n=0)   addedMs=1.4-2.0 (n=9,099-9,570)   uploadMs=3,146-3,190
+
+and uploadMs + addedMs = sinkMs to the tenth on every window, which is what makes
+this a measurement rather than a guess. uploadMs is MarkDirtyAndUpload, which was
+the FNV hash -- now gated -- leaving 155-880 ms per 5 s window.
+
+WHAT THAT RESIDUAL IS, and it is one line. With bContentHashEnabled false,
+MarkDirtyAndUpload does exactly this:
+
+    Staged = Cells;
+    bStagedValid = true;
+
+Cells is sized kCells = kGridSlots * kCellsPerLevel = 7 * (128*128*128) =
+14,680,064 dwords = 56 MiB (VoxelMarchChunkIndex.h:163 kDimXY=128, :178 kDimZ=128,
+:203 kLevels=6, :242 kGridSlots=kRingGrids+1, :243 kCells; the header's own
+Phase 6 note says "56 MiB of use"). So every flush copies 56 MiB on the game
+thread, once per flush, REGARDLESS OF HOW MANY ENTRIES MOVED -- against a delta
+of 9,099-9,570 added cells, i.e. 0.065% of the grid.
+
+  NOTE, because it will mislead the next reader: TWO COMMENTS IN THE TREE STILL
+  SAY 4 MiB (VoxelMarchChunkIndex.h:507 "The CPU shadow. 4 MiB", and the armA
+  file's "an FNV-1a hash over the WHOLE 4 MiB chunk-index grid -- 1,048,576
+  iterations"). Both are stale by 14x: 4 MiB was ONE level grid at kDimZ=64,
+  before the Z-aliasing fix doubled the depth and before the cover slot took the
+  count to seven. :62 records the 4->8 MiB half of that. I have not edited those
+  comments -- they are outside this change's blast radius -- but the arithmetic
+  above is from the live constants.
+
+  SANITY CHECK ON THE RESIDUAL, and it closes: ~180 flushes per 5 s window across
+  both call sites (armA) x 56 MiB = ~10 GB. At a single-thread memcpy rate of
+  ~15 GB/s that is ~670 ms, which sits inside the observed 155-880 ms. That is
+  consistency, not proof -- flush count varies with the leg.
+
+MUST IT BE ON THE GAME THREAD?
+
+  Flush() itself: YES for the queue moves and the ENQUEUE_RENDER_COMMAND, and
+  there is nothing to gain -- the enqueue is 0.3 ms per 5 s window.
+
+  ApplyDelta's INDEX MUTATION: YES. It opens with check(IsInGameThread()) and
+  mutates Cells, CellOwner, PerSlotEntries and NumEntries. Its correctness rests
+  on single-threaded invariants that a lock would not make cheaper: Removed
+  before Added within one delta ("a slot freed by an eviction can be
+  re-allocated to a different chunk inside the same flush ... applied the other
+  way round the index ends up mapping the OLD key to a slot that now holds the
+  NEW chunk -- which is not a missing chunk, it is one chunk's bricks drawn at
+  another chunk's coordinates, and it looks like terrain"), and the "cell still
+  names THIS slot" test with the resident bit in the match. THIS MUST STAY. Say
+  so rather than race it.
+
+  THE 56 MiB COPY: it must stay on the game thread, but it does not have to
+  happen. Two shapes remove it without touching threads, and both are deletion
+  rather than parallelism:
+
+    (i)  DOUBLE-BUFFER instead of copy. Register() consumes Staged once per graph
+         build and clears bStagedValid. A swap plus a dirty flag would give the
+         same ordering guarantee at zero bytes -- but only if Cells is not
+         mutated between the swap and Register(), which it is (every flush
+         mutates it). So this needs a real design pass, not a one-liner.
+    (ii) DIRTY-REGION UPLOAD. The delta names 9,099-9,570 cells out of 14.7M.
+         RDG can upload a sub-range; the index already knows exactly which cells
+         moved because ApplyDelta wrote them. The header at :90 concedes the gap
+         in its own words -- "No delta tracking, no dirty regions, no incremental
+         recentre" -- and at :200 says "Measure before optimising is the rule
+         that kept the first version blunt and it applies to its own successor.
+         GetUploadBytes() is what decides it." GetUploadBytes() has now been
+         decided by uploadMs: it is the largest remaining item in the bucket.
+
+  I did not build either. They are the next item after B.3 and they are worth
+  more than B.3 is.
+
+--------------------------------------------------------------------------------
+3. SIZING THE B.3 ITEM ITSELF
+--------------------------------------------------------------------------------
+
+No profile exists for SubmitGpuMeshJob's asset resolve specifically -- there is
+no bracket around it in the tree, which is why the change ships with one
+(GAssetResolveGameThreadUs / GAssetResolveWorkerUs). What CAN be said from the
+code without running anything:
+
+  * IT IS PAID PER CHUNK, NOT PER FOOTPRINT. The rect is a pure function of
+    (Level, ChunkX, ChunkY); Key.Z appears nowhere in it. resident0 = 41,625
+    level-0 chunks over 5,026 columns = 8.3 stacked chunks per column, each
+    resolving the identical list. Exact admission runs a ninth copy over the
+    same rect. So the game thread pays ~9.3 resolves per level-0 footprint.
+
+  * THE COARSE LEVELS ARE THE EXPENSIVE ONES, which is the opposite of the
+    intuition. VoxelAssetRectForFootprint at level L spans (32 + 2) * 2^L
+    level-0 voxels per axis -- 3.4 m at level 0, 108.8 m at level 5. That is
+    (1088/32)^2 = 1,156x THE AREA, and assetSitesForRect enumerates candidate
+    sites by area with an Amplifier::column per surviving terrain-lattice site.
+
+    EXACT ADMISSION REFUSES TO RUN THIS AT ALL ABOVE LEVEL 0 and says why:
+    "a level-5 footprint is a square kilometre and the exact per-instance resolve
+    below would be tens of thousands of amplifier columns on the streaming path"
+    -- so it takes the cap-based assetTopAboveSurfaceMm instead. SubmitGpuMeshJob
+    runs it anyway, per coarse chunk, on the game thread, and nothing caches it.
+    That asymmetry is the single most surprising thing found while reading for
+    this item.
+
+  * THE UNIT COST IS THE MOST EXPENSIVE PRIMITIVE IN THE PROJECT.
+    cycPerColumn ~= 3,107 (Saved/final-shipped-state.log via the handoff),
+    roughly double the 1,517 of 2026-07-28, and the 34x34 column grid built from
+    the same primitive is ~72% of a level-0 job's retired cycles.
+
+  * IT IS ZERO WITHOUT -VoxelAssetDir. Voxels.assetField() is null and the whole
+    block is skipped. So on a leg with no asset bank installed this change can
+    move nothing, and any leg meant to evaluate B.3 must pass -VoxelAssetDir or
+    it is measuring an empty branch. This is the same trap as the fork that
+    carried zero traffic.
+
+--------------------------------------------------------------------------------
+4. WHAT WOULD EXPOSE A MISTAKE IN ANY OF THIS
+--------------------------------------------------------------------------------
+
+  * The B.3 counters not closing. `hits + inline` must equal the number of
+    resolve sites entered (admission level-0 calls plus GPU submits with a
+    field). If it does not, a path is bypassing the shared entry point.
+  * `warm launched` reading 0 on a moving leg with coarse chunks dispatching.
+    That means WarmAssetResolves never reaches the pending queue, and the whole
+    worker half is a no-op -- the failure this project keeps shipping.
+  * `worker` ms reading 0 while `gameThread` ms is large: same finding, stated
+    the other way.
+  * uploadMs NOT falling when a dirty-region upload lands. If 56 MiB -> 37 KB of
+    upload does not move uploadMs, the copy was never the cost and section 2 is
+    wrong.
