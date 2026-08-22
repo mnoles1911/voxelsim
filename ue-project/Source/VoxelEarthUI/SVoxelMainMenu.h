@@ -76,6 +76,15 @@ public:
 
 private:
 	TSharedRef<class SWidget> BuildMainColumn();
+	TSharedRef<class SWidget> BuildLoadPanel();
+	// HELP, CREDITS and SETTINGS are the same shape: a title, a paragraph and a
+	// BACK button. One builder rather than three near-identical ones, because
+	// three copies of a panel is how three panels start disagreeing.
+	TSharedRef<class SWidget> BuildMessagePanel(const FText& Title, const FText& Body);
+	// menu_body_panel(): oak fill, 2px black border, 18px content margin, plus
+	// the drop shadow Slate brushes cannot express -- see the .cpp.
+	TSharedRef<class SWidget> WrapInPanelFrame(TSharedRef<class SWidget> Content);
+	void RebuildSaveList();
 
 	FOnVoxelMenuAction OnContinue;
 	FOnVoxelMenuAction OnNewGame;

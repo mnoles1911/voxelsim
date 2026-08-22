@@ -13,6 +13,7 @@
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSpacer.h"
+#include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Text/STextBlock.h"
 
@@ -93,9 +94,32 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 		.VAlign(VAlign_Center)
 		[
 			SAssignNew(PanelSwitcher, SWidgetSwitcher)
+			// SLOT ORDER IS THE ENUM ORDER. SVoxelMainMenuDetail::PanelIndex
+			// maps between them and lives next to this list for that reason.
 			+ SWidgetSwitcher::Slot()
 			[
 				BuildMainColumn()
+			]
+			+ SWidgetSwitcher::Slot()
+			[
+				BuildLoadPanel()
+			]
+			+ SWidgetSwitcher::Slot()
+			[
+				BuildMessagePanel(VoxelUIStrings::HelpPanelTitle(), VoxelUIStrings::HelpPanelBody())
+			]
+			+ SWidgetSwitcher::Slot()
+			[
+				BuildMessagePanel(VoxelUIStrings::CreditsPanelTitle(), VoxelUIStrings::CreditsPanelBody())
+			]
+			+ SWidgetSwitcher::Slot()
+			[
+				// SETTINGS is out of scope this pass (docs/front-end-plan.md
+				// R8). It gets the same placeholder treatment HELP and CREDITS
+				// already have in the Godot build rather than being hidden: the
+				// menu a player sees is the menu that shipped, and a missing
+				// button would be the more visible divergence.
+				BuildMessagePanel(VoxelUIStrings::SettingsPanelTitle(), VoxelUIStrings::SettingsPanelBody())
 			]
 		]
 
@@ -240,6 +264,229 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 		];
 }
 
+TSharedRef<SWidget> SVoxelMainMenu::WrapInPanelFrame(TSharedRef<SWidget> Content)
+{
+	using namespace VoxelUITheme;
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	// UIStyles.menu_body_panel() is a StyleBoxFlat carrying four things:
+	// PANEL_OAK_1 fill, a 2px black border, an 18px content margin, and a drop
+	// shadow of rgba(0,0,0,0.6) at size 8, offset (0,4).
+	//
+	// Slate's FSlateBrush carries NONE of the last three. So the panel is
+	// three stacked boxes: the shadow (offset down and inflated), the border,
+	// and the fill inset by the border width. Reproducing a shadow this way
+	// gives a hard-edged rectangle rather than Godot's soft falloff -- an
+	// honest limitation of drawing it with boxes instead of a blur, and one
+	// worth having rather than dropping the shadow entirely, because the panel
+	// sits on photographic art and needs the separation.
+	constexpr float kBorderPx = 2.f;
+	constexpr float kShadowSize = 8.f;
+	constexpr float kShadowOffsetY = 4.f;
+
+	return SNew(SBox)
+		.WidthOverride(L.SubPanelHalfWidth * 2.f)
+		.HeightOverride(L.SubPanelHalfHeight * 2.f)
+		[
+			SNew(SOverlay)
+			+ SOverlay::Slot()
+			// Negative padding grows the slot outward. The shadow rect is the
+			// panel inflated by kShadowSize on every side and then shifted
+			// DOWN by kShadowOffsetY, which moves its top edge in by the offset
+			// and its bottom edge out by it -- hence the asymmetry.
+			.Padding(FMargin(-kShadowSize, kShadowOffsetY - kShadowSize, -kShadowSize, -(kShadowSize + kShadowOffsetY)))
+			[
+				SNew(SImage)
+				.Image(Style.SolidWhite())
+				.ColorAndOpacity(FSlateColor(FLinearColor(0.f, 0.f, 0.f, 0.6f)))
+			]
+			+ SOverlay::Slot()
+			[
+				SNew(SImage)
+				.Image(Style.SolidWhite())
+				.ColorAndOpacity(FSlateColor(FLinearColor::Black))
+			]
+			+ SOverlay::Slot()
+			.Padding(FMargin(kBorderPx))
+			[
+				SNew(SImage)
+				.Image(Style.MenuBodyPanel())
+			]
+			+ SOverlay::Slot()
+			.Padding(FMargin(kBorderPx + L.SubPanelPadding))
+			[
+				Content
+			]
+		];
+}
+
+TSharedRef<SWidget> SVoxelMainMenu::BuildLoadPanel()
+{
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	const float HalfSep = L.SubPanelSeparation * 0.5f;
+
+	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
+
+	Column->AddSlot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+	[
+		SNew(STextBlock)
+		.Text(VoxelUIStrings::LoadPanelTitle())
+		.Font(Style.Serif(L.SubPanelTitleSize))
+		.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+	];
+
+	// FillHeight, so the list takes whatever the title and CANCEL leave --
+	// the Godot ScrollContainer is SIZE_EXPAND_FILL for the same reason.
+	Column->AddSlot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
+	[
+		SNew(SScrollBox)
+		+ SScrollBox::Slot()
+		[
+			SAssignNew(SaveList, SVerticalBox)
+		]
+	];
+
+	Column->AddSlot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+	[
+		SNew(SVoxelMenuButton)
+		.Text(VoxelUIStrings::ButtonCancel())
+		.FontSize(L.SaveRowButtonFont)
+		.MinHeight(L.DialogButtonHeight)
+		.MinWidth(L.DialogButtonWidth)
+		.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
+	];
+
+	RebuildSaveList();
+	return WrapInPanelFrame(Column);
+}
+
+void SVoxelMainMenu::RebuildSaveList()
+{
+	using namespace VoxelUITheme;
+	if (!SaveList.IsValid())
+	{
+		return; // the LOAD panel has not been built yet
+	}
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	SaveList->ClearChildren();
+
+	if (SaveRows.Num() == 0)
+	{
+		// MainMenu.gd's empty state, word for word.
+		SaveList->AddSlot().AutoHeight().Padding(FMargin(0.f, L.SaveRowSeparation))
+		[
+			SNew(STextBlock)
+			.Text(VoxelUIStrings::LoadPanelEmpty())
+			.Font(Style.Serif(L.SaveRowFontSize))
+			.ColorAndOpacity(FVoxelUIStyle::MutedColour())
+			.AutoWrapText(true)
+		];
+		return;
+	}
+
+	for (const FVoxelSaveRowInfo& Row : SaveRows)
+	{
+		const FString Slug = Row.Slug;
+		// Godot renders this as ONE Label with an embedded newline:
+		//   "<save_name>\n<timestamp>   X ..  Y ..  Z .."
+		// Two STextBlocks in a vertical box give the same two lines with
+		// independent colours, which is worth the extra widget: the name wants
+		// INK and the detail wants INK_DIM, and a single label cannot do both.
+		TSharedRef<SVerticalBox> Info = SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(STextBlock)
+				.Text(Row.DisplayName)
+				.Font(Style.Serif(L.SaveRowFontSize))
+				.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+			]
+			+ SVerticalBox::Slot().AutoHeight()
+			[
+				SNew(STextBlock)
+				// An unloadable row shows WHY in place of its coordinates.
+				// The alternative -- showing the position of a world this
+				// build cannot open -- is an invitation to click it.
+				.Text(Row.bLoadable ? Row.Detail : Row.DisabledReason)
+				.Font(Style.Serif(L.SaveRowFontSize - 2))
+				.ColorAndOpacity(Row.bLoadable ? FVoxelUIStyle::DimColour() : FVoxelUIStyle::MutedColour())
+			];
+
+		SaveList->AddSlot().AutoHeight().Padding(FMargin(0.f, L.SaveRowSeparation * 0.5f))
+		[
+			SNew(SBox)
+			.MinDesiredHeight(L.SaveRowMinHeight)
+			[
+				SNew(SHorizontalBox)
+				+ SHorizontalBox::Slot().FillWidth(1.f).VAlign(VAlign_Center)
+				[
+					Info
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(L.SaveRowSeparation, 0.f, 0.f, 0.f))
+				[
+					SNew(SVoxelMenuButton)
+					.Text(VoxelUIStrings::ButtonLoad())
+					.FontSize(L.SaveRowButtonFont)
+					.MinHeight(L.SaveRowButtonHeight)
+					.MinWidth(L.SaveRowButtonWidth)
+					.IsEnabled(Row.bLoadable)
+					.OnClicked_Lambda([this, Slug]() { OnLoadSave.ExecuteIfBound(Slug); return FReply::Handled(); })
+				]
+				+ SHorizontalBox::Slot().AutoWidth().VAlign(VAlign_Center).Padding(FMargin(L.SaveRowSeparation, 0.f, 0.f, 0.f))
+				[
+					SNew(SVoxelMenuButton)
+					.Text(VoxelUIStrings::ButtonDelete())
+					.FontSize(L.SaveRowButtonFont)
+					.MinHeight(L.SaveRowButtonHeight)
+					.MinWidth(L.SaveRowButtonWidth)
+					// HP_BRIGHT, matching the Godot row's font_color override.
+					// DELETE is enabled even on an unloadable save: not being
+					// able to OPEN a world is no reason to be stuck with it.
+					.TextColorOverride(Tint(HpBright))
+					.OnClicked_Lambda([this, Slug]() { OnDeleteSave.ExecuteIfBound(Slug); return FReply::Handled(); })
+				]
+			]
+		];
+	}
+}
+
+TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(const FText& Title, const FText& Body)
+{
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	const float HalfSep = L.SubPanelSeparation * 0.5f;
+
+	return WrapInPanelFrame(
+		SNew(SVerticalBox)
+		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+		[
+			SNew(STextBlock)
+			.Text(Title)
+			.Font(Style.Serif(L.SubPanelTitleSize))
+			.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+		]
+		+ SVerticalBox::Slot().FillHeight(1.f).Padding(FMargin(0.f, HalfSep))
+		[
+			SNew(STextBlock)
+			.Text(Body)
+			.Font(Style.Serif(L.SubPanelBodySize))
+			.ColorAndOpacity(FVoxelUIStyle::BodyColour())
+			.AutoWrapText(true)
+		]
+		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
+		[
+			SNew(SVoxelMenuButton)
+			.Text(VoxelUIStrings::ButtonBack())
+			.FontSize(L.SaveRowButtonFont)
+			.MinHeight(L.DialogButtonHeight)
+			.MinWidth(L.DialogButtonWidth)
+			.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
+		]);
+}
+
 bool SVoxelMainMenu::HasAnyLoadableSave() const
 {
 	// MainMenu.gd::_show_main_column disables CONTINUE and LOAD GAME together,
@@ -261,8 +508,7 @@ bool SVoxelMainMenu::HasAnyLoadableSave() const
 void SVoxelMainMenu::SetSaveRows(TArray<FVoxelSaveRowInfo> Rows)
 {
 	SaveRows = MoveTemp(Rows);
-	// The list widget itself arrives with the LOAD panel; until then, storing
-	// the rows is enough to drive the two buttons' enabled state.
+	RebuildSaveList();
 }
 
 void SVoxelMainMenu::ShowPanel(EVoxelMenuPanel Panel)
