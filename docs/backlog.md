@@ -1445,3 +1445,57 @@ living on the world object so no composition path can opt out by omission — bu
 the discipline is the fix: **`ls -la` the probe binary and `grep -c` the accessor
 on both sides before quoting any number.** See the appendix above and
 `voxelsim-instrument-must-run-the-engine-binding` in the session memory.
+
+## 11. FRONT END (main menu + loading screen) — added 2026-08-22
+
+Landed: a 1:1 clone of the Mira-Thal / *Voxelmark* front end as pure C++ Slate
+in a new `VoxelEarthUI` module, with named saves behind CONTINUE and LOAD GAME.
+See `docs/front-end-plan.md` for what to run and
+`docs/adr/0009-slate-front-end-and-committed-ui-art.md` for why it is built the
+way it is.
+
+**Nothing below has been compiled or photographed.** The environment this was
+written in has no UE 5.8 install, and CI cannot compile the module either
+(`ue-build.yml` is gated off — 30 GB engine, 14 GB runner disk). The two lints
+that DO run in CI pass. Treat the first item as blocking.
+
+1. **Build it, then run the capture set.** `tools\voxel-ui-capture.ps1 -Shot Menu`
+   and its siblings. First contact with a compiler will find things; the module
+   is ~3,500 lines of Slate that has never seen one.
+2. **The colour probe (R1).** `FLinearColor(FColor)` decodes sRGB and Slate
+   re-encodes on output; whether `#f0c14b` survives that round trip is an
+   assumption. `voxel.UI.SRGBTint` A/Bs it at the single conversion site.
+   **Nothing should call this port pixel-exact until this runs.**
+3. **The gate-ring measurement.** `GateMaxRing = 3` is reasoned, not measured.
+   `foreach ($n in 1..5) { tools\voxel-ui-capture.ps1 -Shot GateSweep -GateRing $n -MaxHold 180 }`,
+   into `docs/measurements/front-end-gate-<date>.txt`. Until then the constant's
+   comment says "hypothesis" and should keep saying it.
+4. **The non-regression diff.** A world capture taken through
+   `-VoxelMenuAutoStart` against the same capture without the front end, at the
+   documented within-session noise floor. This is the one that protects the
+   archive.
+5. **Font metrics (R2).** Macondo at 84 px will not lay out identically in
+   Slate and Godot. Expect a few pixels in title width and vertical centring;
+   `Config/DefaultVoxelUI.ini` is where to correct it without a rebuild.
+
+**Deferred, deliberately, with their seams left open:**
+
+- **Pause menu.** The seam is `EVoxelFrontEndState::Playing`; it needs a
+  `Paused` state, an Escape binding on `AVoxelEarthPlayerController`, and an
+  `SVoxelPauseMenu` reusing `FVoxelUIStyle` and `SVoxelMenuButton` unchanged.
+  Its SAVE dialog binds to the existing `VoxelSave::Write`. Until it lands,
+  saves are created through `voxel.SaveGame`.
+- **Settings screen.** Currently a placeholder panel shaped like HELP and
+  CREDITS. The Godot original persists to two files (`settings.json` and
+  `graphics.json`); consolidating them is worth doing at the same time.
+- **Menu music.** The three source WAVs are ~124 MB and one exceeds GitHub's
+  per-file limit. The handoff hook is stubbed; the contract is adopt at
+  BeginLoad, fade to −40 dB over 1.5 s at hand-off.
+- **Per-save seeds.** `Seed` is baked into the amplifier in `Initialize`, before
+  `Impl` exists, so a save from another seed cannot be opened — it is listed as
+  unloadable with the reason shown. Lifting this means extracting a
+  `ConstructImplForSeed()` out of `Initialize`, which also unlocks a seed picker
+  on NEW GAME.
+- **The Mira-Thal branding.** The menu says VOXELMARK and its tips describe
+  Roland, Lethe's Draught and the Aelorin. That was the explicit 1:1 brief; all
+  of it is in `VoxelUIStrings.cpp` so re-authoring is a single-file edit.

@@ -76,6 +76,35 @@ const FNamedException kSelfDrivingExtras[] = {
 	{TEXT("VoxelGIRelight"), TEXT("GI relight fixture: forces a relight then reports")},
 };
 
+// THE FRONT END'S OWN CAPTURE SWITCHES, which the rule above would otherwise
+// suppress the front end for -- -VoxelMenuShot and -VoxelHourglassShot both
+// contain "Shot", and both exist precisely to photograph a menu. Passing
+// -VoxelFrontEnd=1 alongside them works (rule 2 is checked first), and the
+// documented command lines do, but a switch whose whole purpose is defeated
+// when used on its own is a trap rather than a flag. So these force the front
+// end ON, before rule 5 gets a chance to turn it off.
+const TCHAR* const kFrontEndCaptureSwitches[] = {
+	TEXT("VoxelMenuShot"),
+	TEXT("VoxelMenuPanel"),
+	TEXT("VoxelLoadingShot"),
+	TEXT("VoxelLoadingShotAt"),
+	TEXT("VoxelHourglassShot"),
+	TEXT("VoxelMenuAutoStart"),
+	TEXT("VoxelUINoAssets"),
+};
+
+bool NameIsFrontEndCapture(const FString& SwitchName)
+{
+	for (const TCHAR* Entry : kFrontEndCaptureSwitches)
+	{
+		if (SwitchName.Equals(Entry, ESearchCase::CaseSensitive))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 bool NameIsSelfDriving(const FString& SwitchName)
 {
 	for (const TCHAR* Needle : kSelfDrivingSubstrings)
@@ -148,25 +177,11 @@ FResolvedPolicy ComputePolicy()
 		return Result;
 	}
 
-	// Rule 4: unattended. tools/voxel-capture.ps1 and every leg/burst script
-	// built on it pass -unattended, so this single test covers the majority of
-	// the verification fleet in one line.
-	if (FApp::IsUnattended())
-	{
-		Result.bEnabled = false;
-		Result.Reason = TEXT("unattended run (-unattended)");
-		return Result;
-	}
-
-	// Rule 5: a self-driving switch is present. THIS IS THE RULE THAT EARNS
-	// ITS KEEP, and the reason rule 4 alone is not enough:
-	// tools/fluid-spike-measure.ps1 launches `-game -windowed` WITHOUT
-	// -unattended and then drives itself with a fixture switch. Under rules
-	// 1-4 only, that run would stop at a menu and measure nothing.
-	//
-	// Tokenising the command line rather than testing ~200 known names keeps
-	// this O(argv) and, more to the point, makes it work for switches that did
-	// not exist when this was written.
+	// Rules 3.5 and 5 both need the command line's -Voxel* names, so collect
+	// them once. Tokenising rather than testing ~190 known names keeps this
+	// O(argv) and, more to the point, makes it work for switches that did not
+	// exist when this was written.
+	TArray<FString> VoxelSwitchNames;
 	{
 		FString Token;
 		const TCHAR* Cursor = CmdLine;
@@ -182,16 +197,54 @@ FResolvedPolicy ComputePolicy()
 			{
 				Name.LeftInline(EqualsIndex);
 			}
-			if (!Name.StartsWith(TEXT("Voxel"), ESearchCase::CaseSensitive))
+			if (Name.StartsWith(TEXT("Voxel"), ESearchCase::CaseSensitive))
 			{
-				continue;
+				VoxelSwitchNames.Add(MoveTemp(Name));
 			}
-			if (NameIsSelfDriving(Name))
-			{
-				Result.bEnabled = false;
-				Result.Reason = FString::Printf(TEXT("self-driving switch -%s"), *Name);
-				return Result;
-			}
+		}
+	}
+
+	// Rule 3.5: the front end's OWN capture switches force it on, overriding
+	// rules 4 and 5.
+	//
+	// BOTH of those would otherwise defeat it. Rule 5 suppresses anything
+	// containing "Shot", which -VoxelMenuShot and -VoxelHourglassShot both do;
+	// and rule 4 suppresses every unattended run, which every capture run is.
+	// A switch that turns off the thing it exists to photograph is a trap
+	// rather than a flag, so this sits above both of them -- and below rule 3,
+	// because a run that cannot render cannot capture either.
+	for (const FString& Name : VoxelSwitchNames)
+	{
+		if (NameIsFrontEndCapture(Name))
+		{
+			Result.bEnabled = true;
+			Result.Reason = FString::Printf(TEXT("front-end capture switch -%s"), *Name);
+			return Result;
+		}
+	}
+
+	// Rule 4: unattended. tools/voxel-capture.ps1 and every leg/burst script
+	// built on it pass -unattended, so this single test covers the majority of
+	// the verification fleet in one line.
+	if (FApp::IsUnattended())
+	{
+		Result.bEnabled = false;
+		Result.Reason = TEXT("unattended run (-unattended)");
+		return Result;
+	}
+
+	// Rule 5: a self-driving switch is present. THIS IS THE RULE THAT EARNS
+	// ITS KEEP, and the reason rule 4 alone is not enough:
+	// tools/fluid-spike-measure.ps1 launches `-game -windowed` WITHOUT
+	// -unattended and then drives itself with a fixture switch. Under rules
+	// 1-4 only, that run would stop at a menu and measure nothing.
+	for (const FString& Name : VoxelSwitchNames)
+	{
+		if (NameIsSelfDriving(Name))
+		{
+			Result.bEnabled = false;
+			Result.Reason = FString::Printf(TEXT("self-driving switch -%s"), *Name);
+			return Result;
 		}
 	}
 

@@ -28,8 +28,9 @@
 // "the menu did not change any of them" has to be true by construction rather
 // than by inspection.
 //
-// See VoxelFrontEndPolicy.cpp for the six suppression rules and why the
-// obvious one-line version (FApp::IsUnattended()) is not sufficient.
+// See VoxelFrontEndPolicy.cpp for the rules, in the order they are applied,
+// and for why the obvious one-line version (FApp::IsUnattended()) is not
+// sufficient on its own.
 
 #include "CoreMinimal.h"
 

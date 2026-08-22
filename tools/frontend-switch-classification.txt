@@ -1,0 +1,166 @@
+# Front-end switch classification -- the input to
+# tools/lint-frontend-switch-coverage.py.
+#
+# WHAT THIS FILE IS FOR
+# ---------------------
+# VoxelFrontEndPolicy decides, per run, whether the main menu appears. Its
+# rule 5 suppresses the menu whenever a "self-driving" switch is on the command
+# line -- one whose run spawns, poses, waits and captures with no human
+# present. Such a run must never stop at a menu nobody is there to click.
+#
+# That classification is a NAMING-CONVENTION RULE in VoxelFrontEndPolicy.cpp
+# (a switch containing Test / Shot / After / Check / Verify / ... drives
+# itself), not a list, because a list of ~190 names is wrong the first week
+# somebody adds -VoxelFooTest and forgets to update it.
+#
+# The rule cannot classify everything, though, and the failure is silent: a new
+# -VoxelSomethingFixture would fall through as "tuning", the menu would appear,
+# and the capture would hang until the watchdog killed it. This file is what
+# makes that failure LOUD instead. Every switch the rule does not match must
+# appear below, confirming a human decided it is ordinary tuning or
+# configuration. The lint fails on anything unlisted.
+#
+# TO ADD A SWITCH
+# ---------------
+#   * Does the run drive itself and quit?      Name it *Test / *Shot / *After,
+#                                              and the rule handles it.
+#   * Is it configuration or tuning?           Add its name here.
+#   * Neither of those fits?                   Add it to kSelfDrivingExtras in
+#                                              VoxelFrontEndPolicy.cpp, with a
+#                                              reason.
+#
+# Blank lines and #-comments are ignored. One switch name per line, without the
+# leading dash and without a trailing '='.
+
+VoxelAdmissionBandSkip
+VoxelAssetDir
+VoxelBuriedSkip
+VoxelCameraHigh
+VoxelCaveEV
+VoxelCaveLampLumens
+VoxelCaveLampRadiusM
+VoxelCaveLight
+VoxelCavePitch
+VoxelCaveSettle
+VoxelCavernFlooded
+VoxelCoarseGrid
+VoxelCoarseMinLevel
+VoxelDate
+VoxelDebugRings
+VoxelDefaultMaterial
+VoxelDetailRingMeters
+VoxelDetailShadows
+VoxelDigDownDepth
+VoxelDigDownQuit
+VoxelDigDownSettle
+VoxelFineTileCacheBudgetGB
+VoxelFineTileDir
+VoxelFineTileGateFatal
+VoxelFineTileProviderId
+VoxelFineTileRingRadius
+VoxelFlySpeedStep
+VoxelForceUnderwaterSpawn
+VoxelGIBreach
+VoxelGICavePitch
+VoxelGICaveSettle
+VoxelGICaveStandoff
+VoxelGICaveTorch
+VoxelGICaveTorchSettle
+VoxelGIDebug
+VoxelGILegacyBasis
+VoxelGILegacyRefresh
+VoxelGIOn
+VoxelGIQuadSpan
+VoxelGIVis
+VoxelGpuMeshMaxLevel
+VoxelL0BrickSkip
+VoxelL0GridScratch
+VoxelLakeSheetBands
+VoxelLakeSheetCells
+VoxelLakeSheetFineM
+VoxelLakeSheetRangeM
+VoxelLakeSheetSnapPx
+VoxelLakeSheets
+VoxelMaxRingLevel
+VoxelMipCacheBudgetMB
+VoxelNoClipmap
+VoxelNoColdBandThrottle
+VoxelNoDetailAssets
+VoxelNoEditFloorHatch
+VoxelNoGpuMesh
+VoxelNoLoad
+VoxelNoPSOPrecache
+VoxelNoRingSkirt
+VoxelNoUnderground
+VoxelOceanDigDepthM
+VoxelOceanDigHeadingDeg
+VoxelOceanDigLenM
+VoxelOceanDigRadiusM
+VoxelOceanDigReport
+VoxelOverlayOn
+VoxelOverlayRow
+VoxelPendingJobCap
+VoxelPerfDepth
+VoxelPerfExitWatchdogSec
+VoxelPerfHeading
+VoxelPerfLingerSec
+VoxelPerfLogInterval
+VoxelPerfPitch
+VoxelPerfPreflightSec
+VoxelPerfSpeed
+VoxelPerfYaw
+VoxelPoolCapacityQuads
+VoxelRingCrossFade
+VoxelRingFloors
+VoxelRingInnerMeters
+VoxelRingOuterMeters
+VoxelRingQuota
+VoxelRiverRibbonMinPx
+VoxelRiverRibbonRangeM
+VoxelRiverRibbons
+VoxelSeed
+VoxelShadowCascades
+VoxelSkySkip
+VoxelSkyTrim
+VoxelSpawnAltM
+VoxelSpawnAt
+VoxelSpawnPitch
+VoxelSpawnYaw
+VoxelStaticRelevance
+VoxelSweBreachAt
+VoxelSweBreachFillPct
+VoxelSweBreachSampleSec
+VoxelSweBreachSearchM
+VoxelSweBreachSwe
+VoxelTileDir
+VoxelTileScale
+VoxelTimeOfDay
+VoxelTimeScale
+VoxelUndergroundDepth
+VoxelUndergroundVeil
+VoxelVeilExtentM
+VoxelVistaPitch
+VoxelVistaYaw
+VoxelWaterHover
+VoxelWaterLateralFillPx
+VoxelWaterMarkerFillPx
+VoxelWaterUnderside
+VoxelWindFromDeg
+VoxelWindMps
+VoxelZstdDll
+
+# --- The front end's own switches -------------------------------------------
+# Configuration and tuning for the menu itself. None of these drives the run;
+# the ones that DO drive it (-VoxelMenuShot, -VoxelLoadingShot,
+# -VoxelHourglassShot, -VoxelMenuAutoStart) are named in
+# kFrontEndCaptureSwitches in VoxelFrontEndPolicy.cpp instead, where they force
+# the front end ON rather than off.
+VoxelFrontEnd
+VoxelNoMenu
+VoxelMenuPanel
+VoxelMenuAutoStart
+VoxelMenuWatchdog
+VoxelUINoAssets
+VoxelLoadGateMaxRing
+VoxelLoadMinHold
+VoxelLoadMaxHold
