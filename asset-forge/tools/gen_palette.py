@@ -34,7 +34,7 @@ OUT = ROOT / "forge" / "palette.py"
 ENTRY = re.compile(
     r"/\*\s*(MAT_\w+)\s*\*/\s*"
     r"\{\{\{([^}]*)\},\s*\{([^}]*)\},\s*\{([^}]*)\}\},\s*"
-    r"(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*\}",
+    r"(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+)\s*\}",
     re.S,
 )
 
@@ -67,8 +67,8 @@ def source() -> str:
     rows = []
     for i, m in enumerate(ENTRY.finditer(src)):
         name, top, side, bottom = m.group(1), triple(m.group(2)), triple(m.group(3)), triple(m.group(4))
-        jitter, hue, patch, scale = (int(m.group(k)) for k in range(5, 9))
-        rows.append((i, name, top, side, bottom, jitter, hue, patch, scale))
+        jitter, hue, patch, scale, biome = (int(m.group(k)) for k in range(5, 10))
+        rows.append((i, name, top, side, bottom, jitter, hue, patch, scale, biome))
     if not rows:
         raise SystemExit(f"no palette entries parsed from {HEADER}")
 
@@ -99,16 +99,25 @@ def source() -> str:
         "Regenerate: python tools/gen_palette.py",
         "",
         "One flat colour per voxel face, varied per voxel. See ADR-0008 for why",
-        "this is not a texture and why the variation has two frequencies.",
+        "this is not a texture and why the variation has two frequencies, and",
+        "ADR-0009 for the third scale (biome_tint) and the metric patch unit.",
+        "",
+        "THE TABLE IS HERE, THE EVALUATION IS NOT. How these numbers turn into a",
+        "colour is voxelcore/materialcolor.h, mirrored in forge/render.py.",
         '"""',
         "",
-        "# id: (top, side, bottom, voxel_jitter, voxel_hue, patch_strength, patch_scale_vox)",
-        "# Colours are sRGB 0-255. The four numbers are in 1/255ths.",
+        "# id: (top, side, bottom, voxel_jitter, voxel_hue, patch_strength,",
+        "#      patch_scale_dm, biome_tint)",
+        "# Colours are sRGB 0-255. voxel_jitter, voxel_hue, patch_strength and",
+        "# biome_tint are 1/255ths; patch_scale_dm is a WORLD wavelength in",
+        "# decimetres (10 cm), which is one level-0 voxel and half a detail-grid",
+        "# one -- it is not counted in whatever cells the grid at hand happens",
+        "# to use.",
         "PALETTE = {",
     ]
-    for i, name, top, side, bottom, jit, hue, patch, scale in rows:
-        lines.append(f"    {i:>2}: ({top}, {side}, {bottom}, {jit}, {hue}, {patch}, {scale}),"
-                     f"  # {name}")
+    for i, name, top, side, bottom, jit, hue, patch, scale, biome in rows:
+        lines.append(f"    {i:>2}: ({top}, {side}, {bottom}, {jit}, {hue}, {patch}, "
+                     f"{scale}, {biome}),  # {name}")
     lines += [
         "}",
         "",
@@ -116,10 +125,14 @@ def source() -> str:
         "",
         "MATERIAL_COUNT = %d" % len(rows),
         "",
+        "# Column indices into a PALETTE row, so a reader does not have to count.",
+        "TOP, SIDE, BOTTOM = 0, 1, 2",
+        "JITTER, HUE, PATCH, PATCH_SCALE_DM, BIOME_TINT = 3, 4, 5, 6, 7",
+        "",
         "",
         "def entry(mat: int):",
         '    """Appearance for a material id, magenta if it has none."""',
-        "    return PALETTE.get(int(mat), (((255, 0, 255),) * 3) + (0, 0, 0, 0))",
+        "    return PALETTE.get(int(mat), (((255, 0, 255),) * 3) + (0, 0, 0, 0, 0))",
         "",
     ]
     return "\n".join(lines)

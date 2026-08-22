@@ -18,10 +18,21 @@ material looks like (ADR-0008). The RGB column below is generated from it by
 and tools/compile-shaders.ps1 runs that generator with --check, so a hand edit
 here fails CI with the line number. Edit the header, not this table.
 
-BIOME_TINT IS STILL AUTHORED HERE, and that is the whole split. It is not a
-statement about what a material looks like, it is a statement about who decides
-its colour on the UE side, which is this project's policy and not the engine
-core's business.
+BIOME_TINT IS NO LONGER AUTHORED HERE EITHER. It used to be, on the argument
+that "who decides this voxel's colour" is UE-side policy rather than a fact
+about the material. ADR-0009 rejects that argument: rock is the same grey in a
+rainforest and a tundra because it is rock, grass is a different green in each
+because grass is a plant, and that difference IS what the material is. It now
+lives in the engine header as `biomeTint`, a WEIGHT in 1/255ths rather than a
+boolean, and every consumer reads the same number -- including asset-forge's
+preview, which had no way to know and drew terrain materials at a saturation
+the game never shows them at.
+
+The column below is the one-bit SHADOW of that weight (True when the climate
+owns more than half), generated with the RGB. It stays a boolean because the
+only thing that reads it is T_VoxelPalette, which is one texel per material id
+with nowhere to put a weight. Anything that wants the real number reads
+VoxelPaletteBiomeTint in VoxelMaterialPalette.ush.
 
 WHICH FACE THE RGB COMES FROM: the TOP face. This table is indexed by material
 id alone with no face information -- it is what T_VoxelPalette holds, one texel
@@ -59,6 +70,12 @@ are calibrated for the synthetic sampler, not for WorldClim's 0..12000 mm/yr
 quantization -- see VoxelClimateProbe.h), so today the biome path effectively
 owns all outdoor appearance. If the classifier is later fixed to emit varied
 surface ids, this table is already correct for them.
+
+THE BOOLEANS DID NOT MOVE WHEN THEY BECAME GENERATED. Every one of the 47 rows
+came out of the header's weights exactly as it had been hand-authored here,
+which is worth recording: it is the evidence that the weights in the header are
+a faithful promotion of the policy this file used to own, and not a new set of
+opinions wearing its name.
 """
 
 # (name, linear R, G, B, biome_tint)

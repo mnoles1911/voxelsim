@@ -611,6 +611,21 @@ enum Material : MaterialId {
     kMaterialCount
 };
 
+// The first material above the ASSET MATERIALS banner: the line between what
+// the terrain amplifier can emit and what only ever arrives from a baked asset.
+//
+// THIS IS A NAME FOR THE BANNER, NOT A SECOND COPY OF IT. The renderer needs
+// the boundary as a number (VoxelMaterialPalette.ush's
+// VOXEL_MATERIAL_FIRST_ASSET, which decides whether the palette or the biome
+// graph owns a voxel) and voxel-core needs it as a compile-time constant to
+// assert the palette's asset rows against. Both used to derive it separately --
+// the generator by scanning the banner text, everyone else by typing 16 -- which
+// is the arrangement that produced the material-id drift this enum's own comment
+// records. ue-project/Tools/gen_material_palette_ush.py now reads the banner AND
+// this constant and fails if they disagree, so there is one boundary with a
+// check across it rather than two that can drift.
+inline constexpr MaterialId kFirstAssetMaterial = MAT_BARK;
+
 // Floored division/modulo (int division in C++ truncates toward zero; world
 // coordinate -> lattice/pixel/brick index must floor instead).
 constexpr int64_t floorDiv(int64_t a, int64_t b) {

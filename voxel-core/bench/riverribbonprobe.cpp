@@ -41,6 +41,7 @@
 //   --cap      maximum widening factor (default 8).
 
 #include <algorithm>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>

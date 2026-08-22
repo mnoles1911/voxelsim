@@ -13,6 +13,7 @@ add_executable(vxc_tests
   test_carrier.cpp
   test_biome.cpp
   test_climate.cpp
+  test_materialcolor.cpp
   test_mesher.cpp
   test_editlog.cpp
   test_editcompact.cpp

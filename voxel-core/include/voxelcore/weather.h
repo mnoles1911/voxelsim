@@ -212,6 +212,8 @@
 // identical in shape: waves that march into the wind, on a scene that
 // otherwise looks completely fine.
 
+#include <cstddef>
+#include <cstdint>
 #include "voxelcore/hash.h"
 
 namespace vxc {
