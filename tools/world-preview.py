@@ -104,17 +104,36 @@ def read_palette():
 
 
 def read_dump(path):
-    """Header lines, then the binary body. Returns (meta, numpy record arrays)."""
+    """Header lines, then the binary body. Returns (meta, numpy record arrays).
+
+    Read through the file rather than into memory. A dump is 16 bytes per
+    column and the radius/stride that produce it are two independent flags, so
+    it is easy to ask for one much larger than it looks: --dump-radius 3000
+    --dump-stride 4 is a 15000x15000 grid and 3.6 GB. The first version of this
+    function slurped the file and then sliced it, i.e. twice the file in RAM,
+    and that dump got the process OOM-killed -- which surfaced as a zero exit
+    status and no image, the failure mode this repo keeps paying for. np.fromfile
+    with an offset holds one copy and nothing more.
+    """
     import numpy as np
 
-    data = Path(path).read_bytes()
-    end = data.find(b"# END\n")
-    if end < 0:
-        raise SystemExit(f"{path}: no '# END' header terminator -- is this a "
-                         "vxc_matcensus --dump file?")
-    head = data[:end].decode("ascii")
-    body = data[end + len(b"# END\n"):]
+    # The header is short and ASCII; find its terminator without reading the body.
+    CHUNK = 4096
+    head_bytes = b""
+    with open(path, "rb") as f:
+        while b"# END\n" not in head_bytes:
+            more = f.read(CHUNK)
+            if not more:
+                raise SystemExit(f"{path}: no '# END' header terminator -- is this a "
+                                 "vxc_matcensus --dump file?")
+            head_bytes += more
+            if len(head_bytes) > 64 * 1024:
+                raise SystemExit(f"{path}: no '# END' in the first 64 KiB -- is this a "
+                                 "vxc_matcensus --dump file?")
+    offset = head_bytes.index(b"# END\n") + len(b"# END\n")
+    head = head_bytes[:offset].decode("ascii")
 
+    # ONE KEY PER LINE: first token is the key, the rest are its values.
     meta = {}
     for line in head.splitlines():
         parts = line.lstrip("#").split()
@@ -124,13 +143,14 @@ def read_dump(path):
     cell_m = float(meta["metres_per_cell"][0])
 
     want = n * n * RECORD.size
-    if len(body) != want:
-        raise SystemExit(f"{path}: body is {len(body)} bytes, header says "
+    have = Path(path).stat().st_size - offset
+    if have != want:
+        raise SystemExit(f"{path}: body is {have} bytes, header says "
                          f"{n}x{n} records = {want}")
 
     dt = np.dtype([("surface", "<i4"), ("gx", "<i4"), ("gy", "<i4"),
                    ("mat", "u1"), ("biome", "u1"), ("temp", "u1"), ("precip", "u1")])
-    arr = np.frombuffer(body, dtype=dt).reshape(n, n)
+    arr = np.fromfile(path, dtype=dt, count=n * n, offset=offset).reshape(n, n)
     return {"n": n, "cell_m": cell_m, "meta": meta}, arr
 
 
@@ -324,12 +344,19 @@ def main():
     img = Image.new("RGB", (width, height), (18, 19, 22))
     draw = ImageDraw.Draw(img)
 
-    real = info["meta"].get("real_tiles", ["0"])[0] == "1"
+    # TRI-STATE, deliberately. A dump written before the header split has no
+    # real_tiles key at all, and defaulting a missing key to "synthetic" prints
+    # a confident claim about provenance from an absence of evidence -- the same
+    # shape of error as the bug that made this tri-state. Unknown says unknown.
+    real = info["meta"].get("real_tiles", [None])[0]
+    real = None if real is None else real == "1"
+    source = {True: "real tiles", False: "SyntheticTileSampler",
+              None: "tile source UNKNOWN (dump predates the real_tiles header)"}[real]
     ox, oy = info["meta"]["origin_m"][0], info["meta"]["origin_m"][1]
     draw.text((pad, 6),
               f"ground colour, top-down  ·  {n}×{n} columns at {info['cell_m']:.1f} m/cell "
               f"({n * info['cell_m'] / 1000:.1f} km across)  ·  origin ({ox}, {oy}) m  ·  "
-              f"{'real tiles' if real else 'SyntheticTileSampler'}  ·  "
+              f"{source}  ·  "
               f"no sun, no sky, no AO, no vegetation",
               fill=(150, 155, 165))
 
@@ -354,9 +381,13 @@ def main():
 
     img.save(a.out)
     print(f"wrote {a.out}  ({img.size[0]}x{img.size[1]})")
-    if not real:
+    if real is False:
         print("NOTE: SyntheticTileSampler -- the biome mix is not the shipped "
               "world's. Point vxc_matcensus at a real tile cache for proportions.")
+    elif real is None:
+        print("NOTE: this dump has no real_tiles header, so the tile source is "
+              "unknown. Re-dump with a current vxc_matcensus before quoting "
+              "proportions.")
     return 0
 
 

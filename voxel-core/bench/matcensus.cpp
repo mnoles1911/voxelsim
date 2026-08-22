@@ -364,9 +364,16 @@ int main(int argc, char** argv) {
         const int64_t stride = dumpStride > 0 ? dumpStride : 1;
         const int64_t n = std::max<int64_t>(1, (2 * drVox) / stride);
 
+        // ONE KEY PER LINE. The reader takes the first token as the key and
+        // everything after it as that key's values, so a second key on the
+        // same line is swallowed as a value of the first and simply vanishes.
+        // `real_tiles` rode on the seed line and did exactly that, and
+        // world-preview.py captioned every real-tile picture
+        // "SyntheticTileSampler" -- a confident lie about the provenance of
+        // the thing a reviewer is judging.
         std::fprintf(dump, "# vxc_matcensus dump v2\n");
-        std::fprintf(dump, "# seed %llu real_tiles %d\n",
-                     (unsigned long long)seed, realTiles ? 1 : 0);
+        std::fprintf(dump, "# seed %llu\n", (unsigned long long)seed);
+        std::fprintf(dump, "# real_tiles %d\n", realTiles ? 1 : 0);
         std::fprintf(dump, "# origin_m %lld %lld\n",
                      (long long)originXM, (long long)originYM);
         std::fprintf(dump, "# radius_m %lld\n", (long long)dr);
