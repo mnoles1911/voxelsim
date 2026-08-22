@@ -1,239 +1,215 @@
 # Handoff: GPU ray marcher as primary terrain renderer
 
-**Date:** 2026-08-22
+**Date:** 2026-08-22 (rewritten end of day)
 **Branch:** `marcher/wave1-2-shading-and-tick-ceiling` (NOT pushed)
 **Working dir:** `D:\voxelsim` (the single checkout — `vox-int` is dead, do not work there)
 
 ---
 
-## 1. Where this stands in one paragraph
+## 0. READ THIS FIRST — where the bottleneck actually is
 
-The marcher renders terrain into the real frame, is **on by default**, and quads are retired
-(`retired=1`, `terrainPoolUsedQuads=0`, `residentQuads=0`). Draw-path win over quads is
-**2.72x p50 / 2.41x p95** on matched legs. Marched sun shadows and a per-voxel shading pass
-(climate tint, surface gradients, voxel GI) are built and default-on. The prototype was opened
-in the editor tonight for the first live human look. **It ran, then broke.** Three findings
-below, one of them a hard blocker. No further measurement legs were run — the owner called a
-halt to measurement a day earlier and wants live editor iteration instead.
+The owner asked the right question: *"the marcher was supposed to give 2x cascade distance and
+2x FPS, but the game feels worse — is that the rendering side or the streaming side?"*
+
+**It is the streaming side, on the game thread. The marcher is not the problem, and making it
+faster will not help.** Measured in the editor 2026-08-22:
+
+| | |
+|---|---|
+| `renderMs` | **7.4 – 10.9 ms** |
+| `rhiMs` | 2.9 – 6.0 ms |
+| `subsystemTickMs` (voxel, game thread) | **10 – 64 ms** |
+| voxel streaming tick, share of wall during fill | **40 – 79%** |
+
+Rendering is ~8-11 ms and is not the constraint. The game-thread streaming tick is.
+
+**Why the 2.72x is both real and misleading — this is the important part.** That number was
+measured on a **settled world with a static camera**, 90 s preflight before a 60 s run, no
+fluid, shadows off in both arms. Under those conditions streaming is idle and the draw path is
+the entire frame, so the draw path is what the ratio measures. It is an honest number for the
+question it was asked.
+
+**Live play does not meet those conditions.** The camera moves, streaming is saturated, and the
+game thread dominates. The marcher's win is invisible there — not because it failed, but
+because it optimised something that was not the live bottleneck. **Every marcher-vs-quad
+measurement in this programme shares that flaw.** Before quoting any of them again, ask what
+the measurement's settling period excluded.
+
+So: the marcher delivered a faster draw path, and the draw path was not what the owner feels.
 
 ---
 
-## 2. How to actually see the thing (this cost an hour tonight — read it)
+## 1. How to actually see the thing (do not skip)
 
-**This project has NO level asset. Zero `.umap` files.** The voxel world is built entirely in
-code by `AVoxelEarthGameMode::BeginPlay()`; `GlobalDefaultGameMode` points at it and
+**This project has NO level asset. Zero `.umap` files.** The world is built in code by
+`AVoxelEarthGameMode::BeginPlay()`; `GlobalDefaultGameMode` points at it and
 `GameDefaultMap=/Engine/Maps/Entry.Entry`.
 
-Consequences:
-
-- Opening the editor shows an **empty "Untitled" world with default UE landscape**. That is
-  correct and expected, not a rendering bug. `BeginPlay` has not run.
-- **Terrain only exists in Play-In-Editor (PIE) or `-game`.**
-- The spawn defaults to **(0,0)**, which is outside this seed's baked tiles. Every leg used
-  `-VoxelSpawnAt=-61440,-61440`. Launch without it and you get an empty world that looks
-  exactly like a broken renderer.
-
-Launch line that worked:
+- The editor opens an empty "Untitled" world with default UE landscape. **That is correct** —
+  `BeginPlay` has not run. Terrain exists only in **PIE or `-game`**.
+- **The spawn arg is not optional.** It defaults to (0,0), outside this seed's baked tiles.
 
 ```
 D:\UE_5.8\Engine\Binaries\Win64\UnrealEditor.exe "D:\voxelsim\ue-project\VoxelEarth.uproject" -dx12 -sm6 -VoxelSpawnAt=-61440,-61440 -VoxelNoClipmap
 ```
 
-Then press Play. Allow 30-60 s to settle before judging anything.
+Press Play, allow 30-60 s to settle.
 
 ---
 
-## 3. FIXED 2026-08-22 — the second PIE session rendered an empty sky
+## 2. Fixed today, with evidence
 
-> **STATUS: fixed and verified. Read this for the diagnosis, not for open work.**
-> The gate reports `Voxel GPU teardown: released 71060 pool chunks and 71060 index
-> entries (pool now 0, index now 0)` and session two now streams.
->
-> **It did NOT fix the owner's experience.** Session two still fills at roughly a
-> seventh of session one's rate, and the owner reports streaming is worse than the
-> pre-marcher quad system generally. **That is the real problem and it is now
-> §0.0 in `docs/backlog.md` — start there, not here.**
->
-> There were **three** links, not one, and the third is the reusable lesson:
-> `TArray::SetNumZeroed` only zeroes elements it ADDS, so it was a silent no-op on
-> re-attach and the 4 MiB index grid kept every stale bit. Both teardown
-> primitives — `FVoxelBrickPool::Reset` and `FVoxelMarchChunkIndex::Detach` —
-> already existed with **zero callers**.
+### 2.1 PIE teardown — the pool and index outlived the world
 
-**Symptom (owner-observed):** first PIE session showed terrain. Pressed ESC, pressed Play
-again — sky only, no terrain ever streamed in.
+A second PIE session rendered pure sky. Three links, and **both teardown primitives already
+existed with ZERO callers**:
 
-**Confirmed in the log, not inferred.** `Saved/Logs/VoxelEarth.log`:
+1. `UVoxelWorldSubsystem::Deinitialize` never released anything.
+2. `FVoxelBrickPool::Reset` and `FVoxelMarchChunkIndex::Detach` were written for teardown and
+   never wired up.
+3. `AttachToGlobalPool`'s `Cells.SetNumZeroed(kCells)` was a **no-op on re-attach** —
+   `TArray::SetNumZeroed` only zeroes elements it ADDS — so the 4 MiB grid kept every stale
+   resident bit. `Seed()` resets the counters but never the cells.
 
-| Moment | line | reading |
-|---|---|---|
-| PIE #1, healthy | 67796 | `resident0=43338 indexEntries=120769 released=11542 evictions=0` |
-| PIE #2, onset | 128324 | `resident0=51415 indexEntries=131047 released=0 evictions=1227` |
-| PIE #2, later | 133911 | `resident0=53519 indexEntries=131047 released=0 evictions=59954` |
-| shadow march | 129034 | `NO RAYS MARCHED over 600 retired frames ... sky=1027408 far=0 backface=0` |
+Gated by a line that can fail (it logs the AFTER counts):
+`Voxel GPU teardown: released 96310 pool chunks and 96310 index entries (pool now 0, index now 0)`.
 
-Read those columns together:
+Why no leg caught it: **every leg is a fresh `-game` process**, so the pool was always empty at
+start. PIE re-entry is the only path that starts a world against a populated pool.
 
-1. **`indexEntries` is stuck at 131,047 against a pool capacity of 131,072.** The chunk index
-   is essentially full, and it **carried over from PIE #1** — it never fell when the first
-   session ended.
-2. **`released` is 0 for the whole second session** — but was 11,542 in the first. The Wave 1.2
-   brick-release path works; it has nothing to release, because the pool's contents are orphans
-   from the previous session that no live chunk record owns.
-3. **`evictions` climbs ~200 per 5 s** from zero. A full pool evicts farthest-from-focus, which
-   is precisely what "nothing ever streams in" looks like.
-4. `sky=1027408` of `considered=1027408` — every pixel is sky. Confirms the frame is genuinely
-   empty rather than mis-shaded.
+`FVoxelMarchChunkIndex::Detach` also releases the pooled GPU buffer through
+`ENQUEUE_RENDER_COMMAND` — `Register()` writes it via `QueueBufferExtraction` on the render
+thread, so clearing it game-side was a real race, and leaving it alone would hand the next
+world the previous world's index buffer.
 
-**Diagnosis:** the brick pool and the march chunk index are **not torn down when a PIE session
-ends**. They outlive the world, so session two starts against a saturated index full of dead
-chunks and can never admit a new one.
+**Open consequence:** teardown now DISCARDS ~96,000 chunks that were still valid geometry for
+the same world at the same location, so a second Play is a full cold re-stream. Re-adopting
+them would make it near-instant — but that would MASK the throughput problems below, so it
+must wait.
 
-**Where to look:** the pool is a process-lifetime object in `VoxelEarthShaders`, while the
-records that own its contents live on `UVoxelWorldSubsystem` in `VoxelEarth`, which dies with
-the world. Nothing bridges that gap. `UVoxelWorldSubsystem::Deinitialize` should release
-everything it put in the pool, and/or the pool needs an explicit world-teardown reset.
+### 2.2 The sky-band bound was the dispatch bottleneck — `airProof` 250 ms → 0.03 ms
 
-**The asymmetry that made this easy to miss:** every leg ever run was a fresh `-game` process,
-so the pool was always empty at start. **PIE re-entry is a code path no measurement has ever
-exercised.** This is a pre-existing latent bug that the prototype merely revealed.
+`IsChunkProvablyAllAir` → `FootprintSurfaceUpperBoundMm` was **the only worldgen-grade call on
+the dispatch path that was not memoized**, and the call site's own comment said so, ending
+"whether that is where the 0.21 ms/chunk lives is a HYPOTHESIS until this number is read".
 
-`writesDropped=33` also appears only in session two — same cause; confirm it returns to zero
-once teardown is fixed.
+Read: `airProofMs=245-261` of a `dispatchMs=275-288`, with the streaming tick at **95% of wall
+and 170 ms per tick**. Every chunk in a column recomputed a value that depends only on the
+column. Its two siblings twenty lines away were both memoized; this one was missed.
 
----
+Fixed with `FootprintSurfaceUpperBoundCache`, keyed per footprint, both call sites routed
+through it (which helps the cold-fill `recompute` path too). **Measured after:
+`airProofMs=0.02-0.03`.**
 
-## 4. GI showed no visible difference — cause NOT established
+**The trap, and why it is not cached unconditionally.** The bound reads the same rasters as the
+z-range memo, so an entry computed while a fine tile is still decoding comes from the sea-level
+fallback. A stale z-range gives a wrong band; a stale bound here **under-states the surface**,
+and the wrapped function's comment says what that costs: *"a chunk containing terrain is never
+generated. A hole in the world."* It is residency-gated like `FootprintChunkZRangeCached`, and
+widened by asset reach at **every** level rather than just level 0, because
+`assetAwareSurfaceUpperBoundMm` gates on the field being non-empty, never on level.
 
-**Owner-observed:** `voxel.GI.Enabled 0` vs `1` looked identical.
+### 2.3 The editor was throttling PIE to 3 FPS — a confound that invalidated measurements
 
-Two things are already ruled out:
+Session 2 appeared to stream at ~254 chunks/s against ~2,000. It was not throttled by work:
 
-- **The origin is correct.** `GI ORIGIN AUDIT: pool 'VoxelTerrainPool' ... delta (0,0,0) = 0 UU.
-  SAME SPACE` (log:2375). The origin bug predicted in
-  `voxelsim-marcher-flip-silent-regressions` does **not** apply to terrain.
-- **The shader path is structurally right.** `VoxelMarch.usf:1061-1105` samples three probes and
-  applies `BaseColor *= VoxelGIAmbient` at `:1108`. Not dead code, not a neutral write.
+```
+frameMs=333.33   frameMs=333.33   frameMs=333.33
+```
 
-Two candidates remain, in my order of likelihood:
+**Exactly 1/3 second, repeated — a hard 3 FPS cap**, with all of it in `elsewhereMs` outside
+every voxel system while the streaming tick used only 6% of wall. The tick was not slow; it was
+only being **called 3 times a second**. Frame numbers in the log confirm it: `[313] → [328] →
+[343]` across 5-second gaps.
 
-**(a) The camera was outside the GI volume — a benign non-result.** Log:2376-2378 report
-`coverage=+/-3840 UU` (±38.4 m) and `fade=1920..3520 UU`. **GI is fully faded out beyond 35.2 m
-of the field centre.** If the owner was in flycam at altitude or looking at mid-distance
-terrain, zero difference is the *correct* behaviour. The A/B must be done **standing on the
-ground, under an overhang, within ~20 m.**
+Cause: the editor's **"Use Less CPU when in Background"** (`bThrottleCPUWhenNotForeground`), on
+by default, throttling PIE whenever the editor window loses focus.
 
-**(b) The GI producer has no input now that quads are retired.** `VoxelGI.cpp:533` and `:1280`
-take the volume's anchor from `Terrain->GetTerrainGpuPool()` — the pool that retirement
-deliberately empties. If the compute pass that *fills* the volume also reads that pool, the
-volume is uniform and toggling it changes nothing. **This is a hypothesis, not a finding — I
-did not verify what feeds the volume's contents.** Check the producer in `VoxelGIMarchPass.cpp`.
+**This matters more here than in a normal project: a voxel world streams on the game thread, so
+a frame-rate cap IS a streaming cap.** Now set to `False` in BOTH
+`Config/DefaultEditorPerProjectUserSettings.ini` and
+`Saved/Config/WindowsEditor/EditorPerProjectUserSettings.ini` — the `Default*` file only seeds
+new users and would not have taken effect alone.
 
-**Cheapest discriminator:** `voxel.GI.DebugVis 1` (the cvar exists; log:2378 reports
-`debugVis=0`) and look at whether the volume has any structure in it at all. That separates (a)
-from (b) in one look.
+**Nothing measured under this throttle means anything.** Re-measure anything that predates it.
 
 ---
 
-## 5. Shadows worked, and have a real cost
+## 3. STILL OPEN — what the owner is actually complaining about
 
-Marched sun shadows ran in mode 2 and produced sensible censuses (log:109351, 114272, 125569):
-`hit%` 55.7 / 48.8 / 15.2 across three poses, `exhausted/f=0.00`, all decline counters zero.
+### 3.1 Chunk gaps at LOD ring boundaries — NOT diagnosed
 
-**But `gpuMs mean=6.981 / 7.173 / 9.209` at `reach=512.0m`.** That is expensive — the quad
-path's entire ShadowDepths pass was 15.8 ms, so this is not the bargain the earlier
-0.335-0.409 ms figure at 64 m suggested. `voxel.Shadow.MarchRayReachM` is the dial (try
-48 / 96 / 256); the cost sweep was never run.
+Owner-reported repeatedly and **not addressed**. The `airProof` memo changed cost, not the
+admission rule that decides which chunks exist at a ring boundary — do not assume it helped.
 
-**Unresolved: what reach actually looks good enough.** That is a designer question, and
-answering it was the point of opening the editor.
+The owner believes this was solved during the quad era, which makes it a **regression with a
+known-good past**. That is the strongest lead available: find when it worked. The ring presets
+are `kDefaultRingPresets` (0-128, 128-256, 256-512, 512-1024, 1024-2048, 2048-4096 m); the
+parent-admission rule that skips a chunk when its parent ring covers the ground is in
+`DispatchJobs` near the `ParentDistSq >= FMath::Square(OuterUU)` test.
 
----
+### 3.2 Streaming throughput generally
 
-## 6. What is committed, and the 74 dirty files
+Backlog §0.0. **The "before" number still does not exist** — no measurement of the quad
+mesher's chunks/s exists anywhere in the repo. Get it: build `voxel.March 0` +
+`voxel.Terrain.RetireQuads 0`, fly the same path, read chunks/s. Producer switches are command
+line / ini ONLY; `-ExecCmds` lands after streaming has begun and silently no-ops.
 
-Two commits on the branch:
+Now that `airProof` is fixed and the throttle is off, **re-measure before doing anything else** —
+both prior datasets are contaminated.
 
-- `9037b54` — Wave 1.2 brick lifetime, Wave 2 shading data format, and the streaming-tick ceiling
-- `8d884de` — the prototype: marched terrain on by default, with shadows, GI and climate
+### 3.3 GPU mesh jobs time out constantly
 
-**Nothing is pushed.** `719d2b2` (voxel-core cover producer) is also unpushed.
+**900 timeouts in a focused session, 2,024 in a throttled one:**
+`VoxelGpuMesh: job N ... ended TimedOut -- requeueing on the CPU worker path. readback not
+ready after 10.0 s`. Every one is a GPU job abandoned after a 10 s wait and redone on the CPU.
+Independent of focus. Not investigated. The 10 s timeout is hardcoded at
+`VoxelGpuMeshJobManager.h:353`.
 
-`git status` shows **74 dirty: 35 modified, 39 untracked.** They are neither junk nor reviewed.
-Roughly: ~10 modified docs (`status.md`, `backlog.md`, the roadmap and waves plans), config
-(`DefaultEngine.ini`, `DefaultGame.ini`), a spread of `VoxelEarth` sources, and ~28 never-tracked
-source files. **These need an audit before the branch is pushed** — the owner asked about them a
-day ago and the audit never happened.
+### 3.4 Cold fill: the z-range memo waits for residency
 
-Also outstanding: extend `.gitignore` to cover `bake-out/karst/`.
-
----
-
-## 7. The tick-ceiling win (already landed — do not re-derive)
-
-`MarkDirtyAndUpload()` ran an FNV-1a hash over the whole 4 MiB chunk-index grid on the **game
-thread**, once per flush, to serve `voxel.March.VerifySource` — a diagnostic that defaults to 0
-and never arms. Now gated behind `voxel.March.IndexContentHash` (default 0).
-
-Same-binary A/B: flight mean frame **50.18 → 45.51 ms (−9.3%)**, tick share **93.5% → 40.5%**,
-throughput **1,743-2,001 → 2,274-2,435 chunks/s**.
+`recompute` is 2,815 ms of a 5,000 ms window at cold start, decaying to 85 ms as tiles land.
+`FootprintChunkZRangeCached` refuses to memoize while a fine tile is decoding — correct, for
+the reason its comment gives. Landed `1e5207b` 2026-08-17, **not marcher code**, costs the quad
+path identically. Contributes to initial-load holes.
 
 ---
 
-## 8. Waves still open
+## 4. Other open items
 
-| Wave | State |
+| Item | State |
 |---|---|
-| 1.1 fluid decoupling | **Done** |
-| 1.2 brick lifetime | **Done** — but see the PIE teardown blocker in §3 |
-| 1.2b load-before-unload | **Reverted deliberately.** Correct diagnosis, bad trade: evictions 0 → 151,657, pool to 96%, p95 +25%, bought only 5-10% of holes |
-| 2 per-voxel shading | Built (climate, gradients, GI). **Unjudged by a human** |
-| 3 marched shadows | Built and working. **Cost sweep and reach choice outstanding** |
-| 4 flip the default | **Done** — all defaults flipped, no command-line args needed |
-| 5 water off the quad pool | **Not started.** This is what turns retirement into deletion |
-
-Also worth queueing: camera-radial shadow segmentation (per-ray level is the current
-prototype); confirming water's GI origin bug at a lake; the depth gate's unexplained 27.98%
-interior disagreement.
+| GI shows no visible difference | Origin verified CORRECT (`delta (0,0,0)`). Shader path live (`BaseColor *= VoxelGIAmbient`). Volume covers only **±38 m, fades out at 35 m** — the A/B must be done standing on ground within ~20 m. Discriminate with `voxel.GI.DebugVis 1` |
+| Marched shadows | Work, but **7-9 ms at 512 m reach** — not the 0.3 ms the 64 m scaffold implied. Dial is `voxel.Shadow.MarchRayReachM` (48/96/256). Reach choice is a designer call, never made |
+| Wave 5 — water off the quad pool | Not started. Turns retirement into deletion |
+| Depth gate | 27.98% interior disagreement, unexplained |
+| Camera-radial shadow segmentation | Not done; per-ray level is the prototype |
 
 ---
 
-## 9. Rules that will bite you
+## 5. Rules that will bite you
 
-- **One Unreal editor per box.** Check with `Get-Process`, never `tasklist` via Bash — tasklist
-  reports "all clear" while an editor runs.
-- **A live editor blocks builds** (LNK1104 on the DLLs). Builds and legs cannot overlap in
-  either direction. This bit twice.
-- **`.usf` files are live input to the next run.** Stamp with `tools/voxel-stamp-build.ps1` only
-  after a SUCCESSFUL build, and it is `&& stamp`, never `; stamp`.
+- **One Unreal editor per box.** Check with `Get-Process`, never `tasklist` via Bash.
+- **A live editor blocks builds** (LNK1104). Builds and legs cannot overlap either way.
+- **`.usf` files are live input to the next run.** Stamp with `tools/voxel-stamp-build.ps1`
+  only after a SUCCESSFUL build — `&& stamp`, never `; stamp`.
 - **`VoxelEarthShaders` may not depend on `VoxelEarth`.** Mirror cvars instead.
-- **Adaptive unity hides anon-namespace collisions.** `tools/lint-unity-collisions.py` catches
-  some, not all — it missed one of two pairs this session.
-- **Never read a pre-ROP counter as evidence pixels landed.** `tiles`, `emitFrames`, `marchMs`
-  and every decline counter describe work *before* raster output. A blank frame with perfect
-  counters is exactly what two of this feature's bugs looked like — and what §3 looks like.
+- **Adaptive unity hides anon-namespace collisions.** `tools/lint-unity-collisions.py` misses some.
+- **Never read a pre-ROP counter as evidence pixels landed.**
 - **The owner judges screenshots.** Present captures and conditions, never a verdict.
 - **Plain English.** Lead with the effect.
 
 ---
 
-## 10. Suggested first move
+## 6. Suggested first move
 
-**`docs/backlog.md` §0.0 — the streaming regression.** The owner flew the prototype and
-reported that streaming is **slower than the quad mesher the marcher replaced**, with chunks
-missing at LOD boundaries and holes opening up when flying at normal speed.
+**Re-measure. Both existing datasets are contaminated** — one by the 3 FPS throttle, one by the
+250 ms `airProof` cost that is now gone. Fly a focused PIE session and read chunks/s, tick % of
+wall, and where the frame goes.
 
-That outranks everything else in this document, including the 2.72x draw-path win. **A
-renderer that draws an incomplete world quickly is not faster**, and every marcher-vs-quad
-measurement taken so far reads frame time rather than world completeness, so none of them
-could have caught it.
+Then go after **§3.1, the LOD ring gaps**. It is what the owner keeps reporting, it is the one
+symptom nothing here has touched, and the owner's belief that it worked during the quad era
+gives it a bisection target that the throughput work does not have.
 
-The first move is a comparison, not a hunt: build the pre-marcher quad configuration
-(`voxel.March 0`, `voxel.Terrain.RetireQuads 0`), fly the same path, and read chunks/s and the
-LOD-boundary behaviour. That says whether this is the marcher's producer path or something
-underneath both arms. **The producer switches are command line / ini only** — `-ExecCmds`
-lands after streaming has begun and silently will not apply.
-
-This is the one place a measurement leg is still the right tool: the owner's "stop measuring"
-direction was about re-litigating the draw path, and this is a different question that a human
-in the editor has already answered qualitatively. What is missing is the *before* number.
+**Do not spend time making the marcher faster.** Section 0 has the numbers: rendering is
+8-11 ms against a game-thread tick of 40-79% of wall.

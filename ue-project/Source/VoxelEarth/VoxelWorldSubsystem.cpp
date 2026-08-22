@@ -4352,6 +4352,31 @@ struct FVoxelWorldImpl
 	// edits), same prune.
 	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, int64> FootprintSolidFloorCache;
 
+	// THE SKY-BAND BOUND'S MEMO, and it is the third of exactly this shape.
+	//
+	// FootprintSurfaceUpperBoundMm was the ONLY worldgen-grade call left
+	// unmemoized on the dispatch path, and the call site said so in a comment
+	// that ended "whether that is where the 0.21 ms/chunk lives is a HYPOTHESIS
+	// until this number is read". It was read on 2026-08-22 and it is:
+	// airProofMs=245-261 of a 275-288 ms dispatch, with the streaming tick at
+	// 95% of wall and 170 ms per tick. Every chunk in a column recomputed a
+	// value that depends only on the column.
+	//
+	// RESIDENCY-GUARDED, mirroring FootprintChunkZRangeCached rather than
+	// FootprintSolidFloorCache. That choice is deliberate and it is the whole
+	// risk of this memo: the bound reads the same rasters the z-range does, so
+	// an entry computed while a fine tile is still decoding is derived from the
+	// sea-level fallback. For the z-range a stale entry means a wrong band; for
+	// THIS one it means an UNDER-STATED upper bound, and
+	// FootprintSurfaceUpperBoundMm's own comment spells out what that costs --
+	// "a chunk containing terrain is never generated. A hole in the world."
+	// Caching it unconditionally would trade a throughput bug for a
+	// correctness bug of exactly the kind the owner is already reporting.
+	//
+	// Same key convention (Z forced to 0), same prune, same purity argument
+	// once residency has flipped.
+	mutable TMap<VoxelCoords::FVoxelLevelChunkKey, int64> FootprintSurfaceUpperBoundCache;
+
 	// Buried-chunk pre-dispatch skip: level-0 footprint bands, keyed by the
 	// level-0 footprint (X,Y). Like FootprintZRangeCache this memoizes a PURE
 	// function of (X, Y) and the amplifier -- nothing anchor-relative and
@@ -5159,6 +5184,12 @@ private:
 	// edits, nothing per-frame -- which is what lets its result live inside the
 	// FootprintZRangeCache memo alongside the z-range it feeds.
 	int64 FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, int32 ChunkY) const;
+	// FootprintSurfaceUpperBoundMm through FootprintSurfaceUpperBoundCache.
+	// EVERY caller should use this one -- the uncached form is kept only
+	// because the memo calls it. Residency-guarded; see the cache's
+	// declaration for why an unconditional cache here would put holes in the
+	// world rather than merely stale bands.
+	int64 FootprintSurfaceUpperBoundMmCached(int32 Level, int32 ChunkX, int32 ChunkY) const;
 	// True iff every voxel of this chunk is provably above the terrain surface,
 	// and therefore MAT_AIR, and therefore meshes to zero quads. Conservative:
 	// false means "not proven", never "has geometry". Does NOT consider edits --
@@ -8346,11 +8377,73 @@ int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMm(int32 Level, int32 ChunkX, i
 		});
 }
 
+int64 FVoxelWorldImpl::FootprintSurfaceUpperBoundMmCached(int32 Level, int32 ChunkX, int32 ChunkY) const
+{
+	using namespace VoxelCoords;
+
+	// Z forced to 0, the same convention as the two memos beside it: this is a
+	// per-FOOTPRINT value, so every chunk in the column shares one entry. That
+	// sharing IS the fix -- airProof was paying one worldgen-grade bound per
+	// CHUNK for a quantity that varies only per column.
+	const FVoxelLevelChunkKey CacheKey{Level, FVoxelChunkKey{ChunkX, ChunkY, 0}};
+	if (const int64* Cached = FootprintSurfaceUpperBoundCache.Find(CacheKey))
+	{
+		return *Cached;
+	}
+
+	const int64 BoundMm = FootprintSurfaceUpperBoundMm(Level, ChunkX, ChunkY);
+
+	// RESIDENCY GATE, the rule FootprintChunkZRangeCached established and for a
+	// sharper reason here. An entry computed while a fine tile is still
+	// decoding answers from the sea-level fallback, and with no invalidation it
+	// is wrong for the rest of the session. A stale z-range gives a wrong band;
+	// a stale bound here UNDER-STATES the surface, and the function this wraps
+	// says what that costs: "a chunk containing terrain is never generated. A
+	// hole in the world."
+	if (FineStreamer)
+	{
+		const int64 LevelScale = int64(1) << Level;
+		const int64 SpanMm = int64(ChunkEdgeVoxels) * LevelScale * vxc::kVoxelSizeMm;
+		int64 X0Mm = int64(ChunkX) * SpanMm;
+		int64 Y0Mm = int64(ChunkY) * SpanMm;
+		int64 X1Mm = X0Mm + SpanMm - 1;
+		int64 Y1Mm = Y0Mm + SpanMm - 1;
+
+		// WIDENED AT EVERY LEVEL, not just level 0 as the z-range memo does.
+		// That difference is deliberate: assetAwareSurfaceUpperBoundMm consults
+		// the asset field at whatever level it is called with -- it gates on the
+		// field being non-empty, never on Level -- so the columns this answer is
+		// derived from extend by the layer reach at every level. Requiring more
+		// residency before caching only ever caches LESS; getting it the other
+		// way round would cache a bound derived from columns that were not
+		// there yet.
+		if (const vxc::AssetField* Field = Voxels.assetField(); Field != nullptr && !Field->empty())
+		{
+			int64 ReachMm = 0;
+			for (const vxc::AssetLayer& L : Field->layers())
+			{
+				if (L.terrainLattice && L.maxRadiusMm > ReachMm) { ReachMm = L.maxRadiusMm; }
+			}
+			X0Mm -= ReachMm; Y0Mm -= ReachMm; X1Mm += ReachMm; Y1Mm += ReachMm;
+		}
+
+		if (!FineStreamer->IsFootprintResident(X0Mm, Y0Mm, X1Mm, Y1Mm))
+		{
+			// Honest answer for THIS pass; not yet a fact worth memoizing. The
+			// first post-residency answer is cached and genuinely permanent.
+			return BoundMm;
+		}
+	}
+
+	FootprintSurfaceUpperBoundCache.Add(CacheKey, BoundMm);
+	return BoundMm;
+}
+
 bool FVoxelWorldImpl::IsChunkProvablyAllAir(const VoxelCoords::FVoxelLevelChunkKey& LevelKey) const
 {
 	using namespace VoxelCoords;
 
-	const int64 BoundMm = FootprintSurfaceUpperBoundMm(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y);
+	const int64 BoundMm = FootprintSurfaceUpperBoundMmCached(LevelKey.Level, LevelKey.Key.X, LevelKey.Key.Y);
 	if (BoundMm == INT64_MAX)
 	{
 		return false; // declined to bound: never claim air on no information
@@ -8540,7 +8633,7 @@ void FVoxelWorldImpl::ComputeFootprintChunkZRange(int32 ChunkX, int32 ChunkY, in
 	// near rings that the M1 hitch budget actually cares about.
 	if (VoxelSkyBand::GetTrimEnabled())
 	{
-		const int64 BoundMm = FootprintSurfaceUpperBoundMm(Level, ChunkX, ChunkY);
+		const int64 BoundMm = FootprintSurfaceUpperBoundMmCached(Level, ChunkX, ChunkY);
 		if (BoundMm != INT64_MAX)
 		{
 			// Same convention as TopVoxelMax above (the voxel CONTAINING the
@@ -8740,6 +8833,26 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 			{
 				It.RemoveCurrent();
 			}
+		}
+	}
+
+	// Sky-band bound: same key, same growth and same rule again. An entry is
+	// 8 bytes plus map overhead and re-deriving one costs a single bound call
+	// the next time that footprint dispatches -- which is exactly what this
+	// memo exists to stop paying per chunk, so it is worth keeping entries
+	// while the footprint is anywhere near the anchor and worth dropping them
+	// the moment it is not.
+	for (auto It = FootprintSurfaceUpperBoundCache.CreateIterator(); It; ++It)
+	{
+		const int32 Level = It.Key().Level;
+		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
+		const double KeepRadiusUU =
+			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier * 2.0;
+		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
+		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
+		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
+		{
+			It.RemoveCurrent();
 		}
 	}
 
