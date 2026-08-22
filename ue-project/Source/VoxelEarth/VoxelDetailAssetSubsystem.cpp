@@ -74,12 +74,21 @@
 // COLOUR
 // ---------------------------------------------------------------------------
 //
-// One flat colour per voxel face from vxc::kMaterialPalette (the same table
-// the terrain's asset voxels are shaded from -- one definition, every
-// consumer), face-classed top/side/bottom, plus the palette's own per-voxel
-// lightness jitter hashed from the voxel's LOCAL coordinates (deterministic
-// per (species, seed) mesh; instances of the same seed are identical, exactly
-// as terrain-lattice trees are). Colours are authored sRGB; they are handed
+// One flat colour per voxel face from vxc::kMaterialPalette, face-classed
+// top/side/bottom, varied by vxc::voxelTint -- the same table AND the same
+// evaluation the terrain's asset voxels are shaded from, which is newer and
+// less obvious than it sounds. This path used to carry its own formula: the
+// lightness jitter at 0.35 of the authored amount (a factor with no derivation
+// anywhere), no hue drift, and no patch term at all. The missing patch term is
+// the one that mattered -- it is half of ADR-0008 invariant 3, it is the half
+// that survives distance, and this path is 85% of every placement in the world,
+// so a hillside of cover flattened to one grey at exactly the range where the
+// variation was doing the most work.
+//
+// The tint is hashed from the voxel's LOCAL coordinates, salted with the
+// (species, seed) identity: deterministic per mesh, so instances of one seed
+// are identical exactly as terrain-lattice trees are, while two different seeds
+// do not share a dither. Colours are authored sRGB; they are handed
 // to the mesh build as LINEAR floats because UStaticMesh::BuildFromMeshDescription
 // re-encodes vertex colours with ToFColor(true) (verified in the 5.8 source),
 // and the GPU reads the colour buffer as raw UNORM -- so the material
@@ -121,7 +130,7 @@
 #include "voxelcore/assetplacement.h"
 #include "voxelcore/assetpolicy.h"
 #include "voxelcore/core.h"
-#include "voxelcore/hash.h"
+#include "voxelcore/materialcolor.h"
 #include "voxelcore/materialpalette.h"
 
 #include <atomic>
@@ -280,14 +289,18 @@ struct FResolveJobInput
 	TSet<uint32> KnownGeometry;
 };
 
-// sRGB palette -> linear, once, both faces classes and all materials. The
+// sRGB palette -> linear, once, all face classes and all materials. The
 // bank loader guarantees every material id in a served grid is
 // < vxc::kMaterialCount (materialsWithinEngine is a load-time refusal), so
 // indexing this table with a served grid's bytes cannot go out of range.
+//
+// ONLY THE BASE COLOURS ARE CACHED HERE. The variation is not a table any
+// more: vxc::voxelTint reads the appearance itself, and the one thing that has
+// to happen on this side is the sRGB decode, which voxel-core cannot do because
+// it has no floats.
 struct FPaletteLinear
 {
 	FLinearColor Face[vxc::kMaterialCount][vxc::kFaceClassCount];
-	uint8 Jitter[vxc::kMaterialCount];
 	FPaletteLinear()
 	{
 		for (uint32 M = 0; M < uint32(vxc::kMaterialCount); ++M)
@@ -298,7 +311,6 @@ struct FPaletteLinear
 				// FLinearColor(FColor) is the exact sRGB decode.
 				Face[M][F] = FLinearColor(FColor(A.face[F].r, A.face[F].g, A.face[F].b));
 			}
-			Jitter[M] = A.voxelJitter;
 		}
 	}
 };
@@ -372,10 +384,15 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 	// before placing anything ... at() deliberately does NOT scale by it."
 	// This is the scale read; a 5 cm tuft renders at 5 cm.
 	const float PitchUU = float(double(Grid.voxelSizeMm()) * 0.1);
+	// The same pitch the geometry is built at, in the millimetres vxc::voxelTint
+	// wants -- see the variation block below for why it must be the GRID's and
+	// not the world's.
+	const int32 PitchMm = int32(Grid.voxelSizeMm());
 	const int32 Origin[3] = {Grid.originX(), Grid.originY(), Grid.originZ()};
 
 	const FPaletteLinear& Pal = PaletteLinear();
-	const uint64 JitterSeed = (uint64(MeshKey) << 1) | 1u;
+	// Odd, so a MeshKey of 0 (bank 0, seed 0 -- a real combination) still salts.
+	const uint32 TintSalt = (MeshKey << 1) | 1u;
 
 	static const FVector3f AxisDir[3] = {FVector3f(1, 0, 0), FVector3f(0, 1, 0), FVector3f(0, 0, 1)};
 
@@ -402,15 +419,34 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 					continue;
 				}
 
-				// Per-voxel lightness jitter, hashed from LOCAL coordinates +
-				// the (species, seed) identity -- deterministic, and keyed to
-				// the VOXEL so all six faces of one cube agree
-				// (materialpalette.h's "keyed to the voxel and not the face").
-				const double J =
-					double(vxc::hashToSigned16(vxc::hash3(JitterSeed, Cell[0], Cell[1], Cell[2], 0))) /
-					32768.0;
-				const float Gain =
-					1.0f + float(J) * 0.35f * (float(Pal.Jitter[M]) / 255.0f);
+				// The variation, from vxc::voxelTint -- the ONE definition, the
+				// same one VoxelMaterialPalette.ush evaluates for a terrain or
+				// asset voxel and forge/render.py mirrors for a preview.
+				//
+				// THIS USED TO BE A LOCAL FORMULA AND IT WAS WRONG THREE WAYS,
+				// which is worth spelling out because all three still rendered
+				// and none of them looked like a bug. It applied the lightness
+				// jitter at 0.35 of the authored amount -- a factor with no
+				// derivation anywhere; it dropped the hue drift entirely; and it
+				// dropped the PATCH TERM, which is half of ADR-0008 invariant 3
+				// and the half that survives distance. A field of cover with no
+				// patch term flattens to one grey at exactly the range where the
+				// variation is doing the most work, and this path is 85% of all
+				// placements in the world.
+				//
+				// THE PITCH, NOT THE WORLD'S. A detail grid carries its own,
+				// typically 5 cm, and the patch wavelength is world-metric
+				// (materialpalette.h, patchScaleDm) -- so passing the grid's
+				// pitch is what makes a tuft's mottle the same physical size as
+				// the hillside's behind it. Passing 100 here would stretch it to
+				// double scale on every 5 cm asset in the library.
+				//
+				// THE SALT IS THE (species, seed) IDENTITY, because every grid
+				// starts at its own local origin: without it every tuft of grass
+				// in the world would carry the identical dither and a meadow
+				// would read as a repeating texture.
+				const vxc::VoxelTint Tint = vxc::voxelTint(
+					vxc::MaterialId(M), Cell[0], Cell[1], Cell[2], PitchMm, TintSalt);
 
 				for (int32 Axis = 0; Axis < 3; ++Axis)
 				{
@@ -428,10 +464,22 @@ void BuildNaiveFaceGeometry(const vxc::AssetGrid& Grid, uint32 MeshKey, FMeshGeo
 						const vxc::FaceClass FC =
 							(Axis == 2) ? (Positive ? vxc::kFaceTop : vxc::kFaceBottom)
 							            : vxc::kFaceSide;
-						FLinearColor C = Pal.Face[M][FC] * Gain;
-						C.R = FMath::Clamp(C.R, 0.0f, 1.0f);
-						C.G = FMath::Clamp(C.G, 0.0f, 1.0f);
-						C.B = FMath::Clamp(C.B, 0.0f, 1.0f);
+						// Applied through vxc::applyTintQ16 rather than by
+						// three lines here, so the ORDER (lightness on all
+						// three, then the warm/cool tilt on red and blue) has
+						// one definition too. Q16 resolves to 1/65536, far finer
+						// than the 8-bit buffer this ends up in.
+						const FLinearColor& Base = Pal.Face[M][FC];
+						int32 Q16[3] = {
+							int32(Base.R * float(vxc::kColorOne)),
+							int32(Base.G * float(vxc::kColorOne)),
+							int32(Base.B * float(vxc::kColorOne)),
+						};
+						vxc::applyTintQ16(Q16, Tint);
+						FLinearColor C;
+						C.R = FMath::Clamp(float(Q16[0]) / float(vxc::kColorOne), 0.0f, 1.0f);
+						C.G = FMath::Clamp(float(Q16[1]) / float(vxc::kColorOne), 0.0f, 1.0f);
+						C.B = FMath::Clamp(float(Q16[2]) / float(vxc::kColorOne), 0.0f, 1.0f);
 						C.A = 1.0f;
 
 						const float FaceCoord = float(Cell[Axis] + Positive);

@@ -81,79 +81,152 @@ def _material_faces():
     return top, side
 
 
-def _hash01(a, b, c, salt: int):
-    """A stable 0..1 value per integer lattice cell."""
-    h = (a.astype(np.int64) * 73856093) ^ (b.astype(np.int64) * 19349663) \
-        ^ (c.astype(np.int64) * 83492791) ^ np.int64(salt)
-    h = (h ^ (h >> 13)) * np.int64(1274126177)
-    return ((h ^ (h >> 16)) & 0xFFFF).astype(np.float32) / 65535.0
+# --- the voxel tint ---------------------------------------------------------
+#
+# A NUMPY MIRROR OF vxc::voxelTint (voxel-core/include/voxelcore/materialcolor.h),
+# term for term. It used to be an approximation of it and the differences were
+# not small: the warm/cool tilt ran at 0.6 of the authored strength, and the
+# patch term was sampled at ONE wavelength -- the median across the grid --
+# rather than each material's own.
+#
+# The median was defended in a comment ("an asset is essentially one substance,
+# and sampling per material would put a seam wherever two of them meet"), and
+# the engine says otherwise: it samples per material and there is no seam,
+# because the patch field is a smooth function of POSITION and only its
+# wavelength differs between materials. Where bark meets leaf the base colours
+# change anyway. What the median actually did was show a designer a mottle at a
+# scale the game would never draw, on every asset with more than one material in
+# it -- which is most of them.
+#
+# So the forge does not get to have opinions about the evaluation either. The
+# rule from tools/gen_palette.py applies one level down: it reads what the engine
+# will render and shows you that.
+
+_HASH_ADD = 0x9E3779B9
+_HASH_X, _HASH_Y, _HASH_Z, _HASH_SALT = 0x8DA6B343, 0xD8163841, 0xCB1AB31F, 0x165667B1
+_HASH_MIX = 0x2C1B3C6D
+_U32 = 0xFFFFFFFF
 
 
-def _value_noise(x, y, z, scale: float, salt: int):
-    """Smooth 0..1 noise, trilinear over a hash lattice.
+def _palette_hash(x, y, z, salt: int):
+    """vxc::voxelColorHash. Integer in [0, 2^32).
 
-    Smooth rather than blocky on purpose. Hashing the cell index directly is
-    one line and gives hard-edged cubes of colour metres across, which reads as
-    a bug rather than as mottling -- and, more to the point, would not match
-    what the shader does, which is the whole reason this renderer exists.
+    The odd constant is not decoration: without it the mixer maps (0,0,0,0) to 0,
+    which no avalanche can spread, and the origin voxel draws the extreme minimum
+    of both variation axes.
     """
-    s = max(float(scale), 1.0)
-    fx, fy, fz = x / s, y / s, z / s
-    ix, iy, iz = np.floor(fx), np.floor(fy), np.floor(fz)
-    tx, ty, tz = fx - ix, fy - iy, fz - iz
-    # Smoothstep, so the lattice grid does not show as straight seams.
-    tx, ty, tz = (t * t * (3.0 - 2.0 * t) for t in (tx, ty, tz))
-    out = np.zeros_like(tx, dtype=np.float32)
-    for dx in (0, 1):
-        wx = tx if dx else 1.0 - tx
-        for dy in (0, 1):
-            wy = ty if dy else 1.0 - ty
-            for dz in (0, 1):
-                wz = tz if dz else 1.0 - tz
-                out += _hash01(ix + dx, iy + dy, iz + dz, salt) * wx * wy * wz
-    return out
+    h = (_HASH_ADD
+         + np.asarray(x, np.int64) * _HASH_X
+         + np.asarray(y, np.int64) * _HASH_Y
+         + np.asarray(z, np.int64) * _HASH_Z
+         + np.int64(salt) * _HASH_SALT) & _U32
+    h ^= h >> 15
+    h = (h * _HASH_MIX) & _U32
+    h ^= h >> 12
+    return h
 
 
-def _voxel_tint(xs, ys, zs, mats):
-    """Per-voxel colour multiplier: near-field jitter plus far-field patches.
+def _patch_noise(px, py, pz, salt: int):
+    """vxc::voxelPatchNoise: trilinear value noise, smoothstepped, in [-1, 1].
 
-    Returns an (N, 3) multiplier. Hue is applied as a warm/cool tilt -- red up
-    and blue down, or the reverse -- rather than a true hue rotation, because
-    that is what the shader will do and matching it matters more than being
-    colorimetrically proper.
+    Smoothstepped rather than linear because a linear lerp leaves a gradient
+    discontinuity on every lattice plane, and at these wavelengths that reads as
+    a grid of straight creases rather than as mottling.
+    """
+    ix, iy, iz = np.floor(px), np.floor(py), np.floor(pz)
+    fx, fy, fz = px - ix, py - iy, pz - iz
+    fx, fy, fz = (t * t * (3.0 - 2.0 * t) for t in (fx, fy, fz))
+    bx, by, bz = ix.astype(np.int64), iy.astype(np.int64), iz.astype(np.int64)
+
+    c = []
+    for k in range(8):
+        c.append(
+            (_palette_hash(bx + (k & 1), by + ((k >> 1) & 1), bz + ((k >> 2) & 1), salt)
+             & 0xFFFF).astype(np.float32) / 65536.0)
+    lerp = lambda a, b, t: a + (b - a) * t
+    x00, x10 = lerp(c[0], c[1], fx), lerp(c[2], c[3], fx)
+    x01, x11 = lerp(c[4], c[5], fx), lerp(c[6], c[7], fx)
+    return lerp(lerp(x00, x10, fy), lerp(x01, x11, fy), fz) * 2.0 - 1.0
+
+
+def _variation_columns():
+    """Per-material (jitter, hue, patch strength, wavelength mm), as fractions.
+
+    A material the engine's palette does not carry yet gets the quiet end of
+    every range -- the numbers the palette proposals ask the engine for. An
+    animal is one smooth creature, not a granular surface, and a flank at
+    foliage's jitter of 58/255 reads as television static on a twelve-voxel body.
     """
     n = _slots()
     jit = np.zeros(n, np.float32)
     hue = np.zeros(n, np.float32)
     pat = np.zeros(n, np.float32)
-    scl = np.ones(n, np.float32)
+    wave = np.zeros(n, np.float32)
     for m in range(n):
         if _proposed(m):
-            # An animal is one smooth creature, not a granular surface. These
-            # are the numbers the palette proposal asks the engine for, and they
-            # sit at the quiet end of both ranges -- a flank with foliage's
-            # jitter (58/255) reads as static on a twelve-voxel body.
-            jit[m], hue[m], pat[m] = 14 / 255.0, 6 / 255.0, 10 / 255.0
-            scl[m] = 8
+            jit[m], hue[m], pat[m], wave[m] = 14 / 255.0, 6 / 255.0, 10 / 255.0, 800.0
             continue
         e = palette.entry(m)
-        jit[m], hue[m], pat[m] = e[3] / 255.0, e[4] / 255.0, e[5] / 255.0
-        scl[m] = max(e[6], 1)
+        jit[m] = e[palette.JITTER] / 255.0
+        hue[m] = e[palette.HUE] / 255.0
+        pat[m] = e[palette.PATCH] / 255.0
+        wave[m] = e[palette.PATCH_SCALE_DM] * 100.0
+    return jit, hue, pat, wave
 
-    # One hash of the voxel position, shared by every face of that voxel.
-    light = (_hash01(xs, ys, zs, 0x9E37) - 0.5) * 2.0
-    warm = (_hash01(xs, ys, zs, 0x85EB) - 0.5) * 2.0
-    # The patch term is sampled at one wavelength for the whole grid rather
-    # than per material: an asset is essentially one substance, and sampling
-    # per material would put a seam wherever two of them meet.
-    patch = (_value_noise(xs, ys, zs, float(np.median(scl[mats])), 0x27D4) - 0.5) * 2.0
 
-    lightness = 1.0 + light * jit[mats] + patch * pat[mats]
-    tilt = warm * hue[mats]
-    out = np.stack([lightness * (1.0 + 0.6 * tilt),
+def _pitch_mm(grid) -> float:
+    """The grid's own voxel size in millimetres.
+
+    Not a constant, and not the world's 100. The library is authored at two
+    pitches -- terrain-lattice assets at 10 cm and detail-lattice cover at 5 cm
+    -- and the patch wavelength is world-metric, so a 5 cm fern previewed at 100
+    would be shown a mottle twice the size of the one the game draws on it.
+    """
+    return float(getattr(grid, "voxel_m", 0.10) * 1000.0)
+
+
+def _voxel_tint(xs, ys, zs, mats, pitch_mm: float = 100.0, salt: int = 0):
+    """Per-voxel colour multiplier, (N, 3). Mirrors vxc::voxelTint exactly.
+
+    `pitch_mm` is the grid's own voxel size IN THE WORLD, because the patch
+    wavelength is world-metric (materialpalette.h, patchScaleDm). A 5 cm asset
+    passed 100 here would show its mottle at double the scale the game draws it.
+    """
+    jit, hue_amp, pat_amp, wave_mm = _variation_columns()
+
+    h = _palette_hash(xs, ys, zs, salt)
+    r_light = (h & 0xFFFF).astype(np.float32) * (2.0 / 65536.0) - 1.0
+    r_warm = (h >> 16).astype(np.float32) * (2.0 / 65536.0) - 1.0
+
+    light = r_light * jit[mats]
+    tilt = r_warm * hue_amp[mats]
+
+    # PER MATERIAL, not one median wavelength for the grid. Grouped by the
+    # distinct wavelengths present -- there are about a dozen in the whole table
+    # -- so this stays a handful of vectorised passes rather than a Python loop
+    # over voxels.
+    voxel_wave = wave_mm[mats]
+    voxel_amp = pat_amp[mats]
+    active = (voxel_amp > 0.0) & (voxel_wave > 0.0)
+    for w in np.unique(voxel_wave[active]) if active.any() else ():
+        sel = active & (voxel_wave == w)
+        # Band limit: two rendered cubes is the finest wavelength a lattice of
+        # them can carry. Stretched rather than dropped, so a coarse preview
+        # keeps a mottle continuous with a fine one instead of losing it.
+        eff = max(float(w), 2.0 * float(pitch_mm))
+        px = (xs[sel].astype(np.float32) + 0.5) * pitch_mm / eff
+        py = (ys[sel].astype(np.float32) + 0.5) * pitch_mm / eff
+        pz = (zs[sel].astype(np.float32) + 0.5) * pitch_mm / eff
+        light[sel] += _patch_noise(px, py, pz, salt) * voxel_amp[sel]
+
+    lightness = 1.0 + light
+    out = np.stack([lightness * (1.0 + tilt),
                     lightness,
-                    lightness * (1.0 - 0.6 * tilt)], axis=1)
-    return np.clip(out, 0.25, 1.9).astype(np.float32)
+                    lightness * (1.0 - tilt)], axis=1)
+    # max(c, 0) and no clamp at 1 -- the shader's own rule. A tint can push a
+    # bright material above 1.0 in linear, and clamping here would flatten the
+    # top of the range on exactly the materials that sit near it already.
+    return np.maximum(out, 0.0).astype(np.float32)
 
 
 def _sprite(scale: int):
@@ -297,7 +370,7 @@ def elevation(
     height = int(sy.max()) + 2 * b + h - y0 + 1
 
     top_rgb, side_rgb = _material_faces()
-    tint = _voxel_tint(xs, ys, zs, mats)
+    tint = _voxel_tint(xs, ys, zs, mats, _pitch_mm(grid))
     base_top = top_rgb[mats] * tint
     base_side = side_rgb[mats] * tint
     if ao > 0.0:
@@ -466,7 +539,7 @@ def broadside(
     height = int(sy.max()) + b + h - y0
 
     top_rgb, side_rgb = _material_faces()
-    tint = _voxel_tint(xs, ys, zs, mats)
+    tint = _voxel_tint(xs, ys, zs, mats, _pitch_mm(grid))
     base_top = top_rgb[mats] * tint
     base_side = side_rgb[mats] * tint
     if ao > 0.0:
@@ -945,7 +1018,7 @@ def render(
     #     once voxels fall below a pixel and the jitter has averaged itself
     #     back to grey.
     top_rgb, side_rgb = _material_faces()
-    tint = _voxel_tint(xs, ys, zs, mats)
+    tint = _voxel_tint(xs, ys, zs, mats, _pitch_mm(grid))
     base_top = top_rgb[mats] * tint
     base_side = side_rgb[mats] * tint
     if ao > 0.0:

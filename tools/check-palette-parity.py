@@ -503,6 +503,122 @@ def check_evaluation(rows, samples):
     return bad
 
 
+def check_forge_evaluation(rows, samples):
+    """asset-forge's numpy mirror against vxc::voxelTint.
+
+    The third arm. The shader is compiled and compared above; this one is
+    imported and compared, and it is the arm with the most history: forge's
+    preview ran the warm/cool tilt at 0.6 of the authored strength and sampled
+    the patch term at ONE median wavelength for a whole grid, so what a designer
+    approved and what the game drew were different pictures for the whole life
+    of the library.
+
+    Needs numpy. Where it is absent this SAYS SO and names what went unchecked,
+    rather than passing quietly -- a skipped arm reported as a pass is how a
+    check stops existing.
+    """
+    try:
+        import numpy as np  # noqa: PLC0415
+    except ImportError:
+        print("forge:      SKIPPED -- numpy is not installed, so asset-forge's "
+              "evaluation was NOT compared (pip install numpy to cover it)")
+        return 0
+
+    forge_dir = ROOT / "asset-forge"
+    if not (forge_dir / "forge" / "render.py").exists():
+        print(f"forge:      SKIPPED -- no {forge_dir}")
+        return 0
+
+    saved = list(sys.path)
+    sys.path.insert(0, str(forge_dir))
+    try:
+        from forge import render  # noqa: PLC0415
+    except ImportError as exc:
+        sys.path[:] = saved
+        print(f"forge:      SKIPPED -- {exc} (its other dependencies are absent)")
+        return 0
+
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if not cxx:
+        sys.path[:] = saved
+        return fail("no C++ compiler for the reference side of the forge check")
+
+    # The two pitches the library is authored at: terrain-lattice assets at
+    # 10 cm and detail-lattice cover at 5 cm. Both, because the pitch is what
+    # the world-metric patch wavelength is measured against and a mirror that
+    # ignored it would agree at one and not the other.
+    pitches = (100, 50)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "probe.cpp"
+        src.write_text(FORGE_PROBE % {"pitches": ", ".join(str(p) for p in pitches)})
+        exe = Path(tmp) / "probe"
+        build = subprocess.run([cxx, "-std=c++20", "-O2", "-I", str(INCLUDE),
+                                str(src), "-o", str(exe)], capture_output=True, text=True)
+        if build.returncode != 0:
+            sys.path[:] = saved
+            return fail("the forge reference probe did not compile:\n" + build.stderr)
+        run = subprocess.run([str(exe), str(samples)], capture_output=True, text=True)
+
+    parsed = [tuple(int(v) for v in line.split()) for line in run.stdout.splitlines()]
+    worst, where = 0.0, None
+    for pitch in pitches:
+        sub = [r for r in parsed if r[1] == pitch]
+        mats = np.array([r[0] for r in sub])
+        xs = np.array([r[2] for r in sub])
+        ys = np.array([r[3] for r in sub])
+        zs = np.array([r[4] for r in sub])
+        tint = render._voxel_tint(xs, ys, zs, mats, float(pitch))
+        # The forge returns the finished (N, 3) multiplier; recover the two
+        # scalars from it, which also checks that it COMPOSES them the way
+        # vxc::applyTintQ16 does rather than only computing them right.
+        light = tint[:, 1] - 1.0
+        hue = np.where(np.abs(tint[:, 1]) > 1e-9, tint[:, 0] / tint[:, 1] - 1.0, 0.0)
+        for i, r in enumerate(sub):
+            for got, want, axis in ((light[i], r[5] / 65536.0, "light"),
+                                    (hue[i], r[6] / 65536.0, "hue")):
+                d = abs(float(got) - want)
+                if d > worst:
+                    worst, where = d, (rows[r[0]]["name"], pitch, axis, want, float(got))
+    sys.path[:] = saved
+
+    if worst > TOLERANCE:
+        name, pitch, axis, want, got = where
+        return fail(
+            "asset-forge's preview has drifted from vxc::voxelTint.\n"
+            f"  worst: {name} {axis} at a {pitch} mm pitch\n"
+            f"  materialcolor.h says {want:+.6f}, forge/render.py says {got:+.6f}\n"
+            f"  difference {worst:.6f}, tolerance {TOLERANCE:.6f}\n"
+            "  What a designer approves in the forge is not what the game draws.")
+
+    name, pitch, axis, _want, _got = where
+    print(f"forge:      the numpy mirror agrees at both authored pitches "
+          f"(100 and 50 mm); worst {worst:.2e} at {name} {axis}")
+    return 0
+
+
+FORGE_PROBE = r'''
+#include "voxelcore/materialcolor.h"
+#include <cstdio>
+#include <cstdlib>
+int main(int argc, char** argv) {
+    const int n = argc > 1 ? std::atoi(argv[1]) : 200;
+    const int cubes[] = {%(pitches)s};
+    for (int m = 0; m < vxc::kMaterialCount; ++m)
+        for (unsigned c = 0; c < sizeof(cubes) / sizeof(cubes[0]); ++c)
+            for (int i = 0; i < n; ++i) {
+                const int x = (i * 37) %% 511 - 255;
+                const int y = (i * 101) %% 397 - 198;
+                const int z = (i * 7) %% 233 - 116;
+                const vxc::VoxelTint t =
+                    vxc::voxelTint(vxc::MaterialId(m), x, y, z, cubes[c]);
+                std::printf("%%d %%d %%d %%d %%d %%d %%d\n", m, cubes[c], x, y, z,
+                            t.lightQ16, t.hueQ16);
+            }
+    return 0;
+}
+'''
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--samples", type=int, default=400,
@@ -515,6 +631,7 @@ def main():
     rc = check_tables(rows)
     if not a.table_only:
         rc |= check_evaluation(rows, a.samples)
+        rc |= check_forge_evaluation(rows, max(20, a.samples // 2))
     if rc == 0:
         print("palette parity: pass")
     return rc
