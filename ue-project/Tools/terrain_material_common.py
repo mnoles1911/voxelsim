@@ -177,6 +177,21 @@ class GraphBuilder:
         den = self.sub(hi, lo)
         return self.saturate(self.div(num, den))
 
+    def texcoord(self, index):
+        n = self.node(unreal.MaterialExpressionTextureCoordinate)
+        n.set_editor_property("coordinate_index", int(index))
+        return n
+
+    def mask(self, src, lane, src_out=""):
+        """One lane of an expression. `lane` is 'x' or 'y'."""
+        n = self.node(unreal.MaterialExpressionComponentMask)
+        n.set_editor_property("r", lane == "x")
+        n.set_editor_property("g", lane == "y")
+        n.set_editor_property("b", False)
+        n.set_editor_property("a", False)
+        self.link(src, src_out, n, "")
+        return n
+
     def sample(self, texture_path, uv, uv_out, param_name, sampler_type):
         n = self.node(unreal.MaterialExpressionTextureSampleParameter2D)
         n.set_editor_property("parameter_name", param_name)
@@ -184,6 +199,49 @@ class GraphBuilder:
         n.set_editor_property("sampler_type", sampler_type)
         self.link(uv, uv_out, n, "UVs")
         return n
+
+
+def build_palette_inputs(b):
+    """Decode the per-material palette the vertex factory leaves in UV3/4/5.
+
+    Returns a dict for build_terrain_base_color's `palette` argument:
+
+        base        float3   the material's own colour for this face, LINEAR
+        present     0 or 1   did a palette reach this pixel at all
+        biome_tint  0..1     how much of that colour the climate owns
+        light, hue  signed   the per-voxel variation, applied after the blend
+
+    THE THREE SLOTS AND WHAT WRITES THEM are VoxelQuadVertexFactory.ush's
+    GetMaterialPixelParameters, which calls VoxelPaletteUnpack. Read that block
+    before changing anything here -- in particular why the base and the variation
+    travel separately (the climate goes between them) and why [5] costs no
+    interpolant (Unreal packs customised UVs two per float4, and [4] already
+    reserves the one [5] lives in).
+
+    `present` EXISTS BECAUSE ZERO IS AMBIGUOUS. M_VoxelTerrain is also the
+    material on the component path, where FLocalVertexFactory supplies no fourth
+    or fifth UV and they arrive as zero (measured: Tools/probe_texcoord1.py). A
+    raw biome weight of 0 legitimately means "this material owns its colour
+    outright", so an unwritten lane would be indistinguishable from a cave wall
+    -- and with an equally-unwritten base of (0,0,0) the whole world renders
+    black. The shader therefore reserves 0 for ABSENT and sends real weights in
+    the upper half; the two saturates below recover both, and are the exact pair
+    written down at VOXEL_PALETTE_WEIGHT_ABSENT in VoxelMaterialPalette.ush.
+    """
+    uv_rg = b.texcoord(3)
+    uv_b_weight = b.texcoord(4)
+    uv_variation = b.texcoord(5)
+
+    weight = b.mask(uv_b_weight, "y")
+    return {
+        "base": b.append(uv_rg, "", b.mask(uv_b_weight, "x"), ""),
+        # 0 -> 0; anything at or above 0.5 -> 1.
+        "present": b.saturate(b.mul(b.sub(weight, b.const(0.25)), b.const(4.0))),
+        # 0 -> 0; 0.5..1 -> 0..1.
+        "biome_tint": b.saturate(b.sub(b.mul(weight, b.const(2.0)), b.const(1.0))),
+        "light": b.mask(uv_variation, "x"),
+        "hue": b.mask(uv_variation, "y"),
+    }
 
 
 def build_terrain_base_color(
@@ -196,10 +254,17 @@ def build_terrain_base_color(
     detail_fine_strength,
     detail_coarse_strength,
     bathy=None,
+    palette=None,
 ):
     """Build the biome/palette/detail graph.
 
     Returns (base_color_expr, snow_expr, base_color_out, wet_expr).
+
+    `palette` is the dict from build_palette_inputs() below, or None to build the
+    material with no per-material colour at all -- which is what M_VoxelClipmap
+    passes, because a clipmap vertex is a heightmap sample with no material id to
+    look one up with. With None the graph is exactly the climate-only one that
+    shipped before ADR-0009, down to the SubsurfaceColor constant.
 
     `bathy` is the dict from bathy_field_graph.sample_bathy_field, or None to
     build the material without the wet-shore term at all. When it is None the
@@ -321,11 +386,68 @@ def build_terrain_base_color(
     surface = b.lerp(surface, "", beach_color, "", beach_w)
     surface = b.lerp(surface, "", snow_color, "", snow_w)
 
-    # Palette alpha decides how much of the surface biome takes over. It is 0
-    # for subsurface strata (bedrock/rock/gravel/subsoil/mud/clay) and 255 for
-    # surface materials, which is what lets ONE graph make a cave look like rock
-    # and the hillside above it look like grassland.
-    base = b.lerp(subsurface, "", surface, "", tint_weight, "")
+    # --- ADR-0009: the material's own colour, and how much the climate owns ---
+    #
+    # Two weights multiply here and they answer different questions.
+    #
+    #   tint_weight  GEOMETRIC. Is this face near the terrain surface at all?
+    #                A MAT_TOPSOIL face cut open by a cave is soil, not
+    #                grassland, and this is the signal that knows the difference.
+    #                It is VertexColor.R, binary, and it predates this change.
+    #
+    #   biome_tint   MATERIAL. Does this substance respond to climate? Rock is
+    #                the same grey in a rainforest and a tundra; grass is not.
+    #                Authored per material in vxc::kMaterialPalette.
+    #
+    # Their product is how much of the climate answer a pixel takes. What is left
+    # is the material's own colour -- which is what puts bedrock, rock, gravel
+    # and subsoil back on a cave wall after a year of one flat SubsurfaceColor
+    # for all of them.
+    if palette is None:
+        # No material id on this path. Today's graph exactly: one flat tone
+        # below the surface, the climate above it.
+        base = b.lerp(subsurface, "", surface, "", tint_weight, "")
+    else:
+        # `present` is 0 wherever no palette reached this pixel -- the component
+        # vertex factory supplies no fourth or fifth UV and they arrive as zero
+        # (Tools/probe_texcoord1.py measured it). Everything below degrades
+        # through it to the climate-only graph above rather than to black, which
+        # is what an unguarded weight of 0 would mean: "the material owns its
+        # colour", with an equally-unwritten base of (0,0,0).
+        material = b.lerp(subsurface, "", palette["base"], "", palette["present"], "")
+        climate_share = b.mul(
+            tint_weight,
+            b.lerp(b.const(1.0), "", palette["biome_tint"], "", palette["present"], ""))
+        base = b.lerp(material, "", surface, "", climate_share, "")
+
+        # THE VARIATION GOES HERE, AFTER THE BLEND, and that placement is the
+        # whole reason the shader hands the base and the variation over
+        # separately instead of one finished colour. Applied before the blend it
+        # would land on the material's share only, and every outdoor surface
+        # hands 190-235/255 of its colour to the climate -- so the per-voxel
+        # dither would be averaged away on exactly the surfaces the player spends
+        # the whole game looking at. That is the difference between a mottled
+        # hillside and a flat one.
+        #
+        # The arithmetic mirrors vxc::applyTintQ16 and VoxelApplyVariation:
+        # scale all three by (1 + light), then red by (1 + hue) and blue by
+        # (1 - hue). A warm/cool tilt along the material's own axis, not a
+        # rotation in a colour space nothing else here uses.
+        light, hue = palette["light"], palette["hue"]
+        base = b.mul(base, b.add(b.const(1.0), light))
+        # Rebuilt as a full RGB multiply rather than a component write: the
+        # material graph has no way to assign one channel of an expression, and
+        # appending three separately-scaled scalars is the idiom that survives
+        # being read six months from now.
+        tilt = b.append(
+            b.append(b.add(b.const(1.0), hue), "", b.const(1.0), ""), "",
+            b.sub(b.const(1.0), hue), "")
+        base = b.mul(base, tilt)
+        # max(c, 0) -- the shader's own clamp, and NOT a clamp at 1: a tint can
+        # legitimately push a bright material above 1.0 in linear, and clamping
+        # would flatten the top of the range on exactly the materials (snow, pale
+        # bark) that sit near it already.
+        base = b.maximum(base, b.const3(0.0, 0.0, 0.0))
 
     # --- detail -------------------------------------------------------------
     #

@@ -501,13 +501,34 @@ float4 VoxelPalettePack(float3 localPositionUU, float3 chunkOriginUU, float3 fac
 	return float4(insideVox + originVox, key);
 }
 
+// HOW THE BIOME WEIGHT IS ENCODED, and why it is not just the weight.
+//
+// The lane has to answer TWO questions with one number: how much of this
+// material's colour the climate owns, and whether a palette reached this pixel
+// at all. The second is not hypothetical -- M_VoxelTerrain is also the material
+// on the COMPONENT path, where FLocalVertexFactory supplies no fourth or fifth
+// UV and they arrive as zero (measured: Tools/probe_texcoord1.py). A raw weight
+// makes that indistinguishable from "the material owns its colour outright",
+// which with an equally-unwritten base of (0,0,0) renders the world black.
+//
+// So zero is reserved to mean ABSENT and a real weight is sent in the upper
+// half of the range. The graph recovers both with two saturates:
+//
+//     present = saturate((w - 0.25) * 4)     0 -> 0,    0.5..1 -> 1
+//     tint    = saturate(w * 2 - 1)          0 -> 0,    0.5..1 -> 0..1
+//
+// It costs one bit of weight resolution, against 255 authored levels. The
+// alternative -- a fourth lane -- costs an interpolant, and the failure it
+// guards against is a black world rather than a subtly wrong one.
+#define VOXEL_PALETTE_WEIGHT_ABSENT 0.0f
+
 // The pixel half.
 //
-//   baseRGB   the material's own colour for this face, LINEAR, with no
-//             variation, no climate, no lighting and no ambient occlusion
-//   variation the two scalars VoxelApplyVariation consumes, to be applied AFTER
-//             the graph has blended in the climate
-//   biomeTint how much of this material's colour the climate owns, 0..1
+//   baseRGB     the material's own colour for this face, LINEAR, with no
+//               variation, no climate, no lighting and no ambient occlusion
+//   variation   the two scalars VoxelApplyVariation consumes, to be applied
+//               AFTER the graph has blended in the climate
+//   biomeWeight the encoded pair above: presence, and how much the climate owns
 //
 // ROUNDING THE KEY IS NOT PARANOIA. It is constant across the quad, so the
 // rasteriser's plane equation is flat and the value is exact in theory; in
@@ -515,7 +536,7 @@ float4 VoxelPalettePack(float3 localPositionUU, float3 chunkOriginUU, float3 fac
 // the result can land an ULP either side of the integer. Truncating a 538 that
 // arrived as 537.99999 would move a leaf voxel two face classes.
 void VoxelPaletteUnpack(float4 packed, out float3 baseRGB, out float2 variation,
-                        out float biomeTint)
+                        out float biomeWeight)
 {
 	const uint key = (uint)(packed.w + 0.5f);
 	const uint mat = min(key & 0xffu, VOXEL_MATERIAL_COUNT - 1u);
@@ -524,7 +545,7 @@ void VoxelPaletteUnpack(float4 packed, out float3 baseRGB, out float2 variation,
 
 	baseRGB = VoxelMaterialBase(mat, faceClass);
 	variation = VoxelMaterialVariation(mat, (int3)floor(packed.xyz), cubeSizeMm, 0u);
-	biomeTint = VoxelPaletteBiomeTint[mat];
+	biomeWeight = 0.5f + 0.5f * VoxelPaletteBiomeTint[mat];
 }
 '''
 

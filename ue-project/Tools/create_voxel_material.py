@@ -44,12 +44,26 @@ untouched -- Masked mode only adds the OpacityMask input, so with the inert
 defaults every existing chunk renders bit-for-bit as before (Masked with
 OpacityMask==1 draws every pixel, same as Opaque).
 
-ADR-0008 material palette (asset-forge plan Phase 3.1): BaseColor becomes
-lerp(biomeAlbedo, paletteRGB, isAsset), where the palette arrives at pixel rate
-from VoxelQuadVertexFactory.ush through TexCoords[3]/[4]. isAsset is 1 only for
-the ten materials the terrain generator cannot emit, so terrain is unchanged and
-the change is inert until baked assets are in the world. **This graph has never
-been run** -- see the block at the call site.
+ADR-0009 material palette on TERRAIN. BaseColor becomes
+
+    albedo = lerp(materialBase, climateColour, biomeTint * nearSurface)
+    albedo = albedo * (1 + light);  .r *= 1 + hue;  .b *= 1 - hue
+
+with all five inputs arriving at pixel rate from VoxelQuadVertexFactory.ush
+through TexCoords[3]/[4]/[5]. This supersedes the ADR-0008 wiring, which was a
+one-sided lerp(biomeAlbedo, paletteRGB, isAsset) -- deliberately inert on
+terrain, because at the time the biome path was the only appearance path that
+worked and replacing it wholesale could not be verified in the same motion.
+
+What that inertness cost, and what this fixes: every one of the sixteen terrain
+materials took the climate colour and nothing else, so bedrock, rock, gravel,
+subsoil, mud and clay were one flat SubsurfaceColor constant on every cave wall,
+and terrain had no per-voxel variation anywhere -- the palette's jitter reached
+asset materials only. The only thing varying a hillside was an 8 m fBm texture,
+which is why hillsides read as soft blotches rather than as cubes.
+
+**This graph has never been run** -- see the block at the call site, which says
+what a capture must show.
 
 Run via:
   UnrealEditor-Cmd.exe <uproject> -run=pythonscript -script=<this file> -unattended -nop4 -nosplash
@@ -63,7 +77,10 @@ import unreal
 # The shared biome graph lives next to this file. A -run=pythonscript commandlet
 # does not put the script's own directory on sys.path, so add it explicitly.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from terrain_material_common import build_terrain_base_color  # noqa: E402
+from terrain_material_common import (  # noqa: E402
+    build_palette_inputs,
+    build_terrain_base_color,
+)
 from sky_star_graph import SkyGraphBuilder  # noqa: E402
 from bathy_field_graph import sample_bathy_field  # noqa: E402
 
@@ -130,81 +147,83 @@ def main():
 
     base_color, snow_w, base_color_out, wet = build_terrain_base_color(
         b, vertex_color, detail_uv, "", bathy=bathy,
+        palette=build_palette_inputs(b),
         # Voxel face normals are AXIS-ALIGNED, so every 10 cm step riser on a
         # gentle grassy hill is a "vertical" face. At full strength the slope
         # term would stripe the entire world grass/rock; at 0.35 it reads as
         # natural darkening of the riser. The clipmap, whose normals are real
         # terrain normals, passes 1.0.
         rock_slope_strength=0.35,
-        detail_fine_strength=0.30,
-        detail_coarse_strength=0.22,
+        # DROPPED FROM 0.30/0.22 BY ADR-0009, and this is a real change to how
+        # the world looks rather than a tidy-up.
+        #
+        # T_VoxelDetail is an 8 m-tiled fBm, and until this commit it was the
+        # ONLY variation terrain had -- the palette's per-voxel jitter reached
+        # asset materials and nothing else. That is why a hillside read as soft
+        # metre-scale blotches instead of as cube-to-cube dither: the blotches
+        # were the texture, at a scale eighty times coarser than a voxel and
+        # unrelated to the lattice underneath them.
+        #
+        # Now that the real per-voxel term is live, most of what this was doing
+        # is being done properly and the rest is fighting it: two variation
+        # systems at unrelated scales read as noise, not as detail.
+        #
+        # WEAKENED RATHER THAN REMOVED, and the nodes stay in the graph. It is
+        # still the only term that varies within ONE voxel face, which matters at
+        # the near plane where a face is many pixels across, and leaving it as a
+        # live parameter makes "the world looks too clean" a slider rather than a
+        # material regeneration on a box that usually belongs to someone else.
+        detail_fine_strength=0.05,
+        detail_coarse_strength=0.04,
     )
 
-    # --- ADR-0008 MATERIAL PALETTE ------------------------------------------
+    # --- THE MATERIAL PALETTE ON TERRAIN (ADR-0009) -------------------------
     #
     # UNRUN. This function is a `-run=pythonscript` commandlet and one editor per
-    # box is a hard rule here, so the graph below is written but has never been
-    # executed and M_VoxelTerrain.uasset on disk does not contain it yet. The
-    # shader half (VoxelQuadVertexFactory.ush + VoxelMaterialPalette.ush) is
-    # compile-checked by tools/compile-shaders.ps1; this half is not checked by
-    # anything until somebody runs this file.
+    # box is a hard rule here, so the graph is written but has not been executed
+    # and M_VoxelTerrain.uasset on disk does not contain it yet. Everything
+    # upstream IS checked, and headlessly: voxel-core's own tests pin the
+    # evaluation, and tools/check-palette-parity.py compiles the shipped shader
+    # text as C++ and runs it against vxc::voxelTint. What nobody has checked is
+    # the twelve nodes build_terrain_base_color adds below the palette decode.
     #
-    # WHAT IT DOES. VoxelQuadVertexFactory.ush evaluates vxc::kMaterialPalette
-    # per PIXEL and hands the result over as
+    # WHAT A CAPTURE MUST SHOW, so whoever gets the box knows when it is right:
     #
-    #   TexCoords[3] = (R, G)      TexCoords[4] = (B, isAsset)
+    #   1. A CAVE WALL WITH STRATA. bedrock, rock, gravel and subsoil visibly
+    #      different from each other. Until this change every one of them was
+    #      SubsurfaceColor, a single flat constant, and that is the most
+    #      obviously wrong thing in the game today.
+    #   2. A GRASS HILLSIDE WITH CUBE-TO-CUBE VARIATION at 5 m. If it is smooth,
+    #      the variation is being applied before the biome blend instead of
+    #      after, and the climate's 215/255 share has averaged it away.
+    #   3. NO SEAM IN THE MOTTLE at a streaming ring boundary. That is the
+    #      world-metric patch wavelength; a step there means the ring level is
+    #      not surviving the key.
+    #   4. TREES, FOLIAGE AND ANIMALS UNCHANGED from today. Their biomeTint is 0,
+    #      so the composition reduces to exactly the palette colour they already
+    #      had.
+    #   5. THE COMPONENT PATH (voxel.Stream.GPU 0) STILL DRAWS THE WORLD. It
+    #      supplies no fourth or fifth UV, so it must fall through `present` to
+    #      the climate-only graph. If it renders black, the presence encoding is
+    #      the thing to look at.
     #
-    # and this reads them back as BaseColor = lerp(biome, palette, isAsset).
+    # HOW THE THREE SLOTS ARE READ is build_palette_inputs() in
+    # terrain_material_common.py, and what fills them is
+    # VoxelQuadVertexFactory.ush's GetMaterialPixelParameters. The composition
+    # itself -- lerp to the climate, then the variation, then the existing AO
+    # multiply -- is in build_terrain_base_color, next to the biome graph it has
+    # to interleave with.
     #
-    # THE LERP IS ONE-SIDED ON PURPOSE, and this is the part not to "simplify"
-    # later. isAsset is 1 only for the ten materials terrain cannot produce
-    # (bark, heartwood, deadwood, six leaf types, pale bark -- everything at or
-    # above vxc::MAT_BARK). For every terrain voxel it is 0 and this node is the
-    # identity, so the climate-driven biome path above is untouched: terrain's
-    # colour is supposed to come from its climate, not from a material id, and
-    # the biome path is the only appearance path that currently works. Replacing
-    # it wholesale would be a change that cannot be verified in the same motion
-    # as this one.
-    #
-    # WHY THE LERP GOES *BEFORE* THE AO MULTIPLY. ADR-0008 invariant 4: the
-    # table carries no lighting and no ambient occlusion, because baking a
-    # top-is-brighter bias into it would double-count the renderer's own terms
-    # and go wrong the moment the sun moves. So an asset voxel has to arrive at
-    # the same `* VertexColor.G` every terrain voxel goes through.
-    #
-    # AND IT IS WHAT MAKES THE SHADER SIDE LIVE AT ALL. The factory's palette
-    # block is compiled out unless NUM_TEX_COORD_INTERPOLATORS > 4, which is
-    # decided by whether a material reads UV4. Until this graph lands, the
-    # renderer change costs literally nothing -- not an interpolant, not an
-    # instruction. That is deliberate, and it is also why "the shader is in but
-    # nothing changed" is the EXPECTED state right now rather than a bug.
-    palette_uv_rg = mel.create_material_expression(
-        material, unreal.MaterialExpressionTextureCoordinate, -900, 700)
-    palette_uv_rg.set_editor_property("coordinate_index", 3)
-    palette_uv_b_flag = mel.create_material_expression(
-        material, unreal.MaterialExpressionTextureCoordinate, -900, 780)
-    palette_uv_b_flag.set_editor_property("coordinate_index", 4)
-
-    def mask(src, keep_x):
-        """One component of a float2 TextureCoordinate."""
-        n = mel.create_material_expression(material, unreal.MaterialExpressionComponentMask, -750, 780)
-        n.set_editor_property("r", bool(keep_x))
-        n.set_editor_property("g", not keep_x)
-        n.set_editor_property("b", False)
-        n.set_editor_property("a", False)
-        if not mel.connect_material_expressions(src, "", n, ""):
-            raise RuntimeError("connect texcoord -> component mask failed")
-        return n
-
-    palette_rgb = b.append(palette_uv_rg, "", mask(palette_uv_b_flag, True), "")
-    # saturate() is belt and braces. The factory writes exactly 0.0 or 1.0 and
-    # the value is constant across a quad, so interpolation cannot move it; a
-    # lerp alpha is the one place where being wrong outside [0,1] extrapolates
-    # instead of clamping, and this material has been bitten by a channel that
-    # did not carry what its name said before.
-    is_asset = b.saturate(mask(palette_uv_b_flag, False))
-    base_color = b.lerp(base_color, base_color_out, palette_rgb, "", is_asset)
-    base_color_out = ""
+    # WHY THE COMPOSITION IS NOT HERE. It was, in the ADR-0008 version of this
+    # block: one lerp between the biome colour and a finished palette colour,
+    # keyed on isAsset. That worked only because it was one-sided -- terrain took
+    # the biome branch and nothing else happened. Blending per material means the
+    # palette has to reach INSIDE the biome graph, between the climate lookup and
+    # the AO multiply, and a copy of that ordering out here would be a second
+    # place to get it wrong. M_VoxelClipmap builds from the same function and
+    # passes palette=None, which is how the 50 km vista keeps the climate-only
+    # answer it has to keep: a clipmap vertex is a heightmap sample with no
+    # material id to look one up with.
 
     ao_multiply = mel.create_material_expression(material, unreal.MaterialExpressionMultiply, -200, 50)
     # Every connection is checked: a silently-failed pin connect produced an

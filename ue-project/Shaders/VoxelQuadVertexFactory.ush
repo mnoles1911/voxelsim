@@ -458,6 +458,13 @@ FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput In
 		Decoded.Normal,                       // GEOMETRIC, not shading -- this
 		                                      // asks which way the face points
 		VOXEL_SIZE_UU * ChunkScale,           // the quad's own voxel size
+		VOXEL_SIZE_UU,                        // ...and a LEVEL-0 one, so the pack
+		                                      // can put this ring's level in the
+		                                      // key. The pixel half needs the
+		                                      // cube's WORLD size to evaluate a
+		                                      // world-metric patch wavelength and
+		                                      // there is no interpolant left to
+		                                      // spend on it.
 		bWater ? 0u : Decoded.MaterialId,
 		Axis,
 		QPositive != 0u);
@@ -869,40 +876,63 @@ FMaterialPixelParameters GetMaterialPixelParameters(
 	Result.TexCoords[0] = Interpolants.TexCoords;
 #endif
 
-	// --- ADR-0008 MATERIAL PALETTE, AT PIXEL RATE ---------------------------
+	// --- THE MATERIAL PALETTE, AT PIXEL RATE (ADR-0008, extended by ADR-0009) -
 	//
-	// TexCoords[3] = palette RGB.rg, TexCoords[4] = (palette RGB.b, isAsset).
-	// M_VoxelTerrain reads them as TextureCoordinate(3)/(4) and does
+	//     TexCoords[3] = material base colour .rg     (LINEAR, unvaried)
+	//     TexCoords[4] = (base .b, biomeTint)
+	//     TexCoords[5] = (variation lightness, variation hue)
 	//
-	//     BaseColor = lerp(biomeAlbedo, paletteRGB, isAsset)
+	// and M_VoxelTerrain composes them as
 	//
-	// before its AO multiply, so the palette colour is lit and occluded like
-	// everything else -- invariant 4 keeps lighting out of the table itself.
+	//     albedo = lerp(materialBase, climateColour, biomeTint)
+	//     albedo = albedo * (1 + light);  .r *= 1 + hue;  .b *= 1 - hue
 	//
-	// WHY 3 AND 4, when 1 and 2 look free. They are not: the local-lights plan
+	// before its AO multiply, so the result is lit and occluded like everything
+	// else -- invariant 4 keeps lighting out of the table itself.
+	//
+	// WHY THE BASE AND THE VARIATION ARE SEPARATE, when this could hand over one
+	// finished colour in three floats as it used to. Because the CLIMATE goes
+	// between them, and the climate is a texture sample that only exists in the
+	// graph. Multiply the variation in here and it lands on the material's share
+	// only -- and every outdoor surface hands 190-235/255 of its colour to the
+	// climate, so the per-voxel dither would be averaged away on exactly the
+	// surfaces the player spends the whole game looking at. That is the
+	// difference between a mottled hillside and a flat one, and it is the reason
+	// terrain has never had cube-to-cube variation despite the palette carrying
+	// the numbers for it since ADR-0008.
+	//
+	// WHY 3, 4 AND 5, when 1 and 2 look free. They are not: the local-lights plan
 	// (docs/sky-and-local-light-plan.md L2) routes LocalRGB through
 	// TexCoords[1]/[2] into EmissiveColor. Taking them would collide with a
 	// feature that is already designed, and the collision would present as a
 	// torch that tints bark.
 	//
-	// SETTING THEM HERE ADDS NO VS->PS INTERPOLANT -- the same idiom L2 uses.
-	// What it costs is the one interpolant carrying the voxel coordinate (see
-	// the struct), which no existing channel can supply.
+	// [5] IS FREE, WHICH IS WHY IT IS THE THIRD SLOT AND NOT A SECOND
+	// INTERPOLANT. Unreal packs customised UVs two per float4, so the float4
+	// holding TexCoords[4] already reserves the lanes [5] occupies; a material
+	// that reads UV5 spends storage that was allocated and going unused. What
+	// this feature costs remains the ONE interpolant carrying the voxel
+	// coordinate (see the struct), which no existing channel can supply.
 	//
-	// isAsset IS 0 WHEN NOTHING WRITES IT, and that polarity is the safety
-	// argument. Terrain's ten thousand voxels a frame go down the biome path
-	// they already used; only a material terrain cannot produce takes the
-	// palette. It is also what makes this inert on the COMPONENT path, where
-	// FLocalVertexFactory supplies no fourth or fifth UV: Tools/probe_texcoord1.py
-	// measured a second texture coordinate arriving as zero there, and zero here
-	// means "biome", not "black".
+	// EVERY LANE IS 0 WHEN NOTHING WRITES IT, and that polarity is the whole
+	// safety argument. biomeTint 0 means "the material owns its colour", which
+	// with a base of (0,0,0) would be black -- so the graph gates on the base
+	// being written at all, and the component path (where FLocalVertexFactory
+	// supplies no fourth or fifth UV; Tools/probe_texcoord1.py measured a second
+	// texture coordinate arriving as zero there) keeps the pure biome answer it
+	// has always drawn. See create_voxel_material.py, which spells the gate out.
 #if NUM_TEX_COORD_INTERPOLATORS > 4
 	{
-		float3 PaletteRGB;
-		float IsAsset;
-		VoxelPaletteUnpack(Interpolants.VoxelPalette, PaletteRGB, IsAsset);
-		Result.TexCoords[3] = float2(PaletteRGB.r, PaletteRGB.g);
-		Result.TexCoords[4] = float2(PaletteRGB.b, IsAsset);
+		float3 PaletteBase;
+		float2 PaletteVariation;
+		float PaletteBiomeTint;
+		VoxelPaletteUnpack(Interpolants.VoxelPalette, PaletteBase, PaletteVariation,
+		                   PaletteBiomeTint);
+		Result.TexCoords[3] = float2(PaletteBase.r, PaletteBase.g);
+		Result.TexCoords[4] = float2(PaletteBase.b, PaletteBiomeTint);
+#if NUM_TEX_COORD_INTERPOLATORS > 5
+		Result.TexCoords[5] = PaletteVariation;
+#endif
 	}
 #endif
 
