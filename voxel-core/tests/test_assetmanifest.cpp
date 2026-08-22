@@ -615,3 +615,78 @@ VXC_TEST(assetmanifest_refuses_malformed_rules_and_attachments) {
                                   {{0, uint8_t(TAIGA), 0}, {0, uint8_t(TAIGA), 1}}))),
              int(AssetManifestError::kBadAttachment));
 }
+
+// --- assetCoverPitchRefusals: content a cover volume cannot hold, BY NAME ---
+//
+// The failure this guards is not a wrong picture, it is a MISSING one with no
+// explanation attached. A cover volume composes exactly one pitch, so every
+// detail species baked at another is dropped per instance, deep in a resolve
+// loop, where the species no longer has a name. Somebody then debugs it as
+// code. This function is the "say which content, and say it once, at load"
+// half, and this test is what keeps it honest -- including the part that is
+// easy to get wrong in the generous direction: a terrain species and an animal
+// are NOT refusals and must not appear in the list.
+
+VXC_TEST(coverpitch_names_only_the_detail_species_the_volume_cannot_hold) {
+    using namespace vxmtest;
+
+    VxmSpecies tree;                 // terrain lattice, 100 mm -- already in the world
+    tree.name = "test-oak";
+    tree.kind = 0;
+    tree.layer = 1;
+    tree.flags = 1;
+    tree.voxelSizeMm = 100;
+    for (int b = 0; b < vxc::kBiomeCount; ++b) tree.weights[b] = 1000;
+
+    VxmSpecies flower;               // detail at 50 mm -- composes in a 50 mm volume
+    flower.name = "test-daisy";
+    flower.kind = 5;
+    flower.layer = 3;
+    flower.flags = 0;
+    flower.voxelSizeMm = 50;
+    flower.spacingMm = 400;
+    flower.heightMm = 400;
+    flower.depthMinMm = 100;
+    flower.depthMaxMm = 400;
+    for (int b = 0; b < vxc::kBiomeCount; ++b) flower.weights[b] = 1000;
+
+    VxmSpecies bush20 = flower;      // detail at 20 mm -- THE REFUSAL
+    bush20.name = "test-dwarf-bush";
+    bush20.voxelSizeMm = 20;
+
+    VxmSpecies animal = flower;      // layer 255 -- never in any volume, not a refusal
+    animal.name = "test-marmot";
+    animal.layer = vxc::kAssetLayerNotScattered;
+    animal.voxelSizeMm = 20;
+
+    vxc::AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({tree, flower, bush20, animal}))),
+             int(vxc::AssetManifestError::kOk));
+
+    // At 50 mm: only the 20 mm bush is refused. Not the tree (world volume),
+    // not the animal (no volume at all), not the 50 mm flower (it fits).
+    const std::vector<vxc::AssetCoverPitchRefusal> at50 =
+        vxc::assetCoverPitchRefusals(m, 50u);
+    CHECK_EQ(int(at50.size()), 1);
+    if (at50.size() == 1) {
+        CHECK(at50[0].name == "test-dwarf-bush");
+        CHECK_EQ(int(at50[0].voxelSizeMm), 20);
+    }
+
+    // At 20 mm the answer INVERTS -- which is what proves the pitch argument is
+    // actually read rather than a hardcoded list of known-bad species.
+    const std::vector<vxc::AssetCoverPitchRefusal> at20 =
+        vxc::assetCoverPitchRefusals(m, 20u);
+    CHECK_EQ(int(at20.size()), 1);
+    if (at20.size() == 1) CHECK(at20[0].name == "test-daisy");
+
+    // And a pitch nothing is baked at refuses both detail species, still
+    // without ever naming the tree or the animal.
+    const std::vector<vxc::AssetCoverPitchRefusal> at30 =
+        vxc::assetCoverPitchRefusals(m, 30u);
+    CHECK_EQ(int(at30.size()), 2);
+    for (const vxc::AssetCoverPitchRefusal& r : at30) {
+        CHECK(r.name != "test-oak");
+        CHECK(r.name != "test-marmot");
+    }
+}

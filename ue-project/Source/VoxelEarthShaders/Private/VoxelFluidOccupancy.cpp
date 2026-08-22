@@ -4,6 +4,7 @@
 #include "RenderGraphBuilder.h"
 #include "RenderGraphResources.h"
 #include "RenderGraphUtils.h"
+#include "SystemTextures.h"   // GSystemTextures.GetDefaultBuffer, for CreateNullBitsSRV
 #include "ShaderParameterStruct.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "PixelFormat.h"
@@ -698,6 +699,24 @@ FRDGBufferSRVRef FVoxelFluidOccupancyVolume::CreateBitsSRV(FRDGBuilder& GraphBui
 	// the collision read is a single typed load per voxel test, and the
 	// contract names it that way (VoxelFluidContract.ush:66).
 	return GraphBuilder.CreateSRV(Buffer, PF_R32_UINT);
+}
+
+FRDGBufferSRVRef FVoxelFluidOccupancyVolume::CreateNullBitsSRV(FRDGBuilder& GraphBuilder)
+{
+	// One dword, owned by the engine's system-texture pool, so this costs no
+	// per-frame allocation and no clear pass. Same typed view as the real
+	// binding -- VoxelFluidCollision.ush declares Buffer<uint>.
+	//
+	// FILLED 0xFFFFFFFF, NOT ZERO, AND THE DIRECTION IS THE WHOLE POINT. This
+	// volume's convention is UNBUILT IS SOLID (vxc::kFluidVolumeUnbuiltWord,
+	// VoxelFluidOccupancy.usf:253). A zero-filled stand-in inverts it, so if a
+	// dispatch that actually reads occupancy ever reached this buffer the world
+	// would render EMPTY with every counter healthy -- the silent-empty failure
+	// this project has been burned by repeatedly. Filled solid, the same mistake
+	// draws a box at the camera and is impossible to miss.
+	return GraphBuilder.CreateSRV(
+		GSystemTextures.GetDefaultBuffer(GraphBuilder, sizeof(uint32), 0xFFFFFFFFu),
+		PF_R32_UINT);
 }
 
 FRDGBufferRef FVoxelFluidOccupancyVolume::AddPasses(FRDGBuilder& GraphBuilder)

@@ -1,0 +1,2907 @@
+// VoxelBrickTraverse.ush -- THE VOLUME, BEHIND AN INTERFACE.
+//
+// P3 of docs/ray-marching-plan-2026-08-19.md. This file is the ONE place
+// VoxelMarch.usf learns what the world is made of; everything above it -- the
+// ray, the tile classify, the GBuffer emit -- is written against
+// FVoxelMarchHit and VoxelMarchTraverse() and knows nothing else.
+//
+// ---------------------------------------------------------------------------
+// WHY AN INTERFACE AND NOT JUST THE BRICK POOL
+// ---------------------------------------------------------------------------
+//
+// FVoxelBrickPool did not exist when this was written -- P2 is a separate
+// workstream, concurrently owned. The plan's instruction was explicit:
+// "develop against FVoxelFluidOccupancy exactly as VoxelMarchSpike.usf does,
+// and keep the traversal behind an interface so swapping the source is a
+// one-line change."
+//
+// That one line is VOXEL_MARCH_SOURCE, a shader PERMUTATION (not a uniform
+// branch), for the reason VoxelMarchSpike.usf records at length about its own
+// no-fetch arm: a runtime branch leaves BOTH sources' loads in the binary and
+// silently re-bases whichever arm you are measuring. Permutations here are
+// cheap -- the source dimension multiplies the march kernel only.
+//
+//   VOXEL_MARCH_SOURCE 0   FVoxelFluidOccupancy, the 512^3 / 51.2 m bit volume
+//                          -- the SAME volume VoxelMarchSpike.usf marched and
+//                          the same one the fluid collides against. ONE level,
+//                          10 cm, and NO PER-VOXEL MATERIAL (it is a bitfield;
+//                          see THE MATERIAL HOLE below).
+//   VOXEL_MARCH_SOURCE 1   FVoxelBrickPool, docs/brick-volume-format.md.
+//                          Multi-level, per-voxel material, real skip masks.
+//                          Declared here and #error'd until P2 lands, so that
+//                          "the pool is wired up" can never be true by
+//                          accident -- it has to be typed.
+//
+// ---------------------------------------------------------------------------
+// THE MATERIAL HOLE, STATED ONCE AND LOUDLY
+// ---------------------------------------------------------------------------
+//
+// FVoxelFluidOccupancy stores ONE BIT PER VOXEL. It does not know that a voxel
+// is snow rather than bedrock and it never did -- vxc::packBrickSolidBits
+// throws the material away, which is correct for a collision volume and is
+// exactly what docs/brick-volume-format.md 3a is about.
+//
+// So under VOXEL_MARCH_SOURCE 0 the marcher CANNOT produce ADR-0008 colour. It
+// reports VOXEL_MARCH_PLACEHOLDER_MATERIAL for every solid voxel, and the
+// resulting frame is grey rock everywhere. THAT IS NOT A PALETTE BUG AND IT IS
+// NOT A LOD BUG. It is the source having no materials in it.
+//
+// Consequences that must not be papered over:
+//   * a colour A/B against the raster path is MEANINGLESS on source 0. Gate 4
+//     of plan section 10 (colour statistics) cannot run until source 1 exists.
+//   * the DEPTH gate (plan section 10, gate 3) CAN run on source 0 and is the
+//     one that matters for P3: it asks whether the march lands where PrePass +
+//     BasePass landed, which is a question about geometry, not colour.
+//   * the per-voxel hash tint (VoxelMaterialColor's invariant 3) is still
+//     evaluated, because the hash is keyed on the VOXEL COORDINATE and not on
+//     the material -- so the boiling-at-range behaviour the cone fade exists to
+//     suppress is fully exercised even with one material.
+//
+// ---------------------------------------------------------------------------
+// WHAT COMES BACK, AND WHY EACH FIELD IS THERE
+// ---------------------------------------------------------------------------
+//
+// ADR-0008: the march returns the EXACT voxel and the EXACT crossed face, so
+// per-voxel colour is a direct VoxelMaterialColor() call with no interpolants
+// and the normal is the geometric axis, free, with no derivative anywhere.
+// Every field below is either that, or the cone state the LOD rule needs, or
+// the eight neighbour bits the corner AO needs. Nothing is here "in case".
+//
+// ---------------------------------------------------------------------------
+// LOD IS CONE-BASED. IT IS NOT, AND MUST NEVER BE, DERIVATIVE-BASED.
+// ---------------------------------------------------------------------------
+//
+// ADR-0008 records that hardware derivatives (ddx/ddy) are DISCONTINUOUS across
+// voxel edges: two pixels in the same 2x2 quad routinely land on different
+// faces of different voxels, so ddx of anything voxel-derived is a step
+// function and the mip it selects flickers along every silhouette. A marcher
+// does not need them and must not use them.
+//
+// Instead each ray carries its own footprint:
+//
+//     coneRadiusUU(t) = t * PixelConeSlope
+//
+// where PixelConeSlope is the world-space half-width of one pixel per unit of
+// distance -- a pure function of the projection and the viewport, computed once
+// on the host (see FVoxelMarchRenderer's PixelConeSlope note). The level rule
+// is then, per plan section 5:
+//
+//     pick the SMALLEST level L with voxelSizeUU(L) >= 1.5 * coneRadiusUU(t)
+//
+// i.e. "no voxel smaller than ~1.5 px", enforced PER RAY. That is the property
+// a per-chunk mesher structurally cannot have: a mesher picks one LOD for a
+// whole chunk from the chunk's distance, so the near corner of a far chunk is
+// always over-tessellated and the far corner always under-.
+//
+// THE FACTOR 1.5 IS NOT A TUNING KNOB WITH AN OBVIOUS BEST VALUE and it is
+// named rather than inlined. Below ~1.0 the marcher resolves voxels smaller
+// than a pixel and the result aliases into TSR as boiling; above ~2 it throws
+// away silhouette detail TSR would otherwise have resolved. 1.5 is the plan's
+// number and the first thing to sweep if the far field reads wrong.
+
+// ===========================================================================
+// READ THIS BEFORE ADDING A LEVEL TO THE HIERARCHY
+// ===========================================================================
+//
+//   INTEGER COORDINATES ARE THE TRUTH. FLOAT BOUNDS ARE AN OPTIMISATION.
+//   EVERY PLACE THEY BOTH DECIDE THE SAME THING IS A BUG WAITING.
+//
+// ---------------------------------------------------------------------------
+// AND ABOVE ALL OF THEM, BECAUSE IT IS THE ERROR THAT GENERATED THEM:
+//
+//   DO NOT MINE A SELECTION EFFECT FOR MECHANISM.
+//
+// For six rounds the guiding fact was that 94% of disagreements sit on cell
+// boundaries. Every hypothesis below was reverse-engineered from it. But a
+// disagreement is OBSERVABLE only where the two walks straddle a plane --
+// `floor` absorbs any difference everywhere else -- so for ANY perturbation
+// whatsoever, bug or drift or rounding, disagreements concentrate on
+// boundaries BY CONSTRUCTION. The 94% is the observability window. It could
+// not have come out any other way, and it is what a NULL RESULT looks like.
+//
+// The cost of missing that: four hypotheses, THREE OF WHICH WERE REAL DEFECTS
+// and were correctly found and fixed -- which is exactly what made the method
+// feel productive -- and NONE of which moved the population. Being right about
+// three mechanisms is not evidence the search is aimed correctly.
+//
+// The tell was available the whole time and was read as encouragement instead:
+// REPEATED REAL FIXES THAT DO NOT MOVE THE POPULATION mean the selection is
+// doing the work, not the mechanism. When a measured concentration could not
+// have come out otherwise, it constrains nothing -- and the first question
+// about any concentration is not "what causes it" but "what else could this
+// number have been". If the answer is "nothing", it is not evidence.
+//
+// What replaced it: measure the perturbation's MAGNITUDE (VoxelMarch.usf,
+// "THE BAND HISTOGRAM"), which is a fingerprint, and adjudicate with something
+// that is not one of the two disputing walks ("THE INTEGER ARBITER").
+// ---------------------------------------------------------------------------
+//
+// That sentence cost four separate defects in this file, three of them the
+// identical shape, and every one of them produced a plausible picture rather
+// than an error. They are listed because the next person to add a level will
+// otherwise make it a fifth time:
+//
+//  1. THE NUDGE (fixed). The fine walk was bounded by the brick exit PLUS the
+//     advance nudge, so it stepped one voxel past the brick every crossing and
+//     tested that voxel against the wrong brick's occupancy.
+//     -> `gained` 20,233 rays.
+//
+//  2. THE ULP (fixed). With the nudge gone, `Span` (a slab test from the
+//     brick's min corner) and `tMax` (accumulated from the segment entry) still
+//     disagreed by ULP at the exit plane -- an unbiased coin flip, once per
+//     crossing, in the same direction as (1).
+//     -> containment moved into integers: `voxel >> 3` against the loaded brick.
+//
+//  3. THE MIRROR (fixed). Removing the over-run left the float `Span` as the
+//     ONLY early-out, so its ULP error could now only cut SHORT -- one voxel at
+//     the far face, which the brick loop then skipped past entirely.
+//     -> the float bound became the RAY end; the integer test became sole
+//        authority.
+//
+//  4. THE CHUNK HANDOFF (fixed). Same shape one scale up: the brick loop's only
+//     guard on chunk membership was the float `t < tChunkEnd`, while the voxel
+//     was recomputed from the current t. Within a ULP of a chunk plane the ray
+//     was in the NEXT chunk while the bound said otherwise.
+//     -> `lost`, `gained` and `moved` simultaneously, from one cause.
+//
+//  5. THE DUPLICATED EXPRESSION (fixed). VoxelMarchCellExitT recomputed
+//     `floor((Origin + Dir*t) / voxelUU)` that the caller had already computed.
+//     TEXTUALLY IDENTICAL, so it looked correct at both sites and in the diff --
+//     but the compiler may contract one and not the other, and one cell of
+//     disagreement at a plane SKIPS A BRICK when travelling positively while
+//     merely stalling when travelling negatively.
+//     -> 92% of disagreements on positive travel; the cell is now passed in.
+//
+//     THE COROLLARY, WHICH IS THE NON-OBVIOUS PART:
+//         THE SAME EXPRESSION WRITTEN TWICE IS STILL TWO AUTHORITIES.
+//     Every earlier instance had two DIFFERENT formulations to notice. This one
+//     had none, and survived three rounds of reading for exactly that reason.
+//
+//  6. THE TRADE (open). Fixing (5) collapsed `lost onFace` 550 -> 22 and pushed
+//     `moved` 0 -> 29..93 on the same legs. Rays that previously SKIPPED a brick
+//     -- and a skipped brick cannot produce a wrong cell, which is why `moved`
+//     had been exactly zero -- now descend correctly and some land on the wrong
+//     voxel.
+//
+//     THE LESSON, WHICH IS NEW AND COST A ROUND TO LEARN:
+//         A FIX THAT REMOVES ONE AUTHORITY CAN EXPOSE A SECOND DEFECT THAT THE
+//         FIRST WRONG ANSWER WAS HIDING.
+//     Every earlier fix here reduced every term at once. This one traded, and a
+//     pre-registered "this term must not move" is the only reason that was
+//     visible as a regression rather than banked as progress.
+//
+//  7. THE CHUNK-LEVEL ADVANCE (OPEN, NOT FIXED). The brick level is now a real
+//     DDA and cannot skip. The CHUNK level still is not: a non-resident or
+//     all-air chunk is skipped with `t = tChunkExitTrue + NUDGE` and the next
+//     chunk is found by re-flooring the position -- the identical construction
+//     that made (5)/(6) skip bricks, one scale up.
+//
+//     It is narrower here: it needs a ray to clip a chunk for less than the
+//     nudge AND the chunk beyond it to hold content within that sliver. But
+//     "narrower" is what (5) looked like too, and it produced 977 rays. LEFT
+//     DELIBERATELY UNFIXED so the brick-level result can be attributed; it is
+//     the next candidate if a residue survives in high mode.
+//
+//  8. THE DDA REWRITE (REVERTED, and the diagnosis is NOT thereby refuted).
+//     (7) motivated rewriting the brick level as a real DDA, on the reasoning
+//     that a DDA cannot skip a cell by construction while jump-and-re-floor
+//     jumps any brick clipped for less than the nudge. THE REASONING MAY STILL
+//     BE RIGHT. THE IMPLEMENTATION WAS NOT:
+//
+//         disagree      1,060 -> 199,839   (188x worse)
+//         lost offFace      6 ->  79,769   (13,000x worse)
+//         ratio        37.61x ->  31.12x   (fell 17%: more steps, worse answers)
+//
+//     THE SHAPE CHANGED, WHICH IS THE DIAGNOSTIC. The old defect was 94-96%
+//     boundary-concentrated; the new one is 40% OFF boundary, and BOTH descent
+//     bins exploded together (941 -> 149,028 and 42 -> 50,312) with their ratio
+//     barely moving. A skip mechanism raises only the first. Both rising is a
+//     walk wrong in a GENERAL way, not at a geometric configuration.
+//
+//     SUSPECTED CAUSE, recorded for the second attempt rather than acted on:
+//     the rewrite handed the fine walk a brick-entry t that lands EXACTLY on a
+//     brick plane (the DDA's crossing t), where `floor` of the entry position
+//     resolves to either side. The old code entered a nudge INSIDE the brick and
+//     never sat on the plane. If so the fix is not to restore the nudge but to
+//     take the entry voxel's BRICK part from the integer brick coordinate and
+//     only its CELL part from the position -- the same construction already used
+//     for the uniform-SOLID hit. UNVERIFIED.
+//
+//     A DIAGNOSIS AND ITS IMPLEMENTATION ARE SEPARABLE, and conflating them here
+//     would either throw away a correct analysis or preserve a broken rewrite.
+//
+//     RESOLVED 2026-08-20 -- CORRECT AND IRRELEVANT. The coincidence test ran
+//     over four legs, two windows each. In EVERY window the number of thin-clip
+//     hit bricks among all rays equalled the number among disagreeing rays:
+//     1/1, 4/4, 3/3, 2/2, and 0/0 six times.
+//
+//         EVERY THIN CLIP ON A HIT BRICK IS A DISAGREEMENT. 100%, ten windows.
+//
+//     The diagnosis was right. But there are only 0-4 per window against
+//     138-652 disagreements, so THE CORNER CLIP IS ~0.6% OF THE DEFECT AND
+//     OFTEN ZERO. Do not build the second brick-DDA attempt: not because it
+//     cannot be measured, but because it was measured and it is worth 0.6%.
+//     A CONFIRMED MECHANISM IS NOT NECESSARILY THE MECHANISM, and "it fires
+//     every time it can" says nothing about how often it can.
+//
+//  9e. WHEN YOU FIND ONE INSTANCE OF A DEFECT, COUNT THE INSTANCES.
+//     The arbiter's validity test held THREE strict float comparisons against
+//     boundaries -- span (F > N), near bound (F > TIn), far bound (N < TOut).
+//     The 8-ulp tolerance was derived correctly, argued carefully, and applied
+//     TO ONE OF THEM. The other two were the same defect, untouched, and the
+//     far bound then produced 648 rejections against the near bound's exactly 0.
+//
+//     THE ZERO IS WHAT MADE IT LEGIBLE, and the reason is worth keeping: TOut
+//     is TMax - BOX_INSET where TMax is the PREPASS DEPTH, so the far bound sits
+//     1/200 of a voxel in front of the very surface every hit lands on. TIn is
+//     pinned to nothing. A perfectly one-sided count is rarely a property of the
+//     rays; it is usually a property of what the two bounds are MADE OF.
+//
+//     Doctrine 5 says the same expression written twice is two authorities.
+//     This is its sibling: THE SAME MISTAKE MADE THREE TIMES IS NOT FIXED BY
+//     ONE CORRECTION, and a fix that leaves siblings in place will read as a
+//     partial success -- degenerate fell, so the tolerance "worked" -- while the
+//     population simply moves into the neighbouring bin.
+//
+//     IT LANDED A THIRD TIME THE SAME NIGHT, in a different file. A minimum-count
+//     guard was written for the ARBFAIL verdict and for gate v4; the ARBFAIL one
+//     tested the denominator, the gate one tested the SUM. So the gate printed
+//     FAIL at 4.09x, 13.50x and 1.63x over denominators of 11, 2 and 19 -- a
+//     ratio guarded by a bar its denominator never had to clear. A GUARD ON A
+//     RATIO MUST TEST THE DENOMINATOR; a sum lets one large arm carry a tiny one
+//     past the bar. Writing the same guard twice is writing it twice.
+//
+//     AND THE SEGMENT TEST WAS NEVER FIXABLE BY TOLERANCE AT ALL. It re-decided,
+//     with an independent computation, something the walk had already guaranteed
+//     -- doctrine 5 again. The arbiter recomputes entry t directly (O(1) ulp);
+//     the walk accumulates (O(N) ulp). Sizing the arbiter's band to swallow the
+//     walk's drift would be tuning one instrument's constant to absorb another
+//     instrument's error, which is the thing this file refuses everywhere else.
+//     It is now a counter with a MAGNITUDE, not a filter.
+//
+//  9c. A FILTERED COUNT IS A LOWER BOUND, NEVER A DECISION BASIS.
+//     After 9b was fixed, the uncontested skip counts were quoted as "~20 rays
+//     per leg, negligible, characterise and stop" -- BY BOTH OF US, one round
+//     after establishing that pre-fix counts were suppressed. The real value is
+//     ~3,870 per leg (0.29% of frame), about 200x larger, and still a lower
+//     bound because 8-44% of rays remain ill-posed and every one of those is
+//     drawn from the same population.
+//
+//     THE RULE: while any known defect DISCARDS members of a population, every
+//     count over that population is a floor. It may be quoted as a floor. It may
+//     NEVER be quoted as a magnitude, and it may never justify a decision to
+//     stop -- because the decision to stop is exactly the one that a suppressed
+//     count makes look safe. This is the selection-effect error one level down:
+//     there the SELECTION was mistaken for a mechanism, here a SUPPRESSED count
+//     was mistaken for a measurement.
+//
+//  9d. INSTRUMENT A FALSIFIED HYPOTHESIS INSTEAD OF DELETING IT.
+//     The degenerate-span rejection was recorded as the suspected cause of the
+//     arbiter's ill-posedness, then apparently falsified when the first
+//     decomposition showed the sentinel instead -- so it was DEMOTED IN THE
+//     COMMENT BUT ITS COUNTER WAS KEPT. Two legs later that counter read 70 of
+//     80 failures and the verdict fired SELF-INFLICTED, naming it. Both causes
+//     were real; neither was universal; the decomposition refused to fit one to
+//     all three legs.
+//
+//     Deleting the bin would have cost the finding entirely. A hypothesis that
+//     looks wrong is cheap to keep measured and expensive to re-derive, and
+//     "wrong in the leg I happened to read" is not the same as wrong.
+//
+//  9b. THE MISS THAT LOOKS LIKE A HIT. VoxelMarchTraverseBrick sets
+//     `H.Voxel = StartVoxel` before it walks, so ON A MISS THE HIT VOXEL FIELD
+//     HOLDS THE RAY'S ENTRY VOXEL -- a large, plausible, perfectly legal
+//     coordinate -- with H.THitUU left at 0. `bHit` is the only thing that says
+//     otherwise, and three separate consumers forgot to ask:
+//
+//       - the arbiter scored `gained` rays as a contest the flat walk lost,
+//         manufacturing `hier-correct` counts and, where the surviving side also
+//         failed validity, the entire `ill-posed` population (ill-posed ~=
+//         gained, four legs running, 30-43%);
+//       - the brick-mismatch assertion compared a real brick against the ENTRY
+//         brick and fired as an Error on a condition it declared impossible;
+//       - the sample dump printed the sentinel as a position, which is how it
+//         was finally caught: three pixels "hitting" one voxel at t=0.0000.
+//
+//     THE GUARD THAT EXISTED WAS ASYMMETRIC AND THAT IS THE LESSON. The
+//     assertion read `Class != 0` -- someone had already noticed that `lost`
+//     rays have no HIER voxel and excluded them. The identical hole in the
+//     other direction, `gained` rays having no FLAT voxel, was not seen. WHEN
+//     YOU FIND YOURSELF EXCLUDING ONE DIRECTION OF A SYMMETRIC RELATION, THE
+//     OTHER DIRECTION IS ALREADY BROKEN.
+//
+//     This is doctrine 5's shape (a masked index yields a legal answer) moved
+//     up a level: an unset FIELD yielding a legal COORDINATE. The struct cannot
+//     express "no hit" except through a flag nobody is forced to read.
+//
+//  9. A COUNT IS NOT A MEASUREMENT UNTIL ITS POPULATION IS CHARACTERISED.
+//     Every number quoted in (8) is a POINT FROM AN UNMEASURED DISTRIBUTION.
+//     N=6 legs on six distinct index hashes -- six different worlds, not six
+//     draws of one -- put the reverted build's disagree count at:
+//
+//         15   41   148   527   1,060   10,428      RANGE 695x (~2.8 decades)
+//
+//     while the skip ratio moved 3.2% (36.86 - 38.04) across that same swing.
+//
+//     So `1,060`, treated as "the high mode" for six rounds of investigation,
+//     is simply a common draw. The 188x in (8) is real -- 199,839 is outside
+//     this population by more than a decade -- but every SMALLER movement read
+//     during that period proved nothing, in either direction, and neither did
+//     the pre-registrations written over them. A criterion stated on a metric
+//     whose band has never been measured is not a prediction; it is a guess
+//     that will be read as confirmation whichever way it lands. That is worse
+//     than no criterion at all.
+//
+//     WHY MORE LEGS CANNOT FIX IT: the variance is not sampling noise, it is
+//     world content -- how much defect-triggering geometry each world holds.
+//     Averaging more worlds estimates the mean of a distribution nobody cares
+//     about. Normalising by RAYS fails for the same reason: the density varies,
+//     not the population size.
+//
+//     WHAT I PROPOSED, AND WHY IT COULD NOT HAVE WORKED. I added BrickEntries
+//     and ThinClips as denominators, asserting both "scale with world content".
+//     MEASURED, N=6:
+//
+//         brick entries   12.12M - 12.20M    spread 0.7%
+//         thin clips       1,881 - 1,898     spread 0.9%
+//         per thin clip   0.0048 - 0.3435    spread 72x
+//
+//     Neither scales with content. THEY ARE CONSTANTS OF THE CAMERA POSE.
+//     A thin clip is a ray-versus-grid-plane event -- decided by ray origin
+//     and direction against the brick lattice, with the world entering only
+//     through where the ray stops. Same pose, same snapped origin, same clips.
+//     It could not have varied, so it could not have explained variation.
+//
+//     AND THE NORMALISATION WAS ARITHMETICALLY INERT: 72x per clip against
+//     72.4x raw. DIVIDING BY A CONSTANT CANNOT CHANGE A SPREAD. The column
+//     is the raw count rescaled, and it was read as a new measurement.
+//
+//     THIS DID NOT REFUTE THE CORNER CLIP -- IT FAILED TO TEST IT. The rate
+//     is a per-ray verdict over an all-ray sum of an unrelated quantity;
+//     NOTHING IN THE INSTRUMENT EVER CHECKED THAT A DISAGREEMENT AND A THIN
+//     CLIP OCCUR ON THE SAME RAY, LET ALONE THE SAME BRICK. Until they are
+//     intersected, (8) is UNTESTED, not disproved.
+//
+//     THE GENERAL TRAP: a denominator only normalises if it CO-VARIES with
+//     what it divides. One that holds still is decoration on the numerator.
+//     Check that a candidate denominator MOVES before trusting a rate built
+//     on it -- the check is free and it is the whole validity of the metric.
+//
+//     REPLACED BY A TEST THAT CAN ANSWER (VoxelMarch.usf, "THE COINCIDENCE
+//     TEST"): a closed-form slab test on the brick the FLAT walk hit, asked
+//     per ray, reported as the LIFT of the thin share among disagreeing rays
+//     over the thin share among ALL hit rays. It consults neither walk, and it
+//     answers for bricks the hierarchy NEVER ENTERED -- the exact case the
+//     mechanism describes and the one no counter inside the brick loop can
+//     ever see, which is why the previous attempt was structurally blind to it.
+//     A BARE SHARE IS STILL NOT A RESULT. The control is the whole test.
+//     Vindicated immediately: single windows read 0/138 and 0/151 -- "REFUTED"
+//     if either had been read alone -- while others read 4/4 and 3/3. The
+//     two-window print is what stopped a real mechanism being dismissed.
+//
+// AND THE REASON ALL FIVE WERE SILENT IS THE SAME: the index helpers MASK.
+// VoxelMarchCellIndex takes `& 7`, VoxelMarchBrickIndex takes `& 3`. An
+// out-of-range coordinate therefore produces a perfectly legal in-range index,
+// so every value downstream looks correct and the only symptom is geometry in
+// the wrong place. A mask is an assertion that the caller already checked; if
+// nothing checked, the mask is what hides it.
+//
+// So: when you add a level, the cell you are IN is decided by integer
+// coordinates and nothing else. Use the float parameter to skip work, never to
+// decide membership, and never let two things answer the same question.
+//
+// ===========================================================================
+
+#pragma once
+
+// ---------------------------------------------------------------------------
+// Source selection
+// ---------------------------------------------------------------------------
+
+#ifndef VOXEL_MARCH_SOURCE
+#define VOXEL_MARCH_SOURCE 0
+#endif
+
+#define VOXEL_MARCH_SOURCE_OCCUPANCY 0
+#define VOXEL_MARCH_SOURCE_BRICKPOOL 1
+
+// ---------------------------------------------------------------------------
+// COMPILING BOTH SOURCES AT ONCE, for voxel.March.VerifySource
+// ---------------------------------------------------------------------------
+//
+// The two traversals are normally either/or -- one permutation compiles one of
+// them, and the other's bindings do not exist. That is what keeps a source-0
+// dispatch from having to bind four pool SRVs it will never read.
+//
+// The comparator needs BOTH in one kernel, over the SAME rays, in the SAME
+// frame -- that is the entire point of it, and a comparison across two
+// dispatches would be comparing two camera positions as well as two volumes. So
+// VOXEL_MARCH_VERIFY_SOURCE turns both on, and ONLY the comparator kernel sets
+// it (through ModifyCompilationEnvironment, exactly as the index probe forces
+// VOXEL_MARCH_SOURCE 1). The march and emit permutations are untouched.
+#ifndef VOXEL_MARCH_VERIFY_SOURCE
+#define VOXEL_MARCH_VERIFY_SOURCE 0
+#endif
+
+// ---------------------------------------------------------------------------
+// VOXEL_MARCH_SKIP_LEVELS -- and it is a PERMUTATION, never a uniform
+// ---------------------------------------------------------------------------
+//
+//   0  flat. Every voxel stepped, every voxel tested. THE CONTROL, and it is
+//      the same walk that produced the 5.144 -> 6.087 ms indirection number.
+//   1  brick skipping: an empty 8^3 brick is rejected by one bit test against a
+//      register and jumped over. 512 voxels, no memory traffic.
+//   2  chunk skipping as well: a non-resident or all-air 32^3 chunk is rejected
+//      on one index dword. 32,768 voxels.
+//
+// A RUNTIME BRANCH WOULD RE-BASE THE ARM. VoxelMarchSpike.usf recorded exactly
+// this: `if (Skip) ...` leaves the other side's loads in the binary, so the
+// control pays memory traffic it never uses and the ratio the whole project
+// rests on comes out wrong in the flattering direction. Three legs were spent
+// this week discovering that comparing two implementations tells you about the
+// implementations; this is the same lesson applied before the fact.
+// Six rings to 4 km. Bounded here so the traversal loop has a compile-time trip
+// count and so a bad uniform cannot walk off the end of the index.
+#define VOXEL_MARCH_MAX_RINGS 6u
+
+// The ring cascade arm. 0 = single level over one t interval, which is every
+// leg measured before 2026-08-20 and is the control. 1 = the ring loop.
+#ifndef VOXEL_MARCH_RINGS
+#define VOXEL_MARCH_RINGS 0
+#endif
+
+#ifndef VOXEL_MARCH_SKIP_LEVELS
+#define VOXEL_MARCH_SKIP_LEVELS 0
+#endif
+
+#define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
+#define VOXEL_MARCH_HAS_BRICKPOOL 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL || VOXEL_MARCH_VERIFY_SOURCE)
+
+
+// The step budget must be declared before VoxelFluidCollision.ush is included:
+// the walk's loop bound is a macro there, exactly as VoxelMarchSpike.usf does
+// it, and for the same reason (an arbitrary cvar value cannot be a permutation).
+#ifndef VOXEL_MARCH_STEP_BUDGET_DECLARED
+#define VOXEL_MARCH_STEP_BUDGET_DECLARED 1
+int MarchStepBudget;
+#define VOXEL_FLUID_MAX_COLLISION_STEPS MarchStepBudget
+#endif
+
+#include "/VoxelEarth/VoxelFluidCollision.ush"
+// VOXEL_FACE_TOP/SIDE/BOTTOM and VoxelMaterialColor. Included HERE rather than
+// left to the caller so that VoxelMarchFaceClass below sits next to the
+// constants it must agree with -- the raster path and the marcher picking
+// different palette rows for the same voxel is the one way an A/B can look
+// broken while both halves are individually correct.
+#include "/VoxelEarth/VoxelMaterialPalette.ush"
+
+// ---------------------------------------------------------------------------
+// The placeholder material (source 0 only)
+// ---------------------------------------------------------------------------
+//
+// MAT_ROCK. Chosen because it is (a) a terrain material, so the "is this an
+// asset voxel" branch in VoxelMaterialPalette.ush takes the terrain side and
+// the whole colour path is exercised, (b) mid-grey, so a wrong LIGHTING result
+// is visible rather than hidden inside a saturated colour, and (c) NOT
+// MAT_WATERMARK, whose magenta would be read as a debug instrument firing.
+//
+// It is a #define and not a uniform so that it cannot be set at runtime and
+// mistaken for real per-voxel material.
+#define VOXEL_MARCH_PLACEHOLDER_MATERIAL 2u   // vxc::MAT_ROCK
+
+// ---------------------------------------------------------------------------
+// LOD constants
+// ---------------------------------------------------------------------------
+
+// Direction components below this are nudged away from zero before the
+// reciprocal, so an axis-aligned ray produces +/-inf slab distances rather than
+// 0 * inf = NaN.
+//
+// DEFINED HERE RATHER THAN IN VoxelMarch.usf, because the hierarchical walk in
+// this file needs it and this file is included FIRST. Guarded so the consumer's
+// own copy is a no-op rather than a redefinition warning -- the two must stay
+// the same number, and one definition is how that is guaranteed.
+#ifndef VOXEL_MARCH_MIN_DIR_COMPONENT
+#define VOXEL_MARCH_MIN_DIR_COMPONENT 1e-6f
+#endif
+
+// "No voxel smaller than ~1.5 px" -- see the header. Sweep this before
+// anything else if the far field boils or smears.
+#define VOXEL_MARCH_CONE_VOXELS_PER_PIXEL 1.5f
+
+// How many ring levels the source can offer.
+//
+// Source 0 has exactly one -- the fluid volume is a single 10 cm grid.
+//
+// SOURCE 1 IS PINNED TO ONE AS WELL, AND THAT IS P3-B1's SCOPE, NOT THE POOL's
+// LIMIT. The pool holds all six rings (L0 is 19.2% of residency and the
+// distribution is near-uniform -- measured, against gpu-g0-sizing.md's now
+// twice-refuted ~80%). P3-B1 marches level 0 only: no cone LOD, no ring
+// transitions. Raising this to 6 is P3-B2 and it must arrive WITH the
+// ring-transition logic, because a cone rule that selects level 3 while the
+// traversal only knows how to walk level 0 produces a hit at the wrong scale
+// rather than an error.
+#define VOXEL_MARCH_LEVEL_COUNT 1
+
+// ---------------------------------------------------------------------------
+// PHASE 6: THE COVER LEVEL, AND WHY IT IS A LEVEL AND NOT A SECOND VOLUME
+// ---------------------------------------------------------------------------
+//
+// Ground cover (grass, flowers, reeds, small bush) is authored at 50 mm and the
+// world lattice is 100 mm, so cover is EXACTLY ONE LEVEL FINER than ring 0 --
+// docs/detail-assets-in-the-volume-2026-08-19.md section 3, and 100 % 50 == 0
+// is checked in voxelcore/covervolume.h's coverVolumeInit rather than assumed.
+//
+// The ring cascade already knows how to walk a lattice at a different scale:
+// VoxelMarchTraverseRings divides the ray by 2^L so that one level-L voxel
+// measures exactly VOXEL_FLUID_VOXEL_UU in the walk's own units, and all
+// twenty-four VOXEL_FLUID_VOXEL_UU sites stay correct unchanged. Cover is that
+// same trick with a scale of 1/2 instead of 2^L. Nothing about the traversal,
+// the descriptor decode, the occupancy read or the palette read changes -- a
+// cover chunk IS a canonical 32^3 brick chunk (voxelcore/covervolume.h says so:
+// kCoverChunkEdgeCells == kMarchChunkEdgeVoxels) and it is packed by the SAME
+// vxc::packChunkBricksCanonical the terrain path is packed by.
+//
+// 7, NOT 6. Six ring levels exist (VOXEL_MARCH_MAX_RINGS), so 6 is the next
+// ring and must stay free. 7 is the largest value that fits BOTH the chunk
+// record's four-bit LevelAndFlags[0:3] and the VisBuffer's three-bit level
+// field, which is what lets a cover hit travel from the march kernel to the
+// emit pixel shader with no new packing.
+#define VOXEL_MARCH_COVER_LEVEL 7
+
+#ifndef VOXEL_MARCH_COVER
+#define VOXEL_MARCH_COVER 0
+#endif
+
+// THE COVER WALK'S SKIPPING IS ITS OWN DIAL, AND IT DEFAULTS TO FLAT.
+//
+// Not VOXEL_MARCH_SKIP_LEVELS, but NOT for the reason this comment used to
+// give. It cited a budget sweep "PASS -> 3.80x -> 32.25x" as evidence that the
+// hierarchy misses real content the flat walk finds. THAT FINDING WAS RETRACTED
+// THE SAME DAY (see the 2026-08-21 retraction in
+// docs/measurements/armA-drawpath-ceiling-2026-08-19.txt): the progression was
+// built by picking one stats print per leg, and the SAME leg at the SAME budget
+// reads FAIL 32.25x and PASS 1.34x fifty seconds apart. The gate verdict is not
+// reproducible print-to-print; only the ratio is.
+//
+// Independently falsified since: at a pose where the marcher rendered an empty
+// frame, the flat walk (SkipLevels 0) produced an image identical to the
+// hierarchical one to within TSR noise -- max channel delta 4 -- at ten times
+// the march cost. The hierarchy was never losing the geometry.
+//
+// The real reason to keep cover's dial separate is simply that cover is a
+// different population -- a thin shell of 5 cm shells, not a solid heightfield
+// -- and deserves its own number rather than inheriting terrain's.
+//
+// Cover is a 64 m near-field segment. The skip ratio buys little over 64 m and
+// correctness buys everything, so the default is the walk with no open defect.
+// Raise it deliberately, on its own, once the directional skip defect is closed
+// -- and then it is a measurement of the hierarchy over COVER, which is a
+// different population from terrain (a thin shell of 5 cm shells, not a solid
+// heightfield) and deserves its own number rather than inheriting terrain's.
+#ifndef VOXEL_MARCH_COVER_SKIP
+#define VOXEL_MARCH_COVER_SKIP 0
+#endif
+
+// The voxel edge, in UU, at a level. The ring cascade IS the LOD pyramid
+// (brick-volume-format.md section 5): level L is 2^L times coarser, and this is
+// the only place that relationship is written down on the traversal side.
+//
+// THE COVER LEVEL IS THE ONE EXCEPTION AND IT IS FINER, NOT COARSER. 1 << 7
+// would answer 128x, which is not merely wrong but wrong in the direction that
+// looks like distant terrain, so it is intercepted here -- in the one function
+// that owns the level-to-size relationship -- rather than at each call site.
+float VoxelMarchVoxelSizeUU(int Level)
+{
+	if (Level == VOXEL_MARCH_COVER_LEVEL)
+	{
+		return VOXEL_FLUID_VOXEL_UU * 0.5f;
+	}
+	return VOXEL_FLUID_VOXEL_UU * float(1 << Level);
+}
+
+// The cone rule. Returns the level this ray should be sampling at, at distance
+// TUU along it. Monotonic in TUU by construction, which is what lets the
+// traversal test it once per brick rather than once per voxel.
+//
+// ConeSlopeUU is dimensionless: world-space pixel half-width per unit of
+// distance along the ray. The host computes it; see the .cpp.
+int VoxelMarchLevelForCone(float TUU, float ConeSlopeUU)
+{
+	const float WantSizeUU = VOXEL_MARCH_CONE_VOXELS_PER_PIXEL * (TUU * ConeSlopeUU);
+	int Level = 0;
+	// A loop and not a log2: VOXEL_MARCH_LEVEL_COUNT is 1 or 6, the compiler
+	// unrolls it, and an exact comparison against the same expression the
+	// renderer uses elsewhere beats a float log that has to be floor'd and then
+	// corrected at the boundary anyway.
+	[unroll]
+	for (int L = 1; L < VOXEL_MARCH_LEVEL_COUNT; ++L)
+	{
+		if (VoxelMarchVoxelSizeUU(Level) < WantSizeUU)
+		{
+			Level = L;
+		}
+	}
+	return Level;
+}
+
+// THE PER-VOXEL TINT FADE, and it is not cosmetic.
+//
+// VoxelMaterialColor's invariant 3 gives every voxel its own lightness/hue
+// jitter. At one voxel per pixel that reads as material texture; at a third of
+// a pixel per voxel it is white noise, and TSR's 32-sample history turns white
+// noise into BOILING -- the far field shimmers as the camera creeps.
+//
+// So the tint is faded out as the voxel shrinks toward the cone. Returns 1 when
+// a voxel is comfortably larger than the pixel footprint and 0 when it is at or
+// below it. Plan section 5: "fade it as voxelSize/coneRadius -> 1".
+//
+// smoothstep and not a step, because a hard cutoff puts a visible ring in the
+// terrain at whatever distance the ratio crosses -- the exact artefact class
+// the ring skirts existed to hide.
+float VoxelMarchTintFade(float VoxelSizeUU, float TUU, float ConeSlopeUU)
+{
+	const float ConeRadiusUU = max(TUU * ConeSlopeUU, 1e-6f);
+	const float Ratio = VoxelSizeUU / ConeRadiusUU;
+	// Full tint at >= 3 voxel-widths per pixel footprint, none at <= 1.
+	return smoothstep(1.0f, 3.0f, Ratio);
+}
+
+// ---------------------------------------------------------------------------
+// What a march returns
+// ---------------------------------------------------------------------------
+
+struct FVoxelMarchHit
+{
+	bool  bHit;          // terminated on a solid voxel inside the segment
+	bool  bStartedInside;// the ray origin was already inside solid (or unbuilt)
+	bool  bExhausted;    // step budget spent with segment remaining
+
+	int3  Voxel;         // the solid voxel entered, in LEVEL-`Level` voxel coords
+	int   FaceAxis;      // 0/1/2 -- THE GEOMETRIC NORMAL, free, exact (ADR-0008)
+	int   FaceSign;      // +1 == entered moving in +axis, i.e. through the -face
+
+	float THitUU;        // distance along the ray, in UU, of the crossing.
+	                     // THE FLOAT t. Depth and velocity are both reconstructed
+	                     // from THIS, never from an encoded depth -- plan section
+	                     // 5 item 2, and the reason is that a reconstruction from
+	                     // a 24-bit reverse-Z buffer quantises worse than the
+	                     // velocity vectors it would feed.
+	float3 HitPosLocalUU;// the crossing point, in the source's local UU frame
+
+	uint  Material;      // vxc::Material of the voxel hit
+	int   Level;         // ring level actually sampled (cone rule)
+	float VoxelSizeUU;   // = VoxelMarchVoxelSizeUU(Level), carried so callers do
+	                     // not recompute it and cannot disagree about it
+
+	// The eight neighbours of the hit FACE, as an 8-bit occupancy mask, in the
+	// order the AO evaluator below expects. Filled by the traversal because that
+	// is where the bits are cheapest -- under source 1 they are already in
+	// registers from the brick's 16 occupancy dwords; under source 0 they cost
+	// eight bit reads. See VoxelMarchCornerAO.
+	uint  FaceNeighbourMask;
+
+	int   Steps;         // voxel advances, for the census and the cost model
+
+	// ---- where the HIERARCHY stopped, and why -----------------------------
+	//
+	// ONLY MEANINGFUL ON A MISS, AND THAT IS THE POINT. The source comparator's
+	// dump prints both walks' voxels and the brick each belongs to -- which
+	// separates a stepping error from an aliasing one, and is exactly what
+	// resolved `gained`. It is BLIND to `lost`: when the hierarchy misses there
+	// is no hit voxel, so Voxel stays zero-initialised and the brick comparison
+	// compares against chunk (0,0,0).
+	//
+	// So a miss now records where it ended. Without these three fields, "never
+	// entered the brick" and "entered and stopped short" and "ran out of budget
+	// before arriving" are indistinguishable -- and the third is a possibility
+	// neither reading of `lost` had named.
+	int   TermReason;      // VOXEL_MARCH_TERM_*
+	int3  LastChunkCoord;  // the last chunk the walk resolved
+	int   LastBrickIndex;  // ... and the last brick CONSIDERED, -1 if none
+
+	// ---- and whether it actually DESCENDED, which is a different question --
+	//
+	// LastBrickIndex is set at the top of the brick loop, before any test, so it
+	// names a brick the walk LOOKED AT. It does not say the fine walk ran there.
+	// The r6 dump showed lastChunk and lastBrick matching the flat walk's hit
+	// exactly -- so "it skipped at a coarse level" was already excluded and the
+	// question moved inside one brick, where nothing was recorded.
+	//
+	// These three answer it:
+	//   LastFineBrickIndex != the hit's brick   the fine walk never ran there
+	//   LastFineEntryT     >  the flat hit t    it ran, but the ray had already
+	//                                           been advanced past the hit
+	//   LastFineEntryT     <  the flat hit t    it ran from before the hit and
+	//                                           the inner DDA missed it
+	float LastFineEntryT;
+	int   LastFineBrickIndex;
+	int   FineWalks;
+
+	// WHICH BRICKS WERE ACTUALLY DESCENDED INTO, as a 64-bit mask over the LAST
+	// chunk walked, with that chunk's coordinate beside it.
+	//
+	// LastFineBrickIndex records the LAST descent, not whether a given brick was
+	// EVER descended into -- so a ray that entered the hit's brick, missed, and
+	// then descended into a later one is indistinguishable from one that never
+	// entered it at all. That made `neverDescended = 47 of 54` an UPPER BOUND
+	// rather than a measurement, and it could not separate "skipped past" from
+	// "descended and missed". This can.
+	// WHICH RINGS THIS RAY ENTERED, one bit per level. Recorded by the ring loop
+	// because that is the only place the interval test happens -- a comparator
+	// recomputing "did it enter ring N" would be a second authority for one
+	// decision, which is doctrine 5 and is how "zero at L1" spent four rounds
+	// being ambiguous. entered==0 means the ray never got there; entered set
+	// with no hit means it got there and found nothing. Different findings.
+	uint RingsEntered;
+	uint2 FineBrickMask;
+	int3  FineMaskChunk;
+
+	// ---- OPPORTUNITY COUNTS, so a defect can be normalised ----------------
+	//
+	// Six independent worlds gave a disagreement range of 695x (15 .. 10,428).
+	// A COUNT cannot certify anything against that, because it mixes "how often
+	// the defect fires" with "how much defect-triggering geometry this world
+	// happens to contain" -- and only the first is a property of the code.
+	//
+	// The fix is to divide by the OPPORTUNITY, not by the ray count. Normalising
+	// by rays does not help: the variance is in defect DENSITY, not in population
+	// size, so per-ray and per-million-rays swing together.
+	//
+	//   BrickEntries  every brick the hierarchy considered. A general, mechanism-
+	//                 agnostic denominator.
+	//   ThinClips     bricks whose span along the ray is under the advance nudge
+	//                 -- the exact configuration the corner-clip mechanism says
+	//                 gets jumped. A targeted denominator, and a direct test of
+	//                 that hypothesis: if it is right, lost/ThinClips is near
+	//                 constant across worlds and goes to zero on a fix while
+	//                 ThinClips itself does not move.
+	//
+	// Accumulated per ray and pushed with ONE atomic each by the comparator --
+	// an atomic per brick entry would be ~13M per frame.
+	int BrickEntries;
+	int ThinClips;
+};
+
+#define VOXEL_MARCH_TERM_HIT        0u  // not a miss
+#define VOXEL_MARCH_TERM_SEGMENT    1u  // walked the whole segment, found nothing
+#define VOXEL_MARCH_TERM_BUDGET     2u  // step budget spent with segment left
+#define VOXEL_MARCH_TERM_CHUNK_CAP  3u  // outer loop iteration cap -- should be unreachable
+
+// ---------------------------------------------------------------------------
+// CORNER AMBIENT OCCLUSION -- 20 ALU, zero extra memory under source 1
+// ---------------------------------------------------------------------------
+//
+// This is the one piece of shading a marcher gets for free that a mesher pays
+// for. The mesher bakes AO per vertex at mesh time, which is why it needs a
+// one-brick apron (docs/brick-volume-format.md section 8) and why a greedy quad
+// spanning 8x8 voxels can only carry four AO values across sixty-four voxels.
+// The marcher knows the exact voxel and the exact face, so it can ask the eight
+// neighbours in that face's plane directly.
+//
+// THE LAYOUT. Given the hit face's axis, call the two in-plane axes U and V.
+// The eight neighbours of the face, in (u, v) offsets, are indexed:
+//
+//        bit 0 (-1,-1)   bit 1 ( 0,-1)   bit 2 (+1,-1)
+//        bit 3 (-1, 0)                   bit 4 (+1, 0)
+//        bit 5 (-1,+1)   bit 6 ( 0,+1)   bit 7 (+1,+1)
+//
+// all sampled ONE STEP OUT along the face normal (i.e. in the air cell in front
+// of the face, not inside the solid). Occluders behind the face cannot shadow
+// it; occluders in front can.
+//
+// THE VERTEX RULE is the standard one and it is standard because it is right:
+// a face corner's occlusion is decided by its two edge neighbours and its
+// diagonal, and when BOTH edges are solid the diagonal is irrelevant (the
+// corner is already sealed). Getting that last clause wrong produces the
+// classic "AO leaks through a sealed inside corner" artefact.
+//
+//     side1 && side2  ->  0     (fully occluded, diagonal not even read)
+//     otherwise       ->  3 - (side1 + side2 + diagonal)
+//
+// scaled to [0,1] by /3. Then bilinear across the face from the hit point's
+// fractional position, which is why THitUU has to be exact.
+uint VoxelMarchAOBit(uint Mask, uint Bit)
+{
+	return (Mask >> Bit) & 1u;
+}
+
+float VoxelMarchCornerValue(uint Side1, uint Side2, uint Diagonal)
+{
+	// The sealed-corner clause. `Side1 & Side2` and not `+`: two solids seal the
+	// corner regardless of what the diagonal says, and averaging three bits here
+	// instead would let a 2/3 leak through every inside corner in the world.
+	if ((Side1 & Side2) != 0u)
+	{
+		return 0.0f;
+	}
+	return float(3u - (Side1 + Side2 + Diagonal)) * (1.0f / 3.0f);
+}
+
+// `FaceUV` is the hit point's position within the face, both components in
+// [0,1], with u along the first in-plane axis and v along the second -- the
+// same U/V the mask above is indexed in.
+float VoxelMarchCornerAO(uint Mask, float2 FaceUV)
+{
+	const uint N00 = VoxelMarchAOBit(Mask, 0); // (-1,-1)
+	const uint N10 = VoxelMarchAOBit(Mask, 1); // ( 0,-1)
+	const uint N20 = VoxelMarchAOBit(Mask, 2); // (+1,-1)
+	const uint N01 = VoxelMarchAOBit(Mask, 3); // (-1, 0)
+	const uint N21 = VoxelMarchAOBit(Mask, 4); // (+1, 0)
+	const uint N02 = VoxelMarchAOBit(Mask, 5); // (-1,+1)
+	const uint N12 = VoxelMarchAOBit(Mask, 6); // ( 0,+1)
+	const uint N22 = VoxelMarchAOBit(Mask, 7); // (+1,+1)
+
+	const float A00 = VoxelMarchCornerValue(N01, N10, N00); // u-, v-
+	const float A10 = VoxelMarchCornerValue(N21, N10, N20); // u+, v-
+	const float A01 = VoxelMarchCornerValue(N01, N12, N02); // u-, v+
+	const float A11 = VoxelMarchCornerValue(N21, N12, N22); // u+, v+
+
+	return lerp(lerp(A00, A10, FaceUV.x), lerp(A01, A11, FaceUV.x), FaceUV.y);
+}
+
+// The two in-plane axes of a face, in a FIXED order, so the mask the traversal
+// writes and the UV the shader computes cannot disagree. (axis 0 -> (1,2),
+// axis 1 -> (2,0), axis 2 -> (0,1) -- the right-handed cycle, so the pair is
+// oriented consistently and the bilinear does not flip on one axis.)
+void VoxelMarchFaceAxes(int FaceAxis, out int OutU, out int OutV)
+{
+	OutU = (FaceAxis + 1) % 3;
+	OutV = (FaceAxis + 2) % 3;
+}
+
+// ---------------------------------------------------------------------------
+// SOURCE 0: the fluid occupancy volume
+// ---------------------------------------------------------------------------
+#if VOXEL_MARCH_HAS_OCCUPANCY
+
+// Gather the eight in-plane neighbours of a face, one step out along the
+// normal. Eight bit reads on this source, because a flat bitfield has no
+// locality guarantee we can exploit; under source 1 these are eight bit TESTS
+// against the brick's 16 occupancy dwords, which are already in registers from
+// the traversal itself. The interface is identical either way, which is the
+// whole point of it being an interface.
+uint VoxelMarchGatherFaceNeighbours(int3 Voxel, int FaceAxis, int FaceSign)
+{
+	int U, V;
+	VoxelMarchFaceAxes(FaceAxis, U, V);
+
+	// One step out along the normal: the ray entered moving in +FaceSign, so
+	// the AIR side of the crossed face is at -FaceSign.
+	int3 Out = int3(0, 0, 0);
+	if (FaceAxis == 0) { Out.x = -FaceSign; }
+	else if (FaceAxis == 1) { Out.y = -FaceSign; }
+	else { Out.z = -FaceSign; }
+
+	int3 StepU = int3(0, 0, 0);
+	int3 StepV = int3(0, 0, 0);
+	if (U == 0) { StepU.x = 1; } else if (U == 1) { StepU.y = 1; } else { StepU.z = 1; }
+	if (V == 0) { StepV.x = 1; } else if (V == 1) { StepV.y = 1; } else { StepV.z = 1; }
+
+	const int3 Base = Voxel + Out;
+	uint Mask = 0u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base - StepU - StepV)) << 0u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base         - StepV)) << 1u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base + StepU - StepV)) << 2u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base - StepU        )) << 3u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base + StepU        )) << 4u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base - StepU + StepV)) << 5u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base         + StepV)) << 6u;
+	Mask |= uint(VoxelFluidSolidAtVoxel(Base + StepU + StepV)) << 7u;
+	return Mask;
+}
+
+// THE TRAVERSAL.
+//
+// One level, so the cone rule cannot change the grid being walked -- but it is
+// still EVALUATED and still reported, because the tint fade and the emit's
+// roughness both consume it, and because a level that is computed on the arm
+// nobody looks at is a level that is wrong on the arm everybody does.
+//
+// Amanatides & Woo comes from VoxelFluidCollision.ush, which mirrors
+// voxelcore/raycast.h line for line and is cross-checked against it by
+// tests/test_fluidoccupancy.cpp. This function does NOT reimplement it. That is
+// deliberate and it is the same rule VoxelMarchSpike.usf followed: the one DDA
+// in this repo that is unit-tested is the one that runs.
+FVoxelMarchHit VoxelMarchTraverseOccupancy(float3 OriginLocalUU, float3 DirWorld,
+                                           float TMinUU, float TMaxUU, float ConeSlopeUU)
+{
+	FVoxelMarchHit H = (FVoxelMarchHit)0;
+	H.FaceAxis = -1;
+	H.Level = 0;
+	H.VoxelSizeUU = VoxelMarchVoxelSizeUU(0);
+	H.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const float3 Entry = OriginLocalUU + DirWorld * TMinUU;
+	const float3 Exit  = OriginLocalUU + DirWorld * TMaxUU;
+
+	const FVoxelFluidWalkHit W = VoxelFluidWalkVoxelLine(Entry, Exit);
+
+	H.bHit = W.Hit;
+	H.bStartedInside = W.StartedInside;
+	H.bExhausted = W.BudgetExhausted;
+	H.Voxel = W.Voxel;
+	H.FaceAxis = W.FaceAxis;
+	H.FaceSign = W.FaceSign;
+
+	// THE FLOAT t, RECONSTRUCTED IN THE RAY'S OWN PARAMETER AND NOT THE WALK'S.
+	// W.TEnter is a fraction of the Entry->Exit SEGMENT; everything downstream
+	// -- depth, velocity, the cone -- wants a distance in UU from the ray
+	// origin. Converting here, once, is what stops three consumers each doing
+	// it slightly differently.
+	H.THitUU = TMinUU + (TMaxUU - TMinUU) * W.TEnter;
+	H.HitPosLocalUU = OriginLocalUU + DirWorld * H.THitUU;
+
+	// Evaluated at the HIT distance, not at the segment start: the cone widens
+	// along the ray and the level that matters is the one where the surface is.
+	H.Level = VoxelMarchLevelForCone(H.THitUU, ConeSlopeUU);
+	H.VoxelSizeUU = VoxelMarchVoxelSizeUU(H.Level);
+
+	// Steps, derived from the walk's own output exactly as the spike does it,
+	// so VoxelFluidCollision.ush stays free of a field that exists only for a
+	// measurement.
+	const float3 SubEntry = Entry;
+	const float3 SubExit = Exit;
+	const int3 V0 = (int3)floor(SubEntry / VOXEL_FLUID_VOXEL_UU);
+	const int3 V1 = W.Hit ? (W.Voxel - FluidVolumeOriginVoxel)
+	                      : (int3)floor(SubExit / VOXEL_FLUID_VOXEL_UU);
+	const int3 D = abs(V1 - V0);
+	H.Steps = D.x + D.y + D.z;
+
+	if (H.bHit)
+	{
+		H.FaceNeighbourMask = VoxelMarchGatherFaceNeighbours(H.Voxel, H.FaceAxis, H.FaceSign);
+	}
+	return H;
+}
+
+#endif // VOXEL_MARCH_HAS_OCCUPANCY
+
+// ---------------------------------------------------------------------------
+// The hit point's position WITHIN its face, in [0,1]^2, in the (U,V) order
+// VoxelMarchFaceAxes fixes. Shared by both sources -- it is arithmetic on the
+// hit, not a property of the volume.
+//
+// The subtraction is done in VOXEL units and then frac'd, rather than in UU and
+// divided, because at 4 km a UU coordinate has already lost the fractional part
+// this needs. (Same argument VoxelPalettePack makes about doing its arithmetic
+// chunk-locally.)
+// ---------------------------------------------------------------------------
+float2 VoxelMarchFaceUV(FVoxelMarchHit H)
+{
+	int U, V;
+	VoxelMarchFaceAxes(H.FaceAxis, U, V);
+	const float3 InVoxels = H.HitPosLocalUU / H.VoxelSizeUU;
+	const float3 F = frac(InVoxels);
+	const float FU = (U == 0) ? F.x : ((U == 1) ? F.y : F.z);
+	const float FV = (V == 0) ? F.x : ((V == 1) ? F.y : F.z);
+	return float2(FU, FV);
+}
+
+// The world-space geometric normal. EXACT, and free: the DDA already told us
+// which face it crossed, so this is three selects and a negate and there is no
+// derivative, no interpolant, and no normal map anywhere in this renderer.
+//
+// A ray entering with FaceSign +1 crossed the voxel's -axis face, so the
+// outward normal points in -FaceSign.
+float3 VoxelMarchFaceNormal(FVoxelMarchHit H)
+{
+	const float S = -float(H.FaceSign);
+	return float3(H.FaceAxis == 0 ? S : 0.0f,
+	              H.FaceAxis == 1 ? S : 0.0f,
+	              H.FaceAxis == 2 ? S : 0.0f);
+}
+
+// vxc::FaceClass from the crossed face. Mirrors VoxelPaletteFaceClass in
+// VoxelMaterialPalette.ush term for term -- only a Z face can be top or bottom
+// -- and it MUST agree with it, because the raster path and the marcher have to
+// pick the same palette row for the same voxel or the A/B is meaningless.
+uint VoxelMarchFaceClass(FVoxelMarchHit H)
+{
+	if (H.FaceAxis != 2)
+	{
+		return VOXEL_FACE_SIDE;
+	}
+	// Outward normal points +z (a top) when the ray entered moving in -z.
+	return (H.FaceSign < 0) ? VOXEL_FACE_TOP : VOXEL_FACE_BOTTOM;
+}
+
+// ---------------------------------------------------------------------------
+// SOURCE 1: the resident brick pool
+// ---------------------------------------------------------------------------
+//
+// P3-B1. LEVEL 0 ONLY: no cone LOD, no ring transitions, no mip pyramid, and no
+// empty-space skipping beyond the L1 brick-mask test that costs nothing. That
+// scope is deliberate -- it forces the one unavoidable unknown (the GPU chunk
+// index) and delivers the first real per-voxel material, while excluding the
+// two places correctness risk actually lives.
+//
+// THE DELIVERABLE IS ONE NUMBER: marchMs against the 5.06-5.21 ms cluster the
+// occupancy source produced at the same pose and budget. That difference is the
+// per-step cost of five indirections, and every projection in the plan is
+// downstream of it. `0.13 + steps * 5.9 us` was measured on a 1-bit flat volume
+// and does not survive this; it is dead until re-measured here.
+//
+// ===========================================================================
+// WHY THIS FILE CONTAINS A SECOND DDA, WHICH IS NORMALLY A MISTAKE
+// ===========================================================================
+//
+// VoxelFluidWalkVoxelLine is the one Amanatides & Woo walk in this repo that is
+// unit-tested -- it mirrors voxelcore/raycast.h line for line and
+// tests/test_fluidoccupancy.cpp cross-checks the two on real geometry. The
+// occupancy source calls it and does not reimplement it, on purpose.
+//
+// It cannot be reused here. Its solidity test is a direct call to
+// VoxelFluidSolidAtVoxel, which reads a flat bitfield; there is no hook to swap
+// in a five-indirection lookup, and adding one would mean editing the fluid
+// contract file that the solver, the collision tests and the CPU mirror all
+// depend on. That is a worse trade than a second walk.
+//
+// So the walk below is a STRUCTURAL MIRROR of VoxelFluidWalkVoxelLine: same
+// initialisation, same tie rule (lowest axis first, raycast.h:74-80), same
+// segment-exhausted test, same budget semantics, same started-inside handling,
+// same plain-array-not-vector trick for the axis-indexed state. Only the
+// solidity call differs.
+//
+// AND THE THING THAT MAKES THAT ACCEPTABLE IS THE INSTRUMENT, NOT THE CARE.
+// voxel.March.VerifySource marches BOTH sources over the SAME rays in the SAME
+// frame and compares (hit, voxel, t) per pixel inside the 51.2 m window where
+// the occupancy volume has an opinion. A mirrored walk that has drifted shows
+// up there as a disagreement, on real geometry, every frame it is enabled. That
+// gate was pre-registered before this code was written, which is the only order
+// in which it means anything.
+//
+// ===========================================================================
+// THE FIVE INDIRECTIONS, AND WHICH OF THEM ARE FREE
+// ===========================================================================
+//
+//   1. chunk index      worldVoxel >> 5 -> a dword. Cached across the whole
+//                       chunk, so it is one load per 32 voxels of travel.
+//   2. chunk record     32 B at the slot. Cached with the chunk.
+//   3. L1 brick mask    A BIT TEST against a register already loaded with the
+//                       record. FREE, and it rejects an empty brick with no
+//                       memory traffic at all -- format section 5's whole point.
+//   4. brick descriptor 8 B. Cached across the brick, so one load per 8 voxels.
+//                       A uniform-AIR brick short-circuits here with no further
+//                       fetch; a uniform-SOLID brick hits immediately and its
+//                       material is IN the descriptor.
+//   5. occupancy dword  one load per voxel tested.
+//
+// 3 and 4's short circuits pull the cost DOWN relative to the flat volume; 1, 2
+// and 5 push it up. The net is the number this phase exists to produce.
+//
+// ONE DELIBERATE DEVIATION FROM FORMAT SECTION 3, STATED SO IT IS NOT MISTAKEN
+// FOR AN OVERSIGHT. The format's design is "one 64 B occupancy load per entered
+// mixed brick, then up to 22 DDA steps against registers with zero further
+// memory traffic." This loads ONE DWORD PER VOXEL TESTED instead. The reason is
+// that 16 dwords held across a loop are indexed dynamically by cellIndex >> 5,
+// and DXC spills a dynamically indexed array to scratch memory -- which is
+// slower than the loads it was meant to replace. The register-resident form
+// pays off when a brick is traversed many times in a row, which is what the
+// hierarchical walk in P3-B2 produces and what this step deliberately does not
+// build. Revisit it there, with the thing that makes it worth having.
+//
+// ===========================================================================
+// THE INDEX IS A HINT. THE RECORD IS AUTHORITATIVE.
+// ===========================================================================
+//
+// Every 32 B record carries its own OriginVoxel and ring level, in the cache
+// line the lookup already fetched. This traversal CHECKS them against the chunk
+// it asked for, and treats a mismatch as "not resident".
+//
+// That check is what makes a stale index a MISS rather than a WRONG CHUNK -- one
+// chunk's bricks drawn at another chunk's coordinates, which renders as terrain
+// and not as an error. It costs two comparisons on data already in registers.
+//
+// It matters more than it looks: FVoxelBrickPool::GetEvictions() is zero today
+// only because nothing calls RemoveChunk, so the index delta's Removed list is
+// always empty and a consumer that never implemented removal would pass every
+// test that currently exists. This check is what holds when that changes.
+
+#if VOXEL_MARCH_HAS_BRICKPOOL
+
+// ---- the pool's arenas, names from VOXEL_BRICK_POOL_PARAMETERS() ----------
+//
+// STRUCTURED, NOT TYPED, and the descriptors are uint2. A typed view over a
+// structured buffer binds without complaint and then reads plausible nonsense;
+// the pool's own writer reads descriptors as uint2 and the pairing of
+// OccWord/MatWord is what makes a descriptor one thing.
+StructuredBuffer<uint2> VoxelBrickDesc;
+StructuredBuffer<uint>  VoxelBrickOcc;
+StructuredBuffer<uint>  VoxelBrickMat;
+StructuredBuffer<uint>  VoxelBrickChunkTable;
+uint VoxelBrickDescSlots;
+uint VoxelBrickOccWords;
+uint VoxelBrickMatWords;
+uint VoxelBrickChunkSlots;
+uint VoxelBrickChunkRecordDwords;   // from FVoxelBrickPool::kChunkRecordDwords
+
+// ---- the chunk index (VoxelMarchChunkIndex.h) -----------------------------
+Buffer<uint> MarchChunkIndex;
+uint3 MarchIndexDimChunks;   // powers of two; the wrap is a mask
+// The local frame's origin, in LEVEL-0 voxel coordinates. Mirrors
+// FluidVolumeOriginVoxel exactly: local UU is camera-relative and bounded by
+// the ring, so it stays exact in float, and one integer add recovers the world
+// voxel. A world-voxel float at planet scale is quantised coarser than a voxel
+// long before it gets here.
+int3 MarchBrickOriginVoxel;
+// Cells per level in the index. The grid is kLevels deep, contiguous, so a
+// level-L cell is at L * this + the wrapped xyz. One uniform rather than
+// recomputing DimX*DimY*DimZ at every lookup.
+uint MarchIndexCellsPerLevel;
+// Ring segments as plain t intervals in UU, near to far. The ray starts at the
+// camera with a normalised direction, so distance from the camera to P(t) IS t
+// and a ring is an interval -- no cone rule is needed to SELECT the level
+// because residency already decides it (only level-L chunks exist in ring L).
+uint  MarchRingCount;
+// Ring 0's outer radius in UU. EVERY OTHER BOUND IS DERIVED FROM IT, because
+// the cascade is geometric by construction: ring L covers [R0 * 2^(L-1),
+// R0 * 2^L) and ring 0 covers [0, R0). That is exactly kDefaultRingPresets --
+// 0-128, 128-256, 256-512, 512-1024, 1024-2048, 2048-4096 m.
+//
+// CLOSED FORM RATHER THAN AN ARRAY OF EIGHT FLOATS, and the reason is the one
+// this file keeps relearning: eight uploaded bounds are eight chances for the
+// shader's idea of a ring to drift from the CPU's. One number cannot disagree
+// with itself. The ring-discordant classifier and the frame reach read the same
+// derivation, so all three are the same authority.
+float MarchRing0OuterUU;
+// The CAMERA's voxel, level 0. The vis pack is relative to THIS at the hit's own
+// level when the cascade is on -- see VoxelMarchPackVis for why the frame origin
+// stops working at six rings.
+int3 MarchPackOriginVoxel;
+
+// ---- PHASE 6: ground cover ------------------------------------------------
+//
+// Which slot of the index grid holds cover chunks. The host owns the mapping
+// (FVoxelMarchChunkIndex::GridSlotForLevel) because how many ring grids sit in
+// front of it is a host sizing decision; a literal here is how the two halves
+// of an index drift apart.
+uint MarchCoverIndexGrid;
+// How far cover is marched, in UU. ZERO IS A LEGAL VALUE AND MEANS OFF -- the
+// cover segment is then empty and the overlay costs one compare. Bounded on the
+// host against the cover index grid's own aliasing proof, so a leg cannot ask
+// for a reach the grid cannot address.
+float MarchCoverReachUU;
+
+// Ring L's t interval, in UU. Both halves derived from the single radius above.
+float VoxelMarchRingInnerUU(uint L)
+{
+	return (L == 0u) ? 0.0f : (MarchRing0OuterUU * float(1u << (L - 1u)));
+}
+float VoxelMarchRingOuterUU(uint L)
+{
+	return MarchRing0OuterUU * float(1u << L);
+}
+
+// ===========================================================================
+// THE LEVEL CONTEXT, AND WHY IT IS A MUTABLE STATIC
+// ===========================================================================
+//
+// The walk is written in "local UU with VOXEL_FLUID_VOXEL_UU per voxel and
+// MarchBrickOriginVoxel as the world offset". Making it multi-level the obvious
+// way means threading a level through ten functions and thirty-eight sites, and
+// every one of those is a chance to thread it wrong somewhere that still
+// compiles.
+//
+// INSTEAD THE RAY IS RESCALED PER RING. For level L the caller divides the ray
+// origin and both t bounds by 2^L, so ONE LEVEL-L VOXEL MEASURES EXACTLY
+// VOXEL_FLUID_VOXEL_UU IN THE WALK'S UNITS and all twenty-four VOXEL_FLUID_
+// VOXEL_UU sites are correct unchanged. (The cone slope is a ratio -- radius/t
+// -- so it is scale-invariant and must NOT be divided; dividing it would
+// tighten the LOD by 2^L at every level.)
+//
+// That leaves exactly two things that genuinely differ per level: which index
+// grid to read, and the frame origin expressed in level-L voxels. Both are
+// carried here.
+//
+// THESE ARE PER-THREAD STATICS, AND NOTHING MAY WRITE THEM EXCEPT
+// VoxelMarchBeginLevel. A mutable global is a hidden authority and this file
+// spends eight doctrine entries on hidden authorities, so: one writer, named,
+// and the values are the level-0 defaults until it is called. With rings off
+// the defaults are what the walk has always used, which is what makes the
+// rings-off arm a bit-exact control rather than a nearly-identical one.
+static int3 GVoxelMarchOriginVoxelL = int3(0, 0, 0);
+static uint GVoxelMarchIndexLevel = 0u;
+static bool GVoxelMarchCtxSet = false;
+// WHICH SLOT OF THE INDEX GRID, AND WHICH LEVEL THE RECORD MUST CLAIM, are two
+// different numbers and conflating them is what pinned this file to level 0.
+//
+// The grid is a run of equal-sized sub-grids and a level-L chunk lives in slot
+// L -- for RING levels. The cover level is 7 and the grid does not carry eight
+// sub-grids (that would be 64 MiB to hold two populated ones), so cover lives
+// in the slot after the last ring. The host owns that mapping
+// (FVoxelMarchChunkIndex::GridSlotForLevel) and hands the slot in.
+static uint GVoxelMarchIndexGrid = 0u;
+// What LevelAndFlags[0:3] must read for the record to be OURS. This used to be
+// the literal 0 in VoxelMarchLookupChunk, which meant EVERY LEVEL-1 CHUNK WAS
+// REJECTED BY ITS OWN RECORD -- a second, independent cause of hitL1 = 0 sitting
+// underneath the comparator defect of 2026-08-21. See the check itself.
+static uint GVoxelMarchRecordLevel = 0u;
+
+void VoxelMarchBeginLevel(uint Level)
+{
+	GVoxelMarchIndexLevel = Level;
+	GVoxelMarchIndexGrid = Level;
+	GVoxelMarchRecordLevel = Level;
+	// EXACT BECAUSE THE FRAME ORIGIN IS SNAPPED TO 1024 LEVEL-0 VOXELS. A chunk
+	// at level L spans 32 * 2^L level-0 voxels; 1024 is that at L5, so >> L is
+	// an exact division at every level we can reach and the level-L grid stays
+	// chunk-aligned without a per-level fixup. An arithmetic shift is also the
+	// right floor for negative coordinates, which a divide is not.
+	GVoxelMarchOriginVoxelL = int3(MarchBrickOriginVoxel.x >> Level,
+	                               MarchBrickOriginVoxel.y >> Level,
+	                               MarchBrickOriginVoxel.z >> Level);
+	GVoxelMarchCtxSet = true;
+}
+
+// THE COVER CONTEXT. The same three things, at scale 1/2.
+//
+// The frame origin doubles rather than shifting right: one level-0 voxel is two
+// cover cells. It is EXACT for the same reason every ring's is -- the frame
+// origin is snapped to 1024 level-0 voxels, so in cover cells it is a multiple
+// of 2048 and therefore chunk-aligned (32 divides 2048) with no fixup.
+//
+// MarchCoverIndexGrid is a uniform and not a literal because the number of ring
+// grids in front of it is a host decision (FVoxelMarchChunkIndex::kRingGrids);
+// spelling it here as a constant is how the two halves of an index drift.
+void VoxelMarchBeginCover()
+{
+	GVoxelMarchIndexLevel = MarchCoverIndexGrid;
+	GVoxelMarchIndexGrid = MarchCoverIndexGrid;
+	GVoxelMarchRecordLevel = uint(VOXEL_MARCH_COVER_LEVEL);
+	GVoxelMarchOriginVoxelL = MarchBrickOriginVoxel * 2;
+	GVoxelMarchCtxSet = true;
+}
+
+// The origin every level-aware site reads. Level 0 until VoxelMarchBeginLevel
+// says otherwise, so the single-level paths are unchanged by construction.
+int3 VoxelMarchOriginVoxel()
+{
+	return GVoxelMarchCtxSet ? GVoxelMarchOriginVoxelL : MarchBrickOriginVoxel;
+}
+
+#define VOXEL_MARCH_INDEX_RESIDENT_BIT 0x80000000u
+#define VOXEL_MARCH_INDEX_ANYSOLID_BIT 0x40000000u
+#define VOXEL_MARCH_INDEX_SLOT_MASK    0x3FFFFFFFu
+
+#define VOXEL_MARCH_CHUNK_RECORD_DWORDS 16u
+#define VOXEL_MARCH_BRICKS_PER_CHUNK    64u
+
+// What one resident chunk looks like once looked up and validated.
+struct FVoxelMarchChunkCache
+{
+	int3 ChunkCoord;
+	bool bValid;        // resident AND the record agrees with the key
+	uint BrickBase;     // first descriptor slot
+	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
+
+	// WAVE 2. Per-chunk shading, record dwords 7..9. Read on every lookup
+	// because they sit in the same 64 B cache line as the traversal fields
+	// above -- that is why the record is 16 dwords and not 10.
+	uint ClimatePacked;      // [0:7] temperature u8, [8:15] precipitation u8
+	uint SurfaceGradPacked;  // [0:11] QY+2048, [12:23] QX+2048, scale 256
+	float SurfaceZRelUU;     // fitted plane at the chunk ORIGIN, relative to it
+};
+
+// AND WHAT IT LOOKS LIKE WHEN NOTHING IS THERE. An explicit constructor rather
+// than a zeroed struct, because chunk (0,0,0) is a legal coordinate and a
+// zero-initialised cache would claim to be a valid lookup of it.
+FVoxelMarchChunkCache VoxelMarchNoChunk()
+{
+	FVoxelMarchChunkCache C;
+	C.ChunkCoord = int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+	C.bValid = false;
+	C.BrickBase = 0u;
+	C.BrickSolid = uint2(0u, 0u);
+	// NEUTRAL, NOT ZERO, and the distinction matters for exactly one field: a
+	// zeroed SurfaceZRelUU would claim a real surface plane at the chunk's own
+	// origin, so an absent chunk would gate as though the ground were at z=0.
+	// -1e30 is kNoSurfaceGate -- "no gate" -- which is what "nothing here"
+	// should mean.
+	C.ClimatePacked = 128u | (128u << 8);
+	C.SurfaceGradPacked = 0u;
+	C.SurfaceZRelUU = -1.0e30f;
+	return C;
+}
+
+// (level-0 chunk coord) -> the dense toroidal cell. Two's complement makes
+// uint(x) & (dim-1) the correct modulo for negative coordinates, which is why
+// the dims are powers of two.
+uint VoxelMarchIndexCell(int3 ChunkCoord)
+{
+	const uint cx = uint(ChunkCoord.x) & (MarchIndexDimChunks.x - 1u);
+	const uint cy = uint(ChunkCoord.y) & (MarchIndexDimChunks.y - 1u);
+	const uint cz = uint(ChunkCoord.z) & (MarchIndexDimChunks.z - 1u);
+	// The grid-slot offset. Zero on every single-level path, so this is the same
+	// address it has always been until a ring loop or the cover overlay says
+	// otherwise. SLOT, not level: the cover level is 7 and the grid does not
+	// carry eight sub-grids.
+	return GVoxelMarchIndexGrid * MarchIndexCellsPerLevel +
+	       cx + MarchIndexDimChunks.x * (cy + MarchIndexDimChunks.y * cz);
+}
+
+FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
+{
+	FVoxelMarchChunkCache C = VoxelMarchNoChunk();
+
+	const uint Entry = MarchChunkIndex[VoxelMarchIndexCell(ChunkCoord)];
+	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
+	{
+		return C;
+	}
+	// anySolid clear means the chunk is resident and entirely air. Rejected
+	// here with no record fetch at all -- this is the cheapest possible skip and
+	// it is why the bit rides the index dword instead of the record.
+	if ((Entry & VOXEL_MARCH_INDEX_ANYSOLID_BIT) == 0u)
+	{
+		return C;
+	}
+
+	const uint Slot = Entry & VOXEL_MARCH_INDEX_SLOT_MASK;
+	// BOUNDS-CHECKED AGAINST THE CAPACITY THE POOL HANDED US. A corrupt index
+	// then reads as a missing chunk instead of somebody else's payload, which is
+	// the one failure on this path that looks like terrain.
+	if (Slot >= VoxelBrickChunkSlots)
+	{
+		return C;
+	}
+
+	// THE STRIDE CROSS-CHECK, AND IT IS DESIGNED TO EMPTY THE WORLD.
+	//
+	// This file carries VOXEL_MARCH_CHUNK_RECORD_DWORDS as a #define while the
+	// pool's C++ owns kChunkRecordDwords. Growing the record means moving both,
+	// and if only one moves EVERY lookup lands at the wrong offset -- which is
+	// not a crash and not a null: it reads a neighbouring record's fields and
+	// most of them survive the origin validation below often enough to draw
+	// SOMETHING. That is the worst available outcome, terrain in the wrong
+	// place with no error.
+	//
+	// It also catches the second stride failure, which is subtler: a pass that
+	// forgets to bind the parameter. An unbound loose uint reads 0, so without
+	// this test every lookup would collapse onto slot 0 and draw ONE CHUNK
+	// EVERYWHERE.
+	//
+	// Both become a completely empty world here -- unmissable, and impossible to
+	// mistake for terrain. One compare per lookup buys that.
+	if (VoxelBrickChunkRecordDwords != VOXEL_MARCH_CHUNK_RECORD_DWORDS)
+	{
+		return C;
+	}
+
+	const uint Base = Slot * VOXEL_MARCH_CHUNK_RECORD_DWORDS;
+	const int3 RecOrigin = int3(int(VoxelBrickChunkTable[Base + 0u]),
+	                            int(VoxelBrickChunkTable[Base + 1u]),
+	                            int(VoxelBrickChunkTable[Base + 2u]));
+	const uint LevelAndFlags = VoxelBrickChunkTable[Base + 3u];
+
+	// THE VALIDATION. The record's own OriginVoxel and ring level against what
+	// we asked for. A stale index becomes a miss here, never a wrong chunk.
+	// The level MASKS to four bits (it does not clamp) -- confirmed against
+	// BuildChunkRecord, which is the writer, not against the document.
+	//
+	// AGAINST THE LEVEL THE WALK IS AT, NOT AGAINST THE LITERAL 0. This test read
+	// `!= 0u` from P3-B1, when the traversal was level-0-only. It was never
+	// updated when VoxelMarchBeginLevel and the per-level index grid arrived, so
+	// EVERY LEVEL-1 CHUNK WAS REJECTED BY ITS OWN RECORD and read as air. That is
+	// a SECOND, INDEPENDENT cause of hitL1 = 0, underneath the comparator defect
+	// found on 2026-08-21 -- fixing the comparator alone would have left hitL1 at
+	// zero and looked like a ring-residency problem. It is also what the cover
+	// level (7) needs, so the two are one change rather than two.
+	//
+	// Rings OFF is byte-identical: GVoxelMarchRecordLevel is 0 there and this is
+	// the same comparison it always was.
+	const int3 WantOrigin = ChunkCoord * 32;
+	if (any(RecOrigin != WantOrigin) || (LevelAndFlags & 0xFu) != GVoxelMarchRecordLevel)
+	{
+		return C;
+	}
+	// bit 4 anySolid, bit 5 allSolid. Re-checked from the record because the
+	// index's copy is the hint and this one is the truth.
+	if ((LevelAndFlags & 0x10u) == 0u)
+	{
+		return C;
+	}
+
+	const uint BrickBase = VoxelBrickChunkTable[Base + 4u];
+	if (BrickBase + VOXEL_MARCH_BRICKS_PER_CHUNK > VoxelBrickDescSlots)
+	{
+		return C;
+	}
+
+	C.ChunkCoord = ChunkCoord;
+	C.bValid = true;
+	C.BrickBase = BrickBase;
+	C.BrickSolid = uint2(VoxelBrickChunkTable[Base + 5u], VoxelBrickChunkTable[Base + 6u]);
+	// Wave 2: the shading dwords, from the line this lookup has already paid for.
+	C.ClimatePacked     = VoxelBrickChunkTable[Base + 7u];
+	C.SurfaceGradPacked = VoxelBrickChunkTable[Base + 8u];
+	C.SurfaceZRelUU     = asfloat(VoxelBrickChunkTable[Base + 9u]);
+	return C;
+}
+
+// The fitted surface plane evaluated at a point INSIDE the chunk, in the chunk's
+// own frame -- the marcher's half of the quad path's bNearSurface test.
+//
+// TRANSCRIBED FROM VoxelQuadVertexFactory.ush:326-338, NOT re-derived. The 12+12
+// split, the 2048 bias and the 256 scale are that file's encoding; a second
+// derivation of the same plane is how two renderers come to disagree about where
+// the ground is. The integer form is used rather than its float test because the
+// record stores the packing as a uint, so `== 0` is exact.
+float VoxelMarchSurfaceZRelAt(FVoxelMarchChunkCache C, float2 LocalXYUU)
+{
+	if (C.SurfaceGradPacked == 0u)
+	{
+		return C.SurfaceZRelUU;   // flat plane, or no gradient data
+	}
+	const float DZDX = (float((C.SurfaceGradPacked >> 12u) & 0xFFFu) - 2048.0f) / 256.0f;
+	const float DZDY = (float( C.SurfaceGradPacked        & 0xFFFu) - 2048.0f) / 256.0f;
+	return C.SurfaceZRelUU + DZDX * LocalXYUU.x + DZDY * LocalXYUU.y;
+}
+
+// One brick's descriptor, decoded. Format section 2.
+struct FVoxelMarchBrickCache
+{
+	int  BrickIndex;    // -1 = nothing cached
+	uint Kind;          // 0 uniform AIR, 1 uniform SOLID, 2 MIXED
+	uint OccBase;       // dword offset into BrickOcc
+	uint MatBase;       // dword offset into BrickMat
+	uint BppCode;       // 0,1,2,4,8
+	uint UniformMat;    // valid when Kind == 1
+	bool bInBounds;
+};
+
+FVoxelMarchBrickCache VoxelMarchNoBrick()
+{
+	FVoxelMarchBrickCache B;
+	B.BrickIndex = -1;
+	B.Kind = 0u;
+	B.OccBase = 0u;
+	B.MatBase = 0u;
+	B.BppCode = 0u;
+	B.UniformMat = 0u;
+	B.bInBounds = false;
+	return B;
+}
+
+// bppCode is 4 bits holding one of 0,1,2,4,8 -- powers of two only, so no
+// payload entry straddles a dword (format section 2).
+FVoxelMarchBrickCache VoxelMarchLoadBrick(FVoxelMarchChunkCache Chunk, int BrickIndex)
+{
+	FVoxelMarchBrickCache B = VoxelMarchNoBrick();
+	B.BrickIndex = BrickIndex;
+
+	const uint2 D = VoxelBrickDesc[Chunk.BrickBase + uint(BrickIndex)];
+	B.Kind = (D.x >> 28u) & 0x3u;
+	B.OccBase = D.x & 0x0FFFFFFFu;
+	B.MatBase = D.y & 0x0FFFFFFFu;
+	B.BppCode = (D.y >> 28u) & 0xFu;
+	// A uniform SOLID brick carries its material in MatWord[0:7] and has NO
+	// payload at all -- eight bytes and nothing else, which is the whole reason
+	// the format is affordable and the direct analogue of Brick::tryCollapse.
+	B.UniformMat = D.y & 0xFFu;
+
+	// Bounds, again against the capacities the pool handed us.
+	B.bInBounds = (B.Kind != 2u) || ((B.OccBase + 16u) <= VoxelBrickOccWords);
+	return B;
+}
+
+// Cell index within a brick: x + 8*(y + 8*z) -- already canonical, identical in
+// Brick<8>::cellIndex and fluidBrickBitIndex. Do not introduce a second order.
+uint VoxelMarchCellIndex(int3 WorldVoxel)
+{
+	const uint cx = uint(WorldVoxel.x) & 7u;
+	const uint cy = uint(WorldVoxel.y) & 7u;
+	const uint cz = uint(WorldVoxel.z) & 7u;
+	return cx + 8u * (cy + 8u * cz);
+}
+
+// Brick index within a chunk: bx + 4*(by + 4*bz). Pinned by format section 6 --
+// a z-major producer would pass every per-brick test and fail only as a
+// transposed world.
+int VoxelMarchBrickIndex(int3 WorldVoxel)
+{
+	const uint bx = (uint(WorldVoxel.x) >> 3u) & 3u;
+	const uint by = (uint(WorldVoxel.y) >> 3u) & 3u;
+	const uint bz = (uint(WorldVoxel.z) >> 3u) & 3u;
+	return int(bx + 4u * (by + 4u * bz));
+}
+
+// The 16 x uint8 local palette, ascending by MaterialId, packed 4 per dword.
+uint VoxelMarchPaletteEntry(uint MatBase, uint Index)
+{
+	const uint Word = VoxelBrickMat[MatBase + (Index >> 2u)];
+	return (Word >> (8u * (Index & 3u))) & 0xFFu;
+}
+
+// The material of one SOLID cell in a MIXED brick.
+//
+// The payload holds one entry per SOLID voxel in scan order, so a cell's entry
+// index is the POPCOUNT OF OCCUPANCY BITS BELOW IT (format section 4). That is
+// up to 16 dwords read on a hit -- once per ray, never in the step loop.
+uint VoxelMarchMixedMaterial(FVoxelMarchBrickCache B, uint CellIndex)
+{
+	const uint Word = CellIndex >> 5u;
+	const uint Bit = CellIndex & 31u;
+
+	uint Rank = 0u;
+	[loop]
+	for (uint w = 0u; w < 16u; ++w)
+	{
+		if (w >= Word)
+		{
+			break;
+		}
+		Rank += countbits(VoxelBrickOcc[B.OccBase + w]);
+	}
+	// lint-shader-ub: allow VARIABLE_SHIFT - Bit is masked to 0..31 above, so the
+	// distance is provably below the 32-bit operand's width; Bit == 0 yields a
+	// zero mask, which is correct (no bits below the first cell).
+	Rank += countbits(VoxelBrickOcc[B.OccBase + Word] & ((1u << Bit) - 1u));
+
+	// bppCode 0: a MIXED brick whose solid voxels are all ONE material. Palette
+	// present, payload omitted entirely -- so there is nothing to index and the
+	// answer is palette entry 0.
+	if (B.BppCode == 0u)
+	{
+		return VoxelMarchPaletteEntry(B.MatBase, 0u);
+	}
+
+	// bppCode 8 means direct global ids and NO local palette, so the payload
+	// starts at MatBase. Everything else has the 16 B palette in front of it.
+	const uint PayloadBase = (B.BppCode == 8u) ? B.MatBase : (B.MatBase + 4u);
+	const uint BitOffset = Rank * B.BppCode;
+	const uint PayloadWord = PayloadBase + (BitOffset >> 5u);
+	if (PayloadWord >= VoxelBrickMatWords)
+	{
+		return VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+	}
+	// lint-shader-ub: allow VARIABLE_SHIFT - BitOffset & 31 is 0..31 by construction
+	const uint Shift = BitOffset & 31u;
+	const uint Code = (VoxelBrickMat[PayloadWord] >> Shift) & ((1u << B.BppCode) - 1u);
+	return (B.BppCode == 8u) ? Code : VoxelMarchPaletteEntry(B.MatBase, Code);
+}
+
+// THE SOLIDITY TEST, with the chunk and brick caches threaded through it.
+//
+// Caching is what makes the indirection affordable: the chunk lookup is one
+// load per 32 voxels of travel and the descriptor one per 8, because a DDA
+// walks a straight line and a straight line stays inside a chunk for a while.
+bool VoxelMarchBrickSolidAt(int3 WorldVoxel, inout FVoxelMarchChunkCache Chunk,
+                            inout FVoxelMarchBrickCache Brick, out uint OutMaterial)
+{
+	OutMaterial = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const int3 ChunkCoord = int3(WorldVoxel.x >> 5, WorldVoxel.y >> 5, WorldVoxel.z >> 5);
+	if (any(ChunkCoord != Chunk.ChunkCoord))
+	{
+		Chunk = VoxelMarchLookupChunk(ChunkCoord);
+		Brick = VoxelMarchNoBrick();
+	}
+	if (!Chunk.bValid)
+	{
+		// OUTSIDE THE RESIDENT SET IS AIR, and that is the opposite of the fluid
+		// volume's contract, deliberately. "Outside is solid" is right for a
+		// collision volume -- a particle must never escape through an unbuilt
+		// edge. It is wrong for a renderer: it would stop every ray at the
+		// residency frontier and paint a wall across the screen wherever
+		// streaming lagged. A renderer's failure mode should be a hole, which is
+		// visible as missing terrain, not a surface, which is visible as terrain.
+		return false;
+	}
+
+	const int BrickIndex = VoxelMarchBrickIndex(WorldVoxel);
+	if (BrickIndex != Brick.BrickIndex)
+	{
+		// THE FREE SKIP. One bit test against the 64-bit L1 mask already sitting
+		// in a register from the record fetch. An empty brick -- 512 cells --
+		// costs no memory traffic whatsoever to reject.
+		const uint MaskWord = (BrickIndex < 32) ? Chunk.BrickSolid.x : Chunk.BrickSolid.y;
+		// lint-shader-ub: allow VARIABLE_SHIFT - BrickIndex is 0..63 by construction and the shift is masked to 0..31
+		if ((MaskWord & (1u << (uint(BrickIndex) & 31u))) == 0u)
+		{
+			Brick = VoxelMarchNoBrick();
+			Brick.BrickIndex = BrickIndex;
+			Brick.Kind = 0u; // uniform AIR
+			return false;
+		}
+		Brick = VoxelMarchLoadBrick(Chunk, BrickIndex);
+	}
+
+	if (Brick.Kind == 0u)
+	{
+		return false;          // uniform AIR -- no fetch was needed and none was made
+	}
+	if (Brick.Kind == 1u)
+	{
+		OutMaterial = Brick.UniformMat;
+		return true;           // uniform SOLID -- material is IN the descriptor
+	}
+	if (!Brick.bInBounds)
+	{
+		return false;          // corrupt offset: a hole, never someone else's bytes
+	}
+
+	const uint CellIndex = VoxelMarchCellIndex(WorldVoxel);
+	const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+	// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
+	if ((OccWord & (1u << (CellIndex & 31u))) == 0u)
+	{
+		return false;
+	}
+	OutMaterial = VoxelMarchMixedMaterial(Brick, CellIndex);
+	return true;
+}
+
+// The eight in-plane neighbours of the hit face, one step out along the normal.
+//
+// UNDER THIS SOURCE THE BITS ARE NOT FREE, and the header's claim that they are
+// is about the format's design rather than about this step. Format section 5's
+// promise -- AO from occupancy bits already in registers -- is realised when a
+// brick's 16 dwords are held across the walk, which P3-B1 deliberately does not
+// do (see the deviation note above). Here the eight neighbours are eight
+// solidity queries, most of which hit the chunk and brick caches already in
+// hand, and it costs a handful of loads ONCE PER RAY on the hit path only.
+//
+// The caches go in BY VALUE. A neighbour that crosses a brick or chunk boundary
+// would otherwise evict the cache the walk is still using, and the walk has
+// already returned by then -- but relying on that is the kind of coupling that
+// breaks the moment this is called from anywhere else.
+uint VoxelMarchGatherFaceNeighbours(int3 Voxel, int FaceAxis, int FaceSign,
+                                    FVoxelMarchChunkCache Chunk, FVoxelMarchBrickCache Brick)
+{
+	int U, V;
+	VoxelMarchFaceAxes(FaceAxis, U, V);
+
+	int3 Out = int3(0, 0, 0);
+	if (FaceAxis == 0)      { Out.x = -FaceSign; }
+	else if (FaceAxis == 1) { Out.y = -FaceSign; }
+	else                    { Out.z = -FaceSign; }
+
+	int3 StepU = int3(0, 0, 0);
+	int3 StepV = int3(0, 0, 0);
+	if (U == 0) { StepU.x = 1; } else if (U == 1) { StepU.y = 1; } else { StepU.z = 1; }
+	if (V == 0) { StepV.x = 1; } else if (V == 1) { StepV.y = 1; } else { StepV.z = 1; }
+
+	const int3 Base = Voxel + Out;
+	uint Ignored = 0u;
+	uint Mask = 0u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base - StepU - StepV, Chunk, Brick, Ignored)) << 0u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base         - StepV, Chunk, Brick, Ignored)) << 1u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base + StepU - StepV, Chunk, Brick, Ignored)) << 2u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base - StepU        , Chunk, Brick, Ignored)) << 3u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base + StepU        , Chunk, Brick, Ignored)) << 4u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base - StepU + StepV, Chunk, Brick, Ignored)) << 5u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base         + StepV, Chunk, Brick, Ignored)) << 6u;
+	Mask |= uint(VoxelMarchBrickSolidAt(Base + StepU + StepV, Chunk, Brick, Ignored)) << 7u;
+	return Mask;
+}
+
+// WHY DID THE BRICK PATH NOT CALL THIS VOXEL SOLID?
+//
+// Not used by the marcher. Used by voxel.March.VerifySource, on exactly the
+// voxels where the occupancy source found a surface and the brick source did
+// not -- which is the symptom under investigation.
+//
+// IT RETURNS THE BRANCH, NOT A BOOLEAN, and that is the whole design. A count of
+// disagreements cannot separate "the storage says air here" from "the storage
+// says SOLID here and the walk never asked" -- and those two have completely
+// different fixes. Reason 0 is the second one, and if it dominates then the
+// defect is the DDA skipping voxels rather than anything about the volume.
+//
+// Fresh caches every call: this is a point query, not a walk, and inheriting a
+// walk's cache would let a stale brick answer for a voxel it does not cover.
+#define VOXEL_MARCH_REJECT_SOLID        0u  // the pool DOES call it solid
+#define VOXEL_MARCH_REJECT_NO_CHUNK     1u
+#define VOXEL_MARCH_REJECT_RECORD       2u
+#define VOXEL_MARCH_REJECT_L1_CLEAR     3u
+#define VOXEL_MARCH_REJECT_KIND_AIR     4u
+#define VOXEL_MARCH_REJECT_OCC_CLEAR    5u
+#define VOXEL_MARCH_REJECT_BOUNDS       6u
+#define VOXEL_MARCH_REJECT_COUNT        7u
+
+uint VoxelMarchBrickProbeVoxel(int3 WorldVoxel)
+{
+	const int3 ChunkCoord = int3(WorldVoxel.x >> 5, WorldVoxel.y >> 5, WorldVoxel.z >> 5);
+
+	const uint Entry = MarchChunkIndex[VoxelMarchIndexCell(ChunkCoord)];
+	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
+	{
+		return VOXEL_MARCH_REJECT_NO_CHUNK;
+	}
+	const FVoxelMarchChunkCache Chunk = VoxelMarchLookupChunk(ChunkCoord);
+	if (!Chunk.bValid)
+	{
+		return VOXEL_MARCH_REJECT_RECORD;
+	}
+
+	const int BrickIndex = VoxelMarchBrickIndex(WorldVoxel);
+	const uint MaskWord = (BrickIndex < 32) ? Chunk.BrickSolid.x : Chunk.BrickSolid.y;
+	// lint-shader-ub: allow VARIABLE_SHIFT - BrickIndex is 0..63 and the shift is masked to 0..31
+	if ((MaskWord & (1u << (uint(BrickIndex) & 31u))) == 0u)
+	{
+		return VOXEL_MARCH_REJECT_L1_CLEAR;
+	}
+
+	const FVoxelMarchBrickCache Brick = VoxelMarchLoadBrick(Chunk, BrickIndex);
+	if (Brick.Kind == 0u)
+	{
+		return VOXEL_MARCH_REJECT_KIND_AIR;
+	}
+	if (Brick.Kind == 1u)
+	{
+		return VOXEL_MARCH_REJECT_SOLID;
+	}
+	if (!Brick.bInBounds)
+	{
+		return VOXEL_MARCH_REJECT_BOUNDS;
+	}
+	const uint CellIndex = VoxelMarchCellIndex(WorldVoxel);
+	const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+	// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
+	if ((OccWord & (1u << (CellIndex & 31u))) == 0u)
+	{
+		return VOXEL_MARCH_REJECT_OCC_CLEAR;
+	}
+	return VOXEL_MARCH_REJECT_SOLID;
+}
+
+// THE WALK. A structural mirror of VoxelFluidWalkVoxelLine -- see the long note
+// at the top of this section for why a mirror exists at all and what gates it.
+// Every line that is not the solidity call is that function's line.
+FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
+                                       float TMinUU, float TMaxUU, float ConeSlopeUU)
+{
+	FVoxelMarchHit H = (FVoxelMarchHit)0;
+	H.FaceAxis = -1;
+	H.Level = 0;
+	H.VoxelSizeUU = VoxelMarchVoxelSizeUU(0);
+	H.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const float3 Entry = OriginLocalUU + DirWorld * TMinUU;
+	const float3 Exit  = OriginLocalUU + DirWorld * TMaxUU;
+
+	FVoxelMarchChunkCache Chunk = VoxelMarchNoChunk();
+	FVoxelMarchBrickCache Brick = VoxelMarchNoBrick();
+
+	const int3 LocalStart = (int3)floor(Entry / VOXEL_FLUID_VOXEL_UU);
+	const int3 StartVoxel = LocalStart + VoxelMarchOriginVoxel();
+	// A plain array, not an int3: the walk indexes it by the axis it chose, and
+	// dynamic component indexing of a VECTOR forces DXC to spill the whole
+	// vector to scratch on every write.
+	int v[3] = { StartVoxel.x, StartVoxel.y, StartVoxel.z };
+	// WARNING (doctrine 9b): this SURVIVES A MISS. If the walk returns bHit
+	// false, H.Voxel still holds this entry voxel and H.THitUU is 0 -- a legal
+	// coordinate that is not a position. EVERY consumer must gate on bHit; three
+	// of them did not, and the resulting ill-posed population was 30-43% of the
+	// arbiter's input for four legs.
+	H.Voxel = StartVoxel;
+
+	uint Mat = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+	if (VoxelMarchBrickSolidAt(StartVoxel, Chunk, Brick, Mat))
+	{
+		H.bHit = true;
+		H.bStartedInside = true;
+		H.Material = Mat;
+		H.THitUU = TMinUU;
+		H.HitPosLocalUU = Entry;
+		return H;
+	}
+
+	const float3 d = Exit - Entry;
+	float tMax[3], tDelta[3];
+	int step[3];
+	{
+		const float pv[3] = { Entry.x, Entry.y, Entry.z };
+		const float dv[3] = { d.x, d.y, d.z };
+		const float lv[3] = { (float)LocalStart.x, (float)LocalStart.y, (float)LocalStart.z };
+		[unroll]
+		for (int a = 0; a < 3; ++a)
+		{
+			if (dv[a] > 0.0f)
+			{
+				step[a] = 1;
+				tMax[a] = ((lv[a] + 1.0f) * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else if (dv[a] < 0.0f)
+			{
+				step[a] = -1;
+				tMax[a] = (lv[a] * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = -VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else
+			{
+				step[a] = 0;
+				tMax[a] = VOXEL_FLUID_NO_CROSSING_T;
+				tDelta[a] = VOXEL_FLUID_NO_CROSSING_T;
+			}
+		}
+	}
+
+	float tLast = 0.0f;
+	int Steps = 0;
+	[loop]
+	for (int i = 0; i < MarchStepBudget; ++i)
+	{
+		// Ties step one axis at a time, lowest first -- raycast.h:74-80.
+		int axis;
+		if (tMax[0] <= tMax[1] && tMax[0] <= tMax[2])      { axis = 0; }
+		else if (tMax[1] <= tMax[2])                       { axis = 1; }
+		else                                               { axis = 2; }
+
+		if (tMax[axis] > 1.0f)
+		{
+			H.Steps = Steps;
+			return H;   // segment exhausted, nothing in the way
+		}
+
+		tLast = tMax[axis];
+		v[axis] += step[axis];
+		tMax[axis] += tDelta[axis];
+		++Steps;
+
+		const int3 vNow = int3(v[0], v[1], v[2]);
+		if (VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat))
+		{
+			H.bHit = true;
+			H.Voxel = vNow;
+			H.FaceAxis = axis;
+			H.FaceSign = step[axis];
+			H.Material = Mat;
+			H.THitUU = TMinUU + (TMaxUU - TMinUU) * tLast;
+			H.HitPosLocalUU = OriginLocalUU + DirWorld * H.THitUU;
+			H.Steps = Steps;
+			H.FaceNeighbourMask = VoxelMarchGatherFaceNeighbours(vNow, axis, step[axis],
+			                                                     Chunk, Brick);
+			return H;
+		}
+	}
+
+	H.bExhausted = true;
+	H.THitUU = TMinUU + (TMaxUU - TMinUU) * tLast;
+	H.HitPosLocalUU = OriginLocalUU + DirWorld * H.THitUU;
+	H.Steps = Steps;
+	return H;
+}
+
+#endif // VOXEL_MARCH_HAS_BRICKPOOL
+
+// THE SAME ORIGIN, AT AN EXPLICIT LEVEL, for consumers that do not traverse.
+//
+// The emit pixel shader reconstructs a world voxel from the packed LOCAL one,
+// but a ring-1 hit is packed in LEVEL-1 voxels -- so adding the level-0 frame
+// origin back would place it at twice its distance with no error anywhere. The
+// PS does not run the traversal, so the walk's level context is not set there
+// and cannot be consulted; the level travels in the vis packet, which is the
+// only thing that survives between the two passes.
+//
+// Exact at every level because the frame origin is snapped to 1024 level-0
+// voxels when the cascade is on. The occupancy source has no levels, so it
+// ignores the argument rather than pretending to honour it.
+int3 VoxelMarchSourceOriginVoxelAtLevel(int Level)
+{
+#if VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY
+	return FluidVolumeOriginVoxel;
+#else
+	// COVER PACKS AGAINST THE CAMERA'S OWN COVER CELL, in both arms, and that is
+	// a tighter bound than the terrain path's rather than a looser one.
+	//
+	// The cover reach is bounded on the host (voxel.Cover.ReachM, capped by the
+	// index grid -- see FVoxelMarchChunkIndex::kCoverReachChunks), so a cover hit
+	// is at most ReachM / 0.05 cover cells from the camera: 1,280 at the 64 m
+	// default, which is the SAME 1,280 every ring level packs and comfortably
+	// inside the 13-bit field. Doubling is exact -- one level-0 voxel is two
+	// cover cells, no rounding anywhere.
+	//
+	// It does NOT go through the ring branch below, because that shifts RIGHT by
+	// the level and cover is finer, not coarser: >> 7 would collapse the origin
+	// to near zero and put every cover voxel tens of kilometres from where it is.
+	if (Level == VOXEL_MARCH_COVER_LEVEL)
+	{
+		return MarchPackOriginVoxel * 2;
+	}
+#if VOXEL_MARCH_RINGS
+	// CAMERA-RELATIVE, NOT FRAME-RELATIVE, AND SIX RINGS IS WHY.
+	//
+	// The frame origin sits at camera - reach - snap. At 4 km that is 40,960
+	// level-0 voxels away, so a RING-0 hit -- which is at most 1,280 level-0
+	// voxels from the camera -- packs as a local coordinate around 41,000 and
+	// overflows a 13-bit field by a factor of ten. The frame origin worked at
+	// two rings only because the frame was small.
+	//
+	// Relative to the camera at the hit's own level, EVERY ring is within 1,280
+	// voxels OF THAT LEVEL by construction: ring L spans out to 128 * 2^L m and
+	// a level-L voxel is 0.1 * 2^L m, so the ratio is the same 1,280 at every
+	// level. That is the cascade property again, and it is what makes one field
+	// width serve all six rings instead of needing six.
+	const int L = clamp(Level, 0, int(VOXEL_MARCH_MAX_RINGS) - 1);
+	return int3(MarchPackOriginVoxel.x >> L,
+	            MarchPackOriginVoxel.y >> L,
+	            MarchPackOriginVoxel.z >> L);
+#else
+	const int L = clamp(Level, 0, 5);
+	return int3(MarchBrickOriginVoxel.x >> L,
+	            MarchBrickOriginVoxel.y >> L,
+	            MarchBrickOriginVoxel.z >> L);
+#endif // VOXEL_MARCH_RINGS
+#endif // VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY
+}
+
+// ---------------------------------------------------------------------------
+// The origin of the source's local voxel frame
+// ---------------------------------------------------------------------------
+//
+// Both sources express hits as WORLD voxel coordinates and both work internally
+// in a camera-relative local frame, but they name that frame's origin
+// differently -- FluidVolumeOriginVoxel for the occupancy window,
+// MarchBrickOriginVoxel for the brick pool's ring-local frame.
+//
+// The VisBuffer packs LOCAL voxel coordinates (three 13-bit fields since the
+// cascade lengthened the reach -- see VoxelMarchPackVis; world
+// coordinates at planet scale do not fit beside the attributes), so the march
+// kernel subtracts this and the emit adds it back. One accessor rather than two
+// call sites with an #if, because those two call sites have to agree exactly or
+// the palette hash is keyed on a voxel that does not exist.
+int3 VoxelMarchSourceOriginVoxel()
+{
+#if VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY
+	return FluidVolumeOriginVoxel;
+#elif VOXEL_MARCH_RINGS
+	// The march kernel packs at the level the ring loop just walked, and the
+	// level context still holds it here. ONE authority with the emit's unpack.
+	return VoxelMarchSourceOriginVoxelAtLevel(int(GVoxelMarchIndexLevel));
+#else
+	return VoxelMarchOriginVoxel();
+#endif
+}
+
+
+// ===========================================================================
+// THE HIERARCHICAL WALK (P3-B2a) -- chunks -> bricks -> cells
+// ===========================================================================
+//
+// THE WHOLE PERFORMANCE CASE IS HERE. At level 0 with no skipping the brick pool
+// costs +18.3% against the occupancy volume over a 51.2 m box (5.144 -> 6.087 ms,
+// measured, same tiles to within one). That is the price of five indirections
+// per step. The bet is that a hierarchy removes far more steps than indirection
+// adds per step -- and until this runs, that is a hypothesis with a measured
+// cost and an unmeasured benefit.
+//
+// ---------------------------------------------------------------------------
+// THREE NESTED DDAs, NOT ONE DDA WITH JUMPS
+// ---------------------------------------------------------------------------
+//
+// The tempting shape is a single voxel DDA that, on finding an empty brick,
+// leaps t to the brick's exit. VoxelMarchSpike.usf already built that, and the
+// note it left is the reason this is written the way it is:
+//
+//   "Amanatides & Woo crosses exactly ONE plane per iteration"
+//
+// A jump crosses up to three at once, and the state (tMax per axis) is no longer
+// consistent with the position. The spike's version skipped diagonal cells --
+// producing a LOWER step count and a plausible picture, which is the worst
+// possible failure for a number whose whole purpose is to be lower.
+//
+// So each level runs its own DDA over its own cell size, and entering an
+// occupied parent cell RESTARTS the child walk from that cell's entry point.
+// Restarting is what keeps every walk's state self-consistent.
+//
+// THE PRICE OF RESTARTING, STATED: a fresh tMax computed at a cell boundary
+// differs from one accumulated across thirty steps by a few float ULP, so the
+// hierarchical walk and the flat walk will disagree on a small number of rays
+// that cross two planes simultaneously. That is not a defect, it is the
+// reference noise floor, and it is exactly what voxel.March.VerifySource
+// measures -- the flat walk against a negligibly nudged copy of itself, on the
+// same rays. Read the disagreement against that, never against zero.
+//
+// ---------------------------------------------------------------------------
+// WHAT EACH LEVEL COSTS TO REJECT
+// ---------------------------------------------------------------------------
+//
+//   chunk (32^3 = 32,768 voxels)  one index dword. Not resident or anySolid
+//                                 clear -> skip the whole thing.
+//   brick (8^3 = 512 voxels)      one BIT TEST against a register already
+//                                 loaded with the chunk record. Free.
+//   cell                          one occupancy dword.
+//
+// The brick level is the one that should dominate: it costs nothing and it
+// rejects 512 voxels. That is the property the format was designed around
+// (docs/brick-volume-format.md section 5) and it has never been measured.
+
+#if VOXEL_MARCH_HAS_BRICKPOOL
+
+// Where the ray leaves the axis-aligned cell of edge CellUU that contains the
+// point at TNow. Absolute t along the ray.
+//
+// Computed from the CELL BOUNDS and the ray origin rather than incrementally,
+// so it cannot drift: every call is a fresh slab test against exact multiples of
+// CellUU, which is what makes a restart-based walk safe to restart.
+// CELL BOUNDARIES ARE IN WORLD VOXEL SPACE, NOT LOCAL UU SPACE, AND THAT
+// DISTINCTION WAS THE BUG.
+//
+// The first version computed `floor(P / CellUU) * CellUU` in the LOCAL frame,
+// which silently assumes the frame origin is a multiple of the cell size. It is
+// not: UVoxelFluidSubsystem::DesiredOriginVoxel returns `CamVoxel - 256` for an
+// arbitrary camera voxel, so MarchBrickOriginVoxel is 32-aligned only by luck.
+//
+// The consequence was structural and quiet. Every chunk and brick boundary in
+// the hierarchy sat `origin mod 32` voxels away from the real one, so the walk
+// tested the L1 bit of one brick while the ray was inside its neighbour --
+// skipping real content and, because a skip removes steps, producing a BETTER
+// skip ratio and a plausible picture. Measured: 156,031 of 1,354,896 rays
+// disagreeing with the flat walk (11.5%) against a noise floor of 6, and a
+// 66.9x ratio that was not real.
+//
+// Deriving the boundary from the WORLD voxel removes the assumption rather than
+// documenting it. `>> CellShift` is an arithmetic shift, which is floor division
+// for negative coordinates -- the property `/ (1 << n)` does NOT have, and the
+// reason the shift is written rather than a divide.
+float VoxelMarchCellExitT(float3 OriginLocalUU, float3 InvDir, int3 CellMinWorld,
+                          int CellShift)
+{
+	// THE CELL IS PASSED IN. IT USED TO BE RECOMPUTED HERE, AND THAT WAS THE
+	// FOURTH INSTANCE OF THE DOCTRINE -- the first one where BOTH AUTHORITIES
+	// WERE THE SAME EXPRESSION.
+	//
+	// The caller already had `floor((Origin + Dir*t) / voxelUU)`; this recomputed
+	// it verbatim. Textually identical, and therefore invisible in review -- but
+	// the compiler may contract one site and not the other (FMA on Origin+Dir*t,
+	// a different schedule for the divide), so at a cell plane the two floors can
+	// land ONE CELL APART.
+	//
+	// AND THE CONSEQUENCE IS DIRECTIONAL, which is what made it findable:
+	//   travelling POSITIVELY, a floor that rounds one cell further returns the
+	//   NEXT cell's exit, so the advance lands TWO cells on and the intervening
+	//   brick is never L1-tested and never descended -- `lost` with no `moved`,
+	//   because a ray that never enters a brick cannot stop on a wrong cell in
+	//   it;
+	//   travelling NEGATIVELY, the same slip returns an exit BEHIND t, which
+	//   max(..., t + NUDGE) clamps -- a one-nudge crawl that self-corrects.
+	// Measured: 92% of disagreeing rays travelling positively.
+	const float3 CellMinUU =
+		float3(CellMinWorld - VoxelMarchOriginVoxel()) * VOXEL_FLUID_VOXEL_UU;
+	const float CellUU = VOXEL_FLUID_VOXEL_UU * float(1 << CellShift);
+	const float3 T0 = (CellMinUU - OriginLocalUU) * InvDir;
+	const float3 T1 = (CellMinUU + CellUU - OriginLocalUU) * InvDir;
+	const float3 THi = max(T0, T1);
+	return min(min(THi.x, THi.y), THi.z);
+}
+
+// ONE AUTHORITY FOR THE RAY'S INVERSE DIRECTION. The traversal built this
+// inline, and the coincidence diagnostic below needs the IDENTICAL value -- a
+// ray whose slab test used a different epsilon than the walk did would report
+// spans the walk never saw. Doctrine: the same expression written twice is
+// still two authorities, and this is the cheapest possible place to have one.
+// Returns the SAFE DIRECTION, not its inverse. Deliberate: the walk steps
+// positions with SafeDir and divides for InvDir, and 1/(1/x) IS NOT x in float
+// -- returning the inverse here and reconstructing SafeDir from it would have
+// perturbed every position step in the traversal to buy nothing.
+float3 VoxelMarchSafeDir(float3 DirWorld)
+{
+	return DirWorld + float3(abs(DirWorld) < VOXEL_MARCH_MIN_DIR_COMPONENT) *
+	                      VOXEL_MARCH_MIN_DIR_COMPONENT;
+}
+
+// The NEAR half of the slab test whose FAR half is VoxelMarchCellExitT. Split
+// this way ON PURPOSE: the exit t is load-bearing in the walk and must keep
+// exactly one authority, so this computes only the entry and defers the exit.
+// DIAGNOSTIC ONLY -- nothing in the traversal calls it.
+float VoxelMarchCellEnterT(float3 OriginLocalUU, float3 InvDir, int3 CellMinWorld,
+                           int CellShift)
+{
+	const float3 CellMinUU =
+		float3(CellMinWorld - VoxelMarchOriginVoxel()) * VOXEL_FLUID_VOXEL_UU;
+	const float CellUU = VOXEL_FLUID_VOXEL_UU * float(1 << CellShift);
+	const float3 T0 = (CellMinUU - OriginLocalUU) * InvDir;
+	const float3 T1 = (CellMinUU + CellUU - OriginLocalUU) * InvDir;
+	const float3 TLo = min(T0, T1);
+	return max(max(TLo.x, TLo.y), TLo.z);
+}
+
+// The smallest push that is guaranteed to move the sample point into the next
+// cell. A pure `t = exitT` leaves the point exactly ON the boundary, where
+// floor() can land either side -- and landing on the near side is an infinite
+// loop, not a wrong pixel. One thousandth of a voxel is four orders of magnitude
+// above float noise at these ranges and four orders below a voxel.
+#define VOXEL_MARCH_HIER_NUDGE_UU (VOXEL_FLUID_VOXEL_UU * 0.001f)
+
+// The fine walk, INSIDE one brick whose descriptor is already in hand.
+//
+// A real DDA and not a point sample: the crossed face is what gives the normal
+// and the AO their exactness (ADR-0008), so a walk that found the right voxel by
+// the wrong route would still shade wrong.
+bool VoxelMarchWalkCellsInBrick(float3 OriginLocalUU, float3 Dir, float TStart, float TEnd,
+                                int3 BrickCoordWorld,
+                                FVoxelMarchChunkCache Chunk, FVoxelMarchBrickCache Brick,
+                                inout int Steps, out float OutTHit, out int3 OutVoxel,
+                                out int OutFaceAxis, out int OutFaceSign, out uint OutMaterial)
+{
+	OutTHit = TStart;
+	OutVoxel = int3(0, 0, 0);
+	OutFaceAxis = -1;
+	OutFaceSign = 0;
+	OutMaterial = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const float3 Entry = OriginLocalUU + Dir * TStart;
+	const int3 LocalStart = (int3)floor(Entry / VOXEL_FLUID_VOXEL_UU);
+	int v[3] = { LocalStart.x + VoxelMarchOriginVoxel().x,
+	             LocalStart.y + VoxelMarchOriginVoxel().y,
+	             LocalStart.z + VoxelMarchOriginVoxel().z };
+
+	// The entry voxel itself. A restart lands INSIDE a cell, not on its face, so
+	// the first voxel has to be tested before any stepping -- the flat walk's
+	// StartedInside case, one level down.
+	{
+		const int3 V0 = int3(v[0], v[1], v[2]);
+		// Should hold by construction -- the caller derived BrickCoordWorld from
+		// this same t -- but it is three compares and it is the invariant the
+		// whole function now rests on, so it is checked rather than trusted.
+		if (any(int3(V0.x >> 3, V0.y >> 3, V0.z >> 3) != BrickCoordWorld))
+		{
+			return false;
+		}
+		const uint CellIndex = VoxelMarchCellIndex(V0);
+		const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+		// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
+		if ((OccWord & (1u << (CellIndex & 31u))) != 0u)
+		{
+			OutTHit = TStart;
+			OutVoxel = V0;
+			OutMaterial = VoxelMarchMixedMaterial(Brick, CellIndex);
+			// ---- THE FACE, WHICH THIS PATH USED TO LEAVE AT -1 -------------
+			//
+			// A DEFECT, found by reading and living exactly where the dump says
+			// the disagreements concentrate. This branch fires when a ray enters
+			// a brick and the FIRST voxel is solid -- i.e. on a brick boundary --
+			// and it returned with OutFaceAxis still at its -1 initialiser.
+			//
+			// -1 is not a neutral value here. VoxelMarchFaceNormal turns it into
+			// (0,0,0), so the surface gets a zero normal; VoxelMarchFaceAxes maps
+			// it to the (0,1) plane, so the corner AO samples the wrong
+			// neighbours. Both are silent -- the hit is correct, the voxel is
+			// correct, and only the SHADING is wrong, on precisely the boundary
+			// voxels under investigation.
+			//
+			// It does not explain `lost` (the voxel matches, so the comparator
+			// scores it as agreement) and it is fixed on its own terms.
+			//
+			// The face is the last plane crossed entering this voxel: slab-test
+			// the voxel and take the axis whose ENTRY t is largest. Computed from
+			// the voxel's own bounds in world-voxel space, for the same reason
+			// every other boundary in this file is.
+			{
+				const float3 SafeD =
+					Dir + float3(abs(Dir) < VOXEL_MARCH_MIN_DIR_COMPONENT) *
+					          VOXEL_MARCH_MIN_DIR_COMPONENT;
+				const float3 InvD = 1.0f / SafeD;
+				const float3 VMinUU =
+					float3(V0 - VoxelMarchOriginVoxel()) * VOXEL_FLUID_VOXEL_UU;
+				const float3 Ta = (VMinUU - OriginLocalUU) * InvD;
+				const float3 Tb =
+					(VMinUU + VOXEL_FLUID_VOXEL_UU - OriginLocalUU) * InvD;
+				const float3 TLo = min(Ta, Tb);
+				const int Axis = (TLo.x >= TLo.y && TLo.x >= TLo.z) ? 0
+				                 : ((TLo.y >= TLo.z) ? 1 : 2);
+				// Selected, not indexed: dynamic component indexing of a vector
+				// spills the whole thing to scratch.
+				const float DirOnAxis =
+					(Axis == 0) ? SafeD.x : ((Axis == 1) ? SafeD.y : SafeD.z);
+				OutFaceAxis = Axis;
+				OutFaceSign = (DirOnAxis > 0.0f) ? 1 : -1;
+			}
+			return true;
+		}
+	}
+
+	float tMax[3], tDelta[3];
+	int step[3];
+	{
+		const float pv[3] = { Entry.x, Entry.y, Entry.z };
+		const float dv[3] = { Dir.x, Dir.y, Dir.z };
+		const float lv[3] = { (float)LocalStart.x, (float)LocalStart.y, (float)LocalStart.z };
+		[unroll]
+		for (int a = 0; a < 3; ++a)
+		{
+			if (dv[a] > 0.0f)
+			{
+				step[a] = 1;
+				tMax[a] = ((lv[a] + 1.0f) * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else if (dv[a] < 0.0f)
+			{
+				step[a] = -1;
+				tMax[a] = (lv[a] * VOXEL_FLUID_VOXEL_UU - pv[a]) / dv[a];
+				tDelta[a] = -VOXEL_FLUID_VOXEL_UU / dv[a];
+			}
+			else
+			{
+				step[a] = 0;
+				tMax[a] = VOXEL_FLUID_NO_CROSSING_T;
+				tDelta[a] = VOXEL_FLUID_NO_CROSSING_T;
+			}
+		}
+	}
+
+	// The iteration cap. A ray crosses at most 8 planes per axis inside one
+	// brick, so 24 steps reach any exit face; 32 is margin, and it is now the
+	// only STRUCTURAL bound on this loop since the brick-geometry float test was
+	// removed. It cannot be reached by a correct walk -- the integer containment
+	// test fires first -- so hitting it would mean the voxel stepping and the
+	// brick arithmetic disagree, which is worth a bound rather than a hang.
+	// ---------------------------------------------------------------------
+	// CONTAINMENT IS AN INTEGER PROPERTY. DECIDING IT IN FLOAT t WAS THE BUG,
+	// TWICE.
+	// ---------------------------------------------------------------------
+	//
+	// First form: TEnd was the NUDGED brick exit, so `tMax > Span` was false by a
+	// whole nudge and the walk stepped a voxel past the brick every crossing.
+	// Fixed by passing the true exit -- and `lost` fell 156k -> 32 while `gained`
+	// and `moved` only HALVED, because a second contributor shares the signature.
+	//
+	// Second form, and it is the residue: `Span` is a slab test from the brick's
+	// min corner, `tMax[axis]` is accumulated from the segment entry. Those are
+	// two different float computations of THE SAME geometric quantity, so at the
+	// exit plane they differ by ULP in an unbiased direction -- a coin flip, once
+	// per brick crossing. Heads, the walk stops correctly. Tails, it steps into
+	// the next brick and tests that voxel against THIS brick's occupancy dwords,
+	// which VoxelMarchCellIndex masks to 0..7 so it silently aliases onto an
+	// in-brick bit. A hit in air (`gained`) or a hit at the wrong voxel (`moved`).
+	//
+	// So containment is no longer asked of t at all. The brick a voxel belongs to
+	// is `voxel >> 3`, exactly, and comparing that against the brick we loaded is
+	// three integer compares that cannot be half-right. The float bound stays as
+	// the loop's cheap early-out; the integer test is what makes it correct.
+	// THE FLOAT BOUND IS GONE, AND THAT IS THE POINT.
+	//
+	// Half-applying the principle is what produced `lost` 32 -> 464. The integer
+	// test below decides when the walk LEAVES the brick; this float test also
+	// decided it, from a slab computation that disagrees with the accumulated
+	// tMax by ULP -- and once the over-run was fixed, the float test became the
+	// only thing ending the walk early, so its ULP error could only cut SHORT.
+	// One voxel short at the far face, which the brick loop then skips past
+	// entirely because it advances t to the brick exit regardless. The exact
+	// mirror of the over-run, from the same cause.
+	//
+	// So containment is now decided in ONE place and it is the integer one. What
+	// remains here is a genuine bound -- the END OF THE RAY, which is a real
+	// limit rather than a restatement of the brick geometry.
+	const float RayEndSpan = TEnd - TStart;
+	[loop]
+	for (int i = 0; i < 32; ++i)
+	{
+		int axis;
+		if (tMax[0] <= tMax[1] && tMax[0] <= tMax[2])      { axis = 0; }
+		else if (tMax[1] <= tMax[2])                       { axis = 1; }
+		else                                               { axis = 2; }
+
+		if (tMax[axis] > RayEndSpan)
+		{
+			// Past the end of the ray's own segment. NOT a statement about the
+			// brick -- the integer test below owns that.
+			return false;
+		}
+
+		v[axis] += step[axis];
+		const float tHere = tMax[axis];
+		tMax[axis] += tDelta[axis];
+		++Steps;
+
+		const int3 VNow = int3(v[0], v[1], v[2]);
+		// THE INTEGER CONTAINMENT TEST. A step that left the brick is a step this
+		// function has no data for -- returning false hands it back to the brick
+		// loop, which will load the right descriptor for it.
+		if (any(int3(VNow.x >> 3, VNow.y >> 3, VNow.z >> 3) != BrickCoordWorld))
+		{
+			return false;
+		}
+		const uint CellIndex = VoxelMarchCellIndex(VNow);
+		const uint OccWord = VoxelBrickOcc[Brick.OccBase + (CellIndex >> 5u)];
+		// lint-shader-ub: allow VARIABLE_SHIFT - CellIndex & 31 is 0..31 by construction
+		if ((OccWord & (1u << (CellIndex & 31u))) != 0u)
+		{
+			OutTHit = TStart + tHere;
+			OutVoxel = VNow;
+			OutFaceAxis = axis;
+			OutFaceSign = step[axis];
+			OutMaterial = VoxelMarchMixedMaterial(Brick, CellIndex);
+			return true;
+		}
+	}
+	return false;
+}
+
+// WatchChunk: the ONE chunk whose descents are recorded into FineBrickMask.
+//
+// The mask used to follow the LAST chunk walked, resetting on every crossing --
+// and a `lost` ray by definition continues PAST the hit, so by the time it
+// finished the mask described a chunk far beyond the one being asked about.
+// Result: 100% "inconclusive" on 1046/1046, 30/30 and 983/983 rays. Not a weak
+// signal -- zero signal, from an instrument built specifically to separate
+// "skipped past it" from "walked it and missed".
+//
+// The caller knows which chunk it cares about (the comparator runs the flat walk
+// first, so it has the hit), so it says so. Pass a coordinate no chunk can hold
+// to record nothing.
+FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 DirWorld,
+                                                float TMinUU, float TMaxUU, float ConeSlopeUU,
+                                                int3 WatchChunk)
+{
+	FVoxelMarchHit H = (FVoxelMarchHit)0;
+	H.FaceAxis = -1;
+	H.Level = 0;
+	H.VoxelSizeUU = VoxelMarchVoxelSizeUU(0);
+	H.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const float3 SafeDir = VoxelMarchSafeDir(DirWorld);
+	const float3 InvDir = 1.0f / SafeDir;
+
+	// Cell sizes as SHIFTS, because the exit test now works in world voxels:
+	// 32 voxels per chunk (>>5), 8 per brick (>>3).
+	const int ChunkShift = 5;
+	const int BrickShift = 3;
+
+	FVoxelMarchChunkCache Chunk = VoxelMarchNoChunk();
+	FVoxelMarchBrickCache Brick = VoxelMarchNoBrick();
+
+	int Steps = 0;
+	float t = TMinUU;
+	H.LastBrickIndex = -1;
+	H.LastFineBrickIndex = -1;
+	H.LastFineEntryT = -1.0f;
+	H.FineBrickMask = uint2(0u, 0u);
+	// Fixed for the whole walk: the mask describes THIS chunk and no other, so a
+	// bit can never be read against the wrong brick numbering and the verdict is
+	// never "inconclusive" for a reason the caller could have avoided.
+	H.FineMaskChunk = WatchChunk;
+	H.LastChunkCoord = int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+
+	// ---- level 2: chunks ---------------------------------------------------
+	[loop]
+	for (int ci = 0; ci < 512 && t < TMaxUU; ++ci)
+	{
+		const float3 P = OriginLocalUU + SafeDir * t;
+		const int3 LocalVoxel = (int3)floor(P / VOXEL_FLUID_VOXEL_UU);
+		const int3 WorldVoxel = LocalVoxel + VoxelMarchOriginVoxel();
+		const int3 ChunkCoord = int3(WorldVoxel.x >> 5, WorldVoxel.y >> 5, WorldVoxel.z >> 5);
+
+		// TWO VALUES, AND CONFLATING THEM WAS A BUG.
+		//
+		//   ...ExitTrue  the geometric boundary. Bounds the CHILD walk.
+		//   ...Next      that plus a nudge. Advances t past the boundary so
+		//                floor() cannot land back on the near side.
+		//
+		// The first version used the nudged value for BOTH, which let the child
+		// walk step one cell PAST its parent and test that cell against the
+		// PARENT'S occupancy data -- a wrong-brick read reporting a hit where
+		// there is air. See the note on the fine walk's Span.
+		// The cell the CALLER already resolved -- not a second floor of the same t.
+		const int3 ChunkMinWorld = int3(WorldVoxel.x >> ChunkShift, WorldVoxel.y >> ChunkShift,
+		                                WorldVoxel.z >> ChunkShift) << ChunkShift;
+		const float tChunkExitTrue =
+			VoxelMarchCellExitT(OriginLocalUU, InvDir, ChunkMinWorld, ChunkShift);
+		const float tChunkNext =
+			max(tChunkExitTrue + VOXEL_MARCH_HIER_NUDGE_UU, t + VOXEL_MARCH_HIER_NUDGE_UU);
+
+		// ONE BLOCK, BECAUSE THERE WAS NEVER TWO. This sat behind
+		// `#if VOXEL_MARCH_SKIP_LEVELS >= 2` / `#else` with the two branches
+		// BYTE-IDENTICAL, under a comment on the #else claiming that at skip level
+		// 1 "the chunk level is NOT skipped ... it simply does not use a miss to
+		// jump" -- while the code jumped, `t = tChunkNext; continue;`, in both.
+		//
+		// SO SkipLevels 1 AND SkipLevels 2 DO NOT DIFFER AT THE CHUNK LEVEL, and a
+		// sweep across 1 and 2 measured one arm twice. Said here rather than fixed
+		// by inventing a brick-granular advance: the arm is a measurement control
+		// nobody currently runs (shipping is 2, the honest control is 0), and
+		// changing traversal behaviour to satisfy a comment is how this file earns
+		// its next silent defect. If a genuine level-1 arm is ever wanted it must
+		// be WRITTEN, and then it must be shown to differ from level 2 before any
+		// number is read off it.
+		H.LastChunkCoord = ChunkCoord;
+		if (any(ChunkCoord != Chunk.ChunkCoord))
+		{
+			Chunk = VoxelMarchLookupChunk(ChunkCoord);
+			Brick = VoxelMarchNoBrick();
+		}
+		if (!Chunk.bValid)
+		{
+			// 32,768 voxels rejected on one dword. Outside the resident set is
+			// AIR for a renderer -- a hole is visible, a wall is not.
+			t = tChunkNext;
+			continue;
+		}
+
+
+		// Set when the brick loop discovers the ray has already crossed into the
+		// next chunk. The advance below must then NOT fire: t is already correct
+		// and past the boundary, and pushing it to tChunkNext would step over
+		// whatever the new chunk holds against its own near face.
+		bool bChunkChanged = false;
+
+		const float tChunkEnd = min(tChunkExitTrue, TMaxUU);
+
+		// ---- level 1: bricks within this chunk -----------------------------
+		//
+		// REVERTED 2026-08-20 from a brick-level DDA rewrite that regressed by
+		// 188x (disagree 1,060 -> 199,839, lost offFace 6 -> 79,769). See the
+		// doctrine block, entry 8: the diagnosis that motivated it may still be
+		// correct while that implementation of it was not, and the two are being
+		// kept separable.
+		[loop]
+		for (int bi = 0; bi < 64 && t < tChunkEnd; ++bi)
+		{
+			const float3 PB = OriginLocalUU + SafeDir * t;
+			const int3 LV = (int3)floor(PB / VOXEL_FLUID_VOXEL_UU);
+			const int3 WV = LV + VoxelMarchOriginVoxel();
+
+			// CHUNK MEMBERSHIP, DECIDED IN INTEGERS (doctrine entry 4). The
+			// loop's float guard `t < tChunkEnd` cannot be the only authority on
+			// which chunk the ray is in.
+			if (any(int3(WV.x >> 5, WV.y >> 5, WV.z >> 5) != Chunk.ChunkCoord))
+			{
+				bChunkChanged = true;
+				break;
+			}
+
+			// Derived from WV -- the same cell the L1 test below uses. One
+			// authority for "which brick am I in", used by both the test and the
+			// advance (doctrine entry 5).
+			const int3 BrickMinWorld = int3(WV.x >> BrickShift, WV.y >> BrickShift,
+			                                WV.z >> BrickShift) << BrickShift;
+			const float tBrickExitTrue =
+				VoxelMarchCellExitT(OriginLocalUU, InvDir, BrickMinWorld, BrickShift);
+			const float tBrickNext =
+				max(tBrickExitTrue + VOXEL_MARCH_HIER_NUDGE_UU,
+				    t + VOXEL_MARCH_HIER_NUDGE_UU);
+
+			++H.BrickEntries;
+			// The corner-clip configuration, counted where it is decided.
+			if ((tBrickExitTrue - t) < VOXEL_MARCH_HIER_NUDGE_UU)
+			{
+				++H.ThinClips;
+			}
+
+			const int BrickIndex = VoxelMarchBrickIndex(WV);
+			H.LastBrickIndex = BrickIndex;
+			const uint MaskWord = (BrickIndex < 32) ? Chunk.BrickSolid.x : Chunk.BrickSolid.y;
+			// lint-shader-ub: allow VARIABLE_SHIFT - BrickIndex is 0..63 by construction and the shift is masked to 0..31
+			const bool bBrickHasContent =
+				(MaskWord & (1u << (uint(BrickIndex) & 31u))) != 0u;
+
+			if (!bBrickHasContent)
+			{
+				// THE FREE SKIP: 512 voxels rejected by one bit test against a
+				// register already loaded with the chunk record.
+				t = tBrickNext;
+				continue;
+			}
+
+			if (BrickIndex != Brick.BrickIndex)
+			{
+				Brick = VoxelMarchLoadBrick(Chunk, BrickIndex);
+			}
+
+			if (Brick.Kind == 0u)
+			{
+				t = tBrickNext;      // uniform AIR: 512 voxels, no occupancy fetch
+				continue;
+			}
+			if (Brick.Kind == 1u)
+			{
+				// Uniform SOLID. The hit is the brick's ENTRY, and the face is
+				// the one the ray crossed to get in.
+				H.bHit = true;
+				H.THitUU = t;
+				H.HitPosLocalUU = OriginLocalUU + SafeDir * t;
+				H.Voxel = WV;
+				H.Material = Brick.UniformMat;
+				H.Steps = Steps;
+				{
+					// Same world-voxel anchoring as the exit test: the brick's
+					// min corner comes from the WORLD voxel, not from a local-UU
+					// floor that assumes an aligned frame origin.
+					const int3 BMinWorld = int3(WV.x >> BrickShift, WV.y >> BrickShift,
+					                            WV.z >> BrickShift) << BrickShift;
+					const float3 BMin =
+						float3(BMinWorld - VoxelMarchOriginVoxel()) * VOXEL_FLUID_VOXEL_UU;
+					const float BrickUU = VOXEL_FLUID_VOXEL_UU * 8.0f;
+					const float3 T0 = (BMin - OriginLocalUU) * InvDir;
+					const float3 T1 = (BMin + BrickUU - OriginLocalUU) * InvDir;
+					const float3 TLo = min(T0, T1);
+					const int Axis = (TLo.x >= TLo.y && TLo.x >= TLo.z) ? 0
+					                 : ((TLo.y >= TLo.z) ? 1 : 2);
+					// Selected, not indexed: dynamic component indexing of a
+					// VECTOR makes DXC spill the whole thing to scratch.
+					const float DirOnAxis = (Axis == 0) ? SafeDir.x
+					                        : ((Axis == 1) ? SafeDir.y : SafeDir.z);
+					H.FaceAxis = Axis;
+					H.FaceSign = (DirOnAxis > 0.0f) ? 1 : -1;
+				}
+				H.FaceNeighbourMask =
+					VoxelMarchGatherFaceNeighbours(H.Voxel, H.FaceAxis, H.FaceSign, Chunk, Brick);
+				return H;
+			}
+			if (!Brick.bInBounds)
+			{
+				t = tBrickNext;
+				continue;
+			}
+
+			// ---- level 0: cells within this brick --------------------------
+			const int3 BrickCoordWorld = int3(WV.x >> 3, WV.y >> 3, WV.z >> 3);
+			H.LastFineBrickIndex = BrickIndex;
+			H.LastFineEntryT = t;
+			++H.FineWalks;
+			if (all(BrickCoordWorld >> 2 == WatchChunk))
+			{
+				// lint-shader-ub: allow VARIABLE_SHIFT - BrickIndex is 0..63 and the shift is masked to 0..31
+				if (BrickIndex < 32) { H.FineBrickMask.x |= (1u << (uint(BrickIndex) & 31u)); }
+				else                 { H.FineBrickMask.y |= (1u << (uint(BrickIndex) & 31u)); }
+			}
+
+			float THit;
+			int3 HitVoxel;
+			int FaceAxis, FaceSign;
+			uint Material;
+			// TMaxUU, NOT the brick exit. The fine walk leaves this brick when
+			// the INTEGER test says the voxel is no longer in it (doctrine 2/3).
+			if (VoxelMarchWalkCellsInBrick(OriginLocalUU, SafeDir, t, TMaxUU,
+			                               BrickCoordWorld, Chunk, Brick, Steps, THit, HitVoxel,
+			                               FaceAxis, FaceSign, Material))
+			{
+				H.bHit = true;
+				H.THitUU = THit;
+				H.HitPosLocalUU = OriginLocalUU + SafeDir * THit;
+				H.Voxel = HitVoxel;
+				H.FaceAxis = FaceAxis;
+				H.FaceSign = FaceSign;
+				H.Material = Material;
+				H.Steps = Steps;
+				H.FaceNeighbourMask =
+					VoxelMarchGatherFaceNeighbours(HitVoxel, FaceAxis, FaceSign, Chunk, Brick);
+				return H;
+			}
+			t = tBrickNext;
+
+			if (Steps >= MarchStepBudget)
+			{
+				H.bExhausted = true;
+				H.TermReason = VOXEL_MARCH_TERM_BUDGET;
+				H.THitUU = t;
+				H.HitPosLocalUU = OriginLocalUU + SafeDir * t;
+				H.Steps = Steps;
+				return H;
+			}
+		}
+		if (!bChunkChanged)
+		{
+			t = max(t, tChunkNext);
+		}
+	}
+
+	// WHY THE OUTER LOOP ENDED. `t < TMaxUU` here means the 512-iteration cap
+	// stopped it with segment left -- which a correct walk cannot reach (a 51.2 m
+	// ray crosses 16 chunks) and which would look identical to a clean miss in
+	// every counter we have.
+	H.TermReason = (t < TMaxUU) ? VOXEL_MARCH_TERM_CHUNK_CAP : VOXEL_MARCH_TERM_SEGMENT;
+	H.Steps = Steps;
+	H.THitUU = TMaxUU;
+	H.HitPosLocalUU = OriginLocalUU + SafeDir * TMaxUU;
+	return H;
+}
+
+// The plain form the dispatcher calls: no chunk watched, so the mask records
+// nothing and the compiler removes it. Inside the HAS_BRICKPOOL guard, because
+// under source 0 neither this nor the function it forwards to exists.
+FVoxelMarchHit VoxelMarchTraverseBrickHier(float3 OriginLocalUU, float3 DirWorld,
+                                           float TMinUU, float TMaxUU, float ConeSlopeUU)
+{
+	return VoxelMarchTraverseBrickHierWatch(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU,
+	                                        int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF));
+}
+
+// ---------------------------------------------------------------------------
+// THE RING CASCADE (P3-B2b-1). Two rings, L0 + L1, no overlap.
+//
+// A loop over levels, each running the EXISTING walk over its own t-interval,
+// first hit wins -- rings are ordered near to far, so the first hit is the
+// nearest and there is nothing to compare. The walk itself is unmodified; the
+// ray is rescaled into level-L units before it is handed over (see the level
+// context above for why that is the whole trick).
+//
+// OVERLAP IS ZERO AND THAT IS DELIBERATE. The measured cost of padding every
+// ring's admit band was +9.2% resident chunks, p50 14.9 -> 17.3 ms, chunks/s
+// 968 -> 672, hitches 1 -> 47. With overlap 0 the seam is VISIBLE and
+// ATTRIBUTABLE: a silhouette pop is then either the missing overlap or the
+// traversal, and the ring-discordant column separates them. The marcher has no
+// mesh, so the crack the overlap exists to hide may not exist for it at all --
+// a question to test, not to assume in either direction.
+//
+// WHAT `flat` MEANS HERE, because a naive control would destroy the ratio: the
+// flat arm is RING TRANSITIONS WITHOUT CHUNK OR BRICK SKIPPING, not a level-0
+// walk across the whole reach. A level-0 flat walk over 256 m is 2,560 voxel
+// steps and would inflate the ratio into meaninglessness. Both arms cross the
+// same rings; only the skipping differs.
+// WatchChunk/WatchLevel: the descent mask is a LEVEL-LOCAL question. A chunk
+// coordinate at level 0 names a different place than the same triple at level 3,
+// so the watch is armed ONLY on the ring whose level matches -- passing a
+// level-0 coordinate to a level-3 walk would fill the mask with a confident
+// wrong answer, which is worse than the zeros it replaces. WatchLevel < 0
+// disarms it entirely.
+FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
+                                       float TMinUU, float TMaxUU, float ConeSlopeUU,
+                                       bool bHierarchical, int3 WatchChunk, int WatchLevel)
+{
+	FVoxelMarchHit Miss = (FVoxelMarchHit)0;
+	Miss.FaceAxis = -1;
+	Miss.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+	uint EnteredMask = 0u;
+
+	const uint RingCount = min(MarchRingCount, VOXEL_MARCH_MAX_RINGS);
+
+	// ===================================================================
+	// RING BOUNDARIES ARE CYLINDERS, NOT SPHERES
+	// ===================================================================
+	//
+	// This was a real defect, owner-visible, and it produced two symptoms
+	// that did not obviously share a cause:
+	//
+	//   * circular gaps at 128 / 256 / 512 m, whose FAR side was jagged in
+	//     the shape of whole missing chunks;
+	//   * flying straight up eventually stopped rendering the ground
+	//     DIRECTLY BELOW the camera, in a ring, and descending brought it
+	//     back -- with no chunk-shaped popping either way.
+	//
+	// The cause: these segment bounds are ray parameter t, i.e. 3D distance
+	// FROM THE CAMERA, while the streaming admission that decides which
+	// chunks are RESIDENT uses horizontal distance only --
+	//   DistSq = (CenterX - Anchor.X)^2 + (CenterY - Anchor.Y)^2
+	// with no Z term (VoxelWorldSubsystem.cpp, "a finer ring owns this
+	// footprint"). Streaming rings are CYLINDERS. This walk treated them as
+	// SPHERES, and the two diverge by exactly the camera's height.
+	//
+	// So from 300 m up, ground directly below sits at horizontal distance ~0
+	// -- level 0 territory, and streaming therefore never admits a level-2
+	// chunk there -- while the ray reaches it at t ~ 300 m, so this walk
+	// entered ring 2 and looked up level 2. Nothing resident, nothing drawn,
+	// a hole under the camera. At a seam the same error switches the ring at
+	// sqrt(Outer^2 - h^2) horizontally, i.e. EARLY, into an annulus streaming
+	// has only covered at the finer level.
+	//
+	// THE CORRECTION IS ONE SCALE FACTOR because the ray starts at the camera
+	// and the streaming anchor IS the camera's XY: horizontal distance at
+	// parameter t is exactly t * |Dir.xy|, so a boundary at radius R is
+	// crossed at t = R / |Dir.xy|. Linear and monotonic -- no quadratic, no
+	// second root, because the ray's XY origin is the axis of the cylinder.
+	//
+	// A PERFECTLY VERTICAL RAY THEN NEVER LEAVES RING 0, which is not a
+	// degenerate case to guard against -- it is the correct answer. Ground
+	// straight down is at horizontal distance 0 and is level-0 ground however
+	// high the camera is. The clamp only keeps the scale finite; TMaxUU is
+	// what actually bounds the walk.
+	//
+	// Horizontal rays are unaffected: |Dir.xy| = 1 makes this identity.
+	const float RingHorizLen = length(DirWorld.xy);
+	const float RingTScale = 1.0f / max(RingHorizLen, 1e-4f);
+
+	[loop]
+	for (uint L = 0; L < RingCount; ++L)
+	{
+		const float SegIn  = max(VoxelMarchRingInnerUU(L) * RingTScale, TMinUU);
+		const float SegOut = min(VoxelMarchRingOuterUU(L) * RingTScale, TMaxUU);
+		if (SegOut <= SegIn)
+		{
+			continue;
+		}
+		EnteredMask |= (1u << L);
+
+		VoxelMarchBeginLevel(L);
+		// 2^L. The ray goes in divided; the hit comes back multiplied.
+		const float S = float(1u << L);
+		const float InvS = 1.0f / S;
+
+		// if/else, not a ternary: HLSL's conditional operator takes numeric
+		// scalars, vectors and matrices only, never a struct.
+		// Armed only where the level matches -- see the note on the signature.
+		const int3 RingWatch = (int(L) == WatchLevel)
+		                           ? WatchChunk
+		                           : int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+		FVoxelMarchHit H;
+		if (bHierarchical)
+		{
+			H = VoxelMarchTraverseBrickHierWatch(OriginLocalUU * InvS, DirWorld,
+			                                     SegIn * InvS, SegOut * InvS, ConeSlopeUU,
+			                                     RingWatch);
+		}
+		else
+		{
+			H = VoxelMarchTraverseBrick(OriginLocalUU * InvS, DirWorld,
+			                            SegIn * InvS, SegOut * InvS, ConeSlopeUU);
+		}
+		if (H.bHit)
+		{
+			// Back into world units. Voxel and VoxelSizeUU stay in LEVEL-L
+			// terms and H.Level says which -- a level-1 voxel coordinate is not
+			// a level-0 one and silently promoting it would put terrain at half
+			// its size. Consumers read Level.
+			H.THitUU *= S;
+			H.HitPosLocalUU *= S;
+			H.VoxelSizeUU = VOXEL_FLUID_VOXEL_UU * S;
+			H.Level = int(L);
+			H.RingsEntered = EnteredMask;
+			return H;
+		}
+	}
+	Miss.RingsEntered = EnteredMask;
+	return Miss;
+}
+
+// ===========================================================================
+// PHASE 6 -- THE COVER SEGMENT
+// ===========================================================================
+//
+// ONE WALK, THE SAME WALK, AT HALF THE VOXEL SIZE. Everything below the ray
+// rescale is the terrain traversal unchanged: the same index lookup, the same
+// record validation, the same descriptor decode, the same popcount-ranked
+// palette read, the same face axis and the same AO gather. That is not a
+// convenience -- it is why a cover voxel can be shaded by the SAME
+// VoxelMaterialColor(mat, faceClass, voxel) the terrain uses, with no second
+// palette, no second decode and no second thing to keep in step.
+//
+// WHY IT IS AN OVERLAY AND NOT A RING. Rings partition the ray: ring L owns
+// [R*2^(L-1), R*2^L) and nothing else looks there, so first-hit-wins is
+// automatically nearest-hit-wins. COVER DOES NOT PARTITION -- it occupies the
+// SAME space as ring 0, sitting on top of the ground. So the two walks both run
+// over the near segment and the NEARER hit wins, which is a comparison the ring
+// loop deliberately does not have to make. Folding cover into the ring loop as
+// "ring -1" would have made it own an interval it does not own, and the symptom
+// would be terrain vanishing wherever grass grows.
+//
+// COST, STATED SO IT IS MEASURED AND NOT ASSUMED: with the overlay on, the near
+// segment is walked TWICE. voxel.Cover.March 0 is the control arm and it is a
+// permutation, not a branch, for the reason VOXEL_MARCH_RINGS is.
+FVoxelMarchHit VoxelMarchTraverseCoverSeg(float3 OriginLocalUU, float3 DirWorld,
+                                          float TMinUU, float TMaxUU, float ConeSlopeUU,
+                                          bool bHierarchical)
+{
+	FVoxelMarchHit Miss = (FVoxelMarchHit)0;
+	Miss.FaceAxis = -1;
+	Miss.TermReason = int(VOXEL_MARCH_TERM_SEGMENT);
+	Miss.LastBrickIndex = -1;
+	Miss.Material = VOXEL_MARCH_PLACEHOLDER_MATERIAL;
+
+	const float SegOut = min(TMaxUU, MarchCoverReachUU);
+	if (SegOut <= TMinUU)
+	{
+		return Miss;   // reach 0, or the whole segment is past it
+	}
+
+	VoxelMarchBeginCover();
+	// 1/2, spelled as its reciprocal for the same reason the rings do: the ray
+	// goes IN scaled so that one cover cell measures VOXEL_FLUID_VOXEL_UU in the
+	// walk's units, and the hit comes back scaled the other way.
+	const float S = 0.5f;
+	const float InvS = 2.0f;
+
+	FVoxelMarchHit H;
+	if (bHierarchical)
+	{
+		H = VoxelMarchTraverseBrickHier(OriginLocalUU * InvS, DirWorld, TMinUU * InvS,
+		                                SegOut * InvS, ConeSlopeUU);
+	}
+	else
+	{
+		H = VoxelMarchTraverseBrick(OriginLocalUU * InvS, DirWorld, TMinUU * InvS,
+		                            SegOut * InvS, ConeSlopeUU);
+	}
+
+	// THE CONTEXT IS RESTORED WHETHER OR NOT WE HIT, and it is not tidiness.
+	// VoxelMarchSourceOriginVoxel() reads GVoxelMarchIndexLevel, so leaving the
+	// cover context set would make a TERRAIN hit pack against the cover origin --
+	// terrain drawn at the wrong place, no error anywhere. The march kernel now
+	// packs at the hit's OWN level instead, which removes the dependency
+	// entirely; this restore is the belt to that braces.
+	VoxelMarchBeginLevel(0u);
+
+	if (!H.bHit)
+	{
+		return Miss;
+	}
+	H.THitUU *= S;
+	H.HitPosLocalUU *= S;
+	H.VoxelSizeUU = VOXEL_FLUID_VOXEL_UU * S;
+	// H.Voxel stays in COVER CELLS. Promoting it to level-0 voxels here would
+	// halve it and lose the odd cell -- the hit would move up to 5 cm and the
+	// per-voxel palette hash would key on a voxel that is not the one hit.
+	// Consumers read Level, exactly as they do for a ring-1 hit.
+	H.Level = VOXEL_MARCH_COVER_LEVEL;
+	return H;
+}
+
+#endif // VOXEL_MARCH_HAS_BRICKPOOL
+
+// ---------------------------------------------------------------------------
+// The one the renderer calls. A dispatcher, so that the two implementations can
+// coexist for the comparator without either of them knowing about the other.
+// ---------------------------------------------------------------------------
+FVoxelMarchHit VoxelMarchTraverse(float3 OriginLocalUU, float3 DirWorld,
+                                  float TMinUU, float TMaxUU, float ConeSlopeUU)
+{
+#if VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY
+	return VoxelMarchTraverseOccupancy(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU);
+#elif VOXEL_MARCH_RINGS
+	// The ring arm is a PERMUTATION, not a runtime branch, for the same reason
+	// the source is: a runtime branch leaves both paths in the binary and
+	// silently re-bases whichever arm is being measured. With rings off the
+	// generated code is byte-identical to what every level-0 leg measured, which
+	// is what makes rings-off a control rather than a near-control.
+	return VoxelMarchTraverseRings(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU,
+	                               VOXEL_MARCH_SKIP_LEVELS > 0,
+	                               int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF), -1);
+#elif VOXEL_MARCH_SKIP_LEVELS > 0
+	return VoxelMarchTraverseBrickHier(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU);
+#else
+	return VoxelMarchTraverseBrick(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 6: the terrain walk with ground cover overlaid on its near segment.
+// ---------------------------------------------------------------------------
+//
+// THE ORDER IS TERRAIN FIRST, THEN COVER, AND IT IS NOT ARBITRARY. The terrain
+// walk is the one whose hit is used when cover misses, so running it first means
+// the common path is unchanged and the cover walk is a tail. Running cover first
+// would leave the level context set to cover across the terrain walk, and the
+// two walks share that context.
+//
+// NEAREST WINS, not first. See VoxelMarchTraverseCoverSeg for why cover cannot
+// be a ring: the two intervals OVERLAP, so a comparison is required and the ring
+// loop's implicit ordering does not apply.
+//
+// TIES GO TO TERRAIN. Both t values come from the same ray but from walks at
+// different lattice scales, so an exactly-equal t is a coincidence rather than a
+// shared face; `<` rather than `<=` makes the choice deterministic and keeps
+// the cover-off arm's picture reachable from the cover-on arm.
+//
+// With VOXEL_MARCH_COVER 0 this is the dispatcher above and nothing else -- no
+// compare, no second walk, no cover uniform read.
+FVoxelMarchHit VoxelMarchTraverseWithCover(float3 OriginLocalUU, float3 DirWorld,
+                                           float TMinUU, float TMaxUU, float ConeSlopeUU)
+{
+	const FVoxelMarchHit T =
+		VoxelMarchTraverse(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU);
+#if VOXEL_MARCH_COVER && VOXEL_MARCH_HAS_BRICKPOOL
+	// ITS OWN DIAL. See VOXEL_MARCH_COVER_SKIP -- cover must not inherit the
+	// terrain arm's hierarchical walk while that walk has an open directional
+	// skip defect, or a cover bug and that defect are one symptom.
+	const FVoxelMarchHit C =
+		VoxelMarchTraverseCoverSeg(OriginLocalUU, DirWorld, TMinUU, TMaxUU, ConeSlopeUU,
+		                           VOXEL_MARCH_COVER_SKIP > 0);
+	if (C.bHit && (!T.bHit || C.THitUU < T.THitUU))
+	{
+		return C;
+	}
+#endif
+	return T;
+}

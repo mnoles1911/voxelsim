@@ -99,6 +99,17 @@ valid as a pair**:
 | `-VoxelFineTileDir` | command line | `D:/voxelsim/tile-cache` |
 | provider id | ini fall-through | `...-bdcab4bed` |
 
+> **UPDATE 2026-08-21 — the root split that made this trap possible is gone.**
+> `D:/voxelsim/tile-cache` now holds **all three tiers**: the 289 coarse tiles
+> (`s1`), the `bake_ver` 28 fine tiles (`s16`) and their flow superblocks. Before
+> this, coarse lived only under `D:/vox-trunk-cache` and `D:/vox-wet-cache` while
+> fine lived here, so the dir/id cross-product below had extra ways to be wrong
+> and no single `--cache-dir` could drive a bake. `DefaultTileDir` in
+> `DefaultGame.ini` was repointed to match (the coarse bytes are identical --
+> all 289 sha256-equal, and the L1 superblock fingerprint recomputed from the new
+> location still reads `066cf1d469ed`). The other roots are redundant copies now,
+> not alternatives. The dir/id pairing rule below still stands, and still matters.
+
 Both values are individually correct for *something*. Verified on disk:
 
 * `D:/vox-wet-cache/...-bdcab4bed/` — **exists, holds tile (-3,-4)**, created

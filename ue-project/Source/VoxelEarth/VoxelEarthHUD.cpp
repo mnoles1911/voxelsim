@@ -157,6 +157,78 @@ void AVoxelEarthHUD::DrawPerfHUD()
 	{
 		return;
 	}
+
+	// --- FPS, sampled every frame, republished at 4 Hz ---------------------
+	//
+	// WALL CLOCK, not world delta: world time is dilated by slomo, frozen by
+	// pause, and clamped by frame-rate smoothing, so any of those would make
+	// this report a rate the editor is not running at.
+	//
+	// This also happens to be the readout that would have caught the editor
+	// throttling PIE to exactly 3 FPS when its window lost focus -- a whole
+	// session was spent reading that as a streaming bug, because the panel
+	// showed only per-subsystem milliseconds and none of them looked wrong.
+	{
+		const double Now = FPlatformTime::Seconds();
+		if (FpsLastFrameSeconds > 0.0)
+		{
+			const double FrameMs = (Now - FpsLastFrameSeconds) * 1000.0;
+			++FpsWindowFrames;
+			FpsWindowWorstMs = FMath::Max(FpsWindowWorstMs, FrameMs);
+
+			if (FpsHistoryMs.Num() < FpsHistorySize)
+			{
+				FpsHistoryMs.Add(FrameMs);
+			}
+			else
+			{
+				FpsHistoryMs[FpsHistoryNext] = FrameMs;
+			}
+			FpsHistoryNext = (FpsHistoryNext + 1) % FpsHistorySize;
+		}
+		else
+		{
+			FpsWindowStartSeconds = Now;
+		}
+		FpsLastFrameSeconds = Now;
+
+		const double WindowSec = Now - FpsWindowStartSeconds;
+		if (WindowSec >= double(FpsRefreshIntervalSeconds) && FpsWindowFrames > 0)
+		{
+			const double Fps = double(FpsWindowFrames) / WindowSec;
+			const double MeanMs = (WindowSec * 1000.0) / double(FpsWindowFrames);
+
+			// 1% LOW, the way a benchmark means it: the mean of the slowest 1%
+			// of recent frames, expressed as a frame rate. A plain average
+			// hides hitches, and hitches are what this project keeps chasing --
+			// a world that streams at a smooth 60 with a 300 ms stall every
+			// few seconds reads as "fine" on the mean and awful in the hands.
+			double OnePercentLowFps = 0.0;
+			if (FpsHistoryMs.Num() >= 20)
+			{
+				TArray<double> Sorted = FpsHistoryMs;
+				Sorted.Sort([](const double& A, const double& B) { return A > B; }); // slowest first
+				const int32 Count = FMath::Max(1, Sorted.Num() / 100);
+				double SumMs = 0.0;
+				for (int32 I = 0; I < Count; ++I)
+				{
+					SumMs += Sorted[I];
+				}
+				const double AvgWorstMs = SumMs / double(Count);
+				OnePercentLowFps = (AvgWorstMs > 0.0) ? (1000.0 / AvgWorstMs) : 0.0;
+			}
+
+			CachedFpsValue = Fps;
+			CachedFpsText = FString::Printf(
+				TEXT("FPS %.1f  (%.1f ms)   1%% low %.1f   worst %.0f ms"),
+				Fps, MeanMs, OnePercentLowFps, FpsWindowWorstMs);
+
+			FpsWindowStartSeconds = Now;
+			FpsWindowFrames = 0;
+			FpsWindowWorstMs = 0.0;
+		}
+	}
+
 	UVoxelWorldSubsystem* Subsystem = World->GetSubsystem<UVoxelWorldSubsystem>();
 	if (!Subsystem)
 	{
@@ -251,9 +323,28 @@ void AVoxelEarthHUD::DrawPerfHUD()
 	CachedPerfHUDText.ParseIntoArrayLines(Lines, /*bCullEmpty*/ false);
 
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.55f), PerfPanelMarginPx, PerfPanelMarginPx, 620.f,
-	         PerfPanelLineHeightPx * float(Lines.Num()) + 8.f);
+	         PerfPanelLineHeightPx * float(Lines.Num() + (CachedFpsText.IsEmpty() ? 0 : 1)) + 8.f);
 
 	float LineY = PerfPanelMarginPx + 4.f;
+
+	// THE FPS LINE IS DRAWN FROM ITS OWN CACHE, not from CachedPerfHUDText,
+	// because that string is rebuilt once a second and an FPS readout that
+	// only moves at 1 Hz cannot be used for what people use an FPS readout
+	// for. Same panel, same origin, different refresh rate.
+	//
+	// Coloured by frame rate rather than the panel's green, so "is it bad" is
+	// answerable without reading the number: >= 55 green, >= 30 amber, below
+	// that red. Those thresholds are just legibility, not a target.
+	if (!CachedFpsText.IsEmpty())
+	{
+		const FLinearColor FpsColor =
+			(CachedFpsValue >= 55.0) ? FLinearColor(0.2f, 1.f, 0.3f, 1.f)
+			: (CachedFpsValue >= 30.0) ? FLinearColor(1.f, 0.85f, 0.2f, 1.f)
+			                           : FLinearColor(1.f, 0.35f, 0.25f, 1.f);
+		DrawText(CachedFpsText, FpsColor, PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);
+		LineY += PerfPanelLineHeightPx;
+	}
+
 	for (const FString& Line : Lines)
 	{
 		DrawText(Line, FLinearColor(0.2f, 1.f, 0.3f, 1.f), PerfPanelMarginPx + 6.f, LineY, nullptr, 1.f, false);

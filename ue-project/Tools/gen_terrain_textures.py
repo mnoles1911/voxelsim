@@ -241,8 +241,13 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     p = write_palette(os.path.join(out, "T_VoxelPalette.png"))
-    print("T_VoxelPalette.png   16x1   materials=%d biome-tinted-runs=%s"
-          % (len(PALETTE), biome_tinted_runs()))
+    # The width is PRINTED, not spelled 16. It used to be a literal, and the
+    # table it describes is now generated from vxc::Material and grows with it
+    # -- a hardcoded size in the line that tells you what was written is the
+    # kind of thing that stays right for exactly as long as nobody adds a
+    # material.
+    print("T_VoxelPalette.png   %dx1   materials=%d biome-tinted-runs=%s"
+          % (PALETTE_WIDTH, len(PALETTE), biome_tinted_runs()))
 
     b = write_biome_lut(os.path.join(out, "T_VoxelBiomeLUT.png"))
     print("T_VoxelBiomeLUT.png  %dx%d  temp u8 %d..%d, precip u8 %d..%d"

@@ -1,6 +1,11 @@
 #include "VoxelPerfRunSubsystem.h"
 
 #include "VoxelDebug.h"
+// P7: the GI arm this run was measured on. VoxelGI.h for the three switches and
+// the anchored outcome, VoxelGIVolume.h for voxel.GI.Volume's reader -- the two
+// live in different modules and VoxelEarth already depends on VoxelEarthShaders.
+#include "VoxelGI.h"
+#include "VoxelGIVolume.h"
 #include "VoxelSkySubsystem.h" // FVoxelSkyState / VoxelSky::GetTimeScale -- the sun pose this run was measured at
 #include "VoxelWorldSubsystem.h"
 
@@ -277,6 +282,15 @@ void UVoxelPerfRunSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfDepth="), DepthM) && DepthM > 0.f)
 		{
 			DepthUU = double(DepthM) * 100.0;
+		}
+
+		// -VoxelPerfHeightM=<metres above surface>. Same guarded-scalar shape as
+		// -VoxelPerfDepth above. See HeightAboveSurfaceUU for why the pose is a
+		// parameter and which two switches do NOT move it.
+		float HeightM = 0.f;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelPerfHeightM="), HeightM) && HeightM > 0.f)
+		{
+			HeightAboveSurfaceUU = double(HeightM) * 100.0;
 		}
 
 		float SpeedMPerSec = 0.f;
@@ -824,6 +838,45 @@ void UVoxelPerfRunSubsystem::FinishRun()
 			bHaveSky = true;
 		}
 	}
+	// --- GI ARM, READ BACK FROM THE SUBSYSTEM AND FROM THE CVARS -------------
+	//
+	// Same reasoning as the sky block above, and the same failure it prevents:
+	// a frame-time number read without the arm it was taken on. GI's arm is
+	// three switches and one RUNTIME OUTCOME, and it is the outcome that makes
+	// this worth reading back rather than reconstructing from a command line.
+	//
+	// THIS EXISTS BECAUSE THE PROJECT ALREADY MADE THE MISTAKE. Every leg on
+	// record ran with voxel.GI.Enabled 1 and voxel.GI.Volume 1 while three
+	// documents and the cvar's own help text said both shipped at 0, so a
+	// month of budgeting was done against a baseline that already contained
+	// GI's cost. A leg that stamps its own arm cannot be misread that way.
+	//
+	// giVolumeAnchored IS THE ONE NO CVAR REPORTS. A leg can have every switch
+	// on and still have sampled nothing all run, because EnsureVolumeOrigin
+	// refused to identify the terrain pool (P7-a). Its p95 then describes GI
+	// being off while the command line says it is on -- which is precisely the
+	// class of silent arm failure -VoxelGIOff's own re-check was added for.
+	int32 GiEnabled = 0, GiVolume = 0, GiSourceBricks = 0, GiAnchored = 0, GiIdentityRefusals = 0;
+	int32 GiMarchBricks = 0;
+	bool bHaveGI = false;
+	if (UWorld* World = GetWorld())
+	{
+		if (const UVoxelGISubsystem* GI = World->GetSubsystem<UVoxelGISubsystem>())
+		{
+			GiAnchored = GI->IsVolumeAnchored() ? 1 : 0;
+			GiIdentityRefusals = GI->GetPoolIdentityRefusals();
+			bHaveGI = true;
+		}
+	}
+	GiEnabled = VoxelGI::IsEnabled() ? 1 : 0;
+	GiVolume = VoxelGIVolume::IsEnabled() ? 1 : 0;
+	GiMarchBricks = VoxelGI::IsMarchBricksEnabled() ? 1 : 0;
+	// The two arms are reported SEPARATELY even though IsQuadIngestRetired()
+	// is true on both. Folding them would make a march leg and a fed-by-nothing
+	// leg produce identical JSON, and those two describe opposite things: one
+	// has GI content produced on the GPU, the other has no GI content at all.
+	GiSourceBricks = (VoxelGI::IsQuadIngestRetired() && GiMarchBricks == 0) ? 1 : 0;
+
 	const float SkyTimeScale = EffectiveSkyTimeScale(SkyState);
 	int32 SkyHour = 0, SkyMinute = 0;
 	PerfClockFromLocalHours(SkyState.LocalHours, SkyHour, SkyMinute);
@@ -940,7 +993,19 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		TEXT("  \"dateMMDD\": \"%02d-%02d\",\n")
 		TEXT("  \"timeScale\": %.3f,\n")
 		TEXT("  \"sunAltitudeDeg\": %.2f,\n")
-		TEXT("  \"sunAzimuthDeg\": %.2f\n")
+		TEXT("  \"sunAzimuthDeg\": %.2f,\n")
+		// P7. The GI arm, recorded unconditionally, for the sun block's reason.
+		// giSubsystemPresent distinguishes "GI was off" from "there was no GI
+		// subsystem in this world" -- both of which would otherwise write
+		// giVolumeAnchored: 0, exactly as a zeroed sky state and midnight write
+		// identical JSON above.
+		TEXT("  \"giSubsystemPresent\": %d,\n")
+		TEXT("  \"giEnabled\": %d,\n")
+		TEXT("  \"giVolume\": %d,\n")
+		TEXT("  \"giSourceBricks\": %d,\n")
+		TEXT("  \"giMarchBricks\": %d,\n")
+		TEXT("  \"giVolumeAnchored\": %d,\n")
+		TEXT("  \"giPoolIdentityRefusals\": %d\n")
 		TEXT("}\n"),
 		DurationSeconds, N, P50, P95, Max, HitchCount, HitchThresholdMs, (long long)ChunksLoaded, AvgChunksPerSec,
 		AvgBudgetSaturationPct, WarmupExcludeSeconds, PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount,
@@ -950,7 +1015,9 @@ void UVoxelPerfRunSubsystem::FinishRun()
 		                                          : TEXT("surface"),
 		DepthUU / 100.0, LinearSpeedUUPerSecOverride / 100.0, HeadingDeg, PreflightSec, LingerSec, StaticYawDeg, StaticPitchDeg,
 		UndergroundFraction,
-		SkyHour, SkyMinute, SkyMonth, SkyDay, SkyTimeScale, SkyState.SunAltitudeDeg, SkyState.SunAzimuthDeg);
+		SkyHour, SkyMinute, SkyMonth, SkyDay, SkyTimeScale, SkyState.SunAltitudeDeg, SkyState.SunAzimuthDeg,
+		bHaveGI ? 1 : 0, GiEnabled, GiVolume, GiSourceBricks, GiMarchBricks, GiAnchored,
+		GiIdentityRefusals);
 
 	FFileHelper::SaveStringToFile(Json, *OutPath);
 
@@ -962,6 +1029,66 @@ void UVoxelPerfRunSubsystem::FinishRun()
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("VoxelPerfRun post-warmup (t>=%.0fs): frames=%d p50=%.2fms p95=%.2fms max=%.2fms hitches=%d"), WarmupExcludeSeconds,
 	       PostWarmupN, PostWarmupP50, PostWarmupP95, PostWarmupMax, PostWarmupHitchCount);
+
+	// --- THE HITCH COUNT SILENTLY CHANGED MEANING, SO SAY WHEN IT HAS --------
+	//
+	// hitchThresholdMs is a FIXED 33.3 (VoxelDebug::kHitchThresholdMs). When
+	// this threshold was chosen, p50 was 23.3 ms and a hitch genuinely meant a
+	// spike. Since shadows started rendering on 2026-08-19 the shadowed
+	// baseline runs p50 ~34.7, so the MEDIAN frame now exceeds the threshold
+	// and roughly 65% of frames count as "hitches" for the entirely mundane
+	// reason that the scene runs at 28.8 fps.
+	//
+	// A hitch count taken in that regime is not comparable to any historical
+	// one -- including the x3.2 that governed voxel GI for a month -- and
+	// re-basing the threshold would in turn re-base every historical figure.
+	// So the number is kept as it is and its meaning is stated, once, in the
+	// run's own log, immediately after it is printed. Judge such a leg on p95
+	// and postWarmupMaxFrameMs instead.
+	//
+	// TWO-SIDED BY CONSTRUCTION: this fires only when p50 has actually crossed
+	// the bar, and stays silent otherwise, so it is a statement about this leg
+	// rather than a warning that must appear in every long-enough run.
+	//
+	// GREP: "HITCH COUNT IS NOT A SPIKE COUNT"
+	if (PostWarmupN > 0 && PostWarmupP50 >= HitchThresholdMs)
+	{
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("VoxelPerfRun: HITCH COUNT IS NOT A SPIKE COUNT ON THIS LEG. post-warmup p50=%.2fms is at ")
+		       TEXT("or above hitchThresholdMs=%.1f, so the MEDIAN frame counts as a hitch and hitches=%d of ")
+		       TEXT("%d frames mostly measures the frame rate, not spikes. NOT comparable to any hitch count ")
+		       TEXT("taken when p50 was below the threshold. Judge this leg on p95 (%.2fms) and ")
+		       TEXT("postWarmupMaxFrameMs (%.2fms)."),
+		       PostWarmupP50, HitchThresholdMs, PostWarmupHitchCount, PostWarmupN, PostWarmupP95, PostWarmupMax);
+	}
+
+	// --- THE GI ARM, NEXT TO THE NUMBERS IT QUALIFIES -----------------------
+	//
+	// Same placement rule as the sky line below and for the same stated reason:
+	// "a reader who has scrolled to the bottom for the p95 should not have to
+	// scroll back up to find out which sun it was measured under".
+	//
+	// GREP: "VoxelPerfRun GI arm:"
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("VoxelPerfRun GI arm: subsystem=%d enabled=%d volume=%d sourceBricks=%d marchBricks=%d ")
+	       TEXT("anchored=%d identityRefusals=%d -- %s"),
+	       bHaveGI ? 1 : 0, GiEnabled, GiVolume, GiSourceBricks, GiMarchBricks, GiAnchored,
+	       GiIdentityRefusals,
+	       GiMarchBricks != 0
+	           ? TEXT("P7 GPU CONE MARCH over the resident bricks. The CPU voxelize/solve/encode/upload ")
+	             TEXT("chain is retired, so this leg and a control-arm leg differ in WHAT PRODUCED THE ")
+	             TEXT("LIGHTING as well as in cost -- read the pair as a whole-frame A/B and nothing ")
+	             TEXT("finer. v1 has no bounce and binary cones, so caves read darker; judge the picture ")
+	             TEXT("on screenshots, never on this number")
+	           : (GiSourceBricks != 0
+	                  ? TEXT("P7-c MEASUREMENT ARM: the light field is fed by nothing. These frame times ")
+	                    TEXT("describe a run with NO GI CONTENT; read them for streaming, never as a ")
+	                    TEXT("lighting arm")
+	                  : (GiEnabled != 0 && GiVolume != 0 && GiAnchored == 0
+	                         ? TEXT("GI IS SWITCHED ON BUT WAS NEVER ANCHORED -- EnsureVolumeOrigin never ")
+	                           TEXT("identified the terrain pool (P7-a), so this leg measures GI OFF while ")
+	                           TEXT("its switches say on")
+	                         : TEXT("arm as configured"))));
 
 	// The arm this leg belongs to, in one line, next to the numbers it
 	// qualifies. The per-window lines above already carry the same state, but a

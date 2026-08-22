@@ -319,6 +319,50 @@ private:
 // failure is the silent no-op, and an importer that folds 828 species into a
 // table of 500 without a number anywhere is one. Zero `kept` against a
 // non-empty manifest is a wiring fault by definition.
+// --- WHICH CONTENT A COVER VOLUME CANNOT HOLD, BY NAME ----------------------
+//
+// A cover volume composes ONE pitch (AssetField::resolveForCoverCompose, and
+// asset-forge/README.md:38-41 for why: nothing in voxel-core resamples, so a
+// grid composed at the wrong pitch does not degrade, it changes SIZE). Every
+// detail species baked at any other pitch is therefore dropped -- correctly,
+// and silently unless something says so.
+//
+// THIS EXISTS SO THAT IS NOT SILENT. The rule this project keeps paying for is
+// that content failing a gate gets debugged as code: the drop happens per
+// instance, deep in a resolve loop, where the species has no name any more.
+// Called once when a cover volume is configured, this names every species that
+// volume will never show -- the same discipline as ValidateRegionRequest
+// refusing SizeZ > 4095 with the species still nameable by the caller, and as
+// AssetTableBuildStats reporting tooRare/noBiome rather than just keeping fewer
+// rows.
+//
+// It reads the MANIFEST, not the banks, for the same reason placement does:
+// the manifest is the authored truth and does not depend on which banks happen
+// to have been exported today.
+struct AssetCoverPitchRefusal {
+    std::string name;            // banks/<name>/<name>-NNNN.vxa
+    AssetKind kind = AssetKind::kTree;
+    uint32_t voxelSizeMm = 0;    // what it was actually baked at
+};
+
+// Every DETAIL-lattice, scattered species whose bake pitch is not `pitchMm`.
+//
+// Terrain-lattice species are not refusals and are not listed: they compose
+// into the WORLD volume through the asset stamp and are already there. Layer
+// kAssetLayerNotScattered (the 382 animals) is likewise not a refusal -- those
+// never enter any volume, by an owner decision that predates this one.
+inline std::vector<AssetCoverPitchRefusal>
+assetCoverPitchRefusals(const AssetManifest& manifest, uint32_t pitchMm) {
+    std::vector<AssetCoverPitchRefusal> out;
+    for (const AssetManifestSpecies& s : manifest.species()) {
+        if (s.layer == kAssetLayerNotScattered) continue;  // animals: not ours
+        if (s.terrainLattice) continue;                    // already in the world
+        if (s.voxelSizeMm == pitchMm) continue;            // composes fine
+        out.push_back(AssetCoverPitchRefusal{s.name, s.kind, s.voxelSizeMm});
+    }
+    return out;
+}
+
 struct AssetTableBuildStats {
     int kept = 0;           // manifest SPECIES kept (>= 1 output row each)
     int splitRows = 0;      // EXTRA output rows from per-biome overrides: a

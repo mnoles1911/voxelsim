@@ -19,6 +19,7 @@ the 2026-08-05 consolidation:**
 | `BAKE_VERSION` | **28** (was 14) | everything the bake emits that is not ground |
 | `kWorldGenVersion` | **28** (was 23) | the client amplifier's maths |
 | shipped world | seed `20260719`, 17×17 coarse tiles | the world every measurement below is from unless it says otherwise |
+| world source | `D:/voxelsim/tile-cache` | **the single cache root.** Coarse (`s1`), fine (`s16`) and flow superblocks all live under it -- consolidated 2026-08-21 |
 
 **What moved since:** `BAKE_VERSION` 15–28 is water (lake depth and signed shore
 distance, ponds, headwaters) and then **placement** — bake 28 adds five per-tile
@@ -122,6 +123,22 @@ with the elevation and flow planes bit-identical on round trip. So:
     2 km view radius     ~1.7 MB
     289-tile world       ~9.7 GB            (not 58)
 
+**THOSE FIGURES ARE NOW STALE, and the gap is 12x.** Measured 2026-08-21 over the
+15 resident `bake_ver` 28 tiles in `D:/voxelsim/tile-cache`, all written with the
+default `--codec zstd`: **mean 414 MB per tile**, range 220-549 MB. Not 33 MB.
+The 201.4 -> 33.4 MB figure above was taken on tile (-5, 2) at an earlier bake
+version and is still a correct measurement *of that tile at that version* -- the
+tile has simply grown a great deal since (basins v2, headwater tables, span and
+placement planes). For planning today:
+
+    per fine tile        ~414 MB compressed   (measured, n=15, land-biased)
+    256-tile world       ~100 GB              (not 9.7)
+
+The n=15 sample is biased toward land -- those tiles were baked for water and
+karst work -- and 66 of the 256 bakeable tiles are all-ocean and will be much
+smaller, so **~70-100 GB** is the honest range. Re-measure before quoting this:
+it has been wrong by an order of magnitude once already.
+
 **`pregen --codec` now defaults to `zstd`** (since 2026-08-03,
 `pregen.py:1232`), and the migration is under way rather than pending: of the 38
 resident tiles of the current world, **24 are `CODEC_ZSTD` and 14 are
@@ -141,6 +158,51 @@ terrain, not a link error**. With no DLL present a `CODEC_ZSTD` tile is refused
 whole with `kNoDecompressor` and never decoded as zeros.
 
 ---
+
+## 2b. The cache root — one directory, all three tiers
+
+**`D:/voxelsim/tile-cache` is the world.** Coarse (`s1`), fine (`s16`) and the
+flow superblocks (`flow0`, `flow1`) all live under it:
+
+    D:/voxelsim/tile-cache/
+      terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1/     289 coarse tiles, 435 MB
+      terrain-diffusion-unlabeled-80b9ca451a23eae4-b19d281fd/000000000135276f/
+        s16/    the bake_ver 28 fine tiles
+        flow0/  flow1/   the superblocks those tiles were baked against
+        world-identity.json
+
+**Consolidated 2026-08-21, and it was not cosmetic.** Before that date the coarse
+tier lived only in `D:/vox-trunk-cache` and `D:/vox-wet-cache` while the fine tier
+lived here, so **no single `--cache-dir` could see both** -- `pregen --mode bake`
+takes one root and reads coarse from it, writes fine into it. A bake pointed at
+the fine root tried to *generate* coarse tiles (and cannot: the checkpoint weights
+died with the pod, see `docs/parent-hook-scope.md`), and a bake pointed at a coarse
+root could not see the finished fine tiles or their superblocks, so it would
+re-bake all 256 and rebuild the pyramid.
+
+The 289 coarse tiles were copied in from `D:/vox-trunk-cache` and verified two
+ways, because a filename match proves only that someone typed the right string:
+
+* all 289 files `sha256`-equal to the source, and
+* the **L1 flow superblock fingerprint recomputed from the new location still
+  reads `066cf1d469ed`** -- the value stored in the `.vxfl` headers that the
+  shipped fine tiles were actually baked against. That digest is one sha256 pass
+  over all 256 coarse tiles, so it proves the bytes, not the path.
+
+`D:/vox-trunk-cache` and `D:/vox-wet-cache` still hold identical coarse copies.
+They are now **redundant, not authoritative** -- see `docs/backlog.md` for the
+cleanup item, and mind the junction hazard before any recursive delete.
+
+The engine reads the same root: `DefaultTileDir`, `DefaultFineTileDir` and
+`DefaultFineTileProviderId` in `ue-project/Config/DefaultGame.ini` now all name
+it. `DefaultTileDir` used to point at `D:/vox-wet-cache`; since the bytes are
+identical that repoint changed where the engine reads, not what it reads.
+
+A stale `manifest.json` sat at the cache root describing a **different world**
+(seed 424242, provider `...71e2b362e3241e71`, 121 tiles) -- a leftover from an
+old pod packaging run, read by nothing. Renamed to
+`manifest.STALE-seed424242-provider71e2b362.json` rather than deleted.
+
 
 ## 3. Version identity: three numbers, and what rolls which
 

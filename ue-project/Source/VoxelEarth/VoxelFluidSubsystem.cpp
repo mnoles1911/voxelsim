@@ -12,6 +12,7 @@
 #include "VoxelWaterSubsystem.h"
 #include "VoxelSkySubsystem.h"   // sun direction for the renderer's constant-sky Fresnel
 #include "SceneViewExtension.h"  // FSceneViewExtensions::NewExtension
+#include "VoxelMarchRenderer.h"  // VoxelMarchPublishSource -- the P3 marcher's only hookup
 #include "VoxelCoords.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
@@ -265,6 +266,55 @@ namespace
 		TEXT("against vxc::fluidFillRegion, the unit-tested CPU reference. Result in ")
 		TEXT("the perf line as verify=pass|FAIL|stale; every mismatch logs its first ")
 		TEXT("differing word. Debug only -- it costs a 16 MiB readback per cycle."),
+		ECVF_Default);
+
+	// ---- the march spike's substrate (Phase 0 gate G1) --------------------
+	//
+	// WHAT THIS EXISTS TO FIX. The occupancy volume holds TERRAIN bits, but it
+	// is allocated and placed by the FLUID: the origin latches on the first
+	// spawn, emit or armed faucet, and until it does there is no volume at all.
+	// So a march spike that needs "terrain occupancy around the viewer" could
+	// not get it without also creating water -- the first G1 leg ran its whole
+	// length against occupancy=0/0 and measured nothing.
+	//
+	// AND THE OBVIOUS WORKAROUND IS WORSE THAN IT LOOKS. Spawning particles to
+	// force a region into existence puts the SOLVER in the frame beside the
+	// march. The spike's entire purpose is a clean per-pixel cost, read against
+	// Arm A's draw-path numbers; a solver running alongside turns simGpuMs from
+	// a zero you can ignore into a confound you have to subtract, and the spike
+	// frame stops being the frame the other Phase 0 arms were measured on.
+	//
+	// WHAT IT DOES. Latches and recentres the occupancy window on the CAMERA,
+	// with no water anywhere: the existing RecentreTo path does the sliding, the
+	// existing queue does the filling, and the sim tick still posts every frame
+	// -- but with SimSlotBound == 0 it adds the volume's clear/fill passes and
+	// returns BEFORE any solver pass (VoxelFluidSim.cpp's own early-out). That
+	// is terrain occupancy around the viewer, no solver, which is the honest
+	// substrate.
+	//
+	// AND Z FOLLOWS THE CAMERA HERE, which the fluid's own rule does not do:
+	// the water window anchors Z to the GROUND (floor ~13 m under the surface)
+	// because water lives on terrain. A marcher wants the camera at the centre
+	// of the box in all three axes, or its 25.6 m of reach is spent underground
+	// while the camera flies above it. That override is confined to this mode
+	// AND to a session where nothing has ever spawned, so it can never move the
+	// window out from under live water.
+	//
+	// MEASUREMENT MODE, NOT A FLUID MODE. Off by default. Toggling it with the
+	// fluid already latched moves the window in Z, which the recentre policy
+	// will route through its own teleport re-latch and log as such.
+	TAutoConsoleVariable<int32> CVarVoxelMarcherSpikeVolume(
+		TEXT("voxel.Marcher.SpikeVolume"), 0,
+		TEXT("Phase 0 gate G1 substrate: keep the occupancy volume alive and recentred on the ")
+		TEXT("CAMERA, independent of the fluid solver. 1 = the origin latches on the first tick ")
+		TEXT("with a camera instead of waiting for water, the volume fills from vxc::World around ")
+		TEXT("the viewer, and Z follows the camera rather than the ground so the box is centred on ")
+		TEXT("the eye in all three axes. NO PARTICLES ARE CREATED and no solver pass runs (zero ")
+		TEXT("slots early-outs before the solver), so simGpuMs stays at the occupancy fill cost ")
+		TEXT("alone -- which is the whole point: the march must be measured in a frame the solver ")
+		TEXT("is not sharing. Needs voxel.Fluid.Enable 1 (that is what constructs the volume). ")
+		TEXT("The Z override applies only while nothing has ever spawned, so this can never move ")
+		TEXT("the window out from under live water. Measurement mode, off by default."),
 		ECVF_Default);
 
 	// ---- the screen-space fluid renderer (Phase 4 / spike b) ---------------
@@ -792,6 +842,21 @@ FIntVector UVoxelFluidSubsystem::DesiredOriginVoxel(const FVector& ViewOriginUU)
 	LastViewOriginUU = ViewOriginUU; // GroundVoxelZAtCamera reads this
 	const VoxelCoords::FVoxelCoord CamVoxel = VoxelCoords::WorldToVoxel(ViewOriginUU);
 	const int32 Half = vxc::kFluidVolumeDimVoxels / 2;
+
+	// THE MARCH SPIKE'S SUBSTRATE (voxel.Marcher.SpikeVolume, see its cvar).
+	// Camera-centred in Z as well as XY, so the marcher's 25.6 m of reach is
+	// spent around the eye instead of underground. Guarded on "nothing has ever
+	// spawned" as well as on the cvar: with that guard this branch cannot move
+	// the window out from under live water no matter when the cvar is flipped,
+	// which is what lets a measurement mode touch the fluid's own geometry at
+	// all.
+	if (CumulativeSpawnRequested == 0 &&
+	    CVarVoxelMarcherSpikeVolume.GetValueOnGameThread() != 0)
+	{
+		return FIntVector(int32(CamVoxel.X) - Half, int32(CamVoxel.Y) - Half,
+		                  int32(CamVoxel.Z) - Half);
+	}
+
 	return FIntVector(int32(CamVoxel.X) - Half, int32(CamVoxel.Y) - Half,
 	                  // Z ANCHORS TO THE GROUND, NOT THE CAMERA. The round-3
 	                  // playtest flew at 80 m and every faucet landed 55 m BELOW
@@ -1770,17 +1835,37 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 
 	// ---- view origin -------------------------------------------------------
 	FVector ViewOrigin = FVector::ZeroVector;
+	// Whether that origin came from a real camera or is still the zero default.
+	// Only the spike substrate reads it, and it needs to: its latch condition is
+	// "there is a camera" rather than "water is coming", so without this it
+	// would latch the window at the world origin on tick one and then pay a
+	// teleport re-latch plus a second multi-second fill the moment the pawn
+	// exists. The water paths are unaffected -- they latch on an emission, by
+	// which time a camera has always existed.
+	bool bHaveCamera = false;
 	if (const APlayerController* PC = World->GetFirstPlayerController())
 	{
 		if (PC->PlayerCameraManager != nullptr)
 		{
 			ViewOrigin = PC->PlayerCameraManager->GetCameraLocation();
+			bHaveCamera = true;
 		}
 	}
 
 	// ---- origin latch (first spawn / emit / faucet arm) --------------------
+	//
+	// AND ON voxel.Marcher.SpikeVolume, WITH NO WATER. The three original
+	// conditions are all "some water is about to exist", which is correct for a
+	// fluid but made the terrain occupancy volume unreachable to anything else:
+	// the G1 march spike needs the volume and needs the solver NOT to run, and
+	// those were mutually exclusive until this clause. It latches on the first
+	// tick that has a camera; nothing downstream changes, because everything
+	// downstream is already gated on bOriginLatched rather than on particles.
+	const bool bSpikeVolume = CVarVoxelMarcherSpikeVolume.GetValueOnGameThread() != 0;
 	const bool bLatchedThisTick =
-		!bOriginLatched && (PendingSpawnCount > 0 || EmitPerSecond > 0.0f || bFaucets);
+		!bOriginLatched &&
+		(PendingSpawnCount > 0 || EmitPerSecond > 0.0f || bFaucets ||
+		 (bSpikeVolume && bHaveCamera));
 	if (bLatchedThisTick)
 	{
 		LatchOrigin(ViewOrigin);
@@ -2271,6 +2356,17 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			L.RenderState->OccupancyKeepAlive = Occupancy;
 			L.RenderState->SimState = SimState;
 		}
+
+		// THE ONE WIRE INTO THE RAY-MARCH RENDERER (P3,
+		// docs/ray-marching-plan-2026-08-19.md). Until the brick pool lands, the
+		// marcher's traversal source is this same occupancy volume, and this
+		// subsystem is the only thing in the process that owns both it and a
+		// UWorld. The publisher owns the march extension's whole lifetime --
+		// creates it on first call, refreshes the pointer after that -- so
+		// nothing here has to know when to make it or when to let it go, and
+		// voxel.March 0 (the default) means it declines every frame and costs a
+		// lock. Deliberately OUTSIDE the render-state lock: it takes its own.
+		VoxelMarchPublishSource(World, Occupancy);
 	}
 
 	// ---- conservation: asserted on every readback generation ---------------
@@ -2532,6 +2628,59 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 			                  : FString::Printf(TEXT("%.2f"), RenderStats.RenderGpuMs);
 		}
 
+		// marchGpuMs: THE PHASE 0 GATE G1 NUMBER
+		// (docs/ray-marching-plan-2026-08-19.md #3). Printed on this line and not
+		// on a line of its own, because it has to be read next to simGpuMs -- the
+		// spike shares a frame with the solver, and a march number quoted without
+		// the sim that was running beside it is a number nobody can reproduce.
+		// tools/fluid-spike-measure.ps1 parses `simGpuMs=<number>`;
+		// `marchGpuMs=<number>` is the same shape, so the same percentile
+		// machinery reads it.
+		//
+		// THE ARM IS ON THE SAME FIELD as the time, deliberately: budget and
+		// nofetch ARE the measurement's independent variables, and a log that makes
+		// you join a number to a launch command by hand is a log that gets joined
+		// to the wrong one.
+		//
+		// THE THREE BUCKETS, AND THE ONE THAT WAS WRONG. "off" is ONLY EVER
+		// voxel.Marcher.Spike 0 -- and that is now true by construction, because
+		// the arm is read from the cvar here rather than published by the pass.
+		// The first leg printed "off" with the cvar at 886: the budget was
+		// published from inside AddMarchSpikePass, the view extension declined
+		// every frame for want of an occupancy volume, so the pass never ran and
+		// never published, and "could not run" was indistinguishable from "was not
+		// asked to". That is the precise failure this field exists to prevent, so
+		// the fix was to move the question off the path that failed rather than to
+		// rename the bucket.
+		const FVoxelMarchSpikeArm SpikeArm = VoxelMarchSpikeGetArm();
+		FString MarchField;
+		if (SpikeArm.StepBudget <= 0)
+		{
+			MarchField = TEXT("off");
+		}
+		else if (RenderStats.MarchFrames == 0 || RenderStats.MarchGpuMs < 0.0f)
+		{
+			// ARMED AND NOT LANDING, and the field says WHY rather than making the
+			// reader guess. The first leg spent its whole run here -- volume=none,
+			// because the occupancy volume is only allocated once the fluid's origin
+			// latches, and that latch used to need water. voxel.Marcher.SpikeVolume
+			// is the fix; this reason string is how anyone reading a log finds that
+			// out without reading this file.
+			const TCHAR* VolumeReason = !Occupancy.IsValid()  ? TEXT("none")
+			                            : !bOriginLatched     ? TEXT("unlatched")
+			                            : L.RegionsBuiltTotal == 0 ? TEXT("unbuilt")
+			                                                       : TEXT("ok");
+			MarchField = FString::Printf(TEXT("pending(budget=%d,nofetch=%d,volume=%s)"),
+			                             SpikeArm.StepBudget, SpikeArm.bNoFetch ? 1 : 0,
+			                             VolumeReason);
+		}
+		else
+		{
+			MarchField = FString::Printf(TEXT("%.2f(budget=%d,nofetch=%d)"),
+			                             RenderStats.MarchGpuMs, RenderStats.MarchStepBudget,
+			                             RenderStats.bMarchNoFetch ? 1 : 0);
+		}
+
 		// recentre=: the rolling window, and the rule for reading it. "off" is
 		// only ever "no origin latched" -- once latched the policy runs every
 		// tick, so checks= is the ran-flag that separates "the camera has not
@@ -2553,18 +2702,149 @@ void UVoxelFluidSubsystem::Tick(float DeltaTime)
 
 		UE_LOG(LogVoxelFluid, Display,
 		       TEXT("Fluid perf %s alive=%u spawned=%u requested=%llu despawnBasin=%u ")
-		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s iters=%d slots=%llu violations=%llu ")
+		       TEXT("despawnBoundary=%u simGpuMs=%.2f renderMs=%s marchGpuMs=%s iters=%d slots=%llu ")
+		       TEXT("violations=%llu ")
 		       TEXT("faucet=%s spill=%llu/s sink(basin)=%s sink(boundary)=%llu/s recycle=%s ")
 		       TEXT("occupancy=%llu/%d verify=%s skippedNoOcc=%llu deferredNoOccupancy=%s ")
 		       TEXT("recentre=%s%s"),
 		       StateMarker, Snapshot.Alive, Snapshot.SpawnedTotal, CumulativeSpawnRequested,
 		       Snapshot.DespawnedBasin, Snapshot.DespawnedBoundary, Snapshot.SimGpuMs, *RenderField,
+		       *MarchField,
 		       FMath::Clamp(CVarVoxelFluidIterations.GetValueOnGameThread(), 1, 8),
 		       FMath::Min<uint64>(CumulativeSpawnRequested, VoxelFluidSim::kMaxParticles),
 		       ConservationViolations, *FaucetField, L.PerfSpillEmitted, *SinkBasinField, BoundaryRate,
 		       *RecycleField, L.RegionsBuiltTotal, L.PendingRegions.Num(), VerifyField,
 		       SimState->GetTicksSkippedNoOccupancy(), *DeferredField, *RecentreField,
 		       bDebugDrawSkippedTooMany ? TEXT(" debugDraw=skipped(alive>5000)") : TEXT(""));
+
+
+		// ---- the ray census, on its own line ------------------------------
+		//
+		// A SIBLING LINE, not another field on the perf line. The coordinator
+		// asked for it "alongside marchGpuMs" and this is that -- emitted in the
+		// same 1 Hz block, immediately after -- but the perf line is already 24
+		// fields wide and a census is eleven numbers. Folding them in would have
+		// made both harder to read and would have put eleven new ways to break
+		// tools/fluid-spike-measure.ps1's existing regexes on a line those
+		// regexes already parse. Its own line greps cleanly and breaks nothing.
+		//
+		// Emitted only while counting is armed, so a timing run's log is not
+		// diluted with a line that would always say "off".
+		if (SpikeArm.bCount && SpikeArm.StepBudget > 0)
+		{
+			const FVoxelMarchSpikeCensus& C = RenderStats.MarchCensus;
+			if (!C.bValid)
+			{
+				// The ran-flag, and it is the whole reason this branch exists:
+				// a census that never landed must not be printed as a census of
+				// zero rays.
+				UE_LOG(LogVoxelFluid, Display,
+				       TEXT("Marcher census: pending (budget=%d, no readback has landed yet)"),
+				       SpikeArm.StepBudget);
+			}
+			else
+			{
+				// CONSERVATION FIRST. rays= is what the dispatch covered and
+				// counted= is the sum of the five outcome bins; they must be
+				// equal. A mismatch means the histogram is being written wrong,
+				// and every mean below it is then a plausible-looking lie -- so
+				// it is stated before the numbers it invalidates rather than
+				// checked silently.
+				const TCHAR* Conservation =
+					(C.RaysCounted == C.RaysDispatched) ? TEXT("ok") : TEXT("MISMATCH");
+				const double Rays = double(FMath::Max<uint64>(C.RaysCounted, 1));
+				// THE SKIP WALK'S VERDICT, and it gates the number beside it. The
+				// skip walk is the only part of the spike with no unit test, and its
+				// characteristic failure -- one cell too many skipped -- LOWERS the
+				// step count, i.e. it makes the result look better rather than
+				// broken. "unverified" is deliberately not "ok": a run without
+				// voxel.Marcher.SpikeSkipVerify has not shown agreement, it has
+				// merely not looked.
+				FString SkipField;
+				if (C.SkipLevels <= 0)
+				{
+					SkipField = TEXT("skip=0(flat control)");
+				}
+				else if (C.SkipCompared == 0)
+				{
+					SkipField = FString::Printf(TEXT("skip=%d(UNVERIFIED)"), C.SkipLevels);
+				}
+				else
+				{
+					// ties= is reported even when it is the only difference, and is
+					// NOT counted as disagreement: a shared-face tie has no canonical
+					// answer (THE TIE RULE, VoxelMarchSpike.usf). It stays on the line
+					// because a change in its RATE would still be telling us
+					// something -- what it must not do is keep firing RATIO INVALID
+					// on a case that has been decided.
+					// THE VERDICT IS AGAINST THE MEASURED FLOOR, NOT AGAINST ZERO.
+					// refNoise is how often the unit-tested flat walk disagrees with a
+					// negligibly perturbed copy of ITSELF, on these same rays this same
+					// frame. Two DDA instances with different arithmetic histories
+					// diverge at that rate no matter how careful the skip logic is, so
+					// a mismatch at or below it is not evidence of a defect. This is
+					// calibration against a control measured from the same population,
+					// not a tuned threshold -- a real defect runs well above the floor
+					// (the diagonal bug ran 52 against a floor of this order), and
+					// nothing about the control can be adjusted to hide one.
+					// THE VERDICT USES restartNoise, THE DIRECT CONTROL: the same skip
+					// walk with the mip forced solid, so its disagreements with flat
+					// cannot be skipped cells. refNoise (the reference perturbed
+					// against itself) is still printed, but it measures a different
+					// quantity and is NOT the discriminator -- an offline model put it
+					// above the skip walk on two synthetic worlds while the engine
+					// measured it three times below, which is how it was caught.
+					//
+					// restartNoise restarts at EVERY cell, the skip walk only at
+					// occupied ones, so it is an UPPER bound on restart divergence.
+					// Above it is a hard result; below it is consistent with noise
+					// without proving it, and the wording says which.
+					const TCHAR* SkipVerdict =
+						C.SkipMismatch == 0                     ? TEXT("AGREES")
+						: C.SkipMismatch <= C.SkipRestartNoise  ? TEXT("WITHIN RESTART NOISE (not proof)")
+						                                        : TEXT("DISAGREES -- RATIO INVALID");
+					SkipField = FString::Printf(
+						TEXT("skip=%d(vs-flat %s: %llu mismatch / %llu restartNoise / %llu refNoise / ")
+						TEXT("%llu ties / %llu compared)"),
+						C.SkipLevels, SkipVerdict,
+						C.SkipMismatch, C.SkipRestartNoise, C.SkipRefNoise, C.SkipTies,
+						C.SkipCompared);
+				}
+				UE_LOG(LogVoxelFluid, Display,
+				       TEXT("Marcher census: budget=%d nofetch=%d %s rays=%llu counted=%llu(%s) ")
+				       TEXT("hit=%llu(%.1f%%) miss=%llu(%.1f%%) exhausted=%llu(%.1f%%) ")
+				       TEXT("inside=%llu(%.1f%%) nobox=%llu(%.1f%%) ")
+				       TEXT("steps mean=%.1f p95=%.0f hitMean=%.1f missMean=%.1f exhMean=%.1f"),
+				       C.StepBudget, SpikeArm.bNoFetch ? 1 : 0, *SkipField, C.RaysDispatched,
+				       C.RaysCounted,
+				       Conservation,
+				       C.Hit, 100.0 * double(C.Hit) / Rays,
+				       C.Miss, 100.0 * double(C.Miss) / Rays,
+				       C.Exhausted, 100.0 * double(C.Exhausted) / Rays,
+				       C.Inside, 100.0 * double(C.Inside) / Rays,
+				       C.NoBox, 100.0 * double(C.NoBox) / Rays,
+				       C.MeanSteps, C.P95Steps, C.MeanStepsHit, C.MeanStepsMiss,
+				       C.MeanStepsExhausted);
+	
+				// The disagreeing rays themselves. A count with no coordinate is a
+				// count nobody can act on -- the first mismatch report was exactly
+				// that, and diagnosing it needed a hypothesis instead of a pixel.
+				if (C.SkipMismatch > 0 && C.SampleCount > 0)
+				{
+					for (int32 i = 0; i < C.SampleCount; ++i)
+					{
+						const FVoxelMarchSpikeCensus::FSample& Sm = C.Samples[i];
+						UE_LOG(LogVoxelFluid, Display,
+						       TEXT("Marcher mismatch %d/%llu: pixel=(%u,%u) flat=%s(%d,%d,%d) ")
+						       TEXT("skip=%s(%d,%d,%d) skipSteps=%u"),
+						       i + 1, C.SkipMismatch, Sm.PixelX, Sm.PixelY,
+						       Sm.bFlatFound ? TEXT("hit") : TEXT("miss"), Sm.FlatVoxel.X,
+						       Sm.FlatVoxel.Y, Sm.FlatVoxel.Z,
+						       Sm.bSkipFound ? TEXT("hit") : TEXT("miss"), Sm.SkipVoxel.X,
+						       Sm.SkipVoxel.Y, Sm.SkipVoxel.Z, Sm.SkipSteps);
+					}
+				}		}
+		}
 
 		// The scalar side of the extended conservation line, only while the
 		// lifecycle is doing anything -- an all-zero line every second would

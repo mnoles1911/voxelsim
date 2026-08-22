@@ -105,3 +105,10 @@ asset-forge/library/hero-arch-colossal/**/tree.vox
 # rewritten to strip them on 2026-08-16. They are build artifacts, regenerable
 # from the terrain service, and they must never be tracked again.
 bake-out/*.vxtl
+
+# Bake OUTPUT, not source: the karst carve run writes ~19 MB of tiles here and
+# regenerating them is a script invocation, not a recovery. Same reason
+# bake-out/*.vxtl above is ignored -- see GitHub's 100 MB wall in that comment.
+bake-out/karst/
+# Stray bake transcripts. The findings go in docs/measurements/, not the raw log.
+bake-*.log

@@ -111,7 +111,23 @@ private:
 	// constant yaw sweep."
 	static constexpr double CircleRadiusUU = 10000.0;      // 100m
 	static constexpr double LinearSpeedUUPerSec = 2000.0;  // 20 m/s
-	static constexpr double HeightAboveSurfaceUU = 3000.0; // surface + 30m
+	// CAMERA HEIGHT ABOVE THE SURFACE, and it is a member rather than a constant
+	// because the pose decides the measurement.
+	//
+	// 30 m was fine while every leg measured the DRAW path, where what matters is
+	// how much geometry is in frame. It is not fine for the ray-march spike: at
+	// 30 m up, 58.7% of rays MISS (they cross the volume into sky), and
+	// empty-space skipping helps misses 7.8x against 4.6x for hits -- so an
+	// elevated pose flatters the skip ratio that the whole marcher decision rests
+	// on. A player's camera sits near eye height, where the miss population
+	// collapses. -VoxelPerfHeightM= exists so that pose can be measured.
+	//
+	// NOTE it is NOT -VoxelPerfDepth (flight-path depth, no effect on a pinned
+	// static pose) and NOT -VoxelSpawnAltM (spawn altitude, which this overwrites
+	// on the first path-init tick). Both were tried; both silently produced the
+	// 30 m pose again, with an identical census, which is exactly the kind of
+	// null result that reads as "the experiment ran".
+	double HeightAboveSurfaceUU = 3000.0; // surface + 30m unless overridden
 	static constexpr double YawSweepDegPerSec = 60.0;
 
 	// -VoxelPerfFlight=surface|underground. Surface is the default so every

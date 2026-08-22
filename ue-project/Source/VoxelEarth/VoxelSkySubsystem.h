@@ -175,6 +175,14 @@ public:
 	// state before the first tick, and when Impl is null); allocates nothing.
 	const FVoxelSkyState& GetSkyState() const;
 
+	// How submerged the local camera is, 0..1 -- the SAME weight VoxelOceanActor
+	// uses to fade M_Underwater in. Fog density is scaled by (1 - this), so the
+	// two extinction models cross-fade and never sum at full strength. The ocean
+	// PUSHES this; the sky never asks -- same direction-of-dependency rule as
+	// the exposure ownership comment in the .cpp. Defaults 0, so a world with no
+	// ocean actor gets full fog and no coupling.
+	void SetUnderwaterFogSuppression(float Weight01);
+
 	// Jump the clock to a given local hour (0..24) on the CURRENT game day,
 	// preserving the seasonal position as closely as the calendar allows. This
 	// is the in-engine half of -VoxelTimeOfDay and the primitive the W6 capture
@@ -222,6 +230,26 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<class UPostProcessComponent> SkyExposurePP;
+
+	// The atmospheric height fog (fog plan, 2026-08-20). Lives on the sky rig
+	// beside the atmosphere and the exposure PP for the same one-actor-to-find
+	// reason. Its colour is BLACK by design -- the SkyAtmosphere supplies all
+	// fog colour via r.SupportSkyAtmosphereAffectsHeightFog -- and its density
+	// is scaled by (1 - UnderwaterFogSuppression) every frame so it cross-fades
+	// against M_Underwater's Beer-Lambert rather than double-counting extinction
+	// (the failure that got the OLD height fog deleted, VoxelOceanActor.cpp:133).
+	UPROPERTY(Transient)
+	TObjectPtr<class UExponentialHeightFogComponent> SkyHeightFog;
+
+	// 0..1, pushed by AVoxelOceanActor's underwater blend; see the setter.
+	float UnderwaterFogSuppression = 0.0f;
+
+	// Last tier actually applied, so the tier sink logs once per change and the
+	// grid cvars are not re-set every frame. -1 = never applied, forces the
+	// first ApplyFogFromState to run the sink.
+	int32 AppliedVolumetricTier = -1;
+
+	void ApplyFogFromState();
 
 	// The NIGHT SKY's mesh: a camera-following sphere carrying M_NightSky, which
 	// is where the stars and the phased moon disc are drawn. Spawned here rather

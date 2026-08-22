@@ -1,0 +1,170 @@
+COVER VOLUME CENSUS -- vxc_volumeprobe --detail-cover
+=====================================================
+Date   2026-08-19
+Probe  voxel-core/bench/volumeprobe.cpp, new --detail-cover mode
+Seed   20260719, worldgen v28, 438 asset species installed (0 without banks)
+Ref    docs/detail-assets-in-the-volume-2026-08-19.md sections 5 and 5.1
+
+WHY IT EXISTS: docs/detail-assets-in-the-volume-2026-08-19.md section 3.1
+disputes ray-marching-plan-2026-08-19.md:795-797, which asserts that putting the
+230 detail-plant species into a volume and taking R0 to 5 cm are the same work
+item. Section 5.1 named the falsifier before the run: a cover volume measuring
+~500 MiB or more means the plan is right and the doc is wrong.
+
+WHAT A COVER VOLUME IS HERE: a separate 5 cm lattice holding ONLY detail-lattice
+cover -- no terrain. A brick column no instance reaches produces zero bricks,
+not an all-air shell. Terrain stays in the 10 cm world volume where it already
+is. Composition is AssetField::resolveForCoverCompose / coverMaterialOfResolved
+(voxel-core), which is also the byte-equality reference for any GPU mirror.
+
+
+1. RESULTS
+   ring 112 m (the VoxelDetailAssetSubsystem detail ring), pitch 50 mm,
+   payload = descriptors + occupancy + 16 B palette + adaptive cells.
+
+   RING 112 m (the value the design doc was written against):
+   site                     ground              inst/ha   PAYLOAD   flat index
+   grassland   -92445,-75855  REAL fine+climate    3,611   25.4 MiB    29.1 MiB
+   grassland   -92445,-75855  coarse-only*         3,717   26.5 MiB    25.4 MiB
+   alpine bank -61440,-61440  real fine+climate      156   10.5 MiB   290.1 MiB
+
+   RING 256 m -- THE RING THAT ACTUALLY SHIPS (VoxelDetailAssetSubsystem.cpp:152,
+   raised from 112 on 2026-08-18; 5.2x the area):
+   grassland COVER            REAL fine+climate    3,564  131.6 MiB   245.4 MiB
+   grassland TERRAIN CONTROL  REAL fine+climate        -  126.7 MiB    67.5 MiB
+
+   The 112 m rows were measured against a default that was already stale when it
+   was read out of docs/detail-asset-rendering.md. Measured rather than scaled,
+   the shipping ring returned 5.18x the 112 m payload -- exactly the area ratio,
+   so cover density is uniform across the ring.
+
+   WHAT THE SHIPPING ROW CHANGES:
+     * falsifier margin 3.8x, not 20-48x. The decision stands; the comfort does
+       not.
+     * "cover is 34% of terrain" DOES NOT SURVIVE. That was alpine ground with
+       almost no cover on it (156 inst/ha). On dense grassland at the shipping
+       ring cover is 104% of terrain -- 131.6 vs 126.7 MiB -- it roughly DOUBLES
+       the resident volume. Honest range: 34% where nothing grows, ~100% where
+       things do.
+     * requirement C1 gets STRONGER: the flat index is 245.4 MiB against
+       131.6 MiB of payload.
+     * unchanged: cover + terrain at the shipping ring is ~258 MiB of payload,
+       still far under the 1,110 MiB measured for R0-at-5cm and under today's
+       2,197 MiB quad pool. Scoping the cover volume is still the cheaper
+       project by a wide margin.
+
+   CONTROL, same ground as the alpine arm, same reading:
+   terrain at 10 cm, --radius 112       payload 31.3 MiB, flat index 37.4 MiB,
+                                        total adaptive 66.9 MiB
+
+   * coarse-only = synthetic elevation + REAL coarse climate, the same
+     instrument the biome survey used for 6 of its 10 sites. Named, not hidden:
+     biome weight is the dominant placement gate (83.5% of refusals at the
+     alpine site), and that gate is real here; elevation band (15.8%) is not.
+
+   VERDICT: the doc STANDS. 10.5-26.5 MiB against a 500 MiB falsifier -- a
+   factor of 19-48 clear. On identical ground the cover volume is 34% of what
+   the terrain volume already costs there (10.5 vs 31.3 MiB payload).
+
+
+2. THE SITE ALMOST BURIED THE RESULT, AND THAT IS THE READING RULE
+   The first run used the brick census's own site (-61440,-61440). It returned
+   10.5 MiB and it is nearly a null result: vxc_assetprobe over the same 112 m
+   says only THREE species place there -- alpine-krummholz 600, juniper-scrub
+   331, granite-boulder 6 -- with NO grass, NO flowers, NO reeds. It is a
+   steep, above-treeline rock face; 83.5% of (site, species) pairs are refused
+   by biome weight alone.
+
+   So the headline number from that site is "what cover costs where there is
+   almost no cover". The grassland arm is the one that prices cover. A cover
+   census at a barren site is not evidence about cover, the same way
+   vxc_farwaterprobe #226's meshed zero was not evidence about cost.
+
+   The two sites disagree in BOTH directions and it nearly cancelled:
+     - alpine has 24x FEWER instances per hectare (156 vs 3,717)
+     - but its instances are 38x BIGGER (8,173 vs 214 solid voxels each --
+       juniper-scrub bakes at 5,131-10,900 solid voxels, grass/flowers at
+       214-480)
+   Reporting either site alone, without the other, would have been a confident
+   number about the wrong world.
+
+
+3. CROSS-CHECKS THAT PASSED
+   * Instance density against the independent instrument: this probe reports
+     3,717/ha at grassland; docs/biome-placement-survey.md:41 measures 3,908/ha
+     for grassland (grass 2043.3 + flower 1850.6 + reed 14.0). 5% apart, from
+     two different walks.
+   * Per-instance solid voxels against the bank census: 214 at grassland
+     against 257 (grass) / 480 (flower) mean solid in the .vxa run tables;
+     8,173 at alpine against juniper-scrub's own 5,131 and 10,900.
+   * Anchor-ownership dedup: reach dilation returns one instance to every chunk
+     it overlaps, so summing per-chunk list sizes over-counts. Counting only
+     instances whose ANCHOR lies in the chunk is what makes the density agree
+     with the survey; without it the figure read several times high.
+
+
+4. THE ONE TERM THAT CAN STILL BLOW UP: A DENSE INDEX
+   A flat 3D brick index over the cover footprint costs 290.1 MiB at the alpine
+   site and 25.4 MiB at grassland -- an 11x swing driven by TERRAIN RELIEF, not
+   by cover. Cover is a thin shell following the ground, so a dense index over
+   its bounding box is 0.075% occupied on steep ground.
+
+   A COVER VOLUME MUST NOT BE DENSELY INDEXED. This is the same design
+   consequence ray-marching-plan section 4 records for 2.5 cm, arrived at from
+   the cover side, and it is the only term anywhere near the falsifier. The
+   payload columns are the cost of a cover volume; the index column is the cost
+   of addressing it the wrong way.
+
+
+5. A SECONDARY RESULT, FROM THE SAME WALK
+   The probe meshes every brick it censuses, so quads and bricks are two
+   readings of one field. Cover as a VOLUME costs 26.5 MiB at grassland; the
+   same cover as QUADS is 9,074,442 quads = 103.8 MiB at 12 B/quad. The volume
+   is 3.9x cheaper than meshing the same cover -- and at the alpine site,
+   7,267,620 quads = 83.2 MiB against 10.5 MiB, 7.9x cheaper.
+
+
+6. REPRODUCTION
+   vxc_volumeprobe --detail-cover --cover-ring-m 112 --at -61440 -61440 \
+     --assets asset-forge/out/engine --tiles out/volumeprobe-fine \
+     --coarse <world>/000000000135276f/s1
+
+   vxc_volumeprobe --detail-cover --cover-ring-m 112 --at -92445 -75855 \
+     --assets asset-forge/out/engine --coarse <world>/000000000135276f/s1 \
+     --allow-synthetic
+
+   control:
+   vxc_volumeprobe --radius 112 --at -61440 -61440 \
+     --assets asset-forge/out/engine --tiles out/volumeprobe-fine \
+     --coarse <world>/000000000135276f/s1
+
+   A cover census without --assets is refused: every detail species would
+   compose as air and the run would report a free volume.
+
+
+7. STILL OPEN -- AND THE PREDICTION, NOW RESOLVED
+   No vegetated FINE-TILE site was censused -- grassland's fine tile (-7_-5) is
+   not in the working set, and the survey's staged tiles are gone. The
+   grassland number therefore stands on real climate over synthetic elevation.
+
+   PREDICTION, RECORDED BEFORE THE RUN: re-running --detail-cover at
+   -92445,-75855 with a real fine tile will land the payload between 15 and
+   45 MiB, and not above 100 MiB. Reasoning: at the one site where gate
+   attribution was measurable, biome weight refused 83.5% of (site, species)
+   pairs and elevation band 15.8%. The grassland run already has real climate,
+   which drives the dominant gate; real elevation refines the minority one.
+
+   RESOLVED 2026-08-20: 25.4 MiB. Prediction holds; the coarse-only proxy was
+   accurate to 4% (25.4 vs 26.5) and density moved 3,717 -> 3,611/ha, still
+   within 8% of the survey's 3,908.
+
+   NO BAKE WAS NEEDED. -7_-5.vxtl already existed in the v28 fine namespace UE
+   is pinned to (tile-cache/...-b19d281fd/000000000135276f/s16/, 312 MB,
+   2026-08-18), and the grassland site sits inside it: tile edge 15,360 m, so
+   (-7,-5) covers X -107,520..-92,160 and Y -76,800..-61,440. The gap was a
+   staging oversight, not a missing measurement. Worth remembering the next
+   time a result is qualified as "blocked on a bake".
+
+   STILL UNMEASURED: every biome other than grassland and alpine on real fine
+   tiles. By this file's own reading rule (section 2) that is a limit on the
+   claim, not a caveat to wave at it.

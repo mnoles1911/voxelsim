@@ -1,8 +1,10 @@
 add_executable(vxc_tests
   test_main.cpp
   test_brick.cpp
+  test_brickpack.cpp
   test_hash.cpp
   test_amplifier.cpp
+  test_karst.cpp
   test_assetgrid.cpp
   test_assetmanifest.cpp
   test_assetbank.cpp

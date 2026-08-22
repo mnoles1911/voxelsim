@@ -8,6 +8,8 @@
 #include "RHIGPUReadback.h"
 #include "DataDrivenShaderPlatformInfo.h"
 #include "RenderingThread.h"
+#include "VoxelBrickPool.h"   // kChunkRecordDwords -- the record stride these
+                              // two kernels write, bound rather than hardcoded
 
 // For vxc::kWorldGenVersion, which ModifyCompilationEnvironment hands to
 // worldgen.ush as the version half of the mirror contract.
@@ -38,6 +40,22 @@ namespace
 	constexpr uint32 kMasksPerBrick = 48;    // 3 axes * 2 dirs * 8 slices
 	constexpr uint32 kMaxQuadsPerMask = 32;  // upper bound, docs/gpu-mesher-design.md
 	constexpr uint32 kScanBlockSize = 256;
+
+	// --- P1-C: the brick volume's geometry ---------------------------------
+	//
+	// Mirrors docs/brick-volume-format.md section 1 and brickpack.ush's own
+	// constants. Restated here rather than included because this module
+	// deliberately does not link voxel-core; the byte contract is the document,
+	// and both sides quote it.
+	constexpr uint32 kBricksPerChunkEdge = 4;
+	constexpr uint32 kBricksPerChunk = kBricksPerChunkEdge * kBricksPerChunkEdge * kBricksPerChunkEdge;
+	constexpr uint32 kBrickOccWords = 16;    // 512 bits of occupancy, 64 B
+	// The widest a single brick's material allocation can be: the 8 bpp case,
+	// 512 solid voxels x 8 bits and NO local palette. (The widest palette case
+	// is 4 palette dwords + 64 payload dwords = 68.) Same number as
+	// kMaxBrickMatWords in brickpack.ush, which sizes the groupshared staging
+	// buffer the payload is assembled in.
+	constexpr uint32 kMaxBrickMatWords = 132;
 
 	// ScanSumsMain scans the per-block totals in a SINGLE workgroup of 256
 	// threads, so the whole dispatch can carry at most 256 blocks of 256.
@@ -408,6 +426,204 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
+	// --- P1-C: the BrickPack chain -----------------------------------------
+	//
+	// SHARED COMPILE POLICY, AND IT IS DELIBERATELY NOT FVoxelWorldGenShader'S.
+	// brickpack.ush carries NO worldgen version lock, because it contains no
+	// worldgen math -- only the Cells indexing convention, mirrored in six
+	// lines. So these must not be handed VXC_WORLDGEN_VERSION_CPP: doing so
+	// would entangle the brick format's release cadence with the terrain
+	// digest's, and a terrain version bump would then invalidate brick bytecode
+	// that cannot possibly have changed. The argument is VoxelAssetStamp.usf's,
+	// verbatim in shape, and VoxelBrickPack.usf's header states it too.
+	//
+	// SM6 anyway, and not because the kernels need 64-bit integers -- they do
+	// not. They read the Cells buffer that VoxelizeMain wrote, and VoxelizeMain
+	// needs SM6. A permutation compiled for a feature level on which its own
+	// input cannot be produced is a permutation that can only ever be wrong.
+	class FVoxelBrickPackShader : public FGlobalShader
+	{
+	public:
+		FVoxelBrickPackShader() = default;
+		FVoxelBrickPackShader(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+			: FGlobalShader(Initializer) {}
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM6);
+		}
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			// Switches brickpack.ush's resource DECLARATIONS (not its
+			// arithmetic) to Unreal's conventions: no register() slots, and the
+			// parameters as loose globals in $Globals.
+			OutEnvironment.SetDefine(TEXT("VXC_UE"), 1);
+		}
+	};
+
+	// The parameters brickpack.ush declares, by the names it declares them
+	// under. DispatchColumns / BricksZ / ScanCount keep worldgen.ush's names and
+	// meanings on purpose -- they describe the same region, and a second
+	// vocabulary for one region is how two halves of a chain drift apart.
+	//
+	// THE FOUR WRITE BASES ARE ZERO ON EVERY PATH THIS FILE DISPATCHES, and that
+	// is a decision, not an omission: a non-zero base lands IN the descriptor's
+	// offset field, so keeping them at zero is what makes the scratch output the
+	// chunk-relative form docs/brick-volume-format.md defines and
+	// voxel.GPU.VerifyBrickPack compares against. The pool base is added later,
+	// in exactly one kernel. They are still THREADED THROUGH rather than
+	// deleted, because the kernel reads them either way and a parameter that
+	// silently does nothing is this project's most expensive recurring bug.
+	#define VOXEL_BRICKPACK_LOOSE_PARAMETERS() \
+		SHADER_PARAMETER(FUintVector2, DispatchColumns) \
+		SHADER_PARAMETER(uint32,       BricksZ) \
+		SHADER_PARAMETER(uint32,       ScanCount) \
+		SHADER_PARAMETER(uint32,       BrickDescBase) \
+		SHADER_PARAMETER(uint32,       OccWriteBase) \
+		SHADER_PARAMETER(uint32,       MatWriteBase) \
+		SHADER_PARAMETER(uint32,       ChunkRecordBase)
+
+	class FVoxelBrickClassifyCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickClassifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickClassifyCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICKPACK_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCells)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickOccCounts)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickMatCounts)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPackCS : public FVoxelBrickPackShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPackCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPackCS, FVoxelBrickPackShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICKPACK_LOOSE_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InCells)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickMat)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickSkip)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkBrickMask)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- P1-C / P2: the pool-write kernels ---------------------------------
+	//
+	// Plain FGlobalShader, SM5, no VXC_UE: VoxelBrickPoolWrite.usf includes
+	// nothing from voxel-core and interprets no format field except the 28-bit
+	// offset and the 2-bit kind. Same standing as FVoxelQuadPoolWriteCS, and for
+	// the same reasons -- it has no business inside any version lock.
+	class FVoxelBrickPoolShader : public FGlobalShader
+	{
+	public:
+		FVoxelBrickPoolShader() = default;
+		FVoxelBrickPoolShader(const ShaderMetaType::CompiledShaderInitializerType& Initializer)
+			: FGlobalShader(Initializer) {}
+
+		static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
+		{
+			return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		}
+	};
+
+	class FVoxelBrickTotalCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickTotalCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickTotalCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, ScanCount)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InOccCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InOccOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InMatCounts)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InMatOffsets)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutBrickTotals)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickWordCopyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickWordCopyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickWordCopyCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, DstFirst)
+			SHADER_PARAMETER(uint32, NumWords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWords)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutWords)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickDescPoolWriteCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickDescPoolWriteCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickDescPoolWriteCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, DstFirst)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, OccBase)
+			SHADER_PARAMETER(uint32, MatBase)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickChunkRecordCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickChunkRecordCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickChunkRecordCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, SrcChunkIndex)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, ChunkSlot)
+			SHADER_PARAMETER(uint32, BrickBase)
+			SHADER_PARAMETER(uint32, RingLevel)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER(uint32, ChunkClimatePacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceGradPacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceZRelBits)
+			SHADER_PARAMETER(FIntVector3, OriginVoxel)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickChunkClearCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickChunkClearCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickChunkClearCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, ChunkSlot)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
 	//
 	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
@@ -448,6 +664,19 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelQuadCompactCS,   VOXEL_QUAD_POOL_WRITE_USF, "QuadC
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolWriteCS, VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolWriteMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelQuadPoolHideCS,  VOXEL_QUAD_POOL_WRITE_USF, "QuadPoolHideMain",  SF_Compute);
 
+#define VOXEL_BRICK_PACK_USF "/VoxelEarth/VoxelBrickPack.usf"
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickClassifyCS, VOXEL_BRICK_PACK_USF, "BrickClassifyMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPackCS,     VOXEL_BRICK_PACK_USF, "BrickPackMain",     SF_Compute);
+
+#define VOXEL_BRICK_POOL_WRITE_USF "/VoxelEarth/VoxelBrickPoolWrite.usf"
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickTotalCS,         VOXEL_BRICK_POOL_WRITE_USF, "BrickTotalMain",         SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickWordCopyCS,      VOXEL_BRICK_POOL_WRITE_USF, "BrickWordCopyMain",      SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickDescPoolWriteCS, VOXEL_BRICK_POOL_WRITE_USF, "BrickDescPoolWriteMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickChunkRecordCS,   VOXEL_BRICK_POOL_WRITE_USF, "BrickChunkRecordMain",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickChunkClearCS,    VOXEL_BRICK_POOL_WRITE_USF, "BrickChunkClearMain",    SF_Compute);
+
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampCoarseMain", SF_Compute);
 
@@ -461,6 +690,25 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelMeshEmitCS,   VOXEL_WORLDGEN_USF, "MeshEmitMain", 
 
 namespace
 {
+
+	// P1-C. The brickpack.ush half of FillLooseParameters, and the ONE place the
+	// four write bases are set. They are ZERO here and nowhere else decides:
+	// every dispatch this file makes produces the CHUNK-RELATIVE form the byte
+	// contract defines, and FVoxelBrickPool adds the pool base afterwards in a
+	// single kernel. Threaded through rather than deleted -- see the macro's own
+	// comment.
+	template <typename TParams>
+	void FillBrickPackParameters(TParams& Out, const FVoxelGpuRegionRequest& Req, uint32 NumBricks)
+	{
+		Out.DispatchColumns = Req.DispatchColumns;
+		Out.BricksZ = Req.BricksZ;
+		Out.ScanCount = NumBricks;
+		Out.BrickDescBase = 0;
+		Out.OccWriteBase = 0;
+		Out.MatWriteBase = 0;
+		Out.ChunkRecordBase = 0;
+	}
+
 	// Fills the loose parameters that every kernel shares. ScanCount varies by
 	// pass, so it is set by the caller afterwards.
 	template <typename TParams>
@@ -484,6 +732,65 @@ namespace
 		// is byte-for-byte the pre-D5 dispatch.
 		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 5));
 		Out.RingSkirtMask   = Req.RingSkirtMask & 0xfu;
+	}
+
+	// P1-C. The three scan passes, over whichever count array is handed in.
+	//
+	// THIS IS worldgen.ush's SCAN, UNMODIFIED, AND THAT IS THE POINT. It is a
+	// generic exclusive scan over a uint count array; the only things that
+	// change between meshing and brick packing are ScanCount (3,072 masks ->
+	// 64 bricks) and which buffers are bound to OutQuadCounts / OutQuadOffsets /
+	// OutBlockSums. Writing a second scan for the brick arenas would be two
+	// implementations of one prefix sum, and the mesher's is the one with a
+	// determinism gate behind it.
+	//
+	// The names are the mesher's because the SHADER's names are: renaming them
+	// would mean editing worldgen.ush, which is under a version lock shared with
+	// the standalone determinism bench.
+	void AddBrickScanPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request,
+	                        const VoxelGpuWorldGen::FRegionGraphSizes& S,
+	                        FRDGBufferRef Counts, FRDGBufferRef Offsets, FRDGBufferRef BlockSums,
+	                        const TCHAR* Label)
+	{
+		{
+			FVoxelScanBlocksCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelScanBlocksCS::FParameters>();
+			FillLooseParameters(*Params, Request);
+			Params->ScanCount = S.NumBricks;
+			Params->OutQuadCounts = GraphBuilder.CreateUAV(Counts);
+			Params->OutQuadOffsets = GraphBuilder.CreateUAV(Offsets);
+			Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSums);
+
+			TShaderMapRef<FVoxelScanBlocksCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickScanBlocks(%s)", Label), Shader, Params,
+				FIntVector(S.BrickScanBlocks, 1, 1));
+		}
+		{
+			FVoxelScanSumsCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelScanSumsCS::FParameters>();
+			FillLooseParameters(*Params, Request);
+			Params->ScanCount = S.NumBricks;
+			Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSums);
+
+			TShaderMapRef<FVoxelScanSumsCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickScanSums(%s)", Label), Shader, Params,
+				FIntVector(1, 1, 1));   // exactly one workgroup, by design
+		}
+		{
+			FVoxelScanAddCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelScanAddCS::FParameters>();
+			FillLooseParameters(*Params, Request);
+			Params->ScanCount = S.NumBricks;
+			Params->OutQuadOffsets = GraphBuilder.CreateUAV(Offsets);
+			Params->OutBlockSums = GraphBuilder.CreateUAV(BlockSums);
+
+			TShaderMapRef<FVoxelScanAddCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickScanAdd(%s)", Label), Shader, Params,
+				FIntVector(S.BrickScanBlocks, 1, 1));
+		}
 	}
 
 }
@@ -637,6 +944,53 @@ bool VoxelGpuWorldGen::ValidateRegionRequest(const FVoxelGpuRegionRequest& Req, 
 		}
 	}
 
+	// --- P1-C: the brick chain's region shape -------------------------------
+	//
+	// brickpack.ush's decodeBrick has NO brick origin: it decomposes the region
+	// into whole 4x4x4-brick chunks starting at the region's own corner, and
+	// packs chunk c as bricks [4c, 4c+4) on every axis. So a region that is not
+	// a whole number of chunks on every axis is SILENTLY PARTIALLY PACKED, and
+	// -- much worse -- the mesher's 48x48x6 footprint would pack its HALO
+	// corner: bricks 0..3 rather than the interior 1..4. That produces a
+	// complete, self-consistent world displaced by one brick on every axis,
+	// which passes every per-brick test and fails only as a screenshot.
+	//
+	// The kernel cannot check this without silently disabling itself, which is
+	// the failure mode this project has already paid for. So it is refused here.
+	if (Req.bBrickPack)
+	{
+		constexpr uint32 kChunkColumns = kBrickEdge * kBricksPerChunkEdge;   // 32
+		if ((Cx % kChunkColumns) != 0 || (Cy % kChunkColumns) != 0 ||
+		    (Req.BricksZ % kBricksPerChunkEdge) != 0)
+		{
+			OutError = FString::Printf(
+				TEXT("bBrickPack on a %ux%u-column x %u-brick region — the brick chain packs WHOLE ")
+				TEXT("render chunks counted from the region corner, so it needs columns that are ")
+				TEXT("multiples of %u and BricksZ a multiple of %u. The mesher's 48x48x6 halo ")
+				TEXT("footprint is exactly the shape that would pack the halo corner instead of the ")
+				TEXT("interior — use VoxelGpuChunkRegion::MakeBrickRegion."),
+				Cx, Cy, Req.BricksZ, kChunkColumns, kBricksPerChunkEdge);
+			return false;
+		}
+
+		const uint64 NumBricks = uint64(Cx / kBrickEdge) * uint64(Cy / kBrickEdge) * uint64(Req.BricksZ);
+		if (NumBricks == 0)
+		{
+			OutError = TEXT("bBrickPack region contains no bricks");
+			return false;
+		}
+		// The brick counts are scanned by the SAME ScanSumsMain the mesher uses,
+		// which scans the per-block totals in a single 256-thread workgroup.
+		if (NumBricks > uint64(kMaxMasksPerDispatch))
+		{
+			OutError = FString::Printf(
+				TEXT("bBrickPack brick count %llu exceeds the %u the single-workgroup ScanSumsMain ")
+				TEXT("can scan — split the region into z-slabs"),
+				NumBricks, kMaxMasksPerDispatch);
+			return false;
+		}
+	}
+
 	if (Req.bMeshChain)
 	{
 		const uint32 BricksX = Cx / kBrickEdge;
@@ -706,6 +1060,25 @@ VoxelGpuWorldGen::ComputeRegionGraphSizes(const FVoxelGpuRegionRequest& Request)
 		S.MaxQuads = S.MaskCount * kMaxQuadsPerMask;
 		S.QuadWriteBase = Request.bChunkLocalQuads ? Request.QuadWriteBase : 0;
 		S.QuadBufferElements = S.QuadWriteBase + S.MaxQuads;
+	}
+
+	S.bBrickPack = Request.bBrickPack;
+	if (S.bBrickPack)
+	{
+		// Whole chunks only -- ValidateRegionRequest has already refused
+		// anything else, so these divisions are exact.
+		S.NumBrickChunks = (S.BricksX / kBricksPerChunkEdge)
+		                 * (S.BricksY / kBricksPerChunkEdge)
+		                 * (S.BricksZ / kBricksPerChunkEdge);
+		S.NumBricks = S.NumBrickChunks * kBricksPerChunk;
+		S.BrickScanBlocks = FMath::DivideAndRoundUp(S.NumBricks, kScanBlockSize);
+		// The WORST CASE, which is what the scratch buffers are sized to: every
+		// brick MIXED at 8 bpp. One chunk is 4 KB of occupancy and 33.8 KB of
+		// material, so the scratch side needs no readback to size itself. Only
+		// the POOL allocation does, and that is what BrickTotalMain's 8 bytes
+		// are for.
+		S.BrickOccWordsMax = S.NumBricks * kBrickOccWords;
+		S.BrickMatWordsMax = S.NumBricks * kMaxBrickMatWords;
 	}
 	return S;
 }
@@ -928,6 +1301,138 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(1, 1, 1));   // exactly one workgroup, by design
 	}
 
+	// --- P1-C: the brick chain, after AssetStamp and off the mesh path ------
+	//
+	// BrickClassifyMain -> ScanBlocks/ScanSums/ScanAdd x2 -> BrickPackMain, over
+	// the SAME Cells buffer the mesher reads, in the SAME graph. Zero new scan
+	// code: the scan is worldgen.ush's own, unmodified, with the brick count
+	// arrays bound where the quad ones normally go and ScanCount set to the
+	// brick count. It is run TWICE because a brick allocates in two independent
+	// arenas and one prefix sum cannot describe both -- six dispatches over 64
+	// elements each for a single chunk.
+	//
+	// WITH bBrickPack FALSE NOTHING BELOW RUNS AND THE GRAPH IS BYTE-FOR-BYTE
+	// THE ONE THAT SHIPPED. That is the whole shape of this phase: additive,
+	// off-path, and switchable at runtime so an A/B is one cvar on one binary.
+	//
+	// ALL FOUR WRITE BASES ARE ZERO. See VOXEL_BRICKPACK_LOOSE_PARAMETERS.
+	if (S.bBrickPack)
+	{
+		RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickPack");
+
+		FRDGBufferRef OccCounts = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickOccCounts"));
+		FRDGBufferRef OccOffsets = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickOccOffsets"));
+		FRDGBufferRef MatCounts = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickMatCounts"));
+		FRDGBufferRef MatOffsets = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks), TEXT("Voxel.BrickMatOffsets"));
+		// One block-sum buffer per scan rather than one reused twice: reuse
+		// would be correct (RDG would order the two by the write-after-read on
+		// it) but it would also make the second scan wait on the first for no
+		// reason other than a buffer name.
+		FRDGBufferRef OccBlockSums = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickScanBlocks), TEXT("Voxel.BrickOccBlockSums"));
+		FRDGBufferRef MatBlockSums = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickScanBlocks), TEXT("Voxel.BrickMatBlockSums"));
+
+		Out.BrickDesc = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32) * 2, S.NumBricks), TEXT("Voxel.BrickDesc"));
+		Out.BrickOcc = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickOccWordsMax), TEXT("Voxel.BrickOcc"));
+		Out.BrickMat = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.BrickMatWordsMax), TEXT("Voxel.BrickMat"));
+		// The 4^3 intra-brick skip mask. BrickPackMain writes it unconditionally
+		// (2 dwords per MIXED brick, indexed by the brick's mixed rank), and
+		// NOTHING READS IT. It is derivable for free from the 16 occupancy
+		// dwords a marcher already holds in registers, and format section 5's
+		// own recommendation is to spend the ~7 MiB it would cost across the
+		// cascade on payload instead. So it is bound to a transient that dies
+		// with the graph.
+		Out.BrickSkip = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBricks * 2), TEXT("Voxel.BrickSkip"));
+		Out.BrickChunkMask = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumBrickChunks * 2), TEXT("Voxel.BrickChunkMask"));
+		Out.BrickTotals = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2), TEXT("Voxel.BrickTotals"));
+
+		// THE L1 MASK IS ACCUMULATED WITH InterlockedOr AND MUST BE ZEROED
+		// FIRST. An RDG transient buffer is not zero-initialised -- it is
+		// whatever the pooled allocation last held -- so stale bits would claim
+		// occupancy that is no longer there. The marcher would then enter empty
+		// bricks rather than miss full ones, which fails slow and invisible: no
+		// hole, no crash, just traffic. This is a host precondition brickpack.ush
+		// states and cannot enforce.
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Out.BrickChunkMask), 0u);
+
+		// --- brick pass 1: BrickClassifyMain ------------------------------
+		{
+			FVoxelBrickClassifyCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelBrickClassifyCS::FParameters>();
+			FillBrickPackParameters(*Params, Request, S.NumBricks);
+			Params->InCells = GraphBuilder.CreateSRV(Out.Cells);
+			Params->OutBrickOccCounts = GraphBuilder.CreateUAV(OccCounts);
+			Params->OutBrickMatCounts = GraphBuilder.CreateUAV(MatCounts);
+
+			TShaderMapRef<FVoxelBrickClassifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			// ONE WORKGROUP PER BRICK, 64 threads, 8 cells each. The group id IS
+			// the brick's pack index, which is what makes decodeBrick's chunk
+			// decomposition the contract rather than an arrangement.
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickClassifyMain(%u bricks)", S.NumBricks),
+				Shader, Params, FIntVector(S.NumBricks, 1, 1));
+		}
+
+		// --- brick passes 2-7: the two scans, worldgen.ush's own -----------
+		AddBrickScanPasses(GraphBuilder, Request, S, OccCounts, OccOffsets, OccBlockSums, TEXT("Occ"));
+		AddBrickScanPasses(GraphBuilder, Request, S, MatCounts, MatOffsets, MatBlockSums, TEXT("Mat"));
+
+		// --- brick pass 8: BrickPackMain ----------------------------------
+		{
+			FVoxelBrickPackCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelBrickPackCS::FParameters>();
+			FillBrickPackParameters(*Params, Request, S.NumBricks);
+			Params->InCells = GraphBuilder.CreateSRV(Out.Cells);
+			Params->InBrickOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
+			Params->InBrickMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
+			Params->OutBrickDesc = GraphBuilder.CreateUAV(Out.BrickDesc);
+			Params->OutBrickOcc = GraphBuilder.CreateUAV(Out.BrickOcc);
+			Params->OutBrickMat = GraphBuilder.CreateUAV(Out.BrickMat);
+			Params->OutBrickSkip = GraphBuilder.CreateUAV(Out.BrickSkip);
+			Params->OutChunkBrickMask = GraphBuilder.CreateUAV(Out.BrickChunkMask);
+
+			TShaderMapRef<FVoxelBrickPackCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPackMain(%u bricks)", S.NumBricks),
+				Shader, Params, FIntVector(S.NumBricks, 1, 1));
+		}
+
+		// --- brick pass 9: BrickTotalMain ---------------------------------
+		//
+		// Unconditional, for FVoxelQuadTotalCS's reason: it costs one thread,
+		// and being always present is what lets every path that runs the brick
+		// chain -- including the blocking verification one -- cross-check the
+		// GPU's totals against the CPU's derivation from the same scan arrays.
+		// A kernel only the streaming path exercises is a kernel whose first bug
+		// shows up in the streaming path.
+		{
+			FVoxelBrickTotalCS::FParameters* Params =
+				GraphBuilder.AllocParameters<FVoxelBrickTotalCS::FParameters>();
+			Params->ScanCount = S.NumBricks;
+			Params->InOccCounts = GraphBuilder.CreateSRV(OccCounts);
+			Params->InOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
+			Params->InMatCounts = GraphBuilder.CreateSRV(MatCounts);
+			Params->InMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
+			Params->OutBrickTotals = GraphBuilder.CreateUAV(Out.BrickTotals);
+
+			TShaderMapRef<FVoxelBrickTotalCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+			FComputeShaderUtils::AddPass(
+				GraphBuilder, RDG_EVENT_NAME("Voxel.BrickTotalMain"), Shader, Params,
+				FIntVector(1, 1, 1));
+		}
+	}
+
 	if (!S.bMesh)
 	{
 		return Out;
@@ -1120,6 +1625,128 @@ void VoxelGpuWorldGen::AddQuadPoolHidePass(FRDGBuilder& GraphBuilder, FRDGBuffer
 		GraphBuilder, RDG_EVENT_NAME("Voxel.QuadPoolHide(%u quads @ %u)", NumQuads, DstFirst),
 		Shader, Params,
 		FIntVector(FMath::DivideAndRoundUp(NumQuads, 64u), 1, 1));
+}
+
+// --- P1-C / P2: the four moves that make a packed chunk resident -------------
+//
+// Each dispatches one thread per element it writes and restates its own bound in
+// the shader, because a dispatch size rounds up and the tail threads of the last
+// group are real. Same shape and same reasoning as the quad passes above.
+
+void VoxelGpuWorldGen::AddBrickWordCopyPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
+                                            uint32 SrcFirst, uint32 DstFirst, uint32 NumWords)
+{
+	if (NumWords == 0 || Dst == nullptr || Src == nullptr)
+	{
+		// A chunk whose every brick collapsed allocates nothing in an arena, and
+		// that is a NORMAL outcome -- an all-air chunk is 64 descriptors and no
+		// payload at all, which is the property that makes the census affordable.
+		// So this is a legitimate early-out, not the "cannot happen" kind.
+		return;
+	}
+
+	FVoxelBrickWordCopyCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickWordCopyCS::FParameters>();
+	Params->SrcFirst = SrcFirst;
+	Params->DstFirst = DstFirst;
+	Params->NumWords = NumWords;
+	Params->InWords = GraphBuilder.CreateSRV(Src);
+	Params->OutWords = GraphBuilder.CreateUAV(Dst);
+
+	TShaderMapRef<FVoxelBrickWordCopyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickWordCopy(%u dwords @ %u)", NumWords, DstFirst),
+		Shader, Params, FIntVector(FMath::DivideAndRoundUp(NumWords, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickDescPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstDesc,
+                                                 FRDGBufferRef SrcDesc, uint32 SrcFirst, uint32 DstFirst,
+                                                 uint32 BrickCount, uint32 OccBase, uint32 MatBase)
+{
+	if (BrickCount == 0 || DstDesc == nullptr || SrcDesc == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickDescPoolWriteCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickDescPoolWriteCS::FParameters>();
+	Params->SrcFirst = SrcFirst;
+	Params->DstFirst = DstFirst;
+	Params->BrickCount = BrickCount;
+	Params->OccBase = OccBase;
+	Params->MatBase = MatBase;
+	Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+	Params->OutBrickDesc = GraphBuilder.CreateUAV(DstDesc);
+
+	TShaderMapRef<FVoxelBrickDescPoolWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickDescPoolWrite(%u descs @ %u, occ+%u mat+%u)",
+		               BrickCount, DstFirst, OccBase, MatBase),
+		Shader, Params, FIntVector(FMath::DivideAndRoundUp(BrickCount, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickChunkRecordPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+                                               FRDGBufferRef SrcDesc, FRDGBufferRef SrcOcc,
+                                               FRDGBufferRef SrcChunkMask,
+                                               uint32 SrcFirst, uint32 SrcChunkIndex, uint32 BrickCount,
+                                               uint32 ChunkSlot, uint32 BrickBase, uint32 RingLevel,
+                                               const FIntVector& OriginVoxel,
+                                               const FVoxelBrickChunkShading& Shading)
+{
+	if (DstTable == nullptr || SrcDesc == nullptr || SrcOcc == nullptr || SrcChunkMask == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickChunkRecordCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickChunkRecordCS::FParameters>();
+	Params->SrcFirst = SrcFirst;
+	Params->SrcChunkIndex = SrcChunkIndex;
+	Params->BrickCount = BrickCount;
+	Params->ChunkSlot = ChunkSlot;
+	Params->BrickBase = BrickBase;
+	Params->RingLevel = RingLevel;
+	// FROM THE C++ CONSTANT, so this kernel and BuildChunkRecord cannot disagree
+	// about the record length. See VoxelBrickPoolWrite.usf's ChunkRecordDwords.
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	// Packed on the CPU, through the same FVoxelBrickChunkShading::Pack that
+	// BuildChunkRecord uses, so the kernel receives finished dwords and the two
+	// writers cannot lay the bits out differently.
+	Shading.Pack(Params->ChunkClimatePacked, Params->ChunkSurfaceGradPacked,
+	             Params->ChunkSurfaceZRelBits);
+	Params->OriginVoxel = FIntVector3(OriginVoxel.X, OriginVoxel.Y, OriginVoxel.Z);
+	Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+	Params->InBrickOcc = GraphBuilder.CreateSRV(SrcOcc);
+	Params->InChunkBrickMask = GraphBuilder.CreateSRV(SrcChunkMask);
+	Params->OutChunkTable = GraphBuilder.CreateUAV(DstTable);
+
+	TShaderMapRef<FVoxelBrickChunkRecordCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// ONE workgroup: one thread per brick, and the allSolid reduce is over the
+	// 64 of them.
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickChunkRecord(slot %u, L%u)", ChunkSlot, RingLevel),
+		Shader, Params, FIntVector(1, 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickChunkClearPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+                                              uint32 ChunkSlot)
+{
+	if (DstTable == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickChunkClearCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickChunkClearCS::FParameters>();
+	Params->ChunkSlot = ChunkSlot;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	Params->OutChunkTable = GraphBuilder.CreateUAV(DstTable);
+
+	TShaderMapRef<FVoxelBrickChunkClearCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickChunkClear(slot %u)", ChunkSlot), Shader, Params,
+		FIntVector(1, 1, 1));
 }
 
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()

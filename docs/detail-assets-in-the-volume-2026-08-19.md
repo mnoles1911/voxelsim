@@ -109,8 +109,9 @@ Replayed over all 828 specs in `asset-forge/specs/`; agrees with
   `assetSpeciesTableFromManifest`, structurally incapable of coming out of the
   resolver.
 * **Actual Phase 6 scope: 230 species** — flower 87, grass 86, reed 33, bush 24.
-  **223 at 5 cm; 7 bushes at 2 cm.** "Every one on the 5 cm lattice" is not quite
-  true, and §7.3 covers the 7.
+  **223 at 5 cm; 7 at 2 cm.** "Every one on the 5 cm lattice" is not quite true.
+  The 7 are the coral set — `kind: bush`, ocean-only, no land placement — so
+  every detail species that can appear on land is at 5 cm. §7.4.2 has the list.
 
 ---
 
@@ -201,7 +202,8 @@ all 512 cells: `volumeprobe.cpp:701`). Sparse content is cheap under this contra
 * ≤23,500 instances × ~700 placement-weighted solid voxels = **≤16.5M solid voxels**
 * ~350,000 distinct mixed bricks (40 cm bricks, ~25% areal coverage), ~47 solid
   per brick, 2 bpp
-* ⇒ **16-35 MiB; call it under 50 MiB with margin**
+* ⇒ **16-35 MiB; call it under 50 MiB with margin** — *predicted before the run;
+  §5.2 has the measurement, which landed at 26.5 MiB.*
 
 Against the plan's **measured 1,110 MiB** for R0-at-5cm
 (`docs/ray-marching-plan-2026-08-19.md:759`), and against today's 388 MiB commit /
@@ -210,18 +212,155 @@ Against the plan's **measured 1,110 MiB** for R0-at-5cm
 **~50 MiB scoped against 1,110 MiB coupled is not a difference in approach. It is
 a different project.**
 
-### 5.1 The falsifier, stated plainly
+### 5.1 The falsifier, stated plainly — and resolved
 
-The two inputs — grid occupancy and instance density — are **measured**. The soft
-term is the **brick-touch count** (how many distinct 40 cm bricks the cover
-actually lands in, after overlap), which is **modelled, not measured**. That single
-term is what §8 step 2 exists to measure.
+The two inputs — grid occupancy and instance density — were **measured**. The soft
+term was the **brick-touch count** (how many distinct 40 cm bricks the cover
+actually lands in, after overlap), which was **modelled, not measured**.
 
-**If `vxc_volumeprobe --detail-cover` returns ~500 MiB or more, this document is
-wrong and `ray-marching-plan-2026-08-19.md:795-797` is right: the coupling holds,
-and cover should ride R0-at-5cm rather than get its own volume.** The step tests
-the claim rather than arguing it. Nothing downstream should be designed before
-that number lands.
+**The falsifier, written before the run: if `vxc_volumeprobe --detail-cover`
+returns ~500 MiB or more, this document is wrong and
+`ray-marching-plan-2026-08-19.md:795-797` is right.**
+
+### 5.2 Measured 2026-08-19/20 — the doc stands, by 3.8× at the shipping ring
+
+Full record: `docs/measurements/cover-volume-census-2026-08-19.txt`.
+Ring 112 m, pitch 50 mm, payload = descriptors + occupancy + 16 B palette +
+adaptive cells.
+
+**Ring 112 m** — the value this document was written against:
+
+| site | ground | inst/ha | **payload** | flat index |
+|---|---|---:|---:|---:|
+| grassland −92445,−75855 | real fine + real climate | 3,611 | 25.4 MiB | 29.1 MiB |
+| grassland −92445,−75855 | coarse-only\* | 3,717 | 26.5 MiB | 25.4 MiB |
+| alpine bank −61440,−61440 | real fine + real climate | 156 | 10.5 MiB | 290.1 MiB |
+| CONTROL — terrain at 10 cm, same alpine ground | real | — | 31.3 MiB | 37.4 MiB |
+
+**Ring 256 m — THE RING THAT ACTUALLY SHIPS**, and the row that governs
+(`VoxelDetailAssetSubsystem.cpp:152`, `kDefaultRingMeters = 256.0`, raised from
+112 on 2026-08-18):
+
+| site | ground | inst/ha | **payload** | flat index |
+|---|---|---:|---:|---:|
+| **grassland, COVER** | real fine + real climate | 3,564 | **131.6 MiB** | 245.4 MiB |
+| **grassland, TERRAIN CONTROL** at 10 cm, same ground | real | — | **126.7 MiB** | 67.5 MiB |
+
+\* synthetic elevation over real coarse climate — the instrument the biome survey
+used for 6 of its 10 sites. Named, not hidden. **Superseded by the fine-tile row
+above** (§5.5), and kept because the pair is the evidence that the proxy was
+sound: the two disagree by **4%**.
+
+**CORRECTION, 2026-08-20, and it is mine to own.** This document was written
+against a **112 m** detail ring, quoted from
+`docs/detail-asset-rendering.md`'s knobs table. **That default was already stale
+when I read it** — the ring was raised to **256 m on 2026-08-18**
+(`VoxelDetailAssetSubsystem.cpp:139-152`), 5.2× the area. Measured rather than
+scaled, the shipping ring costs **131.6 MiB**, and the ratio the area predicted
+(5.18×) is what came back, so density is uniform across the ring.
+
+**Three things change and one does not.**
+
+1. **The falsifier still holds, with a smaller margin: 131.6 MiB against 500 —
+   3.8×, not the 20–48× the 112 m rows showed.** The design decision stands;
+   the comfort does not.
+2. **The "34% of terrain" claim does not survive and should not be repeated.**
+   It was measured on *alpine* ground, which has almost no cover on it
+   (156 inst/ha). On dense grassland at the shipping ring, **cover is 104% of
+   terrain — 131.6 against 126.7 MiB. It roughly doubles the resident volume.**
+   The honest range is *34% where nothing grows, ~100% where things do.*
+3. **Requirement C1 gets stronger, not weaker** — the flat index at the shipping
+   ring is **245.4 MiB against 131.6 MiB of payload** (§5.3).
+4. **What does not change: the comparison that decides the phase.** Cover plus
+   terrain at the shipping ring is ~258 MiB of payload on the same ground, still
+   far below the **1,110 MiB** measured for R0-at-5cm and below today's 2,197 MiB
+   quad pool. Scoping the cover volume is still the cheaper project by a wide
+   margin — §3.1 is unaffected.
+
+The pre-registered bands were both correct *for the ring they were stated
+against*: 16–35 MiB predicted and 25.4 measured at 112 m (§5), and 15–45 MiB
+predicted and 25.4 measured for the fine-tile row (§5.5). **A prediction is only
+as good as the configuration named with it, and I did not name the ring.**
+
+**The site nearly buried it, and that is the reading rule.** The first run used
+the brick census's own site and returned 10.5 MiB — but `vxc_assetprobe` over the
+same ground says only **three species place there** (alpine-krummholz 600,
+juniper-scrub 331, granite-boulder 6): **no grass, no flowers, no reeds**, a steep
+above-treeline rock face where biome weight alone refuses 83.5% of pairs. The two
+sites disagree in *both* directions and nearly cancelled — alpine has **24× fewer**
+instances per hectare but each is **38× bigger** (8,173 against 214 solid voxels).
+Either site reported alone would have been a confident number about the wrong
+world.
+
+Two cross-checks passed: instance density **3,717/ha against the survey's
+3,908/ha** (§4, two independent walks, 5% apart), and per-instance solid voxels
+against the bank census (214 against grass 257 / flower 480; 8,173 against
+juniper-scrub's own 5,131–10,900).
+
+**The reading rule this generalises to, past this phase: a single-site census is a
+claim about that site.** The alpine row is the project's own standard site, it
+looked entirely plausible, and it was measuring ground with no ground cover on it.
+What caught it was not a better number but a **cross-instrument** check —
+`vxc_assetprobe` naming the three species that place there. A census and its
+cross-check should come from different walks; agreement between two readings of
+the same walk proves only that the walk is self-consistent.
+
+### 5.3 DESIGN REQUIREMENT C1 — a cover volume must be sparsely indexed
+
+**Not an observation. A requirement, and the only one this measurement imposes.**
+
+A flat 3D brick index over the cover footprint costs **290.1 MiB at the alpine
+site against 25.4 MiB at grassland** — an 11× swing driven by **terrain relief,
+not by cover**. Cover is a thin shell following the ground, so a dense index over
+its own bounding box is **0.075% occupied** on steep slopes: the index is sized by
+the landscape's vertical range while the content is sized by a metre of plants.
+
+> **C1. The cover volume is addressed by a sparse structure — per-chunk table,
+> hash, or octree — never by a dense 3D brick array over its bounding box.**
+> A flat index costs 11–28× the payload it addresses and scales with terrain
+> relief, which cover does not control. Any design that reaches for a flat index
+> here has to price it at the steepest ground it will run on, not the flattest.
+
+This is the same design consequence the plan's §4 records for 2.5 cm, reached
+independently from the cover side, and **it is the only term anywhere near the
+falsifier** — payload never came close. Read the payload column for what a cover
+volume costs and the index column for what addressing it the wrong way would.
+
+### 5.4 A secondary result, from the same walk
+
+The probe meshes every brick it censuses, so quads and bricks are two readings of
+one field. Cover as a **volume** costs 26.5 MiB at grassland; the same cover as
+**quads** is 9,074,442 quads = **103.8 MiB** at 12 B/quad. The volume is **3.9×
+cheaper than meshing the same cover** — 7.9× at the alpine site. That is a
+measured argument for retiring the HISM path (§6), not just a tidiness one.
+
+### 5.5 The open item, and the prediction — CLOSED 2026-08-20
+
+**The prediction, recorded before the run:** a vegetated fine-tile census would
+move the payload *by the elevation gate's share, not by an order of magnitude* —
+**between 15 and 45 MiB, and not above 100**. The reasoning was put on the record
+with it: at the one site where gate attribution was measurable, **biome weight
+refused 83.5%** of (site, species) pairs and **elevation band 15.8%**; the
+grassland run already had real climate driving the dominant gate, so real
+elevation could only refine the minority one.
+
+**Result: 25.4 MiB. The prediction holds, and the proxy was accurate to 4%**
+(25.4 against 26.5 MiB). Instance density moved from 3,717 to **3,611/ha**, still
+within 8% of the survey's independently walked 3,908.
+
+No bake was needed. `-7_-5.vxtl` already existed in the v28 fine namespace UE is
+pinned to (`tile-cache/…-b19d281fd/000000000135276f/s16/`), and the grassland site
+sits inside that tile's footprint — tile edge is 15,360 m, so (−7,−5) covers
+X −107,520…−92,160 and Y −76,800…−61,440. **The instrument gap was a staging
+oversight, not a missing measurement**, which is worth remembering next time a
+result is qualified as "blocked on a bake".
+
+**What this closes and what it does not.** The 5 cm cover volume over the 112 m
+detail ring costs **25.4 MiB on real ground at a dense biome**, against a
+**31.3 MiB terrain control** and a **500 MiB falsifier**. What is still unmeasured
+is any biome other than grassland and alpine on real fine tiles — and by this
+document's own reading rule (§5.2), that is a limit on the claim, not a caveat to
+wave at it.
 
 ---
 
@@ -288,16 +427,49 @@ against unit tests, and only then point a byte gate at them.** Same shape as
 `packChunkBricksCanonical` for P1 and `fluidoccupancy.h` against
 `VoxelFluidCollision.ush`: one engine-free header, one test file, one definition.
 
-### 7.3 Four ways the gate fails for non-defect reasons
+### 7.3 Mutate the code, not just the reference
+
+**A third standing rule, earned 2026-08-20 and stated here with the other two
+because this is where anyone looking for gate doctrine will read.**
+
+A gate proved only against a *correct* implementation is proved against the easy
+case. The only way to know a check can fail is to **break the thing it watches
+and watch it go red** — and to break it in more than one place, so selectivity is
+shown rather than assumed.
+
+This is not theory here. Mutating `produceCoverChunk` two ways found that one
+mutation — counting a chunk as packed before knowing whether it packed anything —
+**broke nothing**, because every counter test then written exercised a path that
+returned at the z-reject *before* the counter under test. The assertions were
+real, the suite was green, and it was measuring a line it never reached. **The
+test suite was itself a check that could not fail**, the eleventh such instrument
+in one night on this project and the first one that was a test rather than a
+probe. Reading the code would not have shown it; only mutation did.
+
+So: for every guarantee a gate claims, there must exist a mutation that makes it
+fail, and it must have been run. Mutation did not confirm these tests. **It found
+the hole in them.** See §8b for the case that closed it.
+
+### 7.4 Four ways the gate fails for non-defect reasons
 
 1. **Anchor division sign.** `anchorXMm` is signed millimetres and the census
    ground is at (−39661, −57292). C++ `floorDiv` floors; HLSL `/` truncates toward
    zero. The current stamp never divides — anchors arrive pre-divided from the
    host. **Keep it that way at 50 mm.**
-2. **The 7 bushes at 2 cm.** Not expressible on a 5 cm lattice. **Refuse at load
-   with the species named**, exactly as `SizeZ > 4095` is refused
-   (`VoxelGpuWorldGen.cpp:897-905`). Content failing a gate and then being
-   debugged as code is a real and repeated cost here.
+2. **The 7 species at 2 cm — and measuring them named them, which changed what
+   they are.** Not expressible on a 5 cm lattice, so **refused at load with the
+   species named**, exactly as `SizeZ > 4095` is refused
+   (`VoxelGpuWorldGen.cpp:897-905`). Running `--detail-cover` printed the list:
+   `black-coral-tree, branching-stony-coral, carnation-soft-coral,
+   cold-water-coral, elkhorn-coral, leather-coral, staghorn-coral`. **All seven
+   are corals** — filed as `kind: bush` in the specs, authored at 2 cm, and
+   weighted **`ocean` only, zero in every land biome.** So this is not seven
+   awkward shrubs a land cover volume has to explain away; it is **the entire
+   reef library, which never places on land at all** and which would want its
+   own 2 cm reef volume if it is ever rendered. The land cover volume at 5 cm
+   refuses nothing it would ever have drawn. *(This is why the refusal is by
+   name: an unnamed count of "7 dropped" would have read as a defect in the
+   land path.)*
 3. **Instance ordering.** First-non-air-wins depends on per-instance dispatch in
    `instancesForRect` order via the RDG pass barrier. Checked: at ≤0.469
    instances/m² and a 1.6 m chunk at 5 cm this is **~1 instance per chunk**, well
@@ -313,19 +485,93 @@ against unit tests, and only then point a byte gate at them.** Same shape as
 1. **`resolveForCoverCompose` + `coverMaterialAtResolved` in voxel-core** —
    engine-free, unit-tested, single definition. This is the byte-equality
    reference (§7.2), and it is a prerequisite for step 2, not a parallel task.
-2. **`vxc_volumeprobe --detail-cover`** against the terrain-only census, same seed,
-   same site. One arm (cover composed at 50 mm over the detail ring), one control
-   (today's `--cascade`), one number (MiB added, plus the brick-touch count that
-   is the soft term in §5.1). CPU bench — no editor, no UBT, no shader.
+2. **`vxc_volumeprobe --detail-cover`** — **DONE 2026-08-19, §5.2.** 26.5 MiB at
+   grassland, 10.5 MiB at the alpine site, against a 31.3 MiB terrain control on
+   identical ground and a 500 MiB falsifier. Record:
+   `docs/measurements/cover-volume-census-2026-08-19.txt`.
 3. **A 10 cm column in `asset-forge/tools/lattice_ab.py`**, in parallel — offline,
    no editor. **The owner judges the shape question; state conditions, offer no
    verdict.** The caption must carry the tool's own methodological point: *shrinking
    a 2 cm asset into a 5 cm lattice answers a different and easier question than
    designing one for 5 cm* — so the honest comparison is authored-for-10 cm beside
    authored-for-5 cm, at one physical scale.
-4. **Refuse the 7 bushes at 2 cm by name at load** (§7.3.2).
+4. **Refuse the 7 bushes at 2 cm by name at load** (§7.4.2).
 
 **The one-species stamp is held until the census lands.**
+
+---
+
+## 8b. The producer — built 2026-08-20, and the seam it still needs
+
+**Landed in voxel-core** (`voxelcore/covervolume.h`, tests in `test_assetfield.cpp`):
+
+* `produceCoverChunk(...)` — **`packChunkBricksCanonical` over
+  `coverMaterialOfResolved`**. The producer *is* the shipping packer handed a
+  cover accessor, which is why a GPU cover stamp is checkable against it from day
+  one rather than against a gate written afterwards (§7.2).
+* `coverVolumeInit(manifest, pitchMm)` — refuses a non-tiling pitch **whole**, and
+  returns the refused species **by name** (§7.4.2).
+* `CoverProducerCounters` — a strict funnel, `attempted → resolved → packed`.
+
+**Requirement C1 is in the producer, not just the doc.** A chunk with no cover
+returns `anyCover = false` and accumulates nothing — no zeroed pack, no reserved
+slot. A z-reject runs before any packing, because a cover volume is mostly empty
+vertically.
+
+**The counters exist to fail.** `attempted == 0` means *the producer did not run*;
+`attempted > 0 && packed == 0` means *it ran and found nothing* — a real answer
+about the ground, and exactly what the alpine site turned out to be. A single
+`coverChunks` counter cannot tell those apart, and this project has now found ten
+instruments in a night that reported plausibly while measuring nothing, two of
+them counters that could not fail.
+
+**And mutating the producer found an eleventh — in my own test suite.** Moving
+`chunksPacked` above the `anyCover` check is a real defect: it counts an empty
+pack as produced. **Every counter test I had written passed anyway**, because
+their "produced nothing" chunk exits at the **z-reject**, before the counter is
+ever reached — so the funnel was only ever proved on a path that skips it. The
+test suite was itself a check that could not fail, for exactly the reason this
+document keeps warning about, and reading the code would not have shown it.
+
+Closed by `coverproducer_packs_an_all_air_species_without_counting_it_as_packed`:
+a species whose baked grid is entirely air resolves, survives the z-reject, fills
+the shortlists, reaches the packer and yields nothing — the one path where a
+premature counter lies. It now fails under that mutation (`packed 1 vs 0`) while
+the other four producer tests stay green.
+
+**The rule this earns: mutate the code, not just the reference.** A gate proved
+only against a correct implementation is proved against the easy case. Mutation
+here did not confirm the tests — it found the hole in them.
+
+### What I need at the seams I do not own
+
+I can specify these but must not build them — no UE build this round, and the
+files below belong to other workstreams. Routing request, in priority order:
+
+1. **A cvar, default off.** `voxel.Cover.Produce` (0 = off), read once per
+   dispatch and latched, the shape `voxel.GPU.BrickPack` already uses
+   (`VoxelGpuMeshJobManager.cpp:45-52`). **`voxel.Cover.Produce 0` is the control
+   arm**, and `-VoxelNoDetailAssets` stays as the HISM kill switch so volume and
+   HISM can be A/B'd against each other rather than only against nothing.
+2. **A stats line** — `voxel.Cover.Stats` printing the funnel verbatim
+   (`attempted / resolved / packed / anchored / solid / bytes`), and printing the
+   words *"did not run"* when `attempted == 0` rather than a row of zeroes. Zeroes
+   are what a broken instrument and an empty world have in common.
+3. **A sparse store.** The cover volume must not go into a dense array keyed by
+   brick coordinate — **requirement C1, measured at 290.1 MiB against 25.4 MiB of
+   payload**. Whether it earns a slice of the brick pool or its own sparse table
+   is a call for whoever owns `VoxelBrickPool` / the marcher; I only need the
+   store to be keyed sparsely and to accept "this chunk has nothing".
+4. **The driving loop.** `VoxelDetailAssetSubsystem.cpp` is mine and already has
+   the ring scan, the residency gate and the worker dispatch (§6, "must survive").
+   It needs `columnFacts` bound to the engine's own
+   `assetColumnFactsFromSample(Amplifier::column(...), assetChannelsAt(...))` — the
+   binding rule of 2026-08-17: an instrument that runs a different binding is
+   measuring a different world.
+
+**Not yet, deliberately:** the one-species end-to-end stamp. §7.2's rule applies
+to this phase too — the reference exists now, so the gate can be built against it,
+and the stamp comes after the gate rather than before.
 
 ---
 
@@ -340,5 +586,25 @@ against unit tests, and only then point a byte gate at them.** Same shape as
   "~20k per 128×128 m" is 1.22 instances/m², 2.6× the current ceiling.
   `VoxelDetailAssetSubsystem.cpp:147` records the cut from 1000 → 300 per-mille.
   Use `docs/biome-placement-survey.md` for density; it is post-retune.
+* **`asset-forge/tools/lattice_ab.py` was measuring size on screen, not detail
+  — found and fixed while adding the 10 cm column (step 3).** `render.scale_for`
+  quantises pixels-per-voxel to {8,6,4,3,2,1} and each variant was scaled to
+  FILL its own cell, so metres-per-pixel differed across a row: measured, the
+  5 cm reed rendered 63x118 px against the 2 cm reed's 151x345 px for plants of
+  2.65 m and 2.86 m. **The coarse column looked better than it was, which is the
+  exact direction that would have biased this phase's own decision.** The tool
+  now sets pixels-per-voxel proportional to pitch (1 px per cm of voxel edge,
+  integral because every authored pitch is a whole number of cm) and applies one
+  common per-row downscale. Any earlier sheet from this tool — including
+  `out/lattice-ab.png` — carries the old bias and should not be re-read.
+* **`docs/detail-asset-rendering.md`'s knobs table is stale on the ring** — it
+  says `-VoxelDetailRingMeters` defaults to 112 m; the code has said **256 m
+  since 2026-08-18** (`VoxelDetailAssetSubsystem.cpp:139-152`). I quoted the doc
+  and sized the whole census against it, which cost a 5.2× error in the headline
+  until it was caught and re-measured (§5.2). **That is the third stale default
+  this phase has found quoted in a doc** — after the pre-retune density in the
+  same file and the "flowers have no banks" line in the biome survey. The rule
+  that keeps earning itself: *a default quoted in a doc is a claim to check
+  against the code, not a value to use.*
 * **The `bankGrid` global mutex is a prerequisite for this phase**, not a side
   effect of it — see §6, item 3.

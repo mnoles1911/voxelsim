@@ -98,6 +98,15 @@
 #include "VoxelFineTileStreamer.h"
 #include "VoxelWorldSubsystem.h"
 
+// PHASE 6: the cover funnel does not end at the producer. The index is the other
+// half of it, and "the producer packed 12,000 chunks" against "the index holds
+// 0" is a routing answer that neither counter can give alone -- which is the
+// offered/resident/dropped ownership split that answered the L1 question in one
+// grep instead of a whole leg.
+#include "VoxelBrickPool.h"            // Phase 6: cover is published into the same pool as terrain, at level 7
+#include "VoxelBrickCpuPackFromCore.h" // ...through the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy
+#include "VoxelMarchChunkIndex.h"
+
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
@@ -107,6 +116,7 @@
 #include "Materials/Material.h"
 #include "MaterialDomain.h"
 #include "MeshDescription.h"
+#include "HAL/IConsoleManager.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 #include "StaticMeshAttributes.h"
@@ -121,6 +131,7 @@
 #include "voxelcore/assetplacement.h"
 #include "voxelcore/assetpolicy.h"
 #include "voxelcore/core.h"
+#include "voxelcore/covervolume.h"
 #include "voxelcore/hash.h"
 #include "voxelcore/materialpalette.h"
 
@@ -131,6 +142,297 @@ namespace
 // One 2x2 block of level-0 chunks: 64 voxels = 6.4 m on a side. Small enough
 // that a group's resolve is ~100 amplifier columns (a level-0 mesh job pays
 // ~1,150), large enough that the ring is ~1,000 groups rather than ~4,000.
+// ---------------------------------------------------------------------------
+// THE COVER VOLUME ARM (voxel.Cover.Produce) -- default OFF.
+// ---------------------------------------------------------------------------
+//
+// docs/detail-assets-in-the-volume-2026-08-19.md is the design and the census.
+// The producer itself is engine-free (voxelcore/covervolume.h): it is
+// packChunkBricksCanonical over the cover composition reference, so a GPU cover
+// stamp is checkable against exactly what runs here.
+//
+// WHAT THIS ARM DOES AND DOES NOT DO TODAY, STATED PLAINLY SO IT IS NOT
+// MISTAKEN FOR A RENDERER. There is no cover STORE yet -- the sparse store is
+// blocked on the brick pool / marcher seam, which is mid-revert after a 188x
+// traversal regression. So with this cvar on, every group packs its cover
+// chunks and THROWS THE PACK AWAY. That is deliberate and it is a measurement,
+// not an oversight: it is the "generate, pack, publication stubbed" arm the
+// ray-marching plan section 8 asks for, and it prices the producer and sizes
+// the volume on real ground without waiting on a consumer. NOTHING RENDERS
+// FROM IT. The HISM path is untouched and still draws the cover.
+//
+// 0 (default) = this file behaves exactly as it did before the arm existed.
+int32 GVoxelCoverProduce = 0;
+FAutoConsoleVariableRef CVarVoxelCoverProduce(
+	TEXT("voxel.Cover.Produce"),
+	GVoxelCoverProduce,
+	TEXT("1 = each detail resolve job ALSO packs its group into cover-volume bricks ")
+	TEXT("(voxelcore/covervolume.h) and discards them -- a producer-cost and volume-size ")
+	TEXT("arm, nothing renders from it. 0 (default) = untouched. Latched per dispatch."),
+	ECVF_Default);
+
+// THE MUTATION ARM FOR THE INDEX'S CONSERVATION LAW.
+//
+// offered == admitted + droppedOutOfBand has never failed, which is exactly when
+// a reader starts relying on it. At 1 the index refuses the FIRST cover chunk it
+// is ever offered and counts it NOWHERE, so the law must read VIOLATED. Its
+// precondition is identical to the law's -- a cover chunk was offered -- so if
+// voxel.Cover.Stats does not say NOT EXERCISED, this arm has fired.
+//
+// If the law still reads CONSERVED under this, the law is decorative and every
+// cover funnel it has blessed is unverified. NEVER leave it on.
+int32 GVoxelCoverMutateIndex = 0;
+FAutoConsoleVariableRef CVarVoxelCoverMutateIndex(
+	TEXT("voxel.Cover.MutateIndex"),
+	GVoxelCoverMutateIndex,
+	TEXT("MUTATION ARM, default 0. 1 = the march chunk index refuses the first cover chunk it is ")
+	TEXT("offered and counts it nowhere, so voxel.Cover.Stats MUST report the conservation law ")
+	TEXT("VIOLATED. A check that has never failed is not yet known to be a check. Never ship at 1."),
+	ECVF_Default);
+
+// THE PUBLICATION GATE, SEPARATE FROM THE PRODUCTION GATE.
+//
+// voxel.Cover.Produce 1 alone is the pack-and-discard measurement arm that has
+// existed since 2026-08-20: it prices the producer and sizes the volume without
+// a consumer. Adding voxel.Cover.Resident 1 is what makes those packs reach
+// FVoxelBrickPool at level 7, become visible to the march chunk index, and cost
+// VRAM.
+//
+// TWO CVARS AND NOT ONE, for the reason voxel.GPU.BrickPack and
+// voxel.GPU.BrickPackResident are two: with one, "the producer never ran" and
+// "the producer ran and nothing was stored" are the same reading, and this
+// project has spent three separate diagnoses on exactly that ambiguity.
+//
+// SUBORDINATE: with Produce 0 this does nothing at all, because there is no pack
+// to publish. Latched per dispatch, like Produce.
+int32 GVoxelCoverResident = 0;
+FAutoConsoleVariableRef CVarVoxelCoverResident(
+	TEXT("voxel.Cover.Resident"),
+	GVoxelCoverResident,
+	TEXT("1 = cover packs are published into the brick pool at level 7 and indexed by the march ")
+	TEXT("chunk index; 0 (default) = packed and discarded, which is the producer-cost arm and the ")
+	TEXT("control for what publication costs. Requires voxel.Cover.Produce 1 -- with that off there ")
+	TEXT("is no pack to publish and this is ignored. Nothing RENDERS from the pool until the cover ")
+	TEXT("march segment is enabled separately."),
+	ECVF_Default);
+
+// Process-lifetime cumulative, incremented from workers. Same doctrine as
+// vxc::Counters: the UE layer owns the instrument, voxel-core stays clean.
+vxc::CoverProducerCounters GCoverCounters;
+
+// REFUSED, NOT SILENTLY DEGRADED. A null channel source is the sentinel world
+// (fail-closed water gates), and a cover volume built from it is a DIFFERENT
+// WORLD -- the binding rule of 2026-08-17. Counted so "cover produced nothing"
+// can never be confused with "cover was never allowed to run".
+std::atomic<uint64> GCoverGroupsRefusedSentinel{0};
+// ---- Phase 6: the publication funnel, and every term can move -------------
+//
+// FILE SCOPE, like the two counters below, so voxel.Cover.Stats can print them:
+// the impl is per-subsystem and that command is static. Game thread only, but
+// atomic for the same reason its neighbours are -- one doctrine per file.
+//
+// resident and released are the two halves of a lifetime; REFUSED is the pool
+// declining an add (arenas full after eviction); MISSING is a release finding
+// the pool no longer holds a chunk this subsystem believes it owns. The last two
+// must NOT be folded into one "cover chunks" number: "the pool is full" and "the
+// pool evicted behind our back" have different owners and identical visible
+// symptoms -- cover absent from ground the player is standing on.
+std::atomic<int64> GCoverChunksResident{0};
+std::atomic<int64> GCoverChunksReleased{0};
+std::atomic<int64> GCoverPublishRefused{0};
+std::atomic<int64> GCoverReleaseMissing{0};
+// A group whose instances span more z than any plausible cover shell. Capped
+// rather than walked, and COUNTED, because an uncounted cap is the silent
+// no-op this project keeps paying for.
+std::atomic<uint64> GCoverGroupsZClamped{0};
+constexpr int32 kCoverMaxChunkLayers = 32;
+
+// The pitch the land detail library is baked at. The 7 species at 20 mm are the
+// reef set (ocean-weighted, zero on land) and are refused BY NAME at init.
+constexpr uint32 kCoverPitchMm = 50;
+
+// The INDEX half of the funnel, printed by voxel.Cover.Stats beside the
+// producer half. Separate line, separate verdict, on purpose: "the producer
+// found nothing" and "the producer found plenty and none of it reached the
+// index" are different owners, and a single combined number cannot tell them
+// apart. That ownership split is what answered the L1 residency question in one
+// grep instead of a whole leg.
+// The PUBLICATION half of the funnel: producer -> pool. Printed between the
+// producer's funnel and the index's, because that is the order the bytes travel
+// and because a gap between any two adjacent lines names its own owner.
+void PrintCoverPublication()
+{
+	const int64 Resident = GCoverChunksResident.load(std::memory_order_relaxed);
+	const int64 Released = GCoverChunksReleased.load(std::memory_order_relaxed);
+	const int64 Refused = GCoverPublishRefused.load(std::memory_order_relaxed);
+	const int64 Missing = GCoverReleaseMissing.load(std::memory_order_relaxed);
+	if (Resident == 0 && Released == 0 && Refused == 0)
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCoverPool: NOTHING WAS EVER PUBLISHED -- voxel.Cover.Resident is %d "
+		            "(needs 1, and voxel.Cover.Produce 1 with it). This is not a statement about "
+		            "the pool."),
+		       GVoxelCoverResident);
+		return;
+	}
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelCoverPool: %lld cover chunks resident, %lld released, %lld REFUSED by the "
+	            "pool (arenas full after eviction -- read voxel.Brick stats for allocFailures), "
+	            "%lld release-missing."),
+	       (long long)Resident, (long long)Released, (long long)Refused, (long long)Missing);
+	if (Missing > 0)
+	{
+		// NOT BENIGN, and it is an Error because the symptom is invisible: the
+		// pool evicted cover this subsystem still believes it owns, so the
+		// group's list and residency have diverged and cover goes missing from
+		// ground the player is standing on with every other counter healthy.
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("VoxelCoverPool: %lld cover chunks were gone from the pool by the time their "
+		            "group released them. The pool is evicting cover behind this subsystem's back, "
+		            "so group ownership and residency have diverged. Cover lifetime is supposed to "
+		            "be owned by the detail ring, not by eviction pressure."),
+		       (long long)Missing);
+	}
+}
+
+void PrintCoverIndexFunnel()
+{
+	FVoxelMarchChunkIndex& Idx = GetGlobalVoxelMarchChunkIndex();
+	// Re-armed here only so the flag reflects the cvar when the detail tick is
+	// inert (no assets installed). THE ARMING THAT MATTERS IS IN THE TICK -- by
+	// the time this runs, every cover chunk this leg will ever publish has
+	// already been offered to the index. Both sites read the same global and set
+	// the same value, so they cannot disagree; deleting the tick one because this
+	// exists would silently disarm the mutation.
+	Idx.SetMutateCoverConservation(GVoxelCoverMutateIndex != 0);
+
+	// THE SINK MAY NOT EVEN BE CONNECTED, and that is a different answer from
+	// "no cover was offered". The index attaches from VoxelMarchPublishSource,
+	// which the FLUID subsystem drives -- so a leg without fluids leaves every
+	// counter below at zero for a reason that has nothing to do with cover.
+	if (!Idx.IsAttached())
+	{
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCoverIndex: THE INDEX IS NOT ATTACHED TO THE POOL -- it is hooked up by "
+		            "VoxelMarchPublishSource (driven by the fluid subsystem), which has not run in "
+		            "this session. Cover may well have been published into the pool; nothing was "
+		            "listening. The zeroes below are about the sink, not about the ground."));
+		return;
+	}
+
+	FString Verdict;
+	const FVoxelMarchChunkIndex::ECoverConservation Result = Idx.CheckCoverConservation(Verdict);
+	// NOT EXERCISED IS LOGGED AT Log AND SAYS SO IN WORDS. It is not a pass, and
+	// the one thing it must never do is look like one. Only a genuine violation
+	// is an Error, so a leg grep for Error is not poisoned by "cover was off".
+	//
+	// Two UE_LOG sites rather than a verbosity expression: UE_LOG's verbosity is
+	// a compile-time token, not a value.
+	if (Result == FVoxelMarchChunkIndex::ECoverConservation::Violated)
+	{
+		UE_LOG(LogVoxelEarth, Error, TEXT("VoxelCoverIndex: %s"), *Verdict);
+	}
+	else
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelCoverIndex: %s"), *Verdict);
+	}
+	if (Result == FVoxelMarchChunkIndex::ECoverConservation::NotExercised)
+	{
+		return;
+	}
+	const FIntVector Span = Idx.GetCumulativeCoordSpan(FVoxelMarchChunkIndex::kCoverLevel);
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelCoverIndex: resident %d cover chunks in grid slot %u; alias collisions %d "
+	            "(non-zero means one cover chunk is shadowing another and the shadowed one is a "
+	            "HOLE the marcher invented); cumulative cover coord span (%d,%d,%d) against a "
+	            "band radius of %d chunks -- THE SPAN IS A TRAVEL LOG, NOT AN ALIASING CLAIM."),
+	       Idx.GetCoverEntries(), FVoxelMarchChunkIndex::kCoverGridSlot,
+	       Idx.GetCoverAliasCollisions(), Span.X, Span.Y, Span.Z,
+	       FVoxelMarchChunkIndex::kCoverBandRadiusChunks);
+
+	// ---- THE RECONCILIATION, SUBTRACTED HERE RATHER THAN BY A READER --------
+	//
+	// Publication is bounded by the DETAIL RING (256 m); the index band is
+	// +/-40 cover chunks (64 m). They are deliberately mismatched, so cover
+	// between the two radii is RESIDENT IN THE POOL, costing VRAM, and INVISIBLE
+	// TO THE MARCHER. That gap is the number below.
+	//
+	// AND IT DOES NOT CLOSE BY ITSELF AS THE CAMERA APPROACHES. Admission is
+	// decided ONCE, when the pool emits the Added delta; there is no re-offer
+	// when the band moves. So a cover chunk published at 200 m and dropped stays
+	// dropped even when the camera walks to 10 m from it -- until its group
+	// leaves the unload ring and re-resolves. The symptom would be a hole in
+	// cover that travels with the camera, and NOTHING ELSE WOULD LOOK WRONG.
+	//
+	// Printed, not fixed: the fix is to bound publication to the band, and that
+	// would change the admitted/offered ratio this leg was pre-registered
+	// against. Decide it against this number rather than against my estimate.
+	{
+		const int64 PoolResident = GCoverChunksResident.load(std::memory_order_relaxed);
+		const int64 IndexResident = int64(Idx.GetCoverEntries());
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCoverReconcile: pool holds %lld cover chunks, the index can see %lld -- "
+		            "%lld are RESIDENT BUT UNMARCHABLE (published outside the +/-%d-chunk band and "
+		            "never re-offered). Admission is decided once, at publish time; it does not "
+		            "reopen as the camera approaches."),
+		       (long long)PoolResident, (long long)IndexResident,
+		       (long long)(PoolResident - IndexResident),
+		       FVoxelMarchChunkIndex::kCoverBandRadiusChunks);
+	}
+}
+
+void PrintCoverStats()
+{
+	const uint64 Attempted = GCoverCounters.attempted();
+	if (Attempted == 0)
+	{
+		// THE WORDING MATTERS. Zeroes are what a broken instrument and an empty
+		// world have in common, and that ambiguity has cost this project three
+		// separate diagnoses. Say which one this is.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCover: DID NOT RUN -- no chunk was attempted. "
+		            "voxel.Cover.Produce is %d (needs 1), or no detail group has "
+		            "resolved yet. This is not a result about the ground."),
+		       GVoxelCoverProduce);
+		PrintCoverPublication();
+		PrintCoverIndexFunnel();
+		return;
+	}
+	const uint64 Packed = GCoverCounters.packed();
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("VoxelCover: attempted %llu -> resolved %llu -> PACKED %llu; "
+	            "%llu instances anchored, %llu solid cover voxels, %.2f MiB packed "
+	            "(discarded -- no store yet). Refused sentinel-world groups %llu, "
+	            "z-clamped groups %llu."),
+	       (unsigned long long)Attempted,
+	       (unsigned long long)GCoverCounters.resolved(),
+	       (unsigned long long)Packed,
+	       (unsigned long long)GCoverCounters.anchored(),
+	       (unsigned long long)GCoverCounters.solid(),
+	       double(GCoverCounters.bytes()) / (1024.0 * 1024.0),
+	       (unsigned long long)GCoverGroupsRefusedSentinel.load(std::memory_order_relaxed),
+	       (unsigned long long)GCoverGroupsZClamped.load(std::memory_order_relaxed));
+	if (Packed == 0)
+	{
+		// The other half of the funnel, and it is a REAL answer: measured at the
+		// alpine census site, only three species place there and none of them is
+		// ground cover.
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelCover: RAN AND PRODUCED NOTHING -- %llu chunks attempted, none "
+		            "held cover. That is a statement about this ground, not about the "
+		            "producer."),
+		       (unsigned long long)Attempted);
+	}
+	PrintCoverPublication();
+	PrintCoverIndexFunnel();
+}
+
+FAutoConsoleCommand GCoverStatsCmd(
+	TEXT("voxel.Cover.Stats"),
+	TEXT("Cover-volume producer funnel: attempted -> resolved -> packed, and which of "
+	     "'did not run' / 'ran and found nothing' applies."),
+	FConsoleCommandDelegate::CreateStatic(&PrintCoverStats));
+
 constexpr int32 kGroupEdgeChunks = 2;
 constexpr int32 kGroupEdgeVoxels = kGroupEdgeChunks * VoxelCoords::ChunkEdgeVoxels; // 64
 constexpr double kGroupEdgeUU = double(kGroupEdgeVoxels) * VoxelCoords::VoxelSizeUU; // 640
@@ -246,6 +548,18 @@ struct FMeshGeometry
 	uint64 SolidVoxels = 0;
 };
 
+// One cover chunk on its way from a worker to the pool.
+//
+// The key is in COVER CHUNK coordinates (32 cover cells of 50 mm = 1.6 m each),
+// and it goes into the pool at FVoxelBrickPool::kCoverLevel. That level is the
+// only thing that tells the pool, the index and the marcher that this chunk's
+// cells are 50 mm rather than 100 mm.
+struct FCoverChunkPublish
+{
+	FIntVector CoverChunkCoord = FIntVector::ZeroValue;
+	FVoxelBrickCpuPackRef Pack;
+};
+
 struct FGroupResult
 {
 	FGroupKey Group;
@@ -254,6 +568,14 @@ struct FGroupResult
 	int32 SitesTotal = 0;      // everything instancesForRect resolved
 	int32 DetailKept = 0;      // detail-lattice instances anchored in this group
 	int32 BankMisses = 0;      // detail instances whose grid the library refused
+	int32 CoverChunksPacked = 0;   // voxel.Cover.Produce arm; 0 when it is off
+	// THE PACKS THEMSELVES, carried back to the game thread rather than published
+	// from the worker: FVoxelBrickPool::AddChunkFromCpu is GAME THREAD ONLY (its
+	// header says so, and it mutates the suballocator and the pending-write
+	// lists). Empty unless voxel.Cover.Resident is on, and empty for every chunk
+	// the producer answered anyCover=false for -- requirement C1's "store
+	// nothing" is enforced by never creating the carrier at all.
+	TArray<FCoverChunkPublish> CoverPacks;
 };
 
 // Everything a resolve job needs, captured by value at dispatch. The three
@@ -273,6 +595,17 @@ struct FResolveJobInput
 	vxc::IAssetChannelSource* Channels = nullptr;
 	FGroupKey Group;
 	vxc::AssetVoxelRect Rect;
+	// LATCHED AT DISPATCH, never read from the cvar on the worker: the same
+	// reason VoxelGpuMeshJobManager latches voxel.GPU.BrickPack at Submit --
+	// a value that changes under a job in flight makes two jobs of one leg
+	// disagree about what was measured.
+	bool bProduceCover = false;
+	// LATCHED TOO, and SEPARATE from bProduceCover on purpose. Produce alone is
+	// the pack-and-discard measurement arm that has existed since 2026-08-20;
+	// Resident is what makes the pack reach the pool. The same two-cvar shape as
+	// voxel.GPU.BrickPack / voxel.GPU.BrickPackResident, so "the producer is off"
+	// and "the producer ran and nothing was stored" stay distinguishable.
+	bool bPublishCover = false;
 	// MeshKeys whose geometry the game thread already has (or has in flight
 	// from an earlier job). A stale snapshot only means a duplicate geometry
 	// build, which the drain discards -- never a missing one: the first job
@@ -558,6 +891,97 @@ FGroupResult RunResolveJob(const FResolveJobInput& In)
 			}
 		}
 	}
+	// --- the cover-volume arm, off unless voxel.Cover.Produce 1 -------------
+	if (In.bProduceCover)
+	{
+		if (In.Channels == nullptr)
+		{
+			// The sentinel world is a different world; refuse rather than
+			// produce a volume nobody can compare to anything.
+			GCoverGroupsRefusedSentinel.fetch_add(1, std::memory_order_relaxed);
+		}
+		else
+		{
+			// ONE RESOLVE PER GROUP, not per chunk. resolveForCoverCompose is
+			// the complement of resolveForCompose and reuses the instance list
+			// the HISM path already paid for above.
+			const std::vector<vxc::AssetField::ResolvedCoverInstance> Cover =
+				In.Field->resolveForCoverCompose(Insts, kCoverPitchMm);
+			if (!Cover.empty())
+			{
+				const int64 CellsPerVoxel = int64(vxc::kVoxelSizeMm) / int64(kCoverPitchMm);
+				const int64 BaseCx = In.Rect.vx0 * CellsPerVoxel;
+				const int64 BaseCy = In.Rect.vy0 * CellsPerVoxel;
+				const int64 E = int64(vxc::kCoverChunkEdgeCells);
+
+				// TNumericLimits, not INT64_MAX: this translation unit includes
+				// no <cstdint> of its own and CoreMinimal's reach for the C
+				// macros is a transitive accident, not a contract.
+				int64 ZMin = TNumericLimits<int64>::Max();
+				int64 ZMax = TNumericLimits<int64>::Lowest();
+				for (const vxc::AssetField::ResolvedCoverInstance& CI : Cover)
+				{
+					const int64 Lo = CI.anchorCz + int64(CI.grid->originZ());
+					const int64 Hi = Lo + int64(CI.grid->sizeZ()) - 1;
+					ZMin = FMath::Min(ZMin, Lo);
+					ZMax = FMath::Max(ZMax, Hi);
+				}
+				int64 Cz0 = vxc::floorDiv(ZMin, E);
+				int64 Cz1 = vxc::floorDiv(ZMax, E);
+				if (Cz1 - Cz0 + 1 > int64(kCoverMaxChunkLayers))
+				{
+					// Counted, never silent. See kCoverMaxChunkLayers.
+					GCoverGroupsZClamped.fetch_add(1, std::memory_order_relaxed);
+					Cz1 = Cz0 + int64(kCoverMaxChunkLayers) - 1;
+				}
+
+				// The group is kGroupEdgeVoxels level-0 voxels across, so this
+				// many cover chunks per axis. Derived, not spelled: at 50 mm it
+				// is 4, and it must move with the pitch rather than be a 4.
+				const int64 ChunksPerAxis = (int64(kGroupEdgeVoxels) * CellsPerVoxel) / E;
+				for (int64 Cz = Cz0; Cz <= Cz1; ++Cz)
+				{
+					for (int64 Jy = 0; Jy < ChunksPerAxis; ++Jy)
+					{
+						for (int64 Jx = 0; Jx < ChunksPerAxis; ++Jx)
+						{
+							const int64 Ccx = vxc::floorDiv(BaseCx, E) + Jx;
+							const int64 Ccy = vxc::floorDiv(BaseCy, E) + Jy;
+							const vxc::CoverChunkResult Packed = vxc::packCoverChunk(
+								Cover, kCoverPitchMm, Ccx, Ccy, Cz, GCoverCounters);
+							// anyCover FALSE MEANS STORE NOTHING -- requirement
+							// C1, enforced by never building a carrier rather
+							// than by building one and skipping it later. No
+							// zeroed pack, no reserved slot, no dense entry.
+							if (!Packed.anyCover)
+							{
+								continue;
+							}
+							++R.CoverChunksPacked;
+							if (!In.bPublishCover)
+							{
+								continue;   // the pack-and-discard arm, unchanged
+							}
+							// THE ORIGIN IS IN COVER CELLS, not level-0 voxels.
+							// The chunk record stores it and the marcher
+							// validates the index against it as
+							// (chunkCoord * 32) in the chunk's OWN units, so
+							// passing level-0 voxels here would make every cover
+							// lookup fail the record check and read as air --
+							// silently, as missing cover.
+							FCoverChunkPublish Pub;
+							Pub.CoverChunkCoord =
+								FIntVector(int32(Ccx), int32(Ccy), int32(Cz));
+							Pub.Pack = VoxelBrickCpuPackFromCore(
+								Packed.pack, Ccx * E, Ccy * E, Cz * E);
+							R.CoverPacks.Add(MoveTemp(Pub));
+						}
+					}
+				}
+			}
+		}
+	}
+
 	return R;
 }
 
@@ -587,6 +1011,19 @@ struct FVoxelDetailAssetImpl
 	struct FGroupRecord
 	{
 		TArray<FDetailInstanceRec> Instances;
+		// WHAT THIS GROUP PUT IN THE POOL, so releasing the group can take it
+		// back out. Without this the cover volume grows monotonically as the
+		// camera moves and the pool evicts cover under pressure instead of the
+		// group owning its own lifetime -- and eviction is ranked by distance,
+		// which would silently drop the cover the player is standing in when a
+		// distant group happened to be added later.
+		//
+		// This is also the first caller FVoxelBrickPool::RemoveChunk has ever
+		// had. Its header notes that GetEvictions() reads zero today ONLY
+		// because nothing calls it, so the index's Removed path and the
+		// marcher's stale-index record check are, from here on, live code rather
+		// than code that has never run.
+		TArray<FIntVector> CoverChunks;
 	};
 
 	struct FMeshEntry
@@ -927,6 +1364,49 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 	const double RingUU = S.RingMeters * 100.0;
 	const double UnloadUU = RingUU * kUnloadMultiplier;
 
+	// --- the cover band centre ---------------------------------------------
+	//
+	// The march chunk index admits cover only within kCoverBandRadiusChunks of
+	// this point, which is what bounds the simultaneous cover span to 80 chunks
+	// on every axis and makes the toroidal wrap provably alias-free -- the same
+	// 80 < 128 argument that covers ring 0, reached by bounding what ENTERS
+	// rather than by hoping.
+	//
+	// FROM THE SAME ANCHOR THE RING USES, deliberately. Residency (the pool's
+	// eviction focus), publication (the ring test below) and indexing (this) must
+	// agree about where the camera is, or a chunk can be published, resident, and
+	// refused by the index -- which reads as missing cover with a healthy pool.
+	{
+		// UU -> level-0 voxels -> cover cells -> cover chunks. Each step is an
+		// exact integer floor; FloorToInt is the right rounding for negative
+		// coordinates and a divide is not.
+		const int64 Vx = int64(FMath::FloorToDouble(Anchor.X / VoxelCoords::VoxelSizeUU));
+		const int64 Vy = int64(FMath::FloorToDouble(Anchor.Y / VoxelCoords::VoxelSizeUU));
+		const int64 Vz = int64(FMath::FloorToDouble(Anchor.Z / VoxelCoords::VoxelSizeUU));
+		const int64 E = int64(vxc::kCoverChunkEdgeCells);
+		const int64 Cpv = FVoxelBrickPool::kCoverCellsPerVoxel0;
+		GetGlobalVoxelMarchChunkIndex().SetCoverBandCentreChunk(
+			FIntVector(int32(vxc::floorDiv(Vx * Cpv, E)), int32(vxc::floorDiv(Vy * Cpv, E)),
+			           int32(vxc::floorDiv(Vz * Cpv, E))));
+
+		// THE MUTATION ARM IS ARMED HERE, IN THE TICK, AND NOT AT STATS TIME.
+		//
+		// It was armed inside PrintCoverIndexFunnel, which only runs when
+		// voxel.Cover.Stats is typed -- so the order in a real leg was: set the
+		// cvar, publish every cover chunk with the flag still FALSE, then type
+		// Stats and arm a mutation with nothing left to bite. The law would have
+		// read CONSERVED on a leg whose whole purpose was to make it read
+		// VIOLATED, and a CONSERVED reading there is indistinguishable from a
+		// working check -- which would have certified the law using a run that
+		// never tested it.
+		//
+		// This tick sets the band centre BEFORE the result drain publishes
+		// anything (section 2 below), so the flag is live for the first cover
+		// chunk the index is ever offered -- which is precisely the entry
+		// AdmitToSlot refuses. Same call, moved to where it can still act.
+		GetGlobalVoxelMarchChunkIndex().SetMutateCoverConservation(GVoxelCoverMutateIndex != 0);
+	}
+
 	// --- adaptive budgets (see the constants' comment) -----------------------
 	// DeltaTime is the LAST frame's duration -- the standard one-frame-lagged
 	// headroom proxy, and the same quantity the "Hitch frame" log judges.
@@ -979,6 +1459,46 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 
 			FVoxelDetailAssetImpl::FGroupRecord& Rec = S.Groups.Add(R->Group);
 			Rec.Instances = MoveTemp(R->Instances);
+
+			// ---- publish this group's cover into the brick pool -------------
+			//
+			// GAME THREAD, AFTER THE RING CHECK ABOVE. A group that left the ring
+			// while its job ran has already `continue`d, so its packs are dropped
+			// with the result and never reach the pool -- which is what keeps the
+			// resident cover set inside the reach the index's aliasing proof is
+			// stated against.
+			//
+			// NOTHING IS DISPATCHED HERE. FVoxelBrickPool::Flush batches the
+			// writes and is driven once a tick from UVoxelWorldSubsystem, and the
+			// index sink fires at the END of that flush -- so the GPU never sees
+			// an index entry for a slot the pool has not written yet. That
+			// ordering is the pool's published seam, not a coincidence of this
+			// call site.
+			for (FCoverChunkPublish& Pub : R->CoverPacks)
+			{
+				FVoxelBrickChunkKey Key;
+				Key.X = Pub.CoverChunkCoord.X;
+				Key.Y = Pub.CoverChunkCoord.Y;
+				Key.Z = Pub.CoverChunkCoord.Z;
+				Key.Level = FVoxelBrickPool::kCoverLevel;
+				const int32 Slot = GetGlobalVoxelBrickPool().AddChunkFromCpu(
+					Pub.Pack, Key,
+					// NEUTRAL, and stated rather than defaulted: cover is 50 mm
+					// vegetation at the cover level. It has no biome tint and the
+					// surface-proximity gate is meaningless for it.
+					FVoxelBrickChunkShading::Neutral());
+				if (Slot == INDEX_NONE)
+				{
+					// REFUSED, AND COUNTED. The pool is full and could not evict
+					// enough; GetAllocFailures() has moved. Recording the key
+					// anyway would make the release path call RemoveChunk on a
+					// chunk that was never added.
+					GCoverPublishRefused.fetch_add(1, std::memory_order_relaxed);
+					continue;
+				}
+				Rec.CoverChunks.Add(Pub.CoverChunkCoord);
+				GCoverChunksResident.fetch_add(1, std::memory_order_relaxed);
+			}
 			++S.StatGroupsResolved;
 			S.StatInstancesLive += uint64(Rec.Instances.Num());
 
@@ -1093,6 +1613,35 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 			FVoxelDetailAssetImpl::FGroupRecord Rec;
 			S.Groups.RemoveAndCopyValue(G, Rec);
 			S.StatInstancesLive -= uint64(Rec.Instances.Num());
+
+			// The cover this group put in the pool comes back out with it. The
+			// record's own clear is what makes the slot read "nothing here" the
+			// instant it lands, and the index's Removed-before-Added rule is what
+			// keeps a slot retired and re-used in one flush from being resurrected
+			// under the old key.
+			for (const FIntVector& C : Rec.CoverChunks)
+			{
+				FVoxelBrickChunkKey Key;
+				Key.X = C.X;
+				Key.Y = C.Y;
+				Key.Z = C.Z;
+				Key.Level = FVoxelBrickPool::kCoverLevel;
+				if (GetGlobalVoxelBrickPool().RemoveChunk(Key))
+				{
+					GCoverChunksResident.fetch_sub(1, std::memory_order_relaxed);
+					GCoverChunksReleased.fetch_add(1, std::memory_order_relaxed);
+				}
+				else
+				{
+					// The pool did not have it. That is NOT benign: it means the
+					// pool evicted a cover chunk behind this subsystem's back, so
+					// the group's list and residency have diverged. Counted
+					// rather than ignored, because the visible symptom would be
+					// cover missing from ground the player is standing on with
+					// every other counter reading healthy.
+					GCoverReleaseMissing.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
 			for (const FDetailInstanceRec& Inst : Rec.Instances)
 			{
 				if (TSet<FGroupKey>* Members = S.KeyGroups.Find(Inst.MeshKey))
@@ -1272,6 +1821,11 @@ void UVoxelDetailAssetSubsystem::Tick(float DeltaTime)
 				Input.Channels = VoxelWorld->GetAssetChannelSource();
 				Input.Group = C.Key;
 				Input.Rect = Rect;
+				Input.bProduceCover = (GVoxelCoverProduce != 0);
+				// SUBORDINATE, AND SPELLED AS AN AND rather than left to the
+				// worker to notice: publishing with nothing produced is not a
+				// state this file should be able to reach.
+				Input.bPublishCover = (GVoxelCoverProduce != 0) && (GVoxelCoverResident != 0);
 				Input.KnownGeometry = S.GeometryKnown; // snapshot; stale => dup, not miss
 
 				S.InFlight.Add(C.Key);

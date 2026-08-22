@@ -22,7 +22,10 @@
 #include <cstring>
 #include <vector>
 
+#include "voxelcore/covervolume.h"
 #include "voxelcore/world.h"
+
+#include "asset_manifest_testutil.h"
 
 #include "vxctest.h"
 
@@ -578,4 +581,418 @@ VXC_TEST(assetfield_installed_field_moves_the_world_digest_and_the_digest_is_pin
     // The golden. Moves ONLY on a deliberate worldgen change (kWorldGenVersion
     // bump): layer table, policy maths, scatter channels, or the fixture bake.
     CHECK_EQ((unsigned long long)wooded, 0xF41F8E6A14A3C5A9ull);
+}
+
+// --- COVER COMPOSE: the detail lattice, in a volume of its own --------------
+//
+// WHAT THESE GUARD, and it is a failure shape this project already knows. The
+// obvious reference for a cover byte gate is materialAtResolved, and it returns
+// MAT_AIR for every detail grid BY DESIGN (assetfield.h:354, "the last line of
+// defence"). A gate built on it compares cover against air and PASSES IF THE
+// PRODUCER ALSO EMITS NOTHING -- a check that cannot fail. The first test below
+// is that check made able to fail: over ONE instance list it asserts the world
+// path answers air AND the cover path answers the material. If cover compose is
+// ever quietly reduced to a no-op, that test goes red rather than green.
+//
+// The tolerance here is EXACTLY ZERO and that is not an oversight. Both sides
+// are integer voxels with no float anywhere in the path, so unlike a depth or
+// timing gate there is no reference noise floor to calibrate against. Nobody
+// should add an epsilon here out of habit.
+
+namespace {
+
+// A tuft-sized detail asset: 2x2x6 voxels at 50 mm = 10x10x30 cm.
+bool makeTuft(AssetGrid& g) {
+    return g.parse(solidBlock(2, 2, 6, MAT_LEAF_BROADLEAF, 50u)) == AssetParseError::kOk;
+}
+
+// A detail-lattice field over one grid, sited in every 800 mm cell -- the real
+// L3 cell size (asset-forge/forge/manifest.py:591).
+struct CoverFixture {
+    AssetLayer layers[1];
+    AssetSpecies sp[1];
+    OneGridBank bank;
+    AssetField field;
+
+    explicit CoverFixture(const AssetGrid* g, uint32_t pitchMm = 50u) : bank(g) {
+        layers[0] = everyCell(800, 300, 0, /*terrain*/ false);
+        sp[0] = pillarSpecies(0, 300, pitchMm);
+        field.setSeed(kSeed);
+        field.setLayers(layers, 1);
+        field.setSpecies(sp, 1);
+        field.setBankSource(&bank);
+    }
+};
+
+} // namespace
+
+VXC_TEST(covercompose_composes_exactly_what_world_compose_refuses) {
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CHECK(!g.onTerrainLattice());
+    CoverFixture fx(&g);
+    CHECK(!fx.field.empty());
+
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+
+    // The WORLD path drops every one of them -- this is the "cannot fail"
+    // reference, asserted rather than assumed.
+    const std::vector<AssetField::ResolvedAssetInstance> world =
+        fx.field.resolveForCompose(insts);
+    CHECK_EQ(int(world.size()), 0);
+
+    // The COVER path keeps them all.
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK_EQ(int(cover.size()), int(insts.size()));
+
+    // And it puts the material somewhere. Sample the first instance's own base
+    // voxel: local (0,0,0) of a grid whose origin is (0,0,0).
+    const AssetField::ResolvedCoverInstance& r0 = cover[0];
+    const int64_t bx = r0.anchorCx + r0.grid->rotatedOriginX(r0.yawQuarter);
+    const int64_t by = r0.anchorCy + r0.grid->rotatedOriginY(r0.yawQuarter);
+    const int64_t bz = r0.anchorCz + r0.grid->originZ();
+    CHECK_EQ(int(AssetField::coverMaterialAtResolved(cover, bx, by, bz)),
+             int(MAT_LEAF_BROADLEAF));
+
+    // The same cover voxel through the world composer is air, because a detail
+    // grid is not a world-lattice thing. Two composers, two lattices, and the
+    // one that must answer does.
+    CHECK_EQ(int(AssetField::materialAtResolved(world, bx, by, bz)), int(MAT_AIR));
+}
+
+VXC_TEST(covercompose_stands_cover_on_the_anchor_voxel_not_inside_it) {
+    // The terrain convention shares the anchor voxel; cover must sit on its TOP
+    // surface, or a 5 cm tuft is entirely buried in the 10 cm ground cube
+    // (VoxelDetailAssetSubsystem.cpp:538-544).
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK(!cover.empty());
+
+    // 100 mm world voxel / 50 mm cover voxel = 2 cover voxels per world voxel.
+    for (size_t i = 0; i < cover.size(); ++i) {
+        CHECK_EQ(int(cover[i].anchorCz), int((insts[i].anchorVz + 1) * 2));
+        CHECK_EQ(int(cover[i].pitchMm), 50);
+    }
+
+    // The cover voxel directly BELOW the base is air: nothing was buried.
+    const AssetField::ResolvedCoverInstance& r0 = cover[0];
+    const int64_t bx = r0.anchorCx + r0.grid->rotatedOriginX(r0.yawQuarter);
+    const int64_t by = r0.anchorCy + r0.grid->rotatedOriginY(r0.yawQuarter);
+    const int64_t bz = r0.anchorCz + r0.grid->originZ();
+    CHECK_EQ(int(AssetField::coverMaterialAtResolved(cover, bx, by, bz - 1)), int(MAT_AIR));
+}
+
+VXC_TEST(covercompose_floors_negative_anchors_rather_than_truncating) {
+    // THE SIGN BUG, and the census ground is at (-39661, -57292) so this is the
+    // common case, not the edge one. C++ floorDiv floors; HLSL '/' truncates
+    // toward zero; they disagree on every negative non-multiple. A GPU mirror
+    // must therefore receive anchors ALREADY DIVIDED by this function.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{-400, -400, -369, -369},
+        [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    const std::vector<AssetField::ResolvedCoverInstance> cover =
+        fx.field.resolveForCoverCompose(insts, 50u);
+    CHECK_EQ(int(cover.size()), int(insts.size()));
+
+    // CALIBRATE THE TEST BEFORE TRUSTING IT: it only has teeth if at least one
+    // instance actually lands where floor and truncation disagree.
+    int discriminating = 0;
+    for (size_t i = 0; i < cover.size(); ++i) {
+        const int64_t mm = insts[i].anchorXMm;
+        const int64_t trunc = mm / 50;           // toward zero, what HLSL does
+        const int64_t floored = cover[i].anchorCx;
+        // The floor property itself, on every instance.
+        CHECK(floored * 50 <= mm);
+        CHECK((floored + 1) * 50 > mm);
+        if (mm < 0 && (mm % 50) != 0) {
+            CHECK_EQ(int(floored), int(trunc - 1));
+            ++discriminating;
+        }
+    }
+    CHECK(discriminating > 0);
+}
+
+VXC_TEST(covercompose_refuses_a_grid_baked_at_another_pitch) {
+    // Nothing in voxel-core resamples (asset-forge/README.md:38-41), so a 20 mm
+    // bush in a 50 mm volume would come out 2.5x its size. It is dropped, and
+    // the volume stays empty rather than wrong.
+    AssetGrid g20;
+    CHECK_EQ(int(g20.parse(solidBlock(2, 2, 6, MAT_LEAF_BROADLEAF, 20u))),
+             int(AssetParseError::kOk));
+    CoverFixture fx(&g20, /*species pitch*/ 20u);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+
+    // Its own pitch composes.
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 20u).size()), int(insts.size()));
+    // A 50 mm volume refuses it entirely.
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 50u).size()), 0);
+}
+
+VXC_TEST(covercompose_refuses_a_pitch_that_does_not_tile_the_world_lattice) {
+    // (anchorVz + 1) must land on a cover-voxel boundary. 100/30 does not
+    // divide, so the whole volume is refused rather than composed half a voxel
+    // low everywhere.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const std::vector<AssetInstance> insts = fx.field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 30u).size()), 0);
+    CHECK_EQ(int(fx.field.resolveForCoverCompose(insts, 0u).size()), 0);
+}
+
+VXC_TEST(covercompose_never_admits_a_terrain_lattice_instance) {
+    // Trees and rocks are already in the world volume through
+    // VoxelAssetStamp.usf -> BrickPackMain (VoxelGpuWorldGen.cpp:1367/1389).
+    // Composing them here as well would draw every tree twice.
+    AssetGrid g;
+    CHECK_EQ(int(g.parse(solidBlock(1, 1, 30, MAT_BARK, uint32_t(kVoxelSizeMm)))),
+             int(AssetParseError::kOk));
+    CHECK(g.onTerrainLattice());
+    OneGridBank bank(&g);
+
+    const AssetLayer layers[1] = {everyCell(3200, 3000, 0, /*terrain*/ true)};
+    const AssetSpecies sp[1] = {pillarSpecies(0, 3000, uint32_t(kVoxelSizeMm))};
+    AssetField field;
+    field.setSeed(kSeed);
+    field.setLayers(layers, 1);
+    field.setSpecies(sp, 1);
+    field.setBankSource(&bank);
+
+    const std::vector<AssetInstance> insts = field.instancesForRect(
+        AssetVoxelRect{0, 0, 31, 31}, [&](int64_t, int64_t) { return flatGround(100'000); });
+    CHECK(!insts.empty());
+    // The world composer takes them ...
+    CHECK(!field.resolveForCompose(insts).empty());
+    // ... and the cover composer takes none of them, at any pitch.
+    CHECK_EQ(int(field.resolveForCoverCompose(insts, 50u).size()), 0);
+    CHECK_EQ(int(field.resolveForCoverCompose(insts, uint32_t(kVoxelSizeMm)).size()), 0);
+}
+
+// --- THE CPU COVER PRODUCER -------------------------------------------------
+//
+// The producer is packChunkBricksCanonical over coverMaterialOfResolved, so the
+// first test below is the gate a GPU cover stamp will later be held to: decode
+// the PACK and compare it, voxel for voxel, against the composition reference
+// over the SAME resolved instances. Tolerance is exactly zero -- both sides are
+// integer voxels with no float in the path, so unlike a depth or timing gate
+// there is no reference noise floor to calibrate against.
+
+namespace {
+
+// The cover chunk a resolved instance's anchor falls in.
+void chunkOfAnchor(const vxc::AssetField::ResolvedCoverInstance& r, int64_t& cx, int64_t& cy,
+                   int64_t& cz) {
+    const int64_t E = int64_t(vxc::kCoverChunkEdgeCells);
+    cx = vxc::floorDiv(r.anchorCx, E);
+    cy = vxc::floorDiv(r.anchorCy, E);
+    cz = vxc::floorDiv(r.anchorCz, E);
+}
+
+} // namespace
+
+VXC_TEST(coverproducer_pack_decodes_to_the_reference_voxel_for_voxel) {
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const auto facts = [&](int64_t, int64_t) { return flatGround(100'000); };
+
+    // Find a chunk that actually holds cover, from the resolver rather than
+    // from a hardcoded coordinate.
+    const std::vector<AssetInstance> probe =
+        fx.field.instancesForRect(AssetVoxelRect{0, 0, 31, 31}, facts);
+    const std::vector<AssetField::ResolvedCoverInstance> probeResolved =
+        fx.field.resolveForCoverCompose(probe, 50u);
+    CHECK(!probeResolved.empty());
+    int64_t cx = 0, cy = 0, cz = 0;
+    chunkOfAnchor(probeResolved[0], cx, cy, cz);
+
+    CoverProducerCounters counters;
+    const CoverChunkResult out =
+        produceCoverChunk(fx.field, 50u, cx, cy, cz, facts, counters);
+    CHECK(out.anyCover);
+    CHECK(!out.resolved.empty());
+
+    // THE GATE. Every one of the 32,768 cells, pack against reference.
+    const int64_t E = int64_t(kCoverChunkEdgeCells);
+    int mismatches = 0, solidSeen = 0;
+    for (int32_t x = 0; x < kCoverChunkEdgeCells; ++x)
+        for (int32_t y = 0; y < kCoverChunkEdgeCells; ++y)
+            for (int32_t z = 0; z < kCoverChunkEdgeCells; ++z) {
+                const MaterialId packed = decodeChunkVoxelCanonical(out.pack, x, y, z);
+                const MaterialId ref = AssetField::coverMaterialAtResolved(
+                    out.resolved, cx * E + x, cy * E + y, cz * E + z);
+                if (packed != ref) ++mismatches;
+                if (ref != MAT_AIR) ++solidSeen;
+            }
+    CHECK_EQ(mismatches, 0);
+    // CALIBRATE THE GATE: it only means anything if the chunk held cover. An
+    // all-air chunk would compare 32,768 airs and pass while proving nothing.
+    CHECK(solidSeen > 0);
+}
+
+VXC_TEST(coverproducer_counters_separate_did_not_run_from_produced_nothing) {
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const auto facts = [&](int64_t, int64_t) { return flatGround(100'000); };
+
+    const std::vector<AssetInstance> probe =
+        fx.field.instancesForRect(AssetVoxelRect{0, 0, 31, 31}, facts);
+    const std::vector<AssetField::ResolvedCoverInstance> probeResolved =
+        fx.field.resolveForCoverCompose(probe, 50u);
+    CHECK(!probeResolved.empty());
+    int64_t cx = 0, cy = 0, cz = 0;
+    chunkOfAnchor(probeResolved[0], cx, cy, cz);
+
+    // 1. DID NOT RUN. Nothing entered the producer at all.
+    CoverProducerCounters counters;
+    CHECK_EQ(int(counters.attempted()), 0);
+    CHECK_EQ(int(counters.packed()), 0);
+    CHECK(!counters.ranAndFoundNothing());   // silence is not a finding
+
+    // 2. RAN AND PRODUCED NOTHING. Same ground, a chunk 100 chunks up: the
+    // resolve still finds instances (same xy) and the z reject takes it.
+    const CoverChunkResult high =
+        produceCoverChunk(fx.field, 50u, cx, cy, cz + 100, facts, counters);
+    CHECK(!high.anyCover);
+    CHECK_EQ(int(counters.attempted()), 1);
+    CHECK_EQ(int(counters.packed()), 0);
+    CHECK(counters.ranAndFoundNothing());    // ... and this IS a finding
+    // The funnel is a funnel: the middle stage fired, which is what tells the
+    // reader the ground had cover on it and this chunk simply was not it.
+    CHECK_EQ(int(counters.resolved()), 1);
+
+    // 3. RAN AND PRODUCED SOMETHING.
+    const CoverChunkResult hit = produceCoverChunk(fx.field, 50u, cx, cy, cz, facts, counters);
+    CHECK(hit.anyCover);
+    CHECK_EQ(int(counters.attempted()), 2);
+    CHECK_EQ(int(counters.packed()), 1);
+    CHECK(!counters.ranAndFoundNothing());
+    CHECK(counters.solid() > 0);
+    CHECK(counters.bytes() > 0);
+    CHECK(counters.anchored() > 0);
+}
+
+VXC_TEST(coverproducer_packs_an_all_air_species_without_counting_it_as_packed) {
+    // THE CASE THE FIRST VERSION OF THIS SUITE MISSED, found by mutating the
+    // producer rather than by reading it. Moving the chunksPacked increment
+    // ABOVE the anyCover check is a real defect -- it counts an empty pack as
+    // produced -- and every counter test I had passed anyway, because their
+    // "produced nothing" chunk exits at the Z REJECT, before the counter is
+    // ever reached. So the funnel was only proved on a path that skips it.
+    //
+    // This is the path that does not skip it: a species whose baked grid is
+    // entirely AIR. It resolves (valid grid, right pitch, no rig parts), it
+    // survives the z reject (the box has extent), the shortlists fill, the pack
+    // is BUILT -- and it holds nothing. A mis-baked or emptied species is the
+    // realistic way this happens, so the case is not contrived.
+    AssetGrid air;
+    CHECK_EQ(int(air.parse(solidBlock(2, 2, 6, MAT_AIR, 50u))), int(AssetParseError::kOk));
+    CHECK(air.valid());
+    CoverFixture fx(&air);
+    const auto facts = [&](int64_t, int64_t) { return flatGround(100'000); };
+
+    const std::vector<AssetInstance> probe =
+        fx.field.instancesForRect(AssetVoxelRect{0, 0, 31, 31}, facts);
+    const std::vector<AssetField::ResolvedCoverInstance> resolved =
+        fx.field.resolveForCoverCompose(probe, 50u);
+    CHECK(!resolved.empty());   // it IS admitted -- the grid is legal, just empty
+    int64_t cx = 0, cy = 0, cz = 0;
+    chunkOfAnchor(resolved[0], cx, cy, cz);
+
+    CoverProducerCounters counters;
+    const CoverChunkResult out =
+        produceCoverChunk(fx.field, 50u, cx, cy, cz, facts, counters);
+
+    // Reached the packer and produced nothing.
+    CHECK(!out.anyCover);
+    CHECK_EQ(int(counters.attempted()), 1);
+    CHECK_EQ(int(counters.resolved()), 1);   // the middle stage DID fire ...
+    CHECK_EQ(int(counters.packed()), 0);     // ... and this one must not
+    CHECK(counters.ranAndFoundNothing());
+    CHECK_EQ(int(counters.bytes()), 0);
+    CHECK_EQ(int(counters.solid()), 0);
+}
+
+VXC_TEST(coverproducer_empty_chunk_costs_nothing_to_store) {
+    // Requirement C1. A chunk with no cover must answer "store nothing" rather
+    // than a zeroed pack -- a dense array over the cover footprint measured
+    // 290.1 MiB at the alpine site against 25.4 MiB of payload at grassland.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    const auto facts = [&](int64_t, int64_t) { return flatGround(100'000); };
+    CoverProducerCounters counters;
+
+    const CoverChunkResult sky = produceCoverChunk(fx.field, 50u, 0, 0, 9000, facts, counters);
+    CHECK(!sky.anyCover);
+    CHECK_EQ(int(counters.packed()), 0);
+    // Nothing was accumulated for it, so a store keyed on anyCover holds zero
+    // bytes for empty ground however much of it there is.
+    CHECK_EQ(int(counters.bytes()), 0);
+    CHECK_EQ(int(counters.solid()), 0);
+}
+
+VXC_TEST(coverproducer_init_refuses_a_pitch_and_names_what_it_cannot_hold) {
+    using namespace vxmtest;
+    VxmSpecies flower;
+    flower.name = "test-daisy";
+    flower.kind = 5;
+    flower.layer = 3;
+    flower.flags = 0;
+    flower.voxelSizeMm = 50;
+    flower.spacingMm = 400;
+    flower.heightMm = 400;
+    flower.depthMinMm = 100;
+    flower.depthMaxMm = 400;
+    for (int b = 0; b < vxc::kBiomeCount; ++b) flower.weights[b] = 1000;
+    VxmSpecies reef = flower;
+    reef.name = "test-staghorn-coral";
+    reef.voxelSizeMm = 20;
+
+    vxc::AssetManifest m;
+    CHECK_EQ(int(m.parse(buildVxm({flower, reef}))), int(vxc::AssetManifestError::kOk));
+
+    const CoverVolumeInit at50 = coverVolumeInit(m, 50u);
+    CHECK(at50.ok);
+    CHECK(at50.error == nullptr);
+    CHECK_EQ(int(at50.refused.size()), 1);
+    if (at50.refused.size() == 1) CHECK(at50.refused[0].name == "test-staghorn-coral");
+
+    // A pitch that does not tile the world lattice is refused WHOLE, at init,
+    // rather than composing every instance half a voxel low.
+    const CoverVolumeInit at30 = coverVolumeInit(m, 30u);
+    CHECK(!at30.ok);
+    CHECK(at30.error != nullptr);
+    const CoverVolumeInit at0 = coverVolumeInit(m, 0u);
+    CHECK(!at0.ok);
+
+    // And the producer holds the same line even if a caller ignores init.
+    AssetGrid g;
+    CHECK(makeTuft(g));
+    CoverFixture fx(&g);
+    CoverProducerCounters counters;
+    const CoverChunkResult bad = produceCoverChunk(
+        fx.field, 30u, 0, 0, 0, [&](int64_t, int64_t) { return flatGround(100'000); },
+        counters);
+    CHECK(!bad.anyCover);
+    CHECK_EQ(int(counters.attempted()), 1);   // it ran ...
+    CHECK_EQ(int(counters.resolved()), 0);    // ... and refused before resolving
 }

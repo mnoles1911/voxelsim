@@ -1,0 +1,73 @@
+PHASE 5 COLD FILL -- PRE-REGISTERED BEFORE ANY LEG
+2026-08-20
+
+Written before voxel.Terrain.RetireQuads has been run at all. Nothing in this
+file was chosen after seeing a number.
+
+WHY IT IS PRE-REGISTERED AT ALL
+===============================
+
+Cold fill is the headline and IT HAS NEVER MOVED: 35.4 s before this project,
+35.6 s after Phase 1. The brick volume was added at zero cost and collected
+nothing. Phase 5 is where the saving is supposed to arrive, so the prediction
+goes in writing first -- a number chosen afterwards would be indistinguishable
+from one chosen to make the phase look successful.
+
+BASELINE
+========
+
+  cold fill        80-86 s      (current, this configuration)
+  chunks/s          1,074/s
+  GPU ceiling      92,000/s     (measured)
+  per-chunk mesh   0.969 ms  ->  0.389 ms  = 2.49x, ALREADY MEASURED
+                   (mesh 0.810 + pack 0.158  vs  fill 0.227 + pack 0.160)
+
+The 2.49x is a PER-CHUNK MESH-STAGE figure. It is not a fill figure and must
+not be quoted as one.
+
+THE PREDICTION
+==============
+
+  If cold fill is mesh-stage-bound, a 60% cut to that stage should show as
+  AT LEAST A 25% FALL in cold fill: 80-86 s -> roughly 60-65 s.
+
+  If cold fill falls LESS THAN 10%, THE MESH STAGE WAS NOT THE CONSTRAINT.
+  The saving lands somewhere invisible, Phase 5 repeats Phase 1's outcome,
+  and the finding is "where does cold fill actually go" -- not "how much more
+  can be shaved off meshing".
+
+  Between 10% and 25% is a partial result and should be reported as one,
+  not rounded toward either edge.
+
+THE DISCRIMINATOR, FIXED NOW SO IT CANNOT BE CHOSEN LATER
+=========================================================
+
+chunks/s and cold fill must move TOGETHER.
+
+  both rise/fall together      -> the mesh stage was the constraint. Believe it.
+  chunks/s rises, fill holds   -> the constraint MOVED. The next question is
+                                  WHERE, not how much more to shave here. A leg
+                                  that improves throughput without improving
+                                  fill has found a new bottleneck, and that is
+                                  a result to report rather than a
+                                  disappointment to re-run.
+  neither moves                -> the arm did not engage. Check the engagement
+                                  counters BEFORE re-running anything: a cvar
+                                  reading 1 while the work still happens is the
+                                  failure this phase is built to make visible.
+
+WHAT WOULD FALSIFY THE WHOLE FRAMING
+====================================
+
+If the engagement counters say the arm engaged, chunks/s rises to near the
+92,000/s ceiling, AND cold fill does not move, then cold fill is not
+throughput-bound at all and every per-chunk saving in this project has been
+measured against the wrong denominator. That is the outcome most worth catching
+and the least comfortable, which is why it is written down first.
+
+NOT COVERED
+===========
+
+  - Steady-state frame time. Different question, different leg.
+  - VRAM (~2,197 MB expected back). Real, separately measured, not a fill term.
+  - Water. Untouched by this arm and must stay measurable throughout.

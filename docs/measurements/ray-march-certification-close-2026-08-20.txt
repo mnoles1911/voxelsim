@@ -1,0 +1,152 @@
+HIER-VS-FLAT CERTIFICATION: CLOSED
+2026-08-20
+
+THE RESULT
+==========
+
+The question "do the two walks agree" WAS ILL-POSED, and an arbiter is what
+showed that -- not another hypothesis about why they disagree.
+
+A direct, non-accumulating slab test (O(1) ulp against a walk's O(N)) was
+asked, per disagreeing ray, which candidate the ray genuinely enters first,
+with solidity taken from the pool rather than from either walk. Four legs:
+
+  CONTESTED (both walks offered a candidate) -- ~90% of the population
+      flat-correct 34-40%   hier-correct 35-39%   tie 14-21%
+
+  A coin flip, with a fifth genuinely undecidable. At a cell plane the answer
+  is ambiguous in float. NEITHER WALK IS RIGHT. This population is the
+  resolution limit of float t and is NOT A DEFECT.
+
+  UNCONTESTED (exactly one walk offered a candidate at all)
+
+  CORRECTED 2026-08-20, SAME DAY. First reported as flat-only 13-26 against
+  hier-only 3-9, "~20 rays per leg". THOSE COUNTS WERE SUPPRESSED by the
+  sentinel bug (below) and by the arbiter's own degenerate-span rejection,
+  both of which discard uncontested rays before they are counted. After the
+  sentinel fix:
+
+      n2   flat-only 3,870   hier-only 698    asymmetry  5.5x
+      n3   flat-only   469   hier-only   8    asymmetry 58.6x
+      n1   flat-only    16   -- NO VERDICT, 44% ill-posed, a floor
+
+  CORRECTED AGAIN, same day, and this time the ASYMMETRY itself did not
+  survive. With all three of the arbiter's strict boundary comparisons given
+  the derived tolerance, the one leg with statistical weight reads:
+
+      n4   flat-only 5,081   hier-only 4,124   asymmetry 1.23x   PASS
+
+  against the 11.26x that the same leg reported one round earlier.
+
+  SO THE FILTER WAS NOT ONLY SUPPRESSING THE MAGNITUDE -- IT WAS
+  MANUFACTURING THE ASYMMETRY, because it removed flat-side and hier-side
+  candidates at different rates. Every asymmetry figure quoted before this
+  point (2.2x, 5.5x, 7.33x, 11.26x, 58.6x) is an artefact of a broken
+  comparison and none of them should be cited.
+
+  THE HONEST STATE: the directional skip defect is NOT ESTABLISHED. It may
+  not exist. n4's 1.23x PASS is itself a lower-bound reading -- that leg
+  still carried 1,221 segment rejections -- so the correct summary is that
+  NO READABLE VERDICT EXISTS YET IN EITHER DIRECTION, and the three FAIL
+  verdicts that preceded it were printed over denominators of 11, 2 and 19
+  by a guard that tested the sum instead of the divisor.
+
+So the disagreement population was ~90% arithmetic and ~10% defect, and for
+six rounds it was treated as 100% defect.
+
+WHAT WENT WRONG FOR SIX ROUNDS, AND IT WAS ONE THING
+====================================================
+
+94% of disagreements sat on cell boundaries. Every hypothesis was
+reverse-engineered from that number.
+
+But a disagreement is OBSERVABLE only where the two walks straddle a plane --
+floor() absorbs any difference everywhere else. So for ANY perturbation
+whatever, disagreements concentrate on boundaries BY CONSTRUCTION. The 94%
+was the observability window. It could not have come out otherwise, and it is
+what a null result looks like.
+
+Four mechanisms were proposed from it. THREE WERE REAL DEFECTS, correctly
+found and fixed -- which is exactly what made the method feel productive.
+NONE of them moved the population:
+
+  duplicated expression    falsified by measurement
+  chunk-membership alias   real, fixed, population unmoved
+  corner clip              real, CONFIRMED (100% of thin clips on hit bricks
+                           disagree, ten windows), and worth 0.6%
+  +Y face asymmetry        an artefact of a broken verdict block
+
+THE TELL WAS AVAILABLE THROUGHOUT AND WAS READ AS ENCOURAGEMENT: repeated
+real fixes that do not move the population mean THE SELECTION IS DOING THE
+WORK, NOT THE MECHANISM.
+
+Recorded as doctrine above the individual entries in VoxelBrickTraverse.ush:
+DO NOT MINE A SELECTION EFFECT FOR MECHANISM. The first question about any
+concentration is not what causes it, but what else the number could have
+been. If the answer is "nothing", it is not evidence.
+
+THE SENTINEL, which cost four more legs
+=======================================
+
+VoxelMarchTraverseBrick sets H.Voxel = StartVoxel before it walks, so ON A
+MISS the hit-voxel field holds the ray's ENTRY voxel with t = 0 -- a large,
+plausible, perfectly legal coordinate. Three consumers forgot to gate on
+bHit, and the arbiter's first four legs read 30-47% "ill-posed" as a result.
+
+The guard that already existed was ASYMMETRIC, and that is the lesson: the
+brick-mismatch assertion read `Class != 0`, excluding `lost` rays because
+somebody had noticed THEY have no hier voxel. The identical hole in the other
+direction -- `gained` rays having no FLAT voxel -- was never seen.
+
+  WHEN YOU FIND YOURSELF EXCLUDING ONE DIRECTION OF A SYMMETRIC RELATION,
+  THE OTHER DIRECTION IS ALREADY BROKEN.
+
+After the fix, ill-posed collapsed to 7.7-9.0% and ties went from ZERO to
+14-21% -- the grazing population the broken comparison had been discarding.
+
+THE NEW GATE
+============
+
+v4, stated in VoxelMarchRenderer.h. Flat-as-truth is retired. The criterion
+is the UNCONTESTED asymmetry, with hier-only as the control rather than zero:
+
+  PASS when flat-only <= 1.5 * hier-only
+
+Currently FAILS at 2.2x - 6.7x. Two guards: no verdict above 25% ill-posed
+(those rays are drawn from the uncontested population too and suppress the
+very counts being read), and no ratio below 20 uncontested rays.
+
+WHAT IS NOT WORTH DOING, AND THE ONE THING THAT IS
+==================================================
+
+RETRACTED, SAME DAY. This section originally read: "~20 rays per leg in 1.35M
+is 1.5e-5 of the frame: scattered single pixels of missing terrain. NOT worth
+a third brick-loop rewrite." BOTH THE COORDINATOR AND I AGREED TO STOP ON A
+NUMBER THAT WAS AN ARTEFACT OF A BUG WE HAD JUST FIXED -- one round after
+establishing that pre-fix counts were suppressed. The correct magnitude is
+~3,870 rays per leg, 0.29% of the frame, and still a lower bound.
+
+THE DECISION IS THEREFORE REOPENED, not settled. Whether to fix it is a
+judgement to make against the corrected number once ill-posed is down, not
+against 20.
+
+The reason for caution stands on its own: the second brick-loop rewrite
+regressed 188x and was reverted. But caution is not the same as "negligible",
+and the earlier text conflated them.
+
+BUT THE SEVERITY SCALES WITH LEVEL. A skipped brick is 0.8 m at level 0 and
+25.6 m at level 5. The same defect that is invisible here would be a hole the
+size of a building in the cascade. GATE v4 MUST RUN AT EVERY LEVEL B-2b ADDS,
+and the bar must be set before that cascade is built rather than after seeing
+what it gives.
+
+CARRIED FORWARD
+===============
+
+  ratio          37.4x (36.25-38.04 across ten legs), scope in
+                 ray-march-skip-ratio-2026-08-20.txt
+  correctness    contested population closed as arithmetic; uncontested
+                 asymmetry OPEN -- magnitude was under-reported ~200x and is
+                 still a lower bound while ill-posed sits at 8-44%
+  B-2b           planned only (docs/ray-march-b2b-plan.md); gate v4 is a
+                 precondition on every level it adds

@@ -3,6 +3,8 @@
 
 #include "RenderGraphBuilder.h"
 #include "RenderGraphUtils.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "RHIGPUReadback.h"
 #include "RenderingThread.h"
 #include "Misc/ScopeExit.h"
@@ -27,6 +29,43 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshChunkLocal(
 	TEXT("1 = the GPU emits chunk-local quads (VXC_MESH_CHUNK_LOCAL permutation, no CPU rebase). ")
 	TEXT("0 = the GPU emits brick-local quads and FVoxelGpuMeshJobManager rebases them on the CPU. ")
 	TEXT("Default 1. Read once per Submit, so it takes effect on the next job."),
+	ECVF_Default);
+
+// --- P1-C / P2: the resident brick volume ----------------------------------
+//
+// OFF BY DEFAULT, AND THAT IS THE PHASE'S WHOLE CLAIM. With this at 0 the job
+// dispatches exactly the graph it dispatched yesterday: no second region, no
+// extra passes, no extra readback, byte-identical. With it at 1 the job ALSO
+// packs its chunk into the brick volume on a second, halo-free 32x32x4 region in
+// the SAME FRDGBuilder, and publishes the result into the brick pool. The mesh
+// chain is untouched either way -- nothing marches yet, so this is additive and
+// off-path by construction rather than by care.
+//
+// Latched per job at Submit, like voxel.GPU.MeshChunkLocal, so a flip mid-flight
+// cannot leave a job that dispatched a brick region waiting on a readback
+// nobody enqueued.
+static int32 GVoxelGpuBrickPack = 1;   // PROTOTYPE DEFAULT: the marcher needs bricks
+static FAutoConsoleVariableRef CVarVoxelGpuBrickPack(
+	TEXT("voxel.GPU.BrickPack"),
+	GVoxelGpuBrickPack,
+	TEXT("1 = every mesh job also packs its chunk into the resident brick volume ")
+	TEXT("(BrickClassify -> Scan x2 -> BrickPack on a halo-free 32x32x4 region, in the same graph). ")
+	TEXT("0 (default) = byte-identical to the graph without it. Read once per Submit."),
+	ECVF_Default);
+
+// THE 'PUBLICATION STUBBED' ARM, and it is a measurement instrument rather than
+// a safety valve. docs/ray-marching-plan-2026-08-19.md section 8 asks for
+// exactly this experiment: run the producer with BrickPack on and publication
+// stubbed -- generate, pack, discard -- and measure chunks/s. That isolates the
+// producer's cost from the pool's, which is the only way to know which of the
+// two a throughput change came from.
+static int32 GVoxelGpuBrickPackResident = 1;
+static FAutoConsoleVariableRef CVarVoxelGpuBrickPackResident(
+	TEXT("voxel.GPU.BrickPackResident"),
+	GVoxelGpuBrickPackResident,
+	TEXT("1 (default) = a packed chunk is published into the global brick pool. ")
+	TEXT("0 = packed and DISCARDED -- the 'publication stubbed' arm, which measures the producer's ")
+	TEXT("cost with the pool's removed. Only meaningful with voxel.GPU.BrickPack 1."),
 	ECVF_Default);
 
 // --- render-thread cost caps (2026-07-27 line-flight instrumentation) -------
@@ -158,6 +197,27 @@ FVoxelGpuQuadPayload::~FVoxelGpuQuadPayload()
 	});
 }
 
+// See the declarations for why the CPU producer has to read the same two gates.
+bool VoxelGpuBrickPackEnabled()
+{
+	// -VoxelBrickPack=<n>, for the -ExecCmds startup-window reason set out above
+	// VoxelBrickPackOnCpuEnabled in VoxelBrickPool.cpp. A producer switch that
+	// only takes effect after streaming has begun leaves a fixed residue of
+	// chunks produced the old way, for the whole run.
+	static const int32 CmdLine = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickPack="), Value);
+		return Value;
+	}();
+	return CmdLine >= 0 ? CmdLine != 0 : GVoxelGpuBrickPack != 0;
+}
+
+bool VoxelGpuBrickPackResidentEnabled()
+{
+	return GVoxelGpuBrickPackResident != 0;
+}
+
 const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status)
 {
 	switch (Status)
@@ -188,6 +248,74 @@ void VoxelGpuChunkRegion::SetChunkFootprint(FVoxelGpuRegionRequest& Req,
 	Req.BricksZ = kBricksZ;
 
 	Req.bMeshChain = true;
+}
+
+bool VoxelGpuChunkRegion::MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
+                                          FVoxelGpuRegionRequest& OutReq)
+{
+	// Only the standard single-chunk footprint. Anything else and the one-brick
+	// shift below is arithmetic about a shape that is not there -- see the
+	// declaration for what packing the wrong bricks looks like.
+	if (MeshReq.DispatchColumns.X != kColumns || MeshReq.DispatchColumns.Y != kColumns ||
+	    MeshReq.BricksZ != kBricksZ)
+	{
+		return false;
+	}
+
+	OutReq = MeshReq;
+
+	// Drop the halo: one brick on every axis, on the negative side, and the
+	// interior extent on the positive.
+	OutReq.DispatchColumns = FUintVector2(kChunkEdgeVoxels, kChunkEdgeVoxels);
+	OutReq.OriginVx = MeshReq.OriginVx + int32(kBrickEdge);
+	OutReq.OriginVy = MeshReq.OriginVy + int32(kBrickEdge);
+	OutReq.BrickZMin = MeshReq.BrickZMin + 1;
+	OutReq.BricksZ = kInteriorBricks;
+
+	// This region generates and packs. It does NOT mesh: the mesh chain is the
+	// other region's job and duplicating it would be the one thing this phase
+	// promised not to do.
+	OutReq.bMeshChain = false;
+	OutReq.bBrickPack = true;
+	OutReq.bChunkLocalQuads = false;
+	OutReq.QuadWriteBase = 0;
+
+	// The band is a property of the COLUMNS, and the mesh region already
+	// produces one for whichever job owns its footprint. Producing a second from
+	// a narrower window would be a different reduction over a different grid --
+	// and a band that is not an outer bound skips chunks, i.e. holes.
+	OutReq.BandEdge = 0;
+	OutReq.BandOriginI = 0;
+	OutReq.BandOriginJ = 0;
+
+	// THE RING SKIRT IS DROPPED, AND IT IS A DECISION WORTH SEEING. The skirt
+	// rewrites cells in a chunk's lateral aprons so the MESHER emits a retaining
+	// wall at a ring boundary; regionCellMat applies it against the fixed
+	// interior [8, 40) of a 48-column dispatch, which does not exist here.
+	// docs/brick-volume-format.md section 8 is explicit that ring-boundary
+	// handling is a TRAVERSAL concern for a marcher rather than a producer
+	// apron. So the volume holds the world as generated, and the marcher will
+	// own the ring seam. ValidateRegionRequest would refuse a non-zero mask on a
+	// 32-column region anyway -- this makes the intent explicit instead of
+	// leaving it to a rejection.
+	OutReq.RingSkirtMask = 0;
+
+	// The raster window is copied verbatim: the halo-free footprint is strictly
+	// inside the halo one, so the window over-covers, and over-covering is legal
+	// where under-covering silently clamps and diverges from the CPU.
+
+	// Every asset anchor is relative to the region origin, which has just moved
+	// by one brick of LEVEL-L cells -- i.e. 8 << CoarseLevel level-0 voxels,
+	// because AnchorRelVx is in level-0 voxel units relative to OriginVx * 2^L.
+	// AnchorVz is absolute and does not move.
+	const int32 AnchorShift = int32(kBrickEdge) << FMath::Clamp(MeshReq.CoarseLevel, 0, 5);
+	for (FVoxelGpuRegionRequest::FAssetInstance& Inst : OutReq.AssetInstances)
+	{
+		Inst.AnchorRelVx -= AnchorShift;
+		Inst.AnchorRelVy -= AnchorShift;
+	}
+
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +403,42 @@ struct FVoxelGpuMeshJobManager::FJob
 	// needs no synchronisation: it selects which phase 2 the GAME thread starts.
 	// Latched rather than re-read at delivery -- see the cvar's comment.
 	bool bDirectToPool = false;
+
+	// --- P1-C: the brick half of the job ----------------------------------
+	//
+	// bBrickPack is latched at Submit and ANDed with whether MakeBrickRegion
+	// could actually derive a region, so a job either has a complete brick
+	// region or none at all. There is no half state to check for later.
+	bool bBrickPack = false;
+	bool bBrickResident = false;
+	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
+	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
+	// no 4-byte total readback, no pool write.
+	//
+	// Latched at Submit like every other per-job gate, so a mid-flight flip
+	// cannot leave a job waiting on a readback nobody enqueued -- the exact
+	// failure voxel.GPU.BrickPack's own latch exists to prevent.
+	//
+	// THE BAND SURVIVES THIS, which is what makes it cheap. The band is a pure
+	// function of the columns and AddRegionPasses emits it outside the mesh
+	// block (VoxelGpuWorldGen.cpp, "lets the gate run band-only probes
+	// cheaply"), so the buried-chunk skip and the cold-band throttle keep their
+	// input. Nothing else downstream needs teaching: NumQuads stays 0 and the
+	// existing zero-quad branch carries the job to ReadbackDone.
+	bool bQuadMesh = true;
+	FVoxelGpuRegionRequest BrickRegion;
+	FVoxelBrickChunkKey BrickKey;
+	FVoxelBrickChunkShading BrickShading;
+	FIntVector BrickOriginVoxel = FIntVector::ZeroValue;
+	// Phase 1, harvested ALL-OR-NONE with the quad total: the two dword counts
+	// the pool allocation is made from. Eight bytes, and the only thing on this
+	// path that crosses PCIe.
+	TUniquePtr<FRHIGPUBufferReadback> BrickTotalReadback;
+	uint32 BrickTotals[2] = { 0, 0 };
+	// Constructed on the render thread in DispatchBatch, holding the three
+	// scratch arenas and the L1 mask. Handed to the pool (and to the result) on
+	// the game thread at delivery.
+	FVoxelGpuBrickPayloadRef BrickPayload;
 
 	// Wave D / D1. Non-null once the direct path has taken this job's quads.
 	// Constructed on the game thread holding QuadBuffer (so the payload is
@@ -519,6 +683,78 @@ uint64 FVoxelGpuMeshJobManager::Submit(FVoxelGpuRegionRequest&& Region, uint64 U
 		&& GVoxelGpuMeshDirectToPool != 0
 		&& Job->Region.bChunkLocalQuads;
 
+	// PHASE 5: brick-only. Read once, here, for the latch reason on bQuadMesh.
+	// VoxelTerrainQuadsRetired is already ANDed with voxel.GPU.BrickPack, so this
+	// cannot turn the mesh chain off on a job that will not pack anything either.
+	Job->bQuadMesh = !VoxelTerrainQuadsRetired();
+	if (!Job->bQuadMesh)
+	{
+		// bMeshChain is the pre-existing "stop after voxelization" switch the
+		// region request has always carried -- used until now only by the
+		// verification gates. It is exactly the shape this needs, so Phase 5
+		// costs no new kernel and no new shader.
+		Job->Region.bMeshChain = false;
+		// Nothing to put in the quad pool, so the direct-to-pool path must not
+		// be armed: it would allocate a range for geometry that does not exist.
+		Job->bDirectToPool = false;
+	}
+
+	// P1-C. Latched here, and ANDed with whether a brick region can actually be
+	// derived from this footprint -- a job either carries a complete brick
+	// region or none, so nothing downstream has to check for a half state.
+	// Non-chunk footprints (the bench fixtures, the blocking verify path) simply
+	// do not pack, which is correct: the brick volume is a per-render-chunk
+	// structure and there is no such thing as packing two thirds of one.
+	FString BrickRegionError;
+	// VoxelGpuBrickPackEnabled(), NOT the raw cvar. THE GATE IS NO LONGER "A
+	// CVAR" -- it is a cvar with a command-line override, and only the accessor
+	// knows that. Reading GVoxelGpuBrickPack directly here is what made
+	// -VoxelBrickPack=1 produce a job with bMeshChain false AND bBrickPack false,
+	// which the promotion guard then correctly rejected as producing nothing --
+	// the fork carried zero traffic and `added (gpu 0, cpu 28123)` was the only
+	// sign. The invariant moved when the override landed; every read has to move
+	// with it.
+	if (VoxelGpuBrickPackEnabled() &&
+	    VoxelGpuChunkRegion::MakeBrickRegion(Job->Region, Job->BrickRegion) &&
+	    // VALIDATED HERE TOO, and not because MakeBrickRegion is suspect. The
+	    // mesh region is validated in Tick before it reaches a graph; the brick
+	    // region is derived rather than submitted, so nothing else would ever
+	    // look at it. AddRegionPasses assumes a validated request -- the
+	    // difference between a constraint and an assumption is whether anything
+	    // checks it.
+	    VoxelGpuWorldGen::ValidateRegionRequest(Job->BrickRegion, BrickRegionError))
+	{
+		Job->bBrickPack = true;
+		Job->bBrickResident = GVoxelGpuBrickPackResident != 0;
+
+		// The chunk the brick region covers, in its OWN level's units. The
+		// origins are exact multiples of the chunk edge by construction
+		// (SetChunkFootprint plus MakeBrickRegion's one-brick shift), so these
+		// divisions are exact and sign-safe -- an exact multiple divides the
+		// same way whichever direction the truncation goes.
+		Job->BrickKey.X = Job->BrickRegion.OriginVx / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
+		Job->BrickKey.Y = Job->BrickRegion.OriginVy / int32(VoxelGpuChunkRegion::kChunkEdgeVoxels);
+		Job->BrickKey.Z = Job->BrickRegion.BrickZMin / int32(VoxelGpuChunkRegion::kInteriorBricks);
+		Job->BrickKey.Level = FMath::Clamp(Job->BrickRegion.CoarseLevel, 0, 5);
+		// Latched with the key, from the same region, for the same reason: the
+		// record is written at completion and the game thread that sampled this
+		// is long gone by then.
+		Job->BrickShading = Job->BrickRegion.BrickShading;
+		Job->BrickOriginVoxel = FIntVector(
+			Job->BrickRegion.OriginVx,
+			Job->BrickRegion.OriginVy,
+			Job->BrickRegion.BrickZMin * int32(VoxelGpuChunkRegion::kBrickEdge));
+	}
+	else if (VoxelGpuBrickPackEnabled() && !BrickRegionError.IsEmpty())
+	{
+		// Loud, because the alternative is a cvar that is on and does nothing --
+		// the failure mode this project has paid for twice. The mesh half of the
+		// job is unaffected either way.
+		UE_LOG(LogTemp, Error,
+		       TEXT("voxel.GPU.BrickPack is on but the derived brick region is invalid: %s"),
+		       *BrickRegionError);
+	}
+
 	Job->SubmitSeconds = FPlatformTime::Seconds();
 
 	// Low-priority work goes to its own queue and is promoted only when the
@@ -579,9 +815,14 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 			// pool-ready and the CPU rebase would double-apply the offset. The
 			// brick-local branch below is kept, not vestigial: it is the control
 			// voxel.GPU.MeshChunkLocal 0 selects, and the two must agree.
-			Result.Quads = Job->Region.bChunkLocalQuads
-				? MoveTemp(Job->RawQuads)
-				: RebaseQuadsToChunkLocal(*Job);
+			// PHASE 5: a brick-only job took no readback and holds no scan
+			// tables, so the rebase has nothing to rebase FROM. Its RawQuads is
+			// already empty and empty is the true answer, so it takes the same
+			// branch the chunk-local path does rather than walking a scan that
+			// was never produced.
+			Result.Quads = (Job->bQuadMesh && !Job->Region.bChunkLocalQuads)
+				? RebaseQuadsToChunkLocal(*Job)
+				: MoveTemp(Job->RawQuads);
 
 			// Derived from the ARRAY, not from Job->NumQuads, so the readback
 			// path's invariant NumQuads == Quads.Num() holds by construction
@@ -599,6 +840,50 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 		Result.bBandValid = Job->bBandValid;
 		Result.BandMaxSurfaceTopVoxel = Job->Band[0];
 		Result.BandMinDeepestAirVoxel = Job->Band[1];
+
+		// --- P1-C / P2: make the volume resident ---------------------------
+		//
+		// The totals have landed, so the size of this chunk's two arena
+		// allocations is now known and the pool can be asked for them. This is
+		// the game thread, which is where FVoxelBrickPool expects to be called
+		// from; nothing is dispatched here -- Tick's Flush batches every write
+		// in the tick into one graph.
+		if (Job->bBrickPack && Job->BrickPayload.IsValid())
+		{
+			const uint32 OccWords = Job->BrickTotals[0];
+			const uint32 MatWords = Job->BrickTotals[1];
+			// The scratch buffers were sized to the worst case -- every brick
+			// MIXED, 16 occupancy dwords and 132 material dwords each -- so a
+			// total above that did not come from the scan. Bounded here because
+			// the pool would otherwise allocate from it and the copy would read
+			// past the end of a buffer that is genuinely too small.
+			const uint32 MaxOcc = Job->BrickPayload->BrickCount * 16;
+			const uint32 MaxMat = Job->BrickPayload->BrickCount * 132;
+			if (OccWords > MaxOcc || MatWords > MaxMat)
+			{
+				UE_LOG(LogTemp, Error,
+				       TEXT("Job %llu: brick totals (%u occ, %u mat dwords) exceed the worst case for ")
+				       TEXT("%u bricks (%u, %u). Not published — this is a scan or readback fault, not ")
+				       TEXT("a big chunk."),
+				       Job->JobId, OccWords, MatWords, Job->BrickPayload->BrickCount, MaxOcc, MaxMat);
+			}
+			else
+			{
+				Job->BrickPayload->OccWords = OccWords;
+				Job->BrickPayload->MatWords = MatWords;
+				if (Job->bBrickResident)
+				{
+					GetGlobalVoxelBrickPool().AddChunkFromGpu(
+						Job->BrickPayload, Job->BrickKey, Job->BrickShading);
+				}
+				// Handed on either way. Under voxel.GPU.BrickPackResident 0 the
+				// caller is the only thing holding it, which is what makes
+				// "generate, pack, discard" an actual discard rather than a
+				// quietly-still-resident run.
+				Result.BrickVolume = Job->BrickPayload;
+			}
+			Job->BrickPayload.Reset();
+		}
 	}
 
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
@@ -607,6 +892,11 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 void FVoxelGpuMeshJobManager::Tick()
 {
 	check(IsInGameThread());
+
+	// STAGE BRACKETS. See GetAndResetTickStageMs for why this function has them:
+	// it is the largest item in the streaming tick and therefore the world's
+	// generation ceiling, and it had exactly one number.
+	const double TickStage0 = FPlatformTime::Seconds();
 
 	// --- 1. promote queued jobs, one RDG graph for the whole batch ----------
 	//
@@ -676,10 +966,13 @@ void FVoxelGpuMeshJobManager::Tick()
 		// before the validation checks means a rejected job's QueuedMs still
 		// describes real queueing time, not a zero from a job that was never
 		// actually going to run.
-		if (GVoxelGpuMeshLatencyStats != 0)
-		{
-			Job->PromotedSeconds = FPlatformTime::Seconds();
-		}
+		// STAMPED UNCONDITIONALLY, not just for latency stats. It used to be
+		// gated on GVoxelGpuMeshLatencyStats because its only consumer was
+		// QueuedMs, a diagnostic. It now also drives the in-flight TIMEOUT,
+		// which must not change behaviour depending on whether a stats cvar is
+		// on. One FPlatformTime::Seconds() per promoted job is nothing against
+		// the seven compute passes that follow it.
+		Job->PromotedSeconds = FPlatformTime::Seconds();
 
 		FString ValidationError;
 		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
@@ -692,9 +985,26 @@ void FVoxelGpuMeshJobManager::Tick()
 			Rejected.Emplace(Job, ValidationError);
 			continue;
 		}
-		if (!Job->Region.bMeshChain)
+		// A JOB MUST PRODUCE SOMETHING -- and as of Phase 5 that is no longer the
+		// same statement as "must produce quads".
+		//
+		// THIS GUARD IS WHY THE FORK PACKED NOTHING UNDER RETIREMENT. It read
+		// `bMeshChain must be true -- this manager exists to produce quads`, which
+		// was exactly true when it was written and became false the moment a
+		// brick-only job existed. Every such job was REJECTED here, before it ever
+		// reached a graph, and the streaming path did the correct thing with a
+		// rejection: it fell back to the CPU worker. So the fork silently carried
+		// zero traffic (`added (gpu 0, cpu 30113)` against a control's
+		// `(gpu 6120, cpu 90899)`), and because the CPU arm publishes inside
+		// DrainResults' apply budget while the fork does not, the leg lost both
+		// the fork's chunks AND the rate.
+		//
+		// Same failure shape as the edit-path exemption fixed alongside it: a
+		// constraint that was true in one context, silently inherited into
+		// another. Neither was a wrong line when written.
+		if (!Job->Region.bMeshChain && !Job->bBrickPack)
 		{
-			Rejected.Emplace(Job, TEXT("bMeshChain must be true — this manager exists to produce quads"));
+			Rejected.Emplace(Job, TEXT("a job must produce quads or bricks; this one asked for neither"));
 			continue;
 		}
 
@@ -722,11 +1032,35 @@ void FVoxelGpuMeshJobManager::Tick()
 	}
 
 	// --- 2. poll and harvest ------------------------------------------------
+	const double TickStage1 = FPlatformTime::Seconds();
+	TickStageMs.PromoteMs += (TickStage1 - TickStage0) * 1000.0;
 	PollInFlight();
+	const double TickStage2 = FPlatformTime::Seconds();
+	TickStageMs.PollMs += (TickStage2 - TickStage1) * 1000.0;
+
+	// --- 3. P2: one render command for every brick write this tick ----------
+	//
+	// After the harvest, because the harvest is what delivers jobs and delivery
+	// is what publishes into the pool. Cheap and safe with nothing pending; it
+	// returns without enqueueing anything.
+	GetGlobalVoxelBrickPool().Flush();
+	const double TickStage3 = FPlatformTime::Seconds();
+	TickStageMs.BrickFlushMs += (TickStage3 - TickStage2) * 1000.0;
 }
 
 void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 {
+	// THE ENQUEUE ONLY, NOT THE GRAPH. The lambda below runs on the RENDER
+	// thread; what the GAME thread pays here is constructing the command and
+	// handing it over. If this is large it means the enqueue is blocking, which
+	// is a different and much more serious finding than a slow graph -- worth
+	// being able to tell apart.
+	//
+	// DispatchBatch is called from inside Tick's PROMOTE stage, so this time is
+	// ALSO counted in PromoteMs. Subtract it when reading: promote-proper is
+	// PromoteMs - EnqueueMs. Stated here because a breakdown whose parts overlap
+	// silently is worse than one number.
+	const double DispatchBatchStart = FPlatformTime::Seconds();
 	// ONE graph for the whole batch. Every job's seven passes plus its three
 	// readback copies go into the same FRDGBuilder, which is executed once.
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
@@ -750,23 +1084,44 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			const VoxelGpuWorldGen::FRegionGraphResources Graph =
 				VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->Region);
 
-			if (Graph.Quads == nullptr || Graph.Counts == nullptr ||
-			    Graph.Offsets == nullptr || Graph.Total == nullptr)
+			// PHASE 5: a brick-only job asked for no mesh chain, so no quad
+			// buffers is the CORRECT outcome rather than a failure. Checked
+			// against the job's own latch and not against the buffers being
+			// null, because "null because we asked for nothing" and "null
+			// because the chain broke" must not become the same condition --
+			// that is how a real dispatch failure would start reading as an
+			// intended one.
+			if (Job->bQuadMesh)
 			{
-				Job->Error = TEXT("mesh chain produced no quad buffers");
-				Job->SetState(EJobState::Failed);
-				continue;
+				if (Graph.Quads == nullptr || Graph.Counts == nullptr ||
+				    Graph.Offsets == nullptr || Graph.Total == nullptr)
+				{
+					Job->Error = TEXT("mesh chain produced no quad buffers");
+					Job->SetState(EJobState::Failed);
+					continue;
+				}
+
+				// The quad buffer has to survive this graph: phase 2 fetches from
+				// it in a later one. Everything else here dies at Execute, as it
+				// should.
+				Job->QuadBuffer = GraphBuilder.ConvertToExternalBuffer(Graph.Quads);
+
+				// PHASE 1 READS FOUR BYTES. That is the whole point of D3 — see the
+				// EJobState comment.
+				Job->TotalReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.QuadTotal"));
+				AddEnqueueCopyPass(GraphBuilder, Job->TotalReadback.Get(), Graph.Total, sizeof(uint32));
 			}
-
-			// The quad buffer has to survive this graph: phase 2 fetches from
-			// it in a later one. Everything else here dies at Execute, as it
-			// should.
-			Job->QuadBuffer = GraphBuilder.ConvertToExternalBuffer(Graph.Quads);
-
-			// PHASE 1 READS FOUR BYTES. That is the whole point of D3 — see the
-			// EJobState comment.
-			Job->TotalReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.QuadTotal"));
-			AddEnqueueCopyPass(GraphBuilder, Job->TotalReadback.Get(), Graph.Total, sizeof(uint32));
+			else if (Graph.Quads != nullptr || Graph.Total != nullptr)
+			{
+				// LOUD, because it means bMeshChain did not take: the job would
+				// then be paying for the whole mesh chain on the GPU while
+				// reporting itself as brick-only, and the only visible symptom
+				// would be a throughput number that never improved.
+				UE_LOG(LogTemp, Error,
+				       TEXT("Job %llu is brick-only but the region still produced quad buffers. ")
+				       TEXT("bMeshChain was not honoured; the mesh chain is still being dispatched."),
+				       Job->JobId);
+			}
 
 			// ...twelve, when this job is the one producing its footprint's
 			// band (Wave D / D6). Same graph, same phase, same delivery: the
@@ -784,7 +1139,13 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// CPU and so genuinely needs the per-mask tables. Kept honest
 			// rather than lean: voxel.GPU.MeshChunkLocal 0 is meant to be the
 			// PREVIOUS behaviour, and that included these reads.
-			if (!Job->Region.bChunkLocalQuads)
+			// PHASE 5: ...and not at all on a brick-only job, which has no mask
+			// tables because it has no mesh chain. Without this term the
+			// combination voxel.Terrain.RetireQuads 1 + voxel.GPU.MeshChunkLocal 0
+			// would enqueue a copy from a NULL buffer -- a combination nobody
+			// would run on purpose and exactly the kind that gets run by accident
+			// while bisecting something else.
+			if (Job->bQuadMesh && !Job->Region.bChunkLocalQuads)
 			{
 				Job->CountsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Counts"));
 				Job->OffsetsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.Offsets"));
@@ -793,6 +1154,65 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				                   Job->Sizes.CountsBytes());
 				AddEnqueueCopyPass(GraphBuilder, Job->OffsetsReadback.Get(), Graph.Offsets,
 				                   Job->Sizes.CountsBytes());
+			}
+
+			// --- P1-C: the brick region, in THIS graph ---------------------
+			//
+			// A SECOND AddRegionPasses call rather than a flag on the first,
+			// because the two regions are different shapes: the mesher needs its
+			// one-brick halo and the packer must not have one (brickpack.ush
+			// decomposes from the region corner, so a halo region would pack the
+			// halo). Same FRDGBuilder, so this is one graph, one submission, and
+			// one place to read the split in a ProfileGPU capture.
+			//
+			// A failure here does NOT fail the job. The brick volume is off-path
+			// in this phase: nothing draws from it, so a chunk that meshed
+			// correctly and failed to pack is a chunk with no volume, not a hole
+			// in the world. It stays loud in the log rather than becoming an
+			// outcome.
+			if (Job->bBrickPack)
+			{
+				// A SCOPE, BECAUSE THE SPLIT IS THE DELIVERABLE. The brick
+				// region runs its own ColumnMain and VoxelizeMain, and those
+				// passes carry the SAME RDG event names as the mesh region's --
+				// so without this a ProfileGPU capture shows two of each and no
+				// way to tell which cost what. The phase is gated on "BrickPack's
+				// added GPU cost in the ProfileGPU split"; a capture that cannot
+				// attribute it does not answer the question.
+				RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickRegion");
+
+				const VoxelGpuWorldGen::FRegionGraphResources BrickGraph =
+					VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->BrickRegion);
+
+				if (BrickGraph.BrickDesc == nullptr || BrickGraph.BrickOcc == nullptr ||
+				    BrickGraph.BrickMat == nullptr || BrickGraph.BrickChunkMask == nullptr ||
+				    BrickGraph.BrickTotals == nullptr)
+				{
+					UE_LOG(LogTemp, Error,
+					       TEXT("Job %llu asked for a brick pack and the graph produced no brick buffers. ")
+					       TEXT("The mesh half of this job is unaffected."), Job->JobId);
+					Job->bBrickPack = false;
+				}
+				else
+				{
+					Job->BrickPayload = MakeShared<FVoxelGpuBrickPayload, ESPMode::ThreadSafe>();
+					// These have to survive this graph: the pool write runs in a
+					// later one, once the totals have said how much to allocate.
+					Job->BrickPayload->Desc = GraphBuilder.ConvertToExternalBuffer(BrickGraph.BrickDesc);
+					Job->BrickPayload->Occ = GraphBuilder.ConvertToExternalBuffer(BrickGraph.BrickOcc);
+					Job->BrickPayload->Mat = GraphBuilder.ConvertToExternalBuffer(BrickGraph.BrickMat);
+					Job->BrickPayload->ChunkMask =
+						GraphBuilder.ConvertToExternalBuffer(BrickGraph.BrickChunkMask);
+					Job->BrickPayload->SrcBrickFirst = 0;
+					Job->BrickPayload->SrcChunkIndex = 0;
+					Job->BrickPayload->BrickCount = BrickGraph.Sizes.NumBricks;
+					Job->BrickPayload->OriginVoxel = Job->BrickOriginVoxel;
+
+					Job->BrickTotalReadback =
+						MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.BrickTotals"));
+					AddEnqueueCopyPass(GraphBuilder, Job->BrickTotalReadback.Get(),
+					                   BrickGraph.BrickTotals, 2 * uint32(sizeof(uint32)));
+				}
 			}
 
 			Built.Add(Job);
@@ -810,6 +1230,8 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			Job->SetState(EJobState::Dispatched);
 		}
 	});
+
+	TickStageMs.EnqueueMs += (FPlatformTime::Seconds() - DispatchBatchStart) * 1000.0;
 }
 
 // PHASE 2. The total has landed, so fetch exactly that many quads out of the
@@ -1003,9 +1425,19 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				// --- phase 1: the 4-byte total (+ the control path's tables) --
 				if (State == EJobState::Dispatched)
 				{
-					const bool bNeedTables = !Job->Region.bChunkLocalQuads;
+					const bool bNeedTables = Job->bQuadMesh && !Job->Region.bChunkLocalQuads;
 					const bool bNeedBand = Job->Region.BandEdge > 0;
-					if (!Job->TotalReadback.IsValid() ||
+					// P1-C. Rides phase 1 for the band's reason: one job, one
+					// completion event. A brick total that landed on its own
+					// would be a second async stream to satisfy exactly once.
+					const bool bNeedBricks = Job->bBrickPack;
+					// PHASE 5: a brick-only job never enqueued a quad total, so
+					// requiring it here would fail every such job with "phase 1
+					// readback objects missing" -- which is the failure mode this
+					// whole state machine is built to make impossible.
+					const bool bNeedQuadTotal = Job->bQuadMesh;
+					if ((bNeedQuadTotal && !Job->TotalReadback.IsValid()) ||
+					    (bNeedBricks && !Job->BrickTotalReadback.IsValid()) ||
 					    (bNeedBand && !Job->BandReadback.IsValid()) ||
 					    (bNeedTables && (!Job->CountsReadback.IsValid() ||
 					                     !Job->OffsetsReadback.IsValid())))
@@ -1020,7 +1452,8 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 					// result the streaming path reads as "this footprint has no
 					// band" — which is silent, and costs a whole (X,Y) column
 					// its cold-band throttle release.
-					if (!Job->TotalReadback->IsReady() ||
+					if ((bNeedQuadTotal && !Job->TotalReadback->IsReady()) ||
+					    (bNeedBricks && !Job->BrickTotalReadback->IsReady()) ||
 					    (bNeedBand && !Job->BandReadback->IsReady()) ||
 					    (bNeedTables && (!Job->CountsReadback->IsReady() ||
 					                     !Job->OffsetsReadback->IsReady())))
@@ -1055,9 +1488,39 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 
 					// The GPU number. This is what D3 exists to fetch, and it
 					// is 4 bytes.
+					//
+					// PHASE 5: brick-only leaves NumQuads at its initial 0, which
+					// is not a shortcut -- 0 is the TRUE quad count of a job that
+					// dispatched no mesh chain, and the zero-quad branch in the
+					// phase-2 starter already carries such a job straight to
+					// ReadbackDone without a payload. Nothing downstream needs a
+					// brick-only special case.
 					FString Error;
-					bool bOk = CopyReadback(*Job->TotalReadback, &Job->NumQuads,
-					                        sizeof(uint32), TEXT("QuadTotal"), Error);
+					bool bOk = true;
+					if (bNeedQuadTotal)
+					{
+						bOk = CopyReadback(*Job->TotalReadback, &Job->NumQuads,
+						                   sizeof(uint32), TEXT("QuadTotal"), Error);
+					}
+
+					if (bOk && bNeedBricks)
+					{
+						// The two dword counts the pool allocation is made from.
+						// A failure here is NOT allowed to fail the job -- see
+						// the dispatch note -- so it clears the brick half and
+						// leaves the mesh half alone.
+						FString BrickError;
+						if (!CopyReadback(*Job->BrickTotalReadback, Job->BrickTotals,
+						                  2 * uint32(sizeof(uint32)), TEXT("BrickTotals"), BrickError))
+						{
+							UE_LOG(LogTemp, Error,
+							       TEXT("Job %llu: brick totals readback failed (%s). The chunk meshes ")
+							       TEXT("normally and simply has no resident volume."),
+							       Job->JobId, *BrickError);
+							Job->bBrickPack = false;
+							Job->BrickPayload.Reset();
+						}
+					}
 
 					if (bOk && bNeedBand)
 					{
@@ -1271,15 +1734,44 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 			continue;
 		}
 
-		if (Now - Job->SubmitSeconds > TimeoutSeconds)
+		// TIMED FROM PROMOTION, NOT SUBMISSION -- and that distinction was
+		// costing HALF of all GPU mesh work.
+		//
+		// SubmitSeconds is stamped in Submit(), when the job joins the QUEUE.
+		// Using it here charged a job's queue wait against a budget whose own
+		// message calls itself "readback not ready", i.e. GPU time. Under a
+		// cold fill the queue is deep -- MaxInFlight and MeshBatchCap both
+		// throttle promotion by design -- so a job could sit for 9 s and get
+		// 1 s of actual GPU time before being declared timed out.
+		//
+		// Measured 2026-08-22: 8,984 jobs dispatched, 4,480 TIMED OUT (~50%),
+		// each abandoned after a full 10 s and redone on the CPU worker path.
+		//
+		// AND IT WAS SELF-REINFORCING, which is why it presents as a cliff
+		// rather than a constant tax: a timed-out job occupies its in-flight
+		// slot for the whole timeout, so half the pipeline fills with zombies,
+		// which lengthens the queue, which makes the next batch more likely to
+		// time out the same way.
+		//
+		// PromotedSeconds is the moment the job actually went to the GPU, which
+		// is what "readback not ready after N s" has always claimed to measure.
+		// Falling back to SubmitSeconds keeps a job that somehow reached
+		// InFlight without a promotion stamp from becoming immortal.
+		const double ClockStart = Job->PromotedSeconds > 0.0 ? Job->PromotedSeconds : Job->SubmitSeconds;
+		if (Now - ClockStart > TimeoutSeconds)
 		{
 			// Device loss, a wedged queue, or a render thread that never ran the
 			// command. Give up on it, but keep the job object alive for any
 			// render command still holding a reference.
 			Job->Abandoned.store(1, std::memory_order_release);
 			InFlight.RemoveAt(I, EAllowShrinking::No);
+			// The queue wait is REPORTED rather than charged, so a deep queue is
+			// still visible here -- it just no longer counts against the GPU.
+			const double QueuedSec = (Job->PromotedSeconds > 0.0 && Job->SubmitSeconds > 0.0)
+				? (Job->PromotedSeconds - Job->SubmitSeconds) : 0.0;
 			Finished.Add({ Job, EVoxelGpuMeshJobStatus::TimedOut,
-				FString::Printf(TEXT("readback not ready after %.1f s"), TimeoutSeconds) });
+				FString::Printf(TEXT("readback not ready after %.1f s on the GPU (queued %.1f s before that)"),
+				                Now - ClockStart, QueuedSec) });
 		}
 	}
 

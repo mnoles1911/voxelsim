@@ -332,6 +332,146 @@ public:
         return MAT_AIR;
     }
 
+    // --- COVER COMPOSE: the detail lattice, in a volume of its own ----------
+    //
+    // Everything above composes the WORLD lattice, where a detail species is a
+    // category error and answers MAT_AIR (materialOfInstance says so twice, on
+    // purpose). This pair is the mirror image: it composes ONLY detail-lattice
+    // instances, on a SEPARATE lattice whose pitch is the species' own baked
+    // pitch. docs/detail-assets-in-the-volume-2026-08-19.md is the why.
+    //
+    // WHY A SEPARATE LATTICE RATHER THAN A FINER WORLD. Nothing in voxel-core
+    // resamples an AssetGrid -- asset-forge/README.md:38-41 records the rule and
+    // the symptom: "a 5 cm rock read through AssetGrid::at comes out at twice
+    // its size". So a grid may be composed at exactly one pitch, the one it was
+    // baked at. A cover volume therefore admits ONE pitch and refuses every
+    // other, and the refusal is a dropped instance here rather than a silently
+    // doubled bush. The 7 species baked at 20 mm are refused from a 50 mm
+    // volume by this rule; naming them belongs at load, where the species still
+    // has a name to report.
+    //
+    // THE Z CONVENTION IS THE ONE PLACE THIS DIFFERS FROM TERRAIN COMPOSE, and
+    // it is not a preference. A terrain asset's base slab SHARES its anchor
+    // voxel (rz = vz - anchorVz - originZ). Ground cover stands on the anchor
+    // voxel's TOP surface, because the terrain convention would bury a 5 cm
+    // tuft entirely inside the 10 cm ground cube -- the rule
+    // VoxelDetailAssetSubsystem.cpp:538-544 already ships and the owner has
+    // already seen in-game. So the base is (anchorVz + 1) expressed in cover
+    // voxels, and that is exact only because the cover lattice tiles the world
+    // one (checked below).
+    //
+    // THE ANCHOR DIVISION HAPPENS HERE, ONCE, AND NOWHERE ELSE. anchorXMm is
+    // SIGNED millimetres and the census ground is at (-39661, -57292): C++
+    // floorDiv FLOORS, HLSL '/' TRUNCATES TOWARD ZERO, and the two disagree on
+    // every negative coordinate in the world. A GPU mirror of this function must
+    // receive anchors ALREADY DIVIDED, exactly as VoxelAssetStamp.usf receives
+    // them today -- that shader contains no division and must not grow one.
+    struct ResolvedCoverInstance {
+        const AssetGrid* grid = nullptr;
+        // COVER voxels at pitchMm -- NOT world voxels. A distinct type from
+        // ResolvedAssetInstance deliberately: the two carry the same three
+        // numbers in different units, and a field whose meaning depends on which
+        // function filled it is exactly how a join detaches. Mixing them is a
+        // compile error rather than a wrong picture.
+        int64_t anchorCx = 0, anchorCy = 0, anchorCz = 0;
+        uint8_t yawQuarter = 0;
+        // Attribution only; composition never reads it (same contract as
+        // ResolvedAssetInstance::layer).
+        uint8_t layer = 0;
+        uint32_t pitchMm = 0;
+    };
+
+    // Resolve every DETAIL-LATTICE instance whose grid is baked at pitchMm.
+    // The exact complement of resolveForCompose: what that function keeps, this
+    // one drops, and the reverse. An instance that satisfies both is impossible
+    // (assetLayerAdmitsVoxelSize refuses it at load) and an instance that
+    // satisfies neither composes nowhere, which is the honest answer for a
+    // species whose bake and whose layer disagree.
+    std::vector<ResolvedCoverInstance>
+    resolveForCoverCompose(const std::vector<AssetInstance>& instances,
+                           uint32_t pitchMm) const {
+        std::vector<ResolvedCoverInstance> out;
+        if (banks_ == nullptr) return out;
+        // The cover lattice must TILE the world lattice, or the z convention is
+        // not expressible: (anchorVz + 1) has to land on a cover-voxel
+        // boundary. 100/50 = 2 holds and 100/20 = 5 holds; 100/30 does not, and
+        // a volume at 30 mm is refused whole rather than composed half a voxel
+        // low everywhere.
+        if (pitchMm == 0 || uint32_t(kVoxelSizeMm) % pitchMm != 0) return out;
+        const int64_t ratio = int64_t(uint32_t(kVoxelSizeMm) / pitchMm);
+        out.reserve(instances.size());
+        for (const AssetInstance& inst : instances) {
+            if (size_t(inst.layer) >= layers_.size()) continue;
+            // The INVERSE of resolveForCompose's test. A terrain-lattice
+            // instance is already in the world volume (VoxelAssetStamp.usf ->
+            // BrickClassifyMain/BrickPackMain, VoxelGpuWorldGen.cpp:1367/1389);
+            // composing it here too would draw every tree twice.
+            if (layers_[inst.layer].terrainLattice) continue;
+            const AssetGrid* g = banks_->bankGrid(inst.bankId, inst.seedIndex);
+            if (g == nullptr || !g->valid()) continue;
+            // PITCH EQUALITY, not !onTerrainLattice(). "Not the world lattice"
+            // admits every detail pitch at once; only one of them composes
+            // correctly in this volume. See the header.
+            if (g->voxelSizeMm() != pitchMm) continue;
+            // Animals are excluded structurally (layer 255 never reaches the
+            // species table), and this is the defensive second check the UE
+            // worker already carries: only rig-parted assets answer true, so a
+            // mis-baked plant cannot compose as one.
+            if (g->hasParts()) continue;
+            ResolvedCoverInstance r;
+            r.grid = g;
+            r.anchorCx = floorDiv(inst.anchorXMm, int64_t(pitchMm));
+            r.anchorCy = floorDiv(inst.anchorYMm, int64_t(pitchMm));
+            r.anchorCz = (int64_t(inst.anchorVz) + 1) * ratio;
+            r.yawQuarter = inst.yawQuarter;
+            r.layer = inst.layer;
+            r.pitchMm = pitchMm;
+            out.push_back(r);
+        }
+        return out;
+    }
+
+    // The material the cover term puts at a COVER voxel, or MAT_AIR.
+    //
+    // Same first-non-air-wins rule and the same determinism argument as
+    // materialAtResolved: the list preserves instancesForRect order, which is
+    // assetSitesForRect's (layer, then row-major cell), so two overlapping
+    // tufts resolve identically on every machine and in every session. That
+    // ordering is also the byte-parity contract with any GPU mirror -- one
+    // dispatch per instance, in this array order.
+    //
+    // Static for the same reason materialAtResolved is: it must not be able to
+    // touch the bank source, and therefore cannot take the global bankGrid
+    // mutex from inside a per-voxel loop.
+    // ONE instance's material at a cover voxel. THE ONLY PLACE THE COVER
+    // TRANSFORM IS SPELLED. Callers that walk a per-column SHORTLIST rather
+    // than the whole list (a census, a mesher) must come through here too --
+    // re-inlining the arithmetic at the call site is how a probe ends up
+    // measuring a world the reference does not describe, which is the exact
+    // failure this file's byte-parity contract exists to prevent.
+    static MaterialId coverMaterialOfResolved(const ResolvedCoverInstance& r, int64_t cx,
+                                              int64_t cy, int64_t cz) {
+        const int64_t rx = cx - r.anchorCx - int64_t(r.grid->rotatedOriginX(r.yawQuarter));
+        const int64_t ry = cy - r.anchorCy - int64_t(r.grid->rotatedOriginY(r.yawQuarter));
+        const int64_t rz = cz - r.anchorCz - int64_t(r.grid->originZ());
+        // atYaw answers MAT_AIR out of range by design, so this guard is only
+        // keeping the int32 narrowing honest -- same as above.
+        if (rx < INT32_MIN || rx > INT32_MAX || ry < INT32_MIN || ry > INT32_MAX ||
+            rz < INT32_MIN || rz > INT32_MAX)
+            return MAT_AIR;
+        return r.grid->atYaw(static_cast<int32_t>(rx), static_cast<int32_t>(ry),
+                             static_cast<int32_t>(rz), r.yawQuarter);
+    }
+
+    static MaterialId coverMaterialAtResolved(const std::vector<ResolvedCoverInstance>& resolved,
+                                              int64_t cx, int64_t cy, int64_t cz) {
+        for (const ResolvedCoverInstance& r : resolved) {
+            const MaterialId m = coverMaterialOfResolved(r, cx, cy, cz);
+            if (m != MAT_AIR) return m;
+        }
+        return MAT_AIR;
+    }
+
     // The material one instance puts at a world voxel, or MAT_AIR.
     //
     // Only TERRAIN-LATTICE instances answer anything. A detail-lattice species

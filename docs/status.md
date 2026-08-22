@@ -4153,7 +4153,15 @@ than per-voxel) becomes available.
 ### Voxel light field + cone-traced GI (M4)
 
 First working slice of the M4 line item "voxel light field + cone-traced GI".
-**Default OFF** (`voxel.GI.Enabled 0`) until it earns its way on. CLIENT-SIDE
+~~**Default OFF** (`voxel.GI.Enabled 0`) until it earns its way on.~~
+**CORRECTED 2026-08-20: DEFAULT ON.** `voxel.GI.Enabled` has been **1** since
+2026-07-27 (`VoxelGI.cpp`), as has `voxel.GI.Volume` (`VoxelGIVolume.cpp`). This
+line, `docs/gpu-roadmap-remaining.md`, `docs/gpu-waves-plan.md` and the cvars'
+own help strings all said otherwise, and were believed: **every perf leg on this
+project has run with GI ON**, so GI's cost is already inside the 18.99 ms A0
+baseline and the 34.7 ms shadowed one rather than waiting outside them. Anyone
+budgeting against those numbers while believing GI is off double-counts it.
+CLIENT-SIDE
 RENDERING ONLY: outside the determinism boundary, floats throughout, no
 worldgen / edit-log / replication / digest path is read or written by any of
 it. Two clients may converge to slightly different irradiance; they cannot

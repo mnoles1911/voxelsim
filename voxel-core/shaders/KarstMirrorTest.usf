@@ -1,0 +1,52 @@
+// Compile-check fixture for voxel-core/shaders/karst.ush.
+//
+// WHY THIS EXISTS. The karst mirror's risk is not that it produces wrong
+// geometry -- it is that it produces geometry at all only after being wired into
+// worldgen.ush, which is a 3,180-line contended file. A mirror that cannot be
+// compiled until it is integrated is a mirror whose first error surfaces as an
+// editor that will not boot, which has already happened once in this repo.
+//
+// So this fixture exists purely to give karst.ush an entry point, so it can be
+// compiled against BOTH ADR-0001 targets -- DXIL and SPIR-V -- on its own, with
+// nothing else built. It computes a real column and a real carve so the compiler
+// cannot dead-strip the arithmetic being checked; the output is written to a
+// buffer for the same reason.
+//
+// It is NOT a parity harness. Proving the CPU and GPU agree bit-for-bit needs
+// both sides running over the same inputs, which is `vxc_gpu`'s job once the
+// carve is wired in. This is the cheaper check that has to pass first.
+
+#include "karst.ush"
+
+StructuredBuffer<GpuKarstNode> KarstNodes : register(t0);
+StructuredBuffer<GpuKarstEdge> KarstEdges : register(t1);
+RWStructuredBuffer<uint> Out : register(u0);
+
+cbuffer Params : register(b0) {
+    int EdgeCount;
+    int VoxelSizeMm;
+    int SurfaceMm;
+    int BedrockDepthMm;
+};
+
+[numthreads(8, 8, 1)]
+void KarstMirrorMain(uint3 tid : SV_DispatchThreadID) {
+    const int64_t vx = (int64_t)tid.x;
+    const int64_t vy = (int64_t)tid.y;
+
+    const GpuKarstColumn col =
+        karstColumnFor(KarstNodes, KarstEdges, EdgeCount, vx, vy, VoxelSizeMm);
+
+    // Walk a short span so both the band early-out and the segment loop are
+    // exercised, and fold the result into a value the compiler must keep.
+    uint air = 0;
+    for (int k = 0; k < 32; ++k) {
+        const int64_t vz = (int64_t)(3000 + k);
+        if (karstCarveAt(col, SurfaceMm, BedrockDepthMm, vz, VoxelSizeMm)) {
+            air |= (1u << (uint)k);
+        }
+    }
+
+    const uint idx = tid.y * 8u + tid.x;
+    Out[idx] = air ^ (uint)col.count ^ ((uint)col.overflow << 8);
+}

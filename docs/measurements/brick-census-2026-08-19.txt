@@ -1,0 +1,161 @@
+BRICK / VRAM CENSUS -- vxc_volumeprobe, real terrain
+====================================================
+Date   2026-08-19
+Site   -61440,-61440 m (fine tiles -4_-4 / -4_-5 / -5_-4 / -5_-5), seed 20260719,
+       worldgen v28, real fine tiles + real coarse climate + 438 asset species
+       composed at every level. Full six-ring cascade to 4 km, NO sampling.
+Probe  voxel-core/bench/volumeprobe.cpp (new)
+
+WHY IT EXISTS: three independent estimates of the 10 cm / 4 km resident brick
+set disagreed by 4x (150 / 300 / 657 MB). The disagreement was entirely in the
+mixed-brick fraction and the palette size. Both are now measured.
+
+1. MIXED-BRICK FRACTION -- AND THE 4x SPREAD WAS A DEFINITION PROBLEM
+   Two legitimate readings, and a census that reports one without naming which
+   RECREATES the spread:
+
+   reading                                slots      all-air  all-solid  MIXED
+   volume (12.8 m of ground below shell)  3,025,821    2.6%     67.1%    30.3%
+   surface shell (what the mesher meshes)   806,884    9.2%      0.7%    90.1%
+
+   The 20-30% assumption is a VOLUME assumption and lands at the top of its
+   band. The meshed set is 90% mixed but 3.8x fewer bricks. The probe prints
+   which reading it used; --depth-m is an explicit input, not a hidden default.
+
+2. PALETTE HISTOGRAM (over 916,901 mixed bricks) -- settles bits-per-voxel
+   1 mat 0% | 2 mats 15.0% | 3-4 mats 62.7% | 5-8 mats 22.3% | 9-16 0% | 17+ 0%
+   mean 3.73, MAX OBSERVED 8.
+
+   NOTHING IN THE 4 km CASCADE NEEDS MORE THAN 4 bpp, and 78% needs <= 2.
+   Adaptive: 2.01 bpp (R0) -> 2.63 bpp (R5). The 4 bpp estimate was pessimistic;
+   flat 2 bpp was slightly optimistic. The 5-8 bucket is ENTIRELY assets
+   (bark/heartwood/leaf); terrain-only bricks max out at 4.
+
+3. VRAM, 10 cm, 4 km: 404 MiB adaptive  (2 bpp flat 388, 4 bpp 500)
+     cells 128.5 | flat index 193.3 | occupancy 56.0 | descriptors 23.1 | palette 3.3
+
+4. BRICK vs QUAD OFF ONE WALK -- AND THIS CORRECTS THE PLAN'S HEADLINE
+   Same walk, same ground: 61,378,824 quads = 702 MiB against bricks 404 MiB.
+
+     THE HONEST SAVING IS 1.74x, NOT 3-14x.
+
+   The 2,197 MB shipped pool is ~3x the cascade's own quad content, so most of
+   the "refund" the plan claimed was POOL SATURATION AND SLACK, not the
+   representation change. Both comparisons should be printed; 1.74x is the one
+   to quote for the format, and the pool-vs-pool figure is a separate (real)
+   argument about the allocator.
+
+5. SCALING EXPONENT: 2.193, not the 2.0 the plan assumed
+   100->50 mm x4.64, 50->25 mm x4.51. The 5 cm row is ~16% worse per halving
+   than assumed, ~34% compounded to 2.5 cm.
+
+   config                        measured (adaptive)   plan estimate
+   10 cm, 4 km                        404 MiB          150-660 MB    ok
+   5 cm in R0 only                  1,110 MiB          280 MB-1.4 GB ok (high end)
+   2.5 cm, <=64 m inner ring          977 MiB          630 MB-2.2 GB ok
+   5 cm across 4 km                 2,485 MiB          --
+   2.5 cm across 4 km                16.5 GiB          13.8 GB+      STRIKE CONFIRMED
+
+THREE FINDINGS THE PLAN DID NOT HAVE
+ a) tryCollapse is worth ~250 MiB of the 404 -- 62% of the total. 67.1% of
+    slots collapse to an 8 B descriptor. "Load-bearing" is now a number.
+ b) THE FLAT INDEX IS ALREADY 48% OF THE 10 cm TOTAL (193 of 404 MiB), and at
+    2.5 cm it is 12,080 MiB -- 30x an entire 10 cm world. The plan defers the
+    sparse-hash/octree decision to 2.5 cm. It is worth taking at 10 cm.
+ c) 5 cm IS A WORLDGEN CHANGE, NOT A LATTICE CHANGE. Amplifier::column is
+    addressed in integer LEVEL-0 voxels -- there is no sub-100 mm horizontal
+    query -- so a sub-lattice is exact in z and SATURATED in xy. Halving the
+    voxel size does not by itself buy horizontal detail. This is the terrain-side
+    twin of the asset-side note that detail assets carry their own 5 cm pitch.
+
+CORRECTNESS, EXERCISED NOT ASSERTED
+  - zero-brick ring -> exit 3, loud, ring named (tested)
+  - synthetic ground/climate -> exit 4 unless --allow-synthetic (tested both ways).
+    This was a REAL DEFECT found by the coordinator running the probe blind: it
+    would happily have printed a synthetic census. Synthetic vs real at the same
+    16 m disc: 19.9% mixed / palette 2.82 SYNTHETIC vs 14.9% / 3.23 REAL.
+  - every row prints its own n and extrapolation factor. 2% stratified sample of
+    the 100 mm cascade gave 30.2% / 392.5 MiB against the full walk's 30.3% /
+    404.1 MiB -- 2.9% error, which bounds the 50/25 mm rows.
+  - repeat run byte-identical; binary confirmed newer than include/ and src/.
+  - engine binding: coarseColumns + coarseRep + Amplifier::materialAt, assets
+    resolved per-chunk with shortlists exactly as FCoarseChunkGridSampler does --
+    NOT mips.h (majority vote is a different rule with different goldens; the
+    renderer runs the coarse one).
+
+FREE BY-PRODUCT FOR G1 (the march's step-count denominators)
+  bricks per brick-column   19.0 (R0) -> 2.0 (R5)
+  flat-index occupancy       9.2% (R0) -> 3.8% (R5), i.e. 91-96% SKIPPABLE
+
+================================================================
+CORRECTION 2026-08-19 (later): THE 404 MiB USED A VARIABLE PALETTE
+================================================================
+The census's `palette 3.3 MiB` line implies ~3.77 B per mixed brick, i.e. it was
+computed with a VARIABLE-SIZE palette (ceil(paletteCount/4) dwords).
+
+The format contract specifies a FIXED 16 B local palette, and both Phase 1
+implementations adopted it after the contradiction was found -- four bits index
+it exactly, it is one 16 B load at a known offset, and it keeps arithmetic out
+of the marcher's inner loop.
+
+  fixed palette cost   916,901 mixed bricks x 16 B = 14.0 MiB
+  census counted                                      3.3 MiB
+  difference                                        +10.7 MiB
+
+  => THE 10 cm / 4 km CASCADE IS ~415 MiB, NOT 404 MiB (+2.6%).
+
+  Inside P2's +/-20% gate with room, and it does not move any conclusion: bricks
+  are still ~1.7x denser than the 702 MiB of quads off the same walk. But the
+  404 figure is quoted in the plan and in a memory, so it is corrected here
+  rather than left to be re-derived.
+
+  The alternative -- adopt the variable palette and keep 404 -- was considered
+  and rejected: it saves 10.7 MiB of a ~415 MiB budget and costs a shift and a
+  mask on every brick entry in the hottest loop in the renderer.
+
+================================================================
+P2 DERIVATION (2026-08-19, later still): WHAT THE IMPLEMENTED POOL
+ACTUALLY ALLOCATES -- AND WHY IT IS ~223 MiB, NOT ~415
+================================================================
+FVoxelBrickPool (P1-C / P2) took finding (b) above: it does NOT allocate a
+dense flat brick index. Chunks are addressed through a 32 B FVoxelMarchChunk
+record per RESIDENT chunk plus BrickBase, not through one uint32 per slot of a
+dense 3D array over each ring's footprint and z envelope.
+
+So the census's five lines do not all apply to it, and the ~415 MiB headline is
+the wrong number to hold this implementation to:
+
+  cells (adaptive)                       128.5 MiB   allocated (material arena)
+  palette, fixed 16 B                     14.0 MiB   allocated (material arena)
+  occupancy                               56.0 MiB   allocated (occupancy arena)
+  descriptors                             23.1 MiB   allocated (descriptor arena)
+  chunk records  3,025,821 / 64 x 32 B     1.4 MiB   allocated (chunk table)
+  ---------------------------------------------------
+  PREDICTED RESIDENT SET                 223.0 MiB
+
+  flat index                             193.3 MiB   NOT ALLOCATED
+  ---------------------------------------------------
+  census headline                        415.0 MiB (with the fixed-palette
+                                                    correction above)
+
+Two consequences, both of which have to be carried to whoever reads a settle
+measurement:
+
+ 1. P2's gate is "real VRAM at settle within +/-20% of the census". Measured
+    against 415 MiB this design is 46% LOW and would fail the gate for being
+    CHEAPER than a structure it does not build. The figure to hold it to is
+    223.0 MiB +/- 20%, i.e. 178-268 MiB of USED bytes (FVoxelBrickPool::
+    GetResidentBytes, printed by voxel.Brick.Stats).
+
+ 2. A VRAM tool sees the CAPACITY, not the used prefix: the arenas are committed
+    once at Init and never grow. At the shipped cvar defaults that is 314 MiB
+    (desc 32, occ 80, mat 200, table 2) -- ~1.4x the predicted resident set,
+    which is the churn headroom. voxel.Brick.PoolOccMiB / PoolMatMiB /
+    PoolChunks move it.
+
+The sparse-vs-dense choice is not free and the trade is stated rather than
+implied: a dense index answers "which brick is at this coordinate" with one
+load, and the chunk table answers it with a lookup the marcher has to carry.
+At 10 cm the index costs 193.3 MiB against 1.4 MiB of records -- 138x -- and at
+2.5 cm it is 12,080 MiB against ~90 MiB. Finding (b) said the decision was worth
+taking at 10 cm; P2 took it.

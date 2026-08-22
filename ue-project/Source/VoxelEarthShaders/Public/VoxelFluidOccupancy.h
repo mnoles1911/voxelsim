@@ -525,6 +525,35 @@ public:
 	// parameter struct so this header does not need to know any consumer's
 	// type -- every consumer has the same three field names because they came
 	// from the macro above.
+	// THE NULL BINDING, AND WHY THE DIM IS 1 AND NOT 0.
+	//
+	// The ray marcher carries VOXEL_FLUID_OCCUPANCY_PARAMETERS() on BOTH of its
+	// sources -- one parameter struct serves both, deliberately
+	// (VoxelMarchRenderer.cpp:2338-2342) -- and an unbound SRV there is "an RDG
+	// assert, not a black frame". Under source 1 (the brick pool) the occupancy
+	// volume is never traversed at all, so requiring one to EXIST is what
+	// coupled terrain rendering to the water simulation running.
+	//
+	// DIM 1, NOT 0. Every reader takes FluidVolumeDimVoxels - 1 as a wrap mask
+	// (VoxelFluidCollision.ush:207, VoxelFluidOccupancy.usf:156) and both carry
+	// a lint suppression whose premise is that the dim "is never 0, so Dim-1 is
+	// the wrap mask 511 and cannot underflow". Binding 0 here would make that
+	// mask 0xFFFFFFFF -- precisely the underflow those notes say is impossible.
+	// 1 keeps the positive-power-of-two invariant, and every index those
+	// functions can then form is 0, which the one-dword buffer below covers.
+	//
+	// This mirrors what GVoxelGIVolume already does when GI is off: it points at
+	// GBlackVolumeTexture with Enabled = 0 rather than leaving the binding null
+	// (VoxelGIVolume.h:218-221).
+	template <typename ParametersType>
+	static void BindNullShaderParameters(FRDGBuilder& GraphBuilder, ParametersType& Parameters)
+	{
+		Parameters.FluidOccupancyBits = CreateNullBitsSRV(GraphBuilder);
+		Parameters.FluidVolumeOriginVoxel = FIntVector::ZeroValue;
+		Parameters.FluidVolumeDimVoxels = 1u;
+		Parameters.FluidVolumeWrapOffsetVoxel = FUintVector(0u, 0u, 0u);
+	}
+
 	template <typename ParametersType>
 	void BindShaderParameters(FRDGBuilder& GraphBuilder, ParametersType& Parameters)
 	{
@@ -540,6 +569,11 @@ private:
 	// declaration of FRDGPooledBuffer -- same argument as
 	// FVoxelGpuQuadPayload's destructor (VoxelGpuQuadPayload.h:60-72).
 	FRDGBufferSRVRef CreateBitsSRV(FRDGBuilder& GraphBuilder);
+
+	// The one-dword zeroed stand-in BindNullShaderParameters hands out. Out of
+	// line for the same reason CreateBitsSRV is: it needs SystemTextures.h and
+	// this header should not.
+	static FRDGBufferSRVRef CreateNullBitsSRV(FRDGBuilder& GraphBuilder);
 
 	TRefCountPtr<FRDGPooledBuffer> PooledBits;
 

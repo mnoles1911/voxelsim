@@ -86,23 +86,29 @@ namespace
 	// (water_wave_graph.py, U^0.68), so a wind that moves every frame slides
 	// every crest every frame, and the eye reads that as the scene running fast.
 	//
-	// 45 -> 8 s on 2026-08-14, and the direction of that change is the opposite
-	// of what three rounds of guessing suggested. A LONGER constant is WORSE, not
-	// better: it converts every wind change into a longer smooth drift, and a
-	// coherent drift slides every crest (wind speed sets wavelength) far more
-	// visibly than the gust twitch it was suppressing. The owner reported the
-	// water as "way way too fast" at 0 AND at 45, and had to reach 5000 -- an
-	// effectively frozen wind -- before it looked right, which in hindsight is
-	// the measurement saying "any drift at all is the problem".
+	// 45 -> 8 -> 600 s, and the round trip is worth recording because the middle
+	// step was a wrong inference from a real measurement.
 	//
-	// 8 s still removes the gust band (now 90 s, so it was never the issue) and
-	// settles fast enough that a change is over rather than ongoing. The wind
-	// field itself was slowed 8-15x in the same session, so there is very little
-	// left for this to smooth.
+	// The measurement: with a pinned wind the PUBLISHED vector kept sweeping for
+	// ~135 s while the sample sat still. I read that as "the filter causes drift,
+	// so shorten it". It was really "a STEP INPUT through a long filter is a long
+	// ramp" -- and the only thing producing step inputs is a pin, which is a
+	// deliberate instruction and now bypasses the filter entirely. With a
+	// naturally varying wind a long constant does the opposite: it tracks slowly
+	// and changes little, which is the entire point.
+	//
+	// The evidence for LONG rather than short is the owner's: with
+	// voxel.Weather.Enabled 0 the wind is FROZEN and he judged the water good;
+	// every arm where the direction was free to move he rejected. Rotating the
+	// wave field sweeps every crest sideways, so wave DIRECTION has to be far
+	// more stable than the wind is. 600 s against a field whose fastest
+	// direction band is now 90 s means the water sees a wind that is very nearly
+	// constant over a play session -- "wave direction may only change several
+	// times per day", which is the standard he set.
 	//
 	// 0 disables smoothing entirely. Pins bypass it regardless -- see Tick.
 	TAutoConsoleVariable<float> CVarWeatherWaveResponseSeconds(
-		TEXT("voxel.Weather.WaveResponseSeconds"), 8.0f,
+		TEXT("voxel.Weather.WaveResponseSeconds"), 600.0f,
 		TEXT("Time constant, in seconds, of the low-pass between the wind field and the wind that ")
 		TEXT("reaches water materials. Waves have inertia: a real sea takes minutes to build to a new ")
 		TEXT("wind, and driving wave height AND wavelength from a 6-second gust band makes the whole ")
@@ -914,7 +920,13 @@ void UVoxelWeatherSubsystem::Tick(float DeltaTime)
 	// rather than better.
 	//
 	// A pin is a deliberate step, not weather. It has no inertia to model.
-	const bool bPinned = VoxelWeather::IsBearingPinned() && VoxelWeather::IsSpeedPinned();
+	// EITHER pin, not both. Requiring both was a bug of exactly the kind this
+	// session keeps producing: the owner set voxel.Weather.PinMps 5 without
+	// PinFromDeg, the bypass never fired, and the "still too fast" report was
+	// measuring the unfixed path. A pin is an instruction to HOLD SOMETHING
+	// STILL; honouring half of one and silently smoothing anyway is the worst of
+	// both.
+	const bool bPinned = VoxelWeather::IsBearingPinned() || VoxelWeather::IsSpeedPinned();
 	if (bPinned)
 	{
 		Impl->SmoothedNorthMS = SmoothN;

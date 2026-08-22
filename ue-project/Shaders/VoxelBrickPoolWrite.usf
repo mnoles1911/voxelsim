@@ -1,0 +1,338 @@
+// The GPU-side moves that make a packed chunk RESIDENT in the brick pool
+// (docs/ray-marching-plan-2026-08-19.md P1-C / P2).
+//
+// WHAT THIS FILE IS, IN ONE LINE. brickpack.ush produces a chunk's bricks into
+// scratch buffers with CHUNK-RELATIVE offsets; these five kernels move those
+// bytes into the pool's three arenas, add the pool base to the offsets that
+// name them, and write the one 32 B chunk record that describes the result.
+//
+// WHY THE PRODUCER DOES NOT WRITE STRAIGHT INTO THE POOL. It could -- the three
+// write bases exist for exactly that -- but the pool allocation cannot be made
+// until the totals are known, and the totals are a property of the classify
+// pass's scan, which has already run by then. So the chain is
+//
+//     BrickClassify -> Scan x2 -> BrickPack   (scratch, all bases ZERO)
+//     BrickTotalMain                          (8 bytes to the CPU)
+//     ... CPU allocates from FVoxelBrickPool ...
+//     BrickWordCopy x2 + BrickDescPoolWrite + BrickChunkRecord  (into the pool)
+//
+// which is the D1 quad path's shape (VoxelQuadPoolWrite.usf), one arena wider.
+// Keeping the producer's bases at zero has a second payoff that is worth more
+// than the pass it costs: the scratch buffers ARE the chunk-relative form
+// docs/brick-volume-format.md defines, so voxel.GPU.VerifyBrickPack can compare
+// them against vxc::packChunkBricksCanonical with no rebasing at all, and
+// compare the POOL copy with a rebase it derives from the allocation it was
+// handed. Two comparisons, one of which cannot be wrong about the base.
+//
+// THE TRAP THIS FILE EXISTS TO CONTAIN. A non-zero base lands IN the
+// descriptor's offset field (format section 6b). Every consumer of a descriptor
+// therefore has to agree on whether it is holding a chunk offset or a pool
+// address, and the two are indistinguishable by inspection. The rule here is:
+//   * the SCRATCH buffers are chunk-relative, always;
+//   * the POOL buffers are pool-absolute, always;
+//   * BrickDescPoolWriteMain is the ONLY place the two meet, and it is the
+//     only kernel in the project that adds a base to an offset field.
+//
+// UNIFORM BRICKS ARE NOT REBASED, and that is not an optimisation. A uniform
+// brick allocates nothing, so its offset fields are ZERO by contract (format
+// section 2, and packChunkBricksCanonical writes eight zero bytes for uniform
+// AIR). Adding a base to them would invent an address into another brick's
+// payload -- and it would still LOOK right, because the kind field would still
+// say "no payload here".
+
+#include "/Engine/Public/Platform.ush"
+
+// --- resources ---------------------------------------------------------------
+//
+// Loose globals, Unreal's $Globals convention, bound by reflected name from the
+// FParameters structs in VoxelGpuWorldGen.cpp. Each kernel uses a subset; a
+// resource an entry point does not touch is simply not in its reflection and
+// its parameter struct does not declare it.
+
+// Generic dword arena copy (occupancy and materials both).
+StructuredBuffer<uint>   InWords;
+RWStructuredBuffer<uint> OutWords;
+
+// Descriptors: 8 B per brick slot, format section 2.
+StructuredBuffer<uint2>   InBrickDesc;
+RWStructuredBuffer<uint2> OutBrickDesc;
+
+// The chunk's occupancy, CHUNK-RELATIVE (scratch). Read only by the chunk-record
+// kernel, and only to decide allSolid -- see the note there.
+StructuredBuffer<uint> InBrickOcc;
+
+// The 64-bit L1 mask brickpack.ush accumulated with InterlockedOr: 2 dwords per
+// chunk, "which of my 64 bricks are non-empty".
+StructuredBuffer<uint> InChunkBrickMask;
+
+// FVoxelMarchChunk records, 8 dwords each. Format section 6.
+RWStructuredBuffer<uint> OutChunkTable;
+
+// The two scanned count/offset arrays, for the totals kernel.
+StructuredBuffer<uint> InOccCounts;
+StructuredBuffer<uint> InOccOffsets;
+StructuredBuffer<uint> InMatCounts;
+StructuredBuffer<uint> InMatOffsets;
+RWStructuredBuffer<uint> OutBrickTotals;
+
+// --- parameters --------------------------------------------------------------
+uint NumWords;      // dwords BrickWordCopyMain moves
+uint SrcFirst;      // first source element (0 on every path today; threaded
+                    // through rather than assumed, for VoxelQuadPoolWrite.usf's
+                    // reason -- the failure mode of assuming it is a copy that
+                    // starts somewhere plausible and wrong)
+uint DstFirst;      // first destination element in the pool arena
+uint BrickCount;    // descriptors this chunk owns; 64 by contract, passed so the
+                    // kernel does not hard-code a constant the host could change
+uint OccBase;       // pool dword base of this chunk's occupancy allocation
+uint MatBase;       // pool dword base of this chunk's material allocation
+uint ChunkSlot;     // this chunk's record index in OutChunkTable (DESTINATION)
+uint SrcChunkIndex; // this chunk's index within the SOURCE dispatch, which is
+                    // what indexes the scratch L1 mask. Separate from ChunkSlot
+                    // because the two are unrelated numbers that are equal in
+                    // the one-chunk case -- exactly the coincidence that makes a
+                    // conflated pair pass every test until a batched region
+                    // exists
+uint BrickBase;     // this chunk's first descriptor slot in the pool
+uint RingLevel;     // 0..5; goes in LevelAndFlags [0:3]
+uint ChunkClimatePacked;     // record dword 7, packed by FVoxelBrickChunkShading
+uint ChunkSurfaceGradPacked; // record dword 8   ::Pack on the C++ side -- this
+uint ChunkSurfaceZRelBits;   // record dword 9   kernel does NO arithmetic on
+                    // them, so there is nothing here that can diverge from the
+                    // CPU writer.
+uint ChunkRecordDwords; // record stride, bound from FVoxelBrickPool::
+                    // kChunkRecordDwords. NEVER a literal in this file: the two
+                    // record kernels and the C++ writer must agree, and a
+                    // literal is how one of them gets left behind.
+int3 OriginVoxel;   // chunk min corner in LEVEL-L voxel coords
+uint ScanCount;     // number of scanned bricks, for the totals kernel
+
+// The descriptor's offset field is 28 bits (format section 2). The host is
+// required to keep every base plus its scanned offset under 2^28 dwords per
+// arena -- FVoxelBrickPool::Init refuses a larger capacity outright -- so the
+// mask below can never actually truncate. It is applied anyway because a
+// truncation that reaches the GPU produces a wrong world rather than an error,
+// and the one thing worse than a bound is a bound nobody restated.
+static const uint kBrickOffsetMask = 0x0fffffffu;
+static const uint kBrickFieldMask  = 0xf0000000u;
+static const uint kBrickKindMixed  = 2u;
+static const uint kBrickOccWords   = 16u;
+
+// ---------------------------------------------------------------------------
+// BrickTotalMain -- the 8 bytes the CPU needs, and the only readback on this
+// path.
+//
+// Exactly QuadTotalMain's derivation (VoxelQuadScan.usf), twice: the scan is
+// EXCLUSIVE, so the last brick's start offset plus its own count is the total.
+// Deliberately the same arithmetic rather than a second one, so the two can be
+// cross-checked and so a scan whose semantics ever changed would break both
+// visibly instead of one silently.
+// ---------------------------------------------------------------------------
+[numthreads(1, 1, 1)]
+void BrickTotalMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x != 0)
+	{
+		return;
+	}
+	// ScanCount 0 would underflow to 0xFFFFFFFF and index wildly out of bounds.
+	// The host cannot currently produce it (a region is validated to hold at
+	// least one whole chunk), so this is the same unreachable-defence guard
+	// QuadTotalMain carries, for the same reason.
+	if (ScanCount == 0u)
+	{
+		OutBrickTotals[0] = 0u;
+		OutBrickTotals[1] = 0u;
+		return;
+	}
+	const uint Last = ScanCount - 1u;
+	OutBrickTotals[0] = InOccOffsets[Last] + InOccCounts[Last];
+	OutBrickTotals[1] = InMatOffsets[Last] + InMatCounts[Last];
+}
+
+// ---------------------------------------------------------------------------
+// BrickWordCopyMain -- one arena, one chunk's run of dwords.
+//
+// A compute pass rather than AddCopyBufferPass for VoxelQuadPoolWrite.usf's
+// second reason, which applies verbatim here: two small RDG-pooled buffers can
+// be suballocated from ONE D3D12 resource, and FD3D12CommandContext::
+// RHICopyBufferRegion asserts source != destination. A copy that trips a
+// checked-build assert depending on nothing but pool state is not a copy worth
+// saving a dispatch for.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickWordCopyMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= NumWords)
+	{
+		return;
+	}
+	OutWords[DstFirst + i] = InWords[SrcFirst + i];
+}
+
+// ---------------------------------------------------------------------------
+// BrickDescPoolWriteMain -- the descriptors, WITH the pool base folded into the
+// offset fields. The only kernel that does this; see the file header.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickDescPoolWriteMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= BrickCount)
+	{
+		return;
+	}
+
+	uint2 D = InBrickDesc[SrcFirst + i];
+
+	// MIXED only. A uniform brick's offset fields are zero by contract and must
+	// stay zero -- see the file header for why rebasing them is worse than
+	// useless.
+	const uint Kind = (D.x >> 28u) & 3u;
+	if (Kind == kBrickKindMixed)
+	{
+		const uint OccOffset = ((D.x & kBrickOffsetMask) + OccBase) & kBrickOffsetMask;
+		const uint MatOffset = ((D.y & kBrickOffsetMask) + MatBase) & kBrickOffsetMask;
+		D.x = OccOffset | (D.x & kBrickFieldMask);
+		D.y = MatOffset | (D.y & kBrickFieldMask);
+	}
+
+	OutBrickDesc[DstFirst + i] = D;
+}
+
+// ---------------------------------------------------------------------------
+// BrickChunkRecordMain -- the 32 B FVoxelMarchChunk (format section 6).
+//
+// ONE WORKGROUP, ONE CHUNK, 64 THREADS -- one per brick, because of allSolid.
+//
+// allSolid IS NOT DERIVABLE FROM THE DESCRIPTORS AND IT LOOKS AS THOUGH IT IS.
+// A brick can be fully solid and still MIXED: 512 solid cells holding two
+// materials does not collapse. So "all 64 descriptors are uniform SOLID" is
+// strictly stronger than allSolid and under-reports it, which would tell a
+// marcher a solid chunk needs entering. This kernel computes it from the CELL
+// DATA, as format section 6 requires and as vxc::packChunkBricksCanonical does:
+// a MIXED brick is fully solid iff all 16 of its occupancy dwords are
+// 0xFFFFFFFF, and the AND of 16 dwords is 16 loads of memory that is already
+// hot -- this pass runs immediately after the copy that wrote it.
+//
+// It reads the SCRATCH buffers, not the pool: their offsets are chunk-relative,
+// so this kernel needs no base and cannot be wrong about one.
+//
+// anySolid is free and comes from the L1 mask: a chunk with no non-empty brick
+// has a zero mask by construction.
+// ---------------------------------------------------------------------------
+groupshared uint gsAllSolid;
+
+[numthreads(64, 1, 1)]
+void BrickChunkRecordMain(uint3 gtid : SV_GroupThreadID)
+{
+	if (gtid.x == 0u)
+	{
+		gsAllSolid = 1u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x < BrickCount)
+	{
+		const uint2 D = InBrickDesc[SrcFirst + gtid.x];
+		const uint Kind = (D.x >> 28u) & 3u;
+
+		bool bBrickAllSolid = false;
+		if (Kind == 1u)
+		{
+			// Uniform SOLID: 512 non-air cells, no payload to consult.
+			bBrickAllSolid = true;
+		}
+		else if (Kind == kBrickKindMixed)
+		{
+			const uint OccWord = D.x & kBrickOffsetMask;
+			uint Acc = 0xffffffffu;
+			for (uint k = 0u; k < kBrickOccWords; ++k)
+			{
+				Acc &= InBrickOcc[OccWord + k];
+			}
+			bBrickAllSolid = (Acc == 0xffffffffu);
+		}
+		// Kind 0 is uniform AIR and leaves bBrickAllSolid false, which is what
+		// makes an all-air chunk report allSolid = 0 rather than vacuously 1.
+
+		if (!bBrickAllSolid)
+		{
+			InterlockedAnd(gsAllSolid, 0u);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x != 0u)
+	{
+		return;
+	}
+
+	const uint MaskLo = InChunkBrickMask[2u * SrcChunkIndex + 0u];
+	const uint MaskHi = InChunkBrickMask[2u * SrcChunkIndex + 1u];
+	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+	const uint AllSolid = (gsAllSolid != 0u) ? 1u : 0u;
+
+	// LevelAndFlags: [0:3] ring level, [4] anySolid, [5] allSolid.
+	//
+	// THE RING LEVEL IS THE FIELD THAT MAKES THIS A ONE-LINE REQUIREMENT NOW AND
+	// A REWRITE LATER (format section 6). GI cone marching in Phase 7 steps
+	// ACROSS rings, because rings already are 2x steps, and it can only do that
+	// if the level is resident next to the chunk rather than implied by which
+	// table the chunk was found in.
+	const uint LevelAndFlags = (RingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);
+
+	// STRIDE COMES FROM THE HOST, NOT FROM A LITERAL. ChunkRecordDwords is bound
+	// from FVoxelBrickPool::kChunkRecordDwords, so this kernel and the C++
+	// writer cannot disagree about the record length. A literal here was one of
+	// the two ways the format could grow with a writer silently left behind, and
+	// that failure is not subtle: records land at half stride, overwrite each
+	// other, and the reader's origin validation rejects them -- GPU-forked
+	// terrain vanishes while CPU-worker terrain does not.
+	const uint Base = ChunkSlot * ChunkRecordDwords;
+	OutChunkTable[Base + 0u] = asuint(OriginVoxel.x);
+	OutChunkTable[Base + 1u] = asuint(OriginVoxel.y);
+	OutChunkTable[Base + 2u] = asuint(OriginVoxel.z);
+	OutChunkTable[Base + 3u] = LevelAndFlags;
+	OutChunkTable[Base + 4u] = BrickBase;
+	OutChunkTable[Base + 5u] = MaskLo;
+	OutChunkTable[Base + 6u] = MaskHi;
+	// Step 2: the shading terms, handed down ALREADY PACKED. See the parameter
+	// block -- this kernel deliberately does no bit work on them.
+	OutChunkTable[Base + 7u] = ChunkClimatePacked;
+	OutChunkTable[Base + 8u] = ChunkSurfaceGradPacked;
+	OutChunkTable[Base + 9u] = ChunkSurfaceZRelBits;
+	for (uint D = 10u; D < ChunkRecordDwords; ++D)
+	{
+		OutChunkTable[Base + D] = 0u;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BrickChunkClearMain -- retires one record.
+//
+// Writes eight zero dwords, which is a record whose LevelAndFlags has anySolid
+// clear. A marcher reads that as "nothing here", so a freed slot is inert the
+// instant this lands rather than pointing at an arena range that has been handed
+// to somebody else. Ordering is the caller's: FVoxelBrickPool records the clear
+// in the SAME graph as, and BEFORE, any write that reuses the freed range.
+// ---------------------------------------------------------------------------
+// 64 IS A GROUP SIZE, NOT THE RECORD LENGTH, and the distinction is the whole
+// point. This used to be [numthreads(8)] with an `if (tid.x >= 8u)` guard, where
+// 8 silently meant BOTH. Grow the record and that kernel clears the first half
+// of every retired slot and leaves the rest -- so a slot freed and re-allocated
+// carries the PREVIOUS TENANT'S fields, with no error anywhere. Once the record
+// holds per-chunk shading, the symptom is tint that follows slot reuse.
+//
+// The group is now larger than any plausible record and the bound comes from the
+// host, so the two numbers can never be confused again.
+[numthreads(64, 1, 1)]
+void BrickChunkClearMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= ChunkRecordDwords)
+	{
+		return;
+	}
+	OutChunkTable[ChunkSlot * ChunkRecordDwords + tid.x] = 0u;
+}

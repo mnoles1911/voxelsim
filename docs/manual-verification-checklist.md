@@ -540,7 +540,7 @@ Turn ONE off, relaunch, look again:
 | terrain wrong COLOUR / tint / missing chunks on screen | `voxel.Stream.GPU 0` | the renderer, not the geometry |
 | lighting bands, rings, dark or blown-out surfaces | `voxel.GI.Enabled 0` | GI |
 | water invisible, wrong waterline, z-fighting | `voxel.Water.GPU 0` | the water pool |
-| stutter / hitching | `voxel.GI.Enabled 0` **first** | GI is the known x3.2 hitch source |
+| stutter / hitching | `voxel.GI.Enabled 0` **first** | **NO LONGER A GI-FIRST SYMPTOM — corrected 2026-08-20.** The ×3.2 was measured on a configuration nobody ships and is RETIRED (GI on 34.79 / off 34.71 / solve-disabled 34.90 ms p50). Also note `hitchThresholdMs` is a fixed 33.3 while the shadowed p50 is ~34.7, so the *median* frame now counts as a hitch and ~65% of frames "hitch" purely from running at 28.8 fps — judge p95 and `postWarmupMaxFrameMs`, not the hitch count |
 
 The mesher and the renderer are **independent**: the mesher decides what the quads
 ARE, the renderer decides how they are drawn. Wrong shape is the mesher; wrong
