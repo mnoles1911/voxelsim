@@ -1469,7 +1469,27 @@ struct FJobResult
 	VoxelCoords::FVoxelLevelChunkKey Key;
 	uint64 GenerationId = 0;
 	TArray<FVoxelChunkQuad> Quads;
-	float JobMs = 0.f; // wall time inside the worker task body (docs/debug-tooling-plan.md P1 "Worker timings")
+	// CPU worker arm ONLY: wall time inside the worker task body, pickup to
+	// enqueue (docs/debug-tooling-plan.md P1 "Worker timings"). This is SERVICE
+	// TIME -- how long the job took once a worker picked it up -- and does NOT
+	// include the wait between task launch and worker pickup. Stays 0 on a
+	// GPU-fork result; the fork's number lives in GpuSubmitToDeliverMs below.
+	//
+	// It used to be both: OnGpuMeshJobComplete wrote SubmitToDeliverMs -- an
+	// END-TO-END LATENCY including the manager's queue wait -- into this same
+	// field so the shared windows had something to record. Averaging a
+	// milliseconds-scale cost with a seconds-scale latency is why the HUD's
+	// "Worker ms" row read in seconds and could not be attributed to either
+	// path. The two are different quantities; each now has its own field and
+	// its own window, and nothing may pool or sum them.
+	float JobMs = 0.f;
+	// GPU fork arm ONLY: submit->deliver END-TO-END LATENCY in ms, straight
+	// from FVoxelGpuMeshJobResult::SubmitToDeliverMs -- manager queue wait plus
+	// dispatch plus readback plus poll quantisation. Stays 0 on a CPU worker
+	// result. Discriminate with bFromGpuMesh (below), not by which field is
+	// non-zero -- a sub-half-millisecond value truncates the same way a "not
+	// set" does.
+	float GpuSubmitToDeliverMs = 0.f;
 
 	// --- Buried-chunk pre-dispatch skip, MEASUREMENT ONLY (-VoxelMeasureEmpty).
 	// docs/status.md "Buried-chunk pre-dispatch skip" step 1: before building
@@ -1590,10 +1610,12 @@ struct FJobResult
 	// S0-3: true when this result came from the GPU fork (OnGpuMeshJobComplete)
 	// rather than the CPU worker task body. The two arms' latency windows are
 	// kept separate (VoxelWorldSubsystem.cpp's GpuSubmitToDeliverMsWindow vs
-	// CpuWorkerEndToEndMsWindow etc.) because JobMs means something different
-	// on each arm -- the fork's SubmitToDeliverMs vs the worker's own task-body
-	// wall time -- and the pre-existing WorkerJobMsWindow already mixes both
-	// with no way to tell them apart after the fact.
+	// CpuWorkerEndToEndMsWindow etc.) because the two arms time different
+	// quantities -- the fork's SubmitToDeliverMs vs the worker's own task-body
+	// wall time. WorkerJobMsWindow used to mix both through the shared JobMs
+	// field with no way to tell them apart after the fact; JobMs and
+	// GpuSubmitToDeliverMs are now separate fields (see their comments above)
+	// and DrainResults routes on this flag, so that window is CPU-only.
 	bool bFromGpuMesh = false;
 };
 
@@ -3633,6 +3655,10 @@ struct FVoxelWorldImpl
 		{
 			LevelWorkerJobMsWindow[Level].Init(0.f, WorkerJobMsWindowSize);
 		}
+		// The GPU fork's half of the split HUD row (see the member's doc
+		// comment): same ring-buffer treatment, always on like
+		// WorkerJobMsWindow, never gated behind voxel.Stream.LatencyStats.
+		GpuJobLatencyMsWindow.Init(0.f, WorkerJobMsWindowSize);
 
 		// S0-3: same treatment, one window per (producer, stage). Sized
 		// unconditionally -- cheap (7 * 256 floats) -- even though nothing
@@ -4735,6 +4761,26 @@ struct FVoxelWorldImpl
 	int32 LevelWorkerJobMsWindowNext[VoxelCoords::kNumLevels] = {};
 	int32 LevelWorkerJobMsWindowCount[VoxelCoords::kNumLevels] = {};
 
+	// The GPU fork's half of the split "worker ms" HUD row: submit->deliver
+	// END-TO-END LATENCY of demand fork results, filled in DrainResults from
+	// FJobResult::GpuSubmitToDeliverMs at the same site (and under the same
+	// "count every drained result, even stale ones" rule) as WorkerJobMsWindow.
+	// Always on, like WorkerJobMsWindow and unlike the S0-3 stage windows
+	// below, because it feeds the HUD's always-visible perf panel.
+	//
+	// This exists because WorkerJobMsWindow used to receive BOTH producers
+	// through the shared JobMs field -- the worker's ms-scale service time
+	// averaged with the fork's latency (measured up to 7,395 ms on one
+	// delivery, see GpuMeshSlowDeliveriesSinceLog) -- which is why the HUD's
+	// single "Worker ms" row read in seconds and implicated neither path.
+	// Distinct from GpuSubmitToDeliverMsWindow (S0-3, below): that one is
+	// pushed in OnGpuMeshJobComplete before the speculative early-return, so
+	// it includes speculative jobs and only fills under
+	// voxel.Stream.LatencyStats; this one is demand results only.
+	TArray<float> GpuJobLatencyMsWindow;
+	int32 GpuJobLatencyMsWindowNext = 0;
+	int32 GpuJobLatencyMsWindowCount = 0;
+
 	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): per-producer,
 	// per-stage submit->apply latency, same fixed-size-ring-buffer idiom as
 	// WorkerJobMsWindow above (sized with WorkerJobMsWindowSize -- not a second
@@ -4769,8 +4815,13 @@ struct FVoxelWorldImpl
 	// queue/dispatch/ready stages the way the GPU fork does, so this mirrors
 	// FJobResult::JobMs (already stamped JobStartSeconds..enqueue in the task
 	// body; nothing new added there) rather than inventing a stage split that
-	// does not exist. Isolates the CPU-only population that WorkerJobMsWindow
-	// above mixes with the GPU arm's SubmitToDeliverMs.
+	// does not exist. Note the stamp starts at worker PICKUP, not task launch,
+	// so scheduler queue wait is outside it -- this is the same service-time
+	// quantity as JobMs because it IS JobMs. It originally existed to isolate
+	// the CPU-only population that WorkerJobMsWindow mixed with the GPU arm's
+	// SubmitToDeliverMs; that window is CPU-only now (DrainResults routes on
+	// bFromGpuMesh), so this is redundant with it, but it stays because the
+	// S0-3 log line reads it and it is gated differently (LatencyStats only).
 	TArray<float> CpuWorkerEndToEndMsWindow;
 	int32 CpuWorkerEndToEndMsWindowNext = 0;
 	int32 CpuWorkerEndToEndMsWindowCount = 0;
@@ -5330,6 +5381,24 @@ private:
 	// until it fits EntryCap, removing their chunk records too, and writes the
 	// re-admission cutoff distance. Returns true if anything was held back.
 	bool DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 EntryCap, double& OutCutoffDistSq);
+	// THE in-flight cap, computed in exactly one place. DispatchJobs ENFORCES
+	// this number (its `while (CpuJobsOutstanding() < ...)` loop condition) and
+	// UpdatePerfSnapshot PUBLISHES it (the HUD's "jobs N/cap" row) -- both must
+	// call this, neither may compute its own.
+	//
+	// They used to compute it independently, and drifted: when the multiplier
+	// became the voxel.Stream.JobsInFlightPerCore cvar (default 8), only the
+	// dispatcher was updated. The snapshot kept the original hardcoded
+	// 2 * cores, so the HUD showed a cap of 24 while the dispatcher was
+	// actually filling to 96. Read as "the cap is 24", that understated by 4x
+	// the oversubscription the jobGHz=0.04 measurement traces to
+	// (docs/marcher-handoff-2026-08-22.md section 2: 96 in-flight jobs against the
+	// task graph's ~12 real background threads -- the same ~12 the ring-floor
+	// catastrophe comment above kRingSlotFloorDefault records).
+	static int32 MaxJobsInFlightCap()
+	{
+		return VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
+	}
 	void DispatchJobs();
 	void DrainResults(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
 	void DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, UMaterialInterface* Material);
@@ -5945,8 +6014,12 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		bHasRecomputed = true;
 	}
 
-	// Budgets: jobs in flight <=2xLogicalCores (docs/m1-plan.md Stage 2
-	// decisions table); chunk component applies/unloads/edit-re-meshes are
+	// Budgets: jobs in flight <= MaxJobsInFlightCap(), i.e.
+	// voxel.Stream.JobsInFlightPerCore x logical cores -- originally
+	// 2xLogicalCores per docs/m1-plan.md's Stage 2 decisions table, raised to
+	// 8x on 2026-07-27 (see the cvar's comment); the stale "2x" wording here
+	// was the same drift that had the HUD publishing a cap of 24 against a
+	// real 96. Chunk component applies/unloads/edit-re-meshes are
 	// now voxel.Stream.Max{Applies,Unloads,Remeshes}PerFrame cvars (default
 	// 3/2/2, tightened from the original 8/4/4 -- see VoxelDebug.cpp's cvar
 	// comments for the docs/status.md "Perf-run hitches" measurement this
@@ -6941,10 +7014,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// shared cross-job cache's memory footprint. This is the log-only
 	// evidence for the "report worker p50/p95 per level" measurement (a
 	// -VoxelPerfRun run has no HUD to screenshot).
+	//
+	// "CPU worker" in the label because that is now literally the population:
+	// the per-level windows exclude GPU-fork results (see DrainResults), whose
+	// submit->deliver LATENCY used to be averaged into these cost rows through
+	// the shared JobMs field. The fork's latency gets its own clause on this
+	// same line -- a different quantity, so a different label, never summed.
 	const FVoxelPerfSnapshot& Snap = LastPerfSnapshot;
-	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel worker ms/level: %s | mipCache bricks=%lld bytes=%lld evictions=%lld"),
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel CPU worker ms/level: %s | gpuMesh submit->deliver ms p50=%.1f p95=%.1f max=%.1f | ")
+	       TEXT("mipCache bricks=%lld bytes=%lld evictions=%lld"),
 	       *JoinPerLevel([&](int32 L)
 	       { return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f"), L, Snap.LevelWorkerMsP50[L], Snap.LevelWorkerMsP95[L]); }),
+	       Snap.GpuLatencyMsP50, Snap.GpuLatencyMsP95, Snap.GpuLatencyMsMax,
 	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
 
 	// -VoxelL0GridVerify running total: level-0 chunks meshed BOTH ways and
@@ -11513,7 +11595,13 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 	VoxelStreaming::FJobResult Result;
 	Result.Key = Pending.Key;
 	Result.GenerationId = Pending.GenerationId;
-	Result.JobMs = float(GpuResult.SubmitToDeliverMs);
+	// Into its OWN field, not JobMs. This line used to write SubmitToDeliverMs
+	// -- an end-to-end latency including the manager's queue wait -- into
+	// JobMs, whose CPU-arm meaning is worker service time, and DrainResults
+	// then pooled both into one window. That is the blend that made the HUD's
+	// "Worker ms" row read in seconds while implicating neither path. JobMs
+	// stays 0 on this result; see FJobResult's field comments.
+	Result.GpuSubmitToDeliverMs = float(GpuResult.SubmitToDeliverMs);
 	Result.bFromGpuMesh = true;
 	// S0-3: DELIVER time, i.e. now -- the moment this result is about to go on
 	// ResultsQueue. Gated with the rest of S0-3's bookkeeping; see
@@ -11642,8 +11730,11 @@ void FVoxelWorldImpl::DispatchJobs()
 	// recorded catastrophe is exactly that: floors {0,2,3,4,4} reserved 13 of
 	// 24 slots and collapsed throughput from 49,179 chunks to 558, and with two
 	// knobs moving nobody could say which had done it.
-	const int32 MaxJobsInFlight =
-		VoxelDebug::GetStreamJobsInFlightPerCore() * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
+	// Computed by MaxJobsInFlightCap() and nowhere else -- UpdatePerfSnapshot
+	// publishes the same call, so the HUD's "jobs N/cap" row can no longer
+	// drift from the cap this loop actually enforces (it did: see the helper's
+	// comment for the 24-vs-96 readout that fix removed).
+	const int32 MaxJobsInFlight = MaxJobsInFlightCap();
 	const bool bRingQuota = VoxelStreamAdmission::GetRingQuotaEnabled();
 
 	// Cold-band throttle (see the block after the record lookup below). Hoisted:
@@ -14500,22 +14591,42 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// drained result, even ones about to be discarded as stale below --
 		// the worker did real, representative work regardless of whether the
 		// result is still wanted.
-		WorkerJobMsWindow[WorkerJobMsWindowNext] = Result.JobMs;
-		WorkerJobMsWindowNext = (WorkerJobMsWindowNext + 1) % WorkerJobMsWindowSize;
-		WorkerJobMsWindowCount = FMath::Min(WorkerJobMsWindowCount + 1, WorkerJobMsWindowSize);
-
-		// M2 wave 2 item 1: same recording, split into this result's level's
-		// own window (see LevelWorkerJobMsWindow doc comment).
+		//
+		// ROUTED BY PRODUCER, because the two arms time different quantities.
+		// The CPU arm's JobMs is SERVICE TIME (task-body wall, pickup to
+		// enqueue); the GPU arm's GpuSubmitToDeliverMs is END-TO-END LATENCY
+		// including the manager's queue wait. Both used to land in
+		// WorkerJobMsWindow through the shared JobMs field, and averaging a
+		// ms-scale cost with a latency measured as high as 7,395 ms on one
+		// delivery is why the single "Worker ms" statistic read in seconds and
+		// could not be attributed to either path. Each window now holds one
+		// quantity and the HUD labels each row for what it measures.
+		if (Result.bFromGpuMesh)
 		{
+			PushLatencyMsSample(GpuJobLatencyMsWindow, GpuJobLatencyMsWindowNext,
+			                    GpuJobLatencyMsWindowCount, Result.GpuSubmitToDeliverMs);
+		}
+		else
+		{
+			WorkerJobMsWindow[WorkerJobMsWindowNext] = Result.JobMs;
+			WorkerJobMsWindowNext = (WorkerJobMsWindowNext + 1) % WorkerJobMsWindowSize;
+			WorkerJobMsWindowCount = FMath::Min(WorkerJobMsWindowCount + 1, WorkerJobMsWindowSize);
+
+			// M2 wave 2 item 1: same recording, split into this result's level's
+			// own window (see LevelWorkerJobMsWindow doc comment). CPU-only for
+			// the same reason as the global window: the number this feeds is
+			// "worker p50/p95 per level" -- a cost -- and the fork's latency in
+			// it made R-level cost rows unreadable the same way.
 			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
 			LevelWorkerJobMsWindow[Lvl][LevelWorkerJobMsWindowNext[Lvl]] = Result.JobMs;
 			LevelWorkerJobMsWindowNext[Lvl] = (LevelWorkerJobMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
 		}
 
-		// S0-3: WorkerJobMsWindow above mixes both producers (OnGpuMeshJobComplete
-		// sets Result.JobMs = SubmitToDeliverMs too). This isolates the CPU-only
-		// population, gated with the rest of S0-3's bookkeeping.
+		// S0-3: the CPU-only population, gated with the rest of S0-3's
+		// bookkeeping. Redundant with WorkerJobMsWindow now that the producers
+		// are routed above (it predates that split, when WorkerJobMsWindow
+		// mixed both); kept because the S0-3 latency log line reads it.
 		if (VoxelDebug::GetStreamLatencyStats() && !Result.bFromGpuMesh)
 		{
 			PushLatencyMsSample(CpuWorkerEndToEndMsWindow, CpuWorkerEndToEndMsWindowNext,
@@ -14648,6 +14759,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
 			++LevelResultsSinceLog[Lvl];
 			const int32 ResultQuads = Result.QuadCount();
+			// A GPU-fork result adds 0 here (its JobMs stays 0 -- see
+			// FJobResult): these two accumulators are the census's "worker
+			// WALL TIME split by outcome" (see the members' doc comment), and
+			// the latency the fork used to write through JobMs is not time a
+			// worker spent. The fork's results still count in
+			// LevelResultsSinceLog and the quad histogram above/below.
 			(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
 
 			// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the
@@ -14681,7 +14798,15 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 				default: break; // census switch off
 				}
 			}
-			if (Lvl == 0)
+			// CPU worker results only. A GPU-fork result carries 0 for every
+			// field this block sums (GridMs, cycles, brick skips -- the fork
+			// never fills them), so before the JobMs/GpuSubmitToDeliverMs
+			// split it contributed its LATENCY to AccumLevel0JobMs and a +1 to
+			// AccumLevel0Jobs against all-zero grid numbers -- inflating
+			// jobUs, deflating jobGHz and the grid share, in a log line whose
+			// whole purpose is per-job attribution. Gating the count too keeps
+			// jobs/jobUs/gridUs one consistent population.
+			if (Lvl == 0 && !Result.bFromGpuMesh)
 			{
 				AccumLevel0GridMs += Result.GridMs;
 				AccumLevel0JobMs += Result.JobMs;
@@ -16087,7 +16212,12 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	const float Window = PerfRefreshAccumSeconds;
 	PerfRefreshAccumSeconds = 0.f;
 
-	const int32 MaxJobsInFlight = 2 * FPlatformMisc::NumberOfCoresIncludingHyperthreads();
+	// The SAME function DispatchJobs enforces its loop condition with, not a
+	// local recomputation. This line used to hardcode 2 * cores -- the
+	// pre-cvar formula -- and was left behind when the dispatcher's multiplier
+	// became voxel.Stream.JobsInFlightPerCore (default 8), so the HUD reported
+	// a cap of 24 against a real cap of 96. See MaxJobsInFlightCap()'s comment.
+	const int32 MaxJobsInFlight = MaxJobsInFlightCap();
 
 	LastPerfSnapshot.TotalChunksLoaded = TotalChunksLoaded;
 	LastPerfSnapshot.TotalChunksUnloaded = TotalChunksUnloaded;
@@ -16134,6 +16264,18 @@ void FVoxelWorldImpl::UpdatePerfSnapshot(float DeltaTime, float TickMs)
 	else
 	{
 		LastPerfSnapshot.WorkerMsP50 = LastPerfSnapshot.WorkerMsP95 = LastPerfSnapshot.WorkerMsMax = 0.f;
+	}
+
+	// The GPU fork's half of the split row: submit->deliver end-to-end latency
+	// of demand fork results, a DIFFERENT QUANTITY from the WorkerMs* service
+	// times above (see GpuJobLatencyMsWindow's doc comment for the blend this
+	// replaced). ComputeMsPercentiles handles Count == 0 by returning zeros,
+	// matching the else-branch convention above.
+	{
+		const FMsPercentiles GpuLat = ComputeMsPercentiles(GpuJobLatencyMsWindow, GpuJobLatencyMsWindowCount);
+		LastPerfSnapshot.GpuLatencyMsP50 = GpuLat.P50;
+		LastPerfSnapshot.GpuLatencyMsP95 = GpuLat.P95;
+		LastPerfSnapshot.GpuLatencyMsMax = GpuLat.Max;
 	}
 
 	// M2 wave 2 item 1: identical percentile computation, per level (report

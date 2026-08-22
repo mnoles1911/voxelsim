@@ -257,8 +257,9 @@ void AVoxelEarthHUD::DrawPerfHUD()
 
 		// M2 wave 2 item 1 ("Cross-job mip caching"): per-level worker ms
 		// row -- this is the number the shared mip cache targets (wave 1
-		// measured worker p95 ~296ms on high-level jobs).
-		FString LevelWorkerMsLine = TEXT("Worker ms/level:");
+		// measured worker p95 ~296ms on high-level jobs). CPU arm only, like
+		// the "CPU job ms" row below it.
+		FString LevelWorkerMsLine = TEXT("CPU ms/level:");
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 		{
 			LevelWorkerMsLine +=
@@ -282,7 +283,15 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			TEXT("  jobs %d/%d  queues job=%d gt=%d unload=%d\n")
 			TEXT("  budget sat %.0f%%  stale discards %lld\n")
 			TEXT("%s\n")
-			TEXT("Worker ms: p50 %.2f  p95 %.2f  max %.2f\n")
+			// TWO rows for what was one, because the one row blended two
+			// different quantities: the CPU worker's SERVICE TIME (task body
+			// wall, pickup to enqueue) averaged with the GPU fork's
+			// submit->deliver LATENCY (queue wait included) -- which is why
+			// the old "Worker ms" row could read in seconds and say nothing
+			// about either path. Labelled for what each actually measures;
+			// they must never be summed or compared against each other.
+			TEXT("CPU job ms (worker service): p50 %.2f  p95 %.2f  max %.2f\n")
+			TEXT("GPU job ms (submit->deliver, incl. queue wait): p50 %.2f  p95 %.2f  max %.2f\n")
 			TEXT("%s (p50/p95)\n")
 			TEXT("Memory: components %d  quads %lld  overlay bricks %lld  edit log %lld\n")
 			TEXT("  mip cache: bricks %lld  ~%.1f MB  evictions %lld\n")
@@ -296,6 +305,7 @@ void AVoxelEarthHUD::DrawPerfHUD()
 			Snap.BudgetSaturationPct, (long long)Snap.StaleResultsDiscarded,
 			*RingsLine,
 			Snap.WorkerMsP50, Snap.WorkerMsP95, Snap.WorkerMsMax,
+			Snap.GpuLatencyMsP50, Snap.GpuLatencyMsP95, Snap.GpuLatencyMsMax,
 			*LevelWorkerMsLine,
 			Snap.ResidentComponents, (long long)Snap.ResidentQuads, (long long)Snap.OverlayBrickCount, (long long)Snap.EditLogEntries,
 			(long long)Snap.MipCacheBrickCount, double(Snap.MipCacheBytes) / (1024.0 * 1024.0), (long long)Snap.MipCacheEvictions,

@@ -510,11 +510,25 @@ struct FVoxelPerfSnapshot
 	int64 TotalPoolReuses = 0;    // cumulative reuse events since startup
 
 	// --- Worker timings -----------------------------------------------------
-	// Rolling 256-sample window of per-chunk worker mesh-job milliseconds
+	// Rolling 256-sample window of per-chunk CPU worker mesh-job milliseconds
 	// (measured inside the worker, see VoxelStreaming::FJobResult::JobMs).
+	// SERVICE TIME of the CPU arm only: task-body wall clock from worker
+	// pickup to result enqueue, no queue wait, no GPU-fork results.
 	float WorkerMsP50 = 0.f;
 	float WorkerMsP95 = 0.f;
 	float WorkerMsMax = 0.f;
+	// Same-size rolling window, GPU mesh fork demand results only:
+	// submit->deliver END-TO-END LATENCY in ms, INCLUDING the fork manager's
+	// queue wait (FVoxelGpuMeshJobResult::SubmitToDeliverMs). A different
+	// quantity from WorkerMs* above -- a wait, not a cost -- published
+	// separately because the two used to be pooled into WorkerMs* through one
+	// shared field, which made that row read in seconds and attributable to
+	// neither arm. Never compare or sum the two rows; they answer different
+	// questions ("how long does a worker hold a job" vs "how stale is a fork
+	// chunk by the time it lands").
+	float GpuLatencyMsP50 = 0.f;
+	float GpuLatencyMsP95 = 0.f;
+	float GpuLatencyMsMax = 0.f;
 
 	// --- Memory -------------------------------------------------------------
 	int32 ResidentComponents = 0;
@@ -537,8 +551,9 @@ struct FVoxelPerfSnapshot
 	int32 LevelLoadedCount[VoxelCoords::kNumLevels] = {};
 	int32 LevelPendingCount[VoxelCoords::kNumLevels] = {};
 
-	// M2 wave 2 item 1: per-level worker mesh-job ms (same rolling-window
-	// p50/p95 as WorkerMsP50/P95 above, split by ring level) -- the number
+	// M2 wave 2 item 1: per-level CPU worker mesh-job ms (same rolling-window
+	// p50/p95 as WorkerMsP50/P95 above -- service time, CPU arm only, GPU-fork
+	// results excluded for the same reason -- split by ring level): the number
 	// this wave's fix targets directly (wave 1 measured worker p95 ~296ms on
 	// high-level jobs because every job rebuilt its whole level-0->L mip
 	// chain from scratch; see FSharedMipCache).
