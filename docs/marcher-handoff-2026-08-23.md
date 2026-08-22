@@ -93,6 +93,49 @@ throughput delta is not. n=2 per arm overlaps: control frames 8,049 / 8,786, spe
 8,612. Waste that is obviously waste has measured worse in this codebase before
 (`RingOverlapChunks`), so this needs the owner's own session or more legs before it flips.
 
+### 2.5 The index upload was the ceiling — 56 MiB per flush, now ~74 KiB
+
+`MarkDirtyAndUpload` copied the whole 56 MiB cell grid per flush and handed it to
+`QueueBufferUpload`, which copied it again and uploaded all of it. Now only changed cells
+go up, as `[cell,value]` pairs scattered by a small compute pass into the persistent
+buffer. **A flush averages 145 changed cells, not the ~9,500 estimated** — 70.6 MB moved
+across a whole flight where the full path moved ~850 GB.
+
+n=2 per arm, quiet box. **The arms do not overlap:**
+
+| | frames | p50 | p95 | hitches | brickPacks | chunks/s mean / peak |
+|---|---|---|---|---|---|---|
+| full | 8,786 / 8,049 | 22.21 / 21.27 ms | 67.32 / 69.28 ms | 2,189 / 2,689 | 562,898 / 482,818 | 2,760 / 4,248 |
+| **delta** | **12,323 / 12,381** | **20.71 / 20.73 ms** | **32.11 / 31.50 ms** | **562 / 536** | **768,010 / 768,784** | **4,392 / 7,501** |
+
+Coverage identical, holes=0 of ~24,320 scanned in every leg. The delta arm reproduces to
+within 0.5% on frames and 0.1% on packs — what removing a variable-cost bottleneck looks
+like. **ON by default** (`voxel.March.IndexDeltaUpload 0` reverts).
+
+**Against the owner's floor:** the handoff measured 968–2,435 chunks/s. This is **4,392
+mean, 7,501 peak** — the peak clears the 6,200 floor; the mean is at 70% of it.
+
+**Its verify gate crashes the D3D12 RHI** (`Fence->SyncPoints[GPUIndex] == nullptr` —
+the single readback is re-enqueued while its previous fence is outstanding, and flushes
+come 15,000+ per flight). **So the delta path is running unverified cell-by-cell.**
+Closing that is the next correctness job.
+
+### 2.6 GPU pass count is NOT the bottleneck — measured twice, both default-off
+
+Two independent pieces batched GPU passes, both work mechanically, and **neither moved
+throughput**:
+
+| | passes | cross-check | frames vs its control | brickPacks |
+|---|---|---|---|---|
+| B.1 worldgen batching (`-VoxelGpuWorldGenBatch=1`) | 3,010 vs 10,335 (**3.4x**) | 207 ok / 0 FAIL | 8,429 vs 8,786 | 488,408 vs 562,898 |
+| Pool-flush batching (`-VoxelGpuBrickFlushBatch=1`) | 698 vs ~1,758 (**2.5x**) | 263 ok / 0 FAIL | 12,237 vs 12,355 | 765,436 vs 768,799 |
+
+Both stay off. **They are not failures — they are the measurement that located the real
+ceiling**, which turned out to be §2.5. Reach for them again only if a future change makes
+pass setup bind.
+
+---
+
 ---
 
 ## 3. Phase 1 (the no-hole invariant) — built, measured, and NOT worth enabling yet
@@ -130,22 +173,30 @@ inverts the last handoff's ordering, and the table above is the reason.
 
 ## 5. Next, in the order the measurements now justify
 
-1. **The index upload.** `MarkDirtyAndUpload` does `Staged = Cells;` — a **56 MiB** copy
-   per flush — then hands the whole thing to `QueueBufferUpload`, which copies it again
-   and uploads all of it. A typical flush changes **9,500 cells of 14.7M (0.065%)**, at
-   ~180 flushes per 5 s window. Its own instrumentation: `uploadMs=3,146–3,190` against
-   `addedMs=1.4–2.0`. **This is the largest single game-thread cost left.** (Two comments
-   still say "4 MiB" — stale, from before the Z-aliasing fix and the cover slot.)
-2. **Tier B.1**, batching GPU passes across chunks — the answer to why `MeshBatchCap`
-   hitched when it was raised.
-3. **A hole metric that cannot count the sky**, without which Phase 1 cannot be judged.
-   The naive "ray exited with no hit" counts every sky ray. Use `substituted` (a hit from a
+1. **Close the index-delta verify gate** (§2.5). The delta path is the default and is
+   unverified cell-by-cell. It needs the multi-slot readback ring the hole-stats and
+   shadow-march paths already use, plus a skip when no slot is free.
+2. **Find the new ceiling.** Pass count is out (§2.6) and the index copy is gone. Take a
+   fresh `voxel.Stream.FrameAttribution` leg rather than assuming — every assumption about
+   this pipeline that was not re-measured today turned out to be wrong.
+3. **A hole metric that cannot count the sky** — authored, unmerged (`voxel.March.HoleStats`).
+   The naive "ray exited with no hit" counts every sky ray. `substituted` (a hit from a
    level coarser than the segment owning that ground — counts HITS, so sky cannot
    contaminate it) and `uncovered` (no hit + crossed an ABSENT chunk + pointing below the
-   horizon).
-4. Then re-test Phase 1 against the higher throughput.
-
----
+   horizon). Certify it can move BOTH ways before gating on it: `-VoxelMaxRingLevel=0`
+   must make `uncovered` large, a settled stationary world must make it near zero.
+4. **Re-test Phase 1** against the throughput it now has. It failed at 2,760 chunks/s
+   because nothing coarse was resident to fall through to; at 4,392 that may change.
+5. **Blue speckling** — a full diagnosis exists at
+   `scratchpad/blue-speckling-diagnosis.md`. Its headline: no material or palette index is
+   mip-averaged anywhere (the prime suspect is CLEARED), and in this renderer "a pixel that
+   loses its sunlight" and "a pixel that turns blue" are the same event, so the geometry
+   clues matter and the colour one does not. Cheapest discriminator: `voxel.March.ClimateStrength 4`
+   stains every pixel the emit shaded and nothing else, halving the candidate space in one
+   cvar. It also found, independently, that **GI never anchors under
+   `voxel.Terrain.RetireQuads`** (`VoxelGI.cpp:1316-1332` returns on `NumQuads == 0`, so the
+   volume never gets an origin) — almost certainly the answer to the standing "GI shows no
+   visible difference" item.
 
 ## 6. Rules this session added (the earlier ones all still apply)
 
