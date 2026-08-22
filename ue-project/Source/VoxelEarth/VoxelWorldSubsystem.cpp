@@ -14,6 +14,7 @@
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
 #include "VoxelFrontEndPolicy.h" // front-end suppression rules; see the header for the invariant
+#include "VoxelSaveLibrary.h"      // autosave-on-shutdown writes back to the active named save
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
 #include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
@@ -14976,7 +14977,13 @@ bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 // (never the live log_) when the raw log has more than 2x its compacted
 // entry count (docs/m3-plan.md wave 2 item 1: "COMPACT on save when the log
 // has >2x the entries of its compacted form").
-bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
+// TAKES A PATH, NOT A SEED, for the same reason LoadEditLogFromPath does: the
+// named-save system (VoxelSaveLibrary) keeps each save's log inside its own
+// Saved/SaveGames/<slug>/ directory. GetWorldSaveFilePath(Seed) remains the
+// default location, and UVoxelWorldSubsystem::SaveWorld still writes there, so
+// the autosave-on-shutdown and voxel.SaveWorld behaviour that predates the
+// front end is untouched.
+bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 {
 	const vxc::EditLog& Log = Impl.Voxels.log();
 	const vxc::EditLog Compacted = vxc::compactLog(Log);
@@ -14992,9 +14999,7 @@ bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
 		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
 	}
 
-	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
-	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
-	const FString Path = GetWorldSaveFilePath(Seed);
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree*/ true);
 
 	if (!WriteBytesAtomic(Path, OutBytes))
 	{
@@ -15348,7 +15353,22 @@ void UVoxelWorldSubsystem::Deinitialize()
 		// second door. bWorldSessionStartAttempted is that second door's lock.
 		if (bWorldBegunPlay && bWorldSessionStartAttempted)
 		{
-			SaveWorld();
+			// WHERE the autosave lands depends on where this session came
+			// from. A session opened from a named save writes back INTO that
+			// save, or the player's next CONTINUE would silently reopen the
+			// state they had when they loaded it and lose the whole session.
+			// A session with no named save behind it -- NEW GAME, or any
+			// headless run -- keeps writing to the seed-derived default, which
+			// is byte-identical to the behaviour that predates named saves.
+			const FString& ActiveSlug = VoxelSave::GetActiveSlug();
+			if (!ActiveSlug.IsEmpty())
+			{
+				SaveWorldToPath(VoxelSave::WorldLogPath(ActiveSlug));
+			}
+			else
+			{
+				SaveWorld();
+			}
 		}
 		else if (bWorldBegunPlay)
 		{
@@ -16923,7 +16943,28 @@ bool UVoxelWorldSubsystem::SaveWorld() const
 		       TEXT("SaveWorld: refused on NM_Client -- only the authority (server/listen/standalone) has a log to save."));
 		return false;
 	}
-	return SaveEditLogToDisk(*Impl, Seed);
+	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed));
+}
+
+bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	// The authority-only rule from SaveWorld applies identically: a client has
+	// no authoritative log of its own to write, it relies on join-sync from the
+	// server, and letting it save one would produce a file that silently
+	// disagrees with the world it came from.
+	if (const UWorld* World = GetWorld())
+	{
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogVoxelEdit, Warning, TEXT("SaveWorldToPath: refusing on NM_Client -- no authoritative log here."));
+			return false;
+		}
+	}
+	return SaveEditLogToPath(*Impl, Path);
 }
 
 namespace

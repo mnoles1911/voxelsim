@@ -7,6 +7,7 @@
 
 #include "VoxelFrontEndPolicy.h"
 #include "VoxelEarthGameMode.h"
+#include "VoxelSaveLibrary.h"
 #include "VoxelWorldSubsystem.h"
 
 #include "Engine/GameViewportClient.h"
@@ -178,11 +179,45 @@ void UVoxelFrontEndSubsystem::RefreshSaveRows()
 	{
 		return;
 	}
-	// The save system lands in a later step. Until then the list is genuinely
-	// empty, which is the correct answer for a project that has never written
-	// a named save -- CONTINUE and LOAD GAME grey out exactly as MainMenu.gd
-	// makes them when GameState.list_save_files() is empty.
-	MenuWidget->SetSaveRows(TArray<FVoxelSaveRowInfo>());
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	const uint64 RunningSeed = WorldSub ? WorldSub->GetSeed() : 0;
+
+	TArray<FVoxelSaveRowInfo> Rows;
+	for (const VoxelSave::FSaveInfo& Info : VoxelSave::List())
+	{
+		FVoxelSaveRowInfo Row;
+		Row.Slug = Info.Slug;
+		Row.DisplayName = FText::FromString(Info.DisplayName);
+
+		// MainMenu.gd's row reads
+		//   "<save_name>\n<timestamp>   X %.0f  Y %.0f  Z %.0f"
+		// so the shape is preserved exactly. The UNITS are not: Godot stored
+		// metres and this project stores Unreal units (1 UU = 1 cm), which
+		// would print a coordinate like -6510200 and read as noise. Converted
+		// to metres, which is what the F1 overlay and every log line in this
+		// project use -- so the number a player sees here matches the one they
+		// see in game.
+		const FVector Metres = Info.PlayerPosition / 100.0;
+		Row.Detail = FText::FromString(FString::Printf(TEXT("%s   X %.0f  Y %.0f  Z %.0f"), *Info.TimestampIso,
+		                                               Metres.X, Metres.Y, Metres.Z));
+
+		// THE ONE PLACE A 1:1 CLONE CANNOT HOLD. The world seed is baked into
+		// the amplifier when Impl is constructed, long before any menu exists,
+		// so a save recorded under a different seed cannot be opened without
+		// rebuilding the voxel world wholesale. Only reachable via -VoxelSeed=,
+		// so in ordinary play every row is loadable -- but a row that silently
+		// did nothing when clicked would be far worse than one that says why.
+		if (RunningSeed != 0 && Info.Seed != RunningSeed)
+		{
+			Row.bLoadable = false;
+			Row.DisabledReason = FText::FromString(
+				FString::Printf(TEXT("requires relaunch with -VoxelSeed=%llu"), (unsigned long long)Info.Seed));
+		}
+		Rows.Add(MoveTemp(Row));
+	}
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: %d save(s) listed."), Rows.Num());
+	MenuWidget->SetSaveRows(MoveTemp(Rows));
 }
 
 void UVoxelFrontEndSubsystem::RequestNewGame()
@@ -206,20 +241,77 @@ void UVoxelFrontEndSubsystem::RequestNewGame()
 
 void UVoxelFrontEndSubsystem::RequestContinue()
 {
-	// Enabled only when a loadable save exists, which cannot happen until the
-	// save system lands. Logged rather than silently ignored so a stray click
-	// during that window is visible.
-	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: CONTINUE (no save system yet; ignored)."));
+	// CONTINUE IS LITERALLY "THE NEWEST SAVE". MainMenu.gd implements it as
+	// GameState.list_save_files()[0], relying on that list being newest-first;
+	// VoxelSave::List() keeps the same contract for the same reason.
+	const TArray<VoxelSave::FSaveInfo> Saves = VoxelSave::List();
+	if (Saves.Num() == 0)
+	{
+		UE_LOG(LogVoxelUI, Warning, TEXT("VoxelFrontEnd: CONTINUE with no saves; ignoring."));
+		return;
+	}
+	RequestLoad(Saves[0].Slug);
 }
 
 void UVoxelFrontEndSubsystem::RequestLoad(const FString& Slug)
 {
-	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: LOAD %s (no save system yet; ignored)."), *Slug);
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (WorldSub == nullptr)
+	{
+		UE_LOG(LogVoxelUI, Error, TEXT("VoxelFrontEnd: LOAD %s -- no voxel world subsystem."), *Slug);
+		return;
+	}
+
+	// Re-read the metadata rather than trusting the row: the list was built
+	// when the menu opened, and the save could have been deleted since -- by
+	// the DELETE button sitting right next to it, if nothing else.
+	const TArray<VoxelSave::FSaveInfo> Saves = VoxelSave::List();
+	const VoxelSave::FSaveInfo* Info = Saves.FindByPredicate(
+		[&Slug](const VoxelSave::FSaveInfo& Candidate) { return Candidate.Slug == Slug; });
+	if (Info == nullptr)
+	{
+		UE_LOG(LogVoxelUI, Warning, TEXT("VoxelFrontEnd: LOAD %s -- no such save any more."), *Slug);
+		RefreshSaveRows();
+		return;
+	}
+	if (Info->Seed != WorldSub->GetSeed())
+	{
+		UE_LOG(LogVoxelUI, Warning,
+		       TEXT("VoxelFrontEnd: LOAD %s -- recorded under seed %llu but this session is seed %llu. ")
+		       TEXT("Relaunch with -VoxelSeed=%llu."),
+		       *Slug, (unsigned long long)Info->Seed, (unsigned long long)WorldSub->GetSeed(),
+		       (unsigned long long)Info->Seed);
+		return;
+	}
+
+	// Claim the save BEFORE the world starts, so that an autosave-on-shutdown
+	// at any point after this writes back into it rather than into the
+	// seed-derived default -- otherwise a player's next CONTINUE quietly
+	// reopens the state they had when they loaded, losing the session.
+	VoxelSave::SetActiveSlug(Slug);
+
+	const FTransform SpawnTransform(Info->PlayerRotation, Info->PlayerPosition);
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: LOAD %s (%lld edit(s))."), *Slug, (long long)Info->EditCount);
+
+	WorldSub->StartWorldSession(VoxelSave::WorldLogPath(Slug));
+	if (AVoxelEarthGameMode* GameMode = World->GetAuthGameMode<AVoxelEarthGameMode>())
+	{
+		GameMode->BeginPlayerSession(&SpawnTransform);
+	}
+	TeardownMenu();
+	State = EVoxelFrontEndState::Playing;
 }
 
 void UVoxelFrontEndSubsystem::RequestDelete(const FString& Slug)
 {
-	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: DELETE %s (no save system yet; ignored)."), *Slug);
+	if (!VoxelSave::Delete(Slug))
+	{
+		UE_LOG(LogVoxelUI, Warning, TEXT("VoxelFrontEnd: DELETE %s -- nothing to delete."), *Slug);
+	}
+	// Rebuild the list either way: if the directory was already gone, the row
+	// still on screen is the thing that is wrong.
+	RefreshSaveRows();
 }
 
 void UVoxelFrontEndSubsystem::RequestQuit()

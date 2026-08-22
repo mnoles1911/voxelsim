@@ -34,6 +34,12 @@ public class VoxelEarth : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			// FJsonObject / FJsonSerializer, for the named-save meta.json
+			// (VoxelSaveLibrary). The world half of a save is the existing
+			// binary .vxlog and needs nothing new; only the metadata beside it
+			// is JSON, because it is a file a human may well want to read when
+			// a save misbehaves.
+			"Json",
 			// M2 Band 3 first slice (docs/m2-plan.md, AVoxelClipmapActor):
 			// PRAGMATIC EXCEPTION to the "no PMC" doctrine (that rule targets
 			// the voxel rendering path, not a conventional heightmap clipmap

@@ -618,6 +618,12 @@ public:
 	// (autosave-on-shutdown). Returns true on success.
 	bool SaveWorld() const;
 
+	// SaveWorld(), but to an explicit path -- what VoxelSaveLibrary writes a
+	// named save's world.vxlog with. Same format, same compaction rule, same
+	// atomic tmp+rename write, same authority-only refusal on NM_Client; the
+	// only difference is where the bytes land. Creates the parent directory.
+	bool SaveWorldToPath(const FString& Path) const;
+
 private:
 	// Join-sync buffering state (client only; see BeginJoinSync above).
 	TArray<uint8> JoinSyncAccumulator;
