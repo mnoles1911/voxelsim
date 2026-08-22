@@ -32,6 +32,7 @@
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
 
+#include "VoxelBrickPool.h"
 #include "VoxelChunkMesher.h"
 #include "VoxelCoords.h"
 #include "VoxelGpuMeshJobManager.h"
@@ -49,6 +50,7 @@
 #include "RHIGPUReadback.h"
 
 #include "voxelcore/amplifier.h"
+#include "voxelcore/brickpack.h"
 #include "voxelcore/core.h"
 #include "voxelcore/tiles.h"
 
@@ -1347,6 +1349,923 @@ namespace VoxelGpuMeshAsyncVerify
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[Run](float Dt) -> bool { return Run->Tick(Dt); }), 0.0f);
 	}
+
+	// =====================================================================
+	// voxel.GPU.VerifyBrickPack — the gate on P1-C / P2 (the resident brick volume)
+	// =====================================================================
+	//
+	// WHAT THIS PROVES THAT NOTHING ELSE CAN. P1-B byte-compared brickpack.ush
+	// against vxc::packChunkBricksCanonical over 1,024 bricks with an offline
+	// DXC harness. That says the KERNEL is right. It says nothing about Unreal's
+	// compilation of it, nothing about the dispatch this phase added, and
+	// nothing at all about the pool: the allocation, the three copies, the
+	// descriptor rebase and the chunk record are all new code, and every one of
+	// them can be wrong while producing a pool that looks populated.
+	//
+	// So this meshes K chunks through FVoxelGpuMeshJobManager with
+	// voxel.GPU.BrickPack on, publishes each into a PRIVATE FVoxelBrickPool,
+	// reads the pool back, and checks SIX things per chunk against
+	// vxc::packChunkBricksCanonical over the same chunk:
+	//
+	//   1. CONTROL, and it is the one that cannot be wrong about the base: the
+	//      SCRATCH descriptors, read straight out of the producer's own output.
+	//      Those dispatch with all four write bases at ZERO, so they are the
+	//      chunk-relative form the contract defines and they are compared with
+	//      no arithmetic whatsoever.
+	//   2. DIRECT: the POOL descriptors, which are the same 64 slots with the
+	//      arena bases folded into their offset fields. Compared against the CPU
+	//      reference REBASED BY THE ALLOCATION THE POOL ACTUALLY HANDED OUT --
+	//      not by a base this code assumed. docs/brick-volume-format.md section
+	//      6b: a base compared against a chunk offset reports a mismatch that is
+	//      not one, and it looks exactly like the format being wrong. Checking
+	//      both forms is what makes that indistinguishable pair distinguishable.
+	//   3. the occupancy dwords at the chunk's arena offset, byte for byte;
+	//   4. the material dwords likewise (palette and payload);
+	//   5. the 32 B chunk record: origin, ring level, the 64-bit L1 mask, and
+	//      BOTH FLAGS -- including allSolid, which is NOT derivable from the
+	//      descriptors and looks as though it is, so a kernel that derived it
+	//      would pass every other check here;
+	//   6. GUARD BAND: every dword of every arena that is not inside a live
+	//      allocation must still be ZERO. The arenas are created zero-filled and
+	//      this gate never frees, so a write that ran past the end of its
+	//      allocation has nowhere to hide. That is the one new failure this
+	//      design can produce and the only one a per-chunk comparison misses.
+	//
+	// It forces voxel.GPU.BrickPack 1 and voxel.GPU.BrickPackResident 0 for the
+	// duration and restores both, and it says so in the log -- a PASS that does
+	// not name the path it tested is not evidence about any path. Resident 0 is
+	// what keeps the GLOBAL pool out of the measurement: the payload comes back
+	// on the result and this gate publishes it into its own.
+	struct FBrickPackVerifyRun : public TSharedFromThis<FBrickPackVerifyRun>
+	{
+		struct FChunkUnderTest
+		{
+			VoxelCoords::FVoxelChunkKey Key;
+			vxc::ChunkBrickPack Cpu;
+			FVoxelGpuBrickPayloadRef Payload;
+			FVoxelBrickPool::FResidentChunk Res;
+			TUniquePtr<FRHIGPUBufferReadback> ScratchDescReadback;
+			TArray<uint32> ScratchDesc;     // 2 dwords per brick slot
+			bool bDelivered = false;
+			bool bResident = false;
+		};
+
+		explicit FBrickPackVerifyRun(int32 InNumChunks, int32 InMaxInFlight, double InStartDelay)
+			: Tiles(kSeed)
+			, CpuTiles(kSeed)
+			, CpuAmp(kSeed, CpuTiles)
+			, NumChunks(InNumChunks)
+			, MaxInFlight(InMaxInFlight)
+			, StartDelaySeconds(InStartDelay)
+			, Manager(FVoxelGpuMeshJobComplete::CreateRaw(this, &FBrickPackVerifyRun::OnJobComplete),
+			          InMaxInFlight)
+		{
+		}
+
+		~FBrickPackVerifyRun()
+		{
+			RestoreCvars();
+		}
+
+		// The CPU reference for one render chunk: the canonical packing over the
+		// same 32^3 of world the GPU region covers. THE SHIPPING REFERENCE, not
+		// a transcription of it -- vxc::packChunkBricksCanonical is the same
+		// function 726 unit tests and the P1-B byte comparison run against.
+		static vxc::ChunkBrickPack CpuPackChunk(const vxc::Amplifier& Amp,
+		                                        const VoxelCoords::FVoxelChunkKey& Key)
+		{
+			constexpr int32 ChunkVox = vxc::kMarchChunkEdgeVoxels;
+			const int64 BaseVX = int64(Key.X) * ChunkVox;
+			const int64 BaseVY = int64(Key.Y) * ChunkVox;
+			const int64 BaseVZ = int64(Key.Z) * ChunkVox;
+
+			// NO HALO. A marcher reads neighbours by index, so the producer
+			// dispatches 32x32x4 and the reference samples exactly the same
+			// 32^3 -- one column per voxel column of the chunk and not one more.
+			TArray<vxc::ColumnSample> Columns;
+			Columns.SetNumUninitialized(ChunkVox * ChunkVox);
+			for (int32 LY = 0; LY < ChunkVox; ++LY)
+			{
+				for (int32 LX = 0; LX < ChunkVox; ++LX)
+				{
+					Columns[LX + ChunkVox * LY] = Amp.column(BaseVX + LX, BaseVY + LY);
+				}
+			}
+
+			return vxc::packChunkBricksCanonical(
+				[&Columns, BaseVZ](int32 X, int32 Y, int32 Z) -> vxc::MaterialId
+			{
+				return vxc::Amplifier::materialAt(Columns[X + ChunkVox * Y], BaseVZ + Z);
+			});
+		}
+
+		// FORCING A CVAR AT ECVF_SetByCode IS A SILENT NO-OP AGAINST THE COMMAND
+		// LINE. Every leg on this project sets cvars through -ExecCmds, and the
+		// console records those at ECVF_SetByConsole -- the HIGHEST priority
+		// there is (see FConsoleVariableBase::CanChange: a Set is kept only when
+		// NewPri >= OldPri). A Set at SetByCode is then discarded with nothing
+		// but a LogConsoleManager warning, while this gate goes on to log
+		// "Forced ..." and measure the path it did not force.
+		//
+		// That is harmless when the forced value is what the leg already set. It
+		// is FATAL FOR THE CONTROL ARM: forcing voxel.GPU.BrickPack 0 would be
+		// dropped, and the "control" would be a byte-identical rerun of the
+		// direct arm -- a control that agrees with the thing it controls, for the
+		// worst possible reason.
+		//
+		// So force at max(the priority the cvar already carries, SetByCode).
+		// Equal priority IS accepted, so this beats -ExecCmds; and because the
+		// force and the restore use the SAME priority, the restore puts the old
+		// value back where the force left it instead of clobbering the recorded
+		// priority to something the next writer of this cvar cannot beat.
+		//
+		// It is still only a request, so the value is READ BACK. A gate that
+		// cannot establish its own preconditions must refuse to report, not
+		// report anyway.
+		struct FForcedCvar
+		{
+			int32 SavedValue = 0;
+			EConsoleVariableFlags Priority = ECVF_SetByCode;
+			bool bForced = false;
+		};
+
+		static bool ForceOneCvar(const TCHAR* Name, int32 Value, FForcedCvar& OutState)
+		{
+			IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name);
+			if (Var == nullptr)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("voxel.GPU.VerifyBrickPack: ABORTING -- the console variable '%s' does "
+				            "not exist, so this run cannot select the path it claims to test."),
+				       Name);
+				return false;
+			}
+
+			const uint32 CurrentPriority = uint32(Var->GetFlags()) & uint32(ECVF_SetByMask);
+			OutState.Priority = EConsoleVariableFlags(
+				FMath::Max<uint32>(CurrentPriority, uint32(ECVF_SetByCode)));
+			OutState.SavedValue = Var->GetInt();
+
+			Var->Set(Value, OutState.Priority);
+			OutState.bForced = true;
+
+			const int32 ReadBack = Var->GetInt();
+			if (ReadBack != Value)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("voxel.GPU.VerifyBrickPack: ABORTING -- '%s' still reads %d after being "
+				            "forced to %d at SetBy%s (it now sits at SetBy%s). This run would have "
+				            "measured a path it did not select, so it reports nothing at all."),
+				       Name, ReadBack, Value,
+				       GetConsoleVariableSetByName(OutState.Priority),
+				       GetConsoleVariableSetByName(
+					       EConsoleVariableFlags(uint32(Var->GetFlags()) & uint32(ECVF_SetByMask))));
+				return false;
+			}
+			return true;
+		}
+
+		static void RestoreOneCvar(const TCHAR* Name, FForcedCvar& State)
+		{
+			if (!State.bForced)
+			{
+				return;
+			}
+			State.bForced = false;
+			if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+			{
+				// The priority the force used, so this is accepted for the same
+				// reason the force was, and the recorded priority is left alone.
+				Var->Set(State.SavedValue, State.Priority);
+			}
+		}
+
+		// false => the preconditions do not hold and the caller MUST abandon the
+		// run. Anything already forced stays recorded, so RestoreCvars() still
+		// puts it back.
+		bool ForceCvars()
+		{
+			bCvarsForced = true;
+			if (!ForceOneCvar(TEXT("voxel.GPU.BrickPack"), 1, PackCvarState))
+			{
+				return false;
+			}
+			// This gate owns its own pool. Publishing into the global one as
+			// well would make the run's residency depend on whatever the
+			// streaming path had already put there.
+			if (!ForceOneCvar(TEXT("voxel.GPU.BrickPackResident"), 0, ResidentCvarState))
+			{
+				return false;
+			}
+			return true;
+		}
+
+		void RestoreCvars()
+		{
+			if (!bCvarsForced)
+			{
+				return;
+			}
+			bCvarsForced = false;
+			RestoreOneCvar(TEXT("voxel.GPU.BrickPack"), PackCvarState);
+			RestoreOneCvar(TEXT("voxel.GPU.BrickPackResident"), ResidentCvarState);
+		}
+
+		void Start()
+		{
+			// Small on purpose: the whole arena is read back, and a private pool
+			// sized to the run makes the guard-band check cover every byte the
+			// run could possibly have touched rather than a prefix of a 300 MiB
+			// buffer.
+			FVoxelBrickPoolConfig Config;
+			Config.ChunkCapacity = uint32(NumChunks) + 4;
+			Config.OccWordCapacity = uint32(NumChunks + 1) * 64u * 16u + 4096u;
+			Config.MatWordCapacity = uint32(NumChunks + 1) * 64u * 132u + 4096u;
+			Pool.Init(Config);
+
+			Chunks.SetNum(NumChunks);
+			const int32 Side = FMath::CeilToInt(FMath::Sqrt(double(NumChunks)));
+			for (int32 I = 0; I < NumChunks; ++I)
+			{
+				const int32 Cx = (I % Side) - Side / 2;
+				const int32 Cy = (I / Side) - Side / 2;
+				Chunks[I].Key = SurfaceChunkKey(CpuAmp, Cx, Cy);
+				Chunks[I].Cpu = CpuPackChunk(CpuAmp, Chunks[I].Key);
+			}
+
+			UE_LOG(LogVoxelGpuAsync, Log,
+			       TEXT("voxel.GPU.VerifyBrickPack: %d chunks, %d in flight, seed %llu. Forced "
+			            "voxel.GPU.BrickPack 1 (was %d) and voxel.GPU.BrickPackResident 0 (was %d) "
+			            "for this run AND READ BOTH BACK AT THE FORCED VALUE (a force that does not "
+			            "take aborts the run); both are restored afterwards at the priority they "
+			            "were forced at. The pool is PRIVATE to this run."),
+			       NumChunks, MaxInFlight, kSeed, PackCvarState.SavedValue,
+			       ResidentCvarState.SavedValue);
+
+			FirstSubmitSeconds = FPlatformTime::Seconds();
+			for (int32 I = 0; I < NumChunks; ++I)
+			{
+				Manager.Submit(BuildChunkRequest(Tiles, Chunks[I].Key), uint64(I),
+				               /*bRequestGpuResidentQuads*/ false);
+			}
+		}
+
+		void OnJobComplete(FVoxelGpuMeshJobResult&& Result)
+		{
+			const int32 Index = int32(Result.UserTag);
+			if (!Chunks.IsValidIndex(Index))
+			{
+				++NumDelivered;
+				return;
+			}
+			FChunkUnderTest& Chunk = Chunks[Index];
+			if (Chunk.bDelivered)
+			{
+				++NumDoubleDelivered;
+				return;
+			}
+			Chunk.bDelivered = true;
+			++NumDelivered;
+
+			if (!Result.IsOk())
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("  chunk %d FAILED: %s — %s"),
+				       Index, LexToString(Result.Status), *Result.Error);
+				++NumFailed;
+				return;
+			}
+			if (!Result.BrickVolume.IsValid())
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d (%d,%d,%d) came back with NO BRICK VOLUME. The job meshed but "
+				            "did not pack — check that voxel.GPU.BrickPack took effect."),
+				       Index, Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z);
+				++NumFailed;
+				return;
+			}
+
+			Chunk.Payload = Result.BrickVolume;
+
+			// THE COUNTS MUST AGREE BEFORE ANYTHING IS ALLOCATED FROM THEM. A
+			// wrong total would size the pool range AND the comparison alike,
+			// and the two errors would cancel into a PASS.
+			const uint32 CpuOccWords = uint32(Chunk.Cpu.occ.size());
+			const uint32 CpuMatWords = uint32(Chunk.Cpu.mat.size());
+			if (Chunk.Payload->OccWords != CpuOccWords || Chunk.Payload->MatWords != CpuMatWords)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d (%d,%d,%d): arena SIZES differ — gpu occ %u mat %u, cpu occ %u "
+				            "mat %u"),
+				       Index, Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z,
+				       Chunk.Payload->OccWords, Chunk.Payload->MatWords, CpuOccWords, CpuMatWords);
+				++NumMismatched;
+				return;
+			}
+
+			const FVoxelBrickChunkKey PoolKey{ Chunk.Key.X, Chunk.Key.Y, Chunk.Key.Z, 0 };
+			if (Pool.AddChunkFromGpu(Chunk.Payload, PoolKey,
+			                         FVoxelBrickChunkShading::Neutral()) == INDEX_NONE)
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("  chunk %d: the brick pool refused it (occ %u, mat %u dwords)"),
+				       Index, Chunk.Payload->OccWords, Chunk.Payload->MatWords);
+				++NumFailed;
+				return;
+			}
+			Chunk.bResident = Pool.DebugGetResidentChunk(PoolKey, Chunk.Res);
+		}
+
+		void BeginReadback()
+		{
+			const FVoxelBrickPoolBuffersRef Buffers = Pool.DebugGetBuffers();
+			if (!Buffers.IsValid() || !Buffers->IsValid())
+			{
+				UE_LOG(LogVoxelGpuAsync, Error,
+				       TEXT("voxel.GPU.VerifyBrickPack: the pool has no GPU buffers — nothing was "
+				            "written."));
+				bReadbackFailed = true;
+				return;
+			}
+
+			DescSlots = Buffers->DescSlots;
+			OccWords = Buffers->OccWords;
+			MatWords = Buffers->MatWords;
+			ChunkSlots = Buffers->ChunkSlots;
+
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> D =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyBrick.Desc"));
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> O =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyBrick.Occ"));
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> M =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyBrick.Mat"));
+			TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> T =
+				MakeShared<FRHIGPUBufferReadback, ESPMode::ThreadSafe>(TEXT("Voxel.VerifyBrick.Table"));
+			PoolDescReadback = D;
+			PoolOccReadback = O;
+			PoolMatReadback = M;
+			PoolTableReadback = T;
+
+			// The SCRATCH descriptors, per chunk: 512 B each, and the whole
+			// control experiment. They are the producer's own output with every
+			// write base at zero, so they are compared with no rebasing at all.
+			TArray<TRefCountPtr<FRDGPooledBuffer>> ScratchDescs;
+			TArray<FRHIGPUBufferReadback*> ScratchReadbacks;
+			for (FChunkUnderTest& Chunk : Chunks)
+			{
+				if (!Chunk.bResident || !Chunk.Payload.IsValid() || !Chunk.Payload->Desc.IsValid())
+				{
+					continue;
+				}
+				Chunk.ScratchDescReadback =
+					MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.VerifyBrick.ScratchDesc"));
+				ScratchDescs.Add(Chunk.Payload->Desc);
+				ScratchReadbacks.Add(Chunk.ScratchDescReadback.Get());
+			}
+
+			const uint32 InDescSlots = DescSlots;
+			const uint32 InOccWords = OccWords;
+			const uint32 InMatWords = MatWords;
+			const uint32 InChunkSlots = ChunkSlots;
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyBrickReadback)(
+				[Buffers, D, O, M, T, ScratchDescs, ScratchReadbacks,
+				 InDescSlots, InOccWords, InMatWords, InChunkSlots](FRHICommandListImmediate& RHICmdList)
+			{
+				FRDGBuilder GraphBuilder(RHICmdList);
+				FRDGBufferRef Desc = GraphBuilder.RegisterExternalBuffer(Buffers->DescPooled,
+				                                                        TEXT("VerifyBrick.Desc"));
+				FRDGBufferRef Occ = GraphBuilder.RegisterExternalBuffer(Buffers->OccPooled,
+				                                                       TEXT("VerifyBrick.Occ"));
+				FRDGBufferRef Mat = GraphBuilder.RegisterExternalBuffer(Buffers->MatPooled,
+				                                                       TEXT("VerifyBrick.Mat"));
+				FRDGBufferRef Table = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled,
+				                                                          TEXT("VerifyBrick.Table"));
+				AddEnqueueCopyPass(GraphBuilder, D.Get(), Desc, InDescSlots * 8u);
+				AddEnqueueCopyPass(GraphBuilder, O.Get(), Occ, InOccWords * 4u);
+				AddEnqueueCopyPass(GraphBuilder, M.Get(), Mat, InMatWords * 4u);
+				// The GPU-side half of the same sizing. Both this and the CPU-side
+				// Copy below must use the record stride; the pair is why the
+				// literal survived -- they agreed with each other at 8, so the
+				// gate was self-consistent and wrong together.
+				AddEnqueueCopyPass(GraphBuilder, T.Get(), Table,
+				                   InChunkSlots * uint32(FVoxelBrickPool::kChunkRecordDwords) * 4u);
+
+				for (int32 I = 0; I < ScratchDescs.Num(); ++I)
+				{
+					FRDGBufferRef Src = GraphBuilder.RegisterExternalBuffer(ScratchDescs[I],
+					                                                        TEXT("VerifyBrick.Scratch"));
+					AddEnqueueCopyPass(GraphBuilder, ScratchReadbacks[I], Src, 64u * 8u);
+				}
+				GraphBuilder.Execute();
+			});
+		}
+
+		bool HarvestReadback()
+		{
+			if (!PoolDescReadback.IsValid())
+			{
+				return false;
+			}
+			bool bReady = false;
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyBrickPoll)(
+				[D = PoolDescReadback, O = PoolOccReadback, M = PoolMatReadback,
+				 T = PoolTableReadback, &bReady](FRHICommandListImmediate&)
+			{
+				bReady = D->IsReady() && O->IsReady() && M->IsReady() && T->IsReady();
+			});
+			FlushRenderingCommands();
+			if (!bReady)
+			{
+				return false;
+			}
+
+			PoolDesc.SetNumUninitialized(int32(DescSlots) * 2);
+			PoolOcc.SetNumUninitialized(int32(OccWords));
+			PoolMat.SetNumUninitialized(int32(MatWords));
+			// kChunkRecordDwords, not 8: this sizes the readback the record
+			// comparison and the guard band both index into, so a literal here
+			// would truncate BOTH of them the moment the record grows -- and a
+			// truncated readback reads as zeros, which the guard band scores as
+			// a PASS.
+			PoolTable.SetNumUninitialized(int32(ChunkSlots) * FVoxelBrickPool::kChunkRecordDwords);
+			for (FChunkUnderTest& Chunk : Chunks)
+			{
+				if (Chunk.ScratchDescReadback.IsValid())
+				{
+					Chunk.ScratchDesc.SetNumUninitialized(128);
+				}
+			}
+
+			ENQUEUE_RENDER_COMMAND(VoxelVerifyBrickCopy)(
+				[this](FRHICommandListImmediate&)
+			{
+				const auto Copy = [](FRHIGPUBufferReadback& Rb, void* Dst, uint32 Bytes)
+				{
+					if (const void* Src = Rb.Lock(Bytes))
+					{
+						FMemory::Memcpy(Dst, Src, SIZE_T(Bytes));
+						Rb.Unlock();
+					}
+				};
+				Copy(*PoolDescReadback, PoolDesc.GetData(), DescSlots * 8u);
+				Copy(*PoolOccReadback, PoolOcc.GetData(), OccWords * 4u);
+				Copy(*PoolMatReadback, PoolMat.GetData(), MatWords * 4u);
+				// kChunkRecordDwords, NOT a literal 8. This copy sizes the bytes
+				// pulled back from the chunk table, and the array it fills and
+				// both consumers that index it are already parameterised -- so a
+				// literal here does not error, it copies HALF of each record and
+				// leaves the rest as whatever the array allocation contained.
+				// Caught by the very gate this change was made to strengthen:
+				// "RECORD differs at dword 0 -- got 98c4fc20 want ffffffc0" with
+				// the got-record showing repeated 4-dword groups, i.e. descriptor
+				// payload read at the wrong stride, plus a guard-band hit on a
+				// slot past the copied region.
+				Copy(*PoolTableReadback, PoolTable.GetData(),
+				     ChunkSlots * uint32(FVoxelBrickPool::kChunkRecordDwords) * 4u);
+				for (FChunkUnderTest& Chunk : Chunks)
+				{
+					if (Chunk.ScratchDescReadback.IsValid() && Chunk.ScratchDesc.Num() == 128)
+					{
+						Copy(*Chunk.ScratchDescReadback, Chunk.ScratchDesc.GetData(), 64u * 8u);
+					}
+				}
+			});
+			FlushRenderingCommands();
+			return true;
+		}
+
+		void Compare()
+		{
+			int32 Checked = 0;
+			int32 ScratchFail = 0, PoolDescFail = 0, OccFail = 0, MatFail = 0, RecordFail = 0;
+
+			// Which dwords are legitimately non-zero, for the guard band. Built
+			// from the allocations the POOL handed out, not from what the writes
+			// were asked to do -- so a write that landed outside its allocation
+			// shows up here even if its own bytes are perfect.
+			TArray<bool> OccLive;
+			TArray<bool> MatLive;
+			TArray<bool> DescLive;
+			OccLive.Init(false, int32(OccWords));
+			MatLive.Init(false, int32(MatWords));
+			DescLive.Init(false, int32(DescSlots));
+			TSet<uint32> LiveSlots;
+
+			for (int32 I = 0; I < Chunks.Num(); ++I)
+			{
+				const FChunkUnderTest& C = Chunks[I];
+				if (!C.bResident)
+				{
+					continue;
+				}
+				++Checked;
+				LiveSlots.Add(C.Res.ChunkSlot);
+				for (uint32 W = 0; W < 64u; ++W)
+				{
+					DescLive[int32(C.Res.BrickBase + W)] = true;
+				}
+				for (uint32 W = 0; W < C.Res.OccWords; ++W)
+				{
+					OccLive[int32(C.Res.OccBase + W)] = true;
+				}
+				for (uint32 W = 0; W < C.Res.MatWords; ++W)
+				{
+					MatLive[int32(C.Res.MatBase + W)] = true;
+				}
+
+				// (1) CONTROL. The scratch descriptors, chunk-relative, compared
+				// with no arithmetic at all.
+				if (C.ScratchDesc.Num() == 128)
+				{
+					for (int32 B = 0; B < 64; ++B)
+					{
+						const uint32 GpuOcc = C.ScratchDesc[B * 2 + 0];
+						const uint32 GpuMat = C.ScratchDesc[B * 2 + 1];
+						const vxc::BrickDesc& Ref = C.Cpu.descs[B];
+						if (GpuOcc == Ref.OccWord && GpuMat == Ref.MatWord)
+						{
+							continue;
+						}
+						++ScratchFail;
+						UE_LOG(LogVoxelGpuAsync, Error,
+						       TEXT("  chunk %d (%d,%d,%d) brick %d: SCRATCH descriptor differs — gpu "
+						            "%08x/%08x, cpu %08x/%08x. Chunk-relative on both sides; no base is "
+						            "involved, so this is the FORMAT."),
+						       I, C.Key.X, C.Key.Y, C.Key.Z, B, GpuOcc, GpuMat, Ref.OccWord, Ref.MatWord);
+						break;
+					}
+				}
+
+				// (2) DIRECT. The pool descriptors, against the reference rebased
+				// by the allocation the pool actually handed out. UNIFORM BRICKS
+				// ARE NOT REBASED -- their offset fields are zero by contract and
+				// adding a base would invent an address into somebody else's
+				// payload.
+				for (int32 B = 0; B < 64; ++B)
+				{
+					const uint32 GpuOcc = PoolDesc[int32(C.Res.BrickBase + uint32(B)) * 2 + 0];
+					const uint32 GpuMat = PoolDesc[int32(C.Res.BrickBase + uint32(B)) * 2 + 1];
+					const vxc::BrickDesc& Ref = C.Cpu.descs[B];
+					uint32 WantOcc = Ref.OccWord;
+					uint32 WantMat = Ref.MatWord;
+					if (Ref.kind() == 2u)   // MIXED
+					{
+						WantOcc = ((Ref.occDwordOffset() + C.Res.OccBase) & vxc::kBrickOffsetMask)
+						        | (Ref.OccWord & ~vxc::kBrickOffsetMask);
+						WantMat = ((Ref.matDwordOffset() + C.Res.MatBase) & vxc::kBrickOffsetMask)
+						        | (Ref.MatWord & ~vxc::kBrickOffsetMask);
+					}
+					if (GpuOcc == WantOcc && GpuMat == WantMat)
+					{
+						continue;
+					}
+					++PoolDescFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d (%d,%d,%d) brick %d: POOL descriptor differs — pool "
+					            "%08x/%08x, expected %08x/%08x (chunk-relative %08x/%08x rebased by "
+					            "occ+%u mat+%u)"),
+					       I, C.Key.X, C.Key.Y, C.Key.Z, B, GpuOcc, GpuMat, WantOcc, WantMat,
+					       Ref.OccWord, Ref.MatWord, C.Res.OccBase, C.Res.MatBase);
+					break;
+				}
+
+				// (3) occupancy, byte for byte at the arena offset.
+				for (uint32 W = 0; W < C.Res.OccWords; ++W)
+				{
+					const uint32 Got = PoolOcc[int32(C.Res.OccBase + W)];
+					const uint32 Want = C.Cpu.occ[W];
+					if (Got == Want)
+					{
+						continue;
+					}
+					++OccFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d (%d,%d,%d): occupancy dword %u of %u differs — pool %08x, "
+					            "cpu %08x (arena offset %u)"),
+					       I, C.Key.X, C.Key.Y, C.Key.Z, W, C.Res.OccWords, Got, Want, C.Res.OccBase);
+					break;
+				}
+
+				// (4) materials: the 16 B local palette and the payload.
+				for (uint32 W = 0; W < C.Res.MatWords; ++W)
+				{
+					const uint32 Got = PoolMat[int32(C.Res.MatBase + W)];
+					const uint32 Want = C.Cpu.mat[W];
+					if (Got == Want)
+					{
+						continue;
+					}
+					++MatFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  chunk %d (%d,%d,%d): material dword %u of %u differs — pool %08x, "
+					            "cpu %08x (arena offset %u)"),
+					       I, C.Key.X, C.Key.Y, C.Key.Z, W, C.Res.MatWords, Got, Want, C.Res.MatBase);
+					break;
+				}
+
+				// (5) THE WHOLE RECORD, BUILT BY THE WRITER AND COMPARED AS BYTES.
+				//
+				// THIS USED TO EXTRACT FIVE NAMED FIELDS AND COMPARE THEM ONE BY
+				// ONE, WHICH MEANT THE GATE ONLY CHECKED WHAT SOMEBODY HAD
+				// REMEMBERED TO LIST. Dword 7 was never read at all. That was
+				// survivable only while dword 7 was reserved-and-zero; the moment
+				// the record carries per-chunk shading (climate, the surface
+				// plane) it stops being survivable, because those fields are
+				// written by TWO INDEPENDENT PRODUCERS -- BuildChunkRecord on the
+				// CPU arm and BrickChunkRecordMain on the GPU fork -- and a
+				// disagreement between them has no error, no null and no counter.
+				// The fork takes a small share of chunks and the worker the rest,
+				// so the symptom would be patchy colour whose distribution
+				// follows queue saturation. It would look exactly like a biome.
+				//
+				// Building `Want` through FVoxelBrickPool::BuildChunkRecord --
+				// the same function the CPU arm's own upload path calls -- means
+				// every field is gated, including every field added after this
+				// line was written, for free and forever. This is the shape
+				// VoxelCoverVerify.cpp:230-249 already uses.
+				//
+				// CONVERTED ON THE 8-DWORD FORMAT, DELIBERATELY, AND RUN BEFORE
+				// THE FORMAT GREW. A gate converted in the same change it is
+				// meant to catch is a gate nobody has tested.
+				{
+					uint32 Want[FVoxelBrickPool::kChunkRecordDwords] = {};
+					const FIntVector WantOrigin(
+						C.Key.X * int32(vxc::kMarchChunkEdgeVoxels),
+						C.Key.Y * int32(vxc::kMarchChunkEdgeVoxels),
+						C.Key.Z * int32(vxc::kMarchChunkEdgeVoxels));
+					// RingLevel 0: this harness meshes and admits at level 0 only,
+					// and the GPU kernel masks the level the same way, so the
+					// LevelAndFlags dword must agree bit for bit.
+					FVoxelBrickPool::BuildChunkRecord(WantOrigin, /*RingLevel=*/0u,
+					                                  C.Cpu.anySolid, C.Cpu.allSolid,
+					                                  C.Res.BrickBase, C.Cpu.brickSolid,
+					                                  // This harness submits its own requests and
+					                                  // plumbs no shading, so both sides are neutral.
+					                                  // If that ever stops being true the whole-record
+					                                  // compare below is what will say so.
+					                                  FVoxelBrickChunkShading::Neutral(), Want);
+
+					const int32 R = int32(C.Res.ChunkSlot) * FVoxelBrickPool::kChunkRecordDwords;
+					int32 BadDword = INDEX_NONE;
+					for (int32 W = 0; W < FVoxelBrickPool::kChunkRecordDwords; ++W)
+					{
+						if (PoolTable[R + W] != Want[W])
+						{
+							BadDword = W;
+							break;
+						}
+					}
+
+					if (BadDword != INDEX_NONE)
+					{
+						++RecordFail;
+						// The offending dword is named because "the record
+						// differs" is not actionable on a record that is about to
+						// carry three unrelated field groups.
+						UE_LOG(LogVoxelGpuAsync, Error,
+						       TEXT("  chunk %d (%d,%d,%d): RECORD differs at dword %d — got %08x "
+						            "want %08x. Full record got/want: "
+						            "[%08x %08x %08x %08x %08x %08x %08x %08x] / "
+						            "[%08x %08x %08x %08x %08x %08x %08x %08x]"),
+						       I, C.Key.X, C.Key.Y, C.Key.Z, BadDword,
+						       PoolTable[R + BadDword], Want[BadDword],
+						       PoolTable[R + 0], PoolTable[R + 1], PoolTable[R + 2], PoolTable[R + 3],
+						       PoolTable[R + 4], PoolTable[R + 5], PoolTable[R + 6], PoolTable[R + 7],
+						       Want[0], Want[1], Want[2], Want[3],
+						       Want[4], Want[5], Want[6], Want[7]);
+					}
+				}
+			}
+
+			// (6) THE GUARD BAND. The arenas were created zero-filled and this
+			// run never frees, so every dword outside a live allocation must
+			// still be zero. A per-chunk comparison is blind to a write that ran
+			// past the end of its own range; this is not.
+			int32 GuardFail = 0;
+			for (int32 W = 0; W < PoolOcc.Num() && GuardFail == 0; ++W)
+			{
+				if (!OccLive[W] && PoolOcc[W] != 0)
+				{
+					++GuardFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  GUARD BAND: occupancy dword %d is %08x and belongs to no allocation. "
+					            "Something wrote outside its range."), W, PoolOcc[W]);
+				}
+			}
+			for (int32 W = 0; W < PoolMat.Num() && GuardFail == 0; ++W)
+			{
+				if (!MatLive[W] && PoolMat[W] != 0)
+				{
+					++GuardFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  GUARD BAND: material dword %d is %08x and belongs to no allocation."),
+					       W, PoolMat[W]);
+				}
+			}
+			for (int32 Slot = 0; Slot < int32(DescSlots) && GuardFail == 0; ++Slot)
+			{
+				if (!DescLive[Slot] && (PoolDesc[Slot * 2] != 0 || PoolDesc[Slot * 2 + 1] != 0))
+				{
+					++GuardFail;
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("  GUARD BAND: descriptor slot %d is %08x/%08x and belongs to no chunk."),
+					       Slot, PoolDesc[Slot * 2], PoolDesc[Slot * 2 + 1]);
+				}
+			}
+			for (int32 Slot = 0; Slot < int32(ChunkSlots) && GuardFail == 0; ++Slot)
+			{
+				if (LiveSlots.Contains(uint32(Slot)))
+				{
+					continue;
+				}
+				// kChunkRecordDwords, NOT 8. A literal here is one of the ways
+				// this record's length can grow while a checker silently keeps
+				// inspecting the old half: the guard would then check dwords 0-7
+				// of every dead slot and never look at 8-15, so a stale tail
+				// would be invisible. A slot freed and re-allocated would carry
+				// the PREVIOUS TENANT'S per-chunk shading, and the symptom is
+				// tint that follows slot reuse -- with this gate reporting pass.
+				for (int32 W = 0; W < FVoxelBrickPool::kChunkRecordDwords; ++W)
+				{
+					const int32 D = Slot * FVoxelBrickPool::kChunkRecordDwords + W;
+					if (PoolTable[D] != 0)
+					{
+						++GuardFail;
+						UE_LOG(LogVoxelGpuAsync, Error,
+						       TEXT("  GUARD BAND: chunk record %d dword %d is %08x and belongs to no "
+						            "chunk."), Slot, W, PoolTable[D]);
+						break;
+					}
+				}
+			}
+
+			const bool bPass = (ScratchFail == 0 && PoolDescFail == 0 && OccFail == 0 && MatFail == 0
+			                    && RecordFail == 0 && GuardFail == 0 && NumFailed == 0
+			                    && NumMismatched == 0 && NumDoubleDelivered == 0 && Checked > 0);
+			const FString Summary = FString::Printf(
+				TEXT("voxel.GPU.VerifyBrickPack: %s — %d/%d chunks checked against ")
+				TEXT("packChunkBricksCanonical. scratchDescFail=%d poolDescFail=%d occFail=%d ")
+				TEXT("matFail=%d recordFail=%d guardFail=%d failed=%d sizeMismatch=%d ")
+				TEXT("doubleDelivered=%d. Pool: %d resident, %u occ + %u mat dwords used, ")
+				TEXT("largest free run occ %u mat %u, allocFail %lld, evictions %lld."),
+				bPass ? TEXT("PASS — the resident volume is byte-identical to the CPU reference")
+				      : TEXT("FAIL"),
+				Checked, NumChunks, ScratchFail, PoolDescFail, OccFail, MatFail, RecordFail,
+				GuardFail, NumFailed, NumMismatched, NumDoubleDelivered,
+				Pool.GetNumResidentChunks(), Pool.GetUsedOccWords(), Pool.GetUsedMatWords(),
+				Pool.GetLargestFreeOccRun(), Pool.GetLargestFreeMatRun(),
+				Pool.GetAllocFailures(), Pool.GetEvictions());
+			if (bPass)
+			{
+				UE_LOG(LogVoxelGpuAsync, Log, TEXT("%s"), *Summary);
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuAsync, Error, TEXT("%s"), *Summary);
+			}
+
+			// A run where every chunk packed to nothing would pass all six checks
+			// vacuously. SurfaceChunkKey picks chunks containing the surface, so
+			// this should never fire -- which is exactly why it is worth saying
+			// when it does.
+			if (Checked > 0 && Pool.GetUsedMatWords() == 0)
+			{
+				UE_LOG(LogVoxelGpuAsync, Warning,
+				       TEXT("  NOT ONE chunk allocated a material dword. Every chunk under test packed "
+				            "to uniform bricks, so this run says nothing about the payload."));
+			}
+		}
+
+		bool Tick(float DeltaSeconds)
+		{
+			if (!bStarted)
+			{
+				ElapsedBeforeStart += double(DeltaSeconds);
+				if (ElapsedBeforeStart < StartDelaySeconds)
+				{
+					return true;
+				}
+				if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+				{
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("voxel.GPU.VerifyBrickPack: this RHI cannot run the kernels (SM6 with "
+					            "64-bit integer ops required)."));
+					return false;
+				}
+				if (!ForceCvars())
+				{
+					// The gate could not put the engine into the configuration it
+					// is about to describe. A PASS or a FAIL from here would be a
+					// reading of an unknown path.
+					RestoreCvars();
+					return false;
+				}
+				bStarted = true;
+				Start();
+				return true;
+			}
+
+			Manager.Tick();
+
+			if (NumDelivered < NumChunks)
+			{
+				if (FPlatformTime::Seconds() - FirstSubmitSeconds > 120.0)
+				{
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("ABANDONING: %d of %d jobs never reported back."),
+					       NumChunks - NumDelivered, NumChunks);
+					RestoreCvars();
+					return false;
+				}
+				return true;
+			}
+
+			// The pool writes are render commands the manager's Tick enqueued;
+			// let a couple of frames pass, then read through the same command
+			// stream, which orders the readback behind them.
+			if (!bReadbackStarted)
+			{
+				Pool.Flush();
+				if (++DrainTicks < 3)
+				{
+					return true;
+				}
+				bReadbackStarted = true;
+				BeginReadback();
+				if (bReadbackFailed)
+				{
+					RestoreCvars();
+					return false;
+				}
+				return true;
+			}
+			if (!HarvestReadback())
+			{
+				if (++HarvestTicks > 600)
+				{
+					UE_LOG(LogVoxelGpuAsync, Error,
+					       TEXT("voxel.GPU.VerifyBrickPack: the readback never landed"));
+					RestoreCvars();
+					return false;
+				}
+				return true;
+			}
+
+			Compare();
+			RestoreCvars();
+			return false;
+		}
+
+		vxc::SyntheticTileSampler Tiles;
+		vxc::SyntheticTileSampler CpuTiles;
+		vxc::Amplifier CpuAmp;
+
+		TArray<FChunkUnderTest> Chunks;
+		FVoxelBrickPool Pool;
+
+		TArray<uint32> PoolDesc;
+		TArray<uint32> PoolOcc;
+		TArray<uint32> PoolMat;
+		TArray<uint32> PoolTable;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> PoolDescReadback;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> PoolOccReadback;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> PoolMatReadback;
+		TSharedPtr<FRHIGPUBufferReadback, ESPMode::ThreadSafe> PoolTableReadback;
+		uint32 DescSlots = 0, OccWords = 0, MatWords = 0, ChunkSlots = 0;
+
+		int32 NumChunks = 0;
+		int32 MaxInFlight = 4;
+		double StartDelaySeconds = 25.0;
+		double ElapsedBeforeStart = 0.0;
+		double FirstSubmitSeconds = 0.0;
+		int32 NumDelivered = 0, NumFailed = 0, NumMismatched = 0, NumDoubleDelivered = 0;
+		int32 DrainTicks = 0, HarvestTicks = 0;
+		FForcedCvar PackCvarState, ResidentCvarState;
+		bool bStarted = false, bReadbackStarted = false, bReadbackFailed = false, bCvarsForced = false;
+
+		FVoxelGpuMeshJobManager Manager;
+	};
+
+	void VerifyBrickPackCommand(const TArray<FString>& Args)
+	{
+		const int32 NumChunks = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 256) : 16;
+		const int32 InFlight = (Args.Num() > 1) ? FMath::Clamp(FCString::Atoi(*Args[1]), 1, 64) : 4;
+		const double Delay = (Args.Num() > 2) ? FMath::Max(0.0, FCString::Atod(*Args[2])) : 25.0;
+
+		TSharedPtr<FBrickPackVerifyRun> Run = MakeShared<FBrickPackVerifyRun>(NumChunks, InFlight, Delay);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float Dt) -> bool { return Run->Tick(Dt); }), 0.0f);
+	}
+
+	FAutoConsoleCommand GVoxelGpuVerifyBrickPackCmd(
+		TEXT("voxel.GPU.VerifyBrickPack"),
+		TEXT("P1-C / P2 gate: pack K chunks into the resident brick volume through the streaming "
+		     "dispatch, publish them into a private FVoxelBrickPool, read the POOL back and "
+		     "byte-compare it against vxc::packChunkBricksCanonical. Checks the scratch (chunk-relative, "
+		     "no rebase) and pool (rebased by the real allocation) descriptors, both arenas, the 32 B "
+		     "chunk record including allSolid, and a guard band over every unallocated dword. Forces "
+		     "voxel.GPU.BrickPack 1 / BrickPackResident 0 and restores them. Usage: [K=16] [InFlight=4] "
+		     "[delaySeconds=25]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyBrickPackCommand));
 
 	FAutoConsoleCommand GVoxelGpuVerifyPoolWriteCmd(
 		TEXT("voxel.GPU.VerifyPoolWrite"),

@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "VoxelBrickPool.h"   // FVoxelBrickChunkShading
+
 #include "CoreMinimal.h"
 
 // Mirror of GpuColumnSample in worldgen.ush — the per-column stratigraphy the
@@ -36,6 +38,12 @@ struct FVoxelGpuColumnSample
 // ElevationMm.
 struct FVoxelGpuRegionRequest
 {
+	// WAVE 2. The per-chunk shading this region's chunk record will carry.
+	// Travels on the REQUEST because the record is written on the GPU at job
+	// completion, long after the game thread that sampled the climate is gone --
+	// the same reason the region already carries its own origin and level.
+	FVoxelBrickChunkShading BrickShading;
+
 	// Columns dispatched along x and y. Must both be multiples of 8 (the
 	// kernels work in 8x8x8 bricks) and give at least 3 bricks per axis, or
 	// the mesh chain has no interior brick to mesh.
@@ -69,6 +77,30 @@ struct FVoxelGpuRegionRequest
 	// Skip the mesh chain and stop after voxelization. Useful to isolate a
 	// failure to the generation half.
 	bool bMeshChain = true;
+
+	// --- P1-C: the resident brick volume ------------------------------------
+	//
+	// Runs BrickClassifyMain -> Scan x2 -> BrickPackMain over the SAME Cells
+	// buffer the mesh chain reads, immediately after the asset stamp, in the
+	// same graph. Additive: with this false the graph is byte-for-byte the one
+	// that shipped, and nothing about the mesh chain changes when it is true.
+	//
+	// THE REGION MUST DECOMPOSE INTO WHOLE RENDER CHUNKS FROM BRICK ZERO --
+	// DispatchColumns multiples of 32 and BricksZ a multiple of 4 -- because
+	// brickpack.ush's decodeBrick has no brick origin: chunk c of the dispatch
+	// is bricks [4c, 4c+4) counted from the region's own corner. That is NOT
+	// the mesher's 48x48x6 footprint, whose interior bricks start at brick 1,
+	// so a job that wants both dispatches this on a SECOND, halo-free region
+	// (VoxelGpuChunkRegion::MakeBrickRegion). ValidateRegionRequest refuses a
+	// region of the wrong shape rather than silently packing the halo corner --
+	// which would produce a complete, self-consistent, one-brick-displaced
+	// world.
+	//
+	// docs/brick-volume-format.md is the byte contract, and
+	// docs/ray-marching-plan-2026-08-19.md section 8 is why the halo goes away:
+	// a marcher reads neighbours by index, so it needs no apron, and the
+	// dispatch is 3.375x less voxelize work per chunk than the mesher's.
+	bool bBrickPack = false;
 
 	// --- Wave D / D2: the chunk-local emit permutation ----------------------
 	//

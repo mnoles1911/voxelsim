@@ -9,6 +9,10 @@
 #include "VoxelClimateProbe.h"
 #include "VoxelGpuPoolComponent.h"
 #include "VoxelGpuMeshJobManager.h" // Wave D / D4: the async GPU mesh runner, forked into DispatchJobs
+#include "VoxelBrickPool.h"        // P2: the resident brick volume both mesh arms now publish into
+#include "VoxelBrickCpuPackFromCore.h" // Phase 6: the ONE vxc::ChunkBrickPack -> FVoxelBrickCpuPack copy, shared with the cover producer
+#include "VoxelMarchRenderer.h"    // VoxelMarchPublishStreamingState -- the marcher's convergence signal
+#include "VoxelMarchChunkIndex.h"  // Wave 1.2: the index side of a brick removal, reported next to the pool side
 #include "VoxelGpuRegionBuild.h"    // FillRasterWindow -- shared with both GPU verify harnesses
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
@@ -46,6 +50,7 @@
 #include "voxelcore/assetchannels.h" // ...the canonical channel binding (bake-28 planes + water datum)
 #include "voxelcore/assetfield.h"    // ...the layer table + species + policy, as one object
 #include "voxelcore/assetmanifest.h" // ...and the table asset-forge exports
+#include "voxelcore/brickpack.h" // P2: packChunkBricksCanonical -- the CPU arm's brick producer
 #include "voxelcore/bytes.h"
 // -VoxelCavernShot searches for natural cavern rooms via ColumnSample::cavern
 // (CavernSeg::marginSq); amplifier.h already pulls this in, included
@@ -1314,6 +1319,34 @@ struct FChunkRecord
 	// turn on this and must not care which renderer is in play.
 	bool HoldsGeometry() const { return Component.IsValid() || PoolSlot != INDEX_NONE; }
 
+	// PHASE 5: "IS THERE DRAWN GEOMETRY" AND "IS THERE TERRAIN HERE" ARE NOT
+	// THE SAME QUESTION, and they were only ever the same while quads were the
+	// only producer.
+	//
+	// HoldsGeometry() means "this record owns something render-facing that
+	// costs a RemovePrimitive or a pool free to drop". That is the right
+	// question for the unload budget and the retention gate, and it stays
+	// exactly as it was.
+	//
+	// It is the WRONG question for two callers, and under terrain quad
+	// retirement it is wrong in a way that breaks the game rather than a
+	// metric:
+	//
+	//   * the record-drop sweep would drop a chunk that is fully resident in
+	//     the brick volume, then immediately re-admit it -- a permanent
+	//     re-queue loop;
+	//   * DebugChunkStatusAt reports "no component", so VoxelCharacterMovement
+	//     holds the pawn in bWaitingForTerrain FOREVER and vetoes gravity. The
+	//     player stands on nothing, over terrain that is being drawn.
+	//
+	// ASKED, NOT MIRRORED. A bBrickPublished flag on this record would be a
+	// derived copy of the pool's own answer, free to drift, and it would be
+	// blind to the GPU fork (which publishes straight from the job manager with
+	// no CPU pack to observe). FindChunkSlot is the authority for both arms.
+	//
+	// Game thread only, which every caller of this already is.
+	bool HoldsTerrain(const VoxelCoords::FVoxelLevelChunkKey& Key) const;
+
 	// Bumped by MarkChunkDirtyForRemesh whenever an edit dirties this chunk.
 	// A worker job snapshots the id at dispatch time; if it no longer
 	// matches this value when the result is drained, the result is stale
@@ -1538,6 +1571,20 @@ struct FJobResult
 	// FVoxelGpuMeshJobResult::QueuedMs.
 	double DeliverSeconds = 0.0;
 
+	// --- P2 coverage: the bricks this CPU job packed ------------------------
+	//
+	// Non-null when the worker also packed this chunk into the brick volume's
+	// format. It rides the result rather than being published from the worker
+	// because FVoxelBrickPool is GAME THREAD ONLY -- the same reason GpuQuads
+	// rides it -- and it is published in DrainResults only for a result that is
+	// actually APPLIED, so a stale or superseded job cannot leave the brick
+	// volume describing terrain the renderer does not have.
+	//
+	// Null on every GPU-fork result (that arm publishes directly from the job
+	// manager) and null whenever voxel.Brick.PackOnCpu or voxel.GPU.BrickPack is
+	// off. Dropping it is always safe: it is plain system memory.
+	FVoxelBrickCpuPackRef BrickPack;
+
 	// S0-3: true when this result came from the GPU fork (OnGpuMeshJobComplete)
 	// rather than the CPU worker task body. The two arms' latency windows are
 	// kept separate (VoxelWorldSubsystem.cpp's GpuSubmitToDeliverMsWindow vs
@@ -1549,6 +1596,331 @@ struct FJobResult
 };
 
 } // namespace VoxelStreaming
+
+// ---------------------------------------------------------------------------
+// P2 COVERAGE: THE CPU ARM OF THE RESIDENT BRICK VOLUME
+// ---------------------------------------------------------------------------
+//
+// WHAT THIS FIXES, measured on p1-brickgate-r1/r2 and not guessed at. The brick
+// pool was fed ONLY by the GPU mesh fork, and that fork dispatched 4,564 of the
+// 88,151 chunks the streaming path offers -- 5.2% -- because its in-flight queue
+// (cap GpuMaxInFlight, 256) saturated in the first five-second window and never
+// drained: streaming loaded 11,020 chunks in 5 s against a fork throughput of
+// ~250/s decaying to ~25/s. Everything arriving while the queue was full fell
+// through to the CPU worker below, and the CPU worker had no brick code at all.
+// The pool settled at 4,368 chunks / 8.6 MiB against a target of 88,151 / ~181
+// MiB, with allocFail 0 and evictions 0 -- so the brick path was working at
+// ~100% of what it was OFFERED, and the whole shortfall was upstream of it.
+//
+// WHY THIS AND NOT A BIGGER GPU QUEUE. Raising the cap moves the ratio and
+// leaves three structural holes: a chunk whose GPU job TIMED OUT is flagged
+// bNoGpuRetry and is CPU-only for the rest of the session; adopted parked
+// geometry never re-runs a job; and -- the one that is a correctness bug rather
+// than a coverage percentage -- EDITED AND OVERLAY CHUNKS AND EVERY POST-EDIT
+// RE-MESH ARE GAME-THREAD CPU ONLY, so without a CPU producer the brick volume
+// silently diverges from the world after any edit and never heals. Only a CPU
+// producer closes that, and the first two close for free once it exists.
+//
+// WHAT IT COSTS, WHICH IS NOT ASSUMED. This is per-chunk work on the streaming
+// path -- the very path the ray-marching wave exists to speed up -- so every
+// pack is timed and counted (VoxelBrickNoteCpuPack) and voxel.Brick.PackOnCpu 0
+// is the control arm. Read `voxel.Brick.Stats` for both numbers before believing
+// anything about the cost.
+namespace VoxelBrickCpuArm
+{
+	// GAME THREAD. Read once per dispatch and captured by value into the worker
+	// task body, which is this file's established pattern for a gate a worker
+	// needs (bPredictedEmpty, bComputeBand, bLatencyStatsEnabled).
+	//
+	// THE MASTER GATE IS voxel.GPU.BrickPack, not voxel.Brick.PackOnCpu. With
+	// BrickPack off nothing packs anywhere and this arm must be as absent as the
+	// GPU one, or the "byte-identical to the graph without it" claim that cvar
+	// makes stops being true of the frame as a whole.
+	inline bool ShouldPack()
+	{
+		return VoxelGpuBrickPackEnabled() && VoxelBrickPackOnCpuEnabled();
+	}
+
+	// Is anything consuming the CONTENTS of chunks that emit no faces?
+	//
+	// THE MASTER GATE ONLY, deliberately -- voxel.GPU.BrickPack, not ShouldPack.
+	// A chunk needs to reach the volume if EITHER producer will pack it, and the
+	// GPU fork packs under BrickPack alone with voxel.Brick.PackOnCpu off. Asking
+	// ShouldPack here would keep dropping all-solid chunks on exactly the arm
+	// where the fork is the only producer.
+	//
+	// This is the flag every pre-dispatch skip must consult; see
+	// VoxelStreaming::BandSkipMayDropChunk for what it decides and for the
+	// measured 9,300-chunk hole that made it necessary.
+	inline bool VolumeNeedsSolidChunks()
+	{
+		return VoxelGpuBrickPackEnabled();
+	}
+
+	// --- reusing the mesher's reads instead of repeating them --------------
+	//
+	// MEASURED, NOT ASSUMED: the CPU arm cost 0.743 ms/chunk of worker time and
+	// took cold fill 35.4 s -> 48.1 s (+36%) on the leg that shipped it. Nearly
+	// all of that is 32,768 sampler calls per chunk -- and the mesher had just
+	// made the same reads. voxelcore/mesher.h materialises each brick plus its
+	// apron into mat[10^3] before any face scan and discards it; per brick that
+	// is 1,000 reads of which the packer needs 512.
+	//
+	// So the packer consumes the mesher's reads through a sink instead. Per
+	// chunk that is ~64,000 sampler calls instead of ~96,800 -- a third of the
+	// sampling removed, which is the same order as the regression.
+	//
+	// AND IT STRENGTHENS THE PROPERTY THAT MATTERED IN THE FIRST PLACE. The
+	// point of handing the packer the mesher's sampler was that the mesh and the
+	// brick volume must be two encodings of ONE set of answers; taking the
+	// actual VALUES rather than re-asking the same function makes that true by
+	// construction instead of by the sampler being pure.
+	struct FDenseChunkSink
+	{
+		static constexpr bool kRecords = true;
+		vxc::MaterialId* Dense = nullptr;
+		FORCEINLINE void Set(int32 Cx, int32 Cy, int32 Cz, vxc::MaterialId M) const
+		{
+			Dense[Cx + VoxelCoords::ChunkEdgeVoxels * (Cy + VoxelCoords::ChunkEdgeVoxels * Cz)] = M;
+		}
+	};
+
+	// 32 KB per worker thread, reused for the life of the process, for exactly
+	// the reason the level-0 column grid is a thread_local scratch: a per-job
+	// allocation of this size is an OS-backed commit and a first-touch page-fault
+	// storm PER CHUNK, and the number of jobs doing it concurrently is what rises
+	// under motion. A job's dense chunk is dead the moment the job returns, no
+	// job outlives its own thread, and this never nests.
+	inline vxc::MaterialId* ThreadDenseChunk()
+	{
+		static thread_local vxc::MaterialId Dense[VoxelCoords::ChunkEdgeVoxels *
+		                                          VoxelCoords::ChunkEdgeVoxels *
+		                                          VoxelCoords::ChunkEdgeVoxels];
+		return Dense;
+	}
+
+	// MOVED TO VoxelBrickCpuPackFromCore.h, NOT COPIED, and the move is the whole
+	// point. Phase 6 adds a SECOND producer -- ground cover, packed by
+	// vxc::packCoverChunk in VoxelDetailAssetSubsystem.cpp -- that needs this
+	// exact conversion, and a second transcription of a byte format is the defect
+	// shape this project has paid for most often. One definition, two callers.
+	//
+	// The forwarder is kept rather than the call sites being rewritten: this file
+	// has two producers of its own already pointing at this name, and renaming
+	// them would put churn in a hot file for no gain.
+	inline FVoxelBrickCpuPackRef FinishPack(const vxc::ChunkBrickPack& Packed,
+	                                        int64 BaseVX, int64 BaseVY, int64 BaseVZ)
+	{
+		return VoxelBrickCpuPackFromCore(Packed, BaseVX, BaseVY, BaseVZ);
+	}
+
+	// Packs one chunk through vxc::packChunkBricksCanonical and copies the result
+	// into the engine-side carrier. Runs on whatever thread meshed the chunk.
+	//
+	// Sampler is the SAME functor the mesher was just handed, over LEVEL-L voxel
+	// coordinates -- that is the point. Handing the packer a second sampler would
+	// be a second opinion about what the world contains, which is precisely the
+	// class of bug this project keeps paying for (a join computed instead of
+	// checked); here the brick volume and the mesh are provably two encodings of
+	// one sampler's answers.
+	//
+	// The packer reads the chunk INTERIOR only (0..31 on each axis), never the
+	// apron, so the ring skirt -- which rewrites apron voxels to AIR for the
+	// mesher -- cannot reach it and no skirt argument is needed.
+	template <typename SamplerFn>
+	FVoxelBrickCpuPackRef PackChunk(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+	                                const SamplerFn& Sampler)
+	{
+		static_assert(int32(VoxelCoords::ChunkEdgeVoxels) == int32(vxc::kMarchChunkEdgeVoxels),
+		              "a render chunk and a brick chunk must be the same 32 voxels on a side; the "
+		              "brick key IS the render chunk key and the record's origin is Key * 32");
+
+		const int64 BaseVX = int64(LevelKey.Key.X) * VoxelCoords::ChunkEdgeVoxels;
+		const int64 BaseVY = int64(LevelKey.Key.Y) * VoxelCoords::ChunkEdgeVoxels;
+		const int64 BaseVZ = int64(LevelKey.Key.Z) * VoxelCoords::ChunkEdgeVoxels;
+
+		const double PackStartSeconds = FPlatformTime::Seconds();
+		const vxc::ChunkBrickPack Packed = vxc::packChunkBricksCanonical(
+			[&Sampler, BaseVX, BaseVY, BaseVZ](int32_t X, int32_t Y, int32_t Z) -> vxc::MaterialId
+			{
+				return Sampler(BaseVX + X, BaseVY + Y, BaseVZ + Z);
+			});
+		// Timed around the PACK ALONE, not the copy below: the pack is the term
+		// that scales with what the chunk contains and the term a control arm
+		// removes, and mixing a fixed-size memcpy into it would flatter it.
+		VoxelBrickNoteCpuPack((FPlatformTime::Seconds() - PackStartSeconds) * 1000.0,
+		                      /*bFromDense*/ false);
+		return FinishPack(Packed, BaseVX, BaseVY, BaseVZ);
+	}
+
+	// The cheap producer: the SAME packer, reading the voxels the mesher already
+	// read (FDenseChunkSink) instead of asking the sampler for them again.
+	//
+	// IT IS NOT A SECOND PACKER AND MUST NEVER BECOME ONE. The bytes still come
+	// out of vxc::packChunkBricksCanonical; only where it gets its materials
+	// changes, from a function call to an array load. Dense must hold all 32,768
+	// interior cells of this chunk -- MeshChunkBricks fills every one of them
+	// when a sink is attached, including the bricks its own skip predicate
+	// removed, which is why that fill exists.
+	//
+	// bFillWasFree says the MESHER supplied Dense. It is a parameter rather than
+	// an assumption because the suppression arm also packs from a dense array --
+	// one it filled and PAID for -- and a counter that called that "read the
+	// mesher voxels" would report the reuse as working on the one arm where there
+	// is no mesher to reuse. That is the exact class of self-confirming counter
+	// this instrument exists to prevent.
+	inline FVoxelBrickCpuPackRef PackChunkFromDense(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+	                                                const vxc::MaterialId* Dense,
+	                                                bool bFillWasFree)
+	{
+		constexpr int32 Edge = VoxelCoords::ChunkEdgeVoxels;
+		const int64 BaseVX = int64(LevelKey.Key.X) * Edge;
+		const int64 BaseVY = int64(LevelKey.Key.Y) * Edge;
+		const int64 BaseVZ = int64(LevelKey.Key.Z) * Edge;
+
+		const double PackStartSeconds = FPlatformTime::Seconds();
+		const vxc::ChunkBrickPack Packed = vxc::packChunkBricksCanonical(
+			[Dense](int32_t X, int32_t Y, int32_t Z) -> vxc::MaterialId
+			{
+				return Dense[X + Edge * (Y + Edge * Z)];
+			});
+		// Charged to the SAME ms counter as the re-sampling producer, deliberately:
+		// voxel.Brick.Stats' ms/chunk is then comparable across the change instead
+		// of being two numbers that have to be reconciled. Counted SEPARATELY as a
+		// dense pack, so "the reuse is running" is a fact and not an inference
+		// from the timing having improved.
+		VoxelBrickNoteCpuPack((FPlatformTime::Seconds() - PackStartSeconds) * 1000.0,
+		                      /*bFromDense*/ bFillWasFree);
+		return FinishPack(Packed, BaseVX, BaseVY, BaseVZ);
+
+	}
+
+
+	// Fills the dense chunk from the sampler, ONCE, and packs from it.
+	//
+	// THE PHASE 5 SHAPE OF THIS WORKER, and the reason it exists as its own
+	// function rather than falling back to PackChunk's scattered sampling. Under
+	// voxel.Brick.SuppressQuadMesh there is no mesher, so there is nothing to
+	// reuse -- and the first version of that arm therefore measured the
+	// EXPENSIVE form (0.608 ms/chunk) and would have put it on the plan as
+	// "Phase 5 packing costs 0.608". The counter caught it; this removes the
+	// trap. With no mesher, something still has to materialise the voxels once,
+	// and in Phase 5 that something is the packer.
+	//
+	// COLUMN ORDER: x and y outer, z INNERMOST. Not incidental. Every sampler on
+	// this path is column-shaped -- the level-0 grid holds a 184-byte
+	// vxc::ColumnSample per (x,y) and Amplifier::materialAt walks it for a given
+	// z -- so z-innermost touches one column 32 times in a row instead of
+	// sweeping the whole 208 KB grid 32 times. The dense array is 32 KB and stays
+	// resident either way, so the store pattern is the cheap side of this trade
+	// and the sampler's is the expensive one.
+	template <typename SamplerFn>
+	FVoxelBrickCpuPackRef PackChunkMaterialising(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+	                                             const SamplerFn& Sampler)
+	{
+		constexpr int32 Edge = VoxelCoords::ChunkEdgeVoxels;
+		const int64 BaseVX = int64(LevelKey.Key.X) * Edge;
+		const int64 BaseVY = int64(LevelKey.Key.Y) * Edge;
+		const int64 BaseVZ = int64(LevelKey.Key.Z) * Edge;
+		vxc::MaterialId* Dense = ThreadDenseChunk();
+
+		// Timed apart from the pack, because these are the two terms Phase 5
+		// pays and `mesh` is what they have to be compared against.
+		const double FillStartSeconds = FPlatformTime::Seconds();
+		for (int32 X = 0; X < Edge; ++X)
+		{
+			for (int32 Y = 0; Y < Edge; ++Y)
+			{
+				const int64 WX = BaseVX + X;
+				const int64 WY = BaseVY + Y;
+				for (int32 Z = 0; Z < Edge; ++Z)
+				{
+					Dense[X + Edge * (Y + Edge * Z)] = Sampler(WX, WY, BaseVZ + Z);
+				}
+			}
+		}
+		VoxelBrickNoteCpuFill((FPlatformTime::Seconds() - FillStartSeconds) * 1000.0);
+
+		// bFillWasFree FALSE: this arm paid for the fill above, and the `fill`
+		// term in voxel.Brick.Stats is where that cost is reported.
+		return PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ false);
+	}
+
+	// MeshChunkBricks, timed, and nothing else in the timer.
+	//
+	// The mesher's per-chunk cost is one of the three terms the Phase 5 decision
+	// is made of (see VoxelBrickNoteCpuMesh), and it was previously only
+	// available as arithmetic over sampler counts. Seven inferences of that shape
+	// were falsified 7/7 on this project in one day, which is why it is measured.
+	//
+	// WORKER PATH ONLY. Deliberately not used by the game-thread edit re-mesh
+	// (different thread, different sampler) nor by the two equivalence harnesses
+	// (VoxelL0GridVerify / VoxelCoarseGridVerify mesh the SAME chunk a second
+	// time; timing them would roughly double the mean whenever a debug switch was
+	// on, which is a measurement that changes when you look at it).
+	template <typename... ArgsT>
+	FORCEINLINE void TimedMeshChunkBricks(ArgsT&&... Args)
+	{
+		const double MeshStartSeconds = FPlatformTime::Seconds();
+		MeshChunkBricks(Forward<ArgsT>(Args)...);
+		VoxelBrickNoteCpuMesh((FPlatformTime::Seconds() - MeshStartSeconds) * 1000.0);
+	}
+
+	// The brick key for a render chunk. IDENTICAL to what the GPU fork derives
+	// (VoxelGpuMeshJobManager's BrickKey block) because a brick chunk and a render
+	// chunk are the same 32-voxel cube -- if these two ever disagree, one arm
+	// overwrites the other's chunk under the other's key, which is a wrong world
+	// with no error anywhere. Level is clamped to 0..5 exactly as the fork clamps
+	// it, and VoxelCoords::kNumLevels is 6, so the clamp is exact rather than a
+	// collision.
+	inline FVoxelBrickChunkKey MakeKey(const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+	{
+		FVoxelBrickChunkKey Key;
+		Key.X = LevelKey.Key.X;
+		Key.Y = LevelKey.Key.Y;
+		Key.Z = LevelKey.Key.Z;
+		Key.Level = FMath::Clamp(LevelKey.Level, 0, 5);
+		return Key;
+	}
+
+	// GAME THREAD. Publishes one packed chunk, honouring the publication gate.
+	//
+	// voxel.GPU.BrickPackResident 0 means PACKED AND DISCARDED -- the
+	// publication-stubbed measurement arm -- and it has to mean that on this arm
+	// too or the control stops being a control.
+	// STEP 3: the shading is PASSED IN, not sampled here. This namespace is
+	// defined long before SampleChunkParamsForPool, and more importantly the
+	// sampler needs a scene Root that only the caller has -- so the caller, which
+	// already holds Root for the quad path's identical call, does the sampling.
+	inline void Publish(const VoxelCoords::FVoxelLevelChunkKey& LevelKey,
+	                    const FVoxelBrickCpuPackRef& Pack,
+	                    const FVoxelBrickChunkShading& Shading)
+	{
+		if (!Pack.IsValid() || !VoxelGpuBrickPackResidentEnabled())
+		{
+			return;
+		}
+		GetGlobalVoxelBrickPool().AddChunkFromCpu(Pack, MakeKey(LevelKey), Shading);
+	}
+}
+
+namespace VoxelStreaming
+{
+	// See the declaration for why this asks the pool instead of mirroring a
+	// flag. Drawn geometry short-circuits, so the lookup only happens on the
+	// records that would otherwise be treated as empty -- which under the
+	// current default (quads on) is the rare path, and under retirement is the
+	// only path.
+	bool FChunkRecord::HoldsTerrain(const VoxelCoords::FVoxelLevelChunkKey& Key) const
+	{
+		if (HoldsGeometry())
+		{
+			return true;
+		}
+		return GetGlobalVoxelBrickPool().FindChunkSlot(VoxelBrickCpuArm::MakeKey(Key)) != INDEX_NONE;
+	}
+}
+
 
 // M3 wave 1 (docs/m3-plan.md "Transport"): the wire format AVoxelEditRelay's
 // MulticastAppliedEntries and AVoxelEarthPlayerController's join-sync RPCs
@@ -1889,6 +2261,35 @@ int32 GpuMeshInFlight()
 // -VoxelGpuMeshMaxLevel=<n> still lowers the cap for measurement (0 restores the
 // level-0-only fork, and the clamp's upper bound is the highest level
 // VerifyCoarse has proven).
+// PHASE 5: THE FALSIFIER FOR THE SKIP VERIFIERS.
+//
+// A guard nobody has seen fail is a guard nobody knows works. Both skip
+// verifiers are about to be re-expressed against the brick pack so they survive
+// terrain quad retirement, and a re-expressed guard that silently never fires is
+// worse than the quad-valued one it replaced -- it would carry the same
+// "checked N, violations 0" reassurance with a new justification.
+//
+// 1 = fabricate ONE violation at each verifier, the first time each is reached.
+// The log says (MUTATED) so it can never be mistaken for a real finding. Run a
+// leg with it on: both verifiers must report exactly one violation. Run with it
+// off: both must report zero. Neither result is interesting on its own; the PAIR
+// is the proof.
+int32 GMutateSkipVerify = 0;
+FAutoConsoleVariableRef CVarMutateSkipVerify(
+	TEXT("voxel.Stream.MutateSkipVerify"),
+	GMutateSkipVerify,
+	TEXT("MEASUREMENT ONLY, default 0. 1 fabricates one violation at each skip verifier so the ")
+	TEXT("guards can be PROVEN able to fire rather than assumed to be. The log marks it (MUTATED) ")
+	TEXT("so it can never be mistaken for a real finding.\n")
+	TEXT("Both verifiers must report exactly ONE (MUTATED) violation with this on, and ZERO with ")
+	TEXT("it off. Neither result is interesting alone; the PAIR is the proof. These two are about ")
+	TEXT("to become the only check on the buried and all-solid skips once terrain stops producing ")
+	TEXT("quads, and a re-expressed guard that silently never fires is worse than the quad-valued ")
+	TEXT("one it replaced -- it carries the same reassurance with a new justification."),
+	ECVF_Default);
+
+int32 MutateSkipVerify() { return GMutateSkipVerify; }
+
 int32 GpuMeshMaxLevel()
 {
 	static const int32 MaxLevel = []
@@ -2578,6 +2979,20 @@ int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
 	}();
 	return MaxLevel;
+}
+
+int32 UVoxelWorldSubsystem::GetRingOverlapChunks()
+{
+	static const int32 Overlap = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelRingOverlapChunks="), Value);
+		// Clamped at 4: past that the band is wider than the annulus at the
+		// inner levels and the admission span loop grows quadratically. A
+		// marcher needs ONE chunk; anything above that is a bisection tool.
+		return FMath::Clamp(Value, 0, 4);
+	}();
+	return Overlap;
 }
 
 // docs/streaming-handoff.md: RingPresets was static constexpr and had to
@@ -3549,6 +3964,27 @@ struct FVoxelWorldImpl
 	int64 ChunksParkedTotal = 0;
 	int64 ChunksAdoptedTotal = 0;
 
+	// WAVE 1.2. Brick-pool lifetime, counted at the one site that means "this
+	// chunk has left residency".
+	//
+	// TWO COUNTERS AND NEITHER IS AN ERROR, WHICH IS THE DIFFERENCE FROM COVER.
+	// VoxelDetailAssetSubsystem treats a false return from RemoveChunk as a
+	// defect (GCoverReleaseMissing) and is right to: it keeps an explicit list
+	// of the cover chunks it added, so a key it holds and the pool does not is
+	// a divergence. Terrain has no such list. A record legitimately has no
+	// brick when the buried/sky skip never dispatched a job for it, when
+	// voxel.GPU.BrickPack is off, and when the chunk meshed to nothing at a
+	// level the pack does not cover. Counting those as errors would report tens
+	// of thousands of defects on a healthy run and bury the real signal.
+	//
+	// So the pair is read as a RATIO, not as a zero-bar: bricksReleased must
+	// track the unload rate under the shipping config, and the resident count
+	// must fall. bricksAbsent large with bricksReleased zero is the failure
+	// this wave is about -- it means the removal is not reaching the pool.
+	int64 BricksReleasedSinceLog = 0;
+	int64 BricksAbsentSinceLog = 0;
+	int64 BricksReleasedTotal = 0;
+
 	// Park the oldest entries until the map is within Cap. LRU by ParkedAtSeconds.
 	//
 	// THE CAP IS A CORRECTNESS BOUNDARY, NOT A TUNING KNOB. A parked chunk still
@@ -4243,6 +4679,41 @@ struct FVoxelWorldImpl
 	int32 ThisFrameEditRemeshes = 0;      // DrainGameThreadMesh: overlay-aware re-mesh/first-load applies
 	int32 ThisFrameUnloads = 0;           // DrainUnloads: pool-park-or-destroy events
 	float ThisFrameDispatchMs = 0.f;
+	// THE DISPATCH STAGE HAD NO SUB-BRACKETS AND IS THE LARGEST ITEM IN THE
+	// TICK. Measured 2026-08-22: the streaming tick is 73-84% of wall clock and
+	// DispatchJobs is ~44% of it -- 0.21 ms of GAME THREAD PER DISPATCHED CHUNK,
+	// reproducible across two legs whose tracked counts differ by an order of
+	// magnitude (so it is not O(tracked)). Throughput is MaxJobsInFlight x frame
+	// rate, so that per-chunk cost IS the world's generation ceiling.
+	//
+	// `recompute` has carried exitScanMs/sortMs/entryMs for months; dispatch has
+	// carried one number. These three split it into the parts that can actually
+	// be acted on separately, so the next person sizing a fix is reading a
+	// measurement instead of a hypothesis about which call is expensive.
+	float ThisFrameDispatchAirProofMs = 0.f;  // IsChunkProvablyAllAir: the worldgen-grade bound
+	float ThisFrameDispatchBandMs = 0.f;      // the footprint-band cache consult
+	float ThisFrameDispatchSubmitMs = 0.f;    // building and submitting the job itself
+	// SUBDIVIDING `other`, which the first brackets showed is ~88% of dispatch
+	// (18-19 ms of 21) and is remarkably stable frame to frame -- the signature
+	// of a fixed per-candidate cost paid on every iteration.
+	float ThisFrameDispatchPickMs = 0.f;      // ring-quota scan + the queue pop
+	// NeedsOverlayAwarePath: at level 0 this IS ChunkHasEditedBrick -- an overlay
+	// scan of the chunk plus one brick of border on every axis, per candidate.
+	// The remaining suspect for the fixed per-candidate cost, after the quota
+	// scan and the pop both measured ~0.02 ms.
+	float ThisFrameDispatchOverlayMs = 0.f;
+	// THE BISECTOR. Five brackets inside the per-candidate loop account for ~2 ms
+	// of a ~21 ms dispatch, so the cost is very likely NOT in the loop body at
+	// all. This one wraps the WHOLE `while (CpuJobsOutstanding() < MaxJobsInFlight)`
+	// loop, so loopMs vs dispatchMs says in one leg whether to keep subdividing
+	// the loop or to go look at what DispatchJobs does around it.
+	float ThisFrameDispatchLoopMs = 0.f;
+	// THE BUCKET IS MISLABELLED, AND THIS MEASURES BY HOW MUCH. `dispatchMs` is
+	// (T1 - T0) + (T3b - T3), and T0..T1 spans DispatchJobs() AND
+	// GpuMeshJobs->Tick() -- the GPU mesh job manager's whole tick, which builds
+	// the RDG graph, promotes jobs, polls readbacks and publishes bricks. That
+	// is not dispatch in any sense the name suggests.
+	float ThisFrameGpuManagerTickMs = 0.f;
 	float ThisFrameApplyMs = 0.f;
 	float ThisFrameRemeshMs = 0.f;
 	float ThisFrameUnloadMs = 0.f;
@@ -4325,6 +4796,22 @@ struct FVoxelWorldImpl
 	double AccumApplyMs = 0.0;
 	double AccumRemeshMs = 0.0;
 	double AccumUnloadMs = 0.0;
+	// P2: the brick pool's per-tick publication (one render command for every
+	// brick write the tick made). Its own bucket rather than folded into one of
+	// the four above, so the CPU arm's game-thread cost is attributable instead
+	// of hiding inside unload time.
+	double AccumBrickFlushMs = 0.0;
+	// P2 / Phase 5: brick packs completed as of the last periodic log, so the line
+	// below can report a per-window PACK RATE.
+	//
+	// THE ONE THROUGHPUT NUMBER THAT SURVIVES voxel.Brick.SuppressQuadMesh. Every
+	// other streaming rate on that line is denominated in geometry publication,
+	// and the suppression arm publishes none: it read loaded=3,243 against 50,504
+	// while the brick pool filled perfectly normally to 87,753. A metric that
+	// changes meaning under the one arm that needs it is worse than no metric.
+	// Snapshotted from the worker-thread atomic rather than counted here, so it
+	// costs one relaxed load per log and cannot miss a pack.
+	int64 LastLogBrickPackCount = 0;
 	double AccumRecomputeMs = 0.0;
 	double AccumTickMs = 0.0;
 	int32 AccumTicks = 0;
@@ -4485,17 +4972,50 @@ struct FVoxelWorldImpl
 	int64 BuriedSkipsByLevelSinceLog[VoxelCoords::kNumLevels] = {};
 	int64 BuriedSkipAirSinceLog = 0;
 	int64 BuriedSkipSolidSinceLog = 0;
+	// All-solid chunks whose emptiness proof FIRED and was deliberately not
+	// acted on, because the brick volume needs their contents. See
+	// VoxelStreaming::BandSkipMayDropChunk. These two counters are a PAIR and
+	// are only meaningful read together -- see the log line that prints them.
+	int64 BuriedSolidKeptSinceLog = 0;
+	int64 BuriedSolidKeptTotal = 0;
 	// -VoxelVerifyBuriedSkip: predicted-empty chunks actually meshed, and how
 	// many of them turned out to have geometry. The second must be 0.
 	int64 BuriedVerifyCheckedSinceLog = 0;
 	int64 BuriedVerifyCheckedTotal = 0;
 	int64 BuriedVerifyViolations = 0;
+	// PHASE 5: THE THIRD OUTCOME, and it is the one that matters.
+	//
+	// This verifier fires on Result.QuadCount() > 0. Once terrain stops
+	// producing quads that predicate is ALWAYS FALSE, so the guard can never
+	// report a violation while its Checked counter keeps climbing -- it would
+	// read "checked N, violations 0" forever, which is indistinguishable from
+	// healthy. That is the failure this project has hit repeatedly.
+	//
+	// The brick pack answers the same question and survives retirement, but it
+	// is NULL ON EVERY GPU-FORK RESULT (the fork publishes straight from the job
+	// manager). So a replacement predicate alone would still be blind, just
+	// differently. UNCHECKABLE counts results where NEITHER predicate could
+	// answer, so "could not check" can never be folded into "clean".
+	int64 BuriedVerifyUncheckable = 0;
 
 	// All-solid ADMISSION skip census (voxel.Stream.AdmissionSolidSkip): deep
 	// candidates that never became records at all, which is the whole point --
 	// the dispatch-time buried skip already stopped these from costing worker
 	// time, but they still cost a record in every O(ChunkRecords) pass.
 	int64 SolidSkippedAtAdmissionSinceLog = 0;
+	// The admission-time twin of BuriedSolidKeptSinceLog.
+	int64 SolidAdmittedForVolumeSinceLog = 0;
+	// Phase 5 leak attribution -- see the block in ApplyMeshResult. Cumulative,
+	// never reset: the question is whether ANY allocation happened under
+	// retirement over the whole run, not how many did in some window.
+	int64 TerrainQuadsAllocatedWhileRetired = 0;
+	int64 TerrainQuadsAllocatedWhileRetiredQuads = 0;
+	int64 TerrainQuadAllocGameThread = 0;
+	int64 TerrainQuadAllocDrain = 0;
+	// This window's fork dispatches, captured before the per-window counters are
+	// reset. See the assignment for why the raw counter cannot be read later.
+	int64 ForkDispatchedThisWindow = 0;
+	int64 SolidAdmittedForVolumeTotal = 0;
 	int64 SolidSkippedAtAdmissionTotal = 0;
 	int64 LevelSolidSkippedAtAdmission[VoxelCoords::kNumLevels] = {};
 	// -VoxelVerifySolidSkip only: chunk keys IsChunkProvablyAllSolid claimed,
@@ -4505,6 +5025,8 @@ struct FVoxelWorldImpl
 	int64 SolidVerifyCheckedSinceLog = 0;
 	int64 SolidVerifyCheckedTotal = 0;
 	int64 SolidVerifyViolations = 0;
+	// See BuriedVerifyUncheckable. Same argument, same failure mode.
+	int64 SolidVerifyUncheckable = 0;
 
 	// Buried-band ADMISSION skip census (voxel.Stream.AdmissionBandSkip). The
 	// three numbers that decide whether this lever exists at all, counted over
@@ -4767,6 +5289,21 @@ private:
 	// the cvar, so a chunk loaded before a mid-session flip still releases
 	// correctly.
 	void ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec);
+
+	// WAVE 1.2. Free this chunk's bricks from the global brick pool.
+	//
+	// DELIBERATELY NOT FOLDED INTO ReleaseChunkGeometry, and that is the whole
+	// design decision. ReleaseChunkGeometry is reached only from behind
+	// FChunkRecord::HoldsGeometry() (component or pool slot), and under terrain
+	// quad retirement -- the config the marcher ships in -- a record holds
+	// NEITHER. Hooking the bricks there would free nothing at all in the only
+	// configuration that needs it, while passing every test on the quad path.
+	// That is the same "drawn geometry" vs "terrain is here" confusion
+	// HoldsTerrain was added to fix, arriving a second time.
+	//
+	// Bricks belong to the RECORD, not to the record's drawn geometry, so this
+	// is called where the record itself is dropped.
+	void ReleaseChunkBricks(const VoxelCoords::FVoxelLevelChunkKey& Key);
 	// M2 wave 2: generalized from a level-0-only helper (wave 1) to any
 	// level -- both level-0 edited chunks AND their level>=1 mip ancestors
 	// (see PropagateEditToMips) route through here identically.
@@ -4915,6 +5452,48 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	bHasPrevAnchor = true;
 
 	LastAnchorLocation = Anchor;
+
+	// P2 eviction order. SET BEFORE ANYTHING ADDS THIS TICK, which is the whole
+	// reason it is here rather than next to the brick flush at the bottom: an add
+	// that hits capacity evicts INSIDE the add, so a focus published afterwards
+	// would rank this tick's evictions against last tick's camera.
+	//
+	// LEVEL-0 VOXELS, the one frame every ring can be compared in -- see
+	// FVoxelBrickPool::SetEvictionFocusVoxel0. Three stores and no sort; the pool
+	// re-sorts only when it is actually evicting.
+	//
+	// WHAT IT FIXES: the pool evicted in INSERTION order, and near chunks load
+	// first, so under pressure it threw away the ground under the player and kept
+	// the horizon. That was invisible while the pool held 8.6% of the world and
+	// evicted nothing, and becomes visible the moment coverage lands.
+	{
+		const VoxelCoords::FVoxelCoord FocusVoxel = VoxelCoords::WorldToVoxel(Anchor);
+		GetGlobalVoxelBrickPool().SetEvictionFocusVoxel0(FocusVoxel.X, FocusVoxel.Y, FocusVoxel.Z);
+	}
+
+	// THE MARCHER'S EXTENSION IS CREATED HERE, NOT BY THE FLUID SUBSYSTEM.
+	//
+	// It used to be created only inside VoxelMarchPublishSource, which the fluid
+	// subsystem calls -- so with voxel.Fluid.Enable 0 the marcher did not exist
+	// at all and terrain rendering was gated on the water simulation running.
+	// This subsystem owns the brick pool the marcher reads, so it is the honest
+	// owner. Idempotent and free after the first call.
+	VoxelMarchEnsureExtension(Owner.GetWorld());
+
+	// THE POOL ROOT, SET FROM THE TICK RATHER THAN FROM THE QUAD POOL'S BIRTH.
+	//
+	// GpuPoolRoot was assigned in exactly one place: GetOrCreateGpuPool. That is
+	// a quad-path constructor, and under -VoxelRetireQuads=1 the only thing
+	// keeping it alive is a deliberately-empty stand-in pool that exists solely
+	// for GI to find. Hanging the GPU fork's climate sampling off that would make
+	// per-chunk shading depend on a component Phase 5 intends to delete -- and
+	// the failure would be silent: a null root means neutral shading, which is
+	// flat mid-range climate with the surface gate off, i.e. terrain that looks
+	// completely fine.
+	//
+	// This subsystem has Root every tick. Assigning here is idempotent, costs a
+	// pointer store, and removes the dependency outright.
+	GpuPoolRoot = &Root;
 	ElapsedSeconds += DeltaTime;
 
 	// Hitch attribution (docs/status.md "Perf-run hitches" isolation task):
@@ -4928,6 +5507,13 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	ThisFramePoolReuses = 0;
 	ThisFrameRecomputeMs = 0.f;
 	ThisFrameExitScanMs = 0.f;
+	ThisFrameDispatchAirProofMs = 0.f;
+	ThisFrameDispatchBandMs = 0.f;
+	ThisFrameDispatchSubmitMs = 0.f;
+	ThisFrameDispatchPickMs = 0.f;
+	ThisFrameDispatchOverlayMs = 0.f;
+	ThisFrameDispatchLoopMs = 0.f;
+	ThisFrameGpuManagerTickMs = 0.f;
 	ThisFrameSortMs = 0.f;
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
@@ -5284,7 +5870,9 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		// check per frame.
 		if (GpuMeshJobs.IsValid())
 		{
+			const double GpuTickStart = FPlatformTime::Seconds();
 			GpuMeshJobs->Tick();
+			ThisFrameGpuManagerTickMs += float((FPlatformTime::Seconds() - GpuTickStart) * 1000.0);
 		}
 		T1 = FPlatformTime::Seconds();
 
@@ -5370,6 +5958,27 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		}
 		} // PoolBatch closes here -- the tick's single publication happens now.
 		const double T4 = FPlatformTime::Seconds();
+
+		// --- P2: the brick volume's own publication -------------------------
+		//
+		// SEPARATE FROM THE QUAD POOL'S BATCH ABOVE, and it has to be: the brick
+		// pool is a different structure with a different flush and nothing in
+		// FScopedBatch reaches it.
+		//
+		// THE JOB MANAGER'S OWN FLUSH IS NOT SUFFICIENT AND THAT IS THE POINT.
+		// FVoxelGpuMeshJobManager::Tick() ends with a Flush, but it runs BEFORE
+		// DrainResults and DrainGameThreadMesh -- the two places the CPU arm adds
+		// from -- so without this call every CPU-packed chunk would wait a frame,
+		// and on a run with no GPU fork at all (GpuMeshJobs null) it would wait
+		// forever. Cheap and safe with nothing pending: Flush returns without
+		// enqueueing anything.
+		//
+		// TIMED INTO ITS OWN ACCUMULATOR rather than folded into one of the four
+		// stage buckets: T4 is already taken, and a new cost hidden inside
+		// ThisFrameUnloadMs would be a cost nobody could attribute later.
+		const double BrickFlushT0 = FPlatformTime::Seconds();
+		GetGlobalVoxelBrickPool().Flush();
+		AccumBrickFlushMs += (FPlatformTime::Seconds() - BrickFlushT0) * 1000.0;
 
 		// Hitch attribution timing (docs/status.md "Perf-run hitches"
 		// isolation task): four cheap FPlatformTime::Seconds() calls (already
@@ -5501,6 +6110,25 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		       FrameMs, VoxelDebug::kHitchThresholdMs, TickMsSoFar, ElsewhereMs, RenderMs, RenderWaitMs, RHIMs, GameWaitMs,
 		       ThisFrameDispatchMs, ThisFrameApplyMs, ThisFrameRemeshMs, ThisFrameUnloadMs, ThisFrameAppliesFromWorker,
 		       ThisFrameProxiesCreated, ThisFrameEditRemeshes, ThisFrameUnloads, ThisFramePoolReuses, ComponentPool.Num());
+
+		// DISPATCH BREAKDOWN. Same reasoning as the recompute line below: split
+		// out rather than widened into the format string above, so the existing
+		// line stays greppable against every leg ever taken.
+		//
+		// READ IT AS A SUM CHECK FIRST: airProof + band + submit should account
+		// for most of dispatchMs. A large unexplained remainder means the cost
+		// is in the loop's own bookkeeping rather than in any of the three, and
+		// that is a different fix from all of them.
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Hitch frame dispatch: dispatchMs=%.2f = airProofMs=%.2f + bandMs=%.2f + ")
+		       TEXT("submitMs=%.2f + pickMs=%.2f + overlayMs=%.2f + other=%.2f | loopMs=%.2f ")
+		       TEXT("gpuMgrTickMs=%.2f"),
+		       ThisFrameDispatchMs, ThisFrameDispatchAirProofMs, ThisFrameDispatchBandMs,
+		       ThisFrameDispatchSubmitMs, ThisFrameDispatchPickMs, ThisFrameDispatchOverlayMs,
+		       ThisFrameDispatchMs - ThisFrameDispatchAirProofMs - ThisFrameDispatchBandMs
+		           - ThisFrameDispatchSubmitMs - ThisFrameDispatchPickMs
+		           - ThisFrameDispatchOverlayMs,
+		       ThisFrameDispatchLoopMs, ThisFrameGpuManagerTickMs);
 
 		// Recompute breakdown (M1 steady-state-hitch wave): the one stage of
 		// TickStreaming the line above does not cover. Split out rather than
@@ -5988,6 +6616,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		}
 	}
 
+	// THE MARCHER'S CONVERGENCE SIGNAL, published from the one place that holds
+	// all three values already. Convergence is ALL THREE, HELD: jobsInFlight and
+	// pendingJobs at zero is a LULL if TotalChunksLoaded is still climbing, and
+	// this project has a recorded case of a leg "settling" at loaded=40,615
+	// against a true 43,328 and making a subsystem look 12% faster than it was.
+	// The chunk count is what says the world stopped CHANGING rather than merely
+	// stopped being BUSY.
+	//
+	// Routed here rather than published by the marcher itself because these
+	// counters live on this subsystem. Until this call existed the marcher's
+	// convergence gate announced SIGNAL UNWIRED on every refusal rather than
+	// quietly degrading to the weaker index-vs-pool condition -- which can only
+	// ever say "the index kept up", never "the world is the same", because the
+	// pool itself settles at 97,019 / 97,082 / 97,471 across identical legs.
+	VoxelMarchPublishStreamingState(JobsInFlightCounter.GetValue(), PendingJobNum(),
+	                                (int64)TotalChunksLoaded);
+
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel streaming: loaded=%lld unloaded=%lld quads=%lld tracked=%d jobsInFlight=%d pendingJobs=%d ")
 	       TEXT("pendingGameThread=%d pendingUnload=%d underground=%d deepTracked=%d deepWithGeometry=%d residentQuads=%lld"),
@@ -6231,12 +6876,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// The window is the log cadence itself (LogTimerAccumSeconds has already
 	// been reset to 0 above), i.e. 5s plus at most one frame.
 	constexpr double WindowMs = 5000.0;
+	// Read once and reused for both the count and the rate, so the two cannot
+	// disagree by a pack that landed between them.
+	const int64 BrickPacksNow = VoxelBrickGetCpuPackCount();
+	const int64 BrickPacksThisWindow = BrickPacksNow - LastLogBrickPackCount;
+	LastLogBrickPackCount = BrickPacksNow;
 	UE_LOG(LogVoxelPerf, Log,
 	       TEXT("Voxel tick budget (5s window): ticks=%d tickMs=%.1f (%.2f%% of wall) | recompute=%.1f dispatch=%.1f ")
 	       TEXT("apply=%.1f remesh=%.1f unload=%.1f | specEnum=%.1f specDispatch=%.1f specPark=%.1f (of dispatch) ")
-	       TEXT("| perTick tick=%.3f recompute=%.3f"),
+	       TEXT("| brickFlush=%.1f brickPacks=%lld (%.0f/s) | perTick tick=%.3f recompute=%.3f"),
 	       AccumTicks, AccumTickMs, WindowMs > 0.0 ? 100.0 * AccumTickMs / WindowMs : 0.0, AccumRecomputeMs, AccumDispatchMs,
 	       AccumApplyMs, AccumRemeshMs, AccumUnloadMs, AccumSpecEnumerateMs, AccumSpecDispatchMs, AccumSpecParkMs,
+	       AccumBrickFlushMs, BrickPacksThisWindow,
+	       ThisLogWindowSeconds > 0.f ? double(BrickPacksThisWindow) / double(ThisLogWindowSeconds) : 0.0,
 	       AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
@@ -6576,13 +7228,63 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       TotalMs > 0.0 ? 100.0 * LevelZeroQuadMsSinceLog[Level] / TotalMs : 0.0, *GridSuffix);
 	}
 	BuriedVerifyCheckedTotal += BuriedVerifyCheckedSinceLog;
+	BuriedSolidKeptTotal += BuriedSolidKeptSinceLog;
+	const bool bVolumeFedForSkipLog = VoxelBrickCpuArm::VolumeNeedsSolidChunks();
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel buried skip (5s window): enabled=%d verify=%d skipped=%lld (air=%lld solid=%lld) R0=%lld | ")
+	       TEXT("Voxel buried skip (5s window): enabled=%d verify=%d volumeFed=%d skipped=%lld ")
+	       TEXT("(air=%lld solid=%lld) solidKept=%lld (total %lld) R0=%lld | ")
 	       TEXT("bandCache=%d | verifyChecked=%lld (total %lld) violations=%lld"),
 	       VoxelStreamAdmission::BuriedSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifyBuriedSkipEnabled() ? 1 : 0,
+	       bVolumeFedForSkipLog ? 1 : 0,
 	       (long long)BuriedSkipsSinceLog, (long long)BuriedSkipAirSinceLog, (long long)BuriedSkipSolidSinceLog,
+	       (long long)BuriedSolidKeptSinceLog, (long long)BuriedSolidKeptTotal,
 	       (long long)BuriedSkipsByLevelSinceLog[0], FootprintBandCache.Num(), (long long)BuriedVerifyCheckedSinceLog,
 	       (long long)BuriedVerifyCheckedTotal, (long long)BuriedVerifyViolations);
+	// UNCHECKABLE IS REPORTED, NOT ABSORBED. A verifier that could not answer
+	// must not contribute to a violations-of-zero that reads as clean.
+	if (BuriedVerifyUncheckable > 0)
+	{
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Voxel buried skip verifier: %lld results COULD NOT BE CHECKED -- no quads (the "
+		            "quad-valued test is dead) and no brick pack (null on every GPU-fork result). "
+		            "Those results are not evidence of soundness in either direction, and the "
+		            "violations count above does not cover them."),
+		       (long long)BuriedVerifyUncheckable);
+	}
+
+	// THE TRIPWIRE, AND IT CAN FIRE. solid= counts chunks ACTUALLY DROPPED and
+	// solidKept= counts proofs deliberately overridden, so the two are exclusive
+	// and the pair is falsifiable from both sides:
+	//
+	//   volumeFed=1 -> solid= MUST be 0. Any other value is a provably-solid
+	//                  chunk that reached no producer, i.e. terrain the marcher
+	//                  will read as empty. This is NOT vacuous: the drop sites
+	//                  this change fixed are gated, but a NEW skip site added
+	//                  later would land here and be counted, which is exactly the
+	//                  regression worth catching.
+	//   volumeFed=0 -> solidKept= must be 0, and solid= carries the old meaning.
+	//
+	// Error rather than Warning because the failure is invisible in every other
+	// number on this line, and because brick coverage cannot see it AT ALL: that
+	// figure is a fraction of chunks that got a mesh job, and these never do.
+	if (bVolumeFedForSkipLog && BuriedSkipSolidSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Error,
+		       TEXT("Voxel buried skip HOLE: %lld provably ALL-SOLID chunks were dropped before dispatch ")
+		       TEXT("while the brick volume is being fed. Each is a chunk the marcher will read as EMPTY ")
+		       TEXT("because no record exists to say otherwise -- solid rock you can see through. Brick ")
+		       TEXT("coverage cannot show this: it is a fraction of chunks that GET a mesh job, and these ")
+		       TEXT("never do. Some skip site is not consulting VoxelStreaming::BandSkipMayDropChunk."),
+		       (long long)BuriedSkipSolidSinceLog);
+	}
+	if (!bVolumeFedForSkipLog && BuriedSolidKeptSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Error,
+		       TEXT("Voxel buried skip: %lld all-solid chunks were dispatched FOR the brick volume while ")
+		       TEXT("the volume is not being fed. That is pure wasted streaming work -- the override is ")
+		       TEXT("reading a different gate from this line."),
+		       (long long)BuriedSolidKeptSinceLog);
+	}
 	// markTimeouts keeps its exact former meaning -- CPU-seeded marks only -- so
 	// "should be ZERO on a healthy run" still reads true, and the GPU fork cannot
 	// quietly turn the project's only signal for a stranded column into noise.
@@ -6627,6 +7329,53 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       MeanDeliverMs, GpuMeshSubmitToDeliverMaxMs,
 		       kBlindJobMarkTimeoutSeconds,
 		       (long long)GpuMeshSlowDeliveriesSinceLog, (long long)GpuMeshSlowDeliveriesTotal);
+		// THE TICK'S OWN BREAKDOWN. FVoxelGpuMeshJobManager::Tick was measured at
+		// ~18-19 ms per hitch frame -- the largest single item in the streaming
+		// tick, and therefore the world's generation ceiling, since throughput is
+		// MaxJobsInFlight x frame rate. It had one number; these are its stages.
+		//
+		// enqueue is a SUBSET of promote (DispatchBatch is called from inside the
+		// promote stage), so promote-proper is promote - enqueue. Said here as
+		// well as at the source, because a breakdown whose parts overlap silently
+		// is worse than no breakdown.
+		if (GpuMeshJobs.IsValid())
+		{
+			const FVoxelGpuMeshJobManager::FTickStageMs Stages =
+				GpuMeshJobs->GetAndResetTickStageMs();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel GPU mesh tick (5s window): promoteMs=%.1f (of which enqueueMs=%.1f) "
+			            "pollMs=%.1f brickFlushMs=%.1f"),
+			       Stages.PromoteMs, Stages.EnqueueMs, Stages.PollMs, Stages.BrickFlushMs);
+
+			// AND WHAT THAT FLUSH IS MADE OF. Summed across BOTH call sites (this
+			// tick's and the subsystem's own), because the pool owns the counter
+			// and both callers flush the same pool.
+			//
+			// enqueueMs is the number to read first: the game-thread work before
+			// the render command is a couple of moves and a Reserve, so if the
+			// ENQUEUE dominates then this is RENDER-THREAD BACKPRESSURE -- the
+			// game thread waiting -- and not flush work at all. Those have
+			// opposite fixes and the single brickFlush number cannot separate
+			// them.
+			const FVoxelBrickPool::FFlushStageMs F =
+				GetGlobalVoxelBrickPool().GetAndResetFlushStageMs();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel brick flush (5s window, both call sites): prepMs=%.1f "
+			            "enqueueMs=%.1f sinkMs=%.1f"),
+			       F.PrepMs, F.EnqueueMs, F.SinkMs);
+
+			// AND WHAT THE SINK IS MADE OF. Removed was ALWAYS EMPTY until brick
+			// removal landed, so this split says whether Wave 1.2 made the
+			// ceiling worse or merely revealed it.
+			const FVoxelMarchChunkIndex::FApplyDeltaMs A =
+				GetGlobalVoxelMarchChunkIndex().GetAndResetApplyDeltaMs();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel march index applyDelta (5s window): removedMs=%.1f (n=%lld) "
+			            "addedMs=%.1f (n=%lld) uploadMs=%.1f"),
+			       A.RemovedMs, (long long)A.RemovedCount,
+			       A.AddedMs, (long long)A.AddedCount, A.UploadMs);
+		}
+
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel GPU mesh fork by level (5s window): L0=%lld L1=%lld L2=%lld L3=%lld "
 		            "L4=%lld L5=%lld (cap L%d)"),
@@ -6662,6 +7411,13 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			TileCensusSinceLog.Reset();
 		}
 
+		// SNAPSHOT BEFORE THE RESET. The Phase 5 block below runs LATER IN THIS
+		// SAME FUNCTION, so reading GpuMeshJobsDispatchedSinceLog there reads a
+		// counter this line has already zeroed -- it printed forkDispatched=0 on
+		// every window regardless of the truth, and the tripwire built on it
+		// (`dispatched > 0 && brickFromGpu == 0`) could NEVER fire. A guard that
+		// cannot fail, three rounds after writing a comment claiming it could.
+		ForkDispatchedThisWindow = GpuMeshJobsDispatchedSinceLog;
 		for (int64& N : GpuMeshDispatchedByLevel) { N = 0; }
 		GpuMeshJobsDispatchedSinceLog = 0;
 		GpuMeshJobsDeliveredSinceLog = 0;
@@ -6812,6 +7568,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 
 	BuriedSkipsSinceLog = BuriedSkipAirSinceLog = BuriedSkipSolidSinceLog = BuriedVerifyCheckedSinceLog = 0;
+	BuriedSolidKeptSinceLog = 0;
 
 	// Load-before-unload retention census. ONE headline number now:
 	//
@@ -6888,22 +7645,169 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		LogCoverageVerify();
 	}
 
+
+	// --- PHASE 5 self-check -------------------------------------------------
+	//
+	// DESIGNED SO IT CAN FAIL, which is the whole reason it is not "did we stop
+	// meshing" -- that question has no failing state a bug could reach.
+	//
+	// GetUsedQuads, NOT GetNumQuads. The latter returns CAPACITY (192,000,000),
+	// so the obvious form of this gate would compare a constant against zero and
+	// pass forever while checking nothing. This is the second accessor-shaped
+	// trap on this path today.
+	//
+	// Two sides, both reachable:
+	//   retired + terrain pool still allocating -> something still produces quads
+	//   retired + brick volume not growing      -> we stopped producing and did
+	//                                              not start packing, i.e. no
+	//                                              terrain producer at all
+	//
+	// The water pools are DIFFERENT INSTANCES and are expected to be non-zero.
+	// This reads GpuPool, the terrain one, and nothing else.
+	// WAVE 1.2. Brick-pool lifetime. Printed unconditionally, because the
+	// question it answers -- "does anything ever leave the pool" -- was
+	// answered "no" for this pool's entire existence and nothing said so.
+	//
+	// HOW TO READ IT. `released` is the number that has to be non-zero on any
+	// leg with motion; before this wave it was structurally zero. `resident0`
+	// must come DOWN when the camera leaves ground it has covered -- a rising
+	// resident0 with a healthy `released` means removals are being outrun by
+	// admissions, which is a budget question, not a leak. `evictions` is the
+	// one to watch for the failure this wave prevents: the pool evicting on
+	// its own means it filled, and eviction drops bricks the index is still
+	// naming. `absent` is expected to be large and is not an error -- the
+	// buried and sky skips retire records that never had a brick.
+	{
+		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel brick lifetime (5s window): released=%lld absent=%lld | resident0=%d ")
+		       TEXT("indexEntries=%d | cumulative released=%lld evictions=%lld writesDropped=%lld ")
+		       TEXT("neutralShading=%lld"),
+		       (long long)BricksReleasedSinceLog, (long long)BricksAbsentSinceLog,
+		       BrickPool.GetResidentChunkCountAtLevel(0),
+		       GetGlobalVoxelMarchChunkIndex().GetNumEntries(),
+		       (long long)BricksReleasedTotal,
+		       (long long)BrickPool.GetEvictions(), (long long)BrickPool.GetWritesDropped(),
+		       // WAVE 2. Chunks admitted with no climate and no surface gate.
+		       // Cover legitimately reads neutral; terrain must not. Printed on
+		       // the line people already read rather than behind a command,
+		       // because a producer nobody plumbed is invisible in the picture.
+		       (long long)BrickPool.GetChunksAddedWithNeutralShading());
+	}
+
+	if (VoxelTerrainQuadsRetired())
+	{
+		const UVoxelGpuPoolComponent* TerrainPool = GpuPool.Get();
+		const uint32 TerrainUsedQuads = TerrainPool != nullptr ? TerrainPool->GetUsedQuads() : 0u;
+		const int64 BrickChunks = VoxelBrickGetCpuPackCount();
+		const int64 BrickFromGpu = GetGlobalVoxelBrickPool().GetChunksAddedFromGpu();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel Phase 5 (5s window): retired=1 terrainPoolUsedQuads=%u (capacity %d, NOT the ")
+		       TEXT("number to read) residentQuads=%lld brickPacks=%lld brickFromGpu=%lld ")
+		       TEXT("forkDispatched=%lld. Water pools are separate instances and are not counted here."),
+		       TerrainUsedQuads, TerrainPool != nullptr ? TerrainPool->GetNumQuads() : 0,
+		       (long long)ResidentQuads, (long long)BrickChunks, (long long)BrickFromGpu,
+		       (long long)ForkDispatchedThisWindow);
+
+		if (TerrainUsedQuads > 0)
+		{
+			// TWO CAUSES, AND THE COUNTERS SEPARATE THEM. Read
+			// allocWhileRetired FIRST -- it is the only one that distinguishes a
+			// live producer from residue left by the startup window, and the two
+			// need opposite fixes.
+			UE_LOG(LogVoxelPerf, Error,
+			       TEXT("Voxel Phase 5 VIOLATION: terrain quads are retired but the terrain pool still ")
+			       TEXT("holds %u ALLOCATED quads. allocWhileRetired=%lld (%lld quads; gameThread=%lld ")
+			       TEXT("drain=%lld).%s The VRAM and throughput figures from this run are not the ")
+			       TEXT("retired path."),
+			       TerrainUsedQuads,
+			       (long long)TerrainQuadsAllocatedWhileRetired,
+			       (long long)TerrainQuadsAllocatedWhileRetiredQuads,
+			       (long long)TerrainQuadAllocGameThread, (long long)TerrainQuadAllocDrain,
+			       TerrainQuadsAllocatedWhileRetired > 0
+			           ? TEXT(" A PRODUCER IS STILL ALLOCATING under retirement -- gameThread means the ")
+			             TEXT("edit re-mesh, drain means the worker or fork path.")
+			           : TEXT(" NOTHING has allocated since retirement engaged, so every one of these ")
+			             TEXT("quads predates it: they are the -ExecCmds startup window, not a producer. ")
+			             TEXT("The switch must be readable from the COMMAND LINE."));
+		}
+		if (BrickChunks == 0)
+		{
+			UE_LOG(LogVoxelPerf, Error,
+			       TEXT("Voxel Phase 5 VIOLATION: terrain quads are retired and NOTHING has packed a ")
+			       TEXT("brick chunk. There is no terrain producer at all, so the world is empty for a ")
+			       TEXT("reason no other counter states. Check voxel.GPU.BrickPack."));
+		}
+
+		// THE SIDE THAT WAS ONLY READABLE, NOT CHECKED, AND COST A LEG.
+		//
+		// The fork stopping was invisible until the (gpu, cpu) split on
+		// voxel.Brick.Stats was read by hand -- `added (gpu 0, cpu 30113)` against
+		// a control's `(gpu 6120, cpu 90899)`. Nothing errored, because "the CPU
+		// arm is packing" looks exactly like health. Now it errors.
+		//
+		// GUARDED ON THE FORK ACTUALLY BEING USED, so it is not vacuous in the
+		// other direction: a deliberately CPU-only run (-VoxelNoGpuMesh, or the
+		// fork queue saturated for a whole window) legitimately packs nothing on
+		// the GPU, and dispatched == 0 says so. It fires only when the fork ran
+		// jobs and none of them reached the volume.
+		// GpuMeshEnabled() restated here rather than inherited: the snapshot above
+		// is taken inside that same condition, so without this the tripwire would
+		// read a stale value on a run where the fork was never on.
+		if (VoxelStreamAdmission::GpuMeshEnabled() && ForkDispatchedThisWindow > 0 && BrickFromGpu == 0)
+		{
+			UE_LOG(LogVoxelPerf, Error,
+			       TEXT("Voxel Phase 5 VIOLATION: the GPU fork dispatched %lld jobs this window and NOT ")
+			       TEXT("ONE reached the brick volume. The fork is carrying traffic and producing ")
+			       TEXT("nothing, so every chunk it took fell back to the CPU worker -- which publishes ")
+			       TEXT("inside the apply budget, so the leg loses both the fork's chunks and the rate. ")
+			       TEXT("Residency and throughput from this run describe a CPU-only path."),
+			       (long long)ForkDispatchedThisWindow);
+		}
+	}
+
 	// All-solid ADMISSION skip census. Deliberately its own line rather than
 	// folded into the buried-skip one above: they measure different things and
 	// confusing them would hide the point. That line counts chunks that were
 	// TRACKED and then not dispatched; this one counts chunks that never became
 	// records -- the difference the follow-up was about.
 	SolidSkippedAtAdmissionTotal += SolidSkippedAtAdmissionSinceLog;
+	SolidAdmittedForVolumeTotal += SolidAdmittedForVolumeSinceLog;
 	SolidVerifyCheckedTotal += SolidVerifyCheckedSinceLog;
 	UE_LOG(LogVoxelPerf, Log,
-	       TEXT("Voxel solid skip at admission (5s window): enabled=%d verify=%d skipped=%lld (total %lld) | ")
+	       TEXT("Voxel solid skip at admission (5s window): enabled=%d verify=%d volumeFed=%d ")
+	       TEXT("skipped=%lld (total %lld) admittedForVolume=%lld (total %lld) | ")
 	       TEXT("R0=%lld R1=%lld | floorCache=%d | verifyChecked=%lld (total %lld) VIOLATIONS=%lld"),
 	       VoxelStreamAdmission::SolidSkipEnabled() ? 1 : 0, VoxelStreamAdmission::VerifySolidSkipEnabled() ? 1 : 0,
+	       VoxelBrickCpuArm::VolumeNeedsSolidChunks() ? 1 : 0,
 	       (long long)SolidSkippedAtAdmissionSinceLog, (long long)SolidSkippedAtAdmissionTotal,
+	       (long long)SolidAdmittedForVolumeSinceLog, (long long)SolidAdmittedForVolumeTotal,
 	       (long long)LevelSolidSkippedAtAdmission[0], (long long)LevelSolidSkippedAtAdmission[1],
 	       FootprintSolidFloorCache.Num(), (long long)SolidVerifyCheckedSinceLog,
 	       (long long)SolidVerifyCheckedTotal, (long long)SolidVerifyViolations);
+	if (SolidVerifyUncheckable > 0)
+	{
+		UE_LOG(LogVoxelPerf, Warning,
+		       TEXT("Voxel solid skip verifier: %lld results COULD NOT BE CHECKED -- no quads and no "
+		            "brick pack. Not evidence of soundness in either direction."),
+		       (long long)SolidVerifyUncheckable);
+	}
+
+	// The same tripwire as the buried-skip line, for the OTHER all-solid drop --
+	// and this is the one that is ON BY DEFAULT (voxel.Stream.AdmissionSolidSkip
+	// 1). A chunk dropped here never becomes a record at all, so it is absent
+	// from residency, from coverage, and from the hole detector.
+	if (VoxelBrickCpuArm::VolumeNeedsSolidChunks() && SolidSkippedAtAdmissionSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Error,
+		       TEXT("Voxel solid skip HOLE: %lld provably ALL-SOLID chunks were refused ADMISSION while ")
+		       TEXT("the brick volume is being fed. They are not tracked, not dispatched and not packed, ")
+		       TEXT("so the marcher reads solid rock as empty and nothing else on any line moves. Some ")
+		       TEXT("path is not consulting VoxelStreaming::AllSolidProofMayDropChunk."),
+		       (long long)SolidSkippedAtAdmissionSinceLog);
+	}
 	SolidSkippedAtAdmissionSinceLog = 0;
+	SolidAdmittedForVolumeSinceLog = 0;
 	SolidVerifyCheckedSinceLog = 0;
 	for (int64& N : LevelSolidSkippedAtAdmission)
 	{
@@ -6943,6 +7847,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumLevel0BricksSkippedAir = AccumLevel0BricksSkippedSolid = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
+	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
@@ -6958,6 +7863,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	ParkRefusedNotFinerSinceLog = ParkRefusedEditedSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
 	ParkEvictedStaleSinceLog = ParkEvictedCapSinceLog = 0;
+	BricksReleasedSinceLog = BricksAbsentSinceLog = 0;   // Wave 1.2; the TOTAL is cumulative and is not reset
 	DrainExitQueueEmptySinceLog = DrainExitWallClockSinceLog = 0;
 	DrainExitCountCapSinceLog = DrainExitDrainCapSinceLog = 0;
 	ApplyStagePackMs = ApplyStageParamsMs = ApplyStagePoolAddMs = 0.0;
@@ -8146,6 +9052,11 @@ uint8 FVoxelWorldImpl::ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLe
 
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 {
+	// See VoxelBrickCpuArm::VolumeNeedsSolidChunks. Both admission-time skips
+	// below may only drop a provably ALL-SOLID chunk while nothing reads what is
+	// inside it; dropping one while the brick volume is being fed is terrain you
+	// can see through, with no counter moving.
+	const bool bVolumeNeedsSolid = VoxelBrickCpuArm::VolumeNeedsSolidChunks();
 	using namespace VoxelCoords;
 
 	// Stage timing (see the ThisFrameRecomputeMs member's comment): always
@@ -8298,6 +9209,48 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			// shows nothing, so there is no hole to bridge -- also not retained.
 			const bool bLodTransition = bBeyondOuter || bInsideInner;
 			auto& Rec = Pair.Value;
+			// WAVE 1.2b WAS TRIED HERE AND REVERTED. THE MEASUREMENT IS THE
+			// REASON, AND IT IS RECORDED SO THE IDEA IS NOT RE-ATTEMPTED BLIND.
+			//
+			// The observation that started it is correct and still stands: this
+			// test is quad-shaped twice over -- HoldsGeometry() is false under
+			// -VoxelRetireQuads=1 and LastQuadCount is 0 for every terrain chunk
+			// on that path -- so a marched world never marks an eviction as an
+			// LOD transition and load-before-unload is DEAD CODE for the marcher.
+			// Measured: held=0 covRelSettled=0 covRelAbsent=0 capRel=0 across
+			// every marcher leg ever taken, with retentionMs=10000 configured.
+			//
+			// Extending it (`HoldsGeometry() ? LastQuadCount > 0 :
+			// HoldsTerrain(LevelKey)`) DID switch the mechanism on -- held=1024
+			// covRelSettled=620 covRelAbsent=1842 -- and was a NET REGRESSION on
+			// every number that matters:
+			//
+			//   holes          plateau 19.5-20.7k -> 18.9-20.0k   (~5-10%, matched
+			//                  window for window; NOT the third I first reported)
+			//   p95            72.76 -> 90.71 ms                  (+25%)
+			//   brick releases 346,591 -> 55,359 cumulative       (6x FEWER)
+			//   resident0      25,700 -> 125,941 of 131,072       (96% FULL)
+			//   evictions      0 -> 151,657                       (GATE VIOLATED)
+			//
+			// The last two are the disqualifying pair. Retention defers the
+			// unload, the deferral keeps the record, the record keeps its bricks,
+			// and the pool fills until it evicts farthest-from-focus -- which is
+			// precisely the failure Wave 1.2 exists to prevent, since eviction
+			// drops bricks the march index is still naming. A mechanism sized for
+			// a few thousand quad records does not transfer to the marcher's
+			// 271,549 tracked ones.
+			//
+			// AND IT COULD NOT HAVE WORKED ANYWAY, for a reason the retention site
+			// states itself: "retention can only delay a hole, never manufacture a
+			// chunk." The holes here are the camera outrunning generation. Holding
+			// evictions cannot close that gap; it can only spend pool capacity
+			// pretending to.
+			//
+			// IF THIS IS REVISITED: the missing piece is not the gate, it is a
+			// bound. Retention for brick records would need a pool-pressure cap
+			// (stop retaining above some resident0 fraction) and a much shorter
+			// LodRetentionMs than the quad path's 10 s. Do not re-enable it
+			// without both, and re-read `evictions` as the gate.
 			if (bLodTransition && Rec.HoldsGeometry() && Rec.LastQuadCount > 0)
 			{
 				const float RetentionSeconds = VoxelDebug::GetStreamLodRetentionMs() / 1000.f;
@@ -8467,7 +9420,50 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// already identified as the prerequisite for re-enabling the ring
 		// cross-fade (disabled because the annuli did NOT overlap).
 		const double ChunkHalfDiagUU = ChunkEdge * 0.70710678118654752440; // (edge/2)*sqrt(2)
-		const double AdmitOuterUU = OuterUU + ChunkHalfDiagUU;
+
+		// RING OVERLAP FOR THE MARCHER (-VoxelRingOverlapChunks, default 0).
+		//
+		// The half-diagonal above is a HOLE-FILLING pad: the block below admits a
+		// chunk inside it only when its parent is NOT admitted, so exactly one
+		// level covers any given ground and there is NO OVERLAP. A ray therefore
+		// leaves L's resident set at ground L+1 may not yet cover, and the
+		// resulting silhouette pop cannot be told from a traversal bug.
+		//
+		// With overlap on, the band widens to N chunk edges and EVERY chunk in it
+		// is admitted -- both levels hold the seam, so a pop is the traversal.
+		// Max(): overlap must never SHRINK the hole-filling pad, which is a
+		// correctness fix and not a preference.
+		const int32 RingOverlapChunks = UVoxelWorldSubsystem::GetRingOverlapChunks();
+		const double RingOverlapUU = double(RingOverlapChunks) * ChunkEdge;
+		const double AdmitOuterUU = OuterUU + FMath::Max(ChunkHalfDiagUU, RingOverlapUU);
+
+		// THE ONE WAY OVERLAP CAN GO CATASTROPHICALLY WRONG, and it is silent.
+		//
+		// Admission grows the OUTER radius; the exit pass evicts past
+		// Outer * UnloadRingMultiplier. If the admit band ever reaches the unload
+		// band, every chunk in the overlap is admitted and evicted on alternate
+		// frames -- unbounded churn that looks like a streaming stall, with no
+		// counter naming the cause.
+		//
+		// It cannot happen at the DEFAULT radii: Outer/ChunkEdge is exactly 40 at
+		// every level by construction, so the band would need N >= 10 and the
+		// accessor clamps at 4. It CAN happen once -VoxelRingOuterMeters= moves a
+		// ring, which is why this is a check and not a comment. Once per level.
+		if (RingOverlapChunks > 0)
+		{
+			static bool bWarnedThrash[VoxelCoords::kNumLevels] = {};
+			const double UnloadOuterUU = OuterUU * UVoxelWorldSubsystem::UnloadRingMultiplier;
+			if (AdmitOuterUU >= UnloadOuterUU && !bWarnedThrash[Level])
+			{
+				bWarnedThrash[Level] = true;
+				UE_LOG(LogVoxelStream, Error,
+				       TEXT("Ring overlap L%d admits out to %.1f m but the exit pass evicts past %.1f m. ")
+				       TEXT("Every chunk in the overlap will be admitted and evicted on alternate frames ")
+				       TEXT("-- unbounded churn that reads as a streaming stall. Reduce ")
+				       TEXT("-VoxelRingOverlapChunks (currently %d) or widen this ring."),
+				       Level, AdmitOuterUU / 100.0, UnloadOuterUU / 100.0, RingOverlapChunks);
+			}
+		}
 
 		const int32 ChunkSpan = FMath::CeilToInt32(AdmitOuterUU / ChunkEdge) + 1;
 
@@ -8498,21 +9494,33 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					{
 						continue; // too far to be a seam case, or no coarser ring exists (clipmap takes over)
 					}
-					// Parent at L+1 covering this same ground. Its lattice is 2x
-					// this one and origin-aligned, so the parent index is Cx>>1
-					// (>> floors for negatives, which is what we want).
-					const double ParentEdge = ChunkEdge * 2.0;
-					const double ParentCX = (double(Cx >> 1) + 0.5) * ParentEdge;
-					const double ParentCY = (double(Cy >> 1) + 0.5) * ParentEdge;
-					const double ParentDistSq =
-						FMath::Square(ParentCX - Anchor.X) + FMath::Square(ParentCY - Anchor.Y);
-					// The parent's ring starts exactly where this one ends
-					// (Inner[L+1] == Outer[L]), so the parent is admitted iff its
-					// centre is at or beyond OuterUU. If it is, the ground is
-					// covered and this chunk is redundant.
-					if (ParentDistSq >= FMath::Square(OuterUU))
+					if (RingOverlapChunks > 0)
 					{
-						continue;
+						// OVERLAP: admit inside the band whether or not the parent
+						// is. Skipping the redundant case is precisely what leaves
+						// exactly one level on the seam, so keeping the skip would
+						// make the switch inert -- a cvar that is on and does
+						// nothing, which is the failure this project has paid for
+						// most often. Falls through to admission.
+					}
+					else
+					{
+						// Parent at L+1 covering this same ground. Its lattice is 2x
+						// this one and origin-aligned, so the parent index is Cx>>1
+						// (>> floors for negatives, which is what we want).
+						const double ParentEdge = ChunkEdge * 2.0;
+						const double ParentCX = (double(Cx >> 1) + 0.5) * ParentEdge;
+						const double ParentCY = (double(Cy >> 1) + 0.5) * ParentEdge;
+						const double ParentDistSq =
+							FMath::Square(ParentCX - Anchor.X) + FMath::Square(ParentCY - Anchor.Y);
+						// The parent's ring starts exactly where this one ends
+						// (Inner[L+1] == Outer[L]), so the parent is admitted iff its
+						// centre is at or beyond OuterUU. If it is, the ground is
+						// covered and this chunk is redundant.
+						if (ParentDistSq >= FMath::Square(OuterUU))
+						{
+							continue;
+						}
 					}
 				}
 
@@ -8895,7 +9903,14 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// one AddCandidate would have done rather than adding
 						// to it -- an already-tracked chunk is not a candidate
 						// and must not be counted as one.
-						bBandEmpty = VoxelStreaming::BandProvesChunkEmpty(*AdmitBand, Cz, bAllAir) &&
+						// MayDropChunk, not ProvesEmpty: an all-solid chunk dropped
+						// here is never tracked, never dispatched and never packed,
+						// so the brick volume has a hole exactly where the world is
+						// most solid. Off by default (mode 0), fixed anyway -- the
+						// cost of leaving it is that turning the mode on silently
+						// reintroduces the defect.
+						bBandEmpty = VoxelStreaming::BandSkipMayDropChunk(
+						                 *AdmitBand, Cz, bVolumeNeedsSolid, bAllAir) &&
 						             !ChunkRecords.Contains(CandidateKey);
 					}
 					if (bBandEmpty)
@@ -8957,8 +9972,24 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// one is a chunk the world does not know exists sitting
 						// where somebody is digging.
 						const bool bEditVeto = EditedMinZ != nullptr && Cz >= *EditedMinZ;
+						// THE SECOND ALL-SOLID DROP, AND THIS ONE IS ON BY DEFAULT
+						// (voxel.Stream.AdmissionSolidSkip 1). Its proof is
+						// all-solid by construction -- there is no air case -- so
+						// it is exactly the chunk a marcher must be able to hit.
+						// Dropped here it is never even TRACKED, which is a
+						// stronger absence than the dispatch-time skip: no record
+						// exists to point at the missing volume.
 						if (bSolidSkip && !bEditVeto && IsChunkProvablyAllSolid(DeepKey))
 						{
+							if (!VoxelStreaming::AllSolidProofMayDropChunk(bVolumeNeedsSolid))
+							{
+								// Admitted deliberately, and counted for the same
+								// reason the dispatch-time one is: a silent fix and
+								// no fix look identical in a log.
+								++SolidAdmittedForVolumeSinceLog;
+								AddCandidate(DeepKey, /*bDeepAnchorRelative*/ true);
+								continue;
+							}
 							++SolidSkippedAtAdmissionSinceLog;
 							++LevelSolidSkippedAtAdmission[FMath::Clamp(Level, 0, VoxelCoords::kNumLevels - 1)];
 							if (!VoxelStreamAdmission::VerifySolidSkipEnabled())
@@ -9033,7 +10064,12 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			// dropping a record that DOES own either would leak a component or
 			// strand an in-flight result. Anything already queued for unload is
 			// left to DrainUnloads (it owns that record's removal).
-			if (!Rec->HoldsGeometry() && !Rec->bJobInFlight && !PendingUnloadSet.Contains(Entry.Key))
+			// HoldsTerrain, NOT HoldsGeometry: a chunk resident in the brick
+			// volume but holding no quads is NOT droppable -- dropping it would
+			// re-admit it next tick, forever. Under quad retirement that is
+			// every chunk.
+			if (!Rec->HoldsTerrain(Entry.Key) && !Rec->bJobInFlight &&
+			    !PendingUnloadSet.Contains(Entry.Key))
 			{
 				ChunkRecords.Remove(Entry.Key);
 				++RecordsDroppedSinceLog;
@@ -9759,6 +10795,14 @@ FVoxelGpuMeshJobManager* FVoxelWorldImpl::EnsureGpuMeshJobs()
 	return GpuMeshJobs.Get();
 }
 
+// SampleChunkParamsForPool is a file-static defined ~2,000 lines BELOW this, next
+// to the quad path's only other caller. Forward-declared rather than moved so the
+// definition stays beside the ChunkParams it was written for.
+static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
+                                          const FVector& ChunkOriginRelative,
+                                          int32 Level);
+static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params);
+
 bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, uint64 GenId,
                                        uint8 RingSkirtMask, bool bSpeculative)
 {
@@ -9783,6 +10827,23 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 	// to the edge -- different terrain, no error. Assigning this afterwards is a
 	// no-op that looks like a fix; it cost the D5 gate a full run.
 	Req.CoarseLevel = LevelKey.Level;
+
+	// WAVE 2 STEP 3, GPU ARM. Sampled HERE, on the game thread, because the
+	// record is written on the GPU at completion and nothing there can reach a
+	// climate probe. Same function, same Root and same origin convention as the
+	// CPU arm and the quad path -- three producers, one sampler.
+	//
+	// A null root leaves this neutral, which is flat mid-range climate with the
+	// surface gate off: plausible terrain, no error. That is exactly what
+	// GetChunksAddedWithNeutralShading counts, and GpuPoolRoot is now assigned
+	// every tick rather than only when the quad pool is constructed.
+	if (const USceneComponent* PoolRootForShading = GpuPoolRoot.Get())
+	{
+		Req.BrickShading = ShadingFromChunkParams(SampleChunkParamsForPool(
+			*PoolRootForShading,
+			VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
+			LevelKey.Level));
+	}
 	// D5.3. Computed on the game thread where the anchor and RingPresets are
 	// live, exactly as the worker job's is, and baked into this dispatch.
 	Req.RingSkirtMask = RingSkirtMask;
@@ -10293,11 +11354,17 @@ void FVoxelWorldImpl::DispatchJobs()
 	// unattributable to either, which is the trap the ring floor sweep fell
 	// into.
 	const int32 GpuMaxInFlight = VoxelStreamAdmission::GpuMeshInFlight();
+	// Read ONCE per call, not per chunk: it is a cvar read and this loop runs
+	// over every pending key. See VoxelBrickCpuArm::VolumeNeedsSolidChunks --
+	// with the brick volume off this is false and every skip below behaves
+	// exactly as it did before.
+	const bool bVolumeNeedsSolid = VoxelBrickCpuArm::VolumeNeedsSolidChunks();
 	const auto CpuJobsOutstanding = [&]() -> int32
 	{
 		return FMath::Max(0, JobsInFlightCounter.GetValue() - GpuJobsPending.Num());
 	};
 
+	const double DispatchLoopStart = FPlatformTime::Seconds();
 	while (CpuJobsOutstanding() < MaxJobsInFlight)
 	{
 		// Which ring gets this worker slot.
@@ -10317,6 +11384,11 @@ void FVoxelWorldImpl::DispatchJobs()
 		// the old single flat queue produced -- including the "lower level wins
 		// at equal distance" tie-break, which falls out of scanning levels in
 		// ascending order with a strict <.
+		// BRACKETED: the ring-quota scan and the pop that follows it. This walks
+		// every ring level's queue head on EVERY iteration, so it is the first
+		// candidate for a fixed per-candidate cost -- exactly the shape `other`
+		// showed.
+		const double PickStart = FPlatformTime::Seconds();
 		int32 PickLevel = INDEX_NONE;
 		if (bRingQuota)
 		{
@@ -10364,6 +11436,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		const FSortEntry PoppedEntry =
 			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No); // highest priority in that ring (see SortPendingQueues)
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PoppedEntry.Key;
+		ThisFrameDispatchPickMs += float((FPlatformTime::Seconds() - PickStart) * 1000.0);
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
@@ -10444,7 +11517,10 @@ void FVoxelWorldImpl::DispatchJobs()
 		// NeedsOverlayAwarePath): an edit landing in this same tick, between
 		// recompute and dispatch, may have made this chunk (or one of its
 		// mip ancestors) edited-only.
-		if (NeedsOverlayAwarePath(LevelKey))
+		const double OverlayStart = FPlatformTime::Seconds();
+		const bool bNeedsOverlay = NeedsOverlayAwarePath(LevelKey);
+		ThisFrameDispatchOverlayMs += float((FPlatformTime::Seconds() - OverlayStart) * 1000.0);
+		if (bNeedsOverlay)
 		{
 			PendingGameThreadKeys.Add(LevelKey);
 			continue;
@@ -10479,13 +11555,19 @@ void FVoxelWorldImpl::DispatchJobs()
 		const bool bComputeBand =
 			VoxelStreamAdmission::BuriedSkipEnabled() || VoxelStreamAdmission::VerifyBuriedSkipEnabled();
 		bool bPredictedEmpty = false;
+		const double BandStart = FPlatformTime::Seconds();
 		if (bComputeBand && LevelKey.Level == 0)
 		{
 			if (const VoxelStreaming::FFootprintBand* Band = FootprintBandCache.Find(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
 			{
-				// Shared with the admission-time skip -- see BandProvesChunkEmpty.
+				// Shared with the admission-time skip -- see BandSkipMayDropChunk,
+				// which is NOT BandProvesChunkEmpty: the proof holding and the
+				// proof being safe to act on are different questions once the
+				// brick volume is being fed.
 				bool bAllAir = false;
-				if (VoxelStreaming::BandProvesChunkEmpty(*Band, LevelKey.Key.Z, bAllAir))
+				bool bSolidKeptForVolume = false;
+				if (VoxelStreaming::BandSkipMayDropChunk(
+					    *Band, LevelKey.Key.Z, bVolumeNeedsSolid, bAllAir, &bSolidKeptForVolume))
 				{
 					bPredictedEmpty = true;
 					++BuriedSkipsSinceLog;
@@ -10495,6 +11577,17 @@ void FVoxelWorldImpl::DispatchJobs()
 					{
 						VoxelStreamAdmission::GBandSkipAirL0.fetch_add(1, std::memory_order_relaxed);
 					}
+				}
+				else if (bSolidKeptForVolume)
+				{
+					// THE PROOF FIRED AND WE DELIBERATELY DID NOT ACT ON IT.
+					// Counted, because a silent fix is indistinguishable from no
+					// fix -- and because this counter is what makes the pair
+					// falsifiable in BOTH directions: with the volume fed, solid=
+					// must be 0 and solidKept= must be large during fill; with it
+					// off, exactly the reverse. Either side reading zero when it
+					// should not is a defect this line can show.
+					++BuriedSolidKeptSinceLog;
 				}
 			}
 		}
@@ -10517,6 +11610,8 @@ void FVoxelWorldImpl::DispatchJobs()
 			Rec->bMeshSettled = true;
 			continue;
 		}
+
+		ThisFrameDispatchBandMs += float((FPlatformTime::Seconds() - BandStart) * 1000.0);
 
 		// --- Sky-band pre-dispatch skip (outer rings) ------------------------
 		//
@@ -10544,7 +11639,18 @@ void FVoxelWorldImpl::DispatchJobs()
 		// above has already routed any chunk carrying an edit -- including a
 		// block TryPlace put in what worldgen calls sky -- to the game-thread
 		// overlay path, so it can never reach here.
-		if (VoxelSkyBand::GetSkipEnabled() && IsChunkProvablyAllAir(LevelKey))
+		// BRACKETED: IsChunkProvablyAllAir runs FootprintSurfaceUpperBoundMm,
+		// which walks a dilated cubic-B-spline control grid with Lipschitz
+		// differences and tile lookups -- worldgen-grade work, once per
+		// candidate, and the only such call on this path that is NOT memoised.
+		// (Its sibling twenty lines away, FootprintSolidFloorMmCached, IS.)
+		// Whether that is where the 0.21 ms/chunk lives is a HYPOTHESIS until
+		// this number is read; the short-circuit means it is skipped entirely
+		// when the sky-band skip is off, which the bracket will also show.
+		const double AirProofStart = FPlatformTime::Seconds();
+		const bool bSkyBandSkip = VoxelSkyBand::GetSkipEnabled() && IsChunkProvablyAllAir(LevelKey);
+		ThisFrameDispatchAirProofMs += float((FPlatformTime::Seconds() - AirProofStart) * 1000.0);
+		if (bSkyBandSkip)
 		{
 			if (VoxelSkyBand::GetVerifyEnabled())
 			{
@@ -10699,6 +11805,18 @@ void FVoxelWorldImpl::DispatchJobs()
 			// the CPU instead of stalling the whole dispatch loop.
 			&& GpuJobsPending.Num() < GpuMaxInFlight;
 
+		// BRACKETED: everything from here to the end of the iteration is the job
+		// actually being built and handed off -- the GPU fork's region request
+		// (which now also samples per-chunk shading) or the worker enqueue.
+		// Separated from the two PREDICATES above because they have opposite
+		// fixes: a predicate that is too expensive gets memoised, a submit that
+		// is too expensive gets batched or moved off the game thread.
+		const double SubmitStart = FPlatformTime::Seconds();
+		ON_SCOPE_EXIT
+		{
+			ThisFrameDispatchSubmitMs += float((FPlatformTime::Seconds() - SubmitStart) * 1000.0);
+		};
+
 		if (bUseGpuMesh && SubmitGpuMeshJob(LevelKey, GenId, RingSkirtMask))
 		{
 			++GpuMeshJobsDispatchedSinceLog;
@@ -10736,11 +11854,32 @@ void FVoxelWorldImpl::DispatchJobs()
 		// getting a gate's value into the task body (bPredictedEmpty,
 		// bComputeBand are the same shape).
 		const bool bLatencyStatsEnabled = VoxelDebug::GetStreamLatencyStats();
+		// P2 coverage: the CPU arm's gate, read on the GAME THREAD for exactly the
+		// reason above -- VoxelBrickPackOnCpuEnabled and VoxelGpuBrickPackEnabled are
+		// cvar reads and are not safe from a background task. Latched per dispatch,
+		// like the fork latches its own at Submit, so a flip mid-flight cannot leave
+		// a half-packed job.
+		const bool bPackBricksOnCpu = VoxelBrickCpuArm::ShouldPack();
+		// The transitional-cost experiment (voxel.Brick.SuppressQuadMesh). Already
+		// AND-ed with the pack gate inside the accessor, so this can never leave a
+		// worker that neither meshes nor packs.
+		// ANDed with ShouldPack HERE, not inside the accessor, and the difference
+		// is a real hole rather than style. The accessor can only see its own cvar
+		// and voxel.Brick.PackOnCpu; it cannot see the master gate
+		// voxel.GPU.BrickPack, which lives with the GPU producer. Without this the
+		// combination BrickPack 0 + PackOnCpu 1 + SuppressQuadMesh 1 would suppress
+		// meshing AND pack -- an empty world produced by an arm the master switch
+		// was supposed to have turned off entirely.
+		const bool bSuppressQuadMesh = bPackBricksOnCpu && VoxelBrickSuppressQuadMeshEnabled();
+		// The 4.56x control (voxel.Brick.PackReuseMesherVoxels). 0 restores the
+		// scattered-sampling packer this project measured at 0.743 ms/chunk.
+		const bool bReuseMesherVoxels = VoxelBrickPackReuseMesherVoxelsEnabled();
 
 		UE::Tasks::TTask<void> Task = UE::Tasks::Launch(
 			TEXT("VoxelChunkMeshJob"),
 			[GenPtr, LevelKey, GenId, QueuePtr, CounterPtr, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot,
-			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, RingSkirtMask,
+			 bPredictedEmpty, bComputeBand, bLatencyStatsEnabled, bPackBricksOnCpu, bSuppressQuadMesh,
+			 bReuseMesherVoxels, RingSkirtMask,
 			 AssetTallestVoxSnapshot]()
 			{
 				SCOPE_CYCLE_COUNTER(STAT_VoxelWorkerJob);
@@ -11151,7 +12290,49 @@ void FVoxelWorldImpl::DispatchJobs()
 						}
 						return false;
 					};
-					MeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr, RingSkirtMask, SkipBrick);
+					// P2 coverage. THREE ARMS, AND THE MIDDLE ONE IS THE SHIPPING PATH.
+					//
+					// The packer needs this chunk's 32,768 interior voxels and the mesher
+					// reads every one of them anyway (voxelcore/mesher.h materialises
+					// mat[10^3] per brick and throws it away). So the mesh hands them over
+					// through FDenseChunkSink and the packer loads an array instead of
+					// re-sampling -- measured at 0.743 ms/chunk and +36% cold fill when it
+					// re-sampled.
+					//
+					// The brick SKIP is not applied to the packing either way: a brick the
+					// mesher can prove emits no FACE is still a brick the marcher has to
+					// know the contents of -- a fully buried brick emits nothing and is
+					// solid rock, and packing it as air would carve a hole no screenshot of
+					// the mesh could ever show. MeshChunkBricks fills the skipped bricks
+					// into the sink itself, by direct sampling, for exactly that reason.
+					if (bSuppressQuadMesh)
+					{
+						// MEASUREMENT ARM ONLY, and it renders the world empty. No mesher,
+						// so the packer materialises the chunk itself -- ONCE, in column
+						// order -- rather than scattering 32,768 samples. That is the honest
+						// Phase 5 shape; the scattered form measured 0.608 ms/chunk here and
+						// would have gone on the plan as what Phase 5 costs.
+						Result.BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, GridSampler);
+					}
+					else if (bPackBricksOnCpu && bReuseMesherVoxels)
+					{
+						vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+						VoxelBrickCpuArm::TimedMeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr,
+						                                       RingSkirtMask, SkipBrick,
+						                                       VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+						Result.BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+					}
+					else
+					{
+						VoxelBrickCpuArm::TimedMeshChunkBricks(Key, GridSampler, Result.Quads, PerfCountersPtr,
+						                                       RingSkirtMask, SkipBrick);
+						if (bPackBricksOnCpu)
+						{
+							// The control arm: the packer samples the world itself even though
+							// the mesher just read the same voxels.
+							Result.BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, GridSampler);
+						}
+					}
 					Result.BricksSkippedAir = uint16(SkippedAir);
 					Result.BricksSkippedSolid = uint16(SkippedSolid);
 					// Crown-chunk discriminator (see GCrownChunksMeshed): this
@@ -11185,7 +12366,10 @@ void FVoxelWorldImpl::DispatchJobs()
 					// filled by a plain Amp.column loop -- and compare quad for
 					// quad. A mismatch here is terrain that changed shape, not a
 					// tuning result, so the chunk key is logged.
-					if (VoxelStreamAdmission::L0GridVerifyEnabled())
+					// NOT under the suppression arm: with no quads meshed this harness
+					// would report every chunk as "terrain that changed shape", which is a
+					// false alarm of exactly the kind that costs this project legs.
+					if (VoxelStreamAdmission::L0GridVerifyEnabled() && !bSuppressQuadMesh)
 					{
 						TArray<vxc::ColumnSample> RefColumns;
 						RefColumns.SetNumUninitialized(GridCells);
@@ -11256,7 +12440,33 @@ void FVoxelWorldImpl::DispatchJobs()
 						const double GridStartSeconds = FPlatformTime::Seconds();
 						const FCoarseChunkGridSampler CoarseSampler(*GenPtr, LevelKey.Level, Key, PerfCountersPtr);
 						Result.GridMs = float((FPlatformTime::Seconds() - GridStartSeconds) * 1000.0);
-						MeshChunkBricks(Key, CoarseSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
+						// P2 coverage, coarse levels. FCoarseChunkGridSampler satisfies the
+						// same (int64,int64,int64) -> MaterialId contract the packer wants,
+						// so a coarse chunk packs by substituting the sampler and nothing
+						// else -- which is exactly how the GPU fork packs its coarse rings.
+						// FNeverSkipBrick is spelled out because the sink is the argument
+						// after it; a coarse chunk has never had a skip predicate.
+						if (bSuppressQuadMesh)
+						{
+							Result.BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, CoarseSampler);
+						}
+						else if (bPackBricksOnCpu && bReuseMesherVoxels)
+						{
+							vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+							VoxelBrickCpuArm::TimedMeshChunkBricks(Key, CoarseSampler, Result.Quads, PerfCountersPtr,
+							                                       RingSkirtMask, FNeverSkipBrick(),
+							                                       VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+							Result.BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+						}
+						else
+						{
+							VoxelBrickCpuArm::TimedMeshChunkBricks(Key, CoarseSampler, Result.Quads,
+							                                       PerfCountersPtr, RingSkirtMask);
+							if (bPackBricksOnCpu)
+							{
+								Result.BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, CoarseSampler);
+							}
+						}
 						if (bMeasureEmpty && Result.Quads.Num() == 0)
 						{
 							Result.EmptyClass = ClassifyEmpty(CoarseSampler, Key);
@@ -11265,7 +12475,7 @@ void FVoxelWorldImpl::DispatchJobs()
 						// old brick-cache sampler and compare quad-for-quad.
 						// Logs the chunk key on any mismatch -- a mismatch here
 						// is terrain that changed shape, not a tuning result.
-						if (VoxelStreamAdmission::CoarseGridVerifyEnabled())
+						if (VoxelStreamAdmission::CoarseGridVerifyEnabled() && !bSuppressQuadMesh)
 						{
 							TArray<FVoxelChunkQuad> RefQuads;
 							const auto RefSampler = MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, /*PerfCounters*/ nullptr);
@@ -11287,7 +12497,27 @@ void FVoxelWorldImpl::DispatchJobs()
 							bCoarseLevel
 								? MakeCoarseLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr)
 								: MakeLevelSampler(*GenPtr, LevelKey.Level, PerfCountersPtr, SharedMipCachePtr, EditEpochPtr, EditEpochSnapshot);
-						MeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr, RingSkirtMask);
+						if (bSuppressQuadMesh)
+						{
+							Result.BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, LevelSampler);
+						}
+						else if (bPackBricksOnCpu && bReuseMesherVoxels)
+						{
+							vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+							VoxelBrickCpuArm::TimedMeshChunkBricks(Key, LevelSampler, Result.Quads, PerfCountersPtr,
+							                                       RingSkirtMask, FNeverSkipBrick(),
+							                                       VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+							Result.BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+						}
+						else
+						{
+							VoxelBrickCpuArm::TimedMeshChunkBricks(Key, LevelSampler, Result.Quads,
+							                                       PerfCountersPtr, RingSkirtMask);
+							if (bPackBricksOnCpu)
+							{
+								Result.BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, LevelSampler);
+							}
+						}
 						if (bMeasureEmpty && Result.Quads.Num() == 0)
 						{
 							Result.EmptyClass = ClassifyEmpty(LevelSampler, Key);
@@ -11327,6 +12557,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		}
 
 	}
+	ThisFrameDispatchLoopMs += float((FPlatformTime::Seconds() - DispatchLoopStart) * 1000.0);
 
 	// Re-queue the chunks held back by the cold-band throttle. Order is
 	// irrelevant here -- SortPendingQueues re-sorts both queues on the next
@@ -11459,6 +12690,19 @@ UVoxelGpuPoolComponent* FVoxelWorldImpl::GetOrCreateGpuPool(AActor& Owner, UScen
 	}
 
 	UVoxelGpuPoolComponent* Pool = NewObject<UVoxelGpuPoolComponent>(PoolOwner);
+	// P7-a. THE TERRAIN POOL NOW SAYS WHICH POOL IT IS.
+	//
+	// It never did, which is why UVoxelGISubsystem could only pick a pool by
+	// TObjectIterator ordinal: water buckets, the region-verify pool and the
+	// pool-write pool all also live in this world, all registered, and until
+	// this line every one of them answered GetPoolName() with the same default
+	// "VoxelGpuPool". Picking the wrong one offsets the GI volume by the
+	// difference of two unrelated rebases and the symptom is missing lighting,
+	// never an error.
+	//
+	// BEFORE RegisterComponent, like SetChunkMaterial below and for the same
+	// reason: the proxy takes a COPY and a later setter is a silent no-op.
+	Pool->SetPoolName(VoxelGpuPool::kTerrainPoolName);
 	// Same terrain material the per-chunk components use. Without it the
 	// proxy falls back to the engine default and the biome LUT never runs.
 	Pool->SetChunkMaterial(Material);
@@ -11784,6 +13028,27 @@ static FVector4f SampleChunkParamsForPool(const USceneComponent& Root,
 	                 PackedGradients);
 }
 
+// The SAME four values, in the brick record's form. Deliberately a conversion of
+// SampleChunkParamsForPool's output rather than a second sampler: the quad path
+// and the marcher must agree about where the ground is and what the climate is,
+// and two samplers is how they stop agreeing.
+//
+// THE BYTE ROUND-TRIP IS EXACT AND THAT IS NOT LUCK. The sampler emits
+// k/255.0f for integer k in 0..255; round(x * 255.0f) recovers k for every one
+// of those 256 values in float32. So this reconstructs FVoxelClimateBytes
+// exactly, and the marcher gets the same byte the vertex factory gets.
+static FVoxelBrickChunkShading ShadingFromChunkParams(const FVector4f& Params)
+{
+	FVoxelBrickChunkShading Shading;
+	Shading.Temperature = uint8(FMath::Clamp(FMath::RoundToInt(Params.X * 255.0f), 0, 255));
+	Shading.Precipitation = uint8(FMath::Clamp(FMath::RoundToInt(Params.Y * 255.0f), 0, 255));
+	Shading.SurfaceZRelUU = Params.Z;
+	// PackedGradients rides the float4 as a float only because ChunkParams is an
+	// FVector4f; the value is an integer below 2^24 and is exact there.
+	Shading.SurfaceGradPacked = uint32(Params.W);
+	return Shading;
+}
+
 void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
 {
 	// Dispatch on what the record HOLDS, not on the cvar: a chunk that loaded
@@ -11801,6 +13066,37 @@ void FVoxelWorldImpl::ReleaseChunkGeometry(VoxelStreaming::FChunkRecord& Rec)
 			Pool->RemoveChunk(Rec.PoolSlot);
 		}
 		Rec.PoolSlot = INDEX_NONE;
+	}
+}
+
+// WAVE 1.2. The chunk has left residency; its bricks leave the pool with it.
+//
+// WHY THIS EXISTS AT ALL. FVoxelBrickPool's own header states that
+// `evictions 0` is a correctness property only because nothing in the
+// streaming path ever called RemoveChunk -- so the pool grew monotonically
+// (94,096 / 131,072 at the standard pose) and, once full, evicted
+// farthest-from-focus. Eviction is not a hole in some abstract sense: it
+// drops bricks the marcher is still indexing, and the index learns about it
+// through the same Removed delta as a deliberate free, so the symptom is
+// terrain quietly missing at the far edge with every streaming counter
+// healthy.
+//
+// The key is derived exactly as both producers derive it -- the CPU arm's
+// Publish and the GPU fork's BrickKey block both go through
+// VoxelBrickCpuArm::MakeKey -- because a key that disagrees with the
+// producers frees nothing and reports nothing.
+void FVoxelWorldImpl::ReleaseChunkBricks(const VoxelCoords::FVoxelLevelChunkKey& Key)
+{
+	if (GetGlobalVoxelBrickPool().RemoveChunk(VoxelBrickCpuArm::MakeKey(Key)))
+	{
+		++BricksReleasedSinceLog;
+		++BricksReleasedTotal;
+	}
+	else
+	{
+		// NOT an error -- see the counter declaration for why terrain cannot
+		// use the cover ring's "absent means divergence" rule.
+		++BricksAbsentSinceLog;
 	}
 }
 
@@ -12309,6 +13605,12 @@ void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key
 		// neutralises is already neutral.
 		Pool->RemoveChunk(Parked.PoolHandle);
 	}
+
+	// WAVE 1.2. The park is being given up for good, so the bricks DrainUnloads
+	// deliberately left resident for a possible adoption go now. This is the
+	// other half of that exception: skipped here, the parked population would
+	// be a permanent leak that no unload ever reaches.
+	ReleaseChunkBricks(Key);
 }
 
 void FVoxelWorldImpl::EvictParkedOverCap(int32 Cap)
@@ -12385,6 +13687,37 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 
 	if (NumQuads == 0)
 	{
+		// THE GI HOIST (memo item 6), AND WHY IT IS HERE RATHER THAN LOWER.
+		//
+		// GI takes its volume origin from the terrain GPU pool: VoxelGI.cpp
+		// FindTerrainPoolWorldLocation identifies the pool by ownership and name
+		// and REFUSES rather than guessing, so with no pool there is no origin.
+		// Under voxel.Terrain.RetireQuads EVERY chunk arrives with NumQuads == 0,
+		// so this return runs for all of them and GetOrCreateGpuPool below is
+		// never reached -- the pool is never created, the volume never anchors,
+		// and GI reads as ABSENT FOR WATER AS WELL AS TERRAIN with no error
+		// anywhere, because the shader gates on bInsideVolume. VoxelGI.cpp:1316
+		// names this exact mechanism as the suspect behind its 1800-refusal
+		// escalation; this is the fix for it.
+		//
+		// SCOPED TO RETIREMENT ON PURPOSE. Without retirement, a NumQuads == 0
+		// chunk is an ordinary buried chunk and creating a pool for it would
+		// spawn a component the old path never spawned -- a behaviour change on
+		// the shipping path to fix a problem the shipping path does not have.
+		// With retirement it is the ONLY path, so the pool must come from here or
+		// from nowhere.
+		//
+		// The pool is created EMPTY and stays empty: nothing below adds a chunk
+		// to it, because there are no quads to add. It exists so that something
+		// with the right owner and the right name is findable at the right world
+		// location. That is all GI needs from it.
+		if (VoxelTerrainQuadsRetired())
+		{
+			const FVector PoolOriginRelative =
+				VoxelCoords::ChunkOriginWorldForLevel(Key.Key, Key.Level);
+			GetOrCreateGpuPool(Owner, Root, Material, PoolOriginRelative);
+		}
+
 		// No visible geometry (fully buried chunk, or an edit carved away
 		// the last exposed faces): park (not destroy) any stale component --
 		// M1 hitch-gap wave, same pooling path DrainUnloads uses -- rather
@@ -12535,6 +13868,34 @@ bool FVoxelWorldImpl::ApplyMeshResult(AActor& Owner, USceneComponent& Root, UMat
 		}
 
 		const double PoolAddStart = bStageStats ? FPlatformTime::Seconds() : 0.0;
+
+		// --- WHICH HYPOTHESIS? -------------------------------------------
+		//
+		// terrainPoolUsedQuads read 74,583 on two runs of a 330 s leg, BYTE
+		// IDENTICAL. That exactness is the clue: a rate-driven producer would
+		// vary between legs, a fixed deterministic set would not. Two candidates
+		// survive and they need opposite fixes:
+		//
+		//   (a) a producer that ignores the switch -> allocations happen WHILE
+		//       retirement is active, and this counter moves.
+		//   (b) the pre-flip startup window -> the harness passes cvars through
+		//       -ExecCmds, which this codebase documents lands AFTER streaming
+		//       has begun (voxel-capture.ps1:114, and AdmissionBandSkipMode says
+		//       it at length). Chunks meshed before the flip allocate normally,
+		//       nothing frees them afterwards, and the total is then a fixed
+		//       function of how far streaming got in that window -- deterministic
+		//       at a fixed spawn. This counter stays ZERO.
+		//
+		// The elimination that produced the last fix was sound and still reached
+		// the wrong target, so this is measured rather than reasoned. Costs one
+		// bool test per allocation and only on the path that allocates.
+		if (VoxelTerrainQuadsRetired())
+		{
+			++TerrainQuadsAllocatedWhileRetired;
+			TerrainQuadsAllocatedWhileRetiredQuads += int64(NumQuads);
+			if (bIsGameThreadMesh) { ++TerrainQuadAllocGameThread; } else { ++TerrainQuadAllocDrain; }
+		}
+
 		if (bGpuResident)
 		{
 			// ONLY THE FIRST-LOAD SHAPE EXISTS ON THIS PATH, and it is not an
@@ -12877,12 +14238,40 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (Result.bPredictedEmpty)
 		{
 			++BuriedVerifyCheckedSinceLog;
-			if (Result.QuadCount() > 0)
+			// TWO PREDICATES FOR ONE QUESTION, and the question is "did a chunk
+			// we claimed meshes to nothing actually have a surface?"
+			//
+			//   quad-valued  -- dies the moment terrain stops producing quads
+			//   brick-valued -- survives, but is null on every GPU-fork result
+			//
+			// Neither alone can be trusted, so both are asked and the case where
+			// NEITHER could answer is counted separately. "Could not check" must
+			// never read as "checked and clean".
+			const bool bQuadsAnswer = (Result.QuadCount() > 0);
+			const bool bBrickCanAnswer = Result.BrickPack.IsValid();
+			// A chunk meshes to zero quads when it is all-air OR all-solid, so
+			// the surface case -- the thing the skip would have deleted -- is
+			// exactly MIXED. Same semantics as the quad test, expressed in cells.
+			const bool bBrickAnswer =
+				bBrickCanAnswer && Result.BrickPack->bAnySolid && !Result.BrickPack->bAllSolid;
+			const bool bMutated = (VoxelStreamAdmission::MutateSkipVerify() != 0) &&
+			                      (BuriedVerifyViolations == 0);
+			if (bQuadsAnswer || bBrickAnswer || bMutated)
 			{
 				++BuriedVerifyViolations;
 				UE_LOG(LogVoxelPerf, Error,
-				       TEXT("Voxel buried skip UNSOUND: chunk L%d (%d,%d,%d) was predicted empty but meshed %d quads"),
-				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.QuadCount());
+				       TEXT("Voxel buried skip UNSOUND%s: chunk L%d (%d,%d,%d) was predicted empty "
+				            "but meshed %d quads (brick: %s)"),
+				       bMutated && !bQuadsAnswer && !bBrickAnswer ? TEXT(" (MUTATED)") : TEXT(""),
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z,
+				       Result.QuadCount(),
+				       bBrickCanAnswer
+				           ? (bBrickAnswer ? TEXT("mixed") : TEXT("uniform"))
+				           : TEXT("no pack"));
+			}
+			else if (Result.QuadCount() == 0 && !bBrickCanAnswer)
+			{
+				++BuriedVerifyUncheckable;
 			}
 		}
 
@@ -12895,13 +14284,33 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		if (SolidSkipVerifyKeys.Remove(Result.Key) > 0)
 		{
 			++SolidVerifyCheckedSinceLog;
-			if (Result.QuadCount() > 0)
+			const bool bQuadsAnswer = (Result.QuadCount() > 0);
+			const bool bBrickCanAnswer = Result.BrickPack.IsValid();
+			// STRICTER THAN THE QUAD TEST ON PURPOSE, and the difference is
+			// worth naming rather than absorbing. The quad test fires only when
+			// there is a SURFACE, so a chunk admission called all-solid that is
+			// actually all-AIR meshed to zero quads and passed silently -- a
+			// hole the verifier was structurally blind to. !bAllSolid catches
+			// both that and the mixed case.
+			const bool bBrickAnswer = bBrickCanAnswer && !Result.BrickPack->bAllSolid;
+			const bool bMutated = (VoxelStreamAdmission::MutateSkipVerify() != 0) &&
+			                      (SolidVerifyViolations == 0);
+			if (bQuadsAnswer || bBrickAnswer || bMutated)
 			{
 				++SolidVerifyViolations;
 				UE_LOG(LogVoxelPerf, Error,
-				       TEXT("Voxel solid skip UNSOUND: chunk L%d (%d,%d,%d) was predicted all-solid at admission ")
-				       TEXT("but meshed %d quads"),
-				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z, Result.QuadCount());
+				       TEXT("Voxel solid skip UNSOUND%s: chunk L%d (%d,%d,%d) was predicted all-solid "
+				            "at admission but meshed %d quads (brick: %s)"),
+				       bMutated && !bQuadsAnswer && !bBrickAnswer ? TEXT(" (MUTATED)") : TEXT(""),
+				       Result.Key.Level, Result.Key.Key.X, Result.Key.Key.Y, Result.Key.Key.Z,
+				       Result.QuadCount(),
+				       bBrickCanAnswer
+				           ? (bBrickAnswer ? TEXT("NOT all-solid") : TEXT("all-solid"))
+				           : TEXT("no pack"));
+			}
+			else if (Result.QuadCount() == 0 && !bBrickCanAnswer)
+			{
+				++SolidVerifyUncheckable;
 			}
 		}
 
@@ -13021,6 +14430,29 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			++ProxiesCreated;
 		}
 
+		// P2 coverage: the worker also packed this chunk into the brick volume, and
+		// this is where it becomes resident. AFTER the apply and only for a result
+		// that reached it, which is the point -- the stale/superseded discard
+		// above has already run, so a job an edit overtook cannot leave the brick
+		// volume describing terrain the renderer does not have. Null on every
+		// GPU-fork result (that arm published at completion) and whenever the CPU
+		// arm is gated off.
+		// STEP 3: the real per-chunk shading, sampled EXACTLY as the quad path
+		// samples it for ChunkParams -- same function, same Root, same origin
+		// convention -- so the two renderers cannot disagree about the climate or
+		// the surface plane.
+		VoxelBrickCpuArm::Publish(
+			Result.Key, Result.BrickPack,
+			// ChunkOriginWorldForLevel WITH NO REBASE, exactly as the quad path
+			// passes it at :13333 and :13617. The sampler adds
+			// Root.GetComponentLocation() itself, so this argument is in the
+			// ROOT frame -- subtracting GpuPoolRebase here would sample the
+			// climate and the surface plane at the wrong place on the map, and
+			// the result would still look like terrain.
+			ShadingFromChunkParams(SampleChunkParamsForPool(
+				Root, VoxelCoords::ChunkOriginWorldForLevel(Result.Key.Key, Result.Key.Level),
+				Result.Key.Level)));
+
 		// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2):
 		// DeliverToApplyMs, immediately AFTER the apply rather than inside
 		// ApplyMeshResult itself -- that function is being edited concurrently
@@ -13097,11 +14529,71 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		++Count;
 
 		SCOPE_CYCLE_COUNTER(STAT_VoxelGameThreadMesh);
+		// P2 coverage, AND THE HALF THAT IS A CORRECTNESS BUG RATHER THAN A
+		// PERCENTAGE. This function is the ONLY producer for an edited or overlay
+		// chunk and for every post-edit re-mesh -- the GPU fork never sees them, by
+		// design, because it reads generated terrain and not the edit overlay. So
+		// before this change the brick volume kept the PRE-EDIT shape of every
+		// chunk a player ever dug, permanently and with no counter moving. That is
+		// invisible today (nothing marches) and would be a dig that does not appear
+		// in the marched world the moment something does.
+		const bool bPackBricksOnCpu = VoxelBrickCpuArm::ShouldPack();
+		// The edit path follows the same control so an A/B covers every producer,
+		// but it is NOT timed into the Phase 5 terms: it runs on the game thread
+		// with the overlay-aware sampler, and folding it into a worker-thread mean
+		// would describe no thread at all.
+		const bool bReuseMesherVoxels = VoxelBrickPackReuseMesherVoxelsEnabled();
+		// THIS PATH USED TO BE EXEMPT FROM RETIREMENT AND THE EXEMPTION WAS WRONG.
+		//
+		// voxel.Brick.SuppressQuadMesh is worker-only on purpose: it is a stopwatch
+		// arm, and suppressing edits would have broken editing for no timing gain.
+		// voxel.Terrain.RetireQuads is NOT that -- under it the marcher is the
+		// renderer, so an edited chunk must stop producing quads too and rely on
+		// the brick pack this function already produces.
+		//
+		// Carrying the exemption forward cost a measured leak: with retirement on,
+		// the self-check read `terrainPoolUsedQuads=74583` -- 0.16% of a 46.8M
+		// baseline, which any threshold above zero would have called retired. This
+		// is the ONLY remaining CPU quad producer, and by elimination it was the
+		// one allocating: of the four terrain-pool allocation sites, the
+		// speculative park early-returns on a zero/invalid payload and the
+		// GPU-resident branch cannot fire with bDirectToPool forced off.
+		const bool bRetireQuads = VoxelTerrainQuadsRetired();
+		FVoxelBrickCpuPackRef BrickPack;
 		TArray<FVoxelChunkQuad> Quads;
 		if (LevelKey.Level == 0)
 		{
-			MeshChunkBricks(
-				LevelKey.Key, [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); }, Quads, &PerfCounters);
+			// ONE sampler object for both consumers, not two identical lambdas: the
+			// mesh and the bricks must be two encodings of the same answers, and the
+			// cheapest way to guarantee that is for there to be one thing to answer.
+			const auto EditSampler = [this](int64 X, int64 Y, int64 Z) { return Voxels.materialAt(X, Y, Z); };
+			if (bRetireQuads)
+			{
+				// No mesher, so the packer materialises the chunk itself. Quads
+				// stays EMPTY, which sends ApplyMeshResult down its NumQuads == 0
+				// branch -- the same branch 43% of chunks already take -- so the
+				// edit still updates the volume and allocates no pool range.
+				BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, EditSampler);
+			}
+			else if (bPackBricksOnCpu && bReuseMesherVoxels)
+			{
+				// The same reuse the worker path gets: World::materialAt walks the
+				// edit overlay on every call and is the most expensive sampler in
+				// the project, so re-reading 32,768 cells here would be the worst
+				// place of all to do it.
+				vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+				MeshChunkBricks(LevelKey.Key, EditSampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
+				                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+				BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+			}
+			else
+			{
+				MeshChunkBricks(LevelKey.Key, EditSampler, Quads, &PerfCounters);
+				if (bPackBricksOnCpu)
+				{
+					BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, EditSampler);
+				}
+			}
 		}
 		else
 		{
@@ -13113,7 +14605,25 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 			// log line is the headless-run evidence that a distant edit
 			// actually re-meshed a mip ring chunk.
 			const auto OverlaySampler = MakeOverlayAwareLevelSampler(Voxels, LevelKey.Level);
-			MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
+			if (bRetireQuads)
+			{
+				BrickPack = VoxelBrickCpuArm::PackChunkMaterialising(LevelKey, OverlaySampler);
+			}
+			else if (bPackBricksOnCpu && bReuseMesherVoxels)
+			{
+				vxc::MaterialId* Dense = VoxelBrickCpuArm::ThreadDenseChunk();
+				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters, /*RingSkirtMask*/ 0,
+				                FNeverSkipBrick(), VoxelBrickCpuArm::FDenseChunkSink{ Dense });
+				BrickPack = VoxelBrickCpuArm::PackChunkFromDense(LevelKey, Dense, /*bFillWasFree*/ true);
+			}
+			else
+			{
+				MeshChunkBricks(LevelKey.Key, OverlaySampler, Quads, &PerfCounters);
+				if (bPackBricksOnCpu)
+				{
+					BrickPack = VoxelBrickCpuArm::PackChunk(LevelKey, OverlaySampler);
+				}
+			}
 			UE_LOG(LogVoxelEdit, Log, TEXT("Distant-edit mip re-mesh: level=%d chunk=(%d,%d,%d) quads=%d"), LevelKey.Level,
 			       LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z, Quads.Num());
 		}
@@ -13121,6 +14631,14 @@ void FVoxelWorldImpl::DrainGameThreadMesh(AActor& Owner, USceneComponent& Root, 
 		{
 			++ProxiesCreated;
 		}
+		// Published after the apply, for DrainResults's reason: the record is live
+		// (the !Rec continue above already ran), so this cannot make a chunk
+		// resident in the brick volume that the renderer has no record of.
+		VoxelBrickCpuArm::Publish(
+			LevelKey, BrickPack,
+			ShadingFromChunkParams(SampleChunkParamsForPool(
+				Root, VoxelCoords::ChunkOriginWorldForLevel(LevelKey.Key, LevelKey.Level),
+				LevelKey.Level)));
 	}
 	LastRemeshFrac = float(Count) / float(MaxRemeshes);
 	ThisFrameEditRemeshes = Count;
@@ -13220,6 +14738,22 @@ void FVoxelWorldImpl::DrainUnloads()
 		// a RemovePrimitive on the component path, a pool free plus an
 		// incremental buffer write on the GPU path -- so gate it either way. Over budget this frame: keep the record
 		// tracked and re-queue it for the next frame (do NOT drop the chunk).
+		// Set only when the geometry was PARKED rather than freed, which is the
+		// single case in which this chunk's bricks must outlive its record.
+		bool bParkedGeometry = false;
+
+		// WAVE 1.2b was tried here too -- splitting this into bHoldsGeom /
+		// bHoldsTerrain so retention would cover brick-holding records -- and was
+		// REVERTED with the rest of it. The full measurement and the conditions
+		// any retry must meet are recorded at the stamping site in
+		// RecomputeDesiredSet; the short version is that switching retention on
+		// for the marcher took evictions from 0 to 151,657 and filled the brick
+		// pool to 96%, which is the exact failure Wave 1.2 exists to prevent.
+		//
+		// Left as the original single gate deliberately: retention, the unload
+		// budget and the geometry release are all render-facing costs, and a
+		// record that holds no drawn geometry pays none of them. Its BRICKS are
+		// freed below, past this block, which is where they belong.
 		if (Rec->HoldsGeometry())
 		{
 			// Load-before-unload: keep this chunk drawn as a stand-in until its
@@ -13346,11 +14880,31 @@ void FVoxelWorldImpl::DrainUnloads()
 			{
 				ReleaseChunkGeometry(*Rec);
 			}
+			else
+			{
+				bParkedGeometry = true;
+			}
 			++ComponentUnloads;
 		}
 
 		PendingUnloadSet.Remove(Key);
 		ResidentQuads -= Rec->LastQuadCount;
+		// WAVE 1.2. Bricks are freed HERE -- past the HoldsGeometry() gate, not
+		// inside it -- because this is the line where the chunk stops being
+		// resident. Under terrain quad retirement HoldsGeometry() is false for
+		// every terrain chunk, so anything hung off the geometry release would
+		// free nothing in the shipping config.
+		//
+		// PARKED GEOMETRY IS THE ONE EXCEPTION AND IT IS NOT HYPOTHETICAL.
+		// Adoption re-admits a parked chunk with NO mesh job, so a parked chunk
+		// that lost its bricks here would come back drawable and unmarchable.
+		// EvictParkedKey frees them when the park is finally given up. (Parking
+		// requires a pool slot, so it is already inert under retirement -- this
+		// keeps the two mechanisms independent rather than relying on that.)
+		if (!bParkedGeometry)
+		{
+			ReleaseChunkBricks(Key);
+		}
 		ChunkRecords.Remove(Key);
 		++TotalChunksUnloaded;
 		++RecordsEvictedSinceLog;
@@ -15313,6 +16867,15 @@ bool UVoxelWorldSubsystem::InstallWaterMarker(vxc::IWaterSampler* Sampler, bool 
 	return true;
 }
 
+// P7-a. See the header for why an accessor exists instead of a TObjectIterator
+// at the call site. This is the whole body: the terrain pool is the one THIS
+// subsystem created, and that is not a heuristic about it -- it is what makes
+// it the terrain pool.
+const UVoxelGpuPoolComponent* UVoxelWorldSubsystem::GetTerrainGpuPool() const
+{
+	return Impl ? Impl->GpuPool.Get() : nullptr;
+}
+
 void UVoxelWorldSubsystem::Deinitialize()
 {
 	if (Impl)
@@ -16102,7 +17665,12 @@ bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOu
 	const VoxelCoords::FVoxelLevelChunkKey Key{0, VoxelCoords::ChunkKeyForVoxel(VoxelCoords::WorldToVoxel(WorldPos))};
 	const VoxelStreaming::FChunkRecord* Rec = Impl->ChunkRecords.Find(Key);
 	bOutTracked = (Rec != nullptr);
-	bOutHasComponent = Rec && Rec->HoldsGeometry();
+	// HoldsTerrain, NOT HoldsGeometry. VoxelCharacterMovement reads this to
+	// decide whether the ground exists: it teleports the pawn to the analytic
+	// surface and vetoes gravity while it says no. Quad-valued, it says no for
+	// every chunk under retirement and the pawn never lands -- on terrain the
+	// marcher is drawing.
+	bOutHasComponent = Rec && Rec->HoldsTerrain(Key);
 	OutQuads = Rec ? Rec->LastQuadCount : 0;
 	bOutSettled = Rec && Rec->bMeshSettled;
 	return true;

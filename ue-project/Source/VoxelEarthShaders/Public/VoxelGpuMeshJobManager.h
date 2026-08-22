@@ -91,6 +91,7 @@
 
 #include "CoreMinimal.h"
 #include "Delegates/Delegate.h"
+#include "VoxelBrickPool.h"
 #include "VoxelGpuQuadPayload.h"
 #include "VoxelGpuWorldGen.h"
 
@@ -120,6 +121,34 @@ namespace VoxelGpuChunkRegion
 	// link.
 	VOXELEARTHSHADERS_API void SetChunkFootprint(FVoxelGpuRegionRequest& Req,
 	                                             int32 ChunkX, int32 ChunkY, int32 ChunkZ);
+
+	// --- P1-C: the halo-free footprint the brick volume is packed from ------
+	//
+	// THE MARCHER NEEDS NO APRON, AND THE PRODUCER CANNOT SHARE THE MESHER'S.
+	// Two separate facts, and both of them force this function to exist.
+	//
+	// The one that MAKES it possible: a marcher reads neighbours by index --
+	// face normals come from the DDA's crossed axis, AO from occupancy bits
+	// already in registers, colour from the voxel itself -- so it needs none of
+	// the one-brick halo the greedy mesher reads for AO and face neighbours.
+	// The dispatch is 32x32x4 rather than 48x48x6: 3.375x less voxelize work
+	// per chunk (docs/ray-marching-plan-2026-08-19.md section 8).
+	//
+	// The one that FORCES it: brickpack.ush's decodeBrick has no brick origin.
+	// It decomposes a region into whole chunks counted from the region's OWN
+	// corner, so pointing it at the mesher's 48x48x6 footprint would pack
+	// bricks 0..3 -- the HALO corner -- rather than the interior 1..4. Every
+	// per-brick test would pass and the world would be displaced by one brick
+	// on every axis. That is why this is a derived region and not a flag.
+	//
+	// Returns false, and leaves OutReq untouched, if MeshReq is not the
+	// standard single-chunk footprint SetChunkFootprint produces. The raster
+	// window is copied verbatim -- the halo-free footprint is strictly inside
+	// the halo one, and a window that over-covers is legal where one that
+	// under-covers is not -- and every asset instance's anchor is rebased by
+	// the one brick the origin moved.
+	VOXELEARTHSHADERS_API bool MakeBrickRegion(const FVoxelGpuRegionRequest& MeshReq,
+	                                           FVoxelGpuRegionRequest& OutReq);
 }
 
 // Why a job ended. Exactly one of these is delivered per Submit().
@@ -143,6 +172,25 @@ enum class EVoxelGpuMeshJobStatus : uint8
 };
 
 VOXELEARTHSHADERS_API const TCHAR* LexToString(EVoxelGpuMeshJobStatus Status);
+
+// --- the two brick gates, readable from outside this module -----------------
+//
+// voxel.GPU.BrickPack and voxel.GPU.BrickPackResident are declared next to the
+// job manager because that is where the GPU producer reads them. They are
+// exported here because THE CPU PRODUCER MUST OBEY THE SAME TWO SWITCHES: a
+// brick volume half-fed by an arm that ignores the master gate is worse than one
+// that is off, and "packed and discarded" has to mean discarded on both arms or
+// the publication-stubbed measurement arm silently stops being a control.
+//
+// Accessors rather than extern int32s so the cvar stays owned by one translation
+// unit, and rather than IConsoleManager lookups at the call site so a per-chunk
+// read is a load and not a hash.
+//
+// GAME THREAD. Both are read once per job and captured by value into worker
+// task bodies, which is this project's established pattern for a gate a worker
+// needs (bPredictedEmpty, bComputeBand, bLatencyStatsEnabled are the same shape).
+VOXELEARTHSHADERS_API bool VoxelGpuBrickPackEnabled();
+VOXELEARTHSHADERS_API bool VoxelGpuBrickPackResidentEnabled();
 
 struct FVoxelGpuMeshJobResult
 {
@@ -217,6 +265,22 @@ struct FVoxelGpuMeshJobResult
 	bool bBandValid = false;
 	int32 BandMaxSurfaceTopVoxel = 0;
 	int32 BandMinDeepestAirVoxel = 0;
+
+	// --- P1-C: the packed brick volume, left in GPU memory ------------------
+	//
+	// Non-null when the job packed bricks (voxel.GPU.BrickPack) and the pack
+	// succeeded. Under voxel.GPU.BrickPackResident (the default) the manager has
+	// ALREADY published a reference of this into the global brick pool by the
+	// time the result is delivered -- residency is the streaming path's job, not
+	// the caller's -- and this handle is here so a gate can stand up a private
+	// pool and publish the same bytes into it instead.
+	//
+	// It rides this result rather than its own async stream for the reason the
+	// band does: a second stream would give a job TWO things to deliver exactly
+	// once, and "delivered quads but no volume" would become representable.
+	// Nothing about the mesh path depends on it, and dropping it is safe -- it
+	// releases the GPU memory on the render thread.
+	FVoxelGpuBrickPayloadRef BrickVolume;
 
 	// Wall-clock, all measured from the game thread's point of view except
 	// DispatchToReadyMs.
@@ -343,6 +407,32 @@ public:
 	int32 NumInFlight() const { return InFlight.Num(); }
 	bool HasWork() const { return NumQueued() > 0 || NumInFlight() > 0; }
 
+	// THE THREE STAGES OF Tick(), IN MILLISECONDS SINCE THE LAST READ.
+	//
+	// Tick() was measured at ~18-19 ms per hitch frame -- the largest single
+	// item in the streaming tick, and 90% of the bucket the project calls
+	// "dispatch" (which also spans this call; see VoxelWorldSubsystem's
+	// ThisFrameGpuManagerTickMs). Throughput is MaxJobsInFlight x frame rate,
+	// so this is the world's generation ceiling and it deserves a breakdown
+	// rather than one number -- the same argument that produced the dispatch
+	// brackets, applied one level down.
+	//
+	// Read-and-reset, so the caller owns the window and two readers cannot
+	// halve each other's totals.
+	struct FTickStageMs
+	{
+		double PromoteMs = 0.0;   // selecting jobs into the batch
+		double PollMs = 0.0;      // PollInFlight: harvesting readbacks
+		double BrickFlushMs = 0.0; // the pool Flush this tick owns
+		double EnqueueMs = 0.0;   // building and enqueueing the render command
+	};
+	FTickStageMs GetAndResetTickStageMs()
+	{
+		const FTickStageMs Out = TickStageMs;
+		TickStageMs = FTickStageMs();
+		return Out;
+	}
+
 	int32 GetMaxInFlight() const { return MaxInFlight; }
 	void SetMaxInFlight(int32 InMaxInFlight) { MaxInFlight = FMath::Max(1, InMaxInFlight); }
 
@@ -369,6 +459,7 @@ private:
 
 	FVoxelGpuMeshJobComplete OnJobComplete;
 	int32 MaxInFlight = 8;
+	FTickStageMs TickStageMs;
 	double TimeoutSeconds = 10.0;
 	uint64 NextJobId = 1;
 

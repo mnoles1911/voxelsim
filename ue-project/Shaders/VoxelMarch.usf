@@ -1,0 +1,3072 @@
+// VoxelMarch.usf -- the marcher that DRAWS.
+//
+// P3 of docs/ray-marching-plan-2026-08-19.md. VoxelMarchRenderer.h owns the
+// seam argument (which engine hooks and why); VoxelBrickTraverse.ush owns the
+// volume; this file owns the three kernels between them and, above all, THE
+// GBUFFER CHANNEL TABLE -- what goes in each channel, in what encoding, and
+// which of those encodings are not what the plan said they were.
+//
+//   VoxelMarchMain           [cs] one ray per pixel -> VisBuffer + float t,
+//                                 plus one hit bit per 8x8 tile
+//   VoxelMarchCompactTilesMain [cs] hit tiles -> tile list + DrawIndirect args
+//   VoxelMarchEmitVS/PS      [raster, indirect] SV_Depth + stencil + GBuffers
+//
+// ===========================================================================
+// WHY THE PICTURE IS BUILT IN TWO PASSES AND NOT ONE
+// ===========================================================================
+//
+// The march is expensive and has to happen before the base pass (that is the
+// only hook the engine offers ahead of it); the GBuffer can only be written
+// after it. Between the two the engine renders shadow maps and lights the
+// Lumen scene, which is a large block of work the march now overlaps with
+// instead of sitting in front of.
+//
+// The intermediate is a VISIBILITY BUFFER -- the voxel, the face, the level,
+// the material and the AO bits, packed into 64 bits, plus the ray's float t in
+// its own R32_FLOAT. Two textures rather than one because the t must stay a
+// full float: depth AND velocity are both reconstructed from it, and putting
+// it through the 64-bit packing would quantise the previous-frame position more
+// coarsely than the motion vectors it feeds.
+//
+// ===========================================================================
+// THE GBUFFER CHANNEL TABLE -- AND THREE PLACES THE BRIEF WAS WRONG
+// ===========================================================================
+//
+// Checked against the 5.8 source rather than assumed. The three corrections
+// are marked (!) and each one would have produced a picture that looked
+// plausible and was wrong.
+//
+//   SV_Depth   reverse-Z, from the EXACT hit. Computed by projecting the hit
+//              position through View.TranslatedWorldToClip rather than by
+//              inverting InvDeviceZToWorldZTransform, so it carries the same
+//              TAA jitter every other primitive in the frame carries. A depth
+//              that disagrees with the prepass by the jitter offset reads as a
+//              half-pixel-wobbling silhouette and nothing else.
+//   Stencil    RECEIVE_DECAL (bit 7, 0x80). Set by the pipeline state's
+//              stencil ref, not by this shader.
+//   Target 0   SceneColor. Emissive, which for terrain is 0.
+//   Target 1   GBufferA.rgb = EncodeNormal(worldNormal) -- and the normal is
+//              the EXACT geometric axis off the DDA's crossed face. No
+//              derivative, no interpolant, no normal map (ADR-0008).
+//              GBufferA.a = PerObjectGBufferData, 2 bits: bit0 cast contact
+//              shadow, bit1 dynamic indirect shadow caster. 0 for both.
+//   Target 2   GBufferB = (metallic 0, specular 0.5, roughness,
+//              EncodeShadingModelIdAndSelectiveOutputMask(DEFAULT_LIT, mask)).
+//   Target 3   GBufferC.rgb = the palette colour.
+//          (!) GBufferC.a is NOT GBufferAO in this project. The brief says
+//              "GBufferC .a = GBufferAO from voxel corner AO". That is only
+//              true when ALLOW_STATIC_LIGHTING is 0. With static lighting
+//              allowed -- the engine default, and this project's setting --
+//              DeferredShadingCommon.ush:1014-1021 puts
+//              EncodeIndirectIrradiance(IndirectIrradiance * GBufferAO) there
+//              and the decoder (GBufferHelpers.ush:415-427) returns
+//              GBufferAO = 1 unconditionally. Writing raw AO into it does not
+//              darken anything; it reads back as a garbage indirect-irradiance
+//              term. See THE AO CHANNEL below for what is done instead.
+//      (!)(!) Target 4 is GBufferD = CUSTOM DATA and Target 5 is GBufferE =
+//              PRECOMPUTED SHADOW FACTORS. The brief has these swapped ("D
+//              precomputed shadow = 1, E 0"). DeferredShadingCommon.ush:
+//              1027-1028: `OutGBufferD = GBuffer.CustomData; OutGBufferE =
+//              GBuffer.PrecomputedShadowFactors;`. So D = 0 (DefaultLit has no
+//              custom data) and E = 1 (NOT 0 -- the decoder reads 1 as "no
+//              precomputed shadow", and 0 as "fully shadowed by a lightmap
+//              that does not exist", which would render terrain black under
+//              every stationary light).
+//   Target 6   Velocity. Ours, and never cleared here -- see the .cpp.
+//
+// SLOT INDICES ARE OURS, NOT THE BASE PASS'S. The engine's GBuffer slot
+// indices are data-driven (FSceneTextures::GetGBufferRenderTargets reads
+// Config.GBufferBindings, and r.VelocityOutputPass 1 shifts D and E by one) and
+// an SV_Target index is a compile-time constant, so a shader written against
+// the base pass's layout can only be plausible, never correct. The host builds
+// its own binding slots in the order above, from the textures themselves. The
+// one thing that varies is GBufferE, which does not exist when static lighting
+// is off -- ALLOW_STATIC_LIGHTING is a global compile define and the host tests
+// the same predicate, so the two sides cannot drift.
+//
+// The precedent for a global shader writing SV_Target1..5 directly is the
+// engine's own: DebugProbes.usf:210-227, dispatched from
+// DebugProbeRendering.cpp eighteen lines after our hook fires.
+//
+// ===========================================================================
+// THE AO CHANNEL -- WHAT THE RASTER PATH ACTUALLY DOES, WHICH SETTLES IT
+// ===========================================================================
+//
+// The shipped mesher packs 2 bits of AO per face corner and the material
+// MULTIPLIES IT INTO THE PALETTE COLOUR (VoxelQuadVertexFactory.ush:879,
+// "the palette colour is lit and occluded like..."). It never goes near
+// GBufferAO. So for the marcher to be A/B-comparable against the raster path,
+// its AO has to arrive the same way -- into base colour -- and that is what
+// voxel.March.AO 1 does.
+//
+// AND THE ARITHMETIC IS BYTE-IDENTICAL TO THE MESHER'S, not merely similar.
+// VoxelBrickTraverse.ush's VoxelMarchCornerValue is vxc::detail::aoCorner
+// (mesher.h:33-35) term for term, over the same eight neighbours on the same
+// neighbour plane with the same u=(axis+1)%3, v=(axis+2)%3 convention
+// (mesher.h:107, 125-132). The ONE difference is that the mesher computes four
+// corner values and lets the rasteriser interpolate them across a greedy quad
+// spanning up to 8x8 voxels, while the marcher computes them for the exact
+// voxel the ray hit and interpolates within that one face. The marcher is
+// strictly more correct; it is not a different rule.
+//
+// ===========================================================================
+// THE DBUFFER HOLE -- AND IT IS A HOLE, NOT AN OMISSION
+// ===========================================================================
+//
+// The plan (section 5, item 1) says decals "must be applied by hand ... ~15
+// lines from DeferredDecal.ush. Not optional." Two things are wrong with that
+// and one of them is fatal at this seam:
+//
+//   1. There is no DeferredDecal.ush in UE 5.8. The code is in
+//      DBufferDecalShared.ush (FDBufferData :376, DecodeDBufferData :415,
+//      GetDBufferData :440, ApplyDBufferData :507).
+//   2. THE TEXTURES ARE UNREACHABLE FROM A GAME MODULE AT THIS HOOK. DBufferA/
+//      B/C live in FDBufferParameters / FDBufferTextures, both declared in
+//      Renderer/Private/DBufferTextures.h. FSceneTextureUniformParameters does
+//      not carry them (SceneTexturesConfig.h:14-39 -- SceneColor, SceneDepth,
+//      GBufferA..F, Velocity, SGGX, SSAO, CustomDepth/Stencil, and nothing
+//      else). ESceneTextureSetupMode has no DBuffer flag. FXRenderingUtils
+//      exposes nothing. FSceneTextures reaches them only through a TPimplPtr in
+//      an Internal header whose pointee is defined in a Private one.
+//      PostRenderBasePassDeferred_RenderThread's signature hands us render
+//      targets and scene textures and no third thing.
+//
+// So the apply is WRITTEN AND CORRECT below, behind VOXEL_MARCH_DBUFFER, and
+// the permutation is not compiled and the cvar is forced off. It needs exactly
+// one binding, and that binding needs either an engine change (D:\UE_5.8 is a
+// source build) or a new RENDERER_API accessor.
+//
+// MITIGATING, AND CHECKED: this project places no decals at all -- there is not
+// one UDecalComponent, UDecalActor or r.DBuffer setting anywhere in ue-project.
+// So nothing is currently being lost. What IS lost is the ability to add one
+// later without noticing that it does not land on the ground.
+//
+// ===========================================================================
+// THINGS THIS SHADER DELIBERATELY DOES NOT DO
+// ===========================================================================
+//
+//   * no ddx/ddy, anywhere. ADR-0008: hardware derivatives are discontinuous
+//     across voxel edges. LOD is the cone rule in VoxelBrickTraverse.ush.
+//   * no SV_DepthLessEqual / SV_DepthGreaterEqual. Conservative depth would
+//     keep early-Z alive, but it needs the rasterised depth to bound the
+//     shader's, and the emit's quad has no meaningful bound to give. Plain
+//     SV_Depth it is, early-Z is off for these tiles, and that cost is exactly
+//     what the indirect hit-tile dispatch exists to confine.
+//   * no blending. Every channel written here REPLACES what the base pass put
+//     there; a blend on a GBuffer is not a softer surface, it is a corrupt one.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/DeferredShadingCommon.ush"
+#include "/Engine/Private/VelocityCommon.ush"
+
+#include "/VoxelEarth/VoxelBrickTraverse.ush"
+
+#ifndef VOXEL_MARCH_TILE_SIZE
+#define VOXEL_MARCH_TILE_SIZE 8
+#endif
+#ifndef VOXEL_MARCH_COMPACT_GROUP
+#define VOXEL_MARCH_COMPACT_GROUP 64
+#endif
+#ifndef VOXEL_MARCH_AO
+#define VOXEL_MARCH_AO 1
+#endif
+#ifndef VOXEL_MARCH_DBUFFER
+#define VOXEL_MARCH_DBUFFER 0
+#endif
+#ifndef VOXEL_MARCH_VELOCITY
+#define VOXEL_MARCH_VELOCITY 1
+#endif
+
+// ---------------------------------------------------------------------------
+// Bindings
+// ---------------------------------------------------------------------------
+//
+// FluidOccupancyBits / FluidVolumeOriginVoxel / FluidVolumeDimVoxels /
+// FluidVolumeWrapOffsetVoxel are NOT declared here -- VoxelFluidCollision.ush
+// declares them and it is the only file allowed to, and the host pastes
+// VOXEL_FLUID_OCCUPANCY_PARAMETERS() into the same struct so the names match.
+// MarchStepBudget likewise comes from VoxelBrickTraverse.ush, which has to
+// declare it before the walk is included.
+
+float4x4 MarchViewToTranslatedWorld;
+float3   MarchRayOriginLocalUU;
+float    MarchVolumeExtentUU;
+float2   MarchViewRectMin;
+float2   MarchViewRectSize;
+float2   MarchInvProjDiag;
+float4   MarchInvDeviceZToWorldZ;
+float    MarchPixelConeSlope;
+int2     MarchTileCount;
+
+int MarchHasPrepassDepth;
+Texture2D<float> MarchSceneDepthTexture;
+
+RWTexture2D<uint2> MarchOutVis;
+RWTexture2D<float> MarchOutHitT;
+RWBuffer<uint>     MarchOutTileHit;
+
+uint   MarchTileTotal;
+Buffer<uint>   MarchTileHit;
+RWBuffer<uint> MarchOutTileList;
+RWBuffer<uint> MarchOutDrawArgs;
+
+Texture2D<uint2> MarchVis;
+Texture2D<float> MarchHitT;
+Buffer<uint>     MarchTileList;
+
+// The box inset, lifted verbatim from VoxelMarchSpike.usf with its reason: the
+// walk's first act is floor(pos/10) + origin, and a point sitting exactly on a
+// box face floors to voxel -1 or 512, which the occupancy contract reports as
+// SOLID. Every ray would then terminate on the box wall as "started inside" and
+// the screen would fill with one flat colour. 0.05 UU is ~100 float ULP at the
+// far corner and 1/200 of a voxel.
+#define VOXEL_MARCH_BOX_INSET_UU 0.05f
+
+// Direction components below this are nudged away from zero before the
+// reciprocal, so an axis-aligned ray produces +/-inf slab distances instead of
+// 0 * inf = NaN.
+#ifndef VOXEL_MARCH_MIN_DIR_COMPONENT
+#define VOXEL_MARCH_MIN_DIR_COMPONENT 1e-6f
+#endif
+
+// Terrain roughness. Flat, and deliberately so: ADR-0008's whole position is
+// that a voxel world's material identity lives in the palette and the face, not
+// in a texture, and a per-material roughness table would be a second material
+// authority to keep in step with materialpalette.h. One number, stated here,
+// changed here.
+#define VOXEL_MARCH_ROUGHNESS 0.86f
+#define VOXEL_MARCH_SPECULAR  0.5f
+#define VOXEL_MARCH_METALLIC  0.0f
+
+// ---------------------------------------------------------------------------
+// The VisBuffer packing -- 64 bits, and this is the only place it exists
+// ---------------------------------------------------------------------------
+//
+//   X  [ 0: 9] local voxel x   (volume-local, 0..511 with one bit of headroom)
+//      [10:19] local voxel y
+//      [20:29] local voxel z
+//      [30:31] face axis, 0..2
+//   Y  [ 0]    hit
+//      [ 1]    face sign > 0
+//      [ 2: 4] ring level, 0..7
+//      [ 5:12] material
+//      [13:20] the eight face-neighbour AO bits
+//      [21:31] spare
+//
+// THE VOXEL IS STORED, NOT RE-DERIVED, and that is a deliberate 8 bytes per
+// pixel. Reconstructing it in the emit as floor(hitPos / voxelSize) puts a
+// floor() on a coordinate that lies EXACTLY on a voxel boundary by construction
+// -- which is the arithmetic VoxelMarchSpike.usf's REFERENCE NOISE FLOOR note
+// traced to two float ULP and 20 disagreements in 1.35M rays. Twenty wrong
+// palette hashes per frame would be invisible in a metric and visible as
+// speckle in a screenshot.
+//
+// LOCAL AND NOT WORLD, because 3 x 21-bit world voxel coordinates plus the
+// attributes do not fit in 64 bits at planet scale. The emit adds
+// FluidVolumeOriginVoxel back -- an exact integer add of a uniform -- and the
+// result is the same world voxel lattice VoxelPalettePack hashes on, so the
+// marcher and the raster path tint the same voxel the same colour.
+//
+// UNDER SOURCE 1 THIS GETS EASIER, NOT HARDER: the brick pool's natural
+// coordinates are (level, chunk, brick, cell), all small, so the packing has
+// room rather than needing more.
+// THIRTEEN BITS PER AXIS, NOT TEN, AND THE REACH IS WHY.
+//
+// Ten bits held 1,024 voxels, which covered the 51.2 m box with room. At the
+// cascade's 256 m reach the frame spans 2*2560 + 2048 = 7,168 LEVEL-0 VOXELS,
+// so a 10-bit field WRAPS -- and it wraps into a legal-looking coordinate, which
+// is doctrine 5's exact failure mode: terrain drawn at the wrong place with no
+// error anywhere. P.y had eleven spare bits above the neighbour mask; nine of
+// them carry the high three bits of each axis, giving 8,192 and covering 7,168.
+//
+// THE HEADROOM IS NOT LARGE AND IT IS CHECKED ON THE CPU, not assumed here --
+// see the frame-extent guard in VoxelMarchRenderer.cpp. A future reach increase
+// must trip that guard rather than silently fold the world.
+// THE BIAS, AND WHY ONLY UNDER RINGS.
+//
+// With the cascade on, LocalVoxel is CAMERA-relative and therefore SIGNED --
+// half the rays are behind the camera voxel on any given axis. Masking a
+// negative into 13 bits wraps it to the top of the range and the unpack reads it
+// as a large positive, which is a legal-looking coordinate: terrain drawn on the
+// wrong side of the camera with no error anywhere.
+//
+// 4096 centres the 13-bit field on zero, giving -4096..+4095. Every ring reaches
+// at most 1,280 voxels OF ITS OWN LEVEL from the camera, so the margin is 3.2x
+// at every level rather than at just one.
+//
+// Rings off keeps the unbiased frame-relative form, unchanged, so the control
+// arm's packed image is bit-identical to every leg before the cascade existed.
+#if VOXEL_MARCH_RINGS
+#define VOXEL_MARCH_PACK_BIAS 4096
+#else
+#define VOXEL_MARCH_PACK_BIAS 0
+#endif
+
+uint2 VoxelMarchPackVis(FVoxelMarchHit H, int3 LocalVoxel)
+{
+	LocalVoxel += VOXEL_MARCH_PACK_BIAS;
+	uint2 P;
+	P.x = (uint(LocalVoxel.x) & 0x3FFu) |
+	      ((uint(LocalVoxel.y) & 0x3FFu) << 10u) |
+	      ((uint(LocalVoxel.z) & 0x3FFu) << 20u) |
+	      ((uint(max(H.FaceAxis, 0)) & 0x3u) << 30u);
+	P.y = (H.bHit ? 1u : 0u) |
+	      ((H.FaceSign > 0) ? 2u : 0u) |
+	      ((uint(H.Level) & 0x7u) << 2u) |
+	      ((H.Material & 0xFFu) << 5u) |
+	      ((H.FaceNeighbourMask & 0xFFu) << 13u) |
+	      (((uint(LocalVoxel.x) >> 10u) & 0x7u) << 21u) |
+	      (((uint(LocalVoxel.y) >> 10u) & 0x7u) << 24u) |
+	      (((uint(LocalVoxel.z) >> 10u) & 0x7u) << 27u);
+	return P;
+}
+
+struct FVoxelMarchVis
+{
+	bool  bHit;
+	int3  LocalVoxel;
+	int   FaceAxis;
+	int   FaceSign;
+	int   Level;
+	uint  Material;
+	uint  FaceNeighbourMask;
+};
+
+FVoxelMarchVis VoxelMarchUnpackVis(uint2 P)
+{
+	FVoxelMarchVis V;
+	V.LocalVoxel = int3(int((P.x & 0x3FFu)         | (((P.y >> 21u) & 0x7u) << 10u)),
+	                    int(((P.x >> 10u) & 0x3FFu) | (((P.y >> 24u) & 0x7u) << 10u)),
+	                    int(((P.x >> 20u) & 0x3FFu) | (((P.y >> 27u) & 0x7u) << 10u)))
+	               - VOXEL_MARCH_PACK_BIAS;
+	V.FaceAxis = int((P.x >> 30u) & 0x3u);
+	V.bHit = (P.y & 1u) != 0u;
+	V.FaceSign = ((P.y & 2u) != 0u) ? 1 : -1;
+	V.Level = int((P.y >> 2u) & 0x7u);
+	V.Material = (P.y >> 5u) & 0xFFu;
+	V.FaceNeighbourMask = (P.y >> 13u) & 0xFFu;
+	return V;
+}
+
+// ---------------------------------------------------------------------------
+// The ray
+// ---------------------------------------------------------------------------
+//
+// Lifted from VoxelMarchSpike.usf so that the P3 renderer and the P0 gate build
+// the SAME ray for the same pixel -- otherwise the 5.9 us/step cost model, which
+// was measured on that ray, does not describe this one.
+struct FVoxelMarchRay
+{
+	float3 OriginLocalUU;
+	float3 DirWorld;
+	float  ViewZPerUU;   // multiply a distance along the ray to get view-space Z
+	float  TEnterUU;
+	float  TExitUU;
+	bool   bValid;       // the ray met the volume at all
+};
+
+FVoxelMarchRay VoxelMarchBuildRay(float2 SvPositionXY)
+{
+	FVoxelMarchRay R = (FVoxelMarchRay)0;
+
+	const float2 LocalPixel = SvPositionXY - MarchViewRectMin;
+	float2 Ndc = (LocalPixel / MarchViewRectSize) * 2.0f - 1.0f;
+	Ndc.y = -Ndc.y; // clip y is up, pixel y is down
+
+	// UE view space: X right, Y up, Z forward. z = 1 makes t along this
+	// UNNORMALISED direction equal to view-space Z.
+	const float3 DirView = float3(Ndc * MarchInvProjDiag, 1.0f);
+	R.ViewZPerUU = rsqrt(dot(DirView, DirView));
+	R.DirWorld = normalize(mul(float4(DirView, 0.0f), MarchViewToTranslatedWorld).xyz);
+	R.OriginLocalUU = MarchRayOriginLocalUU;
+
+	const float3 SafeDir =
+		R.DirWorld + float3(abs(R.DirWorld) < VOXEL_MARCH_MIN_DIR_COMPONENT) *
+		                 VOXEL_MARCH_MIN_DIR_COMPONENT;
+	const float3 InvDir = 1.0f / SafeDir;
+#if VOXEL_MARCH_RINGS
+	// THE BOX IS CENTRED ON THE FRAME ORIGIN UNDER RINGS, AND FLOAT PRECISION
+	// IS WHY.
+	//
+	// Cornered at the origin, the camera sits one full reach from local zero. At
+	// 4 km that is 409,600 UU, where a float32 ulp is 409,600 * 2^-23 = 0.049 UU
+	// -- FIVE TIMES THE ADVANCE NUDGE (0.01 UU) and equal to the box inset. The
+	// nudge would round away entirely and the walk would either stall on a plane
+	// or step past a cell, which doctrine 1-8 all describe and none of which
+	// reports an error.
+	//
+	// Rescaling does not save it: ring 0 is walked at level 0, so its positions
+	// are NOT divided, and they are the ones sitting at 409,600.
+	//
+	// Centred, the frame origin is the camera (snapped), so |origin| is at most
+	// the snap slack and positions reach +/- the ring's own outer radius. In
+	// WALK units that is the same 12,800 for every ring -- the cascade property
+	// once more -- where the ulp is 0.0015 UU against a 0.01 UU nudge.
+	//
+	// NOTE THE RESCALE ITSELF IS EXACT. Dividing by 2^L touches only the
+	// exponent, so level 5 loses nothing; the precision risk was never in the
+	// rescale and was never at the coarse end. It was at LEVEL 0, from how far
+	// the frame origin sat from the camera.
+	const float Half = MarchVolumeExtentUU * 0.5f;
+	const float3 T0 = (-Half - R.OriginLocalUU) * InvDir;
+	const float3 T1 = ( Half - R.OriginLocalUU) * InvDir;
+#else
+	const float3 T0 = (0.0f - R.OriginLocalUU) * InvDir;
+	const float3 T1 = (MarchVolumeExtentUU - R.OriginLocalUU) * InvDir;
+#endif
+	const float3 TLo = min(T0, T1);
+	const float3 THi = max(T0, T1);
+	R.TEnterUU = max(max(TLo.x, TLo.y), max(TLo.z, 0.0f));
+	R.TExitUU = min(min(THi.x, THi.y), THi.z);
+	R.bValid = R.TExitUU > R.TEnterUU;
+	return R;
+}
+
+// Common.ush's ConvertFromDeviceZ, restated because this pass passes the
+// transform explicitly rather than relying on the view's copy -- the march
+// kernel binds no view uniform buffer at all (only the emit does), which is
+// what keeps the march kernel offline-compilable against a stub.
+float VoxelMarchSceneViewZ(float DeviceZ)
+{
+	return DeviceZ * MarchInvDeviceZToWorldZ[0] + MarchInvDeviceZToWorldZ[1] +
+	       1.0f / (DeviceZ * MarchInvDeviceZToWorldZ[2] - MarchInvDeviceZToWorldZ[3]);
+}
+
+// ===========================================================================
+// 1. THE MARCH
+// ===========================================================================
+//
+// One thread per pixel, one group per 8x8 tile, and the group IS the tile so
+// that the "did anything in this tile hit" reduction is one groupshared OR and
+// one atomic per tile rather than one atomic per hit pixel.
+
+groupshared uint GVoxelMarchGroupHit;
+
+[numthreads(VOXEL_MARCH_TILE_SIZE, VOXEL_MARCH_TILE_SIZE, 1)]
+void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
+                    uint3 GroupId : SV_GroupID,
+                    uint GroupIndex : SV_GroupIndex)
+{
+	if (GroupIndex == 0)
+	{
+		GVoxelMarchGroupHit = 0u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const int2 LocalPixel = int2(DispatchThreadId.xy);
+	const bool bInView = all(LocalPixel < int2(MarchViewRectSize));
+
+	uint2 Packed = uint2(0u, 0u);
+	float HitT = 0.0f;
+	bool bHit = false;
+
+	if (bInView)
+	{
+		// The SV_Position the rasteriser would hand a pixel shader for this
+		// pixel: rect origin + integer pixel + the half-pixel centre. The emit's
+		// pixel shader reconstructs the ray from its own SV_Position, so the two
+		// halves of this renderer trace the same ray and not merely a similar
+		// one -- the same discipline VoxelMarchSpike.usf's census applies.
+		const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
+		const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
+
+		if (Ray.bValid)
+		{
+			float TMax = Ray.TExitUU;
+
+			// t_max FROM THE PREPASS DEPTH, and this is not a micro-optimisation.
+			// A ray whose pixel already holds a character, a tree or a rock stops
+			// at that surface instead of walking the rest of the volume. It is
+			// the single reason the march can afford to run before the base pass:
+			// the prepass has already done the occlusion work and this reads it.
+			//
+			// GUARDED ON bDepthBufferIsPopulated (ShouldRenderPrePass()). With
+			// Nanite on it is always true; with Nanite off the prepass may be
+			// partial or absent, and a t_max read from an unpopulated depth
+			// buffer would clip every ray to the near plane and the terrain would
+			// simply not be there.
+			if (MarchHasPrepassDepth != 0)
+			{
+				const float DeviceZ =
+					MarchSceneDepthTexture.Load(int3(int2(SvPositionXY), 0)).r;
+				const float SceneViewZ = VoxelMarchSceneViewZ(DeviceZ);
+				// view Z -> distance along the ray. ViewZPerUU converts the other
+				// way, so divide.
+				const float SceneTUU = SceneViewZ / max(Ray.ViewZPerUU, 1e-6f);
+				TMax = min(TMax, SceneTUU);
+			}
+
+			if (TMax > Ray.TEnterUU)
+			{
+				const float Inset = VOXEL_MARCH_BOX_INSET_UU;
+				const float TIn = Ray.TEnterUU + Inset;
+				const float TOut = max(TMax - Inset, TIn);
+
+				const FVoxelMarchHit H = VoxelMarchTraverseWithCover(
+					Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, MarchPixelConeSlope);
+				if (H.bHit)
+				{
+					bHit = true;
+					HitT = H.THitUU;
+					// AT THE HIT'S OWN LEVEL, read from the hit, NOT from the
+					// walk's leftover level context.
+					//
+					// VoxelMarchSourceOriginVoxel() reads GVoxelMarchIndexLevel,
+					// which happened to be right only because the ring loop
+					// returns the instant it hits. The cover overlay runs a
+					// SECOND walk after the terrain one and then chooses, so the
+					// leftover context and the chosen hit can disagree -- and the
+					// symptom is terrain packed against the cover origin, i.e.
+					// terrain drawn in the wrong place with no error anywhere.
+					//
+					// The emit already unpacks with ...AtLevel(V.Level), so this
+					// makes the two halves the same authority. It is
+					// behaviour-identical on every arm that exists today: with
+					// cover off, the leftover context IS H.Level.
+					Packed = VoxelMarchPackVis(
+						H, H.Voxel - VoxelMarchSourceOriginVoxelAtLevel(H.Level));
+				}
+			}
+		}
+
+		// Written on EVERY in-view pixel, hit or miss. An unwritten VisBuffer
+		// texel holds whatever was in the allocation, and the emit's tile quads
+		// cover whole 8x8 blocks -- so a miss inside a hit tile would read
+		// garbage, decode as a hit, and stamp a voxel-coloured square into the
+		// GBuffer at a random depth. The clear is the write.
+		MarchOutVis[LocalPixel] = Packed;
+		MarchOutHitT[LocalPixel] = HitT;
+	}
+
+	if (bHit)
+	{
+		InterlockedOr(GVoxelMarchGroupHit, 1u);
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (GroupIndex == 0 && GVoxelMarchGroupHit != 0u)
+	{
+		const uint TileIndex = GroupId.y * uint(MarchTileCount.x) + GroupId.x;
+		MarchOutTileHit[TileIndex] = 1u;
+	}
+}
+
+// ===========================================================================
+// 2. TILE COMPACTION -> DrawIndirect
+// ===========================================================================
+//
+// THE POINT OF THIS PASS IS THE HTILE BILL. SV_Depth turns off early-Z and
+// invalidates the depth metadata for every tile the emit rasterises, and
+// everything downstream that reads depth then pays decompression on those
+// tiles. Rasterising the whole screen would put every tile on that bill,
+// including the sky. Rasterising only tiles that ACTUALLY HIT confines it to
+// the terrain's own screen coverage -- which at a normal pose is a fraction of
+// the frame, and at a sky-facing pose is nearly none of it.
+//
+// Order does not matter, so a bare InterlockedAdd for the slot is enough; there
+// is no scan and no determinism requirement (nothing downstream reads the list
+// in order, and the emit's output is per-pixel).
+
+[numthreads(VOXEL_MARCH_COMPACT_GROUP, 1, 1)]
+void VoxelMarchCompactTilesMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index == 0u)
+	{
+		// FRHIDrawIndirectParameters: {VertexCountPerInstance, InstanceCount,
+		// StartVertexLocation, StartInstanceLocation}. Six vertices is one quad
+		// as two triangles; InstanceCount is what the atomic below builds. The
+		// buffer was cleared to zero before this pass, so [2] and [3] are already
+		// right -- written anyway, because a reader of this kernel should not
+		// have to go and check that.
+		MarchOutDrawArgs[0] = 6u;
+		MarchOutDrawArgs[2] = 0u;
+		MarchOutDrawArgs[3] = 0u;
+	}
+	if (Index >= MarchTileTotal)
+	{
+		return;
+	}
+	if (MarchTileHit[Index] == 0u)
+	{
+		return;
+	}
+	uint Slot = 0u;
+	InterlockedAdd(MarchOutDrawArgs[1], 1u, Slot);
+	MarchOutTileList[Slot] = Index;
+}
+
+// ===========================================================================
+// 3. THE EMIT
+// ===========================================================================
+
+struct FVoxelMarchEmitInterp
+{
+	float4 Position : SV_Position;
+};
+
+// One instance is one classified tile; six vertices make its screen quad. No
+// vertex buffer, no vertex factory, no index buffer -- SV_VertexID and
+// SV_InstanceID are the entire input.
+//
+// The quad is emitted at clip z = 0.5 and w = 1. Under reverse-Z that is a
+// mid-range depth, and it is IRRELEVANT: the pixel shader writes SV_Depth, so
+// the interpolated value is never the one tested. It is stated here because a
+// reader will otherwise assume it is load-bearing and try to make it correct.
+void VoxelMarchEmitVS(uint VertexId : SV_VertexID, uint InstanceId : SV_InstanceID,
+                      out FVoxelMarchEmitInterp Out)
+{
+	const uint TileIndex = MarchTileList[InstanceId];
+	const uint2 Tile = uint2(TileIndex % uint(MarchTileCount.x),
+	                         TileIndex / uint(MarchTileCount.x));
+
+	// Corner order: two triangles (0,1,2) (2,1,3) over the unit square.
+	const uint2 Corners[6] = {
+		uint2(0u, 0u), uint2(1u, 0u), uint2(0u, 1u),
+		uint2(0u, 1u), uint2(1u, 0u), uint2(1u, 1u),
+	};
+	const uint2 Corner = Corners[VertexId];
+
+	// View-LOCAL pixel coordinates. The host has already set the viewport to the
+	// view rect, so NDC maps onto the rect and the rect's origin does not enter
+	// here -- adding it would double-count on a split-screen family.
+	const float2 PixelLocal = float2((Tile + Corner) * uint(VOXEL_MARCH_TILE_SIZE));
+	float2 Ndc = (PixelLocal / MarchViewRectSize) * 2.0f - 1.0f;
+	Ndc.y = -Ndc.y;
+
+	Out.Position = float4(Ndc, 0.5f, 1.0f);
+}
+
+// The DBuffer apply, written and correct and not currently reachable. See THE
+// DBUFFER HOLE at the top. When a binding exists, declare the three textures
+// and their sampler, delete the guard in FVoxelMarchEmitPS::ShouldCompilePermutation,
+// and stop forcing Arm.bDBuffer false in VoxelMarchGetArm.
+#if VOXEL_MARCH_DBUFFER
+void VoxelMarchApplyDBuffer(float2 BufferUV, inout float3 BaseColor, inout float3 WorldNormal,
+                            inout float Roughness, inout float Metallic, inout float Specular)
+{
+	// GetDBufferTargetMask(PixelPos) & the three response bits, then
+	// GetDBufferData(BufferUV, Mask), then the three-clause blend below --
+	// which is ApplyDBufferData (DBufferDecalShared.ush:507-527) with the
+	// MATERIALDECALRESPONSEMASK #ifs resolved to "terrain responds to all
+	// three", because a marched voxel is not a material graph and has no
+	// per-material decal response to consult.
+	//
+	//   BaseColor  = BaseColor  * D.ColorOpacity     + D.PreMulColor;
+	//   WorldNormal= normalize(WorldNormal * D.NormalOpacity + D.PreMulWorldNormal);
+	//   Roughness  = Roughness  * D.RoughnessOpacity + D.PreMulRoughness;
+	//   Metallic   = Metallic   * D.RoughnessOpacity + D.PreMulMetallic;
+	//   Specular   = Specular   * D.RoughnessOpacity + D.PreMulSpecular;
+	#error "VOXEL_MARCH_DBUFFER has no texture binding at this seam -- see THE DBUFFER HOLE."
+}
+#endif
+
+// ===========================================================================
+// 3a. THE DEPTH PRE-EMIT, AND WHY IT IS A SEPARATE PASS
+// ===========================================================================
+//
+// SceneDepth is NOT WRITABLE FROM PostRenderBasePassDeferred in this renderer.
+// With a full prepass the base pass runs DepthRead_StencilWrite
+// (DeferredShadingRenderer.cpp:2110-2113), and a raster pass added at that hook
+// lands its COLOUR and silently drops its DEPTH. Measured, not assumed: with
+// the emit forced to OutDepth = 0.9 -- one step off the near plane, which
+// nothing can legitimately paint over -- the frame was still covered by the
+// sky. Colour landed; depth did not.
+//
+// The consequence was the whole "the marcher renders nothing" investigation:
+// SceneDepth kept reading far-plane where the terrain was, so the sky and
+// aerial-perspective pass treated the terrain as sky and painted over a
+// perfectly good GBuffer.
+//
+// So depth is written HERE, from the PreRenderBasePass hook, which is where the
+// engine itself writes custom depth -- Nanite::EmitDepthTargets does exactly
+// this, for exactly this reason. The base pass then depth-tests against the
+// terrain (which is correct and wanted), and the GBuffer emit that follows
+// writes colour into pixels whose depth already says "terrain here".
+//
+// It shares VoxelMarchEmitVS: the same tile quads over the same hit list.
+void VoxelMarchDepthOnlyPS(FVoxelMarchEmitInterp In, out float OutDepth : SV_Depth)
+{
+	ResolvedView = ResolveView();
+
+	const int2 LocalPixel = int2(In.Position.xy) - int2(MarchViewRectMin);
+	const FVoxelMarchVis V = VoxelMarchUnpackVis(MarchVis.Load(int3(LocalPixel, 0)));
+	if (!V.bHit)
+	{
+		// The tile quad covers 8x8; the march hit only some of them. The rest
+		// must leave depth exactly as the prepass left it.
+		discard;
+		OutDepth = 0.0f;
+		return;
+	}
+
+	// THE SAME ARITHMETIC AS THE EMIT, DELIBERATELY. Both rebuild the ray from
+	// their own SV_Position and both project through ResolvedView, so the depth
+	// this pass writes and the depth the emit computes are the same number and
+	// the emit's equal-depth test cannot fail on rounding.
+	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+	const float3 HitLocalUU = Ray.OriginLocalUU + Ray.DirWorld * THitUU;
+	const float3 VolumeOriginTWS =
+		ResolvedView.TranslatedWorldCameraOrigin - MarchRayOriginLocalUU;
+	const float4 HitClip =
+		mul(float4(VolumeOriginTWS + HitLocalUU, 1.0f), ResolvedView.TranslatedWorldToClip);
+	OutDepth = HitClip.z / HitClip.w;
+}
+
+void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
+                      out float4 OutSceneColor : SV_Target0,
+                      out float4 OutGBufferA : SV_Target1,
+                      out float4 OutGBufferB : SV_Target2,
+                      out float4 OutGBufferC : SV_Target3,
+                      out float4 OutGBufferD : SV_Target4,
+#if ALLOW_STATIC_LIGHTING
+                      out float4 OutGBufferE : SV_Target5,
+#if VOXEL_MARCH_VELOCITY
+                      out float4 OutVelocity : SV_Target6,
+#endif
+#elif VOXEL_MARCH_VELOCITY
+                      // GBufferE does not exist when static lighting is off, so
+                      // velocity moves up a slot. The HOST TESTS THE SAME
+                      // PREDICATE (IsStaticLightingAllowed) when it builds the
+                      // binding slots -- a gap in the slot array would make RDG
+                      // stop enumerating at the hole and silently drop velocity,
+                      // which is why this is a compile-time agreement and not a
+                      // runtime one.
+                      out float4 OutVelocity : SV_Target5,
+#endif
+                      // PLAIN SV_Depth, NOT SV_DepthLessEqual. Conservative
+                      // depth would keep early-Z alive, but it is a PROMISE:
+                      // under reverse-Z, SV_DepthLessEqual promises the shader
+                      // will only ever push the surface FURTHER than the
+                      // rasterised quad's depth. The quad is emitted at a fixed
+                      // clip z that has nothing to do with the terrain, so the
+                      // promise would be false roughly half the time and the
+                      // hardware would cull real surface. The early-Z loss is
+                      // the cost item (c) budgets and the indirect hit-tile
+                      // dispatch confines.
+                      out float OutDepth : SV_Depth)
+{
+	// RESOLVE THE VIEW FIRST, AND THIS LINE IS THE WHOLE REASON MODE 1 DREW
+	// NOTHING FOR THE ENTIRE LIFE OF THIS FEATURE.
+	//
+	// ResolvedView is NOT an alias for View. InstancedStereo.ush:52 declares it
+	// `static ViewState ResolvedView = (ViewState)0.0f;` -- a ZERO-INITIALISED
+	// static that stays zero until something assigns it. The engine's own shaders
+	// get it from StereoSetupVS/StereoSetupPS; a custom pass that never calls
+	// ResolveView() reads an all-zero view and the compiler is entitled to think
+	// that is fine.
+	//
+	// So TranslatedWorldToClip was the ZERO MATRIX, HitClip came out (0,0,0,0),
+	// and OutDepth was 0/0 = NaN. A NaN loses EVERY depth comparison, and a
+	// pixel that fails the depth test writes NEITHER depth NOR colour -- so the
+	// emit rasterised the whole screen, discarded all of it in the ROP, and left
+	// the frame exactly as the base pass had it. That is why the failure looked
+	// like sky rather than like black, why every counter in this module was
+	// healthy (tiles, emitFrames, declines all describe work BEFORE the ROP), and
+	// why mode 2 and the depth gate always passed -- they read the VisBuffer
+	// directly and never went through this shader at all.
+	//
+	// MEASURED, at the pose this was found on: the march hits 98.8% of pixels
+	// (hitOnSky=1,338,893 of 1,354,896) in the same configuration where mode 1
+	// renders an empty frame. The traversal was never the problem.
+	ResolvedView = ResolveView();
+
+	const int2 LocalPixel = int2(In.Position.xy) - int2(MarchViewRectMin);
+	const uint2 Packed = MarchVis.Load(int3(LocalPixel, 0));
+	const FVoxelMarchVis V = VoxelMarchUnpackVis(Packed);
+
+	if (!V.bHit)
+	{
+		// The tile quad covers 8x8 pixels; the march hit some of them. The rest
+		// leave without touching depth, stencil, any GBuffer or velocity.
+		//
+		// A discard here is safe in a way it explicitly was NOT in
+		// VoxelMarchSpike.usf: that shader had to keep the loop alive against
+		// DXC's dead-code elimination because the loop WAS the measurement. Here
+		// the loop already ran, in a different pass, and this shader only reads
+		// its result.
+		discard;
+		OutSceneColor = 0; OutGBufferA = 0; OutGBufferB = 0; OutGBufferC = 0; OutGBufferD = 0;
+#if ALLOW_STATIC_LIGHTING
+		OutGBufferE = 0;
+#endif
+#if VOXEL_MARCH_VELOCITY
+		OutVelocity = 0;
+#endif
+		OutDepth = 0;
+		return;
+	}
+
+	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
+
+	// ---- rebuild the hit, from the float t --------------------------------
+	//
+	// NOT from the encoded depth, and not from a stored position. The ray is
+	// rebuilt from this pixel's SV_Position by the same function the march used,
+	// and the hit is the ray's own parameter t along it. That is the plan's
+	// section 5 item 2 rule, and the reason for it is that everything below --
+	// depth AND the previous-frame position -- descends from this one number, so
+	// any quantisation applied to it is applied to both and they stay consistent
+	// with each other even when they are wrong.
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(In.Position.xy);
+	const float3 HitLocalUU = Ray.OriginLocalUU + Ray.DirWorld * THitUU;
+
+	// The volume's min corner in translated world. Derived rather than passed:
+	// TranslatedWorldCameraOrigin is the camera in translated world and
+	// MarchRayOriginLocalUU is the camera relative to the volume, so their
+	// difference is the volume relative to the camera, exactly. Passing it as a
+	// uniform would mean assuming PreViewTranslation == -ViewOrigin, which is
+	// true for the primary view and not a thing to rely on.
+	const float3 VolumeOriginTWS =
+		ResolvedView.TranslatedWorldCameraOrigin - MarchRayOriginLocalUU;
+	const float3 HitTWS = VolumeOriginTWS + HitLocalUU;
+
+	// ---- depth ------------------------------------------------------------
+	//
+	// Projected through the frame's own TranslatedWorldToClip rather than
+	// inverted out of InvDeviceZToWorldZTransform, so it carries the same TAA
+	// jitter every other primitive carries. A terrain depth that disagrees with
+	// the prepass by the jitter offset does not look like a depth bug; it looks
+	// like a silhouette that wobbles half a pixel, which is much harder to
+	// attribute.
+	const float4 HitClip = mul(float4(HitTWS, 1.0f), ResolvedView.TranslatedWorldToClip);
+	OutDepth = HitClip.z / HitClip.w;
+
+	// ---- the surface ------------------------------------------------------
+	// THE ORIGIN MUST BE TAKEN AT THE HIT'S OWN LEVEL. V.LocalVoxel is in
+	// LEVEL-V.Level voxels (the ring loop rescaled the ray before the walk), so
+	// adding the level-0 frame origin back would place a ring-1 hit at twice its
+	// distance from the origin -- terrain in the wrong place, no error anywhere.
+	// The frame origin is snapped to 1024 level-0 voxels precisely so this shift
+	// is exact at every level.
+	//
+	// The pixel shader does not traverse, so the traversal's level context is
+	// not set here and cannot be relied on; the level travels in the vis packet
+	// instead, which is the only thing that survives the two passes.
+	const int3 WorldVoxel = V.LocalVoxel + VoxelMarchSourceOriginVoxelAtLevel(V.Level);
+
+	// THE NORMAL: the exact geometric axis of the face the DDA crossed. Three
+	// selects and a negate. The entire reason ADR-0008 could ban interpolants.
+	const float S = -float(V.FaceSign);
+	float3 WorldNormal = float3(V.FaceAxis == 0 ? S : 0.0f,
+	                            V.FaceAxis == 1 ? S : 0.0f,
+	                            V.FaceAxis == 2 ? S : 0.0f);
+
+	// STARTED-INSIDE HITS HAVE NO FACE, AND UNTIL 2026-08-21 THEY WROTE A ZERO
+	// NORMAL INTO GBufferA.
+	//
+	// VoxelBrickTraverse.ush initialises FaceAxis to -1 and returns bHit=true
+	// WITHOUT SETTING IT when the segment's first voxel is already solid
+	// (:1732, bStartedInside). The three selects above then all miss and
+	// WorldNormal is float3(0,0,0). A zero normal in a deferred GBuffer is not a
+	// wrong direction, it is NO direction: it has no diffuse response, so the
+	// pixel shades as a flat featureless field while depth, material and every
+	// counter say the pixel was drawn correctly. That is exactly what it looked
+	// like -- terrain reported at 99% of tiles with no voxel shape visible in it,
+	// and a depth gate that passed because THE DEPTH WAS NEVER WRONG.
+	//
+	// This is doctrine 9b again, one layer further out: the traversal's own
+	// warning says "EVERY consumer must gate on bHit", and the same applies to
+	// FaceAxis. Three consumers missed it there; this one missed it here.
+	//
+	// WHAT TO SUBSTITUTE. There is no correct geometric face -- the ray never
+	// crossed one -- so anything here is a convention, and the honest convention
+	// is the one that cannot be mistaken for a measurement: face the viewer.
+	// -DirWorld is unit length (VoxelMarchBuildRay normalises it), gives a
+	// defined diffuse response, and degrades to plain shading rather than to
+	// black. It is NOT the surface's true orientation and must not be read as
+	// one; a started-inside pixel has no true orientation to report.
+	if (V.FaceAxis < 0)
+	{
+		WorldNormal = -Ray.DirWorld;
+	}
+
+	// vxc::FaceClass, mirroring VoxelPaletteFaceClass: only a Z face can be a
+	// top or a bottom, and the outward normal points +z (a top) when the ray
+	// entered moving in -z.
+	const uint FaceClass = (V.FaceAxis != 2) ? VOXEL_FACE_SIDE
+	                                         : ((V.FaceSign < 0) ? VOXEL_FACE_TOP
+	                                                             : VOXEL_FACE_BOTTOM);
+
+	float3 BaseColor = VoxelMaterialColor(V.Material, FaceClass, WorldVoxel);
+
+	// ---- WAVE 2: THE SURFACE-PROXIMITY GATE ---------------------------------
+	//
+	// THIS IS THE TERM THE MARCHER WAS ACTUALLY MISSING, and it is worth being
+	// precise about why, because the obvious answer is wrong.
+	//
+	// The obvious answer is "the marcher has no biome tint". But the quad path's
+	// tint is BiomeTintForFace, which ignores the material id entirely and
+	// returns 255 for a sky-facing Z face, 0 for a ceiling and 140 for a side --
+	// a purely geometric top/side/bottom distinction. The marcher already has
+	// that: VoxelPaletteFace is indexed [material * 3 + faceClass], and MAT_GRASS
+	// already carries green on top and brown underneath. Applying the tint here
+	// as well would apply the same distinction TWICE, against ADR-0008's
+	// invariant 4 ("face class is for MATERIAL difference, not for shading").
+	//
+	// What the quad path has that the marcher does not is the GATE:
+	//     TerrainTintR = bNearSurface ? FaceTint : 0
+	// (VoxelQuadVertexFactory.ush:373). Without it a +Z face two hundred metres
+	// down a cave is tinted as turf. The face term without the gate is not a
+	// partial win -- it is the wrong answer underground, which is why this lands
+	// before any climate work.
+	//
+	// LocalXY is measured from the chunk's own origin because that is the frame
+	// the plane was fitted in (SampleChunkParamsForPool builds the base at the
+	// chunk's XY ORIGIN, not its centre).
+	//
+	// BRICK-POOL SOURCE ONLY, and that is not a limitation to work around. The
+	// chunk record is the brick pool's structure; VOXEL_MARCH_SOURCE 0 traverses
+	// the fluid occupancy volume, which has no records, no per-chunk climate and
+	// no fitted plane to gate against. VoxelMarchBeginLevel and
+	// VoxelMarchLookupChunk are themselves inside this guard
+	// (VoxelBrickTraverse.ush:1121-1887), so an unguarded call does not read
+	// garbage -- it fails to compile, which is how this was caught.
+	float SurfaceBandFade = 1.0f;
+#if VOXEL_MARCH_HAS_BRICKPOOL
+	{
+		// WorldVoxel, NOT V.LocalVoxel. THE MUTATION ARM CAUGHT THIS.
+		//
+		// V.LocalVoxel is relative to the march's frame origin; the chunk index
+		// and the records are keyed on ABSOLUTE chunk coordinates -- which is
+		// why the line above this block computes WorldVoxel at all, and says so:
+		// "adding the level-0 frame origin back". Using the local coordinate
+		// made every lookup miss, bValid was false on every pixel, and the gate
+		// silently never fired.
+		//
+		// It read as a PASS: the capture was 0.00% different from the ungated
+		// build, which is the correct answer at a pose with no sub-surface +Z
+		// faces in view. Only inverting the comparison -- which must repaint all
+		// open ground -- showed that 0.00% again, and an inverted gate that
+		// changes nothing is not a subtle result.
+		const int3 ChunkCoordOfHit = WorldVoxel >> 5;
+		VoxelMarchBeginLevel(V.Level);
+		const FVoxelMarchChunkCache HitChunk = VoxelMarchLookupChunk(ChunkCoordOfHit);
+		if (HitChunk.bValid)
+		{
+			const float VoxelUU = VoxelMarchVoxelSizeUU(V.Level);
+			const float3 LocalInChunkUU = float3(WorldVoxel - (ChunkCoordOfHit * 32)) * VoxelUU;
+			const float SurfaceZHereRelUU =
+				VoxelMarchSurfaceZRelAt(HitChunk, LocalInChunkUU.xy);
+			// kSurfaceBandUU = 200 UU, the quad path's own constant.
+			const bool bNearSurface = LocalInChunkUU.z > (SurfaceZHereRelUU - 200.0f);
+			// kNoSurfaceGate: a chunk with no fitted plane is ALWAYS surface, so
+			// the gate can never darken terrain it has no information about.
+			SurfaceBandFade = (HitChunk.SurfaceZRelUU < -1.0e29f || bNearSurface) ? 1.0f : 0.0f;
+		}
+	}
+#endif // VOXEL_MARCH_HAS_BRICKPOOL
+
+	// THE TINT FADE. VoxelMaterialColor gives every voxel its own lightness and
+	// hue jitter (invariant 3), which reads as material texture at one voxel per
+	// pixel and as white noise at a third of a pixel per voxel -- and TSR's
+	// 32-sample history turns white noise into a boiling far field. So the
+	// jitter is faded back toward the flat palette colour as the voxel shrinks
+	// into the pixel cone. This is the LOD half of the cone rule; the level
+	// selection is the other half and lives in the traversal.
+	{
+		const float VoxelSizeUU = VoxelMarchVoxelSizeUU(V.Level);
+		const float Fade = VoxelMarchTintFade(VoxelSizeUU, THitUU, MarchPixelConeSlope);
+		const float3 Flat = VoxelPaletteFace[min(V.Material, VOXEL_MATERIAL_COUNT - 1u) * 3u +
+		                                     min(FaceClass, 2u)];
+		BaseColor = lerp(Flat, BaseColor, Fade);
+	}
+
+	// APPLY THE GATE, AND APPLY IT TO THE FACE-CLASS CHOICE RATHER THAN TO THE
+	// COLOUR.
+	//
+	// ADR-0008 invariant 4 says face class is for MATERIAL difference, not for
+	// shading, and the palette already honours that: [material*3 + TOP] is the
+	// sky-facing appearance and [material*3 + SIDE] is the exposed one. Below
+	// the surface band, a Z face is not sky-facing in any meaningful sense --
+	// it is a cave roof or a cave floor -- so the honest correction is to stop
+	// selecting the TOP entry, NOT to darken the pixel.
+	//
+	// Written as a lerp toward the SIDE entry rather than a branch so it costs
+	// no divergence, and gated on FaceClass == TOP so a genuine ceiling
+	// (BOTTOM) keeps its own palette entry.
+	if (SurfaceBandFade < 1.0f && FaceClass == VOXEL_FACE_TOP)
+	{
+		const uint MatIdx = min(V.Material, VOXEL_MATERIAL_COUNT - 1u) * 3u;
+		const float3 SideColour = VoxelPaletteFace[MatIdx + VOXEL_FACE_SIDE];
+		// The per-voxel jitter is a multiplicative property of the voxel, not of
+		// the face, so it is preserved by taking the ratio the palette lookup
+		// would have applied. Guarded against a zero palette entry (MAT_AIR).
+		const float3 TopColour = VoxelPaletteFace[MatIdx + VOXEL_FACE_TOP];
+		const float3 Jitter = (TopColour.g > 1e-5f) ? (BaseColor / max(TopColour, 1e-5f))
+		                                            : float3(1.0f, 1.0f, 1.0f);
+		BaseColor = lerp(SideColour * Jitter, BaseColor, SurfaceBandFade);
+	}
+
+	float Roughness = VOXEL_MARCH_ROUGHNESS;
+	float Metallic = VOXEL_MARCH_METALLIC;
+	float Specular = VOXEL_MARCH_SPECULAR;
+
+#if VOXEL_MARCH_AO
+	// AO INTO BASE COLOUR, because that is where the shipped raster path puts
+	// it (VoxelQuadVertexFactory.ush:879) and an A/B against a renderer that
+	// occludes somewhere else is not an A/B. The corner rule and the eight
+	// neighbours are byte-identical to vxc::detail::aoCorner; see the header.
+	//
+	// GBufferC.a is NOT available for this in a static-lighting project -- it
+	// carries EncodeIndirectIrradiance there and decodes GBufferAO as 1. That
+	// is checked, not assumed, and it is one of the brief's three corrections.
+	{
+		FVoxelMarchHit AoHit = (FVoxelMarchHit)0;
+		AoHit.FaceAxis = V.FaceAxis;
+		AoHit.HitPosLocalUU = HitLocalUU;
+		AoHit.VoxelSizeUU = VoxelMarchVoxelSizeUU(V.Level);
+		const float2 FaceUV = VoxelMarchFaceUV(AoHit);
+		const float AO = VoxelMarchCornerAO(V.FaceNeighbourMask, FaceUV);
+		BaseColor *= AO;
+	}
+#endif
+
+#if VOXEL_MARCH_DBUFFER
+	VoxelMarchApplyDBuffer(SvPositionToBufferUV(In.Position), BaseColor, WorldNormal, Roughness,
+	                       Metallic, Specular);
+#endif
+
+	// ---- the GBuffer ------------------------------------------------------
+	//
+	// Written as raw MRTs rather than through EncodeGBufferToMRT, for the
+	// reason the header gives: the generated encoder writes Out.MRT[] at the
+	// engine's data-driven slot indices, and this pass is not using the
+	// engine's slot indices. Each line below is the corresponding line of
+	// DeferredShadingCommon.ush's EncodeGBuffer (:995-1030).
+
+	OutSceneColor = float4(0.0f, 0.0f, 0.0f, 0.0f); // no emissive
+
+	// GBufferA.a = PerObjectGBufferData, 2 bits: bit0 cast contact shadow,
+	// bit1 dynamic indirect shadow caster. Zero for both -- terrain has no
+	// distance-field representation to cast an indirect shadow from, and
+	// contact shadows on ground that already self-occludes through AO would be
+	// double-counting. Stated because 0 here is a decision, not a default.
+	OutGBufferA = float4(EncodeNormal(WorldNormal), 0.0f);
+
+	// SKIP_PRECSHADOW_MASK, and it is what makes GBufferE = 1 mean what it says.
+	// The decoder reads PrecomputedShadowFactors as 1 when this bit is set,
+	// whatever GBufferE holds (DeferredShadingCommon.ush:1126-1132) -- so the
+	// bit and the 1 below are belt and braces and both are what the base pass
+	// writes for a primitive with no lightmap.
+	//
+	// THE MASK GOES IN BITS [4:7] HERE. EncodeShadingModelIdAndSelectiveOutputMask
+	// ORs it straight in (:295-299) and SKIP_PRECSHADOW_MASK is already (1<<5).
+	// The AUTOGEN encoder wants the same mask in bits [0:3] and shifts it up
+	// itself, which is why the base pass shifts DOWN by 4 before calling it
+	// (BasePassPixelShader.usf:1206-1208). Using the wrong convention here moves
+	// the shading model id, not just a flag.
+	const uint SelectiveOutputMask = SKIP_PRECSHADOW_MASK;
+	OutGBufferB = float4(Metallic, Specular, Roughness,
+	                     EncodeShadingModelIdAndSelectiveOutputMask(SHADINGMODELID_DEFAULT_LIT,
+	                                                                SelectiveOutputMask));
+
+#if ALLOW_STATIC_LIGHTING
+	// The channel is indirect irradiance, not AO. 1.0 is the neutral value --
+	// it leaves the lightmap/ILC contribution at unity rather than at zero,
+	// which is what a primitive with no static lighting writes.
+	OutGBufferC = float4(EncodeBaseColor(BaseColor), EncodeIndirectIrradiance(1.0f));
+#else
+	// Static lighting off: the channel really is GBufferAO, and the corner AO
+	// can go in it as well as into base colour. This branch is written and is
+	// not the configuration this project ships, so it is UNVERIFIED against a
+	// running frame -- said here rather than discovered later.
+	OutGBufferC = float4(EncodeBaseColor(BaseColor), 1.0f);
+#endif
+
+	OutGBufferD = float4(0.0f, 0.0f, 0.0f, 0.0f); // CustomData -- DefaultLit has none
+#if ALLOW_STATIC_LIGHTING
+	OutGBufferE = float4(1.0f, 1.0f, 1.0f, 1.0f); // PrecomputedShadowFactors: 1 = unshadowed
+#endif
+
+#if VOXEL_MARCH_VELOCITY
+	// ---- velocity, and THE TRAP -------------------------------------------
+	//
+	// Terrain is static in world space, so its previous-frame TRANSLATED-world
+	// position is its current one plus the difference between the two frames'
+	// pre-view translations:
+	//
+	//     PrevTWS = TWS - (PreViewTranslation - PrevPreViewTranslation)
+	//
+	// Using the CURRENT PreViewTranslation with PrevTranslatedWorldToClip --
+	// i.e. dropping that difference -- produces a whole-screen velocity offset
+	// on exactly the frames the streaming origin rebases, which are the frames
+	// TSR smears worst and the ones nobody is looking at the velocity buffer on.
+	//
+	// In UE 5.8 there is no plain View.PrevPreViewTranslation uniform: the
+	// buffer carries PrevPreViewTranslationHigh/Low and ResolveView() assembles
+	// the FDFVector3 (InstancedStereo.ush:38). DFFastLocalSubtractDemote is the
+	// sanctioned way to take the difference of two of them into a float3 -- the
+	// same call Lumen makes for the same purpose (LumenPosition.ush:25).
+	const float3 PreViewTranslationOffset =
+		DFFastLocalSubtractDemote(ResolvedView.PreViewTranslation,
+		                          ResolvedView.PrevPreViewTranslation);
+	const float3 PrevHitTWS = HitTWS - PreViewTranslationOffset;
+	const float4 PrevClip = mul(float4(PrevHitTWS, 1.0f), ResolvedView.PrevTranslatedWorldToClip);
+
+	// Calculate3DVelocity does the perspective divides and subtracts both
+	// frames' TAA jitter, so both operands must be PRE-divide clip positions.
+	const float3 Velocity = Calculate3DVelocity(HitClip, PrevClip);
+	OutVelocity = EncodeVelocityToTexture(Velocity);
+#endif
+}
+
+// ===========================================================================
+// 4. THE DEPTH GATE (voxel.March.VerifyDepth)
+// ===========================================================================
+//
+// Plan section 10, gate 3, implemented literally rather than approximately:
+//
+//     "the fraction of pixels with |delta linear depth| > 0.5 * voxelSize(level)
+//      must be < 0.5%, AND the failures must fall inside a dilated edge mask
+//      derived from the raster depth (both renderers are point samples of a
+//      step function at silhouettes)."
+//
+// WHY IT IS THE GATE P3 OWES. Byte-equality against the quad stream is P1's
+// instrument and it proves the VOLUME is the right world. This proves something
+// different and, for a renderer, stronger: that the marched surface lands where
+// PrePass + BasePass put it, in the frame, at this pose. Colour cannot be gated
+// yet -- the occupancy source has no per-voxel material -- but geometry can, and
+// geometry is what P4 turns on.
+//
+// ---------------------------------------------------------------------------
+// IT RUNS IN MODE 2 AND ONLY MODE 2, AND THAT IS ENFORCED, NOT DOCUMENTED
+// ---------------------------------------------------------------------------
+//
+// In mode 1 the emit has already overwritten SceneDepth with the marcher's own
+// depth, so this pass would compare the marcher against itself and report a
+// perfect result. That is the single most dangerous thing this instrument could
+// do, so the host REFUSES the pass outside mode 2 and says why -- it does not
+// quietly produce a number.
+//
+// ---------------------------------------------------------------------------
+// WHAT IS COMPARED, AND WHAT IS DELIBERATELY EXCLUDED
+// ---------------------------------------------------------------------------
+//
+// Only pixels where the MARCHER HIT. A miss is not a disagreement: the volume
+// spans 51.2 m, so every ray past ~25.6 m leaves the box and misses by
+// construction, and counting those as failures would score the volume's extent
+// rather than the marcher's accuracy. Misses are counted in their OWN column so
+// the comparison population is visible and cannot silently collapse to a
+// handful of pixels that happen to agree.
+//
+// The march already clips t_max against the real prepass depth, so it can never
+// report a hit BEHIND a tree or a character -- occluded pixels come back as
+// misses and drop out of the comparison on their own. That is why this gate
+// needs no occluder mask.
+//
+// THE EDGE MASK is a 5x5 neighbourhood of the RASTER depth -- two pixels of
+// dilation -- called an edge when the neighbourhood's linear depth spread
+// exceeds one voxel. Silhouettes are where two point samples of a step function
+// are entitled to disagree, and both renderers are point samples. The number
+// that has to be ~0 is therefore disagreements OUTSIDE the mask: an interior
+// disagreement is a real geometric difference and there is no excuse available
+// for it.
+//
+// AND THE MASK'S OWN SIZE IS REPORTED. A dilated edge mask that quietly covered
+// most of the screen would excuse everything while looking like a strict test,
+// so `edge` is printed beside `compared` and a reader can see what fraction of
+// the comparison the exemption is carrying.
+
+#define VOXEL_MARCH_VERIFY_COMPARED       0u
+#define VOXEL_MARCH_VERIFY_DISAGREE       1u
+#define VOXEL_MARCH_VERIFY_DISAGREE_EDGE  2u
+#define VOXEL_MARCH_VERIFY_DISAGREE_INNER 3u
+#define VOXEL_MARCH_VERIFY_MAX_MILLIVOX   4u
+#define VOXEL_MARCH_VERIFY_HIT_ON_SKY     5u
+#define VOXEL_MARCH_VERIFY_MISS           6u
+#define VOXEL_MARCH_VERIFY_EDGE_PIXELS    7u
+#define VOXEL_MARCH_VERIFY_BUCKET0        8u   // 8..13: <0.25 <0.5 <1 <2 <4 >=4
+// ---------------------------------------------------------------------------
+// THE INTERIOR COLUMNS, ADDED AFTER THE FIRST RUN, AND WHY
+// ---------------------------------------------------------------------------
+//
+// The first gate reported maxDelta = 594.6 voxels -- about 59 m -- and it read
+// as a catastrophic marcher bug. It is not. It is the STATISTIC that was wrong.
+//
+// At a silhouette the two renderers do not disagree about the DEPTH of one
+// surface; they disagree about WHICH SURFACE the pixel belongs to. The
+// foreground might be at 5 m and the background at 65 m, so the delta is the
+// depth RANGE OF THE SCENE, not an error magnitude. A max taken over all
+// compared pixels is therefore dominated by legitimate silhouette behaviour and
+// cannot distinguish one broken ray from normal edge sampling -- which is
+// exactly the ambiguity the first result produced.
+//
+// So max AND the buckets are now tracked a second time over INTERIOR pixels
+// only. Those are the ones with no excuse available, and their max is the
+// number that says whether the 111 interior disagreements are one-voxel ties or
+// something structural. The all-pixel columns stay, because the edge population
+// is still worth seeing -- they are just no longer the headline.
+#define VOXEL_MARCH_VERIFY_INNER_MAX      14u
+#define VOXEL_MARCH_VERIFY_INNER_BUCKET0  15u  // 15..20, same edges as above
+// ---------------------------------------------------------------------------
+// THE REFERENCE NOISE FLOOR -- THE DENOMINATOR THE VERDICT WAS MISSING
+// ---------------------------------------------------------------------------
+//
+// The first two gate runs both FAILED at ~4-5% disagreement, of which 99.8%
+// were silhouette pixels. That verdict carried no information: a 0.5% bar
+// applied to a population dominated by legitimate step-function sampling cannot
+// pass however correct the marcher is.
+//
+// This project already knows the answer to that, and paid for it in Phase 0:
+// CALIBRATE THE VERIFIER AGAINST THE REFERENCE'S OWN NOISE FLOOR, NOT AGAINST
+// ZERO. There, the unit-tested flat walk turned out to disagree with a
+// 1e-6-nudged copy of ITSELF thirteen times more often than it disagreed with
+// the skip walk under test, which converted "20 mismatches, must be a bug" into
+// "the reference is less self-consistent than the thing it is judging."
+//
+// The equivalent here: how often does THE RASTER DEPTH disagree with a
+// slightly-displaced copy of itself, on the SAME pixels, through the SAME
+// threshold and the SAME edge mask? At a silhouette, moving the sample point
+// changes WHICH SURFACE the pixel belongs to, so the reference disagrees with
+// itself constantly there -- and that rate is a property of the SCENE, not of
+// either renderer.
+//
+// The displacement is ONE PIXEL, along each axis, taking the larger. That is
+// coarser than the actual sampling difference between the two renderers (which
+// is sub-pixel: both carry the same TAA jitter and differ only in point-sample
+// versus rasterised coverage). So this is an UPPER BOUND on the noise floor,
+// with exactly the character the spike's own restart control had:
+//
+//     mismatch ABOVE the control  -> a hard result, the marcher is wrong
+//     mismatch BELOW the control  -> consistent with sampling noise, and NOT
+//                                    proof of correctness
+//
+// Stated that way rather than as a pass mark, because a control that is an
+// upper bound cannot certify -- it can only refuse to condemn.
+//
+// A bilinear half-pixel version was considered and rejected: interpolating
+// depth across a silhouette averages foreground and background into a value
+// neither renderer would ever produce, which would understate the floor and
+// flatter the marcher.
+#define VOXEL_MARCH_VERIFY_REFSELF        21u  // all compared px
+#define VOXEL_MARCH_VERIFY_REFSELF_INNER  22u  // interior px only
+#define VOXEL_MARCH_VERIFY_REFSELF_MAX    23u  // interior, milli-voxels
+#define VOXEL_MARCH_VERIFY_WORDS          24u
+
+RWBuffer<uint> MarchOutVerify;
+
+// Half-width of the edge neighbourhood, in pixels. 2 == a 5x5 window == the
+// "dilated" in the pre-registered wording. Not a tuning knob: widening it
+// excuses more, and the reported edge fraction is what makes that visible.
+#define VOXEL_MARCH_VERIFY_EDGE_RADIUS 2
+
+// A neighbourhood counts as an edge when its raster linear-depth spread exceeds
+// this many voxels. One voxel, because that is the scale at which the two
+// renderers' sampling of the same step function can legitimately differ.
+#define VOXEL_MARCH_VERIFY_EDGE_VOXELS 1.0f
+
+[numthreads(VOXEL_MARCH_TILE_SIZE, VOXEL_MARCH_TILE_SIZE, 1)]
+void VoxelMarchVerifyDepthMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int2 LocalPixel = int2(DispatchThreadId.xy);
+	if (any(LocalPixel >= int2(MarchViewRectSize)))
+	{
+		return;
+	}
+
+	const FVoxelMarchVis V = VoxelMarchUnpackVis(MarchVis.Load(int3(LocalPixel, 0)));
+	if (!V.bHit)
+	{
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_MISS], 1u);
+		return;
+	}
+
+	const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
+	const float THitUU = MarchHitT.Load(int3(LocalPixel, 0));
+
+	// The marcher's LINEAR view depth. t is distance along the ray and
+	// ViewZPerUU is the cosine to the forward axis, so their product is view Z --
+	// the same quantity ConvertFromDeviceZ returns for the raster side, which is
+	// what makes the two directly subtractable.
+	const float MarchViewZ = THitUU * Ray.ViewZPerUU;
+
+	const int2 Pixel = int2(SvPositionXY);
+	const float RasterDeviceZ = MarchSceneDepthTexture.Load(int3(Pixel, 0)).r;
+
+	// Reverse-Z: device 0 is the far plane. A marcher hit there means the raster
+	// path drew NOTHING in a pixel the marcher says is ground -- which is not a
+	// depth disagreement, it is a coverage one, and it gets its own column
+	// because the two have completely different causes (this one is almost
+	// always the quad path being suppressed or a chunk not yet resident).
+	if (RasterDeviceZ <= 0.0f)
+	{
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_HIT_ON_SKY], 1u);
+		return;
+	}
+
+	const float RasterViewZ = VoxelMarchSceneViewZ(RasterDeviceZ);
+	const float VoxelSizeUU = VoxelMarchVoxelSizeUU(V.Level);
+	const float DeltaUU = abs(MarchViewZ - RasterViewZ);
+	const float DeltaVoxels = DeltaUU / max(VoxelSizeUU, 1e-6f);
+
+	InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_COMPARED], 1u);
+
+	// The distribution, so a failure is something to look at rather than argue
+	// about. Milli-voxels for the max because an InterlockedMax needs an integer
+	// and a float bit-pattern max is only monotonic for positives -- true here,
+	// but relying on it would be a trick rather than a measurement.
+	InterlockedMax(MarchOutVerify[VOXEL_MARCH_VERIFY_MAX_MILLIVOX],
+	               uint(min(DeltaVoxels * 1000.0f, 4294967000.0f)));
+	{
+		uint Bucket = 5u;
+		if (DeltaVoxels < 0.25f)      { Bucket = 0u; }
+		else if (DeltaVoxels < 0.5f)  { Bucket = 1u; }
+		else if (DeltaVoxels < 1.0f)  { Bucket = 2u; }
+		else if (DeltaVoxels < 2.0f)  { Bucket = 3u; }
+		else if (DeltaVoxels < 4.0f)  { Bucket = 4u; }
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_BUCKET0 + Bucket], 1u);
+	}
+
+	// THE EDGE MASK, from the raster depth only. Derived from the RASTER side on
+	// purpose: an edge mask built from the marcher's own output would be a mask
+	// the thing under test gets to draw for itself.
+	float MinZ = RasterViewZ;
+	float MaxZ = RasterViewZ;
+	[unroll]
+	for (int dy = -VOXEL_MARCH_VERIFY_EDGE_RADIUS; dy <= VOXEL_MARCH_VERIFY_EDGE_RADIUS; ++dy)
+	{
+		[unroll]
+		for (int dx = -VOXEL_MARCH_VERIFY_EDGE_RADIUS; dx <= VOXEL_MARCH_VERIFY_EDGE_RADIUS; ++dx)
+		{
+			const float NeighbourDeviceZ =
+				MarchSceneDepthTexture.Load(int3(Pixel + int2(dx, dy), 0)).r;
+			// Far-plane neighbours are a silhouette against the sky, which is
+			// exactly an edge -- folded in as a large spread rather than skipped.
+			const float NeighbourZ = (NeighbourDeviceZ <= 0.0f)
+			                             ? (RasterViewZ + 1e9f)
+			                             : VoxelMarchSceneViewZ(NeighbourDeviceZ);
+			MinZ = min(MinZ, NeighbourZ);
+			MaxZ = max(MaxZ, NeighbourZ);
+		}
+	}
+	const bool bEdge = (MaxZ - MinZ) > (VOXEL_MARCH_VERIFY_EDGE_VOXELS * VoxelSizeUU);
+	if (bEdge)
+	{
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_EDGE_PIXELS], 1u);
+	}
+
+	// THE PRE-REGISTERED THRESHOLD. Half a voxel at the level the ray actually
+	// sampled -- not a fixed UU number, because a level-3 voxel is eight times a
+	// level-0 one and a fixed threshold would be eight times stricter on the far
+	// field than the rule says.
+	if (DeltaUU > 0.5f * VoxelSizeUU)
+	{
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_DISAGREE], 1u);
+		InterlockedAdd(MarchOutVerify[bEdge ? VOXEL_MARCH_VERIFY_DISAGREE_EDGE
+		                                    : VOXEL_MARCH_VERIFY_DISAGREE_INNER], 1u);
+	}
+
+	// ---- the control: the reference against a displaced copy of itself ----
+	//
+	// Same pixel population, same threshold, same edge classification. The only
+	// thing that changes is that BOTH sides are now the raster path, so whatever
+	// this scores is what the instrument reports when the marcher is not
+	// involved at all.
+	{
+		float RefDelta = 0.0f;
+		[unroll]
+		for (int Axis = 0; Axis < 2; ++Axis)
+		{
+			const int2 Step = (Axis == 0) ? int2(1, 0) : int2(0, 1);
+			const float NDeviceZ = MarchSceneDepthTexture.Load(int3(Pixel + Step, 0)).r;
+			// A far-plane neighbour means one pixel of displacement lands on the
+			// sky. That is a total change of surface and it is exactly the case
+			// this control exists to price, so it is counted as a large delta
+			// rather than skipped.
+			const float NZ = (NDeviceZ <= 0.0f) ? (RasterViewZ + 1e9f)
+			                                    : VoxelMarchSceneViewZ(NDeviceZ);
+			RefDelta = max(RefDelta, abs(NZ - RasterViewZ));
+		}
+		if (RefDelta > 0.5f * VoxelSizeUU)
+		{
+			InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_REFSELF], 1u);
+			if (!bEdge)
+			{
+				InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_REFSELF_INNER], 1u);
+			}
+		}
+		if (!bEdge)
+		{
+			InterlockedMax(MarchOutVerify[VOXEL_MARCH_VERIFY_REFSELF_MAX],
+			               uint(min((RefDelta / max(VoxelSizeUU, 1e-6f)) * 1000.0f,
+			                        4294967000.0f)));
+		}
+	}
+
+	// The interior distribution. Over ALL interior pixels, not only disagreeing
+	// ones, so the shape of the agreeing majority is visible too -- a mass that
+	// sits just under the threshold is a different story from one at zero, and
+	// only one of them is comfortable.
+	if (!bEdge)
+	{
+		InterlockedMax(MarchOutVerify[VOXEL_MARCH_VERIFY_INNER_MAX],
+		               uint(min(DeltaVoxels * 1000.0f, 4294967000.0f)));
+		uint Bucket = 5u;
+		if (DeltaVoxels < 0.25f)      { Bucket = 0u; }
+		else if (DeltaVoxels < 0.5f)  { Bucket = 1u; }
+		else if (DeltaVoxels < 1.0f)  { Bucket = 2u; }
+		else if (DeltaVoxels < 2.0f)  { Bucket = 3u; }
+		else if (DeltaVoxels < 4.0f)  { Bucket = 4u; }
+		InterlockedAdd(MarchOutVerify[VOXEL_MARCH_VERIFY_INNER_BUCKET0 + Bucket], 1u);
+	}
+}
+
+// ===========================================================================
+// 5. THE INDEX/RECORD JOIN PROBE (voxel.March.VerifyIndex)
+// ===========================================================================
+//
+// WHY THIS EXISTS. The first brick-pool A/B came back with the index populated
+// (16,898 level-0 chunks), noPool=0, and the marcher hitting 1,138 tiles where
+// the occupancy source hit 8,016 -- 14% -- while costing 20.6% MORE. Those two
+// facts together are not a cost result. A miss runs to the full step budget and
+// a hit terminates early, so "hits far less, costs more" is the signature of
+// rays failing to find terrain that is there and marching to budget instead.
+//
+// And it cannot be a legitimate difference between the sources: the render
+// predicate (m != MAT_AIR) is a SUPERSET of the fluid one (which excludes
+// MAT_WATERMARK), so the brick volume must mark MORE solid than the occupancy
+// volume, never less. Both arms share the frame, the clip box and the ray by
+// construction, so traversal length is not the variable either.
+//
+// THIS PROBE TRACES NO RAYS AT ALL, and that is the point. It walks the chunk
+// cells the marcher could possibly touch and asks, for each one, whether the
+// index and the record agree -- isolating the join from the DDA completely. If
+// the join is clean the bug is below it, in the brick or cell layer, and the
+// next instrument goes there. If the join is dirty this says exactly how,
+// including the actual coordinates that disagreed.
+//
+// ONE THREAD PER CHUNK CELL over the 16x16x16 box the occupancy window spans
+// (512 voxels / 32 = 16 chunks), anchored at the same origin the marcher uses.
+// 4,096 threads, once, on demand.
+//
+// SAMPLES, NOT JUST TALLIES. A count of "origin mismatch" tells you something
+// is wrong; the wanted and recorded coordinates side by side tell you WHAT --
+// a factor of 32 is a units bug, a permutation is the transposition the format
+// doc warns about (brick order within a chunk was never stated originally, and
+// a z-major reading passes every unit test while producing a transposed world),
+// and an unrelated value is a stale or aliased slot.
+
+// GUARDED TO SOURCE 1. Every symbol below -- the index, the chunk table, the
+// capacities -- is declared by VoxelBrickTraverse.ush only under
+// VOXEL_MARCH_SOURCE 1, so this kernel exists only there. Asking it to compile
+// under source 0 would mean declaring the pool bindings for a permutation that
+// never reads them, which is the coupling the source split exists to avoid.
+#if VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL
+
+#define VOXEL_MARCH_VIDX_PROBED        0u
+#define VOXEL_MARCH_VIDX_RESIDENT      1u
+#define VOXEL_MARCH_VIDX_SLOT_OOB      2u
+#define VOXEL_MARCH_VIDX_ORIGIN_BAD    3u
+#define VOXEL_MARCH_VIDX_LEVEL_BAD     4u
+#define VOXEL_MARCH_VIDX_ANYSOLID_CLR  5u
+#define VOXEL_MARCH_VIDX_BRICKBASE_OOB 6u
+#define VOXEL_MARCH_VIDX_VALID         7u
+#define VOXEL_MARCH_VIDX_L1_ANY        8u   // valid chunks whose L1 mask has any bit
+#define VOXEL_MARCH_VIDX_L1_ZERO       9u   // valid chunks with an EMPTY L1 mask
+#define VOXEL_MARCH_VIDX_CLAIMED      10u
+// ---------------------------------------------------------------------------
+// LAYER 2: DOES THE STORAGE HOLD THE SAME WORLD THE OCCUPANCY VOLUME DOES?
+// ---------------------------------------------------------------------------
+//
+// The first probe proved the JOIN: origin=0, level=0, slotOOB=0, brickBaseOOB=0,
+// L1zero=0 over 706 valid chunks. The index resolves, the records agree, the
+// masks are populated -- and rays still miss 86% of what they should hit. So the
+// defect is below the join, and paper checks have stopped being useful: the
+// descriptor decode, the cell indexing and the payload layout were all re-derived
+// against brickpack.ush (the WRITER, not the doc) and all match, field for field.
+//
+// So this counts, over the SAME 32^3 voxels of every valid chunk:
+//   * how many cells the POOL says are solid, from the descriptors and the
+//     occupancy dwords -- i.e. exactly what the marcher's solidity test reads
+//   * how many voxels the OCCUPANCY VOLUME says are solid, from the bitfield the
+//     other source reads
+//
+// THE TWO NUMBERS SHOULD BE CLOSE AND THE POOL'S SHOULD BE THE LARGER, because
+// the render predicate (m != MAT_AIR) is a strict superset of the fluid one
+// (which excludes MAT_WATERMARK). Anything else localises the bug in one read:
+//
+//   pool ~= occupancy   the storage is right and the DDA is wrong
+//   pool << occupancy   the descriptor or occupancy read is wrong, and the
+//                       brick-kind histogram below says which
+//   pool >> occupancy   the pool holds a different world -- a producer problem,
+//                       not a marcher one
+//
+// AND THE KIND HISTOGRAM IS THE TIEBREAK. If bricks whose L1 bit is SET decode
+// overwhelmingly as kind 0 (uniform AIR), the descriptor read is wrong -- an L1
+// bit is only set for a brick with solid content, so "L1 set but kind says air"
+// is a contradiction the storage cannot legitimately produce.
+#define VOXEL_MARCH_VIDX_POOL_SOLID   11u  // cells the pool calls solid
+#define VOXEL_MARCH_VIDX_OCC_SOLID    12u  // voxels the occupancy volume calls solid
+#define VOXEL_MARCH_VIDX_KIND_AIR     13u  // L1-set bricks decoding as uniform AIR
+#define VOXEL_MARCH_VIDX_KIND_SOLID   14u  // ... as uniform SOLID
+#define VOXEL_MARCH_VIDX_KIND_MIXED   15u  // ... as MIXED
+// ---------------------------------------------------------------------------
+// THE LAYOUT COMES FROM THE CPU. These are pushed by
+// FVoxelMarchVerifyIndexCS::ModifyCompilationEnvironment, the same way
+// VOXEL_MARCH_TILE_SIZE is, because the hand-mirrored version of this DETACHED:
+// the shader computed 64 words while FVoxelMarchState::kIndexProbeWords said 60.
+// MarchOutVerifyIndex is a typed UAV, so D3D12 silently discarded the four
+// overflow writes and sample 5 read back as RecOrigin (x, 0, 0), slot 0,
+// LevelAndFlags 0 -- A PLAUSIBLE WRONG VALUE, NOT A BLANK, and one that reads as
+// "the record claims level 0" when the record said nothing at all.
+//
+// The fallbacks below exist ONLY so tools/voxel-check-marchdraw-shader.ps1 can
+// compile this file outside the engine. They must never be the live values, and
+// if the CPU ever stops pushing them the fit check below is what notices.
+// ---------------------------------------------------------------------------
+#ifndef VOXEL_MARCH_VIDX_HEADER
+#define VOXEL_MARCH_VIDX_HEADER       16u
+#endif
+#ifndef VOXEL_MARCH_VIDX_SAMPLE_WORDS
+#define VOXEL_MARCH_VIDX_SAMPLE_WORDS  8u
+#endif
+#ifndef VOXEL_MARCH_VIDX_SAMPLE_MAX
+#define VOXEL_MARCH_VIDX_SAMPLE_MAX    6u
+#endif
+#define VOXEL_MARCH_VIDX_WORDS \
+	(VOXEL_MARCH_VIDX_HEADER + VOXEL_MARCH_VIDX_SAMPLE_MAX * VOXEL_MARCH_VIDX_SAMPLE_WORDS)
+#ifndef VOXEL_MARCH_VIDX_ALLOC_WORDS
+#define VOXEL_MARCH_VIDX_ALLOC_WORDS  VOXEL_MARCH_VIDX_WORDS
+#endif
+
+// THE FIT CHECK. HLSL has no static_assert, but a negative array extent is a
+// compile error -- so an overflowing layout fails the shader build instead of
+// letting the driver drop the writes on the floor. This is the check that would
+// have caught 64-against-60 at build time rather than at "sample 5 looks odd".
+static const int VoxelMarchVIdxFits[(VOXEL_MARCH_VIDX_WORDS <= VOXEL_MARCH_VIDX_ALLOC_WORDS)
+                                        ? 1 : -1] = { 0 };
+
+RWBuffer<uint> MarchOutVerifyIndex;
+int3 MarchVerifyIndexBaseChunk;
+// PHASE 6: 1 = probe the COVER grid slot at the cover level instead of ring 0.
+//
+// A UNIFORM AND NOT A PERMUTATION, deliberately, and the reason is the opposite
+// of the traversal's: this kernel traces no rays and is dispatched once, outside
+// every timing bracket, so a branch here cannot re-base an arm. What it CAN do
+// is let one leg read both grids and compare them, which is the whole point --
+// "the cover index is empty" and "the terrain index is empty" have completely
+// different owners and a probe that can only see one of them cannot say which.
+int MarchVerifyIndexCover;
+
+[numthreads(4, 4, 4)]
+void VoxelMarchVerifyIndexMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId >= 16u))
+	{
+		return;
+	}
+	// THE PROBE MUST RUN THE ENGINE'S OWN BINDING. Setting the context through
+	// the same VoxelMarchBeginCover the traversal calls -- rather than reading
+	// the cover grid by hand here -- is what makes this probe a statement about
+	// the read path the marcher actually uses. An instrument that computes its
+	// own address is measuring its own arithmetic.
+	if (MarchVerifyIndexCover != 0)
+	{
+		VoxelMarchBeginCover();
+	}
+	else
+	{
+		VoxelMarchBeginLevel(0u);
+	}
+	const int3 ChunkCoord = MarchVerifyIndexBaseChunk + int3(DispatchThreadId);
+	InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_PROBED], 1u);
+
+	const uint Entry = MarchChunkIndex[VoxelMarchIndexCell(ChunkCoord)];
+	if ((Entry & VOXEL_MARCH_INDEX_RESIDENT_BIT) == 0u)
+	{
+		return;   // not resident is the ordinary case for most of a shell
+	}
+	InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_RESIDENT], 1u);
+
+	const uint Slot = Entry & VOXEL_MARCH_INDEX_SLOT_MASK;
+	if (Slot >= VoxelBrickChunkSlots)
+	{
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_SLOT_OOB], 1u);
+		return;
+	}
+
+	const uint Base = Slot * VOXEL_MARCH_CHUNK_RECORD_DWORDS;
+	const int3 RecOrigin = int3(int(VoxelBrickChunkTable[Base + 0u]),
+	                            int(VoxelBrickChunkTable[Base + 1u]),
+	                            int(VoxelBrickChunkTable[Base + 2u]));
+	const uint LevelAndFlags = VoxelBrickChunkTable[Base + 3u];
+	const int3 WantOrigin = ChunkCoord * 32;
+
+	const bool bOriginBad = any(RecOrigin != WantOrigin);
+	// AGAINST THE LEVEL THE CONTEXT IS AT, not the literal 0 -- see the same fix
+	// in VoxelMarchLookupChunk. Reading `!= 0u` here made this probe report
+	// levelBad for every level-1 and every cover chunk it looked at, which is a
+	// probe that agrees with the defect it is meant to find.
+	const bool bLevelBad = (LevelAndFlags & 0xFu) != GVoxelMarchRecordLevel;
+
+	if (bOriginBad || bLevelBad)
+	{
+		if (bOriginBad) { InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_ORIGIN_BAD], 1u); }
+		if (bLevelBad)  { InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_LEVEL_BAD], 1u); }
+
+		// Claim a sample slot. The wanted and the recorded values, side by side.
+		uint Claim = 0u;
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_CLAIMED], 1u, Claim);
+		if (Claim < VOXEL_MARCH_VIDX_SAMPLE_MAX)
+		{
+			const uint S = VOXEL_MARCH_VIDX_HEADER + Claim * VOXEL_MARCH_VIDX_SAMPLE_WORDS;
+			MarchOutVerifyIndex[S + 0u] = uint(WantOrigin.x);
+			MarchOutVerifyIndex[S + 1u] = uint(WantOrigin.y);
+			MarchOutVerifyIndex[S + 2u] = uint(WantOrigin.z);
+			MarchOutVerifyIndex[S + 3u] = uint(RecOrigin.x);
+			MarchOutVerifyIndex[S + 4u] = uint(RecOrigin.y);
+			MarchOutVerifyIndex[S + 5u] = uint(RecOrigin.z);
+			MarchOutVerifyIndex[S + 6u] = Slot;
+			MarchOutVerifyIndex[S + 7u] = LevelAndFlags;
+		}
+		return;
+	}
+
+	if ((LevelAndFlags & 0x10u) == 0u)
+	{
+		// Resident, record agrees, and the chunk is genuinely all air. Ordinary
+		// -- collapsed chunks are the majority of residency -- but counted,
+		// because "the world is empty here" and "the join is broken" produce the
+		// same number of marched hits and must not produce the same reading.
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_ANYSOLID_CLR], 1u);
+		return;
+	}
+
+	const uint BrickBase = VoxelBrickChunkTable[Base + 4u];
+	if (BrickBase + VOXEL_MARCH_BRICKS_PER_CHUNK > VoxelBrickDescSlots)
+	{
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_BRICKBASE_OOB], 1u);
+		return;
+	}
+
+	InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_VALID], 1u);
+
+	// AND ONE LAYER DEEPER, because it is free here and it is the next question
+	// this probe would otherwise force a second leg to ask: does a chunk that
+	// says anySolid actually have any brick bits set? A record claiming solid
+	// content over an all-zero L1 mask means every brick test rejects and the
+	// chunk contributes nothing -- which is exactly "index populated, rays
+	// mostly missing" one level down from the join.
+	const uint2 BrickSolid = uint2(VoxelBrickChunkTable[Base + 5u],
+	                               VoxelBrickChunkTable[Base + 6u]);
+	if ((BrickSolid.x | BrickSolid.y) != 0u)
+	{
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_L1_ANY], 1u);
+	}
+	else
+	{
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_L1_ZERO], 1u);
+	}
+
+	// ---- layer 2: the same 32^3 voxels, counted through both sources -------
+	//
+	// This is the marcher's OWN read path, one level of abstraction down from
+	// the DDA -- the same descriptor fetch, the same kind switch, the same
+	// occupancy dwords. If it reports solid cells the DDA cannot find, the DDA
+	// is the defect. If it reports none either, the read is.
+	uint PoolSolid = 0u;
+	[loop]
+	for (uint b = 0u; b < VOXEL_MARCH_BRICKS_PER_CHUNK; ++b)
+	{
+		const uint MaskWord = (b < 32u) ? BrickSolid.x : BrickSolid.y;
+		// lint-shader-ub: allow VARIABLE_SHIFT - b is 0..63 and the shift is masked to 0..31
+		if ((MaskWord & (1u << (b & 31u))) == 0u)
+		{
+			continue;   // L1 says empty -- the free skip, exercised here too
+		}
+		const uint2 D = VoxelBrickDesc[BrickBase + b];
+		const uint Kind = (D.x >> 28u) & 0x3u;
+		if (Kind == 0u)
+		{
+			// A CONTRADICTION, not a legitimate state: the L1 bit is set, which
+			// the writer only does for a brick with solid content, yet the
+			// descriptor says uniform AIR.
+			InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_KIND_AIR], 1u);
+			continue;
+		}
+		if (Kind == 1u)
+		{
+			InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_KIND_SOLID], 1u);
+			PoolSolid += 512u;   // uniform SOLID: every cell, no payload to read
+			continue;
+		}
+		InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_KIND_MIXED], 1u);
+		const uint OccBase = D.x & 0x0FFFFFFFu;
+		if (OccBase + 16u > VoxelBrickOccWords)
+		{
+			continue;
+		}
+		[unroll]
+		for (uint w = 0u; w < 16u; ++w)
+		{
+			PoolSolid += countbits(VoxelBrickOcc[OccBase + w]);
+		}
+	}
+	InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_POOL_SOLID], PoolSolid);
+
+	// The occupancy volume over the SAME 32^3 voxels. Read a word at a time:
+	// the bitfield is x-major, 32 voxels per word, and a chunk's x range is
+	// 32-aligned and 32 long, so each (y, z) row is exactly one word. The wrap
+	// offset is a multiple of 64, so a 32-aligned run never straddles two words.
+	uint OccSolid = 0u;
+	// NOT ON THE COVER ARM, AND IT LEAVES THE COUNTER AT ZERO ON PURPOSE. The
+	// occupancy volume is a 10 cm terrain grid; asking it about a 5 cm cover cell
+	// is a category error, and its answer over cover-cell coordinates would be
+	// terrain read at half scale -- a plausible number about the wrong lattice,
+	// which is the failure mode this whole programme keeps paying for. Zero here
+	// on the cover arm means NO COMPARISON WAS MADE, and the host says so in
+	// words rather than printing a ratio against it.
+	if (MarchVerifyIndexCover != 0)
+	{
+		return;
+	}
+	const int Dim = (int)FluidVolumeDimVoxels;
+	const uint WordsPerRow = FluidVolumeDimVoxels >> 5u;
+	[loop]
+	for (uint zz = 0u; zz < 32u; ++zz)
+	{
+		[loop]
+		for (uint yy = 0u; yy < 32u; ++yy)
+		{
+			const int3 World = WantOrigin + int3(0, int(yy), int(zz));
+			const int3 L = World - FluidVolumeOriginVoxel;
+			if (any(L < 0) || any(L >= Dim))
+			{
+				continue;   // outside the occupancy window: it has no opinion
+			}
+			const uint3 S = VoxelFluidStorageVoxel((uint3)L);
+			const uint Index = (S.z * FluidVolumeDimVoxels + S.y) * WordsPerRow + (S.x >> 5u);
+			OccSolid += countbits(FluidOccupancyBits[Index]);
+		}
+	}
+	InterlockedAdd(MarchOutVerifyIndex[VOXEL_MARCH_VIDX_OCC_SOLID], OccSolid);
+}
+
+#endif // VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL
+
+// ===========================================================================
+// 6. THE SOURCE COMPARATOR (voxel.March.VerifySource)
+// ===========================================================================
+//
+// PRE-REGISTERED before the brick traversal was written; built now, at the point
+// its own criterion said it becomes worth its cost. Three layers have been
+// eliminated by measurement -- the index/record join (origin=0, slotOOB=0), the
+// descriptor decode (L1-set bricks decoding as air = 0), and the storage itself
+// (poolSolidCells 15,225,079 against occupancySolidVoxels 12,527,771, ratio
+// 1.215, read through the marcher's own path). The remaining surface is the
+// walk, and this instrument localises WITHIN it.
+//
+// WHY THE WALK IS THE SUSPECT AND WHY IT WAS NEVER CHECKED. Source 1 contains a
+// structural mirror of VoxelFluidWalkVoxelLine -- the one Amanatides & Woo in
+// this repo that is unit-tested against voxelcore/raycast.h. It was mirrored
+// rather than reused because its solidity test is a hardcoded call into the
+// fluid bitfield, and adding a hook would have meant editing the contract file
+// the solver, the collision tests and the CPU mirror all depend on. That was the
+// right call, and the price of it is exactly this: two implementations of one
+// algorithm, of which only one has ever been verified.
+//
+// ---------------------------------------------------------------------------
+// SAME RAYS, SAME FRAME, NOT MERELY SIMILAR ONES
+// ---------------------------------------------------------------------------
+//
+// Both traversals run in ONE kernel over ONE ray built by the same
+// VoxelMarchBuildRay the march uses, with the same t_max clip. A comparison
+// across two dispatches would be comparing two camera positions as well as two
+// volumes, and a comparison across two legs would be comparing two worlds.
+//
+// ---------------------------------------------------------------------------
+// AGAINST THE REFERENCE'S OWN NOISE, NEVER AGAINST ZERO
+// ---------------------------------------------------------------------------
+//
+// Phase 0 settled this and paid for it: 20 mismatches in 1.35M rays looked like
+// a defect and turned out to be float32 ordering noise in the reference, proved
+// by showing the flat walk disagrees with a 1e-6-nudged copy of ITSELF thirteen
+// times more often than with the walk under test.
+//
+// So the control runs here too: the occupancy walk a SECOND time over a segment
+// scaled by 1 - 1e-7 -- geometrically the same ray, one part in ten million of
+// arithmetic difference, no new DDA. `refNoise` is how often the reference
+// disagrees with itself, and every other number is read against it.
+//
+// ---------------------------------------------------------------------------
+// TWO NAMED EXCLUSIONS, BOTH DECIDED IN ADVANCE
+// ---------------------------------------------------------------------------
+//
+// 1. MAT_WATERMARK. The two sources use DIFFERENT SOLIDITY PREDICATES by design:
+//    the occupancy volume packs with vxc::isSolidForFluid, which EXCLUDES
+//    MAT_WATERMARK (fluidoccupancy.h:132); the render predicate is
+//    m != MAT_AIR (brick-volume-format.md 3a), which includes it. So a brick-hit
+//    on a watermark voxel where occupancy missed is CORRECT, and it is
+//    identified by the pool's own material, counted in its own column, and
+//    excluded. NOT absorbed into a tolerance -- section 3a records that
+//    inheriting the fluid predicate here would have deleted the water-marker
+//    instrument in exactly the mode someone enabled to look at it, and a
+//    comparator that widened a threshold to hide the difference would recreate
+//    that failure one level up.
+//
+// 2. Shared-face ties. Two adjacent voxels differing on exactly one axis, both
+//    solid, at the same point along the ray. raycast.h's tie rule governs which
+//    AXIS to step, not which voxel a point lying exactly ON a shared face
+//    belongs to -- that question has no canonical answer. Excused narrowly (L1
+//    distance exactly 1 AND separation below half a voxel along the ray) and
+//    counted in its own column, so a change in the RATE is still a signal.
+//
+// ---------------------------------------------------------------------------
+// AND THE FIELD THAT ACTUALLY LOCALISES THE BUG
+// ---------------------------------------------------------------------------
+//
+// For every ray where the occupancy source found a surface and the brick source
+// did not -- the symptom -- the comparator asks the brick path directly:
+// VoxelMarchBrickProbeVoxel(the voxel occupancy hit). That returns the BRANCH
+// that rejected it, not a boolean.
+//
+//   reason SOLID     the pool DOES call that voxel solid, and the walk never
+//                    tested it. The DDA is skipping voxels.
+//   reason L1_CLEAR / KIND_AIR / OCC_CLEAR
+//                    the storage disagrees at that exact voxel, which would
+//                    contradict the layer-2 aggregate and mean the disagreement
+//                    is positional rather than about content.
+//   reason NO_CHUNK / RECORD
+//                    the walk reached a voxel whose chunk is not resident, i.e.
+//                    it is looking somewhere the index does not cover.
+//
+// A count could not separate those three and they have completely different
+// fixes. Six printed samples can, which is the shape that resolved the last two
+// legs in one run each.
+
+#if VOXEL_MARCH_VERIFY_SOURCE
+
+#define VOXEL_MARCH_VSRC_RAYS          0u
+#define VOXEL_MARCH_VSRC_AGREE_MISS    1u
+#define VOXEL_MARCH_VSRC_AGREE_HIT     2u
+#define VOXEL_MARCH_VSRC_TIES          3u
+#define VOXEL_MARCH_VSRC_BRICK_MISSED  4u   // occupancy hit, brick did not -- THE SYMPTOM
+#define VOXEL_MARCH_VSRC_BRICK_EXTRA   5u   // brick hit, occupancy did not
+#define VOXEL_MARCH_VSRC_WATERMARK     6u   // ... and it was a watermark voxel: excluded
+#define VOXEL_MARCH_VSRC_HARD          7u   // both hit, different voxel, not a tie
+#define VOXEL_MARCH_VSRC_REFNOISE      8u   // the reference against a nudged copy of itself
+#define VOXEL_MARCH_VSRC_CLAIMED       9u
+#define VOXEL_MARCH_VSRC_REASON0      10u   // 10..16: the reject-reason histogram
+// ---------------------------------------------------------------------------
+// THE SKIP RATIO, MEASURED WHERE THE RAYS ARE ALREADY IDENTICAL
+// ---------------------------------------------------------------------------
+//
+// steps(flat) / steps(hierarchical) is the single number the entire performance
+// case rests on, and 9.19x was measured against a TWO-LEVEL MIP OVER A FLAT
+// VOLUME -- a different acceleration structure with different cell sizes and
+// different restart behaviour from chunks -> bricks -> cells. It has never been
+// measured here.
+//
+// It belongs in THIS kernel and not in a pass of its own, because a ratio is a
+// comparison and this is the one place two traversals already run over the SAME
+// RAY in the SAME FRAME. Measuring the two arms in separate dispatches would put
+// a camera position inside the ratio.
+//
+// AND THE SAME DISPATCH GATES THE HIERARCHY. A hierarchical walk that skips a
+// diagonal cell produces a LOWER step count and a plausible picture -- it makes
+// this very number look better while being wrong, which is the one failure mode
+// an instrument that only fires on bad-looking results cannot catch. So
+// hierVsFlat counts rays where the two walks disagree about the HIT, read
+// against the same refNoise floor as everything else.
+#define VOXEL_MARCH_VSRC_STEPS_OCC    17u
+#define VOXEL_MARCH_VSRC_STEPS_FLAT   18u
+#define VOXEL_MARCH_VSRC_STEPS_HIER   19u
+#define VOXEL_MARCH_VSRC_HIER_VS_FLAT 20u
+// SPLIT BY SHAPE, because "156,031 rays disagree" cannot say WHICH WAY and the
+// three directions have different causes. A hierarchy that skips real content
+// loses hits (flatHit_hierMiss); one that mis-anchors its cell grid can also
+// stop early on the wrong brick (bothHit_different); one that fails to skip
+// gains nothing but should not gain hits (flatMiss_hierHit) -- a non-zero count
+// there means the hierarchy is finding terrain the flat walk cannot, which
+// would be a flat-walk bug rather than a hierarchy one.
+#define VOXEL_MARCH_VSRC_HVF_LOST     21u  // flat hit, hierarchy missed
+#define VOXEL_MARCH_VSRC_HVF_GAINED   22u  // flat missed, hierarchy hit
+#define VOXEL_MARCH_VSRC_HVF_MOVED    23u  // both hit, different voxel
+// Over every `lost` ray: how the hierarchy terminated (4 bins) and what the
+// brick path says about the voxel the flat walk hit (7 bins). Six samples show
+// a mechanism; these say whether it accounts for all of them.
+#define VOXEL_MARCH_VSRC_OCCNOISE     35u  // the occupancy walk against itself
+// ---------------------------------------------------------------------------
+// RESIDENCY AT SAMPLE TIME, RIDING THE SAME READBACK AS THE COUNTS
+// ---------------------------------------------------------------------------
+//
+// `lost` swings 18x between byte-identical runs while stepsFlat agrees to
+// 0.017% and the ratio to 0.56%. So the rays are identical and the volume is
+// not -- brick residency has settled at 97,019 / 97,082 / 97,471 across legs.
+//
+// AND THE MECHANISM CANNOT BE "THE TWO WALKS SAMPLED DIFFERENT MOMENTS": they
+// run in ONE kernel invocation against ONE set of SRVs, so within a leg they
+// provably see the same world. What differs between LEGS is WHICH CHUNKS EXIST
+// -- and if the hierarchy's remaining defect is geometry-specific (thin
+// features, boundary-grazing rays), its count is dominated by whether the few
+// chunks that trigger it happen to be resident. That predicts `lost` tracking
+// residency while `gained` and `moved` do not, which is exactly the shape seen.
+//
+// Echoed INTO THE COUNTER BUFFER rather than read from the CPU at print time,
+// because a residency number joined to a count by hand is joined to the wrong
+// frame -- the readback lands two or three frames after the dispatch that
+// produced it.
+#define VOXEL_MARCH_VSRC_RESIDENCY    36u
+#define VOXEL_MARCH_VSRC_UPLOADS      37u
+// THE INDEX CONTENT HASH, and the pool's own level-0 chunk count beside it.
+//
+// Residency was falsified as the `lost` driver: 26,217 vs 26,211 -- 0.02% apart
+// -- with `lost` swinging 34 -> 5,134. But a COUNT cannot tell "the same 26,000
+// chunks" from "26,000 chunks, a different few hundred of them", and those are
+// different worlds to a ray.
+//
+// The hash settles it in one comparison. Equal hashes mean the two legs marched
+// the same world, which moves the investigation off the volume entirely.
+//
+// poolLevel0 is the completeness check the upload-quiet gate could not make: a
+// 60-frame lull during streaming is a lull, not convergence, and this project's
+// cold-fill tooling already records a leg that read a mid-fill lull as settled
+// and made the GPU fork look 12%% faster than it was.
+#define VOXEL_MARCH_VSRC_HASHLO       38u
+#define VOXEL_MARCH_VSRC_HASHHI       39u
+#define VOXEL_MARCH_VSRC_POOLL0       40u
+// ---------------------------------------------------------------------------
+// THE TWO POPULATIONS, SPLIT -- because they have been summed all night
+// ---------------------------------------------------------------------------
+//
+// Two reads of one leg: 4,316 disagreements strongly concentrated (+Y, brick
+// faces) and 239 diffuse with `lost` collapsing to 12 while `moved` became the
+// bulk. That is not one quantity being noisy, it is a BIMODAL quantity read as
+// one -- a structural brick-face defect that dominates when it fires, plus a
+// small diffuse residue consistent with the restart float floor.
+//
+// Summing them is why the count swung 150x while the ratio held to 2%. Split
+// here so a fix can drive the concentrated term to zero and leave the diffuse
+// remainder standing beside refNoise, which is the certified-with-a-bounded-
+// residue outcome rather than an unexplained remainder.
+//
+// "On a face" = the flat walk's hit voxel has any cell coordinate at 0 or 7,
+// i.e. it sits on the boundary of its 8^3 brick.
+#define VOXEL_MARCH_VSRC_LOST_ONFACE  41u
+#define VOXEL_MARCH_VSRC_LOST_OFFFACE 42u
+#define VOXEL_MARCH_VSRC_MOVED_ONFACE 43u
+#define VOXEL_MARCH_VSRC_MOVED_OFF    44u
+// ---------------------------------------------------------------------------
+// DID THE HIERARCHY EVER DESCEND INTO THE HIT'S BRICK?
+// ---------------------------------------------------------------------------
+//
+// Over EVERY lost ray, from the 64-bit descent mask rather than from
+// LastFineBrickIndex -- which records only the LAST descent and therefore could
+// not tell "never entered it" from "entered it, missed, and carried on". That
+// made the previous neverDescended=47/54 an upper bound rather than a
+// measurement.
+//
+//   0 NO   the hit's brick was in the walked chunk and was never descended into
+//          -> the advance skipped past it
+//   1 YES  it WAS descended into and the inner DDA still missed
+//          -> a stepping defect, a different bug
+//   2 OTHER the mask belongs to a different chunk; inconclusive for this ray
+#define VOXEL_MARCH_VSRC_DESCEND0     45u  // 45..47
+// ---------------------------------------------------------------------------
+// WHERE `moved` RAYS LAND RELATIVE TO THE FLAT WALK
+// ---------------------------------------------------------------------------
+//
+// `moved` went 0 -> 29/39/93 on the build that collapsed `lost onFace` 550 -> 22.
+// That is a term the fix was pre-registered to leave alone, so it is a
+// regression by the criterion agreed before the run.
+//
+// THE LIKELY TRADE, and this instrument exists to confirm or kill it: rays that
+// previously SKIPPED a brick entirely (scored `lost`, and a skipped brick cannot
+// produce a wrong cell) now descend correctly and land on the wrong voxel. The
+// stepping imprecision would then be pre-existing, merely unmasked -- which is a
+// different claim from "the fix introduced it" and needs different work.
+//
+// The discriminator is the DELTA. An off-by-one at brick entry puts the
+// hierarchy exactly ONE voxel further along the ray than the flat walk; a
+// stepping error inside a brick scatters. So:
+//   AHEAD_1   |delta| == 1 on one axis and hier is further along the ray
+//   BEHIND_1  |delta| == 1 but hier is nearer -- the mirror, and a different bug
+//   OTHER     anything else -- not an off-by-one at all
+#define VOXEL_MARCH_VSRC_MOVED_AHEAD1 48u
+#define VOXEL_MARCH_VSRC_MOVED_BEHIND1 49u
+#define VOXEL_MARCH_VSRC_MOVED_OTHER  50u
+// Opportunity denominators -- see FVoxelMarchHit. These make the verdict a RATE
+// against something that scales with the world, instead of a count that mixes
+// defect density with world content.
+#define VOXEL_MARCH_VSRC_BRICKENTRIES 51u
+#define VOXEL_MARCH_VSRC_THINCLIPS    52u
+// ---- hit/miss, and the coincidence test with its control -----------------
+// flatHit/hierHit exist because the ratio's scope caveat could not be settled:
+// agreeMiss/agreeHit belong to the SOURCE compare, which is gated off whenever
+// the frame is camera-anchored -- so no leg since that change has recorded a
+// hit/miss split at all. These ride the hier-vs-flat arm, which always runs.
+#define VOXEL_MARCH_VSRC_FLATHIT      53u
+#define VOXEL_MARCH_VSRC_HIERHIT      54u
+// hitThin: over EVERY ray with a flat hit, was the hit's own brick clipped for
+// less than the advance nudge. THIS IS THE CONTROL, and it is the whole reason
+// the test can conclude anything -- a high thin share among disagreements says
+// nothing if thin clips are simply common. disThin is the same test restricted
+// to disagreeing rays. The claim is the LIFT of disThin/disHit over
+// hitThin/flatHit; either number alone is uninterpretable.
+#define VOXEL_MARCH_VSRC_HITTHIN      55u
+#define VOXEL_MARCH_VSRC_DISHIT       56u
+#define VOXEL_MARCH_VSRC_DISTHIN      57u
+// ---- THE BAND HISTOGRAM --------------------------------------------------
+// The boundary concentration (94%) was never evidence. A disagreement is
+// OBSERVABLE only where the two walks straddle a cell plane, so ANY
+// perturbation whatever -- bug, drift, rounding -- lands on boundaries by
+// construction. Mining that number for mechanism was mining a selection
+// effect, and it produced four hypotheses, three of which were real defects
+// and none of which moved the population.
+//
+// This measures the perturbation's MAGNITUDE instead, which is a fingerprint
+// rather than a clue. Per hit ray: the CHORD the ray cuts through the voxel
+// the flat walk hit, normalised by the chord a central crossing would have.
+//   d = (tExit - tEnter) / min_axis(voxelUU * |InvDir_axis|)
+// d near 1 is a clean crossing; d near 0 is a corner graze, where an
+// arbitrarily small t error changes the answer. Binned as leading decimal
+// zeros, so bin k means d is of order 1e-k.
+//
+// NOT distance-to-plane: the hit t IS the entry plane, so that metric reads
+// zero for every ray and measures nothing.
+//
+// WHAT IT SEPARATES CLEANLY: bins 0-1 (d >= 10% of a full crossing) CANNOT be
+// produced by any small perturbation -- a disagreement there is a logic error
+// of order a whole voxel. Bins >= 2 are the small-perturbation region.
+// WHAT IT DOES NOT SEPARATE, stated up front so the result is not over-read:
+// inside that region the advance nudge (1e-3 voxels -> bin 3) and accumulated
+// float drift (~1e-4..1e-2 depending on step count -> bins 2-4) OVERLAP. The
+// histogram cannot tell those two apart. The arbiter below can.
+//
+// Both columns are printed -- over ALL hit rays and over disagreeing rays --
+// for the same reason the coincidence test needed its control: a share without
+// a base rate concluded nothing there and would conclude nothing here.
+#define VOXEL_MARCH_VSRC_BANDBINS     12u
+#define VOXEL_MARCH_VSRC_BAND_ALL0    58u  // 58..69
+#define VOXEL_MARCH_VSRC_BAND_DIS0    70u  // 70..81
+// ---- THE INTEGER ARBITER -------------------------------------------------
+// Both walks are float walks, and the gate has been assuming the flat one is
+// truth. If the residual is drift, NEITHER is right and agreement is
+// unreachable by construction.
+//
+// The arbiter is a DIRECT, NON-ACCUMULATING computation of each candidate
+// voxel's entry t: one slab test from the ray origin, carrying O(1) ulp of
+// error against a walk's O(N) ulp. That is what makes it a higher-precision
+// reference for the same ray without needing doubles -- it is not a better
+// walk, it is not a walk at all.
+//
+// Per disagreeing ray it asks which candidate the ray GENUINELY enters first,
+// and confirms solidity in the pool rather than taking either walk's word:
+//   FLAT     flat's voxel is genuinely first, intersected and solid -- the
+//            hierarchy is genuinely wrong (this includes every `lost` ray,
+//            where the hierarchy offers no candidate at all)
+//   HIER     the hierarchy's voxel is genuinely first -- the FLAT walk is
+//            wrong, which the current gate cannot express
+//   TIE      the two entry t's are indistinguishable at float precision --
+//            genuinely ambiguous, no correct answer exists for this ray
+//   NEITHER  the winning candidate is not actually solid or not actually on
+//            the ray -- the comparison itself was ill-posed
+//
+// PRE-REGISTERED, both outcomes accepted before the number exists:
+//   mostly TIE  -> the residual is the resolution limit of float t.
+//                  Certification as defined is unachievable; redefine the gate
+//                  against the arbiter and stop.
+//   mostly FLAT -> a real bug remains, and every future fix now has an
+//                  arbiter to be tested against instead of a float walk
+//                  assuming its own correctness.
+#define VOXEL_MARCH_VSRC_ARB_FLAT     82u
+#define VOXEL_MARCH_VSRC_ARB_HIER     83u
+#define VOXEL_MARCH_VSRC_ARB_TIE      84u
+#define VOXEL_MARCH_VSRC_ARB_NEITHER  85u
+// The tie band is DERIVED, NOT CHOSEN: eight ulp of the larger entry t, which
+// is the scale at which two directly-computed t values stop being
+// distinguishable. It is not a knob and must not be tuned to move a verdict.
+#define VOXEL_MARCH_ARB_REL_EPS       (8.0f * 1.1920929e-7f)
+// ---- WHY THE ARBITER COULD NOT DECIDE -------------------------------------
+// 30-43% ill-posed on three legs of four. The arbiter refused to conclude, which
+// was the point, but "the comparison is faulty" is not yet a cause. THREE are
+// structurally possible and they have completely different fixes, so they get
+// counted rather than guessed:
+//
+//   DEGENERATE  the slab test returned exit <= entry for a voxel a walk really
+//               did hit -- a strict inequality on two nearly equal floats
+//               rejecting near-grazing rays. I recorded this as the SUSPECTED
+//               leading cause. IT WAS NOT. The actual cause was found in the
+//               sample dump: `gained` rays carry the flat walk's miss sentinel
+//               (doctrine 9b) and were being arbitrated as contests, giving
+//               ill-posed ~= gained on every leg. That is fixed by the
+//               contested/uncontested split, not by a tolerance. This bin stays
+//               so the residual can be measured rather than assumed away -- if
+//               it is now near zero, the suspicion was simply wrong.
+//   SEGMENT     the voxel lies outside [TIn, TOut]. Would mean the walk hit
+//               something the comparator's own segment excludes.
+//   NOTSOLID    the pool does not call the walk's hit voxel solid. That is a
+//               join between two readers of the same storage disagreeing, which
+//               is this project's most repeated failure -- so the probe's REASON
+//               is recorded, not just the fact.
+//
+// Per side: the INVALIDATING partition is 0 ok, 1 no candidate, 2 degenerate,
+// 5 notsolid. Bins 3 (before TIn) and 4 (after TOut) are NON-INVALIDATING
+// DIAGNOSTICS as of 2026-08-20 and OVERLAP bin 0 -- a candidate can be counted
+// there and still be valid. They do not partition and must not be summed with
+// the others.
+//
+// SEGMENT IS SPLIT BY DIRECTION and NOT otherwise touched. It dominates two
+// legs of three (1358 vs 73, 21 vs 1) and is a genuine second cause, but it
+// cannot be attributed while the degenerate rejection is still inflating the
+// population it draws from. Splitting it costs two slots and makes the next
+// leg readable without spending a round to learn only "which end".
+#define VOXEL_MARCH_VSRC_ARBFAIL_A0   86u  // 86..91
+#define VOXEL_MARCH_VSRC_ARBFAIL_B0   92u  // 92..97
+// The probe's own reason for side A, VOXEL_MARCH_REJECT_* indexed. Reason 0
+// (SOLID) appearing here would be a contradiction with class 4 and would mean
+// the probe is not deterministic.
+#define VOXEL_MARCH_VSRC_ARBFAIL_AR0  98u  // 98..104
+// Ill-posed rays binned by the SAME band metric. This is the direct test of the
+// degenerate hypothesis: if ill-posedness is a grazing artefact it concentrates
+// in the high bins and tracks the disagreement band; if it is spread flat across
+// bins the cause is not geometric and the probe join is the place to look.
+#define VOXEL_MARCH_VSRC_ARBFAIL_BAND0 105u // 105..116
+// CONSERVATION. The arbiter must classify EXACTLY the rays the shape terms
+// counted. If this does not equal lost+gained+moved, the arbiter is sampling a
+// different population than every other number on the page and none of them can
+// be compared -- a failure that has cost this investigation three false
+// conclusions in other guises.
+#define VOXEL_MARCH_VSRC_ARB_TOTAL    117u
+// UNCONTESTED OUTCOMES, split out because folding them into FLAT/HIER was a
+// real defect. A `gained` ray has NO flat candidate and a `lost` ray has no
+// hier candidate, so neither is a three-way contest -- and scoring them as
+// though they were manufactured `hier-correct` counts and, when the surviving
+// side also failed validity, manufactured `ill-posed` ones. Measured:
+// ill-posed ~= gained, leg after leg.
+#define VOXEL_MARCH_VSRC_ARB_FLATONLY 118u
+#define VOXEL_MARCH_VSRC_ARB_HIERONLY 119u
+// The LARGEST amount by which a candidate's directly-computed entry t exceeded
+// TOut, as asuint of a non-negative float via InterlockedMax. This is the whole
+// question about `afterTOut`: at 8-ulp scale (~5e-3 UU at these ranges) it is
+// the arbiter's own precision; at voxel scale (10 UU) it is a walk returning a
+// hit outside the segment it was given, which is a contract violation.
+#define VOXEL_MARCH_VSRC_SEGHI_MAXOVER 120u
+// ---- the ring cascade columns (P3-B2b-1) ---------------------------------
+// RING-DISCORDANT, pre-registered in VoxelMarchRenderer.h before the source
+// existed and NOT to be adjusted now that it can fire:
+//
+//   A compared pixel is RING-DISCORDANT if its hit distance t lies within
+//   +/- ONE CHUNK WIDTH of a ring transition radius, measured at the COARSER
+//   of the two levels meeting there.
+//
+// At the 128 m boundary the coarser level is 1, whose chunk is 32 * 0.2 m =
+// 6.4 m = 640 UU. Its own column, EXCLUDED from the gate, never folded into
+// agreement. It has read exactly zero through every level-0 leg, which was the
+// pre-registered self-test -- the classifier must not fire where no boundary
+// is crossed.
+#define VOXEL_MARCH_VSRC_RINGDISC     121u
+// Gate v4 split by the level the FLAT walk hit at. The 1.5x bar is a level-0
+// number and must not be inherited upward: a skipped brick is 0.8 m at level 0
+// and 1.6 m at level 1, and the whole reason B-2b-1 was approved past a FAIL is
+// that the LEVEL-DEPENDENCE of the asymmetry is the deliverable.
+#define VOXEL_MARCH_VSRC_FLATONLY_L0  122u  // 122..127
+#define VOXEL_MARCH_VSRC_HIERONLY_L0  128u  // 128..133
+// Rays whose hit landed in each ring, so the fingerprint can say which ring the
+// population came from. A leg that never reached ring 1 cannot say anything
+// about ring 1, and that must be visible rather than inferred.
+#define VOXEL_MARCH_VSRC_HITLVL0      134u  // 134..139
+// RAYS THAT RAN OUT OF STEPS rather than reaching a surface or the segment end.
+//
+// The budget was sized for a 51.2 m box. At the cascade's 256 m reach a ray
+// crosses ten times the distance for the same allowance, so "no hit" and "ran
+// out of allowance" become the same observation -- and hitL0 collapsing from
+// 349,750 to 27,998 while the reach INCREASED is exactly what that looks like.
+//
+// THIS IS AN INSTRUMENT, NOT A KNOB. The standing rule is that the budget is
+// not raised to make a number look better, and it is not raised here. What was
+// missing is the ability to tell a budget-limited leg from a traversal-limited
+// one at all: without this, a leg measuring its own allowance reports a ratio
+// and a hit count that look like properties of the walk.
+#define VOXEL_MARCH_VSRC_BUDGETFLAT   140u
+#define VOXEL_MARCH_VSRC_BUDGETHIER   141u
+// The largest step count either walk needed. Turns "the budget clipped us" from
+// a yes/no into the number required to stop clipping, so the decision about the
+// budget can be made from evidence instead of from a guess.
+#define VOXEL_MARCH_VSRC_MAXSTEPSFLAT 142u
+// ---- B: THE EARLY-OUT CENSUS ---------------------------------------------
+// Three ways a ray leaves before it is counted. `rays` halving between legs was
+// unattributable because nothing recorded WHICH gate dropped them, and the same
+// three gates are the leading explanation for the condition stamp going missing.
+// One counter each turns both questions into a grep.
+#define VOXEL_MARCH_VSRC_EARLYOUT0    143u  // outside the dispatch bounds
+#define VOXEL_MARCH_VSRC_EARLYOUT1    144u  // ray did not meet the volume at all
+#define VOXEL_MARCH_VSRC_EARLYOUT2    145u  // prepass depth clipped the segment away
+// ---- D: entered vs found ---------------------------------------------------
+// A zero hit count at level N has had a non-obvious cause four times. These
+// separate "the ray never got to ring N" from "it got there and found nothing",
+// which are different findings with different owners.
+#define VOXEL_MARCH_VSRC_ENTERED_L0   146u  // 146..151
+#define VOXEL_MARCH_VSRC_SKY          152u  // entered at least one ring, hit nothing
+// ---- F: provenance, STAMPED AT DISPATCH NOT AT PRINT ------------------------
+// The readback is asynchronous, so a frame number taken when the line prints
+// describes a different frame from the one measured. Stamped here, these belong
+// to the dispatch that produced the counts beside them -- which is the whole
+// point of being able to bucket two prints.
+#define VOXEL_MARCH_VSRC_FRAMENUM     153u
+#define VOXEL_MARCH_VSRC_QUIETFRAMES  154u
+// ---- THE ARM STAMP --------------------------------------------------------
+// WHAT THIS KERNEL WAS COMPILED WITH, written by the shader itself.
+//
+// The comparator ran rings-off for its entire existence while the CPU believed
+// it was running the cascade, and NOTHING IN THE OUTPUT COULD SAY SO -- the arm
+// was inferable only from a cvar the shader never saw. Three observations were
+// investigated as independent findings because of it.
+//
+// A cvar describes what was ASKED FOR. This describes what was COMPILED. They
+// are different objects and the difference is exactly the defect, so the log
+// carries both and errors when they disagree -- the same GPU/CPU join as the
+// residency stamp, applied to the configuration rather than to the data.
+//   bit 0     VOXEL_MARCH_RINGS
+//   bits 1-2  VOXEL_MARCH_SKIP_LEVELS
+//   bit 3     VOXEL_MARCH_SOURCE
+#define VOXEL_MARCH_VSRC_ARMSTAMP     155u
+// ATTRIBUTION GUARD. Both uncontested branches read the level from the arm that
+// HIT -- FLATONLY is gated on bAOk (so Brk.bHit) and HIERONLY on bBOk (so
+// Hier.bHit) -- so neither can read an unset level field. THAT IS AN ARGUMENT,
+// AND AN ARGUMENT IS NOT A MEASUREMENT. This counts any uncontested ray whose
+// attributing arm did not hit; it must be exactly 0 by construction, and if it
+// is ever non-zero the per-level split is silently landing everything on L0,
+// which is the shape that has now bitten this one probe three times.
+#define VOXEL_MARCH_VSRC_UNATTRIBUTED 156u
+// ---- WHERE THE BURST IS, IN SCREEN SPACE --------------------------------
+// Four legs of bursts with no surviving mechanism: no fixed print index, a
+// frozen world hash, thousands of quiet frames, and the sign FLIPS between
+// occurrences (r1 hierOnly 87,715 vs flatOnly 6,512; r2 flatOnly 12,495 vs
+// hierOnly 1,044). Every directional story died on the second leg.
+//
+// This splits the remaining space in half without needing a mechanism first:
+//
+//   FEW tiles, SMALL box  -> one contiguous region. A residency or upload
+//                            event: something about that part of the world.
+//   MANY tiles, LARGE box -> frame-wide scatter. Timing, a race, or something
+//                            per-wave -- nothing about the geometry there.
+//
+// A BOUNDING BOX ALONE CANNOT TELL THOSE APART: two clusters at opposite
+// corners give the same box as a frame-wide scatter. The tile mask is what
+// separates them, and the box is what says how far apart the occupied tiles
+// are. Both, or neither is worth reading.
+//
+// 16x16 tiles as a 256-bit mask, popcounted on the CPU.
+#define VOXEL_MARCH_VSRC_DISTILE0     157u  // 157..164, 256 bits
+// Screen-space extent of the disagreeing rays. minX/minY are stored INVERTED
+// (as W-x, H-y) and taken with InterlockedMax, because the buffer is cleared to
+// zero and an InterlockedMin against 0 can never move.
+#define VOXEL_MARCH_VSRC_DISBOX_NMINX 165u
+#define VOXEL_MARCH_VSRC_DISBOX_NMINY 166u
+#define VOXEL_MARCH_VSRC_DISBOX_MAXX  167u
+#define VOXEL_MARCH_VSRC_DISBOX_MAXY  168u
+#define VOXEL_MARCH_VSRC_HEADER       169u
+#define VOXEL_MARCH_VSRC_LOSTTERM0    24u  // 24..27
+#define VOXEL_MARCH_VSRC_LOSTPROBE0   28u  // 28..34
+
+#define VOXEL_MARCH_VSRC_SAMPLE_WORDS 11u
+#define VOXEL_MARCH_VSRC_SAMPLE_MAX    6u
+// ---------------------------------------------------------------------------
+// THE HIERARCHY DUMP -- brick stopped in vs brick containing the reported voxel
+// ---------------------------------------------------------------------------
+//
+// Pre-registered as the next instrument if `gained` survived a fix, and it did:
+// 47,092 -> 20,233 while `moved` went 64,353 -> 37,374 -- both roughly halving
+// rather than collapsing, which is what ONE OF TWO contributors sharing a
+// signature looks like. Guessing the second from a count is what this avoids.
+//
+// Per ray: the flat walk's voxel, the hierarchy's voxel, and the BRICK each
+// belongs to (voxel >> 3). Same brick means the walk descended correctly and
+// stopped on the wrong cell -- a stepping error. Different bricks mean it read
+// one brick's occupancy for a voxel in another -- an aliasing error.
+//
+// Containment is now decided in INTEGER voxel space, so the aliasing case
+// cannot occur by construction. That makes this block the CHECK on that claim
+// rather than merely a diagnostic: a mismatched pair here means some path is
+// still bypassing the integer test.
+#define VOXEL_MARCH_VSRC_HVF_CLAIMED \
+	(VOXEL_MARCH_VSRC_HEADER + VOXEL_MARCH_VSRC_SAMPLE_MAX * VOXEL_MARCH_VSRC_SAMPLE_WORDS)
+#define VOXEL_MARCH_VSRC_HVF_BASE   (VOXEL_MARCH_VSRC_HVF_CLAIMED + 1u)
+#define VOXEL_MARCH_VSRC_HVF_WORDS  24u
+// 64, NOT 6. Recent runs disagree on 15 and 100 rays out of ~1.35M -- a
+// LISTABLE population. Six samples could show a mechanism; sixty-four can
+// characterise the whole defect in one run, which is what same-frame
+// certification needs and what cross-run comparison could never give us.
+#define VOXEL_MARCH_VSRC_HVF_MAX    64u
+
+#define VOXEL_MARCH_VSRC_WORDS \
+	(VOXEL_MARCH_VSRC_HVF_BASE + VOXEL_MARCH_VSRC_HVF_MAX * VOXEL_MARCH_VSRC_HVF_WORDS)
+
+#ifndef VOXEL_MARCH_VSRC_ALLOC_WORDS
+// Offline fallback for tools/voxel-check-marchdraw-shader.ps1 only. The engine
+// build is told the real allocation by
+// FVoxelMarchVerifySourceCS::ModifyCompilationEnvironment.
+#define VOXEL_MARCH_VSRC_ALLOC_WORDS VOXEL_MARCH_VSRC_WORDS
+#endif
+
+// SAME FIT CHECK AS THE INDEX PROBE, on the far larger contract. Until now this
+// join was kept honest by a script run by hand after every edit -- which worked,
+// and which is exactly the kind of guarantee that holds until the night someone
+// is tired. A negative array extent makes it the compiler's problem.
+static const int VoxelMarchVSrcFits[(VOXEL_MARCH_VSRC_WORDS <= VOXEL_MARCH_VSRC_ALLOC_WORDS)
+                                        ? 1 : -1] = { 0 };
+
+// vxc::MAT_WATERMARK. Mirrored from materialpalette.h's ordering, where it is
+// the last terrain material before the asset block begins at
+// VOXEL_MATERIAL_FIRST_ASSET (16).
+#define VOXEL_MARCH_MAT_WATERMARK 15u
+
+// The spike's own constants, reused rather than re-chosen. Widening either would
+// start excusing genuine defects, and both were argued for at length there.
+#define VOXEL_MARCH_VSRC_TIE_SEPARATION_UU 0.5f
+// Entry displacement for the noise control, in UU. The spike's figure, and it
+// perturbs the arithmetic history of the whole walk rather than a thin
+// far-field slice -- see the control's own note.
+#define VOXEL_MARCH_VSRC_NOISE_ENTRY_UU    1e-6f
+
+RWBuffer<uint> MarchOutVerifySource;
+
+// Was the flat walk's hit brick ever descended into by the hierarchy? Read from
+// the descent MASK, so a later descent cannot mask an earlier one.
+uint VoxelMarchDescendVerdict(FVoxelMarchHit Flat, FVoxelMarchHit Hier)
+{
+	const int3 FlatChunk = int3(Flat.Voxel.x >> 5, Flat.Voxel.y >> 5, Flat.Voxel.z >> 5);
+	if (any(FlatChunk != Hier.FineMaskChunk))
+	{
+		return 2u;   // inconclusive: the mask describes a different chunk
+	}
+	const int Idx = VoxelMarchBrickIndex(Flat.Voxel);
+	const uint Word = (Idx < 32) ? Hier.FineBrickMask.x : Hier.FineBrickMask.y;
+	// lint-shader-ub: allow VARIABLE_SHIFT - Idx is 0..63 and the shift is masked to 0..31
+	return ((Word & (1u << (uint(Idx) & 31u))) != 0u) ? 1u : 0u;
+}
+// 1 only while the march frame IS the fluid volume's frame. The occupancy walk
+// resolves world voxels as `localStart + FluidVolumeOriginVoxel`
+// (VoxelFluidCollision.ush:325), so under the camera-anchored frame source 1
+// now uses, that walk would address the wrong voxels entirely. Gated rather
+// than left to produce confident nonsense.
+int MarchOccValid;
+// voxel.March.MutateCounters -- THE MUTATION ARM FOR THE CONSERVATION CHECK.
+//
+// A CHECK THAT HAS NEVER FAILED IS NOT YET KNOWN TO BE A CHECK. The conservation
+// test has passed on every leg including one that looked arithmetically
+// impossible, which is exactly the state in which a reader starts trusting it.
+//
+// Set this and the shader deliberately breaks one relationship -- one extra
+// count into HVF_LOST, so lost+gained+moved no longer equals disagree. If the
+// report does not then print COUNTER CONSERVATION FAILED, the check is decorative
+// and every number it has ever blessed is unverified.
+//
+// Corrupted in the SHADER rather than in the decode, so the arm exercises the
+// whole path: slot layout, readback, and decode alignment -- not just the C++
+// arithmetic.
+int MarchMutateCounters;
+// Resident level-0 chunks in the index, and the index's upload counter, both as
+// of THIS dispatch. Written into the output so they land with the counts.
+int MarchIndexResidency;
+int MarchIndexUploads;
+uint2 MarchIndexHash;
+// F: provenance for THIS dispatch. Stamped into the buffer beside the counts so
+// two prints can be bucketed or rejected, rather than compared by eye.
+uint MarchFrameNumber;
+int  MarchQuietFrames;
+int MarchPoolLevel0;
+
+[numthreads(VOXEL_MARCH_TILE_SIZE, VOXEL_MARCH_TILE_SIZE, 1)]
+void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int2 LocalPixel = int2(DispatchThreadId.xy);
+
+	// ---- A: THE CONDITION STAMP, ABOVE EVERY EARLY-OUT ---------------------
+	//
+	// This used to sit AFTER three `return`s, gated on pixel (0,0) surviving all
+	// of them -- so a diagnostic whose entire job is to identify the
+	// configuration was conditioned on the geometry it was describing. When the
+	// cascade changed the corner ray, every stamped field went to zero together
+	// and the index hash read 0x0 on three legs.
+	//
+	// Thread (0,0) of the dispatch is issued unconditionally. NOTHING ABOVE THIS
+	// POINT MAY RETURN, and nothing that can return may be added above it.
+	if (all(DispatchThreadId.xy == uint2(0, 0)))
+	{
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_RESIDENCY] = uint(max(MarchIndexResidency, 0));
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_UPLOADS] = uint(max(MarchIndexUploads, 0));
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_HASHLO] = MarchIndexHash.x;
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_HASHHI] = MarchIndexHash.y;
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_POOLL0] = uint(max(MarchPoolLevel0, 0));
+		// Stamped at DISPATCH, not read at print: the readback is asynchronous,
+		// so a frame number taken when the line prints describes a different
+		// frame from the one measured.
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_FRAMENUM] = MarchFrameNumber;
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_QUIETFRAMES] = uint(max(MarchQuietFrames, 0));
+		MarchOutVerifySource[VOXEL_MARCH_VSRC_ARMSTAMP] =
+			(uint(VOXEL_MARCH_RINGS != 0) << 0u) |
+			((uint(VOXEL_MARCH_SKIP_LEVELS) & 3u) << 1u) |
+			(uint(VOXEL_MARCH_SOURCE != 0) << 3u);
+	}
+
+	// ---- B: THE EARLY-OUT CENSUS -------------------------------------------
+	// Counted where each gate fires, so "rays halved" names its gate rather than
+	// needing a hypothesis.
+	if (any(LocalPixel >= int2(MarchViewRectSize)))
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_EARLYOUT0], 1u);
+		return;
+	}
+
+	const float2 SvPositionXY = MarchViewRectMin + float2(LocalPixel) + 0.5f;
+	const FVoxelMarchRay Ray = VoxelMarchBuildRay(SvPositionXY);
+	if (!Ray.bValid)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_EARLYOUT1], 1u);
+		return;
+	}
+
+	// The SAME t_max the march applies, including the prepass-depth clip. A
+	// comparator that marched a longer segment than the renderer does would
+	// report disagreements on geometry the renderer never looks at.
+	float TMax = Ray.TExitUU;
+	if (MarchHasPrepassDepth != 0)
+	{
+		const float DeviceZ = MarchSceneDepthTexture.Load(int3(int2(SvPositionXY), 0)).r;
+		const float SceneViewZ = VoxelMarchSceneViewZ(DeviceZ);
+		TMax = min(TMax, SceneViewZ / max(Ray.ViewZPerUU, 1e-6f));
+	}
+	if (TMax <= Ray.TEnterUU)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_EARLYOUT2], 1u);
+		return;
+	}
+	const float TIn = Ray.TEnterUU + VOXEL_MARCH_BOX_INSET_UU;
+	const float TOut = max(TMax - VOXEL_MARCH_BOX_INSET_UU, TIn);
+
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_RAYS], 1u);
+	if (MarchMutateCounters != 0 && all(LocalPixel == int2(0, 0)))
+	{
+		// One extra `lost` that no ray produced. The split sums must now disagree
+		// with their parent, and the check must say so.
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HVF_LOST], 1u);
+	}
+
+	// THE COMPARATOR MUST WALK WHAT THE MARCHER WALKS.
+	//
+	// These two calls went STRAIGHT to the single-level walks, bypassing
+	// VoxelMarchTraverseRings entirely -- VoxelMarchTraverse (line ~455, the
+	// march kernel) was its only caller. So with rings on, every ring number on
+	// the page was computed by a NON-RING comparator: hitL1 read 0 because no
+	// ray was ever walked at level 1, ringDiscordant read 0 for the same reason,
+	// and the per-level gate was splitting a population that had only one level
+	// in it. NONE OF THAT WAS A RING DEFECT; the ring path was never exercised.
+	//
+	// The flat arm is the ring cascade WITHOUT skipping, which is what the plan
+	// specified and what keeps the ratio meaningful: a level-0 flat walk across
+	// the whole reach would be 2,560 voxel steps and would inflate the ratio
+	// into meaninglessness. Both arms cross the same rings; only skipping
+	// differs.
+#if VOXEL_MARCH_RINGS
+	const FVoxelMarchHit Brk =
+		VoxelMarchTraverseRings(Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, 0.0f, false,
+		                        int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF), -1);
+#else
+	const FVoxelMarchHit Brk =
+		VoxelMarchTraverseBrick(Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, 0.0f);
+#endif
+	// The hierarchical walk, on the identical ray. Its step count against Brk's
+	// IS the skip ratio; its hit against Brk's is the gate on it.
+	// The flat walk ran first, so its hit names the chunk the descent mask must
+	// describe. Without this the mask followed whatever chunk the ray finished
+	// in, which for a `lost` ray is never the one being asked about.
+	const int3 WatchChunk = Brk.bHit
+	                            ? int3(Brk.Voxel.x >> 5, Brk.Voxel.y >> 5, Brk.Voxel.z >> 5)
+	                            : int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+#if VOXEL_MARCH_RINGS
+	// C: the descent mask works under rings now. The watch is armed at the level
+	// the FLAT walk hit and nowhere else -- a chunk coordinate names a different
+	// place at each level, so arming it on the wrong ring would fill the mask
+	// with a confident wrong answer rather than leave it honestly empty.
+	const FVoxelMarchHit Hier =
+		VoxelMarchTraverseRings(Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, 0.0f, true,
+		                        WatchChunk, Brk.bHit ? Brk.Level : -1);
+#else
+	const FVoxelMarchHit Hier = VoxelMarchTraverseBrickHierWatch(
+		Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, 0.0f, WatchChunk);
+#endif
+
+	// Summed, not histogrammed: the deliverable is a mean ratio over the frame,
+	// and a per-ray distribution is a later question. uint32 holds it -- 1.3M
+	// rays at a few hundred steps is ~1e8, well inside range, and the readback
+	// would show a wrap as a ratio that made no sense rather than as a plausible
+	// number.
+	// stepsOcc is a property of the OCCUPANCY walk and only exists when that walk
+	// runs; it is accumulated below, inside the gate. The two that matter to the
+	// skip ratio are brick-only and are counted here unconditionally.
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_STEPS_FLAT], uint(max(Brk.Steps, 0)));
+	// One atomic per ray, not per brick: the traversal accumulated these locally.
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BRICKENTRIES],
+	               uint(max(Hier.BrickEntries, 0)));
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_THINCLIPS],
+	               uint(max(Hier.ThinClips, 0)));
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_STEPS_HIER], uint(max(Hier.Steps, 0)));
+	// TWO WALKS, TWO WAYS OF SAYING "I RAN OUT", AND THIS ONLY WATCHED ONE.
+	//
+	// VoxelMarchTraverseBrick sets H.bExhausted when its step loop ends and
+	// NEVER sets TermReason; the hierarchical walk sets TermReason = BUDGET and
+	// never sets bExhausted. Testing only TermReason therefore reported 0.0%
+	// budget exhaustion on a leg where the FLAT REFERENCE was being clipped on
+	// essentially every ray -- the budget is 886 and a level-0 ray across 256 m
+	// needs at least 2,560. The instrument was blind to the arm that mattered
+	// and its silence was read as evidence.
+	//
+	// Both fields are now consulted for both walks. A walk that ran out must be
+	// unable to say so in a way this misses.
+	if (Brk.TermReason == VOXEL_MARCH_TERM_BUDGET || Brk.bExhausted)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BUDGETFLAT], 1u);
+	}
+	if (Hier.TermReason == VOXEL_MARCH_TERM_BUDGET || Hier.bExhausted)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BUDGETHIER], 1u);
+	}
+	InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_MAXSTEPSFLAT],
+	               uint(max(Brk.Steps, 0)));
+	// ---- D: entered vs found ------------------------------------------------
+	// The ring loop recorded which intervals it actually opened. entered==0 for
+	// a level means no ray reached it; entered set with no hit means rays got
+	// there and found nothing. Four separate investigations have turned on that
+	// distinction and it was inferred every time.
+	{
+		[unroll]
+		for (uint EL = 0u; EL < VOXEL_MARCH_MAX_RINGS; ++EL)
+		{
+			if ((Brk.RingsEntered & (1u << EL)) != 0u)
+			{
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ENTERED_L0 + EL], 1u);
+			}
+		}
+		if (!Brk.bHit && Brk.RingsEntered != 0u)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_SKY], 1u);
+		}
+	}
+
+	// ---- THE COINCIDENCE TEST -------------------------------------------
+	//
+	// (8)'s corner-clip diagnosis says a brick clipped for less than the advance
+	// nudge is jumped entirely. The N=6 normalisation could not test it: it
+	// summed thin clips over ALL rays and divided a PER-RAY verdict by that, so
+	// nothing ever established that a disagreement and a thin clip happen on the
+	// same ray -- let alone the same brick.
+	//
+	// This asks directly, and IN CLOSED FORM: a slab test on the brick the FLAT
+	// walk hit, computed from the ray alone. Two properties that a walk-side
+	// counter cannot have:
+	//   - it consults NEITHER walk, so the defect being measured cannot bend the
+	//     measurement;
+	//   - it answers for bricks the hierarchy NEVER ENTERED, which is exactly
+	//     the case the mechanism describes and exactly the case a counter
+	//     incremented inside the brick loop can never reach.
+	//
+	// Both walks are already done here, so this reads only Brk's hit voxel.
+	uint bHitBrickThin = 0u;
+	// The band bin for this ray, computed once and used by both columns. 12 is
+	// the "no hit, nothing to say" value and is never written to a bin.
+	uint BandBin = VOXEL_MARCH_VSRC_BANDBINS;
+	const float3 InvDirW = 1.0f / VoxelMarchSafeDir(Ray.DirWorld);
+	if (Brk.bHit)
+	{
+		const int3 HitBrickMin =
+			int3(Brk.Voxel.x >> 3, Brk.Voxel.y >> 3, Brk.Voxel.z >> 3) << 3;
+		const float TFar = VoxelMarchCellExitT(Ray.OriginLocalUU, InvDirW, HitBrickMin, 3);
+		const float TNear = VoxelMarchCellEnterT(Ray.OriginLocalUU, InvDirW, HitBrickMin, 3);
+		bHitBrickThin = ((TFar - TNear) < VOXEL_MARCH_HIER_NUDGE_UU) ? 1u : 0u;
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_FLATHIT], 1u);
+		if (bHitBrickThin != 0u)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HITTHIN], 1u);
+		}
+
+		// ---- band: the normalised chord through the HIT VOXEL (level 0) ----
+		const float VNear = VoxelMarchCellEnterT(Ray.OriginLocalUU, InvDirW, Brk.Voxel, 0);
+		const float VFar  = VoxelMarchCellExitT(Ray.OriginLocalUU, InvDirW, Brk.Voxel, 0);
+		// The chord a CENTRAL crossing would cut: the dominant axis has the
+		// largest |D| and therefore the smallest |InvDir|, so the minimum over
+		// axes is the full-crossing time. Normalising by it makes d
+		// dimensionless and direction-independent.
+		const float3 AxisCross = VOXEL_FLUID_VOXEL_UU * abs(InvDirW);
+		const float FullCross = min(min(AxisCross.x, AxisCross.y), AxisCross.z);
+		const float Chord = max(VFar - VNear, 0.0f);
+		const float D = (FullCross > 0.0f) ? saturate(Chord / FullCross) : 0.0f;
+		// Leading decimal zeros. 1e-12 floors it so log10 cannot return -inf.
+		BandBin = uint(clamp(int(floor(-log10(max(D, 1e-12f)))), 0,
+		                     int(VOXEL_MARCH_VSRC_BANDBINS) - 1));
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BAND_ALL0 + BandBin], 1u);
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HITLVL0 +
+		                                   uint(clamp(Brk.Level, 0,
+		                                              int(VOXEL_MARCH_MAX_RINGS) - 1))], 1u);
+
+		// ---- RING-DISCORDANT ------------------------------------------------
+		// Pre-registered before the source existed; read, never adjusted. The
+		// band half-width is ONE CHUNK AT THE COARSER LEVEL -- for the boundary
+		// between ring L and ring L+1 that is 32 voxels of level L+1, i.e.
+		// 32 * VOXEL_FLUID_VOXEL_UU * 2^(L+1).
+		{
+			bool bDiscordant = false;
+			const uint RingCount = min(MarchRingCount, 4u);
+			[loop]
+			for (uint B = 0; B + 1u < RingCount; ++B)
+			{
+				// Same closed form the traversal uses, so the classifier and the
+				// walk cannot disagree about where a boundary is.
+				const float Radius = VoxelMarchRingOuterUU(B);
+				const float HalfBand = 32.0f * VOXEL_FLUID_VOXEL_UU * float(1u << (B + 1u));
+				if (abs(Brk.THitUU - Radius) <= HalfBand)
+				{
+					bDiscordant = true;
+				}
+			}
+			if (bDiscordant)
+			{
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_RINGDISC], 1u);
+			}
+		}
+	}
+	if (Hier.bHit)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HIERHIT], 1u);
+	}
+
+	if (Hier.bHit != Brk.bHit || (Brk.bHit && any(Hier.Voxel != Brk.Voxel)))
+	{
+		// The restricted arm of the test above. Gated on Brk.bHit for the same
+		// reason the control is: with no flat hit there is no brick to ask about,
+		// and folding those rays in would dilute both sides unequally.
+		if (Brk.bHit)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISHIT], 1u);
+			if (bHitBrickThin != 0u)
+			{
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISTHIN], 1u);
+			}
+			// Same bin, restricted arm. BandBin was computed above from the
+			// identical expression, so the two columns cannot drift apart.
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BAND_DIS0 + BandBin], 1u);
+		}
+
+		// ---- THE ARBITER ------------------------------------------------
+		// Direct slab tests only. Neither walk is consulted, and solidity is
+		// taken from the pool rather than from either walk's claim -- which is
+		// what lets this contradict the FLAT walk, something the gate as built
+		// cannot do.
+		{
+			float TA = 0.0f;
+			float TB = 0.0f;
+			bool bAOk = false;
+			bool bBOk = false;
+			// FIRST failure, in a fixed order, so the class is deterministic and
+			// a ray never counts against two causes: 2 degenerate, 3 segment,
+			// 4 not solid in the pool.
+			uint ClassA = 0u;
+			uint ClassB = 0u;
+			uint ReasonA = 0u;
+			if (Brk.bHit)
+			{
+				const float N = VoxelMarchCellEnterT(Ray.OriginLocalUU, InvDirW, Brk.Voxel, 0);
+				const float F = VoxelMarchCellExitT(Ray.OriginLocalUU, InvDirW, Brk.Voxel, 0);
+				TA = N;
+				ReasonA = VoxelMarchBrickProbeVoxel(Brk.Voxel);
+				// THE TOLERANCE, applied. A strict F > N rejected near-grazing
+				// rays -- the exact population the arbiter exists to judge, since
+				// disagreements concentrate there. The band is the SAME 8 ulp
+				// already derived for the tie test, not a new number, and it is
+				// four orders of magnitude below a genuine miss (a real miss has
+				// F - N of order a voxel; 8 ulp at these ranges is ~5e-4 voxels),
+				// so it cannot admit one.
+				const float SpanTolA = max(abs(N), abs(F)) * VOXEL_MARCH_ARB_REL_EPS;
+				if (!((F - N) > -SpanTolA))          { ClassA = 2u; }
+				// THE SAME 8 ULP, on the other two strict comparisons. Applying
+				// it to the span alone was fixing one of three instances of one
+				// defect. AND THE FAR BOUND IS THE ONE THAT MATTERS: TOut is
+				// TMax - BOX_INSET where TMax is the PREPASS DEPTH -- the raster
+				// surface the walks are hitting. So TOut sits 1/200 of a voxel in
+				// FRONT of the very surface every hit lands on, and `N < TOut`
+				// fails systematically for hits at that surface. TIn is pinned to
+				// nothing, which is why beforeTIn measured EXACTLY 0 against
+				// afterTOut's 648: the asymmetry is in what the bounds are made
+				// of, not in the rays.
+				else if (ReasonA != VOXEL_MARCH_REJECT_SOLID) { ClassA = 5u; }
+				else                                 { bAOk = true; }
+				// SEGMENT IS NO LONGER A VALIDITY TEST. It re-decided, with an
+				// independent computation, something the walk had ALREADY
+				// guaranteed: a walk given [TIn, TOut] that returns a hit has
+				// bounded it. Re-deriving that and letting the re-derivation
+				// overrule the walk is doctrine 5 -- a second authority for one
+				// decision -- and it cannot be fixed by widening the tolerance,
+				// because the excess does not come from the arbiter's precision.
+				// The arbiter recomputes entry t directly, O(1) ulp. The WALK
+				// accumulates, O(N) ulp. Over a long ray the walk's own drift is
+				// an order of magnitude past any 8-ulp band, so a tolerance sized
+				// to the arbiter would be tuning one instrument's constant to
+				// absorb another's error. THAT is why it collapsed in the small
+				// legs and grew to 1,221 in the long one: it scales with path
+				// length, not with anything about correctness.
+				//
+				// Kept as a COUNTER, with its magnitude, because a large overshoot
+				// at VOXEL scale would be a genuine contract violation rather than
+				// drift -- and that distinction is exactly what the count alone
+				// could never make.
+				if (Brk.bHit)
+				{
+					if (!(F > TIn - SpanTolA))
+					{
+						InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_A0 + 3u], 1u);
+					}
+					if (!(N < TOut + SpanTolA))
+					{
+						InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_A0 + 4u], 1u);
+						InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_SEGHI_MAXOVER],
+						               asuint(max(N - TOut, 0.0f)));
+					}
+				}
+			}
+			if (Hier.bHit)
+			{
+				const float N = VoxelMarchCellEnterT(Ray.OriginLocalUU, InvDirW, Hier.Voxel, 0);
+				const float F = VoxelMarchCellExitT(Ray.OriginLocalUU, InvDirW, Hier.Voxel, 0);
+				TB = N;
+				const uint RB = VoxelMarchBrickProbeVoxel(Hier.Voxel);
+				const float SpanTolB = max(abs(N), abs(F)) * VOXEL_MARCH_ARB_REL_EPS;
+				if (!((F - N) > -SpanTolB))          { ClassB = 2u; }
+				else if (RB != VOXEL_MARCH_REJECT_SOLID) { ClassB = 5u; }
+				else                                 { bBOk = true; }
+				if (Hier.bHit)
+				{
+					if (!(F > TIn - SpanTolB))
+					{
+						InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_B0 + 3u], 1u);
+					}
+					if (!(N < TOut + SpanTolB))
+					{
+						InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_B0 + 4u], 1u);
+						InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_SEGHI_MAXOVER],
+						               asuint(max(N - TOut, 0.0f)));
+					}
+				}
+			}
+			// The failure class per side, computed from the SAME predicates the
+			// validity test used so the two can never disagree.
+			const uint ClsA = !Brk.bHit  ? 1u : (bAOk ? 0u : ClassA);
+			const uint ClsB = !Hier.bHit ? 1u : (bBOk ? 0u : ClassB);
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_A0 + ClsA], 1u);
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_B0 + ClsB], 1u);
+			if (ClsA == 5u)
+			{
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_AR0 + ReasonA], 1u);
+			}
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_ARB_TOTAL], 1u);
+			uint ArbSlot = VOXEL_MARCH_VSRC_ARB_NEITHER;
+			if (bAOk && bBOk)
+			{
+				const float Tol = max(abs(TA), abs(TB)) * VOXEL_MARCH_ARB_REL_EPS;
+				ArbSlot = (abs(TA - TB) <= Tol)
+				              ? VOXEL_MARCH_VSRC_ARB_TIE
+				              : ((TA < TB) ? VOXEL_MARCH_VSRC_ARB_FLAT
+				                           : VOXEL_MARCH_VSRC_ARB_HIER);
+			}
+			// UNCONTESTED: exactly one walk offered a candidate at all. This is
+			// the ordinary shape of `lost` and `gained`, not a failure, and it
+			// must never be scored as one side winning a contest that never
+			// happened.
+			else if (bAOk) { ArbSlot = Hier.bHit ? VOXEL_MARCH_VSRC_ARB_FLAT
+			                                     : VOXEL_MARCH_VSRC_ARB_FLATONLY; }
+			else if (bBOk) { ArbSlot = Brk.bHit  ? VOXEL_MARCH_VSRC_ARB_HIER
+			                                     : VOXEL_MARCH_VSRC_ARB_HIERONLY; }
+			// The uncontested outcomes, split by the level they happened at.
+			// Level comes from whichever walk actually hit -- for flat-only that
+			// is the flat walk, for hier-only the hierarchy.
+			if (ArbSlot == VOXEL_MARCH_VSRC_ARB_FLATONLY)
+			{
+				if (!Brk.bHit)
+				{
+					InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_UNATTRIBUTED], 1u);
+				}
+				const uint FL = uint(clamp(Brk.Level, 0, int(VOXEL_MARCH_MAX_RINGS) - 1));
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_FLATONLY_L0 + FL], 1u);
+			}
+			else if (ArbSlot == VOXEL_MARCH_VSRC_ARB_HIERONLY)
+			{
+				if (!Hier.bHit)
+				{
+					InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_UNATTRIBUTED], 1u);
+				}
+				const uint HL = uint(clamp(Hier.Level, 0, int(VOXEL_MARCH_MAX_RINGS) - 1));
+				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HIERONLY_L0 + HL], 1u);
+			}
+			InterlockedAdd(MarchOutVerifySource[ArbSlot], 1u);
+			// Ill-posed rays against the band. The direct test of whether
+			// ill-posedness is a grazing artefact: if it is, this histogram
+			// leans to the high bins exactly as the disagreement band does.
+			if (ArbSlot == VOXEL_MARCH_VSRC_ARB_NEITHER &&
+			    BandBin < VOXEL_MARCH_VSRC_BANDBINS)
+			{
+				InterlockedAdd(
+					MarchOutVerifySource[VOXEL_MARCH_VSRC_ARBFAIL_BAND0 + BandBin], 1u);
+			}
+		}
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HIER_VS_FLAT], 1u);
+		// ---- the burst's shape, recorded on EVERY disagreeing ray ----------
+		{
+			const uint2 Sz = max(uint2(MarchViewRectSize), uint2(1u, 1u));
+			const uint TileX = min((uint(LocalPixel.x) * 16u) / Sz.x, 15u);
+			const uint TileY = min((uint(LocalPixel.y) * 16u) / Sz.y, 15u);
+			const uint Bit = TileY * 16u + TileX;
+			InterlockedOr(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISTILE0 + (Bit >> 5u)],
+			              1u << (Bit & 31u));
+			InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISBOX_MAXX],
+			               uint(LocalPixel.x));
+			InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISBOX_MAXY],
+			               uint(LocalPixel.y));
+			InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISBOX_NMINX],
+			               Sz.x - uint(LocalPixel.x));
+			InterlockedMax(MarchOutVerifySource[VOXEL_MARCH_VSRC_DISBOX_NMINY],
+			               Sz.y - uint(LocalPixel.y));
+		}
+		// Which of the two populations this ray belongs to. One test, reused by
+		// both terms below.
+		const uint3 Cell = uint3(uint(Brk.Voxel.x) & 7u, uint(Brk.Voxel.y) & 7u,
+		                         uint(Brk.Voxel.z) & 7u);
+		const bool bOnBrickFace = any(Cell == 0u) || any(Cell == 7u);
+
+		if (Brk.bHit && !Hier.bHit)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HVF_LOST], 1u);
+			InterlockedAdd(MarchOutVerifySource[bOnBrickFace
+			                                        ? VOXEL_MARCH_VSRC_LOST_ONFACE
+			                                        : VOXEL_MARCH_VSRC_LOST_OFFFACE], 1u);
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_DESCEND0 +
+			                                   VoxelMarchDescendVerdict(Brk, Hier)], 1u);
+			// Over EVERY lost ray, not the six sampled: six samples can show a
+			// mechanism but cannot say whether it is the mechanism for all 457.
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_LOSTTERM0 +
+			                                   min(uint(Hier.TermReason), 3u)], 1u);
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_LOSTPROBE0 +
+			                                   VoxelMarchBrickProbeVoxel(Brk.Voxel)], 1u);
+		}
+		else if (!Brk.bHit && Hier.bHit)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HVF_GAINED], 1u);
+		}
+		else
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HVF_MOVED], 1u);
+			InterlockedAdd(MarchOutVerifySource[bOnBrickFace
+			                                        ? VOXEL_MARCH_VSRC_MOVED_ONFACE
+			                                        : VOXEL_MARCH_VSRC_MOVED_OFF], 1u);
+			{
+				const int3 D = Hier.Voxel - Brk.Voxel;
+				const int3 A = abs(D);
+				const bool bOneVoxel = (A.x + A.y + A.z) == 1;
+				const bool bAhead = Hier.THitUU > Brk.THitUU;
+				const uint Bin = bOneVoxel
+				                     ? (bAhead ? VOXEL_MARCH_VSRC_MOVED_AHEAD1
+				                               : VOXEL_MARCH_VSRC_MOVED_BEHIND1)
+				                     : VOXEL_MARCH_VSRC_MOVED_OTHER;
+				InterlockedAdd(MarchOutVerifySource[Bin], 1u);
+			}
+		}
+
+		uint HClaim = 0u;
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HVF_CLAIMED], 1u, HClaim);
+		if (HClaim < VOXEL_MARCH_VSRC_HVF_MAX)
+		{
+			const uint S = VOXEL_MARCH_VSRC_HVF_BASE + HClaim * VOXEL_MARCH_VSRC_HVF_WORDS;
+			MarchOutVerifySource[S + 0u] = uint(LocalPixel.x);
+			MarchOutVerifySource[S + 1u] = uint(LocalPixel.y);
+			MarchOutVerifySource[S + 2u] = uint(Brk.Voxel.x);
+			MarchOutVerifySource[S + 3u] = uint(Brk.Voxel.y);
+			MarchOutVerifySource[S + 4u] = uint(Brk.Voxel.z);
+			MarchOutVerifySource[S + 5u] = uint(Hier.Voxel.x);
+			MarchOutVerifySource[S + 6u] = uint(Hier.Voxel.y);
+			MarchOutVerifySource[S + 7u] = uint(Hier.Voxel.z);
+			MarchOutVerifySource[S + 8u] = asuint(Brk.THitUU);
+			MarchOutVerifySource[S + 9u] = asuint(Hier.THitUU);
+			// 0 lost, 1 gained, 2 moved -- carried with the record so a sample
+			// never has to be joined back to a tally by hand.
+			MarchOutVerifySource[S + 10u] =
+				(Brk.bHit && !Hier.bHit) ? 0u : ((!Brk.bHit && Hier.bHit) ? 1u : 2u);
+			// ---- the `lost` half, which the first dump could not see -------
+			//
+			// On a miss the hierarchy has no hit voxel, so the brick comparison
+			// above compares against chunk (0,0,0) and says nothing. These five
+			// fields are what separate the three possibilities:
+			//
+			//   term=SEGMENT + probe=SOLID   it walked the whole ray past a voxel
+			//                                the pool calls solid -> it SKIPPED.
+			//   term=SEGMENT + probe=L1/AIR  it walked past because the hierarchy
+			//                                data says empty -> a mask/descriptor
+			//                                disagreement, not a stepping one.
+			//   term=BUDGET                  it never got there. Neither a skip
+			//                                nor an under-run, and invisible in
+			//                                every count taken so far.
+			//   term=CHUNK_CAP               the outer loop cap fired, which a
+			//                                correct walk cannot reach.
+			//
+			// lastChunk/lastBrick say WHERE it gave up, so "stopped one brick
+			// short" is distinguishable from "was nowhere near".
+			MarchOutVerifySource[S + 11u] = uint(Hier.TermReason);
+			MarchOutVerifySource[S + 12u] = uint(max(Hier.Steps, 0));
+			MarchOutVerifySource[S + 13u] = VoxelMarchBrickProbeVoxel(Brk.Voxel);
+			MarchOutVerifySource[S + 14u] = uint(Hier.LastChunkCoord.x);
+			MarchOutVerifySource[S + 15u] = uint(Hier.LastChunkCoord.y);
+			MarchOutVerifySource[S + 16u] = uint(Hier.LastChunkCoord.z);
+			MarchOutVerifySource[S + 17u] = uint(Hier.LastBrickIndex);
+			// Whether it DESCENDED, and from where. lastBrick says which brick
+			// the walk looked at; these say which one it actually walked and at
+			// what t -- the distinction the r6 dump could not make.
+			MarchOutVerifySource[S + 18u] = uint(Hier.LastFineBrickIndex);
+			MarchOutVerifySource[S + 19u] = asuint(Hier.LastFineEntryT);
+			MarchOutVerifySource[S + 20u] = uint(max(Hier.FineWalks, 0));
+			// ---- the two geometric properties a shared mechanism would show --
+			//
+			// If every disagreeing ray hit the same FACE AXIS, the defect is
+			// axis-specific -- a stepping or tie-break asymmetry. If they all sit
+			// at cell 0 or cell 7 of their brick, it is a boundary defect. Both
+			// are one dword and neither can be recovered from the voxel alone
+			// without knowing which walk crossed which plane.
+			MarchOutVerifySource[S + 21u] =
+				uint(max(Brk.FaceAxis, 0)) | ((Brk.FaceSign > 0) ? 4u : 0u);
+			MarchOutVerifySource[S + 23u] = VoxelMarchDescendVerdict(Brk, Hier);
+			MarchOutVerifySource[S + 22u] = (uint(Brk.Voxel.x) & 7u) |
+			                                ((uint(Brk.Voxel.y) & 7u) << 3u) |
+			                                ((uint(Brk.Voxel.z) & 7u) << 6u);
+		}
+	}
+
+	// ---- the control, NOW ON THE WALK IT ACTUALLY JUDGES --------------------
+	//
+	// It used to nudge the OCCUPANCY walk. That was the reference for the
+	// source comparison and the wrong reference for this one: the verdict being
+	// read is hierarchical-vs-flat BRICK, and a floor measured on a third walk
+	// over a different volume says nothing about how those two can differ.
+	//
+	// It also dragged the fluid into a brick-only measurement, which is the
+	// dependency this whole change is removing.
+	//
+	// So the floor is the FLAT BRICK walk against a 1e-6 UU entry nudge -- the
+	// same construction, on the same volume, with the same arithmetic history
+	// the hierarchy's restarts perturb.
+	{
+		const FVoxelMarchHit BrkRef =
+			VoxelMarchTraverseBrick(Ray.OriginLocalUU, Ray.DirWorld,
+			                        TIn + VOXEL_MARCH_VSRC_NOISE_ENTRY_UU, TOut, 0.0f);
+		if (BrkRef.bHit != Brk.bHit || (Brk.bHit && any(BrkRef.Voxel != Brk.Voxel)))
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_REFNOISE], 1u);
+		}
+	}
+
+	if (MarchOccValid == 0)
+	{
+		// Brick-only mode: everything above this line has run, everything below
+		// it is the source comparison and has no valid occupancy walk to make.
+		return;
+	}
+
+	const FVoxelMarchHit Occ =
+		VoxelMarchTraverseOccupancy(Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, 0.0f);
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_STEPS_OCC], uint(max(Occ.Steps, 0)));
+
+	// ---- the OLD control, kept for the source comparison only ---------------
+	//
+	// THE NUDGE MOVED FROM THE SEGMENT END TO THE ENTRY, and the old form was a
+	// weak instrument that happened to read low.
+	//
+	// Scaling TOut by 1-1e-7 only perturbs rays whose hit lies near the FAR end
+	// of the segment; every other ray walks byte-identical arithmetic and can
+	// never disagree. So the floor it reported was not the floor the measurement
+	// is exposed to -- it read 6 on one leg and 462 on the next with nothing in
+	// between but scene, because it was sampling a thin far-field population
+	// whose size is pure geometry.
+	//
+	// What the hierarchy actually does is RESTART tMax at cell boundaries, which
+	// changes the arithmetic history of the WHOLE walk. The matching control is
+	// therefore the spike's own: nudge the ENTRY, so LocalStart's floor() and
+	// every subsequent tMax accumulation differ, along the entire ray. 1e-6 UU
+	// is one ten-millionth of a voxel and the same figure the spike used.
+	{
+		const FVoxelMarchHit Ref =
+			VoxelMarchTraverseOccupancy(Ray.OriginLocalUU, Ray.DirWorld,
+			                            TIn + VOXEL_MARCH_VSRC_NOISE_ENTRY_UU, TOut, 0.0f);
+		if (Ref.bHit != Occ.bHit || (Occ.bHit && any(Ref.Voxel != Occ.Voxel)))
+		{
+			// Its own slot. The headline floor is the brick one above; this is
+			// only meaningful for the occupancy comparison that follows.
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_OCCNOISE], 1u);
+		}
+	}
+
+	if (!Occ.bHit && !Brk.bHit)
+	{
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_AGREE_MISS], 1u);
+		return;
+	}
+
+	if (Occ.bHit && Brk.bHit)
+	{
+		if (all(Occ.Voxel == Brk.Voxel))
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_AGREE_HIT], 1u);
+			return;
+		}
+		const int3 D = abs(Occ.Voxel - Brk.Voxel);
+		const int L1 = D.x + D.y + D.z;
+		if (L1 == 1 && abs(Occ.THitUU - Brk.THitUU) <= VOXEL_MARCH_VSRC_TIE_SEPARATION_UU)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_TIES], 1u);
+			return;
+		}
+		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HARD], 1u);
+		return;
+	}
+
+	if (!Occ.bHit && Brk.bHit)
+	{
+		// The brick source found a surface the occupancy source is blind to.
+		// Correct AND EXPECTED when it is a water marker -- the named exclusion.
+		if (Brk.Material == VOXEL_MARCH_MAT_WATERMARK)
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_WATERMARK], 1u);
+		}
+		else
+		{
+			InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BRICK_EXTRA], 1u);
+		}
+		return;
+	}
+
+	// ---- THE SYMPTOM: occupancy found a surface, the brick walk did not -----
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BRICK_MISSED], 1u);
+
+	// Ask the brick path directly about the voxel occupancy hit. This is the
+	// field that separates "the walk never asked" from "the storage says air".
+	const uint Reason = VoxelMarchBrickProbeVoxel(Occ.Voxel);
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_REASON0 + Reason], 1u);
+
+	uint Claim = 0u;
+	InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_CLAIMED], 1u, Claim);
+	if (Claim < VOXEL_MARCH_VSRC_SAMPLE_MAX)
+	{
+		const uint S = VOXEL_MARCH_VSRC_HEADER + Claim * VOXEL_MARCH_VSRC_SAMPLE_WORDS;
+		MarchOutVerifySource[S + 0u] = uint(LocalPixel.x);
+		MarchOutVerifySource[S + 1u] = uint(LocalPixel.y);
+		MarchOutVerifySource[S + 2u] = uint(Occ.Voxel.x);
+		MarchOutVerifySource[S + 3u] = uint(Occ.Voxel.y);
+		MarchOutVerifySource[S + 4u] = uint(Occ.Voxel.z);
+		MarchOutVerifySource[S + 5u] = uint(Brk.Voxel.x);
+		MarchOutVerifySource[S + 6u] = uint(Brk.Voxel.y);
+		MarchOutVerifySource[S + 7u] = uint(Brk.Voxel.z);
+		MarchOutVerifySource[S + 8u] = asuint(Occ.THitUU);
+		MarchOutVerifySource[S + 9u] = uint(Brk.Steps);
+		MarchOutVerifySource[S + 10u] = Reason;
+	}
+}
+
+#endif // VOXEL_MARCH_VERIFY_SOURCE

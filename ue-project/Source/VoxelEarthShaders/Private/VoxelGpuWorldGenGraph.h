@@ -18,6 +18,7 @@
 
 #include "CoreMinimal.h"
 #include "RenderGraphFwd.h"
+#include "VoxelBrickPool.h"   // FVoxelBrickChunkShading, carried into the record kernel
 
 struct FVoxelGpuRegionRequest;
 class FRDGBuilder;
@@ -49,6 +50,28 @@ namespace VoxelGpuWorldGen
 		uint32 QuadBufferElements = 0;
 
 		bool bMesh = false;
+
+		// --- P1-C: the brick chain ------------------------------------------
+		//
+		// All zero unless the request set bBrickPack. Every count here is a
+		// property of the region's CHUNK decomposition, not of its bricks in
+		// general: brickpack.ush packs whole 4x4x4-brick chunks and nothing
+		// else, so a region 6 bricks wide contributes ONE chunk and its two
+		// leftover brick columns contribute nothing.
+		uint32 NumBrickChunks = 0;
+		uint32 NumBricks = 0;            // NumBrickChunks * 64
+		uint32 BrickScanBlocks = 0;      // DivideAndRoundUp(NumBricks, 256)
+		// Worst-case arena sizes, which is what the scratch buffers are sized
+		// to. 16 dwords of occupancy per brick; 132 dwords of material per
+		// brick (the 8 bpp case: 512 voxels x 8 bits and no local palette --
+		// see kMaxBrickMatWords in brickpack.ush). ~38 KB for one chunk, which
+		// is why the scratch side needs no readback to size itself and only the
+		// POOL allocation does.
+		uint32 BrickOccWordsMax = 0;
+		uint32 BrickMatWordsMax = 0;
+		bool bBrickPack = false;
+
+		uint32 BrickTotalsBytes() const { return 2 * uint32(sizeof(uint32)); }
 
 		// Byte sizes of the five readbackable buffers.
 		uint32 ColumnsBytes() const;
@@ -83,6 +106,30 @@ namespace VoxelGpuWorldGen
 		// the request asked for a band. The +1/-1 widening and the clamp that
 		// turn these into an FFootprintBand stay on the CPU.
 		FRDGBufferRef Band = nullptr;
+
+		// --- P1-C: the packed brick volume, CHUNK-RELATIVE ------------------
+		//
+		// Null unless the request set bBrickPack. THE OFFSETS INSIDE BrickDesc
+		// ARE CHUNK-RELATIVE, because these passes dispatch with all three
+		// write bases at ZERO (docs/brick-volume-format.md section 6b). They
+		// become pool addresses only in AddBrickDescPoolWritePass, which is the
+		// one place a base is added -- see VoxelBrickPoolWrite.usf.
+		//
+		// BrickSkip is written by BrickPackMain and DELIBERATELY DISCARDED: the
+		// 4^3 intra-brick mask is derivable for free from the 16 occupancy
+		// dwords a marcher already holds in registers, and the contract's own
+		// recommendation is to spend the ~7 MiB on payload instead. The buffer
+		// exists because the kernel writes it unconditionally, not because
+		// anything reads it.
+		FRDGBufferRef BrickDesc = nullptr;
+		FRDGBufferRef BrickOcc = nullptr;
+		FRDGBufferRef BrickMat = nullptr;
+		FRDGBufferRef BrickSkip = nullptr;
+		FRDGBufferRef BrickChunkMask = nullptr;
+		// Two uints: the occupancy and material dword totals this chunk needs.
+		// The ONLY thing the CPU reads on this path, and what the pool
+		// allocation is made from.
+		FRDGBufferRef BrickTotals = nullptr;
 
 		FRegionGraphSizes Sizes;
 	};
@@ -158,4 +205,44 @@ namespace VoxelGpuWorldGen
 	// pass order.
 	void AddQuadPoolHidePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstIds,
 	                         uint32 DstFirst, uint32 NumQuads, uint32 HiddenChunkId);
+
+	// --- P1-C / P2: the four moves that make a packed chunk resident ---------
+	//
+	// Declared here for the same reason the quad passes are: the shader classes
+	// live in VoxelGpuWorldGen.cpp (one IMPLEMENT_GLOBAL_SHADER per class, one
+	// translation unit) and the caller is another one -- FVoxelBrickPool. See
+	// ue-project/Shaders/VoxelBrickPoolWrite.usf for what each kernel does.
+	//
+	// ALL FOUR ARE RENDER THREAD ONLY, and the ORDER a caller records them in is
+	// load-bearing exactly once: a chunk-record CLEAR for a slot being reused
+	// must be recorded before the writes that repopulate it, so the retired
+	// record can never be the last writer. FVoxelBrickPool does that in one
+	// graph; see FVoxelBrickPool::FlushPendingWrites.
+
+	// Copies [SrcFirst, SrcFirst + NumWords) of Src into Dst at DstFirst. Used
+	// for both arenas -- occupancy and materials are the same dwords to a copy.
+	void AddBrickWordCopyPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
+	                          uint32 SrcFirst, uint32 DstFirst, uint32 NumWords);
+
+	// Copies BrickCount descriptors and ADDS THE POOL BASES TO THEIR OFFSET
+	// FIELDS. The only place in the project where a chunk-relative offset
+	// becomes a pool address -- see docs/brick-volume-format.md section 6b, and
+	// the file header of VoxelBrickPoolWrite.usf.
+	void AddBrickDescPoolWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstDesc, FRDGBufferRef SrcDesc,
+	                               uint32 SrcFirst, uint32 DstFirst, uint32 BrickCount,
+	                               uint32 OccBase, uint32 MatBase);
+
+	// Writes the one 32 B FVoxelMarchChunk record. Reads the SCRATCH descriptors
+	// and occupancy (chunk-relative, so it needs no base) plus the scratch L1
+	// mask, and computes allSolid FROM THE CELL DATA -- it is not derivable from
+	// the descriptors, and looks as though it is.
+	void AddBrickChunkRecordPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+	                             FRDGBufferRef SrcDesc, FRDGBufferRef SrcOcc, FRDGBufferRef SrcChunkMask,
+	                             uint32 SrcFirst, uint32 SrcChunkIndex, uint32 BrickCount,
+	                             uint32 ChunkSlot, uint32 BrickBase, uint32 RingLevel,
+	                             const FIntVector& OriginVoxel,
+	                             const FVoxelBrickChunkShading& Shading);
+
+	// Zeroes one record, which reads as "nothing here" (anySolid clear).
+	void AddBrickChunkClearPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable, uint32 ChunkSlot);
 }
