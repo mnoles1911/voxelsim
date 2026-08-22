@@ -1,0 +1,67 @@
+// VoxelMarchIndexScatter.usf -- applies a compact list of changed cells to the
+// persistent march chunk index, instead of re-uploading the whole grid.
+//
+// WHY THIS KERNEL EXISTS. FVoxelMarchChunkIndex::MarkDirtyAndUpload used to
+// stage the ENTIRE cell grid (7 slots x 128^3 dwords = 56 MiB) on every pool
+// flush, and Register() re-uploaded all of it through
+// GraphBuilder.QueueBufferUpload. A typical flush changes ~9,500 cells of
+// 14.7 million -- 0.065% -- so at ~180 flushes per 5 s window that was ~10 GB
+// of game-thread memcpy per window, copied AGAIN inside RDG, and pushed whole
+// over PCIe. The index's own instrumentation showed it: uploadMs=3,146-3,190
+// per 5 s window against a streaming tick totalling ~3,700 ms, with
+// uploadMs + addedMs == sinkMs to the tenth. ApplyDelta already receives the
+// exact Removed/Added lists; this kernel is that information finally being
+// used instead of thrown away.
+//
+// One thread per changed cell. The pairs buffer is [cellIndex, newValue]
+// repeated: two dwords per entry, cell first. The value dword is the complete
+// packed entry (kResidentBit | kAnySolidBit | slot, or 0 for a removal) --
+// this kernel does not understand the encoding and must not: it writes what
+// the CPU shadow holds, so the CPU grid in FVoxelMarchChunkIndex::Cells stays
+// the single authority for what a cell means.
+//
+// DEDUPLICATED ON THE HOST, AND THAT IS LOAD-BEARING. Two pairs naming the
+// same cell in one dispatch would be a write-write race between threads, and
+// which value survived would be up to the hardware -- a wrong index cell does
+// not crash here, it renders another chunk's bricks at this chunk's
+// coordinates, which looks like terrain. FVoxelMarchChunkIndex builds the
+// pair list from a TSet keyed by cell, so within one dispatch every cell
+// appears at most once and every thread's write is to a distinct address.
+//
+// ORDERING IS THE GRAPH'S, NOT LUCK. This pass declares a UAV on the very
+// buffer the march passes read as an SRV, inside the same graph, so RDG
+// inserts the barrier between the scatter and any march -- the exact property
+// the old RHILockBuffer path lacked (see MarkDirtyAndUpload's comment about
+// the unsynchronised-write hazard it replaced).
+
+#include "/Engine/Public/Platform.ush"
+
+// [cell, value] pairs, two dwords per changed cell, deduplicated by cell.
+StructuredBuffer<uint> MarchIndexDeltaPairs;
+// The persistent chunk index grid -- the same buffer the marchers bind as
+// MarchChunkIndex, registered writable for this pass only.
+RWBuffer<uint> MarchChunkIndexRW;
+// Number of pairs (NOT dwords).
+uint MarchIndexDeltaCount;
+// Total cells in the grid (kGridSlots * 128^3). A cell index at or past this
+// is a host-side bug; the guard drops the write rather than trusting typed
+// out-of-bounds behaviour, because a silent wrong write here renders as
+// terrain and this project has paid for that shape repeatedly.
+uint MarchIndexCellCount;
+
+[numthreads(64, 1, 1)]
+void VoxelMarchIndexScatterMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= MarchIndexDeltaCount)
+	{
+		return;
+	}
+	const uint Cell  = MarchIndexDeltaPairs[i * 2u];
+	const uint Value = MarchIndexDeltaPairs[i * 2u + 1u];
+	if (Cell >= MarchIndexCellCount)
+	{
+		return;
+	}
+	MarchChunkIndexRW[Cell] = Value;
+}

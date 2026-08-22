@@ -8500,6 +8500,27 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			            "addedMs=%.1f (n=%lld) uploadMs=%.1f"),
 			       A.RemovedMs, (long long)A.RemovedCount,
 			       A.AddedMs, (long long)A.AddedCount, A.UploadMs);
+
+			// WHICH UPLOAD PATH RAN, AND WHY, cumulative since attach. With
+			// voxel.March.IndexDeltaUpload at its default 0 this reads full=N
+			// delta=0 -- the control-leg fingerprint. With the switch on, a
+			// delta count that is NOT growing means the fallback reasons on
+			// this line say why, and lastCells is "cells uploaded per flush"
+			// (kCells = 14,680,064 marks a full staging). Verify pass/fail is
+			// the voxel.March.IndexDeltaVerify readback gate; fail>0 on any
+			// leg outranks every performance number the leg produced.
+			const FVoxelMarchChunkIndex::FUploadStats U =
+				GetGlobalVoxelMarchChunkIndex().GetUploadStats();
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel march index uploads (cumulative): full=%llu delta=%llu "
+			            "deltaCells=%llu lastCells=%u bytes=%llu | fullBecause "
+			            "first=%u seed=%u pending=%u large=%u | verify pass=%llu FAIL=%llu"),
+			       (unsigned long long)U.FullUploads, (unsigned long long)U.DeltaUploads,
+			       (unsigned long long)U.DeltaCellsStaged, U.LastStagedCells,
+			       (unsigned long long)GetGlobalVoxelMarchChunkIndex().GetUploadBytes(),
+			       U.FullBecauseFirst, U.FullBecauseSeed, U.FullBecausePending,
+			       U.FullBecauseLarge,
+			       (unsigned long long)U.VerifyPasses, (unsigned long long)U.VerifyFailures);
 		}
 
 		UE_LOG(LogVoxelPerf, Log,
