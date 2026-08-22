@@ -43,6 +43,16 @@ if(NOT MSVC)
   target_compile_options(vxc_stagedump PRIVATE -Wall -Wextra -Werror)
 endif()
 
+# --- vxc_biomelut: the Whittaker grid classified by the ENGINE's own
+# classifyBiome/biomeSurfaceMaterial, so gen_terrain_textures.py can paint
+# T_VoxelBiomeLUT from the palette instead of from six authored anchors -- one
+# answer to "what colour is a grassland" across the near field and the vista.
+add_executable(vxc_biomelut biomelut.cpp)
+target_link_libraries(vxc_biomelut PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_biomelut PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_matcensus: WHICH MATERIAL IDS REACH THE QUADS. The gate on ADR-0009's
 # material-led colour, and the re-run VoxelClimateProbe.h asks for: the column
 # census and the quad census, from one walk of one world, so the two can be

@@ -122,54 +122,110 @@ def _mix(a, b, t):
     return np.asarray(a) * (1.0 - t) + np.asarray(b) * t
 
 
-def write_biome_lut(path, size=64):
+BIOMELUT_PROBE = "vxc_biomelut"
+
+
+def _classified_grid(size):
+    """(size, size) of material ids, from the ENGINE's own biome classifier.
+
+    Shells out to vxc_biomelut rather than porting classifyBiome to Python.
+    That classifier is worldgen -- integer-only, and mirrored bit-for-bit in
+    worldgen.ush under the CPU/GPU contract -- so a Python transcription would
+    be a third copy of the biome gates, which is the failure this codebase has
+    already paid for twice (material ids, then colour).
+    """
+    import shutil
+    import subprocess
+
+    candidates = [
+        os.path.join(os.path.dirname(__file__), "..", "..", "build", "voxel-core",
+                     "bench", BIOMELUT_PROBE),
+        os.path.join(os.path.dirname(__file__), "..", "..", "build", "bench",
+                     BIOMELUT_PROBE),
+        shutil.which(BIOMELUT_PROBE) or "",
+    ]
+    exe = next((os.path.abspath(c) for c in candidates if c and os.path.exists(c)), None)
+    if exe is None:
+        raise SystemExit(
+            f"{BIOMELUT_PROBE} not found. T_VoxelBiomeLUT is painted from the "
+            "engine's own biome classifier (ADR-0009), so it has to be built:\n"
+            "    cmake -S voxel-core -B build/voxel-core -G Ninja\n"
+            "    cmake --build build/voxel-core --target vxc_biomelut")
+
+    out = subprocess.run([exe, str(size)], capture_output=True, text=True, check=True)
+    grid = np.zeros((size, size), dtype=np.int32)
+    seen = 0
+    for line in out.stdout.splitlines():
+        if line.startswith("#"):
+            continue
+        u, v, _biome, mat = (int(t) for t in line.split())
+        grid[v, u] = mat
+        seen += 1
+    if seen != size * size:
+        raise SystemExit(f"{BIOMELUT_PROBE} returned {seen} cells, expected {size * size}")
+    return grid
+
+
+def _box_blur(img, radius):
+    """Edge-clamped box blur, applied `radius` times at width 3.
+
+    Repeated 3-wide passes rather than one wide kernel: it stays a couple of
+    lines, it is separable and cheap at 64x64, and the result is close enough to
+    a Gaussian for a texture whose job is to have no hard edges.
+    """
+    out = img.astype(np.float64)
+    for _ in range(radius):
+        for axis in (0, 1):
+            padded = np.concatenate(
+                [np.take(out, [0], axis=axis), out, np.take(out, [-1], axis=axis)],
+                axis=axis)
+            lo = np.take(padded, range(0, out.shape[axis]), axis=axis)
+            mid = np.take(padded, range(1, out.shape[axis] + 1), axis=axis)
+            hi = np.take(padded, range(2, out.shape[axis] + 2), axis=axis)
+            out = (lo + mid + hi) / 3.0
+    return out
+
+
+def write_biome_lut(path, size=64, ecotone=3):
     """Whittaker-style biome diagram: U = precipitation, V = temperature.
 
-    Both axes are ALREADY remapped to this world's p1..p99 (see module docstring),
-    so u=0 is 659 mm/yr and u=1 is 1506 mm/yr; v=0 is -8.6 degC and v=1 is
-    +19.3 degC. Every texel of this texture is therefore reachable by real data,
-    which is the whole point of remapping rather than using raw u8.
+    Both axes are ALREADY remapped to this world's p1..p99 (see module
+    docstring), so u=0 is 659 mm/yr and u=1 is 1506 mm/yr; v=0 is -8.6 degC and
+    v=1 is +19.3 degC. Every texel is therefore reachable by real data, which is
+    the whole point of remapping rather than using raw u8.
 
-    Colours are chosen for a cool-temperate maritime world, NOT the tropical/
-    desert palette a naive biome table would use: nothing here is a sand desert,
-    the dry end is golden steppe grass at ~660 mm/yr.
+    GENERATED FROM THE PALETTE SINCE ADR-0009, not authored. Each cell is
+    classified by the engine's own classifyBiome, mapped through its own
+    biomeSurfaceMaterial, and painted with that material's colour from
+    kMaterialPalette. It used to interpolate six hand-picked corner anchors --
+    "cold_dry = bare tundra, mild_wet = temperate broadleaf" and so on -- which
+    was a second, independent answer to "what colour is a grassland".
+
+    WHY THAT MATTERED ENOUGH TO CHANGE. ADR-0009 makes the NEAR FIELD purely
+    material-led, and the clipmap keeps this LUT because a heightmap vertex has
+    no material id to look one up with. Two authorities over one seam is exactly
+    the arrangement terrain_material_common.py's header describes going wrong
+    before -- "the vista was pale green, the ground was beige". Painted from the
+    palette, the vista is the same colours smoothed across climate space, and a
+    retune reaches both from one table.
+
+    `ecotone` blurs the classified grid. Biome membership is a step function and
+    the colours are discrete, so without it every biome boundary in the 50 km
+    vista is a hard colour edge. Three passes over 64 texels is a soft band a few
+    per cent of the climate range wide -- an ecotone, which is what the real
+    thing looks like.
     """
-    u = np.linspace(0.0, 1.0, size)[None, :].repeat(size, axis=0)  # precipitation
-    v = np.linspace(0.0, 1.0, size)[:, None].repeat(size, axis=1)  # temperature
+    grid = _classified_grid(size)
 
-    # Corner anchors of the diagram, LINEAR albedo.
-    #
-    # These are deliberately DARKER and more saturated than they "look right" in
-    # isolation. The terrain is lit by a full-strength sun plus sky, and the
-    # first tuning pass -- anchors around 0.5 luminance -- came back as a washed
-    # pale olive on screen: a 0.5 linear albedo under this lighting tonemaps to
-    # nearly white. Real vegetation albedo is 0.10-0.25, so these now sit in
-    # that range and the greens survive the exposure.
-    cold_dry = (0.34, 0.32, 0.29)   # bare tundra / frost-shattered fellfield
-    cold_wet = (0.24, 0.27, 0.25)   # wet tundra, mossy grey-green
-    mild_dry = (0.36, 0.31, 0.15)   # golden steppe grass
-    mild_wet = (0.11, 0.21, 0.08)   # temperate broadleaf forest
-    warm_dry = (0.40, 0.34, 0.17)   # dry grassland
-    warm_wet = (0.08, 0.22, 0.07)   # lush temperate rainforest
+    # Material id -> LINEAR albedo, from the generated palette table. PALETTE is
+    # indexed by material id and its RGB column is generated from
+    # materialpalette.h, so this cannot drift from what the near field draws.
+    rgb = np.zeros((size, size, 3), dtype=np.float64)
+    for mat in np.unique(grid):
+        entry = PALETTE[int(mat)]
+        rgb[grid == mat] = (entry[1], entry[2], entry[3])
 
-    cold = _mix(cold_dry, cold_wet, u)
-    mild = _mix(mild_dry, mild_wet, u)
-    warm = _mix(warm_dry, warm_wet, u)
-
-    # Temperature is the dominant axis in this world (it spans a full 28 degC
-    # while precipitation spans a modest 850 mm/yr), so it gets the two-segment
-    # ramp. The cold->mild knee sits at v=0.38, which is ~+2 degC -- roughly the
-    # treeline temperature, and close to the measured land median (+3.3 degC),
-    # so half the land falls on each side and the map actually uses its range.
-    knee = 0.38
-    lower = _mix(cold, mild, v / knee)
-    upper = _mix(mild, warm, (v - knee) / (1.0 - knee))
-    rgb = np.where((v < knee)[..., None], lower, upper)
-
-    # A taiga wedge: cold AND wet reads as dark conifer rather than grey tundra.
-    # Without this the whole cold half is a flat grey and the uplands look dead.
-    taiga = np.clip((0.52 - v) / 0.22, 0.0, 1.0) * np.clip((v - 0.16) / 0.16, 0.0, 1.0) * np.clip((u - 0.35) / 0.4, 0.0, 1.0)
-    rgb = _mix(rgb, (0.07, 0.13, 0.08), taiga)
+    rgb = _box_blur(rgb, ecotone)
 
     # sRGB-encoded on the way out: the LUT is imported with srgb=True, so UE
     # decodes on sample. See linear_to_srgb's docstring.

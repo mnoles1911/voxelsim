@@ -27,6 +27,13 @@ is 828 species of placed cover that carries a great deal of the variety in the
 finished world. Read it as "what colour is the ground", which is the question
 ADR-0009 changes, and not as "what will the game look like".
 
+AND THE LUT PANEL IS THE LUT, not the whole clipmap material. M_VoxelClipmap
+also applies slope-rock, beach and snow over the LUT sample, and the sea is
+covered by the water surface. So the vista panel will show ocean floor painted
+as whatever the climate there says -- taiga soil, usually -- where the real
+vista has water over it. What the panel is for is whether the two paths agree
+about LAND, which is where their seam actually is.
+
 INPUT is the binary dump from `vxc_matcensus --dump`, which carries per column:
 surface elevation, the signed per-axis gradient, the surface material, the
 biome, and the climate bytes. The header is text and self-describing, so this
@@ -293,10 +300,19 @@ def main():
 
     panels = []
     if a.compare:
-        panels = [("today: biome LUT", render(arr, palette, "lut", info["cell_m"],
-                                              stride_vox, a.shade)),
-                  ("ADR-0009: material", render(arr, palette, "lit", info["cell_m"],
-                                                stride_vox, a.shade))]
+        # THE LABELS CHANGED WITH ADR-0009 AND THE CHANGE MATTERS. This used to
+        # read "today: biome LUT" against "ADR-0009: material", i.e. the old
+        # authored LUT against the new material path. Now that the LUT is
+        # generated from the palette too, the comparison is no longer old-vs-new
+        # -- it is the 50 km VISTA against the NEAR FIELD, which is the seam the
+        # two paths have to agree across. Mislabelling it would have someone read
+        # a seam check as a before/after.
+        panels = [("clipmap / 50 km vista: biome LUT", render(arr, palette, "lut",
+                                                              info["cell_m"],
+                                                              stride_vox, a.shade)),
+                  ("near field: material", render(arr, palette, "lit",
+                                                  info["cell_m"], stride_vox,
+                                                  a.shade))]
     else:
         panels = [(a.mode, render(arr, palette, a.mode, info["cell_m"], stride_vox,
                                   a.shade))]
