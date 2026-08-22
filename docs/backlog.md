@@ -108,6 +108,60 @@ has begun and will silently not apply (`VoxelBrickPool.cpp:286-304`).
 **Do not read frame time as progress on this item.** The thing being fixed is
 chunks per second and holes at boundaries.
 
+#### Measured 2026-08-22, second pass — TWO limiters, and only one of them is the marcher's
+
+Read from the same log. **The streaming tick reaches 95% of wall and 170 ms per tick**, which
+is why flying outpaces it. But the dominant stage CHANGES as the world fills, and the two
+halves have different owners:
+
+**Cold fill — `recompute` dominates, and it is NOT marcher work.**
+
+| window | tick % of wall | recompute |
+|---|---|---|
+| first 5 s | 90.0% | 2,815.7 ms |
+| next | 65.1% | 2,128.0 ms |
+| next | 51.8% | 1,193.5 ms |
+| next | 25.3% | **85.2 ms** |
+
+Essentially all of it is the level-0 entry loop: `recomputeMs=70.16` of which
+`entryMs R0=69.96`, over `footprints R0=5088` — about **14 µs per footprint**, per tick.
+
+The cause is `FootprintChunkZRangeCached` (`VoxelWorldSubsystem.cpp:8654`) **refusing to
+memoize while the fine tier has not finished decoding the tile**. Its own comment explains
+why that is correct: an entry computed while a 300 MB tile is still decoding is derived from
+the sea-level fallback and, with no invalidation, would be wrong for the rest of the session.
+So it recomputes every footprint every tick until residency flips.
+
+**That behaviour landed in `1e5207b` (2026-08-17), "Per-layer mesher + admission counters;
+z-range memo waits for residency" — a fine-tier correctness fix, not marcher code. It costs
+the quad path exactly the same.** The decay to 85 ms above shows the memo does re-enable once
+tiles land, so this is a cold-fill and fly-into-new-territory cost, not a permanent one.
+**It is the leading explanation for "chunks missing at LOD boundaries on initial load".**
+
+**Steady state — `dispatch` dominates, and this one IS the marcher's.**
+
+| window | tick % of wall | dispatch | recompute | packs/s |
+|---|---|---|---|---|
+| 16:30:51 | 73.6% | 2,682.5 ms | 169.4 | 2,388 |
+| 16:30:56 | 86.9% | 3,631.9 ms | 128.4 | 1,866 |
+| 16:31:01 | **95.4%** | **4,365.0 ms** | 107.8 | **1,383** |
+
+Throughput FALLS as dispatch grows. The stage brackets inside dispatch put nearly all of the
+unattributed remainder in one place — `other` ≈ `gpuMgrTickMs` in every sample
+(`other=4.19/4.73/4.95` against `gpuMgrTick=4.10/4.66/4.90`) — which is
+**`FVoxelGpuMeshJobManager::Tick`, the brick-packing manager that only runs because
+`voxel.GPU.BrickPack 1`**. `airProof`, `band`, `submit`, `pick` and `overlay` are all
+sub-millisecond and are not the problem.
+
+**So the A/B in the item above is still the right first move, but the prediction is now
+specific rather than open:** turning the marcher off should remove most of the *dispatch* cost
+and leave most of the *recompute* cost in place. If both drop, the z-range memo attribution is
+wrong. If neither drops, both attributions are wrong and the cause is underneath.
+
+**Not yet checked, and cheap:** whether `gpuMgrTick` is doing work proportional to the job
+queue or re-scanning something per tick. That is one read of `VoxelGpuMeshJobManager::Tick`
+and it is where this should resume.
+
 ### Where the engine is (2026-07-28)
 
 Standard flight leg, shipped defaults, **2560x1440**:
