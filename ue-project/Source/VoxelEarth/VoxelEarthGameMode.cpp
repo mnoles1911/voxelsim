@@ -14,6 +14,7 @@
 #include "VoxelAgentReplication.h" // M6 gap closure: AVoxelAgentReplicator spawn below
 #include "VoxelAgentSubsystem.h" // M6 NPC swarm: -VoxelSwarmTest switch below
 #include "VoxelEarth.h"
+#include "VoxelFrontEndPolicy.h" // front-end suppression rules; see the header for the invariant
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelClipmapActor.h"
 #include "VoxelEarthHUD.h"
@@ -105,6 +106,56 @@ AVoxelEarthGameMode::AVoxelEarthGameMode()
 	DefaultPawnClass = AVoxelEarthFlyPawn::StaticClass();
 	PlayerControllerClass = AVoxelEarthPlayerController::StaticClass();
 	HUDClass = AVoxelEarthHUD::StaticClass();
+
+	// FRONT-END RUNS ONLY (docs/front-end-plan.md). As a spectator the
+	// controller is created and possesses nothing, so the menu can own the
+	// screen without a fly pawn drifting around behind it and without
+	// UVoxelWorldSubsystem::Tick finding an anchor to stream from.
+	// BeginPlayerSession() below spawns the real pawn when the player presses
+	// NEW GAME/CONTINUE.
+	//
+	// FALSE IN EVERY SELF-DRIVING RUN, which is the point: roughly forty
+	// verification switches assume a pawn exists at StartPlay, and several of
+	// them start timers from it. See VoxelFrontEndPolicy.h.
+	bStartPlayersAsSpectators = VoxelFrontEnd::IsEnabledThisRun();
+}
+
+void AVoxelEarthGameMode::BeginPlayerSession(const FTransform* SpawnOverride)
+{
+	if (bPlayerSessionBegun)
+	{
+		UE_LOG(LogVoxelEarth, Warning, TEXT("BeginPlayerSession called twice; ignoring the second call."));
+		return;
+	}
+	UWorld* World = GetWorld();
+	APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
+	if (PC == nullptr)
+	{
+		// Not fatal and not silent. The front end calls this on the same tick
+		// it opens the streaming gate, and a controller that has not been
+		// created yet means the caller is a frame early -- it will retry.
+		UE_LOG(LogVoxelEarth, Warning, TEXT("BeginPlayerSession: no player controller yet; caller should retry."));
+		return;
+	}
+	bPlayerSessionBegun = true;
+
+	// SPAWN THROUGH RestartPlayer, NOT AROUND IT. Every spawn-shaping switch
+	// this project has -- -VoxelSpawnAt, -VoxelSpawnAltM, -VoxelCameraHigh,
+	// -VoxelSpawnPitch, -VoxelSpawnYaw, -VoxelForceUnderwaterSpawn -- is
+	// implemented inside that override, and it also carries the reason the
+	// engine's FindPlayerStart path is bypassed (no level in this repo places
+	// one). A second spawn path here would have to duplicate all of it and
+	// would be wrong the first time any of those switches changed.
+	// bStartPlayersAsSpectators only makes AGameModeBase SKIP the automatic
+	// RestartPlayer at HandleStartingNewPlayer; the controller is otherwise
+	// ordinary and possesses nothing, so this is the first spawn, not a
+	// respawn, and nothing needs unpossessing first.
+	PendingSessionSpawnTransform = SpawnOverride ? TOptional<FTransform>(*SpawnOverride) : TOptional<FTransform>();
+	RestartPlayer(PC);
+	PendingSessionSpawnTransform.Reset();
+
+	UE_LOG(LogVoxelEarth, Log, TEXT("BeginPlayerSession: pawn spawned (%s)."),
+	       SpawnOverride ? TEXT("restored from a save") : TEXT("default spawn column"));
 }
 
 void AVoxelEarthGameMode::BeginPlay()
@@ -4190,6 +4241,19 @@ void AVoxelEarthGameMode::RestartPlayer(AController* NewPlayer)
 	if (!NewPlayer || !Subsystem)
 	{
 		Super::RestartPlayer(NewPlayer);
+		return;
+	}
+
+	// RESTORED SAVE WINS (docs/front-end-plan.md). Set only by
+	// BeginPlayerSession when the front end loaded a named save, and cleared
+	// immediately after -- so it is never set in a self-driving run, and the
+	// spawn-shaping switches below keep behaving exactly as they always have.
+	if (PendingSessionSpawnTransform.IsSet())
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("Restoring saved player transform at (%.1f, %.1f, %.1f) UU"),
+		       PendingSessionSpawnTransform->GetLocation().X, PendingSessionSpawnTransform->GetLocation().Y,
+		       PendingSessionSpawnTransform->GetLocation().Z);
+		RestartPlayerAtTransform(NewPlayer, *PendingSessionSpawnTransform);
 		return;
 	}
 

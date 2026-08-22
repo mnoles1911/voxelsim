@@ -419,6 +419,60 @@ namespace VoxelDebug
 	inline constexpr float kHitchThresholdMs = 33.3f;
 }
 
+// --- Always-live streaming progress (front end / loading screen) ------------
+//
+// FVoxelPerfSnapshot BELOW IS NOT USABLE FOR THIS, and that is the entire
+// reason this struct exists rather than a second accessor on that one.
+// UpdatePerfSnapshot is called behind `if (VoxelDebug::GetDebugMode() >= 1)`
+// (VoxelWorldSubsystem.cpp, a deliberate zero-cost-at-mode-0 gate), so in a
+// normal session -- which is exactly when a player is watching a loading
+// screen -- every field of it reads zero. A progress bar driven off it would
+// sit at 0% forever and a readiness gate would never pass.
+// UVoxelCharacterMovementComponent::IsTerrainReadyAt documents falling into
+// this same trap and choosing a live query instead; this is that live query,
+// aggregated.
+//
+// COST. Filling this walks ChunkRecords once, which is 39,020 entries at a
+// settled 4 km cascade (VoxelWorldSubsystem.h's own measured figure). That is
+// far too much to pay per frame and entirely affordable at the 0.4 s poll
+// FVoxelWorldReadyProbe uses -- the header's contract is therefore "poll at
+// 5 Hz or slower", and the probe logs its own per-poll milliseconds under
+// -VoxelReadyProbeLog so the cost stays measured rather than assumed.
+//
+// PENDING MEANS SOMETHING DIFFERENT HERE than it does in FVoxelPerfSnapshot,
+// and the difference is deliberate. That struct's LevelPendingCount folds in
+// PendingUnloadKeys, because its job is to describe queue depth. This one
+// counts only work that will PRODUCE geometry (job dispatch + game-thread
+// mesh), because its job is to answer "is there anything left to wait for" --
+// and a chunk queued for unload is the opposite of something to wait for.
+// Counting unloads here would make the gate fail to pass during any camera
+// move, which is precisely when a loading screen is up.
+struct FVoxelStreamingProgress
+{
+	// Chunks currently holding drawn geometry, per ring level. Same predicate
+	// as FVoxelPerfSnapshot::LevelLoadedCount (FChunkRecord::HoldsGeometry),
+	// so the two agree wherever both are live.
+	int32 LevelLoadedCount[VoxelCoords::kNumLevels] = {};
+	// Queued and not yet drawn: PendingJobKeysByLevel + PendingGameThreadKeys.
+	// Deliberately excludes PendingUnloadKeys -- see the note above.
+	int32 LevelPendingCount[VoxelCoords::kNumLevels] = {};
+	// Chunks with a worker job in flight right now (FChunkRecord::bJobInFlight),
+	// per level. A ring is only settled when pending AND in-flight are both 0.
+	int32 LevelJobsInFlight[VoxelCoords::kNumLevels] = {};
+
+	int32 TotalJobsInFlight = 0;
+	// ChunkRecords.Num(). Not a progress term -- it is the denominator of the
+	// walk this struct costs, and having it in the log makes an unexpectedly
+	// slow poll self-explaining.
+	int32 TrackedChunks = 0;
+
+	// False until UVoxelWorldSubsystem::StartWorldSession has run. Everything
+	// above is zero in that state, and zero-because-nothing-started reads
+	// identically to zero-because-nothing-loaded -- so a caller that does not
+	// check this would compute 0/0 progress on the menu and call it ready.
+	bool bSessionStarted = false;
+};
+
 // --- Perf HUD data (P1 "Perf HUD") ------------------------------------------
 //
 // Plain POD snapshot published once per second by UVoxelWorldSubsystem

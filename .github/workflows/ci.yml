@@ -137,6 +137,28 @@ jobs:
       - name: Lint ue-project modules for unity name collisions
         run: python tools/lint-unity-collisions.py
 
+  # The front end (main menu + loading screen) is suppressed on any run that
+  # drives itself, so that the ~190 -Voxel* verification switches keep behaving
+  # exactly as they did before it existed. That classification is a naming
+  # convention rather than a list, and the failure when the convention does not
+  # reach a new switch is silent: the capture stops at a menu nobody is there
+  # to click and hangs until the watchdog kills it minutes later. This job
+  # makes that failure loud at review time instead.
+  #
+  # Same shape and same justification as the unity lint above -- a defect class
+  # no CI job here can compile its way to, caught with nothing but Python and
+  # the source tree.
+  frontend-switch-coverage:
+    name: Front-end switch classification lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Every -Voxel* switch is classified against the front-end policy
+        run: python tools/lint-frontend-switch-coverage.py
+
   # ADR-0001 determinism surface: the M0 gate passed on AMD and failed on
   # NVIDIA running the IDENTICAL committed SPIR-V, because worldgen.ush's
   # floorDiv derived its flooring correction from `a % b` and HLSL leaves `%`

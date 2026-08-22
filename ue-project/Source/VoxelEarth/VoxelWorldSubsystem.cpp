@@ -13,6 +13,8 @@
 #include "VoxelCoords.h"
 #include "VoxelDebug.h"
 #include "VoxelEarth.h"
+#include "VoxelFrontEndPolicy.h" // front-end suppression rules; see the header for the invariant
+#include "VoxelSaveLibrary.h"      // autosave-on-shutdown writes back to the active named save
 #include "VoxelFineTileStreamer.h" // Phase 2 fine-tier residency/prefetch/eviction gate (-VoxelFineTileDir=)
 #include "VoxelTileCodec.h" // GetFineTileDecompressor -- the asset channel source decodes .vxtl v2 tiles
 #include "VoxelFootprintBand.h" // FFootprintBand + the two per-column reductions (lifted so the GPU gate can call them)
@@ -14975,7 +14977,13 @@ bool WriteBytesAtomic(const FString& Path, const TArray<uint8>& Bytes)
 // (never the live log_) when the raw log has more than 2x its compacted
 // entry count (docs/m3-plan.md wave 2 item 1: "COMPACT on save when the log
 // has >2x the entries of its compacted form").
-bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
+// TAKES A PATH, NOT A SEED, for the same reason LoadEditLogFromPath does: the
+// named-save system (VoxelSaveLibrary) keeps each save's log inside its own
+// Saved/SaveGames/<slug>/ directory. GetWorldSaveFilePath(Seed) remains the
+// default location, and UVoxelWorldSubsystem::SaveWorld still writes there, so
+// the autosave-on-shutdown and voxel.SaveWorld behaviour that predates the
+// front end is untouched.
+bool SaveEditLogToPath(const FVoxelWorldImpl& Impl, const FString& Path)
 {
 	const vxc::EditLog& Log = Impl.Voxels.log();
 	const vxc::EditLog Compacted = vxc::compactLog(Log);
@@ -14991,9 +14999,7 @@ bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
 		FMemory::Memcpy(OutBytes.GetData(), Bytes.data(), Bytes.size());
 	}
 
-	const FString Dir = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds");
-	IFileManager::Get().MakeDirectory(*Dir, /*Tree*/ true);
-	const FString Path = GetWorldSaveFilePath(Seed);
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), /*Tree*/ true);
 
 	if (!WriteBytesAtomic(Path, OutBytes))
 	{
@@ -15013,11 +15019,17 @@ bool SaveEditLogToDisk(const FVoxelWorldImpl& Impl, uint64 Seed)
 	return true;
 }
 
-// Loads Saved/VoxelWorlds/<seed>.vxlog (if present) via vxc::World::replay,
-// called once from OnWorldBeginPlay before any streaming/chunk work reads
-// from Impl.Voxels -- see the call site for the authority-only gating.
+// Loads one .vxlog (if present) via vxc::World::replay, called once from
+// UVoxelWorldSubsystem::StartWorldSession before any streaming/chunk work
+// reads from Impl.Voxels -- see the call site for the authority-only gating.
 // -VoxelNoLoad bypasses this entirely (fresh-start verification aid).
-void LoadEditLogFromDisk(FVoxelWorldImpl& Impl, uint64 Seed)
+//
+// TAKES A PATH, NOT A SEED, since the named-save system (VoxelSaveLibrary)
+// keeps each save's log inside its own Saved/SaveGames/<slug>/ directory
+// rather than at the seed-derived location. GetWorldSaveFilePath(Seed) is
+// still that default location and is what the suppressed-front-end arm
+// passes, so the pre-front-end behaviour is unchanged.
+void LoadEditLogFromPath(FVoxelWorldImpl& Impl, const FString& Path)
 {
 	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelNoLoad")))
 	{
@@ -15025,7 +15037,6 @@ void LoadEditLogFromDisk(FVoxelWorldImpl& Impl, uint64 Seed)
 		return;
 	}
 
-	const FString Path = GetWorldSaveFilePath(Seed);
 	if (!FPaths::FileExists(Path))
 	{
 		UE_LOG(LogVoxelEdit, Log, TEXT("LoadWorld: no saved world at %s -- starting fresh."), *Path);
@@ -15330,9 +15341,39 @@ void UVoxelWorldSubsystem::Deinitialize()
 		// logged warning) on NM_Client, so this is safe to call
 		// unconditionally beyond that -- only the authority (server/listen/
 		// standalone) actually writes a file.
-		if (bWorldBegunPlay)
+		//
+		// AND ONLY FOR A WORLD THAT WAS ACTUALLY STARTED (front end, 2026-08).
+		// bWorldBegunPlay is now necessary but no longer sufficient: with the
+		// main menu up, OnWorldBeginPlay HAS run (so the flag is set) while
+		// StartWorldSession has not, which means Impl->Voxels is a pristine
+		// generated world with an empty edit log. Quitting from the menu would
+		// then serialise that emptiness straight over Saved/VoxelWorlds/
+		// <seed>.vxlog and silently destroy the player's world -- the exact
+		// failure bWorldBegunPlay was introduced to prevent, arriving through a
+		// second door. bWorldSessionStartAttempted is that second door's lock.
+		if (bWorldBegunPlay && bWorldSessionStartAttempted)
 		{
-			SaveWorld();
+			// WHERE the autosave lands depends on where this session came
+			// from. A session opened from a named save writes back INTO that
+			// save, or the player's next CONTINUE would silently reopen the
+			// state they had when they loaded it and lose the whole session.
+			// A session with no named save behind it -- NEW GAME, or any
+			// headless run -- keeps writing to the seed-derived default, which
+			// is byte-identical to the behaviour that predates named saves.
+			const FString& ActiveSlug = VoxelSave::GetActiveSlug();
+			if (!ActiveSlug.IsEmpty())
+			{
+				SaveWorldToPath(VoxelSave::WorldLogPath(ActiveSlug));
+			}
+			else
+			{
+				SaveWorld();
+			}
+		}
+		else if (bWorldBegunPlay)
+		{
+			UE_LOG(LogVoxelEdit, Log,
+			       TEXT("Autosave-on-shutdown skipped: the world session was never started (quit from the front end)."));
 		}
 	}
 
@@ -15395,10 +15436,14 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	// authority role. NM_Client never loads its own file -- a joining client
 	// gets its state from the server's join-sync reply instead (see
 	// AVoxelEarthPlayerController::ServerRequestJoinSync).
-	if (InWorld.GetNetMode() != NM_Client)
-	{
-		LoadEditLogFromDisk(*Impl, Seed);
-	}
+	// FRONT-END SPLIT (docs/front-end-plan.md). The load used to happen right
+	// here, unconditionally. It now happens inside StartWorldSession, which is
+	// called either at the bottom of this function (front end suppressed --
+	// same order, same point, byte-identical to what shipped before) or by
+	// UVoxelFrontEndSubsystem when the player presses NEW GAME/CONTINUE. What
+	// must NOT move is the ordering guarantee the original comment above
+	// states: the log lands before any streaming work reads Impl->Voxels.
+	// StartWorldSession preserves that by replaying before it spawns anything.
 
 	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and
 	// never renders -- render-chunk streaming (mesh generation, worker
@@ -15468,13 +15513,83 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 		ChunkMaterial->PrecachePSOs(&FLocalVertexFactory::StaticType, TerrainPrecacheParams);
 	}
 
+	// THE STREAMING GATE (docs/front-end-plan.md). Everything above this point
+	// -- material resolve and the PSO precache -- deliberately still runs at
+	// BeginPlay even when the front end holds the world back. Both are
+	// asynchronous warm-ups whose whole value is finishing before the first
+	// chunk draws, so letting them overlap the time a player spends reading a
+	// menu is strictly better than what happened before; and neither touches
+	// Impl->Voxels, so neither can violate the edit-log ordering rule.
+	//
+	// The chunk owner is a different matter: spawning it IS starting the
+	// world, because Tick() gates on it. So it moves into StartWorldSession,
+	// and the front end decides when that happens.
+	if (VoxelFrontEnd::IsEnabledThisRun())
+	{
+		UE_LOG(LogVoxelStream, Log,
+		       TEXT("Voxel streaming HELD (seed %llu): the front end owns the first screen (%s). ")
+		       TEXT("StartWorldSession opens the gate."),
+		       (unsigned long long)Seed, VoxelFrontEnd::WhyThisAnswer());
+		return;
+	}
+
+	// Suppressed-front-end arm: identical order and identical point to the
+	// behaviour that predates the front end. The ~40 self-driving verification
+	// switches all land here.
+	StartWorldSession(GetWorldSaveFilePath(Seed));
+}
+
+void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
+{
+	UWorld* World = GetWorld();
+	if (!Impl || World == nullptr)
+	{
+		return;
+	}
+	if (bWorldSessionStartAttempted)
+	{
+		// Not an error worth stopping for, but always worth saying: the only
+		// ways to get here are a double NEW GAME press and a code path that
+		// forgot the front end already started the world. Replaying the edit
+		// log twice would apply every recorded edit on top of itself.
+		UE_LOG(LogVoxelStream, Warning, TEXT("StartWorldSession called twice; ignoring the second call."));
+		return;
+	}
+	bWorldSessionStartAttempted = true;
+
+	// M3 wave 2 persistence (docs/m3-plan.md "Save/load"): authority
+	// (server/listen/standalone) replays its edit log before ANY streaming or
+	// chunk work below can read from Impl->Voxels. NM_Client never loads its
+	// own file -- a joining client gets its state from the server's join-sync
+	// reply instead (see AVoxelEarthPlayerController::ServerRequestJoinSync).
+	if (World->GetNetMode() != NM_Client && !EditLogPathOrEmpty.IsEmpty())
+	{
+		LoadEditLogFromPath(*Impl, EditLogPathOrEmpty);
+	}
+
+	// M3 wave 1 (docs/m3-plan.md): a dedicated server has no viewport and never
+	// renders -- render-chunk streaming is pure client/listen-server concern
+	// that would otherwise burn CPU every tick for nothing (this WAS observed:
+	// the M3 gate's first run showed multi-second tick stalls server-side from
+	// exactly this work). ChunkOwner/ChunkRoot are deliberately left null;
+	// Tick() already no-ops without them, and Impl->Voxels (the authoritative
+	// World + edit log) stays fully usable via TryDig/TryPlace/CarveSphere.
+	if (World->GetNetMode() == NM_DedicatedServer)
+	{
+		UE_LOG(LogVoxelStream, Log,
+		       TEXT("Voxel streaming DISABLED (seed %llu): NM_DedicatedServer has no viewport -- only the authoritative ")
+		       TEXT("World + edit log run here."),
+		       (unsigned long long)Seed);
+		return;
+	}
+
 	// Single actor hosting every render-chunk component (unchanged from
 	// stage 1); streaming now spawns/destroys UVoxelChunkComponents on it
 	// every tick instead of a one-shot fixed-radius pass.
 	FActorSpawnParameters SpawnParams;
 	SpawnParams.ObjectFlags |= RF_Transient;
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	ChunkOwner = InWorld.SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+	ChunkOwner = World->SpawnActor<AActor>(AActor::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
 	if (ChunkOwner == nullptr)
 	{
 		// docs/debug-tooling-plan.md P1 "Log split": streaming-lifecycle lines
@@ -15495,6 +15610,37 @@ void UVoxelWorldSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	       (unsigned long long)Seed, GetLoadRadiusMeters(), GetUnloadRadiusMeters(), DigPlaceRangeMeters);
 }
 
+void UVoxelWorldSubsystem::SetStreamingAnchorOverride(const FVector& AnchorUU)
+{
+	StreamingAnchorOverride = AnchorUU;
+}
+
+void UVoxelWorldSubsystem::ClearStreamingAnchorOverride()
+{
+	StreamingAnchorOverride.Reset();
+}
+
+bool UVoxelWorldSubsystem::IsChunkPresentableAt(const FVector& WorldPos) const
+{
+	// The rule and every clause of its reasoning live in
+	// UVoxelCharacterMovementComponent::IsTerrainReadyAt, which is now one of
+	// this function's two callers. In short: a chunk is NOT presentable only
+	// when it is tracked, holds no geometry, and has not settled -- "queued,
+	// not here yet". A settled component-less chunk is meshed-to-nothing and
+	// final; an untracked one is outside the footprint entirely. Treating
+	// either of those as "not ready" hangs the caller forever.
+	bool bTracked = false;
+	bool bHasComponent = false;
+	int32 Quads = 0;
+	bool bSettled = false;
+	if (DebugChunkStatusAt(WorldPos, bTracked, bHasComponent, Quads, bSettled) && bTracked && !bHasComponent
+	    && !bSettled)
+	{
+		return false;
+	}
+	return true;
+}
+
 void UVoxelWorldSubsystem::Tick(float DeltaTime)
 {
 	if (!Impl || !ChunkOwner || !ChunkRoot)
@@ -15505,7 +15651,10 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	// Streaming anchor (decisions table: "Track a streaming anchor each
 	// tick"): the first local player's possessed pawn, falling back to the
 	// world origin if there is none yet (e.g. before RestartPlayer runs).
-	FVector Anchor = FVector::ZeroVector;
+	// A possessed pawn always wins. The override below only fills the gap
+	// before one exists -- see SetStreamingAnchorOverride for the two ways the
+	// world-origin fallback misleads the front end.
+	FVector Anchor = StreamingAnchorOverride.Get(FVector::ZeroVector);
 	if (UWorld* World = GetWorld())
 	{
 		if (APlayerController* PC = World->GetFirstPlayerController())
@@ -16090,6 +16239,54 @@ bool UVoxelWorldSubsystem::TryPlace(const FVector& CameraWorldLocation, const FV
 		}
 	}
 	return bApplied;
+}
+
+FVoxelStreamingProgress UVoxelWorldSubsystem::GetStreamingProgress() const
+{
+	FVoxelStreamingProgress Out;
+	if (!Impl)
+	{
+		return Out;
+	}
+	// bSessionStarted, not Impl-non-null: Impl exists from Initialize onward,
+	// including for the whole time the front end holds the menu up. A caller
+	// that only checked Impl would read all-zero counters off a world that has
+	// not been asked to stream yet and conclude, reasonably and wrongly, that
+	// there is nothing left to load.
+	Out.bSessionStarted = (ChunkOwner != nullptr);
+	Out.TrackedChunks = Impl->ChunkRecords.Num();
+
+	// ONE walk, not three. This is the O(ChunkRecords) cost the header warns
+	// about (39,020 entries at a settled 4 km cascade), and loaded/in-flight
+	// both come out of the same pass so it is paid once.
+	for (const auto& Pair : Impl->ChunkRecords)
+	{
+		const int32 Level = FMath::Clamp(Pair.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+		if (Pair.Value.HoldsGeometry())
+		{
+			++Out.LevelLoadedCount[Level];
+		}
+		if (Pair.Value.bJobInFlight)
+		{
+			++Out.LevelJobsInFlight[Level];
+			++Out.TotalJobsInFlight;
+		}
+	}
+
+	// Pending = queued work that will produce geometry. PendingUnloadKeys is
+	// deliberately NOT counted -- see FVoxelStreamingProgress in VoxelDebug.h
+	// for why folding unloads in (as FVoxelPerfSnapshot does, correctly, for
+	// its own purpose) would stop the readiness gate ever passing while the
+	// camera is moving.
+	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+	{
+		Out.LevelPendingCount[Level] += Impl->PendingJobKeysByLevel[Level].Num();
+	}
+	for (const VoxelCoords::FVoxelLevelChunkKey& K : Impl->PendingGameThreadKeys)
+	{
+		++Out.LevelPendingCount[FMath::Clamp(K.Level, 0, VoxelCoords::kNumLevels - 1)];
+	}
+	return Out;
 }
 
 bool UVoxelWorldSubsystem::DebugChunkStatusAt(const FVector& WorldPos, bool& bOutTracked, bool& bOutHasComponent,
@@ -16746,7 +16943,28 @@ bool UVoxelWorldSubsystem::SaveWorld() const
 		       TEXT("SaveWorld: refused on NM_Client -- only the authority (server/listen/standalone) has a log to save."));
 		return false;
 	}
-	return SaveEditLogToDisk(*Impl, Seed);
+	return SaveEditLogToPath(*Impl, GetWorldSaveFilePath(Seed));
+}
+
+bool UVoxelWorldSubsystem::SaveWorldToPath(const FString& Path) const
+{
+	if (!Impl)
+	{
+		return false;
+	}
+	// The authority-only rule from SaveWorld applies identically: a client has
+	// no authoritative log of its own to write, it relies on join-sync from the
+	// server, and letting it save one would produce a file that silently
+	// disagrees with the world it came from.
+	if (const UWorld* World = GetWorld())
+	{
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogVoxelEdit, Warning, TEXT("SaveWorldToPath: refusing on NM_Client -- no authoritative log here."));
+			return false;
+		}
+	}
+	return SaveEditLogToPath(*Impl, Path);
 }
 
 namespace
