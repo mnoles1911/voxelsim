@@ -11,5 +11,9 @@ public class VoxelEarthEditorTarget : TargetRules
 
 		ExtraModuleNames.Add("VoxelEarth");
 		ExtraModuleNames.Add("VoxelEarthShaders");
+		// The front end (main menu + loading screen). ClientOnly, so
+		// VoxelEarthServer.Target.cs deliberately does NOT list it -- a
+		// dedicated server links no Slate at all.
+		ExtraModuleNames.Add("VoxelEarthUI");
 	}
 }

@@ -115,6 +115,11 @@ from collections import defaultdict
 DEFAULT_ROOTS = [
     os.path.join("ue-project", "Source", "VoxelEarth"),
     os.path.join("ue-project", "Source", "VoxelEarthShaders"),
+    # The front end. UI code is unusually dense in file-local constants --
+    # kGold, kBorderPx, kMenuZOrder -- which is precisely the collision class
+    # this lint models, so the module is covered from the commit that created
+    # it rather than from the first time it bites.
+    os.path.join("ue-project", "Source", "VoxelEarthUI"),
 ]
 
 ANNOTATION_RE = re.compile(r"//\s*lint-unity:\s*allow\b(.*)$")

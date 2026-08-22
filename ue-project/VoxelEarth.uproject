@@ -13,6 +13,11 @@
 			"Name": "VoxelEarth",
 			"Type": "Runtime",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "VoxelEarthUI",
+			"Type": "ClientOnly",
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [

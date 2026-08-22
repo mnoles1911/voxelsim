@@ -17,5 +17,10 @@ public class VoxelEarthServerTarget : TargetRules
 
 		ExtraModuleNames.Add("VoxelEarth");
 		ExtraModuleNames.Add("VoxelEarthShaders");
+		// VoxelEarthUI is deliberately absent. It is the Slate front end, it
+		// is declared ClientOnly in the .uproject, and a dedicated server has
+		// no viewport to put a menu on -- VoxelFrontEndPolicy rule 3 suppresses
+		// it there anyway. Listed as a comment rather than omitted silently so
+		// the next person to add a module knows this was a choice.
 	}
 }
