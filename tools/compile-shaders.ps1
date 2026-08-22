@@ -59,15 +59,26 @@ Write-Host "All kernels compiled to $OutDir"
 #    the one definition of what a material looks like; a hand-edited copy of it
 #    is the failure this repo has already paid for once with material IDs, and
 #    colour is the version nobody catches because a wrong colour still looks
-#    like a colour. TWO files are covered, not one:
+#    like a colour. TWO files are covered here:
 #      * ue-project/Shaders/VoxelMaterialPalette.ush -- the table the renderer
-#        reads, all 26 materials x 3 face classes, sRGB converted to linear.
+#        reads, all 47 materials x 3 face classes, sRGB converted to linear.
 #      * ue-project/Tools/terrain_palette.py -- the UE-side table that feeds
-#        T_VoxelPalette. Its RGB column is generated from the same header; its
-#        BIOME_TINT column stays authored, because that is a UE-side policy call
-#        with no counterpart in the engine.
+#        T_VoxelPalette. Every column of it is now generated: ADR-0009 moved
+#        BIOME_TINT into the engine header as a weight, because "does this
+#        material respond to climate" is a fact about the material and not a
+#        UE-side policy call.
 # 2. Does the shader COMPILE? The table is generated, so a malformed row reaches
 #    DXC and nothing else.
+#
+# WHAT THIS SCRIPT NO LONGER OWNS ALONE. The drift check also runs in the
+# `palette-parity` CI job on ubuntu, along with two things this script cannot
+# do: comparing the shader's EVALUATION against vxc::voxelTint (it compiles the
+# .ush as C++ against tools/hlsl_cpp_shim.h) and doing the same for
+# asset-forge's mirror. It is duplicated deliberately -- this script is what
+# whoever holds the Windows box runs, and a check only they can run is a check
+# almost nobody runs. The two halves answer different questions: DXC says the
+# shader is well-formed and well-defined on both ADR-0001 targets, the parity
+# job says it computes what the engine header says.
 $Gen = Join-Path $Root "ue-project\Tools\gen_material_palette_ush.py"
 Write-Host "[palette] drift check (.ush + terrain_palette.py)"
 & python $Gen --check

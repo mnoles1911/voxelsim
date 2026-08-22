@@ -1042,7 +1042,11 @@ moving `MAT_BARK_PALE` back up among the woods reproduces the historical
 point: one editor per box is a hard rule, so a check that needs it is a check
 nobody runs.
 
-**What is left is the wiring, and it needs a decision as well as the box.** The
+**What is left is the wiring, and it needs a decision as well as the box.**
+*(DONE — ADR-0009. The decision was the recommended shape and then past it: the
+lerp is per material rather than binary on `isAsset`. The graph half is written
+and still UNRUN; `tools/check-terrain-graph.py` executes it against a stub so
+"unrun" no longer means "unparsed".)* The
 hook is named in `VoxelQuadVertexFactory.ush` (the `bMarker` branch: "the
 smallest possible instance of the thing biomes need next: per-material
 appearance in the pooled renderer... the id survives here"). Two constraints
@@ -1059,12 +1063,38 @@ in the world. Do NOT replace the biome path wholesale as a first step; it cannot
 be verified in the same motion and it is the only appearance path that currently
 works.
 
+**The colour system — CLOSED 2026-08-22 by ADR-0009.** *(`docs/voxel-colour-system.md`
+is the map; `docs/adr/0009-voxel-colour-system.md` is the reasoning.)* Everything
+in this entry and the two below it is done, and two things nobody had listed
+turned out to be the actual defects:
+
+- **Three evaluations, not one.** The TABLE was single; the arithmetic reading it
+  had forked three ways. `VoxelDetailAssetSubsystem` applied the jitter at an
+  invented 0.35, no hue, and **no patch term at all** — on 85% of every placement
+  in the world. `voxelcore/materialcolor.h` is now the definition and
+  `tools/check-palette-parity.py` compiles the shipped shader text as C++ to
+  prove the copies agree with it.
+- **Terrain never got a colour.** The `lerp(biomeAlbedo, paletteRGB, isAsset)`
+  recommended below landed and was correct as a first step, and being one-sided
+  meant every cave wall stayed one flat `SubsurfaceColor` and no terrain voxel
+  had per-voxel variation at all. Both fixed: the blend is now per material via
+  a `biomeTint` weight, and the variation is applied AFTER it.
+- **The patch wavelength was per rendered cube**, so a hillside's mottle stepped
+  from 2 m to 64 m across a streaming ring boundary. Now world-metric.
+
+Still open, and now the highest-value item for appearance: **the surface
+classifier**. It labels nearly all land `MAT_SAND`, which is why the seven
+climate-led surface materials carry `biomeTint` 190–235 — with a real classifier
+those numbers come down and the world gets its material identity back outdoors.
+Nothing else in the colour system is waiting on anything.
+
 **Also found — SINCE FIXED.** `ue-project/Tools/terrain_palette.py` *was* a
 **second palette**, 16 entries, stopping at `MAT_WATERMARK`, and its own header
-called it "single source of truth". Its RGB column is now **generated** from
-`materialpalette.h` by `gen_material_palette_ush.py` and checked by
-`compile-shaders.ps1`; the file owns only the UE-side `BIOME_TINT` policy and its
-header now says so. Original entry kept for the reasoning. The ten asset materials (bark, heartwood, deadwood, six leaf types,
+called it "single source of truth". Every column of it is now **generated** from
+`materialpalette.h` by `gen_material_palette_ush.py`; ADR-0009 moved its last
+authored column, `BIOME_TINT`, into the engine header as a weight, on the
+grounds that "does this material respond to climate" is a fact about the
+material rather than UE-side policy. Original entry kept for the reasoning. The ten asset materials (bark, heartwood, deadwood, six leaf types,
 pale bark) have no appearance on the UE side at all. It is not urgent only
 because no asset is in the world yet. When the wiring above lands, its RGB
 column should be generated from the header too, leaving it to own just the

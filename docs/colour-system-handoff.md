@@ -1,5 +1,19 @@
 # The voxelsim colour system — handoff
 
+> **SUPERSEDED, 2026-08-22. Read [voxel-colour-system.md](voxel-colour-system.md)
+> first.** This document's §8 ends on an open question -- how the palette and the
+> biome LUT should relate -- and [ADR-0009](adr/0009-voxel-colour-system.md)
+> answers it: the biome *modulates* the material, per material, by a weight in
+> the engine header. Its recommendation of "(2) heading toward (3)" is what was
+> built.
+>
+> Three other things below are now out of date and are marked where they appear:
+> the two-palettes section (there is one, plus generated copies), the claim that
+> terrain colour is not the palette's (it is, since ADR-0009), and the channel
+> budget (`TexCoords[5]` is now spoken for). Everything else -- especially §1's
+> invariants, §5's warning about overloading a channel, and §7's traps -- is
+> still current, which is why this file is kept rather than deleted.
+
 Written 2026-08-11, for a session picking up terrain and biome colour. This is
 the whole picture: what has been decided, what is built, what is still two
 things pretending to be one, and the traps that have already cost real time.
@@ -84,6 +98,12 @@ looks like a colour.
 
 ## 3. What actually draws terrain today — and it is NOT the palette
 
+> **OUT OF DATE (ADR-0009).** It IS the palette now, blended with the climate
+> per material. The measurement in this section -- that a categorical id cannot
+> survive the FColor vertex-attribute path -- is still true and still the reason
+> the id is read from the quad's own bits in the pooled shader instead. What
+> changed is that the hook this section names as "the way back in" was taken.
+
 This is the part most likely to surprise you.
 
 **Terrain colour comes from a climate biome LUT, not from material id.**
@@ -130,6 +150,11 @@ will be invisible — that mistake cost a whole session once.
 
 ## 4. There are still TWO palettes, and one dead texture
 
+> **OUT OF DATE.** There is one, in the engine header, plus three generated
+> copies. `terrain_palette.py` is generated in full -- ADR-0009 moved its last
+> authored column, `BIOME_TINT`, into the header as a weight. `T_VoxelPalette`
+> is still dead. The recommendation in this section is what was done.
+
 **`ue-project/Tools/terrain_palette.py`** is a second table. Its docstring calls
 itself "single source of truth". It is:
 
@@ -161,6 +186,12 @@ palette under any circumstances.**
 ## 5. The channel budget — this is the real constraint
 
 Every interpolant is spoken for. Know this before designing anything.
+
+> **UPDATED (ADR-0009).** `TexCoords[3]/[4]` now carry the material's base
+> colour and its biome weight, and `TexCoords[5]` carries the two variation
+> scalars. `[5]` cost nothing: Unreal packs customised UVs two per `float4`, so
+> the one holding `[4]` already reserved its lanes. The rest of this table, and
+> the warning under it, still hold.
 
 | Channel | Carries |
 |---|---|
@@ -246,6 +277,11 @@ is a shader change nobody has checked.
 ---
 
 ## 8. The open design question, which is yours to answer
+
+> **ANSWERED, 2026-08-22, by ADR-0009: option (2), with the weight per material
+> in the engine header, and (3) still the real prize.** The recommendation below
+> is what was built, including its reasoning about the classifier. Kept in full
+> because the argument is the argument.
 
 The palette gives every material an appearance. The biome LUT gives every
 surface a climate-driven colour. **Nothing has decided how those two relate.**

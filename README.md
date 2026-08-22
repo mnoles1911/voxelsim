@@ -15,7 +15,8 @@ ruled out. [docs/status.md](docs/status.md) is the milestone record **up to
 2026-07-29 only** and has not been written since; for the work after that, read
 the merge commits and the per-programme documents
 ([water](docs/water-architecture.md), [land](docs/world-generation-architecture.md),
-[assets](docs/asset-placement-design.md)).
+[assets](docs/asset-placement-design.md),
+[colour](docs/voxel-colour-system.md)).
 
 ## Repo layout
 
