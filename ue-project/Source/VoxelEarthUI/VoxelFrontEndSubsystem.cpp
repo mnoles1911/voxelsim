@@ -251,6 +251,15 @@ void UVoxelFrontEndSubsystem::ApplyMenuInputMode()
 	{
 		PC->MyHUD->bShowHUD = false;
 	}
+
+	// FOCUS A BUTTON, NOT THE MENU. SetWidgetToFocus above puts focus on the
+	// SVoxelMainMenu itself, which is enough for Escape to reach OnKeyDown and
+	// not enough for anything else -- a gamepad player pressing Down would get
+	// nothing, because navigation starts from the focused widget and a
+	// compound widget has no siblings to move between. Handing focus to the
+	// first usable button is what makes the menu drivable without a mouse.
+	MenuWidget->FocusDefaultWidget();
+
 	bMenuInputApplied = true;
 }
 

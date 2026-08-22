@@ -66,6 +66,9 @@ public:
 	void SetSaveRows(TArray<FVoxelSaveRowInfo> Rows);
 
 	void ShowPanel(EVoxelMenuPanel Panel);
+	// Puts keyboard focus on the visible panel's first usable control. Called
+	// when a panel opens and by the front end when the menu first appears.
+	void FocusDefaultWidget();
 	EVoxelMenuPanel GetVisiblePanel() const { return VisiblePanel; }
 
 	// Escape backs out of a sub-panel to the main column, and does nothing on
@@ -80,7 +83,7 @@ private:
 	// HELP, CREDITS and SETTINGS are the same shape: a title, a paragraph and a
 	// BACK button. One builder rather than three near-identical ones, because
 	// three copies of a panel is how three panels start disagreeing.
-	TSharedRef<class SWidget> BuildMessagePanel(const FText& Title, const FText& Body);
+	TSharedRef<class SWidget> BuildMessagePanel(EVoxelMenuPanel Panel, const FText& Title, const FText& Body);
 	// menu_body_panel(): oak fill, 2px black border, 18px content margin, plus
 	// the drop shadow Slate brushes cannot express -- see the .cpp.
 	TSharedRef<class SWidget> WrapInPanelFrame(TSharedRef<class SWidget> Content);
@@ -96,7 +99,17 @@ private:
 	TSharedPtr<class SVoxelMenuButton> ContinueButton;
 	TSharedPtr<class SVoxelMenuButton> LoadGameButton;
 	TSharedPtr<class SVerticalBox> SaveList;
-	TSharedPtr<class SWidget> FirstFocusTarget;
+	// Per-panel focus targets. Slate finds neighbours on its own once something
+	// in the panel HAS focus; these are what give it that starting point when a
+	// panel opens, so a player can drive the whole menu from a gamepad without
+	// touching the mouse first.
+	TSharedPtr<class SVoxelMenuButton> FirstColumnButton;
+	TSharedPtr<class SVoxelMenuButton> LoadPanelCancelButton;
+	TArray<TSharedPtr<class SVoxelMenuButton>> ColumnButtons;
+	// One per message panel. A single shared pointer would end up holding
+	// whichever panel was built LAST, and focusing an invisible widget is a
+	// gamepad player pressing A at nothing.
+	TMap<EVoxelMenuPanel, TSharedPtr<class SVoxelMenuButton>> MessagePanelBackButtons;
 
 	TArray<FVoxelSaveRowInfo> SaveRows;
 	EVoxelMenuPanel VisiblePanel = EVoxelMenuPanel::MainColumn;

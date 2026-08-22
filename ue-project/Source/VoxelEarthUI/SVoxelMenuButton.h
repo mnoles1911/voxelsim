@@ -51,6 +51,16 @@ public:
 
 	void Construct(const FArguments& InArgs);
 
+	// The inner SButton -- what keyboard focus has to land on.
+	//
+	// FOCUS DOES NOT LAND ON *THIS*. SVoxelMenuButton is an SCompoundWidget
+	// wrapping an SButton so it can stack a border behind the fill, and
+	// SCompoundWidget does not take keyboard focus. Slate's own navigation
+	// finds the inner button on its own when arrowing between siblings, but
+	// anything that focuses a button DELIBERATELY -- opening a panel, say --
+	// has to name the widget that can actually hold focus.
+	TSharedPtr<class SWidget> GetFocusWidget() const;
+
 private:
 	// The four-state colour ladder from UIStyles.apply_menu_button():
 	// INK normally, GOLD hovered, GOLD_DEEP pressed, INK_MUTE disabled.

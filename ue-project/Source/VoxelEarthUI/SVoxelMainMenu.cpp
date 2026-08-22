@@ -13,6 +13,8 @@
 #include "Widgets/Images/SImage.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSpacer.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Types/NavigationMetaData.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Text/STextBlock.h"
@@ -106,11 +108,11 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 			]
 			+ SWidgetSwitcher::Slot()
 			[
-				BuildMessagePanel(VoxelUIStrings::HelpPanelTitle(), VoxelUIStrings::HelpPanelBody())
+				BuildMessagePanel(EVoxelMenuPanel::Help, VoxelUIStrings::HelpPanelTitle(), VoxelUIStrings::HelpPanelBody())
 			]
 			+ SWidgetSwitcher::Slot()
 			[
-				BuildMessagePanel(VoxelUIStrings::CreditsPanelTitle(), VoxelUIStrings::CreditsPanelBody())
+				BuildMessagePanel(EVoxelMenuPanel::Credits, VoxelUIStrings::CreditsPanelTitle(), VoxelUIStrings::CreditsPanelBody())
 			]
 			+ SWidgetSwitcher::Slot()
 			[
@@ -119,7 +121,7 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 				// already have in the Godot build rather than being hidden: the
 				// menu a player sees is the menu that shipped, and a missing
 				// button would be the more visible divergence.
-				BuildMessagePanel(VoxelUIStrings::SettingsPanelTitle(), VoxelUIStrings::SettingsPanelBody())
+				BuildMessagePanel(EVoxelMenuPanel::Settings, VoxelUIStrings::SettingsPanelTitle(), VoxelUIStrings::SettingsPanelBody())
 			]
 		]
 
@@ -154,6 +156,11 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	const FMargin SlotPad(0.f, HalfSep);
 
 	TSharedRef<SVerticalBox> Column = SNew(SVerticalBox);
+	TSharedPtr<SVoxelMenuButton> NewGameButton;
+	TSharedPtr<SVoxelMenuButton> SettingsButton;
+	TSharedPtr<SVoxelMenuButton> HelpButton;
+	TSharedPtr<SVoxelMenuButton> CreditsButton;
+	TSharedPtr<SVoxelMenuButton> QuitButton;
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad).HAlign(HAlign_Center)
 	[
@@ -193,7 +200,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(NewGameButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonNewGame())
 		.FontSize(L.ButtonFontSize)
 		.MinHeight(L.ButtonMinHeight)
@@ -212,7 +219,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(SettingsButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonSettings())
 		.FontSize(L.ButtonFontSize)
 		.MinHeight(L.ButtonMinHeight)
@@ -221,7 +228,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(HelpButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonHelp())
 		.FontSize(L.ButtonFontSize)
 		.MinHeight(L.ButtonMinHeight)
@@ -230,7 +237,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(CreditsButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonCredits())
 		.FontSize(L.ButtonFontSize)
 		.MinHeight(L.ButtonMinHeight)
@@ -247,12 +254,39 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 
 	Column->AddSlot().AutoHeight().Padding(SlotPad)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(QuitButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonQuit())
 		.FontSize(L.ButtonFontSize)
 		.MinHeight(L.ButtonMinHeight)
 		.OnClicked_Lambda([this]() { OnQuit.ExecuteIfBound(); return FReply::Handled(); })
 	];
+
+	// In visual order, which is the order navigation walks them.
+	ColumnButtons = {ContinueButton, NewGameButton, LoadGameButton, SettingsButton, HelpButton, CreditsButton,
+	                 QuitButton};
+
+	// KEYBOARD AND GAMEPAD NAVIGATION IS NEW WORK, not a port. The Godot build
+	// has none anywhere -- no grab_focus, no focus_neighbor, no ui_accept
+	// handling in MainMenu.gd, PauseMenu.gd or Settings.gd. Its menus are
+	// mouse-only, and the manual hit-testing that makes that work is a Dialogic
+	// workaround this port deliberately dropped.
+	//
+	// Slate handles the hard part: arrowing between siblings, and the gamepad
+	// mapping (D-pad and left stick to EUINavigation, Virtual_Accept to a
+	// click) comes from the application's navigation config for free. What it
+	// does NOT do by default is wrap at the ends of a list, so pressing Up on
+	// CONTINUE does nothing at all and the player cannot tell whether the menu
+	// is broken or just at the top. The boundary rule below makes it wrap.
+	{
+		TSharedRef<FNavigationMetaData> Navigation = MakeShared<FNavigationMetaData>();
+		Navigation->SetNavigationWrap(EUINavigation::Up);
+		Navigation->SetNavigationWrap(EUINavigation::Down);
+		// Left and right lead nowhere in a single column; stopping is quieter
+		// than letting focus escape to the version stamp.
+		Navigation->SetNavigationStop(EUINavigation::Left);
+		Navigation->SetNavigationStop(EUINavigation::Right);
+		Column->AddMetadata(Navigation);
+	}
 
 	return SNew(SBox)
 		.WidthOverride(L.MainPanelHalfWidth * 2.f)
@@ -262,6 +296,46 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 		[
 			Column
 		];
+}
+
+void SVoxelMainMenu::FocusDefaultWidget()
+{
+	TSharedPtr<SVoxelMenuButton> Target;
+	switch (VisiblePanel)
+	{
+	case EVoxelMenuPanel::MainColumn:
+		// The first ENABLED button, not simply the first: on a fresh install
+		// CONTINUE and LOAD GAME are both greyed out, and focusing a disabled
+		// control leaves a gamepad player pressing A at nothing.
+		for (const TSharedPtr<SVoxelMenuButton>& Button : ColumnButtons)
+		{
+			if (Button.IsValid() && Button->IsEnabled())
+			{
+				Target = Button;
+				break;
+			}
+		}
+		break;
+	case EVoxelMenuPanel::Load:
+		// CANCEL rather than the first save row: it is the control that is
+		// always there, and arrowing up from it reaches the rows.
+		Target = LoadPanelCancelButton;
+		break;
+	default:
+		if (const TSharedPtr<SVoxelMenuButton>* Found = MessagePanelBackButtons.Find(VisiblePanel))
+		{
+			Target = *Found;
+		}
+		break;
+	}
+
+	if (Target.IsValid())
+	{
+		if (const TSharedPtr<SWidget> FocusWidget = Target->GetFocusWidget())
+		{
+			FSlateApplication::Get().SetKeyboardFocus(FocusWidget, EFocusCause::SetDirectly);
+		}
+	}
 }
 
 TSharedRef<SWidget> SVoxelMainMenu::WrapInPanelFrame(TSharedRef<SWidget> Content)
@@ -350,7 +424,7 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildLoadPanel()
 
 	Column->AddSlot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
 	[
-		SNew(SVoxelMenuButton)
+		SAssignNew(LoadPanelCancelButton, SVoxelMenuButton)
 		.Text(VoxelUIStrings::ButtonCancel())
 		.FontSize(L.SaveRowButtonFont)
 		.MinHeight(L.DialogButtonHeight)
@@ -453,13 +527,14 @@ void SVoxelMainMenu::RebuildSaveList()
 	}
 }
 
-TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(const FText& Title, const FText& Body)
+TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(EVoxelMenuPanel Panel, const FText& Title, const FText& Body)
 {
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
 	const float HalfSep = L.SubPanelSeparation * 0.5f;
+	TSharedPtr<SVoxelMenuButton> BackButton;
 
-	return WrapInPanelFrame(
+	TSharedRef<SWidget> Frame = WrapInPanelFrame(
 		SNew(SVerticalBox)
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
 		[
@@ -478,13 +553,16 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMessagePanel(const FText& Title, const 
 		]
 		+ SVerticalBox::Slot().AutoHeight().Padding(FMargin(0.f, HalfSep)).HAlign(HAlign_Center)
 		[
-			SNew(SVoxelMenuButton)
+			SAssignNew(BackButton, SVoxelMenuButton)
 			.Text(VoxelUIStrings::ButtonBack())
 			.FontSize(L.SaveRowButtonFont)
 			.MinHeight(L.DialogButtonHeight)
 			.MinWidth(L.DialogButtonWidth)
 			.OnClicked_Lambda([this]() { ShowPanel(EVoxelMenuPanel::MainColumn); return FReply::Handled(); })
 		]);
+
+	MessagePanelBackButtons.Add(Panel, BackButton);
+	return Frame;
 }
 
 bool SVoxelMainMenu::HasAnyLoadableSave() const
@@ -523,6 +601,7 @@ void SVoxelMainMenu::ShowPanel(EVoxelMenuPanel Panel)
 		// it.
 		PanelSwitcher->SetActiveWidgetIndex(FMath::Clamp(Index, 0, PanelSwitcher->GetNumWidgets() - 1));
 	}
+	FocusDefaultWidget();
 }
 
 FReply SVoxelMainMenu::OnKeyDown(const FGeometry& Geometry, const FKeyEvent& KeyEvent)

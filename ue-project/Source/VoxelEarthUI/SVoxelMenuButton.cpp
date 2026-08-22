@@ -154,3 +154,8 @@ FMargin SVoxelMenuButton::GetHoverSlidePadding() const
 	// does not move -- which is what the mock's translateX does.
 	return FMargin(Slide, 0.f, 0.f, 0.f);
 }
+
+TSharedPtr<SWidget> SVoxelMenuButton::GetFocusWidget() const
+{
+	return Button;
+}
