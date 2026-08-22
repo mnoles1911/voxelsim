@@ -123,6 +123,18 @@ python tools\imgdiff.py <before.png> <after.png>
 Pass condition is the documented within-session noise floor. The front end must
 not change a single pixel of a world capture.
 
+### Headless tests
+
+```sh
+UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 \
+  -ExecCmds="Automation RunTests VoxelEarth.FrontEnd; Quit"
+```
+
+`VoxelFrontEndTests.cpp` covers the progress model's invariants, Godot's
+byte-space `darkened()`, and save-name slugification. Almost all of a menu is
+pixels and belongs to the captures above; this covers the parts that are not,
+and whose failures a still frame cannot show.
+
 ### Lints (these DO run in CI)
 
 ```sh

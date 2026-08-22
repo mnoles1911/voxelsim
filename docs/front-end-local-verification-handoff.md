@@ -82,6 +82,31 @@ both silently stop being called** — the subsystems would then be created in
 editor worlds. Check the base class once. If it is wrong, it is wrong in the
 older file too, which is worth knowing on its own.
 
+## Stage 1b — run the headless tests
+
+Cheapest feedback available, and it needs no display:
+
+```sh
+UnrealEditor-Cmd.exe VoxelEarth.uproject -unattended -nullrhi -nop4 ^
+  -ExecCmds="Automation RunTests VoxelEarth.FrontEnd; Quit"
+```
+
+Three tests, covering the front end's pure logic — the parts whose invariants
+are invisible in a screenshot:
+
+- `LoadProgress` — the bar is monotone, floored by elapsed time, never reaches
+  1.0, and clamps out-of-range inputs rather than propagating a NaN into a
+  full-width fill.
+- `Darkened` — Godot's `Color.darkened()` scales sRGB BYTES, not light. Both
+  the pressed and disabled button states are defined through it, so the obvious
+  linear-space implementation is wrong on every menu.
+- `Slugify` — including the case that matters most: an all-punctuation save
+  name must not slug to the empty string, because a save directory named `""`
+  IS the saves root.
+
+While you are there, `Automation RunTests VoxelEarth` runs the twelve
+pre-existing ones too.
+
 ## Stage 2 — the non-regression diff (do this BEFORE looking at any menu)
 
 This is the one that protects the capture archive, and it is why the engine

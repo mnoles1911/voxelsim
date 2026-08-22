@@ -19,6 +19,17 @@ namespace VoxelReadyProbeDetail
 const float kRingWeights[] = {0.35f, 0.25f, 0.20f, 0.20f, 0.10f, 0.10f};
 } // namespace VoxelReadyProbeDetail
 
+float ComputeLoadProgress(float TimeFraction, float SpatialFraction, float RingFillFraction, float PreviousProgress)
+{
+	// Ring fill dominates the work term: it keeps moving through the long tail,
+	// whereas the spatial term saturates as soon as the ground under the spawn
+	// exists and then says nothing more.
+	const float Work = 0.25f * FMath::Clamp(SpatialFraction, 0.f, 1.f)
+	                   + 0.75f * FMath::Clamp(RingFillFraction, 0.f, 1.f);
+	const float Raw = FMath::Max(FMath::Clamp(TimeFraction, 0.f, 1.f), Work);
+	return FMath::Clamp(FMath::Max(PreviousProgress, Raw), 0.f, 0.995f);
+}
+
 void FVoxelWorldReadyProbe::Start(const FVector& AnchorUU, const FVoxelReadyProbeConfig& InConfig)
 {
 	Config = InConfig;

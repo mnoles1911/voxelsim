@@ -531,39 +531,20 @@ void UVoxelFrontEndSubsystem::StartWorldAndPawn()
 float UVoxelFrontEndSubsystem::ComputeProgress() const
 {
 	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
-
-	// THREE TERMS, EACH PREVENTING A SPECIFIC WAY THE BAR LIES.
-	//
-	// The Godot bar was elapsed/total and nothing else -- honest about time,
-	// wrong about work. On a warm cache it read 30% at the moment the world
-	// was ready; on a cold fill it read 100% while chunks were still landing.
-	// Both were visible in that build.
 	const float TimeTerm = Switches.LoadMaxHoldSeconds > 0.f
-	                           ? FMath::Clamp(LoadElapsedSeconds / Switches.LoadMaxHoldSeconds, 0.f, 1.f)
+	                           ? LoadElapsedSeconds / Switches.LoadMaxHoldSeconds
 	                           : 0.f;
-
-	float WorkTerm = 0.f;
+	float Spatial = 0.f;
+	float RingFill = 0.f;
 	if (ReadyProbe.IsValid())
 	{
 		const FVoxelReadyProbeStatus& Probe = ReadyProbe->GetStatus();
-		const float SpatialTerm = Probe.ProbeTotal > 0 ? float(Probe.ProbeHits) / float(Probe.ProbeTotal) : 0.f;
-		// Ring fill dominates: it is the term that keeps moving through the
-		// long tail, whereas the spatial term saturates as soon as the ground
-		// under the spawn exists and then says nothing more.
-		WorkTerm = 0.25f * SpatialTerm + 0.75f * Probe.RingFillFraction;
+		Spatial = Probe.ProbeTotal > 0 ? float(Probe.ProbeHits) / float(Probe.ProbeTotal) : 0.f;
+		RingFill = Probe.RingFillFraction;
 	}
-
-	// max(): a work bar can sit on one number for tens of seconds while an R3
-	// tail drains, and a bar that never moves reads as a hang.
-	float Raw = FMath::Max(TimeTerm, WorkTerm);
-	// Monotone: RecomputeDesiredSet GROWS the desired set as the anchor
-	// settles, so loaded/(loaded+outstanding) genuinely decreases. A bar that
-	// goes backwards reads as a hang too, and a worse one.
-	Raw = FMath::Max(LastProgress, Raw);
-	// And never 100 until the gate actually passes. TickLoading snaps it to
-	// 1.0 at that moment; until then 100% would be the one lie this whole
-	// model exists to avoid.
-	return FMath::Clamp(Raw, 0.f, 0.995f);
+	// The model itself is a pure function, in VoxelWorldReadyProbe.h, so its
+	// three invariants can be tested without a world.
+	return ComputeLoadProgress(TimeTerm, Spatial, RingFill, LastProgress);
 }
 
 void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)

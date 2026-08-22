@@ -109,7 +109,7 @@ VOXELEARTHUI_API FLinearColor Tint(const FColor& Colour, float Alpha = 1.0f);
 // THIS IS NOT FLinearColor * (1-k). Godot's implementation multiplies the
 // stored sRGB components, and its Colors are stored non-linearly, so
 // PANEL_OAK_2.darkened(0.15) is a scaling of the BYTES -- #2e1b0d becomes
-// #271709, not the rather different colour a linear-space scale would give.
+// #27170b, not the rather different colour a linear-space scale would give.
 // The pressed and disabled button states are both defined this way, so getting
 // it wrong is visible on every menu.
 VOXELEARTHUI_API FColor Darkened(const FColor& Colour, float Amount);

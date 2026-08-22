@@ -85,6 +85,29 @@ struct VOXELEARTHUI_API FVoxelReadyProbeStatus
 	bool bTimedOut = false;
 };
 
+// The loading bar's progress model, as a pure function of its four inputs.
+//
+// FREE AND PURE SO IT CAN BE TESTED. It has three invariants that are easy to
+// state, easy to break, and invisible in a screenshot -- monotone, floored by
+// elapsed time, and never 1.0 -- and each of them exists because the Godot
+// original's bar lied in a specific way. See VoxelFrontEndTests.cpp.
+//
+//   TimeFraction   elapsed / MaxHold, clamped. The floor: a work-only bar can
+//                  sit on one number for tens of seconds while an R3 tail
+//                  drains, and a bar that never moves reads as a hang.
+//   SpatialFraction probe hits / probe total.
+//   RingFillFraction weighted loaded/(loaded+outstanding) over the gated rings.
+//   PreviousProgress the last value returned. The monotone clamp: the desired
+//                  set GROWS as the anchor settles, so the raw ratio genuinely
+//                  decreases, and a bar going backwards reads worse than one
+//                  standing still.
+//
+// Returns at most 0.995. Reaching 1.0 is the caller's job, and only when the
+// gate actually passes -- "100% because a timer expired" is the one lie this
+// whole model exists to avoid.
+VOXELEARTHUI_API float ComputeLoadProgress(float TimeFraction, float SpatialFraction, float RingFillFraction,
+                                           float PreviousProgress);
+
 class VOXELEARTHUI_API FVoxelWorldReadyProbe
 {
 public:
