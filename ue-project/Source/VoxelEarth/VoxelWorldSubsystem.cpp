@@ -754,7 +754,10 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const
 // shared, refcounted (Level, ChunkX, ChunkY) -> column grid map, consulted by
 // every CPU mesh job that would otherwise build the grid from scratch.
 //
-// OFF BY DEFAULT (-VoxelSharedGridCache=<entries>, 0 = off) -- see the
+// ON BY DEFAULT at cap 1024 since 2026-08-22 (-VoxelNoSharedGridCache turns it
+// off; -VoxelSharedGridCache=<entries> re-sizes it). See the accessor for the
+// legs that flipped it and for why 1024 rather than 4096. Text below that still
+// describes the default as off is kept where it explains the design -- see the
 // accessor's doc comment. The -VoxelL0GridCacheProbe measurement that decides
 // whether this cache earns its memory is being taken by the main session;
 // until that number is in, the default must not change behaviour.
@@ -2829,7 +2832,34 @@ int32 SharedGridCacheEntries()
 {
 	static const int32 Entries = []
 	{
-		int32 Value = 0;
+		// ON BY DEFAULT since 2026-08-22, and inverted to the NEGATIVE switch
+		// -VoxelNoSharedGridCache for the reason GpuMeshEnabled records: a PIE
+		// session launched from the editor has no command line of its own, so
+		// an opt-IN switch can never reach the session that most needs it.
+		//
+		// THE MEASUREMENT THAT FLIPPED IT. Matched 30 m/s line legs, same
+		// binary, same spawn, frozen sun, cap 1024:
+		//
+		//              cycPerColumn  brickPacks  frames   p95      hitches
+		//   off           3,056-3,211   475,145   7,626  68.94ms    3,316
+		//   on              902-1,068   623,804  10,321  42.87ms    1,693
+		//
+		// Coverage identical (holes=0 of ~24,320 scanned in both), so the win
+		// is not bought by covering less ground. The mechanism is the one the
+		// -VoxelL0GridCacheProbe leg predicted: 83.6% hit over 324,193 level-0
+		// dispatches, 4.40x footprint reuse, because the 8-16 chunks stacked
+		// over one footprint were each rebuilding the same 34x34 column grid.
+		//
+		// 1024 IS THE KNEE, MEASURED, NOT GUESSED. 4096 was tried in the same
+		// conditions: hit% rose 63.0 -> 69.4 and throughput FELL (brickPacks
+		// 623,804 -> 583,834, p95 42.87 -> 51.53 ms) for 1,698 MB against
+		// 424 MB. Bigger is worse past here.
+		//
+		// THE COST IS 424 MB OF SYSTEM RAM at cap 1024, and the doc comment
+		// above priced it at ~208 MB from sizeof(FGrid) alone -- the real
+		// entry is ~424 KB. Anyone changing the cap should read the measured
+		// MB off the perf line, not compute it.
+		int32 Value = FParse::Param(FCommandLine::Get(), TEXT("VoxelNoSharedGridCache")) ? 0 : 1024;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelSharedGridCache="), Value);
 		// Clamped at 4096 (~832 MB): past that the cache is bigger than the
 		// footprint population of the whole cascade could ever use.
