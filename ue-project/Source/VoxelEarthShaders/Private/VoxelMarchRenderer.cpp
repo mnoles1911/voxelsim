@@ -151,7 +151,14 @@ namespace
 	// THE CLIMATE TINT'S STRENGTH, on a cvar because it is the term most likely
 	// to want tuning by eye. 0 makes the marcher byte-identical to before it.
 	TAutoConsoleVariable<float> CVarVoxelMarchClimateStrength(
-		TEXT("voxel.March.ClimateStrength"), 1.0f,
+		// DEFAULT 0 SINCE 2026-08-22, at the owner's request. The terrain is
+		// rendering with blue speckling that gets stronger at coarser LODs and
+		// is worst directly under the camera, and this tint is the newest thing
+		// in the shading path -- so it is off by default until the speckling
+		// has been judged with it out of the picture. Set to 1 to A/B it: if
+		// the blue returns, this is the cause; if it does not, the cause is the
+		// material lookup or the GI probe and this was never implicated.
+		TEXT("voxel.March.ClimateStrength"), 0.0f,
 		TEXT("Strength of the marcher's per-chunk climate tint (temperature/precipitation from "
 		     "the chunk record's dword 7). 0 = off and byte-identical to no tint. 1 = full. "
 		     "The quad path feeds these two bytes to M_VoxelTerrain's biome graph instead; the "
