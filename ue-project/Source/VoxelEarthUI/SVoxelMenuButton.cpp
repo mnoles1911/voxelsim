@@ -9,6 +9,7 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/SOverlay.h"
 #include "Widgets/Images/SImage.h"
+#include "Types/NavigationMetaData.h"
 
 namespace SVoxelMenuButtonDetail
 {
@@ -68,6 +69,21 @@ void SVoxelMenuButton::Construct(const FArguments& InArgs)
 			]
 		];
 	Button = ButtonRef;
+
+	// NAVIGATION METADATA GOES ON THE FOCUSABLE WIDGET, NOT ON A CONTAINER.
+	// FSlateApplication::AttemptNavigation reads FNavigationMetaData off the
+	// widget that currently HAS focus, to decide what happens when navigation
+	// finds no neighbour in that direction. Attaching it to the enclosing
+	// SVerticalBox -- which is where this started -- means it is never
+	// consulted, so pressing Up on the first button does nothing at all and a
+	// gamepad player cannot tell a menu at its top edge from a broken one.
+	//
+	// Harmless on a button in the MIDDLE of a list: a real neighbour is found
+	// first and the boundary rule never comes up.
+	TSharedRef<FNavigationMetaData> Navigation = MakeShared<FNavigationMetaData>();
+	Navigation->SetNavigationWrap(EUINavigation::Up);
+	Navigation->SetNavigationWrap(EUINavigation::Down);
+	ButtonRef->AddMetadata(Navigation);
 
 	TSharedRef<SBox> Sized =
 		SNew(SBox)

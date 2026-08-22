@@ -51,7 +51,11 @@ const FLinearColor kGlassFill = FLinearColor(0.961f, 0.816f, 0.431f, 0.05f);   /
 FSlateResourceHandle WhiteHandle()
 {
 	static const FSlateBrush* White = FCoreStyle::Get().GetBrush("WhiteBrush");
-	return FSlateApplication::Get().GetRenderer()->GetResourceHandle(*White);
+	// The three-argument form is the pure virtual; the one-argument
+	// convenience wrapper is the thing that might not survive a version bump.
+	// LocalSize and DrawScale only matter for atlased/scaled brushes, and this
+	// is a 1x1 white texture.
+	return FSlateApplication::Get().GetRenderer()->GetResourceHandle(*White, FVector2f::ZeroVector, 1.0f);
 }
 
 // Fills a CONVEX polygon given in local widget space.
@@ -67,7 +71,14 @@ void FillConvexPoly(FSlateWindowElementList& Out, int32 LayerId, const FGeometry
 	{
 		return;
 	}
-	const FSlateRenderTransform& Transform = Geometry.ToPaintGeometry().GetAccumulatedRenderTransform();
+	// BY VALUE, VIA A NAMED TEMPORARY. FGeometry::ToPaintGeometry() returns an
+	// FPaintGeometry by value and GetAccumulatedRenderTransform() returns a
+	// reference to a member of it; binding that reference directly to the
+	// call chain does NOT extend the temporary's lifetime through a member
+	// function, so it dies at the end of the full expression and every vertex
+	// below is transformed by freed memory. Compiles clean, draws garbage.
+	const FPaintGeometry PaintGeometry = Geometry.ToPaintGeometry();
+	const FSlateRenderTransform& Transform = PaintGeometry.GetAccumulatedRenderTransform();
 	const FColor Packed = Colour.ToFColor(/*bSRGB=*/false);
 
 	TArray<FSlateVertex> Vertices;
@@ -83,9 +94,11 @@ void FillConvexPoly(FSlateWindowElementList& Out, int32 LayerId, const FGeometry
 	Indices.Reserve((Points.Num() - 2) * 3);
 	for (int32 Index = 1; Index + 1 < Points.Num(); ++Index)
 	{
-		Indices.Add(0);
-		Indices.Add(uint32(Index));
-		Indices.Add(uint32(Index + 1));
+		// SlateIndex, not uint32: its width is an engine detail and casting to
+		// the alias cannot narrow by surprise.
+		Indices.Add(SlateIndex(0));
+		Indices.Add(SlateIndex(Index));
+		Indices.Add(SlateIndex(Index + 1));
 	}
 	FSlateDrawElement::MakeCustomVerts(Out, LayerId, WhiteHandle(), Vertices, Indices, nullptr, 0, 0);
 }

@@ -24,7 +24,7 @@ const TCHAR* const kBackgroundsSubdir = TEXT("UI/Backgrounds");
 // Decode one image file to BGRA8. Runs on a worker; touches nothing but its
 // arguments. Returns false on any failure, which the caller reports once and
 // then treats as "this file is not in the rotation".
-bool DecodeToBGRA(const FString& Path, TArray<uint8>& OutPixels, int32& OutWidth, int32& OutHeight)
+bool DecodeToBGRA(const FString& Path, TArray64<uint8>& OutPixels, int32& OutWidth, int32& OutHeight)
 {
 	TArray<uint8> FileBytes;
 	if (!FFileHelper::LoadFileToArray(FileBytes, *Path))
@@ -52,7 +52,7 @@ bool DecodeToBGRA(const FString& Path, TArray<uint8>& OutPixels, int32& OutWidth
 	}
 	OutWidth = Wrapper->GetWidth();
 	OutHeight = Wrapper->GetHeight();
-	return OutWidth > 0 && OutHeight > 0 && OutPixels.Num() >= OutWidth * OutHeight * 4;
+	return OutWidth > 0 && OutHeight > 0 && OutPixels.Num() >= int64(OutWidth) * int64(OutHeight) * 4;
 }
 } // namespace VoxelUIAssetDetail
 
@@ -72,10 +72,34 @@ void FVoxelUIAssetLibrary::Shutdown()
 	VoxelUIAssetDetail::GInstance.Reset();
 }
 
+void FVoxelUIAssetLibrary::ReleaseTextures()
+{
+	// Generation bump first: it is what stops a decode still in flight from
+	// landing in the array we are about to clear.
+	++Generation;
+	for (FEntry& Entry : Entries)
+	{
+		Entry.Brush.Reset();
+		Entry.bDecodeStarted = false;
+		Entry.bDecodeFailed = false;
+	}
+	if (Cache.IsValid())
+	{
+		const int32 Released = Cache->Textures.Num();
+		Cache->Textures.Reset();
+		if (Released > 0)
+		{
+			UE_LOG(LogVoxelUI, Log, TEXT("Menu backgrounds: released %d texture(s)."), Released);
+		}
+	}
+}
+
 void FVoxelUIAssetLibrary::RescanBackgrounds()
 {
 	Entries.Reset();
 	Order.Reset();
+	// Invalidates every decode currently in flight; see FEntry / Generation.
+	++Generation;
 
 	if (FVoxelFrontEndSwitches::Get().bNoAssets)
 	{
@@ -176,13 +200,14 @@ void FVoxelUIAssetLibrary::BeginDecode(int32 EntryIndex)
 {
 	Entries[EntryIndex].bDecodeStarted = true;
 	const FString Path = Entries[EntryIndex].Path;
+	const uint32 StartedUnder = Generation;
 
 	// BackgroundNormal, the same priority the chunk mesher's jobs use. The
 	// menu's art is emphatically not more urgent than the world it is hiding.
 	UE::Tasks::Launch(UE_SOURCE_LOCATION,
-	                  [this, EntryIndex, Path]()
+	                  [this, EntryIndex, Path, StartedUnder]()
 	                  {
-		                  TArray<uint8> Pixels;
+		                  TArray64<uint8> Pixels;
 		                  int32 Width = 0;
 		                  int32 Height = 0;
 		                  const bool bOk = VoxelUIAssetDetail::DecodeToBGRA(Path, Pixels, Width, Height);
@@ -191,11 +216,23 @@ void FVoxelUIAssetLibrary::BeginDecode(int32 EntryIndex)
 		                  // UTexture2D::CreateTransient makes a UObject, and
 		                  // UpdateResource enqueues a render command.
 		                  AsyncTask(ENamedThreads::GameThread,
-		                            [this, EntryIndex, Path, bOk, Pixels = MoveTemp(Pixels), Width, Height]() mutable
+		                            [this, EntryIndex, Path, bOk, StartedUnder, Pixels = MoveTemp(Pixels), Width,
+		                             Height]() mutable
 		                            {
-			                            if (!VoxelUIAssetDetail::GInstance)
+			                            // THREE GUARDS, EACH FOR A DIFFERENT WAY THIS CAN
+			                            // ARRIVE TOO LATE. A null instance means shutdown.
+			                            // A DIFFERENT instance means Shutdown() then Get()
+			                            // built a new one at a new address, so `this`
+			                            // dangles -- a bare null check passes there and
+			                            // writes through freed memory. A stale generation
+			                            // means RescanBackgrounds (which is public) reset
+			                            // Entries underneath us, so EntryIndex now points
+			                            // at something else or past the end.
+			                            if (VoxelUIAssetDetail::GInstance.Get() != this
+			                                || StartedUnder != Generation
+			                                || !Entries.IsValidIndex(EntryIndex))
 			                            {
-				                            return; // shut down while we were decoding
+				                            return;
 			                            }
 			                            if (!bOk)
 			                            {
@@ -212,7 +249,7 @@ void FVoxelUIAssetLibrary::BeginDecode(int32 EntryIndex)
 	                  UE::Tasks::ETaskPriority::BackgroundNormal);
 }
 
-void FVoxelUIAssetLibrary::FinishDecode(int32 EntryIndex, TArray<uint8>&& Pixels, int32 Width, int32 Height)
+void FVoxelUIAssetLibrary::FinishDecode(int32 EntryIndex, TArray64<uint8>&& Pixels, int32 Width, int32 Height)
 {
 	check(IsInGameThread());
 
@@ -226,10 +263,19 @@ void FVoxelUIAssetLibrary::FinishDecode(int32 EntryIndex, TArray<uint8>&& Pixels
 	// SRGB on: these are ordinary display-referred photographs, and decoding
 	// them as linear would wash the whole menu out.
 	Texture->SRGB = true;
-	// No mips and no compression: the image is drawn at roughly 1:1 as a
-	// full-screen backdrop, so there is no minification to alias and nothing
-	// for a mip chain to do but cost memory.
+	// No mips: the image is drawn at roughly 1:1 as a full-screen backdrop, so
+	// there is no minification to alias and nothing for a mip chain to do but
+	// cost memory.
+	//
+	// EDITOR-ONLY. UTexture::MipGenSettings lives inside WITH_EDITORONLY_DATA,
+	// so an unguarded assignment compiles in the editor target and fails in
+	// the Game and packaged-client targets -- which is precisely what this
+	// ClientOnly module exists to serve. CreateTransient already produces a
+	// single-mip texture at runtime, so the guarded branch is belt to the
+	// runtime's braces.
+#if WITH_EDITORONLY_DATA
 	Texture->MipGenSettings = TMGS_NoMipmaps;
+#endif
 	Texture->Filter = TF_Bilinear;
 	Texture->AddressX = TA_Clamp;
 	Texture->AddressY = TA_Clamp;

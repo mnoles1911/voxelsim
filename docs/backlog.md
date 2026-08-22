@@ -1477,6 +1477,16 @@ that DO run in CI pass. Treat the first item as blocking.
 5. **Font metrics (R2).** Macondo at 84 px will not lay out identically in
    Slate and Godot. Expect a few pixels in title width and vertical centring;
    `Config/DefaultVoxelUI.ini` is where to correct it without a rebuild.
+6. **Two API forms a read-only audit could not settle**, both cheap to check
+   the moment there is an engine to check against. `FSlateDrawElement::MakeLines`
+   is passed `TArray<FVector2D>` (`SVoxelHourglass.cpp`) on the grounds that
+   the float-precision overload is the newer of the two; and
+   `UWorldSubsystem::DoesSupportWorldType(const EWorldType::Type)` is the
+   signature both `UVoxelFrontEndSubsystem` and the pre-existing
+   `UVoxelWorldSubsystem` override. If the latter has been superseded by the
+   `const UWorld*` form, both still COMPILE and both silently stop being
+   called -- so it is worth one look, and if it is wrong it is wrong in the
+   older file too.
 
 **Deferred, deliberately, with their seams left open:**
 

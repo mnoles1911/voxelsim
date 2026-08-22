@@ -26,6 +26,7 @@
 
 #include "CoreMinimal.h"
 #include "Styling/SlateBrush.h"
+#include "Templates/SharedPointer.h"
 #include "UObject/Object.h"
 #include "UObject/StrongObjectPtr.h"
 #include "VoxelUIAssetLibrary.generated.h"
@@ -45,6 +46,8 @@ public:
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UTexture2D>> Textures;
 };
+
+class UTexture2D;
 
 class VOXELEARTHUI_API FVoxelUIAssetLibrary
 {
@@ -72,6 +75,15 @@ public:
 	// Kicks the decode on first request.
 	const FSlateBrush* RequestBackground(int32 Index);
 
+	// Drops every decoded texture and brush.
+	//
+	// Called at hand-off, because the front end is the ONLY thing that draws
+	// these and after hand-off nothing will again. Six 1920-wide BGRA8
+	// textures is roughly 48 MB, which on a project whose stated constraint is
+	// the frame-time tail is not memory to hold for the rest of the session
+	// out of politeness. A later menu simply decodes them again.
+	void ReleaseTextures();
+
 private:
 	struct FEntry
 	{
@@ -83,9 +95,18 @@ private:
 	};
 
 	void BeginDecode(int32 EntryIndex);
-	void FinishDecode(int32 EntryIndex, TArray<uint8>&& Pixels, int32 Width, int32 Height);
+	// TArray64, matching IImageWrapper::GetRaw's pure virtual. The TArray<uint8>
+	// convenience overload has been on a deprecation track for several
+	// versions; using the 64-bit form directly is both future-proof and one
+	// fewer copy.
+	void FinishDecode(int32 EntryIndex, TArray64<uint8>&& Pixels, int32 Width, int32 Height);
 
 	TArray<FEntry> Entries;
+	// Bumped by RescanBackgrounds and ReleaseTextures. An in-flight decode
+	// captures the value it started under and drops its result if it no longer
+	// matches -- without which a rescan mid-decode indexes an Entries array
+	// that has been reset underneath it.
+	uint32 Generation = 0;
 	// Indices into Entries, in the current shuffled order.
 	TArray<int32> Order;
 	TStrongObjectPtr<UVoxelUITextureCache> Cache;

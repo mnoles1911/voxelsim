@@ -14,7 +14,6 @@
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSpacer.h"
 #include "Framework/Application/SlateApplication.h"
-#include "Types/NavigationMetaData.h"
 #include "Widgets/Layout/SScrollBox.h"
 #include "Widgets/Layout/SWidgetSwitcher.h"
 #include "Widgets/Text/STextBlock.h"
@@ -271,22 +270,11 @@ TSharedRef<SWidget> SVoxelMainMenu::BuildMainColumn()
 	// mouse-only, and the manual hit-testing that makes that work is a Dialogic
 	// workaround this port deliberately dropped.
 	//
-	// Slate handles the hard part: arrowing between siblings, and the gamepad
+	// Slate handles the rest: arrowing between siblings, and the gamepad
 	// mapping (D-pad and left stick to EUINavigation, Virtual_Accept to a
-	// click) comes from the application's navigation config for free. What it
-	// does NOT do by default is wrap at the ends of a list, so pressing Up on
-	// CONTINUE does nothing at all and the player cannot tell whether the menu
-	// is broken or just at the top. The boundary rule below makes it wrap.
-	{
-		TSharedRef<FNavigationMetaData> Navigation = MakeShared<FNavigationMetaData>();
-		Navigation->SetNavigationWrap(EUINavigation::Up);
-		Navigation->SetNavigationWrap(EUINavigation::Down);
-		// Left and right lead nowhere in a single column; stopping is quieter
-		// than letting focus escape to the version stamp.
-		Navigation->SetNavigationStop(EUINavigation::Left);
-		Navigation->SetNavigationStop(EUINavigation::Right);
-		Column->AddMetadata(Navigation);
-	}
+	// click) from the application's navigation config. The end-of-list WRAP
+	// lives on each SVoxelMenuButton's inner SButton rather than here -- see
+	// that file for why a container is the wrong place for it.
 
 	return SNew(SBox)
 		.WidthOverride(L.MainPanelHalfWidth * 2.f)

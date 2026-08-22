@@ -112,7 +112,7 @@ void FVoxelWorldReadyProbe::Poll(const UVoxelWorldSubsystem& World)
 		Pending += Progress.LevelPendingCount[Level];
 		Jobs += Progress.LevelJobsInFlight[Level];
 
-		const float Weight = Level < UE_ARRAY_COUNT(VoxelReadyProbeDetail::kRingWeights)
+		const float Weight = Level < int32(UE_ARRAY_COUNT(VoxelReadyProbeDetail::kRingWeights))
 		                         ? VoxelReadyProbeDetail::kRingWeights[Level]
 		                         : 0.1f;
 		const int32 Loaded = Progress.LevelLoadedCount[Level];

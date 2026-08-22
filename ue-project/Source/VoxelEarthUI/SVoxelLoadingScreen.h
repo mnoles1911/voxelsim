@@ -31,6 +31,7 @@
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
+#include "Types/SlateStructs.h" // FOptionalSize, used in the bar-fill accessor
 
 class VOXELEARTHUI_API SVoxelLoadingScreen : public SCompoundWidget
 {

@@ -3,6 +3,7 @@
 #include "SVoxelHourglass.h"
 #include "SVoxelLoadingScreen.h"
 #include "SVoxelMainMenu.h"
+#include "VoxelUIAssetLibrary.h"
 #include "VoxelWorldReadyProbe.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
@@ -29,6 +30,7 @@
 #include "Misc/DateTime.h"               // the NEW GAME world backup stamp
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformMisc.h"           // FPlatformMisc::RequestExit
 
 namespace VoxelFrontEndDetail
 {
@@ -61,10 +63,24 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: suppressed (%s)."), VoxelFrontEnd::WhyThisAnswer());
 		return;
 	}
+	State = EVoxelFrontEndState::Pending;
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: active (%s)."), VoxelFrontEnd::WhyThisAnswer());
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: menu font %s."),
 	       FVoxelUIStyle::Get().IsProjectFontAvailable() ? TEXT("loaded") : TEXT("FALLBACK (engine default face)"));
 }
+
+// Out of line, and this is not a formality. ReadyProbe is a
+// TUniquePtr<FVoxelWorldReadyProbe> and the generated
+// UVoxelFrontEndSubsystem(FVTableHelper&) instantiates the implicit destructor
+// inside VoxelFrontEndSubsystem.gen.cpp, which includes only the header --
+// where FVoxelWorldReadyProbe is an incomplete type. Deleting through it there
+// is C4150 on MSVC and -Wdelete-incomplete on Clang, and either way
+// ~FVoxelWorldReadyProbe silently does not run. Declaring the destructor and
+// defining it HERE, where the type is complete, is the standard UE pImpl
+// answer. (The TSharedPtr widget members need none of this: TSharedPtr
+// type-erases its deleter.)
+UVoxelFrontEndSubsystem::UVoxelFrontEndSubsystem() = default;
+UVoxelFrontEndSubsystem::~UVoxelFrontEndSubsystem() = default;
 
 void UVoxelFrontEndSubsystem::Deinitialize()
 {
@@ -75,7 +91,9 @@ void UVoxelFrontEndSubsystem::Deinitialize()
 void UVoxelFrontEndSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 {
 	Super::OnWorldBeginPlay(InWorld);
-	if (State == EVoxelFrontEndState::Inactive)
+	// The policy, not the state, because a state that has been mis-assigned is
+	// exactly how this went wrong once already.
+	if (!VoxelFrontEnd::IsEnabledThisRun())
 	{
 		return;
 	}
@@ -157,6 +175,9 @@ bool UVoxelFrontEndSubsystem::IsTickable() const
 	// rather than early-returning inside Tick keeps the front end genuinely
 	// free once the player has the world, which matters because this project
 	// is frame-time bound and a per-frame no-op is still a per-frame call.
+	// Pending ticks harmlessly -- Tick's dispatch has no branch for it -- and
+	// is a state the subsystem passes through in the frames before the world
+	// begins play.
 	return State != EVoxelFrontEndState::Inactive && State != EVoxelFrontEndState::Playing;
 }
 
@@ -624,6 +645,11 @@ void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
 	// reveals a live world rather than cutting to one.
 	TeardownMenu();
 	ReadyProbe.Reset();
+	// The front end is the only thing that draws the background art, and it is
+	// now finished with it -- six 1920-wide BGRA8 textures is roughly 48 MB to
+	// be holding for the rest of a session on a project whose stated
+	// constraint is the frame-time tail.
+	FVoxelUIAssetLibrary::Get().ReleaseTextures();
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: handed off to the player."));
 	State = EVoxelFrontEndState::Playing;
 }

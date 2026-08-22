@@ -18,6 +18,17 @@ enum class EVoxelFrontEndState : uint8
 	// The front end is suppressed for this run. IsTickable() is false forever
 	// and nothing is ever added to the viewport.
 	Inactive,
+	// Enabled, but the world has not begun play yet -- Initialize has run and
+	// OnWorldBeginPlay has not.
+	//
+	// THIS STATE EXISTS BECAUSE ITS ABSENCE WAS A SHOWSTOPPER. State defaults
+	// to Inactive, Initialize only ASSIGNED Inactive on the suppressed branch,
+	// and OnWorldBeginPlay opens with `if (State == Inactive) return;` -- so on
+	// the enabled path the log said "active" and the early-out fired anyway.
+	// The menu never appeared, IsTickable() was false forever, and nothing said
+	// so. "Enabled" and "not started yet" have to be distinguishable states,
+	// not the same one.
+	Pending,
 	// The main menu owns the screen. Streaming is held: ChunkOwner is null, so
 	// UVoxelWorldSubsystem::Tick returns on its first line.
 	Menu,
@@ -39,6 +50,11 @@ class VOXELEARTHUI_API UVoxelFrontEndSubsystem : public UTickableWorldSubsystem
 	GENERATED_BODY()
 
 public:
+	// Both out of line in the .cpp -- see the comment there. ReadyProbe holds
+	// an incomplete type in this header.
+	UVoxelFrontEndSubsystem();
+	virtual ~UVoxelFrontEndSubsystem() override;
+
 	virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const override;
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
