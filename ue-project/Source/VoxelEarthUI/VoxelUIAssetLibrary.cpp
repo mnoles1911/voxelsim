@@ -3,6 +3,7 @@
 #include "VoxelEarthUI.h"
 #include "VoxelFrontEndSwitches.h"
 
+#include "Async/Async.h"      // AsyncTask(ENamedThreads::GameThread, ...)
 #include "Engine/Texture2D.h"
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"

@@ -254,8 +254,13 @@ int32 SVoxelHourglass::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 		// The gold outline. bAntialias=false matches the GDScript's explicit
 		// choice: Godot triangulates every antialiased segment, and at this
 		// size the line sits on whole-pixel boundaries and reads clean without.
-		TArray<FVector2f> Outline = {P(0.f, 0.f),      P(kSvgW, 0.f),  P(21.f, kWaistY), P(kSvgW, kSvgH),
-		                             P(0.f, kSvgH),    P(19.f, kWaistY), P(0.f, 0.f)};
+		// FVector2D rather than FVector2f: FSlateVertex::Make takes the float
+		// form, but MakeLines' point array has been FVector2D for far longer
+		// and the float overload is the newer of the two. Where the two APIs
+		// disagree, prefer the one that has been stable.
+		const auto Pd = [&P](float MockX, float MockY) { return FVector2D(P(MockX, MockY)); };
+		TArray<FVector2D> Outline = {Pd(0.f, 0.f),   Pd(kSvgW, 0.f),   Pd(21.f, kWaistY), Pd(kSvgW, kSvgH),
+		                             Pd(0.f, kSvgH), Pd(19.f, kWaistY), Pd(0.f, 0.f)};
 		FSlateDrawElement::MakeLines(OutDrawElements, LayerId, AllottedGeometry.ToPaintGeometry(), Outline,
 		                             ESlateDrawEffect::None, Tint(Brass1), /*bAntialias=*/false, 1.f);
 	}
