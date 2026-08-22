@@ -139,6 +139,25 @@ namespace
 		TEXT("SOURCE 1 ONLY. There is one occupancy volume and it has no levels."),
 		ECVF_RenderThreadSafe);
 
+	TAutoConsoleVariable<int32> CVarVoxelMarchFallthrough(
+		TEXT("voxel.March.Fallthrough"), 0,
+		TEXT("FINE -> COARSE FALLTHROUGH (Phase 1, the no-hole invariant): how many coarser ")
+		TEXT("levels a ring segment may retry after a miss that crossed a NON-RESIDENT chunk, so ")
+		TEXT("a missing level-0 chunk renders as level-1 detail instead of a hole. 0 (default) = ")
+		TEXT("off, and off is the byte-identical control -- it is a SHADER PERMUTATION for the ")
+		TEXT("same reason rings are. 1 is the intended arm (worst case two walks per segment); 2 ")
+		TEXT("is the measurable step beyond it. Clamped to 0..2.\n")
+		TEXT("THE GATE IS RESIDENCY, NOT VALIDITY: a resident-but-empty chunk is real air and ")
+		TEXT("never falls through -- unconditional fallthrough would plug cave mouths, doorways ")
+		TEXT("and overhangs with coarse rock, a visible regression no counter catches. Sky rays ")
+		TEXT("are NOT protected by the gate (sky-band-trimmed chunks are legitimately ")
+		TEXT("non-resident), so each depth step is paid on them; that is the cost ceiling.\n")
+		TEXT("USELESS WITHOUT -VoxelHierarchicalCoverage on the game side: the coarse levels ")
+		TEXT("must actually COVER the ground inside them for a coarser retry to find anything. ")
+		TEXT("With coverage off this fires and misses, burning the extra walks for nothing. ")
+		TEXT("Rings + source 1 only."),
+		ECVF_RenderThreadSafe);
+
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
 		TEXT("voxel.March.RingCount"), 6,
 		TEXT("How many rings the cascade walks, 1..6. 6 is the full 4 km cascade; 2 is the ")
@@ -401,6 +420,12 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// levels -- and the permutation refuses to compile that combination, so the
 	// arm must not ask for it either.
 	Arm.bRings = (Arm.Source == 1) && (CVarVoxelMarchRings.GetValueOnAnyThread() != 0);
+	// Only the ring walk reads the fallthrough define, so without rings the
+	// dimension is forced to its control value -- the permutation for
+	// fallthrough > 0 with rings off is refused at compile and must not be
+	// asked for here either.
+	Arm.Fallthrough =
+		Arm.bRings ? FMath::Clamp(CVarVoxelMarchFallthrough.GetValueOnAnyThread(), 0, 2) : 0;
 	Arm.ReachM = FMath::Max(CVarVoxelMarchReachM.GetValueOnAnyThread(), 0.0f);
 	Arm.bAO = CVarVoxelMarchAO.GetValueOnAnyThread() != 0;
 	Arm.bVelocity = CVarVoxelMarchVelocity.GetValueOnAnyThread() != 0;
@@ -809,10 +834,10 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 						}
 						UE_LOG(LogVoxelMarch, Display,
 						       TEXT("  JOIN arm rings: shader=%d cpu=%d | shader skip=%u "
-						            "source=%d (stamp 0x%02x)"),
+						            "source=%d fallthrough=%u (stamp 0x%02x)"),
 						       bArmRingsGpu ? 1 : 0, S_.bArmRingsCpu ? 1 : 0,
 						       (S_.ArmStamp >> 1u) & 3u, ((S_.ArmStamp >> 3u) & 1u) ? 1 : 0,
-						       S_.ArmStamp);
+						       (S_.ArmStamp >> 4u) & 3u, S_.ArmStamp);
 						if (bArmRingsGpu != S_.bArmRingsCpu)
 						{
 							UE_LOG(LogVoxelMarch, Error,
@@ -2525,6 +2550,12 @@ class FVoxelMarchSkipDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_SKIP_LEVELS", 3);
 // runtime branch leaves both paths in the binary and silently re-bases whichever
 // arm is being measured, so rings-off would stop being a control.
 class FVoxelMarchRingsDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_RINGS");
+// Fine -> coarse fallthrough depth (Phase 1, the no-hole invariant): 0 off
+// (the byte-identical control), 1 the intended arm, 2 the measurable step
+// beyond it. A PERMUTATION and not a uniform for the reason rings are; only
+// meaningful with rings on and source 1, and the other combinations are
+// refused below rather than compiled and never selected.
+class FVoxelMarchFallthroughDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_FALLTHROUGH", 3);
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -2559,8 +2590,8 @@ class FVoxelMarchRingsDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_RINGS");
 // have to say whether the comparator MUST MATCH it or DELIBERATELY VARIES it.
 // There is no third answer and no way to skip the question.
 //
-// Source, SkipLevels, Rings, Cover, CoverSkip.
-constexpr int32 kVoxelMarchWalkShapeDims = 5;
+// Source, SkipLevels, Rings, Cover, CoverSkip, Fallthrough.
+constexpr int32 kVoxelMarchWalkShapeDims = 6;
 
 // THE COVER REACH, IN ONE PLACE. Both the shader binding and the comparator
 // guard read this; two spellings of "is cover in the picture" is how a guard
@@ -2583,6 +2614,12 @@ struct FVoxelMarchWalkShape
 	int32 Rings = 0;
 	int32 Cover = 0;
 	int32 CoverSkip = 0;
+	// Fine -> coarse fallthrough depth (VOXEL_MARCH_FALLTHROUGH). MUST MATCH:
+	// a fallthrough walk can HIT where a non-fallthrough walk holes, so a
+	// comparator at a different depth grades a different picture. Carried by
+	// FVoxelMarchFallthroughDim in the comparator's own permutation domain,
+	// exactly as Rings is.
+	int32 Fallthrough = 0;
 };
 static_assert(sizeof(FVoxelMarchWalkShape) == kVoxelMarchWalkShapeDims * sizeof(int32),
               "a walk-shape dimension was added or removed without updating "
@@ -2598,7 +2635,8 @@ class FVoxelMarchCS : public FGlobalShader
 	SHADER_USE_PARAMETER_STRUCT(FVoxelMarchCS, FGlobalShader);
 	using FParameters = FVoxelMarchCSParameters;
 	using FPermutationDomain =
-		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim>;
+		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
+		                         FVoxelMarchFallthroughDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -2618,6 +2656,13 @@ class FVoxelMarchCS : public FGlobalShader
 		// 2^level; the occupancy source is one flat volume with no levels at
 		// all, so rings against it would build, bind and mean nothing.
 		if (P.Get<FVoxelMarchRingsDim>() && P.Get<FVoxelMarchSourceDim>() == 0)
+		{
+			return false;
+		}
+		// Fallthrough is a property of the ring walk and nothing else reads the
+		// define, so a depth > 0 permutation without rings would build, bind
+		// and mean nothing -- refused for the reason the pair above is.
+		if (P.Get<FVoxelMarchFallthroughDim>() > 0 && !P.Get<FVoxelMarchRingsDim>())
 		{
 			return false;
 		}
@@ -2870,13 +2915,24 @@ class FVoxelMarchVerifySourceCS : public FGlobalShader
 	//     negative dominant component exited at TExit == TEnter. The origin
 	//     moved and the box did not.
 	//   * "43x is a level-0 number" -- true, and now for a known reason.
-	using FPermutationDomain = TShaderPermutationDomain<FVoxelMarchRingsDim>;
+	// Fallthrough rides the domain for the same reason rings had to: the
+	// kernel that produces every number must walk the cascade the marcher
+	// walks, and a dimension missing here is compiled 0 permanently -- the
+	// exact defect the block above records.
+	using FPermutationDomain =
+		TShaderPermutationDomain<FVoxelMarchRingsDim, FVoxelMarchFallthroughDim>;
 
 	static constexpr int32 kGroupSize = kVoxelMarchTileSize;
 
 	static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters& Parameters)
 	{
-		return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+		if (!IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5))
+		{
+			return false;
+		}
+		// Same rule as the march CS: only the ring walk reads the define.
+		const FPermutationDomain P(Parameters.PermutationId);
+		return !(P.Get<FVoxelMarchFallthroughDim>() > 0 && !P.Get<FVoxelMarchRingsDim>());
 	}
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
 	                                         FShaderCompilerEnvironment& OutEnvironment)
@@ -3110,8 +3166,10 @@ static FVoxelMarchRingReach VoxelMarchCheckRingReach(const FVoxelMarchRingSpec& 
 // compiles both traversals into one kernel and walks flat against hierarchical
 // over the same rays in the same frame. That is the whole instrument.
 //
-// Rings, Cover and CoverSkip MUST MATCH. Rings is already carried by the
-// comparator's own permutation domain. Cover and CoverSkip are NOT -- the
+// Rings, Cover, CoverSkip and Fallthrough MUST MATCH. Rings and Fallthrough
+// are carried by the comparator's own permutation domain (a fallthrough walk
+// can HIT where a non-fallthrough walk holes, so a comparator at a different
+// depth would grade a different picture). Cover and CoverSkip are NOT -- the
 // comparator calls VoxelMarchTraverseRings / VoxelMarchTraverseBrick directly
 // and never routes through VoxelMarchTraverseWithCover, so with cover on it
 // would compare two cover-free walks and report agreement about a picture that
@@ -3138,6 +3196,12 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	// makes whoever adds it come to this line.
 	Shipping.Cover = (VoxelMarchCoverReachUU() > 0.0f) ? 1 : 0;
 	Shipping.CoverSkip = 0;
+	// The same gating VoxelMarchGetArm applies: rings off forces the dimension
+	// to its control value, and the permutation for the other combination does
+	// not exist.
+	Shipping.Fallthrough = (Shipping.Rings != 0)
+	                           ? FMath::Clamp(CVarVoxelMarchFallthrough.GetValueOnRenderThread(), 0, 2)
+	                           : 0;
 
 	// What the comparator kernel is actually compiled with. Rings rides its
 	// permutation domain; the other two do not exist in it at all, which is
@@ -3148,6 +3212,7 @@ static bool VoxelMarchComparatorShapeAgrees(FString& OutWhy)
 	Comparator.Rings = Shipping.Rings;             // carried by FVoxelMarchRingsDim
 	Comparator.Cover = 0;                          // NOT in FVoxelMarchVerifySourceCS's domain
 	Comparator.CoverSkip = 0;
+	Comparator.Fallthrough = Shipping.Fallthrough; // carried by FVoxelMarchFallthroughDim
 
 	if (Shipping.Cover != Comparator.Cover)
 	{
@@ -4237,6 +4302,9 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Permutation.Set<FVoxelMarchSourceDim>(Arm.Source);
 			Permutation.Set<FVoxelMarchSkipDim>(Arm.Source == 1 ? Arm.SkipLevels : 0);
 			Permutation.Set<FVoxelMarchRingsDim>(Arm.bRings);
+			// Already 0 when rings are off (VoxelMarchGetArm), matching the
+			// refused permutation.
+			Permutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -4577,6 +4645,10 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				// different shapes.
 				FVoxelMarchVerifySourceCS::FPermutationDomain CPermutation;
 				CPermutation.Set<FVoxelMarchRingsDim>(Arm.bRings);
+				// MUST MATCH the march CS (see FVoxelMarchWalkShape): a
+				// comparator at a different fallthrough depth walks a
+				// different cascade than the one drawn.
+				CPermutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
 				TShaderMapRef<FVoxelMarchVerifySourceCS> CShader(ShaderMap, CPermutation);
 				FComputeShaderUtils::AddPass(
 					GraphBuilder, RDG_EVENT_NAME("VoxelMarch.VerifySource"),

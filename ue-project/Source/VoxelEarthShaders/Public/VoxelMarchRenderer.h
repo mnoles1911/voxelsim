@@ -318,6 +318,12 @@ struct FVoxelMarchArm
 	int32 SkipLevels = 0;
 	// The ring cascade arm (P3-B2b-1). Source 1 only.
 	bool bRings = false;
+	// voxel.March.Fallthrough: how many coarser levels a ring segment may
+	// retry after a miss that crossed a NON-RESIDENT chunk (Phase 1, the
+	// no-hole invariant). 0 = off = the byte-identical control. Rings only --
+	// forced to 0 when bRings is false, because only the ring walk reads the
+	// define.
+	int32 Fallthrough = 0;
 	// voxel.March.ReachM. 0 keeps the occupancy volume's own box, which is what
 	// keeps the source A/B alive. Anything else moves the local frame and is
 	// source-1 only.

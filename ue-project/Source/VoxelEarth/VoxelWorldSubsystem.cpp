@@ -3270,6 +3270,84 @@ double InnerEvictUU(int32 Level)
 	}
 	return FMath::Max(0.0, AdmitUU - InnerHysteresisChunks() * VoxelCoords::ChunkEdgeUUForLevel(Level));
 }
+
+// --- hierarchical coverage: every coarser level also covers the ground -------
+// --- inside it (Phase 1 of the no-hole plan) ---------------------------------
+//
+// -VoxelHierarchicalCoverage. DEFAULT OFF, and off is byte-identical to today:
+// every test below that consults this reduces to the code that was there
+// before, so a control leg needs no rebuild and no second binary.
+//
+// WHAT IT CHANGES. Today exactly ONE level covers any given ground -- the
+// entry pass skips a coarse candidate whose centre falls inside InnerAdmitUU
+// ("a finer ring owns this footprint, entirely") and the exit scan evicts a
+// resident one that drifts inside InnerEvictUU. So a level-0 chunk that has
+// not arrived yet IS a hole, by construction; no amount of streaming
+// throughput removes that, it only makes it rarer. With this switch on, level
+// L's footprint set becomes the full DISC DistSq < Outer[L]^2 instead of the
+// annulus, the inner eviction stops firing (there is no inner edge left to
+// evict into), and the marcher's ring walk can fall through fine -> coarse on
+// a non-resident chunk (VOXEL_MARCH_FALLTHROUGH, VoxelBrickTraverse.ush) so a
+// late fine chunk renders as coarser detail instead of a gap.
+//
+// THE COST, measured against real MODEFP per-level residency (settled 4 km
+// cascade: 26206/14842/14662/13389/13383/14332 = 96,814): each coarse level's
+// annulus is 3x the area of the whole disc below it (the presets are
+// area-balanced by design -- see kDefaultRingPresets), so full coverage is a
+// flat x4/3 per coarse level, +24.3% resident chunks overall, ~120,350. That
+// puts the DEFAULT 131,072-chunk brick pool at 92% -- inside eviction range
+// under flight, and pool evictions must stay at zero (the P2 gate). The pool
+// is therefore raised alongside this switch, from the SAME command-line flag,
+// in VoxelBrickPool.cpp's Init -- see the note there. The steady-state
+// admission RATE goes DOWN, not up: an annulus sweeping sideways gains ground
+// at two edges (leading outer arc plus the inner hole vacating), a disc gains
+// at one, so each coarse level's admission rate falls to 2/3 of today's
+// (geometry from the ring radii; unverified until a leg measures it).
+//
+// Read via FParse::Param exactly as InnerHysteresisChunks reads its knob:
+// this is streaming-topology state that must not change mid-run, and a static
+// makes it one read, decided before the first recompute.
+bool HierarchicalCoverageEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelHierarchicalCoverage"));
+	return bEnabled;
+}
+
+// The dispatch sort key under hierarchical coverage. Full coverage deletes the
+// test that used to double as priority: "which level owns this ground" and
+// "which level streams first" were the same annulus check, and without a
+// replacement a level-5 chunk sitting under the camera has distance ~0 and
+// sorts AHEAD of the level-0 chunk beside it -- level is only a tie-break at
+// EQUAL distance in SortPendingQueues, and level-primary ordering was tried
+// there and measured catastrophic (R3/R4 at 0 loaded chunks for 90 s; see the
+// comment in SortPendingQueues). Backwards: the near coarse chunk is a
+// stand-in, wanted eventually but never before the fine chunk it stands in
+// for.
+//
+// So: clamp each level's key to its own ring's inner radius --
+// max(DistSq, InnerAdmitUU[L]^2). Outside its old annulus a coarse chunk
+// keeps its true distance ordering, exactly as today; inside the finer rings
+// the whole interior collapses to one flat priority band that sits just
+// behind the finer level's leading edge. The cross-level head comparison in
+// DispatchJobs reads the same stored key, so the bias steers both the
+// within-level order and the between-level pick with one number. This is a
+// claim about intent, not a measured result -- if it is wrong, the symptom is
+// R4/R5 "loaded" falling >10% (interior coarse chunks crowding their own
+// ring's queue) or the near field getting WORSE under flight, and the fix is
+// this function, not the sort.
+//
+// OFF (or level 0) returns DistSq unchanged, so the control's sort keys are
+// bit-identical. Note the biased key is also what the stuck-chunk dump prints
+// as dist= -- an interior coarse chunk reports its ring's inner radius there,
+// which is the priority it is actually queued at.
+double BiasedSortKeySq(int32 Level, double DistSq)
+{
+	if (Level <= 0 || !HierarchicalCoverageEnabled())
+	{
+		return DistSq;
+	}
+	return FMath::Max(DistSq, FMath::Square(InnerAdmitUU(Level)));
+}
 } // namespace VoxelStreamAdmission
 
 // --- sky band: never mesh chunks that are provably above the terrain ---------
@@ -9627,11 +9705,20 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// The worker queues already STORE their distance (FSortEntry), so a re-sort
 	// only has to refresh the cached keys against the new anchor -- no separate
 	// decorate pass, no scratch buffer, no undecorate write-back.
+	//
+	// THE KEY IS THE BIASED ONE under -VoxelHierarchicalCoverage (identity
+	// otherwise -- see BiasedSortKeySq). With the inner skip gone, a coarse
+	// chunk under the camera has true distance ~0, and level only breaks EXACT
+	// ties here, so the raw key would put the stand-in ahead of the level-0
+	// chunk beside it. Clamping each level's key to its ring's inner radius
+	// keeps the fine ring's leading edge in front, both in this sort and in
+	// DispatchJobs' cross-level head comparison, which reads the same stored
+	// number.
 	for (TArray<FSortEntry>& Queue : PendingJobKeysByLevel)
 	{
 		for (FSortEntry& Entry : Queue)
 		{
-			Entry.DistSq = DistSq(Entry.Key);
+			Entry.DistSq = VoxelStreamAdmission::BiasedSortKeySq(Entry.Key.Level, DistSq(Entry.Key));
 		}
 		SortEntries(Queue);
 	}
@@ -9641,7 +9728,8 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	SortScratchGameThread.Reset(PendingGameThreadKeys.Num());
 	for (const VoxelCoords::FVoxelLevelChunkKey& Key : PendingGameThreadKeys)
 	{
-		SortScratchGameThread.Add(FSortEntry{DistSq(Key), Key});
+		SortScratchGameThread.Add(
+		    FSortEntry{VoxelStreamAdmission::BiasedSortKeySq(Key.Level, DistSq(Key)), Key});
 	}
 	SortEntries(SortScratchGameThread);
 	for (int32 Index = 0; Index < SortScratchGameThread.Num(); ++Index)
@@ -9911,7 +9999,18 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double UnloadOuterUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::UnloadRingMultiplier;
 		const double InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(LevelKey.Level);
 		const bool bBeyondOuter = DistSq > FMath::Square(UnloadOuterUU);
-		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerEvictUU);
+		// UNDER -VoxelHierarchicalCoverage THERE IS NO INNER EDGE TO EVICT
+		// INTO: the entry pass admits the whole disc, so a coarse chunk inside
+		// the finer rings is DESIRED, not stale, and evicting it would re-open
+		// exactly the stand-in coverage the switch exists to provide. Forcing
+		// this false neutralises everything keyed off it below -- the
+		// retention direction, the LevelEvictInner counter -- without a second
+		// spelling of the rule. A coarse chunk then only ever leaves for
+		// bBeyondOuter or bBeyondVertical. (Also note the stationary
+		// admit/evict thrash Phase 0.1 fixed cannot come back through this
+		// arm: with no inner eviction there is no inner band to churn.)
+		const bool bInsideInner = LevelKey.Level > 0 && DistSq < FMath::Square(InnerEvictUU) &&
+		                          !VoxelStreamAdmission::HierarchicalCoverageEnabled();
 		// Underground streaming (see namespace VoxelUnderground): the two tests
 		// above are XY-only, which is correct for every chunk whose desired-ness
 		// is a pure function of its footprint (the surface band and the depth
@@ -10265,8 +10364,18 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// InnerEvictUU the exit scan uses. They were written out
 				// separately in the two passes and detached the day this pad
 				// landed -- see that comment for the churn that caused.
+				//
+				// UNDER -VoxelHierarchicalCoverage THIS SKIP IS THE THING THAT
+				// GOES. Rings stop being a coverage boundary and become a
+				// scheduling priority (BiasedSortKeySq): level L covers the
+				// whole disc, so the ground under a late fine chunk is still
+				// resident at L+1 and the marcher's fallthrough can draw it.
+				// The finer ring still streams first -- the interior's sort
+				// keys are clamped to this same InnerAdmitUU radius, so it
+				// queues BEHIND the fine level's leading edge, not ahead of it.
 				const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
-				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
+				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU) &&
+				    !VoxelStreamAdmission::HierarchicalCoverageEnabled())
 				{
 					continue; // a finer ring owns this footprint, entirely
 				}
@@ -10276,6 +10385,19 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// this ground -- but only if the parent chunk containing it is
 					// itself admitted. Admit this chunk ONLY when the parent is
 					// not, which is exactly the seam gap and nothing else.
+					//
+					// UNDER -VoxelHierarchicalCoverage the ParentDistSq test
+					// below is a fossil: the parent covers its full disc, so
+					// "parent admitted over this ground" is ALWAYS true in
+					// reality, while the test still answers the old annulus
+					// question and admits a thin redundant band of level-L
+					// chunks along the seam (ParentDistSq < Outer). That band
+					// is kept DELIBERATELY: the marcher walks segment L at
+					// level L, and ground straddling Outer[L] inside a chunk
+					// whose centre is past it would otherwise be reachable
+					// only through the fallthrough -- which is off in the
+					// coverage-only arm (streaming on, marcher define 0). A
+					// few boundary chunks per level buy that arm a clean seam.
 					//
 					// (First cut padded the outer radius by the chunk half-diagonal
 					// for every chunk. Correct, but blanket: +9.2% resident chunks
@@ -10518,7 +10640,14 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
 					const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 					                        FMath::Square(CenterZ - Anchor.Z);
-					if (!bOverlayAware && DistSq3D >= LevelAdmissionCutoffDistSq[QueueLevel])
+					// The BIASED key (identity when -VoxelHierarchicalCoverage
+					// is off), for both the cutoff test and the queue entry:
+					// the cutoff was derived from stored keys by
+					// DropFarthestOverCap, so comparing a raw distance against
+					// it would mix two scales for interior coarse chunks.
+					const double SortKeySq =
+					    VoxelStreamAdmission::BiasedSortKeySq(QueueLevel, DistSq3D);
+					if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 					{
 						++CandidatesRejectedSinceLog;
 						++CandidatesRejectedThisCall;
@@ -10640,7 +10769,8 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					{
 						// Distance cached at admission; SortPendingQueues refreshes
 						// it against the anchor at the bottom of this same call.
-						PendingJobKeysByLevel[QueueLevel].Add(FSortEntry{DistSq3D, LevelKey});
+						// The biased key, matching what that refresh will write.
+						PendingJobKeysByLevel[QueueLevel].Add(FSortEntry{SortKeySq, LevelKey});
 					}
 				};
 
@@ -11092,6 +11222,16 @@ static uint8 ComputeRingSkirtMask(const VoxelCoords::FVoxelLevelChunkKey& LevelK
 	{
 		return 0; // finest ring: nothing finer sits inside it, so no seam to retain
 	}
+	if (VoxelStreamAdmission::HierarchicalCoverageEnabled())
+	{
+		// Full hierarchical coverage: this level's membership is the whole
+		// disc, so a same-level neighbour exists (or is desired) across every
+		// interior face and "the neighbour belongs to a finer ring" is never
+		// true. No face is a ring boundary; a skirt dropped against a
+		// neighbour that is actually present is the exact defect the
+		// InnerAdmitUU read below was fixed for.
+		return 0;
+	}
 	// The raw InnerMeters is NOT the membership test any more -- admission pads
 	// this edge inward, so a neighbour out in [InnerAdmitUU, InnerMeters) is
 	// admitted at THIS level too and there is no seam across that face to wall
@@ -11271,8 +11411,11 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
 		// InnerAdmitUU, not the raw InnerMeters: this lambda's contract is "would
 		// the entry pass admit this footprint at level L", and the entry pass
-		// pads its inner edge.
-		if (L > 0 && DistSq < FMath::Square(VoxelStreamAdmission::InnerAdmitUU(L)))
+		// pads its inner edge. Under -VoxelHierarchicalCoverage the entry pass
+		// admits the whole disc, so this mirror must answer "yes" inside the
+		// hole too -- same contract, same arm.
+		if (L > 0 && DistSq < FMath::Square(VoxelStreamAdmission::InnerAdmitUU(L)) &&
+		    !VoxelStreamAdmission::HierarchicalCoverageEnabled())
 		{
 			return false;
 		}
@@ -11469,8 +11612,17 @@ void FVoxelWorldImpl::LogCoverageVerify()
 				// InnerEvictUU the exit scan uses. They were written out
 				// separately in the two passes and detached the day this pad
 				// landed -- see that comment for the churn that caused.
+				// MIRRORS THE ENTRY PASS, including its -VoxelHierarchicalCoverage
+				// arm: with the switch on the entry pass admits the whole disc,
+				// so the verifier must scan the whole disc too or every interior
+				// coarse footprint reads as "scanned area the admitter never
+				// claimed" and the holes= number stops meaning anything. The
+				// hierarchical clauses below ((b) walks every coarser ancestor)
+				// already understand stand-in coverage and need no change --
+				// only the footprint set moves.
 				const double InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(Level);
-				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU))
+				if (Level > 0 && DistSq < FMath::Square(InnerAdmitUU) &&
+				    !VoxelStreamAdmission::HierarchicalCoverageEnabled())
 				{
 					continue; // a finer ring owns this footprint, entirely
 				}

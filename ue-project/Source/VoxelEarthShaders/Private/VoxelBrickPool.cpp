@@ -492,6 +492,51 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 	if (Config.ChunkCapacity == 0)
 	{
 		Config.ChunkCapacity = uint32(FMath::Max(1, VoxelBrickPoolDetail::GVoxelBrickPoolChunks));
+
+		// --- hierarchical coverage headroom (Phase 1 of the no-hole plan) ---
+		//
+		// -VoxelHierarchicalCoverage makes every coarse streaming level cover
+		// the ground inside it (VoxelWorldSubsystem.cpp, VoxelStreamAdmission::
+		// HierarchicalCoverageEnabled -- READ FROM THE COMMAND LINE HERE TOO,
+		// deliberately, because this module must not depend on VoxelEarth; the
+		// flag string is the shared contract). Measured per-level residency
+		// (MODEFP, settled 4 km cascade: 96,814 chunks) projects to ~120,350
+		// under full coverage -- 92% of the default 131,072 slots, and peak
+		// residency under flight sits above settled. The pool evicts
+		// farthest-from-focus on pressure and GetEvictions() == 0 is a stated
+		// gate, so running the switch against the default pool would fail its
+		// own gate by construction. The switch therefore brings its own
+		// headroom: 262,144 slots. Committed cost at that size: descriptors
+		// 128 MiB + records 8 MiB on top of the unchanged occupancy/material
+		// arenas (those are paid per MIXED brick, not per slot) -- inside the
+		// owner's approved 1-2 GB envelope.
+		//
+		// EXPLICIT AND REVERSIBLE, not a default change: without the flag this
+		// block does not run and the pool is byte-identical to today. An
+		// explicit -VoxelBrickPoolChunks=N outranks both the default and the
+		// hierarchical raise (that is the right-sizing knob for step 4 of the
+		// plan, and the pre-existing cvar path stays: voxel.Brick.PoolChunks
+		// is ECVF_ReadOnly and read once, above). Command line and not a
+		// console command because this is read ONCE, here, and a resize after
+		// Init is refused -- see the guard at the top of this function.
+		int32 ExplicitChunks = 0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickPoolChunks="), ExplicitChunks) &&
+		    ExplicitChunks > 0)
+		{
+			Config.ChunkCapacity = uint32(ExplicitChunks);
+			UE_LOG(LogVoxelBrickPool, Log,
+			       TEXT("FVoxelBrickPool: chunk capacity %u from -VoxelBrickPoolChunks="),
+			       Config.ChunkCapacity);
+		}
+		else if (FParse::Param(FCommandLine::Get(), TEXT("VoxelHierarchicalCoverage")))
+		{
+			Config.ChunkCapacity = FMath::Max(Config.ChunkCapacity, 262144u);
+			UE_LOG(LogVoxelBrickPool, Log,
+			       TEXT("FVoxelBrickPool: chunk capacity raised to %u for -VoxelHierarchicalCoverage ")
+			       TEXT("(projected residency ~120,350 of the default 131,072 = 92%%, and the ")
+			       TEXT("evictions==0 gate must hold)."),
+			       Config.ChunkCapacity);
+		}
 	}
 	if (Config.OccWordCapacity == 0)
 	{
