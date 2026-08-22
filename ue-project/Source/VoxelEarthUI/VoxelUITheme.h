@@ -94,8 +94,10 @@ inline const FColor Brass4         = FColor(0x3a, 0x24, 0x10);
 inline const FColor TopSurface     = FColor(0xFF, 0xE9, 0xA8); // sand surface highlight
 // The TIP footer's gold prefix. TransitionManager._format_tip uses #f0c14b,
 // which IS Gold above -- named separately only because the source names it
-// separately, and a later divergence should not be a silent one.
-inline const FColor TipPrefix      = FColor(0xf0, 0xc1, 0x4b);
+// separately, and a later divergence should not be a silent one. Called
+// TipGold rather than TipPrefix so it cannot be confused with
+// VoxelUIStrings::TipPrefix(), which is the WORD "TIP".
+inline const FColor TipGold        = FColor(0xf0, 0xc1, 0x4b);
 
 // The one sRGB->linear conversion site. Alpha is applied on top of the
 // colour's own (every token above is opaque), so Tint(Gold, 0.55f) is the
