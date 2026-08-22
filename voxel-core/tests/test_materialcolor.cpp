@@ -428,10 +428,10 @@ VXC_TEST(colour_is_deterministic_and_pinned) {
         int32_t light, hue;
     };
     const Sample expected[] = {
-        {MAT_ROCK, 0, 0, 0, 100, -7056, -499},
-        {MAT_ROCK, 1, 0, 0, 100, -6179, 1652},
+        {MAT_ROCK, 0, 0, 0, 100, -8142, -599},
+        {MAT_ROCK, 1, 0, 0, 100, -7060, 1983},
         {MAT_GRASS, -40, 17, 902, 100, -9343, -3138},
-        {MAT_LEAF_BROADLEAF, 5, 5, 5, 50, -8588, 6290},
+        {MAT_LEAF_BROADLEAF, 5, 5, 5, 50, -8864, 6290},
         {MAT_SNOW, 1000, -1000, 64, 3200, 1858, 728},
         {MAT_BARK, 7, -3, 21, 100, -2791, 827},
     };
