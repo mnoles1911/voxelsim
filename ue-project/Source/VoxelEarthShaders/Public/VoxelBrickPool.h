@@ -979,10 +979,18 @@ private:
 	// definition. Static because it touches no pool state: everything it needs
 	// was moved out of the pool under the game thread before the render command
 	// was enqueued.
+	//
+	// bBatchedFlush is voxel.GPU.BrickFlushBatch, READ ON THE GAME THREAD in
+	// Flush() and captured by value -- the render thread must see the value the
+	// batch was queued under, not whatever the cvar says when the command runs.
+	// false records byte-for-byte the passes this function always recorded;
+	// true fuses each producing dispatch's chunks into ~4 table-driven passes
+	// (see the definition for the table and the live cross-check).
 	static void AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 	                                        const FVoxelBrickPoolBuffersRef& Buffers,
 	                                        const TArray<FPendingWrite>& Writes,
-	                                        const TArray<uint32>& Clears);
+	                                        const TArray<uint32>& Clears,
+	                                        bool bBatchedFlush);
 
 	// The CPU arm's half of Flush, and it runs AFTER the graph above executes.
 	//

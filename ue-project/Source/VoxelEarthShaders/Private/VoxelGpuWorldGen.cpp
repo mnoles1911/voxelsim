@@ -647,6 +647,117 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
+	// --- the BATCHED pool flush (voxel.GPU.BrickFlushBatch) -----------------
+	//
+	// Table-driven twins of the four classic pool-write kernels above, plus the
+	// live verify. Same compile policy as FVoxelBrickPoolShader's other
+	// children: no worldgen include, no version lock -- these move dwords and
+	// interpret nothing but the 28-bit offset and the 2-bit kind. See
+	// VoxelBrickPoolWrite.usf for the table layout and why destinations need a
+	// table at all (non-contiguous per-chunk pool allocations).
+
+	class FVoxelBrickFlushBatchWordCopyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickFlushBatchWordCopyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickFlushBatchWordCopyCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumTableEntries)
+			SHADER_PARAMETER(uint32, TotalWords)
+			SHADER_PARAMETER(uint32, TableFieldFirst)
+			SHADER_PARAMETER(uint32, FlushTableStride)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InFlushTable)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWords)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutWords)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickFlushBatchDescWriteCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickFlushBatchDescWriteCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickFlushBatchDescWriteCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumTableEntries)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, FlushTableStride)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InFlushTable)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickFlushBatchRecordCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickFlushBatchRecordCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickFlushBatchRecordCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumTableEntries)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER(uint32, FlushTableStride)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InFlushTable)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickFlushBatchClearCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickFlushBatchClearCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickFlushBatchClearCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, NumTableEntries)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InFlushTable)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickFlushVerifyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickFlushVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickFlushVerifyCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, SrcFirst)
+			SHADER_PARAMETER(uint32, SrcChunkIndex)
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, ChunkSlot)
+			SHADER_PARAMETER(uint32, BrickBase)
+			SHADER_PARAMETER(uint32, RingLevel)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER(uint32, ChunkClimatePacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceGradPacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceZRelBits)
+			SHADER_PARAMETER(FIntVector3, OriginVoxel)
+			SHADER_PARAMETER(uint32, OccBase)
+			SHADER_PARAMETER(uint32, MatBase)
+			SHADER_PARAMETER(uint32, OccSrcFirst)
+			SHADER_PARAMETER(uint32, MatSrcFirst)
+			SHADER_PARAMETER(uint32, VerifyOccWords)
+			SHADER_PARAMETER(uint32, VerifyMatWords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InPoolDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPoolOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPoolMat)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPoolTable)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutVerify)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
 	//
 	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
@@ -700,6 +811,11 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelBrickWordCopyCS,      VOXEL_BRICK_POOL_WRITE_USF, 
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickDescPoolWriteCS, VOXEL_BRICK_POOL_WRITE_USF, "BrickDescPoolWriteMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickChunkRecordCS,   VOXEL_BRICK_POOL_WRITE_USF, "BrickChunkRecordMain",   SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickChunkClearCS,    VOXEL_BRICK_POOL_WRITE_USF, "BrickChunkClearMain",    SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchWordCopyCS,  VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchWordCopyMain",  SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchDescWriteCS, VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchDescWriteMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchRecordCS,    VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchRecordMain",    SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchClearCS,     VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchClearMain",     SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushVerifyCS,         VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushVerifyMain",         SF_Compute);
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampCoarseMain", SF_Compute);
@@ -1826,6 +1942,179 @@ void VoxelGpuWorldGen::AddBrickChunkClearPass(FRDGBuilder& GraphBuilder, FRDGBuf
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickChunkClear(slot %u)", ChunkSlot), Shader, Params,
 		FIntVector(1, 1, 1));
+}
+
+// --- the BATCHED pool flush (voxel.GPU.BrickFlushBatch) ----------------------
+//
+// Each pass replaces K of the classic passes above with ONE dispatch over a
+// destination table. The table itself is built and owned by
+// FVoxelBrickPool::AddFlushPasses_RenderThread (see there for layout and
+// lifetime); these functions only bind and dispatch. Every early-out mirrors
+// the classic passes': a null buffer or a zero count records nothing, because
+// a pass that dispatches nothing looks like work in a capture.
+
+void VoxelGpuWorldGen::AddBrickFlushBatchWordCopyPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst,
+                                                      FRDGBufferRef Src, FRDGBufferRef Table,
+                                                      uint32 TableStride, uint32 TableFieldFirst,
+                                                      uint32 NumEntries, uint32 TotalWords)
+{
+	if (TotalWords == 0 || NumEntries == 0 || Dst == nullptr || Src == nullptr || Table == nullptr)
+	{
+		// TotalWords 0 is NORMAL: a group of all-collapsed chunks owns no arena
+		// words at all, exactly as the classic copy's zero-word early-out says.
+		return;
+	}
+
+	FVoxelBrickFlushBatchWordCopyCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickFlushBatchWordCopyCS::FParameters>();
+	Params->NumTableEntries = NumEntries;
+	Params->TotalWords = TotalWords;
+	Params->TableFieldFirst = TableFieldFirst;
+	Params->FlushTableStride = TableStride;
+	Params->InFlushTable = GraphBuilder.CreateSRV(Table);
+	Params->InWords = GraphBuilder.CreateSRV(Src);
+	Params->OutWords = GraphBuilder.CreateUAV(Dst);
+
+	TShaderMapRef<FVoxelBrickFlushBatchWordCopyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickFlushBatchWordCopy(%u chunks, %u dwords)", NumEntries, TotalWords),
+		Shader, Params, FIntVector(FMath::DivideAndRoundUp(TotalWords, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickFlushBatchDescWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstDesc,
+                                                       FRDGBufferRef SrcDesc, FRDGBufferRef Table,
+                                                       uint32 TableStride, uint32 NumEntries,
+                                                       uint32 BrickCount)
+{
+	if (NumEntries == 0 || BrickCount == 0 || DstDesc == nullptr || SrcDesc == nullptr || Table == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickFlushBatchDescWriteCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickFlushBatchDescWriteCS::FParameters>();
+	Params->NumTableEntries = NumEntries;
+	Params->BrickCount = BrickCount;
+	Params->FlushTableStride = TableStride;
+	Params->InFlushTable = GraphBuilder.CreateSRV(Table);
+	Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+	Params->OutBrickDesc = GraphBuilder.CreateUAV(DstDesc);
+
+	TShaderMapRef<FVoxelBrickFlushBatchDescWriteCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickFlushBatchDescWrite(%u chunks)", NumEntries),
+		Shader, Params,
+		FIntVector(FMath::DivideAndRoundUp(NumEntries * BrickCount, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickFlushBatchRecordPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+                                                    FRDGBufferRef SrcDesc, FRDGBufferRef SrcOcc,
+                                                    FRDGBufferRef SrcChunkMask, FRDGBufferRef Table,
+                                                    uint32 TableStride, uint32 NumEntries,
+                                                    uint32 BrickCount)
+{
+	if (NumEntries == 0 || DstTable == nullptr || SrcDesc == nullptr || SrcOcc == nullptr ||
+	    SrcChunkMask == nullptr || Table == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickFlushBatchRecordCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickFlushBatchRecordCS::FParameters>();
+	Params->NumTableEntries = NumEntries;
+	Params->BrickCount = BrickCount;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	Params->FlushTableStride = TableStride;
+	Params->InFlushTable = GraphBuilder.CreateSRV(Table);
+	Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+	Params->InBrickOcc = GraphBuilder.CreateSRV(SrcOcc);
+	Params->InChunkBrickMask = GraphBuilder.CreateSRV(SrcChunkMask);
+	Params->OutChunkTable = GraphBuilder.CreateUAV(DstTable);
+
+	TShaderMapRef<FVoxelBrickFlushBatchRecordCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// One WORKGROUP per chunk (the allSolid reduce is per chunk), all in one
+	// dispatch -- that is the entire difference from K record passes.
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickFlushBatchRecord(%u chunks)", NumEntries),
+		Shader, Params, FIntVector(int32(NumEntries), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickFlushBatchClearPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+                                                   FRDGBufferRef SlotList, uint32 NumSlots)
+{
+	if (NumSlots == 0 || DstTable == nullptr || SlotList == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickFlushBatchClearCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickFlushBatchClearCS::FParameters>();
+	Params->NumTableEntries = NumSlots;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	Params->InFlushTable = GraphBuilder.CreateSRV(SlotList);
+	Params->OutChunkTable = GraphBuilder.CreateUAV(DstTable);
+
+	TShaderMapRef<FVoxelBrickFlushBatchClearCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickFlushBatchClear(%u slots)", NumSlots),
+		Shader, Params,
+		FIntVector(FMath::DivideAndRoundUp(NumSlots * uint32(FVoxelBrickPool::kChunkRecordDwords), 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickFlushVerifyPass(FRDGBuilder& GraphBuilder,
+                                               const FBrickFlushVerifyBuffers& Buffers,
+                                               const FBrickFlushVerifyArgs& Args)
+{
+	if (Buffers.PoolDesc == nullptr || Buffers.PoolOcc == nullptr || Buffers.PoolMat == nullptr ||
+	    Buffers.PoolTable == nullptr || Buffers.SrcDesc == nullptr || Buffers.SrcOcc == nullptr ||
+	    Buffers.SrcMat == nullptr || Buffers.SrcChunkMask == nullptr || Buffers.OutVerify == nullptr)
+	{
+		return;
+	}
+
+	FVoxelBrickFlushVerifyCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickFlushVerifyCS::FParameters>();
+	Params->SrcFirst = Args.SrcBrickFirst;
+	Params->SrcChunkIndex = Args.SrcChunkIndex;
+	Params->BrickCount = Args.BrickCount;
+	Params->ChunkSlot = Args.ChunkSlot;
+	Params->BrickBase = Args.BrickBase;
+	Params->RingLevel = Args.RingLevel;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	// Packed on the CPU through the one Pack the record writers share, so the
+	// expected record here cannot lay bits out differently from the writers.
+	Args.Shading.Pack(Params->ChunkClimatePacked, Params->ChunkSurfaceGradPacked,
+	                  Params->ChunkSurfaceZRelBits);
+	Params->OriginVoxel = FIntVector3(Args.OriginVoxel.X, Args.OriginVoxel.Y, Args.OriginVoxel.Z);
+	Params->OccBase = Args.OccBase;
+	Params->MatBase = Args.MatBase;
+	Params->OccSrcFirst = Args.OccSrcFirst;
+	Params->MatSrcFirst = Args.MatSrcFirst;
+	Params->VerifyOccWords = Args.OccWords;
+	Params->VerifyMatWords = Args.MatWords;
+	Params->InBrickDesc = GraphBuilder.CreateSRV(Buffers.SrcDesc);
+	Params->InBrickOcc = GraphBuilder.CreateSRV(Buffers.SrcOcc);
+	Params->InWords = GraphBuilder.CreateSRV(Buffers.SrcMat);
+	Params->InChunkBrickMask = GraphBuilder.CreateSRV(Buffers.SrcChunkMask);
+	Params->InPoolDesc = GraphBuilder.CreateSRV(Buffers.PoolDesc);
+	Params->InPoolOcc = GraphBuilder.CreateSRV(Buffers.PoolOcc);
+	Params->InPoolMat = GraphBuilder.CreateSRV(Buffers.PoolMat);
+	Params->InPoolTable = GraphBuilder.CreateSRV(Buffers.PoolTable);
+	Params->OutVerify = GraphBuilder.CreateUAV(Buffers.OutVerify);
+
+	TShaderMapRef<FVoxelBrickFlushVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// One workgroup, one chunk -- this is deliberately the CLASSIC per-chunk
+	// shape, because its whole purpose is to be the independent arm of the
+	// comparison. It runs on a SAMPLED group only, so the per-chunk cost the
+	// batch removed does not quietly come back through its own gate.
+	FComputeShaderUtils::AddPass(
+		GraphBuilder,
+		RDG_EVENT_NAME("Voxel.BrickFlushVerify(slot %u)", Args.ChunkSlot),
+		Shader, Params, FIntVector(1, 1, 1));
 }
 
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()

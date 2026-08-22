@@ -253,4 +253,82 @@ namespace VoxelGpuWorldGen
 
 	// Zeroes one record, which reads as "nothing here" (anySolid clear).
 	void AddBrickChunkClearPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable, uint32 ChunkSlot);
+
+	// --- the BATCHED pool flush (voxel.GPU.BrickFlushBatch) -----------------
+	//
+	// Table-driven twins of the four passes above: one dispatch per STAGE for a
+	// whole fused group of chunks, instead of one per stage PER CHUNK. The
+	// destinations are non-contiguous (the pool arenas are first-fit
+	// suballocators), so each pass reads its addressing from a per-chunk table
+	// the caller built -- see FVoxelBrickPool::AddFlushPasses_RenderThread for
+	// the table's layout, construction and lifetime, and
+	// VoxelBrickPoolWrite.usf for the kernel-side field map. All RENDER THREAD
+	// ONLY, and the caller's clear-before-write recording rule is unchanged.
+
+	// One arena's every fused run: thread per word over the group's summed
+	// word count; TableFieldFirst selects the occupancy (2) or material (6)
+	// field group so one kernel serves both arenas, as the classic copy does.
+	void AddBrickFlushBatchWordCopyPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
+	                                    FRDGBufferRef Table, uint32 TableStride, uint32 TableFieldFirst,
+	                                    uint32 NumEntries, uint32 TotalWords);
+
+	// Every fused chunk's 64 descriptors, rebased MIXED-only, in one dispatch.
+	void AddBrickFlushBatchDescWritePass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstDesc,
+	                                     FRDGBufferRef SrcDesc, FRDGBufferRef Table,
+	                                     uint32 TableStride, uint32 NumEntries, uint32 BrickCount);
+
+	// Every fused chunk's 64 B record: one workgroup per chunk, one dispatch.
+	void AddBrickFlushBatchRecordPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+	                                  FRDGBufferRef SrcDesc, FRDGBufferRef SrcOcc,
+	                                  FRDGBufferRef SrcChunkMask, FRDGBufferRef Table,
+	                                  uint32 TableStride, uint32 NumEntries, uint32 BrickCount);
+
+	// Every retired record of a flush in one dispatch. SlotList is a plain
+	// stride-1 uint list of chunk slots.
+	void AddBrickFlushBatchClearPass(FRDGBuilder& GraphBuilder, FRDGBufferRef DstTable,
+	                                 FRDGBufferRef SlotList, uint32 NumSlots);
+
+	// --- the batched flush's live cross-check -------------------------------
+	//
+	// One chunk, one workgroup, comparing what the batched kernels LANDED in
+	// the pool against what the classic per-chunk kernels would have written.
+	// The args are LOOSE per-chunk values filled from the same FPendingWrite
+	// the classic passes read -- never from the flush table, because a verify
+	// that reads the table it is checking follows any table bug to the wrong
+	// address and passes. Mismatched dwords are accumulated into
+	// OutVerify[0]; OutVerify[1] counts chunks checked.
+	struct FBrickFlushVerifyArgs
+	{
+		uint32 SrcBrickFirst = 0;
+		uint32 SrcChunkIndex = 0;
+		uint32 BrickCount = 0;
+		uint32 ChunkSlot = 0;
+		uint32 BrickBase = 0;
+		uint32 RingLevel = 0;
+		uint32 OccBase = 0;
+		uint32 MatBase = 0;
+		uint32 OccSrcFirst = 0;
+		uint32 MatSrcFirst = 0;
+		uint32 OccWords = 0;
+		uint32 MatWords = 0;
+		FIntVector OriginVoxel = FIntVector::ZeroValue;
+		FVoxelBrickChunkShading Shading;
+	};
+	struct FBrickFlushVerifyBuffers
+	{
+		// The pool's four arenas, read-only for the compare.
+		FRDGBufferRef PoolDesc = nullptr;
+		FRDGBufferRef PoolOcc = nullptr;
+		FRDGBufferRef PoolMat = nullptr;
+		FRDGBufferRef PoolTable = nullptr;
+		// The producing dispatch's scratch: the reference bytes.
+		FRDGBufferRef SrcDesc = nullptr;
+		FRDGBufferRef SrcOcc = nullptr;
+		FRDGBufferRef SrcMat = nullptr;
+		FRDGBufferRef SrcChunkMask = nullptr;
+		// Two dwords: [0] mismatches, [1] chunks checked. Caller clears it.
+		FRDGBufferRef OutVerify = nullptr;
+	};
+	void AddBrickFlushVerifyPass(FRDGBuilder& GraphBuilder, const FBrickFlushVerifyBuffers& Buffers,
+	                             const FBrickFlushVerifyArgs& Args);
 }
