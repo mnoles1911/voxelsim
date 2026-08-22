@@ -124,6 +124,7 @@ inverts the last handoff's ordering, and the table above is the reason.
 | Asset resolve off the game thread (B.3) | `-VoxelAsyncAssetResolve` | compiles, unmeasured. **Inert without `-VoxelAssetDir`** — a leg without it measures an empty branch |
 | Cold-band re-queue churn (~13,000 defers per 5 s) | `-VoxelColdBandDeferPark=1` | compiles, unmeasured |
 | Marcher fallthrough depth 2 | `voxel.March.Fallthrough 2` | compiles, unmeasured |
+| Batched pool flush (B.1's follow-up: the ~4 per-chunk flush passes fused per stack) | `voxel.GPU.BrickFlushBatch` / `-VoxelGpuBrickFlushBatch=1` | authored, **NOT yet compiled**, unmeasured. **Inert without `-VoxelGpuWorldGenBatch=1`** — without B.1's shared scratch every group is a singleton and falls back per chunk (counted). Read the `[brick-flushbatch]` window line; `xcheck ... FAIL` must stay 0 and `samples` must be non-zero |
 
 ---
 

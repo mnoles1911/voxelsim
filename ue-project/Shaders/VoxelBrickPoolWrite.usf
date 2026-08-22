@@ -68,6 +68,59 @@ StructuredBuffer<uint> InChunkBrickMask;
 // FVoxelMarchChunk records, 8 dwords each. Format section 6.
 RWStructuredBuffer<uint> OutChunkTable;
 
+// --- the batched-flush table (voxel.GPU.BrickFlushBatch) ---------------------
+//
+// One entry per chunk of a FUSED pool flush. The pool's per-chunk allocations
+// are NON-CONTIGUOUS -- the arenas are first-fit suballocators, so K chunks'
+// destination ranges are scattered wherever free runs happened to be -- which
+// is why the batched kernels take a TABLE of destinations rather than a base
+// plus a stride. The sources, by contrast, ARE contiguous per chunk: a Tier
+// B.1 stack's scratch is chunk-major, so each chunk's words are one run.
+//
+// LAYOUT, PER ENTRY (stride bound from the host as FlushTableStride, never a
+// literal here -- the ChunkRecordDwords rule, for the same left-behind-writer
+// reason):
+//   [0]  SrcBrickFirst   first scratch descriptor slot of this chunk
+//   [1]  DstBrickBase    first POOL descriptor slot (the allocation)
+//   [2]  OccSrcFirst     first scratch occupancy dword
+//   [3]  OccDstBase      first POOL occupancy dword
+//   [4]  OccWords        occupancy dwords this chunk owns (0 = all collapsed)
+//   [5]  OccCumEnd       inclusive prefix sum of OccWords over entries 0..e
+//   [6]  MatSrcFirst     first scratch material dword
+//   [7]  MatDstBase      first POOL material dword
+//   [8]  MatWords
+//   [9]  MatCumEnd       inclusive prefix sum of MatWords over entries 0..e
+//   [10] ChunkSlot       record index in OutChunkTable
+//   [11] SrcChunkIndex   index into the scratch L1 mask (the producing dispatch)
+//   [12] RingLevel
+//   [13..15] OriginVoxel xyz, as int bit patterns
+//   [16] ClimatePacked   [17] SurfaceGradPacked  [18] SurfaceZRelBits
+//   [19..] zero
+//
+// The CUM columns exist for the word-copy kernel's binary search: they are
+// non-decreasing by construction (each is the previous plus a non-negative
+// count), so "which chunk owns flat word i" is a lower_bound over at most
+// log2(entries) table reads. A zero-word entry's CumEnd equals its
+// predecessor's and can never be selected, which is what makes all-collapsed
+// chunks free rather than a special case.
+//
+// FOR THE CLEAR KERNEL the same binding is reused as a PLAIN SLOT LIST,
+// stride 1 -- a retired slot needs nothing but its index.
+StructuredBuffer<uint> InFlushTable;
+
+// --- the flush cross-check's inputs (BrickFlushVerifyMain only) --------------
+//
+// The POOL arenas, bound read-only so the verify kernel can compare what the
+// batched kernels LANDED against what the classic per-chunk kernels would have
+// written. Separate names from the Out* UAVs above because one kernel must
+// never hold the same buffer as both UAV and SRV.
+StructuredBuffer<uint2> InPoolDesc;
+StructuredBuffer<uint>  InPoolOcc;
+StructuredBuffer<uint>  InPoolMat;
+StructuredBuffer<uint>  InPoolTable;
+// [0] mismatched dwords, [1] chunks verified. InterlockedAdd only.
+RWStructuredBuffer<uint> OutVerify;
+
 // The two scanned count/offset arrays, for the totals kernel.
 StructuredBuffer<uint> InOccCounts;
 StructuredBuffer<uint> InOccOffsets;
@@ -106,6 +159,32 @@ uint ChunkRecordDwords; // record stride, bound from FVoxelBrickPool::
                     // literal is how one of them gets left behind.
 int3 OriginVoxel;   // chunk min corner in LEVEL-L voxel coords
 uint ScanCount;     // number of scanned bricks, for the totals kernel
+
+// --- batched-flush parameters (voxel.GPU.BrickFlushBatch) --------------------
+uint NumTableEntries;   // chunks (or, for the clear kernel, slots) in InFlushTable
+uint TotalWords;        // sum of the table's per-chunk word counts, one arena
+uint TableFieldFirst;   // 2 for the occupancy field group, 6 for materials --
+                        // one kernel serves both arenas, exactly as
+                        // BrickWordCopyMain does, and the field group is the
+                        // only thing that differs
+uint FlushTableStride;  // dwords per table entry, bound from the host
+                        // (kFlushTableStride). NEVER a literal here.
+
+// --- flush-verify parameters (BrickFlushVerifyMain) --------------------------
+//
+// Everything below is handed as LOOSE PER-CHUNK CONSTANTS, deliberately NOT
+// read from InFlushTable. The verify exists to catch a wrong table (a bad
+// prefix sum, a binary-search bug, a mis-assembled entry); a verify that took
+// its coordinates from the same table would follow the bug to the wrong
+// address and compare the wrong bytes against themselves -- derived, not
+// verified, which is the exact failure family this project keeps paying for.
+// These constants are filled from the SAME FPendingWrite fields the classic
+// per-chunk passes are filled from, so the reference semantics here ARE the
+// classic path's.
+uint OccSrcFirst;       // chunk's first scratch occupancy dword
+uint MatSrcFirst;       // chunk's first scratch material dword
+uint VerifyOccWords;    // occupancy dwords to compare
+uint VerifyMatWords;    // material dwords to compare
 
 // The descriptor's offset field is 28 bits (format section 2). The host is
 // required to keep every base plus its scanned offset under 2^28 dwords per
@@ -399,4 +478,342 @@ void BrickChunkClearMain(uint3 tid : SV_DispatchThreadID)
 		return;
 	}
 	OutChunkTable[ChunkSlot * ChunkRecordDwords + tid.x] = 0u;
+}
+
+// ===========================================================================
+// The BATCHED pool flush (voxel.GPU.BrickFlushBatch) -- Tier B.1's follow-up.
+//
+// WHY THESE EXIST, WITH THE MEASUREMENT THAT MOTIVATED THEM. Tier B.1 fused
+// worldgen+pack for a Z-stack of chunks into one set of passes (a measured leg:
+// 689 chunks in 215 stacks, ~3,010 passes against ~10,335 per-chunk, crosscheck
+// 0 FAIL) -- and throughput did NOT move, so per-chunk PASS SETUP upstream of
+// the pool was not the ceiling. What stayed per-chunk was THIS file's pool
+// flush: 2 word copies + desc rebase + record, ~4 small dispatches per chunk,
+// on every arm. The four kernels below collapse that to ~4 dispatches per
+// FUSED GROUP (a group = the chunks sharing one producing dispatch's scratch
+// buffers, i.e. one B.1 stack), driven by InFlushTable.
+//
+// WHY A TABLE AND NOT A BASE+STRIDE. The pool's arenas are first-fit
+// suballocators; K chunks' destination ranges land wherever free runs were.
+// Non-contiguous destinations cannot be an arithmetic function of the thread
+// id, so each kernel looks its addressing up instead of computing it.
+//
+// BYTE-IDENTITY IS THE CONTRACT. Each kernel below is the corresponding
+// classic kernel's body with the loose per-chunk constants replaced by table
+// reads -- no arithmetic changed. BrickFlushVerifyMain then compares the
+// landed pool bytes against the classic formula computed from loose constants,
+// so "identical by construction" is also CHECKED, every window, live.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// BrickFlushBatchWordCopyMain -- ONE dispatch moves EVERY fused chunk's run in
+// one arena. One thread per word over the group's summed word count; the
+// owning chunk is a lower_bound over the table's non-decreasing CumEnd column
+// (<= 10 iterations at the 512-entry cap, against memory that is hot after the
+// first few threads touch it).
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickFlushBatchWordCopyMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= TotalWords)
+	{
+		return;
+	}
+
+	// lower_bound: first entry whose CumEnd exceeds i. A zero-word entry's
+	// CumEnd equals its predecessor's, so it is never selected -- all-collapsed
+	// chunks cost nothing here rather than needing a skip.
+	uint Lo = 0u;
+	uint Hi = NumTableEntries;
+	while (Lo < Hi)
+	{
+		const uint Mid = (Lo + Hi) >> 1u;
+		const uint Cum = InFlushTable[Mid * FlushTableStride + TableFieldFirst + 3u];
+		if (Cum <= i)
+		{
+			Lo = Mid + 1u;
+		}
+		else
+		{
+			Hi = Mid;
+		}
+	}
+
+	const uint Base = Lo * FlushTableStride + TableFieldFirst;
+	const uint SrcRunFirst = InFlushTable[Base + 0u];
+	const uint DstRunBase  = InFlushTable[Base + 1u];
+	const uint Words       = InFlushTable[Base + 2u];
+	const uint CumEnd      = InFlushTable[Base + 3u];
+	// i is inside this entry's [CumEnd - Words, CumEnd) span by the search's
+	// postcondition, so Local cannot underflow.
+	const uint Local = i - (CumEnd - Words);
+	OutWords[DstRunBase + Local] = InWords[SrcRunFirst + Local];
+}
+
+// ---------------------------------------------------------------------------
+// BrickFlushBatchDescWriteMain -- every fused chunk's descriptors in ONE
+// dispatch. BrickDescPoolWriteMain's arithmetic verbatim, with the rebase
+// derived from the table: (DstBase - SrcFirst) as a wrapping uint, sound for
+// the reason recorded on FVoxelBrickPool::AddFlushPasses_RenderThread -- the
+// kernel masks to 28 bits and Init refuses arenas past 2^28 dwords, so the
+// wrapped add lands on exactly (offset - SrcFirst + DstBase).
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickFlushBatchDescWriteMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= NumTableEntries * BrickCount)
+	{
+		return;
+	}
+	const uint e = i / BrickCount;
+	const uint b = i - e * BrickCount;
+
+	const uint Base = e * FlushTableStride;
+	const uint SrcBrickFirst = InFlushTable[Base + 0u];
+	const uint DstBrickBase  = InFlushTable[Base + 1u];
+	const uint OccRebase = InFlushTable[Base + 3u] - InFlushTable[Base + 2u];
+	const uint MatRebase = InFlushTable[Base + 7u] - InFlushTable[Base + 6u];
+
+	uint2 D = InBrickDesc[SrcBrickFirst + b];
+	const uint Kind = (D.x >> 28u) & 3u;
+	if (Kind == kBrickKindMixed)
+	{
+		// MIXED only -- a uniform brick's zero offsets must stay zero; see the
+		// file header for why rebasing them is worse than useless.
+		const uint OccOffset = ((D.x & kBrickOffsetMask) + OccRebase) & kBrickOffsetMask;
+		const uint MatOffset = ((D.y & kBrickOffsetMask) + MatRebase) & kBrickOffsetMask;
+		D.x = OccOffset | (D.x & kBrickFieldMask);
+		D.y = MatOffset | (D.y & kBrickFieldMask);
+	}
+	OutBrickDesc[DstBrickBase + b] = D;
+}
+
+// ---------------------------------------------------------------------------
+// BrickFlushBatchRecordMain -- one WORKGROUP per fused chunk, 64 threads, in
+// ONE dispatch. BrickChunkRecordMain's body with the loose constants replaced
+// by this group's table entry; the allSolid reduce is unchanged and still runs
+// over the SCRATCH cell data, because allSolid is not derivable from the
+// descriptors (a fully solid two-material brick is still MIXED) -- see the
+// classic kernel above for the full argument.
+// ---------------------------------------------------------------------------
+groupshared uint gsBatchAllSolid;
+
+[numthreads(64, 1, 1)]
+void BrickFlushBatchRecordMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+	const uint e = gid.x;
+	if (e >= NumTableEntries)
+	{
+		return;
+	}
+	const uint Base = e * FlushTableStride;
+	const uint EntrySrcBrickFirst = InFlushTable[Base + 0u];
+	const uint EntryChunkSlot     = InFlushTable[Base + 10u];
+	const uint EntrySrcChunkIndex = InFlushTable[Base + 11u];
+
+	if (gtid.x == 0u)
+	{
+		gsBatchAllSolid = 1u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x < BrickCount)
+	{
+		const uint2 D = InBrickDesc[EntrySrcBrickFirst + gtid.x];
+		const uint Kind = (D.x >> 28u) & 3u;
+
+		bool bBrickAllSolid = false;
+		if (Kind == 1u)
+		{
+			bBrickAllSolid = true;
+		}
+		else if (Kind == kBrickKindMixed)
+		{
+			const uint OccWord = D.x & kBrickOffsetMask;
+			uint Acc = 0xffffffffu;
+			for (uint k = 0u; k < kBrickOccWords; ++k)
+			{
+				Acc &= InBrickOcc[OccWord + k];
+			}
+			bBrickAllSolid = (Acc == 0xffffffffu);
+		}
+		if (!bBrickAllSolid)
+		{
+			InterlockedAnd(gsBatchAllSolid, 0u);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x != 0u)
+	{
+		return;
+	}
+
+	const uint MaskLo = InChunkBrickMask[2u * EntrySrcChunkIndex + 0u];
+	const uint MaskHi = InChunkBrickMask[2u * EntrySrcChunkIndex + 1u];
+	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+	const uint AllSolid = (gsBatchAllSolid != 0u) ? 1u : 0u;
+	const uint LevelAndFlags = (InFlushTable[Base + 12u] & 0xfu)
+	                         | (AnySolid << 4u) | (AllSolid << 5u);
+
+	const uint Rec = EntryChunkSlot * ChunkRecordDwords;
+	OutChunkTable[Rec + 0u] = InFlushTable[Base + 13u];
+	OutChunkTable[Rec + 1u] = InFlushTable[Base + 14u];
+	OutChunkTable[Rec + 2u] = InFlushTable[Base + 15u];
+	OutChunkTable[Rec + 3u] = LevelAndFlags;
+	OutChunkTable[Rec + 4u] = InFlushTable[Base + 1u];   // DstBrickBase
+	OutChunkTable[Rec + 5u] = MaskLo;
+	OutChunkTable[Rec + 6u] = MaskHi;
+	OutChunkTable[Rec + 7u] = InFlushTable[Base + 16u];
+	OutChunkTable[Rec + 8u] = InFlushTable[Base + 17u];
+	OutChunkTable[Rec + 9u] = InFlushTable[Base + 18u];
+	for (uint D = 10u; D < ChunkRecordDwords; ++D)
+	{
+		OutChunkTable[Rec + D] = 0u;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BrickFlushBatchClearMain -- every retired record of the flush in ONE
+// dispatch. InFlushTable is a PLAIN SLOT LIST here (stride 1); one thread per
+// (slot, dword), and the dword count comes from the host for the clear
+// kernel's own grow-the-record reason.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickFlushBatchClearMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= NumTableEntries * ChunkRecordDwords)
+	{
+		return;
+	}
+	const uint e = i / ChunkRecordDwords;
+	const uint d = i - e * ChunkRecordDwords;
+	OutChunkTable[InFlushTable[e] * ChunkRecordDwords + d] = 0u;
+}
+
+// ---------------------------------------------------------------------------
+// BrickFlushVerifyMain -- the LIVE cross-check for the batched flush. One
+// workgroup, one chunk, sampled (one fused group per flush), and every input
+// address below comes from LOOSE CONSTANTS filled from the same FPendingWrite
+// the classic passes would read -- NOT from InFlushTable. See the parameter
+// block for why that independence is the whole point.
+//
+// WHAT FAILS IT: any dword of the chunk's pool descriptor range differing from
+// the classic rebase formula over the scratch descriptors; any dword of its
+// pool occupancy or material ranges differing from its scratch runs; any of
+// the 16 record dwords (reserved tail included) differing from the record the
+// classic kernel would build. Mismatches are InterlockedAdd'ed into
+// OutVerify[0]; OutVerify[1] counts chunks checked so a verify that silently
+// checked nothing is visible as 0/0 rather than as a pass -- the vxc_gpu
+// lesson: never gate on a statistic that cannot come out the other way.
+// ---------------------------------------------------------------------------
+groupshared uint gsVerifyAllSolid;
+
+[numthreads(64, 1, 1)]
+void BrickFlushVerifyMain(uint3 gtid : SV_GroupThreadID)
+{
+	// Phase A: the allSolid reduce, exactly BrickChunkRecordMain's, so the
+	// expected record below is the classic record.
+	if (gtid.x == 0u)
+	{
+		gsVerifyAllSolid = 1u;
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	if (gtid.x < BrickCount)
+	{
+		const uint2 D = InBrickDesc[SrcFirst + gtid.x];
+		const uint Kind = (D.x >> 28u) & 3u;
+		bool bBrickAllSolid = false;
+		if (Kind == 1u)
+		{
+			bBrickAllSolid = true;
+		}
+		else if (Kind == kBrickKindMixed)
+		{
+			const uint OccWord = D.x & kBrickOffsetMask;
+			uint Acc = 0xffffffffu;
+			for (uint k = 0u; k < kBrickOccWords; ++k)
+			{
+				Acc &= InBrickOcc[OccWord + k];
+			}
+			bBrickAllSolid = (Acc == 0xffffffffu);
+		}
+		if (!bBrickAllSolid)
+		{
+			InterlockedAnd(gsVerifyAllSolid, 0u);
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	// Phase B: strided compares. Each thread accumulates locally and adds once,
+	// so the atomic traffic is 64 adds per chunk at worst, not one per dword.
+	uint Mismatches = 0u;
+
+	// Descriptors: pool bytes vs the classic rebase of the scratch bytes.
+	const uint OccRebase = OccBase - OccSrcFirst;
+	const uint MatRebase = MatBase - MatSrcFirst;
+	for (uint b = gtid.x; b < BrickCount; b += 64u)
+	{
+		uint2 E = InBrickDesc[SrcFirst + b];
+		const uint Kind = (E.x >> 28u) & 3u;
+		if (Kind == kBrickKindMixed)
+		{
+			E.x = (((E.x & kBrickOffsetMask) + OccRebase) & kBrickOffsetMask) | (E.x & kBrickFieldMask);
+			E.y = (((E.y & kBrickOffsetMask) + MatRebase) & kBrickOffsetMask) | (E.y & kBrickFieldMask);
+		}
+		const uint2 G = InPoolDesc[BrickBase + b];
+		Mismatches += (E.x != G.x) ? 1u : 0u;
+		Mismatches += (E.y != G.y) ? 1u : 0u;
+	}
+
+	// The two arena runs, dword for dword.
+	for (uint i = gtid.x; i < VerifyOccWords; i += 64u)
+	{
+		Mismatches += (InPoolOcc[OccBase + i] != InBrickOcc[OccSrcFirst + i]) ? 1u : 0u;
+	}
+	// InWords is the scratch MATERIAL buffer on this kernel -- the loose-global
+	// binding model lets each entry point use the generic dword SRV for
+	// whatever arena it needs, exactly as BrickWordCopyMain does.
+	for (uint j = gtid.x; j < VerifyMatWords; j += 64u)
+	{
+		Mismatches += (InPoolMat[MatBase + j] != InWords[MatSrcFirst + j]) ? 1u : 0u;
+	}
+
+	if (gtid.x == 0u)
+	{
+		// The 16-dword record, reserved tail included -- a batched record pass
+		// that forgot to zero the tail must fail here, because slot reuse is
+		// exactly how stale tail dwords become somebody's terrain tint later.
+		const uint MaskLo = InChunkBrickMask[2u * SrcChunkIndex + 0u];
+		const uint MaskHi = InChunkBrickMask[2u * SrcChunkIndex + 1u];
+		const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
+		const uint AllSolid = (gsVerifyAllSolid != 0u) ? 1u : 0u;
+		const uint LevelAndFlags = (RingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);
+
+		const uint Rec = ChunkSlot * ChunkRecordDwords;
+		Mismatches += (InPoolTable[Rec + 0u] != asuint(OriginVoxel.x)) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 1u] != asuint(OriginVoxel.y)) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 2u] != asuint(OriginVoxel.z)) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 3u] != LevelAndFlags) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 4u] != BrickBase) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 5u] != MaskLo) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 6u] != MaskHi) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 7u] != ChunkClimatePacked) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 8u] != ChunkSurfaceGradPacked) ? 1u : 0u;
+		Mismatches += (InPoolTable[Rec + 9u] != ChunkSurfaceZRelBits) ? 1u : 0u;
+		for (uint D = 10u; D < ChunkRecordDwords; ++D)
+		{
+			Mismatches += (InPoolTable[Rec + D] != 0u) ? 1u : 0u;
+		}
+		InterlockedAdd(OutVerify[1], 1u);
+	}
+
+	if (Mismatches != 0u)
+	{
+		InterlockedAdd(OutVerify[0], Mismatches);
+	}
 }

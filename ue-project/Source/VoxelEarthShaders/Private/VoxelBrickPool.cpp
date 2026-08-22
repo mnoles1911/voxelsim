@@ -7,6 +7,7 @@
 #include "Misc/CommandLine.h"  // the -ExecCmds startup window; see the note above the accessors
 #include "Misc/Parse.h"
 #include "RHICommandList.h"
+#include "RHIGPUReadback.h" // the batched-flush cross-check's async result path
 #include "RHIResources.h"
 #include "RenderGraphBuilder.h"
 #include "RenderGraphResources.h"
@@ -225,6 +226,225 @@ namespace VoxelBrickPoolDetail
 	constexpr int64 kEvictionFocusRebuildVoxels = 256;
 	constexpr int64 kEvictionFocusRebuildVoxelsSq =
 		kEvictionFocusRebuildVoxels * kEvictionFocusRebuildVoxels;
+
+	// --- voxel.GPU.BrickFlushBatch: fuse the pool flush's per-chunk passes ---
+	//
+	// WHY THIS EXISTS, IN NUMBERS. Tier B.1 (voxel.GPU.WorldGenBatch) fused
+	// worldgen+pack across each Z-stack and CUT PASSES 3.4x (689 chunks in 215
+	// stacks, ~3,010 passes vs ~10,335 per-chunk, crosscheck 0 FAIL) -- and
+	// throughput did not move (brickPacks 488,408 vs the control's 562,898).
+	// So per-chunk pass SETUP upstream of the pool was not the ceiling. What
+	// stayed per-chunk was THIS pool's flush: 2 word copies + desc rebase +
+	// record, ~4 small dispatches per chunk, on both arms of that A/B. This
+	// switch fuses those into ~4 TABLE-DRIVEN dispatches per producing
+	// dispatch (per B.1 stack), plus one fused clear pass per flush.
+	//
+	// WHY THE FUSION UNIT IS "CHUNKS SHARING ONE SCRATCH", NOT "the flush". A
+	// compute pass binds fixed SRVs, so one dispatch can only read ONE set of
+	// source buffers -- and the chunks of one B.1 stack are exactly the chunks
+	// that share a set. Without -VoxelGpuWorldGenBatch=1 every payload has its
+	// own buffers, every group is a singleton, and this switch falls back to
+	// the classic passes chunk by chunk (counted, see the window line) -- so
+	// it only pays off STACKED ON B.1, which is its whole point.
+	//
+	// DEFAULT 0 AND BYTE-IDENTICAL OFF: with the switch off, AddFlushPasses
+	// takes the pre-existing branch verbatim -- same passes, same order, same
+	// bytes -- so a control leg needs no rebuild. Command-line override for
+	// VoxelBrickPackOnCpuEnabled's -ExecCmds reason (the harness delivers
+	// cvars AFTER streaming begins; for this switch that would only blur the
+	// counters, not the bytes, but a half-covered leg still misleads whoever
+	// reads it). The CVAR is honoured mid-run because both paths emit
+	// identical bytes; a flip's only residue is in the stats.
+	int32 GVoxelBrickFlushBatch = 0;
+	FAutoConsoleVariableRef CVarVoxelBrickFlushBatch(
+		TEXT("voxel.GPU.BrickFlushBatch"),
+		GVoxelBrickFlushBatch,
+		TEXT("1 = fuse the brick pool flush's per-chunk passes (2 word copies + desc rebase + record) ")
+		TEXT("into ~4 table-driven dispatches per producing dispatch, and all record clears into one. ")
+		TEXT("Only fuses chunks that share one scratch (a voxel.GPU.WorldGenBatch stack); everything ")
+		TEXT("else falls back per chunk, counted. 0 (default) = today's per-chunk passes, ")
+		TEXT("byte-identical. Live cross-check: one fused group per flush is byte-compared against ")
+		TEXT("the classic formula and reported on the [brick-flushbatch] window line."),
+		ECVF_Default);
+
+	bool VoxelBrickFlushBatchEnabled()
+	{
+		// -VoxelGpuBrickFlushBatch=<n> outranks the cvar; -1 means "not given"
+		// and the cvar wins, so a run that passes nothing behaves as before.
+		static const int32 CmdLine = []
+		{
+			int32 Value = -1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBrickFlushBatch="), Value);
+			return Value;
+		}();
+		return CmdLine >= 0 ? CmdLine != 0 : GVoxelBrickFlushBatch != 0;
+	}
+
+	// Dwords per flush-table entry. BOUND to the kernels as FlushTableStride,
+	// never restated as a literal there -- the ChunkRecordDwords rule. 32 (two
+	// cache lines exactly) rather than the 19 the fields need, for the record
+	// format's own 16-not-10 reason: entry-aligned lines, and headroom that
+	// does not cost a format change to use. The per-flush cost at the stack
+	// cap is 64 entries x 128 B = 8 KiB, i.e. nothing.
+	constexpr uint32 kFlushTableStride = 32;
+	// Entries one table (and so one fused dispatch set) may carry. A B.1 stack
+	// is capped at 64 chunks, so this never binds today; it exists so a future
+	// producer that hands out bigger shared-scratch groups slices them instead
+	// of building an unbounded table.
+	constexpr int32 kFlushTableMaxEntries = 512;
+
+	// --- batched-flush window counters ---------------------------------------
+	//
+	// Render thread writes (AddFlushPasses records passes there), game thread
+	// reads-and-resets (the window line in Flush) -- so atomics, the
+	// VoxelGpuBatchDetail pattern. int64 because a long soak overflows int32
+	// pass counts.
+	std::atomic<int64> GFlushBatchedFlushes{ 0 };  // batched flushes that carried GPU writes
+	std::atomic<int64> GFlushFusedGroups{ 0 };     // fused dispatch sets recorded
+	std::atomic<int64> GFlushFusedChunks{ 0 };     // chunks those sets covered
+	std::atomic<int64> GFlushFusedPasses{ 0 };     // dispatches actually recorded for them
+	std::atomic<int64> GFlushEquivPasses{ 0 };     // what the same chunks cost per-chunk
+	std::atomic<int64> GFlushFallbackSingle{ 0 };  // singleton group -> classic passes
+	std::atomic<int64> GFlushFallbackMixed{ 0 };   // shared Desc but differing Occ/Mat/Mask
+	std::atomic<int64> GFlushFallbackInvalid{ 0 }; // payload refused (also logged as a drop)
+	std::atomic<int64> GFlushClassicChunks{ 0 };   // chunks that took classic passes while armed
+	std::atomic<int64> GFlushClearsFused{ 0 };     // record clears folded into fused passes
+	std::atomic<int64> GFlushClearPasses{ 0 };     // fused clear dispatches recorded
+	// The cross-check tallies. Ok counts CHUNKS byte-verified clean; a FAIL is
+	// one sampled group with any mismatched dword (its own Error log carries
+	// the dword count). Pending is samples whose readback has not landed yet,
+	// published so the window line can say "no verdict yet" instead of
+	// looking like a pass.
+	std::atomic<int64> GFlushXchkChunksOk{ 0 };
+	std::atomic<int64> GFlushXchkSampleFails{ 0 };
+	std::atomic<int64> GFlushXchkSamples{ 0 };
+	std::atomic<int32> GFlushXchkPending{ 0 };
+
+	// RENDER THREAD ONLY. One entry per sampled fused group whose verify
+	// readback is still in flight. Raw pointers, deleted at harvest: at
+	// process exit whatever is still pending is deliberately leaked, because
+	// destroying an FRHIGPUBufferReadback from a static destructor on the
+	// main thread is the crash-on-exit shape FVoxelGpuBrickPayload's
+	// destructor exists to avoid, and a leak of at most a few 8-byte staging
+	// buffers at exit is the cheaper end of that trade.
+	struct FPendingFlushVerify
+	{
+		FRHIGPUBufferReadback* Readback = nullptr;
+		uint32 ExpectedChunks = 0;
+	};
+	TArray<FPendingFlushVerify> GPendingFlushVerify;
+	// Round-robin over the flush's fused groups, so sampling does not
+	// systematically verify whichever group a TMap happened to iterate first.
+	uint64 GFlushSampleRotor = 0;
+
+	// Harvests any landed verify results. RENDER THREAD ONLY -- called from
+	// inside the flush render command, which is the same serial timeline the
+	// readbacks were enqueued on.
+	void PollFlushVerifyReadbacks_RenderThread()
+	{
+		for (int32 I = GPendingFlushVerify.Num() - 1; I >= 0; --I)
+		{
+			FPendingFlushVerify& Pending = GPendingFlushVerify[I];
+			if (Pending.Readback == nullptr)
+			{
+				GPendingFlushVerify.RemoveAtSwap(I, EAllowShrinking::No);
+				continue;
+			}
+			if (!Pending.Readback->IsReady())
+			{
+				continue;
+			}
+			uint32 Result[2] = { 0, 0 };
+			if (const void* Src = Pending.Readback->Lock(sizeof(Result)))
+			{
+				FMemory::Memcpy(Result, Src, sizeof(Result));
+				Pending.Readback->Unlock();
+			}
+			// TWO ways to fail, both counted as FAIL: mismatched bytes, and a
+			// verify that checked fewer chunks than were sampled -- the second
+			// is the "gate that tested nothing" failure this project has
+			// shipped before (vxc_gpu), and it must not read as a pass.
+			if (Result[0] == 0 && Result[1] == Pending.ExpectedChunks)
+			{
+				GFlushXchkChunksOk.fetch_add(int64(Result[1]), std::memory_order_relaxed);
+			}
+			else
+			{
+				GFlushXchkSampleFails.fetch_add(1, std::memory_order_relaxed);
+				UE_LOG(LogVoxelBrickPool, Error,
+				       TEXT("[brick-flushbatch] FLUSH CROSS-CHECK FAILED: %u mismatched dwords over %u ")
+				       TEXT("verified chunks (%u sampled). The batched pool write did NOT reproduce the ")
+				       TEXT("classic per-chunk bytes -- a wrong table, a wrong prefix sum, or a kernel ")
+				       TEXT("bug -- and a wrong pool write is one chunk's bricks at another chunk's ")
+				       TEXT("address: plausible terrain, wrong place. Turn voxel.GPU.BrickFlushBatch ")
+				       TEXT("off and diff the batched kernels against their classic twins."),
+				       Result[0], Result[1], Pending.ExpectedChunks);
+			}
+			delete Pending.Readback;
+			GPendingFlushVerify.RemoveAtSwap(I, EAllowShrinking::No);
+			GFlushXchkPending.fetch_sub(1, std::memory_order_relaxed);
+		}
+	}
+
+	// The [brick-flushbatch] window line. GAME THREAD (called from Flush), ~5 s
+	// cadence, the MaybeLogBatchWindow shape: quiet while nothing happened,
+	// and when something did, EVERY counter prints -- a fused count without
+	// its fallbacks is how a batch that silently declined everything reads as
+	// healthy. Read-and-reset with one reader (this function).
+	double GFlushBatchWindowStart = 0.0;
+	void MaybeLogFlushBatchWindow()
+	{
+		const double Now = FPlatformTime::Seconds();
+		if (GFlushBatchWindowStart <= 0.0)
+		{
+			GFlushBatchWindowStart = Now;
+			return;
+		}
+		if (Now - GFlushBatchWindowStart < 5.0)
+		{
+			return;
+		}
+
+		const int64 BatchedFlushes = GFlushBatchedFlushes.exchange(0, std::memory_order_relaxed);
+		const int64 FusedGroups = GFlushFusedGroups.exchange(0, std::memory_order_relaxed);
+		const int64 FusedChunks = GFlushFusedChunks.exchange(0, std::memory_order_relaxed);
+		const int64 FusedPasses = GFlushFusedPasses.exchange(0, std::memory_order_relaxed);
+		const int64 EquivPasses = GFlushEquivPasses.exchange(0, std::memory_order_relaxed);
+		const int64 Single = GFlushFallbackSingle.exchange(0, std::memory_order_relaxed);
+		const int64 Mixed = GFlushFallbackMixed.exchange(0, std::memory_order_relaxed);
+		const int64 Invalid = GFlushFallbackInvalid.exchange(0, std::memory_order_relaxed);
+		const int64 Classic = GFlushClassicChunks.exchange(0, std::memory_order_relaxed);
+		const int64 ClearsFused = GFlushClearsFused.exchange(0, std::memory_order_relaxed);
+		const int64 ClearPasses = GFlushClearPasses.exchange(0, std::memory_order_relaxed);
+		const int64 XchkOk = GFlushXchkChunksOk.exchange(0, std::memory_order_relaxed);
+		const int64 XchkFail = GFlushXchkSampleFails.exchange(0, std::memory_order_relaxed);
+		const int64 XchkSamples = GFlushXchkSamples.exchange(0, std::memory_order_relaxed);
+		const int32 XchkPending = GFlushXchkPending.load(std::memory_order_relaxed);
+
+		if (BatchedFlushes == 0 && FusedGroups == 0 && Single == 0 && Mixed == 0 && Invalid == 0 &&
+		    Classic == 0 && ClearsFused == 0 && XchkOk == 0 && XchkFail == 0 && XchkSamples == 0)
+		{
+			GFlushBatchWindowStart = Now;
+			return;
+		}
+
+		// "vs ~N per-chunk": what the SAME fused chunks' passes would have
+		// cost as classic per-chunk recordings -- the number this switch
+		// exists to beat. The xcheck tail is the gate: FAIL > 0 is a wrong
+		// world, and "0 ok / 0 FAIL" with fused chunks non-zero means the
+		// verify never landed -- an answer of "no verdict", never "pass".
+		UE_LOG(LogVoxelBrickPool, Log,
+		       TEXT("[brick-flushbatch] %.1fs window: %lld flushes, %lld fused groups / %lld chunks ")
+		       TEXT("(%.1f per flush) in %lld passes (vs ~%lld per-chunk); fallbacks single %lld ")
+		       TEXT("mixed %lld invalid %lld (classic chunks %lld); clears %lld fused into %lld ")
+		       TEXT("passes; xcheck %lld chunks ok / %lld sample FAIL (%lld samples, %d pending)"),
+		       Now - GFlushBatchWindowStart, BatchedFlushes, FusedGroups, FusedChunks,
+		       BatchedFlushes > 0 ? double(FusedChunks) / double(BatchedFlushes) : 0.0,
+		       FusedPasses, EquivPasses,
+		       Single, Mixed, Invalid, Classic, ClearsFused, ClearPasses,
+		       XchkOk, XchkFail, XchkSamples, XchkPending);
+		GFlushBatchWindowStart = Now;
+	}
 
 	FBufferRHIRef CreateArenaBuffer(FRHICommandListImmediate& RHICmdList, const TCHAR* Name,
 	                                uint32 Stride, uint32 NumElements)
@@ -1252,7 +1472,8 @@ void FVoxelBrickPool::Reset()
 void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
                                                   const FVoxelBrickPoolBuffersRef& Buffers,
                                                   const TArray<FPendingWrite>& Writes,
-                                                  const TArray<uint32>& Clears)
+                                                  const TArray<uint32>& Clears,
+                                                  bool bBatchedFlush)
 {
 	RDG_EVENT_SCOPE(GraphBuilder, "VoxelBrickPool.Flush(%d writes, %d clears)",
 	                Writes.Num(), Clears.Num());
@@ -1266,27 +1487,13 @@ void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 	FRDGBufferRef DstTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled,
 	                                                            TEXT("VoxelBrickPool.ChunkTable"));
 
-	// CLEARS FIRST. A slot retired and re-allocated inside one batch would
-	// otherwise end up cleared by a command recorded for the chunk that used
-	// to own it. The other order is only safe because AddChunkFromGpu and
-	// RemoveChunk drop any write that a clear invalidates -- both halves of
-	// that rule are needed, and this is the half that is visible in a
-	// capture.
-	for (uint32 Slot : Clears)
+	// The classic per-chunk emission, in ONE place so the batched arm's
+	// fallbacks record byte-for-byte the passes the control arm records --
+	// two copies of this body is two places for the rebase-wrap rule below to
+	// be half-remembered.
+	const auto EmitClassicWrite = [&GraphBuilder, DstDesc, DstOcc, DstMat, DstTable](
+		const FPendingWrite& Write)
 	{
-		VoxelGpuWorldGen::AddBrickChunkClearPass(GraphBuilder, DstTable, Slot);
-	}
-
-	for (const FPendingWrite& Write : Writes)
-	{
-		if (Write.CpuPack.IsValid())
-		{
-			// The CPU arm's bytes are in system memory, not in a buffer this
-			// graph could copy from. UploadCpuWrites_RenderThread moves them
-			// after this graph executes -- see its declaration for why after
-			// and not before.
-			continue;
-		}
 		const FVoxelGpuBrickPayloadRef& P = Write.Payload;
 		// Occ is required even by a chunk that allocated no occupancy
 		// dwords: the record pass reads it to decide allSolid, and a write
@@ -1301,7 +1508,7 @@ void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 			       TEXT("Brick write for slot %u DROPPED — payload has no buffers. 64 descriptors ")
 			       TEXT("at %u are allocated and empty."),
 			       Write.ChunkSlot, Write.BrickBase);
-			continue;
+			return;
 		}
 
 		FRDGBufferRef SrcDesc = GraphBuilder.RegisterExternalBuffer(P->Desc, TEXT("BrickSrc.Desc"));
@@ -1358,6 +1565,374 @@ void FVoxelBrickPool::AddFlushPasses_RenderThread(FRDGBuilder& GraphBuilder,
 			P->SrcBrickFirst, P->SrcChunkIndex, P->BrickCount,
 			Write.ChunkSlot, Write.BrickBase, Write.RingLevel, P->OriginVoxel,
 			Write.Shading);
+	};
+
+	if (!bBatchedFlush)
+	{
+		// --- THE CONTROL ARM, UNTOUCHED -----------------------------------
+		//
+		// CLEARS FIRST. A slot retired and re-allocated inside one batch would
+		// otherwise end up cleared by a command recorded for the chunk that
+		// used to own it. The other order is only safe because AddChunkFromGpu
+		// and RemoveChunk drop any write that a clear invalidates -- both
+		// halves of that rule are needed, and this is the half that is visible
+		// in a capture.
+		for (uint32 Slot : Clears)
+		{
+			VoxelGpuWorldGen::AddBrickChunkClearPass(GraphBuilder, DstTable, Slot);
+		}
+
+		for (const FPendingWrite& Write : Writes)
+		{
+			if (Write.CpuPack.IsValid())
+			{
+				// The CPU arm's bytes are in system memory, not in a buffer
+				// this graph could copy from. UploadCpuWrites_RenderThread
+				// moves them after this graph executes -- see its declaration
+				// for why after and not before.
+				continue;
+			}
+			EmitClassicWrite(Write);
+		}
+		return;
+	}
+
+	// =======================================================================
+	// THE BATCHED ARM (voxel.GPU.BrickFlushBatch).
+	//
+	// THE ORDERING ARGUMENT, STATED ONCE AND RELIED ON THROUGHOUT. Three
+	// facts make this sound, and none of them is new to the batched shape:
+	//
+	//   1. CLEAR-BEFORE-WRITE SURVIVES because the fused clear pass and every
+	//      record pass (fused or classic) declare UAV access to the SAME
+	//      buffer (DstTable), and RDG serialises same-resource writers in
+	//      RECORDING order. The clear is recorded first below, so it executes
+	//      first -- the invariant is carried by the resource declaration, not
+	//      by hope.
+	//   2. INTRA-GRAPH ORDER BETWEEN THE ARENA COPIES AND THE RECORD PASS
+	//      DOES NOT MATTER, batched or not, because NOTHING READS THE POOL
+	//      INSIDE THIS GRAPH: the record pass reads scratch, not the arenas
+	//      it names. Visibility to the marcher is at GRAPH granularity -- the
+	//      marcher's passes are in a later graph on the same immediate
+	//      command list, behind this graph's Execute() -- so "record last"
+	//      is a graph-level guarantee here exactly as it was per-chunk.
+	//   3. WITHIN ONE FUSED PASS, chunks write DISJOINT destination ranges:
+	//      each pending write holds a LIVE arena allocation (frees drop the
+	//      write), the allocator never hands out overlapping live ranges,
+	//      and at most one write per slot survives to a flush (the drop
+	//      rules in AllocateForChunk / RemoveChunk / EvictOne). So threads
+	//      of one dispatch never race on an address.
+	//
+	// Two fused groups' passes DO both write the same arena UAVs and get an
+	// RDG barrier between them -- ordering we do not need but that costs a
+	// barrier, not correctness. That is the price of grouping by source
+	// buffers, and it is still ~4 passes per STACK against ~4 per CHUNK.
+	// =======================================================================
+
+	// Harvest any earlier flush's verify results first; this is the same
+	// serial render-thread timeline they were enqueued on.
+	VoxelBrickPoolDetail::PollFlushVerifyReadbacks_RenderThread();
+
+	if (Writes.Num() > 0)
+	{
+		// Denominator for "chunks per batched flush" on the window line.
+		VoxelBrickPoolDetail::GFlushBatchedFlushes.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// --- clears, fused into one dispatch -----------------------------------
+	if (Clears.Num() > 1)
+	{
+		FRDGBufferRef SlotList = CreateStructuredBuffer(
+			GraphBuilder, TEXT("Voxel.BrickFlushClearSlots"), sizeof(uint32),
+			Clears.Num(), Clears.GetData(), Clears.Num() * sizeof(uint32));
+		VoxelGpuWorldGen::AddBrickFlushBatchClearPass(GraphBuilder, DstTable, SlotList,
+		                                              uint32(Clears.Num()));
+		VoxelBrickPoolDetail::GFlushClearsFused.fetch_add(Clears.Num(), std::memory_order_relaxed);
+		VoxelBrickPoolDetail::GFlushClearPasses.fetch_add(1, std::memory_order_relaxed);
+	}
+	else
+	{
+		for (uint32 Slot : Clears)
+		{
+			VoxelGpuWorldGen::AddBrickChunkClearPass(GraphBuilder, DstTable, Slot);
+		}
+	}
+
+	// --- group the GPU writes by producing dispatch -------------------------
+	//
+	// The scratch Desc buffer's pointer IS the producing dispatch's identity:
+	// a Tier B.1 stack hands every member a payload sharing one buffer set,
+	// and a classic per-chunk job's payload shares with nobody. Grouping on
+	// the pointer therefore recovers exactly the stacks, with no protocol
+	// between the job manager and the pool -- the buffers themselves are the
+	// contract. Occ/Mat/Mask are checked against the group's first member
+	// rather than trusted, because a payload that shared Desc but not the
+	// rest would make the fused copies read one stack's words at another
+	// stack's offsets; that cannot happen today, and "cannot happen" is
+	// counted (fallbackMixed) rather than assumed.
+	struct FFlushGroup
+	{
+		const FVoxelGpuBrickPayload* Rep = nullptr;
+		TArray<int32> Members;
+	};
+	TMap<const void*, int32> GroupIndexByDesc;
+	TArray<FFlushGroup> Groups;
+	TArray<int32> ClassicWrites;
+
+	for (int32 I = 0; I < Writes.Num(); ++I)
+	{
+		const FPendingWrite& Write = Writes[I];
+		if (Write.CpuPack.IsValid())
+		{
+			continue; // UploadCpuWrites_RenderThread's, after Execute, both arms
+		}
+		const FVoxelGpuBrickPayloadRef& P = Write.Payload;
+		if (!P.IsValid() || !P->Desc.IsValid() || !P->ChunkMask.IsValid() || !P->Occ.IsValid()
+		    || P->BrickCount != VoxelBrickPoolDetail::kBricksPerChunk)
+		{
+			// EmitClassicWrite logs the drop with the same message the control
+			// arm would; the BrickCount case is unreachable past
+			// AddChunkFromGpu's own refusal and guarded anyway because a fused
+			// dispatch sized on the CONTRACT would half-write a chunk that
+			// somehow carried a different count.
+			VoxelBrickPoolDetail::GFlushFallbackInvalid.fetch_add(1, std::memory_order_relaxed);
+			EmitClassicWrite(Write);
+			continue;
+		}
+		const void* Key = P->Desc.GetReference();
+		if (const int32* Existing = GroupIndexByDesc.Find(Key))
+		{
+			FFlushGroup& Group = Groups[*Existing];
+			const FVoxelGpuBrickPayload* Rep = Group.Rep;
+			if (P->Occ.GetReference() != Rep->Occ.GetReference() ||
+			    P->Mat.GetReference() != Rep->Mat.GetReference() ||
+			    P->ChunkMask.GetReference() != Rep->ChunkMask.GetReference())
+			{
+				VoxelBrickPoolDetail::GFlushFallbackMixed.fetch_add(1, std::memory_order_relaxed);
+				ClassicWrites.Add(I);
+				continue;
+			}
+			Group.Members.Add(I);
+		}
+		else
+		{
+			const int32 NewIndex = Groups.Num();
+			FFlushGroup& Group = Groups.Emplace_GetRef();
+			Group.Rep = P.Get();
+			Group.Members.Add(I);
+			GroupIndexByDesc.Add(Key, NewIndex);
+		}
+	}
+
+	// One fused slice's recorded state, kept so the verify sampler below can
+	// re-reach the slice's writes and registered buffers after all groups
+	// have been recorded.
+	struct FFusedSlice
+	{
+		TArray<int32> Members;
+		FRDGBufferRef SrcDesc = nullptr;
+		FRDGBufferRef SrcOcc = nullptr;
+		FRDGBufferRef SrcMat = nullptr;
+		FRDGBufferRef SrcMask = nullptr;
+	};
+	TArray<FFusedSlice> FusedSlices;
+
+	for (const FFlushGroup& Group : Groups)
+	{
+		if (Group.Members.Num() == 1)
+		{
+			// A singleton fused set would be the same ~4 passes plus a table
+			// upload -- strictly worse. This is the EXPECTED shape whenever
+			// voxel.GPU.WorldGenBatch is off (every payload its own buffers),
+			// which is why the window line reports it as its own reason
+			// rather than folding it into a generic "fallback".
+			VoxelBrickPoolDetail::GFlushFallbackSingle.fetch_add(1, std::memory_order_relaxed);
+			ClassicWrites.Add(Group.Members[0]);
+			continue;
+		}
+
+		// Register the shared scratch ONCE per group (idempotent per graph,
+		// but stating the intent: one group, one buffer set).
+		const FVoxelGpuBrickPayload* Rep = Group.Rep;
+		FRDGBufferRef SrcDesc = GraphBuilder.RegisterExternalBuffer(Rep->Desc, TEXT("BrickSrc.Desc"));
+		FRDGBufferRef SrcMask = GraphBuilder.RegisterExternalBuffer(Rep->ChunkMask, TEXT("BrickSrc.Mask"));
+		FRDGBufferRef SrcOcc = GraphBuilder.RegisterExternalBuffer(Rep->Occ, TEXT("BrickSrc.Occ"));
+		FRDGBufferRef SrcMat = Rep->Mat.IsValid()
+			? GraphBuilder.RegisterExternalBuffer(Rep->Mat, TEXT("BrickSrc.Mat")) : nullptr;
+
+		// Slices only guard a producer bigger than any that exists (stacks
+		// cap at 64 chunks; the table caps at 512 entries).
+		for (int32 SliceStart = 0; SliceStart < Group.Members.Num();
+		     SliceStart += VoxelBrickPoolDetail::kFlushTableMaxEntries)
+		{
+			const int32 SliceCount = FMath::Min(VoxelBrickPoolDetail::kFlushTableMaxEntries,
+			                                    Group.Members.Num() - SliceStart);
+
+			// --- build the destination table --------------------------------
+			//
+			// BUILT HERE, ON THE RENDER THREAD, PER FLUSH, and OWNED BY THE
+			// GRAPH: CreateStructuredBuffer copies the array into RDG's own
+			// allocator, so the table's lifetime is exactly the graph's and
+			// no CPU-side state survives the flush. Layout is the field map
+			// in VoxelBrickPoolWrite.usf; the CUM columns are inclusive
+			// prefix sums for the word-copy kernel's binary search.
+			const uint32 Stride = VoxelBrickPoolDetail::kFlushTableStride;
+			TArray<uint32> Table;
+			Table.SetNumZeroed(SliceCount * int32(Stride));
+			uint32 OccCum = 0;
+			uint32 MatCum = 0;
+			uint32 EquivPasses = 0;
+			for (int32 S = 0; S < SliceCount; ++S)
+			{
+				const FPendingWrite& Write = Writes[Group.Members[SliceStart + S]];
+				const FVoxelGpuBrickPayload* P = Write.Payload.Get();
+				// Mirror the CLASSIC copy conditions exactly: a chunk whose
+				// scratch mat buffer is missing gets no mat copy there, so it
+				// must get none here either -- word counts of zero suppress
+				// the copy without touching the desc rebase fields.
+				const uint32 OccWords = (P->OccWords > 0) ? P->OccWords : 0u;
+				const uint32 MatWords = (P->MatWords > 0 && SrcMat != nullptr) ? P->MatWords : 0u;
+				OccCum += OccWords;
+				MatCum += MatWords;
+
+				uint32* E = Table.GetData() + S * int32(Stride);
+				E[0] = P->SrcBrickFirst;
+				E[1] = Write.BrickBase;
+				E[2] = P->SrcOccFirst;
+				E[3] = Write.OccBase;
+				E[4] = OccWords;
+				E[5] = OccCum;
+				E[6] = P->SrcMatFirst;
+				E[7] = Write.MatBase;
+				E[8] = MatWords;
+				E[9] = MatCum;
+				E[10] = Write.ChunkSlot;
+				E[11] = P->SrcChunkIndex;
+				E[12] = Write.RingLevel;
+				E[13] = uint32(P->OriginVoxel.X);
+				E[14] = uint32(P->OriginVoxel.Y);
+				E[15] = uint32(P->OriginVoxel.Z);
+				Write.Shading.Pack(E[16], E[17], E[18]);
+				// [19..31] stay zero -- SetNumZeroed wrote them, and they are
+				// written rather than left alone for the record tail's reason.
+
+				EquivPasses += 2u + (OccWords > 0 ? 1u : 0u) + (MatWords > 0 ? 1u : 0u);
+			}
+
+			FRDGBufferRef TableBuffer = CreateStructuredBuffer(
+				GraphBuilder, TEXT("Voxel.BrickFlushTable"), sizeof(uint32),
+				Table.Num(), Table.GetData(), Table.Num() * sizeof(uint32));
+
+			// --- the ~4 fused passes ---------------------------------------
+			uint32 FusedPasses = 0;
+			if (OccCum > 0)
+			{
+				VoxelGpuWorldGen::AddBrickFlushBatchWordCopyPass(
+					GraphBuilder, DstOcc, SrcOcc, TableBuffer, Stride, /*FieldFirst*/ 2u,
+					uint32(SliceCount), OccCum);
+				++FusedPasses;
+			}
+			if (MatCum > 0 && SrcMat != nullptr)
+			{
+				VoxelGpuWorldGen::AddBrickFlushBatchWordCopyPass(
+					GraphBuilder, DstMat, SrcMat, TableBuffer, Stride, /*FieldFirst*/ 6u,
+					uint32(SliceCount), MatCum);
+				++FusedPasses;
+			}
+			VoxelGpuWorldGen::AddBrickFlushBatchDescWritePass(
+				GraphBuilder, DstDesc, SrcDesc, TableBuffer, Stride, uint32(SliceCount),
+				VoxelBrickPoolDetail::kBricksPerChunk);
+			++FusedPasses;
+			VoxelGpuWorldGen::AddBrickFlushBatchRecordPass(
+				GraphBuilder, DstTable, SrcDesc, SrcOcc, SrcMask, TableBuffer, Stride,
+				uint32(SliceCount), VoxelBrickPoolDetail::kBricksPerChunk);
+			++FusedPasses;
+
+			VoxelBrickPoolDetail::GFlushFusedGroups.fetch_add(1, std::memory_order_relaxed);
+			VoxelBrickPoolDetail::GFlushFusedChunks.fetch_add(SliceCount, std::memory_order_relaxed);
+			VoxelBrickPoolDetail::GFlushFusedPasses.fetch_add(FusedPasses, std::memory_order_relaxed);
+			VoxelBrickPoolDetail::GFlushEquivPasses.fetch_add(EquivPasses, std::memory_order_relaxed);
+
+			FFusedSlice& Slice = FusedSlices.Emplace_GetRef();
+			Slice.Members.Append(Group.Members.GetData() + SliceStart, SliceCount);
+			Slice.SrcDesc = SrcDesc;
+			Slice.SrcOcc = SrcOcc;
+			Slice.SrcMat = SrcMat;
+			Slice.SrcMask = SrcMask;
+		}
+	}
+
+	// The classic leftovers, AFTER the fused groups only for tidy capture
+	// grouping -- ordering between them is carried by the resource
+	// declarations (point 1 above), not by this loop's position.
+	for (int32 I : ClassicWrites)
+	{
+		EmitClassicWrite(Writes[I]);
+		VoxelBrickPoolDetail::GFlushClassicChunks.fetch_add(1, std::memory_order_relaxed);
+	}
+
+	// --- the live cross-check: sample ONE fused slice this flush -------------
+	//
+	// One workgroup per chunk of the sampled slice, comparing the pool bytes
+	// the fused passes landed against the classic formula computed from the
+	// SAME FPendingWrite fields the classic passes read -- never from the
+	// table, so a table bug cannot verify itself (see BrickFlushVerifyMain).
+	// One slice per flush keeps the reintroduced per-chunk cost to a few
+	// dispatches per flush while every 5 s window still accumulates hundreds
+	// of verified chunks at streaming rates. RDG orders the verify behind the
+	// fused writes because it declares SRV reads of the four pool buffers the
+	// writes declared UAVs on.
+	if (FusedSlices.Num() > 0)
+	{
+		const FFusedSlice& Slice =
+			FusedSlices[int32(VoxelBrickPoolDetail::GFlushSampleRotor++ % uint64(FusedSlices.Num()))];
+
+		FRDGBufferRef VerifyResult = GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 2), TEXT("Voxel.BrickFlushVerify"));
+		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(VerifyResult), 0u);
+
+		VoxelGpuWorldGen::FBrickFlushVerifyBuffers VerifyBuffers;
+		VerifyBuffers.PoolDesc = DstDesc;
+		VerifyBuffers.PoolOcc = DstOcc;
+		VerifyBuffers.PoolMat = DstMat;
+		VerifyBuffers.PoolTable = DstTable;
+		VerifyBuffers.SrcDesc = Slice.SrcDesc;
+		VerifyBuffers.SrcOcc = Slice.SrcOcc;
+		// A slice with no mat buffer has every MatWords at zero, so the
+		// kernel never reads InWords -- the occ buffer stands in only so the
+		// binding is non-null, exactly the "bound but unread" shape, stated.
+		VerifyBuffers.SrcMat = (Slice.SrcMat != nullptr) ? Slice.SrcMat : Slice.SrcOcc;
+		VerifyBuffers.SrcChunkMask = Slice.SrcMask;
+		VerifyBuffers.OutVerify = VerifyResult;
+
+		for (int32 I : Slice.Members)
+		{
+			const FPendingWrite& Write = Writes[I];
+			const FVoxelGpuBrickPayload* P = Write.Payload.Get();
+			VoxelGpuWorldGen::FBrickFlushVerifyArgs Args;
+			Args.SrcBrickFirst = P->SrcBrickFirst;
+			Args.SrcChunkIndex = P->SrcChunkIndex;
+			Args.BrickCount = P->BrickCount;
+			Args.ChunkSlot = Write.ChunkSlot;
+			Args.BrickBase = Write.BrickBase;
+			Args.RingLevel = Write.RingLevel;
+			Args.OccBase = Write.OccBase;
+			Args.MatBase = Write.MatBase;
+			Args.OccSrcFirst = P->SrcOccFirst;
+			Args.MatSrcFirst = P->SrcMatFirst;
+			Args.OccWords = (P->OccWords > 0) ? P->OccWords : 0u;
+			Args.MatWords = (P->MatWords > 0 && Slice.SrcMat != nullptr) ? P->MatWords : 0u;
+			Args.OriginVoxel = P->OriginVoxel;
+			Args.Shading = Write.Shading;
+			VoxelGpuWorldGen::AddBrickFlushVerifyPass(GraphBuilder, VerifyBuffers, Args);
+		}
+
+		FRHIGPUBufferReadback* Readback = new FRHIGPUBufferReadback(TEXT("Voxel.BrickFlushVerify"));
+		AddEnqueueCopyPass(GraphBuilder, Readback, VerifyResult, 2 * sizeof(uint32));
+		VoxelBrickPoolDetail::GPendingFlushVerify.Add(
+			VoxelBrickPoolDetail::FPendingFlushVerify{ Readback, uint32(Slice.Members.Num()) });
+		VoxelBrickPoolDetail::GFlushXchkSamples.fetch_add(1, std::memory_order_relaxed);
+		VoxelBrickPoolDetail::GFlushXchkPending.fetch_add(1, std::memory_order_relaxed);
 	}
 }
 
@@ -1536,9 +2111,14 @@ void FVoxelBrickPool::Flush()
 
 	const double FlushEnqueueStart = FPlatformTime::Seconds();
 	FlushStageMs.PrepMs += (FlushEnqueueStart - FlushPrepStart) * 1000.0;
+	// READ HERE, ON THE GAME THREAD, AND CAPTURED BY VALUE. The render command
+	// may run a frame later; the passes must be the ones this batch was queued
+	// under, not whatever the cvar says by then -- half a flush on each arm is
+	// the one state neither arm's counters describe.
+	const bool bBatchedFlush = VoxelBrickPoolDetail::VoxelBrickFlushBatchEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelBrickPoolFlush)(
 		[Buffers = GetOrCreateBuffers(), Writes = MoveTemp(Writes),
-		 Clears = MoveTemp(Clears)](FRHICommandListImmediate& RHICmdList) mutable
+		 Clears = MoveTemp(Clears), bBatchedFlush](FRHICommandListImmediate& RHICmdList) mutable
 	{
 		if (!Buffers.IsValid())
 		{
@@ -1597,7 +2177,7 @@ void FVoxelBrickPool::Flush()
 		// Every pass, inside a function that closes its own event scope before
 		// it returns. See AddFlushPasses_RenderThread for why that is
 		// load-bearing.
-		AddFlushPasses_RenderThread(GraphBuilder, Buffers, Writes, Clears);
+		AddFlushPasses_RenderThread(GraphBuilder, Buffers, Writes, Clears, bBatchedFlush);
 		GraphBuilder.Execute();
 
 		// AFTER Execute(), and that is the clear-before-write rule rather than a
@@ -1621,6 +2201,13 @@ void FVoxelBrickPool::Flush()
 		IndexSink(IndexDelta);
 	}
 	FlushStageMs.SinkMs += (FPlatformTime::Seconds() - FlushSinkStart) * 1000.0;
+
+	// The batched-flush window line. Only while armed: an unarmed control leg
+	// must not gain a log line, because leg diffs treat new lines as signal.
+	if (bBatchedFlush)
+	{
+		VoxelBrickPoolDetail::MaybeLogFlushBatchWindow();
+	}
 }
 
 uint64 FVoxelBrickPool::GetResidentBytes() const
