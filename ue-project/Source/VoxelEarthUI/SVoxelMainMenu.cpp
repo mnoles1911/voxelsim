@@ -1,6 +1,9 @@
 #include "SVoxelMainMenu.h"
 
+#include "SVoxelCoverImage.h"
 #include "SVoxelMenuButton.h"
+#include "VoxelEarthUI.h"
+#include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStrings.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
@@ -45,6 +48,14 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 	OnLoadSave = InArgs._OnLoadSave;
 	OnDeleteSave = InArgs._OnDeleteSave;
 
+	// MainMenu.gd re-scans the background folder and picks at random on every
+	// launch, so dropping a new image in needs no code change. Shuffling the
+	// library's order and taking entry 0 reproduces that, and leaves the
+	// rotation in a state the loading screen can walk forward from.
+	FRandomStream Stream = MakeVoxelUIRandomStream();
+	FVoxelUIAssetLibrary::Get().ShuffleOrder(Stream);
+	BackgroundIndex = 0;
+
 	// LAYER ORDER, straight from MainMenu.gd::_ready:
 	//   0  backdrop      #0a0a0f (the .tscn's ColorRect, not the palette's
 	//                    BG_NIGHT -- see VoxelUITheme::MenuBackdrop)
@@ -66,9 +77,15 @@ void SVoxelMainMenu::Construct(const FArguments& InArgs)
 
 		+ SOverlay::Slot()
 		[
+			SNew(SVoxelCoverImage)
+			.Brush(this, &SVoxelMainMenu::GetBackgroundBrush)
+		]
+
+		+ SOverlay::Slot()
+		[
 			SNew(SImage)
 			.Image(Style.SolidWhite())
-			.ColorAndOpacity(FSlateColor(Tint(BgNight, L.BackgroundTintAlpha)))
+			.ColorAndOpacity(this, &SVoxelMainMenu::GetBackgroundTint)
 		]
 
 		+ SOverlay::Slot()
@@ -280,4 +297,29 @@ FReply SVoxelMainMenu::OnKeyDown(const FGeometry& Geometry, const FKeyEvent& Key
 		return FReply::Handled();
 	}
 	return SCompoundWidget::OnKeyDown(Geometry, KeyEvent);
+}
+
+const FSlateBrush* SVoxelMainMenu::GetBackgroundBrush() const
+{
+	// One image, picked once per menu-show from the shuffled rotation, exactly
+	// as MainMenu.gd does (`_bg_paths[randi() % _bg_paths.size()]`). Null while
+	// the decode is in flight, which SVoxelCoverImage treats as "draw nothing
+	// this frame" rather than as an error.
+	return FVoxelUIAssetLibrary::Get().RequestBackground(BackgroundIndex);
+}
+
+FSlateColor SVoxelMainMenu::GetBackgroundTint() const
+{
+	using namespace VoxelUITheme;
+	// THE TINT GOES AWAY WITH THE ART, and this is a port of a deliberate
+	// decision rather than an accident: MainMenu.gd::_setup_background returns
+	// early when the pool is empty, so the 55% black wash is never added and
+	// the menu sits on its flat #0a0a0f backdrop. Applying the wash anyway
+	// would put near-black buttons on near-black, which is how a graceful
+	// degradation turns into an unreadable screen.
+	if (!FVoxelUIAssetLibrary::Get().HasAnyBackground())
+	{
+		return FSlateColor(FLinearColor::Transparent);
+	}
+	return FSlateColor(Tint(BgNight, FVoxelMenuLayout::Get().BackgroundTintAlpha));
 }

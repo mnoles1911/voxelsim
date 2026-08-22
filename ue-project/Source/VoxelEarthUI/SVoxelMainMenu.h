@@ -18,6 +18,7 @@
 #include "CoreMinimal.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
+#include "Styling/SlateColor.h"
 
 DECLARE_DELEGATE(FOnVoxelMenuAction);
 DECLARE_DELEGATE_OneParam(FOnVoxelSaveAction, const FString& /*Slug*/);
@@ -92,4 +93,13 @@ private:
 	EVoxelMenuPanel VisiblePanel = EVoxelMenuPanel::MainColumn;
 
 	bool HasAnyLoadableSave() const;
+
+	const struct FSlateBrush* GetBackgroundBrush() const;
+	FSlateColor GetBackgroundTint() const;
+
+	// Which entry of the shuffled background rotation this menu is showing.
+	// Chosen once in Construct: MainMenu.gd re-picks per launch, not per
+	// frame, and a background that changed while somebody was reading the menu
+	// would be a new behaviour rather than a ported one.
+	int32 BackgroundIndex = 0;
 };

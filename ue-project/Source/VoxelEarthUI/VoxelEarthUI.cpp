@@ -1,9 +1,24 @@
 #include "VoxelEarthUI.h"
 
+#include "VoxelUIAssetLibrary.h"
 #include "VoxelUIStyle.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/App.h"
 #include "Modules/ModuleManager.h"
 
 DEFINE_LOG_CATEGORY(LogVoxelUI);
+
+FRandomStream MakeVoxelUIRandomStream()
+{
+	if (FApp::IsUnattended())
+	{
+		// Any constant would do; this one is the project's default world seed,
+		// so a reader who greps for it finds an explanation rather than a
+		// magic number.
+		return FRandomStream(20260719);
+	}
+	return FRandomStream(int32(FPlatformTime::Cycles()));
+}
 
 void FVoxelEarthUIModule::StartupModule()
 {
@@ -19,7 +34,10 @@ void FVoxelEarthUIModule::StartupModule()
 void FVoxelEarthUIModule::ShutdownModule()
 {
 	// Slate resources must not outlive the renderer. Nothing enforces that for
-	// a plain singleton, so the module does it explicitly.
+	// a plain singleton, so the module does it explicitly. The asset library
+	// goes first: its brushes reference the textures its cache holds, and a
+	// brush outliving its texture is the one ordering that crashes.
+	FVoxelUIAssetLibrary::Shutdown();
 	FVoxelUIStyle::Shutdown();
 }
 
