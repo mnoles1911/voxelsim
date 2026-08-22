@@ -1,0 +1,25 @@
+// Unreal-side entry file for the BrickPack kernels (ray-marching plan P1-B).
+//
+// This file deliberately contains NO logic. It exists because Unreal compiles
+// a shader by (virtual file path, entry point name), and because the kernels
+// themselves live outside the Unreal project — in voxel-core/shaders, which is
+// engine-free, so the same text can be compiled by an offline DXC leg and by a
+// future standalone bench without an engine in the loop.
+//
+// It is the VoxelWorldGen.usf pattern, with one difference worth stating:
+// brickpack.ush carries NO worldgen version lock, because it contains no
+// worldgen math — only the Cells layout convention. So the shader classes for
+// BrickClassifyMain and BrickPackMain must NOT derive from FVoxelWorldGenShader
+// (which passes VXC_WORLDGEN_VERSION_CPP in); they need VXC_UE and nothing else.
+// The argument is VoxelAssetStamp.usf's, and its header has the long version.
+//
+// Platform.ush must come first — it defines the per-platform intrinsics and
+// type plumbing every Unreal shader is compiled against.
+//
+// VXC_UE switches brickpack.ush's resource DECLARATIONS (not its arithmetic)
+// over to Unreal's conventions: no explicit register() slots, and the parameter
+// fields declared as loose globals so they land in $Globals where Unreal's
+// shader parameter struct binds them by reflected name.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelCore/brickpack.ush"

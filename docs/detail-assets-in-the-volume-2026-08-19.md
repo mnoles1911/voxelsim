@@ -222,29 +222,65 @@ actually lands in, after overlap), which was **modelled, not measured**.
 returns ~500 MiB or more, this document is wrong and
 `ray-marching-plan-2026-08-19.md:795-797` is right.**
 
-### 5.2 Measured 2026-08-19/20 — the doc stands by a factor of 20–48
+### 5.2 Measured 2026-08-19/20 — the doc stands, by 3.8× at the shipping ring
 
 Full record: `docs/measurements/cover-volume-census-2026-08-19.txt`.
 Ring 112 m, pitch 50 mm, payload = descriptors + occupancy + 16 B palette +
 adaptive cells.
 
+**Ring 112 m** — the value this document was written against:
+
 | site | ground | inst/ha | **payload** | flat index |
 |---|---|---:|---:|---:|
-| **grassland −92445,−75855** | **real fine + real climate** | 3,611 | **25.4 MiB** | 29.1 MiB |
+| grassland −92445,−75855 | real fine + real climate | 3,611 | 25.4 MiB | 29.1 MiB |
 | grassland −92445,−75855 | coarse-only\* | 3,717 | 26.5 MiB | 25.4 MiB |
 | alpine bank −61440,−61440 | real fine + real climate | 156 | 10.5 MiB | 290.1 MiB |
-| **CONTROL** — terrain at 10 cm, same alpine ground, `--radius 112` | real | — | 31.3 MiB | 37.4 MiB |
+| CONTROL — terrain at 10 cm, same alpine ground | real | — | 31.3 MiB | 37.4 MiB |
+
+**Ring 256 m — THE RING THAT ACTUALLY SHIPS**, and the row that governs
+(`VoxelDetailAssetSubsystem.cpp:152`, `kDefaultRingMeters = 256.0`, raised from
+112 on 2026-08-18):
+
+| site | ground | inst/ha | **payload** | flat index |
+|---|---|---:|---:|---:|
+| **grassland, COVER** | real fine + real climate | 3,564 | **131.6 MiB** | 245.4 MiB |
+| **grassland, TERRAIN CONTROL** at 10 cm, same ground | real | — | **126.7 MiB** | 67.5 MiB |
 
 \* synthetic elevation over real coarse climate — the instrument the biome survey
 used for 6 of its 10 sites. Named, not hidden. **Superseded by the fine-tile row
 above** (§5.5), and kept because the pair is the evidence that the proxy was
 sound: the two disagree by **4%**.
 
-**25.4 MiB on real ground at a dense biome, against a 500 MiB falsifier.** On
-identical ground the cover volume is **34% of what the terrain volume already
-costs there** (10.5 against 31.3 MiB). The band predicted in §5 before any run —
-16–35 MiB — contained the measurement, and so did the narrower 15–45 MiB
-prediction made for the fine-tile row specifically (§5.5).
+**CORRECTION, 2026-08-20, and it is mine to own.** This document was written
+against a **112 m** detail ring, quoted from
+`docs/detail-asset-rendering.md`'s knobs table. **That default was already stale
+when I read it** — the ring was raised to **256 m on 2026-08-18**
+(`VoxelDetailAssetSubsystem.cpp:139-152`), 5.2× the area. Measured rather than
+scaled, the shipping ring costs **131.6 MiB**, and the ratio the area predicted
+(5.18×) is what came back, so density is uniform across the ring.
+
+**Three things change and one does not.**
+
+1. **The falsifier still holds, with a smaller margin: 131.6 MiB against 500 —
+   3.8×, not the 20–48× the 112 m rows showed.** The design decision stands;
+   the comfort does not.
+2. **The "34% of terrain" claim does not survive and should not be repeated.**
+   It was measured on *alpine* ground, which has almost no cover on it
+   (156 inst/ha). On dense grassland at the shipping ring, **cover is 104% of
+   terrain — 131.6 against 126.7 MiB. It roughly doubles the resident volume.**
+   The honest range is *34% where nothing grows, ~100% where things do.*
+3. **Requirement C1 gets stronger, not weaker** — the flat index at the shipping
+   ring is **245.4 MiB against 131.6 MiB of payload** (§5.3).
+4. **What does not change: the comparison that decides the phase.** Cover plus
+   terrain at the shipping ring is ~258 MiB of payload on the same ground, still
+   far below the **1,110 MiB** measured for R0-at-5cm and below today's 2,197 MiB
+   quad pool. Scoping the cover volume is still the cheaper project by a wide
+   margin — §3.1 is unaffected.
+
+The pre-registered bands were both correct *for the ring they were stated
+against*: 16–35 MiB predicted and 25.4 measured at 112 m (§5), and 15–45 MiB
+predicted and 25.4 measured for the fine-tile row (§5.5). **A prediction is only
+as good as the configuration named with it, and I did not name the ring.**
 
 **The site nearly buried it, and that is the reading rule.** The first run used
 the brick census's own site and returned 10.5 MiB — but `vxc_assetprobe` over the
@@ -561,5 +597,14 @@ and the stamp comes after the gate rather than before.
   integral because every authored pitch is a whole number of cm) and applies one
   common per-row downscale. Any earlier sheet from this tool — including
   `out/lattice-ab.png` — carries the old bias and should not be re-read.
+* **`docs/detail-asset-rendering.md`'s knobs table is stale on the ring** — it
+  says `-VoxelDetailRingMeters` defaults to 112 m; the code has said **256 m
+  since 2026-08-18** (`VoxelDetailAssetSubsystem.cpp:139-152`). I quoted the doc
+  and sized the whole census against it, which cost a 5.2× error in the headline
+  until it was caught and re-measured (§5.2). **That is the third stale default
+  this phase has found quoted in a doc** — after the pre-retune density in the
+  same file and the "flowers have no banks" line in the biome survey. The rule
+  that keeps earning itself: *a default quoted in a doc is a claim to check
+  against the code, not a value to use.*
 * **The `bankGrid` global mutex is a prerequisite for this phase**, not a side
   effect of it — see §6, item 3.

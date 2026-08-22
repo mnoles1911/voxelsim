@@ -12,6 +12,7 @@
 #include "UObject/ConstructorHelpers.h"
 #include "VoxelCoords.h" // VoxelSizeUU -- the one UU-per-voxel constant, for the UU -> m conversion
 #include "VoxelEarth.h"
+#include "VoxelSkySubsystem.h" // SetUnderwaterFogSuppression -- see the blend push below
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
 
@@ -391,10 +392,11 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 		                           : 0.0;
 		UE_LOG(LogVoxelEarth, Log,
 		       TEXT("Ocean: camera %s water (camera z=%.1f UU, worldgen ground z=%.1f UU, sea z=%.1f UU, ")
-		       TEXT("submerged depth %.2f m, treatment=%s)"),
+		       TEXT("submerged depth %.2f m, treatment=%s, fogSuppression=%.2f)"),
 		       bUnderwater ? TEXT("entered") : TEXT("exited"), CameraZ, GroundZ,
 		       UVoxelWaterSubsystem::SeaLevelZUU(), LastSubmergedDepthM,
-		       UnderwaterMID ? TEXT("M_Underwater") : TEXT("legacy constant tint"));
+		       UnderwaterMID ? TEXT("M_Underwater") : TEXT("legacy constant tint"),
+		       UnderwaterBlendWeight);
 	}
 
 	// --- The blend ------------------------------------------------------------
@@ -415,5 +417,25 @@ void AVoxelOceanActor::UpdateUnderwaterState(float DeltaTime)
 		UnderwaterBlendWeight = FMath::FInterpConstantTo(UnderwaterBlendWeight, Target, DeltaTime,
 		                                                 1.f / UnderwaterBlendSeconds);
 		UnderwaterPostProcess->BlendWeight = UnderwaterBlendWeight;
+
+		// THE SAME WEIGHT suppresses the atmospheric height fog (fog plan,
+		// 2026-08-20). One number drives both transitions so the two extinction
+		// models -- air fog above, Beer-Lambert below -- CROSS-FADE and can
+		// never sum at full strength, which is the double-count the old height
+		// fog was deleted for (:133-164 above). Pushed every tick the blend is
+		// live rather than only on transitions, because the fade itself is the
+		// window where double-counting would happen.
+		//
+		// Direction of dependency: the OCEAN pushes to the sky, never the
+		// reverse -- the sky must not know oceans exist (it works in ocean-less
+		// worlds; suppression just stays 0 there). Same lifetime reasoning as
+		// the exposure-ownership rule in VoxelSkySubsystem.cpp.
+		if (UWorld* FogWorld = GetWorld())
+		{
+			if (UVoxelSkySubsystem* Sky = FogWorld->GetSubsystem<UVoxelSkySubsystem>())
+			{
+				Sky->SetUnderwaterFogSuppression(UnderwaterBlendWeight);
+			}
+		}
 	}
 }

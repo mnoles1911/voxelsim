@@ -411,7 +411,71 @@ namespace VoxelGpuPoolCull
 		     "renders almost nothing; terrain still on screen is geometry the cull is wrongly discarding."),
 		ECVF_RenderThreadSafe);
 
+	// ARM A3 -- REMOVE THE TERRAIN DRAW AND MEASURE THE FRAME.
+	//
+	// The fourth member of the debug family above, and the one that answers a
+	// question none of the others can: what does the frame do when the pool
+	// submits NOTHING? Every other switch here changes WHICH quads are drawn;
+	// this one draws none, so (control - this) is the entire prize available
+	// from the draw path and therefore the ceiling on any renderer that
+	// replaces it. It exists because this project's standing rule is that no
+	// saving goes on a plan until an experiment has removed that work and
+	// measured the FRAME -- seven predictions were falsified 7/7 in one day by
+	// reasoning about component cost instead.
+	//
+	// A BITMASK, not a flag, because camera and shadow gathers are separately
+	// interesting and separately in doubt. Wave G measured shadow gathers
+	// submitting 92.6% of all quads; the 2026-07-28 census recorded
+	// shadowGather=0 at the same default cap. Both cannot describe the same
+	// renderer, and bit 2 reads the shadow contribution directly instead of
+	// arguing about it.
+	//
+	//   1 = suppress CAMERA gathers      2 = suppress SHADOW gathers
+	//   4 = additionally skip the cull walk and range emit
+	//
+	// Without bit 4 the walk and the emit still run in full, so 1|2 isolates
+	// GPU raster and submission while LEAVING the render-thread CPU cost in
+	// place; adding bit 4 removes that too. The difference between them is the
+	// walk+emit share (~4.2 ms of the 13.7 ms render thread, if the attribution
+	// holds), measured rather than assumed.
+	//
+	// The gather is still RECORDED, at zero, on every suppressed path -- the
+	// same choice the AllCapped path makes and for the same reason: an absent
+	// stat and a measured zero must not look alike in the census.
+	static int32 GDebugDrawNothing = 0;
+	static FAutoConsoleVariableRef CVarDebugDrawNothing(
+		TEXT("voxel.Stream.GPUCullDebugDrawNothing"), GDebugDrawNothing,
+		TEXT("Bitmask. Submit no geometry from the voxel pool. 1 = camera gathers, 2 = shadow gathers, "
+		     "4 = also skip the cull walk/emit. 3 = draw nothing at all but keep render-thread cull cost; "
+		     "7 = the pool does nothing whatsoever. Measurement only -- (control - this) bounds the prize "
+		     "from replacing the draw path. 0 = off."),
+		ECVF_RenderThreadSafe);
+
 	inline bool IsEnabled() { return GEnabled != 0; }
+
+	// FORCE THE SHADOW-ELIGIBILITY LINE TO PRINT ONCE, NOW.
+	//
+	// That line is latched on its own answer so it does not spam, which means on
+	// a settled leg the last one is minutes old by the time anything else
+	// interesting happens. The question it now serves needs it printed NEXT TO
+	// the engine's own r.DumpShadows output, on a settled frame, so that the pool
+	// box and the cascade sphere describe the same instant. Bumping this
+	// generation invalidates every live pool's latch, so the next GetViewRelevance
+	// prints -- for the terrain pool AND the water pool, which is deliberate:
+	// if only one of them reports, that difference is itself the answer.
+	//
+	//   voxel.DeferExec 145 voxel.Stream.LogShadowEligibility
+	//   voxel.DeferExec 146 r.DumpShadows
+	static std::atomic<uint32> GEligibilityGeneration{ 0 };
+	static FAutoConsoleCommand CmdLogShadowEligibility(
+		TEXT("voxel.Stream.LogShadowEligibility"),
+		TEXT("Print the voxel pool's shadow-eligibility line once on the next gather, for every live "
+		     "pool. Pair it with r.DumpShadows to read the pool's bounds and the cascade bounds off "
+		     "the same frame."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			GEligibilityGeneration.fetch_add(1, std::memory_order_relaxed);
+		}));
 
 	// HOW MANY LEVELS OF THE CASCADE CAST DYNAMIC SHADOWS.
 	//
@@ -424,11 +488,17 @@ namespace VoxelGpuPoolCull
 	// almost no screen area.
 	//
 	// This caps that by LEVEL, which maps directly to distance under
-	// kDefaultRingPresets: L0 0-64 m, L1 64-128, L2 128-256, L3 256-512,
-	// L4 512-1024, L5 1024-2048.
+	// kDefaultRingPresets (VoxelWorldSubsystem.h:147): L0 0-128 m, L1 128-256,
+	// L2 256-512, L3 512-1024, L4 1024-2048, L5 2048-4096.
+	//
+	// THE DISTANCES ABOVE WERE WRONG BY 2x UNTIL 2026-08-19 -- they read 0-64,
+	// 64-128, ... 1024-2048, i.e. one ring short at every level. The MEASURED
+	// quad savings below are unaffected, because they were measured against
+	// LEVELS and this cvar is a level cap; only the distance a reader would
+	// picture was wrong, and it is the distance a reader tunes by.
 	//
 	// THE DEFAULT IS THE CONSERVATIVE END ON PURPOSE. 4 drops only level 5 --
-	// terrain beyond 1 km -- worth roughly 1.5M quads a frame off an 11.85M floor,
+	// terrain beyond 2 km -- worth roughly 1.5M quads a frame off an 11.85M floor,
 	// which is comparable to the ENTIRE camera-view over-draw the pool's frustum
 	// cull was built to remove. The more aggressive settings are worth
 	// substantially more (~3.3M at 3, ~5.3M at 2) and they are a QUALITY
@@ -442,7 +512,9 @@ namespace VoxelGpuPoolCull
 		TEXT("voxel.Stream.GPUShadowMaxLevel"), GShadowMaxLevel,
 		TEXT("Highest cascade level whose pool chunks cast dynamic shadows. Levels above this are culled "
 		     "from shadow gathers only; the camera still draws every level it can see. Default 4 (terrain "
-		     "beyond ~1 km stops casting). Lower saves more and costs distant self-shadowing. 5+ = no cap."),
+		     "beyond ~2 km stops casting). Lower saves more and costs distant self-shadowing. 5+ = no cap. "
+		     "This CANNOT stop a shadow gather happening -- an all-capped gather still calls RecordGather, "
+		     "so it shows as shadowGathers>0 with shadowQuads=0, never as shadowGathers=0."),
 		ECVF_RenderThreadSafe);
 
 	// A chunk's level, recovered from the chunk table. AddChunk stores
@@ -848,7 +920,154 @@ public:
 		// it was always there; only the relevance flag that asks for it was
 		// missing, and without it TSR reprojects this terrain from depth alone.
 		Result.bVelocityRelevance = DrawsVelocity() && Result.bOpaque && Result.bRenderInMainPass;
+		ReportShadowEligibility(View, Result);
 		return Result;
+	}
+
+	// WHY THIS EXISTS. With r.ShadowQuality restored (DefaultEngine.ini
+	// [ConsoleVariables], 2026-08-19) the renderer now allocates and EXECUTES a
+	// ShadowDepths pass per cascade -- six of them in the ProfileGPU table -- and
+	// every one draws ZERO primitives in ~0.000 ms. The pool's own census reads
+	// shadowGathers=0 in every window at the same time, and that census is sound:
+	// the engine sets ShadowDepthView's cull frustum at ShadowSetup.cpp:2866
+	// BEFORE calling GetDynamicMeshElements at :2941, so if the proxy were
+	// gathered for a cascade the census would see it.
+	//
+	// TWO SUSPECTS ARE ALREADY DEAD, BY READING RATHER THAN BY DEFAULT VALUE, and
+	// neither needs a leg to retire:
+	//   voxel.Stream.GPUCullDebugDrawNothing bit 2 (skip the shadow gather) and
+	//   voxel.Stream.GPUShadowMaxLevel (cap casting levels) both sit INSIDE
+	//   GetDynamicMeshElements, and BOTH of their suppression paths still call
+	//   RecordGather -- deliberately, so a suppressed gather reads as a measured
+	//   zero. Either one firing would give shadowGathers=240 with shadowQuads=0.
+	//   We observe shadowGathers=0, so GetDynamicMeshElements is never REACHED
+	//   with a shadow view. Neither cvar can produce that, at any value.
+	//
+	// So the proxy never lands in FProjectedShadowInfo::DynamicSubjectPrimitives,
+	// which means it is rejected in FSceneRenderer::GatherShadowPrimitives. That
+	// leaves a short list of gates, and they are all reads of proxy state that
+	// only this class can see from inside the process. This prints every one of
+	// them, and the log line says which gate each value answers -- a value here
+	// that reads "wrong" names a file:line in the engine, not a hunch.
+	//
+	// LATCHED ON THE ANSWER, NOT ON A COUNT. Streaming changes bounds and the
+	// material every few seconds, so a fire-once latch would print the empty-pool
+	// answer and never the settled one. This re-prints whenever any bit changes,
+	// which also makes "it was fine and then stopped" visible instead of silent.
+	void ReportShadowEligibility(const FSceneView* View, const FPrimitiveViewRelevance& Rel) const
+	{
+		const bool bShadowView = View->GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+		const uint32 Bits =
+			  (CastsDynamicShadow()      ? 1u <<  0 : 0u)
+			| (CastsStaticShadow()       ? 1u <<  1 : 0u)
+			| (CastsHiddenShadow()       ? 1u <<  2 : 0u)
+			| (IsShadowCast(View)        ? 1u <<  3 : 0u)
+			| (IsShown(View)             ? 1u <<  4 : 0u)
+			| (IsForceHidden()           ? 1u <<  5 : 0u)
+			| (IsOftenMoving()           ? 1u <<  6 : 0u)
+			| (IsMeshShapeOftenMoving()  ? 1u <<  7 : 0u)
+			| (CastsInsetShadow()        ? 1u <<  8 : 0u)
+			| (CastsFarShadow()          ? 1u <<  9 : 0u)
+			| (CastsCinematicShadow()    ? 1u << 10 : 0u)
+			| (SupportsGPUScene()        ? 1u << 11 : 0u)
+			| (Rel.bOpaque               ? 1u << 12 : 0u)
+			| (Rel.bMasked               ? 1u << 13 : 0u)
+			| (Rel.bDynamicRelevance     ? 1u << 14 : 0u)
+			| (Rel.bStaticRelevance      ? 1u << 15 : 0u)
+			| (Rel.bDrawRelevance        ? 1u << 16 : 0u)
+			| (Rel.bRenderInMainPass     ? 1u << 17 : 0u)
+			| (bShadowView               ? 1u << 18 : 0u)
+			| (uint32(GetLightingChannelMask() & 0x7) << 19);
+
+		// GEOMETRY IS PART OF THE KEY NOW, AND THE FIRST VERSION OF THIS WAS WRONG
+		// WITHOUT IT. Latched on the flags alone, this printed three times inside
+		// the first second -- while the pool was still filling -- and then never
+		// again, even though the bounds went on growing by an order of magnitude
+		// afterwards. Every gate this line reports except one is a pure flag read,
+		// so that was nearly harmless; the exception is the one we are now on,
+		// the cascade frustum test at ShadowSetup.cpp:5152-5158, which reads
+		// NOTHING BUT the bounds. A rejection that begins only once the pool grows
+		// past some size is exactly the case in front of us, and the old latch
+		// could not have shown it.
+		//
+		// QUANTISED, NOT EXACT, because the bounds twitch every time a chunk
+		// streams and an exact key would make this a per-frame spam line. The
+		// centre is bucketed to 40.96 m and the extent to its next power of two,
+		// so a print means the pool MOVED or DOUBLED, not that it breathed.
+		const FBoxSphereBounds& B = GetBounds();
+		const auto Bucket = [](double V) -> int32 { return int32(FMath::FloorToDouble(V / 4096.0)); };
+		const auto Octave = [](double V) -> uint32
+		{
+			return V >= 1.0 ? uint32(FMath::FloorLog2(uint32(FMath::Min(V, 4.0e9)))) : 0u;
+		};
+		// Disjoint fields. An earlier draft ORed the radius octave into bit 0,
+		// where it collided with the X bucket -- a collision here does not
+		// misreport anything, it silently SKIPS a print, which is the one failure
+		// mode this whole line exists to avoid.
+		const uint32 GeomKey =
+			  (uint32(Bucket(B.Origin.X)  & 0x3FF) <<  0)   // bits  0-9
+			| (uint32(Bucket(B.Origin.Y)  & 0x3FF) << 10)   // bits 10-19
+			| (uint32(Bucket(B.Origin.Z)  & 0x3F ) << 20)   // bits 20-25
+			| ((Octave(B.BoxExtent.X)     & 0x7u ) << 26)   // bits 26-28
+			| ((Octave(B.SphereRadius)    & 0x7u ) << 29);  // bits 29-31
+
+		bool bChanged = false;
+		uint32 PrevBits = ShadowEligibilityBits.load(std::memory_order_relaxed);
+		if (PrevBits != Bits && ShadowEligibilityBits.compare_exchange_strong(PrevBits, Bits, std::memory_order_relaxed))
+		{
+			bChanged = true;
+		}
+		uint32 PrevGeom = ShadowEligibilityGeomKey.load(std::memory_order_relaxed);
+		if (PrevGeom != GeomKey && ShadowEligibilityGeomKey.compare_exchange_strong(PrevGeom, GeomKey, std::memory_order_relaxed))
+		{
+			bChanged = true;
+		}
+		const uint32 Gen = VoxelGpuPoolCull::GEligibilityGeneration.load(std::memory_order_relaxed);
+		uint32 PrevGen = ShadowEligibilityGen.load(std::memory_order_relaxed);
+		if (PrevGen != Gen && ShadowEligibilityGen.compare_exchange_strong(PrevGen, Gen, std::memory_order_relaxed))
+		{
+			bChanged = true;
+		}
+		if (!bChanged)
+		{
+			return;
+		}
+
+		// THE GEOMETRY FIELDS COME FIRST, and BoxExtent is here because the engine
+		// test we are now on is an AABB test -- ShadowBoundsAccurate.IntersectBox
+		// (ShadowSetup.cpp:5158) takes Origin and BOX EXTENT, not the sphere. A
+		// sphere radius alone cannot answer it, and the first version of this line
+		// printed only the radius, which is enough to reason your way to the wrong
+		// answer on a box this anisotropic (the pool has been 4x longer in Y than
+		// in X for the whole of its fill).
+		//
+		// viewOrigin is here so the pool-versus-camera half of the geometry needs
+		// no second line at all. The only number still to pair is the CASCADE
+		// sphere, and that one is printed by the engine itself via r.DumpShadows
+		// ("Bounds=X,Y,Z,W" per cascade, ShadowSetup.cpp:4715) -- deliberately not
+		// recomputed here, because GetShadowSplitBounds is renderer-private and a
+		// reimplementation of it would be a derived number pretending to be a
+		// measured one.
+		const FVector ViewOrigin = View->ViewMatrices.GetViewOrigin();
+		UE_LOG(LogTemp, Warning,
+		       TEXT("%s shadow eligibility: shadowView=%d boundsOrigin=(%.0f,%.0f,%.0f) ")
+		       TEXT("boundsExtent=(%.0f,%.0f,%.0f) boundsRadius=%.0f viewOrigin=(%.0f,%.0f,%.0f) ")
+		       TEXT("| castsDynamicShadow=%d castsStaticShadow=%d castsHiddenShadow=%d isShadowCast=%d ")
+		       TEXT("isShown=%d forceHidden=%d oftenMoving=%d meshShapeOftenMoving=%d insetShadow=%d ")
+		       TEXT("farShadow=%d cinematicShadow=%d supportsGPUScene=%d opaque=%d masked=%d ")
+		       TEXT("dynRelevance=%d staticRelevance=%d drawRelevance=%d mainPass=%d lightingChannels=0x%x"),
+		       *PoolName,
+		       bShadowView ? 1 : 0,
+		       B.Origin.X, B.Origin.Y, B.Origin.Z,
+		       B.BoxExtent.X, B.BoxExtent.Y, B.BoxExtent.Z, B.SphereRadius,
+		       ViewOrigin.X, ViewOrigin.Y, ViewOrigin.Z,
+		       CastsDynamicShadow() ? 1 : 0, CastsStaticShadow() ? 1 : 0, CastsHiddenShadow() ? 1 : 0,
+		       IsShadowCast(View) ? 1 : 0, IsShown(View) ? 1 : 0, IsForceHidden() ? 1 : 0,
+		       IsOftenMoving() ? 1 : 0, IsMeshShapeOftenMoving() ? 1 : 0, CastsInsetShadow() ? 1 : 0,
+		       CastsFarShadow() ? 1 : 0, CastsCinematicShadow() ? 1 : 0, SupportsGPUScene() ? 1 : 0,
+		       Rel.bOpaque ? 1 : 0, Rel.bMasked ? 1 : 0, Rel.bDynamicRelevance ? 1 : 0,
+		       Rel.bStaticRelevance ? 1 : 0, Rel.bDrawRelevance ? 1 : 0, Rel.bRenderInMainPass ? 1 : 0,
+		       uint32(GetLightingChannelMask()));
 	}
 
 	void GetDynamicMeshElements(const TArray<const FSceneView*>& Views,
@@ -945,6 +1164,24 @@ public:
 			uint32 VisibleQuadsThisGather = 0;
 			ECullOutcome Outcome = ECullOutcome::Ranges;
 			const bool bCull = VoxelGpuPoolCull::IsEnabled() && Runs.Num() > 0 && NumQuads > 0;
+
+			// ARM A3. Which gather this is decided the same way BuildCulledRanges
+			// decides it, so the two cannot disagree about what "a shadow gather"
+			// means. Note this is also the predicate the census counts, which is
+			// why a VSM-cached frame can report shadowGather=0 while shadows still
+			// render -- VSM's dynamic path does not come through here at all.
+			const bool bA3Shadow = Views[ViewIndex]->GetDynamicMeshElementsShadowCullFrustum() != nullptr;
+			const int32 A3Mask = VoxelGpuPoolCull::GDebugDrawNothing;
+			const bool bA3Suppress = (A3Mask & (bA3Shadow ? 2 : 1)) != 0;
+			// Bit 4 cuts BEFORE the walk, so this arm pays no render-thread cull
+			// cost either. Without it the walk and emit below still run in full and
+			// only the submission disappears -- the two arms bracket the walk+emit
+			// share of the render thread.
+			if (bA3Suppress && (A3Mask & 4) != 0)
+			{
+				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, /*VisibleQuads=*/0);
+				continue;
+			}
 			// GATHER TIMING (voxel.Stream.GPUCullTiming). The render thread IS the
 			// frame -- 13.49 ms of a 13.41 ms frame, with the game thread waiting
 			// 10 ms of it -- so this is where frame rate is decided, and the two
@@ -979,6 +1216,16 @@ public:
 				// is allocated at all -- so nothing can be asked how much work it
 				// represents. See RecordGather for what an abandoned, recycled
 				// FMeshBatch reported back when this path did allocate one.
+				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, VisibleQuadsThisGather);
+				continue;
+			}
+
+			// ARM A3, without bit 4: the walk and the emit above have already run
+			// and been timed, and only the SUBMISSION is removed. No FMeshBatch is
+			// allocated -- same reasoning as the AllCapped path, which records the
+			// gather at a real zero rather than vanishing from the census.
+			if (bA3Suppress)
+			{
 				RecordGather(*Views[ViewIndex], /*SubmittedQuads=*/0, VisibleQuadsThisGather);
 				continue;
 			}
@@ -2302,6 +2549,16 @@ private:
 	// -- the batch split is only observable on a gather that actually produced
 	// ranges, so it needs its own latch or the line never prints.
 	mutable FThreadSafeCounter BatchesLogged;
+	// The packed answer ReportShadowEligibility last printed. 0xFFFFFFFF is a
+	// value the packing can never produce (the top bits are unused), so the first
+	// call always prints, and every later call prints only on a CHANGE.
+	mutable std::atomic<uint32> ShadowEligibilityBits{ 0xFFFFFFFFu };
+	// Companions to the bits above: the quantised bounds, and the generation the
+	// voxel.Stream.LogShadowEligibility command bumps. A change in ANY of the
+	// three prints. See ReportShadowEligibility for why geometry had to join the
+	// key and why it is quantised rather than exact.
+	mutable std::atomic<uint32> ShadowEligibilityGeomKey{ 0xFFFFFFFFu };
+	mutable std::atomic<uint32> ShadowEligibilityGen{ 0xFFFFFFFFu };
 	int32 NumQuads = 0;      // drawn
 	int32 BufferQuads = 0;   // allocated
 	int32 NumChunks = 0;

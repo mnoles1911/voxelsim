@@ -96,10 +96,32 @@ by construction only.
 regardless of where meshing runs, and it improves something a player sees (cave
 lighting responding to digging).
 
+> **CORRECTED 2026-08-20 -- THE PARAGRAPH BELOW WAS WRONG FOR A MONTH AND WAS
+> BELIEVED DOWNSTREAM.** It said both cvars "remain **0** on main". They are
+> both **1**, and have been since **2026-07-27**, one day after this was
+> written: `VoxelGI.cpp:45` and `VoxelGIVolume.cpp:15`, each carrying the
+> comment "2026-07-27: ON for the manual PIE evaluation."
+> `docs/manual-verification-checklist.md:20` recorded the change correctly at
+> the time; this file did not, and neither did the cvar's own help string,
+> which still described 0 as the default one line below the 1.
+>
+> **What it cost:** every leg on this project has run with GI ON, so GI's cost
+> is already inside the A0 baseline in
+> `docs/measurements/armA-drawpath-ceiling-2026-08-19.txt` rather than waiting
+> outside it -- and a Phase 7 workstream was briefed on the premise that GI
+> ships off and had to be re-scoped. See
+> `docs/ray-marching-plan-2026-08-19.md` §P7.
+>
+> **The measurement below still stands as a measurement and is retained.** What
+> does not stand is using it to describe the shipping renderer: it was taken on
+> the **component** path (`voxel.Stream.GPU 0`) with `voxel.GI.Volume 0`, and
+> its dominant term -- the per-chunk vertex-colour re-shade -- structurally
+> cannot occur on the pooled path. Measured 2026-08-20: on the pooled path
+> GI-on minus GI-off is **0.08 ms of p50**, inside a 0.19 ms three-arm spread.
+>
 > **LANDED 2026-07-26 (PR #131). The owner asked for GI on by default; the
-> measurement said no, and B7's own escape clause was used as written.** Both
-> `voxel.GI.Enabled` and `voxel.GI.Volume` remain **0** on main
-> (`VoxelGI.cpp:36`, `VoxelGIVolume.cpp:15`). `-VoxelGIOn` is the opt-in.
+> measurement said no, and B7's own escape clause was used as written.**
+> `-VoxelGIOn` is the opt-in; `-VoxelGIOff` (added 2026-08-19) is the control.
 >
 > Component path, pinned pose, one binary, command line verified against
 > `LogInit` on every leg:

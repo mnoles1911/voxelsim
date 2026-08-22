@@ -523,7 +523,10 @@ operator. A hand-rolled quantiser has already produced one false "terrain moved"
 alarm on this system.
 
 **Isolation between world variants is by cache root, not by forging an
-identity.** `D:\voxelsim\tile-cache` and `D:\vox-wet-cache` hold the same
+identity.** (2026-08-21: `D:\voxelsim\tile-cache` is now the SINGLE
+authoritative root -- it holds coarse, fine and superblocks together; the other
+roots are redundant copies. See `docs/world-generation-architecture.md` 2b.)
+`D:\voxelsim\tile-cache` and `D:\vox-wet-cache` hold the same
 content-addressed namespace names, because the name is derived from the bake
 fingerprint and nothing about the bake changed. The tile directory alone decides
 which world you are standing in.
@@ -682,14 +685,29 @@ Reproducing the bake itself:
 ```
 python tools/survey_world_water.py accumulate --coarse-dir <cache>/<ns>/000000000135276f/s1 --out D:/vox-wet-out/worldwater
 python tools/survey_world_water.py blocks --dir D:/vox-wet-out/worldwater
-python tools/bake_tiles_from_cache.py --seed 20260719 --cache-dir D:/vox-wet-cache ^
+python tools/bake_tiles_from_cache.py --seed 20260719 --cache-dir D:/voxelsim/tile-cache ^
   --provider-id terrain-diffusion-unlabeled-80b9ca451a23eae4 ^
   --tiles="-5,-4 -4,-4 -3,-4 -5,-5 -4,-5 -3,-5" --npz-dir D:/vox-wet-npz
 ```
 
-Bake cost is about **300 CPU-seconds per fine tile**, so the six wet tiles are
-about 2,300 CPU-s and the whole 289-tile world would be roughly 24 CPU-hours.
-A world-scale bake is deliberately **not** scheduled.
+Bake cost was about **300 CPU-seconds per fine tile** when this was written, at
+`bake_ver` 13.
+
+**That number is now 2.16x low.** Re-measured 2026-08-21: at `bake_ver` 28 the
+same six wet tiles cost **770-842 CPU-s each** (mean 782). The ratio is stable --
+seven tiles baked at both versions give 1.85-2.38x, aggregate **2.16x**. Scaling
+the 256-tile `bake_ver` 8 census in `out/lake-survey-256/` (it records
+`cpu_seconds_bake` per tile: 23.1 CPU-hours world-wide) by that factor puts a
+full-world pass at **~47 CPU-hours**, not 24.
+
+Wall-clock runs *below* CPU time here -- measured 10.4 min/tile against 13.0
+CPU-min -- so the bake occupies only ~1.25 cores. Throughput comes from running
+separate processes over disjoint tile lists, not from more threads: cap
+`NUMBA_NUM_THREADS` and `OMP_NUM_THREADS` per worker or N workers oversubscribe
+N-fold. Cache writes are atomic (`_atomic_write`: mkstemp + `os.replace`), so
+concurrent workers writing different tiles is safe by construction.
+
+A world-scale bake is still deliberately **not** scheduled.
 
 ---
 

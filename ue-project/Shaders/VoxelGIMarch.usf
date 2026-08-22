@@ -1,0 +1,384 @@
+// VoxelGIMarch.usf -- voxel GI as a SHADER READ OF THE RESIDENT BRICKS.
+//
+// Phase 7 (docs/ray-marching-plan-2026-08-19.md section 13). One thread per GI
+// volume cell; each thread cone-marches the resident brick pool and writes the
+// two RGBA8 ambient-cube volumes the pooled vertex factory already samples.
+// That replaces the CPU chain -- voxelize from quads, solve on workers, encode,
+// UpdateTexture3D -- with a read of bricks that are ALREADY RESIDENT and
+// already traversed for primary visibility.
+//
+// WHY THIS EXISTS AT ALL, AND IT IS NOT FRAME TIME. Measured 2026-08-20, the
+// CPU cone march is at noise on the pooled path (GI on 34.79 / off 34.71 /
+// solve-disabled 34.90 ms p50). What is NOT free is that GI's ingest needs
+// QUADS, and wanting them forces every level-0 chunk within 87.5 m off the D1
+// direct-to-pool path onto the GPU readback path -- 806 of 1,319 level-0
+// candidates at fill, and zero at settle, which is why every settled-pose
+// measurement missed it. Reading bricks instead deletes that demand. THE CASE
+// IS A LOADING CASE.
+//
+// NO ENGINE INCLUDES beyond Platform.ush, on the same rule VoxelShadowMarch.usf
+// states: what dxc compiles in tools\voxel-check-gimarch-shader.ps1 is
+// byte-for-byte what UE's compiler will see, minus only UE's preprocessor
+// environment.
+//
+// ===========================================================================
+// THE DESIGN DECISION, WRITTEN DOWN BECAUSE GETTING IT WRONG LOOKS LIKE A LEAK
+// ===========================================================================
+//
+// The question was whether this walks the RING CASCADE or wants its OWN PYRAMID
+// VIEW of the same bricks. Neither, and the reason is a fact about the data
+// rather than a preference:
+//
+//   * THE RING CASCADE IS NOT A PYRAMID OVER THE NEAR FIELD. vxc::mips
+//     (downsampleBricks, VoxelWorldSubsystem.cpp:566) does generate coarser
+//     levels by 2x downsample with the >=4/8 solid rule and a majority
+//     material -- but level L is resident over an ANNULUS, [R0*2^(L-1),
+//     R0*2^L). Ring 0 is 0-128 m. A GI cone reaches 30 m by default and the
+//     whole light field lives inside a 70 m radius, so EVERY RAY THIS FILE
+//     FIRES TERMINATES INSIDE RING 0, where exactly one resolution exists:
+//     10 UU. There are no coarser bricks covering the near field to read.
+//     Walking the ring loop would buy nothing here and would inherit the ring
+//     path's open questions for it.
+//
+//   * THE PYRAMID THAT DOES EXIST IN THE NEAR FIELD IS THE ONE INSIDE A CHUNK,
+//     and it is free: the 64-bit BrickSolid mask (one bit per 8-voxel brick,
+//     80 UU) and the chunk record's anySolid (320 UU).
+//     VoxelMarchTraverseBrickHier already walks exactly that. So "its own
+//     pyramid view of the same bricks" is not something this file should build
+//     -- it already exists, one function away, and the only question is
+//     whether to TRUST it.
+//
+// SO THE WALK IS A PERMUTATION AND IT DEFAULTS TO FLAT.
+//
+//   GIMARCH_WALK 0  FLAT   VoxelMarchTraverseBrick. Correct by construction,
+//                          more expensive, and CANNOT inherit a skip defect.
+//                          THE DEFAULT.
+//   GIMARCH_WALK 1  HIER   VoxelMarchTraverseBrickHier. Cheaper. Carries
+//                          whatever the skip walk carries.
+//   GIMARCH_WALK 2  BOTH   runs both per cone and counts where they disagree,
+//                          SPLIT BY CONE DIRECTION.
+//
+// WALK 2 IS THE POINT OF THE WHOLE ARRANGEMENT, and it exists because of a
+// property of this specific failure: IN A CONE MARCH, DIRECTIONAL CONTENT LOSS
+// LOOKS EXACTLY LIKE LIGHT LEAKING THROUGH A THIN WALL. If the hierarchy misses
+// content the flat walk finds, GI gets brighter in the directions where it
+// misses -- which presents as a lighting bug and gets debugged as one, in this
+// file, for however long it takes someone to suspect the walk underneath. The
+// per-direction disagreement counters make that attributable in one leg: a leak
+// with a flat/hier disagreement concentrated in the same directions was
+// INHERITED; a leak without one is ours.
+//
+// The skip walk's directional behaviour is OPEN as of 2026-08-20 -- an earlier
+// "monotonic degradation" reading was assembled across two prints of different
+// legs and has been WITHDRAWN by the workstream that reported it. It is
+// unmeasured, not confirmed and not disproven. This file therefore neither
+// assumes it is broken (walk 1 and walk 2 exist) nor assumes it is fine (walk 0
+// is the default). Same call the Phase 6 cover workstream made, for the same
+// reason.
+//
+// ===========================================================================
+// WHAT THIS IS NOT, v1
+// ===========================================================================
+//
+// * NOT APERTURE-INTEGRATED CONE TRACING. Each of the 14 cones is a BINARY
+//   visibility ray. Classic VCT accumulates partial occlusion from successively
+//   coarser mips along the cone; with no near-field pyramid there is nothing
+//   coarser to accumulate from. So this is cosine-weighted sky visibility, not
+//   a filtered cone integral. It is a REAL DIFFERENCE FROM THE CONTROL ARM, and
+//   the owner judges it on screenshots, not on this comment.
+//
+// * NO BOUNCE. The CPU field is a Jacobi iteration: a cone that lands on a
+//   surface picks up that surface's PREVIOUS irradiance times an albedo, which
+//   is what lifts a sealed tunnel off the ambient floor. Doing that here means
+//   reading the two volumes while writing them, which within one dispatch is
+//   undefined rather than merely stale, and doing it honestly needs a
+//   ping-pong pair (+56.6 MB at the shipping dim). v1 writes visibility only,
+//   so ENCLOSED SPACES WILL BE DARKER THAN THE CONTROL ARM. Stated here, in the
+//   cvar help, and in the arm's log line, because "darker in caves" is exactly
+//   what a broken march also looks like.
+//
+// * NOT A SUBSTITUTE FOR THE CONTROL ARM. voxel.GI.MarchBricks defaults to 0.
+
+#include "/Engine/Public/Platform.ush"
+
+// The brick pool is the ONLY source here, exactly as in VoxelShadowMarch.usf.
+// A source-0 permutation would silently march the fluid occupancy volume, whose
+// 51.2 m box cannot contain rays fired from anywhere in a 70 m light field --
+// and the symptom would be GI that is correct near the camera and wrong at the
+// edges, which reads as a falloff bug rather than as a wrong volume.
+#include "/VoxelEarth/VoxelBrickTraverse.ush"
+
+#if VOXEL_MARCH_SOURCE != VOXEL_MARCH_SOURCE_BRICKPOOL
+#error VoxelGIMarch.usf marches the BRICK POOL. Compile with VOXEL_MARCH_SOURCE=1 -- see the note above this line for what a source-0 permutation would do.
+#endif
+
+#ifndef GIMARCH_WALK
+#define GIMARCH_WALK 0
+#endif
+
+#ifndef GIMARCH_TILE
+#define GIMARCH_TILE 4
+#endif
+
+// Cells per brick edge. MUST equal VoxelLF::BrickEdgeCells. Not a uniform: it
+// is a structural constant of the light field's layout (a brick IS a level-0
+// chunk, 320 UU / 40 UU = 8), and the C++ side static_asserts the pair.
+#define GIMARCH_BRICK_EDGE_CELLS 8
+
+// Traced cone count. MUST equal VoxelLF::NumTraceDirs, and the directions
+// themselves are UPLOADED rather than restated here -- see GIMarchTraceDir.
+#define GIMARCH_NUM_TRACE_DIRS 14
+// Ambient-cube storage slots. MUST equal VoxelLF::NumDirs.
+#define GIMARCH_NUM_SLOTS 6
+
+// ---------------------------------------------------------------------------
+// THE CONE BASIS IS UPLOADED, NOT RESTATED
+// ---------------------------------------------------------------------------
+//
+// VoxelLF::TraceDirTable and VoxelLF::SlotWeight in VoxelLightField.cpp are the
+// ONE definition of this basis. They are handed in as uniforms so this file
+// cannot hold a second, drifting copy.
+//
+// THAT IS NOT TIDINESS. The basis was already wrong once, for a subtle reason:
+// six axis-aligned 90-degree cones are DEGENERATE on a greedy voxel mesh,
+// because every normal is axis-aligned, so max(0, N.D) selected exactly one
+// cone and weighted side light to literally zero -- a cave floor lit by a shaft
+// three metres away solved to "dark". The fix (14 cones, five contributing per
+// slot, weights normalised so a slot is a convex combination and an unoccluded
+// cell still solves to exactly 1.0) is subtle enough that a hand-copied table
+// here would be a plausible-looking second answer. One table, one authority.
+//
+// SlotWeight is [GIMARCH_NUM_SLOTS][GIMARCH_NUM_TRACE_DIRS] flattened, one
+// float per float4 slot. Wasteful by 4x and deliberately so: a packed layout
+// needs index arithmetic at both ends, and the two ends drifting is the exact
+// failure this upload exists to prevent. 84 float4s is 1.3 KB of a 64 KB
+// budget.
+float4 GIMarchTraceDir[GIMARCH_NUM_TRACE_DIRS];
+float4 GIMarchSlotWeight[GIMARCH_NUM_SLOTS * GIMARCH_NUM_TRACE_DIRS];
+
+// ---- the dirty-brick work list --------------------------------------------
+//
+// One entry per GI brick to solve this frame. BOTH halves are computed on the
+// CPU in DOUBLE and handed over already resolved, rather than derived here from
+// an absolute cell coordinate: a GI cell coordinate at this world's scale is
+// ~150,000, and (C + 0.5) * 40 in float32 quantises coarser than the 40 UU cell
+// it is addressing. That is the same planet-scale precision argument
+// MarchBrickOriginVoxel exists for one file over.
+StructuredBuffer<float4> GIMarchBrickCornerLocalUU; // xyz = brick corner, pool-local UU
+StructuredBuffer<int4>   GIMarchBrickTexelMin;      // xyz = texel of that corner in the volume
+uint GIMarchNumBricks;
+uint GIMarchVolumeDim;
+
+// ---- march tunables --------------------------------------------------------
+float GIMarchCellSizeUU;      // VoxelLF::CellSizeUU, 40
+float GIMarchConeReachUU;     // FVoxelGISolveParams::MaxConeDistanceUU, 3000
+float GIMarchStartOffsetUU;   // self-hit guard; one level-0 voxel by default
+float GIMarchConeSlopeUU;     // handed to the traversal's cone rule
+float GIMarchSkyIntensity;    // 1.0 keeps open terrain identical with GI on
+uint  GIMarchStatsEnabled;
+
+RWTexture3D<float4> GIMarchOutPos;
+RWTexture3D<float4> GIMarchOutNeg;
+RWBuffer<uint>      GIMarchOutStats;
+
+// Stats slots. Kept small, and each one is a COUNT OF AN OBSERVED EVENT, never
+// a derived ratio -- the host divides, and abstains when the denominator is
+// small.
+#define GIMARCH_STAT_CELLS_DISPATCHED 0u
+#define GIMARCH_STAT_CELLS_SOLVED     1u
+#define GIMARCH_STAT_CELLS_INSIDE     2u  // cell centre was itself solid
+#define GIMARCH_STAT_CELLS_OPEN       3u  // empty, but no solid 6-neighbour
+#define GIMARCH_STAT_CONES_TRACED     4u
+#define GIMARCH_STAT_CONES_HIT        5u
+#define GIMARCH_STAT_STEPS            6u
+#define GIMARCH_STAT_EXHAUSTED        7u  // step budget spent -- see the host's verdict
+// Walk-comparison slots, one per traced cone direction, so a disagreement can
+// be attributed to a DIRECTION rather than to a count. 8 .. 8+14-1.
+#define GIMARCH_STAT_DISAGREE_BASE    8u
+#define GIMARCH_STAT_COUNT            (GIMARCH_STAT_DISAGREE_BASE + GIMARCH_NUM_TRACE_DIRS)
+
+void GIMarchStatAdd(uint Slot, uint Amount)
+{
+	if (GIMarchStatsEnabled != 0u && Amount != 0u)
+	{
+		uint Ignored;
+		InterlockedAdd(GIMarchOutStats[Slot], Amount, Ignored);
+	}
+}
+
+// One cone. Returns visibility in [0,1] and reports whether it hit, so the
+// caller can COUNT cones rather than infer them from a float.
+float GIMarchTraceCone(float3 OriginLocalUU, float3 Dir, uint DirIndex, out bool bOutHit)
+{
+	const float TMin = GIMarchStartOffsetUU;
+	const float TMax = GIMarchConeReachUU;
+
+#if GIMARCH_WALK == 1
+	const FVoxelMarchHit H = VoxelMarchTraverseBrickHier(OriginLocalUU, Dir, TMin, TMax, GIMarchConeSlopeUU);
+#else
+	const FVoxelMarchHit H = VoxelMarchTraverseBrick(OriginLocalUU, Dir, TMin, TMax, GIMarchConeSlopeUU);
+#endif
+
+#if GIMARCH_WALK == 2
+	// THE ATTRIBUTION ARM. Both walks, same ray, same bounds, and the
+	// disagreement is bucketed BY DIRECTION.
+	//
+	// Counted only when the two walks differ on WHETHER there is anything
+	// there, not on where -- a t difference of a voxel between two walks over
+	// the same grid is float ordering and says nothing about content, while
+	// "one found geometry and the other did not" is the thing that becomes a
+	// leak. bStartedInside is excluded for the same reason: both walks report
+	// it identically and it is not a walk outcome.
+	const FVoxelMarchHit Hier =
+		VoxelMarchTraverseBrickHier(OriginLocalUU, Dir, TMin, TMax, GIMarchConeSlopeUU);
+	if (Hier.bHit != H.bHit)
+	{
+		GIMarchStatAdd(GIMARCH_STAT_DISAGREE_BASE + DirIndex, 1u);
+	}
+#endif
+
+	GIMarchStatAdd(GIMARCH_STAT_STEPS, uint(max(H.Steps, 0)));
+	if (H.bExhausted)
+	{
+		GIMarchStatAdd(GIMARCH_STAT_EXHAUSTED, 1u);
+	}
+
+	bOutHit = H.bHit;
+	// A cone that started inside solid sees nothing. Reporting 1.0 there would
+	// light the inside of rock, which downstream reads as a hole.
+	return (H.bHit || H.bStartedInside) ? 0.0f : GIMarchSkyIntensity;
+}
+
+int3 GIMarchVoxelAt(float3 LocalUU)
+{
+	return VoxelMarchOriginVoxel() + int3(floor(LocalUU / VoxelMarchVoxelSizeUU(0)));
+}
+
+// Is this cell one the CPU arm would have solved? EMPTY and adjacent to a
+// surface, exactly.
+//
+// PARITY WITH THE CONTROL ARM IS THE POINT. The two arms must disagree about
+// LIGHTING or not at all -- if they also disagree about WHICH CELLS CARRY DATA,
+// every A/B is confounded by coverage and no capture can be read. So this
+// mirrors FVoxelLightField's rule rather than picking a better one.
+bool GIMarchCellIsSolvable(float3 CellCentreLocalUU, out bool bOutInside)
+{
+	bOutInside = (VoxelMarchBrickProbeVoxel(GIMarchVoxelAt(CellCentreLocalUU))
+	              == VOXEL_MARCH_REJECT_SOLID);
+	if (bOutInside)
+	{
+		return false;
+	}
+
+	const float Step = GIMarchCellSizeUU;
+	[unroll]
+	for (int Axis = 0; Axis < 3; ++Axis)
+	{
+		[unroll]
+		for (int Sign = -1; Sign <= 1; Sign += 2)
+		{
+			float3 P = CellCentreLocalUU;
+			P[Axis] += Step * float(Sign);
+			if (VoxelMarchBrickProbeVoxel(GIMarchVoxelAt(P)) == VOXEL_MARCH_REJECT_SOLID)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+[numthreads(GIMARCH_TILE, GIMARCH_TILE, GIMARCH_TILE)]
+void VoxelGIMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	// Bricks are laid out along Z: eight cell-rows per brick.
+	const uint BrickIndex = DispatchThreadId.z / uint(GIMARCH_BRICK_EDGE_CELLS);
+	if (BrickIndex >= GIMarchNumBricks)
+	{
+		return;
+	}
+	const uint3 Cell = uint3(DispatchThreadId.x, DispatchThreadId.y,
+	                         DispatchThreadId.z % uint(GIMARCH_BRICK_EDGE_CELLS));
+	if (Cell.x >= uint(GIMARCH_BRICK_EDGE_CELLS) || Cell.y >= uint(GIMARCH_BRICK_EDGE_CELLS))
+	{
+		return;
+	}
+
+	const int3 TexelMin = GIMarchBrickTexelMin[BrickIndex].xyz;
+	const int3 Texel = TexelMin + int3(Cell);
+	// A brick whose texels fall outside the volume is DROPPED, not clamped.
+	// Clamping would fold a brick from one edge of the volume onto the other,
+	// which renders as correct-looking lighting in the wrong place -- the one
+	// failure on this path that looks like terrain.
+	const int Dim = int(GIMarchVolumeDim);
+	if (any(Texel < int3(0, 0, 0)) || any(Texel >= int3(Dim, Dim, Dim)))
+	{
+		return;
+	}
+
+	GIMarchStatAdd(GIMARCH_STAT_CELLS_DISPATCHED, 1u);
+
+	const float3 CellCentreLocalUU =
+		GIMarchBrickCornerLocalUU[BrickIndex].xyz +
+		(float3(Cell) + 0.5f) * GIMarchCellSizeUU;
+
+	// EVERY DISPATCHED CELL WRITES. Unsolved cells write zeros rather than being
+	// skipped: A == 0 is the encoding's "no data here", which the vertex factory
+	// turns into plain geometric AO. Skipping would leave whatever was in the
+	// texel before -- which after a dig is the PRE-DIG irradiance, i.e. a tunnel
+	// that stays lit.
+	float4 OutPos = float4(0.0f, 0.0f, 0.0f, 0.0f);
+	float4 OutNeg = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+	bool bInside = false;
+	if (GIMarchCellIsSolvable(CellCentreLocalUU, bInside))
+	{
+		float ConeVis[GIMARCH_NUM_TRACE_DIRS];
+		[unroll]
+		for (uint C = 0u; C < uint(GIMARCH_NUM_TRACE_DIRS); ++C)
+		{
+			bool bHit = false;
+			ConeVis[C] = GIMarchTraceCone(CellCentreLocalUU, GIMarchTraceDir[C].xyz, C, bHit);
+			GIMarchStatAdd(GIMARCH_STAT_CONES_TRACED, 1u);
+			if (bHit)
+			{
+				GIMarchStatAdd(GIMARCH_STAT_CONES_HIT, 1u);
+			}
+		}
+
+		// Recombine into the six ambient-cube slots. The weights are normalised
+		// per slot on the CPU, so each slot is a convex combination of cone
+		// results in [0,1]: an unoccluded cell solves to exactly 1.0 and open
+		// terrain is unchanged with GI on. Nothing here can manufacture energy.
+		float Slot[GIMARCH_NUM_SLOTS];
+		[unroll]
+		for (uint S = 0u; S < uint(GIMARCH_NUM_SLOTS); ++S)
+		{
+			float Acc = 0.0f;
+			[unroll]
+			for (uint T = 0u; T < uint(GIMARCH_NUM_TRACE_DIRS); ++T)
+			{
+				Acc += GIMarchSlotWeight[S * uint(GIMARCH_NUM_TRACE_DIRS) + T].x * ConeVis[T];
+			}
+			Slot[S] = saturate(Acc);
+		}
+
+		// Scheme A, and the slot ORDER is VoxelLF::DirTable's: +X +Y +Z then
+		// -X -Y -Z. A shuffle here is invisible on open ground and wrong on
+		// every wall, which is why the order is restated rather than assumed.
+		OutPos = float4(Slot[0], Slot[1], Slot[2], 1.0f);
+		OutNeg = float4(Slot[3], Slot[4], Slot[5], 1.0f);
+		GIMarchStatAdd(GIMARCH_STAT_CELLS_SOLVED, 1u);
+	}
+	else if (bInside)
+	{
+		GIMarchStatAdd(GIMARCH_STAT_CELLS_INSIDE, 1u);
+	}
+	else
+	{
+		GIMarchStatAdd(GIMARCH_STAT_CELLS_OPEN, 1u);
+	}
+
+	GIMarchOutPos[uint3(Texel)] = OutPos;
+	GIMarchOutNeg[uint3(Texel)] = OutNeg;
+}

@@ -1,0 +1,92 @@
+FIRST HONEST RING LEG -- PRE-REGISTERED
+2026-08-20, written before the leg runs
+
+The first leg on which `entered`, `hit[1..5]`, `ringDiscordant` and the
+per-level gate have ever actually executed. Everything below is a COUNTER;
+nothing here is a frame time, so the owner's browser/video load does not touch
+any of it.
+
+GATE ZERO -- READ THIS LINE FIRST OR READ NOTHING
+=================================================
+
+  JOIN arm rings: shader=1 cpu=1
+
+If shader and cpu disagree, STOP. Every other figure describes a configuration
+that does not exist. This is the line whose absence cost three observations
+being investigated as independent findings.
+
+MUST NOT MOVE (controls)
+========================
+
+  ratio        ~43.5x, band 3.9%   -- six prints held 42.35..44.03
+  hash         constant within a leg; prints with different hashes are
+               different worlds and are not comparable
+
+A ratio outside that band means the traversal changed, not the rings.
+
+STRONG PREDICTION -- THE BOX FIX
+================================
+
+  rayMissedVolume  677,448  ->  ~0
+
+677,448 of 1,354,896 was EXACTLY HALF, and it was the camera sitting on the
+corner of a cornered box while the CPU had already moved the origin to the
+camera for the ring arm. With the comparator compiled rings-on, the box is
+centred on the camera and NO ray should fail the volume test.
+
+If it stays near half, the box and the origin are STILL disagreeing and the
+permutation fix did not take. If it lands somewhere in between, a third thing
+is involved and nothing downstream should be read.
+
+WHAT IS ACTUALLY BEING MEASURED
+===============================
+
+  entered[0]     should be ~= counted rays. Every ray opens ring 0.
+  entered[1..5]  THE MEASUREMENT. Unknown, and deliberately not predicted --
+                 whether rays get past 128 m at this pose is the open question
+                 that "no ray reaches ring 1" was wrongly thought to answer.
+  ringDiscordant non-zero IF AND ONLY IF entered[1] > 0. Non-zero with
+                 entered[1] == 0 means the classifier fires where no boundary
+                 is crossed, which was its pre-registered self-test.
+  gate v4        reports at L0; reports at L1+ only where entered[N] > 0. The
+                 1.5x bar is a LEVEL-0 number and is not applied above it.
+
+THE DESCENT VERDICT -- AND IT IS NOT INDIFFERENT TO RINGS
+=========================================================
+
+The upload-ordering hypothesis is dead (see the hand-back: both walks read the
+same bytes through textually identical occupancy reads, so a payload that has
+not landed makes BOTH miss and produces no disagreement at all). What remains
+is a stepping difference inside one brick.
+
+So the honest prediction is NOT "rings changes nothing":
+
+  IF the mechanism is float conditioning at brick re-entry, rings-on should
+  REDUCE descendedAndMissed as a SHARE of lost rays. The centred box puts the
+  ulp at ~0.0015 UU against a 0.01 UU nudge, where the cornered box at long
+  reach put it at ~0.049 UU -- five times the nudge. That is the exact
+  quantity a re-seeding rounding error is sensitive to.
+
+  IF the mechanism is a pure integer stepping difference, the share is
+  UNCHANGED and float conditioning is not involved.
+
+  IF descendedAndMissed RISES as a share, neither of us understands it and no
+  fix should be attempted until that is explained.
+
+  neverDescended should RISE in ABSOLUTE terms with reach -- more chunks
+  crossed is more chances for the chunk-level advance to skip one -- while its
+  SHARE stays roughly stable. It is a different defect from the above and it
+  is expected to behave differently.
+
+REPORT THE SHARE, NOT THE COUNT. Counts from one print are a snapshot; six
+prints established that while ratios held to 3.9% the counts under them moved
+2.3x and disagreement 37x. Three prints minimum, bucketed by hash.
+
+WHAT WOULD FALSIFY THE TWO-DEFECT READING
+=========================================
+
+If neverDescended and descendedAndMissed move TOGETHER across prints -- both up
+or both down by similar factors -- they are one mechanism with two faces and
+the "two defects" reading is wrong. The Aug-20 hash leg showed them swapping
+dominance (18/42, 2485/5720, 522/22), which is what independence looks like,
+but three prints is not a characterised population.

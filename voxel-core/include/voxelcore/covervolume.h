@@ -162,43 +162,28 @@ struct CoverChunkResult {
 // BINDING: a caller that passes a channel-less facts function is censusing the
 // sentinel world in which riparians refuse everywhere, which is a different
 // world and not this one.
-template <typename ColumnFactsFn>
-CoverChunkResult produceCoverChunk(const AssetField& field, uint32_t pitchMm, int64_t cx,
-                                   int64_t cy, int64_t cz, const ColumnFactsFn& columnFacts,
-                                   CoverProducerCounters& counters) {
+// Pack ONE cover chunk from an ALREADY-RESOLVED instance list.
+//
+// Split out because a caller that walks many chunks over one footprint -- the UE
+// detail ring resolves per 6.4 m group and then packs the 4x4 cover chunks
+// underneath it -- must not re-resolve per chunk. Resolving is the expensive
+// half (it is amplifier columns), and the group's list is the same list for
+// every chunk in it. produceCoverChunk below is this function plus the resolve.
+//
+// `resolved` may legally be empty: the chunk is still ATTEMPTED, which is what
+// keeps the funnel honest for a caller that packs a whole group's worth of
+// chunks whether or not the group found anything.
+inline CoverChunkResult packCoverChunk(
+    const std::vector<AssetField::ResolvedCoverInstance>& resolved, uint32_t pitchMm, int64_t cx,
+    int64_t cy, int64_t cz, CoverProducerCounters& counters) {
     CoverChunkResult out;
     counters.chunksAttempted.fetch_add(1, std::memory_order_relaxed);
     if (pitchMm == 0 || uint32_t(kVoxelSizeMm) % pitchMm != 0) return out;
-
-    const int64_t E = int64_t(kCoverChunkEdgeCells);
-    const int64_t baseCx = cx * E, baseCy = cy * E, baseCz = cz * E;
-
-    // The chunk's own rect in LEVEL-0 voxels. assetSitesForRect already dilates
-    // by each layer's maxRadiusMm and tests every site's reach exactly, so
-    // pre-dilating here would enumerate twice (assetfield.h's own note).
-    const int64_t p = int64_t(pitchMm);
-    const AssetVoxelRect rect{floorDiv(baseCx * p, int64_t(kVoxelSizeMm)),
-                              floorDiv(baseCy * p, int64_t(kVoxelSizeMm)),
-                              floorDiv((baseCx + E) * p - 1, int64_t(kVoxelSizeMm)),
-                              floorDiv((baseCy + E) * p - 1, int64_t(kVoxelSizeMm))};
-
-    // terrainOnly FALSE -- the whole point. Every other UE caller passes true,
-    // which is what makes these 85% of instances invisible to the world volume.
-    const std::vector<AssetInstance> insts =
-        field.instancesForRect(rect, columnFacts, /*terrainOnly*/ false);
-    if (insts.empty()) return out;
-    out.resolved = field.resolveForCoverCompose(insts, pitchMm);
-    const std::vector<AssetField::ResolvedCoverInstance>& resolved = out.resolved;
     if (resolved.empty()) return out;
     counters.chunksResolved.fetch_add(1, std::memory_order_relaxed);
 
-    // Anchor ownership is the dedup; see the counter's comment.
-    for (const auto& r : resolved)
-        if (r.anchorCx >= baseCx && r.anchorCx < baseCx + E && r.anchorCy >= baseCy &&
-            r.anchorCy < baseCy + E)
-            ++out.instancesAnchored;
-    counters.instancesAnchored.fetch_add(uint64_t(out.instancesAnchored),
-                                         std::memory_order_relaxed);
+    const int64_t E = int64_t(kCoverChunkEdgeCells);
+    const int64_t baseCx = cx * E, baseCy = cy * E, baseCz = cz * E;
 
     // Z REJECT BEFORE ANYTHING EXPENSIVE. A cover volume is mostly empty
     // vertically -- cover is a metre of plants over a landscape's whole relief
@@ -263,6 +248,52 @@ CoverChunkResult produceCoverChunk(const AssetField& field, uint32_t pitchMm, in
             for (int32_t z = 0; z < kCoverChunkEdgeCells; ++z)
                 if (decodeChunkVoxelCanonical(out.pack, x, y, z) != MAT_AIR) ++solid;
     counters.solidVoxels.fetch_add(solid, std::memory_order_relaxed);
+    return out;
+}
+
+
+// Resolve this chunk's own rect and pack it. The single-chunk convenience form,
+// and the one the tests gate: a caller with one chunk to build wants this, a
+// caller walking a group wants resolveCoverForRect + packCoverChunk.
+template <typename ColumnFactsFn>
+CoverChunkResult produceCoverChunk(const AssetField& field, uint32_t pitchMm, int64_t cx,
+                                   int64_t cy, int64_t cz, const ColumnFactsFn& columnFacts,
+                                   CoverProducerCounters& counters) {
+    if (pitchMm == 0 || uint32_t(kVoxelSizeMm) % pitchMm != 0) {
+        // Still an attempt, and still refused before any resolve -- the counter
+        // must show that the producer ran and declined.
+        return packCoverChunk({}, pitchMm, cx, cy, cz, counters);
+    }
+    const int64_t E = int64_t(kCoverChunkEdgeCells);
+    const int64_t baseCx = cx * E, baseCy = cy * E;
+    const int64_t p = int64_t(pitchMm);
+
+    // The chunk's own rect in LEVEL-0 voxels. assetSitesForRect already dilates
+    // by each layer's maxRadiusMm and tests every site's reach exactly, so
+    // pre-dilating here would enumerate twice (assetfield.h's own note).
+    const AssetVoxelRect rect{floorDiv(baseCx * p, int64_t(kVoxelSizeMm)),
+                              floorDiv(baseCy * p, int64_t(kVoxelSizeMm)),
+                              floorDiv((baseCx + E) * p - 1, int64_t(kVoxelSizeMm)),
+                              floorDiv((baseCy + E) * p - 1, int64_t(kVoxelSizeMm))};
+
+    // terrainOnly FALSE -- the whole point. Every other UE caller passes true,
+    // which is what makes these 85% of instances invisible to the world volume.
+    const std::vector<AssetInstance> insts =
+        field.instancesForRect(rect, columnFacts, /*terrainOnly*/ false);
+    std::vector<AssetField::ResolvedCoverInstance> resolved =
+        field.resolveForCoverCompose(insts, pitchMm);
+
+    CoverChunkResult out = packCoverChunk(resolved, pitchMm, cx, cy, cz, counters);
+    // Anchor ownership is the dedup; see the counter's comment. Counted here
+    // rather than in packCoverChunk because a group-walking caller resolves
+    // ONCE and would otherwise count its instances once per chunk.
+    for (const auto& r : resolved)
+        if (r.anchorCx >= baseCx && r.anchorCx < baseCx + E &&
+            r.anchorCy >= baseCy && r.anchorCy < baseCy + E)
+            ++out.instancesAnchored;
+    counters.instancesAnchored.fetch_add(uint64_t(out.instancesAnchored),
+                                         std::memory_order_relaxed);
+    out.resolved = std::move(resolved);
     return out;
 }
 

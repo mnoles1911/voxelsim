@@ -8,7 +8,7 @@ happened, and several sections below were overtaken by measurement.
 | wave | state |
 |---|---|
 | **A** culling | landed, on by default, verified pixel-identical to the full draw |
-| **B** GI | landed; **GI ships OFF** — p50 free, hitches ×3.2. The refresh sweep that might have rescued it is done and did not (see below) |
+| **B** GI | landed; **GI SHIPS ON** — `voxel.GI.Enabled` and `voxel.GI.Volume` have BOTH defaulted to **1** since 2026-07-27 (`VoxelGI.cpp`, `VoxelGIVolume.cpp`). **CORRECTED 2026-08-20:** this row said "ships OFF — p50 free, hitches ×3.2" and both halves were wrong. The ×3.2 is **RETIRED**, not merely stale: it was measured on the component path (`voxel.Stream.GPU 0`, `voxel.GI.Volume 0`), a configuration nobody ships, and its dominant term — the per-chunk vertex-colour re-shade — *structurally cannot occur* on the pooled path. Re-measured 2026-08-20 on the shipped defaults: GI on **34.79**, off **34.71**, on-with-solve-disabled **34.90** ms p50 — a 0.08 ms difference inside a 0.19 ms three-arm spread, with the middle arm slowest. See `docs/ray-marching-plan-2026-08-19.md` §13 |
 | **C** determinism gate | green; `6e893ab3679a8c81` held across every edit in this programme, including two to `worldgen.ush` |
 | **D** GPU meshing | **built, gated, measured, OFF by default** — the producer is switched |
 | **E** parity | partial: E1 designed-not-built, E2 shipped-unmeasured, E3 closed |
@@ -1076,7 +1076,16 @@ first upload covers that texel).
 
 ### B7 — ship it on
 
-**Target, as it now stands: `voxel.GI.Enabled 1` and `voxel.GI.Volume 0`.**
+> **SUPERSEDED 2026-07-27, RECORDED 2026-08-20.** This section's target was
+> never reached as written — it was overtaken. **Both** cvars have shipped at
+> **1** since 2026-07-27, one day after this was written, and the
+> `voxel.Stream.GPU` flip the coupling below was waiting on happened that day
+> too. So the "volume is correct-and-off" framing describes a tree that has not
+> existed for three weeks, and every leg since has run with the volume ON. The
+> reasoning about the coupling remains correct and worth reading; only the
+> target is dead.
+
+**Target, as it stood before 2026-07-27: `voxel.GI.Enabled 1` and `voxel.GI.Volume 0`.**
 
 The original wording was "Wave B is complete when `voxel.GI.Enabled 1` **and**
 `voxel.GI.Volume 1` are the defaults". That conflated two things, and the
@@ -1157,6 +1166,36 @@ unaffected, but its `max` and hitch numbers are the clamp, not the scene — whi
 is why the Wave A results cited elsewhere in this section are the **p50 delta and
 the cost model**, never a hitch count.
 
+> ### RETIRED 2026-08-20 — this table and the sentence under it
+>
+> **The numbers below are real; the renderer they describe is one nobody ships.**
+> They were taken on the **component** path (`voxel.Stream.GPU 0`) with
+> `voxel.GI.Volume 0`. The dominant attributed term is the per-chunk
+> vertex-colour re-shade, and that re-shade **structurally cannot occur** on the
+> pooled path: `VoxelGI.cpp` only enqueues a brick for re-shade if
+> `BrickComponents.Contains(Key)`, and pooled chunks never get an entry. The
+> second term, per-vertex CPU `SampleIrradiance` during proxy builds, is
+> likewise absent — the pooled factory samples a volume texture instead. Two of
+> the three measured terms were already gone before this was measured.
+>
+> **Re-measured 2026-08-20 on the shipped defaults**, three arms on the shadowed
+> baseline: GI on **34.79**, `-VoxelGIOff` **34.71**, GI on with the solve
+> disabled **34.90** ms p50. **G0 − G1 = 0.08 ms** inside a **0.19 ms** three-arm
+> spread, and the middle arm sits *above* both ends. The solve-disabled arm's
+> counters read exactly zero, so it is proven to have done what it claims.
+>
+> **The hitch column is doubly dead.** `hitchThresholdMs` is a fixed **33.3** and
+> the post-warmup p50 on the shadowed baseline is **~34.7**, so the *median*
+> frame now exceeds the threshold and ~65% of frames count as hitches for the
+> mundane reason that the scene runs at 28.8 fps. Hitch counts are **not
+> comparable across the 2026-08-19 shadow discontinuity** and must not be quoted
+> against this ×3.2 without re-basing the threshold — which would in turn re-base
+> every historical hitch figure in this document. Judge on p95 and
+> `postWarmupMaxFrameMs`.
+>
+> Full record and the pre-registered decision rule:
+> `docs/ray-marching-plan-2026-08-19.md` §13.
+
 | metric | off | on | delta | ranges overlap? |
 |---|---|---|---|---|
 | p50 | 23.25 | 23.37 | **+0.6%** | yes — below noise |
@@ -1164,7 +1203,8 @@ the cost model**, never a hitch count.
 | hitches | 23.3 | 74.0 | **×3.2** | **no** |
 | max | 40.9 | 49.0 | +19% | no |
 
-**GI is free at the median and expensive in the tail.** That independently
+~~**GI is free at the median and expensive in the tail.**~~ **On the pooled path
+it is free at both** — see the banner above. That independently
 reproduces the shape already on record for this module from a different
 experiment: the `voxel.GI.LegacyProxyRebuild` A/B concluded the re-shade cost was
 *"mostly a TAIL and throughput problem, not a median one"*. Two unrelated
@@ -1230,6 +1270,13 @@ between tiers resolves **downward**.
 Frame-time half (≥2 unclamped legs each; max 41–46 ms, clamped-fraction bound
 1.0–3.8%, all well under the 5% p95 limit) and latency half (one leg each,
 `voxel.GI.RelightTest`, 300 UU carve through the real edit path):
+
+> **READ THE RETIREMENT BANNER ABOVE FIRST.** This sweep runs on the same
+> component-path configuration and inherits the same limitation: its *relative*
+> comparison between refresh settings stands, but every **tier** verdict below
+> that turns on hitches or on the GI-off column is scored against a baseline
+> that does not describe the pooled path, on a hitch threshold that has since
+> stopped meaning "spike".
 
 | config | p50 | p95 | hitches | **edit → fully relit** | tier |
 |---|---|---|---|---|---|

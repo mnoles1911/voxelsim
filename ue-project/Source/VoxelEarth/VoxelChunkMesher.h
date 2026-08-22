@@ -66,10 +66,39 @@ struct FNeverSkipBrick
 	bool operator()(int32 /*Dx*/, int32 /*Dy*/, int32 /*Dz*/) const { return false; }
 };
 
-template <typename MaterialFn, typename BrickSkipFn = FNeverSkipBrick>
+// THE SECOND CONSUMER OF THE MESHER'S READS, and it exists because of a measured
+// +36% cold fill.
+//
+// vxc::packChunkBricksCanonical needs this chunk's 32,768 interior voxels. The
+// mesher has ALREADY READ every one of them: meshBrick materialises the brick
+// plus its apron into a flat mat[10^3] before any face scan (voxelcore/mesher.h)
+// and then throws it away, so the resident brick volume was re-sampling from
+// scratch what the mesher had just held. Measured on the leg that shipped the CPU
+// arm: 0.743 ms/chunk of worker time, 35.4 s -> 48.1 s cold fill.
+//
+// A sink hands the interior cells out AS THE MESHER READS THEM. Per brick the
+// mesher samples 1,000 cells and the packer needed 512 of them; sharing takes a
+// chunk from 1,512 sampler calls per brick to 1,000 -- a third of the sampling
+// removed, which is the same order as the regression it is meant to pay back.
+//
+// ZERO COST WHEN OFF, and that is why it is a template parameter with a
+// static constexpr flag rather than a pointer with a null check: under
+// FNoVoxelSink every `if constexpr` below compiles to nothing at all, so a mesh
+// with no packer behind it is byte-identical AND instruction-identical to what
+// it was. A `const MaterialId*` defaulting to nullptr would have cost a
+// predictable branch per sample -- 64,000 of them per chunk -- for nothing.
+struct FNoVoxelSink
+{
+	static constexpr bool kRecords = false;
+	void Set(int32 /*Cx*/, int32 /*Cy*/, int32 /*Cz*/, vxc::MaterialId /*M*/) const {}
+};
+
+template <typename MaterialFn, typename BrickSkipFn = FNeverSkipBrick,
+          typename VoxelSinkFn = FNoVoxelSink>
 void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const MaterialFn& MaterialAt, TArray<FVoxelChunkQuad>& OutQuads,
                       vxc::Counters* PerfCounters = nullptr, uint8 RingSkirtMask = 0,
-                      const BrickSkipFn& SkipBrick = BrickSkipFn())
+                      const BrickSkipFn& SkipBrick = BrickSkipFn(),
+                      const VoxelSinkFn& VoxelSink = VoxelSinkFn())
 {
 	using namespace vxc;
 	constexpr int32 B = VoxelCoords::BrickEdgeVoxels;
@@ -90,6 +119,37 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 				// nothing.
 				if (SkipBrick(Dx, Dy, Dz))
 				{
+					// A SKIPPED BRICK STILL HAS CONTENTS, and the sink still
+					// needs them. The skip is sound for QUADS -- either proof
+					// means meshBrick would append nothing -- but it says
+					// nothing a marcher can use: "no AIR in brick + apron"
+					// leaves a brick that is fully solid and MIXED, whose
+					// palette only its 512 materials can supply. So the sink
+					// pays 512 direct samples here rather than the 1,000 the
+					// skip just saved, and the skip stays a net win.
+					//
+					// The all-air case could in principle be filled without
+					// sampling, but this predicate does not report WHICH proof
+					// fired and inventing an answer from the wrong one is a
+					// hole in the world. Left as measured work, not guessed
+					// work.
+					if constexpr (VoxelSinkFn::kRecords)
+					{
+						const int64 SkipVX = (int64(ChunkKey.X) * BricksPerChunk + Dx) * int64(B);
+						const int64 SkipVY = (int64(ChunkKey.Y) * BricksPerChunk + Dy) * int64(B);
+						const int64 SkipVZ = (int64(ChunkKey.Z) * BricksPerChunk + Dz) * int64(B);
+						for (int32 Z = 0; Z < B; ++Z)
+						{
+							for (int32 Y = 0; Y < B; ++Y)
+							{
+								for (int32 X = 0; X < B; ++X)
+								{
+									VoxelSink.Set(Dx * B + X, Dy * B + Y, Dz * B + Z,
+									              MaterialAt(SkipVX + X, SkipVY + Y, SkipVZ + Z));
+								}
+							}
+						}
+					}
 					if (PerfCounters)
 					{
 						PerfCounters->incBricksGenerated();
@@ -130,7 +190,22 @@ void MeshChunkBricks(const VoxelCoords::FVoxelChunkKey& ChunkKey, const Material
 							return MAT_AIR;
 						}
 					}
-					return MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z);
+					const MaterialId M = MaterialAt(OriginVX + X, OriginVY + Y, OriginVZ + Z);
+					// The brick packer's voxels, taken from the mesher's own
+					// read rather than sampled a second time. INTERIOR ONLY:
+					// the apron is not part of the packed chunk, and the skirt
+					// branch above -- which is the one place this sampler lies,
+					// returning AIR to force a seam wall -- can only fire for
+					// Xc/Yc outside [0, ChunkVox), so a skirted cell is never
+					// recorded and the volume never inherits the lie.
+					if constexpr (VoxelSinkFn::kRecords)
+					{
+						if (X >= 0 && X < B && Y >= 0 && Y < B && Z >= 0 && Z < B)
+						{
+							VoxelSink.Set(ChunkBaseX + X, ChunkBaseY + Y, Dz * B + Z, M);
+						}
+					}
+					return M;
 				};
 
 				BrickQuads.clear();

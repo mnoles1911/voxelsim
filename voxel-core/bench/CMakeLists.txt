@@ -308,6 +308,21 @@ endif()
 add_executable(vxc_assetprobe assetprobe.cpp)
 target_link_libraries(vxc_assetprobe PRIVATE voxelcore)
 
+# --- vxc_volumeprobe: the BRICK / VRAM CENSUS (ray-marching plan section 4,
+#     Phase 0 gate G2). Three independent estimates of the resident brick
+#     volume at 10 cm over 4 km disagreed by 4x, and the whole spread lived in
+#     two ASSUMED numbers: what fraction of bricks are MIXED, and how many
+#     materials a mixed brick holds. This walks the real six-ring cascade
+#     through the engine's own coarse-generation binding and counts them, with
+#     the SAME walk's meshBrick<8> quads counted beside them so brick-vs-quad
+#     is one field rather than two estimates (the farwaterschemes precedent).
+#     Refuses a cascade with a zero-brick ring; every row prints its own n.
+add_executable(vxc_volumeprobe volumeprobe.cpp)
+target_link_libraries(vxc_volumeprobe PRIVATE voxelcore)
+if(NOT MSVC)
+  target_compile_options(vxc_volumeprobe PRIVATE -Wall -Wextra -Werror)
+endif()
+
 # --- vxc_caveprobe: the interval-band falsification test. Per-footprint air
 # spans over the SHIPPED materialAt, and admitted level-0 chunks per band
 # capacity, so "is an interval band worth building" is a measurement rather

@@ -124,7 +124,25 @@
 //   covers 83 m/s (a 352 m fall) and 32 covers 111 m/s (a 627 m fall). 16 is
 //   chosen because 40 m is the stated requirement and going over budget clamps
 //   rather than leaks -- not because 16 is a limit.
+//
+//   AND IT IS OVERRIDABLE, BY EXACTLY ONE CALLER. VoxelMarchSpike.usf (the
+//   ray-marching plan's G1 gate, docs/ray-marching-plan-2026-08-19.md §3)
+//   reuses this walk as a TERRAIN marcher, where the budget is not an
+//   anti-tunnelling constant at all -- it is the measurement's independent
+//   variable, one cvar value per arm (1 / 64 / 256 / 886). The guard below is
+//   the whole of that hook: the spike defines this to a shader UNIFORM before
+//   including this file, which costs the solver nothing because the loop is
+//   already [loop] and the bound is already read from a name rather than
+//   spelled inline.
+//
+//   THE SOLVER MUST NEVER DEFINE IT. 16 is mirrored by vxc::kFluidMaxCollisionSteps
+//   and pinned by test_fluidoccupancy.cpp; a fluid kernel that overrode it
+//   would move the supported-speed arithmetic above without moving the test
+//   that proves it, which is the one failure this guard makes possible and the
+//   reason it is documented here rather than treated as an ordinary default.
+#ifndef VOXEL_FLUID_MAX_COLLISION_STEPS
 #define VOXEL_FLUID_MAX_COLLISION_STEPS  16
+#endif
 
 // AND THE BUDGET IS NOT A LEAK. Running out of steps with segment remaining
 // clamps the particle to the last boundary the walk VERIFIED, rather than
@@ -204,9 +222,41 @@ uint3 VoxelFluidStorageVoxel(uint3 localVoxel)
 // collide against the terrain 51.2 m to its east, which reads as worldgen and
 // not as a bug.
 //
+// THE NO-FETCH STUB, AND WHY IT LIVES IN THE PREDICATE RATHER THAN THE CALLER.
+// Off by default and off for every fluid kernel, so the solver's compiled
+// binary is byte-identical to what it was before this hook existed. The ONE
+// consumer is VoxelMarchSpike.usf's no-fetch permutation
+// (voxel.Marcher.SpikeNoFetch 1), which is the arm that separates the march's
+// MEMORY cost from its ALU cost -- and that separation is only honest if the
+// loop, the boundary arithmetic and the trip count are the same in both arms
+// and the ONLY thing that changed is the buffer load. Stubbing at the call
+// site cannot do that: the walk chooses its axis and advances tMax inside this
+// file, so a caller-side stub would have to be a second copy of the walk, and
+// then the arm measures two different loops instead of one loop with and
+// without memory traffic.
+//
+// It is a compile-time permutation, not a uniform branch, on purpose: a
+// `if (NoFetch) return false;` leaves the load in the binary for the other side
+// of the branch, and the memory system is exactly what the arm is trying to
+// remove. What DOES also disappear with the load is the addressing maths that
+// feeds it (the wrap, the word index, the bit mask). That is not a leak in the
+// measurement, it is the honest definition of "the cost of asking the volume a
+// question", and it is stated here so the difference is never quoted as a pure
+// bandwidth number.
+#ifndef VOXEL_FLUID_SOLID_NO_FETCH
+#define VOXEL_FLUID_SOLID_NO_FETCH 0
+#endif
+
 // Mirror of vxc::fluidSolidAtVoxel.
 bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
 {
+#if VOXEL_FLUID_SOLID_NO_FETCH
+	// Everything is air, including outside the volume. The spike clips its ray
+	// to the volume box before it walks, so the walk still terminates on the
+	// segment rather than running away -- see VoxelMarchSpike.usf, which owns
+	// that guarantee and would otherwise be measuring an unbounded loop.
+	return false;
+#else
 	const int3 l = worldVoxel - FluidVolumeOriginVoxel;
 	const int dim = (int)FluidVolumeDimVoxels;
 	if (any(l < 0) || any(l >= dim))
@@ -221,6 +271,7 @@ bool VoxelFluidSolidAtVoxel(int3 worldVoxel)
 	const uint index = (s.z * FluidVolumeDimVoxels + s.y) * wordsPerRow + (s.x >> 5u);
 	// lint-shader-ub: allow VARIABLE_SHIFT - the distance is masked to 0..31 by the & 31u in the expression itself, so it is provably below the 32-bit left operand's width
 	return (FluidOccupancyBits[index] & (1u << (s.x & 31u))) != 0u;
+#endif // VOXEL_FLUID_SOLID_NO_FETCH
 }
 
 // Volume-local UU -> world voxel. One floor and one integer add, which is what

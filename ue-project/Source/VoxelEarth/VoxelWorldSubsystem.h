@@ -44,6 +44,12 @@ class IAssetChannelSource;
 }
 // --- end TASK #7 hook --------------------------------------------------------
 
+// P7-a. Surfaced opaquely so GetTerrainGpuPool() can hand out THE terrain pool
+// rather than leaving consumers to guess one out of a TObjectIterator. Same
+// forward-declaration-only rule as the hooks above: this header is UHT-parsed
+// and pulls in no renderer-module header. Must stay above UCLASS().
+class UVoxelGpuPoolComponent;
+
 UCLASS()
 class VOXELEARTH_API UVoxelWorldSubsystem : public UTickableWorldSubsystem
 {
@@ -184,6 +190,43 @@ public:
 	// AVoxelClipmapActor has to butt its inner hole against -- see
 	// SpacingUUForLevel. Resolved once from the command line at first use.
 	static int32 GetMaxRingLevel();
+
+	// Ring OVERLAP, in chunks of the level's own size, for the ray marcher.
+	// -VoxelRingOverlapChunks=<n>, DEFAULT 0 = today's behaviour exactly.
+	//
+	// WHAT IT IS FOR. At a ring boundary a ray leaves level L's resident set and
+	// resumes in L+1 at the same world t. Today exactly ONE level holds any given
+	// patch of ground near the seam (see RecomputeDesiredSet's seam block), so the
+	// ray exits L's grid at ground L+1 may not yet cover -- and the symptom, a
+	// silhouette pop at the seam, is INDISTINGUISHABLE FROM A TRAVERSAL BUG. With
+	// both levels resident there, a pop means the traversal is wrong. That
+	// attribution is the whole purpose; it is not a quality feature.
+	//
+	// WHY IT IS OFF BY DEFAULT, AND THIS IS THE PART TO READ BEFORE TURNING IT ON.
+	// Admitting every chunk in the seam band is not a new idea -- it is the FIRST
+	// CUT of the 2026-07-24 ring-seam fix, and it was measured and REVERTED:
+	// +9.2% resident chunks, p50 frame 14.9 -> 17.3 ms, chunks/s 968 -> 672,
+	// post-warmup hitches 1 -> 47. The shipped rule admits only the chunks that
+	// would otherwise be HOLES, which is why there is no overlap today. So the
+	// marcher's "~2% more residency" is optimistic by roughly 4x against the one
+	// measurement that exists.
+	//
+	// WHAT MAY NOT TRANSFER FROM THAT MEASUREMENT, and must be re-measured rather
+	// than assumed either way: its frame-time half was the QUAD DRAW PATH, which
+	// Phase 5 retires, and its per-chunk streaming cost was the quad mesher's
+	// (0.969 ms/chunk) rather than the brick packer's (0.389). The residency
+	// figure is the part most likely to carry.
+	//
+	// IT ALSO CONFLICTS WITH THE QUAD PATH WHILE THAT IS STILL DRAWING. Overlap
+	// means two levels hold the same ground; a marcher takes the first hit and is
+	// fine, a MESHER draws both and gets coincident geometry. That is why the
+	// coarser ring's inner hole is hard today. Turn this on for marcher arms, not
+	// for mesher legs.
+	//
+	// Command line rather than a cvar for GetRingPresets' reason, verbatim: this
+	// decides the shape of the FIRST desired set, and RecomputeDesiredSet runs
+	// before any -ExecCmds console command has had a chance to execute.
+	static int32 GetRingOverlapChunks();
 
 	// Back-compat aliases (R0's radii; a handful of log lines still reference
 	// these by name -- unchanged numeric values from the pre-M2 single ring).
@@ -550,6 +593,28 @@ public:
 	// voxel.SaveWorld console command and automatically from Deinitialize
 	// (autosave-on-shutdown). Returns true on success.
 	bool SaveWorld() const;
+
+	// P7-a: THE TERRAIN GPU POOL, BY IDENTITY, NOT BY ORDINAL.
+	//
+	// Returns the UVoxelGpuPoolComponent this subsystem itself created in
+	// GetOrCreateGpuPool, or nullptr if it has not been created yet (it is
+	// lazy: the first pooled chunk makes it) or has been torn down.
+	//
+	// WHY THIS EXISTS AT ALL. UVoxelGISubsystem needs the terrain pool's world
+	// location to convert the GI volume origin into pool space, and the only
+	// route it had was `TObjectIterator<UVoxelGpuPoolComponent>` + take the
+	// first. A live world contains up to five registered pools -- terrain, one
+	// per WATER BUCKET, and two verify harnesses -- sitting at unrelated
+	// rebases by construction. The wrong pick is not an error; it is lighting
+	// anchored to a water bucket's rebase, which reads as GI simply being
+	// absent because the vertex factory gates on bInsideVolume.
+	//
+	// NULLPTR IS A REAL ANSWER AND MUST NOT BE PAPERED OVER. Callers are
+	// expected to DEFER (this is called every tick until it succeeds), never to
+	// fall back to an iterator: a fallback re-introduces exactly the ordinal
+	// pick this accessor exists to delete, and it would only fire in the case
+	// where the right answer is unknown.
+	const UVoxelGpuPoolComponent* GetTerrainGpuPool() const;
 
 private:
 	// Join-sync buffering state (client only; see BeginJoinSync above).

@@ -418,6 +418,13 @@ void AVoxelEarthGameMode::BeginPlay()
 	//                       (same SetByCode pattern as -VoxelDebugRings above;
 	//                       more reliable than -ExecCmds timing). Usable on
 	//                       its own, including with -VoxelPerfRun.
+	// -VoxelGIOff           the counterpart, and the CONTROL ARM for measuring
+	//                       what GI costs on the pooled path. NOTE the default
+	//                       is voxel.GI.Enabled 1 (since 2026-07-27), so -Off is
+	//                       the arm that changes anything and -On is a no-op
+	//                       assertion of the shipped state. Both read the value
+	//                       back and log at Error if the set did not take --
+	//                       see the block below for why that is mandatory.
 	// -VoxelGITest=<s>      after <s> seconds, stamp the wall+roof fixture on
 	//                       the flattest column near spawn and put the camera
 	//                       UNDER the roof slab looking down the covered span.
@@ -438,12 +445,90 @@ void AVoxelEarthGameMode::BeginPlay()
 	// (SpawnStructureFixtureAt, already used by -VoxelStructureTest) gives a
 	// real 12.8m x 3.2m covered span with 3.2m of headroom, entirely inside the
 	// R0 ring and unambiguously rendered.
-	if (FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOn")))
+	// -VoxelGIOn / -VoxelGIOff, and BOTH READ THE VALUE BACK.
+	//
+	// WHY THE READ-BACK IS NOT OPTIONAL. ECVF_SetByCode loses to
+	// ECVF_SetByConsole, and every cvar on this project is set from the command
+	// line via -ExecCmds, which IS SetByConsole. The brick-pack gate learned
+	// this the expensive way: it printed "Forced voxel.GPU.BrickPackResident 0
+	// (was 1) ... restored afterwards" into the same log that carried
+	//
+	//   LogConsoleManager: Warning: Setting the console variable
+	//   'voxel.GPU.BrickPackResident' with 'SetByCode' was ignored as it is
+	//   lower priority than the previous 'SetByConsole'. Value remains '1'
+	//
+	// -- a force that did nothing while announcing that it had. That does not
+	// invalidate a direct arm, but it destroys a CONTROL arm: forcing the
+	// feature off would be ignored identically and the "control" would be a
+	// byte-identical rerun of the thing it was controlling, agreeing with it
+	// for the worst possible reason. Recorded as Defect 1 in
+	// docs/measurements/armA-drawpath-ceiling-2026-08-19.txt, with the rule:
+	// A GATE THAT CANNOT ESTABLISH ITS OWN PRECONDITIONS MUST REFUSE TO REPORT.
+	//
+	// So this reads the cvar back after setting it and logs at Error, not Log,
+	// when the value did not take. An Error line is greppable and is the signal
+	// that the leg is void -- it must not be summarised as a result.
+	//
+	// -VoxelGIOff is the control arm for G1 and exists because the alternative
+	// -- -ExecCmds="voxel.GI.Enabled 0" -- lands AFTER streaming has begun, so
+	// chunks already resident keep the GI-on treatment and the leg measures a
+	// mixed state. VoxelGI.cpp:3085 records that this exact trap cost three
+	// runs on -VoxelGIOn. This switch runs from GameMode init, before the first
+	// RecomputeDesiredSet, so the whole session is one configuration.
+	//
+	// GI-off is genuinely zero-cost and that is what makes it a valid control:
+	// UVoxelGISubsystem::Tick clears its state and returns, the scene proxy
+	// emits byte-identical vertex colours, the pooled factory does not sample
+	// the volume, and WantsChunkQuads stops pulling near-field chunks off the
+	// direct-to-pool path.
 	{
-		if (IConsoleVariable* GIVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
+		const bool bWantGIOn = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOn"));
+		const bool bWantGIOff = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOff"));
+		if (bWantGIOn && bWantGIOff)
 		{
-			GIVar->Set(1, ECVF_SetByCode);
-			UE_LOG(LogVoxelEarth, Log, TEXT("VoxelGIOn: forcing voxel.GI.Enabled=1"));
+			// Refuse rather than pick one. A leg launched with both is a
+			// composition mistake in the harness, and silently honouring the
+			// first would produce a perfectly plausible number for whichever
+			// arm the author did not think they were running.
+			UE_LOG(LogVoxelEarth, Error,
+			       TEXT("VoxelGI arm: BOTH -VoxelGIOn AND -VoxelGIOff were passed. Neither applied; ")
+			       TEXT("voxel.GI.Enabled keeps its default. THIS LEG IS VOID as an A/B arm -- fix ")
+			       TEXT("the command line and re-run."));
+		}
+		else if (bWantGIOn || bWantGIOff)
+		{
+			const int32 Want = bWantGIOn ? 1 : 0;
+			const TCHAR* SwitchName = bWantGIOn ? TEXT("-VoxelGIOn") : TEXT("-VoxelGIOff");
+			if (IConsoleVariable* GIVar = IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.GI.Enabled")))
+			{
+				const int32 Before = GIVar->GetInt();
+				GIVar->Set(Want, ECVF_SetByCode);
+				const int32 After = GIVar->GetInt();
+				if (After == Want)
+				{
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("%s: voxel.GI.Enabled %d -> %d (read back and CONFIRMED)"),
+					       SwitchName, Before, After);
+				}
+				else
+				{
+					UE_LOG(LogVoxelEarth, Error,
+					       TEXT("%s: FAILED to set voxel.GI.Enabled -- asked for %d, read back %d ")
+					       TEXT("(was %d). Almost certainly a higher-priority SetByConsole from ")
+					       TEXT("-ExecCmds; SetByCode cannot outrank it. THIS LEG IS VOID as a GI ")
+					       TEXT("arm: it is running the OTHER configuration under this arm's name. ")
+					       TEXT("Do not report its numbers. Remove voxel.GI.Enabled from -ExecCmds ")
+					       TEXT("and use %s alone."),
+					       SwitchName, Want, After, Before, SwitchName);
+				}
+			}
+			else
+			{
+				UE_LOG(LogVoxelEarth, Error,
+				       TEXT("%s: voxel.GI.Enabled does not exist (VoxelGI module not loaded?). ")
+				       TEXT("THIS LEG IS VOID as a GI arm."),
+				       SwitchName);
+			}
 		}
 	}
 

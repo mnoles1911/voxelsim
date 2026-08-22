@@ -97,6 +97,84 @@ inline bool BandProvesChunkEmpty(const FFootprintBand& Band, int32 ChunkZ, bool&
 	return bAllAir || bAllSolid;
 }
 
+// ---------------------------------------------------------------------------
+// MAY the proof be ACTED ON? A different question from whether it holds.
+// ---------------------------------------------------------------------------
+//
+// BandProvesChunkEmpty above answers "does this chunk mesh to zero quads", and
+// for a MESHER that is the whole question: all-air and all-solid both emit
+// nothing, so dropping either before dispatch is free and byte-identical.
+//
+// FOR A RAY MARCHER THEY ARE OPPOSITES, and this is the distinction that was
+// missing.
+//
+//   all-air   -> no chunk record -> the lookup misses -> reads as EMPTY. Right.
+//   all-solid -> no chunk record -> the lookup misses -> reads as EMPTY. WRONG,
+//                and it is wrong in the worst available direction: you can see
+//                THROUGH SOLID ROCK, and no counter moves.
+//
+// MEASURED, not theoretical. p3b1-storage-r1 logged, in one 5 s fill window,
+// `skipped=10210 (air=1462 solid=8748)`. Over 9,300 all-solid chunks were
+// dropped before dispatch and therefore never packed, against a level-0
+// residency of 16,892. The steady-state windows all read `skipped=0`, which is
+// why this mechanism was recorded as "fired 0 times this leg" -- it fires during
+// FILL and is finished by the time anyone reads a settled window.
+//
+// WHY THE COVERAGE FIGURE COULD NOT SEE IT. Brick coverage was reported as 99.4%
+// of the 88,151 chunks that GET A MESH JOB. A chunk dropped before dispatch is
+// not in that denominator, so the metric is structurally incapable of counting
+// this failure. Anything that skips a chunk before dispatch must therefore ask
+// THIS function, not the one above.
+//
+// bVolumeNeedsSolidChunks is the caller's answer to "is anything consuming the
+// contents of chunks that emit no faces" -- i.e. is the brick volume being fed.
+// With it false every caller behaves exactly as it did before, which is what
+// keeps a run with the brick volume off byte-identical.
+// OutSolidKeptForVolume, when supplied, is set true in the ONE case worth
+// counting: the proof held, it was ALL-SOLID, and it was overridden because the
+// volume needs the chunk. That is reported through an out-param rather than left
+// for the caller to re-derive, because re-deriving it means calling
+// BandProvesChunkEmpty a second time and the two calls can then drift -- which is
+// the failure this whole function exists to correct, reintroduced one level up.
+inline bool BandSkipMayDropChunk(const FFootprintBand& Band, int32 ChunkZ,
+                                 bool bVolumeNeedsSolidChunks, bool& bOutAllAir,
+                                 bool* OutSolidKeptForVolume = nullptr)
+{
+	if (OutSolidKeptForVolume != nullptr)
+	{
+		*OutSolidKeptForVolume = false;
+	}
+	if (!BandProvesChunkEmpty(Band, ChunkZ, bOutAllAir))
+	{
+		return false;
+	}
+	// Air is safe to drop under either consumer: absent and empty read alike.
+	if (bOutAllAir)
+	{
+		return true;
+	}
+	// Solid is only safe to drop while nothing reads what is inside it.
+	if (!bVolumeNeedsSolidChunks)
+	{
+		return true;
+	}
+	if (OutSolidKeptForVolume != nullptr)
+	{
+		*OutSolidKeptForVolume = true;
+	}
+	return false;
+}
+
+// The same rule for a proof that is ALL-SOLID BY CONSTRUCTION -- the
+// anchor-relative deep box's IsChunkProvablyAllSolid admission skip, which has
+// no air case at all. Spelled as a named function rather than a bare negation
+// at the call site so the two sites are visibly governed by one rule, and so
+// the reason travels with it.
+inline bool AllSolidProofMayDropChunk(bool bVolumeNeedsSolidChunks)
+{
+	return !bVolumeNeedsSolidChunks;
+}
+
 // Smallest integer >= sqrt(v), for v >= 0. The carve predicates all test
 // `dz*dz < marginSq`, i.e. |dz| < sqrt(marginSq); rounding the radius UP is
 // what keeps every bound below an outer bound.

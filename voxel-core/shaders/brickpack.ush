@@ -1,0 +1,668 @@
+// BrickPack GPU kernels -- the producer that turns the Cells buffer into the
+// ray-marcher's resident brick volume (docs/ray-marching-plan-2026-08-19.md
+// Phase 1-B). THE BYTE LAYOUT IS docs/brick-volume-format.md. That document is
+// the contract; this file is one of its four consumers and must not invent a
+// field.
+//
+// THE CHAIN. Today the mesher runs
+//   ColumnMain -> VoxelizeMain -> [AssetStamp*] -> MeshCountMain -> Scan x3 -> MeshEmitMain
+// and this file adds a second consumer of the SAME Cells buffer:
+//   ColumnMain -> VoxelizeMain -> [AssetStamp*] -> BrickClassifyMain -> Scan x3 -> BrickPackMain
+//
+// The scan is the EXISTING one -- ScanBlocksMain / ScanSumsMain / ScanAddMain in
+// worldgen.ush, unmodified. It is a generic exclusive scan over a uint count
+// array; the only thing that changes is ScanCount (3,072 masks -> 64 bricks) and
+// which buffers the host binds to OutQuadCounts/OutQuadOffsets/OutBlockSums.
+// 64 is trivially under the 65,536 the single-workgroup ScanSumsMain handles.
+// It is run TWICE (once for occupancy dwords, once for material dwords) because
+// a brick allocates in two separate arenas and one prefix sum cannot describe
+// both -- six tiny dispatches over 64 elements, and no new scan code.
+//
+// WHY THIS IS NOT IN /VoxelCore/worldgen.ush -- the VoxelAssetStamp.usf
+// argument, verbatim in its shape. worldgen.ush is a MIRROR of vxc terrain
+// worldgen under a version lock (VXC_WORLDGEN_VERSION_USH) and is shared
+// VERBATIM with the standalone vxc_gpu determinism bench; its #error guard
+// exists precisely so the bench cannot silently run a different program from the
+// one its digest was recorded against. Brick packing is not terrain math, has no
+// bench leg, and carries no worldgen constant, so it takes no version lock and
+// bumping the mirror's contract for it would entangle two release cadences. The
+// only conventions this file borrows from the mirror are THE CELL INDEXING and
+// THE OutCells BRICK ORDER (see regionCellMat and the OutCells layout contract
+// there) -- mirrored below with the same arithmetic, and the pair must move
+// together.
+//
+// CONSEQUENCE FOR THE UNREAL SIDE: the shader classes for these two entry
+// points must NOT derive from FVoxelWorldGenShader. That base sets
+// VXC_WORLDGEN_VERSION_CPP, which this file neither needs nor checks. VXC_UE is
+// the only define that matters here, and it changes resource DECLARATIONS only
+// -- never arithmetic.
+//
+// DO NOT INCLUDE THIS FILE AND worldgen.ush IN THE SAME TRANSLATION UNIT. Both
+// declare DispatchColumns / BricksZ / ScanCount, deliberately with the same
+// names and meanings; two declarations is a redefinition error, not a merge.
+//
+// ---------------------------------------------------------------------------
+// THE HALO DIES, AND THAT IS MOST OF WHY THIS IS CHEAP
+// ---------------------------------------------------------------------------
+// VoxelGpuMeshJobManager.h:107-114 dispatches 48x48 columns x 6 bricks TO
+// PRODUCE 64, because the greedy mesher needs a one-brick apron for AO and for
+// face-neighbour reads. A marcher needs no apron: face normals come from the
+// DDA's crossed axis, AO from occupancy bits already in registers, colour from
+// the voxel itself, and cross-brick reads go through the index. So a BrickPack
+// region is EXACTLY one render chunk -- 32x32 columns x 4 bricks -- which is
+// 3.375x less voxelize work per chunk (48*48*6 = 13,824 brick-columns against
+// 32*32*4 = 4,096). This does not remove ring-boundary handling, which is a
+// traversal concern rather than a producer apron.
+//
+// ASSETS ARE ALREADY IN Cells. VoxelAssetStamp.usf stamps resolved instances
+// between voxelize and mesh; at that instant they ARE voxels, and today they are
+// thrown away with the RDG transient. BrickPack runs after AssetStamp in the
+// same graph and consumes them for free -- zero new kernels, zero new stamping.
+//
+// ---------------------------------------------------------------------------
+// DETERMINISM -- by the mesher's own argument, not by a new one
+// ---------------------------------------------------------------------------
+// count -> scan -> emit, with NO order-dependent atomic anywhere in the output
+// path, so the output order is identical by construction and byte-comparable
+// against vxc::packChunkBricksCanonical.
+//
+// ATOMICS APPEAR HERE AND THIS IS NOT A CONTRADICTION. Every InterlockedOr below
+// is an OR into groupshared memory (or, for the one inter-brick mask, into a
+// pre-zeroed word). OR is commutative and associative, so the RESULT does not
+// depend on which thread got there first. The banned construct is an atomic
+// whose VALUE depends on execution order -- an atomic-append offset is exactly
+// that, and the count/scan/emit shape exists to avoid it.
+//
+// THE PALETTE IS CANONICAL: ASCENDING MaterialId, derived by scanning a
+// 256-bit material-present mask low to high. vxc::Brick::paletteIndex
+// (brick.h:114) is INSERTION-ordered, so two bricks holding identical voxels in
+// a different scan order hold different bytes and a GPU producer cannot
+// reproduce that without reproducing CPU iteration order. This is the whole
+// reason vxc::packChunkBricksCanonical exists.
+
+// --- compile target: standalone DXC vs Unreal ------------------------------
+// Same split, same reasoning, as worldgen.ush's VXC_REG: Unreal binds shader
+// resources by REFLECTED NAME out of a generated parameter struct and assigns
+// its own register slots, so explicit register() declarations fight it and a
+// hand-rolled cbuffer collides with the one Unreal generates. Names, types and
+// every line of arithmetic are identical either way.
+#ifdef VXC_UE
+    #define VXC_BP_REG(slot)
+#else
+    #define VXC_BP_REG(slot) : register(slot)
+#endif
+
+// --- constants (mirrored from the format contract) -------------------------
+static const uint kBrickEdge = 8u;          // Brick<8>, kFluidBrickEdge
+static const uint kBrickCells = 512u;
+static const uint kBrickOccWords = 16u;     // 512 bits / 32
+static const uint kBricksPerChunkEdge = 4u; // VoxelCoords::ChunkEdgeBricks
+static const uint kBricksPerChunk = 64u;
+
+// THE LOCAL PALETTE IS A FIXED 16 ENTRIES -- 16 x uint8 = 4 dwords -- present
+// whenever bppCode <= 4 and absent at bppCode 8. Fixed rather than sized to the
+// brick's actual palette because 4 bits index it exactly and a fixed stride
+// makes the marcher's palette fetch one 16 B load at a known offset with no
+// second-order arithmetic in the inner loop. Unused entries are ZERO, i.e.
+// MAT_AIR, which cannot appear in a palette, so the filler is unambiguous and
+// the bytes are reproducible -- which is what byte-comparison needs.
+//
+// docs/brick-volume-format.md section 4 can be read both ways: its normative
+// sentence says "a 16 B local palette (16 x uint8 ...)", its worked example
+// prices the same brick at "4 B palette ... = 140 B". This file implements the
+// NORMATIVE SENTENCE, which is also what vxc::packChunkBricksCanonical
+// implements (brickpack.h, kMarchLocalPaletteEntries) -- the two were resolved
+// against each other rather than each guessing. A 3-material 256-solid brick is
+// therefore 152 B, not 140. Changing it is a contract decision that moves all
+// four consumers, not a packer decision.
+static const uint kLocalPaletteEntries = 16u;
+static const uint kLocalPaletteWords = 4u;   // 16 x uint8
+
+// Largest BrickMat allocation a single brick can take, and the size of the
+// groupshared staging buffer the payload is assembled in. The maximum is the
+// 8 bpp case: 512 solid voxels x 8 bits = 128 dwords with NO local palette.
+// (The widest palette case is 4 palette dwords + 64 payload dwords = 68.)
+static const uint kMaxBrickMatWords = 132u;
+
+// FVoxelBrickDesc kind field, docs/brick-volume-format.md section 2.
+static const uint kBrickKindAir = 0u;       // uniform AIR, no payload
+static const uint kBrickKindSolid = 1u;     // uniform SOLID, material in MatWord[0:7]
+static const uint kBrickKindMixed = 2u;
+
+// --- parameters ------------------------------------------------------------
+// Loose globals under VXC_UE (Unreal's $Globals convention -- see the long
+// comment above worldgen.ush's WorldGenParams), an explicit cbuffer otherwise.
+// DispatchColumns / BricksZ / ScanCount keep worldgen.ush's names and meanings
+// on purpose: they describe the SAME region, and a second vocabulary for one
+// region is how the two halves of a chain drift apart.
+#ifdef VXC_UE
+uint2 DispatchColumns;
+uint BricksZ;
+uint ScanCount;
+uint BrickDescBase;
+uint OccWriteBase;
+uint MatWriteBase;
+uint ChunkRecordBase;
+#else
+cbuffer BrickPackParams : register(b0)
+{
+    uint2 DispatchColumns;  // region columns along x,y -- multiples of 8, and
+                            // for a chunk-aligned dispatch multiples of 32
+    uint BricksZ;           // vertical extent in bricks (4 for one chunk)
+    uint ScanCount;         // number of bricks scanned = brick count
+    uint BrickDescBase;     // first DESCRIPTOR slot this dispatch may write
+    uint OccWriteBase;      // dword base added to the scanned BrickOcc offset;
+                            // MUST be a multiple of 16 (see OutBrickSkip)
+    uint MatWriteBase;      // dword base added to the scanned BrickMat offset
+    uint ChunkRecordBase;   // first chunk record this dispatch may OR into
+};
+#endif
+
+// THE THREE WRITE BASES ARE THE QuadWriteBase PATTERN, WITH ITS TRAP. They let
+// several chunks pack into disjoint slices of one pool buffer, and they let a
+// later stage point these buffers straight at the resident pool. But a non-zero
+// base lands in the DESCRIPTOR's offset fields, so the bytes differ from a
+// chunk-local reference. voxel.March.VerifyBricks must dispatch with all four
+// bases ZERO, or it is comparing a pool address against a chunk offset and will
+// report a mismatch that is not one.
+//
+// HOST PRECONDITIONS, none of which this file can check without silently
+// disabling itself (which is the failure mode this project has already paid
+// for):
+//   * DispatchColumns.x/.y are multiples of 32 and BricksZ is a multiple of 4,
+//     i.e. the region decomposes into whole render chunks. A region that does
+//     not is silently PARTIALLY packed -- validate it host-side and refuse,
+//     exactly as ValidateRegionRequest refuses a batched ring skirt.
+//   * OccWriteBase is a multiple of 16 (OutBrickSkip is indexed by
+//     occupancy-dword / 16).
+//   * Neither scanned offset plus its base reaches 2^28 dwords (1 GiB per
+//     arena). The descriptor's offset field is 28 bits and this file MASKS --
+//     a host that overruns gets a wrong world, not a compile error. Bound it in
+//     the allocator, the way SizeZ <= 4095 is bounded in VoxelAssetStamp.
+//   * OutChunkBrickMask is ZEROED before the pack dispatch. It is accumulated
+//     with InterlockedOr and stale bits from a previous frame would claim
+//     occupancy that is no longer there -- the marcher would enter empty bricks
+//     rather than miss full ones, so it fails slow and invisible.
+
+StructuredBuffer<uint> InCells VXC_BP_REG(t0);            // == worldgen's OutCells
+StructuredBuffer<uint> InBrickOccOffsets VXC_BP_REG(t1);  // scanned OutBrickOccCounts
+StructuredBuffer<uint> InBrickMatOffsets VXC_BP_REG(t2);  // scanned OutBrickMatCounts
+
+RWStructuredBuffer<uint> OutBrickOccCounts VXC_BP_REG(u4);
+RWStructuredBuffer<uint> OutBrickMatCounts VXC_BP_REG(u5);
+RWStructuredBuffer<uint2> OutBrickDesc VXC_BP_REG(u6);      // FVoxelBrickDesc, 8 B
+RWStructuredBuffer<uint> OutBrickOcc VXC_BP_REG(u7);        // 16 dwords per MIXED brick
+RWStructuredBuffer<uint> OutBrickMat VXC_BP_REG(u8);        // palette then payload
+RWStructuredBuffer<uint> OutBrickSkip VXC_BP_REG(u9);       // 2 dwords per MIXED brick
+RWStructuredBuffer<uint> OutChunkBrickMask VXC_BP_REG(u10); // 2 dwords per chunk
+
+// Register slots are spaced so that after DXC's -fvk-*-shift mapping
+// (b->+0, t->+1, u->+3) every resource lands on a distinct Vulkan binding:
+//   b0  BrickPackParams   -> 0      u4  OutBrickOccCounts -> 7
+//   t0  InCells           -> 1      u5  OutBrickMatCounts -> 8
+//   t1  InBrickOccOffsets -> 2      u6  OutBrickDesc      -> 9
+//   t2  InBrickMatOffsets -> 3      u7  OutBrickOcc       -> 10
+//                                   u8  OutBrickMat       -> 11
+//                                   u9  OutBrickSkip      -> 12
+//                                   u10 OutChunkBrickMask -> 13
+// There is no bench consuming these today; the spacing is here so that adding
+// one is a CMake edit rather than a renumbering.
+
+// --- groupshared state -----------------------------------------------------
+// One workgroup owns one brick, so all of this is per-brick.
+groupshared uint gsOcc[16];          // the 512-bit occupancy, cell order
+groupshared uint gsPresent[8];       // 256-bit material-present mask (air never set)
+groupshared uint gsPresentPrefix[8]; // running palette rank at each present word
+groupshared uint gsMat[132];         // BrickMat staged locally, then stored once
+groupshared uint gsSkip[2];          // 4^3 intra-brick skip mask
+groupshared uint gsInfo[8];          // see the named indices below
+
+static const uint kInfoSolidCount = 0u;
+static const uint kInfoPaletteCount = 1u;
+static const uint kInfoBpp = 2u;
+static const uint kInfoKind = 3u;
+static const uint kInfoPaletteDwords = 4u;
+static const uint kInfoPayloadDwords = 5u;
+static const uint kInfoUniformMat = 6u;
+
+// --- shared helpers --------------------------------------------------------
+
+// Mirrors vxc::Brick<8>::cellIndex (brick.h:46), fluidBrickBitIndex
+// (fluidoccupancy.h:143) and worldgen.ush's cellIndexInBrick. There is exactly
+// one cell order in this project and this is it; do not introduce a second.
+uint cellIndexInBrick(uint x, uint y, uint z) { return x + 8u * (y + 8u * z); }
+
+// Mask of the s low bits, s in [0, 31]. Used for "popcount of the bits BELOW
+// this one", which is both the occupancy->payload index and the
+// material->palette rank.
+uint lowMask(uint s)
+{
+    // lint-shader-ub: allow UNSIGNED_UNDERFLOW - the left operand is 1u << s with s <= 31, i.e. at least 1, so subtracting 1 cannot go below zero
+    return (1u << s) - 1u;   // lint-shader-ub: allow VARIABLE_SHIFT - every call site passes an index already reduced by & 31u or by % 32u, so s is provably in [0, 31] and the shift is in range
+}
+
+// Decodes a workgroup id into the brick it owns.
+//
+// THE PACKED BRICK ORDER IS CHUNK-MAJOR, AND WITHIN A CHUNK x FASTEST:
+//   packIndex = chunkIndex * 64 + (lx + 4 * (ly + 4 * lz))
+// which for a single-chunk dispatch is exactly MeshChunkBricks' own iteration
+// (VoxelChunkMesher.h: Dz outer, Dy, Dx inner) and exactly cellIndex's
+// convention one level up. That is what makes BrickDesc[BrickBase .. +64) a
+// chunk record, and it is what packChunkBricksCanonical must walk.
+//
+// THE Cells ORDER IS DIFFERENT AND THAT IS NOT A BUG. worldgen.ush's OutCells
+// contract is z-major within a column stack:
+//   brickIndex = (bx + BricksX * by) * BricksZ + bz
+// so this function is the whole mapping between the two, in one place.
+bool decodeBrick(uint packIndex, out uint3 brick, out uint cellBase,
+                 out uint chunkIndex, out uint localIndex)
+{
+    brick = uint3(0u, 0u, 0u);
+    cellBase = 0u;
+    chunkIndex = 0u;
+    localIndex = 0u;
+
+    const uint bricksX = DispatchColumns.x / 8u;
+    const uint bricksY = DispatchColumns.y / 8u;
+    const uint chunksX = bricksX / kBricksPerChunkEdge;
+    const uint chunksY = bricksY / kBricksPerChunkEdge;
+    const uint chunksZ = BricksZ / kBricksPerChunkEdge;
+    // A region thinner than one chunk on any axis has no whole chunk to pack,
+    // and the products below would be zero anyway. Mirrors decodeMask's
+    // "a region that thin has NO interior bricks" guard.
+    if (chunksX == 0u || chunksY == 0u || chunksZ == 0u) return false;
+    if (packIndex >= chunksX * chunksY * chunksZ * kBricksPerChunk) return false;
+
+    chunkIndex = packIndex / kBricksPerChunk;
+    localIndex = packIndex % kBricksPerChunk;
+    const uint cx = chunkIndex % chunksX;
+    const uint cy = (chunkIndex / chunksX) % chunksY;
+    const uint cz = chunkIndex / (chunksX * chunksY);
+    const uint lx = localIndex % kBricksPerChunkEdge;
+    const uint ly = (localIndex / kBricksPerChunkEdge) % kBricksPerChunkEdge;
+    const uint lz = localIndex / 16u;
+
+    brick = uint3(cx * kBricksPerChunkEdge + lx,
+                  cy * kBricksPerChunkEdge + ly,
+                  cz * kBricksPerChunkEdge + lz);
+    cellBase = ((brick.x + bricksX * brick.y) * BricksZ + brick.z) * kBrickCells;
+    return true;
+}
+
+// Builds gsOcc and gsPresent from the brick's 512 cells. 8 cells per thread,
+// CONTIGUOUS, so a thread's cells are one x-row of the brick and its 8
+// occupancy bits are 8 adjacent bits of one dword -- 8t mod 32 is 0, 8, 16 or
+// 24, so a thread never straddles a word.
+//
+// Occupancy is (material != MAT_AIR), which is vxc::Brick's own occupancy_
+// predicate (brick.h:48-50 and set()). It is deliberately NOT
+// isSolidForFluid(): that one also excludes MAT_WATERMARK, because the fluid
+// sim must not collide with its own marker. A marcher renders the world, and a
+// watermark voxel is a voxel.
+void brickBuildOccupancy(uint cellBase, uint threadIndex)
+{
+    if (threadIndex < kBrickOccWords) gsOcc[threadIndex] = 0u;
+    if (threadIndex < 8u) gsPresent[threadIndex] = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint c0 = threadIndex * 8u;
+    uint localOcc = 0u;
+    uint bit = 1u;
+    for (uint i = 0u; i < 8u; ++i)
+    {
+        const uint mat = InCells[cellBase + c0 + i] & 0xffu;
+        if (mat != 0u)
+        {
+            localOcc |= bit;
+            // lint-shader-ub: allow VARIABLE_SHIFT - mat is masked to 8 bits above, so (mat & 31u) is provably in [0, 31]
+            InterlockedOr(gsPresent[mat >> 5u], 1u << (mat & 31u));
+        }
+        bit <<= 1u;
+    }
+    if (localOcc != 0u)
+    {
+        // lint-shader-ub: allow VARIABLE_SHIFT - c0 = threadIndex * 8 with threadIndex < 64, so c0 % 32 is 0, 8, 16 or 24, and localOcc is 8 bits wide, so the shifted value stays inside the dword
+        InterlockedOr(gsOcc[c0 / 32u], localOcc << (c0 % 32u));
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
+// Thread 0 only. Derives everything the descriptor and the payload need from
+// the two masks: the collapse test, the canonical palette size, the bit width,
+// and the two allocation sizes. Caller must sync after.
+//
+// tryCollapse (brick.h:80-91) has two sub-cases and BOTH must work here:
+// all-air (occupancy_.none()) and all-solid one-material (Brick(fill)). A
+// uniform brick carries NO payload at all -- 8 bytes and nothing else -- which
+// is 67.1% of real brick slots and ~250 MiB of the measured 404 MiB.
+void brickComputeInfo()
+{
+    uint solid = 0u;
+    for (uint w = 0u; w < kBrickOccWords; ++w) solid += countbits(gsOcc[w]);
+
+    // The canonical palette IS this prefix: entry k is the k-th set bit of the
+    // present mask, scanned low to high, i.e. ascending MaterialId.
+    uint palette = 0u;
+    uint uniformMat = 0u;
+    bool found = false;
+    for (uint p = 0u; p < 8u; ++p)
+    {
+        gsPresentPrefix[p] = palette;
+        const uint word = gsPresent[p];
+        palette += countbits(word);
+        if (!found && word != 0u)
+        {
+            uniformMat = p * 32u + firstbitlow(word);
+            found = true;
+        }
+    }
+
+    uint kind = kBrickKindMixed;
+    if (solid == 0u) kind = kBrickKindAir;
+    else if (solid == kBrickCells && palette == 1u) kind = kBrickKindSolid;
+
+    // bppCode is the literal bits-per-voxel {0,1,2,4,8}, not an enum index --
+    // docs/brick-volume-format.md section 2. 0 means "one material, no payload
+    // at all"; 8 means direct global ids and NO local palette.
+    //
+    // The census says this lands on 2 bpp for the common brick (mean palette
+    // 3.73 over 916,901 mixed bricks, 78% at <= 2 bpp, max observed 8). 8 bpp
+    // needs a palette above 16 and was never observed -- it exists so the
+    // format cannot be wrong, not because it will be hot.
+    uint bpp = 0u;
+    if (palette > 16u) bpp = 8u;
+    else if (palette > 4u) bpp = 4u;
+    else if (palette > 2u) bpp = 2u;
+    else if (palette > 1u) bpp = 1u;
+
+    gsInfo[kInfoSolidCount] = solid;
+    gsInfo[kInfoPaletteCount] = palette;
+    gsInfo[kInfoBpp] = bpp;
+    gsInfo[kInfoKind] = kind;
+    // Palette dwords: the FIXED 4, or zero at 8 bpp where there is no local
+    // palette at all. See kLocalPaletteWords.
+    gsInfo[kInfoPaletteDwords] = (kind != kBrickKindMixed || bpp == 8u)
+                                     ? 0u : kLocalPaletteWords;
+    gsInfo[kInfoPayloadDwords] = (kind != kBrickKindMixed || bpp == 0u)
+                                     ? 0u : (solid * bpp + 31u) / 32u;
+    gsInfo[kInfoUniformMat] = uniformMat;
+}
+
+// Palette rank of a material: the number of present materials below it. This is
+// the canonical palette index, by definition of "ascending MaterialId".
+uint paletteRankOf(uint mat)
+{
+    const uint word = mat >> 5u;
+    return gsPresentPrefix[word] + countbits(gsPresent[word] & lowMask(mat & 31u));
+}
+
+// ---------------------------------------------------------------------------
+// BrickClassifyMain -- the COUNT half. One workgroup per brick, 64 threads,
+// 8 cells each over the 512 cells. Writes nothing but the two word counts, so
+// the scan between count and pack sees exactly the allocation the pack pass
+// will make.
+//
+// Nothing is stashed for the pack pass to reuse. It rebuilds the masks from
+// Cells, exactly as MeshEmitMain re-runs greedyMask rather than carrying state
+// across the scan -- a second 512-cell read is cheaper than a buffer, and it
+// keeps the two passes provably in agreement about the brick they describe.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickClassifyMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint3 brick;
+    uint cellBase, chunkIndex, localIndex;
+    // GROUP-UNIFORM EARLY-OUT: decodeBrick reads only gid.x and the cbuffer, so
+    // either the whole group returns or none of it does. That is what makes the
+    // barriers below legal.
+    if (!decodeBrick(gid.x, brick, cellBase, chunkIndex, localIndex)) return;
+
+    brickBuildOccupancy(cellBase, gtid.x);
+
+    if (gtid.x == 0u)
+    {
+        brickComputeInfo();
+        const bool mixed = (gsInfo[kInfoKind] == kBrickKindMixed);
+        // Bounded: the index is gid.x, capped by decodeBrick's `packIndex >=
+        // chunksX*chunksY*chunksZ*64` early-out above, and the host sizes both
+        // count buffers to exactly that brick count -- the same contract the
+        // scan's ScanCount carries.
+        OutBrickOccCounts[gid.x] = mixed ? kBrickOccWords : 0u;
+        // Same bound as the line above, same buffer size contract.
+        OutBrickMatCounts[gid.x] =
+            mixed ? (gsInfo[kInfoPaletteDwords] + gsInfo[kInfoPayloadDwords]) : 0u;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BrickPackMain -- the EMIT half, at the scanned offsets.
+//
+// THE EXACT BYTES THIS EMITS, per brick, all little-endian dwords:
+//
+//  FVoxelBrickDesc  OutBrickDesc[BrickDescBase + packIndex], 8 B:
+//      OccWord = occDwordOffset[0:27] | kind[28:29] | hasLocalPalette[30] | 0[31]
+//      MatWord = matDwordOffset[0:27] | bppCode[28:31]
+//    UNIFORM (kind 0 or 1): both offset fields are ZERO -- a uniform brick
+//    allocates nothing, so there is no offset to name -- hasLocalPalette 0,
+//    bppCode 0, and the uniform SOLID material sits in MatWord[0:7].
+//
+//  BrickOcc  OutBrickOcc[occ .. occ+16), MIXED only, 64 B:
+//      the bit for cell i is word i/32, shift i%32, cell i = x + 8*(y + 8*z).
+//      Exactly fluidBrickWordOf/fluidBrickShiftOf over fluidBrickBitIndex.
+//      One 64 B load per entered brick, then the DDA runs against registers.
+//
+//  BrickMat  OutBrickMat[mat .. mat+matWords), MIXED only:
+//      [0, 4)               local palette, FIXED 16 entries, 4 x uint8 per
+//                           dword, byte j of dword d is palette entry 4d+j,
+//                           ASCENDING MaterialId, unused entries ZERO.
+//                           Absent entirely at bppCode 8.
+//      [paletteDwords, end) payload: one entry per SOLID voxel in cell order,
+//                           entry k at bit k*bpp, LSB-first within the dword.
+//                           bpp divides 32, so an entry never straddles a
+//                           dword. The entry is the PALETTE INDEX at
+//                           bppCode <= 4 and the GLOBAL MaterialId at 8.
+//                           A voxel's k is the popcount of occupancy bits
+//                           below it -- the 16 dwords are already in registers.
+//
+//  OutBrickSkip[2 * (occDwordOffset/16) .. +2), MIXED only, 8 B:
+//      the 4^3 intra-brick skip mask. Bit b = sx + 4*(sy + 4*sz) is set when
+//      any of the 8 cells of the 2x2x2 block at (2sx, 2sy, 2sz) is solid.
+//      SIDE CHANNEL, NOT PART OF THE BYTE-COMPARED CONTRACT: it is derivable
+//      for free from the 16 occupancy dwords a marcher has already loaded, and
+//      docs/brick-volume-format.md section 3 pins BrickOcc at exactly 64 B /
+//      16 dwords, so it cannot live there without breaking both the one-load
+//      property and the census (occupancy 56.0 MiB = 917,504 x 64 B, exactly).
+//      Its own buffer costs ~7 MiB across the cascade and it can be dropped by
+//      binding a dummy -- see the AMBIGUITY note below.
+//
+//  OutChunkBrickMask[2*(ChunkRecordBase + chunkIndex) .. +2):
+//      the 64-bit L1 inter-brick mask, "which of my 64 bricks are non-empty",
+//      bit = the brick's index within its chunk. Feeds FVoxelMarchChunk's
+//      BrickSolidLo/Hi. Accumulated with InterlockedOr over the 64 workgroups
+//      of a chunk: OR is order-independent, so the RESULT is deterministic --
+//      but the buffer MUST be zeroed first (see the host preconditions).
+//
+// WHAT THIS DELIBERATELY DOES NOT EMIT, and the trap in it. FVoxelMarchChunk's
+// LevelAndFlags carries [4] anySolid and [5] allSolid (format section 6).
+// anySolid is free -- it is `OutChunkBrickMask != 0`. allSolid IS NOT
+// DERIVABLE FROM THE DESCRIPTORS: it means every one of the chunk's 32,768
+// voxels is non-air, and a brick can be fully solid and still MIXED (512 solid
+// cells with two materials does not collapse). "All 64 descriptors are uniform
+// SOLID" is therefore a STRICTER test than allSolid and will under-report.
+// vxc::packChunkBricksCanonical computes the flag directly. Whoever wires the
+// chunk record must either accumulate it here (an OR of "this brick has an air
+// voxel", which is order-independent like the rest) or read it from the CPU
+// reference -- not infer it from the descriptor array.
+//
+// TWO PLACES THE CONTRACT DID NOT DECIDE, and how each was settled:
+//   1. PALETTE PADDING -- section 4's normative sentence says 16 B, its worked
+//      example says 4 B. FIXED 16 B, matching vxc::packChunkBricksCanonical.
+//      See kLocalPaletteWords for the full note; the two implementations were
+//      resolved against each other, not each guessing.
+//   2. UNIFORM OFFSET FIELDS -- zero, not the running scan offset. A uniform
+//      brick allocates nothing, so any value would be legal and only one is
+//      obviously right to read. packChunkBricksCanonical agrees: a uniform AIR
+//      descriptor is eight zero bytes, and a uniform SOLID one is
+//      `kind << 28` and the bare material.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint3 brick;
+    uint cellBase, chunkIndex, localIndex;
+    if (!decodeBrick(gid.x, brick, cellBase, chunkIndex, localIndex)) return;
+    // The scanned offsets are only meaningful below ScanCount -- those are the
+    // entries the scan chain actually wrote. Reading past it would take a write
+    // base out of never-written device memory. GUARD ONLY: the host sets
+    // ScanCount to the brick count, which decodeBrick has already enforced.
+    // Group-uniform, like the guard above it.
+    if (gid.x >= ScanCount) return;
+
+    for (uint z = gtid.x; z < kMaxBrickMatWords; z += 64u) gsMat[z] = 0u;
+    if (gtid.x < 2u) gsSkip[gtid.x] = 0u;
+
+    brickBuildOccupancy(cellBase, gtid.x);
+    if (gtid.x == 0u) brickComputeInfo();
+    GroupMemoryBarrierWithGroupSync();
+
+    const uint kind = gsInfo[kInfoKind];
+    const uint bpp = gsInfo[kInfoBpp];
+    const uint paletteDwords = gsInfo[kInfoPaletteDwords];
+    const uint occBase = OccWriteBase + InBrickOccOffsets[gid.x];
+    const uint matBase = MatWriteBase + InBrickMatOffsets[gid.x];
+
+    if (gtid.x == 0u)
+    {
+        uint occWord = 0u;
+        uint matWord = 0u;
+        if (kind == kBrickKindMixed)
+        {
+            const uint hasLocalPalette = (bpp <= 4u) ? 1u : 0u;
+            occWord = (occBase & 0x0fffffffu) | (kBrickKindMixed << 28u)
+                    | (hasLocalPalette << 30u);
+            matWord = (matBase & 0x0fffffffu) | (bpp << 28u);
+        }
+        else if (kind == kBrickKindSolid)
+        {
+            occWord = kBrickKindSolid << 28u;
+            matWord = gsInfo[kInfoUniformMat] & 0xffu;
+        }
+        // Bounded: gid.x plus a host base, and gid.x is capped both by
+        // decodeBrick's brick-count early-out and by the ScanCount guard above;
+        // the host sizes the descriptor table to BrickDescBase plus that count.
+        OutBrickDesc[BrickDescBase + gid.x] = uint2(occWord, matWord);
+
+        // L1: one bit per brick in the chunk record. Any non-empty brick sets
+        // it -- uniform SOLID as much as MIXED.
+        if (gsInfo[kInfoSolidCount] > 0u)
+        {
+            // Bounded: decodeBrick caps chunkIndex (packIndex < chunks*64
+            // implies chunkIndex < chunks) and localIndex below 64, so the dword
+            // index stays inside the 2 dwords per chunk the host allocates from
+            // ChunkRecordBase.
+            const uint maskDword =
+                (ChunkRecordBase + chunkIndex) * 2u + (localIndex >> 5u);
+            // lint-shader-ub: allow VARIABLE_SHIFT - localIndex is masked to 5 bits here, provably in [0, 31]
+            const uint maskBit = 1u << (localIndex & 31u);
+            InterlockedOr(OutChunkBrickMask[maskDword], maskBit);
+        }
+    }
+
+    // A uniform brick is 8 bytes and nothing else. Group-uniform return: kind
+    // comes from groupshared state every thread read after the same barrier.
+    if (kind != kBrickKindMixed) return;
+
+    // --- occupancy: 16 dwords, one thread each ----------------------------
+    if (gtid.x < kBrickOccWords)
+    {
+        // Bounded: the enclosing `gtid.x < 16` test holds the offset within the
+        // 16 dwords the classify pass counted for this brick, and occBase is
+        // that brick's scanned allocation.
+        OutBrickOcc[occBase + gtid.x] = gsOcc[gtid.x];
+    }
+
+    // --- 4^3 intra-brick skip mask: one 2x2x2 block per thread -------------
+    // Free: 64 blocks, 64 threads, and the bits are already in groupshared.
+    {
+        const uint sx = gtid.x % 4u;
+        const uint sy = (gtid.x / 4u) % 4u;
+        const uint sz = gtid.x / 16u;
+        uint blockAny = 0u;
+        for (uint dz = 0u; dz < 2u; ++dz)
+        {
+            for (uint dy = 0u; dy < 2u; ++dy)
+            {
+                const uint c = cellIndexInBrick(sx * 2u, sy * 2u + dy, sz * 2u + dz);
+                // lint-shader-ub: allow VARIABLE_SHIFT - c % 32 is in [0, 31] by construction, and the pair of cells read here starts at even x <= 6, so the two-bit read never crosses the dword
+                if (((gsOcc[c / 32u] >> (c % 32u)) & 3u) != 0u) blockAny = 1u;
+            }
+        }
+        if (blockAny != 0u)
+        {
+            // lint-shader-ub: allow VARIABLE_SHIFT - gtid.x is a 64-thread group index masked to 5 bits here, provably in [0, 31]
+            InterlockedOr(gsSkip[gtid.x >> 5u], 1u << (gtid.x & 31u));
+        }
+    }
+
+    // --- local palette: 64 threads x 4 material ids = the whole 256-bit mask
+    // No search for "the k-th set bit": each present material computes its OWN
+    // rank from the prefix and writes itself into that byte. Ascending
+    // MaterialId falls out of the mask order rather than being sorted for.
+    if (bpp <= 4u)
+    {
+        for (uint k = 0u; k < 4u; ++k)
+        {
+            const uint mat = gtid.x * 4u + k;
+            // mat 0 is MAT_AIR and is never present; the test is the mask's.
+            // lint-shader-ub: allow VARIABLE_SHIFT - mat = gtid.x * 4 + k with gtid.x < 64 and k < 4, so mat < 256 and (mat & 31u) is provably in [0, 31]
+            if (((gsPresent[mat >> 5u] >> (mat & 31u)) & 1u) != 0u)
+            {
+                const uint rank = paletteRankOf(mat);
+                // lint-shader-ub: allow VARIABLE_SHIFT - (rank & 3u) * 8u is 0, 8, 16 or 24, and mat is an 8-bit material id, so the byte lands inside the dword
+                InterlockedOr(gsMat[rank >> 2u], mat << ((rank & 3u) * 8u));
+            }
+        }
+    }
+
+    // --- payload: this thread's 8 cells, in cell order ---------------------
+    if (bpp != 0u)
+    {
+        const uint c0 = gtid.x * 8u;
+        const uint w = c0 / 32u;
+        // The entry index of this thread's first cell: popcount of every
+        // occupancy bit below it. Whole dwords, then the partial one.
+        uint entry = 0u;
+        for (uint p = 0u; p < w; ++p) entry += countbits(gsOcc[p]);
+        entry += countbits(gsOcc[w] & lowMask(c0 % 32u));
+
+        for (uint i = 0u; i < 8u; ++i)
+        {
+            const uint mat = InCells[cellBase + c0 + i] & 0xffu;
+            if (mat == 0u) continue;
+            const uint value = (bpp <= 4u) ? paletteRankOf(mat) : mat;
+            const uint bitPos = entry * bpp;
+            // lint-shader-ub: allow VARIABLE_SHIFT - bitPos % 32 is in [0, 31], and bpp is 1, 2, 4 or 8, all of which divide 32, so an entry never straddles the dword boundary
+            const uint packed = value << (bitPos % 32u);
+            InterlockedOr(gsMat[paletteDwords + (bitPos / 32u)], packed);
+            ++entry;
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // --- store the staged BrickMat and the skip mask ----------------------
+    const uint matWords = paletteDwords + gsInfo[kInfoPayloadDwords];
+    for (uint m = gtid.x; m < matWords; m += 64u)
+    {
+        // lint-shader-ub: allow UNGUARDED_WRITE - the loop bound matWords is exactly the count BrickClassifyMain wrote for this brick and the scan allocated, and matBase is that brick's scanned offset
+        OutBrickMat[matBase + m] = gsMat[m];
+    }
+    if (gtid.x < 2u)
+    {
+        // Bounded: the enclosing `gtid.x < 2` holds the pair, and the index is
+        // the brick's mixed rank (occBase/16, exact because every mixed brick
+        // allocates exactly 16 occupancy dwords) times the 2 dwords the host
+        // allocates per mixed brick.
+        OutBrickSkip[(occBase / kBrickOccWords) * 2u + gtid.x] = gsSkip[gtid.x];
+    }
+}

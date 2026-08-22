@@ -124,7 +124,39 @@
 // kBiomePrecipSemiU8 dropped 17 -> 10 (800 -> 450 mm/yr) to trade grassland
 // for temperate forest. surfaceMat changes on real ground, so every digest
 // moves at this bump and the prebuilt SPIR-V is respun in the same commit.
-#define VXC_WORLDGEN_VERSION_USH 27
+//
+// v28 (VXM2 asset manifest, placement rules): version lock only, NO MATH --
+// the v24..v26 pattern, and the reason that pattern has a name. The C++ bump
+// in 51b18ce moved kWorldGenVersion 27 -> 28 because MANIFEST BYTES ARE
+// WORLDGEN INPUT (kind x biome density table, per-species biome allowlists,
+// named placement rules); it touched asset-forge, assetmanifest.h/.cpp,
+// assetpolicy.h and core.h, and NOT one line of amplifier.cpp, biome.h or
+// this file. Placement is not terrain math.
+//
+// Not one constant below changes: tools/compile-shaders.ps1 reports "prebuilt
+// SPIR-V matches this build" across this edit, which is the compiled proof.
+// Terrain-only bench digest 67383c809c179c60, GPU output digest
+// c61e8cc97c3ceb80, and vxc_gpu --radius 64 reports PASS bit-exact against the
+// CPU reference. The pinned CPU-reference digest stays b2b5d2f1044caa35
+// (VoxelGpuVerify.cpp:144), whose kExpectedCpuDigestWorldGenVersion was
+// already moved to 28 by the C++ commit.
+//
+// READ THOSE DIGESTS ONLY FROM A FRESHLY BUILT BENCH. The binaries in
+// voxel-core/build/ were 16 hours older than v27 when this was investigated,
+// so vxc_gpu ran PRE-v27 CPU code against the CURRENT .ush and reported 20
+// mismatches (cpu=MAT_ROCK vs gpu=MAT_PERMAFROST -- exactly v27's removed
+// dry-land cliff gate, i.e. the stale side was the CPU one). It reads as a
+// real GPU/CPU divergence and it is not. Rebuild vxc_gpu/vxc_bench before
+// trusting any digest, including the ones on this line.
+//
+// THIS IS THE SECOND TIME THE MIRROR WAS LEFT BEHIND and the failure is
+// identical both times: the C++ ships at vN, this file stays at vN-1, and the
+// #error below fires in every worldgen kernel so the editor dies during
+// global shader compilation -- before any map loads, so it reads as "the
+// harness is broken", not "somebody skipped a step". 38bc780 recorded exactly
+// this at v26. The mirror version moves so the skew check keeps meaning "the
+// math disagrees" rather than "somebody forgot the dance."
+#define VXC_WORLDGEN_VERSION_USH 28
 #ifdef VXC_UE
     #ifndef VXC_WORLDGEN_VERSION_CPP
         #error "worldgen.ush compiled under VXC_UE without VXC_WORLDGEN_VERSION_CPP. Every Unreal-side kernel must derive from FVoxelWorldGenShader so ModifyCompilationEnvironment passes vxc::kWorldGenVersion in."

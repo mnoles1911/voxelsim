@@ -22,10 +22,36 @@ is. Composition is AssetField::resolveForCoverCompose / coverMaterialOfResolved
    ring 112 m (the VoxelDetailAssetSubsystem detail ring), pitch 50 mm,
    payload = descriptors + occupancy + 16 B palette + adaptive cells.
 
+   RING 112 m (the value the design doc was written against):
    site                     ground              inst/ha   PAYLOAD   flat index
    grassland   -92445,-75855  REAL fine+climate    3,611   25.4 MiB    29.1 MiB
    grassland   -92445,-75855  coarse-only*         3,717   26.5 MiB    25.4 MiB
    alpine bank -61440,-61440  real fine+climate      156   10.5 MiB   290.1 MiB
+
+   RING 256 m -- THE RING THAT ACTUALLY SHIPS (VoxelDetailAssetSubsystem.cpp:152,
+   raised from 112 on 2026-08-18; 5.2x the area):
+   grassland COVER            REAL fine+climate    3,564  131.6 MiB   245.4 MiB
+   grassland TERRAIN CONTROL  REAL fine+climate        -  126.7 MiB    67.5 MiB
+
+   The 112 m rows were measured against a default that was already stale when it
+   was read out of docs/detail-asset-rendering.md. Measured rather than scaled,
+   the shipping ring returned 5.18x the 112 m payload -- exactly the area ratio,
+   so cover density is uniform across the ring.
+
+   WHAT THE SHIPPING ROW CHANGES:
+     * falsifier margin 3.8x, not 20-48x. The decision stands; the comfort does
+       not.
+     * "cover is 34% of terrain" DOES NOT SURVIVE. That was alpine ground with
+       almost no cover on it (156 inst/ha). On dense grassland at the shipping
+       ring cover is 104% of terrain -- 131.6 vs 126.7 MiB -- it roughly DOUBLES
+       the resident volume. Honest range: 34% where nothing grows, ~100% where
+       things do.
+     * requirement C1 gets STRONGER: the flat index is 245.4 MiB against
+       131.6 MiB of payload.
+     * unchanged: cover + terrain at the shipping ring is ~258 MiB of payload,
+       still far under the 1,110 MiB measured for R0-at-5cm and under today's
+       2,197 MiB quad pool. Scoping the cover volume is still the cheaper
+       project by a wide margin.
 
    CONTROL, same ground as the alpine arm, same reading:
    terrain at 10 cm, --radius 112       payload 31.3 MiB, flat index 37.4 MiB,

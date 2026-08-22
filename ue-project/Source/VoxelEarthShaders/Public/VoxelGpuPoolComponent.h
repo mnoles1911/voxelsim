@@ -151,6 +151,30 @@ struct FVoxelQuadUploadRun
 	uint32 SrcOffset = 0;
 };
 
+// P7-a: THE ONE SPELLING OF THE TERRAIN POOL'S IDENTITY.
+//
+// It is a named constant and not a literal at each end because this project has
+// shipped several joins that were COMPUTED rather than CHECKED and matched
+// nothing at runtime (see the "instrument must run the engine's binding" rule).
+// A literal at each end passes review and fails silently the first time one of
+// them is edited; two references to one constant cannot drift.
+//
+// EXACTLY TWO REFERENCES ARE EXPECTED IN THE TREE:
+//   producer  VoxelWorldSubsystem.cpp  GetOrCreateGpuPool -> SetPoolName(...)
+//   consumer  VoxelGI.cpp              FindTerrainPoolWorldLocation
+// tools\voxel-check-gi-bindings.ps1 asserts that count and FAILS if either end
+// disappears -- a consumer whose producer is gone reads as "no terrain pool",
+// which under the refusal below is a deferred volume, i.e. GI silently absent.
+//
+// WHY A NAME AND NOT IsWaterMode(). !IsWaterMode() is not identity: the terrain
+// pool, VoxelGpuVerify.cpp's region-verify pool and VoxelGpuMeshAsyncVerify's
+// pool-write pool are ALL non-water and all share the default PoolName. Water
+// is the loudest wrong answer but it is not the only one.
+namespace VoxelGpuPool
+{
+	inline const TCHAR* const kTerrainPoolName = TEXT("VoxelTerrainPool");
+}
+
 UCLASS(ClassGroup = Rendering, meta = (BlueprintSpawnableComponent))
 class VOXELEARTHSHADERS_API UVoxelGpuPoolComponent : public UPrimitiveComponent
 {
@@ -405,6 +429,16 @@ public:
 	// steady state instead of tracking chunks ever added. See GetFreeHandleCount.
 	int32 GetNumAllocationsEver() const { return Allocations.Num(); }
 
+	// Quads this pool has ACTUALLY ALLOCATED. Not GetNumQuads(), which returns
+	// CAPACITY -- a distinction that matters because the obvious gate written
+	// against the obvious accessor ("are we still allocating terrain quads?")
+	// would compare 192,000,000 against zero and be vacuous forever.
+	//
+	// Added for the Phase 5 self-check: with voxel.Terrain.RetireQuads on, the
+	// TERRAIN pool must sit at exactly zero. Water pools are separate instances
+	// and are expected to be non-zero -- see docs/phase5-quad-retirement-plan.md.
+	uint32 GetUsedQuads() const { return Pool.GetUsedQuads(); }
+
 	// S1-2 (docs/speculative-generation-plan.md §2.2). Handles sitting in
 	// FreeHandles, available for the next AddChunk/AddChunkFromGpu instead of a
 	// fresh append. Appended to the "Voxel GPU pool:" log line alongside
@@ -581,6 +615,16 @@ public:
 	// SUBMITTED" would make the one number that matters unattributable.
 	// Must be set BEFORE the proxy is created; the proxy takes a copy.
 	void SetPoolName(const FString& InName) { PoolName = InName; }
+
+	// P7-a. The name is also the pool's IDENTITY to anything that has to pick
+	// one pool out of several, which until now nothing could do: the only
+	// public discriminator was IsWaterMode(), and that leaves terrain and BOTH
+	// verify harnesses in one undifferentiated bucket. See
+	// VoxelGpuPool::kTerrainPoolName below and FindTerrainPoolWorldLocation in
+	// VoxelGI.cpp -- the consumer refuses rather than guessing when this does
+	// not positively identify a pool, because the failure it guards against
+	// (anchoring the GI volume to a water bucket's rebase) is silent.
+	const FString& GetPoolName() const { return PoolName; }
 
 	// Edge length, in voxels, of one entry in this pool -- 32 for a terrain
 	// render chunk, 8 for a vxc::WaterBrick8. Used only to grow LocalBounds by

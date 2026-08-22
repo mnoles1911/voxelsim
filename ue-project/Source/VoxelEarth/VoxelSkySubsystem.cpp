@@ -10,6 +10,7 @@
 #include "Components/DirectionalLightComponent.h"
 #include "Components/PostProcessComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
+#include "Components/ExponentialHeightFogComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Engine/DirectionalLight.h"
 #include "Engine/Scene.h" // FPostProcessSettings, EAutoExposureMethod
@@ -489,6 +490,61 @@ namespace
 		TEXT("at runtime shows/hides within a frame and logs the transition; a spawn-time-only switch would make ")
 		TEXT("that gate unreadable. REFUSED, with an Error, if M_SkyAtmosphereDome failed to load: an IsSky dome ")
 		TEXT("wearing the engine default material would suppress the atmosphere pass AND paint the sky wrong."),
+		ECVF_Default);
+
+	// --- FOG (fog plan, 2026-08-20) ------------------------------------------
+	//
+	// Three layers, three owners, stated here because the division is the whole
+	// design: the SKYATMOSPHERE owns all fog COLOUR at distance (aerial
+	// perspective, already live); the HEIGHT FOG below owns density/falloff
+	// SHAPE with its own colour BLACK; the volumetric checkbox on that same fog
+	// owns lit near-field scattering and god rays. Any tuning that reaches for
+	// a fog colour is wrong by construction -- the colour authority is the
+	// atmosphere, coupled by r.SupportSkyAtmosphereAffectsHeightFog.
+	TAutoConsoleVariable<int32> CVarSkyFog(
+		TEXT("voxel.Sky.Fog"), 1,
+		TEXT("The atmospheric height fog on the sky rig. 1 = on (default). 0 = component invisible, ")
+		TEXT("which restores the pre-fog frame exactly -- the A/B arm, pairable inside one process ")
+		TEXT("via -VoxelSkyLadderAltCvar=voxel.Sky.Fog like the atmosphere dome above. NOT the ")
+		TEXT("volumetric switch; that is voxel.Sky.VolumetricFog, gated behind this one."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyFogDensity(
+		TEXT("voxel.Sky.FogDensity"), 0.008f,
+		TEXT("Height fog density at the reference height (the spawn column's ground). STATIC and ")
+		TEXT("art-directed by owner decision 2026-08-20; the weather field's FogDensity output ")
+		TEXT("multiplies in here later (the WEATHER HOOK in ApplyFogFromState). Default 0.008 -- ")
+		TEXT("NOT the engine's 0.02, which reads as soup across a 65-92 km vista where aerial ")
+		TEXT("perspective already carries the distance haze. Bracketed 0.004/0.008/0.015 by ")
+		TEXT("capture; the owner judges, this number only records the judgement."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<float> CVarSkyFogHeightFalloff(
+		TEXT("voxel.Sky.FogHeightFalloff"), 0.05f,
+		TEXT("How fast density thins with height above the reference. Engine default 0.2 would ")
+		TEXT("halve the fog every ~35 m, which zeroes it across this world's 0-2700 m relief; ")
+		TEXT("0.05 keeps valleys below the ~1650 m play band visibly denser and peaks thinner ")
+		TEXT("without either extreme. Bracket 0.02-0.1 by capture."),
+		ECVF_Default);
+
+	// Implements the name pre-registered at docs/lighting-weather-plan.md:960.
+	// TIERS, not a bool, per that plan's own risk note ("volumetric fog is a
+	// real GPU cost: tier it"): 0 = analytic fog only (checkbox off), 1 =
+	// conservative froxels (GridPixelSize 16, GridSizeZ 64 -- quarter the
+	// voxels of the engine default), 2 = engine default (8/128). Default 1 by
+	// owner decision 2026-08-20 -- conditioned on the perf legs; if tier 1
+	// cannot fit the ~1.5 ms headroom at 1440p it ships 0 pending tuning.
+	//
+	// r.VolumetricFog itself is pinned to 1 in DefaultEngine.ini so the stale
+	// Saved/Config scalability preset (sg.ShadowQuality=0) cannot veto the
+	// feature underneath us -- the ran-flag log in SpawnRig warns if that pin
+	// has been lost, because the symptom (tier >= 1, nothing volumetric on
+	// screen, no error anywhere) already cost this project once on shadows.
+	TAutoConsoleVariable<int32> CVarSkyVolumetricFog(
+		TEXT("voxel.Sky.VolumetricFog"), 1,
+		TEXT("Volumetric fog tier: 0 = off (analytic height fog only), 1 = conservative (r.VolumetricFog.")
+		TEXT("GridPixelSize 16, GridSizeZ 64, ~1/4 the froxels of default), 2 = engine default (8/128). ")
+		TEXT("God rays and lit fog live here. Requires voxel.Sky.Fog 1 and r.VolumetricFog 1."),
 		ECVF_Default);
 
 	// --- the star ambient calibration ----------------------------------------
@@ -2111,6 +2167,46 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 				       TEXT("VoxelShadowCascades override: sun DynamicShadowCascades=%d"),
 				       SunComp->DynamicShadowCascades);
 			}
+
+			// -VoxelShadowDistanceM=<metres>. THE OTHER HALF OF THE CASCADE PAIR,
+			// and the one that can silently produce NO SHADOWS AT ALL.
+			//
+			// DynamicShadowCascades says how many cascades to slice;
+			// DynamicShadowDistanceMovableLight says how far they reach. At zero
+			// there is nothing to slice, so the whole cascade set is skipped --
+			// no ShadowDepths pass is emitted, no primitive is ever gathered for
+			// shadows, and every shadow-related knob (cascade count, VSM,
+			// scalability, per-primitive CastShadow) reads as correctly
+			// configured while nothing casts. Measured 2026-08-19: shadowGathers
+			// stayed at 0 across VSM off, ShadowQuality@3, Movable mobility,
+			// CastShadows(true) and DynamicShadowCascades=4, which is what sent
+			// the investigation here.
+			//
+			// Logged with the value READ BACK rather than echoed, for the same
+			// reason SetCastShadows is above: a property that early-outs must not
+			// be reported as applied.
+			float ShadowDistM = 0.f;
+			if (FParse::Value(FCommandLine::Get(), TEXT("VoxelShadowDistanceM="), ShadowDistM) && ShadowDistM > 0.f)
+			{
+				SunComp->DynamicShadowDistanceMovableLight = ShadowDistM * 100.f;
+				SunComp->MarkRenderStateDirty();
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelShadowDistance override: sun DynamicShadowDistanceMovableLight=%.0f UU (%.0f m)"),
+				       SunComp->DynamicShadowDistanceMovableLight,
+				       SunComp->DynamicShadowDistanceMovableLight / 100.f);
+			}
+			else
+			{
+				// Report the DEFAULT too. If this reads 0, that is the answer to
+				// "why does nothing cast", and it should be visible in every leg
+				// rather than only when someone thinks to override it.
+				UE_LOG(LogVoxelSky, Log,
+				       TEXT("VoxelSky sun cascade setup: DynamicShadowCascades=%d DynamicShadowDistanceMovableLight=%.0f UU (%.0f m) CastShadows=%d"),
+				       SunComp->DynamicShadowCascades,
+				       SunComp->DynamicShadowDistanceMovableLight,
+				       SunComp->DynamicShadowDistanceMovableLight / 100.f,
+				       SunComp->CastShadows ? 1 : 0);
+			}
 		}
 	}
 
@@ -2263,6 +2359,78 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// property of the CLOCK, not of a region a designer could author.
 		SkyExposurePP->bUnbound = true;
 
+		// --- the atmospheric height fog (fog plan, 2026-08-20) --------------
+		//
+		// COLOUR IS BLACK, AND THAT IS THE DESIGN, NOT A PLACEHOLDER. Fog
+		// contributions are additive: with r.SupportSkyAtmosphereAffectsHeightFog
+		// on, the SkyAtmosphere supplies this fog's colour from the same LUTs
+		// that colour the sky, so an authored colour HERE would be a second,
+		// disagreeing colour table added on top -- the exact failure that got
+		// the old underwater height fog deleted (VoxelOceanActor.cpp:133-164,
+		// "two disagreeing colour tables"). The component constructor already
+		// defaults FogInscatteringLuminance to black; it is set explicitly so
+		// the next reader knows it is load-bearing rather than unset.
+		//
+		// THE HEIGHT REFERENCE IS THE SPAWN COLUMN'S GROUND, NOT Z=0, and this
+		// is the trap: the rig root (the atmosphere) must sit at planet ground
+		// level and must not move, but EHF falloff is measured from the
+		// COMPONENT's own Z, and the play band is ~1650 m up. At the engine's
+		// default falloff, fog anchored at Z=0 is ~2^-33 of itself at the pond
+		// -- it would silently not exist exactly where the owner looks first.
+		// A relative offset to the spawn column's ground puts the reference
+		// where the player is, same discipline as every other rig placement in
+		// this function.
+		// Derived here rather than passed in: this is the only consumer, and
+		// GetSurfaceHeightUU is the PURE WORLDGEN column surface -- the same
+		// source every other spawn-height decision in this project uses. A
+		// missing terrain subsystem (stripped configs, the transient loading
+		// world) degrades to Z=0, i.e. sea level, which is the least-wrong
+		// constant available and is named in the ran-flag line below either way.
+		double SpawnGroundZUU = 0.0;
+		if (UVoxelWorldSubsystem* TerrainForFog = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
+		{
+			SpawnGroundZUU = TerrainForFog->GetSurfaceHeightUU(SpawnColumnXUU, SpawnColumnYUU);
+		}
+		SkyHeightFog = NewObject<UExponentialHeightFogComponent>(SkyRigActor, TEXT("SkyHeightFog"));
+		SkyHeightFog->SetupAttachment(AtmosphereComp);
+		SkyHeightFog->RegisterComponent();
+		SkyHeightFog->SetRelativeLocation(FVector(0.0, 0.0, SpawnGroundZUU));
+		SkyHeightFog->SetFogInscatteringColor(FLinearColor::Black);
+		SkyHeightFog->SetDirectionalInscatteringColor(FLinearColor::Black);
+		SkyHeightFog->SetFogDensity(FMath::Max(0.0f, CVarSkyFogDensity.GetValueOnGameThread()));
+		SkyHeightFog->SetFogHeightFalloff(FMath::Max(0.0f, CVarSkyFogHeightFalloff.GetValueOnGameThread()));
+		// StartDistance 0: volumetrics want near fog (god rays start at the
+		// camera). If near-field milkiness offends, the knob to raise is the
+		// ANALYTIC start distance only -- never density, which is shape not
+		// reach, and never a colour.
+		SkyHeightFog->SetStartDistance(0.0f);
+
+		// The ran-flag. Distinguishes every state this feature can silently be
+		// in: spawned-and-off, spawned-with-volumetrics-vetoed (the stale
+		// scalability preset symptom -- r.VolumetricFog=1 is pinned in
+		// DefaultEngine.ini precisely so this cannot happen, and this line is
+		// what says so if the pin is ever lost), and healthy.
+		{
+			static const auto* VolFogCVar = IConsoleManager::Get().FindConsoleVariable(TEXT("r.VolumetricFog"));
+			const int32 VolFogLive = VolFogCVar ? VolFogCVar->GetInt() : -1;
+			const int32 Tier = CVarSkyVolumetricFog.GetValueOnGameThread();
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("Sky: ExponentialHeightFog spawned. Ground ref z=%.1f m, density=%g, falloff=%g, ")
+			       TEXT("volumetric tier=%d, r.VolumetricFog=%d, voxel.Sky.Fog=%d."),
+			       SpawnGroundZUU / 100.0, CVarSkyFogDensity.GetValueOnGameThread(),
+			       CVarSkyFogHeightFalloff.GetValueOnGameThread(), Tier, VolFogLive,
+			       CVarSkyFog.GetValueOnGameThread());
+			if (Tier >= 1 && VolFogLive == 0)
+			{
+				UE_LOG(LogVoxelSky, Warning,
+				       TEXT("Sky: voxel.Sky.VolumetricFog=%d but r.VolumetricFog reads 0 -- the froxel ")
+				       TEXT("passes will not run and fog will be analytic-only with NO other symptom. ")
+				       TEXT("This is the stale-scalability-preset failure (sg.ShadowQuality=0 forces it); ")
+				       TEXT("the pin in DefaultEngine.ini [ConsoleVariables] has been lost or edited."),
+				       Tier);
+			}
+		}
+
 		// ===================================================================
 		// EXPOSURE OWNERSHIP RULE -- READ THIS BEFORE ADDING A THIRD VOLUME.
 		// (The same rule is written into VoxelClipmapActor.cpp beside the other
@@ -2388,6 +2556,12 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 
 void UVoxelSkySubsystem::ApplyStaticRigPose()
 {
+	// The fog did not exist before W4 either, so the static pose hides it --
+	// same byte-identical-off contract the comment below states for the sun.
+	if (SkyHeightFog)
+	{
+		SkyHeightFog->SetVisibility(false);
+	}
 	// The pre-W4 pose, reproduced exactly: FRotator(-45, 30, 0) and Intensity 8,
 	// no colour temperature. This is what voxel.Sky.Enabled 0 leaves behind, and
 	// keeping it byte-identical is what makes the cvar a usable A/B control --
@@ -2564,6 +2738,7 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// brightness staircase for no saving at all. The at-most-100 ms disagreement
 	// between the stepped light and the continuous exposure is not observable.
 	ApplyExposureFromState();
+	ApplyFogFromState();
 
 	// --- the night sky's material parameters, ALSO EVERY frame ---------------
 	//
@@ -3037,6 +3212,88 @@ void UVoxelSkySubsystem::ApplyExposureFromState()
 	PP.AutoExposureMinBrightness = (float)(SceneEV100 - kClampedAutoWindowStops);
 	PP.bOverride_AutoExposureMaxBrightness = true;
 	PP.AutoExposureMaxBrightness = (float)(SceneEV100 + kClampedAutoWindowStops);
+}
+
+void UVoxelSkySubsystem::SetUnderwaterFogSuppression(float Weight01)
+{
+	// Clamped at the door: this arrives from the ocean's blend ramp and is a
+	// weight by contract, but a NaN or an out-of-range value multiplied into a
+	// fog density would be invisible until someone screenshots a black sky.
+	UnderwaterFogSuppression = FMath::IsFinite(Weight01) ? FMath::Clamp(Weight01, 0.0f, 1.0f) : 0.0f;
+}
+
+void UVoxelSkySubsystem::ApplyFogFromState()
+{
+	if (!SkyHeightFog)
+	{
+		return;
+	}
+
+	// voxel.Sky.Fog 0 must restore the pre-fog frame exactly, same contract as
+	// every other off-switch on this rig. Visibility rather than density-0 so
+	// the component costs nothing at all when off.
+	const bool bFogOn = CVarSkyFog.GetValueOnGameThread() != 0;
+	if (SkyHeightFog->GetVisibleFlag() != bFogOn)
+	{
+		SkyHeightFog->SetVisibility(bFogOn);
+	}
+	if (!bFogOn)
+	{
+		return;
+	}
+
+	// WEATHER HOOK (docs/lighting-weather-plan.md:390-406): when the weather
+	// field grows its FogDensity output, it multiplies the cvar base RIGHT
+	// HERE -- Density = Base * WeatherSample.FogDensity -- with the underwater
+	// suppression still applied LAST, so submersion always wins. One seam, by
+	// owner decision 2026-08-20 (static art-directed values first).
+	const float Base = FMath::Max(0.0f, CVarSkyFogDensity.GetValueOnGameThread());
+	const float Density = Base * (1.0f - UnderwaterFogSuppression);
+
+	// Push-on-change, same epsilon discipline as the exposure pusher above: a
+	// per-frame SetFogDensity with an unchanged value still dirties the render
+	// state of a component the whole scene reads.
+	if (!FMath::IsNearlyEqual(SkyHeightFog->FogDensity, Density, 1.0e-6f))
+	{
+		SkyHeightFog->SetFogDensity(Density);
+	}
+	const float Falloff = FMath::Max(0.0f, CVarSkyFogHeightFalloff.GetValueOnGameThread());
+	if (!FMath::IsNearlyEqual(SkyHeightFog->FogHeightFalloff, Falloff, 1.0e-6f))
+	{
+		SkyHeightFog->SetFogHeightFalloff(Falloff);
+	}
+
+	// The volumetric tier. The checkbox is the per-component request;
+	// r.VolumetricFog (pinned in DefaultEngine.ini) is the global permission;
+	// the grid cvars are set at SetByConsole so they win over scalability the
+	// same way the ini pin does.
+	const int32 Tier = FMath::Clamp(CVarSkyVolumetricFog.GetValueOnGameThread(), 0, 2);
+	const bool bWantVolumetric = Tier >= 1;
+	if (SkyHeightFog->bEnableVolumetricFog != bWantVolumetric)
+	{
+		SkyHeightFog->SetVolumetricFog(bWantVolumetric);
+	}
+	if (Tier != AppliedVolumetricTier)
+	{
+		if (Tier >= 1)
+		{
+			IConsoleManager& CM = IConsoleManager::Get();
+			if (IConsoleVariable* Grid = CM.FindConsoleVariable(TEXT("r.VolumetricFog.GridPixelSize")))
+			{
+				Grid->Set(Tier == 1 ? 16 : 8, ECVF_SetByConsole);
+			}
+			if (IConsoleVariable* GridZ = CM.FindConsoleVariable(TEXT("r.VolumetricFog.GridSizeZ")))
+			{
+				GridZ->Set(Tier == 1 ? 64 : 128, ECVF_SetByConsole);
+			}
+		}
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("Sky: volumetric fog tier %d -> %d (%s)."), AppliedVolumetricTier, Tier,
+		       Tier == 0 ? TEXT("analytic height fog only")
+		                 : Tier == 1 ? TEXT("GridPixelSize 16, GridSizeZ 64 -- conservative")
+		                             : TEXT("GridPixelSize 8, GridSizeZ 128 -- engine default"));
+		AppliedVolumetricTier = Tier;
+	}
 }
 
 void UVoxelSkySubsystem::ApplySkyMaterialParams()

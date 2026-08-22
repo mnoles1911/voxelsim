@@ -1,0 +1,110 @@
+RAY MARCH SKIP RATIO -- P3-B2a DELIVERABLE
+2026-08-20
+
+RESULT
+======
+
+  SKIP RATIO  37.4x   (range 36.86 - 38.04, 3.2%)   N = 6 independent worlds
+
+The hierarchical walk (chunks -> bricks -> cells) travels 37.4x fewer steps
+than the flat brick walk over the same rays, same frame, same volume.
+
+Plan `docs/ray-marching-plan-2026-08-19.md` assumed 9.19x. Measured is 4.1x
+better than assumed.
+
+SCOPE -- what this number covers and what it does NOT
+=====================================================
+
+COVERS:
+  - Brick pool as the traversal source (voxel.March.Source=1), LEVEL 0 ONLY.
+  - Reach 51.2 m, camera-anchored chunk-snapped frame origin.
+  - Steps counted per ray by the walk itself; hierarchy vs flat compared
+    WITHIN the same frame, so both arms see byte-identical world state.
+  - N = 6 legs, six DISTINCT index content hashes.
+
+    CORRECTED 2026-08-20 (later the same day): an earlier version of this
+    line read "six different worlds, not six draws of one". THAT WAS NOT
+    MEASURED. A content hash is a CHANGE DETECTOR, NOT A DISTANCE METRIC --
+    FNV-1a over the index decorrelates completely if a single chunk differs,
+    so six distinct hashes prove six distinct states and say NOTHING about
+    how far apart they are. Subsequent counters showed total brick entries
+    constant to 0.7% across all six, which is what near-identical traversal
+    geometry looks like. The legs may be six small perturbations of one
+    world. The ratio's 3.2% band should be read as ITS REPEATABILITY OVER
+    SIX STATES OF UNKNOWN SEPARATION, not as robustness across worlds.
+
+DOES NOT COVER:
+  - The hit/miss mix. UNCHECKED AND IT MATTERS: hierarchy wins most on rays
+    that traverse empty space, so a scene where most rays run to reach
+    without hitting yields a HIGHER ratio than one where rays stop early.
+    CORRECTED: an earlier version of this line said `agreeMiss`/`agreeHit`
+    already print on every leg so this costs nothing. WRONG -- those belong
+    to the SOURCE compare, which is dark on every camera-anchored frame (the
+    gate added to kill the 10x population swing). No leg since that change
+    has recorded a hit/miss split at all. A `flatHit`/`hierHit` pair on the
+    hier-vs-flat arm was added afterwards to make it measurable.
+
+    NOW MEASURED, and the dependence is LARGER THAN ASSUMED: across eight
+    windows `flatHit` ran 46,407 .. 554,789 -- a 12x swing in how much of the
+    frame hits terrain at all. The ratio over those same windows held at
+    36.25 / 36.25 / 36.70 / 37.04, so it is stable ACROSS that swing, which
+    is the reassuring reading. But 37.4x is an average over scenes whose hit
+    fraction varies 12x, and it should be quoted with that, not without it.
+  - Ring transitions or the 4 km cascade (P3-B2b, planned only, not built).
+  - Cone LOD / multi-level descent -- level 0 is the only level walked.
+  - Frame time. A step ratio is not a millisecond ratio; the plan's ~2.9x
+    frame projection depends on further terms that are not measured here.
+  - Correctness. See below. This is a measurement of WORK AVOIDED, and it is
+    reported independent of whether every ray lands on the right voxel.
+
+WHY IT IS REPORTED AHEAD OF CORRECTNESS CERTIFICATION
+=====================================================
+
+The two are measurably independent, which is not an assumption but the
+finding that unblocked this report.
+
+Across the same six legs the raw hierarchy-vs-flat disagreement count ranged
+15 .. 10,428 -- a 695x swing, ~2.8 decades, driven by world content alone.
+The ratio moved 3.2% across that entire swing:
+
+       ratio     disagree    indexHash
+  n1  36.86x         148     0xa46dfa4838e1cf88
+  n2  38.04x          41     0xbd185cd2fad7aac8
+  n3  37.61x       1,060     0x1896abbb96631ffa
+  n4  37.82x          15     0x5a43a6c4afbf673c
+  n5  37.82x      10,428     0xe41434175f07f7a3
+  n6  37.73x         527     0x4fe521fe25464e1e
+
+If the disagreeing rays materially changed how far the walk travelled, a
+695x change in their number would move the ratio. It does not. The residual
+defect is LARGE IN COUNT and NEGLIGIBLE IN EFFECT on distance travelled.
+
+So the ratio is not waiting on a gate that measures something it has been
+shown to be insensitive to. Correctness remains open and is tracked
+separately; it is not a caveat on this number, it is a different number.
+
+MEASUREMENT NOTES
+=================
+
+Determinism had to be built before any of this was readable. Two corrections
+that changed the answer:
+
+  - The march frame originally borrowed the fluid volume's RecentreTo origin,
+    whose hysteresis made byte-identical runs vary 102x. Replaced with a
+    camera-anchored chunk-snapped origin; stepsFlat then agreed to 0.017%.
+
+  - The first skip-ratio reading was 66.86x. The comparator rejected it
+    (disagree 156,031 against a control refNoise of 6). It was a false
+    result SEVEN TIMES BETTER than the one hoped for, and only an instrument
+    that states its own verdict caught it. 37.4x is the post-gate number.
+
+A NOTE ON "1,060"
+=================
+
+n3 reads exactly 1,060 -- the value treated as "the high mode" for six
+rounds of investigation. With N=6 it is visibly a common draw from a skewed
+distribution, not a mode. Every earlier statement of the form "high mode is
+about 1,000" was a point read from a distribution that had never been
+characterised, and the conclusions built on movement away from it were not
+supported. Recorded here because the ratio was measured correctly during
+exactly the same period the correctness counts were being read wrongly.
