@@ -190,8 +190,16 @@ Every interpolant is spoken for. Know this before designing anything.
 > **UPDATED (ADR-0009).** `TexCoords[3]/[4]` now carry the material's base
 > colour and its biome weight, and `TexCoords[5]` carries the two variation
 > scalars. `[5]` cost nothing: Unreal packs customised UVs two per `float4`, so
-> the one holding `[4]` already reserved its lanes. The rest of this table, and
-> the warning under it, still hold.
+> the one holding `[4]` already reserved its lanes.
+>
+> `VertexColor.A` (precipitation) is now **free on terrain quads** — §3a removed
+> climate from the near field, and the clipmap reads the LUT through its own
+> vertex colours. **`VertexColor.B` is NOT free**: it carries temperature on
+> terrain quads, which is likewise unused, but on WATER quads it carries
+> `Decoded.TopBoundary`, which the World Position Offset needs. Reclaiming B
+> means reclaiming it on the terrain branch only.
+>
+> The rest of this table, and the warning under it, still hold.
 
 | Channel | Carries |
 |---|---|

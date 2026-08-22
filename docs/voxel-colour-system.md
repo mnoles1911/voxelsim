@@ -19,8 +19,11 @@ decisions this document describes. This is the map; those are the reasoning.
    └──────────────────────────────┬───────────────────────────────────┘
                                   │
    ┌─ 2. PLACE ───────────────────▼───────────────────────────────────┐
-   │  lerp(base, climate, biomeTint[mat] × nearSurfaceFlag)            │
-   │  climate = T_VoxelBiomeLUT sampled at (precipitation, temperature)│
+   │  NEAR FIELD: nothing. biomeTint is 0 on every row (ADR-0009 §3a). │
+   │  Two GEOMETRIC modifiers instead, both × nearSurfaceFlag:         │
+   │      slope → MAT_ROCK      (v27 dropped worldgen's cliff gate)    │
+   │      snowline → MAT_SNOW   (worldgen never emits MAT_SNOW)        │
+   │  CLIPMAP: T_VoxelBiomeLUT, itself painted from this same palette  │
    └──────────────────────────────┬───────────────────────────────────┘
                                   │
    ┌─ 3. VARIATION ───────────────▼───────────────────────────────────┐
@@ -38,12 +41,12 @@ decisions this document describes. This is the map; those are the reasoning.
    └───────────────────────────────────────────────────────────────────┘
 ```
 
-**The order of 2 and 3 is load-bearing.** Applying the variation before the
-climate blend lets the blend average it away, and every outdoor surface hands
-190–235/255 of its colour to the climate. That is the difference between a
-mottled hillside and a flat one, and it is why the base colour and the variation
-travel to the material graph as separate interpolants instead of one finished
-colour.
+**The order of 2 and 3 is load-bearing**, and stays so even though the climate
+term is now weighted out. Applying the variation before the modifiers lets the
+modifiers flatten it; applying it before a climate blend would let the blend
+average it away. The ordering is a property of the composition, not of today's
+data — the day anyone reintroduces climate, the wrong order silently costs every
+bit of per-voxel variation on the surfaces that carry it.
 
 **Stage 5 is not in the table**, per ADR-0008 invariant 4. Baking a
 top-is-brighter bias into the palette double-counts the renderer's own terms and
@@ -55,6 +58,9 @@ goes wrong the moment the sun moves.
 
 | Piece | File | Kind |
 |---|---|---|
+| The gate: do ids reach quads | `voxel-core/bench/matcensus.cpp` | measurement |
+| The picture | `tools/world-preview.py` | review artifact |
+| The clipmap's LUT | `gen_terrain_textures.write_biome_lut` | generated (via `vxc_biomelut`) |
 | The table | `voxel-core/include/voxelcore/materialpalette.h` | **authored** |
 | The evaluation | `voxel-core/include/voxelcore/materialcolor.h` | **authored** |
 | The asset boundary | `core.h` `kFirstAssetMaterial` + the banner | authored, cross-checked |
@@ -94,7 +100,9 @@ uint8_t biomeTint;      // how much the climate owns, 1/255ths
   the contact sheet is that averaging, drawn.
 - **`patchScaleDm` is WORLD**, not voxels. Band-limited to two rendered cubes by
   `vxc::patchWavelengthMm`.
-- **`biomeTint` is appearance, not policy.** See ADR-0009 §3.
+- **`biomeTint` is appearance, not policy** (ADR-0009 §3) — **and it is 0 on
+  every row** (§3a). The column and the composition stage both survive so that
+  reintroducing climate stays a data change; today nothing is tinted.
 
 ---
 
@@ -134,20 +142,26 @@ it on purpose and show the failure.**
 
 ## 5. Where a change actually lands
 
-Lopsided, and easy to get wrong.
+**Everywhere, since ADR-0009 §3a.** All 47 materials own their colour outright,
+so a palette edit is fully visible: cave walls, trunks, leaves, animals, and
+every outdoor surface.
 
-- **40 materials own their colour outright** (`biomeTint` 0): every cave wall,
-  every trunk, every leaf, every animal. A retune of these is what the player
-  sees today.
-- **7 climate-led surfaces** hand 190–235/255 to the biome LUT, so only 7–25% of
-  a retune survives outdoors.
+This section used to say the opposite — that seven climate-led surfaces handed
+190–235/255 to the LUT so only 7–25% of a retune reached outdoors, and that
+fixing the surface classifier was the highest-value thing anyone could do. **Both
+halves were wrong, and how they were wrong is worth keeping.** The claim behind
+them ("the classifier labels nearly every land surface `MAT_SAND`") came from a
+2026-08-11 handoff, and `VoxelClimateProbe.h` had already retracted it in
+writing. Worldgen v22 and v27 had fixed the classifier; nobody had re-read the
+retraction or re-run the measurement.
 
-That is not the design's preference — it is the surface classifier. On real
-diffusion tiles it labels very nearly every land surface voxel `MAT_SAND`
-(`VoxelClimateProbe.h` has the measurement), so material id carries almost no
-information outdoors. **Fixing the classifier is the single highest-value thing
-anyone can do to this colour system**, and when it lands, `biomeTint` on those
-seven rows is the first number to lower.
+The lesson generalises past this file: **this repo writes down its own
+corrections, and they are worth reading before repeating a claim from a
+handoff.**
+
+What IS still true and still worth doing: `biomeSurfaceMaterial` never emits
+`MAT_SNOW`, so the snowline modifier is a shader-side stand-in for a worldgen
+feature. Emitting `MAT_SNOW` above a line would let that modifier be deleted.
 
 ---
 

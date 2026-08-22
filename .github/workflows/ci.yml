@@ -308,15 +308,33 @@ jobs:
         run: python tools/check-palette-parity.py --samples 2000
       - name: The terrain material graph builds
         run: python tools/check-terrain-graph.py
-      # Not a check -- an artifact. The palette is 47 rows of five numbers and
-      # the question anyone has about it is what it LOOKS like; this is how that
-      # gets reviewed on a pull request without the editor.
+      # THE GATE ON MATERIAL-LED COLOUR. If the surface material ids stop
+      # reaching the quads, ADR-0009's near field renders as one colour -- and
+      # the only instrument that could have caught that before this job existed
+      # was an in-engine switch on the wrong renderer that masked Mat & 0xF.
+      - name: Build the census and preview probes
+        run: |
+          cmake -S voxel-core -B build/voxel-core -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/voxel-core --target vxc_matcensus vxc_biomelut -j 2
+      - name: Material ids reach the quads
+        run: >
+          ./build/voxel-core/bench/vxc_matcensus
+          ue-project/Content/TerrainTiles/synthetic-v1/000000000135276f/s1
+          20260719 --radius 40 --dump world.bin --dump-radius 2000 --dump-stride 40
+      # Not checks -- artifacts. The palette is 47 rows of five numbers and the
+      # question anyone has about it is what it LOOKS like; these are how that
+      # gets reviewed on a pull request without the editor. The world preview in
+      # particular is what caught MAT_PODZOL and MAT_MUD rendering as one brown.
       - name: Render the palette contact sheet
         run: python tools/palette-sheet.py -o palette-sheet.png
+      - name: Render the world preview (vista vs near field)
+        run: python tools/world-preview.py world.bin --compare -o world-preview.png
       - uses: actions/upload-artifact@v4
         with:
-          name: palette-sheet
-          path: palette-sheet.png
+          name: colour-review
+          path: |
+            palette-sheet.png
+            world-preview.png
 
   shader-compile:
     name: Shader compilation (DXIL + SPIR-V)

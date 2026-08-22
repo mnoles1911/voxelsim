@@ -1082,11 +1082,31 @@ turned out to be the actual defects:
 - **The patch wavelength was per rendered cube**, so a hillside's mottle stepped
   from 2 m to 64 m across a streaming ring boundary. Now world-metric.
 
-Still open, and now the highest-value item for appearance: **the surface
-classifier**. It labels nearly all land `MAT_SAND`, which is why the seven
-climate-led surface materials carry `biomeTint` 190–235 — with a real classifier
-those numbers come down and the world gets its material identity back outdoors.
-Nothing else in the colour system is waiting on anything.
+**THE "CLASSIFIER IS THE BLOCKER" CLAIM WAS WRONG, and it was wrong here too**
+until 2026-08-22. This entry said the surface classifier labels nearly all land
+`MAT_SAND`, that the seven surface materials therefore had to carry `biomeTint`
+190–235, and that fixing the classifier was the highest-value item for
+appearance. All three were stale. The claim originates in a 2026-08-11 handoff,
+and `VoxelClimateProbe.h` had **already retracted it in writing** — "an earlier
+draft of this work asserted the world was all MAT_SAND, reasoning from biome.h's
+thresholds rather than measuring — that was wrong". Worldgen v22 and v27 fixed
+the classifier; `vxc_matcensus` now measures the ids reaching the quads and the
+census agrees with the columns to 0.00 points. ADR-0009 §3a removed climate
+tinting from the near field entirely.
+
+Still open in this area, and much smaller than the above implied:
+
+* **`biomeSurfaceMaterial` never emits `MAT_SNOW`** (`core.h` calls it "legacy
+  v0 … superseded by MAT_PERMAFROST/MAT_ROCK"), so the elevation snowline in
+  `M_VoxelTerrain` is a shader-side stand-in for a worldgen feature. Emitting
+  `MAT_SNOW` above a line lets that modifier be deleted.
+* **DESERT is 0.00% of this world** — its temperature tail is ~7 °C short of
+  Earth's, so `MAT_SAND` outdoors is beach-only. `docs/measurements/
+  biome-gates-2026-08-01.txt` §4 shows no threshold fixes it; it belongs to the
+  coarse model.
+* **The material graph is still UNRUN.** `tools/check-terrain-graph.py` executes
+  it against a stub; the editor box is the only thing that can say it is right,
+  and `create_voxel_material.py` lists the eight things a capture must show.
 
 **Also found — SINCE FIXED.** `ue-project/Tools/terrain_palette.py` *was* a
 **second palette**, 16 entries, stopping at `MAT_WATERMARK`, and its own header

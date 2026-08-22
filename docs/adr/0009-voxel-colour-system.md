@@ -8,8 +8,11 @@
   (`materialcolor.h` is integer Q16 throughout), no change to `Material`
   ordering, no change to any on-disk format, no change to any worldgen hash.
 - **Human sign-off:** Matt, 2026-08-22 — chose to retune the art values as well
-  as the system, to weaken rather than remove the detail texture, and to land
-  the material-graph half unrun.
+  as the system, and to land the material-graph half unrun.
+- **Amended the same day**, after measurement, by §3a below: climate tinting is
+  removed from the near field entirely rather than weighted down. The original
+  §3 argued for a per-material *weight* on the strength of a stale claim about
+  the classifier. The weight mechanism survives and every row is zero.
 
 ## Context
 
@@ -117,6 +120,56 @@ identity back when the classifier is fixed, and lowering it is a data change.
 
 Evidence that this is a faithful promotion rather than a new set of opinions:
 all 47 generated booleans came out identical to the hand-authored ones.
+
+### 3a. AMENDMENT: the weight is zero everywhere, and the LUT is generated
+
+Owner call, same day: *"no biome or weather/precipitation based tinting. voxel
+face color is driven purely by the material for now."*
+
+**Why §3's surface weights of 190–235 were wrong.** They rested on "the
+classifier labels nearly every outdoor surface `MAT_SAND`, so climate has to
+carry all outdoor colour". That claim came from the 2026-08-11 handoff — and
+`VoxelClimateProbe.h` had **already retracted it**: *"an earlier draft of this
+work asserted the world was all MAT_SAND, reasoning from biome.h's thresholds
+rather than measuring — that was wrong, and the histogram switch exists so the
+next person measures instead."* Worldgen v22 (savanna gate) and v27 (precip
+boundary) fixed the classifier; the world censuses at GRASSLAND 44.7%,
+TEMPERATE_FOREST 31.2%, TUNDRA_ALPINE 8.1%, BEACH 6.2%, RAINFOREST 4.4%,
+SAVANNA 3.1%, TAIGA 2.4%.
+
+**And the ids reach the renderer**, which nobody had confirmed. `vxc_matcensus`
+walks a world, meshes it, and reports the column census and the quad census
+together: they agree to 0.00 points on the repo's baked tiles. That gate had to
+pass before any of this was safe — if the ids had not survived meshing, removing
+the LUT would have painted the near field one colour.
+
+**What is kept, and why it is not weather.** Two modifiers survive on the voxel
+path, both geometric:
+
+- **Slope → rock.** v27 deliberately removed the dry-land cliff→`BARE_ROCK`
+  gate, so the classifier calls a dry cliff by its surrounding biome. Without
+  this, a 50 m vertical face in grassland renders as grass top to bottom.
+- **Snowline, elevation only.** The temperature half is weather and goes.
+  The elevation half cannot: `biomeSurfaceMaterial` never emits `MAT_SNOW`, so
+  deleting it removes snow from the world. It is a **stand-in** for worldgen
+  emitting `MAT_SNOW` above a line, and is marked as one.
+
+**Beach is deleted** — the classifier already emits `MAT_SAND` for BEACH.
+
+All three modifier colours are now generated from the palette. `RockColor` was
+1.6× brighter and 2.0× the blue of `MAT_ROCK`, so a cliff face and the cave dug
+into it were different rocks.
+
+**The clipmap keeps the LUT**, because a heightmap vertex has no material id —
+but the LUT is now painted by running `classifyBiome` → `biomeSurfaceMaterial`
+→ palette colour over its 64×64 grid, so the vista is the palette smoothed
+across climate space and the two paths cannot drift at their seam.
+
+**What is lost, stated plainly:** the within-biome climate gradient in the near
+field. Every grassland is the same green whatever its rainfall. Per-voxel
+variation and 828 species of placed cover carry the variety instead, which is
+what the reference art does. This is reversible as data: the `biomeTint` column
+still exists and the climate stage is still stage 2 of the composition.
 
 ### 4. Invariant 5 — the patch wavelength is WORLD metric
 
