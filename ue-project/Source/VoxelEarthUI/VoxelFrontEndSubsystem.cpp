@@ -81,6 +81,9 @@ void UVoxelFrontEndSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 // type-erases its deleter.)
 UVoxelFrontEndSubsystem::UVoxelFrontEndSubsystem() = default;
 UVoxelFrontEndSubsystem::~UVoxelFrontEndSubsystem() = default;
+// The generated one would live in gen.cpp, where FVoxelWorldReadyProbe is
+// incomplete. See the header.
+UVoxelFrontEndSubsystem::UVoxelFrontEndSubsystem(FVTableHelper& Helper) : Super(Helper) {}
 
 void UVoxelFrontEndSubsystem::Deinitialize()
 {

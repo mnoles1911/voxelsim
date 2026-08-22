@@ -54,6 +54,16 @@ public:
 	// an incomplete type in this header.
 	UVoxelFrontEndSubsystem();
 	virtual ~UVoxelFrontEndSubsystem() override;
+	// AND THE VTABLE HELPER, which is the half that was missing.
+	//
+	// Declaring the destructor out of line is necessary but NOT sufficient:
+	// UHT emits UVoxelFrontEndSubsystem(FVTableHelper&) into
+	// Module.VoxelEarthUI.gen.cpp, and that constructor instantiates
+	// TUniquePtr's deleter in a translation unit that sees only this header --
+	// where FVoxelWorldReadyProbe is still incomplete. That is the C4150 that
+	// broke the module build. Declaring it here and defining it in the .cpp
+	// moves the instantiation to where the type is complete.
+	UVoxelFrontEndSubsystem(FVTableHelper& Helper);
 
 	virtual bool DoesSupportWorldType(const EWorldType::Type WorldType) const override;
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;

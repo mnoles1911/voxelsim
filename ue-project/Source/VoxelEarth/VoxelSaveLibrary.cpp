@@ -376,7 +376,14 @@ FAutoConsoleCommand GListSavesCommand(
 			}
 		}));
 
-FAutoConsoleCommandWithArgs GDeleteSaveCommand(
+// FAutoConsoleCommand, NOT FAutoConsoleCommandWithArgs -- the latter does not
+// exist. IConsoleManager.h ships FAutoConsoleCommand{,WithWorld,WithWorldAndArgs,
+// WithArgsAndOutputDevice,WithOutputDevice,WithWorldArgsAndOutputDevice}, and
+// plain FAutoConsoleCommand already has an overload taking exactly the
+// FConsoleCommandWithArgsDelegate this builds. The mistake broke the whole
+// module build on main; the two commands above it use real type names, which is
+// why they compiled and this did not.
+FAutoConsoleCommand GDeleteSaveCommand(
 	TEXT("voxel.DeleteSave"),
 	TEXT("voxel.DeleteSave <slug> -- permanently remove one save directory."),
 	FConsoleCommandWithArgsDelegate::CreateStatic(

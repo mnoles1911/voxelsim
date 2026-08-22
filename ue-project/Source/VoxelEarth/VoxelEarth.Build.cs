@@ -130,6 +130,23 @@ public class VoxelEarth : ModuleRules
 				string.Join(", ", ZstdCandidates));
 		}
 
+		// THIS MODULE'S OWN HEADERS, and they were never exposed.
+		//
+		// VoxelEarth has no Public/ or Private/ split -- every header sits at
+		// the module root -- and UBT treats a module-root header as PRIVATE
+		// unless the path is published. So VoxelEarthUI could declare
+		// "VoxelEarth" in PublicDependencyModuleNames (it does) and still fail
+		// to open VoxelDebug.h, VoxelSaveLibrary.h and VoxelFrontEndPolicy.h,
+		// which is exactly how main was left: a declared dependency that
+		// cannot be used, breaking the whole module build.
+		//
+		// Publishing ModuleDirectory is the fix that matches the flat layout.
+		// The alternative -- moving the ~60 headers into Public/ -- is a large
+		// mechanical change with no behavioural benefit, and the ONE-WAY
+		// dependency rule VoxelEarthUI.Build.cs documents (UI -> VoxelEarth,
+		// never back) is enforced by the module graph, not by this path.
+		PublicIncludePaths.Add(ModuleDirectory);
+
 		// voxel-core: engine-agnostic, UE-header-free C++20 static library.
 		string VoxelCoreRoot = Path.Combine(ModuleDirectory, "..", "..", "..", "voxel-core");
 		string VoxelCoreInclude = Path.Combine(VoxelCoreRoot, "include");
