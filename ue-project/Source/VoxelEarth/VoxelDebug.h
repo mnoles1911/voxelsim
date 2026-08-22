@@ -390,6 +390,9 @@ namespace VoxelDebug
 	VOXELEARTH_API float GetStreamVelocityLeadMaxUU();
 	VOXELEARTH_API int32 GetStreamSpeculativeMaxParked();
 	VOXELEARTH_API int32 GetStreamSpeculativeMaxInFlight();
+	// Brick-backed speculative parking under voxel.Terrain.RetireQuads -- see
+	// the cvar's source comment for the adopted=0 mechanism it repairs.
+	VOXELEARTH_API int32 GetStreamSpeculativeParkBricks();
 
 	VOXELEARTH_API int32 GetStreamPoolParkMax();
 
