@@ -67,6 +67,18 @@ private:
 	void RequestDelete(const FString& Slug);
 	void RequestQuit();
 
+	// Raises the curtain and arms the world start. EditLogPath is empty for
+	// NEW GAME; SpawnOverride is null unless a save is restoring a position.
+	void BeginLoad(const FString& EditLogPath, const FTransform* SpawnOverride);
+	// Runs at the end of ArmLoading: opens the streaming gate and spawns the
+	// pawn. Separated from BeginLoad so the two frames between them can be
+	// spent PAINTING, which is the whole point -- see ArmFrames.
+	void StartWorldAndPawn();
+	void TickLoading(float DeltaSeconds);
+	void TickHandOff(float DeltaSeconds);
+	// The monotone, time-floored progress model. See the .cpp.
+	float ComputeProgress() const;
+
 	// Removes the menu from the viewport and hands input back to the game.
 	void TeardownMenu();
 
@@ -74,6 +86,21 @@ private:
 
 	TSharedPtr<class SVoxelMainMenu> MenuWidget;
 	TSharedPtr<class SWidget> HourglassShotWidget;
+	TSharedPtr<class SVoxelLoadingScreen> LoadingWidget;
+
+	// --- Loading state ------------------------------------------------------
+	// Frames still to spend painting the curtain before the world starts.
+	int32 ArmFrames = 0;
+	FString PendingEditLogPath;
+	TOptional<FTransform> PendingSpawnTransform;
+	float LoadElapsedSeconds = 0.f;
+	// Never allowed to decrease -- see ComputeProgress.
+	float LastProgress = 0.f;
+	float HandOffSeconds = 0.f;
+	// Offsets from -VoxelLoadingShotAt that have not been captured yet.
+	int32 NextLoadingShotIndex = 0;
+
+	TUniquePtr<class FVoxelWorldReadyProbe> ReadyProbe;
 
 	// The player controller may not exist on the tick OnWorldBeginPlay runs,
 	// so cursor/input-mode/HUD setup is deferred to the first tick that finds

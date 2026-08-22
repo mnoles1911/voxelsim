@@ -99,6 +99,17 @@ FVoxelFrontEndSwitches Parse()
 		S.bAutoStart = true;
 	}
 
+	// -VoxelLoadingShot IMPLIES -VoxelMenuAutoStart. The loading screen only
+	// exists after somebody presses NEW GAME, and an unattended capture run has
+	// nobody to press it -- without this the switch would photograph the main
+	// menu and the watchdog would eventually kill the run, which is a
+	// confusing way to learn you needed a second flag.
+	if (S.bLoadingShot && !S.bAutoStart)
+	{
+		S.bAutoStart = true;
+		S.AutoStartSeconds = 0.5f;
+	}
+
 	S.bNoAssets = FParse::Param(Cmd, TEXT("VoxelUINoAssets"));
 	S.bReadyProbeLog = FParse::Param(Cmd, TEXT("VoxelReadyProbeLog"));
 

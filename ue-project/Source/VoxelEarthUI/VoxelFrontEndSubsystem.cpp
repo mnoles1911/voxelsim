@@ -1,7 +1,9 @@
 #include "VoxelFrontEndSubsystem.h"
 
 #include "SVoxelHourglass.h"
+#include "SVoxelLoadingScreen.h"
 #include "SVoxelMainMenu.h"
+#include "VoxelWorldReadyProbe.h"
 #include "VoxelUIStyle.h"
 #include "VoxelUITheme.h"
 #include "VoxelEarthUI.h"
@@ -24,6 +26,9 @@
 #include "UnrealClient.h"                // FScreenshotRequest
 #include "Kismet/KismetSystemLibrary.h" // QuitGame / EQuitPreference
 #include "Misc/App.h"                    // FApp::IsUnattended for the watchdog
+#include "Misc/DateTime.h"               // the NEW GAME world backup stamp
+#include "Misc/Paths.h"
+#include "HAL/FileManager.h"
 
 namespace VoxelFrontEndDetail
 {
@@ -299,20 +304,32 @@ void UVoxelFrontEndSubsystem::RefreshSaveRows()
 void UVoxelFrontEndSubsystem::RequestNewGame()
 {
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: NEW GAME."));
-	// The loading screen and the hand-off land in a later step. Starting the
-	// world directly here keeps the menu honest in the meantime: the button
-	// does what it says, and the only thing missing is the curtain.
+
+	// THE PORT OF reset_for_new_game(), with one difference. The Godot version
+	// deletes the existing world deltas outright; this renames them aside with
+	// a UTC stamp. A new game genuinely should not inherit the old world's
+	// edits -- but this repository does not silently destroy evidence, and a
+	// player who presses NEW GAME on the wrong menu should be able to get
+	// their world back from the Saved directory rather than from a backup they
+	// did not make.
 	UWorld* World = GetWorld();
 	if (UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
 	{
-		WorldSub->StartWorldSession(FString());
+		const FString DefaultWorld = FPaths::ProjectSavedDir() / TEXT("VoxelWorlds")
+		                             / FString::Printf(TEXT("%llu.vxlog"), (unsigned long long)WorldSub->GetSeed());
+		if (IFileManager::Get().FileExists(*DefaultWorld))
+		{
+			const FString Backup = DefaultWorld + TEXT(".bak-") + FDateTime::UtcNow().ToString(TEXT("%Y%m%d-%H%M%S"));
+			if (IFileManager::Get().Move(*Backup, *DefaultWorld))
+			{
+				UE_LOG(LogVoxelUI, Log, TEXT("NEW GAME: moved the previous world aside to %s."), *Backup);
+			}
+		}
 	}
-	if (AVoxelEarthGameMode* GameMode = World ? World->GetAuthGameMode<AVoxelEarthGameMode>() : nullptr)
-	{
-		GameMode->BeginPlayerSession(nullptr);
-	}
-	TeardownMenu();
-	State = EVoxelFrontEndState::Playing;
+	// No active save: a new game writes to the seed-derived default until the
+	// player names one.
+	VoxelSave::SetActiveSlug(FString());
+	BeginLoad(FString(), nullptr);
 }
 
 void UVoxelFrontEndSubsystem::RequestContinue()
@@ -370,13 +387,7 @@ void UVoxelFrontEndSubsystem::RequestLoad(const FString& Slug)
 	const FTransform SpawnTransform(Info->PlayerRotation, Info->PlayerPosition);
 	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: LOAD %s (%lld edit(s))."), *Slug, (long long)Info->EditCount);
 
-	WorldSub->StartWorldSession(VoxelSave::WorldLogPath(Slug));
-	if (AVoxelEarthGameMode* GameMode = World->GetAuthGameMode<AVoxelEarthGameMode>())
-	{
-		GameMode->BeginPlayerSession(&SpawnTransform);
-	}
-	TeardownMenu();
-	State = EVoxelFrontEndState::Playing;
+	BeginLoad(VoxelSave::WorldLogPath(Slug), &SpawnTransform);
 }
 
 void UVoxelFrontEndSubsystem::RequestDelete(const FString& Slug)
@@ -400,6 +411,214 @@ void UVoxelFrontEndSubsystem::RequestQuit()
 	}
 }
 
+void UVoxelFrontEndSubsystem::BeginLoad(const FString& EditLogPath, const FTransform* SpawnOverride)
+{
+	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
+	if (Viewport == nullptr)
+	{
+		UE_LOG(LogVoxelUI, Error, TEXT("VoxelFrontEnd: no viewport at BeginLoad; starting the world uncovered."));
+		PendingEditLogPath = EditLogPath;
+		PendingSpawnTransform = SpawnOverride ? TOptional<FTransform>(*SpawnOverride) : TOptional<FTransform>();
+		StartWorldAndPawn();
+		State = EVoxelFrontEndState::Playing;
+		return;
+	}
+
+	PendingEditLogPath = EditLogPath;
+	PendingSpawnTransform = SpawnOverride ? TOptional<FTransform>(*SpawnOverride) : TOptional<FTransform>();
+
+	LoadingWidget = SNew(SVoxelLoadingScreen);
+	Viewport->AddViewportWidgetContent(LoadingWidget.ToSharedRef(), VoxelFrontEndDetail::kLoadingZOrder);
+
+	// The menu goes away now, not at hand-off: it is behind an opaque curtain
+	// either way, and leaving it alive would keep its background texture
+	// resident for the whole load.
+	if (MenuWidget.IsValid())
+	{
+		Viewport->RemoveViewportWidgetContent(MenuWidget.ToSharedRef());
+		MenuWidget.Reset();
+	}
+
+	// TWO FRAMES OF PAINTING BEFORE ANY WORK STARTS. This is the port of the
+	// GDScript's two awaited process_frames, and the reason is the same even
+	// though the work is different. There, a synchronous scene load froze the
+	// main thread for 5-8 s and the player stared at a black rectangle. Here
+	// there is no blocking load -- but StartWorldSession's first tick builds
+	// the initial desired set for a whole cascade, which is the single most
+	// expensive frame of the session. Painting the curtain first means the
+	// player sees a loading screen during that frame rather than a frozen
+	// menu.
+	ArmFrames = 2;
+	LoadElapsedSeconds = 0.f;
+	LastProgress = 0.f;
+	NextLoadingShotIndex = 0;
+	State = EVoxelFrontEndState::ArmLoading;
+	StateSeconds = 0.f;
+}
+
+void UVoxelFrontEndSubsystem::StartWorldAndPawn()
+{
+	UWorld* World = GetWorld();
+	UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (WorldSub == nullptr)
+	{
+		UE_LOG(LogVoxelUI, Error, TEXT("VoxelFrontEnd: no voxel world subsystem; cannot start the world."));
+		return;
+	}
+
+	WorldSub->StartWorldSession(PendingEditLogPath);
+	if (AVoxelEarthGameMode* GameMode = World->GetAuthGameMode<AVoxelEarthGameMode>())
+	{
+		GameMode->BeginPlayerSession(PendingSpawnTransform.IsSet() ? &PendingSpawnTransform.GetValue() : nullptr);
+	}
+
+	// The probe rings the spawn column, which is where the anchor override was
+	// already pointed at OnWorldBeginPlay -- so the probes and the streaming
+	// footprint agree from the very first poll rather than a frame later.
+	FVoxelReadyProbeConfig ProbeConfig;
+	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
+	ProbeConfig.GateMaxRingLevel = Switches.LoadGateMaxRing;
+	ProbeConfig.MaxWaitSeconds = Switches.LoadMaxHoldSeconds;
+
+	FVector Anchor = FVector::ZeroVector;
+	if (PendingSpawnTransform.IsSet())
+	{
+		Anchor = PendingSpawnTransform->GetLocation();
+	}
+	else
+	{
+		double SpawnX = 0.0;
+		double SpawnY = 0.0;
+		VoxelEarthSpawn::ParseSpawnColumnUU(SpawnX, SpawnY);
+		Anchor = FVector(SpawnX, SpawnY, WorldSub->GetSurfaceHeightUU(SpawnX, SpawnY));
+	}
+
+	ReadyProbe = MakeUnique<FVoxelWorldReadyProbe>();
+	ReadyProbe->Start(Anchor, ProbeConfig);
+}
+
+float UVoxelFrontEndSubsystem::ComputeProgress() const
+{
+	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
+
+	// THREE TERMS, EACH PREVENTING A SPECIFIC WAY THE BAR LIES.
+	//
+	// The Godot bar was elapsed/total and nothing else -- honest about time,
+	// wrong about work. On a warm cache it read 30% at the moment the world
+	// was ready; on a cold fill it read 100% while chunks were still landing.
+	// Both were visible in that build.
+	const float TimeTerm = Switches.LoadMaxHoldSeconds > 0.f
+	                           ? FMath::Clamp(LoadElapsedSeconds / Switches.LoadMaxHoldSeconds, 0.f, 1.f)
+	                           : 0.f;
+
+	float WorkTerm = 0.f;
+	if (ReadyProbe.IsValid())
+	{
+		const FVoxelReadyProbeStatus& Probe = ReadyProbe->GetStatus();
+		const float SpatialTerm = Probe.ProbeTotal > 0 ? float(Probe.ProbeHits) / float(Probe.ProbeTotal) : 0.f;
+		// Ring fill dominates: it is the term that keeps moving through the
+		// long tail, whereas the spatial term saturates as soon as the ground
+		// under the spawn exists and then says nothing more.
+		WorkTerm = 0.25f * SpatialTerm + 0.75f * Probe.RingFillFraction;
+	}
+
+	// max(): a work bar can sit on one number for tens of seconds while an R3
+	// tail drains, and a bar that never moves reads as a hang.
+	float Raw = FMath::Max(TimeTerm, WorkTerm);
+	// Monotone: RecomputeDesiredSet GROWS the desired set as the anchor
+	// settles, so loaded/(loaded+outstanding) genuinely decreases. A bar that
+	// goes backwards reads as a hang too, and a worse one.
+	Raw = FMath::Max(LastProgress, Raw);
+	// And never 100 until the gate actually passes. TickLoading snaps it to
+	// 1.0 at that moment; until then 100% would be the one lie this whole
+	// model exists to avoid.
+	return FMath::Clamp(Raw, 0.f, 0.995f);
+}
+
+void UVoxelFrontEndSubsystem::TickLoading(float DeltaSeconds)
+{
+	LoadElapsedSeconds += DeltaSeconds;
+
+	UWorld* World = GetWorld();
+	const UVoxelWorldSubsystem* WorldSub = World ? World->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+	if (ReadyProbe.IsValid() && WorldSub != nullptr)
+	{
+		ReadyProbe->Tick(DeltaSeconds, *WorldSub);
+	}
+
+	LastProgress = ComputeProgress();
+	if (LoadingWidget.IsValid())
+	{
+		LoadingWidget->SetProgress(LastProgress);
+	}
+
+	// -VoxelLoadingShotAt=<s,s,s>: capture at each offset in turn. Ordered and
+	// consumed one at a time, so a burst produces one image per offset rather
+	// than one image and two missed shutters.
+	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
+	if (Switches.bLoadingShot && NextLoadingShotIndex < Switches.LoadingShotSeconds.Num()
+	    && LoadElapsedSeconds >= Switches.LoadingShotSeconds[NextLoadingShotIndex])
+	{
+		++NextLoadingShotIndex;
+		if (NextLoadingShotIndex >= Switches.LoadingShotSeconds.Num())
+		{
+			CaptureAndQuit(TEXT("VoxelLoading"));
+		}
+		else
+		{
+			FScreenshotRequest::RequestScreenshot(TEXT("VoxelLoading"), /*bShowUI=*/true, /*bAddFilenameSuffix=*/true);
+			UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: loading screenshot at t=%.2fs (%d of %d)."),
+			       LoadElapsedSeconds, NextLoadingShotIndex, Switches.LoadingShotSeconds.Num());
+		}
+		return;
+	}
+
+	// THE HOLD CONTRACT, ported from TransitionManager._do_transition:
+	// wait at least MinHold, then leave as soon as the world reports ready;
+	// leave regardless at MaxHold. The minimum exists so a warm cache does not
+	// flash the loading screen for a third of a second, which reads as a
+	// glitch rather than as speed.
+	const bool bReady = ReadyProbe.IsValid() && ReadyProbe->IsReady();
+	const bool bTimedOut = ReadyProbe.IsValid() && ReadyProbe->HasTimedOut();
+	if ((LoadElapsedSeconds >= Switches.LoadMinHoldSeconds && bReady) || bTimedOut)
+	{
+		UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: closing the curtain after %.2fs (%s)."), LoadElapsedSeconds,
+		       bReady ? TEXT("world ready") : TEXT("timed out"));
+		LastProgress = 1.f;
+		if (LoadingWidget.IsValid())
+		{
+			LoadingWidget->SetProgress(1.f);
+		}
+		HandOffSeconds = 0.f;
+		State = EVoxelFrontEndState::HandOff;
+	}
+}
+
+void UVoxelFrontEndSubsystem::TickHandOff(float DeltaSeconds)
+{
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+	HandOffSeconds += DeltaSeconds;
+
+	const float Alpha = L.FadeDuration > 0.f ? FMath::Clamp(HandOffSeconds / L.FadeDuration, 0.f, 1.f) : 1.f;
+	if (LoadingWidget.IsValid())
+	{
+		LoadingWidget->SetCurtainOpacity(1.f - Alpha);
+	}
+	if (Alpha < 1.f)
+	{
+		return;
+	}
+
+	// _hide_loading_screen's ordering, which matters: the world is already
+	// rendering underneath by the time the curtain starts fading, so the fade
+	// reveals a live world rather than cutting to one.
+	TeardownMenu();
+	ReadyProbe.Reset();
+	UE_LOG(LogVoxelUI, Log, TEXT("VoxelFrontEnd: handed off to the player."));
+	State = EVoxelFrontEndState::Playing;
+}
+
 void UVoxelFrontEndSubsystem::TeardownMenu()
 {
 	UWorld* World = GetWorld();
@@ -419,6 +638,14 @@ void UVoxelFrontEndSubsystem::TeardownMenu()
 			Viewport->RemoveViewportWidgetContent(HourglassShotWidget.ToSharedRef());
 		}
 		HourglassShotWidget.Reset();
+	}
+	if (LoadingWidget.IsValid())
+	{
+		if (Viewport != nullptr)
+		{
+			Viewport->RemoveViewportWidgetContent(LoadingWidget.ToSharedRef());
+		}
+		LoadingWidget.Reset();
 	}
 	if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)
 	{
@@ -456,6 +683,33 @@ void UVoxelFrontEndSubsystem::Tick(float DeltaTime)
 		{
 			FPlatformMisc::RequestExit(false);
 		}
+		return;
+	}
+
+	if (State == EVoxelFrontEndState::ArmLoading)
+	{
+		// Count DOWN frames, not seconds: the point is that the renderer has
+		// actually presented the curtain, and at 8 FPS two frames is a quarter
+		// of a second while at 200 FPS it is ten milliseconds. Frames are the
+		// unit that means what is intended here.
+		if (--ArmFrames <= 0)
+		{
+			StartWorldAndPawn();
+			LoadElapsedSeconds = 0.f;
+			State = EVoxelFrontEndState::Loading;
+		}
+		return;
+	}
+
+	if (State == EVoxelFrontEndState::Loading)
+	{
+		TickLoading(DeltaTime);
+		return;
+	}
+
+	if (State == EVoxelFrontEndState::HandOff)
+	{
+		TickHandOff(DeltaTime);
 		return;
 	}
 
