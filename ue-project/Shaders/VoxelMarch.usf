@@ -2327,6 +2327,7 @@ void VoxelMarchVerifyIndexMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 //   bit 0     VOXEL_MARCH_RINGS
 //   bits 1-2  VOXEL_MARCH_SKIP_LEVELS
 //   bit 3     VOXEL_MARCH_SOURCE
+//   bits 4-5  VOXEL_MARCH_FALLTHROUGH (the fine->coarse retry depth; 0 = off)
 #define VOXEL_MARCH_VSRC_ARMSTAMP     155u
 // ATTRIBUTION GUARD. Both uncontested branches read the level from the arm that
 // HIT -- FLATONLY is gated on bAOk (so Brk.bHit) and HIERONLY on bBOk (so
@@ -2505,7 +2506,8 @@ void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 		MarchOutVerifySource[VOXEL_MARCH_VSRC_ARMSTAMP] =
 			(uint(VOXEL_MARCH_RINGS != 0) << 0u) |
 			((uint(VOXEL_MARCH_SKIP_LEVELS) & 3u) << 1u) |
-			(uint(VOXEL_MARCH_SOURCE != 0) << 3u);
+			(uint(VOXEL_MARCH_SOURCE != 0) << 3u) |
+			((uint(VOXEL_MARCH_FALLTHROUGH) & 3u) << 4u);
 	}
 
 	// ---- B: THE EARLY-OUT CENSUS -------------------------------------------

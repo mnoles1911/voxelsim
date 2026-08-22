@@ -474,6 +474,36 @@
 #define VOXEL_MARCH_SKIP_LEVELS 0
 #endif
 
+// FINE -> COARSE FALLTHROUGH (Phase 1, the no-hole invariant). How many
+// COARSER levels a ring segment may retry after a miss that crossed a
+// NON-RESIDENT chunk: a missing level-L chunk then renders as level-L+1 detail
+// instead of a hole. 0 = off, and off is BYTE-IDENTICAL to today -- every
+// fallthrough site below is #if'd out, not branched out, for the reason
+// VOXEL_MARCH_RINGS is a permutation: a runtime branch leaves the other arm in
+// the binary and re-bases whatever is being measured.
+//
+// THE GATE IS "NON-RESIDENT", NEVER "INVALID", and the difference is the
+// biggest risk in this change: VoxelMarchLookupChunk answers bValid=false both
+// for "we do not have this chunk" (a hole -- fall through) and for "we have it
+// and it is genuinely EMPTY" (correct air -- falling through would let a
+// coarser level's fatter voxelisation plug cave mouths, doorways, overhangs
+// and the sky above a ridge with rock, a visible regression no counter
+// catches). bResident below carries the distinction.
+//
+// Depth 1 is the intended arm: it delivers "a missing level-0 chunk renders as
+// level-1" at a worst case of two walks per segment. Unbounded depth would be
+// 21 walks per ray against 6 today, and the gate does NOT protect sky rays --
+// sky-band-trimmed chunks above the terrain are LEGITIMATELY non-resident, so
+// a sky ray pays the extra walks at every depth it is allowed. Keep it small
+// and measured.
+//
+// Only VoxelMarchTraverseRings reads this. The shadow and GI marchers pick
+// their level by their own rule, include this file without the define, and
+// compile today's code unchanged.
+#ifndef VOXEL_MARCH_FALLTHROUGH
+#define VOXEL_MARCH_FALLTHROUGH 0
+#endif
+
 #define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
 #define VOXEL_MARCH_HAS_BRICKPOOL 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL || VOXEL_MARCH_VERIFY_SOURCE)
 
@@ -754,6 +784,17 @@ struct FVoxelMarchHit
 	// being ambiguous. entered==0 means the ray never got there; entered set
 	// with no hit means it got there and found nothing. Different findings.
 	uint RingsEntered;
+#if VOXEL_MARCH_FALLTHROUGH > 0
+	// Set by a walk that SKIPPED a chunk which was not merely invalid but NOT
+	// RESIDENT (see FVoxelMarchChunkCache.bResident for the two meanings of
+	// invalid). This is the fallthrough gate: a miss that never crossed absent
+	// ground is a true miss -- everything on the segment was resident air --
+	// and retrying it coarser could only add rock where the fine level proved
+	// air. A miss that DID cross absent ground may be a hole, and the ring
+	// loop retries that segment one level coarser. Zero-initialised with the
+	// rest of the struct by (FVoxelMarchHit)0.
+	bool bCrossedAbsentChunk;
+#endif
 	uint2 FineBrickMask;
 	int3  FineMaskChunk;
 
@@ -1292,6 +1333,20 @@ struct FVoxelMarchChunkCache
 {
 	int3 ChunkCoord;
 	bool bValid;        // resident AND the record agrees with the key
+#if VOXEL_MARCH_FALLTHROUGH > 0
+	// bValid=false COLLAPSES TWO ANSWERS and the fallthrough must not: "not
+	// resident" (a hole -- the stand-in level should be consulted) and
+	// "resident and genuinely empty" (correct air -- consulting a coarser
+	// level would wall up caves and overhangs). True exactly where the walk
+	// can trust "empty means air": the index's resident+anySolid-clear
+	// early-out, the validated record's own anySolid-clear, and a fully valid
+	// lookup. False on every stale/corrupt path (index slot out of bounds,
+	// stride mismatch, origin/level mismatch, brick base out of bounds) --
+	// those chunks are NOT renderable at this level, so a coarse stand-in is
+	// the honest picture there too, matching what the eviction race already
+	// looks like today (index cleared, chunk gone: a hole).
+	bool bResident;
+#endif
 	uint BrickBase;     // first descriptor slot
 	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
 
@@ -1311,6 +1366,9 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 	FVoxelMarchChunkCache C;
 	C.ChunkCoord = int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
 	C.bValid = false;
+#if VOXEL_MARCH_FALLTHROUGH > 0
+	C.bResident = false; // "nothing here" must read as absent, never as empty
+#endif
 	C.BrickBase = 0u;
 	C.BrickSolid = uint2(0u, 0u);
 	// NEUTRAL, NOT ZERO, and the distinction matters for exactly one field: a
@@ -1354,6 +1412,15 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// it is why the bit rides the index dword instead of the record.
 	if ((Entry & VOXEL_MARCH_INDEX_ANYSOLID_BIT) == 0u)
 	{
+#if VOXEL_MARCH_FALLTHROUGH > 0
+		// Resident and empty: REAL AIR, not a hole. Marking it resident is
+		// what stops the fallthrough from plugging a cave mouth with the
+		// coarse level's rock. The record is never validated on this path --
+		// the same trust the skip itself already extends, sound for the same
+		// reason: the full-coverage span is 80 chunks against the index's 128
+		// per axis, so no live chunk can alias this cell.
+		C.bResident = true;
+#endif
 		return C;
 	}
 
@@ -1419,6 +1486,10 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// index's copy is the hint and this one is the truth.
 	if ((LevelAndFlags & 0x10u) == 0u)
 	{
+#if VOXEL_MARCH_FALLTHROUGH > 0
+		// The validated record itself says empty: real air, so no fallthrough.
+		C.bResident = true;
+#endif
 		return C;
 	}
 
@@ -1430,6 +1501,9 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 
 	C.ChunkCoord = ChunkCoord;
 	C.bValid = true;
+#if VOXEL_MARCH_FALLTHROUGH > 0
+	C.bResident = true;
+#endif
 	C.BrickBase = BrickBase;
 	C.BrickSolid = uint2(VoxelBrickChunkTable[Base + 5u], VoxelBrickChunkTable[Base + 6u]);
 	// Wave 2: the shading dwords, from the line this lookup has already paid for.
@@ -1806,6 +1880,15 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		H.HitPosLocalUU = Entry;
 		return H;
 	}
+#if VOXEL_MARCH_FALLTHROUGH > 0
+	// The flat walk reports absent crossings for the same reason the
+	// hierarchical one does -- the comparator runs BOTH arms through
+	// VoxelMarchTraverseRings under one kernel-wide fallthrough depth, and an
+	// arm that never sets the gate would walk a different cascade than the arm
+	// it is graded against. The solid test refreshed Chunk to the voxel just
+	// tested, so the flag reads the same lookup the walk paid for.
+	H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
+#endif
 
 	const float3 d = Exit - Entry;
 	float tMax[3], tDelta[3];
@@ -1861,7 +1944,17 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		++Steps;
 
 		const int3 vNow = int3(v[0], v[1], v[2]);
+#if VOXEL_MARCH_FALLTHROUGH > 0
+		// See the start-voxel site above: same gate, same reason, once per
+		// step on values already in registers. The call is hoisted into a
+		// bool ONLY on this arm so the depth-0 control keeps its original
+		// text, not just its original meaning.
+		const bool bSolidNow = VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat);
+		H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || (!Chunk.bValid && !Chunk.bResident);
+		if (bSolidNow)
+#else
 		if (VoxelMarchBrickSolidAt(vNow, Chunk, Brick, Mat))
+#endif
 		{
 			H.bHit = true;
 			H.Voxel = vNow;
@@ -2427,6 +2520,14 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 		{
 			// 32,768 voxels rejected on one dword. Outside the resident set is
 			// AIR for a renderer -- a hole is visible, a wall is not.
+#if VOXEL_MARCH_FALLTHROUGH > 0
+			// ...and this is the one place a hole is CREATED, so it is where
+			// the fallthrough learns about it. Absent only -- a resident-empty
+			// chunk (bResident) is real air and must not send the ring loop
+			// coarser. One OR per skipped chunk, on values already in
+			// registers.
+			H.bCrossedAbsentChunk = H.bCrossedAbsentChunk || !Chunk.bResident;
+#endif
 			t = tChunkNext;
 			continue;
 		}
@@ -2704,52 +2805,104 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	const float RingHorizLen = length(DirWorld.xy);
 	const float RingTScale = 1.0f / max(RingHorizLen, 1e-4f);
 
+	// SegL PICKS THE t-INTERVAL; WalkL PICKS THE LEVEL WALKED. One variable
+	// used to do both jobs, and that is precisely why the cascade could not
+	// fall through: with the intervals disjoint and consecutive, "advance to
+	// L+1" meant "advance to ground that is FURTHER AWAY", never "re-examine
+	// the same ground at coarser detail". A miss at level 0 over 0-128 m was
+	// followed by level 1 over 128-256 m; nothing ever re-covered 0-128 m, so
+	// a missing level-0 chunk was a hole BY CONSTRUCTION however many coarser
+	// levels held that ground. Splitting the two jobs is the entire fix:
+	// SegIn/SegOut are ray parameters in world UU and are level-independent --
+	// only the InvS rescale into the walk's units changes per WalkL -- so the
+	// same segment can be handed to a coarser walk unmodified.
 	[loop]
-	for (uint L = 0; L < RingCount; ++L)
+	for (uint SegL = 0; SegL < RingCount; ++SegL)
 	{
-		const float SegIn  = max(VoxelMarchRingInnerUU(L) * RingTScale, TMinUU);
-		const float SegOut = min(VoxelMarchRingOuterUU(L) * RingTScale, TMaxUU);
+		const float SegIn  = max(VoxelMarchRingInnerUU(SegL) * RingTScale, TMinUU);
+		const float SegOut = min(VoxelMarchRingOuterUU(SegL) * RingTScale, TMaxUU);
 		if (SegOut <= SegIn)
 		{
 			continue;
 		}
-		EnteredMask |= (1u << L);
+		EnteredMask |= (1u << SegL);
 
-		VoxelMarchBeginLevel(L);
-		// 2^L. The ray goes in divided; the hit comes back multiplied.
-		const float S = float(1u << L);
-		const float InvS = 1.0f / S;
+#if VOXEL_MARCH_FALLTHROUGH > 0
+		// The retry ladder: this segment at its own level first, then up to
+		// VOXEL_MARCH_FALLTHROUGH coarser levels, and ONLY while the previous
+		// walk crossed a non-resident chunk (the gated break at the bottom).
+		// Bounded by the cascade's top -- past RingCount-1 there is nothing
+		// coarser to stand in.
+		const uint LastWalkL = min(SegL + uint(VOXEL_MARCH_FALLTHROUGH), RingCount - 1u);
+		[loop]
+		for (uint WalkL = SegL; WalkL <= LastWalkL; ++WalkL)
+#else
+		// Depth 0: WalkL is a const alias of SegL and the block below is the
+		// pre-fallthrough loop body verbatim -- the byte-identical control.
+		const uint WalkL = SegL;
+#endif
+		{
+			VoxelMarchBeginLevel(WalkL);
+			// 2^L. The ray goes in divided; the hit comes back multiplied.
+			const float S = float(1u << WalkL);
+			const float InvS = 1.0f / S;
 
-		// if/else, not a ternary: HLSL's conditional operator takes numeric
-		// scalars, vectors and matrices only, never a struct.
-		// Armed only where the level matches -- see the note on the signature.
-		const int3 RingWatch = (int(L) == WatchLevel)
-		                           ? WatchChunk
-		                           : int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
-		FVoxelMarchHit H;
-		if (bHierarchical)
-		{
-			H = VoxelMarchTraverseBrickHierWatch(OriginLocalUU * InvS, DirWorld,
-			                                     SegIn * InvS, SegOut * InvS, ConeSlopeUU,
-			                                     RingWatch);
-		}
-		else
-		{
-			H = VoxelMarchTraverseBrick(OriginLocalUU * InvS, DirWorld,
-			                            SegIn * InvS, SegOut * InvS, ConeSlopeUU);
-		}
-		if (H.bHit)
-		{
-			// Back into world units. Voxel and VoxelSizeUU stay in LEVEL-L
-			// terms and H.Level says which -- a level-1 voxel coordinate is not
-			// a level-0 one and silently promoting it would put terrain at half
-			// its size. Consumers read Level.
-			H.THitUU *= S;
-			H.HitPosLocalUU *= S;
-			H.VoxelSizeUU = VOXEL_FLUID_VOXEL_UU * S;
-			H.Level = int(L);
-			H.RingsEntered = EnteredMask;
-			return H;
+			// if/else, not a ternary: HLSL's conditional operator takes numeric
+			// scalars, vectors and matrices only, never a struct.
+			// Armed only where the level matches -- see the note on the
+			// signature. The level WALKED, not the segment: a chunk coordinate
+			// names a different place at each level, and the watch follows the
+			// lookup actually performed.
+			const int3 RingWatch = (int(WalkL) == WatchLevel)
+			                           ? WatchChunk
+			                           : int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
+			FVoxelMarchHit H;
+			if (bHierarchical)
+			{
+				H = VoxelMarchTraverseBrickHierWatch(OriginLocalUU * InvS, DirWorld,
+				                                     SegIn * InvS, SegOut * InvS, ConeSlopeUU,
+				                                     RingWatch);
+			}
+			else
+			{
+				H = VoxelMarchTraverseBrick(OriginLocalUU * InvS, DirWorld,
+				                            SegIn * InvS, SegOut * InvS, ConeSlopeUU);
+			}
+			if (H.bHit)
+			{
+				// Back into world units. Voxel and VoxelSizeUU stay in LEVEL-
+				// WalkL terms and H.Level says which -- a level-1 voxel
+				// coordinate is not a level-0 one and silently promoting it
+				// would put terrain at half its size. Consumers read Level.
+				// WalkL, NOT SegL: under fallthrough a hit can come from a
+				// coarser walk than the segment's owner, and packing it at the
+				// owner's level would draw the stand-in at half its size.
+				// (WalkL > SegL at this return is also the future
+				// `substituted` metric -- "the player is looking at a
+				// stand-in" -- countable here and nowhere else.)
+				H.THitUU *= S;
+				H.HitPosLocalUU *= S;
+				H.VoxelSizeUU = VOXEL_FLUID_VOXEL_UU * S;
+				H.Level = int(WalkL);
+				H.RingsEntered = EnteredMask;
+				return H;
+			}
+#if VOXEL_MARCH_FALLTHROUGH > 0
+			// THE GATE. A miss that crossed no absent chunk is a TRUE miss:
+			// every chunk on the segment was resident (solid parts missed,
+			// empties genuinely empty), so a coarser retry could only add rock
+			// where this level proved air -- cave mouths, doorways, overhangs,
+			// the sky above a ridge. Break, do not retry. A miss that DID
+			// cross absent ground may be a hole, and the next WalkL re-walks
+			// the SAME SegIn/SegOut one level coarser. Note the sky-band trim
+			// makes chunks above the terrain legitimately non-resident, so sky
+			// rays DO take the retries; that is the cost ceiling of the depth,
+			// not a defect of the gate.
+			if (!H.bCrossedAbsentChunk)
+			{
+				break;
+			}
+#endif
 		}
 	}
 	Miss.RingsEntered = EnteredMask;
