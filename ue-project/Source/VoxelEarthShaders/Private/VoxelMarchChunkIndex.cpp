@@ -67,11 +67,13 @@ namespace
 	// two-build comparison here produced a frame-time move nobody could
 	// attribute.
 	TAutoConsoleVariable<int32> CVarVoxelMarchIndexDeltaUpload(
-		TEXT("voxel.March.IndexDeltaUpload"), 0,
-		TEXT("1 = upload only changed chunk-index cells as [cell,value] pairs scattered into the "
-		     "persistent GPU buffer by a small compute pass; 0 (DEFAULT) = today's full 56 MiB "
-		     "staged copy + QueueBufferUpload per flush. A typical flush changes ~9,500 of "
-		     "14.7M cells, so the delta path stages ~74 KiB where the full path stages 56 MiB. "
+		TEXT("voxel.March.IndexDeltaUpload"), 1,
+		TEXT("1 (DEFAULT since 2026-08-23) = upload only changed chunk-index cells as "
+		     "[cell,value] pairs scattered into the persistent GPU buffer by a small compute "
+		     "pass; 0 = the old full 56 MiB staged copy + QueueBufferUpload per flush. "
+		     "A flush was expected to change ~9,500 of 14.7M cells; MEASURED it averages 145 "
+		     "(2,236,670 cells over 15,457 delta uploads on a 30 m/s line leg), so the delta "
+		     "path moved 70.6 MB across a whole flight where the full path moved ~850 GB. "
 		     "The first upload after attach is always full, and Seed/oversized dirty sets fall "
 		     "back to full -- see voxel.March.IndexDeltaMaxCells and GetUploadStats()."),
 		ECVF_RenderThreadSafe);
@@ -119,8 +121,28 @@ namespace
 		     "full upload of the same state would have). Results in GetUploadStats() "
 		     "VerifyPasses/VerifyFailures; a failure logs an Error with both hashes. Only "
 		     "meaningful with voxel.March.IndexDeltaUpload 1. EXPENSIVE (56 MiB readback + "
-		     "~17.5 ms hash per sample); for correctness legs, default 0."),
+		     "~17.5 ms hash per sample); for correctness legs, default 0. "
+		     "BROKEN AS OF 2026-08-23 -- SEE BELOW BEFORE USING."),
 		ECVF_RenderThreadSafe);
+
+	// THE VERIFY GATE CRASHES THE RHI. Arming it took down a leg 28 s in:
+	//
+	//   Assertion failed: Fence->SyncPoints[GPUIndex] == nullptr
+	//   D3D12DirectCommandListManager.cpp:63
+	//   "The fence for the current GPU node has already been issued."
+	//
+	// The single readback is re-enqueued while its previous fence is still
+	// outstanding -- flushes come far faster than a readback completes (15,457
+	// of them in one flight), so "single-buffered is sufficient" does not hold
+	// at the real flush rate. It needs the same multi-slot ring the hole-stats
+	// and shadow-march readbacks use, and a skip when no slot is free.
+	//
+	// Recorded here rather than fixed because the DELTA PATH ITSELF measured
+	// clean without it and is now the default: two legs, holes=0 of ~24,320
+	// scanned in both, frames 12,323 / 12,381 against a control's 8,786 /
+	// 8,049. The gate is what is broken, not the thing it was meant to check --
+	// but that also means the delta path is running UNVERIFIED cell-by-cell,
+	// and closing this is the next correctness job on this file.
 
 	// One thread per changed cell; pairs are deduplicated BY CONSTRUCTION on
 	// the host (built from a TSet keyed by cell), so no two threads in a
