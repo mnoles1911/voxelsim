@@ -1603,12 +1603,337 @@ namespace
 		}
 	}
 
+	// -----------------------------------------------------------------------
+	// voxel.GPU.VerifyBrickStack -- the Tier B.1 gate.
+	//
+	// WHAT IT PROVES. voxel.GPU.WorldGenBatch fuses K Z-sibling chunk jobs
+	// into one tall region and claims the result is bit-identical to K
+	// per-chunk dispatches. VerifyCoarse cannot see that claim (it dispatches
+	// per-chunk shapes and compares against the CPU), so this gate makes the
+	// batched-vs-per-chunk comparison directly: ONE stacked dispatch (32x32
+	// columns, BricksZ = 4K, bPerChunkBrickTotals) against K single-chunk
+	// dispatches over the same ground, comparing
+	//
+	//   columns             (generation, shared by the whole stack)
+	//   every chunk's cells (voxelize, sliced out of the tall layout)
+	//   per-chunk totals    (BrickStackTotalsMain vs K BrickTotalMain runs,
+	//                        plus the region pair vs the per-chunk sums)
+	//   every descriptor    (kind/flag nibbles exact; MIXED offsets equal
+	//                        after subtracting the chunk's batch start)
+	//   every live arena word (occ and mat, the chunk's contiguous run)
+	//
+	// A pass here plus VerifyCoarse's CPU parity is the full chain: per-chunk
+	// == CPU, batched == per-chunk, therefore batched == CPU.
+	//
+	// Runs at level 0 and level 2, because the batched region carries
+	// CoarseScale exactly as a per-chunk one does and a level-only bug (the
+	// D5 window-sizing class) would otherwise hide behind a level-0-only gate.
+	//
+	// Usage: voxel.GPU.VerifyBrickStack [chunks=4]
+	// -----------------------------------------------------------------------
+	void VerifyBrickStackCommand(const TArray<FString>& Args)
+	{
+		if (!VoxelGpuWorldGen::IsSupportedOnCurrentRHI())
+		{
+			UE_LOG(LogVoxelGpuVerify, Error, TEXT("GPU worldgen needs SM6. Relaunch with -sm6."));
+			return;
+		}
+		const int32 NumChunks = (Args.Num() > 0)
+			? FMath::Clamp(FCString::Atoi(*Args[0]), 2, 16) : 4;
+
+		vxc::SyntheticTileSampler Tiles(kSeed);
+		vxc::SyntheticTileSampler CpuTiles(kSeed);
+		vxc::Amplifier CpuAmp(kSeed, CpuTiles);
+
+		constexpr uint32 kCols = 32;          // one render chunk of columns
+		constexpr uint32 kBricksPerChunkZ = 4;
+		constexpr uint32 kBricksPerChunkCount = 64;
+		constexpr uint32 kCellsPerBrick = 512;
+
+		bool bAllOk = true;
+		const int32 Levels[] = { 0, 2 };
+		for (const int32 Level : Levels)
+		{
+			// Chunk-aligned footprint over the origin fixture's ground. -64 in
+			// level-L cells = chunk (-2,-2) at that level; the terrain there is
+			// real (it is the digest fixture's ground at level 0).
+			FVoxelGpuRegionRequest Base;
+			Base.DispatchColumns = FUintVector2(kCols, kCols);
+			Base.OriginVx = -64;
+			Base.OriginVy = -64;
+			Base.Seed = kSeed;
+			Base.CoarseLevel = Level;
+			Base.bMeshChain = false;
+			Base.bBrickPack = true;
+			Base.bReadbackBricks = true;
+			VoxelGpuRegionBuild::FillRasterWindow(Base, Tiles);
+
+			// The surface band, from the CPU columns -- BuildRequest's
+			// derivation over a 32x32 footprint, then aligned DOWN to a whole
+			// chunk so the K-chunk stack straddles the surface (all-air and
+			// all-solid chunks at the ends are wanted: uniform descriptors are
+			// a case the comparison must cover, not avoid).
+			int64 VzMin = MAX_int64;
+			int64 VzMax = MIN_int64;
+			for (uint32 Y = 0; Y < kCols; ++Y)
+			{
+				for (uint32 X = 0; X < kCols; ++X)
+				{
+					const int64 Vx = CoarseRep(int64(Base.OriginVx) + X, Level);
+					const int64 Vy = CoarseRep(int64(Base.OriginVy) + Y, Level);
+					const vxc::ColumnSample C = CpuAmp.column(Vx, Vy);
+					const int64 Top0 = vxc::floorDiv(int64(C.surfaceMm) - vxc::kVoxelSizeMm / 2,
+					                                 vxc::kVoxelSizeMm);
+					const int64 Scale = int64(1) << Level;
+					const int64 Top = vxc::floorDiv(Top0 - Scale / 2, Scale);
+					VzMin = FMath::Min(VzMin, Top);
+					VzMax = FMath::Max(VzMax, Top);
+				}
+			}
+			const int32 ChunkZLo = int32(vxc::floorDiv(vxc::floorDiv(VzMin, 8), int64(kBricksPerChunkZ)));
+
+			// K single-chunk dispatches -- the control arm, the exact shape the
+			// streaming path takes today.
+			TArray<FVoxelGpuRegionResult> Singles;
+			Singles.SetNum(NumChunks);
+			bool bDispatchOk = true;
+			for (int32 C = 0; C < NumChunks; ++C)
+			{
+				FVoxelGpuRegionRequest Req = Base;
+				Req.BrickZMin = (ChunkZLo + C) * int32(kBricksPerChunkZ);
+				Req.BricksZ = kBricksPerChunkZ;
+				Singles[C] = VoxelGpuWorldGen::RunRegionBlocking(Req);
+				if (!Singles[C].bOk)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[brick-stack] L%d single chunk %d dispatch FAILED: %s"),
+					       Level, C, *Singles[C].Error);
+					bDispatchOk = false;
+				}
+			}
+
+			// The one stacked dispatch -- the treatment arm.
+			FVoxelGpuRegionRequest StackReq = Base;
+			StackReq.BrickZMin = ChunkZLo * int32(kBricksPerChunkZ);
+			StackReq.BricksZ = kBricksPerChunkZ * uint32(NumChunks);
+			StackReq.bPerChunkBrickTotals = true;
+			const FVoxelGpuRegionResult Stack = VoxelGpuWorldGen::RunRegionBlocking(StackReq);
+			if (!Stack.bOk)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[brick-stack] L%d stacked dispatch FAILED: %s"), Level, *Stack.Error);
+				bDispatchOk = false;
+			}
+			if (!bDispatchOk)
+			{
+				bAllOk = false;
+				continue;
+			}
+
+			const int32 StackTotalsWant = 2 + 2 * NumChunks;
+			if (Stack.BrickStackTotalsRaw.Num() != StackTotalsWant)
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[brick-stack] L%d: stack totals hold %d dwords, want %d — the ")
+				       TEXT("per-chunk totals pass did not run or did not land"),
+				       Level, Stack.BrickStackTotalsRaw.Num(), StackTotalsWant);
+				bAllOk = false;
+				continue;
+			}
+
+			// Region pair vs per-chunk sums -- the same cross-check every live
+			// batch makes at harvest, taken here where a failure names the gate
+			// instead of a flight leg.
+			uint64 SumOcc = 0;
+			uint64 SumMat = 0;
+			for (int32 C = 0; C < NumChunks; ++C)
+			{
+				SumOcc += Stack.BrickStackTotalsRaw[2 + 2 * C];
+				SumMat += Stack.BrickStackTotalsRaw[3 + 2 * C];
+			}
+			if (SumOcc != uint64(Stack.BrickStackTotalsRaw[0]) ||
+			    SumMat != uint64(Stack.BrickStackTotalsRaw[1]))
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[brick-stack] L%d: per-chunk sums (%llu, %llu) != region pair (%u, %u)"),
+				       Level, SumOcc, SumMat,
+				       Stack.BrickStackTotalsRaw[0], Stack.BrickStackTotalsRaw[1]);
+				bAllOk = false;
+				continue;
+			}
+
+			// Columns: the stack's 32x32 columns serve every chunk; each single
+			// dispatch derived the identical set.
+			int32 ColumnMismatches = 0;
+			for (int32 C = 0; C < NumChunks; ++C)
+			{
+				if (Singles[C].Columns.Num() != Stack.Columns.Num() ||
+				    FMemory::Memcmp(Singles[C].Columns.GetData(), Stack.Columns.GetData(),
+				                    Stack.Columns.Num() * sizeof(FVoxelGpuColumnSample)) != 0)
+				{
+					++ColumnMismatches;
+				}
+			}
+
+			// Cells, descriptors and arena words, chunk by chunk. The stack's
+			// cell layout is the tall region's ((bx + 4*by) * 4K + (4*c + bz))
+			// against the single's ((bx + 4*by) * 4 + bz); the descriptor and
+			// word comparisons subtract the chunk's batch start, which is what
+			// the pool's desc-write pass does with the same numbers.
+			int32 CellMismatches = 0;
+			int32 DescMismatches = 0;
+			int32 WordMismatches = 0;
+			int32 TotalsMismatches = 0;
+			uint32 OccStart = 0;
+			uint32 MatStart = 0;
+			const uint32 StackBricksZ = kBricksPerChunkZ * uint32(NumChunks);
+			for (int32 C = 0; C < NumChunks; ++C)
+			{
+				const FVoxelGpuRegionResult& Single = Singles[C];
+				const uint32 OccTot = Stack.BrickStackTotalsRaw[2 + 2 * C];
+				const uint32 MatTot = Stack.BrickStackTotalsRaw[3 + 2 * C];
+				if (Single.BrickTotalsRaw.Num() != 2 ||
+				    Single.BrickTotalsRaw[0] != OccTot || Single.BrickTotalsRaw[1] != MatTot)
+				{
+					++TotalsMismatches;
+				}
+
+				for (uint32 By = 0; By < 4; ++By)
+				{
+					for (uint32 Bx = 0; Bx < 4; ++Bx)
+					{
+						for (uint32 Bz = 0; Bz < kBricksPerChunkZ; ++Bz)
+						{
+							const uint32 SingleBrick = (Bx + 4 * By) * kBricksPerChunkZ + Bz;
+							const uint32 StackBrick =
+								(Bx + 4 * By) * StackBricksZ + (uint32(C) * kBricksPerChunkZ + Bz);
+							if (FMemory::Memcmp(
+									Single.Cells.GetData() + SingleBrick * kCellsPerBrick,
+									Stack.Cells.GetData() + StackBrick * kCellsPerBrick,
+									kCellsPerBrick * sizeof(uint32)) != 0)
+							{
+								++CellMismatches;
+							}
+						}
+					}
+				}
+
+				for (uint32 J = 0; J < kBricksPerChunkCount; ++J)
+				{
+					const uint32 SingleX = Single.BrickDescRaw[J * 2 + 0];
+					const uint32 SingleY = Single.BrickDescRaw[J * 2 + 1];
+					const uint32 StackX =
+						Stack.BrickDescRaw[(uint32(C) * kBricksPerChunkCount + J) * 2 + 0];
+					const uint32 StackY =
+						Stack.BrickDescRaw[(uint32(C) * kBricksPerChunkCount + J) * 2 + 1];
+					const uint32 Kind = (StackX >> 28u) & 3u;
+					bool bDescOk;
+					if (Kind == 2u)   // MIXED: offsets are relative to their own buffer
+					{
+						bDescOk = ((StackX >> 28u) == (SingleX >> 28u)) &&
+						          ((StackY >> 28u) == (SingleY >> 28u)) &&
+						          ((StackX & 0x0fffffffu) - OccStart == (SingleX & 0x0fffffffu)) &&
+						          ((StackY & 0x0fffffffu) - MatStart == (SingleY & 0x0fffffffu));
+					}
+					else
+					{
+						bDescOk = (StackX == SingleX) && (StackY == SingleY);
+					}
+					if (!bDescOk)
+					{
+						++DescMismatches;
+					}
+				}
+
+				// Bounds BEFORE the compares: the totals under test are the
+				// very numbers that size these reads, so a corrupt total must
+				// fail the gate, not walk it off the end of a readback array.
+				const bool bRunsInBounds =
+					int64(OccStart) + OccTot <= Stack.BrickOccRaw.Num() &&
+					int64(MatStart) + MatTot <= Stack.BrickMatRaw.Num() &&
+					int64(OccTot) <= Single.BrickOccRaw.Num() &&
+					int64(MatTot) <= Single.BrickMatRaw.Num();
+				if (!bRunsInBounds)
+				{
+					UE_LOG(LogVoxelGpuVerify, Error,
+					       TEXT("[brick-stack] L%d chunk %d: totals name arena runs outside the ")
+					       TEXT("readback (occ %u@%u of %d, mat %u@%u of %d)"),
+					       Level, C, OccTot, OccStart, Stack.BrickOccRaw.Num(),
+					       MatTot, MatStart, Stack.BrickMatRaw.Num());
+					++WordMismatches;
+				}
+				else
+				{
+					if (OccTot > 0 &&
+					    FMemory::Memcmp(Single.BrickOccRaw.GetData(),
+					                    Stack.BrickOccRaw.GetData() + OccStart,
+					                    OccTot * sizeof(uint32)) != 0)
+					{
+						++WordMismatches;
+					}
+					if (MatTot > 0 &&
+					    FMemory::Memcmp(Single.BrickMatRaw.GetData(),
+					                    Stack.BrickMatRaw.GetData() + MatStart,
+					                    MatTot * sizeof(uint32)) != 0)
+					{
+						++WordMismatches;
+					}
+				}
+
+				OccStart += OccTot;
+				MatStart += MatTot;
+			}
+
+			const bool bLevelOk = ColumnMismatches == 0 && CellMismatches == 0 &&
+			                      DescMismatches == 0 && WordMismatches == 0 &&
+			                      TotalsMismatches == 0;
+			bAllOk &= bLevelOk;
+			if (bLevelOk)
+			{
+				UE_LOG(LogVoxelGpuVerify, Log,
+				       TEXT("[brick-stack] L%d PASS — %d chunks (z %d..%d): all comparisons clean"),
+				       Level, NumChunks, ChunkZLo, ChunkZLo + NumChunks - 1);
+			}
+			else
+			{
+				UE_LOG(LogVoxelGpuVerify, Error,
+				       TEXT("[brick-stack] L%d FAIL — %d chunks (z %d..%d): column mismatches %d, ")
+				       TEXT("cell-brick %d, desc %d, arena-run %d, totals %d"),
+				       Level, NumChunks, ChunkZLo, ChunkZLo + NumChunks - 1,
+				       ColumnMismatches, CellMismatches, DescMismatches, WordMismatches,
+				       TotalsMismatches);
+			}
+		}
+
+		if (bAllOk)
+		{
+			UE_LOG(LogVoxelGpuVerify, Log,
+			       TEXT("[brick-stack] PASS — batched stack region vs per-chunk dispatches, %d ")
+			       TEXT("chunks, levels 0 and 2. Chained with voxel.GPU.VerifyCoarse (per-chunk == ")
+			       TEXT("CPU) this proves the batched path bit-exact against the CPU generator."),
+			       NumChunks);
+		}
+		else
+		{
+			UE_LOG(LogVoxelGpuVerify, Error,
+			       TEXT("[brick-stack] FAIL — the batched stack path does not reproduce the ")
+			       TEXT("per-chunk bytes. Do NOT arm voxel.GPU.WorldGenBatch until this passes."));
+		}
+	}
+
 	FAutoConsoleCommand GVoxelGpuVerifyCoarseCmd(
 		TEXT("voxel.GPU.VerifyCoarse"),
 		TEXT("D5: byte-compare GPU coarse generation against vxc::coarseColumns + makeCoarseBrick, ")
 		TEXT("level by level, stopping at the first failure. Does NOT touch the pinned level-0 ")
 		TEXT("digest. Usage: [maxLevel=5]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyCoarseCommand));
+
+	FAutoConsoleCommand GVoxelGpuVerifyBrickStackCmd(
+		TEXT("voxel.GPU.VerifyBrickStack"),
+		TEXT("Tier B.1: byte-compare ONE batched K-chunk stack region against K per-chunk brick ")
+		TEXT("dispatches over the same ground (columns, cells, descriptors, arena words, totals), ")
+		TEXT("at levels 0 and 2. Usage: [chunks=4]"),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&VerifyBrickStackCommand));
 
 	FAutoConsoleCommand GVoxelGpuFindBandFixtureCmd(
 		TEXT("voxel.GPU.FindBandFixture"),

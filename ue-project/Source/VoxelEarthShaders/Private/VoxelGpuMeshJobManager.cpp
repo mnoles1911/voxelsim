@@ -172,6 +172,122 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshLatencyStats(
 	TEXT("so no thread-safety concern reading this cvar directly where it is checked."),
 	ECVF_Default);
 
+// --- Tier B.1: amortise the worldgen/pack passes across Z-sibling chunks ----
+//
+// THE PROBLEM THIS REMOVES, in the numbers that forced it. Every brick-only
+// job costs its own region graph: ~12 compute passes plus a readback copy for
+// the brick chain, all of it render-thread pass setup that is FIXED PER CHUNK.
+// That fixed cost, not ALU and not bandwidth, is the ceiling --
+// voxel.GPU.MeshBatchCap's own comment records the sweep that proved it (32/64
+// gave 367 hitches / 77.2k chunks against 4/8's 8 / 89.4k: bigger bursts of
+// per-chunk graphs are WORSE). So the fix is not a bigger cap; it is making
+// the pass count constant in the number of chunks.
+//
+// WHAT THE BATCHED SHAPE IS. Streaming demand arrives as vertical COLUMN
+// STACKS -- the derivation in docs/marcher-handoff-2026-08-22.md gives 8.3
+// level-0 chunks per column, and the CPU-side finding that "the 8-16
+// Z-siblings rebuild the same column grid identically" has an exact GPU twin:
+// each sibling's ColumnMain re-derives the same 32x32 columns. So the batch
+// unit is a CONTIGUOUS Z-RUN of same-column brick-only jobs, fused into ONE
+// tall region (32x32 columns, BricksZ = 4K) and dispatched through the SAME
+// AddRegionPasses the per-chunk path uses. No generation kernel changed:
+// worldgen.ush reads its per-region scalars only at kernel entry, and
+// brickpack.ush's decodeBrick already decomposes a multi-chunk region
+// chunk-major -- the batched region is a shape the kernels were built for and
+// the streaming path simply never sent. K chunks then cost ONE Column, ONE
+// Voxelize (with the per-column cave/cavern reductions done once per stack
+// instead of once per chunk), ONE classify, ONE set of scans, ONE pack, and
+// ONE (2+2K)-dword totals readback: ~14 passes per stack against ~15 PER
+// CHUNK before.
+//
+// WHAT IT DOES NOT DO. The pool flush still writes per chunk (2 word copies +
+// desc write + record, ~4 small passes each) -- that is the remaining linear
+// term, kept because per-chunk pool allocations are not contiguous and fusing
+// those writes needs new kernels over a per-chunk table, a separate change
+// with its own gate. And it does NOT reintroduce a readback: the only bytes
+// that cross PCIe per stack are the (2+2K)-dword totals -- fewer than the K
+// separate 2-dword readbacks they replace.
+//
+// BIT-EXACTNESS IS BY CONSTRUCTION, THEN CHECKED ANYWAY. Same kernels, same
+// per-world-coordinate inputs (sibling raster windows are verified IDENTICAL
+// before grouping, not assumed), so per-chunk cells are the same bytes; the
+// chunk-major pack order makes each chunk's arena run contiguous and
+// internally identical to a single-chunk dispatch. voxel.GPU.VerifyCoarse is
+// untouched and still proves the kernels against the CPU; the new
+// voxel.GPU.VerifyBrickStack proves batched == per-chunk on columns, cells,
+// descriptors, arena words and totals; and EVERY live stack cross-checks
+// sum(per-chunk totals) == region totals at harvest, failing the whole stack
+// loudly rather than publishing a wrong split.
+//
+// DEFAULT 0: the control graph is byte-identical with the switch off, which
+// is what makes the A/B one flag on one binary. Command-line override for
+// VoxelGpuBrickPackEnabled's -ExecCmds startup-window reason; the CVAR is
+// also honoured mid-run because a flip cannot corrupt anything -- both paths
+// produce the same bytes, so the only residue of a mid-run flip is in the
+// stats, not the world.
+static int32 GVoxelGpuWorldGenBatch = 0;
+static FAutoConsoleVariableRef CVarVoxelGpuWorldGenBatch(
+	TEXT("voxel.GPU.WorldGenBatch"),
+	GVoxelGpuWorldGenBatch,
+	TEXT("1 = fuse contiguous Z-sibling brick-only mesh jobs into one tall region per column ")
+	TEXT("stack: ONE set of worldgen+pack passes and ONE totals readback for K chunks, instead ")
+	TEXT("of K of each. 0 (default) = today's per-chunk graphs, byte-identical. Outputs are ")
+	TEXT("bit-exact either way (gate: voxel.GPU.VerifyBrickStack); read once per Tick."),
+	ECVF_Default);
+
+bool VoxelGpuWorldGenBatchEnabled()
+{
+	// -VoxelGpuWorldGenBatch=<n> outranks the cvar, for the reason recorded on
+	// VoxelGpuBrickPackEnabled: -ExecCmds cvars land after streaming has
+	// begun. Here that is a STATS blemish rather than a correctness one (the
+	// two paths emit identical bytes), but a leg whose counters cover only
+	// half the run is still a leg someone will misread.
+	static const int32 CmdLine = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorldGenBatch="), Value);
+		return Value;
+	}();
+	return CmdLine >= 0 ? CmdLine != 0 : GVoxelGpuWorldGenBatch != 0;
+}
+
+namespace VoxelGpuBatchDetail
+{
+	// Longest Z-run one stack may fuse. NOT a correctness bound -- validation
+	// allows 1,024 chunks (the 65,536-brick single-workgroup scan ceiling) --
+	// but a transient-memory and pass-duration one: the stack's Cells scratch
+	// is 128 KiB per chunk (32x32x32 cells x 4 B), so 64 caps it at 8 MiB,
+	// and a real column stack is 8-16 chunks anyway. Raising it is safe;
+	// measure hitches when you do.
+	constexpr int32 kMaxStackChunks = 64;
+
+	// Pass-count constants for the window counters. DERIVED FROM THE CODE
+	// SHAPE, NOT COUNTED AT THE AddPass SITES -- if AddRegionPasses grows or
+	// loses a pass, update these with it (they are the only two places the
+	// counter can lie).
+	//
+	// Stack: Column, Voxelize, mask clear, BrickClassify, 3+3 scans,
+	// BrickPack, BrickTotal, BrickStackTotals = 13 compute + 1 readback copy.
+	constexpr int32 kPassesPerStackDispatch = 14;
+	// Classic brick-only job: its 48x48x6 mesh region still adds Column +
+	// Voxelize (nothing reads them; RDG may cull, counted anyway because they
+	// are recorded), then the halo-free brick region's 12, then the 2-dword
+	// totals copy.
+	constexpr int32 kPassesPerClassicBrickJob = 15;
+	// Classic quad-mesh job (RetireQuads 0): 7 mesh-chain passes + quad total
+	// + copies; nominal.
+	constexpr int32 kPassesPerClassicQuadJob = 12;
+
+	// Crosscheck counters. File-scope atomics rather than manager members
+	// because they are incremented on the RENDER thread inside poll commands
+	// that deliberately do not capture `this` (the manager may be destroyed
+	// with commands still in flight). One manager exists in practice; if a
+	// second ever does, these become a shared total, which for a pass/fail
+	// tally is still the right read.
+	static std::atomic<int32> GCrosscheckPass{ 0 };
+	static std::atomic<int32> GCrosscheckFail{ 0 };
+}
+
 // Defined here rather than in a file of its own because this is the only place
 // that CREATES one, and because the release it performs is the mirror of
 // ReleaseReadbacksOnRenderThread below -- the two should be read together.
@@ -360,6 +476,60 @@ namespace
 	};
 }
 
+// One batched column stack (Tier B.1, voxel.GPU.WorldGenBatch): the shared
+// half of K Z-sibling jobs that were fused into a single tall region dispatch.
+//
+// OWNERSHIP. Built on the game thread during Tick's grouping, then read-only
+// there; the render thread creates the readback in DispatchBatch and is the
+// only thread that ever touches Totals / bHarvested / bFailed (poll commands
+// run serially on the render thread, so plain fields suffice -- the same
+// single-writer argument FJob's staging arrays rely on). Members publish their
+// per-chunk numbers into their OWN FJob fields before the release-store that
+// moves their state, which is the fence Deliver()'s game-thread reads pair
+// with.
+//
+// EXACTLY-ONCE IS UNTOUCHED: the stack is shared STATE, not a shared OUTCOME.
+// Every member job still delivers its own result exactly once through the
+// same states as before; the stack only replaces K private 2-dword readbacks
+// with one (2+2K)-dword readback they all harvest from.
+struct FVoxelGpuBrickStack
+{
+	// The fused region: bottom member's brick region with BricksZ = 4K and
+	// bPerChunkBrickTotals set. Validated at grouping time, before any member
+	// is pointed at this object.
+	FVoxelGpuRegionRequest Region;
+	int32 NumChunks = 0;
+
+	// Created and used on the render thread; released there too (see ~).
+	TUniquePtr<FRHIGPUBufferReadback> TotalsReadback;
+
+	// RENDER THREAD ONLY. [0]=region occ, [1]=region mat, then per chunk c:
+	// [2+2c]=occ, [3+2c]=mat -- BrickStackTotalsMain's layout, verbatim.
+	TArray<uint32> Totals;
+	bool bHarvested = false;
+	// Set on harvest failure OR on the sum-vs-region cross-check failing; every
+	// member that polls afterwards fails with Error instead of publishing a
+	// volume built from a split the GPU disagrees with.
+	bool bFailed = false;
+	FString Error;
+
+	~FVoxelGpuBrickStack()
+	{
+		// The readback wraps RHI staging memory; free it in render-thread
+		// order behind any command still touching it -- FVoxelGpuBrickPayload's
+		// destructor argument, verbatim. Raw-pointer capture because
+		// TUniquePtr is move-only and the command only needs to delete.
+		if (FRHIGPUBufferReadback* Readback = TotalsReadback.Release())
+		{
+			ENQUEUE_RENDER_COMMAND(VoxelGpuBrickStackRelease)(
+				[Readback](FRHICommandListImmediate&)
+			{
+				delete Readback;
+			});
+		}
+	}
+};
+
 struct FVoxelGpuMeshJobManager::FJob
 {
 	uint64 JobId = 0;
@@ -439,6 +609,14 @@ struct FVoxelGpuMeshJobManager::FJob
 	// scratch arenas and the L1 mask. Handed to the pool (and to the result) on
 	// the game thread at delivery.
 	FVoxelGpuBrickPayloadRef BrickPayload;
+
+	// Tier B.1: non-null iff this job was fused into a batched column stack.
+	// StackChunkIndex is the job's z-slot inside it (0 = bottom), which is
+	// simultaneously decodeBrick's chunkIndex, the L1-mask index, and the
+	// descriptor slice [64*idx, 64*idx+64) -- one number, three contracts,
+	// and BrickStackTotalsMain's layout is keyed on the same one.
+	TSharedPtr<FVoxelGpuBrickStack, ESPMode::ThreadSafe> BrickStack;
+	int32 StackChunkIndex = INDEX_NONE;
 
 	// Wave D / D1. Non-null once the direct path has taken this job's quads.
 	// Constructed on the game thread holding QuadBuffer (so the payload is
@@ -559,6 +737,12 @@ namespace
 				// behaviour and it is why the payload is reference-counted rather
 				// than a raw handle.
 				Job->QuadBuffer.SafeRelease();
+				// Tier B.1: drop this job's share of its stack (if any) here on
+				// the render thread. The last share freed destroys the stack,
+				// whose destructor hands the readback to a render command --
+				// so the thread the LAST holder happens to die on never
+				// matters, same discipline as the payloads.
+				Job->BrickStack.Reset();
 			}
 		});
 	}
@@ -629,6 +813,176 @@ namespace
 			}
 		}
 		return Rebased;
+	}
+
+	// --- Tier B.1 grouping predicates --------------------------------------
+
+	// A job the batched path can take at all: brick-only, band-less,
+	// asset-less. Each exclusion is a counted fallback, not a rejection --
+	// the job dispatches through the classic per-chunk path exactly as it
+	// would with the switch off.
+	//
+	//   quads   -- a quad-mesh job needs its 48x48x6 halo region per chunk
+	//              anyway, so fusing only its brick half would complicate two
+	//              paths to amortise neither.
+	//   band    -- one job per (X,Y) footprint carries the band request, and
+	//              the band rides the mesh region. That job goes classic; its
+	//              K-1 siblings still stack, so a column loses one member,
+	//              not the batch.
+	//   assets  -- instances index per-REQUEST span tables (ColStartsBase);
+	//              merging tables across requests is a rebase this build does
+	//              not attempt. Mostly surface chunks; the counter says how
+	//              much it costs.
+	bool IsStackableBrickJob(const FVoxelGpuMeshJobManager::FJob& Job)
+	{
+		return Job.bBrickPack
+			&& !Job.bQuadMesh
+			&& Job.Region.BandEdge == 0
+			&& Job.BrickRegion.AssetInstances.Num() == 0;
+	}
+
+	// Same vertical column at the same ring level -- the necessary condition.
+	bool SameBrickColumn(const FVoxelGpuMeshJobManager::FJob& A,
+	                     const FVoxelGpuMeshJobManager::FJob& B)
+	{
+		return A.BrickKey.X == B.BrickKey.X
+			&& A.BrickKey.Y == B.BrickKey.Y
+			&& A.BrickKey.Level == B.BrickKey.Level;
+	}
+
+	// The sufficient condition: the sibling would have dispatched over the
+	// SAME inputs the stack will use. The raster arrays are memcmp'd, not
+	// trusted: sibling windows are filled by the same caller from the same
+	// tiles and SHOULD be identical, but a window filled while a fine tile was
+	// still decoding comes from the coarse fallback (the residency-gating
+	// lesson on FootprintChunkZRangeCached), and a stack built on the head's
+	// window would then hand that sibling terrain generated from data it was
+	// never given. Bit-exactness is the promise; the memcmp is what makes it
+	// a property instead of a hope. Cost: the windows are tens of pixels.
+	bool CompatibleForStack(const FVoxelGpuMeshJobManager::FJob& Head,
+	                        const FVoxelGpuMeshJobManager::FJob& Cand)
+	{
+		const FVoxelGpuRegionRequest& H = Head.BrickRegion;
+		const FVoxelGpuRegionRequest& C = Cand.BrickRegion;
+		if (H.Seed != C.Seed || H.CoarseLevel != C.CoarseLevel ||
+		    H.PixelSizeMm != C.PixelSizeMm ||
+		    H.RasterOriginPx != C.RasterOriginPx || H.RasterSize != C.RasterSize ||
+		    H.ElevationMm.Num() != C.ElevationMm.Num() ||
+		    H.ClimatePacked.Num() != C.ClimatePacked.Num())
+		{
+			return false;
+		}
+		if (H.ElevationMm.Num() > 0 &&
+		    FMemory::Memcmp(H.ElevationMm.GetData(), C.ElevationMm.GetData(),
+		                    H.ElevationMm.Num() * sizeof(int32)) != 0)
+		{
+			return false;
+		}
+		if (H.ClimatePacked.Num() > 0 &&
+		    FMemory::Memcmp(H.ClimatePacked.GetData(), C.ClimatePacked.GetData(),
+		                    H.ClimatePacked.Num() * sizeof(uint32)) != 0)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	// --- Tier B.1: the fused dispatch --------------------------------------
+	//
+	// ONE AddRegionPasses call for the whole stack -- the same function, the
+	// same kernels, the same event names the per-chunk path records, over a
+	// region that is simply K chunks tall. Members' 48x48x6 mesh regions are
+	// NOT dispatched: a stackable job is brick-only and band-less, so that
+	// region's outputs feed nothing (no readback references them; RDG culls
+	// unreferenced passes, and skipping the recording removes even the setup).
+	// Either way nothing observable changes, which is what lets the control
+	// leg stay byte-identical.
+	void AddBrickStackPasses(FRDGBuilder& GraphBuilder, const TArray<FJobPtr>& Members,
+	                         TArray<FJobPtr>& Built)
+	{
+		if (Members.Num() == 0 || !Members[0]->BrickStack.IsValid())
+		{
+			return;
+		}
+		const TSharedPtr<FVoxelGpuBrickStack, ESPMode::ThreadSafe> Stack = Members[0]->BrickStack;
+
+		bool bAnyLive = false;
+		for (const FJobPtr& Member : Members)
+		{
+			bAnyLive |= Member->Abandoned.load(std::memory_order_acquire) == 0;
+		}
+		if (!bAnyLive)
+		{
+			// Every member was cancelled between promote and this command;
+			// they have already been delivered. Nothing to generate for.
+			return;
+		}
+
+		// A scope, for the BrickRegion scope's reason: the stack runs the same
+		// event names as everything else, and a ProfileGPU capture must be able
+		// to attribute the fused cost to the fusion.
+		RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickStack(%d chunks)", Stack->NumChunks);
+
+		const VoxelGpuWorldGen::FRegionGraphResources Graph =
+			VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Stack->Region);
+
+		if (Graph.BrickDesc == nullptr || Graph.BrickOcc == nullptr ||
+		    Graph.BrickMat == nullptr || Graph.BrickChunkMask == nullptr ||
+		    Graph.BrickStackTotals == nullptr)
+		{
+			// Unlike the classic path, where a brick failure leaves a mesh half
+			// to deliver, a stack member is brick-only: no volume means the job
+			// produced nothing, and saying so is what routes the streaming path
+			// to its CPU fallback instead of stranding the column.
+			for (const FJobPtr& Member : Members)
+			{
+				Member->Error = TEXT("batched stack region produced no brick buffers");
+				Member->SetState(EJobState::Failed);
+			}
+			return;
+		}
+
+		// ONE set of external buffers, referenced by every member's payload.
+		// Each payload holds its own TRefCountPtr, so the scratch lives until
+		// the LAST member's pool write has consumed its slice, and dying
+		// members simply drop their share -- no per-stack lifetime bookkeeping.
+		const TRefCountPtr<FRDGPooledBuffer> Desc = GraphBuilder.ConvertToExternalBuffer(Graph.BrickDesc);
+		const TRefCountPtr<FRDGPooledBuffer> Occ = GraphBuilder.ConvertToExternalBuffer(Graph.BrickOcc);
+		const TRefCountPtr<FRDGPooledBuffer> Mat = GraphBuilder.ConvertToExternalBuffer(Graph.BrickMat);
+		const TRefCountPtr<FRDGPooledBuffer> Mask = GraphBuilder.ConvertToExternalBuffer(Graph.BrickChunkMask);
+		const uint32 BricksPerChunk = Graph.Sizes.NumBricks / uint32(Stack->NumChunks);
+
+		for (const FJobPtr& Member : Members)
+		{
+			if (Member->Abandoned.load(std::memory_order_acquire) != 0)
+			{
+				continue;
+			}
+			Member->BrickPayload = MakeShared<FVoxelGpuBrickPayload, ESPMode::ThreadSafe>();
+			Member->BrickPayload->Desc = Desc;
+			Member->BrickPayload->Occ = Occ;
+			Member->BrickPayload->Mat = Mat;
+			Member->BrickPayload->ChunkMask = Mask;
+			// The three faces of StackChunkIndex -- descriptor slice, L1-mask
+			// slot, totals slot -- are all keyed on decodeBrick's chunk-major
+			// order, which for a 1x1xK region is ascending z from the region
+			// floor. Grouping sorted members by BrickKey.Z, so index i IS
+			// chunk i of the dispatch.
+			Member->BrickPayload->SrcBrickFirst = uint32(Member->StackChunkIndex) * BricksPerChunk;
+			Member->BrickPayload->SrcChunkIndex = uint32(Member->StackChunkIndex);
+			Member->BrickPayload->BrickCount = BricksPerChunk;
+			Member->BrickPayload->OriginVoxel = Member->BrickOriginVoxel;
+			// SrcOccFirst/SrcMatFirst stay 0 until the totals land -- they are
+			// prefix sums of the per-chunk totals, filled at harvest.
+			Built.Add(Member);
+		}
+
+		// The one readback of the whole stack: (2 + 2K) dwords of SIZES. The
+		// geometry itself never comes back -- the same no-readback property
+		// the per-chunk brick path has, one buffer wider.
+		Stack->TotalsReadback = MakeUnique<FRHIGPUBufferReadback>(TEXT("Voxel.Async.BrickStackTotals"));
+		AddEnqueueCopyPass(GraphBuilder, Stack->TotalsReadback.Get(), Graph.BrickStackTotals,
+		                   (2u + 2u * uint32(Stack->NumChunks)) * sizeof(uint32));
 	}
 }
 
@@ -898,6 +1252,21 @@ void FVoxelGpuMeshJobManager::Tick()
 	// generation ceiling, and it had exactly one number.
 	const double TickStage0 = FPlatformTime::Seconds();
 
+	// Tier B.1. Latched once per tick so one tick behaves like one tick; safe
+	// to flip mid-run because both paths emit identical bytes (the residue of
+	// a flip is in the stats, never the world).
+	const bool bBatchArmed = VoxelGpuWorldGenBatchEnabled();
+	if (bBatchArmed && !bBatchArmingLogged)
+	{
+		bBatchArmingLogged = true;
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-batch] voxel.GPU.WorldGenBatch ARMED: contiguous Z-sibling brick-only ")
+		       TEXT("jobs fuse into one tall region per column stack (cap %d chunks/stack). ")
+		       TEXT("Window counters follow every ~5 s; zero stacks with nonzero fallbacks means ")
+		       TEXT("the feature is running and DECLINING, with the reasons in the line."),
+		       VoxelGpuBatchDetail::kMaxStackChunks);
+	}
+
 	// --- 1. promote queued jobs, one RDG graph for the whole batch ----------
 	//
 	// Rejections are collected rather than delivered inline, for the same
@@ -945,6 +1314,9 @@ void FVoxelGpuMeshJobManager::Tick()
 
 	TArray<FJobPtr> Batch;
 	TArray<TPair<FJobPtr, FString>> Rejected;
+	// Tier B.1: per promoted stackable head, the head plus every Z-sibling
+	// swept out of the same queue. Turned into fused stacks after the loop.
+	TArray<TArray<FJobPtr>> StackSweeps;
 	int32 DemandPromoted = 0;
 	int32 LowPriorityPromoted = 0;
 	while (InFlight.Num() + Batch.Num() < MaxInFlight)
@@ -1018,6 +1390,174 @@ void FVoxelGpuMeshJobManager::Tick()
 		// not loop iterations" behaviour for demand exactly as before.
 		if (bTakeLowPriority) { ++LowPriorityPromoted; } else { ++DemandPromoted; }
 		Batch.Add(MoveTemp(Job));
+
+		// --- Tier B.1: sweep this head's Z-siblings out of the same queue ---
+		//
+		// THE CAP SEMANTICS CHANGE IS THE FEATURE. BatchCap exists to bound
+		// per-tick GRAPH SETUP on the render thread (its comment records the
+		// sweep: bigger per-chunk bursts hitched). A fused stack adds roughly
+		// ONE classic job's worth of passes however many chunks it carries, so
+		// a sibling rides its head's allowance instead of consuming one -- the
+		// per-chunk reason for the cap is exactly what the fusion removes.
+		// MaxInFlight still bounds JOB count (readbacks, poll volume), so the
+		// sweep stops at the room it actually has.
+		//
+		// A COPY of the head handle, deliberately: Batch.Add below can
+		// reallocate the array a reference would point into.
+		if (bBatchArmed)
+		{
+			const FJobPtr Promoted = Batch.Last();
+			if (!Promoted->bBrickPack)
+			{
+				// Not a brick producer (bench fixture shapes, non-chunk
+				// footprints); nothing the batch path could fuse. Not counted:
+				// it was never a candidate.
+			}
+			else if (Promoted->bQuadMesh)
+			{
+				NoteBatchFallback(EBatchFallback::QuadMesh);
+			}
+			else if (Promoted->Region.BandEdge > 0)
+			{
+				NoteBatchFallback(EBatchFallback::Band);
+			}
+			else if (Promoted->BrickRegion.AssetInstances.Num() > 0)
+			{
+				NoteBatchFallback(EBatchFallback::Assets);
+			}
+			else
+			{
+				TArray<FJobPtr>& Sweep = StackSweeps.AddDefaulted_GetRef();
+				Sweep.Add(Promoted);
+				for (int32 SIdx = 0; SIdx < Source.Num(); )
+				{
+					if (InFlight.Num() + Batch.Num() >= MaxInFlight ||
+					    Sweep.Num() >= VoxelGpuBatchDetail::kMaxStackChunks)
+					{
+						break;
+					}
+					const FJobPtr& Cand = Source[SIdx];
+					if (!IsStackableBrickJob(*Cand) || !SameBrickColumn(*Promoted, *Cand))
+					{
+						++SIdx;
+						continue;
+					}
+					if (!CompatibleForStack(*Promoted, *Cand))
+					{
+						// Same column, different inputs: residency moved
+						// between the two Submits, so fusing them would hand
+						// one chunk terrain generated from the other's window.
+						// It stays queued and heads its own dispatch later.
+						NoteBatchFallback(EBatchFallback::Mismatch);
+						++SIdx;
+						continue;
+					}
+					FJobPtr Sibling = Cand;
+					Source.RemoveAt(SIdx, EAllowShrinking::No);
+					// The main loop's promote bookkeeping, verbatim, minus the
+					// allowance increment -- see the cap note above.
+					Sibling->PromotedSeconds = FPlatformTime::Seconds();
+					FString SiblingError;
+					if (!VoxelGpuWorldGen::ValidateRegionRequest(Sibling->Region, SiblingError))
+					{
+						Rejected.Emplace(Sibling, SiblingError);
+						continue;
+					}
+					Sibling->Sizes = VoxelGpuWorldGen::ComputeRegionGraphSizes(Sibling->Region);
+					Sibling->InteriorX = Sibling->Sizes.BricksX - 2;
+					Sibling->InteriorY = Sibling->Sizes.BricksY - 2;
+					Sibling->InteriorZ = Sibling->Sizes.BricksZ - 2;
+					Sweep.Add(Sibling);
+					Batch.Add(MoveTemp(Sibling));
+				}
+			}
+		}
+	}
+
+	// --- Tier B.1: turn the sweeps into fused stack dispatches --------------
+	//
+	// Sort each sweep by chunk z and fuse every maximal CONTIGUOUS run of 2+
+	// into one stack. Contiguity is not a preference: the fused region is one
+	// solid span of bricks, so a gap would generate chunks nobody asked for
+	// and -- worse -- deliver them to nobody. A duplicate key (two queued jobs
+	// for the same chunk) breaks a run the same way and each part stands
+	// alone.
+	for (TArray<FJobPtr>& Sweep : StackSweeps)
+	{
+		Sweep.Sort([](const FJobPtr& A, const FJobPtr& B)
+		{
+			return A->BrickKey.Z < B->BrickKey.Z;
+		});
+		int32 RunStart = 0;
+		for (int32 I = 1; I <= Sweep.Num(); ++I)
+		{
+			const bool bRunEnds = (I == Sweep.Num()) ||
+				(Sweep[I]->BrickKey.Z != Sweep[I - 1]->BrickKey.Z + 1);
+			if (!bRunEnds)
+			{
+				continue;
+			}
+			const int32 RunLen = I - RunStart;
+			if (RunLen < 2)
+			{
+				// A lone chunk fuses with nobody; it dispatches classic,
+				// exactly as with the switch off -- counted, so "armed but
+				// nothing stacked" is a readable state instead of a mystery.
+				NoteBatchFallback(EBatchFallback::Single);
+				RunStart = I;
+				continue;
+			}
+			TSharedPtr<FVoxelGpuBrickStack, ESPMode::ThreadSafe> Stack =
+				MakeShared<FVoxelGpuBrickStack, ESPMode::ThreadSafe>();
+			Stack->NumChunks = RunLen;
+			// The bottom member's halo-free region stretched over the run:
+			// same 32x32 columns, same raster window (memcmp-verified equal
+			// across members), K chunks of z. decodeBrick decomposes it back
+			// into exactly the run's chunks, in the same ascending-z order the
+			// members were just sorted into.
+			Stack->Region = Sweep[RunStart]->BrickRegion;
+			Stack->Region.BricksZ = uint32(RunLen) * VoxelGpuChunkRegion::kInteriorBricks;
+			Stack->Region.bPerChunkBrickTotals = true;
+			FString StackError;
+			if (!VoxelGpuWorldGen::ValidateRegionRequest(Stack->Region, StackError))
+			{
+				// Loud, because the members will silently dispatch classic and
+				// the only other trace would be a throughput number that never
+				// improved -- the exact shape of the fork that carried zero
+				// traffic under retirement.
+				UE_LOG(LogVoxelGpuMeshJob, Error,
+				       TEXT("[gpu-batch] assembled stack region INVALID (%s); its %d chunks ")
+				       TEXT("dispatch per-chunk instead"),
+				       *StackError, RunLen);
+				NoteBatchFallback(EBatchFallback::Invalid);
+				RunStart = I;
+				continue;
+			}
+			for (int32 M = 0; M < RunLen; ++M)
+			{
+				Sweep[RunStart + M]->BrickStack = Stack;
+				Sweep[RunStart + M]->StackChunkIndex = M;
+			}
+			++BatchStacks;
+			BatchStackChunks += RunLen;
+			BatchStackPasses += VoxelGpuBatchDetail::kPassesPerStackDispatch;
+			RunStart = I;
+		}
+	}
+	if (bBatchArmed)
+	{
+		// Whatever did not fuse dispatches classic; tallied so the window line
+		// always shows where every promoted chunk went.
+		for (const FJobPtr& BatchJob : Batch)
+		{
+			if (!BatchJob->BrickStack.IsValid())
+			{
+				++BatchClassicJobs;
+				BatchClassicPasses += BatchJob->bBrickPack
+					? VoxelGpuBatchDetail::kPassesPerClassicBrickJob
+					: VoxelGpuBatchDetail::kPassesPerClassicQuadJob;
+			}
+		}
 	}
 
 	if (Batch.Num() > 0)
@@ -1029,6 +1569,11 @@ void FVoxelGpuMeshJobManager::Tick()
 	for (const TPair<FJobPtr, FString>& R : Rejected)
 	{
 		Deliver(R.Key, EVoxelGpuMeshJobStatus::Rejected, R.Value);
+	}
+
+	if (bBatchArmed)
+	{
+		MaybeLogBatchWindow();
 	}
 
 	// --- 2. poll and harvest ------------------------------------------------
@@ -1046,6 +1591,67 @@ void FVoxelGpuMeshJobManager::Tick()
 	GetGlobalVoxelBrickPool().Flush();
 	const double TickStage3 = FPlatformTime::Seconds();
 	TickStageMs.BrickFlushMs += (TickStage3 - TickStage2) * 1000.0;
+}
+
+// The Tier B.1 window line. ~5 s cadence, and it prints ONLY when something
+// happened -- an armed-but-idle manager stays quiet, an armed-and-declining
+// one prints zero stacks WITH the reasons, which is the state the counters
+// exist to make impossible to miss. The crosscheck pair comes from the
+// render-thread atomics (see VoxelGpuBatchDetail); everything else is
+// game-thread. Read-and-reset with a single reader (this function), for
+// FTickStageMs's two-readers-halve-each-other reason.
+void FVoxelGpuMeshJobManager::MaybeLogBatchWindow()
+{
+	const double Now = FPlatformTime::Seconds();
+	if (LastBatchLogSeconds <= 0.0)
+	{
+		LastBatchLogSeconds = Now;
+		return;
+	}
+	if (Now - LastBatchLogSeconds < 5.0)
+	{
+		return;
+	}
+
+	const int32 CrossPass = VoxelGpuBatchDetail::GCrosscheckPass.exchange(0, std::memory_order_relaxed);
+	const int32 CrossFail = VoxelGpuBatchDetail::GCrosscheckFail.exchange(0, std::memory_order_relaxed);
+	int32 FallbackTotal = 0;
+	for (int32 F = 0; F < int32(EBatchFallback::COUNT); ++F)
+	{
+		FallbackTotal += BatchFallbacks[F];
+	}
+	if (BatchStacks == 0 && BatchClassicJobs == 0 && FallbackTotal == 0 &&
+	    CrossPass == 0 && CrossFail == 0)
+	{
+		LastBatchLogSeconds = Now;
+		return;
+	}
+
+	// "vs ~N per-chunk": what the SAME chunks would have cost as classic
+	// per-chunk dispatches -- the number the fusion exists to beat.
+	const int32 PerChunkEquivalent =
+		BatchStackChunks * VoxelGpuBatchDetail::kPassesPerClassicBrickJob;
+	UE_LOG(LogVoxelGpuMeshJob, Log,
+	       TEXT("[gpu-batch] %.1fs window: %d stacks / %d chunks (~%d passes, vs ~%d per-chunk); ")
+	       TEXT("classic %d jobs (~%d passes); fallbacks quadmesh %d band %d assets %d raster %d ")
+	       TEXT("single %d invalid %d; crosscheck %d ok / %d FAIL"),
+	       Now - LastBatchLogSeconds, BatchStacks, BatchStackChunks, BatchStackPasses,
+	       PerChunkEquivalent, BatchClassicJobs, BatchClassicPasses,
+	       BatchFallbacks[uint8(EBatchFallback::QuadMesh)],
+	       BatchFallbacks[uint8(EBatchFallback::Band)],
+	       BatchFallbacks[uint8(EBatchFallback::Assets)],
+	       BatchFallbacks[uint8(EBatchFallback::Mismatch)],
+	       BatchFallbacks[uint8(EBatchFallback::Single)],
+	       BatchFallbacks[uint8(EBatchFallback::Invalid)],
+	       CrossPass, CrossFail);
+
+	BatchStacks = 0;
+	BatchStackChunks = 0;
+	BatchStackPasses = 0;
+	BatchClassicJobs = 0;
+	BatchClassicPasses = 0;
+	FMemory::Memzero(BatchFallbacks, sizeof(BatchFallbacks));
+	LastBatchLogSeconds = Now;
 }
 
 void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
@@ -1074,8 +1680,35 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		TArray<FJobPtr> Built;
 		Built.Reserve(Jobs.Num());
 
+		// --- Tier B.1: fused stacks first, one region graph per stack -------
+		//
+		// Members are grouped back together by their shared stack object (the
+		// batch array carries them interleaved with classic jobs in promote
+		// order). Raw-pointer key: the members' shared handles keep the stack
+		// alive for the map's whole lifetime, and the map dies with this
+		// command.
+		{
+			TMap<FVoxelGpuBrickStack*, TArray<FJobPtr>> StackGroups;
+			for (const FJobPtr& Job : Jobs)
+			{
+				if (Job->BrickStack.IsValid())
+				{
+					StackGroups.FindOrAdd(Job->BrickStack.Get()).Add(Job);
+				}
+			}
+			for (TPair<FVoxelGpuBrickStack*, TArray<FJobPtr>>& Group : StackGroups)
+			{
+				AddBrickStackPasses(GraphBuilder, Group.Value, Built);
+			}
+		}
+
 		for (const FJobPtr& Job : Jobs)
 		{
+			// Stack members were dispatched above, as one fused region.
+			if (Job->BrickStack.IsValid())
+			{
+				continue;
+			}
 			if (Job->Abandoned.load(std::memory_order_acquire) != 0)
 			{
 				continue;
@@ -1421,6 +2054,120 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				}
 
 				const EJobState State = Job->GetState();
+
+				// --- Tier B.1, phase 1 for a fused stack member ---------------
+				//
+				// The K members share ONE readback; the first member polled
+				// after it lands harvests the whole (2+2K)-dword table (one
+				// budget charge for the stack -- the amortisation shows up in
+				// the harvest too), cross-checks it, and every member then
+				// fills its own pair plus its prefix starts from the shared
+				// table. All render-thread, serial across poll commands, so
+				// the stack's plain fields need no atomics.
+				if (State == EJobState::Dispatched && Job->BrickStack.IsValid())
+				{
+					FVoxelGpuBrickStack& Stack = *Job->BrickStack;
+					if (Stack.bFailed)
+					{
+						Job->Error = Stack.Error;
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					if (!Stack.TotalsReadback.IsValid())
+					{
+						Job->Error = TEXT("stack totals readback missing");
+						Job->SetState(EJobState::Failed);
+						continue;
+					}
+					if (!Stack.bHarvested && !Stack.TotalsReadback->IsReady())
+					{
+						continue;
+					}
+					// First observed ready, before the budget check -- the
+					// classic path's stamping rule, verbatim.
+					if (Job->ReadySeconds <= 0.0)
+					{
+						Job->ReadySeconds = FPlatformTime::Seconds();
+					}
+					if (!Stack.bHarvested)
+					{
+						if (HarvestBudget <= 0)
+						{
+							continue;
+						}
+						--HarvestBudget;
+
+						const uint32 Dwords = 2u + 2u * uint32(Stack.NumChunks);
+						Stack.Totals.SetNumUninitialized(int32(Dwords));
+						FString Error;
+						if (!CopyReadback(*Stack.TotalsReadback, Stack.Totals.GetData(),
+						                  Dwords * sizeof(uint32), TEXT("BrickStackTotals"), Error))
+						{
+							Stack.bFailed = true;
+							Stack.Error = Error;
+							Job->Error = Error;
+							Job->SetState(EJobState::Failed);
+							continue;
+						}
+
+						// THE LIVE CROSS-CHECK. sum(per-chunk) must equal the
+						// region pair the same kernel derived the way
+						// BrickTotalMain does. A mismatch means the per-chunk
+						// split is wrong -- the chunk-major assumption, the
+						// kernel, or the scan -- and publishing from a wrong
+						// split writes one chunk's bricks into another chunk's
+						// pool range: plausible terrain, wrong place. So the
+						// WHOLE stack fails loudly and the streaming path
+						// re-produces the chunks on its CPU arm.
+						uint64 SumOcc = 0;
+						uint64 SumMat = 0;
+						for (int32 C = 0; C < Stack.NumChunks; ++C)
+						{
+							SumOcc += Stack.Totals[2 + 2 * C];
+							SumMat += Stack.Totals[3 + 2 * C];
+						}
+						if (SumOcc != uint64(Stack.Totals[0]) || SumMat != uint64(Stack.Totals[1]))
+						{
+							Stack.bFailed = true;
+							Stack.Error = FString::Printf(
+								TEXT("stack totals cross-check FAILED: per-chunk sums (occ %llu, ")
+								TEXT("mat %llu) != region totals (%u, %u) over %d chunks"),
+								SumOcc, SumMat, Stack.Totals[0], Stack.Totals[1], Stack.NumChunks);
+							UE_LOG(LogVoxelGpuMeshJob, Error, TEXT("[gpu-batch] %s"), *Stack.Error);
+							VoxelGpuBatchDetail::GCrosscheckFail.fetch_add(1, std::memory_order_relaxed);
+							Job->Error = Stack.Error;
+							Job->SetState(EJobState::Failed);
+							continue;
+						}
+						VoxelGpuBatchDetail::GCrosscheckPass.fetch_add(1, std::memory_order_relaxed);
+						Stack.bHarvested = true;
+					}
+
+					// This member's own numbers. The prefix sums are what turn
+					// "chunk c of the batch" into "this contiguous scratch run"
+					// -- the pool's word copies start there, and the desc-write
+					// base subtracts it back out (see AddFlushPasses).
+					const int32 Idx = Job->StackChunkIndex;
+					uint32 OccFirst = 0;
+					uint32 MatFirst = 0;
+					for (int32 C = 0; C < Idx; ++C)
+					{
+						OccFirst += Stack.Totals[2 + 2 * C];
+						MatFirst += Stack.Totals[3 + 2 * C];
+					}
+					Job->BrickTotals[0] = Stack.Totals[2 + 2 * Idx];
+					Job->BrickTotals[1] = Stack.Totals[3 + 2 * Idx];
+					if (Job->BrickPayload.IsValid())
+					{
+						Job->BrickPayload->SrcOccFirst = OccFirst;
+						Job->BrickPayload->SrcMatFirst = MatFirst;
+					}
+					// Brick-only by construction, so NumQuads stays 0 and the
+					// phase-2 starter's zero-quad branch carries the job to
+					// ReadbackDone -- the same road every brick-only job takes.
+					Job->SetState(EJobState::TotalDone);
+					continue;
+				}
 
 				// --- phase 1: the 4-byte total (+ the control path's tables) --
 				if (State == EJobState::Dispatched)
