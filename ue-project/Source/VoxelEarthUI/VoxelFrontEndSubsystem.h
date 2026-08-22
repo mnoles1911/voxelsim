@@ -52,6 +52,12 @@ public:
 
 private:
 	void EnterMenu();
+	// -VoxelHourglassShot: the hourglass ALONE, at fixed progress values, on a
+	// flat field. Isolated from the rest of the front end deliberately -- it is
+	// the densest drawing here and the most likely to need iteration, and a
+	// strip of it at 0/0.25/0.5/0.75/1.0 is one comparable image rather than
+	// five screenshots that have to be lined up by hand.
+	void EnterHourglassShot();
 	void ApplyMenuInputMode();
 	void RefreshSaveRows();
 
@@ -67,6 +73,7 @@ private:
 	EVoxelFrontEndState State = EVoxelFrontEndState::Inactive;
 
 	TSharedPtr<class SVoxelMainMenu> MenuWidget;
+	TSharedPtr<class SWidget> HourglassShotWidget;
 
 	// The player controller may not exist on the tick OnWorldBeginPlay runs,
 	// so cursor/input-mode/HUD setup is deferred to the first tick that finds

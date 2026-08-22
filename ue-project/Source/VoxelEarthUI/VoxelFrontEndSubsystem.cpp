@@ -1,15 +1,22 @@
 #include "VoxelFrontEndSubsystem.h"
 
+#include "SVoxelHourglass.h"
 #include "SVoxelMainMenu.h"
+#include "VoxelUIStyle.h"
+#include "VoxelUITheme.h"
 #include "VoxelEarthUI.h"
 #include "VoxelFrontEndSwitches.h"
-#include "VoxelUIStyle.h"
 
 #include "VoxelFrontEndPolicy.h"
 #include "VoxelEarthGameMode.h"
 #include "VoxelSaveLibrary.h"
 #include "VoxelWorldSubsystem.h"
 
+#include "Widgets/SBoxPanel.h"
+#include "Widgets/SOverlay.h"
+#include "Widgets/Images/SImage.h"
+#include "Widgets/Layout/SBox.h"
+#include "Widgets/Text/STextBlock.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 #include "GameFramework/HUD.h"
@@ -67,7 +74,76 @@ void UVoxelFrontEndSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 	{
 		return;
 	}
+	if (FVoxelFrontEndSwitches::Get().bHourglassShot)
+	{
+		EnterHourglassShot();
+		return;
+	}
 	EnterMenu();
+}
+
+void UVoxelFrontEndSubsystem::EnterHourglassShot()
+{
+	using namespace VoxelUITheme;
+	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
+	if (Viewport == nullptr)
+	{
+		UE_LOG(LogVoxelUI, Error, TEXT("-VoxelHourglassShot: no game viewport."));
+		return;
+	}
+	const FVoxelFrontEndSwitches& Switches = FVoxelFrontEndSwitches::Get();
+	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
+	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
+
+	TSharedRef<SHorizontalBox> Strip = SNew(SHorizontalBox);
+	for (const float ProgressValue : Switches.HourglassProgress)
+	{
+		Strip->AddSlot().AutoWidth().Padding(FMargin(32.f, 0.f)).VAlign(VAlign_Center)
+		[
+			SNew(SVerticalBox)
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center)
+			[
+				SNew(SBox)
+				.WidthOverride(L.HourglassWidth)
+				.HeightOverride(L.HourglassHeight)
+				[
+					SNew(SVoxelHourglass).Progress(ProgressValue)
+				]
+			]
+			+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Center).Padding(FMargin(0.f, 20.f, 0.f, 0.f))
+			[
+				// Labelled, because an unlabelled strip of five hourglasses is
+				// only diffable against another strip -- with the numbers on
+				// it, a single image answers "does 0.25 look right".
+				SNew(STextBlock)
+				.Text(FText::FromString(FString::Printf(TEXT("%.2f"), ProgressValue)))
+				.Font(Style.Serif(L.LoadingPctSize))
+				.ColorAndOpacity(FVoxelUIStyle::TitleColour())
+			]
+		];
+	}
+
+	// A flat field, not the menu background: the point is to see the hourglass,
+	// and photographic art behind it would make a pixel diff meaningless.
+	HourglassShotWidget = SNew(SOverlay)
+		+ SOverlay::Slot()
+		[
+			SNew(SImage).Image(Style.SolidWhite()).ColorAndOpacity(FSlateColor(Tint(BgNight)))
+		]
+		+ SOverlay::Slot()
+		.HAlign(HAlign_Center)
+		.VAlign(VAlign_Center)
+		[
+			Strip
+		];
+
+	Viewport->AddViewportWidgetContent(HourglassShotWidget.ToSharedRef(), VoxelFrontEndDetail::kLoadingZOrder);
+	UE_LOG(LogVoxelUI, Log, TEXT("-VoxelHourglassShot: %d hourglass(es) on screen."), Switches.HourglassProgress.Num());
+	State = EVoxelFrontEndState::Menu;
+	StateSeconds = 0.f;
+	// Input mode is left alone: there is nothing to click, and the run quits.
+	bMenuInputApplied = true;
 }
 
 bool UVoxelFrontEndSubsystem::IsTickable() const
@@ -327,13 +403,22 @@ void UVoxelFrontEndSubsystem::RequestQuit()
 void UVoxelFrontEndSubsystem::TeardownMenu()
 {
 	UWorld* World = GetWorld();
+	UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr;
 	if (MenuWidget.IsValid())
 	{
-		if (UGameViewportClient* Viewport = World ? World->GetGameViewport() : nullptr)
+		if (Viewport != nullptr)
 		{
 			Viewport->RemoveViewportWidgetContent(MenuWidget.ToSharedRef());
 		}
 		MenuWidget.Reset();
+	}
+	if (HourglassShotWidget.IsValid())
+	{
+		if (Viewport != nullptr)
+		{
+			Viewport->RemoveViewportWidgetContent(HourglassShotWidget.ToSharedRef());
+		}
+		HourglassShotWidget.Reset();
 	}
 	if (APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr)
 	{
@@ -388,6 +473,15 @@ void UVoxelFrontEndSubsystem::Tick(float DeltaTime)
 		// art decodes on a worker and glyphs rasterise lazily, so a capture on
 		// frame one would photograph a half-built menu and read as a
 		// regression.
+		if (Switches.bHourglassShot && StateSeconds >= 2.0f)
+		{
+			// Two seconds: long enough for the grain field to fill and for a
+			// mound to have formed at the mid-progress values, which an
+			// immediate capture would miss entirely.
+			CaptureAndQuit(TEXT("VoxelHourglass"));
+			return;
+		}
+
 		if (Switches.bMenuShot && StateSeconds >= Switches.MenuShotSeconds)
 		{
 			CaptureAndQuit(TEXT("VoxelMenu"));
