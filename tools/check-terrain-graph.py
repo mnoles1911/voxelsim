@@ -183,6 +183,74 @@ def main():
         print(f"{label}: {len(MaterialEditingLibrary.created)} nodes, "
               f"{len(MaterialEditingLibrary.connections)} connections")
 
+    # --- REACHABILITY: is each surviving modifier still in the LIVE graph? ---
+    #
+    # THE TRAP THIS CATCHES, which is the single most dangerous edit in
+    # ADR-0009. The slope-rock and snowline terms used to be lerped into
+    # `surface`, and `surface` was only reachable through the climate share. The
+    # moment every biomeTint went to 0 that share became 0 too, so all three
+    # modifiers were orphaned inside a branch nothing reads -- every cliff and
+    # all the snow in the world silently deleted, no error, no failing test, and
+    # nothing visible until someone regenerated the material on the editor box
+    # and looked at a mountain.
+    #
+    # Node COUNTS cannot see it: an orphaned lerp is still a created node still
+    # wired to its neighbours. What distinguishes live from dead is whether the
+    # node can be REACHED from the expression the function returns, so that is
+    # what is walked.
+    def reachable_from(root):
+        """Every node that feeds `root`, transitively."""
+        incoming = {}
+        for src, _so, dst, _di in MaterialEditingLibrary.connections:
+            incoming.setdefault(id(dst), []).append(src)
+        seen, stack = set(), [root]
+        while stack:
+            node = stack.pop()
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            stack.extend(incoming.get(id(node), []))
+        return seen
+
+    def check_live(label, root, wanted):
+        """Each named term must be a node that is REACHABLE from the result.
+
+        Matched on the node's `desc`, not on its colour. Colour matching does
+        not work here and the difference is instructive: the component-path
+        fallback composes the SAME snow colour, so a snowline term deleted from
+        the material path stayed 'reachable' through the fallback and the check
+        passed a real deletion. A desc names the specific node whose presence is
+        being asserted, and it labels that node for a human opening the graph
+        too.
+        """
+        live = reachable_from(root)
+        descs = {n.props.get("desc") for n in MaterialEditingLibrary.created
+                 if id(n) in live}
+        for name, desc in wanted:
+            if desc not in descs:
+                failures.append(
+                    f"{label}: the {name} term is NOT reachable from the returned "
+                    f"base colour (no live node marked '{desc}'). Either it was "
+                    f"deleted, or it is orphaned in a dead branch -- and an orphan "
+                    f"deletes it from the world with nothing erroring.")
+
+    MaterialEditingLibrary.created.clear()
+    MaterialEditingLibrary.connections.clear()
+    b = tmc.GraphBuilder(material)
+    vc = b.node(sys.modules["unreal"].MaterialExpressionVertexColor)
+    uv = b.node(sys.modules["unreal"].MaterialExpressionTextureCoordinate)
+    try:
+        base, _snow, _out, _wet = tmc.build_terrain_base_color(
+            b, vc, uv, "", rock_slope_strength=0.35, detail_fine_strength=0.05,
+            detail_coarse_strength=0.04, bathy=None,
+            palette=tmc.build_palette_inputs(b))
+        check_live("voxel (palette)", base,
+                   [("slope-rock", "ADR-0009 slope-rock (material path)"),
+                    ("snowline", "ADR-0009 snowline (material path)")])
+        print("reachability: slope-rock and snowline are live on the palette path")
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"reachability check: {type(exc).__name__}: {exc}")
+
     # The palette path must add nodes the no-palette path does not; equal counts
     # would mean the palette argument is being ignored, which is a change that
     # runs cleanly and does nothing -- this repo's signature failure.

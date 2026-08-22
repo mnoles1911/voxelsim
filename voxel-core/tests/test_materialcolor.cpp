@@ -31,15 +31,19 @@ struct Composed {
     int32_t rgb[3];
 };
 
+// `biomeTint` is a PARAMETER and not read from the table, because ADR-0009 put
+// zero in every row: reading it would make every climate test a tautology while
+// still looking like it tested something.
 Composed compose(MaterialId mat, FaceClass fc, int32_t vx, int32_t vy, int32_t vz,
-                 int32_t cubeSizeMm, const int32_t* climate = nullptr, uint32_t salt = 0) {
+                 int32_t cubeSizeMm, const int32_t* climate = nullptr,
+                 uint8_t biomeTint = 0, uint32_t salt = 0) {
     const MaterialAppearance& a = kMaterialPalette[mat];
     // sRGB bytes read straight into Q16 without a transfer curve. Fine HERE
     // because every test below compares one composition against another in the
     // same units; a real consumer must convert first (materialcolor.h says so
     // at length).
     Composed out{{a.face[fc].r * 257, a.face[fc].g * 257, a.face[fc].b * 257}};
-    if (climate) blendBiomeQ16(out.rgb, climate, a.biomeTint);
+    if (climate) blendBiomeQ16(out.rgb, climate, biomeTint);
     applyTintQ16(out.rgb, voxelTint(mat, vx, vy, vz, cubeSizeMm, salt));
     return out;
 }
@@ -70,24 +74,26 @@ VXC_TEST(palette_every_material_has_a_visible_appearance) {
     }
 }
 
-VXC_TEST(palette_terrain_surfaces_are_climate_led_and_strata_are_not) {
-    // The decision this colour system turns on, asserted rather than left to a
-    // screenshot. Subsurface strata own their colour outright, which is what
-    // makes a cave wall read as rock rather than as one flat tone; surface
-    // materials hand most of it to the climate, which is what stops a hillside
-    // being the same green in a tundra and a rainforest.
-    const MaterialId strata[] = {MAT_BEDROCK, MAT_ROCK, MAT_GRAVEL, MAT_SUBSOIL,
-                                 MAT_MUD,     MAT_CLAY};
-    for (MaterialId m : strata) {
+VXC_TEST(palette_no_material_is_climate_tinted) {
+    // The decision ADR-0009 turns on, asserted rather than left to a
+    // screenshot: a voxel face's colour is its material, with no biome,
+    // precipitation or temperature term anywhere in it.
+    //
+    // A TEST AND NOT A static_assert, deliberately. The asset rows carry a
+    // static_assert because "a bird must not take the colour of the ground it
+    // flies over" is doctrine and should never be reversible by editing data.
+    // This is a DECISION, and a decision that a future owner may want to revisit
+    // -- so it lives where reversing it is one line of data plus one line of
+    // test, rather than a change to the header's compile-time contract.
+    for (int m = 1; m < kMaterialCount; ++m) {
         CHECK_MSG(kMaterialPalette[m].biomeTint == 0,
-                  "a subsurface stratum is climate-tinted: a cave wall would take "
-                  "the colour of the grassland above it");
-    }
-    const MaterialId surfaces[] = {MAT_SAND,   MAT_TOPSOIL,       MAT_GRASS,
-                                   MAT_PODZOL, MAT_SAVANNA_GRASS, MAT_JUNGLE_SOIL,
-                                   MAT_PERMAFROST};
-    for (MaterialId m : surfaces) {
-        CHECK(kMaterialPalette[m].biomeTint >= 128);
+                  "a material is climate-tinted, but ADR-0009 makes colour "
+                  "purely material-led; if this is intended, the ADR and this "
+                  "test have to move together");
+        if (kMaterialPalette[m].biomeTint != 0) {
+            std::fprintf(stderr, "    material id %d, biomeTint %d\n", m,
+                         kMaterialPalette[m].biomeTint);
+        }
     }
 }
 
@@ -443,26 +449,40 @@ VXC_TEST(colour_biome_blend_respects_the_weight) {
     blendBiomeQ16(full, climate, 255);
     for (int c = 0; c < 3; ++c) CHECK(full[c] == climate[c]);
 
-    // ...and a surface material lands between the two, nearer the climate.
-    int32_t grass[3] = {1000, 2000, 3000};
+    // ...and a mid weight lands between the two, nearer the climate.
+    //
+    // AN EXPLICIT 215 RATHER THAN A TABLE LOOKUP. This used to read
+    // kMaterialPalette[MAT_GRASS].biomeTint, which was 215 when it was written
+    // and is 0 now that ADR-0009 made colour purely material-led -- so the test
+    // quietly became "blending by zero changes nothing", which the case above
+    // already covers. The function is still the one that would carry climate
+    // back if it ever returns, so it is tested at a weight that exercises it.
+    int32_t mid[3] = {1000, 2000, 3000};
     const int32_t before[3] = {1000, 2000, 3000};
-    blendBiomeQ16(grass, climate, kMaterialPalette[MAT_GRASS].biomeTint);
+    blendBiomeQ16(mid, climate, 215);
     for (int c = 0; c < 3; ++c) {
-        CHECK(absDiff(grass[c], climate[c]) < absDiff(grass[c], before[c]));
+        CHECK(absDiff(mid[c], climate[c]) < absDiff(mid[c], before[c]));
     }
 }
 
 VXC_TEST(colour_variation_survives_the_biome_blend) {
-    // WHY STAGE 3 COMES AFTER STAGE 2. Tinting before the blend would average
-    // the variation away wherever the climate dominates -- which is every
-    // outdoor surface in this world, since MAT_GRASS hands 215/255 of its
-    // colour to the climate. Two neighbouring grass voxels under the SAME
-    // climate must still differ.
+    // WHY STAGE 3 COMES AFTER STAGE 2 in materialcolor.h's composition.
+    //
+    // ADR-0009 weighted the climate stage out entirely, so on today's data this
+    // ordering is unobservable -- which is exactly why the test is kept and why
+    // it now supplies its own weight instead of reading one from the table. The
+    // ordering is a property of the COMPOSITION, not of the current data, and
+    // the moment anyone reintroduces a climate term the wrong order silently
+    // costs them every bit of per-voxel variation on the surfaces that carry it.
+    // A test that lapsed into a tautology the day the weights went to zero would
+    // not be there to say so.
     const int32_t climate[3] = {kColorOne / 3, kColorOne / 2, kColorOne / 5};
+    const uint8_t weight = 215; // what the surfaces carried before ADR-0009
+
     int differing = 0;
     for (int i = 0; i < 64; ++i) {
-        const Composed a = compose(MAT_GRASS, kFaceTop, i, 0, 0, 100, climate);
-        const Composed b = compose(MAT_GRASS, kFaceTop, i + 1, 0, 0, 100, climate);
+        const Composed a = compose(MAT_GRASS, kFaceTop, i, 0, 0, 100, climate, weight);
+        const Composed b = compose(MAT_GRASS, kFaceTop, i + 1, 0, 0, 100, climate, weight);
         if (absDiff(a.rgb[1], b.rgb[1]) > kColorOne / 500) ++differing;
     }
     CHECK_MSG(differing >= 60, "climate-led surfaces lost their per-voxel variation");

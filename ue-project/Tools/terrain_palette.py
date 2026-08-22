@@ -84,15 +84,15 @@ PALETTE = [
     ("BEDROCK",           0.061246, 0.059511, 0.068478, False),
     ("ROCK",              0.230740, 0.208637, 0.149960, False),
     ("GRAVEL",            0.304987, 0.258183, 0.184475, False),
-    ("SAND",              0.617207, 0.491021, 0.262251, True),
+    ("SAND",              0.617207, 0.491021, 0.262251, False),
     ("SUBSOIL",           0.187821, 0.116971, 0.064803, False),
-    ("TOPSOIL",           0.116971, 0.068478, 0.034340, True),
+    ("TOPSOIL",           0.116971, 0.068478, 0.034340, False),
     ("SNOW",              0.896269, 0.921582, 0.964686, False),
-    ("GRASS",             0.072272, 0.174647, 0.036889, True),
-    ("JUNGLE_SOIL",       0.138432, 0.042311, 0.019382, True),
-    ("SAVANNA_GRASS",     0.401978, 0.341914, 0.102242, True),
-    ("PODZOL",            0.084376, 0.076185, 0.061246, True),
-    ("PERMAFROST",        0.401978, 0.456411, 0.502886, True),
+    ("GRASS",             0.072272, 0.174647, 0.036889, False),
+    ("JUNGLE_SOIL",       0.138432, 0.042311, 0.019382, False),
+    ("SAVANNA_GRASS",     0.401978, 0.341914, 0.102242, False),
+    ("PODZOL",            0.084376, 0.076185, 0.061246, False),
+    ("PERMAFROST",        0.401978, 0.456411, 0.502886, False),
     ("MUD",               0.048172, 0.054480, 0.042311, False),
     ("CLAY",              0.313989, 0.181164, 0.111932, False),
     # DEBUG INSTRUMENT, not world content -- vxc::MAT_WATERMARK. Solid voxels
@@ -191,6 +191,25 @@ PALETTE = [
 # with an assert beside it, which is a constant that has to be edited in step
 # with the table -- and the table is now generated from an enum that grows.
 PALETTE_WIDTH = len(PALETTE)
+
+
+def linear_rgb(name):
+    """This material's LINEAR albedo, by MAT_ name, for the material graph.
+
+    The graph used to author its own RockColor / BeachColor / SnowColor
+    VectorParameters, and they had drifted a long way from the materials they
+    stood for: RockColor was 1.6x brighter and 2.0x the blue of MAT_ROCK, so a
+    cliff face and the cave you dug into it were different rocks. They are read
+    from here now, which makes them one answer per substance rather than two.
+    """
+    key = name[4:] if name.startswith("MAT_") else name
+    for entry in PALETTE:
+        if entry[0] == key:
+            return entry[1], entry[2], entry[3]
+    raise KeyError(
+        f"{name} is not in terrain_palette.PALETTE. Material ids are "
+        "append-only; if this one was renamed, rename it in core.h and "
+        "regenerate with gen_material_palette_ush.py.")
 
 
 def biome_tinted_runs():

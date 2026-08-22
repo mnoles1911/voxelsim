@@ -154,8 +154,7 @@ def main():
         # natural darkening of the riser. The clipmap, whose normals are real
         # terrain normals, passes 1.0.
         rock_slope_strength=0.35,
-        # DROPPED FROM 0.30/0.22 BY ADR-0009, and this is a real change to how
-        # the world looks rather than a tidy-up.
+        # ZERO AT ADR-0009 -- see below for why the nodes stay anyway.
         #
         # T_VoxelDetail is an 8 m-tiled fBm, and until this commit it was the
         # ONLY variation terrain had -- the palette's per-voxel jitter reached
@@ -168,13 +167,15 @@ def main():
         # is being done properly and the rest is fighting it: two variation
         # systems at unrelated scales read as noise, not as detail.
         #
-        # WEAKENED RATHER THAN REMOVED, and the nodes stay in the graph. It is
-        # still the only term that varies within ONE voxel face, which matters at
-        # the near plane where a face is many pixels across, and leaving it as a
-        # live parameter makes "the world looks too clean" a slider rather than a
-        # material regeneration on a box that usually belongs to someone else.
-        detail_fine_strength=0.05,
-        detail_coarse_strength=0.04,
+        # ZEROED RATHER THAN REMOVED, and the nodes stay in the graph. Two
+        # reasons, and the second is the load-bearing one. It is still the only
+        # term that varies WITHIN one voxel face, which could matter at the near
+        # plane where a face is many pixels across. And leaving it as a live
+        # ScalarParameter makes "the world looks too clean" a slider someone can
+        # move in a material instance, rather than a regeneration on an editor
+        # box that usually belongs to somebody else.
+        detail_fine_strength=0.0,
+        detail_coarse_strength=0.0,
     )
 
     # --- THE MATERIAL PALETTE ON TERRAIN (ADR-0009) -------------------------
@@ -194,8 +195,17 @@ def main():
     #      SubsurfaceColor, a single flat constant, and that is the most
     #      obviously wrong thing in the game today.
     #   2. A GRASS HILLSIDE WITH CUBE-TO-CUBE VARIATION at 5 m. If it is smooth,
-    #      the variation is being applied before the biome blend instead of
-    #      after, and the climate's 215/255 share has averaged it away.
+    #      the variation is being applied before the modifiers rather than after
+    #      and the lerps have flattened it.
+    #   6. A DRY CLIFF STILL READS AS ROCK. Worldgen v27 removed the dry-land
+    #      cliff gate, so the classifier calls a cliff by its surrounding biome;
+    #      the slope term is the only thing left that makes it stone. If a
+    #      vertical face in grassland is green top to bottom, that term is
+    #      orphaned.
+    #   7. MOUNTAINS STILL HAVE SNOW. biomeSurfaceMaterial never emits MAT_SNOW,
+    #      so the elevation snowline is the only white in the world.
+    #   8. A TEMPERATE FOREST FLOOR DOES NOT READ AS BARE DIRT. MAT_TOPSOIL is
+    #      31% of land and was green only because the biome LUT said so.
     #   3. NO SEAM IN THE MOTTLE at a streaming ring boundary. That is the
     #      world-metric patch wavelength; a step there means the ring level is
     #      not surviving the key.

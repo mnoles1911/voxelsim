@@ -104,49 +104,37 @@ struct MaterialAppearance {
     uint8_t patchScaleDm = 0;
 
     // HOW MUCH OF THIS MATERIAL'S COLOUR THE CLIMATE OWNS, in 1/255ths.
-    // 0 = the material's own colour, always, everywhere. 255 = the biome LUT's
-    // answer for this column's temperature and precipitation, and this table's
-    // RGB is only what it falls back to.
+    // 0 = the material's own colour, always, everywhere.
     //
-    // WHY THIS IS APPEARANCE AND NOT RENDERER POLICY. It lived as a boolean
-    // `BIOME_TINT` column in ue-project/Tools/terrain_palette.py, on the
-    // argument that "who decides this voxel's colour" is UE-side policy rather
-    // than a fact about the material. It is a fact about the material. Bedrock
-    // is the same grey in a rainforest and in a tundra because it is rock;
-    // grassland is a different green in each because grass is a plant that
-    // responds to climate. That difference is what the material IS, and every
-    // consumer needs the same answer for the same reason they need the same
-    // colour -- asset-forge's preview included, which today shows terrain
-    // materials at a saturation the game never draws them at.
+    // IT IS ZERO ON EVERY ROW, and that is the decision rather than an accident
+    // of nobody having set it. Owner call, 2026-08-22: "no biome or
+    // weather/precipitation based tinting. voxel face color is driven purely by
+    // the material for now."
     //
-    // WHY IT IS A WEIGHT AND NOT A BOOLEAN. A boolean forces the choice between
-    // "one flat rock tone underground" (what shipped, and what makes a cave wall
-    // read as untextured cardboard) and "the hillside is the colour of its
-    // material, not its climate". A weight is the third option, and it is the one
-    // the colour system is built on: the climate answer and the material answer
-    // are blended per material, so a cave keeps bedrock/rock/gravel/subsoil
-    // apart while a hillside still reads as its biome.
+    // THE COLUMN STAYS because zero is a statement and a deleted field is
+    // silence. It is where the decision is written down, it is what a future
+    // reversal would move, and it is what lets the composition in
+    // materialcolor.h keep its shape -- the climate stage is still stage 2, it
+    // is just weighted out everywhere. Deleting it would make re-introducing
+    // climate a code change instead of a data one.
     //
-    // WHY THE SURFACE VALUES ARE AS HIGH AS THEY ARE (190-235 rather than, say,
-    // 128). Not taste -- the classifier. On real diffusion tiles voxel-core
-    // labels very nearly every outdoor surface voxel MAT_SAND (its precipitation
-    // thresholds are calibrated for SyntheticTileSampler, not for WorldClim's
-    // 0-12000 mm/yr quantisation; VoxelClimateProbe.h records the measurement).
-    // Until that is fixed, material id carries almost no information outdoors and
-    // climate carries all of it, so a low weight here would not make the world
-    // more varied -- it would paint the whole landmass sand. These numbers say
-    // "climate still owns the surface, but the material is allowed to show
-    // through", which is the largest step that is safe to take before the
-    // classifier is measured again. When it is fixed, this column is where the
-    // world gets its material identity back, and lowering it is a data change
-    // rather than a code one.
+    // WHAT IT USED TO SAY, and why that was wrong. Between ADR-0009's first
+    // draft and this one the surface materials carried 190-235 here, on the
+    // argument that voxel-core's classifier labels nearly every outdoor surface
+    // MAT_SAND so climate had to carry all outdoor colour. That argument was
+    // stale: the claim came from a 2026-08-11 handoff, and VoxelClimateProbe.h
+    // had ALREADY retracted it -- "an earlier draft of this work asserted the
+    // world was all MAT_SAND, reasoning from biome.h's thresholds rather than
+    // measuring -- that was wrong". Worldgen v22 and v27 fixed the classifier;
+    // vxc_matcensus now measures six distinct surface materials over 92% of
+    // land and confirms the ids reach the quads.
     //
-    // ASSET MATERIALS ARE ALL 0, and that is a stronger statement than it looks.
-    // A biome tint answers "what colour is the GROUND here" -- it is a property
-    // of a place. Bark is attached to a place; a fish is not, and would change
-    // colour as it swam across a climate boundary. A tinted MAT_PLUME_CYAN would
-    // also destroy the most stylised entry in the table, which exists precisely
-    // because a kingfisher is not the colour of anything around it.
+    // WHAT IS LOST, stated because it is a real subtraction from an
+    // Earth-realistic sim: the within-biome climate gradient. Every grassland is
+    // now the same green whatever its rainfall. What replaces it is per-voxel
+    // variation and 828 species of placed cover, which is what the reference art
+    // does too. The 50 km clipmap keeps the biome LUT, so the vista still has a
+    // climate gradient; the LUT is generated from this table so the two agree.
     uint8_t biomeTint = 0;
 };
 
@@ -159,17 +147,17 @@ inline constexpr MaterialAppearance kMaterialPalette[kMaterialCount] = {
     /* MAT_BEDROCK */ {{{70, 69, 74}, {70, 69, 74}, {63, 62, 67}}, 28, 7, 34, 24, 0},
     /* MAT_ROCK */ {{{132, 126, 108}, {125, 119, 102}, {114, 109, 94}}, 42, 12, 48, 20, 0},
     /* MAT_GRAVEL */ {{{150, 139, 119}, {144, 133, 114}, {134, 124, 107}}, 52, 14, 40, 12, 0},
-    /* MAT_SAND */ {{{206, 186, 140}, {200, 181, 136}, {188, 170, 128}}, 30, 12, 34, 16, 235},
+    /* MAT_SAND */ {{{206, 186, 140}, {200, 181, 136}, {188, 170, 128}}, 30, 12, 34, 16, 0},
     /* MAT_SUBSOIL */ {{{120, 96, 72}, {115, 92, 69}, {106, 85, 64}}, 34, 14, 40, 18, 0},
-    /* MAT_TOPSOIL */ {{{96, 74, 52}, {90, 70, 49}, {82, 63, 44}}, 38, 16, 46, 16, 210},
+    /* MAT_TOPSOIL */ {{{96, 74, 52}, {90, 70, 49}, {82, 63, 44}}, 38, 16, 46, 16, 0},
     /* MAT_SNOW */ {{{243, 246, 251}, {238, 241, 247}, {228, 232, 240}}, 10, 4, 16, 28, 0},
     // Grass: the one where the face split earns its keep. Green on top, a
     // shorter fringe on the sides, soil underneath.
-    /* MAT_GRASS */ {{{76, 116, 54}, {66, 96, 50}, {88, 67, 48}}, 46, 34, 54, 14, 215},
-    /* MAT_JUNGLE_SOIL */ {{{104, 58, 38}, {98, 55, 36}, {88, 49, 32}}, 36, 18, 44, 16, 215},
-    /* MAT_SAVANNA_GRASS */ {{{170, 158, 90}, {154, 142, 82}, {104, 84, 54}}, 44, 30, 52, 14, 215},
-    /* MAT_PODZOL */ {{{82, 78, 70}, {78, 74, 66}, {70, 66, 60}}, 34, 10, 42, 18, 215},
-    /* MAT_PERMAFROST */ {{{170, 180, 188}, {164, 174, 182}, {152, 162, 172}}, 26, 10, 32, 22, 190},
+    /* MAT_GRASS */ {{{76, 116, 54}, {66, 96, 50}, {88, 67, 48}}, 46, 34, 54, 14, 0},
+    /* MAT_JUNGLE_SOIL */ {{{104, 58, 38}, {98, 55, 36}, {88, 49, 32}}, 36, 18, 44, 16, 0},
+    /* MAT_SAVANNA_GRASS */ {{{170, 158, 90}, {154, 142, 82}, {104, 84, 54}}, 44, 30, 52, 14, 0},
+    /* MAT_PODZOL */ {{{82, 78, 70}, {78, 74, 66}, {70, 66, 60}}, 34, 10, 42, 18, 0},
+    /* MAT_PERMAFROST */ {{{170, 180, 188}, {164, 174, 182}, {152, 162, 172}}, 26, 10, 32, 22, 0},
     /* MAT_MUD */ {{{62, 66, 58}, {59, 63, 55}, {53, 57, 50}}, 28, 10, 38, 18, 0},
     /* MAT_CLAY */ {{{152, 118, 94}, {146, 113, 90}, {136, 105, 84}}, 24, 12, 34, 20, 0},
     // Debug instrument. Deliberately flat and deliberately hideous: it is

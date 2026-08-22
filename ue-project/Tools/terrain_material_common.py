@@ -41,7 +41,11 @@ PALETTE_TEXTURE = "/Game/Voxel/T_VoxelPalette.T_VoxelPalette"
 BIOME_LUT_TEXTURE = "/Game/Voxel/T_VoxelBiomeLUT.T_VoxelBiomeLUT"
 DETAIL_TEXTURE = "/Game/Voxel/T_VoxelDetail.T_VoxelDetail"
 
-from terrain_palette import PALETTE_WIDTH, biome_tinted_runs  # noqa: E402
+from terrain_palette import (  # noqa: E402
+    PALETTE_WIDTH,
+    biome_tinted_runs,
+    linear_rgb,
+)
 
 
 def load_texture(path):
@@ -164,11 +168,18 @@ class GraphBuilder:
         self.link(b, b_out, n, "B")
         return n
 
-    def lerp(self, a, a_out, b, b_out, alpha, alpha_out=""):
+    def lerp(self, a, a_out, b, b_out, alpha, alpha_out="", desc=None):
         n = self.node(unreal.MaterialExpressionLinearInterpolate)
         self.link(a, a_out, n, "A")
         self.link(b, b_out, n, "B")
         self.link(alpha, alpha_out, n, "Alpha")
+        # `desc` is the node comment Unreal shows in the graph editor. Worth
+        # setting on the few nodes whose PRESENCE is load-bearing: it labels them
+        # for a human opening M_VoxelTerrain, and it is what
+        # tools/check-terrain-graph.py looks for when it asks whether a term is
+        # still in the live graph rather than orphaned in a dead branch.
+        if desc:
+            n.set_editor_property("desc", desc)
         return n
 
     def ramp(self, value, value_out, lo, hi):
@@ -351,16 +362,35 @@ def build_terrain_base_color(
     # world grass/rock. The voxel material therefore passes a low
     # rock_slope_strength, where the term reads as natural darkening of the
     # riser rather than as a change of material.
-    rock_color = b.vector("RockColor", 0.36, 0.335, 0.30)
+    #
+    # THE COLOUR IS THE MATERIAL'S (ADR-0009). It used to be an authored
+    # VectorParameter at (0.360, 0.335, 0.300), which is 1.6x brighter and 2.0x
+    # the blue of MAT_ROCK -- so a cliff face and the cave you dug into that same
+    # cliff were visibly different rocks. Generated from the palette, there is
+    # one answer per substance.
+    #
+    # AND THE TERM IS NOT OPTIONAL, which is worth stating because everything
+    # else climate-driven was deleted around it. Worldgen v27 deliberately
+    # removed the dry-land cliff -> BARE_ROCK gate, so the classifier labels a
+    # dry cliff as whatever biome surrounds it. Without this, a 50 m vertical
+    # face in grassland renders as grass all the way down. It is GEOMETRY, not
+    # weather, which is why it survived the cut.
+    rock_color = b.const3(*linear_rgb("MAT_ROCK"))
     rock_w = b.mul(
         b.ramp(slope, "", b.scalar("RockSlopeLow", 0.30), b.scalar("RockSlopeHigh", 0.80)),
         b.scalar("RockSlopeStrength", rock_slope_strength),
     )
 
-    # BEACH. Flat ground within a few metres of sea level. This is the one place
-    # real sand belongs; voxel-core currently labels the entire landmass
-    # MAT_SAND, so sand cannot come from the material id.
-    beach_color = b.vector("BeachColor", 0.72, 0.65, 0.50)
+    # BEACH. Flat ground within a few metres of sea level.
+    #
+    # KEPT FOR THE CLIPMAP ONLY. Its justification was "voxel-core currently
+    # labels the entire landmass MAT_SAND, so sand cannot come from the material
+    # id" -- which was never true after worldgen v8 and is measurably false now:
+    # vxc_matcensus finds BEACH columns carrying MAT_SAND, and the world preview
+    # draws them as a sand shoreline without this term doing anything. On the
+    # voxel path it is therefore redundant with the material and is not applied.
+    # The clipmap has no material ids at all, so it still needs this.
+    beach_color = b.const3(*linear_rgb("MAT_SAND"))
     near_sea = b.one_minus(b.ramp(b.abs_(world_z_m), "",
                                   b.const(0.0), b.scalar("BeachHeightMeters", 7.0)))
     beach_w = b.mul(near_sea, b.one_minus(slope))
@@ -372,7 +402,20 @@ def build_terrain_base_color(
     # world's highest point is 2897 m, so it is a cap on the very tops.
     # SnowTempMax 0.16 in remapped units is about -4.1 degC, which is roughly
     # the coldest 8-10% of this world's land.
-    snow_color = b.vector("SnowColor", 0.90, 0.925, 0.96)
+    #
+    # THE COLOUR IS MAT_SNOW'S. These two happened to agree almost exactly
+    # already -- someone had aligned them by hand -- which is the argument for
+    # generating rather than authoring: the pair that was right stays right for
+    # free, and the pair that had drifted (rock) stops being able to.
+    #
+    # ON THE VOXEL PATH ONLY THE ELEVATION HALF IS USED. Temperature is weather,
+    # and ADR-0009 removed weather from near-field colour. The elevation half
+    # survives because it is geometry AND because deleting it would delete snow
+    # from the world outright: biomeSurfaceMaterial never returns MAT_SNOW
+    # (core.h calls it "legacy v0 ... superseded by MAT_PERMAFROST/MAT_ROCK"), so
+    # nothing else would put white on a mountain. This is a STAND-IN for worldgen
+    # emitting MAT_SNOW above a line, and should be deleted the day it does.
+    snow_color = b.const3(*linear_rgb("MAT_SNOW"))
     snow_from_temp = b.one_minus(
         b.ramp(vertex_color, "B", b.scalar("SnowTempMax", 0.16),
                b.add(b.scalar("SnowTempMax", 0.16), b.scalar("SnowTempFeather", 0.10))))
@@ -381,73 +424,69 @@ def build_terrain_base_color(
                          b.scalar("SnowlineHighMeters", 2900.0))
     snow_w = b.saturate(b.maximum(snow_from_temp, snow_from_z))
 
-    # --- compose the surface ------------------------------------------------
-    surface = b.lerp(biome, "RGB", rock_color, "", rock_w)
-    surface = b.lerp(surface, "", beach_color, "", beach_w)
-    surface = b.lerp(surface, "", snow_color, "", snow_w)
-
-    # --- ADR-0009: the material's own colour, and how much the climate owns ---
+    # --- compose ---------------------------------------------------------
     #
-    # Two weights multiply here and they answer different questions.
+    # TWO PATHS, and they diverged deliberately at ADR-0009.
     #
-    #   tint_weight  GEOMETRIC. Is this face near the terrain surface at all?
-    #                A MAT_TOPSOIL face cut open by a cave is soil, not
-    #                grassland, and this is the signal that knows the difference.
-    #                It is VertexColor.R, binary, and it predates this change.
+    # The CLIPMAP still composes a climate colour: it is a heightmap sample with
+    # no material id to look one up with, so the biome LUT and all three
+    # modifiers are the only appearance it has. The LUT is generated from
+    # kMaterialPalette (gen_terrain_textures.write_biome_lut), so the vista's
+    # colours are the palette's colours smoothed across climate space and the
+    # two paths cannot drift apart at their seam -- which they did once before,
+    # and this shared function exists because of it.
     #
-    #   biome_tint   MATERIAL. Does this substance respond to climate? Rock is
-    #                the same grey in a rainforest and a tundra; grass is not.
-    #                Authored per material in vxc::kMaterialPalette.
-    #
-    # Their product is how much of the climate answer a pixel takes. What is left
-    # is the material's own colour -- which is what puts bedrock, rock, gravel
-    # and subsoil back on a cave wall after a year of one flat SubsurfaceColor
-    # for all of them.
+    # The VOXEL path takes its colour from the material and nothing else.
     if palette is None:
-        # No material id on this path. Today's graph exactly: one flat tone
-        # below the surface, the climate above it.
+        surface = b.lerp(biome, "RGB", rock_color, "", rock_w)
+        surface = b.lerp(surface, "", beach_color, "", beach_w)
+        surface = b.lerp(surface, "", snow_color, "", snow_w)
+        # Palette alpha decides how much of the surface biome takes over: 0 for
+        # subsurface strata, 255 for surface materials. One flat tone below,
+        # climate above.
         base = b.lerp(subsurface, "", surface, "", tint_weight, "")
     else:
-        # `present` is 0 wherever no palette reached this pixel -- the component
-        # vertex factory supplies no fourth or fifth UV and they arrive as zero
-        # (Tools/probe_texcoord1.py measured it). Everything below degrades
-        # through it to the climate-only graph above rather than to black, which
-        # is what an unguarded weight of 0 would mean: "the material owns its
-        # colour", with an equally-unwritten base of (0,0,0).
-        material = b.lerp(subsurface, "", palette["base"], "", palette["present"], "")
-        climate_share = b.mul(
-            tint_weight,
-            b.lerp(b.const(1.0), "", palette["biome_tint"], "", palette["present"], ""))
-        base = b.lerp(material, "", surface, "", climate_share, "")
-
-        # THE VARIATION GOES HERE, AFTER THE BLEND, and that placement is the
-        # whole reason the shader hands the base and the variation over
-        # separately instead of one finished colour. Applied before the blend it
-        # would land on the material's share only, and every outdoor surface
-        # hands 190-235/255 of its colour to the climate -- so the per-voxel
-        # dither would be averaged away on exactly the surfaces the player spends
-        # the whole game looking at. That is the difference between a mottled
-        # hillside and a flat one.
+        # THE MODIFIERS ARE APPLIED HERE, TO THE MATERIAL, and that re-parenting
+        # is the whole hazard of this change. They used to be lerped into
+        # `surface`, which was only reachable through the climate share -- so
+        # setting every biomeTint to 0 would have orphaned all three inside a
+        # dead branch and silently deleted every cliff and all the snow in the
+        # world, with nothing erroring and no test failing.
         #
-        # The arithmetic mirrors vxc::applyTintQ16 and VoxelApplyVariation:
-        # scale all three by (1 + light), then red by (1 + hue) and blue by
-        # (1 - hue). A warm/cool tilt along the material's own axis, not a
-        # rotation in a colour space nothing else here uses.
+        # Each is multiplied by tint_weight (VertexColor.R, the near-surface
+        # flag) for the reason that flag has always existed: a cave floor is a
+        # +Z face too, and neither snow nor weathered rock belongs on one.
+        base = palette["base"]
+        base = b.lerp(base, "", rock_color, "", b.mul(rock_w, tint_weight),
+                      desc="ADR-0009 slope-rock (material path)")
+        # ELEVATION ONLY -- snow_from_z, not snow_w. snow_w ORs in the
+        # temperature term, which is weather.
+        base = b.lerp(base, "", snow_color, "",
+                      b.mul(b.saturate(snow_from_z), tint_weight),
+                      desc="ADR-0009 snowline (material path)")
+        # ...and BEACH is not applied at all: the classifier already emits
+        # MAT_SAND for the BEACH biome, so this would paint sand over sand.
+
+        # THE VARIATION GOES LAST. Before the lerps above it would be flattened
+        # by them wherever they bite; before a climate blend it would be averaged
+        # away. materialcolor.h's stage order is: place, then vary.
         light, hue = palette["light"], palette["hue"]
         base = b.mul(base, b.add(b.const(1.0), light))
-        # Rebuilt as a full RGB multiply rather than a component write: the
-        # material graph has no way to assign one channel of an expression, and
-        # appending three separately-scaled scalars is the idiom that survives
-        # being read six months from now.
         tilt = b.append(
             b.append(b.add(b.const(1.0), hue), "", b.const(1.0), ""), "",
             b.sub(b.const(1.0), hue), "")
         base = b.mul(base, tilt)
-        # max(c, 0) -- the shader's own clamp, and NOT a clamp at 1: a tint can
-        # legitimately push a bright material above 1.0 in linear, and clamping
-        # would flatten the top of the range on exactly the materials (snow, pale
-        # bark) that sit near it already.
+        # max(c, 0), the shader's own clamp, and NOT a clamp at 1: a tint can
+        # legitimately push a bright material above 1.0 in linear.
         base = b.maximum(base, b.const3(0.0, 0.0, 0.0))
+
+        # `present` is 0 wherever no palette reached this pixel -- the component
+        # vertex factory supplies no fourth or fifth UV and they arrive as zero.
+        # Falling back to the climate-only graph there rather than to black is
+        # what keeps that path drawing a world.
+        fallback = b.lerp(subsurface, "", b.lerp(biome, "RGB", snow_color, "", snow_w),
+                          "", tint_weight, "")
+        base = b.lerp(fallback, "", base, "", palette["present"], "")
 
     # --- detail -------------------------------------------------------------
     #
