@@ -8842,6 +8842,66 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)BrickPool.GetChunksAddedWithNeutralShading());
 	}
 
+	// THE HOLE METRIC (voxel.March.HoleStats). The owner's complaint is holes
+	// while flying at 30 m/s; this line is its instrument -- before it the only
+	// reading was a screenshot, and the standing rule is that the owner judges
+	// screenshots while decisions need instruments.
+	//
+	// HOW TO READ IT, and what moves each number BOTH ways -- both counters
+	// were built so they can, because a gate that can only come out one way is
+	// this project's most-repeated mistake:
+	//
+	//   substituted -- rays whose HIT came from a level coarser than the
+	//     segment that owns that ground: the no-hole invariant's stand-ins,
+	//     on screen, counted. Counts hits, so sky cannot contaminate it. UP
+	//     under motion with voxel.March.Fallthrough > 0 while streaming lags;
+	//     DOWN to zero at rest once streaming settles, and structurally zero
+	//     with fallthrough 0.
+	//   uncovered -- rays that hit NOTHING at any level, crossed a chunk that
+	//     is ABSENT (not resident-and-empty -- that is real air), and point
+	//     below the horizon. This is the real hole count. UP under
+	//     -VoxelMaxRingLevel=0 (streaming holds level 0 only, the walk covers
+	//     4 km), a cold start, or flight faster than streaming feeds; DOWN to
+	//     near zero on a settled stationary world. Known over-count, stated:
+	//     a below-horizon ray whose true ground lies beyond the cascade's
+	//     edge but which crossed a sky-band-trimmed chunk on the way.
+	//
+	// rays is the denominator for both rates; frames is how many per-frame
+	// readbacks landed in this window (GPU readback runs 1-3 frames behind,
+	// which is noise against a 5 s window). substituted <= hits and
+	// uncovered <= rays - hits are identities; a window violating either
+	// means the readback and the kernel have diverged.
+	{
+		const FVoxelMarchHoleStats H = VoxelMarchGetAndResetHoleStats();
+		if (H.bArmed && H.Frames == 0)
+		{
+			// The refusal path, per the shadow census: zeros that look healthy
+			// are how counters lie. Armed with nothing landed is "not
+			// measuring", never "no holes".
+			UE_LOG(LogVoxelPerf, Warning,
+			       TEXT("Voxel march holes (5s window): ARMED BUT NO READBACKS LANDED -- ")
+			       TEXT("refusing a healthy-looking zero. Either the march pass is not ")
+			       TEXT("running (voxel.March 0, no pool, no view) or every slot ring was ")
+			       TEXT("full. This line is not evidence about holes either way."));
+		}
+		else if (H.Frames > 0)
+		{
+			const double Rays = double(H.Rays);
+			const double Hits = double(H.Hits);
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel march holes (5s window): uncovered=%llu (%.4f%% of rays) ")
+			       TEXT("substituted=%llu (%.4f%% of hits) | rays=%llu hits=%llu ")
+			       TEXT("framesMeasured=%llu"),
+			       (unsigned long long)H.Uncovered,
+			       Rays > 0.0 ? 100.0 * double(H.Uncovered) / Rays : 0.0,
+			       (unsigned long long)H.Substituted,
+			       Hits > 0.0 ? 100.0 * double(H.Substituted) / Hits : 0.0,
+			       (unsigned long long)H.Rays, (unsigned long long)H.Hits,
+			       (unsigned long long)H.Frames);
+		}
+		// Not armed: silence, exactly like every other off instrument here.
+	}
+
 	if (VoxelTerrainQuadsRetired())
 	{
 		const UVoxelGpuPoolComponent* TerrainPool = GpuPool.Get();

@@ -158,6 +158,26 @@ namespace
 		TEXT("Rings + source 1 only."),
 		ECVF_RenderThreadSafe);
 
+	TAutoConsoleVariable<int32> CVarVoxelMarchHoleStats(
+		TEXT("voxel.March.HoleStats"), 0,
+		TEXT("THE HOLE METRIC. The owner's complaint is holes while flying at 30 m/s and this ")
+		TEXT("is its instrument -- until it existed the only reading was a screenshot. Counts, ")
+		TEXT("per frame on the SHIPPING kernel: rays, hits, `substituted` (a hit from a level ")
+		TEXT("COARSER than the segment that owns that ground -- the no-hole invariant visibly ")
+		TEXT("doing its job) and `uncovered` (no hit at any level, AND the ray crossed a chunk ")
+		TEXT("that is ABSENT -- not resident-and-empty -- AND it points below the horizon: the ")
+		TEXT("real hole count). Printed on the 5 s LogVoxelPerf line with rays alongside.\n")
+		TEXT("NOT the naive metric, deliberately: 'ray exited the cascade with no hit' counts ")
+		TEXT("the SKY -- every sky ray satisfies it and the sky-band trim keeps non-resident ")
+		TEXT("space above every ridge, so it can never read zero. Both counters here move BOTH ")
+		TEXT("ways: -VoxelMaxRingLevel=0 makes `uncovered` large; a settled stationary world ")
+		TEXT("reads it near zero; `substituted` rises in flight with voxel.March.Fallthrough>0 ")
+		TEXT("and falls to zero at rest or with fallthrough 0.\n")
+		TEXT("A SHADER PERMUTATION, default 0, and off is FREE: no UAV is created or bound, no ")
+		TEXT("groupshared word exists, no atomic runs -- the off arm is the byte-identical ")
+		TEXT("control, same rule as rings and fallthrough. Rings + source 1 only."),
+		ECVF_RenderThreadSafe);
+
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
 		TEXT("voxel.March.RingCount"), 6,
 		TEXT("How many rings the cascade walks, 1..6. 6 is the full 4 km cascade; 2 is the ")
@@ -427,6 +447,12 @@ FVoxelMarchArm VoxelMarchGetArm()
 	// asked for here either.
 	Arm.Fallthrough =
 		Arm.bRings ? FMath::Clamp(CVarVoxelMarchFallthrough.GetValueOnAnyThread(), 0, 2) : 0;
+	// Both hole counters are properties of the ring walk (`substituted` needs
+	// a segment/level split to compare; `uncovered` needs per-level residency),
+	// so without rings the dimension is forced to its control value -- the
+	// permutation for hole stats without rings is refused at compile and must
+	// not be asked for here either.
+	Arm.bHoleStats = Arm.bRings && (CVarVoxelMarchHoleStats.GetValueOnAnyThread() != 0);
 	Arm.ReachM = FMath::Max(CVarVoxelMarchReachM.GetValueOnAnyThread(), 0.0f);
 	Arm.bAO = CVarVoxelMarchAO.GetValueOnAnyThread() != 0;
 	Arm.bVelocity = CVarVoxelMarchVelocity.GetValueOnAnyThread() != 0;
@@ -2440,6 +2466,26 @@ FVoxelMarchStats VoxelMarchGetStats()
 	return GMarchState->GetStats();
 }
 
+FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats()
+{
+	FVoxelMarchHoleStats Out;
+	// bArmed comes from the cvar, not from whether anything landed, so the
+	// perf line can distinguish "on but no readback yet" (a warning-shaped
+	// zero) from "off" (silence). The distinction is the whole reason the
+	// shadow census has a refusal path.
+	Out.bArmed = VoxelMarchGetArm().bHoleStats;
+	if (!GMarchState.IsValid())
+	{
+		return Out;
+	}
+	FScopeLock Guard(&GMarchState->Lock);
+	const bool bArmed = Out.bArmed;
+	Out = GMarchState->HoleWindow;
+	Out.bArmed = bArmed;
+	GMarchState->HoleWindow = FVoxelMarchHoleStats();
+	return Out;
+}
+
 // ===========================================================================
 // Shader parameter structs
 // ===========================================================================
@@ -2494,6 +2540,11 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCSParameters, )
 	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<uint2>, MarchOutVis)
 	SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, MarchOutHitT)
 	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchOutTileHit)
+	// The hole metric's stats words (voxel.March.HoleStats). Null -- not a
+	// dummy buffer -- on every frame the arm is off: the off permutation has
+	// no shader-side global, so the entry is simply unused, which is the
+	// inverse of the MarchCoverReachUU note above and equally legal.
+	SHADER_PARAMETER_RDG_BUFFER_UAV(RWBuffer<uint>, MarchOutHoleStats)
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCompactParameters, )
@@ -2557,6 +2608,18 @@ class FVoxelMarchRingsDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_RINGS");
 // meaningful with rings on and source 1, and the other combinations are
 // refused below rather than compiled and never selected.
 class FVoxelMarchFallthroughDim : SHADER_PERMUTATION_INT("VOXEL_MARCH_FALLTHROUGH", 3);
+// The hole metric (voxel.March.HoleStats). A PERMUTATION so that off is a
+// byte-identical control -- no UAV global, no groupshared, no atomics in the
+// binary -- same rule as rings. DELIBERATELY NOT A WALK-SHAPE DIMENSION
+// (FVoxelMarchWalkShape stays at 6): everything under VOXEL_MARCH_HOLE_STATS
+// is observation -- it cannot change any ray's bHit or THitUU, so the
+// comparator grades the same picture with it on or off. The bookkeeping it
+// shares with fallthrough (bResident/bCrossedAbsentChunk, via
+// VOXEL_MARCH_TRACK_ABSENT) writes fields only the counters read. If that
+// ever stops being true -- if a hole-stats branch gains the power to change a
+// hit -- it must move into the walk shape and be classified, per the
+// static_assert below.
+class FVoxelMarchHoleStatsDim : SHADER_PERMUTATION_BOOL("VOXEL_MARCH_HOLE_STATS");
 
 // ===========================================================================
 // THE WALK SHAPE, AND WHY IT IS A STRUCT WITH A COUNT NAILED TO IT
@@ -2637,7 +2700,7 @@ class FVoxelMarchCS : public FGlobalShader
 	using FParameters = FVoxelMarchCSParameters;
 	using FPermutationDomain =
 		TShaderPermutationDomain<FVoxelMarchSourceDim, FVoxelMarchSkipDim, FVoxelMarchRingsDim,
-		                         FVoxelMarchFallthroughDim>;
+		                         FVoxelMarchFallthroughDim, FVoxelMarchHoleStatsDim>;
 
 	// One group == one tile, non-negotiable: the group's hit reduction is what
 	// fills the emit's tile list.
@@ -2667,6 +2730,15 @@ class FVoxelMarchCS : public FGlobalShader
 		{
 			return false;
 		}
+		// The hole counters are ring-walk properties (substituted compares the
+		// walked level against the owning segment; uncovered needs per-level
+		// residency), so hole stats without rings would build, bind and mean
+		// nothing -- refused for the reason the pair above is. Rings already
+		// imply source 1, so that pairing needs no third clause.
+		if (P.Get<FVoxelMarchHoleStatsDim>() && !P.Get<FVoxelMarchRingsDim>())
+		{
+			return false;
+		}
 		return P.Get<FVoxelMarchSourceDim>() != 0 || P.Get<FVoxelMarchSkipDim>() == 0;
 	}
 	static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
@@ -2674,6 +2746,20 @@ class FVoxelMarchCS : public FGlobalShader
 	{
 		FGlobalShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
 		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_TILE_SIZE"), kVoxelMarchTileSize);
+		// The hole-stats word layout, pushed from the ONE enum in the header
+		// rather than restated in the .usf -- see VoxelMarchHoleWord for the
+		// incident (silently-discarded out-of-range writes reading back as
+		// plausible values) that makes a hand mirror unacceptable here.
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_RAYS"),
+		                         int32(VoxelMarchHoleWord::Rays));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_HITS"),
+		                         int32(VoxelMarchHoleWord::Hits));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_SUBSTITUTED"),
+		                         int32(VoxelMarchHoleWord::Substituted));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_UNCOVERED"),
+		                         int32(VoxelMarchHoleWord::Uncovered));
+		OutEnvironment.SetDefine(TEXT("VOXEL_MARCH_HOLE_WORDS"),
+		                         int32(VoxelMarchHoleWord::Count));
 	}
 };
 IMPLEMENT_GLOBAL_SHADER(FVoxelMarchCS, VOXEL_MARCH_USF, "VoxelMarchMain", SF_Compute);
@@ -3409,6 +3495,38 @@ void FVoxelMarchRenderExtension::RetireTimingQueries()
 			Slot.Readback->Unlock();
 			FScopeLock Guard(&State->Lock);
 			State->Stats.TilesHit = Hit;
+		}
+		Slot.bInFlight = false;
+	}
+
+	// The hole metric's ring, polled here BEFORE the gate for the reason the
+	// rings above are: a slot left in flight when the cvar goes to 0 would
+	// stay full forever and the next enable would silently measure nothing.
+	// SUMMED into the window, not overwritten -- these are event counts, and
+	// the frame that lands last is not more representative than the ones
+	// before it (the tile count above is a level, so latest-wins is right
+	// there and would be wrong here).
+	for (FVoxelMarchState::FHoleReadback& Slot : State->HoleRing)
+	{
+		if (!Slot.bInFlight || !Slot.Readback.IsValid() || !Slot.Readback->IsReady())
+		{
+			continue;
+		}
+		const uint32* Src = static_cast<const uint32*>(
+			Slot.Readback->Lock(uint32(VoxelMarchHoleWord::Count) * sizeof(uint32)));
+		if (Src != nullptr)
+		{
+			const uint32 Rays = Src[VoxelMarchHoleWord::Rays];
+			const uint32 Hits = Src[VoxelMarchHoleWord::Hits];
+			const uint32 Substituted = Src[VoxelMarchHoleWord::Substituted];
+			const uint32 Uncovered = Src[VoxelMarchHoleWord::Uncovered];
+			Slot.Readback->Unlock();
+			FScopeLock Guard(&State->Lock);
+			State->HoleWindow.Rays += Rays;
+			State->HoleWindow.Hits += Hits;
+			State->HoleWindow.Substituted += Substituted;
+			State->HoleWindow.Uncovered += Uncovered;
+			State->HoleWindow.Frames++;
 		}
 		Slot.bInFlight = false;
 	}
@@ -4299,6 +4417,23 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			Params->MarchOutHitT = GraphBuilder.CreateUAV(HitT);
 			Params->MarchOutTileHit = TileHitUAV;
 
+			// The hole metric's stats buffer. Created, cleared and bound ONLY
+			// when the arm is on -- off must be free, and "free" here means no
+			// buffer exists, not a buffer nobody reads. The off permutation has
+			// no MarchOutHoleStats global, so the null entry is never touched.
+			FRDGBufferRef HoleStats = nullptr;
+			if (Arm.bHoleStats)
+			{
+				HoleStats = GraphBuilder.CreateBuffer(
+					FRDGBufferDesc::CreateBufferDesc(sizeof(uint32),
+					                                 int32(VoxelMarchHoleWord::Count)),
+					TEXT("VoxelMarch.HoleStats"));
+				FRDGBufferUAVRef HoleStatsUAV =
+					GraphBuilder.CreateUAV(HoleStats, PF_R32_UINT);
+				AddClearUAVPass(GraphBuilder, HoleStatsUAV, 0u);
+				Params->MarchOutHoleStats = HoleStatsUAV;
+			}
+
 			FVoxelMarchCS::FPermutationDomain Permutation;
 			Permutation.Set<FVoxelMarchSourceDim>(Arm.Source);
 			Permutation.Set<FVoxelMarchSkipDim>(Arm.Source == 1 ? Arm.SkipLevels : 0);
@@ -4306,6 +4441,8 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 			// Already 0 when rings are off (VoxelMarchGetArm), matching the
 			// refused permutation.
 			Permutation.Set<FVoxelMarchFallthroughDim>(Arm.Fallthrough);
+			// Already false without rings (VoxelMarchGetArm), same rule.
+			Permutation.Set<FVoxelMarchHoleStatsDim>(Arm.bHoleStats);
 			TShaderMapRef<FVoxelMarchCS> Shader(ShaderMap, Permutation);
 			// ERDGPassFlags::NeverCull, AND IT IS NOT DEFENSIVE -- WITHOUT IT
 			// MODE 2 MEASURES NOTHING.
@@ -4331,6 +4468,30 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 				                             Arm.StepBudget),
 				ERDGPassFlags::Compute | ERDGPassFlags::NeverCull,
 				Shader, Params, FIntVector(TileCount.X, TileCount.Y, 1));
+
+			// The hole metric's readback, straight after the pass that wrote
+			// it -- the VoxelShadowMarch.cpp slot-ring pattern, copied rather
+			// than re-invented. A frame with no free slot goes unmeasured and
+			// biases nothing: the perf line divides by frames LANDED.
+			if (HoleStats != nullptr)
+			{
+				FVoxelMarchState::FHoleReadback* Free = nullptr;
+				for (FVoxelMarchState::FHoleReadback& Slot : State->HoleRing)
+				{
+					if (!Slot.bInFlight) { Free = &Slot; break; }
+				}
+				if (Free != nullptr)
+				{
+					if (!Free->Readback.IsValid())
+					{
+						Free->Readback = MakeUnique<FRHIGPUBufferReadback>(
+							TEXT("VoxelMarch.HoleStatsReadback"));
+					}
+					AddEnqueueCopyPass(GraphBuilder, Free->Readback.Get(), HoleStats,
+					                   uint32(VoxelMarchHoleWord::Count) * sizeof(uint32));
+					Free->bInFlight = true;
+				}
+			}
 		}
 
 		// The emit's indirect args and its tile list. Compacted from the hit mask

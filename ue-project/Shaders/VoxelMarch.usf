@@ -206,6 +206,19 @@ RWTexture2D<uint2> MarchOutVis;
 RWTexture2D<float> MarchOutHitT;
 RWBuffer<uint>     MarchOutTileHit;
 
+#if VOXEL_MARCH_HOLE_STATS
+// The hole metric's output: VOXEL_MARCH_HOLE_WORDS uints, cleared by the CPU
+// each frame, read back through the slot ring in VoxelMarchRenderer.cpp and
+// summed into the 5 s perf window. The word indices are pushed as defines by
+// FVoxelMarchCS::ModifyCompilationEnvironment from the ONE enum in
+// VoxelMarchRenderer.h -- not mirrored by hand, because a hand mirror of a
+// stats layout has already bitten this project (the 60-vs-64 word probe whose
+// out-of-range writes D3D12 silently discarded, leaving plausible wrong
+// values). Bound only on this permutation; off is not merely unread, the
+// global does not exist.
+RWBuffer<uint> MarchOutHoleStats;
+#endif
+
 uint   MarchTileTotal;
 Buffer<uint>   MarchTileHit;
 RWBuffer<uint> MarchOutTileList;
@@ -443,6 +456,47 @@ float VoxelMarchSceneViewZ(float DeviceZ)
 
 groupshared uint GVoxelMarchGroupHit;
 
+#if VOXEL_MARCH_HOLE_STATS
+// THE HOLE METRIC (voxel.March.HoleStats): per-tile partial sums, folded into
+// MarchOutHoleStats with one InterlockedAdd per non-zero word per group --
+// the accumulate shape VoxelShadowMarch.usf:591-610 ships, copied rather than
+// re-invented. Per-ray global atomics were rejected there for contention and
+// the same arithmetic applies here (~1.3M rays vs ~20K groups at 1080p).
+//
+// The two counters that matter, and what makes each move BOTH ways -- a gate
+// that cannot come out the other way is not a gate, and this project has a
+// recorded incident of exactly that (the DEAD-number statistic in the Phase 0
+// marcher gate):
+//
+//   substituted -- hits whose winning level was COARSER than the segment
+//     owning that ground. UP: flying at 30 m/s with fallthrough on while
+//     streaming lags (stand-ins on screen). DOWN: hovering until streaming
+//     settles -- the fine chunks arrive and win back their segments -- or
+//     fallthrough 0, where it is structurally zero. Counts HITS, so sky
+//     cannot touch it.
+//
+//   uncovered -- rays that hit NOTHING at any level, CROSSED a chunk that is
+//     absent (not resident -- distinct from resident-and-empty, which is real
+//     air), and point BELOW the horizon. This is the owner's actual hole,
+//     counted. UP: -VoxelMaxRingLevel=0 (streaming holds level 0 only while
+//     the walk covers 4 km of non-resident space -- every downward ray past
+//     128 m counts), a cold start, or flight faster than streaming. DOWN: a
+//     settled stationary world (near zero), and fallthrough on converts
+//     uncovered into substituted one-for-one where a coarse stand-in exists.
+//
+// The naive metric this replaces -- "ray exited the cascade with no hit" --
+// counts the SKY: every sky ray satisfies it, and the sky-band trim keeps
+// legitimately non-resident chunks above every ridge, so even the
+// crossed-absent refinement leaks without the below-horizon test. Where
+// `uncovered` still over-counts, honestly: a below-horizon ray that crosses a
+// trimmed sky-band chunk but whose real ground lies BEYOND the cascade's 4 km
+// edge (clipmap territory, or nothing under -VoxelNoClipmap), and a walk that
+// ran out of step budget after crossing absent space. Both are rare and both
+// still read near zero on the settled-stationary control leg, which is the
+// reading that certifies the counter.
+groupshared uint GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_WORDS];
+#endif
+
 [numthreads(VOXEL_MARCH_TILE_SIZE, VOXEL_MARCH_TILE_SIZE, 1)]
 void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
                     uint3 GroupId : SV_GroupID,
@@ -452,6 +506,12 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 	{
 		GVoxelMarchGroupHit = 0u;
 	}
+#if VOXEL_MARCH_HOLE_STATS
+	if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)
+	{
+		GVoxelMarchHoleStat[GroupIndex] = 0u;
+	}
+#endif
 	GroupMemoryBarrierWithGroupSync();
 
 	const int2 LocalPixel = int2(DispatchThreadId.xy);
@@ -505,6 +565,30 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 
 				const FVoxelMarchHit H = VoxelMarchTraverseWithCover(
 					Ray.OriginLocalUU, Ray.DirWorld, TIn, TOut, MarchPixelConeSlope);
+#if VOXEL_MARCH_HOLE_STATS
+				// Counted HERE, on the ray that was actually walked -- not on
+				// bInView -- so `rays` is the true denominator for the two
+				// rates. DirWorld.z < 0 is the horizon discriminator (see the
+				// groupshared block): ground below the camera is ground, and
+				// six levels having nothing for it is a hole, not a view of
+				// the sky. The one t-bracket the walk implies is already in
+				// force: absent crossings can only happen inside ring
+				// segments, which end at the cascade's outer radius.
+				InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_RAYS], 1u);
+				if (H.bHit)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_HITS], 1u);
+					if (H.bSubstituted)
+					{
+						InterlockedAdd(
+							GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_SUBSTITUTED], 1u);
+					}
+				}
+				else if (H.bCrossedAbsentChunk && Ray.DirWorld.z < 0.0f)
+				{
+					InterlockedAdd(GVoxelMarchHoleStat[VOXEL_MARCH_HOLE_UNCOVERED], 1u);
+				}
+#endif
 				if (H.bHit)
 				{
 					bHit = true;
@@ -550,6 +634,23 @@ void VoxelMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
 		const uint TileIndex = GroupId.y * uint(MarchTileCount.x) + GroupId.x;
 		MarchOutTileHit[TileIndex] = 1u;
 	}
+
+#if VOXEL_MARCH_HOLE_STATS
+	// One atomic per non-zero word per 8x8 group, after the barrier the tile
+	// reduction already pays -- so the whole-frame ceiling is 4 * groups
+	// (240*135 = 32,400 groups at 1080p, so <= ~130K candidate adds, most
+	// skipped because substituted and uncovered are zero in a healthy tile),
+	// not 4 * rays (~5.2M). The shadow marcher measured this shape cheap
+	// enough to ship always-on; here it is a permutation anyway.
+	if (GroupIndex < VOXEL_MARCH_HOLE_WORDS)
+	{
+		const uint V = GVoxelMarchHoleStat[GroupIndex];
+		if (V != 0u)
+		{
+			InterlockedAdd(MarchOutHoleStats[GroupIndex], V);
+		}
+	}
+#endif
 }
 
 // ===========================================================================

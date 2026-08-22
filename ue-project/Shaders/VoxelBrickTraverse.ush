@@ -504,6 +504,42 @@
 #define VOXEL_MARCH_FALLTHROUGH 0
 #endif
 
+// THE HOLE METRIC (voxel.March.HoleStats). Counts, per frame, on the shipping
+// kernel: rays marched, rays that hit, hits that came from a level COARSER
+// than the segment that owns that ground (`substituted`), and misses that
+// crossed a chunk the streaming system does not HOLD while pointing below the
+// horizon (`uncovered`). The owner's complaint is holes while flying at
+// 30 m/s and until this counter existed the only instrument was an eyeball.
+//
+// WHY THIS SHAPE AND NOT THE OBVIOUS ONE, recorded because the obvious one
+// was specified and is wrong: "ray exited the cascade with no hit inside the
+// outer ring" is the definition of SKY. Every sky ray satisfies it, the
+// counter would move with camera pitch, and it could never reach the zero the
+// gate demands -- a gate that can only come out one way, which is the mistake
+// this project has paid for most often. Both counters here are built so they
+// can move BOTH ways: `substituted` counts HITS (sky cannot contaminate a
+// hit) and `uncovered` requires crossing a chunk that is ABSENT -- not merely
+// empty -- plus a downward direction, so a settled world reads near zero and
+// a starved one (-VoxelMaxRingLevel=0) reads large.
+//
+// The bookkeeping it needs (bResident / bCrossedAbsentChunk below) is the
+// SAME bookkeeping the fallthrough needs, so VOXEL_MARCH_TRACK_ABSENT turns
+// it on for EITHER define. That is deliberate: the most important `uncovered`
+// reading is the one taken with fallthrough OFF -- today's shipping picture,
+// the baseline hole rate the invariant exists to remove -- and tying the
+// tracking to the fallthrough alone would make that leg unmeasurable.
+//
+// Observation only, on purpose: nothing under VOXEL_MARCH_HOLE_STATS may
+// change any ray's bHit or THitUU, which is why this is NOT a walk-shape
+// dimension for the comparator (see FVoxelMarchWalkShape in
+// VoxelMarchRenderer.cpp -- the comparator grades the picture, and this
+// cannot change the picture).
+#ifndef VOXEL_MARCH_HOLE_STATS
+#define VOXEL_MARCH_HOLE_STATS 0
+#endif
+
+#define VOXEL_MARCH_TRACK_ABSENT (VOXEL_MARCH_FALLTHROUGH > 0 || VOXEL_MARCH_HOLE_STATS)
+
 #define VOXEL_MARCH_HAS_OCCUPANCY 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_OCCUPANCY || VOXEL_MARCH_VERIFY_SOURCE)
 #define VOXEL_MARCH_HAS_BRICKPOOL 	(VOXEL_MARCH_SOURCE == VOXEL_MARCH_SOURCE_BRICKPOOL || VOXEL_MARCH_VERIFY_SOURCE)
 
@@ -784,7 +820,7 @@ struct FVoxelMarchHit
 	// being ambiguous. entered==0 means the ray never got there; entered set
 	// with no hit means it got there and found nothing. Different findings.
 	uint RingsEntered;
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 	// Set by a walk that SKIPPED a chunk which was not merely invalid but NOT
 	// RESIDENT (see FVoxelMarchChunkCache.bResident for the two meanings of
 	// invalid). This is the fallthrough gate: a miss that never crossed absent
@@ -793,7 +829,18 @@ struct FVoxelMarchHit
 	// air. A miss that DID cross absent ground may be a hole, and the ring
 	// loop retries that segment one level coarser. Zero-initialised with the
 	// rest of the struct by (FVoxelMarchHit)0.
+	//
+	// On the MISS returned by VoxelMarchTraverseRings this is the OR across
+	// every walk of every segment, not the last walk's own flag -- the hole
+	// metric asks "did this ray cross ground we do not hold anywhere", and a
+	// ray whose absent crossing was in segment 2 of 6 must still count.
 	bool bCrossedAbsentChunk;
+	// A HIT whose winning walk was COARSER than the segment that owns that
+	// ground (WalkL > SegL under fallthrough): the player is looking at a
+	// stand-in. Countable at the ring loop's return and nowhere else, because
+	// only the ring loop knows both levels. Structurally false whenever
+	// VOXEL_MARCH_FALLTHROUGH is 0 -- no coarser walk exists to win.
+	bool bSubstituted;
 #endif
 	uint2 FineBrickMask;
 	int3  FineMaskChunk;
@@ -1333,7 +1380,7 @@ struct FVoxelMarchChunkCache
 {
 	int3 ChunkCoord;
 	bool bValid;        // resident AND the record agrees with the key
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 	// bValid=false COLLAPSES TWO ANSWERS and the fallthrough must not: "not
 	// resident" (a hole -- the stand-in level should be consulted) and
 	// "resident and genuinely empty" (correct air -- consulting a coarser
@@ -1366,7 +1413,7 @@ FVoxelMarchChunkCache VoxelMarchNoChunk()
 	FVoxelMarchChunkCache C;
 	C.ChunkCoord = int3(0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF);
 	C.bValid = false;
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 	C.bResident = false; // "nothing here" must read as absent, never as empty
 #endif
 	C.BrickBase = 0u;
@@ -1412,7 +1459,7 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// it is why the bit rides the index dword instead of the record.
 	if ((Entry & VOXEL_MARCH_INDEX_ANYSOLID_BIT) == 0u)
 	{
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 		// Resident and empty: REAL AIR, not a hole. Marking it resident is
 		// what stops the fallthrough from plugging a cave mouth with the
 		// coarse level's rock. The record is never validated on this path --
@@ -1486,7 +1533,7 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 	// index's copy is the hint and this one is the truth.
 	if ((LevelAndFlags & 0x10u) == 0u)
 	{
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 		// The validated record itself says empty: real air, so no fallthrough.
 		C.bResident = true;
 #endif
@@ -1501,7 +1548,7 @@ FVoxelMarchChunkCache VoxelMarchLookupChunk(int3 ChunkCoord)
 
 	C.ChunkCoord = ChunkCoord;
 	C.bValid = true;
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 	C.bResident = true;
 #endif
 	C.BrickBase = BrickBase;
@@ -1880,7 +1927,7 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		H.HitPosLocalUU = Entry;
 		return H;
 	}
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 	// The flat walk reports absent crossings for the same reason the
 	// hierarchical one does -- the comparator runs BOTH arms through
 	// VoxelMarchTraverseRings under one kernel-wide fallthrough depth, and an
@@ -1944,7 +1991,7 @@ FVoxelMarchHit VoxelMarchTraverseBrick(float3 OriginLocalUU, float3 DirWorld,
 		++Steps;
 
 		const int3 vNow = int3(v[0], v[1], v[2]);
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 		// See the start-voxel site above: same gate, same reason, once per
 		// step on values already in registers. The call is hoisted into a
 		// bool ONLY on this arm so the depth-0 control keeps its original
@@ -2520,7 +2567,7 @@ FVoxelMarchHit VoxelMarchTraverseBrickHierWatch(float3 OriginLocalUU, float3 Dir
 		{
 			// 32,768 voxels rejected on one dword. Outside the resident set is
 			// AIR for a renderer -- a hole is visible, a wall is not.
-#if VOXEL_MARCH_FALLTHROUGH > 0
+#if VOXEL_MARCH_TRACK_ABSENT
 			// ...and this is the one place a hole is CREATED, so it is where
 			// the fallthrough learns about it. Absent only -- a resident-empty
 			// chunk (bResident) is real air and must not send the ring loop
@@ -2816,6 +2863,14 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// SegIn/SegOut are ray parameters in world UU and are level-independent --
 	// only the InvS rescale into the walk's units changes per WalkL -- so the
 	// same segment can be handed to a coarser walk unmodified.
+#if VOXEL_MARCH_TRACK_ABSENT
+	// The OR of every walk's absent-crossing flag, across every segment. The
+	// per-walk H below is overwritten each iteration, so without this a miss
+	// would report only the LAST walk's crossings and the hole metric would
+	// under-count exactly the rays it exists for (an absent chunk in segment 2
+	// of 6, resident air after it). Folded into Miss at the bottom.
+	bool bAnyAbsent = false;
+#endif
 	[loop]
 	for (uint SegL = 0; SegL < RingCount; ++SegL)
 	{
@@ -2877,16 +2932,38 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 				// WalkL, NOT SegL: under fallthrough a hit can come from a
 				// coarser walk than the segment's owner, and packing it at the
 				// owner's level would draw the stand-in at half its size.
-				// (WalkL > SegL at this return is also the future
-				// `substituted` metric -- "the player is looking at a
-				// stand-in" -- countable here and nowhere else.)
+				// (WalkL > SegL at this return IS the `substituted` metric,
+				// set just below -- countable here and nowhere else, because
+				// only this loop knows both levels.)
 				H.THitUU *= S;
 				H.HitPosLocalUU *= S;
 				H.VoxelSizeUU = VOXEL_FLUID_VOXEL_UU * S;
 				H.Level = int(WalkL);
 				H.RingsEntered = EnteredMask;
+#if VOXEL_MARCH_TRACK_ABSENT
+				// `substituted`: the winning walk was coarser than the
+				// segment's owner, so the pixel shows a stand-in. Counts HITS,
+				// which is what makes it sky-proof -- the naive hole metric
+				// ("exited the cascade with no hit") counts every sky ray and
+				// can never read zero. With VOXEL_MARCH_FALLTHROUGH 0 this is
+				// WalkL == SegL by construction and folds to false.
+				//
+				// WHAT MOVES IT UP: flying with fallthrough on while streaming
+				// is behind -- fine chunks absent, coarse stand-ins drawn.
+				// WHAT MOVES IT DOWN: standing still until streaming settles
+				// (the fine chunks arrive and win their own segment), or
+				// fallthrough off (structurally zero). A counter that could
+				// not come down would be worthless; this one falling to zero
+				// while stationary is the invariant's success reading.
+				H.bSubstituted = (WalkL > SegL);
+#endif
 				return H;
 			}
+#if VOXEL_MARCH_TRACK_ABSENT
+			// Fold this walk's absent crossings into the ray-wide flag BEFORE
+			// the fallthrough gate can break out of the ladder.
+			bAnyAbsent = bAnyAbsent || H.bCrossedAbsentChunk;
+#endif
 #if VOXEL_MARCH_FALLTHROUGH > 0
 			// THE GATE. A miss that crossed no absent chunk is a TRUE miss:
 			// every chunk on the segment was resident (solid parts missed,
@@ -2906,6 +2983,14 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 		}
 	}
 	Miss.RingsEntered = EnteredMask;
+#if VOXEL_MARCH_TRACK_ABSENT
+	// The `uncovered` half of the hole metric reads this off the miss: no hit
+	// at any level AND the ray crossed a chunk the streaming system does not
+	// HOLD (bResident false -- absent, never resident-and-empty). The horizon
+	// discriminator lives at the kernel, not here: direction is the kernel's
+	// input and this function should not grow a second copy of it.
+	Miss.bCrossedAbsentChunk = bAnyAbsent;
+#endif
 	return Miss;
 }
 

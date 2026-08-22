@@ -324,6 +324,14 @@ struct FVoxelMarchArm
 	// forced to 0 when bRings is false, because only the ring walk reads the
 	// define.
 	int32 Fallthrough = 0;
+	// voxel.March.HoleStats: the hole metric on the shipping kernel --
+	// substituted (hit from a coarser level than the segment's owner) and
+	// uncovered (no hit, crossed an ABSENT chunk, pointing below the horizon),
+	// with rays and hits as denominators. A shader permutation, default off,
+	// and off is free: no UAV exists, no groupshared word, no atomic. Rings
+	// only, forced false without them, because both counters are properties
+	// of the ring walk.
+	bool bHoleStats = false;
 	// voxel.March.ReachM. 0 keeps the occupancy volume's own box, which is what
 	// keeps the source A/B alive. Anything else moves the local frame and is
 	// source-1 only.
@@ -339,6 +347,50 @@ struct FVoxelMarchArm
 	bool bVelocity = true;
 };
 VOXELEARTHSHADERS_API FVoxelMarchArm VoxelMarchGetArm();
+
+// ---------------------------------------------------------------------------
+// The hole metric (voxel.March.HoleStats)
+// ---------------------------------------------------------------------------
+//
+// THE ONE AUTHORITY FOR THE STATS BUFFER LAYOUT. The shader's word indices are
+// pushed from THIS enum by FVoxelMarchCS::ModifyCompilationEnvironment --
+// never restated in the .usf -- because a hand-mirrored stats layout already
+// bit this project once: the index probe's "= 60; // mirrors
+// VOXEL_MARCH_VIDX_WORDS" against a shader that computed 64, whose
+// out-of-range writes D3D12 silently discarded, producing PLAUSIBLE WRONG
+// VALUES rather than an error. One side only, pushed at compile.
+namespace VoxelMarchHoleWord
+{
+	enum
+	{
+		Rays = 0,        // rays that actually walked the volume (the denominator)
+		Hits,            // rays that hit at any level (substituted's denominator)
+		Substituted,     // hits from a level coarser than the owning segment
+		Uncovered,       // misses that crossed an ABSENT chunk, below horizon
+		Count
+	};
+}
+
+// What one 5 s perf-log window reads: sums over every frame whose readback
+// landed since the last call, plus how many frames that was, so the line can
+// print honest per-frame rates instead of whichever frame finished last.
+// Same ran-flag discipline as FVoxelMarchStats: Frames == 0 with bArmed true
+// is "on but nothing landed yet", which must never print as a healthy zero.
+struct FVoxelMarchHoleStats
+{
+	uint64 Rays = 0;
+	uint64 Hits = 0;
+	uint64 Substituted = 0;
+	uint64 Uncovered = 0;
+	uint64 Frames = 0;   // readbacks landed in the window
+	bool bArmed = false; // voxel.March.HoleStats was on when asked
+};
+
+// Drains the accumulated window (the GetAndReset pattern the 5 s perf log
+// already uses for FVoxelMarchChunkIndex::GetAndResetApplyDeltaMs). Safe from
+// the game thread; returns zeros with bArmed=false when the extension has
+// never run.
+VOXELEARTHSHADERS_API FVoxelMarchHoleStats VoxelMarchGetAndResetHoleStats();
 
 // ---------------------------------------------------------------------------
 // THE STENCIL CONSTANT, MIRRORED BY HAND
@@ -1088,6 +1140,28 @@ public:
 	};
 	FTileReadback TileRing[kNumTileReadbacks];
 	uint64 TileReadbackSkips = 0;
+
+	// THE HOLE METRIC'S READBACK RING (voxel.March.HoleStats). Its own ring,
+	// not the tile ring, for the reason the verify ring is separate: the two
+	// are enqueued under different cvars, and a shared ring would hand
+	// whichever pass grabbed a slot first, silently alternating what the
+	// number means. Three slots absorb the GPU running 1-3 frames behind
+	// without a stall; a frame that finds no free slot goes unmeasured and
+	// biases nothing, because the census divides by frames LANDED, not frames
+	// dispatched (the shadow march's rule, kept). Latency to the perf line is
+	// therefore 1-3 frames of readback plus up to one 5 s log period --
+	// irrelevant against a 5 s window, and the window edges smear by at most
+	// 3 frames of ~1.3M rays each.
+	static constexpr int32 kNumHoleReadbacks = 3;
+	struct FHoleReadback
+	{
+		TUniquePtr<FRHIGPUBufferReadback> Readback;
+		bool bInFlight = false;
+	};
+	FHoleReadback HoleRing[kNumHoleReadbacks];
+	// Accumulated under Lock as readbacks land; drained by
+	// VoxelMarchGetAndResetHoleStats (bArmed is filled at drain, from the arm).
+	FVoxelMarchHoleStats HoleWindow;
 
 	// The depth gate's own readback ring. Separate from the tile ring: the two
 	// are enqueued by different passes under different cvars, and a shared ring
