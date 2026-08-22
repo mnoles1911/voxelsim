@@ -142,7 +142,7 @@ namespace VoxelBrickPoolDetail
 	// Renaming it would orphan those numbers. It stays exactly what it was; this
 	// one subsumes it, and VoxelBrickSuppressQuadMeshEnabled ORs the two so the
 	// worker honours either.
-	int32 GVoxelTerrainRetireQuads = 0;
+	int32 GVoxelTerrainRetireQuads = 1;   // PROTOTYPE DEFAULT: terrain is marched now
 	FAutoConsoleVariableRef CVarVoxelTerrainRetireQuads(
 		TEXT("voxel.Terrain.RetireQuads"),
 		GVoxelTerrainRetireQuads,

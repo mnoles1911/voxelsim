@@ -9,6 +9,9 @@
 // field, and call into the VOXELEARTHSHADERS_API volume rather than having the
 // renderer module reach back for the field.
 #include "VoxelGIVolume.h"
+// P7: the GPU cone march over the resident bricks. VoxelEarth ->
+// VoxelEarthShaders, the same direction every other include here runs.
+#include "VoxelGIMarchPass.h"
 #include "VoxelGpuPoolComponent.h"
 // voxel.GI.VolumeDigTest carves through the real edit path (CarveSphere) rather
 // than poking the field, so the dig test exercises the same remesh -> ingest ->
@@ -28,6 +31,7 @@
 #include "HAL/PlatformMisc.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "Misc/ScopeExit.h"
 #include "RenderingThread.h"
 #include "UObject/UObjectIterator.h"
 
@@ -41,11 +45,32 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelGI, Log, All);
 
 namespace
 {
+	// DEFAULT IS 1, AND THE HELP TEXT USED TO SAY 0.
+	//
+	// It read "0 = off (default, and genuinely zero-cost...)" while the line
+	// above it had said 1 since 2026-07-27. A cvar whose description contradicts
+	// its own default one line up is worse than an undocumented one: it is
+	// believed. It was, downstream -- docs/gpu-roadmap-remaining.md:101 still
+	// asserts this and voxel.GI.Volume "remain 0 on main", and a Phase 7 brief
+	// was written on the premise that GI ships off. Every leg on this project,
+	// including the Arm A ceiling in
+	// docs/measurements/armA-drawpath-ceiling-2026-08-19.txt, has run with GI
+	// ON, so GI's cost is already inside that 18.99 / 21.52 ms baseline rather
+	// than waiting outside it.
+	//
+	// The "genuinely zero-cost when 0" claim IS still true and is kept, because
+	// it is the property that makes -VoxelGIOff a valid control arm: with this
+	// at 0 the subsystem clears its state and returns from Tick, the scene proxy
+	// emits byte-identical vertex colours, the volume is not sampled, and
+	// WantsChunkQuads stops forcing chunks off the direct-to-pool path.
 	TAutoConsoleVariable<int32> CVarGIEnabled(
 		TEXT("voxel.GI.Enabled"), 1,   // 2026-07-27: ON for the manual PIE evaluation.
-		TEXT("Voxel light field + cone-traced GI (M4). 0 = off (default, and genuinely zero-cost: ")
-		TEXT("the subsystem does not tick and the scene proxy emits byte-identical vertex colours). ")
-		TEXT("1 = on. CLIENT-SIDE RENDERING ONLY -- outside the determinism boundary."),
+		TEXT("Voxel light field + cone-traced GI (M4). DEFAULT 1 (on) since 2026-07-27. ")
+		TEXT("0 = off, and genuinely zero-cost: the subsystem does not tick, the scene proxy emits ")
+		TEXT("byte-identical vertex colours, and WantsChunkQuads stops forcing near-field chunks off ")
+		TEXT("the direct-to-pool path. Use -VoxelGIOff to set it from the COMMAND LINE -- an ")
+		TEXT("-ExecCmds toggle lands after streaming has begun and measures a mixed state. ")
+		TEXT("CLIENT-SIDE RENDERING ONLY -- outside the determinism boundary."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<float> CVarGIStrength(
@@ -238,6 +263,147 @@ namespace
 		TEXT("field that has barely streamed in reports a tiny sample count and proves nothing."),
 		ECVF_Default);
 
+	// P7-c ARM: RETIRE THE CPU QUAD INGEST, WITH THE OLD PATH AS A LIVE CONTROL.
+	//
+	// WHAT THIS IS AND, MORE IMPORTANTLY, WHAT IT IS NOT.
+	//
+	// Feeding the light field from the resident brick volume is the whole
+	// performance case for Phase 7, and that case is a LOADING case, not a frame
+	// case (docs/ray-marching-plan-2026-08-19.md §13: "What survives, and it is
+	// not frame time"). With GI on, every level-0 chunk within
+	// voxel.GI.RadiusUU * 1.25 = 87.5 m is forced OFF the D1 direct-to-pool path
+	// and onto the GPU readback path purely so this subsystem can have its
+	// quads -- 806 of 1,319 level-0 candidates (61%) at fill, and exactly zero
+	// at settle, which is why every settled-pose GI measurement ever taken
+	// missed it.
+	//
+	// AT 1 THIS ARM REMOVES THE DEMAND AND NOTHING ELSE. WantsChunkQuads stops
+	// retaining, both ingest hooks stop accepting, and the light field is
+	// therefore FED BY NOTHING. That is deliberate and it is the point: it
+	// BOUNDS THE PRIZE before the brick-sourced march is built, exactly as Arm A
+	// bounded the draw-path prize before the marcher existed. What it measures
+	// is cold fill and chunks/s against the 35.4 s control, with
+	// quadsRetainedForGI at 0 -- and both halves have to move together.
+	//
+	// IT IS NOT A LIGHTING ARM AND MUST NEVER BE READ AS ONE. A field with no
+	// input solves nothing, every cell reads back invalid, and the vertex
+	// factory falls through to plain geometric AO. A capture from this arm looks
+	// like GI being off, because for lighting purposes it is. The GI stats line
+	// says so on every window, and tools\voxel-leg-summary.ps1 REFUSES to
+	// summarise a leg that ran with this on unless -AllowInvalid is passed --
+	// because a caveat in a column gets dropped when the number is copied into a
+	// doc, and a missing row cannot be.
+	//
+	// WHY THE MARCH ITSELF IS NOT RE-POINTED IN THIS CHANGE: the resident brick
+	// volume has NO CPU-SIDE OCCUPANCY on the shipping path. The pool is fed by
+	// FVoxelBrickPool::AddChunkFromGpu from a GPU payload; the CPU keeps only
+	// keys and slots (FVoxelBrickIndexEntry), and there is no brick readback
+	// anywhere. So a CPU cone march cannot read the bricks at all, and the
+	// re-point necessarily moves the march onto the GPU. See the report
+	// accompanying this change; that is a separate, larger build, and shipping
+	// half of it would leave the tree in the one state that is neither the old
+	// version nor the new one.
+	TAutoConsoleVariable<int32> CVarGISourceBricks(
+		TEXT("voxel.GI.SourceBricks"), 0,
+		TEXT("P7-c MEASUREMENT ARM. 0 (default) = the shipping CPU quad ingest, the live control. ")
+		TEXT("1 = the quad ingest is RETIRED: WantsChunkQuads stops pulling near-field level-0 chunks ")
+		TEXT("off the D1 direct-to-pool path and both ingest hooks stop accepting. THE LIGHT FIELD IS ")
+		TEXT("THEN FED BY NOTHING -- this arm measures the STREAMING refund (cold fill, chunks/s, ")
+		TEXT("quadsRetainedForGI -> 0), NOT lighting. Captures from it look like GI off because for ")
+		TEXT("lighting purposes it is. Set it on the COMMAND LINE: an -ExecCmds toggle lands after ")
+		TEXT("streaming has begun and measures a mixed state."),
+		ECVF_Default);
+
+	// P7 MARCH ARM: THE CONE MARCH AS A SHADER READ OF THE RESIDENT BRICKS.
+	//
+	// voxel.GI.SourceBricks above removes the quad DEMAND and leaves the field
+	// fed by nothing -- it bounds the streaming prize and is not a lighting arm.
+	// THIS one removes the demand AND replaces the producer: the dirty-brick
+	// keys still arrive (a pooled apply notifies with an empty quad array on the
+	// direct-to-pool path, so the key is free), and the irradiance is produced
+	// by VoxelGIMarch.usf reading bricks that are already resident.
+	//
+	// TWO THINGS ABOUT THIS ARM LOOK EXACTLY LIKE BUGS AND ARE NOT:
+	//
+	//   * ENCLOSED SPACES ARE DARKER. v1 has no bounce. The CPU field is a
+	//     Jacobi iteration whose cone picks up the previously-solved irradiance
+	//     of whatever it lands on; doing that on the GPU means reading the two
+	//     volumes while writing them, which inside one dispatch is undefined
+	//     rather than stale, and doing it honestly costs a ping-pong pair
+	//     (+56.6 MB at the shipping dim). So a cave is lit by sky visibility
+	//     alone.
+	//   * CONES ARE BINARY, not aperture-integrated. Classic VCT accumulates
+	//     partial occlusion from successively coarser mips; there is no
+	//     near-field pyramid to accumulate from (see the .usf header), so each
+	//     cone is a visibility ray.
+	//
+	// Both are real differences from the control arm and BOTH ARE FOR THE OWNER
+	// TO JUDGE ON SCREENSHOTS. They are stated in the arm log line for the same
+	// reason they are stated here: "darker in caves" is also what a broken
+	// march looks like, and the two must not be confusable.
+	TAutoConsoleVariable<int32> CVarGIMarchBricks(
+		TEXT("voxel.GI.MarchBricks"), 0,
+		TEXT("P7. 0 (default) = the shipping CPU quad ingest + CPU cone solve, the live control arm. ")
+		TEXT("1 = the CPU voxelize/solve/encode/upload chain is RETIRED and irradiance is produced by ")
+		TEXT("a compute pass that cone-marches the resident brick pool directly into the GI volume. ")
+		TEXT("NEEDS voxel.GI.VolumeUAV=1 AT STARTUP -- without it the volumes are not UAV-capable and ")
+		TEXT("the pass refuses (logged, once). v1 has NO BOUNCE and BINARY cones, so caves read darker ")
+		TEXT("than the control arm; that is the arm, not a defect. Set on the COMMAND LINE."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGIMarchWalk(
+		TEXT("voxel.GI.MarchWalk"), 0,
+		TEXT("Which brick walk the GI cone march uses. 0 (default) = FLAT (VoxelMarchTraverseBrick) -- ")
+		TEXT("correct by construction and cannot inherit a skip defect. 1 = HIERARCHICAL (brick mask + ")
+		TEXT("chunk mask), cheaper, and carries whatever the skip walk carries. 2 = BOTH, counting ")
+		TEXT("where they disagree PER CONE DIRECTION. The default is flat DELIBERATELY: the ")
+		TEXT("hierarchical walk has an open, unexplained, non-directional burst phenomenon against a ")
+		TEXT("frozen world hash, and in a cone march a walk that intermittently misses content reads ")
+		TEXT("as light leaking through a wall."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGIMarchBricksPerFrame(
+		TEXT("voxel.GI.MarchBricksPerFrame"), 8,
+		TEXT("GI bricks dispatched to the GPU cone march per frame. The march arm's equivalent of ")
+		TEXT("voxel.GI.MaxBrickSolvesPerFrame, and it does the same job: a large edit makes the queue ")
+		TEXT("longer, never the frame."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarGIMarchStats(
+		TEXT("voxel.GI.MarchStats"), 0,
+		TEXT("1 = the GI march shader accumulates its per-dispatch counters. THERE IS NO READBACK ")
+		TEXT("PATH: nothing reads this buffer, so at 1 all this does is pay for the atomics. It ")
+		TEXT("exists so the walk-comparison permutation has somewhere to write when a readback is ")
+		TEXT("built; leave it at 0."),
+		ECVF_Default);
+
+	// P7-a. THE MUTATION THAT PROVES THE IDENTITY GATE CAN FAIL.
+	//
+	// A gate that cannot come out the other way carries no information, and
+	// this project has shipped several that could not. The pool-identity check
+	// is exactly that shape: in a healthy tree it passes on every leg forever,
+	// so "it passed" is indistinguishable from "it never ran". This cvar breaks
+	// the NAME half of the identification on purpose, so the refusal path can
+	// be observed in a real session:
+	//
+	//   voxel.GI.PoolIdentityMutate 1   ->  EnsureVolumeOrigin must log
+	//                                       "POOL IDENTITY REFUSED" at Error,
+	//                                       the volume must NOT anchor, and
+	//                                       "VoxelGI volume: ANCHORED" must be
+	//                                       ABSENT from the log.
+	//   voxel.GI.PoolIdentityMutate 0   ->  "ANCHORED to the TERRAIN pool"
+	//
+	// Set it on the COMMAND LINE (-ExecCmds lands after the origin has already
+	// latched, and the latch is once per session). It mutates the CHECK, never
+	// the pool, so a mutated run cannot corrupt anything: it can only refuse.
+	TAutoConsoleVariable<int32> CVarGIPoolIdentityMutate(
+		TEXT("voxel.GI.PoolIdentityMutate"), 0,
+		TEXT("TEST ONLY. 1 = force the terrain-pool NAME check in EnsureVolumeOrigin to fail, so the ")
+		TEXT("P7-a refusal path is observable. Expect 'POOL IDENTITY REFUSED' at Error and NO ")
+		TEXT("'VoxelGI volume: ANCHORED' line. Proves the gate can fail; a gate that cannot fail is ")
+		TEXT("not a gate. Never set outside that check."),
+		ECVF_Default);
+
 	constexpr int32 kMaxPendingVoxelize = 1024;
 	constexpr int32 kCoarseRebuildIntervalFrames = 30;
 
@@ -266,22 +432,120 @@ namespace
 	// (docs/gpu-gi-volume-design.md §6). Read off the live component rather than
 	// recomputed from the streaming subsystem's rebase so there is exactly one
 	// definition of the space.
-	bool FindPoolWorldLocation(const UWorld* World, FVector& OutLocation)
+	//
+	// P7-a, FIXED 2026-08-20. THIS USED TO TAKE THE FIRST POOL TObjectIterator
+	// HANDED BACK. It no longer picks; it IDENTIFIES, and it REFUSES when it
+	// cannot.
+	//
+	// THERE ARE UP TO FIVE UVoxelGpuPoolComponents IN A LIVE WORLD, and the
+	// count in the previous version of this comment (four) was itself wrong:
+	//   terrain               VoxelWorldSubsystem.cpp   GetOrCreateGpuPool
+	//   water, ONE PER BUCKET VoxelWaterSubsystem.cpp   SpawnWaterPoolPrimitive
+	//   region verify         VoxelGpuVerify.cpp        (voxel.GPU.VerifyRegion)
+	//   pool-write verify     VoxelGpuMeshAsyncVerify.cpp
+	//   automation test       VoxelGpuGeometryPoolTests.cpp  (never registered)
+	//
+	// They sit at unrelated world locations BY CONSTRUCTION -- terrain at
+	// GpuPoolRebase = FirstChunkOrigin, water at WaterPoolBucketRebase(bucket),
+	// and the pool-write harness at the world origin because it never calls
+	// SetWorldLocation at all. The caller computes
+	// OriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU), so a wrong
+	// pick offsets every GI sample by the difference of two unrelated rebases.
+	// The symptom is not an error: it is lighting sampled from nowhere, and
+	// because VoxelQuadVertexFactory.ush gates on bInsideVolume what a player
+	// sees is GI being ABSENT while everything still renders.
+	//
+	// WHY NOT IsWaterMode(). Because it is not identity. Terrain and BOTH
+	// verify pools are non-water, and until P7-a all three also answered
+	// GetPoolName() with the same default. Water is the loudest wrong answer,
+	// not the only one, and a filter that removes only the loudest one would
+	// look like a fix while leaving two ways to be silently wrong.
+	//
+	// TWO INDEPENDENT IDENTIFICATIONS, AND THEY MUST AGREE:
+	//   1. OWNERSHIP -- UVoxelWorldSubsystem::GetTerrainGpuPool() returns the
+	//      pool that subsystem itself created. That is not a heuristic about
+	//      the terrain pool; it is the definition of it.
+	//   2. NAME -- GetPoolName() == VoxelGpuPool::kTerrainPoolName, set at the
+	//      construction site.
+	// (1) alone is sufficient for correctness. (2) is here because (1) is a
+	// join across two modules, and this project's standing failure mode is a
+	// join that is COMPUTED rather than CHECKED. A disagreement means one of
+	// the two ends is stale; it is logged at Error and REFUSED, never resolved
+	// in favour of whichever looks more likely.
+	//
+	// REFUSING IS SAFE HERE, AND THE OLD COMMENT'S OBJECTION TO IT DOES NOT
+	// APPLY. That objection was "water pools always exist, so a refusal would
+	// disable the volume in the shipping configuration". It was an objection to
+	// refusing when the CENSUS IS AMBIGUOUS. With positive identification the
+	// only refusal left in a healthy tree is "the terrain subsystem has no pool
+	// yet", which is exactly the pre-existing deferral: EnsureVolumeOrigin is
+	// called every tick until it succeeds, and the terrain pool is created
+	// lazily by the first pooled chunk. A refusal therefore costs a tick, not a
+	// feature. It becomes permanent only where no terrain pool is ever created
+	// (voxel.Stream.GPU 0), and there nothing samples the volume anyway.
+	//
+	// OutNumCandidates still reports the FULL registered census, INCLUDING the
+	// pools this function now correctly ignores, so the log can say how many
+	// wrong answers were on offer. It is telemetry and not a decision input --
+	// nothing below branches on it.
+	enum class EFindTerrainPoolOutcome : uint8
 	{
-		if (!World)
-		{
-			return false;
-		}
+		Found,
+		NoWorldSubsystem, // no UVoxelWorldSubsystem in this world
+		NoTerrainPoolYet, // subsystem present, pool not created yet: DEFER
+		NameMismatch,     // the subsystem's own pool is not named as terrain
+	};
+
+	// Split out so the three outcomes above can be logged differently. Folding
+	// them into one bool was the previous shape, and it is what let "no pool
+	// yet" (benign, expected on frame 0) and "found a pool that is not ours"
+	// (a wiring defect) print the same reassuring line.
+	int32 CountRegisteredPools(const UWorld* World)
+	{
+		int32 Count = 0;
 		for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
 		{
-			UVoxelGpuPoolComponent* Pool = *It;
+			const UVoxelGpuPoolComponent* Pool = *It;
 			if (Pool && !Pool->IsTemplate() && Pool->IsRegistered() && Pool->GetWorld() == World)
 			{
-				OutLocation = Pool->GetComponentLocation();
-				return true;
+				++Count;
 			}
 		}
-		return false;
+		return Count;
+	}
+
+	EFindTerrainPoolOutcome FindTerrainPoolWorldLocation(const UWorld* World, FVector& OutLocation,
+	                                                     int32* OutNumCandidates = nullptr)
+	{
+		if (OutNumCandidates)
+		{
+			*OutNumCandidates = World ? CountRegisteredPools(World) : 0;
+		}
+		if (!World)
+		{
+			return EFindTerrainPoolOutcome::NoWorldSubsystem;
+		}
+		const UVoxelWorldSubsystem* Terrain = World->GetSubsystem<UVoxelWorldSubsystem>();
+		if (!Terrain)
+		{
+			return EFindTerrainPoolOutcome::NoWorldSubsystem;
+		}
+		const UVoxelGpuPoolComponent* Pool = Terrain->GetTerrainGpuPool();
+		if (!Pool || !Pool->IsRegistered())
+		{
+			return EFindTerrainPoolOutcome::NoTerrainPoolYet;
+		}
+		// Identification 2. See above: a disagreement is a stale join, and the
+		// only safe response to a stale join is to stop rather than to pick.
+		// CVarGIPoolIdentityMutate exists so this branch is reachable in a
+		// healthy tree -- see its declaration.
+		const bool bMutate = CVarGIPoolIdentityMutate.GetValueOnGameThread() != 0;
+		if (bMutate || Pool->GetPoolName() != VoxelGpuPool::kTerrainPoolName)
+		{
+			return EFindTerrainPoolOutcome::NameMismatch;
+		}
+		OutLocation = Pool->GetComponentLocation();
+		return EFindTerrainPoolOutcome::Found;
 	}
 }
 
@@ -313,6 +577,19 @@ namespace VoxelGI
 	float GetFadeEndUU() { return CVarGIFadeEndUU.GetValueOnAnyThread(); }
 	int32 GetDebugLevel() { return CVarGIDebug.GetValueOnAnyThread(); }
 	int32 GetDebugVis() { return CVarGIDebugVis.GetValueOnAnyThread(); }
+	// P7. ONE reader per arm, so the consumers and the stats line cannot
+	// disagree about which arm a leg is on.
+	//
+	// THE MARCH ARM RETIRES THE QUAD INGEST TOO, and that is why this is an OR
+	// rather than two independent switches. Both arms remove the same demand;
+	// they differ only in what replaces it (nothing, versus the GPU march). A
+	// march arm that still pulled chunks off the direct-to-pool path would be
+	// paying the whole streaming cost this phase exists to delete.
+	bool IsMarchBricksEnabled() { return CVarGIMarchBricks.GetValueOnAnyThread() != 0; }
+	bool IsQuadIngestRetired()
+	{
+		return CVarGISourceBricks.GetValueOnAnyThread() != 0 || IsMarchBricksEnabled();
+	}
 }
 
 // --- subsystem lifetime ----------------------------------------------------
@@ -321,6 +598,21 @@ void UVoxelGISubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
 	Field = MakeUnique<FVoxelLightField>();
+
+	// Latch which arm the command line asked for, so Tick can keep checking that
+	// it HELD rather than trusting the one read-back GameMode did at init. See
+	// the member declarations: the init read-back cannot see an -ExecCmds
+	// override that lands later in startup, and SetByConsole outranks the
+	// SetByCode the switch used. Parsed here rather than passed from GameMode so
+	// this works whatever spawns the world.
+	{
+		const bool bArmOn = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOn"));
+		const bool bArmOff = FParse::Param(FCommandLine::Get(), TEXT("VoxelGIOff"));
+		if (bArmOn != bArmOff) // both, or neither, is not an arm -- GameMode logs the both case
+		{
+			ArmRequestedEnabled = bArmOn ? 1 : 0;
+		}
+	}
 
 	// -VoxelGIConverge=<N> -- the energy-conservation proof harness. Read from
 	// the command line at init, NOT via -ExecCmds: cvars set through ExecCmds
@@ -400,7 +692,14 @@ bool UVoxelGISubsystem::IsTickable() const
 {
 	// Zero per-frame cost when GI is off. bHasState keeps ticking for exactly
 	// as long as it takes to release the field after a runtime toggle-off.
-	return VoxelGI::IsEnabled() || bHasState;
+	//
+	// ArmRequestedEnabled keeps it tickable through a -VoxelGIOff leg, which
+	// would otherwise never tick at all and so could never verify that its own
+	// arm held. That is the one case where the verification matters most: a
+	// silently re-enabled control arm is indistinguishable from a clean one in
+	// every number it produces. Costs a cvar read and a clock compare per frame,
+	// and ONLY on a leg that passed an arm switch (-1 otherwise).
+	return VoxelGI::IsEnabled() || bHasState || ArmRequestedEnabled >= 0;
 }
 
 void UVoxelGISubsystem::ClearAllState()
@@ -413,6 +712,13 @@ void UVoxelGISubsystem::ClearAllState()
 	PendingPooledVoxelize.Reset();
 	DirtyQueue.Reset();
 	DirtySet.Reset();
+	// P7 march arm. Cleared with the rest, and for the same reason: a key names
+	// a brick coordinate in a world that is going away. Carrying one across a
+	// teardown would dispatch a march at a coordinate the next world does not
+	// have, which writes zeros into a live texel range -- a rectangle of
+	// unlit terrain, not an error.
+	MarchDirtyQueue.Reset();
+	MarchDirtySet.Reset();
 	RefreshQueue.Reset();
 	RefreshSet.Reset();
 	BrickComponents.Reset();
@@ -439,6 +745,38 @@ void UVoxelGISubsystem::ClearAllState()
 	// Re-centring picks up from wherever the origin was left.
 	bCoarseDirty = false;
 	bHasState = false;
+
+	// PUBLISH Enabled=0 TO THE SHADER ON THE WAY DOWN.
+	//
+	// TickVolume has an identical publish in its own disabled branch, and that
+	// branch is UNREACHABLE on a voxel.GI.Enabled toggle-off: Tick returns at
+	// the !IsEnabled() guard before TickVolume is ever called. So without this,
+	// a mid-session `voxel.GI.Enabled 0` left the last Enabled=1 uniform buffer
+	// bound with its stale texels, and the pooled factory kept sampling a
+	// frozen light field forever -- GI "off" that still costs a volume sample
+	// per pixel and still tints the world with whatever it last solved.
+	//
+	// That matters most for exactly the arm this exists to serve. -VoxelGIOff
+	// sets the cvar at GameMode init, before the first tick, so ClearAllState
+	// never runs and the buffer is still InitRHI's Enabled=0 default -- that
+	// path was always clean. The contaminated path is the -ExecCmds toggle,
+	// which is the one a reader reaches for first and the one this subsystem's
+	// own comments already warn lands mid-stream. A control arm that silently
+	// keeps sampling the feature it is controlling is the same failure shape as
+	// Defect 1 in armA-drawpath-ceiling-2026-08-19.txt, and it is cheaper to
+	// make both routes correct than to document which one is safe.
+	//
+	// Guarded on bVolumeSettingsValid so a session that never turned the volume
+	// on does not enqueue a render command to disable something never enabled.
+	if (bVolumeSettingsValid && LastVolumeSettings.bEnabled)
+	{
+		FVoxelGIVolumeSettings Off = LastVolumeSettings;
+		Off.bEnabled = false;
+		Off.bLocalEnabled = false;
+		LastVolumeSettings = Off;
+		ENQUEUE_RENDER_COMMAND(VoxelGIVolumeOffOnClear)(
+			[Off](FRHICommandListImmediate&) { GVoxelGIVolume.UpdateParameters_RenderThread(Off); });
+	}
 }
 
 // --- ingest ----------------------------------------------------------------
@@ -456,6 +794,27 @@ void UVoxelGISubsystem::NotifyChunkMeshUpdated(UVoxelChunkComponent* Component)
 	// geometric AO exactly as they do today.
 	if (Component->GetLevel() != 0)
 	{
+		return;
+	}
+	// P7 MARCH ARM. The KEY is the payload here; the quads are ignored. Placed
+	// before the retire test below because that test returns, and on this arm
+	// the notification is the only thing that tells the march a brick changed.
+	if (VoxelGI::IsMarchBricksEnabled())
+	{
+		PushMarchDirty(FVoxelLightField::WorldToBrick(Component->GetComponentLocation()));
+		++StatIngestDroppedByArm;
+		bHasState = true;
+		return;
+	}
+	// P7-c ARM. The COMPONENT path. Gated here as well as in WantsChunkQuads
+	// because these are two different demands: WantsChunkQuads governs the
+	// pooled path's readback, and this hook is the only feed under
+	// voxel.Stream.GPU 0. Gating only the first would leave the component arm
+	// still voxelizing from quads while reporting quadsRetainedForGI = 0 --
+	// an arm that reads as applied and is half applied.
+	if (VoxelGI::IsQuadIngestRetired())
+	{
+		++StatIngestDroppedByArm;
 		return;
 	}
 	if (PendingVoxelize.Num() >= kMaxPendingVoxelize)
@@ -482,8 +841,39 @@ void UVoxelGISubsystem::NotifyPooledChunkMeshUpdated(const FVector& ChunkOriginU
 	// Level-0 only, matching NotifyChunkMeshUpdated and the scene proxy's
 	// bGIEnabled = VoxelGI::IsEnabled() && ChunkLevel == 0. Coarse rings have
 	// no field coverage on either renderer.
-	if (ChunkLevel != 0 || Quads.Num() == 0)
+	if (ChunkLevel != 0)
 	{
+		return;
+	}
+	// P7 MARCH ARM, AND IT MUST COME BEFORE THE EMPTY-QUAD TEST.
+	//
+	// This is the whole reason the march arm needs no new plumbing: with
+	// WantsChunkQuads returning false the chunk goes DIRECT TO POOL and arrives
+	// here with an EMPTY quad array -- so the key is delivered for free, on the
+	// existing hook, by the very path the arm exists to preserve. Testing
+	// Quads.Num() == 0 first would drop every one of them.
+	if (VoxelGI::IsMarchBricksEnabled())
+	{
+		PushMarchDirty(FVoxelLightField::WorldToBrick(ChunkOriginUU));
+		++StatIngestDroppedByArm;
+		bHasState = true;
+		return;
+	}
+	if (Quads.Num() == 0)
+	{
+		return;
+	}
+	// P7-c ARM. The POOLED path. In principle unreachable with the arm on --
+	// WantsChunkQuads returned false, so the chunk went direct-to-pool and
+	// arrives with Quads empty, which the test above already dropped. Kept
+	// anyway, and COUNTED, for the reason the `Quads.Num() == 0` test is worth
+	// having twice: if this ever fires with the arm on, the demand did NOT go
+	// away and the streaming refund this arm exists to measure is not what it
+	// appears to be. A zero here is a real reading; a non-zero is a defect that
+	// would otherwise be invisible.
+	if (VoxelGI::IsQuadIngestRetired())
+	{
+		++StatIngestDroppedByArm;
 		return;
 	}
 	if (PendingPooledVoxelize.Num() >= kMaxPendingVoxelize)
@@ -511,6 +901,22 @@ bool UVoxelGISubsystem::WantsChunkQuads(const FVector& ChunkOriginUU, int32 Chun
 		return false;
 	}
 
+	// P7-c ARM. Placed AFTER the level-0 test so the candidate population is
+	// unchanged between arms -- a candidate is still exactly "a level-0 chunk
+	// that was offered", and the two arms' percentages are therefore over the
+	// same denominator. The decline is counted in BOTH places on purpose:
+	// StatQuadsDeclined keeps quadsRetainedForGI's "0 of N candidates" reading
+	// truthful, and StatQuadsRetiredByArm says the zero was produced by the arm
+	// rather than by a call site that stopped firing. Those two readings are
+	// otherwise identical, and this project has already been fooled by that
+	// exact pair once.
+	if (VoxelGI::IsQuadIngestRetired())
+	{
+		++StatQuadsDeclined;
+		++StatQuadsRetiredByArm;
+		return false;
+	}
+
 	// The radius test the voxelize drain applies (VoxRejectedRadius), widened.
 	//
 	// FieldCentreUU is last tick's view origin, which is the right thing to
@@ -529,7 +935,24 @@ bool UVoxelGISubsystem::WantsChunkQuads(const FVector& ChunkOriginUU, int32 Chun
 	// and readback traffic both grow with it. Both configurations are correct;
 	// the gate just tracks the configuration instead of assuming one.
 	const double RadiusUU = double(CVarGIRadiusUU.GetValueOnGameThread()) * 1.25;
-	return FVector::Dist(ChunkOriginUU, FieldCentreUU) <= RadiusUU;
+	const bool bRetain = FVector::Dist(ChunkOriginUU, FieldCentreUU) <= RadiusUU;
+	// BOTH counters, always. See the member declarations: `retained` alone
+	// cannot tell "the gate ran and declined" from "the gate never ran", and a
+	// silently unreached gate reads as a clean zero. Both zero over a second of
+	// streaming means the instrument is broken, not that the cost is absent.
+	//
+	// Counted here rather than at the call site so this stays inside a file this
+	// workstream owns, and so the count is of the DECISION rather than of a
+	// caller's use of it.
+	if (bRetain)
+	{
+		++StatQuadsRetainedForGI;
+	}
+	else
+	{
+		++StatQuadsDeclined;
+	}
+	return bRetain;
 }
 
 void UVoxelGISubsystem::PushDirty(const FIntVector& Key)
@@ -542,6 +965,167 @@ void UVoxelGISubsystem::PushDirty(const FIntVector& Key)
 	}
 }
 
+void UVoxelGISubsystem::PushMarchDirty(const FIntVector& Key)
+{
+	bool bAlready = false;
+	MarchDirtySet.Add(Key, &bAlready);
+	if (bAlready)
+	{
+		return;
+	}
+	if (MarchDirtyQueue.Num() >= kMaxPendingVoxelize)
+	{
+		// Same overflow policy as the two voxelize queues, and cheaper here
+		// because an entry is three ints rather than a quad list. The dropped
+		// brick is not lost forever: anything that re-meshes queues again, and
+		// on this arm a brick with no dispatch keeps whatever texels it had
+		// rather than going black.
+		MarchDirtySet.Remove(MarchDirtyQueue[0]);
+		MarchDirtyQueue.RemoveAt(0, 1, EAllowShrinking::No);
+	}
+	MarchDirtyQueue.Add(Key);
+}
+
+// P7 march arm. Drain the dirty-brick queue into one GPU dispatch.
+//
+// EVERY POSITION IS RESOLVED HERE, IN DOUBLE, AND NOTHING DOWNSTREAM
+// RE-DERIVES ONE. A GI cell coordinate at this world's scale is ~150,000 and
+// float32 quantises it coarser than the 40 UU cell it addresses, so the shader
+// is handed a corner already differenced against the march frame. Same seam,
+// same reasoning, as VoxelShadowMarch.cpp differencing its ray origin in double
+// before it hands over a float3.
+void UVoxelGISubsystem::TickMarchBricks()
+{
+	if (MarchDirtyQueue.Num() == 0)
+	{
+		return;
+	}
+	// The volume must be anchored before a texel index means anything. Not an
+	// error: EnsureVolumeOrigin retries every tick and the terrain pool is
+	// created lazily (P7-a). Dispatching now would write texels addressed
+	// against an origin that is about to change.
+	if (!bVolumeOriginSet || VolumeDim <= 0 || !bFieldCentreResolved)
+	{
+		return;
+	}
+
+	const int32 Budget = FMath::Max(0, CVarGIMarchBricksPerFrame.GetValueOnGameThread());
+	if (Budget == 0)
+	{
+		return;
+	}
+
+	FVoxelGIMarchRequest Request;
+	Request.VolumeDim = VolumeDim;
+	Request.CellSizeUU = float(VoxelLF::CellSizeUU);
+	Request.ConeReachUU = CVarGIConeDistanceUU.GetValueOnGameThread();
+	// One level-0 voxel of self-hit guard. The cone starts at a cell CENTRE and
+	// the cell is four voxels across, so this cannot skip past a wall the cell
+	// is touching -- it only avoids the voxel the origin is standing in.
+	Request.StartOffsetUU = float(VoxelCoords::VoxelSizeUU);
+	// The traversal's cone rule widens the sampled level with distance. There is
+	// no coarser level to widen INTO inside ring 0 (see the .usf header), so a
+	// slope of 0 asks for level 0 for the whole ray, which is what is actually
+	// resident. A non-zero slope here would ask for bricks that do not exist and
+	// get level 0 anyway, less obviously.
+	Request.ConeSlopeUU = 0.0f;
+	Request.SkyIntensity = 1.0f;
+	Request.Walk = FMath::Clamp(CVarGIMarchWalk.GetValueOnGameThread(), 0, 2);
+	Request.bStatsEnabled = CVarGIMarchStats.GetValueOnGameThread() != 0;
+
+	// The step budget the marcher already ships, if it is there to read. The
+	// GI cone is 3000 UU = 300 level-0 voxels, comfortably inside the 886 this
+	// project sized for 51.2 m, so this is a shared setting rather than a new
+	// knob -- and NOT one to raise to make a number look better.
+	static const auto* CVarStepBudget =
+		IConsoleManager::Get().FindConsoleVariable(TEXT("voxel.March.StepBudget"));
+	Request.StepBudget = CVarStepBudget ? FMath::Max(1, CVarStepBudget->GetInt()) : 886;
+
+	// The cone basis, copied from its ONE definition. See the .usf header for
+	// why this is uploaded rather than restated in HLSL.
+	static_assert(VoxelGIMarch::kNumTraceDirs == VoxelLF::NumTraceDirs,
+	              "GI march trace-direction count must match the light field's cone basis");
+	static_assert(VoxelGIMarch::kNumSlots == VoxelLF::NumDirs,
+	              "GI march slot count must match the ambient cube");
+	static_assert(VoxelGIMarch::kBrickEdgeCells == VoxelLF::BrickEdgeCells,
+	              "GI march brick edge must match the light field brick");
+	for (int32 T = 0; T < VoxelLF::NumTraceDirs; ++T)
+	{
+		Request.TraceDir[T] = VoxelLF::TraceDirTable[T];
+	}
+	for (int32 S = 0; S < VoxelLF::NumDirs; ++S)
+	{
+		for (int32 T = 0; T < VoxelLF::NumTraceDirs; ++T)
+		{
+			Request.SlotWeight[S][T] = VoxelLF::SlotWeight[S][T];
+		}
+	}
+
+	// ---- the march frame ---------------------------------------------------
+	//
+	// Constructed exactly as VoxelShadowMarch.cpp constructs its own: a pure
+	// function of the pose, snapped DOWN to a 32-voxel chunk boundary so
+	// chunk-coordinate arithmetic stays exact and sub-chunk camera jitter cannot
+	// move the origin. Sized to hold BOTH populations this dispatch touches --
+	// every cell in the volume, plus a cone of ConeReachUU fired from any of
+	// them -- because a ray leaving the frame reads as empty space, and empty
+	// space is exactly what makes GI too bright.
+	const double VolumeHalfExtentUU = 0.5 * double(VolumeDim) * double(VoxelLF::CellSizeUU);
+	const int32 ReachVoxels = FMath::CeilToInt(
+		(VolumeHalfExtentUU + double(Request.ConeReachUU)) / double(VoxelCoords::VoxelSizeUU));
+	const auto SnapDown = [](int64 V) { return int32((V >> 5) << 5); };
+	const int64 CentreVoxelX = int64(FMath::FloorToDouble(FieldCentreUU.X / double(VoxelCoords::VoxelSizeUU)));
+	const int64 CentreVoxelY = int64(FMath::FloorToDouble(FieldCentreUU.Y / double(VoxelCoords::VoxelSizeUU)));
+	const int64 CentreVoxelZ = int64(FMath::FloorToDouble(FieldCentreUU.Z / double(VoxelCoords::VoxelSizeUU)));
+	Request.FrameOriginVoxel = FIntVector(SnapDown(CentreVoxelX - ReachVoxels),
+	                                      SnapDown(CentreVoxelY - ReachVoxels),
+	                                      SnapDown(CentreVoxelZ - ReachVoxels));
+	const FVector FrameOriginUU(double(Request.FrameOriginVoxel.X) * double(VoxelCoords::VoxelSizeUU),
+	                            double(Request.FrameOriginVoxel.Y) * double(VoxelCoords::VoxelSizeUU),
+	                            double(Request.FrameOriginVoxel.Z) * double(VoxelCoords::VoxelSizeUU));
+
+	// ---- the batch ---------------------------------------------------------
+	Request.Bricks.Reserve(FMath::Min(Budget, MarchDirtyQueue.Num()));
+	while (Request.Bricks.Num() < Budget && MarchDirtyQueue.Num() > 0)
+	{
+		const FIntVector Key = MarchDirtyQueue[0];
+		MarchDirtyQueue.RemoveAt(0, 1, EAllowShrinking::No);
+		MarchDirtySet.Remove(Key);
+
+		// The brick's own texel range, in the volume's cell lattice. A brick
+		// outside the volume is DROPPED HERE rather than dispatched and dropped
+		// in the shader -- the shader's own bounds test is the backstop, not the
+		// policy, and dispatching work that is guaranteed to write nothing would
+		// spend the frame's budget on it.
+		const FIntVector TexelMin(Key.X * VoxelLF::BrickEdgeCells - VolumeCellOrigin.X,
+		                          Key.Y * VoxelLF::BrickEdgeCells - VolumeCellOrigin.Y,
+		                          Key.Z * VoxelLF::BrickEdgeCells - VolumeCellOrigin.Z);
+		if (TexelMin.X < 0 || TexelMin.Y < 0 || TexelMin.Z < 0 ||
+		    TexelMin.X + VoxelLF::BrickEdgeCells > VolumeDim ||
+		    TexelMin.Y + VoxelLF::BrickEdgeCells > VolumeDim ||
+		    TexelMin.Z + VoxelLF::BrickEdgeCells > VolumeDim)
+		{
+			continue;
+		}
+
+		const FVector CornerWorldUU(double(Key.X) * double(VoxelLF::BrickEdgeUU),
+		                            double(Key.Y) * double(VoxelLF::BrickEdgeUU),
+		                            double(Key.Z) * double(VoxelLF::BrickEdgeUU));
+
+		FVoxelGIMarchBrick Brick;
+		Brick.CornerLocalUU = FVector3f(CornerWorldUU - FrameOriginUU);
+		Brick.TexelMin = TexelMin;
+		Request.Bricks.Add(Brick);
+	}
+
+	if (Request.Bricks.Num() == 0)
+	{
+		return;
+	}
+
+	StatMarchBricksSubmitted += VoxelGIMarch::Enqueue_GameThread(MoveTemp(Request));
+}
+
 void UVoxelGISubsystem::MarkBrickNeighbourhoodDirty(const FIntVector& BrickCoord, int32 RadiusBricks)
 {
 	for (int32 DZ = -RadiusBricks; DZ <= RadiusBricks; ++DZ)
@@ -552,22 +1136,74 @@ void UVoxelGISubsystem::MarkBrickNeighbourhoodDirty(const FIntVector& BrickCoord
 	}
 }
 
-FVector UVoxelGISubsystem::ResolveViewOriginUU() const
+FVector UVoxelGISubsystem::ResolveViewOriginUU(bool& bOutResolved) const
 {
+	// THE CAMERA CACHE MUST BE GUARDED, and this cost a leg.
+	//
+	// APlayerCameraManager::GetCameraLocation() reads CameraCachePrivate.POV,
+	// which is EMPTY -- i.e. exactly FVector::ZeroVector -- until the camera
+	// manager has updated at least once. A tickable world subsystem can and
+	// does tick before that on frame 0. So a non-null PlayerCameraManager is
+	// NOT evidence that its location means anything, and the old code treated
+	// it as though it were: it returned (0,0,0) on the first tick while the
+	// pawn was correctly posed at (-6144000, -6144000, 219258).
+	//
+	// The engine states the rule in its own canonical accessor,
+	// APlayerController::GetPlayerViewPoint (PlayerController.cpp):
+	//
+	//   else if (PlayerCameraManager != NULL &&
+	//       PlayerCameraManager->GetCameraCacheTime() > 0.f) // Whether camera
+	//                                                        // was updated at
+	//                                                        // least once
+	//
+	// -- and then falls back to the view target. This now applies the same
+	// guard and then falls through to the pawn, which is what the ORIGINAL
+	// intent of this function's fallback chain already was; only the condition
+	// gating the first branch was missing.
+	//
+	// WHAT A ZERO CENTRE ACTUALLY BROKE, because it is more than one thing:
+	//   1. the voxel.GI.Debug 1 line's camAboveSurface probe called
+	//      GetSurfaceHeightUU(0, 0). That is a BLOCKING, footprint-requesting
+	//      fine-tile query, the amplifier's column stencil around the origin
+	//      reaches fine pixel (-2,-2), tile (-1,-1) is not baked for this seed,
+	//      and the fine-tier gate is fatal on an unattended run. It killed
+	//      g0-gion-r1 on frame 0. G1 never saw it because GI-off returns from
+	//      Tick before the debug block.
+	//   2. every distance test in the tick -- the voxelize drain's build-radius
+	//      rejection and WantsChunkQuads -- measured from the origin instead of
+	//      the camera, so on that tick every chunk is out of range.
+	//   3. worst and quietest: EnsureVolumeOrigin LATCHES
+	//      (bVolumeOriginSet) and derives VolumeOriginWorldUU from
+	//      FieldCentreUU. Under voxel.Stream.GPU 1, where a pool component can
+	//      already exist on frame 0, that anchors the GI volume 6,144 km from
+	//      the camera. This leg escaped it only because voxel.Stream.GPU 0
+	//      never creates a pool, so EnsureVolumeOrigin bailed before latching.
+	//
+	// bOutResolved is FALSE when nothing authoritative was available. Callers
+	// must not perform world queries or latch anything from the returned value
+	// in that case -- it is the PREVIOUS centre, carried forward.
+	bOutResolved = true;
 	if (const UWorld* World = GetWorld())
 	{
 		if (const APlayerController* PC = World->GetFirstPlayerController())
 		{
 			if (const APlayerCameraManager* Cam = PC->PlayerCameraManager)
 			{
-				return Cam->GetCameraLocation();
+				if (Cam->GetCameraCacheTime() > 0.f)
+				{
+					return Cam->GetCameraLocation();
+				}
 			}
+			// Camera not yet updated: the pawn is authoritative and correct
+			// from the frame it is posed, which is why the fixture's spawn pose
+			// is already right in the log line above the crash.
 			if (const APawn* Pawn = PC->GetPawn())
 			{
 				return Pawn->GetActorLocation();
 			}
 		}
 	}
+	bOutResolved = false;
 	return FieldCentreUU;
 }
 
@@ -598,23 +1234,124 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	{
 		return true;
 	}
+	// DO NOT LATCH A VOLUME ORIGIN FROM AN UNRESOLVED CENTRE.
+	//
+	// Everything below derives VolumeOriginWorldUU from FieldCentreUU and then
+	// sets bVolumeOriginSet, which makes this function a no-op for the rest of
+	// the session. On frame 0 FieldCentreUU can still be the carried-forward
+	// zero (see ResolveViewOriginUU), and under voxel.Stream.GPU 1 a pool
+	// component may already exist -- so without this guard the GI volume would
+	// anchor 6,144 km from the camera at the current test spawn and stay there
+	// until a re-centre dragged it back, sampling irradiance from the wrong
+	// place in the meantime. Deferring by one tick costs nothing: this is
+	// already called every tick until it succeeds, and it already returns false
+	// on the no-pool path for the same "try again next frame" reason.
+	if (!bFieldCentreResolved)
+	{
+		return false;
+	}
 
 	// First-time establishment only. Camera-following re-centring afterwards is
 	// BeginVolumeRecentre/StepVolumeRecentre (dead zone + staged re-upload + a
 	// one-frame origin swap, docs/gpu-gi-volume-design.md §4).
-	if (!FindPoolWorldLocation(GetWorld(), PoolWorldUU))
+	//
+	// P7-a: IDENTIFY OR REFUSE. There is no third branch, and in particular
+	// there is no "fall back to the first pool" branch -- a fallback would fire
+	// exactly and only in the case where the right answer is unknown, which is
+	// the case it must not guess in.
+	int32 NumPoolCandidates = 0;
+	const EFindTerrainPoolOutcome PoolOutcome =
+		FindTerrainPoolWorldLocation(GetWorld(), PoolWorldUU, &NumPoolCandidates);
+	if (PoolOutcome != EFindTerrainPoolOutcome::Found)
 	{
-		// No pooled primitive means nothing samples the volume: the per-chunk
-		// renderer reads the field directly at proxy build. Not an error.
+		++PoolIdentityRefusals;
+		if (PoolOutcome == EFindTerrainPoolOutcome::NameMismatch)
+		{
+			// THE ONE OUTCOME THAT IS A DEFECT RATHER THAN A WAIT. Two ends of
+			// the same join disagree: the terrain subsystem handed over a pool
+			// that does not carry the terrain name. Loud, once, with both
+			// sides printed so the stale end is identifiable from the log
+			// alone.
+			if (!bLoggedPoolNameMismatch)
+			{
+				bLoggedPoolNameMismatch = true;
+				const UVoxelWorldSubsystem* Terrain =
+					GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr;
+				const UVoxelGpuPoolComponent* Pool = Terrain ? Terrain->GetTerrainGpuPool() : nullptr;
+				UE_LOG(LogVoxelGI, Error,
+				       TEXT("VoxelGI volume: POOL IDENTITY REFUSED -- the terrain subsystem's own pool is ")
+				       TEXT("named '%s' but this build expects '%s'. The GI volume is NOT anchored and no ")
+				       TEXT("texels are uploaded; GI will read as absent rather than as misplaced, which is ")
+				       TEXT("the safe direction. One of the two ends of the name join is stale: producer is ")
+				       TEXT("VoxelWorldSubsystem.cpp GetOrCreateGpuPool -> SetPoolName, consumer is this ")
+				       TEXT("function. %d registered pool component(s) in this world. ")
+				       TEXT("voxel.GI.PoolIdentityMutate=%d -- if that is 1 this refusal is DELIBERATE and ")
+				       TEXT("is the gate proving itself, not a defect."),
+				       Pool ? *Pool->GetPoolName() : TEXT("<no pool>"),
+				       VoxelGpuPool::kTerrainPoolName, NumPoolCandidates,
+				       CVarGIPoolIdentityMutate.GetValueOnGameThread());
+			}
+			return false;
+		}
+		// The two benign outcomes. Both mean "not yet", both are retried every
+		// tick, and both were already the pre-P7-a behaviour on the no-pool
+		// path. Logged once, and they now say WHICH of the two it was.
 		if (!bLoggedNoPool)
 		{
 			bLoggedNoPool = true;
 			UE_LOG(LogVoxelGI, Log,
-			       TEXT("VoxelGI volume: no GPU pool component yet -- texel uploads deferred. ")
-			       TEXT("(voxel.Stream.GPU 0 never creates one, and the volume has no consumer there.)"));
+			       TEXT("VoxelGI volume: %s -- texel uploads deferred, retried every tick. ")
+			       TEXT("(voxel.Stream.GPU 0 never creates a terrain pool, and the volume has no consumer ")
+			       TEXT("there.) %d registered pool component(s) in this world at this moment."),
+			       PoolOutcome == EFindTerrainPoolOutcome::NoWorldSubsystem
+			           ? TEXT("no UVoxelWorldSubsystem in this world")
+			           : TEXT("the terrain GPU pool has not been created yet"),
+			       NumPoolCandidates);
+		}
+		// ESCALATION. "Deferred, retried every tick" is the right message for
+		// the seconds before the first chunk lands and the WRONG one forever
+		// after -- and logged once at Log severity the two are identical in a
+		// log file. 1800 refusals is ~30 s at 60 Hz, far past any startup.
+		//
+		// The named suspect is deliberate: under voxel.Terrain.RetireQuads,
+		// ApplyMeshResult returns on NumQuads == 0 and never reaches
+		// GetOrCreateGpuPool, so the pool is never created and this wait never
+		// ends. GI then reads as absent -- for WATER too -- with no error
+		// anywhere, because the shader gates on bInsideVolume.
+		if (!bLoggedNoPoolEscalated && PoolIdentityRefusals > 1800)
+		{
+			bLoggedNoPoolEscalated = true;
+			UE_LOG(LogVoxelGI, Error,
+			       TEXT("VoxelGI volume: STILL NOT ANCHORED after %lld refusals (~30 s). This is no "
+			            "longer a startup wait -- GI is ABSENT, for water as well as terrain, and "
+			            "the shader gates on bInsideVolume so nothing else will report it. Most "
+			            "likely cause: the terrain GPU pool is never created because "
+			            "voxel.Terrain.RetireQuads makes ApplyMeshResult return before "
+			            "GetOrCreateGpuPool. %d registered pool component(s) in this world."),
+			       (long long)PoolIdentityRefusals, NumPoolCandidates);
 		}
 		return false;
 	}
+
+	// SAY IT OUT LOUD, ONCE, AT THE MOMENT THE ORIGIN IS LATCHED -- and say it
+	// on the SUCCESS path, not only on the suspicious one.
+	//
+	// The previous version logged a Warning when the census exceeded one and
+	// nothing at all otherwise, so a leg that anchored correctly and a leg that
+	// anchored to a water bucket both produced silence whenever exactly one
+	// pool happened to be registered at that instant. This line always prints,
+	// always names the pool it chose, and always reports how many candidates it
+	// declined -- so "GI is anchored to the terrain pool" is a fact a leg can
+	// be grepped for rather than an absence that has to be trusted.
+	//
+	// GREP: "VoxelGI volume: ANCHORED"
+	UE_LOG(LogVoxelGI, Log,
+	       TEXT("VoxelGI volume: ANCHORED to the TERRAIN pool '%s' at (%.0f, %.0f, %.0f); ")
+	       TEXT("%d registered pool component(s) in this world, %d declined by identity. ")
+	       TEXT("Selection is by OWNERSHIP (UVoxelWorldSubsystem::GetTerrainGpuPool) cross-checked ")
+	       TEXT("against the pool NAME -- never by TObjectIterator order."),
+	       VoxelGpuPool::kTerrainPoolName, PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z,
+	       NumPoolCandidates, FMath::Max(0, NumPoolCandidates - 1));
 
 	VolumeDim = VoxelGIVolume::GetDim();
 	if (VolumeDim <= 0)
@@ -643,6 +1380,58 @@ bool UVoxelGISubsystem::EnsureVolumeOrigin()
 	// prohibited: at ~8.4M UU float32's ULP is 1.0 UU against a 40 UU cell.
 	const FVector3f OriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU);
 	CommittedOriginPoolUU = OriginPoolUU;
+	CommittedVolumeOriginWorldUU = VolumeOriginWorldUU;
+
+	// ONE-SHOT DIAGNOSTIC: is this origin correct for the pools that actually
+	// consume it?
+	//
+	// FVoxelGIVolume is a TGlobalResource -- ONE instance -- and this single
+	// OriginPoolUU is bound identically to EVERY FVoxelQuadVertexFactory draw
+	// (VoxelQuadVertexFactory.cpp:225), including all of water's buckets. But it
+	// is computed against the TERRAIN pool's location, and each water bucket
+	// carries its own unrelated WaterPoolBucketRebase. Neither uniform struct has
+	// a per-primitive origin term, so a water vertex evaluates
+	// (ProbePos - OriginPoolUU) with ProbePos in ITS bucket's space and the
+	// origin in terrain's -- an error of exactly (bucketRebase - terrainRebase).
+	//
+	// VoxelGIVolume.h:69-74 states the assumption in the SINGULAR ("the pool
+	// component carries the big offset"). That was true when written, before
+	// water was split into buckets.
+	//
+	// If the deltas below are non-zero, every non-terrain pool is sampling GI
+	// kilometres away from itself and bInsideVolume is false essentially always
+	// -- water receives no GI, with no error anywhere. Printed once because it is
+	// a structural question, not a per-frame one.
+	{
+		static bool bLoggedGiOriginAudit = false;
+		if (!bLoggedGiOriginAudit)
+		{
+			bLoggedGiOriginAudit = true;
+			for (TObjectIterator<UVoxelGpuPoolComponent> It; It; ++It)
+			{
+				const UVoxelGpuPoolComponent* P = *It;
+				if (P == nullptr || !P->IsRegistered())
+				{
+					continue;
+				}
+				const FVector ThisPoolWorld = P->GetComponentLocation();
+				const FVector Delta = ThisPoolWorld - PoolWorldUU;
+				UE_LOG(LogVoxelGI, Warning,
+				       TEXT("GI ORIGIN AUDIT: pool '%s' at (%.0f,%.0f,%.0f) | GI origin was "
+				            "computed against (%.0f,%.0f,%.0f) | delta (%.0f,%.0f,%.0f) = %.0f UU. "
+				            "%s"),
+				       *P->GetPoolName(),
+				       ThisPoolWorld.X, ThisPoolWorld.Y, ThisPoolWorld.Z,
+				       PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z,
+				       Delta.X, Delta.Y, Delta.Z, Delta.Size(),
+				       Delta.IsNearlyZero()
+				           ? TEXT("SAME SPACE -- this pool's GI lookup is correct.")
+				           : TEXT("DIFFERENT SPACE -- this pool samples GI at the wrong place by "
+				                  "that distance, and bInsideVolume will be false. No error is "
+				                  "raised anywhere; the symptom is simply no GI."));
+			}
+		}
+	}
 
 	VolumeShadow.Empty();
 	VolumeShadow.SetNumZeroed(int64(VolumeDim) * VolumeDim * VolumeDim * 4);
@@ -1009,6 +1798,7 @@ void UVoxelGISubsystem::StepVolumeRecentre()
 		bVolumeRecentring = false;
 		RecentreRowBricks.Reset();
 		CommittedOriginPoolUU = FVector3f(VolumeOriginWorldUU - PoolWorldUU);
+		CommittedVolumeOriginWorldUU = VolumeOriginWorldUU;
 		PushVolumeParamsIfChanged();
 		RecentreTotalOccupied = RecentreOccupiedBeforeLast;
 		UE_LOG(LogVoxelGI, Log,
@@ -1058,6 +1848,10 @@ void UVoxelGISubsystem::PushVolumeParamsIfChanged()
 	New.bLocalEnabled = VoxelGIVolume::IsLocalEnabled() && bVolumeOriginSet && VolumeLocalShadow.Num() > 0;
 	New.DebugVis = VoxelGIVolume::GetDebugVis();
 	New.OriginPoolUU = CommittedOriginPoolUU;
+	// CAMERA-RELATIVE, for consumers that have no pool primitive (the marcher) and
+	// for the ones whose pool is the WRONG primitive (every water bucket).
+	// Subtracted in double and narrowed once, same rule as the origin above.
+	New.OriginRelCameraUU = FVector3f(CommittedVolumeOriginWorldUU - FieldCentreUU);
 	// The CAMERA in pool space, not the volume centre: this is the quantity the
 	// CPU shade measures its fade from (GICentreUU), and B4.3. Subtracted in
 	// double and narrowed once, same rule as the origin.
@@ -1221,7 +2015,14 @@ void UVoxelGISubsystem::TickVolume()
 	}
 	else
 	{
-		DrainVolumeUploads(FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
+		// The accessor rather than Tick()'s bMarchArm: this is TickVolume(), a
+		// different function, and the local does not reach here. On the march
+		// arm there is nothing to drain anyway (nothing pushes the queue), so
+		// this is belt-and-braces -- but a queue that somehow filled would
+		// otherwise upload CPU-encoded texels over the GPU's own writes, which
+		// renders as lighting that flickers between two answers.
+		DrainVolumeUploads(VoxelGI::IsMarchBricksEnabled()
+			? 0 : FMath::Max(0, CVarGIMaxBrickUploadsPerFrame.GetValueOnGameThread()));
 		// Suspended for the duration of a re-centre, exactly as the per-brick drain
 		// is: during one, every local texel is being restaged by
 		// RestageVolumeZRange's own call anyway, and letting the two paths
@@ -1235,6 +2036,20 @@ void UVoxelGISubsystem::TickVolume()
 
 int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 {
+	// TIMED HERE, NOT AT THE TWO CALL SITES, so every early-out is covered and
+	// the ms and the count can never be drawn from different sets of
+	// invocations. Both call sites (TickVolume's budgeted drain and
+	// FlushVolume's unbudgeted one) land in the same pair of accumulators.
+	//
+	// StatUploadBricks counts BRICKS ENCODED AND STAGED -- the same denominator
+	// the ms covers. A frame that drains nothing adds 0 to both, so the printed
+	// mean is over the work that happened and never over frames that did none.
+	const double DrainStartSeconds = FPlatformTime::Seconds();
+	ON_SCOPE_EXIT
+	{
+		StatUploadMs += (FPlatformTime::Seconds() - DrainStartSeconds) * 1000.0;
+	};
+
 	if (!Field || !VoxelGIVolume::IsEnabled())
 	{
 		return 0;
@@ -1366,6 +2181,7 @@ int32 UVoxelGISubsystem::DrainVolumeUploads(int32 Budget)
 
 	VolumeBricksUploaded += Batch.Num();
 	VolumeUploadedThisFrame += Batch.Num();
+	StatUploadBricks += Batch.Num();
 	VolumeRunsUploaded += Runs.Num();
 	if (FirstVolumeUploadSeconds == 0.0)
 	{
@@ -2856,6 +3672,52 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	// --- ARM VERIFICATION, before every other guard -------------------------
+	//
+	// Deliberately ahead of the !IsEnabled() early-out, because the arm most in
+	// need of checking is the OFF one and that arm returns immediately below.
+	// IsTickable keeps us running for exactly this.
+	//
+	// Once a second for the whole leg, not once at startup. GameMode's
+	// read-back proves the set took; it cannot prove it survived -ExecCmds
+	// landing later in startup with SetByConsole priority. A control arm that
+	// gets silently flipped back produces perfectly plausible numbers under the
+	// wrong name, which is the most expensive failure this project has on
+	// record (Defect 1, armA-drawpath-ceiling-2026-08-19.txt).
+	if (ArmRequestedEnabled >= 0)
+	{
+		const double ArmNow = FPlatformTime::Seconds();
+		if (!bArmFirstCheckDone || ArmNow - LastArmCheckSeconds > 1.0)
+		{
+			LastArmCheckSeconds = ArmNow;
+			const int32 Live = VoxelGI::IsEnabled() ? 1 : 0;
+			if (Live != ArmRequestedEnabled)
+			{
+				++ArmViolations;
+				UE_LOG(LogVoxelGI, Error,
+				       TEXT("GI ARM VIOLATED: -VoxelGI%s asked for voxel.GI.Enabled=%d, live value is ")
+				       TEXT("%d (violation #%d). Something outranked the switch AFTER init -- almost ")
+				       TEXT("certainly voxel.GI.Enabled in -ExecCmds, which is SetByConsole and beats ")
+				       TEXT("the switch's SetByCode. THIS LEG IS VOID as a GI arm: it is running the ")
+				       TEXT("other configuration under this arm's name. Do not report its numbers."),
+				       ArmRequestedEnabled ? TEXT("On") : TEXT("Off"),
+				       ArmRequestedEnabled, Live, ArmViolations);
+			}
+			else if (!bArmFirstCheckDone)
+			{
+				// Positive evidence, logged once. "No error appeared" is not the
+				// same statement as "the check ran and passed", and only one of
+				// those survives a grep of a log whose instrument silently died.
+				UE_LOG(LogVoxelGI, Log,
+				       TEXT("GI arm: -VoxelGI%s HELD -- voxel.GI.Enabled=%d verified on the first tick, ")
+				       TEXT("i.e. after -ExecCmds have landed. Re-checked every second for the run; ")
+				       TEXT("any later divergence logs GI ARM VIOLATED."),
+				       ArmRequestedEnabled ? TEXT("On") : TEXT("Off"), ArmRequestedEnabled);
+			}
+			bArmFirstCheckDone = true;
+		}
+	}
+
 	if (!VoxelGI::IsEnabled())
 	{
 		if (bHasState)
@@ -2871,15 +3733,36 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 
 	const double Now = FPlatformTime::Seconds();
 	const double TickStart = Now;
-	FieldCentreUU = ResolveViewOriginUU();
+	FieldCentreUU = ResolveViewOriginUU(bFieldCentreResolved);
+
+	// P7 MARCH ARM. The CPU chain is retired by taking its budgets to ZERO
+	// rather than by branching around it.
+	//
+	// THAT IS A DELIBERATE CHOICE AND NOT LAZINESS. Every phase below is
+	// already budget-bounded and every one of them no-ops at a budget of 0, so
+	// zeroing them retires the chain without moving a single line of the
+	// control arm's code -- the two arms run the same function, and the arm is
+	// a VALUE rather than a different path. Branching around the phases would
+	// also skip the once-a-second stats block at the end, which is exactly
+	// where the arm has to be reported.
+	const bool bMarchArm = VoxelGI::IsMarchBricksEnabled();
+	if (bMarchArm)
+	{
+		TickMarchBricks();
+	}
 
 	// 1) Voxelize newly meshed chunks (stream-in AND post-edit remesh land in
 	//    the same queue -- see NotifyChunkMeshUpdated).
-	const int32 VoxelizeBudget = FMath::Max(0, CVarGIMaxVoxelizePerFrame.GetValueOnGameThread());
+	const int32 VoxelizeBudget = bMarchArm
+		? 0 : FMath::Max(0, CVarGIMaxVoxelizePerFrame.GetValueOnGameThread());
 	const int32 EditRadius = FMath::Clamp(CVarGIEditDirtyRadiusBricks.GetValueOnGameThread(), 0, 4);
 	const double BuildRadiusUU = CVarGIRadiusUU.GetValueOnGameThread();
 	const int32 MaxBricks = FMath::Max(64, CVarGIMaxBricks.GetValueOnGameThread());
 
+	// voxMs spans BOTH drain loops (component and pooled) because they share one
+	// budget and one counter -- splitting the time but not the budget would give
+	// two means over denominators that cannot be added.
+	const double VoxStartSeconds = FPlatformTime::Seconds();
 	int32 Voxelized = 0;
 	while (Voxelized < VoxelizeBudget && PendingVoxelize.Num() > 0)
 	{
@@ -2958,14 +3841,27 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		++Voxelized;
 	}
 
+	StatVoxMs += (FPlatformTime::Seconds() - VoxStartSeconds) * 1000.0;
+	StatVoxChunks += Voxelized;
+
 	// 2) Coarse pyramid rebuild. Full rebuild rather than incremental because
 	//    MAX aggregation is not invertible under removal, and O(NumBricks)
 	//    map inserts a few times a second is far cheaper than getting
 	//    decremental max bookkeeping wrong.
+	//
+	//    TIMED SEPARATELY because it is the one phase here whose cost scales
+	//    with the RESIDENT SET rather than with the frame's work: it is
+	//    O(NumBricks) TMap inserts across three levels under the field's write
+	//    lock, fired at most every kCoarseRebuildIntervalFrames but fired in
+	//    full when it fires. That is a tail-shaped cost, and the tail is the
+	//    half of GI's measured cost that was never attributed.
 	++FramesSinceCoarseRebuild;
 	if (bCoarseDirty && FramesSinceCoarseRebuild >= kCoarseRebuildIntervalFrames)
 	{
+		const double CoarseStartSeconds = FPlatformTime::Seconds();
 		Field->RebuildCoarse();
+		StatCoarseMs += (FPlatformTime::Seconds() - CoarseStartSeconds) * 1000.0;
+		++StatCoarseRuns;
 		bCoarseDirty = false;
 		FramesSinceCoarseRebuild = 0;
 	}
@@ -2979,7 +3875,8 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	Params.bLegacyConeBasis = CVarGILegacyConeBasis.GetValueOnGameThread() != 0;
 
 	TArray<FIntVector> ToSolve;
-	const int32 SolveBudget = FMath::Max(0, CVarGIMaxBrickSolvesPerFrame.GetValueOnGameThread());
+	const int32 SolveBudget = bMarchArm
+		? 0 : FMath::Max(0, CVarGIMaxBrickSolvesPerFrame.GetValueOnGameThread());
 	while (ToSolve.Num() < SolveBudget && DirtyQueue.Num() > 0)
 	{
 		const FIntVector Key = DirtyQueue[0];
@@ -2995,7 +3892,7 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 	// delivers bricks in TMap iteration order, and mixing those into the upload
 	// queue is exactly what makes the steady-state 1.4 bricks/run number
 	// uninformative about the dig case.
-	const int32 RefreshBudget = (DigTestPhase != 0)
+	const int32 RefreshBudget = (DigTestPhase != 0 || bMarchArm)
 		? 0 : FMath::Max(0, CVarGIRefreshBricksPerFrame.GetValueOnGameThread());
 	if (RefreshBudget > 0)
 	{
@@ -3021,6 +3918,13 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		const double SolveStart = FPlatformTime::Seconds();
 		CellsSolved = Field->SolveBricks(ToSolve, Params);
 		SolveMs = (FPlatformTime::Seconds() - SolveStart) * 1000.0;
+		// SolveMs stays as the existing per-frame value on the "GI:" line (kept
+		// so nothing parsing that line changes); these accumulate the same work
+		// across the whole second for the "GI phase:" line, because a
+		// once-per-second print of a per-frame value is a 1-in-60 sample of a
+		// bursty workload.
+		StatSolveMs += SolveMs;
+		StatSolveBricks += ToSolve.Num();
 
 		for (const FIntVector& Key : ToSolve)
 		{
@@ -3256,6 +4160,12 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		}
 	}
 
+	// Whole-tick accumulation, taken before the once-per-second logging below so
+	// the print's own cost (a string format and a couple of subsystem lookups)
+	// is not attributed to GI's steady-state work.
+	StatTickMs += (FPlatformTime::Seconds() - TickStart) * 1000.0;
+	++StatTickFrames;
+
 	if (VoxelGI::GetDebugLevel() > 0 && Now - LastStatSeconds > 1.0)
 	{
 		LastStatSeconds = Now;
@@ -3269,8 +4179,40 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 		// circle centre), and its own underground counterpart warns that the
 		// surface can move more than 60 m over that circle -- so this is a
 		// property of the HARNESS that any measurement taken with it inherits.
+		// -1 also means "not computed", which is what an unresolved centre now
+		// reports. GetSurfaceHeightUU is NOT a cheap read: it requests a fine
+		// tile footprint (disk I/O, exclusive sampler lock) and the fine-tier
+		// gate is FATAL on an unattended run when the tile is not baked. At an
+		// unresolved (0,0) centre the amplifier's column stencil reaches fine
+		// pixel (-2,-2) -> tile (-1,-1), which is not baked for this seed, and
+		// that killed g0-gion-r1 on frame 0. A once-per-second DIAGNOSTIC must
+		// never be able to end a run, so it does not ask unless the question is
+		// well posed.
+		//
+		// MOVED BEHIND Debug >= 2, AND THAT IS HARDENING RATHER THAN A
+		// WORKAROUND FOR THE ZERO CENTRE ABOVE. Fixing the centre removes the
+		// reason this probe pointed at the origin; it does NOT remove the
+		// probe's ability to end a run. A camera legitimately over an unbaked
+		// fine tile -- a pose someone picks to look at exactly that -- would
+		// fatal identically, and the tick order that saved us here (VoxelPerfRun
+		// happens to tick before this subsystem, so the pawn was already posed)
+		// is registration order, not a guarantee.
+		//
+		// So the rule is applied rather than the instance patched: a diagnostic
+		// that runs once a second on every leg must not be able to perform a
+		// blocking, disk-loading, fatal-capable query. It now runs only when
+		// someone explicitly asks for level 2, which is where the rest of this
+		// module's expensive probes already live. voxel.GI.Debug 1 -- what a
+		// measurement leg passes -- keeps every counter that costs nothing.
+		//
+		// The counter itself is retained, not deleted: it is what settled
+		// finding B-M (the surface flight pins Z and leaves the GI radius), and
+		// deleting the instrument that answered a question is how the question
+		// gets re-opened.
 		double CamAboveSurfaceUU = -1.0;
-		if (const UWorld* HeightWorld = GetWorld())
+		const UWorld* HeightWorld =
+			(bFieldCentreResolved && VoxelGI::GetDebugLevel() >= 2) ? GetWorld() : nullptr;
+		if (HeightWorld)
 		{
 			if (const UVoxelWorldSubsystem* Terrain = HeightWorld->GetSubsystem<UVoxelWorldSubsystem>())
 			{
@@ -3278,17 +4220,183 @@ void UVoxelGISubsystem::Tick(float DeltaSeconds)
 			}
 		}
 		UE_LOG(LogVoxelGI, Log,
-		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) rejectedRadius=%d camAboveSurface=%.0f (radius %.0f) ")
+		       TEXT("GI: bricks=%d (%.1f MB) pendingVox=%d(+%d pooled) rejectedRadius=%d camAboveSurface=%s (radius %.0f) ")
 		       TEXT("dirty=%d refresh=%d | solved %d bricks/%d cells in %.2fms, ")
 		       TEXT("reshaded %d chunks (%d dupes skipped), volumeUp %d bricks (queue %d, total %d bricks/%d runs), tick %.2fms"),
 		       Field->NumBricks(), double(Field->EstimatedBytes()) / (1024.0 * 1024.0),
 		       PendingVoxelize.Num(), PendingPooledVoxelize.Num(),
-		       VoxRejectedRadius, CamAboveSurfaceUU, BuildRadiusUU,
+		       VoxRejectedRadius,
+		       // NOT a bare -1. A sentinel that formats like a real measurement
+		       // is how "the probe did not run" gets read as "the camera is 1 UU
+		       // below the surface". Says which it is.
+		       CamAboveSurfaceUU >= 0.0
+		           ? *FString::Printf(TEXT("%.0f"), CamAboveSurfaceUU)
+		           : (bFieldCentreResolved ? TEXT("n/a(needs voxel.GI.Debug 2)") : TEXT("n/a(centre unresolved)")),
+		       BuildRadiusUU,
 		       DirtyQueue.Num(), RefreshQueue.Num(),
 		       ToSolve.Num(), CellsSolved, SolveMs, Refreshed, DedupeSkips,
 		       VolumeUploaded, VolumeUploadQueue.Num(), VolumeBricksUploaded, VolumeRunsUploaded,
 		       (FPlatformTime::Seconds() - TickStart) * 1000.0);
 		VoxRejectedRadius = 0;
+
+		// --- "GI phase:" -- the attribution line ----------------------------
+		//
+		// The "GI:" line above samples PER-FRAME values on whichever frame the
+		// once-a-second timer happens to fire, which for a bursty budgeted
+		// workload is a 1-in-60 sample. This line reports the whole interval.
+		//
+		// ARITHMETIC RULE, and it is the whole reason this comment exists.
+		// Every mean below is TOTAL-MS OVER ITS OWN COUNT. The `phases` and
+		// `tick` figures are TOTALS IN MILLISECONDS, which are legitimately
+		// additive. What is NEVER computed here is a sum of per-item MEANS:
+		// the brick stats line did exactly that -- adding a 0.740 ms/chunk term
+		// measured over 96 chunks to a 0.227 ms/chunk term measured over 83,671
+		// -- and it inflated the result by 3x and reversed the verdict
+		// (docs/measurements/armA-drawpath-ceiling-2026-08-19.txt, "THE PRINTED
+		// `TOTAL` LINE IS WRONG -- DO NOT QUOTE IT"). Denominators that differ
+		// cannot be added, so they are not.
+		//
+		// `phases` vs `tick` is the useful pair: their difference is the part of
+		// the GI tick that no named phase claims. A large unattributed remainder
+		// means this instrument is incomplete, and says so instead of hiding it.
+		auto MeanMs = [](double TotalMs, int32 Count) -> double
+		{
+			return Count > 0 ? TotalMs / double(Count) : 0.0;
+		};
+		const double PhasesMs = StatVoxMs + StatCoarseMs + StatSolveMs + StatUploadMs;
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("GI phase: vox %.2fms/%d chunks (%.3f) | coarse %.2fms/%d runs (%.3f) | ")
+		       TEXT("solve %.2fms/%d bricks (%.3f) | upload %.2fms/%d bricks (%.3f) | ")
+		       TEXT("phases %.2fms of tick %.2fms/%d ticks (%.3f ms/tick, %.2fms unattributed)"),
+		       StatVoxMs, StatVoxChunks, MeanMs(StatVoxMs, StatVoxChunks),
+		       StatCoarseMs, StatCoarseRuns, MeanMs(StatCoarseMs, StatCoarseRuns),
+		       StatSolveMs, StatSolveBricks, MeanMs(StatSolveMs, StatSolveBricks),
+		       StatUploadMs, StatUploadBricks, MeanMs(StatUploadMs, StatUploadBricks),
+		       PhasesMs, StatTickMs, StatTickFrames, MeanMs(StatTickMs, StatTickFrames),
+		       StatTickMs - PhasesMs);
+
+		// --- quadsRetainedForGI ---------------------------------------------
+		//
+		// The count of level-0 chunks this subsystem pulled OFF the D1
+		// direct-to-pool path and onto the GPU readback path, purely to keep
+		// their quads for its own ingest. `declined` is the level-0 chunks that
+		// were offered and left on the fast path -- so retained+declined is the
+		// candidate population and the percentage is meaningful rather than a
+		// bare count. Levels 1-5 never reach the radius test and are in neither.
+		//
+		// BOTH ZERO IS AN INSTRUMENT FAILURE, NOT A GOOD RESULT, and it is
+		// called out in the line itself. WantsChunkQuads is reached from
+		// FVoxelWorldImpl::SubmitGpuMeshJob; if that call site stops firing --
+		// a refactor, a reordered guard, a GPU fork that submitted nothing --
+		// the retained count reads a clean, plausible zero that looks exactly
+		// like the cost having been removed. This project has shipped probes
+		// that ran and measured nothing while reporting success; this one says
+		// which of the two it is doing.
+		const int32 QuadCandidates = StatQuadsRetainedForGI + StatQuadsDeclined;
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("GI ingest: quadsRetainedForGI=%d declined=%d of %d L0 candidates (%s) ")
+		       TEXT("-- retained chunks are forced OFF direct-to-pool onto the readback path"),
+		       StatQuadsRetainedForGI, StatQuadsDeclined, QuadCandidates,
+		       QuadCandidates > 0
+		           ? *FString::Printf(TEXT("%.1f%% retained"),
+		                              100.0 * double(StatQuadsRetainedForGI) / double(QuadCandidates))
+		           : TEXT("NO CANDIDATES OFFERED -- WantsChunkQuads was not called this interval; ")
+		             TEXT("this is an instrument failure or a stalled mesh submit, NOT a zero cost"));
+
+		// --- P7-c: WHICH ARM THIS WINDOW IS, next to the numbers it qualifies -
+		//
+		// Printed on EVERY window, both arms, so an arm can never be inferred
+		// from the absence of a line. The two counters are the claim that the
+		// arm ENGAGED rather than merely that a cvar is set:
+		//
+		//   retiredByArm  level-0 candidates WantsChunkQuads declined because
+		//                 of the arm. Zero with the arm ON means the gate is
+		//                 not being reached -- an instrument failure, not a
+		//                 result.
+		//   ingestDropped chunks the two Notify hooks refused for the same
+		//                 reason. Non-zero on the POOLED path with the arm on
+		//                 would mean the demand did not actually go away.
+		//
+		// THE WARNING IS NOT DECORATION. A leg on this arm has an EMPTY light
+		// field: it measures streaming, and its captures look like GI off.
+		// tools\voxel-leg-summary.ps1 keys its refusal on this exact string.
+		//
+		// GREP: "GI arm:"
+		const bool bArmRetired = VoxelGI::IsQuadIngestRetired();
+		const bool bArmMarch = VoxelGI::IsMarchBricksEnabled();
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("GI arm: sourceBricks=%d marchBricks=%d walk=%d retiredByArm=%d ingestDropped=%d ")
+		       TEXT("marchBricksSubmitted=%d -- %s"),
+		       (bArmRetired && !bArmMarch) ? 1 : 0, bArmMarch ? 1 : 0,
+		       bArmMarch ? FMath::Clamp(CVarGIMarchWalk.GetValueOnGameThread(), 0, 2) : -1,
+		       StatQuadsRetiredByArm, StatIngestDroppedByArm, StatMarchBricksSubmitted,
+		       bArmMarch
+		           ? TEXT("GPU CONE MARCH over the resident bricks (P7). The CPU voxelize/solve/encode/")
+		             TEXT("upload chain is RETIRED. v1 has NO BOUNCE and BINARY cones, so ENCLOSED SPACES ")
+		             TEXT("READ DARKER than the control arm -- that is the arm, not a defect, and it is ")
+		             TEXT("for the owner to judge on screenshots. marchBricksSubmitted is the GAME ")
+		             TEXT("THREAD's count and is NOT a claim the GPU ran them; the pass refuses ")
+		             TEXT("separately and says so where it happens.")
+		           : (bArmRetired
+		                  ? TEXT("QUAD INGEST RETIRED (P7-c measurement arm): the light field is FED BY ")
+		                    TEXT("NOTHING. This window measures STREAMING, not lighting. Any capture from ")
+		                    TEXT("it looks like GI off because for lighting purposes it is. DO NOT QUOTE ")
+		                    TEXT("IT AS A LIGHTING RESULT.")
+		                  : TEXT("control arm: shipping CPU quad ingest")));
+		if (bArmMarch && StatMarchBricksSubmitted == 0 && StatIngestDroppedByArm == 0)
+		{
+			// Both zero on the march arm cannot mean "nothing changed": with GI
+			// enabled, level-0 chunks reach the notify hooks whenever anything
+			// streams or re-meshes. It means the ingest is not being reached, so
+			// no brick was ever queued and the volume is holding whatever it
+			// held before -- which looks exactly like a settled, working arm.
+			UE_LOG(LogVoxelGI, Warning,
+			       TEXT("GI arm: marchBricks=1 but NO bricks were queued OR submitted this interval. ")
+			       TEXT("The arm is SET and did not ENGAGE. A stale volume renders as settled lighting, ")
+			       TEXT("so do not read this window as the march working."));
+		}
+		if (bArmRetired && !bArmMarch && StatQuadsRetiredByArm == 0 && StatIngestDroppedByArm == 0)
+		{
+			// Both zero with the arm ON cannot mean "nothing to retire": with
+			// GI enabled at all, level-0 chunks reach WantsChunkQuads whenever
+			// the mesh submit path is alive. It means the gate was not reached,
+			// and a streaming refund measured against a gate that never ran is
+			// a measurement of something else.
+			UE_LOG(LogVoxelGI, Warning,
+			       TEXT("GI arm: sourceBricks=1 but BOTH arm counters are ZERO this interval. The arm is ")
+			       TEXT("SET and did not ENGAGE -- either no mesh work was submitted at all, or the gate "
+			            "is no longer reached. Do not read this window's streaming numbers as a refund."));
+		}
+
+		// --- P7-a: the anchor, restated once a second ------------------------
+		//
+		// bVolumeOriginSet is latched once per session, so "did this leg anchor
+		// to the terrain pool" is otherwise answerable only from a single line
+		// near the top of a 200 MB log. Restating it beside the ingest counters
+		// means an arm can be qualified from the same window it is measured in.
+		//
+		// refusals > 0 with anchored=1 is the ordinary startup wait (the pool is
+		// created lazily). refusals CLIMBING with anchored=0 for a whole leg is
+		// the defect, and the two are distinguishable only because the count is
+		// cumulative and the flag is not.
+		//
+		// GREP: "GI anchor:"
+		UE_LOG(LogVoxelGI, Log,
+		       TEXT("GI anchor: anchored=%d identityRefusals=%d poolWorldUU=(%.0f, %.0f, %.0f) ")
+		       TEXT("-- selection is by OWNERSHIP + NAME (P7-a), never by TObjectIterator order"),
+		       bVolumeOriginSet ? 1 : 0, PoolIdentityRefusals,
+		       PoolWorldUU.X, PoolWorldUU.Y, PoolWorldUU.Z);
+
+		StatVoxMs = 0.0;         StatVoxChunks = 0;
+		StatCoarseMs = 0.0;      StatCoarseRuns = 0;
+		StatSolveMs = 0.0;       StatSolveBricks = 0;
+		StatUploadMs = 0.0;      StatUploadBricks = 0;
+		StatTickMs = 0.0;        StatTickFrames = 0;
+		StatQuadsRetainedForGI = 0;
+		StatQuadsDeclined = 0;
+		StatQuadsRetiredByArm = 0;
+		StatIngestDroppedByArm = 0;
+		StatMarchBricksSubmitted = 0;
 		// Local lights on their own line, and only when the feature has been armed,
 		// so a session with it off (the shipped default) logs byte-identically to
 		// one built before this existed. texelsLit is the number that separates

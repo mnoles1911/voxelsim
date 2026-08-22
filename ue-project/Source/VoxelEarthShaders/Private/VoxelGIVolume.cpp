@@ -1,6 +1,11 @@
 #include "VoxelGIVolume.h"
 
 #include "GlobalRenderResources.h"
+// RegisterVolumesForCompute only, for the free RegisterExternalTexture() -- the
+// same three-argument form VoxelShadowMarch.cpp already uses, which lives in
+// RenderGraphUtils.h rather than RenderGraphBuilder.h. The header deliberately
+// carries only RenderGraphFwd, so the graph machinery stops here.
+#include "RenderGraphUtils.h"
 #include "RenderUtils.h"
 #include "RHICommandList.h"
 #include "RHIStaticStates.h"
@@ -11,15 +16,34 @@ TGlobalResource<FVoxelGIVolume> GVoxelGIVolume;
 
 namespace
 {
+	// DEFAULT IS 1, AND THE HELP TEXT USED TO SAY 0.
+	//
+	// The exact defect VoxelGI.cpp's CVarGIEnabled carries a note about, in the
+	// second of the two cvars that decide whether GI runs -- and this one was
+	// still uncorrected on 2026-08-20, after the other had been fixed and after
+	// the correction had already been written into
+	// docs/gpu-roadmap-remaining.md and docs/ray-marching-plan-2026-08-19.md. It
+	// read "0 = off (default)" on the line BELOW a literal 1. A cvar whose
+	// description contradicts its own default one line up is worse than an
+	// undocumented one, because it is believed: a Phase 7 brief was written on
+	// the premise that voxel GI ships off, and it was wrong about both switches.
+	//
+	// WHAT IT COST: every leg on this project has run with the volume ON, so its
+	// cost is already inside the 18.99 ms A0 baseline and the 34.7 ms shadowed
+	// one rather than waiting outside them. Anyone budgeting a GI feature
+	// against those numbers while believing this is 0 double-counts it.
+	//
+	// The "genuinely zero-cost when 0" claim IS still true and is kept, because
+	// it is the property that makes voxel.GI.Volume 0 a valid control arm.
 	TAutoConsoleVariable<int32> CVarGIVolume(
 		TEXT("voxel.GI.Volume"), 1,   // 2026-07-27: ON for the manual PIE evaluation.
 		TEXT("Sample the voxel GI light field from a GPU volume texture instead of reading it off ")
-		TEXT("baked vertex colours. 0 = off (default) and genuinely zero-cost: the vertex factory ")
-		TEXT("skips the sample, the texture is not even allocated, and the emitted vertex colours ")
-		TEXT("are byte-identical. Toggling it live works: UVoxelGISubsystem re-pushes the uniform ")
-		TEXT("buffer from its tick whenever any input to it changes. NOTE it needs a CONSUMER -- ")
-		TEXT("only the pooled vertex factory samples the volume, so with voxel.Stream.GPU 0 this ")
-		TEXT("allocates nothing and changes nothing."),
+		TEXT("baked vertex colours. DEFAULT 1 (on) since 2026-07-27. 0 = off, and genuinely ")
+		TEXT("zero-cost: the vertex factory skips the sample, the texture is not even allocated, ")
+		TEXT("and the emitted vertex colours are byte-identical. Toggling it live works: ")
+		TEXT("UVoxelGISubsystem re-pushes the uniform buffer from its tick whenever any input to it ")
+		TEXT("changes. NOTE it needs a CONSUMER -- only the pooled vertex factory samples the ")
+		TEXT("volume, so with voxel.Stream.GPU 0 this allocates nothing and changes nothing."),
 		ECVF_RenderThreadSafe);
 
 	// docs/gpu-gi-volume-design.md §4. Half-width of the box the camera may move
@@ -40,6 +64,50 @@ namespace
 		TEXT("Per-axis texel count of the GI volume. Covers +/-(N*20) unreal units at 40 UU per cell, ")
 		TEXT("and costs N^3 * 4 bytes: 64 -> 12.8 m, 1 MB; 256 -> 51.2 m, 67 MB. STARTUP ONLY -- the ")
 		TEXT("texture is allocated once."),
+		ECVF_ReadOnly);
+
+	// P7 PREREQUISITE, SHIPPED OFF. Makes VolumePos/VolumeNeg writable by a
+	// compute pass.
+	//
+	// WHY IT IS NEEDED AT ALL. Every write to these two textures today goes
+	// through RHICmdList.UpdateTexture3D from the CPU, so they are created with
+	// ETextureCreateFlags::ShaderResource and nothing else. A GPU cone march
+	// that produces irradiance directly from the resident brick pool has to
+	// write them from a UAV, and a texture's flags are fixed at creation -- so
+	// this cannot be added later by the pass that needs it, only by the
+	// allocation that runs once at startup. Landing the flag now decouples that
+	// prerequisite from the march itself, which is blocked on something else
+	// entirely (see the note on VOXEL_MARCH_LEVEL_COUNT in the report
+	// accompanying this change).
+	//
+	// WHY IT DEFAULTS TO 0, AND THIS IS THE SAME RULE voxel.GI.Volume AND T4-1
+	// SHIPPED UNDER: the first build with a new capability compiled in must not
+	// be able to regress anything. At 0 the create descriptors are BYTE-
+	// IDENTICAL to what they were before this cvar existed, no UAV is created,
+	// and nothing downstream can observe the difference. At 1 the two textures
+	// gain ETextureCreateFlags::UAV and nothing else changes -- there is still
+	// no compute writer, so 1 is a VRAM-and-flags arm, not a feature.
+	//
+	// A UAV FLAG IS NOT FREE ON EVERY DRIVER, WHICH IS THE OTHER REASON FOR THE
+	// SWITCH. Declaring a resource UAV-capable can cost it compression and
+	// fast-clear paths, and on a 192^3 RGBA8 pair that is 56.6 MB of texture
+	// whose sampling cost is on the critical path of every terrain pixel. That
+	// is a measurable claim and it is NOT measured here; the switch is what
+	// makes it measurable as a two-arm A/B at some later point, on the whole
+	// frame, rather than argued.
+	//
+	// STARTUP ONLY, like VolumeDim above and for exactly the same reason: it is
+	// read inside EnsureAllocated_RenderThread, which runs once. An -ExecCmds
+	// toggle lands after allocation and changes nothing, silently -- so it is
+	// ECVF_ReadOnly to make that a refusal rather than a mystery.
+	TAutoConsoleVariable<int32> CVarGIVolumeUAV(
+		TEXT("voxel.GI.VolumeUAV"), 0,
+		TEXT("P7 prerequisite. 1 = allocate VolumePos/VolumeNeg with ETextureCreateFlags::UAV so a ")
+		TEXT("compute pass can write them; 0 (default) = byte-identical create descriptors to before ")
+		TEXT("this existed. There is NO compute writer yet, so 1 changes only the flags and whatever ")
+		TEXT("the driver does with them -- it is not a feature switch. STARTUP ONLY: the textures are ")
+		TEXT("allocated once, so setting this after allocation does nothing. Check the 'uav=' field ")
+		TEXT("on the 'VoxelGI volume: allocated' line to see which arm a run actually got."),
 		ECVF_ReadOnly);
 
 	// docs/sky-and-local-light-plan.md §2.2 / phase L1. SHIPPED OFF, exactly as
@@ -114,6 +182,11 @@ namespace VoxelGIVolume
 		return CVarGIVolume.GetValueOnAnyThread() != 0;
 	}
 
+	bool IsUAVEnabled()
+	{
+		return CVarGIVolumeUAV.GetValueOnAnyThread() != 0;
+	}
+
 	bool IsLocalEnabled()
 	{
 		return CVarGILocalLights.GetValueOnAnyThread() != 0;
@@ -162,25 +235,54 @@ void FVoxelGIVolume::EnsureAllocated_RenderThread(FRHICommandListBase& RHICmdLis
 		// it is avoided by construction as long as every write goes through
 		// UpdateTexture3D -- which, unlike the buffer lock path, does honour its
 		// destination offsets (verified in D3D12Texture.cpp).
+		// P7 PREREQUISITE. voxel.GI.VolumeUAV adds ETextureCreateFlags::UAV so a
+		// compute pass can write these; at its default 0 this expression is
+		// exactly ShaderResource and the descriptors are byte-identical to what
+		// they were before the cvar existed.
+		//
+		// LATCHED INTO bAllocatedWithUAV, not re-read later. A texture's flags
+		// are fixed at creation and this function runs ONCE, so a later read of
+		// the cvar would describe what was asked for rather than what exists --
+		// which is the shape of defect this file already carries two notes
+		// about. Anything that wants to know whether a UAV is available must
+		// ask WasAllocatedWithUAV(), never the cvar.
+		bAllocatedWithUAV = VoxelGIVolume::IsUAVEnabled();
+		const ETextureCreateFlags VolumeFlags =
+			ETextureCreateFlags::ShaderResource
+			| (bAllocatedWithUAV ? ETextureCreateFlags::UAV : ETextureCreateFlags::None);
+
 		const FRHITextureCreateDesc DescPos =
 			FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradiancePos"),
 			                                DimTexels, DimTexels, DimTexels,
 			                                PF_R8G8B8A8)
-				.SetFlags(ETextureCreateFlags::ShaderResource);
+				.SetFlags(VolumeFlags);
 		const FRHITextureCreateDesc DescNeg =
 			FRHITextureCreateDesc::Create3D(TEXT("VoxelGI.IrradianceNeg"),
 			                                DimTexels, DimTexels, DimTexels,
 			                                PF_R8G8B8A8)
-				.SetFlags(ETextureCreateFlags::ShaderResource);
+				.SetFlags(VolumeFlags);
 
 		VolumePos = RHICmdList.CreateTexture(DescPos);
 		VolumeNeg = RHICmdList.CreateTexture(DescNeg);
 
+		// uav= REPORTS WHAT WAS ALLOCATED, NOT WHAT WAS REQUESTED. These flags
+		// are unchangeable after this line, the allocation happens once, and
+		// voxel.GI.VolumeUAV is ECVF_ReadOnly precisely because a late set is a
+		// silent no-op -- so the log has to carry the achieved state or a run's
+		// arm is unknowable from its own output.
+		//
+		// GREP: "VoxelGI volume: allocated"
 		UE_LOG(LogTemp, Log,
-		       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f coverage=+/-%.0f UU"),
+		       TEXT("VoxelGI volume: allocated 2x dims=%dx%dx%d fmt=RGBA8 (Scheme A) MB=%.1f ")
+		       TEXT("coverage=+/-%.0f UU uav=%d (%s)"),
 		       DimTexels, DimTexels, DimTexels,
 		       2.0 * double(DimTexels) * DimTexels * DimTexels * 4.0 / (1024.0 * 1024.0),
-		       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU);
+		       0.5 * DimTexels * VoxelGIVolume::kCellSizeUU,
+		       bAllocatedWithUAV ? 1 : 0,
+		       bAllocatedWithUAV
+		           ? TEXT("UAV-capable: a compute pass MAY write these. No writer exists yet, so this ")
+		             TEXT("arm differs from the default only in flags")
+		           : TEXT("sampled-only, byte-identical to pre-P7 -- RegisterVolumesForCompute will refuse"));
 
 		// A freshly created texture's contents are undefined, and undefined bytes in
 		// the validity channel read as "there is data here" -- i.e. arbitrary
@@ -306,6 +408,7 @@ void FVoxelGIVolume::UpdateParameters_RenderThread(const FVoxelGIVolumeSettings&
 	Parameters.VolumeLocal = bLocalEnabled ? VolumeLocal.GetReference() : GBlackVolumeTexture->TextureRHI.GetReference();
 	Parameters.VolumeSampler = TStaticSamplerState<SF_Bilinear, AM_Clamp, AM_Clamp, AM_Clamp>::GetRHI();
 	Parameters.OriginPoolUU = Settings.OriginPoolUU;
+	Parameters.OriginRelCameraUU = Settings.OriginRelCameraUU;
 	Parameters.InvSizeUU = FVector3f(1.0f / ExtentUU);
 	Parameters.FadeCentrePoolUU = Settings.FadeCentrePoolUU;
 	// SUPPLIED, not invented here. Until Wave B these four were hardcoded to
@@ -601,4 +704,52 @@ namespace
 		TEXT("in open terrain Ambient is already 1 and max(Ambient, A) is a no-op by design. The NEXT splat ")
 		TEXT("overwrites the pattern, so a torch placed afterwards is not fighting it."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&GIVolumeLocalTestCommand));
+}
+
+// --- P7 prerequisite: RDG registration, with a refusal ----------------------
+//
+// See the header for why this refuses rather than registering a sampled-only
+// texture. The three conditions are checked in the order they can fail: the
+// volumes may not be allocated yet (ordinary, on any frame before the first
+// EnsureAllocated), and they may be allocated without a UAV (voxel.GI.VolumeUAV
+// was 0 at startup, which is the default).
+//
+// LOGGED AT WARNING, ONCE PER PROCESS, AND NOT SILENT. A pass that skips itself
+// because a prerequisite was off is exactly the shape that reads as "the
+// feature ran and found nothing to do": this project has shipped several. The
+// static flag keeps it off the per-frame log without letting it disappear.
+bool FVoxelGIVolume::RegisterVolumesForCompute(FRDGBuilder& GraphBuilder,
+                                               FRDGTextureRef& OutPos, FRDGTextureRef& OutNeg) const
+{
+	OutPos = nullptr;
+	OutNeg = nullptr;
+
+	if (!VolumePos.IsValid() || !VolumeNeg.IsValid())
+	{
+		return false;
+	}
+	if (!bAllocatedWithUAV)
+	{
+		static bool bLoggedNoUAV = false;
+		if (!bLoggedNoUAV)
+		{
+			bLoggedNoUAV = true;
+			UE_LOG(LogTemp, Warning,
+			       TEXT("VoxelGI volume: RegisterVolumesForCompute REFUSED -- VolumePos/VolumeNeg were ")
+			       TEXT("allocated WITHOUT ETextureCreateFlags::UAV, so no compute pass can write them. ")
+			       TEXT("voxel.GI.VolumeUAV was 0 when the textures were created; it is STARTUP ONLY, so ")
+			       TEXT("setting it now will not help this run. Restart with voxel.GI.VolumeUAV=1 on the ")
+			       TEXT("COMMAND LINE. Refusing here rather than registering, because a non-UAV texture ")
+			       TEXT("registers cleanly and then fails inside RDG at the caller's CreateUAV, which ")
+			       TEXT("names the wrong cause."));
+		}
+		return false;
+	}
+
+	// .GetReference() rather than leaning on TRefCountPtr's implicit conversion,
+	// so the argument type is the FRHITexture* the overload set expects and no
+	// other overload can be selected by accident.
+	OutPos = RegisterExternalTexture(GraphBuilder, VolumePos.GetReference(), TEXT("VoxelGI.IrradiancePos"));
+	OutNeg = RegisterExternalTexture(GraphBuilder, VolumeNeg.GetReference(), TEXT("VoxelGI.IrradianceNeg"));
+	return OutPos != nullptr && OutNeg != nullptr;
 }

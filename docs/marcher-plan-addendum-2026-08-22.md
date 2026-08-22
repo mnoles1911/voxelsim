@@ -38,6 +38,47 @@ residue is streaming/apply.
 
 ---
 
+## 1b. THE FLIP HAS TWO SILENT VISUAL REGRESSIONS, NOT ONE
+
+**Voxel GI has exactly one consumer, and it is the quad vertex factory.**
+Verified by grep, not inferred: `VoxelQuadVertexFactory.ush` is the only shader
+in the tree that reads `VoxelGIVol.`, and `VoxelQuadVertexFactory.cpp:225` is
+the only site that binds the GI uniform buffer for rendering. `VoxelMarch.usf`
+writes `EncodeIndirectIrradiance(1.0f)` — the neutral value. `voxel.GI.Enabled`
+defaults to **1**.
+
+**So flipping to the marcher silently removes voxel GI from terrain.** Same
+shape as the shadow finding, hiding in the same place: a feature the quad path
+provides, that the marcher's frame-time advantage is partly funded by not
+providing, with no error and no counter.
+
+| gate | status |
+|---|---|
+| sun shadows | measured — 42.0M primitives / 15.8 ms on quads, **zero** on the marcher. S2 exists (0.335 ms) but reaches only 64 m. |
+| voxel GI | **terrain gets none under the marcher.** Unmeasured; needs a lit-cave A/B. |
+
+**And the GI origin is already wrong for water**, which reframes "replace the
+anchor" entirely. `FVoxelGIVolume` is a `TGlobalResource` — one instance — whose
+`OriginPoolUU` is computed from the **terrain** pool's location and then bound
+identically to every quad draw, including all of water's buckets, each with its
+own unrelated rebase. No per-primitive origin term exists in either struct. So
+water's GI lookup is off by kilometres and **water silently receives no GI
+today**. `VoxelGIVolume.h:69-74` states the assumption in the singular — true
+when written, before water was split into buckets.
+
+So the task is **not** "find a terrain origin so the empty stand-in pool can be
+deleted". It is **"make the GI origin per-consumer, because terrain's pool was
+never the right space for the consumer that survives."** Falsifiable cheaply: a
+lake captured with `voxel.GI.Enabled` 0 vs 1 should, by this reading, be
+*identical* — that is both the falsifier and the acceptance test.
+
+**Also corrected:** section 5's "up to five pool components" (repeated from
+`VoxelGI.cpp:440-450`) is stale. Water alone can hold **twelve**
+(`kMaxWaterPoolBuckets`, `VoxelWaterSubsystem.cpp:1954`); the true live maximum
+is 16.
+
+---
+
 ## 2. Wave 3 is no longer optional or independent
 
 Retiring quads empties the terrain pool, so nothing is gathered for any
@@ -495,3 +536,69 @@ but attributed to the wrong function.
    a net regression.
 5. The depth gate was never broken; **I read it at frame 0**.
 6. "~600 chunks/s" and `chunksPerSec` are both **stale or dead** on this arm.
+
+---
+
+## 8. PROTOTYPE BUILD — 2026-08-22, approach changed at the owner's direction
+
+The owner's call, and it is the right one for where this is: stop measuring,
+build the remaining planned work as a prototype, and iterate live in the editor
+with a human designer. Everything below is BUILT AND COMPILING, and none of it
+is measured. That is deliberate, not an omission.
+
+**Every piece is on a cvar** so it can be toggled live in the editor rather than
+rebuilt. That is the one measurement-shaped thing kept, and only because three
+separate features this week ran and did nothing while looking perfectly healthy
+— a prototype that silently no-ops costs a designer a session, not a leg.
+
+### What is in the build
+
+| feature | switch | default |
+|---|---|---|
+| ray-marched terrain | `voxel.March` | **1** (was 0) |
+| brick-pool source | `voxel.March.Source` | **1** (was 0) |
+| ring cascade | `voxel.March.Rings` | **1** (was 0) |
+| skip levels / step budget | `voxel.March.SkipLevels` / `.StepBudget` | **2 / 3328** |
+| brick production | `voxel.GPU.BrickPack` | **1** (was 0) |
+| quad retirement | `voxel.Terrain.RetireQuads` | **1** (was 0) |
+| marched sun shadows | `voxel.Shadow.March` | **2** (was 0) |
+| shadow reach | `voxel.Shadow.MarchReachM` | **512 m** (was 64 m) |
+| shadow ring cascade | `voxel.Shadow.MarchRings` | **1** (new) |
+| voxel GI in the marcher | `voxel.GI.Enabled` | 1 (now actually reaches the marcher) |
+| climate tint | `voxel.March.ClimateStrength` | **1.0** (new) |
+| index content hash | `voxel.March.IndexContentHash` | 0 (the ~61%-of-tick cost, off) |
+
+**Opening the editor now gives marched terrain with sun shadows, voxel GI and
+climate tint, with no command-line arguments.** Previously all of it needed
+`-VoxelRetireQuads=1 -VoxelBrickPack=1 -VoxelBrickPackOnCpu=1` plus five cvars.
+
+### Three things built this session that were previously blockers
+
+1. **Voxel GI now reaches the marcher.** It had exactly one consumer — the quad
+   vertex factory — so the flip silently deleted terrain GI. The marcher wrote
+   the neutral irradiance value. Ported the three-probe sample (0.6 / 1.25 / 2.0
+   cells, matching `FVoxelLightField` term for term) using a new
+   **camera-relative volume origin**, because the marcher has no pool primitive
+   to express `OriginPoolUU` in. That new origin is also the groundwork for
+   fixing water, whose GI lookup is currently offset by kilometres.
+2. **Shadow reach 64 m → 512 m.** Two prerequisites had to land first: the march
+   box is now **centred on the camera rather than cornered** (cornered at 2×reach
+   the float32 ulp reaches the traversal's 0.01 UU nudge at ~419 m, so the
+   geometry capped the reach before any ring logic did), and the walk now picks
+   **one ring level per ray from the receiver's camera distance**.
+3. **Climate tint.** The chunk record has carried temperature and precipitation
+   since Wave 2 step 3 and nothing consumed them.
+
+### What is honestly NOT done
+
+- **The shadow level selection is per-RAY, not per-SEGMENT.** Correct wherever a
+  ray stays inside its own annulus; where it leaves, the chunk record's level
+  check rejects the foreign chunk and the ray reads **LIT** — under-shadowed,
+  which is this file's existing fail-lit convention rather than a wrong picture.
+  The fully correct form re-partitions the ray into camera-radial intervals,
+  because a shadow ray's `t` is not distance-from-camera. That is the follow-up.
+- **Wave 5 (water off the quad pool) is not started.** It is a second renderer,
+  not a switch, and nothing about it is prototypable in an evening.
+- **None of the above is measured.** No legs, no captures, no A/Bs.
+- The GI origin audit logs once per run and will say whether water's GI is
+  offset — that is a log line, not a fix.

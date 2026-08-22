@@ -1,0 +1,688 @@
+// VoxelShadowMarch.usf -- ray-marched SUN SHADOWS, fired from the depth buffer.
+//
+// S1 of docs/shadow-march-design-2026-08-20.md. One ray per shaded pixel:
+// origin reconstructed from SceneDepth, offset one voxel along the GBuffer
+// normal, direction toward the sun, walked through the resident brick pyramid
+// at level 0. The output is a screen-space visibility mask (1 = lit) written to
+// a scratch texture -- S1 measures cost and never touches the picture. S2 wires
+// the mask into the sun's screen shadow mask through a light function material;
+// nothing in this file changes for that.
+//
+// DELIBERATELY NOT INSIDE VoxelMarch.usf's primary loop, for three reasons the
+// design doc spells out: receivers (this pass shadows EVERY opaque pixel, not
+// just terrain), wave shape (a second dependent ray appended to the primary
+// walk extends exactly the lanes that are already the tail; a separate dispatch
+// re-converges every wave at the surface), and territory (VoxelMarch.usf is
+// owned by the primary-march workstream and under active edit).
+//
+// NO ENGINE INCLUDES, ON PURPOSE. This shader reads raw textures and decodes
+// the GBuffer normal itself (n * 2 - 1, the default non-octahedral encoding --
+// see the REGISTERED ASSUMPTION below), so the whole file compiles offline
+// against real dxc: tools\voxel-check-shadowmarch-shader.ps1 is a REAL compile
+// of the code that ships, not a stub compile. That is the same property the
+// primary march kernel has and the emit kernels do not.
+//
+// ===========================================================================
+// VERDICT RULE -- one definition, used by BOTH kernels
+// ===========================================================================
+//
+//   shadowed  =  H.bHit || H.bStartedInside
+//
+//   bHit           the ray reached solid before TMax.
+//   bStartedInside the origin (surface + one voxel along the normal) is still
+//                  inside solid -- a concave corner or a pit. Occluded at any
+//                  grazing sun, so shadowed is the right answer; counted
+//                  separately so its magnitude is visible.
+//   bExhausted     the step budget ran out with segment remaining. FAIL-LIT --
+//                  a too-small budget must brighten the screen and inflate a
+//                  counter, never quietly darken it -- and counted, so "the
+//                  budget binds" is a number and not a suspicion.
+//
+// Skipped pixels: sky, beyond-reach and outside-the-box read LIT (no data is
+// no shadow -- fail-lit again); backfacing pixels read SHADOWED, which matches
+// what the light pass does with them anyway (N.L <= 0 receives no direct sun)
+// and is what a shadow map would have said.
+//
+// ===========================================================================
+// THE STAT TABLE -- MIRRORED BY HAND in VoxelShadowMarch.cpp
+// ===========================================================================
+//
+// One grep re-checks the mirror: VOXEL_SHADOW_STAT. The cpp reads these slots
+// out of the readback and prints them; a renumbering here without the cpp is a
+// misattributed census, not a crash -- which is exactly why the table lives in
+// one block with a warning on it rather than spread through the file.
+
+#define VOXEL_SHADOW_STAT_CONSIDERED     0   // in-rect pixels seen
+#define VOXEL_SHADOW_STAT_SKY            1   // DeviceZ == far plane, no surface
+#define VOXEL_SHADOW_STAT_FAR            2   // surface beyond ShadowSurfaceReachUU
+#define VOXEL_SHADOW_STAT_BACKFACE       3   // N.L <= 0, shadowed without a walk
+#define VOXEL_SHADOW_STAT_OFFBOX         4   // origin outside the march box (lit)
+#define VOXEL_SHADOW_STAT_MARCHED        5   // rays actually walked
+#define VOXEL_SHADOW_STAT_HIT            6   // ... of which found solid
+#define VOXEL_SHADOW_STAT_STARTED_INSIDE 7   // ... of which began inside solid
+#define VOXEL_SHADOW_STAT_EXHAUSTED      8   // ... of which ran out of budget (LIT)
+#define VOXEL_SHADOW_STAT_STEPS_TOTAL    9   // sum of H.Steps over marched rays
+#define VOXEL_SHADOW_STAT_MAX_STEPS      10  // InterlockedMax, worst single ray
+#define VOXEL_SHADOW_STAT_HIST0          12  // 14 buckets; bucket b holds steps in
+#define VOXEL_SHADOW_STAT_HIST_BUCKETS   14  //   (2^(b-1), 2^b], bucket 0 holds <= 1
+// startedInside, split by surface distance. HISTORY, kept so the numbers keep
+// their meaning: the footprint hypothesis (near ~ 0, far-heavy) was FALSIFIED
+// by leg D1 -- near=209,577 mid=101,622 far=17,089, monotonically DECREASING
+// with distance, and the 1.5-footprint pullback rescued only ~8% uniformly.
+// So the insides are (a) worst where geometry is closest and (b) buried deeper
+// than a 2-voxel view-ray shift. The counters below exist to name the
+// mechanism: per-band DENOMINATORS (a band with more rays and more insides is
+// otherwise indistinguishable from a band that is worse), burial depth, and
+// the material of the voxel the origin landed in.
+#define VOXEL_SHADOW_STAT_INSIDE_NEAR    26  // startedInside, TSurf <  reach/4
+#define VOXEL_SHADOW_STAT_INSIDE_MID     27  // ... TSurf in [reach/4, reach/2)
+#define VOXEL_SHADOW_STAT_INSIDE_FAR     28  // ... TSurf >= reach/2
+#define VOXEL_SHADOW_STAT_MARCHED_NEAR   29  // the denominators: marched rays
+#define VOXEL_SHADOW_STAT_MARCHED_MID    30  //   per band, so inside/marched is
+#define VOXEL_SHADOW_STAT_MARCHED_FAR    31  //   a per-band RATE
+// Diagnosis counters, populated only under voxel.Shadow.MarchDiag 1 (they cost
+// extra solid-tests per inside ray and must never contaminate a timing leg):
+#define VOXEL_SHADOW_STAT_BURIED_1       32  // first air voxel 1 above origin
+#define VOXEL_SHADOW_STAT_BURIED_2       33  // ... 2 above
+#define VOXEL_SHADOW_STAT_BURIED_3       34  // ... 3 above
+#define VOXEL_SHADOW_STAT_BURIED_4PLUS   35  // ... 4 or more above (DEEP)
+#define VOXEL_SHADOW_STAT_INSIDE_MATDEEP 36  // inside voxel is BEDROCK/ROCK --
+                                             // interior stratigraphy, i.e. the
+                                             // origin is far inside the ground
+#define VOXEL_SHADOW_STAT_INSIDE_MATSURF 37  // inside voxel is a surface material
+// THE BINDING CANARY, always on. Counts marched rays whose decoded normal has
+// no dominant axis (max component magnitude < 0.7). Quad terrain writes exact
+// axis normals, so this must sit near ZERO -- and when GBufferA was silently
+// bound to the engine's black dummy (the D4 incident: a depth-only uniform
+// buffer whose unset slots fall back to SystemTextures.Black,
+// SceneTextures.cpp:1108), every pixel decoded to the corner diagonal
+// (-0.577)^3 and this counter would have read 100% in the first census
+// window. A wrong normal source must never again be inferable only from ray
+// origins landing inside the ground.
+#define VOXEL_SHADOW_STAT_NONAXIS_N      38
+#define VOXEL_SHADOW_STAT_GROUP_WORDS    39  // groupshared mirror covers [0, 39)
+
+// Verify slots live ONLY in the global buffer (the verify kernel is sparse and
+// uses plain atomics -- no groupshared half).
+#define VOXEL_SHADOW_STAT_V_COMPARED     48  // sampled rays with a verdict pair
+#define VOXEL_SHADOW_STAT_V_DISAGREE     49  // walk verdict != mask verdict
+#define VOXEL_SHADOW_STAT_V_DIS_SHADOWED 50  //   ... walk said shadowed, mask lit
+#define VOXEL_SHADOW_STAT_V_DIS_LIT      51  //   ... walk said lit, mask shadowed
+#define VOXEL_SHADOW_STAT_V_REFSELF      52  // walk vs its entry-nudged self
+#define VOXEL_SHADOW_STAT_V_SKIPPED      53  // sampled pixel was sky/far/back/offbox
+
+#define VOXEL_SHADOW_STAT_WORDS          64  // buffer size; cpp mirrors
+
+// ---------------------------------------------------------------------------
+// The volume, behind its interface
+// ---------------------------------------------------------------------------
+//
+// VOXEL_MARCH_SOURCE=1 comes from ModifyCompilationEnvironment (and from -D in
+// the offline check). The guard below is why forgetting it is a compile error
+// naming this file rather than a wall of "undefined identifier
+// VoxelMarchTraverseBrick" naming somebody else's.
+
+// Platform.ush FIRST. The engine requires every global shader to include
+// /Engine/Public/Platform.ush -- omitting it fails at BOOT with "Shader is
+// required to include /Engine/Public/Platform.ush", which kills the next leg
+// rather than the next build. (This line was added by review after the first
+// draft omitted it -- the fix was real and is kept.)
+//
+// AND NOTHING ELSE FROM THE ENGINE, deliberately: VoxelBrickPack.usf:24 is the
+// precedent -- Platform.ush alone, for a global compute shader compiled at
+// boot. Common.ush would drag in /Engine/Generated headers that exist nowhere
+// on disk, downgrading tools\voxel-check-shadowmarch-shader.ps1 from a REAL
+// offline compile of the shipping code to a stub compile -- and this file
+// references no symbol from it (the one Common.ush helper it needs,
+// ConvertFromDeviceZ, is restated below over this pass's own uniform, exactly
+// as VoxelMarch.usf:358 does and for the same offline-compilability reason).
+#include "/Engine/Public/Platform.ush"
+
+#include "/VoxelEarth/VoxelBrickTraverse.ush"
+
+#if VOXEL_MARCH_SOURCE != VOXEL_MARCH_SOURCE_BRICKPOOL
+#error VoxelShadowMarch.usf marches the BRICK POOL. Compile with VOXEL_MARCH_SOURCE=1 \
+       (FVoxelShadowMarchCS::ModifyCompilationEnvironment sets it; the offline check \
+       passes -D VOXEL_MARCH_SOURCE=1). There is no occupancy-volume arm here: the \
+       shadow ray starts at an arbitrary depth-buffer surface, which the 51.2 m \
+       fluid box cannot cover.
+#endif
+
+#ifndef VOXEL_SHADOW_TILE
+#define VOXEL_SHADOW_TILE 8
+#endif
+
+// Lifted from VoxelMarch.usf with its reason: the walk's first act is
+// floor(pos/10) + origin, and a point sitting exactly on a box face floors to a
+// voxel outside the box. 0.05 UU is ~100 float ULP at the far corner and 1/200
+// of a voxel.
+#define VOXEL_SHADOW_BOX_INSET_UU 0.05f
+
+// ---------------------------------------------------------------------------
+// Bindings -- Shadow* names, so nothing here can shadow (or be shadowed by) the
+// traversal header's loose globals. MarchStepBudget / MarchChunkIndex /
+// MarchIndexDimChunks / MarchBrickOriginVoxel and the four pool arenas are
+// declared by VoxelBrickTraverse.ush and bound by the same parameter struct.
+// ---------------------------------------------------------------------------
+
+float4x4 ShadowViewToTranslatedWorld;
+float3   ShadowRayOriginLocalUU;   // CAMERA position, march-frame-local UU
+float3   ShadowDirToSun;           // normalized, toward the sun
+float3   ShadowVerifyDirToSun;     // the verify kernel's sun; differs from
+                                   // ShadowDirToSun ONLY under the mutation arm
+                                   // (voxel.Shadow.MarchVerifySunNudgeDeg)
+float    ShadowVolumeExtentUU;     // march box edge, frame-local [0, extent)^3
+uint     ShadowRingCount;          // ring levels the cascade carries (1 = level-0 only)
+float    ShadowRing0OuterUU;       // R0's outer radius; ring L is [R0*2^(L-1), R0*2^L)
+float2   ShadowViewRectMin;
+float2   ShadowViewRectSize;
+float2   ShadowInvProjDiag;
+float4   ShadowInvDeviceZToWorldZ;
+float    ShadowSurfaceReachUU;     // surfaces farther than this from the camera
+                                   // are skipped (counted FAR, read LIT)
+float    ShadowRayReachUU;         // how far a shadow ray travels
+float    ShadowNormalOffsetUU;     // the acne knob: origin = surface + N * this
+float    ShadowPixelConeSlope;     // one pixel's half-width in UU, per UU of t --
+                                   // the marcher's own cone-slope quantity
+float    ShadowPullbackPx;         // pull the origin back toward the camera by
+                                   // this many pixel FOOTPRINTS before the
+                                   // normal offset. THE RANGE DE-BIAS: any
+                                   // point on the camera ray in front of the
+                                   // depth sample is air BY VISIBILITY, and the
+                                   // shift is sub-pixel on screen by
+                                   // construction. 0 = off
+uint     ShadowVerifyStride;       // verify kernel samples every Nth pixel
+uint     ShadowDiagEnabled;        // voxel.Shadow.MarchDiag: burial probes,
+                                   // material split and the example dump.
+                                   // NEVER on in a timing leg
+uint     ShadowInsideDumpCap;      // max example records this frame
+
+Texture2D<float>  ShadowSceneDepthTexture;
+Texture2D<float4> ShadowGBufferATexture;
+RWTexture2D<float> ShadowOutMask;  // main kernel only. 1 = lit
+Texture2D<float>   ShadowMaskTexture; // verify kernel only. The SAME texture,
+                                      // read back through a separate binding --
+                                      // that separation is the point (the
+                                      // recorded lesson: the instrument must
+                                      // run the engine's binding)
+RWBuffer<uint>     ShadowOutStats;
+// The example dump: word 0 is the ticket counter, then 8-word records --
+//   w0 (px<<16)|py   view-local pixel
+//   w1 asuint(TSurfUU)
+//   w2 N packed 10:10:10 as (n*0.5+0.5)*1023
+//   w3 mat | burial<<8 | band<<12   (burial 15 == no air within 15 voxels up)
+//   w4..w6 StartVoxel.xyz as uint(int)  -- WORLD level-0 voxel, so a record can
+//          be cross-checked OFFLINE against the CPU reference world, which is
+//          the arbiter of "bricks wrong vs reconstruction wrong"
+//   w7 asuint(dot(N, DirToSun))
+RWBuffer<uint>     ShadowOutInsideDump;
+
+// ---------------------------------------------------------------------------
+// Common.ush restated -- one function, so this file stays engine-include-free
+// ---------------------------------------------------------------------------
+float VoxelShadowSceneViewZ(float DeviceZ)
+{
+	return DeviceZ * ShadowInvDeviceZToWorldZ[0] + ShadowInvDeviceZToWorldZ[1] +
+	       1.0f / (DeviceZ * ShadowInvDeviceZToWorldZ[2] - ShadowInvDeviceZToWorldZ[3]);
+}
+
+// ---------------------------------------------------------------------------
+// The ray setup, shared VERBATIM by both kernels
+// ---------------------------------------------------------------------------
+//
+// The verify kernel re-derives its ray from the pixel INDEPENDENTLY of anything
+// the main kernel recorded -- same function, separate dispatch, separate
+// bindings -- and then compares verdicts through the mask texture. In S1 the
+// two kernels walk the same traversal, so main-vs-verify agreement proves the
+// RECORDING AND BINDING path (same world bound on both sides, mask written
+// where the census thinks), NOT the traversal; the traversal's own gate is the
+// entry-nudged floor pair below plus the primary marcher's seven clean source
+// comparisons. When the shadow walk diverges from the reference (any-hit loop,
+// hierarchical skip), this same comparison becomes the real gate without
+// changing shape. Stated here so nobody reads S1's zero as more than it is.
+
+#define VOXEL_SHADOW_SKIP_NONE     0u
+#define VOXEL_SHADOW_SKIP_SKY      1u
+#define VOXEL_SHADOW_SKIP_FAR      2u
+#define VOXEL_SHADOW_SKIP_BACKFACE 3u
+#define VOXEL_SHADOW_SKIP_OFFBOX   4u
+
+struct FVoxelShadowSetup
+{
+	uint   Skip;         // VOXEL_SHADOW_SKIP_*; NONE means "walk it"
+	float  Visibility;   // the mask value when skipped (see the verdict rule)
+	float3 OriginLocalUU;
+	float  TMaxUU;
+	float  TSurfUU;      // camera-ray distance of the surface, for the census's
+	                     // inside-by-distance bands
+	float3 NormalWorld;  // the decoded GBuffer normal, threaded out for the
+	                     // binding canary and the dump (one read, one decode)
+};
+
+FVoxelShadowSetup VoxelShadowBuild(int2 LocalPixel, float3 DirToSun)
+{
+	FVoxelShadowSetup S = (FVoxelShadowSetup)0;
+	S.Skip = VOXEL_SHADOW_SKIP_NONE;
+	S.Visibility = 1.0f;
+
+	const int2 AbsPixel = int2(ShadowViewRectMin) + LocalPixel;
+
+	// Reverse-Z: the far-plane clear is 0, so "no surface" is DeviceZ <= 0 --
+	// the same test the primary march applies to the prepass depth.
+	const float DeviceZ = ShadowSceneDepthTexture.Load(int3(AbsPixel, 0)).r;
+	if (DeviceZ <= 0.0f)
+	{
+		S.Skip = VOXEL_SHADOW_SKIP_SKY;
+		return S;
+	}
+
+	// The camera ray for this pixel -- the math is VoxelMarchBuildRay's,
+	// verbatim, over the Shadow* uniforms, including the half-pixel centre.
+	// Same-ray discipline: the surface this pass reconstructs must be the
+	// surface the depth buffer's producer traced, not merely a similar one.
+	const float2 SvPositionXY = ShadowViewRectMin + float2(LocalPixel) + 0.5f;
+	const float2 Lp = SvPositionXY - ShadowViewRectMin;
+	float2 Ndc = (Lp / ShadowViewRectSize) * 2.0f - 1.0f;
+	Ndc.y = -Ndc.y; // clip y is up, pixel y is down
+
+	// UE view space: X right, Y up, Z forward. z = 1 makes t along this
+	// UNNORMALISED direction equal to view-space Z.
+	const float3 DirView = float3(Ndc * ShadowInvProjDiag, 1.0f);
+	const float  ViewZPerUU = rsqrt(dot(DirView, DirView));
+	const float3 CamDirWorld =
+		normalize(mul(float4(DirView, 0.0f), ShadowViewToTranslatedWorld).xyz);
+
+	const float SceneViewZ = VoxelShadowSceneViewZ(DeviceZ);
+	const float TSurfUU = SceneViewZ / max(ViewZPerUU, 1e-9f);
+	if (TSurfUU > ShadowSurfaceReachUU)
+	{
+		S.Skip = VOXEL_SHADOW_SKIP_FAR;
+		return S;
+	}
+
+	const float3 SurfaceLocalUU = ShadowRayOriginLocalUU + CamDirWorld * TSurfUU;
+
+	// REGISTERED ASSUMPTION: GBufferA.xyz is the world normal at the DEFAULT
+	// encoding, n * 0.5 + 0.5 (no octahedral / high-precision GBuffer in this
+	// project's config). A wrong decode here misaims the one-voxel offset --
+	// which reads as acne or peter-panning at the surface, never as a wrong
+	// occluder -- and the G-S2 capture pair is what would catch it.
+	const float4 GBufA = ShadowGBufferATexture.Load(int3(AbsPixel, 0));
+	const float3 N = normalize(GBufA.xyz * 2.0f - 1.0f);
+	S.NormalWorld = N;
+	if (dot(N, DirToSun) <= 0.0f)
+	{
+		S.Skip = VOXEL_SHADOW_SKIP_BACKFACE;
+		S.Visibility = 0.0f; // matches the light pass: N.L <= 0 gets no sun
+		return S;
+	}
+
+	// The origin, de-biased then offset. Order matters and is worth a line:
+	// the pullback undoes the RECONSTRUCTION error (which lies along the view
+	// ray and grows as TSurf * coneSlope), the normal offset then clears the
+	// surface's own voxel. With ShadowPullbackPx = 0 this is byte-identical to
+	// the configuration s1-shadow-m1b measured.
+	const float FootprintUU = TSurfUU * ShadowPixelConeSlope;
+	const float3 Origin = SurfaceLocalUU
+	                    - CamDirWorld * (ShadowPullbackPx * FootprintUU)
+	                    + N * ShadowNormalOffsetUU;
+
+	// Clip [0, ShadowRayReachUU] to the march box. Same slab arithmetic as
+	// VoxelMarchBuildRay, from an origin that is normally strictly inside the
+	// box (the host sizes the box to 2x the surface reach around the camera);
+	// TEnter > 0 therefore means the origin is OUTSIDE -- no data, fail-lit.
+	const float3 SafeDir =
+		DirToSun + float3(abs(DirToSun) < VOXEL_MARCH_MIN_DIR_COMPONENT) *
+		               VOXEL_MARCH_MIN_DIR_COMPONENT;
+	const float3 InvDir = 1.0f / SafeDir;
+	const float3 T0 = (0.0f - Origin) * InvDir;
+	const float3 T1 = (ShadowVolumeExtentUU - Origin) * InvDir;
+	const float3 TLo = min(T0, T1);
+	const float3 THi = max(T0, T1);
+	const float TEnter = max(max(TLo.x, TLo.y), TLo.z);
+	const float TExit = min(min(THi.x, THi.y), THi.z);
+	const float TMax = min(ShadowRayReachUU, TExit - VOXEL_SHADOW_BOX_INSET_UU);
+	if (TEnter > 0.0f || TMax <= 0.0f)
+	{
+		S.Skip = VOXEL_SHADOW_SKIP_OFFBOX;
+		return S;
+	}
+
+	S.OriginLocalUU = Origin;
+	S.TMaxUU = TMax;
+	S.TSurfUU = TSurfUU;
+	return S;
+}
+
+// The verdict rule, in code. Both kernels call THIS and nothing else -- two
+// spellings of "shadowed" is how a comparator ends up comparing itself.
+bool VoxelShadowWalkShadowed(float3 OriginLocalUU, float3 DirToSun, float TMaxUU,
+                             out FVoxelMarchHit OutHit)
+{
+	// ConeSlopeUU = 0: no LOD along a shadow ray. The brick-pool traversals
+	// ignore the slope entirely (only the occupancy walk reads it), so this is
+	// documentation at the call site rather than a knob.
+	OutHit = VoxelMarchTraverseBrick(OriginLocalUU, DirToSun, 0.0f, TMaxUU, 0.0f);
+	return OutHit.bHit || OutHit.bStartedInside;
+}
+
+#if VOXEL_MARCH_HAS_BRICKPOOL
+// ONE LEVEL PER RAY, CHOSEN BY THE RECEIVER'S DISTANCE FROM THE CAMERA.
+//
+// WHY REACH WAS PINNED AT 64 m: residency is camera-radial annuli -- only
+// level-L chunks exist in ring L -- and this walk was level-0-only, so a ray
+// leaving R0 (128 m) found no bricks and read LIT. That is 62% of the frame at
+// the shipped pose (far=840,288 of 1,354,896).
+//
+// WHY THIS IS THE PROTOTYPE AND NOT THE FINAL ANSWER, stated plainly: the fully
+// correct form re-partitions the ray into camera-radial intervals and walks
+// each at its own level, because a shadow ray's `t` is NOT distance-from-camera
+// (that identity holds only for rays fired FROM the camera, which is exactly
+// what VoxelMarchTraverseRings assumes). Picking one level from the RECEIVING
+// surface is correct wherever the ray stays inside its own annulus, and where
+// it does not the chunk record's own level check rejects the foreign chunk and
+// the ray reads LIT -- under-shadowed, which is this file's existing fail-lit
+// convention rather than a wrong picture.
+//
+// So: long-range shadows that are right in the common case and conservative in
+// the rest, for about fifteen lines. The segmentation is the follow-up.
+uint VoxelShadowLevelForDistance(float DistFromCameraUU)
+{
+	if (ShadowRingCount <= 1u || ShadowRing0OuterUU <= 0.0f)
+	{
+		return 0u;
+	}
+	uint L = 0u;
+	float Outer = ShadowRing0OuterUU;
+	while (L + 1u < ShadowRingCount && DistFromCameraUU >= Outer)
+	{
+		Outer *= 2.0f;
+		++L;
+	}
+	return L;
+}
+
+bool VoxelShadowWalkShadowedLevelled(float3 OriginLocalUU, float3 DirToSun, float TMaxUU,
+                                     float SurfDistFromCameraUU, out FVoxelMarchHit OutHit,
+                                     out uint OutLevel)
+{
+	OutLevel = VoxelShadowLevelForDistance(SurfDistFromCameraUU);
+	if (OutLevel == 0u)
+	{
+		VoxelMarchBeginLevel(0u);
+		OutHit = VoxelMarchTraverseBrick(OriginLocalUU, DirToSun, 0.0f, TMaxUU, 0.0f);
+		return OutHit.bHit || OutHit.bStartedInside;
+	}
+	// THE RESCALE AND THE CONTEXT ARE ONE STATEMENT. Setting the level without
+	// dividing the ray (or the reverse) does not error -- it looks up a chunk
+	// coordinate in the wrong lattice and can return a REAL hit from geometry
+	// 2^L times the wrong size, in roughly the right place. Keeping both here,
+	// with no other caller, is what makes that unrepresentable.
+	const float S = float(1u << OutLevel);
+	VoxelMarchBeginLevel(OutLevel);
+	OutHit = VoxelMarchTraverseBrick(OriginLocalUU / S, DirToSun, 0.0f, TMaxUU / S, 0.0f);
+	OutHit.THitUU *= S;
+	const bool bShadowed = OutHit.bHit || OutHit.bStartedInside;
+	// Restore, for the reason VoxelMarchTraverseCoverSeg records: a context left
+	// set leaks into the next consumer and draws terrain in the wrong place with
+	// no error anywhere.
+	VoxelMarchBeginLevel(0u);
+	return bShadowed;
+}
+#endif // VOXEL_MARCH_HAS_BRICKPOOL
+
+// ===========================================================================
+// 1. THE MARCH -- one thread per pixel, stats reduced per group
+// ===========================================================================
+//
+// No early returns before the barriers: a barrier under divergent control flow
+// is undefined, so the whole body is predicated on bInView instead.
+
+groupshared uint GShadowStat[VOXEL_SHADOW_STAT_GROUP_WORDS];
+
+[numthreads(VOXEL_SHADOW_TILE, VOXEL_SHADOW_TILE, 1)]
+void VoxelShadowMarchMain(uint3 DispatchThreadId : SV_DispatchThreadID,
+                          uint GroupIndex : SV_GroupIndex)
+{
+	{
+		for (uint i = GroupIndex; i < VOXEL_SHADOW_STAT_GROUP_WORDS;
+		     i += VOXEL_SHADOW_TILE * VOXEL_SHADOW_TILE)
+		{
+			GShadowStat[i] = 0u;
+		}
+	}
+	GroupMemoryBarrierWithGroupSync();
+
+	const int2 LocalPixel = int2(DispatchThreadId.xy);
+	const bool bInView = all(LocalPixel < int2(ShadowViewRectSize));
+
+	if (bInView)
+	{
+		InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_CONSIDERED], 1u);
+
+		const FVoxelShadowSetup S = VoxelShadowBuild(LocalPixel, ShadowDirToSun);
+		float Visibility = S.Visibility;
+
+		if (S.Skip == VOXEL_SHADOW_SKIP_NONE)
+		{
+			InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_MARCHED], 1u);
+			// The band, 0/1/2, used for both the denominator and (on inside)
+			// the numerator -- one derivation so the rate cannot mix bands.
+			const uint Band = (S.TSurfUU < ShadowSurfaceReachUU * 0.25f)
+			                      ? 0u
+			                      : ((S.TSurfUU < ShadowSurfaceReachUU * 0.5f) ? 1u : 2u);
+			InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_MARCHED_NEAR + Band], 1u);
+			// The binding canary -- see the stat table.
+			const float3 AbsN = abs(S.NormalWorld);
+			if (max(AbsN.x, max(AbsN.y, AbsN.z)) < 0.7f)
+			{
+				InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_NONAXIS_N], 1u);
+			}
+
+			FVoxelMarchHit H;
+#if VOXEL_MARCH_HAS_BRICKPOOL
+			// The receiver's distance from the camera picks the ring level. The
+			// camera is ShadowRayOriginLocalUU in this frame, so this is a plain
+			// length in frame-local UU -- no extra uniform.
+			uint WalkLevel = 0u;
+			const float SurfDistUU = length(S.OriginLocalUU - ShadowRayOriginLocalUU);
+			const bool bShadowed = VoxelShadowWalkShadowedLevelled(
+				S.OriginLocalUU, ShadowDirToSun, S.TMaxUU, SurfDistUU, H, WalkLevel);
+			// PER-LEVEL MARCHED COUNTS. A cascade whose level split is invisible
+			// is the situation that hid hitL1 = 0 twice on the camera path, for
+			// two independent reasons. Slots 12..17 were free.
+			InterlockedAdd(GShadowStat[12u + min(WalkLevel, 5u)], 1u);
+#else
+			const bool bShadowed =
+				VoxelShadowWalkShadowed(S.OriginLocalUU, ShadowDirToSun, S.TMaxUU, H);
+#endif
+			Visibility = bShadowed ? 0.0f : 1.0f;
+
+			if (H.bHit)
+			{
+				InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_HIT], 1u);
+			}
+			if (H.bStartedInside)
+			{
+				InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_STARTED_INSIDE], 1u);
+				InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_INSIDE_NEAR + Band], 1u);
+
+				if (ShadowDiagEnabled != 0u)
+				{
+					// Burial: walk straight up from the origin voxel until air.
+					// Straight up and not along N, deliberately -- "how deep
+					// under the TERRAIN SURFACE is this origin" is the
+					// question, and up is the direction the surface is in.
+					FVoxelMarchChunkCache PC = VoxelMarchNoChunk();
+					FVoxelMarchBrickCache PB = VoxelMarchNoBrick();
+					uint Burial = 15u; // "no air within 15 voxels" sentinel
+					[loop]
+					for (uint k = 1u; k <= 15u; ++k)
+					{
+						uint PMat = 0u;
+						if (!VoxelMarchBrickSolidAt(H.Voxel + int3(0, 0, int(k)), PC, PB, PMat))
+						{
+							Burial = k;
+							break;
+						}
+					}
+					const uint BurialSlot =
+						(Burial <= 3u) ? (VOXEL_SHADOW_STAT_BURIED_1 + Burial - 1u)
+						               : VOXEL_SHADOW_STAT_BURIED_4PLUS;
+					InterlockedAdd(GShadowStat[BurialSlot], 1u);
+					// Material class: BEDROCK(1)/ROCK(2) are interior
+					// stratigraphy -- an origin in them is far inside the
+					// ground; surface materials say the origin is in the shell.
+					InterlockedAdd(GShadowStat[(H.Material <= 2u)
+					                               ? VOXEL_SHADOW_STAT_INSIDE_MATDEEP
+					                               : VOXEL_SHADOW_STAT_INSIDE_MATSURF],
+					               1u);
+					// The example dump -- the records that let a human (and the
+					// offline CPU-world cross-check) see ACTUAL failing rays
+					// instead of aggregate counts.
+					uint Ticket = 0u;
+					InterlockedAdd(ShadowOutInsideDump[0], 1u, Ticket);
+					if (Ticket < ShadowInsideDumpCap)
+					{
+						const uint Base = 1u + Ticket * 8u;
+						const float3 N = S.NormalWorld;
+						const uint3 NQ = uint3(saturate(N * 0.5f + 0.5f) * 1023.0f);
+						ShadowOutInsideDump[Base + 0] =
+							(uint(LocalPixel.x) << 16) | uint(LocalPixel.y);
+						ShadowOutInsideDump[Base + 1] = asuint(S.TSurfUU);
+						ShadowOutInsideDump[Base + 2] = (NQ.x << 20) | (NQ.y << 10) | NQ.z;
+						ShadowOutInsideDump[Base + 3] =
+							(H.Material & 0xFFu) | (Burial << 8u) | (Band << 12u);
+						ShadowOutInsideDump[Base + 4] = uint(H.Voxel.x);
+						ShadowOutInsideDump[Base + 5] = uint(H.Voxel.y);
+						ShadowOutInsideDump[Base + 6] = uint(H.Voxel.z);
+						ShadowOutInsideDump[Base + 7] = asuint(dot(N, ShadowDirToSun));
+					}
+				}
+			}
+			if (H.bExhausted)
+			{
+				InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_EXHAUSTED], 1u);
+			}
+
+			const uint Steps = uint(max(H.Steps, 0));
+			InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_STEPS_TOTAL], Steps);
+			InterlockedMax(GShadowStat[VOXEL_SHADOW_STAT_MAX_STEPS], Steps);
+			// Bucket b covers (2^(b-1), 2^b]; 0 covers <= 1. firstbithigh(s-1)+1
+			// is exact for that partition and branchless.
+			const uint Bucket =
+				(Steps <= 1u)
+					? 0u
+					: min(uint(VOXEL_SHADOW_STAT_HIST_BUCKETS - 1),
+					      firstbithigh(Steps - 1u) + 1u);
+			InterlockedAdd(GShadowStat[VOXEL_SHADOW_STAT_HIST0 + Bucket], 1u);
+		}
+		else
+		{
+			// SKY/FAR/BACKFACE/OFFBOX are 1..4 and the stat slots are laid out
+			// to match -- see the table.
+			InterlockedAdd(GShadowStat[S.Skip], 1u);
+		}
+
+		const int2 AbsPixel = int2(ShadowViewRectMin) + LocalPixel;
+		ShadowOutMask[AbsPixel] = Visibility;
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+	{
+		for (uint i = GroupIndex; i < VOXEL_SHADOW_STAT_GROUP_WORDS;
+		     i += VOXEL_SHADOW_TILE * VOXEL_SHADOW_TILE)
+		{
+			const uint V = GShadowStat[i];
+			if (V == 0u)
+			{
+				continue;
+			}
+			if (i == VOXEL_SHADOW_STAT_MAX_STEPS)
+			{
+				InterlockedMax(ShadowOutStats[i], V);
+			}
+			else
+			{
+				InterlockedAdd(ShadowOutStats[i], V);
+			}
+		}
+	}
+}
+
+// ===========================================================================
+// 2. THE VERIFY -- G-S1's replay, floor pair and mutation arm (design doc s4)
+// ===========================================================================
+//
+// Sparse (every ShadowVerifyStride-th pixel), separate dispatch, separate
+// bindings, plain atomics. NEVER in a timing leg: the C++ refuses to dispatch
+// it unless voxel.Shadow.MarchVerify > 0, and the cost census would show it
+// anyway.
+//
+// Three measurements per sampled ray:
+//   replay    walk the independently re-derived ray, compare with the mask.
+//   floor     walk the ENTRY-NUDGED ray (origin * (1 + 1e-6)), compare with the
+//             un-nudged walk. Entry-point nudge, NOT segment scaling: G3's
+//             in-engine control scaled the segment and measured a floor its
+//             offline counterpart showed to be understated -- the accumulated-t
+//             divergence originates at the entry, so that is what the
+//             perturbation must move. At 64 m reach the displacement is
+//             <= ~2.6e-3 UU, about 1/4000 of a voxel: ULP-scale, as intended.
+//   mutation  with voxel.Shadow.MarchVerifySunNudgeDeg != 0 the host hands this
+//             kernel a rotated sun. The replay MUST then disagree along every
+//             shadow edge -- a comparator that stays green under a wrong sun is
+//             a check that cannot fail, and tonight produced four of those.
+
+[numthreads(VOXEL_SHADOW_TILE, VOXEL_SHADOW_TILE, 1)]
+void VoxelShadowVerifyMain(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const int2 LocalPixel = int2(DispatchThreadId.xy);
+	if (any(LocalPixel >= int2(ShadowViewRectSize)))
+	{
+		return;
+	}
+	if (ShadowVerifyStride == 0u)
+	{
+		return; // belt and braces; the host does not dispatch at stride 0
+	}
+	const uint Linear =
+		uint(LocalPixel.y) * uint(ShadowViewRectSize.x) + uint(LocalPixel.x);
+	if ((Linear % ShadowVerifyStride) != 0u)
+	{
+		return;
+	}
+
+	const FVoxelShadowSetup S = VoxelShadowBuild(LocalPixel, ShadowVerifyDirToSun);
+	if (S.Skip != VOXEL_SHADOW_SKIP_NONE)
+	{
+		InterlockedAdd(ShadowOutStats[VOXEL_SHADOW_STAT_V_SKIPPED], 1u);
+		return;
+	}
+
+	FVoxelMarchHit HA;
+	const bool bWalkShadowed =
+		VoxelShadowWalkShadowed(S.OriginLocalUU, ShadowVerifyDirToSun, S.TMaxUU, HA);
+
+	const int2 AbsPixel = int2(ShadowViewRectMin) + LocalPixel;
+	const bool bMaskShadowed = ShadowMaskTexture.Load(int3(AbsPixel, 0)).r < 0.5f;
+
+	InterlockedAdd(ShadowOutStats[VOXEL_SHADOW_STAT_V_COMPARED], 1u);
+	if (bWalkShadowed != bMaskShadowed)
+	{
+		InterlockedAdd(ShadowOutStats[VOXEL_SHADOW_STAT_V_DISAGREE], 1u);
+		InterlockedAdd(ShadowOutStats[bWalkShadowed
+		                                  ? VOXEL_SHADOW_STAT_V_DIS_SHADOWED
+		                                  : VOXEL_SHADOW_STAT_V_DIS_LIT],
+		               1u);
+	}
+
+	// The floor pair. Same sun, same TMax, entry nudged.
+	const float3 OriginNudged = S.OriginLocalUU * (1.0f + 1e-6f);
+	FVoxelMarchHit HB;
+	const bool bNudgedShadowed =
+		VoxelShadowWalkShadowed(OriginNudged, ShadowVerifyDirToSun, S.TMaxUU, HB);
+	if (bNudgedShadowed != bWalkShadowed)
+	{
+		InterlockedAdd(ShadowOutStats[VOXEL_SHADOW_STAT_V_REFSELF], 1u);
+	}
+}

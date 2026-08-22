@@ -19,6 +19,13 @@
 #include "RenderResource.h"
 #include "ShaderParameters.h"
 #include "RHIResources.h"
+// FRDGTextureRef, for RegisterVolumesForCompute's seam. Fwd header only, on the
+// same rule VoxelBrickPool.h states: a reference parameter and a typedef do not
+// justify pulling the whole render-graph header into every consumer of this
+// file, most of which never build a pass.
+#include "RenderGraphFwd.h"
+
+class FRDGBuilder;
 
 // Bound alongside VoxelVF, as a SECOND uniform buffer rather than by widening
 // that one. The factory's buffer is built once in InitRHI and its header warns
@@ -65,6 +72,18 @@ BEGIN_GLOBAL_SHADER_PARAMETER_STRUCT(FVoxelGIVolumeParameters, VOXELEARTHSHADERS
 	// the big offset in its double-precision transform, so Intermediates.Position
 	// is already small; supplying the origin in the same space keeps the whole
 	// lookup in the range where float32 has ~0.015 UU of headroom.
+	// THE SAME ORIGIN, RELATIVE TO THE CAMERA INSTEAD OF TO A POOL PRIMITIVE.
+	//
+	// OriginPoolUU below is expressed in ONE primitive's space -- the terrain
+	// pool's -- and this is a TGlobalResource bound identically to every quad
+	// draw, so every water bucket (each with its own rebase) samples GI at the
+	// wrong place. The marcher has no pool primitive at all.
+	//
+	// Camera-relative works for both: the volume is a few tens of metres around
+	// the camera, so both operands are small and float32 is exact here, which is
+	// the whole reason pool space was chosen in the first place (at ~8.4M UU the
+	// ULP is 1.0 UU against a 40 UU cell).
+	SHADER_PARAMETER(FVector3f, OriginRelCameraUU)
 	SHADER_PARAMETER(FVector3f, OriginPoolUU)
 	SHADER_PARAMETER(FVector3f, InvSizeUU)
 	// Centre the distance fade is measured FROM, in the same pool space. This is
@@ -121,9 +140,19 @@ namespace VoxelGIVolume
 	// partial-brick clip case).
 	VOXELEARTHSHADERS_API int32 GetLocalDim();
 
-	// Master switch. Off by default: with it off the factory does not sample,
-	// and the emitted vertex colour is byte-identical to what it is today.
+	// Master switch. DEFAULT 1 (on) since 2026-07-27 -- the comment here used to
+	// say "off by default" and, like the cvar's own help string, was believed
+	// downstream for a month. With it off the factory does not sample and the
+	// emitted vertex colour is byte-identical to what it is with GI absent.
 	VOXELEARTHSHADERS_API bool IsEnabled();
+
+	// voxel.GI.VolumeUAV. P7 prerequisite, default 0, STARTUP ONLY.
+	//
+	// FOR THE ALLOCATION SITE ONLY. Everything downstream must ask
+	// FVoxelGIVolume::WasAllocatedWithUAV() instead: this reports what was
+	// requested, that reports what exists, and after allocation only the second
+	// one is true.
+	VOXELEARTHSHADERS_API bool IsUAVEnabled();
 
 	// voxel.GI.LocalLights. Second master switch, independent of IsEnabled():
 	// with it off VolumeLocal is not allocated, not splatted and not sampled.
@@ -155,6 +184,9 @@ namespace VoxelGIVolume
 struct FVoxelGIVolumeSettings
 {
 	FVector3f OriginPoolUU = FVector3f::ZeroVector;
+	// The same origin relative to the CAMERA. See the shader parameter's note:
+	// this is the one consumers without a pool primitive can use.
+	FVector3f OriginRelCameraUU = FVector3f::ZeroVector;
 	FVector3f FadeCentrePoolUU = FVector3f::ZeroVector;
 	float Strength = 1.0f;
 	float AmbientFloor = 0.06f;
@@ -175,6 +207,7 @@ struct FVoxelGIVolumeSettings
 	bool operator==(const FVoxelGIVolumeSettings& Other) const
 	{
 		return OriginPoolUU == Other.OriginPoolUU
+			&& OriginRelCameraUU == Other.OriginRelCameraUU
 			&& FadeCentrePoolUU == Other.FadeCentrePoolUU
 			&& Strength == Other.Strength
 			&& AmbientFloor == Other.AmbientFloor
@@ -202,6 +235,12 @@ public:
 	// is a validation failure, not a tolerated no-op, so this hands back a
 	// buffer pointing at GBlackVolumeTexture with Enabled=0.
 	FRHIUniformBuffer* GetUniformBuffer() const { return UniformBuffer.GetReference(); }
+	// THE REF, for RDG parameter structs -- and it must be this rather than
+	// TUniformBufferRef<T>(GetUniformBuffer()). That constructor COMPILES and
+	// then produces an UNSET binding, which UE reports as a fatal "required
+	// shader parameter was not set" at the first dispatch. Cost an hour on the
+	// marcher's View binding on 2026-08-21.
+	const TUniformBufferRef<FVoxelGIVolumeParameters>& GetUniformBufferRef() const { return UniformBuffer; }
 
 	// Rebuilds the uniform buffer. Render thread. Cheap -- it is a handful of
 	// scalars plus two resource pointers.
@@ -283,10 +322,48 @@ public:
 	int32 GetDimTexels() const { return DimTexels; }
 	int32 GetLocalDimTexels() const { return LocalDimTexels; }
 
+	// --- P7 PREREQUISITE: the seam a compute writer would come in through ----
+	//
+	// True iff VolumePos/VolumeNeg were CREATED with ETextureCreateFlags::UAV,
+	// which is decided once, at allocation, by voxel.GI.VolumeUAV.
+	//
+	// ASK THIS, NEVER THE CVAR. Texture flags are fixed at creation and this
+	// resource is allocated exactly once per session, so the cvar answers "what
+	// was requested" while this answers "what exists". Those diverge for the
+	// whole run if the cvar is set after allocation -- which is why it is
+	// ECVF_ReadOnly, and why this accessor exists rather than a second reader
+	// of the same cvar. A join computed instead of checked is the failure this
+	// project has hit five times in three days.
+	bool WasAllocatedWithUAV() const { return bAllocatedWithUAV; }
+
+	// Registers the two irradiance volumes into an RDG graph so a compute pass
+	// can write them, and REFUSES if they were not allocated UAV-capable.
+	//
+	// RETURNS FALSE AND LEAVES BOTH OUTPUTS NULL when the volumes do not exist
+	// yet or were created sampled-only. That refusal is the point of the
+	// function. Registering a non-UAV texture succeeds here and then fails much
+	// later, inside RDG, at the CreateUAV the caller inevitably makes -- as a
+	// validation assert in a development build and as undefined behaviour in a
+	// shipping one. Neither names the actual cause, which is a cvar that was
+	// off at startup. A caller that checks the return value gets a pass it can
+	// skip cleanly instead.
+	//
+	// THIS DOES NOT MAKE ANYTHING WRITE THEM. There is no compute writer in the
+	// tree; this is the prerequisite half, landed separately because it is
+	// blocked on nothing while the march itself is blocked on the ring-level
+	// walk. Its first caller does not exist yet, so NOTHING HERE IS EXERCISED
+	// BY ANY LEG -- see the report accompanying this change.
+	//
+	// Render thread, inside a graph, like every other RDG registration.
+	bool RegisterVolumesForCompute(FRDGBuilder& GraphBuilder,
+	                               FRDGTextureRef& OutPos, FRDGTextureRef& OutNeg) const;
+
 private:
 	FTextureRHIRef VolumePos;
 	FTextureRHIRef VolumeNeg;
 	FTextureRHIRef VolumeLocal;
+	// Latched at allocation from voxel.GI.VolumeUAV. See WasAllocatedWithUAV.
+	bool bAllocatedWithUAV = false;
 	TUniformBufferRef<FVoxelGIVolumeParameters> UniformBuffer;
 	FVoxelGIVolumeSettings Settings;
 	int32 DimTexels = 0;

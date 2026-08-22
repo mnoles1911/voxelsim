@@ -196,6 +196,7 @@ float2   MarchViewRectSize;
 float2   MarchInvProjDiag;
 float4   MarchInvDeviceZToWorldZ;
 float    MarchPixelConeSlope;
+float    MarchClimateStrength;   // 0 = no climate tint (byte-identical to before)
 int2     MarchTileCount;
 
 int MarchHasPrepassDepth;
@@ -924,6 +925,8 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	// (VoxelBrickTraverse.ush:1121-1887), so an unguarded call does not read
 	// garbage -- it fails to compile, which is how this was caught.
 	float SurfaceBandFade = 1.0f;
+	// 128/128 = neutral, so a miss tints nothing.
+	uint HitClimatePacked = 128u | (128u << 8);
 #if VOXEL_MARCH_HAS_BRICKPOOL
 	{
 		// WorldVoxel, NOT V.LocalVoxel. THE MUTATION ARM CAUGHT THIS.
@@ -954,6 +957,7 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 			// kNoSurfaceGate: a chunk with no fitted plane is ALWAYS surface, so
 			// the gate can never darken terrain it has no information about.
 			SurfaceBandFade = (HitChunk.SurfaceZRelUU < -1.0e29f || bNearSurface) ? 1.0f : 0.0f;
+			HitClimatePacked = HitChunk.ClimatePacked;
 		}
 	}
 #endif // VOXEL_MARCH_HAS_BRICKPOOL
@@ -1002,6 +1006,106 @@ void VoxelMarchEmitPS(FVoxelMarchEmitInterp In,
 	float Roughness = VOXEL_MARCH_ROUGHNESS;
 	float Metallic = VOXEL_MARCH_METALLIC;
 	float Specular = VOXEL_MARCH_SPECULAR;
+
+	// ---- WAVE 2: CLIMATE TINT ----------------------------------------------
+	//
+	// The chunk record carries temperature and precipitation in dword 7 (Wave 2
+	// steps 0-3 put them there and gated three ways). Nothing consumed them
+	// until now, so they were correct and invisible.
+	//
+	// THIS IS NOT A TRANSCRIPTION OF THE QUAD PATH. The quad path writes the two
+	// bytes into vertex colour B/A and lets M_VoxelTerrain's biome graph do the
+	// work; the marcher has no material graph and, per ADR-0008, is meant to
+	// shade per-voxel from what it knows. So this is a deliberate, small
+	// re-design: a warm/cool and a dry/lush shift applied to the palette colour,
+	// strength on a cvar so the designer can dial it live rather than through a
+	// rebuild. It is the term most likely to need tuning by eye, which is
+	// exactly why it is a knob and not a constant.
+	if (MarchClimateStrength > 0.0f && SurfaceBandFade > 0.0f)
+	{
+		const float Temperature = float(HitClimatePacked & 0xFFu) / 255.0f;
+		const float Precipitation = float((HitClimatePacked >> 8u) & 0xFFu) / 255.0f;
+		// Neutral is 128/255 on both, so a chunk with no climate data shifts
+		// nothing -- the same fail-neutral convention the record's Neutral() uses.
+		const float T = (Temperature - 0.5f) * 2.0f;   // -1 cold .. +1 hot
+		const float P = (Precipitation - 0.5f) * 2.0f; // -1 arid .. +1 wet
+		// Warm shifts toward red, cool toward blue; wet deepens and greens,
+		// arid lightens and yellows. Applied multiplicatively so albedo
+		// structure and the per-voxel jitter both survive.
+		const float3 Warm = float3(1.0f + 0.18f * T, 1.0f + 0.02f * T, 1.0f - 0.16f * T);
+		const float3 Wet  = float3(1.0f - 0.14f * P, 1.0f + 0.06f * P, 1.0f - 0.05f * P);
+		BaseColor *= lerp(float3(1.0f, 1.0f, 1.0f), Warm * Wet, MarchClimateStrength);
+	}
+
+	// ---- WAVE 2: VOXEL GI --------------------------------------------------
+	//
+	// The quad path samples the GI light field in VoxelQuadVertexFactory.ush and
+	// folds the result into vertex colour G. The marcher wrote
+	// EncodeIndirectIrradiance(1.0f) -- the NEUTRAL value -- so flipping terrain
+	// to the marcher removed voxel GI from terrain entirely, silently, with
+	// voxel.GI.Enabled defaulting to 1. This closes that.
+	//
+	// CAMERA-RELATIVE ORIGIN, NOT POOL SPACE. The quad path works in its pool
+	// primitive's space and the GI uniform's OriginPoolUU is expressed there. The
+	// marcher has no pool primitive. HitTWS is already camera-relative and the
+	// volume sits a few tens of metres around the camera, so both operands are
+	// small and float32 is exact -- which is the same reason the quad path uses
+	// pool space rather than world space.
+	//
+	// THREE PROBE OFFSETS, matching FVoxelLightField's {0.6, 1.25, 2.0} cells
+	// term for term, and for the reason VoxelQuadVertexFactory.ush:686-694 gives:
+	// a single 0.6-cell push-out along the normal frequently stays inside a thin
+	// slab's own solid cell, finds nothing solved, and falls back to flat AO --
+	// exactly the roof-underside defect the CPU side already fixed once.
+	float VoxelGIAmbient = 1.0f;
+	if (VoxelGIVol.Enabled != 0u)
+	{
+		const float3 ProbeRelCam = HitTWS - VoxelGIVol.OriginRelCameraUU;
+		const float3 GIUVW = ProbeRelCam * VoxelGIVol.InvSizeUU;
+		if (all(GIUVW > 0.0f) && all(GIUVW < 1.0f))
+		{
+			const float3 N = WorldNormal;
+			const float3 StepUVW = N * VoxelGIVol.CellSizeUU * VoxelGIVol.InvSizeUU;
+			const float3 AbsN = abs(N);
+			const bool bAxisX = (AbsN.x >= AbsN.y) && (AbsN.x >= AbsN.z);
+			const bool bAxisY = (!bAxisX) && (AbsN.y >= AbsN.z);
+			// Scheme A: VolumePos holds (Vis[+X],Vis[+Y],Vis[+Z],v) and VolumeNeg
+			// the negatives, so the face reads ONE of them by the sign of its own
+			// normal and takes ONE component. Two textures, still one sample.
+			const bool bPos = bAxisX ? (N.x >= 0.0f) : (bAxisY ? (N.y >= 0.0f) : (N.z >= 0.0f));
+			float3 ProbeUVW = GIUVW;
+			float4 T = bPos
+				? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+				: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+			if (T.a <= 0.0f)
+			{
+				ProbeUVW = GIUVW + StepUVW * 0.65f;   // 1.25 cells total
+				T = bPos
+					? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+					: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+			}
+			if (T.a <= 0.0f)
+			{
+				ProbeUVW = GIUVW + StepUVW * 1.4f;    // 2.0 cells total
+				T = bPos
+					? Texture3DSampleLevel(VoxelGIVol.VolumePos, VoxelGIVol.VolumeSampler, ProbeUVW, 0)
+					: Texture3DSampleLevel(VoxelGIVol.VolumeNeg, VoxelGIVol.VolumeSampler, ProbeUVW, 0);
+			}
+			const float W = T.a;
+			if (W > 0.0f)
+			{
+				const float Irr = (bAxisX ? T.r : (bAxisY ? T.g : T.b)) / W;
+				// Fade measured from the CAMERA, which in this frame is the origin.
+				const float DistUU = length(ProbeRelCam);
+				const float Fade = 1.0f - saturate((DistUU - VoxelGIVol.FadeStartUU)
+				                                 / max(1.0f, VoxelGIVol.FadeEndUU - VoxelGIVol.FadeStartUU));
+				const float Ambient = lerp(VoxelGIVol.AmbientFloor, 1.0f, saturate(Irr));
+				const float Weight = saturate(VoxelGIVol.Strength * Fade);
+				VoxelGIAmbient = lerp(1.0f, Ambient, Weight);
+			}
+		}
+	}
+	BaseColor *= VoxelGIAmbient;
 
 #if VOXEL_MARCH_AO
 	// AO INTO BASE COLOUR, because that is where the shipped raster path puts

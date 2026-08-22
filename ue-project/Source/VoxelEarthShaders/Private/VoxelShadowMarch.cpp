@@ -95,7 +95,7 @@ namespace
 	// ---- the arm ----------------------------------------------------------
 
 	TAutoConsoleVariable<int32> CVarVoxelShadowMarch(
-		TEXT("voxel.Shadow.March"), 0,
+		TEXT("voxel.Shadow.March"), 2,
 		TEXT("S1 of docs/shadow-march-design-2026-08-20.md: march one sun ray per shaded ")
 		TEXT("pixel through the resident brick pyramid, from the depth buffer. ")
 		TEXT("0 = off (default; the extension declines every hook and the frame is ")
@@ -115,8 +115,65 @@ namespace
 		TEXT("whole purpose is to be set by someone reading it."),
 		ECVF_RenderThreadSafe);
 
+	// THE CASCADE, mirrored from the camera marcher's cvars so the shadow walk and
+	// the camera walk cannot disagree about where a ring ends. Defaults match
+	// voxel.March.Rings / voxel.March.RingOuterM.
+	TAutoConsoleVariable<int32> CVarVoxelShadowRings(
+		TEXT("voxel.Shadow.MarchRings"), 1,
+		TEXT("Let shadow rays walk the ring cascade instead of level 0 only. 1 = on (default). "
+		     "0 pins the walk to level 0, which caps useful reach at R0 (128 m) because "
+		     "residency is camera-radial annuli -- beyond it a level-0 ray finds no bricks and "
+		     "reads LIT. Off is the bit-exact pre-cascade control."),
+		ECVF_RenderThreadSafe);
+
+	TAutoConsoleVariable<float> CVarVoxelShadowRingOuterM(
+		TEXT("voxel.Shadow.MarchRing0OuterM"), 128.0f,
+		TEXT("R0's outer radius in metres for the shadow walk's level selection. Ring L covers "
+		     "[R0*2^(L-1), R0*2^L). MUST match voxel.March.RingOuterM -- a disagreement makes "
+		     "shadow rays ask for levels at radii the pool does not populate, which is a hole "
+		     "rather than an error."),
+		ECVF_RenderThreadSafe);
+
+	// Derived once, read by the pass. Clamped to what the index actually carries:
+	// asking for a level the grid has no sub-grid for is a silent miss.
+	inline uint32 VoxelShadowGetRingCount()
+	{
+		const int32 Max = int32(FVoxelMarchChunkIndex::kLevels);
+		return uint32(FMath::Clamp(CVarVoxelShadowRings.GetValueOnRenderThread() != 0 ? Max : 1, 1, Max));
+	}
+	inline float VoxelShadowGetRing0OuterUU()
+	{
+		return FMath::Max(CVarVoxelShadowRingOuterM.GetValueOnRenderThread(), 1.0f) * 100.0f;
+	}
+
+	// RAY REACH, SPLIT FROM SURFACE REACH -- and the split is the cost control.
+	//
+	// They were one number, so raising reach to kill the 62% of pixels beyond it
+	// ALSO made every shadow ray four times longer. Measured: reach 64 -> 512 m
+	// took far= from 840,288 to 70,305 (the win) and gpuMs from 0.409 to 10.511
+	// (the price). Only SURFACE reach has to grow -- that is what decides whether
+	// a pixel is shadowed at all. How far its ray then travels toward the sun is
+	// a separate question, and occluders hundreds of metres away contribute
+	// almost nothing at a high sun.
+	TAutoConsoleVariable<float> CVarVoxelShadowRayReachM(
+		TEXT("voxel.Shadow.MarchRayReachM"), 96.0f,
+		TEXT("How far a shadow ray travels toward the sun, metres. SEPARATE from "
+		     "voxel.Shadow.MarchReachM, which decides how far away a pixel may be and still be "
+		     "shadow-tested at all. This is the COST knob: ray length drives steps per ray, and "
+		     "the two were coupled until 2026-08-22, so raising surface reach to 512 m also made "
+		     "every ray 8x longer and took the pass from 0.4 ms to 10.5 ms. 0 = follow surface "
+		     "reach (the old coupled behaviour)."),
+		ECVF_RenderThreadSafe);
+
+	// 0 means "follow surface reach", i.e. the pre-split behaviour.
+	inline float VoxelShadowGetRayReachUU(float SurfaceReachM)
+	{
+		const float RayM = CVarVoxelShadowRayReachM.GetValueOnRenderThread();
+		return (RayM > 0.0f ? RayM : SurfaceReachM) * 100.0f;
+	}
+
 	TAutoConsoleVariable<float> CVarVoxelShadowMarchReachM(
-		TEXT("voxel.Shadow.MarchReachM"), 64.0f,
+		TEXT("voxel.Shadow.MarchReachM"), 512.0f,
 		TEXT("Shadow march reach, metres. Surfaces farther than this from the camera are ")
 		TEXT("skipped (counted 'far', read LIT), and a shadow ray travels at most this far ")
 		TEXT("toward the sun. The march box is camera +/- 2x this, chunk-snapped; the ")
@@ -274,6 +331,14 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelShadowMarchParameters, )
 	SHADER_PARAMETER(FVector3f, ShadowDirToSun)
 	SHADER_PARAMETER(FVector3f, ShadowVerifyDirToSun)
 	SHADER_PARAMETER(float, ShadowVolumeExtentUU)
+	// The cascade. MarchIndexCellsPerLevel is REQUIRED the moment this kernel
+	// calls VoxelMarchBeginLevel: the index cell address is
+	// GVoxelMarchIndexGrid * MarchIndexCellsPerLevel + ..., and leaving it out
+	// is a loud boot-time bind failure rather than a wrong picture. Do not
+	// 'fix' that by hardcoding a literal.
+	SHADER_PARAMETER(uint32, MarchIndexCellsPerLevel)
+	SHADER_PARAMETER(uint32, ShadowRingCount)
+	SHADER_PARAMETER(float, ShadowRing0OuterUU)
 	SHADER_PARAMETER(FVector2f, ShadowViewRectMin)
 	SHADER_PARAMETER(FVector2f, ShadowViewRectSize)
 	SHADER_PARAMETER(FVector2f, ShadowInvProjDiag)
@@ -625,12 +690,23 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 	// and sub-chunk camera jitter cannot move the origin. Sized to hold both
 	// populations this pass touches: surfaces up to ReachM from the camera,
 	// plus a ray of up to ReachM from any of them -- so half-extent 2x reach.
+	// THE BOX IS CENTRED ON THE CAMERA, NOT CORNERED, AND THAT IS A PRECISION
+	// PREREQUISITE FOR RAISING REACH -- not a tidiness change.
+	//
+	// Cornered at 2 x reach, |RayOriginLocalUU| is about 2*reach, and float32's
+	// ulp there reaches the traversal's 0.01 UU advance nudge
+	// (VOXEL_MARCH_HIER_NUDGE_UU) at roughly 419 m of reach. Above that the DDA
+	// stalls or skips silently. The cvar already permits 512 m. So the geometry
+	// had to move before the reach could, independently of anything else.
+	//
+	// This is the camera marcher's own arithmetic (VoxelMarchRenderer.cpp's ring
+	// frame): snap the CAMERA down and size the box symmetrically about it, so
+	// local coordinates stay near zero where float32 has headroom.
 	const int32 ReachVoxels = FMath::CeilToInt(Arm.ReachM * 10.0f);
-	const int32 HalfVoxels = 2 * ReachVoxels;
 	const auto SnapDown = [](int32 V) { return (V >> 5) << 5; };
-	const FIntVector FrameOriginVoxel(SnapDown(Stash->CameraVoxel.X - HalfVoxels),
-	                                  SnapDown(Stash->CameraVoxel.Y - HalfVoxels),
-	                                  SnapDown(Stash->CameraVoxel.Z - HalfVoxels));
+	const FIntVector FrameOriginVoxel(SnapDown(Stash->CameraVoxel.X - ReachVoxels),
+	                                  SnapDown(Stash->CameraVoxel.Y - ReachVoxels),
+	                                  SnapDown(Stash->CameraVoxel.Z - ReachVoxels));
 	// Differenced in DOUBLE against the true camera position -- the precision
 	// seam recorded at the stash.
 	const FVector FrameOriginUU(double(FrameOriginVoxel.X) * 10.0,
@@ -639,7 +715,7 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 	const FVector3f RayOriginLocalUU = FVector3f(Stash->ViewOriginUU - FrameOriginUU);
 	// 2 x half-extent, plus one chunk of slack for the snap -- the marcher's
 	// own sizing arithmetic.
-	const float FrameExtentUU = float(4 * ReachVoxels + 64) * 10.0f;
+	const float FrameExtentUU = float(2 * ReachVoxels + 64) * 10.0f;
 
 	// The verify kernel's sun: identical unless the mutation arm asks for a
 	// rotation, in which case the replay MUST disagree -- see the cvar text.
@@ -735,12 +811,22 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->ShadowDirToSun = DirToSun;
 		Params->ShadowVerifyDirToSun = VerifyDirToSun;
 		Params->ShadowVolumeExtentUU = FrameExtentUU;
+		Params->MarchIndexCellsPerLevel = FVoxelMarchChunkIndex::kCellsPerLevel;
+		// Ring geometry, from the same presets the streaming cascade is built
+		// from. R0's outer radius is the ONE number; ring L is
+		// [R0*2^(L-1), R0*2^L), which is kDefaultRingPresets exactly.
+		// READ FROM THE MARCHER'S OWN CVARS, not from UVoxelWorldSubsystem:
+		// VoxelEarthShaders may not depend on VoxelEarth. These are the same two
+		// values VoxelMarchRenderer binds as MarchRingCount / MarchRing0OuterUU,
+		// so both passes walk one cascade rather than two derivations of it.
+		Params->ShadowRingCount = VoxelShadowGetRingCount();
+		Params->ShadowRing0OuterUU = VoxelShadowGetRing0OuterUU();
 		Params->ShadowViewRectMin = FVector2f(Stash->ViewRect.Min);
 		Params->ShadowViewRectSize = FVector2f(Size);
 		Params->ShadowInvProjDiag = Stash->InvProjDiag;
 		Params->ShadowInvDeviceZToWorldZ = Stash->InvDeviceZToWorldZ;
 		Params->ShadowSurfaceReachUU = Arm.ReachM * 100.0f;
-		Params->ShadowRayReachUU = Arm.ReachM * 100.0f;
+		Params->ShadowRayReachUU = VoxelShadowGetRayReachUU(Arm.ReachM);
 		Params->ShadowNormalOffsetUU = Arm.NormalOffsetVoxels * 10.0f;
 		Params->ShadowPixelConeSlope = Stash->PixelConeSlope;
 		Params->ShadowPullbackPx = Arm.PullbackPx;
@@ -855,7 +941,7 @@ void FVoxelShadowMarchExtension::PostRenderBasePassDeferred_RenderThread(
 				VParams->ShadowInvProjDiag = Stash->InvProjDiag;
 				VParams->ShadowInvDeviceZToWorldZ = Stash->InvDeviceZToWorldZ;
 				VParams->ShadowSurfaceReachUU = Arm.ReachM * 100.0f;
-				VParams->ShadowRayReachUU = Arm.ReachM * 100.0f;
+				VParams->ShadowRayReachUU = VoxelShadowGetRayReachUU(Arm.ReachM);
 				VParams->ShadowNormalOffsetUU = Arm.NormalOffsetVoxels * 10.0f;
 				VParams->ShadowPixelConeSlope = Stash->PixelConeSlope;
 				VParams->ShadowPullbackPx = Arm.PullbackPx;

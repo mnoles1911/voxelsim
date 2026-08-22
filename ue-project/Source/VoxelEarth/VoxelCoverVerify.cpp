@@ -106,10 +106,20 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelCoverVerify, Log, All);
 namespace
 {
 	// The pitch the land detail library is baked at. Restated from
-	// VoxelDetailAssetSubsystem.cpp's kCoverPitchMm; vxc::coverVolumeInit refuses
+	// VoxelDetailAssetSubsystem.cpp's kCoverVerifyPitchMm; vxc::coverVolumeInit refuses
 	// a pitch that does not tile the world lattice, so a disagreement between the
 	// two is a refusal rather than a volume half a voxel low everywhere.
-	constexpr uint32 kCoverPitchMm = 50;
+	// RENAMED FOR THE UNITY BUILD, not for clarity. VoxelDetailAssetSubsystem.cpp
+	// defines kCoverVerifyPitchMm and kCoverVerifyGroupEdgeVoxels in ITS anonymous namespace too;
+	// separate translation units make that legal, and a unity build concatenates
+	// them into one where it is a redefinition. tools/lint-unity-collisions.py
+	// exists for exactly this and names the second pair.
+	//
+	// IT WAS INVISIBLE UNTIL 2026-08-22 BECAUSE ADAPTIVE UNITY WAS HIDING IT:
+	// UBT excludes recently-edited files from the unity blob, and both of these
+	// files had been edited recently enough to be excluded on every build that
+	// touched them. The collision appeared the moment one of them aged back in.
+	constexpr uint32 kCoverVerifyPitchMm = 50;
 
 	// ---- the abstain floors ------------------------------------------------
 	//
@@ -128,7 +138,7 @@ namespace
 	constexpr int32 kSearchRadiusGroups = 12;
 
 	// One 2x2 block of level-0 chunks, as VoxelDetailAssetSubsystem resolves.
-	constexpr int64 kGroupEdgeVoxels = 64;
+	constexpr int64 kCoverVerifyGroupEdgeVoxels = 64;
 
 	struct FCoverChunkUnderTest
 	{
@@ -317,7 +327,7 @@ namespace
 				int64(FMath::FloorToDouble(AnchorUU.X / VoxelCoords::VoxelSizeUU));
 			const int64 AnchorVy =
 				int64(FMath::FloorToDouble(AnchorUU.Y / VoxelCoords::VoxelSizeUU));
-			const int64 CellsPerVoxel = int64(vxc::kVoxelSizeMm) / int64(kCoverPitchMm);
+			const int64 CellsPerVoxel = int64(vxc::kVoxelSizeMm) / int64(kCoverVerifyPitchMm);
 			const int64 E = int64(vxc::kCoverChunkEdgeCells);
 
 			vxc::CoverProducerCounters Counters;
@@ -340,16 +350,16 @@ namespace
 						}
 						++GroupsSearched;
 
-						const int64 BaseVx = AnchorVx + int64(Gx) * kGroupEdgeVoxels;
-						const int64 BaseVy = AnchorVy + int64(Gy) * kGroupEdgeVoxels;
+						const int64 BaseVx = AnchorVx + int64(Gx) * kCoverVerifyGroupEdgeVoxels;
+						const int64 BaseVy = AnchorVy + int64(Gy) * kCoverVerifyGroupEdgeVoxels;
 						const vxc::AssetVoxelRect Rect{ BaseVx, BaseVy,
-						                                BaseVx + kGroupEdgeVoxels - 1,
-						                                BaseVy + kGroupEdgeVoxels - 1 };
+						                                BaseVx + kCoverVerifyGroupEdgeVoxels - 1,
+						                                BaseVy + kCoverVerifyGroupEdgeVoxels - 1 };
 
 						const std::vector<vxc::AssetInstance> Insts =
 							Field->instancesForRect(Rect, ColumnFacts, /*terrainOnly*/ false);
 						const std::vector<vxc::AssetField::ResolvedCoverInstance> Cover =
-							Field->resolveForCoverCompose(Insts, kCoverPitchMm);
+							Field->resolveForCoverCompose(Insts, kCoverVerifyPitchMm);
 						if (Cover.empty())
 						{
 							continue;
@@ -370,7 +380,7 @@ namespace
 						const int64 Cz1 = vxc::floorDiv(ZMax, E);
 						const int64 BaseCx = BaseVx * CellsPerVoxel;
 						const int64 BaseCy = BaseVy * CellsPerVoxel;
-						const int64 ChunksPerAxis = (kGroupEdgeVoxels * CellsPerVoxel) / E;
+						const int64 ChunksPerAxis = (kCoverVerifyGroupEdgeVoxels * CellsPerVoxel) / E;
 
 						for (int64 Cz = Cz0; Cz <= Cz1 && Chunks.Num() < WantChunks; ++Cz)
 						{
@@ -382,7 +392,7 @@ namespace
 									const int64 Ccx = vxc::floorDiv(BaseCx, E) + Jx;
 									const int64 Ccy = vxc::floorDiv(BaseCy, E) + Jy;
 									const vxc::CoverChunkResult Packed = vxc::packCoverChunk(
-										Cover, kCoverPitchMm, Ccx, Ccy, Cz, Counters);
+										Cover, kCoverVerifyPitchMm, Ccx, Ccy, Cz, Counters);
 									if (!Packed.anyCover)
 									{
 										continue;   // store nothing -- requirement C1
@@ -422,7 +432,7 @@ namespace
 			       (unsigned long long)Counters.attempted(),
 			       (unsigned long long)Counters.resolved(),
 			       (unsigned long long)Counters.packed(), Chunks.Num(), TotalSolid,
-			       kCoverPitchMm);
+			       kCoverVerifyPitchMm);
 			return true;
 		}
 

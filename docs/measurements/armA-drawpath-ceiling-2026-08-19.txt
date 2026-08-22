@@ -9956,3 +9956,241 @@ brickPacks/s must RISE -- because the game thread is what was capping it.
 
   DO NOT SHIP THIS AS "25% faster streaming" WITHOUT THAT. Two numbers moved in
   opposite directions and only one of them is the one people feel.
+
+================================================================================
+2026-08-22  A UNITY-BUILD COLLISION THAT ADAPTIVE UNITY HAD BEEN HIDING
+================================================================================
+
+A build failed with:
+  VoxelDetailAssetSubsystem.cpp(252): error C2374: 'kCoverPitchMm': redefinition
+  VoxelDetailAssetSubsystem.cpp(437): error C2371: 'kGroupEdgeVoxels': redefinition
+
+VoxelCoverVerify.cpp and VoxelDetailAssetSubsystem.cpp BOTH define kCoverPitchMm
+and kGroupEdgeVoxels in their anonymous namespaces. Separate translation units
+make that legal; a unity build concatenates them into one where it is a
+redefinition.
+
+IT WAS NOT MY CHANGE, AND THE REASON IT SURFACED IS THE INTERESTING PART. UBT's
+ADAPTIVE UNITY excludes recently-edited files from the unity blob -- every build
+tonight printed "[Adaptive Build] Excluded from VoxelEarth unity file: ...
+VoxelCoverVerify.cpp, VoxelDetailAssetSubsystem.cpp ...". Both colliding files
+had been edited recently enough to be excluded on every build that touched them.
+The collision appeared the moment one aged back in.
+
+SO THE HAZARD IS: A LATENT UNITY COLLISION IS INVISIBLE FOR EXACTLY AS LONG AS
+SOMEONE KEEPS EDITING THE FILES. It surfaces later, on someone else's build, in
+a file they did not touch.
+
+tools/lint-unity-collisions.py exists for this and named one of the two pairs
+(kGroupEdgeVoxels) before the fix; it did not name kCoverPitchMm, so the linter
+has a blind spot worth a look. Fixed by renaming the VERIFY file's copies to
+kCoverVerifyPitchMm / kCoverVerifyGroupEdgeVoxels -- the harness is the less
+central of the two, and the linter's prescribed alternative (per-file NAMED
+namespaces) would have been a larger edit to code unrelated to this work.
+Linter now reports "clean (65 .cpp files in 2 module(s))".
+
+RUNNING THE LINTER SHOULD PRECEDE A BUILD AFTER ANY SESSION THAT EDITS SEVERAL
+FILES IN ONE MODULE, because that is exactly the state in which adaptive unity
+is hiding the most.
+
+================================================================================
+2026-08-22  voxel.March.IndexContentHash -- the A/B switch the last one needed
+================================================================================
+
+The 4 MiB index hash is now forceable from a cvar (default 0), so its cost can be
+measured IN ONE BINARY. The before/after that produced the headline spanned two
+builds, and the first thing that comparison produced was a p50 move
+(8.01 -> 15.27 ms) that nothing could attribute -- the two-legs-two-binaries
+problem this project keeps paying for.
+
+Applied on the GAME THREAD in VoxelMarchEnsureExtension, not from the render
+thread where the comparator enables it: MarkDirtyAndUpload reads the flag from
+the game thread during a flush, and a flag written by one thread and read by the
+other every flush is a race on a value that decides whether ~85% of the
+streaming tick happens.
+
+The A/B pair (p50ab-hashON against hashgate-verify) is what settles whether the
+p50 rise is the hash's absence or something else. Same binary, same flight, same
+pose, one cvar apart.
+
+================================================================================
+2026-08-22  THE p50 RISE WAS AN ARTIFACT. MY EXPLANATION WAS WRONG.
+================================================================================
+
+I wrote that p50 8.01 -> 15.27 ms was probably "the game thread previously
+hashing rather than generating, now carrying 25% more real work per frame".
+BOTH HALVES ARE REFUTED. Per frame the AFTER leg does slightly LESS work
+(103.79 vs 107.59 brickPacks/frame) and its tick is 26.91 ms CHEAPER. The 25%
+throughput gain is entirely FRAME RATE, not per-frame work.
+
+WHAT ACTUALLY HAPPENED: the run is BIMODAL and p50 crossed the seam.
+
+The harness runs 90 s preflight + 150 s flight. The preflight cold-fills for
+~50 s and then GOES COMPLETELY IDLE for 30 s at the spawn pose -- windows
+reading tickMs=13.2 (0.26% of wall), brickPacks=0, at 663-668 frames per 5 s
+(133 fps). That idle stretch is about HALF of all post-warmup frames.
+
+  fast (idle) lobe share   BEFORE 3905/7542 = 51.78%  -> median lands INSIDE it
+                           AFTER  3973/8199 = 48.46%  -> median lands 1.54 pts PAST it
+  and the lobes are 7 ms and 20 ms.
+
+The idle lobe is the same ABSOLUTE size in both legs (3905 vs 3973) -- the
+change does not touch the idle path, and the 7.51 / 7.52 ms idle means are the
+control that proves it. Its SHARE fell only because the flight got faster and
+produced 546 more frames. A 3.3-point shift in lobe fraction stepped the median
+across a 13 ms discontinuity.
+
+  segment            BEFORE frames/mean      AFTER frames/mean
+  cold fill  w3-12     723 / 69.16 ms          733 / 68.21 ms     unchanged
+  IDLE      w13-17    3328 /  7.51 ms         3325 /  7.52 ms     unchanged (control)
+  FLIGHT    w19-49    2860 / 54.20 ms         3406 / 45.51 ms     -16.0%
+
+EVERY SEGMENT IS UNCHANGED OR BETTER. p50 measured which lobe the 50th
+percentile landed in and nothing else.
+
+THE DEFENSIBLE HEADLINE, replacing everything I wrote last night:
+  flight-segment mean frame time  54.20 -> 45.51 ms   (-16%)
+  throughput                      1,985 -> 2,281 brickPacks/s  (+15%)
+  with idle (7.51/7.52) and cold fill (69.2/68.2) as unchanged controls.
+
+AND TWO CORRECTIONS TO MY OWN NUMBERS:
+  * "~85% of the streaming tick" is OVERSTATED. Measured against the flight
+    segment the hash was 27.57 of 45.34 ms per frame -- about 61% of tickMs.
+    The 85% came from comparing a 5 s window total against a tick total that
+    included windows of different character.
+  * The sub-stage timers do NOT cleanly partition the saving: uploadMs is
+    35.59 ms/frame, larger than any single sub-stage, and the drop splits across
+    `dispatch` (-14.0) and `brickFlush` (-13.4) because there are TWO
+    Pool.Flush() sites with separate timers. Do not read those sub-stages as a
+    partition of the whole.
+
+THE RENDER THREAD IS NOT THE CONSTRAINT: renderMs 24.80 -> 16.00,
+renderWaitMs 9.23 -> 1.32 on flight hitch frames. Only gameWaitMs rose
+(4.42 -> 8.25).
+
+DO NOT COMPARE THE HITCH-FRAME MEANS (54.53 -> 64.24, which looks like a
+regression). The populations are not the same: BEFORE, 98.6% of flight frames
+exceeded the 33.3 ms threshold; AFTER, 56.3%. BEFORE's "hitches" are nearly all
+frames; AFTER's are a selected worst-half. Sixth instance of the unlike-things
+failure, and it was waiting in the very table I would have quoted next.
+
+WHAT THE FLIGHT DISTRIBUTION BECAME: the change CREATED a fast population
+(43.7% of flight frames at ~21.4 ms) and left the remaining 56.3% heavier
+(~64.2 ms). That is the honest reading of p95 rising 63.78 -> 72.83, and it
+lines up with the next item.
+
+NEW, AND THE LARGEST OPEN ITEM NOW: game-thread time OUTSIDE the voxel tick rose
+8.85 -> 27.08 ms/frame over the flight (+206%), concentrated on 1,880 hitch
+frames at 46.87 ms each. The engine's own counters cannot account for it --
+renderMs ~8 + rhiMs ~4 + gameWait ~0 do not close a 45 ms frame. Note
+`elsewhereMs` is a RESIDUAL (FMath::Max(0, FrameMs - TickMsSoFar),
+VoxelWorldSubsystem.cpp:6086), i.e. "unaccounted", not "measured", and
+GRenderThreadTime/GGameThreadWaitTime describe the PREVIOUS frame by the code's
+own comment. This needs an instrument, not another leg.
+
+HARNESS CHANGE WORTH MAKING: retire whole-run p50 for this harness or report it
+per segment. With a 30 s idle stretch that is ~50% of post-warmup frames, every
+percentile below p60 measures the idle scene rather than the workload.
+
+================================================================================
+2026-08-22  THE SAME-BINARY A/B. This is the number to quote.
+================================================================================
+
+voxel.March.IndexContentHash 1 vs 0, ONE BINARY, same flight, same pose, same
+config, one cvar apart. Segment-analysed, because whole-run percentiles on this
+harness measure the idle lobe (see the p50 artifact entry above).
+
+                       hash ON        hash OFF
+  idle frames          3,331          3,325       <- control, unchanged
+  FLIGHT frames        3,089          3,406
+  FLIGHT mean frame    50.18 ms       45.51 ms    -9.3%
+  tick % of wall       93.5%          40.5%
+  uploadMs             3,742-4,224    155-880
+
+  WHOLE-RUN percentiles, recorded ONLY to show they are unusable here:
+    hash ON   p50=7.87  p95=59.65  max=306.72
+    hash OFF  p50=15.27 p95=72.83  max=301.62
+  Read naively that says the hash makes everything faster. It does not; the
+  medians sit on opposite sides of the bimodal seam. This pair is the cleanest
+  possible demonstration that p50/p95 must not be quoted for this harness.
+
+THE HONEST HEADLINE IS -9.3% ON FLIGHT FRAME TIME, NOT -16%.
+
+The -16% came from comparing across TWO BUILDS (applydelta-full vs
+hashgate-verify), which differed by more than the hash -- the earlier build also
+carried a different set of instrumentation brackets. The same-binary A/B is
+worth more than the cross-build one and it is smaller. Both are real; only one
+is attributable.
+
+TICK SHARE IS THE MORE STRIKING HALF: 93.5% -> 40.5% of wall clock. The game
+thread was almost entirely consumed by the streaming tick during flight and now
+is not. That the frame time only fell 9.3% is the interesting residue -- it says
+the freed game-thread time is NOT what was capping the frame, which lines up
+exactly with the +18 ms/frame of unattributed non-tick game-thread time the p50
+investigation surfaced. The two findings agree: something outside the voxel tick
+is holding the flight frame, and it is now the largest item in the project.
+
+================================================================================
+2026-08-22  THE FLIP HAS A SECOND SILENT VISUAL REGRESSION: VOXEL GI
+================================================================================
+
+VERIFIED BY GREP, not inferred:
+  * VoxelQuadVertexFactory.ush is the ONLY shader in the tree that reads
+    `VoxelGIVol.` -- one file, confirmed by `grep -l "VoxelGIVol\." Shaders/*`.
+  * VoxelQuadVertexFactory.cpp:225 is the only site that binds the GI uniform
+    buffer for RENDERING. (VoxelGIMarchPass.cpp:188 registers the volumes for
+    COMPUTE -- that is the producer, not a consumer.)
+  * VoxelMarch.usf:1069 writes EncodeIndirectIrradiance(1.0f) -- the NEUTRAL
+    value. The marcher does not sample GI at all.
+  * voxel.GI.Enabled DEFAULTS TO 1 (VoxelGI.cpp:66-67).
+  * The GI block in the vertex factory is NOT gated on WaterMode.
+
+SO THE MOMENT TERRAIN LEAVES THE QUAD PATH, TERRAIN LOSES VOXEL GI ENTIRELY AND
+SILENTLY. This is the same shape as the shadow finding earlier tonight and it
+was hiding in the same place: a feature the quad path provides, that the
+marcher's frame-time advantage is partly funded by not providing, with no error
+and no counter.
+
+TWO SILENT VISUAL REGRESSIONS NOW GATE THE FLIP, NOT ONE:
+  1. sun shadows      -- measured: 42.0M primitives / 15.8 ms on the quad path,
+                         ZERO in the marcher arm. S2 marched shadows now exist
+                         (0.335-0.409 ms) but reach only 64 m.
+  2. voxel GI         -- terrain gets none under the marcher. Nothing measured
+                         yet; needs a lit-cave A/B.
+
+THE GI ORIGIN IS ALSO ALREADY WRONG FOR WATER, WHICH REFRAMES "REPLACE THE
+ANCHOR". FVoxelGIVolume is a TGlobalResource -- ONE instance -- and its
+OriginPoolUU is computed from the TERRAIN pool's component location
+(VoxelGI.cpp:1264, 1381). That single uniform is bound identically to EVERY
+FVoxelQuadVertexFactory draw, including all of water's buckets, each of which
+carries its own unrelated WaterPoolBucketRebase. There is no per-primitive
+origin term in either uniform struct. So water's GI lookup is offset by
+(WaterBucketRebase - GpuPoolRebase) -- kilometres -- and bInsideVolume is false
+essentially always, i.e. WATER SILENTLY RECEIVES NO GI TODAY.
+
+The header states the assumption that makes this a bug rather than an oversight:
+"Pool space is the only correct space for this... THE POOL COMPONENT carries the
+big offset" (VoxelGIVolume.h:69-74, singular). True when written -- before W5
+split water into buckets.
+
+CONSEQUENCE FOR THE PLAN: item "replace the GI volume anchor" is NOT "find a
+terrain origin so the empty stand-in pool can be deleted". It is "make the GI
+origin per-consumer, because terrain's pool was never the right space for the
+consumer that survives". The empty stand-in is propping up a coordinate system
+for WATER, and propping it up incorrectly.
+
+NOT CONFIRMED IN A PICTURE. This is arithmetic over the code plus the absence of
+any compensating term. Falsifiable cheaply: log OriginPoolUU beside each pool's
+GetComponentLocation() for one frame, or capture a lake with voxel.GI.Enabled
+0 vs 1 -- by this reading the pair should be IDENTICAL, which is the falsifier
+and the acceptance test in one shot.
+
+ALSO CORRECTED: VoxelGI.cpp:440-450 says "up to FIVE UVoxelGpuPoolComponents in
+a live world" and my plan addendum repeats it. Water alone can hold TWELVE
+(kMaxWaterPoolBuckets = 12, VoxelWaterSubsystem.cpp:1954). True live maximum is
+16 counting the two debug verifiers and the never-registered test.
+
+AND ONE CLAIM OF THE AUDIT'S THAT I CAN RETIRE FROM MEASUREMENT: it lists
+"whether terrain currently casts shadows at all" as unresolved, citing
+shadowGathers=0. That is the stale comment retired earlier tonight -- terrain
+casts, at 42M primitives and 15.8 ms, once -VoxelShadowDistanceM is passed.

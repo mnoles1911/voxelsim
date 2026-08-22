@@ -44,7 +44,7 @@ static FAutoConsoleVariableRef CVarVoxelGpuMeshChunkLocal(
 // Latched per job at Submit, like voxel.GPU.MeshChunkLocal, so a flip mid-flight
 // cannot leave a job that dispatched a brick region waiting on a readback
 // nobody enqueued.
-static int32 GVoxelGpuBrickPack = 0;
+static int32 GVoxelGpuBrickPack = 1;   // PROTOTYPE DEFAULT: the marcher needs bricks
 static FAutoConsoleVariableRef CVarVoxelGpuBrickPack(
 	TEXT("voxel.GPU.BrickPack"),
 	GVoxelGpuBrickPack,

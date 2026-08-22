@@ -12,7 +12,9 @@
 #include <atomic>
 
 #include "VoxelBrickPool.h"       // the P3-B1 traversal source
+#include "VoxelMarchChunkIndex.h"
 #include "VoxelMarchChunkIndex.h" // and the GPU lookup that makes it walkable
+#include "VoxelGIVolume.h"       // the marcher now samples voxel GI
 #include "SystemTextures.h"       // GetDefaultBuffer, for the emit pass's index fallback
 #include "VoxelFluidOccupancy.h" // the P3 traversal source; see the header, section 5
 
@@ -57,7 +59,7 @@ namespace
 	// ---- the phase gate ---------------------------------------------------
 
 	TAutoConsoleVariable<int32> CVarVoxelMarch(
-		TEXT("voxel.March"), 0,
+		TEXT("voxel.March"), 1,
 		TEXT("P3 of docs/ray-marching-plan-2026-08-19.md: draw terrain by ray-marching the voxel ")
 		TEXT("volume into SceneDepth + the GBuffer, so the engine's lighting, shadows, SSAO, TSR ")
 		TEXT("and Lumen screen traces all work on it.\n")
@@ -82,7 +84,7 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchSource(
-		TEXT("voxel.March.Source"), 0,
+		TEXT("voxel.March.Source"), 1,
 		TEXT("WHICH VOLUME THE MARCHER WALKS. 0 = FVoxelFluidOccupancy, the Phase 0 stand-in: ")
 		TEXT("512^3, 51.2 m, ONE level, one bit per voxel and NO PER-VOXEL MATERIAL. 1 = ")
 		TEXT("FVoxelBrickPool, the real volume -- six ring levels, per-brick descriptors, ")
@@ -103,7 +105,7 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchSkipLevels(
-		TEXT("voxel.March.SkipLevels"), 0,
+		TEXT("voxel.March.SkipLevels"), 2,
 		TEXT("EMPTY-SPACE SKIPPING, and the whole performance case. 0 = flat: every voxel ")
 		TEXT("stepped and tested -- THE CONTROL, and the same walk that produced the measured ")
 		TEXT("+18.3%% indirection cost. 1 = skip an empty 8^3 brick on one bit test against a ")
@@ -120,7 +122,7 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchRings(
-		TEXT("voxel.March.Rings"), 0,
+		TEXT("voxel.March.Rings"), 1,
 		TEXT("The ring cascade (P3-B2b-1). 0 = one level over one interval, which is every leg ")
 		TEXT("measured before 2026-08-20 and is THE CONTROL. 1 = two rings, L0 covering 0-128 m ")
 		TEXT("and L1 covering 128-256 m, no overlap.\n")
@@ -144,6 +146,17 @@ namespace
 		TEXT("levels the chunk index actually carries -- asking for more would walk a level with ")
 		TEXT("no grid behind it, which reads as empty space rather than as an error.\n")
 		TEXT("Only meaningful with voxel.March.Rings 1."),
+		ECVF_RenderThreadSafe);
+
+	// THE CLIMATE TINT'S STRENGTH, on a cvar because it is the term most likely
+	// to want tuning by eye. 0 makes the marcher byte-identical to before it.
+	TAutoConsoleVariable<float> CVarVoxelMarchClimateStrength(
+		TEXT("voxel.March.ClimateStrength"), 1.0f,
+		TEXT("Strength of the marcher's per-chunk climate tint (temperature/precipitation from "
+		     "the chunk record's dword 7). 0 = off and byte-identical to no tint. 1 = full. "
+		     "The quad path feeds these two bytes to M_VoxelTerrain's biome graph instead; the "
+		     "marcher shades per-voxel (ADR-0008), so this is a deliberate re-design and a dial, "
+		     "not a transcription."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<float> CVarVoxelMarchRingOuterM(
@@ -173,7 +186,7 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchStepBudget(
-		TEXT("voxel.March.StepBudget"), 886,
+		TEXT("voxel.March.StepBudget"), 3328,
 		TEXT("DDA step cap per ray, clamped to [1, 4096]. 886 = 512*sqrt(3), the full diagonal of ")
 		TEXT("the occupancy volume, which is the arm the Phase 0 gate was measured at. A budget ")
 		TEXT("too small for the pose does not error -- rays terminate early and the terrain simply ")
@@ -270,6 +283,28 @@ namespace
 		TEXT("The corruption is applied in the SHADER, so the arm exercises slot layout, readback ")
 		TEXT("and decode alignment rather than only the C++ arithmetic. NEVER leave it on: it ")
 		TEXT("makes the lost counters wrong by one on purpose."),
+		ECVF_RenderThreadSafe);
+
+	// THE 4 MiB INDEX HASH, AS AN A/B SWITCH RATHER THAN A REBUILD.
+	//
+	// FVoxelMarchChunkIndex::MarkDirtyAndUpload used to run an FNV-1a over the
+	// whole chunk-index grid on the GAME THREAD, once per pool flush,
+	// unconditionally -- measured at 3,146-3,190 ms per 5 s window against a
+	// streaming tick totalling ~3,700 ms. It is now off unless something asks
+	// for it, and the only thing that asks is the source comparator below.
+	//
+	// This cvar exists so the cost can be A/B'd IN ONE BINARY. Gating it purely
+	// in code meant the before/after comparison spanned two builds, and the
+	// first thing that comparison produced was a frame-time move nobody could
+	// attribute -- exactly the two-legs-two-binaries problem this project keeps
+	// paying for. 1 forces the hash on with the comparator off.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexContentHash(
+		TEXT("voxel.March.IndexContentHash"), 0,
+		TEXT("Force the chunk index's 4 MiB FNV content hash on (1) with the source comparator "
+		     "off. Default 0. The hash is otherwise enabled only by voxel.March.VerifySource, "
+		     "which is the only consumer of the value. MEASUREMENT SWITCH: it costs ~85% of the "
+		     "streaming tick, so this is how you A/B that cost in a single binary rather than "
+		     "across two builds."),
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchVerifySource(
@@ -417,6 +452,20 @@ void VoxelMarchEnsureExtension(UWorld* World)
 	if (World == nullptr)
 	{
 		return;
+	}
+
+	// APPLIED HERE, ON THE GAME THREAD, EVERY TICK -- and that placement is the
+	// point. MarkDirtyAndUpload reads this flag from the game thread during a
+	// pool flush; the comparator's own enable at the source-compare site runs on
+	// the RENDER thread. Setting a flag from one thread that the other reads
+	// every flush is a race on a value that decides whether ~85% of the
+	// streaming tick happens, so the cvar half is applied from the side that
+	// consumes it. The comparator's render-thread enable is left in place: it
+	// only ever turns the flag ON, and it turns it on for the one consumer that
+	// genuinely needs the value.
+	if (CVarVoxelMarchIndexContentHash.GetValueOnGameThread() != 0)
+	{
+		GetGlobalVoxelMarchChunkIndex().SetContentHashEnabled(true);
 	}
 	if (!GMarchExtension.IsValid())
 	{
@@ -2353,6 +2402,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchViewParameters, )
 	SHADER_PARAMETER(FVector2f, MarchInvProjDiag)
 	SHADER_PARAMETER(FVector4f, MarchInvDeviceZToWorldZ)
 	SHADER_PARAMETER(float, MarchPixelConeSlope)
+	SHADER_PARAMETER(float, MarchClimateStrength)
 	// NOTE: the volume's origin in TRANSLATED world is deliberately NOT here.
 	// The emit derives it as TranslatedWorldCameraOrigin - MarchRayOriginLocalUU,
 	// which is exact; passing it as a uniform would mean assuming
@@ -2399,6 +2449,7 @@ BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchCompactParameters, )
 END_SHADER_PARAMETER_STRUCT()
 
 BEGIN_SHADER_PARAMETER_STRUCT(FVoxelMarchEmitParameters, )
+	SHADER_PARAMETER_STRUCT_REF(FVoxelGIVolumeParameters, VoxelGIVol)
 	SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 	VOXEL_FLUID_OCCUPANCY_PARAMETERS()
 	VOXEL_BRICK_POOL_PARAMETERS()
@@ -4082,6 +4133,7 @@ void FVoxelMarchRenderExtension::PreRenderBasePass_RenderThread(FRDGBuilder& Gra
 		MarchView.MarchInvProjDiag = Entry.InvProjDiag;
 		MarchView.MarchInvDeviceZToWorldZ = Entry.InvDeviceZToWorldZ;
 		MarchView.MarchPixelConeSlope = Entry.PixelConeSlope;
+		MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 		MarchView.MarchTileCount = TileCount;
 
 		FRDGBufferRef TileHit = GraphBuilder.CreateBuffer(
@@ -4975,6 +5027,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 		Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;
 		Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 		Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
+		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 		Params->MarchView.MarchTileCount = Entry->TileCount;
 		Params->MarchStepBudget = Arm.StepBudget;
 		Params->MarchBrickOriginVoxel = Entry->FrameOriginVoxel;
@@ -4989,6 +5042,12 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 			// the same bindings) and is not treated as one.
 			int32 IgnoredEntries = 0;
 			VoxelMarchBindPool(GraphBuilder, Arm.Source, *Params, IgnoredEntries);
+
+			// VOXEL GI. The quad path binds this per draw in the vertex factory;
+			// the marcher binds it once for the emit. Null when GI has never
+			// published -- the shader's Enabled check then reads 0 and the sample
+			// is skipped, which is byte-identical to the behaviour before this.
+			Params->VoxelGIVol = GVoxelGIVolume.GetUniformBufferRef();
 
 			// THE INDEX MAY LEGITIMATELY BE UNAVAILABLE HERE, AND ONLY HERE.
 			//
@@ -5205,6 +5264,7 @@ void FVoxelMarchRenderExtension::PostRenderBasePassDeferred_RenderThread(
 				Params->MarchView.MarchInvProjDiag = Entry->InvProjDiag;
 				Params->MarchView.MarchInvDeviceZToWorldZ = Entry->InvDeviceZToWorldZ;
 				Params->MarchView.MarchPixelConeSlope = Entry->PixelConeSlope;
+		Params->MarchView.MarchClimateStrength = CVarVoxelMarchClimateStrength.GetValueOnRenderThread();
 				Params->MarchView.MarchTileCount = Entry->TileCount;
 				Params->MarchVis = Entry->VisBuffer;
 				Params->MarchHitT = Entry->HitDistance;
