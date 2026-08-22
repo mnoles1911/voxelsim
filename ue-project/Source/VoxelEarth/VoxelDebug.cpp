@@ -777,6 +777,43 @@ TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeMaxInFlight(
 	TEXT("work even though demand is submitted first."),
 	ECVF_Default);
 
+// WHY SPECULATION ADOPTED NOTHING UNDER THE MARCHER CONFIG, and what this
+// switch does about it.
+//
+// Under voxel.Terrain.RetireQuads (the marcher shipping config,
+// -VoxelRetireQuads=1) every GPU mesh job is brick-only: the manager sets
+// bQuadMesh=false and bDirectToPool=false at Submit, so every delivery carries
+// NumQuads == 0 and no GPU quad payload BY CONFIGURATION. ParkSpeculativeResult
+// then asks its "did this job mesh anything" question of the QUAD product
+// (!GpuQuads.IsValid() || NumQuads == 0) and classifies every result as
+// dropEmpty. Measured on final-shipped-state.log (2026-08-22): cumulative
+// dispatched=9,804 adopted=0, dropEmpty at 100%, with a MID-HEAVY band
+// distribution (top=17 mid=190 bot=157 in one window) -- and the trim sweep of
+// 2026-07-28 measured that GENUINE empties never sit mid-band (top/bot only,
+// mid=0). Mid-band "empties" are surface chunks with real geometry whose quads
+// were retired out from under the classifier.
+//
+// The waste is double: the bricks those jobs packed were ALREADY published
+// resident into the global brick pool by the manager's Deliver (bBrickResident
+// default 1) -- the march index sinks every pool write, so the terrain even
+// RENDERS -- but nothing records it, so when admission later wants the chunk it
+// dispatches a second full GPU job for ground the pool already holds.
+//
+// 1 = under quad retirement, park a brick-backed marker (no quad-pool slot)
+// for each speculative delivery whose bricks the brick pool confirms resident,
+// so admission ADOPTS the chunk (a table write) instead of re-meshing it.
+// 0 (default) = today's behaviour: the result is dropped; only the census
+// wording changes (dropBrickOnly, counted apart from dropEmpty, because the
+// old label was false).
+TAutoConsoleVariable<int32> CVarVoxelStreamSpeculativeParkBricks(
+	TEXT("voxel.Stream.SpeculativeParkBricks"),
+	0,
+	TEXT("1 = under voxel.Terrain.RetireQuads, park speculative GPU results as brick-backed entries so ")
+	TEXT("admission adopts them instead of re-dispatching a job for terrain the brick pool already holds. ")
+	TEXT("0 (default) = drop them exactly as before (counted as dropBrickOnly, not dropEmpty). ")
+	TEXT("No effect when quads are not retired."),
+	ECVF_Default);
+
 TAutoConsoleVariable<int32> CVarVoxelStreamPoolParkMax(
 	TEXT("voxel.Stream.PoolParkMax"),
 	12000,
@@ -1236,6 +1273,11 @@ int32 VoxelDebug::GetStreamSpeculativeMaxParked()
 int32 VoxelDebug::GetStreamSpeculativeMaxInFlight()
 {
 	return FMath::Max(0, CVarVoxelStreamSpeculativeMaxInFlight.GetValueOnGameThread());
+}
+
+int32 VoxelDebug::GetStreamSpeculativeParkBricks()
+{
+	return CVarVoxelStreamSpeculativeParkBricks.GetValueOnGameThread();
 }
 
 int32 VoxelDebug::GetStreamPoolParkMax()

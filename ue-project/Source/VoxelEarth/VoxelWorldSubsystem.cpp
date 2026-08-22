@@ -2952,6 +2952,26 @@ bool ColdBandThrottleEnabled()
 	return bEnabled;
 }
 
+// -VoxelColdBandDeferPark=1: park cold-band deferred column-mates in a side map
+// keyed by footprint instead of re-queueing them every tick. Default 0 --
+// byte-identical to the shipped pop-test-requeue behaviour. Command line
+// rather than a cvar for the family's usual reason (must be fixed before
+// streaming starts; a mid-leg flip would make the A/B unreadable), and latching
+// it also removes the only way parked entries could strand: the drain sweep in
+// DispatchJobs runs whenever the map is non-empty, independent of this switch.
+// Measured motivation: defers=13,217 per 5 s against dispatched=10,192 on
+// final-shipped-state.log -- see ColdBandParkedByFootprint's declaration.
+int32 ColdBandDeferParkEnabled()
+{
+	static const int32 Value = []
+	{
+		int32 V = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelColdBandDeferPark="), V);
+		return V;
+	}();
+	return Value;
+}
+
 bool BuriedSkipEnabled()
 {
 	static const bool bEnabled = []
@@ -4087,6 +4107,9 @@ struct FVoxelWorldImpl
 		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 		{
 			LevelWorkerJobMsWindow[Level].Init(0.f, WorkerJobMsWindowSize);
+			// The GPU arm's per-level latency window (see its declaration for
+			// the census-blending defect this split repairs).
+			LevelGpuLatencyMsWindow[Level].Init(0.f, WorkerJobMsWindowSize);
 		}
 		// The GPU fork's half of the split HUD row (see the member's doc
 		// comment): same ring-buffer treatment, always on like
@@ -4438,6 +4461,15 @@ struct FVoxelWorldImpl
 		// caches geometry that MIGHT be. Conflating their hit rates would hide
 		// exactly the number that decides whether speculation is worth running.
 		bool bSpeculative = false;
+		// voxel.Stream.SpeculativeParkBricks: this entry's geometry is BRICKS in
+		// the global brick pool (already resident -- the GPU manager's Deliver
+		// published it), NOT a quad-pool range. PoolHandle is INDEX_NONE and
+		// must never be handed to UVoxelGpuPoolComponent::Unpark/RemoveChunk.
+		// Adoption creates a settled no-geometry record -- byte-identical to
+		// what ApplyMeshResult's NumQuads==0 branch leaves for every demand
+		// chunk under voxel.Terrain.RetireQuads -- and eviction relies on
+		// EvictParkedKey's existing ReleaseChunkBricks call to free the bricks.
+		bool bBrickBacked = false;
 	};
 	TMap<VoxelCoords::FVoxelLevelChunkKey, FParkedGeometry> ParkedGeometry;
 
@@ -4494,6 +4526,24 @@ struct FVoxelWorldImpl
 	// Why a speculative dispatch did not become a park. These three plus
 	// SpecParkedSinceLog account for every delivered speculative result.
 	int64 SpecDroppedEmptySinceLog = 0;
+	// The brick-only population, counted APART from dropEmpty because the old
+	// label was a lie the plan believed: under voxel.Terrain.RetireQuads every
+	// GPU job delivers zero quads BY CONFIGURATION, and 9,804 speculative
+	// results -- most of them mid-band, where genuine empties never sit (the
+	// 2026-07-28 trim sweep measured mid=0 for real empties) -- were reported
+	// as "dropped empty" when they were surface chunks whose bricks were
+	// already resident. dropBrickOnly = quads retired, result not parked
+	// (switch off). dropBrickNotResident = switch on, but the brick pool does
+	// not confirm the chunk (BrickPackResident off, pool alloc failure, or
+	// evicted between Deliver and here) -- parking it anyway would let
+	// adoption settle a record over terrain that is not there, a permanent
+	// hole, which is why this is checked rather than assumed.
+	int64 SpecDroppedBrickOnlySinceLog = 0;
+	int64 SpecDroppedBrickNotResidentSinceLog = 0;
+	int64 SpecParkedBrickSinceLog = 0;
+	// Adoption-side refusal: a brick-backed park whose bricks left the pool
+	// (its own capacity eviction) before admission wanted the chunk.
+	int64 SpecBrickParkLostSinceLog = 0;
 	// Where in the surface band an empty speculative chunk sat. See task #19.
 	int64 SpecEmptyTopSinceLog = 0;
 	int64 SpecEmptyMidSinceLog = 0;
@@ -4993,6 +5043,33 @@ struct FVoxelWorldImpl
 	//
 	// It exists only to SPLIT the age-out counter below. See there.
 	TSet<FIntPoint> FootprintBlindJobIsGpu;
+
+	// -VoxelColdBandDeferPark=1: column-mates held OFF the pending queues while
+	// their footprint's seeding job is in flight, keyed by footprint so the
+	// whole column is released in one map hit when the seed's result lands.
+	//
+	// WHY. The default defer path is pop-test-requeue: every deferred candidate
+	// is popped from its ring queue (paying the ring-quota scan over every
+	// queue head), map-tested, appended to DeferredColdBand and re-queued after
+	// the loop -- to be popped again NEXT tick, because the queue is
+	// nearest-first and deferred near-field chunks sit at its head. Measured on
+	// final-shipped-state.log: defers=13,217 per 5 s against dispatched=10,192
+	// -- ~145 wasted pop-test-requeue cycles per tick, every tick, on the game
+	// thread, inside the dispatch bucket that already spans 42-86% of wall.
+	// Parking makes each candidate pay the pop ONCE per mark lifetime; the
+	// per-tick cost becomes a sweep over parked FOOTPRINTS (tens) instead of
+	// pop cycles over parked CHUNKS (hundreds).
+	//
+	// Entries in here are invisible to the queue scrubs (eviction's
+	// RemoveAllSwap, the per-key RemoveAll), so a parked key can outlive its
+	// record or be re-admitted while parked. Both are absorbed at flush time
+	// exactly where the queues already absorb them: the dispatch loop's
+	// `!Rec` / staleness checks. Flushing appends with the entry's stored
+	// DistSq, which is what the default path's re-queue Append does too;
+	// SortPendingQueues refreshes and re-sorts on the next recompute.
+	TMap<FIntPoint, TArray<FSortEntry>> ColdBandParkedByFootprint;
+	int32 ColdBandParkedEntryCount = 0;   // sum of array sizes, for the census
+	int64 ColdBandParkFlushedSinceLog = 0;
 	// Generous next to a worker job (measured p50 well under 100 ms) so a healthy
 	// column is never released early, but short enough that a stranded one
 	// recovers in seconds rather than never.
@@ -5223,6 +5300,19 @@ struct FVoxelWorldImpl
 	TArray<float> GpuJobLatencyMsWindow;
 	int32 GpuJobLatencyMsWindowNext = 0;
 	int32 GpuJobLatencyMsWindowCount = 0;
+
+	// The GPU fork's per-level SUBMIT-TO-DELIVER latency, kept OUT of the
+	// windows above. Until this split, DrainResults pushed Result.JobMs from
+	// both producers into LevelWorkerJobMsWindow, and on the GPU arm that field
+	// is end-to-end latency -- which is how the "Voxel worker ms/level" line
+	// came to print R2 p50=3918.27: not a worker taking four seconds, a GPU
+	// round trip labelled as one. The two populations now live in separate
+	// windows and separate log lines ("worker ms" = CPU task-body wall time
+	// only; "gpuLatency ms" = fork submit->deliver only), so a reader can no
+	// longer mistake queue depth for worker cost.
+	TArray<float> LevelGpuLatencyMsWindow[VoxelCoords::kNumLevels];
+	int32 LevelGpuLatencyMsWindowNext[VoxelCoords::kNumLevels] = {};
+	int32 LevelGpuLatencyMsWindowCount[VoxelCoords::kNumLevels] = {};
 
 	// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): per-producer,
 	// per-stage submit->apply latency, same fixed-size-ring-buffer idiom as
@@ -5562,6 +5652,21 @@ struct FVoxelWorldImpl
 	// AccumLevel0Jobs * 64.
 	int64 AccumLevel0BricksSkippedAir = 0;
 	int64 AccumLevel0BricksSkippedSolid = 0;
+	// THE GPU ARM OF THE LEVEL-0 CENSUS, counted apart because JobMs means a
+	// different quantity on each arm: task-body wall time on the CPU worker,
+	// but SUBMIT-TO-DELIVER LATENCY (queue wait included) on the GPU fork.
+	// Before this split the census summed both into AccumLevel0JobMs and the
+	// blend was not subtle: one measured 5 s window (final-shipped-state.log,
+	// 07:08:37) reported jobMs=1,226,578 ms of "worker time" -- 30x more than
+	// the 8 background workers can physically supply in 5 s -- because 728 GPU
+	// deliveries at a 1,780.3 ms mean round trip (= ~1.30M ms) were being
+	// counted as worker milliseconds. jobGHz then read 0.04 BY CONSTRUCTION
+	// (cycles from the CPU arm only, divided by latency from mostly the GPU
+	// arm), and a whole phase of the streaming plan was built on that artifact
+	// before gridGHz=3.26 on the same log line -- clean, because both of its
+	// inputs are zero on GPU results and the dilution cancels -- exposed it.
+	double AccumLevel0GpuLatencyMs = 0.0;
+	int64 AccumLevel0GpuJobs = 0;
 
 	// -VoxelL0GridCacheProbe: simulated cross-job level-0 column-grid cache.
 	// Game thread only, one packed-key probe per level-0 dispatch, no grids
@@ -7306,6 +7411,38 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       JobsInFlightCounter.GetValue(), PendingJobNum(), PendingGameThreadKeys.Num(), PendingUnloadKeys.Num(),
 	       bAnchorUnderground ? 1 : 0, DeepTracked, DeepWithGeometry, (long long)ResidentQuads);
 
+	// THE THREE POPULATIONS jobsInFlight= COMPRESSES, published separately so
+	// no future reader has to reverse-engineer them. jobsInFlight above blends
+	// (CPU worker jobs + GPU DEMAND jobs) -- both increment JobsInFlightCounter
+	// at dispatch, before the fork decides who meshes -- while speculative GPU
+	// jobs sit in GpuJobsPending WITHOUT ever touching the counter. The
+	// dispatch loop's own budget test then computes
+	// max(0, jobsInFlight - GpuJobsPending.Num()), whose clamp swallowed a
+	// persistent negative: a measured steady state of jobsInFlight=240 against
+	// pending=252 with 12 speculative jobs outstanding printed as an
+	// honest-looking 0, and "the CPU arm is idle while the GPU arm is 12 over
+	// its own book" became unreadable from any published number. cpuInFlight
+	// below is the RAW difference, deliberately unclamped: a negative value is
+	// the speculative population showing through, and the identities
+	//   cpuInFlight + gpuDemandPending == jobsInFlight   (when cpuInFlight >= 0)
+	//   gpuDemandPending + specPending == gpuPendingTotal
+	// must reconcile on every window -- a window where they do not is the tell
+	// that a fourth population has appeared and this comment is out of date.
+	{
+		int32 SpecPendingNow = 0;
+		for (const auto& Pair : GpuJobsPending)
+		{
+			SpecPendingNow += Pair.Value.bSpeculative ? 1 : 0;
+		}
+		const int32 GpuPendingTotal = GpuJobsPending.Num();
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel in-flight split: cpuInFlight=%d gpuDemandPending=%d specPending=%d ")
+		       TEXT("(jobsInFlight=%d gpuPendingTotal=%d)"),
+		       JobsInFlightCounter.GetValue() - GpuPendingTotal,
+		       GpuPendingTotal - SpecPendingNow, SpecPendingNow,
+		       JobsInFlightCounter.GetValue(), GpuPendingTotal);
+	}
+
 	// The anchor drives every ring footprint, so when one ring's population
 	// differs between two runs this is the first thing to compare.
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel anchor: (%.0f, %.0f, %.0f)"),
@@ -7485,6 +7622,32 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       Snap.GpuLatencyMsP50, Snap.GpuLatencyMsP95, Snap.GpuLatencyMsMax,
 	       (long long)Snap.MipCacheBrickCount, (long long)Snap.MipCacheBytes, (long long)Snap.MipCacheEvictions);
 
+	// The GPU fork's per-level latency, under its TRUE name. Before the census
+	// split these samples were pushed into the same windows as the CPU worker's
+	// job time, which is how the line above once printed "R2 p50=3918.27" --
+	// 3.9 seconds labelled worker milliseconds, when the worker's real R0 p50
+	// was ~1.5 ms and the 3.9 s was a GPU submit->deliver round trip. Computed
+	// here directly from the windows (not via the 1 Hz snapshot) because the
+	// snapshot struct is HUD-facing and this is a log-only instrument.
+	{
+		bool bAnyGpu = false;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			bAnyGpu |= (LevelGpuLatencyMsWindowCount[L] > 0);
+		}
+		if (bAnyGpu)
+		{
+			UE_LOG(LogVoxelPerf, Log, TEXT("Voxel gpuLatency ms/level: %s"),
+			       *JoinPerLevel([&](int32 L)
+			       {
+				       const FMsPercentiles P =
+					       ComputeMsPercentiles(LevelGpuLatencyMsWindow[L], LevelGpuLatencyMsWindowCount[L]);
+				       return FString::Printf(TEXT("R%d p50=%.2f p95=%.2f n=%d"), L, P.P50, P.P95,
+				                              LevelGpuLatencyMsWindowCount[L]);
+			       }));
+		}
+	}
+
 	// -VoxelL0GridVerify running total: level-0 chunks meshed BOTH ways and
 	// compared quad-for-quad. Any level-0 storage change is only legitimate if
 	// MISMATCHES stays 0 -- see VoxelStreamAdmission::L0GridVerifyEnabled.
@@ -7659,6 +7822,23 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       VoxelDebug::GetStreamVelocityLeadSec(), SmoothedAnchorSpeedUUPerSec / 100.0,
 		       (long long)SpecDispatchedTotal, (long long)SpecAdoptedTotal,
 		       SpecParkedTotal > 0 ? 100.0 * double(SpecAdoptedTotal) / double(SpecParkedTotal) : 0.0);
+		// The brick arm's census, its own line (file convention: never widen an
+		// existing one). Under voxel.Terrain.RetireQuads the line above CANNOT
+		// report dropEmpty for real results any more -- brick-only deliveries
+		// go to these counters instead, because "empty" was a misclassification
+		// of a config with no quad product (the adopted=0 artifact). A window
+		// where dropEmpty is non-zero AND dropBrickOnly/parkedBrick are
+		// non-zero means the retirement cvar flipped mid-session.
+		if (SpecDroppedBrickOnlySinceLog > 0 || SpecParkedBrickSinceLog > 0 ||
+		    SpecDroppedBrickNotResidentSinceLog > 0 || SpecBrickParkLostSinceLog > 0)
+		{
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel speculation brick arm (5s window): parkedBrick=%lld dropBrickOnly=%lld ")
+			       TEXT("dropBrickNotResident=%lld adoptLostBricks=%lld parkBricks=%d"),
+			       (long long)SpecParkedBrickSinceLog, (long long)SpecDroppedBrickOnlySinceLog,
+			       (long long)SpecDroppedBrickNotResidentSinceLog, (long long)SpecBrickParkLostSinceLog,
+			       VoxelDebug::GetStreamSpeculativeParkBricks());
+		}
 	}
 
 	// S2-3 park census. adopted/parked is the hit rate: a park that is never
@@ -7897,7 +8077,14 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		FString GridSuffix;
 		if (Level == 0 && AccumLevel0JobMs > 0.0)
 		{
-			GridSuffix = FString::Printf(TEXT(" | gridMs=%.1f jobMs=%.1f (grid %.1f%% of job)"), AccumLevel0GridMs,
+			// The keys here are DELIBERATELY renamed (jobMs -> cpuJobMs, jobs ->
+			// cpuJobs, jobGHz -> cpuJobGHz) rather than keeping the old names
+			// with the newly-gated values. The old jobGHz was an artifact (see
+			// the accumulator block in DrainResults), and a grep against old
+			// legs that silently matched the FIXED number under the BROKEN name
+			// would let a stale conclusion survive the repair. Same-name lines
+			// must mean the same thing forever; these could not, so they moved.
+			GridSuffix = FString::Printf(TEXT(" | cpuGridMs=%.1f cpuJobMs=%.1f (grid %.1f%% of job)"), AccumLevel0GridMs,
 			                             AccumLevel0JobMs, 100.0 * AccumLevel0GridMs / AccumLevel0JobMs);
 			// Per-JOB normalisation plus the cycle probe. Read gridGHz first: the
 			// grid build is exactly 1156 Amplifier::column calls in every level-0
@@ -7915,7 +8102,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 				const double JobUs = 1000.0 * AccumLevel0JobMs / N;
 				const double JobKcyc = double(AccumLevel0JobCycles) / N / 1000.0;
 				GridSuffix += FString::Printf(
-					TEXT(" | jobs=%lld perJob jobUs=%.0f jobKcyc=%.0f jobGHz=%.2f | gridUs=%.0f gridKcyc=%.0f gridGHz=%.2f")
+					TEXT(" | cpuJobs=%lld perJob cpuJobUs=%.0f cpuJobKcyc=%.0f cpuJobGHz=%.2f | gridUs=%.0f gridKcyc=%.0f gridGHz=%.2f")
 					TEXT(" cycPerColumn=%.0f"),
 					(long long)AccumLevel0Jobs, JobUs, JobKcyc, JobUs > 0.0 ? JobKcyc / JobUs : 0.0, GridUsPerJob,
 					GridKcycPerJob, GridUsPerJob > 0.0 ? GridKcycPerJob / GridUsPerJob : 0.0,
@@ -7939,6 +8126,21 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (long long)LevelAllAirSinceLog[Level], (long long)LevelAllSolidSinceLog[Level],
 		       (long long)LevelMixedEmptySinceLog[Level], LevelZeroQuadMsSinceLog[Level], LevelQuadMsSinceLog[Level],
 		       TotalMs > 0.0 ? 100.0 * LevelZeroQuadMsSinceLog[Level] / TotalMs : 0.0, *GridSuffix);
+	}
+	// The GPU arm's half of the level-0 census, on its OWN line (file
+	// convention: new line, never a widened one -- greps against old legs must
+	// keep matching). gpuLatencyMs here is submit-to-deliver summed over the
+	// window; it is the quantity the old census silently mixed into "jobMs".
+	// Sanity identity for a reader: cpuJobMs on the R0 line above is bounded by
+	// (background workers x window seconds) -- 8 x 5,000 = 40,000 ms on this
+	// box -- while this line's gpuLatencyMs sum is bounded only by
+	// (deliveries x round-trip) and can legitimately read in the millions.
+	if (AccumLevel0GpuJobs > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel empty census R0 gpu arm (5s window): gpuJobs=%lld gpuLatencyMs=%.1f perJob gpuLatencyUs=%.0f"),
+		       (long long)AccumLevel0GpuJobs, AccumLevel0GpuLatencyMs,
+		       1000.0 * AccumLevel0GpuLatencyMs / double(AccumLevel0GpuJobs));
 	}
 	BuriedVerifyCheckedTotal += BuriedVerifyCheckedSinceLog;
 	BuriedSolidKeptTotal += BuriedSolidKeptSinceLog;
@@ -8013,7 +8215,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       (long long)ColdBandDefersSinceLog, ColdBandHeldThisFrame, FootprintBandCache.Num(),
 	       FootprintBlindJobInFlight.Num(), FootprintBlindJobIsGpu.Num(),
 	       (long long)ColdBandMarkTimeoutsSinceLog, (long long)ColdBandGpuLatencyTimeoutsSinceLog);
+	// The park variant's own numbers, a separate line (never widen an existing
+	// one) and only when the mechanism has anything to say. parkedNow is
+	// entries currently held off the queues; flushed is entries returned to
+	// the queue this window. On the default path both are structurally zero.
+	if (ColdBandParkedEntryCount > 0 || ColdBandParkFlushedSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel cold-band park (5s window): parkedNow=%d footprints=%d flushed=%lld"),
+		       ColdBandParkedEntryCount, ColdBandParkedByFootprint.Num(),
+		       (long long)ColdBandParkFlushedSinceLog);
+	}
 	ColdBandDefersSinceLog = 0;
+	ColdBandParkFlushedSinceLog = 0;
 	ColdBandMarkTimeoutsSinceLog = 0;
 	ColdBandGpuLatencyTimeoutsSinceLog = 0;
 
@@ -8558,6 +8772,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumLevel0GridCycles = AccumLevel0JobCycles = 0;
 	AccumLevel0Jobs = 0;
 	AccumLevel0BricksSkippedAir = AccumLevel0BricksSkippedSolid = 0;
+	AccumLevel0GpuLatencyMs = 0.0;
+	AccumLevel0GpuJobs = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
 	AccumBrickFlushMs = 0.0;
@@ -8572,6 +8788,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	SpecDispatchedSinceLog = SpecParkedSinceLog = SpecAdoptedSinceLog = SpecEvictedUnusedSinceLog = 0;
 	SpecDroppedEmptySinceLog = SpecDroppedOvertakenSinceLog = SpecDroppedPoolFullSinceLog = 0;
 	SpecEmptyTopSinceLog = SpecEmptyMidSinceLog = SpecEmptyBotSinceLog = SpecBandSkippedSinceLog = 0;
+	SpecDroppedBrickOnlySinceLog = SpecDroppedBrickNotResidentSinceLog = 0;
+	SpecParkedBrickSinceLog = SpecBrickParkLostSinceLog = 0;
 	ParkRefusedNoPoolGeomSinceLog = ParkRefusedUnsettledSinceLog = 0;
 	ParkRefusedNotFinerSinceLog = ParkRefusedEditedSinceLog = 0;
 	ChunksParkedSinceLog = ChunksAdoptedSinceLog = 0;
@@ -10588,11 +10806,35 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// edit, so this catches the world-version case rather than
 						// the edit case.
 						const uint64 NowEpoch = EditEpoch.load(std::memory_order_relaxed);
+						// A brick-backed park (voxel.Stream.SpeculativeParkBricks)
+						// promises its geometry is resident in the GLOBAL BRICK
+						// POOL, and that pool runs its own capacity eviction
+						// (EvictOne) which knows nothing about parks. Re-verify
+						// at the moment of adoption, because adopting sets
+						// bMeshSettled with NO job queued -- over bricks that
+						// left the pool, that is a permanent hole no counter
+						// would ever name. Verified the same way it was at park
+						// time: the pool's own by-key residency query, through
+						// the same MakeKey both producers use.
+						bool bBrickParkLost = false;
+						if (Parked->bBrickBacked && Parked->EditEpoch == NowEpoch)
+						{
+							FVoxelBrickPool::FResidentChunk ResidentProbe;
+							bBrickParkLost = !GetGlobalVoxelBrickPool().DebugGetResidentChunk(
+								VoxelBrickCpuArm::MakeKey(LevelKey), ResidentProbe);
+						}
 						if (Parked->EditEpoch != NowEpoch)
 						{
 							EvictParkedKey(LevelKey);
 							++ParkEvictedStaleSinceLog;
 							// Fall through and admit it normally.
+						}
+						else if (bBrickParkLost)
+						{
+							EvictParkedKey(LevelKey);
+							++SpecBrickParkLostSinceLog;
+							// Fall through and admit it normally -- a fresh job
+							// re-meshes the chunk the pool no longer holds.
 						}
 						else
 						{
@@ -10608,9 +10850,19 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							Adopted.bMeshSettled = true;
 							Adopted.LoadedAtSeconds = ElapsedSeconds;
 
-							if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+							// Brick-backed parks hold no quad-pool range --
+							// PoolHandle is INDEX_NONE and unparking it would
+							// stamp a table entry for a slot that was never
+							// allocated. The bricks are already resident in
+							// the volume the marcher reads (verified above);
+							// adoption's whole job for them is this record
+							// write.
+							if (Parked->PoolHandle != INDEX_NONE)
 							{
-								Pool->UnparkChunk(Parked->PoolHandle, Parked->OriginInPool, Parked->Level);
+								if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+								{
+									Pool->UnparkChunk(Parked->PoolHandle, Parked->OriginInPool, Parked->Level);
+								}
 							}
 							ResidentQuads += Parked->QuadCount;
 							// COUNTS AS A LOAD, because it is one: the chunk is
@@ -12349,6 +12601,65 @@ void FVoxelWorldImpl::DispatchJobs()
 		VoxelStreamAdmission::ColdBandThrottleEnabled();
 	TArray<FSortEntry> DeferredColdBand;
 
+	// -VoxelColdBandDeferPark: release parked column-mates whose seeding mark
+	// has cleared or aged out, BEFORE the pop loop so they are dispatchable in
+	// this same tick -- the same latency the default re-queue path has (its
+	// deferred entries also only re-pop on the tick after the mark clears).
+	//
+	// Runs on map-nonempty rather than on the switch, so entries can never
+	// strand behind a configuration change: whatever turned parking on, an
+	// empty map costs one branch here and a populated one always drains.
+	//
+	// The age-out logic is a copy of the in-loop stale-mark test below, and has
+	// to be: with the column-mates parked, no candidate of a stranded footprint
+	// ever pops, so the in-loop test can never run for it -- the sweep is the
+	// only place a parked footprint's mark age-out can be observed. Same
+	// counters, same GPU/CPU split, same "should be zero on a healthy run"
+	// reading (see the in-loop comment).
+	if (ColdBandParkedByFootprint.Num() > 0)
+	{
+		for (auto It = ColdBandParkedByFootprint.CreateIterator(); It; ++It)
+		{
+			const FIntPoint Footprint = It.Key();
+			bool bRelease = false;
+			if (const double* MarkedAt = FootprintBlindJobInFlight.Find(Footprint))
+			{
+				if (ElapsedSeconds - *MarkedAt >= kBlindJobMarkTimeoutSeconds)
+				{
+					FootprintBlindJobInFlight.Remove(Footprint);
+					if (FootprintBlindJobIsGpu.Remove(Footprint) > 0)
+					{
+						++ColdBandGpuLatencyTimeoutsSinceLog;
+					}
+					else
+					{
+						++ColdBandMarkTimeoutsSinceLog;
+					}
+					bRelease = true;
+				}
+			}
+			else
+			{
+				// The seed's result drained (DrainResults removed the mark), or
+				// the mark never survived -- either way there is nothing left
+				// to wait for.
+				bRelease = true;
+			}
+			if (bRelease)
+			{
+				ColdBandParkedEntryCount -= It.Value().Num();
+				ColdBandParkFlushedSinceLog += It.Value().Num();
+				// Append with the stored DistSq, exactly as the default path's
+				// post-loop re-queue does. Keys whose record was evicted (or
+				// re-admitted, creating a duplicate entry) while parked are
+				// absorbed by the loop's own !Rec / staleness checks, same as
+				// any stale queue entry.
+				PendingJobKeysByLevel[0].Append(MoveTemp(It.Value()));
+				It.RemoveCurrent();
+			}
+		}
+	}
+
 	// THE GPU FORK GETS ITS OWN IN-FLIGHT BUDGET, AND THIS IS THE FIX FOR THE
 	// 3.4x COLD-FILL REGRESSION D5.3a MEASURED.
 	//
@@ -12527,7 +12838,23 @@ void FVoxelWorldImpl::DispatchJobs()
 				}
 				else
 				{
-					DeferredColdBand.Add(PoppedEntry);
+					// -VoxelColdBandDeferPark=1: hold the column-mate OFF the
+					// queue until the seed's mark clears, instead of the
+					// default requeue-and-repop-next-tick. The defers= counter
+					// keeps its meaning ("a pop was deferred") on both paths;
+					// what changes is HOW OFTEN one candidate can produce a
+					// defer -- once per mark lifetime when parked, once per
+					// TICK when re-queued. That collapse (13,217/5 s measured
+					// on the default path) is the A/B's primary readout.
+					if (VoxelStreamAdmission::ColdBandDeferParkEnabled() != 0)
+					{
+						ColdBandParkedByFootprint.FindOrAdd(Footprint).Add(PoppedEntry);
+						++ColdBandParkedEntryCount;
+					}
+					else
+					{
+						DeferredColdBand.Add(PoppedEntry);
+					}
 					++ColdBandDefersSinceLog;
 					continue;
 				}
@@ -14580,7 +14907,97 @@ void FVoxelWorldImpl::ParkSpeculativeResult(const VoxelCoords::FVoxelLevelChunkK
 	// Every early-out drops the geometry, which is correct: it was never wanted,
 	// and dropping speculation is always safe. The payload releases its GPU
 	// memory when GpuResult goes out of scope.
-	if (!Pool || MaxParked <= 0 || SpecParkedNow >= MaxParked)
+	if (MaxParked <= 0 || SpecParkedNow >= MaxParked)
+	{
+		return;
+	}
+
+	// --- THE BRICK-ONLY ARM (voxel.Terrain.RetireQuads) ----------------------
+	//
+	// Under quad retirement the test below this block CANNOT work: every GPU
+	// job is submitted with bQuadMesh=false, so every delivery carries
+	// NumQuads == 0 and no quad payload BY CONFIGURATION, not because the chunk
+	// is empty. This function kept asking the quad question anyway, and the
+	// answer was a census that read 100% dropEmpty -- 9,804 dispatched, 0
+	// adopted on final-shipped-state.log -- with a MID-HEAVY band distribution
+	// (top=17 mid=190 bot=157), where the 2026-07-28 trim sweep had measured
+	// that GENUINE empties sit only at the band ends (mid=0). Meanwhile the
+	// bricks those jobs packed were already resident: the manager's Deliver
+	// runs GetGlobalVoxelBrickPool().AddChunkFromGpu for every successful
+	// brick job, speculative included, and the march index sinks every pool
+	// write -- so the terrain was generated, resident and even RENDERED, then
+	// forgotten, and demand re-dispatched a second full GPU job for it later.
+	//
+	// This arm is taken for any brick-only delivery. What it does depends on
+	// voxel.Stream.SpeculativeParkBricks:
+	//   0 (default) -- behave exactly as before (drop, park nothing); only the
+	//     census wording changes, because "empty" was false.
+	//   1 -- record a brick-backed ParkedGeometry marker so admission ADOPTS
+	//     the chunk (a table write, record settled, no job) instead of
+	//     commissioning the meshing a second time.
+	if (VoxelTerrainQuadsRetired() && !GpuResult.GpuQuads.IsValid() && GpuResult.NumQuads == 0)
+	{
+		if (VoxelDebug::GetStreamSpeculativeParkBricks() == 0)
+		{
+			// NOT ++SpecDroppedEmptySinceLog: quads are retired, so this result
+			// carries no evidence of emptiness in either direction.
+			++SpecDroppedBrickOnlySinceLog;
+			return;
+		}
+		// Demand overtook it in flight -- same test, same counter, same
+		// double-mesh meaning as the quad arm's check below.
+		if (ChunkRecords.Contains(Key) || ParkedGeometry.Contains(Key))
+		{
+			++SpecDroppedOvertakenSinceLog;
+			return;
+		}
+		// VERIFIED RESIDENT, NOT ASSUMED (the derived-not-verified rule: a
+		// join computed instead of checked has produced five bugs in three
+		// days on this project). Deliver publishes only when bBrickResident
+		// was latched on AND the totals passed its bounds check, and the brick
+		// pool can also have evicted the chunk for capacity between Deliver
+		// and this call. An unverified park here would let adoption settle a
+		// record over terrain the pool does not hold -- a permanent hole,
+		// invisible until someone flies past it. DebugGetResidentChunk is
+		// labelled debug but is the pool's one public by-key residency query,
+		// a const map lookup on the owning thread.
+		FVoxelBrickPool::FResidentChunk ResidentProbe;
+		if (!VoxelGpuBrickPackResidentEnabled() ||
+		    !GetGlobalVoxelBrickPool().DebugGetResidentChunk(VoxelBrickCpuArm::MakeKey(Key), ResidentProbe))
+		{
+			++SpecDroppedBrickNotResidentSinceLog;
+			return;
+		}
+
+		FParkedGeometry Parked;
+		Parked.PoolHandle = INDEX_NONE; // bricks, not a quad-pool range
+		Parked.Level = Key.Level;
+		// 0 on purpose: byte-identical to what ApplyMeshResult's NumQuads==0
+		// branch records for every demand terrain chunk under retirement.
+		Parked.QuadCount = 0;
+		// Speculation is worldgen-only, so its generation is the base one --
+		// same reasoning as the quad arm below.
+		Parked.GenerationId = 1;
+		Parked.EditEpoch = EditEpoch.load(std::memory_order_relaxed);
+		Parked.ParkedAtSeconds = ElapsedSeconds;
+		Parked.bSpeculative = true;
+		Parked.bBrickBacked = true;
+
+		ParkedGeometry.Add(Key, Parked);
+		ParkedInsertionOrder.Add(Key);
+		++SpecParkedNow;
+		++SpecParkedBrickSinceLog;
+		++SpecParkedSinceLog;
+		++SpecParkedTotal;
+		if (SpecParkedNow > MaxParked)
+		{
+			EvictOldestSpeculative();
+		}
+		return;
+	}
+
+	// --- THE QUAD ARM (everything below is the pre-existing path) ------------
+	if (!Pool)
 	{
 		return;
 	}
@@ -14704,13 +15121,20 @@ void FVoxelWorldImpl::EvictParkedKey(const VoxelCoords::FVoxelLevelChunkKey& Key
 	{
 		SpecParkedNow = FMath::Max(0, SpecParkedNow - 1);
 	}
-	if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+	// Brick-backed parks (voxel.Stream.SpeculativeParkBricks) have no quad-pool
+	// range to free -- PoolHandle is INDEX_NONE -- and their bricks are freed by
+	// the ReleaseChunkBricks below, which this function already ran for every
+	// park before brick-backed entries existed.
+	if (Parked.PoolHandle != INDEX_NONE)
 	{
-		// RemoveChunk on a PARKED handle is correct and is why parking did not
-		// need the GPU hide pass: the range is still allocated and the handle
-		// still valid, so this is the ordinary free path. The table entry it
-		// neutralises is already neutral.
-		Pool->RemoveChunk(Parked.PoolHandle);
+		if (UVoxelGpuPoolComponent* Pool = GpuPool.Get())
+		{
+			// RemoveChunk on a PARKED handle is correct and is why parking did not
+			// need the GPU hide pass: the range is still allocated and the handle
+			// still valid, so this is the ordinary free path. The table entry it
+			// neutralises is already neutral.
+			Pool->RemoveChunk(Parked.PoolHandle);
+		}
 	}
 
 	// WAVE 1.2. The park is being given up for good, so the bricks DrainUnloads
@@ -15286,16 +15710,27 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// ROUTED BY PRODUCER, because the two arms time different quantities.
 		// The CPU arm's JobMs is SERVICE TIME (task-body wall, pickup to
 		// enqueue); the GPU arm's GpuSubmitToDeliverMs is END-TO-END LATENCY
-		// including the manager's queue wait. Both used to land in
-		// WorkerJobMsWindow through the shared JobMs field, and averaging a
-		// ms-scale cost with a latency measured as high as 7,395 ms on one
-		// delivery is why the single "Worker ms" statistic read in seconds and
-		// could not be attributed to either path. Each window now holds one
-		// quantity and the HUD labels each row for what it measures.
+		// including the manager's queue wait. Both used to land in the same
+		// windows through a shared JobMs field, and averaging a ms-scale cost
+		// with a latency measured as high as 7,395 ms on one delivery is why
+		// the single "Worker ms" statistic read in seconds and could not be
+		// attributed to either path. The per-level rows carried the same blend
+		// and printed "R2 p50=3918.27" -- not a worker taking four seconds, a
+		// GPU round trip wearing a worker's label. Each window now holds one
+		// quantity and each log row is named for what it measures.
+		//
+		// The GPU arm reads GpuSubmitToDeliverMs, NOT JobMs: JobMs is now 0 on
+		// that arm, so a per-level GPU row fed from it would be a row of zeros
+		// that looked like a working instrument.
+		const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
 		if (Result.bFromGpuMesh)
 		{
 			PushLatencyMsSample(GpuJobLatencyMsWindow, GpuJobLatencyMsWindowNext,
 			                    GpuJobLatencyMsWindowCount, Result.GpuSubmitToDeliverMs);
+
+			LevelGpuLatencyMsWindow[Lvl][LevelGpuLatencyMsWindowNext[Lvl]] = Result.GpuSubmitToDeliverMs;
+			LevelGpuLatencyMsWindowNext[Lvl] = (LevelGpuLatencyMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
+			LevelGpuLatencyMsWindowCount[Lvl] = FMath::Min(LevelGpuLatencyMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
 		}
 		else
 		{
@@ -15304,11 +15739,7 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			WorkerJobMsWindowCount = FMath::Min(WorkerJobMsWindowCount + 1, WorkerJobMsWindowSize);
 
 			// M2 wave 2 item 1: same recording, split into this result's level's
-			// own window (see LevelWorkerJobMsWindow doc comment). CPU-only for
-			// the same reason as the global window: the number this feeds is
-			// "worker p50/p95 per level" -- a cost -- and the fork's latency in
-			// it made R-level cost rows unreadable the same way.
-			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			// own window (see LevelWorkerJobMsWindow doc comment).
 			LevelWorkerJobMsWindow[Lvl][LevelWorkerJobMsWindowNext[Lvl]] = Result.JobMs;
 			LevelWorkerJobMsWindowNext[Lvl] = (LevelWorkerJobMsWindowNext[Lvl] + 1) % WorkerJobMsWindowSize;
 			LevelWorkerJobMsWindowCount[Lvl] = FMath::Min(LevelWorkerJobMsWindowCount[Lvl] + 1, WorkerJobMsWindowSize);
@@ -15447,16 +15878,18 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 		// discarded as stale still did the full generate+mesh. Counting only
 		// live results would understate exactly the waste this is measuring.
 		{
-			const int32 Lvl = FMath::Clamp(Result.Key.Level, 0, VoxelCoords::kNumLevels - 1);
+			// Lvl is already in scope from the producer-routed windows above.
 			++LevelResultsSinceLog[Lvl];
 			const int32 ResultQuads = Result.QuadCount();
-			// A GPU-fork result adds 0 here (its JobMs stays 0 -- see
-			// FJobResult): these two accumulators are the census's "worker
-			// WALL TIME split by outcome" (see the members' doc comment), and
-			// the latency the fork used to write through JobMs is not time a
-			// worker spent. The fork's results still count in
-			// LevelResultsSinceLog and the quad histogram above/below.
-			(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+			// CPU results only, same reason as the window gate above: this pair
+			// is printed as "workerMs zeroQuad=/quad=" and on a GPU result
+			// JobMs is submit-to-deliver latency, not worker time. Adding it
+			// here is what let one window's empty census claim more worker
+			// milliseconds than the machine has worker threads to spend.
+			if (!Result.bFromGpuMesh)
+			{
+				(ResultQuads == 0 ? LevelZeroQuadMsSinceLog[Lvl] : LevelQuadMsSinceLog[Lvl]) += Result.JobMs;
+			}
 
 			// S0-3 (docs/speculative-generation-plan.md Wave S0 / T0-2): the
 			// per-level quad-count distribution -- free here, ResultQuads and Lvl
@@ -15499,13 +15932,35 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// jobs/jobUs/gridUs one consistent population.
 			if (Lvl == 0 && !Result.bFromGpuMesh)
 			{
-				AccumLevel0GridMs += Result.GridMs;
-				AccumLevel0JobMs += Result.JobMs;
-				AccumLevel0GridCycles += Result.GridCycles;
-				AccumLevel0JobCycles += Result.JobCycles;
-				AccumLevel0BricksSkippedAir += Result.BricksSkippedAir;
-				AccumLevel0BricksSkippedSolid += Result.BricksSkippedSolid;
-				++AccumLevel0Jobs;
+				// SPLIT BY PRODUCER -- this ungated block is where jobGHz=0.04
+				// was manufactured. GPU results carry JobMs = submit-to-deliver
+				// latency and JobCycles/GridCycles/GridMs = 0 (never measured),
+				// so summing them here inflated jobUs ~80x while diluting
+				// jobKcyc only ~3.6% (356 GPU results of 9,929 in the measured
+				// window), and the ratio printed as a worker running at 0.04
+				// GHz. The same line's gridGHz read 3.26 because BOTH of its
+				// inputs are zero on GPU results and the dilution cancels --
+				// two instruments in one line, one poisoned, one clean, and
+				// the poisoned one was the one the plan was built on. The gate
+				// is the same predicate the S0-3 latency windows already use.
+				// AccumLevel0Jobs is now CPU jobs only, which also fixes the
+				// brickSkip percentage: its denominator is jobs * 64 bricks,
+				// and GPU jobs (which skip no CPU bricks) were inflating it.
+				if (!Result.bFromGpuMesh)
+				{
+					AccumLevel0GridMs += Result.GridMs;
+					AccumLevel0JobMs += Result.JobMs;
+					AccumLevel0GridCycles += Result.GridCycles;
+					AccumLevel0JobCycles += Result.JobCycles;
+					AccumLevel0BricksSkippedAir += Result.BricksSkippedAir;
+					AccumLevel0BricksSkippedSolid += Result.BricksSkippedSolid;
+					++AccumLevel0Jobs;
+				}
+				else
+				{
+					AccumLevel0GpuLatencyMs += Result.JobMs;
+					++AccumLevel0GpuJobs;
+				}
 			}
 			// Per-ring in-flight bookkeeping (see LevelJobsInFlight): every job
 			// DispatchJobs launches produces exactly one result, live or stale,
