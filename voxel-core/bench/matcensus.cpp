@@ -336,11 +336,23 @@ int main(int argc, char** argv) {
     // --- the column dump, for tools/world-preview.py -------------------------
     //
     // A SEPARATE PASS, columns only and no meshing, so it can cover kilometres
-    // while the census above stays local and affordable. The census answers
-    // "do the ids reach the quads" and needs the mesher; the picture answers
-    // "what does the world look like" and needs area. Sharing one radius would
-    // have made both bad: a census wide enough to see several biomes takes
-    // hours to mesh, and a picture narrow enough to mesh quickly shows one.
+    // while the census above stays local and affordable. The census answers "do
+    // the ids reach the quads" and needs the mesher; the picture answers "what
+    // does the world look like" and needs area. Sharing one radius would have
+    // made both bad: a census wide enough to see several biomes takes hours to
+    // mesh, and one narrow enough to mesh shows a single biome.
+    //
+    // Amplifier::surfaceInfo, not column(): it returns surface, the signed
+    // per-axis gradient, the biome AND the climate in one call, and skips the
+    // cave and cavern reductions the picture has no use for. The gradient is
+    // what hillshades the image; the climate is what lets --compare paint
+    // today's biome-LUT answer beside the material one.
+    //
+    // BINARY RECORDS, TEXT HEADER. The first version wrote one text line per
+    // column and produced a 194 MB file for a 6 km window -- most of it the
+    // coordinates, which are redundant because the grid is regular. The header
+    // stays text so the file says what it is; the body is fixed-width
+    // little-endian so a 6 km window is a few megabytes.
     if (!dumpPath.empty()) {
         std::FILE* dump = std::fopen(dumpPath.c_str(), "wb");
         if (dump == nullptr) {
@@ -350,35 +362,49 @@ int main(int argc, char** argv) {
         const int64_t dr = dumpRadiusM > 0 ? dumpRadiusM : radiusM;
         const int64_t drVox = dr * 1000 / kVoxelSizeMm;
         const int64_t stride = dumpStride > 0 ? dumpStride : 1;
-        const int64_t n = (2 * drVox) / stride;
+        const int64_t n = std::max<int64_t>(1, (2 * drVox) / stride);
 
-        // Self-describing: world-preview.py reads the geometry out of the file
-        // rather than being told it on its own command line, which is how the
-        // two would drift.
-        std::fprintf(dump, "# vxc_matcensus dump v1\n");
+        std::fprintf(dump, "# vxc_matcensus dump v2\n");
         std::fprintf(dump, "# seed %llu real_tiles %d\n",
                      (unsigned long long)seed, realTiles ? 1 : 0);
-        std::fprintf(dump, "# origin_m %lld %lld radius_m %lld stride_vox %lld\n",
-                     (long long)originXM, (long long)originYM, (long long)dr,
-                     (long long)stride);
+        std::fprintf(dump, "# origin_m %lld %lld\n",
+                     (long long)originXM, (long long)originYM);
+        std::fprintf(dump, "# radius_m %lld\n", (long long)dr);
+        std::fprintf(dump, "# stride_vox %lld\n", (long long)stride);
         std::fprintf(dump, "# grid %lld %lld\n", (long long)n, (long long)n);
-        std::fprintf(dump, "# row-major: vx vy surface_mm mat\n");
+        std::fprintf(dump, "# metres_per_cell %.4f\n",
+                     double(stride) * kVoxelSizeMm / 1000.0);
+        // int32 surfaceMm, int32 gradX, int32 gradY, u8 mat, u8 biome,
+        // u8 temperature, u8 precipitation -- 16 bytes, row-major.
+        std::fprintf(dump, "# record <iiiBBBB> row-major\n");
+        std::fprintf(dump, "# END\n");
 
+        std::vector<uint8_t> row(size_t(n) * 16);
         for (int64_t j = 0; j < n; ++j) {
+            size_t o = 0;
             for (int64_t i = 0; i < n; ++i) {
                 const int64_t vx = originVx - drVox + i * stride;
                 const int64_t vy = originVy - drVox + j * stride;
+                const Amplifier::SurfaceInfo si = amp.surfaceInfo(vx, vy);
                 const ColumnSample col = amp.column(vx, vy);
                 const MaterialId m = Amplifier::materialAt(col, topSolidVoxelZ(col.surfaceMm));
-                std::fprintf(dump, "%lld %lld %lld %d\n", (long long)vx, (long long)vy,
-                             (long long)col.surfaceMm, int(m));
+
+                const int32_t vals[3] = {si.surfaceMm,
+                                         static_cast<int32_t>(si.slopeXMmPerM),
+                                         static_cast<int32_t>(si.slopeYMmPerM)};
+                std::memcpy(&row[o], vals, sizeof(vals));
+                o += sizeof(vals);
+                row[o++] = uint8_t(m);
+                row[o++] = uint8_t(si.biome);
+                row[o++] = si.climate.temperature;
+                row[o++] = si.climate.precipitation;
             }
+            std::fwrite(row.data(), 1, o, dump);
         }
         std::fclose(dump);
-        std::printf("wrote %lldx%lld column dump to %s (%lld m radius, "
-                    "%lld-voxel stride)\n\n",
+        std::printf("wrote %lldx%lld column dump to %s (%lld m radius, %.2f m/cell)\n\n",
                     (long long)n, (long long)n, dumpPath.c_str(), (long long)dr,
-                    (long long)stride);
+                    double(stride) * kVoxelSizeMm / 1000.0);
     }
 
     if (c.totalArea == 0) {

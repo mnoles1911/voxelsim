@@ -86,14 +86,14 @@ PALETTE = [
     ("GRAVEL",            0.304987, 0.258183, 0.184475, False),
     ("SAND",              0.617207, 0.491021, 0.262251, True),
     ("SUBSOIL",           0.187821, 0.116971, 0.064803, False),
-    ("TOPSOIL",           0.107023, 0.061246, 0.031896, True),
+    ("TOPSOIL",           0.116971, 0.068478, 0.034340, True),
     ("SNOW",              0.896269, 0.921582, 0.964686, False),
     ("GRASS",             0.072272, 0.174647, 0.036889, True),
-    ("JUNGLE_SOIL",       0.088656, 0.051269, 0.025187, True),
+    ("JUNGLE_SOIL",       0.138432, 0.042311, 0.019382, True),
     ("SAVANNA_GRASS",     0.401978, 0.341914, 0.102242, True),
-    ("PODZOL",            0.076185, 0.051269, 0.036889, True),
+    ("PODZOL",            0.084376, 0.076185, 0.061246, True),
     ("PERMAFROST",        0.401978, 0.456411, 0.502886, True),
-    ("MUD",               0.068478, 0.048172, 0.031896, False),
+    ("MUD",               0.048172, 0.054480, 0.042311, False),
     ("CLAY",              0.313989, 0.181164, 0.111932, False),
     # DEBUG INSTRUMENT, not world content -- vxc::MAT_WATERMARK. Solid voxels
     # standing where the bake says water is, so the water model can be judged at

@@ -97,26 +97,79 @@ VXC_TEST(palette_materials_that_meet_are_distinguishable) {
     // naturally similar (rock vs gravel, the six leaf types)". That pressure is
     // measurable, so measure it instead of hoping.
     //
-    // The pairs are the ones that actually appear side by side -- a cave wall's
-    // strata, and the leaf types, two of which can meet in one mixed wood. The
-    // bar is a sum-of-channels distance on the TOP face, low enough that it
-    // passes today and high enough that collapsing a pair fails it.
+    // EXHAUSTIVE OVER SURFACE MATERIALS, not a hand-picked list of pairs, and
+    // that change is the whole value of this test. The hand-picked version
+    // named seven plausible pairs and passed -- while FOUR OTHER PAIRS sat
+    // below its own bar, including MAT_PODZOL against MAT_MUD at a distance of
+    // 10. Those two are 55% and 31% of the taiga coastline that
+    // tools/world-preview.py drew, meeting along a shoreline, and the picture
+    // showed them as one indistinguishable brown. A list of pairs someone
+    // thought of cannot catch the pair nobody thought of.
+    //
+    // Any two surface materials CAN meet: they are chosen per column by
+    // classifyBiome, and biome boundaries put arbitrary pairs side by side.
+    struct Named {
+        MaterialId id;
+        const char* name;
+    };
+    const Named surfaces[] = {
+        {MAT_SAND, "SAND"},           {MAT_TOPSOIL, "TOPSOIL"},
+        {MAT_GRASS, "GRASS"},         {MAT_JUNGLE_SOIL, "JUNGLE_SOIL"},
+        {MAT_SAVANNA_GRASS, "SAVANNA_GRASS"}, {MAT_PODZOL, "PODZOL"},
+        {MAT_PERMAFROST, "PERMAFROST"}, {MAT_MUD, "MUD"},
+        {MAT_ROCK, "ROCK"},           {MAT_SNOW, "SNOW"},
+    };
+    const int n = int(sizeof(surfaces) / sizeof(surfaces[0]));
+    for (int i = 0; i < n; ++i) {
+        for (int j = i + 1; j < n; ++j) {
+            const Rgb& x = kMaterialPalette[surfaces[i].id].face[kFaceTop];
+            const Rgb& y = kMaterialPalette[surfaces[j].id].face[kFaceTop];
+            const int d = std::abs(int(x.r) - int(y.r)) +
+                          std::abs(int(x.g) - int(y.g)) +
+                          std::abs(int(x.b) - int(y.b));
+            CHECK_MSG(d >= 24,
+                      "two SURFACE materials are the same colour -- worldgen can "
+                      "put them side by side at a biome boundary");
+            if (d < 24) {
+                std::fprintf(stderr, "    %s / %s: distance %d\n", surfaces[i].name,
+                             surfaces[j].name, d);
+            }
+        }
+    }
+
+    // The subsurface and asset pairs that are known to meet, still named
+    // explicitly: these are not chosen by a classifier, so an exhaustive sweep
+    // over all 47 materials would fail on pairs that can never touch (a fish
+    // beside a leaf) and would have to be suppressed pair by pair.
+    //
+    // EACH PAIR NAMES ITS FACES, which is not pedantry. The first version
+    // compared MAT_BARK's TOP against MAT_HEARTWOOD's top and failed -- but
+    // bark's top face is DELIBERATELY heartwood-coloured ("a trunk's top and
+    // bottom are where it was cut, so they show heartwood while the sides show
+    // bark"), so that comparison asked two intentionally-identical values to
+    // differ. The adjacency that actually exists on a felled log is bark's SIDE
+    // against heartwood's top, and that is what is checked.
     struct Pair {
-        MaterialId a, b;
+        MaterialId a;
+        FaceClass fa;
+        MaterialId b;
+        FaceClass fb;
         const char* why;
     };
     const Pair pairs[] = {
-        {MAT_ROCK, MAT_GRAVEL, "a cave wall's two commonest neighbours"},
-        {MAT_BEDROCK, MAT_ROCK, "the deep/shallow rock boundary"},
-        {MAT_SUBSOIL, MAT_TOPSOIL, "the soil profile a dig cuts through"},
-        {MAT_LEAF_BROADLEAF, MAT_LEAF_NEEDLE, "mixed woodland"},
-        {MAT_LEAF_BROADLEAF, MAT_LEAF_JUNGLE, "adjacent biomes' canopies"},
-        {MAT_SAND, MAT_GRAVEL, "the beach/shore boundary"},
-        {MAT_BARK, MAT_BARK_PALE, "birch among oak"},
+        {MAT_ROCK, kFaceTop, MAT_GRAVEL, kFaceTop, "a cave wall's two commonest neighbours"},
+        {MAT_BEDROCK, kFaceTop, MAT_ROCK, kFaceTop, "the deep/shallow rock boundary"},
+        {MAT_SUBSOIL, kFaceTop, MAT_TOPSOIL, kFaceTop, "the soil profile a dig cuts through"},
+        {MAT_SUBSOIL, kFaceTop, MAT_ROCK, kFaceTop, "the stratum contact below the soil"},
+        {MAT_CLAY, kFaceTop, MAT_SUBSOIL, kFaceTop, "fine sediment against generic subsoil"},
+        {MAT_LEAF_BROADLEAF, kFaceTop, MAT_LEAF_NEEDLE, kFaceTop, "mixed woodland"},
+        {MAT_LEAF_BROADLEAF, kFaceTop, MAT_LEAF_JUNGLE, kFaceTop, "adjacent biomes' canopies"},
+        {MAT_BARK, kFaceSide, MAT_HEARTWOOD, kFaceTop, "a felled log: bark beside its cut end"},
+        {MAT_BARK, kFaceSide, MAT_BARK_PALE, kFaceSide, "birch among oak"},
     };
     for (const Pair& p : pairs) {
-        const Rgb& x = kMaterialPalette[p.a].face[kFaceTop];
-        const Rgb& y = kMaterialPalette[p.b].face[kFaceTop];
+        const Rgb& x = kMaterialPalette[p.a].face[p.fa];
+        const Rgb& y = kMaterialPalette[p.b].face[p.fb];
         const int d = std::abs(int(x.r) - int(y.r)) + std::abs(int(x.g) - int(y.g)) +
                       std::abs(int(x.b) - int(y.b));
         CHECK_MSG(d >= 24, "two materials that meet in the world are the same colour");
