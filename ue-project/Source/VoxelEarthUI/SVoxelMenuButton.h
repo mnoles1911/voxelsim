@@ -50,6 +50,10 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	// This widget holds bare pointers into FVoxelUIStyle (SButton's
+	// FButtonStyle*, SImage's FSlateBrush*), so its lifetime is what that
+	// singleton's Shutdown assertion counts.
+	virtual ~SVoxelMenuButton() override;
 
 	// The inner SButton -- what keyboard focus has to land on.
 	//

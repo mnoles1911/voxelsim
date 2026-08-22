@@ -38,8 +38,14 @@ int32 PanelIndex(EVoxelMenuPanel Panel)
 }
 } // namespace SVoxelMainMenuDetail
 
+SVoxelMainMenu::~SVoxelMainMenu()
+{
+	FVoxelUIStyle::UnregisterWidget();
+}
+
 void SVoxelMainMenu::Construct(const FArguments& InArgs)
 {
+	FVoxelUIStyle::RegisterWidget();
 	using namespace VoxelUITheme;
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();
@@ -583,10 +589,10 @@ void SVoxelMainMenu::ShowPanel(EVoxelMenuPanel Panel)
 	if (PanelSwitcher.IsValid())
 	{
 		const int32 Index = SVoxelMainMenuDetail::PanelIndex(Panel);
-		// Clamped because the sub-panels land in a later step: asking a
-		// two-slot switcher for slot 3 would assert, and a menu that crashes
-		// on its own SETTINGS button is a worse failure than one that ignores
-		// it.
+		// Clamped defensively. Every enumerator has a slot today, so this is a
+		// no-op -- but PanelIndex and the slot list are two things that have to
+		// agree, and a menu that crashes on its own SETTINGS button is a worse
+		// failure than one that shows the wrong panel.
 		PanelSwitcher->SetActiveWidgetIndex(FMath::Clamp(Index, 0, PanelSwitcher->GetNumWidgets() - 1));
 	}
 	FocusDefaultWidget();

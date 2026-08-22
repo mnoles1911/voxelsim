@@ -40,6 +40,10 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	// This widget holds bare pointers into FVoxelUIStyle (SButton's
+	// FButtonStyle*, SImage's FSlateBrush*), so its lifetime is what that
+	// singleton's Shutdown assertion counts.
+	virtual ~SVoxelLoadingScreen() override;
 
 	// Called each time the screen appears. Reshuffles the background, quip and
 	// tip orders -- the Godot build shuffles all three fresh on every show, so
@@ -49,7 +53,6 @@ public:
 	// 0..1. The caller is responsible for the monotone clamp and the
 	// elapsed-time floor; this widget just draws what it is given.
 	void SetProgress(float InProgress) { Progress = FMath::Clamp(InProgress, 0.f, 1.f); }
-	float GetProgress() const { return Progress; }
 
 	// Drives the fade in and out of the whole curtain.
 	void SetCurtainOpacity(float InOpacity) { CurtainOpacity = FMath::Clamp(InOpacity, 0.f, 1.f); }
@@ -111,5 +114,9 @@ private:
 	FText CachedFpsText;
 	bool bFpsWorstIsBad = false;
 
+	// Held rather than discarded: the widget drives itself from the Progress
+	// attribute, so nothing reads this today, but a handle to the one piece of
+	// this screen with its own simulation is worth having when something needs
+	// to be reset or paused.
 	TSharedPtr<class SVoxelHourglass> Hourglass;
 };

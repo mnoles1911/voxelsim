@@ -41,8 +41,14 @@ TArray<int32> ShuffledIndices(int32 Count, FRandomStream& Stream)
 }
 } // namespace SVoxelLoadingDetail
 
+SVoxelLoadingScreen::~SVoxelLoadingScreen()
+{
+	FVoxelUIStyle::UnregisterWidget();
+}
+
 void SVoxelLoadingScreen::Construct(const FArguments& InArgs)
 {
+	FVoxelUIStyle::RegisterWidget();
 	using namespace VoxelUITheme;
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	const FVoxelMenuLayout& L = FVoxelMenuLayout::Get();

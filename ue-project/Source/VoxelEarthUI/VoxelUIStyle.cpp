@@ -14,6 +14,9 @@ namespace VoxelUIStyleDetail
 
 TUniquePtr<FVoxelUIStyle> GInstance;
 
+// Front-end widgets alive right now; see FVoxelUIStyle::RegisterWidget.
+int32 GLiveWidgets = 0;
+
 const TCHAR* const kSerifRelativePath = TEXT("UI/Fonts/MacondoSwashCaps-Regular.ttf");
 
 // A 1x1 opaque white box, tinted per use. Every flat colour in this front end
@@ -59,7 +62,30 @@ void FVoxelUIStyle::Startup()
 
 void FVoxelUIStyle::Shutdown()
 {
+	// NOT A check(). A module unloading with widgets still on the viewport is
+	// a real ordering bug and worth shouting about, but taking the process
+	// down at shutdown -- when the thing being torn down is a menu -- would
+	// turn a cosmetic risk into a crash report. The log line is what makes it
+	// findable; the dangling read, if it happens at all, happens after this.
+	if (VoxelUIStyleDetail::GLiveWidgets != 0)
+	{
+		UE_LOG(LogVoxelUI, Error,
+		       TEXT("FVoxelUIStyle::Shutdown with %d front-end widget(s) still alive. SButton and SImage hold BARE ")
+		       TEXT("pointers into this style, so any further paint of them reads freed memory. Something is tearing ")
+		       TEXT("the module down before the viewport."),
+		       VoxelUIStyleDetail::GLiveWidgets);
+	}
 	VoxelUIStyleDetail::GInstance.Reset();
+}
+
+void FVoxelUIStyle::RegisterWidget()
+{
+	++VoxelUIStyleDetail::GLiveWidgets;
+}
+
+void FVoxelUIStyle::UnregisterWidget()
+{
+	--VoxelUIStyleDetail::GLiveWidgets;
 }
 
 FVoxelUIStyle& FVoxelUIStyle::Get()

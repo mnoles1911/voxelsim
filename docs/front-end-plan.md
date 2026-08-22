@@ -177,7 +177,17 @@ of loading and lose the session.
 
 ## Known-unverified
 
-Nothing here has been compiled or photographed. Two claims are specifically
+**If you are the session that can build: read
+[`front-end-local-verification-handoff.md`](front-end-local-verification-handoff.md)
+first.** It sequences everything below and names the four places a first build
+is most likely to break.
+
+Nothing here has been compiled or photographed. One thing HAS been checked
+without an engine: the hourglass geometry was rasterised from the same formulas
+`SVoxelHourglass::OnPaint` encodes, and the sand stays inside the glass at every
+progress value, the mound reaches the waist exactly at 1.0, and the caps and
+pillars are symmetric about the diamond. That validates the maths, not the
+Slate path that draws it. Two claims are specifically
 open:
 
 - **Colour round-trip.** `FLinearColor(FColor)` decodes sRGB and Slate

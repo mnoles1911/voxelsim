@@ -1459,6 +1459,10 @@ written in has no UE 5.8 install, and CI cannot compile the module either
 (`ue-build.yml` is gated off — 30 GB engine, 14 GB runner disk). The two lints
 that DO run in CI pass. Treat the first item as blocking.
 
+0. **Read `docs/front-end-local-verification-handoff.md` first.** It sequences
+   the items below, names the four API shapes most likely to fail a first
+   build, and flags one bug class (`DoesSupportWorldType`) that would compile
+   silently and stop working — in the pre-existing `UVoxelWorldSubsystem` too.
 1. **Build it, then run the capture set.** `tools\voxel-ui-capture.ps1 -Shot Menu`
    and its siblings. First contact with a compiler will find things; the module
    is ~3,500 lines of Slate that has never seen one.

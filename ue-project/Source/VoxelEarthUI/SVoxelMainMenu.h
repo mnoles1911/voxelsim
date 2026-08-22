@@ -59,6 +59,10 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	// This widget holds bare pointers into FVoxelUIStyle (SButton's
+	// FButtonStyle*, SImage's FSlateBrush*), so its lifetime is what that
+	// singleton's Shutdown assertion counts.
+	virtual ~SVoxelMainMenu() override;
 
 	// Rebuilds the LOAD GAME list and, with it, the enabled state of CONTINUE
 	// and LOAD GAME -- MainMenu.gd::_show_main_column disables both whenever
@@ -103,7 +107,6 @@ private:
 	// in the panel HAS focus; these are what give it that starting point when a
 	// panel opens, so a player can drive the whole menu from a gamepad without
 	// touching the mouse first.
-	TSharedPtr<class SVoxelMenuButton> FirstColumnButton;
 	TSharedPtr<class SVoxelMenuButton> LoadPanelCancelButton;
 	TArray<TSharedPtr<class SVoxelMenuButton>> ColumnButtons;
 	// One per message panel. A single shared pointer would end up holding

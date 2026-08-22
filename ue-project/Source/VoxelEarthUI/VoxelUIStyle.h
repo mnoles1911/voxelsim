@@ -25,6 +25,18 @@ public:
 	static void Shutdown();
 	static FVoxelUIStyle& Get();
 
+	// Live widget count, for Shutdown's assertion.
+	//
+	// SButton STORES THE FButtonStyle* AND SImage STORES THE FSlateBrush*, as
+	// bare pointers into this singleton. That is how Slate works and is fine
+	// while the singleton outlives the widgets -- but nothing enforces that
+	// ordering, and the failure if it inverts is a paint reading freed memory,
+	// which is the kind of crash that gets blamed on the renderer for a week.
+	// Front-end widgets register here on construction and unregister on
+	// destruction, and Shutdown() says so loudly if any are left.
+	static void RegisterWidget();
+	static void UnregisterWidget();
+
 	// The Macondo Swash Caps face at a pixel size, or the engine's default
 	// face if the .ttf could not be found. IsProjectFontAvailable() says which
 	// -- the front end logs it once and -VoxelUINoAssets forces the fallback,

@@ -74,8 +74,10 @@ struct VOXELEARTHUI_API FVoxelFrontEndSwitches
 	// Parsed once on first call.
 	static const FVoxelFrontEndSwitches& Get();
 
-	// True when any switch here drives the run itself -- used to decide
-	// whether the front end should quit after its capture.
+	// True when any switch here drives the run itself. Each capture path arms
+	// its own quit, so nothing consults this yet; it is the predicate a future
+	// caller wanting "is this a capture run at all" should use rather than
+	// re-deriving the disjunction.
 	bool IsCaptureRun() const { return bMenuShot || bLoadingShot || bHourglassShot; }
 };
 

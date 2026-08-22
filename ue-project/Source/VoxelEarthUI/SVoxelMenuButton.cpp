@@ -30,8 +30,14 @@ FAutoConsoleVariableRef CVarHoverSlide(TEXT("voxel.UI.HoverSlide"),
 constexpr float kBorderPx = 2.f;
 } // namespace SVoxelMenuButtonDetail
 
+SVoxelMenuButton::~SVoxelMenuButton()
+{
+	FVoxelUIStyle::UnregisterWidget();
+}
+
 void SVoxelMenuButton::Construct(const FArguments& InArgs)
 {
+	FVoxelUIStyle::RegisterWidget();
 	using namespace VoxelUITheme;
 	const FVoxelUIStyle& Style = FVoxelUIStyle::Get();
 	TextColorOverride = InArgs._TextColorOverride;
