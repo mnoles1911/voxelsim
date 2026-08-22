@@ -158,6 +158,50 @@ changes almost nothing (holes 2,368 → 2,356).
 **Phase 1 is a throughput consumer, not a throughput fix. It needs Tier B first.** That
 inverts the last handoff's ordering, and the table above is the reason.
 
+### 3.1 The hole metric now exists, is certified, and measures the owner's complaint
+
+`voxel.March.HoleStats 1` (default off). `uncovered` = no hit anywhere + the ray crossed
+an ABSENT chunk (not merely an empty one) + it points below the horizon. `substituted` =
+a hit that came from a level coarser than the segment owning that ground, so it counts
+HITS and the sky cannot contaminate it.
+
+**Certified in both directions before being used** — a gate that cannot come out the other
+way is worthless:
+
+| condition | uncovered |
+|---|---|
+| settled, stationary | **0.0302% of rays** |
+| `-VoxelMaxRingLevel=0` (ring 0 only) | **8.2479% of rays** |
+
+273x separation. Then the number that matters:
+
+| condition | uncovered | substituted |
+|---|---|---|
+| settled, stationary | 0.0302% | 0 |
+| **flying at 30 m/s** | **3.9853%** | 0 |
+
+**132x more holes in motion than at rest. That is the owner's complaint, in a number.**
+The coverage verifier says `holes=0` in the same legs — it checks the DESIRED set is
+resident, which is a different question from whether a ray found ground.
+
+### 3.2 Phase 1 re-tested at the higher throughput — it substitutes, and still does not help
+
+With the pipeline now 60% faster, hierarchical coverage plus fallthrough was re-run:
+
+| | frames | p50 | p95 | brickPacks | uncovered | substituted |
+|---|---|---|---|---|---|---|
+| default | 11,949 | 21.55 ms | 32.69 ms | 752,707 | 3.9853% | 0 |
+| + hierarchical + fallthrough 1 | 11,087 | 22.72 ms | 39.19 ms | 829,270 | **4.1363%** | **0.1129%** |
+
+**Fallthrough is now demonstrably working** — 77,453 hits served by a coarser level, up
+from exactly 0. And `uncovered` did not fall; it rose slightly. The substitution rate
+(0.11% of hits) is two orders of magnitude too small to dent a 4% hole rate, because the
+coarse levels are not resident at the leading edge either — the +49% residency demand is
+still not met where it matters. **Stays off.** The next attempt should target residency at
+the leading edge specifically, not total coverage.
+
+---
+
 ---
 
 ## 4. Authored, merged, default-off, NOT yet measured
@@ -179,14 +223,12 @@ inverts the last handoff's ordering, and the table above is the reason.
 2. **Find the new ceiling.** Pass count is out (§2.6) and the index copy is gone. Take a
    fresh `voxel.Stream.FrameAttribution` leg rather than assuming — every assumption about
    this pipeline that was not re-measured today turned out to be wrong.
-3. **A hole metric that cannot count the sky** — authored, unmerged (`voxel.March.HoleStats`).
-   The naive "ray exited with no hit" counts every sky ray. `substituted` (a hit from a
-   level coarser than the segment owning that ground — counts HITS, so sky cannot
-   contaminate it) and `uncovered` (no hit + crossed an ABSENT chunk + pointing below the
-   horizon). Certify it can move BOTH ways before gating on it: `-VoxelMaxRingLevel=0`
-   must make `uncovered` large, a settled stationary world must make it near zero.
-4. **Re-test Phase 1** against the throughput it now has. It failed at 2,760 chunks/s
-   because nothing coarse was resident to fall through to; at 4,392 that may change.
+3. **Drive `uncovered` down from 3.99% while flying** (§3.1). That is now the goal with a
+   number on it. Phase 1 was the wrong lever (§3.2); the metric says the shortfall is
+   residency at the LEADING EDGE, so target admission order and prefetch along the
+   velocity vector rather than total coverage. `voxel.Stream.SpeculativeParkBricks 1`
+   (§2.4) is the closest thing already in the tree and is worth re-measuring against
+   `uncovered` specifically — it was judged on throughput, which was the wrong gate.
 5. **Blue speckling** — a full diagnosis exists at
    `scratchpad/blue-speckling-diagnosis.md`. Its headline: no material or palette index is
    mip-averaged anywhere (the prime suspect is CLEARED), and in this renderer "a pixel that
