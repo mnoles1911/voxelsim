@@ -112,7 +112,7 @@ Everything here was taken this session, matched legs, quiet box.
    game-thread bucket at 853 ms of a 1,450 ms tick (59%), and the dispatch loop now exits
    on an empty queue 60% of the time. Once P1-P3 land, admission is what will bind. Do not
    be surprised by it, and do not start on it first — it is not binding yet.
-4. **More throughput did not reduce holes.** +52% chunks/s took `uncovered` 3.99% → 4.97%.
+5. **More throughput did not reduce holes.** +52% chunks/s took `uncovered` 3.99% → 4.97%.
    Holes are an admission-ORDER problem. **`uncovered`, not chunks/s, is the gate that
    matters to the owner.**
 
