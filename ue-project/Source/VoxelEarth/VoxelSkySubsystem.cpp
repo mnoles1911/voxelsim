@@ -279,6 +279,80 @@ namespace
 		TEXT("which is also the A/B control for 'how much of the night frame is moonlight'."),
 		ECVF_Default);
 
+	// --- WHERE THE MOON IS TONIGHT, as a knob -------------------------------
+	//
+	// THE DEFECT THIS EXISTS FOR (owner-reported 2026-08-23, "no moon is visible
+	// at any point in the night"). Nothing about the moon was broken. The clock
+	// is DETERMINISTIC -- SolveEpochFor lands on epoch 37800.000 s in every
+	// single run, which both of the owner's PIE logs print verbatim -- so every
+	// session gets the SAME moon, and at that epoch the moon spends the whole
+	// first evening below the horizon.
+	//
+	// MEASURED OFF THE OWNER'S OWN LOG, not asserted. Re-deriving ComputeMoon
+	// against epoch 37800 s at the shipped DayLength 3600 s / DaysPerYear 48 /
+	// 52 N puts moonrise at wall-clock +29.33 min from PIE start (game 23:44).
+	// Saved/Logs/VoxelEarth.log records the moon at altitude -1.00 deg at wall
+	// +28.9 min and the session ending seconds later; the 2026-08-22 log is the
+	// same run with the same numbers. So the sun sets at wall +15.7 min and the
+	// player gets FOURTEEN MINUTES of moonless night before a moon appears -- and
+	// then only low in the east. That is not a rendering bug and no amount of
+	// staring at the disc code would have found it.
+	//
+	// WHAT THIS KNOB DOES. It adds days to the MOON'S OWN slow clock and nothing
+	// else -- the sun, the star field, the calendar date and the exposure curve
+	// are all driven from the untouched JulianDay, so they cannot move. The moon's
+	// longitude runs at 13.176 deg/day and its argument of latitude at 13.229
+	// deg/day (ComputeMoon), so one day of offset walks the moon ~13.2 deg east
+	// along its own arc -- i.e. it rises ~53 min of game time EARLIER per day of
+	// NEGATIVE offset -- and moves the phase by 1/29.53 of a cycle. Both move
+	// together, which is correct and is the point: a moon that rises at dusk IS a
+	// nearly-full moon, and one that rises at dawn IS a thin crescent. A knob that
+	// moved the position without the phase would draw a moon that cannot exist.
+	//
+	// USEFUL VALUES, re-derived over the FIRST game night (which runs from wall
+	// +15.7 min, sunset, to wall +44.7 min, sunrise, at the shipped epoch). Moon
+	// altitude / azimuth / illuminated fraction, sampled just after sunset and
+	// again a third of the way through the night:
+	//
+	//     offset      wall +18 min            wall +35 min
+	//      0.0    -24.1 deg  (below)  87%   +16.5 deg az 150   75%   <- SHIPS
+	//     -2.0     -1.7 deg  (rising) 98%   +28.7 deg az 175   92%
+	//     -3.0     +9.5 deg  az  99  100%   +32.8 deg az 190   97%
+	//     -4.0    +20.5 deg  az 106   99%   +35.2 deg az 205   99%
+	//     -6.0    +41.5 deg  az 125   90%   +33.7 deg az 237   97%
+	//
+	// So -3 puts a FULL moon low in the east at dusk and carries it up through
+	// the night, which is the sky the report was about. -4 starts it higher. 0 is
+	// what shipped: nothing at all until nearly half an hour in.
+	//
+	// THESE ARE ARITHMETIC, NOT SCREENSHOTS. The re-derivation reproduces the
+	// owner's log to within half a minute on the one crossing that log contains,
+	// which is why they are written down; nobody has yet looked at any of them on
+	// a frame.
+	//
+	// DEFAULT 0.0 IS THE SHIPPED SKY, BIT FOR BIT. At 0 the expression below adds
+	// a literal zero to the continuous day count and every number downstream is
+	// the one that shipped, so this cvar cannot change a pixel until it is set.
+	//
+	// LIVE, and read every frame in Tick rather than latched at Initialize, which
+	// is what makes it usable at all: the whole reason this defect took two
+	// sessions to see is that nobody wants to fly for 29 minutes to find out
+	// whether the moon draws. -ExecCmds reaches it for the same reason (Tick, not
+	// Initialize) -- unlike -VoxelTimeOfDay, which must be a command-line switch
+	// because it IS read in Initialize.
+	TAutoConsoleVariable<float> CVarSkyMoonEpochOffsetDays(
+		TEXT("voxel.Sky.MoonEpochOffsetDays"), 0.0f,
+		TEXT("Days added to the MOON's own slow clock, moving it along its arc and through its ")
+		TEXT("phases without touching the sun, the stars, the date or the exposure curve. Default ")
+		TEXT("0 = the shipped sky exactly. NEGATIVE brings moonrise EARLIER: the moon walks 13.18 ")
+		TEXT("deg/day along its orbit, so -1 day is about 53 minutes of game time earlier, and the ")
+		TEXT("phase moves with it (1/29.53 of a cycle per day) because a dusk-rising moon IS a ")
+		TEXT("nearly-full one. WHY IT EXISTS: at the shipped fixed epoch the moon does not rise ")
+		TEXT("until wall-clock +29.3 min into every session, which is why 'there is no moon' was ")
+		TEXT("reported twice. Clamped so the moon's Julian day stays positive; a non-positive one ")
+		TEXT("makes ComputeMoon silently fall back to the stepped clock."),
+		ECVF_Default);
+
 	TAutoConsoleVariable<float> CVarSkySunIntensity(
 		TEXT("voxel.Sky.SunIntensity"), kSunOuterSpaceIntensity,
 		TEXT("The sun's OUTER-SPACE illuminance -- what the light carries ABOVE the atmosphere, not ")
@@ -547,6 +621,84 @@ namespace
 		TEXT("God rays and lit fog live here. Requires voxel.Sky.Fog 1 and r.VolumetricFog 1."),
 		ECVF_Default);
 
+	// =========================================================================
+	// THE AMBIENT TERM IS BEING INTEGRATED FROM 2187.6 m BELOW THE PLAYER, AND
+	// SINCE 2026-08-20 IT HAS BEEN INTEGRATED FROM INSIDE A FOG WALL.
+	//
+	// The two cvars below are the two arms of that, and BOTH DEFAULT TO WHAT
+	// SHIPS. Nothing here changes a pixel until one of them is set. They are
+	// separate switches rather than one because they are two different mistakes
+	// and the owner has to be able to see which one moves the picture.
+	//
+	// WHAT WAS READ, not inferred:
+	//
+	//   * SpawnRig places the SkyLight at (SpawnColumnXUU, SpawnColumnYUU, 0.0).
+	//     The X and Y were fixed -- the comment there records that fix at length,
+	//     because the pre-W4 rig left the light at the world origin. THE Z WAS
+	//     NEVER PART OF THAT FIX and has been 0 since. The owner's own log says
+	//     the spawn column's ground is at z = 2187.6 m.
+	//   * The real-time capture is rendered FROM the SkyLight component's world
+	//     location: USkyLightComponent::SendRenderTransform_Concurrent copies
+	//     GetComponentTransform().GetLocation() into FSkyLightSceneProxy::
+	//     CapturePosition (SkyLightComponent.cpp:546-560), and
+	//     ReflectionEnvironmentRealTimeCapture.cpp:557 uses that as the cube
+	//     view's ViewOrigin. So the ambient term the whole world is lit by is
+	//     the sky as seen from 2187.6 m below where the player stands.
+	//   * Height fog IS rendered into that capture unless the component says
+	//     otherwise: SetupFogUniformParameters substitutes dummy fog parameters
+	//     for the capture ONLY when ExponentialFogs[0].bVisibleInRealTimeSkyCaptures
+	//     is false (FogRendering.cpp:135), and that flag defaults to TRUE
+	//     (ExponentialHeightFogComponent.cpp's constructor).
+	//   * The fog's density at a viewpoint is Density * 2^(-HeightFalloff *
+	//     (ObserverZ - FogHeight)) with HeightFalloff scaled by 1/1000
+	//     (SceneCore.cpp:403-406, FogRendering.cpp:396-403). The fog is anchored
+	//     at the spawn column's ground, so at the capture's z = 0 that exponent
+	//     is (0.05/1000) * 218760 = 10.94 and the density there is
+	//     0.008 * 2^10.94 = 15.7 -- ONE THOUSAND NINE HUNDRED AND SIXTY TIMES
+	//     the 0.008 the player is standing in.
+	//
+	// THAT ARITHMETIC IS ARITHMETIC. What it does to the picture is NOT measured
+	// and is not claimed here: no leg in this project has ever rendered a night
+	// frame (every one pins TimeScale 0 at 12:00), so the exposure ladder's night
+	// rungs were calibrated against an ambient term that the fog work of
+	// 2026-08-20 then changed underneath them, and nothing has re-shot them. The
+	// owner reports the ground reading BRIGHTER at night than by day, which is
+	// what an ambient term that no longer falls with the sky would produce
+	// against a curve that lifts the night frame 4.77 stops (13.60 EV against the
+	// day's 8.83). It is a candidate, not a diagnosis -- see the capture sweep in
+	// the report that shipped these.
+	//
+	// WHY NOT JUST FIX IT. Because "fix" here means "change every night frame in
+	// the game" on the strength of an exponent, and this project's rule is that
+	// appearance is the owner's call on a screenshot. Default 0 / default 1 keep
+	// today's frame exactly; the arms exist so the A/B can be shot.
+	TAutoConsoleVariable<int32> CVarSkySkyLightAtGroundZ(
+		TEXT("voxel.Sky.SkyLightAtGroundZ"), 0,
+		TEXT("Where the SkyLight's real-time capture is taken from. 0 = z=0, sea level, WHICH IS ")
+		TEXT("WHAT SHIPS (default) -- 2187.6 m below the spawn column's ground at the shipped seed. ")
+		TEXT("1 = the spawn column's ground, i.e. where the player actually stands, from the same ")
+		TEXT("GetSurfaceHeightUU the height fog's own reference uses. This moves the ambient term ")
+		TEXT("that lights EVERY surface in the world, and at night it is the only thing lighting ")
+		TEXT("them, so it is a whole-frame change and is judged on a screenshot. Pairs with ")
+		TEXT("voxel.Sky.FogInSkyCapture: at z=0 the capture also sits in fog 1960x denser than the ")
+		TEXT("player's. LIVE -- moving the light re-points the real-time capture within a frame or ")
+		TEXT("two and logs the new altitude read back off the actor. It has to be live: ")
+		TEXT("tools/voxel-capture.ps1 passes -Cvars through -ExecCmds, which lands AFTER BeginPlay, ")
+		TEXT("so a spawn-time-only switch could not be reached by the sweep meant to judge it."),
+		ECVF_Default);
+
+	TAutoConsoleVariable<int32> CVarSkyFogInSkyCapture(
+		TEXT("voxel.Sky.FogInSkyCapture"), 1,
+		TEXT("Whether the atmospheric height fog is rendered into the SkyLight's real-time capture. ")
+		TEXT("1 = yes, WHICH IS THE ENGINE DEFAULT AND WHAT SHIPS. 0 = the capture sees the sky and ")
+		TEXT("the fog only affects the main view. This is the control arm for 'is the night ambient ")
+		TEXT("term the sky or the fog': the capture is taken at z=0 where the fog is 1960x denser ")
+		TEXT("than at the player (see the block above this cvar for the exponent), so at 1 the ")
+		TEXT("cubemap is largely the fog's own colour rather than the sky's. LIVE -- re-applied ")
+		TEXT("every frame by ApplyFogFromState and logged on change, so it can be flipped inside one ")
+		TEXT("session. Note this is a property of the FOG, so it does nothing at voxel.Sky.Fog 0."),
+		ECVF_Default);
+
 	// --- the star ambient calibration ----------------------------------------
 	//
 	// THE ONE CONSTANT THAT TIES "HOW BRIGHT STARS LOOK" TO "HOW MUCH THEY LIGHT
@@ -773,6 +925,26 @@ namespace VoxelSky
 	// that must never leave the scene.
 	float GetMoonIntensity() { return FMath::Max(0.f, CVarSkyMoonIntensity.GetValueOnAnyThread()); }
 
+	// CLAMPED, AND THE CLAMP IS LOAD-BEARING RATHER THAN DEFENSIVE. ComputeMoon
+	// treats a SlowJulianDay <= 0 as "no continuous clock supplied" and falls
+	// back to the STEPPED Julian day -- silently, with no log line -- which is
+	// exactly the teleporting moon that fix was written to remove. The game clock
+	// starts at JD 2451544.5, so anything past about -2.45e6 days would cross
+	// that sentinel; +/- 2.0e5 days (about 548 game years of lunar motion, and
+	// 6800 synodic months) is far more travel than any judgement needs and leaves
+	// the sentinel unreachable by a fat-fingered exponent.
+	//
+	// NaN derives the same way ResolveStarAmbientGain's does: FMath::Clamp on a
+	// NaN returns the NaN, so it is tested for explicitly. A NaN here reaches the
+	// moon's longitude, then its direction, then the MPC vector M_NightSky dots
+	// against the view -- and a NaN moon direction does not draw a wrong moon, it
+	// blanks the star dome.
+	double GetMoonEpochOffsetDays()
+	{
+		const float Requested = CVarSkyMoonEpochOffsetDays.GetValueOnAnyThread();
+		return FMath::IsFinite(Requested) ? (double)FMath::Clamp(Requested, -2.0e5f, 2.0e5f) : 0.0;
+	}
+
 	// Clamped to a band whose ENDS are both failure modes rather than tastes. Below
 	// 0.05 deg the disc is under two pixels at 2200x1300 and the smoothstep limb
 	// (MoonEdgeSoftness, 12% of the radius) has no pixels left to feather across,
@@ -810,6 +982,14 @@ namespace VoxelSky
 	float GetExposureBias() { return CVarSkyExposureBias.GetValueOnAnyThread(); }
 
 	bool IsDomeEnabled() { return CVarSkyDomeEnabled.GetValueOnAnyThread() != 0; }
+
+	// The two ambient-term arms. Both read as plain bools with no clamping to do,
+	// and both are named here rather than read at their use sites for the reason
+	// the header gives for every accessor in this block: a cvar four files can
+	// reach is a value four files interpret four ways.
+	bool IsSkyLightAtGroundZ() { return CVarSkySkyLightAtGroundZ.GetValueOnAnyThread() != 0; }
+
+	bool IsFogInSkyCapture() { return CVarSkyFogInSkyCapture.GetValueOnAnyThread() != 0; }
 
 	// Floored at 1e6 UU (10 km) purely so that a fat-fingered 0 or a negative
 	// value cannot collapse the dome to a point at the camera, which renders as a
@@ -2123,6 +2303,25 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 	Impl->ObserverXUU = SpawnColumnXUU;
 	Impl->ObserverYUU = SpawnColumnYUU;
 
+	// THE SPAWN COLUMN'S GROUND HEIGHT, RESOLVED ONCE AND SHARED. It used to be
+	// derived inside the height-fog block below, with a comment saying "derived
+	// here rather than passed in: this is the only consumer". That stopped being
+	// true the moment voxel.Sky.SkyLightAtGroundZ existed, and TWO copies of a
+	// ground height is precisely how the sky's pieces end up at two different
+	// altitudes -- which is the defect that cvar exists for in the first place.
+	// One query, one number, both consumers.
+	//
+	// GetSurfaceHeightUU is the PURE WORLDGEN column surface, the same source
+	// every other spawn-height decision in this project uses. A missing terrain
+	// subsystem (stripped configs, the transient loading world) degrades to Z=0,
+	// i.e. sea level, which is the least-wrong constant available and is named in
+	// the fog's ran-flag line either way.
+	SpawnGroundZUU = 0.0;
+	if (UVoxelWorldSubsystem* TerrainForRig = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
+	{
+		SpawnGroundZUU = TerrainForRig->GetSurfaceHeightUU(SpawnColumnXUU, SpawnColumnYUU);
+	}
+
 	// --- sun ---------------------------------------------------------------
 	SunLight = World.SpawnActor<ADirectionalLight>();
 	if (SunLight)
@@ -2325,7 +2524,41 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		//
 		// Placed AFTER the mobility change above, not before: moving a Stationary
 		// root at runtime is refused, so the order here is load-bearing.
+		//
+		// --- AND THE Z, WHICH THAT FIX NEVER TOUCHED --------------------------
+		//
+		// The paragraph above is about X and Y. The Z has been a literal 0 --
+		// SEA LEVEL -- since this rig was written, while the spawn column's
+		// ground at the shipped seed is 2187.6 m up. The real-time capture is
+		// rendered from this exact location (USkyLightComponent::
+		// SendRenderTransform_Concurrent copies it into FSkyLightSceneProxy::
+		// CapturePosition, SkyLightComponent.cpp:546-560, and
+		// ReflectionEnvironmentRealTimeCapture.cpp:557 uses it as the cube view's
+		// ViewOrigin), so the ambient term every surface in the world is lit by
+		// is the sky as seen from two kilometres below the player's feet.
+		//
+		// THAT WAS SURVIVABLE UNTIL THE HEIGHT FOG LANDED (2026-08-20). The fog is
+		// anchored at the spawn column's ground and thickens downward, so at z=0
+		// its density is 0.008 * 2^((0.05/1000) * 218760) = 15.7 against the
+		// 0.008 the player stands in. The capture is taken from inside that. The
+		// full derivation and the engine file:lines are at
+		// voxel.Sky.SkyLightAtGroundZ; the short version is that the term which
+		// lights the world at night is being integrated from the wrong altitude
+		// by 2187.6 m and through 1960x the fog.
+		//
+		// DEFAULT 0 KEEPS THE 0.0. This is a whole-frame appearance change and
+		// this project's rule is that appearance is settled on a screenshot, not
+		// by an exponent in a comment -- and the exposure ladder's night rungs
+		// were calibrated against the ambient term as it is TODAY, so moving it
+		// silently would invalidate a measured curve with nothing in the log to
+		// say so. The switch is here so the A/B can be shot; it is not here
+		// because anyone has looked at it yet.
+		// The X and Y are set here; the Z is set by ApplySkyLightPlacement, which
+		// runs now and again on every change of voxel.Sky.SkyLightAtGroundZ. One
+		// function owns the placement so the spawn path and the live path cannot
+		// disagree about where this light is.
 		SkyLightActor->SetActorLocation(FVector(SpawnColumnXUU, SpawnColumnYUU, 0.0));
+		ApplySkyLightPlacement();
 	}
 
 	// --- atmosphere + the exposure post-process, on one actor ---------------
@@ -2381,17 +2614,12 @@ void UVoxelSkySubsystem::SpawnRig(UWorld& World)
 		// A relative offset to the spawn column's ground puts the reference
 		// where the player is, same discipline as every other rig placement in
 		// this function.
-		// Derived here rather than passed in: this is the only consumer, and
-		// GetSurfaceHeightUU is the PURE WORLDGEN column surface -- the same
-		// source every other spawn-height decision in this project uses. A
-		// missing terrain subsystem (stripped configs, the transient loading
-		// world) degrades to Z=0, i.e. sea level, which is the least-wrong
-		// constant available and is named in the ran-flag line below either way.
-		double SpawnGroundZUU = 0.0;
-		if (UVoxelWorldSubsystem* TerrainForFog = GetWorld() ? GetWorld()->GetSubsystem<UVoxelWorldSubsystem>() : nullptr)
-		{
-			SpawnGroundZUU = TerrainForFog->GetSurfaceHeightUU(SpawnColumnXUU, SpawnColumnYUU);
-		}
+		// The height itself is SpawnGroundZUU, resolved once at the top of this
+		// function. It used to be derived on this spot under a comment saying the
+		// fog was its only consumer; voxel.Sky.SkyLightAtGroundZ made that false.
+		// SpawnGroundZUU is resolved ONCE at the top of this function and shared
+		// with the SkyLight's placement; see the comment there for why the local
+		// copy that used to live on this line had to go.
 		SkyHeightFog = NewObject<UExponentialHeightFogComponent>(SkyRigActor, TEXT("SkyHeightFog"));
 		SkyHeightFog->SetupAttachment(AtmosphereComp);
 		SkyHeightFog->RegisterComponent();
@@ -2699,8 +2927,21 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// The moon's slow elements run on the UNFLOORED calendar (see ComputeMoon):
 	// same expression as JulianDayFromGameClock without FloorToDouble, so the
 	// two agree to within the fraction the floor discards.
+	// THE OFFSET GOES ON THE SLOW CLOCK ONLY, AND ONLY HERE. voxel.Sky.
+	// MoonEpochOffsetDays exists because the shipped epoch puts moonrise 29.3
+	// minutes of wall clock into every session -- see the cvar's own comment for
+	// the re-derivation and for the two logs it was checked against. Adding it to
+	// SlowJulianDay and nowhere else is what keeps it a MOON knob: the sun, the
+	// star field's sidereal rotation, the date, the day fraction and the whole
+	// exposure curve are driven from JulianDay, which this line does not touch.
+	//
+	// It moves the moon's POSITION and its PHASE together, because ComputeMoon
+	// derives both from the same slow day count -- which is correct, not a
+	// side-effect. A moon that rises at dusk is nearly full and a moon that rises
+	// at dawn is a thin crescent; a knob that moved one without the other would
+	// draw a moon that does not exist.
 	const double SlowJulianDay = VoxelSky::ContinuousJulianDayFromGameClock(
-		Impl->EpochSeconds, DayLength, DaysPerYear);
+		Impl->EpochSeconds, DayLength, DaysPerYear) + VoxelSky::GetMoonEpochOffsetDays();
 	const VoxelSky::FMoonState Moon = VoxelSky::ComputeMoon(JulianDay, Geo, Sun, SlowJulianDay);
 
 	FVoxelSkyState& S = Impl->State;
@@ -2740,6 +2981,11 @@ void UVoxelSkySubsystem::Tick(float DeltaTime)
 	// between the stepped light and the continuous exposure is not observable.
 	ApplyExposureFromState();
 	ApplyFogFromState();
+	// Every frame, and it is a single bool compare unless the cvar moved. Live
+	// for the reason the header's declaration gives: tools/voxel-capture.ps1
+	// routes -Cvars through -ExecCmds, which lands after BeginPlay, so a
+	// spawn-time-only switch is unreachable by the very sweep meant to judge it.
+	ApplySkyLightPlacement();
 
 	// --- the night sky's material parameters, ALSO EVERY frame ---------------
 	//
@@ -3223,12 +3469,89 @@ void UVoxelSkySubsystem::SetUnderwaterFogSuppression(float Weight01)
 	UnderwaterFogSuppression = FMath::IsFinite(Weight01) ? FMath::Clamp(Weight01, 0.0f, 1.0f) : 0.0f;
 }
 
+void UVoxelSkySubsystem::ApplySkyLightPlacement()
+{
+	if (!SkyLightActor)
+	{
+		return;
+	}
+
+	const bool bAtGround = VoxelSky::IsSkyLightAtGroundZ();
+	const int32 Now = bAtGround ? 1 : 0;
+	if (Now == AppliedSkyLightAtGroundZ)
+	{
+		return; // one bool compare per frame in the steady state
+	}
+	AppliedSkyLightAtGroundZ = Now;
+
+	const FVector Current = SkyLightActor->GetActorLocation();
+	SkyLightActor->SetActorLocation(FVector(Current.X, Current.Y, bAtGround ? SpawnGroundZUU : 0.0));
+
+	// READ BACK off the actor, never echoed from the request. SetActorLocation is
+	// refused outright on a Stationary root -- which is exactly what a regression
+	// in SpawnRig's SetMobility(Movable) line would produce -- and the symptom of
+	// that silent refusal is the whole world lit from the wrong altitude, which
+	// no log line other than this one would ever mention.
+	UE_LOG(LogVoxelSky, Log,
+	       TEXT("VoxelSky SkyLight capture point now z=%.1f m (voxel.Sky.SkyLightAtGroundZ=%d; the ")
+	       TEXT("spawn column's ground is %.1f m, sea level is 0.0 m). THIS IS WHERE THE REAL-TIME ")
+	       TEXT("CAPTURE IS RENDERED FROM (USkyLightComponent::SendRenderTransform_Concurrent -> ")
+	       TEXT("FSkyLightSceneProxy::CapturePosition -> the cube view's ViewOrigin), so it is where ")
+	       TEXT("the ambient term that lights every surface in this world is integrated -- and at ")
+	       TEXT("night, with the moon down, it is the ONLY thing lighting them. At 0 the capture ")
+	       TEXT("also sits far below the height fog's reference height, so it integrates fog rather ")
+	       TEXT("than sky; voxel.Sky.FogInSkyCapture 0 is the other arm of that pair, and the fog's ")
+	       TEXT("own APPLIED line prints the density at both altitudes."),
+	       SkyLightActor->GetActorLocation().Z / 100.0, Now, SpawnGroundZUU / 100.0);
+}
+
 void UVoxelSkySubsystem::ApplyFogFromState()
 {
 	if (!SkyHeightFog)
 	{
 		return;
 	}
+
+	// =====================================================================
+	// THESE CVARS ARE LIVE, AND THEY ALWAYS HAVE BEEN. READ THIS BEFORE
+	// "FIXING" THEM AGAIN.
+	//
+	// The 2026-08-23 report was that voxel.Sky.FogDensity, voxel.Sky.
+	// FogHeightFalloff and voxel.Sky.Fog do nothing when set in a live session,
+	// and the diagnosis filed with it was "read once when the fog component is
+	// configured and never re-applied on change". THAT DIAGNOSIS IS WRONG, and
+	// the evidence is in the reporter's own log:
+	//
+	//   * this function is called from Tick every frame, unconditionally, right
+	//     after ApplyExposureFromState;
+	//   * every one of the three is read HERE, from the cvar, on every one of
+	//     those calls -- not cached, not latched;
+	//   * Saved/Logs/VoxelEarth.log records the console setting them
+	//     (voxel.Sky.FogDensity 0.002 / 0.008 / 0.02 / 0.002, then the falloff,
+	//     then voxel.Sky.Fog 1 and 0) AND records "Sky: volumetric fog tier -1 ->
+	//     1", which is printed from the bottom of this very function. The
+	//     function ran; the cvars changed; the setters below are guarded only by
+	//     an epsilon.
+	//   * UExponentialHeightFogComponent::SetFogDensity and SetFogHeightFalloff
+	//     are the generated UEXPONENTIALHEIGHTFOG_VARIABLE setters and end in
+	//     MarkRenderStateDirty (ExponentialHeightFogComponent.cpp:270-280); they
+	//     carry NO AreDynamicDataChangesAllowed guard, so unlike a light they
+	//     cannot be silently refused by a Static mobility. SetVisibility routes
+	//     through USceneComponent::OnVisibilityChanged, which in 5.8 also marks
+	//     the render state dirty (SceneComponent.cpp:3574) -- checked, because
+	//     UExponentialHeightFogComponent derives from USceneComponent and not
+	//     from UPrimitiveComponent, which is exactly where a setter of this shape
+	//     usually IS inert.
+	//
+	// SO THE SWITCH IS NOT THE INERT PART. What was actually missing is a way to
+	// tell the two possible causes apart: "the value never reached the component"
+	// and "the value reached the component and the fog is not visibly doing
+	// anything" look identical in a log that says nothing at all. The read-back
+	// block at the bottom of this function is the fix for the reported problem,
+	// and it prints the density AT THE OBSERVER as well as the requested one,
+	// because those differ by a factor of 1960 between the player and the
+	// SkyLight's capture position and that is not a difference anyone guesses.
+	// =====================================================================
 
 	// voxel.Sky.Fog 0 must restore the pre-fog frame exactly, same contract as
 	// every other off-switch on this rig. Visibility rather than density-0 so
@@ -3240,6 +3563,20 @@ void UVoxelSkySubsystem::ApplyFogFromState()
 	}
 	if (!bFogOn)
 	{
+		// LOGGED ON THE WAY OUT, not skipped. "voxel.Sky.Fog 0 produced no
+		// change" is one of the three reports this block exists to answer, and a
+		// silent early return is precisely what made it unanswerable. Read back
+		// off the component rather than echoed off the cvar.
+		if (AppliedFogVisible != 0)
+		{
+			AppliedFogVisible = 0;
+			AppliedFogDensity = -1.f; // force a full line when it comes back on
+			UE_LOG(LogVoxelSky, Log,
+			       TEXT("Sky: height fog OFF (voxel.Sky.Fog=0). Component visible flag read back as ")
+			       TEXT("%d. Density and falloff are NOT re-applied while off -- they resume on the ")
+			       TEXT("frame this returns to 1."),
+			       SkyHeightFog->GetVisibleFlag() ? 1 : 0);
+		}
 		return;
 	}
 
@@ -3264,16 +3601,119 @@ void UVoxelSkySubsystem::ApplyFogFromState()
 		SkyHeightFog->SetFogHeightFalloff(Falloff);
 	}
 
-	// The volumetric tier. The checkbox is the per-component request;
-	// r.VolumetricFog (pinned in DefaultEngine.ini) is the global permission;
-	// the grid cvars are set at SetByConsole so they win over scalability the
-	// same way the ini pin does.
+	// The volumetric CHECKBOX is pushed here, ahead of the read-back line below,
+	// purely so that line can report it off the component rather than one frame
+	// stale. The TIER's side effects -- the r.VolumetricFog.* grid cvars -- stay
+	// at the bottom of this function where they were, because they are a
+	// once-per-change sink and not a per-frame push.
 	const int32 Tier = FMath::Clamp(CVarSkyVolumetricFog.GetValueOnGameThread(), 0, 2);
 	const bool bWantVolumetric = Tier >= 1;
 	if (SkyHeightFog->bEnableVolumetricFog != bWantVolumetric)
 	{
 		SkyHeightFog->SetVolumetricFog(bWantVolumetric);
 	}
+
+	// --- does the SkyLight's capture see this fog ----------------------------
+	//
+	// SET DIRECTLY AND DIRTIED BY HAND, because this one has no setter: the
+	// engine exposes bVisibleInRealTimeSkyCaptures as a plain UPROPERTY bitfield
+	// with no Set function (ExponentialHeightFogComponent.h:244-246), unlike
+	// every other value in this function. MarkRenderStateDirty is therefore ours
+	// to call, and it is guarded on the compare so this stays one bit test per
+	// frame rather than a render-state rebuild per frame.
+	//
+	// WHAT IT DECIDES. The renderer substitutes dummy fog parameters into the
+	// real-time sky capture only when this flag is false
+	// (SetupFogUniformParameters, FogRendering.cpp:135); at true -- the engine
+	// default and what ships -- the capture integrates this fog. That matters
+	// here far more than it usually would, because the capture is taken at the
+	// SkyLight's location, which is z=0 by default while this fog is anchored at
+	// the spawn column's ground 2187.6 m higher: the fog at the capture point is
+	// 0.008 * 2^((0.05/1000) * 218760) = 15.7, or 1960x what the player is
+	// standing in. See voxel.Sky.SkyLightAtGroundZ for the whole derivation.
+	const bool bFogInCapture = VoxelSky::IsFogInSkyCapture();
+	if (SkyHeightFog->bVisibleInRealTimeSkyCaptures != bFogInCapture)
+	{
+		SkyHeightFog->bVisibleInRealTimeSkyCaptures = bFogInCapture;
+		SkyHeightFog->MarkRenderStateDirty();
+	}
+
+	// --- the read-back line, which is the actual fix for the 0.0g report ------
+	//
+	// See the long block at the top of this function for why this exists: the
+	// three fog cvars were reported inert, they are not, and the thing that was
+	// genuinely missing was any way to tell "the value never landed" from "the
+	// value landed and the fog is not visibly doing anything".
+	//
+	// EVERY NUMBER HERE IS READ BACK OFF THE COMPONENT. Not one is echoed from
+	// the cvar that was just written, which is the whole point -- an echoed log
+	// would report the request and would have said exactly the same thing on the
+	// broken reading of this defect as on the true one.
+	//
+	// THE OBSERVER DENSITY IS THE NUMBER THAT WAS MISSING. FogDensity is not what
+	// the frame sees; the frame sees Density * 2^(-HeightFalloff/1000 * (ViewZ -
+	// FogZ)) (SceneCore.cpp:403-406 for the /1000, FogRendering.cpp:396-403 for
+	// the exponent), and this world has 2.7 km of relief with the fog pinned to
+	// the spawn column forever. Two altitudes are printed because two things read
+	// this fog and they are 2187.6 m apart: the player, and the SkyLight capture
+	// that supplies the world's ambient term. A fog that is invisible to one and
+	// opaque to the other is not a paradox and should not read like one.
+	const int32 FogInCaptureNow = SkyHeightFog->bVisibleInRealTimeSkyCaptures ? 1 : 0;
+	if (!FMath::IsNearlyEqual(AppliedFogDensity, SkyHeightFog->FogDensity, 1.0e-6f) ||
+		!FMath::IsNearlyEqual(AppliedFogFalloff, SkyHeightFog->FogHeightFalloff, 1.0e-6f) ||
+		AppliedFogVisible != 1 || AppliedFogInSkyCapture != FogInCaptureNow)
+	{
+		AppliedFogDensity = SkyHeightFog->FogDensity;
+		AppliedFogFalloff = SkyHeightFog->FogHeightFalloff;
+		AppliedFogVisible = 1;
+		AppliedFogInSkyCapture = FogInCaptureNow;
+
+		const double FogZUU = SkyHeightFog->GetComponentLocation().Z;
+		// The renderer's own expression, spelled the same way, so the two cannot
+		// drift: exponent = -HeightFalloff * (ObserverZ - FogZ), HeightFalloff
+		// already divided by 1000. Clamped the same way too -- an unclamped
+		// exp2 of a 2 km drop at a fat-fingered falloff overflows to inf and
+		// prints "inf", which reads as a bug in this log line rather than as the
+		// input it is.
+		const double FalloffPerUU = (double)SkyHeightFog->FogHeightFalloff / 1000.0;
+		double ObserverZUU = FogZUU;
+		if (const UWorld* FogWorld = GetWorld())
+		{
+			if (const APlayerController* PC = FogWorld->GetFirstPlayerController())
+			{
+				if (const APlayerCameraManager* Cam = PC->PlayerCameraManager)
+				{
+					ObserverZUU = Cam->GetCameraLocation().Z;
+				}
+			}
+		}
+		const double CameraExp = FMath::Clamp(-FalloffPerUU * (ObserverZUU - FogZUU), -125.0, 126.0);
+		const double CaptureExp = FMath::Clamp(-FalloffPerUU * (0.0 - FogZUU), -125.0, 126.0);
+		const double DensityAtCamera = (double)SkyHeightFog->FogDensity * FMath::Pow(2.0, CameraExp);
+		const double DensityAtCapture = (double)SkyHeightFog->FogDensity * FMath::Pow(2.0, CaptureExp);
+
+		UE_LOG(LogVoxelSky, Log,
+		       TEXT("Sky: height fog APPLIED. Read back off the component: visible=%d, density=%g, ")
+		       TEXT("falloff=%g, volumetric=%d, inRealTimeSkyCapture=%d, reference z=%.1f m. ")
+		       TEXT("Requested voxel.Sky.FogDensity=%g (times %.3f for underwater suppression), ")
+		       TEXT("voxel.Sky.FogHeightFalloff=%g. EFFECTIVE density at the camera (z=%.1f m) is ")
+		       TEXT("%g; at the SkyLight's capture point (z=0.0 m) it is %g. Those last two are what ")
+		       TEXT("the frame and the ambient term actually see, and they are what to read if a ")
+		       TEXT("fog cvar 'did nothing' -- if this line moved, the cvar applied and the answer ")
+		       TEXT("is somewhere else."),
+		       SkyHeightFog->GetVisibleFlag() ? 1 : 0, SkyHeightFog->FogDensity,
+		       SkyHeightFog->FogHeightFalloff, SkyHeightFog->bEnableVolumetricFog ? 1 : 0,
+		       FogInCaptureNow, FogZUU / 100.0,
+		       CVarSkyFogDensity.GetValueOnGameThread(), 1.0f - UnderwaterFogSuppression,
+		       CVarSkyFogHeightFalloff.GetValueOnGameThread(), ObserverZUU / 100.0,
+		       DensityAtCamera, DensityAtCapture);
+	}
+
+	// The volumetric tier's SINK. The checkbox itself is pushed further up (it
+	// moved so the read-back line could report it un-stale); r.VolumetricFog
+	// (pinned in DefaultEngine.ini) is the global permission; the grid cvars are
+	// set at SetByConsole so they win over scalability the same way the ini pin
+	// does. Once per change, not per frame.
 	if (Tier != AppliedVolumetricTier)
 	{
 		if (Tier >= 1)
@@ -3523,13 +3963,33 @@ void UVoxelSkySubsystem::ApplySkyMaterialParams()
 	if (Impl->AppliedMoonUp != MoonUpNow)
 	{
 		Impl->AppliedMoonUp = MoonUpNow;
+		// THE SUN'S ALTITUDE AND THE GAME HOUR ARE ON THIS LINE BECAUSE THE MOON'S
+		// OWN NUMBERS COULD NOT ANSWER THE QUESTION THAT WAS ASKED. "No moon is
+		// visible at any point in the night" (owner, 2026-08-23) is a claim about
+		// the moon AND about the hour, and the old line printed only the moon --
+		// so a reader could see "moon IS UP" and still not know whether it rose
+		// into a night sky or into a blue afternoon, which at DaysPerYear 48 is a
+		// coin toss. Settling it took a Python re-derivation of ComputeMoon
+		// against the epoch printed at startup, for the SECOND time (the first is
+		// recorded above this block, round 15). This line is what stops there
+		// being a third.
+		//
+		// The offset is printed too, and printed from the CLAMPING accessor
+		// rather than echoed off the cvar, for the reason every read-back in this
+		// file is: a capture has to state the sky it actually rendered.
 		UE_LOG(LogVoxelSky, Log,
 		       TEXT("VoxelSky moon %s: altitude %+.2f deg, azimuth %.1f deg, %.0f%% illuminated (phase ")
-		       TEXT("%.3f, 0=new 0.5=full). MoonEnabled=%d, disc radius %.3f deg. A moon BELOW the ")
-		       TEXT("horizon or at ~0%% illuminated is not a bug -- both draw nothing on purpose."),
+		       TEXT("%.3f, 0=new 0.5=full) at game %05.2f h with the SUN at %+.2f deg. MoonEnabled=%d, ")
+		       TEXT("disc radius %.3f deg, voxel.Sky.MoonEpochOffsetDays=%+.3f. A moon BELOW the ")
+		       TEXT("horizon or at ~0%% illuminated is not a bug -- both draw nothing on purpose. At ")
+		       TEXT("offset 0 the shipped epoch puts this crossing at wall-clock +29.3 min into every ")
+		       TEXT("session, identically, because the clock is solved to the same 37800.000 s every ")
+		       TEXT("run; a NEGATIVE offset brings it forward."),
 		       S.bMoonUp ? TEXT("IS UP") : TEXT("has SET"),
 		       S.MoonAltitudeDeg, S.MoonAzimuthDeg, 100.0 * S.MoonIlluminatedFraction,
-		       S.MoonPhaseFraction, VoxelSky::IsMoonEnabled() ? 1 : 0, MoonRadiusDeg);
+		       S.MoonPhaseFraction, S.LocalHours, S.SunAltitudeDeg,
+		       VoxelSky::IsMoonEnabled() ? 1 : 0, MoonRadiusDeg,
+		       VoxelSky::GetMoonEpochOffsetDays());
 	}
 
 	// --- the observer ---------------------------------------------------------
