@@ -26,6 +26,60 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0j Chunks admit LEFT-TO-RIGHT and FAR-BEFORE-NEAR — diagnosed, fix authored, NOT YET IN ANY BINARY
+
+Owner-reported twice, most recently 2026-08-23 while the fix was still in merge:
+*"chunks are still streaming and rendering in from a left to right basis in
+front of player. that still feels wrong in terms of prioritization"*. **He is
+right, and what he is seeing is expected — the fix has never been built.** It
+conflicts with Phase 2 in three places inside `AddCandidate` and is being
+integrated. Do not treat a sighting of this symptom as the fix failing until a
+binary containing `-VoxelNearestAdmit` has actually been run.
+
+**ROOT CAUSE, confirmed in code rather than inferred from the plot.** A gate
+inside `AddCandidate` — `AdmissionsThisLevel >= Cap/4` — rejected everything past
+the first **512** admissions **IN SCAN ORDER**. The cell sweep is row-major from
+the southwest corner, so whenever a level's missing set exceeds 512 (cold start,
+teleport, and every refill of a drained ring during flight) the admitted set is a
+row-major strip beginning at the **far corner** of the sweep square, running
+west→east. That is both halves of the complaint from one gate.
+
+**THE SAME GATE IS THE THROUGHPUT COLLAPSE.** Budget is spent admitting far
+slabs; `DropFarthestOverCap` then throws them straight back out; they are
+re-collected on the next call. Net-zero work. This is what drives
+`candidatesRejected` to ~1.1M per 5 s window while `dispatched` decays 16,227 →
+9,512. An in-file note already said it plainly and nobody had connected it to the
+visible symptom: *"each refill admitted Cap/4 = 512, and the truncation pass
+threw ~500 straight back out."*
+
+**WHAT WAS ALREADY CORRECT, so nobody re-fixes it.** The sort
+(`SortPendingQueues`, distance-primary, with `BiasedSortKeySq` clamping interior
+coarse chunks to their ring's inner radius), the truncation (`DropFarthestOverCap`
+drops farthest), and the dispatch pick (ring-floor deficit, then nearest across
+queue heads) are ALL proximity-correct. They faithfully ordered a queue that only
+ever CONTAINED the far strip. The last stage did not win here — the first did.
+**No stage anywhere consulted view direction.**
+
+**THE FIX, authored, unbuilt:**
+  * `-VoxelNearestAdmit` — the gate keeps its budget but commits the **nearest**
+    Cap/4 rather than the first Cap/4, collected during the sweep and committed
+    after it, sorted by the same key the queue stores. This makes enumeration
+    order irrelevant rather than reordering the enumeration, which is also what
+    makes it merge-safe against Phase 2's margin strips.
+  * `-VoxelViewBias[=k]` — `key = BiasedSortKeySq * (1 + k(1-cos t)/2)`, layered
+    inside `PrioritySortKeySq` so one number steers the cutoff, the sort, the
+    truncation and the cross-level dispatch pick. Bounded and multiplicative, so
+    distance dominates and no ring can starve by facing. **Never feeds
+    eviction** — a 180 deg turn must not evict what is already resident.
+
+**WHAT TO READ WHEN IT IS FINALLY RUN:** `admMeanM R0..R6` (mean 2D admit distance
+per ring) — row-major truncation pins a budget-bound ring near its FAR edge from
+the first window; nearest-first starts at the inner edge and walks outward. That
+is the ordering itself, not a proxy. Plus `nearestAdmit` non-zero in treatment and
+exactly 0 in control. Judge safety on PER-RING `loaded`/`pending`, never aggregate
+throughput — level-primary ordering once measured "R3/R4 at 0 loaded chunks for
+90 s" while the aggregate looked healthy.
+
 ### 0.0i The uncovered level+reason instrument FAILS BOTH HALVES — do not quote it
 
 Measured 2026-08-23 from three headless captures at 120 m / 400 m / 1200 m

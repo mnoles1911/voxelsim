@@ -920,9 +920,16 @@ struct FVoxelResidencyGpu::FImpl
 		for (int32 I = 0; I < N; ++I)
 		{
 			const int32 Level = int32(Raw[I * 4 + 0] & 0xF);
-			const FIntVector C(int32(Raw[I * 4 + 1]), int32(Raw[I * 4 + 2]),
-			                   int32(Raw[I * 4 + 3]));
-			Out.Add(PackKey(Level, C));
+			// NAMED LOCALS, NOT A BRACED TEMPORARY IN THE CONSTRUCTOR CALL.
+			// FIntVector C(int32(Raw[..]), int32(Raw[..]), int32(Raw[..])) is
+			// parsed by MSVC as a FUNCTION DECLARATION taking three `int32
+			// Raw[]` parameters -- the most vexing parse -- and reports as
+			// "error C2086: 'int32 Raw[]': redefinition", which points at the
+			// argument rather than at the declaration that caused it.
+			const int32 Cx = int32(Raw[I * 4 + 1]);
+			const int32 Cy = int32(Raw[I * 4 + 2]);
+			const int32 Cz = int32(Raw[I * 4 + 3]);
+			Out.Add(PackKey(Level, FIntVector(Cx, Cy, Cz)));
 		}
 	}
 
