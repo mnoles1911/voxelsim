@@ -227,6 +227,20 @@ authored, default-off lever that this sweep never armed.
 All at -VoxelPerfSpeed=120, against spd120.log as control.  Judge on per-ring
 residency, never aggregate throughput.
 
+READ THESE FOUR ON EVERY ARM, because the gate is all four and not just p95:
+  * p50 and p95        -- "VoxelPerfRun complete" (p50 must NOT rise)
+  * per-ring residency -- the per-ring resident counts, never the aggregate;
+                          level-primary ordering once read "R3/R4 at 0 loaded
+                          chunks for 90 s" while the aggregate looked healthy
+  * holes / uncovered  -- tools/read-holes.sh
+  * time-to-settle     -- "Voxel cold settle: SETTLED t=..s ..." (the probe
+                          that landed on main 2026-08-23; see
+                          docs/measurements/cold-fill-diagnosis-2026-08-23.txt).
+                          Every experiment below changes admission, and (1) in
+                          particular changes how much the cold fill may have
+                          in flight, so settle is the reading most likely to
+                          regress quietly while p95 improves.
+
 (1) NO CODE AT ALL -- shrink the cap.  -VoxelAdmissionCapDrainSec=1 and =2.
     At the measured drainEMA of 6,203/s those give Wanted = 6,203 and 12,406,
     both inside [StaticCap 2048, ceiling 32,768], so capSrc= must read `ema`
