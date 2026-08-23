@@ -164,6 +164,7 @@ VoxelBrickPackOnCpu
 VoxelBrickPoolChunks
 VoxelClipmapSquareHole
 VoxelColdBandDeferPark
+VoxelDispatchAheadCap
 VoxelGIOff
 VoxelGpuBrickFlushBatch
 VoxelGpuMesh
