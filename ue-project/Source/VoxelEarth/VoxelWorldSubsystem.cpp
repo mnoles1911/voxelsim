@@ -7973,7 +7973,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Fine tier (5s window): resident=%llu tile(s) %.2f/%.2f GiB (decoded %.2f GiB) | loaded=%llu ")
 		       TEXT("absentOnDisk=%llu corrupt=%llu identityMismatch=%llu refusedTiles=%llu retriesSuppressed=%llu ")
-		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d"),
+		       // ringCentre/ringMoves ADDED 2026-08-23. Without them this line
+		       // cannot tell "the streamer stopped following the player" from
+		       // "the player never left his tile", and on 2026-08-23 it was
+		       // read as the first when it was the second: 40 windows of
+		       // byte-identical resident=4/loaded=4 over an anchor that moved
+		       // 1.2 km inside a 15.36 km tile. ringCentre=(-2147483648,...)
+		       // is the sentinel for "the residency tick has never run", which
+		       // is a third, genuinely broken state that used to look the same.
+		       TEXT("| blockingLoads=%llu gateLeaks=%llu | ringRadius=%d ringCentre=(%d,%d) ringMoves=%llu"),
 		       (unsigned long long)FineStreamer->ResidentTileCount(),
 		       double(FineStreamer->ResidentBytes()) / double(1ull << 30),
 		       double(FineStreamer->BudgetBytes()) / double(1ull << 30),
@@ -7990,7 +7998,9 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       (unsigned long long)FineStreamer->SuppressedRetriesSinceStart(),
 		       (unsigned long long)FineStreamer->BlockingLoadsSinceStart(),
 		       (unsigned long long)FineStreamer->GateLeaksSinceStart(),
-		       FineStreamer->RingRadiusTiles());
+		       FineStreamer->RingRadiusTiles(), FineStreamer->RingCentreTile().x,
+		       FineStreamer->RingCentreTile().y,
+		       (unsigned long long)FineStreamer->RingCentreMovesSinceStart());
 
 		// THE AFTER-THE-FACT CHECK, now reported against GateLeaksSinceStart()
 		// rather than the sampler's missingTileQueries.

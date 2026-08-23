@@ -292,6 +292,40 @@ public:
 	void SetRingRadiusTiles(int32_t Radius) { RingRadiusTiles_ = Radius; }
 	int32_t RingRadiusTiles() const { return RingRadiusTiles_; }
 
+	// --- WHERE THE RING IS, AND WHETHER IT HAS EVER MOVED -------------------
+	//
+	// ADDED 2026-08-23 BECAUSE THE ABSENCE OF THESE TWO NUMBERS COST A DAY.
+	// The owner's PIE session printed a BYTE-IDENTICAL fine tier line in all 40
+	// of its perf windows -- resident=4, loaded=4, gateLeaks=10814, frozen --
+	// and that was read as "the streamer loaded four tiles at spawn and then
+	// stopped following the player". It had not stopped. A coarse tile is
+	// 15.36 km on a side (kTileFootprintMm) and the anchor moved 1.2 km in the
+	// whole session, from (-61440,-61440) m to (-60510,-60684) m: it never left
+	// tile (-4,-4), so a frozen resident set was the CORRECT answer and there
+	// was nothing to prefetch. Nothing in the log said that, because the log
+	// printed the ring RADIUS and never the ring CENTRE.
+	//
+	// These distinguish the two failures that produce the identical frozen
+	// line, which is the whole point:
+	//
+	//   ringCentre = (INT32_MIN, INT32_MIN)  => TickResidencyAndEviction has
+	//       NEVER RUN. The ring is not stale, it does not exist. That is a
+	//       missing call site, and it is a real bug this could not previously
+	//       be told apart from the healthy case.
+	//   ringCentre set, ringMoves == 0       => the anchor has not left the tile
+	//       it started in. Residency is correct and frozen is expected.
+	//   ringMoves > 0 with a frozen resident set => the ring IS tracking and the
+	//       tiles it wants are absent or refused; read absentOnDisk/refusedTiles.
+	//
+	// ringMoves counts CENTRE CHANGES, not ticks, and deliberately does not
+	// count the first centre being established -- "0" then means exactly "has
+	// not crossed a tile boundary yet" rather than "has run once". It can come
+	// out either way on any leg with real travel, which is the requirement:
+	// a flight that visibly crosses a 15.36 km boundary and still reports
+	// ringMoves=0 is the frozen-ring bug, out loud.
+	vxc::TileCoord RingCentreTile() const;
+	uint64 RingCentreMovesSinceStart() const;
+
 	// WHAT A GATE LEAK DOES. A leak means a query could not be answered from a
 	// resident tile and could not be made resident either -- i.e. this run is
 	// now generating terrain no other client will reproduce.
@@ -479,7 +513,16 @@ private:
 	// retry contract above: this is the thing that turns "retry forever at 30
 	// ms" into "attempt, refuse, say why, stop".
 	std::unordered_map<uint64, FTileLoadFailure> LoadFailures_;
+	// The prefetch ring's centre, and the sentinel that means "no tick yet".
+	// The sentinel is load-bearing for the diagnostic above: it is the only
+	// thing that can say TickResidencyAndEviction was never called at all, as
+	// opposed to called with an anchor that never moved.
 	vxc::TileCoord LastRingCentre_{INT32_MIN, INT32_MIN};
+	// Times the centre CHANGED after being established. Written under Lock_
+	// exclusively by TickResidencyAndEviction (game thread) and read under it
+	// shared by the perf log (also game thread), so a plain uint64 is enough --
+	// unlike GateLeaks_, which the meshing workers can write.
+	uint64 RingCentreMoves_ = 0;
 	uint64 DecodedBytes_ = 0;
 	uint64 CorruptLoads_ = 0;
 	uint64 IdentityMismatches_ = 0;
