@@ -3755,6 +3755,91 @@ bool NearestAdmitEnabled()
 	return bEnabled;
 }
 
+// --- cutoff-clamped enumeration (-VoxelCutoffClamp, 2026-08-23) -------------
+//
+// THE WASTE THIS REMOVES, from gpu-a1-control.log: in the admission-limited
+// stretch of the flight (07:38:06-07:39:18) the entry scans rejected
+// 1.0-2.1 MILLION candidates per 5 s window (vs ~5 k in the healthy stretch
+// minutes earlier), recompute time doubled to 700-840 ms per window, and the
+// streaming tick held 33-38% of wall -- while every ring's cutoff sat at
+// 71-130 m. The scans still walked their FULL per-level disc
+// ((2*ChunkSpan+1)^2 cells, ~7,200 at level 0) and then rejected almost every
+// cell one at a time against a cutoff a fraction of the disc radius.
+//
+// With this on, a level whose own cutoff is finite clamps its enumerated
+// square to the cutoff radius: every cell outside it is PROVABLY RejectedCutoff
+// (the queue sort key is >= the 3D centre distance, which is >= the 2D centre
+// distance the clamp tests -- BiasedSortKeySq only ever raises a key and the
+// view-bias multiplier is >= 1), so enumerating it does nothing but burn the
+// game thread and grow DeferredFootprints.
+//
+// TWO HONEST DIVERGENCES from the control arm, both bounded, both visible in
+// counters, neither a hole: (1) a pending-unload or parked chunk beyond the
+// clamp radius is not resurrected/adopted this scan (those checks run before
+// the cutoff test in AdmitCandidateEvaluate); it unloads and is re-admitted
+// or re-adopted when the cutoff relaxes -- reads as extra unloads+dispatches,
+// never as a missing chunk, because the deferral flag stays armed (a clamped
+// scan can never clear it) and the relaxed-scan re-walks the full disc.
+// (2) an EVICTED edited chunk beyond the clamp radius (overlay-aware
+// candidates skip the cutoff test) waits for the relax the same way. Live
+// edits are unaffected -- they travel the game-thread remesh queue, not this
+// scan.
+bool CutoffClampEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelCutoffClamp"));
+	return bEnabled;
+}
+
+// --- drain-scaled admission cap (-VoxelAdmissionCapDrainSec, 2026-08-23) ----
+//
+// WHAT DRIVES cutoffM, spelled out because it took a night to trace: the
+// cutoff is not a tuned constant and not a latency controller. It is the
+// distance of a near-the-far-end survivor of a ring's pending queue after
+// TruncatePendingJobQueue capped it (DropFarthestOverCap), and it relaxes to
+// "no cutoff" only when RecomputeDesiredSet begins with the TOTAL queue under
+// 3/4 of GetPendingJobCap(). So the cutoff radius is, by construction,
+// roughly "the radius that holds cap-many chunks", and the CAP is the whole
+// controller.
+//
+// THE INPUT STOPPED BEING TRUE. kDefaultPendingJobCap=2048 was sized as "~8
+// seconds of queued work at the measured ~250 chunks/s drain rate" (see its
+// comment). The measured drain on gpu-a1-control.log is 2,000-3,000
+// dispatches/s -- the same 2048 is now 0.7 s of work, an order of magnitude
+// stale. "Queue at cap" was a proxy for "downstream is saturated"; today the
+// queue is at cap because one recompute's admission burst (up to cap/4 per
+// level) refills it faster than one inter-recompute interval drains it, while
+// the workers sit idle -- the signal is caused by the cap itself. The result
+// is the measured collapse: cutoffM pinned at 71-130 m against a 4,096 m
+// cascade, and 1-2 M rejections per window re-enumerating the strangled
+// annulus.
+//
+// THE FIX: size the cap from the drain it was always meant to track. With
+// -VoxelAdmissionCapDrainSec=N the effective cap each tick is
+// max(GetPendingJobCap(), drainEMA * N), bounded at 32,768 (the sort and the
+// exit scan are O(queue) per recompute; 28k-deep queues were the recorded
+// cost that motivated the cap). Self-correcting in BOTH directions: if
+// dispatch genuinely slows (downstream truly saturated), the EMA falls and
+// the cap walks back down to the static floor -- the one input that can come
+// out the other way. Default 0 = off = the static cap everywhere,
+// byte-identical control arm.
+//
+// FAILING READINGS, stated up front: cap= in the admission log pinned at 2048
+// with the switch on means drain never exceeded 2048/N per second -- the arm
+// is doing nothing and must read that way. cap climbing while dispatched/5s
+// does NOT climb means the queue was never the binding constraint and the
+// bottleneck is elsewhere (name it from the tick-budget line, do not re-run
+// this arm).
+int32 AdmissionCapDrainSec()
+{
+	static const int32 Seconds = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelAdmissionCapDrainSec="), Value);
+		return FMath::Clamp(Value, 0, 60);
+	}();
+	return Seconds;
+}
+
 double ViewBiasStrength()
 {
 	static const double K = []
@@ -6490,6 +6575,95 @@ struct FVoxelWorldImpl
 	int64 CandidatesRejectedSinceLog = 0; // bounded admission: in-annulus candidates NOT admitted (never became records)
 	int64 RecordsDroppedSinceLog = 0;     // bounded admission: queued-but-never-meshed records displaced by nearer work
 
+	// PER-LEVEL, PER-REASON split of CandidatesRejectedSinceLog (2026-08-23).
+	// The aggregate hid the mechanism for a full night of work: the
+	// gpu-a1-control.log windows read rejected=1.4-2.1M with cutoffM=71-98,
+	// and the received diagnosis ("level 5's whole annulus is rejected against
+	// an 84 m cutoff") could not be tested because no counter said WHICH ring
+	// was rejecting or WHY -- with -VoxelRingQuota on (the default), the
+	// printed cutoffM is the WIDEST ring cutoff, so 84 m means only the FINE
+	// rings were capping and level 5's own cutoff was DBL_MAX. The four
+	// reasons mean four different fixes (budget: per-call cap/4; cutoff: the
+	// queue-derived radius; fine: tile residency; nearest: the sorted commit
+	// pass's budget tail), so they are counted apart. Flushed and reset with
+	// the admission line every 5 s.
+	int64 LevelRejBudgetSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelRejCutoffSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelRejFineSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelRejNearestSinceLog[VoxelCoords::kNumLevels] = {};
+
+	// -VoxelCutoffClamp bookkeeping (see VoxelStreamAdmission::
+	// CutoffClampEnabled). A clamped scan is NOT a full scan: cells outside
+	// the clamp radius were never enumerated, so their work is outstanding by
+	// construction. bLevelScanClampedThisCall guards the per-level deferral
+	// CLEAR in TruncatePendingJobQueue -- the recorded one-way-latch bug
+	// (428 full-annulus rescans in 14 s) came from a global flag gating a
+	// per-level clear, and the dual failure here would be a clamped scan with
+	// zero rejections reading as "converged" and disarming the refill trigger
+	// forever. bLevelLastScanClamped makes the NEXT scan ineligible for
+	// incremental diffing: a clamped predecessor never evaluated the outer
+	// annulus, so "every skipped cell's realized state is already decided"
+	// does not hold beyond its clamp radius.
+	bool bLevelScanClampedThisCall[VoxelCoords::kNumLevels] = {};
+	bool bLevelLastScanClamped[VoxelCoords::kNumLevels] = {};
+	int32 LevelClampedScansSinceLog[VoxelCoords::kNumLevels] = {};
+	int64 LevelClampSkippedCellsSinceLog[VoxelCoords::kNumLevels] = {}; // cells provably-rejected without being walked
+
+	// -VoxelAdmissionCapDrainSec state (see VoxelStreamAdmission::
+	// AdmissionCapDrainSec). EffectivePendingJobCap is computed ONCE per
+	// streaming tick (UpdateEffectivePendingJobCap) and read by every
+	// admission site that used to read GetPendingJobCap() directly -- the
+	// refill trigger, gate (a), the nearest-admit commit budget, the cutoff
+	// relax test and the truncate pass must all see the SAME cap within one
+	// tick, for the same reason admit and evict must share an anchor.
+	// JobsDispatchedTotalForCap is a monotonic twin of JobsDispatchedSinceLog
+	// (which resets every 5 s and so cannot difference across ticks).
+	int64 JobsDispatchedTotalForCap = 0;
+	double DrainPerSecEMA = 0.0;
+	double LastDrainSampleSeconds = -1.0;
+	int64 LastDrainSampleDispatched = 0;
+	int32 EffectivePendingJobCap = 0; // valid after the first UpdateEffectivePendingJobCap of a tick
+
+	void UpdateEffectivePendingJobCap()
+	{
+		const int32 StaticCap = VoxelStreamAdmission::GetPendingJobCap();
+		const int32 DrainSec = VoxelStreamAdmission::AdmissionCapDrainSec();
+		if (DrainSec <= 0 || StaticCap <= 0)
+		{
+			EffectivePendingJobCap = StaticCap; // switch off: the control arm, byte for byte
+			return;
+		}
+		const double Now = FPlatformTime::Seconds();
+		if (LastDrainSampleSeconds < 0.0)
+		{
+			// First tick: no interval to rate yet. EMA starts at 0, so the
+			// effective cap starts at the static floor -- identical to
+			// control until a drain has actually been measured.
+			LastDrainSampleSeconds = Now;
+			LastDrainSampleDispatched = JobsDispatchedTotalForCap;
+			EffectivePendingJobCap = StaticCap;
+			return;
+		}
+		const double Dt = Now - LastDrainSampleSeconds;
+		if (Dt > 0.05) // don't rate over sub-frame intervals; ~20 Hz sampling is plenty
+		{
+			const double InstRate = double(JobsDispatchedTotalForCap - LastDrainSampleDispatched) / Dt;
+			// ~5 s horizon: long enough to ride out one truncate/refill
+			// cycle, short enough that a real downstream stall walks the
+			// cap back inside a couple of log windows.
+			const double Alpha = FMath::Clamp(Dt / 5.0, 0.0, 1.0);
+			DrainPerSecEMA += (InstRate - DrainPerSecEMA) * Alpha;
+			LastDrainSampleSeconds = Now;
+			LastDrainSampleDispatched = JobsDispatchedTotalForCap;
+		}
+		// 32,768: the queue sort/filter and the truncate are O(queue) per
+		// recompute, and the pre-cap 28k-deep queue is the recorded cost this
+		// bound respects. The floor is the static cap -- this arm may only
+		// ever OPEN admission relative to control, never strangle it further.
+		EffectivePendingJobCap = FMath::Clamp(FMath::RoundToInt(DrainPerSecEMA * double(DrainSec)),
+		                                      StaticCap, 32768);
+	}
+
 	// Per-level breakouts of the three above. The global tallies cannot answer
 	// "this ring keeps admitting records that never mesh -- who is removing
 	// them", because every ring's adds and removes land in the same number.
@@ -7289,7 +7463,12 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	// the A/B for this change runs on ONE binary -- the same reason
 	// -VoxelRingQuota exists. It is safe from -ExecCmds because it is read
 	// fresh on every tick rather than latched at startup.
-	const int32 AdmissionCap = VoxelStreamAdmission::GetPendingJobCap();
+	// -VoxelAdmissionCapDrainSec: one cap value per tick, computed here so the
+	// refill trigger, gate (a), the relax test and the truncate pass cannot
+	// disagree about it within a tick. With the switch off this IS
+	// GetPendingJobCap(), unconditionally.
+	UpdateEffectivePendingJobCap();
+	const int32 AdmissionCap = EffectivePendingJobCap;
 	bool bLevelWantsRefill[VoxelCoords::kNumLevels] = {};
 	bool bAdmissionRefill = false;
 	if (bHasRecomputed && AdmissionCap > 0)
@@ -9205,9 +9384,52 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	}
 
 	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
-	       VoxelStreamAdmission::GetPendingJobCap(),
+	       // The EFFECTIVE cap: identical to GetPendingJobCap() unless
+	       // -VoxelAdmissionCapDrainSec is on, in which case this line is the
+	       // arm's proof of traffic -- cap pinned at the static floor with
+	       // the switch on is the FAILING reading (drain never justified more).
+	       EffectivePendingJobCap,
 	       WidestAdmissionCutoffM(),
 	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+
+	// PER-LEVEL, PER-REASON attribution of the line above (2026-08-23; see
+	// LevelRejBudgetSinceLog's doc comment for the night this would have
+	// saved). cut= is THIS ring's own cutoff in metres (-1 = not capping) --
+	// the aggregate line prints only the widest, which under -VoxelRingQuota
+	// says nothing about WHICH ring is strangled. rejB/rejC/rejF/rejN are the
+	// budget / cutoff / fine-tier / nearest-admit-declined rejection reasons;
+	// bk= is DeferredFootprints (the rejection backlog incremental rescans
+	// re-attempt -- if rejections are pathological this is the pathology,
+	// preserved). Always on: one line per 5 s, integers already counted.
+	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission detail (5s window): %s"),
+	       *JoinPerLevel(
+	           [&](int32 L)
+	           {
+		           const double CutM = (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
+		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L]) / 100.0
+		                                   : -1.0;
+		           return FString::Printf(
+		               TEXT("R%d[cut=%.0f rejB=%lld rejC=%lld rejF=%lld rejN=%lld bk=%d]"), L, CutM,
+		               (long long)LevelRejBudgetSinceLog[L], (long long)LevelRejCutoffSinceLog[L],
+		               (long long)LevelRejFineSinceLog[L], (long long)LevelRejNearestSinceLog[L],
+		               DeferredFootprints[L].Num());
+	           }));
+	// -VoxelCutoffClamp proof-of-traffic (gated so old-leg greps stay clean):
+	// clampScans / skippedCells per ring. All zeros with the cutoffs relaxed
+	// is the healthy reading (nothing to clamp); non-zero clamps while the
+	// tick-budget line's recompute= does NOT fall is the FAILING reading --
+	// the enumeration was not where that time went.
+	if (VoxelStreamAdmission::CutoffClampEnabled())
+	{
+		UE_LOG(LogVoxelPerf, Log, TEXT("Voxel cutoff clamp (5s window): %s"),
+		       *JoinPerLevel(
+		           [&](int32 L)
+		           {
+			           return FString::Printf(TEXT("R%d[scans=%d cells=%lld]"), L,
+			                                  LevelClampedScansSinceLog[L],
+			                                  (long long)LevelClampSkippedCellsSinceLog[L]);
+		           }));
+	}
 
 	// Wave S0 (docs/speculative-generation-plan.md §4, executing T0-1). Two
 	// questions in one line, both of which the open P0 currently answers by
@@ -10374,6 +10596,12 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		AccumLevelEntryMs[Level] = 0.0;
 		LevelEntryScans[Level] = 0;
 		LevelIncrScansSinceLog[Level] = 0;
+		LevelRejBudgetSinceLog[Level] = 0;
+		LevelRejCutoffSinceLog[Level] = 0;
+		LevelRejFineSinceLog[Level] = 0;
+		LevelRejNearestSinceLog[Level] = 0;
+		LevelClampedScansSinceLog[Level] = 0;
+		LevelClampSkippedCellsSinceLog[Level] = 0;
 	}
 	IncrFullFirstSinceLog = IncrFullEditSinceLog = IncrFullUndergroundSinceLog = IncrFullConfigSinceLog = 0;
 
@@ -12191,6 +12419,7 @@ bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKe
 			++CandidatesRejectedSinceLog;
 			++CandidatesRejectedThisCall;
 			++LevelCandidatesRejectedThisCall[QueueLevel];
+			++LevelRejFineSinceLog[QueueLevel];
 			bAdmissionDeferredWork[QueueLevel] = true;
 			// Backlog (see DeferredFootprints): "re-scanned on every future
 			// call" in the comment up top is exactly what this makes true
@@ -12443,7 +12672,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// edit-driven (always near the player, never a backlog) and
 	// is not what the cap exists to bound.
 	const bool bOverlayAware = NeedsOverlayAwarePath(LevelKey);
-	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+	const int32 Cap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: per-tick cap (== GetPendingJobCap() when off)
 	const int32 QueueLevel = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
 	const bool bNearestAdmit = VoxelStreamAdmission::NearestAdmitEnabled();
 	// Gate (a) runs HERE only in the control arm. Under
@@ -12459,6 +12688,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 		++CandidatesRejectedSinceLog;
 		++CandidatesRejectedThisCall;
 		++LevelCandidatesRejectedThisCall[QueueLevel];
+		++LevelRejBudgetSinceLog[QueueLevel];
 		bAdmissionDeferredWork[QueueLevel] = true;
 		// Backlog: remember WHERE the deferral's work lives,
 		// so the rescan it provokes can be incremental. The
@@ -12493,6 +12723,7 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 		++CandidatesRejectedSinceLog;
 		++CandidatesRejectedThisCall;
 		++LevelCandidatesRejectedThisCall[QueueLevel];
+		++LevelRejCutoffSinceLog[QueueLevel];
 		bAdmissionDeferredWork[QueueLevel] = true;
 		// Backlog: same recording as the budget rejection above.
 		if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
@@ -12541,7 +12772,7 @@ void FVoxelWorldImpl::CommitNearestAdmitScratch(int32 Level, const FVector& Anch
 	}
 	NearestAdmitScratch.Sort([](const FNearestAdmitEntry& A, const FNearestAdmitEntry& B)
 	                         { return A.KeySq < B.KeySq; });
-	const int32 CommitCap = VoxelStreamAdmission::GetPendingJobCap();
+	const int32 CommitCap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: same per-tick cap gate (a) read
 	const int32 Budget = (CommitCap > 0) ? CommitCap / 4 : MAX_int32; // same expression as gate (a)
 	int32 Committed = 0;
 	for (; Committed < NearestAdmitScratch.Num(); ++Committed)
@@ -12565,6 +12796,7 @@ void FVoxelWorldImpl::CommitNearestAdmitScratch(int32 Level, const FVector& Anch
 		CandidatesRejectedSinceLog += Declined;
 		CandidatesRejectedThisCall += Declined;
 		LevelCandidatesRejectedThisCall[Level] += Declined;
+		LevelRejNearestSinceLog[Level] += Declined;
 		bAdmissionDeferredWork[Level] = true;
 		// Backlog (see DeferredFootprints): under -VoxelNearestAdmit
 		// the budget rejection happens HERE, after the sweep, not at
@@ -12919,6 +13151,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	{
 		bLevelScannedThisCall[Level] = false;
 		LevelCandidatesRejectedThisCall[Level] = 0;
+		bLevelScanClampedThisCall[Level] = false; // -VoxelCutoffClamp: per-call, set only by a scan that actually clamped
 	}
 
 	// Incremental admission: fold this call's anchor into every level's
@@ -13020,7 +13253,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	// flight is ~50,900, so a useful cap sits above the latter and far below
 	// 86,077.
 	{
-		const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+		const int32 Cap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: the relax threshold scales with the cap
 		const int32 RecordCap = VoxelDebug::GetStreamAdmissionRecordCap();
 		const bool bQueueHasRoom = (Cap <= 0 || PendingJobNum() * 4 < Cap * 3);
 		const bool bRecordsHaveRoom = (RecordCap <= 0 || ChunkRecords.Num() < RecordCap);
@@ -13751,6 +13984,20 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// anchor.
 				++IncrFullConfigSinceLog;
 			}
+			else if (VoxelStreamAdmission::CutoffClampEnabled() &&
+			         (LevelAdmissionCutoffDistSq[Level] < DBL_MAX || bLevelLastScanClamped[Level]))
+			{
+				// -VoxelCutoffClamp: a clamped scan never evaluates the outer
+				// annulus, so it can neither BE incremental (the diff would
+				// trust verdicts this scan is about to not produce) nor SERVE
+				// as a predecessor (the next diff would trust verdicts the
+				// last scan never produced). Any finite cutoff is treated as
+				// "may clamp" -- the actual clamp decision needs AdmitOuterUU,
+				// derived below; being conservative here costs one full sweep,
+				// being precise would cost a forward reference. Counted as
+				// config: the cause is the knob.
+				++IncrFullConfigSinceLog;
+			}
 			else
 			{
 				bIncrementalScan = true;
@@ -13891,6 +14138,65 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 
 		const int32 ChunkSpan = FMath::CeilToInt32(AdmitOuterUU / ChunkEdge) + 1;
 
+		// -VoxelCutoffClamp (see VoxelStreamAdmission::CutoffClampEnabled for
+		// the measured waste and the two bounded divergences): when this
+		// level's own cutoff is finite, every cell whose 2D centre distance
+		// is >= the cutoff radius is provably RejectedCutoff -- the queue
+		// sort key PrioritySortKeySq >= DistSq3D >= 2D centre DistSq (the
+		// hierarchical clamp is a max() and the view-bias multiplier is
+		// >= 1) -- so the walk below is clamped to the cells that can still
+		// answer differently. +1 chunk: a cell's CENTRE decides, and the
+		// centre sits up to half an edge outside the radius that contains
+		// the cutoff; ceil plus one edge over-covers that bound the same way
+		// ChunkSpan itself over-covers AdmitOuterUU.
+		//
+		// A CLAMPED SCAN IS NOT A SCAN of the outer annulus, and the
+		// bookkeeping says so in all three places that could forget it: the
+		// deferral flag is armed here (work outstanding by construction),
+		// bLevelScanClampedThisCall guards the per-level deferral CLEAR in
+		// TruncatePendingJobQueue (a clamped scan with zero rejections must
+		// not read as converged -- the one-way-latch lesson, inverted), and
+		// the backlog entries beyond the clamp radius are handed straight
+		// back to DeferredFootprints (the Swap above assumed a full-disc
+		// re-attempt this walk will not perform; dropping them is the
+		// silently-lost-chunk failure the backlog exists to prevent).
+		// Self-quenching: the moment the cutoff relaxes (queue drains below
+		// 3/4 cap) the clamp goes inactive, the next scan walks the full
+		// disc, and a zero-rejection full scan clears the deferral exactly
+		// as before. NOTE: do not combine with -VoxelGpuResidency mode >= 1
+		// -- the GPU mirror predicts full-disc decisions and a clamped CPU
+		// walk will read as spurious mismatches in its comparator.
+		int32 ScanSpan = ChunkSpan;
+		if (VoxelStreamAdmission::CutoffClampEnabled() &&
+		    LevelAdmissionCutoffDistSq[Level] < DBL_MAX)
+		{
+			const double CutoffRadiusUU = FMath::Sqrt(LevelAdmissionCutoffDistSq[Level]);
+			const int32 ClampSpan =
+			    FMath::Min(ChunkSpan, FMath::CeilToInt32(CutoffRadiusUU / ChunkEdge) + 1);
+			if (ClampSpan < ChunkSpan)
+			{
+				ScanSpan = ClampSpan;
+				bLevelScanClampedThisCall[Level] = true;
+				bAdmissionDeferredWork[Level] = true;
+				++LevelClampedScansSinceLog[Level];
+				const int64 FullCells = FMath::Square(int64(2 * ChunkSpan + 1));
+				const int64 WalkedCells = FMath::Square(int64(2 * ScanSpan + 1));
+				LevelClampSkippedCellsSinceLog[Level] += FullCells - WalkedCells;
+				if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+				{
+					for (const FIntPoint& Deferred : DeferredFootprintsScratch)
+					{
+						if (FMath::Max(FMath::Abs(Deferred.X - AnchorChunk.X),
+						               FMath::Abs(Deferred.Y - AnchorChunk.Y)) > ScanSpan)
+						{
+							DeferredFootprints[Level].Add(Deferred); // idempotent; in-span entries are re-attempted by the walk
+						}
+					}
+				}
+			}
+		}
+		bLevelLastScanClamped[Level] = bLevelScanClampedThisCall[Level];
+
 		// HOISTED OUT OF THE CELL LOOP (2026-08-23, pure refactor, same batch
 		// as the exit scan's per-level tables). The inner-pad radius was
 		// recomputed PER GRID CELL below -- (2*ChunkSpan+1)^2 = ~7,200 calls
@@ -13934,9 +14240,10 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// cell loop nothing.
 		const bool bIncrHasBacklog = bIncrementalScan && DeferredFootprintsScratch.Num() > 0;
 
-		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
+		// ScanSpan == ChunkSpan except under an active -VoxelCutoffClamp (above).
+		for (int32 Cy = AnchorChunk.Y - ScanSpan; Cy <= AnchorChunk.Y + ScanSpan; ++Cy)
 		{
-			for (int32 Cx = AnchorChunk.X - ChunkSpan; Cx <= AnchorChunk.X + ChunkSpan; ++Cx)
+			for (int32 Cx = AnchorChunk.X - ScanSpan; Cx <= AnchorChunk.X + ScanSpan; ++Cx)
 			{
 				const double CenterX = (double(Cx) + 0.5) * ChunkEdge;
 				const double CenterY = (double(Cy) + 0.5) * ChunkEdge;
@@ -14522,7 +14829,7 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 {
 	// Called only from RecomputeDesiredSet, immediately after SortPendingQueues,
 	// so every level's queue is sorted farthest-first with its distances current.
-	const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
+	const int32 Cap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: same per-tick cap admission spent
 	bool bHeldBack = false;
 	bool bLevelHeldBackThisCall[VoxelCoords::kNumLevels] = {}; // per-ring attribution for the clear below
 
@@ -14641,8 +14948,14 @@ void FVoxelWorldImpl::TruncatePendingJobQueue()
 	// per-level gate first.
 	for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 	{
+		// -VoxelCutoffClamp: a clamped scan never evaluated the outer annulus,
+		// so its zero-rejection reading is not convergence -- the clear would
+		// disarm the refill trigger with the whole strangled annulus
+		// outstanding, permanently (the same shape as the one-way-latch bug,
+		// pointing the other way). The flag is per-level and per-call on both
+		// set and clear, like everything else in this loop.
 		if (bLevelScannedThisCall[Level] && LevelCandidatesRejectedThisCall[Level] == 0 &&
-		    !bLevelHeldBackThisCall[Level])
+		    !bLevelHeldBackThisCall[Level] && !bLevelScanClampedThisCall[Level])
 		{
 			bAdmissionDeferredWork[Level] = false;
 		}
@@ -16451,6 +16764,7 @@ void FVoxelWorldImpl::DispatchJobs()
 		JobsInFlightCounter.Increment();
 		++LevelJobsInFlight[PickLevel];
 		++JobsDispatchedSinceLog;
+		++JobsDispatchedTotalForCap; // -VoxelAdmissionCapDrainSec: monotonic twin, never reset
 		++LevelJobsDispatchedSinceLog[PickLevel];
 		++LevelJobsDispatchedTotal[PickLevel];
 
