@@ -249,6 +249,27 @@ private:
 	// first ApplyFogFromState to run the sink.
 	int32 AppliedVolumetricTier = -1;
 
+	// --- what the fog was last SEEN to be, for the read-back log --------------
+	//
+	// THE DEFECT THESE EXIST FOR. voxel.Sky.FogDensity, voxel.Sky.FogHeightFalloff
+	// and voxel.Sky.Fog were reported (owner, 2026-08-23) as "set in a live PIE
+	// session with no visible change", and the diagnosis written into the backlog
+	// was that they are read once at spawn and never re-applied. They are NOT --
+	// ApplyFogFromState has re-read all three every tick since the fog landed, and
+	// the owner's own log proves that function runs (it prints the volumetric tier
+	// line from inside it). But NOTHING IN THE LOG COULD DISTINGUISH "the cvar did
+	// not apply" FROM "the cvar applied and the fog is not doing anything", and
+	// those are opposite bugs in opposite files. That ambiguity is what cost the
+	// session, so the fix is a line that answers it.
+	//
+	// Sentinels are negative/-1 rather than 0, because 0 is a legal value for
+	// every one of these and a first-frame log line is exactly the one worth
+	// having.
+	float AppliedFogDensity = -1.f;
+	float AppliedFogFalloff = -1.f;
+	int32 AppliedFogVisible = -1;
+	int32 AppliedFogInSkyCapture = -1;
+
 	void ApplyFogFromState();
 
 	// The NIGHT SKY's mesh: a camera-following sphere carrying M_NightSky, which
@@ -260,6 +281,30 @@ private:
 	// root is the SkyAtmosphere and its transform must not move.
 	UPROPERTY(Transient)
 	TObjectPtr<class AVoxelSkyDomeActor> SkyDome;
+
+	// The spawn column's WORLDGEN ground height in UU, resolved once in SpawnRig
+	// through GetSurfaceHeightUU. Two things need it and they are 2187.6 m apart
+	// if either gets it wrong: the height fog's reference height, and the
+	// SkyLight's capture position under voxel.Sky.SkyLightAtGroundZ. It is a
+	// member rather than a local because the second of those is re-applied live.
+	// 0 (sea level) is the honest degraded answer when there is no terrain
+	// subsystem, and the fog's ran-flag line prints it either way.
+	double SpawnGroundZUU = 0.0;
+
+	// Last placement actually applied for the SkyLight, so the push below is a
+	// compare rather than a per-frame SetActorLocation on a light that a
+	// real-time capture is reading. -1 = never applied.
+	int32 AppliedSkyLightAtGroundZ = -1;
+
+	// Re-applies voxel.Sky.SkyLightAtGroundZ. LIVE rather than spawn-time-only,
+	// and that is not a nicety: tools/voxel-capture.ps1 passes -Cvars through
+	// -ExecCmds, which lands AFTER BeginPlay (the script says so at :114-116 and
+	// refuses some names for exactly this reason), so a spawn-time-only switch
+	// could not be reached by the capture sweep that is supposed to judge it.
+	// voxel.Sky.AtmosphereDome's help string records the same rule in one line:
+	// a switch that cannot be flipped inside one session makes its own A/B
+	// unreadable.
+	void ApplySkyLightPlacement();
 
 	void SpawnRig(UWorld& World);
 	void ApplyStaticRigPose();
