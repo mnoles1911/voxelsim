@@ -6556,6 +6556,24 @@ struct FVoxelWorldImpl
 	double AccumApplyMs = 0.0;
 	double AccumRemeshMs = 0.0;
 	double AccumUnloadMs = 0.0;
+	// PER-WINDOW sums of the dispatch sub-brackets (2026-08-23). The brackets
+	// themselves (ThisFrameDispatch*Ms) have existed since the B.3 split but
+	// printed ONLY on hitch frames -- on a smooth leg the one number the
+	// admission programme now turns on was unreadable: game-thread ms PER
+	// DISPATCHED CHUNK. Measured 0.21 ms/chunk on two legs an order of
+	// magnitude apart in tracked count; at that cost 2,800 dispatches/s is
+	// ~590 ms/s of game thread -- dispatch cost IS the throughput wall well
+	// before any queue or cutoff is, and every admission-side arm that
+	// "opens" admission without moving perDispatch down is rearranging who
+	// waits. These make that number a per-window column instead of a
+	// hitch-day anecdote.
+	double AccumDispatchAirProofMs = 0.0;
+	double AccumDispatchBandMs = 0.0;
+	double AccumDispatchSubmitMs = 0.0;
+	double AccumDispatchPickMs = 0.0;
+	double AccumDispatchOverlayMs = 0.0;
+	double AccumDispatchLoopMs = 0.0;   // the whole pop loop: the honest denominator for perDispatch
+	double AccumGpuManagerTickMs = 0.0; // GpuMeshJobs->Tick(), bundled into dispatch= by T0..T1 but not dispatch
 	// P2: the brick pool's per-tick publication (one render command for every
 	// brick write the tick made). Its own bucket rather than folded into one of
 	// the four above, so the CPU arm's game-thread cost is attributable instead
@@ -8138,6 +8156,16 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 		AccumApplyMs += (T2 - T1) * 1000.0;
 		AccumRemeshMs += (T3 - T2) * 1000.0;
 		AccumUnloadMs += (T4 - T3b) * 1000.0;
+		// Dispatch sub-brackets into the same window (see the Accum
+		// declarations). The ThisFrame values are final here: both
+		// DispatchJobs passes and the GPU manager tick are behind T3b.
+		AccumDispatchAirProofMs += ThisFrameDispatchAirProofMs;
+		AccumDispatchBandMs += ThisFrameDispatchBandMs;
+		AccumDispatchSubmitMs += ThisFrameDispatchSubmitMs;
+		AccumDispatchPickMs += ThisFrameDispatchPickMs;
+		AccumDispatchOverlayMs += ThisFrameDispatchOverlayMs;
+		AccumDispatchLoopMs += ThisFrameDispatchLoopMs;
+		AccumGpuManagerTickMs += ThisFrameGpuManagerTickMs;
 		AccumRecomputeMs += ThisFrameRecomputeMs;
 		++AccumTicks;
 	}
@@ -9327,6 +9355,29 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       ThisLogWindowSeconds > 0.f ? double(BrickPacksThisWindow) / double(ThisLogWindowSeconds) : 0.0,
 	       AccumTicks > 0 ? AccumTickMs / AccumTicks : 0.0,
 	       AccumTicks > 0 ? AccumRecomputeMs / AccumTicks : 0.0);
+	// DISPATCH STAGES, PER WINDOW (2026-08-23) -- the hitch-only breakdown
+	// promoted to a standing column, because the admission programme's next
+	// wall is arithmetic on exactly these numbers: at the measured 0.21 ms of
+	// game thread per dispatched chunk, 2,800 dispatches/s costs ~590 ms/s --
+	// most of a game thread -- and no queue/cutoff/cap arm can raise
+	// dispatched/s past 1000/perDispatch. READINGS: perDispatch flat across
+	// an arm that "opened admission" but dispatched/s also flat = the wall is
+	// HERE, stop tuning admission; perDispatch RISING as dispatched/s rises =
+	// a superlinear term in the loop (the fixed-cost theory was wrong);
+	// loopMs far below dispatch= in the budget line = the cost is around the
+	// loop (manager tick, flushes), not in it -- three different fixes.
+	// other= is loop minus the named brackets: large and stable means the
+	// per-candidate bookkeeping nobody has bracketed yet.
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel dispatch stages (5s window): loopMs=%.1f = airProof=%.1f + band=%.1f + submit=%.1f ")
+	       TEXT("+ pick=%.1f + overlay=%.1f + other=%.1f | gpuMgrTickMs=%.1f | dispatched=%lld ")
+	       TEXT("perDispatch=%.3fms"),
+	       AccumDispatchLoopMs, AccumDispatchAirProofMs, AccumDispatchBandMs, AccumDispatchSubmitMs,
+	       AccumDispatchPickMs, AccumDispatchOverlayMs,
+	       AccumDispatchLoopMs - AccumDispatchAirProofMs - AccumDispatchBandMs - AccumDispatchSubmitMs
+	           - AccumDispatchPickMs - AccumDispatchOverlayMs,
+	       AccumGpuManagerTickMs, (long long)JobsDispatchedSinceLog,
+	       JobsDispatchedSinceLog > 0 ? AccumDispatchLoopMs / double(JobsDispatchedSinceLog) : 0.0);
 	// S0-2: apply throughput for THIS window, alongside the leg-long mean
 	// TotalChunksLoaded already gives on the "Voxel streaming" line above.
 	// §2.2's testable prediction is that this decays monotonically across a
@@ -10813,6 +10864,8 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumLevel0GpuJobs = 0;
 
 	AccumDispatchMs = AccumApplyMs = AccumRemeshMs = AccumUnloadMs = AccumRecomputeMs = AccumTickMs = 0.0;
+	AccumDispatchAirProofMs = AccumDispatchBandMs = AccumDispatchSubmitMs = AccumDispatchPickMs = 0.0;
+	AccumDispatchOverlayMs = AccumDispatchLoopMs = AccumGpuManagerTickMs = 0.0;
 	AccumBrickFlushMs = 0.0;
 	AccumSpecDispatchMs = AccumSpecEnumerateMs = AccumSpecParkMs = 0.0;
 	AccumTicks = 0;
