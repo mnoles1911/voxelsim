@@ -87,7 +87,6 @@ VoxelNoClipmap
 VoxelNoColdBandThrottle
 VoxelNoDetailAssets
 VoxelNoEditFloorHatch
-VoxelNoGpuMesh
 VoxelNoLoad
 VoxelNoPSOPrecache
 VoxelNoRingSkirt
@@ -148,6 +147,37 @@ VoxelWaterUnderside
 VoxelWindFromDeg
 VoxelWindMps
 VoxelZstdDll
+
+# --- 2026-08-22 batch: streaming/pool/perf work ------------------------------
+# All tuning or configuration; none drives the run. The perf DRIVER switches
+# (-VoxelPerfRun, -VoxelPerfStaticAt) are already in kSelfDrivingExtras;
+# VoxelPerfHeightM is a pose parameter alongside the existing VoxelPerfDepth.
+# VoxelNoGpuMesh left this list the same day: the fork's default flipped to
+# OFF and the switch became VoxelGpuMesh (the enable arm).
+VoxelAsyncAssetResolve
+VoxelAsyncAssetResolveWarm
+VoxelBrickPack
+VoxelBrickPackOnCpu
+VoxelBrickPoolChunks
+VoxelClipmapSquareHole
+VoxelColdBandDeferPark
+VoxelGIOff
+VoxelGpuBrickFlushBatch
+VoxelGpuMesh
+VoxelGpuMeshQueueDepth
+VoxelGpuPoolAlloc
+VoxelGpuWorldGenBatch
+VoxelHierarchicalCoverage
+VoxelInnerHysteresisChunks
+VoxelNoHierarchicalCoverage
+VoxelNoSharedGridCache
+VoxelPerfHeightM
+VoxelRetireQuads
+VoxelRingFloorCpuOnly
+VoxelRingOverlapChunks
+VoxelRingSkirtPaddedInner
+VoxelShadowDistanceM
+VoxelSharedGridCache
 
 # --- The front end's own switches -------------------------------------------
 # Configuration and tuning for the menu itself. None of these drives the run;
