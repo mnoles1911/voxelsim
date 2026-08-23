@@ -315,6 +315,37 @@ Write/Record stages) -- per-chunk cost 5 (claim + 4 writes). Converting them
 moves production fully into the flush graph and delivery to "the tick after
 flush"; that is the piece that finally makes passes/tick FLAT.
 
+## Stage 6 DESIGN SKETCH (not started): claim + writes + delivery
+
+Deliberately NOT stacked on the five unmeasured stages above -- it changes
+WHERE production happens and how jobs complete, and every debugging surface
+above it should be green on hardware first. When stages 1-5's gates hold:
+
+1. **Claim indirect** (the PackClaim slot's second half, or a new stage
+   slot): 1 group/record off the totals arena + R.ChunkSlot, bump-allocating
+   on the pool's AllocState exactly as today's per-chunk kernel (its atomics
+   are already multi-claim safe -- the stack form proves it), writing an
+   8-dword claim arena slice. Needs FVoxelBrickPool's alloc buffers
+   registered INTO THE FLUSH GRAPH -- the manager should hand
+   FVoxelGpuWorklist a bindings callback rather than the worklist including
+   the pool.
+2. **Write indirect**: word copies at worst-case groups/record
+   (64 + 264 = kOccWordsPerRecord/64 + kMatWordsPerRecord/32-ish), exiting
+   on the claim slice's actual counts; desc write 1 group/record; record +
+   index-cell write 1 group/record (today's AddBrickPoolAllocWritePasses
+   kernels, parameterized by record like every stage before).
+3. **Delivery**: a pack-fed job then has NO brick work in the batch graph at
+   all. The manager delivers it the tick after flush (the lean-alloc shape:
+   no readback, resident on the GPU timeline); claim failures surface on the
+   existing [brick-gpualloc] counters, now attributed per flush rather than
+   per job. THIS is the part to design against teardown and stale-drop
+   (GenId) carefully -- the job can no longer be cancelled between promote
+   and claim.
+4. Gate: `voxel.GPU.VerifyBrickStack`-style byte compare of the landed pool
+   state, plus the pinned digest as always. Passes/tick then reads ~10-12
+   constant per tick with chunks/tick fully off the pass term -- the FLAT
+   line the whole programme exists for.
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:
