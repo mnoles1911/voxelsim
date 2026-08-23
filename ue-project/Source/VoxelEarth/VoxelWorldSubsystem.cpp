@@ -3920,6 +3920,37 @@ int32 AdmissionCapDrainSec()
 	return Seconds;
 }
 
+// -VoxelAdmissionCapMax=N: the CEILING of the drain-sized cap (2026-08-23).
+//
+// WHY THIS IS A SWITCH AND NOT THE 32,768 LITERAL IT REPLACES: the literal
+// binds INSIDE the drain-sec sweep's own range. Measured drain at the current
+// best arm is ~2,800 dispatches/s, so EMA x DrainSec crosses 32,768 at
+// DrainSec ~= 12 -- every rung at or above that collapses to the same
+// effective cap, and the sweep would read "drain-sec stopped helping at 12"
+// when the truth is "a hidden third bound took over". The bound itself is
+// real (the queue sort and the truncate are O(queue) per recompute; 28k-deep
+// queues were the recorded cost that motivated the static cap), so it stays
+// -- but it has to be sweepable alongside the thing it silently caps, and the
+// admission line's capSrc= names the windows where it decided.
+//
+// FAILING READING for a raised ceiling: capSrc=max gone, cap= climbing, and
+// dispatched/5s NOT climbing while recompute sortMs/exitScanMs does -- that is
+// the O(queue) cost the 32,768 figure was protecting, measured instead of
+// assumed, and the answer is "the ceiling was right", not a bigger number.
+int32 AdmissionCapMax()
+{
+	static const int32 Max = []
+	{
+		int32 Value = 32768;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelAdmissionCapMax="), Value);
+		// Floor at the old literal's shape (>= one static cap) and bound by the
+		// brick pool's own population (262,144 chunks): a pending queue deeper
+		// than the whole pool is a statement with no meaning.
+		return FMath::Clamp(Value, 2048, 262144);
+	}();
+	return Max;
+}
+
 double ViewBiasStrength()
 {
 	static const double K = []
@@ -6713,6 +6744,14 @@ struct FVoxelWorldImpl
 	double LastDrainSampleSeconds = -1.0;
 	int64 LastDrainSampleDispatched = 0;
 	int32 EffectivePendingJobCap = 0; // valid after the first UpdateEffectivePendingJobCap of a tick
+	// WHICH bound produced EffectivePendingJobCap, for the admission line's
+	// capSrc= column. Three-way controllers are unreadable from their output
+	// alone: cap=32768 could mean "EMA x N landed there" or "the ceiling
+	// clamped it", and those demand opposite next moves (keep sweeping N vs
+	// sweep -VoxelAdmissionCapMax). One char per window settles it.
+	//   static = switch off (control arm)   floor = EMA x N under the static cap
+	//   ema    = tracking drain             max   = ceiling clamped (the bound decided)
+	const TCHAR* EffectiveCapSrc = TEXT("static");
 
 	void UpdateEffectivePendingJobCap()
 	{
@@ -6721,6 +6760,7 @@ struct FVoxelWorldImpl
 		if (DrainSec <= 0 || StaticCap <= 0)
 		{
 			EffectivePendingJobCap = StaticCap; // switch off: the control arm, byte for byte
+			EffectiveCapSrc = TEXT("static");
 			return;
 		}
 		const double Now = FPlatformTime::Seconds();
@@ -6746,12 +6786,19 @@ struct FVoxelWorldImpl
 			LastDrainSampleSeconds = Now;
 			LastDrainSampleDispatched = JobsDispatchedTotalForCap;
 		}
-		// 32,768: the queue sort/filter and the truncate are O(queue) per
+		// Ceiling: the queue sort/filter and the truncate are O(queue) per
 		// recompute, and the pre-cap 28k-deep queue is the recorded cost this
-		// bound respects. The floor is the static cap -- this arm may only
-		// ever OPEN admission relative to control, never strangle it further.
-		EffectivePendingJobCap = FMath::Clamp(FMath::RoundToInt(DrainPerSecEMA * double(DrainSec)),
-		                                      StaticCap, 32768);
+		// bound respects. Default 32,768, sweepable as -VoxelAdmissionCapMax
+		// because at drain ~2,800/s it binds from DrainSec ~12 up (see
+		// AdmissionCapMax's comment). The floor is the static cap -- this arm
+		// may only ever OPEN admission relative to control, never strangle it
+		// further.
+		const int32 MaxCap = VoxelStreamAdmission::AdmissionCapMax();
+		const int32 Wanted = FMath::RoundToInt(DrainPerSecEMA * double(DrainSec));
+		EffectivePendingJobCap = FMath::Clamp(Wanted, StaticCap, MaxCap);
+		EffectiveCapSrc = (Wanted <= StaticCap) ? TEXT("floor")
+		                : (Wanted >= MaxCap)    ? TEXT("max")
+		                                        : TEXT("ema");
 	}
 
 	// Per-level breakouts of the three above. The global tallies cannot answer
@@ -9487,14 +9534,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       Slow.M(Slow.RHI) - Fast.M(Fast.RHI), Slow.M(Slow.GameWait) - Fast.M(Fast.GameWait));
 	}
 
-	UE_LOG(LogVoxelPerf, Log, TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld"),
+	UE_LOG(LogVoxelPerf, Log,
+	       TEXT("Voxel admission (5s window): cap=%d cutoffM=%.0f rejected=%lld dropped=%lld ")
+	       // drainEMA/capSrc appended 2026-08-23 (new columns at the END so
+	       // old-leg greps still parse): the drain-sec sweep cannot be read
+	       // from cap= alone -- cap=32768 is both "EMA x N landed there" and
+	       // "the ceiling clamped it", and only capSrc=max says the sweep has
+	       // stopped measuring DrainSec and started measuring
+	       // -VoxelAdmissionCapMax. drainEMA is the controller's one input;
+	       // if it does not track dispatched/5s / 5 the EMA is broken, which
+	       // no downstream number would otherwise reveal.
+	       TEXT("drainEMA=%.0f capSrc=%s"),
 	       // The EFFECTIVE cap: identical to GetPendingJobCap() unless
 	       // -VoxelAdmissionCapDrainSec is on, in which case this line is the
 	       // arm's proof of traffic -- cap pinned at the static floor with
 	       // the switch on is the FAILING reading (drain never justified more).
 	       EffectivePendingJobCap,
 	       WidestAdmissionCutoffM(),
-	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog);
+	       (long long)CandidatesRejectedSinceLog, (long long)RecordsDroppedSinceLog,
+	       DrainPerSecEMA, EffectiveCapSrc);
 
 	// PER-LEVEL, PER-REASON attribution of the line above (2026-08-23; see
 	// LevelRejBudgetSinceLog's doc comment for the night this would have
@@ -9512,11 +9570,19 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		           const double CutM = (LevelAdmissionCutoffDistSq[L] < DBL_MAX)
 		                                   ? FMath::Sqrt(LevelAdmissionCutoffDistSq[L]) / 100.0
 		                                   : -1.0;
+		           // q= appended 2026-08-23 (at the END of the block, same
+		           // old-leg-grep rule as the aggregate line): this ring's
+		           // pending-queue occupancy at log time. The relax tests --
+		           // global today, per-ring under -VoxelPerRingRelax -- are
+		           // occupancy comparisons, and without the occupancy printed
+		           // beside the cutoff, "cut= pinned" cannot be told apart
+		           // from "cut= pinned AND the queue genuinely never drains",
+		           // which are opposite verdicts on the relax condition.
 		           return FString::Printf(
-		               TEXT("R%d[cut=%.0f rejB=%lld rejC=%lld rejF=%lld rejN=%lld bk=%d]"), L, CutM,
+		               TEXT("R%d[cut=%.0f rejB=%lld rejC=%lld rejF=%lld rejN=%lld bk=%d q=%d]"), L, CutM,
 		               (long long)LevelRejBudgetSinceLog[L], (long long)LevelRejCutoffSinceLog[L],
 		               (long long)LevelRejFineSinceLog[L], (long long)LevelRejNearestSinceLog[L],
-		               DeferredFootprints[L].Num());
+		               DeferredFootprints[L].Num(), PendingJobKeysByLevel[L].Num());
 	           }));
 	// -VoxelCutoffClamp proof-of-traffic (gated so old-leg greps stay clean):
 	// clampScans / skippedCells per ring. All zeros with the cutoffs relaxed
