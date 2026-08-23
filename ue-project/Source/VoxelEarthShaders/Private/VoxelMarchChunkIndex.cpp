@@ -125,6 +125,42 @@ namespace
 		     "(56 MiB readback + ~17.5 ms hash per sample); for correctness legs, default 0."),
 		ECVF_RenderThreadSafe);
 
+	// THE METER WAS THE LOAD (2026-08-23). On the P1/P2 armed legs the game
+	// thread's largest single cost was not streaming at all -- it was the
+	// EXPECTED-HASH half of the verify above: the 56 MiB whole-grid FNV in
+	// MarkDirtyAndUpload, run once per dirty flush, measured at uploadMs
+	// 1,232-1,547 ms per 5 s window (25-30% of wall; ~13 ms per flush) on
+	// p1p2-armed and p2-verify-armed, against addedMs of 1-2 ms for the actual
+	// index bookkeeping. Every conclusion about "brickFlush cost" on those legs
+	// was really this hash: the manager's brickFlushMs bracket wraps the pool
+	// Flush whose index sink ends here.
+	//
+	// The fix leans on the verify's OWN sampling argument (FVerifySlot: "a
+	// wrong cell is PERSISTENT divergence... any later sample catches the bug
+	// class"): a sample that is skipped costs nothing to correctness, so the
+	// expected hash does not need computing for flushes that will not sample.
+	// This throttles the HASH, game-thread side, to at most one per period;
+	// unhashed flushes stage/publish exactly as before with no verify armed
+	// (the bHashNowValid=false path that already existed).
+	//
+	// Default 0 = hash every dirty flush, byte-identical to tonight's legs.
+	// 500 is the recommended verify-leg setting: ~2 samples/s still catches
+	// persistent divergence within a second while cutting the meter's cost
+	// ~25x. Does NOT throttle the comparator's hash (voxel.March.VerifySource
+	// / voxel.March.IndexContentHash force per-flush freshness; the comparator
+	// reads the value every frame). FAILING READING: VerifyPasses+VerifyFailures
+	// stuck at 0 with the verify armed and this set -- the throttle ate every
+	// sample (period too long against the leg length), and the leg verified
+	// nothing; it must be read as NOT MEASURED, never as 0 FAIL.
+	TAutoConsoleVariable<int32> CVarVoxelMarchIndexDeltaVerifyPeriodMs(
+		TEXT("voxel.March.IndexDeltaVerifyPeriodMs"), 0,
+		TEXT("Minimum milliseconds between EXPECTED-HASH computations for "
+		     "voxel.March.IndexDeltaVerify (the 56 MiB game-thread FNV -- measured 25-30% of "
+		     "wall on the 2026-08-23 armed legs at the default). 0 = every dirty flush "
+		     "(tonight's behaviour). Flushes between samples stage without a verify, which "
+		     "the sampling design already treats as correct. Recommended 500 for verify legs."),
+		ECVF_RenderThreadSafe);
+
 	// THE VERIFY GATE USED TO CRASH THE RHI, and the fix is the readback ring
 	// in the header (FVerifySlot). The crash, for the record:
 	//
@@ -1079,7 +1115,31 @@ void FVoxelMarchChunkIndex::MarkDirtyAndUpload()
 	// other side is compared against.
 	uint64 HashNow = 0;
 	bool bHashNowValid = false;
-	if (bContentHashEnabled || bVerifyWanted)
+	// The verify-only consumer is THROTTLED (see the PeriodMs cvar for the
+	// 25-30%-of-wall measurement that forced this); the comparator is not --
+	// it reads the hash every frame, so a stale value there is a wrong
+	// instrument, where a skipped verify sample is just a smaller sample.
+	bool bWantHashNow = bContentHashEnabled;
+	if (!bWantHashNow && bVerifyWanted)
+	{
+		const int32 PeriodMs = CVarVoxelMarchIndexDeltaVerifyPeriodMs.GetValueOnGameThread();
+		if (PeriodMs <= 0)
+		{
+			bWantHashNow = true;
+		}
+		else
+		{
+			// Game thread only, like every mutable on this path.
+			static double LastVerifyHashSeconds = 0.0;
+			const double NowSeconds = FPlatformTime::Seconds();
+			if (NowSeconds - LastVerifyHashSeconds >= double(PeriodMs) / 1000.0)
+			{
+				LastVerifyHashSeconds = NowSeconds;
+				bWantHashNow = true;
+			}
+		}
+	}
+	if (bWantHashNow)
 	{
 		uint64 Hash = 1469598103934665603ull;
 		for (uint32 V : Cells)

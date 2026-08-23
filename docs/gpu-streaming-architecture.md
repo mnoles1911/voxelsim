@@ -212,6 +212,31 @@ The 6,200 floor is cleared. This morning it was 12,355 frames, p50 20.72 ms,
 | Shadow marching OFF | ~13 ms of a 20.7 ms frame; backlog §0.0a |
 | Brick pool 262,144 | the cap raise overflowed the old 131,072 and it silently evicted and DROPPED WRITES |
 
+### Producer leg (2026-08-23, later session) — landed, default OFF, unmeasured
+
+The armed-fork legs answered §4's open question with the stage partition itself:
+**queued = 2,187-2,196 ms of a 2,337-2,350 ms submit→deliver (93-94%), n≈25k
+jobs**, against dispatchToReady 61-70 ms. Delivered rate 89/s == MeshBatchCap
+(4) × the leg's ~24 fps; gpuInFlight ~12 == 4/tick × the ~3-tick service
+latency — Little's law closes exactly, so **the per-tick promotion quota is the
+fork's ceiling**, not MaxInFlight (256, never approached) and not the GPU.
+Separately, the "brickFlush" game-thread cost (651-822 ms/5 s at the manager's
+bracket; sink 1,232-1,547 ms/5 s across both call sites) attributes line-by-line
+to the **delta-verify's 56 MiB whole-grid FNV** (`uploadMs` ≈ the whole sink;
+`addedMs` 1-2 ms) — the meter was the load, and every armed leg tonight carried
+it via `-ExecCmds voxel.March.IndexDeltaVerify 1`.
+
+What landed (all command-line latched, all default OFF, control byte-identical):
+
+| switch | what it removes | proof it ran / failing reading |
+|---|---|---|
+| `-VoxelGpuLeanBrickJobs=1` | the 48×48×6 mesh-region graph on brick-only band-free jobs (3.4× the generation work; consumed by nothing) | `[gpu-lean]` line: `skipped=` must grow; `kept because:` names the blocking precondition |
+| `-VoxelGpuBandColdOnly=1` | the band readback — the LAST fence on a P1 brick job — on the ~88% of level-0 jobs whose (X,Y) band is already cached | `[gpu-lean] kept because: band` must fall toward the cold fraction |
+| `-VoxelGpuStackClaim=1` (needs `-VoxelGpuWorldGenBatch=1 -VoxelGpuPoolAlloc=1`) | the B.1↔P1 conflict: fused K-chunk stacks now land through per-member claim passes reading the per-chunk totals **in the stack's graph** (prefix derived in-kernel); no stack totals readback, and the quota counts STACKS (~8 chunks) | `[gpu-batch] stacks=` must be nonzero; the claim kernel's split gate (sum per-chunk == region, `claimFail worst`) and the bitmap double-grant gate stay live; either nonzero invalidates the leg |
+| `-VoxelGpuMeshBatchCap= / -VoxelGpuMeshSpecCap= / -VoxelGpuMeshHarvestCap=` | the -ExecCmds startup-window blur on the three quotas, so the promotion knee can be swept honestly | delivered/s must move ∝ cap if the quota analysis is right; hitches-not-chunks says pass setup binds next |
+| `-VoxelGpuPoolOccStep= / -VoxelGpuPoolMatStep= / -VoxelGpuPoolFreeStackCap=` | the 39.7-40.8% class-round-up padding (steps 128/512 vs small mean claims) and the leaked free-runs (bursty evictions overflowing 2,048-deep class stacks: 29,012 leaks vs 347,709 frees on the worst leg) | `padding` must fall ~with the step; `leakedRuns` must stop growing at cap 16384 — still growing says eviction outruns claims systemically |
+| `voxel.March.IndexDeltaVerifyPeriodMs 500` | ~25× of the verify meter's game-thread cost (sampled expected-hash instead of per-flush) | `VerifyPasses+VerifyFailures` still >0 or the leg verified nothing and must read NOT MEASURED |
+
 ### Landed, default OFF, unmeasured
 
 `voxel.GPU.PoolAlloc` (P1, one GPU allocator for both producers — latched at

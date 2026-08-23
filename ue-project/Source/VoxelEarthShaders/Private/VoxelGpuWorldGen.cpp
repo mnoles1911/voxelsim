@@ -799,6 +799,11 @@ namespace
 			SHADER_PARAMETER(uint32, ChunkSlot)
 			SHADER_PARAMETER(uint32, OccWorstWords)
 			SHADER_PARAMETER(uint32, MatWorstWords)
+			// Stack-claim (see the .usf): 0 = classic totals at [0..1]; n =
+			// fused-stack member n-1, totals at [2+2c..], prefix summed in-kernel.
+			SHADER_PARAMETER(uint32, TotalsChunkIndexPlusOne)
+			// Stack size K; non-zero arms the in-kernel split gate.
+			SHADER_PARAMETER(uint32, TotalsNumChunks)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickTotals)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocState)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
@@ -831,6 +836,8 @@ namespace
 		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
 			SHADER_PARAMETER(uint32, BrickCount)
 			SHADER_PARAMETER(uint32, BrickBase)
+			// Stack-claim: this member's slice of the shared scratch descs.
+			SHADER_PARAMETER(uint32, SrcDescBase)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
@@ -853,6 +860,9 @@ namespace
 			SHADER_PARAMETER(uint32, ChunkSurfaceGradPacked)
 			SHADER_PARAMETER(uint32, ChunkSurfaceZRelBits)
 			SHADER_PARAMETER(FIntVector3, OriginVoxel)
+			// Stack-claim: this member's desc slice and L1-mask slot.
+			SHADER_PARAMETER(uint32, SrcDescBase)
+			SHADER_PARAMETER(uint32, ChunkMaskBase)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
@@ -2313,7 +2323,9 @@ FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
                                                       const FBrickPoolAllocBuffers& Buffers,
                                                       const FBrickPoolAllocLayout& Layout,
                                                       FRDGBufferRef BrickTotals, uint32 ChunkSlot,
-                                                      uint32 OccWorstWords, uint32 MatWorstWords)
+                                                      uint32 OccWorstWords, uint32 MatWorstWords,
+                                                      uint32 TotalsChunkIndexPlusOne,
+                                                      uint32 TotalsNumChunks)
 {
 	if (!Buffers.IsValid() || BrickTotals == nullptr)
 	{
@@ -2329,6 +2341,8 @@ FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
 	Params->ChunkSlot = ChunkSlot;
 	Params->OccWorstWords = OccWorstWords;
 	Params->MatWorstWords = MatWorstWords;
+	Params->TotalsChunkIndexPlusOne = TotalsChunkIndexPlusOne;
+	Params->TotalsNumChunks = TotalsNumChunks;
 	Params->InBrickTotals = GraphBuilder.CreateSRV(BrickTotals);
 	Params->AllocState = GraphBuilder.CreateUAV(Buffers.AllocState);
 	Params->AllocBitmap = GraphBuilder.CreateUAV(Buffers.AllocBitmap);
@@ -2350,7 +2364,8 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
                                                     uint32 BrickCount, uint32 ChunkSlot, uint32 BrickBase,
                                                     uint32 RingLevel, const FIntVector& OriginVoxel,
                                                     const FVoxelBrickChunkShading& Shading,
-                                                    uint32 OccWorstWords, uint32 MatWorstWords)
+                                                    uint32 OccWorstWords, uint32 MatWorstWords,
+                                                    uint32 SrcDescBase, uint32 ChunkMaskBase)
 {
 	if (!Buffers.IsValid() || Claim == nullptr || SrcOcc == nullptr || SrcMat == nullptr ||
 	    SrcDesc == nullptr || SrcChunkMask == nullptr || BrickCount == 0)
@@ -2398,6 +2413,7 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 			GraphBuilder.AllocParameters<FVoxelBrickPoolAllocDescCS::FParameters>();
 		Params->BrickCount = BrickCount;
 		Params->BrickBase = BrickBase;
+		Params->SrcDescBase = SrcDescBase;
 		Params->InClaim = GraphBuilder.CreateSRV(Claim);
 		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
 		Params->OutBrickDesc = GraphBuilder.CreateUAV(Buffers.PoolDesc);
@@ -2417,6 +2433,8 @@ void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
 		Shading.Pack(Params->ChunkClimatePacked, Params->ChunkSurfaceGradPacked,
 		             Params->ChunkSurfaceZRelBits);
 		Params->OriginVoxel = FIntVector3(OriginVoxel.X, OriginVoxel.Y, OriginVoxel.Z);
+		Params->SrcDescBase = SrcDescBase;
+		Params->ChunkMaskBase = ChunkMaskBase;
 		Params->InClaim = GraphBuilder.CreateSRV(Claim);
 		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
 		Params->InBrickOcc = GraphBuilder.CreateSRV(SrcOcc);

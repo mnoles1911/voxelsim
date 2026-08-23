@@ -253,6 +253,190 @@ bool VoxelGpuWorldGenBatchEnabled()
 	return CmdLine >= 0 ? CmdLine != 0 : GVoxelGpuWorldGenBatch != 0;
 }
 
+// --- P3 prep (2026-08-23): the promotion quotas become sweepable ------------
+//
+// WHY THESE EXIST. The armed-fork legs (Saved/p1p2-armed.log, p2-verify-armed.log)
+// put 93% of the fork's submit->deliver latency in QUEUE WAIT: mean
+// queued=2,187.5 ms of submitToDeliver=2,350.0 ms over n=25,387 complete jobs,
+// against dispatchToReady=70.1 ms of actual GPU+poll time. Little's law closes
+// the loop exactly: delivered rate 89/s == MeshBatchCap (4) x the leg's ~24 fps,
+// and the observed gpuInFlight ~12 == 4/tick x the ~3-tick promote->deliver
+// latency. THE PER-TICK PROMOTION QUOTA IS THE FORK'S THROUGHPUT CEILING, not
+// MaxInFlight (256, never approached) and not the GPU (idle-dominated).
+//
+// The quotas were already cvars, but -ExecCmds cvars land after streaming has
+// begun (the standing reason on VoxelGpuBrickPackEnabled), so an A/B sweep off
+// the cvar silently measures a blend of two regimes. These latches make the
+// sweep honest: -VoxelGpuMeshBatchCap=N / -VoxelGpuMeshSpecCap=N /
+// -VoxelGpuMeshHarvestCap=N outrank the cvars for the whole process.
+//
+// THE OLD SWEEP DOES NOT PRE-ANSWER THE NEW ONE. MeshBatchCap's own comment
+// records 32/64 hitching (367 hitches vs 4/8's 8) -- but that sweep ran with
+// every job paying TWO region graphs (the 48x48x6 mesh region plus the 32x32x4
+// brick region; see VoxelGpuLeanBrickJobsEnabled below). With the lean switch
+// removing the larger graph, the per-job render-thread and GPU cost the old
+// sweep choked on is ~4.4x smaller, so the knee is expected somewhere new --
+// which is exactly what the sweep is for. Failure reading: raising the cap
+// moves hitches, not chunks/s -- then pass setup still binds and the next fix
+// is fused multi-chunk dispatch, not a bigger cap.
+static int32 VoxelGpuMeshBatchCapEffective()
+{
+	static const int32 CmdLine = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshBatchCap="), Value);
+		return Value;
+	}();
+	return CmdLine >= 0 ? CmdLine : GVoxelGpuMeshBatchCap;
+}
+
+static int32 VoxelGpuMeshSpecCapEffective()
+{
+	static const int32 CmdLine = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshSpecCap="), Value);
+		return Value;
+	}();
+	return CmdLine >= 0 ? CmdLine : GVoxelGpuMeshSpeculativeBatchCap;
+}
+
+static int32 VoxelGpuMeshHarvestCapEffective()
+{
+	static const int32 CmdLine = []
+	{
+		int32 Value = -1;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshHarvestCap="), Value);
+		return Value;
+	}();
+	return CmdLine >= 0 ? CmdLine : GVoxelGpuMeshHarvestCap;
+}
+
+// --- LEAN BRICK-ONLY JOBS (-VoxelGpuLeanBrickJobs, default OFF) -------------
+//
+// WHAT THE FULL PATH WASTES. DispatchBatch runs AddRegionPasses(Job->Region) --
+// the 48x48x6-brick MESH region, with its one-brick halo -- for EVERY job,
+// before the halo-free 32x32x4 brick region that actually feeds the pool. On a
+// brick-only job (voxel.Terrain.RetireQuads, the marcher build) that first
+// graph's outputs are consumed by exactly one thing: the 2-int footprint BAND
+// readback, and only on level-0 jobs that asked for one. A coarse brick-only
+// job, and a level-0 job whose footprint band is already cached (the subsystem's
+// -VoxelGpuBandColdOnly latch), reads NOTHING from it -- yet still pays
+// 48x48=2,304 columns + 48x48x48 voxelize against the brick region's 1,024
+// columns + 32x32x32: 3.4x the generation work, in a second set of ~7 passes,
+// per chunk, for nothing.
+//
+// It also pays a LATENCY price: the band readback is the only fence left on a
+// P1 (voxel.GPU.PoolAlloc) brick-only job. Without it the job has NO readback
+// at all and is deliverable the tick after dispatch instead of riding the
+// poll-quantised readback path (dispatchToReady 70.1 ms mean on p1p2-armed).
+//
+// Armed, a job that is brick-only AND band-free AND packing skips the mesh
+// region graph entirely. Counted both ways (window line below): lean= must grow
+// while armed or the switch is dead -- the "on and doing nothing" state this
+// project keeps paying for is made unrepresentable by the counters, not by
+// hope. Default OFF: the control graph is byte-identical without the flag.
+static bool VoxelGpuLeanBrickJobsEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuLeanBrickJobs="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// --- STACK-CLAIM (-VoxelGpuStackClaim, default OFF) -------------------------
+//
+// THE ROUND-TRIP-FREE PRODUCER'S MISSING THIRD. Tonight's measured chain: P1
+// claims a classic job's ranges in-graph with zero readback (1,101,676 claims,
+// 0 FAIL); P2 publishes index cells from the GPU (verify pass=8319 FAIL=0);
+// but B.1's K-chunk fused stacks -- the only shape whose PASS COUNT is
+// constant in K -- were DISABLED under the armed pool, because a stack's
+// members landed through the (2+2K)-dword totals readback and a CPU-side
+// prefix harvest the armed pool cannot use. So the armed configuration was
+// forced to per-chunk graphs, and the per-tick promotion quota (the fork's
+// measured ceiling: delivered 89/s == MeshBatchCap 4 x ~24 fps, queued
+// p50 2.2-13 s, gpuDemandPending pinned at 253-255) counted CHUNKS.
+//
+// Armed, a fused stack's members claim their own ranges IN THE STACK'S GRAPH:
+// the claim kernel reads member c's totals pair at [2+2c] and derives its
+// shared-scratch prefix in-kernel (the arithmetic the CPU harvest used to do
+// from the readback), and the write passes land words/descs/record through
+// the member's own claim. NOTHING comes back -- the stack totals readback is
+// not enqueued at all -- and the promotion quota now counts STACKS of ~8
+// chunks (the measured column stack), an ~8x amortisation of both the quota
+// and the per-chunk pass setup, on top of the mesh-region graphs the stack
+// path already skips.
+//
+// Requires voxel.GPU.WorldGenBatch (or -VoxelGpuWorldGenBatch=1) AND
+// -VoxelGpuPoolAlloc=1; without either it changes nothing. Default OFF:
+// tonight's armed configuration is bit-for-bit the control. Correctness is
+// watched by the SAME instruments as the classic claims -- the page-bitmap
+// double-grant gate, the [brick-gpualloc] xcheck samples (stack members'
+// shells enter the same verify ring), and voxel.GPU.VerifyBrickStack for the
+// generation half. FAILING READINGS: xcheck FAIL>0 or doubleGrant>0
+// invalidates the leg outright; [gpu-batch] stacks=0 with this armed means
+// the fusion never fired and the arm measured the classic path wearing a new
+// flag.
+static bool VoxelGpuStackClaimEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuStackClaim="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+namespace VoxelGpuLeanDetail
+{
+	// Render-thread atomics, VoxelGpuBatchDetail's reason verbatim: the counts
+	// are taken inside DispatchBatch's render command, which must not capture
+	// `this`. Window-read by MaybeLogLeanWindow on the game thread; a torn read
+	// misplaces a job across two windows, never invents or loses one.
+	static std::atomic<int64> GLeanJobs{ 0 };       // mesh region SKIPPED
+	static std::atomic<int64> GFullQuadJobs{ 0 };   // kept: job still emits quads
+	static std::atomic<int64> GFullBandJobs{ 0 };   // kept: job carries a band request
+	static std::atomic<int64> GFullNoPackJobs{ 0 }; // kept: job packs no bricks
+
+	// The armed-only window line, ~5 s cadence, game thread (called from Tick).
+	// CUMULATIVE counts, deliberately -- a window that happened to be idle must
+	// not print zeros that read as "the switch died"; growth between lines is
+	// the signal. THE FAILING READING: lean stays 0 while band/quads/noPack
+	// grow -- the switch is armed and declining everything, and the dominant
+	// reason names which precondition is missing.
+	inline void MaybeLogWindow()
+	{
+		static double LastLogSeconds = 0.0;
+		const double Now = FPlatformTime::Seconds();
+		if (LastLogSeconds <= 0.0)
+		{
+			LastLogSeconds = Now;
+			return;
+		}
+		if (Now - LastLogSeconds < 5.0)
+		{
+			return;
+		}
+		LastLogSeconds = Now;
+		const int64 Lean = GLeanJobs.load(std::memory_order_relaxed);
+		const int64 Quad = GFullQuadJobs.load(std::memory_order_relaxed);
+		const int64 Band = GFullBandJobs.load(std::memory_order_relaxed);
+		const int64 NoPack = GFullNoPackJobs.load(std::memory_order_relaxed);
+		if (Lean + Quad + Band + NoPack == 0)
+		{
+			return; // armed and idle: no jobs dispatched yet, nothing to claim
+		}
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-lean] mesh-region graphs skipped=%lld kept=%lld ")
+		       TEXT("(kept because: quads %lld, band %lld, noPack %lld) (cumulative)"),
+		       Lean, Quad + Band + NoPack, Quad, Band, NoPack);
+	}
+}
+
 namespace VoxelGpuBatchDetail
 {
 	// Longest Z-run one stack may fuse. NOT a correctness bound -- validation
@@ -501,6 +685,15 @@ struct FVoxelGpuBrickStack
 	// is pointed at this object.
 	FVoxelGpuRegionRequest Region;
 	int32 NumChunks = 0;
+
+	// STACK-CLAIM (-VoxelGpuStackClaim, 2026-08-23): true when this stack's
+	// members land through the GPU allocator -- per-member claim passes read
+	// the per-chunk totals IN THE GRAPH and no TotalsReadback exists. Set on
+	// the game thread at assembly, before any member is pointed at this
+	// object; read on both threads afterwards, immutable. The poll's stack
+	// phase-1 branch is BYPASSED for such members (there is nothing to
+	// harvest); they take the ordinary no-readback road to TotalDone.
+	bool bClaimBased = false;
 
 	// Created and used on the render thread; released there too (see ~).
 	TUniquePtr<FRHIGPUBufferReadback> TotalsReadback;
@@ -917,8 +1110,15 @@ namespace
 	// unreferenced passes, and skipping the recording removes even the setup).
 	// Either way nothing observable changes, which is what lets the control
 	// leg stay byte-identical.
+	// BindPoolAlloc / PoolAllocBufs / PoolAllocLayout: DispatchBatch's lazy
+	// allocator binding, reached through here so a CLAIM-BASED stack (see
+	// FVoxelGpuBrickStack::bClaimBased) can add its members' claim+write passes
+	// into this same graph. A readback-based stack never touches them.
 	void AddBrickStackPasses(FRDGBuilder& GraphBuilder, const TArray<FJobPtr>& Members,
-	                         TArray<FJobPtr>& Built)
+	                         TArray<FJobPtr>& Built,
+	                         TFunctionRef<bool()> BindPoolAlloc,
+	                         const VoxelGpuWorldGen::FBrickPoolAllocBuffers& PoolAllocBufs,
+	                         const FVoxelBrickPoolAllocLayout& PoolAllocLayout)
 	{
 		if (Members.Num() == 0 || !Members[0]->BrickStack.IsValid())
 		{
@@ -959,6 +1159,72 @@ namespace
 				Member->Error = TEXT("batched stack region produced no brick buffers");
 				Member->SetState(EJobState::Failed);
 			}
+			return;
+		}
+
+		// --- STACK-CLAIM: land the members through the GPU allocator, HERE -----
+		//
+		// Same graph, no payloads, no readback. Each live shelled member claims
+		// its ranges off its own totals pair (TotalsChunkIndexPlusOne = c+1;
+		// the kernel derives the shared-scratch prefix the CPU harvest used to
+		// compute) and the write passes copy its slice straight into the
+		// arenas. The scratch never becomes an external buffer -- it dies with
+		// this graph, exactly like a classic P1 job's. A member without a
+		// shell (ShellRefused, already counted) adds no passes and delivers
+		// "produced nothing", the classic path's own semantics for that state.
+		if (Stack->bClaimBased)
+		{
+			const uint32 BricksPerChunk = Graph.Sizes.NumBricks / uint32(Stack->NumChunks);
+			const bool bBound = BindPoolAlloc();
+			if (!bBound)
+			{
+				// Loud and fatal for the stack, not silent: without the
+				// allocator buffers no member can land, and "armed but landed
+				// nothing" must never read as an empty world with healthy
+				// counters -- the fourth silent no-op this project refuses to
+				// grow.
+				UE_LOG(LogTemp, Error,
+				       TEXT("[gpu-batch] claim-based stack of %d chunks: allocator buffers ")
+				       TEXT("unavailable; every member fails loudly."), Stack->NumChunks);
+				for (const FJobPtr& Member : Members)
+				{
+					Member->Error = TEXT("stack-claim: allocator buffers unavailable");
+					Member->SetState(EJobState::Failed);
+				}
+				return;
+			}
+			for (const FJobPtr& Member : Members)
+			{
+				if (Member->Abandoned.load(std::memory_order_acquire) != 0)
+				{
+					continue;
+				}
+				if (Member->bGpuPoolAlloc)
+				{
+					const uint32 C = uint32(Member->StackChunkIndex);
+					FRDGBufferRef Claim = VoxelGpuWorldGen::AddBrickPoolClaimPass(
+						GraphBuilder, PoolAllocBufs, PoolAllocLayout,
+						Graph.BrickStackTotals, Member->GpuChunkSlot,
+						BricksPerChunk * 16u, BricksPerChunk * 132u,
+						/*TotalsChunkIndexPlusOne*/ C + 1u,
+						/*TotalsNumChunks (arms the split gate)*/ uint32(Stack->NumChunks));
+					VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(
+						GraphBuilder, PoolAllocBufs, Claim,
+						Graph.BrickOcc, Graph.BrickMat,
+						Graph.BrickDesc, Graph.BrickChunkMask,
+						BricksPerChunk, Member->GpuChunkSlot, Member->GpuBrickBase,
+						uint32(FMath::Clamp(Member->BrickKey.Level, 0, 15)),
+						Member->BrickOriginVoxel, Member->BrickShading,
+						BricksPerChunk * 16u, BricksPerChunk * 132u,
+						/*SrcDescBase*/ C * BricksPerChunk, /*ChunkMaskBase*/ C * 2u);
+				}
+				// Built either way: a shell-less member's outcome is "Success,
+				// no volume", delivered through the ordinary no-readback road.
+				Built.Add(Member);
+			}
+			// NO TotalsReadback -- that is the point. The poll's stack branch
+			// is bypassed by bClaimBased and every member walks the classic
+			// no-readback phase 1 to TotalDone.
 			return;
 		}
 
@@ -1319,7 +1585,12 @@ void FVoxelGpuMeshJobManager::Tick()
 	// passes, zero throughput moved), so the combination costs nothing tonight
 	// and the interplay is a counted fallback rather than a silent one.
 	bool bBatchArmed = VoxelGpuWorldGenBatchEnabled();
-	if (bBatchArmed && VoxelGpuPoolAllocEnabled())
+	// STACK-CLAIM lifts the conflict: with -VoxelGpuStackClaim=1 a stack's
+	// members claim their own ranges in the stack's graph (see the accessor),
+	// so the totals readback the armed pool refuses is not needed. Without it,
+	// the disable stands exactly as before.
+	const bool bStackClaim = VoxelGpuStackClaimEnabled() && VoxelGpuPoolAllocEnabled();
+	if (bBatchArmed && VoxelGpuPoolAllocEnabled() && !bStackClaim)
 	{
 		if (!bPoolAllocStackConflictLogged)
 		{
@@ -1327,7 +1598,8 @@ void FVoxelGpuMeshJobManager::Tick()
 			UE_LOG(LogVoxelGpuMeshJob, Warning,
 			       TEXT("[gpu-batch] voxel.GPU.WorldGenBatch is armed but voxel.GPU.PoolAlloc is too; ")
 			       TEXT("stacking is DISABLED for this run (stack members would need the totals ")
-			       TEXT("readback the armed pool refuses)."));
+			       TEXT("readback the armed pool refuses). Arm -VoxelGpuStackClaim=1 to fuse ")
+			       TEXT("stacks through the GPU allocator instead."));
 		}
 		bBatchArmed = false;
 	}
@@ -1361,7 +1633,10 @@ void FVoxelGpuMeshJobManager::Tick()
 	// The cap counts PROMOTED jobs, not loop iterations: a rejected job never
 	// reaches the graph and costs no pass setup, so draining a run of rejects in
 	// one tick is both free and desirable (it gets them delivered sooner).
-	const int32 BatchCap = GVoxelGpuMeshBatchCap > 0 ? GVoxelGpuMeshBatchCap : MAX_int32;
+	// P3 prep: the command-line latch outranks the cvar (see the accessor for
+	// the queued=93% measurement that made these quotas the thing to sweep).
+	const int32 BatchCapRaw = VoxelGpuMeshBatchCapEffective();
+	const int32 BatchCap = BatchCapRaw > 0 ? BatchCapRaw : MAX_int32;
 
 	// LOW PRIORITY GETS ITS OWN PER-TICK ALLOWANCE, NOT A SHARE OF BatchCap.
 	//
@@ -1385,7 +1660,7 @@ void FVoxelGpuMeshJobManager::Tick()
 	// separate SpecBatchCap on top, still bounded by MaxInFlight and still taken
 	// only after demand has had its fill this tick. Demand's throughput and
 	// ordering are untouched; speculation rides in the slack.
-	const int32 SpecBatchCap = FMath::Max(0, GVoxelGpuMeshSpeculativeBatchCap);
+	const int32 SpecBatchCap = FMath::Max(0, VoxelGpuMeshSpecCapEffective());
 
 	TArray<FJobPtr> Batch;
 	TArray<TPair<FJobPtr, FString>> Rejected;
@@ -1585,6 +1860,9 @@ void FVoxelGpuMeshJobManager::Tick()
 			TSharedPtr<FVoxelGpuBrickStack, ESPMode::ThreadSafe> Stack =
 				MakeShared<FVoxelGpuBrickStack, ESPMode::ThreadSafe>();
 			Stack->NumChunks = RunLen;
+			// Latched at assembly, immutable after -- the poll and the graph
+			// build both read it. (bStackClaim implies PoolAlloc is armed.)
+			Stack->bClaimBased = bStackClaim;
 			// The bottom member's halo-free region stretched over the run:
 			// same 32x32 columns, same raster window (memcmp-verified equal
 			// across members), K chunks of z. decodeBrick decomposes it back
@@ -1649,6 +1927,12 @@ void FVoxelGpuMeshJobManager::Tick()
 	if (bBatchArmed)
 	{
 		MaybeLogBatchWindow();
+	}
+	// The lean window line, same armed-only rule as the batch one: a control
+	// leg must not gain a log line.
+	if (VoxelGpuLeanBrickJobsEnabled())
+	{
+		VoxelGpuLeanDetail::MaybeLogWindow();
 	}
 
 	// --- 2. poll and harvest ------------------------------------------------
@@ -1769,11 +2053,14 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			{
 				continue;
 			}
-			if (Job->BrickStack.IsValid())
+			if (Job->BrickStack.IsValid() && !Job->BrickStack->bClaimBased)
 			{
-				// Should be unreachable -- stacking is disabled while armed --
-				// but counted rather than assumed, because "cannot happen" that
-				// silently starts happening is this project's recurring bill.
+				// Should be unreachable -- readback-based stacking is disabled
+				// while armed -- but counted rather than assumed, because
+				// "cannot happen" that silently starts happening is this
+				// project's recurring bill. A CLAIM-BASED stack member falls
+				// through: it takes a shell exactly like a classic job, and
+				// its claim rides the stack's graph instead of its own.
 				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::Stacked);
 				continue;
 			}
@@ -1892,7 +2179,8 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			}
 			for (TPair<FVoxelGpuBrickStack*, TArray<FJobPtr>>& Group : StackGroups)
 			{
-				AddBrickStackPasses(GraphBuilder, Group.Value, Built);
+				AddBrickStackPasses(GraphBuilder, Group.Value, Built,
+				                    BindPoolAlloc, PoolAllocBufs, PoolAllocLayout);
 			}
 		}
 
@@ -1908,6 +2196,52 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				continue;
 			}
 
+			// --- LEAN BRICK-ONLY JOBS (-VoxelGpuLeanBrickJobs) ----------------
+			//
+			// The mesh-region graph below exists, on a brick-only job, for ONE
+			// consumer: the band readback -- and only when this job asked for a
+			// band. A brick-only, band-free, packing job reads nothing from it,
+			// so armed, it is skipped whole: 2,304 columns + 110,592-cell
+			// voxelize (48x48x6 with halo) that the 1,024-column/32,768-cell
+			// brick region below repeats anyway -- 3.4x the generation work --
+			// and, under voxel.GPU.PoolAlloc, the job's LAST readback, i.e. the
+			// difference between the poll-quantised path (dispatchToReady
+			// 70.1 ms mean, p1p2-armed) and deliverable-at-enqueue.
+			//
+			// The decision is per JOB, not per batch: a mixed batch (a level-0
+			// cold-band job beside coarse ones) leans the jobs that can and
+			// counts the ones that cannot, by reason. Byte-identical with the
+			// switch off.
+			const bool bLeanJob = VoxelGpuLeanBrickJobsEnabled()
+				&& !Job->bQuadMesh
+				&& Job->Region.BandEdge == 0
+				&& Job->bBrickPack;
+			if (bLeanJob)
+			{
+				VoxelGpuLeanDetail::GLeanJobs.fetch_add(1, std::memory_order_relaxed);
+			}
+			else if (VoxelGpuLeanBrickJobsEnabled())
+			{
+				// Counted BY REASON, so "armed but lean=0" reads as a diagnosis
+				// instead of a mystery: all-quads means RetireQuads is off,
+				// all-band means -VoxelGpuBandColdOnly is not armed (or the
+				// band cache never warms), all-noPack means BrickPack is off.
+				if (Job->bQuadMesh)
+				{
+					VoxelGpuLeanDetail::GFullQuadJobs.fetch_add(1, std::memory_order_relaxed);
+				}
+				else if (Job->Region.BandEdge > 0)
+				{
+					VoxelGpuLeanDetail::GFullBandJobs.fetch_add(1, std::memory_order_relaxed);
+				}
+				else
+				{
+					VoxelGpuLeanDetail::GFullNoPackJobs.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
+
+			if (!bLeanJob)
+			{
 			const VoxelGpuWorldGen::FRegionGraphResources Graph =
 				VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->Region);
 
@@ -1982,6 +2316,7 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				AddEnqueueCopyPass(GraphBuilder, Job->OffsetsReadback.Get(), Graph.Offsets,
 				                   Job->Sizes.CountsBytes());
 			}
+			} // !bLeanJob -- the mesh-region graph and its three consumers
 
 			// --- P1-C: the brick region, in THIS graph ---------------------
 			//
@@ -2250,7 +2585,7 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 		// Latched here rather than read on the render thread, for the same
 		// reason Submit latches MeshChunkLocal: one poll should behave like one
 		// poll, not change budget halfway through.
-		const int32 HarvestCap = GVoxelGpuMeshHarvestCap;
+		const int32 HarvestCap = VoxelGpuMeshHarvestCapEffective();
 
 		ENQUEUE_RENDER_COMMAND(VoxelGpuMeshPoll)(
 			[Jobs = MoveTemp(ToPoll), HarvestCap](FRHICommandListImmediate&)
@@ -2298,7 +2633,13 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 				// fills its own pair plus its prefix starts from the shared
 				// table. All render-thread, serial across poll commands, so
 				// the stack's plain fields need no atomics.
-				if (State == EJobState::Dispatched && Job->BrickStack.IsValid())
+				// STACK-CLAIM: a claim-based member has no stack readback to
+				// harvest -- its totals were consumed by its claim pass in the
+				// stack's own graph -- so it takes the classic no-readback
+				// phase 1 below (all its bNeed* terms are false) instead of
+				// this branch, which would fail it for the readback's absence.
+				if (State == EJobState::Dispatched && Job->BrickStack.IsValid() &&
+				    !Job->BrickStack->bClaimBased)
 				{
 					FVoxelGpuBrickStack& Stack = *Job->BrickStack;
 					if (Stack.bFailed)

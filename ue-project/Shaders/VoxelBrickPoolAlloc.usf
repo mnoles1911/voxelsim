@@ -172,6 +172,30 @@ uint WordsClaimIndex;  // copy pass: 2 selects occ (claim[1]/[2]), 0 means read
 uint NumSlots;         // free pass
 uint NumEntries;       // verify pass
 
+// --- stack-claim (B.1 fusion under voxel.GPU.PoolAlloc, 2026-08-23) ----------
+//
+// A fused Z-stack runs ONE region graph for K chunks; BrickStackTotalsMain
+// writes [0..1] region totals then [2+2c, 3+2c] per-chunk pairs. Each member's
+// claim reads ITS OWN pair and derives its scratch prefix (where its words
+// start in the SHARED batch scratch) by summing the pairs before it -- the
+// same prefix the CPU harvest used to compute from the totals readback this
+// path deletes. 0 = classic single-chunk claim, byte-identical: totals at
+// [0..1], prefix 0. Encoded as index+1 so the zero default cannot be confused
+// with "member 0" (member 0 is value 1, prefix 0, totals at [2..3]).
+uint TotalsChunkIndexPlusOne;
+// Stack size K, 0 on the classic path. Non-zero arms the SPLIT GATE inside the
+// claim: sum(per-chunk pairs) must equal the region pair -- the cross-check the
+// CPU harvest used to run on the totals readback, now run where the totals
+// live. A wrong split would copy one chunk's words into another chunk's claimed
+// range: correctly-allocated addresses, wrong bytes, plausible terrain -- the
+// exact class the bitmap gate CANNOT see, which is why the check must not die
+// with the readback.
+uint TotalsNumChunks;
+// Copy/desc/record passes: where this member's slice starts in the shared
+// scratch. 0 on the classic path (whole scratch is the chunk's).
+uint SrcDescBase;      // descriptor slice: chunkIndex * bricks-per-chunk
+uint ChunkMaskBase;    // L1-mask slot: chunkIndex * 2
+
 // Counter indices in AllocState. MIRRORED in FVoxelBrickPool (kGpuAllocCtr*);
 // a drifted index misattributes a counter, it does not corrupt terrain, which is
 // why params were not spent on all of them -- but keep the two lists in sync.
@@ -199,6 +223,12 @@ static const uint kFailWorstCase = 1u;
 static const uint kFailOccSpace  = 2u;
 static const uint kFailMatSpace  = 3u;
 static const uint kFailCollision = 4u;
+// Stack-claim split gate: sum(per-chunk totals) != region totals. Counted into
+// kCtrClaimFailWorst -- the same verdict ("these totals cannot be trusted; the
+// leg is invalid"), distinguishable post-mortem by this reason code. 5, NOT 4:
+// it was first written as 4 and collided with kFailCollision above -- two
+// failures indistinguishable in the one dword that exists to tell them apart.
+static const uint kFailStackSplit = 5u;
 
 static const uint kBrickOffsetMask = 0x0fffffffu;
 static const uint kBrickFieldMask  = 0xf0000000u;
@@ -300,11 +330,60 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		return;
 	}
 
-	const uint OccWords = InBrickTotals[0];
-	const uint MatWords = InBrickTotals[1];
+	// Stack-claim: a fused member reads its own totals pair and computes its
+	// scratch prefix; classic (TotalsChunkIndexPlusOne == 0) reads [0..1] with
+	// prefix 0, exactly as before. The prefix lands in OutClaim[6]/[7] -- the
+	// documented spare pair -- where the copy/desc kernels read it back; on the
+	// classic path those stay 0 and every consumer's arithmetic is the
+	// identity, which is what keeps the control byte-identical.
+	uint OccWords = 0u;
+	uint MatWords = 0u;
+	uint SrcOccFirst = 0u;
+	uint SrcMatFirst = 0u;
+	if (TotalsChunkIndexPlusOne == 0u)
+	{
+		OccWords = InBrickTotals[0];
+		MatWords = InBrickTotals[1];
+	}
+	else
+	{
+		const uint C = TotalsChunkIndexPlusOne - 1u;
+		OccWords = InBrickTotals[2u + 2u * C];
+		MatWords = InBrickTotals[3u + 2u * C];
+		for (uint K = 0u; K < C; ++K)
+		{
+			SrcOccFirst += InBrickTotals[2u + 2u * K];
+			SrcMatFirst += InBrickTotals[3u + 2u * K];
+		}
+	}
 
 	OutClaim[1] = 0u; OutClaim[2] = 0u; OutClaim[3] = 0u; OutClaim[4] = 0u;
-	OutClaim[6] = 0u; OutClaim[7] = 0u;
+	OutClaim[6] = SrcOccFirst; OutClaim[7] = SrcMatFirst;
+
+	// --- the split gate (stack-claim only; see TotalsNumChunks) -------------
+	// One thread, <=128 extra reads per member: cheap against the copy passes
+	// it protects. Runs BEFORE the side-table write below takes the failure
+	// path, so a failed gate leaves the same "nothing to free" state as every
+	// other refusal.
+	if (TotalsNumChunks > 0u)
+	{
+		uint SumOcc = 0u;
+		uint SumMat = 0u;
+		for (uint K2 = 0u; K2 < TotalsNumChunks; ++K2)
+		{
+			SumOcc += InBrickTotals[2u + 2u * K2];
+			SumMat += InBrickTotals[3u + 2u * K2];
+		}
+		if (SumOcc != InBrickTotals[0] || SumMat != InBrickTotals[1])
+		{
+			InterlockedAdd(AllocState[kCtrClaimFailWorst], 1u);
+			const uint SideF = ChunkSlot * 4u;
+			AllocSide[SideF + 0u] = 0u; AllocSide[SideF + 1u] = 0u;
+			AllocSide[SideF + 2u] = 0u; AllocSide[SideF + 3u] = 0u;
+			OutClaim[0] = 0u; OutClaim[5] = kFailStackSplit;
+			return;
+		}
+	}
 
 	// The side table entry is written on EVERY path, including failure, so the
 	// free pass for this slot always reads a defined entry. Failure writes
@@ -475,9 +554,12 @@ void BrickPoolAllocWordCopyMain(uint3 tid : SV_DispatchThreadID)
 	{
 		return;
 	}
-	// Scratch is chunk-relative from 0 on this path (single-chunk region), which
-	// is SrcFirst == 0 in the classic kernel's terms.
-	OutWords[Base + i] = InWords[i];
+	// The source prefix the claim wrote into the spare pair: 0 on the classic
+	// single-chunk path (chunk-relative scratch), the member's slice start on a
+	// fused stack (shared batch scratch). One read makes both cases one code
+	// path -- the classic kernel's "SrcFirst == 0" comment, now literal.
+	const uint SrcFirst = InClaim[6u + WordsClaimIndex];
+	OutWords[Base + i] = InWords[SrcFirst + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -503,15 +585,21 @@ void BrickPoolAllocDescMain(uint3 tid : SV_DispatchThreadID)
 	}
 	const uint OccBaseClaim = InClaim[1];
 	const uint MatBaseClaim = InClaim[3];
+	// Stack-claim: scratch descriptors of a fused member are BATCH-relative
+	// (the pack is chunk-major over one shared scratch), so the member's slice
+	// prefix -- the claim's spare pair -- comes back OFF before the pool base
+	// goes ON. Classic path: SrcDescBase 0, spare pair 0, arithmetic verbatim.
+	const uint OccSrcFirst = InClaim[6];
+	const uint MatSrcFirst = InClaim[7];
 
-	uint2 D = InBrickDesc[i];
+	uint2 D = InBrickDesc[SrcDescBase + i];
 	const uint Kind = (D.x >> 28u) & 3u;
 	if (Kind == kBrickKindMixed)
 	{
 		// MIXED only -- a uniform brick's zero offsets must stay zero, for
 		// VoxelBrickPoolWrite.usf's file-header reason.
-		const uint OccOffset = ((D.x & kBrickOffsetMask) + OccBaseClaim) & kBrickOffsetMask;
-		const uint MatOffset = ((D.y & kBrickOffsetMask) + MatBaseClaim) & kBrickOffsetMask;
+		const uint OccOffset = ((D.x & kBrickOffsetMask) - OccSrcFirst + OccBaseClaim) & kBrickOffsetMask;
+		const uint MatOffset = ((D.y & kBrickOffsetMask) - MatSrcFirst + MatBaseClaim) & kBrickOffsetMask;
 		D.x = OccOffset | (D.x & kBrickFieldMask);
 		D.y = MatOffset | (D.y & kBrickFieldMask);
 	}
@@ -542,7 +630,10 @@ void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
 
 	if (bOk && gtid.x < BrickCount)
 	{
-		const uint2 D = InBrickDesc[gtid.x];
+		// Stack-claim: this member's descriptor slice. The occ offsets inside
+		// the descriptors stay BATCH-relative here on purpose -- they index the
+		// SHARED scratch this kernel reads (InBrickOcc), not the pool.
+		const uint2 D = InBrickDesc[SrcDescBase + gtid.x];
 		const uint Kind = (D.x >> 28u) & 3u;
 		bool bBrickAllSolid = false;
 		if (Kind == 1u)
@@ -581,8 +672,10 @@ void BrickPoolAllocRecordMain(uint3 gtid : SV_GroupThreadID)
 		return;
 	}
 
-	const uint MaskLo = InChunkBrickMask[0];
-	const uint MaskHi = InChunkBrickMask[1];
+	// Stack-claim: 2 dwords per chunk, chunk-major -- this member's slot.
+	// Classic path: ChunkMaskBase 0, same two dwords as always.
+	const uint MaskLo = InChunkBrickMask[ChunkMaskBase + 0u];
+	const uint MaskHi = InChunkBrickMask[ChunkMaskBase + 1u];
 	const uint AnySolid = ((MaskLo | MaskHi) != 0u) ? 1u : 0u;
 	const uint AllSolid = (gsAllocAllSolid != 0u) ? 1u : 0u;
 	const uint LevelAndFlags = (RingLevel & 0xfu) | (AnySolid << 4u) | (AllSolid << 5u);

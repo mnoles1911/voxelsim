@@ -582,9 +582,16 @@ namespace VoxelBrickPoolDetail
 	constexpr int32 kGpuAllocCtrOccActualCum = 14;
 	constexpr int32 kGpuAllocCtrMatPaddedCum = 15;
 	constexpr int32 kGpuAllocCtrMatActualCum = 16;
-	// How many state dwords the counter readback copies: the counter block plus
-	// both stack-top arrays, which is what the stranded-dwords figures need.
-	// Kept in one number so the readback and the harvest cannot disagree.
+	// How many state dwords the counter readback copies AT MINIMUM: the counter
+	// block plus both stack-top arrays, which is what the stranded-dwords
+	// figures need. This was one constant (96) while the class steps were
+	// constants; the step latches (-VoxelGpuPoolOccStep= etc.) can now grow the
+	// tops arrays past it, so the ACTUAL width is computed per readback from
+	// the layout (MatTopsFirst + MatClasses) and carried on the pending entry
+	// -- the readback and the harvest still cannot disagree, because both read
+	// the same field. An under-sized read here would not fault; it would
+	// silently zero the tail classes' stranded figures, which is exactly the
+	// quiet-lie shape the one-number rule existed to prevent.
 	constexpr uint32 kGpuAllocCounterReadDwords = 96;
 
 	// RENDER THREAD ONLY, the GPendingFlushVerify shape (and the same
@@ -601,6 +608,9 @@ namespace VoxelBrickPoolDetail
 		// The layout the readback was taken under, for the stack-top walk.
 		uint32 OccTopsFirst = 0, OccClasses = 0, OccClassStep = 0;
 		uint32 MatTopsFirst = 0, MatClasses = 0, MatClassStep = 0;
+		// Dwords this readback actually copied (>= kGpuAllocCounterReadDwords;
+		// see that constant for why it stopped being the whole truth).
+		uint32 ReadDwords = kGpuAllocCounterReadDwords;
 	};
 	TArray<FPendingAllocCounters> GPendingAllocCounters;
 
@@ -660,12 +670,16 @@ namespace VoxelBrickPoolDetail
 			{
 				continue;
 			}
-			uint32 C[kGpuAllocCounterReadDwords] = {};
-			if (const void* Src = Pending.Readback->Lock(sizeof(C)))
+			// Sized from the pending entry, not the constant -- the step latches
+			// can widen the tops arrays past 96 dwords (see the constant).
+			TArray<uint32> CArr;
+			CArr.SetNumZeroed(int32(FMath::Max(Pending.ReadDwords, kGpuAllocCounterReadDwords)));
+			if (const void* Src = Pending.Readback->Lock(Pending.ReadDwords * sizeof(uint32)))
 			{
-				FMemory::Memcpy(C, Src, sizeof(C));
+				FMemory::Memcpy(CArr.GetData(), Src, Pending.ReadDwords * sizeof(uint32));
 				Pending.Readback->Unlock();
 			}
+			const uint32* C = CArr.GetData();
 			// NEW failures, not merely non-zero ones: the counters are
 			// cumulative, so the delta against the last landed value is what
 			// gets announced. Announce BEFORE publishing the snapshot.
@@ -710,12 +724,12 @@ namespace VoxelBrickPoolDetail
 			// size, per class, both arenas -- the honest cost of the no-coalesce
 			// design, printed rather than argued about.
 			int64 StrandedOcc = 0;
-			for (uint32 K = 0; K < Pending.OccClasses && Pending.OccTopsFirst + K < kGpuAllocCounterReadDwords; ++K)
+			for (uint32 K = 0; K < Pending.OccClasses && Pending.OccTopsFirst + K < Pending.ReadDwords; ++K)
 			{
 				StrandedOcc += int64(C[Pending.OccTopsFirst + K]) * int64((K + 1) * Pending.OccClassStep);
 			}
 			int64 StrandedMat = 0;
-			for (uint32 K = 0; K < Pending.MatClasses && Pending.MatTopsFirst + K < kGpuAllocCounterReadDwords; ++K)
+			for (uint32 K = 0; K < Pending.MatClasses && Pending.MatTopsFirst + K < Pending.ReadDwords; ++K)
 			{
 				StrandedMat += int64(C[Pending.MatTopsFirst + K]) * int64((K + 1) * Pending.MatClassStep);
 			}
@@ -1095,14 +1109,58 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 		L.OccRegionWords = Config.OccWordCapacity;
 		L.MatRegionFirst = 0;
 		L.MatRegionWords = Config.MatWordCapacity;
-		L.OccClassStep = kGpuAllocOccClassStep;
-		L.MatClassStep = kGpuAllocMatClassStep;
+		// --- the three allocator geometry knobs, command-line-latched ---------
+		//
+		// P1's own window line indicted the defaults on its first honest legs
+		// (2026-08-23): padding 39.7-40.8% against the 5-15% the design comment
+		// above the claim kernel expected, and leakedRuns 16,736 / 1,164 /
+		// 29,012 across three runs of identical code. Both have geometric
+		// causes, not bugs:
+		//
+		//  * PADDING is the class round-up. It is ~step/2 per claim per arena,
+		//    so 40% padding says the MEAN claim is barely over one step --
+		//    halving the steps roughly halves the waste, at the price of more
+		//    classes (more free-stack storage, a finer bitmap; both accounted
+		//    below, both trivial next to the 40% of two multi-hundred-MiB
+		//    arenas).
+		//  * leakedRuns is kCtrFreePushOverflow: a free whose class stack was
+		//    FULL (2,048 deep). Eviction arrives in bursts concentrated in the
+		//    one or two classes real chunks share, so a burst deeper than the
+		//    stack LEAKS the tail -- permanently, the bump cursor never comes
+		//    back down. The spread across the three runs tracks each leg's
+		//    eviction volume (347,709 frees on the worst), which is why
+		//    identical code produced three different counts: the counter is
+		//    honest, the stack is too shallow for the burst size. At the 50k/s
+		//    target the burst is ~20x tonight's and a 2,048 stack is minutes
+		//    from arena exhaustion.
+		//
+		// Latched (-VoxelGpuPoolOccStep= / -VoxelGpuPoolMatStep= /
+		// -VoxelGpuPoolFreeStackCap=) rather than re-defaulted so the sweep is
+		// an A/B on one binary against tonight's exact layout; recommended
+		// first sweep: OccStep 64, MatStep 128, FreeStackCap 16384. FAILING
+		// READINGS: padding that does NOT fall roughly with the step says the
+		// claim mix is bimodal (per-SIZE histogram needed, not smaller steps);
+		// leakedRuns still growing at cap 16384 says frees outrun claims
+		// SYSTEMICALLY (an eviction-rate problem, not a stack-depth one);
+		// stranded MiB rising after a step change says the finer classes
+		// stopped recycling across sizes -- the cost side of the same coin.
+		const auto LatchedU32 = [](const TCHAR* Key, uint32 Default, uint32 Lo, uint32 Hi)
+		{
+			int32 Value = -1;
+			FParse::Value(FCommandLine::Get(), Key, Value);
+			return Value >= 0 ? FMath::Clamp(uint32(Value), Lo, Hi) : Default;
+		};
+		L.OccClassStep = LatchedU32(TEXT("VoxelGpuPoolOccStep="), kGpuAllocOccClassStep,
+		                            16u, VoxelBrickPoolDetail::kBricksPerChunk * 16u);
+		L.MatClassStep = LatchedU32(TEXT("VoxelGpuPoolMatStep="), kGpuAllocMatClassStep,
+		                            32u, VoxelBrickPoolDetail::kBricksPerChunk * 132u);
 		// Classes cover the per-chunk worst case (64 bricks x 16 occ / 132 mat
 		// dwords), computed rather than restated so a brick-format change moves
 		// the class count with it.
 		L.OccClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 16u + L.OccClassStep - 1u) / L.OccClassStep;
 		L.MatClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 132u + L.MatClassStep - 1u) / L.MatClassStep;
-		L.FreeStackCap = kGpuAllocFreeStackCap;
+		L.FreeStackCap = LatchedU32(TEXT("VoxelGpuPoolFreeStackCap="), kGpuAllocFreeStackCap,
+		                            256u, 65536u);
 		// State-buffer map: [0..63] counters, then the two top arrays, then the
 		// two storage arrays. The counter block width is part of the readback
 		// contract (kGpuAllocCounterReadDwords) -- it must cover the tops.
@@ -2171,13 +2229,19 @@ void FVoxelBrickPool::MaybePumpGpuAllocWindow()
 			}
 
 			// The counter block, always -- it is what carries the two always-on
-			// FAIL counters (bitmap collisions, bad frees) to the log.
+			// FAIL counters (bitmap collisions, bad frees) to the log. Width
+			// covers the tops arrays WHEREVER the step latches put their end
+			// (MatTopsFirst + MatClasses; the arrays are adjacent), never less
+			// than the historical 96.
+			const uint32 ReadDwords = FMath::Max(kGpuAllocCounterReadDwords,
+			                                     Layout.MatTopsFirst + Layout.MatClasses);
 			FRHIGPUBufferReadback* Counters =
 				new FRHIGPUBufferReadback(TEXT("Voxel.BrickPoolAllocCounters"));
 			AddEnqueueCopyPass(GraphBuilder, Counters, AB.AllocState,
-			                   kGpuAllocCounterReadDwords * sizeof(uint32));
+			                   ReadDwords * sizeof(uint32));
 			FPendingAllocCounters PendingCounters;
 			PendingCounters.Readback = Counters;
+			PendingCounters.ReadDwords = ReadDwords;
 			PendingCounters.OccTopsFirst = Layout.OccTopsFirst;
 			PendingCounters.OccClasses = Layout.OccClasses;
 			PendingCounters.OccClassStep = Layout.OccClassStep;
