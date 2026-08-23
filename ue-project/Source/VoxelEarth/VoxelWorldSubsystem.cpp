@@ -5285,6 +5285,53 @@ struct FVoxelWorldImpl
 	bool bLevelLastScanSkirtOn[VoxelCoords::kNumLevels] = {};
 	bool bLevelLastScanVolumeNeedsSolid[VoxelCoords::kNumLevels] = {};
 
+	// WHY the level's bHasRecomputedLevel was cleared, because a bare `false`
+	// cannot tell a first scan from a refill rescan -- and the difference is
+	// the whole ballgame on the perf leg. Measured on the first
+	// -VoxelIncrementalAdmission A/B (p2-on.log, 2026-08-23): the leg's
+	// admission-limited regime rejects 300k-1.2M candidates per 5s window, so
+	// the deferral flag stays armed, the per-level refill re-fires on every
+	// queue drain, and the rescans it forces were ~60% of all warm-flight
+	// scans -- each one taken as a full disc walk because the cleared flag
+	// read as "no predecessor". A refill rescan's predecessor is in fact
+	// FULLY valid: everything it left behind is recorded in
+	// DeferredFootprints below, so it may run incrementally. An EDIT rescan
+	// may not -- the hatches change interior Z verdicts with no radius
+	// crossed -- so edits set their own flag, and edit wins when both are
+	// set. A clear with NEITHER cause flag (first scan, or any future code
+	// that clears the gate without naming why) stays a full sweep, which is
+	// the conservative default a new clear site inherits automatically.
+	// Consumed (reset) by the scan that acts on them.
+	bool bLevelRefillRescan[VoxelCoords::kNumLevels] = {};
+	bool bLevelEditRescan[VoxelCoords::kNumLevels] = {};
+
+	// THE REJECTED/DROPPED BACKLOG, per level: every XY footprint where,
+	// since this level's last entry scan, admission turned a candidate away
+	// (per-level budget, distance cutoff, fine-tier residency) or the
+	// truncation pass dropped a queued record (DropFarthestOverCap, both
+	// quota arms). This is what lets a scan under an armed deferral run
+	// incrementally AT ALL: the deferral flag says work was left behind but
+	// not WHERE, and the OFF arm's answer -- re-walk the disc to rediscover
+	// it -- is precisely the dominant cost this phase exists to delete. With
+	// the locations recorded, an incremental scan re-attempts exactly
+	// (backlog UNION margin), which is the same candidate population a full
+	// sweep would act on (already-realized cells contribute nothing to a full
+	// sweep), in the same row-major order -- so the admitted set is
+	// identical, budget truncation included. Footprint-granular, not
+	// chunk-granular: a whole column is re-attempted for one rejected chunk,
+	// which only ever errs toward extra work. Self-pruning: an entry is
+	// dropped at the next scan's swap and only re-added if it rejects again,
+	// so cells that leave the annulus or get admitted fall out on their own.
+	// Bounded by the disc (~5.2k footprints). GAME THREAD ONLY, like every
+	// other admission structure. Populated only under the switch -- the
+	// control arm must not pay the inserts (~200k rejections/s at peak).
+	TSet<FIntPoint> DeferredFootprints[VoxelCoords::kNumLevels];
+	// The consumed copy the cell loop reads during one level's scan: swapped
+	// in at scan start (emptying the live set for this scan's own
+	// rejections), valid only for the duration of that scan. One scratch, not
+	// per-level: levels scan strictly sequentially.
+	TSet<FIntPoint> DeferredFootprintsScratch;
+
 	// Quiescence detector for the stale-scan refill (rev B): the trigger above
 	// only fires once the anchor has been effectively still for half a second,
 	// because firing it while MOVING fed re-admission churn without buying any
@@ -5913,10 +5960,14 @@ struct FVoxelWorldImpl
 	// In-annulus XY footprints on which the per-footprint work actually ran
 	// (= ComputeFootprintChunkZRange calls) -- the same quantity in BOTH
 	// admission arms, which is what makes it the incremental fork's traffic
-	// proof: under -VoxelIncrementalAdmission it must FALL by roughly the
-	// margin/disc ratio, because cells skipped by the crossing test never
-	// reach the increment. If it does not fall, the fallback counters
-	// (IncrFull*SinceLog) say which full-sweep cause ate the win.
+	// proof: under -VoxelIncrementalAdmission it must FALL to roughly
+	// (margin + rejected backlog) / disc, because cells skipped by the
+	// crossing and backlog tests never reach the increment. The backlog term
+	// is the honest part of that ratio: on an admission-limited leg the
+	// rejected frontier is real work both arms must re-attempt, so the floor
+	// is set by rejections per scan, not by the margin alone. If the counter
+	// does not fall, the fallback counters (IncrFull*SinceLog) say which
+	// full-sweep cause ate the win.
 	int32 ThisFrameLevelFootprints[VoxelCoords::kNumLevels] = {};
 
 	// Running maxima since the last periodic counter log (MaybeLogCounters
@@ -5935,14 +5986,17 @@ struct FVoxelWorldImpl
 	// never accepted without "did the work actually move": these say, per 5s
 	// window, how many of each level's scans took the incremental path and,
 	// when one did not, WHY -- because a fallback cause that fires on most
-	// scans (e.g. deferred-armed on every call of an admission-limited burst)
-	// makes ThisFrameLevelFootprints not drop, and that must be attributable
-	// from the log, not guessed. Reset beside LevelEntryScans.
+	// scans makes ThisFrameLevelFootprints not drop, and that must be
+	// attributable from the log, not guessed. Proven on the first A/B
+	// (2026-08-23): a single "forced" bucket read 100% for the cold-fill
+	// phase and ~60% warm, and it took splitting the causes to see that the
+	// warm share was refill rescans -- work the incremental path could carry
+	// -- not first scans. Reset beside LevelEntryScans.
 	int32 LevelIncrScansSinceLog[VoxelCoords::kNumLevels] = {};
-	int32 IncrFullForcedSinceLog = 0;      // first scan / refill / edit-forced rescan (bHasRecomputedLevel was false)
-	int32 IncrFullDeferredSinceLog = 0;    // bAdmissionDeferredWork[L] armed: prior rejections may sit anywhere in the annulus
+	int32 IncrFullFirstSinceLog = 0;       // first scan of a level, or an unattributed bHasRecomputedLevel clear
+	int32 IncrFullEditSinceLog = 0;        // edit-forced rescan (bLevelEditRescan): interior Z verdicts moved, full sweep required
 	int32 IncrFullUndergroundSinceLog = 0; // underground now or at the level's last scan
-	int32 IncrFullConfigSinceLog = 0;      // skirt on/off or VolumeNeedsSolidChunks flipped since the last scan
+	int32 IncrFullConfigSinceLog = 0;      // skirt on/off, VolumeNeedsSolidChunks, or level-0 band-skip mode
 	int32 RecomputeCalls = 0;
 
 	// --- Streaming pipeline re-measure (docs/status.md "Streaming pipeline
@@ -7137,6 +7191,19 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 				if (bLevelWantsRefill[Level])
 				{
 					bHasRecomputedLevel[Level] = false;
+					// Incremental admission: name the CAUSE of this clear. A
+					// refill rescan has a fully valid predecessor -- every
+					// rejection since the last scan is in DeferredFootprints,
+					// everything else is realized -- so the rescan it forces
+					// may run incrementally. Measured before this flag
+					// existed: the leg's admission-limited regime kept the
+					// deferral armed (300k-1.2M rejections per 5s window),
+					// this trigger re-fired on every queue drain, and the
+					// rescans it forced were ~60% of all warm-flight scans --
+					// every one a full disc walk the incremental arm could
+					// not touch, because a bare bHasRecomputedLevel=false is
+					// indistinguishable from a first scan.
+					bLevelRefillRescan[Level] = true;
 				}
 			}
 		}
@@ -8490,13 +8557,22 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// the fallback counters' job to attribute, and a window that is all
 	// fallbacks with footprints not falling means the switch is on and doing
 	// nothing -- the fork-carried-zero-traffic failure this line exists to
-	// make visible.
+	// make visible. In steady flight `first` and `edit` should both be ~0;
+	// `first` is legitimately large only while the cold fill is still
+	// reaching new rings (measured decaying 49 -> 2 over the first ~2
+	// minutes of the p2 leg).
+	//
+	// FORMAT CHANGE vs the first p2 legs (2026-08-23, same day): that build
+	// printed `forced=` (any bHasRecomputedLevel clear -- refill rescans
+	// included, which made it read ~60% warm) and `deferred=` (a fallback
+	// that no longer exists: the backlog set made deferred-armed scans
+	// incremental). Do not diff the fields across the two formats.
 	if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 	{
 		UE_LOG(LogVoxelPerf, Log,
-		       TEXT("Voxel incremental admission (5s window): incr %s | full: forced=%d deferred=%d underground=%d config=%d"),
+		       TEXT("Voxel incremental admission (5s window): incr %s | full: first=%d edit=%d underground=%d config=%d"),
 		       *JoinPerLevel([&](int32 L) { return FString::Printf(TEXT("R%d=%d"), L, LevelIncrScansSinceLog[L]); }),
-		       IncrFullForcedSinceLog, IncrFullDeferredSinceLog, IncrFullUndergroundSinceLog,
+		       IncrFullFirstSinceLog, IncrFullEditSinceLog, IncrFullUndergroundSinceLog,
 		       IncrFullConfigSinceLog);
 	}
 	// Streaming pipeline re-measure (docs/status.md "Streaming pipeline
@@ -9864,7 +9940,7 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		LevelEntryScans[Level] = 0;
 		LevelIncrScansSinceLog[Level] = 0;
 	}
-	IncrFullForcedSinceLog = IncrFullDeferredSinceLog = IncrFullUndergroundSinceLog = IncrFullConfigSinceLog = 0;
+	IncrFullFirstSinceLog = IncrFullEditSinceLog = IncrFullUndergroundSinceLog = IncrFullConfigSinceLog = 0;
 
 	// Track B2 missing-tile telemetry: only meaningful once a real tile grid
 	// is in use (bUsingTileGrid) -- the synthetic sampler has no concept of a
@@ -12132,13 +12208,21 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// consecutive scan anchors" is transitive: a cell skipped at every
 		// step has been on the same side of every radius since it was last
 		// actually evaluated. bWasForcedScan is the bHasRecomputedLevel=false
-		// entry path -- first scan, admission/stale-scan refill, edit-forced
-		// rescan -- all of which exist precisely because something OTHER than
-		// a simple anchor translation invalidated the level, so all take the
-		// full sweep. (-VoxelMaxRingLevel is command-line-latched and cannot
-		// change mid-run, so it needs no fallback of its own.)
+		// entry path; which full-sweep treatment (if any) it earns depends on
+		// WHY it was cleared -- the cause flags read next -- because a refill
+		// rescan's predecessor is valid (its leftovers are in
+		// DeferredFootprints) while a first scan has none and an edit rescan's
+		// is wrong in the interior. (-VoxelMaxRingLevel is command-line-latched
+		// and cannot change mid-run, so it needs no fallback of its own.)
 		const bool bWasForcedScan = !bHasRecomputedLevel[Level];
 		const FVector2D PrevScanAnchorXY = LastEntryScanAnchorXY[Level];
+		// The cause flags behind a forced scan (see bLevelRefillRescan's doc
+		// comment), consumed here so a stale cause can never leak into a
+		// later scan. Read before the stamps for the same reason A0 is.
+		const bool bRefillRescan = bLevelRefillRescan[Level];
+		const bool bEditRescan = bLevelEditRescan[Level];
+		bLevelRefillRescan[Level] = false;
+		bLevelEditRescan[Level] = false;
 		LastAnchorChunkPerLevel[Level] = AnchorChunk;
 		// Stale-scan refill (see LastEntryScanAnchorXY): the UNQUANTIZED anchor
 		// this scan is about to make its distance decisions against. Written here,
@@ -12162,39 +12246,51 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// workers idle ("cap 0 / empty" on the HUD) this scan IS the pipeline
 		// limit. Every condition below is a recorded reason a diff would lie:
 		//
-		//  - bWasForcedScan: the forcing paths (first scan, refills, edit
-		//    rescans) exist because verdicts changed WITHOUT the anchor
-		//    moving; there is no valid predecessor to diff against.
-		//  - bAdmissionDeferredWork[Level]: the last scan REJECTED candidates
-		//    (budget, cutoff, fine-tier residency), and those sit anywhere in
-		//    the annulus, not in the margin. The OFF arm re-attempts them on
-		//    every crossing once the cutoff relaxes; skipping the interior
-		//    here would quietly starve the ring against its control. NOTE for
-		//    future refactors: this flag's CLEAR is per-level in
-		//    TruncatePendingJobQueue and must stay per-level -- the one-way
-		//    latch (global early-return over a per-level clear) is a recorded
-		//    bug there ("428/421 full-annulus rescans in a 14 s burst"), and
-		//    this fallback would inherit it doubled: a never-clearing flag
-		//    here means never taking the incremental path at all.
+		//  - A forced scan that is NOT a pure refill rescan: a first scan has
+		//    no predecessor at all, and an edit rescan's predecessor is
+		//    invalid in the interior (the hatches move Z verdicts with no
+		//    radius crossed). A REFILL rescan's predecessor is fully valid --
+		//    everything it left behind is in DeferredFootprints -- and
+		//    refusing those was the first A/B's headline failure: the
+		//    admission-limited leg keeps the deferral armed, the refill
+		//    re-fires on every queue drain, and its rescans were ~60% of all
+		//    warm-flight scans, each one a full disc walk (incr 824 vs
+		//    forced 3,835 over the leg). Edit wins when both flags are set.
 		//  - underground / config: see the doc comments on
 		//    bLevelLastScanUnderground and its two siblings.
 		//
-		// Note what is NOT here: no fallback on how FAR the anchor moved. The
-		// crossing test is exact for any translation -- a teleport just makes
-		// every cell cross something and the pass degrades to a full sweep by
-		// itself, paying only the cheap per-cell test on top.
+		// Note what is NOT here, twice over:
+		//  - No fallback on bAdmissionDeferredWork. An armed deferral means
+		//    rejected work is outstanding, but its LOCATIONS are recorded in
+		//    DeferredFootprints and re-attempted below, so a deferred-armed
+		//    scan -- crossing- or refill-triggered -- diffs like any other.
+		//    (The flag's per-level CLEAR in TruncatePendingJobQueue is
+		//    untouched by all of this; the recorded one-way-latch bug there
+		//    stays fixed.)
+		//  - No fallback on how FAR the anchor moved. The crossing test is
+		//    exact for any translation -- a teleport just makes every cell
+		//    cross something and the pass degrades to a full sweep by
+		//    itself, paying only the cheap per-cell test on top.
 		const bool bSkirtOn = !VoxelUnderground::UndergroundDisabled();
 		bool bIncrementalScan = false;
 		FVector2D IncrBoxMin(0.0, 0.0), IncrBoxMax(0.0, 0.0);
 		if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
 		{
-			if (bWasForcedScan)
+			// Take this level's backlog for the cell loop and start the next
+			// window's collection empty -- on BOTH arms of the decision: a
+			// full sweep re-attempts everything anyway, so entries collected
+			// before it are re-realized or re-recorded by the sweep itself,
+			// and letting them linger would only cause phantom re-visits
+			// later.
+			DeferredFootprintsScratch.Reset();
+			Swap(DeferredFootprintsScratch, DeferredFootprints[Level]);
+			// bEditRescan tested on its own, not only under bWasForcedScan:
+			// today the edit path always clears the gate too, but this
+			// decision must not lean on that coupling -- an edit means the
+			// interior moved, full stop.
+			if (bEditRescan || (bWasForcedScan && !bRefillRescan))
 			{
-				++IncrFullForcedSinceLog;
-			}
-			else if (bAdmissionDeferredWork[Level])
-			{
-				++IncrFullDeferredSinceLog;
+				++(bEditRescan ? IncrFullEditSinceLog : IncrFullFirstSinceLog);
 			}
 			else if (bAnchorUnderground || bLevelLastScanUnderground[Level])
 			{
@@ -12395,6 +12491,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		const double IncrInnerEvictSq = ExitInnerEvictUUSq[Level];
 		const double PrevAX = PrevScanAnchorXY.X;
 		const double PrevAY = PrevScanAnchorXY.Y;
+		// Backlog re-attempt (see DeferredFootprints): non-empty exactly when
+		// candidates were rejected or records dropped since the last scan,
+		// i.e. when bAdmissionDeferredWork-style work is outstanding. The
+		// bool exists so the (overwhelmingly common) empty case costs the
+		// cell loop nothing.
+		const bool bIncrHasBacklog = bIncrementalScan && DeferredFootprintsScratch.Num() > 0;
 
 		for (int32 Cy = AnchorChunk.Y - ChunkSpan; Cy <= AnchorChunk.Y + ChunkSpan; ++Cy)
 		{
@@ -12417,14 +12519,15 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 				// wander); or (c) the cell sat in the seam band while its
 				// PARENT crossed the Outer radius, flipping the
 				// parent-admitted test without the cell itself crossing
-				// anything. Every skipped cell's realized state -- rejections
-				// included, since a deferred-armed level takes the full sweep
-				// instead of this path -- is therefore already what this scan
-				// would have produced for it. The skip sits BEFORE the
-				// footprint counter on purpose: ThisFrameLevelFootprints
-				// keeps meaning "cells the per-footprint work ran on" in both
-				// arms, and its fall is the proof the work was deleted rather
-				// than moved.
+				// anything; or (d) something in this footprint was REJECTED
+				// or dropped since the last scan (the backlog set) -- the
+				// re-attempt a full sweep performs by re-walking the disc,
+				// done here by address instead. Every skipped cell's realized
+				// state is therefore already what this scan would have
+				// produced for it. The skip sits BEFORE the footprint counter
+				// on purpose: ThisFrameLevelFootprints keeps meaning "cells
+				// the per-footprint work ran on" in both arms, and its fall
+				// is the proof the work was deleted rather than moved.
 				if (bIncrementalScan)
 				{
 					const double PrevDistSq =
@@ -12476,6 +12579,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						const double SeamParentD0 =
 						    FMath::Square(SeamParentCX - PrevAX) + FMath::Square(SeamParentCY - PrevAY);
 						bRevisit = (SeamParentD0 < IncrOuterSq) != (SeamParentD1 < IncrOuterSq);
+					}
+					if (!bRevisit && bIncrHasBacklog)
+					{
+						// (d): re-attempt everything this level turned away
+						// since its last scan, exactly where it was turned
+						// away. Same population, same row-major order a full
+						// sweep would re-attempt it in -- realized cells
+						// contribute nothing to a full sweep -- so budget
+						// truncation lands on the same candidates.
+						bRevisit = DeferredFootprintsScratch.Contains(FIntPoint(Cx, Cy));
 					}
 					if (!bRevisit)
 					{
@@ -12659,8 +12772,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 				}
 
-				const auto AddCandidate = [this, ChunkEdge, CenterX, CenterY, &Anchor](const FVoxelLevelChunkKey& LevelKey,
-				                                                                     bool bDeepAnchorRelative)
+				// Backlog recording (see DeferredFootprints): one insert per
+				// FOOTPRINT per scan, not per rejected chunk -- the Z loop
+				// below rejects a column's chunks consecutively and the set
+				// is footprint-keyed anyway, so the flag turns up to ~10
+				// hash inserts into one. Declared out here so all three
+				// rejection sites in the lambda share it.
+				bool bCellDeferredRecorded = false;
+				const auto AddCandidate = [this, ChunkEdge, CenterX, CenterY, &Anchor,
+				                           &bCellDeferredRecorded](const FVoxelLevelChunkKey& LevelKey,
+				                                                   bool bDeepAnchorRelative)
 				{
 					// RESURRECTION (2026-07-27, the last of the ring-gap residue). A
 					// record can exist and yet be PENDING UNLOAD: the footprint
@@ -12834,6 +12955,14 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						++CandidatesRejectedThisCall;
 						++LevelCandidatesRejectedThisCall[QueueLevel];
 						bAdmissionDeferredWork[QueueLevel] = true;
+						// Backlog: remember WHERE the deferral's work lives,
+						// so the rescan it provokes can be incremental. The
+						// flag arm above says only THAT work was left behind.
+						if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
+						{
+							bCellDeferredRecorded = true;
+							DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+						}
 						return;
 					}
 					// The cutoff is now this RING's own (see
@@ -12855,6 +12984,12 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						++CandidatesRejectedThisCall;
 						++LevelCandidatesRejectedThisCall[QueueLevel];
 						bAdmissionDeferredWork[QueueLevel] = true;
+						// Backlog: same recording as the budget rejection above.
+						if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
+						{
+							bCellDeferredRecorded = true;
+							DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+						}
 						return;
 					}
 
@@ -12954,6 +13089,15 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 							++CandidatesRejectedThisCall;
 							++LevelCandidatesRejectedThisCall[QueueLevel];
 							bAdmissionDeferredWork[QueueLevel] = true;
+							// Backlog: same recording as the budget rejection
+							// above -- "re-scanned on every future call" in
+							// the comment up top is exactly what this makes
+							// true again under the incremental arm.
+							if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
+							{
+								bCellDeferredRecorded = true;
+								DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+							}
 							return;
 						}
 					}
@@ -13219,6 +13363,17 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 
 	int32 ToDrop = OldNum - EntryCap;
 	int32 Write = 0;
+	// Backlog recording (see DeferredFootprints): every entry this pass
+	// removes is desired work being put back for later -- the deferral flag
+	// the caller arms says so, and the incremental rescan that answers it
+	// consults the SET, not the flag, for where to look. A record dropped
+	// here but not recorded there would be re-admitted only by a full sweep,
+	// i.e. never, once the full sweeps are gone -- a permanent, counter-less
+	// hole. Latched once outside the loop; the dead-weight branch records
+	// too, deliberately: whatever removed that entry's record out from under
+	// the queue may not have re-asked, and one spurious re-visit is the
+	// cheap side of that bet.
+	const bool bRecordDropsForIncremental = VoxelStreamAdmission::IncrementalAdmissionEnabled();
 	for (int32 Read = 0; Read < OldNum; ++Read)
 	{
 		const FSortEntry Entry = Entries[Read];
@@ -13228,6 +13383,11 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 			if (!Rec)
 			{
 				--ToDrop; // already untracked: a queue entry with no record is dead weight anyway
+				if (bRecordDropsForIncremental)
+				{
+					DeferredFootprints[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)].Add(
+						FIntPoint(Entry.Key.Key.X, Entry.Key.Key.Y));
+				}
 				continue;
 			}
 			// A queued chunk has never meshed, so it has no component and no job
@@ -13265,6 +13425,14 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 					Entry.Key.Level);
 				++RecordsDroppedSinceLog;
 				++LevelRecordsDropped[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)];
+				if (bRecordDropsForIncremental)
+				{
+					// Backlog: see the note above the loop. This branch is
+					// the one that matters -- the chunk was desired, admitted
+					// and is now record-less.
+					DeferredFootprints[FMath::Clamp(Entry.Key.Level, 0, VoxelCoords::kNumLevels - 1)].Add(
+						FIntPoint(Entry.Key.Key.X, Entry.Key.Key.Y));
+				}
 				--ToDrop;
 				continue;
 			}
@@ -18976,6 +19144,10 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 			MaxZ = FMath::Max(MaxZ, Level0Chunk.Z);
 			MinZ = FMath::Min(MinZ, Level0Chunk.Z);
 			bHasRecomputedLevel[0] = false;
+			// Incremental admission: an edit hatch widened -- interior Z
+			// verdicts changed with no radius crossed, so the rescan this
+			// forces must be a FULL sweep (see bLevelEditRescan).
+			bLevelEditRescan[0] = true;
 			++EditForcedRescansSinceLog;
 		}
 	}
@@ -19006,6 +19178,8 @@ void FVoxelWorldImpl::PropagateEditToMips(const TSet<VoxelCoords::FVoxelChunkKey
 					MaxZ = FMath::Max(MaxZ, Ancestor.Z);
 					MinZ = FMath::Min(MinZ, Ancestor.Z);
 					bHasRecomputedLevel[Level] = false;
+					// Same edit-forced full-sweep marker as level 0 above.
+					bLevelEditRescan[Level] = true;
 					++EditForcedRescansSinceLog;
 				}
 			}
