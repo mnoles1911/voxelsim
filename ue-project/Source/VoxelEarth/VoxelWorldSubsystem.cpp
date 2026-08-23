@@ -4375,6 +4375,114 @@ double AdmitOuterUU(int32 Level)
 	return OuterUU + FMath::Max(ChunkHalfDiagUU, RingOverlapUU);
 }
 
+// --- the EVICT-outer radius, and why the multiplier is the wrong parameter ---
+//
+// AdmitOuterUU's partner. Every site that asks "how far out does a resident
+// chunk stay" reads THIS, for the same reason Inner{Admit,Evict}UU exist as a
+// pair: two separately-written spellings of the same radius is how the
+// 11,779-unloads/s standing-still churn band was opened, and this file's
+// longest comment is about that.
+//
+// THE DEFECT THIS KNOB FIXES, in arithmetic. The cascade is built so
+// Outer[L]/ChunkEdge[L] == 40 at every level, so a MULTIPLIER m is exactly a
+// band of 40*(m-1) chunk edges -- and -VoxelRingScale multiplies Outer, so it
+// multiplies the band too:
+//
+//   arm                              Outer/edge   band (chunk edges)   span
+//   default        scale 1.00 m 1.25     40             10.0           101
+//   wide ring      scale 1.25 m 1.15     50              7.5           116
+//   wide, m 1.25   scale 1.25 m 1.25     50             12.5           126  REFUSED
+//
+// Widening the ring 25% widened the hysteresis band from 6.0 chunk edges (what
+// m=1.15 buys at scale 1) to 7.5. THE JITTER THE BAND PROTECTS AGAINST DID NOT
+// GET 25% BIGGER. Anchor wobble and per-tick motion are absolute -- at 240 m/s
+// and 60 Hz the anchor moves 4 m = 1.25 level-0 chunk edges per tick, and the
+// desired-set rescan gate is a quarter edge (InnerHysteresisChunks' note) --
+// so the band's requirement is a chunk-edge count, not a fraction of a radius
+// that the ring scale happens to be moving. This is the SAME lesson the inner
+// edge already recorded: "A FRACTION OF AN EDGE, never the outer edge's 1.25x
+// multiplier".
+//
+// WHAT IT BUYS, against the toroidal span budget the marcher's index imposes
+// (kDim 128 minus 8 safety = 120 cells; span = floor(2*(40*scale + band)) + 1,
+// so 40*scale + band <= 59.5):
+//
+//   * SAME ring width, cheaper: scale 1.25 with band 4.0 is a resident radius
+//     of 54 chunks against the wide arm's 57.5 -- (54/57.5)^2 = 0.88, i.e.
+//     ~12% FEWER resident chunks for the identical 160 m R0. Against the ~246k
+//     of 262,144 pool slots the wide arm extrapolates to, that is ~217k (83%)
+//     and back under the cap.
+//   * SAME span, wider ring: band 4.0 allows scale (59.5-4)/40 = 1.3875, i.e.
+//     R0 177.6 m against the wide arm's 160 m -- 11% more ring for the same
+//     116-of-120 index span the multiplier form could not exceed.
+//
+// The multiplier can express NEITHER, because it cannot move the band without
+// moving it proportionally to a ring width the owner is trying to grow.
+//
+// HOW LOW THE BAND CAN GO, and it is not zero. Admission takes a chunk out to
+// AdmitOuterUU = Outer + max(half-diagonal 0.7071, RingOverlapChunks) edges.
+// A band at or below that admits and evicts the same chunk on alternate
+// recomputes -- the tripwire in RecomputeDesiredSet says so and now checks it
+// unconditionally. Above that floor the band is jitter margin: default 10.0
+// edges, wide arm 7.5, and 4.0 leaves 3.29 edges = 10.5 m at L0, still 2.6x
+// the 1.25-edge per-tick anchor motion at 240 m/s. 4.0 IS A CANDIDATE, NOT A
+// MEASURED SETTING.
+//
+// FAILING READINGS for a trimmed band, both of which must be checked before
+// crediting it: stationary unloaded/s not flat (the 11,779/s signature -- the
+// band no longer covers anchor jitter, and this number is what goes back up),
+// and `Voxel evictions/level` out= per ring rising with speed while
+// `Voxel brick lifetime` residentAll and all three arenas sit well under
+// 100% (churn rather than capacity).
+//
+// -VoxelUnloadBandChunks=<f>. NEGATIVE (the default) means "use the
+// multiplier", and that arm is byte-identical: the same operands in the same
+// order as the constexpr 1.25 expression every call site used to spell inline.
+// Latched in a static like every other streaming-topology knob, because it
+// must not change between two recomputes.
+double UnloadBandChunks()
+{
+	static const double Band = []
+	{
+		double Value = -1.0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelUnloadBandChunks="), Value);
+		if (Value >= 0.0)
+		{
+			// Clamped ABOVE the admit pad's worst case (RingOverlapChunks caps
+			// at 4, half-diagonal is 0.7071), so a parse can never hand the
+			// exit scan a band the entry scan already admits past. The tripwire
+			// stays armed regardless -- this only refuses at parse time.
+			Value = FMath::Clamp(Value, 4.25, 40.0);
+			// NO GetRingPresets() CALL IN HERE, deliberately: the span
+			// validation runs inside GetRingPresets' own init lambda and reads
+			// this knob, so touching the presets from this initializer would
+			// re-enter a function-local static that is still under
+			// construction. The span arithmetic is printed by that validation,
+			// which has the presets in hand already.
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("-VoxelUnloadBandChunks=%.2f: the XY exit scan keeps chunks to ring outer + %.2f ")
+			       TEXT("level-L chunk edges. -VoxelUnloadRingMult is IGNORED for that radius while this ")
+			       TEXT("is set (it still sizes the underground deep box's vertical keep)."),
+			       Value, Value);
+		}
+		return Value;
+	}();
+	return Band;
+}
+
+double UnloadOuterUU(int32 Level)
+{
+	const double OuterUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0;
+	const double Band = UnloadBandChunks();
+	if (Band < 0.0)
+	{
+		// CONTROL ARM, byte-identical: same two operands, same order, as the
+		// expression this replaced at every call site.
+		return OuterUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
+	}
+	return OuterUU + Band * VoxelCoords::ChunkEdgeUUForLevel(Level);
+}
+
 // The one key every priority stage reads. Layered on BiasedSortKeySq rather
 // than replacing it: hierarchical coverage's inner-radius clamp and the view
 // bias compose (an interior coarse stand-in behind the camera queues behind
@@ -4814,23 +4922,59 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 			    int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)) -
 			    kSpanSafetyChunks;
 			const double Mult = GetUnloadRingMultiplier();
+			// -VoxelUnloadBandChunks: when set, the resident radius is
+			// Outer/edge + Band chunks instead of (Outer/edge) * Mult. This is
+			// the whole point of the knob -- the span cost of hysteresis stops
+			// scaling with the ring width -- so the validation has to see it or
+			// it would refuse configurations that are in fact legal, and pass
+			// ones that are not. UnloadBandChunks() deliberately touches no
+			// preset (see its initializer), so calling it from inside this
+			// lambda cannot re-enter GetRingPresets.
+			const double Band = VoxelStreamAdmission::UnloadBandChunks();
 			for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
 			{
 				const double EdgeMeters = VoxelCoords::ChunkEdgeUUForLevel(Level) / 100.0;
-				const int32 SpanChunks =
-				    FMath::FloorToInt32(2.0 * Presets[Level].OuterMeters * Mult / EdgeMeters) + 1;
+				const double KeepChunkRadius = (Band >= 0.0)
+					? Presets[Level].OuterMeters / EdgeMeters + Band
+					: Presets[Level].OuterMeters * Mult / EdgeMeters;
+				const int32 SpanChunks = FMath::FloorToInt32(2.0 * KeepChunkRadius) + 1;
+				// ALWAYS PRINTED, not only on refusal. The wide-ring arm was
+				// chosen against a span figure nobody could see at runtime
+				// (116 of 120, computed by hand in a commit message), and the
+				// headroom is the number that says whether the next scale bump
+				// is purchasable. Level 0 only: the construction keeps
+				// Outer/edge uniform, so every level prints the same span.
+				if (Level == 0)
+				{
+					UE_LOG(LogVoxelEarth, Log,
+					       TEXT("Ring span budget: resident radius %.2f chunks (outer %.1f m / edge %.2f m ")
+					       TEXT("%s), toroidal span %d of %d (kDim %d - %d safety) -- headroom %d cells. ")
+					       TEXT("Residency scales as radius^2: %.3fx the default arm's 50.0 chunks."),
+					       KeepChunkRadius, Presets[Level].OuterMeters, EdgeMeters,
+					       (Band >= 0.0) ? *FString::Printf(TEXT("+ %.2f chunk band"), Band)
+					                     : *FString::Printf(TEXT("x %.3f unload mult"), Mult),
+					       SpanChunks, DimBudget,
+					       int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)),
+					       kSpanSafetyChunks, DimBudget - SpanChunks,
+					       FMath::Square(KeepChunkRadius / 50.0));
+				}
 				if (SpanChunks > DimBudget)
 				{
 					UE_LOG(LogVoxelEarth, Fatal,
 					       TEXT("Ring config would alias the marcher's toroidal chunk index at level %d: ")
-					       TEXT("resident span floor(2 * %.1f m outer * %.3f unload-mult / %.1f m edge)+1 = %d chunks ")
-					       TEXT("exceeds the index budget %d (kDim %d minus %d safety for eviction lag). ")
-					       TEXT("Two chunks would share a cell and the marcher would render a hole nobody ordered. ")
-					       TEXT("Lower -VoxelRingScale=, lower -VoxelUnloadRingMult= (>= ~1.08 to clear the ")
-					       TEXT("admit-pad tripwire at ring overlap 4), or raise kDimXY/kDimZ in ")
-					       TEXT("VoxelMarchChunkIndex.h -- a power of two; 256 is 8x the index memory, 56 -> 448 MiB."),
-					       Level, Presets[Level].OuterMeters, Mult, EdgeMeters, SpanChunks,
-					       DimBudget, int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)),
+					       TEXT("resident radius %.2f chunks (outer %.1f m, edge %.2f m, %s) -> span ")
+					       TEXT("floor(2 * radius)+1 = %d chunks exceeds the index budget %d (kDim %d minus %d ")
+					       TEXT("safety for eviction lag). Two chunks would share a cell and the marcher would ")
+					       TEXT("render a hole nobody ordered. Lower -VoxelRingScale=, or trim the hysteresis: ")
+					       TEXT("-VoxelUnloadBandChunks=<chunks> costs span ADDITIVELY (band 4.0 leaves scale ")
+					       TEXT("1.3875 inside this budget) where -VoxelUnloadRingMult= costs it in proportion ")
+					       TEXT("to the ring width. Or raise kDimXY/kDimZ in VoxelMarchChunkIndex.h -- a power ")
+					       TEXT("of two; 256 is 8x the index memory, 56 -> 448 MiB."),
+					       Level, KeepChunkRadius, Presets[Level].OuterMeters, EdgeMeters,
+					       (Band >= 0.0) ? *FString::Printf(TEXT("+ %.2f chunk band"), Band)
+					                     : *FString::Printf(TEXT("x %.3f unload mult"), Mult),
+					       SpanChunks, DimBudget,
+					       int32(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ)),
 					       kSpanSafetyChunks);
 				}
 			}
@@ -4865,6 +5009,11 @@ const UVoxelWorldSubsystem::FRingPreset* UVoxelWorldSubsystem::GetRingPresets()
 // wrong at parse time. FAILING READING for a trimmed multiplier: stationary
 // unloaded/s not flat -- the band no longer covers anchor jitter, and the
 // number to move is this one, back up.
+double UVoxelWorldSubsystem::GetUnloadRadiusMeters()
+{
+	return VoxelStreamAdmission::UnloadOuterUU(0) / 100.0;
+}
+
 double UVoxelWorldSubsystem::GetUnloadRingMultiplier()
 {
 	static const double Mult = []
@@ -8132,12 +8281,22 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			constexpr int32 kSpanSafetyChunks = 8; // same reserve as GetRingPresets' validation
 			const double L0EdgeUU = VoxelCoords::ChunkEdgeUUForLevel(0);
 			const double L0OuterUU = UVoxelWorldSubsystem::GetRingPresets()[0].OuterMeters * 100.0;
-			const double Mult = UVoxelWorldSubsystem::GetUnloadRingMultiplier();
 			const double DimBudgetChunks =
 			    double(FMath::Min(FVoxelMarchChunkIndex::kDimXY, FVoxelMarchChunkIndex::kDimZ) -
 			           uint32(kSpanSafetyChunks));
+			// Outer (the leading half of the ring) + the TRAILING KEEP radius,
+			// which is now single-sourced -- it was `L0OuterUU * (1.0 + Mult)`,
+			// i.e. a second spelling of the exit scan's radius, and the two
+			// would have silently disagreed the moment -VoxelUnloadBandChunks
+			// was used. NOT claimed byte-identical on the reassociation alone:
+			// Outer*(1+Mult) and Outer + Outer*Mult can differ by an ulp in
+			// general. They do not at the shipped radii (12800 * 2.25 = 28800
+			// and 12800 + 16000 = 28800, both exact), and this feeds a budget
+			// compared against a 6,000 UU cvar clamp, so an ulp cannot change
+			// which bound decides.
+			const double L0KeepUU = VoxelStreamAdmission::UnloadOuterUU(0);
 			const double Budget =
-			    FMath::Max(0.0, DimBudgetChunks * L0EdgeUU - L0OuterUU * (1.0 + Mult));
+			    FMath::Max(0.0, DimBudgetChunks * L0EdgeUU - (L0OuterUU + L0KeepUU));
 			UE_LOG(LogVoxelStream, Log,
 			       TEXT("Speculative lead budget: %.0f UU (%.1f m) from the march index span ")
 			       TEXT("(%s the %.0f UU VelocityLeadMaxUU clamp %s)"),
@@ -12247,6 +12406,18 @@ static_assert(UE_ARRAY_COUNT(KeepChunks) == VoxelCoords::kNumLevels, "KeepChunks
 // chunk of slack is always strictly greater than the R the sphere admits.
 static double VerticalKeepUU(int32 Level, double ChunkEdgeUU)
 {
+	// STAYS ON THE MULTIPLIER, deliberately, and -VoxelUnloadBandChunks does
+	// NOT reach here. This is a Z keep-distance around the anchor's own
+	// altitude, not the XY ring edge: its base is the sight sphere's radius
+	// (level 0) or a fixed chunk count (level 1), neither of which the ring
+	// scale moves, so the "the band should not scale with a ring width the
+	// owner is growing" argument does not apply. What DOES apply is that a
+	// trimmed multiplier trims this too -- at 1.15 the level-0 margin over the
+	// radius admission uses is 0.15*R + one chunk instead of 0.25*R + one --
+	// and the invariant the comment above states (keep strictly greater than
+	// the R the sphere admits) still holds at the 1.05 clamp floor. The
+	// failing reading is `Voxel evictions/level` vert= going non-zero on an
+	// underground leg while the anchor is not surfacing.
 	if (Level == 0)
 	{
 		return SightRadiusUU() * UVoxelWorldSubsystem::GetUnloadRingMultiplier() + ChunkEdgeUU;
@@ -13233,8 +13404,10 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 		{
 			const int32 Level = It.Key().Level;
 			const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
-			const double KeepRadiusUU = UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 *
-			                            UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
+			// Twice the level's UNLOAD radius, single-sourced: a cache prune
+			// radius derived from a second spelling of the eviction radius
+			// would silently stop matching it under -VoxelUnloadBandChunks.
+			const double KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(Level) * 2.0;
 			const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 			const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 			if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) >
@@ -13267,9 +13440,8 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	// ring). An entry is ~12 bytes and re-deriving one costs nothing extra --
 	// it comes back with the next level-0 job in that footprint.
 	{
-		const UVoxelWorldSubsystem::FRingPreset& L0Preset = UVoxelWorldSubsystem::GetRingPresets()[0];
 		const double L0ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(0);
-		const double L0KeepRadiusUU = L0Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
+		const double L0KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(0) * 2.0;
 		const double L0KeepRadiusSq = FMath::Square(L0KeepRadiusUU);
 		for (auto It = FootprintBandCache.CreateIterator(); It; ++It)
 		{
@@ -13292,8 +13464,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	{
 		const int32 Level = It.Key().Level;
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
-		const double KeepRadiusUU =
-			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
+		const double KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(Level) * 2.0;
 		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
@@ -13308,8 +13479,7 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	{
 		const int32 Level = It.Key().Level;
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Level);
-		const double KeepRadiusUU =
-			UVoxelWorldSubsystem::GetRingPresets()[Level].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
+		const double KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(Level) * 2.0;
 		const double CenterX = (double(It.Key().Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(It.Key().Key.Y) + 0.5) * ChunkEdge;
 		if (FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) > FMath::Square(KeepRadiusUU))
@@ -13321,12 +13491,11 @@ void FVoxelWorldImpl::PruneFootprintZRangeCache(const FVector& Anchor)
 	for (auto It = FootprintZRangeCache.CreateIterator(); It; ++It)
 	{
 		const VoxelCoords::FVoxelLevelChunkKey& Key = It.Key();
-		const UVoxelWorldSubsystem::FRingPreset& Preset = UVoxelWorldSubsystem::GetRingPresets()[Key.Level];
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(Key.Level);
 		const double CenterX = (double(Key.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(Key.Key.Y) + 0.5) * ChunkEdge;
 		const double DistSq = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y);
-		const double KeepRadiusUU = Preset.OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier() * 2.0;
+		const double KeepRadiusUU = VoxelStreamAdmission::UnloadOuterUU(Key.Level) * 2.0;
 		if (DistSq > FMath::Square(KeepRadiusUU))
 		{
 			It.RemoveCurrent();
@@ -14706,7 +14875,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 			LP.AdmitOuterUU = LP.OuterUU + FMath::Max(ResidHalfDiag, ResidOverlapUU);
 			LP.InnerAdmitUU = VoxelStreamAdmission::InnerAdmitUU(ResidLevel);
 			LP.InnerEvictUU = VoxelStreamAdmission::InnerEvictUU(ResidLevel);
-			LP.UnloadOuterUU = LP.OuterUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
+			LP.UnloadOuterUU = VoxelStreamAdmission::UnloadOuterUU(ResidLevel);
 			LP.VerticalKeepUU = VoxelUnderground::VerticalKeepUU(ResidLevel, LP.ChunkEdgeUU);
 			LP.CutoffSortKeySq = LevelAdmissionCutoffDistSq[ResidLevel];
 			const FVoxelCoord ResidAnchorVoxel = WorldToVoxelForLevel(Anchor, ResidLevel);
@@ -14820,8 +14989,11 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
 	{
 		ExitChunkEdgeUU[L] = ChunkEdgeUUForLevel(L);
-		ExitUnloadOuterUUSq[L] = FMath::Square(
-			UVoxelWorldSubsystem::GetRingPresets()[L].OuterMeters * 100.0 * UVoxelWorldSubsystem::GetUnloadRingMultiplier());
+		// THE evict radius. Single-sourced with the admit radius through
+		// VoxelStreamAdmission (see UnloadOuterUU): this used to spell
+		// Outer * Mult inline, and a second spelling of an eviction radius is
+		// how the 11,779-unloads/s band was opened on the inner edge.
+		ExitUnloadOuterUUSq[L] = FMath::Square(VoxelStreamAdmission::UnloadOuterUU(L));
 		ExitInnerEvictUUSq[L] = FMath::Square(VoxelStreamAdmission::InnerEvictUU(L));
 	}
 	// Command-line-latched static, identical on every read within a run --
@@ -15451,19 +15623,35 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// every level by construction, so the band would need N >= 10 and the
 		// accessor clamps at 4. It CAN happen once -VoxelRingOuterMeters= moves a
 		// ring, which is why this is a check and not a comment. Once per level.
-		if (RingOverlapChunks > 0)
+		//
+		// NO LONGER GATED ON RingOverlapChunks > 0, and the gate was a defect of
+		// exactly the kind this file keeps finding: a tripwire that cannot fire
+		// in the shipped configuration. Overlap defaults to 0, so this check has
+		// never once been evaluated on a default run -- and it has three ways to
+		// trip with overlap at 0:
+		//   * -VoxelRingScale below ~0.7: the half-diagonal pad is a FRACTION of
+		//     Outer that grows as the ring shrinks (0.7071/(40*scale) of it), so
+		//     at scale 0.25 the admit pad is Outer*1.0707 against a multiplier
+		//     clamped as low as 1.05.
+		//   * -VoxelRingOuterMeters= moving one ring, which was the stated case.
+		//   * -VoxelUnloadBandChunks below the admit pad. Its own clamp refuses
+		//     that at parse time; this is the belt to that brace, and it is the
+		//     check that has to hold if the pad is ever widened again.
+		// Cost when it does not fire: one compare and one bool read per level
+		// per recompute, and one accessor call that is a latched static.
 		{
 			static bool bWarnedThrash[VoxelCoords::kNumLevels] = {};
-			const double UnloadOuterUU = OuterUU * UVoxelWorldSubsystem::GetUnloadRingMultiplier();
-			if (AdmitOuterUU >= UnloadOuterUU && !bWarnedThrash[Level])
+			const double EvictOuterUU = VoxelStreamAdmission::UnloadOuterUU(Level);
+			if (AdmitOuterUU >= EvictOuterUU && !bWarnedThrash[Level])
 			{
 				bWarnedThrash[Level] = true;
 				UE_LOG(LogVoxelStream, Error,
-				       TEXT("Ring overlap L%d admits out to %.1f m but the exit pass evicts past %.1f m. ")
-				       TEXT("Every chunk in the overlap will be admitted and evicted on alternate frames ")
+				       TEXT("Ring L%d admits out to %.1f m but the exit pass evicts past %.1f m. ")
+				       TEXT("Every chunk in that band will be admitted and evicted on alternate frames ")
 				       TEXT("-- unbounded churn that reads as a streaming stall. Reduce ")
-				       TEXT("-VoxelRingOverlapChunks (currently %d) or widen this ring."),
-				       Level, AdmitOuterUU / 100.0, UnloadOuterUU / 100.0, RingOverlapChunks);
+				       TEXT("-VoxelRingOverlapChunks (currently %d), raise -VoxelUnloadBandChunks / ")
+				       TEXT("-VoxelUnloadRingMult, or widen this ring."),
+				       Level, AdmitOuterUU / 100.0, EvictOuterUU / 100.0, RingOverlapChunks);
 			}
 		}
 

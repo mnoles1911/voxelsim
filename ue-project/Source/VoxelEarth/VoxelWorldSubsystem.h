@@ -268,7 +268,12 @@ public:
 	// Functions, not constants, now that level 0's radii can be overridden at
 	// runtime (-VoxelRingOuterMeters=).
 	static double GetLoadRadiusMeters() { return GetRingPresets()[0].OuterMeters; }
-	static double GetUnloadRadiusMeters() { return GetRingPresets()[0].OuterMeters * GetUnloadRingMultiplier(); }
+	// OUT OF LINE since 2026-08-23: the unload radius is single-sourced through
+	// VoxelStreamAdmission::UnloadOuterUU in the .cpp (the same pairing
+	// Inner{Admit,Evict}UU use), and -VoxelUnloadBandChunks makes it something
+	// other than Outer * Mult. Spelled inline here it would print a radius the
+	// exit scan does not use.
+	static double GetUnloadRadiusMeters();
 
 	// Stage 2 decisions table: dig/place raycast range.
 	static constexpr double DigPlaceRangeMeters = 8.0;
