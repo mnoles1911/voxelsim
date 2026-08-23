@@ -19,7 +19,7 @@ int32 CacheSlots()
 {
 	static const int32 Latched = []
 	{
-		// 8192 slots x 32 B = 256 KB, and the working set it must hold is one
+		// 8192 slots x 40 B = 320 KB, and the working set it must hold is one
 		// cascade's worth of FOOTPRINTS, not chunks: the measured settled
 		// cascade is 43,328 chunks over roughly 1,400 footprints per level, so
 		// a few thousand slots cover the live set with room for the ring the

@@ -62,6 +62,31 @@
 // See ELEVEN INERT FEATURES below.
 //
 // ===========================================================================
+// WHY NO EXISTING COUNTER FOUND THIS -- AND WHY ONE OF THEM READS ALL-CLEAR
+// ===========================================================================
+//
+// LevelZeroQuadMs / LevelQuadMs are WORKER-side. They sum Result.JobMs, CPU
+// results only, and price what a worker spent producing a zero-quad chunk --
+// the ceiling on a pre-dispatch buried-chunk skip. They say nothing about the
+// game thread in either direction. LevelZeroQuadTotal is a count.
+//
+// `Voxel apply stages` IS named for this exact cost and is structurally blind
+// to it. ApplyStageParamsMs's declaration reads "SampleChunkParamsForPool: a
+// full Amplifier::column on the game thread", and its comment says that if the
+// bucket is large, T1-3's column cache moves up the queue. But that bucket and
+// AppliesTimedSinceLog are incremented ONLY inside ApplyMeshResult's POOLED
+// branch -- and under voxel.Terrain.RetireQuads (the default) every chunk
+// returns from the NumQuads == 0 branch ABOVE it. So every marcher leg prints
+//
+//     Voxel apply stages (5s window): ... timedApplies=0 params=0.00ms ...
+//
+// params=0.00ms is not "the sampler is free". It is "the branch this
+// instrument watches was never taken". The sampler that DOES run is the one in
+// DrainResults, which nothing wraps. That is why 54.5 us/chunk had no
+// explanation for a night: the counter that would have named it was watching a
+// different call site and reading a clean zero.
+//
+// ===========================================================================
 // THE SWITCH -- -VoxelApplyFast=N  (bitmask, latched, default 0 = OFF)
 // ===========================================================================
 //
@@ -81,7 +106,7 @@
 //
 //   -VoxelApplyColumnCache=N       column-cache slots, default 8192 (a
 //                                  direct-mapped table, rounded up to a power
-//                                  of two; ~64 B/slot, so 8192 = 512 KB).
+//                                  of two; 40 B/slot, so 8192 = 320 KB).
 //   -VoxelApplyColumnCacheAudit=N  recompute and compare 1 hit in N. 0 = off.
 //                                  Named *Audit and not *Verify on purpose:
 //                                  VoxelFrontEndPolicy's naming rule treats a

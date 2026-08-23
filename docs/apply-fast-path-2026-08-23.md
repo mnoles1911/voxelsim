@@ -94,6 +94,41 @@ corner heights, the climate bytes and the fitted gradients are functions of
 `SurfaceZRelUU = BaseZUU - ChunkWorldOrigin.Z`. A level-0 band is 20-40 chunks
 deep, so the same four columns are computed 20-40 times for one footprint.
 
+### What the counters already in the tree say — and why they could not have found this
+
+Two instruments already exist near this cost. Neither can see it, and one of
+them reads as an all-clear.
+
+**`LevelZeroQuadMs` / `LevelQuadMs` (`:7802`) are worker-side, not apply-side.**
+They sum `Result.JobMs`, CPU results only, in the census block *above* the
+stale-result discard. Their own comment says what they are for: the honest
+ceiling on a pre-dispatch buried-chunk skip, `zeroQuadMs / (zeroQuadMs +
+quadMs)`. They price what the *worker* spent producing a zero-quad chunk. They
+say nothing whatever about the game thread, and `LevelZeroQuadTotal` is a count.
+They are not evidence about apply in either direction.
+
+**`Voxel apply stages` (`:11193`) is named for exactly this cost and is
+structurally blind to it.** `ApplyStageParamsMs`'s declaration
+(`:7716`) reads "SampleChunkParamsForPool: a full Amplifier::column on the game
+thread", and its comment at `:7711` says that if this bucket is large, T1-3's
+column cache moves up the queue. But `ApplyStageParamsMs` and
+`AppliesTimedSinceLog` are incremented **only inside `ApplyMeshResult`'s pooled
+branch** — and on the marcher path `NumQuads == 0` returns *before* that branch,
+for every chunk. So on any leg with `voxel.Terrain.RetireQuads` on (the default):
+
+    Voxel apply stages (5s window): ... timedApplies=0 pack=0.00ms params=0.00ms
+                                        poolAdd=0.00ms | per-apply params=0.000
+
+**`params=0.00ms` is not "the sampler is free". It is "the branch this
+instrument watches was never taken."** The sampler that *does* run is the one in
+`DrainResults`, which this instrument does not wrap. That is the whole reason
+0.054 ms/chunk had no explanation: the counter that would have named it was
+measuring a different call site, and it was reading a clean zero.
+
+This is also why the first leg is `-VoxelApplyFast=4`. `sampleUs/call` from the
+new line is the first number in this project that prices the sampler at the call
+site that actually runs it.
+
 ### The same sampler runs on the DISPATCH path too — read this, dispatch owner
 
 `SubmitGpuMeshJob`, `VoxelWorldSubsystem.cpp:17841`:
@@ -142,7 +177,7 @@ cold fill and make the leg a blend of two behaviours). **Default 0 = off.**
 the **first** leg to run.
 
 Sizing: `-VoxelApplyColumnCache=N` (default 8192 slots, direct-mapped, rounded
-up to a power of two, ~32 B/slot). Cross-check: `-VoxelApplyColumnCacheAudit=N`
+up to a power of two, 40 B/slot). Cross-check: `-VoxelApplyColumnCacheAudit=N`
 recomputes and compares 1 hit in N, logs an Error on any mismatch, and
 **returns the fresh value**, so an audited leg can never publish worse than
 control.
