@@ -185,3 +185,66 @@ producer.
   GPU generator against the CPU one on columns, cells and quads;
   `voxel.GPU.VerifyBrickStack` proves batched against per-chunk. A new allocator needs its
   own equivalent, and it must be able to FAIL.
+
+---
+
+## 7. State at the end of 2026-08-23 — what is in, and how to drive it
+
+**Run it:** `toolsoxel-launch-prototype.ps1`, press Play, then in the console:
+
+```
+voxel.GpuStream.Prototype 1     -- streaming panel + hole stats, one switch
+```
+
+**Measured on the merged tree, flag-free except the panel:** 25,258 frames,
+p50 8.52 ms, p95 28.17 ms, **7,075 chunks/s mean, 10,794 peak**, evictions 0.
+The 6,200 floor is cleared. This morning it was 12,355 frames, p50 20.72 ms,
+4,341 chunks/s.
+
+### Landed and ON
+
+| | why |
+|---|---|
+| Index delta upload | 56 MiB per flush → ~74 KiB. The single biggest win. |
+| Shared column-grid cache (1024) | 83.6% hit, columns 3.1x cheaper |
+| Dispatch cap 24/core | the cap was a per-tick batch quota below the floor by arithmetic |
+| GPU fork OFF | 6.5% of packs, 90% of hitches — the shape being replaced |
+| Shadow marching OFF | ~13 ms of a 20.7 ms frame; backlog §0.0a |
+| Brick pool 262,144 | the cap raise overflowed the old 131,072 and it silently evicted and DROPPED WRITES |
+
+### Landed, default OFF, unmeasured
+
+`voxel.GPU.PoolAlloc` (P1, one GPU allocator for both producers — latched at
+pool Init, so arm it before the first PIE session), `voxel.March.IndexGpuResident`
+(P2, GPU publishes its own index cells), plus the earlier B.1/flush-batch work.
+
+**P1 and P2 are the programme's keystone and neither has been measured yet.**
+That is the first job next session, and the gates are in their reports: P1's
+`[brick-gpualloc]` line must show `doubleGrant`/`badFree`/xcheck FAIL all 0 and
+`unwritten` 0 while `claimFail` is 0; P2's `verify FAIL=0 with pass>0`.
+
+### The owner's dark arcs at LOD boundaries — OPEN, three hypotheses dead
+
+Reported with screenshots while flying: black arcs concentric on the camera, at
+LOD boundaries, that fill in when he stops.
+
+**Established:** `uncovered` 4.0% of rays flying against 0.03% standing still —
+the metric matches the symptom exactly. Mid-flight **R1-R5 pending=0 and R0
+pending=242**: the coarse rings are fully resident, the FINE ring is behind. And
+inside R0's radius only R0 covers, by construction, so a missing R0 chunk has
+nothing beneath it. Churn reproduces (7,815 unloads/s here, 8,504/s in his
+session).
+
+**Tested and refuted, each with a matched leg:**
+
+| hypothesis | result |
+|---|---|
+| my skirt-mask change removed the retaining walls | 3.9933% raw vs 3.9964% padded — dead heat |
+| coarse rings are starving (`-VoxelRingFloors=0,4,4,8,8,8`) | 4.0094% — and R1-R5 pending is already 0 |
+| Phase 1 hierarchical coverage, re-tested at 2x pool and the raised cap | **4.5583%, worse**, with evictions 32,923 — its +49% residency overflows even the doubled pool, so the coarse backstop is evicted before anything can fall through to it |
+
+**Do not guess a fourth time.** The next step is an instrument, not a theory:
+extend `uncovered` to report, per miss, **which level** the ray wanted and
+**why that chunk was absent** — never admitted / admitted but not yet resident /
+admitted then evicted. Those three have different fixes and nothing currently
+distinguishes them.
