@@ -42,12 +42,19 @@ struct float2 {
     float x = 0, y = 0;
     float2() = default;
     float2(float a, float b) : x(a), y(b) {}
+    // HLSL broadcasts a scalar to every lane: `float2 v = 0.0f;` is legal and
+    // the shaders use it. Left IMPLICIT on purpose, because that is what HLSL
+    // does -- and it does not make the overload sets below ambiguous, since an
+    // exact match on `(float3, float)` always beats a user conversion to
+    // `(float3, float3)`.
+    float2(float s) : x(s), y(s) {}
 };
 
 struct float3 {
     float x = 0, y = 0, z = 0;
     float3() = default;
     float3(float a, float b, float c) : x(a), y(b), z(c) {}
+    float3(float s) : x(s), y(s), z(s) {}   // HLSL scalar broadcast
     // HLSL's colour spellings are the same lanes.
     float& r_() { return x; }
     // .r/.g/.b are handled by the members below rather than by aliases, because
@@ -61,6 +68,7 @@ struct float4 {
     float x = 0, y = 0, z = 0, w = 0;
     float4() = default;
     float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
+    float4(float s) : x(s), y(s), z(s), w(s) {}   // HLSL scalar broadcast
     float4(float3 v, float d) : x(v.x), y(v.y), z(v.z), w(d) {}
     float3 xyz_() const { return float3(x, y, z); }
 };
@@ -97,6 +105,8 @@ inline float3 operator*(float3 a, float s) { return {a.x * s, a.y * s, a.z * s};
 inline float3 operator*(float s, float3 a) { return a * s; }
 inline float3 operator/(float3 a, float s) { return {a.x / s, a.y / s, a.z / s}; }
 inline int3 operator+(int3 a, int3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+inline float3& operator+=(float3& a, float3 b) { a = a + b; return a; }
+inline float2& operator+=(float2& a, float2 b) { a.x += b.x; a.y += b.y; return a; }
 
 // --- intrinsics -------------------------------------------------------------
 inline float lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -120,4 +130,22 @@ inline float log2(float v) { return std::log2(v); }
 // rewritten by the same mechanical pass that handles [unroll] and out
 // parameters. Keeping the substitution HERE, next to the type, is what stops it
 // being invisible: `c.r *= k` becomes `c.x *= k`, which is the same lane.
+// --- THE COMPUTE-SHADER SURFACE --------------------------------------------
+//
+// Reached only by VoxelMaterialPaletteTest.usf, which is a real dispatch entry
+// point rather than a header. It is type-checked here (never run) so that an
+// arity change in the .ush fails on any box in seconds, instead of waiting for
+// the Windows DXC job -- which does not run on a feature branch at all, since
+// CI is push-to-main plus pull requests.
+//
+// Nothing below models GPU behaviour. There is no dispatch, no thread group and
+// no buffer; `[numthreads]` and the SV_ semantic are stripped by the checker's
+// transform list, and this array stands in for the UAV purely so the store at
+// the end of the entry point is a well-typed statement.
+template <typename T>
+struct RWStructuredBuffer {
+    T slot{};
+    T& operator[](uint) { return slot; }
+};
+
 #define VXC_HLSL_SHIM 1

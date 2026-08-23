@@ -404,6 +404,79 @@ int main(int argc, char** argv) {
 '''
 
 
+# The DISPATCH ENTRY POINT, type-checked. Separate from the evaluation check
+# above because it answers a separate question, and because it is the one that
+# was silently broken.
+#
+# VoxelMaterialPaletteTest.usf is the only thing that compiles the renderer
+# route -- the vertex factory cannot be handed to DXC, so pack/unpack were
+# deliberately put in the generated header where they can be. But the .usf is
+# hand-written, not generated, so it does not follow a signature change: ADR-0009
+# gave VoxelMaterialColor a cube size, VoxelPalettePack a base cube size, and
+# VoxelPaletteUnpack two extra outs, and all three call sites kept the old
+# arities. The file was last touched in e3c1e40 and would have failed DXC.
+#
+# It was not caught because tools/compile-shaders.ps1 is Windows-only and CI
+# runs on push-to-main plus pull requests, so nothing on a feature branch ever
+# compiles it. A checker that only runs where the defect cannot be introduced is
+# not a checker. This runs the same source through the same shim as the .ush.
+#
+# THIS IS A TYPE CHECK, NOT A COMPILE. It says the calls agree with the
+# declarations and the expressions are well typed; it says nothing about DXIL,
+# SPIR-V, or whether a construct is well DEFINED on a GPU. compile-shaders.ps1
+# still answers that, and the two claims must not be reported as one.
+USF = ROOT / "ue-project" / "Shaders" / "VoxelMaterialPaletteTest.usf"
+
+# Applied on top of TRANSFORMS, and only to the .usf: the three constructs a
+# header does not have.
+USF_TRANSFORMS = [
+    (re.compile(r"\[numthreads\([^)]*\)\]"), "",
+     "a thread-group declaration, which has no C++ spelling"),
+    (re.compile(r"\s*:\s*SV_[A-Za-z]+"), "",
+     "a system-value semantic, which binds a register rather than naming a type"),
+    (re.compile(r'#include\s+"VoxelMaterialPalette\.ush"'), '#include "shader_as_cpp.h"',
+     "the shimmed spelling of the header it includes"),
+]
+
+
+def shim_entry_point(text):
+    text = shim_shader(text)
+    for pattern, repl, _why in USF_TRANSFORMS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+def check_entry_point(cxx):
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        shutil.copy(ROOT / "tools" / "hlsl_cpp_shim.h", tmp / "hlsl_cpp_shim.h")
+        (tmp / "shader_as_cpp.h").write_text(
+            shim_shader(USH.read_text(encoding="utf-8")), encoding="utf-8")
+        src = tmp / "entry.cpp"
+        src.write_text('#include "hlsl_cpp_shim.h"\n'
+                       + shim_entry_point(USF.read_text(encoding="utf-8")),
+                       encoding="utf-8")
+
+        # -fsyntax-only: nothing here is meant to run, and an entry point with no
+        # main() would not link anyway.
+        build = subprocess.run(
+            [cxx, "-std=c++20", "-fsyntax-only", "-I", str(tmp), str(src)],
+            capture_output=True, text=True)
+        if build.returncode != 0:
+            return fail(
+                "VoxelMaterialPaletteTest.usf does not type-check against "
+                "VoxelMaterialPalette.ush.\n"
+                "  Usually this means the .ush changed a signature and the harness "
+                "kept the old call -- which DXC would reject, on the Windows job "
+                "that does not run on this branch.\n"
+                "  It can also mean the .usf grew a construct "
+                "tools/hlsl_cpp_shim.h does not model.\n\n" + build.stderr)
+
+    print(f"entry point: {USF.name} type-checks against the shipped .ush "
+          f"(syntax only -- DXIL and SPIR-V are compile-shaders.ps1's claim)")
+    return 0
+
+
 def check_evaluation(rows, samples):
     cxx = shutil.which("g++") or shutil.which("clang++")
     if not cxx:
@@ -630,8 +703,18 @@ def main():
     rows = read_header()
     rc = check_tables(rows)
     if not a.table_only:
-        rc |= check_evaluation(rows, a.samples)
-        rc |= check_forge_evaluation(rows, max(20, a.samples // 2))
+        cxx = shutil.which("g++") or shutil.which("clang++")
+        if not cxx:
+            rc |= fail("no g++ or clang++ on PATH; the evaluation half needs one "
+                       "to compile both vxc::voxelTint and the shader text. "
+                       "(The table half above already ran.)")
+        else:
+            # The entry point FIRST. It is a type check and takes under a second,
+            # and if the harness does not agree with the header there is nothing
+            # useful to say about parity yet.
+            rc |= check_entry_point(cxx)
+            rc |= check_evaluation(rows, a.samples)
+            rc |= check_forge_evaluation(rows, max(20, a.samples // 2))
     if rc == 0:
         print("palette parity: pass")
     return rc
