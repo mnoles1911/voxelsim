@@ -21,6 +21,7 @@
 #include "RHICommandList.h"
 
 #include "VoxelBrickPool.h"
+#include "VoxelMarchRenderer.h" // VoxelMarchGetArm -- the absent-annotation writer's arming gate
 
 #include "RenderGraphBuilder.h"
 #include "RenderGraphResources.h"
@@ -761,6 +762,11 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 	// sets; double bookkeeping at ~145 cells per measured flush is noise.
 	const bool bGpuPublish =
 		bTrackDelta && CVarVoxelMarchIndexGpuResident.GetValueOnGameThread() != 0;
+	// voxel.March.HoleStats 2: an eviction writes WHY the cell is empty
+	// instead of a bare 0, so the marcher's uncovered breakdown can tell
+	// "evicted" from "never admitted". Read once per flush, same rule as
+	// bTrackDelta above.
+	const bool bAnnotateAbsent = AreAbsentMarksArmed();
 
 	// REMOVED BEFORE ADDED, AND IT IS NOT A STYLE CHOICE. Both halves can name
 	// the SAME SLOT in one delta, because a slot freed by an eviction can be
@@ -820,7 +826,24 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 		if ((Existing & kResidentBit) != 0u &&
 		    (Existing & kSlotMask) == (E.ChunkSlot & kSlotMask))
 		{
-			Cells[int32(Cell)] = 0u;
+			const FIntVector RemCoord(E.Key.X, E.Key.Y, E.Key.Z);
+			// The eviction annotation (voxel.March.HoleStats 2): the cell was
+			// resident and is now being cleared, which is the ONE moment
+			// "evicted" is a fact rather than an inference -- so it is written
+			// here and nowhere else. The tag pins it to THIS coord: a chunk
+			// 128 cells away that later maps to this cell reads a mismatched
+			// tag and classifies as never-admitted, which for it is the truth.
+			// Ring levels only -- an absent COVER chunk is the normal state
+			// ("no cover here" stores nothing), and annotating cover would
+			// bury the ring signal. Disarmed this is the bare 0 it always was,
+			// so a control run's index stream is byte-identical.
+			const bool bAnnotateThis = bAnnotateAbsent && RemSlot != int32(kCoverGridSlot);
+			Cells[int32(Cell)] =
+				bAnnotateThis ? MakeAbsentEntry(kAbsentReasonEvicted, RemCoord) : 0u;
+			if (bAnnotateThis)
+			{
+				++AbsentEvictedMarks;
+			}
 			if (bTrackDelta)
 			{
 				DeltaPendingCells.Add(Cell);
@@ -830,7 +853,6 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 			// Only drop the ownership record if it still names THIS chunk; a
 			// cell re-pointed by an earlier Added in the same batch belongs to
 			// the new owner, not to the one being retired.
-			const FIntVector RemCoord(E.Key.X, E.Key.Y, E.Key.Z);
 			if (const FIntVector* Owner = CellOwner.Find(Cell))
 			{
 				if (*Owner == RemCoord)
@@ -918,6 +940,120 @@ void FVoxelMarchChunkIndex::ApplyDelta(const FVoxelBrickIndexDelta& Delta)
 	// size-independent) or the fallback counters in GetUploadStats() will say
 	// the full path is running anyway, and why.
 	ApplyDeltaMs.UploadMs += (FPlatformTime::Seconds() - UploadStart) * 1000.0;
+}
+
+// ---------------------------------------------------------------------------
+// The absent-annotation writer (voxel.March.HoleStats 2)
+// ---------------------------------------------------------------------------
+
+bool FVoxelMarchChunkIndex::AreAbsentMarksArmed() const
+{
+	// The GPU publish kernel (Phase 2) clears cells to LITERAL 0 on the GPU;
+	// an annotated shadow would fail the delta-verify hash on the very next
+	// gated flush, so the writer stands down whenever that mode is on. The
+	// perf line prints which gate closed it -- a disarmed writer must be
+	// readable as disarmed, not as "nothing pending, nothing evicted".
+	if (CVarVoxelMarchIndexGpuResident.GetValueOnGameThread() != 0)
+	{
+		return false;
+	}
+	// HoleStatsLevel >= 2 is the breakdown arm; below it the annotations would
+	// be dead weight in the delta stream AND a control-leg divergence -- the
+	// requirement is that voxel.March.HoleStats 0 legs stream a byte-identical
+	// index, and the cheapest proof is to never write.
+	return VoxelMarchGetArm().HoleStatsLevel >= 2;
+}
+
+void FVoxelMarchChunkIndex::NoteChunkAdmitted(const FIntVector& Coord, int32 Level)
+{
+	check(IsInGameThread());
+	if (Cells.Num() == 0 || !AreAbsentMarksArmed())
+	{
+		return;
+	}
+	const int32 Slot = GridSlotForLevel(Level);
+	if (Slot < 0 || Slot == int32(kCoverGridSlot))
+	{
+		return; // rings only -- see the header
+	}
+	const uint32 Cell = CellOf(Coord, Slot);
+	const uint32 Existing = Cells[int32(Cell)];
+	if ((Existing & kResidentBit) != 0u)
+	{
+		// Already resident (re-admission of parked/adopted geometry). Nothing
+		// to explain: a ray cannot miss a chunk the index holds, and if the
+		// pool later drops it the eviction annotation takes over.
+		return;
+	}
+	const uint32 Value = MakeAbsentEntry(kAbsentReasonPending, Coord);
+	if (Existing == Value)
+	{
+		// RecomputeDesiredSet re-scans candidates every anchor move; the
+		// second and later admissions of the same still-pending chunk must
+		// not re-dirty the cell or the delta stream doubles for free.
+		return;
+	}
+	Cells[int32(Cell)] = Value;
+	if (CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0)
+	{
+		DeltaPendingCells.Add(Cell);
+	}
+	bAbsentMarksPending = true;
+	++AbsentPendingMarks;
+}
+
+void FVoxelMarchChunkIndex::NoteChunkNoLongerAdmitted(const FIntVector& Coord, int32 Level)
+{
+	check(IsInGameThread());
+	if (Cells.Num() == 0 || !AreAbsentMarksArmed())
+	{
+		return;
+	}
+	const int32 Slot = GridSlotForLevel(Level);
+	if (Slot < 0 || Slot == int32(kCoverGridSlot))
+	{
+		return;
+	}
+	const uint32 Cell = CellOf(Coord, Slot);
+	const uint32 Existing = Cells[int32(Cell)];
+	// Clear ONLY a pending annotation that names exactly this coord. Resident
+	// cells belong to the delta path; an evicted annotation is history this
+	// cancellation did not create; an alias's annotation is not ours to touch.
+	// Without this narrowing, queue-cap truncation (which drops the FARTHEST
+	// admissions first) would leave "pending" painted over ground the
+	// streaming system has in fact walked away from, and the throughput bucket
+	// would absorb a coverage problem -- the exact conflation the three-way
+	// split exists to remove.
+	if ((Existing & kResidentBit) != 0u ||
+	    (Existing & kAbsentReasonMask) != kAbsentReasonPending ||
+	    ((Existing >> kAbsentTagShift) & kAbsentTagMask) != AbsentTagOf(Coord))
+	{
+		return;
+	}
+	Cells[int32(Cell)] = 0u;
+	if (CVarVoxelMarchIndexDeltaUpload.GetValueOnGameThread() != 0)
+	{
+		DeltaPendingCells.Add(Cell);
+	}
+	bAbsentMarksPending = true;
+}
+
+void FVoxelMarchChunkIndex::FlushAbsentMarks()
+{
+	check(IsInGameThread());
+	if (!bAbsentMarksPending)
+	{
+		return;
+	}
+	bAbsentMarksPending = false;
+	// One staging per admission PASS, not per admission -- RecomputeDesiredSet
+	// admits in bursts (~8 calls/second) and calls this once at its tail. The
+	// upload itself rides the same machinery as every other cell write:
+	// MarkDirtyAndUpload stages the delta pairs (or the full grid), Register()
+	// consumes them, and the delta-verify gate covers these cells exactly as
+	// it covers residency writes.
+	bDirty = true;
+	MarkDirtyAndUpload();
 }
 
 void FVoxelMarchChunkIndex::MarkDirtyAndUpload()

@@ -40,6 +40,60 @@
 #define VOXEL_MARCH_INDEX_ANYSOLID_BIT 0x40000000u
 #define VOXEL_MARCH_INDEX_SLOT_MASK    0x3FFFFFFFu
 
+// ---------------------------------------------------------------------------
+// THE ABSENT-CELL ANNOTATION (voxel.March.HoleStats 2) -- why a chunk is gone
+// ---------------------------------------------------------------------------
+//
+// A NON-resident entry (bit 31 clear) was, until 2026-08-23, always literally
+// 0 -- the reader returns at the resident test and the other 31 bits carried
+// nothing. That wasted exactly the information the dark-arcs investigation
+// needs: `uncovered` says a ray crossed a chunk the streaming system does not
+// hold, but not WHY it does not hold it. Never admitted (a coverage-rule bug),
+// admitted but still in the pipe (a throughput problem) and evicted after
+// being resident (an eviction-policy problem) have three different fixes, and
+// the CPU is the only party that knows which one happened -- so the CPU writes
+// its answer into the bits the absent entry was throwing away, and the marcher
+// reads it in the same load it already pays for the residency test. Zero extra
+// GPU bandwidth; the CPU cost is one extra shadow-cell write per admission and
+// the eviction clear writing a tag instead of a zero.
+//
+//   bits [1:0]  reason   0 = nothing recorded (never admitted since the grid
+//                            was last cleared -- boot, Seed(), or the reason
+//                            writer being disarmed)
+//                        1 = admitted: a streaming record exists and the chunk
+//                            is queued or in flight, not yet in the pool
+//                        2 = evicted: the pool held it and removed it
+//                        3 = reserved, classified as unattributable
+//   bits [10:2] tag      3 bits per axis of (coord >> 7) & 7 -- WHICH torus
+//                        wrap wrote this annotation. The grid is 128 cells per
+//                        axis, so coords 128 apart share a cell; without the
+//                        tag, a leading-edge chunk entering a cell would
+//                        inherit the trailing-edge occupant's "evicted" and the
+//                        three-way split would misattribute exactly the rays it
+//                        exists for. A tag mismatch is PROOF of never-admitted:
+//                        every admission and every eviction of the wanted coord
+//                        stamps the wanted coord's tag, so a cell still tagged
+//                        for the alias means the wanted coord had no streaming
+//                        transition since that write.
+//
+// MIRRORED as kAbsentReason* / AbsentTagOf / MakeAbsentEntry in
+// VoxelMarchChunkIndex.h (the CPU writer), the same hand mirror kResidentBit
+// already lives under, checked by the same delta-verify readback gate. The
+// >>7 is log2(kDimXY)=log2(kDimZ)=7, static_asserted on the CPU side.
+#define VOXEL_MARCH_ABSENT_REASON_MASK    0x3u
+#define VOXEL_MARCH_ABSENT_REASON_NONE    0u
+#define VOXEL_MARCH_ABSENT_REASON_PENDING 1u
+#define VOXEL_MARCH_ABSENT_REASON_EVICTED 2u
+#define VOXEL_MARCH_ABSENT_TAG_SHIFT      2u
+#define VOXEL_MARCH_ABSENT_TAG_MASK       0x1FFu
+
+uint VoxelMarchAbsentTag(int3 ChunkCoord)
+{
+	return ((uint(ChunkCoord.x) >> 7u) & 7u) |
+	       (((uint(ChunkCoord.y) >> 7u) & 7u) << 3u) |
+	       (((uint(ChunkCoord.z) >> 7u) & 7u) << 6u);
+}
+
 uint VoxelMarchIndexCellCompute(int3 ChunkCoord, uint3 DimChunks,
                                 uint CellsPerLevel, uint GridSlot)
 {

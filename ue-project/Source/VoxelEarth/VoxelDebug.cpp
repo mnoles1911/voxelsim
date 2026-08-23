@@ -107,8 +107,12 @@ TAutoConsoleVariable<int32> CVarVoxelGpuStreamPrototype(
 	TEXT("voxel.GpuStream.Prototype"),
 	0,
 	TEXT("One-switch arm for the GPU streaming shakedown: non-zero sets voxel.Debug 3 (streaming panel) ")
-	TEXT("and arms voxel.March.HoleStats (found by name; logged and skipped if absent). The value is ")
-	TEXT("passed through to HoleStats so a frame-count semantic survives. 0 stands both down."),
+	TEXT("and arms voxel.March.HoleStats (found by name; logged and skipped if absent). Armed at ")
+	TEXT("max(value, 2) since 2026-08-23 so the one-switch always includes the uncovered BREAKDOWN ")
+	TEXT("(per-level + per-reason) the panel's hole rows exist to show -- the owner flying with ")
+	TEXT("Prototype 1 must see the split, not a note telling him to type a second cvar. A cheap ")
+	TEXT("level-1 control leg is still available by setting voxel.March.HoleStats 1 directly. ")
+	TEXT("0 stands both down."),
 	ECVF_Default);
 
 // The arm/disarm behavior. Runs on every change of the cvar (and once at
@@ -128,7 +132,12 @@ void ApplyGpuStreamPrototype()
 		int32 OnValue;  // what "armed" means for this switch
 	};
 	const FArmTarget Targets[] = {
-		{ TEXT("voxel.March.HoleStats"), Value },
+		// max(Value, 2): HoleStats 2 is the per-level/per-reason uncovered
+		// breakdown, and the streaming panel's hole rows are its display --
+		// arming the panel while leaving the breakdown off would show the
+		// owner "not measured" rows by default, which is the one-switch
+		// promise broken. Values above 2 still pass through untouched.
+		{ TEXT("voxel.March.HoleStats"), FMath::Max(Value, 2) },
 	};
 
 	if (Value != 0)

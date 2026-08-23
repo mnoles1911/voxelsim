@@ -9,6 +9,7 @@
 #include "VoxelEarthFlyPawn.h"
 #include "VoxelEarthPlayerController.h"
 #include "VoxelGI.h"
+#include "VoxelMarchRenderer.h" // VoxelMarchPeekLastHoleWindow -- the streaming panel's uncovered breakdown rows
 #include "VoxelSkySubsystem.h" // FVoxelSkyState + VoxelSky::MonthDayFromDayOfYear -- the overlay's geo/calendar block
 #include "VoxelWaterSubsystem.h"
 #include "VoxelWorldSubsystem.h"
@@ -547,6 +548,73 @@ void AVoxelEarthHUD::DrawStreamPanel()
 					                       (UncoveredPct <= 0.1f) ? TEXT("OK")
 					                       : (UncoveredPct <= 1.0f) ? TEXT("WARN") : TEXT("BAD")),
 					       HoleColor);
+				}
+
+				// ---- the uncovered BREAKDOWN (voxel.March.HoleStats 2) ----
+				// Which ring level's chunk was missing, and why -- the two
+				// rows this panel exists for while the owner chases the dark
+				// arcs. Direct API (this module links VoxelEarthShaders), a
+				// PEEK of the window the 5 s perf log drained: the panel must
+				// never become a second drainer of one accumulator. Every
+				// not-measured state gets words, never zeros -- two readings
+				// were retracted this week for zeros mistaken for
+				// measurements.
+				{
+					const FVoxelMarchHoleStats B = VoxelMarchPeekLastHoleWindow();
+					if (!B.bBreakdownArmed)
+					{
+						AddRow(TEXT("Holes breakdown: not measured (voxel.March.HoleStats 2 arms ")
+						       TEXT("per-level + per-reason)"),
+						       kStreamRowMuted);
+					}
+					else if (B.BreakdownFrames == 0)
+					{
+						AddRow(TEXT("Holes breakdown: armed, no 5s window landed yet"),
+						       kStreamRowWarn);
+					}
+					else
+					{
+						uint64 Attributed = 0;
+						for (int32 L = 0; L < 6; ++L) { Attributed += B.UncoveredByLevel[L]; }
+						if (Attributed == 0)
+						{
+							// A real, measured zero: uncovered rays existed
+							// (or not) but none were attributed. Distinct
+							// wording from every disarmed state above.
+							AddRow(TEXT("Holes breakdown: measured, 0 attributed misses this ")
+							       TEXT("window"),
+							       kStreamRowGood);
+						}
+						else
+						{
+							const double Inv = 100.0 / double(Attributed);
+							AddRow(FString::Printf(
+							           TEXT("Holes by level: L0 %.0f%%  L1 %.0f%%  L2 %.0f%%  ")
+							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  (of %s misses)"),
+							           double(B.UncoveredByLevel[0]) * Inv,
+							           double(B.UncoveredByLevel[1]) * Inv,
+							           double(B.UncoveredByLevel[2]) * Inv,
+							           double(B.UncoveredByLevel[3]) * Inv,
+							           double(B.UncoveredByLevel[4]) * Inv,
+							           double(B.UncoveredByLevel[5]) * Inv,
+							           *CommaInt(int64(Attributed))),
+							       kStreamRowNeutral);
+							// Reason order is the shader's bucket codes:
+							// never / pending / evicted / unattributed.
+							// pending dominating = throughput; never =
+							// coverage rule; evicted = eviction policy --
+							// three different fixes, which is the entire
+							// point of the row.
+							AddRow(FString::Printf(
+							           TEXT("Holes why: never %.0f%%  pending %.0f%%  ")
+							           TEXT("evicted %.0f%%  unattrib %.0f%%"),
+							           double(B.UncoveredByReason[0]) * Inv,
+							           double(B.UncoveredByReason[1]) * Inv,
+							           double(B.UncoveredByReason[2]) * Inv,
+							           double(B.UncoveredByReason[3]) * Inv),
+							       kStreamRowNeutral);
+						}
+					}
 				}
 			}
 		}

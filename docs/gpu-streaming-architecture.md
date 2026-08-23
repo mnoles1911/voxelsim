@@ -248,3 +248,47 @@ extend `uncovered` to report, per miss, **which level** the ray wanted and
 **why that chunk was absent** — never admitted / admitted but not yet resident /
 admitted then evicted. Those three have different fixes and nothing currently
 distinguishes them.
+
+### The instrument exists (2026-08-23, authored, NOT yet compiled or run)
+
+`voxel.March.HoleStats 2` (a third permutation value; 0 and 1 unchanged, 0
+still byte-identical). Every uncovered ray now also reports:
+
+- **Which level** — the ring level of the segment that owned the ground at the
+  ray's FIRST absent crossing, captured in the ring loop (only it knows SegL),
+  a histogram over the 6 levels. Uncaptured rays are NOT folded into a level;
+  they surface as `attributed < uncovered` on the log line, so a capture defect
+  reads as an instrument defect, never as a phantom L0 signal.
+- **Why absent** — the CPU streamer writes a 2-bit reason + 9-bit wrap tag
+  into the NON-resident index cells it already owns (the 31 bits below the
+  resident bit carried nothing): reason 1 "admitted-pending" stamped at
+  RecomputeDesiredSet's admission, reason 2 "evicted" written by the index's
+  ApplyDelta where the eviction clear used to write bare 0, reason 0 = never
+  admitted. The marcher classifies in the same index load its residency test
+  already pays — zero extra GPU bandwidth. The tag pins the annotation to its
+  torus wrap; a mismatch is deduced never-admitted (any transition of the
+  wanted coord would have stamped its own tag). A fourth bucket, unattributed,
+  holds what the instrument refuses to guess (stale resident records) and
+  indicts the meter, not the streaming, when large.
+
+**Read it:** the 5 s `Voxel march holes breakdown` line (byLevel, byReason,
+the attributed-vs-uncovered identity, and the annotation writer's own lifetime
+write counters — a reason split against zero writes is stale bits and says
+so), and two rows on the `voxel.Debug 3` panel ("Holes by level", "Holes
+why"). `voxel.GpuStream.Prototype` now arms level 2, so the owner's one-switch
+flow shows the split live. Level 1 legs print "breakdown NOT MEASURED", never
+zeros.
+
+**Certification runs, stated in advance:** `-VoxelMaxRingLevel=0` must put the
+mass at L1-L5 / near-100% never-admitted; `-VoxelHierarchicalCoverage` must
+inflate evicted (32,923 pool evictions measured); hovering must drain pending
+to ~0 alongside the ring queues; and normal flight, per the established R0
+facts, predicts mass at L0 with pending dominating — if it lands elsewhere,
+the arcs are a coverage-rule problem, not throughput.
+
+**Known limits:** incompatible with `voxel.March.IndexGpuResident 1` (its
+publish kernel clears cells to literal 0; the writer disarms and the log says
+so); annotations start cold when armed mid-session (evicted/pending read as
+never-admitted until the churn re-stamps the edges — seconds, while flying);
+truncation-cancelled admissions are un-stamped at the drop site so the pending
+bucket cannot absorb a coverage problem.
