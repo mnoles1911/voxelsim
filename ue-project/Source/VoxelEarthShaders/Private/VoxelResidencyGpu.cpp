@@ -1089,6 +1089,10 @@ struct FVoxelResidencyGpu::FImpl
 		A.ColdEnumerated += B.ColdEnumerated;
 		A.ColdDeferred += B.ColdDeferred;
 		A.EditedEnumerated += B.EditedEnumerated;
+		A.EditedFullSweeps += B.EditedFullSweeps;
+		A.EditedDirtyPasses += B.EditedDirtyPasses;
+		A.EditedSkipped += B.EditedSkipped;
+		A.EditedDeferred += B.EditedDeferred;
 		A.ResidualWalked += B.ResidualWalked;
 		A.EvictMs += B.EvictMs;
 		A.AdmitMs += B.AdmitMs;
@@ -1831,6 +1835,29 @@ struct FVoxelResidencyGpu::FImpl
 		//     exactly the same all-zero live line as a dead GPU path.
 		//   editEnum growing without edits happening -> the edited maps are
 		//     leaking into the annulus test.
+		// The -VoxelEditedLaneGate lanes (editFull/editDirty/editSkip/editDefer).
+		// The lane they bound re-walked the WHOLE edit map every live call, so
+		// these are read as a PAIR and neither alone is a verdict:
+		//   editSkip=0 with edits present and move= large -> the gate NEVER
+		//     SKIPS. Either a footprint is parked on a ring edge (slack is
+		//     genuinely 0 -- legitimate, and the floor is exactly the old
+		//     behaviour) or NoteEnumerated is not being called and the slack
+		//     was never computed at all. Only distinguishable because the
+		//     gate's own slack is printed beside it by the caller.
+		//   editFull=0 across a window containing a teleport or a long flight
+		//     -> the gate NEVER SWEEPS: the slack arithmetic is wrong in the
+		//     UNSAFE direction and edited chunks are being missed. This is the
+		//     dangerous half, and it is why editFull is a counter rather than
+		//     an implied remainder.
+		//   editFull+editDirty+editSkip != consume calls with edits present ->
+		//     a call took none of the three paths. That is the silent-lane
+		//     failure this file has now found in three places (underground,
+		//     resync, and this one).
+		//   editDefer climbing while editFull does not -> the per-call sweep
+		//     budget is under the edit-map size and the tail is starving. Not
+		//     a hole (the sweep resumes by construction, the gate refuses to
+		//     publish a slack for a truncated sweep), but a dig then takes
+		//     several recomputes to appear.
 		if (Mode == 2)
 		{
 			const FVoxelResidencyLiveOutcome& L = Since.Live;
@@ -1841,7 +1868,8 @@ struct FVoxelResidencyGpu::FImpl
 			       TEXT("[gpu-resid] live: move=%.0fuu delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
 			       TEXT("ad: prop=%u adOK=%u adopt=%u res=%u stale=%u rejFine=%u rejBud=%u ")
 			       TEXT("rejCut=%u | ev: prop=%u q=%u VETO=%u stale=%u resid=%u | cold: prop=%u ")
-			       TEXT("enum=%u defer=%u | edit=%u | fallback: cpuCalls=%u firstScans=%u ")
+			       TEXT("enum=%u defer=%u | edit: enum=%u full=%u dirty=%u skip=%u defer=%u | ")
+			       TEXT("fallback: cpuCalls=%u firstScans=%u ")
 			       TEXT("ug=%llu resync=%llu | ")
 			       TEXT("ms ev=%.2f ad=%.2f"),
 			       MoveUU, Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
@@ -1849,7 +1877,8 @@ struct FVoxelResidencyGpu::FImpl
 			       L.AdmitResurrected, L.AdmitStale, L.AdmitRejFine, L.AdmitRejBudget,
 			       L.AdmitRejCutoff, L.EvictProposals, L.EvictQueued, L.EvictVetoed,
 			       L.EvictStale, L.ResidualWalked, L.ColdProposals, L.ColdEnumerated,
-			       L.ColdDeferred, L.EditedEnumerated, L.CpuFallbackCalls, L.CpuFirstScans,
+			       L.ColdDeferred, L.EditedEnumerated, L.EditedFullSweeps, L.EditedDirtyPasses,
+			       L.EditedSkipped, L.EditedDeferred, L.CpuFallbackCalls, L.CpuFirstScans,
 			       Since.LiveUndergroundCalls, Since.LiveResyncCalls,
 			       L.EvictMs, L.AdmitMs);
 		}

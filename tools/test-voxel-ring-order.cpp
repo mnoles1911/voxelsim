@@ -25,6 +25,16 @@
 //   E2  the gate DOES skip -- a gate that always sweeps is as broken as one
 //       that never does, and E1 alone cannot tell them apart.
 //
+//   P1  the recompute profile reconciles: total minus the named stages is the
+//       printed residual, exactly.
+//   P2  the residual is SIGNED. Overlapping timers (a nested stage added as a
+//       top-level one) must produce a NEGATIVE residual, not a small positive
+//       one -- double-counted shares are the harder bug and an absolute value
+//       would hide them.
+//   P3  "never ran" and "ran and cost nothing" are distinguishable. Both print
+//       0.00 ms; only the call count separates them, and three lanes in this
+//       codebase have already been found inert because it did not.
+//
 // This compiles THE ENGINE HEADERS THEMSELVES, not a copy. That is the rule
 // that cost this project three green probes measuring a world the engine was
 // not running.
@@ -32,6 +42,7 @@
 //   tools/run-voxel-ring-order-test.sh     (or: see the compile line inside)
 
 #include "../ue-project/Source/VoxelEarth/VoxelEditedLaneGate.h"
+#include "../ue-project/Source/VoxelEarth/VoxelRecomputeProfile.h"
 #include "../ue-project/Source/VoxelEarth/VoxelRingOrder.h"
 
 #include <cmath>
@@ -316,6 +327,86 @@ static void TestEditedLaneGate()
 	      "E2 a budget-truncated sweep resumes next call");
 }
 
+// ---------------------------------------------------------------------------
+// P1, P2, P3 -- the recompute profile's reconciliation arithmetic.
+// ---------------------------------------------------------------------------
+static void TestRecomputeProfile()
+{
+	using namespace VoxelRecomputeProfile;
+
+	// P1: a clean partition reconciles to zero.
+	{
+		FWindow W;
+		W.AddRecomputeTotal(0.100);             // 100 ms of recompute
+		W.AddStage(EStage::Prologue, 0.002);
+		W.AddStage(EStage::FineResidency, 0.001);
+		W.AddStage(EStage::ExitScan, 0.037);
+		W.AddStage(EStage::QueueFilter, 0.000);
+		W.AddStage(EStage::EntryScan, 0.055);
+		W.AddStage(EStage::Sort, 0.003);
+		W.AddStage(EStage::LiveConsume, 0.001);
+		W.AddStage(EStage::Epilogue, 0.001);
+		Check(std::fabs(W.GetTotalMs() - 100.0) < 1e-9, "P1 total is the recompute timer");
+		Check(std::fabs(W.NamedMs() - 100.0) < 1e-9, "P1 named stages sum to the total");
+		Check(std::fabs(W.ResidualMs()) < 1e-9, "P1 a clean partition has zero residual");
+	}
+
+	// P1: an unbucketed stage shows up as a POSITIVE residual of its size.
+	{
+		FWindow W;
+		W.AddRecomputeTotal(0.100);
+		W.AddStage(EStage::EntryScan, 0.055);
+		W.AddStage(EStage::ExitScan, 0.030);
+		Check(std::fabs(W.ResidualMs() - 15.0) < 1e-9,
+		      "P1 unbucketed work is the residual, to the millisecond");
+		Check(W.ResidualPct() > 14.0 && W.ResidualPct() < 16.0, "P1 residual percentage");
+	}
+
+	// P2: overlapping timers must go NEGATIVE, not quietly small.
+	{
+		FWindow W;
+		W.AddRecomputeTotal(0.100);
+		W.AddStage(EStage::EntryScan, 0.090);
+		W.AddStage(EStage::ExitScan, 0.037);
+		// EntryScan double-counted as a nested stage on top:
+		W.AddStage(EStage::Sort, 0.020);
+		Check(W.ResidualMs() < 0.0, "P2 overlapping timers produce a NEGATIVE residual");
+		Check(std::fabs(W.ResidualMs() + 47.0) < 1e-9, "P2 the overlap is the residual magnitude");
+	}
+
+	// P3: never-ran and ran-for-free both print 0.00; only N separates them.
+	{
+		FWindow W;
+		W.AddRecomputeTotal(0.100);
+		W.AddStage(EStage::QueueFilter, 0.0); // ran, cost nothing
+		Check(W.GetStage(EStage::QueueFilter).Ms == 0.0, "P3 a free stage costs 0 ms");
+		Check(W.GetStage(EStage::QueueFilter).N == 1, "P3 ... but was entered once");
+		Check(!W.StageNeverRan(EStage::QueueFilter), "P3 a free stage is not a never-ran stage");
+		Check(W.GetStage(EStage::ExitScan).Ms == 0.0, "P3 an unentered stage also costs 0 ms");
+		Check(W.GetStage(EStage::ExitScan).N == 0, "P3 ... and was entered zero times");
+		Check(W.StageNeverRan(EStage::ExitScan), "P3 the two are distinguishable");
+	}
+
+	// Counters accumulate per level and do not bleed across levels.
+	{
+		FWindow W;
+		FEntryCounters C;
+		C.CellsVisited = 7225;
+		C.ZCells = 240000;
+		C.MemoHit = 7000;
+		C.MemoFill = 225;
+		W.AddEntry(0, C);
+		W.AddEntry(0, C);
+		W.AddEntry(3, C);
+		Check(W.GetEntry(0).CellsVisited == 14450, "entry counters accumulate");
+		Check(W.GetEntry(3).CellsVisited == 7225, "entry counters are per level");
+		Check(W.GetEntry(1).CellsVisited == 0, "entry counters do not bleed");
+		Check(W.GetEntry(0).ZCells == 480000, "Z-cell counter accumulates");
+	}
+
+	std::printf("      profile: 8 named stages, residual signed, N kept beside every Ms\n");
+}
+
 int main()
 {
 	std::printf("VoxelRingOrder / VoxelEditedLaneGate -- standalone checks\n\n");
@@ -345,6 +436,9 @@ int main()
 
 	std::printf("  E1/E2 edited-footprint lane gate\n");
 	TestEditedLaneGate();
+
+	std::printf("  P1/P2/P3 recompute profile reconciliation\n");
+	TestRecomputeProfile();
 
 	std::printf("\n%s (%d failure%s)\n", gFailures == 0 ? "PASS" : "FAIL", gFailures,
 	            gFailures == 1 ? "" : "s");

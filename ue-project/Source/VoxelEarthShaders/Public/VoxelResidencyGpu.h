@@ -193,6 +193,18 @@ struct FVoxelResidencyLiveOutcome
 	uint32 ColdEnumerated = 0;     // cold footprints CPU-enumerated this call
 	uint32 ColdDeferred = 0;       // over the per-call cold budget; re-proposed next scan
 	uint32 EditedEnumerated = 0;   // edited footprints in the annulus enumerated this consume
+	// -VoxelEditedLaneGate (VoxelEditedLaneGate.h). The edited lane used to
+	// re-walk the WHOLE edit map every live call; the gate skips the calls on
+	// which no verdict can have changed. These four exist so the skip is
+	// REFUTABLE -- see the failing readings at the log site, and note that
+	// EditedSkipped and EditedFullSweeps must BOTH be seen non-zero over a
+	// flight: a gate that always sweeps and a gate that never sweeps are both
+	// broken, and either one alone looks like success from the other's
+	// counter.
+	uint32 EditedFullSweeps = 0;   // calls that walked both edited maps
+	uint32 EditedDirtyPasses = 0;  // calls that enumerated only the dirty set
+	uint32 EditedSkipped = 0;      // calls the slack proved could change nothing
+	uint32 EditedDeferred = 0;     // footprints past the per-call sweep budget (sweep resumes)
 	uint32 ResidualWalked = 0;     // orphaned records walked with the CPU evict math
 	float EvictMs = 0.f;           // the live exit stage's cost (replaces the record walk)
 	float AdmitMs = 0.f;           // the live entry stage's cost (replaces the cell sweeps)

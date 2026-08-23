@@ -179,6 +179,7 @@ VoxelGpuMeshQueueDepth
 VoxelGpuPoolAlloc
 VoxelGpuWorldGenBatch
 VoxelEditedLaneGate
+VoxelRecomputeCensus
 VoxelResidencyAdmitBudget
 VoxelRingOrderScan
 VoxelHierarchicalCoverage
