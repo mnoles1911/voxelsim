@@ -878,7 +878,13 @@ namespace
 		SHADER_PARAMETER(uint32, OccStackFirst) \
 		SHADER_PARAMETER(uint32, MatStackFirst) \
 		SHADER_PARAMETER(uint32, OccBitmapFirst) \
-		SHADER_PARAMETER(uint32, MatBitmapFirst)
+		SHADER_PARAMETER(uint32, MatBitmapFirst) \
+		SHADER_PARAMETER(uint32, OccHistFirst) \
+		SHADER_PARAMETER(uint32, OccHistBucketWords) \
+		SHADER_PARAMETER(uint32, OccHistBuckets) \
+		SHADER_PARAMETER(uint32, MatHistFirst) \
+		SHADER_PARAMETER(uint32, MatHistBucketWords) \
+		SHADER_PARAMETER(uint32, MatHistBuckets)
 
 	class FVoxelBrickPoolClaimCS : public FVoxelBrickPoolShader
 	{
@@ -2611,6 +2617,12 @@ namespace
 		Params->MatStackFirst = L.MatStackFirst;
 		Params->OccBitmapFirst = L.OccBitmapFirst;
 		Params->MatBitmapFirst = L.MatBitmapFirst;
+		Params->OccHistFirst = L.OccHistFirst;
+		Params->OccHistBucketWords = L.OccHistBucketWords;
+		Params->OccHistBuckets = L.OccHistBuckets;
+		Params->MatHistFirst = L.MatHistFirst;
+		Params->MatHistBucketWords = L.MatHistBucketWords;
+		Params->MatHistBuckets = L.MatHistBuckets;
 	}
 }
 

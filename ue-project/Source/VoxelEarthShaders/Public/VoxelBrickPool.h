@@ -383,6 +383,16 @@ struct FVoxelBrickPoolAllocLayout
 	uint32 MatStackFirst = 0;
 	uint32 OccBitmapFirst = 0;  // bitmap-buffer dword offsets
 	uint32 MatBitmapFirst = 0;
+	// The claim-size demand histogram (state-buffer offsets + geometry). Lives
+	// between the counter block and the stack tops; the counter readback covers
+	// it by construction because it reads through MatTopsFirst + MatClasses.
+	// See kGpuAllocOccHistBucketWords for why it exists and what it decides.
+	uint32 OccHistFirst = 0;
+	uint32 OccHistBucketWords = 0;
+	uint32 OccHistBuckets = 0;
+	uint32 MatHistFirst = 0;
+	uint32 MatHistBucketWords = 0;
+	uint32 MatHistBuckets = 0;
 	uint32 StateDwords = 0;     // buffer sizes, for creation
 	uint32 BitmapDwords = 0;
 	uint32 SideDwords = 0;
@@ -882,9 +892,36 @@ public:
 	// be believed.
 	static constexpr uint32 kGpuAllocOccClassStep = 128;
 	static constexpr uint32 kGpuAllocMatClassStep = 512;
-	// Free-stack depth per class. 2,048 ranges per class absorbs any churn the
-	// current pipeline can produce (nothing in streaming frees at all today);
-	// overflow LEAKS the range and counts it, it never corrupts.
+	// Claim-size demand histogram bucket widths, in dwords. THE INSTRUMENT THE
+	// STEP CHANGE MUST WAIT FOR: the first honest legs (2026-08-23) measured
+	// padding 39.7-40.8% against the ~5-15% estimated above, and the recorded
+	// MEANS are exactly the numbers that cannot choose the fix -- 194 occ mean:
+	// ceil(194/64)*64 = 256 = ceil(194/128)*128, so the once-recommended
+	// "OccStep 128 -> 64" sweep moves occ padding by ZERO if claims cluster at
+	// the mean, while step 96 (misaligned with the cluster) could make it
+	// WORSE. Which of these is true depends on the distribution's shape, so
+	// the claim kernel counts every accepted total into (words-1)/width
+	// buckets and the window harvest prints quantiles plus the EXACT projected
+	// padding at candidate steps (any step that is a multiple of the width
+	// projects exactly, because bucket upper edges land on step boundaries).
+	// Widths: occ 16 -> 64 buckets over the 1,024-dword worst case; mat 64 ->
+	// 132 buckets over 8,448. 196 state dwords and two InterlockedAdds per
+	// claim, both unmeasurable.
+	static constexpr uint32 kGpuAllocOccHistBucketWords = 16;
+	static constexpr uint32 kGpuAllocMatHistBucketWords = 64;
+	// Free-stack depth per class -- since 2026-08-23 this constant is only the
+	// FLOOR: the armed default is max(this, ChunkCapacity), which makes stack
+	// overflow IMPOSSIBLE BY CONSTRUCTION rather than unlikely (see the Init
+	// comment for the induction). The original 2,048 was written when "nothing
+	// in streaming frees at all today" was true; the first legs with real
+	// eviction leaked 16,736 / 1,164 / 29,012 ranges across three runs of
+	// identical code (the spread tracks eviction volume -- 347,709 frees on
+	// the worst leg), because eviction bursts concentrate in the one or two
+	// classes real chunks share and 2,048 is ~128x below the provable bound.
+	// A leaked range is VRAM that never comes back; at the 50k chunks/s target
+	// the bursts are ~18x tonight's and this would have been arena exhaustion
+	// in minutes. Overflow still LEAKS-and-counts, never corrupts -- leakedRuns
+	// and the stackPeak counters remain the gate that proves the bound holds.
 	static constexpr uint32 kGpuAllocFreeStackCap = 2048;
 
 	// Latched at Init from VoxelGpuPoolAllocEnabled(). The arming decision is
@@ -941,6 +978,20 @@ public:
 		Stacked,       // Tier B.1 stack member -- stacks keep the readback path
 		Discard,       // voxel.GPU.BrickPackResident 0: pack-and-discard arm
 		ShellRefused,  // descriptor/record slot allocation failed (pool full)
+		// A shell that WAS allocated (and counted into `shells`) but was evicted
+		// by a later allocation in the same dispatch loop before its claim graph
+		// was enqueued -- the job drops its brick half and no claim ever runs.
+		// SPLIT OUT of ShellRefused (2026-08-23) because the two sit on opposite
+		// sides of the shells-vs-claims reconciliation: a refused shell never
+		// incremented `shells`, a stolen one did, and while both lived in one
+		// counter the identity `shells == claims + claimFails + stolen` could
+		// not be checked -- which is how a 40-count shells/claims mismatch on an
+		// otherwise-clean leg went unexplained. The window line now prints the
+		// residual (`shellsUnclaimed`); its FAILING reading is a value that
+		// stays non-zero at quiescence AFTER the GPU counters have landed --
+		// each such shell is a descriptor block and record slot resident with
+		// no volume behind it, i.e. a chunk the world will show as missing.
+		ShellStolen,
 	};
 	void NoteGpuAllocFallback(EGpuAllocFallback Reason);
 
@@ -1288,6 +1339,7 @@ private:
 	int64 GpuFallbackStacked = 0;
 	int64 GpuFallbackDiscard = 0;
 	int64 GpuFallbackShellRefused = 0;
+	int64 GpuFallbackShellStolen = 0;  // see EGpuAllocFallback::ShellStolen
 	// A small ring of recent shells for the sampled verify: fresh claims are
 	// where an allocator bug shows first, and sampling a ring is O(1) where a
 	// walk of ~100k residents per window is not. Stale entries (evicted or

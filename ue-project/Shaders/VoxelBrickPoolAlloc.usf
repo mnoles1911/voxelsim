@@ -46,8 +46,11 @@
 //
 // FRAGMENTATION, STATED HONESTLY. External fragmentation is ZERO by construction --
 // classes never split or merge ranges. The costs are (a) INTERNAL padding, the
-// class round-up, counted exactly (PaddedCum vs ActualCum counters; expect ~5-15%
-// at 128/512-dword steps against the census means) and (b) STRANDING: dwords parked
+// class round-up, counted exactly (PaddedCum vs ActualCum counters; the original
+// ~5-15% estimate at 128/512-dword steps MEASURED at 39.7-40.8% on the first
+// honest legs, 2026-08-23 -- the mat arena's 512-dword step against a ~208-dword
+// mean claim is the dominant term, and the claim kernel's demand histogram now
+// exists to choose the replacement steps from evidence) and (b) STRANDING: dwords parked
 // in the free stack of a class the current mix no longer asks for. Both are printed
 // on the [brick-gpualloc] window line (padding %, per-arena stranded MiB, bump
 // high-water), so a caller finds out from the log, not from an allocFail. When the
@@ -75,6 +78,9 @@
 //   [2..31]             counters -- see the kCtr* indices, mirrored in
 //                       FVoxelBrickPool (kGpuAllocCtr*); indices, not meanings, are
 //                       what the two sides must agree on
+//   [OccHistFirst..]    claim-size demand histogram, occ (OccHistBuckets entries
+//                       of OccHistBucketWords dwords each) -- see the claim kernel
+//   [MatHistFirst..]    claim-size demand histogram, mat
 //   [OccTopsFirst..]    occ class stack tops (OccClasses entries)
 //   [MatTopsFirst..]    mat class stack tops (MatClasses entries)
 //   [OccStackFirst..]   occ stack storage, FreeStackCap entries per class
@@ -153,6 +159,23 @@ uint OccStackFirst;
 uint MatStackFirst;
 uint OccBitmapFirst;   // bitmap-buffer dword offsets
 uint MatBitmapFirst;
+// The claim-size demand histogram's geometry (state-buffer offsets and bucket
+// widths/counts), host-bound like every other layout number. Added 2026-08-23
+// because the first honest legs read padding 39.7-40.8% against the 5-15% the
+// header expected, and the ONLY defensible response to that is to measure the
+// claim-size DISTRIBUTION before touching the class steps: the recorded means
+// (~194 occ / ~208 mat dwords) sit just above class boundaries in a way that
+// makes some "obvious" step changes exact no-ops -- ceil(194/64)*64 = 256 =
+// ceil(194/128)*128, so the recommended OccStep 64 sweep would move occ padding
+// by ZERO if claims cluster at the mean. This project has a recorded case of
+// exactly that shape (a caps sweep that moved throughput 0.0); the histogram is
+// what prevents the rerun.
+uint OccHistFirst;
+uint OccHistBucketWords;
+uint OccHistBuckets;
+uint MatHistFirst;
+uint MatHistBucketWords;
+uint MatHistBuckets;
 
 // Per-chunk values, same meanings as VoxelBrickPoolWrite.usf's.
 uint ChunkSlot;
@@ -216,6 +239,18 @@ static const uint kCtrOccPaddedCum     = 13u;
 static const uint kCtrOccActualCum     = 14u;
 static const uint kCtrMatPaddedCum     = 15u;
 static const uint kCtrMatActualCum     = 16u;
+// High-water of any single class's free-stack DEPTH, per arena -- the counter
+// that sizes FreeStackCap from evidence instead of hope. Recorded as the depth
+// a push WANTED (Old + 1, before the overflow check), so a burst deeper than
+// the stack still reports its true demand: a peak above FreeStackCap is the
+// FAILING reading and says exactly how far under-provisioned the stack was --
+// it is what 16,736 / 1,164 / 29,012 leakedRuns across three identical-code
+// legs (2026-08-23) never told us. A peak at or below FreeStackCap with
+// leakedRuns 0 is the healthy reading. (Concurrent overflowing pushes in one
+// 64-thread free pass can transiently overshoot the true demand by up to the
+// wave width; a diagnostic, not a gate, and biased only upward.)
+static const uint kCtrOccStackPeak     = 17u;
+static const uint kCtrMatStackPeak     = 18u;
 
 // Claim fail reasons, mirrored as FVoxelBrickPool::EGpuClaimFail.
 static const uint kFailNone      = 0u;
@@ -262,10 +297,14 @@ bool StackPop(uint TopsFirst, uint StackFirst, uint Class, out uint OutRel)
 // Push a class-sized range back. False = stack full (the range is LEAKED, which
 // the caller counts -- a full stack means frees are outrunning reuse by
 // FreeStackCap * step dwords in one class, which the window line surfaces).
-bool StackPush(uint TopsFirst, uint StackFirst, uint Class, uint Rel)
+// PeakCtr is the arena's kCtr*StackPeak: the demanded depth (Old + 1) is
+// recorded BEFORE the overflow check, deliberately, so an overflowing burst
+// reports how deep it actually wanted to go -- see the counter's comment.
+bool StackPush(uint TopsFirst, uint StackFirst, uint Class, uint Rel, uint PeakCtr)
 {
 	uint Old;
 	InterlockedAdd(AllocState[TopsFirst + Class - 1u], 1u, Old);
+	InterlockedMax(AllocState[PeakCtr], Old + 1u);
 	if (Old >= FreeStackCap)
 	{
 		InterlockedAdd(AllocState[TopsFirst + Class - 1u], 0xffffffffu);
@@ -402,6 +441,31 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		return;
 	}
 
+	// --- the claim-size demand histogram (always-on) ------------------------
+	// One InterlockedAdd per arena per claim, in a single-thread kernel --
+	// unmeasurable next to the copy passes. Counts DEMAND (every total the
+	// gates above accepted), not grants: on a leg with claimFail 0 the two are
+	// identical, and on a leg with failures the histogram still shows the mix
+	// that was asked for -- which is the number step tuning needs. Zero-word
+	// arenas are deliberately NOT counted (they allocate nothing and pad
+	// nothing); their count is recovered CPU-side as demand minus the bucket
+	// sum. Bucket = (words-1)/width, so a bucket's upper edge is exactly
+	// (b+1)*width and any step that is a multiple of the width projects
+	// EXACTLY onto the buckets -- the harvest's projected-padding line depends
+	// on that alignment. The min() cannot clip in today's layout (the worst-
+	// case gate above already refused anything past the last bucket's edge);
+	// it guards a drifted layout, not a live path.
+	if (OccWords > 0u)
+	{
+		const uint OccBucket = min((OccWords - 1u) / OccHistBucketWords, OccHistBuckets - 1u);
+		InterlockedAdd(AllocState[OccHistFirst + OccBucket], 1u);
+	}
+	if (MatWords > 0u)
+	{
+		const uint MatBucket = min((MatWords - 1u) / MatHistBucketWords, MatHistBuckets - 1u);
+		InterlockedAdd(AllocState[MatHistFirst + MatBucket], 1u);
+	}
+
 	const uint OccClass = (OccWords + OccClassStep - 1u) / OccClassStep;  // 0 when 0
 	const uint MatClass = (MatWords + MatClassStep - 1u) / MatClassStep;
 
@@ -468,7 +532,7 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 		// give-back-what-succeeded rule AllocateForChunk's retry loop follows.
 		// It is class-sized whether it came from the stack or the bump, so the
 		// stack is always a legal home for it; a full stack leaks it, counted.
-		if (OccClass > 0u && !StackPush(OccTopsFirst, OccStackFirst, OccClass, OccRel))
+		if (OccClass > 0u && !StackPush(OccTopsFirst, OccStackFirst, OccClass, OccRel, kCtrOccStackPeak))
 		{
 			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
 		}
@@ -732,7 +796,7 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 	{
 		const uint Rel = OccBaseAbs - OccRegionFirst;
 		Missing += BitmapClear(OccBitmapFirst, Rel, OccClass, OccClassStep);
-		if (!StackPush(OccTopsFirst, OccStackFirst, OccClass, Rel))
+		if (!StackPush(OccTopsFirst, OccStackFirst, OccClass, Rel, kCtrOccStackPeak))
 		{
 			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
 		}
@@ -742,7 +806,7 @@ void BrickPoolFreeMain(uint3 tid : SV_DispatchThreadID)
 	{
 		const uint Rel = MatBaseAbs - MatRegionFirst;
 		Missing += BitmapClear(MatBitmapFirst, Rel, MatClass, MatClassStep);
-		if (!StackPush(MatTopsFirst, MatStackFirst, MatClass, Rel))
+		if (!StackPush(MatTopsFirst, MatStackFirst, MatClass, Rel, kCtrMatStackPeak))
 		{
 			InterlockedAdd(AllocState[kCtrFreePushOverflow], 1u);
 		}
