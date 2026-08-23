@@ -2389,6 +2389,14 @@ void VoxelMarchVerifyIndexMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 // number and must not be inherited upward: a skipped brick is 0.8 m at level 0
 // and 1.6 m at level 1, and the whole reason B-2b-1 was approved past a FAIL is
 // that the LEVEL-DEPENDENCE of the asymmetry is the deliverable.
+// SIX WORDS PER LEVEL GROUP, PINNED, even though VOXEL_MARCH_MAX_RINGS is now
+// 7: this layout is pre-registered and every recorded verify leg reads by
+// these offsets, so widening a group would shift every later word and break
+// leg-to-leg comparability. The three per-level writes below therefore clamp
+// their bucket index to 5 EXPLICITLY (not to MAX_RINGS-1, which would spill
+// each group's level-6 count into the FIRST WORD OF THE NEXT GROUP -- a silent
+// counter corruption, the exact defect class this file's 60-vs-64-word note
+// records). A level-6 hit counts in the R5 bucket, labelled as such.
 #define VOXEL_MARCH_VSRC_FLATONLY_L0  122u  // 122..127
 #define VOXEL_MARCH_VSRC_HIERONLY_L0  128u  // 128..133
 // Rays whose hit landed in each ring, so the fingerprint can say which ring the
@@ -2763,7 +2771,11 @@ void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 	// distinction and it was inferred every time.
 	{
 		[unroll]
-		for (uint EL = 0u; EL < VOXEL_MARCH_MAX_RINGS; ++EL)
+		// 6u, not VOXEL_MARCH_MAX_RINGS: ENTERED is a pinned six-word group
+		// (146..151; see the layout note at VSRC_FLATONLY_L0) and word 152 is
+		// SKY -- a ring-6 entry counted there would report sky rays that
+		// never existed. Ring 6 entry is simply not censused here.
+		for (uint EL = 0u; EL < 6u; ++EL)
 		{
 			if ((Brk.RingsEntered & (1u << EL)) != 0u)
 			{
@@ -2827,9 +2839,10 @@ void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 		BandBin = uint(clamp(int(floor(-log10(max(D, 1e-12f)))), 0,
 		                     int(VOXEL_MARCH_VSRC_BANDBINS) - 1));
 		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_BAND_ALL0 + BandBin], 1u);
+		// Clamp 5, not MAX_RINGS-1: the group is six words (see the pinned-
+		// layout note at VSRC_FLATONLY_L0); index 6 here is BUDGETFLAT's word.
 		InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HITLVL0 +
-		                                   uint(clamp(Brk.Level, 0,
-		                                              int(VOXEL_MARCH_MAX_RINGS) - 1))], 1u);
+		                                   uint(clamp(Brk.Level, 0, 5))], 1u);
 
 		// ---- RING-DISCORDANT ------------------------------------------------
 		// Pre-registered before the source existed; read, never adjusted. The
@@ -3016,7 +3029,8 @@ void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 				{
 					InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_UNATTRIBUTED], 1u);
 				}
-				const uint FL = uint(clamp(Brk.Level, 0, int(VOXEL_MARCH_MAX_RINGS) - 1));
+				// Clamp 5 -- pinned six-word group, see VSRC_FLATONLY_L0.
+				const uint FL = uint(clamp(Brk.Level, 0, 5));
 				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_FLATONLY_L0 + FL], 1u);
 			}
 			else if (ArbSlot == VOXEL_MARCH_VSRC_ARB_HIERONLY)
@@ -3025,7 +3039,8 @@ void VoxelMarchVerifySourceMain(uint3 DispatchThreadId : SV_DispatchThreadID)
 				{
 					InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_UNATTRIBUTED], 1u);
 				}
-				const uint HL = uint(clamp(Hier.Level, 0, int(VOXEL_MARCH_MAX_RINGS) - 1));
+				// Clamp 5 -- pinned six-word group, see VSRC_FLATONLY_L0.
+				const uint HL = uint(clamp(Hier.Level, 0, 5));
 				InterlockedAdd(MarchOutVerifySource[VOXEL_MARCH_VSRC_HIERONLY_L0 + HL], 1u);
 			}
 			InterlockedAdd(MarchOutVerifySource[ArbSlot], 1u);

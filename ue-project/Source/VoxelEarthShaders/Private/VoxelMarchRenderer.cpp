@@ -204,9 +204,12 @@ namespace
 		ECVF_RenderThreadSafe);
 
 	TAutoConsoleVariable<int32> CVarVoxelMarchRingCount(
-		TEXT("voxel.March.RingCount"), 6,
-		TEXT("How many rings the cascade walks, 1..6. 6 is the full 4 km cascade; 2 is the ")
-		TEXT("B-2b-1 configuration that proved the mechanism (0-128 / 128-256 m). Clamped to the ")
+		TEXT("voxel.March.RingCount"), 0,
+		TEXT("How many rings the cascade walks. 0 (default) = FOLLOW THE STREAMING CASCADE ")
+		TEXT("(GetMaxRingLevel()+1, via FVoxelMarchChunkIndex::GetStreamedRingLevels) -- 6 on a ")
+		TEXT("default run, 7 under -VoxelMaxRingLevel=6, so the 8 km ring cannot stream without ")
+		TEXT("being walked. Explicit 1..7 overrides for measurement; 2 is the B-2b-1 ")
+		TEXT("configuration that proved the mechanism (0-128 / 128-256 m). Clamped to the ")
 		TEXT("levels the chunk index actually carries -- asking for more would walk a level with ")
 		TEXT("no grid behind it, which reads as empty space rather than as an error.\n")
 		TEXT("Only meaningful with voxel.March.Rings 1."),
@@ -1102,12 +1105,13 @@ static FAutoConsoleCommand GVoxelMarchStatsCmd(
 					// without a second leg.
 					UE_LOG(LogVoxelMarch, Display,
 					       TEXT("  MODEFP offered per level: L0=%d L1=%d L2=%d L3=%d L4=%d "
-					            "L5=%d | dropped above the %u indexed levels=%d (SHOULD BE 0 "
-					            "at six levels; anything else is the pool building a level "
+					            "L5=%d L6=%d | dropped above the %u indexed levels=%d (SHOULD BE 0 "
+					            "at seven levels; anything else is the pool building a level "
 					            "the marcher cannot walk)"),
 					       Idx.GetOfferedAtLevel(0), Idx.GetOfferedAtLevel(1),
 					       Idx.GetOfferedAtLevel(2), Idx.GetOfferedAtLevel(3),
 					       Idx.GetOfferedAtLevel(4), Idx.GetOfferedAtLevel(5),
+					       Idx.GetOfferedAtLevel(6),
 					       FVoxelMarchChunkIndex::kLevels, Idx.GetDroppedWrongLevel());
 					if (Idx.GetNumEntriesAtLevel(1) == 0)
 					{
@@ -3245,10 +3249,11 @@ struct FVoxelMarchRingSpec
 	float OuterUU(int32 L) const { return Ring0OuterUU * float(1 << L); }
 };
 
-// Six rings to 4 km. Mirrors VOXEL_MARCH_MAX_RINGS in VoxelBrickTraverse.ush and
+// Seven rings to 8.19 km (level 6 landed 2026-08-23). Mirrors
+// VOXEL_MARCH_MAX_RINGS in VoxelBrickTraverse.ush and
 // FVoxelMarchChunkIndex::kLevels; all three must agree or the marcher walks a
 // level the index does not carry.
-static constexpr int32 kVoxelMarchMaxRings = 6;
+static constexpr int32 kVoxelMarchMaxRings = 7;
 
 // ===========================================================================
 // CAN A RAY ARITHMETICALLY REACH THE RING WE CLAIM TO BE MEASURING?
@@ -3294,7 +3299,13 @@ static FVoxelMarchRingSpec VoxelMarchGetRingSpec()
 		S.ReachUU = S.Ring0OuterUU;
 		return S;
 	}
-	S.Count = FMath::Clamp(CVarVoxelMarchRingCount.GetValueOnAnyThread(), 1, kVoxelMarchMaxRings);
+	// 0 = follow the streaming cascade (see the cvar's help text and
+	// FVoxelMarchChunkIndex::SetStreamedRingLevels for why the default cannot
+	// be a second hand-set copy of the cascade depth).
+	const int32 Requested = CVarVoxelMarchRingCount.GetValueOnAnyThread();
+	S.Count = FMath::Clamp(
+		Requested > 0 ? Requested : GetGlobalVoxelMarchChunkIndex().GetStreamedRingLevels(),
+		1, kVoxelMarchMaxRings);
 	S.ReachUU = S.OuterUU(S.Count - 1);
 	return S;
 }

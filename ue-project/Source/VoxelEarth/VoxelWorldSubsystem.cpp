@@ -2731,11 +2731,16 @@ int32 MutateSkipVerify() { return GMutateSkipVerify; }
 
 int32 GpuMeshMaxLevel()
 {
+	// Default and clamp track kNumLevels-1 (were literal 5) so the 8 km ring's
+	// chunks take the GPU fork like every other coarse level's, rather than
+	// silently falling to the CPU workers -- an inert-by-omission fork is the
+	// exact failure the "did work actually move" rule exists for. In the
+	// default cascade no level-6 chunk is ever dispatched, so this is inert.
 	static const int32 MaxLevel = []
 	{
-		int32 Value = 5;
+		int32 Value = VoxelCoords::kNumLevels - 1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshMaxLevel="), Value);
-		return FMath::Clamp(Value, 0, 5);
+		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
 	}();
 	return MaxLevel;
 }
@@ -3390,7 +3395,12 @@ bool GetRingQuotaEnabled()
 // threads; since the coarse path made per-chunk cost flat in level (~4 ms at R5
 // exactly as at R1), an R5 slot is now no more expensive to reserve than an R1
 // one, so the "at most 4 of 24 slots" reasoning extends unchanged to 5 of 24.
-constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1, 1};
+// R6's floor of 1 rides the same argument as R5's did: the coarse path is flat
+// in level (~4 ms/chunk), so reserving a slot for the 8 km ring costs the same
+// as reserving one for R1 -- 6 of 24 slots worst case, still far from the
+// 13-slot catastrophe above. In the default run (MaxRingLevel 5) level 6 never
+// queues a chunk, its deficit never fires, and the floor is inert.
+constexpr int32 kRingSlotFloorDefault[VoxelCoords::kNumLevels] = {0, 1, 1, 1, 1, 1, 1};
 static_assert(UE_ARRAY_COUNT(kRingSlotFloorDefault) == VoxelCoords::kNumLevels,
               "kRingSlotFloorDefault must have one entry per level (a short list zero-fills silently, starving the tail rings)");
 
@@ -3449,19 +3459,34 @@ const int32* GetRingSlotFloors()
 // a LevelCap of 1 via the Max(1,...) below, so the ring holds one queued chunk,
 // permanently re-arms bAdmissionDeferredWork, and spins the recompute every tick
 // while never streaming.
-constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12};
+// R6'S SHARE IS ADDITIVE, NOT A RE-PARTITION, and that is deliberate. The
+// first six shares still sum to 1.0 exactly as before, so with the default
+// cascade (MaxRingLevel 5) every level's cap is bit-identical to the six-level
+// build -- the cascade A/B must attribute its delta to the NEW ring, not to
+// six quietly-shrunken old ones. With -VoxelMaxRingLevel=6 the pending queues
+// can therefore hold up to 1.12x the nominal cap in total (2048 -> ~2294);
+// that oversubscription is bounded, costs only sort/filter time proportional
+// to it, and was chosen over renormalising precisely because renormalising
+// moves six knobs to add one. R6 takes R5's 0.12 by R5's own argument: annulus
+// column counts are roughly equal at every level by construction.
+constexpr double kRingCapShare[VoxelCoords::kNumLevels] = {0.25, 0.18, 0.17, 0.15, 0.13, 0.12, 0.12};
 static_assert(UE_ARRAY_COUNT(kRingCapShare) == VoxelCoords::kNumLevels, "kRingCapShare must have one entry per level");
 
-constexpr double SumRingCapShare()
+constexpr double SumRingCapShare(int32 NumLevels)
 {
 	double Sum = 0.0;
-	for (double Share : kRingCapShare)
+	for (int32 L = 0; L < NumLevels; ++L)
 	{
-		Sum += Share;
+		Sum += kRingCapShare[L];
 	}
 	return Sum;
 }
-static_assert(SumRingCapShare() > 0.999 && SumRingCapShare() < 1.001, "kRingCapShare must sum to 1.0");
+// The historic partition invariant, kept over the six DEFAULT-cascade levels
+// (see the additive-share note above for why level 6 sits outside it).
+static_assert(SumRingCapShare(6) > 0.999 && SumRingCapShare(6) < 1.001,
+              "kRingCapShare[0..5] must sum to 1.0 (the default-cascade partition)");
+static_assert(kRingCapShare[VoxelCoords::kNumLevels - 1] > 0.0,
+              "a 0.0 share breaks, it does not mistune -- see the comment above the table");
 
 // --- the inner edge of a ring, as ONE pair of radii -------------------------
 //
@@ -3663,6 +3688,111 @@ bool IncrementalAdmissionEnabled()
 	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelIncrementalAdmission"));
 	return bEnabled;
 }
+
+// --- proximity-first admission + view-direction bias (2026-08-23) -----------
+//
+// THE DEFECT THESE TWO SWITCHES EXIST FOR, measured on phase1-split.log
+// (flight `line`, spawn -61440,-61440) and reported by the owner as "chunks
+// always load left to right ... far chunk areas load before the clearly
+// higher-priority areas near the player":
+//
+// The SORT and the DISPATCH were already proximity-first (SortPendingQueues,
+// DispatchJobs' head comparison). The stage that was not is ADMISSION gate (a),
+// the per-level budget: it rejected every candidate after the first Cap/4 IN
+// ENUMERATION ORDER, and the entry scan enumerates its square row-major
+// (Cy outer, Cx inner, from -ChunkSpan to +ChunkSpan). Whenever a level's
+// missing set exceeded the budget -- cold start, teleport, every refill of a
+// drained ring under flight -- the admitted 512 were therefore "the southmost
+// rows of the scan square, west to east": a lateral strip that starts at the
+// FAR edge of the ring and marches across, which is exactly the owner's
+// left-to-right fill. The nearest-first sort then faithfully ordered a queue
+// that only CONTAINED the far strip. The first stage decided; the later
+// stages never saw the near chunks at all. Worse, the strip's far chunks were
+// then thrown back by the distance truncation at the end of the same call
+// (the recorded B1 churn: "admitted Cap/4 = 512, truncation threw ~500
+// straight back out"), which is the candidatesRejected explosion
+// (6.4k -> 748k/window) and the dispatched decay (16.2k -> 9.5k) on that leg.
+//
+// -VoxelNearestAdmit: gate (a) keeps its budget but SELECTS THE NEAREST
+// Cap/4 INSTEAD OF THE FIRST Cap/4. Candidates that pass every other gate are
+// collected per level, sorted by the same priority key the queue itself uses,
+// and committed nearest-first until the budget is spent. Enumeration order
+// stops mattering entirely -- which is also what makes this robust against
+// Phase 2's margin-strip enumeration landing in parallel. Byte-identical off.
+//
+// -VoxelViewBias=<k> (0 = off): the owner's SECOND clause -- "first by
+// proximity, then, secondarily, by view direction". Applied INSIDE the sort
+// key so that one number still steers admission gate (b), the per-level sort,
+// the truncation and the cross-level dispatch pick, exactly as the
+// hierarchical-coverage bias does:
+//
+//     key = BiasedSortKeySq * (1 + k * (1 - cos(angleXY to view)) / 2)
+//
+// MULTIPLICATIVE AND BOUNDED, never a partition: a chunk directly behind the
+// camera is ranked as if sqrt(1+k) times farther (k=1 -> 1.41x) and NOTHING
+// is ever excluded outright, so distance still dominates and view direction
+// is a bounded tiebreak -- a chunk 100 m behind still beats one 150 m ahead
+// at k=1. What a 180 DEGREE TURN costs: nothing resident (the exit scan uses
+// raw distances, deliberately -- view bias must never feed eviction), one
+// re-key of the pending queues at the next recompute (SortPendingQueues
+// already refreshes every key per call), plus a per-level rescan to admit
+// candidates the old facing's cutoff had rejected -- the rotation trigger in
+// TickStreaming arms it, gated on the same drained-queue condition the
+// stale-scan trigger uses so it can never refill into a full queue (the
+// recorded 237k-rejections/s churn loop).
+//
+// Command-line-latched like every streaming-topology switch in this file
+// (-ExecCmds cvars land after the first desired set is built, and an A/B
+// taken that way silently measures the same state twice).
+bool NearestAdmitEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelNearestAdmit"));
+	return bEnabled;
+}
+
+double ViewBiasStrength()
+{
+	static const double K = []
+	{
+		// -VoxelViewBias=0.5 sets the strength; bare -VoxelViewBias means 0.5
+		// (behind costs sqrt(1.5) = 1.22x of distance -- deliberately gentle).
+		// Clamped at 3.0: sqrt(4) = 2x distance is already the edge of "view
+		// breaks ties"; past it the bias starts to look like a partition, and
+		// a partition is how far rings starve.
+		double Value = 0.0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelViewBias="), Value))
+		{
+			return FMath::Clamp(Value, 0.0, 3.0);
+		}
+		return FParse::Param(FCommandLine::Get(), TEXT("VoxelViewBias")) ? 0.5 : 0.0;
+	}();
+	return K;
+}
+
+// The one key every priority stage reads. Layered on BiasedSortKeySq rather
+// than replacing it: hierarchical coverage's inner-radius clamp and the view
+// bias compose (an interior coarse stand-in behind the camera queues behind
+// the same stand-in in front, at the same clamped radius band -- which is the
+// right order for a turn: the marcher falls through to whichever is there).
+// (DxUU, DyUU) is chunk centre minus anchor, XY; ViewDirXY is the unit camera
+// forward's XY (zero when no camera / bias off), captured on the game thread.
+double PrioritySortKeySq(int32 Level, double DistSq, double DxUU, double DyUU, const FVector2D& ViewDirXY,
+                          double ViewBiasK)
+{
+	double Key = BiasedSortKeySq(Level, DistSq);
+	if (ViewBiasK > 0.0 && !ViewDirXY.IsNearlyZero())
+	{
+		const double LenXY = FMath::Sqrt(DxUU * DxUU + DyUU * DyUU);
+		// A chunk essentially under the camera has no meaningful bearing;
+		// leave it unbiased (cos = 1) rather than dividing by ~0.
+		if (LenXY > 1.0)
+		{
+			const double CosToView = (DxUU * ViewDirXY.X + DyUU * ViewDirXY.Y) / LenXY;
+			Key *= 1.0 + ViewBiasK * 0.5 * (1.0 - CosToView);
+		}
+	}
+	return Key;
+}
 } // namespace VoxelStreamAdmission
 
 // --- sky band: never mesh chunks that are provably above the terrain ---------
@@ -3730,8 +3860,19 @@ namespace VoxelSkyBand
 // 11.25 m, so the 2 km cascade stays inside this cap and the bound is still
 // computed at every level in use. See the matching note on
 // vxc::kSurfaceBoundMaxCornersPerAxis for why a looser bound at a bigger
-// footprint is the safe direction, and why level 6 would start declining.
-constexpr int64 kMaxPixelCornersPerAxis = 16;
+// footprint is the safe direction.
+//
+// RAISED 16 -> 24 FOR THE LEVEL-6 RING (2026-08-23). A level-6 footprint
+// (204.8 m + 12.8 m apron = 217.6 m) needs ~8x8 corners at 30 m pixels and
+// ~21x21 at the 11.25 m scale-8 tier; at 16 the bound simply declined
+// (INT64_MAX) for every L6 chunk, which is SAFE but means the 8 km ring's
+// admission would never sky-trim -- every L6 footprint would carry its full
+// untrimmed Z headroom, at the level where a single footprint is the most
+// chunks. 24 covers the worst case with margin and sits far under
+// vxc::kSurfaceBoundMaxCornersPerAxis (72). Levels <= 5 need at most 12, so
+// raising the cap changes NO answer they ever got -- the cap only ever turns
+// "declined" into "computed", and only for footprints that needed 17..24.
+constexpr int64 kMaxPixelCornersPerAxis = 24;
 
 // -VoxelSkyTrim=0: restore ComputeFootprintChunkZRange's unconditional
 // +2-level-L-chunk headroom (the pre-wave behaviour) for A/B on one binary.
@@ -3802,9 +3943,19 @@ bool GetVerifyEnabled()
 // its inner hole against it.
 int32 UVoxelWorldSubsystem::GetMaxRingLevel()
 {
+	// DEFAULT 5, NOT kNumLevels-1, since kNumLevels went to 7 (2026-08-23).
+	// Level 6 (the 8.19 km ring) is compiled in but dormant, so a flag-free
+	// run streams exactly the shipped 4 km cascade -- the control arm of the
+	// cascade A/B is the default binary with no flags at all, per the same
+	// one-knob discipline every latched switch in this file follows.
+	// -VoxelMaxRingLevel=6 is the treatment arm. The clamp still tracks
+	// kNumLevels so the constant is the only thing to touch if an eighth ring
+	// ever becomes representable (it currently is not -- level 7 is ground
+	// cover's, see VoxelCoords::kNumLevels).
 	static const int32 MaxLevel = []
 	{
-		int32 Value = VoxelCoords::kNumLevels - 1;
+		constexpr int32 kDefaultMaxRingLevel = 5; // the shipped 4 km cascade edge
+		int32 Value = kDefaultMaxRingLevel;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelMaxRingLevel="), Value);
 		return FMath::Clamp(Value, 0, VoxelCoords::kNumLevels - 1);
 	}();
@@ -5331,6 +5482,61 @@ struct FVoxelWorldImpl
 	// rejections), valid only for the duration of that scan. One scratch, not
 	// per-level: levels scan strictly sequentially.
 	TSet<FIntPoint> DeferredFootprintsScratch;
+
+	// --- proximity-first admission + view bias state (2026-08-23) ------------
+	// See VoxelStreamAdmission::NearestAdmitEnabled / ViewBiasStrength for the
+	// defect and the design; game-thread only, like all streaming state.
+
+	// The camera's unit forward, XY, captured by UVoxelWorldSubsystem::Tick
+	// each tick BEFORE TickStreaming (cvar/camera reads belong on the game
+	// thread, captured by value). Zero until a camera exists; every consumer
+	// treats zero as "no bias, no metric" rather than as a direction.
+	FVector2D StreamViewDirXY = FVector2D::ZeroVector;
+	void SetStreamViewDir(const FVector2D& DirXY) { StreamViewDirXY = DirXY; }
+	// The view direction each level's entry scan last decided admission
+	// against -- the rotation analogue of LastEntryScanAnchorXY, and the state
+	// that makes the rotation-rescan trigger self-quenching (the rescan it
+	// arms overwrites this, so a held facing fires each level at most once).
+	FVector2D LastEntryScanViewDir[VoxelCoords::kNumLevels] = {};
+
+	// -VoxelNearestAdmit scratch: one level's budget-eligible candidates,
+	// collected during the cell sweep and committed nearest-first after it.
+	// A member so its capacity survives across scans (a cold level-0 scan can
+	// collect tens of thousands of entries; reallocating that every scan is
+	// exactly the kind of hidden per-recompute cost the hoisting notes above
+	// keep paying down). Reset (not shrunk) at each level's scan start.
+	struct FNearestAdmitEntry
+	{
+		double KeySq = 0.0; // the same PrioritySortKeySq the queue stores
+		VoxelCoords::FVoxelLevelChunkKey Key{};
+		bool bDeepAnchorRelative = false;
+	};
+	TArray<FNearestAdmitEntry> NearestAdmitScratch;
+
+	// Proof-of-effect counters ("did work actually move" -- a fork in this
+	// file once carried zero traffic for weeks, so a timing is never the
+	// evidence that an ordering change is live).
+	int64 NearestAdmitCommitsSinceLog = 0; // admissions that went through the sorted commit pass; 0 in the control arm
+	int64 ViewRescansSinceLog = 0;         // per-level rescans armed by the rotation trigger
+	// Mean 2D admit distance per level per window, BOTH arms: under row-major
+	// truncation a budget-bound level admits a far strip (mean pinned near the
+	// ring's far edge from the first window); nearest-first admits from the
+	// inside out (mean starts at the inner edge and walks outward window by
+	// window). This is the ordering evidence itself, not a proxy.
+	double LevelAdmitDistSumUU[VoxelCoords::kNumLevels] = {};
+	int64 LevelAdmitCountSinceLog[VoxelCoords::kNumLevels] = {};
+	// Mean cos(angle to view) of DISPATCHED chunks per window: the number that
+	// must move up when -VoxelViewBias is on, and must not move when it is off.
+	double DispatchDotSumSinceLog = 0.0;
+	int64 DispatchDotCountSinceLog = 0;
+
+	// The commit half of admission -- the fine-tier gate plus the record/queue
+	// write -- factored out of AddCandidate so the nearest-first commit pass
+	// and the legacy inline path run ONE spelling of it (a second spelling of
+	// an admission tail is the drift this file keeps paying for). Returns
+	// false when the fine tier refused the footprint (counted inside).
+	bool AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, double SortKeySq,
+	                          bool bDeepAnchorRelative, bool bOverlayAware, const FVector& Anchor);
 
 	// Quiescence detector for the stale-scan refill (rev B): the trigger above
 	// only fires once the anchor has been effectively still for half a second,
@@ -7174,6 +7380,56 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 			}
 		}
 	}
+
+	// VIEW-ROTATION RESCAN (-VoxelViewBias only; byte-identical inert without
+	// it). The bias steers the sort key, and SortPendingQueues re-keys the
+	// PENDING queues every recompute -- so a turn reorders queued work for
+	// free. What a turn cannot reorder is work that was never admitted: a
+	// candidate the old facing's per-level cutoff rejected (its key inflated
+	// by up to (1+k) while behind the camera) now deserves a smaller key, but
+	// EVERY existing rescan trigger is positional -- a pure rotation moves no
+	// anchor, crosses no chunk boundary, and would never re-ask. This is the
+	// rotation analogue of the stale-scan trigger directly above, and it
+	// borrows that trigger's two hard-learned guards verbatim:
+	//
+	//  * DRAINED-QUEUE GATE: only a ring whose queue holds nothing
+	//    dispatchable re-arms. Refilling into a ring at cap is the recorded
+	//    B1 churn loop (~237,600 rejections/s, R0 residency 2,024 -> 92) and
+	//    the reason the deferred-refill trigger grew its genuine-room guard.
+	//    The latency this costs a turn is small: while MOVING, the positional
+	//    gates rescan every level anyway (a turn mid-flight heals through
+	//    them); STATIONARY, the near rings drain in a second or two and fire.
+	//  * SELF-QUENCH: the rescan overwrites LastEntryScanViewDir[Level], so a
+	//    held facing fires each level at most once per 30 degrees of actual
+	//    turn, never per tick.
+	//
+	// cos 30 deg = 0.866: finer than the bias's own resolution would justify
+	// is pointless (the penalty at 30 deg off-axis is k*0.5*(1-0.866) = ~7%
+	// of key), coarser would make a deliberate quarter-turn miss the trigger.
+	if (VoxelStreamAdmission::ViewBiasStrength() > 0.0 && !StreamViewDirXY.IsNearlyZero())
+	{
+		constexpr double kViewRescanCos = 0.866; // cos(30 deg)
+		for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+		{
+			if (bLevelWantsRefill[Level] || !bHasRecomputedLevel[Level])
+			{
+				continue; // already re-arming, or never scanned (no stale facing to compare)
+			}
+			const int32 Undispatchable = (Level == 0) ? ColdBandHeldThisFrame : 0;
+			if (PendingJobKeysByLevel[Level].Num() > Undispatchable)
+			{
+				continue; // this ring still has work in hand -- see the drained-queue gate above
+			}
+			const FVector2D& ScannedDir = LastEntryScanViewDir[Level];
+			if (ScannedDir.IsNearlyZero() ||
+			    FVector2D::DotProduct(StreamViewDirXY, ScannedDir) < kViewRescanCos)
+			{
+				bLevelWantsRefill[Level] = true;
+				bAdmissionRefill = true;
+				++ViewRescansSinceLog;
+			}
+		}
+	}
 	if (!bHasRecomputed || AnchorChunk.X != LastAnchorChunk.X || AnchorChunk.Y != LastAnchorChunk.Y ||
 	    bUndergroundChanged || (bAnchorUnderground && AnchorChunk.Z != LastAnchorChunk.Z) || bAdmissionRefill)
 	{
@@ -8622,6 +8878,38 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	       ResultsDrainedSinceLog > 0 ? 100.0 * double(StaleDiscardsSinceLog) / double(ResultsDrainedSinceLog) : 0.0,
 	       (long long)ZeroQuadAppliesSinceLog, (long long)RecordsAddedSinceLog, (long long)RecordsEvictedSinceLog,
 	       (long long)CandidatesRejectedSinceLog, ChunksPerSecThisWindow);
+	// Priority-order evidence (2026-08-23; see VoxelStreamAdmission::
+	// NearestAdmitEnabled and ViewBiasStrength for the defect and the design).
+	//  admMeanM     mean 2D admit distance per ring this window, metres, BOTH
+	//               arms. Under the row-major budget a budget-bound ring pins
+	//               near its FAR edge from the first window; nearest-first
+	//               starts at the inner edge and walks outward window by
+	//               window. This is the ordering itself, not a proxy. "-" =
+	//               no admissions this window.
+	//  nearestAdmit admissions that went through the sorted commit pass. THE
+	//               proof-of-traffic counter: nonzero in the -VoxelNearestAdmit
+	//               arm, exactly 0 in control -- a fork in this file once
+	//               carried zero traffic for weeks, so the arm must prove
+	//               itself per window, not per design.
+	//  viewRescans  rotation-armed per-level rescans (-VoxelViewBias only).
+	//  dispatchDot  mean cos(bearing vs camera facing) of dispatched chunks;
+	//               must rise under -VoxelViewBias and hold still without it.
+	{
+		const FString DotStr = DispatchDotCountSinceLog > 0
+			? FString::Printf(TEXT("%+.2f"), DispatchDotSumSinceLog / double(DispatchDotCountSinceLog))
+			: FString(TEXT("n/a"));
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel admit order: admMeanM %s | nearestAdmit=%lld viewRescans=%lld dispatchDot=%s"),
+		       *JoinPerLevel([&](int32 L)
+		       {
+			       return LevelAdmitCountSinceLog[L] > 0
+			                  ? FString::Printf(TEXT("R%d=%.0f"), L,
+			                                    LevelAdmitDistSumUU[L] /
+			                                        (100.0 * double(LevelAdmitCountSinceLog[L])))
+			                  : FString::Printf(TEXT("R%d=-"), L);
+		       }),
+		       (long long)NearestAdmitCommitsSinceLog, (long long)ViewRescansSinceLog, *DotStr);
+	}
 	// T4-1 speculation census. specHitRate is reported but is NOT the deciding
 	// number -- parking scored 89% and still looked like a loss until the
 	// throughput metric was fixed to count adopted chunks. The decision is
@@ -9897,6 +10185,15 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	AccumTicks = 0;
 	JobsDispatchedSinceLog = ResultsDrainedSinceLog = StaleDiscardsSinceLog = ZeroQuadAppliesSinceLog = 0;
 	RecordsAddedSinceLog = RecordsEvictedSinceLog = CandidatesRejectedSinceLog = RecordsDroppedSinceLog = 0;
+	// Priority-order evidence counters (the "Voxel admit order" line).
+	NearestAdmitCommitsSinceLog = ViewRescansSinceLog = 0;
+	DispatchDotSumSinceLog = 0.0;
+	DispatchDotCountSinceLog = 0;
+	for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+	{
+		LevelAdmitDistSumUU[L] = 0.0;
+		LevelAdmitCountSinceLog[L] = 0;
+	}
 	// Wave S0. The pool's own push stats are drained and reset by
 	// GetAndResetPushStats where the line is emitted, not here -- they live on the
 	// component, and resetting them from two places is how the render-thread half
@@ -10252,7 +10549,7 @@ static constexpr int32 BoxRadiusChunksL1 = 0; // whole ring (fraction is always 
 // anchor's Z leaves the keep window entirely.
 // Levels 2+ get no deep box at all (BoxRadiusChunks returns false for them), so
 // their entry here is unused and 0 is the correct value for R5 as well.
-static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0, 0};
+static constexpr int32 KeepChunks[VoxelCoords::kNumLevels] = {9, 2, 0, 0, 0, 0, 0};
 static_assert(UE_ARRAY_COUNT(KeepChunks) == VoxelCoords::kNumLevels, "KeepChunks must have one entry per level");
 
 // Vertical keep-distance in UU for a deep chunk of this level, used by the
@@ -11411,13 +11708,23 @@ bool FVoxelWorldImpl::ChunkOwnsEditedBrick(const VoxelCoords::FVoxelChunkKey& Ch
 
 void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 {
-	const auto DistSq = [&Anchor](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+	// The refreshed key is PrioritySortKeySq -- 3D distance, the hierarchical-
+	// coverage clamp, and the bounded view-direction penalty in one number
+	// (each layer the identity with its switch off, so the control arm's keys
+	// are bit-identical). Refreshing the VIEW term here, every recompute, is
+	// what makes a turn reorder the already-queued work without any rescan:
+	// the queue's stored keys are never older than the last recompute.
+	const double ViewBiasK = VoxelStreamAdmission::ViewBiasStrength();
+	const auto PriorityKeySq = [&Anchor, ViewBiasK, this](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 	{
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level);
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
 		const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
 		const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
-		return FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) + FMath::Square(CenterZ - Anchor.Z);
+		const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
+		                        FMath::Square(CenterZ - Anchor.Z);
+		return VoxelStreamAdmission::PrioritySortKeySq(LevelKey.Level, DistSq3D, CenterX - Anchor.X,
+		                                                CenterY - Anchor.Y, StreamViewDirXY, ViewBiasK);
 	};
 	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance."
@@ -11487,7 +11794,7 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	{
 		for (FSortEntry& Entry : Queue)
 		{
-			Entry.DistSq = VoxelStreamAdmission::BiasedSortKeySq(Entry.Key.Level, DistSq(Entry.Key));
+			Entry.DistSq = PriorityKeySq(Entry.Key);
 		}
 		SortEntries(Queue);
 	}
@@ -11497,8 +11804,7 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	SortScratchGameThread.Reset(PendingGameThreadKeys.Num());
 	for (const VoxelCoords::FVoxelLevelChunkKey& Key : PendingGameThreadKeys)
 	{
-		SortScratchGameThread.Add(
-		    FSortEntry{VoxelStreamAdmission::BiasedSortKeySq(Key.Level, DistSq(Key)), Key});
+		SortScratchGameThread.Add(FSortEntry{PriorityKeySq(Key), Key});
 	}
 	SortEntries(SortScratchGameThread);
 	for (int32 Index = 0; Index < SortScratchGameThread.Num(); ++Index)
@@ -11619,7 +11925,14 @@ uint8 FVoxelWorldImpl::ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLe
 	}
 	if (Dir == RetainDir_Coarser)
 	{
-		if (L + 1 >= kNumLevels)
+		// The outermost ACTIVE ring, not kNumLevels-1: since level 6 exists in
+		// the tables but streams only under -VoxelMaxRingLevel=6, a default
+		// run's L5 eviction has no coarser replacement coming -- computing an
+		// L6 mask for it would make ReplacementCovered wait on a record that
+		// can never exist and hold every outward-evicted L5 stand-in to the
+		// retention cap. (Same reasoning at the other two GetMaxRingLevel
+		// sites this day added -- search "outermost ACTIVE".)
+		if (L + 1 > UVoxelWorldSubsystem::GetMaxRingLevel())
 		{
 			return 0xFF; // outermost: nothing coarser, and ReplacementCovered returns before it reads this
 		}
@@ -11629,6 +11942,181 @@ uint8 FVoxelWorldImpl::ComputeRetainReplacementZMask(const VoxelCoords::FVoxelLe
 		return (ParentZ >= ZMin && ParentZ <= ZMax) ? uint8(1) : uint8(0);
 	}
 	return 0;
+}
+
+bool FVoxelWorldImpl::AdmitCandidateCommit(const VoxelCoords::FVoxelLevelChunkKey& LevelKey, double SortKeySq,
+                                            bool bDeepAnchorRelative, bool bOverlayAware, const FVector& Anchor)
+{
+	using namespace VoxelCoords;
+	// Recomputed, not passed: (Cx+0.5)*ChunkEdge is the identical expression
+	// the cell sweep evaluated, on the same doubles, so the values are
+	// bit-equal to the captures the pre-refactor lambda closed over -- and the
+	// nearest-admit commit pass, which runs after the sweep's locals are gone,
+	// needs them derivable from the key alone.
+	const int32 QueueLevel = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
+	const double ChunkEdge = ChunkEdgeUUForLevel(LevelKey.Level);
+	const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
+	const double CenterY = (double(LevelKey.Key.Y) + 0.5) * ChunkEdge;
+
+	// Phase 2 fine-tier residency gate ("block-until-ready" --
+	// docs/terrain-amplification-plan.md: a missing fine tile is
+	// a DESYNC, never a procedural fallback, because collision
+	// and edits must agree on every client). No-op when
+	// FineStreamer is null (-VoxelFineTileDir not passed).
+	// Applies to EVERY candidate reaching this point, including
+	// the overlay-aware (edit-driven) path: an edit is
+	// always near the player, so it is virtually always inside
+	// the already-resident prefetch ring, but there is no
+	// edit-path exception in the product rule and none is added
+	// here. IsFootprintResident is a pure, no-I/O check (cheap,
+	// the common case); RequestFootprint is the one call that
+	// can synchronously touch disk, and only runs when the
+	// footprint is not already resident.
+	if (FineStreamer)
+	{
+		// THE FOOTPRINT CHECKED IS THE DISPATCH FOOTPRINT, NOT THE
+		// CHUNK'S OWN, and the difference is a real hole that was
+		// open until now.
+		//
+		// A chunk taken by the GPU fork is dispatched over 48
+		// columns starting at ChunkX*32 - 8
+		// (VoxelGpuChunkRegion::SetChunkFootprint): one BRICK of
+		// halo on each side, in level-L cells. VoxelGpuRegionBuild::
+		// FillRasterWindow then grows THAT by kRasterCavernMarginMm
+		// and the carrier stencil. So the raster the GPU actually
+		// samples reaches 8 cells further out than this gate was
+		// checking -- 0.8 m at level 0, but 25.6 m at level 5, since
+		// a level-L cell is 2^L level-0 voxels.
+		//
+		// Under 36.5 m of read margin that gap only bites within
+		// ~26 m of a tile boundary, which is exactly why it never
+		// showed up: it needs a high-level chunk straddling a tile
+		// edge with the neighbour not resident, and then it does not
+		// fault -- the kernel reads sea level and produces terrain
+		// no other client reproduces.
+		//
+		// Widening the gate by the halo costs nothing (it only ever
+		// defers a chunk slightly earlier) and makes the checked
+		// area a superset of BOTH paths' reach: the CPU worker's
+		// grid is the chunk plus a ONE-cell apron, comfortably
+		// inside this.
+		const double CellUU = ChunkEdge / double(VoxelCoords::ChunkEdgeVoxels);
+		double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
+		// THE SAME HOLE A THIRD TIME, and this instance was live:
+		// asset anchors sit up to maxRadiusMm OUTSIDE the chunk
+		// (site enumeration dilates by it), and the resolver reads
+		// Amp.column AT THE ANCHOR -- "one column per site, at the
+		// site's own anchor". At level 0 this gate covered 0.8 m of
+		// halo against a 15 m reach, so anchor columns fell into
+		// non-resident blocks, answered elevation 0 with default
+		// climate, and assetSpeciesTolerates refused every species.
+		// The terrain meshed perfectly and the world simply had no
+		// trees -- measured at the alpine lake, 2026-08-17: census
+		// with fully-decoded tiles places 13,995 instances; the
+		// engine composed zero. Level 0 only, because that is the
+		// only level whose sampler resolves instances at all.
+		if (QueueLevel == 0)
+		{
+			if (const vxc::AssetField* AFieldGate = Voxels.assetField();
+			    AFieldGate != nullptr && !AFieldGate->empty())
+			{
+				int32 ReachMm = 0;
+				for (const vxc::AssetLayer& L : AFieldGate->layers())
+				{
+					if (L.terrainLattice && L.maxRadiusMm > ReachMm)
+					{
+						ReachMm = L.maxRadiusMm;
+					}
+				}
+				// mm -> UU via the documented identity (1 UU = 10 mm,
+				// VoxelCoords.h:71), written as the ratio so a
+				// change to either constant moves this with it.
+				HalfEdge += double(ReachMm) *
+				            (VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm));
+			}
+		}
+		const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
+		const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
+		const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
+		const int64 FineY1Mm = WorldToMm(CenterY + HalfEdge);
+		if (!FineStreamer->IsFootprintResident(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm) &&
+		    !FineStreamer->RequestFootprint(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm))
+		{
+			// Still not resident (missing on disk, or failed
+			// validation -- see VoxelFineTileStreamer.cpp's
+			// EnsureTileResident logging). Do NOT admit; this
+			// candidate is re-scanned on every future call
+			// (RecomputeDesiredSet re-evaluates every
+			// un-admitted candidate on anchor movement), so it
+			// is retried, not dropped, once the fine tier
+			// catches up.
+			++CandidatesRejectedSinceLog;
+			++CandidatesRejectedThisCall;
+			++LevelCandidatesRejectedThisCall[QueueLevel];
+			bAdmissionDeferredWork[QueueLevel] = true;
+			// Backlog (see DeferredFootprints): "re-scanned on every future
+			// call" in the comment up top is exactly what this makes true
+			// again under the incremental arm. No bCellDeferredRecorded
+			// guard here -- the cell-loop local is out of reach from the
+			// nearest-admit commit pass, and TSet::Add is idempotent, so the
+			// guard was only ever a hash-count optimization; a rejection
+			// that goes unrecorded is a silently lost chunk.
+			if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+			{
+				DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
+			}
+			return false;
+		}
+	}
+
+	VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
+	// T4-2 shadow: THE admission, mirrored + ledgered. No-op in mode 0.
+	FVoxelResidencyGpu::Get().NoteRecordAdded(
+		LevelKey.Level,
+		FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+		bDeepAnchorRelative);
+	++RecordsAddedSinceLog;
+	++LevelRecordsAdded[QueueLevel];
+	AdmissionsThisLevel += bOverlayAware ? 0 : 1;
+	// Ordering evidence, both arms (see LevelAdmitDistSumUU): the RAW 2D
+	// distance, not the priority key -- the metric must mean the same thing
+	// whichever biases are on, or the A/B compares two different rulers.
+	LevelAdmitDistSumUU[QueueLevel] +=
+		FMath::Sqrt(FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y));
+	++LevelAdmitCountSinceLog[QueueLevel];
+	NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
+	// Phase 3 hook 2 of 4 (fresh admission -- THE admission).
+	// Placed against the flag write rather than the Add
+	// because the index needs both, and bDeepAnchorRelative is
+	// immutable from here on, which is what lets the index
+	// decide once whether this record can ever need the
+	// vertical test.
+	EvictionIndex.Insert(LevelKey, bDeepAnchorRelative);
+	// The absent-annotation writer (voxel.March.HoleStats 2):
+	// this is THE admission -- the one moment "admitted, not
+	// yet resident" becomes true -- so the march index's cell
+	// is stamped here and the uncovered breakdown can charge a
+	// miss on this chunk to THROUGHPUT instead of guessing.
+	// LevelKey's chunk coordinate is the brick/march chunk
+	// coordinate verbatim (VoxelBrickCpuArm::MakeKey copies
+	// the fields), so no translation happens here that could
+	// drift from the pool's. No-op unless armed; the uploads
+	// ride FlushAbsentMarks at this recompute's tail.
+	GetGlobalVoxelMarchChunkIndex().NoteChunkAdmitted(
+		FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
+		QueueLevel);
+	if (bOverlayAware)
+	{
+		PendingGameThreadKeys.Add(LevelKey);
+	}
+	else
+	{
+		// Distance cached at admission; SortPendingQueues refreshes
+		// it against the anchor at the bottom of this same call.
+		// The priority key, matching what that refresh will write.
+		PendingJobKeysByLevel[QueueLevel].Add(FSortEntry{SortKeySq, LevelKey});
+	}
+	return true;
 }
 
 void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
@@ -12231,11 +12719,18 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 		// trigger self-quiescing: the rescan it provokes sets this to the current
 		// anchor, so a pinned anchor fires the trigger at most once per level.
 		LastEntryScanAnchorXY[Level] = FVector2D(Anchor.X, Anchor.Y);
+		// Rotation analogue of the line above (the view-rescan trigger in
+		// TickStreaming compares against this; writing it only on scans that
+		// ran is what makes that trigger self-quenching). Written whether or
+		// not the bias is on -- it is a record of fact, and the trigger is
+		// gated on the switch, not this.
+		LastEntryScanViewDir[Level] = StreamViewDirXY;
 		bHasRecomputedLevel[Level] = true;
 		++LevelEntryScans[Level];
 		++LevelsScannedThisCall;
 		bLevelScannedThisCall[Level] = true;
 		AdmissionsThisLevel = 0; // per-level admission budget (see its doc comment)
+		NearestAdmitScratch.Reset(); // -VoxelNearestAdmit: this level's eligible candidates, committed after the sweep
 
 		// Incremental admission (-VoxelIncrementalAdmission): decide whether
 		// THIS scan may diff against the previous one instead of re-walking
@@ -12560,7 +13055,7 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// about direction for a later change to invalidate.)
 						bRevisit = Crossed(IncrNearBandSq) || Crossed(IncrMidBandSq);
 					}
-					if (!bRevisit && RingOverlapChunks == 0 && Level + 1 < VoxelCoords::kNumLevels &&
+					if (!bRevisit && RingOverlapChunks == 0 && Level + 1 <= MaxRingLevel &&
 					    DistSq >= IncrOuterSq && DistSq < IncrAdmitOuterSq)
 					{
 						// (c): in the seam band at both endpoints (reaching
@@ -12570,7 +13065,16 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						// that the same way the body tests it. Skipped
 						// entirely under -VoxelRingOverlapChunks>0, where the
 						// band admits unconditionally and the verdict is
-						// constant.
+						// constant. MaxRingLevel, not kNumLevels-1, in the
+						// guard above, mirroring the body's seam test: past
+						// the outermost ACTIVE ring the body's in-band
+						// verdict is a constant `continue` (clipmap ground),
+						// so there is no parent flip to diff -- with level 6
+						// compiled in but dormant, kNumLevels-1 would only
+						// buy L5 spurious revisits. At default
+						// -VoxelMaxRingLevel 5 this is the same set of
+						// levels the pre-ring-6 `Level + 1 < kNumLevels`
+						// tested.
 						const double SeamParentEdge = ChunkEdge * 2.0;
 						const double SeamParentCX = (double(Cx >> 1) + 0.5) * SeamParentEdge;
 						const double SeamParentCY = (double(Cy >> 1) + 0.5) * SeamParentEdge;
@@ -12667,9 +13171,17 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					// everywhere, measured at p50 14.9 -> 17.3 ms, chunks/s
 					// 968 -> 672 and post-warmup hitches 1 -> 47. This admits only
 					// the chunks that would otherwise be holes.)
-					if (DistSq >= FMath::Square(AdmitOuterUU) || Level + 1 >= VoxelCoords::kNumLevels)
+					// MaxRingLevel, not kNumLevels-1: the outermost ACTIVE ring
+					// this run. With level 6 compiled in but dormant (default
+					// -VoxelMaxRingLevel 5), kNumLevels-1 would send L5's edge
+					// into the parent-coverage test below, which would infer
+					// "L6 covers this ground" from radii alone while L6
+					// streams nothing -- and skip the seam chunk, opening a
+					// hole band at 4,096 m in the control arm.
+					if (DistSq >= FMath::Square(AdmitOuterUU) ||
+					    Level + 1 > MaxRingLevel)
 					{
-						continue; // too far to be a seam case, or no coarser ring exists (clipmap takes over)
+						continue; // too far to be a seam case, or no coarser ring active (clipmap takes over)
 					}
 					if (RingOverlapChunks > 0)
 					{
@@ -12948,7 +13460,15 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					const bool bOverlayAware = NeedsOverlayAwarePath(LevelKey);
 					const int32 Cap = VoxelStreamAdmission::GetPendingJobCap();
 					const int32 QueueLevel = FMath::Clamp(LevelKey.Level, 0, VoxelCoords::kNumLevels - 1);
-					if (!bOverlayAware && Cap > 0 && AdmissionsThisLevel >= Cap / 4)
+					const bool bNearestAdmit = VoxelStreamAdmission::NearestAdmitEnabled();
+					// Gate (a) runs HERE only in the control arm. Under
+					// -VoxelNearestAdmit the budget is enforced in the sorted
+					// commit pass after the cell sweep, where it can take the
+					// NEAREST Cap/4 instead of the FIRST Cap/4 in row-major
+					// scan order -- scan order is the measured cause of the
+					// owner's "left to right / far before near" fill; see
+					// VoxelStreamAdmission::NearestAdmitEnabled.
+					if (!bNearestAdmit && !bOverlayAware && Cap > 0 && AdmissionsThisLevel >= Cap / 4)
 					{
 						// Per-level admission budget (see AdmissionsThisLevel).
 						++CandidatesRejectedSinceLog;
@@ -12971,13 +13491,18 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					const double CenterZ = (double(LevelKey.Key.Z) + 0.5) * ChunkEdge;
 					const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 					                        FMath::Square(CenterZ - Anchor.Z);
-					// The BIASED key (identity when -VoxelHierarchicalCoverage
-					// is off), for both the cutoff test and the queue entry:
+					// The PRIORITY key -- BiasedSortKeySq (identity when
+					// -VoxelHierarchicalCoverage is off) times the bounded
+					// view-direction penalty (identity when -VoxelViewBias is
+					// off) -- for both the cutoff test and the queue entry:
 					// the cutoff was derived from stored keys by
 					// DropFarthestOverCap, so comparing a raw distance against
-					// it would mix two scales for interior coarse chunks.
-					const double SortKeySq =
-					    VoxelStreamAdmission::BiasedSortKeySq(QueueLevel, DistSq3D);
+					// it would mix two scales for interior coarse chunks, and
+					// mixing biased-and-unbiased view keys would do the same
+					// for chunks behind the camera.
+					const double SortKeySq = VoxelStreamAdmission::PrioritySortKeySq(
+					    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamViewDirXY,
+					    VoxelStreamAdmission::ViewBiasStrength());
 					if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 					{
 						++CandidatesRejectedSinceLog;
@@ -12992,157 +13517,27 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 						}
 						return;
 					}
-
-					// Phase 2 fine-tier residency gate ("block-until-ready" --
-					// docs/terrain-amplification-plan.md: a missing fine tile is
-					// a DESYNC, never a procedural fallback, because collision
-					// and edits must agree on every client). No-op when
-					// FineStreamer is null (-VoxelFineTileDir not passed).
-					// Applies to EVERY candidate reaching this point, including
-					// the overlay-aware (edit-driven) path above: an edit is
-					// always near the player, so it is virtually always inside
-					// the already-resident prefetch ring, but there is no
-					// edit-path exception in the product rule and none is added
-					// here. IsFootprintResident is a pure, no-I/O check (cheap,
-					// the common case); RequestFootprint is the one call that
-					// can synchronously touch disk, and only runs when the
-					// footprint is not already resident.
-					if (FineStreamer)
+					if (bNearestAdmit && !bOverlayAware)
 					{
-						// THE FOOTPRINT CHECKED IS THE DISPATCH FOOTPRINT, NOT THE
-						// CHUNK'S OWN, and the difference is a real hole that was
-						// open until now.
-						//
-						// A chunk taken by the GPU fork is dispatched over 48
-						// columns starting at ChunkX*32 - 8
-						// (VoxelGpuChunkRegion::SetChunkFootprint): one BRICK of
-						// halo on each side, in level-L cells. VoxelGpuRegionBuild::
-						// FillRasterWindow then grows THAT by kRasterCavernMarginMm
-						// and the carrier stencil. So the raster the GPU actually
-						// samples reaches 8 cells further out than this gate was
-						// checking -- 0.8 m at level 0, but 25.6 m at level 5, since
-						// a level-L cell is 2^L level-0 voxels.
-						//
-						// Under 36.5 m of read margin that gap only bites within
-						// ~26 m of a tile boundary, which is exactly why it never
-						// showed up: it needs a high-level chunk straddling a tile
-						// edge with the neighbour not resident, and then it does not
-						// fault -- the kernel reads sea level and produces terrain
-						// no other client reproduces.
-						//
-						// Widening the gate by the halo costs nothing (it only ever
-						// defers a chunk slightly earlier) and makes the checked
-						// area a superset of BOTH paths' reach: the CPU worker's
-						// grid is the chunk plus a ONE-cell apron, comfortably
-						// inside this.
-						const double CellUU = ChunkEdge / double(VoxelCoords::ChunkEdgeVoxels);
-						double HalfEdge = ChunkEdge * 0.5 + double(VoxelGpuChunkRegion::kBrickEdge) * CellUU;
-						// THE SAME HOLE A THIRD TIME, and this instance was live:
-						// asset anchors sit up to maxRadiusMm OUTSIDE the chunk
-						// (site enumeration dilates by it), and the resolver reads
-						// Amp.column AT THE ANCHOR -- "one column per site, at the
-						// site's own anchor". At level 0 this gate covered 0.8 m of
-						// halo against a 15 m reach, so anchor columns fell into
-						// non-resident blocks, answered elevation 0 with default
-						// climate, and assetSpeciesTolerates refused every species.
-						// The terrain meshed perfectly and the world simply had no
-						// trees -- measured at the alpine lake, 2026-08-17: census
-						// with fully-decoded tiles places 13,995 instances; the
-						// engine composed zero. Level 0 only, because that is the
-						// only level whose sampler resolves instances at all.
-						if (QueueLevel == 0)
-						{
-							if (const vxc::AssetField* AFieldGate = Voxels.assetField();
-							    AFieldGate != nullptr && !AFieldGate->empty())
-							{
-								int32 ReachMm = 0;
-								for (const vxc::AssetLayer& L : AFieldGate->layers())
-								{
-									if (L.terrainLattice && L.maxRadiusMm > ReachMm)
-									{
-										ReachMm = L.maxRadiusMm;
-									}
-								}
-								// mm -> UU via the documented identity (1 UU = 10 mm,
-								// VoxelCoords.h:71), written as the ratio so a
-								// change to either constant moves this with it.
-								HalfEdge += double(ReachMm) *
-								            (VoxelCoords::VoxelSizeUU / double(vxc::kVoxelSizeMm));
-							}
-						}
-						const int64 FineX0Mm = WorldToMm(CenterX - HalfEdge);
-						const int64 FineX1Mm = WorldToMm(CenterX + HalfEdge);
-						const int64 FineY0Mm = WorldToMm(CenterY - HalfEdge);
-						const int64 FineY1Mm = WorldToMm(CenterY + HalfEdge);
-						if (!FineStreamer->IsFootprintResident(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm) &&
-						    !FineStreamer->RequestFootprint(FineX0Mm, FineY0Mm, FineX1Mm, FineY1Mm))
-						{
-							// Still not resident (missing on disk, or failed
-							// validation -- see VoxelFineTileStreamer.cpp's
-							// EnsureTileResident logging). Do NOT admit; this
-							// candidate is re-scanned on every future call
-							// (RecomputeDesiredSet re-evaluates every
-							// un-admitted candidate on anchor movement), so it
-							// is retried, not dropped, once the fine tier
-							// catches up.
-							++CandidatesRejectedSinceLog;
-							++CandidatesRejectedThisCall;
-							++LevelCandidatesRejectedThisCall[QueueLevel];
-							bAdmissionDeferredWork[QueueLevel] = true;
-							// Backlog: same recording as the budget rejection
-							// above -- "re-scanned on every future call" in
-							// the comment up top is exactly what this makes
-							// true again under the incremental arm.
-							if (!bCellDeferredRecorded && VoxelStreamAdmission::IncrementalAdmissionEnabled())
-							{
-								bCellDeferredRecorded = true;
-								DeferredFootprints[QueueLevel].Add(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y));
-							}
-							return;
-						}
+						// Eligible; commitment is ORDERED, not immediate. The
+						// sorted commit pass after the cell sweep spends the
+						// budget nearest-first and runs the fine-tier gate
+						// only for the winners (running it here would trigger
+						// synchronous tile I/O for candidates the budget was
+						// never going to take).
+						NearestAdmitScratch.Add(FNearestAdmitEntry{SortKeySq, LevelKey, bDeepAnchorRelative});
+						return;
 					}
 
-					VoxelStreaming::FChunkRecord& NewRecord = ChunkRecords.Add(LevelKey);
-					// T4-2 shadow: THE admission, mirrored + ledgered. No-op in mode 0.
-					FVoxelResidencyGpu::Get().NoteRecordAdded(
-						LevelKey.Level,
-						FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
-						bDeepAnchorRelative);
-					++RecordsAddedSinceLog;
-					++LevelRecordsAdded[QueueLevel];
-					AdmissionsThisLevel += bOverlayAware ? 0 : 1;
-					NewRecord.bDeepAnchorRelative = bDeepAnchorRelative;
-					// Phase 3 hook 2 of 4 (fresh admission -- THE admission).
-					// Placed against the flag write rather than the Add
-					// because the index needs both, and bDeepAnchorRelative is
-					// immutable from here on, which is what lets the index
-					// decide once whether this record can ever need the
-					// vertical test.
-					EvictionIndex.Insert(LevelKey, bDeepAnchorRelative);
-					// The absent-annotation writer (voxel.March.HoleStats 2):
-					// this is THE admission -- the one moment "admitted, not
-					// yet resident" becomes true -- so the march index's cell
-					// is stamped here and the uncovered breakdown can charge a
-					// miss on this chunk to THROUGHPUT instead of guessing.
-					// LevelKey's chunk coordinate is the brick/march chunk
-					// coordinate verbatim (VoxelBrickCpuArm::MakeKey copies
-					// the fields), so no translation happens here that could
-					// drift from the pool's. No-op unless armed; the uploads
-					// ride FlushAbsentMarks at this recompute's tail.
-					GetGlobalVoxelMarchChunkIndex().NoteChunkAdmitted(
-						FIntVector(LevelKey.Key.X, LevelKey.Key.Y, LevelKey.Key.Z),
-						QueueLevel);
-					if (bOverlayAware)
-					{
-						PendingGameThreadKeys.Add(LevelKey);
-					}
-					else
-					{
-						// Distance cached at admission; SortPendingQueues refreshes
-						// it against the anchor at the bottom of this same call.
-						// The biased key, matching what that refresh will write.
-						PendingJobKeysByLevel[QueueLevel].Add(FSortEntry{SortKeySq, LevelKey});
-					}
+					// The fine-tier gate and the record/queue write live in
+					// AdmitCandidateCommit -- ONE spelling, shared with the
+					// -VoxelNearestAdmit commit pass (moved 2026-08-23,
+					// carrying the Phase 2 backlog recording, Phase 3
+					// EvictionIndex hook and T4-2 residency mirror with it;
+					// the arithmetic recomputing this footprint's centre
+					// there is the identical expression that produced the
+					// captures here).
+					AdmitCandidateCommit(LevelKey, SortKeySq, bDeepAnchorRelative, bOverlayAware, Anchor);
 				};
 
 				// Buried-chunk band skip, ADMISSION side (see
@@ -13298,6 +13693,81 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 					}
 				}
 			}
+		}
+
+		// -VoxelNearestAdmit COMMIT PASS: spend this level's budget on the
+		// NEAREST eligible candidates, not the first-enumerated ones. This is
+		// the fix for the owner's "left to right / far before near" fill --
+		// the row-major cell sweep above decided WHICH chunks the budget took,
+		// and no later stage (sort, truncate, dispatch, all already
+		// nearest-first) could recover chunks admission never let in. Sorting
+		// by the SAME priority key the queue stores means the budget, the
+		// cutoff, the sort and the dispatch now agree on one ordering.
+		//
+		// Cost: one sort over this scan's eligible candidates. Steady-state
+		// scans collect roughly what they used to admit (~hundreds); the cold
+		// worst case (~tens of thousands on a first level-0 scan) sorts in
+		// single-digit ms against the 185-660 ms the same scan's entryMs
+		// already measures -- and it is INSIDE this level's entry timing, so
+		// entryMs still accounts for it.
+		//
+		// The commit also fixes the recorded refill churn ("admitted
+		// Cap/4 = 512, truncation threw ~500 straight back out"): the nearest
+		// 512 are precisely the entries DropFarthestOverCap keeps, so a refill
+		// now converts budget into resident-bound work instead of into
+		// add/erase pairs. Expected signature on a leg: candidatesRejected
+		// stays large (the cutoff still declines the far annulus by design)
+		// while recordsAdded stops tracking recordsDropped and dispatched
+		// recovers.
+		if (VoxelStreamAdmission::NearestAdmitEnabled() && NearestAdmitScratch.Num() > 0)
+		{
+			NearestAdmitScratch.Sort([](const FNearestAdmitEntry& A, const FNearestAdmitEntry& B)
+			                         { return A.KeySq < B.KeySq; });
+			const int32 CommitCap = VoxelStreamAdmission::GetPendingJobCap();
+			const int32 Budget = (CommitCap > 0) ? CommitCap / 4 : MAX_int32; // same expression as gate (a)
+			int32 Committed = 0;
+			for (; Committed < NearestAdmitScratch.Num(); ++Committed)
+			{
+				if (AdmissionsThisLevel >= Budget)
+				{
+					break;
+				}
+				const FNearestAdmitEntry& E = NearestAdmitScratch[Committed];
+				if (AdmitCandidateCommit(E.Key, E.KeySq, E.bDeepAnchorRelative, /*bOverlayAware*/ false, Anchor))
+				{
+					++NearestAdmitCommitsSinceLog; // the proof-of-traffic counter: 0 in the control arm
+				}
+			}
+			// The tail the budget declined: counted exactly as gate (a)
+			// counted its rejections, so candidatesRejected means the same
+			// thing in both arms and the refill triggers re-arm identically.
+			const int32 Declined = NearestAdmitScratch.Num() - Committed;
+			if (Declined > 0)
+			{
+				CandidatesRejectedSinceLog += Declined;
+				CandidatesRejectedThisCall += Declined;
+				LevelCandidatesRejectedThisCall[Level] += Declined;
+				bAdmissionDeferredWork[Level] = true;
+				// Backlog (see DeferredFootprints): under -VoxelNearestAdmit
+				// the budget rejection happens HERE, after the sweep, not at
+				// gate (a) -- so the recording moves with it. Without this,
+				// a declined candidate is in no set at all: not tracked, not
+				// backlogged, its cell crossing no radius -- and the next
+				// incremental scan would skip its cell forever. That is the
+				// silently-lost-chunk failure Phase 2's backlog exists to
+				// make impossible, re-created by the interaction of the two
+				// switches. Footprint-granular and idempotent, exactly like
+				// every other recording site.
+				if (VoxelStreamAdmission::IncrementalAdmissionEnabled())
+				{
+					for (int32 DeclinedIdx = Committed; DeclinedIdx < NearestAdmitScratch.Num(); ++DeclinedIdx)
+					{
+						const VoxelCoords::FVoxelLevelChunkKey& DK = NearestAdmitScratch[DeclinedIdx].Key;
+						DeferredFootprints[Level].Add(FIntPoint(DK.Key.X, DK.Key.Y));
+					}
+				}
+			}
+			NearestAdmitScratch.Reset();
 		}
 
 		// Levels that early-`continue`d above (anchor still inside the same
@@ -13903,7 +14373,10 @@ bool ReplacementCovered(const TMap<VoxelCoords::FVoxelLevelChunkKey, VoxelStream
 	}
 	if (Dir == RetainDir_Coarser)
 	{
-		if (L >= VoxelCoords::kNumLevels - 1) return true; // outermost: nothing coarser
+		// The outermost ACTIVE ring (see the "outermost ACTIVE" note in
+		// ComputeRetainReplacementZMask): past it nothing coarser will ever
+		// stream, whatever kNumLevels says the tables could hold.
+		if (L >= UVoxelWorldSubsystem::GetMaxRingLevel()) return true; // outermost: nothing coarser
 		// The parent of an outward-evicted chunk sits well inside its own annulus
 		// in practice, so the plain padded-annulus test is what applies; a parent
 		// that falls outside it is genuinely somebody else's ground.
@@ -15041,6 +15514,26 @@ void FVoxelWorldImpl::DispatchJobs()
 			PendingJobKeysByLevel[PickLevel].Pop(EAllowShrinking::No); // highest priority in that ring (see SortPendingQueues)
 		const VoxelCoords::FVoxelLevelChunkKey LevelKey = PoppedEntry.Key;
 		ThisFrameDispatchPickMs += float((FPlatformTime::Seconds() - PickStart) * 1000.0);
+
+		// dispatchDot: mean cos(bearing of the picked chunk vs the camera's
+		// facing), per log window, in EVERY arm -- the number -VoxelViewBias
+		// must move up and its control must not move ("did work actually move"
+		// is a counter's job, never a timing's). Metric only; no decision
+		// reads it. LastAnchorLocation rather than a parameter because
+		// DispatchJobs deliberately takes none, and a metric may be a frame
+		// coarse.
+		if (!StreamViewDirXY.IsNearlyZero())
+		{
+			const double DotEdge = VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level);
+			const double DotDx = (double(LevelKey.Key.X) + 0.5) * DotEdge - LastAnchorLocation.X;
+			const double DotDy = (double(LevelKey.Key.Y) + 0.5) * DotEdge - LastAnchorLocation.Y;
+			const double DotLen = FMath::Sqrt(DotDx * DotDx + DotDy * DotDy);
+			if (DotLen > 1.0)
+			{
+				DispatchDotSumSinceLog += (DotDx * StreamViewDirXY.X + DotDy * StreamViewDirXY.Y) / DotLen;
+				++DispatchDotCountSinceLog;
+			}
+		}
 
 		VoxelStreaming::FChunkRecord* Rec = ChunkRecords.Find(LevelKey);
 		if (!Rec)
@@ -21330,9 +21823,16 @@ void UVoxelWorldSubsystem::StartWorldSession(const FString& EditLogPathOrEmpty)
 	ChunkOwner->SetActorLabel(TEXT("VoxelChunkOwner"));
 #endif
 
+	// The marcher's default ring count FOLLOWS the streamed cascade (see
+	// FVoxelMarchChunkIndex::SetStreamedRingLevels): pushed here, before the
+	// first recompute can make anything resident, so -VoxelMaxRingLevel=6
+	// cannot stream an 8 km ring the renderer silently never walks.
+	GetGlobalVoxelMarchChunkIndex().SetStreamedRingLevels(GetMaxRingLevel() + 1);
+
 	UE_LOG(LogVoxelStream, Log,
-	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm"),
-	       (unsigned long long)Seed, GetLoadRadiusMeters(), GetUnloadRadiusMeters(), DigPlaceRangeMeters);
+	       TEXT("Voxel streaming initialized (seed %llu): load=%.0fm unload=%.0fm digRange=%.0fm maxRing=%d"),
+	       (unsigned long long)Seed, GetLoadRadiusMeters(), GetUnloadRadiusMeters(), DigPlaceRangeMeters,
+	       GetMaxRingLevel());
 }
 
 void UVoxelWorldSubsystem::SetStreamingAnchorOverride(const FVector& AnchorUU)
@@ -21380,6 +21880,14 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 	// before one exists -- see SetStreamingAnchorOverride for the two ways the
 	// world-origin fallback misleads the front end.
 	FVector Anchor = StreamingAnchorOverride.Get(FVector::ZeroVector);
+	// The camera's forward (XY, unit), captured here on the game thread and
+	// handed to streaming BY VALUE -- the view-direction half of the priority
+	// key (-VoxelViewBias) and the dispatchDot metric both read it. The PAWN
+	// stays the anchor (position decides residency and eviction); the CAMERA
+	// decides facing, because "what the player is looking at" is a camera
+	// property -- a pawn's yaw lags the view on a mouse look. Zero when no
+	// camera exists yet; every consumer treats zero as "no facing known".
+	FVector2D ViewDirXY = FVector2D::ZeroVector;
 	if (UWorld* World = GetWorld())
 	{
 		if (APlayerController* PC = World->GetFirstPlayerController())
@@ -21388,8 +21896,20 @@ void UVoxelWorldSubsystem::Tick(float DeltaTime)
 			{
 				Anchor = Pawn->GetActorLocation();
 			}
+			if (PC->PlayerCameraManager)
+			{
+				const FVector Forward = PC->PlayerCameraManager->GetCameraRotation().Vector();
+				ViewDirXY = FVector2D(Forward.X, Forward.Y);
+				// A camera pitched straight down has no horizontal facing;
+				// below this the XY projection is noise, not direction.
+				if (!ViewDirXY.Normalize(1e-3))
+				{
+					ViewDirXY = FVector2D::ZeroVector;
+				}
+			}
 		}
 	}
+	Impl->SetStreamViewDir(ViewDirXY);
 
 	Impl->TickStreaming(Anchor, *ChunkOwner, *ChunkRoot, ChunkMaterial, DeltaTime);
 

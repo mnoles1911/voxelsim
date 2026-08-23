@@ -1074,7 +1074,11 @@ namespace
 			Params.InnerStartUU = InnerUU;
 			Params.InnerEndUU = InnerUU + Band;
 		}
-		if (Level < VoxelCoords::kNumLevels - 1) // outermost ring: no outer fade (kInertHigh* default stands)
+		// The outermost ACTIVE ring, not kNumLevels-1: level 6 exists in the
+		// tables but streams only under -VoxelMaxRingLevel=6, and the ring
+		// past the active edge has no neighbour to cross-fade into -- fading
+		// there would thin real terrain against the clipmap seam.
+		if (Level < UVoxelWorldSubsystem::GetMaxRingLevel()) // outermost ring: no outer fade (kInertHigh* default stands)
 		{
 			Params.OuterStartUU = OuterUU - Band;
 			Params.OuterEndUU = OuterUU;

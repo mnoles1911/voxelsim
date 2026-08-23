@@ -460,9 +460,12 @@
 // rests on comes out wrong in the flattering direction. Three legs were spent
 // this week discovering that comparing two implementations tells you about the
 // implementations; this is the same lesson applied before the fact.
-// Six rings to 4 km. Bounded here so the traversal loop has a compile-time trip
-// count and so a bad uniform cannot walk off the end of the index.
-#define VOXEL_MARCH_MAX_RINGS 6u
+// Seven rings to 8.19 km (level 6 landed 2026-08-23; walked only when
+// MarchRingCount says so -- the default cascade still stops at six). Bounded
+// here so the traversal loop has a compile-time trip count and so a bad
+// uniform cannot walk off the end of the index. Mirrors kVoxelMarchMaxRings
+// (VoxelMarchRenderer.cpp) and FVoxelMarchChunkIndex::kLevels.
+#define VOXEL_MARCH_MAX_RINGS 7u
 
 // The ring cascade arm. 0 = single level over one t interval, which is every
 // leg measured before 2026-08-20 and is the control. 1 = the ring loop.
@@ -666,11 +669,13 @@ int MarchStepBudget;
 // kCoverChunkEdgeCells == kMarchChunkEdgeVoxels) and it is packed by the SAME
 // vxc::packChunkBricksCanonical the terrain path is packed by.
 //
-// 7, NOT 6. Six ring levels exist (VOXEL_MARCH_MAX_RINGS), so 6 is the next
-// ring and must stay free. 7 is the largest value that fits BOTH the chunk
-// record's four-bit LevelAndFlags[0:3] and the VisBuffer's three-bit level
-// field, which is what lets a cover hit travel from the march kernel to the
-// emit pixel shader with no new packing.
+// 7. Seven ring levels now exist (VOXEL_MARCH_MAX_RINGS -- level 6, the 8 km
+// ring, took the slot this comment used to hold free). 7 is the largest value
+// that fits BOTH the chunk record's four-bit LevelAndFlags[0:3] and the
+// VisBuffer's three-bit level field, which is what lets a cover hit travel
+// from the march kernel to the emit pixel shader with no new packing -- and it
+// is also why level 6 was the LAST ring this format can take: an eighth ring
+// would collide with cover here.
 #define VOXEL_MARCH_COVER_LEVEL 7
 
 #ifndef VOXEL_MARCH_COVER
