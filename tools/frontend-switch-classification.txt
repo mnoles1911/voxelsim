@@ -73,6 +73,9 @@ VoxelGIOn
 VoxelGIQuadSpan
 VoxelGIVis
 VoxelGpuMeshMaxLevel
+VoxelGpuWorklist
+VoxelGpuWorklistBudget
+VoxelGpuWorklistCap
 VoxelL0BrickSkip
 VoxelL0GridScratch
 VoxelLakeSheetBands
