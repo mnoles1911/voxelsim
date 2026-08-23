@@ -279,6 +279,21 @@ bool VoxelGpuWorldGenBatchEnabled()
 // which is exactly what the sweep is for. Failure reading: raising the cap
 // moves hitches, not chunks/s -- then pass setup still binds and the next fix
 // is fused multi-chunk dispatch, not a bigger cap.
+// -VoxelGpuPrimary=1 (default off, latched): see the exported declaration in
+// VoxelGpuMeshJobManager.h. Defined here because this file owns the quota and
+// lean defaults it re-points; the streaming module links against the same
+// definition so both sides latch ONE parse of ONE flag.
+bool VoxelGpuPrimaryEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuPrimary="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 static int32 VoxelGpuMeshBatchCapEffective()
 {
 	static const int32 CmdLine = []
@@ -287,7 +302,29 @@ static int32 VoxelGpuMeshBatchCapEffective()
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshBatchCap="), Value);
 		return Value;
 	}();
-	return CmdLine >= 0 ? CmdLine : GVoxelGpuMeshBatchCap;
+	// GPU-primary default: 64, NOT the shipped 4 and NOT unbounded.
+	//
+	// The 4 was sized by a sweep in which every job paid TWO region graphs
+	// (~17 passes: 32/64 hitched at 367 vs 4/8's 8), and Little's law made it
+	// the fork's whole throughput ceiling once the graphs got cheap: delivered
+	// 89/s == 4 x ~24 fps with the GPU idle-dominated and MaxInFlight never
+	// approached. Under primary the promoted population is lean band-free
+	// brick jobs (~5 passes, the band carriers capped at one per footprint by
+	// seed-only) and, with WorldGenBatch armed, the cap counts STACK HEADS of
+	// ~8 chunks each -- so 64 is ~320 passes/tick per-chunk worst case (the
+	// render-thread cost of ~19 of the old classic jobs) and up to ~530
+	// chunks/tick fused, ~16k chunks/s at 30 fps: above the CPU's measured
+	// ~10.5k/s power-limited ceiling, on the road to the 50k/s target.
+	//
+	// Unbounded stays wrong here: cold fill queues hundreds of jobs, and one
+	// FRDGBuilder taking MaxInFlight lean graphs in a burst frame is exactly
+	// the 100+-pass hitch shape the cap exists to flatten.
+	//
+	// FAILING READINGS: hitches climbing with chunks/s flat -- pass setup
+	// still binds, sweep DOWN with -VoxelGpuMeshBatchCap=N (which outranks
+	// this default); delivered pinned at 64 x fps -- the quota binds again,
+	// sweep UP and report the knee.
+	return CmdLine >= 0 ? CmdLine : (VoxelGpuPrimaryEnabled() ? 64 : GVoxelGpuMeshBatchCap);
 }
 
 static int32 VoxelGpuMeshSpecCapEffective()
@@ -309,7 +346,17 @@ static int32 VoxelGpuMeshHarvestCapEffective()
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshHarvestCap="), Value);
 		return Value;
 	}();
-	return CmdLine >= 0 ? CmdLine : GVoxelGpuMeshHarvestCap;
+	// GPU-primary default: unbounded (0). The copies this cap was sized
+	// against were whole-quad-stream memcpys on the readback path; the primary
+	// configuration is marcher/brick (DirectToPool, PoolAlloc, lean band-free
+	// jobs), where the only readbacks left to harvest are the per-footprint
+	// band seeds and per-job totals -- a handful of ints each. At the shipped
+	// 8/tick the cap would quantise band-seed delivery to 8 x fps (~240/s),
+	// putting a ~65 s floor under warming the ~15.6k-footprint band cache that
+	// the buried-skip and the cold-band throttle both feed from. A leg that
+	// runs primary WITH quads un-retired should restore -VoxelGpuMeshHarvestCap=8
+	// explicitly (it outranks this default).
+	return CmdLine >= 0 ? CmdLine : (VoxelGpuPrimaryEnabled() ? 0 : GVoxelGpuMeshHarvestCap);
 }
 
 // --- LEAN BRICK-ONLY JOBS (-VoxelGpuLeanBrickJobs, default OFF) -------------
@@ -338,11 +385,15 @@ static int32 VoxelGpuMeshHarvestCapEffective()
 // hope. Default OFF: the control graph is byte-identical without the flag.
 static bool VoxelGpuLeanBrickJobsEnabled()
 {
+	// -1 sentinel so "absent" and "=0" stay distinguishable: an explicit
+	// -VoxelGpuLeanBrickJobs=0 must win over -VoxelGpuPrimary's implied ON
+	// (primary changes defaults, never outranks an explicit flag), or the
+	// control arm of a lean A/B under primary would be unrunnable.
 	static const bool bEnabled = []
 	{
-		int32 Value = 0;
+		int32 Value = -1;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuLeanBrickJobs="), Value);
-		return Value != 0;
+		return Value >= 0 ? Value != 0 : VoxelGpuPrimaryEnabled();
 	}();
 	return bEnabled;
 }

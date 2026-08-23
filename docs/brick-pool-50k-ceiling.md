@@ -119,3 +119,58 @@ and clean FAIL counters is the success reading, not a null result.** The gate:
 0`, `stackPeak ≤ cap`, `doubleGrant 0`, `badFree 0`, `xcheck N ok / 0 FAIL`
 with N > 0, `unwritten 0` while `claimFail 0`, and `evictions` /
 `writesDropped` flat.
+
+## Addendum 2026-08-23 (later the same day): re-derived against the 99% leg
+
+The four-arm eviction matrix (Saved/ev-A..D.log) landed a measurement this
+document did not have: **the DEFAULT configuration runs the pool at 99.0% of
+slot capacity** (arm A: residentAll 259,582/262,144, evictions 156), and the
+same window's `[brick-gpualloc]` line read **occ 136.1/192.0 MiB (70.9%) and
+mat 248.4/448.0 MiB (55.4%)**. Three corrections follow, and they moved the
+shipped geometry.
+
+**1. Slots bind first, not the occupancy arena.** The "192 MiB exhausts at
+~196,600 claiming residents" projection above sized arenas from the per-CLAIM
+mean (~194 occ dwords). But the histogram on the same leg shows **716,774 of
+1,136,504 claims (63.1%) carry zero payload words** — uniform chunks store
+collapsed, descriptors and a record only. The honest basis is amortized
+per-SLOT cost, measured directly at 99% residency:
+
+    occ:  136.1 MiB / 259,582 slots = 550 B/slot   (step-128 padding, 16.8%)
+    mat:  248.4 MiB / 259,582 slots = 1,003 B/slot (step-512 padding, 50.9%)
+
+At full 262,144-slot residency: occ ~137.5 MiB (72% of 192), mat ~251 MiB
+(56% of 448). **Today's default needed no arena raise at all — it needed
+slots.** The "192 → 288" recommendation was right by accident of direction
+only; its arithmetic double-counted padding onto chunks that never claim.
+
+**2. The shipped geometry (same-day commit).** Slots 262,144 → 393,216
+(covers the scale-1.25 + band-4 wide ring at ~302,800 demand = 77%, and even
+the mult-1.15 variant at ~343,300 = 87%; exhausts at ring scale ~1.44). Occ
+192 → 288 MiB, because full-slot demand at the new count is 393,216 × 550 B
+≈ 206 MiB — 192 would have refused before the slots did, inverting the
+orderly-failure ordering (slot exhaustion evicts farthest-first; arena
+exhaustion claim-fails and leaves unwritten volume). Mat stays 448 MiB.
+
+**3. The mat step, chosen from the histogram as instructed.** Projections on
+the leg: `{ 128:17.9% 192:25.5% 256:32.2% 384:42.4% 512:50.9% }`, p99 ≤ 896
+dwords. **Shipped 512 → 256**, not 128, because free-stack state is
+(classes × ChunkCapacity × 4 B): 66 mat classes at step 128 cost +50 MiB of
+state at 393,216 chunks against ~47 MiB of incremental arena saving — a wash
+carrying double the class-count stranding risk. At 256, measured-mix mat cost
+falls 1,003 → ~726 B/slot (~110 MiB effective at full slots). The occ-64
+claim in this doc is also corrected by the histogram: it is NOT an arithmetic
+no-op (projection 7.6% vs 16.8% — the mass is not at the mean), but nets only
+~6 MiB after stack growth, so occ stays 128.
+
+**VRAM, before → after** (committed, GPU-alloc armed): desc 128 → 192, occ
+192 → 288, mat 448 → 448, records 16 → 24, free-stack/alloc state ~29 → ~68
+MiB. **Total ~813 → ~1,020 MiB** (+207 MiB), inside the approved 1–2 GB.
+Control geometry on one binary: `-VoxelBrickPoolChunks=262144
+-VoxelBrickPoolOccMiB=192 -VoxelBrickPoolMatMiB=448 -VoxelGpuPoolMatStep=512`.
+
+Also fixed: `Voxel brick lifetime`'s occ/mat columns read the CPU arenas,
+which a GPU-alloc leg never touches — they printed a structural 0.0% through
+the entire eviction matrix. GetUsedOccWords/GetUsedMatWords now return the
+landed GPU snapshot on an armed pool (one window stale, like the
+[brick-gpualloc] line they mirror).

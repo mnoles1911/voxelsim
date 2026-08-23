@@ -885,13 +885,36 @@ public:
 	// size, and their identity must be CPU-visible for eviction and the index).
 
 	// The class steps, spelled once. 128 dwords rounds the occ worst case
-	// (1,024) into 8 classes; 512 rounds the mat worst case (8,448) into 17.
-	// Against the measured per-chunk means (~194 occ / ~208 mat dwords) the
-	// round-up wastes about a quarter of a step per chunk per arena -- counted
-	// exactly by the PaddedCum/ActualCum counters, so the estimate never has to
-	// be believed.
+	// (1,024) into 8 classes; 256 rounds the mat worst case (8,448) into 33.
+	//
+	// MAT 512 -> 256 ON 2026-08-23, CHOSEN FROM THE HISTOGRAM, NOT BY HALVING.
+	// The always-on claim-size histogram's exact projections on the 99%-full
+	// arm A leg (1.14M claims, claimFail 0; Saved/ev-A.log):
+	//     mat padding by step { 128:17.9%  192:25.5%  256:32.2%  384:42.4%  512:50.9% }
+	//     mat quantiles p50<=320 p90<=768 p99<=896 dwords
+	// 256 takes mat padding 50.9% -> 32.2%, i.e. per-resident-slot mat cost
+	// 1,003 -> ~726 B measured-mix -- ~110 MiB of effective arena at full
+	// 393,216-slot residency. Why not 128 (17.9%), the projection minimum:
+	// (a) free-stack state is (OccClasses + MatClasses) x ChunkCapacity x 4 B,
+	// so 66 mat classes instead of 33 cost +50 MiB of state at 393,216 chunks
+	// -- eating most of the incremental ~47 MiB arena saving; (b) finer
+	// classes recycle across fewer claim sizes, and stranding is the cost side
+	// the projection cannot see (the Init comment's warning). Net VRAM at 128
+	// ties 256 while carrying double the class-count risk, so 256 it is;
+	// -VoxelGpuPoolMatStep=128 remains one latched flag for the A/B if the
+	// stranded column stays flat.
+	//
+	// OCC STAYS 128, and the histogram is why the once-recommended 64 sweep
+	// stays unswept: the same leg projects occ { 32:2.6% 48:5.4% 64:7.6%
+	// 96:12.6% 128:16.8% } -- note 64 is NOT the arithmetic no-op the
+	// mean-based argument claimed (ceil(194/64)*64 = 256 = the 128 round-up
+	// holds only AT the mean; the mass is not at the mean, and the exact
+	// projection says 64 would halve occ padding). It stays because the win is
+	// ~19 MiB at full slots while 8 more classes cost ~13 MiB of stack state:
+	// a ~6 MiB net for double the occ class count. Recorded so the next
+	// reader argues with the histogram, not the mean.
 	static constexpr uint32 kGpuAllocOccClassStep = 128;
-	static constexpr uint32 kGpuAllocMatClassStep = 512;
+	static constexpr uint32 kGpuAllocMatClassStep = 256;
 	// Claim-size demand histogram bucket widths, in dwords. THE INSTRUMENT THE
 	// STEP CHANGE MUST WAIT FOR: the first honest legs (2026-08-23) measured
 	// padding 39.7-40.8% against the ~5-15% estimated above, and the recorded
@@ -1014,8 +1037,14 @@ public:
 
 	// --- the numbers P2 is gated on ----------------------------------------
 	int32 GetNumResidentChunks() const { return Resident.Num(); }
-	uint32 GetUsedOccWords() const { return OccArena.GetUsedQuads(); }
-	uint32 GetUsedMatWords() const { return MatArena.GetUsedQuads(); }
+	// OUT OF LINE SINCE 2026-08-23, because the inline arena read was an
+	// instrument that could not come out the other way: with the GPU allocator
+	// armed the CPU Occ/MatArena are never allocated from, so `Voxel brick
+	// lifetime` printed `occ=0.0% mat=0.0%` through four eviction-matrix legs
+	// -- including one at 99.0% slot residency with occ actually at 70.9%.
+	// Armed pools now report the last landed GPU snapshot (see the .cpp).
+	uint32 GetUsedOccWords() const;
+	uint32 GetUsedMatWords() const;
 	uint32 GetUsedDescSlots() const { return DescArena.GetUsedQuads(); }
 	// The gap between this and the free total IS the fragmentation, per arena.
 	uint32 GetLargestFreeOccRun() const { return OccArena.GetLargestFreeRun(); }

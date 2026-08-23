@@ -2586,7 +2586,13 @@ bool GpuMeshEnabled()
 	// the editor has no command line of its own, so whichever way the default
 	// points, the switch that flips it has to be the one on the editor's own
 	// command line.
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"));
+	// -VoxelGpuPrimary implies the fork ON: a "GPU is the primary producer"
+	// switch that still required a second flag to have a GPU producer at all
+	// would be the exact silent-no-op trap this project keeps re-measuring.
+	// -VoxelGpuMesh alone still works as before, and a primary leg needs no
+	// second flag.
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"))
+		|| VoxelGpuPrimaryEnabled();
 	return bEnabled;
 }
 
@@ -2614,9 +2620,22 @@ int32 GpuMeshInFlight()
 	// MeshBatchCap (4/8 vs 16/32 moved 0.0), and not the mesher choice
 	// (-VoxelNoGpuMesh arm also ~593/s). That plateau is the open P0 in
 	// docs/measurements/gpu-throughput-wave-2026-07-27.txt.
+	// GPU-primary default: 1024. The 2026-07-27 falsification of "raise the
+	// depth" stands UNCONTRADICTED for the regime it measured -- the fork was
+	// promotion-quota-bound at 4/tick and idled at ~11 in flight, so depth was
+	// never the binding constraint and 1024 rightly moved nothing. Primary
+	// changes the regime: BatchCap defaults to 64 and a WorldGenBatch stack
+	// sweep counts every fused MEMBER against MaxInFlight (the sweep stops at
+	// `InFlight + Batch >= MaxInFlight`), so 64 stack heads x ~8.3 members
+	// ~= 530 jobs from ONE tick's promotion -- 256 would clamp the very
+	// amortisation the quota lift exists to buy, and two caps in series make
+	// the throughput unattributable (the standing reason these were matched at
+	// 256/256). 1024 keeps the manager cap from binding before the streaming
+	// side's own budget at the new promotion rate. Explicit
+	// -VoxelGpuMeshInFlight=N still outranks.
 	static const int32 N = []
 	{
-		int32 Value = 256;
+		int32 Value = VoxelGpuPrimaryEnabled() ? 1024 : 256;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshInFlight="), Value);
 		return FMath::Clamp(Value, 1, 4096);
 	}();
@@ -6868,6 +6887,52 @@ struct FVoxelWorldImpl
 	// instead of turning the line above into noise.
 	int64 ColdBandGpuLatencyTimeoutsSinceLog = 0;
 	int32 ColdBandHeldThisFrame = 0;  // held on the most recent DispatchJobs pass
+
+	// --- GPU band-request attribution (routing-gate work, 2026-08-23) -------
+	//
+	// WHY THIS EXISTS. On the cold-fill legs the manager's worklist skip line
+	// read `band=16,210 noPack=0 quads=0 noAlloc=0 noAtlas=143`: the band
+	// condition alone rejects essentially every fork job from the lean /
+	// worklist / fused-stack paths, and band-carrying jobs are the fork's only
+	// round-trip-bound population (the band readback is the sole fence left on
+	// a P1 pool-alloc brick job). But `band` is ONE counter over THREE distinct
+	// causes with three different fixes, so it gets split at the only place
+	// that can tell them apart -- SubmitGpuMeshJob, where the request is built:
+	//
+	//   redundant -- the footprint's band is ALREADY in FootprintBandCache and
+	//               the job asked anyway, because -VoxelGpuBandColdOnly is off
+	//               (the shipped default). Fix: suppression policy. ~8.3 chunks
+	//               share a footprint, so this is the expected majority once
+	//               any seeding has happened.
+	//   dup      -- band uncached, but ANOTHER job with a live band request for
+	//               this footprint is already in flight (fresh entry in the map
+	//               below). The cold-band throttle should be deferring these
+	//               column-mates before they get here; a large dup count means
+	//               the throttle is off or not covering this path. Fix: dedup.
+	//   seed     -- band uncached and nothing in flight: the one request per
+	//               footprint that genuinely has to carry a band. This is the
+	//               irreducible floor (1 per footprint, ~1/8.3 of level-0
+	//               traffic on the measured column stacks).
+	//
+	// FAILING READINGS, stated up front: if seed dominates, neither suppression
+	// nor dedup helps and the fix must make seeds themselves band-free; if all
+	// four counters stay 0 while the fork dispatches level-0 jobs, this
+	// attribution is not wired to the path the jobs take and the numbers must
+	// not be argued from.
+	//
+	// The map: level-0 footprints with a band-CARRYING GPU job in flight, value
+	// FPlatformTime::Seconds() at submit so entries AGE OUT on the same
+	// kBlindJobMarkTimeoutSeconds rule as FootprintBlindJobInFlight -- both
+	// exist because launch paths that produce no result keep being enumerated
+	// wrongly, so neither map is allowed to trust releases alone. Removed on
+	// any level-0 result in DrainResults (same site as the blind mark) and on
+	// speculative completion, which returns before DrainResults ever sees it.
+	// Game-thread only, like FootprintBandCache itself.
+	TMap<FIntPoint, double> FootprintBandRequestInFlight;
+	int64 GpuBandReqSeedSinceLog = 0;      // band requested: uncached, none in flight
+	int64 GpuBandReqDupSinceLog = 0;       // band requested: uncached, one already in flight
+	int64 GpuBandReqRedundantSinceLog = 0; // band requested: already cached (policy, not need)
+	int64 GpuBandFreeSubmitsSinceLog = 0;  // level-0 GPU submits that carried NO band request
 
 	// --- Bounded admission (docs/status.md "Streaming pipeline re-measure +
 	// rework") ---------------------------------------------------------------
@@ -11255,6 +11320,38 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	ColdBandParkFlushedSinceLog = 0;
 	ColdBandMarkTimeoutsSinceLog = 0;
 	ColdBandGpuLatencyTimeoutsSinceLog = 0;
+
+	// GPU band-request attribution: the per-reason split of the manager's
+	// `band=` worklist skip, counted where the request is built (SubmitGpuMeshJob;
+	// see FootprintBandRequestInFlight's declaration for the three causes and
+	// what each implies). Its own line, per the never-widen-an-existing-line
+	// rule, and printed only when the fork submitted level-0 jobs this window
+	// so a fork-off leg stays silent rather than printing four zeros that look
+	// like a wired-up instrument.
+	//
+	// HOW TO READ IT: redundant dominating means the band suppression policy
+	// (-VoxelGpuBandColdOnly, or the seed-only successor) is the fix; dup
+	// dominating means the cold-band throttle is not covering the fork's
+	// submissions and dedup is the fix; seed dominating means every request is
+	// already the irreducible one-per-footprint and only band-free seeding can
+	// move the ratio. free is the population the lean/worklist/stack paths can
+	// take TODAY -- it should track the manager's lean= counter, and free
+	// staying ~0 while this line prints is the 96%-to-CPU cold-start mechanism
+	// in one number.
+	if (GpuBandReqSeedSinceLog + GpuBandReqDupSinceLog + GpuBandReqRedundantSinceLog +
+	        GpuBandFreeSubmitsSinceLog > 0)
+	{
+		UE_LOG(LogVoxelPerf, Log,
+		       TEXT("Voxel GPU band requests (5s window): seed=%lld dup=%lld redundant=%lld free=%lld ")
+		       TEXT("reqInFlight=%d bandCache=%d"),
+		       (long long)GpuBandReqSeedSinceLog, (long long)GpuBandReqDupSinceLog,
+		       (long long)GpuBandReqRedundantSinceLog, (long long)GpuBandFreeSubmitsSinceLog,
+		       FootprintBandRequestInFlight.Num(), FootprintBandCache.Num());
+	}
+	GpuBandReqSeedSinceLog = 0;
+	GpuBandReqDupSinceLog = 0;
+	GpuBandReqRedundantSinceLog = 0;
+	GpuBandFreeSubmitsSinceLog = 0;
 
 	// The GPU mesh fork. Printed only when it is on, so an unforked run's log is
 	// byte-comparable with every log taken before this wave.
@@ -17641,12 +17738,110 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandColdOnly="), Value);
 			return Value != 0;
 		}();
-		if (!bBandColdOnly ||
-		    !FootprintBandCache.Contains(FIntPoint(LevelKey.Key.X, LevelKey.Key.Y)))
+		// -VoxelGpuBandSeedOnly=1 (default off, latched -- the -ExecCmds
+		// startup-window rule): AT MOST ONE band-carrying job per footprint,
+		// EVER. Request the band only when it is uncached AND no band-carrying
+		// job for this footprint is already in flight; every other job goes
+		// band-free, which is what makes it eligible for the lean graph
+		// (-VoxelGpuLeanBrickJobs), the B.1 fused stacks, and the worklist
+		// records -- every one of which rejects on BandEdge != 0 -- and what
+		// removes the job's only remaining readback fence under PoolAlloc.
+		//
+		// WHY BandColdOnly IS NOT ENOUGH, with the cold-fill numbers that
+		// forced this: BandColdOnly suppresses the band only once the cache is
+		// WARM, and cold start -- the owner's stated target -- is exactly when
+		// it is not. On the measured cold fill the fork carried 3-4% of
+		// dispatch (forkDispatched ~600 vs dispatched ~17k per 5 s window)
+		// while the manager's skip line read band=16,210: every uncached
+		// footprint's whole ~8.3-chunk column carried a band request, each one
+		// a readback fence, so fork slots recycled at round-trip speed and 96%
+		// of the work fell to a CPU that is power-limited at ~10.5k jobs/s
+		// (doubling workers halves the clock; the box gives the same jobs/s at
+		// any thread count). Seed-only caps the band-carrying population at
+		// one per footprint from the very first tick.
+		//
+		// WHAT A DEDUPED COLUMN-MATE LOSES: nothing that lasts. Its result
+		// carries bBandValid=false -- already a legal state every consumer
+		// guards on -- and the footprint's band still arrives, once, from the
+		// seed (or from any CPU worker job for the footprint, which computes
+		// bands from the column grid it builds anyway). Until it lands the
+		// column-mates simply mesh without a predicted-empty verdict, exactly
+		// what every job did before the band existed. The cold-band throttle,
+		// where armed, is what keeps most column-mates from even dispatching
+		// until the seed drains; this switch covers the paths the throttle
+		// does not (throttle off, and the speculative submitter).
+		//
+		// Observable on the "Voxel GPU band requests" window line: seed-only
+		// forces dup=0 and redundant=0 BY CONSTRUCTION, so the readings that
+		// matter are free= rising toward the fork's level-0 dispatch count and
+		// the manager's band= skip collapsing toward seed=. If instead
+		// bandCache stalls while free rises, seeds are being lost and this
+		// switch is starving the buried-skip -- that is the failing state, and
+		// holes/uncovered would follow it.
+		// -1 sentinel: an explicit -VoxelGpuBandSeedOnly=0 must win over
+		// -VoxelGpuPrimary's implied ON (primary changes defaults, never
+		// outranks an explicit flag), or the band-policy control arm under
+		// primary would be unrunnable.
+		static const bool bBandSeedOnly = []
+		{
+			int32 Value = -1;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandSeedOnly="), Value);
+			return Value >= 0 ? Value != 0 : VoxelGpuPrimaryEnabled();
+		}();
+		// Attribution (see FootprintBandRequestInFlight's declaration for
+		// the three causes and their failing readings): the manager's worklist
+		// line collapses every band-carrying job into one `band=` skip counter,
+		// and the split decides which fix is real, so it is computed HERE where
+		// the cache, the in-flight map and the policy are all visible.
+		const FIntPoint BandFootprint(LevelKey.Key.X, LevelKey.Key.Y);
+		const bool bBandCached = FootprintBandCache.Contains(BandFootprint);
+		const double BandNowSeconds = FPlatformTime::Seconds();
+		bool bBandReqInFlight = false;
+		if (const double* ReqAt = FootprintBandRequestInFlight.Find(BandFootprint))
+		{
+			bBandReqInFlight = (BandNowSeconds - *ReqAt) < kBlindJobMarkTimeoutSeconds;
+			if (!bBandReqInFlight)
+			{
+				// Aged out: the carrying job produced no result (or is slower
+				// than the mark). Treat as absent so this footprint can seed
+				// again -- same release rule, same constant, same reasoning as
+				// FootprintBlindJobInFlight.
+				FootprintBandRequestInFlight.Remove(BandFootprint);
+			}
+		}
+		// Seed-only: request iff uncached AND nothing fresh in flight. Legacy
+		// (seed-only off): request unless BandColdOnly has a warm cache entry
+		// to point at -- the shipped behaviour, byte-identical.
+		const bool bWantBand = bBandSeedOnly
+			? (!bBandCached && !bBandReqInFlight)
+			: (!bBandColdOnly || !bBandCached);
+		if (bWantBand)
 		{
 			Req.BandOriginI = kBandApronOffset;
 			Req.BandOriginJ = kBandApronOffset;
 			Req.BandEdge = kBandGridEdge;
+			if (bBandCached)
+			{
+				++GpuBandReqRedundantSinceLog;
+			}
+			else if (bBandReqInFlight)
+			{
+				++GpuBandReqDupSinceLog;
+			}
+			else
+			{
+				++GpuBandReqSeedSinceLog;
+				// Marked at request-build time rather than at Submit success:
+				// if the manager refuses this job it falls to the CPU worker,
+				// whose level-0 result clears the mark in DrainResults exactly
+				// as a GPU result would -- and the age-out above covers every
+				// path that produces no result at all.
+				FootprintBandRequestInFlight.Add(BandFootprint, BandNowSeconds);
+			}
+		}
+		else
+		{
+			++GpuBandFreeSubmitsSinceLog;
 		}
 	}
 	// The one place the raster-window arithmetic may live -- see
@@ -17987,6 +18182,15 @@ void FVoxelWorldImpl::OnGpuMeshJobComplete(FVoxelGpuMeshJobResult&& GpuResult)
 		// band of zeroes -- "this column is empty ground at z=0", silently, for
 		// the whole footprint. The demand path's Add (DrainResults) has always
 		// had this guard; this one now matches it.
+		if (Pending.Key.Level == 0)
+		{
+			// Band-request attribution mark (see FootprintBandRequestInFlight):
+			// a speculative completion returns from this branch and never
+			// reaches DrainResults' release site, so without this line every
+			// speculative band carrier would hold its footprint's mark until
+			// the 5 s age-out and the dup/seed split would be noise.
+			FootprintBandRequestInFlight.Remove(FIntPoint(Pending.Key.Key.X, Pending.Key.Key.Y));
+		}
 		if (Pending.Key.Level == 0 && GpuResult.bBandValid)
 		{
 			// + AssetBandRaiseVox: the GPU reduced ground columns only. See the
@@ -21617,6 +21821,12 @@ void FVoxelWorldImpl::DrainResults(AActor& Owner, USceneComponent& Root, UMateri
 			// Same site, same condition, so the GPU tag can never outlive the
 			// mark it annotates (Wave D / D4).
 			FootprintBlindJobIsGpu.Remove(DoneFootprint);
+			// Band-request attribution mark: released on any level-0 result for
+			// the footprint, band or not, mirroring the blind mark above -- a
+			// bandless result means the band either landed via the cache Add
+			// before this line or never will, and either way the next submit
+			// for this footprint must be free to classify (and seed) afresh.
+			FootprintBandRequestInFlight.Remove(DoneFootprint);
 		}
 
 		// -VoxelVerifyBuriedSkip soundness check: this chunk's band verdict
