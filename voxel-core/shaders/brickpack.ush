@@ -545,54 +545,66 @@ void BrickClassifyMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 //      descriptor is eight zero bytes, and a uniform SOLID one is
 //      `kind << 28` and the bare material.
 // ---------------------------------------------------------------------------
-[numthreads(64, 1, 1)]
-void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+// The ENTIRE pack body, factored so the classic entry point below and the
+// worklist's converted Pack stage (VoxelWorklistPack.usf) emit bricks from
+// the same text -- brickBuildOccupancy / brickComputeInfo /
+// brickOccCountFromInfo's rule, applied to the pass that writes the payload.
+//
+// TWO BASE PAIRS, ONE SUBTLETY. The classic entry passes OccWriteBase /
+// MatWriteBase for BOTH pairs, which reproduces the shipped arithmetic bit
+// for bit (both are zero on every path this repo dispatches). The worklist
+// pack stage passes descOccBase/descMatBase = 0 -- the DESCRIPTOR offset
+// fields stay CHUNK-RELATIVE, the byte contract every downstream rebase and
+// verify assumes -- while wordOccBase/wordMatBase carry the record's slice
+// base into the shared word arenas, where the copy kernels pick the words up
+// through the claim's spare pair.
+void packBrickInto(uint packIndex, uint cellBase, uint chunkIndex, uint localIndex,
+                   uint gtidx,
+                   uint descBase, uint chunkRecBase,
+                   uint descOccBase, uint descMatBase,
+                   uint wordOccBase, uint wordMatBase,
+                   uint scanReadBase)
 {
-    uint3 brick;
-    uint cellBase, chunkIndex, localIndex;
-    if (!decodeBrick(gid.x, brick, cellBase, chunkIndex, localIndex)) return;
-    // The scanned offsets are only meaningful below ScanCount -- those are the
-    // entries the scan chain actually wrote. Reading past it would take a write
-    // base out of never-written device memory. GUARD ONLY: the host sets
-    // ScanCount to the brick count, which decodeBrick has already enforced.
-    // Group-uniform, like the guard above it.
-    if (gid.x >= ScanCount) return;
+    for (uint z = gtidx; z < kMaxBrickMatWords; z += 64u) gsMat[z] = 0u;
+    if (gtidx < 2u) gsSkip[gtidx] = 0u;
 
-    for (uint z = gtid.x; z < kMaxBrickMatWords; z += 64u) gsMat[z] = 0u;
-    if (gtid.x < 2u) gsSkip[gtid.x] = 0u;
-
-    brickBuildOccupancy(cellBase, gtid.x);
-    if (gtid.x == 0u) brickComputeInfo();
+    brickBuildOccupancy(cellBase, gtidx);
+    if (gtidx == 0u) brickComputeInfo();
     GroupMemoryBarrierWithGroupSync();
 
     const uint kind = gsInfo[kInfoKind];
     const uint bpp = gsInfo[kInfoBpp];
     const uint paletteDwords = gsInfo[kInfoPaletteDwords];
-    // BrickScanReadBase is 0 on every classic dispatch (see its declaration);
-    // nonzero only when the offsets live in the worklist scan arenas.
-    const uint occBase = OccWriteBase + InBrickOccOffsets[BrickScanReadBase + gid.x];
-    const uint matBase = MatWriteBase + InBrickMatOffsets[BrickScanReadBase + gid.x];
+    // The scanned offsets, read once; the DESCRIPTOR fields and the WORD
+    // writes take separate bases (see the function header) -- identical on
+    // every classic dispatch, split only by the worklist pack stage.
+    const uint occOff = InBrickOccOffsets[scanReadBase + packIndex];
+    const uint matOff = InBrickMatOffsets[scanReadBase + packIndex];
+    const uint occBase = wordOccBase + occOff;   // word writes + skip index
+    const uint matBase = wordMatBase + matOff;   // word writes
+    const uint descOcc = descOccBase + occOff;   // descriptor offset field
+    const uint descMat = descMatBase + matOff;
 
-    if (gtid.x == 0u)
+    if (gtidx == 0u)
     {
         uint occWord = 0u;
         uint matWord = 0u;
         if (kind == kBrickKindMixed)
         {
             const uint hasLocalPalette = (bpp <= 4u) ? 1u : 0u;
-            occWord = (occBase & 0x0fffffffu) | (kBrickKindMixed << 28u)
+            occWord = (descOcc & 0x0fffffffu) | (kBrickKindMixed << 28u)
                     | (hasLocalPalette << 30u);
-            matWord = (matBase & 0x0fffffffu) | (bpp << 28u);
+            matWord = (descMat & 0x0fffffffu) | (bpp << 28u);
         }
         else if (kind == kBrickKindSolid)
         {
             occWord = kBrickKindSolid << 28u;
             matWord = gsInfo[kInfoUniformMat] & 0xffu;
         }
-        // Bounded: gid.x plus a host base, and gid.x is capped both by
+        // Bounded: packIndex plus a host base, and packIndex is capped both by
         // decodeBrick's brick-count early-out and by the ScanCount guard above;
         // the host sizes the descriptor table to BrickDescBase plus that count.
-        OutBrickDesc[BrickDescBase + gid.x] = uint2(occWord, matWord);
+        OutBrickDesc[descBase + packIndex] = uint2(occWord, matWord);
 
         // L1: one bit per brick in the chunk record. Any non-empty brick sets
         // it -- uniform SOLID as much as MIXED.
@@ -603,7 +615,7 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
             // index stays inside the 2 dwords per chunk the host allocates from
             // ChunkRecordBase.
             const uint maskDword =
-                (ChunkRecordBase + chunkIndex) * 2u + (localIndex >> 5u);
+                (chunkRecBase + chunkIndex) * 2u + (localIndex >> 5u);
             // lint-shader-ub: allow VARIABLE_SHIFT - localIndex is masked to 5 bits here, provably in [0, 31]
             const uint maskBit = 1u << (localIndex & 31u);
             InterlockedOr(OutChunkBrickMask[maskDword], maskBit);
@@ -615,20 +627,20 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     if (kind != kBrickKindMixed) return;
 
     // --- occupancy: 16 dwords, one thread each ----------------------------
-    if (gtid.x < kBrickOccWords)
+    if (gtidx < kBrickOccWords)
     {
-        // Bounded: the enclosing `gtid.x < 16` test holds the offset within the
+        // Bounded: the enclosing `gtidx < 16` test holds the offset within the
         // 16 dwords the classify pass counted for this brick, and occBase is
         // that brick's scanned allocation.
-        OutBrickOcc[occBase + gtid.x] = gsOcc[gtid.x];
+        OutBrickOcc[occBase + gtidx] = gsOcc[gtidx];
     }
 
     // --- 4^3 intra-brick skip mask: one 2x2x2 block per thread -------------
     // Free: 64 blocks, 64 threads, and the bits are already in groupshared.
     {
-        const uint sx = gtid.x % 4u;
-        const uint sy = (gtid.x / 4u) % 4u;
-        const uint sz = gtid.x / 16u;
+        const uint sx = gtidx % 4u;
+        const uint sy = (gtidx / 4u) % 4u;
+        const uint sz = gtidx / 16u;
         uint blockAny = 0u;
         for (uint dz = 0u; dz < 2u; ++dz)
         {
@@ -641,8 +653,8 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         }
         if (blockAny != 0u)
         {
-            // lint-shader-ub: allow VARIABLE_SHIFT - gtid.x is a 64-thread group index masked to 5 bits here, provably in [0, 31]
-            InterlockedOr(gsSkip[gtid.x >> 5u], 1u << (gtid.x & 31u));
+            // lint-shader-ub: allow VARIABLE_SHIFT - gtidx is a 64-thread group index masked to 5 bits here, provably in [0, 31]
+            InterlockedOr(gsSkip[gtidx >> 5u], 1u << (gtidx & 31u));
         }
     }
 
@@ -654,9 +666,9 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     {
         for (uint k = 0u; k < 4u; ++k)
         {
-            const uint mat = gtid.x * 4u + k;
+            const uint mat = gtidx * 4u + k;
             // mat 0 is MAT_AIR and is never present; the test is the mask's.
-            // lint-shader-ub: allow VARIABLE_SHIFT - mat = gtid.x * 4 + k with gtid.x < 64 and k < 4, so mat < 256 and (mat & 31u) is provably in [0, 31]
+            // lint-shader-ub: allow VARIABLE_SHIFT - mat = gtidx * 4 + k with gtidx < 64 and k < 4, so mat < 256 and (mat & 31u) is provably in [0, 31]
             if (((gsPresent[mat >> 5u] >> (mat & 31u)) & 1u) != 0u)
             {
                 const uint rank = paletteRankOf(mat);
@@ -669,7 +681,7 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     // --- payload: this thread's 8 cells, in cell order ---------------------
     if (bpp != 0u)
     {
-        const uint c0 = gtid.x * 8u;
+        const uint c0 = gtidx * 8u;
         const uint w = c0 / 32u;
         // The entry index of this thread's first cell: popcount of every
         // occupancy bit below it. Whole dwords, then the partial one.
@@ -694,17 +706,40 @@ void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 
     // --- store the staged BrickMat and the skip mask ----------------------
     const uint matWords = paletteDwords + gsInfo[kInfoPayloadDwords];
-    for (uint m = gtid.x; m < matWords; m += 64u)
+    for (uint m = gtidx; m < matWords; m += 64u)
     {
         // lint-shader-ub: allow UNGUARDED_WRITE - the loop bound matWords is exactly the count BrickClassifyMain wrote for this brick and the scan allocated, and matBase is that brick's scanned offset
         OutBrickMat[matBase + m] = gsMat[m];
     }
-    if (gtid.x < 2u)
+    if (gtidx < 2u)
     {
-        // Bounded: the enclosing `gtid.x < 2` holds the pair, and the index is
+        // Bounded: the enclosing `gtidx < 2` holds the pair, and the index is
         // the brick's mixed rank (occBase/16, exact because every mixed brick
         // allocates exactly 16 occupancy dwords) times the 2 dwords the host
         // allocates per mixed brick.
-        OutBrickSkip[(occBase / kBrickOccWords) * 2u + gtid.x] = gsSkip[gtid.x];
+        OutBrickSkip[(occBase / kBrickOccWords) * 2u + gtidx] = gsSkip[gtidx];
     }
+}
+
+[numthreads(64, 1, 1)]
+void BrickPackMain(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    uint3 brick;
+    uint cellBase, chunkIndex, localIndex;
+    if (!decodeBrick(gid.x, brick, cellBase, chunkIndex, localIndex)) return;
+    // The scanned offsets are only meaningful below ScanCount -- those are the
+    // entries the scan chain actually wrote. Reading past it would take a write
+    // base out of never-written device memory. GUARD ONLY: the host sets
+    // ScanCount to the brick count, which decodeBrick has already enforced.
+    // Group-uniform, like the guard above it.
+    if (gid.x >= ScanCount) return;
+
+    // BrickScanReadBase is 0 on every classic dispatch (see its declaration);
+    // nonzero only when the offsets live in the worklist scan arenas. The
+    // write bases ride in for BOTH pairs -- see packBrickInto's header.
+    packBrickInto(gid.x, cellBase, chunkIndex, localIndex, gtid.x,
+                  BrickDescBase, ChunkRecordBase,
+                  OccWriteBase, MatWriteBase,
+                  OccWriteBase, MatWriteBase,
+                  BrickScanReadBase);
 }

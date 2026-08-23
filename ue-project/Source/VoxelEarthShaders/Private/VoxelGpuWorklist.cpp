@@ -83,6 +83,8 @@ namespace
 	std::atomic<uint32> GProofCtChecked{ 0 };
 	std::atomic<uint32> GProofStampMismatch{ 0 };
 	std::atomic<uint32> GProofStampChecked{ 0 };
+	std::atomic<uint32> GProofPackMismatch{ 0 };
+	std::atomic<uint32> GProofPackChecked{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -105,7 +107,11 @@ namespace
 		// single group; the scan + totals live in the next stage's 1 group.
 		FVoxelGpuWorklist::kClassifyGroupsPerRecord,       // Classify: (LOCKED)
 		FVoxelGpuWorklist::kClassifyTotalsGroupsPerRecord, // ClassifyTotals: (LOCKED)
-		2,    // PackClaim: classify+pack pair
+		// The PackClaim slot carries the PACK dispatch (one group per brick,
+		// the classic pack shape); the claim stays per-chunk in the batch
+		// graph, sourcing from the pack arenas, until the Write/Record
+		// stages land.
+		FVoxelGpuWorklist::kPackGroupsPerRecord,           // PackClaim: (LOCKED, pack half)
 		64,   // Write: upper-bound word-copy groups
 		1,    // Record
 	};
@@ -409,6 +415,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 CtChecked = GProofCtChecked.load(std::memory_order_relaxed);
 		const uint32 StampMismatch = GProofStampMismatch.load(std::memory_order_relaxed);
 		const uint32 StampChecked = GProofStampChecked.load(std::memory_order_relaxed);
+		const uint32 PackMismatch = GProofPackMismatch.load(std::memory_order_relaxed);
+		const uint32 PackChecked = GProofPackChecked.load(std::memory_order_relaxed);
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
@@ -418,7 +426,20 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		Proof.CtDwordsChecked = CtChecked;
 		Proof.StampCellMismatches = StampMismatch;
 		Proof.StampCellsChecked = StampChecked;
+		Proof.PackDwordMismatches = PackMismatch;
+		Proof.PackDwordsChecked = PackChecked;
 		++Proof.Landed;
+		if (PackMismatch > 0)
+		{
+			// THE PACK FAILING READING: the converted pack emitted different
+			// bytes than the classic one, and those bytes are the POOL
+			// PAYLOAD ITSELF. Leg invalid outright.
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] PACK VERIFY FAIL: %u mismatching dwords over %u ")
+			       TEXT("compared (cumulative). The converted Pack stage and the classic ")
+			       TEXT("BrickPackMain disagree; the leg is invalid."),
+			       PackMismatch, PackChecked);
+		}
 		if (StampMismatch > 0)
 		{
 			// THE ASSETSTAMP FAILING READING: the gather stamped different
@@ -494,9 +515,10 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("[gpu-worklist] proof #%u ok: gpu consumed=%u fold=0x%08x tail=%u ")
 			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u; ")
 			       TEXT("voxverify checked=%u mism=%u; ctverify checked=%u mism=%u; ")
-			       TEXT("stampverify checked=%u mism=%u)"),
+			       TEXT("stampverify checked=%u mism=%u; packverify checked=%u mism=%u)"),
 			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
-			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch);
+			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch,
+			       PackChecked, PackMismatch);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -536,6 +558,7 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		 // lifetime argument every region graph already leans on.
 		 bColumns = bColumnStageArmed, bVoxelize = IsVoxelizeStageArmed(),
 		 bClassify = IsClassifyStageArmed(), bStamp = IsAssetStampStageArmed(),
+		 bPack = IsPackStageArmed(),
 		 StampInstances = MoveTemp(FlushInstances),
 		 StampColStarts = MoveTemp(FlushColStarts),
 		 StampSpans = MoveTemp(FlushSpans),
@@ -563,6 +586,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				GProofCtChecked.store(Data[9], std::memory_order_relaxed);
 				GProofStampMismatch.store(Data[10], std::memory_order_relaxed);
 				GProofStampChecked.store(Data[11], std::memory_order_relaxed);
+				GProofPackMismatch.store(Data[12], std::memory_order_relaxed);
+				GProofPackChecked.store(Data[13], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();
@@ -813,6 +838,80 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 					CDispatch.Totals = GraphBuilder.RegisterExternalBuffer(
 						PooledTotalsArena, TEXT("Voxel.WorklistTotals"));
 					VoxelGpuWorldGen::AddWorklistClassifyPasses(GraphBuilder, CDispatch);
+
+					// --- Pack: FIFTH indirect (+ the mask-arena clear) ------
+					//
+					// Reads the cell arena and the classify stage's offset
+					// arenas; writes the pack arenas the batch graph's
+					// claim/write passes consume through their read bases.
+					// The chunk-mask arena is InterlockedOr-accumulated, so
+					// it is CLEARED here first, every flush -- the host
+					// precondition brickpack.ush states, kept as one small
+					// constant pass per tick.
+					if (bPack)
+					{
+						if (!PooledPackDescArena.IsValid())
+						{
+							PackArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
+							const auto MakePackArena =
+								[&](uint32 BytesPerElement, uint32 ElementsPerRecord, const TCHAR* Name)
+							{
+								return AllocatePooledBuffer(
+									FRDGBufferDesc::CreateStructuredDesc(
+										BytesPerElement, PackArenaRecords * ElementsPerRecord),
+									Name);
+							};
+							PooledPackDescArena = MakePackArena(sizeof(uint32) * 2, kBricksPerRecord,
+							                                    TEXT("Voxel.WorklistPackDesc"));
+							PooledPackOccArena = MakePackArena(sizeof(uint32), kOccWordsPerRecord,
+							                                   TEXT("Voxel.WorklistPackOcc"));
+							PooledPackMatArena = MakePackArena(sizeof(uint32), kMatWordsPerRecord,
+							                                   TEXT("Voxel.WorklistPackMat"));
+							PooledPackSkipArena = MakePackArena(sizeof(uint32), kSkipWordsPerRecord,
+							                                    TEXT("Voxel.WorklistPackSkip"));
+							PooledPackMaskArena = MakePackArena(sizeof(uint32), kMaskDwordsPerRecord,
+							                                    TEXT("Voxel.WorklistPackMask"));
+							UE_LOG(LogVoxelGpuWorklist, Log,
+							       TEXT("[gpu-worklist] pack arenas created: %u slices ")
+							       TEXT("(desc 64x8B, occ %u, mat %u, skip %u, mask %u dwords ")
+							       TEXT("per record; %.1f MiB total); Pack stage dispatching ")
+							       TEXT("indirect from this flush on."),
+							       PackArenaRecords, kOccWordsPerRecord, kMatWordsPerRecord,
+							       kSkipWordsPerRecord, kMaskDwordsPerRecord,
+							       double(PackArenaRecords) *
+							       double(kBricksPerRecord * 2 + kOccWordsPerRecord +
+							              kMatWordsPerRecord + kSkipWordsPerRecord +
+							              kMaskDwordsPerRecord) * 4.0 / (1024.0 * 1024.0));
+						}
+						FRDGBufferRef PackDesc = GraphBuilder.RegisterExternalBuffer(
+							PooledPackDescArena, TEXT("Voxel.WorklistPackDesc"));
+						FRDGBufferRef PackOcc = GraphBuilder.RegisterExternalBuffer(
+							PooledPackOccArena, TEXT("Voxel.WorklistPackOcc"));
+						FRDGBufferRef PackMat = GraphBuilder.RegisterExternalBuffer(
+							PooledPackMatArena, TEXT("Voxel.WorklistPackMat"));
+						FRDGBufferRef PackSkip = GraphBuilder.RegisterExternalBuffer(
+							PooledPackSkipArena, TEXT("Voxel.WorklistPackSkip"));
+						FRDGBufferRef PackMask = GraphBuilder.RegisterExternalBuffer(
+							PooledPackMaskArena, TEXT("Voxel.WorklistPackMask"));
+						AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(PackMask), 0u);
+
+						VoxelGpuWorldGen::FWorklistPackDispatch PDispatch;
+						PDispatch.Records = Records;
+						PDispatch.Control = Control;
+						PDispatch.IndirectArgs = Args;
+						PDispatch.IndirectArgsOffset =
+							uint32(EVoxelWorklistStage::PackClaim) * 3u * uint32(sizeof(uint32));
+						PDispatch.RingCapacity = Capacity;
+						PDispatch.CellArena = CellArena;
+						PDispatch.OccOffsets = CDispatch.OccOffsets;
+						PDispatch.MatOffsets = CDispatch.MatOffsets;
+						PDispatch.Desc = PackDesc;
+						PDispatch.Occ = PackOcc;
+						PDispatch.Mat = PackMat;
+						PDispatch.Skip = PackSkip;
+						PDispatch.Mask = PackMask;
+						VoxelGpuWorldGen::AddWorklistPackPass(GraphBuilder, PDispatch);
+					}
 				}
 			}
 		}
@@ -903,6 +1002,17 @@ FVoxelGpuWorklist::FColumnStageBindings FVoxelGpuWorklist::RegisterColumnStage(F
 			PooledMatOffsetsArena, TEXT("Voxel.WorklistMatOffsets"));
 		Out.TotalsArena = GraphBuilder.RegisterExternalBuffer(
 			PooledTotalsArena, TEXT("Voxel.WorklistTotals"));
+	}
+	if (PooledPackDescArena.IsValid())
+	{
+		Out.PackDescArena = GraphBuilder.RegisterExternalBuffer(
+			PooledPackDescArena, TEXT("Voxel.WorklistPackDesc"));
+		Out.PackOccArena = GraphBuilder.RegisterExternalBuffer(
+			PooledPackOccArena, TEXT("Voxel.WorklistPackOcc"));
+		Out.PackMatArena = GraphBuilder.RegisterExternalBuffer(
+			PooledPackMatArena, TEXT("Voxel.WorklistPackMat"));
+		Out.PackMaskArena = GraphBuilder.RegisterExternalBuffer(
+			PooledPackMaskArena, TEXT("Voxel.WorklistPackMask"));
 	}
 	if (PooledStats.IsValid())
 	{

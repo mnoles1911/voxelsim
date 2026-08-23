@@ -41,6 +41,7 @@ $ColumnUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistColumn.usf'
 $VoxelizeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistVoxelize.usf'
 $ClassifyUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistClassify.usf'
 $StampUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistAssetStamp.usf'
+$PackUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistPack.usf'
 $AssetStampUsf = Join-Path $Root 'ue-project\Shaders\VoxelAssetStamp.usf'
 $WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $BrickPack = Join-Path $Root 'voxel-core\shaders\brickpack.ush'
@@ -103,6 +104,11 @@ Copy-Item $BrickPack (Join-Path $Stage 'brickpack.ush')
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
     Replace('"/VoxelEarth/VoxelAssetStamp.usf"', '"VoxelAssetStamp.usf"') |
     Out-File (Join-Path $Stage 'VoxelWorklistAssetStamp.hlsl') -Encoding utf8
+(Get-Content $PackUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/brickpack.ush"', '"brickpack.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistPack.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
@@ -175,6 +181,15 @@ $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistAssetStamp.hls
 # the factoring must not have broken the shipped forms.
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampMain'       'stamp   DXIL  AssetStampMain (classic)'
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelAssetStamp.usf') 'AssetStampCoarseMain' 'stamp   DXIL  AssetStampCoarseMain (classic)'
+
+# The converted Pack stage (VoxelWorklistPack.usf; P3 stage 5). Defines mirror
+# FVoxelWorklistPackCS's; the classic BrickPackMain forms are covered by
+# voxel-check-brickpack-shader.ps1 (the factoring must not break them).
+$PackDefines = @('VXC_UE=1',
+                 'VXC_WORKLIST_PACK_GROUPS=64', 'VXC_WORKLIST_BRICKS_PER_RECORD=64',
+                 'VXC_WORKLIST_CELLS_PER_RECORD=32768', 'VXC_WORKLIST_MATWORDS_PER_RECORD=8448')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistMain'       'pack    DXIL  PackWorklistMain'       $PackDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistPack.hlsl') 'PackWorklistVerifyMain' 'packvfy DXIL  PackWorklistVerifyMain' $PackDefines
 
 # The factored classic kernels, both atlas permutations -- the factoring must
 # not have broken the shipped forms (the digest gate proves bytes; this proves

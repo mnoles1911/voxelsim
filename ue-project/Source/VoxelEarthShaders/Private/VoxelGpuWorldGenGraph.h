@@ -136,6 +136,17 @@ namespace VoxelGpuWorldGen
 		// 2-dword transient); SliceIndex * 2 when BrickTotals is the worklist
 		// totals arena. The claim pass reads through it (TotalsReadBase).
 		uint32 BrickTotalsReadBase = 0;
+		// P3 Pack stage: the pack-arena read bases, all 0 on every classic
+		// path. Desc/mask feed the write passes' SrcDescBase/ChunkMaskBase;
+		// occ/mat feed the claim's SrcWordsOccBase/SrcWordsMatBase (which
+		// relocate the copy kernels' source through the claim's spare pair).
+		uint32 BrickDescReadBase = 0;     // SliceIndex * 64
+		uint32 BrickOccSrcBase = 0;       // SliceIndex * 1,024
+		uint32 BrickMatSrcBase = 0;       // SliceIndex * 8,448
+		uint32 ChunkMaskReadBase = 0;     // SliceIndex * 2 -- NOTE: element base
+		                                  // into the mask arena; the write pass
+		                                  // wants a CHUNK index, so the caller
+		                                  // passes SliceIndex (base / 2) there.
 
 		// Tier B.1 (voxel.GPU.WorldGenBatch): (2 + 2*NumBrickChunks) uints --
 		// the region totals pair, then each chunk's own occ/mat dword pair.
@@ -217,6 +228,21 @@ namespace VoxelGpuWorldGen
 		// Verify arm: run the classic classify + scans + totals as well and
 		// compare offsets + totals into VerifyStats [8..9].
 		bool bVerifyCt = false;
+
+		// P3 Pack stage: non-null when this chunk's descriptors and word
+		// payloads were also packed this tick (the pack indirect dispatch,
+		// riding the totals feed). AddRegionPasses then SKIPS the chunk-mask
+		// clear and BrickPackMain, and returns the arenas as
+		// Out.BrickDesc/BrickOcc/BrickMat/BrickChunkMask with the read bases
+		// the claim/write passes consume.
+		FRDGBufferRef PackDescArena = nullptr;   // budget x 64 uint2
+		FRDGBufferRef PackOccArena = nullptr;    // budget x 1,024 uint
+		FRDGBufferRef PackMatArena = nullptr;    // budget x 8,448 uint
+		FRDGBufferRef PackMaskArena = nullptr;   // budget x 2 uint
+		// Verify arm: run the classic mask clear + BrickPackMain as well
+		// (into transients, reading the SAME arena cells and offsets) and
+		// compare desc + bounded words + mask into VerifyStats [12..13].
+		bool bVerifyPack = false;
 	};
 
 	// The once-per-tick indirect Column dispatch, added to the worklist FLUSH
@@ -297,6 +323,27 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Spans = nullptr;         // rebased packed spans
 	};
 	void AddWorklistAssetStampPass(FRDGBuilder& GraphBuilder, const FWorklistAssetStampDispatch& Dispatch);
+
+	// The Pack stage's once-per-tick indirect dispatch (P3 stage 5), added to
+	// the worklist FLUSH graph after the classify pair (it reads their offset
+	// arenas) -- one group per brick, the classic pack shape.
+	struct FWorklistPackDispatch
+	{
+		FRDGBufferRef Records = nullptr;
+		FRDGBufferRef Control = nullptr;
+		FRDGBufferRef IndirectArgs = nullptr;
+		uint32 IndirectArgsOffset = 0;        // byte offset of the PackClaim triple
+		uint32 RingCapacity = 0;
+		FRDGBufferRef CellArena = nullptr;    // read
+		FRDGBufferRef OccOffsets = nullptr;   // read (the classify stage's arenas)
+		FRDGBufferRef MatOffsets = nullptr;
+		FRDGBufferRef Desc = nullptr;         // written, one slice per record
+		FRDGBufferRef Occ = nullptr;
+		FRDGBufferRef Mat = nullptr;
+		FRDGBufferRef Skip = nullptr;
+		FRDGBufferRef Mask = nullptr;         // caller cleared it this flush
+	};
+	void AddWorklistPackPass(FRDGBuilder& GraphBuilder, const FWorklistPackDispatch& Dispatch);
 
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any
@@ -539,7 +586,9 @@ namespace VoxelGpuWorldGen
 	                                    uint32 OccWorstWords, uint32 MatWorstWords,
 	                                    uint32 TotalsChunkIndexPlusOne = 0,
 	                                    uint32 TotalsNumChunks = 0,
-	                                    uint32 TotalsReadBase = 0);
+	                                    uint32 TotalsReadBase = 0,
+	                                    uint32 SrcWordsOccBase = 0,
+	                                    uint32 SrcWordsMatBase = 0);
 
 	// The three writes: occ words, mat words (worst-case dispatch, actual count
 	// read from the claim), descriptors (claim-based rebase), and the record

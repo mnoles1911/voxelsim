@@ -122,6 +122,10 @@ StructuredBuffer<uint>  InBrickTotals;  // [0] occ dwords, [1] mat dwords
 // stack-claim form (TotalsChunkIndexPlusOne != 0) never reads through it:
 // fused stacks take no worklist feed.
 uint TotalsReadBase;
+// P3 worklist Pack stage: element bases added into OutClaim[6]/[7] so the
+// word-copy kernels source from the worklist pack arenas. 0 classic.
+uint SrcWordsOccBase;
+uint SrcWordsMatBase;
 StructuredBuffer<uint>  InWords;        // scratch words, one arena per pass
 StructuredBuffer<uint2> InBrickDesc;    // scratch descriptors, chunk-relative
 StructuredBuffer<uint>  InBrickOcc;     // scratch occupancy, for allSolid
@@ -365,7 +369,13 @@ void BrickPoolClaimMain(uint3 tid : SV_DispatchThreadID)
 	}
 
 	OutClaim[1] = 0u; OutClaim[2] = 0u; OutClaim[3] = 0u; OutClaim[4] = 0u;
-	OutClaim[6] = SrcOccFirst; OutClaim[7] = SrcMatFirst;
+	// P3 worklist Pack stage: SrcWordsOccBase/SrcWordsMatBase relocate the
+	// word-copy source into the worklist PACK ARENAS (sliceIndex * the
+	// per-record worst-case strides) -- 0 on every classic dispatch, and the
+	// stack prefix arithmetic above is untouched (fused stacks take no
+	// worklist feed, so the two terms never both fire).
+	OutClaim[6] = SrcOccFirst + SrcWordsOccBase;
+	OutClaim[7] = SrcMatFirst + SrcWordsMatBase;
 
 	// --- the split gate (stack-claim only; see TotalsNumChunks) -------------
 	// One thread, <=128 extra reads per member: cheap against the copy passes

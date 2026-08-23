@@ -189,14 +189,26 @@ public:
 	static constexpr uint32 kClassifyTotalsGroupsPerRecord = 1;
 	// The AssetStamp gather: one thread per column, the Column stage's shape.
 	static constexpr uint32 kStampGroupsPerRecord = kColumnsPerRecord / 64;
+	// The Pack stage: one group per brick, the classic pack shape (the
+	// payload assembly is groupshared). Arena strides are the WORST CASE per
+	// record; actual counts live compactly at the front of each slice, which
+	// is what lets the claim's spare pair hand the copy kernels a flat base.
+	// kMatWordsPerRecord mirrors brickpack.ush's kMaxBrickMatWords (132) --
+	// the kernel #errors if the product drifts.
+	static constexpr uint32 kPackGroupsPerRecord = kBricksPerRecord;
+	static constexpr uint32 kOccWordsPerRecord = kBricksPerRecord * 16;
+	static constexpr uint32 kMatWordsPerRecord = kBricksPerRecord * 132;
+	static constexpr uint32 kSkipWordsPerRecord = kOccWordsPerRecord / 16 * 2;
+	static constexpr uint32 kMaskDwordsPerRecord = 2;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
 	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's
 	// (VoxelWorklistVoxelize.usf), [8..9] the classify-totals verify's
 	// (VoxelWorklistClassify.usf), [10..11] the asset-stamp verify's (the
 	// voxelize verify kernel with VerifyStatsBase 10 -- it compares the
-	// stamped cells).
-	static constexpr uint32 kStatsDwords = 12;
+	// stamped cells), [12..13] the pack verify's (VoxelWorklistPack.usf),
+	// [14..15] reserved for the remaining stages.
+	static constexpr uint32 kStatsDwords = 16;
 
 	~FVoxelGpuWorklist();
 
@@ -266,6 +278,16 @@ public:
 	void SetAssetStampStageArmed(bool bArmed) { bStampStageArmed = bArmed; }
 	bool IsAssetStampStageArmed() const { return bStampStageArmed && IsVoxelizeStageArmed(); }
 
+	// --- the Pack stage (-VoxelGpuWorklistPack) -----------------------------
+	//
+	// Gated behind the fused ClassifyTotals stage (its scanned-offset arenas
+	// are this stage's input). With it armed, a totals-fed chunk's classic
+	// BrickChunkMask clear and BrickPackMain disappear; the claim/write
+	// passes source descriptors and words from the pack arenas through the
+	// bases FRegionGraphResources carries.
+	void SetPackStageArmed(bool bArmed) { bPackStageArmed = bArmed; }
+	bool IsPackStageArmed() const { return bPackStageArmed && IsClassifyStageArmed(); }
+
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
 	// record appended at monotonic index m was consumed by that flush iff
@@ -298,6 +320,14 @@ public:
 		FRDGBufferRef OccOffsetsArena = nullptr;
 		FRDGBufferRef MatOffsetsArena = nullptr;
 		FRDGBufferRef TotalsArena = nullptr;
+		// The Pack stage's arenas (null until its first armed flush, same
+		// contract). Desc: budget x 64 uint2; occ/mat words: budget x the
+		// worst-case strides; mask: budget x 2 (the flush cleared it before
+		// packing). The skip arena stays flush-side -- nothing consumes it.
+		FRDGBufferRef PackDescArena = nullptr;
+		FRDGBufferRef PackOccArena = nullptr;
+		FRDGBufferRef PackMatArena = nullptr;
+		FRDGBufferRef PackMaskArena = nullptr;
 	};
 	FColumnStageBindings RegisterColumnStage(FRDGBuilder& GraphBuilder);
 
@@ -354,6 +384,11 @@ public:
 		// mismatch is a wrong asset voxel in the pool -- leg invalid.
 		uint64 StampCellMismatches = 0;
 		uint64 StampCellsChecked = 0;
+		// The Pack stage's byte gate (stats [12..13]): desc + bounded word
+		// ranges + chunk mask vs the classic pack. A mismatch is the POOL
+		// PAYLOAD ITSELF being wrong -- leg invalid outright.
+		uint64 PackDwordMismatches = 0;
+		uint64 PackDwordsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -425,6 +460,14 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> PooledOccOffsetsArena;
 	TRefCountPtr<FRDGPooledBuffer> PooledMatOffsetsArena;
 	TRefCountPtr<FRDGPooledBuffer> PooledTotalsArena;
+	// --- Pack stage (same lifetime rules) -----------------------------------
+	bool bPackStageArmed = false;
+	uint32 PackArenaRecords = 0;     // slices the pack arenas hold; latched at creation
+	TRefCountPtr<FRDGPooledBuffer> PooledPackDescArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledPackOccArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledPackMatArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledPackSkipArena;
+	TRefCountPtr<FRDGPooledBuffer> PooledPackMaskArena;
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------

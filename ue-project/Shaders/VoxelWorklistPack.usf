@@ -1,0 +1,189 @@
+// VoxelWorklistPack.usf -- the FIFTH converted stage of the P3 worklist: the
+// Pack half of the brick chain (docs/gpu-worklist-plan-2026-08-23.md,
+// conversion step 4's table row). Behind -VoxelGpuWorklistPack=1, on top of
+// -VoxelGpuWorklistClassify=1 -- the scanned offsets it reads live in the
+// classify stage's arenas.
+//
+// WHAT IT REPLACES, per totals-fed chunk: the BrickChunkMask clear pass and
+// BrickPackMain -- TWO passes -- replaced by one per-flush arena clear (2
+// dwords per record, constant) and ONE indirect dispatch per tick (64 groups
+// per record, one group per brick, the classic pack shape: the payload
+// assembly is groupshared).
+//
+// THE MATH IS NOT COPIED, IT IS CALLED: packBrickInto in brickpack.ush is the
+// factored body of BrickPackMain, and both entry points call the same text.
+// THE ONE DELIBERATE SPLIT, stated there and restated here because bytes
+// depend on it: the DESCRIPTOR offset fields stay CHUNK-RELATIVE
+// (descOccBase/descMatBase = 0 -- the byte contract every downstream rebase
+// and voxel.GPU.Verify* assumes), while the WORD writes take the record's
+// slice base into the shared word arenas (wordOccBase/wordMatBase). The
+// claim pass hands the copy kernels that same slice base through its spare
+// pair (SrcWordsOccBase/SrcWordsMatBase), so the pool receives exactly the
+// bytes the classic path would have staged.
+//
+// OUTPUTS, all flush-level arenas, per-record strides:
+//   desc  64 x uint2      occ  1,024 dwords (64 x 16)
+//   mat   8,448 dwords (64 x kMaxBrickMatWords=132)
+//   skip  128 dwords (indexed occBase/16*2 -- nothing reads it, classic rule)
+//   mask  2 dwords (InterlockedOr -- cleared by the flush graph BEFORE this
+//         dispatch, the host precondition brickpack.ush states)
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+#include "/VoxelCore/brickpack.ush"
+
+#ifndef VXC_WORKLIST_PACK_GROUPS
+#error "VXC_WORKLIST_PACK_GROUPS not defined -- dispatch this kernel only through FVoxelWorklistPackCS"
+#endif
+#ifndef VXC_WORKLIST_BRICKS_PER_RECORD
+#error "VXC_WORKLIST_BRICKS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistPackCS"
+#endif
+#ifndef VXC_WORKLIST_CELLS_PER_RECORD
+#error "VXC_WORKLIST_CELLS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistPackCS"
+#endif
+#ifndef VXC_WORKLIST_MATWORDS_PER_RECORD
+#error "VXC_WORKLIST_MATWORDS_PER_RECORD not defined -- dispatch this kernel only through FVoxelWorklistPackCS"
+#endif
+#if VXC_WORKLIST_PACK_GROUPS != 64
+#error "Pack stage shape drifted: one group per brick, 64 bricks per lean chunk, and the host table must agree"
+#endif
+#if VXC_WORKLIST_BRICKS_PER_RECORD != 64
+#error "Pack stage shape drifted: a lean brick chunk is 4x4x4 = 64 bricks"
+#endif
+#if VXC_WORKLIST_CELLS_PER_RECORD != 32768
+#error "Pack stage shape drifted: a lean brick chunk is 32x32x32 cells"
+#endif
+#if VXC_WORKLIST_MATWORDS_PER_RECORD != 8448
+#error "Pack stage shape drifted: 64 bricks x kMaxBrickMatWords (132) = 8448 -- if kMaxBrickMatWords moved, move this with it ON BOTH SIDES"
+#endif
+
+// The ring (same three bindings, same meanings, as every worklist consumer).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+StructuredBuffer<uint> WorklistControl;   // [0]=consumeFirst [1]=consumeCount
+uint RingCapacity;
+
+// Everything else -- InCells (the cell arena), InBrickOccOffsets /
+// InBrickMatOffsets (the classify stage's offset arenas), OutBrickDesc /
+// OutBrickOcc / OutBrickMat / OutBrickSkip / OutChunkBrickMask (the pack
+// arenas) -- binds through brickpack.ush's own declarations, the every-stage
+// rule: this file declares no duplicate of anything the classic kernel binds.
+
+[numthreads(64, 1, 1)]
+void PackWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Take = WorklistControl[1];
+	const uint Rec = Gid.x / VXC_WORKLIST_PACK_GROUPS;
+	// Group-uniform (Gid-derived) -- the groupshared flow inside
+	// packBrickInto requires it. Belt-and-braces, not a code path.
+	if (Rec >= Take)
+	{
+		return;
+	}
+	const uint Slot = (WorklistControl[0] + Rec) % RingCapacity;
+	const GpuChunkWorkRecord R = WorklistRecords[Slot];
+	// Same asset gate as the Voxelize/Classify stages (group-uniform): a
+	// record is packable iff its cells -- terrain and, when staged, stamps --
+	// are in the arena.
+	if (worklistAssetsBlockRecord(R) != 0u)
+	{
+		return;
+	}
+
+	const uint PackIndex = Gid.x % VXC_WORKLIST_PACK_GROUPS;
+	uint3 Brick;
+	uint CellBase, ChunkIndex, LocalIndex;
+	if (!decodeBrick(PackIndex, Brick, CellBase, ChunkIndex, LocalIndex))
+	{
+		return;
+	}
+
+	packBrickInto(PackIndex,
+	              Rec * VXC_WORKLIST_CELLS_PER_RECORD + CellBase,
+	              ChunkIndex, LocalIndex, GTid.x,
+	              /*descBase*/     Rec * VXC_WORKLIST_BRICKS_PER_RECORD,
+	              /*chunkRecBase*/ Rec,
+	              /*descOccBase*/  0u,
+	              /*descMatBase*/  0u,
+	              /*wordOccBase*/  Rec * (VXC_WORKLIST_BRICKS_PER_RECORD * 16u),
+	              /*wordMatBase*/  Rec * VXC_WORKLIST_MATWORDS_PER_RECORD,
+	              /*scanReadBase*/ Rec * VXC_WORKLIST_BRICKS_PER_RECORD);
+}
+
+// --- PackWorklistVerifyMain: the stage's byte gate --------------------------
+//
+// Compares ONE converted chunk's arena DESC (64 x 2 dwords), OCC words
+// ([0, occTotal)), MAT words ([0, matTotal)) and chunk MASK (2 dwords)
+// against a classic BrickPackMain re-run of the same chunk into transients
+// (reading the SAME arena cells and arena offsets, so the compare isolates
+// the pack conversion). The totals bound the word compares -- words past
+// them were never written by either side and comparing them would be
+// comparing pool noise. Mismatches into WorklistStats[12], dwords compared
+// into [13]. One 64-thread group per verified chunk, verify arm only.
+//
+// THE FAILING READINGS: stats[12] > 0 -- the converted pack emits different
+// bytes; those bytes are the POOL PAYLOAD ITSELF, the leg is invalid
+// outright. stats[13] staying 0 while converted chunks flow with the verify
+// switch armed -- the gate is dead.
+
+StructuredBuffer<uint2> VerifyClassicDesc;
+StructuredBuffer<uint>  VerifyClassicOcc;
+StructuredBuffer<uint>  VerifyClassicMat;
+StructuredBuffer<uint>  VerifyClassicMask;    // the region transient, 2 dwords
+StructuredBuffer<uint2> VerifyArenaDesc;
+StructuredBuffer<uint>  VerifyArenaOcc;
+StructuredBuffer<uint>  VerifyArenaMat;
+StructuredBuffer<uint>  VerifyArenaMask;
+StructuredBuffer<uint>  VerifyTotals;         // the totals arena
+RWStructuredBuffer<uint> WorklistStats;
+uint VerifyDescBase;    // slice * 64
+uint VerifyOccBase;     // slice * 1024
+uint VerifyMatBase;     // slice * 8448
+uint VerifyMaskBase;    // slice * 2
+uint VerifyTotalsBase;  // slice * 2
+
+[numthreads(64, 1, 1)]
+void PackWorklistVerifyMain(uint3 tid : SV_DispatchThreadID)
+{
+	if (tid.x >= 64u)
+	{
+		return;
+	}
+	uint Mismatch = 0u;
+	uint Checked = 0u;
+
+	// Descriptors: one per thread.
+	{
+		const uint2 A = VerifyArenaDesc[VerifyDescBase + tid.x];
+		const uint2 C = VerifyClassicDesc[tid.x];
+		Checked += 2u;
+		Mismatch += (A.x != C.x) ? 1u : 0u;
+		Mismatch += (A.y != C.y) ? 1u : 0u;
+	}
+
+	const uint OccTotal = VerifyTotals[VerifyTotalsBase + 0u];
+	const uint MatTotal = VerifyTotals[VerifyTotalsBase + 1u];
+	// Words: strided across the group, bounded by the totals.
+	for (uint i = tid.x; i < OccTotal; i += 64u)
+	{
+		Checked += 1u;
+		Mismatch += (VerifyArenaOcc[VerifyOccBase + i] != VerifyClassicOcc[i]) ? 1u : 0u;
+	}
+	for (uint j = tid.x; j < MatTotal; j += 64u)
+	{
+		Checked += 1u;
+		Mismatch += (VerifyArenaMat[VerifyMatBase + j] != VerifyClassicMat[j]) ? 1u : 0u;
+	}
+	if (tid.x < 2u)
+	{
+		Checked += 1u;
+		Mismatch += (VerifyArenaMask[VerifyMaskBase + tid.x] !=
+		             VerifyClassicMask[tid.x]) ? 1u : 0u;
+	}
+
+	uint Unused;
+	InterlockedAdd(WorklistStats[13], Checked, Unused);
+	if (Mismatch != 0u)
+	{
+		InterlockedAdd(WorklistStats[12], Mismatch, Unused);
+	}
+}

@@ -274,6 +274,47 @@ fbAssets stop growing):
   the classic per-instance stamp passes, so the tally's -1 per converted
   asset chunk UNDERSTATES the real cut (which also removes N stamp passes).
 
+## Stage 5 LANDED: the Pack half of the brick chain (2026-08-23, -VoxelGpuWorklistPack)
+
+Authored-not-yet-built. The Pack half of the PackClaim table row, landed alone
+(the claim and the four writes stay per-chunk, sourcing from arenas): per
+totals-fed chunk, the BrickChunkMask clear and BrickPackMain -- TWO passes --
+become one indirect dispatch per tick (`PackWorklistMain`,
+VoxelWorklistPack.usf, 64 groups/record, one group per brick, the classic
+groupshared pack shape) plus one small per-flush mask-arena clear. 7 -> 5
+passes on the lean-alloc shape; spine constant 6 -> 8/tick.
+
+* THE MATH IS CALLED: brickpack.ush's BrickPackMain body is factored into
+  `packBrickInto` and both entry points call the same text. THE ONE
+  DELIBERATE SPLIT: descriptor offset fields keep separate bases from the
+  word writes -- classic passes the same value for both (bit-identical),
+  the worklist passes 0 for descriptors (CHUNK-RELATIVE, the byte contract
+  every rebase and verify assumes) and the record's arena slice base for
+  words.
+* The claim/write plumbing: the claim kernel gains SrcWordsOccBase /
+  SrcWordsMatBase (folded into its spare pair OutClaim[6]/[7], which the
+  copy kernels already read as their source base -- zero classic), and the
+  write passes take the desc/mask bases they already supported for stacks.
+  FRegionGraphResources carries all four bases; the chunk's compact word
+  range sits at the FRONT of its worst-case arena slice, which is what makes
+  a flat source base sufficient.
+* Arenas per record: desc 64 x uint2, occ 1,024, mat 8,448 (64 x
+  kMaxBrickMatWords -- the kernel #errors if that product drifts), skip 128
+  (unread, classic rule), mask 2 (cleared each flush). ~10 MiB at the
+  256-record cell budget.
+* Switches: `-VoxelGpuWorklistPack=1` (requires the Classify switch); byte
+  gate `-VoxelGpuWorklistVerifyPack=1` -- classic clear + pack re-run into
+  transients (same arena cells and offsets) + a 1-group compare of desc +
+  totals-bounded word ranges + mask into stats [12..13] (kStatsDwords
+  12 -> 16). A packverify mismatch is the POOL PAYLOAD ITSELF being wrong.
+* Readings: `[gpu-worklist] wlpack conv= arenaMissing= packverify checked=
+  mism=`; same failing-readings table as wlct.
+
+Remaining after this: the claim + the four write passes + delivery (the
+Write/Record stages) -- per-chunk cost 5 (claim + 4 writes). Converting them
+moves production fully into the flush graph and delivery to "the tick after
+flush"; that is the piece that finally makes passes/tick FLAT.
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:

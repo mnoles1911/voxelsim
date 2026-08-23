@@ -598,6 +598,40 @@ static bool VoxelGpuWorklistVerifyStampEnabled()
 	return bEnabled;
 }
 
+// -VoxelGpuWorklistPack=1 (P3 stage 5), on top of -VoxelGpuWorklistClassify:
+// the flush graph ALSO dispatches the converted Pack (one indirect dispatch
+// per tick, one group per brick, plus one small mask-arena clear), and every
+// totals-fed chunk skips its classic BrickChunkMask clear and BrickPackMain
+// -- TWO more passes (7 -> 5 on the lean-alloc shape). The claim/write
+// passes source descriptors and words from the pack arenas through
+// FRegionGraphResources' read bases; descriptor offsets stay CHUNK-RELATIVE
+// (packBrickInto's split). Command-line latched.
+static bool VoxelGpuWorklistPackEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistPack="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// The Pack stage's byte gate (-VoxelGpuWorklistVerifyPack): every pack-fed
+// chunk ALSO runs the classic mask clear + BrickPackMain into transients
+// (reading the SAME arena cells and offsets) plus a 1-group compare of desc
+// + bounded words + mask into stats [12..13]. Verify arm only.
+static bool VoxelGpuWorklistVerifyPackEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVerifyPack="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 // -VoxelGpuWorklistCellBudget=<n> (default 256): the per-flush record cap
 // while the Voxelize stage is armed. The cell arena costs 128 KiB per record
 // (32,768 cells x 4 B) -- 256 is a 32 MiB arena and 15,360 chunks/s of
@@ -734,6 +768,8 @@ namespace VoxelGpuBatchDetail
 	// Same failure, fused ClassifyTotals stage: a job flagged totals-fed
 	// reached the batch graph and the scan/totals arenas did not exist.
 	static std::atomic<int64> GWorklistCtArenaMissing{ 0 };
+	// Same failure, Pack stage.
+	static std::atomic<int64> GWorklistPackArenaMissing{ 0 };
 }
 
 // Defined here rather than in a file of its own because this is the only place
@@ -1074,6 +1110,9 @@ struct FVoxelGpuMeshJobManager::FJob
 	// P3 fused ClassifyTotals: this job's brick offsets/totals were also
 	// computed (arenas at slice * 64 / slice * 2). Implies bWorklistCellsFed.
 	bool bWorklistTotalsFed = false;
+	// P3 Pack: this job's descriptors and word payloads were also packed
+	// (pack arenas). Implies bWorklistTotalsFed.
+	bool bWorklistPackFed = false;
 	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
 	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
 	// no 4-byte total readback, no pool write.
@@ -2239,6 +2278,7 @@ void FVoxelGpuMeshJobManager::Tick()
 			                               VoxelGpuWorklistCellBudget());
 			Worklist.SetClassifyStageArmed(VoxelGpuWorklistClassifyEnabled());
 			Worklist.SetAssetStampStageArmed(VoxelGpuWorklistAssetStampEnabled());
+			Worklist.SetPackStageArmed(VoxelGpuWorklistPackEnabled());
 		}
 		if (!bWorklistArmingLogged)
 		{
@@ -2291,6 +2331,19 @@ void FVoxelGpuMeshJobManager::Tick()
 				       VoxelGpuWorklistVoxelizeEnabled()
 					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
 			}
+			if (VoxelGpuWorklistPackEnabled())
+			{
+				UE_LOG(LogVoxelGpuMeshJob, Log,
+				       TEXT("[gpu-worklist] PACK STAGE ARMED (-VoxelGpuWorklistPack): the Pack ")
+				       TEXT("kernel is CONVERTED -- one indirect dispatch (+ a mask-arena ")
+				       TEXT("clear) per tick replaces the chunk-mask clear and BrickPackMain ")
+				       TEXT("per totals-fed chunk (7 -> 5 on the lean-alloc shape); the ")
+				       TEXT("claim/write passes source from the pack arenas. Requires ")
+				       TEXT("-VoxelGpuWorklistClassify=1%s. Read the wlpack line. Verify arm: ")
+				       TEXT("-VoxelGpuWorklistVerifyPack=1."),
+				       VoxelGpuWorklistClassifyEnabled()
+					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
+			}
 			if (VoxelGpuWorklistClassifyEnabled())
 			{
 				UE_LOG(LogVoxelGpuMeshJob, Log,
@@ -2330,7 +2383,8 @@ void FVoxelGpuMeshJobManager::Tick()
 			+ (Worklist.IsColumnStageArmed() ? 1 : 0)
 			+ (Worklist.IsVoxelizeStageArmed() ? 1 : 0)
 			+ (Worklist.IsAssetStampStageArmed() ? 1 : 0)
-			+ (Worklist.IsClassifyStageArmed() ? 2 : 0);
+			+ (Worklist.IsClassifyStageArmed() ? 2 : 0)
+			+ (Worklist.IsPackStageArmed() ? 2 : 0);
 		WorklistBatchPassesThisTick = 0;
 		WorklistWinPasses += WorklistPassesThisTick;
 		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, WorklistPassesThisTick);
@@ -2594,6 +2648,20 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		       WorklistStampConverted,
 		       P.StampCellsChecked, P.StampCellMismatches,
 		       P.StampCellMismatches > 0 ? TEXT(" (ASSETSTAMP VERIFY FAILED -- LEG INVALID)") : TEXT(""));
+	}
+	// P3 Pack line, armed-only, the wlct contract restated. A packverify
+	// mismatch is the POOL PAYLOAD being wrong -- the loudest gate of all.
+	if (VoxelGpuWorklistPackEnabled())
+	{
+		const int64 PackArenaMissing =
+			VoxelGpuBatchDetail::GWorklistPackArenaMissing.load(std::memory_order_relaxed);
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] wlpack conv=%lld arenaMissing=%lld packverify ")
+		       TEXT("checked=%llu mism=%llu (cumulative)%s%s"),
+		       WorklistPackConverted, PackArenaMissing,
+		       P.PackDwordsChecked, P.PackDwordMismatches,
+		       P.PackDwordMismatches > 0 ? TEXT(" (PACK VERIFY FAILED -- LEG INVALID)") : TEXT(""),
+		       PackArenaMissing > 0 ? TEXT(" (PACK ARENAS MISSING -- converted jobs fell back)") : TEXT(""));
 	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
@@ -2945,6 +3013,16 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 								RecordJobs[RIdx]->bWorklistTotalsFed = true;
 								++WorklistCtConverted;
 								PassesThisTick += VoxelGpuWorklistVerifyCtEnabled() ? 1 : -8;
+								// P3 stage 5: the Pack rides the totals feed.
+								// Drops the mask clear + BrickPackMain (-2);
+								// verify puts both back and adds the compare
+								// (net +1).
+								if (Worklist.IsPackStageArmed())
+								{
+									RecordJobs[RIdx]->bWorklistPackFed = true;
+									++WorklistPackConverted;
+									PassesThisTick += VoxelGpuWorklistVerifyPackEnabled() ? 1 : -2;
+								}
 							}
 						}
 						else
@@ -2994,9 +3072,11 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	const bool bVerifyVoxArmed = VoxelGpuWorklistVerifyVoxEnabled();
 	const bool bVerifyCtArmed = VoxelGpuWorklistVerifyCtEnabled();
 	const bool bVerifyStampArmed = VoxelGpuWorklistVerifyStampEnabled();
+	const bool bVerifyPackArmed = VoxelGpuWorklistVerifyPackEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
 		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed,
-		 bVerifyVoxArmed, bVerifyCtArmed, bVerifyStampArmed](FRHICommandListImmediate& RHICmdList)
+		 bVerifyVoxArmed, bVerifyCtArmed, bVerifyStampArmed,
+		 bVerifyPackArmed](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 
@@ -3295,11 +3375,37 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 							ColumnFeed.TotalsArena = WorklistCols.TotalsArena;
 							ColumnFeed.bVerifyCt =
 								bVerifyCtArmed && WorklistCols.Stats != nullptr;
+							// P3 stage 5: the pack feed rides the totals feed.
+							if (Job->bWorklistPackFed)
+							{
+								if (WorklistCols.PackDescArena != nullptr &&
+								    WorklistCols.PackOccArena != nullptr &&
+								    WorklistCols.PackMatArena != nullptr &&
+								    WorklistCols.PackMaskArena != nullptr)
+								{
+									ColumnFeed.PackDescArena = WorklistCols.PackDescArena;
+									ColumnFeed.PackOccArena = WorklistCols.PackOccArena;
+									ColumnFeed.PackMatArena = WorklistCols.PackMatArena;
+									ColumnFeed.PackMaskArena = WorklistCols.PackMaskArena;
+									ColumnFeed.bVerifyPack =
+										bVerifyPackArmed && WorklistCols.Stats != nullptr;
+								}
+								else
+								{
+									VoxelGpuBatchDetail::GWorklistPackArenaMissing.fetch_add(
+										1, std::memory_order_relaxed);
+								}
+							}
 						}
 						else
 						{
 							VoxelGpuBatchDetail::GWorklistCtArenaMissing.fetch_add(
 								1, std::memory_order_relaxed);
+							if (Job->bWorklistPackFed)
+							{
+								VoxelGpuBatchDetail::GWorklistPackArenaMissing.fetch_add(
+									1, std::memory_order_relaxed);
+							}
 						}
 					}
 				}
@@ -3352,7 +3458,8 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 							BrickGraph.BrickTotals, Job->GpuChunkSlot,
 							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax,
 							/*TotalsChunkIndexPlusOne*/ 0, /*TotalsNumChunks*/ 0,
-							BrickGraph.BrickTotalsReadBase);
+							BrickGraph.BrickTotalsReadBase,
+							BrickGraph.BrickOccSrcBase, BrickGraph.BrickMatSrcBase);
 						VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(
 							GraphBuilder, PoolAllocBufs, Claim,
 							BrickGraph.BrickOcc, BrickGraph.BrickMat,
@@ -3360,7 +3467,11 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 							BrickGraph.Sizes.NumBricks, Job->GpuChunkSlot, Job->GpuBrickBase,
 							uint32(FMath::Clamp(Job->BrickKey.Level, 0, 15)),
 							Job->BrickOriginVoxel, Job->BrickShading,
-							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax);
+							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax,
+							// SrcDescBase is a BRICK index; ChunkMaskBase a
+							// CHUNK index (the kernel multiplies by 2).
+							BrickGraph.BrickDescReadBase,
+							BrickGraph.ChunkMaskReadBase / 2u);
 					}
 					else
 					{
