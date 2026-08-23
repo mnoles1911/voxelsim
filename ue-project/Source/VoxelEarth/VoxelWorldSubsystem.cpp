@@ -11320,12 +11320,58 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 	// its own means it filled, and eviction drops bricks the index is still
 	// naming. `absent` is expected to be large and is not an error -- the
 	// buried and sky skips retire records that never had a brick.
+	//
+	// `resident0` IS ONE OF SEVEN LEVEL BUCKETS, NOT THE POOL, and on
+	// 2026-08-23 it was read as the pool and a live hypothesis was retired on
+	// the strength of it. The reading was resident0 66,649 against "262,144
+	// pool slots" -> "residency is ~25% of the pool, so 91,422 evictions
+	// cannot be capacity". GetResidentChunkCountAtLevel(0) returns
+	// LevelChunkCounts[0]; the pool's occupancy is Resident.Num() over all
+	// SEVEN buckets. At the shipped ring geometry level 0 is ~27% of the total
+	// (settled 4 km census 26206/14842/14662/13389/13383/14332 = 96,814, i.e.
+	// total ~= 3.69 x resident0), so that same reading extrapolates to ~246k
+	// of 262,144 -- 94% full -- and capacity is very much alive. residentAll=
+	// is on the line now so that division cannot be done in someone's head a
+	// second time.
+	//
+	// AND SLOTS ARE NOT THE ONLY WAY THE POOL FILLS. AllocateForChunk evicts
+	// when ANY of the three arenas refuses -- desc, occ, or mat -- so
+	// "residentAll is under capacity" does not clear capacity on its own. The
+	// owner already hit eviction at 59.5% SLOT occupancy once because the mat
+	// arena was the full one (see GVoxelBrickPoolOccMiB's note in
+	// VoxelBrickPool.cpp). The three arena fill percentages are printed for
+	// exactly that reason, and they are what says WHICH capacity to raise. A
+	// 192 -> 288 MiB occ raise that moved evictions 92,012 -> 91,422 (0.6%)
+	// means occ was never the binding arena; with these columns that is one
+	// glance instead of one leg.
+	//
+	// FAILING READINGS, and they point opposite ways on purpose:
+	//   * residentAll and all three arenas well under 100% WHILE evictions
+	//     climb -> eviction is NOT capacity, and the ring exit scan is where
+	//     to look (read `Voxel records/level`: adds far exceeding residency
+	//     with drops and evictions to match is churn).
+	//   * residentAll or any arena at/near 100% -> it IS capacity: the ring
+	//     geometry is ordering more residency than the pool can hold, and no
+	//     hysteresis tuning fixes that. Raise the pool (all three capacities
+	//     move together) or shrink the resident radius.
+	//   * residentAll == resident0 exactly -> the per-level counters are not
+	//     maintained on some path, i.e. this instrument is lying. Credit
+	//     neither conclusion until it is fixed.
 	{
 		FVoxelBrickPool& BrickPool = GetGlobalVoxelBrickPool();
+		const FVoxelBrickPoolConfig& PoolCfg = BrickPool.GetConfig();
+		FString PoolPerLevel;
+		for (int32 L = 0; L < VoxelCoords::kNumLevels; ++L)
+		{
+			PoolPerLevel += FString::Printf(TEXT("%s%d"), L ? TEXT("/") : TEXT(""),
+			                                BrickPool.GetResidentChunkCountAtLevel(L));
+		}
+		auto PctOf = [](double Used, double Cap) { return Cap > 0.0 ? 100.0 * Used / Cap : 0.0; };
 		UE_LOG(LogVoxelPerf, Log,
 		       TEXT("Voxel brick lifetime (5s window): released=%lld absent=%lld | resident0=%d ")
 		       TEXT("indexEntries=%d | cumulative released=%lld evictions=%lld writesDropped=%lld ")
-		       TEXT("neutralShading=%lld"),
+		       TEXT("neutralShading=%lld | residentAll=%d/%u (%.1f%%) perLevel=%s ")
+		       TEXT("arenas desc=%.1f%% occ=%.1f%% mat=%.1f%% | evByDist=%lld allocFail=%lld"),
 		       (long long)BricksReleasedSinceLog, (long long)BricksAbsentSinceLog,
 		       BrickPool.GetResidentChunkCountAtLevel(0),
 		       GetGlobalVoxelMarchChunkIndex().GetNumEntries(),
@@ -11335,7 +11381,25 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 		       // Cover legitimately reads neutral; terrain must not. Printed on
 		       // the line people already read rather than behind a command,
 		       // because a producer nobody plumbed is invisible in the picture.
-		       (long long)BrickPool.GetChunksAddedWithNeutralShading());
+		       (long long)BrickPool.GetChunksAddedWithNeutralShading(),
+		       // APPENDED, never inserted: the columns above are read by eye
+		       // and by anything that counts fields from the left.
+		       BrickPool.GetNumResidentChunks(), PoolCfg.ChunkCapacity,
+		       PctOf(BrickPool.GetNumResidentChunks(), PoolCfg.ChunkCapacity), *PoolPerLevel,
+		       PctOf(BrickPool.GetUsedDescSlots(),
+		             double(PoolCfg.ChunkCapacity) * double(FVoxelBrickPool::kBricksPerChunk)),
+		       PctOf(BrickPool.GetUsedOccWords(), PoolCfg.OccWordCapacity),
+		       PctOf(BrickPool.GetUsedMatWords(), PoolCfg.MatWordCapacity),
+		       // evByDist SPLITS THE EVICTION COUNT BY WHICH ORDER PICKED THE
+		       // VICTIM. Below `evictions` means some evictions ran in
+		       // INSERTION order -- no eviction focus was ever set -- and
+		       // insertion order evicts the chunk that loaded EARLIEST, which
+		       // is the one nearest the player. That reads as churn on every
+		       // downstream counter and is a different bug entirely.
+		       // allocFail > 0 means eviction ran out of victims: capacity or
+		       // fragmentation, and not churn either.
+		       (long long)BrickPool.GetEvictionsByDistance(),
+		       (long long)BrickPool.GetAllocFailures());
 	}
 
 	// THE HOLE METRIC (voxel.March.HoleStats). The owner's complaint is holes
