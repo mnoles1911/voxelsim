@@ -194,3 +194,30 @@ VoxelUINoAssets
 VoxelLoadGateMaxRing
 VoxelLoadMinHold
 VoxelLoadMaxHold
+
+# --- 2026-08-23: far-clipmap appearance (docs/backlog.md 0.0d) ---------------
+# All tuning, diagnosis or configuration; none of them drives the run, so all of
+# them belong here rather than in kSelfDrivingExtras.
+#
+# VoxelClimateSentinelGuard=0 turns OFF the floor that stops terrain writing the
+# byte pattern M_VoxelTerrain/M_VoxelClipmap reserve for a debug marker. It is
+# the A/B arm for the magenta fix, not a feature switch -- passed, cold-and-dry
+# ground draws bright magenta again on purpose. See VoxelClimateProbe.h's
+# kSentinelSafeFloorU8 for the measurement.
+#
+# The four VoxelClipmapSnow*/Snowline* switches move M_VoxelClipmap's snow
+# parameters at runtime through a per-level MID. With none of them passed no MID
+# is created and the frame is byte-identical to one taken before the change,
+# which is why they are tuning rather than a mode.
+#
+# VoxelClipmapColorCensus only adds log lines. It is deliberately NOT named
+# *Check or *Verify: those endings make VoxelFrontEndPolicy treat the whole run
+# as self-driving and suppress the menu, and this switch is meant to be readable
+# on an ordinary interactive flight where the owner is the one looking at the
+# vista.
+VoxelClimateSentinelGuard
+VoxelClipmapSnowlineLowM
+VoxelClipmapSnowlineHighM
+VoxelClipmapSnowTempMax
+VoxelClipmapSnowTempFeather
+VoxelClipmapColorCensus

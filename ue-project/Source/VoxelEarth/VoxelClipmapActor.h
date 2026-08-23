@@ -297,6 +297,117 @@ private:
 	// UVoxelChunkComponent::SetDebugTint/ClearDebugTint).
 	void UpdateDebugTint();
 
+	// ---- SNOW OVERRIDE (why this exists, and why it is off by default) -----
+	//
+	// THE EFFECT: the far clipmap draws flat white over its high ground. Above
+	// 3000 m, 100.0% of this world's land is at full snow.
+	//
+	// M_VoxelClipmap's snow term is the ONLY white in the whole graph -- every
+	// other colour it can produce is a biome, rock grey, or beach tan, none of
+	// them above 0.72 in any channel. The term fires two ways
+	// (Tools/terrain_material_common.py):
+	//
+	//   snow_from_temp = 1 - ramp(VertexColor.B, SnowTempMax, +SnowTempFeather)
+	//   snow_from_z    =     ramp(worldZ_m,  SnowlineLowMeters, SnowlineHighMeters)
+	//   snow           = saturate(max(the two))
+	//
+	// and its four constants were fitted to a world that no longer exists.
+	// terrain_material_common says so in as many words: "the world Z term only
+	// bites above ~2700 m, and THIS WORLD'S HIGHEST POINT IS 2897 m, so it is a
+	// cap on the very tops". The world configured today (DefaultGame.ini
+	// DefaultTileDir, provider 80b9ca451a23eae4, 289 tiles) reaches 6331 m. A
+	// snowline at 93% of the old world's maximum height sits at 43% of this
+	// one's, and "a cap on the very tops" has become most of a mountain range.
+	//
+	// MEASURED on that world's tiles, replaying the graph over all 33,234,574
+	// land pixels (snow weight >= 0.9, i.e. essentially pure snow_color):
+	//
+	//   land overall     12.4%
+	//   land >= 1500 m   44.2%
+	//   land >= 2500 m   87.7%
+	//   land >= 3000 m  100.0%
+	//
+	// WHY THIS IS A RUNTIME OVERRIDE AND NOT AN EDIT TO THE MATERIAL. All four
+	// constants are ScalarParameters on the shipped M_VoxelClipmap.uasset
+	// (verified in its name table: SnowlineLowMeters, SnowlineHighMeters,
+	// SnowTempMax, SnowTempFeather), so a MID can move them with no asset
+	// regeneration at all -- and regenerating a .uasset in this project breaks
+	// dependents silently and has its own procedure.
+	//
+	// WHY IT DEFAULTS TO DOING NOTHING. Where the snowline BELONGS on a 6331 m
+	// world is a judgement about how the world should look, and this is judged
+	// by eye by the owner, not by me. With no switch passed, no MID is created
+	// and no parameter is set, so the frame is byte-identical to one taken
+	// before this change. Pass any of the four and the pair of captures is an
+	// A/B on one binary.
+	//
+	//   -VoxelClipmapSnowlineLowM=<m>      -VoxelClipmapSnowlineHighM=<m>
+	//   -VoxelClipmapSnowTempMax=<0..1>    -VoxelClipmapSnowTempFeather=<0..1>
+	//
+	// A CANDIDATE THAT WAS CHECKED AND IS WRONG, so nobody spends a capture on
+	// it: scaling the old constants by the height ratio (6331/2897) gives about
+	// 5900/6300 m, and this world has only 0.005% of its land above 5900 m --
+	// that is not a higher snowline, it is no snow anywhere. The scaling fails
+	// because the two worlds have different SHAPES, not just different maxima:
+	// this one's p99.9 is 4898 m, so its top 1400 m is a handful of summits.
+	//
+	// The hypsometry, so a number can be picked instead of derived (fraction of
+	// this world's land above each height, all 289 tiles):
+	//
+	//   2700 m  3.18%     3500 m  0.59%     4500 m  0.20%
+	//   3000 m  1.79%     4000 m  0.35%     5000 m  0.08%
+	//
+	// AND WHATEVER IS PICKED MUST MOVE IN TWO PLACES. 2700 m was chosen to match
+	// voxel-core's MAT_SNOW threshold (amplifier.cpp, voxel-core/shaders/
+	// worldgen.ush); moving the material without moving that splits the vista
+	// from the near field at the snowline, which is precisely the class of
+	// divergence terrain_material_common.py was written to end. These switches
+	// are for finding the number by eye, not for shipping it.
+	bool bSnowOverrideActive = false;
+	float SnowlineLowMetersOverride = 2700.f;
+	float SnowlineHighMetersOverride = 2900.f;
+	float SnowTempMaxOverride = 0.16f;
+	float SnowTempFeatherOverride = 0.10f;
+
+	// Per-level MID, created only when something actually needs one (the snow
+	// override at BeginPlay, or voxel.Debug.Rings on a transition). Null entries
+	// mean "this level is drawing the plain shared material", which is the
+	// shipped path and stays the shipped path unless a switch is passed.
+	//
+	// ONE ARRAY FOR BOTH USERS, and that is the point: the debug tint used to
+	// create its own MID and then throw it away by calling SetMaterial(0,
+	// ClipmapMaterial) when the layer turned off. With a second parameter source
+	// on the same material that would have silently reverted the snowline every
+	// time the ring debug layer was toggled off. ApplyLevelMaterial is now the
+	// single place that decides what a level draws with.
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> LevelMIDs;
+
+	// Points a level's PMC at its MID if it needs one, at the plain shared
+	// material if it does not, and re-pushes every parameter the MID owns.
+	// Called from the first build of a level and from every debug-tint
+	// transition, so no path can leave a level holding a material with half its
+	// parameters set.
+	void ApplyLevelMaterial(int32 LevelIndex);
+
+	// -VoxelClipmapColorCensus: after each level rebuild, log what the vertex
+	// colours this actor just wrote will DO in the material -- the fraction
+	// inside the magenta marker gate, the fraction at full snow by each of the
+	// two routes, and how much of each biome-LUT axis is pinned at an end.
+	//
+	// WHY AN INSTRUMENT AND NOT A DESCRIPTION. "The vista is white" and "the
+	// vista is magenta" are the same sentence for four different mechanisms, and
+	// every one of them was a live candidate here (a failed material load, an
+	// unbound parameter, a UV running out of range, a per-band difference). This
+	// turns the screenshot into numbers taken from the ACTUAL run, with the
+	// actual tiles and the actual seed, on the same data the material reads --
+	// which is the only kind of reading that has ever settled one of these.
+	//
+	// The thresholds it applies are copied from Tools/terrain_material_common.py
+	// and are named beside their use in RebuildLevel. If that graph moves and
+	// this does not, the census lies -- so it prints the thresholds it used.
+	bool bColorCensus = false;
+
 	UPROPERTY(Transient)
 	TObjectPtr<USceneComponent> ClipmapRoot;
 

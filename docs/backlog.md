@@ -102,6 +102,174 @@ this order:
 **Judged by eye, by the owner** — this is appearance, so matched captures at a
 fixed pose looking at the horizon, not a metric.
 
+#### DIAGNOSED 2026-08-23 — one cause, two symptoms, and it is not a lookup failure
+
+**The white and the magenta ARE the same defect**, and the thing they share is
+one number: the byte this codebase puts in `VertexColor.B` (temperature) and
+`VertexColor.A` (precipitation) for every terrain vertex. The material paints
+white when the temperature byte is low, and magenta when the temperature byte
+AND the precipitation byte are both at the floor. Nothing is failing to load and
+nothing is unbound.
+
+**Magenta is not UE's missing-material colour here.** UE substitutes a flat
+GREY when a material fails; this magenta is an authored parameter called
+`WaterMarkerColor` (0.90, 0.00, 0.90), and it is present in the shipped
+`M_VoxelClipmap.uasset` (its name table lists `WaterMarkerColor` alongside
+`SnowColor`, `SnowlineLowMeters`, `BiomeLUT` and the rest, so the asset is the
+current graph and it loaded fine). The last thing
+`Tools/terrain_material_common.py` does to BaseColor is
+
+```
+is_marker = (1 - ramp(VertexColor.B, 0.02, 0.06))
+          * (1 - ramp(VertexColor.A, 0.02, 0.06))
+          *      ramp(VertexColor.R, 0.94, 0.98)
+BaseColor = lerp(BaseColor, WaterMarkerColor, saturate(is_marker))
+```
+
+which decodes the `(R=1, B=0, A=0)` sentinel `VoxelQuadVertexFactory.ush` writes
+for `MAT_WATERMARK` debug voxels. But `R` is 255 on every sky-facing land
+surface (`VoxelClimate::BiomeTintForFace`), and `B`/`A` are climate — so any
+ground that is cold enough AND dry enough impersonates the instrument. The
+comment in that file predicted the collision ("ground at p1 temperature AND p1
+precipitation ... would go magenta ... in a debug mode that is already not
+shippable") — but only the WRITER is gated on the debug mode. The DECODER runs
+in every frame of every run.
+
+The white is the snow lerp — the only white anything in the graph can produce
+(every other colour it makes tops out at 0.72 in any channel).
+
+**Why now: the constants were fitted to a different world.** The remap window in
+`VoxelClimateProbe.h` (`kTempU8Lo/Hi = 100/189`, `kPrecipU8Lo/Hi = 14/32`) and
+the snowline in `terrain_material_common.py` (2700/2900 m) were measured on 25
+tiles under provider `3e11cf157a836c70`, cool-temperate maritime, highest point
+2897 m. `DefaultGame.ini` today points at provider `80b9ca451a23eae4` — **289
+tiles, and a different climate**. Measured over all of it (33,234,574 land
+pixels, elevation > 0):
+
+| | old world (what the constants assume) | world configured today |
+|---|---|---|
+| raw precipitation u8 | p1 14, p99 32 | **p1 0, p50 6, p99 52, max 104** |
+| raw temperature u8 | p1 100, p99 189 | p1 89, p50 181, p99 215, max 230 |
+| highest land | 2897 m | **6331 m** |
+
+So the precipitation window `[14, 32]` now clamps **72.9% of all land to byte
+0**, and a snowline chosen to sit at 93% of the old world's maximum height sits
+at 43% of this one's.
+
+**What that does to the picture** (the full graph replayed on those tiles):
+
+| ground | flat white (snow ≥ 0.9) | magenta (marker gate) | neither |
+|---|---|---|---|
+| all land | 12.4% | 4.5% | 85.9% |
+| ≥ 1500 m | 44.2% | 20.9% | 50.8% |
+| ≥ 2500 m | 87.7% | 51.2% | 8.7% |
+| ≥ 3000 m | **100.0%** | 63.4% | **0.0%** |
+| ≥ 4000 m | — | **82.5%** | — |
+
+That is the owner's report line for line: white, turning magenta at the highest
+ground. **It is not a per-band or per-distance effect at all** — distance only
+selects for altitude, because a horizon vista is made of the tallest ground in
+frame. The task's hint that "magenta only at distance argues for a per-band
+difference" is disproved: every band runs the identical shader on identical
+vertex-colour semantics, and level 3 simply contains the mountains.
+
+Two more things fall out of the same measurement. The precipitation axis of
+`T_VoxelBiomeLUT` carries information on only **16.7%** of this world's land
+(72.9% pinned to the dry end, 10.4% to the wet end), and the temperature axis is
+pinned at the hot end on a further 44.9% — so most of the non-snow vista is being
+sampled from one corner of the LUT and has almost no biome variation left to
+show. That is the "no terrain texture at all" half of the complaint, and it is
+NOT fixed by anything below.
+
+#### Fixed in code (no asset regeneration)
+
+* **The magenta.** `VoxelClimate::SampleClimateAtWorldUU` now floors both emitted
+  climate bytes at `kSentinelSafeFloorU8 = 20` (0.078, a 1.3× margin over the
+  material's 0.06 gate), so terrain can no longer write the reserved sentinel.
+  Costs the bottom 7.8% of both LUT axes — roughly a 6% shift along the LUT's
+  dry→wet mix — and **does not touch snow at all** (that gate is at 0.16). The
+  `MAT_WATERMARK` instrument is unaffected: the vertex factory writes a literal
+  `0.0`, not a climate byte. `-VoxelClimateSentinelGuard=0` restores the old
+  behaviour on the same binary for the A/B. Fixes the quad path too.
+* **A knob for the white**, off by default. All four snow constants are
+  ScalarParameters on the shipped asset, so `AVoxelClipmapActor` can move them
+  through a per-level MID with no asset change: `-VoxelClipmapSnowlineLowM=`,
+  `-VoxelClipmapSnowlineHighM=`, `-VoxelClipmapSnowTempMax=`,
+  `-VoxelClipmapSnowTempFeather=`. **Pass none and the frame is byte-identical to
+  before**, because no MID is created. Where the snowline belongs on a 6331 m
+  world is a judgement by eye, not arithmetic — and 2700 m was chosen to match
+  voxel-core's `MAT_SNOW` threshold, so moving one without the other splits the
+  vista from the near field at the snowline.
+* **`-VoxelClipmapColorCensus`** logs, per level rebuild, what the vertex colours
+  just written will do in the material: % inside the marker gate, % at full snow
+  by each route, and how much of each LUT axis is pinned. Turns "the vista is
+  white" into numbers from the real run.
+* `ApplyLevelMaterial` is now the single place a level's material is set. The old
+  `UpdateDebugTint` **discarded** the MID whenever the ring debug layer was
+  switched off, which was harmless with only `DebugTint` on it and would have
+  silently reverted the snowline the moment a second parameter existed.
+* The material-load check now logs on SUCCESS as well as failure. Ruling
+  `StaticLoadObject` in was the first question asked of this defect and the log
+  could not answer it.
+
+#### Still open — needs an asset regeneration, so deliberately NOT done
+
+Regenerating any of these must go through **`tools/voxel-sky-chain-regen.ps1`**,
+which discovers every dependent of `MPC_VoxelSky` (`create_clipmap_material.py`
+is in its ORDER list), rebuilds in order, and refuses the run if a pinned-pose
+capture moved.
+
+1. **Gate the debug-marker term properly.** The floor above stops terrain
+   impersonating the sentinel, but the right fix is that the decode should not
+   exist in a shipping material at all, or should key off something terrain can
+   never produce. Touches `terrain_material_common.py`, so both
+   `M_VoxelClipmap` and `M_VoxelTerrain`.
+2. **Re-measure the climate remap window for THIS world** and regenerate
+   `T_VoxelBiomeLUT` with matching axes in the same commit. The window and the
+   LUT axes are two copies of the same numbers; `VoxelClimateProbe.h`'s
+   `static_assert`s exist to stop one moving without the other. This is what
+   would give the vista its biome colour back on the 83.3% of land whose
+   precipitation is currently pinned to an axis end.
+3. **Retune the snowline against voxel-core's `MAT_SNOW`**, once the owner has
+   picked a number by eye with the runtime switches above. Both must move
+   together or the near field and the vista disagree at the snowline.
+
+#### The capture that shows it
+
+The pose matters more than usual here, because the defect lives on ground above
+2500 m: a vista with no mountains in it looks identical in both arms. This site
+was picked off the configured tiles rather than guessed (the block-mean
+elevation mosaic over all 289 tiles, then the lowest land in a ring around the
+biggest massif). **Camera on 398 m ground at world (-9524, -40563) m; the massif
+centred at (-31440, -42480) m, 22 km away, mean 5333 m over a 4 km box with a
+6061 m peak; bearing 185°.** From 2500 m up, that summit sits ~8° above the
+horizon, so a level camera frames the far band and the peaks together.
+
+```powershell
+# AFTER (shipped default: the sentinel guard is on)
+tools\voxel-capture.ps1 -Name clipmap-0d-after `
+    -SpawnAt -9524,-40563 -SpawnAltM 2500 -SpawnPitch 0 -SpawnYaw 185 `
+    -SettleSec 180 -ExtraArgs "-VoxelClipmapColorCensus"
+
+# BEFORE, same binary, same pose -- the magenta comes back
+tools\voxel-capture.ps1 -Name clipmap-0d-before `
+    -SpawnAt -9524,-40563 -SpawnAltM 2500 -SpawnPitch 0 -SpawnYaw 185 `
+    -SettleSec 180 -ExtraArgs "-VoxelClimateSentinelGuard=0","-VoxelClipmapColorCensus"
+```
+
+The census lines land in the same log, so the picture arrives with its numbers.
+
+To try a snowline by eye, add e.g.
+`-ExtraArgs "-VoxelClipmapSnowlineLowM=3500","-VoxelClipmapSnowlineHighM=3800"`
+to a third capture. That is a knob to turn, not a recommendation — and one
+candidate is already **disproved**: scaling the old constants by the height
+ratio (6331/2897) gives ~5900/6300 m, and only **0.005%** of this world's land
+is above 5900 m, so that is not a higher snowline, it is no snow at all. The two
+worlds differ in SHAPE, not just in maximum: this one's p99.9 is 4898 m. The
+hypsometry, so the next person picks rather than derives — fraction of land
+above each height: 2700 m 3.18%, 3000 m 1.79%, 3500 m 0.59%, 4000 m 0.35%,
+4500 m 0.20%, 5000 m 0.08%.
+
 ### 0.0e A diagnostic flag shipped in the launch script for a session
 
 `tools/voxel-launch-prototype.ps1` passed **`-VoxelNoClipmap`**, copied out of the

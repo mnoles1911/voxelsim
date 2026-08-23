@@ -30,6 +30,13 @@ namespace
 	int32 GLoadedTiles = 0;
 	bool GUsingTileGrid = false;
 
+	// -VoxelClimateSentinelGuard=0 turns the floor off. Resolved ONCE, under
+	// GInitLock, for the same reason the sampler is: SampleClimateAtWorldUU runs
+	// on meshing workers, and FCommandLine::Get() per vertex would be both a
+	// waste and a data race waiting to happen. See kSentinelSafeFloorU8 in the
+	// header for what the floor is and why it exists.
+	bool GSentinelGuard = true;
+
 	// Deliberately a copy of VoxelWorldSubsystem.cpp's MakeTileSampler scan,
 	// not a call into it: that file is off-limits to this change, and its
 	// version is a file-local static anyway. The two must agree about which
@@ -144,11 +151,20 @@ void EnsureInitialized()
 	FScopeLock Lock(&GInitLock);
 	if (GInitialized) { return; }
 	LoadTiles();
+
+	int32 GuardFlag = 1;
+	if (FParse::Value(FCommandLine::Get(), TEXT("VoxelClimateSentinelGuard="), GuardFlag))
+	{
+		GSentinelGuard = (GuardFlag != 0);
+	}
+
 	GInitialized = true;
 	UE_LOG(LogVoxelEarth, Log,
-	       TEXT("VoxelClimateProbe: %s, tiles=%d, remap temp u8 [%d,%d] precip u8 [%d,%d]"),
+	       TEXT("VoxelClimateProbe: %s, tiles=%d, remap temp u8 [%d,%d] precip u8 [%d,%d], sentinel guard %s (floor %d)"),
 	       GUsingTileGrid ? TEXT("tile grid") : TEXT("SYNTHETIC (no -VoxelTileDir)"),
-	       GLoadedTiles, kTempU8Lo, kTempU8Hi, kPrecipU8Lo, kPrecipU8Hi);
+	       GLoadedTiles, kTempU8Lo, kTempU8Hi, kPrecipU8Lo, kPrecipU8Hi,
+	       GSentinelGuard ? TEXT("ON") : TEXT("OFF -- cold+dry terrain will draw MAGENTA"),
+	       GSentinelGuard ? kSentinelSafeFloorU8 : 0);
 }
 
 uint8 BiomeTintForFace(uint8 /*MaterialId*/, int32 FaceAxis, bool bFacePositive)
@@ -219,10 +235,29 @@ FVoxelClimateBytes SampleClimateAtWorldUU(double WorldXUU, double WorldYUU)
 	// Remap the measured p1..p99 window onto the full byte. Values outside it
 	// clamp rather than wrap -- the window is p1..p99 precisely so the 2% of
 	// outliers saturate at the ends of the LUT instead of compressing the 98%.
-	auto Remap = [](double Raw, int32 Lo, int32 Hi) -> uint8
+	//
+	// THE FLOOR IS NOT PART OF THE REMAP, it is a guard on what this function is
+	// allowed to emit. kSentinelSafeFloorU8's comment has the whole story: the
+	// bottom of both channels is reserved by the terrain materials for a debug
+	// marker, and terrain that lands there is painted magenta. Applied AFTER the
+	// clamp, so it lifts exactly the values the window pushed to zero and leaves
+	// every in-window value alone.
+	//
+	// "p1..p99 means only 1% clamps" is true of the world this window was
+	// measured on and false of the one configured today: precipitation clamps to
+	// zero on 72.9% of its land. That is a separate defect -- the window itself
+	// is stale -- and it CANNOT be fixed here, because kTempU8Lo/Hi and
+	// kPrecipU8Lo/Hi are also baked into T_VoxelBiomeLUT's axes by
+	// Tools/gen_terrain_textures.py, and moving one without regenerating the
+	// other silently shifts every biome. The static_asserts on those constants
+	// say so, and they are why this change guards the emission instead of
+	// retuning the window.
+	const bool bGuard = GSentinelGuard;
+	auto Remap = [bGuard](double Raw, int32 Lo, int32 Hi) -> uint8
 	{
 		const double T = (Raw - double(Lo)) / double(FMath::Max(Hi - Lo, 1));
-		return (uint8)FMath::Clamp(FMath::RoundToInt(T * 255.0), 0, 255);
+		const int32 Byte = FMath::Clamp(FMath::RoundToInt(T * 255.0), 0, 255);
+		return (uint8)(bGuard ? FMath::Max(Byte, kSentinelSafeFloorU8) : Byte);
 	};
 
 	Out.Temperature = Remap(TempRaw, kTempU8Lo, kTempU8Hi);

@@ -156,11 +156,49 @@ void AVoxelClipmapActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	if (!ClipmapMaterial)
+	// LOG THE SUCCESS TOO, not only the failure. "Does StaticLoadObject actually
+	// return the material at runtime" was the first question asked of the
+	// white-clipmap defect, and the honest answer from a log that only speaks up
+	// on failure is "probably, but nothing in the run says so". A null here gives
+	// every level UE's stand-in material, which is a flat grey -- so it is worth
+	// ruling in or out in one line rather than inferring it from the picture.
+	//
+	// (For the record, on the reported defect it is NOT this: the magenta is an
+	// authored WaterMarkerColor parameter and the white is the snow term, both of
+	// which require the real material to be loaded and shading. See
+	// VoxelClimateProbe.h's kSentinelSafeFloorU8 and this class's snow-override
+	// block. Nothing about that makes the line below less worth having.)
+	if (ClipmapMaterial)
+	{
+		UE_LOG(LogVoxelEarth, Log, TEXT("VoxelClipmap material: loaded '%s' for %d levels."),
+		       *ClipmapMaterial->GetName(), NumLevels);
+	}
+	else
+	{
+		UE_LOG(LogVoxelEarth, Error,
+		       TEXT("VoxelClipmap material: /Game/Voxel/M_VoxelClipmap did NOT load -- every clipmap level is drawing ")
+		       TEXT("with the engine default material (flat grey, no biome colour, no snow, no vertex colours read at all)."));
+	}
+
+	// Snow override + colour census. Both read here, once, and NOT as cvars, for
+	// the reason bVeilEnabled's declaration gives (and the veil block a few
+	// dozen lines below repeats): -ExecCmds lands after systems initialise, so a
+	// cvar can silently measure the same state twice.
+	bSnowOverrideActive |= FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapSnowlineLowM="), SnowlineLowMetersOverride);
+	bSnowOverrideActive |= FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapSnowlineHighM="), SnowlineHighMetersOverride);
+	bSnowOverrideActive |= FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapSnowTempMax="), SnowTempMaxOverride);
+	bSnowOverrideActive |= FParse::Value(FCommandLine::Get(), TEXT("VoxelClipmapSnowTempFeather="), SnowTempFeatherOverride);
+	if (bSnowOverrideActive)
 	{
 		UE_LOG(LogVoxelEarth, Warning,
-		       TEXT("M_VoxelClipmap not found at /Game/Voxel/M_VoxelClipmap -- clipmap levels using the engine default material."));
+		       TEXT("VoxelClipmap snow OVERRIDDEN: snowline %.0f-%.0f m, SnowTempMax %.3f feather %.3f ")
+		       TEXT("(shipped material defaults are 2700-2900 m, 0.160, 0.100). This changes what is drawn."),
+		       SnowlineLowMetersOverride, SnowlineHighMetersOverride, SnowTempMaxOverride, SnowTempFeatherOverride);
 	}
+
+	bColorCensus = FParse::Param(FCommandLine::Get(), TEXT("VoxelClipmapColorCensus"));
+
+	LevelMIDs.SetNum(NumLevels);
 
 	// Load the climate tiles here, on the game thread, before the first clipmap
 	// rebuild and before any meshing worker can need them. The probe is
@@ -805,6 +843,76 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		}
 	}
 
+	// ---- COLOUR CENSUS (-VoxelClipmapColorCensus) --------------------------
+	//
+	// What the vertex colours just written will DO once M_VoxelClipmap shades
+	// them. Every threshold below is transcribed from
+	// Tools/terrain_material_common.py's build_terrain_base_color and is printed
+	// with the line, so a reading taken after that graph moves is obviously
+	// suspect instead of quietly wrong.
+	//
+	// This is a per-VERTEX census, not a per-pixel or per-area one. A clipmap
+	// vertex covers 256 m at level 0 and 2048 m at level 3, so a level's numbers
+	// are area-weighted by construction WITHIN that level, but the four levels
+	// cover wildly different areas and must not be summed. Read one line at a
+	// time -- and note that level 3 is the band the horizon is made of.
+	if (bColorCensus)
+	{
+		// terrain_material_common.py, verbatim:
+		//   is_marker = (1-ramp(B,0.02,0.06)) * (1-ramp(A,0.02,0.06)) * ramp(R,0.94,0.98)
+		//   snow_from_temp = 1 - ramp(B, SnowTempMax, SnowTempMax+SnowTempFeather)
+		//   snow_from_z    =     ramp(worldZ_m, SnowlineLowMeters, SnowlineHighMeters)
+		constexpr float kMarkerLo = 0.02f, kMarkerHi = 0.06f;
+		constexpr float kMarkerRLo = 0.94f, kMarkerRHi = 0.98f;
+		const float SnowTempMax = bSnowOverrideActive ? SnowTempMaxOverride : 0.16f;
+		const float SnowTempFeather = bSnowOverrideActive ? SnowTempFeatherOverride : 0.10f;
+		const float SnowLowM = bSnowOverrideActive ? SnowlineLowMetersOverride : 2700.f;
+		const float SnowHighM = bSnowOverrideActive ? SnowlineHighMetersOverride : 2900.f;
+
+		auto Ramp = [](float V, float Lo, float Hi) { return FMath::Clamp((V - Lo) / FMath::Max(Hi - Lo, 1e-6f), 0.f, 1.f); };
+
+		int32 Marker = 0, SnowByTemp = 0, SnowByZ = 0, PrecipPinnedLo = 0, PrecipPinnedHi = 0, TempPinnedLo = 0, TempPinnedHi = 0;
+		for (int32 Idx = 0; Idx < NumVertsTotal; ++Idx)
+		{
+			const FColor& C = VertexColors[Idx];
+			const float R = float(C.R) / 255.f;
+			const float B = float(C.B) / 255.f;
+			const float A = float(C.A) / 255.f;
+			const float ZM = float(HeightsUU[Idx] / 100.0);
+
+			if ((1.f - Ramp(B, kMarkerLo, kMarkerHi)) * (1.f - Ramp(A, kMarkerLo, kMarkerHi)) * Ramp(R, kMarkerRLo, kMarkerRHi) >= 0.5f)
+			{
+				++Marker;
+			}
+			if (1.f - Ramp(B, SnowTempMax, SnowTempMax + SnowTempFeather) >= 0.9f) { ++SnowByTemp; }
+			if (Ramp(ZM, SnowLowM, SnowHighM) >= 0.9f) { ++SnowByZ; }
+			// "Pinned" = the remap clamped this vertex onto an END of the biome
+			// LUT axis, where it carries no information at all. This is the
+			// number that says whether the vista has biome colour to lose.
+			// <= the floor, not == it: with the sentinel guard ON nothing is
+			// below the floor so this is exactly the clamped set, and with it
+			// OFF (-VoxelClimateSentinelGuard=0) it still counts the same
+			// ground rather than reading 0% and looking like a fix.
+			if (C.A <= VoxelClimate::kSentinelSafeFloorU8) { ++PrecipPinnedLo; }
+			if (C.A == 255) { ++PrecipPinnedHi; }
+			if (C.B <= VoxelClimate::kSentinelSafeFloorU8) { ++TempPinnedLo; }
+			if (C.B == 255) { ++TempPinnedHi; }
+		}
+
+		const float Inv = 100.f / float(NumVertsTotal);
+		UE_LOG(LogVoxelEarth, Log,
+		       TEXT("VoxelClipmapColorCensus L%d spacing=%.0f m verts=%d | MAGENTA(marker gate) %.1f%% | ")
+		       TEXT("SNOW by temp %.1f%% by altitude %.1f%% | LUT precip axis pinned lo/hi %.1f%%/%.1f%% ")
+		       TEXT("temp axis pinned lo/hi %.1f%%/%.1f%% | thresholds marker(%.2f,%.2f,R %.2f,%.2f) ")
+		       TEXT("snowTemp(%.3f,+%.3f) snowline(%.0f,%.0f m)"),
+		       LevelIndex, Spacing / 100.0, NumVertsTotal,
+		       float(Marker) * Inv, float(SnowByTemp) * Inv, float(SnowByZ) * Inv,
+		       float(PrecipPinnedLo) * Inv, float(PrecipPinnedHi) * Inv,
+		       float(TempPinnedLo) * Inv, float(TempPinnedHi) * Inv,
+		       kMarkerLo, kMarkerHi, kMarkerRLo, kMarkerRHi,
+		       SnowTempMax, SnowTempFeather, SnowLowM, SnowHighM);
+	}
+
 	// Pass 3: seam treatment at the outer grid edge (position only, after
 	// normals/colors are computed from the true surface).
 	//
@@ -930,10 +1038,12 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		// instead, which is strictly cheaper (no scene proxy recreation).
 		PMC->CreateMeshSection(0, Positions, SharedTriangles, Normals, SharedUV0, VertexColors, TArray<FProcMeshTangent>(),
 		                       /*bCreateCollision*/ false);
-		if (ClipmapMaterial)
-		{
-			PMC->SetMaterial(0, ClipmapMaterial);
-		}
+		// Through ApplyLevelMaterial, not SetMaterial directly: with a snow
+		// override in play the first build is where the level has to pick up its
+		// MID, and a bare SetMaterial here would give level 0 the plain material
+		// and leave the override applying to nothing until the next debug
+		// toggle. See ApplyLevelMaterial's comment.
+		ApplyLevelMaterial(LevelIndex);
 	}
 	else
 	{
@@ -965,6 +1075,74 @@ bool AVoxelClipmapActor::GetCameraLocationUU(FVector& OutCameraLocationUU) const
 	return false;
 }
 
+// The ONE place that decides what material a clipmap level draws with, and the
+// one place that pushes parameters into it.
+//
+// WHY IT IS ONE PLACE NOW. There used to be three: RebuildLevel's first build
+// set the shared material, UpdateDebugTint created a MID when the ring debug
+// layer came on, and UpdateDebugTint set the shared material back when it went
+// off -- which THREW THE MID AWAY. With DebugTint the only parameter that ever
+// moved, throwing it away was harmless (the tint's whole purpose is to be
+// temporary). It stops being harmless the moment a second parameter source
+// exists, because toggling an unrelated debug layer off would silently revert
+// it, and a parameter that reverts when you press something else is the hardest
+// kind of appearance bug to reproduce.
+//
+// A level gets a MID only if something actually needs one. With no switches
+// passed and the ring layer off, every level holds the plain shared material
+// exactly as it always did, and this function allocates nothing.
+void AVoxelClipmapActor::ApplyLevelMaterial(int32 LevelIndex)
+{
+	UProceduralMeshComponent* PMC = LevelMeshes.IsValidIndex(LevelIndex) ? LevelMeshes[LevelIndex] : nullptr;
+	if (!PMC || !ClipmapMaterial)
+	{
+		return;
+	}
+	if (!LevelMIDs.IsValidIndex(LevelIndex))
+	{
+		LevelMIDs.SetNum(NumLevels);
+	}
+
+	const bool bNeedsMID = bSnowOverrideActive || bLastRingsEnabled;
+	if (!bNeedsMID)
+	{
+		LevelMIDs[LevelIndex] = nullptr;
+		PMC->SetMaterial(0, ClipmapMaterial);
+		return;
+	}
+
+	// UProceduralMeshComponent derives from UMeshComponent (unlike
+	// UVoxelChunkComponent's bare UPrimitiveComponent), so the built-in helper
+	// is available directly. Called again on a later transition it returns the
+	// component's existing MID rather than making a second one.
+	UMaterialInstanceDynamic* MID = PMC->CreateDynamicMaterialInstance(0, ClipmapMaterial);
+	LevelMIDs[LevelIndex] = MID;
+	if (!MID)
+	{
+		return;
+	}
+
+	// EVERY parameter, every time, not just the one that changed. The cost is
+	// four SetScalar calls on a transition that happens at most once per level
+	// per debug toggle; the alternative is tracking which parameter is stale in
+	// which order, which is how the throw-away above got missed in the first
+	// place.
+	if (bSnowOverrideActive)
+	{
+		MID->SetScalarParameterValue(TEXT("SnowlineLowMeters"), SnowlineLowMetersOverride);
+		MID->SetScalarParameterValue(TEXT("SnowlineHighMeters"), SnowlineHighMetersOverride);
+		MID->SetScalarParameterValue(TEXT("SnowTempMax"), SnowTempMaxOverride);
+		MID->SetScalarParameterValue(TEXT("SnowTempFeather"), SnowTempFeatherOverride);
+	}
+
+	// docs/debug-tooling-plan.md P1 palette: "heightmap band cyan". Opaque white
+	// is the multiplicative identity the material ships with, so setting it
+	// explicitly when the layer is off is how the tint gets CLEARED now that the
+	// MID is no longer discarded.
+	MID->SetVectorParameterValue(TEXT("DebugTint"),
+	                             bLastRingsEnabled ? VoxelDebug::HeightmapBandTint() : FLinearColor::White);
+}
+
 void AVoxelClipmapActor::UpdateDebugTint()
 {
 	const bool bRingsEnabled = VoxelDebug::IsRingsEnabled();
@@ -974,26 +1152,9 @@ void AVoxelClipmapActor::UpdateDebugTint()
 	}
 	bLastRingsEnabled = bRingsEnabled;
 
-	for (UProceduralMeshComponent* PMC : LevelMeshes)
+	for (int32 Level = 0; Level < NumLevels; ++Level)
 	{
-		if (!PMC)
-		{
-			continue;
-		}
-		if (bRingsEnabled)
-		{
-			// UProceduralMeshComponent derives from UMeshComponent (unlike
-			// UVoxelChunkComponent's bare UPrimitiveComponent), so the
-			// built-in helper is available directly.
-			if (UMaterialInstanceDynamic* MID = PMC->CreateDynamicMaterialInstance(0, ClipmapMaterial))
-			{
-				MID->SetVectorParameterValue(TEXT("DebugTint"), VoxelDebug::HeightmapBandTint());
-			}
-		}
-		else if (ClipmapMaterial)
-		{
-			PMC->SetMaterial(0, ClipmapMaterial);
-		}
+		ApplyLevelMaterial(Level);
 	}
 }
 

@@ -94,14 +94,106 @@ namespace VoxelClimate
 	static_assert(kPrecipU8Lo == 14 && kPrecipU8Hi == 32,
 	              "the precipitation LUT axis must not move -- see above");
 
+	// --- THE RESERVED SENTINEL BAND ------------------------------------------
+	//
+	// TERRAIN MUST NEVER WRITE A CLIMATE BYTE BELOW THIS. Not a taste value --
+	// the material reserves the bottom of both climate channels for a debug
+	// instrument, and terrain that lands there is painted bright magenta.
+	//
+	// WHAT THE MATERIAL DOES. Tools/terrain_material_common.py's "DEBUG WATER
+	// MARKER" block, which both M_VoxelTerrain and M_VoxelClipmap carry, ends
+	// their BaseColor with
+	//
+	//   is_marker = (1 - ramp(VertexColor.B, 0.02, 0.06))
+	//             * (1 - ramp(VertexColor.A, 0.02, 0.06))
+	//             *      ramp(VertexColor.R, 0.94, 0.98)
+	//   BaseColor = lerp(BaseColor, WaterMarkerColor /* 0.90, 0.00, 0.90 */,
+	//                    saturate(is_marker))
+	//
+	// It decodes the (R=1, B=0, A=0) sentinel VoxelQuadVertexFactory.ush writes
+	// for vxc::MAT_WATERMARK voxels. But B and A are TEMPERATURE and
+	// PRECIPITATION, and R is 255 on every sky-facing land surface, so any
+	// terrain that is cold enough AND dry enough satisfies all three terms and
+	// is drawn as if it were a debug marker.
+	//
+	// THE MAGENTA IS NOT A MISSING MATERIAL. UE's stand-in for a failed material
+	// load is grey, not magenta; this magenta is an authored parameter
+	// (WaterMarkerColor) in a material that loaded fine. terrain_material_common
+	// even predicted the collision -- "ground at p1 temperature AND p1
+	// precipitation also reads (0,0) and would go magenta ... in a debug mode
+	// that is already not shippable" -- but the marker term is NOT gated on that
+	// debug mode in the material, only its WRITER is, so it fires in every run.
+	//
+	// HOW MUCH GROUND, MEASURED. Replaying the whole graph on the CURRENTLY
+	// configured world (DefaultGame.ini DefaultTileDir,
+	// terrain-diffusion-unlabeled-80b9ca451a23eae4/000000000135276f/s1, all 289
+	// tiles, 33,234,574 land pixels):
+	//
+	//   land overall      4.5% inside the marker gate
+	//   land >= 1500 m   20.9%
+	//   land >= 2500 m   51.2%
+	//   land >= 3000 m   63.4%
+	//   land >= 4000 m   82.5%
+	//
+	// That is the owner's report exactly: magenta at the highest ground, which
+	// from a horizon vista is the farthest ground. It is not a per-band or a
+	// per-distance effect at all -- distance only selects for altitude.
+	//
+	// WHY IT ONLY APPEARED NOW. The window this file remaps into (kTempU8Lo/Hi,
+	// kPrecipU8Lo/Hi below) was measured on a DIFFERENT world: 25 tiles under
+	// provider 3e11cf157a836c70, cool-temperate maritime, highest point 2897 m.
+	// The world configured today is 289 tiles under provider
+	// 80b9ca451a23eae4 and is neither: raw precipitation runs p1=0 p50=6 p99=52
+	// against a [14, 32] window, so 72.9% of its land clamps to precipitation
+	// byte 0, and elevation reaches 6331 m. A window that clamped ~1% of the old
+	// world to zero clamps three quarters of this one.
+	//
+	// WHY 20 AND NOT 16. 16/255 = 0.0627 is the smallest byte that closes the
+	// 0.06 gate, and 20/255 = 0.0784 is that with a 1.3x margin. The margin is
+	// there because the exact byte-to-shader transform on this path is NOT
+	// pinned: the note further down records a probe reading VertexColor.R back
+	// as ~6-8 where the CPU wrote 4. (That probe fed an unlit emissive through
+	// the TONEMAPPER and assumed a ratio against a 0.5 reference survives it. A
+	// filmic tonemap is not a per-channel linear scale, so the ratio does not
+	// survive, and the reading is not evidence of a transform on the vertex
+	// stream -- but it is not evidence against one either, so this leaves room.)
+	//
+	// WHAT IT COSTS. The bottom 7.8% of both LUT axes becomes unreachable. On
+	// this world that moves 72.9% of land's precipitation axis from 0.000 to
+	// 0.078 and 4.5% of land's temperature axis likewise -- about a 6% shift
+	// along the LUT's dry->wet mix, e.g. warm-dry (0.40, 0.34, 0.17) becomes
+	// (0.375, 0.331, 0.162). It does NOT touch snow: the snow term's gate is at
+	// temperature 0.16, more than twice this floor, so every vertex that was
+	// full snow before still is.
+	//
+	// THE DEBUG MARKER STILL WORKS. VoxelQuadVertexFactory.ush writes a LITERAL
+	// 0.0 into B and A for a MAT_WATERMARK quad ("bMarker ? 0.0f :
+	// ChunkClimate.x"), not a climate byte, so it never passes through this
+	// function and the floor cannot reach it. What the floor removes is only the
+	// false positives -- terrain impersonating the instrument.
+	//
+	// -VoxelClimateSentinelGuard=0 restores the unfloored bytes on the same
+	// binary, so the magenta can be photographed before and after without two
+	// builds. It defaults ON because it is a fix to a lookup that was reading
+	// terrain as an instrument, not a change of intent about what the world
+	// should look like.
+	inline constexpr int32 kSentinelSafeFloorU8 = 20;
+
 	// Samples the tile climate planes at a world XY (unreal units) and returns
 	// the remapped bytes. Bilinear across tile pixels, so the 30 m raster does
 	// not show up as 30 m colour blocks.
 	//
 	// Thread-safe: the underlying TileGridSampler is immutable after init and its
 	// queries are pure reads. Safe to call from the meshing worker tasks.
+	//
 	// Outside the loaded tile box (or with no -VoxelTileDir) it returns the
-	// neutral 128/128, which lands mid-LUT rather than at a corner.
+	// neutral 128/128, which lands mid-LUT rather than at a corner. WRONG SINCE
+	// the ClimateSample default became "a bland plausible climate" instead of
+	// zeros (voxelcore/tiles.h): a missing tile now reads 10 degC / 800 mm/yr,
+	// which through this file's remap is temperature 169 and precipitation 42,
+	// not 128/128. Still mid-LUT, still not a corner, so nothing downstream
+	// changes -- but the numbers in this sentence were never re-derived and are
+	// corrected here rather than left to be quoted again.
 	FVoxelClimateBytes SampleClimateAtWorldUU(double WorldXUU, double WorldYUU);
 
 	// Called once, early, from the game thread. Reads -VoxelTileDir /
