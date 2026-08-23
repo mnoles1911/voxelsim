@@ -595,6 +595,10 @@ private:
 	int64 WorklistStampConverted = 0;
 	// P3 Pack (cumulative, wlpack line): a subset of WorklistCtConverted.
 	int64 WorklistPackConverted = 0;
+	// P3 Claim (cumulative, wlclaim line): a subset of WorklistPackConverted.
+	// A claim-fed job adds ZERO brick passes to the batch graph -- the whole
+	// chain runs in the flush graph, stage 6's point.
+	int64 WorklistClaimConverted = 0;
 	int64 WorklistSkipNoPack = 0;    // no brick region (quad-only leg, or shell refused)
 	int64 WorklistSkipQuadMesh = 0;  // job still emits quads (RetireQuads off)
 	int64 WorklistSkipBand = 0;      // job carries its footprint's band readback

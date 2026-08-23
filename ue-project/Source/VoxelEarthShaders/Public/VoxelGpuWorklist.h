@@ -14,7 +14,16 @@
 // between the voxelize and classify dispatches. ASSET CHUNKS thereby enter
 // the whole cell-arena chain. Byte gate: -VoxelGpuWorklistVerifyStamp=1 into
 // stats [10..11] (classic voxelize + per-instance stamps as the reference).
-// Three stages remain: PackClaim, Write, Record.
+//
+// Behind -VoxelGpuWorklistClaim=1 (on top of the Pack switch) the flush graph
+// ALSO dispatches the Claim stage -- the claim + the four pool writes as
+// THREE indirect dispatches per tick (VoxelWorklistClaim.usf has the whole
+// argument) -- and a claim-fed chunk has NO brick work in the batch graph at
+// all: production is fully inside the flush graph, per-chunk batch passes
+// 5 -> 0, and the pass term goes FLAT in N (the spine constant plus nothing
+// per chunk). Byte gate: -VoxelGpuWorklistVerifyClaim=1 into stats [14..15]
+// (the LANDED pool state vs the stage's own sources through the shared
+// factored text). ALL SEVEN GENERATION STAGES ARE CONVERTED.
 //
 // Behind -VoxelGpuWorklistClassify=1 (on top of the Voxelize switch) the
 // flush graph ALSO dispatches the fused ClassifyTotals pair -- one group per
@@ -80,8 +89,10 @@
 
 #include "CoreMinimal.h"
 #include "RenderGraphResources.h"
+#include "VoxelBrickPool.h"   // FVoxelBrickPoolAllocLayout -- the Claim stage binds the pool
 
 class FRDGBuilder;
+class FRHICommandListImmediate;
 class FRHIGPUBufferReadback;
 class FVoxelRasterAtlasGpu;
 
@@ -105,7 +116,12 @@ struct FVoxelGpuChunkWorkRecord
 	uint32 ShadingClimatePacked = 0;   // FVoxelBrickChunkShading::Pack's three dwords
 	uint32 ShadingGradPacked = 0;
 	uint32 ShadingSurfaceZBits = 0;
-	uint32 Reserved[5] = {0, 0, 0, 0, 0};
+	// The CPU-dispensed descriptor-block base (the shell's BrickBase) -- the
+	// one claim/write input the Claim stage needs that is neither derivable
+	// from the origin fields nor a process-wide constant. Truthful on every
+	// record (the AssetCount precedent).
+	uint32 BrickBase = 0;
+	uint32 Reserved[4] = {0, 0, 0, 0};
 };
 static_assert(sizeof(FVoxelGpuChunkWorkRecord) == 64, "the 64-byte record IS the contract");
 
@@ -200,6 +216,15 @@ public:
 	static constexpr uint32 kMatWordsPerRecord = kBricksPerRecord * 132;
 	static constexpr uint32 kSkipWordsPerRecord = kOccWordsPerRecord / 16 * 2;
 	static constexpr uint32 kMaskDwordsPerRecord = 2;
+	// The Claim stage (stage 6): the word-copy dispatch rides the Write
+	// triple at worst-case groups -- (1,024 occ + 8,448 mat) / 64 threads =
+	// 148 per record, the classic copies' own worst-case-dispatch decision.
+	// The claim, desc+record and verify dispatches ride the Record triple
+	// (1 group per record, the prover's shape). 8 dwords of claim slice per
+	// record, the classic claim's own contract.
+	static constexpr uint32 kWriteGroupsPerRecord =
+		(kOccWordsPerRecord + kMatWordsPerRecord) / 64;
+	static constexpr uint32 kClaimDwordsPerRecord = 8;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
 	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's
@@ -207,7 +232,8 @@ public:
 	// (VoxelWorklistClassify.usf), [10..11] the asset-stamp verify's (the
 	// voxelize verify kernel with VerifyStatsBase 10 -- it compares the
 	// stamped cells), [12..13] the pack verify's (VoxelWorklistPack.usf),
-	// [14..15] reserved for the remaining stages.
+	// [14..15] the claim verify's (VoxelWorklistClaim.usf -- [14]
+	// mismatches, [15] dwords checked).
 	static constexpr uint32 kStatsDwords = 16;
 
 	~FVoxelGpuWorklist();
@@ -287,6 +313,50 @@ public:
 	// bases FRegionGraphResources carries.
 	void SetPackStageArmed(bool bArmed) { bPackStageArmed = bArmed; }
 	bool IsPackStageArmed() const { return bPackStageArmed && IsClassifyStageArmed(); }
+
+	// --- the Claim stage (-VoxelGpuWorklistClaim; P3 stage 6) ---------------
+	//
+	// The claim + the four pool writes, moved into the flush graph as three
+	// indirect dispatches per tick (see VoxelWorklistClaim.usf's banner). A
+	// claim-fed job adds ZERO brick passes to the batch graph; delivery keeps
+	// the lean-alloc shape.
+	//
+	// The pool's alloc buffers are registered into the flush graph through a
+	// BINDER the manager supplies (the plan doc's decision: the worklist does
+	// not include the pool's lifecycle). It runs on the RENDER thread inside
+	// the flush command, must EnsureCreated the buffers and register them
+	// into the given graph, and returns false when the allocator is
+	// unavailable -- the flush then skips the claim dispatches for that tick
+	// and the stage stays dark (the host counted nothing claim-fed either,
+	// because arming is what it keys on... see the eligibility note below).
+	struct FPoolBindings
+	{
+		FRDGBufferRef PoolDesc = nullptr;
+		FRDGBufferRef PoolOcc = nullptr;
+		FRDGBufferRef PoolMat = nullptr;
+		FRDGBufferRef PoolTable = nullptr;
+		FRDGBufferRef AllocState = nullptr;
+		FRDGBufferRef AllocBitmap = nullptr;
+		FRDGBufferRef AllocSide = nullptr;
+		FVoxelBrickPoolAllocLayout Layout;
+		uint32 ChunkRecordDwords = 0;
+		bool IsValid() const
+		{
+			return PoolDesc && PoolOcc && PoolMat && PoolTable
+			    && AllocState && AllocBitmap && AllocSide && ChunkRecordDwords > 0;
+		}
+	};
+	using FPoolBinder = TFunction<bool(FRDGBuilder&, FRHICommandListImmediate&, FPoolBindings&)>;
+
+	// Game thread, before Flush, idempotent. Gated BEHIND the Pack stage (the
+	// claim sources from the pack arenas and sizes from the totals arena).
+	// bVerify arms the per-flush byte gate (ClaimWorklistVerifyMain into
+	// stats [14..15]) -- one extra indirect dispatch per tick, verify arm
+	// only. Arming without a binder is REFUSED loudly: a claim stage that
+	// cannot reach the pool would set claimStaged bits whose records nothing
+	// ever lands -- the exact quiet-dead shape this project keeps paying for.
+	void SetClaimStageArmed(bool bArmed, FPoolBinder Binder, bool bVerify);
+	bool IsClaimStageArmed() const { return bClaimStageArmed && IsPackStageArmed(); }
 
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
@@ -389,6 +459,14 @@ public:
 		// PAYLOAD ITSELF being wrong -- leg invalid outright.
 		uint64 PackDwordMismatches = 0;
 		uint64 PackDwordsChecked = 0;
+		// The Claim stage's byte gate (stats [14..15]): the LANDED pool
+		// state -- descriptors, bounded word ranges, the chunk record (or
+		// its fail-zero) -- vs the stage's own sources through the shared
+		// factored text. A mismatch is pool corruption at the landing site;
+		// leg invalid outright. Checked == 0 with claim-fed chunks flowing
+		// under the verify switch is a DEAD GATE, never a pass.
+		uint64 ClaimDwordMismatches = 0;
+		uint64 ClaimDwordsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -468,6 +546,11 @@ private:
 	TRefCountPtr<FRDGPooledBuffer> PooledPackMatArena;
 	TRefCountPtr<FRDGPooledBuffer> PooledPackSkipArena;
 	TRefCountPtr<FRDGPooledBuffer> PooledPackMaskArena;
+	// --- Claim stage (game-thread flags; the claim buffer is a per-flush
+	// RDG transient -- nothing outside the flush graph reads it) ------------
+	bool bClaimStageArmed = false;
+	bool bClaimVerifyArmed = false;
+	FPoolBinder ClaimPoolBinder;
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------

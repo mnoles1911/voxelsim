@@ -352,6 +352,40 @@ namespace VoxelGpuWorldGen
 	};
 	void AddWorklistPackPass(FRDGBuilder& GraphBuilder, const FWorklistPackDispatch& Dispatch);
 
+	// The Claim stage's THREE (or four, verify-armed) once-per-tick indirect
+	// dispatches (P3 stage 6), added to the worklist FLUSH graph after the
+	// pack pass: ClaimWorklistMain (Record triple, 1 group/record -- the
+	// claim proper off the totals arena into a per-flush claim buffer),
+	// ClaimWriteWorklistMain (Write triple, 148 groups/record -- both word
+	// copies, pack arenas -> claimed pool ranges), ClaimRecordWorklistMain
+	// (Record triple -- descriptors + the chunk record), and, verify arm
+	// only, ClaimWorklistVerifyMain (Record triple -- the landed pool state
+	// vs its sources, into stats [14..15]).
+	struct FWorklistClaimDispatch
+	{
+		FRDGBufferRef Records = nullptr;
+		FRDGBufferRef Control = nullptr;
+		FRDGBufferRef IndirectArgs = nullptr;
+		uint32 RecordArgsOffset = 0;     // byte offset of the Record triple
+		uint32 WriteArgsOffset = 0;      // byte offset of the Write triple
+		uint32 RingCapacity = 0;
+		uint32 ClaimBudgetRecords = 0;   // sizes the per-flush claim buffer
+		// The pack stage's arenas (sources) and the classify totals arena.
+		FRDGBufferRef Totals = nullptr;
+		FRDGBufferRef PackDesc = nullptr;
+		FRDGBufferRef PackOcc = nullptr;
+		FRDGBufferRef PackMat = nullptr;
+		FRDGBufferRef PackMask = nullptr;
+		// The pool, registered into this graph by the manager's binder.
+		FBrickPoolAllocBuffers Pool;
+		FBrickPoolAllocLayout PoolLayout;
+		uint32 ChunkRecordDwords = 0;
+		// Verify arm (stats [14..15]).
+		bool bVerify = false;
+		FRDGBufferRef VerifyStats = nullptr;
+	};
+	void AddWorklistClaimPasses(FRDGBuilder& GraphBuilder, const FWorklistClaimDispatch& Dispatch);
+
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any
 	// readback, and does not block -- the caller owns all three decisions.

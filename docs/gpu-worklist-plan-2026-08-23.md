@@ -315,7 +315,113 @@ Write/Record stages) -- per-chunk cost 5 (claim + 4 writes). Converting them
 moves production fully into the flush graph and delivery to "the tick after
 flush"; that is the piece that finally makes passes/tick FLAT.
 
-## Stage 6 DESIGN SKETCH (not started): claim + writes + delivery
+## Stage-6 AUDIT (2026-08-23): three landed slice>0 corruptions in the seam
+
+Before stage 6 was written, reading the claim/write integration it replaces
+found THREE bugs in the SHIPPED wlpack -> pool landing path -- all invisible
+to every existing gate (the stage gates verify the ARENAS; the pool desc, the
+record's masks and allSolid were never compared by anything), all corrupting
+only pack-fed records with arena slice > 0 (slice 0 was accidentally exact,
+which is why small smoke tests would look clean):
+
+1. **Mask base**: the lean claim/write call passed `ChunkMaskReadBase / 2`
+   (= SliceIndex) to a record kernel that indexes the mask arena by ELEMENT
+   (the stack path passes `C * 2`). Slice > 0 records read MaskLo/MaskHi --
+   and therefore anySolid -- from the wrong elements.
+2. **Desc rebase**: the desc kernel subtracted the claim's spare pair as the
+   batch-relative rebase term, but on the pack path that dword carries
+   `SrcWordsOccBase` (slice x 1,024 -- the COPY source base) while pack-arena
+   descriptors are CHUNK-relative. Slice > 0 chunks landed MIXED descriptors
+   with garbage pool offsets. Fixed by subtracting the host-known base back
+   out (stack: prefix, classic: 0, pack-fed: 0).
+3. **allSolid source**: the record kernel read `InBrickOcc[descOffset + k]`
+   with chunk-relative offsets against the SHARED pack occ arena -- every
+   slice > 0 record computed allSolid from slice 0's words. New
+   `SrcWordsOccBase` parameter (0 = byte-identical on classic and stack).
+
+All three fixed in the commit before stage 6; stage 6's claim verify gate
+(below) compares exactly these bytes and would have caught all three.
+
+## Stage 6 LANDED: claim + the four writes + delivery (2026-08-23, -VoxelGpuWorklistClaim)
+
+Authored-not-yet-built. The last generation stage: per claim-fed chunk the
+batch graph's ENTIRE brick chain -- BrickPoolClaimMain + both worst-case word
+copies + the desc write + the record write, FIVE passes -- becomes THREE
+indirect dispatches per tick in the FLUSH graph (VoxelWorklistClaim.usf):
+
+* `ClaimWorklistMain` (Record triple, 1 group/record, thread 0 claims):
+  totals from the ClassifyTotals arena at slice x 2, the claim proper through
+  the FACTORED `poolClaimChunkAt` -- the same atomics, size classes, bitmap
+  double-grant gate and counters into the same AllocState, so claim failures
+  keep surfacing on [brick-gpualloc], now attributed per flush. The 8-dword
+  claim slice lands in a per-flush RDG TRANSIENT (nothing outside the flush
+  reads it); the spare pair carries the record's pack-arena slice bases.
+* `ClaimWriteWorklistMain` (Write triple, 148 worst-case groups/record =
+  (1,024 occ + 8,448 mat) / 64 -- the classic copies' own worst-case-dispatch
+  decision): both word copies, pack arenas -> claimed pool ranges, actual
+  counts off the claim via the factored `poolAllocWordRun`.
+* `ClaimRecordWorklistMain` (Record triple, 64 threads): descriptors through
+  the factored `poolAllocDescWriteAt`/`poolAllocRebaseDesc` (rebase term
+  exactly zero -- chunk-relative descs, the audit's arithmetic), then the
+  factored cooperative `poolAllocRecordWriteAt` (allSolid reduce + the record
+  composed dword-by-dword through `poolAllocRecordDword`). Every per-chunk
+  input comes off the RECORD: ChunkSlot and the new BrickBase field (dword
+  11, ex-Reserved0 -- the one CPU-dispensed input) are the shell, origin is
+  (OriginVx, OriginVy, BrickZMin x 8), RingLevel is CoarseLevel, shading is
+  the record's three packed dwords.
+
+**Per-chunk batch passes 5 -> 0.** A claim-fed job adds NOTHING to the batch
+graph (AddRegionPasses is still called -- fully fed it adds zero passes and
+keeps every earlier verify arm working); the spine constant goes 8 -> 11
+(+1 verify-armed). Delivery keeps the lean-alloc shape unchanged: no
+readback, deliverable at enqueue -- the flush command executes BEFORE the
+batch command that used to carry these passes.
+
+* Switches: `-VoxelGpuWorklistClaim=1` (requires the Pack switch); byte gate
+  `-VoxelGpuWorklistVerifyClaim=1` -- ClaimWorklistVerifyMain (one more
+  indirect dispatch per tick, NOT per chunk) compares the LANDED POOL STATE
+  against the stage's own sources through the same factored text: descs vs
+  the rebase, occ/mat pool words vs the pack arenas bounded by ACTUAL
+  counts, the chunk record vs the composer + a re-run allSolid reduce, and a
+  FAILED claim's record against all-zeros. Into stats [14..15]. The classic
+  claim cannot be re-run as a reference (a bump allocator is not
+  idempotent), so this is the VerifyBrickStack shape sketch item 4 named.
+* **The deferred-record trap, closed by construction**: claimStaged
+  (LevelFlags bit 10) is set by Flush ONLY for records consumed the same
+  flush they were staged -- the stampsStaged mechanism verbatim, set before
+  the folds so both proof mirrors cover the bytes. A deferred record keeps
+  bit 10 clear FOREVER; its job fell back to the classic claim, and the
+  later flush that consumes it claims nothing -- without this, the same slot
+  would be claimed twice and the first ranges would leak.
+* **Teardown / stale-drop (GenId)**: once consumed with bit 10, the claim is
+  committed -- the job cannot be cancelled between promote and claim. Safe
+  because every later death (abandon, fail, stale GenId) releases the shell
+  through ReleaseGpuChunkShell, whose queued GPU free reads the SIDE TABLE
+  this claim wrote -- and frees are always enqueued before the next batch's
+  claims (rule 3), so a free can never race a re-claim of the slot.
+* **The batch side never falls back classically for a claim-fed job** -- a
+  classic claim there would double-claim the slot. A dark claim stage (pool
+  binder failure, logged once) lands nothing: unwritten slots, missing
+  chunks, never corruption.
+* Pool plumbing: the manager hands FVoxelGpuWorklist a BINDER (sketch item
+  1's decision) that registers the pool's alloc buffers into the flush graph
+  on the render thread.
+* Readings: `[gpu-worklist] wlclaim conv= claimverify checked= mism=`.
+  FAILING: conv=0 while wlpack conv grows (stage armed, feeding nothing);
+  mism>0 (the landed pool state is WRONG -- leg invalid outright); checked=0
+  with conv>0 under the verify switch (DEAD GATE, never a pass).
+* Offline gate: tools/voxel-check-worklist-shader.ps1 now compiles all 30
+  kernels (the 4 claim kernels + the 6 classic alloc entry points whose file
+  gained the factored bodies) in ~2 s without an editor.
+
+With all seven stages armed the lean-alloc pass ledger reads: 17 classic ->
+16 (cols) -> 15 (vox) -> 7 (ct) -> 5 (pack) -> **0 (claim)** per chunk, plus
+a constant ~11/tick spine -- passes/tick FLAT in N, the property the whole
+programme exists for. Expect throughput NOT to move while admission routes
+96% of chunks away from this path; the gate is the pass line, the byte gates
+and the pinned digest.
+
+## Stage 6 DESIGN SKETCH (superseded by the LANDED section above)
 
 Deliberately NOT stacked on the five unmeasured stages above -- it changes
 WHERE production happens and how jobs complete, and every debugging surface

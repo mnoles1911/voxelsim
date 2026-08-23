@@ -29,6 +29,7 @@ DEFINE_LOG_CATEGORY_STATIC(LogVoxelGpuWorklist, Log, All);
 static_assert(offsetof(FVoxelGpuChunkWorkRecord, OriginVx) == 0, "record layout");
 static_assert(offsetof(FVoxelGpuChunkWorkRecord, LevelFlags) == 12, "record layout");
 static_assert(offsetof(FVoxelGpuChunkWorkRecord, ShadingSurfaceZBits) == 40, "record layout");
+static_assert(offsetof(FVoxelGpuChunkWorkRecord, BrickBase) == 44, "record layout");
 
 namespace
 {
@@ -85,6 +86,8 @@ namespace
 	std::atomic<uint32> GProofStampChecked{ 0 };
 	std::atomic<uint32> GProofPackMismatch{ 0 };
 	std::atomic<uint32> GProofPackChecked{ 0 };
+	std::atomic<uint32> GProofClaimMismatch{ 0 };
+	std::atomic<uint32> GProofClaimChecked{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -112,8 +115,13 @@ namespace
 		// graph, sourcing from the pack arenas, until the Write/Record
 		// stages land.
 		FVoxelGpuWorklist::kPackGroupsPerRecord,           // PackClaim: (LOCKED, pack half)
-		64,   // Write: upper-bound word-copy groups
-		1,    // Record
+		// The Claim stage's word-copy dispatch: worst-case groups per record
+		// ((1,024 occ + 8,448 mat) / 64 = 148 -- the classic copies' own
+		// worst-case-dispatch decision), locked against the kernel's #error.
+		FVoxelGpuWorklist::kWriteGroupsPerRecord,          // Write: (LOCKED)
+		// Record serves the spine prover AND the Claim stage's claim,
+		// desc+record and verify dispatches -- all 1 group per record.
+		1,    // Record (LOCKED)
 	};
 }
 
@@ -297,6 +305,25 @@ void FVoxelGpuWorklist::SetVoxelizeStageArmed(bool bArmed, uint32 CellBudgetReco
 	VoxelizeCellBudget = CellBudgetRecords;
 }
 
+void FVoxelGpuWorklist::SetClaimStageArmed(bool bArmed, FPoolBinder Binder, bool bVerify)
+{
+	check(IsInGameThread());
+	if (bArmed && !Binder)
+	{
+		// A claim stage with no way to reach the pool would set claimStaged
+		// bits whose records nothing ever lands -- ghost chunks with an armed
+		// switch. Refuse loudly instead of running dead.
+		UE_LOG(LogVoxelGpuWorklist, Error,
+		       TEXT("[gpu-worklist] Claim stage arm REFUSED: no pool binder was supplied."));
+		bClaimStageArmed = false;
+		ClaimPoolBinder = nullptr;
+		return;
+	}
+	bClaimStageArmed = bArmed;
+	bClaimVerifyArmed = bVerify;
+	ClaimPoolBinder = MoveTemp(Binder);
+}
+
 void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 {
 	check(IsInGameThread());
@@ -376,6 +403,28 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 	}
 	StagedAssets.Reset();
 
+	// --- Claim staging (-VoxelGpuWorklistClaim; P3 stage 6) -----------------
+	//
+	// claimStaged (bit 10) is set for exactly the STAGED records this flush
+	// will consume -- the asset-staging window arithmetic verbatim, and for
+	// the same reason: a record deferred past its staging flush keeps the bit
+	// clear FOREVER (it is uploaded with it clear and never re-uploaded), so
+	// a later flush consuming it claims nothing -- its host job already fell
+	// back to the classic per-chunk claim, and a second claim for the same
+	// slot would leak the first ranges and overwrite the side table. BEFORE
+	// the folds, so both proof mirrors cover the post-mutation bytes.
+	if (IsClaimStageArmed())
+	{
+		for (int32 I = 0; I < Staged.Num(); ++I)
+		{
+			const uint32 Mono = Head + uint32(I);
+			if (Mono - Tail < Take)
+			{
+				Staged[I].LevelFlags |= (1u << 10);
+			}
+		}
+	}
+
 	// Slot folds for the records being uploaded this flush -- BEFORE the
 	// consume-fold mirror below, because the args pass sees HeadCursor ==
 	// NewHead and can consume a record the same tick it arrives. AFTER the
@@ -417,6 +466,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 StampChecked = GProofStampChecked.load(std::memory_order_relaxed);
 		const uint32 PackMismatch = GProofPackMismatch.load(std::memory_order_relaxed);
 		const uint32 PackChecked = GProofPackChecked.load(std::memory_order_relaxed);
+		const uint32 ClaimMismatch = GProofClaimMismatch.load(std::memory_order_relaxed);
+		const uint32 ClaimChecked = GProofClaimChecked.load(std::memory_order_relaxed);
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
@@ -428,7 +479,21 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		Proof.StampCellsChecked = StampChecked;
 		Proof.PackDwordMismatches = PackMismatch;
 		Proof.PackDwordsChecked = PackChecked;
+		Proof.ClaimDwordMismatches = ClaimMismatch;
+		Proof.ClaimDwordsChecked = ClaimChecked;
 		++Proof.Landed;
+		if (ClaimMismatch > 0)
+		{
+			// THE CLAIM FAILING READING: the pool holds different bytes than
+			// the Claim stage's own sources demand -- a torn dispatch, a
+			// wrong base, a racing tenant. POOL CORRUPTION at the landing
+			// site; the leg is invalid outright.
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] CLAIM VERIFY FAIL: %u mismatching dwords over %u ")
+			       TEXT("compared (cumulative). The landed pool state and the Claim stage's ")
+			       TEXT("sources disagree; the leg is invalid."),
+			       ClaimMismatch, ClaimChecked);
+		}
 		if (PackMismatch > 0)
 		{
 			// THE PACK FAILING READING: the converted pack emitted different
@@ -515,10 +580,11 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			       TEXT("[gpu-worklist] proof #%u ok: gpu consumed=%u fold=0x%08x tail=%u ")
 			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u; ")
 			       TEXT("voxverify checked=%u mism=%u; ctverify checked=%u mism=%u; ")
-			       TEXT("stampverify checked=%u mism=%u; packverify checked=%u mism=%u)"),
+			       TEXT("stampverify checked=%u mism=%u; packverify checked=%u mism=%u; ")
+			       TEXT("claimverify checked=%u mism=%u)"),
 			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
 			       VoxChecked, VoxMismatch, CtChecked, CtMismatch, StampChecked, StampMismatch,
-			       PackChecked, PackMismatch);
+			       PackChecked, PackMismatch, ClaimChecked, ClaimMismatch);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -559,6 +625,9 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		 bColumns = bColumnStageArmed, bVoxelize = IsVoxelizeStageArmed(),
 		 bClassify = IsClassifyStageArmed(), bStamp = IsAssetStampStageArmed(),
 		 bPack = IsPackStageArmed(),
+		 bClaim = IsClaimStageArmed(),
+		 bClaimVerify = IsClaimStageArmed() && bClaimVerifyArmed,
+		 ClaimBinder = ClaimPoolBinder,
 		 StampInstances = MoveTemp(FlushInstances),
 		 StampColStarts = MoveTemp(FlushColStarts),
 		 StampSpans = MoveTemp(FlushSpans),
@@ -588,6 +657,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				GProofStampChecked.store(Data[11], std::memory_order_relaxed);
 				GProofPackMismatch.store(Data[12], std::memory_order_relaxed);
 				GProofPackChecked.store(Data[13], std::memory_order_relaxed);
+				GProofClaimMismatch.store(Data[14], std::memory_order_relaxed);
+				GProofClaimChecked.store(Data[15], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();
@@ -911,6 +982,71 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 						PDispatch.Skip = PackSkip;
 						PDispatch.Mask = PackMask;
 						VoxelGpuWorldGen::AddWorklistPackPass(GraphBuilder, PDispatch);
+
+						// --- Claim: SIXTH/SEVENTH/EIGHTH indirect (P3 stage 6)
+						//
+						// The claim + both word copies + desc/record (+ the
+						// byte gate, verify arm), sourcing from the pack
+						// arenas the dispatch above just filled and landing
+						// in the POOL -- whose buffers the manager's binder
+						// registers into THIS graph. A binder failure lands
+						// nothing and logs once: the affected records' slots
+						// stay unwritten (the P1 xcheck's `unwritten`
+						// reading), never corrupted.
+						if (bClaim)
+						{
+							FPoolBindings PoolB;
+							const bool bBound = ClaimBinder
+								&& ClaimBinder(GraphBuilder, RHICmdList, PoolB)
+								&& PoolB.IsValid();
+							if (bBound)
+							{
+								VoxelGpuWorldGen::FWorklistClaimDispatch KDispatch;
+								KDispatch.Records = Records;
+								KDispatch.Control = Control;
+								KDispatch.IndirectArgs = Args;
+								KDispatch.RecordArgsOffset =
+									uint32(EVoxelWorklistStage::Record) * 3u * uint32(sizeof(uint32));
+								KDispatch.WriteArgsOffset =
+									uint32(EVoxelWorklistStage::Write) * 3u * uint32(sizeof(uint32));
+								KDispatch.RingCapacity = Capacity;
+								KDispatch.ClaimBudgetRecords = FMath::Max(SliceBudgetRecords, 1u);
+								KDispatch.Totals = CDispatch.Totals;
+								KDispatch.PackDesc = PackDesc;
+								KDispatch.PackOcc = PackOcc;
+								KDispatch.PackMat = PackMat;
+								KDispatch.PackMask = PackMask;
+								KDispatch.Pool.PoolDesc = PoolB.PoolDesc;
+								KDispatch.Pool.PoolOcc = PoolB.PoolOcc;
+								KDispatch.Pool.PoolMat = PoolB.PoolMat;
+								KDispatch.Pool.PoolTable = PoolB.PoolTable;
+								KDispatch.Pool.AllocState = PoolB.AllocState;
+								KDispatch.Pool.AllocBitmap = PoolB.AllocBitmap;
+								KDispatch.Pool.AllocSide = PoolB.AllocSide;
+								KDispatch.PoolLayout = PoolB.Layout;
+								KDispatch.ChunkRecordDwords = PoolB.ChunkRecordDwords;
+								KDispatch.bVerify = bClaimVerify;
+								if (bClaimVerify)
+								{
+									KDispatch.VerifyStats = GraphBuilder.RegisterExternalBuffer(
+										PooledStats, TEXT("Voxel.WorklistStats"));
+								}
+								VoxelGpuWorldGen::AddWorklistClaimPasses(GraphBuilder, KDispatch);
+							}
+							else
+							{
+								static bool bBinderFailLogged = false;
+								if (!bBinderFailLogged)
+								{
+									bBinderFailLogged = true;
+									UE_LOG(LogVoxelGpuWorklist, Error,
+									       TEXT("[gpu-worklist] CLAIM STAGE DARK: the pool binder ")
+									       TEXT("failed on an armed flush. Claim-staged records land ")
+									       TEXT("nothing (unwritten slots, missing chunks); the ")
+									       TEXT("classic paths are unaffected. Logged once."));
+								}
+							}
+						}
 					}
 				}
 			}

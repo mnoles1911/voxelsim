@@ -1,0 +1,351 @@
+// VoxelWorklistClaim.usf -- the SIXTH converted stage of the P3 worklist: the
+// claim + the four pool writes (docs/gpu-worklist-plan-2026-08-23.md, stage 6).
+// Behind -VoxelGpuWorklistClaim=1, on top of -VoxelGpuWorklistPack=1 -- the
+// pack arenas it sources from are that stage's output, and the totals arena
+// it sizes claims from is the ClassifyTotals stage's.
+//
+// WHAT IT REPLACES, per claim-eligible chunk: the batch graph's ENTIRE brick
+// chain -- BrickPoolClaimMain + two worst-case word copies + the desc write +
+// the record write, FIVE passes -- replaced by THREE indirect dispatches per
+// tick (claim via the Record triple, the word copies via the Write triple,
+// desc+record via the Record triple again). A claim-fed job adds ZERO passes
+// to the batch graph: production is fully inside the flush graph, and
+// delivery keeps the lean-alloc shape (no readback, resident on the GPU
+// timeline the moment the flush command is enqueued -- which is BEFORE the
+// batch command that used to carry these passes).
+//
+// THE MATH IS NOT COPIED, IT IS CALLED: poolClaimChunkAt, poolAllocWordRun,
+// poolAllocDescWriteAt / poolAllocRebaseDesc, poolAllocRecordWriteAt /
+// poolAllocBrickAllSolid / poolAllocLevelAndFlags / poolAllocRecordDword are
+// the factored bodies of VoxelBrickPoolAlloc.usf's kernels, and both entry
+// points run the same text -- the same atomics, the same size classes, the
+// same bitmap double-grant gate, the same counters into the same AllocState
+// (so claim failures keep surfacing on the [brick-gpualloc] window line,
+// now attributed per flush).
+//
+// ELIGIBILITY -- worklistClaimEligible, and it is LOAD-BEARING twice over:
+//   * claimStaged (LevelFlags bit 10) is set by Flush ONLY for records
+//     consumed the same flush they were staged. A record deferred past its
+//     staging flush keeps bit 10 clear forever; its host job already fell
+//     back to the classic per-chunk claim, and a second claim here would
+//     leak the first ranges and overwrite the slot's side-table entry.
+//   * the asset gate matches the pack stage's: a record whose cells never
+//     reached the pack arenas has nothing to land.
+// The host's bWorklistClaimFed mapping mirrors this exactly -- the wlclaim
+// conv counter and this kernel's work must be the same set of chunks.
+//
+// TEARDOWN / STALE-DROP (GenId), the design note stage 6 owes: once a record
+// is consumed with bit 10 set, the claim is COMMITTED on the GPU timeline --
+// the job can no longer be cancelled between promote and claim. That is safe
+// because a job that dies afterwards (abandoned, failed, stale GenId at
+// delivery) releases its shell through ReleaseGpuChunkShell, whose queued GPU
+// free reads the SIDE TABLE this claim wrote -- frees the claimed ranges,
+// clears the bitmap, zeroes the record. Frees are always enqueued before the
+// next batch's claims (rule 3 in the manager), so the free can never race a
+// re-claim of the same slot.
+
+#include "/Engine/Public/Platform.ush"
+#include "/VoxelEarth/VoxelWorklist.ush"
+// The classic kernels AND the factored bodies this stage calls -- the
+// VoxelWorklistAssetStamp.usf include pattern. Brings the pool resource
+// declarations (AllocState, AllocBitmap, AllocSide, OutClaim/InClaim,
+// InBrickTotals, InBrickDesc/InBrickOcc/InChunkBrickMask, OutBrickDesc,
+// OutChunkTable, InPoolTable) and the host-bound layout uniforms.
+#include "/VoxelEarth/VoxelBrickPoolAlloc.usf"
+
+#ifndef VXC_WORKLIST_CLAIM_GROUPS
+#error "VXC_WORKLIST_CLAIM_GROUPS not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
+#endif
+#ifndef VXC_WORKLIST_WRITE_GROUPS
+#error "VXC_WORKLIST_WRITE_GROUPS not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
+#endif
+#ifndef VXC_WORKLIST_BRICKS_PER_RECORD
+#error "VXC_WORKLIST_BRICKS_PER_RECORD not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
+#endif
+#ifndef VXC_WORKLIST_MATWORDS_PER_RECORD
+#error "VXC_WORKLIST_MATWORDS_PER_RECORD not defined -- dispatch these kernels only through the FVoxelWorklistClaim* shader classes"
+#endif
+#if VXC_WORKLIST_CLAIM_GROUPS != 1
+#error "Claim stage shape drifted: the claim, desc+record and verify dispatches ride the Record triple at ONE group per record"
+#endif
+#if VXC_WORKLIST_BRICKS_PER_RECORD != 64
+#error "Claim stage shape drifted: a lean brick chunk is 4x4x4 = 64 bricks"
+#endif
+#if VXC_WORKLIST_MATWORDS_PER_RECORD != 8448
+#error "Claim stage shape drifted: 64 bricks x kMaxBrickMatWords (132) = 8448 -- if kMaxBrickMatWords moved, move this with it ON BOTH SIDES"
+#endif
+#if VXC_WORKLIST_WRITE_GROUPS != (VXC_WORKLIST_BRICKS_PER_RECORD * 16 + VXC_WORKLIST_MATWORDS_PER_RECORD) / 64
+#error "Write stage shape drifted: (1,024 occ + 8,448 mat) worst-case words / 64 threads = 148 groups per record, and the host table must agree"
+#endif
+
+// The per-record worst-case strides -- also the pack arenas' slice strides,
+// which is what makes a flat per-record base the whole addressing story.
+static const uint kWlOccWordsPerRecord = VXC_WORKLIST_BRICKS_PER_RECORD * 16u;
+static const uint kWlMatWordsPerRecord = VXC_WORKLIST_MATWORDS_PER_RECORD;
+
+// The ring (same three bindings, same meanings, as every worklist consumer).
+StructuredBuffer<GpuChunkWorkRecord> WorklistRecords;
+StructuredBuffer<uint> WorklistControl;   // [0]=consumeFirst [1]=consumeCount
+uint RingCapacity;
+
+// The word copies read TWO pack arenas and write TWO pool arenas in one
+// dispatch, so the included file's single InWords/OutWords pair cannot serve;
+// these are this stage's own names, bound per dispatch.
+StructuredBuffer<uint>   InWordsOccArena;   // pack occ arena (slice-strided)
+StructuredBuffer<uint>   InWordsMatArena;   // pack mat arena
+RWStructuredBuffer<uint> OutWordsOcc;       // pool occ arena
+RWStructuredBuffer<uint> OutWordsMat;       // pool mat arena
+
+// Verify-only read views of the pool arenas the write dispatches just wrote
+// (a kernel must never bind one buffer as UAV and SRV; InPoolTable comes from
+// the included file).
+StructuredBuffer<uint2> VerifyPoolDesc;
+StructuredBuffer<uint>  VerifyPoolOcc;
+StructuredBuffer<uint>  VerifyPoolMat;
+// The worklist stats/evidence buffer: claim verify accumulates into
+// [14] mismatches / [15] dwords checked.
+RWStructuredBuffer<uint> WorklistStats;
+
+// Group-uniform record fetch shared by all four kernels. RecOut/ROut valid
+// only when the return is nonzero.
+uint worklistClaimFetch(uint RecIndex, out GpuChunkWorkRecord ROut)
+{
+	ROut = (GpuChunkWorkRecord)0;
+	const uint Take = WorklistControl[1];
+	if (RecIndex >= Take)
+	{
+		return 0u;
+	}
+	const uint Slot = (WorklistControl[0] + RecIndex) % RingCapacity;
+	ROut = WorklistRecords[Slot];
+	return worklistClaimEligible(ROut);
+}
+
+// ---------------------------------------------------------------------------
+// ClaimWorklistMain -- ONE indirect dispatch per tick through the Record
+// triple (1 group per consumed record); thread 0 of each group claims its
+// record's two arena ranges via the factored claim proper, writing the
+// 8-dword slice at Rec * 8 of the per-flush claim buffer. Totals come from
+// the ClassifyTotals arena at Rec * 2; the spare pair carries the record's
+// pack-arena slice bases so the write dispatch sources the right words.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClaimWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	GpuChunkWorkRecord R;
+	if (worklistClaimFetch(Gid.x, R) == 0u || GTid.x != 0u)
+	{
+		return;
+	}
+	const uint Rec = Gid.x;
+	// TotalsReadBase is bound 0 on this dispatch; the slice base is explicit.
+	const uint OccWords = InBrickTotals[Rec * 2u + 0u];
+	const uint MatWords = InBrickTotals[Rec * 2u + 1u];
+	poolClaimChunkAt(/*ClaimBase*/ Rec * 8u, R.ChunkSlot,
+	                 OccWords, MatWords,
+	                 /*worst*/ kWlOccWordsPerRecord, kWlMatWordsPerRecord,
+	                 /*src*/   Rec * kWlOccWordsPerRecord,
+	                           Rec * kWlMatWordsPerRecord);
+}
+
+// ---------------------------------------------------------------------------
+// ClaimWriteWorklistMain -- the two word copies, ONE indirect dispatch per
+// tick through the Write triple (148 groups per record: 16 occ + 132 mat,
+// worst case; the excess threads read the claim and exit -- the classic
+// kernels' own worst-case-dispatch decision, kept). Sources are the pack
+// arenas through the claim's spare pair, exactly as the classic copies
+// source; destinations are the claimed pool ranges.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClaimWriteWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Rec = Gid.x / VXC_WORKLIST_WRITE_GROUPS;
+	GpuChunkWorkRecord R;
+	if (worklistClaimFetch(Rec, R) == 0u)
+	{
+		return;
+	}
+	const uint i = (Gid.x % VXC_WORKLIST_WRITE_GROUPS) * 64u + GTid.x;
+	uint Base, Words, SrcFirst;
+	if (i < kWlOccWordsPerRecord)
+	{
+		if (poolAllocWordRun(Rec * 8u, 0u, Base, Words, SrcFirst) && i < Words)
+		{
+			OutWordsOcc[Base + i] = InWordsOccArena[SrcFirst + i];
+		}
+	}
+	else
+	{
+		const uint j = i - kWlOccWordsPerRecord;
+		if (poolAllocWordRun(Rec * 8u, 1u, Base, Words, SrcFirst) && j < Words)
+		{
+			OutWordsMat[Base + j] = InWordsMatArena[SrcFirst + j];
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ClaimRecordWorklistMain -- descriptors + the chunk record, ONE indirect
+// dispatch per tick through the Record triple (1 group per record, 64
+// threads: one brick's descriptor per thread, then the factored cooperative
+// record write). Everything per-chunk comes off the record: ChunkSlot and
+// BrickBase are the CPU-dispensed shell, the origin is
+// (OriginVx, OriginVy, BrickZMin * 8) -- the same derivation the host's
+// BrickOriginVoxel latch runs -- RingLevel is the record's CoarseLevel
+// (BrickKey.Level by the same clamp), and the shading is the record's three
+// packed dwords.
+//
+// The desc rebase subtraction: the claim's spare pair holds the pack-arena
+// slice bases (the word-copy SOURCE), while pack descriptors are
+// CHUNK-relative -- so the slice bases are subtracted back out, leaving a
+// rebase term of exactly zero. The same audit-fixed arithmetic the classic
+// pack-fed dispatch runs, through the same factored text.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClaimRecordWorklistMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Rec = Gid.x;
+	GpuChunkWorkRecord R;
+	// Group-uniform (Gid-derived): poolAllocRecordWriteAt barriers inside.
+	if (worklistClaimFetch(Rec, R) == 0u)
+	{
+		return;
+	}
+	if (GTid.x < VXC_WORKLIST_BRICKS_PER_RECORD)
+	{
+		poolAllocDescWriteAt(/*ClaimBase*/ Rec * 8u,
+		                     /*Src*/ Rec * VXC_WORKLIST_BRICKS_PER_RECORD + GTid.x,
+		                     /*Dst*/ R.BrickBase + GTid.x,
+		                     /*RebaseSub*/ Rec * kWlOccWordsPerRecord,
+		                                   Rec * kWlMatWordsPerRecord);
+	}
+	const int3 Origin = int3(R.OriginVx, R.OriginVy, R.BrickZMin * 8);
+	poolAllocRecordWriteAt(/*ClaimBase*/ Rec * 8u, GTid.x,
+	                       VXC_WORKLIST_BRICKS_PER_RECORD,
+	                       /*DescSrcBase*/ Rec * VXC_WORKLIST_BRICKS_PER_RECORD,
+	                       /*OccSrcWordsBase*/ Rec * kWlOccWordsPerRecord,
+	                       /*MaskElemBase*/ Rec * 2u,
+	                       R.ChunkSlot, Origin, worklistCoarseLevel(R),
+	                       R.BrickBase, R.ShadingClimatePacked,
+	                       R.ShadingGradPacked, R.ShadingSurfaceZBits);
+}
+
+// --- ClaimWorklistVerifyMain: the stage's byte gate -------------------------
+//
+// The landed POOL STATE against its sources, per eligible record, one
+// 64-thread group per record through the Record triple, verify arm only
+// (-VoxelGpuWorklistVerifyClaim=1). The classic claim CANNOT be re-run as a
+// reference (a bump allocator is not idempotent), so the gate is the
+// VerifyBrickStack shape the plan doc names: every byte the stage landed,
+// compared against what the shared factored text says it must be --
+//   * a FAILED claim: the record slot must be fully zeroed;
+//   * descriptors: pool desc at BrickBase vs poolAllocRebaseDesc over the
+//     pack desc slice (the same text both write paths call);
+//   * words: pool occ/mat at the claimed bases vs the pack arenas through
+//     the claim's spare pair, bounded by the ACTUAL counts;
+//   * the record: all ChunkRecordDwords vs poolAllocRecordDword over the
+//     record's fields, the pack mask slice, and a re-run of the allSolid
+//     reduce (poolAllocBrickAllSolid, the same text).
+// Mismatches into WorklistStats[14], dwords compared into [15].
+//
+// THE FAILING READINGS: stats[14] > 0 -- the pool holds different bytes than
+// the stage's own inputs demand: a torn dispatch, a wrong base, a racing
+// tenant -- POOL CORRUPTION, the leg invalid outright. stats[15] staying 0
+// while wlclaim conv grows with the verify switch armed -- the gate is dead
+// and "no mismatches" is vacuous (checked=0 with conv>0 must READ AS A DEAD
+// GATE, never a pass). This gate is also what would have caught the three
+// slice>0 seam bugs the stage-6 audit found by inspection.
+// ---------------------------------------------------------------------------
+[numthreads(64, 1, 1)]
+void ClaimWorklistVerifyMain(uint3 Gid : SV_GroupID, uint3 GTid : SV_GroupThreadID)
+{
+	const uint Rec = Gid.x;
+	GpuChunkWorkRecord R;
+	// Group-uniform: the allSolid re-run below barriers.
+	if (worklistClaimFetch(Rec, R) == 0u)
+	{
+		return;
+	}
+	const uint CB = Rec * 8u;
+	const uint RecBase = R.ChunkSlot * ChunkRecordDwords;
+	uint Mismatch = 0u;
+	uint Checked = 0u;
+
+	if (InClaim[CB + 0u] == 0u)
+	{
+		// Claim failed: "nothing here" means every record dword is zero.
+		for (uint z = GTid.x; z < ChunkRecordDwords; z += 64u)
+		{
+			Checked += 1u;
+			Mismatch += (InPoolTable[RecBase + z] != 0u) ? 1u : 0u;
+		}
+	}
+	else
+	{
+		// Descriptors: one per thread, expectation through the shared rebase.
+		if (GTid.x < VXC_WORKLIST_BRICKS_PER_RECORD)
+		{
+			const uint2 E = poolAllocRebaseDesc(
+				InBrickDesc[Rec * VXC_WORKLIST_BRICKS_PER_RECORD + GTid.x],
+				InClaim[CB + 1u], InClaim[CB + 3u],
+				InClaim[CB + 6u] - Rec * kWlOccWordsPerRecord,
+				InClaim[CB + 7u] - Rec * kWlMatWordsPerRecord);
+			const uint2 A = VerifyPoolDesc[R.BrickBase + GTid.x];
+			Checked += 2u;
+			Mismatch += (A.x != E.x) ? 1u : 0u;
+			Mismatch += (A.y != E.y) ? 1u : 0u;
+		}
+
+		// Words: strided across the group, bounded by the ACTUAL counts.
+		uint Base, Words, SrcFirst;
+		poolAllocWordRun(CB, 0u, Base, Words, SrcFirst);
+		for (uint i = GTid.x; i < Words; i += 64u)
+		{
+			Checked += 1u;
+			Mismatch += (VerifyPoolOcc[Base + i] != InWordsOccArena[SrcFirst + i]) ? 1u : 0u;
+		}
+		poolAllocWordRun(CB, 1u, Base, Words, SrcFirst);
+		for (uint j = GTid.x; j < Words; j += 64u)
+		{
+			Checked += 1u;
+			Mismatch += (VerifyPoolMat[Base + j] != InWordsMatArena[SrcFirst + j]) ? 1u : 0u;
+		}
+
+		// The record: re-run the allSolid reduce through the same factored
+		// per-brick text, then compare every dword through the same composer.
+		if (GTid.x == 0u)
+		{
+			gsAllocAllSolid = 1u;
+		}
+		GroupMemoryBarrierWithGroupSync();
+		if (GTid.x < VXC_WORKLIST_BRICKS_PER_RECORD &&
+		    !poolAllocBrickAllSolid(
+		        InBrickDesc[Rec * VXC_WORKLIST_BRICKS_PER_RECORD + GTid.x],
+		        Rec * kWlOccWordsPerRecord))
+		{
+			InterlockedAnd(gsAllocAllSolid, 0u);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		const uint MaskLo = InChunkBrickMask[Rec * 2u + 0u];
+		const uint MaskHi = InChunkBrickMask[Rec * 2u + 1u];
+		const uint AllSolid = (gsAllocAllSolid != 0u) ? 1u : 0u;
+		const uint LF = poolAllocLevelAndFlags(worklistCoarseLevel(R), MaskLo, MaskHi, AllSolid);
+		const int3 Origin = int3(R.OriginVx, R.OriginVy, R.BrickZMin * 8);
+		for (uint d = GTid.x; d < ChunkRecordDwords; d += 64u)
+		{
+			const uint E = poolAllocRecordDword(
+				d, Origin, LF, R.BrickBase, MaskLo, MaskHi,
+				R.ShadingClimatePacked, R.ShadingGradPacked, R.ShadingSurfaceZBits);
+			Checked += 1u;
+			Mismatch += (InPoolTable[RecBase + d] != E) ? 1u : 0u;
+		}
+	}
+
+	uint Unused;
+	InterlockedAdd(WorklistStats[15], Checked, Unused);
+	if (Mismatch != 0u)
+	{
+		InterlockedAdd(WorklistStats[14], Mismatch, Unused);
+	}
+}

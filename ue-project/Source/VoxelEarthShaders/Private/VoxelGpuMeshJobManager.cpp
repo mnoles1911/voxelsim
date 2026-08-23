@@ -632,6 +632,41 @@ static bool VoxelGpuWorklistVerifyPackEnabled()
 	return bEnabled;
 }
 
+// -VoxelGpuWorklistClaim=1 (P3 stage 6), on top of -VoxelGpuWorklistPack:
+// the flush graph ALSO dispatches the Claim stage -- the claim + both word
+// copies + desc/record as THREE indirect dispatches per tick
+// (VoxelWorklistClaim.usf) -- and every claim-fed chunk adds ZERO brick
+// passes to the batch graph (5 -> 0 on the lean-alloc shape): production is
+// fully inside the flush graph, delivery keeps the lean-alloc no-readback
+// shape, and the pass term goes flat in N. Command-line latched.
+static bool VoxelGpuWorklistClaimEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistClaim="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// The Claim stage's byte gate (-VoxelGpuWorklistVerifyClaim): one extra
+// indirect dispatch per tick comparing the LANDED pool state (descriptors,
+// bounded word ranges, the chunk record or its fail-zero) against the
+// stage's own sources through the shared factored text, into stats [14..15].
+// The classic claim cannot be re-run as a reference (a bump allocator is not
+// idempotent), so this is the VerifyBrickStack shape the plan doc names.
+static bool VoxelGpuWorklistVerifyClaimEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVerifyClaim="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 // -VoxelGpuWorklistCellBudget=<n> (default 256): the per-flush record cap
 // while the Voxelize stage is armed. The cell arena costs 128 KiB per record
 // (32,768 cells x 4 B) -- 256 is a 32 MiB arena and 15,360 chunks/s of
@@ -1113,6 +1148,11 @@ struct FVoxelGpuMeshJobManager::FJob
 	// P3 Pack: this job's descriptors and word payloads were also packed
 	// (pack arenas). Implies bWorklistTotalsFed.
 	bool bWorklistPackFed = false;
+	// P3 Claim (stage 6): this job's pool claim AND all four writes ran in
+	// the flush graph -- the batch graph must add NO brick passes for it (a
+	// classic claim here would double-claim the slot and leak the ranges).
+	// Implies bWorklistPackFed; mirrors the GPU's worklistClaimEligible.
+	bool bWorklistClaimFed = false;
 	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
 	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
 	// no 4-byte total readback, no pool write.
@@ -2279,6 +2319,45 @@ void FVoxelGpuMeshJobManager::Tick()
 			Worklist.SetClassifyStageArmed(VoxelGpuWorklistClassifyEnabled());
 			Worklist.SetAssetStampStageArmed(VoxelGpuWorklistAssetStampEnabled());
 			Worklist.SetPackStageArmed(VoxelGpuWorklistPackEnabled());
+			if (VoxelGpuWorklistClaimEnabled())
+			{
+				// The Claim stage's pool binder (the plan doc's decision: the
+				// worklist does not include the pool's lifecycle). Runs on
+				// the RENDER thread inside the flush command; BindPoolAlloc's
+				// body, callback-shaped. Captures nothing -- the pool is the
+				// process-lifetime global.
+				Worklist.SetClaimStageArmed(
+					true,
+					[](FRDGBuilder& GraphBuilder, FRHICommandListImmediate& RHICmdList,
+					   FVoxelGpuWorklist::FPoolBindings& Out) -> bool
+					{
+						FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+						const FVoxelBrickPoolBuffersRef Buffers = Pool.GetBuffers();
+						FVoxelBrickPool::EnsureCreated_RenderThread(RHICmdList, Buffers);
+						if (!Buffers.IsValid() || !Buffers->IsValid() || !Buffers->HasGpuAlloc())
+						{
+							return false;
+						}
+						Out.Layout = Pool.GetGpuAllocLayout();
+						Out.ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+						Out.PoolDesc = GraphBuilder.RegisterExternalBuffer(
+							Buffers->DescPooled, TEXT("VoxelBrickPool.Desc"));
+						Out.PoolOcc = GraphBuilder.RegisterExternalBuffer(
+							Buffers->OccPooled, TEXT("VoxelBrickPool.Occ"));
+						Out.PoolMat = GraphBuilder.RegisterExternalBuffer(
+							Buffers->MatPooled, TEXT("VoxelBrickPool.Mat"));
+						Out.PoolTable = GraphBuilder.RegisterExternalBuffer(
+							Buffers->ChunkTablePooled, TEXT("VoxelBrickPool.ChunkTable"));
+						Out.AllocState = GraphBuilder.RegisterExternalBuffer(
+							Buffers->AllocStatePooled, TEXT("VoxelBrickPool.AllocState"));
+						Out.AllocBitmap = GraphBuilder.RegisterExternalBuffer(
+							Buffers->AllocBitmapPooled, TEXT("VoxelBrickPool.AllocBitmap"));
+						Out.AllocSide = GraphBuilder.RegisterExternalBuffer(
+							Buffers->AllocSidePooled, TEXT("VoxelBrickPool.AllocSide"));
+						return true;
+					},
+					VoxelGpuWorklistVerifyClaimEnabled());
+			}
 		}
 		if (!bWorklistArmingLogged)
 		{
@@ -2344,6 +2423,19 @@ void FVoxelGpuMeshJobManager::Tick()
 				       VoxelGpuWorklistClassifyEnabled()
 					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
 			}
+			if (VoxelGpuWorklistClaimEnabled())
+			{
+				UE_LOG(LogVoxelGpuMeshJob, Log,
+				       TEXT("[gpu-worklist] CLAIM STAGE ARMED (-VoxelGpuWorklistClaim): the ")
+				       TEXT("claim + all four pool writes are CONVERTED -- three indirect ")
+				       TEXT("dispatches per tick replace FIVE per-chunk passes, and a ")
+				       TEXT("claim-fed chunk adds ZERO brick passes to the batch graph ")
+				       TEXT("(5 -> 0 on the lean-alloc shape; production is fully inside the ")
+				       TEXT("flush graph). Requires -VoxelGpuWorklistPack=1%s. Read the ")
+				       TEXT("wlclaim line. Verify arm: -VoxelGpuWorklistVerifyClaim=1."),
+				       VoxelGpuWorklistPackEnabled()
+					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
+			}
 			if (VoxelGpuWorklistClassifyEnabled())
 			{
 				UE_LOG(LogVoxelGpuMeshJob, Log,
@@ -2384,7 +2476,11 @@ void FVoxelGpuMeshJobManager::Tick()
 			+ (Worklist.IsVoxelizeStageArmed() ? 1 : 0)
 			+ (Worklist.IsAssetStampStageArmed() ? 1 : 0)
 			+ (Worklist.IsClassifyStageArmed() ? 2 : 0)
-			+ (Worklist.IsPackStageArmed() ? 2 : 0);
+			+ (Worklist.IsPackStageArmed() ? 2 : 0)
+			// Claim stage: claim + write + desc/record (+ the byte gate on
+			// the verify arm) -- three (four) indirect dispatches per tick.
+			+ (Worklist.IsClaimStageArmed()
+			       ? (VoxelGpuWorklistVerifyClaimEnabled() ? 4 : 3) : 0);
 		WorklistBatchPassesThisTick = 0;
 		WorklistWinPasses += WorklistPassesThisTick;
 		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, WorklistPassesThisTick);
@@ -2663,6 +2759,25 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		       P.PackDwordMismatches > 0 ? TEXT(" (PACK VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       PackArenaMissing > 0 ? TEXT(" (PACK ARENAS MISSING -- converted jobs fell back)") : TEXT(""));
 	}
+	// P3 Claim line (stage 6), armed-only. THE FAILING READINGS: conv=0 while
+	// wlpack conv grows -- the stage is armed and feeding nothing (check the
+	// arming chain); mism>0 -- the LANDED POOL STATE is wrong, leg invalid
+	// outright; checked=0 with conv>0 under the verify switch -- the byte
+	// gate is DEAD and "no mismatches" is vacuous, never a pass. Claim
+	// failures (arena exhausted etc.) stay on the [brick-gpualloc] counters,
+	// now attributed per flush.
+	if (VoxelGpuWorklistClaimEnabled())
+	{
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] wlclaim conv=%lld claimverify checked=%llu mism=%llu ")
+		       TEXT("(cumulative)%s%s"),
+		       WorklistClaimConverted,
+		       P.ClaimDwordsChecked, P.ClaimDwordMismatches,
+		       P.ClaimDwordMismatches > 0 ? TEXT(" (CLAIM VERIFY FAILED -- LEG INVALID)") : TEXT(""),
+		       (VoxelGpuWorklistVerifyClaimEnabled() && WorklistClaimConverted > 0 &&
+		        P.ClaimDwordsChecked == 0)
+			       ? TEXT(" (DEAD GATE: conv>0, checked=0 -- NOT a pass)") : TEXT(""));
+	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
 	WorklistWinPasses = 0;
@@ -2864,6 +2979,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// with AssetCount > 0 are already flowing to size it against.
 			R.AssetBase = 0;
 			R.AssetCount = uint32(Job->BrickRegion.AssetInstances.Num());
+			// The shell's descriptor-block base: the Claim stage's one
+			// CPU-dispensed input. Truthful on every record (the AssetCount
+			// precedent -- flow the data before the consumer).
+			R.BrickBase = Job->GpuBrickBase;
 			Job->BrickShading.Pack(R.ShadingClimatePacked, R.ShadingGradPacked,
 			                       R.ShadingSurfaceZBits);
 			NewRecords.Add(R);
@@ -3026,6 +3145,18 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 									RecordJobs[RIdx]->bWorklistPackFed = true;
 									++WorklistPackConverted;
 									PassesThisTick += VoxelGpuWorklistVerifyPackEnabled() ? 1 : -2;
+									// Stage 6: the flush graph claims and
+									// lands this chunk's pool state; the
+									// batch graph adds NO brick passes for
+									// it. The claim verify is a per-TICK
+									// indirect dispatch, tallied with the
+									// spine constant, not here.
+									if (Worklist.IsClaimStageArmed())
+									{
+										RecordJobs[RIdx]->bWorklistClaimFed = true;
+										++WorklistClaimConverted;
+										PassesThisTick += -5;
+									}
 								}
 							}
 						}
@@ -3455,7 +3586,23 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					// the record is zero, the verify counts it unwritten, and
 					// the window line says so. Loud, not fatal: the mesh half
 					// is unaffected, exactly like the null-buffer branch above.
-					if (BindPoolAlloc())
+					//
+					// STAGE 6 (bWorklistClaimFed): the claim AND all four
+					// writes already ran in the FLUSH graph, whose render
+					// command executed before this one -- this job adds ZERO
+					// brick passes here. Adding the classic claim anyway
+					// would DOUBLE-CLAIM the slot: the second claim's side
+					// entry overwrites the first's and the first ranges leak
+					// forever. Never fall back classically for a claim-fed
+					// job -- the flush side owns it, success or (counted,
+					// loud) failure.
+					if (Job->bWorklistClaimFed)
+					{
+						// Nothing to add. Delivery keeps the lean-alloc
+						// shape; the record landed on the GPU timeline
+						// before this command's own passes.
+					}
+					else if (BindPoolAlloc())
 					{
 						FRDGBufferRef Claim = VoxelGpuWorldGen::AddBrickPoolClaimPass(
 							GraphBuilder, PoolAllocBufs, PoolAllocLayout,
