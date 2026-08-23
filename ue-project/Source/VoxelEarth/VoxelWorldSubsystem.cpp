@@ -3905,6 +3905,42 @@ bool PerRingRelaxEnabled()
 	return bEnabled;
 }
 
+// -VoxelCutoffHeadroomDiv=N (default 8 = byte-identical control): the divisor
+// behind DropFarthestOverCap's headroom band, Headroom = EntryCap / N.
+//
+// The band is the SECOND drain-sized constant in this controller, and it was
+// sized by the same ~250 chunks/s world as the static cap: its comment says
+// the cutoff sits a band in from the farthest survivor "sized so a call's
+// admissions are on the order of what a call's dispatches drain". Drain is
+// now 2,000-3,000/s. -VoxelAdmissionCapDrainSec re-sized the cap from
+// measured drain; nothing re-sized the band, so per truncate cycle each ring
+// still exposes only shareCap/8 entries' worth of new radius while dispatch
+// drains an order of magnitude more than the number that band was tuned for.
+//
+// DIRECTION, because the index arithmetic reads backwards: survivors are
+// sorted farthest-first, so a BIGGER divisor means a SMALLER index, a cutoff
+// NEARER the farthest survivor, a WIDER admission radius -- more admitted per
+// cycle. Sweep upward (16/32/64) to open the band; 1 is the degenerate
+// tightest (cutoff at the nearest survivor, admits almost nothing) and
+// exists only so the anti-thrash claim can be tested from the other side.
+//
+// THE NUMBER THAT MUST BE WATCHED: dropped= on the admission line. The band
+// exists to prevent admit-then-truncate-drop thrash (measured ~46k
+// adds+erases/s before it existed). dispatched/5s rising with dropped=
+// proportional is the band having been the constraint; dropped= ballooning
+// while dispatched stays flat is the thrash coming back with no throughput
+// bought -- the band was doing its job, revert the rung.
+int32 CutoffHeadroomDiv()
+{
+	static const int32 Div = []
+	{
+		int32 Value = 8;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelCutoffHeadroomDiv="), Value);
+		return FMath::Clamp(Value, 1, 64);
+	}();
+	return Div;
+}
+
 // --- drain-scaled admission cap (-VoxelAdmissionCapDrainSec, 2026-08-23) ----
 //
 // WHAT DRIVES cutoffM, spelled out because it took a night to trace: the
@@ -15214,7 +15250,11 @@ bool FVoxelWorldImpl::DropFarthestOverCap(TArray<FSortEntry>& Entries, int32 Ent
 	// chunks that are clearly nearer, sized so a call's admissions are on the
 	// order of what a call's dispatches drain, which is the whole point of the
 	// exercise: make production track drain.
-	const int32 Headroom = FMath::Max(1, EntryCap / 8);
+	// /8 was tuned against ~250 chunks/s of drain; the divisor is sweepable
+	// because drain is now 10x that -- see CutoffHeadroomDiv's comment for
+	// the direction (bigger divisor = wider band) and the dropped= reading
+	// that decides whether a rung bought throughput or just thrash.
+	const int32 Headroom = FMath::Max(1, EntryCap / VoxelStreamAdmission::CutoffHeadroomDiv());
 	const int32 CutoffIndex = FMath::Min(Headroom, Write - 1);
 	OutCutoffDistSq = (Write > 0) ? Entries[CutoffIndex].DistSq : DBL_MAX;
 	return true;
