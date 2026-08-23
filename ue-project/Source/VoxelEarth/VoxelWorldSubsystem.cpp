@@ -17168,7 +17168,53 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandColdOnly="), Value);
 			return Value != 0;
 		}();
-		// Attribution first (see FootprintBandRequestInFlight's declaration for
+		// -VoxelGpuBandSeedOnly=1 (default off, latched -- the -ExecCmds
+		// startup-window rule): AT MOST ONE band-carrying job per footprint,
+		// EVER. Request the band only when it is uncached AND no band-carrying
+		// job for this footprint is already in flight; every other job goes
+		// band-free, which is what makes it eligible for the lean graph
+		// (-VoxelGpuLeanBrickJobs), the B.1 fused stacks, and the worklist
+		// records -- every one of which rejects on BandEdge != 0 -- and what
+		// removes the job's only remaining readback fence under PoolAlloc.
+		//
+		// WHY BandColdOnly IS NOT ENOUGH, with the cold-fill numbers that
+		// forced this: BandColdOnly suppresses the band only once the cache is
+		// WARM, and cold start -- the owner's stated target -- is exactly when
+		// it is not. On the measured cold fill the fork carried 3-4% of
+		// dispatch (forkDispatched ~600 vs dispatched ~17k per 5 s window)
+		// while the manager's skip line read band=16,210: every uncached
+		// footprint's whole ~8.3-chunk column carried a band request, each one
+		// a readback fence, so fork slots recycled at round-trip speed and 96%
+		// of the work fell to a CPU that is power-limited at ~10.5k jobs/s
+		// (doubling workers halves the clock; the box gives the same jobs/s at
+		// any thread count). Seed-only caps the band-carrying population at
+		// one per footprint from the very first tick.
+		//
+		// WHAT A DEDUPED COLUMN-MATE LOSES: nothing that lasts. Its result
+		// carries bBandValid=false -- already a legal state every consumer
+		// guards on -- and the footprint's band still arrives, once, from the
+		// seed (or from any CPU worker job for the footprint, which computes
+		// bands from the column grid it builds anyway). Until it lands the
+		// column-mates simply mesh without a predicted-empty verdict, exactly
+		// what every job did before the band existed. The cold-band throttle,
+		// where armed, is what keeps most column-mates from even dispatching
+		// until the seed drains; this switch covers the paths the throttle
+		// does not (throttle off, and the speculative submitter).
+		//
+		// Observable on the "Voxel GPU band requests" window line: seed-only
+		// forces dup=0 and redundant=0 BY CONSTRUCTION, so the readings that
+		// matter are free= rising toward the fork's level-0 dispatch count and
+		// the manager's band= skip collapsing toward seed=. If instead
+		// bandCache stalls while free rises, seeds are being lost and this
+		// switch is starving the buried-skip -- that is the failing state, and
+		// holes/uncovered would follow it.
+		static const bool bBandSeedOnly = []
+		{
+			int32 Value = 0;
+			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandSeedOnly="), Value);
+			return Value != 0;
+		}();
+		// Attribution (see FootprintBandRequestInFlight's declaration for
 		// the three causes and their failing readings): the manager's worklist
 		// line collapses every band-carrying job into one `band=` skip counter,
 		// and the split decides which fix is real, so it is computed HERE where
@@ -17189,7 +17235,13 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 				FootprintBandRequestInFlight.Remove(BandFootprint);
 			}
 		}
-		if (!bBandColdOnly || !bBandCached)
+		// Seed-only: request iff uncached AND nothing fresh in flight. Legacy
+		// (seed-only off): request unless BandColdOnly has a warm cache entry
+		// to point at -- the shipped behaviour, byte-identical.
+		const bool bWantBand = bBandSeedOnly
+			? (!bBandCached && !bBandReqInFlight)
+			: (!bBandColdOnly || !bBandCached);
+		if (bWantBand)
 		{
 			Req.BandOriginI = kBandApronOffset;
 			Req.BandOriginJ = kBandApronOffset;
