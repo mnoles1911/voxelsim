@@ -2,7 +2,19 @@
 // FVoxelGpuWorklist -- the persistent chunk-record ring for P3 (persistent
 // worklist + indirect dispatch; docs/gpu-worklist-plan-2026-08-23.md).
 //
-// *** SPINE WIRED; FIRST KERNEL CONVERTED: Column (2026-08-23). ***
+// *** SPINE WIRED; KERNELS CONVERTED: Column, Voxelize (2026-08-23). ***
+// Behind -VoxelGpuWorklistVoxelize=1 (on top of the two switches below) the
+// flush graph ALSO dispatches VoxelizeWorklistMain once per tick: every
+// consumed asset-free record's 32,768 cells land in a flush-level CELL ARENA
+// (128 KiB/record; consume clamped to -VoxelGpuWorklistCellBudget records per
+// flush, default 256), the chunk's BrickClassify/BrickPack read the slice
+// through brickpack.ush's CellReadBase, and the chunk's own VoxelizeMain is
+// SKIPPED (16 -> 15 passes on the lean-alloc shape). Asset chunks fall back
+// by design until the flush-level asset buffer lands. Byte gate:
+// -VoxelGpuWorklistVerifyVox=1 into stats [6..7]. Five stages remain:
+// AssetStamp, ClassifyTotals, PackClaim, Write, Record.
+//
+// The stage-1 banner, still accurate for the Column stage:
 // Behind -VoxelGpuWorklistColumns=1 (on top of -VoxelGpuWorklist=1) the flush
 // graph now also dispatches ColumnWorklistMain (VoxelWorklistColumn.usf) once
 // per tick through the Column-stage indirect triple: every consumed record's
@@ -101,9 +113,17 @@ public:
 	// the plan doc mandates per converted kernel.
 	static constexpr uint32 kColumnsPerRecord = 1024;
 	static constexpr uint32 kColumnGroupsPerRecord = kColumnsPerRecord / 64;
+	// The Voxelize stage keeps the classic kernel's own mapping -- one thread
+	// per COLUMN looping the 32 z cells, NOT one per cell: the cave and cavern
+	// reductions are per-column and per-cell threads would recompute each 32
+	// times. So its group count per record is the Column stage's, and its
+	// arena slice is the lean chunk's 32x32x32 cells.
+	static constexpr uint32 kCellsPerRecord = 32768;
+	static constexpr uint32 kVoxelizeGroupsPerRecord = kColumnsPerRecord / 64;
 	// Stats buffer: [0..3] the prover's evidence (VoxelWorklistConsume.usf),
 	// [4..5] the column verify's mismatch/checked counters
-	// (VoxelWorklistColumn.usf), [6..7] reserved for later stages.
+	// (VoxelWorklistColumn.usf), [6..7] the voxelize verify's mismatch/checked
+	// counters (VoxelWorklistVoxelize.usf).
 	static constexpr uint32 kStatsDwords = 8;
 
 	~FVoxelGpuWorklist();
@@ -134,6 +154,21 @@ public:
 	void SetColumnStageInputs(FVoxelRasterAtlasGpu* Atlas, uint64 Seed, int32 PixelSizeMm);
 	bool IsColumnStageArmed() const { return bColumnStageArmed; }
 
+	// --- the Voxelize stage (-VoxelGpuWorklistVoxelize) ---------------------
+	//
+	// Game thread, before Flush, idempotent. No inputs of its own: the
+	// voxelize kernel reads the SAME process-wide inputs the column stage
+	// carries (atlas, seed, pitch -- SetColumnStageInputs) plus the column
+	// arena itself, which is why arming is a flag and a budget rather than a
+	// second input set, and why IsVoxelizeStageArmed() is false until the
+	// column stage is armed too. CellBudgetRecords caps how many records one
+	// flush may consume while this stage is armed: the cell arena costs 128
+	// KiB per slice (32,768 cells x 4 B), so the default budget of 1,024
+	// records would be 128 MiB -- the plan doc says start smaller and latch
+	// it up when refusedFull says so.
+	void SetVoxelizeStageArmed(bool bArmed, uint32 CellBudgetRecords);
+	bool IsVoxelizeStageArmed() const { return bVoxelizeStageArmed && bColumnStageArmed; }
+
 	// Game thread: the consume window the most recent Flush mirrored --
 	// [ConsumeFirst, ConsumeFirst + Take) in monotonic record indices. A
 	// record appended at monotonic index m was consumed by that flush iff
@@ -152,8 +187,12 @@ public:
 	// when that happens, never silently read a buffer that does not exist.
 	struct FColumnStageBindings
 	{
-		FRDGBufferRef Arena = nullptr;   // budget x 1,024 GpuColumnSample
-		FRDGBufferRef Stats = nullptr;   // kStatsDwords dwords (verify writes [4..5])
+		FRDGBufferRef Arena = nullptr;     // budget x 1,024 GpuColumnSample
+		FRDGBufferRef Stats = nullptr;     // kStatsDwords dwords (verifies write [4..7])
+		// The Voxelize stage's cell arena (cellBudget x 32,768 uint). Null
+		// until the first voxelize-armed Flush has run on the render thread
+		// -- same fallback-and-count contract as Arena.
+		FRDGBufferRef CellArena = nullptr;
 	};
 	FColumnStageBindings RegisterColumnStage(FRDGBuilder& GraphBuilder);
 
@@ -193,6 +232,12 @@ public:
 		uint64 MalformedOnGpu = 0;
 		uint64 ColumnDwordMismatches = 0;
 		uint64 ColumnsChecked = 0;
+		// The Voxelize stage's byte gate, same contract as the column pair:
+		// VoxCellMismatches > 0 invalidates the leg; VoxCellsChecked == 0
+		// with the verify switch armed and converted chunks flowing means the
+		// gate is dead and "no mismatches" is vacuous.
+		uint64 VoxCellMismatches = 0;
+		uint64 VoxCellsChecked = 0;
 	};
 	FProofStatus GetProofStatus() const { return Proof; }
 
@@ -244,6 +289,11 @@ private:
 	int32 ColumnPixelSizeMm = 0;
 	uint32 ColumnArenaRecords = 0;   // slices the arena holds; latched at creation
 	TRefCountPtr<FRDGPooledBuffer> PooledColumnArena;
+	// --- Voxelize stage (same lifetime rules as the column arena) -----------
+	bool bVoxelizeStageArmed = false;
+	uint32 VoxelizeCellBudget = 0;   // per-flush record cap while armed (see setter)
+	uint32 CellArenaRecords = 0;     // slices the cell arena holds; latched at creation
+	TRefCountPtr<FRDGPooledBuffer> PooledCellArena;
 	FLastFlush LastFlush;
 
 	// --- the spine proof (game-thread state) --------------------------------

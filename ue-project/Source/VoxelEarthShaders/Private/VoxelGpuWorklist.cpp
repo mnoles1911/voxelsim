@@ -77,6 +77,8 @@ namespace
 	// Column-stage verify counters (stats [4..5]); cumulative, like the rest.
 	std::atomic<uint32> GProofColMismatch{ 0 };
 	std::atomic<uint32> GProofColChecked{ 0 };
+	std::atomic<uint32> GProofVoxMismatch{ 0 };
+	std::atomic<uint32> GProofVoxChecked{ 0 };
 
 	// Groups per record per stage -- the host copy of the stage shapes the
 	// converted kernels are written against. The Column entry is LOCKED: it
@@ -89,7 +91,10 @@ namespace
 	const uint32 kGroupsPerRecord[uint8(EVoxelWorklistStage::COUNT)] =
 	{
 		FVoxelGpuWorklist::kColumnGroupsPerRecord,   // Column: 1024 columns / 64 = 16 (LOCKED)
-		512,  // Voxelize: 32^3 cells / 64
+		// Voxelize keeps the classic kernel's one-thread-per-COLUMN mapping
+		// (cave/cavern reductions are per column), not the plan's provisional
+		// per-cell 512: 1024 columns / 64 = 16.
+		FVoxelGpuWorklist::kVoxelizeGroupsPerRecord, // Voxelize: (LOCKED)
 		16,   // AssetStamp: per-column gather, 1024 columns / 64
 		1,    // ClassifyTotals: 64 bricks, one group
 		2,    // PackClaim: classify+pack pair
@@ -250,10 +255,40 @@ void FVoxelGpuWorklist::SetColumnStageInputs(FVoxelRasterAtlasGpu* Atlas, uint64
 	bColumnStageArmed = true;
 }
 
+void FVoxelGpuWorklist::SetVoxelizeStageArmed(bool bArmed, uint32 CellBudgetRecords)
+{
+	check(IsInGameThread());
+	if (bArmed && CellBudgetRecords == 0)
+	{
+		// A zero cell budget would clamp every flush's Take to zero -- the
+		// worklist would consume NOTHING while every counter upstream looked
+		// armed. Refuse the arm loudly instead of running dead.
+		UE_LOG(LogVoxelGpuWorklist, Error,
+		       TEXT("[gpu-worklist] Voxelize stage arm REFUSED: cell budget 0 would clamp ")
+		       TEXT("consumption to zero. Set -VoxelGpuWorklistCellBudget."));
+		bVoxelizeStageArmed = false;
+		return;
+	}
+	bVoxelizeStageArmed = bArmed;
+	VoxelizeCellBudget = CellBudgetRecords;
+}
+
 void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 {
 	check(IsInGameThread());
 	check(IsInitialized());
+	// Voxelize stage armed: the CELL arena caps how many records one flush
+	// may consume -- 128 KiB per slice means the ring budget's default 1,024
+	// would be a 128 MiB arena. Clamped HERE, before the host consume mirror
+	// and the captured args budget, so the GPU's min(pending, budget), the
+	// host's, and the arena size are the same number by construction. The
+	// unconsumed remainder stays pending in the ring for the next tick;
+	// sustained clamping shows up as pending>0 across window lines, and the
+	// relief valve is -VoxelGpuWorklistCellBudget.
+	if (IsVoxelizeStageArmed())
+	{
+		SliceBudgetRecords = FMath::Min(SliceBudgetRecords, VoxelizeCellBudget);
+	}
 	const uint32 NewHead = Head + uint32(Staged.Num());
 	const uint32 FirstSlot = Head % Capacity;
 
@@ -297,10 +332,26 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		const uint32 GpuTail = GProofGpuTail.load(std::memory_order_relaxed);
 		const uint32 ColMismatch = GProofColMismatch.load(std::memory_order_relaxed);
 		const uint32 ColChecked = GProofColChecked.load(std::memory_order_relaxed);
+		const uint32 VoxMismatch = GProofVoxMismatch.load(std::memory_order_relaxed);
+		const uint32 VoxChecked = GProofVoxChecked.load(std::memory_order_relaxed);
 		Proof.MalformedOnGpu = GpuBad;
 		Proof.ColumnDwordMismatches = ColMismatch;
 		Proof.ColumnsChecked = ColChecked;
+		Proof.VoxCellMismatches = VoxMismatch;
+		Proof.VoxCellsChecked = VoxChecked;
 		++Proof.Landed;
+		if (VoxMismatch > 0)
+		{
+			// THE VOXELIZE-STAGE FAILING READING, the column one's twin: the
+			// converted kernel computed different CELLS than the classic
+			// dispatch of the same chunk. Those cells are what BrickPack put
+			// in the pool -- the leg is invalid and the terrain is wrong.
+			UE_LOG(LogVoxelGpuWorklist, Error,
+			       TEXT("[gpu-worklist] VOXELIZE VERIFY FAIL: %u mismatching cells over %u ")
+			       TEXT("compared (cumulative). The converted Voxelize kernel and the classic ")
+			       TEXT("VoxelizeMain disagree; the leg is invalid."),
+			       VoxMismatch, VoxChecked);
+		}
 		if (ColMismatch > 0)
 		{
 			// THE COLUMN-STAGE FAILING READING: the converted kernel computed
@@ -339,8 +390,10 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		{
 			UE_LOG(LogVoxelGpuWorklist, Log,
 			       TEXT("[gpu-worklist] proof #%u ok: gpu consumed=%u fold=0x%08x tail=%u ")
-			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u)"),
-			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch);
+			       TEXT("== host (malformed-on-gpu=%u; colverify checked=%u mism=%u; ")
+			       TEXT("voxverify checked=%u mism=%u)"),
+			       ProofSeq, GpuConsumed, GpuFold, GpuTail, GpuBad, ColChecked, ColMismatch,
+			       VoxChecked, VoxMismatch);
 			if (GpuBad > 0)
 			{
 				UE_LOG(LogVoxelGpuWorklist, Error,
@@ -378,7 +431,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 		 // Column stage: plain values latched on the game thread. The atlas
 		 // pointer is process-lifetime (FVoxelWorldImpl owns it), the same
 		 // lifetime argument every region graph already leans on.
-		 bColumns = bColumnStageArmed, Atlas = ColumnAtlas,
+		 bColumns = bColumnStageArmed, bVoxelize = IsVoxelizeStageArmed(),
+		 Atlas = ColumnAtlas,
 		 ColSeedLo = ColumnSeedLo, ColSeedHi = ColumnSeedHi,
 		 ColPixelSizeMm = ColumnPixelSizeMm](FRHICommandListImmediate& RHICmdList)
 	{
@@ -396,6 +450,8 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 				GProofGpuTail.store(Data[3], std::memory_order_relaxed);
 				GProofColMismatch.store(Data[4], std::memory_order_relaxed);
 				GProofColChecked.store(Data[5], std::memory_order_relaxed);
+				GProofVoxMismatch.store(Data[6], std::memory_order_relaxed);
+				GProofVoxChecked.store(Data[7], std::memory_order_relaxed);
 				GProofLandedSeq.store(ProofCopySeq, std::memory_order_release);
 			}
 			ProofReadback->Unlock();
@@ -497,6 +553,56 @@ void FVoxelGpuWorklist::Flush(uint32 SliceBudgetRecords)
 			Dispatch.SeedHi = ColSeedHi;
 			Dispatch.PixelSizeMm = ColPixelSizeMm;
 			VoxelGpuWorldGen::AddWorklistColumnPass(GraphBuilder, Dispatch);
+
+			// --- the CONVERTED Voxelize stage: SECOND indirect dispatch -----
+			//
+			// Reads the column arena the pass above just wrote (RDG orders
+			// the two by that dependency), writes the cell arena the batch
+			// graph's BrickClassify/BrickPack will read through CellReadBase.
+			// One pass per tick for this stage too; asset records early-out
+			// inside the kernel (group-uniform) and keep their classic
+			// Voxelize + AssetStamp. Recorded even at Take == 0 -- the
+			// constant-pass-per-tick property, stage 1's reason verbatim.
+			if (bVoxelize)
+			{
+				if (!PooledCellArena.IsValid())
+				{
+					// Lazy, AllocatePooledBuffer, batch-graph-readable: the
+					// column arena's reasons verbatim. Sized to the CLAMPED
+					// budget -- the clamp at the top of Flush is what makes
+					// "Take fits the arena" an identity, not a hope.
+					CellArenaRecords = FMath::Max(SliceBudgetRecords, 1u);
+					PooledCellArena = AllocatePooledBuffer(
+						FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32),
+						                                     CellArenaRecords * kCellsPerRecord),
+						TEXT("Voxel.WorklistCellArena"));
+					UE_LOG(LogVoxelGpuWorklist, Log,
+					       TEXT("[gpu-worklist] cell arena created: %u slices x %u cells ")
+					       TEXT("(%.1f MiB); Voxelize stage dispatching indirect from this ")
+					       TEXT("flush on (per-flush consume clamped to %u records)."),
+					       CellArenaRecords, kCellsPerRecord,
+					       double(CellArenaRecords) * double(kCellsPerRecord) *
+					       double(sizeof(uint32)) / (1024.0 * 1024.0),
+					       CellArenaRecords);
+				}
+				FRDGBufferRef CellArena = GraphBuilder.RegisterExternalBuffer(
+					PooledCellArena, TEXT("Voxel.WorklistCellArena"));
+
+				VoxelGpuWorldGen::FWorklistVoxelizeDispatch VDispatch;
+				VDispatch.Records = Records;
+				VDispatch.Control = Control;
+				VDispatch.IndirectArgs = Args;
+				VDispatch.IndirectArgsOffset =
+					uint32(EVoxelWorklistStage::Voxelize) * 3u * uint32(sizeof(uint32));
+				VDispatch.RingCapacity = Capacity;
+				VDispatch.ColumnArena = Arena;
+				VDispatch.CellArena = CellArena;
+				VDispatch.Atlas = Atlas;
+				VDispatch.SeedLo = ColSeedLo;
+				VDispatch.SeedHi = ColSeedHi;
+				VDispatch.PixelSizeMm = ColPixelSizeMm;
+				VoxelGpuWorldGen::AddWorklistVoxelizePass(GraphBuilder, VDispatch);
+			}
 		}
 
 		// --- the spine prover: the first indirect consumer ------------------
@@ -571,6 +677,11 @@ FVoxelGpuWorklist::FColumnStageBindings FVoxelGpuWorklist::RegisterColumnStage(F
 	{
 		Out.Arena = GraphBuilder.RegisterExternalBuffer(PooledColumnArena,
 		                                                TEXT("Voxel.WorklistColumnArena"));
+	}
+	if (PooledCellArena.IsValid())
+	{
+		Out.CellArena = GraphBuilder.RegisterExternalBuffer(PooledCellArena,
+		                                                    TEXT("Voxel.WorklistCellArena"));
 	}
 	if (PooledStats.IsValid())
 	{

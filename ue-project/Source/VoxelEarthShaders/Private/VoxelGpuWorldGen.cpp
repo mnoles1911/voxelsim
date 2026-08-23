@@ -247,6 +247,76 @@ namespace
 		}
 	};
 
+	// --- VoxelizeWorklistMain: the CONVERTED Voxelize stage (P3 stage 2) ----
+	//
+	// One indirect dispatch per tick off the worklist args (16 groups per
+	// consumed record -- one thread per COLUMN, the classic mapping), reading
+	// the column arena the column pass wrote earlier in the same flush graph
+	// and writing every consumed record's 32,768 cells into the flush-level
+	// cell arena -- VoxelWorklistVoxelize.usf has the whole argument. Atlas
+	// always on, FVoxelWorldGenShader base: FVoxelWorklistColumnCS's reasons.
+	class FVoxelWorklistVoxelizeCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistVoxelizeCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistVoxelizeCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			VOXEL_RASTER_ATLAS_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			// worldgen.ush's own binding names: the column arena reads as
+			// InColumns, the cell arena writes as OutCells.
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelWorldGenShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VXC_RASTER_ATLAS"), 1);
+			// The torn-dispatch lock: the kernel #errors if its own derivation
+			// of the stage shape disagrees with the host table entries these
+			// defines are built from.
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_VOXELIZE_GROUPS"),
+			                         FVoxelGpuWorklist::kVoxelizeGroupsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_COLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kColumnsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_CELLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kCellsPerRecord);
+		}
+	};
+
+	// --- VoxelizeWorklistVerifyMain: converted cells vs classic cells -------
+	// (-VoxelGpuWorklistVerifyVox; the stage's byte gate.) One 512-group pass
+	// per VERIFIED chunk, verify arm only, accumulating into the worklist
+	// stats buffer's [6..7] so the result rides the existing proof readback.
+	class FVoxelWorklistVoxelizeVerifyCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistVoxelizeVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistVoxelizeVerifyCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyClassicCells)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, VerifyArenaCells)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
+			SHADER_PARAMETER(uint32, VerifyArenaBase)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			// Same defines as the main kernel: they share the file and its
+			// shape #errors.
+			FVoxelWorklistVoxelizeCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		}
+	};
+
 	// --- MeshCountMain: greedy meshing, counting only ----------------------
 	class FVoxelMeshCountCS : public FVoxelWorldGenShader
 	{
@@ -577,7 +647,8 @@ namespace
 		SHADER_PARAMETER(uint32,       BrickDescBase) \
 		SHADER_PARAMETER(uint32,       OccWriteBase) \
 		SHADER_PARAMETER(uint32,       MatWriteBase) \
-		SHADER_PARAMETER(uint32,       ChunkRecordBase)
+		SHADER_PARAMETER(uint32,       ChunkRecordBase) \
+		SHADER_PARAMETER(uint32,       CellReadBase)
 
 	class FVoxelBrickClassifyCS : public FVoxelBrickPackShader
 	{
@@ -1080,6 +1151,9 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain", 
 #define VOXEL_WORKLIST_COLUMN_USF "/VoxelEarth/VoxelWorklistColumn.usf"
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistColumnCS,       VOXEL_WORKLIST_COLUMN_USF, "ColumnWorklistMain",       SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistColumnVerifyCS, VOXEL_WORKLIST_COLUMN_USF, "ColumnWorklistVerifyMain", SF_Compute);
+#define VOXEL_WORKLIST_VOXELIZE_USF "/VoxelEarth/VoxelWorklistVoxelize.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistVoxelizeCS,       VOXEL_WORKLIST_VOXELIZE_USF, "VoxelizeWorklistMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistVoxelizeVerifyCS, VOXEL_WORKLIST_VOXELIZE_USF, "VoxelizeWorklistVerifyMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
@@ -1105,6 +1179,10 @@ namespace
 		Out.OccWriteBase = 0;
 		Out.MatWriteBase = 0;
 		Out.ChunkRecordBase = 0;
+		// P3 Voxelize stage: 0 everywhere except the two brick-chain passes
+		// of a cell-fed chunk, which override it after this call. A READ
+		// base -- the four zero WRITE bases above keep their contract.
+		Out.CellReadBase = 0;
 	}
 
 	// Fills the loose parameters that every kernel shares. ScanCount varies by
@@ -1589,6 +1667,24 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	const bool bVerifyColumns = bWorklistColumns && ColumnFeed->bVerify
 	                         && ColumnFeed->VerifyStats != nullptr;
 
+	// --- P3 Voxelize stage: are this region's CELLS already in the arena? ---
+	//
+	// Same hard-check reasoning as the column feed: a violation would not
+	// fail, it would pack plausible bricks from someone else's cells.
+	const bool bWorklistCells = bWorklistColumns && ColumnFeed->CellArena != nullptr;
+	if (bWorklistCells)
+	{
+		checkf(Request.AssetInstances.Num() == 0 && Request.BricksZ == 4
+		       && Request.bBrickPack && !Request.bMeshChain,
+		       TEXT("worklist cell feed on a region that is not a lean asset-free brick chunk"));
+	}
+	// Verify arm for the cells: the classic VoxelizeMain still runs (into the
+	// region transient, reading the SAME arena columns the converted kernel
+	// read) purely as the byte reference; the brick chain reads the ARENA
+	// either way, so the verified path is the live path.
+	const bool bVerifyVox = bWorklistCells && ColumnFeed->bVerifyVox
+	                     && ColumnFeed->VerifyStats != nullptr;
+
 	// --- inputs -----------------------------------------------------
 	//
 	// A: under bRasterAtlas there IS no per-request raster -- the sampling
@@ -1630,9 +1726,15 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			TEXT("Voxel.Columns"))
 		: nullptr;
 
-	Out.Cells = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells),
-		TEXT("Voxel.Cells"));
+	// P3 Voxelize stage: with a cell feed and no verify, NO Voxel.Cells
+	// transient exists for this region -- the cells live in the worklist cell
+	// arena and the brick chain reads them there. Null-not-unwritten, the
+	// Columns rule above verbatim.
+	Out.Cells = (!bWorklistCells || bVerifyVox)
+		? GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells),
+			TEXT("Voxel.Cells"))
+		: nullptr;
 
 	// --- pass 1: ColumnMain ----------------------------------------
 	//
@@ -1684,6 +1786,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	}
 
 	// --- pass 2: VoxelizeMain --------------------------------------
+	//
+	// SKIPPED with a worklist CELL feed (the once-per-tick indirect
+	// VoxelizeWorklistMain already computed this chunk's cell slice) -- the
+	// Voxelize stage's entire win, the Column skip's twin. Under the verify
+	// arm the classic pass still runs, into the transient, purely as the
+	// byte reference; the brick chain reads the ARENA either way.
+	if (!bWorklistCells || bVerifyVox)
 	{
 		FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
 		FillLooseParameters(*Params, Request);
@@ -1711,6 +1820,24 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		FComputeShaderUtils::AddPass(
 			GraphBuilder, RDG_EVENT_NAME("Voxel.VoxelizeMain"), Shader, Params,
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
+	}
+
+	// --- pass 2v (verify arm only): converted cells vs classic --------------
+	if (bVerifyVox)
+	{
+		FVoxelWorklistVoxelizeVerifyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistVoxelizeVerifyCS::FParameters>();
+		Params->VerifyClassicCells = GraphBuilder.CreateSRV(Out.Cells);
+		Params->VerifyArenaCells = GraphBuilder.CreateSRV(ColumnFeed->CellArena);
+		Params->WorklistStats = GraphBuilder.CreateUAV(ColumnFeed->VerifyStats);
+		Params->VerifyArenaBase = ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord;
+
+		TShaderMapRef<FVoxelWorklistVoxelizeVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("Voxel.WorklistVoxelizeVerify(slice %u)", ColumnFeed->SliceIndex),
+			Shader, Params,
+			FIntVector(FVoxelGpuWorklist::kCellsPerRecord / 64, 1, 1));
 	}
 
 	// --- pass 2a: AssetStampMain / AssetStampCoarseMain, one dispatch per ----
@@ -1948,7 +2075,14 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FVoxelBrickClassifyCS::FParameters* Params =
 				GraphBuilder.AllocParameters<FVoxelBrickClassifyCS::FParameters>();
 			FillBrickPackParameters(*Params, Request, S.NumBricks);
-			Params->InCells = GraphBuilder.CreateSRV(Out.Cells);
+			// P3 Voxelize stage: a cell-fed chunk's cells are its slice of
+			// the worklist cell arena, addressed through CellReadBase.
+			// Classic: the region's own transient at base 0 -- the compiled
+			// +0 changes no output byte, the digest's guarantee.
+			Params->InCells = GraphBuilder.CreateSRV(
+				bWorklistCells ? ColumnFeed->CellArena : Out.Cells);
+			Params->CellReadBase = bWorklistCells
+				? ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord : 0u;
 			Params->OutBrickOccCounts = GraphBuilder.CreateUAV(OccCounts);
 			Params->OutBrickMatCounts = GraphBuilder.CreateUAV(MatCounts);
 
@@ -1970,7 +2104,13 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FVoxelBrickPackCS::FParameters* Params =
 				GraphBuilder.AllocParameters<FVoxelBrickPackCS::FParameters>();
 			FillBrickPackParameters(*Params, Request, S.NumBricks);
-			Params->InCells = GraphBuilder.CreateSRV(Out.Cells);
+			// Same cell source and read base as BrickClassifyMain above --
+			// the two halves of the chain must read the same cells or the
+			// counts and the payload describe different bricks.
+			Params->InCells = GraphBuilder.CreateSRV(
+				bWorklistCells ? ColumnFeed->CellArena : Out.Cells);
+			Params->CellReadBase = bWorklistCells
+				? ColumnFeed->SliceIndex * FVoxelGpuWorklist::kCellsPerRecord : 0u;
 			Params->InBrickOccOffsets = GraphBuilder.CreateSRV(OccOffsets);
 			Params->InBrickMatOffsets = GraphBuilder.CreateSRV(MatOffsets);
 			Params->OutBrickDesc = GraphBuilder.CreateUAV(Out.BrickDesc);
@@ -2216,6 +2356,55 @@ void VoxelGpuWorldGen::AddWorklistColumnPass(FRDGBuilder& GraphBuilder,
 	// even when Take is 0 -- a constant pass per tick is the property.
 	FComputeShaderUtils::AddPass(
 		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistColumn(indirect)"), Shader, Params,
+		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+}
+
+void VoxelGpuWorldGen::AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder,
+                                               const FWorklistVoxelizeDispatch& Dispatch)
+{
+	check(IsInRenderingThread());
+	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs);
+	check(Dispatch.ColumnArena && Dispatch.CellArena);
+	check(Dispatch.Atlas != nullptr && Dispatch.PixelSizeMm != 0 && Dispatch.RingCapacity > 0);
+
+	const FVoxelRasterAtlasBindings AtlasBindings = Dispatch.Atlas->Register(GraphBuilder);
+
+	FVoxelWorklistVoxelizeCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelWorklistVoxelizeCS::FParameters>();
+	// AddWorklistColumnPass's split verbatim: process-wide half in the loose
+	// block, per-record half off the ring inside the kernel, per-region
+	// fields zeroed dead weight.
+	Params->DispatchColumns = FUintVector2(32, 32);
+	Params->RasterOriginPx = FIntPoint::ZeroValue;
+	Params->RasterSize = FUintVector2(0, 0);
+	Params->PixelSizeMm = Dispatch.PixelSizeMm;
+	Params->SeedLo = Dispatch.SeedLo;
+	Params->SeedHi = Dispatch.SeedHi;
+	Params->OriginVx = 0;
+	Params->OriginVy = 0;
+	Params->BrickZMin = 0;
+	Params->BricksZ = 4;
+	Params->ScanCount = 0;
+	Params->CoarseScale = 1;
+	Params->RingSkirtMask = 0;
+	// Same single accessor FillLooseParameters reads: the converted and
+	// classic dispatches cannot be configured apart, which is what makes the
+	// byte gate a statement about the kernels rather than the knobs.
+	Params->SurfaceMip = SurfaceMipEnabled() ? 1u : 0u;
+	FillRasterAtlasParameters(*Params, AtlasBindings);
+	Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+	Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+	Params->RingCapacity = Dispatch.RingCapacity;
+	Params->InColumns = GraphBuilder.CreateSRV(Dispatch.ColumnArena);
+	Params->OutCells = GraphBuilder.CreateUAV(Dispatch.CellArena);
+	Params->IndirectArgs = Dispatch.IndirectArgs;
+
+	TShaderMapRef<FVoxelWorklistVoxelizeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// Group count = Take * 16 off the Voxelize triple the args pass wrote.
+	// Recorded even when Take is 0 -- constant passes per tick is the
+	// property this arm exists for.
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistVoxelize(indirect)"), Shader, Params,
 		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
 }
 

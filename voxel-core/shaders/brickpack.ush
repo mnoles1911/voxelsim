@@ -143,7 +143,20 @@ uint BrickDescBase;
 uint OccWriteBase;
 uint MatWriteBase;
 uint ChunkRecordBase;
+// P3 worklist Voxelize stage (VXC_UE only; docs/gpu-worklist-plan-2026-08-23.md):
+// base ELEMENT added to every InCells read, worldgen.ush's ColumnReadBase
+// pattern verbatim. 0 on every classic dispatch -- the shipped indexing plus a
+// uniform +0, which changes no output byte -- and sliceIndex * 32768 when this
+// chunk's cells live in the shared worklist CELL ARENA (VoxelizeWorklistMain
+// wrote them there, one 32,768-cell slice per consumed record). A READ base
+// only: the four WRITE bases above keep their zero-on-every-path contract, and
+// the descriptor bytes cannot be touched by a read-side offset. The bench form
+// never compiles a worklist arm, so it keeps the literal 0.
+uint CellReadBase;
 #else
+static const uint CellReadBase = 0;
+#endif
+#ifndef VXC_UE
 cbuffer BrickPackParams : register(b0)
 {
     uint2 DispatchColumns;  // region columns along x,y -- multiples of 8, and
@@ -285,7 +298,11 @@ bool decodeBrick(uint packIndex, out uint3 brick, out uint cellBase,
     brick = uint3(cx * kBricksPerChunkEdge + lx,
                   cy * kBricksPerChunkEdge + ly,
                   cz * kBricksPerChunkEdge + lz);
-    cellBase = ((brick.x + bricksX * brick.y) * BricksZ + brick.z) * kBrickCells;
+    // CellReadBase is 0 on every classic dispatch (see its declaration);
+    // nonzero only when this chunk's cells live in the worklist cell arena.
+    // Added HERE, once, because cellBase's only consumers are InCells reads --
+    // the descriptor/write side never sees it.
+    cellBase = CellReadBase + ((brick.x + bricksX * brick.y) * BricksZ + brick.z) * kBrickCells;
     return true;
 }
 

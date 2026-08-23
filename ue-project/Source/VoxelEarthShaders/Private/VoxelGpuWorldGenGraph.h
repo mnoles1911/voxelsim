@@ -168,7 +168,22 @@ namespace VoxelGpuWorldGen
 		FRDGBufferRef Arena = nullptr;        // budget x 1,024 GpuColumnSample
 		uint32 SliceIndex = 0;                // this chunk's slice in this tick's consume
 		bool bVerify = false;
-		FRDGBufferRef VerifyStats = nullptr;  // the worklist stats buffer ([4..5])
+		FRDGBufferRef VerifyStats = nullptr;  // the worklist stats buffer ([4..7])
+
+		// P3 Voxelize stage: non-null when this chunk's CELLS were also
+		// computed this tick by the worklist's indirect Voxelize dispatch
+		// (VoxelizeWorklistMain writing the flush-level cell arena at slice
+		// SliceIndex * 32768). AddRegionPasses then SKIPS its VoxelizeMain
+		// pass and binds BrickClassify/BrickPack's InCells to this arena at
+		// CellReadBase = SliceIndex * 32768. Null -- the chunk voxelizes
+		// classically (spine-only legs, asset chunks, deferred records).
+		// EXTRA PRECONDITIONS the caller owns (checkf'd): no asset instances,
+		// BricksZ == 4, brick-only (no mesh chain), bBrickPack.
+		FRDGBufferRef CellArena = nullptr;    // cellBudget x 32,768 uint
+		// Verify arm for the Voxelize stage: run the classic VoxelizeMain as
+		// well (into the region's transient Cells, reading the SAME column
+		// arena slice) plus a compare pass into VerifyStats [6..7].
+		bool bVerifyVox = false;
 	};
 
 	// The once-per-tick indirect Column dispatch, added to the worklist FLUSH
@@ -190,6 +205,26 @@ namespace VoxelGpuWorldGen
 		int32 PixelSizeMm = 0;
 	};
 	void AddWorklistColumnPass(FRDGBuilder& GraphBuilder, const FWorklistColumnDispatch& Dispatch);
+
+	// The once-per-tick indirect Voxelize dispatch (P3 stage 2), added to the
+	// worklist FLUSH graph right after the column pass -- it reads the column
+	// arena that pass wrote and fills the cell arena the batch graph's brick
+	// chain reads. Same declaration-placement reasons as the column pass.
+	struct FWorklistVoxelizeDispatch
+	{
+		FRDGBufferRef Records = nullptr;       // the ring
+		FRDGBufferRef Control = nullptr;       // [0]=consumeFirst [1]=consumeCount
+		FRDGBufferRef IndirectArgs = nullptr;  // the args pass's triples
+		uint32 IndirectArgsOffset = 0;         // byte offset of the Voxelize triple
+		uint32 RingCapacity = 0;
+		FRDGBufferRef ColumnArena = nullptr;   // read: the column stage's output
+		FRDGBufferRef CellArena = nullptr;     // written: one 32,768-cell slice per record
+		FVoxelRasterAtlasGpu* Atlas = nullptr; // registered into this graph here
+		uint32 SeedLo = 0;
+		uint32 SeedHi = 0;
+		int32 PixelSizeMm = 0;
+	};
+	void AddWorklistVoxelizePass(FRDGBuilder& GraphBuilder, const FWorklistVoxelizeDispatch& Dispatch);
 
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any

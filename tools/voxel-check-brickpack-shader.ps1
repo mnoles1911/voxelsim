@@ -58,6 +58,9 @@ if (-not $Root) {
 }
 $Root = (Resolve-Path $Root).Path
 $Dxc = Join-Path $Root 'tools\dxc\bin\x64\dxc.exe'
+# A worktree checkout has no fetched dxc; fall back to the main checkout's
+# (voxel-check-worklist-shader.ps1's line, verbatim).
+if (-not (Test-Path $Dxc)) { $Dxc = 'D:\voxelsim\tools\dxc\bin\x64\dxc.exe' }
 $Kernel = Join-Path $Root 'voxel-core\Shaders\brickpack.ush'
 if (-not (Test-Path $Kernel)) { $Kernel = Join-Path $Root 'voxel-core\shaders\brickpack.ush' }
 $Entry = Join-Path $Root 'ue-project\Shaders\VoxelBrickPack.usf'

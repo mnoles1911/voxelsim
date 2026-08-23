@@ -577,6 +577,15 @@ private:
 	// Why a promoted chunk did NOT get a record, by first failing reason --
 	// the [gpu-lean] diagnosis pattern: "armed but records=0" must read as a
 	// named missing precondition, not a mystery.
+	// P3 Voxelize stage (cumulative, wlvox line). Converted: record consumed
+	// this flush AND asset-free -- the chunk's VoxelizeMain is skipped.
+	// FallbackAssets: consumed but carries assets (designed exclusion until
+	// the flush-level asset buffer lands). Fallback: everything else a
+	// column-converted chunk would also have fallen back for (deferred,
+	// refused, stack-fused).
+	int64 WorklistVoxConverted = 0;
+	int64 WorklistVoxFallback = 0;
+	int64 WorklistVoxFallbackAssets = 0;
 	int64 WorklistSkipNoPack = 0;    // no brick region (quad-only leg, or shell refused)
 	int64 WorklistSkipQuadMesh = 0;  // job still emits quads (RetireQuads off)
 	int64 WorklistSkipBand = 0;      // job carries its footprint's band readback

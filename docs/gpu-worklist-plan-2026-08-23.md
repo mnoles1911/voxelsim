@@ -129,6 +129,70 @@ into `columnSampleAt` and BOTH entry points call the same text.
   kernels (both new entries, the factored classic forms in both atlas
   permutations, and the bench form) in ~2 s without an editor.
 
+## The passes/tick counter: dead reading FIXED (2026-08-23, night 2)
+
+The leg read `passes/tick mean=0.0 max=0` on both measured arms while the raw
+mid-leg windows read 73-128. Three stacked faults, all in the instrument:
+
+1. The window line's quiet gate compared the CUMULATIVE skip total to zero, so
+   once any chunk had ever skipped, every post-flight linger window printed
+   zeros forever -- and `tail -1` (the summary's read) landed on a linger
+   line. The gate now compares the window's skip delta; the last printed line
+   is the last ACTIVE window.
+2. The spine's per-tick constant was tallied only inside DispatchBatch, so
+   batchless ticks tallied 0 while dispatching 2-4 real passes. Tick now owns
+   the constant and folds DispatchBatch's share in.
+3. Nothing tripwired the tally. Every armed tick must now tally at least the
+   2/tick args+prover floor, and a printed window below it appends
+   `PASS TALLY DEAD` to its own line.
+
+FAILING READINGS of the fixed counter: the `PASS TALLY DEAD` marker; any
+printed window with mean below 2.0; `mean=0.0` without the marker (the
+tripwire itself broken). Recovered from the night's logs with the fixed
+filter: spine arm 116.8 passes/tick at 576 chunks/s = 17.6/chunk; cols+VERIFY
+arm 128.3 at 598 chunks/s = 18.6/chunk -- exactly the verify arm's +1. The
+17 -> 16 claim needs a NON-verify cols leg.
+
+## Stage 2 LANDED: the Voxelize kernel (2026-08-23, -VoxelGpuWorklistVoxelize)
+
+Authored-not-yet-built. `VoxelizeWorklistMain` (ue-project/Shaders/
+VoxelWorklistVoxelize.usf) is dispatched once per tick through the
+Voxelize-stage triple -- **16 groups per record, NOT the plan's provisional
+512**: it keeps the classic one-thread-per-COLUMN mapping because the cave and
+cavern reductions are per-column, so per-cell threads would recompute each 32
+times and change the cost shape without changing a byte. It reads the column
+arena (same flush graph, RDG-ordered) and writes a flush-level CELL ARENA
+(128 KiB/record); the chunk's BrickClassify/BrickPack read their slice through
+brickpack.ush's `CellReadBase` (classic dispatches compile a +0). The chunk's
+own VoxelizeMain pass is SKIPPED: 16 -> 15 passes on the lean-alloc shape,
+spine constant 3 -> 4/tick. worldgen.ush's VoxelizeMain body is factored into
+`voxelizeColumnInto` and BOTH entry points call the same text.
+
+* Switches: `-VoxelGpuWorklistVoxelize=1` (requires `-VoxelGpuWorklistColumns=1`
+  -- the kernel reads the column arena; armed without it, everything falls
+  back, counted); byte gate `-VoxelGpuWorklistVerifyVox=1` (classic
+  VoxelizeMain re-run into the transient reading the SAME arena columns + a
+  512-group compare into stats [6..7], riding the proof readback; +2
+  passes/chunk, verify arm only).
+* `-VoxelGpuWorklistCellBudget=<n>` (default 256): per-flush consume cap while
+  armed -- the cell arena is 128 KiB/record, so the ring's default 1,024
+  budget would be a 128 MiB arena; 256 is 32 MiB and 15,360 chunks/s of
+  consume headroom. Sustained `pending>0` on the window line = raise it.
+* ASSET CHUNKS FALL BACK BY DESIGN (`fbAssets`): AssetStamp writes cells
+  between Voxelize and the brick chain, and stamping into the shared arena
+  would put UAV barriers between every other chunk's reads of it. They keep
+  classic Voxelize + AssetStamp until the flush-level asset buffer lands
+  (step 5). The kernel's hasAssets early-out is group-uniform.
+* Readings: `[gpu-worklist] wlvox conv= fb= fbAssets= arenaMissing= voxverify
+  checked= mism=`. FAILING: conv=0 with fb growing (converting nothing);
+  conv=0 with fbAssets growing and fb quiet (every chunk on this flight
+  carries assets -- the stage is buying nothing, a flight fact to report);
+  arenaMissing>0 (flush/batch ordering broke); mism>0 (LEG INVALID);
+  checked=0 with conv>0 under the verify switch (dead gate).
+* The pinned digest is untouched by construction: classic dispatches compile
+  `CellReadBase = 0` / `cellBase + 0`, and the factored entry points call the
+  same text the shipped kernels ran.
+
 ## Conversion sequencing (the P3 work proper)
 
 Stage by stage, each stage gated before the next:

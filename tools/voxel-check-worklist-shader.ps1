@@ -38,6 +38,7 @@ $Ush = Join-Path $Root 'ue-project\Shaders\VoxelWorklist.ush'
 $ArgsUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistArgs.usf'
 $ConsumeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistConsume.usf'
 $ColumnUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistColumn.usf'
+$VoxelizeUsf = Join-Path $Root 'ue-project\Shaders\VoxelWorklistVoxelize.usf'
 $WorldGen = Join-Path $Root 'voxel-core\shaders\worldgen.ush'
 $Stage = Join-Path $env:TEMP 'voxel-worklist-check'
 
@@ -46,6 +47,7 @@ if (-not (Test-Path $Ush)) { throw "VoxelWorklist.ush not found at $Ush" }
 if (-not (Test-Path $ArgsUsf)) { throw "VoxelWorklistArgs.usf not found at $ArgsUsf" }
 if (-not (Test-Path $ConsumeUsf)) { throw "VoxelWorklistConsume.usf not found at $ConsumeUsf" }
 if (-not (Test-Path $ColumnUsf)) { throw "VoxelWorklistColumn.usf not found at $ColumnUsf" }
+if (-not (Test-Path $VoxelizeUsf)) { throw "VoxelWorklistVoxelize.usf not found at $VoxelizeUsf" }
 if (-not (Test-Path $WorldGen)) { throw "worldgen.ush not found at $WorldGen" }
 if (Test-Path $Stage) { Remove-Item $Stage -Recurse -Force }
 New-Item -ItemType Directory -Path $Stage | Out-Null
@@ -73,6 +75,11 @@ Copy-Item $WorldGen (Join-Path $Stage 'worldgen.ush')
     Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
     Replace('"/VoxelCore/worldgen.ush"', '"worldgen.ush"') |
     Out-File (Join-Path $Stage 'VoxelWorklistColumn.hlsl') -Encoding utf8
+(Get-Content $VoxelizeUsf -Raw).
+    Replace('#include "/Engine/Public/Platform.ush"', '// platform stub').
+    Replace('"/VoxelEarth/VoxelWorklist.ush"', '"VoxelWorklist.ush"').
+    Replace('"/VoxelCore/worldgen.ush"', '"worldgen.ush"') |
+    Out-File (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') -Encoding utf8
 
 $Out = Join-Path $Stage 'out.bin'
 $Fail = 0
@@ -112,6 +119,17 @@ $ColumnDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion",
                    'VXC_WORKLIST_COLUMN_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024')
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistMain'       'column  DXIL  ColumnWorklistMain'       $ColumnDefines
 $Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistColumn.hlsl') 'ColumnWorklistVerifyMain' 'colvfy  DXIL  ColumnWorklistVerifyMain' $ColumnDefines
+
+# The converted Voxelize stage (VoxelWorklistVoxelize.usf; P3 stage 2). Same
+# mechanism: the defines mirror FVoxelWorklistVoxelizeCS's (16 groups per
+# record -- one thread per COLUMN, the classic mapping -- over 1,024 columns /
+# 32,768 cells), and the kernel #errors on disagreement.
+$VoxelizeDefines = @('VXC_UE=1', "VXC_WORLDGEN_VERSION_CPP=$WorldGenVersion",
+                     'VXC_RASTER_ATLAS=1',
+                     'VXC_WORKLIST_VOXELIZE_GROUPS=16', 'VXC_WORKLIST_COLS_PER_RECORD=1024',
+                     'VXC_WORKLIST_CELLS_PER_RECORD=32768')
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') 'VoxelizeWorklistMain'       'voxlize DXIL  VoxelizeWorklistMain'       $VoxelizeDefines
+$Total += 1; $Fail += Try-Compile (Join-Path $Stage 'VoxelWorklistVoxelize.hlsl') 'VoxelizeWorklistVerifyMain' 'voxvfy  DXIL  VoxelizeWorklistVerifyMain' $VoxelizeDefines
 
 # The factored classic kernels, both atlas permutations -- the factoring must
 # not have broken the shipped forms (the digest gate proves bytes; this proves

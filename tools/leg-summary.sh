@@ -74,6 +74,14 @@ for f in "$@"; do
   [ -n "$wl" ] || wl=$(grep -o "\[gpu-worklist\] [0-9.]*s window: .*" "$log" | tail -1)
   if [ -n "$wl" ]; then
     printf "%-18s   %s\n" "" "$wl"
+    # Converted-stage lines (cumulative counters, so the LAST line is the
+    # leg's total -- tail -1 is correct here). One per armed stage; absent on
+    # spine-only and control legs by design. Their FAILING READINGS live on
+    # MaybeLogWorklistWindow.
+    for stage in wlcols wlvox; do
+      sl=$(grep -o "\[gpu-worklist\] $stage .*" "$log" | tail -1)
+      if [ -n "$sl" ]; then printf "%-18s   %s\n" "" "$sl"; fi
+    done
     wlfails=$(grep -c "\[gpu-worklist\] proof .* FAIL" "$log")
     if [ "$wlfails" -gt 0 ]; then
       printf "%-18s   worklist: %s PROOF FAILURES -- LEG INVALID\n" "" "$wlfails"

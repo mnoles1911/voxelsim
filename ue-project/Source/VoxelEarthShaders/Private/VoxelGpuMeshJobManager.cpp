@@ -494,6 +494,56 @@ static bool VoxelGpuWorklistVerifyColsEnabled()
 	return bEnabled;
 }
 
+// -VoxelGpuWorklistVoxelize=1 (P3 stage 2), on top of -VoxelGpuWorklistColumns:
+// the flush graph ALSO dispatches VoxelizeWorklistMain (one indirect pass per
+// tick) into a flush-level cell arena, and every asset-free chunk whose record
+// was consumed this tick skips its own VoxelizeMain pass too -- its brick
+// chain reads the arena slice through brickpack.ush's CellReadBase. 16 -> 15
+// passes on the lean-alloc shape. Requires the column stage (the voxelize
+// kernel READS the column arena); armed without it, the worklist refuses to
+// dispatch it and every chunk falls back, counted. Command-line latched.
+static bool VoxelGpuWorklistVoxelizeEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVoxelize="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// The Voxelize stage's byte gate (-VoxelGpuWorklistVerifyVox): every cell-fed
+// chunk ALSO runs the classic VoxelizeMain into the transient plus a 512-group
+// compare pass into stats [6..7], riding the proof readback. +2 passes per
+// converted chunk -- a verify arm, never a production one.
+static bool VoxelGpuWorklistVerifyVoxEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVerifyVox="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// -VoxelGpuWorklistCellBudget=<n> (default 256): the per-flush record cap
+// while the Voxelize stage is armed. The cell arena costs 128 KiB per record
+// (32,768 cells x 4 B) -- 256 is a 32 MiB arena and 15,360 chunks/s of
+// consume headroom at 60 ticks; the ring's default budget of 1,024 would be
+// 128 MiB. Sustained pending>0 on the window line is the raise-me signal.
+static uint32 VoxelGpuWorklistCellBudget()
+{
+	static const uint32 Value = []
+	{
+		int32 Parsed = 256;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistCellBudget="), Parsed);
+		return uint32(FMath::Max(Parsed, 1));
+	}();
+	return Value;
+}
+
 namespace VoxelGpuLeanDetail
 {
 	// Render-thread atomics, VoxelGpuBatchDetail's reason verbatim: the counts
@@ -606,6 +656,11 @@ namespace VoxelGpuBatchDetail
 	// classic ColumnMain FROM the converted path -- the window line prints
 	// it, and any growth is a bug in the flush/batch ordering, not noise.
 	static std::atomic<int64> GWorklistColArenaMissing{ 0 };
+	// Same failure, Voxelize stage: a job flagged cell-fed reached the batch
+	// graph and no cell arena existed to read. Every count is a chunk that
+	// fell back to classic VoxelizeMain from the converted path -- printed on
+	// the wlvox line, any growth is a flush/batch ordering bug.
+	static std::atomic<int64> GWorklistVoxArenaMissing{ 0 };
 }
 
 // Defined here rather than in a file of its own because this is the only place
@@ -938,6 +993,11 @@ struct FVoxelGpuMeshJobManager::FJob
 	// missing). Written on the game thread in DispatchBatch after the flush,
 	// before the batch render command is enqueued; read only inside it.
 	uint32 WorklistColumnSlice = MAX_uint32;
+	// P3 Voxelize stage: this job's CELLS were also computed by the indirect
+	// dispatch (into the cell arena at WorklistColumnSlice * 32768). Only
+	// ever true with a valid WorklistColumnSlice, and only for asset-free
+	// jobs -- the AssetStamp exclusion lives at the set site.
+	bool bWorklistCellsFed = false;
 	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
 	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
 	// no 4-byte total readback, no pool write.
@@ -2095,6 +2155,12 @@ void FVoxelGpuMeshJobManager::Tick()
 		if (!Worklist.IsInitialized())
 		{
 			Worklist.Init(VoxelGpuWorklistCapacity());
+			// The Voxelize arm is a latched flag plus a budget, not an input
+			// set (it shares the column stage's inputs) -- handed over once,
+			// here, so every Flush from the first one applies the cell-arena
+			// consume clamp consistently.
+			Worklist.SetVoxelizeStageArmed(VoxelGpuWorklistVoxelizeEnabled(),
+			                               VoxelGpuWorklistCellBudget());
 		}
 		if (!bWorklistArmingLogged)
 		{
@@ -2120,6 +2186,21 @@ void FVoxelGpuMeshJobManager::Tick()
 				       TEXT("line: conv must grow; fb growing with conv=0 means the stage ")
 				       TEXT("converts nothing. Verify arm: -VoxelGpuWorklistVerifyCols=1."));
 			}
+			if (VoxelGpuWorklistVoxelizeEnabled())
+			{
+				UE_LOG(LogVoxelGpuMeshJob, Log,
+				       TEXT("[gpu-worklist] VOXELIZE STAGE ARMED (-VoxelGpuWorklistVoxelize): the ")
+				       TEXT("Voxelize kernel is CONVERTED -- a second indirect dispatch per tick ")
+				       TEXT("replaces one VoxelizeMain pass per asset-free lean chunk (16 -> 15 ")
+				       TEXT("passes on the lean-alloc shape). Consume clamped to %u records/flush ")
+				       TEXT("(-VoxelGpuWorklistCellBudget) for the 128 KiB/record cell arena. ")
+				       TEXT("Asset chunks fall back, counted on the wlvox line's fbAssets. ")
+				       TEXT("Requires -VoxelGpuWorklistColumns=1%s. Verify arm: ")
+				       TEXT("-VoxelGpuWorklistVerifyVox=1."),
+				       VoxelGpuWorklistCellBudget(),
+				       VoxelGpuWorklistColumnsEnabled()
+					       ? TEXT("") : TEXT(" -- MISSING on this leg, so EVERY chunk will fall back"));
+			}
 		}
 		++WorklistWinTicks;
 		// Column stage armed: DispatchBatch already flushed this tick (it has
@@ -2143,7 +2224,8 @@ void FVoxelGpuMeshJobManager::Tick()
 		// and the window line read mean=0.0 over hundreds of ticks.
 		const int64 WorklistPassesThisTick = WorklistBatchPassesThisTick
 			+ VoxelGpuBatchDetail::kWorklistSpinePassesPerTick
-			+ (Worklist.IsColumnStageArmed() ? 1 : 0);
+			+ (Worklist.IsColumnStageArmed() ? 1 : 0)
+			+ (Worklist.IsVoxelizeStageArmed() ? 1 : 0);
 		WorklistBatchPassesThisTick = 0;
 		WorklistWinPasses += WorklistPassesThisTick;
 		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, WorklistPassesThisTick);
@@ -2356,6 +2438,26 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 		       P.ColumnsChecked, P.ColumnDwordMismatches,
 		       P.ColumnDwordMismatches > 0 ? TEXT(" (COLUMN VERIFY FAILED -- LEG INVALID)") : TEXT(""),
 		       ArenaMissing > 0 ? TEXT(" (ARENA MISSING -- converted jobs fell back)") : TEXT(""));
+	}
+	// P3 Voxelize stage line, armed-only, the wlcols contract restated for
+	// cells. THE FAILING READINGS: conv=0 with fb growing -- the stage is
+	// armed and converting nothing; conv=0 with fbAssets growing and fb
+	// quiet -- every chunk this leg carries assets (a flight-path fact, not
+	// a bug, but the stage is buying nothing); arenaMissing>0 -- flush/batch
+	// ordering broke; voxverify checked=0 with conv>0 under the verify
+	// switch -- the byte gate is dead and "no mismatches" is vacuous.
+	if (VoxelGpuWorklistVoxelizeEnabled())
+	{
+		const int64 VoxArenaMissing =
+			VoxelGpuBatchDetail::GWorklistVoxArenaMissing.load(std::memory_order_relaxed);
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] wlvox conv=%lld fb=%lld fbAssets=%lld arenaMissing=%lld ")
+		       TEXT("voxverify checked=%llu mism=%llu (cumulative)%s%s"),
+		       WorklistVoxConverted, WorklistVoxFallback, WorklistVoxFallbackAssets,
+		       VoxArenaMissing,
+		       P.VoxCellsChecked, P.VoxCellMismatches,
+		       P.VoxCellMismatches > 0 ? TEXT(" (VOXELIZE VERIFY FAILED -- LEG INVALID)") : TEXT(""),
+		       VoxArenaMissing > 0 ? TEXT(" (CELL ARENA MISSING -- converted jobs fell back)") : TEXT(""));
 	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
@@ -2605,6 +2707,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				if (RecordJobs[RIdx]->BrickStack.IsValid())
 				{
 					++WorklistColFallback;
+					if (Worklist.IsVoxelizeStageArmed())
+					{
+						++WorklistVoxFallback;
+					}
 					continue;
 				}
 				const uint32 Mono = RecordMono.IsValidIndex(RIdx) ? RecordMono[RIdx] : MAX_uint32;
@@ -2618,10 +2724,40 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					// pass (-1); the verify arm puts it back as the byte
 					// reference and adds the compare (+2, net +1).
 					PassesThisTick += VoxelGpuWorklistVerifyColsEnabled() ? 1 : -1;
+					// P3 stage 2: the same record's CELLS, when the Voxelize
+					// stage is armed and the chunk carries no assets.
+					// AssetStamp writes cells between Voxelize and the brick
+					// chain, and stamping into the shared arena would put UAV
+					// barriers between every other chunk's reads of it -- so
+					// asset chunks keep their classic Voxelize + AssetStamp
+					// (the kernel's group-uniform hasAssets early-out mirrors
+					// this exactly), counted apart from deferred records
+					// because the two mean different things: fbAssets is a
+					// designed exclusion, fb is the ring falling behind.
+					if (Worklist.IsVoxelizeStageArmed())
+					{
+						if (RecordJobs[RIdx]->BrickRegion.AssetInstances.Num() == 0)
+						{
+							RecordJobs[RIdx]->bWorklistCellsFed = true;
+							++WorklistVoxConverted;
+							// Same shape as the column term: drops its
+							// VoxelizeMain (-1); verify puts it back and adds
+							// the compare (net +1).
+							PassesThisTick += VoxelGpuWorklistVerifyVoxEnabled() ? 1 : -1;
+						}
+						else
+						{
+							++WorklistVoxFallbackAssets;
+						}
+					}
 				}
 				else
 				{
 					++WorklistColFallback;
+					if (Worklist.IsVoxelizeStageArmed())
+					{
+						++WorklistVoxFallback;
+					}
 				}
 			}
 		}
@@ -2644,8 +2780,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 		(VoxelGpuWorklistColumnsEnabled() && VoxelGpuWorklistEnabled()
 		 && Worklist.IsInitialized()) ? &Worklist : nullptr;
 	const bool bVerifyColsArmed = VoxelGpuWorklistVerifyColsEnabled();
+	const bool bVerifyVoxArmed = VoxelGpuWorklistVerifyVoxEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
-		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed](FRHICommandListImmediate& RHICmdList)
+		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed,
+		 bVerifyVoxArmed](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
 
@@ -2899,11 +3037,35 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					ColumnFeed.SliceIndex = Job->WorklistColumnSlice;
 					ColumnFeed.bVerify = bVerifyColsArmed && WorklistCols.Stats != nullptr;
 					ColumnFeed.VerifyStats = WorklistCols.Stats;
+					// P3 stage 2: the cell feed rides the column feed (a
+					// cell-fed job is by construction column-fed). A job
+					// FLAGGED cell-fed with no cell arena is the same
+					// render-side failure as the column case: fall back to
+					// classic VoxelizeMain and COUNT it.
+					if (Job->bWorklistCellsFed)
+					{
+						if (WorklistCols.CellArena != nullptr)
+						{
+							ColumnFeed.CellArena = WorklistCols.CellArena;
+							ColumnFeed.bVerifyVox =
+								bVerifyVoxArmed && WorklistCols.Stats != nullptr;
+						}
+						else
+						{
+							VoxelGpuBatchDetail::GWorklistVoxArenaMissing.fetch_add(
+								1, std::memory_order_relaxed);
+						}
+					}
 				}
 				else if (Job->WorklistColumnSlice != MAX_uint32)
 				{
 					VoxelGpuBatchDetail::GWorklistColArenaMissing.fetch_add(
 						1, std::memory_order_relaxed);
+					if (Job->bWorklistCellsFed)
+					{
+						VoxelGpuBatchDetail::GWorklistVoxArenaMissing.fetch_add(
+							1, std::memory_order_relaxed);
+					}
 				}
 
 				const VoxelGpuWorldGen::FRegionGraphResources BrickGraph =

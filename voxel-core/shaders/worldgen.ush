@@ -2776,34 +2776,34 @@ uint materialAt(GpuColumnSample col, GpuCaveColumn cc, GpuCavernColumn cv, int64
     return m;
 }
 
-[numthreads(8, 8, 1)]
-void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
+// P3 worklist Voxelize stage (2026-08-23): the WHOLE per-column voxelize body,
+// factored exactly the way ColumnMain's body became columnSampleAt -- so the
+// classic entry point below and VoxelizeWorklistMain (ue-project/Shaders/
+// VoxelWorklistVoxelize.usf) call the same text rather than each maintaining a
+// copy. Per-REGION values arrive as parameters (the classic entry passes its
+// $Globals; the worklist entry passes record fields); process-wide values
+// (SeedLo/SeedHi, SurfaceMip, the sampling bindings inside caveColumnFor /
+// cavernColumnFor / materialAt) stay globals, provided identically by both
+// dispatch paths. cellBase is 0 on every classic call -- the shipped indexing
+// plus a literal +0, which changes no output byte and keeps the pinned coarse
+// digest a statement about the same program -- and sliceIndex * 32768 when the
+// cells land in the worklist CELL ARENA.
+void voxelizeColumnInto(GpuColumnSample col,
+                        int originVx, int originVy, uint coarseScale,
+                        int brickZMin, uint bricksZ,
+                        uint2 t, uint bricksX, uint cellBase)
 {
-    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
-        return;
-
-    // Same guard as ColumnMain, and now load-bearing for the same reason: the
-    // cavern pass calls evalSurface (for the SITE's surface height), which
-    // divides by PixelSizeMm. GUARD ONLY â€” valid values are 30000 or 3750.
-    if (PixelSizeMm == 0)
-        return;
-
-    const uint bx = tid.x / 8u, by = tid.y / 8u;
-    const uint lx = tid.x % 8u, ly = tid.y % 8u;
-    const uint bricksX = DispatchColumns.x / 8u;
+    const uint bx = t.x / 8u, by = t.y / 8u;
+    const uint lx = t.x % 8u, ly = t.y % 8u;
     const uint footprintIndex = bx + bricksX * by;
-
-    // ColumnReadBase is 0 on every classic dispatch (see its declaration);
-    // nonzero only when these columns live in the worklist column arena.
-    const GpuColumnSample col = InColumns[ColumnReadBase + tid.x + tid.y * DispatchColumns.x];
 
     // Cave pass: one reduction per column, reused down the whole brick stack â€”
     // the same split vxc::ColumnSample::cave makes on the CPU.
     const uint64_t caveSeed = ((uint64_t)SeedHi << 32) | (uint64_t)SeedLo;
     // D5: same coarse mapping ColumnMain used, so the cave and cavern passes
     // sample at the representative column rather than the coarse index.
-    const int64_t colVx = coarseRep((int64_t)OriginVx + (int64_t)tid.x, CoarseScale);
-    const int64_t colVy = coarseRep((int64_t)OriginVy + (int64_t)tid.y, CoarseScale);
+    const int64_t colVx = coarseRep((int64_t)originVx + (int64_t)t.x, coarseScale);
+    const int64_t colVy = coarseRep((int64_t)originVy + (int64_t)t.y, coarseScale);
     const GpuCaveColumn cave = caveColumnFor(caveSeed, colVx, colVy, col.surfaceMm);
 
     // Cavern pass, wired in exactly as the cave pass above: one reduction per
@@ -2848,30 +2848,50 @@ void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
     // shape, no variable shift.
     const int64_t topSolid =
         floorDiv((int64_t)col.surfaceMm - (int64_t)kVoxelSizeMm / 2, (int64_t)kVoxelSizeMm);
-    const bool preserveSurface = (SurfaceMip != 0u) && (CoarseScale > 1u);
+    const bool preserveSurface = (SurfaceMip != 0u) && (coarseScale > 1u);
 
-    for (uint bz = 0; bz < BricksZ; ++bz)
+    for (uint bz = 0; bz < bricksZ; ++bz)
     {
-        const uint brickIndex = footprintIndex * BricksZ + bz;
-        const int64_t brickZ = (int64_t)BrickZMin + (int64_t)bz;
+        const uint brickIndex = footprintIndex * bricksZ + bz;
+        const int64_t brickZ = (int64_t)brickZMin + (int64_t)bz;
         [unroll]
         for (uint z = 0; z < 8u; ++z)
         {
             // D5: mirrors makeCoarseBrick's
             // materialAt(col, coarseRep(key.z * B + z, level)). Identity at 0.
-            const int64_t vz = coarseRep(brickZ * (int64_t)8 + (int64_t)z, CoarseScale);
+            const int64_t vz = coarseRep(brickZ * (int64_t)8 + (int64_t)z, coarseScale);
             uint m = materialAt(col, cave, cavern, vz);
             if (preserveSurface && m != MAT_AIR && vz <= topSolid &&
-                topSolid < vz + (int64_t)CoarseScale)
+                topSolid < vz + (int64_t)coarseScale)
             {
                 const uint surf = materialAt(col, cave, cavern, topSolid);
                 if (surf != MAT_AIR)
                     m = surf;
             }
-            // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the entry guard caps tid below DispatchColumns, so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*BricksZ, while lx/ly/z are all < 8; the host sizes OutCells to exactly bricksX*bricksY*BricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
-            OutCells[brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = m;
+            // lint-shader-ub: allow UNGUARDED_WRITE - index is bounded by construction: the classic entry guard caps t below DispatchColumns (and the worklist entry derives t from a 0..1023 lane id), so footprintIndex < bricksX*bricksY and brickIndex < bricksX*bricksY*bricksZ, while lx/ly/z are all < 8; each caller sizes OutCells to exactly cellBase's slice count plus bricksX*bricksY*bricksZ*512 (contract mirrored in gpu_harness.cpp, asserted there)
+            OutCells[cellBase + brickIndex * 512u + cellIndexInBrick(lx, ly, z)] = m;
         }
     }
+}
+
+[numthreads(8, 8, 1)]
+void VoxelizeMain(uint3 tid : SV_DispatchThreadID)
+{
+    if (tid.x >= DispatchColumns.x || tid.y >= DispatchColumns.y)
+        return;
+
+    // Same guard as ColumnMain, and now load-bearing for the same reason: the
+    // cavern pass calls evalSurface (for the SITE's surface height), which
+    // divides by PixelSizeMm. GUARD ONLY â€” valid values are 30000 or 3750.
+    if (PixelSizeMm == 0)
+        return;
+
+    // ColumnReadBase is 0 on every classic dispatch (see its declaration);
+    // nonzero only when these columns live in the worklist column arena.
+    const GpuColumnSample col = InColumns[ColumnReadBase + tid.x + tid.y * DispatchColumns.x];
+
+    voxelizeColumnInto(col, OriginVx, OriginVy, CoarseScale, BrickZMin, BricksZ,
+                       tid.xy, DispatchColumns.x / 8u, 0u);
 }
 
 // --- Greedy mesher kernels (docs/gpu-mesher-design.md) ---------------------
