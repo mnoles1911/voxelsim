@@ -482,3 +482,70 @@ VXC_TEST(coarsegen_cavern_survival) {
         CHECK(coarseVoid > 0);
     }
 }
+
+// Backlog 0.0b: the surface-preserving coarse rule
+// (Amplifier::coarseSurfaceMaterialAt via makeCoarseBrick's surfacePreserve
+// flag). The representative z of a column's topmost solid coarse cell sits up
+// to 2^L - 1 level-0 voxels below the true surface, so the 1-3 voxel surface
+// skin falls between representatives and coarse rings brown out with level.
+// The flag resamples exactly that one cell per column AT the surface voxel.
+//
+// Pins three things on generated terrain (not fixtures): (1) the flag NEVER
+// moves occupancy -- byte-identical air/solid, so the switch is colour-only
+// and every geometry gate stays a statement about both states; (2) the
+// substituted cell is exactly the one the rule names, carrying exactly
+// materialAt(col, topSolidVoxelZ) when that is solid; (3) the rule actually
+// BITES at the levels the defect is visible at -- a run where nothing
+// changes would mean the flag is wired to nothing, the silent-no-op failure
+// this repo has already paid for several times over.
+VXC_TEST(coarsegen_surface_preserve) {
+    SyntheticTileSampler tiles(kSeed);
+    Amplifier amp(kSeed, tiles);
+    GeneratedWorld<B> gen(amp);
+
+    int64_t changedTotal = 0;
+    for (int32_t level = 1; level <= 4; ++level) {
+        const int64_t s = int64_t(1) << level;
+        const auto grid = gen.coarseColumns(level, 0, 0);
+        int32_t bzMin = 0, bzMax = 0;
+        gen.coarseSurfaceBrickRange(level, grid, bzMin, bzMax);
+
+        int64_t changed = 0;
+        for (int32_t bz = bzMin; bz <= bzMax; ++bz) {
+            const BrickKey key{0, 0, bz};
+            const Brick<B> plain = gen.makeCoarseBrick(level, key, grid, false);
+            const Brick<B> preserved = gen.makeCoarseBrick(level, key, grid, true);
+            for (int z = 0; z < B; ++z)
+                for (int y = 0; y < B; ++y)
+                    for (int x = 0; x < B; ++x) {
+                        const MaterialId a = plain.get(x, y, z);
+                        const MaterialId b = preserved.get(x, y, z);
+                        // (1) Occupancy is identical, cell for cell.
+                        CHECK_EQ(a == MAT_AIR, b == MAT_AIR);
+
+                        const ColumnSample& col = grid.at(x, y);
+                        const int64_t rep =
+                            GeneratedWorld<B>::coarseRep(int64_t(key.z) * B + z, level);
+                        const int64_t top = topSolidVoxelZ(col.surfaceMm);
+                        const bool isSurfaceCell =
+                            a != MAT_AIR && rep <= top && top < rep + s;
+                        if (isSurfaceCell) {
+                            // (2) Exactly the named substitution -- or the
+                            // carve-rejected fallback to the plain sample.
+                            const MaterialId surf = Amplifier::materialAt(col, top);
+                            CHECK_EQ(b, surf != MAT_AIR ? surf : a);
+                        } else {
+                            CHECK_EQ(a, b);
+                        }
+                        if (a != b) ++changed;
+                    }
+        }
+        std::printf("    [coarsegen] L%d surface-preserve changed %" PRId64 " cells\n", level,
+                    changed);
+        changedTotal += changed;
+    }
+    // (3) The flag bites somewhere across L1..L4 on this fixture. Per-level
+    // counts are printed, not pinned: how MANY cells change is terrain- and
+    // seed-dependent; that it changes at all is the wiring proof.
+    CHECK(changedTotal > 0);
+}

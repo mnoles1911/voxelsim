@@ -528,6 +528,14 @@ public:
 		, GlobalEditEpoch(InGlobalEditEpoch)
 		, EpochSnapshot(InEpochSnapshot)
 		, Threshold(InThreshold)
+		// Backlog 0.0b: surface-preserving downsampling, read from the single
+		// process-wide accessor here in the ctor (NOT per call) so every brick
+		// this builder ever makes -- and every FSharedMipCache entry it
+		// populates -- is generated under one rule. The overlay-aware path
+		// constructs through this same ctor, so edited-region mips follow the
+		// same rule as pure ones and a dug hole doesn't change colour at
+		// distance.
+		, bSurfacePreserve(VoxelGpuWorldGen::SurfaceMipEnabled())
 	{
 	}
 
@@ -579,7 +587,7 @@ public:
 			return nullptr; // whole 2x2x2 group is air; matches MipChain's convention (don't materialize).
 		}
 
-		BrickT Built = vxc::downsampleBricks<VoxelCoords::BrickEdgeVoxels>(Children, Threshold);
+		BrickT Built = vxc::downsampleBricks<VoxelCoords::BrickEdgeVoxels>(Children, Threshold, bSurfacePreserve);
 		if (SharedCache && (!GlobalEditEpoch || GlobalEditEpoch->load() == EpochSnapshot))
 		{
 			SharedCache->Insert(Level, Key, Built);
@@ -595,6 +603,7 @@ private:
 	const std::atomic<uint64>* GlobalEditEpoch;
 	uint64 EpochSnapshot;
 	int32 Threshold;
+	bool bSurfacePreserve = false;
 	std::unordered_map<vxc::MipKey, BrickT, vxc::MipKeyHash> LocalCache;
 };
 
@@ -716,7 +725,12 @@ std::function<vxc::MaterialId(int64, int64, int64)> MakeCoarseLevelSampler(const
 				return &Found->second;
 			}
 			const auto& Grid = ColumnCache.Get(Key.x, Key.y);
-			auto [It, Inserted] = Bricks.emplace(Key, Gen.makeCoarseBrick(Level, Key, Grid));
+			// Backlog 0.0b: same process-wide surface-preserve flag as the flat
+			// grid sampler and the GPU dispatch, so -VoxelCoarseGrid=0 (this
+			// path) stays a pure plumbing A/B against the flat grid rather than
+			// silently becoming a rule A/B.
+			auto [It, Inserted] = Bricks.emplace(
+				Key, Gen.makeCoarseBrick(Level, Key, Grid, VoxelGpuWorldGen::SurfaceMipEnabled()));
 			(void)Inserted;
 			return &It->second;
 		}
@@ -981,6 +995,15 @@ private:
 // Not a std::function: this is passed to MeshChunkBricks by reference as a
 // concrete functor, so the per-voxel call inlines the way the level-0 lambda
 // does. -VoxelCoarseGridVerify meshes both ways and compares the quads.
+//
+// Backlog 0.0b: with -VoxelSurfaceMip=1 the terrain sample below goes through
+// Amplifier::coarseSurfaceMaterialAt instead of bare materialAt -- the topmost
+// solid cell of each column takes the true level-0 surface voxel's material,
+// so thin snow/grass caps stop disappearing from coarse rings. The
+// substitution derivation above still holds because MakeCoarseLevelSampler /
+// makeCoarseBrick apply the SAME helper under the SAME process-wide flag; the
+// two paths stay byte-identical in both flag states, which is what keeps
+// -VoxelCoarseGridVerify a plumbing check rather than a rule check.
 struct FCoarseChunkGridSampler
 {
 	using GenT = vxc::GeneratedWorld<VoxelCoords::BrickEdgeVoxels>;
@@ -1002,6 +1025,7 @@ struct FCoarseChunkGridSampler
 		: Level(InLevel)
 		, BaseVX(int64(Key.X) * ChunkVox)
 		, BaseVY(int64(Key.Y) * ChunkVox)
+		, bSurfacePreserve(VoxelGpuWorldGen::SurfaceMipEnabled()) // backlog 0.0b, one process-wide value
 	{
 		static_assert(GridEdge * GridEdge == FSharedColumnGridCache::kGridCells,
 		              "the shared cache's grid layout must match the coarse sampler's");
@@ -1141,8 +1165,22 @@ struct FCoarseChunkGridSampler
 		const int32 LX = int32(X - BaseVX) + 1;
 		const int32 LY = int32(Y - BaseVY) + 1;
 		checkSlow(LX >= 0 && LX < GridEdge && LY >= 0 && LY < GridEdge);
-		const vxc::MaterialId M =
-			vxc::Amplifier::materialAt(Cols[LX + GridEdge * LY], GenT::coarseRep(Z, Level));
+		// Backlog 0.0b: coarseSurfaceMaterialAt is materialAt(coarseRep(Z))
+		// verbatim when the flag is off (see its header); when on, the topmost
+		// solid cell of the column takes the true surface voxel's material so
+		// thin snow/grass caps stop browning out with ring level. Never
+		// changes solidity, so the -VoxelCoarseGridVerify quad-identity
+		// harness and the AIR-only asset compose below are both unaffected in
+		// shape -- only the Mat field of quads can differ, and only with the
+		// flag on.
+		//
+		// READS Cols, NOT A LOCAL Columns ARRAY. This change was authored against
+		// a tree that predated the shared column-grid cache, where the sampler
+		// owned its columns outright. Cols is the accessor that works whether the
+		// columns are cache-served or locally owned -- see the members below.
+		const vxc::MaterialId M = vxc::Amplifier::coarseSurfaceMaterialAt(
+			Cols[LX + GridEdge * LY], GenT::coarseRep(Z, Level), int64(1) << Level,
+			bSurfacePreserve);
 		// AIR ONLY, the same monotone rule as every other compose site; the
 		// shortlist holds the 0-to-few instances whose box covers this
 		// column's rep coordinate, in resolveForCompose order, so
@@ -1187,6 +1225,9 @@ struct FCoarseChunkGridSampler
 	FSharedColumnGridCache::FConstGridRef SharedGrid;
 	TArray<vxc::ColumnSample> OwnColumns;
 	const vxc::ColumnSample* Cols = nullptr;
+	// -VoxelSurfaceMip, latched per sampler at construction so a mid-run flip
+	// cannot mix two rules inside one cached grid.
+	bool bSurfacePreserve = false;
 	std::vector<vxc::AssetField::ResolvedAssetInstance> Resolved;
 	TArray<TArray<uint16, TInlineAllocator<2>>> ColShortlist;
 };

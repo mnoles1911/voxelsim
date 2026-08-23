@@ -506,9 +506,19 @@ namespace
 					{
 						// D5: mirrors makeCoarseBrick's
 						// materialAt(col, coarseRep(key.z * B + z, level)).
+						//
+						// Backlog 0.0b: through coarseSurfaceMaterialAt, with
+						// the SAME process-wide flag the GPU dispatch reads --
+						// so this gate covers the surface-preserving rule too,
+						// in whichever state the process was launched, instead
+						// of only ever proving the historical rule. With the
+						// flag off (the default) the helper is materialAt
+						// verbatim.
 						const int64 Vz = CoarseRep(BrickZ * 8 + ZLocal, Region.CoarseLevel);
 						const uint32 CellIdx = BrickIndex * 512 + CellIndexInBrick(Lx, Ly, ZLocal);
-						const uint8 CpuMat = static_cast<uint8>(vxc::Amplifier::materialAt(C, Vz));
+						const uint8 CpuMat = static_cast<uint8>(vxc::Amplifier::coarseSurfaceMaterialAt(
+							C, Vz, int64(1) << Region.CoarseLevel,
+							VoxelGpuWorldGen::SurfaceMipEnabled()));
 						const uint8 GpuMat = static_cast<uint8>(Gpu.Cells[CellIdx] & 0xffu);
 
 						Digest.u8(GpuMat);
@@ -569,7 +579,16 @@ namespace
 						                           Region.CoarseLevel);
 						const vxc::ColumnSample& C =
 							CpuColumns[int32(Rvx + Rvy * int64(Region.Width))];
-						return vxc::Amplifier::materialAt(C, Vz);
+						// Backlog 0.0b: same helper + same flag as the cell
+						// loop above -- the GPU mesher reads the substituted
+						// cells, so the CPU quad reference must sample the
+						// substituted rule or every surface quad's Mat field
+						// mismatches with the flag on. Solidity is identical
+						// either way, so quad GEOMETRY never depends on the
+						// flag -- only Mat can.
+						return vxc::Amplifier::coarseSurfaceMaterialAt(
+							C, Vz, int64(1) << Region.CoarseLevel,
+							VoxelGpuWorldGen::SurfaceMipEnabled());
 					};
 
 					CpuQuads.clear();

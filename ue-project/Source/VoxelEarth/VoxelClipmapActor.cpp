@@ -650,40 +650,94 @@ void AVoxelClipmapActor::BuildSharedTopology()
 	}
 
 	// Annulus mask (m2-plan.md "Cracks/overlap" row): skip any quad fully
-	// inside the [HalfIndex-HoleHalfIndex, HalfIndex+HoleHalfIndex) hole --
-	// a finer level (or, for level 0, the voxel ring cascade) covers that
-	// area instead. This mask, like every other part of the grid layout, is
-	// identical for all 4 levels (see class comment), hence built once and
-	// shared.
-	SharedTriangles.Reset();
-	SharedTriangles.Reserve((NumVertsPerSide - 1) * (NumVertsPerSide - 1) * 6);
-	for (int32 i = 0; i < NumVertsPerSide - 1; ++i)
+	// inside the hole, because something finer covers that area instead.
+	//
+	// TWO MASKS, NOT ONE, AND THE DIFFERENCE IS A HOLE THE OWNER FOUND FROM
+	// ALTITUDE. What each level's hole has to abut is not the same shape:
+	//
+	//   * levels 1..N-1 abut the NEXT FINER CLIPMAP LEVEL, whose extent is a
+	//     SQUARE (its grid runs +-HalfIndex vertices). A square hole is exactly
+	//     right there and "lands exactly on level L-1's outer edge, by
+	//     construction" as the spacing comment says.
+	//   * level 0 abuts THE VOXEL RING CASCADE, which is admitted by RADIAL
+	//     distance and therefore ends in a DISC of radius RingEdgeUU.
+	//
+	// A square hole of half-width R against a disc of radius R leaves the four
+	// corners out to R*sqrt(2) covered by NEITHER system. Looking straight down
+	// from altitude that reads as a circle of voxels failing to fill a square
+	// of clipmap, with bare gaps at the diagonals -- which is exactly how the
+	// owner reported it, and how he diagnosed it.
+	//
+	// So level 0 gets a RADIAL hole and the rest keep the square one. The
+	// topology can no longer be shared across all four levels; that is the cost
+	// and it is one extra index array.
+	//
+	// CONSERVATIVE ON PURPOSE: a quad is dropped only when its FARTHEST corner
+	// is inside the disc, so the clipmap keeps every quad the voxels might not
+	// reach and overlaps slightly UNDER the voxel disc at the seam. Drawing
+	// must over-cover; that rule is why the lake sink once ate rivers over a
+	// bounding box. Overlapping cheap heightfield triangles under opaque voxels
+	// costs nothing visible; the reverse leaves a hole through the world.
+	auto BuildTopology = [this](TArray<int32>& Out, bool bRadialHole)
 	{
-		for (int32 j = 0; j < NumVertsPerSide - 1; ++j)
+		Out.Reset();
+		Out.Reserve((NumVertsPerSide - 1) * (NumVertsPerSide - 1) * 6);
+		for (int32 i = 0; i < NumVertsPerSide - 1; ++i)
 		{
-			const bool bHoleQuad = (i >= HalfIndex - HoleHalfIndex) && (i < HalfIndex + HoleHalfIndex) &&
-			                       (j >= HalfIndex - HoleHalfIndex) && (j < HalfIndex + HoleHalfIndex);
-			if (bHoleQuad)
+			for (int32 j = 0; j < NumVertsPerSide - 1; ++j)
 			{
-				continue;
+				bool bHoleQuad;
+				if (bRadialHole)
+				{
+					// Farthest corner of quad (i,j) from the grid centre, in
+					// index units -- spacing is uniform per level, so index
+					// radius and world radius agree up to that one scale.
+					const double DX = FMath::Max(FMath::Abs(double(i) - double(HalfIndex)),
+					                             FMath::Abs(double(i + 1) - double(HalfIndex)));
+					const double DY = FMath::Max(FMath::Abs(double(j) - double(HalfIndex)),
+					                             FMath::Abs(double(j + 1) - double(HalfIndex)));
+					bHoleQuad = (DX * DX + DY * DY) <= double(HoleHalfIndex) * double(HoleHalfIndex);
+				}
+				else
+				{
+					bHoleQuad = (i >= HalfIndex - HoleHalfIndex) && (i < HalfIndex + HoleHalfIndex) &&
+					            (j >= HalfIndex - HoleHalfIndex) && (j < HalfIndex + HoleHalfIndex);
+				}
+				if (bHoleQuad)
+				{
+					continue;
+				}
+
+				const int32 V00 = i * NumVertsPerSide + j;
+				const int32 V10 = (i + 1) * NumVertsPerSide + j;
+				const int32 V01 = i * NumVertsPerSide + (j + 1);
+				const int32 V11 = (i + 1) * NumVertsPerSide + (j + 1);
+
+				// Winding as below -- M_VoxelClipmap is two-sided defensively.
+				Out.Add(V00);
+				Out.Add(V01);
+				Out.Add(V11);
+				Out.Add(V00);
+				Out.Add(V11);
+				Out.Add(V10);
 			}
-
-			const int32 V00 = i * NumVertsPerSide + j;
-			const int32 V10 = (i + 1) * NumVertsPerSide + j;
-			const int32 V01 = i * NumVertsPerSide + (j + 1);
-			const int32 V11 = (i + 1) * NumVertsPerSide + (j + 1);
-
-			// Winding picked by hand (not visually verifiable in this
-			// headless task) -- M_VoxelClipmap is two-sided defensively,
-			// see Tools/create_clipmap_material.py.
-			SharedTriangles.Add(V00);
-			SharedTriangles.Add(V01);
-			SharedTriangles.Add(V11);
-			SharedTriangles.Add(V00);
-			SharedTriangles.Add(V11);
-			SharedTriangles.Add(V10);
 		}
-	}
+	};
+	// -VoxelClipmapSquareHole restores the old square level-0 hole, so the seam
+	// this fixes can be photographed on ONE binary instead of two builds. That
+	// is the convention every change in this programme follows: the control arm
+	// is a switch, not a rebuild, because then a difference in the capture pair
+	// cannot be blamed on a different compile.
+	const bool bSquareHoleControl = FParse::Param(FCommandLine::Get(), TEXT("VoxelClipmapSquareHole"));
+	BuildTopology(SharedTriangles, /*bRadialHole*/ false);
+	BuildTopology(SharedTrianglesLevel0, /*bRadialHole*/ !bSquareHoleControl);
+
+	UE_LOG(LogVoxelEarth, Log,
+	       TEXT("Voxel clipmap topology: square hole %d tris (levels 1-%d), radial hole %d tris (level 0, ")
+	       TEXT("abuts the voxel DISC). Radial keeps %d more quads -- those are the corner wedges that ")
+	       TEXT("were bare before."),
+	       SharedTriangles.Num() / 3, NumLevels - 1, SharedTrianglesLevel0.Num() / 3,
+	       (SharedTrianglesLevel0.Num() - SharedTriangles.Num()) / 6);
 
 	bTopologyBuilt = true;
 }
@@ -928,7 +982,14 @@ void AVoxelClipmapActor::RebuildLevel(int32 LevelIndex, const FVector2D& Snapped
 		// Topology (SharedTriangles/SharedUV0) never changes for a given
 		// level after this -- every later rebuild uses UpdateMeshSection
 		// instead, which is strictly cheaper (no scene proxy recreation).
-		PMC->CreateMeshSection(0, Positions, SharedTriangles, Normals, SharedUV0, VertexColors, TArray<FProcMeshTangent>(),
+		// Level 0 uses the radial-hole topology (it abuts the voxel DISC);
+		// every coarser level uses the square-hole one (it abuts a square
+		// clipmap level). Topology never changes after this CreateMeshSection
+		// -- later rebuilds only UpdateMeshSection positions -- so picking here
+		// is picking once per level for the session.
+		const TArray<int32>& LevelTriangles =
+			(LevelIndex == 0) ? SharedTrianglesLevel0 : SharedTriangles;
+		PMC->CreateMeshSection(0, Positions, LevelTriangles, Normals, SharedUV0, VertexColors, TArray<FProcMeshTangent>(),
 		                       /*bCreateCollision*/ false);
 		if (ClipmapMaterial)
 		{

@@ -308,6 +308,12 @@ private:
 
 	// Shared across all levels (see BuildSharedTopology); built once.
 	TArray<int32> SharedTriangles;
+
+	// Level 0's topology, identical to SharedTriangles except its hole is a
+	// DISC rather than a square -- level 0 abuts the voxel ring cascade, which
+	// is admitted radially, while every other level abuts a square clipmap
+	// level. See BuildSharedTopology for the hole this difference closed.
+	TArray<int32> SharedTrianglesLevel0;
 	TArray<FVector2D> SharedUV0;
 	bool bTopologyBuilt = false;
 

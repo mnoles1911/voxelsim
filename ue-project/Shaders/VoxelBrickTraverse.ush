@@ -1463,6 +1463,7 @@ struct FVoxelMarchChunkCache
 	// tag comparison itself). Costs one register on the level-2 permutation
 	// and nothing anywhere else. Meaningful only while bResident is false.
 	uint AbsentReason;
+#endif // VOXEL_MARCH_HOLE_STATS >= 2
 #endif
 	uint BrickBase;     // first descriptor slot
 	uint2 BrickSolid;   // the 64-bit L1 mask, lo/hi
@@ -3043,6 +3044,7 @@ FVoxelMarchHit VoxelMarchTraverseRings(float3 OriginLocalUU, float3 DirWorld,
 	// question is "which level was WANTED".
 	uint RayAbsentLevel = 0xFFFFFFFFu;
 	uint RayAbsentReason = VOXEL_MARCH_MISS_UNATTRIBUTED;
+#endif // VOXEL_MARCH_HOLE_STATS >= 2
 #endif
 	[loop]
 	for (uint SegL = 0; SegL < RingCount; ++SegL)

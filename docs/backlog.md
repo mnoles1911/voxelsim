@@ -26,6 +26,86 @@ says so inline.
 
 ## 0. ENGINE PERFORMANCE — the current front
 
+### 0.0h The 10,814 gate leaks are a lake-sheet STARTUP-ORDER bug, not streaming — plus a live capture landmine
+
+REWRITTEN TWICE on 2026-08-23, and both wrong versions are recorded here because
+each was a different way of reading a frozen counter as a frozen system.
+
+  * v1 called `gateLeaks=10814` a streaming defect ("the fine tier never follows
+    the player"). Wrong.
+  * v2 called it the expected cost of an unbaked world, on a tile size that was
+    **off by 125x**. Also wrong, and worse, because it was confidently derived.
+
+THE ARITHMETIC ERROR, because it is the reusable lesson. v2 read
+`-VoxelSpawnAt=-61440` as Unreal units (-614.4 m) and concluded a tile was
+122.88 m across and the baked patch was 370 m x 250 m. **`-VoxelSpawnAt` is in
+METRES** (`VoxelEarthGameMode.cpp:61`); the anchor logs -6,144,000 UU = -61,440 m.
+A fine tile is 8192 px x 1875 mm/px = **15.36 km** on a side. So the contiguous
+baked block x in {-5,-4,-3}, y in {-5,-4} is **46 km x 31 km**, the 4 km ring
+cascade sat inside four baked, resident tiles for the whole session, and the
+player never flew over unbaked fine ground at all.
+
+WHAT ACTUALLY HAPPENED. `AVoxelWaterSheetActor`'s first gather
+(`VoxelWaterSheetActor.cpp:483-510`) ran with `CamUU = (0,0)` before the pawn had
+a position:
+
+    Lake sheets: scanning 4 fine tile(s) within 10000 m of (0, 0)
+
+Those are tiles (0,0), (0,-1), (-1,0), (-1,-1) — the four meeting at the WORLD
+ORIGIN, ~61 km from the player and genuinely never baked. It read 10,814
+elevations out of them. 2.5 s later it re-gathered correctly at
+(-6144000, -6144000) and found 476 basins. All 10,814 leaks are in the first 13
+seconds: the log carries exactly ONE `+10814` delta line, in the first window,
+and the counter never moves again across all 40 windows.
+
+`resident=4` / `loaded=4` / `ringRadius=0` are all correct and healthy: a coarse
+tile is 15.36 km and the anchor's entire session excursion was **1.56 km**,
+so the player never crossed a tile boundary and there was nothing to prefetch.
+
+WHAT A GATE LEAK ACTUALLY DOES, which nobody had established:
+**it returns SEA LEVEL (elevation 0)** — `ReportGateLeak_Locked`
+(`VoxelFineTileStreamer.cpp:874-975`) ends `return Sampler_.elevationMm(px,py)`,
+which is 0 for a non-resident tile. It does NOT fall back to coarse and does NOT
+suppress geometry. Geometry suppression is a separate mechanism entirely
+(`VoxelWorldSubsystem.cpp:9981-9982`): a candidate whose footprint is not
+resident is simply not admitted. So **gate leaks are never the meshing path** —
+they are the ~100 non-meshing consumers that read `FVoxelWorldImpl::Voxels`
+directly (collision, agents, water, HUD, `GetSurfaceHeightUU`). A leak means one
+of those got a wrong elevation.
+
+WHY THE LOG COULD NOT SHOW THIS: the fine-tier line had no way to distinguish
+"streamer stuck" from "player stayed put". Fixed — it now also prints
+`ringCentre=(x,y) ringMoves=N`, where the sentinel `(INT32_MIN, INT32_MIN)` means
+`TickResidencyAndEviction` has never run (the genuinely-broken third state, which
+used to look identical to the healthy one), and gate-leak messages now carry the
+anchor tile and Chebyshev distance with the reading rule attached: distance 0-1
+is a coverage gap, distance >1 means a caller sampled terrain the player is
+nowhere near and no bake would prevent it.
+
+**LIVE LANDMINE, fix this before it costs a night:** `tools/voxel-capture.ps1`
+runs `-unattended` with `-VoxelFineTileDir` and does NOT pass
+`-VoxelFineTileGateFatal=0`. Under `-unattended` the first gate leak is
+`UE_LOG(Fatal)`. If the sheet actor's origin gather beats the pawn placement in a
+`-game` run, **the capture dies**. `tools/bv12-river-captures.ps1:43` and
+`tools/bv12-shoot-one.ps1:37` already pass that flag — someone hit this and
+worked around it without diagnosing it.
+
+TWO REAL FOLLOW-UPS:
+  1. Make `AVoxelWaterSheetActor` skip its first gather until the camera has a
+     real position. That deletes all 10,814 leaks at the source.
+  2. Either add `-VoxelFineTileGateFatal=0` to `voxel-capture.ps1`, or fix (1) so
+     the flag is not needed. Prefer (1).
+
+Two things checked and RULED OUT along the way, recorded so nobody re-runs them:
+
+  * March index aliasing — the toroidal grid has a live `AliasCollisions[]`
+    counter and a one-shot complaint; the owner's log contains none.
+  * A truncated cascade — his command line carried no `-VoxelMaxRingLevel`, so
+    all six rings streamed to 4 km.
+
+None of this explains "voxel terrain stops rendering below a certain z level".
+`tools/voxel-zcutoff-ladder.ps1` is the instrument for that.
+
 ### 0.0f Night sky: no moon at all, and the ground is brighter at night than by day
 
 **Owner-reported 2026-08-23** from a PIE session played through to nightfall. Two defects,
