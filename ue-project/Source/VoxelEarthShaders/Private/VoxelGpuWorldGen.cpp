@@ -1,6 +1,7 @@
 #include "VoxelGpuWorldGen.h"
 #include "VoxelGpuWorldGenGraph.h"
 #include "VoxelRasterAtlasGpu.h"   // A: the persistent raster atlas the VXC_RASTER_ATLAS permutation samples
+#include "VoxelGpuWorklist.h"      // P3: the record ring the converted Column stage consumes
 
 #include "GlobalShader.h"
 #include "RenderGraphBuilder.h"
@@ -170,8 +171,80 @@ namespace
 			// a cave site's own xy, which is usually not a dispatch column.
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<int>, ElevationMm)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, InColumns)
+			// P3 Column stage: base element added to every InColumns read.
+			// 0 on every classic dispatch (byte-identical output, digest
+			// untouched); slice * 1024 when InColumns is the worklist column
+			// arena. See ColumnReadBase in worldgen.ush.
+			SHADER_PARAMETER(uint32, ColumnReadBase)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutCells)
 		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	// --- ColumnWorklistMain: the CONVERTED Column stage (P3) ----------------
+	//
+	// One indirect dispatch per tick off the worklist args (16 groups per
+	// consumed record), computing every consumed record's 1,024 columns into
+	// the flush-level arena -- VoxelWorklistColumn.usf has the whole argument.
+	// ATLAS ALWAYS ON: a record carries no raster window, so this class has no
+	// permutation domain; it compiles the VXC_RASTER_ATLAS=1 form only.
+	// Derives FVoxelWorldGenShader because it compiles worldgen.ush and must
+	// carry the version lock like every kernel that does.
+	class FVoxelWorklistColumnCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistColumnCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistColumnCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_WORLDGEN_LOOSE_PARAMETERS()
+			VOXEL_RASTER_ATLAS_PARAMETERS()
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuChunkWorkRecord>, WorklistRecords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, WorklistControl)
+			SHADER_PARAMETER(uint32, RingCapacity)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<GpuColumnSample>, OutColumns)
+			RDG_BUFFER_ACCESS(IndirectArgs, ERHIAccess::IndirectArgs)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			FVoxelWorldGenShader::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+			OutEnvironment.SetDefine(TEXT("VXC_RASTER_ATLAS"), 1);
+			// The torn-dispatch lock: the kernel #errors if its own derivation
+			// of the stage shape disagrees with the host table entry these
+			// defines are built from (FVoxelGpuWorklist::kColumnGroupsPerRecord
+			// is also what kGroupsPerRecord[Column] feeds the args kernel).
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_COLUMN_GROUPS"),
+			                         FVoxelGpuWorklist::kColumnGroupsPerRecord);
+			OutEnvironment.SetDefine(TEXT("VXC_WORKLIST_COLS_PER_RECORD"),
+			                         FVoxelGpuWorklist::kColumnsPerRecord);
+		}
+	};
+
+	// --- ColumnWorklistVerifyMain: converted bytes vs classic bytes ---------
+	// (-VoxelGpuWorklistVerifyCols; the plan doc's stage-2 gate.) One 16-group
+	// pass per VERIFIED chunk, verify arm only, accumulating into the worklist
+	// stats buffer's [4..5] so the result rides the existing proof readback.
+	class FVoxelWorklistColumnVerifyCS : public FVoxelWorldGenShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelWorklistColumnVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelWorklistColumnVerifyCS, FVoxelWorldGenShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, VerifyClassicColumns)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<GpuColumnSample>, VerifyArenaColumns)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, WorklistStats)
+			SHADER_PARAMETER(uint32, VerifyArenaBase)
+		END_SHADER_PARAMETER_STRUCT()
+
+		static void ModifyCompilationEnvironment(const FGlobalShaderPermutationParameters& Parameters,
+		                                         FShaderCompilerEnvironment& OutEnvironment)
+		{
+			// Same defines as the main kernel: they share the file and its
+			// shape #errors.
+			FVoxelWorklistColumnCS::ModifyCompilationEnvironment(Parameters, OutEnvironment);
+		}
 	};
 
 	// --- MeshCountMain: greedy meshing, counting only ----------------------
@@ -1001,6 +1074,12 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.u
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelColumnCS,     VOXEL_WORLDGEN_USF, "ColumnMain",     SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelVoxelizeCS,   VOXEL_WORLDGEN_USF, "VoxelizeMain",   SF_Compute);
+
+// P3 Column stage: entry points live in VoxelWorklistColumn.usf (the record
+// load and arena write), which includes worldgen.ush for columnSampleAt.
+#define VOXEL_WORKLIST_COLUMN_USF "/VoxelEarth/VoxelWorklistColumn.usf"
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistColumnCS,       VOXEL_WORKLIST_COLUMN_USF, "ColumnWorklistMain",       SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelWorklistColumnVerifyCS, VOXEL_WORKLIST_COLUMN_USF, "ColumnWorklistVerifyMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelMeshCountCS,  VOXEL_WORLDGEN_USF, "MeshCountMain",  SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanBlocksCS, VOXEL_WORLDGEN_USF, "ScanBlocksMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelScanSumsCS,   VOXEL_WORLDGEN_USF, "ScanSumsMain",   SF_Compute);
@@ -1480,7 +1559,8 @@ VoxelGpuWorldGen::ComputeRegionGraphSizes(const FVoxelGpuRegionRequest& Request)
 // The seven passes, and nothing else. No execute, no readback, no blocking --
 // see VoxelGpuWorldGenGraph.h for why those are the caller's decisions.
 VoxelGpuWorldGen::FRegionGraphResources
-VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request)
+VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request,
+                                  const FWorklistColumnFeed* ColumnFeed)
 {
 	check(IsInRenderingThread());
 
@@ -1490,6 +1570,24 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 
 	const uint32 Cx = Request.DispatchColumns.X;
 	const uint32 Cy = Request.DispatchColumns.Y;
+
+	// --- P3 Column stage: are this region's columns already in the arena? ---
+	//
+	// The feed's preconditions are the worklist record eligibility, restated
+	// here as hard checks because a violation would not fail -- it would read
+	// the wrong slice and build plausible terrain from it.
+	const bool bWorklistColumns = ColumnFeed != nullptr && ColumnFeed->Arena != nullptr;
+	if (bWorklistColumns)
+	{
+		checkf(Request.bRasterAtlas && Request.BandEdge == 0
+		       && Cx == 32 && Cy == 32
+		       && Cx * Cy == FVoxelGpuWorklist::kColumnsPerRecord,
+		       TEXT("worklist column feed on a region that is not a lean atlas brick chunk"));
+	}
+	// Verify arm: run the CLASSIC ColumnMain as well and byte-compare -- the
+	// converted path still feeds Voxelize, so what is verified is what runs.
+	const bool bVerifyColumns = bWorklistColumns && ColumnFeed->bVerify
+	                         && ColumnFeed->VerifyStats != nullptr;
 
 	// --- inputs -----------------------------------------------------
 	//
@@ -1520,15 +1618,31 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 	}
 
 	// --- outputs ----------------------------------------------------
-	Out.Columns = GraphBuilder.CreateBuffer(
-		FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample), S.NumColumns),
-		TEXT("Voxel.Columns"));
+	//
+	// P3 Column stage: with a feed and no verify, NO Voxel.Columns transient
+	// exists for this region at all -- the columns live in the worklist arena
+	// and nothing here produces or consumes a private copy. (Null rather than
+	// an unwritten buffer: RDG refuses to extract what no pass wrote, and a
+	// caller reaching for it should crash on the null, not on the assert.)
+	Out.Columns = (!bWorklistColumns || bVerifyColumns)
+		? GraphBuilder.CreateBuffer(
+			FRDGBufferDesc::CreateStructuredDesc(sizeof(FVoxelGpuColumnSample), S.NumColumns),
+			TEXT("Voxel.Columns"))
+		: nullptr;
 
 	Out.Cells = GraphBuilder.CreateBuffer(
 		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), S.NumCells),
 		TEXT("Voxel.Cells"));
 
 	// --- pass 1: ColumnMain ----------------------------------------
+	//
+	// SKIPPED with a worklist column feed (the once-per-tick indirect
+	// ColumnWorklistMain already computed this chunk's slice) -- that skip is
+	// the Column stage's entire win: one pass per tick instead of one per
+	// chunk. Under the verify arm the classic pass still runs, into the
+	// transient, purely as the byte reference; Voxelize reads the ARENA
+	// either way, so the verified path is the live path.
+	if (!bWorklistColumns || bVerifyColumns)
 	{
 		FVoxelColumnCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelColumnCS::FParameters>();
 		FillLooseParameters(*Params, Request);
@@ -1551,6 +1665,24 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 			FIntVector(Cx / kBrickEdge, Cy / kBrickEdge, 1));
 	}
 
+	// --- pass 1v (verify arm only): converted columns vs classic ------------
+	if (bVerifyColumns)
+	{
+		FVoxelWorklistColumnVerifyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelWorklistColumnVerifyCS::FParameters>();
+		Params->VerifyClassicColumns = GraphBuilder.CreateSRV(Out.Columns);
+		Params->VerifyArenaColumns = GraphBuilder.CreateSRV(ColumnFeed->Arena);
+		Params->WorklistStats = GraphBuilder.CreateUAV(ColumnFeed->VerifyStats);
+		Params->VerifyArenaBase = ColumnFeed->SliceIndex * FVoxelGpuWorklist::kColumnsPerRecord;
+
+		TShaderMapRef<FVoxelWorklistColumnVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder,
+			RDG_EVENT_NAME("Voxel.WorklistColumnVerify(slice %u)", ColumnFeed->SliceIndex),
+			Shader, Params,
+			FIntVector(FVoxelGpuWorklist::kColumnGroupsPerRecord, 1, 1));
+	}
+
 	// --- pass 2: VoxelizeMain --------------------------------------
 	{
 		FVoxelVoxelizeCS::FParameters* Params = GraphBuilder.AllocParameters<FVoxelVoxelizeCS::FParameters>();
@@ -1563,7 +1695,14 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 		{
 			Params->ElevationMm = GraphBuilder.CreateSRV(ElevationBuffer);
 		}
-		Params->InColumns = GraphBuilder.CreateSRV(Out.Columns);
+		// P3 Column stage: with a feed, this chunk's columns are its slice of
+		// the worklist arena, addressed through ColumnReadBase. Classic:
+		// the region's own transient at base 0 -- the compiled +0 changes no
+		// output byte, which is what keeps the pinned digest green.
+		Params->InColumns = GraphBuilder.CreateSRV(
+			bWorklistColumns ? ColumnFeed->Arena : Out.Columns);
+		Params->ColumnReadBase = bWorklistColumns
+			? ColumnFeed->SliceIndex * FVoxelGpuWorklist::kColumnsPerRecord : 0u;
 		Params->OutCells = GraphBuilder.CreateUAV(Out.Cells);
 
 		FVoxelVoxelizeCS::FPermutationDomain Permutation;
@@ -2030,6 +2169,55 @@ VoxelGpuWorldGen::AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegi
 // has. The group size (64) is restated in the shader as an `i >= NumQuads`
 // early-out because the dispatch rounds up, so the tail threads of the last
 // group are real.
+
+void VoxelGpuWorldGen::AddWorklistColumnPass(FRDGBuilder& GraphBuilder,
+                                             const FWorklistColumnDispatch& Dispatch)
+{
+	check(IsInRenderingThread());
+	check(Dispatch.Records && Dispatch.Control && Dispatch.IndirectArgs && Dispatch.ColumnArena);
+	check(Dispatch.Atlas != nullptr && Dispatch.PixelSizeMm != 0 && Dispatch.RingCapacity > 0);
+
+	// Register is idempotent per graph -- if the flush graph ever gains a
+	// second atlas consumer this stays one registration.
+	const FVoxelRasterAtlasBindings AtlasBindings = Dispatch.Atlas->Register(GraphBuilder);
+
+	FVoxelWorklistColumnCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelWorklistColumnCS::FParameters>();
+	// The loose block carries the PROCESS-WIDE half only; the per-record half
+	// (origin, coarse scale) comes off the ring inside the kernel -- that
+	// substitution IS the conversion. The per-region fields are zeroed dead
+	// weight the reflection layout requires; the kernel never reads them.
+	Params->DispatchColumns = FUintVector2(32, 32);
+	Params->RasterOriginPx = FIntPoint::ZeroValue;
+	Params->RasterSize = FUintVector2(0, 0);
+	Params->PixelSizeMm = Dispatch.PixelSizeMm;
+	Params->SeedLo = Dispatch.SeedLo;
+	Params->SeedHi = Dispatch.SeedHi;
+	Params->OriginVx = 0;
+	Params->OriginVy = 0;
+	Params->BrickZMin = 0;
+	Params->BricksZ = 4;
+	Params->ScanCount = 0;
+	Params->CoarseScale = 1;
+	Params->RingSkirtMask = 0;
+	// Same single accessor FillLooseParameters reads, so the converted and
+	// classic dispatches cannot be configured apart.
+	Params->SurfaceMip = SurfaceMipEnabled() ? 1u : 0u;
+	FillRasterAtlasParameters(*Params, AtlasBindings);
+	Params->WorklistRecords = GraphBuilder.CreateSRV(Dispatch.Records);
+	Params->WorklistControl = GraphBuilder.CreateSRV(Dispatch.Control);
+	Params->RingCapacity = Dispatch.RingCapacity;
+	Params->OutColumns = GraphBuilder.CreateUAV(Dispatch.ColumnArena);
+	Params->IndirectArgs = Dispatch.IndirectArgs;
+
+	TShaderMapRef<FVoxelWorklistColumnCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	// THE dispatch shape this whole arm exists for: group count = Take * 16
+	// off the triple the args pass wrote, never seen by the CPU. Recorded
+	// even when Take is 0 -- a constant pass per tick is the property.
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.WorklistColumn(indirect)"), Shader, Params,
+		Dispatch.IndirectArgs, Dispatch.IndirectArgsOffset);
+}
 
 void VoxelGpuWorldGen::AddQuadCompactPass(FRDGBuilder& GraphBuilder, FRDGBufferRef Dst, FRDGBufferRef Src,
                                           uint32 SrcFirst, uint32 NumQuads)

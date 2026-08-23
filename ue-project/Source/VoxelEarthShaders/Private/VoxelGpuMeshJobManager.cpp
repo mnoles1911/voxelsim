@@ -456,6 +456,44 @@ static uint32 VoxelGpuWorklistBudget()
 	return Budget;
 }
 
+// --- P3 STAGE 1: the CONVERTED Column kernel (-VoxelGpuWorklistColumns) -----
+//
+// On top of -VoxelGpuWorklist=1: the flush graph dispatches ColumnWorklistMain
+// (one indirect pass per tick, 16 groups per consumed record) into a
+// flush-level column arena, and every chunk whose record was consumed this
+// tick SKIPS its own ColumnMain pass -- its VoxelizeMain reads the arena slice
+// instead. Passes drop by 1 x chunks/tick (17 -> 16 on the lean-alloc shape);
+// they go FLAT only when the remaining six stages convert. Requires the flush
+// to run BEFORE the batch graph in the same tick (DispatchBatch does that when
+// this is armed), because the batch's VoxelizeMain reads what the flush's
+// column dispatch wrote. Command-line latched, same reasoning as the spine.
+static bool VoxelGpuWorklistColumnsEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistColumns="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
+// The stage-2 byte gate (-VoxelGpuWorklistVerifyCols): every converted chunk
+// ALSO runs the classic ColumnMain into a transient plus a 16-group compare
+// pass; mismatching dwords ride the proof readback and any nonzero is a loud
+// leg-invalidating Error (see FVoxelGpuWorklist::Flush). Costs +2 passes per
+// converted chunk -- a verify arm, never a production one.
+static bool VoxelGpuWorklistVerifyColsEnabled()
+{
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuWorklistVerifyCols="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
+}
+
 namespace VoxelGpuLeanDetail
 {
 	// Render-thread atomics, VoxelGpuBatchDetail's reason verbatim: the counts
@@ -561,6 +599,13 @@ namespace VoxelGpuBatchDetail
 	// tally is still the right read.
 	static std::atomic<int32> GCrosscheckPass{ 0 };
 	static std::atomic<int32> GCrosscheckFail{ 0 };
+
+	// P3 Column stage, render-side failure: a job carried an arena slice but
+	// the batch graph found no arena to register (the armed flush never
+	// created it). Every count here is a chunk that silently fell back to
+	// classic ColumnMain FROM the converted path -- the window line prints
+	// it, and any growth is a bug in the flush/batch ordering, not noise.
+	static std::atomic<int64> GWorklistColArenaMissing{ 0 };
 }
 
 // Defined here rather than in a file of its own because this is the only place
@@ -887,6 +932,12 @@ struct FVoxelGpuMeshJobManager::FJob
 	bool bGpuShellAllocated = false;
 	uint32 GpuChunkSlot = 0;
 	uint32 GpuBrickBase = 0;
+	// P3 Column stage: this job's slice in the worklist column arena for THIS
+	// tick's consume window, or MAX_uint32 when its columns were not computed
+	// by the indirect dispatch (stage off, record refused/deferred, atlas
+	// missing). Written on the game thread in DispatchBatch after the flush,
+	// before the batch render command is enqueued; read only inside it.
+	uint32 WorklistColumnSlice = MAX_uint32;
 	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
 	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
 	// no 4-byte total readback, no pool write.
@@ -2057,9 +2108,31 @@ void FVoxelGpuMeshJobManager::Tick()
 			       TEXT("flowing (see the skips= reasons); proofs landed=0 with records ")
 			       TEXT("flowing (GPU consumption unverified -- the spine may be dead)."),
 			       VoxelGpuWorklistCapacity(), VoxelGpuWorklistBudget());
+			if (VoxelGpuWorklistColumnsEnabled())
+			{
+				UE_LOG(LogVoxelGpuMeshJob, Log,
+				       TEXT("[gpu-worklist] COLUMN STAGE ARMED (-VoxelGpuWorklistColumns): the ")
+				       TEXT("Column kernel is CONVERTED -- one indirect dispatch per tick ")
+				       TEXT("replaces one ColumnMain pass per lean chunk (17 -> 16 passes on ")
+				       TEXT("the lean-alloc shape). The other six stages remain per-chunk, so ")
+				       TEXT("passes/tick drops but does NOT flatten, and throughput is NOT ")
+				       TEXT("expected to move (admission is today's limiter). Read the wlcols ")
+				       TEXT("line: conv must grow; fb growing with conv=0 means the stage ")
+				       TEXT("converts nothing. Verify arm: -VoxelGpuWorklistVerifyCols=1."));
+			}
 		}
 		++WorklistWinTicks;
-		Worklist.Flush(VoxelGpuWorklistBudget());
+		// Column stage armed: DispatchBatch already flushed this tick (it has
+		// to -- the batch graph reads what the flush's column dispatch wrote,
+		// and render commands execute in enqueue order). Flushing again here
+		// would double the args/prover passes and split the tick's consume
+		// window in two. Ticks with no batch still flush here, so the spine's
+		// constant per-tick shape (and the proof cadence) is unchanged.
+		if (!bWorklistFlushedThisTick)
+		{
+			Worklist.Flush(VoxelGpuWorklistBudget());
+		}
+		bWorklistFlushedThisTick = false;
 		MaybeLogWorklistWindow();
 	}
 
@@ -2220,6 +2293,26 @@ void FVoxelGpuMeshJobManager::MaybeLogWorklistWindow()
 	       P.Landed, P.Failed,
 	       P.Failed > 0 ? TEXT(" (PROOF FAILED -- LEG INVALID)") : TEXT(""),
 	       bUnproven ? TEXT(" (NO PROOF LANDED -- GPU consumption UNVERIFIED)") : TEXT(""));
+	// P3 Column stage line, armed-only (a spine-only or control leg must not
+	// gain a log line). THE FAILING READINGS: conv=0 with fb growing -- the
+	// stage is armed and converting nothing (ring refusing, records deferred
+	// past the budget, or SetColumnStageInputs refusing a null atlas);
+	// arenaMissing>0 -- jobs reached the batch graph with a slice but no
+	// arena existed to read (flush/batch ordering bug, every one fell back
+	// classic); colverify checked=0 with conv>0 and the verify switch armed
+	// -- the byte gate is dead and "no mismatches" is vacuous.
+	if (VoxelGpuWorklistColumnsEnabled())
+	{
+		const int64 ArenaMissing =
+			VoxelGpuBatchDetail::GWorklistColArenaMissing.load(std::memory_order_relaxed);
+		UE_LOG(LogVoxelGpuMeshJob, Log,
+		       TEXT("[gpu-worklist] wlcols conv=%lld fb=%lld arenaMissing=%lld ")
+		       TEXT("colverify checked=%llu mism=%llu (cumulative)%s%s"),
+		       WorklistColConverted, WorklistColFallback, ArenaMissing,
+		       P.ColumnsChecked, P.ColumnDwordMismatches,
+		       P.ColumnDwordMismatches > 0 ? TEXT(" (COLUMN VERIFY FAILED -- LEG INVALID)") : TEXT(""),
+		       ArenaMissing > 0 ? TEXT(" (ARENA MISSING -- converted jobs fell back)") : TEXT(""));
+	}
 	WorklistWinTicks = 0;
 	WorklistWinChunks = 0;
 	WorklistWinPasses = 0;
@@ -2336,6 +2429,10 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	{
 		TArray<FVoxelGpuChunkWorkRecord> NewRecords;
 		NewRecords.Reserve(Batch.Num());
+		// Parallel to NewRecords: which job each record serves, so the Column
+		// stage can hand the job its arena slice after the flush.
+		TArray<FJobPtr> RecordJobs;
+		RecordJobs.Reserve(Batch.Num());
 		TSet<FVoxelGpuBrickStack*> TalliedStacks;
 		int64 PassesThisTick = 0;
 		const bool bLeanArmed = VoxelGpuLeanBrickJobsEnabled();
@@ -2408,11 +2505,14 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			Job->BrickShading.Pack(R.ShadingClimatePacked, R.ShadingGradPacked,
 			                       R.ShadingSurfaceZBits);
 			NewRecords.Add(R);
+			RecordJobs.Add(Job);
 		}
-		PassesThisTick += VoxelGpuBatchDetail::kWorklistSpinePassesPerTick;
-		WorklistWinPasses += PassesThisTick;
-		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, PassesThisTick);
-		WorklistWinChunks += Batch.Num();
+		const bool bColumnsArmed = VoxelGpuWorklistColumnsEnabled();
+		// Spine: args + prover, plus the Column indirect dispatch when stage 1
+		// is armed -- all constant per tick regardless of N.
+		PassesThisTick += VoxelGpuBatchDetail::kWorklistSpinePassesPerTick
+		                + (bColumnsArmed ? 1 : 0);
+		TArray<uint32> RecordMono;
 		if (NewRecords.Num() > 0)
 		{
 			// Refusals (ring full) are counted inside Append; the chunk is
@@ -2420,16 +2520,98 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 			// generates it. Nothing retries: a refused record's chunk simply
 			// never enters the ring, and RefusedFull growing is the
 			// back-pressure reading the capacity latch exists to surface.
-			Worklist.Append(NewRecords);
+			Worklist.Append(NewRecords, bColumnsArmed ? &RecordMono : nullptr);
 		}
+
+		// --- Column stage: flush HERE, before the batch render command ------
+		//
+		// Render commands execute in enqueue order, so flushing now puts the
+		// upload + args pass + indirect Column dispatch AHEAD of the batch
+		// graph whose VoxelizeMain will read the arena. With the stage off
+		// the flush stays in Tick (after the batch), exactly where the spine
+		// was measured -- arm B of the spine A/B does not move.
+		if (bColumnsArmed)
+		{
+			if (RecordJobs.Num() > 0)
+			{
+				// Process-wide generation inputs, from any eligible job (all
+				// jobs share the seed, the pitch and the process atlas; the
+				// eligibility gate above required bRasterAtlas).
+				const FVoxelGpuRegionRequest& AnyRegion = RecordJobs[0]->BrickRegion;
+				Worklist.SetColumnStageInputs(AnyRegion.RasterAtlas, AnyRegion.Seed,
+				                              AnyRegion.PixelSizeMm);
+			}
+			Worklist.Flush(VoxelGpuWorklistBudget());
+			bWorklistFlushedThisTick = true;
+
+			// Hand each record's job its arena slice -- or count WHY not.
+			// THE FAILING READINGS: fallback growing while converted stays 0
+			// means the stage is armed and converting nothing (ring refusing,
+			// or records deferred past the budget every tick); both stuck at
+			// 0 with records flowing means this mapping itself is broken.
+			const FVoxelGpuWorklist::FLastFlush LF = Worklist.GetLastFlush();
+			for (int32 RIdx = 0; RIdx < RecordJobs.Num(); ++RIdx)
+			{
+				// A stack-fused member's region is dispatched through
+				// AddBrickStackPasses, which takes no column feed -- its
+				// arena slice would go unread while the tally claimed the
+				// ColumnMain saving. Fallback, counted, until the stack path
+				// learns the feed.
+				if (RecordJobs[RIdx]->BrickStack.IsValid())
+				{
+					++WorklistColFallback;
+					continue;
+				}
+				const uint32 Mono = RecordMono.IsValidIndex(RIdx) ? RecordMono[RIdx] : MAX_uint32;
+				const bool bConsumedThisFlush =
+					Mono != MAX_uint32 && (Mono - LF.ConsumeFirst) < LF.Take;
+				if (bConsumedThisFlush && Worklist.IsColumnStageArmed())
+				{
+					RecordJobs[RIdx]->WorklistColumnSlice = Mono - LF.ConsumeFirst;
+					++WorklistColConverted;
+					// The converted job's region graph drops its ColumnMain
+					// pass (-1); the verify arm puts it back as the byte
+					// reference and adds the compare (+2, net +1).
+					PassesThisTick += VoxelGpuWorklistVerifyColsEnabled() ? 1 : -1;
+				}
+				else
+				{
+					++WorklistColFallback;
+				}
+			}
+		}
+		WorklistWinPasses += PassesThisTick;
+		WorklistWinPassesMaxTick = FMath::Max(WorklistWinPassesMaxTick, PassesThisTick);
+		WorklistWinChunks += Batch.Num();
 	}
 
 	// ONE graph for the whole batch. Every job's seven passes plus its three
 	// readback copies go into the same FRDGBuilder, which is executed once.
+	//
+	// WorklistPtr (P3 Column stage): raw pointer to the member ring so the
+	// graph can register the column arena the flush command just filled.
+	// Same lifetime standing as FVoxelGpuWorklist::Flush's own `this`
+	// capture: by the time the manager can be destroyed the game thread has
+	// stopped enqueuing, and destruction drains the render queue behind any
+	// command still holding this pointer.
+	FVoxelGpuWorklist* const WorklistPtr =
+		(VoxelGpuWorklistColumnsEnabled() && VoxelGpuWorklistEnabled()
+		 && Worklist.IsInitialized()) ? &Worklist : nullptr;
+	const bool bVerifyColsArmed = VoxelGpuWorklistVerifyColsEnabled();
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
-		[Jobs = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
+		[Jobs = MoveTemp(Batch), WorklistPtr, bVerifyColsArmed](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
+
+		// P3 Column stage: the arena and stats buffers, registered once for
+		// the whole batch. Arena null (stage never dispatched) makes every
+		// job below fall back to its classic ColumnMain -- counted, loudly,
+		// never silent.
+		FVoxelGpuWorklist::FColumnStageBindings WorklistCols;
+		if (WorklistPtr != nullptr)
+		{
+			WorklistCols = WorklistPtr->RegisterColumnStage(GraphBuilder);
+		}
 
 		// --- P1: the pool's arenas, registered ONCE for every claiming job ---
 		//
@@ -2655,8 +2837,32 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 				// attribute it does not answer the question.
 				RDG_EVENT_SCOPE(GraphBuilder, "Voxel.BrickRegion");
 
+				// P3 Column stage: this chunk's columns are already in the
+				// worklist arena (the flush command ran first) -- feed the
+				// region graph its slice so it skips its own ColumnMain. A
+				// job with a slice but NO arena is the render-side failure
+				// (the stage armed and the flush never created it): fall back
+				// classic and COUNT it -- silence here would be the eighth
+				// feature found running while doing nothing.
+				VoxelGpuWorldGen::FWorklistColumnFeed ColumnFeed;
+				const bool bFeedColumns =
+					Job->WorklistColumnSlice != MAX_uint32 && WorklistCols.Arena != nullptr;
+				if (bFeedColumns)
+				{
+					ColumnFeed.Arena = WorklistCols.Arena;
+					ColumnFeed.SliceIndex = Job->WorklistColumnSlice;
+					ColumnFeed.bVerify = bVerifyColsArmed && WorklistCols.Stats != nullptr;
+					ColumnFeed.VerifyStats = WorklistCols.Stats;
+				}
+				else if (Job->WorklistColumnSlice != MAX_uint32)
+				{
+					VoxelGpuBatchDetail::GWorklistColArenaMissing.fetch_add(
+						1, std::memory_order_relaxed);
+				}
+
 				const VoxelGpuWorldGen::FRegionGraphResources BrickGraph =
-					VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->BrickRegion);
+					VoxelGpuWorldGen::AddRegionPasses(GraphBuilder, Job->BrickRegion,
+					                                  bFeedColumns ? &ColumnFeed : nullptr);
 
 				if (BrickGraph.BrickDesc == nullptr || BrickGraph.BrickOcc == nullptr ||
 				    BrickGraph.BrickMat == nullptr || BrickGraph.BrickChunkMask == nullptr ||

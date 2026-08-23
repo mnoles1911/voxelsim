@@ -598,5 +598,18 @@ private:
 	uint64 WorklistCumRefused = 0;
 	double LastWorklistLogSeconds = 0.0;
 	bool bWorklistArmingLogged = false;
+	// --- P3 stage 1, the converted Column kernel (-VoxelGpuWorklistColumns) --
+	// conv: chunks whose ColumnMain pass was replaced by their slice of the
+	// once-per-tick indirect dispatch. fb: eligible records that were NOT
+	// consumed by this tick's flush (ring backlog past the budget, refused
+	// ring, or stage unarmed at flush) -- those chunks ran classic and their
+	// arena slice, if any, went unread. Cumulative, printed by the armed-only
+	// wlcols line; the failing readings are documented at the log site.
+	int64 WorklistColConverted = 0;
+	int64 WorklistColFallback = 0;
+	// True when DispatchBatch flushed the worklist this tick (column stage:
+	// the flush must precede the batch render command); Tick then skips its
+	// own flush and clears the flag.
+	bool bWorklistFlushedThisTick = false;
 	void MaybeLogWorklistWindow();
 };

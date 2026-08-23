@@ -22,6 +22,7 @@
 
 struct FVoxelGpuRegionRequest;
 class FRDGBuilder;
+class FVoxelRasterAtlasGpu;
 
 namespace VoxelGpuWorldGen
 {
@@ -149,6 +150,47 @@ namespace VoxelGpuWorldGen
 	// Pure arithmetic over the request. Assumes it already validated.
 	FRegionGraphSizes ComputeRegionGraphSizes(const FVoxelGpuRegionRequest& Request);
 
+	// --- P3 Column stage (the first converted worklist kernel) --------------
+	//
+	// FWorklistColumnFeed: a lean brick region whose COLUMNS were already
+	// computed this tick by the worklist's indirect Column dispatch
+	// (ColumnWorklistMain writing the flush-level arena). With a feed,
+	// AddRegionPasses SKIPS its ColumnMain pass and binds VoxelizeMain's
+	// InColumns to the arena at ColumnReadBase = SliceIndex * 1024. bVerify
+	// additionally runs the classic ColumnMain into a transient AND a compare
+	// pass (ColumnWorklistVerifyMain) accumulating into VerifyStats [4..5] --
+	// the plan doc's stage-2 byte gate, verify arm only.
+	//
+	// PRECONDITIONS the caller owns (checkf'd): atlas request, BandEdge 0,
+	// 32x32 columns -- i.e. exactly the worklist record eligibility.
+	struct FWorklistColumnFeed
+	{
+		FRDGBufferRef Arena = nullptr;        // budget x 1,024 GpuColumnSample
+		uint32 SliceIndex = 0;                // this chunk's slice in this tick's consume
+		bool bVerify = false;
+		FRDGBufferRef VerifyStats = nullptr;  // the worklist stats buffer ([4..5])
+	};
+
+	// The once-per-tick indirect Column dispatch, added to the worklist FLUSH
+	// graph (caller: FVoxelGpuWorklist::Flush). Declared here for the quad
+	// passes' reason: the shader class lives in VoxelGpuWorldGen.cpp (it
+	// compiles worldgen.ush and must carry the version-lock define), the
+	// caller is another translation unit.
+	struct FWorklistColumnDispatch
+	{
+		FRDGBufferRef Records = nullptr;       // the ring
+		FRDGBufferRef Control = nullptr;       // [0]=consumeFirst [1]=consumeCount
+		FRDGBufferRef IndirectArgs = nullptr;  // the args pass's triples
+		uint32 IndirectArgsOffset = 0;         // byte offset of the Column triple
+		uint32 RingCapacity = 0;
+		FRDGBufferRef ColumnArena = nullptr;   // written: one slice per consumed record
+		FVoxelRasterAtlasGpu* Atlas = nullptr; // registered into this graph here
+		uint32 SeedLo = 0;
+		uint32 SeedHi = 0;
+		int32 PixelSizeMm = 0;
+	};
+	void AddWorklistColumnPass(FRDGBuilder& GraphBuilder, const FWorklistColumnDispatch& Dispatch);
+
 	// Adds the seven passes to GraphBuilder and returns the buffers they wrote.
 	// RENDER THREAD ONLY. Does not execute the graph, does not enqueue any
 	// readback, and does not block -- the caller owns all three decisions.
@@ -157,7 +199,12 @@ namespace VoxelGpuWorldGen
 	// outlive it: the raster arrays are copied into RDG's own allocator here
 	// (CreateStructuredBuffer with the default ERDGInitialDataFlags copies), and
 	// the loose parameters are plain scalars written into the parameter struct.
-	FRegionGraphResources AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request);
+	//
+	// ColumnFeed (P3 Column stage): see FWorklistColumnFeed above. Null -- the
+	// default, and every caller except the lean worklist path -- is the shipped
+	// graph, byte for byte.
+	FRegionGraphResources AddRegionPasses(FRDGBuilder& GraphBuilder, const FVoxelGpuRegionRequest& Request,
+	                                      const FWorklistColumnFeed* ColumnFeed = nullptr);
 
 	// --- Wave D / D1: the two GPU-side quad copies --------------------------
 	//
