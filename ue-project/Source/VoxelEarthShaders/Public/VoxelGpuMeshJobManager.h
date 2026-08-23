@@ -203,6 +203,19 @@ VOXELEARTHSHADERS_API bool VoxelGpuBrickPackResidentEnabled();
 // cvar" lesson recorded there.
 VOXELEARTHSHADERS_API bool VoxelGpuWorldGenBatchEnabled();
 
+// -VoxelGpuPrimary=1: the GPU is the intended PRIMARY chunk producer, with the
+// CPU workers as the fallback for what the GPU cannot or will not take (edits
+// and overlay chunks, bNoGpuRetry records, a full fork queue). One switch, two
+// modules: the streaming side reads it to enable the fork, widen its in-flight
+// budget and imply seed-only band requests; the manager reads it here to imply
+// the lean brick graph and lift the per-tick promotion/harvest quota defaults
+// that were sized for the 4%-of-traffic era. Every implied default is still
+// individually overridable by its own explicit command-line latch -- primary
+// changes DEFAULTS, never outranks an explicit flag. Exported for the same
+// one-owner reason as VoxelGpuBrickPackEnabled above. Default off: without the
+// flag every default is byte-identical to the shipped configuration.
+VOXELEARTHSHADERS_API bool VoxelGpuPrimaryEnabled();
+
 struct FVoxelGpuMeshJobResult
 {
 	uint64 JobId = 0;

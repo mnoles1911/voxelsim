@@ -2586,7 +2586,13 @@ bool GpuMeshEnabled()
 	// the editor has no command line of its own, so whichever way the default
 	// points, the switch that flips it has to be the one on the editor's own
 	// command line.
-	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"));
+	// -VoxelGpuPrimary implies the fork ON: a "GPU is the primary producer"
+	// switch that still required a second flag to have a GPU producer at all
+	// would be the exact silent-no-op trap this project keeps re-measuring.
+	// -VoxelGpuMesh alone still works as before, and a primary leg needs no
+	// second flag.
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelGpuMesh"))
+		|| VoxelGpuPrimaryEnabled();
 	return bEnabled;
 }
 
@@ -2614,9 +2620,22 @@ int32 GpuMeshInFlight()
 	// MeshBatchCap (4/8 vs 16/32 moved 0.0), and not the mesher choice
 	// (-VoxelNoGpuMesh arm also ~593/s). That plateau is the open P0 in
 	// docs/measurements/gpu-throughput-wave-2026-07-27.txt.
+	// GPU-primary default: 1024. The 2026-07-27 falsification of "raise the
+	// depth" stands UNCONTRADICTED for the regime it measured -- the fork was
+	// promotion-quota-bound at 4/tick and idled at ~11 in flight, so depth was
+	// never the binding constraint and 1024 rightly moved nothing. Primary
+	// changes the regime: BatchCap defaults to 64 and a WorldGenBatch stack
+	// sweep counts every fused MEMBER against MaxInFlight (the sweep stops at
+	// `InFlight + Batch >= MaxInFlight`), so 64 stack heads x ~8.3 members
+	// ~= 530 jobs from ONE tick's promotion -- 256 would clamp the very
+	// amortisation the quota lift exists to buy, and two caps in series make
+	// the throughput unattributable (the standing reason these were matched at
+	// 256/256). 1024 keeps the manager cap from binding before the streaming
+	// side's own budget at the new promotion rate. Explicit
+	// -VoxelGpuMeshInFlight=N still outranks.
 	static const int32 N = []
 	{
-		int32 Value = 256;
+		int32 Value = VoxelGpuPrimaryEnabled() ? 1024 : 256;
 		FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuMeshInFlight="), Value);
 		return FMath::Clamp(Value, 1, 4096);
 	}();
@@ -17208,11 +17227,15 @@ bool FVoxelWorldImpl::SubmitGpuMeshJob(const VoxelCoords::FVoxelLevelChunkKey& L
 		// bandCache stalls while free rises, seeds are being lost and this
 		// switch is starving the buried-skip -- that is the failing state, and
 		// holes/uncovered would follow it.
+		// -1 sentinel: an explicit -VoxelGpuBandSeedOnly=0 must win over
+		// -VoxelGpuPrimary's implied ON (primary changes defaults, never
+		// outranks an explicit flag), or the band-policy control arm under
+		// primary would be unrunnable.
 		static const bool bBandSeedOnly = []
 		{
-			int32 Value = 0;
+			int32 Value = -1;
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuBandSeedOnly="), Value);
-			return Value != 0;
+			return Value >= 0 ? Value != 0 : VoxelGpuPrimaryEnabled();
 		}();
 		// Attribution (see FootprintBandRequestInFlight's declaration for
 		// the three causes and their failing readings): the manager's worklist
