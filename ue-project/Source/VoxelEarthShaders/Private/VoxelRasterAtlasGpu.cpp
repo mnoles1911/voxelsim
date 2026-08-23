@@ -97,24 +97,36 @@ void FVoxelRasterAtlasGpu::Init(uint32 InPagePx, uint32 InPagesDim)
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Slots),
 			TEXT("Voxel.RasterAtlasTags"));
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Tags), 0xffffffffu);
-		FRDGBufferRef Elev = GraphBuilder.CreateBuffer(
+		// PAYLOADS ARE ALLOCATED OUTSIDE THE GRAPH, and that is forced by the
+		// decision not to clear them. A payload behind a sentinel tag is
+		// unreachable by construction (atlasResolve checks the tag first), so
+		// clearing hundreds of MiB here would be a hitch bought for nothing --
+		// but an RDG buffer that no pass writes cannot be extracted:
+		//
+		//   Assertion failed: Resource->bProduced || Resource->bExternal ||
+		//   Resource->bQueuedForUpload -- "Unable to queue the extraction of
+		//   the resource Voxel.RasterAtlasElev because it has not been
+		//   produced by any pass."
+		//
+		// AllocatePooledBuffer hands back the pooled buffer directly, with no
+		// producing pass required and no clear. The alternative -- creating
+		// them in the graph and clearing to satisfy RDG -- would reintroduce
+		// exactly the hitch this comment exists to avoid, at up to ~610 MiB
+		// under ring 6 at fine pitch.
+		PooledElevation = AllocatePooledBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(int32), Pixels),
 			TEXT("Voxel.RasterAtlasElev"));
-		FRDGBufferRef Climate = GraphBuilder.CreateBuffer(
+		PooledClimate = AllocatePooledBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), Pixels),
 			TEXT("Voxel.RasterAtlasClimate"));
-		// Payloads are NOT cleared: a payload behind a sentinel tag is
-		// unreachable by construction (atlasResolve checks the tag first),
-		// and clearing hundreds of MiB here would be a hitch bought for
-		// nothing.
 		FRDGBufferRef Miss = GraphBuilder.CreateBuffer(
 			FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), kMissStatsDwords),
 			TEXT("Voxel.RasterAtlasMiss"));
 		AddClearUAVPass(GraphBuilder, GraphBuilder.CreateUAV(Miss), 0u);
 
+		// Only the two CLEARED buffers go through extraction -- the payloads
+		// above are already pooled and never entered the graph.
 		GraphBuilder.QueueBufferExtraction(Tags, &PooledTags);
-		GraphBuilder.QueueBufferExtraction(Elev, &PooledElevation);
-		GraphBuilder.QueueBufferExtraction(Climate, &PooledClimate);
 		GraphBuilder.QueueBufferExtraction(Miss, &PooledMissStats);
 		GraphBuilder.Execute();
 	});
@@ -157,6 +169,12 @@ void FVoxelRasterAtlasGpu::EnqueueUpsert(FVoxelRasterAtlasGpuDelta&& Delta)
 		[this, Delta = MoveTemp(Delta), PixelsPerPage, NumUpserts,
 		 bWantMissRead](FRHICommandListImmediate& RHICmdList) mutable
 	{
+		// Drain any readback that landed since the last upsert, HERE, on the
+		// render thread. The game thread's PollMissStats only consumes what
+		// this publishes -- doing the RHI IsReady()/Lock() in Tick asserted
+		// IsInRenderingThread() and killed the run at 37 s.
+		PollMissStats_RenderThread();
+
 		FRDGBuilder GraphBuilder(RHICmdList);
 		FRDGBufferRef Elev = nullptr;
 		FRDGBufferRef Climate = nullptr;
@@ -264,12 +282,12 @@ void FVoxelRasterAtlasGpu::EnqueueMissStatsRead()
 	bMissReadbackArmed.store(true);
 }
 
-bool FVoxelRasterAtlasGpu::PollMissStats(FVoxelRasterAtlasMissStats& Out)
+void FVoxelRasterAtlasGpu::PollMissStats_RenderThread()
 {
-	check(IsInGameThread());
+	check(IsInRenderingThread());
 	if (!bMissReadbackInFlight.load() || !MissReadback.IsValid() || !MissReadback->IsReady())
 	{
-		return false;
+		return;
 	}
 	uint32 Data[kMissStatsDwords] = {};
 	if (const void* Src = MissReadback->Lock(sizeof(Data)))
@@ -278,10 +296,30 @@ bool FVoxelRasterAtlasGpu::PollMissStats(FVoxelRasterAtlasMissStats& Out)
 		MissReadback->Unlock();
 	}
 	bMissReadbackInFlight.store(false);
-	Out.Misses = Data[0];
+	PublishedMisses.store(Data[0], std::memory_order_relaxed);
 	for (int32 I = 0; I < 4; ++I)
 	{
-		Out.FirstPageTags[I] = Data[1 + I];
+		PublishedFirstPageTags[I].store(Data[1 + I], std::memory_order_relaxed);
+	}
+	bMissStatsPublished.store(true, std::memory_order_release);
+}
+
+bool FVoxelRasterAtlasGpu::PollMissStats(FVoxelRasterAtlasMissStats& Out)
+{
+	check(IsInGameThread());
+	// THE ACTUAL READBACK RUNS ON THE RENDER THREAD. IsReady() and Lock() are
+	// RHI calls that assert IsInRenderingThread(); calling them from
+	// TickStreaming crashed the run at 37 s with
+	//   Assertion failed: IsInRenderingThread() [RHICommandList.h:5316]
+	// This function now only consumes what the render thread published.
+	if (!bMissStatsPublished.load(std::memory_order_acquire))
+	{
+		return false;
+	}
+	Out.Misses = PublishedMisses.load(std::memory_order_relaxed);
+	for (int32 I = 0; I < 4; ++I)
+	{
+		Out.FirstPageTags[I] = PublishedFirstPageTags[I].load(std::memory_order_relaxed);
 	}
 	return true;
 }

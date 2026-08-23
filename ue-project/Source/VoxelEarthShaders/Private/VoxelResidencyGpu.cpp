@@ -144,6 +144,7 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, FeedbackOps)
 			SHADER_PARAMETER(uint32, FeedbackOpCount)
 			SHADER_PARAMETER(uint32, OrphanCap)
+			SHADER_PARAMETER(uint32, MaxRingLevel)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -160,6 +161,7 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, ZRangeGrid)
 			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, ZRangeOps)
 			SHADER_PARAMETER(uint32, ZRangeOpCount)
+			SHADER_PARAMETER(uint32, MaxRingLevel)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
@@ -178,6 +180,7 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, EvictList)
 			SHADER_PARAMETER(uint32, EvictCap)
 			SHADER_PARAMETER(uint32, NumLevels)
+			SHADER_PARAMETER(uint32, MaxRingLevel)
 			SHADER_PARAMETER(uint32, HierarchicalCoverage)
 			SHADER_PARAMETER_ARRAY(FVector4f, LevelRadiiA, [8])
 			SHADER_PARAMETER_ARRAY(FVector4f, LevelRadiiB, [8])
@@ -234,6 +237,7 @@ namespace
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, ShadowGrid)
 			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, Counters)
 			SHADER_PARAMETER(uint32, NumLevels)
+			SHADER_PARAMETER(uint32, MaxRingLevel)
 		END_SHADER_PARAMETER_STRUCT()
 	};
 } // namespace

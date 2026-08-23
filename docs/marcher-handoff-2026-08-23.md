@@ -563,3 +563,187 @@ cmake --build build/voxel-core-msvc --config Release
 # then FORCE A RELINK -- rebuilding the lib alone does not trigger one:
 touch a file under ue-project/Source/VoxelEarth && Build.bat ...
 ```
+
+
+---
+
+## 9. THE PRODUCER DIAGNOSIS — the GPU is idle, not slow
+
+The single most consequential finding of 2026-08-23, and it overturns the premise
+the GPU fork was switched off on.
+
+### 9.1 The fork does 2% of the work and halves throughput
+
+With `-VoxelGpuMesh` armed (`Saved/p2-verify-armed.log`):
+
+```
+forkDispatched   ~116 per 5 s window  =    ~23 chunks/s
+total dispatched (fork armed)         = ~1,107 chunks/s
+total dispatched (fork OFF, CPU only) = ~2,331 chunks/s
+```
+
+**The fork handles ~2% of the traffic, and merely arming it halves total
+throughput.** So "GPU meshing is slower than CPU" -- the belief that defaulted it
+off -- is false. The GPU is barely running.
+
+### 9.2 94% of fork latency is QUEUE WAIT
+
+`tools/leg-summary.sh p2-verify-armed`, n = 25,248 samples:
+
+| stage | ms | share |
+| --- | --- | --- |
+| **queued** (waiting to be promoted) | **2,196.0** | **94.0%** |
+| promoteToDispatch | 5.1 | 0.2% |
+| dispatchToReady (actual GPU work) | 61.1 | 2.6% |
+| readyToDeliver (readback) | 74.6 | 3.2% |
+| **submitToDeliver** | **2,336.9** | |
+
+**136 ms of real work inside a 2,337 ms round trip.** Chunks wait 2.2 seconds to
+be promoted.
+
+### 9.3 This answers "why 12 in flight of an allowed 256"
+
+In-flight depth is NOT capped and NOT eligibility-starved -- it is
+**promotion-starved**. Little's law: at 2.337 s latency, 12 in flight yields
+~5 chunks/s, the order of magnitude measured (~23/s).
+
+**A CORRECTION WORTH RECORDING.** The coordinator initially read `gpuInFlight=12`
+as a cap and asked for it to be raised to ~500. It is not a cap. The cap is 256,
+and the depth hypothesis was **already tested and falsified on 2026-07-27**
+(`VoxelWorldSubsystem.cpp:2551`): 590 chunks/s at 1024 vs 602 at 256, "the fork
+idling at ~11 in flight (never depth-bound at all)", with submit->deliver max
+ballooning to 13,146 ms -- past the 10 s retention cap, a correctness hazard.
+Same error shape as the tile-size mistake the same night: **a value observed was
+mistaken for a limit imposed, without reading the constant.**
+
+### 9.4 One mechanism plausibly explains every symptom
+
+Promotion runs on the game thread. `brickFlush` burns **967 ms per 5 s window**
+(~19% of wall) on that same thread:
+
+```
+Voxel GPU mesh tick (5s window): promoteMs=0.4 (enqueueMs=0.1) pollMs=3.5 brickFlushMs=967.6
+```
+
+Flush blocks the tick -> promotion runs less often -> in-flight stays ~12 ->
+queue wait balloons to 2.2 s -> the fork delivers 23 chunks/s -> and the flush
+cost halves total throughput while the fork contributes almost nothing. **One
+cause, five symptoms.** Moving flush off the game thread is therefore the highest
+-value single change, and is authorised.
+
+### 9.5 The arithmetic that forces an architecture change
+
+At **50,000 chunks/s**:
+  * latency 2,337 ms -> needs ~117,000 in flight. Impossible.
+  * queue wait removed, latency 136 ms -> needs ~6,800 in flight. Unreasonable.
+
+**Per-chunk CPU round trips cannot reach the target at any depth.** The round trip
+must be ELIMINATED, not shortened. That is now the authorised direction.
+
+The route exists and both halves were validated tonight for the first time ever:
+  * **P1** GPU brick-pool suballocator -- 1,101,676 claims, `claimFail 0`,
+    `doubleGrant 0 badFree 0`, `xcheck 408 ok / 0 FAIL`. The GPU can allocate its
+    own pool slots.
+  * **P2** GPU-written march index -- `verify pass=8319 FAIL=0 lost=0`. The GPU
+    can publish its own index.
+
+So generate -> allocate -> pack -> publish can run entirely GPU-side with no
+geometry returning to the CPU. The CPU keeps DECIDING (it must -- residency
+cannot be queried off the game thread, `:10688-10690`) and stops RECEIVING.
+
+**Check `voxel.GPU.MeshDirectToPool` first.** A no-readback path shipped earlier
+(D1 direct-to-pool, PR #161) and its recorded lesson is that **its wins were
+hidden by config gates**. A round-trip-free path may already exist and be inert
+-- which would make it the fourth feature found doing nothing this session, after
+the GPU fork itself, P2's verify counters, Phase 2's incremental scans, and the
+hole instrument's annotation writer.
+
+### 9.6 Where throughput actually stands
+
+| arm | chunks/s |
+| --- | --- |
+| control (CPU, before tonight's streaming work) | 2,238 |
+| `-VoxelNearestAdmit` | 2,453 (+9.6%) |
+| **all three streaming switches on** | **2,821 (+26%)** |
+| GPU fork armed | 1,107 |
+| CPU theoretical ceiling (8 workers x ~0.5 ms) | ~16,000 |
+| **target** | **50,000** |
+
+The +26% is game-thread work reduction and does not touch the producer ceiling.
+`candidatesRejected` fell 505,391 -> 210,356 per window (-58%) and no ring lost
+residency.
+
+
+---
+
+## 10. THE PRODUCER SWEEP: every GPU lever pulled, nothing moved
+
+Four-arm sweep, one binary, one flight, and the FIRST legs of the session run
+with the meter off the command line (no `IndexDeltaVerify`, no
+`CoverageVerify` -- their 56 MiB whole-grid FNV was poisoning every earlier
+armed leg and is what made `brickFlush` read 967 ms/window).
+
+| arm | dispatched | vs control |
+| --- | --- | --- |
+| control (`-VoxelGpuMesh -VoxelGpuPoolAlloc=1`) | 2,108/s | -- |
+| + `-VoxelGpuLeanBrickJobs -VoxelGpuBandColdOnly` | 2,083/s | -1% |
+| + `-VoxelGpuWorldGenBatch -VoxelGpuStackClaim` | 2,177/s | +3% |
+| + `-VoxelGpuMeshBatchCap=16` | 2,135/s | +1% |
+
+**All inside noise.** And critically, **every switch demonstrably engaged** -- this
+is not a fifth inert feature:
+
+  * `[gpu-lean] mesh-region graphs skipped=34489 kept=13210` -- 72% of region
+    graphs eliminated (all 13,210 retained are kept for `band`; quads 0,
+    noPack 0).
+  * `[gpu-batch] 77 stacks / 311 chunks (~1078 passes, vs ~4665 per-chunk)` --
+    passes cut 4.3x.
+  * `gpuInFlight` mean 12.1 -> 15.4 under `MeshBatchCap=16`, with the override on
+    the logged command line.
+
+So fences removed, round trips removed, passes cut 4.3x, quota raised 4x,
+in-flight raised -- **and throughput did not move.**
+
+### 10.1 Four falsified hypotheses
+
+1. **In-flight depth.** Cap is 256, not 12; raising it to 1024 was falsified on
+   2026-07-27 (590 vs 602 chunks/s, fork idling at ~11, submit->deliver max
+   13,146 ms -- a correctness hazard).
+2. **Per-job region graphs / readback fences.** 72% removed, no change.
+3. **The CPU round trip.** Stack claim removes it (no totals readback at all),
+   no change.
+4. **The per-tick promotion quota.** Raised 4x, in-flight rose, no change.
+
+**The producer is not GPU-limited, not latency-limited, and not quota-limited.**
+
+### 10.2 What is left, and it is the owner's stated blocker
+
+Per-chunk work on the GAME THREAD, in two terms, both dominated by duplication
+across chunks that share a footprint:
+
+  * **`FillRasterWindow`** -- 34 KB (5,800 px) per chunk, ~94% overlap between
+    neighbours. **290 Mpx/s at 50,000 chunks/s**, against a coarse atlas that
+    holds the ENTIRE 8.19 km ring-6 cascade in **0.30 Mpx = 1.71 MB**
+    (int16 elevation + 4x uint8 climate = 6 B/px; coarse pitch 30 m/px, fine
+    1.875 m/px, `tilePixelSizeMm`). A ~1,000x reduction, uploaded once and
+    updated at the edges.
+  * **The inline asset resolve in `SubmitGpuMeshJob`** -- `Amplifier::column`,
+    the project's most expensive primitive, paid **per chunk rather than per
+    footprint**: 8.3 stacked chunks each resolving the same instance list, plus a
+    ninth copy in exact admission. **~9.3 resolves where 1 would do.** Measured
+    live: `cycPerColumn` 1,067 (CPU arm), 2,268 (armed GPU leg).
+
+**VRAM is a non-issue** -- only "fine resolution everywhere" is expensive
+(437 MB), and nothing needs it; fine data exists for just 15 baked tiles.
+
+### 10.3 Open: the stack-claim crosscheck is a no-verdict gate
+
+`crosscheck 0 ok / 0 FAIL` in every window -- neither passing nor failing, so it
+proves nothing about stack-claim correctness. Treat stack claim as UNVERIFIED
+until it reports. This is the fifth instance tonight of a gate whose silence
+reads as success.
+
+Also open: **stack fusion is weak** -- 311 chunks over 77 stacks (~4/stack) and
+127 over 57 (~2.2/stack) against a design assumption of ~8, with 33 then 73 jobs
+falling back to `single`. The quota counts stacks, so weak fusion directly halves
+the benefit.

@@ -91,6 +91,10 @@ public:
 	// in flight); PollMissStats returns the result when it lands. Never blocks.
 	void EnqueueMissStatsRead();
 	bool PollMissStats(FVoxelRasterAtlasMissStats& Out);
+	// Render-thread half of the above: does the RHI-side IsReady()/Lock() and
+	// publishes into the atomics PollMissStats reads. Must be called from a
+	// render command, never from Tick.
+	void PollMissStats_RenderThread();
 
 	// Render thread, from inside a graph that wants to SAMPLE the atlas.
 	// Registers the pooled buffers (creating them empty -- all tags sentinel --
@@ -121,4 +125,15 @@ private:
 	TUniquePtr<FRHIGPUBufferReadback> MissReadback;
 	std::atomic<bool> bMissReadbackArmed{false};
 	std::atomic<bool> bMissReadbackInFlight{false};
+	// PUBLISHED BY THE RENDER THREAD, READ BY THE GAME THREAD. The readback's
+	// IsReady()/Lock() are RHI calls and assert IsInRenderingThread(); polling
+	// them from TickStreaming crashed with
+	//   Assertion failed: IsInRenderingThread() [RHICommandList.h:5316]
+	// So the render thread does the poll and publishes here, and the game
+	// thread only ever reads these atomics. A stale read is harmless: these
+	// are diagnostic counters, and one window of lag is invisible against the
+	// 5 s log cadence.
+	std::atomic<uint32> PublishedMisses{0};
+	std::atomic<uint32> PublishedFirstPageTags[4]{};
+	std::atomic<bool> bMissStatsPublished{false};
 };
