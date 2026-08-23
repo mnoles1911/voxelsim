@@ -1,0 +1,116 @@
+================================================================================
+WHY R0 SETTLES LAST UNDER -VoxelGpuPrimary: THE UNBOUNDED RESULTS BACKLOG
+2026-08-23 -- read from Saved/gp-pri.log and Saved/gp-ctl.log. No new legs;
+every number is quoted from an instrument already in the tree.
+================================================================================
+
+THE SYMPTOM. Per-ring cold settle inverts under -VoxelGpuPrimary while total
+work is identical (164,778 vs 164,725 jobs):
+
+    control:      R0  9.3s  R1  9.0s  R2 12.7s  R3 17.8s  R4 27.6s  R5 40.9s
+    gpu-primary:  R0 47.7s  R1 37.6s  R2 39.4s  R3 40.9s  R4 42.3s  R5 42.9s
+
+R0 -- the terrain the player stands in -- goes from FIRST to LAST.
+
+--------------------------------------------------------------------------------
+THE THREE NAMED CANDIDATES, ALL FALSIFIED BY THE SAME LOG
+--------------------------------------------------------------------------------
+
+1. "Fused stacks mix ring levels."  NO. SameBrickColumn() requires
+   A.BrickKey.Level == B.BrickKey.Level (VoxelGpuMeshJobManager.cpp) -- a
+   stack is level-homogeneous by construction. A fine chunk never waits on a
+   coarse stack member.
+
+2. "The 64/tick promotion quota is level-agnostic and bypasses ring
+   protection."  The quota is level-agnostic, but it is NOT the wait: the
+   manager's demand queue held only 136-380 entries all fill (fork window
+   line, queued=), promotion ran ~5,660 chunks/s ([gpu-batch] 5,377 stacks /
+   28,298 chunks in one 5s window), and the stage ledger puts queued= at
+   p50 5.9-103 ms. A 100 ms level-agnostic reorder cannot produce a 38 s
+   inversion.
+
+3. "Unbounded harvest delivers FIFO over a mixed set."  Delivery is not
+   where the time goes either: delivered tracks dispatched in every window,
+   failed=0, submitToDeliver mean 110-280 ms, and the slow-delivery counter
+   -- built to catch exactly this -- reads slow(>=5s)=0 (total 0) for the
+   whole leg.
+
+--------------------------------------------------------------------------------
+THE ACTUAL MECHANISM, IN TWO COUPLED HALVES
+--------------------------------------------------------------------------------
+
+HALF 1: DISPATCH OUTRUNS APPLY ~6x AND NOTHING BOUNDS THE GAP.
+
+The GPU fork does not consume the CPU worker budget (by design), and
+GpuJobsPending clears at DELIVERY, so the only GPU bound (GpuMeshInFlight,
+1024 under primary) never sees the applied/unapplied distinction. Meanwhile
+DrainResults applies under a per-frame budget (MaxApplies + wall clock), and
+the frame rate collapses to ~2-7 fps during the fill (dispatch-loop passes=
+26/19/14/13/10 per 5s window). "Voxel job flow" windows:
+
+    t~ 5-10s  dispatched=21,901  drained=9,439
+    t~10-15s  dispatched=24,221  drained=9,741
+    t~17-22s  dispatched=11,187  drained=   742
+    t~22-27s  dispatched= 5,162  drained=    81   <-- apply nearly stopped
+
+Cumulative by t~22s: ~127k dispatched vs ~37k drained = A ~90,000-RESULT
+BACKLOG in ResultsQueue. That queue is a single MPSC FIFO, drained
+level-agnostically -- so it is a 25-30 second, level-blind reorder buffer
+between "generated" and "resident". Per-ring settle order becomes pure
+submission order with a half-minute lag. The control never sees this because
+its CPU arm holds at most ~288 jobs between pop and enqueue: dispatch can
+never get more than a worker pool ahead of apply, so nearest-first pop order
+IS settle order (R0's fill-line q drains to 0 by t=8.1s and it settles 9.3s).
+
+HALF 2: THE BACKLOG BREAKS R0's BAND-SEED PIPELINE, SO R0 CANNOT EVEN DISPATCH.
+
+R0 is the one ring whose dispatch is SERIALIZED per footprint: the cold-band
+throttle parks a footprint's column-mates until its band seed's result
+DRAINS (band install + blind-mark clear live in DrainResults). Under
+primary, a seed's result delivers in ~250 ms and then sits ~20-30 s in the
+backlog. The 5 s blind-job mark (kBlindJobMarkTimeoutSeconds) always ages
+out first. The log shows the cycle directly:
+
+    * bandCache FROZEN at 908 from t~4s to t~28s (control: 5,088 by t~8s)
+    * gpuLatencyTimeouts bursts of 130-228 every ~5s -- one per seed cohort
+    * seed= 85-200/window sustained (footprints re-seeding after age-out)
+    * R0 fill line: j pinned at 3,492, q pinned at 512, for seconds at a
+      stretch -- dispatch starvation, not delivery starvation
+    * defers explode to 80,895-95,611/window in the tail: the pop loop
+      churning R0 candidates it must park again
+
+So R0 advances in ~5 s timeout generations while R1-R5 (never footprint-
+gated) dispatch freely, and R0's last dispatches land at t~43-47s. Settle
+order = dispatch order + the FIFO lag = the measured inversion. This is the
+exact failing state the -VoxelGpuBandSeedOnly comment predicted: "if
+bandCache stalls while free rises, seeds are being lost and this switch is
+starving the buried-skip".
+
+NOTE ON TOTALS: apply, not generation, is the settle clock in BOTH arms
+(mean 4,029/s control, 3,457/s primary -- primary is SLOWER end-to-end
+despite 20x GPU routing). Raising GPU throughput cannot shorten cold settle
+until the apply side keeps up; that is a separate lever with a separate
+owner. This doc is about ORDER.
+
+--------------------------------------------------------------------------------
+THE FIX SHAPE (committed separately)
+--------------------------------------------------------------------------------
+
+Bound dispatch-ahead-of-apply: pause the dispatch pop loop (BOTH arms, so
+the GPU/CPU split is untouched) while the un-applied results backlog exceeds
+a cap (-VoxelDispatchAheadCap, default 4096 under primary, 0=off otherwise
+-- control stays byte-identical). A ~1 s reorder window restores "pop order
+== settle order", which is the control's entire ordering mechanism, and
+shrinks seed drain latency below the 5 s mark so the band pipeline works as
+designed. Plus: install GPU-delivered bands and clear the footprint marks at
+DELIVERY (the speculative path already does), removing the band round trip's
+dependence on the backlog entirely.
+
+NOT the fix: level-primary promotion in the manager (the recorded "R3/R4 at
+0 loaded chunks for 90 s" failure), or relaxing apply budgets from the
+dispatch side (aggregate lever, different owner, and the cold-fill-diagnosis
+warning about burst modes still stands for the CPU-only regime it measured).
+
+Judge any change on PER-RING settle and per-ring loaded/pending, never
+aggregate. Gate: R0 completes first, toward 9.3 s; GPU share >= 75%; total
+<= 40.9 s; holes/uncovered flat; pool evictions flat.
