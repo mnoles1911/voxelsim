@@ -1,0 +1,334 @@
+================================================================================
+THE FRAME TAIL AT SPEED IS THE ANCHOR RECOMPUTE, AND IT IS ADMIT/TRUNCATE CHURN
+2026-08-23 -- read from Saved/st-all.log, Saved/spd60.log, Saved/spd120.log.
+No new legs run; every number is quoted from an instrument already in the tree,
+with the line that produced it named.
+================================================================================
+
+THE DEFECT: p95 frame time nearly triples from 30 to 120 m/s while throughput
+falls.  p50 is flat, so it is entirely a tail problem.
+
+    speed     p50      p95      hitches   frames
+    30 m/s    9.71    17.06        351    24,826   (st-all.log)
+    60 m/s   11.16    38.94      1,579    16,405   (spd60.log)
+   120 m/s    9.94    47.36      1,892    17,090   (spd120.log)
+
+"VoxelPerfRun complete", one binary, one flight (`line`, spawn -61440,-61440),
+varying only -VoxelPerfSpeed.  (st-all additionally carries
+-VoxelGpuWorklistAssetStamp=1, which the spd legs drop.  Noted so nobody
+reports the 30 m/s arm as switch-identical: it is not.  It does not affect any
+conclusion below, all of which rest on within-leg ratios.)
+
+THE ANSWER IN ONE LINE: the streaming recompute costs the same per call at
+every speed and is CALLED four times as often at speed, and what it spends
+that time on at speed is admitting half a million records per two seconds and
+throwing 498,025 of them straight back out again.
+
+--------------------------------------------------------------------------------
+1. IT IS NOT THE RENDER THREAD.  IT IS THE SUBSYSTEM TICK.
+--------------------------------------------------------------------------------
+
+The first thing to rule out, because if it were true none of the rest would
+matter.  Aggregated over every "Hitch frame:" line in each leg (mean; the
+attribution counts each hitch once):
+
+              subsystemTickMs   renderWaitMs   hitches whose frame is
+    speed        mean   max        mean        >50% subsystem tick
+     30 m/s      4.26   69.5       37.4          1 of   351  (0.3%)
+     60 m/s     19.33   91.5       33.5        697 of 1,579  (44%)
+    120 m/s     32.77  775.1       43.3      1,021 of 1,892  (54%)
+
+renderWaitMs is FLAT across the sweep.  subsystemTickMs on a hitch frame goes
+up 7.7x.  At 30 m/s a hitch is essentially never a streaming hitch; at 120 m/s
+the majority are.
+
+And it is not dispatch and not apply -- those are flat:
+
+                dispatchMs   applyMs   remeshMs   unloadMs
+     30 m/s        0.62       2.49       0.00       0.40
+    120 m/s        2.03       2.30       0.00       0.77
+
+--------------------------------------------------------------------------------
+2. INSIDE THE TICK IT IS RecomputeDesiredSet, AND THE COST IS PER CALL
+--------------------------------------------------------------------------------
+
+"Voxel recompute (max since last log)" carries calls=; "(sum since last log)"
+carries the stage split.  Both aggregated over windows 50..100 (mid-flight;
+zero-total windows dropped -- see tools/leg-summary.sh for why the last window
+of a log is never read).  The log interval is 2 s, so a window is 2 s of wall.
+
+    speed    calls/2s    ms per call    total ms/2s    share of wall
+     30        12.5         25.91          324.7          16%
+     60        54.7         22.07        1,207.6          60%
+    120        47.8         29.90        1,428.9          71%
+
+** ms PER CALL IS FLAT.  THE CALL COUNT IS WHAT EXPLODES. **
+
+That single fact decides the shape of any fix.  The recompute's cost does not
+scale with how far the anchor moved between calls -- it scales with the number
+of calls.  So calling it less often is a straight saving, not a deferral of
+work into a later, bigger call.
+
+WHY the call count explodes: the trigger is a LEVEL-0 chunk crossing
+(VoxelWorldSubsystem.cpp, `AnchorChunk.X != LastAnchorChunk.X || ...`).  A
+level-0 chunk is 3.2 m.  At 120 m/s that is 37.5 crossings/s.  The 3.2 m
+trigger was sized for walking speed; at flight speed it is a 37.5 Hz timer on
+a 25-30 ms function.  (Measured 23.9 calls/s, not 37.5, because the recompute
+is by then slow enough that several crossings collapse into one tick -- the
+cadence is self-limiting only because it is already eating the frame.)
+
+At 120 m/s the recompute occupies 71% of the game thread.  p50 stays at 9.94 ms
+because roughly half the frames carry no recompute at all; p95 is 47.36 ms
+because the ones that do carry a 25-30 ms blob (worst single call in the leg:
+109.8 ms).
+
+Stage split, ms per 2 s window, windows 50..100 (the parts sum to the total):
+
+    stage           30 m/s    60 m/s    120 m/s    ratio 120/30
+    entry R0          94.5     434.7      353.3        3.7x
+    entry R1          41.8     147.1      286.4        6.9x
+    entry R2          22.0      85.5      161.8        7.4x
+    entry R3-R5       24.8      80.9      158.7        6.4x
+    sort               1.3     154.7      249.8      192x
+    exitScan         139.1     260.0      176.3        1.3x
+    queueFilter        0.5      41.6       37.3       75x
+    fine               0.4       1.4        1.3
+    ---------------------------------------------------------
+    TOTAL            324.7   1,207.6    1,428.9        4.4x
+
+--------------------------------------------------------------------------------
+3. WHAT THE TIME IS ACTUALLY SPENT ON: ADMIT/TRUNCATE CHURN
+--------------------------------------------------------------------------------
+
+"Voxel admission (5s window)", aggregated over ALL 51 flight windows
+(50..100), not a single window -- the churn is a steady state, not a spike:
+
+    speed   mean cap   capSrc over 51 windows   mean drainEMA   mean dropped
+     30      32,768    max x51                      7,820              0
+     60      32,448    max x50, ema x1              7,528        206,479
+    120      32,768    max x51                      6,203        470,376
+
+dropped= is ZERO IN EVERY ONE of the 51 windows at 30 m/s and never below six
+figures at 120.  This is a phase change, not a gradient.
+
+`dropped=` is the counter this file's own comment (AdmissionCapMax, and again
+at LeadHorizonSec) names as THE NUMBER THAT MUST BE WATCHED, with the failing
+reading written out in advance: "dropped= balloons while dispatched/s stays
+flat: truncate churn."  It balloons from ZERO to a 470,376-per-2 s mean while
+dispatched FALLS.  The predicted failure mode is the one that is happening.
+
+"Voxel job flow (5s window)".  These are ONE representative mid-flight window
+per leg, not the 51-window means above -- the stale% and recordsAdded/
+dispatched ratios are what matter and they hold across the flight:
+
+    speed   dispatched   drained    stale      recordsAdded  recordsEvicted
+     30       15,734     15,461     0 (0.0%)        16,973        15,900
+     60       17,529     12,539   443 (3.5%)       210,889        12,190
+    120       12,659     12,661 3,637 (28.7%)      503,424        15,144
+
+At 30 m/s recordsAdded (16,973) tracks dispatched (15,734): every record
+admitted is a record used.  At 120 m/s the system admits 503,424 records per
+2 s, dispatches 12,659 and evicts 15,144.  The other ~475,000 were added and
+then removed again by truncation inside the same or the next call -- and the
+51-window mean of dropped= (470,376) says the same thing independently, from
+the counter that measures the removal directly.  That is ~235,000 TMap
+insert/erase pairs PER SECOND on the game thread producing nothing, and it is
+10,532 admitted per recompute call against 265 dispatched per call -- a 40:1
+ratio.
+
+DropFarthestOverCap's own comment states the design intent it is missing by
+that 40x: "the band admits only chunks that are clearly nearer, sized so a
+call's admissions are on the order of what a call's dispatches drain, which is
+the whole point of the exercise: make production track drain."
+
+Stale results are the same waste seen from the other end: 28.7% of completed
+mesh jobs at 120 m/s are discarded because the chunk was un-admitted before
+the result landed.  0.0% at 30 m/s.
+
+WHY THE PHASE CHANGE.  Queue depth ("pendingJob=" on the max line):
+
+    speed    pendingJob    cap     tracked    entry scans/2s  R0/R1/R2/R3/R4/R5
+     30        1,436     32,768   250,692    12.5  6.3 3.1 1.6 0.8 0.4
+     60       29,389     32,768   109,385    54.7 18.8 9.5 4.7 2.4 1.2
+    120       32,336     32,768    60,441    47.8 34.5 18.8 9.5 4.8 2.4
+
+At 30 m/s the queue holds 1,436 against a 32,768 cap: subcritical, truncation
+never fires (dropped=0), no cutoff (cutoffM=-1), no rejections.  At 60 m/s and
+above the queue PINS at the cap, the cutoff collapses to 67 m, and every one
+of the 24 recomputes per second re-keys and re-sorts all 32,336 entries and
+then truncates them.  That is the sort's 192x: 1,436 entries x 12.5 calls
+versus 32,336 x 47.8 calls, n log n, which predicts ~123x against 192x
+measured -- same mechanism, same order.
+
+And the sorted output is almost entirely unused: dispatch pops ~265 entries
+between two sorts.  0.8% of a 32,336-entry sort is ever read before the whole
+array is re-keyed and re-sorted from scratch.
+
+--------------------------------------------------------------------------------
+4. THE CAP CEILING IS DECIDING EVERYTHING, AND THE SWEEP THAT WAS RUN COULD NOT
+   HAVE SEEN IT
+--------------------------------------------------------------------------------
+
+`capSrc=max` in every window at every speed.  The drain-sized cap
+(-VoxelAdmissionCapDrainSec=8, drainEMA ~6,425/s -> wanted ~51,400) is clamped
+to the 32,768 ceiling and never binds.  The cap in force is the CEILING, at
+every rung of the drainSec sweep that was run.
+
+worker-tap-2026-08-23.txt already records the confound -- "at drainSec>=8 the
+EMA crosses the 32,768 ceiling and every rung runs the same effective cap" --
+and the drainSec sweep that was run was 8 / 16 / 32.  All three are above the
+crossing.  ** THE SWEEP WAS THREE IDENTICAL ARMS. **  It read
+2,841-2,842 chunks/s "identical to the digit" because it WAS the same arm three
+times.  The only untested direction is DOWN, and down is the direction this
+churn analysis points.
+
+AND IT IS WORSE THAN THAT.  Every -VoxelAdmissionCapDrainSec value ever put on
+a command line, across every log in Saved/:
+
+    drainSec=4  : 6 legs   (b3b-off/on, cut-drain, p3-a/b/c)
+    drainSec=8  : 23 legs
+    drainSec=16 : 1 leg
+    drainSec=32 : 1 leg
+
+All six drainSec=4 legs carry NO -VoxelPerfSpeed, i.e. they ran at 30 m/s --
+the speed at which dropped= is zero in every window and the cap never binds at
+all.  They are also from a build predating the instrument: their admission
+line has no drainEMA=/capSrc= columns and reads cap=2048 throughout, the
+static floor.  So the drain-sized cap has NEVER been swept at speed, on any
+build that could report which bound decided.  The one arm that could have
+distinguished the ceiling from the controller was run six times, at the one
+speed where neither is in force.
+
+--------------------------------------------------------------------------------
+5. THE LEAD-HORIZON FLOOR IS NOT THE CAUSE (it is a ~8% aggravator)
+--------------------------------------------------------------------------------
+
+-VoxelLeadHorizonSec landed tonight and was the standing suspect.  Its own A/B
+at 60 m/s, one binary, one switch:
+
+    lead-off-60.log   p50 11.43   p95 39.77   hitches 1,602
+    lead-on-60.log    p50 11.34   p95 42.86   hitches 1,844   (+7.8% p95)
+
+It costs p95, and it should be re-judged on its own merits once the churn is
+gone.  But spd60.log carries the floor OFF and still reads p95 38.94 against
+17.06 at 30 m/s: the tail is 2.3x with the floor switched off.  The floor is
+not the defect.
+
+--------------------------------------------------------------------------------
+6. INCREMENTAL ADMISSION WAS OFF FOR THE ENTIRE SWEEP
+--------------------------------------------------------------------------------
+
+-VoxelIncrementalAdmission appears on none of the three command lines, and no
+"Voxel incremental admission (5s window)" line appears anywhere in any of the
+three logs.  Every one of the 960 ms/window of entry scans at 120 m/s was a
+FULL per-level disc walk.  The largest single term in the speed tail has an
+authored, default-off lever that this sweep never armed.
+
+--------------------------------------------------------------------------------
+7. WHAT TO RUN NEXT, CHEAPEST FIRST
+--------------------------------------------------------------------------------
+
+All at -VoxelPerfSpeed=120, against spd120.log as control.  Judge on per-ring
+residency, never aggregate throughput.
+
+READ THESE FOUR ON EVERY ARM, because the gate is all four and not just p95:
+  * p50 and p95        -- "VoxelPerfRun complete" (p50 must NOT rise)
+  * per-ring residency -- the per-ring resident counts, never the aggregate;
+                          level-primary ordering once read "R3/R4 at 0 loaded
+                          chunks for 90 s" while the aggregate looked healthy
+  * holes / uncovered  -- tools/read-holes.sh
+  * time-to-settle     -- "Voxel cold settle: SETTLED t=..s ..." (the probe
+                          that landed on main 2026-08-23; see
+                          docs/measurements/cold-fill-diagnosis-2026-08-23.txt).
+                          Every experiment below changes admission, and (1) in
+                          particular changes how much the cold fill may have
+                          in flight, so settle is the reading most likely to
+                          regress quietly while p95 improves.
+
+(1) NO CODE AT ALL -- shrink the cap.  -VoxelAdmissionCapDrainSec=1 and =2.
+    At the measured drainEMA of 6,203/s those give Wanted = 6,203 and 12,406,
+    both inside [StaticCap 2048, ceiling 32,768], so capSrc= must read `ema`
+    and not `max`.  ** capSrc=max on either rung means the arm did not take
+    and the leg measured the control twice ** -- check it before reading
+    anything else.  This is the untested half of section 4's sweep.
+      PREDICTED: dropped= collapses toward 0, pendingJob falls ~5x, sortMs
+      falls ~10x, stale% falls from 28.7%, recompute share falls from 71%,
+      p95 falls.
+      FAILING READING that says the cap was already right: per-ring residency
+      loses R3/R4/R5 (they are the rings a smaller shared budget starves
+      first -- this is exactly the failure the ring quota exists for, so read
+      per-ring, and read `holes`/`uncovered` with tools/read-holes.sh), or
+      dispatched/s falls with dropped= unchanged.
+
+(2) NO CODE -- arm -VoxelIncrementalAdmission (section 6).  Read
+    "Voxel incremental admission": incr R# close to the `scans` field is the
+    fast path carrying traffic.
+      FAILING READING: incr ~0, or incr high with entryMs unmoved -- the
+      switch is on and doing nothing.
+
+(3) The rate bound authored alongside this note (-VoxelRecomputeDutyPct=25),
+    which attacks the call COUNT rather than the per-call cost, and is
+    therefore orthogonal to (1) and (2).  Its own readings are on the
+    accessor's comment, including the magnitude it can and cannot deliver:
+    p95 47 -> high twenties, NOT to the 17 ms of the 30 m/s arm, because p95
+    is a percentile over FRAMES and 8.4 calls/s is still ~9% of them.  Do not
+    read a partial result as a dead feature; read defer= first.
+
+    NOTE ON COMPOSING (1) AND (3): (1) makes each call cheaper, and the rate
+    bound is expressed as a duty cycle, so a cheaper call automatically buys
+    MORE calls at the same duty.  The two do not fight, and (1)+(3) together
+    is the arm that should clear the gate -- but run them apart first, because
+    a duty bound sitting on top of an already-cheap recompute may never engage
+    (defer=0) and would then be carried forward as "measured, works" when it
+    was never tested.
+
+--------------------------------------------------------------------------------
+8. WHAT THIS NOTE DOES NOT CLAIM
+--------------------------------------------------------------------------------
+
+* It does not explain why the producer is too slow to keep up at 60 m/s in the
+  first place.  It explains what the CONSEQUENCE of falling behind costs on
+  the game thread, which is a positive feedback loop, not the root.
+* exitScanMs is the one stage that barely moves (139 -> 176 ms/window) and
+  that is because `tracked` FALLS with speed (250,692 -> 60,441).  Per call it
+  goes 11.1 ms -> 3.7 ms.  It is O(tracked) and behaving exactly as designed;
+  it is not a speed defect.
+* The 30 m/s arm carries one extra switch (section head).  Every conclusion
+  here is a within-leg ratio or a stage split that closes against its own
+  total, so no conclusion rests on that difference -- but a re-run of the
+  30 m/s arm on the exact spd command line would remove the caveat for free.
+
+--------------------------------------------------------------------------------
+9. 240 m/s CANNOT CURRENTLY BE MEASURED AT ALL -- ALL SIX LEGS DIED
+--------------------------------------------------------------------------------
+
+The 240 m/s row of tonight's table has a blank p95 and this is why.  Every leg
+run at -VoxelPerfSpeed=240 crashed before "VoxelPerfRun complete":
+
+    spd240.log  arena-240.log  wide-on-240.log  wide-ctl-240.log
+    lead-off-240.log  lead-on-240.log
+
+All six on the SAME fatal, VoxelFineTileStreamer.cpp:944:
+
+    FINE TIER GATE LEAK (fatal, unattended run): elevation query at fine pixel
+    (-16384,-35200) needs tile (-2,-5), which is not resident and could not be
+    loaded ... The streaming anchor is in tile (-3,-4), so this query is
+    1 tile(s) (~15 km) away from the player.
+
+This is NOT a streaming defect and NOT something this note's fixes address.
+The gate is working exactly as designed: at 240 m/s the `line` flight runs off
+the edge of the baked fine-tile coverage, and the gate refuses to answer with
+sea level rather than produce an unreproducible artifact.  The whole 240 m/s
+column of any sweep is therefore vacuous until one of:
+
+  * bake the missing tile -- tools/bake_tiles_from_cache.py --tiles="-2,-5"
+    (the gate message names it, and names the seed and namespace it checked);
+  * -VoxelFineTileGateFatal=0 to downgrade it to an Error -- but then the leg
+    is reading sea level over the unbaked ground and its terrain-shaped numbers
+    (holes, residency, dispatched) are measuring a different world than the
+    30/60/120 arms.  Use it only for frame-time-only questions, and say so;
+  * shorten the flight or move the spawn so 240 m/s stays inside coverage.
+
+RECORDED SO IT IS NOT RE-DISCOVERED: a 240 m/s leg that "produced no p95" has
+not measured a slow arm.  It crashed at ~2 minutes.  Check the tail of the log
+for `FINE TIER GATE LEAK` before drawing any conclusion from a missing number.
