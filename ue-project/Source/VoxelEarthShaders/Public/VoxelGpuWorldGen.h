@@ -275,6 +275,23 @@ namespace VoxelGpuWorldGen
 	// needs SM6 with 64-bit integer shader ops.
 	VOXELEARTHSHADERS_API bool IsSupportedOnCurrentRHI();
 
+	// Backlog 0.0b: `-VoxelSurfaceMip=1` on the command line enables
+	// surface-preserving coarse LOD materials -- the topmost solid cell of
+	// each coarse column takes the true level-0 surface voxel's material
+	// instead of the representative sample up to a whole coarse cell below
+	// it, so thin snow/grass caps stop browning out ring by ring. Default 0:
+	// today's behaviour, byte-identical, so a control capture needs no flag.
+	//
+	// Command-line rather than a cvar for the reason documented on
+	// -VoxelCoarseMinLevel (VoxelWorldSubsystem.cpp): -ExecCmds lands after
+	// streaming has already begun, and this must be one value for the whole
+	// process -- it feeds BOTH the CPU coarse/mip samplers (VoxelEarth) and
+	// the GPU dispatch constants (this module), plus voxel.GPU.VerifyCoarse's
+	// CPU reference, and a mid-run flip would put cached bricks generated
+	// under two different rules side by side. This accessor is the SINGLE
+	// derivation of the switch; every consumer calls it.
+	VOXELEARTHSHADERS_API bool SurfaceMipEnabled();
+
 	// One decoded corner, as DecodeVoxelQuadVertex produced it.
 	struct FDecodedVertex
 	{

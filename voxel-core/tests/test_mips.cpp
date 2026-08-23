@@ -181,3 +181,97 @@ VXC_TEST(mips_chain_determinism_golden) {
     // (was 0xE827A786195B8A73 at v3/v4/v5, 0xE4CF1B376622A38F at v2)
     CHECK_EQ(d.h, 0x216323B8FF725CC0ull);
 }
+
+// --- Backlog 0.0b: surface-preserving downsampling --------------------------
+//
+// The defect these pin: the majority vote discards thin surface layers. Snow
+// and grass caps are 1-3 voxels over an unbounded rock body, so a surface
+// group usually hands rock the vote outright, and a 4-4 tie STILL goes to
+// rock because the tie-break is lowest id (MAT_ROCK 2 < MAT_SNOW 7 <
+// MAT_GRASS 8). Compounded per level, and level is distance, the owner sees
+// terrain that gets browner ring by ring. surfacePreserve = true carries the
+// TOPMOST solid child instead; these tests pin the pick, the tie case it was
+// built for, the fully-solid-group case that justifies topmost-ALWAYS, and
+// the guarantee that solidity never moves.
+
+VXC_TEST(mips_surface_preserve_topmost_wins) {
+    // Parent cell (0,0,0), child 0, local block (0..1)^3: 4x rock on the
+    // bottom layer, ONE snow voxel on top. Vote: rock 4-1. Preserve: snow.
+    Brick<8> child;
+    child.set(0, 0, 0, MAT_ROCK);
+    child.set(1, 0, 0, MAT_ROCK);
+    child.set(0, 1, 0, MAT_ROCK);
+    child.set(1, 1, 0, MAT_ROCK);
+    child.set(0, 0, 1, MAT_SNOW);
+    const Brick<8>* children[8] = {};
+    children[0] = &child;
+
+    const Brick<8> voted = downsampleBricks<8>(children, 4, /*surfacePreserve=*/false);
+    CHECK_EQ(voted.get(0, 0, 0), MAT_ROCK);
+    const Brick<8> preserved = downsampleBricks<8>(children, 4, /*surfacePreserve=*/true);
+    CHECK_EQ(preserved.get(0, 0, 0), MAT_SNOW);
+    // Same occupancy either way -- the mode is colour, never shape.
+    CHECK_EQ(voted.solidCount(), preserved.solidCount());
+}
+
+VXC_TEST(mips_surface_preserve_beats_tie_break) {
+    // THE reported mechanism, exactly: 4 grass over 4 rock is a 4-4 tie, and
+    // the deterministic tie-break hands it to rock (2 < 8). Preserve mode
+    // must hand it to the grass on top.
+    Brick<8> child;
+    for (int dy = 0; dy < 2; ++dy)
+        for (int dx = 0; dx < 2; ++dx) {
+            child.set(dx, dy, 0, MAT_ROCK);
+            child.set(dx, dy, 1, MAT_GRASS);
+        }
+    const Brick<8>* children[8] = {};
+    children[0] = &child;
+
+    CHECK_EQ(downsampleBricks<8>(children, 4, false).get(0, 0, 0), MAT_ROCK);
+    CHECK_EQ(downsampleBricks<8>(children, 4, true).get(0, 0, 0), MAT_GRASS);
+}
+
+VXC_TEST(mips_surface_preserve_full_group) {
+    // Why topmost-ALWAYS rather than only-when-mixed: a 1-voxel cap whose
+    // surface lands exactly on a group's top boundary makes the group FULLY
+    // solid (the air starts in the group above), and a mixed-only rule would
+    // still hand it to the vote -- losing the cap on roughly half of all
+    // columns at every level. Verified here on the fully-solid group; the
+    // deterministic within-layer pick (first (dy,dx) ascending at the top dz)
+    // rides along via the two-material top layer.
+    Brick<8> child;
+    for (int dy = 0; dy < 2; ++dy)
+        for (int dx = 0; dx < 2; ++dx)
+            child.set(dx, dy, 0, MAT_ROCK);
+    child.set(0, 0, 1, MAT_SNOW);   // (dy=0,dx=0): first in scan order -> the pick
+    child.set(1, 0, 1, MAT_GRASS);
+    child.set(0, 1, 1, MAT_GRASS);
+    child.set(1, 1, 1, MAT_GRASS);
+    const Brick<8>* children[8] = {};
+    children[0] = &child;
+
+    // Vote: rock 4, grass 3, snow 1 -> rock. Preserve: top layer, first in
+    // (dy,dx) order -> snow.
+    CHECK_EQ(downsampleBricks<8>(children, 4, false).get(0, 0, 0), MAT_ROCK);
+    CHECK_EQ(downsampleBricks<8>(children, 4, true).get(0, 0, 0), MAT_SNOW);
+}
+
+VXC_TEST(mips_surface_preserve_solidity_untouched) {
+    // 3 solid of 8 stays AIR at the default threshold with the mode on --
+    // preserve changes which material a solid cell reports, never whether a
+    // cell is solid. (The erosion the threshold causes is real and is a
+    // separate, geometry-changing decision; see downsampleBricks' header.)
+    Brick<8> child;
+    child.set(0, 0, 0, MAT_ROCK);
+    child.set(1, 0, 0, MAT_ROCK);
+    child.set(0, 0, 1, MAT_SNOW);
+    const Brick<8>* children[8] = {};
+    children[0] = &child;
+
+    const Brick<8> preserved = downsampleBricks<8>(children, 4, true);
+    CHECK_EQ(preserved.get(0, 0, 0), MAT_AIR);
+    CHECK(!preserved.occupied(0, 0, 0));
+    // And at threshold 3 it becomes solid with the topmost material, exactly
+    // as the same threshold change does in vote mode.
+    CHECK_EQ(downsampleBricks<8>(children, 3, true).get(0, 0, 0), MAT_SNOW);
+}

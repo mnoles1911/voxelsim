@@ -77,7 +77,8 @@ namespace
 		SHADER_PARAMETER(uint32,       BricksZ) \
 		SHADER_PARAMETER(uint32,       ScanCount) \
 		SHADER_PARAMETER(uint32,       CoarseScale) \
-		SHADER_PARAMETER(uint32,       RingSkirtMask)
+		SHADER_PARAMETER(uint32,       RingSkirtMask) \
+		SHADER_PARAMETER(uint32,       SurfaceMip)
 
 	// Shared compile policy for all seven kernels.
 	//
@@ -732,6 +733,12 @@ namespace
 		// is byte-for-byte the pre-D5 dispatch.
 		Out.CoarseScale     = 1u << static_cast<uint32>(FMath::Clamp(Req.CoarseLevel, 0, 5));
 		Out.RingSkirtMask   = Req.RingSkirtMask & 0xfu;
+		// Backlog 0.0b: one process-wide value, from the single accessor the
+		// CPU samplers and voxel.GPU.VerifyCoarse's reference also read -- so
+		// the two arms cannot be configured apart. Dead in the kernel at
+		// CoarseScale == 1, which keeps level 0 (and the pinned digest) a
+		// statement about the pre-0.0b program in both flag states.
+		Out.SurfaceMip      = VoxelGpuWorldGen::SurfaceMipEnabled() ? 1u : 0u;
 	}
 
 	// P1-C. The three scan passes, over whichever count array is handed in.
@@ -1752,6 +1759,22 @@ void VoxelGpuWorldGen::AddBrickChunkClearPass(FRDGBuilder& GraphBuilder, FRDGBuf
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()
 {
 	return GMaxRHIFeatureLevel >= ERHIFeatureLevel::SM6;
+}
+
+bool VoxelGpuWorldGen::SurfaceMipEnabled()
+{
+	// Parsed once and cached: the value must be identical for every brick the
+	// process ever generates (CPU worker, GPU dispatch, verify reference),
+	// because coarse bricks generated under two rules would sit side by side
+	// in the same caches and rings. See the header comment for the full
+	// contract and for why this is a command-line switch, not a cvar.
+	static const bool bEnabled = []
+	{
+		int32 Value = 0;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSurfaceMip="), Value);
+		return Value != 0;
+	}();
+	return bEnabled;
 }
 
 FVoxelGpuRegionResult VoxelGpuWorldGen::RunRegionBlocking(const FVoxelGpuRegionRequest& Request)

@@ -544,6 +544,55 @@ public:
     // source of air below the surface shell.
     static MaterialId materialAt(const ColumnSample& col, int64_t vz);
 
+    // COARSE-CELL material under the D5 representative-sample rule, with an
+    // optional SURFACE-PRESERVING substitution (backlog 0.0b, 2026-08-23).
+    //
+    // THE DEFECT THIS EXISTS FOR. The coarse path samples a level-L cell at
+    // one representative level-0 voxel, `repVz`, the centre of the cell's
+    // span (GeneratedWorld::coarseRep, mirrored by worldgen.ush's coarseRep).
+    // For the TOPMOST solid cell of a column that centre sits anywhere from 0
+    // to `scale`-1 level-0 voxels BELOW the true surface -- on average
+    // scale/2, so ~0.8 m at level 4 -- which is deeper than the 1-3 voxel
+    // snow/grass/topsoil cap on most columns. The cap therefore vanishes from
+    // coarse rings level by level, and since distance selects level, the
+    // owner sees terrain that gets progressively browner with distance
+    // (screenshots, 2026-08-23; present since the marcher landed).
+    //
+    // THE RULE. `repVz` is the representative already computed by the caller
+    // (this function deliberately does NOT re-derive it -- rep derivation has
+    // several audited mirrors and this must not become another); `scale` is
+    // the coarse cell size in level-0 voxels (1 << level). Exactly one cell
+    // per column satisfies repVz <= top < repVz + scale, where `top` is
+    // topSolidVoxelZ(col.surfaceMm) -- the topmost cell whose representative
+    // is at or below the surface. That cell resamples at `top` itself, i.e.
+    // takes the true level-0 surface voxel's material; every other cell keeps
+    // its representative sample.
+    //
+    // WHAT IT CAN NEVER CHANGE: geometry. Substitution applies only when the
+    // representative sample is already solid, and only adopts the resample
+    // when IT is solid too -- so air stays air and solid stays solid,
+    // byte-for-byte, with the mode on or off. If a cave/cavern carves the
+    // surface voxel to air (a cave mouth, a sinkhole lip), the resample is
+    // rejected and that column keeps today's colours; if the carve took the
+    // REPRESENTATIVE instead, the cell was already air and is never touched.
+    // MAT_WATERMARK cells sit above the surface (repVz > top) and never
+    // qualify.
+    //
+    // MIRROR: worldgen.ush VoxelizeMain (SurfaceMip / CoarseScale). Any edit
+    // here must be re-mirrored there or voxel.GPU.VerifyCoarse goes red --
+    // which is that gate doing its job, not a reason to relax it.
+    static MaterialId coarseSurfaceMaterialAt(const ColumnSample& col, int64_t repVz,
+                                              int64_t scale, bool surfacePreserve) {
+        const MaterialId m = materialAt(col, repVz);
+        if (!surfacePreserve || scale <= 1 || m == MAT_AIR) return m;
+        const int64_t top = topSolidVoxelZ(col.surfaceMm);
+        if (repVz <= top && top < repVz + scale) {
+            const MaterialId surf = materialAt(col, top);
+            if (surf != MAT_AIR) return surf;
+        }
+        return m;
+    }
+
     // Stratigraphy only, cave pass NOT applied — the pre-M4 definition, kept
     // for tests and tooling that need "what would be here if no cave crossed
     // it". Production paths want materialAt().

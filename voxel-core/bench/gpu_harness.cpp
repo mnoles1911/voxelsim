@@ -267,7 +267,7 @@ struct GpuColumnSample {
 };
 static_assert(sizeof(GpuColumnSample) == 20, "GpuColumnSample must match the HLSL layout");
 
-// GPU-side mirror of worldgen.ush's cbuffer WorldGenParams (56 bytes,
+// GPU-side mirror of worldgen.ush's cbuffer WorldGenParams (68 bytes,
 // tightly packed — verified against the compiled SPIR-V's member offsets;
 // nothing here straddles a 16-byte boundary so DXC's HLSL-style cbuffer
 // packing matches plain sequential layout). BrickZMin/BricksZ are read only
@@ -294,8 +294,17 @@ struct WorldGenParamsCB {
     // D5.3 ring-boundary skirt; 0 for every bench fixture, and 0 makes the
     // whole block in regionCellMat dead, so the digest is unaffected.
     uint32_t RingSkirtMask;
+    // Backlog 0.0b surface-preserving coarse materials. 0 for every bench
+    // fixture (and the substitution is additionally dead at CoarseScale == 1,
+    // which is all the fixtures dispatch), so the digest is unaffected.
+    // APPENDED LAST deliberately: the committed prebuilt SPIR-V predates this
+    // field and simply never reads the trailing 4 bytes, so the bench stays
+    // valid against the stale bytecode until tools/compile-shaders.ps1 is
+    // re-run -- at which point the recompiled kernel reads the 0 and behaves
+    // identically anyway.
+    uint32_t SurfaceMip;
 };
-static_assert(sizeof(WorldGenParamsCB) == 64, "WorldGenParamsCB must match the HLSL cbuffer layout");
+static_assert(sizeof(WorldGenParamsCB) == 68, "WorldGenParamsCB must match the HLSL cbuffer layout");
 
 // Host half of the 2026-07 cross-vendor UB hardening pass. worldgen.ush now
 // guards these in-shader (it returns without writing rather than executing an
@@ -1314,6 +1323,7 @@ RegionResult runRegion(GpuContext& ctx, const RegionSpec& region, uint64_t seed)
     // per region and looked plausible.
     params.CoarseScale = 1;
     params.RingSkirtMask = 0;
+    params.SurfaceMip = 0; // 0.0b: historical materials; also dead at CoarseScale 1.
     params.DispatchColumnsX = region.width;
     params.DispatchColumnsY = region.height;
     params.RasterOriginPxX = static_cast<int32_t>(pxMin);
@@ -2086,6 +2096,7 @@ void prepTileCpu(GpuContext& ctx, FlightSlot& s, const TileSpec& tile, uint64_t 
     // leaving the value-initialised 0 collapses every column to world origin.
     params.CoarseScale = 1;
     params.RingSkirtMask = 0;
+    params.SurfaceMip = 0; // 0.0b: historical materials; also dead at CoarseScale 1.
     validateWorldGenParams(params, "prepTileCpu");
 
     if (!s.colVoxDescriptorsWritten || elevGrew || climGrew || cellsGrew) {

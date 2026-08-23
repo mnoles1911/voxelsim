@@ -239,21 +239,36 @@ public:
     // Level-`level` brick at `key` (level-L brick coords), generated at
     // its own resolution from a coarseColumns(level, key.x, key.y) grid.
     // makeCoarseBrick(0, key, grid) == makeBrick(key, grid) bit-identically.
-    Brick<B> makeCoarseBrick(int32_t level, const BrickKey& key, const ColumnGrid& grid) const {
+    //
+    // surfacePreserve (backlog 0.0b): route each cell through
+    // Amplifier::coarseSurfaceMaterialAt so the topmost solid cell of every
+    // column takes the true level-0 surface voxel's material instead of the
+    // representative sample up to a whole coarse cell below it -- the fix for
+    // coarse rings browning out as thin snow/grass caps fall between
+    // representatives. false (the default) is byte-identical to the historical
+    // rule, and the helper is the identity at level 0 either way, so the
+    // pinned makeCoarseBrick(0, ...) == makeBrick(...) tests stand untouched.
+    // Solidity never changes in either mode -- see the helper's contract.
+    Brick<B> makeCoarseBrick(int32_t level, const BrickKey& key, const ColumnGrid& grid,
+                             bool surfacePreserve = false) const {
         Brick<B> brick;
+        const int64_t s = int64_t(1) << level;
         for (int y = 0; y < B; ++y)
             for (int x = 0; x < B; ++x) {
                 const ColumnSample& col = grid.at(x, y);
                 for (int z = 0; z < B; ++z)
                     brick.set(x, y, z,
-                              Amplifier::materialAt(col, coarseRep(int64_t(key.z) * B + z, level)));
+                              Amplifier::coarseSurfaceMaterialAt(
+                                  col, coarseRep(int64_t(key.z) * B + z, level), s,
+                                  surfacePreserve));
             }
         brick.tryCollapse();
         return brick;
     }
 
-    Brick<B> makeCoarseBrick(int32_t level, const BrickKey& key) const {
-        return makeCoarseBrick(level, key, coarseColumns(level, key.x, key.y));
+    Brick<B> makeCoarseBrick(int32_t level, const BrickKey& key,
+                             bool surfacePreserve = false) const {
+        return makeCoarseBrick(level, key, coarseColumns(level, key.x, key.y), surfacePreserve);
     }
 
     // Level-L brick-z range intersecting the surface shell for a coarse

@@ -14,6 +14,36 @@
 // solid votes among the 8 children; ties broken deterministically by LOWEST
 // material id. Below-threshold cells are MAT_AIR.
 //
+// SURFACE-PRESERVING MODE (surfacePreserve = true, backlog 0.0b, 2026-08-23).
+// The majority vote above discards thin surface layers, and the effect is
+// visible: snow and grass caps are 1-3 voxels thick while the rock body under
+// them is unbounded, so any 2x2x2 group straddling the surface usually gives
+// rock the vote outright -- and on a 4-4 tie rock still wins, because the tie
+// break is LOWEST id and MAT_ROCK = 2 sits below MAT_SNOW = 7 and
+// MAT_GRASS = 8. Each level compounds the last, and distance selects level,
+// so on screen the defect reads as "the further the ring, the browner the
+// terrain" (owner-reported with screenshots; present since the marcher
+// landed).
+//
+// The mode changes ONE thing: a solid parent cell takes the material of the
+// TOPMOST solid child voxel in its 2x2x2 group (highest dz; first (dy, dx)
+// in ascending scan order breaks ties among the four voxels of that layer,
+// deterministically) instead of the vote winner. Topmost-always -- not
+// "topmost only when the group is mixed" -- is deliberate: a 1-voxel cap
+// whose surface lands exactly on a group's top boundary produces a FULLY
+// SOLID group (air starts in the group above), which a mixed-group-only rule
+// would still hand to the vote, losing the cap on ~half of all columns per
+// level. For buried groups the topmost child is body material anyway, so
+// topmost-always only ever biases a stratigraphy boundary upward by at most
+// one child cell per level -- invisible, since buried cells don't render.
+//
+// SOLIDITY IS DELIBERATELY UNTOUCHED in this mode: the solidThreshold rule
+// (and therefore every occupancy bit, quad, and streaming decision) is
+// byte-identical with the mode on or off. The mode is a COLOUR fix and its
+// A/B captures must differ only in colour; the half-voxel-per-level surface
+// erosion the threshold causes is real but is a separate, geometry-changing
+// decision with its own worldgen-version consequences.
+//
 // Brick layout: a level L+1 brick of edge B covers exactly the same world
 // footprint as a 2x2x2 group of level L bricks of edge B (each level's voxel
 // size is 2x the level below, doctrine plan §3.3 Band 2 "8 cubes become 1").
@@ -39,7 +69,8 @@ namespace vxc {
 // (x>=B/2 selects the +x child, etc.), and the local coordinate within that
 // child is (x*2)%B (covering that cell and its +1 neighbor on each axis).
 template <int B>
-Brick<B> downsampleBricks(const Brick<B>* const children[8], int solidThreshold = 4) {
+Brick<B> downsampleBricks(const Brick<B>* const children[8], int solidThreshold = 4,
+                          bool surfacePreserve = false) {
     static_assert(B % 2 == 0, "brick edge must be even for 2x downsample");
     constexpr int half = B / 2;
 
@@ -59,6 +90,12 @@ Brick<B> downsampleBricks(const Brick<B>* const children[8], int solidThreshold 
 
                 int counts[kMaterialCount] = {};
                 int solid = 0;
+                // Topmost solid child in this 2x2x2 group: highest dz wins;
+                // within a dz layer the FIRST solid voxel in the ascending
+                // (dy, dx) scan wins, so the pick is deterministic without a
+                // second pass. Only consulted in surface-preserving mode.
+                MaterialId topMat = MAT_AIR;
+                int topDz = -1;
                 for (int dz = 0; dz < 2; ++dz)
                     for (int dy = 0; dy < 2; ++dy)
                         for (int dx = 0; dx < 2; ++dx) {
@@ -66,9 +103,22 @@ Brick<B> downsampleBricks(const Brick<B>* const children[8], int solidThreshold 
                             if (m != MAT_AIR) {
                                 ++counts[m];
                                 ++solid;
+                                if (dz > topDz) {
+                                    topDz = dz;
+                                    topMat = m;
+                                }
                             }
                         }
                 if (solid < solidThreshold) continue; // stays MAT_AIR.
+
+                if (surfacePreserve) {
+                    // Backlog 0.0b: carry the topmost solid child's material so
+                    // a thin surface cap survives instead of being outvoted by
+                    // the body beneath it. Solidity (the threshold test above)
+                    // is untouched -- this mode changes colour, never shape.
+                    parent.set(x, y, z, topMat);
+                    continue;
+                }
 
                 // Majority vote; ascending scan + strict '>' ties toward the
                 // lowest material id (doctrine: deterministic tie-break).
@@ -127,8 +177,9 @@ public:
     // materialized there (treated as all-air by downsampleBricks).
     using SourceFn = std::function<const BrickT*(const BrickKey&)>;
 
-    explicit MipChain(SourceFn level0Source, int solidThreshold = 4)
-        : source_(std::move(level0Source)), threshold_(solidThreshold) {}
+    explicit MipChain(SourceFn level0Source, int solidThreshold = 4, bool surfacePreserve = false)
+        : source_(std::move(level0Source)), threshold_(solidThreshold),
+          surfacePreserve_(surfacePreserve) {}
 
     int solidThreshold() const { return threshold_; }
     size_t cachedCount() const { return cache_.size(); }
@@ -157,7 +208,7 @@ public:
         if (!anyChild) return nullptr; // whole group is air; don't materialize.
 
         auto [it, inserted] =
-            cache_.emplace(mk, downsampleBricks<B>(children, threshold_));
+            cache_.emplace(mk, downsampleBricks<B>(children, threshold_, surfacePreserve_));
         (void)inserted;
         return &it->second;
     }
@@ -165,6 +216,7 @@ public:
 private:
     SourceFn source_;
     int threshold_;
+    bool surfacePreserve_ = false;
     std::unordered_map<MipKey, BrickT, MipKeyHash> cache_;
 };
 
