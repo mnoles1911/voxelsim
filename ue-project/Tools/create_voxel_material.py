@@ -188,7 +188,21 @@ def main():
     # text as C++ and runs it against vxc::voxelTint. What nobody has checked is
     # the twelve nodes build_terrain_base_color adds below the palette decode.
     #
-    # WHAT A CAPTURE MUST SHOW, so whoever gets the box knows when it is right:
+    # WHAT A CAPTURE MUST SHOW, so whoever gets the box knows when it is right.
+    #
+    # FOUR OF THESE ARE NOW PRE-VERIFIED NUMERICALLY, which changes where to
+    # spend attention rather than removing them from the list.
+    # tools/check-terrain-graph.py evaluates the recorded graph and asserts the
+    # composition, its stage order (2), the ABSENT fallback (8), and that a
+    # biomeTint of 0 keeps the climate out of the near field (7); and
+    # tools/check-palette-parity.py compiles the shipped .ush and runs it against
+    # vxc::voxelTint. If one of those four looks wrong in a capture, the defect
+    # is in the parts no headless check reaches -- the vertex factory's own
+    # palette block, the interpolant budget, or the import settings -- not in the
+    # arithmetic.
+    #
+    # 1, 3, 4 and 6 are the ones only a picture can settle.
+    #
     #
     #   1. A CAVE WALL WITH STRATA. bedrock, rock, gravel and subsoil visibly
     #      different from each other. Until this change every one of them was
@@ -197,25 +211,26 @@ def main():
     #   2. A GRASS HILLSIDE WITH CUBE-TO-CUBE VARIATION at 5 m. If it is smooth,
     #      the variation is being applied before the modifiers rather than after
     #      and the lerps have flattened it.
-    #   6. A DRY CLIFF STILL READS AS ROCK. Worldgen v27 removed the dry-land
+    #   3. A DRY CLIFF STILL READS AS ROCK. Worldgen v27 removed the dry-land
     #      cliff gate, so the classifier calls a cliff by its surrounding biome;
     #      the slope term is the only thing left that makes it stone. If a
     #      vertical face in grassland is green top to bottom, that term is
     #      orphaned.
-    #   7. MOUNTAINS STILL HAVE SNOW. biomeSurfaceMaterial never emits MAT_SNOW,
+    #   4. MOUNTAINS STILL HAVE SNOW. biomeSurfaceMaterial never emits MAT_SNOW,
     #      so the elevation snowline is the only white in the world.
-    #   8. A TEMPERATE FOREST FLOOR DOES NOT READ AS BARE DIRT. MAT_TOPSOIL is
+    #   5. A TEMPERATE FOREST FLOOR DOES NOT READ AS BARE DIRT. MAT_TOPSOIL is
     #      31% of land and was green only because the biome LUT said so.
-    #   3. NO SEAM IN THE MOTTLE at a streaming ring boundary. That is the
+    #   6. NO SEAM IN THE MOTTLE at a streaming ring boundary. That is the
     #      world-metric patch wavelength; a step there means the ring level is
     #      not surviving the key.
-    #   4. TREES, FOLIAGE AND ANIMALS UNCHANGED from today. Their biomeTint is 0,
+    #   7. TREES, FOLIAGE AND ANIMALS UNCHANGED from today. Their biomeTint is 0,
     #      so the composition reduces to exactly the palette colour they already
     #      had.
-    #   5. THE COMPONENT PATH (voxel.Stream.GPU 0) STILL DRAWS THE WORLD. It
+    #   8. THE COMPONENT PATH (voxel.Stream.GPU 0) STILL DRAWS THE WORLD. It
     #      supplies no fourth or fifth UV, so it must fall through `present` to
     #      the climate-only graph. If it renders black, the presence encoding is
     #      the thing to look at.
+    #
     #
     # HOW THE THREE SLOTS ARE READ is build_palette_inputs() in
     # terrain_material_common.py, and what fills them is

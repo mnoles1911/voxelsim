@@ -114,8 +114,10 @@ uint8_t biomeTint;      // how much the climate owns, 1/255ths
 | `test_materialcolor.cpp` (15 tests) | bias, amplitude, coherence, band limit, salt, composition order, two materials collapsing onto each other | `ctest` |
 | `gen_material_palette_ush.py --check` | a generated copy drifting from the header | anywhere |
 | `check-palette-parity.py` | the shader's or the forge's **evaluation** drifting from `voxelTint`; the composition; the face-class mapping | Linux CI, no GPU |
-| `check-terrain-graph.py` | the material graph failing to build at all | Linux CI |
+| `check-terrain-graph.py` | the material graph failing to build; the composition, its stage order, an orphaned modifier, a black component path, a climate blend creeping back | Linux CI |
 | `palette-sheet.py` | nothing — it is how a human judges the numbers | Linux CI (artifact) |
+| `check-palette-parity.py` (entry point) | `VoxelMaterialPaletteTest.usf` drifting from the `.ush`'s signatures | Linux CI |
+| `gen_terrain_textures.py --check` | a committed PNG the palette has moved out from under | Linux CI |
 | `compile-shaders.ps1` | the shader being ill-formed or undefined on either ADR-0001 target | the Windows box |
 | a capture | everything above put together | the editor box |
 

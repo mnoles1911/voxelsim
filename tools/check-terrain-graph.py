@@ -28,6 +28,7 @@ Run:
     python3 tools/check-terrain-graph.py
 """
 import sys
+import tempfile
 import types
 from pathlib import Path
 
@@ -146,7 +147,357 @@ def install_stub():
     return u
 
 
+
+# ---------------------------------------------------------------------------
+# THE EVALUATOR: what the graph COMPUTES, not just whether it builds
+# ---------------------------------------------------------------------------
+#
+# Everything above answers "does this code run" -- nodes exist, methods resolve,
+# arg counts match, the two surviving modifiers are reachable. None of it can
+# tell a well-formed graph from a CORRECT one, and the header above says so.
+#
+# It does not have to stay that way. The stub already records the entire DAG:
+# `connections` is (src, src_out, dst, dst_in) with the real pin names, and
+# every set_editor_property is kept on the node. That is enough to EVALUATE the
+# graph -- walk it post-order, one small function per expression type, with the
+# leaves supplied by the caller -- and once it can be evaluated, ADR-0009's
+# composition claims stop being things a screenshot has to adjudicate.
+#
+# WHAT THIS DOES AND DOES NOT REPLACE. It checks the COMPOSITION: the order of
+# the stages, what the modifiers do to the material's colour, and what happens
+# on a pixel the palette never reached. It does NOT check the tint arithmetic
+# itself -- light and hue arrive here as inputs, exactly as they arrive at the
+# real material through TexCoords[5]. tools/check-palette-parity.py owns that
+# half, by compiling the shipped .ush and running it against vxc::voxelTint.
+#
+# The two together are what make the editor trip a confirmation. What is left
+# for it is the genuinely visual: cave strata, a dry cliff reading as rock,
+# snow on a mountain, and no mottle seam at a ring boundary.
+
+
+def _vec(v):
+    """Everything is a float list, so scalars and vectors compose like HLSL."""
+    if isinstance(v, (int, float)):
+        return [float(v)]
+    return [float(x) for x in v]
+
+
+def _broadcast(a, b):
+    """HLSL promotes a scalar against a vector, and rejects mismatched vectors."""
+    a, b = _vec(a), _vec(b)
+    if len(a) == len(b):
+        return a, b
+    if len(a) == 1:
+        return a * len(b), b
+    if len(b) == 1:
+        return a, b * len(a)
+    raise ValueError(f"cannot combine a float{len(a)} with a float{len(b)}")
+
+
+def _zip(f, a, b):
+    a, b = _broadcast(a, b)
+    return [f(x, y) for x, y in zip(a, b)]
+
+
+def _pin(value, out):
+    """Take an output pin off a value. '' is the whole thing."""
+    v = _vec(value)
+    if out in ("", None):
+        return v
+    if out == "RGB":
+        return v[:3]
+    lane = {"R": 0, "G": 1, "B": 2, "A": 3}.get(out)
+    if lane is None:
+        raise ValueError(f"unknown output pin {out!r}")
+    if lane >= len(v):
+        raise ValueError(f"pin {out} off a float{len(v)}")
+    return [v[lane]]
+
+
+class GraphEvaluator:
+    """Numeric evaluation of a recorded graph.
+
+    `leaves` supplies the values the editor would get from the mesh and the
+    vertex factory: vertex colour, the three palette UVs, the world position and
+    the vertex normal. `textures` supplies what each named texture sampler
+    returns, since a sample is a leaf here too.
+    """
+
+    def __init__(self, connections, leaves, textures):
+        self.leaves = leaves
+        self.textures = textures
+        self.incoming = {}
+        for src, src_out, dst, dst_in in connections:
+            # LAST WRITE WINS, matching the editor: connecting a pin twice
+            # replaces the first connection rather than adding to it.
+            self.incoming.setdefault(id(dst), {})[dst_in] = (src, src_out)
+        self._memo = {}
+
+    def _in(self, node, pin):
+        edge = self.incoming.get(id(node), {}).get(pin)
+        if edge is None:
+            raise ValueError(f"{node.cls_name} has nothing connected to pin {pin!r}")
+        src, src_out = edge
+        return _pin(self.eval(src), src_out)
+
+    def _has(self, node, pin):
+        return pin in self.incoming.get(id(node), {})
+
+    def eval(self, node):
+        if id(node) in self._memo:
+            return self._memo[id(node)]
+        value = self._eval(node)
+        self._memo[id(node)] = value
+        return value
+
+    def _eval(self, node):
+        c, p = node.cls_name, node.props
+        short = c.replace("MaterialExpression", "")
+
+        # --- leaves the mesh and the vertex factory supply ------------------
+        if short == "VertexColor":
+            return _vec(self.leaves["vertex_color"])
+        if short == "VertexNormalWS":
+            return _vec(self.leaves["normal"])
+        if short in ("WorldPosition", "CameraPositionWS"):
+            return _vec(self.leaves["world_pos" if short == "WorldPosition"
+                                    else "camera_pos"])
+        if short == "TextureCoordinate":
+            idx = int(p.get("coordinate_index", 0))
+            if idx not in self.leaves["texcoords"]:
+                raise ValueError(f"no leaf value supplied for UV{idx}")
+            return _vec(self.leaves["texcoords"][idx])
+
+        # --- authored constants ---------------------------------------------
+        if short == "Constant":
+            return [float(p["r"])]
+        if short == "Constant3Vector":
+            return _vec(p["constant"][:3])
+        if short == "ScalarParameter":
+            return [float(p["default_value"])]
+        if short == "VectorParameter":
+            return _vec(p["default_value"][:3])
+
+        # --- a texture sample is a leaf too ----------------------------------
+        if short.startswith("TextureSampleParameter"):
+            name = p.get("parameter_name")
+            if name not in self.textures:
+                raise ValueError(f"no stub value for texture sampler {name!r}")
+            fn = self.textures[name]
+            return _vec(fn(self._in(node, "UVs")) if callable(fn) else fn)
+
+        # --- DitherTemporalAA, which only ever feeds OpacityMask -------------
+        if short == "MaterialFunctionCall":
+            # Returned as a sentinel rather than a number: nothing downstream of
+            # BaseColor may consume it, and a NaN would make that violation loud
+            # instead of plausible.
+            return [float("nan")]
+
+        # --- arithmetic -------------------------------------------------------
+        if short == "Add":
+            return _zip(lambda x, y: x + y, self._in(node, "A"), self._in(node, "B"))
+        if short == "Subtract":
+            return _zip(lambda x, y: x - y, self._in(node, "A"), self._in(node, "B"))
+        if short == "Multiply":
+            return _zip(lambda x, y: x * y, self._in(node, "A"), self._in(node, "B"))
+        if short == "Divide":
+            return _zip(lambda x, y: x / y, self._in(node, "A"), self._in(node, "B"))
+        if short == "Max":
+            return _zip(max, self._in(node, "A"), self._in(node, "B"))
+        if short == "Distance":
+            a, b = _broadcast(self._in(node, "A"), self._in(node, "B"))
+            return [sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5]
+        if short == "Abs":
+            return [abs(x) for x in self._in(node, "")]
+        if short == "OneMinus":
+            return [1.0 - x for x in self._in(node, "")]
+        if short == "Saturate":
+            return [min(1.0, max(0.0, x)) for x in self._in(node, "")]
+        if short == "AppendVector":
+            return self._in(node, "A") + self._in(node, "B")
+        if short == "LinearInterpolate":
+            a, bb = _broadcast(self._in(node, "A"), self._in(node, "B"))
+            alpha = self._in(node, "Alpha")
+            alpha = alpha * len(a) if len(alpha) == 1 else alpha
+            return [x + (y - x) * t for x, y, t in zip(a, bb, alpha)]
+        if short == "ComponentMask":
+            v = self._in(node, "")
+            lanes = [i for i, k in enumerate("rgba") if p.get(k)]
+            return [v[i] for i in lanes]
+
+        raise ValueError(f"the evaluator does not model {c}. Add it -- an "
+                         "unmodelled node cannot be silently skipped, because a "
+                         "skipped node is an unchecked one.")
+
+
+# The composition ADR-0009 specifies, in three lines, so the expected value is
+# written where it can be read next to the assertions that use it. This is the
+# same arithmetic as vxc::applyTintQ16 and VoxelApplyVariation; that those two
+# agree with EACH OTHER is check-palette-parity.py's job, and it compiles the
+# shipped shader to say so rather than mirroring it. What is checked here is
+# that the GRAPH performs it, on the right operand, in the right order.
+def apply_variation(rgb, light, hue):
+    c = [x * (1.0 + light) for x in rgb]
+    c[0] *= 1.0 + hue
+    c[2] *= 1.0 - hue
+    return [max(x, 0.0) for x in c]
+
+
+def close(a, b, tol=1e-6):
+    a, b = _vec(a), _vec(b)
+    return len(a) == len(b) and all(abs(x - y) <= tol for x, y in zip(a, b))
+
+
+def check_composition(tmc, unreal_mod, failures):
+    """Evaluate the palette path and hold it to ADR-0009's four claims."""
+
+    # The base colour and the variation as the vertex factory delivers them:
+    #   UV3 = base .rg      UV4 = (base .b, encoded biome weight)
+    #   UV5 = (light, hue)
+    # The weight lane reserves 0 for ABSENT and sends a real weight in the upper
+    # half, so a biomeTint of 0 travels as 0.5.
+    BASE = [0.31, 0.19, 0.11]
+    LIGHT, HUE = 0.12, -0.05
+    PRESENT_WEIGHT = 0.5           # biomeTint 0, present
+    ABSENT_WEIGHT = 0.0            # the component path: no UV written at all
+
+    def leaves(*, weight=PRESENT_WEIGHT, base=BASE, light=LIGHT, hue=HUE,
+               normal_z=1.0, height_m=0.0):
+        return {
+            # R = 1: near-surface, so the modifiers are allowed to apply at all.
+            # B and A are climate, and both are well clear of 0.06 so the water
+            # marker's is_marker term evaluates to 0 and the override is inert.
+            "vertex_color": [1.0, 1.0, 0.5, 0.5],
+            "normal": [0.0, 0.0, normal_z],
+            "world_pos": [0.0, 0.0, height_m * 100.0],   # metres -> UU
+            "camera_pos": [0.0, 0.0, 0.0],
+            "texcoords": {0: [0.0, 0.0],
+                          3: [base[0], base[1]],
+                          4: [base[2], weight],
+                          5: [light, hue]},
+        }
+
+    # A detail sample of exactly 0.5 makes (sample - 0.5) * strength zero on
+    # every channel, so `variation` is exactly 1.0 and the detail multiply is the
+    # identity -- WITHOUT passing strengths of 0, which would test a
+    # configuration the game does not ship.
+    def textures(biome_rgb=(0.2, 0.4, 0.15)):
+        return {"BiomeLUT": lambda uv: list(biome_rgb) + [1.0],
+                "DetailTex": [0.5, 0.5, 0.5, 1.0]}
+
+    def build(rock_strength=0.35):
+        MaterialEditingLibrary.created.clear()
+        MaterialEditingLibrary.connections.clear()
+        b = tmc.GraphBuilder(Material())
+        vc = b.node(unreal_mod.MaterialExpressionVertexColor)
+        uv = b.node(unreal_mod.MaterialExpressionTextureCoordinate)
+        base, _snow, base_out, _wet = tmc.build_terrain_base_color(
+            b, vc, uv, "", rock_slope_strength=rock_strength,
+            detail_fine_strength=0.05, detail_coarse_strength=0.04,
+            bathy=None, palette=tmc.build_palette_inputs(b))
+        return base, base_out, list(MaterialEditingLibrary.connections)
+
+    def run(root, out, conns, lv, tx):
+        return _pin(GraphEvaluator(conns, lv, tx).eval(root), out)
+
+    root, out, conns = build()
+
+    # --- 1. the palette path composes exactly what materialcolor.h says ------
+    got = run(root, out, conns, leaves(), textures())
+    want = apply_variation(BASE, LIGHT, HUE)
+    if not close(got, want, 1e-6):
+        failures.append(
+            "the palette path does not compose the documented colour.\n"
+            f"    base {BASE} light {LIGHT} hue {HUE}\n"
+            f"    graph  {[round(x, 6) for x in got]}\n"
+            f"    ADR-0009 {[round(x, 6) for x in want]}")
+    else:
+        print(f"composition: the palette path evaluates to "
+              f"applyVariation(base, light, hue) to 1e-6")
+
+    # --- 2. the variation SURVIVES the modifiers -----------------------------
+    #
+    # ADR-0009's load-bearing ordering claim, as a number rather than as a
+    # screenshot of a hillside. With slope-rock fully applied the colour becomes
+    # MAT_ROCK's -- but it must still be MODULATED by this voxel's own light and
+    # hue, because the variation is stage 3 and the modifiers are stage 2. Move
+    # the variation before the lerps and the output stops depending on it
+    # entirely wherever a modifier bites, which is exactly the flat hillside
+    # capture requirement 2 is looking for.
+    vertical = dict(normal_z=0.0)         # a wall: slope = 1
+    rr, ro, rc = build(rock_strength=1.0)
+    a = run(rr, ro, rc, leaves(light=0.20, hue=0.08, **vertical), textures())
+    bb = run(rr, ro, rc, leaves(light=-0.20, hue=-0.08, **vertical), textures())
+    if close(a, bb, 1e-9):
+        failures.append(
+            "with slope-rock fully applied the output no longer depends on the "
+            "per-voxel variation.\n"
+            "    That is the variation being applied BEFORE the modifiers rather "
+            "than after, so the lerps flatten it.\n"
+            "    ADR-0009: 'place, then vary'. A cliff would render as one flat "
+            "grey.")
+    else:
+        spread = max(abs(x - y) for x, y in zip(a, bb))
+        print(f"ordering:    variation survives a fully-applied slope-rock "
+              f"(spread {spread:.4f}); the modifiers do not flatten it")
+
+    # --- 3. an unwritten palette falls through, and does NOT render black ----
+    #
+    # M_VoxelTerrain is also the material on the component path, where
+    # FLocalVertexFactory supplies no fourth or fifth UV and they arrive as zero.
+    # A raw weight of 0 legitimately means "this material owns its colour", so
+    # the lane reserves 0 for ABSENT -- and if that encoding breaks, the world
+    # renders from a base of (0,0,0). This is capture requirement 5, and it is
+    # the one whose failure mode is a black world.
+    absent = run(root, out, conns,
+                 leaves(weight=ABSENT_WEIGHT, base=[0.0, 0.0, 0.0],
+                        light=0.0, hue=0.0),
+                 textures())
+    if max(absent) <= 1e-6:
+        failures.append(
+            "with no palette written (UV3/4/5 all zero, the component path) the "
+            "graph renders BLACK.\n"
+            "    The ABSENT encoding is not being recovered, so `present` is not "
+            "reaching the final lerp.\n"
+            "    Every chunk drawn with voxel.Stream.GPU 0 would be black.")
+    else:
+        print(f"fallback:    an unwritten palette falls through to the "
+              f"climate-only colour {[round(x, 4) for x in absent]}, not black")
+
+    # --- 4. with biomeTint 0 the palette path ignores the climate ------------
+    #
+    # Every row is 0 today (ADR-0009 section 3a), so the near field must be
+    # independent of the biome LUT. If a climate blend crept back in, the same
+    # voxel would take two different colours in two different climates -- which
+    # is precisely what that amendment removed.
+    warm = run(root, out, conns, leaves(), textures(biome_rgb=(0.05, 0.6, 0.02)))
+    cold = run(root, out, conns, leaves(), textures(biome_rgb=(0.7, 0.7, 0.9)))
+    if not close(warm, cold, 1e-9):
+        failures.append(
+            "the palette path still depends on the biome LUT.\n"
+            f"    two climates give {[round(x, 5) for x in warm]} and "
+            f"{[round(x, 5) for x in cold]}\n"
+            "    ADR-0009 section 3a: near-field colour is the material, and every "
+            "biomeTint is 0.")
+    else:
+        print("climate:     with biomeTint 0 the palette path is independent of "
+              "the biome LUT")
+
 def main():
+    # RECOMPILE FROM SOURCE, ALWAYS. CPython invalidates a cached .pyc on
+    # (mtime, size), and mtime has one-second granularity -- so two edits to
+    # terrain_material_common.py inside the same second that leave its LENGTH
+    # unchanged reuse the first one's bytecode. Every edit that reorders or
+    # swaps code has exactly that shape, which is to say every edit worth
+    # checking: reordering the composition stages does not change the file
+    # length, and this tool would then check the previous version and report on
+    # a graph that no longer exists. Measured -- it silently did, twice, while
+    # the breakage proofs for this file were being written.
+    #
+    # Pointing the cache at a fresh directory is non-destructive (nothing in the
+    # repo is deleted) and makes the lookup always miss.
+    sys.pycache_prefix = tempfile.mkdtemp(prefix="vxc-graphcheck-")
+
     install_stub()
     sys.path.insert(0, str(TOOLS))
     import terrain_material_common as tmc
@@ -283,13 +634,31 @@ def main():
     except Exception as exc:  # noqa: BLE001
         failures.append(f"node-count comparison: {type(exc).__name__}: {exc}")
 
+    try:
+        check_composition(tmc, sys.modules["unreal"], failures)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        failures.append(f"composition check: {type(exc).__name__}: {exc}\n"
+                        + "".join(traceback.format_tb(exc.__traceback__)[-2:]))
+
     if failures:
         for f in failures:
             print("FAIL: " + f, file=sys.stderr)
         return 1
-    print("terrain graph: both paths build against the stub")
-    print("  NOTE: this says the code RUNS, not that the material is correct. "
-          "The editor is still the only thing that can say that.")
+    print("terrain graph: both paths build, and the palette path composes what "
+          "ADR-0009 says")
+    print("  CHECKED HERE: the composition and its stage order, the slope-rock "
+          "and snowline\n"
+          "  modifiers being live rather than orphaned, the ABSENT fallback, and "
+          "that a\n"
+          "  biomeTint of 0 keeps the climate out of the near field.")
+    print("  NOT CHECKED HERE: whether the .ush's own arithmetic matches "
+          "vxc::voxelTint (that is\n"
+          "  check-palette-parity.py), and anything a picture decides -- cave "
+          "strata, a dry cliff\n"
+          "  reading as rock, snow on a mountain, no mottle seam at a ring "
+          "boundary. Those four\n"
+          "  are what the editor is still for.")
     return 0
 
 
