@@ -233,3 +233,10 @@ VoxelNoColdSettle
 VoxelSettleHoldSec
 VoxelSettleTimeoutSec
 VoxelSettleProgressSec
+#
+# -VoxelRecomputeDutyPct caps the share of wall time the anchor recompute may
+# occupy (see VoxelStreamAdmission::RecomputeDutyPct). It is a streaming tuning
+# knob: 0 is the control arm, it drives nothing and quits nothing, and it is
+# meant to be usable on an ordinary interactive flight -- which is exactly why
+# the name avoids a *Check/*Verify ending that would suppress the menu.
+VoxelRecomputeDutyPct
