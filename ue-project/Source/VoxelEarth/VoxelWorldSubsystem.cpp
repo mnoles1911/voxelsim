@@ -3870,6 +3870,41 @@ bool CutoffClampEnabled()
 	return bEnabled;
 }
 
+// -VoxelPerRingRelax (2026-08-23): the cutoff relax test judged per ring,
+// against that ring's own share of the cap, instead of the TOTAL queue
+// against 3/4 of the whole cap.
+//
+// THE ASYMMETRY THIS REMOVES. Everything else in bounded admission went
+// per-ring when -VoxelRingQuota landed -- the truncate cap, the cutoff, the
+// deferral flags, the refill trigger -- because one shared number is always
+// spent by R0 (measured: R0 overflows its share on essentially every call of
+// a flight). The ENTRY relax is the one test still global, so a full R0
+// holds every other ring's cutoff pinned even in a call where that ring's
+// own queue has drained to nothing. The ring does eventually reopen -- the
+// truncate's own not-full branch relaxes a below-share ring's cutoff -- but
+// that runs at the END of the call, after this call's entry scans already
+// rejected the ring's annulus against the stale radius. Cost: one full
+// trigger cycle of added latency per drain, paid at exactly the moment the
+// ring is starving (an empty queue is what arms the refill trigger that
+// forced this scan).
+//
+// Per-ring test, same 3/4 fraction, same per-tick cap the truncate divides:
+// ring L relaxes iff queueL * 4 < shareL * 3. The record-cap guard stays
+// global (ChunkRecords is one population). With -VoxelRingQuota=0 there are
+// no shares to test against and the global form is the honest one -- the
+// switch is inert there by construction, not by accident.
+//
+// FAILING READINGS: q= below 3/4 share while cut= stays pinned in the same
+// window = the relax is not reaching the scan (a bug, not a null result);
+// rejC/dispatched unchanged with the switch on while q= sits above 3/4 share
+// all leg = the relax condition was never the constraint -- the queues
+// genuinely never drain, and the next lever is elsewhere.
+bool PerRingRelaxEnabled()
+{
+	static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("VoxelPerRingRelax"));
+	return bEnabled;
+}
+
 // --- drain-scaled admission cap (-VoxelAdmissionCapDrainSec, 2026-08-23) ----
 //
 // WHAT DRIVES cutoffM, spelled out because it took a night to trace: the
@@ -13590,13 +13625,38 @@ void FVoxelWorldImpl::RecomputeDesiredSet(const FVector& Anchor)
 	{
 		const int32 Cap = EffectivePendingJobCap; // -VoxelAdmissionCapDrainSec: the relax threshold scales with the cap
 		const int32 RecordCap = VoxelDebug::GetStreamAdmissionRecordCap();
-		const bool bQueueHasRoom = (Cap <= 0 || PendingJobNum() * 4 < Cap * 3);
 		const bool bRecordsHaveRoom = (RecordCap <= 0 || ChunkRecords.Num() < RecordCap);
-		if (bRecordsHaveRoom && bQueueHasRoom)
+		if (VoxelStreamAdmission::PerRingRelaxEnabled() && VoxelStreamAdmission::GetRingQuotaEnabled() &&
+		    Cap > 0)
 		{
-			for (double& Cutoff : LevelAdmissionCutoffDistSq)
+			// -VoxelPerRingRelax: each ring judged against ITS share (see the
+			// switch's comment for the asymmetry this removes). Same share
+			// arithmetic as TruncatePendingJobQueue -- the two must agree on
+			// what "this ring's cap" means or relax and re-pin oscillate.
+			if (bRecordsHaveRoom)
 			{
-				Cutoff = DBL_MAX;
+				for (int32 Level = 0; Level < VoxelCoords::kNumLevels; ++Level)
+				{
+					const int32 LevelCap = FMath::Max(
+					    1, FMath::RoundToInt(double(Cap) * VoxelStreamAdmission::kRingCapShare[Level]));
+					if (PendingJobKeysByLevel[Level].Num() * 4 < LevelCap * 3)
+					{
+						LevelAdmissionCutoffDistSq[Level] = DBL_MAX;
+					}
+				}
+			}
+		}
+		else
+		{
+			// Control arm (and -VoxelRingQuota=0, where there is no per-ring
+			// share to test against): the global form, byte for byte.
+			const bool bQueueHasRoom = (Cap <= 0 || PendingJobNum() * 4 < Cap * 3);
+			if (bRecordsHaveRoom && bQueueHasRoom)
+			{
+				for (double& Cutoff : LevelAdmissionCutoffDistSq)
+				{
+					Cutoff = DBL_MAX;
+				}
 			}
 		}
 	}
