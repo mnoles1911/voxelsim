@@ -82,6 +82,12 @@ public:
 	int32 GetSheetCount() const { return Sheets.Num(); }
 	int32 GetSheetRectCount() const { return TotalRects; }
 	int32 GetUnresolvedBasinCount() const { return UnresolvedBasins; }
+	// Ticks this actor did nothing on because no pawn had been possessed yet, so
+	// there was no real position to gather around. Zero on an ordinary -game
+	// run; non-zero and STILL COUNTING means the session has no pawn (front-end
+	// menu, or a spawn that never happened) and there are no sheets for a reason
+	// that is not about water. See Tick() and GetCameraLocationUU().
+	int32 GetDeferredGatherTicks() const { return DeferredGatherTicks; }
 
 private:
 	// One basin's mesh and the state that says whether it is still current.
@@ -179,6 +185,17 @@ private:
 	FVector2D GatherCenterXY = FVector2D::ZeroVector;
 	bool bGathered = false;
 	double RegatherDistanceUU = 100000.0; // 1 km
+
+	// HOW LONG THE FIRST GATHER WAITED FOR A REAL POSITION, and the proof that
+	// waiting is what happened rather than nothing happening. The gather used to
+	// run on tick 1 at the camera manager's default (0,0,0) -- 61 km from the
+	// spawn, into four unbaked origin tiles, 10,814 sea-level elevation reads,
+	// fatal on the first one under -unattended. It now waits for a possessed
+	// pawn, and a wait that logged nothing would be indistinguishable from a
+	// feature that quietly stopped working. See Tick().
+	int32 DeferredGatherTicks = 0;
+	double FirstDeferSeconds = 0.0;
+	bool bWarnedLongDefer = false;
 
 	// Fine tiles this scan still has to read, one per tick. See Tick().
 	TArray<FIntPoint> PendingTiles;

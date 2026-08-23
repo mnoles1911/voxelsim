@@ -149,29 +149,104 @@ void AVoxelWaterSheetActor::BeginPlay()
 	                       "near-field disc"));
 }
 
+namespace
+{
+// A camera further than this from its own pawn is not a camera POSITION, it is
+// a camera CACHE that has not caught up with where the pawn was placed. The
+// largest legitimate separation anything in this project produces is the
+// third-person boom -- 2.5 m back and 0.4 m to the active shoulder
+// (VoxelMovementTuning::ThirdPersonBoomBackUU / ThirdPersonBoomRightUU, applied
+// per frame in AVoxelEarthFlyPawn::UpdateThirdPersonCamera, no spring arm). 100
+// m is two orders of magnitude past that, so this cannot separate a real first-
+// or third-person camera from its pawn; it can only catch a cache still holding
+// a position the pawn has left. Deliberately loose, because what it falls back
+// to is not a refusal: it is the PAWN's location, which at a 10 km gather
+// radius with 1 km of hysteresis answers every question this actor asks
+// identically.
+constexpr double kMaxCameraPawnSeparationUU = 10000.0; // 100 m
+} // namespace
+
 bool AVoxelWaterSheetActor::GetCameraLocationUU(FVector& Out) const
 {
-	// Same fallback chain AVoxelClipmapActor::GetCameraLocationUU and
-	// AVoxelOceanActor::UpdateFollowPlane use.
+	// WHY THIS IS NO LONGER THE FALLBACK CHAIN AVoxelClipmapActor::
+	// GetCameraLocationUU, AVoxelRiverRibbonActor and AVoxelOceanActor::
+	// UpdateFollowPlane still use ("camera manager first, pawn second").
+	//
+	// MEASURED 2026-08-23, the owner's PIE session. APlayerCameraManager is
+	// spawned with the PlayerController, well before AVoxelEarthGameMode::
+	// RestartPlayer picks a spawn column and puts a pawn in it, and until its
+	// first UpdateCamera its cached POV is the DEFAULT: (0,0,0). The old chain
+	// took that default for a camera position, so this actor's FIRST basin
+	// gather ran at the world origin and logged
+	//     "Lake sheets: scanning 4 fine tile(s) within 10000 m of (0, 0)"
+	// -- tiles (0,0), (0,-1), (-1,0) and (-1,-1), the four that meet at the
+	// origin, about 61 km from where the player actually spawned and none of
+	// them ever baked (only 15 fine tiles exist, all in the -3..-15 band).
+	// 10,814 elevation reads went into them over the first ~2.5 s, until the
+	// pawn appeared and the gather re-ran correctly at (-6144000, -6144000).
+	// The leak counter never moved again all session: ONE gather, at a fake
+	// position, and the session was filed as a streaming regression on it.
+	//
+	// WHY THAT IS NOT JUST A NOISY COUNTER. A fine-tier query into a
+	// non-resident tile does NOT fall back to the coarse tier. It returns SEA
+	// LEVEL -- FVoxelFineTileStreamer::ReportGateLeak_Locked ends
+	// `return Sampler_.elevationMm(px,py)` -- i.e. ground no other client
+	// computes. And under -unattended the FIRST such query is UE_LOG(Fatal)
+	// (SetLeakIsFatal, driven from FApp::IsUnattended), so on the headless path
+	// this is not a warning, it KILLS THE RUN. tools/voxel-capture.ps1 launches
+	// -unattended with a fine tile dir and does NOT pass
+	// -VoxelFineTileGateFatal=0; tools/bv12-river-captures.ps1:43 and
+	// tools/bv12-shoot-one.ps1:37 do, which is this bug being worked around
+	// rather than diagnosed.
+	//
+	// THE CONDITION IS "IS THERE A POSSESSED PAWN", NOT "IS THE CAMERA AWAY
+	// FROM THE ORIGIN". A player standing legitimately at (0,0) is a position,
+	// not a default, and a test that cannot tell those apart would refuse that
+	// player lakes forever. RestartPlayer places the pawn on a ground-derived
+	// column before it possesses, so a pawn EXISTING is the honest evidence
+	// that a real position exists -- it is the event actually being waited for,
+	// not a proxy for it.
 	const UWorld* World = GetWorld();
 	if (!World)
 	{
 		return false;
 	}
-	if (const APlayerController* PC = World->GetFirstPlayerController())
+	const APlayerController* PC = World->GetFirstPlayerController();
+	if (!PC)
 	{
-		if (const APlayerCameraManager* Cam = PC->PlayerCameraManager)
+		return false;
+	}
+	const APawn* Pawn = PC->GetPawn();
+	if (!Pawn)
+	{
+		// No pawn: whatever the camera manager reports is a default, not a place.
+		return false;
+	}
+	const FVector PawnUU = Pawn->GetActorLocation();
+	if (const APlayerCameraManager* Cam = PC->PlayerCameraManager)
+	{
+		// The pawn existing closes the "before RestartPlayer" window but NOT the
+		// one-frame window after it: the camera manager fills its cache during
+		// the PlayerController's own tick, and nothing orders this actor after
+		// that. One frame at (0,0) is still one fatal gate leak on the
+		// unattended path, so the cache is believed only when it is actually ON
+		// the pawn. Every SetViewTarget in this project targets PC->GetPawn()
+		// (VoxelSkyLadderFixture.cpp:392, VoxelSweBreachFixture.cpp:477,
+		// VoxelWorldSubsystem.cpp:20948), so "on the pawn" is the whole truth
+		// about where this camera is allowed to be.
+		const FVector CamUU = Cam->GetCameraLocation();
+		if (FVector::DistSquared(CamUU, PawnUU) < FMath::Square(kMaxCameraPawnSeparationUU))
 		{
-			Out = Cam->GetCameraLocation();
-			return true;
-		}
-		if (const APawn* Pawn = PC->GetPawn())
-		{
-			Out = Pawn->GetActorLocation();
+			Out = CamUU;
 			return true;
 		}
 	}
-	return false;
+	// Not a failure and not a guess: the pawn is a PLACED actor. This is also
+	// the answer on the frame a pose fixture teleports the pawn kilometres
+	// (SetActorLocation with TeleportPhysics) and the camera cache still holds
+	// the pose before it.
+	Out = PawnUU;
+	return true;
 }
 
 namespace
@@ -465,9 +540,50 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 	{
 		return;
 	}
+
+	// ---- Anchor: is there a real position to gather around yet? -------------
+	//
+	// GetCameraLocationUU now REFUSES to answer until a pawn exists, because
+	// the answer it used to give before that was (0,0,0) and it cost 10,814
+	// fine-tier gate leaks into four unbaked origin tiles -- each answered at
+	// SEA LEVEL, and fatal on the first one under -unattended. See that
+	// function's note.
+	//
+	// AND THE WAIT IS COUNTED, not swallowed. A skip that logs nothing is the
+	// same failure in the other direction, and this project has shipped that
+	// shape before (the weathering pass that removed 20 voxels of 90,000 for
+	// months). "No lake sheets drew" and "no lake sheets were ever asked for"
+	// have to be different lines in a log, so the deferral is announced once,
+	// warned about if it drags, and reported by the first gather that follows.
 	FVector CamUU;
 	if (!GetCameraLocationUU(CamUU))
 	{
+		const double NowSec = FPlatformTime::Seconds();
+		if (DeferredGatherTicks == 0)
+		{
+			FirstDeferSeconds = NowSec;
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: no possessed pawn yet -- DEFERRING the first basin gather. Gathering now would "
+			            "scan the four fine tiles meeting at the world origin, which are unbaked; every elevation "
+			            "read into them is answered at sea level, and the first one is FATAL under -unattended."));
+		}
+		++DeferredGatherTicks;
+		// A menu session is a legitimate forever-wait: VoxelFrontEnd::
+		// IsEnabledThisRun makes AVoxelEarthGameMode set
+		// bStartPlayersAsSpectators, so no pawn is spawned at StartPlay and one
+		// only appears on NEW GAME/CONTINUE. A -game capture is not: ten
+		// seconds with no pawn there means the run is stuck on something else,
+		// and absent lakes are a symptom of that rather than a lake bug. Say it
+		// once; do not repeat it every tick on the menu.
+		if (!bWarnedLongDefer && NowSec - FirstDeferSeconds > 10.0)
+		{
+			bWarnedLongDefer = true;
+			UE_LOG(LogVoxelEarth, Warning,
+			       TEXT("Lake sheets: still no possessed pawn after %d tick(s) / %.1f s. NO LAKE SHEETS WILL DRAW "
+			            "until one exists. Expected while the front-end menu is up (VoxelFrontEnd::IsEnabledThisRun); "
+			            "on a -game capture it means the pawn never spawned, which is not a water problem."),
+			       DeferredGatherTicks, NowSec - FirstDeferSeconds);
+		}
 		return;
 	}
 
@@ -482,6 +598,7 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 	const FVector2D CamXY(CamUU.X, CamUU.Y);
 	if (!bGathered || FVector2D::Distance(CamXY, LastGatherXY) > RegatherDistanceUU)
 	{
+		const bool bFirstGather = !bGathered;
 		int32 Tx0 = 0, Ty0 = 0, Tx1 = 0, Ty1 = 0;
 		UVoxelWaterSubsystem::FineTileForWorldUU(CamUU.X - ScanRadiusUU, CamUU.Y - ScanRadiusUU, Tx0, Ty0);
 		UVoxelWaterSubsystem::FineTileForWorldUU(CamUU.X + ScanRadiusUU, CamUU.Y + ScanRadiusUU, Tx1, Ty1);
@@ -508,6 +625,21 @@ void AVoxelWaterSheetActor::Tick(float DeltaTime)
 		bLoggedFirstBuild = false;
 		UE_LOG(LogVoxelEarth, Log, TEXT("Lake sheets: scanning %d fine tile(s) within %.0f m of (%.0f, %.0f)"),
 		       PendingTiles.Num(), ScanRadiusUU / 100.0, CamUU.X, CamUU.Y);
+		if (bFirstGather)
+		{
+			// ALWAYS PRINTED, INCLUDING "0 deferred tick(s)". The fix is that
+			// the first gather runs at a position something was actually placed
+			// at; the proof is this line naming that position and what it
+			// waited for. Printing it only when the wait was non-zero would
+			// make its ABSENCE ambiguous -- which is precisely how a gather at
+			// (0,0) went unnoticed until a leak counter forced the question.
+			UE_LOG(LogVoxelEarth, Log,
+			       TEXT("Lake sheets: FIRST gather ran at (%.0f, %.0f) after %d deferred tick(s), %.2f s waiting for "
+			            "a possessed pawn. A first gather at (0, 0) would be the origin-gather bug, not a spawn on "
+			            "the origin -- see GetCameraLocationUU."),
+			       CamUU.X, CamUU.Y, DeferredGatherTicks,
+			       DeferredGatherTicks > 0 ? FPlatformTime::Seconds() - FirstDeferSeconds : 0.0);
+		}
 	}
 
 	if (PendingTiles.Num() > 0)
