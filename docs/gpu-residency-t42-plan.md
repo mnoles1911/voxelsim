@@ -1,10 +1,13 @@
 # T4-2: GPU-resident residency — design + shadow implementation
 
 **Date:** 2026-08-23
-**Status:** SHADOW ARM IMPLEMENTED (mode 1), never compiled or run — the
-validation leg is the next step. LIVE arm (mode 2) designed here, deliberately
-not wired (§7).
-**Switch:** `-VoxelGpuResidency=1` (command-line latched, for
+**Status:** SHADOW ARM IMPLEMENTED (mode 1). LIVE ARM (mode 2) WIRED
+2026-08-23, per §7 exactly (its prerequisite, the AddCandidate extraction,
+landed as `AdmitCandidateCommit` + `AdmitCandidateEvaluate`): mode 2 consumes
+the delta and skips both CPU walks; edits / cold / underground / first-scan /
+starvation lanes stay CPU and are counted on the `[gpu-resid] live:` line.
+Neither arm has completed a validation leg yet.
+**Switch:** `-VoxelGpuResidency=1` or `=2` (command-line latched, for
 `-VoxelPendingJobCap`'s reason: an `-ExecCmds` cvar lands after streaming has
 built its desired set). Absent = mode 0 = the control arm, byte-identical.
 **Prior design:** `docs/deep-review-streaming-perf-2026-07-27.md` T4-2 (§359-364),
@@ -101,7 +104,10 @@ adjudicator, per the owner's decision.
   comparator holds the two against each other. Streaming decisions unchanged.
   Adds cost (notes, dispatch, compare) — this arm buys *validation*, mode 2
   buys the win.
-- **2 LIVE (designed, not wired):** clamps to 1 with a warning. §7.
+- **2 LIVE (wired 2026-08-23):** consumes the delta, skips the CPU walks;
+  adjudication and every fallback lane per §7. The `[gpu-resid] live:` line
+  carries its counters and their failing readings (documented at the log
+  site in VoxelResidencyGpu.cpp).
 
 ## 4. The gate, and what FAILURE looks like (stated in advance)
 
@@ -158,10 +164,17 @@ Standard harness, standard two-leg minimum, quiet box:
   `voxel.March.HoleStats 2` and with P1/P2 validation flags — but do not stack
   first-run validations of three features in one leg; attribute one at a time.
 
-## 7. The LIVE arm: exactly what remains (deferred, deliberately)
+## 7. The LIVE arm wiring plan (IMPLEMENTED 2026-08-23)
 
-Small once the concurrent subsystem waves land; wrong to interleave with them
-now:
+Implemented as written below, with two additions: a STARVATION fallback (8
+consume-eligible recomputes with no delta run the full CPU walks that call,
+counted as cpuFallback -- a dead GPU path degrades to the CPU arm and reads
+as that counter climbing, never as a working GPU path), and per-level scan
+STAMPING on consume (a consumed delta that scanned level L stamps
+`LastAnchorChunkPerLevel`/`LastEntryScanAnchorXY` from its own dispatch
+params and clears the refill/edit cause flags, which is what keeps the
+refill/stale-scan/view-rescan triggers and the dispatch gate working with no
+CPU sweep in the loop). The original plan, for reference:
 
 1. Extract `AddCandidate` (the lambda in the entry loop) into a member
    callable with explicit (footprint, key, sortKey) — mechanical, one site,

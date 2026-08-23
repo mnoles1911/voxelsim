@@ -206,6 +206,7 @@ namespace
 			SHADER_PARAMETER(uint32, ResurrectCap)
 			SHADER_PARAMETER(uint32, ColdCap)
 			SHADER_PARAMETER(uint32, NumLevels)
+			SHADER_PARAMETER(uint32, MaxRingLevel)
 			SHADER_PARAMETER(uint32, LevelIndex)
 			SHADER_PARAMETER(uint32, HierarchicalCoverage)
 			SHADER_PARAMETER(uint32, RingOverlapChunks)
@@ -320,6 +321,15 @@ struct FVoxelResidencyGpu::FImpl
 	TArray<FSeqLedger> Ledgers;
 	FSeqLedger* OpenLedger = nullptr; // points into Ledgers while bracketed
 
+	// Mode 2: the newest arrived, unconsumed delta. AT MOST ONE is staged --
+	// every scan is a complete statement over the (mirror, annulus) state at
+	// its dispatch, so a newer delta supersedes an older one outright: any
+	// proposal the older carried that is still valid is re-derived by the
+	// newer scan by construction (the mirror only changes through confirmed
+	// feedback, which the unconsumed older delta never generated). Superseded
+	// deltas are counted, never merged.
+	TUniquePtr<FVoxelResidencyLiveDelta> PendingLive;
+
 	// Persistent GPU buffers (render-thread owned after creation).
 	TRefCountPtr<FRDGPooledBuffer> ShadowPooled;
 	TRefCountPtr<FRDGPooledBuffer> ZRangePooled;
@@ -341,6 +351,11 @@ struct FVoxelResidencyGpu::FImpl
 		uint64 AuditPass = 0, AuditFail = 0;
 		int64 LastAuditGpuCount = -1, LastAuditCpuCount = -1;
 		uint64 ColdLastWindow = 0;
+		// ---- mode-2 (LIVE) lanes ----
+		uint64 LiveConsumed = 0;     // deltas handed to the subsystem
+		uint64 LiveSuperseded = 0;   // staged deltas replaced by a newer one before consumption
+		uint64 LiveEmptyRetired = 0; // deltas with no proposals and no scanned level (nothing stampable)
+		FVoxelResidencyLiveOutcome Live; // summed subsystem adjudication reports
 	};
 	FStats Since; // reset each log window
 	FStats Total; // lifetime
@@ -355,21 +370,23 @@ struct FVoxelResidencyGpu::FImpl
 		{
 			int32 Requested = 0;
 			FParse::Value(FCommandLine::Get(), TEXT("VoxelGpuResidency="), Requested);
-			if (Requested >= 2)
-			{
-				UE_LOG(LogVoxelResidGpu, Warning,
-				       TEXT("[gpu-resid] -VoxelGpuResidency=%d requested but the LIVE arm is not wired ")
-				       TEXT("yet (see docs/gpu-residency-t42-plan.md); running SHADOW (1)."),
-				       Requested);
-				Requested = 1;
-			}
-			Mode = FMath::Clamp(Requested, 0, 1);
+			Mode = FMath::Clamp(Requested, 0, 2);
 			if (Mode != 0)
 			{
-				UE_LOG(LogVoxelResidGpu, Log,
-				       TEXT("[gpu-resid] mode %d (shadow): scans dispatch and compare; streaming ")
-				       TEXT("decisions unchanged."),
-				       Mode);
+				if (Mode == 2)
+				{
+					UE_LOG(LogVoxelResidGpu, Log,
+					       TEXT("[gpu-resid] mode 2 (LIVE): the GPU pass proposes the desired-set ")
+					       TEXT("delta and the CPU walks are skipped on the steady path; the CPU ")
+					       TEXT("adjudicates every proposal (edits, cold, underground, starvation ")
+					       TEXT("all fall back CPU-side, counted on the live line)."));
+				}
+				else
+				{
+					UE_LOG(LogVoxelResidGpu, Log,
+					       TEXT("[gpu-resid] mode 1 (shadow): scans dispatch and compare; streaming ")
+					       TEXT("decisions unchanged."));
+				}
 				TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
 					FTickerDelegate::CreateLambda([this](float) {
 						PollAndConsume();
@@ -405,7 +422,12 @@ struct FVoxelResidencyGpu::FImpl
 	{
 		StageOp(kOpInsert, Level, C, bDeep);
 		LedgerXor(Level, C, +1);
-		if (bInBracket && OpenLedger)
+		// Decision-ledger recording is the COMPARATOR's input, so mode 1 only:
+		// in mode 2 the "CPU decisions" are the consumption of the GPU's own
+		// proposals, and comparing those would be a statistic that cannot come
+		// out the other way. The ledger itself still opens in mode 2 -- the
+		// audit snapshot and the dispatch params ride it.
+		if (Mode == 1 && bInBracket && OpenLedger)
 		{
 			OpenLedger->CpuAdmits.Add(PackKey(Level, C));
 			OpenLedger->CpuAdmitDeep.Add(bDeep ? 1 : 0);
@@ -432,7 +454,7 @@ struct FVoxelResidencyGpu::FImpl
 		{
 			StageOp(kOpMarkPending, Level, C, false);
 		}
-		if (bInBracket && OpenLedger)
+		if (Mode == 1 && bInBracket && OpenLedger)
 		{
 			OpenLedger->CpuEvicts.Add(PackKey(Level, C));
 			OpenLedger->CpuEvictDeep.Add(bDeep ? 1 : 0);
@@ -445,7 +467,7 @@ struct FVoxelResidencyGpu::FImpl
 		{
 			StageOp(kOpClearPending, Level, C, false);
 		}
-		if (bInBracket && OpenLedger)
+		if (Mode == 1 && bInBracket && OpenLedger)
 		{
 			OpenLedger->CpuResurrects.Add(PackKey(Level, C));
 		}
@@ -484,6 +506,15 @@ struct FVoxelResidencyGpu::FImpl
 		Total.Uncompared += uint64(Ledgers.Num());
 		Ledgers.Reset();
 		OpenLedger = nullptr;
+		// A staged live delta was scanned against the pre-drift mirror; it
+		// must not be consumed. Dropped proposals re-propose after the resync
+		// by construction.
+		if (PendingLive.IsValid())
+		{
+			PendingLive.Reset();
+			++Since.LiveSuperseded;
+			++Total.LiveSuperseded;
+		}
 	}
 
 	void EndResyncReplay()
@@ -575,6 +606,7 @@ struct FVoxelResidencyGpu::FImpl
 			FVector4f AnchorFrac[8];
 			FIntVector4 AnchorChunk[8];
 			uint32 NumLevels = 0;
+			uint32 MaxRingLevel = 0;
 			uint32 Hier = 0;
 			uint32 Overlap = 0;
 			uint32 UndergroundDisabled = 0;
@@ -586,6 +618,10 @@ struct FVoxelResidencyGpu::FImpl
 		};
 		FShaderConsts K;
 		K.NumLevels = uint32(FMath::Clamp(P.NumLevels, 1, int32(kMaxLevels)));
+		// Clamped below NumLevels so the kernel's seam-parent access at L+1
+		// can never index past the populated params (the CPU accessor already
+		// clamps to kNumLevels-1; this is belt for a garbage param).
+		K.MaxRingLevel = uint32(FMath::Clamp(P.MaxRingLevel, 0, int32(K.NumLevels) - 1));
 		K.Hier = P.bHierarchicalCoverage ? 1 : 0;
 		K.Overlap = uint32(FMath::Max(0, P.RingOverlapChunks));
 		K.UndergroundDisabled = P.bUndergroundDisabled ? 1 : 0;
@@ -751,6 +787,7 @@ struct FVoxelResidencyGpu::FImpl
 				Params->ResurrectCap = kResurrectCap;
 				Params->ColdCap = kColdCap;
 				Params->NumLevels = Levels;
+				Params->MaxRingLevel = K.MaxRingLevel;
 				Params->LevelIndex = LevelIdx;
 				Params->HierarchicalCoverage = K.Hier;
 				Params->RingOverlapChunks = K.Overlap;
@@ -815,6 +852,71 @@ struct FVoxelResidencyGpu::FImpl
 		bInBracket = false;
 		OpenLedger = nullptr;
 		PollAndConsume();
+	}
+
+	// ---- mode-2 (LIVE) game-thread API -------------------------------------
+	bool TakeLiveDelta(FVoxelResidencyLiveDelta& Out)
+	{
+		// Drain anything already copied back before answering -- the render
+		// poll this enqueues completes asynchronously (a NEXT taker's gain);
+		// nothing here waits.
+		PollAndConsume();
+		if (!PendingLive.IsValid())
+		{
+			return false;
+		}
+		Out = MoveTemp(*PendingLive);
+		PendingLive.Reset();
+		++Since.LiveConsumed;
+		++Total.LiveConsumed;
+		return true;
+	}
+
+	void SnapshotResidual(TArray<FVoxelResidencyProposal>& Out)
+	{
+		Out.Reset();
+		Out.Reserve(Residual.Num());
+		for (const uint64 Key : Residual)
+		{
+			int32 Level;
+			FIntVector C;
+			UnpackKey(Key, Level, C);
+			Out.Add(FVoxelResidencyProposal{Level, C});
+		}
+	}
+
+	static void FoldLiveOutcome(FVoxelResidencyLiveOutcome& A, const FVoxelResidencyLiveOutcome& B)
+	{
+		A.ConsumedDelta += B.ConsumedDelta;
+		A.NoDeltaCalls += B.NoDeltaCalls;
+		A.CpuFallbackCalls += B.CpuFallbackCalls;
+		A.CpuFirstScans += B.CpuFirstScans;
+		A.AdmitProposals += B.AdmitProposals;
+		A.AdmitAdmitted += B.AdmitAdmitted;
+		A.AdmitAdopted += B.AdmitAdopted;
+		A.AdmitResurrected += B.AdmitResurrected;
+		A.AdmitStale += B.AdmitStale;
+		A.AdmitRejFine += B.AdmitRejFine;
+		A.AdmitRejBudget += B.AdmitRejBudget;
+		A.AdmitRejCutoff += B.AdmitRejCutoff;
+		A.ResurrectProposals += B.ResurrectProposals;
+		A.EvictProposals += B.EvictProposals;
+		A.EvictQueued += B.EvictQueued;
+		A.EvictVetoed += B.EvictVetoed;
+		A.EvictStale += B.EvictStale;
+		A.ColdProposals += B.ColdProposals;
+		A.ColdEnumerated += B.ColdEnumerated;
+		A.ColdDeferred += B.ColdDeferred;
+		A.EditedEnumerated += B.EditedEnumerated;
+		A.ResidualWalked += B.ResidualWalked;
+		A.EvictMs += B.EvictMs;
+		A.AdmitMs += B.AdmitMs;
+	}
+
+	void NoteLiveOutcome(const FVoxelResidencyLiveOutcome& Outcome)
+	{
+		FoldLiveOutcome(Since.Live, Outcome);
+		FoldLiveOutcome(Total.Live, Outcome);
 	}
 
 	// ---- poll + consume ----------------------------------------------------
@@ -913,6 +1015,22 @@ struct FVoxelResidencyGpu::FImpl
 	}
 
 	// ---- the comparator ----------------------------------------------------
+	// Mode-2 list parse: order-preserving, levels clamped to the packed field.
+	// The subsystem re-validates level range against kNumLevels; a corrupt
+	// entry can therefore be dropped there, never indexed with.
+	static void ParseListArray(const TArray<uint32>& Raw, TArray<FVoxelResidencyProposal>& Out)
+	{
+		const int32 N = Raw.Num() / 4;
+		Out.Reserve(N);
+		for (int32 I = 0; I < N; ++I)
+		{
+			FVoxelResidencyProposal& P = Out.AddDefaulted_GetRef();
+			P.Level = int32(Raw[I * 4 + 0] & 0xF);
+			P.Coord = FIntVector(int32(Raw[I * 4 + 1]), int32(Raw[I * 4 + 2]),
+			                     int32(Raw[I * 4 + 3]));
+		}
+	}
+
 	static void ParseList(const TArray<uint32>& Raw, TSet<uint64>& Out)
 	{
 		const int32 N = Raw.Num() / 4;
@@ -961,8 +1079,13 @@ struct FVoxelResidencyGpu::FImpl
 			return true;
 		}
 		if (DistSq >= OuterSq && L.Params.RingOverlapChunks == 0 &&
-		    Level + 1 < L.Params.NumLevels)
+		    Level + 1 <= L.Params.MaxRingLevel)
 		{
+			// MaxRingLevel, not NumLevels-1: the CPU's seam test only runs the
+			// parent-coverage exception below the outermost ACTIVE ring (its
+			// own MaxRingLevel comment records why), so the boundary tolerance
+			// must stop at the same edge or diagnostics near the cascade edge
+			// are more forgiving than the rule they excuse.
 			const double ParentEdge = Edge * 2.0;
 			const double PX = (double(C.X >> 1) + 0.5) * ParentEdge - L.Params.Anchor.X;
 			const double PY = (double(C.Y >> 1) + 0.5) * ParentEdge - L.Params.Anchor.Y;
@@ -1145,6 +1268,54 @@ struct FVoxelResidencyGpu::FImpl
 		{
 			++Since.Uncompared;
 			++Total.Uncompared;
+			return;
+		}
+
+		// ---- mode 2 (LIVE): stage the delta for the subsystem --------------
+		// No comparison happens here -- in live mode there are no independent
+		// CPU walk decisions to hold the GPU against, and comparing the GPU to
+		// its own consumed proposals would be a gate that cannot fail. The
+		// gates that CAN fail in live mode are the audit above (mirror drift),
+		// the subsystem's adjudication lanes (veto/stale/fallback counters),
+		// and the leg-level uncovered metric.
+		if (Mode == 2)
+		{
+			bool bAnyScannedLevel = false;
+			for (int32 I = 0; I < Ledger.Params.NumLevels && I < 8; ++I)
+			{
+				bAnyScannedLevel |= Ledger.Params.Levels[I].bScanThisDispatch;
+			}
+			if (CAdmit + CEvict + CRes + CCold == 0 && !bAnyScannedLevel)
+			{
+				// Nothing to adjudicate and nothing to stamp: retiring it here
+				// (instead of staging) is what lets a converged, stationary
+				// world go quiet instead of forcing recomputes forever.
+				++Since.LiveEmptyRetired;
+				++Total.LiveEmptyRetired;
+				return;
+			}
+			TUniquePtr<FVoxelResidencyLiveDelta> Delta = MakeUnique<FVoxelResidencyLiveDelta>();
+			Delta->Seq = Seq.Seq;
+			Delta->OverflowBits = Overflow;
+			Delta->Params = Ledger.Params;
+			ParseListArray(Seq.Admit, Delta->Admits);
+			ParseListArray(Seq.Evict, Delta->Evicts);
+			ParseListArray(Seq.Resurrect, Delta->Resurrects);
+			ParseListArray(Seq.Cold, Delta->Colds);
+			if (PendingLive.IsValid() && PendingLive->Seq > Delta->Seq)
+			{
+				// A newer delta is already staged; this one arrived out of
+				// order and is superseded on arrival.
+				++Since.LiveSuperseded;
+				++Total.LiveSuperseded;
+				return;
+			}
+			if (PendingLive.IsValid())
+			{
+				++Since.LiveSuperseded;
+				++Total.LiveSuperseded;
+			}
+			PendingLive = MoveTemp(Delta);
 			return;
 		}
 
@@ -1390,6 +1561,45 @@ struct FVoxelResidencyGpu::FImpl
 		       Since.FbStaged, Since.FbApplied, Since.FbDropped, Since.FbCollisions,
 		       Residual.Num(), Since.AuditPass, Since.AuditFail, (long long)Since.LastAuditCpuCount,
 		       (long long)Since.LastAuditGpuCount, (long long)CpuCount);
+		// The mode-2 line. Failing readings, stated in advance (the counter
+		// rule: every lane here can come out the other way):
+		//   admit=0 (adOK+adopt+res all zero) over a moving leg with disp>0
+		//     -> the pass proposes nothing the CPU accepts: dead kernel, dead
+		//        readback, or a gate rejecting everything. THE failure.
+		//   cpuFallback>0 after warmup -> the live arm starved (no delta for
+		//     kLiveStarvationCalls recomputes) and the run is silently CPU;
+		//     the leg's timings then measure the CPU arm, not this feature.
+		//   noDelta ~= one per consume-eligible recompute, sustained -> the
+		//     readback lane is dead even if dispatches count up.
+		//   evVETO a large, persistent fraction of evProp -> the exit kernel
+		//     disagrees with the CPU recheck: kernel geometry wrong (would
+		//     also have shown as evEXTRA in a mode-1 leg).
+		//   adStale/evStale dominating their lanes -> the mirror is not being
+		//     fed (audit would also be failing) or deltas are consistently
+		//     ancient (superseded should be climbing with them).
+		//   cold not decaying (coldEnum staying high, texels never warming)
+		//     -> everything is coming back through the CPU-enumeration lane:
+		//        the walk has been MOVED, not removed. Aokana's failure.
+		//   firstScans climbing past kNumLevels -> live never holds a level.
+		//   editEnum growing without edits happening -> the edited maps are
+		//     leaking into the annulus test.
+		if (Mode == 2)
+		{
+			const FVoxelResidencyLiveOutcome& L = Since.Live;
+			UE_LOG(LogVoxelResidGpu, Log,
+			       TEXT("[gpu-resid] live: delta cons=%llu sup=%llu empty=%llu noDelta=%u | ")
+			       TEXT("ad: prop=%u adOK=%u adopt=%u res=%u stale=%u rejFine=%u rejBud=%u ")
+			       TEXT("rejCut=%u | ev: prop=%u q=%u VETO=%u stale=%u resid=%u | cold: prop=%u ")
+			       TEXT("enum=%u defer=%u | edit=%u | fallback: cpuCalls=%u firstScans=%u | ")
+			       TEXT("ms ev=%.2f ad=%.2f"),
+			       Since.LiveConsumed, Since.LiveSuperseded, Since.LiveEmptyRetired,
+			       L.NoDeltaCalls, L.AdmitProposals, L.AdmitAdmitted, L.AdmitAdopted,
+			       L.AdmitResurrected, L.AdmitStale, L.AdmitRejFine, L.AdmitRejBudget,
+			       L.AdmitRejCutoff, L.EvictProposals, L.EvictQueued, L.EvictVetoed,
+			       L.EvictStale, L.ResidualWalked, L.ColdProposals, L.ColdEnumerated,
+			       L.ColdDeferred, L.EditedEnumerated, L.CpuFallbackCalls, L.CpuFirstScans,
+			       L.EvictMs, L.AdmitMs);
+		}
 		if (MissedSurfaceSamples.Num() > 0)
 		{
 			FString Samples;
@@ -1424,6 +1634,7 @@ struct FVoxelResidencyGpu::FImpl
 		InFlight.Reset();
 		Ledgers.Reset();
 		OpenLedger = nullptr;
+		PendingLive.Reset();
 		bInBracket = false;
 		bNeedsResync = true;
 		bClearGridOnNextDispatch = true;
@@ -1538,6 +1749,40 @@ void FVoxelResidencyGpu::NoteFootprintZRange(int32 Level, int32 X, int32 Y, int3
 	if (GetImpl().LatchMode() != 0)
 	{
 		GetImpl().NoteFootprintZRange(Level, X, Y, ChunkZMin, ChunkZMax);
+	}
+}
+
+bool FVoxelResidencyGpu::HasActionableDelta()
+{
+	return GetImpl().LatchMode() == 2 && GetImpl().PendingLive.IsValid();
+}
+
+bool FVoxelResidencyGpu::TakeLiveDelta(FVoxelResidencyLiveDelta& Out)
+{
+	if (GetImpl().LatchMode() != 2)
+	{
+		return false;
+	}
+	return GetImpl().TakeLiveDelta(Out);
+}
+
+void FVoxelResidencyGpu::SnapshotResidual(TArray<FVoxelResidencyProposal>& Out)
+{
+	if (GetImpl().LatchMode() == 2)
+	{
+		GetImpl().SnapshotResidual(Out);
+	}
+	else
+	{
+		Out.Reset();
+	}
+}
+
+void FVoxelResidencyGpu::NoteLiveOutcome(const FVoxelResidencyLiveOutcome& Outcome)
+{
+	if (GetImpl().LatchMode() == 2)
+	{
+		GetImpl().NoteLiveOutcome(Outcome);
 	}
 }
 
