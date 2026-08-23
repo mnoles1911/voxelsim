@@ -583,6 +583,24 @@ struct FVoxelGpuMeshJobManager::FJob
 	// region or none at all. There is no half state to check for later.
 	bool bBrickPack = false;
 	bool bBrickResident = false;
+
+	// --- P1 (voxel.GPU.PoolAlloc): this job claims its own pool ranges -------
+	//
+	// Latched in DispatchBatch, NOT in Submit, because stack membership (which
+	// keeps the readback path) is only decided at promote time. When true, the
+	// dispatch adds claim + write passes to the SAME graph as generation, no
+	// BrickTotalReadback is enqueued, no BrickPayload is built, and Deliver
+	// publishes nothing -- the chunk became resident on the GPU's own timeline.
+	// A brick-only job with no band then has NO readback at all: it is
+	// deliverable the moment its graph is enqueued, which is the death of the
+	// per-chunk fence this phase exists for.
+	bool bGpuPoolAlloc = false;
+	// Whether a resident SHELL (descriptor block + record slot) is held for
+	// this job. Separate from bGpuPoolAlloc so Deliver can release the shell of
+	// a job whose brick half was dropped after the shell was taken.
+	bool bGpuShellAllocated = false;
+	uint32 GpuChunkSlot = 0;
+	uint32 GpuBrickBase = 0;
 	// PHASE 5. False = BRICK-ONLY: this job runs the generation half and the
 	// brick region and produces NO QUADS at all -- no mesh chain, no quad buffer,
 	// no 4-byte total readback, no pool write.
@@ -1258,6 +1276,26 @@ void FVoxelGpuMeshJobManager::Deliver(const FJobPtr& Job, EVoxelGpuMeshJobStatus
 		}
 	}
 
+	// --- P1: give the shell back when the volume will never land -------------
+	//
+	// A GPU-claimed job that failed (rejected after the shell was somehow
+	// taken, dispatch failed, timed out, cancelled) -- or that dropped its
+	// brick half on the render thread (null brick buffers, allocator buffers
+	// unavailable) -- holds a resident shell whose record will never be
+	// written. Left alone it is a permanent ghost: a chunk the index reports
+	// and the marcher reads as empty forever. The slot guard inside
+	// ReleaseGpuChunkShell makes this a no-op if a re-add already replaced the
+	// entry. The one ghost this does NOT catch is a claim that failed ON THE
+	// GPU (arena exhausted) in an otherwise successful job -- the CPU cannot
+	// see that without a readback, which is the whole design; it shows up
+	// instead as claimFail plus `unwritten` on the [brick-gpualloc] line.
+	if (Job->bGpuShellAllocated &&
+	    (Status != EVoxelGpuMeshJobStatus::Success || !Job->bBrickPack))
+	{
+		GetGlobalVoxelBrickPool().ReleaseGpuChunkShell(Job->BrickKey, Job->GpuChunkSlot);
+		Job->bGpuShellAllocated = false;
+	}
+
 	OnJobComplete.ExecuteIfBound(MoveTemp(Result));
 }
 
@@ -1273,7 +1311,26 @@ void FVoxelGpuMeshJobManager::Tick()
 	// Tier B.1. Latched once per tick so one tick behaves like one tick; safe
 	// to flip mid-run because both paths emit identical bytes (the residue of
 	// a flip is in the stats, never the world).
-	const bool bBatchArmed = VoxelGpuWorldGenBatchEnabled();
+	//
+	// P1: STACKING IS OFF WHILE voxel.GPU.PoolAlloc IS ARMED. A stack member's
+	// bricks land through the readback path (per-chunk totals split), which the
+	// armed pool refuses -- and teaching the claim kernels the stack shape is
+	// scope B.1 has not earned: it is measured throughput-neutral (3.4x fewer
+	// passes, zero throughput moved), so the combination costs nothing tonight
+	// and the interplay is a counted fallback rather than a silent one.
+	bool bBatchArmed = VoxelGpuWorldGenBatchEnabled();
+	if (bBatchArmed && VoxelGpuPoolAllocEnabled())
+	{
+		if (!bPoolAllocStackConflictLogged)
+		{
+			bPoolAllocStackConflictLogged = true;
+			UE_LOG(LogVoxelGpuMeshJob, Warning,
+			       TEXT("[gpu-batch] voxel.GPU.WorldGenBatch is armed but voxel.GPU.PoolAlloc is too; ")
+			       TEXT("stacking is DISABLED for this run (stack members would need the totals ")
+			       TEXT("readback the armed pool refuses)."));
+		}
+		bBatchArmed = false;
+	}
 	if (bBatchArmed && !bBatchArmingLogged)
 	{
 		bBatchArmingLogged = true;
@@ -1685,12 +1742,131 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 	// PromoteMs - EnqueueMs. Stated here because a breakdown whose parts overlap
 	// silently is worse than one number.
 	const double DispatchBatchStart = FPlatformTime::Seconds();
+
+	// --- P1 (voxel.GPU.PoolAlloc): take each job's SHELL on the game thread --
+	//
+	// The shell is the fixed-size CPU half (descriptor block + record slot);
+	// the variable word ranges are claimed by this batch's own graph. Taken
+	// HERE, in the same function that enqueues the graph, because everything
+	// the ordering rules below depend on follows from that adjacency:
+	//
+	//   1. The index Added entry queued by the shell is delivered by the pool's
+	//      Flush, which runs later this tick -- so the index upload lands after
+	//      this graph's record write.
+	//   2. A shell can be evicted by a LATER shell in this same loop (the
+	//      evict-until-it-fits path), so after the loop every job is
+	//      RE-VALIDATED against the resident map and a stolen shell drops its
+	//      brick half rather than claiming into a slot somebody else now owns.
+	//   3. Every free those evictions queued is flushed BEFORE this batch is
+	//      enqueued (FlushPendingGpuFrees below), so the free pass reads side
+	//      table entries no claim in this batch has overwritten yet.
+	if (VoxelGpuPoolAllocEnabled())
+	{
+		FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+		for (const FJobPtr& Job : Batch)
+		{
+			if (!Job->bBrickPack)
+			{
+				continue;
+			}
+			if (Job->BrickStack.IsValid())
+			{
+				// Should be unreachable -- stacking is disabled while armed --
+				// but counted rather than assumed, because "cannot happen" that
+				// silently starts happening is this project's recurring bill.
+				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::Stacked);
+				continue;
+			}
+			if (!Job->bBrickResident)
+			{
+				// The pack-and-discard measurement arm keeps the readback path:
+				// it publishes nothing, so it cannot conflict with the armed
+				// allocator, and its whole point is the producer's cost.
+				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::Discard);
+				continue;
+			}
+			FVoxelBrickPool::FResidentChunk Shell;
+			if (Pool.AllocateGpuChunkShell(Job->BrickKey, Job->BrickOriginVoxel, Shell))
+			{
+				Job->bGpuPoolAlloc = true;
+				Job->bGpuShellAllocated = true;
+				Job->GpuChunkSlot = Shell.ChunkSlot;
+				Job->GpuBrickBase = Shell.BrickBase;
+			}
+			else
+			{
+				// Counted inside AllocateGpuChunkShell. The job keeps its mesh
+				// half and simply has no resident volume -- a missing chunk,
+				// never a corrupted one. It must NOT fall back to the readback
+				// path: publication there allocates from the CPU arenas the
+				// armed pool has retired.
+				Job->bBrickPack = false;
+			}
+		}
+		// Rule 2: drop the brick half of any job whose shell was stolen by a
+		// later allocation's eviction inside this very loop.
+		for (const FJobPtr& Job : Batch)
+		{
+			if (!Job->bGpuPoolAlloc)
+			{
+				continue;
+			}
+			FVoxelBrickPool::FResidentChunk Current;
+			if (!Pool.DebugGetResidentChunk(Job->BrickKey, Current) ||
+			    !Current.bGpuArenas || Current.ChunkSlot != Job->GpuChunkSlot)
+			{
+				Job->bGpuPoolAlloc = false;
+				Job->bGpuShellAllocated = false;
+				Job->bBrickPack = false;
+				Pool.NoteGpuAllocFallback(FVoxelBrickPool::EGpuAllocFallback::ShellRefused);
+			}
+		}
+		// Rule 3: frees before claims, always.
+		Pool.FlushPendingGpuFrees();
+	}
+
 	// ONE graph for the whole batch. Every job's seven passes plus its three
 	// readback copies go into the same FRDGBuilder, which is executed once.
 	ENQUEUE_RENDER_COMMAND(VoxelGpuMeshDispatchBatch)(
 		[Jobs = MoveTemp(Batch)](FRHICommandListImmediate& RHICmdList)
 	{
 		FRDGBuilder GraphBuilder(RHICmdList);
+
+		// --- P1: the pool's arenas, registered ONCE for every claiming job ---
+		//
+		// Lazily, on the first job that claims: an unarmed batch must add no
+		// pass, register no buffer and differ in no byte. EnsureCreated runs
+		// here because this graph can be the pool's very first GPU touch --
+		// the flush that used to create the buffers may never have run yet.
+		// The layout read is safe cross-thread: written once at Init (game
+		// thread), before any job could have been armed, immutable after.
+		VoxelGpuWorldGen::FBrickPoolAllocBuffers PoolAllocBufs;
+		FVoxelBrickPoolAllocLayout PoolAllocLayout;
+		bool bPoolAllocBound = false;
+		const auto BindPoolAlloc = [&]() -> bool
+		{
+			if (bPoolAllocBound)
+			{
+				return PoolAllocBufs.IsValid();
+			}
+			bPoolAllocBound = true;
+			FVoxelBrickPool& Pool = GetGlobalVoxelBrickPool();
+			const FVoxelBrickPoolBuffersRef Buffers = Pool.GetBuffers();
+			FVoxelBrickPool::EnsureCreated_RenderThread(RHICmdList, Buffers);
+			if (!Buffers.IsValid() || !Buffers->IsValid() || !Buffers->HasGpuAlloc())
+			{
+				return false;
+			}
+			PoolAllocLayout = Pool.GetGpuAllocLayout();
+			PoolAllocBufs.PoolDesc = GraphBuilder.RegisterExternalBuffer(Buffers->DescPooled, TEXT("VoxelBrickPool.Desc"));
+			PoolAllocBufs.PoolOcc = GraphBuilder.RegisterExternalBuffer(Buffers->OccPooled, TEXT("VoxelBrickPool.Occ"));
+			PoolAllocBufs.PoolMat = GraphBuilder.RegisterExternalBuffer(Buffers->MatPooled, TEXT("VoxelBrickPool.Mat"));
+			PoolAllocBufs.PoolTable = GraphBuilder.RegisterExternalBuffer(Buffers->ChunkTablePooled, TEXT("VoxelBrickPool.ChunkTable"));
+			PoolAllocBufs.AllocState = GraphBuilder.RegisterExternalBuffer(Buffers->AllocStatePooled, TEXT("VoxelBrickPool.AllocState"));
+			PoolAllocBufs.AllocBitmap = GraphBuilder.RegisterExternalBuffer(Buffers->AllocBitmapPooled, TEXT("VoxelBrickPool.AllocBitmap"));
+			PoolAllocBufs.AllocSide = GraphBuilder.RegisterExternalBuffer(Buffers->AllocSidePooled, TEXT("VoxelBrickPool.AllocSide"));
+			return PoolAllocBufs.IsValid();
+		};
 
 		// Jobs that made it into the graph. Anything that falls out below is
 		// terminated here and now with a Failed state, so no job can leave this
@@ -1843,6 +2019,46 @@ void FVoxelGpuMeshJobManager::DispatchBatch(TArray<FJobPtr>&& Batch)
 					       TEXT("Job %llu asked for a brick pack and the graph produced no brick buffers. ")
 					       TEXT("The mesh half of this job is unaffected."), Job->JobId);
 					Job->bBrickPack = false;
+				}
+				else if (Job->bGpuPoolAlloc)
+				{
+					// --- P1: claim + write IN THIS GRAPH, read back NOTHING --
+					//
+					// The claim pass consumes BrickTotals where the scan wrote
+					// them; the write passes land words, descriptors and the
+					// record at the claimed ranges. No payload survives this
+					// graph (the scratch dies with it, as it should), no
+					// BrickTotalReadback exists, and for a brick-only job with
+					// no band the whole job now has NO readback: it is
+					// deliverable the moment this command is enqueued. That is
+					// the fence this phase exists to kill.
+					//
+					// If binding fails (allocator buffers could not be
+					// created), the chunk keeps its shell and lands nothing --
+					// the record is zero, the verify counts it unwritten, and
+					// the window line says so. Loud, not fatal: the mesh half
+					// is unaffected, exactly like the null-buffer branch above.
+					if (BindPoolAlloc())
+					{
+						FRDGBufferRef Claim = VoxelGpuWorldGen::AddBrickPoolClaimPass(
+							GraphBuilder, PoolAllocBufs, PoolAllocLayout,
+							BrickGraph.BrickTotals, Job->GpuChunkSlot,
+							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax);
+						VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(
+							GraphBuilder, PoolAllocBufs, Claim,
+							BrickGraph.BrickOcc, BrickGraph.BrickMat,
+							BrickGraph.BrickDesc, BrickGraph.BrickChunkMask,
+							BrickGraph.Sizes.NumBricks, Job->GpuChunkSlot, Job->GpuBrickBase,
+							uint32(FMath::Clamp(Job->BrickKey.Level, 0, 15)),
+							Job->BrickOriginVoxel, Job->BrickShading,
+							BrickGraph.Sizes.BrickOccWordsMax, BrickGraph.Sizes.BrickMatWordsMax);
+					}
+					else
+					{
+						UE_LOG(LogTemp, Error,
+						       TEXT("Job %llu: voxel.GPU.PoolAlloc armed but the allocator buffers are ")
+						       TEXT("unavailable; the chunk has a shell and no volume."), Job->JobId);
+					}
 				}
 				else
 				{
@@ -2195,7 +2411,11 @@ void FVoxelGpuMeshJobManager::PollInFlight()
 					// P1-C. Rides phase 1 for the band's reason: one job, one
 					// completion event. A brick total that landed on its own
 					// would be a second async stream to satisfy exactly once.
-					const bool bNeedBricks = Job->bBrickPack;
+					// P1: a GPU-claimed job enqueued NO brick readback -- its
+					// totals were consumed on the GPU by the claim pass -- so
+					// requiring one here would fail every such job with
+					// "readback objects missing".
+					const bool bNeedBricks = Job->bBrickPack && !Job->bGpuPoolAlloc;
 					// PHASE 5: a brick-only job never enqueued a quad total, so
 					// requiring it here would fail every such job with "phase 1
 					// readback objects missing" -- which is the failure mode this

@@ -758,6 +758,144 @@ namespace
 		END_SHADER_PARAMETER_STRUCT()
 	};
 
+	// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) -----------------
+	//
+	// Same standing as FVoxelBrickPoolShader's other children: these kernels
+	// move dwords and interpret nothing but the 28-bit offset and the 2-bit
+	// kind, so SM5 and no version lock. See VoxelBrickPoolAlloc.usf for the
+	// allocator design; every layout number below is BOUND from
+	// FVoxelBrickPool's one authoritative copy, never restated.
+
+	// The layout parameters every alloc kernel shares, spelled once. A macro
+	// rather than a nested struct because BEGIN_SHADER_PARAMETER_STRUCT
+	// reflection matches loose global names, and the .usf declares these as
+	// loose globals exactly as VoxelBrickPoolWrite.usf does.
+	#define VOXEL_BRICK_ALLOC_LAYOUT_PARAMETERS() \
+		SHADER_PARAMETER(uint32, OccRegionFirst) \
+		SHADER_PARAMETER(uint32, OccRegionWords) \
+		SHADER_PARAMETER(uint32, MatRegionFirst) \
+		SHADER_PARAMETER(uint32, MatRegionWords) \
+		SHADER_PARAMETER(uint32, OccClassStep) \
+		SHADER_PARAMETER(uint32, OccClasses) \
+		SHADER_PARAMETER(uint32, MatClassStep) \
+		SHADER_PARAMETER(uint32, MatClasses) \
+		SHADER_PARAMETER(uint32, FreeStackCap) \
+		SHADER_PARAMETER(uint32, OccTopsFirst) \
+		SHADER_PARAMETER(uint32, MatTopsFirst) \
+		SHADER_PARAMETER(uint32, OccStackFirst) \
+		SHADER_PARAMETER(uint32, MatStackFirst) \
+		SHADER_PARAMETER(uint32, OccBitmapFirst) \
+		SHADER_PARAMETER(uint32, MatBitmapFirst)
+
+	class FVoxelBrickPoolClaimCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolClaimCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolClaimCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICK_ALLOC_LAYOUT_PARAMETERS()
+			SHADER_PARAMETER(uint32, ChunkSlot)
+			SHADER_PARAMETER(uint32, OccWorstWords)
+			SHADER_PARAMETER(uint32, MatWorstWords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickTotals)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocState)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocSide)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutClaim)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPoolAllocWordCopyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolAllocWordCopyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolAllocWordCopyCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, MaxWords)
+			SHADER_PARAMETER(uint32, WordsClaimIndex)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InWords)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutWords)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPoolAllocDescCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolAllocDescCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolAllocDescCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, BrickBase)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint2>, OutBrickDesc)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPoolAllocRecordCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolAllocRecordCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolAllocRecordCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			SHADER_PARAMETER(uint32, BrickCount)
+			SHADER_PARAMETER(uint32, ChunkSlot)
+			SHADER_PARAMETER(uint32, BrickBase)
+			SHADER_PARAMETER(uint32, RingLevel)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER(uint32, ChunkClimatePacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceGradPacked)
+			SHADER_PARAMETER(uint32, ChunkSurfaceZRelBits)
+			SHADER_PARAMETER(FIntVector3, OriginVoxel)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InClaim)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint2>, InBrickDesc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InBrickOcc)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InChunkBrickMask)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPoolFreeCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolFreeCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolFreeCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICK_ALLOC_LAYOUT_PARAMETERS()
+			SHADER_PARAMETER(uint32, NumSlots)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InSlotList)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocState)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocBitmap)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, AllocSide)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutChunkTable)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
+	class FVoxelBrickPoolAllocVerifyCS : public FVoxelBrickPoolShader
+	{
+	public:
+		DECLARE_GLOBAL_SHADER(FVoxelBrickPoolAllocVerifyCS);
+		SHADER_USE_PARAMETER_STRUCT(FVoxelBrickPoolAllocVerifyCS, FVoxelBrickPoolShader);
+
+		BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+			VOXEL_BRICK_ALLOC_LAYOUT_PARAMETERS()
+			SHADER_PARAMETER(uint32, NumEntries)
+			SHADER_PARAMETER(uint32, ChunkRecordDwords)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InExpect)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InPoolTable)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InAllocSide)
+			SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint>, InAllocBitmap)
+			SHADER_PARAMETER_RDG_BUFFER_UAV(RWStructuredBuffer<uint>, OutVerify)
+		END_SHADER_PARAMETER_STRUCT()
+	};
+
 	// --- BandReduceMain: the footprint band (Wave D / D6) ------------------
 	//
 	// Derives from FVoxelWorldGenShader, unlike the quad-total kernel, because
@@ -816,6 +954,15 @@ IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchDescWriteCS, VOXEL_BRICK_POOL_WRITE
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchRecordCS,    VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchRecordMain",    SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushBatchClearCS,     VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushBatchClearMain",     SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelBrickFlushVerifyCS,         VOXEL_BRICK_POOL_WRITE_USF, "BrickFlushVerifyMain",         SF_Compute);
+
+#define VOXEL_BRICK_POOL_ALLOC_USF "/VoxelEarth/VoxelBrickPoolAlloc.usf"
+
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolClaimCS,         VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolClaimMain",         SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocWordCopyCS, VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolAllocWordCopyMain", SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocDescCS,     VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolAllocDescMain",     SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocRecordCS,   VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolAllocRecordMain",   SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolFreeCS,          VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolFreeMain",          SF_Compute);
+IMPLEMENT_GLOBAL_SHADER(FVoxelBrickPoolAllocVerifyCS,   VOXEL_BRICK_POOL_ALLOC_USF, "BrickPoolAllocVerifyMain",   SF_Compute);
 
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampMain", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FVoxelAssetStampCoarseCS, "/VoxelEarth/VoxelAssetStamp.usf", "AssetStampCoarseMain", SF_Compute);
@@ -2115,6 +2262,212 @@ void VoxelGpuWorldGen::AddBrickFlushVerifyPass(FRDGBuilder& GraphBuilder,
 		GraphBuilder,
 		RDG_EVENT_NAME("Voxel.BrickFlushVerify(slot %u)", Args.ChunkSlot),
 		Shader, Params, FIntVector(1, 1, 1));
+}
+
+// --- P1: GPU-side pool allocation (voxel.GPU.PoolAlloc) ----------------------
+//
+// See VoxelBrickPoolAlloc.usf for the design. These functions only bind and
+// dispatch; the layout is FVoxelBrickPool's and arrives complete in Layout.
+
+namespace
+{
+	// One filler for the shared layout block, because three parameter structs
+	// carry it and a field forgotten in one of them is a kernel addressing the
+	// wrong dwords with no error anywhere.
+	template <typename TParams>
+	void FillBrickAllocLayout(TParams* Params, const VoxelGpuWorldGen::FBrickPoolAllocLayout& L)
+	{
+		Params->OccRegionFirst = L.OccRegionFirst;
+		Params->OccRegionWords = L.OccRegionWords;
+		Params->MatRegionFirst = L.MatRegionFirst;
+		Params->MatRegionWords = L.MatRegionWords;
+		Params->OccClassStep = L.OccClassStep;
+		Params->OccClasses = L.OccClasses;
+		Params->MatClassStep = L.MatClassStep;
+		Params->MatClasses = L.MatClasses;
+		Params->FreeStackCap = L.FreeStackCap;
+		Params->OccTopsFirst = L.OccTopsFirst;
+		Params->MatTopsFirst = L.MatTopsFirst;
+		Params->OccStackFirst = L.OccStackFirst;
+		Params->MatStackFirst = L.MatStackFirst;
+		Params->OccBitmapFirst = L.OccBitmapFirst;
+		Params->MatBitmapFirst = L.MatBitmapFirst;
+	}
+}
+
+FRDGBufferRef VoxelGpuWorldGen::AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
+                                                      const FBrickPoolAllocBuffers& Buffers,
+                                                      const FBrickPoolAllocLayout& Layout,
+                                                      FRDGBufferRef BrickTotals, uint32 ChunkSlot,
+                                                      uint32 OccWorstWords, uint32 MatWorstWords)
+{
+	if (!Buffers.IsValid() || BrickTotals == nullptr)
+	{
+		return nullptr;
+	}
+
+	FRDGBufferRef Claim = GraphBuilder.CreateBuffer(
+		FRDGBufferDesc::CreateStructuredDesc(sizeof(uint32), 8), TEXT("Voxel.BrickPoolClaim"));
+
+	FVoxelBrickPoolClaimCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickPoolClaimCS::FParameters>();
+	FillBrickAllocLayout(Params, Layout);
+	Params->ChunkSlot = ChunkSlot;
+	Params->OccWorstWords = OccWorstWords;
+	Params->MatWorstWords = MatWorstWords;
+	Params->InBrickTotals = GraphBuilder.CreateSRV(BrickTotals);
+	Params->AllocState = GraphBuilder.CreateUAV(Buffers.AllocState);
+	Params->AllocBitmap = GraphBuilder.CreateUAV(Buffers.AllocBitmap);
+	Params->AllocSide = GraphBuilder.CreateUAV(Buffers.AllocSide);
+	Params->OutClaim = GraphBuilder.CreateUAV(Claim);
+
+	TShaderMapRef<FVoxelBrickPoolClaimCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolClaim(slot %u)", ChunkSlot),
+		Shader, Params, FIntVector(1, 1, 1));
+	return Claim;
+}
+
+void VoxelGpuWorldGen::AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
+                                                    const FBrickPoolAllocBuffers& Buffers,
+                                                    FRDGBufferRef Claim,
+                                                    FRDGBufferRef SrcOcc, FRDGBufferRef SrcMat,
+                                                    FRDGBufferRef SrcDesc, FRDGBufferRef SrcChunkMask,
+                                                    uint32 BrickCount, uint32 ChunkSlot, uint32 BrickBase,
+                                                    uint32 RingLevel, const FIntVector& OriginVoxel,
+                                                    const FVoxelBrickChunkShading& Shading,
+                                                    uint32 OccWorstWords, uint32 MatWorstWords)
+{
+	if (!Buffers.IsValid() || Claim == nullptr || SrcOcc == nullptr || SrcMat == nullptr ||
+	    SrcDesc == nullptr || SrcChunkMask == nullptr || BrickCount == 0)
+	{
+		return;
+	}
+
+	// The two word copies, worst-case dispatched: the actual counts live on the
+	// GPU (in the claim), so the excess threads read two dwords and exit. An
+	// indirect dispatch here would be P3 built early against measurement #1
+	// (pass and dispatch setup is NOT the current ceiling). A zero bound skips
+	// the pass outright -- the CPU producer passes its EXACT counts here, and an
+	// all-collapsed chunk owns no words in an arena (a zero-group dispatch is
+	// not merely wasteful, it is invalid).
+	if (OccWorstWords > 0)
+	{
+		FVoxelBrickPoolAllocWordCopyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelBrickPoolAllocWordCopyCS::FParameters>();
+		Params->MaxWords = OccWorstWords;
+		Params->WordsClaimIndex = 0;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InWords = GraphBuilder.CreateSRV(SrcOcc);
+		Params->OutWords = GraphBuilder.CreateUAV(Buffers.PoolOcc);
+		TShaderMapRef<FVoxelBrickPoolAllocWordCopyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocOccCopy(slot %u)", ChunkSlot),
+			Shader, Params, FIntVector(FMath::DivideAndRoundUp(OccWorstWords, 64u), 1, 1));
+	}
+	if (MatWorstWords > 0)
+	{
+		FVoxelBrickPoolAllocWordCopyCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelBrickPoolAllocWordCopyCS::FParameters>();
+		Params->MaxWords = MatWorstWords;
+		Params->WordsClaimIndex = 1;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InWords = GraphBuilder.CreateSRV(SrcMat);
+		Params->OutWords = GraphBuilder.CreateUAV(Buffers.PoolMat);
+		TShaderMapRef<FVoxelBrickPoolAllocWordCopyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocMatCopy(slot %u)", ChunkSlot),
+			Shader, Params, FIntVector(FMath::DivideAndRoundUp(MatWorstWords, 64u), 1, 1));
+	}
+	{
+		FVoxelBrickPoolAllocDescCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelBrickPoolAllocDescCS::FParameters>();
+		Params->BrickCount = BrickCount;
+		Params->BrickBase = BrickBase;
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+		Params->OutBrickDesc = GraphBuilder.CreateUAV(Buffers.PoolDesc);
+		TShaderMapRef<FVoxelBrickPoolAllocDescCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocDesc(slot %u)", ChunkSlot),
+			Shader, Params, FIntVector(FMath::DivideAndRoundUp(BrickCount, 64u), 1, 1));
+	}
+	{
+		FVoxelBrickPoolAllocRecordCS::FParameters* Params =
+			GraphBuilder.AllocParameters<FVoxelBrickPoolAllocRecordCS::FParameters>();
+		Params->BrickCount = BrickCount;
+		Params->ChunkSlot = ChunkSlot;
+		Params->BrickBase = BrickBase;
+		Params->RingLevel = RingLevel;
+		Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+		Shading.Pack(Params->ChunkClimatePacked, Params->ChunkSurfaceGradPacked,
+		             Params->ChunkSurfaceZRelBits);
+		Params->OriginVoxel = FIntVector3(OriginVoxel.X, OriginVoxel.Y, OriginVoxel.Z);
+		Params->InClaim = GraphBuilder.CreateSRV(Claim);
+		Params->InBrickDesc = GraphBuilder.CreateSRV(SrcDesc);
+		Params->InBrickOcc = GraphBuilder.CreateSRV(SrcOcc);
+		Params->InChunkBrickMask = GraphBuilder.CreateSRV(SrcChunkMask);
+		Params->OutChunkTable = GraphBuilder.CreateUAV(Buffers.PoolTable);
+		TShaderMapRef<FVoxelBrickPoolAllocRecordCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+		FComputeShaderUtils::AddPass(
+			GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocRecord(slot %u, L%u)", ChunkSlot, RingLevel),
+			Shader, Params, FIntVector(1, 1, 1));
+	}
+}
+
+void VoxelGpuWorldGen::AddBrickPoolFreePass(FRDGBuilder& GraphBuilder,
+                                            const FBrickPoolAllocBuffers& Buffers,
+                                            const FBrickPoolAllocLayout& Layout,
+                                            FRDGBufferRef SlotList, uint32 NumSlots)
+{
+	if (!Buffers.IsValid() || SlotList == nullptr || NumSlots == 0)
+	{
+		return;
+	}
+
+	FVoxelBrickPoolFreeCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickPoolFreeCS::FParameters>();
+	FillBrickAllocLayout(Params, Layout);
+	Params->NumSlots = NumSlots;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	Params->InSlotList = GraphBuilder.CreateSRV(SlotList);
+	Params->AllocState = GraphBuilder.CreateUAV(Buffers.AllocState);
+	Params->AllocBitmap = GraphBuilder.CreateUAV(Buffers.AllocBitmap);
+	Params->AllocSide = GraphBuilder.CreateUAV(Buffers.AllocSide);
+	Params->OutChunkTable = GraphBuilder.CreateUAV(Buffers.PoolTable);
+
+	TShaderMapRef<FVoxelBrickPoolFreeCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolFree(%u slots)", NumSlots),
+		Shader, Params, FIntVector(FMath::DivideAndRoundUp(NumSlots, 64u), 1, 1));
+}
+
+void VoxelGpuWorldGen::AddBrickPoolAllocVerifyPass(FRDGBuilder& GraphBuilder,
+                                                   const FBrickPoolAllocBuffers& Buffers,
+                                                   const FBrickPoolAllocLayout& Layout,
+                                                   FRDGBufferRef Expect, uint32 NumEntries,
+                                                   FRDGBufferRef OutVerify)
+{
+	if (!Buffers.IsValid() || Expect == nullptr || OutVerify == nullptr || NumEntries == 0)
+	{
+		return;
+	}
+
+	FVoxelBrickPoolAllocVerifyCS::FParameters* Params =
+		GraphBuilder.AllocParameters<FVoxelBrickPoolAllocVerifyCS::FParameters>();
+	FillBrickAllocLayout(Params, Layout);
+	Params->NumEntries = NumEntries;
+	Params->ChunkRecordDwords = uint32(FVoxelBrickPool::kChunkRecordDwords);
+	Params->InExpect = GraphBuilder.CreateSRV(Expect);
+	Params->InPoolTable = GraphBuilder.CreateSRV(Buffers.PoolTable);
+	Params->InAllocSide = GraphBuilder.CreateSRV(Buffers.AllocSide);
+	Params->InAllocBitmap = GraphBuilder.CreateSRV(Buffers.AllocBitmap);
+	Params->OutVerify = GraphBuilder.CreateUAV(OutVerify);
+
+	TShaderMapRef<FVoxelBrickPoolAllocVerifyCS> Shader(GetGlobalShaderMap(GMaxRHIFeatureLevel));
+	FComputeShaderUtils::AddPass(
+		GraphBuilder, RDG_EVENT_NAME("Voxel.BrickPoolAllocVerify(%u chunks)", NumEntries),
+		Shader, Params, FIntVector(FMath::DivideAndRoundUp(NumEntries, 64u), 1, 1));
 }
 
 bool VoxelGpuWorldGen::IsSupportedOnCurrentRHI()

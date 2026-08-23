@@ -331,4 +331,84 @@ namespace VoxelGpuWorldGen
 	};
 	void AddBrickFlushVerifyPass(FRDGBuilder& GraphBuilder, const FBrickFlushVerifyBuffers& Buffers,
 	                             const FBrickFlushVerifyArgs& Args);
+
+	// --- P1 of the GPU streaming architecture: GPU-side pool allocation --------
+	//
+	// (voxel.GPU.PoolAlloc.) The generation graph claims its own occ/mat arena
+	// ranges with atomics and writes words, descriptors and record IN THE SAME
+	// GRAPH -- no totals readback, no CPU allocation, no later flush graph for
+	// these chunks. See VoxelBrickPoolAlloc.usf's header for the whole allocator
+	// design (size-class bump + free stacks, the page-bitmap double-grant gate,
+	// and the one-allocator rule: both producers claim from THIS allocator).
+	//
+	// All RENDER THREAD ONLY, same standing as every other pass here.
+
+	// The pool-side buffers every alloc-path pass binds. Filled by the caller
+	// from FVoxelBrickPoolBuffers via RegisterExternalBuffer.
+	struct FBrickPoolAllocBuffers
+	{
+		FRDGBufferRef PoolDesc = nullptr;    // written by the desc pass
+		FRDGBufferRef PoolOcc = nullptr;     // written by the occ word copy
+		FRDGBufferRef PoolMat = nullptr;     // written by the mat word copy
+		FRDGBufferRef PoolTable = nullptr;   // written by the record / free passes
+		FRDGBufferRef AllocState = nullptr;  // bumps + counters + free stacks
+		FRDGBufferRef AllocBitmap = nullptr; // one bit per class page
+		FRDGBufferRef AllocSide = nullptr;   // 4 dwords per chunk slot: the ranges
+
+		bool IsValid() const
+		{
+			return PoolDesc && PoolOcc && PoolMat && PoolTable
+			    && AllocState && AllocBitmap && AllocSide;
+		}
+	};
+
+	// The arena/state-buffer layout is computed ONCE by FVoxelBrickPool::Init and
+	// handed to every kernel as parameters -- never restated as literals on either
+	// side (the ChunkRecordDwords rule). It is DEFINED in VoxelBrickPool.h (the
+	// pool owns it and this private header already includes that public one);
+	// aliased here so the pass signatures read in this namespace's vocabulary.
+	using FBrickPoolAllocLayout = ::FVoxelBrickPoolAllocLayout;
+
+	// One thread: totals -> class -> pop-or-bump -> bitmap -> side table + claim.
+	// Returns the 8-dword claim buffer the three write passes consume. BrickTotals
+	// is the region graph's own totals buffer -- the two dwords that used to cross
+	// PCIe, now consumed where they were produced.
+	FRDGBufferRef AddBrickPoolClaimPass(FRDGBuilder& GraphBuilder,
+	                                    const FBrickPoolAllocBuffers& Buffers,
+	                                    const FBrickPoolAllocLayout& Layout,
+	                                    FRDGBufferRef BrickTotals, uint32 ChunkSlot,
+	                                    uint32 OccWorstWords, uint32 MatWorstWords);
+
+	// The three writes: occ words, mat words (worst-case dispatch, actual count
+	// read from the claim), descriptors (claim-based rebase), and the record
+	// (zeroed on a failed claim). One call because their ordering relative to the
+	// claim is the only thing a caller could get wrong.
+	void AddBrickPoolAllocWritePasses(FRDGBuilder& GraphBuilder,
+	                                  const FBrickPoolAllocBuffers& Buffers,
+	                                  FRDGBufferRef Claim,
+	                                  FRDGBufferRef SrcOcc, FRDGBufferRef SrcMat,
+	                                  FRDGBufferRef SrcDesc, FRDGBufferRef SrcChunkMask,
+	                                  uint32 BrickCount, uint32 ChunkSlot, uint32 BrickBase,
+	                                  uint32 RingLevel, const FIntVector& OriginVoxel,
+	                                  const FVoxelBrickChunkShading& Shading,
+	                                  uint32 OccWorstWords, uint32 MatWorstWords);
+
+	// Eviction without a round trip: one thread per slot reads the side table,
+	// pushes the ranges onto their class stacks, clears the bitmap, zeroes the
+	// record and side entry. The CALLER owns the enqueue-order rule recorded on
+	// BrickPoolFreeMain: every pending free lands before any batch that could
+	// re-claim a freed slot.
+	void AddBrickPoolFreePass(FRDGBuilder& GraphBuilder,
+	                          const FBrickPoolAllocBuffers& Buffers,
+	                          const FBrickPoolAllocLayout& Layout,
+	                          FRDGBufferRef SlotList, uint32 NumSlots);
+
+	// The sampled window cross-check. Expect: 8 dwords per entry
+	// {slot, ox, oy, oz, level, brickBase, 0, 0}, from the CPU's resident map.
+	// OutVerify: [0] mismatches (FAIL), [1] checked, [2] unwritten. Caller clears.
+	void AddBrickPoolAllocVerifyPass(FRDGBuilder& GraphBuilder,
+	                                 const FBrickPoolAllocBuffers& Buffers,
+	                                 const FBrickPoolAllocLayout& Layout,
+	                                 FRDGBufferRef Expect, uint32 NumEntries,
+	                                 FRDGBufferRef OutVerify);
 }
