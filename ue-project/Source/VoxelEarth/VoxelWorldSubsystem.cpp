@@ -8837,13 +8837,33 @@ void FVoxelWorldImpl::MaybeLogCounters(float DeltaTime)
 			UE_LOG(LogVoxelPerf, Log,
 			       TEXT("Voxel march index uploads (cumulative): full=%llu delta=%llu "
 			            "deltaCells=%llu lastCells=%u bytes=%llu | fullBecause "
-			            "first=%u seed=%u pending=%u large=%u | verify pass=%llu FAIL=%llu"),
+			            "first=%u seed=%u pending=%u large=%u lost=%u | verify pass=%llu "
+			            "FAIL=%llu skip=%llu"),
 			       (unsigned long long)U.FullUploads, (unsigned long long)U.DeltaUploads,
 			       (unsigned long long)U.DeltaCellsStaged, U.LastStagedCells,
 			       (unsigned long long)GetGlobalVoxelMarchChunkIndex().GetUploadBytes(),
 			       U.FullBecauseFirst, U.FullBecauseSeed, U.FullBecausePending,
-			       U.FullBecauseLarge,
-			       (unsigned long long)U.VerifyPasses, (unsigned long long)U.VerifyFailures);
+			       U.FullBecauseLarge, U.FullBecauseLost,
+			       (unsigned long long)U.VerifyPasses, (unsigned long long)U.VerifyFailures,
+			       (unsigned long long)U.VerifySkippedNoSlot);
+
+			// PHASE 2: who wrote the index cells. "GPU" is the publish kernel
+			// (voxel.March.IndexGpuResident 1 -- residency the game thread
+			// never staged); "CPU" is the pair-staging arm plus the full
+			// uploads. gpuPublishes=0 on a control leg is the fingerprint that
+			// the switch was off. lostNoBuffer>0 means publish entries were
+			// DROPPED and healed by a full -- read the FAIL count before
+			// trusting anything else from that leg. fellbackPendingCpu should
+			// be at most 1 per mid-flight ON-flip; growing means Register()
+			// stopped draining staged pairs.
+			UE_LOG(LogVoxelPerf, Log,
+			       TEXT("Voxel march index GPU publish (cumulative): publishes=%llu "
+			            "cellsWritten=%llu evictionsCleared=%llu | fellbackPendingCpu=%u "
+			            "lostNoBuffer=%u"),
+			       (unsigned long long)U.GpuPublishes,
+			       (unsigned long long)U.GpuCellsWritten,
+			       (unsigned long long)U.GpuCellsCleared,
+			       U.GpuFellBackPendingCpu, U.GpuLostNoBuffer);
 		}
 
 		UE_LOG(LogVoxelPerf, Log,

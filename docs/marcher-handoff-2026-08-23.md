@@ -370,3 +370,63 @@ sample, not the hitch line.
 **This matters beyond the fork.** Tier B assumes moving MORE work onto the GPU is the way to
 20,000-50,000 chunks/s. The only measurement anyone has of that direction says the opposite
 at today's scale. Settle §7.5's unexplained cost BEFORE building more of Tier B on it.
+
+---
+
+## 8. Phase 2 landed (added later this session): GPU-written residency, and the verify gate un-broken
+
+Per docs/gpu-streaming-architecture.md P2. Two deliverables, both **default off /
+behaviour-preserving**; a control leg is byte-identical.
+
+### 8.1 The publish path — `voxel.March.IndexGpuResident` (default 0)
+
+A flushed chunk's index cell is written by a GPU kernel (`VoxelMarchIndexPublishMain`,
+second entry point of VoxelMarchIndexScatter.usf) in a render command enqueued directly
+behind the pool's brick writes, instead of the game thread snapshotting `[cell,value]`
+pairs for the next marcher graph. The kernel derives the CELL with **the marcher's own
+wrap function** — factored into `Shaders/VoxelMarchIndexCell.ush`, included by both the
+read side (VoxelBrickTraverse.ush) and the write side — composes the value, and executes
+the removal guard (clear only a cell still naming the retired slot) against the live GPU
+buffer. Removals dispatch before additions; RDG's UAV barrier is the Removed-before-Added
+rule.
+
+**What the CPU still supplies, plainly:** the chunk coordinate and level (request data —
+the CPU decides what to generate), the level→grid-slot mapping and cover-band admission
+(index policy, kept where its counters live), and — until P1's suballocator lands — the
+**pool slot**, which is `AllocateForChunk`'s answer carried in the entry. Entry dword 4 is
+the P1 seam: it stops being uploaded and starts being read from the allocator's output.
+
+The CPU shadow (`Cells`) is still maintained — it is the counters, the full-upload
+fallback base, and the verify reference — but it is **off the residency path**: the
+marcher finds the chunk resident without `Register()` staging anything.
+
+Counters (log line "Voxel march index GPU publish"): publishes, cellsWritten,
+evictionsCleared, fellbackPendingCpu (once per mid-flight ON-flip is normal),
+lostNoBuffer (must stay 0; a full staging heals it, counted as `fullBecause lost`).
+
+### 8.2 The verify gate — fixed, and it can FAIL
+
+`voxel.March.IndexDeltaVerify` no longer crashes the D3D12 RHI. The single readback was
+re-enqueued while its previous fence was outstanding because `IsReady()` is meaningless
+between `AddEnqueueCopyPass` and graph execution (the fence is only re-armed at execution,
+and `Register()` runs up to three times a frame). Now: a 2-slot readback ring with
+per-slot expected hashes, an ArmedFrame gate (never poll a slot in the frame that armed
+it), and a counted skip when the ring is full — the hole-stats / shadow-march pattern.
+
+The gate is the Phase 2 correctness proof: after a sampled publish (or CPU delta scatter),
+the whole GPU buffer is read back, FNV-hashed in shadow order, and compared to the hash of
+the CPU shadow state it was patched to equal. **It fails if the GPU-derived cells disagree
+with what the CPU would have written** — shared-wrap drift, a lost entry, a guard
+mismatch — and a wrong cell is persistent divergence, so sampling suffices. Run it on any
+leg that flips 8.1 on.
+
+### 8.3 Not done / to measure (no build was run from this worktree)
+
+- Compile + a PIE leg: `voxel.March.IndexGpuResident 1` + `voxel.March.IndexDeltaVerify 1`,
+  read `verify pass/FAIL/skip` and the publish line. **FAIL>0 outranks everything.**
+- The publish path still builds its entries on the game thread from the flush delta; the
+  game-thread win is that staging/merge/Register-consume drop out, but the real payoff is
+  architectural — P1's allocator plugs into entry dword 4 and the apply loop can then
+  shrink to shadow bookkeeping.
+- Holes gate: `uncovered` must not move with the switch on (admission order is untouched,
+  so it should not — verify, don't assume).

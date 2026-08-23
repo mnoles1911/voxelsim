@@ -35,6 +35,10 @@
 // the unsynchronised-write hazard it replaced).
 
 #include "/Engine/Public/Platform.ush"
+// The shared coord->cell wrap and the entry bit layout -- the SAME function the
+// marcher's read-side lookup runs. See that file's header for why sharing it is
+// load-bearing for the publish kernel below.
+#include "/VoxelEarth/VoxelMarchIndexCell.ush"
 
 // [cell, value] pairs, two dwords per changed cell, deduplicated by cell.
 StructuredBuffer<uint> MarchIndexDeltaPairs;
@@ -64,4 +68,119 @@ void VoxelMarchIndexScatterMain(uint3 tid : SV_DispatchThreadID)
 		return;
 	}
 	MarchChunkIndexRW[Cell] = Value;
+}
+
+// ===========================================================================
+// PHASE 2 (docs/gpu-streaming-architecture.md): THE PUBLISH KERNEL.
+// A chunk becomes resident by THIS kernel writing its index cell -- the GPU
+// derives the cell and composes the entry value itself, instead of the CPU
+// shadow snapshotting a [cell, value] pair for the scatter above.
+// ===========================================================================
+//
+// WHAT THE GPU DERIVES vs WHAT THE CPU STILL SUPPLIES, stated so nobody has to
+// re-discover it:
+//
+//   GPU-derived, here:  the CELL (VoxelMarchIndexCellCompute -- the marcher's
+//                       own wrap, from the shared include), the VALUE
+//                       composition (resident | anySolid | slot), and the
+//                       removal guard (clear only a cell that still names the
+//                       retired slot).
+//   CPU-supplied, per entry: the chunk COORDINATE and ring LEVEL (they are
+//                       request data -- the CPU decides what to generate, per
+//                       Aokana's split), the level -> grid-slot mapping and
+//                       the cover-band admission (index policy, applied where
+//                       the counters live), and -- TODAY -- the pool SLOT,
+//                       because allocation is still the CPU's AllocateForChunk
+//                       at flush time. THE SLOT FIELD IS THE PHASE 1 SEAM:
+//                       when the GPU suballocator owns allocation, entry dword
+//                       4 stops being uploaded and starts being read from the
+//                       allocator's per-request output. Nothing else here
+//                       changes.
+//
+// ENTRY LAYOUT: five dwords -- [coordX, coordY, coordZ, gridSlot, chunkSlot],
+// coords as int32 bit patterns (asint on read). The host lays the buffer out
+// REMOVALS FIRST, ADDITIONS AFTER, and dispatches this kernel twice over the
+// two ranges (MarchIndexPublishFirst/Count) with MarchIndexPublishMode 0 then
+// 1. Two dispatches, not one, because a removal and an addition can name the
+// SAME cell in one flush (a slot freed and re-used inside one batch): within
+// one dispatch that would be a write-write race, across two it is an RDG UAV
+// barrier -- removals complete before the first addition writes, which is the
+// same Removed-before-Added rule the CPU shadow's ApplyDelta enforces, kept
+// for the same reason (the other order maps the OLD key to a slot that now
+// holds the NEW chunk, and it renders as terrain).
+//
+// ADDITIONS ARE DEDUPLICATED BY CELL ON THE HOST (last writer kept, matching
+// the shadow's sequential apply order); REMOVALS NEED NO DEDUP: two removals
+// can share a cell only with different retired slots, at most one matches the
+// guard, and a thread that loses the read race reads 0 -- whose resident bit
+// is clear, so its guard fails and it writes nothing. Either interleaving
+// converges to the cleared cell.
+//
+// THE REMOVAL GUARD IS WHAT KEEPS SLOT REUSE SAFE, and it must stay
+// bit-identical to the CPU shadow's (ApplyDelta's Removed loop): clear only if
+// the cell is resident AND still names the retired slot. The host emits a
+// removal entry for EVERY retirement it is told about, including ones whose
+// cell this index never wrote (a band-refused cover entry the pool still
+// considered resident) -- the guard, not the emission, is the filter, on both
+// sides, so both sides refuse the same false matches. A slot is unique among
+// resident chunks -- ONE allocator hands them out, whichever processor owns it
+// -- so the guard cannot collide with a different resident chunk.
+
+StructuredBuffer<uint> MarchIndexPublishEntries;
+// First entry and entry count for THIS dispatch's range (entries, not dwords).
+uint MarchIndexPublishFirst;
+uint MarchIndexPublishCount;
+// 0 = removals (guarded clears), 1 = additions (composed writes).
+uint MarchIndexPublishMode;
+// The grid shape, same values the marcher binds as MarchIndexDimChunks /
+// MarchIndexCellsPerLevel -- both sides are set from the same C++ constants.
+uint3 MarchIndexPublishDimChunks;
+uint  MarchIndexPublishCellsPerLevel;
+// Total cells; same out-of-bounds stance as the scatter kernel above. The
+// computed cell cannot exceed it while the uniforms match the C++ constants,
+// so a hit here is a host-side bug surfacing as a dropped write, not terrain.
+uint  MarchIndexPublishCellCount;
+
+[numthreads(64, 1, 1)]
+void VoxelMarchIndexPublishMain(uint3 tid : SV_DispatchThreadID)
+{
+	const uint i = tid.x;
+	if (i >= MarchIndexPublishCount)
+	{
+		return;
+	}
+	const uint Base = (MarchIndexPublishFirst + i) * 5u;
+	const int3 Coord = int3(asint(MarchIndexPublishEntries[Base + 0u]),
+	                        asint(MarchIndexPublishEntries[Base + 1u]),
+	                        asint(MarchIndexPublishEntries[Base + 2u]));
+	const uint GridSlot = MarchIndexPublishEntries[Base + 3u];
+	const uint Slot     = MarchIndexPublishEntries[Base + 4u] & VOXEL_MARCH_INDEX_SLOT_MASK;
+
+	const uint Cell = VoxelMarchIndexCellCompute(
+		Coord, MarchIndexPublishDimChunks, MarchIndexPublishCellsPerLevel, GridSlot);
+	if (Cell >= MarchIndexPublishCellCount)
+	{
+		return;
+	}
+
+	if (MarchIndexPublishMode == 0u)
+	{
+		// Removal: the guarded clear. See the header block for why the guard is
+		// the filter and why racing removals still converge.
+		const uint Old = MarchChunkIndexRW[Cell];
+		if ((Old & VOXEL_MARCH_INDEX_RESIDENT_BIT) != 0u &&
+		    (Old & VOXEL_MARCH_INDEX_SLOT_MASK) == Slot)
+		{
+			MarchChunkIndexRW[Cell] = 0u;
+		}
+	}
+	else
+	{
+		// Addition. anySolid is set unconditionally, exactly as the CPU shadow
+		// sets it (Seed's comment owns the argument): the record is
+		// authoritative and an all-air chunk is rejected one step later by the
+		// record instead.
+		MarchChunkIndexRW[Cell] =
+			VOXEL_MARCH_INDEX_RESIDENT_BIT | VOXEL_MARCH_INDEX_ANYSOLID_BIT | Slot;
+	}
 }
