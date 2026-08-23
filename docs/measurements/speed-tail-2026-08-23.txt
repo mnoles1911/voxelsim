@@ -293,3 +293,38 @@ READ THESE FOUR ON EVERY ARM, because the gate is all four and not just p95:
   here is a within-leg ratio or a stage split that closes against its own
   total, so no conclusion rests on that difference -- but a re-run of the
   30 m/s arm on the exact spd command line would remove the caveat for free.
+
+--------------------------------------------------------------------------------
+9. 240 m/s CANNOT CURRENTLY BE MEASURED AT ALL -- ALL SIX LEGS DIED
+--------------------------------------------------------------------------------
+
+The 240 m/s row of tonight's table has a blank p95 and this is why.  Every leg
+run at -VoxelPerfSpeed=240 crashed before "VoxelPerfRun complete":
+
+    spd240.log  arena-240.log  wide-on-240.log  wide-ctl-240.log
+    lead-off-240.log  lead-on-240.log
+
+All six on the SAME fatal, VoxelFineTileStreamer.cpp:944:
+
+    FINE TIER GATE LEAK (fatal, unattended run): elevation query at fine pixel
+    (-16384,-35200) needs tile (-2,-5), which is not resident and could not be
+    loaded ... The streaming anchor is in tile (-3,-4), so this query is
+    1 tile(s) (~15 km) away from the player.
+
+This is NOT a streaming defect and NOT something this note's fixes address.
+The gate is working exactly as designed: at 240 m/s the `line` flight runs off
+the edge of the baked fine-tile coverage, and the gate refuses to answer with
+sea level rather than produce an unreproducible artifact.  The whole 240 m/s
+column of any sweep is therefore vacuous until one of:
+
+  * bake the missing tile -- tools/bake_tiles_from_cache.py --tiles="-2,-5"
+    (the gate message names it, and names the seed and namespace it checked);
+  * -VoxelFineTileGateFatal=0 to downgrade it to an Error -- but then the leg
+    is reading sea level over the unbaked ground and its terrain-shaped numbers
+    (holes, residency, dispatched) are measuring a different world than the
+    30/60/120 arms.  Use it only for frame-time-only questions, and say so;
+  * shorten the flight or move the spawn so 240 m/s stays inside coverage.
+
+RECORDED SO IT IS NOT RE-DISCOVERED: a 240 m/s leg that "produced no p95" has
+not measured a slow arm.  It crashed at ~2 minutes.  Check the tail of the log
+for `FINE TIER GATE LEAK` before drawing any conclusion from a missing number.
