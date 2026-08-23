@@ -4131,6 +4131,61 @@ double ViewBiasStrength()
 	return K;
 }
 
+// -VoxelVelocityBias=<k> (0 = off; bare = 0.5, same scale and clamp as
+// -VoxelViewBias): the view-bias penalty aimed along the anchor's MEASURED
+// VELOCITY instead of the camera's facing.
+//
+// WHY A SECOND DIRECTION SOURCE EXISTS: the horizon defect this programme is
+// fixing is about where the player is GOING, and facing and heading are
+// different signals the moment he strafes, or looks around while flying --
+// on exactly those legs -VoxelViewBias spends its budget on ground the
+// camera is looking at and the player is leaving. Velocity is the signal
+// with the lead-time meaning; the floor (-VoxelLeadHorizonSec) sets how FAR
+// ahead admission may reach, this sets WHICH candidates inside that reach
+// queue first -- the pairing that turns an open horizon into terrain landing
+// in dispatch order along the flight path.
+//
+// PRECEDENCE when both are on: velocity wins while the anchor is actually
+// moving (> 1 m/s on the smoothed EMA -- below that the heading is noise and
+// a stationary player has no horizon problem), and the pair falls back to
+// (view dir, ViewBiasStrength) otherwise. Note the fallback strength is the
+// VIEW switch's: velocity bias off-moving is not a hidden view bias.
+//
+// WHY NO velocity analogue of the view-ROTATION rescan is wired: a change of
+// velocity direction requires motion, motion crosses chunk boundaries, and
+// boundary crossings already retrigger the entry scans (at 240 m/s R0
+// crosses ~75/s). The view rescan exists because a camera can rotate while
+// the anchor holds still, which velocity by definition cannot. (Corollary:
+// with BOTH switches on, view rotation still arms rescans that velocity-
+// keyed admission does not need -- harmless re-scans, not wrong answers.)
+//
+// CHURN SAFETY, same argument that shipped -VoxelViewBias: the penalty only
+// ever RAISES the key of an off-axis candidate, admission compares keys
+// against cutoffs derived from the same keys, and eviction never reads them
+// -- so a biased candidate is admitted later or not yet, never admitted-
+// then-evicted (the 11,779 unloads/s standing-still failure was two ANCHORS
+// disagreeing, which this does not touch).
+//
+// READINGS: dispatchDot (mean cos of DISPATCHED chunks to the VIEW dir) is
+// the wrong lens for this switch on a strafe leg by design; the proof of
+// traffic is per-ring loaded/pending holding at speed on a leg where the
+// camera yaws while the flight line holds. The FAILING reading is stationary
+// unloads/s moving with the switch on -- that would mean the penalty leaked
+// into an eviction decision, which must never happen.
+double VelocityBiasStrength()
+{
+	static const double K = []
+	{
+		double Value = 0.0;
+		if (FParse::Value(FCommandLine::Get(), TEXT("VoxelVelocityBias="), Value))
+		{
+			return FMath::Clamp(Value, 0.0, 3.0);
+		}
+		return FParse::Param(FCommandLine::Get(), TEXT("VoxelVelocityBias")) ? 0.5 : 0.0;
+	}();
+	return K;
+}
+
 // --- velocity-scaled admission horizon (-VoxelLeadHorizonSec, 2026-08-23) ----
 //
 // THE DEFECT, measured on matched -VoxelPerfSpeed legs (identical binary):
@@ -5987,6 +6042,19 @@ struct FVoxelWorldImpl
 	// treats zero as "no bias, no metric" rather than as a direction.
 	FVector2D StreamViewDirXY = FVector2D::ZeroVector;
 	void SetStreamViewDir(const FVector2D& DirXY) { StreamViewDirXY = DirXY; }
+	// The (direction, strength) pair the admission KEYS actually use --
+	// (StreamViewDirXY, ViewBiasStrength) in the control arm, the smoothed
+	// anchor velocity under -VoxelVelocityBias while moving (see
+	// VoxelStreamAdmission::VelocityBiasStrength for precedence and why).
+	// Recomputed once per streaming tick, immediately after the velocity EMA,
+	// so every key producer in one tick sees ONE pair -- the entry scan and
+	// SortPendingQueues disagreeing on the direction would store keys the
+	// cutoff was not derived against. Metrics that are ABOUT facing
+	// (dispatchDot, the rotation-rescan trigger) deliberately keep reading
+	// StreamViewDirXY: overriding it here would corrupt the instrument that
+	// proves where dispatches point.
+	FVector2D StreamBiasDirXY = FVector2D::ZeroVector;
+	double StreamBiasK = 0.0;
 	// The view direction each level's entry scan last decided admission
 	// against -- the rotation analogue of LastEntryScanAnchorXY, and the state
 	// that makes the rotation-rescan trigger self-quenching (the rescan it
@@ -7802,6 +7870,26 @@ void FVoxelWorldImpl::TickStreaming(const FVector& Anchor, AActor& Owner, UScene
 	}
 	PrevAnchorLocation = Anchor;
 	bHasPrevAnchor = true;
+
+	// -VoxelVelocityBias: pick this tick's ONE (direction, strength) pair for
+	// every admission key producer (see StreamBiasDirXY's declaration). The
+	// 1 m/s gate is on the same smoothed speed the lead-horizon floor uses;
+	// under it (and always with the switch off) this is exactly the old
+	// (view, ViewBias) pair, so the control arm's keys are bit-identical.
+	StreamBiasDirXY = StreamViewDirXY;
+	StreamBiasK = VoxelStreamAdmission::ViewBiasStrength();
+	{
+		const double VelK = VoxelStreamAdmission::VelocityBiasStrength();
+		if (VelK > 0.0 && SmoothedAnchorSpeedUUPerSec > 100.0)
+		{
+			const FVector2D VelXY(SmoothedAnchorVelocity.X, SmoothedAnchorVelocity.Y);
+			if (!VelXY.IsNearlyZero()) // pure vertical flight has no XY heading; keep the view pair
+			{
+				StreamBiasDirXY = VelXY.GetSafeNormal();
+				StreamBiasK = VelK;
+			}
+		}
+	}
 
 	LastAnchorLocation = Anchor;
 
@@ -12821,8 +12909,13 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 	// are bit-identical). Refreshing the VIEW term here, every recompute, is
 	// what makes a turn reorder the already-queued work without any rescan:
 	// the queue's stored keys are never older than the last recompute.
-	const double ViewBiasK = VoxelStreamAdmission::ViewBiasStrength();
-	const auto PriorityKeySq = [&Anchor, ViewBiasK, this](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
+	// -VoxelVelocityBias: (StreamBiasDirXY, StreamBiasK) is the per-tick pair
+	// -- identical to (StreamViewDirXY, ViewBiasStrength) in the control arm,
+	// the velocity heading while moving with the switch on. Refreshing the
+	// SAME pair here and in the entry scan is what keeps stored keys and the
+	// cutoff on one scale.
+	const double BiasK = StreamBiasK;
+	const auto PriorityKeySq = [&Anchor, BiasK, this](const VoxelCoords::FVoxelLevelChunkKey& LevelKey)
 	{
 		const double ChunkEdge = VoxelCoords::ChunkEdgeUUForLevel(LevelKey.Level);
 		const double CenterX = (double(LevelKey.Key.X) + 0.5) * ChunkEdge;
@@ -12831,7 +12924,7 @@ void FVoxelWorldImpl::SortPendingQueues(const FVector& Anchor)
 		const double DistSq3D = FMath::Square(CenterX - Anchor.X) + FMath::Square(CenterY - Anchor.Y) +
 		                        FMath::Square(CenterZ - Anchor.Z);
 		return VoxelStreamAdmission::PrioritySortKeySq(LevelKey.Level, DistSq3D, CenterX - Anchor.X,
-		                                                CenterY - Anchor.Y, StreamViewDirXY, ViewBiasK);
+		                                                CenterY - Anchor.Y, StreamBiasDirXY, BiasK);
 	};
 	// docs/m2-plan.md item 1: "Budgets shared across levels, nearest-first
 	// within level, lower level (finer) wins priority at equal distance."
@@ -13456,9 +13549,12 @@ FVoxelWorldImpl::EAdmitEvalOutcome FVoxelWorldImpl::AdmitCandidateEvaluate(
 	// it would mix two scales for interior coarse chunks, and
 	// mixing biased-and-unbiased view keys would do the same
 	// for chunks behind the camera.
+	// (StreamBiasDirXY, StreamBiasK): view pair in the control arm,
+	// velocity pair under -VoxelVelocityBias while moving -- the SAME
+	// pair SortPendingQueues refreshed this tick's stored keys with.
 	const double SortKeySq = VoxelStreamAdmission::PrioritySortKeySq(
-	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamViewDirXY,
-	    VoxelStreamAdmission::ViewBiasStrength());
+	    QueueLevel, DistSq3D, CenterX - Anchor.X, CenterY - Anchor.Y, StreamBiasDirXY,
+	    StreamBiasK);
 	if (!bOverlayAware && SortKeySq >= LevelAdmissionCutoffDistSq[QueueLevel])
 	{
 		++CandidatesRejectedSinceLog;
