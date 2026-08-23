@@ -19716,7 +19716,24 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 	// whole ring every tick; this walks only the sliver that is new.
 	const FVector Dir = Lead.GetSafeNormal();
 	const double LeadLen = Lead.Size();
-	const int32 Span = FMath::Clamp(FMath::CeilToInt32(LeadLen / ChunkEdge) + 1, 1, 64);
+	// WALK FROM THE PREDICTED DISC'S NEAR EDGE, not unconditionally from the
+	// R0 edge (2026-08-23). The sliver "inside the ring at the PREDICTED
+	// anchor, outside it at the TRUE one" starts at the R0 edge only while
+	// the two discs overlap (LeadLen <= 2*Outer). Past that they are
+	// DISJOINT, the sliver starts at LeadLen - Outer, and a walk anchored at
+	// the R0 edge probes ground the predicted-disc test then rejects --
+	// speculation parks NOTHING, silently, at exactly the speeds it exists
+	// for. Under today's clamps this branch is unreachable (lead <= 96 m
+	// from the index span budget, 2*Outer >= 256 m), so the control arm's
+	// probes are bit-identical; it becomes live the day the index grows to
+	// kDim 256 and -VoxelSpecLeadMaxM opens the lead to the ~450 m a 240 m/s
+	// flight needs. Landed ahead of that so the index resize alone unlocks
+	// it, instead of shipping a lead that measures as a no-op -- the T4-1
+	// guards that silently disabled the whole feature are the recorded
+	// failure this respects.
+	const double WalkStartUU = FMath::Max(OuterUU, LeadLen - OuterUU);
+	const int32 Span = FMath::Clamp(
+	    FMath::CeilToInt32((LeadLen + OuterUU - WalkStartUU) / ChunkEdge) + 1, 1, 64);
 	const int32 HalfWidth = FMath::Clamp(FMath::CeilToInt32(OuterUU / ChunkEdge), 1, 96);
 
 	int32 Queued = 0;
@@ -19725,7 +19742,7 @@ void FVoxelWorldImpl::EnumerateSpeculativeCandidates()
 	const FVector Perp(-Dir.Y, Dir.X, 0.0);
 	for (int32 Step = 0; Step <= Span && Queued < QueueBudget; ++Step)
 	{
-		const FVector Along = LastAnchorLocation + Dir * (OuterUU + double(Step) * ChunkEdge);
+		const FVector Along = LastAnchorLocation + Dir * (WalkStartUU + double(Step) * ChunkEdge);
 		for (int32 W = -HalfWidth; W <= HalfWidth && Queued < QueueBudget; ++W)
 		{
 			const FVector Probe = Along + Perp * (double(W) * ChunkEdge);

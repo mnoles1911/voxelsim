@@ -1552,6 +1552,42 @@ float VoxelDebug::GetStreamVelocityLeadSec()
 
 float VoxelDebug::GetStreamVelocityLeadMaxUU()
 {
+	// -VoxelSpecLeadMaxM=<metres> outranks the cvar for the whole process,
+	// command-line latched like -VoxelGpuMeshBatchCap= and for the same
+	// reason: the legs never use -ExecCmds, and the value shapes behaviour
+	// from the first tick. The cvar's 6,000 UU default is self-described as
+	// "~3 s at the 20 m/s flight profile" -- calibrated for ONE speed and
+	// blind above it (0.25 s of lead at 240 m/s).
+	//
+	// RAISING IT IS NOT A FREE LEVER, and the clamp deliberately does not
+	// decide alone: TickStreaming takes min(this, the march-index span
+	// budget) -- brick-backed speculative parking is resident in the
+	// toroidal index, and at kDimXY=128 the whole L0 forward reach
+	// (trailing hysteresis + ring + lead) shares 409.6 m of axis span, which
+	// leaves only ~96 m of lead at default rings and ~40 m at
+	// -VoxelRingScale=1.25. So at TODAY'S index this switch can add at most
+	// ~36 m over the default; its real range opens with kDimXY/kDimZ=256
+	// (448 MiB index), where the budget reaches ~450 m -- the ~2 s of lead a
+	// 240 m/s flight actually needs. The walk already follows the predicted
+	// disc's near edge (EnumerateSpeculativeCandidates), so a long lead
+	// parks real ground instead of sliding past the Span<=64 walk and
+	// parking nothing -- which is what an unclamped 480 m lead measured as
+	// before that fix.
+	//
+	// FAILING READING for a raised value: specLead budget line says the
+	// index BINDS and spec parked/adopted do not move -- the switch is
+	// doing nothing at this index size and must not be credited; the next
+	// lever is the index dims, not this number.
+	static const float CmdLineUU = []
+	{
+		float Meters = -1.0f;
+		FParse::Value(FCommandLine::Get(), TEXT("VoxelSpecLeadMaxM="), Meters);
+		return Meters >= 0.0f ? FMath::Min(Meters, 2000.0f) * 100.0f : -1.0f;
+	}();
+	if (CmdLineUU >= 0.0f)
+	{
+		return CmdLineUU;
+	}
 	return FMath::Max(0.f, CVarVoxelStreamVelocityLeadMaxUU.GetValueOnGameThread());
 }
 
