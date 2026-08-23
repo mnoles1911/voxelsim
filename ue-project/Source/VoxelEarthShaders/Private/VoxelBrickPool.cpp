@@ -106,7 +106,41 @@ namespace VoxelBrickPoolDetail
 	// more chunks in flight cost pool capacity, and the pool does not complain
 	// loudly -- it silently evicts and drops. Read `Voxel brick lifetime`'s
 	// evictions/writesDropped after any such change.
-	int32 GVoxelBrickPoolChunks = 262144;
+	//
+	// RAISED 262,144 -> 393,216 ON 2026-08-23 (the second raise that day), from
+	// the four-arm eviction matrix (Saved/ev-A..D.log, same seed/flight):
+	//
+	//   arm A, DEFAULT rings:  residentAll 259,582/262,144 = 99.0%, evictions 156
+	//   arm B, ring scale 1.25 + unload mult 1.15: 262,144/262,144 = 100.0%
+	//          PINNED, evictions 91,476 -- every admission evicts a resident
+	//   arm D, ring scale 1.25 + additive band 4:  still saturates in flight
+	//          (78,798 evictions), only the preflight fill fit at 97.2%
+	//
+	// i.e. the DEFAULT configuration was already at 99% of slot capacity with
+	// ~2,500 slots of headroom, and every wider-ring configuration saturated.
+	// Which arena bound: the same leg's [brick-gpualloc] line read occ
+	// high-water 136.1/192.0 MiB (70.9%) and mat 248.4/448.0 MiB (55.4%) at
+	// that 99% -- so SLOTS (descriptors/records) bind first, not payload
+	// words. That ordering is the one to preserve on any future resize: slot
+	// exhaustion evicts farthest-first (orderly), payload-arena exhaustion
+	// claim-fails and leaves unwritten volumes (disorderly). Keep desc the
+	// first arena to refuse.
+	//
+	// 393,216 = 1.5x sizes the wide ring the eviction work is moving to:
+	// resident demand scales with resident radius squared (radius in chunk
+	// edges = 40 x scale + band), so against arm A's measured 259,582 at
+	// radius 50:
+	//   default rings                       259,582  -> 66.0% of 393,216
+	//   scale 1.25 + band 4  (radius 54)   ~302,800  -> 77.0%
+	//   scale 1.25 + mult 1.15 (radius 57.5) ~343,300 -> 87.3%
+	// and the geometry exhausts at scale ~1.44 (band 4). Committed cost of the
+	// raise: descriptors 128 -> 192 MiB, records 16 -> 24 MiB, free-stack
+	// state 25 -> ~62 MiB (it is classes x ChunkCapacity x 4 B), side table
+	// 4 -> 6 MiB; occupancy moves 192 -> 288 MiB with it below. Total
+	// committed ~813 -> ~1,020 MiB, inside the owner's approved 1-2 GB.
+	// Control geometry on this same binary: -VoxelBrickPoolChunks=262144
+	// -VoxelBrickPoolOccMiB=192 -VoxelBrickPoolMatMiB=448 -VoxelGpuPoolMatStep=512.
+	int32 GVoxelBrickPoolChunks = 393216;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolChunks(
 		TEXT("voxel.Brick.PoolChunks"),
 		GVoxelBrickPoolChunks,
@@ -135,13 +169,44 @@ namespace VoxelBrickPoolDetail
 	// approved 1-2 GB. ANYONE CHANGING THE CHUNK COUNT MUST CHANGE THESE: the
 	// three capacities are one budget wearing three names, and nothing in the
 	// code ties them together.
-	int32 GVoxelBrickPoolOccMiB = 192;
+	//
+	// RAISED 192 -> 288 ON 2026-08-23 WITH THE 262,144 -> 393,216 SLOT RAISE,
+	// and the basis is measured amortized-per-SLOT cost, not per-claim means.
+	// docs/brick-pool-50k-ceiling.md derived "192 exhausts at ~196,600
+	// residents" from the ~194-dword per-claim mean -- but that mean is over
+	// CLAIMING chunks only, and the same leg's histogram shows 716,774 of
+	// 1,136,504 claims (63.1%) carry ZERO payload words (uniform chunks store
+	// collapsed: descriptors and a record, no occ/mat). The honest per-slot
+	// figure comes from dividing the measured arena high-water by the measured
+	// resident slots on the 99%-full arm A leg:
+	//     occ 136.1 MiB / 259,582 slots = 550 B/slot   (at step 128 padding, 16.8%)
+	//     mat 248.4 MiB / 259,582 slots = 1,003 B/slot (at step 512 padding, 50.9%)
+	// At the new 393,216 slots fully resident, occ demand is 393,216 x 550 B
+	// = ~206 MiB -- 192 would bind BEFORE the slots do, inverting the
+	// slots-bind-first ordering the chunk-count comment requires. 288 puts
+	// full-slot demand at 72% with a ~40% margin for terrain-mix shift (the
+	// 63.1% zero-claim fraction is one line flight's mix; mountains carry more
+	// mixed bricks). Mat needs no raise: at the step-256 class fix (see
+	// kGpuAllocMatClassStep) full-slot demand is ~272 MiB of 448 = 61%.
+	// FAILING READINGS if this is wrong: `claimFail occ > 0` on the
+	// [brick-gpualloc] line, or occ bump high-water pinned at the arena size
+	// while residentAll is under 100%.
+	int32 GVoxelBrickPoolOccMiB = 288;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolOccMiB(
 		TEXT("voxel.Brick.PoolOccMiB"),
 		GVoxelBrickPoolOccMiB,
 		TEXT("Occupancy arena size in MiB (16 dwords per MIXED brick). Census: 56.0 MiB at 10 cm / 4 km."),
 		ECVF_ReadOnly);
 
+	// UNCHANGED AT 448 THROUGH THE 2026-08-23 SLOT RAISE, DELIBERATELY. Mat was
+	// the least-loaded arena on the 99%-full leg (248.4/448 = 55.4%), and the
+	// mat class-step fix (kGpuAllocMatClassStep 512 -> 256, chosen from the
+	// exact claim-size histogram) cuts its padding 50.9% -> 32.2%, taking the
+	// measured per-slot cost 1,003 -> ~726 B. Full 393,216-slot demand is then
+	// ~272 MiB = 61% of 448 -- the step fix bought more effective mat capacity
+	// (~110 MiB at full slots) than any arena raise under discussion, for
+	// free. Do not shrink it on the back of that without re-reading the
+	// histogram's p99 on the target terrain (this leg: p99 <= 896 dwords).
 	int32 GVoxelBrickPoolMatMiB = 448;
 	FAutoConsoleVariableRef CVarVoxelBrickPoolMatMiB(
 		TEXT("voxel.Brick.PoolMatMiB"),
@@ -1239,13 +1304,31 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 			       Config.ChunkCapacity);
 		}
 	}
+	// -VoxelBrickPoolOccMiB= / -VoxelBrickPoolMatMiB= are the arena analogues
+	// of -VoxelBrickPoolChunks= above, added with the 2026-08-23 slot raise so
+	// ONE binary can fly both geometries: the pre-raise control arm is
+	// -VoxelBrickPoolChunks=262144 -VoxelBrickPoolOccMiB=192
+	// -VoxelBrickPoolMatMiB=448 -VoxelGpuPoolMatStep=512, byte-identical to the
+	// old defaults. Same contract as the chunk flag: read ONCE, here, because a
+	// resize after Init is refused; an explicit InConfig capacity outranks both
+	// (these blocks only run when it was 0).
 	if (Config.OccWordCapacity == 0)
 	{
-		Config.OccWordCapacity = uint32(FMath::Max(1, VoxelBrickPoolDetail::GVoxelBrickPoolOccMiB)) * (1024u * 1024u / 4u);
+		int32 OccMiB = 0;
+		if (!(FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickPoolOccMiB="), OccMiB) && OccMiB > 0))
+		{
+			OccMiB = VoxelBrickPoolDetail::GVoxelBrickPoolOccMiB;
+		}
+		Config.OccWordCapacity = uint32(FMath::Max(1, OccMiB)) * (1024u * 1024u / 4u);
 	}
 	if (Config.MatWordCapacity == 0)
 	{
-		Config.MatWordCapacity = uint32(FMath::Max(1, VoxelBrickPoolDetail::GVoxelBrickPoolMatMiB)) * (1024u * 1024u / 4u);
+		int32 MatMiB = 0;
+		if (!(FParse::Value(FCommandLine::Get(), TEXT("VoxelBrickPoolMatMiB="), MatMiB) && MatMiB > 0))
+		{
+			MatMiB = VoxelBrickPoolDetail::GVoxelBrickPoolMatMiB;
+		}
+		Config.MatWordCapacity = uint32(FMath::Max(1, MatMiB)) * (1024u * 1024u / 4u);
 	}
 
 	// The 28-bit offset field. BrickDescPoolWriteMain masks, so an arena past
@@ -1273,9 +1356,12 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 	// ONE allocator over the WHOLE of each word arena -- the owner's decision.
 	// The CPU Occ/MatArena objects above are still initialised but are NEVER
 	// ALLOCATED FROM while armed (AddChunkFromGpu refuses outright; the CPU
-	// producer routes through the GPU claim in Flush), so GetUsedOccWords /
-	// GetUsedMatWords read 0 on an armed pool and the [brick-gpualloc] window
-	// line carries the real usage. Descriptor slots and record slots stay on
+	// producer routes through the GPU claim in Flush). GetUsedOccWords /
+	// GetUsedMatWords therefore report the landed GPU snapshot on an armed
+	// pool (since 2026-08-23; they read the CPU arenas' structural 0 before,
+	// which put `occ=0.0% mat=0.0%` on the lifetime line through the whole
+	// eviction matrix); the [brick-gpualloc] window line carries the full
+	// per-window detail. Descriptor slots and record slots stay on
 	// DescArena for both producers -- fixed size, one dispenser, CPU-visible
 	// identity for eviction and the index.
 	// GLOBAL POOL ONLY. voxel.GPU.VerifyBrickPack stands up PRIVATE pools to
@@ -3461,11 +3547,50 @@ void FVoxelBrickPool::Flush()
 	}
 }
 
+// THE ARMED POOL'S WORD USAGE LIVES ON THE GPU, and until 2026-08-23 these two
+// accessors read the CPU arenas anyway -- which AddChunkFromGpu never allocates
+// from while armed, so `Voxel brick lifetime`'s occ/mat columns printed a
+// structural 0.0% on every GPU-alloc leg, including the four-arm eviction
+// matrix where the real occ figure was 70.9% at 99.0% slot residency. An
+// instrument that can only read one way is not an instrument (the churn
+// tripwire that never evaluated through 91,422 evictions was the same shape).
+//
+// Armed pools return the last LANDED inFlight snapshot from the counter
+// readback -- the same numbers the [brick-gpualloc] line prints, ONE WINDOW
+// STALE by construction (the readback lands next window; the line says so).
+// Bounded by the arena word capacity (2^28 max), so the uint32 narrowing is
+// exact. FAILING READING: 0.0% on the lifetime line while the same log's
+// [brick-gpualloc] line shows non-zero inFlight means the snapshot never
+// landed and the counter readback path is broken -- distrust both lines.
+// (The snapshot globals are harvested only for the global pool, and only the
+// global pool can be armed, so an armed `this` is always the pool the
+// snapshot describes.)
+uint32 FVoxelBrickPool::GetUsedOccWords() const
+{
+	if (bGpuAllocArmed)
+	{
+		return uint32(VoxelBrickPoolDetail::GAllocSnapOccInFlight.load(std::memory_order_relaxed));
+	}
+	return OccArena.GetUsedQuads();
+}
+
+uint32 FVoxelBrickPool::GetUsedMatWords() const
+{
+	if (bGpuAllocArmed)
+	{
+		return uint32(VoxelBrickPoolDetail::GAllocSnapMatInFlight.load(std::memory_order_relaxed));
+	}
+	return MatArena.GetUsedQuads();
+}
+
 uint64 FVoxelBrickPool::GetResidentBytes() const
 {
+	// Through the accessors above, not the arenas, for the armed-pool reason
+	// they exist: an armed pool's payload words are GPU-tracked, and this
+	// total fed VRAM readings that silently omitted them.
 	return uint64(DescArena.GetUsedQuads()) * VoxelBrickPoolDetail::kBrickDescBytes
-	     + uint64(OccArena.GetUsedQuads()) * 4
-	     + uint64(MatArena.GetUsedQuads()) * 4
+	     + uint64(GetUsedOccWords()) * 4
+	     + uint64(GetUsedMatWords()) * 4
 	     + uint64(Resident.Num()) * VoxelBrickPoolDetail::kChunkRecordBytes;
 }
 
