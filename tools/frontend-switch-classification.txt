@@ -224,3 +224,12 @@ VoxelClipmapSnowlineHighM
 VoxelClipmapSnowTempMax
 VoxelClipmapSnowTempFeather
 VoxelClipmapColorCensus
+#
+# The cold-start settle probe's four switches only tune an always-on log
+# instrument (hold/timeout/cadence) or turn it off; none of them makes a run
+# drive itself, and the probe is meant to be readable on ordinary interactive
+# launches -- which is exactly why the names avoid *Check/*Verify endings.
+VoxelNoColdSettle
+VoxelSettleHoldSec
+VoxelSettleTimeoutSec
+VoxelSettleProgressSec
