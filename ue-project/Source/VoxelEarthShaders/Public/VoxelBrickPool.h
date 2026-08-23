@@ -909,9 +909,19 @@ public:
 	// claim, both unmeasurable.
 	static constexpr uint32 kGpuAllocOccHistBucketWords = 16;
 	static constexpr uint32 kGpuAllocMatHistBucketWords = 64;
-	// Free-stack depth per class. 2,048 ranges per class absorbs any churn the
-	// current pipeline can produce (nothing in streaming frees at all today);
-	// overflow LEAKS the range and counts it, it never corrupts.
+	// Free-stack depth per class -- since 2026-08-23 this constant is only the
+	// FLOOR: the armed default is max(this, ChunkCapacity), which makes stack
+	// overflow IMPOSSIBLE BY CONSTRUCTION rather than unlikely (see the Init
+	// comment for the induction). The original 2,048 was written when "nothing
+	// in streaming frees at all today" was true; the first legs with real
+	// eviction leaked 16,736 / 1,164 / 29,012 ranges across three runs of
+	// identical code (the spread tracks eviction volume -- 347,709 frees on
+	// the worst leg), because eviction bursts concentrate in the one or two
+	// classes real chunks share and 2,048 is ~128x below the provable bound.
+	// A leaked range is VRAM that never comes back; at the 50k chunks/s target
+	// the bursts are ~18x tonight's and this would have been arena exhaustion
+	// in minutes. Overflow still LEAKS-and-counts, never corrupts -- leakedRuns
+	// and the stackPeak counters remain the gate that proves the bound holds.
 	static constexpr uint32 kGpuAllocFreeStackCap = 2048;
 
 	// Latched at Init from VoxelGpuPoolAllocEnabled(). The arming decision is

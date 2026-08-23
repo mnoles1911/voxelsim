@@ -1228,26 +1228,30 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 		//    below, both trivial next to the 40% of two multi-hundred-MiB
 		//    arenas).
 		//  * leakedRuns is kCtrFreePushOverflow: a free whose class stack was
-		//    FULL (2,048 deep). Eviction arrives in bursts concentrated in the
-		//    one or two classes real chunks share, so a burst deeper than the
-		//    stack LEAKS the tail -- permanently, the bump cursor never comes
-		//    back down. The spread across the three runs tracks each leg's
-		//    eviction volume (347,709 frees on the worst), which is why
-		//    identical code produced three different counts: the counter is
-		//    honest, the stack is too shallow for the burst size. At the 50k/s
-		//    target the burst is ~20x tonight's and a 2,048 stack is minutes
-		//    from arena exhaustion.
+		//    FULL (2,048 deep at the time). Eviction arrives in bursts
+		//    concentrated in the one or two classes real chunks share, so a
+		//    burst deeper than the stack LEAKS the tail -- permanently, the
+		//    bump cursor never comes back down. The spread across the three
+		//    runs tracks each leg's eviction volume (347,709 frees on the
+		//    worst), which is why identical code produced three different
+		//    counts: the counter is honest, the stack was too shallow for the
+		//    burst size. FIXED BELOW by defaulting the cap to the provable
+		//    bound (ChunkCapacity) instead of a guess.
 		//
 		// Latched (-VoxelGpuPoolOccStep= / -VoxelGpuPoolMatStep= /
-		// -VoxelGpuPoolFreeStackCap=) rather than re-defaulted so the sweep is
-		// an A/B on one binary against tonight's exact layout; recommended
-		// first sweep: OccStep 64, MatStep 128, FreeStackCap 16384. FAILING
-		// READINGS: padding that does NOT fall roughly with the step says the
-		// claim mix is bimodal (per-SIZE histogram needed, not smaller steps);
-		// leakedRuns still growing at cap 16384 says frees outrun claims
-		// SYSTEMICALLY (an eviction-rate problem, not a stack-depth one);
-		// stranded MiB rising after a step change says the finer classes
-		// stopped recycling across sizes -- the cost side of the same coin.
+		// -VoxelGpuPoolFreeStackCap=) rather than re-defaulted so a sweep is
+		// an A/B on one binary against tonight's exact layout. DO NOT SWEEP
+		// THE STEPS BLIND: read the [brick-gpualloc] claim sizes lines first
+		// -- they print the exact projected padding for every candidate step
+		// over the leg's real claim mix, so the sweep is one leg of reading,
+		// not five legs of guessing. (Concretely: the once-recommended
+		// OccStep 64 projects to the SAME occ padding as 128 if claims
+		// cluster at the ~194-dword mean, because ceil(194/64)*64 =
+		// ceil(194/128)*128 = 256.) FAILING READINGS after a step change:
+		// padding that does not match the projection says the mix shifted
+		// between legs (re-read the histogram, do not trust the old one);
+		// stranded MiB rising says the finer classes stopped recycling
+		// across sizes -- the cost side of the same coin.
 		const auto LatchedU32 = [](const TCHAR* Key, uint32 Default, uint32 Lo, uint32 Hi)
 		{
 			int32 Value = -1;
@@ -1263,8 +1267,36 @@ void FVoxelBrickPool::Init(const FVoxelBrickPoolConfig& InConfig)
 		// the class count with it.
 		L.OccClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 16u + L.OccClassStep - 1u) / L.OccClassStep;
 		L.MatClasses = (VoxelBrickPoolDetail::kBricksPerChunk * 132u + L.MatClassStep - 1u) / L.MatClassStep;
-		L.FreeStackCap = LatchedU32(TEXT("VoxelGpuPoolFreeStackCap="), kGpuAllocFreeStackCap,
-		                            256u, 65536u);
+		// --- the free-stack cap: sized to the provable bound, not a guess ---
+		//
+		// THE INVARIANT: a class-c range exists only because the bump created
+		// it, and the bump runs ONLY when the class-c stack is empty -- at
+		// which instant every class-c range ever created is held by a live
+		// resident chunk, and live ranges are held by DISTINCT chunk slots, so
+		// at that instant count(c) = inflight(c) <= ChunkCapacity. By
+		// induction from a leak-free start: while no push has ever overflowed,
+		// the number of class-c ranges in existence never exceeds
+		// ChunkCapacity, so stack depth never exceeds ChunkCapacity, so a cap
+		// of ChunkCapacity CANNOT overflow -- which closes the induction and
+		// makes leakedRuns == 0 a theorem instead of a hope. (The 2,048
+		// default this replaces was ~128x under that bound; a whole-resident-
+		// set eviction burst -- a teleport, a ring collapse -- can legally
+		// free every mat-class-1 chunk in the pool at once, and at 50,000
+		// chunks/s such bursts are routine, not pathological.)
+		//
+		// THE BILL: state storage is (OccClasses + MatClasses) x cap x 4 B --
+		// 25 MiB at the default 8+17 classes and 262,144 chunks, printed on
+		// the ARMED line below. It scales with the CLASS COUNT, so anyone
+		// latching finer steps (more classes) buys proportionally more state;
+		// read the ARMED line's overhead figure before flying a fine-step,
+		// deep-cap combination. The knob still overrides for A/B; the gate
+		// that proves the bound is leakedRuns 0 AND stackPeak <= cap on the
+		// window line -- the FAILING reading (either one violated) means the
+		// invariant above has a hole in it, and that is a finding worth a leg
+		// on its own, not a tuning miss.
+		L.FreeStackCap = LatchedU32(TEXT("VoxelGpuPoolFreeStackCap="),
+		                            FMath::Max(kGpuAllocFreeStackCap, Config.ChunkCapacity),
+		                            256u, 1u << 20);
 		// The claim-size demand histogram's geometry (see the header constants
 		// for why it exists). Bucket counts are DERIVED from the same worst
 		// cases the classes are, so a brick-format change moves them together.
