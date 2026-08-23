@@ -80,55 +80,92 @@ exactly 0 in control. Judge safety on PER-RING `loaded`/`pending`, never aggrega
 throughput — level-primary ordering once measured "R3/R4 at 0 loaded chunks for
 90 s" while the aggregate looked healthy.
 
-### 0.0i The uncovered level+reason instrument FAILS BOTH HALVES — do not quote it
+### 0.0i The uncovered instrument: DIAGNOSED and FIXED (both halves, one cause)
 
-Measured 2026-08-23 from three headless captures at 120 m / 400 m / 1200 m
-(`tools/voxel-zcutoff-ladder.ps1`), read with `tools/read-holes.sh`. This is the
-instrument the streaming plan leaned on to say whether remaining gaps are
-throughput, coverage or eviction. It cannot answer that yet.
+Authored 2026-08-23, NOT YET BUILT OR MEASURED. The gate below is what the
+next leg has to read; until it does, nothing here is a result.
 
-**Half one — `byLevel` is stuck at L0.** Every window of every rung reads
-`byLevel L0=<everything> L1=0 L2=0 L3=0 L4=0 L5=0`. That is the same failure the
-earlier `-VoxelMaxRingLevel=0` certification found, and it reproduces at three
-altitudes, so it is not a property of one pose. A histogram that only ever names
-one level cannot attribute a hole to a ring.
+**THE ORIGINAL SYMPTOMS,** from three headless captures at 120/400/1200 m
+(`Saved/capture-zcut-alt*.log`, read with `tools/read-holes.sh`): `byLevel`
+read `L0=<everything> L1..L5=0` in EVERY window of EVERY rung, and `byReason`
+sat at 100% in ONE bucket per window, flipping between `never` and `unattrib`
+with nothing streaming (`records/level R0[+0 -0 ev0]`, `jobsInFlight=0`) and
+the picture on screen unchanged.
 
-**Half two — `byReason` collapses to `unattrib=100%` once the world settles.**
-The progression is consistent across rungs: early windows read `never=100%`
-(honest), then `never` and `unattrib` trade off, then `never=0` and
-`unattrib=100%` for the entire remaining steady state.
+**THE LEAD IN THE PREVIOUS VERSION OF THIS ENTRY IS FALSIFIED.** It said
+`annotWrites pending` freezing at 290,332 was the mechanism -- the annotation
+writer dying and the reason bits going stale. It is not:
 
-**The mechanism is visible in the same line.** `annotWrites pending` climbs
-normally (72,678 -> 290,332 on the 120 m rung) and then FREEZES at 290,332 —
-and the freeze coincides exactly with `unattrib` reaching 100%. The annotation
-writer stops writing, the reason bits go stale, and every ray lands in
-"unattributed". So the reason split is only alive while annotations are still
-being produced.
+  * The freeze is normal. `annotWrites` counts ADMISSIONS; a settled world
+    admits nothing. Same window, same log: `records/level R0[+0 -0 ev0]`.
+  * The correlation does not hold in either direction. On the **alt400** rung
+    the counter CLIMBS 27,661 -> 48,018 through windows reading
+    `unattrib=100%`, and sits FROZEN through later windows reading
+    `never=100%`. The 120 m rung's apparent coincidence was one rung's
+    ordering read as a law.
+  * `[ANNOTATION WRITER DISARMED ...]` printed **zero times** in all three
+    logs, so `voxel.March.IndexGpuResident` was off throughout and the known
+    P2 interaction is not the story either.
 
-The instrument's own doc comment states the reading rule and it is worth quoting
-because it makes this unambiguous:
+**THE ACTUAL CAUSE, one for both halves.** `uncovered` and its attribution
+trigger on `bCrossedAbsentChunk` -- "the ray crossed a chunk that is not
+resident" -- and **the streamed set is a thin SHELL around the surface**:
+`resident0=28103` over a ~6,400-column ring-0 footprint is 4.4 chunks per
+column. Everything above it (sky-band trim) and below it (buried skip) is
+absent AND CORRECTLY SO, and the camera flies in that air. Ring boundaries
+are horizontal CYLINDERS, so segment 0 starts AT THE CAMERA. Therefore:
 
-    unattrib -- indicts the INSTRUMENT (stale resident records, uncaptured
-    rays); large values mean fix the meter, not the streaming.
+  * the first absent chunk on essentially every ray is the air the camera is
+    sitting in, at level 0 -- and "first crossing wins" hands the whole
+    histogram to it. That is `byLevel L0=100%`, at all three altitudes, and
+    it is why `attributed == uncovered` held EXACTLY in every window: a
+    tautology, not a health check.
+  * one index cell (the camera's own chunk) therefore supplies the reason for
+    ~100% of attributed rays. That is why the split is all-or-nothing rather
+    than a mixture, and why it flips wholesale between windows.
+  * `uncovered` itself read **25.27% of ALL RAYS on a settled, stationary
+    world**, unchanged window after window. Its doc comment's "known
+    over-count" caveat was the entire signal.
 
-By its own rule, a steady-state reading from this instrument indicts itself.
+**THE FIX (authored, in this branch).** A hole is not "a chunk that is not
+there"; it is a GAP IN GROUND THE STREAMING SYSTEM HOLDS. So the breakdown
+now triggers on a new flag, `bCrossedShellAbsent`, set only where the absent
+chunk is FACE-ADJACENT to a resident one (`VoxelMarchAbsentTouchesShell`, six
+index loads, early-out, level-2 permutation only). New counter `uncShell`
+prints beside `uncovered` with the ratio, so the old counter's contamination
+is a reading rather than an argument. `bCrossedAbsentChunk` is UNCHANGED --
+the fallthrough gate keeps its own flag and the shipping arm is
+byte-identical. A new `MarchIndexLevelPopulated` uniform (one bit per index
+grid slot) short-circuits the shell test for a slot that streams NOTHING,
+which is the only reason `-VoxelMaxRingLevel=0` can still be the proving run.
 
-**CONSEQUENCES:**
-  * Do not use `byLevel` or `byReason` as evidence for any streaming decision
-    until both are fixed. Screenshots outrank them, per the standing rule.
-  * `uncovered` was ALREADY flagged untrustworthy (it rose while the owner
-    watched holes disappear). Phase 0 of the streaming plan expected this
-    instrument to restore it. It does not.
-  * The one thing that IS sound is the identity `attributed == uncovered` with
-    `sum(byLevel) == sum(byReason)` — it holds in every window, including the
-    all-unattrib ones. So the capture side is fine; it is the ANNOTATION side
-    that dies.
+Two silent drops fixed alongside, both the same shape: the kernel's sentinel
+guard was the literal `< 6u` and the CPU's sum loop stopped at 6 while the
+enum has carried SEVEN level words since the 8 km ring landed, so every
+level-6 attribution was dropped and printed as a SHORTFALL (i.e. as a shader
+capture defect) instead. The bound is now pushed from the enum, and the perf
+line prints L6.
 
-**Where to look first:** why `annotWrites` stops. Candidates in order of
-cheapness — the writer being disarmed by a mode the settled world enters, a
-one-shot arm that is never re-armed after the first drain, or the annotation
-buffer filling and silently refusing further writes. The freeze at a round-ish
-stable number across many windows favours the last two.
+**THE GATE, and state the failing reading for each:**
+  * `byLevel` shows mass at MORE THAN ONE level on a normal flight. All at L0
+    means the camera-air defect is back.
+  * `byReason` does NOT collapse to one bucket in steady state.
+  * `uncShell` < `uncovered`. **`100.00% of uncovered` means the shell test
+    narrowed nothing** -- suspect `MarchIndexLevelPopulated == 0`.
+    `uncShell == 0` across a flight with visible arcs means it narrowed too
+    far. `tools/read-holes.sh` flags both.
+  * `-VoxelMaxRingLevel=0` must move the mass OUT of L0 and push `never` to
+    near-100% above L0. Expect it to pile at the first starved segment the
+    ray enters, not to spread evenly across L1-L5.
+
+**IS `uncovered` TRUSTWORTHY NOW? No, and it is not meant to be.** It is left
+bit-identical on purpose so every historical leg stays comparable and the
+level-1 arm is unchanged. `uncShell` is the number to quote; `uncovered` is
+its denominator and nothing else.
+
+**Run:** `tools/voxel-zcutoff-ladder.ps1` (three altitudes, `HoleStats 2`
+armed), read with `tools/read-holes.sh Saved/capture-zcut-alt*.log`. Then the
+certification leg with `-VoxelMaxRingLevel=0`.
 
 ### 0.0h The 10,814 gate leaks are a lake-sheet STARTUP-ORDER bug, not streaming — plus a live capture landmine
 

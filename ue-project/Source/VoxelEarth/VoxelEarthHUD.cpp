@@ -590,6 +590,23 @@ void AVoxelEarthHUD::DrawStreamPanel()
 						else
 						{
 							const double Inv = 100.0 / double(Attributed);
+							// THE DENOMINATOR THE TWO ROWS BELOW BREAK DOWN,
+							// and it is NOT the "Holes:" percentage above.
+							// That one counts any absent crossing and read
+							// 25.27% of all rays on a settled stationary world
+							// (2026-08-23) because the streamed set is a shell
+							// and the camera flies outside it. uncShell counts
+							// only gaps IN that shell. Printed here so the
+							// histograms can never be read against the wrong
+							// total -- which is how they were read all night.
+							AddRow(FString::Printf(
+							           TEXT("Holes (shell gaps): %s rays, %.1f%% of the ")
+							           TEXT("absent-crossing count above"),
+							           *CommaInt(int64(B.UncoveredShell)),
+							           B.Uncovered > 0
+							               ? 100.0 * double(B.UncoveredShell) / double(B.Uncovered)
+							               : 0.0),
+							       kStreamRowNeutral);
 							AddRow(FString::Printf(
 							           TEXT("Holes by level: L0 %.0f%%  L1 %.0f%%  L2 %.0f%%  ")
 							           TEXT("L3 %.0f%%  L4 %.0f%%  L5 %.0f%%  L6 %.0f%%  (of %s misses)"),

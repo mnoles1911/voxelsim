@@ -374,10 +374,22 @@ namespace VoxelMarchHoleWord
 		Uncovered,       // misses that crossed an ABSENT chunk, below horizon
 
 		// ---- LEVEL 2 (voxel.March.HoleStats 2): the uncovered breakdown ----
-		// Six level words and four reason words, both written ONLY by the
-		// level-2 permutation. Every attributed uncovered ray adds exactly one
-		// word from each group, so sum(UncLevel*) == sum(UncReason*) ==
-		// "attributed uncovered", and attributed <= Uncovered is an identity
+		// UncoveredShell is Uncovered NARROWED TO ACTUAL HOLES: misses that
+		// crossed an absent chunk FACE-ADJACENT TO A RESIDENT ONE, i.e. a gap
+		// in ground the streaming system holds rather than the air outside the
+		// shell. Uncovered stays exactly as it was so the two are comparable
+		// window for window; UncoveredShell / Uncovered is the share of the
+		// old number that was ever about holes, and on the three zcut captures
+		// of 2026-08-23 the old number was 25.27% of ALL RAYS on a settled
+		// stationary world. Written only by the level-2 permutation, and it is
+		// the denominator the attributed identity is checked against.
+		UncoveredShell,
+		// SEVEN level words (kNumLevels -- the 8 km ring took the seventh on
+		// 2026-08-23) and four reason words, both written ONLY by the level-2
+		// permutation. Every attributed ray adds exactly one word from each
+		// group, so sum(UncLevel*) == sum(UncReason*) ==
+		// "attributed uncovered", and attributed <= UncoveredShell -- NOT
+		// <= Uncovered, the two count different populations -- is an identity
 		// the perf line CHECKS -- a shortfall is a capture defect in the
 		// shader, printed as such, never silently absorbed. Under level 1
 		// these ten words exist in the buffer (one layout, one enum, one
@@ -428,6 +440,11 @@ struct FVoxelMarchHoleStats
 	// [1] admitted-pending, [2] evicted, [3] unattributed (the instrument
 	// refused to guess -- stale resident record or reserved code).
 	uint64 UncoveredByReason[4] = {};
+	// Uncovered narrowed to gaps in the resident shell -- see
+	// VoxelMarchHoleWord::UncoveredShell. Level-2 frames only, so it lives
+	// with the breakdown and not beside Uncovered above: a zero here on a
+	// level-1 window means "not measured", exactly as the histograms do.
+	uint64 UncoveredShell = 0;
 	uint64 BreakdownFrames = 0;
 	bool bBreakdownArmed = false; // voxel.March.HoleStats >= 2 when asked
 };
