@@ -254,3 +254,71 @@ the leading edge specifically, not total coverage.
   the compile from the list of things a difference could be blamed on.
 - **Run-to-run spread on this leg is large** — the same config measured 6,602 and 9,610
   frames. Treat n=1 as direction, never magnitude.
+
+---
+
+## 7. Where the pipeline bottlenecks now (measured after everything above)
+
+Once the index copy was gone the ceiling moved twice more. Both were found with
+instruments, not argument.
+
+### 7.1 The in-flight "cap" was a per-tick BATCH QUOTA — and it was below the floor by construction
+
+`MaxJobsInFlight = JobsInFlightPerCore x cores = 96`. With jobs now retiring in ~0.5 ms
+inside a ~20.7 ms tick, "96 in flight" degenerates into "**96 dispatched per tick, then
+the workers idle until the next tick tops them up**". That is `96 x 48.3 ticks/s =
+4,637 chunks/s` — **below the owner's 6,200 floor as a matter of arithmetic**, no matter
+how fast the workers get. Measured 4,341/s against that predicted 4,637/s ceiling.
+
+The dispatch-loop counter now says it outright: at cap 96, `exitCap` dominates.
+
+| config | chunks/s mean | peak | frames | p95 | hitches | holes |
+|---|---|---|---|---|---|---|
+| default (fork on, cap 8/core) | 4,341 | 7,516 | 12,355 | 31.74 ms | 543 | 0 |
+| fork off, cap 8/core | 4,498 | 7,644 | 14,138 | 25.48 ms | **54** | 0 |
+| **fork off, cap 24/core** | **6,763** | **9,811** | 12,103 | 31.99 ms | 511 | 6 |
+| fork off, cap 48/core | 6,673 | 9,164 | 12,044 | 31.95 ms | 501 | 6 |
+
+**6,763/s clears the floor.** 48/core is not better than 24 — that is the knee.
+
+**Why nobody saw this:** the audit concluded the cap "never binds", correctly, *while the
+GPU fork was on* — the fork's jobs inflated the blended counter so `CpuJobsOutstanding()`
+read ~0 and the cap looked irrelevant. It was masked, not absent. The planned
+`JobsInFlightPerCore` 8 -> 2 experiment would have made things worse; the right direction
+was up.
+
+### 7.2 The GPU fork is a net negative right now
+
+It packs **6.5%** of chunks (`brickFromGpu=49,665` of 768,799) at `submit->deliver p50
+2,281-2,348 ms`, holds per-ring floor slots for those seconds, and accounts for **90% of
+all hitches** (543 -> 54 with it off). Its FIFO drains at `MeshBatchCap = 4` promotions
+per tick, so Little's law caps the whole fork at ~111-144 chunks/s — about **2% of the
+floor**. It cannot carry this pipeline in its current shape.
+
+Do NOT raise `MeshBatchCap` — the measured hitch sweep behind it still stands. The fix is
+either the queue-depth gate (`-VoxelGpuMeshQueueDepth=16`, in the tree, default off) or a
+fork that costs less per job.
+
+### 7.3 The current limiter: the queue runs dry
+
+At cap 24/core the loop's exits invert — **`exitCap` 40%, `exitEmpty` 60%** across 11,744
+passes. The dispatcher now outruns the producer of work. `pendingJobs` falls from ~1,630 to
+~470 in the same window. **Admission, not dispatch, is next.**
+
+Also confirmed and NOT fixed by the obvious lever: coarse rings still starve
+(`R5 pending=245 dispCpu=1 floor=1`), and `voxel.Stream.RingFloorCpuOnly 1` does not move
+throughput (6,589 -> 6,624/s, starved-ring lines 9 -> 12). Leave it off.
+
+### 7.4 The finding that matters most, and it is not a throughput finding
+
+Throughput rose **52%** and the hole rate did not fall:
+
+| | chunks/s | uncovered (flying) |
+|---|---|---|
+| default | 4,341 | 3.99% of rays |
+| cap 24, fork off | 6,589 | **4.97% of rays** |
+
+**More chunks per second is not buying fewer holes.** That points away from raw rate and at
+*which* chunks get streamed: admission ORDER and the leading edge, not admission VOLUME.
+The next work should be priority along the velocity vector, not another throughput lever —
+and `uncovered`, not `brickPacks/s`, is the gate it should be judged on.
